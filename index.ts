@@ -396,14 +396,17 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	if (!saved) throw new Error(`resume child record not found: ${input.node.id}`);
 	const cwd = input.node.worktreePath ?? parent.worktreePath ?? parentRun.cwd ?? input.cwd;
 	const catalog = loadCatalog(cwd, cwd, undefined);
-	const agent = findControlAgent(catalog.agents, catalog.allAgents, input.node.role);
+	const resumedTeam = input.node.team
+		? applyTeam(catalog.allAgents, { ...catalog.settings, team: input.node.team }, { ...process.env, [TEAM_ENV]: input.node.team })
+		: { agents: catalog.agents, team: catalog.team, warnings: catalog.teamWarnings };
+	const agent = findControlAgent(resumedTeam.agents, catalog.allAgents, input.node.role);
 	if (!agent) throw new Error(`resume role no longer exists: ${input.node.role}`);
 	const childRun = store.readRun(input.node.runId);
 	if (!childRun) throw new Error(`child run.json not found: ${input.node.runId}`);
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
-	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: catalog.team, childContext: catalog.settings.childContext, parentPath: parentRun.path, legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
+	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: catalog.settings.childContext, parentPath: parentRun.path, legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
 	orchestrator.restore(parentRun);
-	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
+	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 

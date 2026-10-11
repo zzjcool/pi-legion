@@ -473,7 +473,9 @@ export class Orchestrator {
 		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
 		const previous = this.children.get(name) ?? (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
 		if (previous && !this.children.has(name)) this.children.set(name, previous);
-		this.assertWithinBudgets(Boolean(previous && (previous.state === "retired" || previous.state === "exited")));
+		// Resuming any persisted node does not consume a fresh spawn slot. An
+		// abrupt parent shutdown can leave the durable child state at `working`.
+		this.assertWithinBudgets(Boolean(previous));
 		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		const models = this.planModelCandidates({
 			agent: input.agent,

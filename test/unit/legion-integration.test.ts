@@ -201,7 +201,7 @@ test("centurion resume recovers a running child and does not revive a settled ch
 	const extraAgentsDir = path.join(cwd, "extra-agents");
 	mkdirSync(agentDir, { recursive: true });
 	mkdirSync(extraAgentsDir, { recursive: true });
-	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { disableBuiltins: true } }));
+	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { disableBuiltins: true, teams: { backend: { members: ["worker"] } } } }));
 	writeFileSync(path.join(extraAgentsDir, "worker.md"), "---\nname: worker\ndescription: worker role\nworktree: false\n---\nworker prompt\n");
 	const envNames = ["PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_SUBAGENT_CHILD", "PI_SUBAGENT_ALLOW_NESTED", LEGION_DB_ENV, LEGION_NODE_ID_ENV, "PI_SUBAGENTS_TEAM"];
 	const prior = new Map(envNames.map((name) => [name, process.env[name]]));
@@ -230,7 +230,7 @@ test("centurion resume recovers a running child and does not revive a settled ch
 	insertNode(db, { parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" }, () => now);
 	insertNode(db, { parentId: "root", name: "centurion", role: "centurion", runId: centurionRun.runId, sessionFile: centurionSession, worktreePath: cwd, status: "running", phase: "implementing" }, () => now);
 	insertNode(db, { parentId: "root.centurion", name: "worker-done", role: "worker", runId: settledRun.runId, sessionFile: settledSession, status: "settled" }, () => now);
-	insertNode(db, { parentId: "root.centurion", name: "worker-running", role: "worker", runId: runningRun.runId, sessionFile: runningSession, status: "running" }, () => now);
+	insertNode(db, { parentId: "root.centurion", name: "worker-running", role: "worker", runId: runningRun.runId, sessionFile: runningSession, team: "backend", status: "running" }, () => now);
 	await store.addChild(rootRun.runId, { name: "centurion", nodeId: "root.centurion", sessionFile: centurionSession, ownerToken: "centurion", state: "working", spawnedAt: rootRun.createdAt, agent: "centurion", kind: "pi", worktreePath: cwd });
 	await store.addChild(centurionRun.runId, { name: "worker-done", nodeId: "root.centurion.worker-done", sessionFile: settledSession, ownerToken: "worker-done", state: "retired", spawnedAt: settledRun.createdAt, agent: "worker", kind: "pi" });
 	await store.addChild(centurionRun.runId, { name: "worker-running", nodeId: "root.centurion.worker-running", sessionFile: runningSession, ownerToken: "worker-running", state: "retired", spawnedAt: runningRun.createdAt, agent: "worker", kind: "pi" });
@@ -261,6 +261,7 @@ test("centurion resume recovers a running child and does not revive a settled ch
 		assert.equal(supervisor.spawns[0]?.input.name, "worker-running");
 		assert.equal(supervisor.spawns[0]?.input.sessionFile, runningSession);
 		assert.equal(supervisor.spawns[0]?.input.env?.[LEGION_NODE_ID_ENV], "root.centurion.worker-running");
+		assert.equal(supervisor.spawns[0]?.input.env?.PI_SUBAGENTS_TEAM, "backend", "a resumed node retains its persisted team override");
 		assert.equal(getNode(db, "root.centurion.worker-done")?.status, "settled");
 		assert.equal(getNode(db, "root.centurion.worker-running")?.runId, runningRun.runId, "resume keeps the node's own run id");
 		await supervisor.retire("worker-running");
@@ -331,9 +332,13 @@ test("legion child outcomes and usage reach the ledger; resuming reuses its node
 		await first.retire(handle.name);
 		await fx.runStore.updateChild(fx.rootRun.runId, handle.name, (child) => Object.assign(child, first.childrenSnapshot()[0]));
 
+		await fx.runStore.updateRun(fx.rootRun.runId, (run) => {
+			run.children[0]!.state = "working";
+			run.budget.spawned = 1;
+		});
 		const persistedRoot = fx.runStore.readRun(fx.rootRun.runId)!;
 		const resumedSupervisor = new FakeSupervisor({ immediateTimeout: false });
-		const resumed = new Orchestrator({ supervisor: resumedSupervisor, runDir, cwd: fx.rootDir, maxDepth: 4, legion: fx.context });
+		const resumed = new Orchestrator({ supervisor: resumedSupervisor, runDir, cwd: fx.rootDir, maxDepth: 4, maxSpawns: 1, legion: fx.context });
 		resumed.restore(persistedRoot);
 		const handle2 = await resumed.launch({ agent: agent(), task: "resume without duplicating the node", name: handle.name, worktree: false });
 		assert.equal(handle2.child.nodeId, ledger.id);
