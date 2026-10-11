@@ -38,8 +38,6 @@ export interface StatusEntry {
 	nodeId?: string;
 	parentId?: string | null;
 	depth?: number;
-	/** Optional caller override. Active descendants always force the branch open. */
-	childrenCollapsed?: boolean;
 }
 
 export function formatElapsed(ms: number): string {
@@ -255,7 +253,7 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
 		const { entry } = node;
 		const activeSubtree = hasActiveSubtree(node, activeMemo);
 		const collapse = node.children.length > 0 && !activeSubtree &&
-			(entry.childrenCollapsed ?? (node.depth > 2 || TERMINAL_STATES.has(entry.state)));
+			(node.depth > 2 || TERMINAL_STATES.has(entry.state));
 		const branch = `${ancestors}${isLast ? "└─ " : "├─ "}`;
 		const linkedName = entry.nodeId
 			? osc8NodeLink(entry.nodeId, entry.name)

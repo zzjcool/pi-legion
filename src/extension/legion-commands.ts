@@ -16,15 +16,14 @@ import {
 	type TreeNodeSnapshot,
 	type TreeViewComponent,
 } from "../tui/tree-view.ts";
-import { osc8NodeLink } from "../tui/status.ts";
 import {
 	type LegionEvent,
 	type LegionEventBus,
 	LEGION_EVENT_TYPES,
+	LEGION_PROCESS_EVENT_TYPES,
 } from "./event-bus.ts";
 import type {
 	EventSubscriptionOptions,
-	LegionSupervisor,
 	SupervisorEvent,
 } from "../supervisor/types.ts";
 
@@ -41,77 +40,6 @@ export interface RpcEventSource {
 		listener: (event: SupervisorEvent) => void,
 		options?: EventSubscriptionOptions,
 	) => () => void;
-}
-
-export interface LegionSupervisorEventAdapter extends RpcEventSource, LegionSupervisor {
-	/** Optional bridge for M2 ChildRecord.nodeId once orchestration returns it. */
-	setNodeId(name: string, nodeId: string): void;
-}
-
-export function createLegionSupervisorEventAdapter(
-	supervisor: LegionSupervisor & RpcEventSource,
-	bus: LegionEventBus,
-	nodeIdForName: (name: string) => string | undefined,
-): LegionSupervisorEventAdapter {
-	const nodeIds = new Map<string, string>();
-	const pendingLifecycle = new Map<string, Array<Extract<
-		LegionEvent["type"],
-		"node_launched" | "node_steered" | "node_retired" | "node_aborted"
-	>>>();
-	const resolveNodeId = (name: string): string | undefined => nodeIds.get(name) ?? nodeIdForName(name);
-	const emitLifecycle = (
-		name: string,
-		type: Extract<
-			LegionEvent["type"],
-			"node_launched" | "node_steered" | "node_retired" | "node_aborted"
-		>,
-	): void => {
-		const nodeId = resolveNodeId(name);
-		if (!nodeId) {
-			const pending = pendingLifecycle.get(name) ?? [];
-			pending.push(type);
-			pendingLifecycle.set(name, pending);
-			return;
-		}
-		bus.emit({ nodeId, type, data: null, ts: Date.now() });
-	};
-	return {
-		setNodeId(name, nodeId) {
-			nodeIds.set(name, nodeId);
-			for (const type of pendingLifecycle.get(name) ?? []) {
-				bus.emit({ nodeId, type, data: null, ts: Date.now() });
-			}
-			pendingLifecycle.delete(name);
-		},
-		async spawnChild(input) {
-			const handle = await supervisor.spawnChild(input);
-			emitLifecycle(handle.name, "node_launched");
-			return handle;
-		},
-		prompt: (name, text) => supervisor.prompt(name, text),
-		async steer(name, text) {
-			await supervisor.steer(name, text);
-			emitLifecycle(name, "node_steered");
-		},
-		followUp: (name, text) => supervisor.followUp(name, text),
-		async abort(name) {
-			await supervisor.abort(name);
-			emitLifecycle(name, "node_aborted");
-		},
-		waitSettled: (name, timeoutMs) => supervisor.waitSettled(name, timeoutMs),
-		isAlive: (name) => supervisor.isAlive(name),
-		stats: (name) => supervisor.stats(name),
-		async retire(name, options) {
-			await supervisor.retire(name, options);
-			emitLifecycle(name, "node_retired");
-		},
-		...(supervisor.onEvent
-			? {
-				onEvent: (name: string, listener: (event: SupervisorEvent) => void, options?: EventSubscriptionOptions) =>
-					supervisor.onEvent!(name, listener, options),
-			}
-			: {}),
-	};
 }
 
 export function publishUIRequest(
@@ -239,6 +167,7 @@ function treeForLiveSource(
 	deps: LegionCommandDeps,
 ): LiveOverlaySource {
 	const nodes = new Map<string, TreeNodeSnapshot>();
+	const processEventTypes = new Set<LegionEvent["type"]>(LEGION_PROCESS_EVENT_TYPES);
 	const refresh = (): void => {
 		for (const node of deps.runtime.treeNodes()) nodes.set(node.id, { ...node });
 	};
@@ -268,8 +197,11 @@ function treeForLiveSource(
 			const busUnsubscribers = LEGION_EVENT_TYPES.map((type) =>
 				deps.bus.on(type, (event) => {
 					if (event.nodeId !== nodeId) return;
+					if (event.id === undefined && !processEventTypes.has(event.type)) return;
 					refresh();
 					listener({
+						...(event.id === undefined ? {} : { id: event.id }),
+						domain: event.id === undefined ? "process" : "stored",
 						type: event.type,
 						nodeId: event.nodeId,
 						ts: event.ts,
@@ -290,39 +222,6 @@ function treeForLiveSource(
 		},
 		getNode(nodeId) {
 			return nodes.has(nodeId) ? liveNode(nodes.get(nodeId)!) : undefined;
-		},
-	};
-}
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function withOsc8Links(
-	component: TreeViewComponent,
-	nodes: readonly TreeNodeSnapshot[],
-): TreeViewComponent {
-	let byId = new Map(nodes.map((node) => [node.id, node]));
-	return {
-		...component,
-		updateSnapshot(nextNodes, events) {
-			byId = new Map(nextNodes.map((node) => [node.id, node]));
-			component.updateSnapshot(nextNodes, events);
-		},
-		render(width) {
-			return component.render(width).map((line) => {
-				for (const id of component.getState().visibleIds) {
-					const node = byId.get(id);
-					if (!node) continue;
-					const pattern = new RegExp(`(● |▸ )(${escapeRegExp(node.name)})(?=\\s|\\+|$)`);
-					if (pattern.test(line)) {
-						return line.replace(pattern, (_match, marker: string, name: string) =>
-							`${marker}${osc8NodeLink(node.id, name)}`,
-						);
-					}
-				}
-				return line;
-			});
 		},
 	};
 }
@@ -408,19 +307,18 @@ export function registerLegionCommand(
 				await ctx.ui.custom((tui, theme, keybindings, done) => {
 					const tree = baseFactory(tui, theme, keybindings, done);
 					component = tree;
-					const wrapped = withOsc8Links(tree, nodes);
 					return {
-						...wrapped,
+						...tree,
 						handleInput(data) {
 							if (!tree.getState().searchMode && matchesKey(data, "o")) {
 								const selectedId = tree.getState().selectedId;
 								if (selectedId) openLiveOverlay(ctx, liveOverlay, selectedId);
 								return;
 							}
-							wrapped.handleInput?.(data);
+							tree.handleInput?.(data);
 						},
 						handleMouse(event: TuiMouseEvent) {
-							const result = wrapped.handleMouse?.(event);
+							const result = tree.handleMouse?.(event);
 							if (event.type === "click" && event.button === "left" && result?.handled) {
 								const selectedId = tree.getState().selectedId;
 								if (selectedId) openLiveOverlay(ctx, liveOverlay, selectedId);
@@ -428,7 +326,7 @@ export function registerLegionCommand(
 							return result;
 						},
 						dispose() {
-							wrapped.dispose();
+							tree.dispose();
 							component = undefined;
 						},
 					};

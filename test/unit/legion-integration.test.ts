@@ -23,13 +23,13 @@ import { assistantMsg, sessionHeader, userMsg } from "../helpers/fixtures.ts";
 import { stripTerminalSequences, type Component, type OverlayHandle } from "@earendil-works/pi-tui";
 import type { LegionEvent } from "../../src/extension/event-bus.ts";
 import {
-	createLegionSupervisorEventAdapter,
 	publishSupervisorEvent,
+	publishUIRequest,
 	registerLegionCommand,
 	type RpcEventSource,
 } from "../../src/extension/legion-commands.ts";
 import type { TreeNodeSnapshot, TreeViewComponent } from "../../src/tui/tree-view.ts";
-import type { LegionSupervisor, SpawnInput, SupervisorEvent } from "../../src/supervisor/types.ts";
+import type { SupervisorEvent } from "../../src/supervisor/types.ts";
 
 function agent(name = "worker", overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
@@ -626,7 +626,7 @@ test("/legion mounts the paged tree; j/o opens a node overlay and q/Esc close bo
 	assert.deepEqual(harness.rpc.subscriptions.map(({ name, options }) => ({ name, options })), [
 		{ name: "worker", options: { includeTextDelta: true } },
 	]);
-	harness.bus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "planning", to: "implementing" }, ts: NOW });
+	harness.bus.emit({ nodeId: "root.worker", id: 40, type: "phase_change", data: { from: "planning", to: "implementing" }, ts: NOW });
 	assert.match(stripTerminalSequences(tree.render(80).join("\n")), /implementing/);
 
 	const overlay = harness.ui.calls[1]?.component as (Component & {
@@ -669,6 +669,17 @@ test("/legion <name> opens the selected floating overlay and Esc unsubscribes on
 	await harness.ui.calls[0]!.promise;
 	assert.equal(harness.rpc.unsubscribeCount, 1);
 	assert.equal(harness.rpc.subscriptions.length, 0);
+});
+
+test("/legion shows a prompt for an empty Legion tree", async () => {
+	const harness = commandHarness([]);
+	const treeOpen = harness.handler("", harness.ctx);
+	await Promise.resolve();
+	const tree = harness.ui.calls[0]?.component as TreeViewComponent | undefined;
+	assert.ok(tree);
+	assert.match(stripTerminalSequences(tree.render(80).join("\n")), /No Legion nodes yet\./);
+	tree.handleInput?.("q");
+	await treeOpen;
 });
 
 test("/legion component mouse clicks open a node overlay while OSC 8 remains a visual anchor", async () => {
@@ -725,6 +736,28 @@ test("/legion tree preserves settled and failed outcomes when processes are reti
 	}
 });
 
+test("live overlay deduplicates matching stored and process-domain lifecycle events", async () => {
+	const harness = commandHarness();
+	await harness.handler("worker", harness.ctx);
+	const overlay = harness.ui.calls[0]?.component as (Component & {
+		getState(): { activity: readonly string[] };
+	}) | undefined;
+	assert.ok(overlay);
+	harness.bus.emit({ nodeId: "root.worker", id: 41, type: "node_launched", data: { runId: "worker-run" }, ts: NOW });
+	harness.bus.emit({ nodeId: "root.worker", id: 41, type: "node_launched", data: { runId: "worker-run" }, ts: NOW });
+	harness.bus.emit({ nodeId: "root.worker", type: "node_launched", data: { name: "worker" }, ts: NOW + 1 });
+	assert.deepEqual(overlay.getState().activity, ["· node_launched"]);
+	harness.bus.emit({ nodeId: "root.worker", id: 42, type: "node_retired", data: { execution: "success" }, ts: NOW + 10 });
+	harness.bus.emit({ nodeId: "root.worker", type: "node_retired", data: { name: "worker" }, ts: NOW + 11 });
+	assert.deepEqual(overlay.getState().activity, ["· node_launched", "· node_retired"], "stored and process retire outcomes produce one activity line");
+	harness.bus.emit({ nodeId: "root.worker", type: "node_retired", data: { name: "worker" }, ts: NOW + 12 });
+	assert.deepEqual(overlay.getState().activity, ["· node_launched", "· node_retired", "· node_retired"], "a separate process-only event is not swallowed with its already paired stored event");
+	harness.bus.emit({ nodeId: "root.worker", type: "turn_start", data: null, ts: NOW + 13 });
+	assert.deepEqual(overlay.getState().activity, ["· node_launched", "· node_retired", "· node_retired", "↻ turn 1"], "process-only fine-grained activity remains visible alongside deduplicated stored lifecycle events");
+	overlay.handleInput?.("\u001b");
+	await harness.ui.calls[0]!.promise;
+});
+
 test("/legion rejects ambiguous short names and completion values disambiguate by node id", async () => {
 	const nodes = [
 		makeNode("root", null, "root", 0),
@@ -763,44 +796,47 @@ test("/legion does not subscribe a nested node overlay to a same-named direct ch
 	await harness.ui.calls[0]!.promise;
 });
 
-test("Legion supervisor adapter emits process-domain lifecycle events on operation completion", async () => {
+test("publishUIRequest exposes request method on the process-domain event bus", () => {
 	const bus = createLegionEventBus();
 	const seen: LegionEvent[] = [];
-	for (const type of ["node_launched", "node_steered", "node_aborted", "node_retired"] as const) {
-		bus.on(type, (event) => seen.push(event));
-	}
-	const calls: string[] = [];
-	const supervisor: LegionSupervisor & RpcEventSource = {
-		async spawnChild(input: SpawnInput) {
-			calls.push(`spawn:${input.name}`);
-			return { name: input.name, sessionFile: "/tmp/child.jsonl" };
-		},
-		async prompt() {},
-		async steer(name) { calls.push(`steer:${name}`); },
-		async followUp() {},
-		async abort(name) { calls.push(`abort:${name}`); },
-		async waitSettled() { return { settled: true, abnormal: false }; },
-		isAlive() { return true; },
-		async stats() { return null; },
-		async retire(name) { calls.push(`retire:${name}`); },
-		onEvent: (_name, _listener) => () => {},
-	};
-	const adapter = createLegionSupervisorEventAdapter(
-		supervisor,
-		bus,
-		() => "root.centurion.worker",
-	);
-	await adapter.spawnChild({ name: "worker" } as SpawnInput);
-	await adapter.steer("worker", "fix this");
-	await adapter.abort("worker");
-	await adapter.retire("worker");
-	assert.deepEqual(calls, ["spawn:worker", "steer:worker", "abort:worker", "retire:worker"]);
-	assert.deepEqual(seen.map(({ type, nodeId }) => ({ type, nodeId })), [
-		{ type: "node_launched", nodeId: "root.centurion.worker" },
-		{ type: "node_steered", nodeId: "root.centurion.worker" },
-		{ type: "node_aborted", nodeId: "root.centurion.worker" },
-		{ type: "node_retired", nodeId: "root.centurion.worker" },
+	bus.on("ui_request", (event) => seen.push(event));
+	publishUIRequest(bus, "root.worker", "notify");
+	assert.deepEqual(seen.map(({ nodeId, type, data }) => ({ nodeId, type, data })), [
+		{ nodeId: "root.worker", type: "ui_request", data: { method: "notify" } },
 	]);
+});
+
+test("M2 orchestrator emits process-domain lifecycle events on the shared event bus", async () => {
+	const fx = fixture();
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const events: LegionEvent[] = [];
+	for (const type of ["node_launched", "node_steered", "node_aborted", "node_retired"] as const) {
+		fx.context.eventBus.on(type, (event) => {
+			if (event.id === undefined) events.push(event);
+		});
+	}
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir: fx.runStore.runDir(fx.rootRun.runId),
+		cwd: fx.rootDir,
+		maxDepth: 4,
+		legion: fx.context,
+	});
+	try {
+		const handle = await orchestrator.launch({ agent: agent(), task: "exercise process facts", worktree: false });
+		assert.equal(handle.child.nodeId, "root.worker-0");
+		await orchestrator.steer(handle.name, "change course");
+		await orchestrator.abort(handle.name);
+		await orchestrator.retire(handle.name);
+		assert.deepEqual(events.map(({ type, nodeId }) => ({ type, nodeId })), [
+			{ type: "node_launched", nodeId: "root.worker-0" },
+			{ type: "node_steered", nodeId: "root.worker-0" },
+			{ type: "node_aborted", nodeId: "root.worker-0" },
+			{ type: "node_retired", nodeId: "root.worker-0" },
+		]);
+	} finally {
+		fx.cleanup();
+	}
 });
 
 test("LegionEventBus only publishes text_delta when the per-child opt-in is enabled", () => {
@@ -814,6 +850,63 @@ test("LegionEventBus only publishes text_delta when the per-child opt-in is enab
 	assert.deepEqual(seen.map(({ nodeId, data }) => ({ nodeId, data })), [
 		{ nodeId: "root.worker", data: { delta: "secret body" } },
 	]);
+});
+
+test("active Legion overlay consumes process-only lifecycle feed beside stored outcomes", async () => {
+	const fx = fixture();
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	let activeSubscription: { listener: (event: SupervisorEvent) => void; options?: { includeTextDelta?: boolean } } | undefined;
+	let stopCoarse: (() => void) | undefined;
+	const runtime = {
+		activeJobs: () => [{ name: "worker-0", nodeId: "root.worker-0", state: "working" }],
+		treeNodes: () => [makeNode("root", null, "root", 0), makeNode("root.worker-0", "root", "worker-0", 1)],
+	};
+	const pi = {
+		registerCommand(_name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+			commandHandler = command.handler;
+		},
+	};
+	let commandHandler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+	registerLegionCommand(pi as never, {
+		bus: fx.context.eventBus,
+		runtime,
+		supervisor: {
+			onEvent(_name, listener, options) {
+				activeSubscription = { listener, ...(options ? { options } : {}) };
+				return () => { activeSubscription = undefined; };
+			},
+		},
+	});
+	const ui = new FakeCommandUi();
+	try {
+		await commandHandler!("worker-0", { hasUI: true, cwd: fx.rootDir, ui });
+		const overlay = ui.calls[0]?.component as (Component & { getState(): { activity: readonly string[] } }) | undefined;
+		assert.ok(overlay);
+		assert.deepEqual(activeSubscription?.options, { includeTextDelta: true });
+		fx.context.eventBus.emit({ nodeId: "root.worker-0", id: 5, type: "node_launched", data: null, ts: NOW });
+		fx.context.eventBus.emit({ nodeId: "root.worker-0", type: "node_launched", data: { name: "worker-0" }, ts: NOW + 1 });
+		assert.deepEqual(overlay.getState().activity, ["· node_launched"], "the process lifecycle twin is deduplicated against its stored event");
+		const rpcLaunch = await supervisor.spawnChild({
+			name: "worker-0",
+			task: "active worker",
+			agent: agent(),
+			sessionFile: path.join(fx.rootDir, "worker.jsonl"),
+			tempDir: fx.rootDir,
+			cwd: fx.rootDir,
+		});
+		assert.equal(rpcLaunch.name, "worker-0");
+		stopCoarse = supervisor.onEvent("worker-0", (event) => publishSupervisorEvent(fx.context.eventBus, "root.worker-0", event));
+		supervisor.settle("worker-0", { text: "turn complete" });
+		assert.deepEqual(overlay.getState().activity, ["· node_launched", "✓ agent turn settled"]);
+		activeSubscription?.listener({ name: "worker-0", type: "message_update", updateType: "text_delta", delta: "visible output" });
+		assert.deepEqual(overlay.getState().activity, ["· node_launched", "✓ agent turn settled", "visible output"]);
+		overlay.handleInput?.("\u001b");
+		await ui.calls[0]!.promise;
+		assert.equal(activeSubscription, undefined);
+	} finally {
+		stopCoarse?.();
+		fx.cleanup();
+	}
 });
 
 test("session runtime paints injected machine facts and applies in-process Legion events", async () => {
@@ -884,6 +977,78 @@ test("session runtime paints injected machine facts and applies in-process Legio
 		assert.match(rendered, /Legion · 2 agents · 1 running/);
 	} finally {
 		finishRetire?.();
+		runtime.dispose();
+	}
+});
+
+test("session runtime rejects name-only tree fallback when stable identity is ambiguous", () => {
+	const bus = createLegionEventBus();
+	const nodes = [
+		makeNode("root", null, "root", 0),
+		makeNode("root.alpha.worker", "root.alpha", "worker", 2),
+		makeNode("root.beta.worker", "root.beta", "worker", 2),
+	];
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus: bus,
+		getTreeNodes: () => nodes,
+		getTreeIdentity: () => undefined,
+		now: () => NOW,
+	});
+	try {
+		runtime.track({
+			name: "worker",
+			runId: "unknown-run",
+			agent: "worker",
+			sessionFile: "",
+			timeoutMs: 1_000,
+			collect: async () => ({ execution: { status: "running" }, output: "", acceptance: { status: "unknown" } }),
+		});
+		assert.deepEqual(runtime.treeNodes().map((entry) => entry.id), [
+			"root",
+			"root.alpha.worker",
+			"root.beta.worker",
+		]);
+		const statusEntries = runtime.statusEntries().filter((entry) => entry.name === "worker");
+		assert.equal(statusEntries.filter((entry) => entry.nodeId === undefined).length, 1, "ambiguous jobs remain visible without being attached to a wrong tree node");
+		assert.equal(statusEntries.filter((entry) => entry.nodeId === "root.alpha.worker").length, 1);
+		assert.equal(statusEntries.filter((entry) => entry.nodeId === "root.beta.worker").length, 1, "same-named persisted nodes are not hidden by an uncorrelated job");
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("session runtime correlates tree fallback by child session identity, not duplicate name", () => {
+	const bus = createLegionEventBus();
+	const nodes = [
+		makeNode("root", null, "root", 0),
+		{ ...makeNode("root.alpha.worker", "root.alpha", "worker", 2), runId: "worker-run", sessionFile: "/sessions/worker.jsonl" },
+		{ ...makeNode("root.beta.worker", "root.beta", "worker", 2), runId: "other-run", sessionFile: "/sessions/other.jsonl" },
+	];
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus: bus,
+		getTreeNodes: () => nodes,
+		getTreeIdentity: () => undefined,
+		now: () => NOW,
+	});
+	try {
+		runtime.track({
+			name: "worker",
+			runId: "worker-run",
+			agent: "worker",
+			sessionFile: "/sessions/worker.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => ({ execution: { status: "running" }, output: "", acceptance: { status: "unknown" } }),
+		});
+		const worker = runtime.treeNodes().find((entry) => entry.id === "root.alpha.worker");
+		const other = runtime.treeNodes().find((entry) => entry.id === "root.beta.worker");
+		assert.equal(worker?.status, "running");
+		assert.equal(other?.updatedAt, NOW - 1_000, "a same-named sibling's tree facts remain untouched");
+		const workerEntries = runtime.statusEntries().filter((entry) => entry.name === "worker");
+		assert.equal(workerEntries.filter((entry) => entry.nodeId === "root.alpha.worker").length, 1);
+		assert.equal(workerEntries.filter((entry) => entry.nodeId === "root.beta.worker").length, 1, "the same-named sibling remains visible in persisted status facts");
+	} finally {
 		runtime.dispose();
 	}
 });

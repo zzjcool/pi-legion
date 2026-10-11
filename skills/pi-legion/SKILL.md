@@ -5,6 +5,17 @@ description: "Delegate with the subagent tool whenever a loaded role matches the
 
 # Pi Legion
 
+## Legion visualization
+
+In an interactive Pi session, `/legion` opens the paged Legion tree. Navigate with
+`j`/`k` or the arrow keys, use Enter/Space to expand or collapse, `/` to search,
+and PageUp/PageDown to scroll; `q` or Esc closes the tree. Press `o` on the
+selected node, or use a component-routed mouse click in the full-screen tree, to
+open its live overlay. `/legion <name>` opens a node directly. If short names
+are ambiguous, use the full node ID shown in command completion. Esc closes an
+overlay and unsubscribes its node's live feed. OSC 8 links are visual anchors
+only; they do not open overlays or route clicks.
+
 The launch path is frozen. Do not invent herdr commands.
 
 The system prompt lists **every loaded role** each turn, including user agents

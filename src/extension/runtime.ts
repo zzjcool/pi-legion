@@ -282,6 +282,25 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		return [...tree.values()].map((node) => ({ ...node }));
 	};
 
+	const storedNodeForJob = (
+		job: TrackedJob,
+		nodes: readonly TreeNodeSnapshot[],
+	): TreeNodeSnapshot | undefined => {
+		if (job.nodeId) return nodes.find((node) => node.id === job.nodeId);
+		if (job.sessionFile) {
+			const sessionMatches = nodes.filter((node) => node.sessionFile === job.sessionFile);
+			if (sessionMatches.length === 1) return sessionMatches[0];
+		}
+		if (job.runId) {
+			const runMatches = nodes.filter((node) => node.runId === job.runId && node.name === job.name);
+			if (runMatches.length === 1) return runMatches[0];
+		}
+		const mapped = deps.getTreeIdentity?.(job.name);
+		if (mapped?.nodeId) return nodes.find((node) => node.id === mapped.nodeId);
+		const sameName = nodes.filter((node) => node.name === job.name);
+		return sameName.length === 1 ? sameName[0] : undefined;
+	};
+
 	const identityForJob = (
 		job: TrackedJob,
 		storedNode?: TreeNodeSnapshot,
@@ -303,13 +322,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			.filter((job) => job.state !== "retired")
 			.sort((a, b) => a.spawnedAt - b.spawnedAt)
 			.map((job) => {
-				const identity = identityForJob(job);
-				const storedNode = identity
-					? nodes.find((node) => node.id === identity.nodeId)
-					: nodes.find((node) => node.name === job.name);
+				const storedNode = storedNodeForJob(job, nodes);
+				const mappedIdentity = deps.getTreeIdentity?.(job.name);
+				const identity = job.nodeId || mappedIdentity?.nodeId || storedNode
+					? identityForJob(job, storedNode)
+					: undefined;
 				return statusEntryFromJob(
 					job,
-					identity ?? identityForJob(job, storedNode),
+					identity,
 					storedNode,
 					finished.get(job.name)?.execution.status,
 				);
@@ -317,7 +337,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		const seen = new Set(jobEntries.flatMap((entry) => entry.nodeId ? [entry.nodeId] : []));
 		const persistedEntries: StatusEntry[] = [];
 		for (const node of nodes) {
-			if (seen.has(node.id) || jobs.has(node.name)) continue;
+			if (seen.has(node.id)) continue;
 			const details = activity.get(node.id);
 			persistedEntries.push(statusEntryFromNode(node, details));
 		}
@@ -743,11 +763,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			const result = snapshotNodes();
 			for (const job of jobs.values()) {
 				if (job.state === "retired") continue;
-				const identity = identityForJob(job);
-				const storedNode = identity
-					? result.find((node) => node.id === identity.nodeId)
-					: result.find((node) => node.name === job.name);
-				const resolvedIdentity = identity ?? identityForJob(job, storedNode);
+				const storedNode = storedNodeForJob(job, result);
+				const mappedIdentity = deps.getTreeIdentity?.(job.name);
+				const hasStableIdentity = Boolean(job.nodeId || mappedIdentity?.nodeId || storedNode);
+				if (!hasStableIdentity) continue;
+				const resolvedIdentity = identityForJob(job, storedNode);
 				if (!resolvedIdentity) continue;
 				const index = result.findIndex((node) => node.id === resolvedIdentity.nodeId);
 				const previous = index >= 0 ? result[index] : undefined;
