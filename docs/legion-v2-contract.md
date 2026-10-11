@@ -209,7 +209,7 @@ kind: pi
 allowNestedSubagents: true
 maxSubagentDepth: 2          # R=本角色子树代数上限（含自身；与所在深度无关；只收紧不放宽）：1=叶子禁派生；2=可派一层组员、组员不可再派；3=组员（如孙代 centurion）可再派一层
 worktree: true               # 子树 worktree：本人 cwd 即队的工作区（§9）
-team: be-value               # 默认队；launch 可覆盖（subagent({team:"fe-premium"})）
+team:                        # 可选：默认队（须是 settings.teams 里真实存在的队名）；省略 = 全 roster 可选；launch 可覆盖（subagent({team:"fe-premium"})）
 ---
 ```
 
@@ -456,4 +456,5 @@ interface LegionEventBus {
 | 2026-10-11 | REV-11 | 归属最终形态（终结逐类补丁）：主链切换型里程碑的边界 = 验收本身。测试侧：切换破坏的一切既有测试（含经 fake-herdr 驱动 index.ts 的 teams/presets-regression、断言 herdr 行为的 child-mode/context-injection/playbook 等）均归 M1，锚点 = 切换后全量绿。生产侧：补入 summary.ts 及其他因切换编译失败的 src 文件（仍排除 supervisor/legion/tui/agents/docs）。触发：worker-8 第三次按 §15-2 正确拒绝（fake-herdr 驱动型与行为断言型测试不在 REV-10 类别内，零改动） |
 | 2026-10-11 | REV-12 | REV-11 生产侧排除清单修正：删除 `Placement` 必然波及 `src/agents/agents.ts`（frontmatter 解析/默认值）与 `src/agents/settings.ts`（herdr.defaultPlacement）——锚点「切换后全量绿」自身要求的改动范围，从排除清单移入归属（仅 Placement 相关行，agents/ 其余不动）。触发：worker-8 第四次按 §15-2 正确拒绝（Placement 删除 vs agents/ 排除的矛盾，零改动） |
 | 2026-10-11 | REV-13 | §10.2 总线事件分两域：存储域（§4.3 的 14 种，经 createDbEventSource）与**进程内域**（node_launched/node_steered/node_retired/node_aborted/ui_request + 观察流 text_delta/tool_call/turn_start/agent_settled，带 nodeId 不落库，由扩展层在调 supervisor 方法/接 uiProxy 回调时 emit）。M3-integration 归属增加 `src/extension/event-bus.ts` 的类型集扩展（仅加进程内域类型，不动脏检查逻辑）。原因：RpcSupervisor.onEvent 是 per-child RPC 协议事件，操作级事件（launch/steer/retire）不在其中，须由扩展层显式 emit。触发：worker-12 按 §15-2 正确拒绝（类型闭集不含操作事件，零改动） |
-| 2026-10-11 | REV-14 | §10.1 点击双通道降级：OSC 8 超链接仅作视觉锄点 → 视觉锚点（REV-14 行文勘误）（宿主 TUI 截获链接点击去 openBrowser，pi-tui tui-alt-screen.js:1097-1104 + extensions types 无 URL 回调 API——worker-14 读源码实证）；浮窗打开 = 组件鼠标事件 + 键盘路径（/legion <name>）。鼠标事件在全屏模式路由到组件（tree-view 自管分页的点击 handler 已支持），regular 模式无鼠标为宿主限制。触发：worker-14 按 §15-2 正确拒绝（WIP 已由合并权人固化 2dff211） |
+| 2026-10-11 | REV-14 | §10.1 点击双通道降级：OSC 8 超链接仅作视觉锚点（宿主 TUI 截获链接点击去 openBrowser，pi-tui tui-alt-screen.js:1097-1104 + extensions types 无 URL 回调 API——worker-14 读源码实证）；浮窗打开 = 组件鼠标事件 + 键盘路径（/legion <name>）。鼠标事件在全屏模式路由到组件（tree-view 自管分页的点击 handler 已支持），regular 模式无鼠标为宿主限制。触发：worker-14 按 §15-2 正确拒绝（WIP 已由合并权人固化 2dff211） |
+| 2026-10-11 | REV-15 | §6.1 centurion 角色卡的 `team: be-value` 改为可选省略：be-value 是示例值，仓库/用户 settings 均未定义该队，不覆盖时子进程收警告并退化全 roster。team 字段语义 = 可选的默认队绑定（须真实存在），省略即全 roster。触发：reviewer-6 对 PR #13 的范围外观察 |
