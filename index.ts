@@ -11,7 +11,6 @@
  *   is still working. Running children are painted next to the input box.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type {
@@ -52,6 +51,11 @@ import { getChildByName, getChildren, getNode, insertNode, type LegionNode, upda
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
+import {
+	publishSupervisorEvent,
+	registerLegionCommand,
+	type RpcEventSource,
+} from "./src/extension/legion-commands.ts";
 import { DEFAULT_FLUSH_MS, DEFAULT_JOIN_MODE } from "./src/extension/join.ts";
 import { registerChildGuard } from "./src/extension/child-guard.ts";
 import { ALLOW_NESTED_ENV } from "./src/extension/budget.ts";

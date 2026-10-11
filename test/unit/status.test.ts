@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	applyStatus,
 	createStatusBoard,
@@ -48,6 +48,56 @@ function assertLinesFit(lines: string[], width: number): void {
 	}
 }
 
+function treeEntries(): StatusEntry[] {
+	return [
+		{
+			name: "root",
+			nodeId: "root",
+			parentId: null,
+			depth: 0,
+			agent: "ceo",
+			state: "working",
+			startedAt: 0,
+		},
+		{
+			name: "centurion",
+			nodeId: "root.centurion",
+			parentId: "root",
+			depth: 1,
+			agent: "centurion",
+			state: "working",
+			startedAt: 100,
+		},
+		{
+			name: "worker-a2",
+			nodeId: "root.centurion.worker-a2",
+			parentId: "root.centurion",
+			depth: 2,
+			agent: "worker",
+			state: "working",
+			startedAt: 200,
+		},
+		{
+			name: "deep-manager",
+			nodeId: "root.centurion.worker-a2.deep-manager",
+			parentId: "root.centurion.worker-a2",
+			depth: 3,
+			agent: "centurion",
+			state: "settled",
+			startedAt: 300,
+		},
+		{
+			name: "deep-worker",
+			nodeId: "root.centurion.worker-a2.deep-manager.deep-worker",
+			parentId: "root.centurion.worker-a2.deep-manager",
+			depth: 4,
+			agent: "worker",
+			state: "settled",
+			startedAt: 400,
+		},
+	];
+}
+
 test("formatElapsed rounds to seconds", () => {
 	assert.equal(formatElapsed(0), "0s");
 	assert.equal(formatElapsed(1_400), "1s");
@@ -81,6 +131,53 @@ test("formatWidgetLines keeps the compact roster when no extra fields are set", 
 	assert.equal(lines[2], "│    ⎿  working");
 	assert.equal(lines[3], "└─ ● reviewer-1 (reviewer) · 3s");
 	assert.equal(lines[4], "     ⎿  working");
+});
+
+test("formatWidgetLines renders a tree, folds deep completed subtrees, and opens running paths", () => {
+	const entries = treeEntries();
+	const lines = formatWidgetLines(entries, 5_000).map(stripTerminalSequences);
+	assert.equal(lines[0], "⏳ Legion · 5 agents · 3 running");
+	assert.ok(lines.some((line) => line.includes("▸ deep-manager +1 collapsed")));
+	assert.ok(!lines.some((line) => line.includes("deep-worker")));
+
+	const runningDeep = entries.map((entry) =>
+		entry.name === "deep-worker" ? { ...entry, state: "working" } : entry,
+	);
+	const expanded = formatWidgetLines(runningDeep, 5_000).map(stripTerminalSequences);
+	assert.ok(expanded.some((line) => line.includes("deep-worker")));
+	assert.ok(!expanded.some((line) => line.includes("deep-manager +1 collapsed")));
+	assert.equal(expanded[0], "⏳ Legion · 5 agents · 4 running");
+});
+
+test("formatWidgetLines renders 300 nodes within the refresh budget", () => {
+	const entries: StatusEntry[] = [
+		{
+			name: "root",
+			nodeId: "root",
+			parentId: null,
+			depth: 0,
+			agent: "ceo",
+			state: "working",
+			startedAt: 0,
+		},
+	];
+	for (let index = 1; index < 300; index += 1) {
+		const parentId = index === 1 ? "root" : `root.worker-${index - 1}`;
+		entries.push({
+			name: `worker-${index}`,
+			nodeId: `root.worker-${index}`,
+			parentId,
+			depth: index,
+			agent: "worker",
+			state: "working",
+			startedAt: index,
+		});
+	}
+	const start = performance.now();
+	const lines = formatWidgetLines(entries, 5_000);
+	const elapsedMs = performance.now() - start;
+	assert.ok(lines.length >= 300);
+	assert.ok(elapsedMs < 500, `300-node refresh took ${elapsedMs.toFixed(1)}ms`);
 });
 
 test("formatWidgetLines adds model, thinking, kind, tools, and worktree", () => {

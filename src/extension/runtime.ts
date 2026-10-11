@@ -27,6 +27,16 @@ import {
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
 import { DEFAULTS, type AgentKind } from "../shared/types.ts";
+import type {
+	EventSubscriptionOptions,
+	SupervisorEvent,
+} from "../supervisor/types.ts";
+import type { LegionEvent, LegionEventBus } from "./event-bus.ts";
+import { LEGION_EVENT_TYPES } from "./event-bus.ts";
+import { createDbEventSource, type DbEventSource } from "./event-bus.ts";
+import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
+import { getSubtree, type LegionNode } from "../legion/nodes.ts";
+import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 
 export interface CollectSnapshot {
 	execution: { status: string; reason?: string };
@@ -57,6 +67,10 @@ export interface TrackedJobInput {
 	model?: string;
 	thinking?: string | false;
 	worktreeBranch?: string;
+	/** Legion tree identity supplied by the host when the M2 ChildRecord is available. */
+	nodeId?: string;
+	parentId?: string | null;
+	depth?: number;
 	collect: () => Promise<CollectSnapshot>;
 	persist?: (snapshot: CollectSnapshot) => Promise<void>;
 	/** Retire the RPC child after a terminal collect. Blocked children stay alive. */
@@ -77,7 +91,15 @@ export interface TrackedJob extends TrackedJobInput {
 	notified: boolean;
 	watching: boolean;
 	generation: number;
+	unsubscribeRpcEvents?: () => void;
 	collectPromise?: Promise<CollectSnapshot>;
+}
+
+export interface LegionTreeIdentity {
+	nodeId: string;
+	parentId: string | null;
+	depth: number;
+	supervisorName?: string;
 }
 
 export interface SessionRuntimeDeps {
@@ -85,6 +107,27 @@ export interface SessionRuntimeDeps {
 	emitBusy?: (active: boolean, label?: string) => void;
 	now?: () => number;
 	refreshMs?: number;
+	/** Shared extension-lifetime bus; all visual refreshes are driven through it. */
+	eventBus?: LegionEventBus;
+	/** Optional host metadata snapshot; the runtime never asks the UI to query DB. */
+	getTreeNodes?: () => readonly TreeNodeSnapshot[];
+	/**
+	 * Optional name-to-tree mapping for live RPC jobs.
+	 * TODO(M2-int): wire this to ChildRecord.nodeId/parentId/depth when the
+	 * orchestrator exposes those fields to index.ts.
+	 */
+	getTreeIdentity?: (name: string) => LegionTreeIdentity | undefined;
+	/** Error hook for an optional PI_LEGION_DB feed. */
+	onDbEventSourceError?: (error: unknown) => void;
+	/**
+	 * Adapter for coarse RPC observations. The index supplies only a bus-forwarding
+	 * listener; text_delta remains disabled unless a live overlay opts in.
+	 */
+	subscribeSupervisorEvents?: (
+		name: string,
+		listener: (event: SupervisorEvent) => void,
+		options?: EventSubscriptionOptions,
+	) => () => void;
 	/** Batching config; applied via setJoinConfig right after construction. */
 	joinConfig?: JoinConfig;
 }
@@ -127,6 +170,10 @@ export interface SessionRuntime {
 	release(name: string): void;
 	get(name: string): TrackedJob | undefined;
 	activeJobs(): TrackedJob[];
+	/** Immutable metadata snapshot for tree/custom UI consumers. */
+	treeNodes(): TreeNodeSnapshot[];
+	/** Current live widget rows, including any retained Legion tree facts. */
+	statusEntries(): StatusEntry[];
 	refreshUi(): void;
 	/** Forward join config to the internal coordinator (settings wiring). */
 	setJoinConfig(config: JoinConfig): void;
@@ -147,6 +194,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const jobs = new Map<string, TrackedJob>();
 	const finished = new Map<string, CollectSnapshot>();
 	const board = createStatusBoard();
+	const tree = new Map<string, TreeNodeSnapshot>();
+	const activity = new Map<string, { turn?: number; tools: string[] }>();
+	const eventOverrides = new Map<string, { ts: number; status?: TreeNodeSnapshot["status"]; phase?: string }>();
+	let ledgerDb: DatabaseSync | undefined;
+	let dbEventSource: DbEventSource | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let disposed = false;
 	let busyRaised = false;
@@ -207,17 +259,64 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	});
 	join.setConfig(joinConfig);
 
-	const entries = (): StatusEntry[] =>
-		[...jobs.values()]
+	const snapshotNodes = (): TreeNodeSnapshot[] => {
+		const provided = deps.getTreeNodes?.() ?? (ledgerDb ? getSubtree(ledgerDb, "root") : undefined);
+		if (provided !== undefined) {
+			tree.clear();
+			for (const node of provided) {
+				const override = eventOverrides.get(node.id);
+				if (override && override.ts >= node.updatedAt) {
+					tree.set(node.id, {
+						...node,
+						...(override.status === undefined ? {} : { status: override.status }),
+						...(override.phase === undefined ? {} : { phase: override.phase }),
+						updatedAt: override.ts,
+					});
+				} else {
+					if (override) eventOverrides.delete(node.id);
+					tree.set(node.id, { ...node });
+				}
+			}
+			for (const nodeId of activity.keys()) if (!tree.has(nodeId)) activity.delete(nodeId);
+		}
+		return [...tree.values()].map((node) => ({ ...node }));
+	};
+
+	const statusEntries = (): StatusEntry[] => {
+		const jobEntries = [...jobs.values()]
 			.filter((job) => job.state !== "retired")
 			.sort((a, b) => a.spawnedAt - b.spawnedAt)
-			.map(statusEntryFromJob);
+			.map((job) => {
+				const storedNode = [...tree.values()].find((node) => node.name === job.name);
+				const identity = job.nodeId
+					? { nodeId: job.nodeId, parentId: job.parentId ?? null, depth: job.depth ?? 0 }
+					: deps.getTreeIdentity?.(job.name) ?? (storedNode ? {
+						nodeId: storedNode.id,
+						parentId: storedNode.parentId,
+						depth: storedNode.depth,
+					} : undefined);
+				return statusEntryFromJob(job, identity);
+			});
+		const seen = new Set(jobEntries.flatMap((entry) => entry.nodeId ? [entry.nodeId] : []));
+		const persistedEntries: StatusEntry[] = [];
+		for (const node of snapshotNodes()) {
+			if (seen.has(node.id) || jobs.has(node.name)) continue;
+			const details = activity.get(node.id);
+			persistedEntries.push(statusEntryFromNode(node, details));
+		}
+		return [...persistedEntries, ...jobEntries].sort((left, right) =>
+			(left.depth ?? 0) - (right.depth ?? 0) ||
+			left.startedAt - right.startedAt ||
+			left.name.localeCompare(right.name),
+		);
+	};
+
+	const entries = statusEntries;
 
 	const syncBusy = (): void => {
 		const list = entries();
 		const label = formatBusyLabel(list);
-		if (list.length > 0) {
-			if (busyRaised && label === undefined) return;
+		if (label !== undefined) {
 			deps.emitBusy?.(true, label);
 			busyRaised = true;
 			return;
@@ -230,9 +329,67 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 
 	const refreshUi = (): void => {
 		if (disposed) return;
-		board.paint(entries(), now());
+		board.paint(statusEntries(), now());
 		syncBusy();
 	};
+
+	const refreshTreeSnapshot = (): void => {
+		snapshotNodes();
+	};
+
+	const applyTreeEvent = (event: LegionEvent): void => {
+		const node = tree.get(event.nodeId);
+		const data = event.data && typeof event.data === "object" && !Array.isArray(event.data)
+			? event.data as Record<string, unknown>
+			: undefined;
+		if (node) {
+			const updated = { ...node, updatedAt: event.ts };
+			if (event.type === "node_launched" || event.type === "node_resumed") updated.status = "running";
+			else if (event.type === "node_settled") updated.status = "settled";
+			else if (event.type === "node_failed") updated.status = "failed";
+			else if (event.type === "node_retired") updated.status = "retired";
+			else if (event.type === "node_blocked") updated.status = "blocked";
+			else if (event.type === "phase_change" && typeof data?.to === "string") updated.phase = data.to;
+			tree.set(event.nodeId, updated);
+		}
+		if (event.type === "turn_start") {
+			const current = activity.get(event.nodeId) ?? { tools: [] };
+			current.turn = typeof data?.turn === "number" ? data.turn : (current.turn ?? 0) + 1;
+			activity.set(event.nodeId, current);
+		} else if (event.type === "tool_call") {
+			const current = activity.get(event.nodeId) ?? { tools: [] };
+			const toolName = typeof data?.toolName === "string" ? data.toolName : typeof data?.name === "string" ? data.name : undefined;
+			if (toolName) current.tools = [...current.tools.slice(-1), toolName];
+			activity.set(event.nodeId, current);
+		}
+	};
+
+	const onWidgetEvent = (event: LegionEvent): void => {
+		refreshTreeSnapshot();
+		applyTreeEvent(event);
+		refreshUi();
+	};
+	const busUnsubscribers = deps.eventBus
+		? LEGION_EVENT_TYPES.map((type) => deps.eventBus!.on(type, onWidgetEvent))
+		: [];
+
+	if (process.env.PI_LEGION_DB) {
+		try {
+			ledgerDb = openLegionDb(process.env.PI_LEGION_DB);
+			snapshotNodes();
+			dbEventSource = createDbEventSource(ledgerDb, {
+				onError: deps.onDbEventSourceError,
+			});
+			if (deps.eventBus) dbEventSource.start(deps.eventBus);
+		} catch (error) {
+			deps.onDbEventSourceError?.(error);
+			ledgerDb?.close();
+			ledgerDb = undefined;
+			dbEventSource = undefined;
+		}
+	}
+
+	if (!ledgerDb) snapshotNodes();
 
 	const ensureTimer = (): void => {
 		if (timer || jobs.size === 0 || disposed) return;
@@ -382,6 +539,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				watching: false,
 				generation: 0,
 			};
+			if (deps.subscribeSupervisorEvents) {
+				job.unsubscribeRpcEvents = deps.subscribeSupervisorEvents(
+					job.name,
+					() => {},
+					{},
+				);
+			}
 			jobs.set(job.name, job);
 			join.addPending(job.runId, job.name);
 			ensureTimer();
@@ -522,7 +686,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		},
 
 		release(name) {
-			if (!jobs.delete(name)) return;
+			const job = jobs.get(name);
+			if (!job || !jobs.delete(name)) return;
+			job.unsubscribeRpcEvents?.();
+			job.unsubscribeRpcEvents = undefined;
 			join.remove(name);
 			stopTimerIfIdle();
 			refreshUi();
@@ -534,6 +701,60 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 
 		activeJobs() {
 			return [...jobs.values()];
+		},
+
+		treeNodes() {
+			refreshTreeSnapshot();
+			const result = snapshotNodes();
+			for (const job of jobs.values()) {
+				if (job.state === "retired") continue;
+				const storedNode = result.find((node) => node.id === job.nodeId || node.name === job.name);
+				const identity = job.nodeId
+					? { nodeId: job.nodeId, parentId: job.parentId ?? null, depth: job.depth ?? 0 }
+					: deps.getTreeIdentity?.(job.name) ?? (storedNode ? {
+						nodeId: storedNode.id,
+						parentId: storedNode.parentId,
+						depth: storedNode.depth,
+					} : undefined);
+				if (!identity) continue;
+				const index = result.findIndex((node) => node.id === identity.nodeId);
+				const previous = index >= 0 ? result[index] : undefined;
+				const status = job.state === "blocked"
+					? "blocked"
+					: job.state === "awaiting"
+						? "settled"
+						: "running";
+				const next: TreeNodeSnapshot = previous
+					? { ...previous, status, model: job.model ?? previous.model, updatedAt: now() }
+					: {
+						id: identity.nodeId,
+						parentId: identity.parentId,
+						name: job.name,
+						role: job.agent,
+						kind: job.kind ?? "pi",
+						depth: identity.depth,
+						runId: null,
+						sessionFile: job.sessionFile || null,
+						worktreePath: null,
+						model: job.model ?? null,
+						team: null,
+						status,
+						phase: null,
+						phaseSince: null,
+						reworkCount: 0,
+						contractPath: null,
+						taskSummary: null,
+						createdAt: job.spawnedAt,
+						updatedAt: now(),
+					};
+				if (index >= 0) result[index] = next;
+				else result.push(next);
+			}
+			return result;
+		},
+
+		statusEntries() {
+			return statusEntries();
 		},
 
 		refreshUi,
@@ -554,11 +775,16 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		dispose() {
 			if (disposed) return;
 			disposed = true;
+			for (const job of jobs.values()) job.unsubscribeRpcEvents?.();
 			jobs.clear();
 			finished.clear();
 			join.dispose();
 			if (timer) clearInterval(timer);
 			timer = undefined;
+			for (const unsubscribe of busUnsubscribers) unsubscribe();
+			dbEventSource?.stop();
+			ledgerDb?.close();
+			ledgerDb = undefined;
 			board.clear();
 			if (busyRaised) {
 				busyRaised = false;
@@ -570,7 +796,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	return runtime;
 }
 
-function statusEntryFromJob(job: TrackedJob): StatusEntry {
+function statusEntryFromJob(
+	job: TrackedJob,
+	identity?: LegionTreeIdentity,
+): StatusEntry {
 	const live = progressFromSessionFile(job.sessionFile);
 	const model = live.model ?? job.model;
 	const thinking = job.thinking;
@@ -585,5 +814,30 @@ function statusEntryFromJob(job: TrackedJob): StatusEntry {
 		...(job.worktreeBranch ? { worktreeBranch: job.worktreeBranch } : {}),
 		...(live.turns ? { turns: live.turns } : {}),
 		...(live.lastTools?.length ? { lastTools: live.lastTools } : {}),
+		...(identity ? {
+			nodeId: identity.nodeId,
+			parentId: identity.parentId,
+			depth: identity.depth,
+		} : {}),
+	};
+}
+
+function statusEntryFromNode(
+	node: LegionNode,
+	activity?: { turn?: number; tools: string[] },
+): StatusEntry {
+	return {
+		name: node.name,
+		agent: node.role,
+		state: node.status,
+		startedAt: node.createdAt,
+		...(node.phase ? { phase: node.phase } : {}),
+		...(node.kind ? { kind: node.kind } : {}),
+		...(node.model ? { model: node.model } : {}),
+		...(activity?.turn !== undefined ? { turns: activity.turn } : {}),
+		...(activity?.tools.length ? { lastTools: activity.tools } : {}),
+		nodeId: node.id,
+		parentId: node.parentId,
+		depth: node.depth,
 	};
 }
