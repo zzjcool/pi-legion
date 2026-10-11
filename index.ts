@@ -377,9 +377,8 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	if (!parentRun) throw new Error(`parent run.json not found: ${parentRunId}`);
 	let saved = parentRun.children.find((child) => child.nodeId === input.node.id || child.sessionFile === input.node.sessionFile);
 	if (!saved) {
-				await store.addChild(parentRunId, {
-					name: input.node.name,
-
+		await store.addChild(parentRunId, {
+			name: input.node.name,
 			nodeId: input.node.id,
 			sessionFile: input.node.sessionFile,
 			ownerToken: `legion-${input.node.id}`,
