@@ -30,6 +30,7 @@ import {
 import {
 	applyTeam,
 	DEFAULT_TEAM,
+	TEAM_ENV,
 	type ActiveTeam,
 } from "./src/agents/teams.ts";
 import { resolveModel } from "./src/agents/model-resolution.ts";
@@ -40,8 +41,16 @@ import {
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
 import { createSessionRuntime, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
+import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
+import { LegionPostman, registerLegionTools } from "./src/extension/legion-tools.ts";
+import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
+import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
+import { appendEvent } from "./src/legion/events.ts";
+import { getChildByName, getChildren, getNode, insertNode, type LegionNode } from "./src/legion/nodes.ts";
+import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
+import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { DEFAULT_FLUSH_MS, DEFAULT_JOIN_MODE } from "./src/extension/join.ts";
-import { registerChildGuard } from "./src/extension/child-guard.ts";
+import { CHILD_ROLE_ENV, registerChildGuard } from "./src/extension/child-guard.ts";
 import { ALLOW_NESTED_ENV } from "./src/extension/budget.ts";
 import {
 	applyOnBlockedPolicy,
@@ -64,6 +73,7 @@ import { getAgentDir } from "./src/agents/paths.ts";
 import {
 	effectiveMaxDepth,
 	Orchestrator,
+	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
@@ -184,6 +194,141 @@ export interface ExtensionSupervisorDeps {
 	supervisor?: LegionSupervisor;
 	uiProxy?: UIProxy;
 	onBudgetRefused?: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+}
+
+interface LegionRuntimeIdentity {
+	db: DatabaseSync;
+	dbPath: string;
+	nodeId: string;
+	runId: string;
+	rootRunId: string;
+	storeRootDir: string;
+	settings: LegionSettings;
+	eventBus: LegionEventBus;
+	dbEventSource: DbEventSource;
+	postman: LegionPostman;
+	childNodeId(name: string): string | undefined;
+}
+
+function settingsForLegion(settings: ReturnType<typeof loadSubagentSettings>): LegionSettings {
+	return { ...DEFAULT_LEGION_SETTINGS, ...(settings.legion ?? {}), phaseTimeouts: { ...DEFAULT_LEGION_SETTINGS.phaseTimeouts, ...(settings.legion?.phaseTimeouts ?? {}) } };
+}
+
+function notice(pi: ExtensionAPI, text: string): void {
+	pi.sendMessage({ customType: SUBAGENT_NOTIFY_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+}
+
+function createLegionRuntime(input: {
+	pi: ExtensionAPI;
+	supervisor: LegionSupervisor;
+	db: DatabaseSync;
+	dbPath: string;
+	nodeId: string;
+	rootRunId: string;
+	cwd: string;
+	storeRootDir: string;
+	settings: LegionSettings;
+	registerTools: boolean;
+}): LegionRuntimeIdentity {
+	const self = getNode(input.db, input.nodeId);
+	const eventBus = createLegionEventBus();
+	const dbEventSource = createDbEventSource(input.db);
+	dbEventSource.start(eventBus);
+	const postman = new LegionPostman({
+		db: input.db,
+		nodeId: input.nodeId,
+		supervisor: input.supervisor,
+		settings: input.settings,
+		eventBus,
+		sendRootMessage: (text) => notice(input.pi, text),
+		resumeChild: (node, mail) => resumeLegionChild({
+			pi: input.pi, supervisor: input.supervisor, db: input.db, dbPath: input.dbPath,
+			eventBus, settings: input.settings, cwd: input.cwd, storeRootDir: input.storeRootDir,
+			parentNodeId: input.nodeId, node, message: mail.text,
+		}),
+	});
+	const identity: LegionRuntimeIdentity = {
+		db: input.db,
+		dbPath: input.dbPath,
+		nodeId: input.nodeId,
+		runId: self?.runId ?? input.rootRunId,
+		rootRunId: input.rootRunId,
+		storeRootDir: input.storeRootDir,
+		settings: input.settings,
+		eventBus,
+		dbEventSource,
+		postman,
+		childNodeId: (name) => getChildByName(input.db, input.nodeId, name)?.id,
+	};
+	if (input.registerTools && input.nodeId !== "root") registerLegionTools(input.pi, { db: input.db, nodeId: input.nodeId, role: self?.role, settings: input.settings, cwd: input.cwd, eventBus, sendSelfMessage: (text) => notice(input.pi, text) });
+	postman.start();
+	return identity;
+}
+
+function resolveLegionIdentity(input: {
+	pi: ExtensionAPI;
+	supervisor: LegionSupervisor;
+	store: RunStore;
+	cwd: string;
+	settings: ReturnType<typeof loadSubagentSettings>;
+	cached?: LegionRuntimeIdentity;
+}): LegionRuntimeIdentity | undefined {
+	const dbPath = process.env[LEGION_DB_ENV];
+	const nodeId = process.env[LEGION_NODE_ID_ENV];
+	if (Boolean(dbPath) !== Boolean(nodeId)) throw new Error("PI_LEGION_DB and PI_LEGION_NODE_ID must be set together");
+	if (dbPath && nodeId) {
+		if (input.cached?.dbPath === dbPath && input.cached.nodeId === nodeId) return input.cached;
+		if (!path.isAbsolute(dbPath)) throw new Error("PI_LEGION_DB must be an absolute path");
+		const db = openLegionDb(dbPath);
+		const node = getNode(db, nodeId);
+		if (!node) { db.close(); throw new Error(`legion node not found: ${nodeId}`); }
+		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(dbPath)), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), registerTools: true });
+		if (node.role === "centurion") void resumeLegionTeam({ identity, input });
+		return identity;
+	}
+	if (input.cached?.nodeId === "root") return input.cached;
+	const root = input.store.listRuns().find((run) => run.nodeId === "root" || run.herdr.node_id === "root");
+	if (!root) return undefined;
+	const ledgerPath = path.join(input.store.runDir(root.runId), "legion.db");
+	if (!fs.existsSync(ledgerPath)) return undefined;
+	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db: openLegionDb(ledgerPath), dbPath: ledgerPath, nodeId: "root", rootRunId: root.runId, cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), registerTools: false });
+}
+
+async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input: { pi: ExtensionAPI; supervisor: LegionSupervisor; cwd: string } }): Promise<void> {
+	for (const node of getChildren(input.identity.db, input.identity.nodeId)) {
+		if (["settled", "failed"].includes(node.status) || ["done", "failed", "aborted"].includes(node.phase ?? "") || input.supervisor.isAlive(node.name)) continue;
+		try {
+			await resumeLegionChild({ pi: input.input.pi, supervisor: input.input.supervisor, db: input.identity.db, dbPath: input.identity.dbPath, eventBus: input.identity.eventBus, settings: input.identity.settings, cwd: input.input.cwd, storeRootDir: input.identity.storeRootDir, parentNodeId: input.identity.nodeId, node, message: `Resume from saved session ${node.sessionFile} and continue interrupted work.` });
+		} catch (error) { notice(input.input.pi, `Could not resume ${node.id}: ${error instanceof Error ? error.message : String(error)}`); }
+	}
+}
+
+function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; store: RunStore; cwd: string; task: string; settings: ReturnType<typeof loadSubagentSettings>; maxDepth: number }): LegionRuntimeIdentity {
+	const rootRun = input.store.createRun({ task: input.task, cwd: input.cwd, maxDepth: input.maxDepth, nodeId: "root", herdr: { supervisor: "rpc" } });
+	const dbPath = legionDbPath(input.store.runDir(rootRun.runId));
+	const db = openLegionDb(dbPath);
+	const now = Date.now();
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: rootRun.runId, status: "running", taskSummary: input.task.slice(0, 2_000), createdAt: now, updatedAt: now }, () => now);
+	appendEvent(db, "root", "node_launched", { runId: rootRun.runId, task: input.task }, { now: () => now });
+	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), registerTools: false });
+}
+
+async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; db: DatabaseSync; dbPath: string; eventBus: LegionEventBus; settings: LegionSettings; cwd: string; storeRootDir: string; parentNodeId: string; node: LegionNode; message: string }): Promise<void> {
+	const parent = getNode(input.db, input.parentNodeId);
+	if (!parent || !input.node.runId || !input.node.sessionFile) throw new Error(`resume credentials missing for ${input.node.id}`);
+	const store = new RunStore({ rootDir: input.storeRootDir });
+	const run = store.readRun(input.node.runId);
+	if (!run) throw new Error(`resume run.json not found: ${input.node.runId}`);
+	const saved = run.children.find((child) => child.nodeId === input.node.id || child.sessionFile === input.node.sessionFile);
+	if (!saved) throw new Error(`resume child record not found: ${input.node.id}`);
+	const cwd = parent.worktreePath ?? run.cwd ?? input.cwd;
+	const catalog = loadCatalog(cwd, cwd, undefined);
+	const agent = findControlAgent(catalog.agents, catalog.allAgents, input.node.role);
+	if (!agent) throw new Error(`resume role no longer exists: ${input.node.role}`);
+	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(run.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: catalog.team, childContext: catalog.settings.childContext, parentPath: run.path, legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, runId: run.runId, settings: input.settings, eventBus: input.eventBus } });
+	orchestrator.restore(run);
+	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
+	await store.updateChild(run.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
 export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {

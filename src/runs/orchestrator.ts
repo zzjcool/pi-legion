@@ -272,6 +272,32 @@ export class Orchestrator {
 		return fallback;
 	}
 
+	private allocateLegionName(agentName: string): string {
+		const legion = this.legion;
+		if (!legion) return this.allocateName(agentName);
+		const seen = this.nameCounter.get(agentName) ?? 0;
+		for (let index = seen; index < seen + 1_000; index += 1) {
+			const candidate = makeName(agentName, index);
+			if (this.children.has(candidate) || getChildByName(legion.db, legion.nodeId, candidate) || this.supervisor.isAlive(candidate)) continue;
+			this.nameCounter.set(agentName, index + 1);
+			return candidate;
+		}
+		throw new SubagentError(`could not allocate a unique child name for ${agentName}`, ErrorCodes.NAME_TAKEN);
+	}
+
+	private legionLocalName(name: string): string {
+		const prefix = `${this.legion?.nodeId}.`;
+		return sanitizeNodeSlug(name.startsWith(prefix) ? name.slice(prefix.length) : name);
+	}
+
+	private childFromNode(name: string, node: LegionNode): ChildRecord {
+		if (node.status === "settled" || node.status === "failed" || ["done", "failed", "aborted"].includes(node.phase ?? "")) {
+			throw new SubagentError(`legion child is terminal and cannot be resumed: ${node.id}`, ErrorCodes.BUDGET_EXCEEDED);
+		}
+		if (!node.sessionFile) throw new SubagentError(`legion child has no session to resume: ${node.id}`, ErrorCodes.NOT_FOUND);
+		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
+	}
+
 	budget(): { used: number; limit: number | null; remaining: number | null } {
 		return {
 			used: this.spawned,
