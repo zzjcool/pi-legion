@@ -298,6 +298,63 @@ export class Orchestrator {
 		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
 	}
 
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; team?: string; worktreePath?: string; model?: string }): LegionNode | null {
+		const legion = this.legion;
+		if (!legion) return null;
+		const parent = getNode(legion.db, legion.nodeId);
+		if (!parent) throw new SubagentError(`legion parent node not found: ${legion.nodeId}`, ErrorCodes.BUDGET_EXCEEDED);
+		const previous = getNode(legion.db, input.nodeId);
+		if (previous && (previous.status === "settled" || previous.status === "failed" || ["done", "failed", "aborted"].includes(previous.phase ?? ""))) {
+			throw new SubagentError(`legion child is terminal and cannot be resumed: ${input.nodeId}`, ErrorCodes.BUDGET_EXCEEDED);
+		}
+		const team = input.team ?? input.agent.extraFields?.team ?? this.team?.name;
+		const limits: LegionBudgetLimits = { maxDepth: legion.settings?.maxDepth ?? this.maxDepthValue, maxChildrenPerNode: legion.settings?.maxChildrenPerNode, maxActiveNodes: legion.settings?.maxActiveNodes };
+		const gate = withLaunchBudget(legion.db, { parentId: legion.nodeId, depth: parent.depth + 1, nodeId: input.nodeId }, () => {
+			if (previous) {
+				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team }, this.now);
+				return previous;
+			}
+			insertNode(legion.db, { id: input.nodeId, parentId: legion.nodeId, name: input.name, role: input.agent.name, kind: input.agent.kind, runId: legion.runId ?? null, sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? null, model: input.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, status: "starting", ...(input.agent.name === "centurion" ? { phase: "planning", phaseSince: this.now() } : {}), taskSummary: input.task.slice(0, 2_000) }, this.now);
+			return null;
+		}, { limits, now: this.now });
+		if (!gate.allowed) throw new SubagentError(`legion launch refused (${gate.decision.reason}): ${gate.decision.message}`, ErrorCodes.BUDGET_EXCEEDED);
+		return gate.value;
+	}
+
+	private recordLegionLaunch(child: ChildRecord, agent: AgentConfig, task: string, teamOverride: string | undefined, resumed: boolean): void {
+		if (!this.legion || !child.nodeId) return;
+		const team = teamOverride ?? agent.extraFields?.team ?? this.team?.name;
+		updateNode(this.legion.db, child.nodeId, { status: "running", sessionFile: child.sessionFile, worktreePath: child.worktreePath ?? null, model: child.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, taskSummary: task.slice(0, 2_000) }, this.now);
+		this.emitStored(child.nodeId, resumed ? "node_resumed" : "node_launched", { parentId: this.legion.nodeId, runId: this.legion.runId, sessionFile: child.sessionFile, role: agent.name, kind: agent.kind });
+	}
+
+	private recordSettled(child: ChildRecord, execution: Execution): void {
+		if (!this.legion || !child.nodeId || execution.status === "running") return;
+		const status = execution.status === "success" ? "settled" : "failed";
+		const current = getNode(this.legion.db, child.nodeId);
+		if (!current || current.status === status) return;
+		updateNode(this.legion.db, child.nodeId, { status }, this.now);
+		this.emitStored(child.nodeId, status === "settled" ? "node_settled" : "node_failed", { execution: execution.status, reason: execution.reason });
+		void this.supervisor.stats(child.name).then((usage) => {
+			if (usage) upsertUsage(this.legion!.db, { nodeId: child.nodeId!, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, costUsd: usage.costUsd }, this.now);
+		}).catch(() => {});
+	}
+
+	private emitProcess(type: LegionProcessEventType, nodeId: string, data: unknown): void {
+		this.legion?.eventBus?.emit({ nodeId, type, data: data as Record<string, unknown> | null, ts: this.now() });
+	}
+
+	private emitStored(nodeId: string, type: Parameters<typeof appendEvent>[2], data: unknown): void {
+		if (!this.legion) return;
+		this.legion.eventBus?.emit(appendEvent(this.legion.db, nodeId, type, data, { now: this.now }));
+	}
+
+	private rollbackReservation(nodeId: string, previous: LegionNode | null): void {
+		if (!this.legion) return;
+		if (!previous) { this.legion.db.prepare("DELETE FROM nodes WHERE id = ?").run(nodeId); return; }
+		updateNode(this.legion.db, nodeId, { status: previous.status, runId: previous.runId, sessionFile: previous.sessionFile, worktreePath: previous.worktreePath, model: previous.model, team: previous.team, taskSummary: previous.taskSummary }, this.now);
+	}
+
 	budget(): { used: number; limit: number | null; remaining: number | null } {
 		return {
 			used: this.spawned,
@@ -403,7 +460,6 @@ export class Orchestrator {
 					spawned = true;
 					break;
 				} catch (error) {
-					unsubscribeEvents();
 					lastError = error;
 					if (!canFallbackStart(error) || index === effectiveModel.length - 1) throw error;
 				}
