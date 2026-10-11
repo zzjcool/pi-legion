@@ -1,6 +1,6 @@
 {
   "name": "pi-legion",
-  "version": "0.16.0",
+  "version": "2.0.0",
   "description": "Herdr-backed subagents for Pi: visible, steerable, resumable child agents in Herdr panes",
   "type": "module",
   "license": "MIT",
