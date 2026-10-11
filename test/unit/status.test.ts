@@ -108,6 +108,17 @@ test("formatFooterStatus is empty when nothing is running", () => {
 	assert.equal(formatFooterStatus([]), undefined);
 	assert.equal(formatFooterStatus(entries.slice(0, 1)), "1 agent running");
 	assert.equal(formatFooterStatus(entries), "2 agents running");
+	const root: StatusEntry = {
+		name: "root",
+		nodeId: "root",
+		parentId: null,
+		depth: 0,
+		agent: "ceo",
+		state: "running",
+		startedAt: 0,
+	};
+	assert.equal(formatFooterStatus([root]), undefined, "the parent session itself is not an async child agent");
+	assert.equal(formatBusyLabel([root]), undefined);
 });
 
 test("formatBusyLabel matches the herdr overlay copy", () => {

@@ -47,7 +47,9 @@ export function formatElapsed(ms: number): string {
 }
 
 function activeEntries(entries: StatusEntry[]): StatusEntry[] {
-	return entries.filter((entry) => ACTIVE_STATES.has(entry.herdrStatus ?? entry.state));
+	return entries.filter((entry) =>
+		entry.parentId !== null && entry.depth !== 0 && ACTIVE_STATES.has(entry.herdrStatus ?? entry.state),
+	);
 }
 
 export function formatFooterStatus(entries: StatusEntry[]): string | undefined {
