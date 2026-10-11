@@ -306,6 +306,8 @@ function resolveLegionIdentity(input: {
 	settings: ReturnType<typeof loadSubagentSettings>;
 	eventBus: LegionEventBus;
 	cached?: LegionRuntimeIdentity;
+	/** This process's session file (identity credential). From ctx.sessionManager. */
+	sessionFile?: string | undefined;
 }): LegionRuntimeIdentity | undefined {
 	const dbPath = process.env[LEGION_DB_ENV];
 	const nodeId = process.env[LEGION_NODE_ID_ENV];
@@ -317,6 +319,21 @@ function resolveLegionIdentity(input: {
 		const db = openLegionDb(absoluteDbPath);
 		const node = getNode(db, nodeId);
 		if (!node) { db.close(); throw new Error(`legion node not found: ${nodeId}`); }
+		// Identity credential check: the node's recorded sessionFile must match
+		// THIS process's session. A child env (PI_LEGION_DB/PI_LEGION_NODE_ID)
+		// inherited by an arbitrary subprocess (e.g. a scout running `npm test`
+		// whose tests load this extension) must not adopt the scout's tree
+		// identity — that produced the "healthy ghost nodes" incident: fake
+		// launches persisted into the live ledger. A mismatch means the env
+		// belongs to an ancestor process, not to us; refuse to attach.
+		const mySession = input.sessionFile;
+		if (mySession && node.sessionFile && path.resolve(mySession) !== path.resolve(node.sessionFile)) {
+			db.close();
+			throw new Error(
+					`legion identity mismatch: node ${nodeId} belongs to session ${node.sessionFile}, ` +
+						`but this process runs ${mySession}; inherited PI_LEGION_* env is not yours to adopt`,
+			);
+		}
 		const nodeRuns = input.store.listRuns().filter((run) => run.nodeId === nodeId || run.herdr.node_id === nodeId);
 		let nodeRun = nodeRuns.at(-1);
 		if (!nodeRun) {
@@ -429,25 +446,27 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		legionIdentity.db.close();
 		legionIdentity = undefined;
 	};
-	const initializeLegionRuntime = (ctx: Pick<ExtensionContext, "cwd">): void => {
+	const initializeLegionRuntime = (ctx: Pick<ExtensionContext, "cwd"> & { sessionFile?: string }): void => {
 		const store = runStoreFor(ctx.cwd);
 		const settings = loadSubagentSettings({
 			userSettingsPath: path.join(getAgentDir(), "settings.json"),
 			projectSettingsPath: path.join(ctx.cwd, ".pi", "settings.json"),
 		});
-		const next = resolveLegionIdentity({ pi, supervisor, store, cwd: ctx.cwd, settings, eventBus: legionBus, cached: legionIdentity });
+		const next = resolveLegionIdentity({ pi, supervisor, store, cwd: ctx.cwd, settings, eventBus: legionBus, cached: legionIdentity, sessionFile: ctx.sessionFile });
 		if (legionIdentity && next !== legionIdentity) stopLegionRuntime();
 		legionIdentity = next;
 	};
 	if (isChild) {
 		registerChildGuard(pi);
 		if (process.env[LEGION_DB_ENV] && process.env[LEGION_NODE_ID_ENV]) {
+			// Boot-time attach: no ExtensionContext yet, so no session credential —
+			// the session_start handler re-runs this with the real credential.
 			try { initializeLegionRuntime({ cwd: process.cwd() }); }
 			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 		}
 	}
 	pi.on("session_start", (_event, ctx) => {
-		try { initializeLegionRuntime(ctx); }
+		try { initializeLegionRuntime({ cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile() }); }
 		catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 	});
 	if (isChild && !allowNested) {
@@ -629,7 +648,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 
 			let activeLegion: LegionRuntimeIdentity | undefined;
 			try {
-				activeLegion = resolveLegionIdentity({ pi, supervisor, store, cwd, settings, eventBus: legionBus, cached: legionIdentity });
+				activeLegion = resolveLegionIdentity({ pi, supervisor, store, cwd, settings, eventBus: legionBus, cached: legionIdentity, sessionFile: ctx.sessionManager?.getSessionFile() });
 				if (!activeLegion && action === "launch" && !isChild) {
 					const plan = buildPlan(params);
 					if (plan.ok) activeLegion = createRootLegion({ pi, supervisor, store, cwd, task: plan.task, settings, maxDepth: effectiveMaxDepth(settings.legion?.maxDepth), eventBus: legionBus });

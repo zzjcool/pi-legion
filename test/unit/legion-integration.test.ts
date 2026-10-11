@@ -1089,3 +1089,61 @@ test("session runtime reads PI_LEGION_DB events and cleans up its event source",
 		rmSync(cwd, { recursive: true, force: true });
 	}
 });
+
+test("a supervisor-injected extension never adopts a legion identity from inherited env", async () => {
+	// Regression (healthy ghost nodes): a scout running `npm test` in its
+	// worktree inherits PI_LEGION_DB/PI_LEGION_NODE_ID; the test's extension
+	// instance must not attach to the live tree and persist fake launches,
+	// no matter what env says. Explicit supervisor injection = test mode.
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-test-mode-"));
+	// Match the real layout: <root>/.pi-subagents/runs/<runId>/legion.db —
+	// runStoreFor() derives the store root from the db path (three dirname hops).
+	const dbPath = path.join(dir, ".pi-subagents", "runs", "r-ghost", "legion.db");
+	mkdirSync(path.dirname(dbPath), { recursive: true });
+	const db = openLegionDb(dbPath);
+	const now = Date.now();
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: "r-ghost", status: "running", createdAt: now, updatedAt: now }, () => now);
+	insertNode(db, { id: "root.scout-x", parentId: "root", name: "scout-x", role: "scout", kind: "pi", depth: 1, runId: "r-scout", status: "running", sessionFile: path.join(dir, "scout-x-session.jsonl"), createdAt: now, updatedAt: now }, () => now);
+	db.close();
+
+	const prevDb = process.env[LEGION_DB_ENV];
+	const prevNode = process.env[LEGION_NODE_ID_ENV];
+	process.env[LEGION_DB_ENV] = dbPath;
+	process.env[LEGION_NODE_ID_ENV] = "root.scout-x";
+	try {
+		const tools: Array<Record<string, unknown>> = [];
+		const handlers = new Map<string, (...args: unknown[]) => unknown>();
+		const pi = {
+			registerTool(tool: unknown) { tools.push(tool as Record<string, unknown>); },
+			registerMessageRenderer() {}, registerCommand() {}, sendMessage() {},
+			events: { emit() {} },
+			on(name: string, handler: (...args: unknown[]) => unknown) { handlers.set(name, handler); },
+		};
+		// Supervisor injection is what every unit test harness does.
+		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		const tool = tools.find((entry) => entry.name === "subagent") as { execute: (...args: unknown[]) => Promise<unknown> };
+		assert.ok(tool, "subagent tool registered");
+		// Launch through the injected fake: must NOT create legion ledger rows.
+		const result = (await tool.execute("t", { action: "launch", agent: "scout", task: "probe", async: true, worktree: false, cwd: dir }, undefined, undefined, {
+			cwd: dir, hasUI: false, ui: { notify() {}, setStatus() {} },
+			// Identity credential: this fake session differs from the scout-x node's
+			// recorded session, so attach must be refused even though env matches.
+			sessionManager: { getSessionFile: () => path.join(dir, "someone-elses.jsonl") },
+		} as never)) as { content?: Array<{ text?: string }> };
+		const text = result?.content?.[0]?.text ?? "";
+		// The credential check must refuse the inherited identity — the launch
+		// surfaces the refusal instead of adopting the scout's tree.
+		assert.match(text, /legion identity mismatch[\s\S]*not yours to adopt/, `attach must be refused with the credential error: ${text}`);
+		const check = openLegionDb(dbPath);
+		const rows = check.prepare("SELECT id FROM nodes ORDER BY id").all();
+		check.close();
+		assert.deepEqual(rows.map((r) => r.id), ["root", "root.scout-x"], "no ghost nodes may be persisted by a test-mode extension");
+		handlers.get("session_shutdown")?.();
+	} finally {
+		if (prevDb === undefined) delete process.env[LEGION_DB_ENV];
+		else process.env[LEGION_DB_ENV] = prevDb;
+		if (prevNode === undefined) delete process.env[LEGION_NODE_ID_ENV];
+		else process.env[LEGION_NODE_ID_ENV] = prevNode;
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
