@@ -7,7 +7,7 @@ allowNestedSubagents: true
 maxSubagentDepth: 2
 timeoutMs: 1800000
 worktree: true
-team: be-value
+# team: 可选默认队（须真实存在于 settings.teams）；省略 = 全 roster（REV-15）
 acceptance:
   level: verified
   role: writer
