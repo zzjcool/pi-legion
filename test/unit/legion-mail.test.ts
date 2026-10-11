@@ -86,6 +86,30 @@ test("mail broadcasts expand children and squad without duplicate or self delive
 	}
 });
 
+test("mail validates the 256-byte subject ceiling and kind whitelist", () => {
+	const db = makeTree();
+	try {
+		const maxSubject = sendMail(db, {
+			fromNode: "root.team-a", to: "alice", subject: "é".repeat(128), body: "ok",
+		});
+		assert.equal(maxSubject.ok, true, "exactly 256 UTF-8 bytes is allowed");
+
+		const oversized = sendMail(db, {
+			fromNode: "root.team-a", to: "alice", subject: "é".repeat(129), body: "must be refused",
+		});
+		assert.equal(oversized.ok, false);
+		if (!oversized.ok) assert.equal(oversized.code, "subject_too_large");
+
+		const invalidKind = sendMail(db, {
+			fromNode: "root.team-a", to: "alice", subject: "valid", body: "body", kind: "spoofed" as never,
+		});
+		assert.equal(invalidKind.ok, false);
+		if (!invalidKind.ok) assert.equal(invalidKind.code, "forbidden");
+	} finally {
+		db.close();
+	}
+});
+
 test("mail applies 4KB soft warning, 32KB hard rejection, and per-node rate limit", () => {
 	const db = makeTree();
 	try {

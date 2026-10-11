@@ -180,6 +180,9 @@ test("phase rework beyond the frozen limit forces failed and notifies the parent
 		assert.match(result.message, /exceeds limit 2/);
 		assert.equal(getNode(db, "root.team")?.phase, "failed");
 		assert.equal(getNode(db, "root.team")?.reworkCount, 3);
+		const parentMail = inbox(db, "root", { delivery: MAIL_DELIVERY.PENDING });
+		assert.equal(parentMail.length, 1, "rework exhaustion must queue a notice for the parent");
+		assert.match(parentMail[0]?.body ?? "", /exceeds limit 2/);
 	} finally {
 		db.close();
 		rmSync(rootDir, { recursive: true, force: true });
@@ -210,6 +213,38 @@ test("verification parser, command timeout runner seam, and persisted result pre
 		assert.equal(metadata.__piLegion?.taskSummary, "original task", "verification metadata must preserve the task summary");
 		assert.equal(readFileSync(result.outputFile, "utf8").includes("exit: 0"), true);
 	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("root orphan scan ignores normally retired nodes and live squads but reports a stale running orphan", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-orphan-scan-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const messages: string[] = [];
+	const now = 10_000;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const retired = insertNode(db, { parentId: "root", name: "retired-child", role: "worker", status: "retired" }, () => 1);
+		const orphan = insertNode(db, { parentId: "root", name: "lost-child", role: "worker", status: "running" }, () => 1);
+		const liveSquad = insertNode(db, { parentId: "root", name: "live-squad", role: "centurion", status: "running" }, () => 1);
+		const hostedStaleChild = insertNode(db, { parentId: liveSquad.id, name: "hosted-child", role: "worker", status: "running" }, () => 1);
+		const sessionFile = path.join(rootDir, "live-squad.jsonl");
+		await supervisor.spawnChild({ name: liveSquad.name, task: "active host", agent: agent("centurion"), sessionFile, tempDir: rootDir, cwd: rootDir });
+		const postman = new LegionPostman({
+			db, nodeId: "root", supervisor, settings: { orphanStaleMs: 100 },
+			now: () => now, sendRootMessage: (message) => messages.push(message), intervalMs: 10_000,
+		});
+		await postman.tick();
+		const orphanEvents = readEventsAfter(db, 0).filter((event) => event.type === "orphan_detected");
+		assert.deepEqual(orphanEvents.map((event) => event.nodeId), [orphan.id]);
+		assert.equal(messages.some((message) => message.includes(retired.id)), false);
+		assert.equal(messages.some((message) => message.includes(hostedStaleChild.id)), false, "an active host supervisor prevents a nested orphan report");
+		assert.equal(messages.some((message) => message.includes(orphan.id)), true);
+		postman.stop();
+	} finally {
+		await supervisor.retire("live-squad").catch(() => {});
 		db.close();
 		rmSync(rootDir, { recursive: true, force: true });
 	}

@@ -3,7 +3,7 @@
  *
  * Ported from pi-subagents: rank models by cost + name heuristics, then pick
  * three points on that ranking. Quota profiles sit lower; quality profiles sit
- * higher. Our five bundled roles map onto those three tiers.
+ * higher. Built-in writer roles map onto those three tiers.
  */
 
 export type ProfileKind = "quota" | "quality";
@@ -16,7 +16,7 @@ export type ClassificationSource = "official-metadata" | "heuristic-name";
 export const TIER_AGENTS = {
 	cheap: ["scout", "prototype"],
 	medium: ["planner"],
-	strong: ["worker", "reviewer", "designer"],
+	strong: ["worker", "reviewer", "designer", "centurion"],
 } as const;
 
 export type BuiltinProfileAgent =

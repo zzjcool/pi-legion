@@ -34,6 +34,7 @@ export const BUILTIN_AGENT_NAMES = [
 	"planner",
 	"reviewer",
 	"worker",
+	"centurion",
 	"advisor",
 	"designer",
 	"prototype",

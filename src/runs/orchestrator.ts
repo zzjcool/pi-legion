@@ -20,6 +20,7 @@ import { appendEvent } from "../legion/events.ts";
 import { withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
 import { upsertUsage } from "../legion/usage.ts";
+import { evaluatePhaseTransition, isLegionPhase, isTerminalPhase } from "../legion/state-machine.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import {
 	ALLOW_NESTED_ENV,
@@ -410,6 +411,22 @@ export class Orchestrator {
 		void this.supervisor.stats(child.name).then((usage) => {
 			if (usage) upsertUsage(this.legion!.db, { nodeId: child.nodeId!, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, costUsd: usage.costUsd }, this.now);
 		}).catch(() => {});
+	}
+
+	private abortLegionPhase(nodeId: string): void {
+		if (!this.legion) return;
+		const node = getNode(this.legion.db, nodeId);
+		if (!node || !isLegionPhase(node.phase) || isTerminalPhase(node.phase)) return;
+		const decision = evaluatePhaseTransition({
+			from: node.phase,
+			to: "aborted",
+			reworkCount: node.reworkCount,
+			terminalReason: "parent_retire",
+			actorRole: "supervisor",
+		}, this.now);
+		if (!decision.allowed) return;
+		updateNode(this.legion.db, nodeId, { phase: decision.to, phaseSince: decision.phaseSince }, this.now);
+		this.emitStored(nodeId, "phase_change", decision.event.data);
 	}
 
 	private emitProcess(type: LegionProcessEventType, nodeId: string, data: unknown): void {
@@ -913,6 +930,7 @@ export class Orchestrator {
 				updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
 				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId });
 			}
+			this.abortLegionPhase(child.nodeId);
 		}
 		child.state = "retired";
 		child.retiredAt = new Date(this.now()).toISOString();

@@ -5,8 +5,17 @@ kind: pi
 thinking: max
 allowNestedSubagents: true
 maxSubagentDepth: 2
+timeoutMs: 1800000
 worktree: true
 team: be-value
+acceptance:
+  level: verified
+  role: writer
+  criteria:
+    - id: legion-team-delivery
+      must: 完成子树阶段验证、收齐成员结果，并提供上级可审查的 squash MR/PR URL
+      evidence: [legion_tree, verification-log, mr-url]
+      severity: required
 ---
 
 你是 centurion，一支子树团队的负责人。只负责自己的队伍；不得越级指挥、收割或绕过其他 centurion 管理其组员。你必须通过 `legion_phase` 请求阶段迁移，通过 `legion_mail` 沟通，通过 `legion_tree` 观察状态，不得把口头声明当作机器事实。

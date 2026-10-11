@@ -3,6 +3,7 @@ import { withTransaction } from "./db.ts";
 import { appendEvent } from "./events.ts";
 import { getNode, getSubtree, sanitizeNodeSlug, type LegionNode } from "./nodes.ts";
 
+export const MAIL_SUBJECT_HARD_LIMIT_BYTES = 256;
 export const MAIL_BODY_SOFT_LIMIT_BYTES = 4 * 1024;
 export const MAIL_BODY_HARD_LIMIT_BYTES = 32 * 1024;
 export const DEFAULT_MAIL_RATE_PER_5_MIN = 10;
@@ -49,13 +50,14 @@ export interface MailSuccess {
 	ok: true;
 	messages: LegionMessage[];
 	recipients: string[];
+	subjectBytes: number;
 	bodyBytes: number;
 	warning?: string;
 }
 
 export interface MailDenied {
 	ok: false;
-	code: "forbidden" | "body_too_large" | "rate_limited" | "recipient_not_found";
+	code: "forbidden" | "subject_too_large" | "body_too_large" | "rate_limited" | "recipient_not_found";
 	message: string;
 	fromNode: string;
 	to?: string;
@@ -135,6 +137,15 @@ export function sendMail(
 	if (typeof input.subject !== "string" || input.subject.trim().length === 0) {
 		return { ok: false, code: "forbidden", message: "mail subject must not be empty", fromNode: input.fromNode };
 	}
+	const subjectBytes = Buffer.byteLength(input.subject, "utf8");
+	if (subjectBytes > MAIL_SUBJECT_HARD_LIMIT_BYTES) {
+		return {
+			ok: false,
+			code: "subject_too_large",
+			message: `mail subject is ${subjectBytes} bytes; hard limit is ${MAIL_SUBJECT_HARD_LIMIT_BYTES} bytes`,
+			fromNode: input.fromNode,
+		};
+	}
 	if (typeof input.body !== "string") {
 		return { ok: false, code: "forbidden", message: "mail body must be a string", fromNode: input.fromNode };
 	}
@@ -146,6 +157,9 @@ export function sendMail(
 			message: `mail body is ${bodyBytes} bytes; hard limit is ${MAIL_BODY_HARD_LIMIT_BYTES} bytes`,
 			fromNode: input.fromNode,
 		};
+	}
+	if (input.kind !== undefined && !isMailKind(input.kind)) {
+		return { ok: false, code: "forbidden", message: `invalid mail kind: ${String(input.kind)}`, fromNode: input.fromNode };
 	}
 	const urgency = input.urgency ?? "info";
 	if (urgency !== "info" && urgency !== "action-needed") {
@@ -206,6 +220,7 @@ export function sendMail(
 			ok: true,
 			messages,
 			recipients: messages.map((message) => message.toNode),
+			subjectBytes,
 			bodyBytes,
 			...(warning ? { warning } : {}),
 		};
@@ -296,6 +311,10 @@ export class InvalidDeliveryTransitionError extends Error {
 		super(`mail delivery cannot transition from ${current} to ${next}`);
 		this.name = "InvalidDeliveryTransitionError";
 	}
+}
+
+function isMailKind(value: unknown): value is MailKind {
+	return value === "question" || value === "report" || value === "handoff" || value === "notice";
 }
 
 function resolveRecipient(

@@ -10,6 +10,7 @@ import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "../../src/runs/args.ts";
 import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
 import { readEventsAfter } from "../../src/legion/events.ts";
+import { inbox, MAIL_DELIVERY, sendMail } from "../../src/legion/mail.ts";
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import { getUsage } from "../../src/legion/usage.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
@@ -254,6 +255,7 @@ test("centurion resume recovers a running child and does not revive a settled ch
 		herdrSubagents(pi as never, { supervisor });
 		assert.ok(tools.has("legion_mail"));
 		assert.ok(tools.has("legion_tree"));
+		assert.ok(tools.has("legion_phase"), "a resumed centurion keeps the phase-transition tool");
 		for (let attempt = 0; attempt < 20 && supervisor.spawns.length === 0; attempt += 1) {
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
@@ -276,6 +278,55 @@ test("centurion resume recovers a running child and does not revive a settled ch
 		}
 		db.close();
 		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("retireAll marks an unfinished squad aborted and queued mail cannot revive it", async () => {
+	const fx = fixture();
+	const name = "centurion";
+	const sessionFile = fx.runStore.sessionFileFor(fx.rootRun.runId, name);
+	const centurion = insertNode(fx.db, {
+		parentId: "root", name, role: "centurion", runId: fx.rootRun.runId,
+		sessionFile, status: "running", phase: "implementing",
+	});
+	await fx.runStore.addChild(fx.rootRun.runId, {
+		name, nodeId: centurion.id, sessionFile, ownerToken: "centurion-token",
+		state: "working", spawnedAt: fx.rootRun.createdAt, agent: name, kind: "pi",
+	});
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	await supervisor.spawnChild({ name, task: "unfinished squad", agent: agent(name), sessionFile, tempDir: fx.runStore.runDir(fx.rootRun.runId), cwd: fx.rootDir });
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir: fx.runStore.runDir(fx.rootRun.runId),
+		cwd: fx.rootDir,
+		maxDepth: 4,
+		legion: fx.context,
+	});
+	orchestrator.restore(fx.runStore.readRun(fx.rootRun.runId)!);
+	try {
+		await orchestrator.retireAll();
+		assert.equal(getNode(fx.db, centurion.id)?.phase, "aborted");
+		assert.ok(readEventsAfter(fx.db, 0).some((event) => event.nodeId === centurion.id && event.type === "phase_change" && (event.data as { to?: string } | null)?.to === "aborted"));
+
+		const mail = sendMail(fx.db, { fromNode: "root", to: centurion.id, subject: "late task", body: "resume the old squad" });
+		assert.equal(mail.ok, true);
+		assert.ok(mail.ok);
+		const resumed: string[] = [];
+		const postman = new LegionPostman({
+			db: fx.db,
+			nodeId: "root",
+			supervisor,
+			resumeChild: async (node) => { resumed.push(node.id); },
+			intervalMs: 10_000,
+		});
+		await postman.tick();
+		assert.deepEqual(resumed, [], "an upper-level retire is deliberate and cannot be undone by mail");
+		assert.equal(inbox(fx.db, centurion.id, { delivery: MAIL_DELIVERY.BOUNCED }).length, 1);
+		assert.equal(supervisor.isAlive(name), false);
+		postman.stop();
+	} finally {
+		await supervisor.retire(name).catch(() => {});
+		fx.cleanup();
 	}
 });
 

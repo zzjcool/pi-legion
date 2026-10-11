@@ -402,6 +402,8 @@ test("discovery: bundled roles are present by default", () => {
 		}
 		const scout = res.agents.find((a) => a.name === "scout");
 		assert.equal(scout?.source, "builtin");
+		const centurion = res.agents.find((a) => a.name === "centurion");
+		assert.equal(centurion?.source, "builtin");
 	});
 });
 
@@ -681,6 +683,10 @@ test("formatAgentRoster lists user roles so the parent can pick search without l
 	assert.match(roster, /- search \[user\] \(kind=cursor, model=auto\)/);
 	assert.match(roster, /- worker \[builtin\] — 实现者/);
 	assert.doesNotMatch(roster, /kind=pi/);
+});
+
+test("formatAgentRoster includes the bundled centurion role", () => {
+	assert.match(formatAgentRoster(loadBundledAgents()), /- centurion \[builtin\]/);
 });
 
 test("every bundled role ships a non-empty system prompt", () => {

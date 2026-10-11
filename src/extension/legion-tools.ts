@@ -232,7 +232,7 @@ export class LegionPostman {
 	private scanOrphans(timestamp: number): void {
 		const staleMs = this.settings.orphanStaleMs ?? DEFAULT_ORPHAN_STALE_MS;
 		const nodes = listStaleNodes(this.db, timestamp - staleMs)
-			.filter((node) => !isTerminalNode(node))
+			.filter((node) => !isTerminalNode(node) && (node.status === "starting" || node.status === "running" || node.status === "blocked"))
 			.sort((a, b) => a.depth - b.depth || a.id.localeCompare(b.id));
 		const reported = new Set<string>();
 		for (const node of nodes) {
