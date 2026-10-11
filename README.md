@@ -1,715 +1,213 @@
 ---
 name: pi-legion
 npm: "pi-legion"
-description: "Delegate work to child Pi agents running in Herdr panes: visible, steerable, resumable, with accurate success/failure accounting. Use when a task would benefit from parallel workers, fresh-context adversarial review, or long-running background subtasks that must survive the parent. Do not use for trivial single-file edits, running tests, or answering simple questions."
+description: "Pi Legion v2: recursive centurion trees on headless Pi RPC; shared SQLite WAL legion.db. Four-stage planning/implementing/reviewing/verifying state machine, parent/child/sibling legion_mail, three-layer /legion UI, upward MR trees, squad resume."
 ---
 
 # pi-legion
 
-A [Pi](https://github.com/badlogic/pi-mono) extension that delegates work to
-**child Pi agents in [Herdr](https://herdr.dev) panes**.
-
-A herdr subagent is a **supervised live process**, not a one-shot function call.
-It stays resident across turns, can be steered mid-flight, resumed after its
-pane is gone, and stays visible to you. The parent session never has to invent
-`herdr pane split` / `herdr agent start` — one `subagent` tool call is the
-whole launch path.
+A Pi extension for building recursive, resumable agent teams. A `centurion`
+leads each squad; Pi RPC runs its children as headless processes, while a
+shared SQLite ledger records the whole tree.
 
 > **Name note.** This package was formerly published as
-> `@zzjcool/pi-herdr-subagents` (through 0.14.3; renamed after an npm
-> name collision) and then as `pi-herdr-swarm` (0.15.0; retired when the
-> name stopped matching the architecture — this is a command tree, not a
-> swarm). It is now `pi-legion`, first published as 0.16.0 (continuing
-> the version line). To migrate: `pi uninstall` the old package, then
-> `pi install npm:pi-legion`.
+> `@zzjcool/pi-herdr-subagents` (through 0.14.3; renamed after an npm name
+> collision), then as `pi-herdr-swarm` (0.15.0), before becoming `pi-legion`
+> in 0.16.0. **2.0.0: the legion era — recursive centurion tree on pi RPC transport; herdr pane execution archived to legacy**
 
 ## Contents
 
-- [Requirements](#requirements)
-- [Install](#install)
-- [What the plugin does for you](#what-the-plugin-does-for-you)
+- [Architecture](#architecture)
 - [Quick start](#quick-start)
-- [Tool reference](#tool-reference)
-- [Bundled roles](#bundled-roles)
-- [Presets (kind+model+thinking)](#presets-kindmodelthinking)
-- [Model profiles (cheap / medium / strong)](#model-profiles-cheap--medium--strong)
-- [Settings](#settings)
-- [Master switch](#master-switch)
-- [Teams](#teams)
-- [Custom agents](#custom-agents)
-- [Isolation](#isolation)
-- [Success and failure](#success-and-failure)
-- [Programmatic API](#programmatic-api)
+- [Legion tools and phases](#legion-tools-and-phases)
+- [Three-layer visualization](#three-layer-visualization)
+- [Settings and budget gates](#settings-and-budget-gates)
+- [Delivery and resume](#delivery-and-resume)
+- [Herdr transition and role migration](#herdr-transition-and-role-migration)
 - [Development](#development)
-- [Known limitations](#known-limitations)
 
-## Requirements
+## Architecture
 
-- **Pi** (the coding agent that loads this package as an extension)
-- **Herdr**, with the parent session running **inside** a Herdr pane
-  (`HERDR_ENV=1`). The plugin talks to herdr to create tabs/panes and start
-  child agents; it will not launch anything from a plain terminal Pi.
-- Node.js 22+ if you are developing the package itself
+```text
+User (CEO) — root Pi session (TUI)
+├─ pi-legion extension
+│  ├─ LegionSupervisor (root)
+│  │  ├─ RpcClient × N → headless `pi --mode rpc` child processes
+│  │  ├─ mail postman (inbox delivery) + four-phase state machine
+│  │  └─ orphan scan + child lifecycle / usage accounting
+│  ├─ `legion.db` (one shared SQLite/WAL tree ledger)
+│  └─ LegionEventBus → resident tree | `/legion` full view | live overlay
+└─ centurion child (RpcClient; cwd = its subtree worktree)
+   └─ pi-legion in child mode
+      ├─ LegionSupervisor for this squad
+      ├─ `legion_mail` / `legion_tree` / `legion_phase` tools
+      ├─ worker / scout / reviewer … children (`worktree: false`)
+      └─ nested centurions → recursive squads
+```
 
-You do **not** need to run `test "$HERDR_ENV" = 1` or `herdr --help` yourself.
-The parent model must not either — the plugin blocks that ritual and checks
-herdr on every launch.
+Transport, state, decision-making, and display are separate layers:
 
-## Install
+- **Transport:** each child is a headless Pi RPC process managed by a
+  `LegionSupervisor`; a centurion can supervise another squad recursively.
+- **State:** all nodes in the tree share the `legion.db` SQLite ledger in WAL
+  mode. Per-run `run.json` records and session files remain the resume source
+  for each child.
+- **Decision:** centurions and squad members do the LLM work. The supervisor
+  owns machine state and validates phase transitions.
+- **Display:** the event bus feeds the resident tree, the `/legion` full view,
+  and an on-demand live overlay.
+
+## Quick start
+
+Install and load the extension in Pi:
 
 ```bash
 pi install npm:pi-legion
 ```
 
-From git (picks up commits that are not on npm yet):
-
-```bash
-pi install git:github.com/zzjcool/pi-legion
-```
-
-From a local checkout:
-
-```bash
-pi install /path/to/pi-legion
-```
-
-Then **reload the parent session** (`/reload`, or restart Pi). After install,
-seven roles (`scout`, `planner`, `worker`, `reviewer`, `advisor`, `designer`,
-`prototype`) are available
-with no extra files to copy — see [Bundled roles](#bundled-roles).
-
-To update a git install: `pi update`. To switch from a path/git install to npm
-once a release is published, remove the old package and `pi install npm:pi-legion`.
-
-## What the plugin does for you
-
-These used to be “please remember this in the prompt.” They are now
-**scripts**. Neither the parent model nor the child has to cooperate for them
-to hold.
-
-| Concern | What happens |
-| --- | --- |
-| Launch | One `subagent` call creates the type tab, splits a pane, starts `pi`, and begins watching. Same agent type shares one tab (each child is a pane). |
-| Status | Running children are painted **above the parent input** with model (`:thinking` when set), kind (if not `pi`), turn / in-flight tool, and worktree branch. Elapsed time keeps ticking after the tool call returns. Non-pi kinds (cursor, claude, …) fill the same slots from `agent get` labels / pane title when jsonl is absent. |
-| Completion | When a turn finishes, the plugin injects `Background task completed: **name**` into the parent. If the parent is idle it wakes immediately; if it is still in a tool loop, the notice waits (`followUp`) instead of steering mid-turn. Every finish is shown in the transcript: a completed child renders as one truncated row (`✓ name · success · acceptance · size`, clamped to the live pane width), failures/stops keep the full block, and `ctrl+o` expands a collapsed row. |
-| Recycle | Terminal children get `ctrl+d`, then pane close (and the type tab when it is empty). You do not `retire` or close panes. `blocked` is the exception — the pane stays. |
-| Child must not ping the parent | Every child Pi loads a **child-guard** extension. `herdr agent prompt/wait/send-keys/start`, pane split, tab create/close, and reading someone else’s pane are blocked. |
-| Task-card boilerplate | A frozen appendix is appended to every child task: no wakeup, no nested agents, end with `{"ok": true\|false, "reason": "..."}`. |
-| Read-only roles | `acceptance.role: read-only` (scout, reviewer, …) may still have `bash` for `rg` / `git log` / `ls`, but writes (`rm`, `git commit`, `echo > file`, `npm install`, `sed -i`, …) are blocked. |
-| Acceptance | `{"ok": true}` is only **attested**. If a required criterion lists `evidence: [verification-output]` **and** carries an explicit `command`, collect then runs that command in the child’s cwd and promotes the result to **verified** or rejects it. Without a `command` the result stays attested with the criterion surfaced as pending — the parent confirms it from the child’s pasted output; nothing is guessed. |
-| Tool approval (`blocked`) | `onBlocked: auto-approve` (**default**; a subagent pane has no human, so an approval dialog is a deadlock) silently approves a blocked child via `send-keys y` and keeps watching. `forward` pops a **confirm** in the parent TUI (Yes → `send-keys y`, No → deny; no TUI → a notify is queued). `notify` only notifies. The default is also what cursor children launch with: `--force` (Run Everything) unless the agent sets `forward`/`notify` — set `subagents.defaultOnBlocked` in settings.json to change the default globally. |
-| Late `collect` / `retire` | If watch already collected, `collect` returns the cached snapshot. If the pane is already gone, `retire` is a no-op that points at the session file. |
-
-What is still a **judgment** (and must stay one):
-
-- whether to spawn a child, which role, and what the task should say
-- what to do with the completion (accept, `steer`, `continue`, ignore)
-- whether a semantic checklist item like “no secrets in the diff” actually holds
-
-## Quick start
-
-Use the `subagent` tool. **Do not run herdr CLI or env checks first.** Do not
-tell the child to prompt the parent.
+Ask a `centurion` to lead a recursive squad, with a goal and concrete
+acceptance checklist in its task:
 
 ```text
 subagent({
-  agent: "reviewer",
-  task: "Review src/foo.ts for regressions. Write findings to /tmp/review.md."
+  agent: "centurion",
+  task: "Goal: implement the account export flow. Acceptance: contract is recorded; implementation is reviewed; the verification commands pass; return a squash MR and verdict."
 })
 ```
 
-The frozen appendix (verdict JSON, no wakeup) is added automatically. You can
-still write a detailed task card; just do not include “when done, `herdr agent
-prompt` the parent.” Isolation is the parent’s call:
+The centurion plans the work, writes the squad contract, dispatches ordinary
+roles such as `worker`, `scout`, and `reviewer`, and coordinates the squad
+through its phases. For a single leaf task, dispatch an ordinary role directly:
 
 ```text
-subagent({ agent: "worker", task: "<implement>", worktree: true })   // own branch, child opens MR
-subagent({ agent: "worker", task: "<hotfix>", worktree: false })     // edit this checkout
+subagent({ agent: "scout", task: "Map the export code path and report relevant files and risks." })
 ```
 
-Parallel fan-out — one tool call, then return control:
+No manual child-process launch is needed. Use `/legion` to inspect the tree;
+see [Three-layer visualization](#three-layer-visualization) for navigation.
+
+## Legion tools and phases
+
+Child nodes receive these tree-aware tools:
 
 ```text
-subagent({ tasks: [
-  { agent: "worker", task: "<task A>" },
-  { agent: "worker", task: "<task B>" },
-  { agent: "reviewer", task: "<task C>" },
-] })
+legion_mail({ to, subject, body, kind?, urgency? })
+legion_tree({ scope?: "children" | "squad" | "subtree" | "tree", depth? })
+legion_phase({ to, note?, evidence? })
 ```
 
-Steer a running agent (current task abandoned, context kept):
+- **`legion_mail`** sends asynchronous messages over permitted tree edges:
+  parent, children, or same-parent siblings. `to` may be a short name, node ID,
+  `parent`, `children`, or `squad`. Cross-squad direct mail and bypassing the
+  parent are refused; route cross-squad requests through the relevant
+  centurions. Keep large artifacts in the shared worktree and mail a file
+  pointer. The body has a 4 KB soft limit and a 32 KB hard limit.
+- **`legion_tree`** is a read-only view of machine-recorded node state. It does
+  not interrupt the nodes being observed.
+- **`legion_phase`** is available to centurions. It requests a state transition;
+  the supervisor checks the transition's invariants and records the result.
 
-```text
-subagent({ action: "steer", name: "reviewer-0", message: "Stop the API review; focus on the migration script instead." })
-```
+A squad moves through **planning → implementing → reviewing → verifying**.
+Planning produces a non-empty `.pi-legion/contract.md` with file ownership
+and acceptance commands. During reviewing, an independent reviewer supplies
+the judgment; in verifying, the supervisor runs the contract's `legion-verify`
+commands without an LLM. Passing verification advances the squad to `done`.
 
-Pass `async: false` only when **this turn** must have the result before it
-ends. The default is async: launch, return control, get a completion later.
+## Three-layer visualization
 
-## Tool reference
+1. **Resident tree panel:** stays visible in the Pi session, with deeper levels
+   folded by default so the whole tree remains scannable.
+2. **`/legion` full tree:** navigate with `j`/`k` or arrow keys; Enter/Space
+   expands or collapses a node; `/` searches; PageUp/PageDown scroll; `q` or
+   Esc closes the view.
+3. **Live overlay:** press `o` on the selected node, use a component-routed
+   mouse click in the full tree, or open it directly with `/legion <name>`.
+   The overlay subscribes to that node's live feed only while open; Esc closes
+   it and unsubscribes. OSC 8 links are visual anchors only, not overlay links.
 
-| `action` | Purpose |
-| --- | --- |
-| *(omitted)* / `launch` | Start one child (`agent` + `task`) or several (`tasks[]`) |
-| `steer` | Prompt a live child; it drops the current turn and takes the new message |
-| `continue` | Prompt a live child without abandoning the current turn |
-| `resume` | Relaunch from the session file if the pane is already gone |
-| `status` | Show the persisted record (state, pane, session path, last execution) |
-| `collect` | Wait for the current turn (or return the cache if watch already did) |
-| `list` | Roles the parent can spawn, with provenance (`builtin` / `user` / `project`) |
-| `retire` | Close the pane. After auto-recycle this is a documented no-op |
+## Settings and budget gates
 
-Useful launch fields: `model`, `preset`, `cwd`, `placement` (`split-down` / `split-right` /
-`new-tab`), `worktree` (`true` = isolated branch + child opens an MR; `false` =
-edit the current checkout; omit = role default), `agentScope` (`user` /
-`project` / `both`), `async`.
-
-Handles look like `reviewer-0`. Every loaded role (builtin plus
-`~/.pi/agent/agents` and project `.pi/agents`) is injected into the parent
-system prompt each turn — that is how the model knows to call `search` without
-`action=list` first. `status` / `collect` take `name`.
-
-## Bundled roles
-
-Five role definitions ship inside the package and load with **zero setup**.
-They are anchored to the package itself (not to `~/.pi/agent/agents`), because
-Pi’s package resource conventions have no `agents/` slot — a manifest entry
-alone would be silently ignored.
-
-| Role | Purpose | Acceptance |
-| --- | --- | --- |
-| `scout` | Read-only reconnaissance: map code, conventions, environment. Facts only. | attested, **read-only** bash |
-| `planner` | Turn a task into a parallelisable, verifiable plan; freeze interfaces. | attested |
-| `worker` | Implement a frozen plan on an isolated worktree; open an MR; run tests; self-report a verdict. | **verified** via the project’s own verifier |
-| `reviewer` | Read-only adversarial review; findings with path + severity. | attested, **read-only** bash |
-| `advisor` | Decision counsel and final arbitration on contested options (A-vs-B rulings). Grok via cursor. | attested |
-| `designer` | Front-end UI/visual/interaction design: design tokens, full-state matrices, and the component implementation. UI layer only — business logic stays with `worker`. | **verified** via build |
-| `prototype` | Single-file clickable HTML prototypes to validate an interaction flow before real implementation. | attested, writer |
-
-Bundled roles do **not** pin a vendor model. A child uses the parent session’s
-model unless you set `subagents.defaultModel`,
-`subagents.agentOverrides.<name>.model`, assign a named
-[preset](#presets-kindmodelthinking), pass `model` on the tool call, or
-[load a model profile](#model-profiles-cheap--medium--strong).
-
-## Presets (kind+model+thinking)
-
-Named bundles in settings, referenced from agent frontmatter (`preset: strong`),
-from `agentOverrides.<name>.preset`, or from the tool’s `preset` param (single
-launch and `tasks[]` both accept it):
+Add the v2 `legion` block to `~/.pi/agent/settings.json` or the project
+`.pi/settings.json`, merging it with any existing `subagents` keys:
 
 ```json
 {
   "subagents": {
-    "presets": {
-      "cheap":  { "kind": "pi", "model": "cb/deepseek-v4.1-flash", "thinking": "low" },
-      "coder":  { "kind": "pi", "model": "cb/deepseek-v4.1-flash", "thinking": "max" },
-      "medium": { "kind": "pi", "model": "cb/glm-5.3", "thinking": "high" },
-      "strong": { "kind": "pi", "model": "cb/kimi-k3", "thinking": "max" },
-      "strongest": { "kind": "cursor", "model": "grok-4.6", "thinking": "xhigh" }
-    }
-  }
-}
-```
-
-One calibrated mapping (2026-09 snapshot — re-verify against current
-benchmarks before adopting) aligns each role with what its model is measured
-best at, not with price-tier folklore: cheap flash for scouting, a coder-tier
-flash for implementation (same-card benchmarks had it out-coding flagships at
-1/20 the price), a reasoning-strong model for adversarial review, and grok for
-decision arbitration.
-
-Model precedence, strongest first:
-
-```text
-per-run tool `model`            (beats the preset's MODEL, but the preset's KIND still applies)
-→ preset kind / model / thinking
-→ agentOverridesByProvider.<provider>.<name>
-→ agentOverrides.<name>
-→ agent frontmatter `model`
-→ subagents.defaultModel
-→ the dispatching (parent) session model
-```
-
-A preset deliberately beats `agentOverrides` — that is the point of the level:
-profiles pin roles via `agentOverrides` (`loadCatalog` folds them into
-`agent.model` before anything resolves), so a frontmatter-adjacent preset would
-be unreachable. Two guarantees:
-
-- **Atomic.** The preset's `kind` and the model the child is *actually launched
-  with* are checked together. Whichever level supplied the model — the preset
-  itself, a per-run tool `model`, `agentOverrides`, `defaultModel`, the parent
-  session — a pair the kind cannot accept is refused loudly instead of being
-  silently dropped at start (`kind: cursor` with a pi-shaped `provider/id` is
-  the canonical case).
-- **Loud.** Referencing an undefined preset is an error naming the defined
-  presets — never a silent fallback to the parent model.
-
-Agents with no `preset` resolve exactly as before.
-
-Precedence, lowest to highest — later layers override earlier ones by name:
-
-```text
-builtin (shipped)  <  extra dirs  <  ~/.pi/agent/agents  <  <project>/.pi/agents
-```
-
-Shadow any bundled role by putting a same-name `*.md` in `~/.pi/agent/agents`
-or `<repo>/.pi/agents`.
-
-- `subagents.disableBuiltins: true` drops the bundled layer entirely.
-- `PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS` (PATH-style) injects extra read-only
-  role directories — Nix store, container, read-only mount.
-- `subagent({ action: "list" })` shows every role with its provenance tag.
-
-## Model profiles (cheap / medium / strong)
-
-Same workflow as pi-subagents: classify a provider’s models into three
-capability tiers, then bind roles to those tiers so you do not have to change
-the parent session model every time.
-
-| Tier | Roles |
-| --- | --- |
-| cheap | `scout`, `prototype` |
-| medium | `planner` |
-| strong | `worker`, `reviewer`, `designer` |
-
-(`advisor` is cursor-kind and carries its own model, so it never takes a pi-tier override.)
-
-```text
-/subagents-refresh-provider-models <provider>
-/subagents-generate-profiles <provider>
-/subagents-load-profile <provider>.quota
-```
-
-That writes two profiles (`<provider>.quota` leans cheaper,
-`<provider>.quality` leans stronger) under
-`~/.pi/agent/profiles/pi-legion/` and, on load, copies
-`agentOverrides` into `~/.pi/agent/settings.json`. Project `.pi/settings.json`
-still wins on overlapping keys.
-
-Other commands: `/subagents-profiles` lists saved profiles;
-`/subagents-check-profile <name>` re-checks each assigned model against the
-current registry (and a live probe unless you pass `--no-probe`). Refresh and
-generate accept `--force` and `--no-probe`.
-
-`/subagents-agents [user|project|both]` lists the roles available to the
-`subagent` tool in the CURRENT session — the human-facing version of the
-roster injected into the model's system prompt, plus what a launch would
-actually resolve:
-
-```text
-builtin (7)
-  advisor
-    决策顾问：……
-    kind=cursor · alias: ask, consult, oracle · model: (agent CLI default)
-    file: /pkg/agents/advisor.md
-  scout
-    侦察员：……
-    model: cb/glm-5.3 (agentOverrides)
-    file: ~/.pi/agent/agents/scout.md
-project (1)
-  deploy
-    deploys things
-    model: cb/kimi-k3 (the parent session model)
-    file: <repo>/.pi/agents/deploy.md
-
-Directories
-  builtin: /pkg/agents
-  user: ~/.pi/agent/agents
-  project: /repo/.pi/agents
-```
-
-Each role shows its layer (`builtin` / `user` / `project`), the model a launch
-would actually resolve — with the same provenance labels and refusal checks
-the launch path uses (`the agent's frontmatter`, `agentOverrides`, `the
-preset`, `the parent session model`, …; `✗ outside model scope`, `✗ cannot
-be used with kind 'cursor'`, or `dropped at launch` for a model the target
-CLI cannot express) — plus kind, aliases, and the definition file, so a role
-that is not doing what you expect can be traced to the exact file that
-defines it in one step. The optional scope argument mirrors the tool's
-`agentScope` (`user` by default; `project` skips the user layers, the bundled
-roles always load); it re-reads agent files on every invocation, so edits
-show up immediately.
-
-`/subagents-summary` renders a Markdown table of the current parent pane's
-subagent runs, including role outcomes, turns, token usage, cost, and cumulative
-agent-time. Use `/subagents-summary --all` to include runs from every parent
-pane in the current working directory, or `/subagents-summary <name>` for one
-child's detailed state, timing, usage, and session path. Child names are
-available through command completion.
-
-you can still hand-write the same mapping:
-
-```json
-{
-  "subagents": {
-    "agentOverrides": {
-      "scout": { "model": "your-provider/fast-model" },
-      "planner": { "model": "your-provider/mid-model" },
-      "worker": { "model": "your-provider/strong-coder" },
-      "reviewer": { "model": "your-provider/strong-reasoner" },
-      "designer": { "model": "your-provider/strong-model" }
-    }
-  }
-}
-```
-
-## Master switch
-
-Two levels, both temporary-by-design:
-
-- **Session** — `/subagents-toggle` flips the switch for the current session
-  only. No files change; `/reload` restores whatever the settings say.
-  `/subagents-toggle` (no args) shows the current state; `on`/`off` are
-  explicit; the status line also warns how many children are still running.
-- **Project / user settings** — `"subagents": { "enabled": false }` in
-  `<repo>/.pi/settings.json` (project wins over `~/.pi/agent/settings.json`)
-  persists the off state across sessions.
-
-While disabled:
-
-- New launches are refused with a pointer to `/subagents-toggle on`.
-- The system-prompt roster/playbook injection stops (next turn), so the model
-  is not coached toward a tool that refuses.
-- The bash guard stops blocking manual `herdr` commands — you are free to
-  drive herdr by hand.
-- **Existing children are untouched**: they keep running and notify normally,
-  and `status`/`collect`/`wait`/`resume`/`steer` keep working, so a disable
-  mid-flight stays observable.
-
-## Settings
-
-Read from `~/.pi/agent/settings.json` (user) and `<project>/.pi/settings.json`
-(project). Project wins on overlap.
-
-> **herdr sidebar**: while async children are live, the parent pane is annotated
-> `idle=⏳ N subagents (…)` via `pane report-metadata --state-label` (TTL'd, self
-> clearing). herdr's own integration reports the parent `idle` the moment its
-> turn settles — the label is the visible "waiting on subagents" cue in the
-> sidebar. No setting; automatic when running inside herdr.
-
-```json
-{
-  "subagents": {
-    "defaultModel": "provider/id",
-    "defaultOnBlocked": "auto-approve",
-    "team": "frontend",
-    "teams": {
-      "frontend": {
-        "description": "UI work",
-        "members": ["designer", "prototype", { "agent": "worker", "model": "provider/strong" }]
-      }
-    },
-    "disableBuiltins": false,
-    "maxSubagentSpawnsPerSession": 8,
-    "agentOverrides": {
-      "worker": { "model": "provider/id", "thinking": "medium" }
-    },
-    "agentOverridesByProvider": {
-      "cb": { "worker": { "model": "cb/glm-5.3" } }
-    },
-    "modelScope": { "allow": ["cb/*", "openai/*"] },
-    "herdr": {
-      "defaultPlacement": "split-down",
-      "maxConcurrentAgents": 6,
-      "startRetries": 40,
-      "startRetryBackoffMs": 150,
-      "sessionRetentionDays": 7
-    }
-  }
-}
-```
-
-| Key | Meaning |
-| --- | --- |
-| `defaultModel` | Fallback model for roles that do not pin one |
-| `defaultOnBlocked` | Fallback `onBlocked` for roles that do not set one (default `auto-approve`; `forward` restores a human confirm in the parent TUI) |
-| `team` | Project/user-selected team name; `PI_SUBAGENTS_TEAM` takes precedence |
-| `teams` | Named role lists; project entries with the same name replace the user entry |
-| `presets` | Named kind+model+thinking bundles, referenced via `preset:` — they beat `agentOverrides`, lose to the tool `model` |
-| `agentOverrides` | Per-role field overlay (`model`, `thinking`, `preset`, `tools`, `disabled`, …) |
-| `agentOverridesByProvider` | Same overlay, keyed by the **parent** provider id |
-| `enabled` | Master switch: `false` disables launches, roster injection, and the bash guard (see [Master switch](#master-switch)) |
-| `parentContext` | Extra parent-side context appended after the playbook + roster every turn. Inline markdown or `@path` file reference(s) (string or array); if omitted, uses the same-directory `subagents-parent-context.md` convention file |
-| `childContext` | Extra context injected into every child's system prompt (pi: appended after the role prompt; cursor and other kinds: rides along in the task prompt). Same value forms and precedence as `parentContext`; if omitted, uses `subagents-child-context.md` beside that settings file |
-| `modelScope.allow` | Glob list of `provider/id` the parent may assign. Explicit tool `model` is an error if it misses; inherited is a warning |
-| `disableBuiltins` | Do not load the five shipped roles |
-| `maxSubagentSpawnsPerSession` | Hard cap on how many children this session may start |
-| `herdr.maxConcurrentAgents` | Layout / density hint (default 6) |
-| `herdr.startRetries` | `agent_pane_busy` retries (default 40 × 150ms+) |
-
-### Context convention files
-
-Context can live beside settings instead of in `settings.json`: place
-`subagents-parent-context.md` and/or `subagents-child-context.md` next to the
-settings file (`~/.pi/agent/` for user settings, `<repo>/.pi/` for project
-settings). When a key is omitted, its convention file is read automatically;
-a missing, unreadable, or whitespace-only convention file is silently ignored.
-
-Within one settings layer, explicit inline text or `@path` references (including
-arrays) take precedence. `false` disables that layer's context and suppresses
-its convention file; otherwise the convention file is the default. Without any
-resolved context, that layer contributes no value. Existing cross-layer
-precedence is unchanged: a project context value—including one from a project
-convention file—replaces the user context wholesale, while a layer with no
-value leaves the other layer's context intact. Sharing these named files with
-a project means machines do not need absolute context paths in `settings.json`.
-
-Run records and child session jsonl live under `<cwd>/.pi-subagents/`. That
-directory is the resume credential; do not delete it while you still want to
-`resume` a child.
-
-## Teams
-
-Teams select a named subset of discovered roles without changing the role files:
-
-```json
-{
-  "subagents": {
-    "teams": {
-      "frontend": {
-        "description": "UI work",
-        "members": [
-          "designer",
-          "prototype",
-          { "agent": "worker", "model": "provider/strong" }
-        ]
+    "legion": {
+      "maxDepth": 4,
+      "maxChildrenPerNode": 8,
+      "maxActiveNodes": 30,
+      "phaseTimeouts": {
+        "planning": 900000,
+        "implementing": 3600000,
+        "reviewing": 1800000,
+        "verifying": 900000
       },
-      "full+": { "members": ["*", { "agent": "worker", "model": "provider/strong" }] }
-    },
-    "team": "frontend"
+      "verifyCommandTimeoutMs": 600000,
+      "mailRatePer5Min": 10,
+      "usagePollMs": 30000,
+      "orphanStaleMs": 90000
+    }
   }
 }
 ```
 
-Use `/subagents-team` to show the active team, `/subagents-team list` to list
-teams, `/subagents-team use <name>` to select one in project settings, and add
-`--global` to write user settings. `/subagents-team create <name> a,b,c`
-creates a team. The selection priority is
-`PI_SUBAGENTS_TEAM` > `subagents.team` > `default`; whitespace-only environment
-values are ignored. `default` means all discovered roles and returns the
-unfiltered catalog. A missing selected team also falls back to all roles with a
-warning.
+The three launch budget gates are enforced against the tree ledger:
 
-A string member names a role, and `"*"` expands to every discovered role once,
-preserving first-seen order. An object member reuses the normal
-`agentOverrides` fields (including `model`, `thinking`, `kind`, and `disabled`);
-its fields are applied after earlier members, so later objects win. The active
-team name is injected into child pane/tab processes as `PI_SUBAGENTS_TEAM` for
-non-default teams, so nested children inherit the same selection.
+| Gate | Setting | Default | Limit |
+| --- | --- | ---: | --- |
+| Depth | `maxDepth` | 4 | Maximum tree depth; the hard cap is 4 (`MAX_NESTED_PATH_ENTRIES`). |
+| Fan-out | `maxChildrenPerNode` | 8 | Direct children for one node. |
+| Concurrency | `maxActiveNodes` | 30 | Whole-tree `running` + `starting` nodes. |
 
-## Custom agents
+The effective tree depth cap is bounded by the operator override,
+`subagents.legion.maxDepth`, and the hard cap of 4. **INCL semantics:** a
+launched role's `maxSubagentDepth = R` counts generations in that role's
+subtree, including itself; when launched by a parent at depth `d`, it inherits
+`C_child = min(C_parent, d + R, 4)` (`R = 1` makes it a leaf), so it can tighten
+the inherited cap but cannot widen it.
 
-A role is a markdown file with YAML frontmatter + a system prompt body:
+## Delivery and resume
 
-```markdown
+A centurion owns a Git worktree for its subtree; its worker/scout/reviewer
+children work in that subtree, and a nested centurion gets a nested worktree.
+Each subtree is delivered as a squash MR to its parent level. MRs move upward
+through the tree until the root reviews and merges into the default branch.
+
+Resuming follows the tree's saved sessions and node records. If a supervisor
+process ends, its child processes do not become detached workers; resuming the
+parent restores the squad, while already-settled children are not restarted.
+Keep the run records and session files while the tree may need to resume.
+
+## Herdr transition and role migration
+
+Version **0.16.x is the final Herdr-era line**. Pi Legion 2.x is RPC-only:
+child execution uses headless `pi --mode rpc` processes, and the legacy backend
+is archived under `src/backends/legacy/`, not offered as a v2 runtime option.
+Pin to `pi-legion` 0.16.x if a workflow must stay on the former Herdr-based
+execution model.
+
+Pi Legion 2.x supports `kind: pi` only. Migrate a custom role that uses another
+CLI kind by changing its frontmatter, for example:
+
+```yaml
 ---
-name: researcher
-description: Read-only paper/code survey
-tools: read, grep, find, ls, bash
-timeoutMs: 600000
-acceptance:
-  level: attested
-  role: read-only
+name: search
 kind: pi
-placement: split-down
-steer: true
-onBlocked: forward
 ---
-
-You are a read-only researcher. Facts with paths. No edits.
 ```
 
-Put it in `~/.pi/agent/agents/researcher.md` (user) or
-`<repo>/.pi/agents/researcher.md` (project). Required fields: `name`,
-`description`. Useful optional fields: `model`, `preset`, `thinking`, `tools`, `skills`,
-`timeoutMs`, `placement`, `onBlocked` (`auto-approve` default / `forward` / `notify`),
-`acceptance.role` (`read-only` / `writer`), `acceptance.criteria` with
-`evidence: [verification-output]` (and optional `command:`) if collect should
-run a check, `worktree`, `toolBudget` / `turnBudget` / `toolTimeoutMs`,
-`fallbackModels`, `alias`, `completionGuard`, `allowNestedSubagents`.
-
-If `subagent({ action: "list" })` prints `⚠ not enforced yet: …`, that key is
-parsed but inert. A listed key that does nothing is worse than an unknown key
-— if you see that warning, the field is decoration. The shipped roles currently
-report none.
-
-## Isolation
-
-Herdr panes are **one trust domain**. A child can in principle `herdr pane
-read` any pane in the session (measured: F23). We now **enforce** a subset of
-that discipline; the rest is still on you.
-
-**Enforced in the child process**
-
-- `herdr agent prompt|wait|send-keys|start`
-- `herdr pane split`, `herdr tab create|close`
-- `herdr pane read|close` of a pane that is not this child’s
-- for `acceptance.role: read-only`: filesystem writes, `git` mutations,
-  package-manager installs, `sed -i`, redirects onto files
-- `toolBudget.maxToolCalls` / `turnBudget.maxTurns` (further tool calls are
-  blocked); `toolTimeoutMs` wraps bash with GNU `timeout`
-- `worktree: true` → `git worktree add -b` under the run dir (named
-  `pi-subagent/<name>-…` branch). The pane’s cwd is that tree. The **parent**
-  decides per launch (`subagent({ worktree: true|false })`); omitting it uses
-  the role default. Writer roles (`acceptance.role: writer`, including bundled
-  `worker`) default this on so concurrent parent Pis do not share a dirty
-  checkout; the child commits on the branch and opens an MR. `worktree: false`
-  opts out. Retire leaves the tree on disk. Requires a git repository.
-- child tabs are pinned to the **parent herdr Space**
-  (`HERDR_WORKSPACE_ID` → `tab create --workspace`). A focused Space elsewhere
-  cannot steal the child, and adopt will not reuse a same-label tab in another
-  Space.
-
-**Still not a sandbox**
-
-- `HERDR_SOCKET_PATH` cannot be overridden per pane (F24)
-- a true isolated session would break the visible/steerable model (F25)
-- never put secrets on screen in any pane while children run
-- owner tokens: recycle only panes the tree registered; skip + warn otherwise
-
-If a task genuinely needs isolation, run it **outside** herdr (plain `pi`, no
-`HERDR_ENV`), rather than pretending panes are sandboxed.
-
-## Success and failure
-
-**herdr `agent_status` cannot tell you whether an agent succeeded.** Success,
-model error, and kill all report `done`. The plugin derives outcome from the
-child’s session jsonl (`stopReason` of the last turn) and from the
-machine-readable verdict.
-
-Two orthogonal dimensions — never conflate them:
-
-- **Lifecycle** (`launching → working → awaiting → blocked → retired/exited`):
-  is the process alive?
-- **Execution** (`success / failed / aborted / truncated / running`): did the
-  task succeed?
-
-`state: retired` + `execution.status: failed` is a normal combination.
-
-| Session signal | Execution |
-| --- | --- |
-| Last turn `stopReason: "stop"` | success |
-| `stopReason: "error"` without “aborted” | failed |
-| `stopReason: "error"` + “This operation was aborted” | aborted |
-| Last user prompt with **no** assistant message | aborted (killed mid-turn) |
-| Last assistant `stopReason: "toolUse"` and the agent is gone | aborted |
-| Last assistant `toolUse` and herdr says `blocked` | not terminal — confirm / wait |
-| `stopReason: "length"` | truncated |
-| No messages | unknown |
-
-On top of that:
-
-- **Only the last turn decides execution.** A tool error in turn 1 followed by
-  a clean turn 2 is overall success. `toolErrors` is diagnostic only.
-- **Self-report is attested, not verified.** `{"ok": true}` is the agent
-  marking its own homework. Worker’s `verification-output` criterion is the
-  exception: when it carries an explicit `command`, the plugin runs it itself,
-  with a timeout; without one, the criterion is surfaced as pending for the
-  parent to confirm from the pasted output — the plugin never guesses a
-  project-unaware command. `completionGuard:
-  true` rejects a successful turn that forgot the `{"ok":…}` verdict.
-- **Recycle destroys live evidence** (`agent get` → `agent_not_found`). The
-  plugin collects and snapshots `execution` into `.pi-subagents/run.json`
-  **before** closing the pane. Resume uses the session file, not the pane.
-
-## Programmatic API
-
-Hosts that are not the Pi `subagent` tool can drive the same machinery:
-
-```ts
-import {
-  createHerdrClient,
-  Orchestrator,
-  loadAgentsFromDir,
-} from "pi-legion/api";
-
-const client = createHerdrClient();
-const [scout] = loadAgentsFromDir("/path/to/agents", "user");
-const orch = new Orchestrator({
-  client,
-  runDir: "/tmp/run",
-  cwd: process.cwd(),
-});
-const handle = await orch.launch({ agent: scout, task: "survey the repo" });
-const result = await orch.collect(handle.name);
-```
-
-Everything re-exported from `./api` is covered by the test suite. Do not import
-from `src/` directly.
+A non-Pi kind is rejected by v2. If that role must continue to run through
+another CLI, keep it on the 0.16.x line or replace it with a Pi role.
 
 ## Development
 
 ```bash
-git clone https://github.com/zzjcool/pi-legion.git
-cd pi-legion
 npm install
 npm run typecheck
-npm test                 # unit
-npm run test:integration # fake herdr, no live binary
+npm test                  # unit tests
+npm run test:integration  # integration tests
+npm run test:all          # typecheck + unit + integration tests
 ```
-
-Live tests (`npm run test:live`) need a real herdr on `PATH` and
-`HERDR_ENV=1`. They are skipped otherwise.
-
-Container checks (host Pi config bind-mounted, package at `/plugin`) live in
-`test/docker/`. Each numbered script is one feature:
-
-```bash
-bash test/docker/verify-1-child-guard.sh
-bash test/docker/verify-2-task-appendix.sh
-bash test/docker/verify-3-readonly.sh
-bash test/docker/verify-4-acceptance.sh
-bash test/docker/verify-5-blocked.sh
-bash test/docker/verify-6-cache.sh
-bash test/docker/verify-7-budget.sh
-bash test/docker/verify-8-verify-command.sh
-bash test/docker/verify-9-worktree.sh
-bash test/docker/verify-10-fallback.sh
-bash test/docker/verify-11-nested-alias.sh
-bash test/docker/verify-12-workspace.sh
-bash test/docker/verify-13-kinds.sh        # kinds + models; live CodeBuddy/Cursor when mounted
-```
-
-They expect image `pi-herdr-sandbox:latest` and copy `~/.pi/agent/{settings,models,auth}.json`
-into a disposable home so the container uses your providers without writing
-back. See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-The measured design (findings F1–F46, why session jsonl is the source of
-truth, why recycle is unconditional) is [docs/design.md](docs/design.md).
-Historical “this field is parsed but inert” notes in that file may predate
-the runtime table above — trust this README and `action=list`’s
-`unenforcedFields` for what is actually wired.
-
-## Known limitations
-
-- **Not a sandbox** (F23–F25): child-guard covers bash/herdr dispatch and
-  read-only writes; it does not give you process isolation. The read-only
-  bash rules are a **text heuristic** over the command line, so they miss
-  indirect writes — `node -e "require('fs').writeFileSync(…)"`,
-  `python3 -c "open('f','w')…"` and `perl -i` all pass, as does any child whose
-  agent definition omits `acceptance.role` (the guard is keyed off it). Treat it
-  as a guard-rail against accidents, not a boundary against intent.
-- **`agent_status` has no success/failure semantics** (F26).
-- **Non-pi kinds degrade** (F7): same Herdr control plane (`start` → `prompt` → `wait`), but no usage and outcome is `unknown` unless the pane text includes a verdict JSON that is not just the echoed launch prompt. Cursor starts with `--trust --force` (Run Everything) unless the agent opts back into a human gate via `onBlocked: forward`/`notify`, so workspace-trust and shell-approval dialogs cannot block the first prompt. Resume depends on each CLI.
-- **A model the kind cannot express**: `--model` is built per CLI (pi wants
-  `provider/id`, cursor wants slugs like `cursor-grok-4.6-high`). A model that
-  cannot be expressed is omitted rather than mangled. Whether that is refused or
-  allowed depends on how it was chosen — an **explicit** choice (frontmatter,
-  `agentOverrides`, a preset, a `model` param) is refused before any pane is
-  created, while an **inherited** one (`subagents.defaultModel`, the parent
-  session's model) is dropped on purpose and reported as `modelDropped`, because
-  the parent's pi model simply means nothing to another CLI.
-- **`blocked` is screen-heuristic**: false positives exist; the confirm is
-  paired with the collect timeout as a backstop.
-- **Verification** runs `criterion.command` when a required criterion asks
-  for `verification-output` and carries one. A criterion without a `command`
-  stays attested and is surfaced as pending for the parent — semantic `must`
-  strings are never NLP-parsed (F32 / F44) and no default command is guessed.
-  Other evidence types stay a checklist.
-- **Panes are scarce**: cap fan-out (`maxSubagentSpawnsPerSession` /
-  `herdr.maxConcurrentAgents`). Warm-pane pooling is not worth it (~0.9s).
-
-## License
 
 MIT. See [LICENSE](LICENSE).

@@ -1,131 +1,98 @@
 ---
 name: pi-legion
-description: "Delegate with the subagent tool whenever a loaded role matches the job (search, scout, planner, worker, reviewer, oracle, or any user agent in ~/.pi/agent/agents). Prefer subagent over doing that work yourself. Do not run herdr CLI to launch agents."
+description: "Use the subagent tool to delegate to a loaded role; use centurion for recursive squads and /legion to inspect the tree. Pi Legion v2 runs headless Pi RPC children and records their shared tree state in legion.db."
 ---
 
 # Pi Legion
 
-## Legion visualization
+Use the `subagent` tool to delegate to a matching loaded role. Prefer the
+specific role that fits the task; use a `centurion` when the task needs a
+recursive team, a frozen squad contract, and a tree-shaped delivery. Do not
+launch child processes manually.
 
-In an interactive Pi session, `/legion` opens the paged Legion tree. Navigate with
-`j`/`k` or the arrow keys, use Enter/Space to expand or collapse, `/` to search,
-and PageUp/PageDown to scroll; `q` or Esc closes the tree. Press `o` on the
-selected node, or use a component-routed mouse click in the full-screen tree, to
-open its live overlay. `/legion <name>` opens a node directly. If short names
-are ambiguous, use the full node ID shown in command completion. Esc closes an
-overlay and unsubscribes its node's live feed. OSC 8 links are visual anchors
-only; they do not open overlays or route clicks.
-
-The launch path is frozen. Do not invent herdr commands.
-
-The system prompt lists **every loaded role** each turn, including user agents
-such as `search`. Use the matching name. Do not curl the web yourself when a
-search/research role exists.
+## Dispatch
 
 ```text
 subagent({ agent: "search", task: "<query>" })
 subagent({ agent: "worker", task: "<task card>" })
-subagent({ agent: "worker", task: "<task card>", worktree: true })
+subagent({ agent: "centurion", task: "<目标 + 验收清单>" })
 subagent({ tasks: [
   { agent: "reviewer", task: "<lane A>" },
   { agent: "reviewer", task: "<lane B>" },
 ] })
 ```
 
-That is the entire dispatch. The tool creates the type tab, splits panes, starts
-agents, shows status **above the input**, and queues a completion when a child
-finishes. If this session is idle it wakes immediately; if it is still working,
-the notice waits until the current turn ends. **Same agent type = one tab,
-different panes.** A scout and a reviewer get two tabs; two scouts share one.
+That is the dispatch path: Pi Legion starts headless `pi --mode rpc` child
+processes under a tree-aware supervisor. A `centurion` leads its own squad and
+may recursively dispatch when its role and inherited depth budget allow it;
+ordinary roles should not be assumed to have that permission. Give every child
+a concrete task and acceptance criteria. Children communicate through the
+Legion tools, not by starting another runtime or editing the shared tree ledger
+directly.
 
-**First action is the `subagent` tool.** Do not `test HERDR_ENV`, do not
-`herdr --help`, do not `herdr agent` / `herdr pane`, do not `pane split` /
-`agent start` / `agent prompt` / `agent wait`. Those are the old ritual; the
-plugin will block them. Prefer one `tasks[]` call over two separate launches.
+## Legion visualization
 
-**Isolation is your call.** Pass `worktree: true` when another parent may write
-this repo, or when the child should ship via MR (own branch, do not touch the
-current checkout). Pass `worktree: false` to edit this checkout in place. Omit
-it to use the role default (bundled `worker` isolates).
+In an interactive Pi session, `/legion` opens the paged Legion tree. Navigate
+with `j`/`k` or the arrow keys, use Enter/Space to expand or collapse, `/` to
+search, and PageUp/PageDown to scroll; `q` or Esc closes the tree. Press `o` on
+the selected node, or use a component-routed mouse click in the full-screen
+tree, to open its live overlay. `/legion <name>` opens a node directly. If
+short names are ambiguous, use the full node ID shown in command completion.
+Esc closes an overlay and unsubscribes its node's live feed. OSC 8 links are
+visual anchors only; they do not open overlays or route clicks.
 
-Then return control. Completions arrive as `Background task completed: **name**`.
-The plugin recycles the child's pane (and the type tab when empty) when the
-turn finishes. Do not `retire` or close panes yourself. `resume` from the
-session file if you need the child again. `collect` after auto-watch returns
-the cached snapshot; `retire` after auto-recycle is a no-op. Pass `async: false`
-only for a short foreground run.
+## Tree tools and phases
 
-Parallel children launched together finish at different times; their completion
-notices are merged and delivered as one grouped message — read it once and
-synthesize a combined summary instead of reacting per child. If you need
-first-finished-first or know runtimes differ wildly, call
-`subagent({ action: "wait", all: true, timeoutMs })` (or `wait` with `name`)
-to block for results.
+Child nodes have access to:
 
-A completion notice reading `collect timed out … the agent is still alive` is a
-progress signal, not a verdict: the child keeps running and will notify again
-when it truly finishes. Check `status` and the child's session tail before
-deciding to steer or continue — a `continue` while it is mid-turn appends to
-its queue rather than interrupting.
+- `legion_mail` for asynchronous messages along permitted parent/child/sibling
+  tree edges. Cross-squad mail must be routed through the relevant centurions;
+  there is no direct bypass to the root.
+- `legion_tree` for read-only machine state. Observation does not interrupt the
+  node being observed.
+- `legion_phase` for centurions to request a phase transition. The supervisor
+  validates and records the transition; do not claim a phase change from chat
+  text alone.
 
-## Task cards
+A squad's four work phases are **planning → implementing → reviewing →
+verifying**. Planning writes `.pi-legion/contract.md` with interfaces, file
+ownership, and acceptance commands before implementation starts. Reviewing
+uses independent review; verifying runs the contract's `legion-verify`
+commands under the supervisor, without an LLM deciding whether they passed.
 
-Write the work, the paths, and the output location. The plugin **already
-appends** frozen constraints to every child:
+## Delivery, resume, and isolation
 
-- do not prompt / wait on / send-keys to any other pane
-- do not read or close panes that are not yours
-- do not spawn nested agents
-- writers: isolated worktree branch; commit there and open an MR, do not write the parent checkout
-- end with `{"ok": true|false, "reason": "..."}` on its own line
+A centurion owns a Git worktree for its subtree; squad members share that
+worktree, and a nested centurion gets a nested Git worktree. Each squad
+squashes its subtree into an MR for its parent. MRs move upward until the root
+reviews and merges into the default branch. Do not merge a child squad's work
+at the wrong level.
 
-Do **not** add a wakeup instruction. Never tell a child to
-`herdr agent prompt` this pane.
+Resume uses saved run records and Pi session files. Parent shutdown does not
+leave detached child processes; recovery follows the tree's resume chain.
+Keep the run/session records while the squad may need to resume. The
+`legion.db` file is a machine-owned shared ledger: use `legion_mail`,
+`legion_tree`, and `legion_phase`, not direct database access.
 
-Read-only roles (`scout`, `reviewer`) still have `bash` for reconnaissance;
-writes are blocked by the child-guard. You do not need to repeat “do not `rm`”
-in the task unless you want extra emphasis.
+A Git worktree is workspace separation, not a security sandbox. Read-only
+checks remain guardrails rather than a process boundary; never rely on them to
+protect against intentional writes. Pi Legion v2 supports `kind: pi`; for a
+role that requires a non-Pi CLI, use the Herdr-era 0.16.x release line rather
+than expecting v2 to launch it.
 
 ## Later control
 
-```text
-subagent({ action: "steer", name, message })
-subagent({ action: "continue", name, message })
-subagent({ action: "resume", name, message })
-subagent({ action: "status", name })
-subagent({ action: "list" })
-```
-
-If a child is waiting on a tool approval, the parent TUI gets a confirm
-(`onBlocked: forward`). Do not invent a `steer` just to type `y`.
-
-## Model profiles
-
-Roles do not pin a vendor model. To bind capability tiers without switching the
-parent session each time:
+Steer, inspect, collect, resume, or retire children with the `subagent` tool:
 
 ```text
-/subagents-refresh-provider-models <provider>
-/subagents-generate-profiles <provider>
-/subagents-load-profile <provider>.quota
+subagent({ action: "status", name: "worker-0" })
+subagent({ action: "collect", name: "worker-0" })
+subagent({ action: "steer", name: "worker-0", message: "Focus on the parser tests." })
+subagent({ action: "resume", name: "worker-0" })
+subagent({ action: "retire", name: "worker-0" })
 ```
 
-`scout` → cheap, `planner` → medium, `worker`/`reviewer`/`oracle` → strong.
-`/subagents-profiles` lists saved files; `/subagents-check-profile <name>`
-verifies they still resolve.
-
-## Listing roles
-
-`/subagents-agents [user|project|both]` shows every role the `subagent` tool
-can spawn in this session — grouped by layer (builtin / user / project), each
-with the model a launch would actually resolve (and where it came from),
-kind, aliases, and the defining file. The same scope semantics as the tool's
-`agentScope`; re-reads agent files on every invocation.
-
-## Isolation
-
-Child-guard blocks `herdr agent prompt` and foreign `pane read`, and it blocks
-writes for read-only roles. Writer roles (`worker`) run in an isolated git
-worktree on their own branch and ship via MR — they must not write the parent
-checkout. Herdr is still **one trust domain**: never put secrets on screen
-while children run. Do not treat a pane as a sandbox.
+For a blocked extension UI request, the RPC supervisor bubbles the request up
+to the root Pi UI for human response by default. A child completion or a
+`legion_mail` message is not a substitute for checking its saved result and
+machine-recorded state.
