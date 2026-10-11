@@ -11,6 +11,16 @@ import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
+import type { LegionSettings } from "../shared/types.ts";
+import { legionIdentityEnv } from "./args.ts";
+import type { DatabaseSync } from "../legion/db.ts";
+import type { RunStore } from "./store.ts";
+import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
+import { appendEvent } from "../legion/events.ts";
+import { withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
+import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
+import { upsertUsage } from "../legion/usage.ts";
+import { evaluatePhaseTransition, isLegionPhase, isTerminalPhase } from "../legion/state-machine.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import {
 	ALLOW_NESTED_ENV,
@@ -62,11 +72,24 @@ export interface BudgetRefusedEvent {
 	reason: string;
 }
 
+export interface OrchestratorLegionContext {
+	db: DatabaseSync;
+	dbPath: string;
+	nodeId: string;
+	parentNodeId?: string | null;
+	parentRunId?: string | null;
+	runId?: string;
+	runStore?: RunStore;
+	settings?: LegionSettings;
+	eventBus?: Pick<LegionEventBus, "emit">;
+}
+
 export interface OrchestratorDeps {
 	supervisor?: LegionSupervisor;
 	uiProxy?: UIProxy;
 	runDir: string;
 	cwd: string;
+	legion?: OrchestratorLegionContext;
 	onChildUpdate?: (child: ChildRecord) => void;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
@@ -197,6 +220,7 @@ export class Orchestrator {
 	private readonly team?: ActiveTeam;
 	private readonly childContext?: string;
 	private readonly onBudgetRefused?: (event: BudgetRefusedEvent) => void;
+	private readonly legion?: OrchestratorLegionContext;
 	private readonly requestedDepthCap?: number;
 	private depthWarningEmitted = false;
 	private spawned = 0;
@@ -225,6 +249,7 @@ export class Orchestrator {
 		this.team = deps.team;
 		this.childContext = deps.childContext?.trim() || undefined;
 		this.onBudgetRefused = deps.onBudgetRefused;
+		this.legion = deps.legion;
 	}
 
 	get maxDepth(): number { return this.maxDepthValue; }
@@ -250,6 +275,173 @@ export class Orchestrator {
 		const fallback = makeName(agentName, seen);
 		this.nameCounter.set(agentName, seen + 1);
 		return fallback;
+	}
+
+	private allocateLegionName(agentName: string): string {
+		const legion = this.legion;
+		if (!legion) return this.allocateName(agentName);
+		const seen = this.nameCounter.get(agentName) ?? 0;
+		for (let index = seen; index < seen + 1_000; index += 1) {
+			const candidate = makeName(agentName, index);
+			if (this.children.has(candidate) || getChildByName(legion.db, legion.nodeId, candidate) || this.supervisor.isAlive(candidate)) continue;
+			this.nameCounter.set(agentName, index + 1);
+			return candidate;
+		}
+		throw new SubagentError(`could not allocate a unique child name for ${agentName}`, ErrorCodes.NAME_TAKEN);
+	}
+
+	private legionLocalName(name: string): string {
+		const prefix = `${this.legion?.nodeId}.`;
+		const local = name.startsWith(prefix) ? name.slice(prefix.length) : name;
+		return sanitizeNodeSlug(local);
+	}
+
+	private childFromNode(name: string, node: LegionNode): ChildRecord {
+		if (node.status === "failed" || ["done", "failed", "aborted"].includes(node.phase ?? "")) {
+			throw new SubagentError(`legion child is terminal and cannot be resumed: ${node.id}`, ErrorCodes.BUDGET_EXCEEDED);
+		}
+		if (!node.sessionFile) throw new SubagentError(`legion child has no session to resume: ${node.id}`, ErrorCodes.NOT_FOUND);
+		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
+	}
+
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string }): LegionNode | null {
+		const legion = this.legion;
+		if (!legion) return null;
+		const parent = getNode(legion.db, legion.nodeId);
+		if (!parent) throw new SubagentError(`legion parent node not found: ${legion.nodeId}`, ErrorCodes.BUDGET_EXCEEDED);
+		const previous = getNode(legion.db, input.nodeId);
+		if (!previous && getChildByName(legion.db, legion.nodeId, input.name)) {
+			throw new SubagentError(`legion child already exists: ${input.name}`, ErrorCodes.NAME_TAKEN);
+		}
+		if (previous && (previous.status === "failed" || ["done", "failed", "aborted"].includes(previous.phase ?? ""))) {
+			throw new SubagentError(`legion child is terminal and cannot be resumed: ${input.nodeId}`, ErrorCodes.BUDGET_EXCEEDED);
+		}
+		const team = input.team ?? input.agent.extraFields?.team ?? this.team?.name;
+		const depthCeiling = Math.min(legion.settings?.maxDepth ?? this.maxDepthValue, MAX_NESTED_PATH_ENTRIES);
+		const childCount = Number(legion.db.prepare("SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?").get(legion.nodeId)?.count ?? 0);
+		const maxChildren = previous ? Math.max(legion.settings?.maxChildrenPerNode ?? 8, childCount + 1) : legion.settings?.maxChildrenPerNode;
+		const activeReservation = previous && (previous.status === "starting" || previous.status === "running") ? 1 : 0;
+		const limits: LegionBudgetLimits = { maxDepth: depthCeiling, maxChildrenPerNode: maxChildren, maxActiveNodes: (legion.settings?.maxActiveNodes ?? 30) + activeReservation };
+		const gate = withLaunchBudget(legion.db, { parentId: legion.nodeId, depth: parent.depth + 1, nodeId: input.nodeId }, () => {
+			if (previous) {
+				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team }, this.now);
+				return previous;
+			}
+			if (!input.runId) throw new SubagentError(`node run reservation is missing: ${input.nodeId}`, ErrorCodes.START_FAILED);
+			insertNode(legion.db, {
+				id: input.nodeId,
+				parentId: legion.nodeId,
+				name: input.name,
+				role: input.agent.name,
+				kind: input.agent.kind,
+				runId: input.runId,
+				sessionFile: input.sessionFile,
+				worktreePath: input.worktreePath ?? null,
+				model: input.model ?? null,
+				team: team && team !== DEFAULT_TEAM ? team : null,
+				status: "starting",
+				...(input.agent.name === "centurion" ? { phase: "planning", phaseSince: this.now() } : {}),
+				taskSummary: input.task.slice(0, 2_000),
+			}, this.now);
+			return null;
+		}, { limits, now: this.now });
+		if (!gate.allowed) {
+			this.legion?.eventBus?.emit({ nodeId: input.nodeId, type: "budget_refused", data: { reason: gate.decision.reason, message: gate.decision.message, depth: gate.decision.depth, activeNodes: gate.decision.activeNodes, children: gate.decision.children, limits: gate.decision.limits }, ts: this.now() });
+			throw new SubagentError(`legion launch refused (${gate.decision.reason}): ${gate.decision.message}`, ErrorCodes.BUDGET_EXCEEDED);
+		}
+		return gate.value;
+	}
+
+	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string }): Promise<boolean> {
+		const legion = this.legion;
+		const parentRunId = legion?.runId;
+		if (!legion?.runStore || !parentRunId) return false;
+		const run = legion.runStore.readRun(parentRunId);
+		if (!run) throw new SubagentError(`parent run record not found: ${parentRunId}`, ErrorCodes.NOT_FOUND);
+		const previous = run.children.find((child) => child.name === input.name);
+		if (previous) {
+			if (previous.nodeId !== input.nodeId) throw new SubagentError(`child name is already assigned to ${previous.nodeId ?? previous.name}`, ErrorCodes.NAME_TAKEN);
+			await legion.runStore.updateChild(parentRunId, input.name, (child) => {
+				child.sessionFile = input.sessionFile;
+				child.state = "launching";
+				child.spawnedAt = new Date(this.now()).toISOString();
+				child.agent = input.agent.name;
+				child.kind = input.agent.kind;
+				child.nodeId = input.nodeId;
+				if (input.model) child.model = input.model;
+				if (input.worktreePath) child.worktreePath = input.worktreePath;
+			});
+			return false;
+		}
+		await legion.runStore.addChild(parentRunId, {
+			name: input.name,
+			nodeId: input.nodeId,
+			sessionFile: input.sessionFile,
+			ownerToken: `legion-${input.nodeId}`,
+			state: "launching",
+			spawnedAt: new Date(this.now()).toISOString(),
+			agent: input.agent.name,
+			kind: input.agent.kind,
+			...(input.model ? { model: input.model } : {}),
+			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
+		});
+		return true;
+	}
+
+	private recordLegionLaunch(child: ChildRecord, agent: AgentConfig, task: string, teamOverride: string | undefined, resumed: boolean): void {
+		if (!this.legion || !child.nodeId) return;
+		const team = teamOverride ?? agent.extraFields?.team ?? this.team?.name;
+		const current = getNode(this.legion.db, child.nodeId);
+		const childRun = current?.runId ?? this.legion.runId ?? path.basename(this.runDir);
+		updateNode(this.legion.db, child.nodeId, { status: "running", runId: childRun, sessionFile: child.sessionFile, worktreePath: child.worktreePath ?? null, model: child.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, taskSummary: task.slice(0, 2_000) }, this.now);
+		this.emitStored(child.nodeId, resumed ? "node_resumed" : "node_launched", { parentId: this.legion.nodeId, runId: childRun, sessionFile: child.sessionFile, role: agent.name, kind: agent.kind });
+	}
+
+	private recordSettled(child: ChildRecord, execution: Execution): void {
+		if (!this.legion || !child.nodeId || execution.status === "running") return;
+		const status = execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
+		const current = getNode(this.legion.db, child.nodeId);
+		if (!current || current.status === status) return;
+		updateNode(this.legion.db, child.nodeId, { status }, this.now);
+		const eventType = status === "settled" ? "node_settled" : status === "failed" ? "node_failed" : "node_retired";
+		this.emitStored(child.nodeId, eventType, { execution: execution.status, reason: execution.reason });
+		if (execution.usage) {
+			upsertUsage(this.legion.db, { nodeId: child.nodeId, tokensIn: execution.usage.input + execution.usage.cacheRead + execution.usage.cacheWrite, tokensOut: execution.usage.output, costUsd: execution.usage.cost }, this.now);
+		}
+		void this.supervisor.stats(child.name).then((usage) => {
+			if (usage) upsertUsage(this.legion!.db, { nodeId: child.nodeId!, tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, costUsd: usage.costUsd }, this.now);
+		}).catch(() => {});
+	}
+
+	private abortLegionPhase(nodeId: string): void {
+		if (!this.legion) return;
+		const node = getNode(this.legion.db, nodeId);
+		if (!node || !isLegionPhase(node.phase) || isTerminalPhase(node.phase)) return;
+		const decision = evaluatePhaseTransition({
+			from: node.phase,
+			to: "aborted",
+			reworkCount: node.reworkCount,
+			terminalReason: "parent_retire",
+			actorRole: "supervisor",
+		}, this.now);
+		if (!decision.allowed) return;
+		updateNode(this.legion.db, nodeId, { phase: decision.to, phaseSince: decision.phaseSince }, this.now);
+		this.emitStored(nodeId, "phase_change", decision.event.data);
+	}
+
+	private emitProcess(type: LegionProcessEventType, nodeId: string, data: unknown): void {
+		this.legion?.eventBus?.emit({ nodeId, type, data: data as Record<string, unknown> | null, ts: this.now() });
+	}
+
+	private emitStored(nodeId: string, type: Parameters<typeof appendEvent>[2], data: unknown): void {
+		if (!this.legion) return;
+		this.legion.eventBus?.emit(appendEvent(this.legion.db, nodeId, type, data, { now: this.now }));
+	}
+
+	private rollbackReservation(nodeId: string, previous: LegionNode | null): void {
+		if (!this.legion) return;
+		if (!previous) { this.legion.db.prepare("DELETE FROM nodes WHERE id = ?").run(nodeId); return; }
+		updateNode(this.legion.db, nodeId, { status: previous.status, runId: previous.runId, sessionFile: previous.sessionFile, worktreePath: previous.worktreePath, model: previous.model, team: previous.team, taskSummary: previous.taskSummary }, this.now);
 	}
 
 	budget(): { used: number; limit: number | null; remaining: number | null } {
@@ -279,38 +471,51 @@ export class Orchestrator {
 		agent: AgentConfig;
 		task: string;
 		name?: string;
+		team?: string;
 		model?: string;
 		thinking?: string | false;
 		worktree?: boolean;
 		modelOrigin?: ModelOrigin;
 	}): Promise<Handle> {
 		this.warnDepthCap();
-		this.assertWithinBudgets();
 		if (input.agent.kind !== "pi") {
 			throw new SubagentError(
 				`RPC supervisor only supports pi children (received kind '${input.agent.kind}'); migrate the role to kind: pi or pin pi-legion v0.16.x`,
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
-		const name = input.name ?? this.allocateName(input.agent.name);
-		if (this.supervisor.isAlive(name)) {
-			throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
-		}
-		const previous = this.children.get(name);
+		const generated = input.name ?? (this.legion ? this.allocateLegionName(input.agent.name) : this.allocateName(input.agent.name));
+		const name = this.legion ? this.legionLocalName(generated) : generated;
+		const nodeId = this.legion ? nodeIdForChild(this.legion.nodeId, name) : undefined;
+		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
+		const previous = this.children.get(name) ?? (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
+		if (previous && !this.children.has(name)) this.children.set(name, previous);
+		// Resuming any persisted node does not consume a fresh spawn slot. An
+		// abrupt parent shutdown can leave the durable child state at `working`.
+		this.assertWithinBudgets(Boolean(previous));
+		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		const models = this.planModelCandidates({
 			agent: input.agent,
 			...(input.model !== undefined ? { model: input.model } : {}),
 			origin: input.modelOrigin ?? (input.model !== undefined ? "explicit" : input.agent.modelSource?.type === "subagents.defaultModel" ? "inherited" : input.agent.model ? "explicit" : "inherited"),
 			...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
 		});
-		const sessionFile = previous?.sessionFile ?? this.sessionFileFor(name);
-		preCreateSessionFile(sessionFile);
+		let sessionFile = previous?.sessionFile ?? this.sessionFileFor(name);
 		const tempDir = this.runDir;
-		const worktree = resolveLaunchWorktree({ roleDefault: input.agent.worktree, launch: input.worktree });
+		const parentRole = this.legion ? getNode(this.legion.db, this.legion.nodeId)?.role : undefined;
+		const worktree = this.legion && input.agent.name === "centurion"
+			? true
+			: this.legion && parentRole === "centurion"
+				? false
+				: resolveLaunchWorktree({ roleDefault: input.agent.worktree, launch: input.worktree });
 		let worktreePath = previous?.worktreePath;
 		let worktreeBranch = previous?.worktreeBranch;
 		let createdWorktree = false;
 		let spawned = false;
+		let reservedNode: LegionNode | null = null;
+		let reserved = false;
+		let createdRunId: string | undefined;
+		let parentReservationCreated = false;
 		try {
 			if (worktree && !worktreePath) {
 				const tree = createChildWorktree({ repoCwd: this.cwd, runDir: this.runDir, name });
@@ -319,6 +524,30 @@ export class Orchestrator {
 				createdWorktree = true;
 			}
 			const effectiveModel = models.candidates;
+			if (this.legion && nodeId && !previous && this.legion.runStore) {
+				const roleDepth = input.agent.maxSubagentDepth === undefined
+					? Number.POSITIVE_INFINITY
+					: Number.isInteger(input.agent.maxSubagentDepth) && input.agent.maxSubagentDepth >= 1
+						? input.agent.maxSubagentDepth
+						: 1;
+				const run = this.legion.runStore.createRun({
+					task: input.task,
+					cwd: worktreePath ?? this.cwd,
+					path: this.childPath(name),
+					maxDepth: Math.min(this.maxDepthValue, this.depth + roleDepth, MAX_NESTED_PATH_ENTRIES),
+					nodeId,
+					herdr: { supervisor: "rpc", node_id: nodeId },
+				});
+				createdRunId = run.runId;
+				sessionFile = this.legion.runStore.sessionFileFor(run.runId, name);
+			}
+			preCreateSessionFile(sessionFile);
+			if (this.legion && nodeId) {
+				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
+				reservedNode = this.reserveNode({ nodeId, name, agent: input.agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models.candidates[0] });
+				reserved = true;
+				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models.candidates[0] ? { model: models.candidates[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
+			}
 			let result: Awaited<ReturnType<LegionSupervisor["spawnChild"]>> | undefined;
 			let startedModel: string | undefined;
 			let lastError: unknown;
@@ -331,7 +560,7 @@ export class Orchestrator {
 					sessionFile,
 					tempDir,
 					cwd: worktreePath ?? this.cwd,
-					env: this.lineageEnv(name, input.agent),
+					env: this.lineageEnv(name, input.agent, input.team, nodeId),
 					...(model ? { model } : {}),
 					...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
 					...(input.agent.allowNestedSubagents !== undefined ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
@@ -361,6 +590,7 @@ export class Orchestrator {
 			}
 			const child = previous ?? this.recordChild({
 				name: result.name,
+				...(nodeId ? { nodeId } : {}),
 				agent: input.agent,
 				sessionFile: result.sessionFile,
 				...(startedModel ? { model: startedModel } : {}),
@@ -369,6 +599,8 @@ export class Orchestrator {
 				...(worktreeBranch ? { worktreeBranch } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
+			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
+			this.emitProcess("node_launched", nodeId ?? name, { name, agent: input.agent.name, pid: result.pid });
 			return {
 				name: result.name,
 				sessionFile: result.sessionFile,
@@ -379,6 +611,13 @@ export class Orchestrator {
 			};
 		} catch (error) {
 			if (spawned) await this.supervisor.retire(name).catch(() => {});
+			if (reserved && nodeId) this.rollbackReservation(nodeId, reservedNode);
+			if (parentReservationCreated && this.legion?.runStore) {
+				try { await this.legion.runStore.removeChild(this.legion.runId!, name, nodeId); } catch { /* rollback is best effort */ }
+			}
+			if (createdRunId && this.legion?.runStore) {
+				try { fs.rmSync(this.legion.runStore.runDir(createdRunId), { recursive: true, force: true }); } catch { /* rollback is best effort */ }
+			}
 			if (createdWorktree && worktreePath) removeChildWorktree({ repoCwd: this.cwd, dest: worktreePath });
 			throw error;
 		}
@@ -404,14 +643,14 @@ export class Orchestrator {
 		return { candidates: candidates.length ? candidates : [undefined], dropped };
 	}
 
-	private assertWithinBudgets(): void {
+	private assertWithinBudgets(existingChild = false): void {
 		if (this.depth + 1 > this.maxDepthValue) {
 			throw new SubagentError(
 				`subagent nesting limit reached (depth ${this.depth}, max ${this.maxDepthValue}); raise maxSubagentDepth to allow deeper nesting`,
 				ErrorCodes.BUDGET_EXCEEDED,
 			);
 		}
-		if (this.maxSpawns !== null && this.spawned >= this.maxSpawns) {
+		if (!existingChild && this.maxSpawns !== null && this.spawned >= this.maxSpawns) {
 			throw new SubagentError(
 				`subagent spawn budget exhausted (${this.spawned}/${this.maxSpawns}); raise subagents.maxSubagentSpawnsPerSession to allow more`,
 				ErrorCodes.BUDGET_EXCEEDED,
@@ -419,7 +658,7 @@ export class Orchestrator {
 		}
 	}
 
-	private lineageEnv(name: string, agent: AgentConfig): Record<string, string> {
+	private lineageEnv(name: string, agent: AgentConfig, teamOverride?: string, nodeId?: string): Record<string, string> {
 		const roleDepth = agent.maxSubagentDepth === undefined
 			? Number.POSITIVE_INFINITY
 			: Number.isInteger(agent.maxSubagentDepth) && agent.maxSubagentDepth >= 1
@@ -431,7 +670,9 @@ export class Orchestrator {
 			[CHILD_ENV]: "1",
 			[CHILD_ROLE_ENV]: agent.name,
 		};
-		if (this.team && (this.team.name !== DEFAULT_TEAM || this.team.source === "env")) env[TEAM_ENV] = this.team.name;
+		const team = teamOverride ?? agent.extraFields?.team ?? this.team?.name;
+		if (team !== undefined && (team !== DEFAULT_TEAM || teamOverride === DEFAULT_TEAM || this.team?.source === "env")) env[TEAM_ENV] = team;
+		if (this.legion && nodeId) Object.assign(env, legionIdentityEnv(this.legion.dbPath, nodeId));
 		if (agent.acceptance?.role) env[CHILD_ACCEPTANCE_ROLE_ENV] = agent.acceptance.role;
 		if (agent.toolBudget?.maxToolCalls !== undefined) env[MAX_TOOL_CALLS_ENV] = String(agent.toolBudget.maxToolCalls);
 		if (agent.turnBudget?.maxTurns !== undefined) env[MAX_TURNS_ENV] = String(agent.turnBudget.maxTurns);
@@ -442,6 +683,7 @@ export class Orchestrator {
 
 	private recordChild(input: {
 		name: string;
+		nodeId?: string;
 		agent: AgentConfig;
 		sessionFile: string;
 		model?: string;
@@ -451,6 +693,7 @@ export class Orchestrator {
 	}): ChildRecord {
 		const child: ChildRecord = {
 			name: input.name,
+			...(input.nodeId ? { nodeId: input.nodeId } : {}),
 			sessionFile: input.sessionFile,
 			ownerToken: ownerToken(),
 			state: "working",
@@ -474,6 +717,7 @@ export class Orchestrator {
 	async steer(name: string, text: string): Promise<void> {
 		const child = this.requireChild(name);
 		await this.supervisor.steer(name, text);
+		this.emitProcess("node_steered", child.nodeId ?? name, { name, text });
 		this.clearBlocked(child);
 	}
 
@@ -484,8 +728,9 @@ export class Orchestrator {
 	}
 
 	async abort(name: string): Promise<void> {
-		this.requireChild(name);
+		const child = this.requireChild(name);
 		await this.supervisor.abort(name);
+		this.emitProcess("node_aborted", child.nodeId ?? name, { name });
 	}
 
 	private requireChild(name: string): ChildRecord {
@@ -609,6 +854,7 @@ export class Orchestrator {
 		if (execution.status !== "running") child.state = "awaiting";
 		child.execution = execution;
 		child.acceptance = acceptance;
+		if (execution.status !== "running") this.recordSettled(child, execution);
 		this.onChildUpdate(child);
 		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
 		let outputFile: string | undefined;
@@ -676,8 +922,19 @@ export class Orchestrator {
 		const child = this.requireChild(name);
 		if (!child.execution && fs.existsSync(child.sessionFile)) child.execution = deriveOutcome(parseSessionFile(child.sessionFile));
 		if (this.supervisor.isAlive(name)) await this.supervisor.retire(name);
+		if (child.nodeId && this.legion) {
+			if (child.execution && child.execution.status !== "unknown" && child.execution.status !== "running") {
+				this.recordSettled(child, child.execution);
+				if (child.execution.status !== "aborted") this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, execution: child.execution.status });
+			} else {
+				updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
+				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId });
+			}
+			this.abortLegionPhase(child.nodeId);
+		}
 		child.state = "retired";
 		child.retiredAt = new Date(this.now()).toISOString();
+		this.emitProcess("node_retired", child.nodeId ?? name, { name });
 		this.onChildUpdate(child);
 		return child;
 	}
@@ -693,7 +950,10 @@ export class Orchestrator {
 	childrenSnapshot(): ChildRecord[] { return [...this.children.values()]; }
 
 	restore(record: RunRecord): void {
-		for (const child of record.children) this.children.set(child.name, { ...child });
+		for (const child of record.children) {
+			const node = this.legion && !child.nodeId ? getChildByName(this.legion.db, this.legion.nodeId, child.name) : null;
+			this.children.set(child.name, { ...child, ...(node ? { nodeId: node.id } : {}) });
+		}
 		this.spawned = Math.max(this.spawned, record.budget.spawned);
 	}
 }

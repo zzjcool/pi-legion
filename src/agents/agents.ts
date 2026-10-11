@@ -34,6 +34,7 @@ export const BUILTIN_AGENT_NAMES = [
 	"planner",
 	"reviewer",
 	"worker",
+	"centurion",
 	"advisor",
 	"designer",
 	"prototype",
@@ -387,6 +388,8 @@ export function parseAgentDocument(
 	applyCapabilityFields(config, fm);
 	applyBehaviorFields(config, fm);
 	applyHerdrFields(config, fm);
+	const team = str(fm.team);
+	if (team) config.extraFields = { ...(config.extraFields ?? {}), team };
 
 	config.unenforcedFields = unenforcedFieldsIn(config);
 	return config;

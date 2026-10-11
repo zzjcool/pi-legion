@@ -923,7 +923,7 @@ function indexHarness(
 	cleanup(): Promise<void>;
 } {
 	const cwd = mkdtempSync(path.join(tmpdir(), "teams-index-rpc-"));
-	const names = ["PI_SUBAGENT_CHILD", "PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS"];
+	const names = ["PI_SUBAGENT_CHILD", "PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV];
 	const previous = new Map(names.map((name) => [name, process.env[name]]));
 	const agentDir = path.join(cwd, "agentdir");
 	const extraDir = path.join(cwd, "extra-agents");
@@ -934,6 +934,7 @@ function indexHarness(
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraDir;
 	delete process.env.PI_SUBAGENT_CHILD;
+	for (const name of ["PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV]) delete process.env[name];
 	const supervisor = new FakeSupervisor({
 		immediateTimeout: supervisorOptions.immediateTimeout ?? true,
 		...(supervisorOptions.autoSettle === false ? {} : { autoSettle: { text: `{"ok":true,"reason":"fake RPC child completed"}` } }),
@@ -992,7 +993,11 @@ test("session shutdown retires active RPC children while preserving their run re
 		await harness.shutdown();
 		assert.equal(harness.supervisor.isAlive(name), false);
 		assert.ok(harness.supervisor.calls.some((call) => call.method === "retire" && call.name === name));
-		assert.equal(new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") }).listRuns().length, 1);
+		const runs = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") }).listRuns();
+		assert.equal(runs.length, 2, "the root launch owns a root run and a distinct worker run");
+		const rootRun = runs.find((run) => run.nodeId === "root");
+		assert.ok(rootRun, "root run is marked with the Legion root identity");
+		assert.equal(rootRun.children[0]?.nodeId, `root.${name}`);
 	} finally {
 		await harness.cleanup();
 	}
@@ -1014,6 +1019,22 @@ test("index mainline: the selected team reaches RPC children", async () => {
 		for (const spawn of harness.supervisor.spawns) {
 			assert.equal(spawn.input.env?.PI_SUBAGENTS_TEAM, "frontend");
 		}
+	} finally { await harness.cleanup(); }
+});
+
+test("index mainline: a launch team override selects the roster and reaches the RPC child", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true, teams: { backend: { members: ["worker"] } } },
+		{ "worker.md": WORKER_FILE, "designer.md": DESIGNER_FILE },
+	);
+	try {
+		const text = await invokeIndex(harness, { agent: "worker", task: "use backend squad", team: "backend", async: true, worktree: false });
+		assert.match(text, /supervisor=rpc/);
+		assert.equal(harness.supervisor.spawns.length, 1);
+		assert.equal(harness.supervisor.spawns[0]?.input.env?.PI_SUBAGENTS_TEAM, "backend");
+		const designer = await invokeIndex(harness, { agent: "designer", task: "not in backend", team: "backend", async: true, worktree: false });
+		assert.match(designer, /unknown agent/);
+		assert.equal(harness.supervisor.spawns.length, 1);
 	} finally { await harness.cleanup(); }
 });
 

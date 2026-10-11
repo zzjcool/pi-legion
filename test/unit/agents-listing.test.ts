@@ -86,10 +86,13 @@ async function withSandbox(
 		child: process.env.PI_SUBAGENT_CHILD,
 		extra: process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS,
 		agentDir: process.env.PI_CODING_AGENT_DIR,
+		team: process.env.PI_SUBAGENTS_TEAM,
 	};
 	try {
-		// The tool is not registered inside a child process.
+		// The tool is not registered inside a child process, and an ambient team
+		// must not alter the independently sandboxed catalog under test.
 		delete process.env.PI_SUBAGENT_CHILD;
+		delete process.env.PI_SUBAGENTS_TEAM;
 
 		const agentDir = path.join(dir, "agentdir");
 		mkdirSync(agentDir, { recursive: true });
@@ -131,6 +134,8 @@ async function withSandbox(
 		else process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = previous.extra;
 		if (previous.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previous.agentDir;
+		if (previous.team === undefined) delete process.env.PI_SUBAGENTS_TEAM;
+		else process.env.PI_SUBAGENTS_TEAM = previous.team;
 		rmSync(dir, { recursive: true, force: true });
 	}
 }
@@ -462,7 +467,7 @@ test("command: lists sandboxed + builtin roles, grouped, with file paths", async
 			// …the sandboxed user-level role…
 			assert.match(text, /  search\n    web and code search/);
 			// …and the bundled roles still load.
-			assert.match(text, /builtin \(7\)/);
+			assert.match(text, /builtin \(8\)/);
 			assert.match(text, /  worker\n/);
 			// The project directory points at the temp project.
 			assert.match(text, new RegExp(`project: .*${path.basename(projectRoot)}`));

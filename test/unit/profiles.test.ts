@@ -146,7 +146,7 @@ test("filterDominatedModels: cheaper equal-or-better model wins", () => {
 	);
 });
 
-test("buildProfileFile maps our five roles onto the three tiers", () => {
+test("buildProfileFile maps all profiled built-in roles onto the three tiers", () => {
 	const file = buildProfileFile({
 		cheap: "cb/flash",
 		medium: "cb/sonnet",
@@ -158,6 +158,7 @@ test("buildProfileFile maps our five roles onto the three tiers", () => {
 	assert.equal(file.subagents.agentOverrides.worker?.model, "cb/opus");
 	assert.equal(file.subagents.agentOverrides.reviewer?.model, "cb/opus");
 	assert.equal(file.subagents.agentOverrides.designer?.model, "cb/opus");
+	assert.equal(file.subagents.agentOverrides.centurion?.model, "cb/opus");
 	assert.equal(
 		Object.keys(file.subagents.agentOverrides).length,
 		[...TIER_AGENTS.cheap, ...TIER_AGENTS.medium, ...TIER_AGENTS.strong]
