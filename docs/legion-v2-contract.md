@@ -333,7 +333,7 @@ legion_phase({ to, note?, evidence? })                // 仅 centurion（§7）
 2. **`/legion` 全屏树视图**（新 `tui/tree-view.ts`，`ctx.ui.custom()`）：完整树、展开/收起（键盘 + 鼠标）、`ScrollView` 滚动、搜索定位
 3. **实时浮窗**（新 `tui/live-overlay.ts`，`overlay: true` + `MouseRegion`）：点击 agent 名或 `/legion <name>` 打开；**打开才订阅**该节点 RPC 事件流（D10）；ESC 关闭
 
-**输入双通道**：`MouseRegion` 为主 + agent 名渲染 OSC 8 超链接为备（链接优先级高于点击区域，herdr/ghostty 嵌套环境已验证可点）。**键盘全路径**是硬要求（terminal 鼠标模式的文档铁律）。
+**输入双通道**：鼠标点击走组件事件（`MouseRegion`/自管分页视图的点击 handler——全屏模式下路由到组件）；agent 名可渲染 OSC 8 超链接作为**视觉锚点**（REV-14 降级：宿主 TUI 自行截获 OSC 8 点击去开浏览器，扩展无链接点击回调 API——链接渲染保留为视觉/语义辅助，浮窗打开仅由组件鼠标事件与键盘完成）。**键盘全路径**是硬要求（terminal 鼠标模式的文档铁律；regular 模式无鼠标是宿主限制，文档写明）。
 
 ### 10.2 LegionEventBus（D19，动画预留口）
 
@@ -456,3 +456,4 @@ interface LegionEventBus {
 | 2026-10-11 | REV-11 | 归属最终形态（终结逐类补丁）：主链切换型里程碑的边界 = 验收本身。测试侧：切换破坏的一切既有测试（含经 fake-herdr 驱动 index.ts 的 teams/presets-regression、断言 herdr 行为的 child-mode/context-injection/playbook 等）均归 M1，锚点 = 切换后全量绿。生产侧：补入 summary.ts 及其他因切换编译失败的 src 文件（仍排除 supervisor/legion/tui/agents/docs）。触发：worker-8 第三次按 §15-2 正确拒绝（fake-herdr 驱动型与行为断言型测试不在 REV-10 类别内，零改动） |
 | 2026-10-11 | REV-12 | REV-11 生产侧排除清单修正：删除 `Placement` 必然波及 `src/agents/agents.ts`（frontmatter 解析/默认值）与 `src/agents/settings.ts`（herdr.defaultPlacement）——锚点「切换后全量绿」自身要求的改动范围，从排除清单移入归属（仅 Placement 相关行，agents/ 其余不动）。触发：worker-8 第四次按 §15-2 正确拒绝（Placement 删除 vs agents/ 排除的矛盾，零改动） |
 | 2026-10-11 | REV-13 | §10.2 总线事件分两域：存储域（§4.3 的 14 种，经 createDbEventSource）与**进程内域**（node_launched/node_steered/node_retired/node_aborted/ui_request + 观察流 text_delta/tool_call/turn_start/agent_settled，带 nodeId 不落库，由扩展层在调 supervisor 方法/接 uiProxy 回调时 emit）。M3-integration 归属增加 `src/extension/event-bus.ts` 的类型集扩展（仅加进程内域类型，不动脏检查逻辑）。原因：RpcSupervisor.onEvent 是 per-child RPC 协议事件，操作级事件（launch/steer/retire）不在其中，须由扩展层显式 emit。触发：worker-12 按 §15-2 正确拒绝（类型闭集不含操作事件，零改动） |
+| 2026-10-11 | REV-14 | §10.1 点击双通道降级：OSC 8 超链接仅作视觉锄点 → 视觉锚点（REV-14 行文勘误）（宿主 TUI 截获链接点击去 openBrowser，pi-tui tui-alt-screen.js:1097-1104 + extensions types 无 URL 回调 API——worker-14 读源码实证）；浮窗打开 = 组件鼠标事件 + 键盘路径（/legion <name>）。鼠标事件在全屏模式路由到组件（tree-view 自管分页的点击 handler 已支持），regular 模式无鼠标为宿主限制。触发：worker-14 按 §15-2 正确拒绝（WIP 已由合并权人固化 2dff211） |
