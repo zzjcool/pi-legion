@@ -387,6 +387,8 @@ export function parseAgentDocument(
 	applyCapabilityFields(config, fm);
 	applyBehaviorFields(config, fm);
 	applyHerdrFields(config, fm);
+	const team = str(fm.team);
+	if (team) config.extraFields = { ...(config.extraFields ?? {}), team };
 
 	config.unenforcedFields = unenforcedFieldsIn(config);
 	return config;

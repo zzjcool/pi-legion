@@ -11,6 +11,14 @@ import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
+import type { LegionSettings } from "../shared/types.ts";
+import { legionIdentityEnv } from "./args.ts";
+import type { DatabaseSync } from "../legion/db.ts";
+import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
+import { appendEvent } from "../legion/events.ts";
+import { withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
+import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
+import { upsertUsage } from "../legion/usage.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import {
 	ALLOW_NESTED_ENV,
@@ -62,11 +70,21 @@ export interface BudgetRefusedEvent {
 	reason: string;
 }
 
+export interface OrchestratorLegionContext {
+	db: DatabaseSync;
+	dbPath: string;
+	nodeId: string;
+	runId?: string;
+	settings?: LegionSettings;
+	eventBus?: Pick<LegionEventBus, "emit">;
+}
+
 export interface OrchestratorDeps {
 	supervisor?: LegionSupervisor;
 	uiProxy?: UIProxy;
 	runDir: string;
 	cwd: string;
+	legion?: OrchestratorLegionContext;
 	onChildUpdate?: (child: ChildRecord) => void;
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
@@ -197,6 +215,7 @@ export class Orchestrator {
 	private readonly team?: ActiveTeam;
 	private readonly childContext?: string;
 	private readonly onBudgetRefused?: (event: BudgetRefusedEvent) => void;
+	private readonly legion?: OrchestratorLegionContext;
 	private readonly requestedDepthCap?: number;
 	private depthWarningEmitted = false;
 	private spawned = 0;
@@ -225,6 +244,7 @@ export class Orchestrator {
 		this.team = deps.team;
 		this.childContext = deps.childContext?.trim() || undefined;
 		this.onBudgetRefused = deps.onBudgetRefused;
+		this.legion = deps.legion;
 	}
 
 	get maxDepth(): number { return this.maxDepthValue; }
@@ -279,6 +299,7 @@ export class Orchestrator {
 		agent: AgentConfig;
 		task: string;
 		name?: string;
+		team?: string;
 		model?: string;
 		thinking?: string | false;
 		worktree?: boolean;
@@ -292,11 +313,14 @@ export class Orchestrator {
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
-		const name = input.name ?? this.allocateName(input.agent.name);
-		if (this.supervisor.isAlive(name)) {
-			throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
-		}
-		const previous = this.children.get(name);
+		const generated = input.name ?? (this.legion ? this.allocateLegionName(input.agent.name) : this.allocateName(input.agent.name));
+		const name = this.legion ? this.legionLocalName(generated) : generated;
+		const nodeId = this.legion ? nodeIdForChild(this.legion.nodeId, name) : undefined;
+		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
+		const previous = this.children.get(name) ?? (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
+		if (previous && !this.children.has(name)) this.children.set(name, previous);
+		if (!previous) this.assertWithinBudgets();
+		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		const models = this.planModelCandidates({
 			agent: input.agent,
 			...(input.model !== undefined ? { model: input.model } : {}),
@@ -306,11 +330,16 @@ export class Orchestrator {
 		const sessionFile = previous?.sessionFile ?? this.sessionFileFor(name);
 		preCreateSessionFile(sessionFile);
 		const tempDir = this.runDir;
-		const worktree = resolveLaunchWorktree({ roleDefault: input.agent.worktree, launch: input.worktree });
+		const parentRole = this.legion ? getNode(this.legion.db, this.legion.nodeId)?.role : undefined;
+		const worktree = parentRole === "centurion" && input.agent.name !== "centurion"
+			? false
+			: resolveLaunchWorktree({ roleDefault: input.agent.worktree, launch: input.worktree });
 		let worktreePath = previous?.worktreePath;
 		let worktreeBranch = previous?.worktreeBranch;
 		let createdWorktree = false;
 		let spawned = false;
+		let reservedNode: LegionNode | null = null;
+		let reserved = false;
 		try {
 			if (worktree && !worktreePath) {
 				const tree = createChildWorktree({ repoCwd: this.cwd, runDir: this.runDir, name });
@@ -319,6 +348,10 @@ export class Orchestrator {
 				createdWorktree = true;
 			}
 			const effectiveModel = models.candidates;
+			if (this.legion && nodeId) {
+				reservedNode = this.reserveNode({ nodeId, name, agent: input.agent, task: input.task, sessionFile, team: input.team, worktreePath, model: models.candidates[0] });
+				reserved = true;
+			}
 			let result: Awaited<ReturnType<LegionSupervisor["spawnChild"]>> | undefined;
 			let startedModel: string | undefined;
 			let lastError: unknown;
@@ -331,7 +364,7 @@ export class Orchestrator {
 					sessionFile,
 					tempDir,
 					cwd: worktreePath ?? this.cwd,
-					env: this.lineageEnv(name, input.agent),
+					env: this.lineageEnv(name, input.agent, input.team, nodeId),
 					...(model ? { model } : {}),
 					...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
 					...(input.agent.allowNestedSubagents !== undefined ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
@@ -344,6 +377,7 @@ export class Orchestrator {
 					spawned = true;
 					break;
 				} catch (error) {
+					unsubscribeEvents();
 					lastError = error;
 					if (!canFallbackStart(error) || index === effectiveModel.length - 1) throw error;
 				}
@@ -361,6 +395,7 @@ export class Orchestrator {
 			}
 			const child = previous ?? this.recordChild({
 				name: result.name,
+				...(nodeId ? { nodeId } : {}),
 				agent: input.agent,
 				sessionFile: result.sessionFile,
 				...(startedModel ? { model: startedModel } : {}),
@@ -369,6 +404,8 @@ export class Orchestrator {
 				...(worktreeBranch ? { worktreeBranch } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
+			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
+			this.emitProcess("node_launched", nodeId ?? name, { name, agent: input.agent.name, pid: result.pid });
 			return {
 				name: result.name,
 				sessionFile: result.sessionFile,
@@ -379,6 +416,7 @@ export class Orchestrator {
 			};
 		} catch (error) {
 			if (spawned) await this.supervisor.retire(name).catch(() => {});
+			if (reserved && nodeId) this.rollbackReservation(nodeId, reservedNode);
 			if (createdWorktree && worktreePath) removeChildWorktree({ repoCwd: this.cwd, dest: worktreePath });
 			throw error;
 		}
@@ -419,7 +457,7 @@ export class Orchestrator {
 		}
 	}
 
-	private lineageEnv(name: string, agent: AgentConfig): Record<string, string> {
+	private lineageEnv(name: string, agent: AgentConfig, teamOverride?: string, nodeId?: string): Record<string, string> {
 		const roleDepth = agent.maxSubagentDepth === undefined
 			? Number.POSITIVE_INFINITY
 			: Number.isInteger(agent.maxSubagentDepth) && agent.maxSubagentDepth >= 1
@@ -431,7 +469,9 @@ export class Orchestrator {
 			[CHILD_ENV]: "1",
 			[CHILD_ROLE_ENV]: agent.name,
 		};
-		if (this.team && (this.team.name !== DEFAULT_TEAM || this.team.source === "env")) env[TEAM_ENV] = this.team.name;
+		const team = teamOverride ?? agent.extraFields?.team ?? this.team?.name;
+		if (team && (team !== DEFAULT_TEAM || this.team?.source === "env")) env[TEAM_ENV] = team;
+		if (this.legion && nodeId) Object.assign(env, legionIdentityEnv(this.legion.dbPath, nodeId));
 		if (agent.acceptance?.role) env[CHILD_ACCEPTANCE_ROLE_ENV] = agent.acceptance.role;
 		if (agent.toolBudget?.maxToolCalls !== undefined) env[MAX_TOOL_CALLS_ENV] = String(agent.toolBudget.maxToolCalls);
 		if (agent.turnBudget?.maxTurns !== undefined) env[MAX_TURNS_ENV] = String(agent.turnBudget.maxTurns);
@@ -442,6 +482,7 @@ export class Orchestrator {
 
 	private recordChild(input: {
 		name: string;
+		nodeId?: string;
 		agent: AgentConfig;
 		sessionFile: string;
 		model?: string;
@@ -451,6 +492,7 @@ export class Orchestrator {
 	}): ChildRecord {
 		const child: ChildRecord = {
 			name: input.name,
+			...(input.nodeId ? { nodeId: input.nodeId } : {}),
 			sessionFile: input.sessionFile,
 			ownerToken: ownerToken(),
 			state: "working",
@@ -474,6 +516,7 @@ export class Orchestrator {
 	async steer(name: string, text: string): Promise<void> {
 		const child = this.requireChild(name);
 		await this.supervisor.steer(name, text);
+		this.emitProcess("node_steered", child.nodeId ?? name, { name, text });
 		this.clearBlocked(child);
 	}
 
@@ -484,8 +527,9 @@ export class Orchestrator {
 	}
 
 	async abort(name: string): Promise<void> {
-		this.requireChild(name);
+		const child = this.requireChild(name);
 		await this.supervisor.abort(name);
+		this.emitProcess("node_aborted", child.nodeId ?? name, { name });
 	}
 
 	private requireChild(name: string): ChildRecord {
@@ -609,6 +653,7 @@ export class Orchestrator {
 		if (execution.status !== "running") child.state = "awaiting";
 		child.execution = execution;
 		child.acceptance = acceptance;
+		if (execution.status !== "running") this.recordSettled(child, execution);
 		this.onChildUpdate(child);
 		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
 		let outputFile: string | undefined;
@@ -678,6 +723,11 @@ export class Orchestrator {
 		if (this.supervisor.isAlive(name)) await this.supervisor.retire(name);
 		child.state = "retired";
 		child.retiredAt = new Date(this.now()).toISOString();
+		if (child.nodeId && this.legion) {
+			updateNode(this.legion.db, child.nodeId, { status: child.execution?.status === "success" ? "settled" : child.execution && child.execution.status !== "unknown" && child.execution.status !== "running" ? "failed" : "retired" }, this.now);
+			this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId });
+		}
+		this.emitProcess("node_retired", child.nodeId ?? name, { name });
 		this.onChildUpdate(child);
 		return child;
 	}
@@ -693,7 +743,10 @@ export class Orchestrator {
 	childrenSnapshot(): ChildRecord[] { return [...this.children.values()]; }
 
 	restore(record: RunRecord): void {
-		for (const child of record.children) this.children.set(child.name, { ...child });
+		for (const child of record.children) {
+			const node = this.legion && !child.nodeId ? getChildByName(this.legion.db, this.legion.nodeId, child.name) : null;
+			this.children.set(child.name, { ...child, ...(node ? { nodeId: node.id } : {}) });
+		}
 		this.spawned = Math.max(this.spawned, record.budget.spawned);
 	}
 }

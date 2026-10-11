@@ -8,6 +8,11 @@ import type { LegionEventType as StoredLegionEventType } from "../legion/events.
 
 /** Process-only activity. These events are never written to the closed DB enum. */
 export const LEGION_PROCESS_EVENT_TYPES = [
+	"node_launched",
+	"node_steered",
+	"node_retired",
+	"node_aborted",
+	"ui_request",
 	"text_delta",
 	"tool_call",
 	"agent_settled",

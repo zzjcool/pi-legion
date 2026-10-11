@@ -44,6 +44,17 @@ export function applyThinkingSuffix(
  */
 export const TASK_ARG_LIMIT = 8_000;
 
+/** Legion identity is inherited through every RPC child environment. */
+export const LEGION_DB_ENV = "PI_LEGION_DB";
+export const LEGION_NODE_ID_ENV = "PI_LEGION_NODE_ID";
+
+/** Build the identity overlay passed from one legion supervisor to a child. */
+export function legionIdentityEnv(dbPath: string, nodeId: string): Record<string, string> {
+	if (!dbPath || !path.isAbsolute(dbPath)) throw new TypeError("PI_LEGION_DB must be an absolute path");
+	if (!nodeId || nodeId.trim().length === 0) throw new TypeError("PI_LEGION_NODE_ID must be a non-empty node id");
+	return { [LEGION_DB_ENV]: dbPath, [LEGION_NODE_ID_ENV]: nodeId };
+}
+
 /** Absolute path to this package's extension entry (injected into every child). */
 export function childGuardExtensionPath(): string {
 	return path.resolve(

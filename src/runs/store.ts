@@ -27,6 +27,12 @@ import {
 	type RunRecord,
 } from "../shared/types.ts";
 
+/** M2 tree identity is an additive field on persisted v1 run/child records. */
+declare module "../shared/types.ts" {
+	interface ChildRecord { nodeId?: string; }
+	interface RunRecord { nodeId?: string; }
+}
+
 export interface StoreOptions {
 	rootDir: string;
 	/** Injectable clock (ms epoch) for tests. Defaults to Date.now. */
@@ -244,6 +250,7 @@ export class RunStore {
 		cwd: string;
 		path?: NestedPathEntry[];
 		maxDepth?: number;
+		nodeId?: string;
 		herdr?: RunRecord["herdr"];
 	}): RunRecord {
 		if (typeof input.task !== "string" || input.task.length === 0) {
@@ -264,7 +271,11 @@ export class RunStore {
 			runId: newRunId(),
 			task: input.task,
 			cwd: input.cwd,
-			herdr: input.herdr ?? {},
+			...(input.nodeId ? { nodeId: input.nodeId } : {}),
+			herdr: {
+				...(input.herdr ?? {}),
+				...(input.nodeId ? { node_id: input.nodeId } : {}),
+			},
 			path: (input.path ?? []).slice(0, MAX_NESTED_PATH_ENTRIES),
 			depth: input.path?.length ?? 0,
 			maxDepth: input.maxDepth ?? MAX_NESTED_PATH_ENTRIES,
