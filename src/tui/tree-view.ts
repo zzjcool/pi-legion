@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { LegionEvent } from "../extension/event-bus.ts";
 import type { LegionNode, NodeStatus } from "../legion/nodes.ts";
+import { osc8NodeLink } from "./status.ts";
 
 const TREE_HEADER = "Legion tree · j/k move · enter toggle · / search · pgup/pgdn scroll · esc/q close";
 const DEFAULT_TERMINAL_ROWS = 24;
@@ -232,12 +233,12 @@ export function createTreeView(
 		const selection = isSelected ? "❯" : " ";
 		const indent = "  ".repeat(Math.max(0, node.depth));
 		const model = safeText(node.model);
-		const head = [
-			`● ${safeText(node.name)} (${safeText(node.role)})`,
-			...(model ? [model] : []),
-			formatElapsed(node),
-		].join(" · ");
-		return `${indent}${selection}${marker} ${head}`;
+		return formatNodeLine(node, `${indent}${selection}${marker} `, model);
+	}
+
+	function formatNodeLine(node: TreeNodeSnapshot, prefix: string, model: string, suffix?: string): string {
+		const head = `${prefix}● ${osc8NodeLink(node.id, safeText(node.name))} (${safeText(node.role)})`;
+		return [head, ...(model ? [model] : []), formatElapsed(node), ...(suffix ? [suffix] : [])].join(" · ");
 	}
 
 	function rowDetail(node: TreeNodeSnapshot, isSelected: boolean): string {
@@ -668,6 +669,10 @@ export function createTreeView(
 		headerLineCount = headerLines.length;
 		const lines = [...headerLines];
 		rowOffsets.clear();
+		if (nodes.size === 0) {
+			lines.push(fitLine("No Legion nodes yet.", contentWidth));
+			return lines;
+		}
 		for (const id of visibleIds) {
 			const node = nodes.get(id);
 			if (!node) continue;
@@ -677,7 +682,7 @@ export function createTreeView(
 			const childCount = sortedChildren(id).length;
 			const isExpanded = isVisuallyExpanded(id, searchVisible);
 			const hiddenCount = subtreeSize(id) - 1;
-			const collapsedLine = `${"  ".repeat(Math.max(0, node.depth))}${isSelected ? "❯" : " "}▸ ${safeText(node.name)} +${hiddenCount} collapsed`;
+			const collapsedLine = `${"  ".repeat(Math.max(0, node.depth))}${isSelected ? "❯" : " "}▸ ${osc8NodeLink(node.id, safeText(node.name))} +${hiddenCount} collapsed`;
 			const head = childCount > 0 && !isExpanded
 				? collapsedLine
 				: rowHead(node, isSelected, Boolean(searchVisible && isExpanded));

@@ -21,11 +21,13 @@ export const LEGION_PROCESS_EVENT_TYPES = [
 export type LegionProcessEventType = (typeof LEGION_PROCESS_EVENT_TYPES)[number];
 
 /** Stored tree events plus transient RPC activity for consumers such as the live overlay. */
-export const LEGION_EVENT_TYPES = [
-	...STORED_LEGION_EVENT_TYPES,
-	...LEGION_PROCESS_EVENT_TYPES,
-] as const;
 export type LegionEventType = StoredLegionEventType | LegionProcessEventType;
+export const LEGION_EVENT_TYPES: readonly LegionEventType[] = [
+	...new Set<LegionEventType>([
+		...STORED_LEGION_EVENT_TYPES,
+		...LEGION_PROCESS_EVENT_TYPES,
+	]),
+];
 
 /**
  * A normalized event-bus event. Persisted events retain the DB row id; process-only

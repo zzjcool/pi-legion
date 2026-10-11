@@ -7,7 +7,12 @@
  * plus `requestRender`, not a one-shot `string[]` on a dying context.
  */
 
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	hyperlink,
+	stripTerminalSequences,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import { isThinkingLevel } from "../shared/types.ts";
 
 export const STATUS_WIDGET_KEY = "pi-legion-status";
@@ -19,6 +24,8 @@ export interface StatusEntry {
 	agent: string;
 	state: string;
 	startedAt: number;
+	/** Frozen endpoint for settled nodes; omitted for live entries. */
+	finishedAt?: number;
 	herdrStatus?: string;
 	kind?: string;
 	model?: string;
@@ -26,27 +33,40 @@ export interface StatusEntry {
 	worktreeBranch?: string;
 	turns?: number;
 	lastTools?: string[];
+	phase?: string;
+	/** Legion tree identity; omitted for callers that still use the flat roster. */
+	nodeId?: string;
+	parentId?: string | null;
+	depth?: number;
 }
 
 export function formatElapsed(ms: number): string {
 	return `${Math.max(0, Math.round(ms / 1000))}s`;
 }
 
+function activeEntries(entries: StatusEntry[]): StatusEntry[] {
+	return entries.filter((entry) =>
+		entry.parentId !== null && entry.depth !== 0 && ACTIVE_STATES.has(entry.herdrStatus ?? entry.state),
+	);
+}
+
 export function formatFooterStatus(entries: StatusEntry[]): string | undefined {
-	if (entries.length === 0) return undefined;
-	return entries.length === 1
+	const active = activeEntries(entries);
+	if (active.length === 0) return undefined;
+	return active.length === 1
 		? "1 agent running"
-		: `${entries.length} agents running`;
+		: `${active.length} agents running`;
 }
 
 export function formatBusyLabel(entries: StatusEntry[]): string | undefined {
-	if (entries.length === 0) return undefined;
-	const names = entries.map((entry) => entry.name);
+	const active = activeEntries(entries);
+	if (active.length === 0) return undefined;
+	const names = active.map((entry) => entry.name);
 	const who =
 		names.length > 0
 			? ` (${names.slice(0, 3).join(", ")}${names.length > 3 ? ", …" : ""})`
 			: "";
-	return `⏳ ${entries.length} subagent${entries.length === 1 ? "" : "s"}${who}`;
+	return `⏳ ${active.length} subagent${active.length === 1 ? "" : "s"}${who}`;
 }
 
 function roleSuffix(entry: StatusEntry): string {
@@ -85,12 +105,14 @@ function headlineBits(entry: StatusEntry, now: number): string[] {
 	if (entry.kind && entry.kind !== "pi") bits.push(entry.kind);
 	const model = formatModel(entry);
 	if (model) bits.push(model);
-	bits.push(formatElapsed(now - entry.startedAt));
+	const elapsedEnd = TERMINAL_STATES.has(entry.state) ? entry.finishedAt ?? now : now;
+	bits.push(formatElapsed(elapsedEnd - entry.startedAt));
 	return bits;
 }
 
 function detailBits(entry: StatusEntry): string[] {
-	const bits = [entryStatus(entry)];
+	const status = entryStatus(entry);
+	const bits = [entry.phase ? `${entry.phase}/${status}` : status];
 	if (entry.turns && entry.turns > 0) bits.push(`turn ${entry.turns}`);
 	if (entry.lastTools?.length) {
 		bits.push(entry.lastTools.slice(0, 2).join(", "));
@@ -112,15 +134,169 @@ function formatEntryLines(
 	];
 }
 
+interface TreeStatusEntry {
+	id: string;
+	parentId: string | null;
+	depth: number;
+	entry: StatusEntry;
+	children: TreeStatusEntry[];
+}
+
+const RUNNING_STATES = new Set(["starting", "working", "running"]);
+const ACTIVE_STATES = new Set([...RUNNING_STATES, "blocked"]);
+const TERMINAL_STATES = new Set([
+	"settled",
+	"success",
+	"completed",
+	"failed",
+	"aborted",
+	"retired",
+	"awaiting",
+	"unknown",
+]);
+
+function cleanDisplayText(value: string): string {
+	return stripTerminalSequences(value)
+		.replace(/[\r\n\t]/g, " ")
+		.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/g, "");
+}
+
+/** Return the OSC 8 fallback link used by the status and tree views. */
+export function osc8NodeLink(nodeId: string, label: string): string {
+	const target = `pi-legion://node/${encodeURIComponent(nodeId)}`;
+	return hyperlink(cleanDisplayText(label), target);
+}
+
+function treeEntries(entries: StatusEntry[]): TreeStatusEntry[] {
+	const nodes = new Map<string, TreeStatusEntry>();
+	for (const [index, entry] of entries.entries()) {
+		const id = entry.nodeId ?? `legacy-${index}-${entry.name}`;
+		const separator = id.lastIndexOf(".");
+		const parentId = entry.parentId !== undefined
+			? entry.parentId
+			: separator > 0
+				? id.slice(0, separator)
+				: null;
+		const derivedDepth = parentId === null ? 0 : id.split(".").length - 1;
+		const depth = entry.depth ?? derivedDepth;
+		nodes.set(id, { id, parentId, depth, entry, children: [] });
+	}
+
+	const roots: TreeStatusEntry[] = [];
+	for (const node of nodes.values()) {
+		const parent = node.parentId ? nodes.get(node.parentId) : undefined;
+		if (!parent || parent === node) roots.push(node);
+		else parent.children.push(node);
+	}
+	for (const node of nodes.values()) {
+		node.children.sort((left, right) =>
+			left.entry.startedAt - right.entry.startedAt ||
+			left.entry.name.localeCompare(right.entry.name),
+		);
+	}
+	roots.sort((left, right) =>
+		left.entry.startedAt - right.entry.startedAt ||
+		left.entry.name.localeCompare(right.entry.name),
+	);
+	// Malformed cyclic parent links have no root. Keep those facts visible once.
+	if (roots.length === 0) roots.push(...nodes.values());
+	return roots;
+}
+
+function isActiveEntry(entry: StatusEntry): boolean {
+	return ACTIVE_STATES.has(entry.herdrStatus ?? entry.state);
+}
+
+function descendantCount(node: TreeStatusEntry, seen = new Set<string>()): number {
+	if (seen.has(node.id)) return 0;
+	seen.add(node.id);
+	let count = 0;
+	for (const child of node.children) {
+		count += 1 + descendantCount(child, seen);
+	}
+	return count;
+}
+
+function hasActiveSubtree(
+	node: TreeStatusEntry,
+	memo: Map<string, boolean>,
+	visiting: Set<string> = new Set(),
+): boolean {
+	const cached = memo.get(node.id);
+	if (cached !== undefined) return cached;
+	if (visiting.has(node.id)) return false;
+	visiting.add(node.id);
+	const active = isActiveEntry(node.entry) || node.children.some((child) =>
+		hasActiveSubtree(child, memo, visiting),
+	);
+	visiting.delete(node.id);
+	memo.set(node.id, active);
+	return active;
+}
+
+function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
+	const roots = treeEntries(entries);
+	const running = entries.filter((entry) =>
+		RUNNING_STATES.has(entry.herdrStatus ?? entry.state),
+	).length;
+	const lines = [`⏳ Legion · ${entries.length} agents · ${running} running`];
+	const activeMemo = new Map<string, boolean>();
+	const visited = new Set<string>();
+
+	const visit = (
+		node: TreeStatusEntry,
+		ancestors: string,
+		isLast: boolean,
+	): void => {
+		if (visited.has(node.id)) return;
+		visited.add(node.id);
+		const { entry } = node;
+		const activeSubtree = hasActiveSubtree(node, activeMemo);
+		const collapse = node.children.length > 0 && !activeSubtree &&
+			(node.depth > 2 || TERMINAL_STATES.has(entry.state));
+		const branch = `${ancestors}${isLast ? "└─ " : "├─ "}`;
+		const linkedName = entry.nodeId
+			? osc8NodeLink(entry.nodeId, entry.name)
+			: cleanDisplayText(entry.name);
+		if (collapse) {
+			lines.push(
+				`${branch}▸ ${linkedName} +${descendantCount(node)} collapsed`,
+			);
+			return;
+		}
+
+		const headline = headlineBits(entry, now);
+		headline[0] = `${linkedName}${roleSuffix(entry)}`;
+		lines.push(`${branch}● ${headline.join(" · ")}`);
+		const detailPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
+		lines.push(`${detailPrefix}  ⎿  ${detailBits(entry).map(cleanDisplayText).join(" · ")}`);
+		const childPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
+		for (const [index, child] of node.children.entries()) {
+			visit(child, childPrefix, index === node.children.length - 1);
+		}
+	};
+
+	for (const [index, root] of roots.entries()) {
+		const prefix = root.parentId && !entries.some((entry) => entry.nodeId === root.parentId)
+			? "  ".repeat(Math.max(0, root.depth - 1))
+			: "";
+		visit(root, prefix, index === roots.length - 1);
+	}
+	return lines;
+}
+
 /**
- * Compact roster copied from pi-subagents' async widget: a header plus
- * `● name · elapsed` / `⎿  state` rows.
+ * Compact status roster. Entries carrying Legion identity render as a tree;
+ * callers without tree metadata keep the historical flat format.
  */
 export function formatWidgetLines(
 	entries: StatusEntry[],
 	now: number,
 ): string[] {
 	if (entries.length === 0) return [];
+	if (entries.some((entry) => entry.nodeId !== undefined || entry.parentId !== undefined || entry.depth !== undefined)) {
+		return renderTreeWidgetLines(entries, now);
+	}
 	if (entries.length === 1) {
 		return formatEntryLines(entries[0]!, now, { head: "", detail: "" });
 	}

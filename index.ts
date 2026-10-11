@@ -11,7 +11,6 @@
  *   is still working. Running children are painted next to the input box.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type {
@@ -48,10 +47,16 @@ import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
 import { appendEvent } from "./src/legion/events.ts";
 import { upsertUsage } from "./src/legion/usage.ts";
-import { getChildByName, getChildren, getNode, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
+import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
+import {
+	publishSupervisorEvent,
+	publishUIRequest,
+	registerLegionCommand,
+	type RpcEventSource,
+} from "./src/extension/legion-commands.ts";
 import { DEFAULT_FLUSH_MS, DEFAULT_JOIN_MODE } from "./src/extension/join.ts";
 import { registerChildGuard } from "./src/extension/child-guard.ts";
 import { ALLOW_NESTED_ENV } from "./src/extension/budget.ts";
@@ -249,10 +254,11 @@ function createLegionRuntime(input: {
 	cwd: string;
 	storeRootDir: string;
 	settings: LegionSettings;
+	eventBus: LegionEventBus;
 	registerTools: boolean;
 }): LegionRuntimeIdentity {
 	const self = getNode(input.db, input.nodeId);
-	const eventBus = createLegionEventBus();
+	const eventBus = input.eventBus;
 	const dbEventSource = createDbEventSource(input.db);
 	dbEventSource.start(eventBus);
 	const postman = new LegionPostman({
@@ -298,6 +304,7 @@ function resolveLegionIdentity(input: {
 	store: RunStore;
 	cwd: string;
 	settings: ReturnType<typeof loadSubagentSettings>;
+	eventBus: LegionEventBus;
 	cached?: LegionRuntimeIdentity;
 }): LegionRuntimeIdentity | undefined {
 	const dbPath = process.env[LEGION_DB_ENV];
@@ -316,7 +323,7 @@ function resolveLegionIdentity(input: {
 			nodeRun = input.store.createRun({ task: node.taskSummary ?? `Resume ${node.role} node ${node.id}`, cwd: input.cwd, path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH), maxDepth: effectiveMaxDepth(input.settings.legion?.maxDepth), nodeId, herdr: { supervisor: "rpc", node_id: nodeId } });
 		}
 		if (node.runId !== nodeRun.runId) updateLegionRunId(db, nodeId, nodeRun.runId);
-		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), registerTools: true });
+		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true });
 		if (node.role === "centurion") void resumeLegionTeam({ identity, input });
 		return identity;
 	}
@@ -355,14 +362,14 @@ async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input:
 	}
 }
 
-function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; store: RunStore; cwd: string; task: string; settings: ReturnType<typeof loadSubagentSettings>; maxDepth: number }): LegionRuntimeIdentity {
+function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; store: RunStore; cwd: string; task: string; settings: ReturnType<typeof loadSubagentSettings>; maxDepth: number; eventBus: LegionEventBus }): LegionRuntimeIdentity {
 	const rootRun = input.store.createRun({ task: input.task, cwd: input.cwd, maxDepth: input.maxDepth, nodeId: "root", herdr: { supervisor: "rpc" } });
 	const dbPath = path.resolve(legionDbPath(input.store.runDir(rootRun.runId)));
 	const db = openLegionDb(dbPath);
 	const now = Date.now();
 	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: rootRun.runId, status: "running", taskSummary: input.task.slice(0, 2_000), createdAt: now, updatedAt: now }, () => now);
 	appendEvent(db, "root", "node_launched", { runId: rootRun.runId, task: input.task }, { now: () => now });
-	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), registerTools: false });
+	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false });
 }
 
 async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; db: DatabaseSync; dbPath: string; eventBus: LegionEventBus; settings: LegionSettings; cwd: string; storeRootDir: string; parentNodeId: string; node: LegionNode; message: string }): Promise<void> {
@@ -413,6 +420,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";
 	const supervisor = deps.supervisor ?? new RpcSupervisor();
+	const legionBus = createLegionEventBus();
 	let legionIdentity: LegionRuntimeIdentity | undefined;
 	const stopLegionRuntime = (): void => {
 		if (!legionIdentity) return;
@@ -427,7 +435,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			userSettingsPath: path.join(getAgentDir(), "settings.json"),
 			projectSettingsPath: path.join(ctx.cwd, ".pi", "settings.json"),
 		});
-		const next = resolveLegionIdentity({ pi, supervisor, store, cwd: ctx.cwd, settings, cached: legionIdentity });
+		const next = resolveLegionIdentity({ pi, supervisor, store, cwd: ctx.cwd, settings, eventBus: legionBus, cached: legionIdentity });
 		if (legionIdentity && next !== legionIdentity) stopLegionRuntime();
 		legionIdentity = next;
 	};
@@ -464,8 +472,31 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	// busy parent instead of queueing behind the whole turn (join extends
 	// the window at most MAX_BUSY_EXTENSIONS times).
 	let parentTurnActive = false;
+	const rpcEventSource = supervisor as LegionSupervisor & RpcEventSource;
 	const runtime = createSessionRuntime({
 		sendMessage: (message, options) => pi.sendMessage(message, options),
+		eventBus: legionBus,
+		getTreeNodes: () => legionIdentity
+			? getSubtree(legionIdentity.db, legionIdentity.nodeId)
+			: [],
+		getTreeIdentity: (name) => {
+			const node = legionIdentity && getChildByName(legionIdentity.db, legionIdentity.nodeId, name);
+			return node ? {
+				nodeId: node.id,
+				parentId: node.parentId,
+				depth: node.depth,
+				supervisorName: name,
+			} : undefined;
+		},
+		subscribeSupervisorEvents: (name, listener, options) => rpcEventSource.onEvent?.(
+			name,
+			(event) => {
+				const nodeId = legionIdentity?.childNodeId(name);
+				if (nodeId) publishSupervisorEvent(legionBus, nodeId, event, options);
+				listener(event);
+			},
+			options,
+		) ?? (() => {}),
 		emitBusy: (active, label) => {
 			try { pi.events.emit("pi-legion:busy", active ? { active: true, label } : { active: false }); }
 			catch { /* optional display integration */ }
@@ -493,6 +524,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		getModelRegistry: () => lastModelRegistry,
 	});
 	registerSummaryCommand(pi);
+	registerLegionCommand(pi, { bus: legionBus, runtime, supervisor: rpcEventSource });
 
 	// ── Master switch ────────────────────────────────────────────────────
 	// Session-level override over `subagents.enabled` (user+project settings).
@@ -597,10 +629,10 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 
 			let activeLegion: LegionRuntimeIdentity | undefined;
 			try {
-				activeLegion = resolveLegionIdentity({ pi, supervisor, store, cwd, settings, cached: legionIdentity });
+				activeLegion = resolveLegionIdentity({ pi, supervisor, store, cwd, settings, eventBus: legionBus, cached: legionIdentity });
 				if (!activeLegion && action === "launch" && !isChild) {
 					const plan = buildPlan(params);
-					if (plan.ok) activeLegion = createRootLegion({ pi, supervisor, store, cwd, task: plan.task, settings, maxDepth: effectiveMaxDepth(settings.legion?.maxDepth) });
+					if (plan.ok) activeLegion = createRootLegion({ pi, supervisor, store, cwd, task: plan.task, settings, maxDepth: effectiveMaxDepth(settings.legion?.maxDepth), eventBus: legionBus });
 				}
 				if (activeLegion) legionIdentity = activeLegion;
 			} catch (error) {
@@ -678,9 +710,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 
 	uiProxy.onRequest((pending) => {
 		const legionNodeId = legionIdentity?.childNodeId(pending.childName);
-		if (legionNodeId) {
-			legionIdentity?.eventBus.emit({ nodeId: legionNodeId, type: "ui_request", data: { requestId: pending.id, method: pending.request.method }, ts: Date.now() });
-		}
+		if (legionNodeId) publishUIRequest(legionBus, legionNodeId, pending.request.method);
 		const ui = lastUi;
 		if (!ui) return;
 		const request = pending.request;
@@ -1524,6 +1554,7 @@ function followJob(
 		orchestrator: Orchestrator;
 		store: RunStore;
 		watch: boolean;
+		treeIdentity?: { nodeId: string; parentId: string | null; depth: number };
 	},
 ): void {
 	const child = input.orchestrator
@@ -1540,6 +1571,11 @@ function followJob(
 		...(child?.model ? { model: child.model } : {}),
 		...(child?.thinking !== undefined ? { thinking: child.thinking } : {}),
 		...(child?.worktreeBranch ? { worktreeBranch: child.worktreeBranch } : {}),
+		...(input.treeIdentity ? input.treeIdentity : child?.nodeId ? {
+			nodeId: child.nodeId,
+			parentId: child.nodeId.includes(".") ? child.nodeId.slice(0, child.nodeId.lastIndexOf(".")) : null,
+			depth: child.nodeId.split(".").length - 1,
+		} : {}),
 		collect: () =>
 			input.orchestrator.collect(input.name, { timeoutMs: input.timeoutMs }),
 		persist: async () =>
@@ -1593,6 +1629,13 @@ function followChild(ctx: ChildContext, opts: { watch: boolean }): void {
 		orchestrator: ctx.orchestrator,
 		store: ctx.store,
 		watch: opts.watch,
+		...(ctx.found.child.nodeId ? {
+			treeIdentity: {
+				nodeId: ctx.found.child.nodeId,
+				parentId: ctx.found.child.nodeId.includes(".") ? ctx.found.child.nodeId.slice(0, ctx.found.child.nodeId.lastIndexOf(".")) : null,
+				depth: ctx.found.child.nodeId.split(".").length - 1,
+			},
+		} : {}),
 	});
 }
 
@@ -1613,6 +1656,13 @@ function followLaunched(
 		orchestrator: session.orchestrator,
 		store: session.store,
 		watch: opts.watch,
+		...(child?.nodeId ? {
+			treeIdentity: {
+				nodeId: child.nodeId,
+				parentId: child.nodeId.includes(".") ? child.nodeId.slice(0, child.nodeId.lastIndexOf(".")) : null,
+				depth: child.nodeId.split(".").length - 1,
+			},
+		} : {}),
 	});
 }
 

@@ -15,11 +15,13 @@ export interface LiveOverlayNode extends Pick<LegionNode, "id" | "name" | "role"
 	turns?: number;
 }
 
-/** A single coarse RPC activity event; text is displayed verbatim, never interpreted. */
+/** A normalized tree-bus or coarse RPC activity event; text is display-only. */
 export interface LiveOverlayEvent {
 	type: string;
 	nodeId?: string;
 	ts?: number;
+	id?: number;
+	domain?: "stored" | "process";
 	data?: unknown;
 	[key: string]: unknown;
 }
@@ -138,6 +140,24 @@ function createSession(
 	}
 
 	const activity: string[] = [];
+	const seenStoredEvents = new Set<number>();
+	interface LifecyclePair {
+		stored?: number;
+		process?: number;
+		storedPaired?: boolean;
+		processPaired?: boolean;
+	}
+	const recentLifecycle = new Map<string, LifecyclePair>();
+	const lifecycleEventTypes = new Set([
+		"node_launched",
+		"node_retired",
+		"node_settled",
+		"node_failed",
+		"node_blocked",
+		"node_resumed",
+		"phase_change",
+	]);
+	const lifecyclePairWindowMs = 1_000;
 	let open = true;
 	let subscription: LiveOverlaySubscription | undefined;
 	let overlayHandle: OverlayHandle | undefined;
@@ -198,6 +218,45 @@ function createSession(
 
 	const handleEvent = (event: LiveOverlayEvent): void => {
 		if (!open || (event.nodeId !== undefined && event.nodeId !== nodeId)) return;
+		if (event.id !== undefined) {
+			if (seenStoredEvents.has(event.id)) return;
+			seenStoredEvents.add(event.id);
+			if (seenStoredEvents.size > maxLines * 4) {
+				const oldest = seenStoredEvents.values().next().value;
+				if (oldest !== undefined) seenStoredEvents.delete(oldest);
+			}
+		}
+		if (lifecycleEventTypes.has(event.type)) {
+			const domain = event.domain ?? (event.id === undefined ? "process" : "stored");
+			const key = event.type;
+			const timestamp = event.ts ?? now();
+			const previous = recentLifecycle.get(key) ?? {};
+			const oppositeTimestamp = domain === "stored" ? previous.process : previous.stored;
+			const oppositePaired = domain === "stored" ? previous.processPaired : previous.storedPaired;
+			const duplicate = oppositeTimestamp !== undefined && oppositePaired !== true &&
+				Math.abs(timestamp - oppositeTimestamp) <= lifecyclePairWindowMs;
+			const next: LifecyclePair = { ...previous };
+			if (domain === "stored") {
+				next.stored = timestamp;
+				next.storedPaired = duplicate;
+				if (duplicate) next.processPaired = true;
+			} else {
+				next.process = timestamp;
+				next.processPaired = duplicate;
+				if (duplicate) next.storedPaired = true;
+			}
+			if (next.stored !== undefined && Math.abs(timestamp - next.stored) > lifecyclePairWindowMs) {
+				next.stored = undefined;
+				next.storedPaired = undefined;
+			}
+			if (next.process !== undefined && Math.abs(timestamp - next.process) > lifecyclePairWindowMs) {
+				next.process = undefined;
+				next.processPaired = undefined;
+			}
+			if (next.stored === undefined && next.process === undefined) recentLifecycle.delete(key);
+			else recentLifecycle.set(key, next);
+			if (duplicate) return;
+		}
 		const updateType = readString(event, "updateType");
 		const eventType = event.type === "message_update" ? updateType ?? event.type : event.type;
 		if (eventType === "text_delta") {

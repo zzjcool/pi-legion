@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { getOsc8LinkAtColumn, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { createTreeView, type TreeNodeSnapshot } from "../../src/tui/tree-view.ts";
 
 const BASE_TIME = 1_000;
@@ -66,6 +66,31 @@ function node(
 	};
 }
 
+test("OSC 8 links bind repeated node names to the id on their own tree rows", () => {
+	const nodes = [
+		node("root", null, "root", 0, "root", "running"),
+		node("root.alpha", "root", "alpha", 1, "centurion", "running"),
+		node("root.alpha.worker", "root.alpha", "worker", 2, "worker", "running"),
+		node("root.beta", "root", "beta", 1, "centurion", "running"),
+		node("root.beta.worker", "root.beta", "worker", 2, "worker", "running"),
+	];
+	const view = createTreeView({ nodes });
+	try {
+		const rows = view.render(120).filter((line) => stripTerminalSequences(line).includes("● worker (worker)"));
+		assert.equal(rows.length, 2, "each same-named worker has its own rendered tree row");
+		const targets = rows.map((line) => {
+			const plain = stripTerminalSequences(line);
+			return getOsc8LinkAtColumn(line, plain.indexOf("● worker") + 2);
+		});
+		assert.deepEqual(targets, [
+			"pi-legion://node/root.alpha.worker",
+			"pi-legion://node/root.beta.worker",
+		]);
+	} finally {
+		view.dispose();
+	}
+});
+
 test("tree view default folding is independent of snapshot/event arrival order", () => {
 	const nodes = treeFixture().map((entry) =>
 		entry.id === "root.centurion.worker-a2.deep-manager.deep-worker"
@@ -105,8 +130,8 @@ test("tree view folds settled nodes below depth two and displays one collapsed r
 		assert.equal(view.isExpanded("root.centurion.worker-a2"), true);
 		assert.equal(view.isExpanded("root.centurion.worker-a2.deep-manager"), false);
 		assert.ok(
-			lines.some((line) => line.includes("▸ deep-manager +1 collapsed")),
-			"the depth-three branch is represented by a single collapsed row",
+			lines.some((line) => stripTerminalSequences(line).includes("▸ deep-manager +1 collapsed")),
+			"the depth-three branch is represented by one correctly linked collapsed row",
 		);
 		assert.ok(!lines.some((line) => line.includes("deep-worker")));
 	} finally {
@@ -123,7 +148,7 @@ test("tree view ignores unrelated mail events when preserving machine status tim
 			data: { messageId: 1 },
 			ts: BASE_TIME + 100_000,
 		});
-		const peerLine = view.render(100).find((line) => line.includes("peer (worker)"));
+		const peerLine = view.render(100).find((line) => stripTerminalSequences(line).includes("peer (worker)"));
 		assert.ok(peerLine);
 		assert.match(stripTerminalSequences(peerLine), /peer \(worker\).*0s/);
 	} finally {
@@ -319,7 +344,7 @@ test("tree mouse click toggles the selected row head; narrow layouts never overf
 	try {
 		const wideLines = view.render(100);
 		assert.equal(view.isExpanded("root.centurion.worker-a2.deep-manager"), false);
-		const managerRow = wideLines.findIndex((line) => line.includes("deep-manager +1 collapsed"));
+		const managerRow = wideLines.findIndex((line) => stripTerminalSequences(line).includes("▸ deep-manager +1 collapsed"));
 		assert.ok(managerRow > 0);
 		const mouseResult = view.handleMouse?.({
 			type: "click",
