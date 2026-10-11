@@ -385,6 +385,19 @@ export class RunStore {
 		});
 	}
 
+	async removeChild(runId: string, name: string, expectedNodeId?: string): Promise<RunRecord> {
+		return this.updateRun(runId, (run) => {
+			const index = run.children.findIndex((child) => child.name === name);
+			if (index < 0) return;
+			const existing = run.children[index]!;
+			if (expectedNodeId !== undefined && existing.nodeId !== expectedNodeId) {
+				throw new SubagentError(`child identity mismatch while removing ${name}`, ErrorCodes.INVALID_PARAMS);
+			}
+			run.children.splice(index, 1);
+			run.budget.spawned = Math.max(0, run.budget.spawned - 1);
+		});
+	}
+
 	async updateChild(
 		runId: string,
 		name: string,

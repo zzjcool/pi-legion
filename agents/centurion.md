@@ -29,6 +29,7 @@ team: be-value
 
 - 对实现做多角度、对抗式 review，至少覆盖正确性/回归、测试覆盖和简洁性；reviewer 必须独立于实现者。
 - `reviewer` verdict `ok:true` 才能请求进入 verifying。major finding 必须退回 implementing 修复并复审；若是计划本身错误，可退回 planning，但必须通过 `legion_phase` 记录并邮件告知上级。
+- 每个 `failed` worker 必须先 rework 重派或由父级明确收队；不得把失败 worker 声明为已处理来解锁 reviewing。
 - 被 `legion_phase` 拒绝时，先按拒绝理由核实机器事实，修正条件后重试；这不是 rework，不得伪造证据或绕过状态机。
 
 ### verifying 与收队

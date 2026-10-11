@@ -319,6 +319,18 @@ test("updateChild throws NOT_FOUND for unknown child", async () => {
 	);
 });
 
+test("removeChild atomically releases a failed launch reservation", async () => {
+	const store = newStore();
+	const run = store.createRun({ task: "t", cwd: "/p" });
+	await store.addChild(run.runId, { ...makeChild("worker-0"), nodeId: "root.worker-0", state: "launching" });
+	const removed = await store.removeChild(run.runId, "worker-0", "root.worker-0");
+	assert.equal(removed.children.length, 0);
+	assert.equal(removed.budget.spawned, 0);
+	assert.equal(store.findChild(run.runId, "worker-0"), null);
+	await store.addChild(run.runId, makeChild("worker-0"));
+	assert.equal(store.findChild(run.runId, "worker-0")?.state, "launching");
+});
+
 // ── updateRun + concurrency ───────────────────────────────────────────────
 
 test("updateRun read-modify-write round trip", async () => {
