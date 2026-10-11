@@ -254,12 +254,17 @@ function treeForLiveSource(
 		subscribe(nodeId: string, listener: LiveOverlayListener): LiveOverlaySubscription {
 			refresh();
 			const currentNode = nodes.get(nodeId);
-			const rpcUnsubscribe = subscribeTextDeltas(
-				deps.supervisor,
-				deps.bus,
-				supervisorName(nodeId, currentNode),
-				nodeId,
+			const activeJob = deps.runtime.activeJobs().find((job) =>
+				job.nodeId === nodeId || (job.nodeId === undefined && currentNode !== undefined && job.name === currentNode.name),
 			);
+			const rpcUnsubscribe = activeJob
+				? subscribeTextDeltas(
+					deps.supervisor,
+					deps.bus,
+					supervisorName(nodeId, currentNode),
+					nodeId,
+				)
+				: () => {};
 			const busUnsubscribers = LEGION_EVENT_TYPES.map((type) =>
 				deps.bus.on(type, (event) => {
 					if (event.nodeId !== nodeId) return;
@@ -351,9 +356,15 @@ export function registerLegionCommand(
 		description: "Open the Legion tree, or inspect one node with /legion <name>",
 		getArgumentCompletions(prefix) {
 			if (prefix.includes(" ")) return null;
-			return deps.runtime.treeNodes()
+			const nodes = deps.runtime.treeNodes();
+			return nodes
 				.filter((node) => node.name.startsWith(prefix) || node.id.startsWith(prefix))
-				.map((node) => ({ value: node.name, label: nodeLabel(node.id, node.name) }));
+				.map((node) => ({
+					value: nodes.filter((candidate) => candidate.name === node.name).length > 1
+						? node.id
+						: node.name,
+					label: nodeLabel(node.id, node.name),
+				}));
 		},
 		async handler(args, ctx) {
 			if (!ctx.hasUI) {
@@ -382,12 +393,16 @@ export function registerLegionCommand(
 			}
 
 			let component: TreeViewComponent | undefined;
-			const unsubscribe = LEGION_EVENT_TYPES.map((type) =>
-				deps.bus.on(type, (event: LegionEvent) => {
+			const unsubscribe = LEGION_EVENT_TYPES
+				.filter((type) => type !== "text_delta")
+				.map((type) => deps.bus.on(type, (event: LegionEvent) => {
 					if (!component) return;
-					component.updateSnapshot(deps.runtime.treeNodes(), [event]);
-				}),
-			);
+					const nextNodes = deps.runtime.treeNodes();
+					const node = nextNodes.find((entry) => entry.id === event.nodeId);
+					const retirementOnly = event.type === "node_retired" &&
+						(node?.status === "settled" || node?.status === "failed");
+					component.updateSnapshot(nextNodes, retirementOnly ? [] : [event]);
+				}));
 			const baseFactory = createTreeViewFactory({ nodes });
 			try {
 				await ctx.ui.custom((tui, theme, keybindings, done) => {
