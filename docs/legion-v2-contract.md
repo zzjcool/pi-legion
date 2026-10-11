@@ -343,7 +343,7 @@ interface LegionEventBus {
 }
 ```
 
-消费端（面板/树视图/浮窗/未来动画）只订阅总线，永不直连 DB 或进程事件。**喂料端可插拔**：
+事件类型分两域（REV-13 明确）：**存储域**（对齐 §4.3 的 14 种，经 createDbEventSource 脏检查入总线）与**进程内域**（node_launched/node_steered/node_retired/node_aborted/ui_request + 细粒度观察流 text_delta/tool_call/turn_start/agent_settled，由扩展层在调用 supervisor 方法与接收 uiProxy 回调时同步 emit；事件带 nodeId，不落库）。消费端（面板/树视图/浮窗/未来动画）只订阅总线，永不直连 DB 或进程事件。**喂料端可插拔**：
 - 进程内直发（supervisor 执行命令/投递邮件的瞬间，方法调用级零延迟——覆盖"主干戏份"：直接子节点全部活动）
 - 跨进程增量读：UI 进程每 200–500ms `PRAGMA data_version` 脏检查（一次整数比较，实测可用）→ 变了才 `SELECT * FROM events WHERE id > <游标>`（append-only + AUTOINCREMENT 天然游标）
 - **禁止** `fs.watch` 盯 db 文件（WAL 写入不触主文件 mtime，必漏）
@@ -455,3 +455,4 @@ interface LegionEventBus {
 | 2026-10-11 | REV-10 | REV-9 测试归属从枚举改为类别授权：凡直接 import `src/herdr/*`、`src/runs/layout.ts`、`src/extension/parent-label.ts` 或被删 pane-progress/Placement API 的既有测试文件均在 M1 归属内（含 progress.test.ts 等，不再逐一枚举）。触发：worker-8 第二次按 §15-2 正确拒绝（progress.test.ts 未在 REV-9 枚举内，零改动） |
 | 2026-10-11 | REV-11 | 归属最终形态（终结逐类补丁）：主链切换型里程碑的边界 = 验收本身。测试侧：切换破坏的一切既有测试（含经 fake-herdr 驱动 index.ts 的 teams/presets-regression、断言 herdr 行为的 child-mode/context-injection/playbook 等）均归 M1，锚点 = 切换后全量绿。生产侧：补入 summary.ts 及其他因切换编译失败的 src 文件（仍排除 supervisor/legion/tui/agents/docs）。触发：worker-8 第三次按 §15-2 正确拒绝（fake-herdr 驱动型与行为断言型测试不在 REV-10 类别内，零改动） |
 | 2026-10-11 | REV-12 | REV-11 生产侧排除清单修正：删除 `Placement` 必然波及 `src/agents/agents.ts`（frontmatter 解析/默认值）与 `src/agents/settings.ts`（herdr.defaultPlacement）——锚点「切换后全量绿」自身要求的改动范围，从排除清单移入归属（仅 Placement 相关行，agents/ 其余不动）。触发：worker-8 第四次按 §15-2 正确拒绝（Placement 删除 vs agents/ 排除的矛盾，零改动） |
+| 2026-10-11 | REV-13 | §10.2 总线事件分两域：存储域（§4.3 的 14 种，经 createDbEventSource）与**进程内域**（node_launched/node_steered/node_retired/node_aborted/ui_request + 观察流 text_delta/tool_call/turn_start/agent_settled，带 nodeId 不落库，由扩展层在调 supervisor 方法/接 uiProxy 回调时 emit）。M3-integration 归属增加 `src/extension/event-bus.ts` 的类型集扩展（仅加进程内域类型，不动脏检查逻辑）。原因：RpcSupervisor.onEvent 是 per-child RPC 协议事件，操作级事件（launch/steer/retire）不在其中，须由扩展层显式 emit。触发：worker-12 按 §15-2 正确拒绝（类型闭集不含操作事件，零改动） |
