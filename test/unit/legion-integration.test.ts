@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
+import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import herdrSubagents from "../../index.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "../../src/runs/args.ts";
 import { createLegionEventBus } from "../../src/extension/event-bus.ts";
@@ -68,7 +69,7 @@ test("index root launch honors a per-request team override", async () => {
 	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { disableBuiltins: true, teams: { backend: { members: ["worker"] } } } }));
 	writeFileSync(path.join(extraAgentsDir, "worker.md"), "---\nname: worker\ndescription: unit worker\n---\nworker prompt\n");
 	writeFileSync(path.join(extraAgentsDir, "designer.md"), "---\nname: designer\ndescription: unit designer\n---\ndesigner prompt\n");
-	const previous = new Map(["PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_SUBAGENT_CHILD", "PI_SUBAGENT_ALLOW_NESTED"].map((name) => [name, process.env[name]]));
+	const previous = new Map(["PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_SUBAGENT_CHILD", "PI_SUBAGENT_ALLOW_NESTED", "PI_LEGION_DB", "PI_LEGION_NODE_ID", "PI_SUBAGENTS_TEAM"].map((name) => [name, process.env[name]]));
 	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }> }>();
 	const handlers = new Map<string, (...args: unknown[]) => unknown>();
 	const supervisor = new FakeSupervisor({ immediateTimeout: false });
@@ -80,7 +81,7 @@ test("index root launch honors a per-request team override", async () => {
 	try {
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
-		for (const name of ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_ALLOW_NESTED"]) delete process.env[name];
+		for (const name of ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_ALLOW_NESTED", "PI_LEGION_DB", "PI_LEGION_NODE_ID", "PI_SUBAGENTS_TEAM"]) delete process.env[name];
 		herdrSubagents(pi as never, { supervisor });
 		const tool = tools.get("subagent");
 		assert.ok(tool);
@@ -131,17 +132,25 @@ test("index root launch creates one reusable ledger, child identity opens it, an
 		});
 		assert.match((launch.content ?? []).map((part) => part.text).join("\n"), /worker-0/);
 		const store = new RunStore({ rootDir: path.join(cwd, ".pi-subagents") });
+		await tool.execute("root-test-second", { agent: "worker", task: "reuse the current Legion tree", async: true, worktree: false }, undefined, undefined, {
+			cwd, hasUI: false, ui: { notify() {}, setStatus() {} },
+		});
 		const runs = store.listRuns();
-		assert.equal(runs.length, 2, "the root and its child each have a run.json");
-		const rootRun = runs.find((run) => run.nodeId === "root");
+		assert.equal(runs.length, 3, "one root run is reused while each node retains its own run.json");
+		const rootRuns = runs.filter((run) => run.nodeId === "root");
+		assert.equal(rootRuns.length, 1, "repeated root launches must not create another root ledger");
+		const rootRun = rootRuns[0];
 		const childRun = runs.find((run) => run.nodeId === "root.worker-0");
 		assert.ok(rootRun && childRun);
 		const dbPath = legionDbPath(store.runDir(rootRun.runId));
 		assert.equal(existsSync(dbPath), true);
-		assert.equal(rootRun.children[0]?.nodeId, "root.worker-0");
-		const childSpawn = supervisor.spawns[0]?.input;
-		assert.equal(childSpawn?.env?.[LEGION_DB_ENV], path.resolve(dbPath));
-		assert.equal(childSpawn?.env?.[LEGION_NODE_ID_ENV], "root.worker-0");
+		assert.deepEqual(rootRun?.children.map((child) => child.nodeId), ["root.worker-0", "root.worker-1"]);
+		assert.equal(runs.filter((run) => existsSync(legionDbPath(store.runDir(run.runId)))).length, 1, "only the root run owns legion.db");
+		assert.equal(supervisor.spawns.length, 2);
+		for (const childSpawn of supervisor.spawns.map((spawn) => spawn.input)) {
+			assert.equal(childSpawn?.env?.[LEGION_DB_ENV], path.resolve(dbPath));
+		}
+		assert.deepEqual(supervisor.spawns.map((spawn) => spawn.input.env?.[LEGION_NODE_ID_ENV]), ["root.worker-0", "root.worker-1"]);
 
 		const db = openLegionDb(dbPath);
 		try {
@@ -226,14 +235,22 @@ test("centurion resume recovers a running child and does not revive a settled ch
 	await store.addChild(centurionRun.runId, { name: "worker-done", nodeId: "root.centurion.worker-done", sessionFile: settledSession, ownerToken: "worker-done", state: "retired", spawnedAt: settledRun.createdAt, agent: "worker", kind: "pi" });
 	await store.addChild(centurionRun.runId, { name: "worker-running", nodeId: "root.centurion.worker-running", sessionFile: runningSession, ownerToken: "worker-running", state: "retired", spawnedAt: runningRun.createdAt, agent: "worker", kind: "pi" });
 	try {
+		const rootSupervisor = new FakeSupervisor({ immediateTimeout: false });
+		await rootSupervisor.spawnChild({ name: "centurion", task: "old centurion process", agent: agent("centurion"), sessionFile: centurionSession, tempDir: store.runDir(rootRun.runId), cwd });
+		await rootSupervisor.retire("centurion");
+		db.prepare("UPDATE nodes SET updated_at = 1 WHERE id = ?").run("root.centurion");
+		const orphanMessages: string[] = [];
+		const rootPostman = new LegionPostman({ db, nodeId: "root", supervisor: rootSupervisor, settings: { orphanStaleMs: 100 }, now: () => now + 1_000, sendRootMessage: (message) => orphanMessages.push(message), intervalMs: 10_000 });
+		await rootPostman.tick();
+		assert.ok(orphanMessages.some((message) => message.includes("Legion orphan detected: root.centurion")));
+		assert.ok(readEventsAfter(db, 0).some((event) => event.nodeId === "root.centurion" && event.type === "orphan_detected"));
+		rootPostman.stop();
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
 		process.env.PI_SUBAGENT_CHILD = "1";
 		process.env.PI_SUBAGENT_ALLOW_NESTED = "1";
 		process.env[LEGION_DB_ENV] = path.resolve(dbPath);
 		process.env[LEGION_NODE_ID_ENV] = "root.centurion";
-		const context = { ...process.env };
-		void context;
 		herdrSubagents(pi as never, { supervisor });
 		assert.ok(tools.has("legion_mail"));
 		assert.ok(tools.has("legion_tree"));

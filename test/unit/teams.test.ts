@@ -923,7 +923,7 @@ function indexHarness(
 	cleanup(): Promise<void>;
 } {
 	const cwd = mkdtempSync(path.join(tmpdir(), "teams-index-rpc-"));
-	const names = ["PI_SUBAGENT_CHILD", "PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS"];
+	const names = ["PI_SUBAGENT_CHILD", "PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV];
 	const previous = new Map(names.map((name) => [name, process.env[name]]));
 	const agentDir = path.join(cwd, "agentdir");
 	const extraDir = path.join(cwd, "extra-agents");
@@ -934,6 +934,7 @@ function indexHarness(
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraDir;
 	delete process.env.PI_SUBAGENT_CHILD;
+	for (const name of ["PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV]) delete process.env[name];
 	const supervisor = new FakeSupervisor({
 		immediateTimeout: supervisorOptions.immediateTimeout ?? true,
 		...(supervisorOptions.autoSettle === false ? {} : { autoSettle: { text: `{"ok":true,"reason":"fake RPC child completed"}` } }),

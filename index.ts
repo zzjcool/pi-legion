@@ -419,7 +419,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		legionIdentity.db.close();
 		legionIdentity = undefined;
 	};
-	const initializeLegionRuntime = (ctx: ExtensionContext): void => {
+	const initializeLegionRuntime = (ctx: Pick<ExtensionContext, "cwd">): void => {
 		const store = runStoreFor(ctx.cwd);
 		const settings = loadSubagentSettings({
 			userSettingsPath: path.join(getAgentDir(), "settings.json"),
@@ -432,7 +432,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	if (isChild) {
 		registerChildGuard(pi);
 		if (process.env[LEGION_DB_ENV] && process.env[LEGION_NODE_ID_ENV]) {
-			try { initializeLegionRuntime({ cwd: process.cwd() } as ExtensionContext); }
+			try { initializeLegionRuntime({ cwd: process.cwd() }); }
 			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 		}
 	}

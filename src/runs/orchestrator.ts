@@ -906,6 +906,7 @@ export class Orchestrator {
 		if (child.nodeId && this.legion) {
 			if (child.execution && child.execution.status !== "unknown" && child.execution.status !== "running") {
 				this.recordSettled(child, child.execution);
+				if (child.execution.status !== "aborted") this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, execution: child.execution.status });
 			} else {
 				updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
 				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId });

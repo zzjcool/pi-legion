@@ -68,7 +68,7 @@ async function finishChild(input: {
 	runId: string;
 	role: string;
 	task: string;
-	text: string;	
+	text: string;
 }) {
 	const handle = await input.orchestrator.launch({ agent: agent(input.role), task: input.task, worktree: false });
 	if (input.store.findChild(input.runId, handle.name)) {
