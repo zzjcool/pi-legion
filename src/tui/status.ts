@@ -24,6 +24,8 @@ export interface StatusEntry {
 	agent: string;
 	state: string;
 	startedAt: number;
+	/** Frozen endpoint for settled nodes; omitted for live entries. */
+	finishedAt?: number;
 	herdrStatus?: string;
 	kind?: string;
 	model?: string;
@@ -103,7 +105,8 @@ function headlineBits(entry: StatusEntry, now: number): string[] {
 	if (entry.kind && entry.kind !== "pi") bits.push(entry.kind);
 	const model = formatModel(entry);
 	if (model) bits.push(model);
-	bits.push(formatElapsed(now - entry.startedAt));
+	const elapsedEnd = TERMINAL_STATES.has(entry.state) ? entry.finishedAt ?? now : now;
+	bits.push(formatElapsed(elapsedEnd - entry.startedAt));
 	return bits;
 }
 

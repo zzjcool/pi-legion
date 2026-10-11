@@ -22,7 +22,6 @@ import {
 	type LegionEventBus,
 	LEGION_EVENT_TYPES,
 } from "./event-bus.ts";
-import type { SessionRuntime } from "./runtime.ts";
 import type {
 	EventSubscriptionOptions,
 	LegionSupervisor,
@@ -31,10 +30,10 @@ import type {
 
 export const LEGION_COMMAND = "legion";
 
-export interface LegionCommandRuntime extends Pick<
-	SessionRuntime,
-	"activeJobs" | "treeNodes"
-> {}
+export interface LegionCommandRuntime {
+	activeJobs(): ReadonlyArray<{ name: string; nodeId?: string }>;
+	treeNodes(): readonly TreeNodeSnapshot[];
+}
 
 export interface RpcEventSource {
 	onEvent?: (
@@ -44,13 +43,22 @@ export interface RpcEventSource {
 	) => () => void;
 }
 
-export interface LegionSupervisorEventAdapter extends RpcEventSource, LegionSupervisor {}
+export interface LegionSupervisorEventAdapter extends RpcEventSource, LegionSupervisor {
+	/** Optional bridge for M2 ChildRecord.nodeId once orchestration returns it. */
+	setNodeId(name: string, nodeId: string): void;
+}
 
 export function createLegionSupervisorEventAdapter(
 	supervisor: LegionSupervisor & RpcEventSource,
 	bus: LegionEventBus,
-	nodeIdForName: (name: string) => string,
+	nodeIdForName: (name: string) => string | undefined,
 ): LegionSupervisorEventAdapter {
+	const nodeIds = new Map<string, string>();
+	const pendingLifecycle = new Map<string, Array<Extract<
+		LegionEvent["type"],
+		"node_launched" | "node_steered" | "node_retired" | "node_aborted"
+	>>>();
+	const resolveNodeId = (name: string): string | undefined => nodeIds.get(name) ?? nodeIdForName(name);
 	const emitLifecycle = (
 		name: string,
 		type: Extract<
@@ -58,9 +66,23 @@ export function createLegionSupervisorEventAdapter(
 			"node_launched" | "node_steered" | "node_retired" | "node_aborted"
 		>,
 	): void => {
-		bus.emit({ nodeId: nodeIdForName(name), type, data: null, ts: Date.now() });
+		const nodeId = resolveNodeId(name);
+		if (!nodeId) {
+			const pending = pendingLifecycle.get(name) ?? [];
+			pending.push(type);
+			pendingLifecycle.set(name, pending);
+			return;
+		}
+		bus.emit({ nodeId, type, data: null, ts: Date.now() });
 	};
 	return {
+		setNodeId(name, nodeId) {
+			nodeIds.set(name, nodeId);
+			for (const type of pendingLifecycle.get(name) ?? []) {
+				bus.emit({ nodeId, type, data: null, ts: Date.now() });
+			}
+			pendingLifecycle.delete(name);
+		},
 		async spawnChild(input) {
 			const handle = await supervisor.spawnChild(input);
 			emitLifecycle(handle.name, "node_launched");

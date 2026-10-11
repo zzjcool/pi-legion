@@ -18,6 +18,17 @@ import { RunStore } from "../../src/runs/store.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { assistantMsg, sessionHeader, userMsg } from "../helpers/fixtures.ts";
 
+import type { Component, OverlayHandle } from "@earendil-works/pi-tui";
+import type { LegionEvent } from "../../src/extension/event-bus.ts";
+import {
+	createLegionSupervisorEventAdapter,
+	publishSupervisorEvent,
+	registerLegionCommand,
+	type RpcEventSource,
+} from "../../src/extension/legion-commands.ts";
+import type { TreeNodeSnapshot, TreeViewComponent } from "../../src/tui/tree-view.ts";
+import type { LegionSupervisor, SpawnInput, SupervisorEvent } from "../../src/supervisor/types.ts";
+
 function agent(name = "worker", overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
 		name,
@@ -400,5 +411,318 @@ test("legion child outcomes and usage reach the ledger; resuming reuses its node
 		assert.ok(readEventsAfter(fx.db, 0).some((event) => event.type === "node_resumed" && event.nodeId === ledger.id));
 	} finally {
 		fx.cleanup();
+	}
+});
+
+const NOW = 50_000;
+
+function makeNode(
+	id: string,
+	parentId: string | null,
+	name: string,
+	depth: number,
+	status: TreeNodeSnapshot["status"] = "running",
+): TreeNodeSnapshot {
+	return {
+		id,
+		parentId,
+		name,
+		role: name === "root" ? "ceo" : "worker",
+		kind: "pi",
+		depth,
+		runId: null,
+		sessionFile: null,
+		worktreePath: null,
+		model: "test/model",
+		team: null,
+		status,
+		phase: null,
+		phaseSince: null,
+		reworkCount: 0,
+		contractPath: null,
+		taskSummary: null,
+		createdAt: NOW - 5_000,
+		updatedAt: NOW - 1_000,
+	};
+}
+
+const treeNodes = [
+	makeNode("root", null, "root", 0),
+	makeNode("root.worker", "root", "worker", 1),
+	makeNode("root.other", "root", "other", 1),
+];
+
+class FakeRpcEvents implements RpcEventSource {
+	readonly subscriptions: Array<{
+		name: string;
+		options?: { includeTextDelta?: boolean };
+		listener: (event: SupervisorEvent) => void;
+	}> = [];
+	unsubscribeCount = 0;
+
+	onEvent(
+		name: string,
+		listener: (event: SupervisorEvent) => void,
+		options?: { includeTextDelta?: boolean },
+	): () => void {
+		const subscription = { name, listener, ...(options ? { options } : {}) };
+		this.subscriptions.push(subscription);
+		return () => {
+			this.unsubscribeCount += 1;
+			const index = this.subscriptions.indexOf(subscription);
+			if (index >= 0) this.subscriptions.splice(index, 1);
+		};
+	}
+
+	emit(name: string, event: SupervisorEvent): void {
+		for (const subscription of [...this.subscriptions]) {
+			if (subscription.name === name) subscription.listener(event);
+		}
+	}
+}
+
+function testOverlayHandle(): OverlayHandle {
+	return {
+		hide() {},
+		setHidden() {},
+		isHidden: () => false,
+		focus() {},
+		unfocus() {},
+		isFocused: () => false,
+		getBounds: () => undefined,
+	};
+}
+
+interface OpenCustomCall {
+	component?: Component;
+	options?: { overlay?: boolean; onHandle?: (handle: OverlayHandle) => void };
+	promise: Promise<unknown>;
+}
+
+class FakeCommandUi {
+	readonly calls: OpenCustomCall[] = [];
+	readonly notifications: Array<{ message: string; level: string }> = [];
+	readonly theme = { fg: (_color: string, text: string) => text };
+	readonly tui = { requestRender() {}, terminal: { rows: 8 } };
+
+	custom<T>(
+		factory: (
+			tui: never,
+			theme: never,
+			keybindings: never,
+			done: (result: T) => void,
+		) => Component | Promise<Component>,
+		options?: { overlay?: boolean; onHandle?: (handle: OverlayHandle) => void },
+	): Promise<T> {
+		let resolve!: (value: T) => void;
+		let reject!: (error: unknown) => void;
+		const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+			resolve = resolvePromise;
+			reject = rejectPromise;
+		});
+		const call: OpenCustomCall = { options, promise };
+		this.calls.push(call);
+		try {
+			const created = factory(
+				this.tui as never,
+				this.theme as never,
+				undefined as never,
+				(value) => resolve(value),
+			);
+			void Promise.resolve(created).then((component) => {
+				call.component = component;
+				options?.onHandle?.(testOverlayHandle());
+			}, reject);
+		} catch (error) {
+			reject(error);
+		}
+		return promise;
+	}
+
+	notify(message: string, level = "info"): void {
+		this.notifications.push({ message, level });
+	}
+}
+
+function commandHarness(nodes: TreeNodeSnapshot[] = treeNodes) {
+	const bus = createLegionEventBus();
+	const rpc = new FakeRpcEvents();
+	const ui = new FakeCommandUi();
+	const jobs = nodes
+		.filter((node) => node.parentId !== null)
+		.map((node) => ({ name: node.name, nodeId: node.id, state: "working" }));
+	const runtime = {
+		activeJobs: () => jobs,
+		treeNodes: () => nodes.map((node) => ({ ...node })),
+	};
+	let handler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
+	const pi = {
+		registerCommand(name: string, command: { handler: typeof handler }) {
+			if (name === "legion") handler = command.handler;
+		},
+	};
+	registerLegionCommand(pi as never, { bus, runtime, supervisor: rpc });
+	const ctx = { hasUI: true, cwd: "/tmp", ui };
+	return { bus, rpc, ui, runtime, handler: handler!, ctx };
+}
+
+test("/legion mounts the paged tree; j/o opens a node overlay and q/Esc close both views", async () => {
+	const harness = commandHarness();
+	const treeOpen = harness.handler("", harness.ctx);
+	await Promise.resolve();
+	assert.equal(harness.ui.calls.length, 1);
+	assert.equal(harness.ui.calls[0]?.options?.overlay, undefined);
+	const tree = harness.ui.calls[0]?.component as TreeViewComponent | undefined;
+	assert.ok(tree);
+	assert.ok(tree.render(80).length <= 8, "the factory injects terminal rows for self-paging");
+
+	tree.handleInput?.("j");
+	tree.handleInput?.("j");
+	assert.equal(tree.getState().selectedId, "root.worker");
+	tree.handleInput?.("o");
+	await Promise.resolve();
+	assert.equal(harness.ui.calls.length, 2);
+	assert.equal(harness.ui.calls[1]?.options?.overlay, true);
+	assert.deepEqual(harness.rpc.subscriptions.map(({ name, options }) => ({ name, options })), [
+		{ name: "worker", options: { includeTextDelta: true } },
+	]);
+
+	const overlay = harness.ui.calls[1]?.component as (Component & {
+		getState(): { activity: readonly string[]; open: boolean };
+	}) | undefined;
+	assert.ok(overlay);
+	harness.rpc.emit("other", {
+		name: "other",
+		type: "message_update",
+		updateType: "text_delta",
+		delta: "not for worker",
+	});
+	harness.rpc.emit("worker", {
+		name: "worker",
+		type: "message_update",
+		updateType: "text_delta",
+		delta: "worker output",
+	});
+	assert.deepEqual(overlay.getState().activity, ["worker output"]);
+	assert.equal(overlay.getState().open, true);
+
+	overlay.handleInput?.("\u001b");
+	await harness.ui.calls[1]!.promise;
+	assert.equal(harness.rpc.unsubscribeCount, 1, "closing unsubscribes the one selected child RPC feed");
+	tree.handleInput?.("q");
+	await treeOpen;
+	assert.equal(tree.getState().visibleIds.length > 0, true);
+	assert.equal(harness.rpc.subscriptions.length, 0);
+});
+
+test("/legion <name> opens the selected floating overlay and Esc unsubscribes only that node", async () => {
+	const harness = commandHarness();
+	await harness.handler("worker", harness.ctx);
+	assert.equal(harness.ui.calls.length, 1);
+	assert.equal(harness.ui.calls[0]?.options?.overlay, true);
+	assert.deepEqual(harness.rpc.subscriptions.map((subscription) => subscription.name), ["worker"]);
+	const overlay = harness.ui.calls[0]?.component as Component | undefined;
+	assert.ok(overlay);
+	overlay.handleInput?.("\u001b");
+	await harness.ui.calls[0]!.promise;
+	assert.equal(harness.rpc.unsubscribeCount, 1);
+	assert.equal(harness.rpc.subscriptions.length, 0);
+});
+
+test("/legion rejects ambiguous short names and completes with node labels", async () => {
+	const nodes = [
+		makeNode("root", null, "root", 0),
+		makeNode("root.alpha.worker", "root.alpha", "worker", 2),
+		makeNode("root.beta.worker", "root.beta", "worker", 2),
+	];
+	const harness = commandHarness(nodes);
+	await harness.handler("worker", harness.ctx);
+	assert.equal(harness.ui.calls.length, 0);
+	assert.match(harness.ui.notifications[0]?.message ?? "", /ambiguous/);
+});
+
+test("Legion supervisor adapter emits process-domain lifecycle events on operation completion", async () => {
+	const bus = createLegionEventBus();
+	const seen: LegionEvent[] = [];
+	for (const type of ["node_launched", "node_steered", "node_aborted", "node_retired"] as const) {
+		bus.on(type, (event) => seen.push(event));
+	}
+	const calls: string[] = [];
+	const supervisor: LegionSupervisor & RpcEventSource = {
+		async spawnChild(input: SpawnInput) {
+			calls.push(`spawn:${input.name}`);
+			return { name: input.name, sessionFile: "/tmp/child.jsonl" };
+		},
+		async prompt() {},
+		async steer(name) { calls.push(`steer:${name}`); },
+		async followUp() {},
+		async abort(name) { calls.push(`abort:${name}`); },
+		async waitSettled() { return { settled: true, abnormal: false }; },
+		isAlive() { return true; },
+		async stats() { return null; },
+		async retire(name) { calls.push(`retire:${name}`); },
+		onEvent: (_name, _listener) => () => {},
+	};
+	const adapter = createLegionSupervisorEventAdapter(
+		supervisor,
+		bus,
+		(name) => `root.${name}`,
+	);
+	adapter.setNodeId("worker", "root.centurion.worker");
+	await adapter.spawnChild({ name: "worker" } as SpawnInput);
+	await adapter.steer("worker", "fix this");
+	await adapter.abort("worker");
+	await adapter.retire("worker");
+	assert.deepEqual(calls, ["spawn:worker", "steer:worker", "abort:worker", "retire:worker"]);
+	assert.deepEqual(seen.map(({ type, nodeId }) => ({ type, nodeId })), [
+		{ type: "node_launched", nodeId: "root.centurion.worker" },
+		{ type: "node_steered", nodeId: "root.centurion.worker" },
+		{ type: "node_aborted", nodeId: "root.centurion.worker" },
+		{ type: "node_retired", nodeId: "root.centurion.worker" },
+	]);
+});
+
+test("LegionEventBus only publishes text_delta when the per-child opt-in is enabled", () => {
+	const bus = createLegionEventBus();
+	const seen: LegionEvent[] = [];
+	bus.on("text_delta", (event) => seen.push(event));
+	const event = { name: "worker", type: "message_update", updateType: "text_delta", delta: "secret body" };
+	publishSupervisorEvent(bus, "root.worker", event);
+	assert.deepEqual(seen, []);
+	publishSupervisorEvent(bus, "root.worker", event, { includeTextDelta: true });
+	assert.deepEqual(seen.map(({ nodeId, data }) => ({ nodeId, data })), [
+		{ nodeId: "root.worker", data: { delta: "secret body" } },
+	]);
+});
+
+test("session runtime paints injected machine facts and applies in-process Legion events", () => {
+	const bus = createLegionEventBus();
+	const nodes = [makeNode("root", null, "root", 0)];
+	let factory: ((tui: { requestRender(): void }, theme: { fg(color: string, text: string): string }) => { render(width?: number): string[] }) | undefined;
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus: bus,
+		getTreeNodes: () => nodes,
+		now: () => NOW,
+	});
+	runtime.bind({
+		hasUI: true,
+		ui: {
+			theme: { fg: (_color, text) => text },
+			setStatus() {},
+			setWidget(_key, content) {
+				if (typeof content === "function") factory = content;
+			},
+		},
+	});
+	try {
+		assert.equal(typeof factory, "function");
+		assert.match(factory!({ requestRender() {} }, { fg: (_color, text) => text }).render().join("\n"), /root/);
+		bus.emit({ nodeId: "root", type: "phase_change", data: { from: "planning", to: "done" }, ts: NOW });
+		const rendered = factory!({ requestRender() {} }, { fg: (_color, text) => text }).render().join("\n");
+		assert.match(rendered, /done\/running/);
+		assert.match(rendered, /Legion · 1 agents · 1 running/);
+	} finally {
+		runtime.dispose();
 	}
 });
