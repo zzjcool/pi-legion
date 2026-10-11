@@ -87,12 +87,56 @@ const COARSE_EVENT_TYPES = new Set([
 	"tool_execution_end",
 ]);
 
-/** Resolve the installed package's bundled CLI, independent of the child's cwd. */
-function defaultPiCliPath(): string {
+/**
+ * Resolve the Pi CLI that children should run.
+ *
+ * Children MUST speak the same RPC protocol dialect as the RpcClient we
+ * import (the host pi process's own copy). Resolving through
+ * import.meta.resolve would pick this repo's devDependency (0.85.x), whose
+ * prompt responses lack the `data.disposition` field the 1.1.x client
+ * reads — producing "Cannot read properties of undefined (reading
+ * 'disposition')" on every launch in real deployments. The live tests
+ * missed this because, inside this repo, client and child were both 0.85.x
+ * (self-consistent). Prefer, in order:
+ *   1. an explicit PI_SUBAGENT_CLI env override;
+ *   2. the host pi executable actually running this process
+ *      (process.execPath is node, so resolve via argv[1]);
+ *   3. fall back to import.meta.resolve for bare test harnesses.
+ */
+export function defaultPiCliPath(): string {
+	const override = process.env.PI_SUBAGENT_CLI;
+	if (override) return path.resolve(override);
+
+	const hostEntry = process.argv[1];
+	if (hostEntry && path.isAbsolute(hostEntry)) {
+		let real = hostEntry;
+		try {
+			real = fs.realpathSync(hostEntry);
+		} catch {
+			// Non-existent or unreadable entry (test harnesses): use as-is.
+		}
+		// argv[1] may be the mise pi launcher (a shell-ish node script that
+		// requires cli-runtime.js) or dist/cli.js itself; both live inside a
+		// pi-coding-agent install. Walk up to the package root and use its
+		// dist/cli.js so the child speaks the same dialect as the host client.
+		const marker = path.join("node_modules", "@earendil-works", "pi-coding-agent");
+		const idx = real.lastIndexOf(marker);
+		if (idx !== -1) {
+			return path.join(real.slice(0, idx + marker.length), "dist", "cli.js");
+		}
+		// argv[1] inside the package but not under node_modules (e.g. a linked
+		// install): use it directly when it looks like the cli entry.
+		if (real.endsWith("cli.js") || real.endsWith("cli-runtime.js")) {
+			return real.endsWith("cli-runtime.js")
+				? path.join(path.dirname(real), "cli.js")
+				: real;
+		}
+	}
+
 	const packageEntry = fileURLToPath(
 		import.meta.resolve("@earendil-works/pi-coding-agent"),
 	);
-	return path.resolve(path.dirname(packageEntry), "bundle/cli.js");
+	return path.resolve(path.dirname(packageEntry), "bundle", "cli.js");
 }
 
 function defaultClientFactory(options: RpcClientOptions): RpcClientLike {

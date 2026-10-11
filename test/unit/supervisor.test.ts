@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
 	RpcSupervisor,
+	defaultPiCliPath,
 	type RpcSupervisorOptions,
 } from "../../src/supervisor/rpc-supervisor.ts";
 import {
@@ -675,4 +676,40 @@ test("non-dialog extension UI events queue without an answer callback", () => {
 	assert.equal(callbackCount, 0);
 	proxy.forgetChild("root.worker");
 	assert.equal(proxy.pending().length, 0);
+});
+
+test("defaultPiCliPath prefers the host pi install over the repo devDependency", () => {
+	// Regression: import.meta.resolve picked this repo's 0.85.x devDependency
+	// bundle as the child CLI while the host client was 1.1.x, whose prompt
+	// responses include data.disposition. The 0.85.x child omits `data`, so
+	// every real-deployment launch threw "Cannot read properties of undefined
+	// (reading 'disposition')". The live suite missed it because inside this
+	// repo client and child were both 0.85.x.
+	const originalArgv1 = process.argv[1] ?? "/usr/bin/node";
+	const originalEnv = process.env.PI_SUBAGENT_CLI;
+	try {
+		// 1. Explicit env override wins.
+		process.env.PI_SUBAGENT_CLI = "/opt/other-pi/cli.js";
+		assert.equal(defaultPiCliPath(), "/opt/other-pi/cli.js");
+
+		// 2. Host argv[1] under a pi-coding-agent install resolves to that
+		// install's dist/cli.js (same dialect as the host client).
+		delete process.env.PI_SUBAGENT_CLI;
+		process.argv[1] =
+			"/mise/lib/node_modules/@earendil-works/pi-coding-agent/bin/pi";
+		assert.match(
+			defaultPiCliPath(),
+			/@earendil-works[\\/]pi-coding-agent[\\/]dist[\\/]cli\.js$/,
+		);
+
+		// 3. No override and no recognizable host entry: legacy devDependency
+		// fallback (keeps bare test harnesses working).
+		process.argv[1] = "/usr/bin/node";
+		const fallback = defaultPiCliPath();
+		assert.match(fallback, /pi-coding-agent/);
+	} finally {
+		process.argv[1] = originalArgv1;
+		if (originalEnv === undefined) delete process.env.PI_SUBAGENT_CLI;
+		else process.env.PI_SUBAGENT_CLI = originalEnv;
+	}
 });
