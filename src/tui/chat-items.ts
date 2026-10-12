@@ -153,6 +153,9 @@ export function createChatItemFactory(options: ChatItemFactoryOptions): ChatItem
 					const content = Array.isArray(message.content)
 						? message.content.filter(isTextOrThinking)
 						: [];
+					const hasToolCall = Array.isArray(message.content) &&
+						message.content.some((part) => part?.type === "toolCall");
+					if (content.length === 0 && !hasToolCall) break;
 					const renderableMessage: AssistantMessage = { ...message, content };
 					items.push({
 						kind: "assistant",

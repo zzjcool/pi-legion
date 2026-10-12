@@ -235,6 +235,7 @@ function createSession(
 	let turn = initialNode?.turn ?? initialNode?.turns ?? 0;
 	let turnStartedAt: number | undefined;
 	let streamingText = "";
+	let finalizedAssistantText = "";
 	const activity: string[] = [];
 	let lastActivityTextLine = -1;
 	let toolsExpanded = false;
@@ -447,6 +448,24 @@ function createSession(
 		hasSession = true;
 		turn = Math.max(turn, update.cursor.turnCount);
 
+		if (!initial && finalizedAssistantText) {
+			const finalizedText = finalizedAssistantText;
+			let consumedFinalizedText = false;
+			messages = messages.map((message) => {
+				if (
+					consumedFinalizedText ||
+					message.role !== "assistant" ||
+					!Array.isArray(message.content) ||
+					!messageText(message.content).includes(finalizedText)
+				) {
+					return message;
+				}
+				consumedFinalizedText = true;
+				return { ...message, content: message.content.filter((part) => part?.type !== "text") };
+			});
+			if (consumedFinalizedText) finalizedAssistantText = "";
+		}
+
 		let diskAssistantText: string | undefined;
 		if (!initial) {
 			for (const message of messages) {
@@ -513,6 +532,7 @@ function createSession(
 
 	const updateStreamingText = (delta: string): void => {
 		if (!delta) return;
+		if (finalizedAssistantText) finalizedAssistantText = "";
 		streamingText = clampStreamingText(`${streamingText}${delta}`);
 		appendActivityText(delta);
 		chat.updateStreamingText(streamingText, sourceNode()?.model ?? initialNode?.model ?? undefined);
@@ -525,6 +545,7 @@ function createSession(
 	const finishStreaming = (): void => {
 		if (!streamingText) return;
 		chat.finishStreaming();
+		finalizedAssistantText = streamingText;
 		streamingText = "";
 		requestRender();
 	};
