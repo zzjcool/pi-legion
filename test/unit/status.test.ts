@@ -147,17 +147,31 @@ test("formatWidgetLines keeps the compact roster when no extra fields are set", 
 test("formatWidgetLines renders a tree, folds deep completed subtrees, and opens running paths", () => {
 	const entries = treeEntries();
 	const lines = formatWidgetLines(entries, 5_000).map(stripTerminalSequences);
-	assert.equal(lines[0], "⏳ Legion · 5 agents · 3 running");
-	assert.ok(lines.some((line) => line.includes("▸ deep-manager +1 collapsed")));
+	// Live-panel semantics: the settled deep-manager/deep-worker branch has no
+	// active descendant, so it ages out of the resident widget entirely (its
+	// collapsed row included). Only the three live agents remain.
+	assert.equal(lines[0], "⏳ Legion · 3 agents · 3 running");
+	assert.ok(!lines.some((line) => line.includes("deep-manager")));
 	assert.ok(!lines.some((line) => line.includes("deep-worker")));
 
+	// A completed branch with a running descendant stays, force-expanded, and
+	// the completed parent renders as waiting on downstream work.
 	const runningDeep = entries.map((entry) =>
 		entry.name === "deep-worker" ? { ...entry, state: "working" } : entry,
 	);
 	const expanded = formatWidgetLines(runningDeep, 5_000).map(stripTerminalSequences);
 	assert.ok(expanded.some((line) => line.includes("deep-worker")));
 	assert.ok(!expanded.some((line) => line.includes("deep-manager +1 collapsed")));
+	assert.ok(expanded.some((line) => line.includes("deep-manager (centurion)")), "settled parent with live subtree stays visible");
+	assert.ok(expanded.some((line) => line.includes("waiting")), "waiting-on-downstream state replaces the dead settled label");
 	assert.equal(expanded[0], "⏳ Legion · 5 agents · 4 running");
+});
+
+test("formatWidgetLines clears completely once every agent is done", () => {
+	const finished = treeEntries().map((entry) =>
+		entry.name === "root" ? entry : { ...entry, state: "settled", finishedAt: 4_000 },
+	);
+	assert.deepEqual(formatWidgetLines(finished, 5_000), []);
 });
 
 test("formatWidgetLines renders 300 nodes within the refresh budget", () => {

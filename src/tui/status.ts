@@ -50,6 +50,23 @@ function activeEntries(entries: StatusEntry[]): StatusEntry[] {
 	);
 }
 
+/**
+ * Panel-visibility gate for the status board: with any Legion-identity
+ * entries present, the board mirrors the live-tree filter (completed
+ * branches age out; footer/busy counts stay consistent with the widget).
+ * Legacy flat rosters keep the historical always-shown behavior.
+ */
+export function visiblePanelEntries(entries: StatusEntry[]): StatusEntry[] {
+	const hasTreeIdentity = entries.some(
+		(entry) => entry.nodeId !== undefined || entry.parentId !== undefined || entry.depth !== undefined,
+	);
+	if (!hasTreeIdentity) return entries;
+	const live = filterLiveTree(entries);
+	// Footer/busy labels key off activeEntries(); keep the ledger root row out
+	// of the visible set entirely (it is not an agent).
+	return live.filter((entry) => entry.nodeId !== "root");
+}
+
 export function formatFooterStatus(entries: StatusEntry[]): string | undefined {
 	const active = activeEntries(entries);
 	if (active.length === 0) return undefined;
@@ -234,12 +251,53 @@ function hasActiveSubtree(
 	return active;
 }
 
+/**
+ * Live-activity filter for the resident tree widget: keep a node when it is
+ * active itself or when an active descendant keeps its branch alive (a
+ * centurion waiting on its squad stays visible, rendered as "waiting").
+ * Completed leaves age out — full history remains in /legion and the ledger.
+ * The ledger "root" row is never active on its own: it only appears while a
+ * descendant runs, so the panel clears once the whole tree is at rest.
+ */
+function filterLiveTree(entries: StatusEntry[]): StatusEntry[] {
+	const activeIds = new Set<string>();
+	for (const entry of entries) {
+		if (entry.nodeId && entry.nodeId !== "root" && isActiveEntry(entry)) {
+			activeIds.add(entry.nodeId);
+		}
+	}
+	if (activeIds.size === 0) return [];
+	const keepAncestors = new Set<string>();
+	for (const id of activeIds) {
+		let separator = id.lastIndexOf(".");
+		while (separator > 0) {
+			const ancestor = id.slice(0, separator);
+			keepAncestors.add(ancestor);
+			separator = ancestor.lastIndexOf(".");
+		}
+	}
+	return entries.filter((entry) => {
+		if (entry.nodeId) {
+			return activeIds.has(entry.nodeId) || keepAncestors.has(entry.nodeId);
+		}
+		// Legacy flat entries (no Legion identity): active ones stay.
+		return isActiveEntry(entry);
+	});
+}
+
 function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
-	const roots = treeEntries(entries);
-	const running = entries.filter((entry) =>
+	// The resident widget is a live-activity view: completed agents drop out
+	// once nothing in their subtree is still running (the centurion waiting on
+	// its squad counts as running and keeps the branch alive). Full history
+	// stays available in /legion and the ledger — this panel is for "what is
+	// happening now".
+	const liveEntries = filterLiveTree(entries);
+	if (liveEntries.length === 0) return [];
+	const roots = treeEntries(liveEntries);
+	const running = liveEntries.filter((entry) =>
 		RUNNING_STATES.has(entry.herdrStatus ?? entry.state),
 	).length;
-	const lines = [`⏳ Legion · ${entries.length} agents · ${running} running`];
+	const lines = [`⏳ Legion · ${liveEntries.length} agents · ${running} running`];
 	const activeMemo = new Map<string, boolean>();
 	const visited = new Set<string>();
 
@@ -252,6 +310,12 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
 		visited.add(node.id);
 		const { entry } = node;
 		const activeSubtree = hasActiveSubtree(node, activeMemo);
+		// A terminal node whose subtree is still running is waiting on
+	// downstream work (e.g. a centurion between turns while its squad
+	// executes) — render it as "waiting" instead of a dead settled state.
+		const effectiveEntry = !isActiveEntry(entry) && activeSubtree
+			? { ...entry, state: "waiting" as const, herdrStatus: "waiting" as const }
+			: entry;
 		const collapse = node.children.length > 0 && !activeSubtree &&
 			(node.depth > 2 || TERMINAL_STATES.has(entry.state));
 		const branch = `${ancestors}${isLast ? "└─ " : "├─ "}`;
@@ -265,11 +329,11 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
 			return;
 		}
 
-		const headline = headlineBits(entry, now);
-		headline[0] = `${linkedName}${roleSuffix(entry)}`;
+		const headline = headlineBits(effectiveEntry, now);
+		headline[0] = `${linkedName}${roleSuffix(effectiveEntry)}`;
 		lines.push(`${branch}● ${headline.join(" · ")}`);
 		const detailPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
-		lines.push(`${detailPrefix}  ⎿  ${detailBits(entry).map(cleanDisplayText).join(" · ")}`);
+		lines.push(`${detailPrefix}  ⎿  ${detailBits(effectiveEntry).map(cleanDisplayText).join(" · ")}`);
 		const childPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
 		for (const [index, child] of node.children.entries()) {
 			visit(child, childPrefix, index === node.children.length - 1);
@@ -395,7 +459,7 @@ export function createStatusBoard(): StatusBoard {
 	let tui: WidgetTui | undefined;
 
 	const renderLines = (now: number, theme: Theme): string[] =>
-		themeLines(formatWidgetLines(entries, now), theme);
+		themeLines(formatWidgetLines(visiblePanelEntries(entries), now), theme);
 
 	const safe = (fn: () => void): void => {
 		try {
@@ -416,8 +480,11 @@ export function createStatusBoard(): StatusBoard {
 
 	const paint = (): void => {
 		if (!ctx || !liveHasUi(ctx)) return;
-		safe(() => ctx!.ui.setStatus(STATUS_FOOTER_KEY, formatFooterStatus(entries)));
-		if (entries.length === 0) {
+		// Footer and widget share the live-tree visibility filter so the counts
+		// stay consistent ("N agents running" refers to visible live agents).
+		const visible = visiblePanelEntries(entries);
+		safe(() => ctx!.ui.setStatus(STATUS_FOOTER_KEY, formatFooterStatus(visible)));
+		if (visible.length === 0) {
 			dropWidget();
 			return;
 		}
@@ -454,6 +521,9 @@ export function createStatusBoard(): StatusBoard {
 			paint();
 		},
 		paint(next, _now) {
+			// Store the raw snapshot, but render only the live tree: the resident
+			// panel is a "what is happening now" view (completed agents age out;
+			// footer counts follow the same filter).
 			entries = next;
 			paint();
 		},

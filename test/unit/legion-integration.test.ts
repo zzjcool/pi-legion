@@ -973,8 +973,12 @@ test("session runtime paints injected machine facts and applies in-process Legio
 		assert.equal(failedEntry?.finishedAt, NOW);
 		bus.emit({ nodeId: "root", type: "phase_change", data: { from: "planning", to: "done" }, ts: NOW });
 		const rendered = factory!({ requestRender() {} }, { fg: (_color, text) => text }).render().join("\n");
-		assert.match(rendered, /done\/running/);
-		assert.match(rendered, /Legion · 2 agents · 1 running/);
+		// Live-panel semantics (post live-tree filter): the worker is failed and
+		// nothing runs, so the resident widget clears. The full facts (phase done,
+		// failed node) stay in treeNodes() — the /legion view's data source.
+		assert.equal(rendered, "", "resident panel clears once nothing is running");
+		assert.equal(runtime.treeNodes().find((node) => node.id === "root")?.phase, "done", "ledger facts keep the final phase");
+		assert.equal(runtime.treeNodes().find((node) => node.id === "root.worker")?.status, "failed");
 	} finally {
 		finishRetire?.();
 		runtime.dispose();
