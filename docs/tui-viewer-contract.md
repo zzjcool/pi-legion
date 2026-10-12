@@ -42,7 +42,7 @@
 | T9 | 浮窗内 `app.tools.expand`（ctrl+o）经 keybindingsManager 判定；其余滚动/关闭键用 pi-tui 原生键硬编码 | `app.*` 是 pi 应用级键位可被用户自定义；j/k/pgup/esc 是 pi-tui 原生键。树视图键位维持现状不动。 |
 | T10 | 依赖 caret 升级 `^1.0.0` + 重新生成 lockfile + `npm install` | worktree 无 node_modules 是历史遗留；typecheck/test 需要真实 .d.ts。npm registry pi-coding-agent 与 pi-tui 最新均为 1.1.0（主会话实测）。 |
 | T11 | `ToolExecutionComponent` 的 `ui` 传 `ctx.ui.custom` 工厂第一参数（真实 TUI 实例）；`cwd` 传 `node.worktreePath ?? ctx.cwd`；`toolDefinition` 传 undefined | 查看器无工具注册表上下文；undefined 走 fallback 渲染（scout 实测确认可渲染）。 |
-| T12 | 活跃节点（有 active job）打开浮窗时不轮询磁盘；RPC 流缺位时才轮询 | 沿用现有双通道互斥（`legion-commands.ts:315-319`），既有回归断言 `legion-integration.test.ts:800-829` 必须保留。 |
+| T12 | **[REV-2] 活跃节点（有 active job）打开浮窗时同样轮询磁盘增量；RPC text_delta 流与磁盘轮询并行**。去重机制：磁盘增量中的 assistant 消息落地时收回（retract）流式组件，避免同一条消息双重渲染；若流式文本领先已落盘消息（属于未落盘后续内容），在增量 append 后重建流式组件显示余量 | REV-1 时代的互斥（"RPC 流缺位时才轮询"）导致活跃节点的结构化消息（user / assistant+toolCall / toolResult）无任何路径进入 viewer——正是用户需求"支持动态渲染"要修复的缺口。旧行为的回归断言（`legion-integration.test.ts` "active text-delta sessions do not duplicate session-file activity"）随之改写为：磁盘增量动态出现 + 不与流式文本重复。 |
 
 ---
 
@@ -209,7 +209,8 @@ export type ChatItem =
 - **U6** 快捷键冒烟：ctrl+o 切换工具块展开（render 输出变化）、pgdn 滚动、esc 关闭（新增测试）。
 - **U6a** `test/unit/legion-tree-view.test.ts` 全绿且其覆盖的源文件零改动。
 - **U7** `legion-integration.test.ts:717-725` 的 backfill 行断言允许适配为全量渲染语义（打开时渲染全部 turn，契约 T4）；除此之外该文件仅允许为组件流改造所必需的断言修改。
-- **U7a** 激活节点打开浮窗不轮询磁盘的断言（`legion-integration.test.ts:800-829`）保留。
+- **U7a** [REV-2 改写] 激活节点打开浮窗时磁盘轮询照常工作：RPC text_delta 流活跃期间，session 文件新落盘的结构化消息必须动态出现在 viewer，且不与流式文本重复渲染（收回/重建去重）。原 "active text-delta sessions do not duplicate session-file activity" 断言改写为 "动态出现 + 无重复"（`legion-integration.test.ts` 对应用例）。
+- **U7c** [REV-2 新增] 流式收回去重：磁盘增量落地某 assistant 消息后，流式组件被收回；若 streamingText 领先该消息（未落盘余量），流式组件重建显示余量（`legion-live-overlay.test.ts` 新用例）。
 - **U7b** `legion-schema-sentinel.test.ts` 不受影响（预期全绿）。
 - **U8** `npm run test:all`（typecheck + unit + integration）全绿。
 - **U9**（人工，主会话收官）真实宿主打开 `/legion` 点开 agent，浮窗视觉对齐主上下文。
@@ -264,6 +265,7 @@ export type ChatItem =
 ## 9. 契约修订记录（REV）
 
 - **REV-1**（2026-10-13，触发者 worker-0）：§2a 消息类型 import 修正——`AgentMessage` 来自 `@earendil-works/pi-agent-core`（`dist/types.d.ts:322`）而非 pi-ai（pi-ai@1.1.0 不导出该类型）；`AssistantMessage`/`ThinkingContent` 等成员类型仍来自 pi-ai。机械缺口，直接修订。
+- **REV-2**（2026-10-20，触发者主会话，用户新需求）：T12 互斥解除——用户反馈活跃节点上下文展示不支持动态渲染；根因是 RPC feed 订阅成功时磁盘轮询被关闭，结构化消息无路径进入 viewer。改为双通道并行 + 流式组件收回去重（chat-items.ts 新增 `retractStreamingItem()`）。U7a/U7c 同步改写/新增。涉及文件：`src/extension/legion-commands.ts`（订阅时始终挂 pollBackfill）、`src/tui/live-overlay.ts`（acceptBackfill 增量收回/重建流式组件）、`src/tui/chat-items.ts`（新增收回能力）、两测试文件。
 
 ## 10. 修订规则
 
