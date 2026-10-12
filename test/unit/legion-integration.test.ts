@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -28,6 +28,7 @@ import {
 	registerLegionCommand,
 	type RpcEventSource,
 } from "../../src/extension/legion-commands.ts";
+import type { LiveOverlayComponent } from "../../src/tui/live-overlay.ts";
 import type { TreeNodeSnapshot, TreeViewComponent } from "../../src/tui/tree-view.ts";
 import type { SupervisorEvent } from "../../src/supervisor/types.ts";
 
@@ -181,9 +182,9 @@ test("index root launch creates one reusable ledger, child identity opens it, an
 			method: "notify",
 			message: "approval notification",
 		});
-		assert.deepEqual(liveOverlay.getState().activity, ["· ui_request"], "extension UI requests are visible through the shared event bus");
+		assert.equal(liveOverlay.getState().activity.at(-1), "· ui_request", "extension UI requests are visible through the shared event bus after session history");
 		supervisor.settle("worker-0", { text: "done" });
-		assert.deepEqual(liveOverlay.getState().activity, ["· ui_request", "✓ agent turn settled"], "index wiring forwards RPC observation events over the extension-lifetime Legion bus");
+		assert.equal(liveOverlay.getState().activity.at(-1), "✓ agent turn settled", "index wiring forwards RPC observation events over the extension-lifetime Legion bus");
 		liveOverlay.handleInput?.("\u001b");
 		await liveUi.calls[0]!.promise;
 
@@ -669,6 +670,108 @@ test("/legion <name> opens the selected floating overlay and Esc unsubscribes on
 	await harness.ui.calls[0]!.promise;
 	assert.equal(harness.rpc.unsubscribeCount, 1);
 	assert.equal(harness.rpc.subscriptions.length, 0);
+});
+
+test("/legion backfills session history, polls stopped nodes for appends, then stops polling on close", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "legion-overlay-history-"));
+	const sessionFile = path.join(cwd, "worker.jsonl");
+	writeFileSync(sessionFile, [
+		sessionHeader({ cwd }),
+		userMsg("oldest request"),
+		assistantMsg({ text: "oldest response" }),
+		userMsg("first request"),
+		assistantMsg({ text: "first response", tools: ["read"] }),
+		userMsg("second request"),
+		assistantMsg({ text: "second response" }),
+		userMsg("third request"),
+		assistantMsg({ text: "third response" }),
+	].join("\n") + "\n");
+	const nodes = [
+		makeNode("root", null, "root", 0),
+		{ ...makeNode("root.worker", "root", "worker", 1, "settled"), sessionFile },
+	];
+	const harness = commandHarness(nodes, []);
+	let overlay: LiveOverlayComponent | undefined;
+	try {
+		await harness.handler("worker", harness.ctx);
+		overlay = harness.ui.calls[0]?.component as LiveOverlayComponent | undefined;
+		assert.ok(overlay);
+		const state = overlay;
+		assert.deepEqual(state.getState().activity, [
+			"▸ first request",
+			"first response",
+			"⚙ read",
+			"▸ second request",
+			"second response",
+			"▸ third request",
+			"third response",
+		], "default history contains only the newest three turns");
+
+		appendFileSync(sessionFile, [userMsg("fourth request"), assistantMsg({ text: "fourth response", tools: ["write"] })].join("\n") + "\n");
+		const pollDeadline = Date.now() + 1_500;
+		while (state.getState().activity.at(-1) !== "⚙ write" && Date.now() < pollDeadline) {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		assert.deepEqual(state.getState().activity, [
+			"▸ first request",
+			"first response",
+			"⚙ read",
+			"▸ second request",
+			"second response",
+			"▸ third request",
+			"third response",
+			"▸ fourth request",
+			"fourth response",
+			"⚙ write",
+		]);
+
+		state.close();
+		await harness.ui.calls[0]!.promise;
+		appendFileSync(sessionFile, [userMsg("after close"), assistantMsg({ text: "should not appear" })].join("\n") + "\n");
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		assert.equal(state.getState().activity.at(-1), "⚙ write", "closed overlays do not continue polling the session file");
+	} finally {
+		overlay?.dispose();
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("/legion does not poll session history when the active node has a text-delta RPC feed", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "legion-overlay-active-"));
+	const sessionFile = path.join(cwd, "worker.jsonl");
+	writeFileSync(sessionFile, [sessionHeader({ cwd }), userMsg("existing request"), assistantMsg({ text: "existing response" })].join("\n") + "\n");
+	const nodes = [
+		makeNode("root", null, "root", 0),
+		{ ...makeNode("root.worker", "root", "worker", 1), sessionFile },
+	];
+	const harness = commandHarness(nodes, [{ name: "worker", nodeId: "root.worker", state: "working" }]);
+	let overlay: LiveOverlayComponent | undefined;
+	try {
+		await harness.handler("worker", harness.ctx);
+		overlay = harness.ui.calls[0]?.component as LiveOverlayComponent | undefined;
+		assert.ok(overlay);
+		const state = overlay;
+		const history = ["▸ existing request", "existing response"];
+		assert.deepEqual(state.getState().activity, history);
+		assert.deepEqual(harness.rpc.subscriptions.map(({ name, options }) => ({ name, options })), [
+			{ name: "worker", options: { includeTextDelta: true } },
+		]);
+
+		appendFileSync(sessionFile, [userMsg("RPC-owned request"), assistantMsg({ text: "disk content must not be polled" })].join("\n") + "\n");
+		await new Promise((resolve) => setTimeout(resolve, 350));
+		assert.deepEqual(state.getState().activity, history, "active text-delta sessions do not duplicate session-file activity");
+		harness.rpc.emit("worker", {
+			name: "worker",
+			type: "message_update",
+			updateType: "text_delta",
+			delta: "live RPC output",
+		});
+		assert.deepEqual(state.getState().activity, [...history, "live RPC output"]);
+	} finally {
+		overlay?.handleInput?.("\u001b");
+		if (harness.ui.calls[0]) await harness.ui.calls[0].promise;
+		rmSync(cwd, { recursive: true, force: true });
+	}
 });
 
 test("/legion shows a prompt for an empty Legion tree", async () => {

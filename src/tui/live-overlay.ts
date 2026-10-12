@@ -26,13 +26,36 @@ export interface LiveOverlayEvent {
 	[key: string]: unknown;
 }
 
-export type LiveOverlaySubscription = () => void;
+export interface LiveOverlayBackfillCursor {
+	/** Number of parsed turns already represented by the overlay. */
+	turnCount: number;
+	/** Number of assistant messages already represented by the overlay. */
+	assistantMessageCount: number;
+	/** Session file size used to skip polls when the append-only file is unchanged. */
+	fileSize: number;
+}
+
+export interface LiveOverlayBackfillResult {
+	lines: readonly string[];
+	cursor: LiveOverlayBackfillCursor;
+}
+
+export type LiveOverlayBackfill = (
+	nodeId: string,
+	maxBackfillTurns: number,
+) => LiveOverlayBackfillResult | undefined;
+
+export type LiveOverlaySubscription = (() => void) & {
+	/** Present only when the subscription did not acquire the live text-delta RPC feed. */
+	pollBackfill?: (cursor: LiveOverlayBackfillCursor) => LiveOverlayBackfillResult | undefined;
+};
 export type LiveOverlayListener = (event: LiveOverlayEvent) => void;
 
 export interface LiveOverlaySource {
 	subscribe(nodeId: string, listener: LiveOverlayListener): LiveOverlaySubscription;
 	unsubscribe(subscription: LiveOverlaySubscription): void;
 	getNode(nodeId: string): LiveOverlayNode | null | undefined;
+	backfill?: LiveOverlayBackfill;
 }
 
 export interface LiveOverlayTheme {
@@ -46,6 +69,9 @@ export interface LiveOverlayOpenOptions {
 	requestRender?: () => void;
 	maxLines?: number;
 	maxLineWidth?: number;
+	maxBackfillTurns?: number;
+	/** Override the source's session-history loader (primarily for embedding and tests). */
+	backfill?: LiveOverlayBackfill;
 }
 
 export interface LiveOverlayState {
@@ -74,6 +100,8 @@ export interface LiveOverlayController {
 
 const DEFAULT_ACTIVITY_LINES = 120;
 const DEFAULT_ACTIVITY_LINE_WIDTH = 2_000;
+const DEFAULT_BACKFILL_TURNS = 3;
+const BACKFILL_POLL_INTERVAL_MS = 250;
 
 /**
  * Build an on-demand live overlay controller. Calling `open` subscribes to the
@@ -132,11 +160,15 @@ function createSession(
 	const now = options.now ?? (() => Date.now());
 	const maxLines = options.maxLines ?? DEFAULT_ACTIVITY_LINES;
 	const maxLineWidth = options.maxLineWidth ?? DEFAULT_ACTIVITY_LINE_WIDTH;
+	const maxBackfillTurns = options.maxBackfillTurns ?? DEFAULT_BACKFILL_TURNS;
 	if (!Number.isSafeInteger(maxLines) || maxLines < 1) {
 		throw new TypeError("maxLines must be a positive safe integer");
 	}
 	if (!Number.isSafeInteger(maxLineWidth) || maxLineWidth < 1) {
 		throw new TypeError("maxLineWidth must be a positive safe integer");
+	}
+	if (!Number.isSafeInteger(maxBackfillTurns) || maxBackfillTurns < 0) {
+		throw new TypeError("maxBackfillTurns must be a non-negative safe integer");
 	}
 
 	const activity: string[] = [];
@@ -160,6 +192,8 @@ function createSession(
 	const lifecyclePairWindowMs = 1_000;
 	let open = true;
 	let subscription: LiveOverlaySubscription | undefined;
+	let backfillInterval: ReturnType<typeof globalThis.setInterval> | undefined;
+	let backfillCursor: LiveOverlayBackfillCursor | undefined;
 	let overlayHandle: OverlayHandle | undefined;
 	let lastTextLine = -1;
 	const initialNode = source.getNode(nodeId);
@@ -187,6 +221,15 @@ function createSession(
 		}
 		keepActivityBounded();
 	};
+
+	// Hydrate synchronously before subscribing so the first render has history;
+	// this path intentionally does not call requestRender.
+	const initialBackfill = options.backfill?.(nodeId, maxBackfillTurns) ??
+		source.backfill?.(nodeId, maxBackfillTurns);
+	if (initialBackfill) {
+		backfillCursor = initialBackfill.cursor;
+		for (const line of initialBackfill.lines) appendLine(safeEventText(line));
+	}
 
 	const appendText = (text: string): void => {
 		const chunks = text.split("\n");
@@ -350,6 +393,10 @@ function createSession(
 	const close = (): void => {
 		if (!open) return;
 		open = false;
+		if (backfillInterval !== undefined) {
+			globalThis.clearInterval(backfillInterval);
+			backfillInterval = undefined;
+		}
 		const activeSubscription = subscription;
 		subscription = undefined;
 		if (activeSubscription) source.unsubscribe(activeSubscription);
@@ -383,7 +430,25 @@ function createSession(
 
 	try {
 		subscription = source.subscribe(nodeId, handleEvent);
+		if (backfillCursor && subscription.pollBackfill) {
+			backfillInterval = globalThis.setInterval(() => {
+				if (!open || !backfillCursor || !subscription?.pollBackfill) return;
+				let update: LiveOverlayBackfillResult | undefined;
+				try {
+					update = subscription.pollBackfill(backfillCursor);
+				} catch {
+					// A transient file race must not break the TUI's interval callback.
+					return;
+				}
+				if (!update) return;
+				backfillCursor = update.cursor;
+				for (const line of update.lines) appendLine(safeEventText(line));
+				if (update.lines.length > 0) options.requestRender?.();
+			}, BACKFILL_POLL_INTERVAL_MS);
+		}
 	} catch (error) {
+		if (backfillInterval !== undefined) globalThis.clearInterval(backfillInterval);
+		backfillInterval = undefined;
 		open = false;
 		onClose();
 		throw error;

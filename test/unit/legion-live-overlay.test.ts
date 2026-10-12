@@ -12,6 +12,7 @@ import type { OverlayHandle } from "@earendil-works/pi-tui";
 
 class FakeOverlaySource implements LiveOverlaySource {
 	readonly listeners = new Map<LiveOverlaySubscription, { nodeId: string; listener: LiveOverlayListener }>();
+	backfill?: LiveOverlaySource["backfill"];
 	subscribeCount = 0;
 	unsubscribeCount = 0;
 	private nextSubscription = 0;
@@ -155,4 +156,80 @@ test("opening a different node closes the old subscription, and done runs once o
 	const third = overlay.open("root.worker", { done: () => doneCount++ });
 	third.handleInput?.("\u001b");
 	assert.equal(doneCount, 2);
+});
+
+test("live overlay synchronously backfills safe activity before subscribing without requesting a render", () => {
+	const source = new FakeOverlaySource();
+	const overlay = createLiveOverlay(source);
+	const requestedTurns: number[] = [];
+	let requestRenderCount = 0;
+	const component = overlay.open("root.worker", {
+		maxBackfillTurns: 2,
+		backfill(nodeId, maxBackfillTurns) {
+			assert.equal(nodeId, "root.worker");
+			assert.equal(source.subscribeCount, 0, "history is loaded before the live event subscription");
+			requestedTurns.push(maxBackfillTurns);
+			return {
+				lines: ["▸ archived request", "\u001b[31marchived answer\u001b[0m", "⚙ read"],
+				cursor: { turnCount: 1, assistantMessageCount: 1, fileSize: 128 },
+			};
+		},
+		requestRender() {
+			requestRenderCount++;
+		},
+	});
+	try {
+		assert.deepEqual(requestedTurns, [2]);
+		assert.deepEqual(component.getState().activity, ["▸ archived request", "archived answer", "⚙ read"]);
+		assert.equal(requestRenderCount, 0, "synchronous backfill is present on first render without scheduling another one");
+		assert.equal(source.subscribeCount, 1);
+	} finally {
+		component.close();
+	}
+});
+
+test("live overlay polls non-RPC backfill, renders deltas, and stops polling when closed", async () => {
+	const source = new FakeOverlaySource();
+	const stopPolling: string[] = [];
+	const originalSubscribe = source.subscribe.bind(source);
+	source.backfill = () => ({
+		lines: ["▸ existing request"],
+		cursor: { turnCount: 1, assistantMessageCount: 1, fileSize: 128 },
+	});
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			stopPolling.push("poll");
+			return stopPolling.length === 1
+				? {
+					lines: ["new response"],
+					cursor: { turnCount: 2, assistantMessageCount: 2, fileSize: 192 },
+				}
+				: undefined;
+		};
+		return subscription;
+	};
+	let requestRenderCount = 0;
+	const component = createLiveOverlay(source).open("root.worker", {
+		requestRender() {
+			requestRenderCount++;
+		},
+	});
+	try {
+		assert.deepEqual(component.getState().activity, ["▸ existing request"]);
+		const deadline = Date.now() + 1_500;
+		while (stopPolling.length === 0 && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		assert.equal(stopPolling.length, 1, "the file-backed source is polled on the 250ms interval");
+		assert.deepEqual(component.getState().activity, ["▸ existing request", "new response"]);
+		assert.equal(requestRenderCount, 1, "incremental backfill requests a render once");
+
+		component.close();
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		assert.equal(stopPolling.length, 1, "close clears the backfill interval");
+		assert.equal(source.unsubscribeCount, 1);
+	} finally {
+		component.close();
+	}
 });
