@@ -748,7 +748,7 @@ test("finalized dedup preserves toolCall blocks of the landing message", async (
 
 test("a fresh streaming cycle clears the finalized record", async () => {
 	const source = new FakeOverlaySource();
-	const diskMessages = [assistantMessage("answer two")];
+	const diskMessages = [assistantMessage("alpha and more")];
 	let polls = 0;
 	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
 	const originalSubscribe = source.subscribe.bind(source);
@@ -764,15 +764,16 @@ test("a fresh streaming cycle clears the finalized record", async () => {
 	};
 	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
 	try {
-		source.emit("root.worker", { type: "text_delta", delta: "answer one" });
+		source.emit("root.worker", { type: "text_delta", delta: "alpha" });
 		source.emit("root.worker", { type: "agent_settled" });
-		source.emit("root.worker", { type: "text_delta", delta: "answer two" });
+		source.emit("root.worker", { type: "text_delta", delta: "beta" });
 		const pollDeadline = Date.now() + 1_500;
 		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
 		assert.equal(polls, 1, "the incremental session-file batch is polled");
 
 		const rendered = stripTerminalSequences(component.getState().text);
-		assert.equal(rendered.split("answer two").length - 1, 1);
+		assert.match(rendered, /alpha and more/);
+		assert.equal(rendered.split("alpha and more").length - 1, 1);
 	} finally {
 		component.close();
 	}
