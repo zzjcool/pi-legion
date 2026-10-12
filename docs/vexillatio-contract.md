@@ -96,8 +96,12 @@ const VexillatioParams = Type.Object({
 | `src/extension/child-guard.ts` | 无改动（预算变量照旧）；如需在 child 附录说明 vexillatio，最小追加 |
 | `~/.pi/agent/agents/scout.md` | 加 `utility: true`（**用户层文件，部署时应用；worker 不改它**，写进部署清单） |
 | `agents/scout.md`（内置层） | 同上（包内默认） |
+| `test/unit/utility-agents.test.ts` | **新建**。§4 场景 1（frontmatter `utility` 解析）+ 场景 5（utility+allowNested 同开 warning） |
+| `test/integration/vexillatio.test.ts` | **新建**。§4 场景 2/3/4（mock supervisor：env 剔除断言 / 非 utility 硬拒 / subagent 兼容派发） |
 
 **共享文件**：`index.ts` / `orchestrator.ts` / `types.ts` 本契约全部分配给唯一 worker，无并发写。
+
+**既有测试文件一律不修改**；§4 要求的新增测试全部落在上面两个新文件里。
 
 ## 4. 验收清单（可机器检查）
 
@@ -128,3 +132,4 @@ const VexillatioParams = Type.Object({
 | 日期 | 版本 | 修订 | 原因 |
 |---|---|---|---|
 | 2026-10-12 | REV-17 初版 | — | 首次冻结 |
+| 2026-10-12 | REV-17.1 | §3 增补两行测试文件所有权（新建 `test/unit/utility-agents.test.ts`、`test/integration/vexillatio.test.ts`），并明确既有测试文件不改 | worker 依 §4 验收要求提出契约矛盾（§3 未授权测试文件）——拒绝正确，修订后重派 |
