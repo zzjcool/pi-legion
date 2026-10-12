@@ -194,6 +194,8 @@ const LEGION_SETTING_FIELDS = [
 	"maxActiveNodes",
 	"phaseTimeouts",
 	"verifyCommandTimeoutMs",
+	"worktreeBootstrap",
+	"worktreeBootstrapTimeoutMs",
 	"mailRatePer5Min",
 	"usagePollMs",
 	"orphanStaleMs",
@@ -272,6 +274,20 @@ function parseLegionSettings(
 	);
 	if (verifyCommandTimeoutMs !== undefined)
 		out.verifyCommandTimeoutMs = verifyCommandTimeoutMs;
+	if (input.worktreeBootstrap !== undefined) {
+		if (typeof input.worktreeBootstrap !== "string")
+			throw new Error(
+				`${filePath}: legion.worktreeBootstrap must be a string ("npm-install" or a shell command)`,
+			);
+		out.worktreeBootstrap = input.worktreeBootstrap.trim();
+	}
+	const worktreeBootstrapTimeoutMs = positiveInt(
+		input.worktreeBootstrapTimeoutMs,
+		"legion.worktreeBootstrapTimeoutMs",
+		filePath,
+	);
+	if (worktreeBootstrapTimeoutMs !== undefined)
+		out.worktreeBootstrapTimeoutMs = worktreeBootstrapTimeoutMs;
 	const mailRatePer5Min = nonNegativeInt(
 		input.mailRatePer5Min,
 		"legion.mailRatePer5Min",

@@ -915,6 +915,7 @@ function indexHarness(
 	settings: Record<string, unknown>,
 	agents: Record<string, string>,
 	supervisorOptions: { autoSettle?: boolean; immediateTimeout?: boolean } = {},
+	verifyRunner?: (command: string, cwd: string) => Promise<{ code: number; stdout: string; stderr: string }>,
 ): {
 	cwd: string;
 	supervisor: FakeSupervisor;
@@ -947,7 +948,7 @@ function indexHarness(
 		events: { emit() {} },
 		on(name: string, handler: (...args: any[]) => unknown) { handlers.set(name, handler); },
 	};
-	herdrSubagents(pi as never, { supervisor });
+	herdrSubagents(pi as never, { supervisor, ...(verifyRunner ? { verifyRunner } : {}) });
 	const tool = tools.find((entry) => entry.name === "subagent") as {
 		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }>;
 	};
@@ -1064,6 +1065,103 @@ test("index mainline: environment default team reaches child and non-pi role rec
 		assert.equal(harness.supervisor.spawns.length, 1, "non-pi kinds never reach RpcSupervisor.spawnChild");
 	} finally {
 		restoreEnv(TEAM_ENV, previous);
+		await harness.cleanup();
+	}
+});
+
+test("index verify: launch-supplied commands run at collect and gate the verdict", async () => {
+	const calls: Array<{ command: string; cwd: string }> = [];
+	const verifyRunner = async (command: string, cwd: string) => {
+		calls.push({ command, cwd });
+		// The joined criterion command is one string; fail it as bash would
+		// (&& short-circuits at npm test, so the whole chain is non-zero).
+		return command === "npm run typecheck && npm test" ? { code: 1, stdout: "", stderr: "1 failing" } : { code: 0, stdout: "ok", stderr: "" };
+	};
+	// async:false so the tool call collects inline and the verify chain runs.
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: true },
+		verifyRunner,
+	);
+	try {
+		const text = await invokeIndex(harness, {
+			agent: "worker",
+			task: "implement",
+			async: false,
+			worktree: false,
+			verify: ["npm run typecheck", "npm test"],
+		});
+		assert.ok(text.length > 0, "inline collect produced output");
+		// The launcher's verify list is joined into ONE criterion command; the
+		// runner sees the joined form and the child cwd (no worktree → launch cwd).
+		assert.deepEqual(calls.map((c) => c.command), ["npm run typecheck && npm test"]);
+		assert.equal(calls[0]?.cwd, harness.cwd);
+		// The joined command exits non-zero (npm test fails under &&) and rejects
+		// the verdict with the failing command named.
+		assert.match(text, /rejected/);
+		assert.match(text, /npm test/);
+		const runs = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") }).listRuns();
+		const workerRun = runs.flatMap((run) => run.children).find((child) => child.agent === "worker");
+		assert.ok(workerRun, "worker child record persisted");
+		assert.ok(
+			(workerRun.pendingCriteria ?? []).some((criterion) => criterion.id === "task-verify" && criterion.command === "npm run typecheck && npm test"),
+			"task-verify criterion was snapshotted into pendingCriteria at launch",
+		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("index verify: all commands passing promotes the verdict to verified", async () => {
+	const calls: Array<{ command: string; cwd: string }> = [];
+	const verifyRunner = async (command: string, cwd: string) => {
+		calls.push({ command, cwd });
+		return { code: 0, stdout: "green", stderr: "" };
+	};
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: true },
+		verifyRunner,
+	);
+	try {
+		const text = await invokeIndex(harness, {
+			agent: "worker",
+			task: "implement",
+			async: false,
+			worktree: false,
+			verify: ["npm run typecheck", "npm test"],
+		});
+		assert.deepEqual(calls.map((c) => c.command), ["npm run typecheck && npm test"]);
+		assert.match(text, /accepted \(verified\)/);
+		assert.match(text, /`npm run typecheck && npm test`/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("index verify: without verify the worker path keeps its attested semantics", async () => {
+	const calls: Array<{ command: string; cwd: string }> = [];
+	const verifyRunner = async (command: string, cwd: string) => {
+		calls.push({ command, cwd });
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: true },
+		verifyRunner,
+	);
+	try {
+		await invokeIndex(harness, {
+			agent: "worker",
+			task: "implement",
+			async: false,
+			worktree: false,
+		});
+		assert.deepEqual(calls, [], "no verify supplied: the extension must not guess a command");
+	} finally {
 		await harness.cleanup();
 	}
 });

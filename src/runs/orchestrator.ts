@@ -64,6 +64,7 @@ import {
 	removeChildWorktree,
 	resolveLaunchWorktree,
 } from "./worktree.ts";
+import { provisionWorktree } from "./provision.ts";
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
@@ -97,6 +98,9 @@ export interface OrchestratorDeps {
 	maxDepth?: number;
 	maxSpawns?: number | null;
 	verifyRunner?: VerifyRunner;
+	/** Post-create bootstrap for child worktrees (legion.worktreeBootstrap). */
+	worktreeBootstrap?: string;
+	worktreeBootstrapTimeoutMs?: number;
 	team?: ActiveTeam;
 	childContext?: string;
 	onBudgetRefused?: (event: BudgetRefusedEvent) => void;
@@ -217,6 +221,8 @@ export class Orchestrator {
 	private readonly maxDepthValue: number;
 	private readonly maxSpawns: number | null;
 	private readonly verifyRunner?: VerifyRunner;
+	private readonly worktreeBootstrap?: string;
+	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
 	private readonly childContext?: string;
 	private readonly onBudgetRefused?: (event: BudgetRefusedEvent) => void;
@@ -246,6 +252,8 @@ export class Orchestrator {
 		this.maxDepthValue = effectiveMaxDepth(deps.maxDepth);
 		this.maxSpawns = deps.maxSpawns ?? null;
 		this.verifyRunner = deps.verifyRunner;
+		this.worktreeBootstrap = deps.worktreeBootstrap?.trim() || undefined;
+		this.worktreeBootstrapTimeoutMs = deps.worktreeBootstrapTimeoutMs;
 		this.team = deps.team;
 		this.childContext = deps.childContext?.trim() || undefined;
 		this.onBudgetRefused = deps.onBudgetRefused;
@@ -522,6 +530,14 @@ export class Orchestrator {
 				worktreePath = tree.path;
 				worktreeBranch = tree.branch;
 				createdWorktree = true;
+				// Provision before any spawn: the child's first command and any
+				// plugin-run verify command would otherwise fail on a bare checkout.
+				// Failure throws through the existing rollback below (tree removed).
+				provisionWorktree({
+					worktreePath,
+					mode: this.worktreeBootstrap,
+					timeoutMs: this.worktreeBootstrapTimeoutMs,
+				});
 			}
 			const effectiveModel = models.candidates;
 			if (this.legion && nodeId && !previous && this.legion.runStore) {

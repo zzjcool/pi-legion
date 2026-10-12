@@ -44,6 +44,7 @@ import { createSessionRuntime, type SessionRuntime, shouldRecycleAfterCollect, t
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
+import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
 import { appendEvent } from "./src/legion/events.ts";
 import { upsertUsage } from "./src/legion/usage.ts";
@@ -113,6 +114,12 @@ const TaskItem = Type.Object({
 				"Parent decides isolation for this child. true = own git branch, child opens an MR. false = write the current checkout.",
 		}),
 	),
+	verify: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+			"Commands the extension runs itself in the child worktree at collect time; first non-zero exit rejects the verdict.",
+		}),
+	),
 });
 
 const SubagentParams = Type.Object({
@@ -155,6 +162,12 @@ const SubagentParams = Type.Object({
 		Type.Boolean({
 			description:
 				"Parent decides isolation. true = isolated git branch, child opens an MR. false = edit the current checkout. Omit to use the role default (bundled worker: true).",
+		}),
+	),
+	verify: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+			"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; the first non-zero exit rejects the child's verdict as `rejected (verified-path)`. The worker does not need to paste test output.",
 		}),
 	),
 	agentScope: Type.Optional(
@@ -205,6 +218,8 @@ export interface ExtensionSupervisorDeps {
 	supervisor?: LegionSupervisor;
 	uiProxy?: UIProxy;
 	onBudgetRefused?: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+	/** Injected verify runner for tests; production falls back to the real shell runner. */
+	verifyRunner?: VerifyRunner;
 }
 
 interface LegionRuntimeIdentity {
@@ -437,6 +452,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";
 	const supervisor = deps.supervisor ?? new RpcSupervisor();
+	const verifyRunner = deps.verifyRunner;
 	const legionBus = createLegionEventBus();
 	let legionIdentity: LegionRuntimeIdentity | undefined;
 	const stopLegionRuntime = (): void => {
@@ -667,6 +683,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 					supervisor,
 					uiProxy,
 					onBudgetRefused,
+					verifyRunner,
 					store,
 					cwd,
 					agents,
@@ -679,11 +696,12 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			}
 
 			return launchFamily({
-				params,
+					params,
 				ctx,
 				supervisor,
 				uiProxy,
 				onBudgetRefused,
+				verifyRunner,
 				store,
 				cwd,
 				agents,
@@ -843,6 +861,7 @@ async function controlAction(input: {
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
 	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+	verifyRunner?: VerifyRunner;
 	store: RunStore;
 	cwd: string;
 	agents: AgentConfig[];
@@ -893,6 +912,9 @@ async function controlAction(input: {
 		cwd,
 		maxDepth: input.settings.legion?.maxDepth,
 		childContext: input.settings.childContext,
+		verifyRunner: input.verifyRunner,
+		worktreeBootstrap: input.settings.legion?.worktreeBootstrap,
+		worktreeBootstrapTimeoutMs: input.settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
 		...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: store } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
@@ -1097,6 +1119,7 @@ async function launchFamily(input: {
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
 	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+	verifyRunner?: VerifyRunner;
 	store: RunStore;
 	cwd: string;
 	agents: AgentConfig[];
@@ -1162,6 +1185,9 @@ async function launchFamily(input: {
 		maxDepth: settings.legion?.maxDepth,
 		maxSpawns: settings.maxSubagentSpawnsPerSession ?? null,
 		childContext: settings.childContext,
+		verifyRunner: input.verifyRunner,
+		worktreeBootstrap: settings.legion?.worktreeBootstrap,
+		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
 		...(legion ? { legion: { db: legion.db, dbPath: legion.dbPath, nodeId: legion.nodeId, runId: run.runId, parentNodeId: legion.parentNodeId ?? undefined, parentRunId: legion.parentRunId ?? undefined, runStore: store, settings: legion.settings, eventBus: legion.eventBus } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
@@ -1257,7 +1283,7 @@ interface LaunchSession {
  */
 async function launchStep(
 	session: LaunchSession,
-	step: { agent: string; task: string; model?: string; preset?: string; worktree?: boolean },
+	step: { agent: string; task: string; model?: string; preset?: string; worktree?: boolean; verify?: string[] },
 ): Promise<void> {
 	const agent = findAgent(session.agents, step.agent);
 	if (!agent) {
@@ -1288,6 +1314,34 @@ async function launchStep(
 		const effective = model.agent;
 		const resolved = model.resolved;
 
+		// `verify:` on the launch call becomes a criterion with an explicit
+		// `command`, so `applyVerification` runs it in the child worktree at
+		// collect time — the extension verifies the child's verdict instead
+		// of trusting pasted test output. Blank entries are dropped; an empty
+		// result is a no-op. Never mutated onto the shared agent object: the
+		// catalog would hand the same reference to every later launch.
+		const verifyCommands = (step.verify ?? session.params.verify ?? [])
+			.map((command) => command.trim())
+			.filter(Boolean);
+		const launchedAgent = verifyCommands.length
+			? {
+				...effective,
+				acceptance: {
+					...(effective.acceptance ?? { level: "attested" as const }),
+					criteria: [
+						...(effective.acceptance?.criteria ?? []),
+						{
+							id: "task-verify",
+							must: "Launcher-supplied verify commands pass (run by the extension, not the child)",
+							evidence: ["verification-output"],
+							severity: "required" as const,
+							command: verifyCommands.join(" && "),
+						},
+					],
+				},
+			}
+			: effective;
+
 		const violation = checkModelScope(
 			resolved.model,
 			session.settings.modelScope,
@@ -1301,7 +1355,7 @@ async function launchStep(
 		// Let `launch()` allocate from the supervisor-local registry; the index
 		// must not race separate subagent tool calls.
 		const handle = await session.orchestrator.launch({
-			agent: effective,
+			agent: launchedAgent,
 			task: step.task,
 			...(session.teamOverride ? { team: session.teamOverride } : {}),
 			...(resolved.model ? { model: resolved.model } : {}),
@@ -1478,8 +1532,10 @@ export function buildPlan(params: {
 		model?: string;
 		preset?: string;
 		worktree?: boolean;
+		verify?: string[];
 	}>;
 	worktree?: boolean;
+	verify?: string[];
 }): Plan {
 	const hasSingle = isPresent(params.agent) && isPresent(params.task);
 	const hasTasks = Boolean(params.tasks?.length);
@@ -1528,6 +1584,7 @@ interface PlanStep {
 	model?: string;
 	preset?: string;
 	worktree?: boolean;
+	verify?: string[];
 }
 
 /**
@@ -1926,6 +1983,7 @@ function renderCollect(
 		acceptance: {
 			status: string;
 			level?: string;
+			reason?: string;
 			pendingCriteria?: Array<{
 				id: string;
 				must: string;
@@ -1940,6 +1998,11 @@ function renderCollect(
 		`execution: ${collected.execution.status}${collected.execution.reason ? ` (${collected.execution.reason})` : ""}`,
 		`acceptance: ${collected.acceptance.status}${collected.acceptance.level ? ` (${collected.acceptance.level})` : ""}`,
 	];
+	// The mechanical verify outcome (which command failed / which commands had
+	// to pass) is the parent's primary trust anchor — surface it inline.
+	if (collected.acceptance.reason && /^(verified by|verification failed)/.test(collected.acceptance.reason)) {
+		lines.push(collected.acceptance.reason);
+	}
 	if (collected.blocked) {
 		lines.push(
 			"blocked: waiting for child UI approval. Answer the pending request in the parent UI, or steer the child.",

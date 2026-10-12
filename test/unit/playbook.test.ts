@@ -14,6 +14,7 @@ test("playbook text describes RPC launch and frozen child guidance", () => {
 	assert.match(PARENT_PLAYBOOK, /Isolation is YOUR call/);
 	assert.match(PARENT_PLAYBOOK, /worktree: true/);
 	assert.match(PARENT_PLAYBOOK, /headless RPC children/);
+	assert.match(PARENT_PLAYBOOK, /verify:/);
 	assert.match(TOOL_DESCRIPTION, /async by default/);
 	assert.doesNotMatch(PARENT_PLAYBOOK, /Same agent type shares one tab/);
 });

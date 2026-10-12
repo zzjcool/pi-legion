@@ -900,12 +900,27 @@ subagent({
   tasks?: Array<{ agent: string; task: string }>,   // 并行
   async?: boolean,          // 默认 true
   model?: string, cwd?: string, placement?: string,
+  worktree?: boolean,       // 隔离 git worktree（默认随角色）
+  verify?: string[],        // 收集时由扩展在子 worktree 里机械执行的验证命令；
+                            // 首个非零退出即 reject。子 agent 无需粘贴测试输出。
 
   // 续跑 / 控制
   name?: string,            // handle 名，如 "reviewer-1"
   message?: string,         // steer / continue 的内容
 })
 ```
+
+#### `verify` 的信任链
+
+- launch 时 `verify` 合成一条带 `command` 的 acceptance criterion（`task-verify`），快照进子记录的 `pendingCriteria`；
+- collect 时 `applyVerification` 在子 worktree cwd 亲自执行（bash -lc，超时 SIGKILL）；
+- 全零退出 → `accepted (verified)`；首个非零 → `rejected`，reason 指名失败的命令；
+- 未提供 `verify` 时扩展**绝不猜命令**，保持 attested 语义不变（F44 边界）。
+
+配套设置（`~/.pi/agent/settings.json` → `subagents.legion`）：
+
+- `worktreeBootstrap`: 新建子 worktree 后自动准备依赖环境。`"npm-install"`（按 lockfile 选 pnpm/bun/yarn/npm）或任意 shell 命令（如 `"ln -sfn /path/to/node_modules ./node_modules"`）。幂等：`.pi-provisioned` 标记文件记录已应用的 mode，同 mode 重入直接跳过（resume 不重装）；mode 变更视为声明变更，重新执行。
+- `worktreeBootstrapTimeoutMs`: bootstrap 命令预算，默认 600s。失败即失败整个 launch，worktree 走既有回滚被整体移除。
 
 ### 动作语义
 

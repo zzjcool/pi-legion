@@ -58,6 +58,20 @@ function mergePending(
 	return [...byId.values()];
 }
 
+/** All runnable verification commands, in declaration order. */
+export function verifyCommandsOf(
+	criteria: AcceptanceCriterion[] | undefined,
+): string[] {
+	const commands: string[] = [];
+	for (const criterion of criteria ?? []) {
+		if (criterion.severity === "optional") continue;
+		if (!(criterion.evidence ?? []).includes("verification-output")) continue;
+		const command = criterion.command?.trim();
+		if (command) commands.push(command);
+	}
+	return commands;
+}
+
 /** First required verification-output command, else undefined. */
 export function verifyCommandOf(
 	criteria: AcceptanceCriterion[] | undefined,
@@ -129,12 +143,12 @@ export async function applyVerification(
 	if (acceptance.status !== "accepted") return acceptance;
 	if (!needsVerification(opts.criteria)) return acceptance;
 
-	const command = verifyCommandOf(opts.criteria);
+	const commands = verifyCommandsOf(opts.criteria);
 	// No explicit command on the criterion: do not guess one. The project's own
 	// verifier only the child/parent can know — running a hardcoded default
 	// here would verify the wrong thing on every non-Node project. Keep the
 	// result attested and surface the criteria as pending for the parent.
-	if (!command) {
+	if (commands.length === 0) {
 		return {
 			...acceptance,
 			level: "attested",
@@ -144,21 +158,33 @@ export async function applyVerification(
 		};
 	}
 	const run = opts.run ?? defaultVerifyRunner;
-	const result = await run(command, opts.cwd, opts.timeoutMs);
-	const output = `${result.stdout}\n${result.stderr}`.trim();
-	if (result.code === 0) {
+	// Command-bearing criteria are resolved mechanically below — verified or
+	// failed, they never stay "pending for the parent to confirm". Only
+	// no-command criteria remain in pending (mergePending above), which is
+	// what the unverified-criteria banner is for.
+	const carried = (acceptance.pendingCriteria ?? []).filter(
+		(criterion) => !criterion.command?.trim(),
+	);
+	// Run every command in order; stop at the first failure so the rejection
+	// names the command that actually broke, not a later one that never ran.
+	for (const command of commands) {
+		const result = await run(command, opts.cwd, opts.timeoutMs);
+		const output = `${result.stdout}\n${result.stderr}`.trim();
+		if (result.code === 0) continue;
 		return {
 			...acceptance,
-			status: "accepted",
-			level: "verified",
-			reason: `verified by \`${command}\``,
+			status: "rejected",
+			level: "attested",
+			reason: `verification failed (\`${command}\`): ${output.slice(0, 1_500)}`,
+			pendingCriteria: carried,
 		};
 	}
 	return {
 		...acceptance,
-		status: "rejected",
-		level: "attested",
-		reason: `verification failed (\`${command}\`): ${output.slice(0, 1_500)}`,
-		pendingCriteria: acceptance.pendingCriteria,
+		status: "accepted",
+		level: "verified",
+		// Name every command that had to pass, not just the first.
+		reason: `verified by ${commands.map((c) => `\`${c}\``).join(" && ")}`,
+		pendingCriteria: carried,
 	};
 }
