@@ -208,6 +208,8 @@ test("subagent remains compatible with misconfigured utility roles and enforces 
 		assert.equal(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_UTILITY_CHILD, "1");
 		assert.equal(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_ALLOW_NESTED, undefined);
 		assert.equal(supervisor.spawns[0]?.input.allowNestedSubagents, undefined);
+		const toolsIndex = supervisor.spawns[0]?.args.indexOf("--tools") ?? -1;
+		assert.equal(supervisor.spawns[0]?.args[toolsIndex + 1], "read,grep,find,ls", "utility roles must not inherit vexillatio");
 	});
 });
 

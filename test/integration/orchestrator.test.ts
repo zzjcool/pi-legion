@@ -96,7 +96,8 @@ test("RPC launch builds the Pi argv, records lineage/budgets, and stores a real 
 		assert.ok(spawn.args.includes("--model"));
 		assert.ok(spawn.args.includes("anthropic/claude-sonnet-4"));
 		assert.ok(spawn.args.includes("--tools"));
-		assert.ok(spawn.args.includes("read,bash"));
+		// REV-17.7 §2.7: non-utility allowlists include the separate recon tool.
+		assert.ok(spawn.args.includes("read,bash,vexillatio"));
 		assert.ok(spawn.args.includes("--extension"));
 		assert.equal(spawn.args.some((arg) => arg.startsWith("@")), false, "RPC task is sent over prompt, not argv");
 		assert.equal(spawn.input.env?.PI_SUBAGENT_CHILD, "1");

@@ -566,20 +566,12 @@ export class Orchestrator {
 			let result: Awaited<ReturnType<LegionSupervisor["spawnChild"]>> | undefined;
 			let startedModel: string | undefined;
 			let lastError: unknown;
-			const spawnAgent = !input.agent.utility && input.agent.tools
-				? {
-					...input.agent,
-					tools: input.agent.tools.includes("vexillatio")
-						? input.agent.tools
-						: [...input.agent.tools, "vexillatio"],
-				}
-				: input.agent;
 			for (let index = 0; index < effectiveModel.length; index += 1) {
 				const model = effectiveModel[index];
 				const spawnInput: SpawnInput = {
 					name,
 					task: input.task,
-					agent: spawnAgent,
+					agent: input.agent,
 					sessionFile,
 					tempDir,
 					cwd: worktreePath ?? this.cwd,
