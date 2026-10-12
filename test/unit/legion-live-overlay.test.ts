@@ -6,6 +6,7 @@ import {
 	matchesKey,
 	stripTerminalSequences,
 	type OverlayHandle,
+	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import type {
 	AssistantMessage,
@@ -117,6 +118,22 @@ function assistantMessage(
 		stopReason: options.stopReason ?? "stop",
 		timestamp: 2,
 	} satisfies AssistantMessage;
+}
+
+function mouseEvent(y: number, type: TuiMouseEvent["type"] = "click"): TuiMouseEvent {
+	return {
+		type,
+		button: "left",
+		x: 1,
+		y,
+		screenX: 1,
+		screenY: y,
+		width: 80,
+		height: 40,
+		shift: false,
+		alt: false,
+		ctrl: false,
+	};
 }
 
 function toolResult(toolCallId: string, text: string): AgentMessage {
@@ -239,11 +256,20 @@ test("live overlay streams text/tool/settled events into a bounded recent-messag
 		source.emit("root.worker", { type: "text_delta", delta: "hello " });
 		source.emit("root.worker", { type: "text_delta", delta: "world" });
 		source.emit("root.worker", {
-			type: "message_update",
-			updateType: "toolcall_start",
-			toolName: "read",
+			type: "tool_call",
+			data: { toolName: "read", phase: "tool_execution_start" },
 		});
-		assert.equal(component.getState().streamingText, "", "tool-call start closes the previous streamed assistant message");
+		assert.equal(component.getState().streamingText, "", "production-shaped tool start closes the streamed assistant message");
+		const separate = component.getState().activity.length === 2 &&
+			component.getState().activity[0] === "hello world" &&
+			component.getState().activity[1] === "⚙ read";
+		assert.equal(separate, true, "production-shaped tool start keeps the assistant and tool entries separate");
+		source.emit("root.worker", {
+			type: "tool_call",
+			data: { toolName: "read", phase: "tool_execution_end" },
+		});
+		assert.equal(component.getState().activity.at(-1), "✓ read", "production-shaped tool end gets the completion marker");
+		assert.ok(component.getState().itemCount <= 1, "coarse tool facts do not create transcript components");
 		source.emit("root.worker", { type: "turn_start" });
 		source.emit("root.worker", { type: "agent_settled", ts: 4_000 });
 
@@ -252,7 +278,7 @@ test("live overlay streams text/tool/settled events into a bounded recent-messag
 		assert.equal(state.status, "running", "RPC turn settlement does not settle the Legion node");
 		assert.equal(state.turn, 1);
 		assert.ok(state.activity.length <= 3);
-		assert.deepEqual(state.activity, ["⚙ read", "↻ turn 1", "✓ agent turn settled"]);
+		assert.deepEqual(state.activity, ["✓ read", "↻ turn 1", "✓ agent turn settled"]);
 		const rendered = component.render(100).join("\n");
 		assert.match(rendered, /worker \(worker\)/);
 		assert.match(rendered, /running/);
@@ -533,6 +559,25 @@ test("a viewer dispatch error during a disk poll is contained to that polling ti
 		await new Promise((resolve) => setTimeout(resolve, 600));
 		assert.ok(polls >= 2, "the interval callback survives a render/dispatch exception");
 		assert.equal(component.getState().open, true);
+	} finally {
+		component.close();
+	}
+});
+
+test("tool mouse events are mapped through the viewer header and scroll offset into the tool wrapper", () => {
+	const source = new FakeOverlaySource();
+	source.backfill = () => {
+		const messages = parseSessionMessages(sessionWithToolResult());
+		return { messages, cursor: cursor(1, 2, messages.length, 1_024) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		const before = component.render(80);
+		const headerLines = 1;
+		const visibleToolLine = before.findIndex((line) => stripTerminalSequences(line).includes("read"));
+		assert.ok(visibleToolLine >= headerLines, "tool component appears in the visible transcript");
+		const result = component.handleMouse?.(mouseEvent(visibleToolLine));
+		assert.equal(result?.handled, true, "mouse hit reaches the tool component/wrapper");
 	} finally {
 		component.close();
 	}

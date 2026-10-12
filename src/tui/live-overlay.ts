@@ -9,6 +9,7 @@ import {
 	type Component,
 	type OverlayHandle,
 	type TUI,
+	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -375,17 +376,10 @@ function createSession(
 		for (const message of messages) {
 			if (!message || typeof message !== "object") continue;
 			if (message.role === "user") {
-				const text = typeof message.content === "string"
-					? message.content
-					: Array.isArray(message.content)
-						? message.content.filter((part) => part !== null && typeof part === "object" && part.type === "text").map((part) => part.text).join("")
-						: "";
+				const text = messageText(message.content);
 				if (text) appendActivityLine(`▸ ${text}`);
 			} else if (message.role === "assistant" && Array.isArray(message.content)) {
-				const text = message.content
-					.filter((part) => part !== null && typeof part === "object" && part.type === "text")
-					.map((part) => part.text)
-					.join("");
+				const text = messageText(message.content);
 				if (text) appendActivityLine(text);
 				for (const part of message.content) {
 					if (part !== null && typeof part === "object" && part.type === "toolCall") {
@@ -394,6 +388,19 @@ function createSession(
 				}
 			}
 		}
+	};
+
+	const messageText = (content: unknown): string => {
+		if (typeof content === "string") return content;
+		if (!Array.isArray(content)) return "";
+		const textParts: string[] = [];
+		for (const part of content) {
+			if (part === null || typeof part !== "object" || Array.isArray(part)) continue;
+			if (!("type" in part) || part.type !== "text") continue;
+			if (!("text" in part) || typeof part.text !== "string") continue;
+			textParts.push(part.text);
+		}
+		return textParts.join("");
 	};
 
 	const appendMessages = (messages: readonly AgentMessage[], redraw: boolean): boolean => {
@@ -542,9 +549,14 @@ function createSession(
 		}
 		if (eventType === "tool_call" || eventType === "toolcall_start" || eventType === "toolcall_end" ||
 			eventType === "tool_execution_start" || eventType === "tool_execution_end") {
-			if (eventType === "toolcall_start" || eventType === "tool_execution_start") finishStreaming();
+			const toolPhase = readString(event, "phase");
+			const toolStarted = eventType === "toolcall_start" || eventType === "tool_execution_start" ||
+				(eventType === "tool_call" && toolPhase === "tool_execution_start");
+			const toolEnded = eventType === "toolcall_end" || eventType === "tool_execution_end" ||
+				(eventType === "tool_call" && toolPhase === "tool_execution_end");
+			if (toolStarted) finishStreaming();
 			const name = safeText(readString(event, "toolName") ?? readString(event, "name") ?? "tool");
-			const phase = eventType === "toolcall_end" || eventType === "tool_execution_end" ? "✓" : "⚙";
+			const phase = toolEnded ? "✓" : "⚙";
 			appendActivityLine(`${phase} ${name}`);
 		} else if (eventType !== "message_update") {
 			appendActivityLine(`· ${safeText(eventType)}`);
@@ -680,6 +692,25 @@ function createSession(
 			} else if (matchesKey(data, Key.shift("g"))) {
 				goToEnd();
 			}
+		},
+		handleMouse(event: TuiMouseEvent) {
+			if (!open) return undefined;
+			if (event.type === "wheel" && event.wheelDelta) {
+				scrollBy(event.wheelDelta);
+				return { handled: true };
+			}
+			contentWidth = Math.max(1, Math.floor(event.width));
+			lastBodyLines = renderBody(contentWidth);
+			clampScroll(lastBodyLines);
+			const viewportY = event.y - 1;
+			if (viewportY < 0 || viewportY >= bodyPageSize()) return undefined;
+			const transcriptY = viewportY + scrollTop;
+			if (transcriptY >= lastBodyLines.length) return undefined;
+			return transcript.handleMouse({
+				...event,
+				y: transcriptY,
+				height: lastBodyLines.length,
+			});
 		},
 		invalidate() {
 			transcript.invalidate();
