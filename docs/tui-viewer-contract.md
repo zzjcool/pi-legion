@@ -43,6 +43,7 @@
 | T10 | 依赖 caret 升级 `^1.0.0` + 重新生成 lockfile + `npm install` | worktree 无 node_modules 是历史遗留；typecheck/test 需要真实 .d.ts。npm registry pi-coding-agent 与 pi-tui 最新均为 1.1.0（主会话实测）。 |
 | T11 | `ToolExecutionComponent` 的 `ui` 传 `ctx.ui.custom` 工厂第一参数（真实 TUI 实例）；`cwd` 传 `node.worktreePath ?? ctx.cwd`；`toolDefinition` 传 undefined | 查看器无工具注册表上下文；undefined 走 fallback 渲染（scout 实测确认可渲染）。 |
 | T12 | **[REV-2] 活跃节点（有 active job）打开浮窗时同样轮询磁盘增量；RPC text_delta 流与磁盘轮询并行**。去重机制：磁盘增量中的 assistant 消息落地时收回（retract）流式组件，避免同一条消息双重渲染；若流式文本领先已落盘消息（属于未落盘后续内容），在增量 append 后重建流式组件显示余量 | REV-1 时代的互斥（"RPC 流缺位时才轮询"）导致活跃节点的结构化消息（user / assistant+toolCall / toolResult）无任何路径进入 viewer——正是用户需求"支持动态渲染"要修复的缺口。旧行为的回归断言（`legion-integration.test.ts` "active text-delta sessions do not duplicate session-file activity"）随之改写为：磁盘增量动态出现 + 不与流式文本重复。 |
+| T13 | **[REV-3] 流式去重的"包含"判定用子串而非前缀**：`diskText.includes(streamingText)` 即视为已包含（收回不重建，无余量）；仅当流式严格领先（`streamingText.startsWith(diskText)`）时取余量重建；两者均不成立才全量重建（防御分支） | REV-2 三分支的前缀语义在中途打开/clamp 截断场景下失真：viewer 订阅前的 delta 丢失（打开时消息已流到一半）与 `clampStreamingText` 截头，使 streamingText 只是落盘消息的尾部子串，双向 startsWith 均为 false，落入"无前缀"分支 → 落盘全文与陈旧尾巴永久双重渲染且跨消息复合（reviewer 探针验证）。子串判定容忍丢失头部的流式文本：最坏情况只丢一小截陈旧尾巴的视觉，不会永久重复。 |
 
 ---
 
@@ -266,6 +267,7 @@ export type ChatItem =
 
 - **REV-1**（2026-10-13，触发者 worker-0）：§2a 消息类型 import 修正——`AgentMessage` 来自 `@earendil-works/pi-agent-core`（`dist/types.d.ts:322`）而非 pi-ai（pi-ai@1.1.0 不导出该类型）；`AssistantMessage`/`ThinkingContent` 等成员类型仍来自 pi-ai。机械缺口，直接修订。
 - **REV-2**（2026-10-20，触发者主会话，用户新需求）：T12 互斥解除——用户反馈活跃节点上下文展示不支持动态渲染；根因是 RPC feed 订阅成功时磁盘轮询被关闭，结构化消息无路径进入 viewer。改为双通道并行 + 流式组件收回去重（chat-items.ts 新增 `retractStreamingItem()`）。U7a/U7c 同步改写/新增。涉及文件：`src/extension/legion-commands.ts`（订阅时始终挂 pollBackfill）、`src/tui/live-overlay.ts`（acceptBackfill 增量收回/重建流式组件）、`src/tui/chat-items.ts`（新增收回能力）、两测试文件。
+- **REV-3**（2026-10-20，触发者 reviewer（对抗审查 F1）：三分支去重的包含判定从前缀放宽为子串）：REV-2 的「无前缀 → 全量重建」分支在真实主线路径（viewer 中途打开、clampStreamingText 截头）下产生永久性双重渲染且跨消息复合（探针验证：尾部子串场景落盘全文与陈旧尾巴同时渲染不消失）。T13 新增固化语义：`diskText.includes(streamingText)` → 已包含（收回不重建）；`streamingText.startsWith(diskText)` → 余量重建；否则防御性全量重建。U7c 补齐三分支用例 + 中途打开 + clamp 截断场景。
 
 ## 10. 修订规则
 
