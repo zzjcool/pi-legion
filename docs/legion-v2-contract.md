@@ -98,7 +98,7 @@ interface LegionSupervisor {
 | `agent wait` 2s 切片轮询 | `agent_settled` 事件 |
 | `agent get` presence | `isAlive`（进程/连接状态） |
 | `agentSendKeys y/n/enter/ctrl+d` | `extension_ui_request` 应答 / stdin close |
-| `pane close` 杀进程 | stdin close 优雅退出；超时 SIGTERM |
+| `pane close` 杀进程 | stdin close 优雅退出；超时 SIGTERM；仍超时 SIGKILL；后代进程按进程组清场（REV-16） |
 | `run.json` herdr 字段 | 载体改为 `{supervisor: "rpc", node_id}`，`paneId/tabId` 删除 |
 
 ### 3.3 判定链不变：成败仍以 session jsonl 为唯一权威（F26–F33）。collect 复用 `waitForQuiet` + `parseSessionFile` + `deriveOutcome`，收割后顺手写 `node_settled` 事件 + 更新 nodes 行。
@@ -458,3 +458,4 @@ interface LegionEventBus {
 | 2026-10-11 | REV-13 | §10.2 总线事件分两域：存储域（§4.3 的 14 种，经 createDbEventSource）与**进程内域**（node_launched/node_steered/node_retired/node_aborted/ui_request + 观察流 text_delta/tool_call/turn_start/agent_settled，带 nodeId 不落库，由扩展层在调 supervisor 方法/接 uiProxy 回调时 emit）。M3-integration 归属增加 `src/extension/event-bus.ts` 的类型集扩展（仅加进程内域类型，不动脏检查逻辑）。原因：RpcSupervisor.onEvent 是 per-child RPC 协议事件，操作级事件（launch/steer/retire）不在其中，须由扩展层显式 emit。触发：worker-12 按 §15-2 正确拒绝（类型闭集不含操作事件，零改动） |
 | 2026-10-11 | REV-14 | §10.1 点击双通道降级：OSC 8 超链接仅作视觉锚点（宿主 TUI 截获链接点击去 openBrowser，pi-tui tui-alt-screen.js:1097-1104 + extensions types 无 URL 回调 API——worker-14 读源码实证）；浮窗打开 = 组件鼠标事件 + 键盘路径（/legion <name>）。鼠标事件在全屏模式路由到组件（tree-view 自管分页的点击 handler 已支持），regular 模式无鼠标为宿主限制。触发：worker-14 按 §15-2 正确拒绝（WIP 已由合并权人固化 2dff211） |
 | 2026-10-11 | REV-15 | §6.1 centurion 角色卡的 `team: be-value` 改为可选省略：be-value 是示例值，仓库/用户 settings 均未定义该队，不覆盖时子进程收警告并退化全 roster。team 字段语义 = 可选的默认队绑定（须真实存在），省略即全 roster。触发：reviewer-6 对 PR #13 的范围外观察 |
+| 2026-10-12 | REV-16 | §3.2 retire 链加固：SIGTERM 超时后升级 SIGKILL（新 option `killTimeoutMs`，默认 1s），并在 retire 时枚举子 pi 的后代进程（/proc 祖先链），按进程组 SIGTERM→SIGKILL 清场（排除 supervisor 自身进程组与子 pi 自身 pid）。触发：2026-10-12 孤儿 `node --test` 进程泄露事故（两个 PPID=1 进程各烧 4h20m CPU，SIGTERM 无效，人工 SIGKILL 收场）。子契约：`docs/retire-hardening-contract.md`（FROZEN-1） |

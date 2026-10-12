@@ -5,6 +5,7 @@
 import type { RpcClientOptions as PiRpcClientOptions } from "@earendil-works/pi-coding-agent";
 import type { Writable } from "node:stream";
 import type { BuildArgsInput } from "../runs/args.ts";
+import type { UIProxy } from "./ui-proxy.ts";
 
 /**
  * Input to one child launch. `name` is the registry key supplied by the caller
@@ -25,6 +26,30 @@ export interface ChildHandle {
 	name: string;
 	sessionFile: string;
 	pid?: number;
+}
+
+/** Process id and process group id for one descendant of a supervised child. */
+export interface DescendantInfo {
+	pid: number;
+	pgid: number;
+}
+
+/** Injectable options for process lifecycle handling in RpcSupervisor. */
+export interface RpcSupervisorOptions {
+	/** Replace the Pi client constructor in unit tests. */
+	clientFactory?: RpcClientFactory;
+	/** In-memory by default; M1-integration supplies a real TUI consumer. */
+	uiProxy?: UIProxy;
+	/** Grace period after stdin close before SIGTERM. */
+	retireTimeoutMs?: number;
+	/** Grace period for a child to exit after SIGTERM. */
+	signalTimeoutMs?: number;
+	/** Grace period for a child to exit after SIGKILL. */
+	killTimeoutMs?: number;
+	/** Enumerate process descendants before retiring a child. */
+	enumerateDescendants?: (rootPid: number) => DescendantInfo[];
+	/** Signal a PID or process group while sweeping descendants. */
+	signalProcess?: (target: number, signal: NodeJS.Signals) => boolean;
 }
 
 /** Result of waiting for a child turn to settle or for its process to exit. */

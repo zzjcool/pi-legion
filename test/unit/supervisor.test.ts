@@ -30,6 +30,7 @@ import type {
 	RpcProcessHandle,
 	SpawnInput,
 } from "../../src/supervisor/types.ts";
+import { currentPgid } from "../../src/supervisor/proc-tree.ts";
 
 class FakeRpcProcess implements RpcProcessHandle {
 	readonly pid: number;
@@ -201,6 +202,8 @@ function harness(options: Partial<RpcSupervisorOptions> = {}) {
 		clientFactory: factory,
 		retireTimeoutMs: 100,
 		signalTimeoutMs: 100,
+		killTimeoutMs: 100,
+		enumerateDescendants: () => [],
 		...options,
 	});
 	return {
@@ -350,7 +353,32 @@ test("abnormal retire preserves the unexpected exit result for waitSettled", asy
 	}
 });
 
-test("retire resolving timeout is retryable after a child ignores SIGTERM", async () => {
+test("retire resolving timeout is retryable after a child ignores SIGTERM and SIGKILL", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const process = h.clients[0]!.process;
+		process.ignoreInputClose = true;
+		process.ignoredSignals.add("SIGTERM");
+		process.ignoredSignals.add("SIGKILL");
+
+		await assert.rejects(
+			h.supervisor.retire("root.worker", { graceful: false }),
+			{ code: "RETIRE_FAILED" },
+		);
+		assert.equal(h.supervisor.isAlive("root.worker"), true);
+		assert.deepEqual(process.signals, ["SIGTERM", "SIGKILL"]);
+
+		process.ignoredSignals.delete("SIGTERM");
+		await h.supervisor.retire("root.worker", { graceful: false });
+		assert.deepEqual(process.signals, ["SIGTERM", "SIGKILL", "SIGTERM"]);
+		assert.equal(h.supervisor.isAlive("root.worker"), false);
+	} finally {
+		h.close();
+	}
+});
+
+test("SIGKILL escalation retires a child that ignores SIGTERM", async () => {
 	const h = harness();
 	try {
 		await h.supervisor.spawnChild(testInput(h.root));
@@ -358,17 +386,86 @@ test("retire resolving timeout is retryable after a child ignores SIGTERM", asyn
 		process.ignoreInputClose = true;
 		process.ignoredSignals.add("SIGTERM");
 
-		await assert.rejects(
-			h.supervisor.retire("root.worker", { graceful: false }),
-			{ code: "RETIRE_FAILED" },
-		);
-		assert.equal(h.supervisor.isAlive("root.worker"), true);
-		assert.deepEqual(process.signals, ["SIGTERM"]);
-
-		process.ignoredSignals.delete("SIGTERM");
 		await h.supervisor.retire("root.worker", { graceful: false });
-		assert.deepEqual(process.signals, ["SIGTERM", "SIGTERM"]);
+
+		assert.deepEqual(process.signals, ["SIGTERM", "SIGKILL"]);
 		assert.equal(h.supervisor.isAlive("root.worker"), false);
+	} finally {
+		h.close();
+	}
+});
+
+test("retire sweeps enumerated descendants with SIGTERM then SIGKILL", async () => {
+	const calls: Array<[number, NodeJS.Signals]> = [];
+	const h = harness({
+		enumerateDescendants: () => [
+			{ pid: 4242, pgid: 4242 },
+			{ pid: 5150, pgid: 4242 },
+		],
+		signalProcess: (target, signal) => {
+			calls.push([target, signal]);
+			return true;
+		},
+	});
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		await h.supervisor.retire("root.worker", { graceful: false });
+
+		assert.deepEqual(calls, [
+			[-4242, "SIGTERM"],
+			[4242, "SIGTERM"],
+			[5150, "SIGTERM"],
+			[-4242, "SIGKILL"],
+			[4242, "SIGKILL"],
+			[5150, "SIGKILL"],
+		]);
+	} finally {
+		h.close();
+	}
+});
+
+const ownPgidForSweepTest = currentPgid();
+test(
+	"descendant sweep never signals the supervisor's own process group",
+	{ skip: ownPgidForSweepTest === null },
+	async () => {
+		if (ownPgidForSweepTest === null) return;
+		const ownPgid = ownPgidForSweepTest;
+		const calls: Array<[number, NodeJS.Signals]> = [];
+		const h = harness({
+			enumerateDescendants: () => [{ pid: 777, pgid: ownPgid }],
+			signalProcess: (target, signal) => {
+				calls.push([target, signal]);
+				return true;
+			},
+		});
+		try {
+			await h.supervisor.spawnChild(testInput(h.root));
+			await h.supervisor.retire("root.worker", { graceful: false });
+
+			assert.deepEqual(calls, [
+				[777, "SIGTERM"],
+				[777, "SIGKILL"],
+			]);
+			assert.equal(calls.some(([target]) => target < 0), false);
+		} finally {
+			h.close();
+		}
+	},
+);
+
+test("retire completes without sweep when no descendants", async () => {
+	const calls: Array<[number, NodeJS.Signals]> = [];
+	const h = harness({
+		signalProcess: (target, signal) => {
+			calls.push([target, signal]);
+			return true;
+		},
+	});
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		await h.supervisor.retire("root.worker", { graceful: false });
+		assert.deepEqual(calls, []);
 	} finally {
 		h.close();
 	}
@@ -401,6 +498,7 @@ test("spawn failure stops the client, removes temp files, and permits retry", as
 	const supervisor = new RpcSupervisor({
 		retireTimeoutMs: 100,
 		signalTimeoutMs: 100,
+		enumerateDescendants: () => [],
 		clientFactory: (options) => {
 			const client = new FakeRpcClient(options, 20_000 + clients.length);
 			if (clients.length === 0) client.promptError = new Error("prompt rejected");
