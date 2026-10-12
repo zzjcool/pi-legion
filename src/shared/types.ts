@@ -132,6 +132,7 @@ export interface AgentConfig {
 	completionGuard?: boolean;
 	maxSubagentDepth?: number;
 	allowNestedSubagents?: boolean;
+	utility?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	turnBudget?: TurnBudgetConfig;
 	disabled?: boolean;
@@ -489,6 +490,9 @@ export interface LegionSettings {
 	maxActiveNodes?: number;
 	phaseTimeouts?: LegionPhaseTimeouts;
 	verifyCommandTimeoutMs?: number;
+	/** Post-create provisioning for child worktrees: "npm-install" or a shell command. */
+	worktreeBootstrap?: string;
+	worktreeBootstrapTimeoutMs?: number;
 	mailRatePer5Min?: number;
 	usagePollMs?: number;
 	orphanStaleMs?: number;
@@ -506,6 +510,9 @@ export const DEFAULT_LEGION_SETTINGS = {
 		verifying: 900_000,
 	},
 	verifyCommandTimeoutMs: 600_000,
+	// Provisioning is opt-in: no default mode, a generous install budget.
+	worktreeBootstrap: "",
+	worktreeBootstrapTimeoutMs: 600_000,
 	mailRatePer5Min: 10,
 	usagePollMs: 30_000,
 	orphanStaleMs: 90_000,

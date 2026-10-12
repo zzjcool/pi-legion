@@ -44,12 +44,14 @@ import { createSessionRuntime, type SessionRuntime, shouldRecycleAfterCollect, t
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
+import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
 import { appendEvent } from "./src/legion/events.ts";
 import { upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
+import { makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
 import {
 	publishSupervisorEvent,
@@ -113,6 +115,12 @@ const TaskItem = Type.Object({
 				"Parent decides isolation for this child. true = own git branch, child opens an MR. false = write the current checkout.",
 		}),
 	),
+	verify: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+			"Commands the extension runs itself in the child worktree at collect time; first non-zero exit rejects the verdict.",
+		}),
+	),
 });
 
 const SubagentParams = Type.Object({
@@ -128,6 +136,7 @@ const SubagentParams = Type.Object({
 				Type.Literal("collect"),
 				Type.Literal("list"),
 				Type.Literal("wait"),
+				Type.Literal("stop"),
 			],
 			{ description: "Defaults to launch." },
 		),
@@ -157,6 +166,12 @@ const SubagentParams = Type.Object({
 				"Parent decides isolation. true = isolated git branch, child opens an MR. false = edit the current checkout. Omit to use the role default (bundled worker: true).",
 		}),
 	),
+	verify: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+			"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; the first non-zero exit rejects the child's verdict as `rejected (verified-path)`. The worker does not need to paste test output.",
+		}),
+	),
 	agentScope: Type.Optional(
 		Type.Union(
 			[Type.Literal("user"), Type.Literal("project"), Type.Literal("both")],
@@ -166,16 +181,16 @@ const SubagentParams = Type.Object({
 		),
 	),
 	name: Type.Optional(
-		Type.String({ description: "Child handle name (control actions)" }),
+		Type.String({ description: "Child handle name (control actions, including wait and stop)" }),
 	),
 	all: Type.Optional(
 		Type.Boolean({
-			description: "wait: wait for every currently-running child in this session",
+			description: "wait: wait for active children; stop: stop every non-retired child",
 		}),
 	),
 	timeoutMs: Type.Optional(
 		Type.Number({
-			description: "wait: per-child timeout in ms (default: role turnTimeoutMs)",
+			description: "wait: per-child timeout in ms; event-driven completion returns early (default: role turnTimeoutMs)",
 		}),
 	),
 	message: Type.Optional(
@@ -188,6 +203,17 @@ const SubagentParams = Type.Object({
 
 /** The validated tool parameters, as the model supplies them. */
 type SubagentParams = Static<typeof SubagentParams>;
+
+const VexillatioParams = Type.Object({
+	task: Type.String({ description: "Recon task: one clear question list" }),
+	agent: Type.Optional(Type.String({ description: "Utility agent name (default: scout)" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel recon launches" })),
+	cwd: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	timeoutMs: Type.Optional(Type.Number({ description: "Per-child wait in ms, default 600000" })),
+});
+
+const UTILITY_CHILD_ENV = "PI_SUBAGENT_UTILITY_CHILD";
 
 const blockedUi = new WeakMap<
 	SessionRuntime,
@@ -205,6 +231,8 @@ export interface ExtensionSupervisorDeps {
 	supervisor?: LegionSupervisor;
 	uiProxy?: UIProxy;
 	onBudgetRefused?: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+	/** Injected verify runner for tests; production falls back to the real shell runner. */
+	verifyRunner?: VerifyRunner;
 }
 
 interface LegionRuntimeIdentity {
@@ -437,7 +465,30 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";
 	const supervisor = deps.supervisor ?? new RpcSupervisor();
+	const verifyRunner = deps.verifyRunner;
 	const legionBus = createLegionEventBus();
+	const rpcUIProxy = (supervisor as LegionSupervisor & { uiProxy?: UIProxy }).uiProxy;
+	const uiProxy = deps.uiProxy ?? rpcUIProxy ?? new InMemoryUIProxy();
+	const onBudgetRefused = deps.onBudgetRefused ?? ((event) => {
+		try { pi.events.emit("pi-legion:budget_refused", event); } catch { /* optional host event */ }
+	});
+	let sessionEnabledOverride: boolean | undefined;
+	const subagentsEnabled = (cwd: string): boolean => {
+		if (sessionEnabledOverride !== undefined) return sessionEnabledOverride;
+		try {
+			return loadSubagentSettings({
+				userSettingsPath: path.join(getAgentDir(), "settings.json"),
+				projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
+			}).enabled !== false;
+		} catch (error) {
+			console.warn(
+				"[pi-legion] Unable to load settings while checking whether subagents are enabled; defaulting to enabled.",
+				error,
+			);
+			return true;
+		}
+	};
+	let lastCwd = process.cwd();
 	let legionIdentity: LegionRuntimeIdentity | undefined;
 	const stopLegionRuntime = (): void => {
 		if (!legionIdentity) return;
@@ -469,24 +520,72 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		try { initializeLegionRuntime({ cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile() }); }
 		catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 	});
-	if (isChild && !allowNested) {
+	const pendingUtilityRetires: Array<() => Promise<void>> = [];
+	if (process.env[UTILITY_CHILD_ENV] !== "1") {
+		pi.registerTool({
+			name: "vexillatio",
+			label: "Vexillatio",
+			description: "Launch only read-only utility agents and return their collected output.",
+			parameters: VexillatioParams,
+			async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
+				if (!subagentsEnabled(ctx.cwd)) {
+					return fail("subagents are disabled (subagents.enabled: false or /subagents-toggle off). Re-enable with /subagents-toggle on.", ErrorCodes.DISABLED);
+				}
+				return launchUtilityFamily({
+					pi,
+					ctx,
+					params,
+					supervisor,
+					uiProxy,
+					onBudgetRefused,
+					cwd: params.cwd ?? ctx.cwd,
+					sessionCwd: ctx.cwd,
+					isChild,
+					legion: legionIdentity,
+					eventBus: legionBus,
+					onLegion: (identity) => {
+						if (legionIdentity && legionIdentity !== identity) stopLegionRuntime();
+						legionIdentity = identity;
+					},
+					onUtilityChild: (retire) => pendingUtilityRetires.push(retire),
+				});
+			},
+		});
+	}
+	pi.on("before_agent_start", (event, ctx) => {
+		if (process.env[UTILITY_CHILD_ENV] === "1") return;
+		if (!subagentsEnabled(ctx?.cwd ?? lastCwd)) return;
+		const tools = event.systemPromptOptions?.selectedTools;
+		if (Array.isArray(tools) && !tools.includes("subagent") && !tools.includes("vexillatio")) return;
+		if (ctx?.cwd) lastCwd = ctx.cwd;
+		const catalog = loadCatalog(lastCwd, lastCwd, undefined);
+		const parentContext = catalog.settings.parentContext?.trim();
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${PARENT_PLAYBOOK}\n\n${renderParentRoster(
+				catalog.agents,
+				catalog.team,
+				catalog.teamWarnings,
+			)}${parentContext ? `\n\n${parentContext}` : ""}`,
+		};
+	});
+	if (process.env[UTILITY_CHILD_ENV] === "1") {
 		pi.on("session_shutdown", () => stopLegionRuntime());
 		return;
 	}
-
+	if (isChild && !allowNested) {
+		pi.on("session_shutdown", async () => {
+			await Promise.all(pendingUtilityRetires.map((retire) => retire().catch(() => {})));
+			stopLegionRuntime();
+		});
+		return;
+	}
 	// The parent transcript records every finish; the renderer keeps a
 	// completed child to one line so visibility does not cost a screen.
 	pi.registerMessageRenderer(SUBAGENT_NOTIFY_TYPE, renderSubagentNotice);
 
-	const rpcUIProxy = (supervisor as LegionSupervisor & { uiProxy?: UIProxy }).uiProxy;
-	const uiProxy = deps.uiProxy ?? rpcUIProxy ?? new InMemoryUIProxy();
-	const onBudgetRefused = deps.onBudgetRefused ?? ((event) => {
-		try { pi.events.emit("pi-legion:budget_refused", event); } catch { /* optional host event */ }
-	});
 	let lastUi: ExtensionContext["ui"] | undefined;
 	let lastModelRegistry: ExtensionContext["modelRegistry"] | undefined;
 	let lastConfirm: ((message: string) => Promise<boolean>) | undefined;
-	let lastCwd = process.cwd();
 	// turn_start/turn_end maintain this so a flush window can wait out a
 	// busy parent instead of queueing behind the whole turn (join extends
 	// the window at most MAX_BUSY_EXTENSIONS times).
@@ -546,29 +645,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	registerLegionCommand(pi, { bus: legionBus, runtime, supervisor: rpcEventSource });
 
 	// ── Master switch ────────────────────────────────────────────────────
-	// Session-level override over `subagents.enabled` (user+project settings).
-	// `undefined` means "follow settings" so /reload picks up file changes;
-	// the toggle command is what writes to this variable.
-	let sessionEnabledOverride: boolean | undefined;
-	/** Effective enabled state: session override > merged settings. */
-	const subagentsEnabled = (cwd: string): boolean => {
-		if (sessionEnabledOverride !== undefined) return sessionEnabledOverride;
-		try {
-			return (
-				loadSubagentSettings({
-					userSettingsPath: path.join(getAgentDir(), "settings.json"),
-					projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
-				}).enabled !== false
-			);
-		} catch (error) {
-			console.warn(
-				"[pi-legion] Unable to load settings while checking whether subagents are enabled; defaulting to enabled.",
-				error,
-			);
-			return true;
-		}
-	};
-
 	registerToggleCommand(pi, {
 		sessionEnabled: () => subagentsEnabled(lastCwd),
 		setSessionEnabled: (enabled) => {
@@ -611,15 +687,16 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		async execute(
 			_id,
 			params,
-			_signal,
+			signal,
 			onUpdate,
 			ctx: ExtensionContext,
 		): Promise<AgentToolResult<unknown>> {
 			runtime.bind(ctx);
+			const action = params.action ?? "launch";
+			if (signal?.aborted && action !== "stop") return ok("interrupted (parent turn aborted)");
 			// Master switch: refuse NEW launches with a pointer to the toggle;
 			// control actions (status/collect/wait/…) must stay available so a
 			// disable with live children remains observable and collectable.
-			const action = params.action ?? "launch";
 			if (!subagentsEnabled(ctx.cwd) && (action === "launch" || !action)) {
 				return fail(
 					"subagents are disabled (subagents.enabled: false or /subagents-toggle off). " +
@@ -637,7 +714,9 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 				: { agents: catalog.agents, team: catalog.team, warnings: catalog.teamWarnings };
 			const agents = selectedTeam.agents;
 			const team = selectedTeam.team;
-			const teamWarnings = selectedTeam.warnings;
+			const teamWarnings = teamName
+				? [...selectedTeam.warnings, ...catalog.utilityWarnings]
+				: selectedTeam.warnings;
 			runtime.setJoinConfig({
 				mode: settings.joinMode ?? DEFAULT_JOIN_MODE,
 				flushMs: settings.joinFlushMs ?? DEFAULT_FLUSH_MS,
@@ -657,6 +736,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			} catch (error) {
 				return fail(`legion runtime initialization failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
 			}
+			if (signal?.aborted && action !== "stop") return ok("interrupted (parent turn aborted)");
 
 			// Control actions address an EXISTING child; launch-family actions
 			// create new ones. The two share almost nothing, so they are separate.
@@ -664,9 +744,11 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 				return controlAction({
 					action,
 					params,
+					signal,
 					supervisor,
 					uiProxy,
 					onBudgetRefused,
+					verifyRunner,
 					store,
 					cwd,
 					agents,
@@ -680,10 +762,12 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 
 			return launchFamily({
 				params,
+				signal,
 				ctx,
 				supervisor,
 				uiProxy,
 				onBudgetRefused,
+				verifyRunner,
 				store,
 				cwd,
 				agents,
@@ -695,25 +779,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 				onUpdate,
 			});
 		},
-	});
-
-	pi.on("before_agent_start", (event, ctx) => {
-		if (isChild && !allowNested) return;
-		// Master switch: when disabled, stop injecting the playbook and the
-		// roster so the model is not coached toward a tool that will refuse.
-		if (!subagentsEnabled(ctx?.cwd ?? lastCwd)) return;
-		const tools = event.systemPromptOptions?.selectedTools;
-		if (Array.isArray(tools) && !tools.includes("subagent")) return;
-		if (ctx?.cwd) lastCwd = ctx.cwd;
-		const catalog = loadCatalog(lastCwd, lastCwd, undefined);
-		const parentContext = catalog.settings.parentContext?.trim();
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n${PARENT_PLAYBOOK}\n\n${renderParentRoster(
-				catalog.agents,
-				catalog.team,
-				catalog.teamWarnings,
-			)}${parentContext ? `\n\n${parentContext}` : ""}`,
-		};
 	});
 
 	const bindUi = (_event: unknown, ctx: ExtensionContext): void => {
@@ -767,9 +832,10 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	pi.on("session_shutdown", async () => {
 		const children = runtime.activeJobs();
 		runtime.dispose();
-		await Promise.all(
-			children.map((job) => job.retire?.().catch(() => {})),
-		);
+		await Promise.all([
+			...children.map((job) => job.retire?.().catch(() => {})),
+			...pendingUtilityRetires.map((retire) => retire().catch(() => {})),
+		]);
 		stopLegionRuntime();
 	});
 }
@@ -797,6 +863,7 @@ export function loadCatalog(
 	teamWarnings: string[];
 	projectAgentsDir: string | null;
 	builtinAgentsDir: string;
+	utilityWarnings: string[];
 } {
 	const settings = loadSubagentSettings({
 		userSettingsPath: path.join(getAgentDir(), "settings.json"),
@@ -807,6 +874,14 @@ export function loadCatalog(
 	});
 	const overridden = applyAgentOverrides(discovery.agents, settings.agentOverrides);
 	const teamResult = applyTeam(overridden, settings);
+	const utilityWarnings = [...new Map(
+		[...overridden, ...teamResult.agents]
+			.filter((agent) => agent.utility && agent.allowNestedSubagents)
+			.map((agent) => [
+				agent.name,
+				`Utility agent "${agent.name}" sets allowNestedSubagents: true; utility identity takes precedence and nested dispatch is ignored.`,
+			] as const),
+	).values()];
 	const resolveDefaults = (items: AgentConfig[]): AgentConfig[] =>
 		applyDefaultOnBlocked(
 			applyDefaultModel(items, settings.defaultModel),
@@ -818,7 +893,8 @@ export function loadCatalog(
 		agents: resolveDefaults(teamResult.agents),
 		allAgents: resolveDefaults(overridden),
 		team: teamResult.team,
-		teamWarnings: teamResult.warnings,
+		teamWarnings: [...teamResult.warnings, ...utilityWarnings],
+		utilityWarnings,
 		settings,
 		projectAgentsDir: discovery.projectAgentsDir,
 		builtinAgentsDir: discovery.builtinAgentsDir ?? BUILTIN_AGENTS_DIR,
@@ -839,10 +915,12 @@ export function loadCatalog(
 async function controlAction(input: {
 	action: string;
 	params: SubagentParams;
+	signal?: AbortSignal;
 	legion?: OrchestratorLegionContext;
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
 	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+	verifyRunner?: VerifyRunner;
 	store: RunStore;
 	cwd: string;
 	agents: AgentConfig[];
@@ -868,11 +946,46 @@ async function controlAction(input: {
 		}
 		return waitAction({
 			params,
+			signal: input.signal,
 			runtime: input.runtime,
 			agents: input.agents,
 			allAgents: input.allAgents,
 			store,
 			cwd,
+		});
+	}
+
+	if (action === "stop") {
+		return stopAction({
+			params,
+			runtime: input.runtime,
+			retire: async (name) => {
+				const job = input.runtime.get(name);
+				if (job?.retire) {
+					await job.retire();
+					return;
+				}
+				// A completion watch can retire/release a target after stop snapshots
+				// all names but before the serial loop reaches it. Treat that target as
+				// stopped; only rebuild if its persisted record is not already retired.
+				const found = findChild(input.store.listRuns(), name);
+				if (!found) throw new SubagentError(`unknown child: ${name}`, ErrorCodes.NOT_FOUND);
+				if (found.child.state === "retired") return;
+				const orchestrator = new Orchestrator({
+					supervisor: input.supervisor,
+					uiProxy: input.uiProxy,
+					runDir: input.store.runDir(found.runId),
+					cwd: input.cwd,
+					maxDepth: input.settings.legion?.maxDepth,
+					childContext: input.settings.childContext,
+					...teamForChildren(input.team),
+					...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: input.store } } : {}),
+					onBudgetRefused: input.onBudgetRefused,
+				});
+				orchestrator.restore(found.run);
+				await orchestrator.retire(name);
+				await persistChild(input.store, found.runId, orchestrator, name);
+			},
 		});
 	}
 
@@ -893,6 +1006,9 @@ async function controlAction(input: {
 		cwd,
 		maxDepth: input.settings.legion?.maxDepth,
 		childContext: input.settings.childContext,
+		verifyRunner: input.verifyRunner,
+		worktreeBootstrap: input.settings.legion?.worktreeBootstrap,
+		worktreeBootstrapTimeoutMs: input.settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
 		...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: store } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
@@ -908,7 +1024,7 @@ async function controlAction(input: {
 
 	if (action === "status") return renderChild(found.child, "status");
 	if (action === "steer") return steerChild(ctx);
-	if (action === "collect") return collectChild(ctx);
+	if (action === "collect") return collectChild(ctx, input.signal);
 	if (action === "retire") return retireChild(ctx);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
 
@@ -974,12 +1090,17 @@ async function steerChild(
 /** Wait for the child's current turn and derive its outcome from the session. */
 async function collectChild(
 	ctx: ChildContext,
+	signal?: AbortSignal,
 ): Promise<AgentToolResult<unknown>> {
 	try {
-		const pending = ctx.runtime.consumeCollect(ctx.name);
+		if (signal?.aborted) return ok("interrupted (parent turn aborted)");
+		const pending = signal
+			? ctx.runtime.consumeCollectInterruptible(ctx.name, signal)
+			: ctx.runtime.consumeCollect(ctx.name);
 		if (pending) {
 			const collected = await pending;
-			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
+			if (!collected || signal?.aborted) return ok("interrupted (parent turn aborted)");
+			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
 			return ok(renderCollect(ctx.name, collected));
 		}
 
@@ -992,12 +1113,16 @@ async function collectChild(
 			ctx.found.child.agent,
 		);
 		const timeoutMs = agentDef?.timeoutMs ?? DEFAULTS.turnTimeoutMs;
-		const collected = await ctx.orchestrator.collect(ctx.name, { timeoutMs });
-		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
-		if (
-			shouldRecycleAfterCollect(collected.execution.status) &&
-			!collected.blocked
-		) {
+		const collected = await ctx.orchestrator.collect(ctx.name, {
+			timeoutMs,
+			...(signal ? { signal } : {}),
+		});
+		if (signal?.aborted || collected.execution.reason === "aborted by parent") {
+			return ok("interrupted (parent turn aborted)");
+		}
+		const retireAlreadyFinishedJob = shouldRecycleAfterCollect(collected.execution.status) && !collected.blocked;
+		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: !retireAlreadyFinishedJob });
+		if (retireAlreadyFinishedJob) {
 			await ctx.orchestrator.retire(ctx.name);
 			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
 		}
@@ -1097,6 +1222,7 @@ async function launchFamily(input: {
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
 	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+	verifyRunner?: VerifyRunner;
 	store: RunStore;
 	cwd: string;
 	agents: AgentConfig[];
@@ -1105,6 +1231,7 @@ async function launchFamily(input: {
 	team: ActiveTeam;
 	legion?: LegionRuntimeIdentity;
 	runtime: SessionRuntime;
+	signal?: AbortSignal;
 	onUpdate?: AgentToolUpdateCallback;
 }): Promise<AgentToolResult<unknown>> {
 	const { params, ctx, store, cwd, agents, settings, runtime, onUpdate } = input;
@@ -1162,6 +1289,9 @@ async function launchFamily(input: {
 		maxDepth: settings.legion?.maxDepth,
 		maxSpawns: settings.maxSubagentSpawnsPerSession ?? null,
 		childContext: settings.childContext,
+		verifyRunner: input.verifyRunner,
+		worktreeBootstrap: settings.legion?.worktreeBootstrap,
+		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
 		...(legion ? { legion: { db: legion.db, dbPath: legion.dbPath, nodeId: legion.nodeId, runId: run.runId, parentNodeId: legion.parentNodeId ?? undefined, parentRunId: legion.parentRunId ?? undefined, runStore: store, settings: legion.settings, eventBus: legion.eventBus } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
@@ -1170,6 +1300,7 @@ async function launchFamily(input: {
 
 	const session: LaunchSession = {
 		params,
+		signal: input.signal,
 		teamOverride: params.team,
 		store,
 		agents,
@@ -1188,13 +1319,27 @@ async function launchFamily(input: {
 		timeoutByName: new Map(),
 	};
 
+	const interruptedResult = async (): Promise<AgentToolResult<unknown> | undefined> => {
+		if (!input.signal?.aborted) return undefined;
+		for (const name of session.handles) await abandonLaunchedChild(session, name);
+		session.handles.length = 0;
+		return {
+			content: [{ type: "text", text: session.results.join("\n") || "interrupted (parent turn aborted)" }],
+			details: { runId: run.runId, handles: [], async: params.async ?? true },
+		};
+	};
+
 	// Every planned child is independent and launches concurrently.
 	await Promise.all(plan.steps.map((step) => launchStep(session, step)));
+	const interruptedLaunch = await interruptedResult();
+	if (interruptedLaunch) return interruptedLaunch;
 
 	// Persist children first so a crash during the wait still leaves a record.
 	for (const name of session.handles) {
 		await persistChild(store, run.runId, orchestrator, name);
 	}
+	const interruptedPersistence = await interruptedResult();
+	if (interruptedPersistence) return interruptedPersistence;
 
 	// Collect inline unless the caller asked for async (the default).
 	// Async: the session runtime watches each child and wakes the parent
@@ -1204,11 +1349,16 @@ async function launchFamily(input: {
 		followLaunched(session, name, { watch: isAsync });
 	}
 	if (!isAsync) {
-		await collectInline(session);
+		await collectInline(session, input.signal);
 		for (const name of session.handles) {
 			const child = orchestrator
 				.childrenSnapshot()
 				.find((c) => c.name === name);
+			if (input.signal?.aborted && (!child?.execution || !shouldRecycleAfterCollect(child.execution.status))) {
+				followLaunched(session, name, { watch: true });
+				await persistChild(store, run.runId, orchestrator, name);
+				continue;
+			}
 			if (
 				child?.execution &&
 				shouldRecycleAfterCollect(child.execution.status)
@@ -1235,6 +1385,7 @@ async function launchFamily(input: {
 /** Accumulated state for one launch-family request. */
 interface LaunchSession {
 	params: SubagentParams;
+	signal?: AbortSignal;
 	teamOverride?: string;
 	store: RunStore;
 	agents: AgentConfig[];
@@ -1257,8 +1408,9 @@ interface LaunchSession {
  */
 async function launchStep(
 	session: LaunchSession,
-	step: { agent: string; task: string; model?: string; preset?: string; worktree?: boolean },
+	step: { agent: string; task: string; model?: string; preset?: string; worktree?: boolean; verify?: string[] },
 ): Promise<void> {
+	if (session.signal?.aborted) return;
 	const agent = findAgent(session.agents, step.agent);
 	if (!agent) {
 		session.results.push(
@@ -1288,6 +1440,34 @@ async function launchStep(
 		const effective = model.agent;
 		const resolved = model.resolved;
 
+		// `verify:` on the launch call becomes a criterion with an explicit
+		// `command`, so `applyVerification` runs it in the child worktree at
+		// collect time — the extension verifies the child's verdict instead
+		// of trusting pasted test output. Blank entries are dropped; an empty
+		// result is a no-op. Never mutated onto the shared agent object: the
+		// catalog would hand the same reference to every later launch.
+		const verifyCommands = (step.verify ?? session.params.verify ?? [])
+			.map((command) => command.trim())
+			.filter(Boolean);
+		const launchedAgent = verifyCommands.length
+			? {
+				...effective,
+				acceptance: {
+					...(effective.acceptance ?? { level: "attested" as const }),
+					criteria: [
+						...(effective.acceptance?.criteria ?? []),
+						{
+							id: "task-verify",
+							must: "Launcher-supplied verify commands pass (run by the extension, not the child)",
+							evidence: ["verification-output"],
+							severity: "required" as const,
+							command: verifyCommands.join(" && "),
+						},
+					],
+				},
+			}
+			: effective;
+
 		const violation = checkModelScope(
 			resolved.model,
 			session.settings.modelScope,
@@ -1301,7 +1481,7 @@ async function launchStep(
 		// Let `launch()` allocate from the supervisor-local registry; the index
 		// must not race separate subagent tool calls.
 		const handle = await session.orchestrator.launch({
-			agent: effective,
+			agent: launchedAgent,
 			task: step.task,
 			...(session.teamOverride ? { team: session.teamOverride } : {}),
 			...(resolved.model ? { model: resolved.model } : {}),
@@ -1324,6 +1504,10 @@ async function launchStep(
 		session.handles.push(handle.name);
 		if (effective.timeoutMs !== undefined) {
 			session.timeoutByName.set(handle.name, effective.timeoutMs);
+		}
+		if (session.signal?.aborted) {
+			await abandonLaunchedChild(session, handle.name);
+			return;
 		}
 		session.results.push(
 			`▶ ${handle.name} (${effective.name}) supervisor=rpc`,
@@ -1437,12 +1621,21 @@ function resolveStep(
 }
 
 /** Wait for each launched child's turn, appending its outcome. */
-async function collectInline(session: LaunchSession): Promise<void> {
+async function collectInline(session: LaunchSession, signal?: AbortSignal): Promise<void> {
 	for (const name of session.handles) {
+		if (signal?.aborted) {
+			session.results.push("interrupted (parent turn aborted)");
+			return;
+		}
 		try {
 			const collected = await session.orchestrator.collect(name, {
 				timeoutMs: session.timeoutByName.get(name) ?? DEFAULTS.turnTimeoutMs,
+				...(signal ? { signal } : {}),
 			});
+			if (signal?.aborted || collected.execution.reason === "aborted by parent") {
+				session.results.push("interrupted (parent turn aborted)");
+				return;
+			}
 			session.results.push(renderCollect(name, collected));
 		} catch (error) {
 			session.results.push(`✗ ${name}: collect failed: ${String(error)}`);
@@ -1468,6 +1661,255 @@ type Plan =
 	  }
 	| { ok: false; message: string };
 
+type UtilityTaskItem = Static<typeof TaskItem>;
+type VexillatioParams = Static<typeof VexillatioParams>;
+
+type UtilityPlan =
+	| { ok: true; steps: UtilityTaskItem[] }
+	| { ok: false; message: string };
+
+function buildUtilityPlan(params: VexillatioParams): UtilityPlan {
+	if (!params.task.trim()) return { ok: false, message: "`task` must not be blank." };
+	const steps = params.tasks?.length
+		? params.tasks
+		: [{ agent: params.agent?.trim() || "scout", task: params.task }];
+	const invalid = steps.findIndex((item) => !item.agent.trim() || !item.task.trim());
+	if (invalid >= 0) {
+		return { ok: false, message: `tasks[] step ${invalid + 1} must include non-blank \`agent\` and \`task\`.` };
+	}
+	return { ok: true, steps };
+}
+
+async function launchUtilityFamily(input: {
+	pi: ExtensionAPI;
+	ctx: ExtensionContext;
+	params: VexillatioParams;
+	supervisor: LegionSupervisor;
+	uiProxy: UIProxy;
+	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+	cwd: string;
+	sessionCwd: string;
+	isChild: boolean;
+	legion?: LegionRuntimeIdentity;
+	eventBus: LegionEventBus;
+	onLegion: (identity: LegionRuntimeIdentity) => void;
+	onUtilityChild: (retire: () => Promise<void>) => void;
+}): Promise<AgentToolResult<unknown>> {
+	const plan = buildUtilityPlan(input.params);
+	if (!plan.ok) return fail(plan.message, ErrorCodes.INVALID_PARAMS);
+
+	const catalog = loadCatalog(input.sessionCwd, input.cwd, undefined);
+	const prepared: Array<{
+		step: UtilityTaskItem;
+		agent: AgentConfig;
+		resolved: ReturnType<typeof resolveStepModel>["resolved"];
+		modelOrigin: ModelOrigin;
+	}> = [];
+	for (const step of plan.steps) {
+		const agent = findAgent(catalog.allAgents, step.agent);
+		if (!agent?.utility) {
+			return fail(
+				`not a utility agent: ${step.agent} (mark it with 'utility: true')`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		if (agent.disabled) {
+			return fail(`utility agent is disabled: ${agent.name}`, ErrorCodes.DISABLED);
+		}
+		try {
+			const resolvedStep = resolveStepModel({
+				agent,
+				step: {
+					...(step.model !== undefined ? { model: step.model } : {}),
+					...(step.preset !== undefined ? { preset: step.preset } : {}),
+				},
+				params: { ...(input.params.model !== undefined ? { model: input.params.model } : {}) },
+				...(input.ctx.model ? { dispatchModel: `${input.ctx.model.provider}/${input.ctx.model.id}` } : {}),
+				settings: catalog.settings,
+			});
+			const violation = checkModelScope(
+				resolvedStep.resolved.model,
+				catalog.settings.modelScope,
+				resolvedStep.modelOrigin,
+			);
+			if (violation?.severity === "error") {
+				return fail(violation.message, ErrorCodes.INVALID_PARAMS);
+			}
+			prepared.push({
+				step,
+				agent: resolvedStep.agent,
+				resolved: resolvedStep.resolved,
+				modelOrigin: resolvedStep.modelOrigin,
+			});
+		} catch (error) {
+			return fail(`✗ ${step.agent}: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
+		}
+	}
+
+	const firstPrepared = prepared[0];
+	const runTask = prepared.length === 1 && firstPrepared
+		? firstPrepared.step.task
+		: `${prepared.length} parallel utility tasks`;
+	const rootStore = runStoreFor(input.cwd);
+	let legion = resolveLegionIdentity({
+		pi: input.pi,
+		supervisor: input.supervisor,
+		store: rootStore,
+		cwd: input.cwd,
+		settings: catalog.settings,
+		eventBus: input.eventBus,
+		cached: input.legion,
+		sessionFile: input.ctx.sessionManager?.getSessionFile(),
+	});
+	if (!legion && !input.isChild) {
+		legion = createRootLegion({
+			pi: input.pi,
+			supervisor: input.supervisor,
+			store: rootStore,
+			cwd: input.cwd,
+			task: `vexillatio: ${runTask}`,
+			settings: catalog.settings,
+			maxDepth: effectiveMaxDepth(catalog.settings.legion?.maxDepth),
+			eventBus: input.eventBus,
+		});
+	}
+	if (legion) input.onLegion(legion);
+
+	const store = legion?.runStore ?? rootStore;
+	const run = legion
+		? store.readRun(legion.runId)
+		: store.createRun({
+			task: runTask,
+			cwd: input.cwd,
+			maxDepth: effectiveMaxDepth(catalog.settings.legion?.maxDepth),
+			path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH),
+			herdr: { supervisor: "rpc" },
+		});
+	if (!run) return fail("vexillatio parent run is not available", ErrorCodes.NOT_FOUND);
+	const runId = run.runId;
+	const timeoutMs = input.params.timeoutMs ?? 600_000;
+	const existingNames = new Set(
+		store.listRuns().flatMap((existingRun) => existingRun.children.map((child) => child.name)),
+	);
+	if (legion) {
+		for (const child of getChildren(legion.db, legion.nodeId)) existingNames.add(child.name);
+	}
+	const names = new Map<UtilityTaskItem, string>();
+	const nameCounters = new Map<string, number>();
+	for (const item of prepared) {
+		let index = nameCounters.get(item.agent.name) ?? 0;
+		for (;; index += 1) {
+			const candidate = makeName(item.agent.name, index);
+			if (existingNames.has(candidate) || input.supervisor.isAlive(candidate)) continue;
+			existingNames.add(candidate);
+			names.set(item.step, candidate);
+			nameCounters.set(item.agent.name, index + 1);
+			break;
+		}
+	}
+
+	const results: string[] = [];
+	const launches = await Promise.all(prepared.map(async (item) => {
+		const cwd = item.step.cwd ? path.resolve(input.cwd, item.step.cwd) : input.cwd;
+		const orchestrator = new Orchestrator({
+			supervisor: input.supervisor,
+			uiProxy: input.uiProxy,
+			runDir: legion?.runDir ?? store.runDir(runId),
+			cwd,
+			maxDepth: catalog.settings.legion?.maxDepth,
+			maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null,
+			childContext: catalog.settings.childContext,
+			team: catalog.team,
+			onBudgetRefused: input.onBudgetRefused,
+			...(legion ? {
+				legion: {
+					db: legion.db,
+					dbPath: legion.dbPath,
+					nodeId: legion.nodeId,
+					runId,
+					parentNodeId: legion.parentNodeId,
+					parentRunId: legion.parentRunId ?? undefined,
+					runStore: store,
+					settings: legion.settings,
+					eventBus: legion.eventBus,
+				},
+			} : {}),
+		});
+		orchestrator.restore(run);
+		try {
+			const handle = await orchestrator.launch({
+				agent: item.agent,
+				task: item.step.task,
+				name: names.get(item.step),
+				...(item.resolved.model ? { model: item.resolved.model } : {}),
+				modelOrigin: item.modelOrigin,
+				...(item.step.worktree !== undefined ? { worktree: item.step.worktree } : {}),
+				utilityDispatch: true,
+				stripLegionIdentity: true,
+			});
+			await persistChild(store, runId, orchestrator, handle.name);
+			input.onUtilityChild(async () => {
+				try {
+					await orchestrator.retire(handle.name);
+					await persistChild(store, runId, orchestrator, handle.name);
+				} catch {
+					// Shutdown cleanup is best-effort; the supervisor owns final process state.
+				}
+			});
+			return {
+				item,
+				value: {
+					name: handle.name,
+					agent: item.agent.name,
+					sessionFile: handle.sessionFile,
+					orchestrator,
+				},
+			};
+		} catch (error) {
+			return {
+				item,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	}));
+	const handles: Array<{
+		name: string;
+		agent: string;
+		sessionFile: string;
+		orchestrator: Orchestrator;
+	}> = [];
+	for (const launch of launches) {
+		if ("error" in launch) results.push(`✗ ${launch.item.agent.name}: ${launch.error}`);
+		else handles.push(launch.value);
+	}
+
+	const collected = await Promise.all(handles.map(async (handle) => {
+		try {
+			const result = await handle.orchestrator.collect(handle.name, { timeoutMs });
+			await persistChild(store, runId, handle.orchestrator, handle.name);
+			const lines = [
+				`── ${handle.name} ──`,
+				`execution: ${result.execution.status}${result.execution.reason ? ` (${result.execution.reason})` : ""}`,
+				result.output || "(no output)",
+			];
+			if (result.outputFile) lines.push(`outputFile: ${result.outputFile}`);
+			lines.push(`sessionFile: ${handle.sessionFile}`);
+			return lines.join("\n");
+		} catch (error) {
+			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
+		}
+	}));
+	results.push(...collected);
+	return {
+		content: [{ type: "text", text: results.join("\n\n") || "No utility agents were launched." }],
+		details: {
+			runId,
+			handles: handles.map(({ name, agent, sessionFile }) => ({ name, agent, sessionFile })),
+			async: false,
+		},
+	};
+}
+
 export function buildPlan(params: {
 	agent?: string;
 	task?: string;
@@ -1478,8 +1920,10 @@ export function buildPlan(params: {
 		model?: string;
 		preset?: string;
 		worktree?: boolean;
+		verify?: string[];
 	}>;
 	worktree?: boolean;
+	verify?: string[];
 }): Plan {
 	const hasSingle = isPresent(params.agent) && isPresent(params.task);
 	const hasTasks = Boolean(params.tasks?.length);
@@ -1528,6 +1972,7 @@ interface PlanStep {
 	model?: string;
 	preset?: string;
 	worktree?: boolean;
+	verify?: string[];
 }
 
 /**
@@ -1595,8 +2040,11 @@ function followJob(
 			parentId: child.nodeId.includes(".") ? child.nodeId.slice(0, child.nodeId.lastIndexOf(".")) : null,
 			depth: child.nodeId.split(".").length - 1,
 		} : {}),
-		collect: () =>
-			input.orchestrator.collect(input.name, { timeoutMs: input.timeoutMs }),
+		collect: (opts) =>
+			input.orchestrator.collect(input.name, {
+				timeoutMs: input.timeoutMs,
+				...(opts?.signal ? { signal: opts.signal } : {}),
+			}),
 		persist: async () =>
 			persistChild(input.store, input.runId, input.orchestrator, input.name),
 		retire: async () => {
@@ -1697,13 +2145,38 @@ async function persistChild(
 	runId: string,
 	orchestrator: Orchestrator,
 	name: string,
+	opts: { preserveRetired?: boolean } = {},
 ): Promise<void> {
 	const child = orchestrator.childrenSnapshot().find((c) => c.name === name);
 	if (!child) return;
 	try {
-		await store.updateChild(runId, name, (c) => Object.assign(c, child));
+		await store.updateChild(runId, name, (c) => {
+			if (opts.preserveRetired && c.state === "retired" && child.state !== "retired") return;
+			Object.assign(c, child);
+		});
 	} catch {
 		// Not persisted yet (or already removed) — the caller's own addChild wins.
+	}
+}
+
+async function abandonLaunchedChild(session: LaunchSession, name: string): Promise<void> {
+	const child = session.orchestrator.childrenSnapshot().find((entry) => entry.name === name);
+	if (!child) return;
+	if (child.state === "retired") {
+		session.runtime.release(name);
+		return;
+	}
+	child.execution = { status: "failed", reason: "launch abandoned because parent turn aborted" };
+	child.acceptance = { status: "rejected", level: "none", reason: "aborted by parent" };
+	try {
+		await session.orchestrator.retire(name);
+		await persistChild(session.store, session.runId, session.orchestrator, name);
+		session.runtime.release(name);
+		session.results.push(`✗ ${name}: abandoned because parent turn aborted (child retired)`);
+	} catch (error) {
+		await persistChild(session.store, session.runId, session.orchestrator, name);
+		followLaunched(session, name, { watch: true });
+		session.results.push(`✗ ${name}: abandon retire failed: ${String(error)}; completion remains watched`);
 	}
 }
 
@@ -1746,6 +2219,7 @@ export function resolveWaitTargets(
 export function renderWait(results: WaitResult[]): string {
 	let done = 0;
 	let running = 0;
+	let interrupted = 0;
 	const parts: string[] = [];
 	for (const result of results) {
 		if (result.snapshot) {
@@ -1754,23 +2228,83 @@ export function renderWait(results: WaitResult[]): string {
 		} else if (result.stillRunning) {
 			running += 1;
 			parts.push(`── ${result.name} ──\nstill running`);
+		} else if (result.interrupted) {
+			interrupted += 1;
+			parts.push(`── ${result.name} ──\ninterrupted (parent turn aborted)`);
 		} else {
 			parts.push(`── ${result.name} ──\nnot tracked (no live job, no finished cache)`);
 		}
 	}
 	parts.push(`${done} done, ${running} still running`);
+	if (interrupted > 0) parts.push(`${interrupted} interrupted`);
 	return parts.join("\n");
+}
+
+/** Gracefully retire a named child or every child tracked by this session. */
+export async function stopAction(input: {
+	params: { name?: string; all?: boolean };
+	runtime: SessionRuntime;
+	retire: (name: string) => Promise<void>;
+}): Promise<AgentToolResult<unknown>> {
+	const { params, runtime, retire } = input;
+	if (params.name && params.all) {
+		return fail("`name` and `all` are mutually exclusive for stop.", ErrorCodes.INVALID_PARAMS);
+	}
+	if (!params.name && !params.all) {
+		return fail("`name` or `all` is required for stop", ErrorCodes.INVALID_PARAMS);
+	}
+	const jobs = runtime.activeJobs();
+	const active = jobs.filter((job) => job.state !== "retired");
+	let targets: string[];
+	if (params.all) {
+		targets = active.map((job) => job.name);
+	} else {
+		const target = jobs.find((job) => job.name === params.name);
+		if (!target) {
+			return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
+		}
+		targets = target.state === "retired" ? [] : [target.name];
+	}
+	if (targets.length === 0) return ok("No non-retired children to stop.");
+
+	// Stop every watcher before any retire starts: a later target must not finish
+	// its own watch (and notify/release) while an earlier target is being retired.
+	for (const name of targets) runtime.cancelWatch(name);
+
+	const stopped: string[] = [];
+	const failures: string[] = [];
+	for (const name of targets) {
+		try {
+			// The runtime job may have been released after the target snapshot was
+			// taken. The retire adapter can then resolve its persisted run record.
+			await retire(name);
+			runtime.release(name);
+			stopped.push(name);
+		} catch (error) {
+			// If the graceful-retire chain fails, restore the completion watcher so a
+			// still-live child is not orphaned by the explicit stop attempt.
+			if (runtime.get(name)) runtime.rewatch(name);
+			failures.push(`${name}: ${String(error)}`);
+		}
+	}
+	const summary = stopped.length
+		? `Stopped ${stopped.length} child${stopped.length === 1 ? "" : "ren"}: ${stopped.join(", ")}.`
+		: "No children were stopped.";
+	return failures.length
+		? fail(`${summary}\nFailed to stop: ${failures.join("; ")}`, ErrorCodes.RETIRE_FAILED)
+		: ok(summary);
 }
 
 export async function waitAction(input: {
 	params: SubagentParams;
+	signal?: AbortSignal;
 	runtime: SessionRuntime;
 	agents: AgentConfig[];
 	allAgents?: AgentConfig[];
 	store: RunStore;
 	cwd: string;
 }): Promise<AgentToolResult<unknown>> {
-	const { params, runtime, agents, allAgents = agents, store, cwd } = input;
+	const { params, signal, runtime, agents, allAgents = agents, store, cwd } = input;
 	const jobs = runtime.activeJobs();
 	let targets = resolveWaitTargets(
 		{ name: params.name, all: params.all },
@@ -1805,7 +2339,7 @@ export async function waitAction(input: {
 				);
 			}),
 		);
-	const results = await runtime.wait(targets.names, { timeoutMs });
+	const results = await runtime.wait(targets.names, { timeoutMs, ...(signal ? { signal } : {}) });
 	return ok(renderWait(results));
 }
 
@@ -1926,6 +2460,7 @@ function renderCollect(
 		acceptance: {
 			status: string;
 			level?: string;
+			reason?: string;
 			pendingCriteria?: Array<{
 				id: string;
 				must: string;
@@ -1940,6 +2475,11 @@ function renderCollect(
 		`execution: ${collected.execution.status}${collected.execution.reason ? ` (${collected.execution.reason})` : ""}`,
 		`acceptance: ${collected.acceptance.status}${collected.acceptance.level ? ` (${collected.acceptance.level})` : ""}`,
 	];
+	// The mechanical verify outcome (which command failed / which commands had
+	// to pass) is the parent's primary trust anchor — surface it inline.
+	if (collected.acceptance.reason && /^(verified by|verification failed)/.test(collected.acceptance.reason)) {
+		lines.push(collected.acceptance.reason);
+	}
 	if (collected.blocked) {
 		lines.push(
 			"blocked: waiting for child UI approval. Answer the pending request in the parent UI, or steer the child.",

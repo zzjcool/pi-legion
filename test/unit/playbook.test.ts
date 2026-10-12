@@ -14,6 +14,7 @@ test("playbook text describes RPC launch and frozen child guidance", () => {
 	assert.match(PARENT_PLAYBOOK, /Isolation is YOUR call/);
 	assert.match(PARENT_PLAYBOOK, /worktree: true/);
 	assert.match(PARENT_PLAYBOOK, /headless RPC children/);
+	assert.match(PARENT_PLAYBOOK, /verify:/);
 	assert.match(TOOL_DESCRIPTION, /async by default/);
 	assert.doesNotMatch(PARENT_PLAYBOOK, /Same agent type shares one tab/);
 });
@@ -60,6 +61,12 @@ test("legacy herdr commands remain available for manual v0.16.x workflows", () =
 test("playbook keeps the explicit wait action available", () => {
 	assert.match(PARENT_PLAYBOOK, /Use `wait` when you need blocking results/);
 	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire/);
+});
+
+test("playbook describes event-driven waits and graceful stop", () => {
+	assert.match(PARENT_PLAYBOOK, /use `stop` to gracefully retire one child or all tracked children/);
+	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire, stop/);
+	assert.match(TOOL_DESCRIPTION, /`wait` is event-driven/);
 });
 
 test("playbook explains RPC timeout and steering semantics", () => {

@@ -262,7 +262,8 @@ test("spawn passes the complete buildPiArgs CLI context and starts the first pro
 		assert.equal(args[modelIndex + 1], "openai/gpt-4.1");
 		const toolsIndex = args.indexOf("--tools");
 		assert.ok(toolsIndex >= 0);
-		assert.equal(args[toolsIndex + 1], "read,bash");
+		// REV-17.7 §2.7: non-utility allowlists include the separate recon tool.
+		assert.equal(args[toolsIndex + 1], "read,bash,vexillatio");
 		assert.ok(args.includes("--extension"));
 		assert.ok(args.includes("/tmp/example-extension.ts"));
 		assert.ok(args.includes("--append-system-prompt"));
@@ -305,6 +306,42 @@ test("spawn → first prompt → agent_settled → graceful retire lifecycle", a
 		assert.deepEqual(client.process.signals, []);
 		assert.equal(h.supervisor.isAlive("root.worker"), false);
 	} finally {
+		h.close();
+	}
+});
+
+test("waitSettled: parent abort resolves promptly and clears the waiter timeout", async () => {
+	const h = harness();
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	let waitTimer: ReturnType<typeof setTimeout> | undefined;
+	let clearedWaitTimer = false;
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const controller = new AbortController();
+		globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+			const timer = originalSetTimeout(...args);
+			if (args[1] === 60_000) waitTimer = timer;
+			return timer;
+		}) as typeof setTimeout;
+		globalThis.clearTimeout = ((...args: Parameters<typeof clearTimeout>) => {
+			if (args[0] === waitTimer) clearedWaitTimer = true;
+			return originalClearTimeout(...args);
+		}) as typeof clearTimeout;
+
+		const pending = h.supervisor.waitSettled("root.worker", 60_000, controller.signal);
+		controller.abort();
+		assert.deepEqual(await pending, {
+			settled: false,
+			abnormal: false,
+			reason: "aborted by parent",
+		});
+		assert.ok(waitTimer, "the waiter installs a timeout guard");
+		assert.equal(clearedWaitTimer, true, "abort clears the timeout guard");
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+		await h.supervisor.retire("root.worker").catch(() => {});
 		h.close();
 	}
 });

@@ -128,7 +128,10 @@ function pushModelArgs(args: string[], input: BuildArgsInput): void {
 /** `--tools a,b`, plus one `--extension` per explicitly listed extension. */
 function pushToolArgs(args: string[], agent: AgentConfig): void {
 	const tools = agent.tools?.filter(Boolean) ?? [];
-	if (tools.length > 0) args.push("--tools", tools.join(","));
+	if (tools.length > 0) {
+		if (!agent.utility && !tools.includes("vexillatio")) tools.push("vexillatio");
+		args.push("--tools", tools.join(","));
+	}
 
 	// Only pass through what the agent explicitly lists: a child must not
 	// silently inherit every extension the parent happens to have loaded.

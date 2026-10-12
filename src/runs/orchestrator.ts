@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
 import type { LegionSettings } from "../shared/types.ts";
-import { legionIdentityEnv } from "./args.ts";
+import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, legionIdentityEnv } from "./args.ts";
 import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
@@ -64,6 +64,7 @@ import {
 	removeChildWorktree,
 	resolveLaunchWorktree,
 } from "./worktree.ts";
+import { provisionWorktree } from "./provision.ts";
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
@@ -97,6 +98,9 @@ export interface OrchestratorDeps {
 	maxDepth?: number;
 	maxSpawns?: number | null;
 	verifyRunner?: VerifyRunner;
+	/** Post-create bootstrap for child worktrees (legion.worktreeBootstrap). */
+	worktreeBootstrap?: string;
+	worktreeBootstrapTimeoutMs?: number;
 	team?: ActiveTeam;
 	childContext?: string;
 	onBudgetRefused?: (event: BudgetRefusedEvent) => void;
@@ -115,6 +119,7 @@ export interface CollectResult {
 export const COLLECT_GRACE_EXTENSIONS = 2;
 const LINEAGE_ENV = "PI_SUBAGENT_PARENT_PATH";
 const MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
+const UTILITY_CHILD_ENV = "PI_SUBAGENT_UTILITY_CHILD";
 const CHILD_ENV = "PI_SUBAGENT_CHILD";
 const POLL_INTERVAL_MS = 500;
 
@@ -217,6 +222,8 @@ export class Orchestrator {
 	private readonly maxDepthValue: number;
 	private readonly maxSpawns: number | null;
 	private readonly verifyRunner?: VerifyRunner;
+	private readonly worktreeBootstrap?: string;
+	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
 	private readonly childContext?: string;
 	private readonly onBudgetRefused?: (event: BudgetRefusedEvent) => void;
@@ -246,6 +253,8 @@ export class Orchestrator {
 		this.maxDepthValue = effectiveMaxDepth(deps.maxDepth);
 		this.maxSpawns = deps.maxSpawns ?? null;
 		this.verifyRunner = deps.verifyRunner;
+		this.worktreeBootstrap = deps.worktreeBootstrap?.trim() || undefined;
+		this.worktreeBootstrapTimeoutMs = deps.worktreeBootstrapTimeoutMs;
 		this.team = deps.team;
 		this.childContext = deps.childContext?.trim() || undefined;
 		this.onBudgetRefused = deps.onBudgetRefused;
@@ -304,7 +313,7 @@ export class Orchestrator {
 		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
 	}
 
-	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string }): LegionNode | null {
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string; utility?: boolean }): LegionNode | null {
 		const legion = this.legion;
 		if (!legion) return null;
 		const parent = getNode(legion.db, legion.nodeId);
@@ -317,7 +326,11 @@ export class Orchestrator {
 			throw new SubagentError(`legion child is terminal and cannot be resumed: ${input.nodeId}`, ErrorCodes.BUDGET_EXCEEDED);
 		}
 		const team = input.team ?? input.agent.extraFields?.team ?? this.team?.name;
-		const depthCeiling = Math.min(legion.settings?.maxDepth ?? this.maxDepthValue, MAX_NESTED_PATH_ENTRIES);
+		// A utility node is a hard leaf and does not consume the recursive depth
+		// budget. Keep the real ledger depth, but allow this one generation.
+		const depthCeiling = input.utility
+			? parent.depth + 1
+			: Math.min(legion.settings?.maxDepth ?? this.maxDepthValue, MAX_NESTED_PATH_ENTRIES);
 		const childCount = Number(legion.db.prepare("SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?").get(legion.nodeId)?.count ?? 0);
 		const maxChildren = previous ? Math.max(legion.settings?.maxChildrenPerNode ?? 8, childCount + 1) : legion.settings?.maxChildrenPerNode;
 		const activeReservation = previous && (previous.status === "starting" || previous.status === "running") ? 1 : 0;
@@ -398,7 +411,7 @@ export class Orchestrator {
 	}
 
 	private recordSettled(child: ChildRecord, execution: Execution): void {
-		if (!this.legion || !child.nodeId || execution.status === "running") return;
+		if (!this.legion || !child.nodeId || execution.status === "running" || child.state === "retired") return;
 		const status = execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
 		const current = getNode(this.legion.db, child.nodeId);
 		if (!current || current.status === status) return;
@@ -476,6 +489,10 @@ export class Orchestrator {
 		thinking?: string | false;
 		worktree?: boolean;
 		modelOrigin?: ModelOrigin;
+		/** Vexillatio launch: bypass nested-depth gates while recording its parent-side Legion node. */
+		utilityDispatch?: boolean;
+		/** Mask inherited Legion identity from the spawned child process. */
+		stripLegionIdentity?: boolean;
 	}): Promise<Handle> {
 		this.warnDepthCap();
 		if (input.agent.kind !== "pi") {
@@ -490,9 +507,9 @@ export class Orchestrator {
 		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
 		const previous = this.children.get(name) ?? (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
 		if (previous && !this.children.has(name)) this.children.set(name, previous);
-		// Resuming any persisted node does not consume a fresh spawn slot. An
-		// abrupt parent shutdown can leave the durable child state at `working`.
-		this.assertWithinBudgets(Boolean(previous));
+		// A utility dispatch is a hard leaf, not a nested command-chain launch.
+		// The frozen contract therefore skips assertWithinBudgets entirely.
+		if (!input.utilityDispatch) this.assertWithinBudgets(Boolean(previous));
 		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		const models = this.planModelCandidates({
 			agent: input.agent,
@@ -522,6 +539,14 @@ export class Orchestrator {
 				worktreePath = tree.path;
 				worktreeBranch = tree.branch;
 				createdWorktree = true;
+				// Provision before any spawn: the child's first command and any
+				// plugin-run verify command would otherwise fail on a bare checkout.
+				// Failure throws through the existing rollback below (tree removed).
+				provisionWorktree({
+					worktreePath,
+					mode: this.worktreeBootstrap,
+					timeoutMs: this.worktreeBootstrapTimeoutMs,
+				});
 			}
 			const effectiveModel = models.candidates;
 			if (this.legion && nodeId && !previous && this.legion.runStore) {
@@ -534,7 +559,9 @@ export class Orchestrator {
 					task: input.task,
 					cwd: worktreePath ?? this.cwd,
 					path: this.childPath(name),
-					maxDepth: Math.min(this.maxDepthValue, this.depth + roleDepth, MAX_NESTED_PATH_ENTRIES),
+					maxDepth: input.utilityDispatch
+						? this.depth + 1
+						: Math.min(this.maxDepthValue, this.depth + roleDepth, MAX_NESTED_PATH_ENTRIES),
 					nodeId,
 					herdr: { supervisor: "rpc", node_id: nodeId },
 				});
@@ -544,9 +571,13 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent: input.agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models.candidates[0] });
+				reservedNode = this.reserveNode({ nodeId, name, agent: input.agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models.candidates[0], utility: Boolean(input.utilityDispatch && input.agent.utility) });
 				reserved = true;
 				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models.candidates[0] ? { model: models.candidates[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
+			}
+			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId);
+			if (input.stripLegionIdentity) {
+				for (const key of [LEGION_DB_ENV, LEGION_NODE_ID_ENV, LINEAGE_ENV, MAX_DEPTH_ENV]) delete childEnv[key];
 			}
 			let result: Awaited<ReturnType<LegionSupervisor["spawnChild"]>> | undefined;
 			let startedModel: string | undefined;
@@ -560,10 +591,11 @@ export class Orchestrator {
 					sessionFile,
 					tempDir,
 					cwd: worktreePath ?? this.cwd,
-					env: this.lineageEnv(name, input.agent, input.team, nodeId),
+					env: childEnv,
 					...(model ? { model } : {}),
+					...(input.stripLegionIdentity ? { stripLegionIdentity: true } : {}),
 					...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
-					...(input.agent.allowNestedSubagents !== undefined ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
+					...(input.agent.allowNestedSubagents !== undefined && !input.agent.utility ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
 					...(worktreeBranch ? { worktreeBranch } : {}),
 					...(this.childContext ? { childContext: this.childContext } : {}),
 				};
@@ -677,7 +709,10 @@ export class Orchestrator {
 		if (agent.toolBudget?.maxToolCalls !== undefined) env[MAX_TOOL_CALLS_ENV] = String(agent.toolBudget.maxToolCalls);
 		if (agent.turnBudget?.maxTurns !== undefined) env[MAX_TURNS_ENV] = String(agent.turnBudget.maxTurns);
 		if (agent.toolTimeoutMs !== undefined) env[TOOL_TIMEOUT_MS_ENV] = String(agent.toolTimeoutMs);
-		if (agent.allowNestedSubagents) env[ALLOW_NESTED_ENV] = "1";
+		if (agent.utility) env[UTILITY_CHILD_ENV] = "1";
+		// Utility identity takes precedence even when a role was misconfigured
+		// with allowNestedSubagents: utility children are always hard leaves.
+		if (agent.allowNestedSubagents && !agent.utility) env[ALLOW_NESTED_ENV] = "1";
 		return env;
 	}
 
@@ -766,23 +801,33 @@ export class Orchestrator {
 		this.onChildUpdate(child);
 	}
 
-	async collect(name: string, opts: { timeoutMs?: number } = {}): Promise<CollectResult> {
+	async collect(name: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CollectResult> {
 		const child = this.requireChild(name);
+		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(child.sessionFile));
+		if (opts.signal?.aborted) return abortedSnapshot();
 		if (this.pendingDialogs(name).length) return this.blockedResult(child);
 		const timeoutMs = opts.timeoutMs ?? DEFAULTS.turnTimeoutMs;
 		let deadline = this.now() + timeoutMs;
 		const initial = parseSessionFile(child.sessionFile);
-		let wait: "settled" | "timeout" | "blocked" | "gone" = isLastTurnComplete(initial)
+		let wait: "settled" | "timeout" | "blocked" | "gone" | "aborted" = isLastTurnComplete(initial)
 			? "settled"
-			: await this.awaitSupervisor(child, deadline);
+			: await this.awaitSupervisor(child, deadline, opts.signal);
+		if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		for (let attempt = 0; wait === "timeout" && attempt < COLLECT_GRACE_EXTENSIONS; attempt += 1) {
-			if (!(await this.collectArtifactGrowing(child))) break;
+			if (opts.signal?.aborted) return abortedSnapshot();
+			if (!(await this.collectArtifactGrowing(child, opts.signal))) break;
+			if (opts.signal?.aborted) return abortedSnapshot();
 			deadline += timeoutMs;
-			wait = await this.awaitSupervisor(child, deadline);
+			wait = await this.awaitSupervisor(child, deadline, opts.signal);
+			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
 		const parsed = parseSessionFile(child.sessionFile);
-		if (wait === "settled" && countAssistantMessages(parsed) > 0) await this.waitForQuiet(child.sessionFile, deadline);
+		if (wait === "settled" && countAssistantMessages(parsed) > 0) {
+			await this.waitForQuiet(child.sessionFile, deadline, opts.signal);
+			if (opts.signal?.aborted) return abortedSnapshot();
+		}
+		if (opts.signal?.aborted) return abortedSnapshot();
 		const current = parseSessionFile(child.sessionFile);
 		let execution = deriveOutcome(current);
 		if (wait === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(current)) {
@@ -793,38 +838,78 @@ export class Orchestrator {
 		return this.finishCollect(child, current, execution, deadline);
 	}
 
-	private async awaitSupervisor(child: ChildRecord, deadline: number): Promise<"settled" | "timeout" | "blocked" | "gone"> {
+	private interruptedCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>): CollectResult {
+		return {
+			execution: { status: "running", reason: "aborted by parent" },
+			output: parsed.output,
+			usage: parsed.usage,
+			model: parsed.model ?? child.model ?? null,
+			acceptance: { status: "unknown", level: "none", reason: "aborted by parent" },
+		};
+	}
+
+	private async awaitSupervisor(
+		child: ChildRecord,
+		deadline: number,
+		signal?: AbortSignal,
+	): Promise<"settled" | "timeout" | "blocked" | "gone" | "aborted"> {
+		if (signal?.aborted) return "aborted";
 		if (this.pendingDialogs(child.name).length) return "blocked";
-		let pending = this.pendingWaits.get(child.name);
+		let pending = signal ? undefined : this.pendingWaits.get(child.name);
 		if (!pending) {
-			pending = this.supervisor.waitSettled(child.name, Math.max(1, deadline - this.now()));
-			this.pendingWaits.set(child.name, pending);
-			const current = pending;
-			void current.then(
-				() => { if (this.pendingWaits.get(child.name) === current) this.pendingWaits.delete(child.name); },
-				() => { if (this.pendingWaits.get(child.name) === current) this.pendingWaits.delete(child.name); },
+			const wait = this.supervisor.waitSettled(
+				child.name,
+				Math.max(1, deadline - this.now()),
+				...(signal ? [signal] : []),
 			);
+			pending = wait;
+			if (!signal) {
+				this.pendingWaits.set(child.name, pending);
+				const current = pending;
+				void current.then(
+					() => { if (this.pendingWaits.get(child.name) === current) this.pendingWaits.delete(child.name); },
+					() => { if (this.pendingWaits.get(child.name) === current) this.pendingWaits.delete(child.name); },
+				);
+			}
 		}
-		if (!this.uiProxy) return this.settleDisposition(await pending, child.name);
 		let unsubscribe: (() => void) | undefined;
-		const blocked = new Promise<"blocked">((resolve) => {
-			unsubscribe = this.uiProxy?.onRequest((request) => {
-				if (request.childName !== child.name || !isApprovalRequest(request)) return;
-				child.state = "blocked";
-				this.onChildUpdate(child);
-				resolve("blocked");
+		let removeAbortListener: (() => void) | undefined;
+		try {
+			const waitForSettle = pending.then((settled) =>
+				settled.reason === "aborted by parent"
+					? "aborted" as const
+					: this.settleDisposition(settled, child.name),
+			);
+			if (!this.uiProxy && !signal) return await waitForSettle;
+			const waitForChildEvent = waitForSettle.then((result) => {
+				if (result === "settled" && child.state === "retired") return "gone" as const;
+				return result;
 			});
-		});
-		if (this.pendingDialogs(child.name).length) {
+			const blocked = new Promise<"blocked">((resolve) => {
+				if (!this.uiProxy) return;
+				unsubscribe = this.uiProxy.onRequest((request) => {
+					if (request.childName !== child.name || !isApprovalRequest(request) || child.state === "retired") return;
+					child.state = "blocked";
+					this.onChildUpdate(child);
+					resolve("blocked");
+				});
+			});
+			if (this.pendingDialogs(child.name).length) return "blocked";
+			const races: Array<Promise<"settled" | "timeout" | "blocked" | "gone" | "aborted">> = [waitForChildEvent];
+			if (this.uiProxy) races.push(blocked);
+			if (signal) {
+				races.push(new Promise((resolve) => {
+					const onAbort = () => resolve("aborted");
+					removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+					if (signal.aborted) onAbort();
+					else signal.addEventListener("abort", onAbort, { once: true });
+				}));
+			}
+			return await Promise.race(races);
+		} finally {
 			unsubscribe?.();
-			return "blocked";
+			removeAbortListener?.();
 		}
-		const result = await Promise.race([
-			pending.then((settled) => this.settleDisposition(settled, child.name)),
-			blocked,
-		]);
-		unsubscribe?.();
-		return result;
 	}
 
 	private settleDisposition(result: SettleResult, name: string): "settled" | "timeout" | "gone" {
@@ -839,10 +924,12 @@ export class Orchestrator {
 		const acceptance = deriveAcceptance(parsed, execution, child.pendingCriteria, {
 			...(child.completionGuard ? { completionGuard: true } : {}),
 		});
-		child.state = "blocked";
-		child.execution = execution;
-		child.acceptance = acceptance;
-		this.onChildUpdate(child);
+		if (child.state !== "retired") {
+			child.state = "blocked";
+			child.execution = execution;
+			child.acceptance = acceptance;
+			this.onChildUpdate(child);
+		}
 		return { execution, output: parsed.output, usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance, blocked: true };
 	}
 
@@ -851,19 +938,26 @@ export class Orchestrator {
 			deriveAcceptance(parsed, execution, child.pendingCriteria, { ...(child.completionGuard ? { completionGuard: true } : {}) }),
 			{ cwd: child.worktreePath ?? this.cwd, criteria: child.pendingCriteria, run: this.verifyRunner, timeoutMs: Math.max(5_000, deadline - this.now()) },
 		);
-		if (execution.status !== "running") child.state = "awaiting";
+		const isRetired = () => child.state === "retired";
+		// A running child can finish its in-flight collect while an explicit stop
+		// is retiring it. Record the result, but never demote a retired lifecycle
+		// state back to awaiting; only a later launch/resume may revive that child.
+		if (execution.status !== "running" && !isRetired()) child.state = "awaiting";
 		child.execution = execution;
 		child.acceptance = acceptance;
 		if (execution.status !== "running") this.recordSettled(child, execution);
-		this.onChildUpdate(child);
+		if (!isRetired()) this.onChildUpdate(child);
 		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
+		if (isRetired()) {
+			return { execution, output, usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance };
+		}
 		let outputFile: string | undefined;
 		if (execution.status === "running") child.outputFile = undefined;
 		else {
 			outputFile = this.writeOutputFile(child, output);
 			child.outputFile = outputFile;
 		}
-		this.onChildUpdate(child);
+		if (!isRetired()) this.onChildUpdate(child);
 		return { execution, output, ...(outputFile ? { outputFile } : {}), usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance };
 	}
 
@@ -882,23 +976,53 @@ export class Orchestrator {
 		} catch { return undefined; }
 	}
 
-	private async collectArtifactGrowing(child: ChildRecord): Promise<boolean> {
+	private async collectArtifactGrowing(child: ChildRecord, signal?: AbortSignal): Promise<boolean> {
 		const before = artifactSize(child.sessionFile);
-		if (before <= 0) return false;
-		await this.sleep(POLL_INTERVAL_MS);
+		if (before <= 0 || signal?.aborted) return false;
+		if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return false;
 		return artifactSize(child.sessionFile) > before;
 	}
 
-	private async waitForQuiet(sessionFile: string, deadline: number): Promise<void> {
+	private async sleepOrAbort(ms: number, signal?: AbortSignal): Promise<boolean> {
+		if (!signal) {
+			await this.sleep(ms);
+			return false;
+		}
+		if (signal.aborted) return true;
+		return new Promise<boolean>((resolve) => {
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const cleanup = () => {
+				signal.removeEventListener("abort", onAbort);
+				if (timer) clearTimeout(timer);
+			};
+			const finish = (aborted: boolean) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				resolve(aborted);
+			};
+			const onAbort = () => finish(true);
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) {
+				onAbort();
+				return;
+			}
+			timer = setTimeout(() => finish(false), ms);
+		});
+	}
+
+	private async waitForQuiet(sessionFile: string, deadline: number, signal?: AbortSignal): Promise<void> {
 		let previous = -1;
 		let quietSince = this.now();
 		const maxPolls = Math.max(1, Math.ceil(DEFAULTS.turnTimeoutMs / POLL_INTERVAL_MS));
 		for (let poll = 0; poll < maxPolls; poll += 1) {
+			if (signal?.aborted) return;
 			const size = artifactSize(sessionFile);
 			if (size !== previous) { previous = size; quietSince = this.now(); }
 			else if (this.now() - quietSince >= DEFAULTS.settleQuietMs) return;
 			if (this.now() >= deadline) return;
-			await this.sleep(POLL_INTERVAL_MS);
+			if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return;
 		}
 	}
 
@@ -920,6 +1044,7 @@ export class Orchestrator {
 
 	async retire(name: string): Promise<ChildRecord> {
 		const child = this.requireChild(name);
+		if (child.state === "retired") return child;
 		if (!child.execution && fs.existsSync(child.sessionFile)) child.execution = deriveOutcome(parseSessionFile(child.sessionFile));
 		if (this.supervisor.isAlive(name)) await this.supervisor.retire(name);
 		if (child.nodeId && this.legion) {

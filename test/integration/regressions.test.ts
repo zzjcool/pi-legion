@@ -177,3 +177,63 @@ test("regression: session completion distinguishes settled, toolUse, and unanswe
 	assert.equal(isLastTurnComplete(parseSessionText([userMsg("go"), assistantMsg({ stopReason: "toolUse", tools: ["bash"] })].join("\n"))), false);
 	assert.equal(isLastTurnComplete(parseSessionText(userMsg("go"))), false);
 });
+
+test("regression: worktree bootstrap provisions a fresh child worktree once", async () => {
+	const root = tempDir();
+	const repo = path.join(root, "repo");
+	const runDir = path.join(root, "run");
+	const { execFileSync } = await import("node:child_process");
+	const { provisionMarkerPath } = await import("../../src/runs/provision.ts");
+	try {
+		execFileSync("git", ["init", "-q", repo]);
+		execFileSync("git", ["-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"]);
+		const supervisor = new FakeSupervisor();
+		const bootstrap = new Orchestrator({
+			supervisor, runDir, cwd: repo,
+			worktreeBootstrap: "printf provisioned > bootstrap-marker.txt",
+		});
+		const handle = await bootstrap.launch({ agent: agent({ worktree: true }), task: "isolated" });
+		assert.ok(handle.child.worktreePath, "worktree created");
+		assert.ok(existsSync(path.join(handle.child.worktreePath, "bootstrap-marker.txt")), "bootstrap command ran inside the worktree");
+		assert.ok(existsSync(provisionMarkerPath(handle.child.worktreePath)), "provision marker written");
+
+		// Retire, then relaunch the SAME name on the SAME instance. `previous`
+		// hits the persisted worktreePath, so no new tree is created and no
+		// provisioning runs — the marker-file idempotency that guards a resumed
+		// worktree (different-mode no-op) is pinned in test/unit/provision.test.ts.
+		await bootstrap.retire(handle.name);
+		const relaunched = await bootstrap.launch({ agent: agent({ worktree: true }), task: "resumed", name: handle.name });
+		assert.equal(relaunched.child.worktreePath, handle.child.worktreePath, "resume reuses the tree");
+		assert.ok(existsSync(path.join(handle.child.worktreePath, "bootstrap-marker.txt")), "first-pass artifact survives the reuse");
+		const provisionedTrees = (await import("node:fs")).readdirSync(path.join(runDir, "worktrees"), { recursive: false });
+		assert.equal(provisionedTrees.length, 1, "no second worktree was created for the resume");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("regression: worktree bootstrap failure fails the launch and rolls back the worktree", async () => {
+	const root = tempDir();
+	const repo = path.join(root, "repo");
+	const runDir = path.join(root, "run");
+	const { execFileSync } = await import("node:child_process");
+	try {
+		execFileSync("git", ["init", "-q", repo]);
+		execFileSync("git", ["-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"]);
+		const supervisor = new FakeSupervisor();
+		const orchestrator = new Orchestrator({
+			supervisor, runDir, cwd: repo,
+			worktreeBootstrap: "exit 7",
+		});
+		await assert.rejects(
+			orchestrator.launch({ agent: agent({ worktree: true }), task: "doomed" }),
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.match((error as SubagentError).message, /worktree bootstrap failed/);
+				return true;
+			},
+		);
+		// The half-started launch leaves no worktree behind (existing rollback).
+		const { execFileSync: git } = await import("node:child_process");
+		const listed = git("git", ["-C", repo, "worktree", "list", "--porcelain"]).toString();
+		assert.doesNotMatch(listed, /pi-subagent\//, "no leftover worktree after bootstrap failure");
+	} finally { rmSync(root, { recursive: true, force: true }); }
+});

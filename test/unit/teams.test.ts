@@ -915,9 +915,11 @@ function indexHarness(
 	settings: Record<string, unknown>,
 	agents: Record<string, string>,
 	supervisorOptions: { autoSettle?: boolean; immediateTimeout?: boolean } = {},
+	verifyRunner?: (command: string, cwd: string) => Promise<{ code: number; stdout: string; stderr: string }>,
 ): {
 	cwd: string;
 	supervisor: FakeSupervisor;
+	sentMessages: unknown[];
 	tool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
 	shutdown(): Promise<void>;
 	cleanup(): Promise<void>;
@@ -940,20 +942,21 @@ function indexHarness(
 		...(supervisorOptions.autoSettle === false ? {} : { autoSettle: { text: `{"ok":true,"reason":"fake RPC child completed"}` } }),
 	});
 	const tools: Array<Record<string, unknown>> = [];
+	const sentMessages: unknown[] = [];
 	const handlers = new Map<string, (...args: any[]) => unknown>();
 	const pi = {
 		registerTool(tool: unknown) { tools.push(tool as Record<string, unknown>); },
-		registerCommand() {}, registerMessageRenderer() {}, sendMessage() {},
+		registerCommand() {}, registerMessageRenderer() {}, sendMessage(message: unknown) { sentMessages.push(message); },
 		events: { emit() {} },
 		on(name: string, handler: (...args: any[]) => unknown) { handlers.set(name, handler); },
 	};
-	herdrSubagents(pi as never, { supervisor });
+	herdrSubagents(pi as never, { supervisor, ...(verifyRunner ? { verifyRunner } : {}) });
 	const tool = tools.find((entry) => entry.name === "subagent") as {
 		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }>;
 	};
 	assert.ok(tool, "subagent tool registered through the index entry point");
 	return {
-		cwd, supervisor, tool,
+		cwd, supervisor, sentMessages, tool,
 		async shutdown() {
 			await handlers.get("session_shutdown")?.();
 		},
@@ -1003,6 +1006,145 @@ test("session shutdown retires active RPC children while preserving their run re
 	}
 });
 
+
+test("index stop action retires multiple RPC children and persists their retired state", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true, joinMode: "each" },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	let releaseFirstRetire: () => void = () => {};
+	try {
+		await invokeIndex(harness, {
+			tasks: [
+				{ agent: "worker", task: "first" },
+				{ agent: "worker", task: "second" },
+			],
+			async: true,
+			worktree: false,
+		});
+		const names = harness.supervisor.spawns.map((spawn) => spawn.input.name);
+		assert.equal(names.length, 2);
+		const firstName = names[0]!;
+		const secondName = names[1]!;
+		assert.ok(names.every((name) => harness.supervisor.isAlive(name)));
+
+		let firstRetireStartedResolve!: () => void;
+		const firstRetireStarted = new Promise<void>((resolve) => { firstRetireStartedResolve = resolve; });
+		const firstRetireGate = new Promise<void>((resolve) => { releaseFirstRetire = resolve; });
+		let firstRetireCalls = 0;
+		const originalRetire = harness.supervisor.retire.bind(harness.supervisor);
+		harness.supervisor.retire = async (name: string) => {
+			if (name === firstName && firstRetireCalls++ === 0) {
+				firstRetireStartedResolve();
+				await firstRetireGate;
+			}
+			await originalRetire(name);
+		};
+		const stopPending = invokeIndex(harness, { action: "stop", all: true });
+		await firstRetireStarted;
+		harness.supervisor.settle(secondName, { text: "second finished while first retires" });
+		await new Promise((resolve) => setTimeout(resolve, 2_600));
+		assert.equal(harness.sentMessages.length, 0, "all completion watchers are canceled before the first retire starts");
+		releaseFirstRetire();
+		const stopped = await stopPending;
+		assert.match(stopped, /Stopped 2 children/);
+		assert.equal(harness.sentMessages.length, 0, "stop cancels every completion watcher before retiring the first child");
+		assert.deepEqual(
+			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
+			names,
+		);
+		assert.ok(names.every((name) => !harness.supervisor.isAlive(name)));
+		const runs = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") }).listRuns();
+		const stoppedRecords = runs.flatMap((run) => run.children).filter((child) => names.includes(child.name));
+		assert.deepEqual(
+			stoppedRecords.map((child) => ({ name: child.name, state: child.state })),
+			names.map((name) => ({ name, state: "retired" })),
+		);
+	} finally {
+		releaseFirstRetire();
+		await harness.cleanup();
+	}
+});
+
+test("index launch abort retires the child spawned while the parent turn was canceled", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	let releaseSpawn: () => void = () => {};
+	try {
+		let spawnedResolve!: () => void;
+		const spawned = new Promise<void>((resolve) => { spawnedResolve = resolve; });
+		const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve; });
+		const originalSpawn = harness.supervisor.spawnChild.bind(harness.supervisor);
+		harness.supervisor.spawnChild = async (input) => {
+			const handle = await originalSpawn(input);
+			spawnedResolve();
+			await spawnGate;
+			return handle;
+		};
+		const controller = new AbortController();
+		const pending = harness.tool.execute(
+			"launch-abort",
+			{ agent: "worker", task: "do not keep a canceled launch", async: true, worktree: false },
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		await spawned;
+		controller.abort();
+		releaseSpawn();
+		const result = await pending;
+		const handle = harness.supervisor.spawns[0]?.input;
+		if (!handle) throw new Error("expected the child spawn to complete");
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /abandoned because parent turn aborted/);
+		assert.equal(harness.supervisor.isAlive(handle.name), false, "an abandoned launch is retired without starting a watch");
+		const records = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") }).listRuns();
+		const child = records.flatMap((run) => run.children).find((entry) => entry.name === handle.name);
+		assert.equal(child?.state, "retired");
+		assert.equal(child?.execution?.status, "failed", "the abandoned launch persists a failed run outcome");
+		assert.equal(harness.sentMessages.length, 0, "the abandoned child was never watched");
+	} finally {
+		releaseSpawn();
+		await harness.cleanup();
+	}
+});
+
+test("index collect abort returns promptly and leaves the RPC child running", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		await invokeIndex(harness, { agent: "worker", task: "finish after parent abort", async: true, worktree: false });
+		const name = harness.supervisor.spawns[0]?.input.name;
+		if (!name) throw new Error("worker child did not spawn");
+		const controller = new AbortController();
+		const pending = harness.tool.execute(
+			"collect-abort",
+			{ action: "collect", name },
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		controller.abort();
+		const result = await pending;
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
+		assert.equal(harness.supervisor.isAlive(name), true, "collect abort does not retire the child");
+
+		harness.supervisor.settle(name, { text: "the child completed after Esc" });
+		const deadline = Date.now() + 5_000;
+		while (harness.supervisor.isAlive(name)) {
+			if (Date.now() > deadline) throw new Error("watch did not retire the completed child");
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+	} finally {
+		await harness.cleanup();
+	}
+});
 
 test("index mainline: the selected team reaches RPC children", async () => {
 	const harness = indexHarness(
@@ -1064,6 +1206,103 @@ test("index mainline: environment default team reaches child and non-pi role rec
 		assert.equal(harness.supervisor.spawns.length, 1, "non-pi kinds never reach RpcSupervisor.spawnChild");
 	} finally {
 		restoreEnv(TEAM_ENV, previous);
+		await harness.cleanup();
+	}
+});
+
+test("index verify: launch-supplied commands run at collect and gate the verdict", async () => {
+	const calls: Array<{ command: string; cwd: string }> = [];
+	const verifyRunner = async (command: string, cwd: string) => {
+		calls.push({ command, cwd });
+		// The joined criterion command is one string; fail it as bash would
+		// (&& short-circuits at npm test, so the whole chain is non-zero).
+		return command === "npm run typecheck && npm test" ? { code: 1, stdout: "", stderr: "1 failing" } : { code: 0, stdout: "ok", stderr: "" };
+	};
+	// async:false so the tool call collects inline and the verify chain runs.
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: true },
+		verifyRunner,
+	);
+	try {
+		const text = await invokeIndex(harness, {
+			agent: "worker",
+			task: "implement",
+			async: false,
+			worktree: false,
+			verify: ["npm run typecheck", "npm test"],
+		});
+		assert.ok(text.length > 0, "inline collect produced output");
+		// The launcher's verify list is joined into ONE criterion command; the
+		// runner sees the joined form and the child cwd (no worktree → launch cwd).
+		assert.deepEqual(calls.map((c) => c.command), ["npm run typecheck && npm test"]);
+		assert.equal(calls[0]?.cwd, harness.cwd);
+		// The joined command exits non-zero (npm test fails under &&) and rejects
+		// the verdict with the failing command named.
+		assert.match(text, /rejected/);
+		assert.match(text, /npm test/);
+		const runs = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") }).listRuns();
+		const workerRun = runs.flatMap((run) => run.children).find((child) => child.agent === "worker");
+		assert.ok(workerRun, "worker child record persisted");
+		assert.ok(
+			(workerRun.pendingCriteria ?? []).some((criterion) => criterion.id === "task-verify" && criterion.command === "npm run typecheck && npm test"),
+			"task-verify criterion was snapshotted into pendingCriteria at launch",
+		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("index verify: all commands passing promotes the verdict to verified", async () => {
+	const calls: Array<{ command: string; cwd: string }> = [];
+	const verifyRunner = async (command: string, cwd: string) => {
+		calls.push({ command, cwd });
+		return { code: 0, stdout: "green", stderr: "" };
+	};
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: true },
+		verifyRunner,
+	);
+	try {
+		const text = await invokeIndex(harness, {
+			agent: "worker",
+			task: "implement",
+			async: false,
+			worktree: false,
+			verify: ["npm run typecheck", "npm test"],
+		});
+		assert.deepEqual(calls.map((c) => c.command), ["npm run typecheck && npm test"]);
+		assert.match(text, /accepted \(verified\)/);
+		assert.match(text, /`npm run typecheck && npm test`/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("index verify: without verify the worker path keeps its attested semantics", async () => {
+	const calls: Array<{ command: string; cwd: string }> = [];
+	const verifyRunner = async (command: string, cwd: string) => {
+		calls.push({ command, cwd });
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: true },
+		verifyRunner,
+	);
+	try {
+		await invokeIndex(harness, {
+			agent: "worker",
+			task: "implement",
+			async: false,
+			worktree: false,
+		});
+		assert.deepEqual(calls, [], "no verify supplied: the extension must not guess a command");
+	} finally {
 		await harness.cleanup();
 	}
 });

@@ -152,3 +152,71 @@ test("defaultVerifyRunner times out a hung command", async () => {
 	assert.match(result.stderr, /timed out/);
 	assert.ok(Date.now() - started < 5_000);
 });
+
+test("applyVerification runs every command in order and names the first failure", async () => {
+	const calls: Array<{ command: string; cwd: string }> = [];
+	const run = async (command: string, cwd: string) => {
+		calls.push({ command, cwd });
+		// Second command fails; the third must never run.
+		return command === "npm test"
+			? { code: 1, stdout: "", stderr: "1 failing" }
+			: { code: 0, stdout: "", stderr: "" };
+	};
+	const out = await applyVerification(attested, {
+		cwd: "/work",
+		criteria: [
+			{
+				id: "a",
+				must: "typecheck",
+				evidence: ["verification-output"],
+				severity: "required",
+				command: "npm run typecheck",
+			},
+			{
+				id: "b",
+				must: "tests",
+				evidence: ["verification-output"],
+				severity: "required",
+				command: "npm test",
+			},
+			{
+				id: "c",
+				must: "integration",
+				evidence: ["verification-output"],
+				severity: "required",
+				command: "npm run test:integration",
+			},
+		],
+		run,
+	});
+	assert.deepEqual(calls.map((c) => c.command), ["npm run typecheck", "npm test"]);
+	assert.equal(out.status, "rejected");
+	assert.match(out.reason ?? "", /npm test/);
+	assert.doesNotMatch(out.reason ?? "", /test:integration/);
+});
+
+test("applyVerification success names every command that had to pass", async () => {
+	const out = await applyVerification(attested, {
+		cwd: "/work",
+		criteria: [
+			{
+				id: "a",
+				must: "typecheck",
+				evidence: ["verification-output"],
+				severity: "required",
+				command: "npm run typecheck",
+			},
+			{
+				id: "b",
+				must: "tests",
+				evidence: ["verification-output"],
+				severity: "required",
+				command: "npm test",
+			},
+		],
+		run: async () => ({ code: 0, stdout: "", stderr: "" }),
+	});
+	assert.equal(out.status, "accepted");
+	assert.equal(out.level, "verified");
+	assert.match(out.reason ?? "", /`npm run typecheck` && `npm test`/);
+});

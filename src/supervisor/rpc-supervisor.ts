@@ -44,6 +44,7 @@ interface EventSubscription {
 interface SettleWaiter {
 	resolve(result: SettleResult): void;
 	timer?: NodeJS.Timeout;
+	cleanup?: () => void;
 }
 
 type ChildState = "starting" | "running" | "idle" | "retiring" | "exited" | "retired";
@@ -142,7 +143,9 @@ function defaultClientFactory(options: RpcClientOptions): RpcClientLike {
 	// pinned runtime's `process` property (a TS-private, non-# field) to close
 	// stdin, observe exit, and write UI responses. RpcClient's declarations
 	// confirm every method in RpcClientLike; the process is checked for null.
-	return new RpcClient(options) as unknown as RpcClientLike;
+	// Node spawn treats undefined env values as explicit removals. The SDK type
+	// omits that Node behavior, so the cast stays at this adapter boundary.
+	return new RpcClient(options as unknown as ConstructorParameters<typeof RpcClient>[0]) as unknown as RpcClientLike;
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
@@ -264,6 +267,7 @@ export class RpcSupervisor implements LegionSupervisor {
 				env: _env,
 				cliPath: _cliPath,
 				tempDir: _tempDir,
+				stripLegionIdentity: _stripLegionIdentity,
 				...buildInput
 			} = input;
 			const built = buildPiArgs({
@@ -281,13 +285,28 @@ export class RpcSupervisor implements LegionSupervisor {
 
 		let client: RpcClientLike;
 		try {
+			const env: Record<string, string | undefined> = {
+				// These are identity/permission markers, not ambient settings. A child
+				// only gets the roles its target's lineageEnv explicitly supplies.
+				PI_SUBAGENT_UTILITY_CHILD: undefined,
+				PI_SUBAGENT_ALLOW_NESTED: undefined,
+				...(input.env ?? {}),
+			};
+			if (input.stripLegionIdentity) {
+				for (const key of [
+					"PI_LEGION_DB",
+					"PI_LEGION_NODE_ID",
+					"PI_SUBAGENT_PARENT_PATH",
+					"PI_SUBAGENT_MAX_DEPTH",
+				]) env[key] = undefined;
+			}
 			const options: RpcClientOptions = {
 				cliPath: input.cliPath
 					? path.resolve(input.cliPath)
 					: defaultPiCliPath(),
 				cwd: input.cwd,
 				args: builtArgs,
-				...(input.env ? { env: input.env } : {}),
+				...(input.env || input.stripLegionIdentity ? { env: env as Record<string, string> } : {}),
 			};
 			client = this.clientFactory(options);
 			registration.client = client;
@@ -350,8 +369,11 @@ export class RpcSupervisor implements LegionSupervisor {
 		await this.requireClient(child).abort();
 	}
 
-	waitSettled(name: string, timeoutMs = 900_000): Promise<SettleResult> {
+	waitSettled(name: string, timeoutMs = 900_000, signal?: AbortSignal): Promise<SettleResult> {
 		const child = this.requireChild(name);
+		if (signal?.aborted) {
+			return Promise.resolve({ settled: false, abnormal: false, reason: "aborted by parent" });
+		}
 		if (!child.turnActive && child.lastTurnResult) {
 			return Promise.resolve(child.lastTurnResult);
 		}
@@ -377,13 +399,34 @@ export class RpcSupervisor implements LegionSupervisor {
 
 		return new Promise((resolve) => {
 			const waiter: SettleWaiter = { resolve };
+			let abortListener: (() => void) | undefined;
+			waiter.cleanup = () => {
+				if (waiter.timer) {
+					clearTimeout(waiter.timer);
+					waiter.timer = undefined;
+				}
+				if (signal && abortListener) {
+					signal.removeEventListener("abort", abortListener);
+					abortListener = undefined;
+				}
+			};
+			child.waiters.add(waiter);
 			if (timeoutMs > 0) {
 				waiter.timer = setTimeout(() => {
 					child.waiters.delete(waiter);
+					waiter.cleanup?.();
 					resolve({ settled: false, abnormal: false, reason: "timeout" });
 				}, timeoutMs);
 			}
-			child.waiters.add(waiter);
+			if (signal) {
+				abortListener = () => {
+					if (!child.waiters.delete(waiter)) return;
+					waiter.cleanup?.();
+					resolve({ settled: false, abnormal: false, reason: "aborted by parent" });
+				};
+				if (signal.aborted) abortListener();
+				else signal.addEventListener("abort", abortListener, { once: true });
+			}
 		});
 	}
 
@@ -696,7 +739,7 @@ export class RpcSupervisor implements LegionSupervisor {
 	private resolveWaiters(child: ChildRecord, result: SettleResult): void {
 		for (const waiter of [...child.waiters]) {
 			child.waiters.delete(waiter);
-			if (waiter.timer) clearTimeout(waiter.timer);
+			waiter.cleanup?.();
 			waiter.resolve(result);
 		}
 	}
