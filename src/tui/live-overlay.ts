@@ -457,7 +457,7 @@ function createSession(
 			const retractedText = chat.retractStreamingItem();
 			const currentStreamingText = retractedText || streamingText;
 			let remainingStreamingText = "";
-			if (currentStreamingText && !diskAssistantText.startsWith(currentStreamingText)) {
+			if (currentStreamingText && !diskAssistantText.includes(currentStreamingText)) {
 				remainingStreamingText = currentStreamingText.startsWith(diskAssistantText)
 					? currentStreamingText.slice(diskAssistantText.length)
 					: currentStreamingText;

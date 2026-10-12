@@ -739,3 +739,110 @@ test("streaming ahead of disk keeps the remaining tail", async () => {
 		component.close();
 	}
 });
+
+test("an unrelated disk assistant preserves the streaming draft", async () => {
+	const source = new FakeOverlaySource();
+	const diskMessages = [assistantMessage("different final text")];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		source.emit("root.worker", { type: "text_delta", delta: "unrelated draft" });
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		const rendered = stripTerminalSequences(state.text);
+		assert.match(rendered, /different final text/);
+		assert.match(rendered, /unrelated draft/);
+		assert.equal(state.streamingText, "unrelated draft");
+	} finally {
+		component.close();
+	}
+});
+
+test("disk backfill containing an opened-midstream tail retracts its duplicate", async () => {
+	const source = new FakeOverlaySource();
+	const diskMessages = [assistantMessage("The answer is 42")];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		source.emit("root.worker", { type: "text_delta", delta: "s 42" });
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		const rendered = stripTerminalSequences(state.text);
+		assert.equal(rendered.split("The answer is 42").length - 1, 1);
+		assert.equal(rendered.split("s 42").length - 1, 1, "the tail remains only inside the complete answer");
+		assert.equal(state.items.filter((item) => item.kind === "assistant").length, 1);
+		assert.equal(state.streamingText, "");
+	} finally {
+		component.close();
+	}
+});
+
+test("disk backfill containing clamped streaming text does not repeat its last line", async () => {
+	const source = new FakeOverlaySource();
+	const lines = ["First line", "Second line", "Third line", "Fourth line", "Fifth line"];
+	const diskMessages = [assistantMessage(lines.join("\n"))];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { maxLines: 2, terminalRows: 40 });
+	try {
+		for (const [index, line] of lines.entries()) {
+			source.emit("root.worker", {
+				type: "text_delta",
+				delta: `${index === 0 ? "" : "\n"}${line}`,
+			});
+		}
+		assert.equal(component.getState().streamingText, "Fourth line\nFifth line");
+
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		const rendered = stripTerminalSequences(state.text);
+		assert.equal(rendered.split("Fifth line").length - 1, 1);
+		assert.equal(state.streamingText, "");
+	} finally {
+		component.close();
+	}
+});
