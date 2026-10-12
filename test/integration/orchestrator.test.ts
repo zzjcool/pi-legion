@@ -150,6 +150,78 @@ test("U7: a growing session artifact extends the RPC collect deadline", async ()
 	}
 });
 
+test("collect: parent abort returns a running snapshot and leaves the child alive", async () => {
+	const h = harness({ immediateTimeout: false });
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "continue after parent abort", worktree: false });
+		const controller = new AbortController();
+		const pending = h.orchestrator.collect(handle.name, {
+			timeoutMs: 60_000,
+			signal: controller.signal,
+		});
+		controller.abort();
+		const collected = await pending;
+		assert.equal(collected.execution.status, "running");
+		assert.equal(collected.execution.reason, "aborted by parent");
+		assert.equal(collected.acceptance.reason, "aborted by parent");
+		assert.equal(h.supervisor.isAlive(handle.name), true, "ESC abort must not retire the child");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
+		h.supervisor.settle(handle.name, { text: "child still completed" });
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("collect finishing after explicit retire does not demote the child from retired", async () => {
+	const h = harness({ immediateTimeout: false });
+	let releaseSettle: () => void = () => {};
+	const settleGate = new Promise<void>((resolve) => { releaseSettle = resolve; });
+	const waitSettled = h.supervisor.waitSettled.bind(h.supervisor);
+	h.supervisor.waitSettled = async (name, timeoutMs) => {
+		const result = await waitSettled(name, timeoutMs);
+		await settleGate;
+		return result;
+	};
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "retire during collect", worktree: false });
+		const collecting = h.orchestrator.collect(handle.name, { timeoutMs: 60_000 });
+		assert.ok(h.supervisor.calls.some((call) => call.method === "waitSettled" && call.name === handle.name));
+		const retired = await h.orchestrator.retire(handle.name);
+		assert.equal(retired.state, "retired");
+		releaseSettle();
+		const collected = await collecting;
+		assert.equal(collected.execution.status, "aborted");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "retired");
+	} finally {
+		releaseSettle();
+		h.cleanup();
+	}
+});
+
+test("an in-flight collect does not overwrite retired state after explicit retire", async () => {
+	const h = harness({ immediateTimeout: false });
+	let waitStartedResolve!: () => void;
+	const waitStarted = new Promise<void>((resolve) => { waitStartedResolve = resolve; });
+	const waitForSettle = h.supervisor.waitSettled.bind(h.supervisor);
+	h.supervisor.waitSettled = async (name, timeoutMs) => {
+		const pending = waitForSettle(name, timeoutMs);
+		waitStartedResolve();
+		return pending;
+	};
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "retire during collect", worktree: false });
+		const collecting = h.orchestrator.collect(handle.name, { timeoutMs: 60_000 });
+		await waitStarted;
+		const retired = await h.orchestrator.retire(handle.name);
+		assert.equal(retired.state, "retired");
+		const result = await collecting;
+		assert.match(result.execution.reason ?? "", /no assistant message|RPC child exited before writing session JSONL/);
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "retired");
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("M1 lifecycle: launch, RPC steer, session JSONL collect, and retire", async () => {
 	const h = harness({ immediateTimeout: false });
 	try {

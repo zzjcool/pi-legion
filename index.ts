@@ -136,6 +136,7 @@ const SubagentParams = Type.Object({
 				Type.Literal("collect"),
 				Type.Literal("list"),
 				Type.Literal("wait"),
+				Type.Literal("stop"),
 			],
 			{ description: "Defaults to launch." },
 		),
@@ -180,16 +181,16 @@ const SubagentParams = Type.Object({
 		),
 	),
 	name: Type.Optional(
-		Type.String({ description: "Child handle name (control actions)" }),
+		Type.String({ description: "Child handle name (control actions, including wait and stop)" }),
 	),
 	all: Type.Optional(
 		Type.Boolean({
-			description: "wait: wait for every currently-running child in this session",
+			description: "wait: wait for active children; stop: stop every non-retired child",
 		}),
 	),
 	timeoutMs: Type.Optional(
 		Type.Number({
-			description: "wait: per-child timeout in ms (default: role turnTimeoutMs)",
+			description: "wait: per-child timeout in ms; event-driven completion returns early (default: role turnTimeoutMs)",
 		}),
 	),
 	message: Type.Optional(
@@ -686,15 +687,16 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		async execute(
 			_id,
 			params,
-			_signal,
+			signal,
 			onUpdate,
 			ctx: ExtensionContext,
 		): Promise<AgentToolResult<unknown>> {
 			runtime.bind(ctx);
+			const action = params.action ?? "launch";
+			if (signal?.aborted && action !== "stop") return ok("interrupted (parent turn aborted)");
 			// Master switch: refuse NEW launches with a pointer to the toggle;
 			// control actions (status/collect/wait/…) must stay available so a
 			// disable with live children remains observable and collectable.
-			const action = params.action ?? "launch";
 			if (!subagentsEnabled(ctx.cwd) && (action === "launch" || !action)) {
 				return fail(
 					"subagents are disabled (subagents.enabled: false or /subagents-toggle off). " +
@@ -734,6 +736,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			} catch (error) {
 				return fail(`legion runtime initialization failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
 			}
+			if (signal?.aborted && action !== "stop") return ok("interrupted (parent turn aborted)");
 
 			// Control actions address an EXISTING child; launch-family actions
 			// create new ones. The two share almost nothing, so they are separate.
@@ -741,6 +744,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 				return controlAction({
 					action,
 					params,
+					signal,
 					supervisor,
 					uiProxy,
 					onBudgetRefused,
@@ -757,7 +761,8 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			}
 
 			return launchFamily({
-					params,
+				params,
+				signal,
 				ctx,
 				supervisor,
 				uiProxy,
@@ -910,6 +915,7 @@ export function loadCatalog(
 async function controlAction(input: {
 	action: string;
 	params: SubagentParams;
+	signal?: AbortSignal;
 	legion?: OrchestratorLegionContext;
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
@@ -940,11 +946,46 @@ async function controlAction(input: {
 		}
 		return waitAction({
 			params,
+			signal: input.signal,
 			runtime: input.runtime,
 			agents: input.agents,
 			allAgents: input.allAgents,
 			store,
 			cwd,
+		});
+	}
+
+	if (action === "stop") {
+		return stopAction({
+			params,
+			runtime: input.runtime,
+			retire: async (name) => {
+				const job = input.runtime.get(name);
+				if (job?.retire) {
+					await job.retire();
+					return;
+				}
+				// A completion watch can retire/release a target after stop snapshots
+				// all names but before the serial loop reaches it. Treat that target as
+				// stopped; only rebuild if its persisted record is not already retired.
+				const found = findChild(input.store.listRuns(), name);
+				if (!found) throw new SubagentError(`unknown child: ${name}`, ErrorCodes.NOT_FOUND);
+				if (found.child.state === "retired") return;
+				const orchestrator = new Orchestrator({
+					supervisor: input.supervisor,
+					uiProxy: input.uiProxy,
+					runDir: input.store.runDir(found.runId),
+					cwd: input.cwd,
+					maxDepth: input.settings.legion?.maxDepth,
+					childContext: input.settings.childContext,
+					...teamForChildren(input.team),
+					...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: input.store } } : {}),
+					onBudgetRefused: input.onBudgetRefused,
+				});
+				orchestrator.restore(found.run);
+				await orchestrator.retire(name);
+				await persistChild(input.store, found.runId, orchestrator, name);
+			},
 		});
 	}
 
@@ -983,7 +1024,7 @@ async function controlAction(input: {
 
 	if (action === "status") return renderChild(found.child, "status");
 	if (action === "steer") return steerChild(ctx);
-	if (action === "collect") return collectChild(ctx);
+	if (action === "collect") return collectChild(ctx, input.signal);
 	if (action === "retire") return retireChild(ctx);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
 
@@ -1049,12 +1090,17 @@ async function steerChild(
 /** Wait for the child's current turn and derive its outcome from the session. */
 async function collectChild(
 	ctx: ChildContext,
+	signal?: AbortSignal,
 ): Promise<AgentToolResult<unknown>> {
 	try {
-		const pending = ctx.runtime.consumeCollect(ctx.name);
+		if (signal?.aborted) return ok("interrupted (parent turn aborted)");
+		const pending = signal
+			? ctx.runtime.consumeCollectInterruptible(ctx.name, signal)
+			: ctx.runtime.consumeCollect(ctx.name);
 		if (pending) {
 			const collected = await pending;
-			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
+			if (!collected || signal?.aborted) return ok("interrupted (parent turn aborted)");
+			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
 			return ok(renderCollect(ctx.name, collected));
 		}
 
@@ -1067,12 +1113,16 @@ async function collectChild(
 			ctx.found.child.agent,
 		);
 		const timeoutMs = agentDef?.timeoutMs ?? DEFAULTS.turnTimeoutMs;
-		const collected = await ctx.orchestrator.collect(ctx.name, { timeoutMs });
-		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
-		if (
-			shouldRecycleAfterCollect(collected.execution.status) &&
-			!collected.blocked
-		) {
+		const collected = await ctx.orchestrator.collect(ctx.name, {
+			timeoutMs,
+			...(signal ? { signal } : {}),
+		});
+		if (signal?.aborted || collected.execution.reason === "aborted by parent") {
+			return ok("interrupted (parent turn aborted)");
+		}
+		const retireAlreadyFinishedJob = shouldRecycleAfterCollect(collected.execution.status) && !collected.blocked;
+		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: !retireAlreadyFinishedJob });
+		if (retireAlreadyFinishedJob) {
 			await ctx.orchestrator.retire(ctx.name);
 			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
 		}
@@ -1181,6 +1231,7 @@ async function launchFamily(input: {
 	team: ActiveTeam;
 	legion?: LegionRuntimeIdentity;
 	runtime: SessionRuntime;
+	signal?: AbortSignal;
 	onUpdate?: AgentToolUpdateCallback;
 }): Promise<AgentToolResult<unknown>> {
 	const { params, ctx, store, cwd, agents, settings, runtime, onUpdate } = input;
@@ -1249,6 +1300,7 @@ async function launchFamily(input: {
 
 	const session: LaunchSession = {
 		params,
+		signal: input.signal,
 		teamOverride: params.team,
 		store,
 		agents,
@@ -1267,13 +1319,27 @@ async function launchFamily(input: {
 		timeoutByName: new Map(),
 	};
 
+	const interruptedResult = async (): Promise<AgentToolResult<unknown> | undefined> => {
+		if (!input.signal?.aborted) return undefined;
+		for (const name of session.handles) await abandonLaunchedChild(session, name);
+		session.handles.length = 0;
+		return {
+			content: [{ type: "text", text: session.results.join("\n") || "interrupted (parent turn aborted)" }],
+			details: { runId: run.runId, handles: [], async: params.async ?? true },
+		};
+	};
+
 	// Every planned child is independent and launches concurrently.
 	await Promise.all(plan.steps.map((step) => launchStep(session, step)));
+	const interruptedLaunch = await interruptedResult();
+	if (interruptedLaunch) return interruptedLaunch;
 
 	// Persist children first so a crash during the wait still leaves a record.
 	for (const name of session.handles) {
 		await persistChild(store, run.runId, orchestrator, name);
 	}
+	const interruptedPersistence = await interruptedResult();
+	if (interruptedPersistence) return interruptedPersistence;
 
 	// Collect inline unless the caller asked for async (the default).
 	// Async: the session runtime watches each child and wakes the parent
@@ -1283,11 +1349,16 @@ async function launchFamily(input: {
 		followLaunched(session, name, { watch: isAsync });
 	}
 	if (!isAsync) {
-		await collectInline(session);
+		await collectInline(session, input.signal);
 		for (const name of session.handles) {
 			const child = orchestrator
 				.childrenSnapshot()
 				.find((c) => c.name === name);
+			if (input.signal?.aborted && (!child?.execution || !shouldRecycleAfterCollect(child.execution.status))) {
+				followLaunched(session, name, { watch: true });
+				await persistChild(store, run.runId, orchestrator, name);
+				continue;
+			}
 			if (
 				child?.execution &&
 				shouldRecycleAfterCollect(child.execution.status)
@@ -1314,6 +1385,7 @@ async function launchFamily(input: {
 /** Accumulated state for one launch-family request. */
 interface LaunchSession {
 	params: SubagentParams;
+	signal?: AbortSignal;
 	teamOverride?: string;
 	store: RunStore;
 	agents: AgentConfig[];
@@ -1338,6 +1410,7 @@ async function launchStep(
 	session: LaunchSession,
 	step: { agent: string; task: string; model?: string; preset?: string; worktree?: boolean; verify?: string[] },
 ): Promise<void> {
+	if (session.signal?.aborted) return;
 	const agent = findAgent(session.agents, step.agent);
 	if (!agent) {
 		session.results.push(
@@ -1431,6 +1504,10 @@ async function launchStep(
 		session.handles.push(handle.name);
 		if (effective.timeoutMs !== undefined) {
 			session.timeoutByName.set(handle.name, effective.timeoutMs);
+		}
+		if (session.signal?.aborted) {
+			await abandonLaunchedChild(session, handle.name);
+			return;
 		}
 		session.results.push(
 			`▶ ${handle.name} (${effective.name}) supervisor=rpc`,
@@ -1544,12 +1621,21 @@ function resolveStep(
 }
 
 /** Wait for each launched child's turn, appending its outcome. */
-async function collectInline(session: LaunchSession): Promise<void> {
+async function collectInline(session: LaunchSession, signal?: AbortSignal): Promise<void> {
 	for (const name of session.handles) {
+		if (signal?.aborted) {
+			session.results.push("interrupted (parent turn aborted)");
+			return;
+		}
 		try {
 			const collected = await session.orchestrator.collect(name, {
 				timeoutMs: session.timeoutByName.get(name) ?? DEFAULTS.turnTimeoutMs,
+				...(signal ? { signal } : {}),
 			});
+			if (signal?.aborted || collected.execution.reason === "aborted by parent") {
+				session.results.push("interrupted (parent turn aborted)");
+				return;
+			}
 			session.results.push(renderCollect(name, collected));
 		} catch (error) {
 			session.results.push(`✗ ${name}: collect failed: ${String(error)}`);
@@ -1954,8 +2040,11 @@ function followJob(
 			parentId: child.nodeId.includes(".") ? child.nodeId.slice(0, child.nodeId.lastIndexOf(".")) : null,
 			depth: child.nodeId.split(".").length - 1,
 		} : {}),
-		collect: () =>
-			input.orchestrator.collect(input.name, { timeoutMs: input.timeoutMs }),
+		collect: (opts) =>
+			input.orchestrator.collect(input.name, {
+				timeoutMs: input.timeoutMs,
+				...(opts?.signal ? { signal: opts.signal } : {}),
+			}),
 		persist: async () =>
 			persistChild(input.store, input.runId, input.orchestrator, input.name),
 		retire: async () => {
@@ -2056,13 +2145,38 @@ async function persistChild(
 	runId: string,
 	orchestrator: Orchestrator,
 	name: string,
+	opts: { preserveRetired?: boolean } = {},
 ): Promise<void> {
 	const child = orchestrator.childrenSnapshot().find((c) => c.name === name);
 	if (!child) return;
 	try {
-		await store.updateChild(runId, name, (c) => Object.assign(c, child));
+		await store.updateChild(runId, name, (c) => {
+			if (opts.preserveRetired && c.state === "retired" && child.state !== "retired") return;
+			Object.assign(c, child);
+		});
 	} catch {
 		// Not persisted yet (or already removed) — the caller's own addChild wins.
+	}
+}
+
+async function abandonLaunchedChild(session: LaunchSession, name: string): Promise<void> {
+	const child = session.orchestrator.childrenSnapshot().find((entry) => entry.name === name);
+	if (!child) return;
+	if (child.state === "retired") {
+		session.runtime.release(name);
+		return;
+	}
+	child.execution = { status: "failed", reason: "launch abandoned because parent turn aborted" };
+	child.acceptance = { status: "rejected", level: "none", reason: "aborted by parent" };
+	try {
+		await session.orchestrator.retire(name);
+		await persistChild(session.store, session.runId, session.orchestrator, name);
+		session.runtime.release(name);
+		session.results.push(`✗ ${name}: abandoned because parent turn aborted (child retired)`);
+	} catch (error) {
+		await persistChild(session.store, session.runId, session.orchestrator, name);
+		followLaunched(session, name, { watch: true });
+		session.results.push(`✗ ${name}: abandon retire failed: ${String(error)}; completion remains watched`);
 	}
 }
 
@@ -2105,6 +2219,7 @@ export function resolveWaitTargets(
 export function renderWait(results: WaitResult[]): string {
 	let done = 0;
 	let running = 0;
+	let interrupted = 0;
 	const parts: string[] = [];
 	for (const result of results) {
 		if (result.snapshot) {
@@ -2113,23 +2228,83 @@ export function renderWait(results: WaitResult[]): string {
 		} else if (result.stillRunning) {
 			running += 1;
 			parts.push(`── ${result.name} ──\nstill running`);
+		} else if (result.interrupted) {
+			interrupted += 1;
+			parts.push(`── ${result.name} ──\ninterrupted (parent turn aborted)`);
 		} else {
 			parts.push(`── ${result.name} ──\nnot tracked (no live job, no finished cache)`);
 		}
 	}
 	parts.push(`${done} done, ${running} still running`);
+	if (interrupted > 0) parts.push(`${interrupted} interrupted`);
 	return parts.join("\n");
+}
+
+/** Gracefully retire a named child or every child tracked by this session. */
+export async function stopAction(input: {
+	params: { name?: string; all?: boolean };
+	runtime: SessionRuntime;
+	retire: (name: string) => Promise<void>;
+}): Promise<AgentToolResult<unknown>> {
+	const { params, runtime, retire } = input;
+	if (params.name && params.all) {
+		return fail("`name` and `all` are mutually exclusive for stop.", ErrorCodes.INVALID_PARAMS);
+	}
+	if (!params.name && !params.all) {
+		return fail("`name` or `all` is required for stop", ErrorCodes.INVALID_PARAMS);
+	}
+	const jobs = runtime.activeJobs();
+	const active = jobs.filter((job) => job.state !== "retired");
+	let targets: string[];
+	if (params.all) {
+		targets = active.map((job) => job.name);
+	} else {
+		const target = jobs.find((job) => job.name === params.name);
+		if (!target) {
+			return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
+		}
+		targets = target.state === "retired" ? [] : [target.name];
+	}
+	if (targets.length === 0) return ok("No non-retired children to stop.");
+
+	// Stop every watcher before any retire starts: a later target must not finish
+	// its own watch (and notify/release) while an earlier target is being retired.
+	for (const name of targets) runtime.cancelWatch(name);
+
+	const stopped: string[] = [];
+	const failures: string[] = [];
+	for (const name of targets) {
+		try {
+			// The runtime job may have been released after the target snapshot was
+			// taken. The retire adapter can then resolve its persisted run record.
+			await retire(name);
+			runtime.release(name);
+			stopped.push(name);
+		} catch (error) {
+			// If the graceful-retire chain fails, restore the completion watcher so a
+			// still-live child is not orphaned by the explicit stop attempt.
+			if (runtime.get(name)) runtime.rewatch(name);
+			failures.push(`${name}: ${String(error)}`);
+		}
+	}
+	const summary = stopped.length
+		? `Stopped ${stopped.length} child${stopped.length === 1 ? "" : "ren"}: ${stopped.join(", ")}.`
+		: "No children were stopped.";
+	return failures.length
+		? fail(`${summary}\nFailed to stop: ${failures.join("; ")}`, ErrorCodes.RETIRE_FAILED)
+		: ok(summary);
 }
 
 export async function waitAction(input: {
 	params: SubagentParams;
+	signal?: AbortSignal;
 	runtime: SessionRuntime;
 	agents: AgentConfig[];
 	allAgents?: AgentConfig[];
 	store: RunStore;
 	cwd: string;
 }): Promise<AgentToolResult<unknown>> {
-	const { params, runtime, agents, allAgents = agents, store, cwd } = input;
+	const { params, signal, runtime, agents, allAgents = agents, store, cwd } = input;
 	const jobs = runtime.activeJobs();
 	let targets = resolveWaitTargets(
 		{ name: params.name, all: params.all },
@@ -2164,7 +2339,7 @@ export async function waitAction(input: {
 				);
 			}),
 		);
-	const results = await runtime.wait(targets.names, { timeoutMs });
+	const results = await runtime.wait(targets.names, { timeoutMs, ...(signal ? { signal } : {}) });
 	return ok(renderWait(results));
 }
 

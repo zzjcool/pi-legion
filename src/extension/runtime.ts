@@ -71,7 +71,7 @@ export interface TrackedJobInput {
 	nodeId?: string;
 	parentId?: string | null;
 	depth?: number;
-	collect: () => Promise<CollectSnapshot>;
+	collect: (opts?: { signal?: AbortSignal }) => Promise<CollectSnapshot>;
 	persist?: (snapshot: CollectSnapshot) => Promise<void>;
 	/** Retire the RPC child after a terminal collect. Blocked children stay alive. */
 	retire?: () => Promise<void>;
@@ -135,6 +135,7 @@ const DEFAULT_WAIT_TIMEOUT_MS = DEFAULTS.turnTimeoutMs;
 
 /** A wait() promise that must settle by the deadline. */
 class WaitTimeoutError extends Error {}
+const WAIT_INTERRUPTED = Symbol("wait interrupted");
 
 /** Retire after collect unless the child is still waiting on the user. */
 export function shouldRecycleAfterCollect(status: string): boolean {
@@ -149,6 +150,8 @@ export interface WaitResult {
 	snapshot?: CollectSnapshot;
 	/** Still running when the timeout fired. */
 	stillRunning?: boolean;
+	/** The parent turn aborted while this wait was pending. */
+	interrupted?: boolean;
 	/** Not tracked live and no finished cache (pre-validated upstream). */
 	missing?: boolean;
 }
@@ -163,6 +166,10 @@ export interface SessionRuntime {
 	 * collect promise when we are already tracking the child.
 	 */
 	consumeCollect(name: string): Promise<CollectSnapshot> | undefined;
+	/** Abortable variant used by an in-flight collect tool call. */
+	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<CollectSnapshot | undefined> | undefined;
+	/** Invalidate an in-flight notification watch without dropping the job. */
+	cancelWatch(name: string): void;
 	rewatch(name: string, opts?: { triggerTurn?: boolean }): void;
 	release(name: string): void;
 	get(name: string): TrackedJob | undefined;
@@ -180,7 +187,7 @@ export interface SessionRuntime {
 	 */
 	wait(
 		names: string[],
-		opts?: { timeoutMs?: number },
+		opts?: { timeoutMs?: number; signal?: AbortSignal },
 	): Promise<WaitResult[]>;
 	dispose(): void;
 }
@@ -449,19 +456,25 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		timer = undefined;
 	};
 
-	const ensureCollect = (job: TrackedJob): Promise<CollectSnapshot> => {
+	const ensureCollect = (job: TrackedJob, signal?: AbortSignal): Promise<CollectSnapshot> => {
 		if (!job.collectPromise) {
+			const generation = job.generation;
 			job.collectPromise = (async () => {
-				const snapshot = await job.collect();
-				try {
-					await job.persist?.(snapshot);
-				} catch {
-					// Notification still happens; the tool-side persist is the backup.
+				const snapshot = await job.collect(signal ? { signal } : undefined);
+				const current = jobs.get(job.name) === job && job.generation === generation;
+				if (current) {
+					try {
+						await job.persist?.(snapshot);
+					} catch {
+						// Notification still happens; the tool-side persist is the backup.
+					}
 				}
 				// C: a `running` snapshot is a timeout on a live child, not a result.
 				// Caching it would let a later wait/collect hand out a stale
-				// "still working" snapshot as if it were the final answer.
+				// "still working" snapshot as if it were the final answer. Also do not
+				// revive a result after an explicit stop invalidates this generation.
 				if (
+					current &&
 					!snapshot.blocked &&
 					snapshot.execution.status !== "running"
 				) {
@@ -481,6 +494,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const waitOne = async (
 		name: string,
 		timeoutMs: number,
+		signal?: AbortSignal,
 	): Promise<WaitResult> => {
 		const job = jobs.get(name);
 		if (!job) {
@@ -489,10 +503,16 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			return { name, missing: true };
 		}
 		job.consumedByTool = true;
+		if (signal?.aborted) {
+			job.consumedByTool = false;
+			if (!job.watching) runtime.watch(name);
+			return { name, interrupted: true };
+		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
+		let removeAbortListener: (() => void) | undefined;
 		try {
-			const snapshot = await Promise.race([
-				ensureCollect(job),
+			const racers: Array<Promise<CollectSnapshot | typeof WAIT_INTERRUPTED>> = [
+				ensureCollect(job, signal),
 				new Promise<never>((_resolve, reject) => {
 					// NOT unref'd: this timer may be the only thing driving the
 					// caller's await; unref'd it could let the event loop drain
@@ -502,7 +522,24 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						timeoutMs,
 					);
 				}),
-			]);
+			];
+			if (signal) {
+				racers.splice(1, 0, new Promise<typeof WAIT_INTERRUPTED>((resolve) => {
+					const onAbort = () => resolve(WAIT_INTERRUPTED);
+					removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+					if (signal.aborted) onAbort();
+					else signal.addEventListener("abort", onAbort, { once: true });
+				}));
+			}
+			const outcome = await Promise.race(racers);
+			if (outcome === WAIT_INTERRUPTED) {
+				// The background watcher owns completion notification after the
+				// parent turn stops waiting; start one if this tool owns the only collect.
+				job.consumedByTool = false;
+				if (!job.watching) runtime.watch(name);
+				return { name, interrupted: true };
+			}
+			const snapshot = outcome;
 			if (
 				snapshot.blocked ||
 				!shouldRecycleAfterCollect(snapshot.execution.status)
@@ -545,6 +582,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			}
 			throw error;
 		} finally {
+			removeAbortListener?.();
 			if (timer) clearTimeout(timer);
 		}
 	};
@@ -734,6 +772,59 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			return undefined;
 		},
 
+		consumeCollectInterruptible(name, signal) {
+			const job = jobs.get(name);
+			if (!job) {
+				const cached = finished.get(name);
+				return cached ? Promise.resolve(cached) : undefined;
+			}
+			job.consumedByTool = true;
+			if (signal.aborted) {
+				job.consumedByTool = false;
+				return Promise.resolve(undefined);
+			}
+			const pending = ensureCollect(job, signal);
+			return new Promise<CollectSnapshot | undefined>((resolve, reject) => {
+				let done = false;
+				const cleanup = () => signal.removeEventListener("abort", onAbort);
+				const onAbort = () => {
+					if (done) return;
+					done = true;
+					cleanup();
+					if (jobs.get(name) === job) {
+						job.consumedByTool = false;
+						if (!job.watching) runtime.watch(name);
+					}
+					resolve(undefined);
+				};
+				signal.addEventListener("abort", onAbort, { once: true });
+				if (signal.aborted) onAbort();
+				pending.then(
+					(snapshot) => {
+						if (done) return;
+						done = true;
+						cleanup();
+						resolve(snapshot);
+					},
+					(error: unknown) => {
+						if (done) return;
+						done = true;
+						cleanup();
+						reject(error);
+					},
+				);
+			});
+		},
+
+		cancelWatch(name) {
+			const job = jobs.get(name);
+			if (!job) return;
+			job.generation += 1;
+			job.watching = false;
+			job.consumedByTool = false;
+			refreshUi();
+		},
+
 		rewatch(name, opts) {
 			const job = jobs.get(name);
 			if (!job || disposed) return;
@@ -750,6 +841,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		release(name) {
 			const job = jobs.get(name);
 			if (!job || !jobs.delete(name)) return;
+			// Invalidate any in-flight watch before its collect can deliver a stale
+			// completion or overwrite a terminal state after explicit stop/retire.
+			job.generation += 1;
+			job.watching = false;
 			job.unsubscribeRpcEvents?.();
 			job.unsubscribeRpcEvents = undefined;
 			join.remove(name);
@@ -831,7 +926,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		async wait(names, opts = {}) {
 			return Promise.all(
 				names.map((name) =>
-					waitOne(name, opts.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
+					waitOne(name, opts.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, opts.signal),
 				),
 			);
 		},
