@@ -42,7 +42,9 @@
 | T9 | 浮窗内 `app.tools.expand`（ctrl+o）经 keybindingsManager 判定；其余滚动/关闭键用 pi-tui 原生键硬编码 | `app.*` 是 pi 应用级键位可被用户自定义；j/k/pgup/esc 是 pi-tui 原生键。树视图键位维持现状不动。 |
 | T10 | 依赖 caret 升级 `^1.0.0` + 重新生成 lockfile + `npm install` | worktree 无 node_modules 是历史遗留；typecheck/test 需要真实 .d.ts。npm registry pi-coding-agent 与 pi-tui 最新均为 1.1.0（主会话实测）。 |
 | T11 | `ToolExecutionComponent` 的 `ui` 传 `ctx.ui.custom` 工厂第一参数（真实 TUI 实例）；`cwd` 传 `node.worktreePath ?? ctx.cwd`；`toolDefinition` 传 undefined | 查看器无工具注册表上下文；undefined 走 fallback 渲染（scout 实测确认可渲染）。 |
-| T12 | 活跃节点（有 active job）打开浮窗时不轮询磁盘；RPC 流缺位时才轮询 | 沿用现有双通道互斥（`legion-commands.ts:315-319`），既有回归断言 `legion-integration.test.ts:800-829` 必须保留。 |
+| T12 | **[REV-2] 活跃节点（有 active job）打开浮窗时同样轮询磁盘增量；RPC text_delta 流与磁盘轮询并行**。去重机制：磁盘增量中的 assistant 消息落地时收回（retract）流式组件，避免同一条消息双重渲染；若流式文本领先已落盘消息（属于未落盘后续内容），在增量 append 后重建流式组件显示余量 | REV-1 时代的互斥（"RPC 流缺位时才轮询"）导致活跃节点的结构化消息（user / assistant+toolCall / toolResult）无任何路径进入 viewer——正是用户需求"支持动态渲染"要修复的缺口。旧行为的回归断言（`legion-integration.test.ts` "active text-delta sessions do not duplicate session-file activity"）随之改写为：磁盘增量动态出现 + 不与流式文本重复。 |
+| T13 | **[REV-3] 流式去重的"包含"判定用子串而非前缀**：`diskText.includes(streamingText)` 即视为已包含（收回不重建，无余量）；仅当流式严格领先（`streamingText.startsWith(diskText)`）时取余量重建；两者均不成立才全量重建（防御分支） | REV-2 三分支的前缀语义在中途打开/clamp 截断场景下失真：viewer 订阅前的 delta 丢失（打开时消息已流到一半）与 `clampStreamingText` 截头，使 streamingText 只是落盘消息的尾部子串，双向 startsWith 均为 false，落入"无前缀"分支 → 落盘全文与陈旧尾巴永久双重渲染且跨消息复合（reviewer 探针验证）。子串判定容忍丢失头部的流式文本：最坏情况只丢一小截陈旧尾巴的视觉，不会永久重复。 |
+| T14 | **[REV-4] finalize-then-disk 去重**：`finishStreaming()` 固化流式文本时记录 `finalizedAssistantText`；`acceptBackfill` 增量中 assistant 文本包含该记录时，克隆消息置空 text part（保留 thinking/toolCall part）再 append；`chat-items.ts` 对"渲染 content 为空且无 toolCall"的 assistant 跳过建组件；消费后清空记录 | 粗事件（`agent_settled`/`tool_execution_start`/`turn_start`）触发 finishStreaming 后流式文本固化成普通组件并脱离去重追踪；若落盘增量在之后才被轮询抓到，同文本消息会再 append 一份 → 永久双渲染（reviewer-1 探针验证，旧谓词下同样存在，非 REV-3 引入）。带 toolCall 的落盘消息不能整条跳过（会丢工具块），故只置空文本 part 保留 toolCall 渲染。 |
 
 ---
 
@@ -209,7 +211,8 @@ export type ChatItem =
 - **U6** 快捷键冒烟：ctrl+o 切换工具块展开（render 输出变化）、pgdn 滚动、esc 关闭（新增测试）。
 - **U6a** `test/unit/legion-tree-view.test.ts` 全绿且其覆盖的源文件零改动。
 - **U7** `legion-integration.test.ts:717-725` 的 backfill 行断言允许适配为全量渲染语义（打开时渲染全部 turn，契约 T4）；除此之外该文件仅允许为组件流改造所必需的断言修改。
-- **U7a** 激活节点打开浮窗不轮询磁盘的断言（`legion-integration.test.ts:800-829`）保留。
+- **U7a** [REV-2 改写] 激活节点打开浮窗时磁盘轮询照常工作：RPC text_delta 流活跃期间，session 文件新落盘的结构化消息必须动态出现在 viewer，且不与流式文本重复渲染（收回/重建去重）。原 "active text-delta sessions do not duplicate session-file activity" 断言改写为 "动态出现 + 无重复"（`legion-integration.test.ts` 对应用例）。
+- **U7c** [REV-2 新增] 流式收回去重：磁盘增量落地某 assistant 消息后，流式组件被收回；若 streamingText 领先该消息（未落盘余量），流式组件重建显示余量（`legion-live-overlay.test.ts` 新用例）。
 - **U7b** `legion-schema-sentinel.test.ts` 不受影响（预期全绿）。
 - **U8** `npm run test:all`（typecheck + unit + integration）全绿。
 - **U9**（人工，主会话收官）真实宿主打开 `/legion` 点开 agent，浮窗视觉对齐主上下文。
@@ -264,6 +267,9 @@ export type ChatItem =
 ## 9. 契约修订记录（REV）
 
 - **REV-1**（2026-10-13，触发者 worker-0）：§2a 消息类型 import 修正——`AgentMessage` 来自 `@earendil-works/pi-agent-core`（`dist/types.d.ts:322`）而非 pi-ai（pi-ai@1.1.0 不导出该类型）；`AssistantMessage`/`ThinkingContent` 等成员类型仍来自 pi-ai。机械缺口，直接修订。
+- **REV-2**（2026-10-20，触发者主会话，用户新需求）：T12 互斥解除——用户反馈活跃节点上下文展示不支持动态渲染；根因是 RPC feed 订阅成功时磁盘轮询被关闭，结构化消息无路径进入 viewer。改为双通道并行 + 流式组件收回去重（chat-items.ts 新增 `retractStreamingItem()`）。U7a/U7c 同步改写/新增。涉及文件：`src/extension/legion-commands.ts`（订阅时始终挂 pollBackfill）、`src/tui/live-overlay.ts`（acceptBackfill 增量收回/重建流式组件）、`src/tui/chat-items.ts`（新增收回能力）、两测试文件。
+- **REV-3**（2026-10-20，触发者 reviewer（对抗审查 F1）：三分支去重的包含判定从前缀放宽为子串）：REV-2 的「无前缀 → 全量重建」分支在真实主线路径（viewer 中途打开、clampStreamingText 截头）下产生永久性双重渲染且跨消息复合（探针验证：尾部子串场景落盘全文与陈旧尾巴同时渲染不消失）。T13 新增固化语义：`diskText.includes(streamingText)` → 已包含（收回不重建）；`streamingText.startsWith(diskText)` → 余量重建；否则防御性全量重建。U7c 补齐三分支用例 + 中途打开 + clamp 截断场景。
+- **REV-4**（2026-10-20，触发者 reviewer-1（增量复审 minor）：finalize-then-disk 双重渲染窗口）：粗事件（agent_settled/tool_execution_start/turn_start）先于轮询抓到落盘增量到达时，已固化的流式组件与同文本落盘消息双渲染（探针验证新旧谓词下均存在，REV-2 遗留非 REV-3 引入；窗口 ≤250ms 但每次 turn 结束常见）。T14 新增固化语义：finishStreaming 记录 finalizedAssistantText；acceptBackfill 增量 assistant 文本包含该记录时克隆置空 text part（保留 thinking/toolCall）再 append；chat-items 对空 content 且无 toolCall 的 assistant 跳过建组件；消费后清记录。U7c 追加 settle-先-落盘用例。
 
 ## 10. 修订规则
 
