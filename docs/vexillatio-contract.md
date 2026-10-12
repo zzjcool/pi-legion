@@ -88,6 +88,12 @@ const VexillatioParams = Type.Object({
 - 工具名 `vexillatio`；子节点命名同现有规则（`scout-0` 等，避免与 subagent 派发的同名冲突：vexillatio 的默认名前缀 = 目标角色名，序号接续该父节点既有 children）。
 - legion.db：**不改 schema**（不加表不加列）。工具人节点照常记 `nodes` 表（role 列存角色名），树渲染 `legion_tree` 自然可见。区别只在身份 env（2.3）。
 
+### 2.7 工具白名单注入（REV-17.7，worker-6 提出）
+
+角色显式写了 `tools:` 时，pi 的 `--tools` 是硬替换 allowlist，注册了的扩展工具不进白名单就不可见。存量角色 .md 均未列 `vexillatio`，若不处理，planner 等受限角色调不到它——违背「谁都可以调用」的核心目标。
+
+**规则（冻结）**：`pushToolArgs`（`src/runs/args.ts`）组装非 utility 角色的 `--tools` 时，若白名单非空且未含 `vexillatio`，追加 `vexillatio`；utility 角色不追加（它们本来就不该持有）。不写 `tools:` 的角色不受影响（无白名单时 pi 默认激活全部注册工具，vexillatio 天然可见）。此为 `args.ts` 的行为变更，属于 §3 新增授权：`src/runs/args.ts` 加入所有权清单。受影响的两个既有断言（`orchestrator.test.ts:99`、`supervisor.test.ts:265` 的 `read,bash`）已在 §3 单列授权。
+
 ## 3. 文件所有权（单 worker，无并行冲突）
 
 | 文件 | 动作 |
@@ -97,6 +103,7 @@ const VexillatioParams = Type.Object({
 | `src/agents/settings.ts` | agentOverrides 白名单字段加 `utility` |
 | `src/agents/overrides.ts` | `OVERRIDE_FIELDS`（:20-54）加 `"utility"`——settings 层 override 的实际复制通道，不加则 override 被丢弃 || `src/runs/orchestrator.ts` | launch 支持 `stripLegionIdentity?: boolean`（SpawnInput 选项，控制 env 剔除） |
 | `src/supervisor/rpc-supervisor.ts` | SpawnInput.env 透传（已有；无需改动，除非类型收紧） |
+| `src/runs/args.ts` | **REV-17.7 新增**：`pushToolArgs` 对非 utility 角色追加 `vexillatio` 到非空 `--tools` 白名单（§2.7） |
 | `index.ts` | 注册 `vexillatio` 工具（早退之前）+ PLAYBOOK 文本 |
 | `src/extension/playbook.ts` | PARENT_PLAYBOOK 追加段 |
 | `src/extension/child-guard.ts` | 无改动（预算变量照旧）；如需在 child 附录说明 vexillatio，最小追加 |
@@ -104,7 +111,9 @@ const VexillatioParams = Type.Object({
 | `agents/scout.md`（内置层） | 同上（包内默认） |
 | `test/unit/utility-agents.test.ts` | **新建**。§4 场景 1（frontmatter `utility` 解析）+ 场景 5（utility+allowNested 同开 warning） |
 | `test/integration/vexillatio.test.ts` | **新建**。§4 场景 2/3/4（mock supervisor：env 剔除断言 / 非 utility 硬拒 / subagent 兼容派发） |
-| `test/unit/child-mode.test.ts` | **唯一允许修改的既有测试**：两个用例的断言数字修订——第一用例 0→1（仅 vexillatio），第二用例 1→2（vexillatio+subagent），各加注释引用本契约 §2.2（REV-17.5 授权；已全量扫描既有测试，其余断言均为按名取工具不数总数，不受影响） |
+| `test/unit/child-mode.test.ts` | **允许修改的既有测试 A**：两个用例的断言数字修订——第一用例 0→1（仅 vexillatio），第二用例 1→2（vexillatio+subagent），各加注释引用本契约 §2.2（REV-17.5 授权；已全量扫描既有测试，其余断言均为按名取工具不数总数，不受影响） |
+| `test/integration/orchestrator.test.ts` | **允许修改的既有测试 B（REV-17.7）**：仅限 `:99` 断言 `read,bash` → `read,bash,vexillatio`，加注释引用本契约 §2.7 |
+| `test/unit/supervisor.test.ts` | **允许修改的既有测试 C（REV-17.7）**：仅限 `:265` 断言 `read,bash` → `read,bash,vexillatio`，加注释引用本契约 §2.7 |
 
 **共享文件**：`index.ts` / `orchestrator.ts` / `types.ts` 本契约全部分配给唯一 worker，无并发写。
 
@@ -147,3 +156,4 @@ const VexillatioParams = Type.Object({
 | 2026-10-12 | REV-17.4 | §2.2 重写：判定依据从「出生方式」改为「角色身份」（agent.utility），新 env `PI_SUBAGENT_UTILITY_CHILD` 由 lineageEnv 统一设置（两通道同规则）；§2.3 表重排；§2.5 重写；场景矩阵六例闭合推演（root/planner/worker/scout 两通道/误配 warning） | worker-3 指出 17.3 的门与「链上每环节持有工具」同句自矛盾且 PI_UTILITY_CHAIN 初始化语义悬空——拒绝正确，修订后重派 |
 | 2026-10-12 | REV-17.5 | §3 child-mode 授权扩为两处断言数字（第一用例 0→1，第二用例 1→2）；新增「断言影响总则」：全量扫描一次列尽受影响断言，不再逐轮挤牙膏 | worker-4 指出第二用例（嵌套权子进程）按 §2.2 应注册 subagent+vexillatio 共 2 工具但断言仍为 1 且未授权——拒绝正确，修订后重派 |
 | 2026-10-12 | REV-17.6 | §2.2/§2.3/§2.5.1/§2.5.3 四处统一：**utility 语义优先，allowNested 被忽略**——两通道对 utility 目标都剥除 ALLOW_NESTED，不存在持有 subagent 的工具人，误配不恢复递归路径（§2.5.1 原句“此时持有 subagent”是 17.4 引入的后门，与硬叶子不变量自相矛盾） | worker-5 指出硬叶子规则与误配时持有 subagent 的规定冲突——拒绝正确，修订后重派 |
+| 2026-10-12 | REV-17.7 | 新增 §2.7 工具白名单注入规则（`pushToolArgs` 对非 utility 角色追加 vexillatio）；§3 新增 `src/runs/args.ts` 所有权 + 两个 `read,bash` 断言授权（orchestrator.test:99 / supervisor.test:265）。分支已合入 master 最新（PR #22） | worker-6 完成全部实现后指出：受限角色（显式 tools: 白名单）调不到未列名的 vexillatio，需在 args 层追加且两个既有断言未授权——拒绝正确；从原会话恢复继续，勿重写已完成的 90% |
