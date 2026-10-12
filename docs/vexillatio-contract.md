@@ -104,11 +104,13 @@ const VexillatioParams = Type.Object({
 | `agents/scout.md`（内置层） | 同上（包内默认） |
 | `test/unit/utility-agents.test.ts` | **新建**。§4 场景 1（frontmatter `utility` 解析）+ 场景 5（utility+allowNested 同开 warning） |
 | `test/integration/vexillatio.test.ts` | **新建**。§4 场景 2/3/4（mock supervisor：env 剔除断言 / 非 utility 硬拒 / subagent 兼容派发） |
-| `test/unit/child-mode.test.ts` | **唯一允许修改的既有测试**：仅限第一个用例的断言数字 0 → 1，并加注释引用本契约 §2.2（REV-17.4 维持授权） |
+| `test/unit/child-mode.test.ts` | **唯一允许修改的既有测试**：两个用例的断言数字修订——第一用例 0→1（仅 vexillatio），第二用例 1→2（vexillatio+subagent），各加注释引用本契约 §2.2（REV-17.5 授权；已全量扫描既有测试，其余断言均为按名取工具不数总数，不受影响） |
 
 **共享文件**：`index.ts` / `orchestrator.ts` / `types.ts` 本契约全部分配给唯一 worker，无并发写。
 
-**既有测试文件除 §3 明确授权的 `test/unit/child-mode.test.ts` 断言数字修订外一律不修改**；§4 要求的新增测试全部落在两个新文件里。
+**既有测试文件除 §3 明确授权的 `test/unit/child-mode.test.ts` 两处断言数字修订外一律不修改**；§4 要求的新增测试全部落在两个新文件里。
+
+**断言影响总则（REV-17.5）**：契约导致的注册行为变化若使某既有断言失效，属于本契约的影响面；授权范围以本 §3 该行所列为准，本行已全量扫描（grep `pi.tools\|tools.length\|tools.find\|tools.get\|herdrSubagents(` 全测试目录）并一次列尽。后续若再发现同类冲突，上报照旧。
 
 ## 4. 验收清单（可机器检查）
 
@@ -143,3 +145,4 @@ const VexillatioParams = Type.Object({
 | 2026-10-12 | REV-17.2 | §3 增补 `src/agents/overrides.ts` 所有权（worker-1 指出 settings 行的动作列引用了未授权文件）；自查确认无其他「动作列引用未授权文件」情况 | worker-1 依契约矛盾流程上报（§3 :91 行动作列要求同步 overrides.ts 清单但表未授权）——拒绝正确，修订后重派 |
 | 2026-10-12 | REV-17.3 | §2.2 注册条件从「无条件」改为「环境门 PI_UTILITY_CHAIN」（修自复制递归无上界漏洞 + 与 child-mode.test 兼容）；授权修改该测试断言 0→1 | worker-2 指出 §2.2 无条件注册与 test/unit/child-mode.test.ts:21-27 冲突且 §3 未授权——拒绝正确；根因是契约自身设计缺陷（自复制无上界），修订后重派 |
 | 2026-10-12 | REV-17.4 | §2.2 重写：判定依据从「出生方式」改为「角色身份」（agent.utility），新 env `PI_SUBAGENT_UTILITY_CHILD` 由 lineageEnv 统一设置（两通道同规则）；§2.3 表重排；§2.5 重写；场景矩阵六例闭合推演（root/planner/worker/scout 两通道/误配 warning） | worker-3 指出 17.3 的门与「链上每环节持有工具」同句自矛盾且 PI_UTILITY_CHAIN 初始化语义悬空——拒绝正确，修订后重派 |
+| 2026-10-12 | REV-17.5 | §3 child-mode 授权扩为两处断言数字（第一用例 0→1，第二用例 1→2）；新增「断言影响总则」：全量扫描一次列尽受影响断言，不再逐轮挤牙膏 | worker-4 指出第二用例（嵌套权子进程）按 §2.2 应注册 subagent+vexillatio 共 2 工具但断言仍为 1 且未授权——拒绝正确，修订后重派 |
