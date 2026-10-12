@@ -746,7 +746,18 @@ test("/legion backfills session history, polls stopped nodes for appends, then s
 		await harness.ui.calls[0]!.promise;
 		appendFileSync(sessionFile, [userMsg("after close"), assistantMsg({ text: "should not appear" })].join("\n") + "\n");
 		await new Promise((resolve) => setTimeout(resolve, 300));
-		assert.equal(state.getState().activity.at(-1), "⚙ write", "closed overlays do not continue polling the session file");
+		assert.deepEqual(state.getState().activity, [
+			"▸ first request",
+			"first response",
+			"⚙ read",
+			"▸ second request",
+			"second response",
+			"▸ third request",
+			"third response",
+			"▸ fourth request",
+			"fourth response",
+			"⚙ write",
+		], "closed overlays do not continue polling the session file");
 	} finally {
 		overlay?.dispose();
 		rmSync(cwd, { recursive: true, force: true });
