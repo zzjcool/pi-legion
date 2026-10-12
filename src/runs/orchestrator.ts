@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
 import type { LegionSettings } from "../shared/types.ts";
-import { legionIdentityEnv } from "./args.ts";
+import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, legionIdentityEnv } from "./args.ts";
 import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
@@ -119,6 +119,7 @@ export interface CollectResult {
 export const COLLECT_GRACE_EXTENSIONS = 2;
 const LINEAGE_ENV = "PI_SUBAGENT_PARENT_PATH";
 const MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
+const UTILITY_CHILD_ENV = "PI_SUBAGENT_UTILITY_CHILD";
 const CHILD_ENV = "PI_SUBAGENT_CHILD";
 const POLL_INTERVAL_MS = 500;
 
@@ -312,7 +313,7 @@ export class Orchestrator {
 		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
 	}
 
-	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string }): LegionNode | null {
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string; utility?: boolean }): LegionNode | null {
 		const legion = this.legion;
 		if (!legion) return null;
 		const parent = getNode(legion.db, legion.nodeId);
@@ -325,7 +326,11 @@ export class Orchestrator {
 			throw new SubagentError(`legion child is terminal and cannot be resumed: ${input.nodeId}`, ErrorCodes.BUDGET_EXCEEDED);
 		}
 		const team = input.team ?? input.agent.extraFields?.team ?? this.team?.name;
-		const depthCeiling = Math.min(legion.settings?.maxDepth ?? this.maxDepthValue, MAX_NESTED_PATH_ENTRIES);
+		// A utility node is a hard leaf and does not consume the recursive depth
+		// budget. Keep the real ledger depth, but allow this one generation.
+		const depthCeiling = input.utility
+			? parent.depth + 1
+			: Math.min(legion.settings?.maxDepth ?? this.maxDepthValue, MAX_NESTED_PATH_ENTRIES);
 		const childCount = Number(legion.db.prepare("SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?").get(legion.nodeId)?.count ?? 0);
 		const maxChildren = previous ? Math.max(legion.settings?.maxChildrenPerNode ?? 8, childCount + 1) : legion.settings?.maxChildrenPerNode;
 		const activeReservation = previous && (previous.status === "starting" || previous.status === "running") ? 1 : 0;
@@ -484,6 +489,10 @@ export class Orchestrator {
 		thinking?: string | false;
 		worktree?: boolean;
 		modelOrigin?: ModelOrigin;
+		/** Vexillatio launch: bypass nested-depth gates while recording its parent-side Legion node. */
+		utilityDispatch?: boolean;
+		/** Mask inherited Legion identity from the spawned child process. */
+		stripLegionIdentity?: boolean;
 	}): Promise<Handle> {
 		this.warnDepthCap();
 		if (input.agent.kind !== "pi") {
@@ -498,9 +507,9 @@ export class Orchestrator {
 		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
 		const previous = this.children.get(name) ?? (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
 		if (previous && !this.children.has(name)) this.children.set(name, previous);
-		// Resuming any persisted node does not consume a fresh spawn slot. An
-		// abrupt parent shutdown can leave the durable child state at `working`.
-		this.assertWithinBudgets(Boolean(previous));
+		// A utility dispatch is a hard leaf, not a nested command-chain launch.
+		// The frozen contract therefore skips assertWithinBudgets entirely.
+		if (!input.utilityDispatch) this.assertWithinBudgets(Boolean(previous));
 		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		const models = this.planModelCandidates({
 			agent: input.agent,
@@ -550,7 +559,9 @@ export class Orchestrator {
 					task: input.task,
 					cwd: worktreePath ?? this.cwd,
 					path: this.childPath(name),
-					maxDepth: Math.min(this.maxDepthValue, this.depth + roleDepth, MAX_NESTED_PATH_ENTRIES),
+					maxDepth: input.utilityDispatch
+						? this.depth + 1
+						: Math.min(this.maxDepthValue, this.depth + roleDepth, MAX_NESTED_PATH_ENTRIES),
 					nodeId,
 					herdr: { supervisor: "rpc", node_id: nodeId },
 				});
@@ -560,9 +571,13 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent: input.agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models.candidates[0] });
+				reservedNode = this.reserveNode({ nodeId, name, agent: input.agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models.candidates[0], utility: Boolean(input.utilityDispatch && input.agent.utility) });
 				reserved = true;
 				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models.candidates[0] ? { model: models.candidates[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
+			}
+			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId);
+			if (input.stripLegionIdentity) {
+				for (const key of [LEGION_DB_ENV, LEGION_NODE_ID_ENV, LINEAGE_ENV, MAX_DEPTH_ENV]) delete childEnv[key];
 			}
 			let result: Awaited<ReturnType<LegionSupervisor["spawnChild"]>> | undefined;
 			let startedModel: string | undefined;
@@ -576,10 +591,11 @@ export class Orchestrator {
 					sessionFile,
 					tempDir,
 					cwd: worktreePath ?? this.cwd,
-					env: this.lineageEnv(name, input.agent, input.team, nodeId),
+					env: childEnv,
 					...(model ? { model } : {}),
+					...(input.stripLegionIdentity ? { stripLegionIdentity: true } : {}),
 					...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
-					...(input.agent.allowNestedSubagents !== undefined ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
+					...(input.agent.allowNestedSubagents !== undefined && !input.agent.utility ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
 					...(worktreeBranch ? { worktreeBranch } : {}),
 					...(this.childContext ? { childContext: this.childContext } : {}),
 				};
@@ -693,7 +709,10 @@ export class Orchestrator {
 		if (agent.toolBudget?.maxToolCalls !== undefined) env[MAX_TOOL_CALLS_ENV] = String(agent.toolBudget.maxToolCalls);
 		if (agent.turnBudget?.maxTurns !== undefined) env[MAX_TURNS_ENV] = String(agent.turnBudget.maxTurns);
 		if (agent.toolTimeoutMs !== undefined) env[TOOL_TIMEOUT_MS_ENV] = String(agent.toolTimeoutMs);
-		if (agent.allowNestedSubagents) env[ALLOW_NESTED_ENV] = "1";
+		if (agent.utility) env[UTILITY_CHILD_ENV] = "1";
+		// Utility identity takes precedence even when a role was misconfigured
+		// with allowNestedSubagents: utility children are always hard leaves.
+		if (agent.allowNestedSubagents && !agent.utility) env[ALLOW_NESTED_ENV] = "1";
 		return env;
 	}
 

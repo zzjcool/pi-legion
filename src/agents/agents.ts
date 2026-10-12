@@ -468,6 +468,7 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "completionGuard", bool(fm.completionGuard));
 	setIf(config, "maxSubagentDepth", int(fm.maxSubagentDepth));
 	setIf(config, "allowNestedSubagents", bool(fm.allowNestedSubagents));
+	setIf(config, "utility", bool(fm.utility));
 	setIf(config, "disabled", bool(fm.disabled));
 	setIf(config, "worktree", bool(fm.worktree));
 	setIf(config, "steer", bool(fm.steer));

@@ -15,6 +15,7 @@ export const PARENT_PLAYBOOK = [
 	"5. A collect timeout with a live RPC child is a progress signal, not a verdict. Check status or session JSONL before deciding to steer or resume.",
 	"6. Isolation is YOUR call. Pass `worktree: true` when another parent may write this repo or the child must ship via MR; pass `worktree: false` to share the checkout. Omit it for the role default.",
 	"7. Launch with `verify: [\"npm run typecheck\", \"npm test\"]` when the project has a mechanical verifier. The extension runs those commands itself in the child worktree at collect time; the child does not need to paste test output.",
+	"Utility agents (`utility: true`, e.g. scout) can be dispatched by ANY role via the separate `vexillatio` tool — read-only helpers, always leaf, no depth budget. The `subagent` tool stays for the command chain (worker/centurion).",
 	"Forbidden: direct bash access to legion.db, hand-launching child Pi processes, or using herdr pane/tab/agent commands for dispatch.",
 ].join("\n");
 

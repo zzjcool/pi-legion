@@ -51,6 +51,7 @@ import { upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
+import { makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
 import {
 	publishSupervisorEvent,
@@ -201,6 +202,17 @@ const SubagentParams = Type.Object({
 
 /** The validated tool parameters, as the model supplies them. */
 type SubagentParams = Static<typeof SubagentParams>;
+
+const VexillatioParams = Type.Object({
+	task: Type.String({ description: "Recon task: one clear question list" }),
+	agent: Type.Optional(Type.String({ description: "Utility agent name (default: scout)" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel recon launches" })),
+	cwd: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	timeoutMs: Type.Optional(Type.Number({ description: "Per-child wait in ms, default 600000" })),
+});
+
+const UTILITY_CHILD_ENV = "PI_SUBAGENT_UTILITY_CHILD";
 
 const blockedUi = new WeakMap<
 	SessionRuntime,
@@ -454,6 +466,28 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	const supervisor = deps.supervisor ?? new RpcSupervisor();
 	const verifyRunner = deps.verifyRunner;
 	const legionBus = createLegionEventBus();
+	const rpcUIProxy = (supervisor as LegionSupervisor & { uiProxy?: UIProxy }).uiProxy;
+	const uiProxy = deps.uiProxy ?? rpcUIProxy ?? new InMemoryUIProxy();
+	const onBudgetRefused = deps.onBudgetRefused ?? ((event) => {
+		try { pi.events.emit("pi-legion:budget_refused", event); } catch { /* optional host event */ }
+	});
+	let sessionEnabledOverride: boolean | undefined;
+	const subagentsEnabled = (cwd: string): boolean => {
+		if (sessionEnabledOverride !== undefined) return sessionEnabledOverride;
+		try {
+			return loadSubagentSettings({
+				userSettingsPath: path.join(getAgentDir(), "settings.json"),
+				projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
+			}).enabled !== false;
+		} catch (error) {
+			console.warn(
+				"[pi-legion] Unable to load settings while checking whether subagents are enabled; defaulting to enabled.",
+				error,
+			);
+			return true;
+		}
+	};
+	let lastCwd = process.cwd();
 	let legionIdentity: LegionRuntimeIdentity | undefined;
 	const stopLegionRuntime = (): void => {
 		if (!legionIdentity) return;
@@ -485,24 +519,72 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		try { initializeLegionRuntime({ cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile() }); }
 		catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 	});
-	if (isChild && !allowNested) {
+	const pendingUtilityRetires: Array<() => Promise<void>> = [];
+	if (process.env[UTILITY_CHILD_ENV] !== "1") {
+		pi.registerTool({
+			name: "vexillatio",
+			label: "Vexillatio",
+			description: "Launch only read-only utility agents and return their collected output.",
+			parameters: VexillatioParams,
+			async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
+				if (!subagentsEnabled(ctx.cwd)) {
+					return fail("subagents are disabled (subagents.enabled: false or /subagents-toggle off). Re-enable with /subagents-toggle on.", ErrorCodes.DISABLED);
+				}
+				return launchUtilityFamily({
+					pi,
+					ctx,
+					params,
+					supervisor,
+					uiProxy,
+					onBudgetRefused,
+					cwd: params.cwd ?? ctx.cwd,
+					sessionCwd: ctx.cwd,
+					isChild,
+					legion: legionIdentity,
+					eventBus: legionBus,
+					onLegion: (identity) => {
+						if (legionIdentity && legionIdentity !== identity) stopLegionRuntime();
+						legionIdentity = identity;
+					},
+					onUtilityChild: (retire) => pendingUtilityRetires.push(retire),
+				});
+			},
+		});
+	}
+	pi.on("before_agent_start", (event, ctx) => {
+		if (process.env[UTILITY_CHILD_ENV] === "1") return;
+		if (!subagentsEnabled(ctx?.cwd ?? lastCwd)) return;
+		const tools = event.systemPromptOptions?.selectedTools;
+		if (Array.isArray(tools) && !tools.includes("subagent") && !tools.includes("vexillatio")) return;
+		if (ctx?.cwd) lastCwd = ctx.cwd;
+		const catalog = loadCatalog(lastCwd, lastCwd, undefined);
+		const parentContext = catalog.settings.parentContext?.trim();
+		return {
+			systemPrompt: `${event.systemPrompt}\n\n${PARENT_PLAYBOOK}\n\n${renderParentRoster(
+				catalog.agents,
+				catalog.team,
+				catalog.teamWarnings,
+			)}${parentContext ? `\n\n${parentContext}` : ""}`,
+		};
+	});
+	if (process.env[UTILITY_CHILD_ENV] === "1") {
 		pi.on("session_shutdown", () => stopLegionRuntime());
 		return;
 	}
-
+	if (isChild && !allowNested) {
+		pi.on("session_shutdown", async () => {
+			await Promise.all(pendingUtilityRetires.map((retire) => retire().catch(() => {})));
+			stopLegionRuntime();
+		});
+		return;
+	}
 	// The parent transcript records every finish; the renderer keeps a
 	// completed child to one line so visibility does not cost a screen.
 	pi.registerMessageRenderer(SUBAGENT_NOTIFY_TYPE, renderSubagentNotice);
 
-	const rpcUIProxy = (supervisor as LegionSupervisor & { uiProxy?: UIProxy }).uiProxy;
-	const uiProxy = deps.uiProxy ?? rpcUIProxy ?? new InMemoryUIProxy();
-	const onBudgetRefused = deps.onBudgetRefused ?? ((event) => {
-		try { pi.events.emit("pi-legion:budget_refused", event); } catch { /* optional host event */ }
-	});
 	let lastUi: ExtensionContext["ui"] | undefined;
 	let lastModelRegistry: ExtensionContext["modelRegistry"] | undefined;
 	let lastConfirm: ((message: string) => Promise<boolean>) | undefined;
-	let lastCwd = process.cwd();
 	// turn_start/turn_end maintain this so a flush window can wait out a
 	// busy parent instead of queueing behind the whole turn (join extends
 	// the window at most MAX_BUSY_EXTENSIONS times).
@@ -562,29 +644,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	registerLegionCommand(pi, { bus: legionBus, runtime, supervisor: rpcEventSource });
 
 	// ── Master switch ────────────────────────────────────────────────────
-	// Session-level override over `subagents.enabled` (user+project settings).
-	// `undefined` means "follow settings" so /reload picks up file changes;
-	// the toggle command is what writes to this variable.
-	let sessionEnabledOverride: boolean | undefined;
-	/** Effective enabled state: session override > merged settings. */
-	const subagentsEnabled = (cwd: string): boolean => {
-		if (sessionEnabledOverride !== undefined) return sessionEnabledOverride;
-		try {
-			return (
-				loadSubagentSettings({
-					userSettingsPath: path.join(getAgentDir(), "settings.json"),
-					projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
-				}).enabled !== false
-			);
-		} catch (error) {
-			console.warn(
-				"[pi-legion] Unable to load settings while checking whether subagents are enabled; defaulting to enabled.",
-				error,
-			);
-			return true;
-		}
-	};
-
 	registerToggleCommand(pi, {
 		sessionEnabled: () => subagentsEnabled(lastCwd),
 		setSessionEnabled: (enabled) => {
@@ -653,7 +712,9 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 				: { agents: catalog.agents, team: catalog.team, warnings: catalog.teamWarnings };
 			const agents = selectedTeam.agents;
 			const team = selectedTeam.team;
-			const teamWarnings = selectedTeam.warnings;
+			const teamWarnings = teamName
+				? [...selectedTeam.warnings, ...catalog.utilityWarnings]
+				: selectedTeam.warnings;
 			runtime.setJoinConfig({
 				mode: settings.joinMode ?? DEFAULT_JOIN_MODE,
 				flushMs: settings.joinFlushMs ?? DEFAULT_FLUSH_MS,
@@ -715,25 +776,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		},
 	});
 
-	pi.on("before_agent_start", (event, ctx) => {
-		if (isChild && !allowNested) return;
-		// Master switch: when disabled, stop injecting the playbook and the
-		// roster so the model is not coached toward a tool that will refuse.
-		if (!subagentsEnabled(ctx?.cwd ?? lastCwd)) return;
-		const tools = event.systemPromptOptions?.selectedTools;
-		if (Array.isArray(tools) && !tools.includes("subagent")) return;
-		if (ctx?.cwd) lastCwd = ctx.cwd;
-		const catalog = loadCatalog(lastCwd, lastCwd, undefined);
-		const parentContext = catalog.settings.parentContext?.trim();
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n${PARENT_PLAYBOOK}\n\n${renderParentRoster(
-				catalog.agents,
-				catalog.team,
-				catalog.teamWarnings,
-			)}${parentContext ? `\n\n${parentContext}` : ""}`,
-		};
-	});
-
 	const bindUi = (_event: unknown, ctx: ExtensionContext): void => {
 		lastModelRegistry = ctx.modelRegistry;
 		lastUi = ctx.hasUI ? ctx.ui : undefined;
@@ -785,9 +827,10 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	pi.on("session_shutdown", async () => {
 		const children = runtime.activeJobs();
 		runtime.dispose();
-		await Promise.all(
-			children.map((job) => job.retire?.().catch(() => {})),
-		);
+		await Promise.all([
+			...children.map((job) => job.retire?.().catch(() => {})),
+			...pendingUtilityRetires.map((retire) => retire().catch(() => {})),
+		]);
 		stopLegionRuntime();
 	});
 }
@@ -815,6 +858,7 @@ export function loadCatalog(
 	teamWarnings: string[];
 	projectAgentsDir: string | null;
 	builtinAgentsDir: string;
+	utilityWarnings: string[];
 } {
 	const settings = loadSubagentSettings({
 		userSettingsPath: path.join(getAgentDir(), "settings.json"),
@@ -825,6 +869,14 @@ export function loadCatalog(
 	});
 	const overridden = applyAgentOverrides(discovery.agents, settings.agentOverrides);
 	const teamResult = applyTeam(overridden, settings);
+	const utilityWarnings = [...new Map(
+		[...overridden, ...teamResult.agents]
+			.filter((agent) => agent.utility && agent.allowNestedSubagents)
+			.map((agent) => [
+				agent.name,
+				`Utility agent "${agent.name}" sets allowNestedSubagents: true; utility identity takes precedence and nested dispatch is ignored.`,
+			] as const),
+	).values()];
 	const resolveDefaults = (items: AgentConfig[]): AgentConfig[] =>
 		applyDefaultOnBlocked(
 			applyDefaultModel(items, settings.defaultModel),
@@ -836,7 +888,8 @@ export function loadCatalog(
 		agents: resolveDefaults(teamResult.agents),
 		allAgents: resolveDefaults(overridden),
 		team: teamResult.team,
-		teamWarnings: teamResult.warnings,
+		teamWarnings: [...teamResult.warnings, ...utilityWarnings],
+		utilityWarnings,
 		settings,
 		projectAgentsDir: discovery.projectAgentsDir,
 		builtinAgentsDir: discovery.builtinAgentsDir ?? BUILTIN_AGENTS_DIR,
@@ -1521,6 +1574,255 @@ type Plan =
 			}>;
 	  }
 	| { ok: false; message: string };
+
+type UtilityTaskItem = Static<typeof TaskItem>;
+type VexillatioParams = Static<typeof VexillatioParams>;
+
+type UtilityPlan =
+	| { ok: true; steps: UtilityTaskItem[] }
+	| { ok: false; message: string };
+
+function buildUtilityPlan(params: VexillatioParams): UtilityPlan {
+	if (!params.task.trim()) return { ok: false, message: "`task` must not be blank." };
+	const steps = params.tasks?.length
+		? params.tasks
+		: [{ agent: params.agent?.trim() || "scout", task: params.task }];
+	const invalid = steps.findIndex((item) => !item.agent.trim() || !item.task.trim());
+	if (invalid >= 0) {
+		return { ok: false, message: `tasks[] step ${invalid + 1} must include non-blank \`agent\` and \`task\`.` };
+	}
+	return { ok: true, steps };
+}
+
+async function launchUtilityFamily(input: {
+	pi: ExtensionAPI;
+	ctx: ExtensionContext;
+	params: VexillatioParams;
+	supervisor: LegionSupervisor;
+	uiProxy: UIProxy;
+	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
+	cwd: string;
+	sessionCwd: string;
+	isChild: boolean;
+	legion?: LegionRuntimeIdentity;
+	eventBus: LegionEventBus;
+	onLegion: (identity: LegionRuntimeIdentity) => void;
+	onUtilityChild: (retire: () => Promise<void>) => void;
+}): Promise<AgentToolResult<unknown>> {
+	const plan = buildUtilityPlan(input.params);
+	if (!plan.ok) return fail(plan.message, ErrorCodes.INVALID_PARAMS);
+
+	const catalog = loadCatalog(input.sessionCwd, input.cwd, undefined);
+	const prepared: Array<{
+		step: UtilityTaskItem;
+		agent: AgentConfig;
+		resolved: ReturnType<typeof resolveStepModel>["resolved"];
+		modelOrigin: ModelOrigin;
+	}> = [];
+	for (const step of plan.steps) {
+		const agent = findAgent(catalog.allAgents, step.agent);
+		if (!agent?.utility) {
+			return fail(
+				`not a utility agent: ${step.agent} (mark it with 'utility: true')`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		if (agent.disabled) {
+			return fail(`utility agent is disabled: ${agent.name}`, ErrorCodes.DISABLED);
+		}
+		try {
+			const resolvedStep = resolveStepModel({
+				agent,
+				step: {
+					...(step.model !== undefined ? { model: step.model } : {}),
+					...(step.preset !== undefined ? { preset: step.preset } : {}),
+				},
+				params: { ...(input.params.model !== undefined ? { model: input.params.model } : {}) },
+				...(input.ctx.model ? { dispatchModel: `${input.ctx.model.provider}/${input.ctx.model.id}` } : {}),
+				settings: catalog.settings,
+			});
+			const violation = checkModelScope(
+				resolvedStep.resolved.model,
+				catalog.settings.modelScope,
+				resolvedStep.modelOrigin,
+			);
+			if (violation?.severity === "error") {
+				return fail(violation.message, ErrorCodes.INVALID_PARAMS);
+			}
+			prepared.push({
+				step,
+				agent: resolvedStep.agent,
+				resolved: resolvedStep.resolved,
+				modelOrigin: resolvedStep.modelOrigin,
+			});
+		} catch (error) {
+			return fail(`✗ ${step.agent}: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
+		}
+	}
+
+	const firstPrepared = prepared[0];
+	const runTask = prepared.length === 1 && firstPrepared
+		? firstPrepared.step.task
+		: `${prepared.length} parallel utility tasks`;
+	const rootStore = runStoreFor(input.cwd);
+	let legion = resolveLegionIdentity({
+		pi: input.pi,
+		supervisor: input.supervisor,
+		store: rootStore,
+		cwd: input.cwd,
+		settings: catalog.settings,
+		eventBus: input.eventBus,
+		cached: input.legion,
+		sessionFile: input.ctx.sessionManager?.getSessionFile(),
+	});
+	if (!legion && !input.isChild) {
+		legion = createRootLegion({
+			pi: input.pi,
+			supervisor: input.supervisor,
+			store: rootStore,
+			cwd: input.cwd,
+			task: `vexillatio: ${runTask}`,
+			settings: catalog.settings,
+			maxDepth: effectiveMaxDepth(catalog.settings.legion?.maxDepth),
+			eventBus: input.eventBus,
+		});
+	}
+	if (legion) input.onLegion(legion);
+
+	const store = legion?.runStore ?? rootStore;
+	const run = legion
+		? store.readRun(legion.runId)
+		: store.createRun({
+			task: runTask,
+			cwd: input.cwd,
+			maxDepth: effectiveMaxDepth(catalog.settings.legion?.maxDepth),
+			path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH),
+			herdr: { supervisor: "rpc" },
+		});
+	if (!run) return fail("vexillatio parent run is not available", ErrorCodes.NOT_FOUND);
+	const runId = run.runId;
+	const timeoutMs = input.params.timeoutMs ?? 600_000;
+	const existingNames = new Set(
+		store.listRuns().flatMap((existingRun) => existingRun.children.map((child) => child.name)),
+	);
+	if (legion) {
+		for (const child of getChildren(legion.db, legion.nodeId)) existingNames.add(child.name);
+	}
+	const names = new Map<UtilityTaskItem, string>();
+	const nameCounters = new Map<string, number>();
+	for (const item of prepared) {
+		let index = nameCounters.get(item.agent.name) ?? 0;
+		for (;; index += 1) {
+			const candidate = makeName(item.agent.name, index);
+			if (existingNames.has(candidate) || input.supervisor.isAlive(candidate)) continue;
+			existingNames.add(candidate);
+			names.set(item.step, candidate);
+			nameCounters.set(item.agent.name, index + 1);
+			break;
+		}
+	}
+
+	const results: string[] = [];
+	const launches = await Promise.all(prepared.map(async (item) => {
+		const cwd = item.step.cwd ? path.resolve(input.cwd, item.step.cwd) : input.cwd;
+		const orchestrator = new Orchestrator({
+			supervisor: input.supervisor,
+			uiProxy: input.uiProxy,
+			runDir: legion?.runDir ?? store.runDir(runId),
+			cwd,
+			maxDepth: catalog.settings.legion?.maxDepth,
+			maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null,
+			childContext: catalog.settings.childContext,
+			team: catalog.team,
+			onBudgetRefused: input.onBudgetRefused,
+			...(legion ? {
+				legion: {
+					db: legion.db,
+					dbPath: legion.dbPath,
+					nodeId: legion.nodeId,
+					runId,
+					parentNodeId: legion.parentNodeId,
+					parentRunId: legion.parentRunId ?? undefined,
+					runStore: store,
+					settings: legion.settings,
+					eventBus: legion.eventBus,
+				},
+			} : {}),
+		});
+		orchestrator.restore(run);
+		try {
+			const handle = await orchestrator.launch({
+				agent: item.agent,
+				task: item.step.task,
+				name: names.get(item.step),
+				...(item.resolved.model ? { model: item.resolved.model } : {}),
+				modelOrigin: item.modelOrigin,
+				...(item.step.worktree !== undefined ? { worktree: item.step.worktree } : {}),
+				utilityDispatch: true,
+				stripLegionIdentity: true,
+			});
+			await persistChild(store, runId, orchestrator, handle.name);
+			input.onUtilityChild(async () => {
+				try {
+					await orchestrator.retire(handle.name);
+					await persistChild(store, runId, orchestrator, handle.name);
+				} catch {
+					// Shutdown cleanup is best-effort; the supervisor owns final process state.
+				}
+			});
+			return {
+				item,
+				value: {
+					name: handle.name,
+					agent: item.agent.name,
+					sessionFile: handle.sessionFile,
+					orchestrator,
+				},
+			};
+		} catch (error) {
+			return {
+				item,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	}));
+	const handles: Array<{
+		name: string;
+		agent: string;
+		sessionFile: string;
+		orchestrator: Orchestrator;
+	}> = [];
+	for (const launch of launches) {
+		if ("error" in launch) results.push(`✗ ${launch.item.agent.name}: ${launch.error}`);
+		else handles.push(launch.value);
+	}
+
+	const collected = await Promise.all(handles.map(async (handle) => {
+		try {
+			const result = await handle.orchestrator.collect(handle.name, { timeoutMs });
+			await persistChild(store, runId, handle.orchestrator, handle.name);
+			const lines = [
+				`── ${handle.name} ──`,
+				`execution: ${result.execution.status}${result.execution.reason ? ` (${result.execution.reason})` : ""}`,
+				result.output || "(no output)",
+			];
+			if (result.outputFile) lines.push(`outputFile: ${result.outputFile}`);
+			lines.push(`sessionFile: ${handle.sessionFile}`);
+			return lines.join("\n");
+		} catch (error) {
+			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
+		}
+	}));
+	results.push(...collected);
+	return {
+		content: [{ type: "text", text: results.join("\n\n") || "No utility agents were launched." }],
+		details: {
+			runId,
+			handles: handles.map(({ name, agent, sessionFile }) => ({ name, agent, sessionFile })),
+			async: false,
+		},
+	};
+}
 
 export function buildPlan(params: {
 	agent?: string;

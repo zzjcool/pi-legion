@@ -18,32 +18,46 @@ function fakePi() {
 	};
 }
 
-test("child process without nested dispatch registers only the child guard", () => {
+test("child process without nested dispatch registers only vexillatio", () => {
 	const previous = process.env.PI_SUBAGENT_CHILD;
+	const previousNested = process.env.PI_SUBAGENT_ALLOW_NESTED;
+	const previousUtility = process.env.PI_SUBAGENT_UTILITY_CHILD;
+	delete process.env.PI_SUBAGENT_ALLOW_NESTED;
+	delete process.env.PI_SUBAGENT_UTILITY_CHILD;
 	process.env.PI_SUBAGENT_CHILD = "1";
 	try {
 		const pi = fakePi();
 		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
-		assert.equal(pi.tools.length, 0);
+		// REV-17.6: a non-nested child gets only the utility dispatch tool (§2.2).
+		assert.equal(pi.tools.length, 1);
 	} finally {
 		if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = previous;
+		if (previousNested === undefined) delete process.env.PI_SUBAGENT_ALLOW_NESTED;
+		else process.env.PI_SUBAGENT_ALLOW_NESTED = previousNested;
+		if (previousUtility === undefined) delete process.env.PI_SUBAGENT_UTILITY_CHILD;
+		else process.env.PI_SUBAGENT_UTILITY_CHILD = previousUtility;
 	}
 });
 
-test("nested-allowed RPC child still registers the subagent tool", () => {
+test("nested-allowed RPC child registers vexillatio and subagent", () => {
 	const previousChild = process.env.PI_SUBAGENT_CHILD;
 	const previousNested = process.env.PI_SUBAGENT_ALLOW_NESTED;
+	const previousUtility = process.env.PI_SUBAGENT_UTILITY_CHILD;
+	delete process.env.PI_SUBAGENT_UTILITY_CHILD;
 	process.env.PI_SUBAGENT_CHILD = "1";
 	process.env.PI_SUBAGENT_ALLOW_NESTED = "1";
 	try {
 		const pi = fakePi();
 		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
-		assert.equal(pi.tools.length, 1);
+		// REV-17.6: nested-enabled roles register vexillatio in addition to subagent (§2.2).
+		assert.equal(pi.tools.length, 2);
 	} finally {
 		if (previousChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
 		else process.env.PI_SUBAGENT_CHILD = previousChild;
 		if (previousNested === undefined) delete process.env.PI_SUBAGENT_ALLOW_NESTED;
 		else process.env.PI_SUBAGENT_ALLOW_NESTED = previousNested;
+		if (previousUtility === undefined) delete process.env.PI_SUBAGENT_UTILITY_CHILD;
+		else process.env.PI_SUBAGENT_UTILITY_CHILD = previousUtility;
 	}
 });

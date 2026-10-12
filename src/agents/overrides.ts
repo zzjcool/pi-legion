@@ -35,6 +35,7 @@ export const OVERRIDE_FIELDS = [
 	"async",
 	"completionGuard",
 	"allowNestedSubagents",
+	"utility",
 	"disabled",
 	"worktree",
 	"steer",

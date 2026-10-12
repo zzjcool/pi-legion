@@ -142,7 +142,9 @@ function defaultClientFactory(options: RpcClientOptions): RpcClientLike {
 	// pinned runtime's `process` property (a TS-private, non-# field) to close
 	// stdin, observe exit, and write UI responses. RpcClient's declarations
 	// confirm every method in RpcClientLike; the process is checked for null.
-	return new RpcClient(options) as unknown as RpcClientLike;
+	// Node spawn treats undefined env values as explicit removals. The SDK type
+	// omits that Node behavior, so the cast stays at this adapter boundary.
+	return new RpcClient(options as unknown as ConstructorParameters<typeof RpcClient>[0]) as unknown as RpcClientLike;
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
@@ -264,6 +266,7 @@ export class RpcSupervisor implements LegionSupervisor {
 				env: _env,
 				cliPath: _cliPath,
 				tempDir: _tempDir,
+				stripLegionIdentity: _stripLegionIdentity,
 				...buildInput
 			} = input;
 			const built = buildPiArgs({
@@ -281,13 +284,28 @@ export class RpcSupervisor implements LegionSupervisor {
 
 		let client: RpcClientLike;
 		try {
+			const env: Record<string, string | undefined> = {
+				// These are identity/permission markers, not ambient settings. A child
+				// only gets the roles its target's lineageEnv explicitly supplies.
+				PI_SUBAGENT_UTILITY_CHILD: undefined,
+				PI_SUBAGENT_ALLOW_NESTED: undefined,
+				...(input.env ?? {}),
+			};
+			if (input.stripLegionIdentity) {
+				for (const key of [
+					"PI_LEGION_DB",
+					"PI_LEGION_NODE_ID",
+					"PI_SUBAGENT_PARENT_PATH",
+					"PI_SUBAGENT_MAX_DEPTH",
+				]) env[key] = undefined;
+			}
 			const options: RpcClientOptions = {
 				cliPath: input.cliPath
 					? path.resolve(input.cliPath)
 					: defaultPiCliPath(),
 				cwd: input.cwd,
 				args: builtArgs,
-				...(input.env ? { env: input.env } : {}),
+				...(input.env || input.stripLegionIdentity ? { env: env as Record<string, string> } : {}),
 			};
 			client = this.clientFactory(options);
 			registration.client = client;

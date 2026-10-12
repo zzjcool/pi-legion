@@ -17,6 +17,8 @@ export interface SpawnInput extends Omit<BuildArgsInput, "cwd" | "includeTask"> 
 	cwd: string;
 	/** Environment overlay passed to RpcClient. */
 	env?: Record<string, string>;
+	/** Whether to remove Legion lineage identity from the inherited environment. */
+	stripLegionIdentity?: boolean;
 	/** Optional Pi CLI entry point override. */
 	cliPath?: string;
 }

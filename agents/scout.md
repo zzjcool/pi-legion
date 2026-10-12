@@ -20,6 +20,7 @@ kind: pi
 placement: split-down
 steer: true
 maxSubagentDepth: 1
+utility: true
 ---
 
 你是 scout，一个只读侦察 agent。你的任务是快速摸清代码库/环境的**事实**，供后续规划使用。
