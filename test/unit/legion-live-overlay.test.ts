@@ -243,6 +243,7 @@ test("live overlay streams text/tool/settled events into a bounded recent-messag
 			updateType: "toolcall_start",
 			toolName: "read",
 		});
+		assert.equal(component.getState().streamingText, "", "tool-call start closes the previous streamed assistant message");
 		source.emit("root.worker", { type: "turn_start" });
 		source.emit("root.worker", { type: "agent_settled", ts: 4_000 });
 
@@ -402,6 +403,141 @@ test("cursor regression is ignored without advancing or replaying old messages",
 	}
 });
 
+test("malformed null content parts in user, assistant, and tool results do not crash the viewer", () => {
+	const source = new FakeOverlaySource();
+	const sessionText = [
+		JSON.stringify({ type: "session", id: "sess-null-parts", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/tmp" }),
+		messageEntry({ role: "user", content: [{ type: "text", text: "Safe user text" }, null], timestamp: 1 }),
+		messageEntry({
+			role: "assistant",
+			content: [null, { type: "text", text: "Safe assistant text" }, { type: "toolCall", id: "null-parts-tool", name: "read", arguments: {} }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "test/model",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "toolUse",
+			timestamp: 2,
+		}),
+		messageEntry({
+			role: "toolResult",
+			toolCallId: "null-parts-tool",
+			toolName: "read",
+			content: [null, { type: "text", text: "Safe tool result" }],
+			isError: false,
+			timestamp: 3,
+		}),
+	].join("\n");
+	source.backfill = () => {
+		const messages = parseSessionMessages(sessionText);
+		return { messages, cursor: cursor(1, 1, messages.length, 512) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		const rendered = component.render(100).join("\n");
+		assert.match(stripTerminalSequences(rendered), /Safe user text/);
+		assert.match(stripTerminalSequences(rendered), /Safe assistant text/);
+		assert.match(stripTerminalSequences(rendered), /Safe tool result/);
+		assert.equal(component.getState().itemCount, 3);
+	} finally {
+		component.close();
+	}
+});
+
+test("orphan tool results are held pending and backfilled into their later tool call", () => {
+	const source = new FakeOverlaySource();
+	source.backfill = () => {
+		const messages = [
+			toolResult("orphan-call", "orphan output arrives first"),
+			userMessage("Inspect this"),
+			assistantMessage("Reading now", { toolCallId: "orphan-call" }),
+		];
+		return { messages, cursor: cursor(1, 1, messages.length, 512) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		const rendered = stripTerminalSequences(component.render(100).join("\n"));
+		assert.match(rendered, /orphan output arrives first/);
+		assert.equal(component.getState().itemCount, 3, "tool result does not add a standalone component");
+		assert.equal(component.getState().items.filter((item) => item.kind === "tool").length, 1);
+	} finally {
+		component.close();
+	}
+});
+
+test("v1 session headers migrate before their messages render", () => {
+	const source = new FakeOverlaySource();
+	const v1Session = [
+		JSON.stringify({ type: "session", version: 1, id: "sess-v1", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/tmp" }),
+		messageEntry({ role: "user", content: "Legacy user prompt", timestamp: 1 }),
+		messageEntry({
+			role: "assistant",
+			content: [{ type: "text", text: "Legacy assistant answer" }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "test/model",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop",
+			timestamp: 2,
+		}),
+	].join("\n");
+	source.backfill = () => {
+		const messages = parseSessionMessages(v1Session);
+		return { messages, cursor: cursor(1, 1, messages.length, 512) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		const rendered = stripTerminalSequences(component.render(100).join("\n"));
+		assert.match(rendered, /Legacy user prompt/);
+		assert.match(rendered, /Legacy assistant answer/);
+		assert.equal(component.getState().itemCount, 2);
+	} finally {
+		component.close();
+	}
+});
+
+test("a viewer dispatch error during a disk poll is contained to that polling tick", async () => {
+	const source = new FakeOverlaySource();
+	const initial = [userMessage("Inspect"), assistantMessage("Checking")];
+	const appended = [
+		...initial,
+		assistantMessage("", { toolCallId: "poll-tool" }),
+		toolResult("poll-tool", Array.from({ length: 14 }, (_, index) => `poll result ${index + 1}`).join("\n")),
+	];
+	let polls = 0;
+	source.backfill = () => ({ messages: initial, cursor: cursor(1, 1, 2, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1 ? { messages: appended, cursor: cursor(1, 2, 4, 256) } : undefined;
+		};
+		return subscription;
+	};
+	let throwOnFirstKeysRead = true;
+	const throwingKeybindings = {
+		...keybindings,
+		getKeys(id: string) {
+			if (throwOnFirstKeysRead && id === "app.tools.expand") {
+				throwOnFirstKeysRead = false;
+				throw new Error("transient transcript render failure");
+			}
+			return [Key.ctrl("o")];
+		},
+	};
+	const component = createLiveOverlay(source).open("root.worker", {
+		terminalRows: 40,
+		keybindings: throwingKeybindings as never,
+	});
+	try {
+		await new Promise((resolve) => setTimeout(resolve, 600));
+		assert.ok(polls >= 2, "the interval callback survives a render/dispatch exception");
+		assert.equal(component.getState().open, true);
+	} finally {
+		component.close();
+	}
+});
+
 test("session messages render with Pi user background, markdown highlighting, and tool results", () => {
 	const source = new FakeOverlaySource();
 	source.backfill = () => {
@@ -419,8 +555,9 @@ test("session messages render with Pi user background, markdown highlighting, an
 		assert.match(stripTerminalSequences(rendered), /Thinking\.\.\./);
 		assert.doesNotMatch(stripTerminalSequences(rendered), /private reasoning/);
 		assert.match(stripTerminalSequences(rendered), /result line 1/);
-		assert.match(rendered, /\u001b\[[0-9;]*48;/, "user message has the Pi user-message background ANSI style");
-		assert.match(rendered, /\u001b\[[0-9;]*38;/, "markdown syntax highlighting emits ANSI foreground colors");
+		const userLineIndex = stripTerminalSequences(rendered).split("\n").findIndex((line) => line.includes("Review the implementation"));
+		assert.ok(userLineIndex >= 0, "user message line is present");
+		assert.match(rendered.split("\n")[userLineIndex] ?? "", /\u001b\[[0-9;]*48;/, "user message line carries the Pi user-block background ANSI");
 		const codeLineIndex = stripTerminalSequences(rendered).split("\n").findIndex((line) => line.includes("const answer"));
 		assert.ok(codeLineIndex >= 0 && rendered.split("\n")[codeLineIndex]?.includes("\u001b["), "the fenced code line itself is syntax-highlighted with ANSI colors");
 		assert.equal(component.getState().itemCount, 4, "tool result updates its tool component instead of adding a component");
@@ -448,6 +585,19 @@ test("ctrl+o expands tools, pgdn scrolls, and Esc closes the viewer", () => {
 		assert.notEqual(expanded, collapsed);
 		assert.match(expanded, /result line 12/);
 
+		component.handleInput?.("g");
+		assert.equal(component.getState().scrollTop, 0);
+		component.handleInput?.("j");
+		assert.equal(component.getState().scrollTop, 1, "j scrolls down one line");
+		component.handleInput?.("k");
+		assert.equal(component.getState().scrollTop, 0, "k scrolls up one line");
+		component.handleInput?.("G");
+		const maxScrollTop = Math.max(0, expanded.split("\n").length - 3);
+		assert.equal(component.getState().scrollTop, maxScrollTop, "G moves to the transcript end");
+		component.handleInput?.("k");
+		assert.equal(component.getState().scrollTop, Math.max(0, maxScrollTop - 1));
+		component.handleInput?.("j");
+		assert.equal(component.getState().scrollTop, maxScrollTop);
 		component.handleInput?.("g");
 		assert.equal(component.getState().scrollTop, 0);
 		component.handleInput?.("\u001b[6~");

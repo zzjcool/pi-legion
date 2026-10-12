@@ -34,7 +34,6 @@ import type {
 	EventSubscriptionOptions,
 	SupervisorEvent,
 } from "../supervisor/types.ts";
-import { countAssistantMessages, parseSessionText } from "../shared/session.ts";
 
 export const LEGION_COMMAND = "legion";
 
@@ -161,13 +160,11 @@ function resolveNode(
 
 function sessionCursor(
 	messages: readonly AgentMessage[],
-	sessionText: string,
 	fileSize: number,
 ): LiveOverlayBackfillCursor {
-	const parsed = parseSessionText(sessionText);
 	return {
-		turnCount: parsed.turns.length,
-		assistantMessageCount: countAssistantMessages(parsed),
+		turnCount: messages.filter((message) => message.role === "user").length,
+		assistantMessageCount: messages.filter((message) => message.role === "assistant").length,
 		messageCount: messages.length,
 		fileSize,
 	};
@@ -190,9 +187,8 @@ function readSessionBackfill(
 	const fileSize = readSessionSize(sessionFile);
 	if (fileSize === undefined) return undefined;
 	try {
-		const sessionText = readFileSync(sessionFile, "utf8");
-		const messages = parseSessionMessages(sessionText);
-		return { messages, cursor: sessionCursor(messages, sessionText, fileSize) };
+		const messages = parseSessionMessages(readFileSync(sessionFile, "utf8"));
+		return { messages, cursor: sessionCursor(messages, fileSize) };
 	} catch {
 		return undefined;
 	}
@@ -205,15 +201,13 @@ function readSessionDelta(
 	// The append-only JSONL file is only reparsed after its byte size changes.
 	const fileSize = readSessionSize(sessionFile);
 	if (fileSize === undefined || fileSize === cursor.fileSize) return undefined;
-	let sessionText: string;
 	let messages: ReturnType<typeof parseSessionMessages>;
 	try {
-		sessionText = readFileSync(sessionFile, "utf8");
-		messages = parseSessionMessages(sessionText);
+		messages = parseSessionMessages(readFileSync(sessionFile, "utf8"));
 	} catch {
 		return undefined;
 	}
-	const nextCursor = sessionCursor(messages, sessionText, fileSize);
+	const nextCursor = sessionCursor(messages, fileSize);
 	if (
 		nextCursor.messageCount < cursor.messageCount ||
 		nextCursor.turnCount < cursor.turnCount ||
@@ -346,6 +340,7 @@ function openLiveOverlay(
 	});
 	void ctx.ui.custom(factory, {
 		overlay: true,
+		overlayOptions: { width: "100%" },
 		onHandle: (handle) => controller.getCurrent()?.attachOverlayHandle(handle),
 	}).catch((error: unknown) => {
 		controller.close();

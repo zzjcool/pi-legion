@@ -54,6 +54,10 @@ export interface LiveOverlayBackfillResult {
 	cursor: LiveOverlayBackfillCursor;
 }
 
+/**
+ * Load structured session history before subscribing. `maxBackfillTurns` is retained
+ * for API/test compatibility; the context viewer deliberately renders all turns.
+ */
 export type LiveOverlayBackfill = (
 	nodeId: string,
 	maxBackfillTurns: number,
@@ -132,6 +136,10 @@ export interface LiveOverlayController {
 
 const DEFAULT_VIEWER_LINES = 120;
 const DEFAULT_VIEWER_LINE_WIDTH = 2_000;
+/**
+ * Retained as the historical/test-injection default. The structured context
+ * viewer deliberately backfills the full session transcript instead of truncating turns.
+ */
 const DEFAULT_BACKFILL_TURNS = 3;
 const DEFAULT_TERMINAL_ROWS = 24;
 const TOOL_COLLAPSED_PREVIEW_LINES = 10;
@@ -280,7 +288,7 @@ function createSession(
 		for (; renderedItemCount < items.length; renderedItemCount++) {
 			const item = items[renderedItemCount];
 			if (!item) continue;
-			if (item.kind === "user") transcript.addChild(new Spacer(1));
+			if (item.kind === "user" && renderedItemCount > 0) transcript.addChild(new Spacer(1));
 			if (item.kind !== "tool") {
 				transcript.addChild(item.component);
 				continue;
@@ -292,14 +300,17 @@ function createSession(
 				render(width) {
 					const lines = item.component.render(width);
 					if (toolsExpanded || lines.length <= TOOL_COLLAPSED_PREVIEW_LINES) return lines;
-				const visible = lines.slice(0, TOOL_COLLAPSED_PREVIEW_LINES);
-				const expandKeys = options.keybindings?.getKeys("app.tools.expand").join("/") || "ctrl+o";
-				visible.push(style(
-					options.theme,
-					"dim",
-					fitLine(`… (${lines.length - visible.length} more lines · ${expandKeys} to expand)`, width),
-				));
+					const visible = lines.slice(0, TOOL_COLLAPSED_PREVIEW_LINES);
+					const expandKeys = options.keybindings?.getKeys("app.tools.expand").join("/") || "ctrl+o";
+					visible.push(style(
+						options.theme,
+						"dim",
+						fitLine(`… (${lines.length - visible.length} more lines · ${expandKeys} to expand)`, width),
+					));
 					return visible;
+				},
+				handleMouse(event) {
+					return item.component.handleMouse(event);
 				},
 				invalidate() {
 					item.component.invalidate();
@@ -367,14 +378,19 @@ function createSession(
 				const text = typeof message.content === "string"
 					? message.content
 					: Array.isArray(message.content)
-						? message.content.filter((part) => part.type === "text").map((part) => part.text).join("")
+						? message.content.filter((part) => part !== null && typeof part === "object" && part.type === "text").map((part) => part.text).join("")
 						: "";
 				if (text) appendActivityLine(`▸ ${text}`);
 			} else if (message.role === "assistant" && Array.isArray(message.content)) {
-				const text = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+				const text = message.content
+					.filter((part) => part !== null && typeof part === "object" && part.type === "text")
+					.map((part) => part.text)
+					.join("");
 				if (text) appendActivityLine(text);
 				for (const part of message.content) {
-					if (part.type === "toolCall") appendActivityLine(`⚙ ${part.name}`);
+					if (part !== null && typeof part === "object" && part.type === "toolCall") {
+						appendActivityLine(`⚙ ${part.name}`);
+					}
 				}
 			}
 		}
@@ -526,6 +542,7 @@ function createSession(
 		}
 		if (eventType === "tool_call" || eventType === "toolcall_start" || eventType === "toolcall_end" ||
 			eventType === "tool_execution_start" || eventType === "tool_execution_end") {
+			if (eventType === "toolcall_start" || eventType === "tool_execution_start") finishStreaming();
 			const name = safeText(readString(event, "toolName") ?? readString(event, "name") ?? "tool");
 			const phase = eventType === "toolcall_end" || eventType === "tool_execution_end" ? "✓" : "⚙";
 			appendActivityLine(`${phase} ${name}`);
@@ -693,7 +710,14 @@ function createSession(
 					// A transient file race must not break the TUI's interval callback.
 					return;
 				}
-				if (update) acceptBackfill(update, false);
+				if (update) {
+					try {
+						acceptBackfill(update, false);
+					} catch {
+						// Invalid SDK/session content must not escape the host polling callback.
+						return;
+					}
+				}
 			}, BACKFILL_POLL_INTERVAL_MS);
 		}
 	} catch (error) {

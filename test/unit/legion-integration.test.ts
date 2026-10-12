@@ -544,7 +544,7 @@ function testOverlayHandle(): OverlayHandle {
 
 interface OpenCustomCall {
 	component?: Component;
-	options?: { overlay?: boolean; onHandle?: (handle: OverlayHandle) => void };
+	options?: { overlay?: boolean; overlayOptions?: { width?: string }; onHandle?: (handle: OverlayHandle) => void };
 	promise: Promise<unknown>;
 }
 
@@ -561,7 +561,7 @@ class FakeCommandUi {
 			keybindings: never,
 			done: (result: T) => void,
 		) => Component | Promise<Component>,
-		options?: { overlay?: boolean; onHandle?: (handle: OverlayHandle) => void },
+		options?: { overlay?: boolean; overlayOptions?: { width?: string }; onHandle?: (handle: OverlayHandle) => void },
 	): Promise<T> {
 		let resolve!: (value: T) => void;
 		let reject!: (error: unknown) => void;
@@ -647,6 +647,7 @@ test("/legion mounts the paged tree; j/o opens a node overlay and q/Esc close bo
 	await Promise.resolve();
 	assert.equal(harness.ui.calls.length, 2);
 	assert.equal(harness.ui.calls[1]?.options?.overlay, true);
+	assert.deepEqual(harness.ui.calls[1]?.options?.overlayOptions, { width: "100%" });
 	assert.deepEqual(harness.rpc.subscriptions.map(({ name, options }) => ({ name, options })), [
 		{ name: "worker", options: { includeTextDelta: true } },
 	]);
@@ -686,6 +687,7 @@ test("/legion <name> opens the selected floating overlay and Esc unsubscribes on
 	await harness.handler("worker", harness.ctx);
 	assert.equal(harness.ui.calls.length, 1);
 	assert.equal(harness.ui.calls[0]?.options?.overlay, true);
+	assert.deepEqual(harness.ui.calls[0]?.options?.overlayOptions, { width: "100%" });
 	assert.deepEqual(harness.rpc.subscriptions.map((subscription) => subscription.name), ["worker"]);
 	const overlay = harness.ui.calls[0]?.component as Component | undefined;
 	assert.ok(overlay);

@@ -71,7 +71,7 @@ export function parseSessionMessages(content: string): AgentMessage[] {
 	for (const entry of entries) {
 		if (!entry || typeof entry !== "object" || entry.type !== "message") continue;
 		try {
-			messages.push(...sessionEntryToContextMessages(entry));
+			messages.push(...sessionEntryToContextMessages(entry).map(sanitizeMessageContent));
 		} catch {
 			// Session JSONL is external input; skip a malformed row and keep going.
 		}
@@ -188,17 +188,21 @@ export function createChatItemFactory(options: ChatItemFactoryOptions): ChatItem
 				case "toolResult": {
 					const result = message as ToolResultMessage;
 					if (typeof result.toolCallId !== "string" || !Array.isArray(result.content)) break;
-					const component = toolsByCallId.get(result.toolCallId);
+					const safeResult = {
+						...result,
+						content: filterObjectContentParts(result.content),
+					};
+					const component = toolsByCallId.get(safeResult.toolCallId);
 					if (component) {
 						component.updateResult({
-							content: result.content,
-							details: result.details,
-							isError: result.isError,
-							durationMs: result.durationMs,
+							content: safeResult.content,
+							details: safeResult.details,
+							isError: safeResult.isError,
+							durationMs: safeResult.durationMs,
 						});
 						changed = true;
 					} else {
-						pendingResults.set(result.toolCallId, result);
+						pendingResults.set(safeResult.toolCallId, safeResult);
 					}
 					break;
 				}
@@ -260,6 +264,31 @@ export function createChatItemFactory(options: ChatItemFactoryOptions): ChatItem
 			}
 		},
 	};
+}
+
+function sanitizeMessageContent(message: AgentMessage): AgentMessage {
+	switch (message.role) {
+		case "user":
+			return Array.isArray(message.content)
+				? { ...message, content: filterObjectContentParts(message.content) }
+				: message;
+		case "assistant":
+			return Array.isArray(message.content)
+				? { ...message, content: filterObjectContentParts(message.content) }
+				: message;
+		case "toolResult":
+			return Array.isArray(message.content)
+				? { ...message, content: filterObjectContentParts(message.content) }
+				: message;
+		default:
+			return message;
+	}
+}
+
+function filterObjectContentParts<T>(content: readonly T[]): T[] {
+	return content.filter((part) =>
+		part !== null && typeof part === "object" && !Array.isArray(part),
+	);
 }
 
 function userMessageText(content: unknown): string {
