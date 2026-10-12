@@ -1,5 +1,7 @@
 import {
+	Container,
 	Key,
+	Spacer,
 	matchesKey,
 	stripTerminalSequences,
 	truncateToWidth,
@@ -8,14 +10,23 @@ import {
 	type OverlayHandle,
 	type TUI,
 } from "@earendil-works/pi-tui";
+import type { KeybindingsManager } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { LegionNode } from "../legion/nodes.ts";
+import {
+	createChatItemFactory,
+	type ChatItem,
+	type ChatItemSettings,
+} from "./chat-items.ts";
 
 export interface LiveOverlayNode extends Pick<LegionNode, "id" | "name" | "role" | "model" | "status" | "createdAt" | "updatedAt"> {
 	turn?: number;
 	turns?: number;
+	sessionFile?: string | null;
+	worktreePath?: string | null;
 }
 
-/** A normalized tree-bus or coarse RPC activity event; text is display-only. */
+/** A normalized tree-bus or RPC event associated with one Legion node. */
 export interface LiveOverlayEvent {
 	type: string;
 	nodeId?: string;
@@ -27,16 +38,19 @@ export interface LiveOverlayEvent {
 }
 
 export interface LiveOverlayBackfillCursor {
-	/** Number of parsed turns already represented by the overlay. */
+	/** Number of parsed user messages already represented by the overlay. */
 	turnCount: number;
-	/** Number of assistant messages already represented by the overlay. */
+	/** Number of parsed assistant messages already represented by the overlay. */
 	assistantMessageCount: number;
+	/** Number of parsed message entries already represented by the overlay. */
+	messageCount: number;
 	/** Session file size used to skip polls when the append-only file is unchanged. */
 	fileSize: number;
 }
 
 export interface LiveOverlayBackfillResult {
-	lines: readonly string[];
+	/** Full parsed transcript; the cursor identifies messages already consumed. */
+	messages: readonly AgentMessage[];
 	cursor: LiveOverlayBackfillCursor;
 }
 
@@ -70,6 +84,14 @@ export interface LiveOverlayOpenOptions {
 	maxLines?: number;
 	maxLineWidth?: number;
 	maxBackfillTurns?: number;
+	/** Working directory supplied to tool renderers when the node has no worktree. */
+	cwd?: string;
+	/** Effective pi host settings used by the reusable message components. */
+	settings?: ChatItemSettings;
+	/** Runtime arguments supplied by ctx.ui.custom; direct callers may omit them. */
+	tui?: TUI;
+	keybindings?: KeybindingsManager;
+	terminalRows?: number | (() => number);
 	/** Override the source's session-history loader (primarily for embedding and tests). */
 	backfill?: LiveOverlayBackfill;
 }
@@ -77,9 +99,19 @@ export interface LiveOverlayOpenOptions {
 export interface LiveOverlayState {
 	nodeId: string;
 	open: boolean;
+	items: readonly ChatItem[];
+	itemCount: number;
+	/** Compatibility/test projection of message and coarse event text; not rendered. */
 	activity: readonly string[];
+	/** Plain-text projection of transcript components (ANSI sequences removed). */
+	text: string;
+	streamingText: string;
 	turn: number;
 	status: string;
+	hasSession: boolean;
+	cursor: LiveOverlayBackfillCursor | undefined;
+	scrollTop: number;
+	followEnd: boolean;
 }
 
 export interface LiveOverlayComponent extends Component {
@@ -91,22 +123,23 @@ export interface LiveOverlayComponent extends Component {
 }
 
 export interface LiveOverlayController {
-	/** Open one node's overlay, subscribing only for the lifetime of this component. */
+	/** Open one node's viewer, subscribing only for the lifetime of this component. */
 	open(nodeId: string, options?: LiveOverlayOpenOptions): LiveOverlayComponent;
-	/** Close the current overlay, if any. */
+	/** Close the current viewer, if any. */
 	close(): void;
 	getCurrent(): LiveOverlayComponent | undefined;
 }
 
-const DEFAULT_ACTIVITY_LINES = 120;
-const DEFAULT_ACTIVITY_LINE_WIDTH = 2_000;
+const DEFAULT_VIEWER_LINES = 120;
+const DEFAULT_VIEWER_LINE_WIDTH = 2_000;
 const DEFAULT_BACKFILL_TURNS = 3;
+const DEFAULT_TERMINAL_ROWS = 24;
+const TOOL_COLLAPSED_PREVIEW_LINES = 10;
 const BACKFILL_POLL_INTERVAL_MS = 250;
 
 /**
- * Build an on-demand live overlay controller. Calling `open` subscribes to the
- * requested node; closing, Esc, disposal, or replacing it unsubscribes exactly
- * once. Pass the returned component to `ctx.ui.custom(..., { overlay: true })`.
+ * Build an on-demand context-viewer controller. Calling `open` subscribes to
+ * the requested node; closing, Esc, disposal, or replacing it unsubscribes once.
  */
 export function createLiveOverlay(source: LiveOverlaySource): LiveOverlayController {
 	let current: LiveOverlayComponent | undefined;
@@ -131,21 +164,24 @@ export function createLiveOverlay(source: LiveOverlaySource): LiveOverlayControl
 	};
 }
 
-/** Create the custom-UI factory for a node; set `{ overlay: true }` on ui.custom. */
+/** Create the `ctx.ui.custom()` factory shape for one node's viewer. */
 export function createLiveOverlayFactory<T>(
 	controller: LiveOverlayController,
 	nodeId: string,
-	options: Omit<LiveOverlayOpenOptions, "done" | "theme" | "requestRender"> = {},
+	options: Omit<LiveOverlayOpenOptions, "done" | "theme" | "requestRender" | "tui" | "keybindings" | "terminalRows"> = {},
 ): (
-	tui: Pick<TUI, "requestRender">,
+	tui: TUI,
 	theme: LiveOverlayTheme,
-	keybindings: unknown,
+	keybindings: KeybindingsManager,
 	done: (result: T) => void,
 ) => LiveOverlayComponent {
-	return (tui, theme, _keybindings, done) =>
+	return (tui, theme, keybindings, done) =>
 		controller.open(nodeId, {
 			...options,
+			tui,
 			theme,
+			keybindings,
+			terminalRows: () => tui.terminal.rows,
 			requestRender: () => tui.requestRender(),
 			done: () => done(undefined as T),
 		});
@@ -158,8 +194,8 @@ function createSession(
 	onClose: () => void,
 ): LiveOverlayComponent {
 	const now = options.now ?? (() => Date.now());
-	const maxLines = options.maxLines ?? DEFAULT_ACTIVITY_LINES;
-	const maxLineWidth = options.maxLineWidth ?? DEFAULT_ACTIVITY_LINE_WIDTH;
+	const maxLines = options.maxLines ?? DEFAULT_VIEWER_LINES;
+	const maxLineWidth = options.maxLineWidth ?? DEFAULT_VIEWER_LINE_WIDTH;
 	const maxBackfillTurns = options.maxBackfillTurns ?? DEFAULT_BACKFILL_TURNS;
 	if (!Number.isSafeInteger(maxLines) || maxLines < 1) {
 		throw new TypeError("maxLines must be a positive safe integer");
@@ -171,8 +207,31 @@ function createSession(
 		throw new TypeError("maxBackfillTurns must be a non-negative safe integer");
 	}
 
+	const initialNode = source.getNode(nodeId);
+	const cwd = initialNode?.worktreePath ?? options.cwd ?? process.cwd();
+	const chat = createChatItemFactory({
+		tui: options.tui,
+		cwd,
+		settings: options.settings,
+	});
+	const transcript = new Container();
+	let renderedItemCount = 0;
+	let open = true;
+	let hasSession = false;
+	let subscription: LiveOverlaySubscription | undefined;
+	let backfillInterval: ReturnType<typeof globalThis.setInterval> | undefined;
+	let backfillCursor: LiveOverlayBackfillCursor | undefined;
+	let overlayHandle: OverlayHandle | undefined;
+	let turn = initialNode?.turn ?? initialNode?.turns ?? 0;
+	let streamingText = "";
 	const activity: string[] = [];
-	const seenStoredEvents = new Set<number>();
+	let lastActivityTextLine = -1;
+	let toolsExpanded = false;
+	let followEnd = true;
+	let scrollTop = 0;
+	let contentWidth = 80;
+	let lastBodyLines: string[] = [];
+	const seenEventIds = new Set<number>();
 	interface LifecyclePair {
 		stored?: number;
 		process?: number;
@@ -190,64 +249,183 @@ function createSession(
 		"phase_change",
 	]);
 	const lifecyclePairWindowMs = 1_000;
-	let open = true;
-	let subscription: LiveOverlaySubscription | undefined;
-	let backfillInterval: ReturnType<typeof globalThis.setInterval> | undefined;
-	let backfillCursor: LiveOverlayBackfillCursor | undefined;
-	let overlayHandle: OverlayHandle | undefined;
-	let lastTextLine = -1;
-	const initialNode = source.getNode(nodeId);
-	let turn = initialNode?.turn ?? initialNode?.turns ?? 0;
 
-	const safeEventText = (value: unknown): string => {
+	const safeText = (value: unknown): string => {
 		if (typeof value !== "string") return "";
 		return stripTerminalSequences(value)
-			.replace(/\r\n?/g, "\n")
+			.replace(/[\r\n\t]/g, " ")
 			.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 	};
 
-	const keepActivityBounded = (): void => {
-		if (activity.length > maxLines) {
-			const removed = activity.length - maxLines;
-			activity.splice(0, removed);
-			lastTextLine = lastTextLine < removed ? -1 : lastTextLine - removed;
+	const safeActivityText = (value: string): string => stripTerminalSequences(value)
+		.replace(/\r\n?/g, "\n")
+		.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
+
+	const sourceNode = (): LiveOverlayNode | undefined => source.getNode(nodeId) ?? undefined;
+
+	const currentTerminalRows = (): number => {
+		const value = typeof options.terminalRows === "function"
+			? options.terminalRows()
+			: options.terminalRows ?? DEFAULT_TERMINAL_ROWS;
+		if (!Number.isSafeInteger(value) || value < 1) {
+			throw new TypeError("terminalRows must be a positive safe integer");
+		}
+		return value;
+	};
+
+	const bodyPageSize = (): number => Math.max(0, currentTerminalRows() - 1);
+
+	const mountNewItems = (): void => {
+		const items = chat.items;
+		for (; renderedItemCount < items.length; renderedItemCount++) {
+			const item = items[renderedItemCount];
+			if (!item) continue;
+			if (item.kind === "user") transcript.addChild(new Spacer(1));
+			if (item.kind !== "tool") {
+				transcript.addChild(item.component);
+				continue;
+			}
+			// pi 1.1.0's undefined-toolDefinition fallback always displays the
+			// full output and ignores setExpanded(). Keep the public component,
+			// but cap its transcript lines while collapsed so ctrl+o still toggles.
+			transcript.addChild({
+				render(width) {
+					const lines = item.component.render(width);
+					if (toolsExpanded || lines.length <= TOOL_COLLAPSED_PREVIEW_LINES) return lines;
+				const visible = lines.slice(0, TOOL_COLLAPSED_PREVIEW_LINES);
+				const expandKeys = options.keybindings?.getKeys("app.tools.expand").join("/") || "ctrl+o";
+				visible.push(style(
+					options.theme,
+					"dim",
+					fitLine(`… (${lines.length - visible.length} more lines · ${expandKeys} to expand)`, width),
+				));
+					return visible;
+				},
+				invalidate() {
+					item.component.invalidate();
+				},
+			});
 		}
 	};
 
-	const appendLine = (line: string): void => {
-		for (const segment of line.split("\n")) {
-			activity.push(segment.slice(0, maxLineWidth));
-			lastTextLine = -1;
-		}
-		keepActivityBounded();
+	const renderBody = (width: number): string[] => {
+		mountNewItems();
+		const lines = transcript.render(width);
+		if (lines.length > 0) return lines;
+		return [hasSession ? "No displayable messages." : "No session yet."];
 	};
 
-	// Hydrate synchronously before subscribing so the first render has history;
-	// this path intentionally does not call requestRender.
+	const maxScrollTop = (lines: readonly string[]): number =>
+		Math.max(0, lines.length - bodyPageSize());
+
+	const clampScroll = (lines: readonly string[]): void => {
+		scrollTop = Math.max(0, Math.min(maxScrollTop(lines), Math.trunc(scrollTop)));
+	};
+
+	const syncScroll = (lines: readonly string[]): void => {
+		if (followEnd) scrollTop = maxScrollTop(lines);
+		else clampScroll(lines);
+	};
+
+	const requestRender = (): void => options.requestRender?.();
+
+	const trimActivity = (): void => {
+		if (activity.length <= maxLines) return;
+		const removed = activity.length - maxLines;
+		activity.splice(0, removed);
+		lastActivityTextLine = lastActivityTextLine < removed
+			? -1
+			: lastActivityTextLine - removed;
+	};
+
+	const appendActivityLine = (line: string): void => {
+		for (const segment of line.split("\n")) activity.push(safeActivityText(segment).slice(0, maxLineWidth));
+		lastActivityTextLine = -1;
+		trimActivity();
+	};
+
+	const appendActivityText = (text: string): void => {
+		for (const [index, chunk] of text.split("\n").entries()) {
+			if (index > 0) {
+				activity.push("");
+				lastActivityTextLine = activity.length - 1;
+			}
+			if (!chunk) continue;
+			if (lastActivityTextLine < 0 || lastActivityTextLine !== activity.length - 1) {
+				activity.push("");
+				lastActivityTextLine = activity.length - 1;
+			}
+			activity[lastActivityTextLine] = `${activity[lastActivityTextLine] ?? ""}${safeActivityText(chunk)}`.slice(-maxLineWidth);
+		}
+		trimActivity();
+	};
+
+	const projectMessagesToActivity = (messages: readonly AgentMessage[]): void => {
+		for (const message of messages) {
+			if (!message || typeof message !== "object") continue;
+			if (message.role === "user") {
+				const text = typeof message.content === "string"
+					? message.content
+					: Array.isArray(message.content)
+						? message.content.filter((part) => part.type === "text").map((part) => part.text).join("")
+						: "";
+				if (text) appendActivityLine(`▸ ${text}`);
+			} else if (message.role === "assistant" && Array.isArray(message.content)) {
+				const text = message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
+				if (text) appendActivityLine(text);
+				for (const part of message.content) {
+					if (part.type === "toolCall") appendActivityLine(`⚙ ${part.name}`);
+				}
+			}
+		}
+	};
+
+	const appendMessages = (messages: readonly AgentMessage[], redraw: boolean): boolean => {
+		projectMessagesToActivity(messages);
+		const result = chat.appendMessages(messages);
+		mountNewItems();
+		if (toolsExpanded) chat.setToolsExpanded(true);
+		if (result.changed && redraw) {
+			lastBodyLines = renderBody(contentWidth);
+			syncScroll(lastBodyLines);
+			requestRender();
+		}
+		return result.changed;
+	};
+
+	const isCursorRegression = (
+		previous: LiveOverlayBackfillCursor,
+		next: LiveOverlayBackfillCursor,
+	): boolean => next.messageCount < previous.messageCount ||
+		next.turnCount < previous.turnCount ||
+		next.assistantMessageCount < previous.assistantMessageCount ||
+		next.fileSize < previous.fileSize;
+
+	const acceptBackfill = (update: LiveOverlayBackfillResult, initial: boolean): boolean => {
+		const previous = backfillCursor;
+		if (previous && isCursorRegression(previous, update.cursor)) return false;
+		let messages = update.messages;
+		if (!initial && previous) {
+			// A source may retry a parsed tail after a torn write. Only consume the
+			// entries beyond the previous monotonic message cursor.
+			const addedMessageCount = Math.max(0, update.cursor.messageCount - previous.messageCount);
+			messages = messages.slice(previous.messageCount, previous.messageCount + addedMessageCount);
+		}
+		backfillCursor = { ...update.cursor };
+		hasSession = true;
+		turn = Math.max(turn, update.cursor.turnCount);
+		const changed = appendMessages(messages, !initial);
+		if (!initial && !changed && messages.length > 0) requestRender();
+		return changed;
+	};
+
 	const initialBackfill = options.backfill?.(nodeId, maxBackfillTurns) ??
 		source.backfill?.(nodeId, maxBackfillTurns);
 	if (initialBackfill) {
-		backfillCursor = initialBackfill.cursor;
-		for (const line of initialBackfill.lines) appendLine(safeEventText(line));
+		acceptBackfill(initialBackfill, true);
+		lastBodyLines = renderBody(contentWidth);
+		if (followEnd) syncScroll(lastBodyLines);
 	}
-
-	const appendText = (text: string): void => {
-		const chunks = text.split("\n");
-		for (const [index, chunk] of chunks.entries()) {
-			if (index > 0) {
-				activity.push("");
-				lastTextLine = activity.length - 1;
-			}
-			if (!chunk) continue;
-			if (lastTextLine < 0 || lastTextLine !== activity.length - 1) {
-				activity.push("");
-				lastTextLine = activity.length - 1;
-			}
-			const line = activity[lastTextLine] ?? "";
-			activity[lastTextLine] = `${line}${chunk}`.slice(-maxLineWidth);
-		}
-		keepActivityBounded();
-	};
 
 	const readString = (event: LiveOverlayEvent, key: string): string | undefined => {
 		const direct = event[key];
@@ -259,21 +437,44 @@ function createSession(
 		return undefined;
 	};
 
+	const clampStreamingText = (text: string): string => text
+		.split("\n")
+		.slice(-maxLines)
+		.map((line) => line.slice(-maxLineWidth))
+		.join("\n");
+
+	const updateStreamingText = (delta: string): void => {
+		if (!delta) return;
+		streamingText = clampStreamingText(`${streamingText}${delta}`);
+		appendActivityText(delta);
+		chat.updateStreamingText(streamingText, sourceNode()?.model ?? initialNode?.model ?? undefined);
+		mountNewItems();
+		lastBodyLines = renderBody(contentWidth);
+		syncScroll(lastBodyLines);
+		requestRender();
+	};
+
+	const finishStreaming = (): void => {
+		if (!streamingText) return;
+		chat.finishStreaming();
+		streamingText = "";
+		requestRender();
+	};
+
 	const handleEvent = (event: LiveOverlayEvent): void => {
 		if (!open || (event.nodeId !== undefined && event.nodeId !== nodeId)) return;
 		if (event.id !== undefined) {
-			if (seenStoredEvents.has(event.id)) return;
-			seenStoredEvents.add(event.id);
-			if (seenStoredEvents.size > maxLines * 4) {
-				const oldest = seenStoredEvents.values().next().value;
-				if (oldest !== undefined) seenStoredEvents.delete(oldest);
+			if (seenEventIds.has(event.id)) return;
+			seenEventIds.add(event.id);
+			if (seenEventIds.size > DEFAULT_VIEWER_LINES * 4) {
+				const oldest = seenEventIds.values().next().value;
+				if (oldest !== undefined) seenEventIds.delete(oldest);
 			}
 		}
 		if (lifecycleEventTypes.has(event.type)) {
 			const domain = event.domain ?? (event.id === undefined ? "process" : "stored");
-			const key = event.type;
 			const timestamp = event.ts ?? now();
-			const previous = recentLifecycle.get(key) ?? {};
+			const previous = recentLifecycle.get(event.type) ?? {};
 			const oppositeTimestamp = domain === "stored" ? previous.process : previous.stored;
 			const oppositePaired = domain === "stored" ? previous.processPaired : previous.storedPaired;
 			const duplicate = oppositeTimestamp !== undefined && oppositePaired !== true &&
@@ -296,98 +497,86 @@ function createSession(
 				next.process = undefined;
 				next.processPaired = undefined;
 			}
-			if (next.stored === undefined && next.process === undefined) recentLifecycle.delete(key);
-			else recentLifecycle.set(key, next);
+			if (next.stored === undefined && next.process === undefined) recentLifecycle.delete(event.type);
+			else recentLifecycle.set(event.type, next);
 			if (duplicate) return;
 		}
+
 		const updateType = readString(event, "updateType");
 		const eventType = event.type === "message_update" ? updateType ?? event.type : event.type;
 		if (eventType === "text_delta") {
-			const delta = readString(event, "delta") ?? readString(event, "text");
-			if (delta !== undefined) appendText(safeEventText(delta));
-		} else if (
-			eventType === "tool_call" ||
-			eventType === "toolcall_start" ||
-			eventType === "toolcall_end" ||
-			eventType === "tool_execution_start" ||
-			eventType === "tool_execution_end"
-		) {
-			const toolName = safeEventText(readString(event, "toolName") ?? readString(event, "name") ?? "tool");
-			const phase = eventType === "toolcall_end" || eventType === "tool_execution_end" ? "✓" : "⚙";
-			appendLine(`${phase} ${toolName}`);
-		} else if (eventType === "turn_start") {
+			updateStreamingText(readString(event, "delta") ?? readString(event, "text") ?? "");
+			return;
+		}
+		if (eventType === "turn_start") {
+			finishStreaming();
 			const data = event.data && typeof event.data === "object" && !Array.isArray(event.data)
 				? event.data as Record<string, unknown>
 				: undefined;
 			turn = typeof data?.turn === "number" ? data.turn : turn + 1;
-			appendLine(`↻ turn ${turn}`);
-		} else if (eventType === "agent_settled" || eventType === "agent_end") {
-			// RPC turn completion is activity, not a Legion node lifecycle transition.
-			appendLine("✓ agent turn settled");
-		} else if (eventType !== "message_update") {
-			appendLine(`· ${safeEventText(eventType)}`);
+			appendActivityLine(`↻ turn ${turn}`);
+			requestRender();
+			return;
 		}
-		options.requestRender?.();
-	};
-
-	const sourceNode = (): LiveOverlayNode | undefined => {
-		const node = source.getNode(nodeId);
-		return node ?? undefined;
+		if (eventType === "agent_settled" || eventType === "agent_end") {
+			finishStreaming();
+			appendActivityLine("✓ agent turn settled");
+			requestRender();
+			return;
+		}
+		if (eventType === "tool_call" || eventType === "toolcall_start" || eventType === "toolcall_end" ||
+			eventType === "tool_execution_start" || eventType === "tool_execution_end") {
+			const name = safeText(readString(event, "toolName") ?? readString(event, "name") ?? "tool");
+			const phase = eventType === "toolcall_end" || eventType === "tool_execution_end" ? "✓" : "⚙";
+			appendActivityLine(`${phase} ${name}`);
+		} else if (eventType !== "message_update") {
+			appendActivityLine(`· ${safeText(eventType)}`);
+		}
+		// Lifecycle and coarse tool facts are retained for the test/state view;
+		// conversation content itself is rendered only from structured messages.
+		requestRender();
 	};
 
 	const getState = (): LiveOverlayState => {
 		const node = sourceNode();
+		lastBodyLines = renderBody(contentWidth);
+		clampScroll(lastBodyLines);
 		return {
 			nodeId,
 			open,
+			items: [...chat.items],
+			itemCount: chat.items.length,
 			activity: [...activity],
-			turn: turn || node?.turn || node?.turns || 0,
+			text: lastBodyLines.map((line) => stripTerminalSequences(line)).join("\n"),
+			streamingText,
+			turn,
 			status: node?.status ?? "unknown",
+			hasSession,
+			cursor: backfillCursor ? { ...backfillCursor } : undefined,
+			scrollTop,
+			followEnd,
 		};
 	};
 
-	const render = (width: number): string[] => {
+	const headerLine = (width: number): string => {
 		const safeWidth = Math.max(1, Math.floor(width));
 		const node = sourceNode();
-		const lines: string[] = [];
 		if (!node) {
-			lines.push(style(options.theme, "dim", `● ${nodeId} · node unavailable`));
-		} else {
-			const status = node.status;
-			const completed = status === "settled" || status === "failed" || status === "retired";
-			const elapsedEnd = completed ? node.updatedAt : now();
-			const elapsed = `${Math.max(0, Math.round((elapsedEnd - node.createdAt) / 1_000))}s`;
-			const details = [
-				`● ${safeEventText(node.name)} (${safeEventText(node.role)})`,
-				...(node.model ? [safeEventText(node.model)] : []),
-				`turn ${turn || node.turn || node.turns || 0}`,
-				elapsed,
-				status,
-			];
-			const header = details.join(" · ");
-			lines.push(
-				style(
-					options.theme,
-					completed ? "dim" : "accent",
-					visibleWidth(header) <= safeWidth ? header : truncateToWidth(header, safeWidth),
-				),
-			);
+			const missing = `● ${nodeId} · node unavailable`;
+			return style(options.theme, "dim", fitLine(missing, safeWidth));
 		}
-		const activities = activity.slice(-maxLines);
-		if (activities.length === 0) {
-			const empty = "No recent activity.";
-			lines.push(visibleWidth(empty) <= safeWidth ? empty : truncateToWidth(empty, safeWidth));
-		}
-		else {
-			for (const line of activities) {
-				const safeLine = safeEventText(line);
-				const fitted = visibleWidth(safeLine) <= safeWidth
-					? safeLine
-					: truncateToWidth(safeLine, safeWidth);
-				lines.push(style(options.theme, "dim", fitted));
-			}
-		}
-		return lines;
+		const status = node.status;
+		const completed = status === "settled" || status === "failed" || status === "retired";
+		const elapsedEnd = completed ? node.updatedAt : now();
+		const elapsed = `${Math.max(0, Math.round((elapsedEnd - node.createdAt) / 1_000))}s`;
+		const details = [
+			`● ${safeText(node.name)} (${safeText(node.role)})`,
+			...(node.model ? [safeText(node.model)] : []),
+			`turn ${turn || node.turn || node.turns || 0}`,
+			elapsed,
+			status,
+		];
+		return style(options.theme, completed ? "dim" : "accent", fitLine(details.join(" · "), safeWidth));
 	};
 
 	const close = (): void => {
@@ -407,13 +596,77 @@ function createSession(
 		options.done?.(undefined);
 	};
 
+	const scrollBy = (amount: number): void => {
+		lastBodyLines = renderBody(contentWidth);
+		const maximum = maxScrollTop(lastBodyLines);
+		const next = Math.max(0, Math.min(maximum, scrollTop + Math.trunc(amount)));
+		if (amount < 0) followEnd = false;
+		if (next === scrollTop) {
+			if (next >= maximum && amount > 0) followEnd = true;
+			return;
+		}
+		scrollTop = next;
+		followEnd = scrollTop >= maximum;
+		requestRender();
+	};
+
+	const goToTop = (): void => {
+		followEnd = false;
+		if (scrollTop === 0) return;
+		scrollTop = 0;
+		requestRender();
+	};
+
+	const goToEnd = (): void => {
+		lastBodyLines = renderBody(contentWidth);
+		followEnd = true;
+		const next = maxScrollTop(lastBodyLines);
+		if (scrollTop === next) return;
+		scrollTop = next;
+		requestRender();
+	};
+
 	const component: LiveOverlayComponent = {
 		nodeId,
-		render,
-		handleInput(data) {
-			if (matchesKey(data, Key.escape)) close();
+		render(width) {
+			contentWidth = Math.max(1, Math.floor(width));
+			lastBodyLines = renderBody(contentWidth);
+			syncScroll(lastBodyLines);
+			const start = Math.max(0, scrollTop);
+			const end = start + bodyPageSize();
+			return [headerLine(contentWidth), ...lastBodyLines.slice(start, end)];
 		},
-		invalidate() {},
+		handleInput(data) {
+			if (!open) return;
+			if (matchesKey(data, Key.escape)) {
+				close();
+				return;
+			}
+			if (options.keybindings?.matches(data, "app.tools.expand")) {
+				toolsExpanded = !toolsExpanded;
+				chat.setToolsExpanded(toolsExpanded);
+				lastBodyLines = renderBody(contentWidth);
+				syncScroll(lastBodyLines);
+				requestRender();
+				return;
+			}
+			if (matchesKey(data, "j") || matchesKey(data, Key.down)) {
+				scrollBy(1);
+			} else if (matchesKey(data, "k") || matchesKey(data, Key.up)) {
+				scrollBy(-1);
+			} else if (matchesKey(data, Key.pageDown)) {
+				scrollBy(Math.max(1, bodyPageSize()));
+			} else if (matchesKey(data, Key.pageUp)) {
+				scrollBy(-Math.max(1, bodyPageSize()));
+			} else if (matchesKey(data, "g")) {
+				goToTop();
+			} else if (matchesKey(data, Key.shift("g"))) {
+				goToEnd();
+			}
+		},
+		invalidate() {
+			transcript.invalidate();
+		},
 		close,
 		attachOverlayHandle(handle) {
 			if (!open) {
@@ -440,10 +693,7 @@ function createSession(
 					// A transient file race must not break the TUI's interval callback.
 					return;
 				}
-				if (!update) return;
-				backfillCursor = update.cursor;
-				for (const line of update.lines) appendLine(safeEventText(line));
-				if (update.lines.length > 0) options.requestRender?.();
+				if (update) acceptBackfill(update, false);
 			}, BACKFILL_POLL_INTERVAL_MS);
 		}
 	} catch (error) {
@@ -454,6 +704,11 @@ function createSession(
 		throw error;
 	}
 	return component;
+}
+
+function fitLine(line: string, width: number): string {
+	const safeWidth = Math.max(1, Math.floor(width));
+	return visibleWidth(line) <= safeWidth ? line : truncateToWidth(line, safeWidth);
 }
 
 function style(
