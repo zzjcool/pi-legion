@@ -88,7 +88,8 @@ const VexillatioParams = Type.Object({
 |---|---|
 | `src/shared/types.ts` | AgentConfig + `utility?: boolean` |
 | `src/agents/agents.ts` | frontmatter 解析 `utility`（applyBehaviorFields 层） |
-| `src/agents/settings.ts` | agentOverrides 白名单字段加 `utility`（`overrides.ts:32-46` 那份清单同步） |
+| `src/agents/settings.ts` | agentOverrides 白名单字段加 `utility` |
+| `src/agents/overrides.ts` | `OVERRIDE_FIELDS`（:20-54）加 `"utility"`——settings 层 override 的实际复制通道，不加则 override 被丢弃 |
 | `src/runs/orchestrator.ts` | launch 支持 `stripLegionIdentity?: boolean`（SpawnInput 选项，控制 env 剔除） |
 | `src/supervisor/rpc-supervisor.ts` | SpawnInput.env 透传（已有；无需改动，除非类型收紧） |
 | `index.ts` | 注册 `vexillatio` 工具（早退之前）+ PLAYBOOK 文本 |
@@ -133,3 +134,4 @@ const VexillatioParams = Type.Object({
 |---|---|---|---|
 | 2026-10-12 | REV-17 初版 | — | 首次冻结 |
 | 2026-10-12 | REV-17.1 | §3 增补两行测试文件所有权（新建 `test/unit/utility-agents.test.ts`、`test/integration/vexillatio.test.ts`），并明确既有测试文件不改 | worker 依 §4 验收要求提出契约矛盾（§3 未授权测试文件）——拒绝正确，修订后重派 |
+| 2026-10-12 | REV-17.2 | §3 增补 `src/agents/overrides.ts` 所有权（worker-1 指出 settings 行的动作列引用了未授权文件）；自查确认无其他「动作列引用未授权文件」情况 | worker-1 依契约矛盾流程上报（§3 :91 行动作列要求同步 overrides.ts 清单但表未授权）——拒绝正确，修订后重派 |
