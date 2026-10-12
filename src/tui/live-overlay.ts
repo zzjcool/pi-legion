@@ -65,7 +65,7 @@ export type LiveOverlayBackfill = (
 ) => LiveOverlayBackfillResult | undefined;
 
 export type LiveOverlaySubscription = (() => void) & {
-	/** Present only when the subscription did not acquire the live text-delta RPC feed. */
+	/** Session-file backfill poll, including when a live text-delta RPC feed is subscribed. */
 	pollBackfill?: (cursor: LiveOverlayBackfillCursor) => LiveOverlayBackfillResult | undefined;
 };
 export type LiveOverlayListener = (event: LiveOverlayEvent) => void;
@@ -225,6 +225,7 @@ function createSession(
 	});
 	const transcript = new Container();
 	let renderedItemCount = 0;
+	const mountedItems = new Set<ChatItem>();
 	let open = true;
 	let hasSession = false;
 	let subscription: LiveOverlaySubscription | undefined;
@@ -286,13 +287,19 @@ function createSession(
 	const bodyPageSize = (): number => Math.max(0, currentTerminalRows() - 1);
 
 	const mountNewItems = (): void => {
+		for (const item of mountedItems) {
+			if (!item.revoked) continue;
+			if (item.kind === "assistant") transcript.removeChild(item.component);
+			mountedItems.delete(item);
+		}
 		const items = chat.items;
 		for (; renderedItemCount < items.length; renderedItemCount++) {
 			const item = items[renderedItemCount];
-			if (!item) continue;
+			if (!item || item.revoked) continue;
 			if (item.kind === "user" && renderedItemCount > 0) transcript.addChild(new Spacer(1));
 			if (item.kind !== "tool") {
 				transcript.addChild(item.component);
+				mountedItems.add(item);
 				continue;
 			}
 			// pi 1.1.0's undefined-toolDefinition fallback always displays the
@@ -318,6 +325,7 @@ function createSession(
 					item.component.invalidate();
 				},
 			});
+			mountedItems.add(item);
 		}
 	};
 
@@ -438,6 +446,42 @@ function createSession(
 		backfillCursor = { ...update.cursor };
 		hasSession = true;
 		turn = Math.max(turn, update.cursor.turnCount);
+
+		let diskAssistantText: string | undefined;
+		if (!initial) {
+			for (const message of messages) {
+				if (message.role === "assistant") diskAssistantText = messageText(message.content);
+			}
+		}
+		if (diskAssistantText !== undefined) {
+			const retractedText = chat.retractStreamingItem();
+			const currentStreamingText = retractedText || streamingText;
+			let remainingStreamingText = "";
+			if (currentStreamingText && !diskAssistantText.startsWith(currentStreamingText)) {
+				remainingStreamingText = currentStreamingText.startsWith(diskAssistantText)
+					? currentStreamingText.slice(diskAssistantText.length)
+					: currentStreamingText;
+			}
+			streamingText = "";
+			const changed = appendMessages(messages, false);
+			if (remainingStreamingText) {
+				streamingText = remainingStreamingText;
+				chat.updateStreamingText(
+					streamingText,
+					sourceNode()?.model ?? initialNode?.model ?? undefined,
+				);
+				mountNewItems();
+			}
+			if (changed) {
+				lastBodyLines = renderBody(contentWidth);
+				syncScroll(lastBodyLines);
+				requestRender();
+			} else if (messages.length > 0) {
+				requestRender();
+			}
+			return changed;
+		}
+
 		const changed = appendMessages(messages, !initial);
 		if (!initial && !changed && messages.length > 0) requestRender();
 		return changed;
@@ -575,11 +619,12 @@ function createSession(
 		const node = sourceNode();
 		lastBodyLines = renderBody(contentWidth);
 		clampScroll(lastBodyLines);
+		const items = chat.items.filter((item) => !item.revoked);
 		return {
 			nodeId,
 			open,
-			items: [...chat.items],
-			itemCount: chat.items.length,
+			items,
+			itemCount: items.length,
 			activity: [...activity],
 			text: lastBodyLines.map((line) => stripTerminalSequences(line)).join("\n"),
 			streamingText,

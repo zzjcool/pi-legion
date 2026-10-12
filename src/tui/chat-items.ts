@@ -17,9 +17,9 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { MarkdownTheme, TUI } from "@earendil-works/pi-tui";
 
 export type ChatItem =
-	| { kind: "user"; component: UserMessageComponent }
-	| { kind: "assistant"; component: AssistantMessageComponent }
-	| { kind: "tool"; component: ToolExecutionComponent; toolCallId: string };
+	| { kind: "user"; component: UserMessageComponent; revoked?: boolean }
+	| { kind: "assistant"; component: AssistantMessageComponent; revoked?: boolean }
+	| { kind: "tool"; component: ToolExecutionComponent; toolCallId: string; revoked?: boolean };
 
 export interface ChatItemSettings {
 	outputPad?: number;
@@ -37,7 +37,7 @@ export interface ChatItemFactoryOptions {
 }
 
 export interface ChatItemFactory {
-	/** All components created so far, in transcript order. */
+	/** All components created so far, in transcript order; revoked items preserve mount indices. */
 	readonly items: readonly ChatItem[];
 	/** Append parsed session messages. Returns the new items and whether the view changed. */
 	appendMessages(messages: readonly AgentMessage[]): {
@@ -46,6 +46,8 @@ export interface ChatItemFactory {
 	};
 	/** Create/update the one currently streaming assistant component. */
 	updateStreamingText(text: string, model?: string): AssistantMessageComponent;
+	/** Revoke the streaming assistant without finalizing it; return its accumulated text. */
+	retractStreamingItem(): string;
 	/** Mark the current streaming assistant message complete, if one exists. */
 	finishStreaming(): void;
 	/** Change every tool component's expanded state. */
@@ -94,6 +96,7 @@ export function createChatItemFactory(options: ChatItemFactoryOptions): ChatItem
 	const pendingResults = new Map<string, ToolResultMessage>();
 	let anonymousToolId = 0;
 	let streamingComponent: AssistantMessageComponent | undefined;
+	let streamingItem: Extract<ChatItem, { kind: "assistant" }> | undefined;
 	let streamingText = "";
 
 	const addToolCall = (
@@ -246,16 +249,27 @@ export function createChatItemFactory(options: ChatItemFactoryOptions): ChatItem
 					"Thinking...",
 					outputPad,
 				);
-				items.push({ kind: "assistant", component: streamingComponent });
+				streamingItem = { kind: "assistant", component: streamingComponent };
+				items.push(streamingItem);
 			}
 			streamingText = text;
 			streamingComponent.updateContent(makeStreamingMessage(streamingText, model), true);
 			return streamingComponent;
 		},
+		retractStreamingItem() {
+			if (!streamingComponent) return "";
+			const text = streamingText;
+			if (streamingItem) streamingItem.revoked = true;
+			streamingComponent = undefined;
+			streamingItem = undefined;
+			streamingText = "";
+			return text;
+		},
 		finishStreaming() {
 			if (!streamingComponent) return;
 			streamingComponent.updateContent(makeStreamingMessage(streamingText), false);
 			streamingComponent = undefined;
+			streamingItem = undefined;
 			streamingText = "";
 		},
 		setToolsExpanded(expanded) {

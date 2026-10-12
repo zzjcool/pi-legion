@@ -672,3 +672,70 @@ test("ctrl+o expands tools, pgdn scrolls, and Esc closes the viewer", () => {
 		component.close();
 	}
 });
+
+test("disk assistant message supersedes the streaming component", async () => {
+	const source = new FakeOverlaySource();
+	const diskMessages = [assistantMessage("partial + more")];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		source.emit("root.worker", { type: "text_delta", delta: "partial" });
+		assert.equal(component.getState().streamingText, "partial");
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		assert.equal(state.items.filter((item) => item.kind === "assistant").length, 1);
+		assert.match(stripTerminalSequences(state.text), /partial \+ more/);
+		assert.doesNotMatch(stripTerminalSequences(state.text), /partialpartial/);
+		assert.equal(state.streamingText, "");
+	} finally {
+		component.close();
+	}
+});
+
+test("streaming ahead of disk keeps the remaining tail", async () => {
+	const source = new FakeOverlaySource();
+	const diskMessages = [assistantMessage("full")];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		source.emit("root.worker", { type: "text_delta", delta: "full tail ahead" });
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		assert.match(stripTerminalSequences(state.text), /full/);
+		assert.match(stripTerminalSequences(state.text), /tail ahead/);
+		assert.equal(state.streamingText, " tail ahead");
+		assert.equal(state.items.filter((item) => item.kind === "assistant").length, 2);
+	} finally {
+		component.close();
+	}
+});
