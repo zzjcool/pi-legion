@@ -18,7 +18,7 @@ import { getUsage } from "../../src/legion/usage.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
-import { assistantMsg, sessionHeader, userMsg } from "../helpers/fixtures.ts";
+import { assistantMsg, sessionHeader, toolResult, userMsg } from "../helpers/fixtures.ts";
 
 import { stripTerminalSequences, type Component, type OverlayHandle } from "@earendil-works/pi-tui";
 import type { LegionEvent } from "../../src/extension/event-bus.ts";
@@ -182,9 +182,26 @@ test("index root launch creates one reusable ledger, child identity opens it, an
 			method: "notify",
 			message: "approval notification",
 		});
-		assert.equal(liveOverlay.getState().activity.at(-1), "· ui_request", "extension UI requests are visible through the shared event bus after session history");
+		assert.deepEqual(liveOverlay.getState().activity, [
+			"▸ Task: create the first Legion tree",
+			"",
+			"## Frozen child constraints (injected by pi-legion)",
+			"- Do not spawn nested agents.",
+			'- End with machine-readable JSON on its own: {"ok": true|false, "reason": "..."}.',
+			"",
+			"· ui_request",
+		], "extension UI requests are visible through the shared event bus after session history");
 		supervisor.settle("worker-0", { text: "done" });
-		assert.equal(liveOverlay.getState().activity.at(-1), "✓ agent turn settled", "index wiring forwards RPC observation events over the extension-lifetime Legion bus");
+		assert.deepEqual(liveOverlay.getState().activity, [
+			"▸ Task: create the first Legion tree",
+			"",
+			"## Frozen child constraints (injected by pi-legion)",
+			"- Do not spawn nested agents.",
+			'- End with machine-readable JSON on its own: {"ok": true|false, "reason": "..."}.',
+			"",
+			"· ui_request",
+			"✓ agent turn settled",
+		], "index wiring forwards RPC observation events over the extension-lifetime Legion bus");
 		liveOverlay.handleInput?.("\u001b");
 		await liveUi.calls[0]!.promise;
 
@@ -729,7 +746,56 @@ test("/legion backfills session history, polls stopped nodes for appends, then s
 		await harness.ui.calls[0]!.promise;
 		appendFileSync(sessionFile, [userMsg("after close"), assistantMsg({ text: "should not appear" })].join("\n") + "\n");
 		await new Promise((resolve) => setTimeout(resolve, 300));
-		assert.equal(state.getState().activity.at(-1), "⚙ write", "closed overlays do not continue polling the session file");
+		assert.deepEqual(state.getState().activity, [
+			"▸ first request",
+			"first response",
+			"⚙ read",
+			"▸ second request",
+			"second response",
+			"▸ third request",
+			"third response",
+			"▸ fourth request",
+			"fourth response",
+			"⚙ write",
+		], "closed overlays do not continue polling the session file");
+	} finally {
+		overlay?.dispose();
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+test("/legion backfill emits a same-turn assistant append once, without re-emitting the turn", async () => {
+	const cwd = mkdtempSync(path.join(tmpdir(), "legion-overlay-same-turn-"));
+	const sessionFile = path.join(cwd, "worker.jsonl");
+	writeFileSync(sessionFile, [
+		sessionHeader({ cwd }),
+		userMsg("draft the fix"),
+		assistantMsg({ text: "investigating", tools: ["read"], stopReason: "toolUse" }),
+		toolResult({ toolName: "read" }),
+	].join("\n") + "\n");
+	const nodes = [
+		makeNode("root", null, "root", 0),
+		{ ...makeNode("root.worker", "root", "worker", 1, "settled"), sessionFile },
+	];
+	const harness = commandHarness(nodes, []);
+	let overlay: LiveOverlayComponent | undefined;
+	try {
+		await harness.handler("worker", harness.ctx);
+		overlay = harness.ui.calls[0]?.component as LiveOverlayComponent | undefined;
+		assert.ok(overlay);
+		const state = overlay;
+		assert.deepEqual(state.getState().activity, ["▸ draft the fix", "investigating", "⚙ read"]);
+
+		// Same turn: turnCount stays at 1; only assistantMessageCount advances from 1 to 2.
+		appendFileSync(sessionFile, assistantMsg({ text: "final answer" }) + "\n");
+		const pollDeadline = Date.now() + 1_500;
+		while (state.getState().activity.at(-1) !== "final answer" && Date.now() < pollDeadline) {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+		assert.deepEqual(state.getState().activity, ["▸ draft the fix", "investigating", "⚙ read", "final answer"]);
+
+		state.close();
+		await harness.ui.calls[0]!.promise;
 	} finally {
 		overlay?.dispose();
 		rmSync(cwd, { recursive: true, force: true });
