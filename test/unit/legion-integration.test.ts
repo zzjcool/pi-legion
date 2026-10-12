@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -31,6 +32,9 @@ import {
 import type { LiveOverlayComponent } from "../../src/tui/live-overlay.ts";
 import type { TreeNodeSnapshot, TreeViewComponent } from "../../src/tui/tree-view.ts";
 import type { SupervisorEvent } from "../../src/supervisor/types.ts";
+
+// Unit tests run without Pi's host process, which normally initializes the theme.
+initTheme("dark");
 
 function agent(name = "worker", overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
@@ -133,6 +137,7 @@ test("index root launch creates one reusable ledger, child identity opens it, an
 	const pi = {
 		registerTool(tool: unknown) { const typed = tool as { name: string; execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }> }; tools.set(typed.name, typed); },
 		registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) { commands.set(name, command); },
+		getSettings() { return {}; },
 		registerMessageRenderer() {}, sendMessage() {},
 		events: { emit() {} },
 		on(name: string, handler: (...args: unknown[]) => unknown) { handlers.set(name, handler); },
@@ -170,7 +175,7 @@ test("index root launch creates one reusable ledger, child identity opens it, an
 		assert.deepEqual(supervisor.spawns.map((spawn) => spawn.input.env?.[LEGION_NODE_ID_ENV]), ["root.worker-0", "root.worker-1"]);
 		assert.ok(commands.has("legion"), "the extension registers its full-screen Legion command");
 		const liveUi = new FakeCommandUi();
-		await commands.get("legion")!.handler("worker-0", { hasUI: true, cwd, ui: liveUi });
+		await commands.get("legion")!.handler("worker-0", { hasUI: true, mode: "tui", cwd, ui: liveUi });
 		const liveOverlay = liveUi.calls[0]?.component as (Component & {
 			getState(): { activity: readonly string[] };
 		}) | undefined;
@@ -610,9 +615,10 @@ function commandHarness(
 		registerCommand(name: string, value: RegisteredLegionCommand) {
 			if (name === "legion") command = value;
 		},
+		getSettings() { return {}; },
 	};
 	registerLegionCommand(pi as never, { bus, runtime, supervisor: rpc });
-	const ctx = { hasUI: true, cwd: "/tmp", ui };
+	const ctx = { hasUI: true, mode: "tui", cwd: "/tmp", ui };
 	return {
 		bus,
 		rpc,
@@ -715,6 +721,8 @@ test("/legion backfills session history, polls stopped nodes for appends, then s
 		assert.ok(overlay);
 		const state = overlay;
 		assert.deepEqual(state.getState().activity, [
+			"▸ oldest request",
+			"oldest response",
 			"▸ first request",
 			"first response",
 			"⚙ read",
@@ -722,7 +730,8 @@ test("/legion backfills session history, polls stopped nodes for appends, then s
 			"second response",
 			"▸ third request",
 			"third response",
-		], "default history contains only the newest three turns");
+		], "opening the viewer renders the complete session transcript");
+		assert.equal(state.getState().itemCount, 9);
 
 		appendFileSync(sessionFile, [userMsg("fourth request"), assistantMsg({ text: "fourth response", tools: ["write"] })].join("\n") + "\n");
 		const pollDeadline = Date.now() + 1_500;
@@ -730,6 +739,8 @@ test("/legion backfills session history, polls stopped nodes for appends, then s
 			await new Promise((resolve) => setTimeout(resolve, 25));
 		}
 		assert.deepEqual(state.getState().activity, [
+			"▸ oldest request",
+			"oldest response",
 			"▸ first request",
 			"first response",
 			"⚙ read",
@@ -747,6 +758,8 @@ test("/legion backfills session history, polls stopped nodes for appends, then s
 		appendFileSync(sessionFile, [userMsg("after close"), assistantMsg({ text: "should not appear" })].join("\n") + "\n");
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		assert.deepEqual(state.getState().activity, [
+			"▸ oldest request",
+			"oldest response",
 			"▸ first request",
 			"first response",
 			"⚙ read",
@@ -785,6 +798,7 @@ test("/legion backfill emits a same-turn assistant append once, without re-emitt
 		assert.ok(overlay);
 		const state = overlay;
 		assert.deepEqual(state.getState().activity, ["▸ draft the fix", "investigating", "⚙ read"]);
+		assert.equal(state.getState().itemCount, 3);
 
 		// Same turn: turnCount stays at 1; only assistantMessageCount advances from 1 to 2.
 		appendFileSync(sessionFile, assistantMsg({ text: "final answer" }) + "\n");
@@ -819,6 +833,7 @@ test("/legion does not poll session history when the active node has a text-delt
 		const state = overlay;
 		const history = ["▸ existing request", "existing response"];
 		assert.deepEqual(state.getState().activity, history);
+		assert.equal(state.getState().itemCount, 2);
 		assert.deepEqual(harness.rpc.subscriptions.map(({ name, options }) => ({ name, options })), [
 			{ name: "worker", options: { includeTextDelta: true } },
 		]);
@@ -1034,6 +1049,7 @@ test("active Legion overlay consumes process-only lifecycle feed beside stored o
 		registerCommand(_name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
 			commandHandler = command.handler;
 		},
+		getSettings() { return {}; },
 	};
 	let commandHandler: ((args: string, ctx: unknown) => Promise<void>) | undefined;
 	registerLegionCommand(pi as never, {
@@ -1048,7 +1064,7 @@ test("active Legion overlay consumes process-only lifecycle feed beside stored o
 	});
 	const ui = new FakeCommandUi();
 	try {
-		await commandHandler!("worker-0", { hasUI: true, cwd: fx.rootDir, ui });
+		await commandHandler!("worker-0", { hasUI: true, mode: "tui", cwd: fx.rootDir, ui });
 		const overlay = ui.calls[0]?.component as (Component & { getState(): { activity: readonly string[] } }) | undefined;
 		assert.ok(overlay);
 		assert.deepEqual(activeSubscription?.options, { includeTextDelta: true });

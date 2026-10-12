@@ -1,5 +1,18 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { initTheme } from "@earendil-works/pi-coding-agent";
+import {
+	Key,
+	matchesKey,
+	stripTerminalSequences,
+	type OverlayHandle,
+} from "@earendil-works/pi-tui";
+import type {
+	AssistantMessage,
+	ToolResultMessage,
+	UserMessage,
+} from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	createLiveOverlay,
 	type LiveOverlayEvent,
@@ -8,7 +21,10 @@ import {
 	type LiveOverlaySubscription,
 	type LiveOverlaySource,
 } from "../../src/tui/live-overlay.ts";
-import type { OverlayHandle } from "@earendil-works/pi-tui";
+import { parseSessionMessages } from "../../src/tui/chat-items.ts";
+
+// Unit tests run without the host Pi process that normally initializes theme.
+initTheme("dark");
 
 class FakeOverlaySource implements LiveOverlaySource {
 	readonly listeners = new Map<LiveOverlaySubscription, { nodeId: string; listener: LiveOverlayListener }>();
@@ -66,6 +82,115 @@ class FakeOverlaySource implements LiveOverlaySource {
 	}
 }
 
+function userMessage(text: string): AgentMessage {
+	return { role: "user", content: text, timestamp: 1 } satisfies UserMessage;
+}
+
+function assistantMessage(
+	text: string,
+	options: { stopReason?: AssistantMessage["stopReason"]; toolCallId?: string; toolName?: string } = {},
+): AgentMessage {
+	const content: AssistantMessage["content"] = [];
+	if (text) content.push({ type: "text", text });
+	if (options.toolCallId) {
+		content.push({
+			type: "toolCall",
+			id: options.toolCallId,
+			name: options.toolName ?? "read",
+			arguments: { path: "file.ts" },
+		});
+	}
+	return {
+		role: "assistant",
+		content,
+		api: "openai-completions",
+		provider: "openai",
+		model: "test/model",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: options.stopReason ?? "stop",
+		timestamp: 2,
+	} satisfies AssistantMessage;
+}
+
+function toolResult(toolCallId: string, text: string): AgentMessage {
+	return {
+		role: "toolResult",
+		toolCallId,
+		toolName: "read",
+		content: [{ type: "text", text }],
+		isError: false,
+		timestamp: 3,
+	} satisfies ToolResultMessage;
+}
+
+function messageEntry(message: Record<string, unknown>): string {
+	return JSON.stringify({ type: "message", message });
+}
+
+function sessionWithToolResult(): string {
+	return [
+		JSON.stringify({ type: "session", id: "sess-test", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/tmp" }),
+		messageEntry({ role: "user", content: "Review the implementation", timestamp: 1 }),
+		messageEntry({
+			role: "assistant",
+			content: [
+				{ type: "text", text: "Checking the source." },
+				{ type: "toolCall", id: "tool-call-1", name: "read", arguments: { path: "src/example.ts" } },
+			],
+			api: "openai-completions",
+			provider: "openai",
+			model: "test/model",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "toolUse",
+			timestamp: 2,
+		}),
+		messageEntry({
+			role: "toolResult",
+			toolCallId: "tool-call-1",
+			toolName: "read",
+			content: [{ type: "text", text: Array.from({ length: 12 }, (_, index) => `result line ${index + 1}`).join("\n") }],
+			isError: false,
+			timestamp: 3,
+		}),
+		messageEntry({
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "private reasoning" },
+				{ type: "text", text: "Here is the implementation:\n\n```typescript\nconst answer: number = 42;\n```" },
+			],
+			api: "openai-completions",
+			provider: "openai",
+			model: "test/model",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop",
+			timestamp: 4,
+		}),
+	].join("\n");
+}
+
+const cursor = (turnCount: number, assistantMessageCount: number, messageCount: number, fileSize: number) => ({
+	turnCount,
+	assistantMessageCount,
+	messageCount,
+	fileSize,
+});
+
+const keybindings = {
+	matches(data: string, id: string) {
+		return id === "app.tools.expand" && matchesKey(data, Key.ctrl("o"));
+	},
+	getKeys(id: string) {
+		return id === "app.tools.expand" ? [Key.ctrl("o")] : [];
+	},
+} as const;
+
 test("live overlay subscribes only when opened for the requested node and Esc unsubscribes", () => {
 	const source = new FakeOverlaySource();
 	const overlay = createLiveOverlay(source);
@@ -76,6 +201,7 @@ test("live overlay subscribes only when opened for the requested node and Esc un
 	assert.equal(source.subscribeCount, 1);
 	assert.equal(source.listeners.size, 1);
 	assert.equal([...source.listeners.values()][0]?.nodeId, "root.worker");
+	assert.match(component.render(80).join("\n"), /No session yet\./);
 	let hideCount = 0;
 	const overlayHandle: OverlayHandle = {
 		hide() {
@@ -102,7 +228,7 @@ test("live overlay subscribes only when opened for the requested node and Esc un
 	assert.equal(overlay.getCurrent(), undefined);
 });
 
-test("live overlay streams text/tool/settled events into a bounded recent-activity window", () => {
+test("live overlay streams text/tool/settled events into a bounded recent-message view", () => {
 	const source = new FakeOverlaySource();
 	const overlay = createLiveOverlay(source);
 	const component = overlay.open("root.worker", { maxLines: 3, now: () => 5_000 });
@@ -129,7 +255,7 @@ test("live overlay streams text/tool/settled events into a bounded recent-activi
 		const rendered = component.render(100).join("\n");
 		assert.match(rendered, /worker \(worker\)/);
 		assert.match(rendered, /running/);
-		assert.match(rendered, /agent turn settled/);
+		assert.match(state.text, /hello world/);
 		assert.doesNotMatch(rendered, /ignored/);
 	} finally {
 		component.close();
@@ -158,11 +284,16 @@ test("opening a different node closes the old subscription, and done runs once o
 	assert.equal(doneCount, 2);
 });
 
-test("live overlay synchronously backfills safe activity before subscribing without requesting a render", () => {
+test("live overlay synchronously renders structured backfill before subscribing", () => {
 	const source = new FakeOverlaySource();
 	const overlay = createLiveOverlay(source);
 	const requestedTurns: number[] = [];
 	let requestRenderCount = 0;
+	const archived = [
+		userMessage("archived request"),
+		assistantMessage("archived answer", { toolCallId: "archived-tool" }),
+		toolResult("archived-tool", "archived output"),
+	];
 	const component = overlay.open("root.worker", {
 		maxBackfillTurns: 2,
 		backfill(nodeId, maxBackfillTurns) {
@@ -170,8 +301,8 @@ test("live overlay synchronously backfills safe activity before subscribing with
 			assert.equal(source.subscribeCount, 0, "history is loaded before the live event subscription");
 			requestedTurns.push(maxBackfillTurns);
 			return {
-				lines: ["▸ archived request", "\u001b[31marchived answer\u001b[0m", "⚙ read"],
-				cursor: { turnCount: 1, assistantMessageCount: 1, fileSize: 128 },
+				messages: archived,
+				cursor: cursor(1, 1, 3, 128),
 			};
 		},
 		requestRender() {
@@ -181,6 +312,7 @@ test("live overlay synchronously backfills safe activity before subscribing with
 	try {
 		assert.deepEqual(requestedTurns, [2]);
 		assert.deepEqual(component.getState().activity, ["▸ archived request", "archived answer", "⚙ read"]);
+		assert.equal(component.getState().itemCount, 3);
 		assert.equal(requestRenderCount, 0, "synchronous backfill is present on first render without scheduling another one");
 		assert.equal(source.subscribeCount, 1);
 	} finally {
@@ -188,13 +320,15 @@ test("live overlay synchronously backfills safe activity before subscribing with
 	}
 });
 
-test("live overlay polls non-RPC backfill, renders deltas, and stops polling when closed", async () => {
+test("live overlay polls structured non-RPC backfill and stops polling when closed", async () => {
 	const source = new FakeOverlaySource();
 	const stopPolling: string[] = [];
 	const originalSubscribe = source.subscribe.bind(source);
+	const existing = [userMessage("existing request"), assistantMessage("existing response")];
+	const appended = [userMessage("existing request"), assistantMessage("existing response"), assistantMessage("new response")];
 	source.backfill = () => ({
-		lines: ["▸ existing request"],
-		cursor: { turnCount: 1, assistantMessageCount: 1, fileSize: 128 },
+		messages: existing,
+		cursor: cursor(1, 1, 2, 128),
 	});
 	source.subscribe = (nodeId, listener) => {
 		const subscription = originalSubscribe(nodeId, listener);
@@ -202,8 +336,8 @@ test("live overlay polls non-RPC backfill, renders deltas, and stops polling whe
 			stopPolling.push("poll");
 			return stopPolling.length === 1
 				? {
-					lines: ["new response"],
-					cursor: { turnCount: 2, assistantMessageCount: 2, fileSize: 192 },
+					messages: appended,
+					cursor: cursor(1, 2, 3, 192),
 				}
 				: undefined;
 		};
@@ -216,18 +350,110 @@ test("live overlay polls non-RPC backfill, renders deltas, and stops polling whe
 		},
 	});
 	try {
-		assert.deepEqual(component.getState().activity, ["▸ existing request"]);
+		assert.deepEqual(component.getState().activity, ["▸ existing request", "existing response"]);
 		const deadline = Date.now() + 1_500;
 		while (stopPolling.length === 0 && Date.now() < deadline) {
 			await new Promise((resolve) => setTimeout(resolve, 25));
 		}
 		assert.equal(stopPolling.length, 1, "the file-backed source is polled on the 250ms interval");
-		assert.deepEqual(component.getState().activity, ["▸ existing request", "new response"]);
+		assert.deepEqual(component.getState().activity, ["▸ existing request", "existing response", "new response"]);
 		assert.equal(requestRenderCount, 1, "incremental backfill requests a render once");
 
 		component.close();
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		assert.equal(stopPolling.length, 1, "close clears the backfill interval");
+		assert.equal(source.unsubscribeCount, 1);
+	} finally {
+		component.close();
+	}
+});
+
+test("cursor regression is ignored without advancing or replaying old messages", async () => {
+	const source = new FakeOverlaySource();
+	const initial = [userMessage("request"), assistantMessage("first answer")];
+	const complete = [...initial, assistantMessage("second answer")];
+	let polls = 0;
+	source.backfill = () => ({ messages: initial, cursor: cursor(1, 1, 2, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = (currentCursor) => {
+			polls++;
+			assert.equal(currentCursor.messageCount, 2, "a regressed message count cannot move the cursor");
+			if (polls === 1) {
+				return { messages: [userMessage("request")], cursor: cursor(1, 0, 1, 64) };
+			}
+			return { messages: complete, cursor: cursor(1, 2, 3, 192) };
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker");
+	try {
+		const deadline = Date.now() + 1_500;
+		while (polls < 1 && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1);
+		assert.deepEqual(component.getState().activity, ["▸ request", "first answer"]);
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		assert.ok(polls >= 2);
+		assert.deepEqual(component.getState().activity, ["▸ request", "first answer", "second answer"]);
+		assert.equal(component.getState().cursor?.messageCount, 3);
+	} finally {
+		component.close();
+	}
+});
+
+test("session messages render with Pi user background, markdown highlighting, and tool results", () => {
+	const source = new FakeOverlaySource();
+	source.backfill = () => {
+		const messages = parseSessionMessages(sessionWithToolResult());
+		return { messages, cursor: cursor(1, 2, messages.length, 1_024) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", {
+		terminalRows: 40,
+		settings: { hideThinkingBlock: true },
+	});
+	try {
+		const rendered = component.render(100).join("\n");
+		assert.match(stripTerminalSequences(rendered), /Review the implementation/);
+		assert.match(stripTerminalSequences(rendered), /read/);
+		assert.match(stripTerminalSequences(rendered), /Thinking\.\.\./);
+		assert.doesNotMatch(stripTerminalSequences(rendered), /private reasoning/);
+		assert.match(stripTerminalSequences(rendered), /result line 1/);
+		assert.match(rendered, /\u001b\[[0-9;]*48;/, "user message has the Pi user-message background ANSI style");
+		assert.match(rendered, /\u001b\[[0-9;]*38;/, "markdown syntax highlighting emits ANSI foreground colors");
+		const codeLineIndex = stripTerminalSequences(rendered).split("\n").findIndex((line) => line.includes("const answer"));
+		assert.ok(codeLineIndex >= 0 && rendered.split("\n")[codeLineIndex]?.includes("\u001b["), "the fenced code line itself is syntax-highlighted with ANSI colors");
+		assert.equal(component.getState().itemCount, 4, "tool result updates its tool component instead of adding a component");
+	} finally {
+		component.close();
+	}
+});
+
+test("ctrl+o expands tools, pgdn scrolls, and Esc closes the viewer", () => {
+	const source = new FakeOverlaySource();
+	source.backfill = () => {
+		const messages = parseSessionMessages(sessionWithToolResult());
+		return { messages, cursor: cursor(1, 2, messages.length, 1_024) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", {
+		terminalRows: 4,
+		keybindings: keybindings as never,
+	});
+	try {
+		const collapsed = component.getState().text;
+		assert.match(collapsed, /more lines/);
+		assert.doesNotMatch(collapsed, /result line 12/);
+		component.handleInput?.("\u000f");
+		const expanded = component.getState().text;
+		assert.notEqual(expanded, collapsed);
+		assert.match(expanded, /result line 12/);
+
+		component.handleInput?.("g");
+		assert.equal(component.getState().scrollTop, 0);
+		component.handleInput?.("\u001b[6~");
+		assert.ok(component.getState().scrollTop > 0, "PageDown moves the self-managed transcript viewport");
+		component.handleInput?.("\u001b");
+		assert.equal(component.getState().open, false);
 		assert.equal(source.unsubscribeCount, 1);
 	} finally {
 		component.close();

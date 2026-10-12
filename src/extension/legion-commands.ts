@@ -1,9 +1,10 @@
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { matchesKey, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	createLiveOverlay,
 	createLiveOverlayFactory,
@@ -14,6 +15,10 @@ import {
 	type LiveOverlaySource,
 	type LiveOverlaySubscription,
 } from "../tui/live-overlay.ts";
+import {
+	parseSessionMessages,
+	type ChatItemSettings,
+} from "../tui/chat-items.ts";
 import {
 	createTreeViewFactory,
 	type TreeNodeSnapshot,
@@ -29,8 +34,7 @@ import type {
 	EventSubscriptionOptions,
 	SupervisorEvent,
 } from "../supervisor/types.ts";
-import { countAssistantMessages, parseSessionFile } from "../shared/session.ts";
-import type { ParsedSession } from "../shared/types.ts";
+import { countAssistantMessages, parseSessionText } from "../shared/session.ts";
 
 export const LEGION_COMMAND = "legion";
 
@@ -155,30 +159,18 @@ function resolveNode(
 	return matches.length === 1 ? matches[0] : undefined;
 }
 
-function sessionActivityLines(
-	parsed: ParsedSession,
-	options: { startTurnIndex?: number; cursor?: LiveOverlayBackfillCursor } = {},
-): string[] {
-	const lines: string[] = [];
-	const startTurnIndex = options.startTurnIndex ?? 0;
-	let assistantMessageIndex = 0;
-	for (const [turnIndex, turn] of parsed.turns.entries()) {
-		const isNewTurn = options.cursor
-			? turnIndex >= options.cursor.turnCount
-			: turnIndex >= startTurnIndex;
-		if (isNewTurn && turn.userText.length > 0) lines.push(`▸ ${turn.userText}`);
-		for (const assistant of turn.assistants) {
-			const isNewAssistant = options.cursor
-				? assistantMessageIndex >= options.cursor.assistantMessageCount
-				: turnIndex >= startTurnIndex;
-			if (isNewAssistant) {
-				if (assistant.text) lines.push(assistant.text);
-				for (const toolName of assistant.tools) lines.push(`⚙ ${toolName}`);
-			}
-			assistantMessageIndex++;
-		}
-	}
-	return lines;
+function sessionCursor(
+	messages: readonly AgentMessage[],
+	sessionText: string,
+	fileSize: number,
+): LiveOverlayBackfillCursor {
+	const parsed = parseSessionText(sessionText);
+	return {
+		turnCount: parsed.turns.length,
+		assistantMessageCount: countAssistantMessages(parsed),
+		messageCount: messages.length,
+		fileSize,
+	};
 }
 
 function readSessionSize(sessionFile: string): number | undefined {
@@ -189,29 +181,21 @@ function readSessionSize(sessionFile: string): number | undefined {
 	}
 }
 
-function sessionCursor(parsed: ParsedSession, fileSize: number): LiveOverlayBackfillCursor {
-	return {
-		turnCount: parsed.turns.length,
-		assistantMessageCount: countAssistantMessages(parsed),
-		fileSize,
-	};
-}
-
 function readSessionBackfill(
 	sessionFile: string,
-	maxBackfillTurns: number,
+	_maxBackfillTurns: number,
 ): LiveOverlayBackfillResult | undefined {
 	// Take the size before parsing: if the append-only file grows during the
 	// parse, the next poll sees that newer size and can safely re-read it.
 	const fileSize = readSessionSize(sessionFile);
 	if (fileSize === undefined) return undefined;
-	const parsed = parseSessionFile(sessionFile);
-	return {
-		lines: sessionActivityLines(parsed, {
-			startTurnIndex: Math.max(0, parsed.turns.length - maxBackfillTurns),
-		}),
-		cursor: sessionCursor(parsed, fileSize),
-	};
+	try {
+		const sessionText = readFileSync(sessionFile, "utf8");
+		const messages = parseSessionMessages(sessionText);
+		return { messages, cursor: sessionCursor(messages, sessionText, fileSize) };
+	} catch {
+		return undefined;
+	}
 }
 
 function readSessionDelta(
@@ -221,21 +205,27 @@ function readSessionDelta(
 	// The append-only JSONL file is only reparsed after its byte size changes.
 	const fileSize = readSessionSize(sessionFile);
 	if (fileSize === undefined || fileSize === cursor.fileSize) return undefined;
-	const parsed = parseSessionFile(sessionFile);
-	const nextAssistantMessageCount = countAssistantMessages(parsed);
-	if (
-		parsed.turns.length < cursor.turnCount ||
-		nextAssistantMessageCount < cursor.assistantMessageCount
-	) {
-		// Do not move a monotonic cursor backwards if a concurrent partial write is unreadable.
+	let sessionText: string;
+	let messages: ReturnType<typeof parseSessionMessages>;
+	try {
+		sessionText = readFileSync(sessionFile, "utf8");
+		messages = parseSessionMessages(sessionText);
+	} catch {
 		return undefined;
 	}
-	// Parsed turn/message counts are stable positions in the append-only JSONL:
-	// render only turns/messages at or beyond them, so each appended record is emitted once.
-	return {
-		lines: sessionActivityLines(parsed, { cursor }),
-		cursor: sessionCursor(parsed, fileSize),
-	};
+	const nextCursor = sessionCursor(messages, sessionText, fileSize);
+	if (
+		nextCursor.messageCount < cursor.messageCount ||
+		nextCursor.turnCount < cursor.turnCount ||
+		nextCursor.assistantMessageCount < cursor.assistantMessageCount ||
+		fileSize < cursor.fileSize
+	) {
+		// Do not move a monotonic cursor backwards during a concurrent partial write.
+		return undefined;
+	}
+	// Return the full parsed transcript; the viewer compares the message cursor
+	// and appends only new entries. This covers assistant appends within a turn.
+	return { messages, cursor: nextCursor };
 }
 
 function liveNode(
@@ -251,6 +241,8 @@ function liveNode(
 		updatedAt: node.updatedAt,
 		...(node.turn === undefined ? {} : { turn: node.turn }),
 		...(node.turns === undefined ? {} : { turns: node.turns }),
+		sessionFile: node.sessionFile,
+		worktreePath: node.worktreePath,
 	};
 }
 
@@ -332,12 +324,26 @@ function notify(ctx: ExtensionCommandContext, message: string, level: "info" | "
 	ctx.ui.notify(message, level);
 }
 
+function viewerSettings(settings: ReturnType<ExtensionAPI["getSettings"]>): ChatItemSettings {
+	return {
+		outputPad: settings.outputPad,
+		hideThinkingBlock: settings.hideThinkingBlock,
+		codeBlockIndent: settings.markdown?.codeBlockIndent,
+		showImages: settings.terminal?.showImages,
+		imageWidthCells: settings.terminal?.imageWidthCells,
+	};
+}
+
 function openLiveOverlay(
+	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	controller: ReturnType<typeof createLiveOverlay>,
 	nodeId: string,
 ): void {
-	const factory = createLiveOverlayFactory(controller, nodeId);
+	const factory = createLiveOverlayFactory(controller, nodeId, {
+		cwd: ctx.cwd,
+		settings: viewerSettings(pi.getSettings()),
+	});
 	void ctx.ui.custom(factory, {
 		overlay: true,
 		onHandle: (handle) => controller.getCurrent()?.attachOverlayHandle(handle),
@@ -352,6 +358,7 @@ export function registerLegionCommand(
 	deps: LegionCommandDeps,
 ): void {
 	const liveOverlay = createLiveOverlay(treeForLiveSource(deps));
+	let warnedNonTui = false;
 
 	pi.registerCommand(LEGION_COMMAND, {
 		description: "Open the Legion tree, or inspect one node with /legion <name>",
@@ -368,8 +375,11 @@ export function registerLegionCommand(
 				}));
 		},
 		async handler(args, ctx) {
-			if (!ctx.hasUI) {
-				notify(ctx, "/legion requires an interactive UI", "warning");
+			if (ctx.mode !== "tui") {
+				if (!warnedNonTui) {
+					warnedNonTui = true;
+					notify(ctx, "/legion is available only in TUI mode", "warning");
+				}
 				return;
 			}
 			const query = args.trim();
@@ -389,7 +399,7 @@ export function registerLegionCommand(
 					);
 					return;
 				}
-				openLiveOverlay(ctx, liveOverlay, node.id);
+				openLiveOverlay(pi, ctx, liveOverlay, node.id);
 				return;
 			}
 
@@ -414,7 +424,7 @@ export function registerLegionCommand(
 						handleInput(data) {
 							if (!tree.getState().searchMode && matchesKey(data, "o")) {
 								const selectedId = tree.getState().selectedId;
-								if (selectedId) openLiveOverlay(ctx, liveOverlay, selectedId);
+								if (selectedId) openLiveOverlay(pi, ctx, liveOverlay, selectedId);
 								return;
 							}
 							tree.handleInput?.(data);
@@ -423,7 +433,7 @@ export function registerLegionCommand(
 							const result = tree.handleMouse?.(event);
 							if (event.type === "click" && event.button === "left" && result?.handled) {
 								const selectedId = tree.getState().selectedId;
-								if (selectedId) openLiveOverlay(ctx, liveOverlay, selectedId);
+								if (selectedId) openLiveOverlay(pi, ctx, liveOverlay, selectedId);
 							}
 							return result;
 						},
