@@ -298,9 +298,8 @@ function treeForLiveSource(
 				textDeltaFeed.unsubscribe();
 				for (const unsubscribe of busUnsubscribers) unsubscribe();
 			}) as LiveOverlaySubscription;
-			// The RPC feed is authoritative for an active job; its subscription and
-			// session-file polling are mutually exclusive to prevent double output.
-			if (!textDeltaFeed.subscribed && currentNode?.sessionFile) {
+			// Keep session-file backfill alongside RPC deltas; the viewer reconciles overlap.
+			if (currentNode?.sessionFile) {
 				subscription.pollBackfill = (cursor) => readSessionDelta(currentNode.sessionFile!, cursor);
 			}
 			return subscription;

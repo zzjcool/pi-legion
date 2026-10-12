@@ -818,7 +818,7 @@ test("/legion backfill emits a same-turn assistant append once, without re-emitt
 	}
 });
 
-test("/legion does not poll session history when the active node has a text-delta RPC feed", async () => {
+test("/legion active text-delta sessions render session-file messages as they land", async () => {
 	const cwd = mkdtempSync(path.join(tmpdir(), "legion-overlay-active-"));
 	const sessionFile = path.join(cwd, "worker.jsonl");
 	writeFileSync(sessionFile, [sessionHeader({ cwd }), userMsg("existing request"), assistantMsg({ text: "existing response" })].join("\n") + "\n");
@@ -840,16 +840,26 @@ test("/legion does not poll session history when the active node has a text-delt
 			{ name: "worker", options: { includeTextDelta: true } },
 		]);
 
-		appendFileSync(sessionFile, [userMsg("RPC-owned request"), assistantMsg({ text: "disk content must not be polled" })].join("\n") + "\n");
-		await new Promise((resolve) => setTimeout(resolve, 350));
-		assert.deepEqual(state.getState().activity, history, "active text-delta sessions do not duplicate session-file activity");
 		harness.rpc.emit("worker", {
 			name: "worker",
 			type: "message_update",
 			updateType: "text_delta",
-			delta: "live RPC output",
+			delta: "RPC-owned reply",
 		});
-		assert.deepEqual(state.getState().activity, [...history, "live RPC output"]);
+		assert.equal(state.getState().streamingText, "RPC-owned reply");
+		appendFileSync(sessionFile, [userMsg("RPC-owned request"), assistantMsg({ text: "RPC-owned reply" })].join("\n") + "\n");
+		await new Promise((resolve) => setTimeout(resolve, 350));
+
+		const rendered = state.getState().text;
+		assert.match(rendered, /RPC-owned request/, "session-file user messages appear on the active polling interval");
+		assert.equal(rendered.split("RPC-owned reply").length - 1, 1, "the disk assistant replaces its streamed duplicate");
+		assert.equal(state.getState().streamingText, "");
+
+		state.close();
+		await harness.ui.calls[0]!.promise;
+		appendFileSync(sessionFile, [userMsg("after close"), assistantMsg({ text: "should not appear" })].join("\n") + "\n");
+		await new Promise((resolve) => setTimeout(resolve, 350));
+		assert.doesNotMatch(state.getState().text, /after close/, "closed viewers stop polling session-file changes");
 	} finally {
 		overlay?.handleInput?.("\u001b");
 		if (harness.ui.calls[0]) await harness.ui.calls[0].promise;
