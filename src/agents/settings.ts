@@ -521,7 +521,7 @@ function overrideFieldExpected(field: string): string | undefined {
 	if (field === "kind") return `one of: ${AGENT_KINDS.join(", ")}`;
 	if (field === "onBlocked") return "a valid onBlocked policy";
 	if (field === "systemPromptMode") return "replace or append";
-	if (["inheritProjectContext", "inheritSkills", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "disabled", "worktree", "steer"].includes(field)) return "a boolean";
+	if (["inheritProjectContext", "inheritSkills", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer"].includes(field)) return "a boolean";
 	if (["timeoutMs", "toolTimeoutMs", "maxSubagentDepth"].includes(field)) return "a number";
 	if (field === "skills") return "an array of strings or false";
 	if (["tools", "extensions", "subagentOnlyExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return "an array of strings";
@@ -534,7 +534,7 @@ function isValidOverrideField(field: string, value: unknown): boolean {
 	if (field === "kind") return typeof value === "string" && (AGENT_KINDS as readonly string[]).includes(value);
 	if (field === "onBlocked") return typeof value === "string" && VALID_ON_BLOCKED_POLICIES.has(value);
 	if (field === "systemPromptMode") return value === "replace" || value === "append";
-	if (["inheritProjectContext", "inheritSkills", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "disabled", "worktree", "steer"].includes(field)) return typeof value === "boolean";
+	if (["inheritProjectContext", "inheritSkills", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer"].includes(field)) return typeof value === "boolean";
 	if (["timeoutMs", "toolTimeoutMs", "maxSubagentDepth"].includes(field)) return typeof value === "number";
 	if (field === "skills") return value === false || isStringArray(value);
 	if (["tools", "extensions", "subagentOnlyExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return isStringArray(value);
@@ -598,6 +598,11 @@ function parseAgentOverrides(
 		}
 		const normalized: Record<string, unknown> = { ...override };
 		delete normalized.placement;
+		if (normalized.utility !== undefined && typeof normalized.utility !== "boolean") {
+			throw new Error(
+				`Subagent settings in '${filePath}' have invalid 'agentOverrides.${name}.utility'; expected a boolean.`,
+			);
+		}
 		parsed[name] = normalized as AgentOverride;
 	}
 	return parsed;

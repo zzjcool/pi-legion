@@ -14,6 +14,7 @@ export const PARENT_PLAYBOOK = [
 	"4. Later control is only through `subagent({ action, name, message })`. Do not tell a child to message or prompt the parent directly.",
 	"5. A collect timeout with a live RPC child is a progress signal, not a verdict. Check status or session JSONL before deciding to steer or resume.",
 	"6. Isolation is YOUR call. Pass `worktree: true` when another parent may write this repo or the child must ship via MR; pass `worktree: false` to share the checkout. Omit it for the role default.",
+	"Utility agents (`utility: true`, e.g. scout) can be dispatched by ANY role via the separate `vexillatio` tool — read-only helpers, always leaf, no depth budget. The `subagent` tool stays for the command chain (worker/centurion).",
 	"Forbidden: direct bash access to legion.db, hand-launching child Pi processes, or using herdr pane/tab/agent commands for dispatch.",
 ].join("\n");
 

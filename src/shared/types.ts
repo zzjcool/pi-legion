@@ -132,6 +132,7 @@ export interface AgentConfig {
 	completionGuard?: boolean;
 	maxSubagentDepth?: number;
 	allowNestedSubagents?: boolean;
+	utility?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	turnBudget?: TurnBudgetConfig;
 	disabled?: boolean;
