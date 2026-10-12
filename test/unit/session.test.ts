@@ -302,3 +302,30 @@ test("parseSessionText never throws on hostile input", () => {
 		);
 	}
 });
+
+test("turn records capture user/assistant message timestamps (current-turn elapsed)", () => {
+	const parsed = parseLines(
+		userMsg("first", { timestamp: 1_000 }),
+		assistantMsg({ stopReason: "stop", text: "ok", timestamp: 2_500 }),
+		userMsg("second", { timestamp: 10_000 }),
+		assistantMsg({ stopReason: "toolUse", tools: ["bash"], timestamp: 11_000 }),
+	);
+	assert.equal(parsed.turns[0]?.startedAt, 1_000);
+	assert.equal(parsed.turns[0]?.endedAt, 2_500);
+	assert.equal(parsed.turns[1]?.startedAt, 10_000);
+	assert.equal(parsed.turns[1]?.endedAt, 11_000);
+});
+
+test("turn timestamps fall back to the ISO entry timestamp, then stay absent", () => {
+	const iso = JSON.stringify({
+		type: "message",
+		timestamp: "2024-12-03T14:00:01.000Z",
+		message: { role: "user", content: "entry ts only" },
+	});
+	const fromEntry = parseLines(iso);
+	assert.equal(fromEntry.turns[0]?.startedAt, Date.parse("2024-12-03T14:00:01.000Z"));
+
+	const bare = parseLines(userMsg("no timestamps at all"));
+	assert.equal(bare.turns[0]?.startedAt, undefined);
+	assert.equal(bare.turns[0]?.endedAt, undefined);
+});

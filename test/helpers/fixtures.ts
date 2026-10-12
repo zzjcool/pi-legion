@@ -36,9 +36,16 @@ export function modelChange(model: string): string {
 	return JSON.stringify({ type: "model_change", model, provider: model.split("/")[0] ?? "test" });
 }
 
-/** User message opening a turn. */
-export function userMsg(text: string): string {
-	return JSON.stringify({ type: "message", message: { role: "user", content: text } });
+/** User message opening a turn. `timestamp` is Unix ms (session-format.md). */
+export function userMsg(text: string, opts?: { timestamp?: number }): string {
+	return JSON.stringify({
+		type: "message",
+		message: {
+			role: "user",
+			content: text,
+			...(opts?.timestamp !== undefined ? { timestamp: opts.timestamp } : {}),
+		},
+	});
 }
 
 export interface AssistantMsgOptions {
@@ -48,6 +55,7 @@ export interface AssistantMsgOptions {
 	errorMessage?: string;
 	model?: string;
 	usage?: FixtureUsage;
+	timestamp?: number;
 }
 
 /** Assistant message; `content` mixes text parts and toolCall parts. */
@@ -71,6 +79,7 @@ export function assistantMsg(opts: AssistantMsgOptions = {}): string {
 			errorMessage: opts.errorMessage,
 			model: opts.model ?? "test/glm-5.3-flash",
 			usage,
+			...(opts.timestamp !== undefined ? { timestamp: opts.timestamp } : {}),
 		},
 	});
 }

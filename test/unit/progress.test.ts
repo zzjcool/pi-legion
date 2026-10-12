@@ -60,6 +60,40 @@ test("progressFromSession: a finished text turn does not keep stale tools", () =
 	assert.equal(live.lastTools, undefined);
 });
 
+test("progressFromSession: in-flight turn exposes its start timestamp", () => {
+	const parsed = parseSessionText(
+		[
+			userMsg("first", { timestamp: 1_000 }),
+			assistantMsg({ stopReason: "stop", text: "ok", timestamp: 2_000 }),
+			userMsg("second", { timestamp: 10_000 }),
+			assistantMsg({ stopReason: "toolUse", tools: ["bash"], timestamp: 11_000 }),
+		].join("\n"),
+	);
+	assert.deepEqual(progressFromSession(parsed), {
+		model: "test/glm-5.3-flash",
+		turns: 2,
+		lastTools: ["bash"],
+		currentTurnStartedAt: 10_000,
+	});
+});
+
+test("progressFromSession: a settled last turn has no current-turn start", () => {
+	const parsed = parseSessionText(
+		[
+			userMsg("go", { timestamp: 1_000 }),
+			assistantMsg({ stopReason: "stop", text: "done", timestamp: 9_000 }),
+		].join("\n"),
+	);
+	assert.equal(progressFromSession(parsed).currentTurnStartedAt, undefined);
+});
+
+test("progressFromSession: timestamps are absent when the session omits them", () => {
+	const parsed = parseSessionText(
+		[userMsg("go"), assistantMsg({ stopReason: "toolUse", tools: ["bash"] })].join("\n"),
+	);
+	assert.equal(progressFromSession(parsed).currentTurnStartedAt, undefined);
+});
+
 test("mergeProgress: later sources win, empty parts do not clobber", () => {
 	assert.deepEqual(
 		mergeProgress(
@@ -73,4 +107,11 @@ test("mergeProgress: later sources win, empty parts do not clobber", () => {
 			turns: 3,
 		},
 	);
+});
+
+test("mergeProgress: currentTurnStartedAt merges like other fields", () => {
+	const merged = mergeProgress({ currentTurnStartedAt: 1_000 }, {}, { currentTurnStartedAt: 5_000 });
+	assert.equal(merged.currentTurnStartedAt, 5_000);
+	const kept = mergeProgress({ currentTurnStartedAt: 1_000 }, {});
+	assert.equal(kept.currentTurnStartedAt, 1_000);
 });

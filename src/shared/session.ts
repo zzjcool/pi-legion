@@ -119,6 +119,26 @@ function accumulateUsage(
 	target.cost += num(cost?.total);
 }
 
+/**
+ * Turn-boundary timestamps for the current-turn elapsed display.
+ *
+ * The nested message `timestamp` is Unix ms (session-format.md); fall back to
+ * the ISO 8601 entry timestamp for entries written without the nested value.
+ */
+function messageTimestamp(
+	event: Record<string, unknown>,
+	message: Record<string, unknown>,
+): number | undefined {
+	const inner = message.timestamp;
+	if (typeof inner === "number" && Number.isFinite(inner)) return inner;
+	const outer = event.timestamp;
+	if (typeof outer === "string") {
+		const ms = Date.parse(outer);
+		if (Number.isFinite(ms)) return ms;
+	}
+	return undefined;
+}
+
 /** Find (or create) the turn an assistant/toolResult message belongs to. */
 function currentTurn(parsed: ParsedSession): TurnRecord {
 	const existing = parsed.turns.at(-1);
@@ -136,6 +156,7 @@ function currentTurn(parsed: ParsedSession): TurnRecord {
 function applyAssistant(
 	parsed: ParsedSession,
 	message: Record<string, unknown>,
+	timestamp?: number,
 ): void {
 	const turn = currentTurn(parsed);
 	const stopReason = asStopReason(message.stopReason);
@@ -151,6 +172,7 @@ function applyAssistant(
 		text,
 		tools: toolsOf(message.content),
 	});
+	if (timestamp !== undefined) turn.endedAt = timestamp;
 
 	accumulateUsage(parsed.usage, message);
 	if (typeof message.model === "string") parsed.model = message.model;
@@ -251,10 +273,13 @@ function applyEvent(
 				assistants: [],
 				toolResults: 0,
 				toolErrors: 0,
+				...(messageTimestamp(event, message) !== undefined
+					? { startedAt: messageTimestamp(event, message) }
+					: {}),
 			});
 			break;
 		case "assistant":
-			applyAssistant(parsed, message);
+			applyAssistant(parsed, message, messageTimestamp(event, message));
 			break;
 		case "toolResult":
 		case "tool":

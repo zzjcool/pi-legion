@@ -24,6 +24,8 @@ export interface TreeNodeSnapshot extends LegionNode {
 	turns?: number;
 	tools?: readonly string[];
 	lastTools?: readonly string[];
+	/** Unix ms start of the current turn, when known (bus events or snapshots). */
+	turnStartedAt?: number;
 }
 
 export interface TreeViewTheme {
@@ -244,13 +246,31 @@ export function createTreeView(
 	function rowDetail(node: TreeNodeSnapshot, isSelected: boolean): string {
 		const info = activity.get(node.id);
 		const turn = info?.turn ?? node.turn ?? node.turns;
+		const turnStartedAt = info?.turnStartedAt ?? node.turnStartedAt;
 		const tools = info?.tools.length ? info.tools : node.lastTools ?? node.tools ?? [];
 		const detail = [safeText(info?.phase ?? node.phase ?? node.status)];
-		if (turn !== undefined && turn > 0) detail.push(`turn ${turn}`);
+		if (turn !== undefined && turn > 0) {
+			const turnSuffix = formatTurnElapsed(turnStartedAt, node);
+			detail.push(`turn ${turn}${turnSuffix ? ` (${turnSuffix})` : ""}`);
+		}
 		if (tools.length > 0) {
 			detail.push(tools.slice(-MAX_ACTIVITY_TOOLS).map((tool) => safeText(tool)).join(", "));
 		}
 		return `${"  ".repeat(Math.max(0, node.depth))}${isSelected ? "│" : " "}   ⎿ ${detail.join(" · ")}`;
+	}
+
+	/**
+	 * Current-turn elapsed for the tree detail line: live while the node runs,
+	 * frozen at the node's terminal transition once it settles.
+	 */
+	function formatTurnElapsed(
+		turnStartedAt: number | undefined,
+		node: TreeNodeSnapshot,
+	): string | undefined {
+		if (turnStartedAt === undefined) return undefined;
+		const end = TERMINAL_STATUSES.has(node.status) ? node.updatedAt : now();
+		if (end < turnStartedAt) return undefined;
+		return `${Math.max(0, Math.round((end - turnStartedAt) / 1_000))}s`;
 	}
 
 	function findMatches(): string[] {
@@ -605,7 +625,15 @@ export function createTreeView(
 					typeof data?.turn === "number"
 						? data.turn
 						: (details.turn ?? current.turn ?? current.turns ?? 0) + 1;
+				details.turnStartedAt = event.ts;
 				changed = true;
+				break;
+			case "agent_settled":
+				// The in-flight turn is over; stop timing it. Turn count stays.
+				if (details.turnStartedAt !== undefined) {
+					details.turnStartedAt = undefined;
+					changed = true;
+				}
 				break;
 			case "tool_call": {
 				const toolName = stringField(data, "toolName") ?? stringField(data, "name");
@@ -751,6 +779,7 @@ export function createTreeViewFactory(options: TreeViewOptions) {
 
 interface TreeActivity {
 	turn?: number;
+	turnStartedAt?: number;
 	phase?: string;
 	tools: string[];
 }

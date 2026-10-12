@@ -251,6 +251,47 @@ test("formatWidgetLines adds model, thinking, kind, tools, and worktree", () => 
 	);
 });
 
+test("formatWidgetLines appends current-turn elapsed for live in-flight turns", () => {
+	assert.deepEqual(
+		formatWidgetLines(
+			[
+				{
+					name: "worker-0",
+					agent: "worker",
+					state: "working",
+					startedAt: 1_000,
+					turns: 4,
+					currentTurnStartedAt: 4_213_000,
+				},
+			],
+			5_000_000,
+		),
+		[
+			"● worker-0 (worker) · 4999s",
+			"  ⎿  working · turn 4 (787s)",
+		],
+	);
+});
+
+test("formatWidgetLines omits current-turn elapsed without a start, once settled, or for terminal entries", () => {
+	const cases: Array<{ entry: Parameters<typeof formatWidgetLines>[0][number]; label: string }> = [
+		{ label: "no turn start", entry: { name: "w", agent: "worker", state: "working", startedAt: 0, turns: 2 } },
+		{ label: "settled turn", entry: { name: "w", agent: "worker", state: "working", startedAt: 0, turns: 2, currentTurnStartedAt: undefined } },
+		{ label: "terminal node", entry: { name: "w", agent: "worker", state: "settled", startedAt: 0, finishedAt: 1_000, turns: 2, currentTurnStartedAt: 0 } },
+	];
+	for (const { entry, label } of cases) {
+		const lines = formatWidgetLines([entry], 5_000_000).join("\n");
+		assert.doesNotMatch(lines, /turn \d+ \(/, `${label}: no elapsed suffix expected`);
+		assert.match(lines, /turn 2/, `${label}: turn count stays`);
+	}
+	// Clock skew clamps to zero instead of going negative.
+	const skewed = formatWidgetLines(
+		[{ name: "w", agent: "worker", state: "working", startedAt: 0, turns: 2, currentTurnStartedAt: 9_999_999 }],
+		5_000_000,
+	).join("\n");
+	assert.match(skewed, /turn 2 \(0s\)/);
+});
+
 test("applyStatus paints above the editor and in the footer", () => {
 	const widgets: unknown[] = [];
 	const statuses: unknown[] = [];

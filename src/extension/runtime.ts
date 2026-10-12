@@ -192,7 +192,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const finished = new Map<string, CollectSnapshot>();
 	const board = createStatusBoard();
 	const tree = new Map<string, TreeNodeSnapshot>();
-	const activity = new Map<string, { turn?: number; tools: string[] }>();
+	const activity = new Map<string, { turn?: number; turnStartedAt?: number; tools: string[] }>();
 	const eventOverrides = new Map<string, { ts: number; status?: TreeNodeSnapshot["status"]; phase?: string }>();
 	let ledgerDb: DatabaseSync | undefined;
 	let dbEventSource: DbEventSource | undefined;
@@ -393,7 +393,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		if (event.type === "turn_start") {
 			const current = activity.get(event.nodeId) ?? { tools: [] };
 			current.turn = typeof data?.turn === "number" ? data.turn : (current.turn ?? 0) + 1;
+			current.turnStartedAt = event.ts;
 			activity.set(event.nodeId, current);
+		} else if (event.type === "agent_settled") {
+			// The in-flight turn is over; drop its start so the widget stops
+			// timing a turn that has already settled.
+			const current = activity.get(event.nodeId);
+			if (current) current.turnStartedAt = undefined;
 		} else if (event.type === "tool_call") {
 			const current = activity.get(event.nodeId) ?? { tools: [] };
 			const toolName = typeof data?.toolName === "string" ? data.toolName : typeof data?.name === "string" ? data.name : undefined;
@@ -884,6 +890,9 @@ function statusEntryFromJob(
 		...(job.worktreeBranch ? { worktreeBranch: job.worktreeBranch } : {}),
 		...(live.turns ? { turns: live.turns } : {}),
 		...(live.lastTools?.length ? { lastTools: live.lastTools } : {}),
+		...(live.currentTurnStartedAt !== undefined
+			? { currentTurnStartedAt: live.currentTurnStartedAt }
+			: {}),
 		...(identity ? {
 			nodeId: identity.nodeId,
 			parentId: identity.parentId,
@@ -894,7 +903,7 @@ function statusEntryFromJob(
 
 function statusEntryFromNode(
 	node: LegionNode,
-	activity?: { turn?: number; tools: string[] },
+	activity?: { turn?: number; turnStartedAt?: number; tools: string[] },
 ): StatusEntry {
 	return {
 		name: node.name,
@@ -908,6 +917,7 @@ function statusEntryFromNode(
 		...(node.kind ? { kind: node.kind } : {}),
 		...(node.model ? { model: node.model } : {}),
 		...(activity?.turn !== undefined ? { turns: activity.turn } : {}),
+		...(activity?.turnStartedAt !== undefined ? { currentTurnStartedAt: activity.turnStartedAt } : {}),
 		...(activity?.tools.length ? { lastTools: activity.tools } : {}),
 		nodeId: node.id,
 		parentId: node.parentId,

@@ -389,6 +389,10 @@ export interface ParsedSession {
 
 export interface TurnRecord {
 	userText: string;
+	/** Unix ms timestamp of the user message that opened this turn, when written. */
+	startedAt?: number;
+	/** Unix ms timestamp of the last assistant message in this turn, when written. */
+	endedAt?: number;
 	assistants: Array<{
 		stopReason: StopReason | null;
 		/**

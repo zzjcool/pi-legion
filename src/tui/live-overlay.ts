@@ -198,6 +198,7 @@ function createSession(
 	let lastTextLine = -1;
 	const initialNode = source.getNode(nodeId);
 	let turn = initialNode?.turn ?? initialNode?.turns ?? 0;
+	let turnStartedAt: number | undefined;
 
 	const safeEventText = (value: unknown): string => {
 		if (typeof value !== "string") return "";
@@ -320,9 +321,12 @@ function createSession(
 				? event.data as Record<string, unknown>
 				: undefined;
 			turn = typeof data?.turn === "number" ? data.turn : turn + 1;
+			turnStartedAt = event.ts ?? now();
 			appendLine(`↻ turn ${turn}`);
 		} else if (eventType === "agent_settled" || eventType === "agent_end") {
 			// RPC turn completion is activity, not a Legion node lifecycle transition.
+			// The timed turn is over; stop counting it as "current".
+			turnStartedAt = undefined;
 			appendLine("✓ agent turn settled");
 		} else if (eventType !== "message_update") {
 			appendLine(`· ${safeEventText(eventType)}`);
@@ -357,10 +361,15 @@ function createSession(
 			const completed = status === "settled" || status === "failed" || status === "retired";
 			const elapsedEnd = completed ? node.updatedAt : now();
 			const elapsed = `${Math.max(0, Math.round((elapsedEnd - node.createdAt) / 1_000))}s`;
+			const turnNumber = turn || node.turn || node.turns || 0;
+			const turnElapsed = turnStartedAt !== undefined && !completed
+				? `${Math.max(0, Math.round((now() - turnStartedAt) / 1_000))}s`
+				: undefined;
+			const turnLabel = `turn ${turnNumber}${turnElapsed !== undefined ? ` (${turnElapsed})` : ""}`;
 			const details = [
 				`● ${safeEventText(node.name)} (${safeEventText(node.role)})`,
 				...(node.model ? [safeEventText(node.model)] : []),
-				`turn ${turn || node.turn || node.turns || 0}`,
+				turnLabel,
 				elapsed,
 				status,
 			];

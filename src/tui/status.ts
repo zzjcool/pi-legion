@@ -34,6 +34,8 @@ export interface StatusEntry {
 	turns?: number;
 	lastTools?: string[];
 	phase?: string;
+	/** Unix ms start of the agent's current turn (only for live, in-flight turns). */
+	currentTurnStartedAt?: number;
 	/** Legion tree identity; omitted for callers that still use the flat roster. */
 	nodeId?: string;
 	parentId?: string | null;
@@ -42,6 +44,20 @@ export interface StatusEntry {
 
 export function formatElapsed(ms: number): string {
 	return `${Math.max(0, Math.round(ms / 1000))}s`;
+}
+
+/**
+ * Elapsed of the CURRENT turn, next to the total elapsed in the headline.
+ * Undefined when the turn's start is unknown, the last turn already settled
+ * (no live turn to time), or the entry itself is terminal.
+ */
+function currentTurnElapsedMs(
+	entry: Pick<StatusEntry, "state" | "herdrStatus" | "currentTurnStartedAt">,
+	now: number,
+): number | undefined {
+	if (entry.currentTurnStartedAt === undefined) return undefined;
+	if (!ACTIVE_STATES.has(entry.herdrStatus ?? entry.state)) return undefined;
+	return Math.max(0, now - entry.currentTurnStartedAt);
 }
 
 function activeEntries(entries: StatusEntry[]): StatusEntry[] {
@@ -127,10 +143,13 @@ function headlineBits(entry: StatusEntry, now: number): string[] {
 	return bits;
 }
 
-function detailBits(entry: StatusEntry): string[] {
+function detailBits(entry: StatusEntry, now: number): string[] {
 	const status = entryStatus(entry);
 	const bits = [entry.phase ? `${entry.phase}/${status}` : status];
-	if (entry.turns && entry.turns > 0) bits.push(`turn ${entry.turns}`);
+	const turnElapsed = currentTurnElapsedMs(entry, now);
+	if (entry.turns && entry.turns > 0) {
+		bits.push(`turn ${entry.turns}${turnElapsed !== undefined ? ` (${formatElapsed(turnElapsed)})` : ""}`);
+	}
 	if (entry.lastTools?.length) {
 		bits.push(entry.lastTools.slice(0, 2).join(", "));
 	}
@@ -147,7 +166,7 @@ function formatEntryLines(
 ): string[] {
 	return [
 		`${prefix.head}● ${headlineBits(entry, now).join(" · ")}`,
-		`${prefix.detail}  ⎿  ${detailBits(entry).join(" · ")}`,
+		`${prefix.detail}  ⎿  ${detailBits(entry, now).join(" · ")}`,
 	];
 }
 
@@ -333,7 +352,7 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
 		headline[0] = `${linkedName}${roleSuffix(effectiveEntry)}`;
 		lines.push(`${branch}● ${headline.join(" · ")}`);
 		const detailPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
-		lines.push(`${detailPrefix}  ⎿  ${detailBits(effectiveEntry).map(cleanDisplayText).join(" · ")}`);
+		lines.push(`${detailPrefix}  ⎿  ${detailBits(effectiveEntry, now).map(cleanDisplayText).join(" · ")}`);
 		const childPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
 		for (const [index, child] of node.children.entries()) {
 			visit(child, childPrefix, index === node.children.length - 1);

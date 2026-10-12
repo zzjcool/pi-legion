@@ -233,3 +233,21 @@ test("live overlay polls non-RPC backfill, renders deltas, and stops polling whe
 		component.close();
 	}
 });
+
+test("live overlay headline shows current-turn elapsed while the turn is in flight", () => {
+	const source = new FakeOverlaySource();
+	const overlay = createLiveOverlay(source);
+	const component = overlay.open("root.worker", { maxLines: 5, now: () => 10_000 });
+	try {
+		source.emit("root.worker", { type: "turn_start", ts: 6_000 });
+		const rendered = component.render(100).join("\n");
+		assert.match(rendered, /turn 1 \(4s\)/);
+
+		source.emit("root.worker", { type: "agent_settled", ts: 9_000 });
+		const settled = component.render(100).join("\n");
+		assert.doesNotMatch(settled, /turn 1 \(/);
+		assert.match(settled, /turn 1/);
+	} finally {
+		component.close();
+	}
+});

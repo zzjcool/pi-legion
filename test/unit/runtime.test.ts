@@ -949,3 +949,62 @@ test("U5: a terminal snapshot is still cached (the exclusion is running-only)", 
 	const results = await runtime.wait(["done"], { timeoutMs: 50 });
 	assert.equal(results[0]?.snapshot?.output, "all good", "wait hits the cache too");
 });
+
+test("runtime: session jsonl fills the live current-turn elapsed", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = join(dir, "worker-0.jsonl");
+		writeFileSync(
+			sessionFile,
+			[
+				sessionHeader(),
+				modelChange("cb/glm-5.3"),
+				userMsg("go", { timestamp: 1_000 }),
+				assistantMsg({
+					stopReason: "stop",
+					text: "done",
+					model: "cb/glm-5.3",
+					timestamp: 2_000,
+				}),
+				userMsg("more", { timestamp: 4_000 }),
+				assistantMsg({
+					stopReason: "toolUse",
+					tools: ["bash"],
+					model: "cb/glm-5.3",
+					timestamp: 4_500,
+				}),
+			].join("\n"),
+		);
+		const rendered: string[] = [];
+		const runtime = createSessionRuntime({
+			sendMessage() {},
+			now: () => 5_000,
+		});
+		runtime.bind({
+			hasUI: true,
+			ui: {
+				theme: { fg: (_c, text) => text },
+				setStatus() {},
+				setWidget(_key, content) {
+					if (typeof content === "function") {
+						const component = content({ requestRender() {} }, {
+							fg: (_c, text) => text,
+						});
+						rendered.splice(0, rendered.length, ...component.render());
+					}
+				},
+			},
+		});
+		runtime.track({
+			name: "worker-0",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile,
+			timeoutMs: 1_000,
+			collect: () => new Promise(() => {}),
+		});
+		// The board renders with the real clock, so assert shape, not a fixed
+		// second count: the in-flight turn (started at 4_000) shows a suffix.
+		assert.match(rendered.join("\n"), /turn 2 \(\d+s\) · bash/);
+		runtime.dispose();
+	});
+});

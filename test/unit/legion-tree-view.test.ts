@@ -369,3 +369,79 @@ test("tree mouse click toggles the selected row head; narrow layouts never overf
 		view.dispose();
 	}
 });
+
+test("tree view shows current-turn elapsed on turn_start and drops it on agent_settled", () => {
+	const view = createTreeView({ nodes: treeFixture(), now: () => BASE_TIME + 5_000 });
+	try {
+		const lines = (): string[] => view.render(120).map(stripTerminalSequences);
+		const detailLine = (): string | undefined => {
+			const index = lines().findIndex((line) => line.includes("worker-a2 (worker)"));
+			return index >= 0 ? lines()[index + 1] : undefined;
+		};
+
+		view.applyEvent({
+			nodeId: "root.centurion.worker-a2",
+			type: "turn_start",
+			data: null,
+			ts: BASE_TIME + 2_000,
+		});
+		assert.match(detailLine() ?? "", /turn 1 \(3s\)/);
+
+		view.applyEvent({
+			nodeId: "root.centurion.worker-a2",
+			type: "agent_settled",
+			data: null,
+			ts: BASE_TIME + 3_000,
+		});
+		assert.match(detailLine() ?? "", /turn 1$/);
+	} finally {
+		view.dispose();
+	}
+});
+
+test("tree view freezes current-turn elapsed at the terminal transition", () => {
+	// A leaf node keeps its detail row after settling; a parent would collapse.
+	const leaf = node("root.leaf", "root", "leaf", 1, "worker", "running");
+	const view = createTreeView({
+		nodes: [node("root", null, "root", 0, "root", "running"), leaf],
+		now: () => BASE_TIME + 60_000,
+	});
+	try {
+		view.applyEvent({
+			nodeId: "root.leaf",
+			type: "turn_start",
+			data: null,
+			ts: BASE_TIME + 2_000,
+		});
+		// Terminal transition lands long after the turn started; the frozen
+		// suffix is measured to that transition, not to now().
+		view.applyEvent({
+			nodeId: "root.leaf",
+			type: "node_settled",
+			data: null,
+			ts: BASE_TIME + 10_000,
+		});
+		const lines = view.render(120).map(stripTerminalSequences);
+		const index = lines.findIndex((line) => line.includes("leaf (worker)"));
+		assert.ok(index >= 0);
+		assert.match(lines[index + 1] ?? "", /turn 1 \(8s\)/);
+	} finally {
+		view.dispose();
+	}
+});
+
+test("tree view shows current-turn elapsed from a snapshot-provided turnStartedAt", () => {
+	const nodes = treeFixture().map((entry) =>
+		entry.id === "root.centurion.worker-a2"
+			? { ...entry, turn: 7, turnStartedAt: BASE_TIME + 3_500 }
+			: entry,
+	);
+	const view = createTreeView({ nodes, now: () => BASE_TIME + 5_000 });
+	try {
+		const lines = view.render(120).map(stripTerminalSequences);
+		const index = lines.findIndex((line) => line.includes("worker-a2 (worker)"));
+		assert.match(lines[index + 1] ?? "", /turn 7 \(2s\)/);
+	} finally {
+		view.dispose();
+	}
+});
