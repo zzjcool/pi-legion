@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { renderWait, waitAction } from "../../index.ts";
+import { renderWait, stopAction, waitAction } from "../../index.ts";
 import {
 	createSessionRuntime,
 	type CollectSnapshot,
@@ -145,6 +145,31 @@ test("waitAction: default timeout is the strictest (smallest) role timeout", asy
 	base.dispose();
 });
 
+test("waitAction forwards the parent abort signal into runtime.wait", async () => {
+	const base = runtimeWith([{ name: "live", agent: "worker" }]);
+	const controller = new AbortController();
+	const calls: Array<{ names: string[]; signal?: AbortSignal }> = [];
+	const runtime: SessionRuntime = {
+		...base,
+		wait: (names, opts) => {
+			calls.push({ names, signal: opts?.signal });
+			return Promise.resolve(names.map((name) => ({ name, interrupted: true })));
+		},
+	};
+	const { store, cwd } = tempStore();
+	await waitAction({
+		params: { action: "wait", name: "live" },
+		signal: controller.signal,
+		runtime,
+		agents: [agent("worker")],
+		store,
+		cwd,
+	});
+	assert.equal(calls.length, 1);
+	assert.deepEqual(calls[0], { names: ["live"], signal: controller.signal });
+	base.dispose();
+});
+
 test("waitAction: targets without a role entry fall back to DEFAULTS.turnTimeoutMs", async () => {
 	const calls: Array<{ names: string[]; timeoutMs?: number }> = [];
 	const base = runtimeWith([{ name: "mystery", agent: "no-such-role" }]);
@@ -171,6 +196,35 @@ test("waitAction: targets without a role entry fall back to DEFAULTS.turnTimeout
 	base.dispose();
 });
 
+test("stopAction: all retires active children sequentially and releases each target", async () => {
+	const runtime = runtimeWith([
+		{ name: "first", agent: "worker" },
+		{ name: "already-retired", agent: "worker" },
+		{ name: "second", agent: "worker" },
+	]);
+	runtime.get("already-retired")!.state = "retired";
+	const supervisorCalls: string[] = [];
+	let retiring = false;
+	const supervisor = {
+		async retire(name: string) {
+			assert.equal(retiring, false, "stop must await each retirement before starting the next");
+			retiring = true;
+			await Promise.resolve();
+			supervisorCalls.push(name);
+			retiring = false;
+		},
+	};
+	const result = await stopAction({
+		params: { all: true },
+		runtime,
+		retire: (name) => supervisor.retire(name),
+	});
+	assert.deepEqual(supervisorCalls, ["first", "second"]);
+	assert.deepEqual(runtime.activeJobs().map((job) => job.name), ["already-retired"]);
+	assert.match(text(result), /Stopped 2 children/);
+	runtime.dispose();
+});
+
 test("renderWait: summary line counts done and still-running", () => {
 	const rendered = renderWait([
 		{ name: "a", snapshot: snapshot("A-out") },
@@ -182,4 +236,8 @@ test("renderWait: summary line counts done and still-running", () => {
 	assert.match(rendered, /── b ──\nstill running/);
 	assert.match(rendered, /── c ──\nnot tracked/);
 	assert.match(rendered, /1 done, 1 still running/);
+	const interrupted = renderWait([{ name: "wait", interrupted: true }]);
+	assert.match(interrupted, /── wait ──\ninterrupted \(parent turn aborted\)/);
+	assert.match(interrupted, /0 done, 0 still running/);
+	assert.match(interrupted, /1 interrupted/);
 });

@@ -398,7 +398,7 @@ export class Orchestrator {
 	}
 
 	private recordSettled(child: ChildRecord, execution: Execution): void {
-		if (!this.legion || !child.nodeId || execution.status === "running") return;
+		if (!this.legion || !child.nodeId || execution.status === "running" || child.state === "retired") return;
 		const status = execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
 		const current = getNode(this.legion.db, child.nodeId);
 		if (!current || current.status === status) return;
@@ -766,23 +766,33 @@ export class Orchestrator {
 		this.onChildUpdate(child);
 	}
 
-	async collect(name: string, opts: { timeoutMs?: number } = {}): Promise<CollectResult> {
+	async collect(name: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CollectResult> {
 		const child = this.requireChild(name);
+		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(child.sessionFile));
+		if (opts.signal?.aborted) return abortedSnapshot();
 		if (this.pendingDialogs(name).length) return this.blockedResult(child);
 		const timeoutMs = opts.timeoutMs ?? DEFAULTS.turnTimeoutMs;
 		let deadline = this.now() + timeoutMs;
 		const initial = parseSessionFile(child.sessionFile);
-		let wait: "settled" | "timeout" | "blocked" | "gone" = isLastTurnComplete(initial)
+		let wait: "settled" | "timeout" | "blocked" | "gone" | "aborted" = isLastTurnComplete(initial)
 			? "settled"
-			: await this.awaitSupervisor(child, deadline);
+			: await this.awaitSupervisor(child, deadline, opts.signal);
+		if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		for (let attempt = 0; wait === "timeout" && attempt < COLLECT_GRACE_EXTENSIONS; attempt += 1) {
-			if (!(await this.collectArtifactGrowing(child))) break;
+			if (opts.signal?.aborted) return abortedSnapshot();
+			if (!(await this.collectArtifactGrowing(child, opts.signal))) break;
+			if (opts.signal?.aborted) return abortedSnapshot();
 			deadline += timeoutMs;
-			wait = await this.awaitSupervisor(child, deadline);
+			wait = await this.awaitSupervisor(child, deadline, opts.signal);
+			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
 		const parsed = parseSessionFile(child.sessionFile);
-		if (wait === "settled" && countAssistantMessages(parsed) > 0) await this.waitForQuiet(child.sessionFile, deadline);
+		if (wait === "settled" && countAssistantMessages(parsed) > 0) {
+			await this.waitForQuiet(child.sessionFile, deadline, opts.signal);
+			if (opts.signal?.aborted) return abortedSnapshot();
+		}
+		if (opts.signal?.aborted) return abortedSnapshot();
 		const current = parseSessionFile(child.sessionFile);
 		let execution = deriveOutcome(current);
 		if (wait === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(current)) {
@@ -793,38 +803,78 @@ export class Orchestrator {
 		return this.finishCollect(child, current, execution, deadline);
 	}
 
-	private async awaitSupervisor(child: ChildRecord, deadline: number): Promise<"settled" | "timeout" | "blocked" | "gone"> {
+	private interruptedCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>): CollectResult {
+		return {
+			execution: { status: "running", reason: "aborted by parent" },
+			output: parsed.output,
+			usage: parsed.usage,
+			model: parsed.model ?? child.model ?? null,
+			acceptance: { status: "unknown", level: "none", reason: "aborted by parent" },
+		};
+	}
+
+	private async awaitSupervisor(
+		child: ChildRecord,
+		deadline: number,
+		signal?: AbortSignal,
+	): Promise<"settled" | "timeout" | "blocked" | "gone" | "aborted"> {
+		if (signal?.aborted) return "aborted";
 		if (this.pendingDialogs(child.name).length) return "blocked";
-		let pending = this.pendingWaits.get(child.name);
+		let pending = signal ? undefined : this.pendingWaits.get(child.name);
 		if (!pending) {
-			pending = this.supervisor.waitSettled(child.name, Math.max(1, deadline - this.now()));
-			this.pendingWaits.set(child.name, pending);
-			const current = pending;
-			void current.then(
-				() => { if (this.pendingWaits.get(child.name) === current) this.pendingWaits.delete(child.name); },
-				() => { if (this.pendingWaits.get(child.name) === current) this.pendingWaits.delete(child.name); },
+			const wait = this.supervisor.waitSettled(
+				child.name,
+				Math.max(1, deadline - this.now()),
+				...(signal ? [signal] : []),
 			);
+			pending = wait;
+			if (!signal) {
+				this.pendingWaits.set(child.name, pending);
+				const current = pending;
+				void current.then(
+					() => { if (this.pendingWaits.get(child.name) === current) this.pendingWaits.delete(child.name); },
+					() => { if (this.pendingWaits.get(child.name) === current) this.pendingWaits.delete(child.name); },
+				);
+			}
 		}
-		if (!this.uiProxy) return this.settleDisposition(await pending, child.name);
 		let unsubscribe: (() => void) | undefined;
-		const blocked = new Promise<"blocked">((resolve) => {
-			unsubscribe = this.uiProxy?.onRequest((request) => {
-				if (request.childName !== child.name || !isApprovalRequest(request)) return;
-				child.state = "blocked";
-				this.onChildUpdate(child);
-				resolve("blocked");
+		let removeAbortListener: (() => void) | undefined;
+		try {
+			const waitForSettle = pending.then((settled) =>
+				settled.reason === "aborted by parent"
+					? "aborted" as const
+					: this.settleDisposition(settled, child.name),
+			);
+			if (!this.uiProxy && !signal) return await waitForSettle;
+			const waitForChildEvent = waitForSettle.then((result) => {
+				if (result === "settled" && child.state === "retired") return "gone" as const;
+				return result;
 			});
-		});
-		if (this.pendingDialogs(child.name).length) {
+			const blocked = new Promise<"blocked">((resolve) => {
+				if (!this.uiProxy) return;
+				unsubscribe = this.uiProxy.onRequest((request) => {
+					if (request.childName !== child.name || !isApprovalRequest(request) || child.state === "retired") return;
+					child.state = "blocked";
+					this.onChildUpdate(child);
+					resolve("blocked");
+				});
+			});
+			if (this.pendingDialogs(child.name).length) return "blocked";
+			const races: Array<Promise<"settled" | "timeout" | "blocked" | "gone" | "aborted">> = [waitForChildEvent];
+			if (this.uiProxy) races.push(blocked);
+			if (signal) {
+				races.push(new Promise((resolve) => {
+					const onAbort = () => resolve("aborted");
+					removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+					if (signal.aborted) onAbort();
+					else signal.addEventListener("abort", onAbort, { once: true });
+				}));
+			}
+			return await Promise.race(races);
+		} finally {
 			unsubscribe?.();
-			return "blocked";
+			removeAbortListener?.();
 		}
-		const result = await Promise.race([
-			pending.then((settled) => this.settleDisposition(settled, child.name)),
-			blocked,
-		]);
-		unsubscribe?.();
-		return result;
 	}
 
 	private settleDisposition(result: SettleResult, name: string): "settled" | "timeout" | "gone" {
@@ -839,10 +889,12 @@ export class Orchestrator {
 		const acceptance = deriveAcceptance(parsed, execution, child.pendingCriteria, {
 			...(child.completionGuard ? { completionGuard: true } : {}),
 		});
-		child.state = "blocked";
-		child.execution = execution;
-		child.acceptance = acceptance;
-		this.onChildUpdate(child);
+		if (child.state !== "retired") {
+			child.state = "blocked";
+			child.execution = execution;
+			child.acceptance = acceptance;
+			this.onChildUpdate(child);
+		}
 		return { execution, output: parsed.output, usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance, blocked: true };
 	}
 
@@ -851,19 +903,26 @@ export class Orchestrator {
 			deriveAcceptance(parsed, execution, child.pendingCriteria, { ...(child.completionGuard ? { completionGuard: true } : {}) }),
 			{ cwd: child.worktreePath ?? this.cwd, criteria: child.pendingCriteria, run: this.verifyRunner, timeoutMs: Math.max(5_000, deadline - this.now()) },
 		);
-		if (execution.status !== "running") child.state = "awaiting";
+		const isRetired = () => child.state === "retired";
+		// A running child can finish its in-flight collect while an explicit stop
+		// is retiring it. Record the result, but never demote a retired lifecycle
+		// state back to awaiting; only a later launch/resume may revive that child.
+		if (execution.status !== "running" && !isRetired()) child.state = "awaiting";
 		child.execution = execution;
 		child.acceptance = acceptance;
 		if (execution.status !== "running") this.recordSettled(child, execution);
-		this.onChildUpdate(child);
+		if (!isRetired()) this.onChildUpdate(child);
 		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
+		if (isRetired()) {
+			return { execution, output, usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance };
+		}
 		let outputFile: string | undefined;
 		if (execution.status === "running") child.outputFile = undefined;
 		else {
 			outputFile = this.writeOutputFile(child, output);
 			child.outputFile = outputFile;
 		}
-		this.onChildUpdate(child);
+		if (!isRetired()) this.onChildUpdate(child);
 		return { execution, output, ...(outputFile ? { outputFile } : {}), usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance };
 	}
 
@@ -882,23 +941,53 @@ export class Orchestrator {
 		} catch { return undefined; }
 	}
 
-	private async collectArtifactGrowing(child: ChildRecord): Promise<boolean> {
+	private async collectArtifactGrowing(child: ChildRecord, signal?: AbortSignal): Promise<boolean> {
 		const before = artifactSize(child.sessionFile);
-		if (before <= 0) return false;
-		await this.sleep(POLL_INTERVAL_MS);
+		if (before <= 0 || signal?.aborted) return false;
+		if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return false;
 		return artifactSize(child.sessionFile) > before;
 	}
 
-	private async waitForQuiet(sessionFile: string, deadline: number): Promise<void> {
+	private async sleepOrAbort(ms: number, signal?: AbortSignal): Promise<boolean> {
+		if (!signal) {
+			await this.sleep(ms);
+			return false;
+		}
+		if (signal.aborted) return true;
+		return new Promise<boolean>((resolve) => {
+			let settled = false;
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const cleanup = () => {
+				signal.removeEventListener("abort", onAbort);
+				if (timer) clearTimeout(timer);
+			};
+			const finish = (aborted: boolean) => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				resolve(aborted);
+			};
+			const onAbort = () => finish(true);
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) {
+				onAbort();
+				return;
+			}
+			timer = setTimeout(() => finish(false), ms);
+		});
+	}
+
+	private async waitForQuiet(sessionFile: string, deadline: number, signal?: AbortSignal): Promise<void> {
 		let previous = -1;
 		let quietSince = this.now();
 		const maxPolls = Math.max(1, Math.ceil(DEFAULTS.turnTimeoutMs / POLL_INTERVAL_MS));
 		for (let poll = 0; poll < maxPolls; poll += 1) {
+			if (signal?.aborted) return;
 			const size = artifactSize(sessionFile);
 			if (size !== previous) { previous = size; quietSince = this.now(); }
 			else if (this.now() - quietSince >= DEFAULTS.settleQuietMs) return;
 			if (this.now() >= deadline) return;
-			await this.sleep(POLL_INTERVAL_MS);
+			if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return;
 		}
 	}
 
@@ -920,6 +1009,7 @@ export class Orchestrator {
 
 	async retire(name: string): Promise<ChildRecord> {
 		const child = this.requireChild(name);
+		if (child.state === "retired") return child;
 		if (!child.execution && fs.existsSync(child.sessionFile)) child.execution = deriveOutcome(parseSessionFile(child.sessionFile));
 		if (this.supervisor.isAlive(name)) await this.supervisor.retire(name);
 		if (child.nodeId && this.legion) {

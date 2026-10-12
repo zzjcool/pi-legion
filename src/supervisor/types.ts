@@ -78,7 +78,7 @@ export interface LegionSupervisor {
 	steer(name: string, text: string): Promise<void>;
 	followUp(name: string, text: string): Promise<void>;
 	abort(name: string): Promise<void>;
-	waitSettled(name: string, timeoutMs?: number): Promise<SettleResult>;
+	waitSettled(name: string, timeoutMs?: number, signal?: AbortSignal): Promise<SettleResult>;
 	isAlive(name: string): boolean;
 	stats(name: string): Promise<UsageSnapshot | null>;
 	retire(name: string, opts?: { graceful?: boolean }): Promise<void>;

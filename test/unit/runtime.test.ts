@@ -662,6 +662,63 @@ test("runtime.wait: timeout yields stillRunning, resets consumedByTool, auto-not
 	assert.match(messages[0]!.content, /Background task completed: \*\*slow/);
 });
 
+test("runtime.wait: parent abort interrupts promptly, clears its timer, and restores notifications", async () => {
+	const messages: SentMessage[] = [];
+	let resolveCollect!: (snapshot: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "slow",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/slow.jsonl",
+		timeoutMs: 1_000,
+		collect: () => new Promise<CollectSnapshot>((resolve) => {
+			resolveCollect = resolve;
+		}),
+	});
+	runtime.watch("slow");
+
+	const controller = new AbortController();
+	const timeoutMs = 60_000;
+	const scheduledTimers = new Set<ReturnType<typeof setTimeout>>();
+	let clearedWaitTimers = 0;
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	try {
+		globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+			const timer = originalSetTimeout(...args);
+			if (args[1] === timeoutMs) scheduledTimers.add(timer);
+			return timer;
+		}) as typeof setTimeout;
+		globalThis.clearTimeout = ((...args: Parameters<typeof clearTimeout>) => {
+			if (scheduledTimers.has(args[0] as ReturnType<typeof setTimeout>)) {
+				clearedWaitTimers += 1;
+			}
+			return originalClearTimeout(...args);
+		}) as typeof clearTimeout;
+
+		const pending = runtime.wait(["slow"], { timeoutMs, signal: controller.signal });
+		controller.abort();
+		assert.deepEqual(await pending, [{ name: "slow", interrupted: true }]);
+		assert.equal(scheduledTimers.size, 1, "wait must install its timeout guard");
+		assert.equal(clearedWaitTimers, 1, "abort must clear the losing timeout");
+		assert.equal(runtime.get("slow")?.consumedByTool, false, "abort restores notification ownership");
+		assert.equal(runtime.get("slow")?.watching, true, "the existing watch continues after abort");
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+	}
+
+	resolveCollect(joinSnapshot({ output: "finally" }));
+	await waitFor(() => messages.length === 1, "completion notify after parent abort");
+	assert.match(messages[0]!.content, /finally/);
+	runtime.dispose();
+});
+
 test("runtime.wait: finished-cache hits return instantly; unknown names are missing", async () => {
 	const runtime = createSessionRuntime({ sendMessage() {} });
 	runtime.track({

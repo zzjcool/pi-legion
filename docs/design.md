@@ -893,7 +893,7 @@ function countToolErrors(turn: Turn): number {
 ```ts
 subagent({
   action?: "launch" | "continue" | "steer" | "resume" | "retire"
-         | "status" | "collect" | "list",     // 默认 launch
+         | "status" | "collect" | "wait" | "list" | "stop", // 默认 launch
 
   // launch
   agent?: string, task?: string,
@@ -916,7 +916,15 @@ subagent({
 | `steer` | **运行中插话改方向**（F10） | `agent prompt`（不等） |
 | `resume` | **已退出后恢复**（F12） | 新 pane + `--session <file>` |
 | `retire` | 回收 | ctrl+d / pane close / tab close |
-| `status` / `collect` / `list` | 查询 | `agent get` / jsonl / `agent list` |
+| `status` / `collect` / `list` | 查询 | child record / session JSONL |
+| `wait` | 等待指定或全部活动 child 完成；由 RPC settle 事件唤醒，也支持 ESC 提前返回 | session runtime + RPC supervisor |
+| `stop` | 优雅停止指定或全部 tracked、非 retired children | `retire` 全链 + runtime release |
+
+### ESC abort 语义 + stop
+
+父 turn 的 ESC / RPC abort signal 只打断当前 `subagent` 工具的等待，不会杀死 child。`wait` 和 `collect` 将 signal 传到可中断等待点；`wait` 返回 `interrupted (parent turn aborted)`，并把完成通知权还给后台 watcher，因此 child 继续运行、完成后仍会通知父会话。RPC settle 事件会立即解除正常 `wait`，不需要等满 timeout。`collect` 被中断时返回 `execution: running (aborted by parent)` 快照，不把 child 标为完成，也不开始 retire。
+
+`stop` 是显式停止操作：`subagent({ action: "stop", name: "worker-0" })` 停一个 child，`subagent({ action: "stop", all: true })` 逐个停止当前跟踪的全部非 retired children。它复用 `retire` 生命周期（优雅关闭、超时后升级信号、后代清理）并释放 runtime 跟踪；`stop` 本身不接父 turn abort signal。`name` 与 `all` 互斥且必须指定其一。
 
 ### `continue` vs `steer` vs `resume`
 

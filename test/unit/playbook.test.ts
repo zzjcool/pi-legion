@@ -62,6 +62,12 @@ test("playbook keeps the explicit wait action available", () => {
 	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire/);
 });
 
+test("playbook describes event-driven waits and graceful stop", () => {
+	assert.match(PARENT_PLAYBOOK, /use `stop` to gracefully retire one child or all tracked children/);
+	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire, stop/);
+	assert.match(TOOL_DESCRIPTION, /`wait` is event-driven/);
+});
+
 test("playbook explains RPC timeout and steering semantics", () => {
 	assert.match(PARENT_PLAYBOOK, /collect timeout with a live RPC child is a progress signal/);
 	assert.match(PARENT_PLAYBOOK, /session JSONL/);

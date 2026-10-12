@@ -309,6 +309,42 @@ test("spawn → first prompt → agent_settled → graceful retire lifecycle", a
 	}
 });
 
+test("waitSettled: parent abort resolves promptly and clears the waiter timeout", async () => {
+	const h = harness();
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	let waitTimer: ReturnType<typeof setTimeout> | undefined;
+	let clearedWaitTimer = false;
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const controller = new AbortController();
+		globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+			const timer = originalSetTimeout(...args);
+			if (args[1] === 60_000) waitTimer = timer;
+			return timer;
+		}) as typeof setTimeout;
+		globalThis.clearTimeout = ((...args: Parameters<typeof clearTimeout>) => {
+			if (args[0] === waitTimer) clearedWaitTimer = true;
+			return originalClearTimeout(...args);
+		}) as typeof clearTimeout;
+
+		const pending = h.supervisor.waitSettled("root.worker", 60_000, controller.signal);
+		controller.abort();
+		assert.deepEqual(await pending, {
+			settled: false,
+			abnormal: false,
+			reason: "aborted by parent",
+		});
+		assert.ok(waitTimer, "the waiter installs a timeout guard");
+		assert.equal(clearedWaitTimer, true, "abort clears the timeout guard");
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+		await h.supervisor.retire("root.worker").catch(() => {});
+		h.close();
+	}
+});
+
 test("abort → waitSettled observes aborted turns from real RPC event shapes", async () => {
 	for (const source of ["turn_end", "agent_end"] as const) {
 		const h = harness();
