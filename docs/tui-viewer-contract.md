@@ -68,9 +68,12 @@ import {
   sessionEntryToContextMessages, // (entry: SessionEntry) => AgentMessage[]
 } from "@earendil-works/pi-coding-agent";
 
-// @earendil-works/pi-ai —— 消息类型（新增 devDep）
+// 消息类型 —— REV-1 修正（2026-10-13，worker-0 上报：pi-ai@1.1.0 不导出 AgentMessage）：
+// AgentMessage 定义在 @earendil-works/pi-agent-core/dist/types.d.ts:322
+//   （= Message | CustomAgentMessages[...]，Message 及 AssistantMessage 等成员类型来自 pi-ai）
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
-  AgentMessage, AssistantMessage, ThinkingContent,
+  AssistantMessage, ThinkingContent,
 } from "@earendil-works/pi-ai";
 
 // @earendil-works/pi-tui
@@ -260,7 +263,7 @@ export type ChatItem =
 
 ## 9. 契约修订记录（REV）
 
-（无。冻结于 2026-10-13。）
+- **REV-1**（2026-10-13，触发者 worker-0）：§2a 消息类型 import 修正——`AgentMessage` 来自 `@earendil-works/pi-agent-core`（`dist/types.d.ts:322`）而非 pi-ai（pi-ai@1.1.0 不导出该类型）；`AssistantMessage`/`ThinkingContent` 等成员类型仍来自 pi-ai。机械缺口，直接修订。
 
 ## 10. 修订规则
 
