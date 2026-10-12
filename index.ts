@@ -40,7 +40,7 @@ import {
 	loadSubagentSettings,
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
-import { createSessionRuntime, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
+import { createSessionRuntime, type SessionRuntime, type TrackedJob, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
@@ -96,6 +96,10 @@ import {
 	type ModelOrigin,
 	SubagentError,
 } from "./src/shared/types.ts";
+
+// The parent turn owns its child lifetime. Parallel tool aborts in one turn
+// share this graceful-retire cascade; turn_start begins a fresh cycle.
+let cascadePromise: Promise<void> | undefined;
 
 // ---------------------------------------------------------------------------
 // Parameters
@@ -462,6 +466,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 }
 
 export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {
+	cascadePromise = undefined;
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";
 	const supervisor = deps.supervisor ?? new RpcSupervisor();
@@ -521,17 +526,57 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 	});
 	const pendingUtilityRetires: Array<() => Promise<void>> = [];
+	let sessionRuntime: SessionRuntime | undefined;
+	let cascadingJobs = new Set<TrackedJob>();
+	let cascadingUtilityRetires = new Set<() => Promise<void>>();
+	const cascadeRetireAll = (): Promise<void> => {
+		const jobs = (sessionRuntime?.activeJobs() ?? []).filter(
+			(job) => job.state !== "retired" && !cascadingJobs.has(job),
+		);
+		const utilityRetires = pendingUtilityRetires.filter(
+			(retire) => !cascadingUtilityRetires.has(retire),
+		);
+		if (!cascadePromise) cascadePromise = Promise.resolve();
+		if (jobs.length === 0 && utilityRetires.length === 0) return cascadePromise;
+		for (const job of jobs) {
+			cascadingJobs.add(job);
+			sessionRuntime?.cancelWatch(job.name);
+		}
+		for (const retire of utilityRetires) cascadingUtilityRetires.add(retire);
+		const retirements = [
+			...jobs.map((job) => async () => job.retire?.()),
+			...utilityRetires.map((retire) => async () => retire()),
+		];
+		cascadePromise = cascadePromise.then(async () => {
+			// allSettled waits for every graceful retire without turning a child
+			// failure into a user-visible result or skipping runtime release.
+			await Promise.allSettled(retirements.map((retire) => retire()));
+			for (const job of jobs) sessionRuntime?.release(job.name);
+		});
+		return cascadePromise;
+	};
+	// Register before the child early-return paths below: a command-chain child
+	// may use vexillatio across multiple turns without creating a session runtime.
+	pi.on("turn_start", () => {
+		cascadePromise = undefined;
+		cascadingJobs = new Set();
+		cascadingUtilityRetires = new Set();
+	});
 	if (process.env[UTILITY_CHILD_ENV] !== "1") {
 		pi.registerTool({
 			name: "vexillatio",
 			label: "Vexillatio",
 			description: "Launch only read-only utility agents and return their collected output.",
 			parameters: VexillatioParams,
-			async execute(_id, params, _signal, _onUpdate, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
+			async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
+				if (signal?.aborted) {
+					await cascadeRetireAll();
+					return ok("interrupted (parent turn aborted)");
+				}
 				if (!subagentsEnabled(ctx.cwd)) {
 					return fail("subagents are disabled (subagents.enabled: false or /subagents-toggle off). Re-enable with /subagents-toggle on.", ErrorCodes.DISABLED);
 				}
-				return launchUtilityFamily({
+				const result = await launchUtilityFamily({
 					pi,
 					ctx,
 					params,
@@ -540,6 +585,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 					onBudgetRefused,
 					cwd: params.cwd ?? ctx.cwd,
 					sessionCwd: ctx.cwd,
+					signal,
 					isChild,
 					legion: legionIdentity,
 					eventBus: legionBus,
@@ -549,6 +595,11 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 					},
 					onUtilityChild: (retire) => pendingUtilityRetires.push(retire),
 				});
+				if (signal?.aborted) {
+					await cascadeRetireAll();
+					return ok("interrupted (parent turn aborted)");
+				}
+				return result;
 			},
 		});
 	}
@@ -620,6 +671,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			catch { /* optional display integration */ }
 		},
 	});
+	sessionRuntime = runtime;
 	blockedUi.set(runtime, {
 		getConfirm: () => lastConfirm,
 		notifyBlocked: (message) => {
@@ -693,7 +745,10 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		): Promise<AgentToolResult<unknown>> {
 			runtime.bind(ctx);
 			const action = params.action ?? "launch";
-			if (signal?.aborted && action !== "stop") return ok("interrupted (parent turn aborted)");
+			if (signal?.aborted && action !== "stop") {
+				await cascadeRetireAll();
+				return ok("interrupted (parent turn aborted)");
+			}
 			// Master switch: refuse NEW launches with a pointer to the toggle;
 			// control actions (status/collect/wait/…) must stay available so a
 			// disable with live children remains observable and collectable.
@@ -736,12 +791,15 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			} catch (error) {
 				return fail(`legion runtime initialization failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
 			}
-			if (signal?.aborted && action !== "stop") return ok("interrupted (parent turn aborted)");
+			if (signal?.aborted && action !== "stop") {
+				await cascadeRetireAll();
+				return ok("interrupted (parent turn aborted)");
+			}
 
 			// Control actions address an EXISTING child; launch-family actions
 			// create new ones. The two share almost nothing, so they are separate.
 			if (action !== "launch") {
-				return controlAction({
+				const result = await controlAction({
 					action,
 					params,
 					signal,
@@ -758,9 +816,14 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 					settings,
 					legion: activeLegion,
 				});
+				if (signal?.aborted && action !== "stop") {
+					await cascadeRetireAll();
+					return ok("interrupted (parent turn aborted)");
+				}
+				return result;
 			}
 
-			return launchFamily({
+			const result = await launchFamily({
 				params,
 				signal,
 				ctx,
@@ -778,6 +841,11 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 				runtime,
 				onUpdate,
 			});
+			if (signal?.aborted) {
+				await cascadeRetireAll();
+				return ok("interrupted (parent turn aborted)");
+			}
+			return result;
 		},
 	});
 
@@ -1684,6 +1752,7 @@ async function launchUtilityFamily(input: {
 	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	params: VexillatioParams;
+	signal?: AbortSignal;
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
 	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
@@ -1885,7 +1954,10 @@ async function launchUtilityFamily(input: {
 
 	const collected = await Promise.all(handles.map(async (handle) => {
 		try {
-			const result = await handle.orchestrator.collect(handle.name, { timeoutMs });
+			const result = await handle.orchestrator.collect(handle.name, {
+				timeoutMs,
+				...(input.signal ? { signal: input.signal } : {}),
+			});
 			await persistChild(store, runId, handle.orchestrator, handle.name);
 			const lines = [
 				`── ${handle.name} ──`,
@@ -1899,6 +1971,7 @@ async function launchUtilityFamily(input: {
 			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
+	if (input.signal?.aborted) return ok("interrupted (parent turn aborted)");
 	results.push(...collected);
 	return {
 		content: [{ type: "text", text: results.join("\n\n") || "No utility agents were launched." }],

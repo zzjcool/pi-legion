@@ -921,11 +921,13 @@ function indexHarness(
 	supervisor: FakeSupervisor;
 	sentMessages: unknown[];
 	tool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
+	utilityTool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
+	startTurn(): void;
 	shutdown(): Promise<void>;
 	cleanup(): Promise<void>;
 } {
 	const cwd = mkdtempSync(path.join(tmpdir(), "teams-index-rpc-"));
-	const names = ["PI_SUBAGENT_CHILD", "PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV];
+	const names = ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_UTILITY_CHILD", "PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV];
 	const previous = new Map(names.map((name) => [name, process.env[name]]));
 	const agentDir = path.join(cwd, "agentdir");
 	const extraDir = path.join(cwd, "extra-agents");
@@ -936,6 +938,7 @@ function indexHarness(
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraDir;
 	delete process.env.PI_SUBAGENT_CHILD;
+	delete process.env.PI_SUBAGENT_UTILITY_CHILD;
 	for (const name of ["PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV]) delete process.env[name];
 	const supervisor = new FakeSupervisor({
 		immediateTimeout: supervisorOptions.immediateTimeout ?? true,
@@ -944,19 +947,30 @@ function indexHarness(
 	const tools: Array<Record<string, unknown>> = [];
 	const sentMessages: unknown[] = [];
 	const handlers = new Map<string, (...args: any[]) => unknown>();
+	const turnStartHandlers: Array<(...args: any[]) => unknown> = [];
 	const pi = {
 		registerTool(tool: unknown) { tools.push(tool as Record<string, unknown>); },
 		registerCommand() {}, registerMessageRenderer() {}, sendMessage(message: unknown) { sentMessages.push(message); },
 		events: { emit() {} },
-		on(name: string, handler: (...args: any[]) => unknown) { handlers.set(name, handler); },
+		on(name: string, handler: (...args: any[]) => unknown) {
+			if (name === "turn_start") turnStartHandlers.push(handler);
+			else handlers.set(name, handler);
+		},
 	};
 	herdrSubagents(pi as never, { supervisor, ...(verifyRunner ? { verifyRunner } : {}) });
 	const tool = tools.find((entry) => entry.name === "subagent") as {
 		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }>;
 	};
+	const utilityTool = tools.find((entry) => entry.name === "vexillatio") as {
+		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }>;
+	};
 	assert.ok(tool, "subagent tool registered through the index entry point");
+	assert.ok(utilityTool, "vexillatio tool registered through the index entry point");
 	return {
-		cwd, supervisor, sentMessages, tool,
+		cwd, supervisor, sentMessages, tool, utilityTool,
+		startTurn() {
+			for (const handler of turnStartHandlers) handler({}, { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } });
+		},
 		async shutdown() {
 			await handlers.get("session_shutdown")?.();
 		},
@@ -969,6 +983,7 @@ function indexHarness(
 }
 
 const WORKER_FILE = "---\nname: worker\ndescription: worker role\n---\nworker prompt\n";
+const UTILITY_FILE = "---\nname: scout\ndescription: read-only utility role\nutility: true\ntools: read, grep, find, ls\nkind: pi\n---\nscout prompt\n";
 const DESIGNER_FILE = "---\nname: designer\ndescription: designer role\nkind: cursor\n---\ndesigner prompt\n";
 
 async function invokeIndex(
@@ -1099,7 +1114,7 @@ test("index launch abort retires the child spawned while the parent turn was can
 		const result = await pending;
 		const handle = harness.supervisor.spawns[0]?.input;
 		if (!handle) throw new Error("expected the child spawn to complete");
-		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /abandoned because parent turn aborted/);
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
 		assert.equal(harness.supervisor.isAlive(handle.name), false, "an abandoned launch is retired without starting a watch");
 		const records = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") }).listRuns();
 		const child = records.flatMap((run) => run.children).find((entry) => entry.name === handle.name);
@@ -1112,13 +1127,55 @@ test("index launch abort retires the child spawned while the parent turn was can
 	}
 });
 
-test("index collect abort returns promptly and leaves the RPC child running", async () => {
+test("index wait abort retires tracked children before returning interrupted", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
 		{ "worker.md": WORKER_FILE },
 		{ autoSettle: false, immediateTimeout: false },
 	);
 	try {
+		harness.startTurn();
+		await invokeIndex(harness, { agent: "worker", task: "finish after parent abort", async: true, worktree: false });
+		const name = harness.supervisor.spawns[0]?.input.name;
+		if (!name) throw new Error("worker child did not spawn");
+		const controller = new AbortController();
+		const pending = harness.tool.execute(
+			"wait-abort",
+			{ action: "wait", name },
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		controller.abort();
+		const result = await pending;
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
+		assert.deepEqual(
+			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
+			[name],
+		);
+		assert.equal(harness.supervisor.isAlive(name), false, "aborting wait cascades retirement to the tracked child");
+		assert.equal(harness.sentMessages.length, 0, "the silent cascade cancels completion notifications");
+		const secondWait = await harness.tool.execute(
+			"wait-after-cascade",
+			{ action: "wait", all: true },
+			undefined,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		assert.match((secondWait.content ?? []).map((item) => item.text ?? "").join("\n"), /no running children/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("index collect abort returns promptly and cascades retirement to the RPC child", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.startTurn();
 		await invokeIndex(harness, { agent: "worker", task: "finish after parent abort", async: true, worktree: false });
 		const name = harness.supervisor.spawns[0]?.input.name;
 		if (!name) throw new Error("worker child did not spawn");
@@ -1133,15 +1190,166 @@ test("index collect abort returns promptly and leaves the RPC child running", as
 		controller.abort();
 		const result = await pending;
 		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
-		assert.equal(harness.supervisor.isAlive(name), true, "collect abort does not retire the child");
+		assert.deepEqual(
+			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
+			[name],
+		);
+		assert.equal(harness.supervisor.isAlive(name), false, "collect abort cascades retirement to the child");
+	} finally {
+		await harness.cleanup();
+	}
+});
 
-		harness.supervisor.settle(name, { text: "the child completed after Esc" });
-		const deadline = Date.now() + 5_000;
-		while (harness.supervisor.isAlive(name)) {
-			if (Date.now() > deadline) throw new Error("watch did not retire the completed child");
+test("vexillatio collect abort returns promptly and retires utility children", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "scout.md": UTILITY_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.startTurn();
+		const collectSignals: Array<AbortSignal | undefined> = [];
+		const signalAwareSupervisor = harness.supervisor as unknown as {
+			waitSettled(name: string, timeoutMs?: number, signal?: AbortSignal): Promise<{ settled: boolean; abnormal: boolean; reason?: string }>;
+		};
+		signalAwareSupervisor.waitSettled = (_name, _timeoutMs, signal) => {
+			collectSignals.push(signal);
+			return new Promise((resolve) => {
+				const aborted = () => resolve({ settled: false, abnormal: false, reason: "aborted by parent" });
+				if (signal?.aborted) aborted();
+				else signal?.addEventListener("abort", aborted, { once: true });
+			});
+		};
+		const controller = new AbortController();
+		const pending = harness.utilityTool.execute(
+			"vexillatio-abort",
+			{ agent: "scout", task: "inspect until aborted", cwd: harness.cwd, timeoutMs: 600_000 },
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		const collectDeadline = Date.now() + 1_000;
+		while (collectSignals.length === 0) {
+			if (Date.now() > collectDeadline) throw new Error("vexillatio did not start collecting the utility child");
 			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
+		const name = harness.supervisor.spawns[0]?.input.name;
+		if (!name) throw new Error("utility child did not spawn");
+		assert.equal(collectSignals[0], controller.signal, "vexillatio forwards the tool signal to collect");
+
+		controller.abort();
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const result = await Promise.race([
+			pending,
+			new Promise<undefined>((resolve) => { timeout = setTimeout(() => resolve(undefined), 250); }),
+		]);
+		if (timeout) clearTimeout(timeout);
+		assert.ok(result, "aborted collect returns without waiting for the 600s timeout");
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
+		assert.equal(harness.supervisor.isAlive(name), false, "the utility child is retired by cascade");
+		assert.deepEqual(
+			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
+			[name],
+		);
 	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("turn_start resets the cascade promise for the next turn", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		for (let turn = 0; turn < 2; turn += 1) {
+			harness.startTurn();
+			await invokeIndex(harness, {
+				agent: "worker",
+				task: `turn ${turn + 1}`,
+				async: true,
+				worktree: false,
+			});
+			const name = harness.supervisor.spawns.at(-1)?.input.name;
+			if (!name) throw new Error("worker child did not spawn");
+			const controller = new AbortController();
+			const pending = harness.tool.execute(
+				`turn-${turn + 1}-wait-abort`,
+				{ action: "wait", name },
+				controller.signal,
+				undefined,
+				{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+			);
+			controller.abort();
+			const result = await pending;
+			assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
+		}
+		assert.deepEqual(
+			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
+			harness.supervisor.spawns.map((spawn) => spawn.input.name),
+		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("parallel aborted waits share one in-flight cascade retirement", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	let releaseRetires: () => void = () => {};
+	try {
+		await invokeIndex(harness, {
+			tasks: [
+				{ agent: "worker", task: "first" },
+				{ agent: "worker", task: "second" },
+			],
+			async: true,
+			worktree: false,
+		});
+		const names = harness.supervisor.spawns.map((spawn) => spawn.input.name);
+		assert.equal(names.length, 2);
+		const retireGate = new Promise<void>((resolve) => { releaseRetires = resolve; });
+		let retireCalls = 0;
+		let resolveAllRetiresStarted!: () => void;
+		const allRetiresStarted = new Promise<void>((resolve) => { resolveAllRetiresStarted = resolve; });
+		const originalRetire = harness.supervisor.retire.bind(harness.supervisor);
+		harness.supervisor.retire = async (name: string) => {
+			retireCalls += 1;
+			if (retireCalls === names.length) resolveAllRetiresStarted();
+			await retireGate;
+			await originalRetire(name);
+		};
+		const controller = new AbortController();
+		const waits = names.map((name, index) => harness.tool.execute(
+			`parallel-wait-abort-${index}`,
+			{ action: "wait", name },
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		));
+		controller.abort();
+		await allRetiresStarted;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(retireCalls, names.length, "both simultaneous aborts share the same in-flight cascade");
+		assert.equal(
+			harness.supervisor.calls.filter((call) => call.method === "retire").length,
+			0,
+			"runtime release waits until every parallel retire has settled",
+		);
+		releaseRetires();
+		const results = await Promise.all(waits);
+		assert.ok(results.every((result) => /interrupted \(parent turn aborted\)/.test((result.content ?? []).map((item) => item.text ?? "").join("\n"))));
+		assert.deepEqual(
+			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name).sort(),
+			[...names].sort(),
+		);
+		assert.ok(names.every((name) => !harness.supervisor.isAlive(name)));
+	} finally {
+		releaseRetires();
 		await harness.cleanup();
 	}
 });

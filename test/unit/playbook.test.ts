@@ -16,6 +16,7 @@ test("playbook text describes RPC launch and frozen child guidance", () => {
 	assert.match(PARENT_PLAYBOOK, /headless RPC children/);
 	assert.match(PARENT_PLAYBOOK, /verify:/);
 	assert.match(TOOL_DESCRIPTION, /async by default/);
+	assert.match(PARENT_PLAYBOOK, /Pressing Esc to abort a parent turn gracefully retires its children/);
 	assert.doesNotMatch(PARENT_PLAYBOOK, /Same agent type shares one tab/);
 });
 
@@ -67,6 +68,7 @@ test("playbook describes event-driven waits and graceful stop", () => {
 	assert.match(PARENT_PLAYBOOK, /use `stop` to gracefully retire one child or all tracked children/);
 	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire, stop/);
 	assert.match(TOOL_DESCRIPTION, /`wait` is event-driven/);
+	assert.match(TOOL_DESCRIPTION, /Esc abort also gracefully retires children owned by that turn/);
 });
 
 test("playbook explains RPC timeout and steering semantics", () => {
