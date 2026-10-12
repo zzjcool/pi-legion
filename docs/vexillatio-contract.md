@@ -32,7 +32,17 @@ utility: true        # 布尔；缺省 false。utility 与 allowNestedSubagents 
 
 ### 2.2 工具 `vexillatio`（index.ts）
 
-注册条件：**无条件注册**（root、子 agent、工具人进程都注册；不受 `isChild && !allowNested` 早退影响——放在 `index.ts:472` 早退**之前**，但受 `subagentsEnabled` 总开关管）。参数：
+注册条件：**root 与子 agent 都注册**；child-guard 的 `isChild && !allowNested` 早退**之前**注册（即无嵌套权的子进程里也可用）。但为避免「工具人无限自复制」（§2.5.4 不校验深度会导致递归无上界）与 `test/unit/child-mode.test.ts:21-27` 的既有断言冲突，注册条件增加一道**环境门**：
+
+```ts
+// index.ts，早退之前：
+const vexillatioAllowed = !isChild
+    || allowNested
+    || process.env[UTILITY_CHAIN_ENV] !== "1";   // 新 env：PI_UTILITY_CHAIN
+// 只有「非链环境」或「工具人链已断」时才注册 vexillatio，见 §2.3a
+```
+
+派发时对 spawn env 设置：若派发者自身是工具人（`PI_UTILITY_CHAIN=1`），则子进程同样带 `PI_UTILITY_CHAIN=1`——即工具人链上**每一个环节都持有 vexillatio 工具**，但工具人链由角色 .md 的 `utility: true` 声明显式开启（scout 默认不开再派），从而自复制是配置行为而非机制默认。与 child-mode.test 断言的兼容：无嵌套权子进程仍注册 1 个工具（vexillatio），测试从 0 改为 1；REV-17.3 授权修改该测试断言（见修订记录）。参数：
 
 ```ts
 const VexillatioParams = Type.Object({
@@ -99,10 +109,11 @@ const VexillatioParams = Type.Object({
 | `agents/scout.md`（内置层） | 同上（包内默认） |
 | `test/unit/utility-agents.test.ts` | **新建**。§4 场景 1（frontmatter `utility` 解析）+ 场景 5（utility+allowNested 同开 warning） |
 | `test/integration/vexillatio.test.ts` | **新建**。§4 场景 2/3/4（mock supervisor：env 剔除断言 / 非 utility 硬拒 / subagent 兼容派发） |
+| `test/unit/child-mode.test.ts` | **唯一允许修改的既有测试**：仅限第一个用例的断言数字 0 → 1，并加注释引用本契约 §2.2（REV-17.3 授权） |
 
 **共享文件**：`index.ts` / `orchestrator.ts` / `types.ts` 本契约全部分配给唯一 worker，无并发写。
 
-**既有测试文件一律不修改**；§4 要求的新增测试全部落在上面两个新文件里。
+**既有测试文件除 §3 明确授权的 `test/unit/child-mode.test.ts` 断言数字修订外一律不修改**；§4 要求的新增测试全部落在两个新文件里。
 
 ## 4. 验收清单（可机器检查）
 
@@ -135,3 +146,4 @@ const VexillatioParams = Type.Object({
 | 2026-10-12 | REV-17 初版 | — | 首次冻结 |
 | 2026-10-12 | REV-17.1 | §3 增补两行测试文件所有权（新建 `test/unit/utility-agents.test.ts`、`test/integration/vexillatio.test.ts`），并明确既有测试文件不改 | worker 依 §4 验收要求提出契约矛盾（§3 未授权测试文件）——拒绝正确，修订后重派 |
 | 2026-10-12 | REV-17.2 | §3 增补 `src/agents/overrides.ts` 所有权（worker-1 指出 settings 行的动作列引用了未授权文件）；自查确认无其他「动作列引用未授权文件」情况 | worker-1 依契约矛盾流程上报（§3 :91 行动作列要求同步 overrides.ts 清单但表未授权）——拒绝正确，修订后重派 |
+| 2026-10-12 | REV-17.3 | §2.2 注册条件从「无条件」改为「环境门 PI_UTILITY_CHAIN」（修自复制递归无上界漏洞 + 与 child-mode.test 兼容）；授权修改该测试断言 0→1 | worker-2 指出 §2.2 无条件注册与 test/unit/child-mode.test.ts:21-27 冲突且 §3 未授权——拒绝正确；根因是契约自身设计缺陷（自复制无上界），修订后重派 |
