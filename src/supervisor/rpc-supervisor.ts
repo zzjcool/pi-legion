@@ -20,18 +20,21 @@ import {
 } from "./ui-proxy.ts";
 import {
 	type ChildHandle,
+	type DescendantInfo,
 	type EventSubscriptionOptions,
 	type LegionSupervisor,
 	type RpcClientFactory,
 	type RpcClientLike,
 	type RpcClientOptions,
 	type RpcProcessHandle,
+	type RpcSupervisorOptions,
 	type SettleResult,
 	type SpawnInput,
 	type SupervisorEvent,
 	type SupervisorEventListener,
 	type UsageSnapshot,
 } from "./types.ts";
+import { currentPgid, enumerateDescendants } from "./proc-tree.ts";
 
 interface EventSubscription {
 	listener: SupervisorEventListener;
@@ -64,19 +67,11 @@ interface ChildRecord {
 	abortedPending: boolean;
 }
 
-export interface RpcSupervisorOptions {
-	/** Replace the Pi client constructor in unit tests. */
-	clientFactory?: RpcClientFactory;
-	/** In-memory by default; M1-integration supplies a real TUI consumer. */
-	uiProxy?: UIProxy;
-	/** Grace period after stdin close before SIGTERM. */
-	retireTimeoutMs?: number;
-	/** Grace period for a child to exit after SIGTERM. */
-	signalTimeoutMs?: number;
-}
+export type { RpcSupervisorOptions } from "./types.ts";
 
 const DEFAULT_RETIRE_TIMEOUT_MS = 5_000;
 const DEFAULT_SIGNAL_TIMEOUT_MS = 1_000;
+const DEFAULT_KILL_TIMEOUT_MS = 1_000;
 const COARSE_EVENT_TYPES = new Set([
 	"agent_start",
 	"agent_end",
@@ -164,6 +159,15 @@ function processHasExited(child: RpcProcessHandle): boolean {
 	);
 }
 
+function defaultSignalProcess(target: number, signal: NodeJS.Signals): boolean {
+	try {
+		process.kill(target, signal);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function normalizedNumber(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
@@ -192,6 +196,9 @@ export class RpcSupervisor implements LegionSupervisor {
 	private readonly clientFactory: RpcClientFactory;
 	private readonly retireTimeoutMs: number;
 	private readonly signalTimeoutMs: number;
+	private readonly killTimeoutMs: number;
+	private readonly enumerateDescendants: (rootPid: number) => DescendantInfo[];
+	private readonly signalProcess: (target: number, signal: NodeJS.Signals) => boolean;
 	readonly uiProxy: UIProxy;
 
 	constructor(options: RpcSupervisorOptions = {}) {
@@ -199,6 +206,9 @@ export class RpcSupervisor implements LegionSupervisor {
 		this.uiProxy = options.uiProxy ?? new InMemoryUIProxy();
 		this.retireTimeoutMs = options.retireTimeoutMs ?? DEFAULT_RETIRE_TIMEOUT_MS;
 		this.signalTimeoutMs = options.signalTimeoutMs ?? DEFAULT_SIGNAL_TIMEOUT_MS;
+		this.killTimeoutMs = options.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
+		this.enumerateDescendants = options.enumerateDescendants ?? enumerateDescendants;
+		this.signalProcess = options.signalProcess ?? defaultSignalProcess;
 	}
 
 	async spawnChild(input: SpawnInput): Promise<ChildHandle> {
@@ -776,6 +786,10 @@ export class RpcSupervisor implements LegionSupervisor {
 			this.removeTempDir(child);
 			return;
 		}
+		const childPid = child.process?.pid;
+		const descendants = childPid === undefined
+			? []
+			: this.enumerateDescendants(childPid);
 		child.retireRequested = true;
 		child.state = "retiring";
 		this.uiProxy.forgetChild(child.name);
@@ -805,6 +819,11 @@ export class RpcSupervisor implements LegionSupervisor {
 			await this.waitForExit(child, this.signalTimeoutMs);
 		}
 		if (this.isAlive(child.name)) {
+			child.process?.kill("SIGKILL");
+			await this.waitForExit(child, this.killTimeoutMs);
+		}
+		await this.sweepDescendants(descendants);
+		if (this.isAlive(child.name)) {
 			throw new SubagentError(
 				`timed out retiring Pi RPC child: ${child.name}`,
 				ErrorCodes.RETIRE_FAILED,
@@ -816,6 +835,55 @@ export class RpcSupervisor implements LegionSupervisor {
 		child.unsubscribeRpcEvents?.();
 		child.unsubscribeRpcEvents = undefined;
 		this.removeTempDir(child);
+	}
+
+	private async sweepDescendants(descendants: DescendantInfo[]): Promise<void> {
+		if (descendants.length === 0) return;
+
+		const ownPgid = currentPgid();
+		const pgids: number[] = [];
+		const seenPgids = new Set<number>();
+		for (const descendant of descendants) {
+			const pgid = descendant.pgid;
+			if (
+				ownPgid === null ||
+				!Number.isSafeInteger(pgid) ||
+				pgid <= 0 ||
+				pgid === ownPgid ||
+				seenPgids.has(pgid)
+			) {
+				continue;
+			}
+			seenPgids.add(pgid);
+			pgids.push(pgid);
+		}
+
+		const pids: number[] = [];
+		const seenPids = new Set<number>();
+		for (const descendant of descendants) {
+			const pid = descendant.pid;
+			if (!Number.isSafeInteger(pid) || pid <= 0 || seenPids.has(pid)) continue;
+			seenPids.add(pid);
+			pids.push(pid);
+		}
+
+		const signal = (target: number, signalName: NodeJS.Signals) => {
+			try {
+				this.signalProcess(target, signalName);
+			} catch {
+				// A stale or inaccessible descendant must not stop the sweep.
+			}
+		};
+		for (const pgid of pgids) signal(-pgid, "SIGTERM");
+		for (const pid of pids) signal(pid, "SIGTERM");
+
+		await new Promise<void>((resolve) => {
+			const timer = setTimeout(resolve, this.signalTimeoutMs);
+			timer.unref();
+		});
+
+		for (const pgid of pgids) signal(-pgid, "SIGKILL");
+		for (const pid of pids) signal(pid, "SIGKILL");
 	}
 
 	private closeInput(child: ChildRecord): boolean {
@@ -844,6 +912,7 @@ export class RpcSupervisor implements LegionSupervisor {
 			};
 			const onExit = () => finish(true);
 			const timer = setTimeout(() => finish(false), timeoutMs);
+			timer.unref?.();
 			process.once("exit", onExit);
 			if (processHasExited(process)) finish(true);
 		});
