@@ -1,3 +1,4 @@
+import { statSync } from "node:fs";
 import { matchesKey, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type {
 	ExtensionAPI,
@@ -6,6 +7,8 @@ import type {
 import {
 	createLiveOverlay,
 	createLiveOverlayFactory,
+	type LiveOverlayBackfillCursor,
+	type LiveOverlayBackfillResult,
 	type LiveOverlayListener,
 	type LiveOverlayNode,
 	type LiveOverlaySource,
@@ -26,6 +29,8 @@ import type {
 	EventSubscriptionOptions,
 	SupervisorEvent,
 } from "../supervisor/types.ts";
+import { countAssistantMessages, parseSessionFile } from "../shared/session.ts";
+import type { ParsedSession } from "../shared/types.ts";
 
 export const LEGION_COMMAND = "legion";
 
@@ -119,7 +124,7 @@ function subscribeTextDeltas(
 	bus: LegionEventBus,
 	supervisorName: string,
 	nodeId: string,
-): () => void {
+): { unsubscribe: () => void; subscribed: boolean } {
 	const unsubscribe = supervisor.onEvent?.(
 		supervisorName,
 		(event) => publishSupervisorEvent(bus, nodeId, event, {
@@ -128,7 +133,10 @@ function subscribeTextDeltas(
 		}),
 		{ includeTextDelta: true },
 	);
-	return unsubscribe ?? (() => {});
+	return {
+		unsubscribe: unsubscribe ?? (() => {}),
+		subscribed: unsubscribe !== undefined,
+	};
 }
 
 function nodeLabel(nodeId: string, name: string): string {
@@ -145,6 +153,89 @@ function resolveNode(
 		node.name === query || node.id.slice(node.id.lastIndexOf(".") + 1) === query,
 	);
 	return matches.length === 1 ? matches[0] : undefined;
+}
+
+function sessionActivityLines(
+	parsed: ParsedSession,
+	options: { startTurnIndex?: number; cursor?: LiveOverlayBackfillCursor } = {},
+): string[] {
+	const lines: string[] = [];
+	const startTurnIndex = options.startTurnIndex ?? 0;
+	let assistantMessageIndex = 0;
+	for (const [turnIndex, turn] of parsed.turns.entries()) {
+		const isNewTurn = options.cursor
+			? turnIndex >= options.cursor.turnCount
+			: turnIndex >= startTurnIndex;
+		if (isNewTurn && turn.userText.length > 0) lines.push(`▸ ${turn.userText}`);
+		for (const assistant of turn.assistants) {
+			const isNewAssistant = options.cursor
+				? assistantMessageIndex >= options.cursor.assistantMessageCount
+				: turnIndex >= startTurnIndex;
+			if (isNewAssistant) {
+				if (assistant.text) lines.push(assistant.text);
+				for (const toolName of assistant.tools) lines.push(`⚙ ${toolName}`);
+			}
+			assistantMessageIndex++;
+		}
+	}
+	return lines;
+}
+
+function readSessionSize(sessionFile: string): number | undefined {
+	try {
+		return statSync(sessionFile).size;
+	} catch {
+		return undefined;
+	}
+}
+
+function sessionCursor(parsed: ParsedSession, fileSize: number): LiveOverlayBackfillCursor {
+	return {
+		turnCount: parsed.turns.length,
+		assistantMessageCount: countAssistantMessages(parsed),
+		fileSize,
+	};
+}
+
+function readSessionBackfill(
+	sessionFile: string,
+	maxBackfillTurns: number,
+): LiveOverlayBackfillResult | undefined {
+	// Take the size before parsing: if the append-only file grows during the
+	// parse, the next poll sees that newer size and can safely re-read it.
+	const fileSize = readSessionSize(sessionFile);
+	if (fileSize === undefined) return undefined;
+	const parsed = parseSessionFile(sessionFile);
+	return {
+		lines: sessionActivityLines(parsed, {
+			startTurnIndex: Math.max(0, parsed.turns.length - maxBackfillTurns),
+		}),
+		cursor: sessionCursor(parsed, fileSize),
+	};
+}
+
+function readSessionDelta(
+	sessionFile: string,
+	cursor: LiveOverlayBackfillCursor,
+): LiveOverlayBackfillResult | undefined {
+	// The append-only JSONL file is only reparsed after its byte size changes.
+	const fileSize = readSessionSize(sessionFile);
+	if (fileSize === undefined || fileSize === cursor.fileSize) return undefined;
+	const parsed = parseSessionFile(sessionFile);
+	const nextAssistantMessageCount = countAssistantMessages(parsed);
+	if (
+		parsed.turns.length < cursor.turnCount ||
+		nextAssistantMessageCount < cursor.assistantMessageCount
+	) {
+		// Do not move a monotonic cursor backwards if a concurrent partial write is unreadable.
+		return undefined;
+	}
+	// Parsed turn/message counts are stable positions in the append-only JSONL:
+	// render only turns/messages at or beyond them, so each appended record is emitted once.
+	return {
+		lines: sessionActivityLines(parsed, { cursor }),
+		cursor: sessionCursor(parsed, fileSize),
+	};
 }
 
 function liveNode(
@@ -180,20 +271,25 @@ function treeForLiveSource(
 	};
 
 	return {
+		backfill(nodeId, maxBackfillTurns) {
+			refresh();
+			const sessionFile = nodes.get(nodeId)?.sessionFile;
+			return sessionFile ? readSessionBackfill(sessionFile, maxBackfillTurns) : undefined;
+		},
 		subscribe(nodeId: string, listener: LiveOverlayListener): LiveOverlaySubscription {
 			refresh();
 			const currentNode = nodes.get(nodeId);
 			const activeJob = deps.runtime.activeJobs().find((job) =>
 				job.nodeId === nodeId || (job.nodeId === undefined && currentNode !== undefined && job.name === currentNode.name),
 			);
-			const rpcUnsubscribe = activeJob
+			const textDeltaFeed = activeJob
 				? subscribeTextDeltas(
 					deps.supervisor,
 					deps.bus,
 					supervisorName(nodeId, currentNode),
 					nodeId,
 				)
-				: () => {};
+				: { unsubscribe: () => {}, subscribed: false };
 			const busUnsubscribers = LEGION_EVENT_TYPES.map((type) =>
 				deps.bus.on(type, (event) => {
 					if (event.nodeId !== nodeId) return;
@@ -210,12 +306,18 @@ function treeForLiveSource(
 				}),
 			);
 			let active = true;
-			return (() => {
+			const subscription = (() => {
 				if (!active) return;
 				active = false;
-				rpcUnsubscribe();
+				textDeltaFeed.unsubscribe();
 				for (const unsubscribe of busUnsubscribers) unsubscribe();
 			}) as LiveOverlaySubscription;
+			// The RPC feed is authoritative for an active job; its subscription and
+			// session-file polling are mutually exclusive to prevent double output.
+			if (!textDeltaFeed.subscribed && currentNode?.sessionFile) {
+				subscription.pollBackfill = (cursor) => readSessionDelta(currentNode.sessionFile!, cursor);
+			}
+			return subscription;
 		},
 		unsubscribe(subscription) {
 			subscription();
