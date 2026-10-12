@@ -719,6 +719,31 @@ test("runtime.wait: parent abort interrupts promptly, clears its timer, and rest
 	runtime.dispose();
 });
 
+test("runtime.wait: an interrupted unwatched job is not re-armed before the session cascade", async () => {
+	let resolveCollect!: (snapshot: CollectSnapshot) => void;
+	const messages: unknown[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) { messages.push(message); },
+	});
+	runtime.track({
+		name: "unwatched",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/unwatched.jsonl",
+		timeoutMs: 1_000,
+		collect: () => new Promise<CollectSnapshot>((resolve) => { resolveCollect = resolve; }),
+	});
+	const controller = new AbortController();
+	const pending = runtime.wait(["unwatched"], { timeoutMs: 5_000, signal: controller.signal });
+	controller.abort();
+	assert.deepEqual(await pending, [{ name: "unwatched", interrupted: true }]);
+	assert.equal(runtime.get("unwatched")?.watching, false, "the session cascade, not waitOne, owns post-abort cleanup");
+	resolveCollect(joinSnapshot({ output: "retired by cascade" }));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(messages.length, 0, "aborted waits do not arm a completion notification");
+	runtime.dispose();
+});
+
 test("runtime.wait: finished-cache hits return instantly; unknown names are missing", async () => {
 	const runtime = createSessionRuntime({ sendMessage() {} });
 	runtime.track({

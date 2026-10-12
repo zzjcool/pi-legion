@@ -932,12 +932,12 @@ subagent({
 | `resume` | **已退出后恢复**（F12） | 新 pane + `--session <file>` |
 | `retire` | 回收 | ctrl+d / pane close / tab close |
 | `status` / `collect` / `list` | 查询 | child record / session JSONL |
-| `wait` | 等待指定或全部活动 child 完成；由 RPC settle 事件唤醒，也支持 ESC 提前返回 | session runtime + RPC supervisor |
+| `wait` | 等待指定或全部活动 child 完成；由 RPC settle 事件唤醒；ESC 中断时级联优雅关闭 children 后返回 | session runtime + RPC supervisor |
 | `stop` | 优雅停止指定或全部 tracked、非 retired children | `retire` 全链 + runtime release |
 
 ### ESC abort 语义 + stop
 
-父 turn 的 ESC / RPC abort signal 只打断当前 `subagent` 工具的等待，不会杀死 child。`wait` 和 `collect` 将 signal 传到可中断等待点；`wait` 返回 `interrupted (parent turn aborted)`，并把完成通知权还给后台 watcher，因此 child 继续运行、完成后仍会通知父会话。RPC settle 事件会立即解除正常 `wait`，不需要等满 timeout。`collect` 被中断时返回 `execution: running (aborted by parent)` 快照，不把 child 标为完成，也不开始 retire。
+父 turn 的 ESC / RPC abort signal 会立即打断当前工具等待，并静默级联优雅关闭该 session 所拥有的 tracked children（包括 vexillatio utility children）。`wait` 返回 `interrupted (parent turn aborted)` 前先完成级联 retire；`collect` / inline collect 被中断时也会级联关闭 children，不生成显式 stop 的工具结果文案。级联先取消 completion watch，再并行 retire 并释放 runtime tracking；并发 abort 复用同一级联 promise。新的 turn 会建立新的级联周期。正常完成的 `wait` 仍由 RPC settle 事件立即解除，不需要等满 timeout。
 
 `stop` 是显式停止操作：`subagent({ action: "stop", name: "worker-0" })` 停一个 child，`subagent({ action: "stop", all: true })` 逐个停止当前跟踪的全部非 retired children。它复用 `retire` 生命周期（优雅关闭、超时后升级信号、后代清理）并释放 runtime 跟踪；`stop` 本身不接父 turn abort signal。`name` 与 `all` 互斥且必须指定其一。
 

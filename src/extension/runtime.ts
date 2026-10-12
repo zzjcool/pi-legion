@@ -505,7 +505,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		job.consumedByTool = true;
 		if (signal?.aborted) {
 			job.consumedByTool = false;
-			if (!job.watching) runtime.watch(name);
 			return { name, interrupted: true };
 		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -533,10 +532,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			}
 			const outcome = await Promise.race(racers);
 			if (outcome === WAIT_INTERRUPTED) {
-				// The background watcher owns completion notification after the
-				// parent turn stops waiting; start one if this tool owns the only collect.
+				// The session-level abort cascade retires this job, so do not arm
+				// a completion watcher for a child that is about to be closed.
 				job.consumedByTool = false;
-				if (!job.watching) runtime.watch(name);
 				return { name, interrupted: true };
 			}
 			const snapshot = outcome;
@@ -793,7 +791,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					cleanup();
 					if (jobs.get(name) === job) {
 						job.consumedByTool = false;
-						if (!job.watching) runtime.watch(name);
 					}
 					resolve(undefined);
 				};

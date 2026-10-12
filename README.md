@@ -88,9 +88,10 @@ see [Three-layer visualization](#three-layer-visualization) for navigation.
 
 The `subagent` control actions include event-driven `wait` and graceful `stop`:
 `subagent({ action: "wait", name: "worker-0" })` returns as soon as the child
-settles (or the parent turn is interrupted with Esc); interrupting a wait does
-not stop the child, which continues to deliver its completion notice. To stop
-children, use `subagent({ action: "stop", name: "worker-0" })` or
+settles (or the parent turn is interrupted with Esc). Aborting a parent turn
+with Esc gracefully retires its tracked children, including those being waited
+on or collected; the cascade is silent. To stop children explicitly, use
+`subagent({ action: "stop", name: "worker-0" })` or
 `subagent({ action: "stop", all: true })`; this runs the normal graceful-retire
 sequence for each selected child.
 
