@@ -32,17 +32,12 @@ utility: true        # 布尔；缺省 false。utility 与 allowNestedSubagents 
 
 ### 2.2 工具 `vexillatio`（index.ts）
 
-注册条件：**root 与子 agent 都注册**；child-guard 的 `isChild && !allowNested` 早退**之前**注册（即无嵌套权的子进程里也可用）。但为避免「工具人无限自复制」（§2.5.4 不校验深度会导致递归无上界）与 `test/unit/child-mode.test.ts:21-27` 的既有断言冲突，注册条件增加一道**环境门**：
+注册条件（REV-17.4 重写，取代 17.3 的环境门）：**`env.PI_SUBAGENT_UTILITY_CHILD !== "1"`**（root 与非 utility 角色进程都注册；child-guard 的 `isChild && !allowNested` 早退之前注册）。`PI_SUBAGENT_UTILITY_CHILD`（下称 UTILITY_CHILD）**不是**由工具人在派发时传播，而是在 `orchestrator.lineageEnv` 里统一初始化：目标角色 `utility === true` → 设为 `"1"`，两个派发通道（vexillatio / subagent）同规则。因此：
 
-```ts
-// index.ts，早退之前：
-const vexillatioAllowed = !isChild
-    || allowNested
-    || process.env[UTILITY_CHAIN_ENV] !== "1";   // 新 env：PI_UTILITY_CHAIN
-// 只有「非链环境」或「工具人链已断」时才注册 vexillatio，见 §2.3a
-```
+- 工具人进程**不持有 vexillatio**（也没 subagent：§2.3 剥除其 ALLOW_NESTED）——它是硬叶子，自复制/再派任何东西都必须改角色 .md 显式配置，机制默认不可递归。
+- 判定依据是**角色身份**（agent.utility），不是出生方式（哪个通道生的）——兼容通道（subagent 派 utility 角色）与专用通道行为一致，不再存在「subagent 兼容派 scout 绕开叶子约束」的路径。
 
-派发时对 spawn env 设置：若派发者自身是工具人（`PI_UTILITY_CHAIN=1`），则子进程同样带 `PI_UTILITY_CHAIN=1`——即工具人链上**每一个环节都持有 vexillatio 工具**，但工具人链由角色 .md 的 `utility: true` 声明显式开启（scout 默认不开再派），从而自复制是配置行为而非机制默认。与 child-mode.test 断言的兼容：无嵌套权子进程仍注册 1 个工具（vexillatio），测试从 0 改为 1；REV-17.3 授权修改该测试断言（见修订记录）。参数：
+与 `test/unit/child-mode.test.ts:21-27` 的兼容：无嵌套权子进程仍注册 1 个工具（vexillatio），测试断言 0 → 1；REV-17.4 维持 17.3 的授权（见 §3）。参数：
 
 ```ts
 const VexillatioParams = Type.Object({
@@ -58,7 +53,7 @@ const VexillatioParams = Type.Object({
 **只有 launch 语义**（无 status/collect/wait/steer/retire——用 `subagent` 工具的既有控制动作管理同名子节点；见 2.6）。执行流程（同步）：
 
 1. 解析 agent：默认 `scout`；目标必须在 catalog 里且 `utility === true`，否则报错 `not a utility agent: <name> (mark it with 'utility: true')`。
-2. 走**既有 `orchestrator.launch`**（复用 budget/session/colony 管线），但 `SpawnInput.env` 显式剔除 legion 身份四变量：`PI_LEGION_DB`、`PI_LEGION_NODE_ID`、`PI_SUBAGENT_PARENT_PATH`、`PI_SUBAGENT_MAX_DEPTH`（防幽灵节点 + 防工具人继承指挥链身份）。**不剔除** `PI_SUBAGENT_CHILD`、`PI_SUBAGENT_ALLOW_NESTED`、`PI_SUBAGENT_CHILD_ROLE`、`PI_SUBAGENT_MAX_TOOL_CALLS` 等预算变量（child-guard 仍要工作；见 2.5 的 ALLOW_NESTED 剥离）。
+2. 走**既有 `orchestrator.launch`**（复用 budget/session 管线），但 `SpawnInput.env` 显式剔除 legion 身份四变量：`PI_LEGION_DB`、`PI_LEGION_NODE_ID`、`PI_SUBAGENT_PARENT_PATH`、`PI_SUBAGENT_MAX_DEPTH`（防幽灵节点 + 防工具人继承指挥链身份）。**不剔除** `PI_SUBAGENT_CHILD`、`PI_SUBAGENT_CHILD_ROLE`、`PI_SUBAGENT_MAX_TOOL_CALLS` 等预算变量（child-guard 仍要工作）。vexillatio 通道对目标 utility 角色**剥除 `PI_SUBAGENT_ALLOW_NESTED`**（§2.5 叶子）；`lineageEnv` 统一设置 `PI_SUBAGENT_UTILITY_CHILD`（§2.2）。
 3. launch 后 `awaitSupervisor` + 静默宽限（复用 `collect` 的 grace 逻辑），产出直接以文本返回（`renderCollect` 简化版：`── <name> ──\nexecution: …\n<output>`），同 `collect` 的 `outputFile` 惯例写 `<name>.output.md`。
 4. 返回值含 `outputFile`/`sessionFile` 路径，父可后续用 `subagent({action:'collect'|'steer'|'retire', name})` 控制——**节点进 legion 树**，parent = 派发进程自己的 nodeId（若派发者无 legion 身份，则该 run 走无 legion 的普通 run 目录管线，同现有非 legion 子进程行为）。
 
@@ -70,7 +65,8 @@ const VexillatioParams = Type.Object({
 | `PI_SUBAGENT_PARENT_PATH` | **剔除** | 不继承指挥链 lineage |
 | `PI_SUBAGENT_MAX_DEPTH` | **剔除** | 工具人不做深度预算参与者；它自身作为叶子由 2.5 保证 |
 | `PI_SUBAGENT_CHILD` | 保留 =1 | child-guard 必须激活 |
-| `PI_SUBAGENT_ALLOW_NESTED` | **剔除**（工具人自身不带嵌套权——除非它要再派工具人） | 工具人默认叶子；若某工具人想再派工具人，其角色 .md 自己写 `allowNestedSubagents: true`（此时它既可派 subagent 又可派 vexillatio，深度语义不叠加） |
+| `PI_SUBAGENT_ALLOW_NESTED` | **剔除**（vexillatio 通道对 utility 目标强制叶子；subagent 兼容通道照旧由目标自己的 frontmatter 决定） | 工具人默认叶子；想显式再派（罕见）需角色 .md 同时声明，此时受 catalog warning 提示 |
+| `PI_SUBAGENT_UTILITY_CHILD` | **lineageEnv 统一设置**：目标 utility → "1"；否则 unset | 工具人身份标记，vexillatio 注册门的判定输入（§2.2） |
 | `PI_SUBAGENT_CHILD_ROLE` / 预算变量（MAX_TOOL_CALLS / MAX_TURNS / TOOL_TIMEOUT_MS） | 保留 | child-guard 行为不变 |
 | `PI_SUBAGENT_TEAM` | 保留 | team 过滤照旧 |
 
@@ -82,10 +78,10 @@ const VexillatioParams = Type.Object({
 
 ### 2.5 互斥与约束（实现必须校验）
 
-1. `utility: true` + `allowNestedSubagents: true` 同角色 → **catalog 加载时报 warning**（不硬拒），提示「utility 角色不应开嵌套」。
-2. vexillatio 的目标角色强制叶子：launch 时若目标 `maxSubagentDepth > 1` 或写了 `allowNestedSubagents`，按 2.3 的 ALLOW_NESTED 剥离规则执行（提示层警告一次）。
-3. `subagent` 工具派发 utility 角色 → **允许**（向下兼容，工具人本来就是子 agent 的一种）；vexillatio 派非 utility 角色 → 硬拒（INVALID_PARAMS）。
-4. depth：vexillatio 派发**不校验 assertWithinBudgets**（它不是嵌套）；但 vexillatio 自身进程的 `PI_SUBAGENT_MAX_DEPTH` 已剥离，其再派任何东西（若该工具人配了 allowNested）按 `subagent` 语义重新从头计深度。
+1. `utility: true` + `allowNestedSubagents: true` 同角色 → **catalog 加载时报 warning**（不硬拒），提示「utility 角色不应开嵌套」；此时该角色进程持有 subagent 但无 vexillatio（§2.2 门），行为仍可预测。
+2. vexillatio 通道派发的 utility 目标强制叶子：剥除其 ALLOW_NESTED（§2.3）；其深度预算亦已剥离（MAX_DEPTH env 剔除）。
+3. `subagent` 工具派发 utility 角色 → 允许（向下兼容）；其 env 中 `PI_SUBAGENT_UTILITY_CHILD` 仍由 lineageEnv 统一设置（角色身份优先），即兼容通道出生的 utility 同样是硬叶子，无递归路径。vexillatio 派非 utility 角色 → 硬拒（INVALID_PARAMS）。
+4. depth：vexillatio 派发**不校验 assertWithinBudgets**（它不是嵌套）；工具人进程自身已无 vexillatio/subagent（§2.2/§2.3），天然无递归上界问题。
 
 ### 2.6 命名与树
 
@@ -99,8 +95,7 @@ const VexillatioParams = Type.Object({
 | `src/shared/types.ts` | AgentConfig + `utility?: boolean` |
 | `src/agents/agents.ts` | frontmatter 解析 `utility`（applyBehaviorFields 层） |
 | `src/agents/settings.ts` | agentOverrides 白名单字段加 `utility` |
-| `src/agents/overrides.ts` | `OVERRIDE_FIELDS`（:20-54）加 `"utility"`——settings 层 override 的实际复制通道，不加则 override 被丢弃 |
-| `src/runs/orchestrator.ts` | launch 支持 `stripLegionIdentity?: boolean`（SpawnInput 选项，控制 env 剔除） |
+| `src/agents/overrides.ts` | `OVERRIDE_FIELDS`（:20-54）加 `"utility"`——settings 层 override 的实际复制通道，不加则 override 被丢弃 || `src/runs/orchestrator.ts` | launch 支持 `stripLegionIdentity?: boolean`（SpawnInput 选项，控制 env 剔除） |
 | `src/supervisor/rpc-supervisor.ts` | SpawnInput.env 透传（已有；无需改动，除非类型收紧） |
 | `index.ts` | 注册 `vexillatio` 工具（早退之前）+ PLAYBOOK 文本 |
 | `src/extension/playbook.ts` | PARENT_PLAYBOOK 追加段 |
@@ -109,7 +104,7 @@ const VexillatioParams = Type.Object({
 | `agents/scout.md`（内置层） | 同上（包内默认） |
 | `test/unit/utility-agents.test.ts` | **新建**。§4 场景 1（frontmatter `utility` 解析）+ 场景 5（utility+allowNested 同开 warning） |
 | `test/integration/vexillatio.test.ts` | **新建**。§4 场景 2/3/4（mock supervisor：env 剔除断言 / 非 utility 硬拒 / subagent 兼容派发） |
-| `test/unit/child-mode.test.ts` | **唯一允许修改的既有测试**：仅限第一个用例的断言数字 0 → 1，并加注释引用本契约 §2.2（REV-17.3 授权） |
+| `test/unit/child-mode.test.ts` | **唯一允许修改的既有测试**：仅限第一个用例的断言数字 0 → 1，并加注释引用本契约 §2.2（REV-17.4 维持授权） |
 
 **共享文件**：`index.ts` / `orchestrator.ts` / `types.ts` 本契约全部分配给唯一 worker，无并发写。
 
@@ -147,3 +142,4 @@ const VexillatioParams = Type.Object({
 | 2026-10-12 | REV-17.1 | §3 增补两行测试文件所有权（新建 `test/unit/utility-agents.test.ts`、`test/integration/vexillatio.test.ts`），并明确既有测试文件不改 | worker 依 §4 验收要求提出契约矛盾（§3 未授权测试文件）——拒绝正确，修订后重派 |
 | 2026-10-12 | REV-17.2 | §3 增补 `src/agents/overrides.ts` 所有权（worker-1 指出 settings 行的动作列引用了未授权文件）；自查确认无其他「动作列引用未授权文件」情况 | worker-1 依契约矛盾流程上报（§3 :91 行动作列要求同步 overrides.ts 清单但表未授权）——拒绝正确，修订后重派 |
 | 2026-10-12 | REV-17.3 | §2.2 注册条件从「无条件」改为「环境门 PI_UTILITY_CHAIN」（修自复制递归无上界漏洞 + 与 child-mode.test 兼容）；授权修改该测试断言 0→1 | worker-2 指出 §2.2 无条件注册与 test/unit/child-mode.test.ts:21-27 冲突且 §3 未授权——拒绝正确；根因是契约自身设计缺陷（自复制无上界），修订后重派 |
+| 2026-10-12 | REV-17.4 | §2.2 重写：判定依据从「出生方式」改为「角色身份」（agent.utility），新 env `PI_SUBAGENT_UTILITY_CHILD` 由 lineageEnv 统一设置（两通道同规则）；§2.3 表重排；§2.5 重写；场景矩阵六例闭合推演（root/planner/worker/scout 两通道/误配 warning） | worker-3 指出 17.3 的门与「链上每环节持有工具」同句自矛盾且 PI_UTILITY_CHAIN 初始化语义悬空——拒绝正确，修订后重派 |
