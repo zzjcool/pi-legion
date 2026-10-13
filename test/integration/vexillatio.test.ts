@@ -24,9 +24,11 @@ interface RegisteredTool {
 function fakePi() {
 	const tools = new Map<string, RegisteredTool>();
 	const handlers = new Map<string, (...args: unknown[]) => unknown>();
+	const messages: unknown[] = [];
 	return {
 		tools,
 		handlers,
+		messages,
 		registerTool(tool: unknown) {
 			const typed = tool as RegisteredTool;
 			tools.set(typed.name, typed);
@@ -36,7 +38,7 @@ function fakePi() {
 			handlers.set(name, handler);
 		},
 		registerCommand() {},
-		sendMessage() {},
+		sendMessage(message: unknown) { messages.push(message); },
 		events: { emit() {} },
 	};
 }
@@ -231,6 +233,9 @@ test("vexillatio dispatches a utility agent, strips lineage, and returns its col
 			assert.match(text, /utility output for scout/);
 			assert.match(text, /sessionFile:/);
 			assert.equal(supervisor.spawns.length, 1);
+			const details = result.details as { async?: boolean; stillRunning?: string[] } | undefined;
+			assert.equal(details?.async, false);
+			assert.equal(details?.stillRunning, undefined, "settled utilities need no stillRunning detail");
 
 			const env = supervisor.spawns[0]?.input.env;
 			assert.equal(env?.PI_SUBAGENT_CHILD, "1");
@@ -291,6 +296,29 @@ test("vexillatio falls back to allAgents when the active team omits a utility ag
 			assert.match(result.content[0]?.text ?? "", /── scout-0 ──/);
 			assert.equal(supervisor.spawns.length, 1);
 			assert.equal(supervisor.spawns[0]?.input.agent.name, "scout");
+		},
+	);
+});
+
+test("vexillatio does not resurrect a utility explicitly disabled by the active team", async () => {
+	await withSandbox(
+		{ PI_SUBAGENTS_TEAM: "be-value" },
+		async ({ pi, supervisor, cwd }) => {
+			writeProjectSubagentSettings(cwd, {
+				teams: {
+					"be-value": {
+						members: ["worker", { agent: "scout", disabled: true }],
+					},
+				},
+			});
+			const result = await invoke(pi, "vexillatio", {
+				task: "Inspect the test repository as a utility.",
+				agent: "scout",
+			}, context(cwd));
+			assert.equal((result.details as { error?: string } | undefined)?.error, ErrorCodes.INVALID_PARAMS);
+			assert.match(result.content[0]?.text ?? "", /unknown agent "scout" in team "be-value"/);
+			assert.doesNotMatch(result.content[0]?.text ?? "", /not a utility agent/);
+			assert.equal(supervisor.spawns.length, 0);
 		},
 	);
 });
@@ -466,6 +494,11 @@ test("vexillatio tracks a timed-out utility until completion clears its Legion a
 		const output = result.content.map((part) => part.text ?? "").join("\n");
 		assert.match(output, /execution: running/);
 		assert.match(output, /collect timed out after 50ms/);
+		assert.deepEqual(
+			(result.details as { stillRunning?: string[] } | undefined)?.stillRunning,
+			["scout-0"],
+			"the tool details name the utility that remains under a watch",
+		);
 		assert.equal(supervisor.isAlive("scout-0"), true);
 		assert.equal(footer.status, "1 agent running");
 		assert.equal(footer.widgetVisible, true);
@@ -505,6 +538,120 @@ test("vexillatio tracks a timed-out utility until completion clears its Legion a
 			"the retained shutdown retire hook must share the watch's completed retirement",
 		);
 	}, supervisor);
+});
+
+test("non-nested command-chain child retires a timed-out utility on session shutdown", async () => {
+	const supervisor = new FirstTimeoutSupervisor();
+	await withSandbox(
+		{
+			PI_SUBAGENT_CHILD: "1",
+			PI_SUBAGENT_ALLOW_NESTED: undefined,
+		},
+		async ({ pi, cwd }) => {
+			const result = await invoke(pi, "vexillatio", {
+				task: "Inspect and report after the initial collection times out.",
+				agent: "scout",
+				timeoutMs: 50,
+			}, context(cwd));
+			assert.match(result.content[0]?.text ?? "", /execution: running/);
+			assert.equal(supervisor.isAlive("scout-0"), true);
+
+			await pi.handlers.get("session_shutdown")?.();
+			assert.equal(supervisor.isAlive("scout-0"), false);
+			assert.equal(
+				supervisor.calls.filter((call) => call.method === "retire" && call.name === "scout-0").length,
+				1,
+				"the child and pending utility retire paths must share one retirement",
+			);
+		},
+		supervisor,
+	);
+});
+
+test("vexillatio tasks[] keeps and retires both timed-out utilities independently", async () => {
+	const supervisor = new FirstTimeoutSupervisor();
+	await withSandbox(
+		{ PI_SUBAGENTS_TEAM: undefined },
+		async ({ pi, cwd }) => {
+			const footer: CapturedFooter = {};
+			writeProjectSubagentSettings(cwd, { joinMode: "each" });
+			await invoke(pi, "subagent", { action: "list" }, context(cwd, { footer }));
+
+			const result = await invoke(pi, "vexillatio", {
+				task: "Wait for both independent utility tasks.",
+				tasks: [
+					{ agent: "scout", task: "Inspect area A." },
+					{ agent: "scout", task: "Inspect area B." },
+				],
+				timeoutMs: 50,
+			}, context(cwd, { footer }));
+			const output = result.content.map((part) => part.text ?? "").join("\n");
+			assert.match(output, /scout-0[\s\S]*execution: running/);
+			assert.match(output, /scout-1[\s\S]*execution: running/);
+			assert.deepEqual(
+				(result.details as { stillRunning?: string[] } | undefined)?.stillRunning,
+				["scout-0", "scout-1"],
+			);
+			assert.equal(footer.status, "2 agents running");
+			assert.equal(footer.widgetVisible, true);
+			assert.equal(supervisor.isAlive("scout-0"), true);
+			assert.equal(supervisor.isAlive("scout-1"), true);
+
+			supervisor.settle("scout-0", { text: "area A completed" });
+			supervisor.settle("scout-1", { text: "area B completed" });
+			assert.equal(
+				await waitFor(
+					() =>
+						pi.messages.length === 2 &&
+						footer.status === undefined &&
+						footer.widgetVisible === false &&
+						supervisor.calls.filter((call) => call.method === "retire").length === 2,
+					2_000,
+				),
+				true,
+				"both watches notify and retire their child, then clear the shared footer",
+			);
+			const notices = pi.messages.map((message) => JSON.stringify(message) ?? "");
+			assert.ok(notices.some((message) => message.includes("scout-0")));
+			assert.ok(notices.some((message) => message.includes("scout-1")));
+		},
+		supervisor,
+	);
+});
+
+class ExitsOnCollectFailureSupervisor extends FakeSupervisor {
+	override waitSettled(name: string, _timeoutMs?: number): Promise<SettleResult> {
+		this.exit(name);
+		return Promise.reject(new Error("collect failed after child exit"));
+	}
+}
+
+test("vexillatio retires an already-dead utility when collect fails", async () => {
+	const supervisor = new ExitsOnCollectFailureSupervisor();
+	await withSandbox(
+		{},
+		async ({ pi, cwd }) => {
+			const result = await invoke(pi, "vexillatio", {
+				task: "Collect from a child that exits unexpectedly.",
+				agent: "scout",
+			}, context(cwd));
+			assert.match(result.content[0]?.text ?? "", /collect failed after child exit/);
+			assert.equal(supervisor.isAlive("scout-0"), false);
+			const runId = (result.details as { runId?: string } | undefined)?.runId;
+			assert.ok(runId, "vexillatio returns the parent run id");
+			const db = openLegionDb(legionDbPath(path.join(cwd, ".pi-subagents", "runs", runId)));
+			try {
+				assert.equal(
+					getNode(db, "root.scout-0")?.status,
+					"retired",
+					"the dead child's Legion node must not remain working after collect failure",
+				);
+			} finally {
+				db.close();
+			}
+		},
+		supervisor,
+	);
 });
 
 test("RPC spawn masks inherited utility and Legion identities before applying target env", async () => {
