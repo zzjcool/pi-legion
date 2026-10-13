@@ -55,7 +55,7 @@ const VexillatioParams = Type.Object({
 1. 解析 agent：默认 `scout`；目标必须在 catalog 里且 `utility === true`，否则报错 `not a utility agent: <name> (mark it with 'utility: true')`。
 2. 走**既有 `orchestrator.launch`**（复用 budget/session 管线），但 `SpawnInput.env` 显式剔除 legion 身份四变量：`PI_LEGION_DB`、`PI_LEGION_NODE_ID`、`PI_SUBAGENT_PARENT_PATH`、`PI_SUBAGENT_MAX_DEPTH`（防幽灵节点 + 防工具人继承指挥链身份）。**不剔除** `PI_SUBAGENT_CHILD`、`PI_SUBAGENT_CHILD_ROLE`、`PI_SUBAGENT_MAX_TOOL_CALLS` 等预算变量（child-guard 仍要工作）。utility 目标（两通道）**剥除 `PI_SUBAGENT_ALLOW_NESTED`**（§2.5.1，utility 语义优先）；`lineageEnv` 统一设置 `PI_SUBAGENT_UTILITY_CHILD`（§2.2）。
 3. launch 后 `awaitSupervisor` + 静默宽限（复用 `collect` 的 grace 逻辑），产出直接以文本返回（`renderCollect` 简化版：`── <name> ──\nexecution: …\n<output>`），同 `collect` 的 `outputFile` 惯例写 `<name>.output.md`。
-4. 返回值含 `outputFile`/`sessionFile` 路径，父可后续用 `subagent({action:'collect'|'steer'|'retire', name})` 控制——**节点进 legion 树**，parent = 派发进程自己的 nodeId（若派发者无 legion 身份，则该 run 走无 legion 的普通 run 目录管线，同现有非 legion 子进程行为）。
+4. 返回值含 `outputFile`/`sessionFile` 路径，父可后续用 `subagent({action:'collect'|'steer'|'retire', name})` 控制——**节点进 legion 树**， parent = 派发进程自己的 nodeId；无 legion 身份的**child** 派发者走普通 run 目录管线（子记录必须 `store.addChild` 落 run.json，同 launchStep 惯例——REV-17.8 修正：原措辞导致实现只 updateChild 丢记录）；**root** 派发者照 subagent 通道惯例创建 root legion（原措辞含糊，见 REV-17.8 修订记录）。
 
 ### 2.3 env 语义（冻结表）
 
@@ -102,7 +102,9 @@ const VexillatioParams = Type.Object({
 | `src/agents/agents.ts` | frontmatter 解析 `utility`（applyBehaviorFields 层） |
 | `src/agents/settings.ts` | agentOverrides 白名单字段加 `utility` |
 | `src/agents/overrides.ts` | `OVERRIDE_FIELDS`（:20-54）加 `"utility"`——settings 层 override 的实际复制通道，不加则 override 被丢弃 || `src/runs/orchestrator.ts` | launch 支持 `stripLegionIdentity?: boolean`（SpawnInput 选项，控制 env 剔除） |
-| `src/supervisor/rpc-supervisor.ts` | SpawnInput.env 透传（已有；无需改动，除非类型收紧） |
+| `src/supervisor/rpc-supervisor.ts` | **REV-17.8 修正注记**：实际变更 22 行（SpawnInput 基底对 UTILITY_CHILD/ALLOW_NESTED 的 ambient 遮蔽 + stripLegionIdentity 透传）。此变更是 §2.3 硬叶子不变量在「嵌套权父进程经 process.env 泄漏」场景下的必要实现（RpcClient 合并语义），追认进所有权。遮蔽对**所有** spawn 生效（同时修复了 master 既有泄漏：nested 父的 ALLOW_NESTED=1 曾可泄给任意孙辈） |
+| `src/supervisor/types.ts` | **REV-17.8 新增**：SpawnInput 增 utilityDispatch/stripLegionIdentity 字段（rpc-supervisor 变更的必然配套） |
+| `package.json` | **REV-17.8 新增**：test / test:integration / test:live / test:docker 四个脚本各加 `-u PI_SUBAGENT_UTILITY_CHILD`（防 utility 子进程内跑测试的 32 个假失败） |
 | `src/runs/args.ts` | **REV-17.7 新增**：`pushToolArgs` 对非 utility 角色追加 `vexillatio` 到非空 `--tools` 白名单（§2.7） |
 | `index.ts` | 注册 `vexillatio` 工具（早退之前）+ PLAYBOOK 文本 |
 | `src/extension/playbook.ts` | PARENT_PLAYBOOK 追加段 |
@@ -157,3 +159,4 @@ const VexillatioParams = Type.Object({
 | 2026-10-12 | REV-17.5 | §3 child-mode 授权扩为两处断言数字（第一用例 0→1，第二用例 1→2）；新增「断言影响总则」：全量扫描一次列尽受影响断言，不再逐轮挤牙膏 | worker-4 指出第二用例（嵌套权子进程）按 §2.2 应注册 subagent+vexillatio 共 2 工具但断言仍为 1 且未授权——拒绝正确，修订后重派 |
 | 2026-10-12 | REV-17.6 | §2.2/§2.3/§2.5.1/§2.5.3 四处统一：**utility 语义优先，allowNested 被忽略**——两通道对 utility 目标都剥除 ALLOW_NESTED，不存在持有 subagent 的工具人，误配不恢复递归路径（§2.5.1 原句“此时持有 subagent”是 17.4 引入的后门，与硬叶子不变量自相矛盾） | worker-5 指出硬叶子规则与误配时持有 subagent 的规定冲突——拒绝正确，修订后重派 |
 | 2026-10-12 | REV-17.7 | 新增 §2.7 工具白名单注入规则（`pushToolArgs` 对非 utility 角色追加 vexillatio）；§3 新增 `src/runs/args.ts` 所有权 + 两个 `read,bash` 断言授权（orchestrator.test:99 / supervisor.test:265）。分支已合入 master 最新（PR #22） | worker-6 完成全部实现后指出：受限角色（显式 tools: 白名单）调不到未列名的 vexillatio，需在 args 层追加且两个既有断言未授权——拒绝正确；从原会话恢复继续，勿重写已完成的 90% |
+| 2026-10-13 | REV-17.8 | 三路 review 门禁退回后的修复授权：M1=非 legion 派发者子记录持久化（persistChild 改 findChild 守卫式 addChild+updateChild，补集成测试）；M3=package.json 四脚本加 `-u PI_SUBAGENT_UTILITY_CHILD`；测试缺口补：跨通道同名续接（subagent 先派 scout-0 后 vexillatio 应派 scout-1）与超时行为（不 autoSettle 场景）；契约自身修正：§2.2 步骤 4 措辞（child 走 addChild 惯例/root 走 createRootLegion）、rpc-supervisor/types.ts 追认、§3 新增 package.json。四个 minor 采纳：abort signal 贯通、strip 列表常量化、verify 字段报错、child-mode 越授权改动追认；其余 minor（F5 重构收敛等）记档不阻塞 | 四路 reviewer 独立印证 3 major（M1 探针实证 children:[]、M2 部署惰性、M3 32 假失败实测）；采纳 worker-0/2/3 交叉发现 |
