@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { DatabaseSync } from "./db.ts";
 import { withTransaction } from "./db.ts";
 import { appendEvent } from "./events.ts";
-import { insertNode, nodeIdForChild, sanitizeNodeSlug } from "./nodes.ts";
+import { getNode, insertNode, nodeIdForChild, sanitizeNodeSlug } from "./nodes.ts";
 import { upsertUsage } from "./usage.ts";
 import { deriveOutcome, parseSessionFile } from "../shared/session.ts";
 import type { ChildRecord, RunRecord, Usage } from "../shared/types.ts";
@@ -59,8 +59,13 @@ export function rebuildLegionDb(options: RebuildOptions): RebuildResult {
 	if (!options.rootRunDir) throw new TypeError("rootRunDir must be a non-empty path");
 	const clock = options.now ?? (() => Date.now());
 	const warnings: RebuildWarning[] = [];
-	const runs = loadRuns(options.rootRunDir, warnings);
-	const sources = collectSources(runs, warnings, clock);
+	const discoveredRuns = loadRuns(options.rootRunDir, warnings);
+	const scope = selectTreeRuns(options.rootRunDir, discoveredRuns, options.db, warnings);
+	if (scope.rootRunId === null) {
+		return { runFiles: [], nodesRebuilt: 0, eventsRebuilt: 0, usageRebuilt: 0, warnings };
+	}
+	const runs = scope.runs;
+	const sources = collectSources(runs, scope.rootRunId, warnings, clock);
 	if (!sources.some((source) => source.id === "root")) {
 		warnings.push({ path: options.rootRunDir, message: "no root run.json was found" });
 	}
@@ -147,22 +152,125 @@ function loadRuns(input: string, warnings: RebuildWarning[]): LoadedRun[] {
 	return loaded;
 }
 
+function selectTreeRuns(
+	input: string,
+	discovered: readonly LoadedRun[],
+	db: DatabaseSync,
+	warnings: RebuildWarning[],
+): { rootRunId: string | null; runs: LoadedRun[] } {
+	const explicitRunDir = path.resolve(input);
+	const explicitRunId = path.basename(explicitRunDir);
+	const inputIsRunDirectory = path.basename(path.dirname(explicitRunDir)) === "runs";
+	const dbRootId = getNode(db, "root")?.runId ?? null;
+	const emptyPathRoots = discovered.filter((entry) => entry.run.path.length === 0);
+	const explicitRoot = discovered.find(
+		(entry) => entry.file === path.join(explicitRunDir, "run.json") && entry.run.path.length === 0,
+	);
+	const rootRun = explicitRoot ??
+		discovered.find((entry) => entry.run.path.length === 0 && entry.run.runId === dbRootId) ??
+		discovered.find((entry) => entry.run.path.length === 0 && entry.run.runId === explicitRunId) ??
+		(!inputIsRunDirectory && emptyPathRoots.length === 1 ? emptyPathRoots[0] : null);
+	if (!rootRun) {
+		warnings.push({ path: input, message: "could not identify a target root run.json; skipped all run records" });
+		return { rootRunId: null, runs: [] };
+	}
+	const rootRunId = rootRun.run.runId;
+	const byRunId = new Map(discovered.map((entry) => [entry.run.runId, entry]));
+	const selected = new Map<string, LoadedRun>([[rootRunId, rootRun]]);
+	for (const entry of discovered) {
+		if (entry.run.runId === rootRunId) continue;
+		if (entry.run.path.length === 0) {
+			warnings.push({ path: entry.file, message: `skipped foreign root run ${entry.run.runId} (target root ${rootRunId})` });
+			continue;
+		}
+		if (pathBelongsToRoot(entry.run, rootRunId, byRunId, db, warnings, entry.file)) {
+			selected.set(entry.run.runId, entry);
+		} else {
+			warnings.push({ path: entry.file, message: `skipped run ${entry.run.runId} outside root ${rootRunId}` });
+		}
+	}
+	return { rootRunId, runs: [...selected.values()].sort((left, right) => left.file.localeCompare(right.file)) };
+}
+
+function pathBelongsToRoot(
+	run: RunRecord,
+	rootRunId: string,
+	byRunId: ReadonlyMap<string, LoadedRun>,
+	db: DatabaseSync,
+	warnings: RebuildWarning[],
+	file: string,
+): boolean {
+	const parentRunId = run.path[0]?.runId;
+	if (!parentRunId) return false;
+	if (parentRunId === rootRunId) return true;
+
+	// Names are optional path metadata; ancestry membership is established by
+	// the parent run-id chain (or the persisted tree's run_id relation).
+	const parentRun = byRunId.get(parentRunId);
+	const inTree = parentRun
+		? runPathChainReachesRoot(parentRun.run, rootRunId, byRunId, new Set())
+		: persistedRunBelongsToRoot(db, parentRunId, rootRunId);
+	if (!inTree) return false;
+	if (run.path.some((entry) => !entry.agent)) {
+		warnings.push({ path: file, message: `kept legacy lineage with optional path.agent omitted under root ${rootRunId}` });
+	}
+	return true;
+}
+
+function runPathChainReachesRoot(
+	run: RunRecord,
+	rootRunId: string,
+	byRunId: ReadonlyMap<string, LoadedRun>,
+	seen: Set<string>,
+): boolean {
+	if (run.runId === rootRunId) return run.path.length === 0;
+	if (seen.has(run.runId) || run.path.length === 0) return false;
+	seen.add(run.runId);
+	const parentRunId = run.path[0]?.runId;
+	if (!parentRunId) return false;
+	if (parentRunId === rootRunId) return true;
+	const parent = byRunId.get(parentRunId);
+	return parent ? runPathChainReachesRoot(parent.run, rootRunId, byRunId, seen) : false;
+}
+
+function persistedRunBelongsToRoot(
+	db: DatabaseSync,
+	runId: string,
+	rootRunId: string,
+): boolean {
+	const query = db.prepare("SELECT id, parent_id FROM nodes WHERE run_id = ? LIMIT 1");
+	let row = query.get(runId);
+	const seen = new Set<string>();
+	while (row) {
+		const id = String(row.id);
+		if (seen.has(id)) return false;
+		seen.add(id);
+		if (id === "root") return getNode(db, "root")?.runId === rootRunId;
+		const parentId = row.parent_id === null ? null : String(row.parent_id);
+		if (!parentId) return false;
+		row = db.prepare("SELECT id, parent_id FROM nodes WHERE id = ?").get(parentId);
+	}
+	return false;
+}
+
 function collectSources(
 	runs: readonly LoadedRun[],
+	rootRunId: string,
 	warnings: RebuildWarning[],
 	clock: () => number,
 ): NodeSource[] {
 	const byId = new Map<string, NodeSource>();
 	for (const { file, run } of runs) {
 		const currentId = nodeIdFromPath(run.path);
-		if (currentId === "root") {
+		const isRootRun = run.path.length === 0 && run.runId === rootRunId;
+		if (isRootRun) {
 			mergeSource(byId, {
 				id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0,
 				runId: run.runId, sessionFile: null, worktreePath: null, model: null, team: null,
 				status: "running", createdAt: toMillis(run.createdAt, clock),
 				updatedAt: toMillis(run.updatedAt, clock), fromSession: false,
 			});
-		} else {
+		} else if (run.path.length > 0) {
 			const lastIndex = lastNamedPathIndex(run.path);
 			const last = lastIndex === null ? null : run.path[lastIndex];
 			if (last && lastIndex !== null) {
@@ -186,6 +294,11 @@ function collectSources(
 					createdAt: toMillis(run.createdAt, clock),
 					updatedAt: toMillis(run.updatedAt, clock),
 					fromSession: false,
+				});
+			} else {
+				warnings.push({
+					path: file,
+					message: "retained in-tree run with optional path.agent omitted; its own node id cannot be reconstructed",
 				});
 			}
 		}
