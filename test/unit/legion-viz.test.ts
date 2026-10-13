@@ -159,6 +159,13 @@ test("layout: wide >= 140, stacked in between, portrait when narrow or tall", ()
 	assert.equal(selectLayout(79, 20), "portrait");
 	assert.equal(selectLayout(60, 70), "portrait");
 	assert.equal(selectLayout(46, 60), "portrait");
+	// Tall terminals are portrait by aspect ratio, whatever the width.
+	assert.equal(selectLayout(110, 120), "portrait");
+	assert.equal(selectLayout(120, 100), "portrait");
+	assert.equal(selectLayout(90, 80), "portrait");
+	assert.equal(selectLayout(60, 120), "portrait");
+	assert.equal(selectLayout(160, 90), "portrait");
+	assert.equal(selectLayout(120, 40), "stacked");
 	for (const [w, h] of [[46, 60], [60, 70], [100, 40], [160, 50]] as const) {
 		const l = computeLayout(w, h);
 		for (const r of [l.galaxy, l.chart, l.log]) {
@@ -431,5 +438,144 @@ test("status board: railway repaints every second while a subagent is live and s
 	assert.equal(renders, before + 1);
 	board.paint(live.map((e) => e.nodeId === "root.s" ? { ...e, state: "settled", finishedAt: now + 900 } : e), now + 1000);
 	assert.equal(intervals.size, 0, "ticker must stop when no subagent is live");
+	board.clear();
+});
+
+test("layout: tall terminals cap galaxy/chart heights; few events hand log space to the galaxy", () => {
+	for (const [w, h] of [[110, 120], [120, 100], [90, 80], [60, 120], [46, 60], [100, 40], [139, 69], [160, 50], [220, 105]] as const) {
+		const l = computeLayout(w, h);
+		assert.ok(l.chart.h <= 24, `${w}x${h} chart ${l.chart.h}`);
+		if (l.kind === "portrait") {
+			assert.ok(l.chart.h >= 10 || h < 40, `${w}x${h} chart ${l.chart.h}`);
+			assert.ok(l.galaxy.h <= Math.round(w * 0.65), `${w}x${h} galaxy ${l.galaxy.h}`);
+			assert.equal(l.galaxy.w, w);
+			assert.equal(l.chart.y, l.galaxy.y + l.galaxy.h);
+			assert.equal(l.log.y, l.chart.y + l.chart.h);
+		}
+		if (l.kind === "stacked") assert.ok(l.galaxy.h <= 24);
+		for (const r of [l.galaxy, l.chart, l.log]) assert.ok(r.y + r.h <= h - 1 && r.x + r.w <= w);
+	}
+	const many = computeLayout(110, 120, { logEvents: 200 });
+	const few = computeLayout(110, 120, { logEvents: 4 });
+	assert.ok(few.galaxy.h > many.galaxy.h, `${few.galaxy.h} > ${many.galaxy.h}`);
+	assert.ok(few.log.h >= 8);
+	assert.equal(few.chart.h, many.chart.h);
+});
+
+test("legion view: tall sizes render full width/height without clipping", () => {
+	const { nodes, sampler, now } = scenario();
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	for (const [w, h] of [[110, 120], [120, 100], [90, 80], [60, 120]] as const) {
+		const { canvas, layout } = renderLegionView(data, initialViewState(), w, h);
+		assert.equal(layout, "portrait");
+		const lines = canvas.toLines(ansiTheme);
+		assert.equal(lines.length, h);
+		for (const line of lines) assert.equal(visibleWidth(line), w);
+	}
+});
+
+test("railway: ended scouts vanish — one row, only the survivor's label, no orphan glyphs on the header", () => {
+	const nodes = [ROOT,
+		node("scout-0", { startedAt: sec(0), status: "settled", endedAt: sec(60) }),
+		node("scout-1", { startedAt: sec(30), status: "settled", endedAt: sec(120) }),
+		node("scout-2", { startedAt: sec(50), status: "failed", endedAt: sec(150) }),
+		node("scout-3", { startedAt: sec(100) }),
+	];
+	for (let t = 160; t <= 220; t += 1) {
+		const out = renderRailway({ nodes, now: sec(t), width: 120, rate: 10 })!;
+		const lines = out.canvas.toLines(plainTheme);
+		assert.equal(lines.length, 2, "header + one lane");
+		assert.deepEqual(out.nodeIdsByRow, [undefined, "scout-3"]);
+		assert.match(lines[0]!, /^[─\s\-−0-9a-z·./]+$/, `header has only rule/text: ${lines[0]}`);
+		assert.doesNotMatch(lines.join("\n"), /scout-[012]/);
+		assert.equal((lines[1]!.match(/scout-3/g) ?? []).length, 1);
+		assert.doesNotMatch(lines[1]!, /[┴┬✗]/);
+	}
+});
+
+test("railway: all lanes share one time axis — every lane head is at the same x and scrolls in sync", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(0) }),
+		node("scout-1", { startedAt: sec(40), parentId: "worker-0", depth: 2 }),
+		node("scout-2", { startedAt: sec(90) }),
+		node("scout-3", { startedAt: sec(20), status: "settled", endedAt: sec(100) }),
+	];
+	const startX = (line: string, from: string): number => Array.from(line).findIndex((ch) => from.includes(ch));
+	const heads = (t: number) => {
+		const lines = renderRailway({ nodes, now: sec(t), width: 120, rate: 0 })!.canvas.toLines(plainTheme).slice(1).map((l) => Array.from(l));
+		return lines.map((l) => ({ head: l.lastIndexOf("━"), start: startX(l.join(""), "╺╰╭┄") }));
+	};
+	const a = heads(150);
+	assert.equal(a.length, 3);
+	assert.ok(a.every((l) => l.head === a[0]!.head), JSON.stringify(a));
+	// The window is 360s over ~80 columns; after 45s every lane start shifts left by the same amount.
+	const b = heads(195);
+	const shifts = a.map((l, i) => l.start - b[i]!.start);
+	assert.ok(shifts[0]! === 0 || a[0]!.start === 0 || shifts.every((s) => s === shifts[0]), JSON.stringify(shifts));
+	assert.ok(shifts.slice(1).every((s) => s > 0 && Math.abs(s - shifts[1]!) <= 1), JSON.stringify({ a, b }));
+});
+
+test("railway hit map: every drawn cell maps to the agent whose glyph it is (fork from parent lane, compaction)", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(0) }),
+		node("scout-9", { startedAt: sec(10), status: "settled", endedAt: sec(60) }), // ended -> compacted away
+		node("scout-1", { startedAt: sec(120), parentId: "worker-0", depth: 2 }), // forks off worker-0's lane
+		node("scout-2", { startedAt: sec(200) }),
+	];
+	const out = renderRailway({ nodes, now: sec(300), width: 120, rate: 0 })!;
+	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+	assert.equal(out.hit.length, lines.length);
+	assert.deepEqual(out.nodeIdsByRow, [undefined, "worker-0", "scout-1", "scout-2"]);
+	// Header row and dotted background are never clickable.
+	assert.ok(out.hit[0]!.every((id) => id === undefined));
+	const nameX = lines[1]!.indexOf("▶");
+	let forkCells = 0;
+	for (let y = 1; y < lines.length; y++) {
+		for (let x = 0; x < lines[y]!.length; x++) {
+			const ch = lines[y]![x]!;
+			const id = out.hit[y]![x];
+			if (x >= nameX) { assert.equal(id, out.nodeIdsByRow[y], `name col ${x},${y}`); continue; }
+			if (ch === "·" || ch === " ") assert.equal(id, undefined, `background ${x},${y}`);
+			else if (ch === "━" || ch === "╺") assert.equal(id, out.nodeIdsByRow[y], `lane ${x},${y} ${ch}`);
+			else if ("╰╭│┳┻".includes(ch)) { assert.equal(id, "scout-1", `fork ${x},${y} ${ch}`); forkCells++; }
+			else assert.fail(`unexpected glyph ${ch} at ${x},${y}`);
+		}
+	}
+	assert.ok(forkCells >= 2, "fork connector (┳ on parent lane + ╰ on child) is owned by the child");
+	assert.ok(!out.hit.flat().includes("scout-9"), "ended, compacted agent owns no cells");
+});
+
+test("status board: railway click opens the agent of the exact cell; name column opens the row; empty cells are no-ops", () => {
+	let factory: WidgetFactory | undefined;
+	const opened: string[] = [];
+	const ctx: StatusUi = { hasUI: true, ui: { theme: plainTheme, setStatus() {}, setWidget(_k, c) { factory = typeof c === "function" ? c : undefined; } } };
+	const board = createStatusBoard({ strip: "railway", onNodeClick: (id) => opened.push(id) });
+	board.bind(ctx);
+	const now = Date.now();
+	const entries: StatusEntry[] = [
+		{ name: "centurion-0", agent: "centurion", state: "running", startedAt: now - 300_000, nodeId: "root", parentId: null, depth: 0 },
+		{ name: "worker-0", agent: "worker", state: "running", startedAt: now - 200_000, nodeId: "root.w", parentId: "root", depth: 1 },
+		{ name: "scout-1", agent: "scout", state: "running", startedAt: now - 100_000, nodeId: "root.w.s", parentId: "root.w", depth: 2 },
+	];
+	board.paint(entries, now);
+	const comp = factory!({ requestRender() {} }, plainTheme);
+	const lines = comp.render(120).map((l) => Array.from(stripTerminalSequences(l)));
+	const click = (x: number, y: number) => {
+		const ev = (type: string) => ({ type, button: "left", x, y, screenX: x, screenY: y, width: 120, height: lines.length }) as never;
+		const pressed = comp.handleMouse!(ev("press"));
+		return [pressed, comp.handleMouse!(ev("click"))];
+	};
+	// Fork glyph on worker-0's lane opens scout-1; a plain cell on that same row opens worker-0.
+	const forkX = lines[1]!.findIndex((ch) => ch === "┳");
+	assert.ok(forkX > 0);
+	click(forkX, 1);
+	click(forkX + 2, 1);
+	click(lines[2]!.lastIndexOf("━"), 2);
+	click(lines[2]!.indexOf("▶") + 4, 2);
+	assert.deepEqual(opened, ["root.w.s", "root.w", "root.w.s", "root.w.s"]);
+	// Dotted background and header do nothing.
+	assert.deepEqual(click(2, 2), [undefined, undefined]);
+	assert.deepEqual(click(10, 0), [undefined, undefined]);
+	assert.equal(opened.length, 4);
 	board.clear();
 });

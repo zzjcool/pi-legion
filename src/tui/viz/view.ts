@@ -23,7 +23,7 @@ const PANES: Pane[] = ["galaxy", "chart", "log"];
 export function renderLegionView(data: ViewData, state: LegionViewState, cols: number, rows: number): { canvas: Canvas; layout: LayoutKind } {
 	const W = Math.max(1, Math.floor(cols));
 	const H = Math.max(6, Math.floor(rows));
-	const layout = computeLayout(W, H);
+	const layout = computeLayout(W, H, { logEvents: buildLog(data.nodes).length });
 	const cv = new Canvas(W, H);
 	const selected = data.nodes.find((node) => node.id === state.selectedId);
 	const portrait = layout.kind === "portrait";

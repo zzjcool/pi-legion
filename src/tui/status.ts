@@ -583,7 +583,8 @@ export function createStatusBoard(options: {
 
 	const renderLines = (now: number, theme: Theme, width?: number): {
 		lines: string[];
-		nodeIdsByRow: Array<string | undefined>;
+		/** Node whose glyph occupies cell (x, y), from the same render pass; undefined = no-op. */
+		hitAt: (x: number, y: number) => string | undefined;
 	} => {
 		if (strip === "railway" && hasTreeIdentity(entries) && width !== undefined && width >= 20) {
 			const nodes = nodesFromEntries(entries);
@@ -595,7 +596,7 @@ export function createStatusBoard(options: {
 		const nodeIdsByRow = rows.map((row) => row.nodeId);
 		return {
 			lines: themeLines(formatWidgetLines(visible, now, totals), theme),
-			nodeIdsByRow,
+			hitAt: (_x, y) => nodeIdsByRow[y],
 		};
 	};
 
@@ -652,26 +653,26 @@ export function createStatusBoard(options: {
 				STATUS_WIDGET_KEY,
 				(nextTui, theme) => {
 					tui = nextTui;
-					let nodeIdsByRow: Array<string | undefined> = [];
+					let hitAt: (x: number, y: number) => string | undefined = () => undefined;
 					let latchedNodeId: string | undefined;
 					return {
 						render: (width) => {
 							const rendered = renderLines(Date.now(), theme, width);
 							// Build the identity map before styling or width fitting can change the display rows.
-							nodeIdsByRow = rendered.nodeIdsByRow;
+							hitAt = rendered.hitAt;
 							return fitLines(rendered.lines, width);
 						},
 						handleMouse: (event) => {
 							if (event.type === "press") {
 								latchedNodeId = undefined;
 								if (event.button !== "left") return undefined;
-								const nodeId = nodeIdsByRow[event.y];
+								const nodeId = hitAt(event.x, event.y);
 								if (nodeId === undefined) return undefined;
 								latchedNodeId = nodeId;
 								return { handled: true };
 							}
 							if (event.type !== "click" || event.button !== "left") return undefined;
-							const nodeId = nodeIdsByRow[event.y];
+							const nodeId = hitAt(event.x, event.y);
 							if (latchedNodeId === undefined || nodeId !== latchedNodeId) return undefined;
 							const clickedNodeId = latchedNodeId;
 							latchedNodeId = undefined;
