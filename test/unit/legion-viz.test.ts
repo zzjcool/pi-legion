@@ -514,3 +514,68 @@ test("railway: all lanes share one time axis — every lane head is at the same 
 	assert.ok(shifts[0]! === 0 || a[0]!.start === 0 || shifts.every((s) => s === shifts[0]), JSON.stringify(shifts));
 	assert.ok(shifts.slice(1).every((s) => s > 0 && Math.abs(s - shifts[1]!) <= 1), JSON.stringify({ a, b }));
 });
+
+test("railway hit map: every drawn cell maps to the agent whose glyph it is (fork from parent lane, compaction)", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(0) }),
+		node("scout-9", { startedAt: sec(10), status: "settled", endedAt: sec(60) }), // ended -> compacted away
+		node("scout-1", { startedAt: sec(120), parentId: "worker-0", depth: 2 }), // forks off worker-0's lane
+		node("scout-2", { startedAt: sec(200) }),
+	];
+	const out = renderRailway({ nodes, now: sec(300), width: 120, rate: 0 })!;
+	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+	assert.equal(out.hit.length, lines.length);
+	assert.deepEqual(out.nodeIdsByRow, [undefined, "worker-0", "scout-1", "scout-2"]);
+	// Header row and dotted background are never clickable.
+	assert.ok(out.hit[0]!.every((id) => id === undefined));
+	const nameX = lines[1]!.indexOf("▶");
+	let forkCells = 0;
+	for (let y = 1; y < lines.length; y++) {
+		for (let x = 0; x < lines[y]!.length; x++) {
+			const ch = lines[y]![x]!;
+			const id = out.hit[y]![x];
+			if (x >= nameX) { assert.equal(id, out.nodeIdsByRow[y], `name col ${x},${y}`); continue; }
+			if (ch === "·" || ch === " ") assert.equal(id, undefined, `background ${x},${y}`);
+			else if (ch === "━" || ch === "╺") assert.equal(id, out.nodeIdsByRow[y], `lane ${x},${y} ${ch}`);
+			else if ("╰╭│┳┻".includes(ch)) { assert.equal(id, "scout-1", `fork ${x},${y} ${ch}`); forkCells++; }
+			else assert.fail(`unexpected glyph ${ch} at ${x},${y}`);
+		}
+	}
+	assert.ok(forkCells >= 2, "fork connector (┳ on parent lane + ╰ on child) is owned by the child");
+	assert.ok(!out.hit.flat().includes("scout-9"), "ended, compacted agent owns no cells");
+});
+
+test("status board: railway click opens the agent of the exact cell; name column opens the row; empty cells are no-ops", () => {
+	let factory: WidgetFactory | undefined;
+	const opened: string[] = [];
+	const ctx: StatusUi = { hasUI: true, ui: { theme: plainTheme, setStatus() {}, setWidget(_k, c) { factory = typeof c === "function" ? c : undefined; } } };
+	const board = createStatusBoard({ strip: "railway", onNodeClick: (id) => opened.push(id) });
+	board.bind(ctx);
+	const now = Date.now();
+	const entries: StatusEntry[] = [
+		{ name: "centurion-0", agent: "centurion", state: "running", startedAt: now - 300_000, nodeId: "root", parentId: null, depth: 0 },
+		{ name: "worker-0", agent: "worker", state: "running", startedAt: now - 200_000, nodeId: "root.w", parentId: "root", depth: 1 },
+		{ name: "scout-1", agent: "scout", state: "running", startedAt: now - 100_000, nodeId: "root.w.s", parentId: "root.w", depth: 2 },
+	];
+	board.paint(entries, now);
+	const comp = factory!({ requestRender() {} }, plainTheme);
+	const lines = comp.render(120).map((l) => Array.from(stripTerminalSequences(l)));
+	const click = (x: number, y: number) => {
+		const ev = (type: string) => ({ type, button: "left", x, y, screenX: x, screenY: y, width: 120, height: lines.length }) as never;
+		const pressed = comp.handleMouse!(ev("press"));
+		return [pressed, comp.handleMouse!(ev("click"))];
+	};
+	// Fork glyph on worker-0's lane opens scout-1; a plain cell on that same row opens worker-0.
+	const forkX = lines[1]!.findIndex((ch) => ch === "┳");
+	assert.ok(forkX > 0);
+	click(forkX, 1);
+	click(forkX + 2, 1);
+	click(lines[2]!.lastIndexOf("━"), 2);
+	click(lines[2]!.indexOf("▶") + 4, 2);
+	assert.deepEqual(opened, ["root.w.s", "root.w", "root.w.s", "root.w.s"]);
+	// Dotted background and header do nothing.
+	assert.deepEqual(click(2, 2), [undefined, undefined]);
+	assert.deepEqual(click(10, 0), [undefined, undefined]);
+	assert.equal(opened.length, 4);
+	board.clear();
+});

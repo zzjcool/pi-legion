@@ -29,6 +29,12 @@ export interface RailRender {
 	canvas: Canvas;
 	/** Node id rendered on each output row (undefined for the header). */
 	nodeIdsByRow: Array<string | undefined>;
+	/**
+	 * Per-cell owner map, hit[y][x] = node id whose glyph is drawn there (lane
+	 * segments, fork connectors, name column), produced in the same pass that
+	 * draws the canvas. Header, dotted background and padding are undefined.
+	 */
+	hit: Array<Array<string | undefined>>;
 	shown: VizNode[];
 	hidden: VizNode[];
 }
@@ -82,6 +88,7 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	const dt = windowMs / AW;
 	const tc = (c: number): number => now - windowMs + (c + 1) * dt;
 	const canvas = new Canvas(width, rows + 1);
+	const hit: Array<Array<string | undefined>> = Array.from({ length: rows + 1 }, () => new Array<string | undefined>(width).fill(undefined));
 	const byId = new Map(nodes.map((node) => [node.id, node]));
 	const color = (node: VizNode): string => roleColor(node.role);
 
@@ -90,13 +97,15 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	// so their labels/ticks can never be compacted onto a surviving row. Every
 	// lane's head sits at the same "now" column, so all lanes scroll in sync.
 	const colOf = (t: number): number => Math.floor((t - (now - windowMs)) / dt - 1e-9);
-	const cells = new Map<string, { ch: string; color: string }>();
-	const put = (c: number, r: number, ch: string, col: string): void => {
+	const cells = new Map<string, { ch: string; color: string; owner: string }>();
+	let owner = "";
+	const put = (c: number, r: number, ch: string, col: string, by: string = owner): void => {
 		if (c < 0 || c >= AW || r < 0 || r >= rows) return;
-		cells.set(`${c},${r}`, { ch, color: col });
+		cells.set(`${c},${r}`, { ch, color: col, owner: by });
 	};
 	for (const [id, r] of current.lanes) {
 		const node = byId.get(id)!;
+		owner = id;
 		const col = color(node);
 		const start = colOf(node.startedAt);
 		const c0 = Math.max(0, start);
@@ -113,6 +122,7 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		put(start, r, p < r ? "╰" : "╭", col);
 		for (let y = Math.min(p, r) + 1; y < Math.max(p, r); y++) if (!cells.has(`${start},${y}`)) put(start, y, "│", col);
 		const pc = cells.get(`${start},${p}`);
+		// The branch point is part of the child's fork, so clicking it opens the child.
 		if (pc && pc.ch === "━") put(start, p, p < r ? "┳" : "┻", pc.color);
 	}
 
@@ -123,6 +133,7 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	for (const [key, cell] of cells) {
 		const [c, r] = key.split(",").map(Number) as [number, number];
 		canvas.set(LX + c, y0 + r, cell.ch, cell.color);
+		hit[y0 + r]![LX + c] = cell.owner;
 	}
 
 	const live = current.shown.length + current.hidden.length;
@@ -139,6 +150,7 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		const y = y0 + i;
 		const col = color(node);
 		canvas.set(nameX, y, "▶", col, { bold: true });
+		for (let x = nameX; x < width; x++) hit[y]![x] = node.id;
 		const overflow = i === rows - 1 && current.hidden.length > 0 ? ` +${current.hidden.length}` : "";
 		const avail = width - (nameX + 2) - overflow.length;
 		if (portrait) {
@@ -158,13 +170,19 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	return {
 		canvas,
 		nodeIdsByRow: [undefined, ...current.shown.map((node) => node.id)],
+		hit,
 		shown: current.shown,
 		hidden: current.hidden,
 	};
 }
 
-export function railwayLines(input: RailInput, theme: VizTheme): { lines: string[]; nodeIdsByRow: Array<string | undefined> } {
+export function railwayLines(input: RailInput, theme: VizTheme): {
+	lines: string[];
+	nodeIdsByRow: Array<string | undefined>;
+	hitAt: (x: number, y: number) => string | undefined;
+} {
 	const rendered = renderRailway(input);
-	if (!rendered) return { lines: [], nodeIdsByRow: [] };
-	return { lines: rendered.canvas.toLines(theme), nodeIdsByRow: rendered.nodeIdsByRow };
+	if (!rendered) return { lines: [], nodeIdsByRow: [], hitAt: () => undefined };
+	const { hit } = rendered;
+	return { lines: rendered.canvas.toLines(theme), nodeIdsByRow: rendered.nodeIdsByRow, hitAt: (x, y) => hit[y]?.[x] };
 }
