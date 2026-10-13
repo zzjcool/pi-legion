@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { formatChildTask } from "../extension/child-guard.ts";
 import { buildPiArgs, LEGION_IDENTITY_ENV_KEYS } from "../runs/args.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
+import { checkMemoryGate, childMemoryEnv } from "./child-memory.ts";
 import { ErrorCodes, SubagentError } from "../shared/types.ts";
 import {
 	InMemoryUIProxy,
@@ -203,6 +204,8 @@ export class RpcSupervisor implements LegionSupervisor {
 	private readonly killTimeoutMs: number;
 	private readonly enumerateDescendants: (rootPid: number) => DescendantInfo[];
 	private readonly signalProcess: (target: number, signal: NodeJS.Signals) => boolean;
+	private readonly onSpawnRefused?: (message: string) => void;
+	private readonly memoryAvailable?: () => number;
 	readonly uiProxy: UIProxy;
 
 	constructor(options: RpcSupervisorOptions = {}) {
@@ -213,9 +216,18 @@ export class RpcSupervisor implements LegionSupervisor {
 		this.killTimeoutMs = options.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS;
 		this.enumerateDescendants = options.enumerateDescendants ?? enumerateDescendants;
 		this.signalProcess = options.signalProcess ?? defaultSignalProcess;
+		this.onSpawnRefused = options.onSpawnRefused;
+		this.memoryAvailable = options.memoryAvailable;
 	}
 
 	async spawnChild(input: SpawnInput): Promise<ChildHandle> {
+		// Memory gate (program level): refuse before any process/temp dir exists.
+		const inFlight = [...this.children.values()].filter((child) => child.state === "starting").length;
+		const gate = checkMemoryGate({ name: input.name, inFlight, ...(this.memoryAvailable ? { available: this.memoryAvailable } : {}) });
+		if (!gate.ok) {
+			this.onSpawnRefused?.(gate.message!);
+			throw new SubagentError(gate.message!, ErrorCodes.INSUFFICIENT_MEMORY);
+		}
 		if (input.agent.kind !== "pi") {
 			throw new SubagentError(
 				`RpcSupervisor only supports pi children (received kind '${input.agent.kind}'); ` +
@@ -294,6 +306,9 @@ export class RpcSupervisor implements LegionSupervisor {
 				// only gets the roles its target's lineageEnv explicitly supplies.
 				PI_SUBAGENT_UTILITY_CHILD: undefined,
 				PI_SUBAGENT_ALLOW_NESTED: undefined,
+				// Memory-saving V8 flags; the child restores the host NODE_OPTIONS
+				// at extension load so its tool subprocesses never inherit them.
+				...childMemoryEnv(),
 				...(input.env ?? {}),
 			};
 			if (input.stripLegionIdentity) {
@@ -305,7 +320,7 @@ export class RpcSupervisor implements LegionSupervisor {
 					: defaultPiCliPath(),
 				cwd: input.cwd,
 				args: builtArgs,
-				...(input.env || input.stripLegionIdentity ? { env: env as Record<string, string> } : {}),
+				env: env as Record<string, string>,
 			};
 			client = this.clientFactory(options);
 			registration.client = client;

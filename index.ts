@@ -54,6 +54,7 @@ import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
+import { restoreHostNodeOptions } from "./src/supervisor/child-memory.ts";
 import { applyEventRetention, checkpoint, formatHygieneReport, hygieneEnabled, runStartupHygiene } from "./src/runs/hygiene.ts";
 import {
 	createStatusNodeOpener,
@@ -474,7 +475,12 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	cascadePromise = undefined;
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";
-	const supervisor = deps.supervisor ?? new RpcSupervisor();
+	if (isChild) restoreHostNodeOptions();
+	const supervisor = deps.supervisor ?? new RpcSupervisor({
+		onSpawnRefused: (message) => {
+			try { lastUi?.notify(`pi-legion: ${message}`, "error"); } catch { /* no UI (child / print mode) */ }
+		},
+	});
 	const verifyRunner = deps.verifyRunner;
 	const legionBus = createLegionEventBus();
 	const rpcUIProxy = (supervisor as LegionSupervisor & { uiProxy?: UIProxy }).uiProxy;
