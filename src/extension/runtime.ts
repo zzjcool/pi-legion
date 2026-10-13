@@ -36,7 +36,7 @@ import { LEGION_EVENT_TYPES } from "./event-bus.ts";
 import { createDbEventSource, type DbEventSource } from "./event-bus.ts";
 import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
 import { getSubtree } from "../legion/nodes.ts";
-import { usageTotalTokens } from "../legion/usage.ts";
+import { attachUsageTotals } from "../legion/usage.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 
 export interface CollectSnapshot {
@@ -268,12 +268,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		const ledger = ledgerDb;
 		const provided = deps.getTreeNodes
 			? deps.getTreeNodes()
-			: ledger
-				? getSubtree(ledger, "root").map((node) => {
-					const total = node.id === "root" ? 0 : usageTotalTokens(ledger, node.id);
-					return total > 0 ? { ...node, tokensTotal: total } : { ...node };
-				})
-				: undefined;
+			: ledger ? attachUsageTotals(ledger, getSubtree(ledger, "root")) : undefined;
 		if (provided !== undefined) {
 			tree.clear();
 			for (const node of provided) {

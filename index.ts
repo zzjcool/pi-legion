@@ -47,7 +47,7 @@ import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
 import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
 import { appendEvent } from "./src/legion/events.ts";
-import { upsertUsage, usageTotalTokens } from "./src/legion/usage.ts";
+import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
@@ -656,10 +656,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		getTreeNodes: () => {
 			const identity = legionIdentity;
 			return identity
-				? getSubtree(identity.db, identity.nodeId).map((node) => {
-					const total = node.id === "root" ? 0 : usageTotalTokens(identity.db, node.id);
-					return total > 0 ? { ...node, tokensTotal: total } : { ...node };
-				})
+				? attachUsageTotals(identity.db, getSubtree(identity.db, identity.nodeId))
 				: [];
 		},
 		getTreeIdentity: (name) => {

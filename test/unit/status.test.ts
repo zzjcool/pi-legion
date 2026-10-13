@@ -321,6 +321,63 @@ test("formatWidgetLines appends a session-wide tree overview when totals are sup
 	assert.equal(formatWidgetLines(entries, 5_000)[0], "⏳ Legion · 2 agents · 2 running");
 });
 
+test("formatWidgetLines shows token totals without Sigma when every agent is live", () => {
+	const entries: StatusEntry[] = [
+		{
+			name: "worker-0",
+			nodeId: "root.worker-0",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "working",
+			startedAt: 0,
+			tokensTotal: 1_200,
+		},
+		{
+			name: "worker-1",
+			nodeId: "root.worker-1",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "working",
+			startedAt: 0,
+			tokensTotal: 800,
+		},
+		{
+			name: "worker-2",
+			nodeId: "root.worker-2",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "working",
+			startedAt: 0,
+			tokensTotal: 1_000,
+		},
+	];
+	const totals = statusTotals(entries);
+	assert.deepEqual(totals, { agents: 3, tokensTotal: 3_000 });
+	assert.equal(
+		formatWidgetLines(entries, 5_000, totals)[0],
+		"⏳ Legion · 3 agents · 3 running · 3K tok",
+	);
+});
+
+test("formatWidgetLines computes throughput using the original 1.5-second duration", () => {
+	const lines = formatWidgetLines(
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_200 }],
+		1_500,
+	);
+	assert.match(lines[1] ?? "", /· 800 t\/s$/);
+});
+
+test("formatWidgetLines includes throughput at exactly one second", () => {
+	const lines = formatWidgetLines(
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_000 }],
+		1_000,
+	);
+	assert.match(lines[1] ?? "", /· 1K t\/s$/);
+});
+
 test("formatWidgetLines appends current-turn elapsed for live in-flight turns", () => {
 	assert.deepEqual(
 		formatWidgetLines(

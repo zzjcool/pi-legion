@@ -61,6 +61,16 @@ export function usageTotalTokens(db: DatabaseSync, nodeId: string): number {
 	return usage ? usage.tokensIn + usage.tokensOut : 0;
 }
 
+export function attachUsageTotals<T extends { id: string }>(
+	db: DatabaseSync,
+	nodes: T[],
+): Array<T & { tokensTotal?: number }> {
+	return nodes.map((node) => {
+		const total = node.id === "root" ? 0 : usageTotalTokens(db, node.id);
+		return (total > 0 ? { ...node, tokensTotal: total } : { ...node }) as T & { tokensTotal?: number };
+	});
+}
+
 function mapUsage(row: SqliteRow): UsageSnapshot {
 	return {
 		nodeId: String(row.node_id),
