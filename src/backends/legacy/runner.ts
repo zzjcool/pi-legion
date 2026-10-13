@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createCappedOutput, resolveMaxOutputBytes } from "../../shared/output-cap.ts";
 import type { CommandRunner } from "./types.ts";
 
 const HERDR_BIN_ENV = "HERDR_BIN";
@@ -48,14 +49,26 @@ export function createCommandRunner(
 				return;
 			}
 
-			let stdout = "";
-			let stderr = "";
+			const cap = resolveMaxOutputBytes(baseEnv);
+			const killOnOverflow = () => {
+				child.stdout?.destroy();
+				child.stderr?.destroy();
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					/* already gone */
+				}
+			};
+			const out = createCappedOutput(cap, killOnOverflow);
+			const err = createCappedOutput(cap, killOnOverflow);
+			let extraStderr = "";
 			let settled = false;
 			const finish = (code: number) => {
 				if (settled) return;
 				settled = true;
 				if (timer) clearTimeout(timer);
-				resolve({ stdout, stderr, code });
+				const overflowed = out.truncated || err.truncated;
+				resolve({ stdout: out.text(), stderr: `${err.text()}${extraStderr}`, code: overflowed && code === 0 ? -3 : code });
 			};
 
 			let timer: ReturnType<typeof setTimeout> | undefined;
@@ -67,20 +80,20 @@ export function createCommandRunner(
 					} catch {
 						/* already gone */
 					}
-					stderr += `\n[timeout after ${timeoutMs}ms]`;
+					extraStderr += `\n[timeout after ${timeoutMs}ms]`;
 					finish(-2);
 				}, timeoutMs);
 				timer.unref?.();
 			}
 
 			child.stdout?.on("data", (chunk) => {
-				stdout += chunk.toString();
+				out.push(chunk);
 			});
 			child.stderr?.on("data", (chunk) => {
-				stderr += chunk.toString();
+				err.push(chunk);
 			});
-			child.on("error", (err) => {
-				stderr += String(err);
+			child.on("error", (e) => {
+				extraStderr += String(e);
 				finish(-1);
 			});
 			child.on("close", (code) => finish(code ?? 0));
