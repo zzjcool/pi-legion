@@ -145,6 +145,8 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	const colOf = (t: number): number => Math.floor((t - (now - windowMs)) / dt - 1e-9);
 	const cells = new Map<string, { ch: string; color: string; owner: string }>();
 	let owner = "";
+	// Spawn ticks on the header rule for root-spawned live lanes (first sibling owns it).
+	const headerTicks = new Map<number, { color: string; owner: string }>();
 	const put = (c: number, r: number, ch: string, col: string, by: string = owner): void => {
 		if (c < 0 || c >= AW || r < 0 || r >= rows) return;
 		cells.set(`${c},${r}`, { ch, color: col, owner: by });
@@ -164,15 +166,27 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 			p = current.lanes.get(parent.id);
 			parent = parent.parentId ? byId.get(parent.parentId) : undefined;
 		}
-		if (p === undefined || p === r) { put(start, r, "╺", col); continue; }
-		put(start, r, p < r ? "╰" : "╭", col);
-		for (let y = Math.min(p, r) + 1; y < Math.max(p, r); y++) if (!cells.has(`${start},${y}`)) put(start, y, "│", col);
-		const pc = cells.get(`${start},${p}`);
+		if (p === r) { put(start, r, "╺", col); continue; }
+		// No visible ancestor lane: the child was spawned from the root, whose
+		// implicit trunk is the header rule (row -1). Siblings forking at the same
+		// x share one vertical: an earlier sibling's ╰ becomes ├ when a later
+		// sibling's connector passes through it.
+		const from = p ?? -1;
+		put(start, r, from < r ? "╰" : "╭", col);
+		for (let y = Math.min(from, r) + 1; y < Math.max(from, r); y++) {
+			const cell = cells.get(`${start},${y}`);
+			if (!cell) put(start, y, "│", col);
+			else if (cell.ch === "━") cell.ch = "┿"; // crossing another lane: that lane keeps the cell
+			else if (cell.ch === "╰" && from < r) cell.ch = "├";
+			else if (cell.ch === "╭" && from > r) cell.ch = "├";
+		}
+		if (from < 0) { if (!headerTicks.has(start)) headerTicks.set(start, { color: col, owner: id }); continue; }
+		const pc = cells.get(`${start},${from}`);
 		// The branch point is part of the child's fork, so clicking it opens the child.
-		if (pc && pc.ch === "━") put(start, p, p < r ? "┳" : "┻", pc.color);
+		if (pc && pc.ch === "━") put(start, from, from < r ? "┳" : "┻", pc.color);
 	}
 
-	// Header: plain rule (no lane glyphs ever drawn on it).
+	// Header: plain rule; the only glyphs on it are ┬ spawn ticks of live root-spawned lanes.
 	const y0 = 1;
 	for (let x = 0; x < width; x++) canvas.set(x, 0, "─", "borderMuted");
 	for (let r = 0; r < rows; r++) for (let c = 0; c < AW; c++) canvas.set(LX + c, y0 + r, "·", "borderMuted");
@@ -193,6 +207,11 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		? ` ${live} live${range} · ${rateText} `
 		: ` legion ${live} live${range} · ${rateText} `;
 	canvas.text(Math.max(LX + 1 + winLabel.length, width - header.length - 1), 0, header, "accent", { bold: true, maxX: width - 1 });
+	for (const [c, tick] of headerTicks) {
+		if (canvas.get(LX + c, 0)?.ch !== "─") continue; // never draw over header text
+		canvas.set(LX + c, 0, "┬", tick.color);
+		hit[0]![LX + c] = tick.owner;
+	}
 
 	const nameX = LX + AW;
 	current.shown.forEach((node, i) => {

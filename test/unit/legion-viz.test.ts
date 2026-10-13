@@ -489,7 +489,12 @@ test("railway: ended scouts vanish — one row, only the survivor's label, no or
 		const lines = out.canvas.toLines(plainTheme);
 		assert.equal(lines.length, 2, "header + one lane");
 		assert.deepEqual(out.nodeIdsByRow, [undefined, "scout-3"]);
-		assert.match(lines[0]!, /^[─\s\-−0-9a-z·./]+$/, `header has only rule/text: ${lines[0]}`);
+		assert.match(lines[0]!, /^[─┬\s\-−0-9a-z·./]+$/, `header has only rule/text/spawn tick: ${lines[0]}`);
+		// Exactly one spawn tick: scout-3's (root-spawned, live), at its lane start, owned by it.
+		const ticks = Array.from(lines[0]!).flatMap((ch, x) => ch === "┬" ? [x] : []);
+		assert.equal(ticks.length, 1);
+		assert.equal(out.hit[0]![ticks[0]!], "scout-3");
+		assert.equal(Array.from(lines[1]!)[ticks[0]!], "╰");
 		assert.doesNotMatch(lines.join("\n"), /scout-[012]/);
 		assert.equal((lines[1]!.match(/scout-3/g) ?? []).length, 1);
 		assert.doesNotMatch(lines[1]!, /[┴┬✗]/);
@@ -529,9 +534,16 @@ test("railway hit map: every drawn cell maps to the agent whose glyph it is (for
 	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
 	assert.equal(out.hit.length, lines.length);
 	assert.deepEqual(out.nodeIdsByRow, [undefined, "worker-0", "scout-1", "scout-2"]);
-	// Header row and dotted background are never clickable.
-	assert.ok(out.hit[0]!.every((id) => id === undefined));
 	const nameX = lines[1]!.indexOf("▶");
+	// Lane start column per agent (where its ╰/├/╭/╺ cap is drawn).
+	const startX = new Map<string, number>();
+	for (let y = 1; y < lines.length; y++) startX.set(out.nodeIdsByRow[y]!, lines[y]!.findIndex((ch) => "╰├╭╺┄".includes(ch)));
+	// Header: only ┬ spawn ticks of root-spawned live lanes are clickable (owned by that child).
+	lines[0]!.forEach((ch, x) => {
+		if (ch === "┬") assert.ok(["worker-0", "scout-2"].includes(out.hit[0]![x]!) && startX.get(out.hit[0]![x]!) === x, `tick ${x}`);
+		else assert.equal(out.hit[0]![x], undefined, `header ${x}`);
+	});
+	assert.equal(lines[0]!.filter((ch) => ch === "┬").length, 2);
 	let forkCells = 0;
 	for (let y = 1; y < lines.length; y++) {
 		for (let x = 0; x < lines[y]!.length; x++) {
@@ -539,8 +551,11 @@ test("railway hit map: every drawn cell maps to the agent whose glyph it is (for
 			const id = out.hit[y]![x];
 			if (x >= nameX) { assert.equal(id, out.nodeIdsByRow[y], `name col ${x},${y}`); continue; }
 			if (ch === "·" || ch === " ") assert.equal(id, undefined, `background ${x},${y}`);
-			else if (ch === "━" || ch === "╺") assert.equal(id, out.nodeIdsByRow[y], `lane ${x},${y} ${ch}`);
-			else if ("╰╭│┳┻".includes(ch)) { assert.equal(id, "scout-1", `fork ${x},${y} ${ch}`); forkCells++; }
+			else if (ch === "━" || ch === "╺" || ch === "┿") assert.equal(id, out.nodeIdsByRow[y], `lane ${x},${y} ${ch}`);
+			else if ("╰╭├│┳┻".includes(ch)) {
+				assert.ok(id !== undefined && startX.get(id) === x, `connector ${x},${y} ${ch} -> ${id}`);
+				if (id === "scout-1") forkCells++;
+			}
 			else assert.fail(`unexpected glyph ${ch} at ${x},${y}`);
 		}
 	}
@@ -681,4 +696,26 @@ test("status board: wheel over the railway scrolls lanes (65 down / 64 up), clic
 	comp.render(120);
 	assert.equal(comp.handleMouse!(ev("wheel", 1, { wheelDelta: 1 })), undefined);
 	board.clear();
+});
+
+test("railway: root-spawned lanes get a ┬ spawn connector from the header; siblings at the same x share one vertical", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(100) }),
+		node("scout-1", { startedAt: sec(200) }),
+		node("scout-2", { startedAt: sec(200) }),
+		node("scout-3", { startedAt: sec(200) }),
+		node("gone", { startedAt: sec(150), status: "settled", endedAt: sec(250) }),
+	];
+	const out = renderRailway({ nodes, now: sec(300), width: 120, rate: 0 })!;
+	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+	const ticks = lines[0]!.flatMap((ch, x) => ch === "┬" ? [x] : []);
+	assert.equal(ticks.length, 2, "worker-0 + one shared tick for the three siblings; none for the ended agent");
+	const [wx, sx] = ticks as [number, number];
+	assert.equal(lines[1]![wx], "╰");
+	assert.deepEqual([lines[1]![sx], lines[2]![sx], lines[3]![sx], lines[4]![sx]], ["┿", "├", "├", "╰"], "crosses worker-0's lane");
+	assert.equal(out.hit[1]![sx], "worker-0", "a crossing stays with the lane it sits on");
+	assert.equal(out.hit[0]![sx], "scout-1");
+	assert.equal(out.hit[4]![sx], "scout-3");
+	assert.equal(out.hit[2]![sx], "scout-1");
+	for (const line of out.canvas.toLines(ansiTheme)) assert.equal(visibleWidth(line), 120);
 });
