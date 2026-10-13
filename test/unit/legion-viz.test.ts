@@ -55,6 +55,10 @@ test("viz: blocked and starting display as running; terminal states map to done/
 	assert.equal(displayStatus("starting"), "running");
 	assert.equal(displayStatus("blocked"), "running");
 	assert.equal(displayStatus("running"), "running");
+	assert.equal(displayStatus("working"), "running");
+	// Matches the footer's active set: an idle/awaiting child is not counted as live.
+	assert.equal(displayStatus("idle"), "retired");
+	assert.equal(displayStatus("awaiting"), "retired");
 	assert.equal(displayStatus("settled"), "settled");
 	assert.equal(displayStatus("failed"), "failed");
 	assert.equal(displayStatus("retired"), "retired");

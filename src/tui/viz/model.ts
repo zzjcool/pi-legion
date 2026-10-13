@@ -24,7 +24,8 @@ export interface VizNode {
 	tokens: number;
 }
 
-const RUNNING = new Set(["starting", "running", "blocked", "active", "spawning", "working", "idle", "pending", "queued"]);
+/** Same set the footer/busy label treat as active, so live counts agree everywhere. */
+const RUNNING = new Set(["starting", "working", "running", "blocked"]);
 const SETTLED = new Set(["settled", "success", "completed", "done"]);
 const FAILED = new Set(["failed", "aborted", "error", "truncated"]);
 
