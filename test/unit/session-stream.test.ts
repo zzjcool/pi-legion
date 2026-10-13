@@ -1,0 +1,80 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { clearSessionParseCache, parseSessionFile, parseSessionText } from "../../src/shared/session.ts";
+
+const user = (t: string) => JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: t }] } });
+const asst = (t: string) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: t }], stopReason: "stop", usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } });
+const tool = (err: boolean) => JSON.stringify({ type: "message", message: { role: "toolResult", isError: err, content: [{ type: "text", text: "x" }] } });
+
+function tmp(): string {
+	return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "sess-")), "s.jsonl");
+}
+
+test("streamed parse equals whole-text parse", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	const text = [user("a"), asst("one"), tool(true), user("b"), asst("two"), "{torn"].join("\n");
+	fs.writeFileSync(f, text);
+	assert.deepEqual(parseSessionFile(f), parseSessionText(text));
+});
+
+test("incremental append parses only new bytes and matches full parse", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	fs.writeFileSync(f, `${user("a")}\n${asst("one")}\n`);
+	assert.equal(parseSessionFile(f).turns.length, 1);
+	// partial line in progress: provisional, not committed
+	const a2 = asst("two");
+	fs.appendFileSync(f, `${user("b")}\n${a2.slice(0, 20)}`);
+	const mid = parseSessionFile(f);
+	assert.equal(mid.turns.length, 2);
+	assert.equal(mid.lastTurnMissing, true);
+	fs.appendFileSync(f, `${a2.slice(20)}\n`);
+	const full = fs.readFileSync(f, "utf8");
+	assert.deepEqual(parseSessionFile(f), parseSessionText(full));
+	assert.equal(parseSessionFile(f).lastTurnOutput, "two");
+});
+
+test("in-place rewrite with different content invalidates the cache", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	fs.writeFileSync(f, `${user("a")}\n${asst("old")}\n`);
+	assert.equal(parseSessionFile(f).lastTurnOutput, "old");
+	fs.writeFileSync(f, `${user("a")}\n${asst("new")}\n${user("c")}\n${asst("third")}\n`);
+	assert.equal(parseSessionFile(f).lastTurnOutput, "third");
+	assert.equal(parseSessionFile(f).turns.length, 2);
+	fs.writeFileSync(f, `${user("z")}\n`);
+	assert.equal(parseSessionFile(f).turns.length, 1);
+});
+
+test("callers cannot corrupt the cache by mutating the result", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	fs.writeFileSync(f, `${user("a")}\n${asst("one")}\n`);
+	const r = parseSessionFile(f);
+	r.turns.length = 0;
+	assert.equal(parseSessionFile(f).turns.length, 1);
+});
+
+test("oversized single line is skipped as torn without materialising it", () => {
+	clearSessionParseCache();
+	const prev = process.env.PI_LEGION_SESSION_MAX_LINE_BYTES;
+	process.env.PI_LEGION_SESSION_MAX_LINE_BYTES = "4096";
+	try {
+		const f = tmp();
+		const huge = JSON.stringify({ type: "message", message: { role: "toolResult", content: [{ type: "text", text: "y".repeat(3 * 1024 * 1024) }] } });
+		fs.writeFileSync(f, `${user("a")}\n${huge}\n${asst("after")}\n`);
+		const r = parseSessionFile(f);
+		assert.equal(r.tornLines, 1);
+		assert.equal(r.lastTurnOutput, "after");
+	} finally {
+		if (prev === undefined) delete process.env.PI_LEGION_SESSION_MAX_LINE_BYTES; else process.env.PI_LEGION_SESSION_MAX_LINE_BYTES = prev;
+	}
+});
+
+test("missing file yields empty", () => {
+	assert.equal(parseSessionFile("/nonexistent/x.jsonl").turns.length, 0);
+});
