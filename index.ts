@@ -54,6 +54,7 @@ import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
+import { applyEventRetention, checkpoint, formatHygieneReport, hygieneEnabled, runStartupHygiene } from "./src/runs/hygiene.ts";
 import {
 	createStatusNodeOpener,
 	publishSupervisorEvent,
@@ -503,6 +504,9 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		if (!legionIdentity) return;
 		legionIdentity.postman.stop();
 		legionIdentity.dbEventSource.stop();
+		// #40: bound the ledger and fold the WAL back before closing.
+		if (hygieneEnabled() && !isChild) applyEventRetention(legionIdentity.db);
+		else checkpoint(legionIdentity.db);
 		legionIdentity.db.close();
 		legionIdentity = undefined;
 	};
@@ -525,9 +529,25 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 		}
 	}
+	let hygieneScheduled = false;
 	pi.on("session_start", (_event, ctx) => {
 		try { initializeLegionRuntime({ cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile() }); }
 		catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
+		// #37/#38/#40: one deferred, best-effort storage sweep per root process.
+		if (!isChild && !hygieneScheduled && hygieneEnabled()) {
+			hygieneScheduled = true;
+			const storeRoot = runStoreFor(ctx.cwd).rootDir;
+			const timer = setTimeout(() => {
+				try {
+					const report = runStartupHygiene({ storeRoot, protectRunIds: legionIdentity ? [legionIdentity.rootRunId] : [] });
+					const text = formatHygieneReport(report);
+					if (text) ctx.ui?.notify?.(text, "info");
+				} catch (error) {
+					console.error(`[pi-legion] storage sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			}, 1_500);
+			timer.unref?.();
+		}
 	});
 	const pendingUtilityRetires: Array<() => Promise<void>> = [];
 	let sessionRuntime: SessionRuntime | undefined;

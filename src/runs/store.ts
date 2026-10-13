@@ -18,6 +18,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
+import { writeRunOwner } from "./owner.ts";
 import {
 	MAX_NESTED_PATH_ENTRIES,
 	SubagentError,
@@ -136,6 +137,7 @@ export class RunStore {
 	private readonly nowFn: () => number;
 	/** Per-runId write mutex: maps runId → tail of the write chain. */
 	private readonly locks = new Map<string, Promise<unknown>>();
+	private readonly ownedRuns = new Set<string>();
 
 	constructor(opts: StoreOptions) {
 		if (!opts.rootDir || typeof opts.rootDir !== "string") {
@@ -300,6 +302,16 @@ export class RunStore {
 			this.runFile(record.runId),
 			`${JSON.stringify(record, null, "\t")}\n`,
 		);
+		// Record which process last wrote this run so the startup sweep (#38)
+		// can tell a live concurrent session from a hard-killed one.
+		if (!this.ownedRuns.has(record.runId)) {
+			try {
+				writeRunOwner(path.dirname(this.runFile(record.runId)));
+				this.ownedRuns.add(record.runId);
+			} catch {
+				// best effort: a missing owner file only makes the sweep more conservative
+			}
+		}
 	}
 
 	/**
