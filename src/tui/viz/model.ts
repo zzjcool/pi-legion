@@ -63,7 +63,27 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 	for (const node of out) {
 		if (node.parentId !== null && !ids.has(node.parentId)) node.parentId = ids.has("root") && node.id !== "root" ? "root" : null;
 	}
+	disambiguateNames(out);
 	return out;
+}
+
+/**
+ * Child supervisors number their own children, so a nested "scout-0" can share
+ * a name with a root-level "scout-0". Prefix duplicates with their parent name
+ * (the shallowest keeps the bare name) so strip/log/galaxy labels stay unique.
+ */
+export function disambiguateNames(nodes: VizNode[]): void {
+	const byName = new Map<string, VizNode[]>();
+	for (const node of nodes) byName.set(node.name, [...(byName.get(node.name) ?? []), node]);
+	const byId = new Map(nodes.map((node) => [node.id, node]));
+	for (const group of byName.values()) {
+		if (group.length < 2) continue;
+		const sorted = [...group].sort((a, b) => a.depth - b.depth || a.startedAt - b.startedAt);
+		for (const node of sorted.slice(1)) {
+			const parent = node.parentId ? byId.get(node.parentId) : undefined;
+			if (parent && parent.id !== "root") node.name = `${parent.name}/${node.name}`;
+		}
+	}
 }
 
 export function isAgent(node: VizNode): boolean {

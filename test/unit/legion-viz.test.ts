@@ -297,3 +297,14 @@ test("legion view: root is not listed as an agent type and the factory fills the
 	assert.equal(component.render(100).length, 37);
 	component.dispose();
 });
+
+test("viz: duplicate child names from nested supervisors are disambiguated by parent", () => {
+	const entries: StatusEntry[] = [
+		{ name: "root", agent: "root", state: "running", startedAt: T0, nodeId: "root", parentId: null, depth: 0 },
+		{ name: "centurion-0", agent: "centurion", state: "running", startedAt: T0, nodeId: "root.c0", parentId: "root", depth: 1 },
+		{ name: "scout-0", agent: "scout", state: "running", startedAt: T0, nodeId: "root.s0", parentId: "root", depth: 1 },
+		{ name: "scout-0", agent: "scout", state: "running", startedAt: T0 + 5, nodeId: "root.c0.s0", parentId: "root.c0", depth: 2 },
+	];
+	const names = nodesFromEntries(entries).map((n) => n.name);
+	assert.deepEqual(names, ["root", "centurion-0", "scout-0", "centurion-0/scout-0"]);
+});
