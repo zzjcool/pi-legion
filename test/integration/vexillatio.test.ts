@@ -6,7 +6,9 @@ import * as path from "node:path";
 import herdrSubagents from "../../index.ts";
 import { ErrorCodes, type AgentConfig } from "../../src/shared/types.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
-import type { RpcClientOptions } from "../../src/supervisor/types.ts";
+import type { RpcClientOptions, SettleResult } from "../../src/supervisor/types.ts";
+import { openLegionDb, legionDbPath } from "../../src/legion/db.ts";
+import { getNode } from "../../src/legion/nodes.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 interface ToolResult {
@@ -41,13 +43,60 @@ function fakePi() {
 
 type FakePi = ReturnType<typeof fakePi>;
 
-function context(cwd: string) {
+interface CapturedFooter {
+	status?: string;
+	widgetVisible?: boolean;
+	widgetText?: string;
+}
+
+function context(
+	cwd: string,
+	options: { footer?: CapturedFooter; model?: { provider: string; id: string } } = {},
+) {
 	return {
 		cwd,
-		hasUI: false,
-		ui: { setStatus() {}, setWidget() {} },
+		hasUI: options.footer !== undefined,
+		ui: {
+			setStatus(_key: string, status: string | undefined) {
+				if (options.footer) options.footer.status = status;
+			},
+			setWidget(_key: string, widget: unknown) {
+				if (!options.footer) return;
+				options.footer.widgetVisible = widget !== undefined;
+				if (typeof widget !== "function") {
+					options.footer.widgetText = undefined;
+					return;
+				}
+				const factory = widget as (
+					tui: { requestRender(): void },
+					theme: { fg(color: string, text: string): string },
+				) => { render(width?: number): string[] };
+				const view = factory(
+					{ requestRender() {} },
+					{ fg(_color, text) { return text; } },
+				);
+				options.footer.widgetText = view.render(120).join("\n");
+			},
+		},
 		sessionManager: { getSessionFile: () => path.join(cwd, "root-session.jsonl") },
+		...(options.model ? { model: options.model } : {}),
 	};
+}
+
+class FirstTimeoutSupervisor extends FakeSupervisor {
+	private readonly timedOut = new Set<string>();
+
+	constructor() {
+		super({ immediateTimeout: false });
+	}
+
+	override waitSettled(name: string, timeoutMs?: number): Promise<SettleResult> {
+		if (!this.timedOut.has(name)) {
+			this.timedOut.add(name);
+			return Promise.resolve({ settled: false, abnormal: false, reason: "timeout" });
+		}
+		return super.waitSettled(name, timeoutMs);
+	}
 }
 
 async function withEnvironment<T>(
@@ -131,6 +180,24 @@ async function invoke(
 	return tool.execute("test-call", params, undefined, undefined, ctx);
 }
 
+function writeProjectSubagentSettings(cwd: string, subagents: Record<string, unknown>): void {
+	const piDir = path.join(cwd, ".pi");
+	mkdirSync(piDir, { recursive: true });
+	writeFileSync(path.join(piDir, "settings.json"), JSON.stringify({ subagents }));
+}
+
+async function waitFor(
+	predicate: () => boolean,
+	timeoutMs = 1_000,
+): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return true;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	return predicate();
+}
+
 test("vexillatio dispatches a utility agent, strips lineage, and returns its collected output", async () => {
 	await withSandbox(
 		{
@@ -178,6 +245,52 @@ test("vexillatio dispatches a utility agent, strips lineage, and returns its col
 				assert.equal(env?.[key], undefined, `${key} must be stripped for utility dispatch`);
 			}
 			assert.equal(supervisor.spawns[0]?.input.allowNestedSubagents, undefined);
+		},
+	);
+});
+
+test("vexillatio resolves utility model and thinking from the active team", async () => {
+	await withSandbox(
+		{ PI_SUBAGENTS_TEAM: "be-value" },
+		async ({ pi, supervisor, cwd }) => {
+			writeProjectSubagentSettings(cwd, {
+				teams: {
+					"be-value": {
+						members: [{ agent: "scout", model: "workbuddy/hy4-preview-f", thinking: "high" }],
+					},
+				},
+			});
+			const result = await invoke(pi, "vexillatio", {
+				task: "Inspect the test repository under the active team.",
+				agent: "scout",
+			}, context(cwd, { model: { provider: "parent-provider", id: "parent-model" } }));
+			assert.match(result.content[0]?.text ?? "", /execution: success/);
+			assert.equal(supervisor.spawns.length, 1);
+			const spawn = supervisor.spawns[0];
+			assert.ok(spawn);
+			assert.equal(spawn.input.model, "workbuddy/hy4-preview-f");
+			assert.equal(spawn.input.thinking, "high");
+			const modelIndex = spawn.args.indexOf("--model");
+			assert.notEqual(modelIndex, -1);
+			assert.equal(spawn.args[modelIndex + 1], "workbuddy/hy4-preview-f:high");
+		},
+	);
+});
+
+test("vexillatio falls back to allAgents when the active team omits a utility agent", async () => {
+	await withSandbox(
+		{ PI_SUBAGENTS_TEAM: "be-value" },
+		async ({ pi, supervisor, cwd }) => {
+			writeProjectSubagentSettings(cwd, {
+				teams: { "be-value": { members: ["worker"] } },
+			});
+			const result = await invoke(pi, "vexillatio", {
+				task: "Inspect the test repository as a utility outside the team roster.",
+				agent: "scout",
+			}, context(cwd));
+			assert.match(result.content[0]?.text ?? "", /── scout-0 ──/);
+			assert.equal(supervisor.spawns.length, 1);
+			assert.equal(supervisor.spawns[0]?.input.agent.name, "scout");
 		},
 	);
 });
@@ -339,6 +452,59 @@ test("vexillatio avoids a live same-name subagent and returns on collect timeout
 		},
 		supervisor,
 	);
+});
+
+test("vexillatio tracks a timed-out utility until completion clears its Legion and footer state", async () => {
+	const supervisor = new FirstTimeoutSupervisor();
+	await withSandbox({}, async ({ pi, cwd }) => {
+		const footer: CapturedFooter = {};
+		const result = await invoke(pi, "vexillatio", {
+			task: "Inspect and report after the initial collection times out.",
+			agent: "scout",
+			timeoutMs: 50,
+		}, context(cwd, { footer }));
+		const output = result.content.map((part) => part.text ?? "").join("\n");
+		assert.match(output, /execution: running/);
+		assert.match(output, /collect timed out after 50ms/);
+		assert.equal(supervisor.isAlive("scout-0"), true);
+		assert.equal(footer.status, "1 agent running");
+		assert.equal(footer.widgetVisible, true);
+		assert.match(footer.widgetText ?? "", /scout-0/);
+		const runId = (result.details as { runId?: string } | undefined)?.runId;
+		assert.ok(runId, "vexillatio returns the parent run id");
+
+		const dbPath = legionDbPath(path.join(cwd, ".pi-subagents", "runs", runId));
+		const db = openLegionDb(dbPath);
+		try {
+			assert.equal(getNode(db, "root.scout-0")?.status, "running");
+			supervisor.settle("scout-0", { text: "utility work completed after the timeout" });
+			await waitFor(() => !supervisor.isAlive("scout-0"), 2_000);
+			assert.deepEqual(
+				{
+					nodeStatus: getNode(db, "root.scout-0")?.status,
+					footerStatus: footer.status,
+					widgetVisible: footer.widgetVisible,
+					widgetText: footer.widgetText ?? "",
+					childAlive: supervisor.isAlive("scout-0"),
+				},
+				{
+					nodeStatus: "settled",
+					footerStatus: undefined,
+					widgetVisible: false,
+					widgetText: "",
+					childAlive: false,
+				},
+			);
+		} finally {
+			db.close();
+		}
+		await pi.handlers.get("session_shutdown")?.();
+		assert.equal(
+			supervisor.calls.filter((call) => call.method === "retire" && call.name === "scout-0").length,
+			1,
+			"the retained shutdown retire hook must share the watch's completed retirement",
+		);
+	}, supervisor);
 });
 
 test("RPC spawn masks inherited utility and Legion identities before applying target env", async () => {
