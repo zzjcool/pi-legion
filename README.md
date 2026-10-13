@@ -206,6 +206,21 @@ subtree, including itself; when launched by a parent at depth `d`, it inherits
 `C_child = min(C_parent, d + R, 4)` (`R = 1` makes it a leaf), so it can tighten
 the inherited cap but cannot widen it.
 
+### Child extensions
+
+Children start with `--no-extensions`, so they do not load the host's
+discovered extensions (settings `packages`, `~/.pi/agent/extensions`, project
+extensions). Each extension a child loads is a memory cost multiplied by every
+concurrent child; an LSP stack is ~1 GB (#43). A child still loads pi-legion
+itself (guard and nested spawning) and every path listed in the role's
+`extensions` / `subagentOnlyExtensions`.
+
+| Knob | Effect |
+| --- | --- |
+| role frontmatter `inheritExtensions: true` | That role loads all host extensions, as before. |
+| `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` | Every child loads all host extensions, as before. |
+| `PI_LEGION_CHILD_EXTENSIONS=/a.ts,/b.ts` | Extra extension paths every child loads explicitly, e.g. a provider extension the child's model needs. |
+
 ### Storage hygiene
 
 Each root pi session runs one deferred, best-effort sweep of `.pi-subagents/`

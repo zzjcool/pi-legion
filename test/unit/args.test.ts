@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import type { AgentConfig } from "../../src/shared/types.ts";
 import {
 	buildPiArgs,
 	childGuardExtensionPath,
@@ -103,4 +104,41 @@ test("buildPiArgs worktreeBranch lands in the task file", () => {
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+function withEnv<T>(vars: Record<string, string | undefined>, fn: () => T): T {
+	const prev: Record<string, string | undefined> = {};
+	for (const k of Object.keys(vars)) { prev[k] = process.env[k]; if (vars[k] === undefined) delete process.env[k]; else process.env[k] = vars[k]; }
+	try { return fn(); } finally { for (const k of Object.keys(prev)) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; } }
+}
+
+function argvFor(a: AgentConfig): string[] {
+	const dir = mkdtempSync(path.join(tmpdir(), "args-noext-"));
+	try { return buildPiArgs({ agent: a, task: "t", sessionFile: "/tmp/s.jsonl", tempDir: dir }).args; }
+	finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+test("#43 children get --no-extensions by default, guard + explicit extensions still load", () => {
+	withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined }, () => {
+		const args = argvFor({ ...agent(), extensions: ["/opt/ext/lsp.ts"] });
+		assert.equal(args.filter((a) => a === "--no-extensions").length, 1);
+		const exts = args.flatMap((a, i) => (a === "--extension" ? [args[i + 1]] : []));
+		assert.deepEqual(exts, ["/opt/ext/lsp.ts", childGuardExtensionPath()]);
+		assert.ok(args.indexOf("--no-extensions") < args.indexOf("--extension"));
+	});
+});
+
+test("#43 escape hatches: role inheritExtensions, env inherit, env extra extensions", () => {
+	withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined }, () => {
+		assert.ok(!argvFor({ ...agent(), inheritExtensions: true }).includes("--no-extensions"));
+	});
+	for (const v of ["1", "true", "on"]) {
+		withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: v }, () => assert.ok(!argvFor(agent()).includes("--no-extensions")));
+	}
+	withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: "0", PI_LEGION_CHILD_EXTENSIONS: "/a/provider.ts,/b/x.ts" }, () => {
+		const args = argvFor(agent());
+		assert.ok(args.includes("--no-extensions"));
+		const exts = args.flatMap((a, i) => (a === "--extension" ? [args[i + 1]] : []));
+		assert.deepEqual(exts, ["/a/provider.ts", "/b/x.ts", childGuardExtensionPath()]);
+	});
 });

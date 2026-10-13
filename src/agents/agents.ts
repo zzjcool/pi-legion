@@ -377,6 +377,7 @@ export function parseAgentDocument(
 		// Defaults chosen to match pi-subagents conventions (design §6.1).
 		inheritProjectContext: bool(fm.inheritProjectContext) ?? true,
 		inheritSkills: bool(fm.inheritSkills) ?? false,
+		...(bool(fm.inheritExtensions) !== undefined ? { inheritExtensions: bool(fm.inheritExtensions) } : {}),
 		kind: enumOr<AgentKind>(fm.kind, VALID_KINDS, "pi"),
 		systemPrompt: body,
 		source,
