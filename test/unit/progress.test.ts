@@ -43,6 +43,7 @@ test("progressFromSession: turns and in-flight tools come from the last assistan
 		model: "cb/glm-5.3",
 		turns: 1,
 		lastTools: ["edit"],
+		usageTotal: 24,
 	});
 });
 
@@ -74,6 +75,7 @@ test("progressFromSession: in-flight turn exposes its start timestamp", () => {
 		turns: 2,
 		lastTools: ["bash"],
 		currentTurnStartedAt: 10_000,
+		usageTotal: 24,
 	});
 });
 
@@ -94,17 +96,44 @@ test("progressFromSession: timestamps are absent when the session omits them", (
 	assert.equal(progressFromSession(parsed).currentTurnStartedAt, undefined);
 });
 
+test("progressFromSession: token usage includes input, cache, and output", () => {
+	const parsed = parseSessionText(
+		[
+			sessionHeader(),
+			userMsg("go"),
+			assistantMsg({
+				usage: { input: 100, cacheRead: 200, cacheWrite: 300, output: 400 },
+			}),
+		].join("\n"),
+	);
+	assert.equal(progressFromSession(parsed).usageTotal, 1_000);
+});
+
+test("progressFromSession: all-zero token usage stays absent", () => {
+	const parsed = parseSessionText(
+		[
+			sessionHeader(),
+			userMsg("go"),
+			assistantMsg({
+				usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
+			}),
+		].join("\n"),
+	);
+	assert.equal(progressFromSession(parsed).usageTotal, undefined);
+});
+
 test("mergeProgress: later sources win, empty parts do not clobber", () => {
 	assert.deepEqual(
 		mergeProgress(
 			{ model: "launch/model" },
 			{},
-			{ model: "cursor/gpt-4.1", lastTools: ["edit"], turns: 3 },
+			{ model: "cursor/gpt-4.1", lastTools: ["edit"], turns: 3, usageTotal: 420 },
 		),
 		{
 			model: "cursor/gpt-4.1",
 			lastTools: ["edit"],
 			turns: 3,
+			usageTotal: 420,
 		},
 	);
 });

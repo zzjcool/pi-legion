@@ -56,6 +56,11 @@ export function getUsage(db: DatabaseSync, nodeId: string): UsageSnapshot | null
 	return row ? mapUsage(row) : null;
 }
 
+export function usageTotalTokens(db: DatabaseSync, nodeId: string): number {
+	const usage = getUsage(db, nodeId);
+	return usage ? usage.tokensIn + usage.tokensOut : 0;
+}
+
 function mapUsage(row: SqliteRow): UsageSnapshot {
 	return {
 		nodeId: String(row.node_id),

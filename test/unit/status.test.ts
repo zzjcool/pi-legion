@@ -8,6 +8,7 @@ import {
 	formatElapsed,
 	formatFooterStatus,
 	formatWidgetLines,
+	statusTotals,
 	STATUS_FOOTER_KEY,
 	STATUS_WIDGET_KEY,
 	STATUS_WIDGET_PLACEMENT,
@@ -251,6 +252,75 @@ test("formatWidgetLines adds model, thinking, kind, tools, and worktree", () => 
 	);
 });
 
+test("formatWidgetLines shows cumulative tokens and average throughput", () => {
+	const lines = formatWidgetLines(
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_200 }],
+		5_000,
+	);
+	assert.match(lines[0] ?? "", /· 1\.2K tok$/);
+	assert.match(lines[1] ?? "", /· 240 t\/s$/);
+});
+
+test("formatWidgetLines uses finishedAt for terminal throughput", () => {
+	const lines = formatWidgetLines(
+		[{ name: "worker-0", agent: "worker", state: "settled", startedAt: 0, finishedAt: 4_000, tokensTotal: 1_000 }],
+		5_000,
+	);
+	assert.match(lines[1] ?? "", /· 250 t\/s$/);
+});
+
+test("formatWidgetLines omits throughput below one second but keeps token headline", () => {
+	const lines = formatWidgetLines(
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 4_500, tokensTotal: 800 }],
+		5_000,
+	);
+	assert.match(lines[0] ?? "", /· 800 tok$/);
+	assert.doesNotMatch(lines[1] ?? "", /t\/s/);
+});
+
+test("formatWidgetLines appends a session-wide tree overview when totals are supplied", () => {
+	const entries: StatusEntry[] = [
+		{
+			name: "worker-0",
+			nodeId: "root.worker-0",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "working",
+			startedAt: 0,
+			tokensTotal: 1_200,
+		},
+		{
+			name: "worker-1",
+			nodeId: "root.worker-1",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "working",
+			startedAt: 0,
+			tokensTotal: 800,
+		},
+		{
+			name: "done",
+			nodeId: "root.done",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "settled",
+			startedAt: 0,
+			finishedAt: 4_000,
+			tokensTotal: 1_000,
+		},
+	];
+	const totals = statusTotals(entries);
+	assert.deepEqual(totals, { agents: 3, tokensTotal: 3_000 });
+	assert.equal(
+		formatWidgetLines(entries, 5_000, totals)[0],
+		"⏳ Legion · 2 agents · 2 running · Σ 3 agents · 3K tok",
+	);
+	assert.equal(formatWidgetLines(entries, 5_000)[0], "⏳ Legion · 2 agents · 2 running");
+});
+
 test("formatWidgetLines appends current-turn elapsed for live in-flight turns", () => {
 	assert.deepEqual(
 		formatWidgetLines(
@@ -392,6 +462,70 @@ test("status board registers a persistent factory and then requestRender", () =>
 	assert.deepEqual(statuses.at(-1), { key: STATUS_FOOTER_KEY, text: undefined });
 });
 
+test("status board totals count aged-out nodes but exclude the ledger root", () => {
+	let factory: WidgetFactory | undefined;
+	const tui = { requestRender() {} };
+	const ctx: StatusUi = {
+		hasUI: true,
+		ui: {
+			theme,
+			setStatus() {},
+			setWidget(_key, content) {
+				if (typeof content === "function") factory = content;
+			},
+		},
+	};
+	const entries: StatusEntry[] = [
+		{
+			name: "root",
+			nodeId: "root",
+			parentId: null,
+			depth: 0,
+			agent: "ceo",
+			state: "running",
+			startedAt: 0,
+			tokensTotal: 900,
+		},
+		{
+			name: "worker-0",
+			nodeId: "root.worker-0",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "working",
+			startedAt: 0,
+			tokensTotal: 1_200,
+		},
+		{
+			name: "worker-1",
+			nodeId: "root.worker-1",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "working",
+			startedAt: 0,
+			tokensTotal: 800,
+		},
+		{
+			name: "done",
+			nodeId: "root.done",
+			parentId: "root",
+			depth: 1,
+			agent: "worker",
+			state: "settled",
+			startedAt: 0,
+			finishedAt: 4_000,
+			tokensTotal: 1_000,
+		},
+	];
+	const board = createStatusBoard();
+	board.bind(ctx);
+	board.paint(entries, 5_000);
+	assert.equal(typeof factory, "function");
+	const lines = factory!(tui, theme).render(120).map(stripTerminalSequences);
+	assert.equal(lines[0], "⏳ Legion · 2 agents · 2 running · Σ 3 agents · 3K tok");
+});
+
 test("formatWidgetLines crash replica exceeds a 66-column terminal before truncation", () => {
 	const [headline] = formatWidgetLines([crashEntry], 0);
 	assert.equal(
@@ -417,7 +551,7 @@ test("status board render truncates crash-replica titles to terminal width", () 
 	};
 	const board = createStatusBoard();
 	board.bind(ctx);
-	board.paint([crashEntry], 0);
+	board.paint([{ ...crashEntry, tokensTotal: 1_200 }], 0);
 	assert.equal(typeof factory, "function");
 	const lines = factory!(tui, theme).render(66);
 	assertLinesFit(lines, 66);

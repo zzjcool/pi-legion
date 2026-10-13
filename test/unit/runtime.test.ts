@@ -10,6 +10,7 @@ import { SUBAGENT_NOTIFY_TYPE } from "../../src/extension/notify.ts";
 import type { CollectSnapshot } from "../../src/extension/runtime.ts";
 import { withTempDir } from "../helpers/tmp.ts";
 import { assistantMsg, modelChange, sessionHeader, userMsg } from "../helpers/fixtures.ts";
+import type { TreeNodeSnapshot } from "../../src/tui/tree-view.ts";
 
 function snapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
 	return {
@@ -17,6 +18,37 @@ function snapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
 		output: "ok",
 		acceptance: { status: "attested", level: "attested" },
 		...over,
+	};
+}
+
+function statusTreeNode(
+	id: string,
+	parentId: string | null,
+	name: string,
+	depth: number,
+	tokensTotal?: number,
+): TreeNodeSnapshot {
+	return {
+		id,
+		parentId,
+		name,
+		role: name === "root" ? "root" : "worker",
+		kind: "pi",
+		depth,
+		runId: null,
+		sessionFile: null,
+		worktreePath: null,
+		model: null,
+		team: null,
+		status: "running",
+		phase: null,
+		phaseSince: null,
+		reworkCount: 0,
+		contractPath: null,
+		taskSummary: null,
+		createdAt: 0,
+		updatedAt: 0,
+		...(tokensTotal ? { tokensTotal } : {}),
 	};
 }
 
@@ -1032,6 +1064,35 @@ test("U5: a terminal snapshot is still cached (the exclusion is running-only)", 
 	assert.equal(results[0]?.snapshot?.output, "all good", "wait hits the cache too");
 });
 
+test("runtime: persisted tree usage flows to status entries and fills missing live session usage", () => {
+	const nodes = [
+		statusTreeNode("root", null, "root", 0),
+		statusTreeNode("root.worker", "root", "worker", 1, 256),
+	];
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		getTreeNodes: () => nodes,
+		now: () => 10_000,
+	});
+	try {
+		assert.equal(runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.tokensTotal, 256);
+		runtime.track({
+			name: "worker",
+			runId: "worker-run",
+			agent: "worker",
+			sessionFile: "",
+			nodeId: "root.worker",
+			parentId: "root",
+			depth: 1,
+			timeoutMs: 1_000,
+			collect: () => new Promise(() => {}),
+		});
+		assert.equal(runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.tokensTotal, 256);
+	} finally {
+		runtime.dispose();
+	}
+});
+
 test("runtime: session jsonl fills the live current-turn elapsed", async () => {
 	await withTempDir(async (dir) => {
 		const sessionFile = join(dir, "worker-0.jsonl");
@@ -1045,6 +1106,7 @@ test("runtime: session jsonl fills the live current-turn elapsed", async () => {
 					stopReason: "stop",
 					text: "done",
 					model: "cb/glm-5.3",
+					usage: { input: 100, cacheRead: 200, cacheWrite: 300, output: 400 },
 					timestamp: 2_000,
 				}),
 				userMsg("more", { timestamp: 4_000 }),
@@ -1052,6 +1114,7 @@ test("runtime: session jsonl fills the live current-turn elapsed", async () => {
 					stopReason: "toolUse",
 					tools: ["bash"],
 					model: "cb/glm-5.3",
+					usage: { input: 10, cacheRead: 20, cacheWrite: 30, output: 40 },
 					timestamp: 4_500,
 				}),
 			].join("\n"),
@@ -1087,6 +1150,7 @@ test("runtime: session jsonl fills the live current-turn elapsed", async () => {
 		// The board renders with the real clock, so assert shape, not a fixed
 		// second count: the in-flight turn (started at 4_000) shows a suffix.
 		assert.match(rendered.join("\n"), /turn 2 \(\d+s\) · bash/);
+		assert.equal(runtime.statusEntries().find((entry) => entry.name === "worker-0")?.tokensTotal, 1_100);
 		runtime.dispose();
 	});
 });

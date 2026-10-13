@@ -20,6 +20,8 @@ const ACTIVE_STATUSES = new Set<NodeStatus>(["starting", "running", "blocked"]);
 const TERMINAL_STATUSES = new Set<NodeStatus>(["settled", "failed", "retired"]);
 
 export interface TreeNodeSnapshot extends LegionNode {
+	/** Snapshot from legion.db usage table (≤30s granularity). */
+	tokensTotal?: number;
 	turn?: number;
 	turns?: number;
 	tools?: readonly string[];

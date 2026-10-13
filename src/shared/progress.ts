@@ -12,12 +12,14 @@ export interface LiveProgress {
 	lastTools?: string[];
 	/** Unix ms start of the in-flight turn, when the session records it. */
 	currentTurnStartedAt?: number;
+	usageTotal?: number;
 }
 
 export function progressFromSession(parsed: ParsedSession): LiveProgress {
 	const lastTools = lastInflightTools(parsed);
 	const lastTurn = parsed.turns.at(-1);
 	const turnInFlight = lastTurn !== undefined && !isLastTurnComplete(parsed);
+	const total = parsed.usage.input + parsed.usage.cacheRead + parsed.usage.cacheWrite + parsed.usage.output;
 	return {
 		...(parsed.model ? { model: parsed.model } : {}),
 		...(parsed.turns.length > 0 ? { turns: parsed.turns.length } : {}),
@@ -25,6 +27,7 @@ export function progressFromSession(parsed: ParsedSession): LiveProgress {
 		...(turnInFlight && lastTurn?.startedAt !== undefined
 			? { currentTurnStartedAt: lastTurn.startedAt }
 			: {}),
+		...(total > 0 ? { usageTotal: total } : {}),
 	};
 }
 
@@ -42,6 +45,7 @@ export function mergeProgress(...parts: Array<LiveProgress | undefined>): LivePr
 		if (part.turns && part.turns > 0) out.turns = part.turns;
 		if (part.lastTools?.length) out.lastTools = part.lastTools;
 		if (part.currentTurnStartedAt !== undefined) out.currentTurnStartedAt = part.currentTurnStartedAt;
+		if (part.usageTotal && part.usageTotal > 0) out.usageTotal = part.usageTotal;
 	}
 	return out;
 }

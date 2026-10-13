@@ -36,14 +36,42 @@ export interface StatusEntry {
 	phase?: string;
 	/** Unix ms start of the agent's current turn (only for live, in-flight turns). */
 	currentTurnStartedAt?: number;
+	/** Cumulative tokens (input+cache+output); from session jsonl (fresh) or ledger usage (≤30s stale). */
+	tokensTotal?: number;
 	/** Legion tree identity; omitted for callers that still use the flat roster. */
 	nodeId?: string;
 	parentId?: string | null;
 	depth?: number;
 }
 
+/** Session-wide totals for the tree header: every launched agent (incl. aged-out), root excluded. */
+export interface StatusTotals {
+	agents: number;
+	tokensTotal: number;
+}
+
+/** Aggregate all non-root entries (live + aged-out) for the header overview. */
+export function statusTotals(entries: StatusEntry[]): StatusTotals | undefined {
+	const agents = entries.filter((entry) => entry.nodeId && entry.nodeId !== "root");
+	if (agents.length === 0) return undefined;
+	return {
+		agents: agents.length,
+		tokensTotal: agents.reduce((sum, entry) => sum + (entry.tokensTotal ?? 0), 0),
+	};
+}
+
 export function formatElapsed(ms: number): string {
 	return `${Math.max(0, Math.round(ms / 1000))}s`;
+}
+
+/** Compact token count: 950 -> "950", 1200 -> "1.2K", 2500000 -> "2.5M". */
+function formatTokensCompact(value: number): string {
+	if (!Number.isFinite(value) || value <= 0) return "0";
+	if (value < 1000) return String(Math.round(value));
+	const absolute = Math.abs(value);
+	const unit = absolute >= 1_000_000_000 ? "B" : absolute >= 1_000_000 ? "M" : "K";
+	const divisor = unit === "B" ? 1_000_000_000 : unit === "M" ? 1_000_000 : 1_000;
+	return `${(value / divisor).toFixed(1).replace(/\.0$/, "")}${unit}`;
 }
 
 /**
@@ -140,6 +168,7 @@ function headlineBits(entry: StatusEntry, now: number): string[] {
 	if (model) bits.push(model);
 	const elapsedEnd = TERMINAL_STATES.has(entry.state) ? entry.finishedAt ?? now : now;
 	bits.push(formatElapsed(elapsedEnd - entry.startedAt));
+	if (entry.tokensTotal && entry.tokensTotal > 0) bits.push(`${formatTokensCompact(entry.tokensTotal)} tok`);
 	return bits;
 }
 
@@ -155,6 +184,13 @@ function detailBits(entry: StatusEntry, now: number): string[] {
 	}
 	if (entry.worktreeBranch) {
 		bits.push(`wt ${formatWorktreeBranch(entry.worktreeBranch)}`);
+	}
+	if (entry.tokensTotal && entry.tokensTotal > 0) {
+		const end = TERMINAL_STATES.has(entry.state) ? entry.finishedAt ?? now : now;
+		const elapsedMs = Math.max(0, end - entry.startedAt);
+		if (elapsedMs >= 1_000) {
+			bits.push(`${formatTokensCompact(Math.round(entry.tokensTotal / (elapsedMs / 1_000)))} t/s`);
+		}
 	}
 	return bits;
 }
@@ -304,7 +340,7 @@ function filterLiveTree(entries: StatusEntry[]): StatusEntry[] {
 	});
 }
 
-function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
+function renderTreeWidgetLines(entries: StatusEntry[], now: number, totals?: StatusTotals): string[] {
 	// The resident widget is a live-activity view: completed agents drop out
 	// once nothing in their subtree is still running (the centurion waiting on
 	// its squad counts as running and keeps the branch alive). Full history
@@ -316,7 +352,14 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
 	const running = liveEntries.filter((entry) =>
 		RUNNING_STATES.has(entry.herdrStatus ?? entry.state),
 	).length;
-	const lines = [`⏳ Legion · ${liveEntries.length} agents · ${running} running`];
+	const liveAgents = liveEntries.filter((entry) => entry.nodeId !== "root");
+	const overviewBits: string[] = [];
+	if (totals && totals.agents > liveAgents.length) overviewBits.push(`Σ ${totals.agents} agents`);
+	if (totals && totals.tokensTotal > 0) overviewBits.push(`${formatTokensCompact(totals.tokensTotal)} tok`);
+	const header = overviewBits.length > 0
+		? `⏳ Legion · ${liveEntries.length} agents · ${running} running · ${overviewBits.join(" · ")}`
+		: `⏳ Legion · ${liveEntries.length} agents · ${running} running`;
+	const lines = [header];
 	const activeMemo = new Map<string, boolean>();
 	const visited = new Set<string>();
 
@@ -375,10 +418,11 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number): string[] {
 export function formatWidgetLines(
 	entries: StatusEntry[],
 	now: number,
+	totals?: StatusTotals,
 ): string[] {
 	if (entries.length === 0) return [];
 	if (entries.some((entry) => entry.nodeId !== undefined || entry.parentId !== undefined || entry.depth !== undefined)) {
-		return renderTreeWidgetLines(entries, now);
+		return renderTreeWidgetLines(entries, now, totals);
 	}
 	if (entries.length === 1) {
 		return formatEntryLines(entries[0]!, now, { head: "", detail: "" });
@@ -478,7 +522,7 @@ export function createStatusBoard(): StatusBoard {
 	let tui: WidgetTui | undefined;
 
 	const renderLines = (now: number, theme: Theme): string[] =>
-		themeLines(formatWidgetLines(visiblePanelEntries(entries), now), theme);
+		themeLines(formatWidgetLines(visiblePanelEntries(entries), now, statusTotals(entries)), theme);
 
 	const safe = (fn: () => void): void => {
 		try {

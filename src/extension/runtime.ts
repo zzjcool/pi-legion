@@ -35,7 +35,8 @@ import type { LegionEvent, LegionEventBus } from "./event-bus.ts";
 import { LEGION_EVENT_TYPES } from "./event-bus.ts";
 import { createDbEventSource, type DbEventSource } from "./event-bus.ts";
 import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
-import { getSubtree, type LegionNode } from "../legion/nodes.ts";
+import { getSubtree } from "../legion/nodes.ts";
+import { usageTotalTokens } from "../legion/usage.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 
 export interface CollectSnapshot {
@@ -264,9 +265,15 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	join.setConfig(joinConfig);
 
 	const snapshotNodes = (): TreeNodeSnapshot[] => {
+		const ledger = ledgerDb;
 		const provided = deps.getTreeNodes
 			? deps.getTreeNodes()
-			: ledgerDb ? getSubtree(ledgerDb, "root") : undefined;
+			: ledger
+				? getSubtree(ledger, "root").map((node) => {
+					const total = node.id === "root" ? 0 : usageTotalTokens(ledger, node.id);
+					return total > 0 ? { ...node, tokensTotal: total } : { ...node };
+				})
+				: undefined;
 		if (provided !== undefined) {
 			tree.clear();
 			for (const node of provided) {
@@ -985,6 +992,9 @@ function statusEntryFromJob(
 		...(live.currentTurnStartedAt !== undefined
 			? { currentTurnStartedAt: live.currentTurnStartedAt }
 			: {}),
+		...(live.usageTotal
+			? { tokensTotal: live.usageTotal }
+			: node?.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
 		...(identity ? {
 			nodeId: identity.nodeId,
 			parentId: identity.parentId,
@@ -994,7 +1004,7 @@ function statusEntryFromJob(
 }
 
 function statusEntryFromNode(
-	node: LegionNode,
+	node: TreeNodeSnapshot,
 	activity?: { turn?: number; turnStartedAt?: number; tools: string[] },
 ): StatusEntry {
 	return {
@@ -1008,6 +1018,7 @@ function statusEntryFromNode(
 		...(node.phase ? { phase: node.phase } : {}),
 		...(node.kind ? { kind: node.kind } : {}),
 		...(node.model ? { model: node.model } : {}),
+		...(node.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
 		...(activity?.turn !== undefined ? { turns: activity.turn } : {}),
 		...(activity?.turnStartedAt !== undefined ? { currentTurnStartedAt: activity.turnStartedAt } : {}),
 		...(activity?.tools.length ? { lastTools: activity.tools } : {}),
