@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
 import type { LegionSettings } from "../shared/types.ts";
-import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, legionIdentityEnv } from "./args.ts";
+import { LEGION_DB_ENV, LEGION_IDENTITY_ENV_KEYS, LEGION_NODE_ID_ENV, legionIdentityEnv } from "./args.ts";
 import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
@@ -577,7 +577,7 @@ export class Orchestrator {
 			}
 			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId);
 			if (input.stripLegionIdentity) {
-				for (const key of [LEGION_DB_ENV, LEGION_NODE_ID_ENV, LINEAGE_ENV, MAX_DEPTH_ENV]) delete childEnv[key];
+				for (const key of LEGION_IDENTITY_ENV_KEYS) delete childEnv[key];
 			}
 			let result: Awaited<ReturnType<LegionSupervisor["spawnChild"]>> | undefined;
 			let startedModel: string | undefined;

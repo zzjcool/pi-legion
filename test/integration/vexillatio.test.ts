@@ -73,6 +73,9 @@ async function withEnvironment<T>(
 async function withSandbox(
 	parentEnv: Record<string, string | undefined>,
 	run: (helpers: { pi: FakePi; supervisor: FakeSupervisor; cwd: string }) => Promise<void>,
+	supervisor = new FakeSupervisor({
+		autoSettle: (input) => ({ text: `utility output for ${input.agent.name}` }),
+	}),
 ): Promise<void> {
 	const root = mkdtempSync(path.join(tmpdir(), "vexillatio-test-"));
 	try {
@@ -93,9 +96,6 @@ async function withSandbox(
 			"---\nname: worker\ndescription: restricted command-chain role\ntools: read, grep, find, ls\nallowNestedSubagents: true\nkind: pi\n---\nImplement carefully.",
 		);
 		const pi = fakePi();
-		const supervisor = new FakeSupervisor({
-			autoSettle: (input) => ({ text: `utility output for ${input.agent.name}` }),
-		});
 		await withEnvironment(
 			{
 				PI_CODING_AGENT_DIR: agentDir,
@@ -182,6 +182,37 @@ test("vexillatio dispatches a utility agent, strips lineage, and returns its col
 	);
 });
 
+test("non-legion children can control utility agents dispatched through vexillatio", async () => {
+	await withSandbox(
+		{
+			PI_SUBAGENT_CHILD: "1",
+			PI_SUBAGENT_ALLOW_NESTED: "1",
+		},
+		async ({ pi, supervisor, cwd }) => {
+			const dispatch = await invoke(pi, "vexillatio", {
+				task: "Inspect this repository and report.",
+				agent: "scout",
+			}, context(cwd));
+			assert.match(dispatch.content[0]?.text ?? "", /── scout-0 ──/);
+			assert.equal(supervisor.spawns.length, 1);
+
+			const status = await invoke(pi, "subagent", {
+				action: "status",
+				name: "scout-0",
+			}, context(cwd));
+			assert.equal((status.details as { error?: string } | undefined)?.error, undefined);
+			assert.match(status.content[0]?.text ?? "", /scout-0/);
+
+			const collected = await invoke(pi, "subagent", {
+				action: "collect",
+				name: "scout-0",
+			}, context(cwd));
+			assert.equal((collected.details as { error?: string } | undefined)?.error, undefined);
+			assert.match(collected.content[0]?.text ?? "", /utility output for scout/);
+		},
+	);
+});
+
 test("vexillatio rejects a non-utility target with INVALID_PARAMS", async () => {
 	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
 		const result = await invoke(pi, "vexillatio", {
@@ -190,6 +221,18 @@ test("vexillatio rejects a non-utility target with INVALID_PARAMS", async () => 
 		}, context(cwd));
 		assert.equal((result.details as { error?: string } | undefined)?.error, ErrorCodes.INVALID_PARAMS);
 		assert.match(result.content[0]?.text ?? "", /not a utility agent: worker/);
+		assert.equal(supervisor.spawns.length, 0);
+	});
+});
+
+test("vexillatio rejects task verification commands instead of ignoring them", async () => {
+	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
+		const result = await invoke(pi, "vexillatio", {
+			task: "Run the requested utility task.",
+			tasks: [{ agent: "scout", task: "Inspect code.", verify: ["npm test"] }],
+		}, context(cwd));
+		assert.equal((result.details as { error?: string } | undefined)?.error, ErrorCodes.INVALID_PARAMS);
+		assert.match(result.content[0]?.text ?? "", /verify/i);
 		assert.equal(supervisor.spawns.length, 0);
 	});
 });
@@ -247,6 +290,55 @@ test("vexillatio tasks launch distinct same-role children and return each output
 		assert.match(output, /scout-1/);
 		assert.equal(supervisor.spawns.length, 2);
 	});
+});
+
+test("vexillatio continues name allocation after subagent launches the same utility", async () => {
+	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
+		const first = await invoke(pi, "subagent", {
+			agent: "scout",
+			task: "Inspect the first area.",
+			async: false,
+			worktree: false,
+		}, context(cwd));
+		assert.match(first.content[0]?.text ?? "", /scout-0/);
+
+		const second = await invoke(pi, "vexillatio", {
+			task: "Inspect the second area.",
+			agent: "scout",
+		}, context(cwd));
+		assert.match(second.content[0]?.text ?? "", /── scout-1 ──/);
+		assert.deepEqual(supervisor.spawns.map((spawn) => spawn.input.name), ["scout-0", "scout-1"]);
+	});
+});
+
+test("vexillatio avoids a live same-name subagent and returns on collect timeout", async () => {
+	const supervisor = new FakeSupervisor({ immediateTimeout: true });
+	await withSandbox(
+		{},
+		async ({ pi, cwd }) => {
+			const first = await invoke(pi, "subagent", {
+				agent: "scout",
+				task: "Inspect the first area.",
+				async: true,
+				worktree: false,
+			}, context(cwd));
+			assert.match(first.content[0]?.text ?? "", /scout-0/);
+
+			const second = await invoke(pi, "vexillatio", {
+				task: "Inspect the second area.",
+				agent: "scout",
+				timeoutMs: 50,
+			}, context(cwd));
+			const output = second.content.map((part) => part.text ?? "").join("\n");
+			assert.match(output, /── scout-1 ──/);
+			assert.match(output, /execution: running/);
+			assert.match(output, /collect timed out after 50ms/);
+			assert.match(output, /sessionFile:/);
+			assert.equal(supervisor.isAlive("scout-1"), true, "timed-out utility remains alive and controllable");
+			assert.deepEqual(supervisor.spawns.map((spawn) => spawn.input.name), ["scout-0", "scout-1"]);
+		},
+		supervisor,
+	);
 });
 
 test("RPC spawn masks inherited utility and Legion identities before applying target env", async () => {

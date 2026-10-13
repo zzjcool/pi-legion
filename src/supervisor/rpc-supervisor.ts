@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatChildTask } from "../extension/child-guard.ts";
-import { buildPiArgs } from "../runs/args.ts";
+import { buildPiArgs, LEGION_IDENTITY_ENV_KEYS } from "../runs/args.ts";
 import { ErrorCodes, SubagentError } from "../shared/types.ts";
 import {
 	InMemoryUIProxy,
@@ -293,12 +293,7 @@ export class RpcSupervisor implements LegionSupervisor {
 				...(input.env ?? {}),
 			};
 			if (input.stripLegionIdentity) {
-				for (const key of [
-					"PI_LEGION_DB",
-					"PI_LEGION_NODE_ID",
-					"PI_SUBAGENT_PARENT_PATH",
-					"PI_SUBAGENT_MAX_DEPTH",
-				]) env[key] = undefined;
+				for (const key of LEGION_IDENTITY_ENV_KEYS) env[key] = undefined;
 			}
 			const options: RpcClientOptions = {
 				cliPath: input.cliPath

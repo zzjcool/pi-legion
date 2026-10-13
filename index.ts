@@ -122,7 +122,7 @@ const TaskItem = Type.Object({
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-			"Commands the extension runs itself in the child worktree at collect time; first non-zero exit rejects the verdict.",
+				"Commands the extension runs itself in the child worktree at collect time; first non-zero exit rejects the verdict.",
 		}),
 	),
 });
@@ -1738,9 +1738,16 @@ type UtilityPlan =
 
 function buildUtilityPlan(params: VexillatioParams): UtilityPlan {
 	if (!params.task.trim()) return { ok: false, message: "`task` must not be blank." };
-	const steps = params.tasks?.length
+	const steps: UtilityTaskItem[] = params.tasks?.length
 		? params.tasks
 		: [{ agent: params.agent?.trim() || "scout", task: params.task }];
+	const unsupportedVerify = steps.findIndex((item) => item.verify !== undefined);
+	if (unsupportedVerify >= 0) {
+		return {
+			ok: false,
+			message: `tasks[] step ${unsupportedVerify + 1} cannot include \`verify\`; vexillatio does not run verification commands.`,
+		};
+	}
 	const invalid = steps.findIndex((item) => !item.agent.trim() || !item.task.trim());
 	if (invalid >= 0) {
 		return { ok: false, message: `tasks[] step ${invalid + 1} must include non-blank \`agent\` and \`task\`.` };
@@ -2223,12 +2230,18 @@ async function persistChild(
 	const child = orchestrator.childrenSnapshot().find((c) => c.name === name);
 	if (!child) return;
 	try {
-		await store.updateChild(runId, name, (c) => {
-			if (opts.preserveRetired && c.state === "retired" && child.state !== "retired") return;
-			Object.assign(c, child);
+		const recorded = store.findChild(runId, name);
+		if (!recorded) {
+			await store.addChild(runId, child);
+			return;
+		}
+		if (recorded.nodeId !== child.nodeId) return;
+		await store.updateChild(runId, name, (current) => {
+			if (opts.preserveRetired && current.state === "retired" && child.state !== "retired") return;
+			Object.assign(current, child);
 		});
 	} catch {
-		// Not persisted yet (or already removed) — the caller's own addChild wins.
+		// Persistence is best-effort when a competing lifecycle callback wins the write.
 	}
 }
 

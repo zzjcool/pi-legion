@@ -47,6 +47,12 @@ export const TASK_ARG_LIMIT = 8_000;
 /** Legion identity is inherited through every RPC child environment. */
 export const LEGION_DB_ENV = "PI_LEGION_DB";
 export const LEGION_NODE_ID_ENV = "PI_LEGION_NODE_ID";
+export const LEGION_IDENTITY_ENV_KEYS = [
+	LEGION_DB_ENV,
+	LEGION_NODE_ID_ENV,
+	"PI_SUBAGENT_PARENT_PATH",
+	"PI_SUBAGENT_MAX_DEPTH",
+] as const;
 
 /** Build the identity overlay passed from one legion supervisor to a child. */
 export function legionIdentityEnv(dbPath: string, nodeId: string): Record<string, string> {
