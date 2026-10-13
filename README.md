@@ -95,6 +95,26 @@ on or collected; the cascade is silent. To stop children explicitly, use
 `subagent({ action: "stop", all: true })`; this runs the normal graceful-retire
 sequence for each selected child.
 
+### Stopping async subagents yourself
+
+Async children keep running after the main turn ends, so Esc-abort no longer
+reaches them. Three user controls run the same graceful `stop` (a stopped
+parent retires its own subtree on shutdown):
+
+- **`/legion stop`** stops every live subagent; **`/legion stop <name>`** stops
+  one (`all` is an alias for no name). Names complete from the live children;
+  nested agents complete as `parent/name` and are reported as owned by their
+  parent (stop the parent to retire them).
+- **Esc** while the main agent is idle, the editor is empty, no dialog or
+  overlay is open and subagents are live asks "Stop N running subagents?".
+  In every other state Esc keeps pi's normal behaviour.
+- **`x`** on the selected live agent in the `/legion` view or its live
+  overlay asks `y` to confirm in place, then stops it.
+
+While the main agent is idle and subagents are live, the railway header shows
+a dim `esc stop all · /legion stop [name]` hint (shortened on narrow terminals,
+hidden while the main agent is working).
+
 ## Legion tools and phases
 
 Child nodes receive these tree-aware tools:
@@ -133,14 +153,16 @@ commands without an LLM. Passing verification advances the squad to `done`.
    chart by agent type (peak marker, now/avg/peak/total, per-role share), and
    a scrollable `log --graph` history. Tab switches panes, arrows scroll or
    move the selection, Enter selects an agent (its own rate line, tok/s,
-   tokens and share are overlaid), `o` opens its live overlay, Esc clears the
+   tokens and share are overlaid), `o` opens its live overlay, `x` stops it
+   (confirm with `y`), Esc clears the
    selection, `q`/Esc closes. Layouts: wide (≥140 cols), stacked, and portrait
    (<80 cols, or tall and <100 cols). `/legion --tree` opens the classic tree
    (`j`/`k`, Enter/Space fold, `/` search, PageUp/PageDown).
 3. **Live overlay:** press `o` on the selected node, use a component-routed
    mouse click in the strip or classic tree, or open it directly with `/legion <name>`.
    The overlay subscribes to that node's live feed only while open; Esc closes
-   it and unsubscribes. OSC 8 links are visual anchors only, not overlay links.
+   it (returning to `/legion` when opened from there) and unsubscribes; `x`
+   stops the agent after a `y` confirmation. OSC 8 links are visual anchors only, not overlay links.
 
 ## Settings and budget gates
 

@@ -25,6 +25,10 @@ export interface RailInput {
 	windowMs?: number;
 	/** Lane scroll position when more agents are live than lanes fit. */
 	scroll?: RailScroll;
+	/** Dim hint on the header rule (e.g. stop controls while the main agent is idle). */
+	hint?: string;
+	/** Shorter variant used when the full hint does not fit. */
+	hintShort?: string;
 }
 
 /**
@@ -206,7 +210,15 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	const header = portrait
 		? ` ${live} live${range} · ${rateText} `
 		: ` legion ${live} live${range} · ${rateText} `;
-	canvas.text(Math.max(LX + 1 + winLabel.length, width - header.length - 1), 0, header, "accent", { bold: true, maxX: width - 1 });
+	const headerX = Math.max(LX + 1 + winLabel.length, width - header.length - 1);
+	canvas.text(headerX, 0, header, "accent", { bold: true, maxX: width - 1 });
+	if (input.hint) {
+		// Between the window label and the summary, with a rule gap on both sides.
+		const hx = LX + 1 + winLabel.length + 1;
+		const room = headerX - 1 - hx;
+		const pick = [input.hint, input.hintShort].find((text) => text && Array.from(text).length + 2 <= room);
+		if (pick) canvas.text(hx, 0, ` ${pick} `, "dim");
+	}
 	for (const [c, tick] of headerTicks) {
 		if (canvas.get(LX + c, 0)?.ch !== "─") continue; // never draw over header text
 		canvas.set(LX + c, 0, "┬", tick.color);

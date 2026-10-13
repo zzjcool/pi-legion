@@ -97,6 +97,8 @@ export interface LiveOverlayOpenOptions {
 	tui?: TUI;
 	keybindings?: KeybindingsManager;
 	terminalRows?: number | (() => number);
+	/** `x`: ask the host to stop this agent (it confirms first). */
+	onStop?: (nodeId: string) => void;
 	/** Override the source's session-history loader (primarily for embedding and tests). */
 	backfill?: LiveOverlayBackfill;
 }
@@ -658,6 +660,7 @@ function createSession(
 		};
 	};
 
+	let stopPending = false;
 	const headerLine = (width: number): string => {
 		const safeWidth = Math.max(1, Math.floor(width));
 		const node = sourceNode();
@@ -696,7 +699,11 @@ function createSession(
 		if (activeSubscription) source.unsubscribe(activeSubscription);
 		const handle = overlayHandle;
 		overlayHandle = undefined;
-		if (handle) handle.hide();
+		// pi's custom() `done` already hides this overlay (ui.hideOverlay() pops the
+		// TOP overlay). Hiding the handle as well popped the overlay underneath —
+		// the /legion view — without resolving its promise, so the /legion command
+		// never returned and pi silently queued every later prompt.
+		if (handle && !options.done) handle.hide();
 		onClose();
 		options.done?.(undefined);
 	};
@@ -739,10 +746,20 @@ function createSession(
 			syncScroll(lastBodyLines);
 			const start = Math.max(0, scrollTop);
 			const end = start + bodyPageSize();
-			return [headerLine(contentWidth), ...lastBodyLines.slice(start, end)];
+			const header = stopPending
+				? style(options.theme, "accent", fitLine(`Stop ${safeText(sourceNode()?.name ?? nodeId)}? Its own subagents are retired with it.  y stop · any other key cancel`, contentWidth))
+				: headerLine(contentWidth);
+			return [header, ...lastBodyLines.slice(start, end)];
 		},
 		handleInput(data) {
 			if (!open) return;
+			if (stopPending) {
+				// In-overlay y/N prompt: a pi dialog could render behind this overlay.
+				stopPending = false;
+				if (matchesKey(data, "y") || data === "Y" || matchesKey(data, Key.enter)) options.onStop?.(nodeId);
+				requestRender();
+				return;
+			}
 			if (matchesKey(data, Key.escape)) {
 				close();
 				return;
@@ -767,6 +784,12 @@ function createSession(
 				goToTop();
 			} else if (matchesKey(data, Key.shift("g"))) {
 				goToEnd();
+			} else if (matchesKey(data, "x") && options.onStop) {
+				const node = sourceNode();
+				if (node && node.status !== "settled" && node.status !== "failed" && node.status !== "retired") {
+					stopPending = true;
+					requestRender();
+				}
 			}
 		},
 		handleMouse(event: TuiMouseEvent) {

@@ -188,6 +188,10 @@ export interface SessionRuntime {
 	refreshUi(): void;
 	/** Live visualization data (nodes + token-rate sampler) for the /legion view. */
 	vizSnapshot(): StatusVizSnapshot;
+	/** Main agent idle flag for the railway stop hint. */
+	setParentIdle(idle: boolean): void;
+	/** TUI hosting the status widget (unknown shape; used for overlay/focus checks). */
+	statusTui(): unknown;
 	/** Forward join config to the internal coordinator (settings wiring). */
 	setJoinConfig(config: JoinConfig): void;
 	/**
@@ -870,6 +874,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			return [...jobs.values()];
 		},
 
+		setParentIdle(idle) {
+			board.setIdleHint?.(idle);
+		},
+		statusTui() {
+			return board.getTui?.();
+		},
 		vizSnapshot() {
 			return board.vizSnapshot!(now());
 		},

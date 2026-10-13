@@ -1,5 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
 import { matchesKey, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { resolveStopTarget, runLegionStop, stopCompletions, type StopDeps } from "./legion-stop.ts";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -41,7 +42,7 @@ import type {
 export const LEGION_COMMAND = "legion";
 
 export interface LegionCommandRuntime {
-	activeJobs(): ReadonlyArray<{ name: string; nodeId?: string }>;
+	activeJobs(): ReadonlyArray<{ name: string; nodeId?: string; state: string }>;
 	treeNodes(): readonly TreeNodeSnapshot[];
 	/** Live visualization data; when present, bare `/legion` opens the galaxy/tok-s/log view. */
 	vizSnapshot?(): StatusVizSnapshot;
@@ -67,6 +68,8 @@ export interface LegionCommandDeps {
 	bus: LegionEventBus;
 	runtime: LegionCommandRuntime;
 	supervisor: RpcEventSource;
+	/** Graceful retire via the subagent `stop` action (see legion-stop.ts). */
+	stop?: (params: { name?: string; all?: boolean }) => Promise<{ ok: boolean; text: string }>;
 }
 
 function stringField(value: unknown, key: string): string | undefined {
@@ -357,8 +360,10 @@ function openLiveOverlay(
 	cwd: string,
 	controller: ReturnType<typeof createLiveOverlay>,
 	nodeId: string,
+	onStop?: (nodeId: string) => void,
 ): void {
 	const factory = createLiveOverlayFactory(controller, nodeId, {
+		...(onStop ? { onStop } : {}),
 		cwd,
 		settings: viewerSettings(pi.getSettings()),
 	});
@@ -374,6 +379,7 @@ export function createStatusNodeOpener(
 	controller: ReturnType<typeof createLiveOverlay>,
 	getUi: () => ExtensionUIContext | undefined,
 	getCwd: () => string | undefined,
+	onStop?: (ui: ExtensionUIContext, nodeId: string) => void,
 ): (nodeId: string) => void {
 	return (nodeId) => {
 		let ui: ExtensionUIContext | undefined;
@@ -382,11 +388,30 @@ export function createStatusNodeOpener(
 			ui = getUi();
 			const cwd = getCwd();
 			if (ui === undefined || cwd === undefined) return;
-			openLiveOverlay(pi, ui, cwd, controller, nodeId);
+			const host = ui;
+			openLiveOverlay(pi, ui, cwd, controller, nodeId, onStop ? (id) => onStop(host, id) : undefined);
 		} catch (error) {
 			reportOverlayOpenError(controller, ui, error);
 		}
 	};
+}
+
+/**
+ * Stop the agent behind `nodeId` (nested agents get an "owned by" notice).
+ * The /legion view and live overlay confirm in-place (y/N), so `confirm`
+ * defaults to false; pass true to ask via a pi dialog instead.
+ */
+export async function confirmAndStopNode(ui: ExtensionUIContext, deps: Pick<LegionCommandDeps, "runtime" | "stop">, nodeId: string, confirm = false): Promise<void> {
+	if (!deps.stop) return;
+	const target = resolveStopTarget(nodeId, deps.runtime.activeJobs(), deps.runtime.treeNodes());
+	if (confirm && target.kind === "job" && !(await ui.confirm("Stop subagent", `Stop ${target.name}? Its own subagents are retired with it.`))) return;
+	const stop = deps.stop;
+	await runLegionStop(nodeId, {
+		jobs: () => deps.runtime.activeJobs(),
+		nodes: () => deps.runtime.treeNodes(),
+		stop: (params) => stop(params),
+		notify: (message, type) => ui.notify(message, type),
+	});
 }
 
 export function registerLegionCommand(
@@ -395,20 +420,36 @@ export function registerLegionCommand(
 ): ReturnType<typeof createLiveOverlay> {
 	const liveOverlay = createLiveOverlay(treeForLiveSource(deps));
 	let warnedNonTui = false;
+	const stopDeps = (ctx: { ui: ExtensionUIContext }): StopDeps => ({
+		jobs: () => deps.runtime.activeJobs(),
+		nodes: () => deps.runtime.treeNodes(),
+		stop: (params) => deps.stop!(params),
+		notify: (message, type) => ctx.ui.notify(message, type),
+	});
+	const confirmStopNode = (ctx: { ui: ExtensionUIContext }, nodeId: string): Promise<void> => confirmAndStopNode(ctx.ui, deps, nodeId);
+	const overlayStop = (ui: ExtensionUIContext) => deps.stop ? (id: string) => void confirmAndStopNode(ui, deps, id) : undefined;
 
 	pi.registerCommand(LEGION_COMMAND, {
-		description: "Open the Legion view (galaxy · tok/s · log), /legion --tree for the classic tree, or /legion <name>",
+		description: "Open the Legion view (galaxy · tok/s · log), /legion --tree, /legion <name>, or /legion stop [name] (no name = all)",
 		getArgumentCompletions(prefix) {
+			if (deps.stop && /^stop\s/.test(prefix)) {
+				const rest = prefix.replace(/^stop\s+/, "");
+				return stopCompletions(rest, deps.runtime.activeJobs(), deps.runtime.treeNodes())
+					.map((item) => ({ value: `stop ${item.value}`, label: item.label }));
+			}
 			if (prefix.includes(" ")) return null;
 			const nodes = deps.runtime.treeNodes();
-			return nodes
+			const stopItem = deps.stop && "stop".startsWith(prefix) && prefix.length > 0
+				? [{ value: "stop", label: "stop [name] — stop one live subagent, or all" }]
+				: [];
+			return [...stopItem, ...nodes
 				.filter((node) => node.name.startsWith(prefix) || node.id.startsWith(prefix))
 				.map((node) => ({
 					value: nodes.filter((candidate) => candidate.name === node.name).length > 1
 						? node.id
 						: node.name,
 					label: nodeLabel(node.id, node.name),
-				}));
+				}))];
 		},
 		async handler(args, ctx) {
 			if (ctx.mode !== "tui") {
@@ -419,6 +460,11 @@ export function registerLegionCommand(
 				return;
 			}
 			let query = args.trim();
+			const stopMatch = deps.stop ? /^stop(?:\s+(.*))?$/.exec(query) : null;
+			if (stopMatch && deps.stop) {
+				await runLegionStop(stopMatch[1] ?? "", stopDeps(ctx));
+				return;
+			}
 			const nodes = deps.runtime.treeNodes();
 			const classicTree = query === "--tree";
 			if (classicTree) query = "";
@@ -426,9 +472,10 @@ export function registerLegionCommand(
 			if (!query && !classicTree && vizSnapshot) {
 				await ctx.ui.custom(createLegionViewFactory({
 					getData: () => vizSnapshot(),
+					onStopNode: deps.stop ? (nodeId) => void confirmStopNode(ctx, nodeId) : undefined,
 					onOpenNode: (nodeId) => {
 						if (nodes.some((node) => node.id === nodeId) || deps.runtime.treeNodes().some((node) => node.id === nodeId)) {
-							openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, nodeId);
+							openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, nodeId, overlayStop(ctx.ui));
 						}
 					},
 				}), {
@@ -452,7 +499,7 @@ export function registerLegionCommand(
 					);
 					return;
 				}
-				openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, node.id);
+				openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, node.id, overlayStop(ctx.ui));
 				return;
 			}
 
@@ -477,7 +524,7 @@ export function registerLegionCommand(
 						handleInput(data) {
 							if (!tree.getState().searchMode && matchesKey(data, "o")) {
 								const selectedId = tree.getState().selectedId;
-								if (selectedId) openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, selectedId);
+								if (selectedId) openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, selectedId, overlayStop(ctx.ui));
 								return;
 							}
 							tree.handleInput?.(data);
@@ -486,7 +533,7 @@ export function registerLegionCommand(
 							const result = tree.handleMouse?.(event);
 							if (event.type === "click" && event.button === "left" && result?.handled) {
 								const selectedId = tree.getState().selectedId;
-								if (selectedId) openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, selectedId);
+								if (selectedId) openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, selectedId, overlayStop(ctx.ui));
 							}
 							return result;
 						},
