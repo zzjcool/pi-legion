@@ -473,3 +473,44 @@ test("legion view: tall sizes render full width/height without clipping", () => 
 		for (const line of lines) assert.equal(visibleWidth(line), w);
 	}
 });
+
+test("railway: ended scouts vanish — one row, only the survivor's label, no orphan glyphs on the header", () => {
+	const nodes = [ROOT,
+		node("scout-0", { startedAt: sec(0), status: "settled", endedAt: sec(60) }),
+		node("scout-1", { startedAt: sec(30), status: "settled", endedAt: sec(120) }),
+		node("scout-2", { startedAt: sec(50), status: "failed", endedAt: sec(150) }),
+		node("scout-3", { startedAt: sec(100) }),
+	];
+	for (let t = 160; t <= 220; t += 1) {
+		const out = renderRailway({ nodes, now: sec(t), width: 120, rate: 10 })!;
+		const lines = out.canvas.toLines(plainTheme);
+		assert.equal(lines.length, 2, "header + one lane");
+		assert.deepEqual(out.nodeIdsByRow, [undefined, "scout-3"]);
+		assert.match(lines[0]!, /^[─\s\-−0-9a-z·./]+$/, `header has only rule/text: ${lines[0]}`);
+		assert.doesNotMatch(lines.join("\n"), /scout-[012]/);
+		assert.equal((lines[1]!.match(/scout-3/g) ?? []).length, 1);
+		assert.doesNotMatch(lines[1]!, /[┴┬✗]/);
+	}
+});
+
+test("railway: all lanes share one time axis — every lane head is at the same x and scrolls in sync", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(0) }),
+		node("scout-1", { startedAt: sec(40), parentId: "worker-0", depth: 2 }),
+		node("scout-2", { startedAt: sec(90) }),
+		node("scout-3", { startedAt: sec(20), status: "settled", endedAt: sec(100) }),
+	];
+	const startX = (line: string, from: string): number => Array.from(line).findIndex((ch) => from.includes(ch));
+	const heads = (t: number) => {
+		const lines = renderRailway({ nodes, now: sec(t), width: 120, rate: 0 })!.canvas.toLines(plainTheme).slice(1).map((l) => Array.from(l));
+		return lines.map((l) => ({ head: l.lastIndexOf("━"), start: startX(l.join(""), "╺╰╭┄") }));
+	};
+	const a = heads(150);
+	assert.equal(a.length, 3);
+	assert.ok(a.every((l) => l.head === a[0]!.head), JSON.stringify(a));
+	// The window is 360s over ~80 columns; after 45s every lane start shifts left by the same amount.
+	const b = heads(195);
+	const shifts = a.map((l, i) => l.start - b[i]!.start);
+	assert.ok(shifts[0]! === 0 || a[0]!.start === 0 || shifts.every((s) => s === shifts[0]), JSON.stringify(shifts));
+	assert.ok(shifts.slice(1).every((s) => s > 0 && Math.abs(s - shifts[1]!) <= 1), JSON.stringify({ a, b }));
+});
