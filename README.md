@@ -124,13 +124,21 @@ commands without an LLM. Passing verification advances the squad to `done`.
 
 ## Three-layer visualization
 
-1. **Resident tree panel:** stays visible in the Pi session, with deeper levels
-   folded by default so the whole tree remains scannable.
-2. **`/legion` full tree:** navigate with `j`/`k` or arrow keys; Enter/Space
-   expands or collapses a node; `/` searches; PageUp/PageDown scroll; `q` or
-   Esc closes the view.
+1. **Railway strip above the input:** one git-graph lane per live subagent
+   (max 4, 3 below 80 columns; oldest/shallowest first, `+N` for the rest).
+   When an agent ends its lane merges back and lower lanes shift up. The
+   header shows the live count and tok/s (trailing 60s average). Hidden when
+   no subagent is live. Set `PI_LEGION_STRIP=tree` for the classic roster.
+2. **`/legion` full view:** galaxy graph of the agent tree, stacked tok/s
+   chart by agent type (peak marker, now/avg/peak/total, per-role share), and
+   a scrollable `log --graph` history. Tab switches panes, arrows scroll or
+   move the selection, Enter selects an agent (its own rate line, tok/s,
+   tokens and share are overlaid), `o` opens its live overlay, Esc clears the
+   selection, `q`/Esc closes. Layouts: wide (≥140 cols), stacked, and portrait
+   (<80 cols, or tall and <100 cols). `/legion --tree` opens the classic tree
+   (`j`/`k`, Enter/Space fold, `/` search, PageUp/PageDown).
 3. **Live overlay:** press `o` on the selected node, use a component-routed
-   mouse click in the full tree, or open it directly with `/legion <name>`.
+   mouse click in the strip or classic tree, or open it directly with `/legion <name>`.
    The overlay subscribes to that node's live feed only while open; Esc closes
    it and unsubscribes. OSC 8 links are visual anchors only, not overlay links.
 

@@ -16,6 +16,8 @@ import {
 	type LiveOverlaySource,
 	type LiveOverlaySubscription,
 } from "../tui/live-overlay.ts";
+import type { StatusVizSnapshot } from "../tui/status.ts";
+import { createLegionViewFactory } from "../tui/viz/view.ts";
 import {
 	parseSessionMessages,
 	type ChatItemSettings,
@@ -41,6 +43,8 @@ export const LEGION_COMMAND = "legion";
 export interface LegionCommandRuntime {
 	activeJobs(): ReadonlyArray<{ name: string; nodeId?: string }>;
 	treeNodes(): readonly TreeNodeSnapshot[];
+	/** Live visualization data; when present, bare `/legion` opens the galaxy/tok-s/log view. */
+	vizSnapshot?(): StatusVizSnapshot;
 }
 
 export interface RpcEventSource {
@@ -393,7 +397,7 @@ export function registerLegionCommand(
 	let warnedNonTui = false;
 
 	pi.registerCommand(LEGION_COMMAND, {
-		description: "Open the Legion tree, or inspect one node with /legion <name>",
+		description: "Open the Legion view (galaxy · tok/s · log), /legion --tree for the classic tree, or /legion <name>",
 		getArgumentCompletions(prefix) {
 			if (prefix.includes(" ")) return null;
 			const nodes = deps.runtime.treeNodes();
@@ -414,8 +418,25 @@ export function registerLegionCommand(
 				}
 				return;
 			}
-			const query = args.trim();
+			let query = args.trim();
 			const nodes = deps.runtime.treeNodes();
+			const classicTree = query === "--tree";
+			if (classicTree) query = "";
+			const vizSnapshot = deps.runtime.vizSnapshot?.bind(deps.runtime);
+			if (!query && !classicTree && vizSnapshot) {
+				await ctx.ui.custom(createLegionViewFactory({
+					getData: () => vizSnapshot(),
+					onOpenNode: (nodeId) => {
+						if (nodes.some((node) => node.id === nodeId) || deps.runtime.treeNodes().some((node) => node.id === nodeId)) {
+							openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, nodeId);
+						}
+					},
+				}), {
+					overlay: true,
+					overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 },
+				});
+				return;
+			}
 			if (query) {
 				const node = resolveNode(nodes, query);
 				if (!node) {
