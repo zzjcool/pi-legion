@@ -923,6 +923,7 @@ function indexHarness(
 	tool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
 	utilityTool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
 	startTurn(): void;
+	emitSettled(aborted: boolean): void;
 	shutdown(): Promise<void>;
 	cleanup(): Promise<void>;
 } {
@@ -970,6 +971,9 @@ function indexHarness(
 		cwd, supervisor, sentMessages, tool, utilityTool,
 		startTurn() {
 			for (const handler of turnStartHandlers) handler({}, { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } });
+		},
+		emitSettled(aborted: boolean): void {
+			handlers.get("agent_settled")?.({ type: "agent_settled", aborted }, { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } });
 		},
 		async shutdown() {
 			await handlers.get("session_shutdown")?.();
@@ -1163,6 +1167,62 @@ test("index wait abort retires tracked children before returning interrupted", a
 			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
 		);
 		assert.match((secondWait.content ?? []).map((item) => item.text ?? "").join("\n"), /no running children/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("agent_settled aborted retires async children after the launch tool returned", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.startTurn();
+		await invokeIndex(harness, { agent: "worker", task: "async child outlives the launch tool call", async: true, worktree: false });
+		const name = harness.supervisor.spawns[0]?.input.name;
+		if (!name) throw new Error("worker child did not spawn");
+		assert.equal(harness.supervisor.isAlive(name), true, "the async child is live after the launch tool returned");
+		// ESC lands with no subagent-family tool call in flight: the launch tool
+		// already returned, so agent_settled{aborted} is the only abort signal.
+		harness.emitSettled(true);
+		for (let attempt = 0; attempt < 100 && harness.supervisor.isAlive(name); attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		assert.deepEqual(
+			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
+			[name],
+		);
+		assert.equal(harness.supervisor.isAlive(name), false, "agent_settled aborted cascades retirement to the async child");
+		assert.equal(harness.sentMessages.length, 0, "the cascade stays silent: no completion notification");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("agent_settled without abort leaves async children running", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.startTurn();
+		await invokeIndex(harness, { agent: "worker", task: "async child survives a normal settle", async: true, worktree: false });
+		const name = harness.supervisor.spawns[0]?.input.name;
+		if (!name) throw new Error("worker child did not spawn");
+		harness.emitSettled(false);
+		for (let attempt = 0; attempt < 100 && harness.supervisor.isAlive(name); attempt++) {
+			if (harness.supervisor.calls.some((call) => call.method === "retire")) break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		assert.equal(
+			harness.supervisor.calls.some((call) => call.method === "retire"),
+			false,
+			"a normally settled run must not retire its async children",
+		);
+		assert.equal(harness.supervisor.isAlive(name), true, "the async child keeps running after a normal settle");
 	} finally {
 		await harness.cleanup();
 	}

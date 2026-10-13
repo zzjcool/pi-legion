@@ -562,6 +562,14 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		cascadingJobs = new Set();
 		cascadingUtilityRetires = new Set();
 	});
+	// An async launch has already returned when ESC lands: no subagent-family
+	// tool call is in flight to observe the abort signal, so the run's settle
+	// event is the last chance to retire this turn's children. Never awaited —
+	// a graceful retire may take seconds and must not stall the settle path.
+	pi.on("agent_settled", (event) => {
+		if (!event.aborted) return;
+		void cascadeRetireAll();
+	});
 	if (process.env[UTILITY_CHILD_ENV] !== "1") {
 		pi.registerTool({
 			name: "vexillatio",

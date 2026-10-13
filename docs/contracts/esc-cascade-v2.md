@@ -72,6 +72,14 @@ vexillatio 工具 execute 也要把 signal 传进来（找到它的 registerTool
 | docs/design.md, README.md | 语义说明 |
 | test/unit/* | 新测试 |
 
+## v2.1 修订（2026-10-13，会话 01a13345 实测后补）
+
+v2 的触发点只覆盖了「abort 落在 in-flight subagent 工具调用上」（wait/collect/launch 中途）。**async launch（默认形态）在 ESC 前就早已返回**：ESC 落在模型生成、空档或别的工具上时，没有任何 subagent 工具在执行，signal 无处投递，级联不触发——子 agent 继续跑，直到 session_shutdown 或显式 stop。
+
+实测：2026-10-13 03:20Z 会话 01a13345 async 启动 centurion（worktree），03:20:10 ESC abort 父 turn，子 agent 存活至用户退出父会话（03:20:24，走的是 session_shutdown 级联）。
+
+**修复**：`index.ts` 注册 `pi.on("agent_settled")`——pi 核心在每个 agent run 结算时发 `{ aborted: boolean }`，ESC abort 后必为 true（见 pi AgentSettledEvent："Whether the run ended because it was aborted, for example with Escape."）。handler 在 `event.aborted` 时 fire-and-forget `cascadeRetireAll()`（不 await：优雅 retire 可达秒级，不能拖住 settle 路径）。注册点与 turn_start 相邻、位于子进程 early-return 之前，父会话/嵌套子/工具人全部生效；无 runtime 的会话上是 no-op。幂等性由既有 cascadePromise/cascadingJobs 保证：ESC 打断 in-flight 工具时工具路径先触发一次，agent_settled 再触发一次为 no-op。
+
 ## 验收
 
 1. typecheck + unit + integration 全绿。
@@ -79,6 +87,8 @@ vexillatio 工具 execute 也要把 signal 传进来（找到它的 registerTool
 3. 新测试：cascade 幂等（同 signal 两次触发只 retire 一次）。
 4. 新测试：parallel 工具调用同时 abort，cascade 只跑一次。
 5. 新测试：vexillatio collect 在 abort 时提前返回（不长等 600s）。
+6. 新测试（v2.1）：async launch 已返回后 emitSettled(true) → 子 agent 被 retire、无完成通知。
+7. 新测试（v2.1）：emitSettled(false)（正常结算）→ 不 retire，async 子继续运行。
 
 ## 锚点（以 master bc9c205 为准）
 
