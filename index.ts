@@ -529,6 +529,15 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	});
 	const pendingUtilityRetires: Array<() => Promise<void>> = [];
 	let sessionRuntime: SessionRuntime | undefined;
+	const shutdownRetireAll = async (): Promise<void> => {
+		const children = sessionRuntime?.activeJobs() ?? [];
+		sessionRuntime?.dispose();
+		await Promise.all([
+			...children.map((job) => job.retire?.().catch(() => {})),
+			...pendingUtilityRetires.map((retire) => retire().catch(() => {})),
+		]);
+		stopLegionRuntime();
+	};
 	let cascadingJobs = new Set<TrackedJob>();
 	let cascadingUtilityRetires = new Set<() => Promise<void>>();
 	const cascadeRetireAll = (): Promise<void> => {
@@ -699,15 +708,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	});
 
 	if (isChild && !allowNested) {
-		pi.on("session_shutdown", async () => {
-			const children = runtime.activeJobs();
-			runtime.dispose();
-			await Promise.all([
-				...children.map((job) => job.retire?.().catch(() => {})),
-				...pendingUtilityRetires.map((retire) => retire().catch(() => {})),
-			]);
-			stopLegionRuntime();
-		});
+		pi.on("session_shutdown", shutdownRetireAll);
 		return;
 	}
 	// The parent transcript records every finish; the renderer keeps a
@@ -931,15 +932,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		bindUi(_event, ctx);
 		runtime.refreshUi();
 	});
-	pi.on("session_shutdown", async () => {
-		const children = runtime.activeJobs();
-		runtime.dispose();
-		await Promise.all([
-			...children.map((job) => job.retire?.().catch(() => {})),
-			...pendingUtilityRetires.map((retire) => retire().catch(() => {})),
-		]);
-		stopLegionRuntime();
-	});
+	pi.on("session_shutdown", shutdownRetireAll);
 }
 
 /**
@@ -1817,7 +1810,32 @@ async function launchUtilityFamily(input: {
 		modelOrigin: ModelOrigin;
 	}> = [];
 	for (const step of plan.steps) {
-		const agent = findAgent(catalog.agents, step.agent) ?? findAgent(catalog.allAgents, step.agent);
+		const selectedAgent = findAgent(catalog.agents, step.agent);
+		const fallbackAgent = findAgent(catalog.allAgents, step.agent);
+		const teamMembers = catalog.settings.teams?.[catalog.team.name]?.members ?? [];
+		const explicitlyMentionedByTeam = Boolean(
+			!selectedAgent &&
+			fallbackAgent &&
+			catalog.team.name !== DEFAULT_TEAM &&
+			teamMembers.some((member) => {
+				const reference = typeof member === "string" ? member.trim() : member.agent.trim();
+				if (reference === "*") return false;
+				return findAgent(catalog.allAgents, reference)?.name === fallbackAgent.name;
+			}),
+		);
+		if (explicitlyMentionedByTeam) {
+			return fail(
+				unknownAgentLineForCatalog(
+					catalog.agents,
+					catalog.allAgents,
+					step.agent,
+					catalog.team,
+					catalog.settings,
+				),
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		const agent = selectedAgent ?? fallbackAgent;
 		if (!agent?.utility) {
 			return fail(
 				`not a utility agent: ${step.agent} (mark it with 'utility: true')`,
@@ -1920,6 +1938,7 @@ async function launchUtilityFamily(input: {
 	}
 
 	const results: string[] = [];
+	const stillRunning = new Set<string>();
 	const launches = await Promise.all(prepared.map(async (item) => {
 		const cwd = item.step.cwd ? path.resolve(input.cwd, item.step.cwd) : input.cwd;
 		const orchestrator = new Orchestrator({
@@ -2033,6 +2052,7 @@ async function launchUtilityFamily(input: {
 			await persistChild(store, runId, handle.orchestrator, handle.name);
 			if (result.blocked || !shouldRecycleAfterCollect(result.execution.status)) {
 				followUtility(handle, true);
+				stillRunning.add(handle.name);
 			} else {
 				await handle.retire();
 				input.runtime.release(handle.name);
@@ -2046,8 +2066,13 @@ async function launchUtilityFamily(input: {
 			lines.push(`sessionFile: ${handle.sessionFile}`);
 			return lines.join("\n");
 		} catch (error) {
-			if (input.supervisor.isAlive(handle.name)) followUtility(handle, true);
-			else input.runtime.release(handle.name);
+			if (input.supervisor.isAlive(handle.name)) {
+				followUtility(handle, true);
+				stillRunning.add(handle.name);
+			} else {
+				await handle.retire().catch(() => {});
+				input.runtime.release(handle.name);
+			}
 			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
@@ -2059,6 +2084,9 @@ async function launchUtilityFamily(input: {
 			runId,
 			handles: handles.map(({ name, agent, sessionFile }) => ({ name, agent, sessionFile })),
 			async: false,
+			...(stillRunning.size > 0
+				? { stillRunning: handles.filter(({ name }) => stillRunning.has(name)).map(({ name }) => name) }
+				: {}),
 		},
 	};
 }
