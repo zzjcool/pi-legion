@@ -23,6 +23,18 @@ export interface RailInput {
 	/** tok/s over the shared 60s window. */
 	rate: number;
 	windowMs?: number;
+	/** Lane scroll position when more agents are live than lanes fit. */
+	scroll?: RailScroll;
+}
+
+/**
+ * Scroll state: `topId` anchors the view to the agent in the top visible lane
+ * so agents ending above it don't shift what's on screen; `offset` is the
+ * fallback when that agent itself is gone.
+ */
+export interface RailScroll {
+	offset: number;
+	topId?: string;
 }
 
 export interface RailRender {
@@ -37,6 +49,10 @@ export interface RailRender {
 	hit: Array<Array<string | undefined>>;
 	shown: VizNode[];
 	hidden: VizNode[];
+	/** Resolved (clamped) scroll window. */
+	offset: number;
+	total: number;
+	maxLanes: number;
 }
 
 function endOf(node: VizNode): number {
@@ -51,17 +67,47 @@ export function liveAt(nodes: readonly VizNode[], t: number): VizNode[] {
 }
 
 /**
- * Lane assignment with compaction: the first `maxLanes` live agents get rows
- * 0..k-1 in priority order; the rest are folded into the `+N` overflow.
+ * Clamp a scroll request to the live list. The anchor agent keeps its lane on
+ * top while it lives; new agents (appended at the bottom, oldest-first order)
+ * never move the view; when everything fits the offset is 0.
  */
-export function assignLanes(nodes: readonly VizNode[], t: number, maxLanes: number): {
+export function resolveScroll(live: readonly VizNode[], maxLanes: number, scroll?: RailScroll): number {
+	const maxOffset = Math.max(0, live.length - Math.max(0, maxLanes));
+	if (maxOffset === 0 || !scroll) return 0;
+	let offset = scroll.offset;
+	if (scroll.topId !== undefined && offset > 0) {
+		const index = live.findIndex((node) => node.id === scroll.topId);
+		if (index >= 0) offset = index;
+	}
+	return Math.min(maxOffset, Math.max(0, Math.round(offset)));
+}
+
+/** "5-8/12" — 1-based visible lane range over the live total. */
+export function scrollIndicator(offset: number, shown: number, total: number): string {
+	return `${offset + 1}-${offset + shown}/${total}`;
+}
+
+/**
+ * Lane assignment with compaction: live agents in priority order, the window
+ * [offset, offset+maxLanes) gets rows 0..k-1; the rest are scrolled out.
+ */
+export function assignLanes(nodes: readonly VizNode[], t: number, maxLanes: number, scroll?: RailScroll): {
 	lanes: Map<string, number>;
 	shown: VizNode[];
 	hidden: VizNode[];
+	offset: number;
+	total: number;
 } {
 	const live = liveAt(nodes, t);
-	const shown = live.slice(0, Math.max(0, maxLanes));
-	return { lanes: new Map(shown.map((node, index) => [node.id, index])), shown, hidden: live.slice(shown.length) };
+	const offset = resolveScroll(live, maxLanes, scroll);
+	const shown = live.slice(offset, offset + Math.max(0, maxLanes));
+	return {
+		lanes: new Map(shown.map((node, index) => [node.id, index])),
+		shown,
+		hidden: [...live.slice(0, offset), ...live.slice(offset + shown.length)],
+		offset,
+		total: live.length,
+	};
 }
 
 export function maxLanesFor(width: number): number {
@@ -77,7 +123,7 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	if (width < 20) return undefined;
 	const { nodes, now } = input;
 	const maxLanes = maxLanesFor(width);
-	const current = assignLanes(nodes, now, maxLanes);
+	const current = assignLanes(nodes, now, maxLanes, input.scroll);
 	const rows = current.shown.length;
 	if (rows === 0) return undefined;
 	const portrait = width < RAIL_NARROW_COLS;
@@ -136,13 +182,16 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		hit[y0 + r]![LX + c] = cell.owner;
 	}
 
-	const live = current.shown.length + current.hidden.length;
+	const live = current.total;
+	const above = current.offset > 0;
+	const below = current.offset + rows < live;
 	const rateText = formatRate(input.rate);
 	const winLabel = ` −${Math.max(1, Math.round(windowMs / 60000))}m `;
 	canvas.text(LX + 1, 0, winLabel, "dim");
+	const range = above || below ? ` · ${scrollIndicator(current.offset, rows, live)} ${above ? "▲" : " "}${below ? "▼" : " "}` : "";
 	const header = portrait
-		? ` ${live} live · ${rateText} `
-		: ` legion ${live} live · ${rateText} `;
+		? ` ${live} live${range} · ${rateText} `
+		: ` legion ${live} live${range} · ${rateText} `;
 	canvas.text(Math.max(LX + 1 + winLabel.length, width - header.length - 1), 0, header, "accent", { bold: true, maxX: width - 1 });
 
 	const nameX = LX + AW;
@@ -151,7 +200,8 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		const col = color(node);
 		canvas.set(nameX, y, "▶", col, { bold: true });
 		for (let x = nameX; x < width; x++) hit[y]![x] = node.id;
-		const overflow = i === rows - 1 && current.hidden.length > 0 ? ` +${current.hidden.length}` : "";
+		// Scroll hints at the right edge: ▲ on the top lane, ▼ on the bottom lane.
+		const overflow = i === 0 && above ? " ▲" : i === rows - 1 && below ? " ▼" : "";
 		const avail = width - (nameX + 2) - overflow.length;
 		if (portrait) {
 			canvas.text(nameX + 2, y, ellipsize(node.name, avail), col, { bold: true });
@@ -173,6 +223,9 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		hit,
 		shown: current.shown,
 		hidden: current.hidden,
+		offset: current.offset,
+		total: current.total,
+		maxLanes,
 	};
 }
 
@@ -180,9 +233,16 @@ export function railwayLines(input: RailInput, theme: VizTheme): {
 	lines: string[];
 	nodeIdsByRow: Array<string | undefined>;
 	hitAt: (x: number, y: number) => string | undefined;
+	/** Resolved window (undefined when hidden); total > maxLanes means scrollable. */
+	window?: { offset: number; total: number; maxLanes: number; topId?: string };
 } {
 	const rendered = renderRailway(input);
 	if (!rendered) return { lines: [], nodeIdsByRow: [], hitAt: () => undefined };
 	const { hit } = rendered;
-	return { lines: rendered.canvas.toLines(theme), nodeIdsByRow: rendered.nodeIdsByRow, hitAt: (x, y) => hit[y]?.[x] };
+	return {
+		lines: rendered.canvas.toLines(theme),
+		nodeIdsByRow: rendered.nodeIdsByRow,
+		hitAt: (x, y) => hit[y]?.[x],
+		window: { offset: rendered.offset, total: rendered.total, maxLanes: rendered.maxLanes, topId: rendered.shown[0]?.id },
+	};
 }
