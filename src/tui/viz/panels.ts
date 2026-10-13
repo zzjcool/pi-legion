@@ -318,7 +318,8 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	const statsBelow = statsW === 0 ? Math.min(selected ? 4 : 3, Math.max(0, r.h - 6)) : 0;
 	const axisW = 6;
 	const plotX = r.x + axisW;
-	const plotW = Math.max(4, r.w - axisW - statsW - (statsW ? 2 : 0) - 1);
+	// With side stats, keep room for the "◂ now" label so it never runs into the stats column.
+	const plotW = Math.max(4, r.w - axisW - statsW - (statsW ? 9 : 0) - 1);
 	const plotTop = r.y + 1;
 	const plotH = Math.max(1, r.h - 2 - statsBelow);
 	const axisY = plotTop + plotH;
@@ -386,7 +387,7 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	cv.text(plotX + plotW - 3, axisY, "now", "text", { bold: true });
 	const nowLabel = `◂ ${formatCount(stats.now)}`;
 	if (statsW === 0) cv.text(r.x, r.y, `now ${formatCount(stats.now)} tok/s`, "accent", { bold: true, maxX: Math.max(r.x, plotX + plotW - 22) });
-	else cv.text(plotX + plotW + 1, axisY - 1 - Math.min(plotH - 1, Math.floor(rowsFor(stats.now))), nowLabel, "text", { maxX: r.x + r.w });
+	else cv.text(plotX + plotW + 1, axisY - 1 - Math.min(plotH - 1, Math.floor(rowsFor(stats.now))), nowLabel, "text", { maxX: r.x + r.w - statsW - 1 });
 
 	const selLines = (): Array<[string, string]> => {
 		if (!selected) return [];

@@ -159,6 +159,13 @@ test("layout: wide >= 140, stacked in between, portrait when narrow or tall", ()
 	assert.equal(selectLayout(79, 20), "portrait");
 	assert.equal(selectLayout(60, 70), "portrait");
 	assert.equal(selectLayout(46, 60), "portrait");
+	// Tall terminals are portrait by aspect ratio, whatever the width.
+	assert.equal(selectLayout(110, 120), "portrait");
+	assert.equal(selectLayout(120, 100), "portrait");
+	assert.equal(selectLayout(90, 80), "portrait");
+	assert.equal(selectLayout(60, 120), "portrait");
+	assert.equal(selectLayout(160, 90), "portrait");
+	assert.equal(selectLayout(120, 40), "stacked");
 	for (const [w, h] of [[46, 60], [60, 70], [100, 40], [160, 50]] as const) {
 		const l = computeLayout(w, h);
 		for (const r of [l.galaxy, l.chart, l.log]) {
@@ -432,4 +439,37 @@ test("status board: railway repaints every second while a subagent is live and s
 	board.paint(live.map((e) => e.nodeId === "root.s" ? { ...e, state: "settled", finishedAt: now + 900 } : e), now + 1000);
 	assert.equal(intervals.size, 0, "ticker must stop when no subagent is live");
 	board.clear();
+});
+
+test("layout: tall terminals cap galaxy/chart heights; few events hand log space to the galaxy", () => {
+	for (const [w, h] of [[110, 120], [120, 100], [90, 80], [60, 120], [46, 60], [100, 40], [139, 69], [160, 50], [220, 105]] as const) {
+		const l = computeLayout(w, h);
+		assert.ok(l.chart.h <= 24, `${w}x${h} chart ${l.chart.h}`);
+		if (l.kind === "portrait") {
+			assert.ok(l.chart.h >= 10 || h < 40, `${w}x${h} chart ${l.chart.h}`);
+			assert.ok(l.galaxy.h <= Math.round(w * 0.65), `${w}x${h} galaxy ${l.galaxy.h}`);
+			assert.equal(l.galaxy.w, w);
+			assert.equal(l.chart.y, l.galaxy.y + l.galaxy.h);
+			assert.equal(l.log.y, l.chart.y + l.chart.h);
+		}
+		if (l.kind === "stacked") assert.ok(l.galaxy.h <= 24);
+		for (const r of [l.galaxy, l.chart, l.log]) assert.ok(r.y + r.h <= h - 1 && r.x + r.w <= w);
+	}
+	const many = computeLayout(110, 120, { logEvents: 200 });
+	const few = computeLayout(110, 120, { logEvents: 4 });
+	assert.ok(few.galaxy.h > many.galaxy.h, `${few.galaxy.h} > ${many.galaxy.h}`);
+	assert.ok(few.log.h >= 8);
+	assert.equal(few.chart.h, many.chart.h);
+});
+
+test("legion view: tall sizes render full width/height without clipping", () => {
+	const { nodes, sampler, now } = scenario();
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	for (const [w, h] of [[110, 120], [120, 100], [90, 80], [60, 120]] as const) {
+		const { canvas, layout } = renderLegionView(data, initialViewState(), w, h);
+		assert.equal(layout, "portrait");
+		const lines = canvas.toLines(ansiTheme);
+		assert.equal(lines.length, h);
+		for (const line of lines) assert.equal(visibleWidth(line), w);
+	}
 });
