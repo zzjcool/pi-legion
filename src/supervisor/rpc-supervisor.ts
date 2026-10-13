@@ -11,6 +11,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatChildTask } from "../extension/child-guard.ts";
 import { buildPiArgs, LEGION_IDENTITY_ENV_KEYS } from "../runs/args.ts";
+import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import { ErrorCodes, SubagentError } from "../shared/types.ts";
 import {
 	InMemoryUIProxy,
@@ -254,6 +255,9 @@ export class RpcSupervisor implements LegionSupervisor {
 			const parentTempDir = path.resolve(input.tempDir);
 			fs.mkdirSync(parentTempDir, { recursive: true });
 			tempDir = fs.mkdtempSync(path.join(parentTempDir, "rpc-child-"));
+			// Owner marker for the startup sweep (#38): a hard-killed parent
+			// leaves this dir behind; a later session deletes it once this pid is gone.
+			writeOwnerFile(path.join(tempDir, TEMP_OWNER_FILE));
 		} catch (error) {
 			await this.rollbackSpawn(registration);
 			throw error;

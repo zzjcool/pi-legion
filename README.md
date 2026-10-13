@@ -206,6 +206,26 @@ subtree, including itself; when launched by a parent at depth `d`, it inherits
 `C_child = min(C_parent, d + R, 4)` (`R = 1` makes it a leaf), so it can tighten
 the inherited cap but cannot widen it.
 
+### Storage hygiene
+
+Each root pi session runs one deferred, best-effort sweep of `.pi-subagents/`
+at startup. A step only touches state whose owner process is gone: runs and
+`rpc-child-*` temp dirs record the owner pid (`owner.json` / `.owner`). Set any
+limit to `0` to disable that step.
+
+| Env | Default | Effect |
+| --- | ---: | --- |
+| `PI_LEGION_HYGIENE` | on | `0`/`off` disables the whole sweep. |
+| `PI_LEGION_RUN_RETENTION_DAYS` | 14 | Delete run dirs idle this long. Runs with a `worktrees/` entry are kept as resume credentials. |
+| `PI_LEGION_STALE_NODE_HOURS` | 72 | Non-root ledger nodes still `starting`/`running`/`blocked` this long after their owner died are marked `failed` (`node_abandoned` event). |
+| `PI_LEGION_STALE_TEMP_HOURS` | 24 | Age threshold for legacy `rpc-child-*` dirs without an owner marker. |
+| `PI_LEGION_EVENT_RETENTION_DAYS` | 30 | Drop ledger events of settled/failed nodes older than this (`orphan_detected`, `budget_refused`, `node_abandoned` are kept). |
+| `PI_LEGION_EVENT_MAX_ROWS` | 200000 | Soft cap on the events table. Oldest terminal-node rows are deleted first. |
+
+The live `legion.db` gets event retention and a `wal_checkpoint(TRUNCATE)` on
+session shutdown. A large delete is followed by `VACUUM`, which is skipped when
+another connection holds the db.
+
 ## Delivery and resume
 
 A centurion owns a Git worktree for its subtree; its worker/scout/reviewer
