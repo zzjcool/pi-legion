@@ -18,7 +18,7 @@ import {
 import { isThinkingLevel } from "../shared/types.ts";
 import { nodesFromEntries, type VizNode } from "./viz/model.ts";
 import { RateSampler } from "./viz/rate.ts";
-import { railwayLines } from "./viz/railway.ts";
+import { railwayLines, type RailScroll } from "./viz/railway.ts";
 
 export const STATUS_WIDGET_KEY = "pi-legion-status";
 export const STATUS_FOOTER_KEY = "pi-legion";
@@ -580,6 +580,8 @@ export function createStatusBoard(options: {
 	let entries: StatusEntry[] = [];
 	let registered = false;
 	let tui: WidgetTui | undefined;
+	let railScroll: RailScroll = { offset: 0 };
+	let railWindow: { offset: number; total: number; maxLanes: number } | undefined;
 
 	const renderLines = (now: number, theme: Theme, width?: number): {
 		lines: string[];
@@ -588,8 +590,14 @@ export function createStatusBoard(options: {
 	} => {
 		if (strip === "railway" && hasTreeIdentity(entries) && width !== undefined && width >= 20) {
 			const nodes = nodesFromEntries(entries);
-			return railwayLines({ nodes, now, width, rate: sampler.totalRate(now) }, theme);
+			const rendered = railwayLines({ nodes, now, width, rate: sampler.totalRate(now), scroll: railScroll }, theme);
+			// Persist the clamped window (anchored on the top lane's agent) so later
+			// renders follow ends/starts without jumping; resets to 0 when all fit.
+			railWindow = rendered.window;
+			railScroll = rendered.window ? { offset: rendered.window.offset, topId: rendered.window.topId } : { offset: 0 };
+			return rendered;
 		}
+		railWindow = undefined;
 		const visible = visiblePanelEntries(entries);
 		const totals = statusTotals(entries);
 		const rows = formatWidgetRows(visible, now, totals);
@@ -663,6 +671,18 @@ export function createStatusBoard(options: {
 							return fitLines(rendered.lines, width);
 						},
 						handleMouse: (event) => {
+							if (event.type === "wheel") {
+								// Wheel over the railway scrolls lanes; when everything fits, let pi scroll the chat.
+								const win = railWindow;
+								const delta = Math.trunc(event.wheelDelta ?? 0);
+								if (!win || win.total <= win.maxLanes || delta === 0) return undefined;
+								const maxOffset = win.total - win.maxLanes;
+								const next = Math.min(maxOffset, Math.max(0, win.offset + delta));
+								railScroll = { offset: next };
+								railWindow = { ...win, offset: next };
+								tui?.requestRender();
+								return { handled: true };
+							}
 							if (event.type === "press") {
 								latchedNodeId = undefined;
 								if (event.button !== "left") return undefined;

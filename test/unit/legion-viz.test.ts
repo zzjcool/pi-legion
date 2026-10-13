@@ -4,7 +4,7 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
-import { assignLanes, liveAt, maxLanesFor, renderRailway } from "../../src/tui/viz/railway.ts";
+import { assignLanes, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { buildLog, computeStats } from "../../src/tui/viz/panels.ts";
 import { createLegionViewFactory, handleViewKey, initialViewState, renderLegionView } from "../../src/tui/viz/view.ts";
@@ -105,7 +105,7 @@ test("railway: lanes compact when an agent ends (no empty rows, lower lanes shif
 	assert.deepEqual([...after.lanes.entries()], [["worker-1", 0], ["worker-3", 1]]);
 });
 
-test("railway: lane priority is oldest then shallowest, overflow folds into +N", () => {
+test("railway: lane priority is oldest then shallowest, overflow scrolls with a range indicator", () => {
 	const nodes = [ROOT,
 		node("deep", { startedAt: sec(0), depth: 3 }),
 		node("shallow", { startedAt: sec(0), depth: 1 }),
@@ -119,10 +119,13 @@ test("railway: lane priority is oldest then shallowest, overflow folds into +N",
 	assert.equal(maxLanesFor(80), 4);
 	const narrow = renderRailway({ nodes, now: sec(10), width: 60, rate: 0 })!;
 	assert.equal(narrow.canvas.height, 4);
-	assert.match(narrow.canvas.toPlain()[3]!, /\+4$/);
+	assert.match(narrow.canvas.toPlain()[0]!, / 7 live · 1-3\/7  ▼ · /);
+	assert.match(narrow.canvas.toPlain()[3]!, / ▼$/);
 	const wide = renderRailway({ nodes, now: sec(10), width: 120, rate: 0 })!;
 	assert.equal(wide.canvas.height, 5);
-	assert.match(wide.canvas.toPlain()[4]!, /\+3\s*$/);
+	assert.match(wide.canvas.toPlain()[0]!, /legion 7 live · 1-4\/7  ▼ · /);
+	assert.match(wide.canvas.toPlain()[4]!, / ▼$/);
+	assert.doesNotMatch(wide.canvas.toPlain().join("\n"), /\+\d/);
 	assert.deepEqual(wide.nodeIdsByRow, [undefined, "shallow", "deep", "w-0", "w-1"]);
 });
 
@@ -486,7 +489,12 @@ test("railway: ended scouts vanish — one row, only the survivor's label, no or
 		const lines = out.canvas.toLines(plainTheme);
 		assert.equal(lines.length, 2, "header + one lane");
 		assert.deepEqual(out.nodeIdsByRow, [undefined, "scout-3"]);
-		assert.match(lines[0]!, /^[─\s\-−0-9a-z·./]+$/, `header has only rule/text: ${lines[0]}`);
+		assert.match(lines[0]!, /^[─┬\s\-−0-9a-z·./]+$/, `header has only rule/text/spawn tick: ${lines[0]}`);
+		// Exactly one spawn tick: scout-3's (root-spawned, live), at its lane start, owned by it.
+		const ticks = Array.from(lines[0]!).flatMap((ch, x) => ch === "┬" ? [x] : []);
+		assert.equal(ticks.length, 1);
+		assert.equal(out.hit[0]![ticks[0]!], "scout-3");
+		assert.equal(Array.from(lines[1]!)[ticks[0]!], "╰");
 		assert.doesNotMatch(lines.join("\n"), /scout-[012]/);
 		assert.equal((lines[1]!.match(/scout-3/g) ?? []).length, 1);
 		assert.doesNotMatch(lines[1]!, /[┴┬✗]/);
@@ -526,9 +534,16 @@ test("railway hit map: every drawn cell maps to the agent whose glyph it is (for
 	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
 	assert.equal(out.hit.length, lines.length);
 	assert.deepEqual(out.nodeIdsByRow, [undefined, "worker-0", "scout-1", "scout-2"]);
-	// Header row and dotted background are never clickable.
-	assert.ok(out.hit[0]!.every((id) => id === undefined));
 	const nameX = lines[1]!.indexOf("▶");
+	// Lane start column per agent (where its ╰/├/╭/╺ cap is drawn).
+	const startX = new Map<string, number>();
+	for (let y = 1; y < lines.length; y++) startX.set(out.nodeIdsByRow[y]!, lines[y]!.findIndex((ch) => "╰├╭╺┄".includes(ch)));
+	// Header: only ┬ spawn ticks of root-spawned live lanes are clickable (owned by that child).
+	lines[0]!.forEach((ch, x) => {
+		if (ch === "┬") assert.ok(["worker-0", "scout-2"].includes(out.hit[0]![x]!) && startX.get(out.hit[0]![x]!) === x, `tick ${x}`);
+		else assert.equal(out.hit[0]![x], undefined, `header ${x}`);
+	});
+	assert.equal(lines[0]!.filter((ch) => ch === "┬").length, 2);
 	let forkCells = 0;
 	for (let y = 1; y < lines.length; y++) {
 		for (let x = 0; x < lines[y]!.length; x++) {
@@ -536,8 +551,11 @@ test("railway hit map: every drawn cell maps to the agent whose glyph it is (for
 			const id = out.hit[y]![x];
 			if (x >= nameX) { assert.equal(id, out.nodeIdsByRow[y], `name col ${x},${y}`); continue; }
 			if (ch === "·" || ch === " ") assert.equal(id, undefined, `background ${x},${y}`);
-			else if (ch === "━" || ch === "╺") assert.equal(id, out.nodeIdsByRow[y], `lane ${x},${y} ${ch}`);
-			else if ("╰╭│┳┻".includes(ch)) { assert.equal(id, "scout-1", `fork ${x},${y} ${ch}`); forkCells++; }
+			else if (ch === "━" || ch === "╺" || ch === "┿") assert.equal(id, out.nodeIdsByRow[y], `lane ${x},${y} ${ch}`);
+			else if ("╰╭├│┳┻".includes(ch)) {
+				assert.ok(id !== undefined && startX.get(id) === x, `connector ${x},${y} ${ch} -> ${id}`);
+				if (id === "scout-1") forkCells++;
+			}
 			else assert.fail(`unexpected glyph ${ch} at ${x},${y}`);
 		}
 	}
@@ -578,4 +596,126 @@ test("status board: railway click opens the agent of the exact cell; name column
 	assert.deepEqual(click(10, 0), [undefined, undefined]);
 	assert.equal(opened.length, 4);
 	board.clear();
+});
+
+const many = (n: number, opts: (i: number) => Partial<VizNode> = () => ({})) =>
+	Array.from({ length: n }, (_, i) => node(`scout-${i}`, { role: "scout", startedAt: sec(i), ...opts(i) }));
+
+test("railway scroll: window math, indicator text and ▲/▼ hints", () => {
+	const nodes = [ROOT, ...many(12)];
+	const live = liveAt(nodes, sec(100));
+	assert.equal(resolveScroll(live, 4, undefined), 0);
+	assert.equal(resolveScroll(live, 4, { offset: 4 }), 4);
+	assert.equal(resolveScroll(live, 4, { offset: 99 }), 8);
+	assert.equal(resolveScroll(live, 4, { offset: -3 }), 0);
+	assert.equal(scrollIndicator(4, 4, 12), "5-8/12");
+	const mid = renderRailway({ nodes, now: sec(100), width: 120, rate: 0, scroll: { offset: 4 } })!;
+	const plain = mid.canvas.toPlain();
+	assert.match(plain[0]!, /legion 12 live · 5-8\/12 ▲▼ · /);
+	assert.deepEqual(mid.nodeIdsByRow, [undefined, "scout-4", "scout-5", "scout-6", "scout-7"]);
+	assert.match(plain[1]!, / ▲$/);
+	assert.match(plain[4]!, / ▼$/);
+	const end = renderRailway({ nodes, now: sec(100), width: 120, rate: 0, scroll: { offset: 8 } })!;
+	assert.match(end.canvas.toPlain()[0]!, / 9-12\/12 ▲  · /);
+	assert.doesNotMatch(end.canvas.toPlain()[4]!, /▼/);
+	for (const r of [mid, end]) for (const line of r.canvas.toLines(ansiTheme)) assert.equal(visibleWidth(line), 120);
+});
+
+test("railway scroll: clamps as agents end/start, new agents don't yank, all-fit resets to 0, hidden when none live", () => {
+	const base = many(10);
+	const at = (nodes: VizNode[], t: number, scroll: { offset: number; topId?: string }) => renderRailway({ nodes: [ROOT, ...nodes], now: sec(t), width: 120, rate: 0, scroll });
+	// Viewing scout-4..7; two agents above end -> anchor keeps scout-4 on top.
+	const ended = base.map((n, i) => i < 2 ? { ...n, status: "settled" as const, endedAt: sec(50) } : n);
+	const a = at(ended, 60, { offset: 4, topId: "scout-4" })!;
+	assert.deepEqual(a.nodeIdsByRow.slice(1), ["scout-4", "scout-5", "scout-6", "scout-7"]);
+	assert.equal(a.offset, 2);
+	// New agents start (appended at the bottom) -> same view.
+	const grown = [...base, ...Array.from({ length: 3 }, (_, i) => node(`late-${i}`, { startedAt: sec(70 + i) }))];
+	assert.deepEqual(at(grown, 80, { offset: 4, topId: "scout-4" })!.nodeIdsByRow.slice(1), ["scout-4", "scout-5", "scout-6", "scout-7"]);
+	// Anchor itself ends and the list shrinks -> offset clamps to the last full window.
+	const shrunk = base.map((n, i) => i >= 3 ? { ...n, status: "settled" as const, endedAt: sec(50) } : n).concat([node("x", { startedAt: sec(55) }), node("y", { startedAt: sec(56) })]);
+	const c = at(shrunk, 60, { offset: 4, topId: "scout-4" })!;
+	assert.equal(c.total, 5);
+	assert.equal(c.offset, 1);
+	// Everything fits -> offset 0, no indicator.
+	const fit = at(base.slice(0, 3), 60, { offset: 5, topId: "scout-2" })!;
+	assert.equal(fit.offset, 0);
+	assert.doesNotMatch(fit.canvas.toPlain()[0]!, /\d+-\d+\/\d+|[▲▼]/);
+	// No live agents -> hidden regardless of scroll.
+	assert.equal(at(base.map((n) => ({ ...n, status: "settled" as const, endedAt: sec(20) })), 60, { offset: 3 }), undefined);
+});
+
+test("railway scroll: hit map follows the scrolled window", () => {
+	const nodes = [ROOT, ...many(12)];
+	const out = renderRailway({ nodes, now: sec(100), width: 120, rate: 0, scroll: { offset: 6 } })!;
+	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+	assert.deepEqual(out.nodeIdsByRow.slice(1), ["scout-6", "scout-7", "scout-8", "scout-9"]);
+	for (let y = 1; y < lines.length; y++) {
+		const nameX = lines[y]!.indexOf("▶");
+		lines[y]!.forEach((ch, x) => {
+			const id = out.hit[y]![x];
+			if (x >= nameX) assert.equal(id, out.nodeIdsByRow[y]);
+			else if (ch === "·" || ch === " ") assert.equal(id, undefined);
+			else assert.equal(id, out.nodeIdsByRow[y], `${x},${y} ${ch}`);
+		});
+	}
+	assert.ok(!out.hit.flat().some((id) => id === "scout-0" || id === "scout-11"));
+});
+
+test("status board: wheel over the railway scrolls lanes (65 down / 64 up), clicks follow, no-op when all fit", () => {
+	let factory: WidgetFactory | undefined;
+	const opened: string[] = [];
+	let renders = 0;
+	const ctx: StatusUi = { hasUI: true, ui: { theme: plainTheme, setStatus() {}, setWidget(_k, c) { factory = typeof c === "function" ? c : undefined; } } };
+	const board = createStatusBoard({ strip: "railway", onNodeClick: (id) => opened.push(id) });
+	board.bind(ctx);
+	const now = Date.now();
+	const entry = (i: number): StatusEntry => ({ name: `scout-${i}`, agent: "scout", state: "running", startedAt: now - 100_000 + i * 1000, nodeId: `root.s${i}`, parentId: "root", depth: 1 });
+	const entries: StatusEntry[] = [
+		{ name: "centurion-0", agent: "centurion", state: "running", startedAt: now - 300_000, nodeId: "root", parentId: null, depth: 0 },
+		...Array.from({ length: 8 }, (_, i) => entry(i)),
+	];
+	board.paint(entries, now);
+	const comp = factory!({ requestRender() { renders++; } }, plainTheme);
+	const ev = (type: string, y: number, extra: object = {}) => ({ type, button: type === "wheel" ? "none" : "left", x: 115, y, screenX: 115, screenY: y, width: 120, height: 5, ...extra }) as never;
+	const names = () => comp.render(120).slice(1).map((l) => /▶ (\S+)/.exec(stripTerminalSequences(l))?.[1]);
+	assert.deepEqual(names(), ["scout-0", "scout-1", "scout-2", "scout-3"]);
+	assert.deepEqual(comp.handleMouse!(ev("wheel", 2, { wheelDelta: 1 })), { handled: true });
+	assert.deepEqual(names(), ["scout-1", "scout-2", "scout-3", "scout-4"]);
+	comp.handleMouse!(ev("wheel", 2, { wheelDelta: 10 }));
+	assert.deepEqual(names(), ["scout-4", "scout-5", "scout-6", "scout-7"], "clamped at the end");
+	assert.match(stripTerminalSequences(comp.render(120)[0]!), /5-8\/8 ▲ /);
+	// Click on the name column in the scrolled window opens that lane's agent.
+	comp.handleMouse!(ev("press", 1)); comp.handleMouse!(ev("click", 1));
+	assert.deepEqual(opened, ["root.s4"]);
+	comp.handleMouse!(ev("wheel", 2, { wheelDelta: -1 }));
+	assert.deepEqual(names(), ["scout-3", "scout-4", "scout-5", "scout-6"]);
+	assert.ok(renders >= 3);
+	// When all agents fit, wheel is not consumed (pi scrolls the chat instead).
+	board.paint(entries.slice(0, 3), now);
+	comp.render(120);
+	assert.equal(comp.handleMouse!(ev("wheel", 1, { wheelDelta: 1 })), undefined);
+	board.clear();
+});
+
+test("railway: root-spawned lanes get a ┬ spawn connector from the header; siblings at the same x share one vertical", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(100) }),
+		node("scout-1", { startedAt: sec(200) }),
+		node("scout-2", { startedAt: sec(200) }),
+		node("scout-3", { startedAt: sec(200) }),
+		node("gone", { startedAt: sec(150), status: "settled", endedAt: sec(250) }),
+	];
+	const out = renderRailway({ nodes, now: sec(300), width: 120, rate: 0 })!;
+	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+	const ticks = lines[0]!.flatMap((ch, x) => ch === "┬" ? [x] : []);
+	assert.equal(ticks.length, 2, "worker-0 + one shared tick for the three siblings; none for the ended agent");
+	const [wx, sx] = ticks as [number, number];
+	assert.equal(lines[1]![wx], "╰");
+	assert.deepEqual([lines[1]![sx], lines[2]![sx], lines[3]![sx], lines[4]![sx]], ["┿", "├", "├", "╰"], "crosses worker-0's lane");
+	assert.equal(out.hit[1]![sx], "worker-0", "a crossing stays with the lane it sits on");
+	assert.equal(out.hit[0]![sx], "scout-1");
+	assert.equal(out.hit[4]![sx], "scout-3");
+	assert.equal(out.hit[2]![sx], "scout-1");
+	for (const line of out.canvas.toLines(ansiTheme)) assert.equal(visibleWidth(line), 120);
 });
