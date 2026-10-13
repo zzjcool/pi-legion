@@ -649,6 +649,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	const runtime = createSessionRuntime({
 		sendMessage: (message, options) => pi.sendMessage(message, options),
 		onStatusNodeClick: (nodeId) => statusNodeOpener?.(nodeId),
+		statusStrip: process.env.PI_LEGION_STRIP === "tree" ? "tree" : "railway",
 		eventBus: legionBus,
 		getTreeNodes: () => {
 			const identity = legionIdentity;

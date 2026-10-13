@@ -21,6 +21,8 @@ import {
 } from "./join.ts";
 import {
 	createStatusBoard,
+	type StatusStripStyle,
+	type StatusVizSnapshot,
 	formatBusyLabel,
 	type StatusEntry,
 	type StatusUi,
@@ -117,6 +119,8 @@ export interface SessionRuntimeDeps {
 	getTreeIdentity?: (name: string) => LegionTreeIdentity | undefined;
 	/** Open the live activity viewer for a node selected in the resident status widget. */
 	onStatusNodeClick?: (nodeId: string) => void;
+	/** Above-input strip style; the extension uses "railway", the default stays "tree". */
+	statusStrip?: StatusStripStyle;
 	/** Error hook for an optional PI_LEGION_DB feed. */
 	onDbEventSourceError?: (error: unknown) => void;
 	/**
@@ -182,6 +186,8 @@ export interface SessionRuntime {
 	/** Current live widget rows, including any retained Legion tree facts. */
 	statusEntries(): StatusEntry[];
 	refreshUi(): void;
+	/** Live visualization data (nodes + token-rate sampler) for the /legion view. */
+	vizSnapshot(): StatusVizSnapshot;
 	/** Forward join config to the internal coordinator (settings wiring). */
 	setJoinConfig(config: JoinConfig): void;
 	/**
@@ -200,7 +206,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const refreshMs = deps.refreshMs ?? DEFAULT_REFRESH_MS;
 	const jobs = new Map<string, TrackedJob>();
 	const finished = new Map<string, CollectSnapshot>();
-	const board = createStatusBoard({ onNodeClick: deps.onStatusNodeClick });
+	const board = createStatusBoard({
+		onNodeClick: deps.onStatusNodeClick,
+		...(deps.statusStrip ? { strip: deps.statusStrip } : {}),
+	});
 	const tree = new Map<string, TreeNodeSnapshot>();
 	const activity = new Map<string, { turn?: number; turnStartedAt?: number; tools: string[] }>();
 	const eventOverrides = new Map<string, { ts: number; status?: TreeNodeSnapshot["status"]; phase?: string }>();
@@ -859,6 +868,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 
 		activeJobs() {
 			return [...jobs.values()];
+		},
+
+		vizSnapshot() {
+			return board.vizSnapshot!(now());
 		},
 
 		treeNodes() {

@@ -16,6 +16,9 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { isThinkingLevel } from "../shared/types.ts";
+import { nodesFromEntries, type VizNode } from "./viz/model.ts";
+import { RateSampler } from "./viz/rate.ts";
+import { railwayLines } from "./viz/railway.ts";
 
 export const STATUS_WIDGET_KEY = "pi-legion-status";
 export const STATUS_FOOTER_KEY = "pi-legion";
@@ -102,6 +105,10 @@ function activeEntries(entries: StatusEntry[]): StatusEntry[] {
  * branches age out; footer/busy counts stay consistent with the widget).
  * Legacy flat rosters keep the historical always-shown behavior.
  */
+function hasTreeIdentity(entries: StatusEntry[]): boolean {
+	return entries.some((entry) => entry.nodeId !== undefined || entry.parentId !== undefined || entry.depth !== undefined);
+}
+
 export function visiblePanelEntries(entries: StatusEntry[]): StatusEntry[] {
 	const hasTreeIdentity = entries.some(
 		(entry) => entry.nodeId !== undefined || entry.parentId !== undefined || entry.depth !== undefined,
@@ -524,8 +531,21 @@ function fitLines(lines: string[], width?: number): string[] {
 	);
 }
 
+/** Above-input strip style: the railway lanes (default in the extension) or the classic tree roster. */
+export type StatusStripStyle = "railway" | "tree";
+
+export interface StatusVizSnapshot {
+	nodes: VizNode[];
+	sampler: RateSampler;
+	now: number;
+	/** Shared tok/s definition (trailing 60s window). */
+	rate: number;
+}
+
 export interface StatusBoard {
 	bind(ctx: StatusUi): void;
+	/** Live data for the /legion view (same sampler and rate definition as the strip). */
+	vizSnapshot?(now?: number): StatusVizSnapshot;
 	paint(entries: StatusEntry[], now: number): void;
 	clear(): void;
 }
@@ -536,17 +556,27 @@ export interface StatusBoard {
  * Calling `setWidget` on the tool-execute context after it returns is a
  * no-op (stale ctx). The factory keeps a TUI handle that outlives that ctx.
  */
-export function createStatusBoard(options: { onNodeClick?: (nodeId: string) => void } = {}): StatusBoard {
+export function createStatusBoard(options: {
+	onNodeClick?: (nodeId: string) => void;
+	strip?: StatusStripStyle;
+	sampler?: RateSampler;
+} = {}): StatusBoard {
+	const sampler = options.sampler ?? new RateSampler();
+	const strip: StatusStripStyle = options.strip ?? "tree";
 	let ctx: StatusUi | undefined;
 	let ui: StatusUi["ui"] | undefined;
 	let entries: StatusEntry[] = [];
 	let registered = false;
 	let tui: WidgetTui | undefined;
 
-	const renderLines = (now: number, theme: Theme): {
+	const renderLines = (now: number, theme: Theme, width?: number): {
 		lines: string[];
 		nodeIdsByRow: Array<string | undefined>;
 	} => {
+		if (strip === "railway" && hasTreeIdentity(entries) && width !== undefined && width >= 20) {
+			const nodes = nodesFromEntries(entries);
+			return railwayLines({ nodes, now, width, rate: sampler.totalRate(now) }, theme);
+		}
 		const visible = visiblePanelEntries(entries);
 		const totals = statusTotals(entries);
 		const rows = formatWidgetRows(visible, now, totals);
@@ -597,7 +627,7 @@ export function createStatusBoard(options: { onNodeClick?: (nodeId: string) => v
 					let latchedNodeId: string | undefined;
 					return {
 						render: (width) => {
-							const rendered = renderLines(Date.now(), theme);
+							const rendered = renderLines(Date.now(), theme, width);
 							// Build the identity map before styling or width fitting can change the display rows.
 							nodeIdsByRow = rendered.nodeIdsByRow;
 							return fitLines(rendered.lines, width);
@@ -645,7 +675,11 @@ export function createStatusBoard(options: { onNodeClick?: (nodeId: string) => v
 			// panel is a "what is happening now" view (completed agents age out;
 			// footer counts follow the same filter).
 			entries = next;
+			if (hasTreeIdentity(next)) sampler.record(_now, nodesFromEntries(next));
 			paint();
+		},
+		vizSnapshot(now = Date.now()) {
+			return { nodes: nodesFromEntries(entries), sampler, now, rate: sampler.totalRate(now) };
 		},
 		clear() {
 			entries = [];
