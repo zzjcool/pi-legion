@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
-import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleToken } from "../../src/tui/viz/palette.ts";
+import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
 import { assignLanes, liveAt, maxLanesFor, renderRailway } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
@@ -291,7 +291,7 @@ test("legion view: root is not listed as an agent type and the factory fills the
 	const { canvas } = renderLegionView(data, initialViewState(), 160, 50);
 	const legend = canvas.toPlain().find((l) => l.includes("⣿ worker"))!;
 	assert.ok(!legend.includes("⣿ root"), legend);
-	assert.equal(roleToken("root"), "accent");
+	assert.equal(roleColor("root"), "text");
 	const factory = createLegionViewFactory({ getData: () => data });
 	const component = factory({ requestRender() {}, terminal: { rows: 37 } }, plainTheme, undefined, () => {});
 	assert.equal(component.render(100).length, 37);
@@ -338,7 +338,7 @@ function laneColorsByRole(lines: string[], names: Record<string, string>): Map<s
 	return out;
 }
 
-const TYPED = [ROOT,
+const TYPED = [{ ...ROOT, name: "root", role: "root" },
 	node("centurion-0", { role: "centurion", startedAt: sec(0) }),
 	node("scout-0", { role: "scout", startedAt: sec(1) }),
 	node("worker-0", { role: "worker", startedAt: sec(2) }),
@@ -379,6 +379,10 @@ for (const kind of ["dark", "system"] as const) {
 		const view = renderLegionView({ nodes: TYPED, sampler, now: sec(60), rate: 0 }, initialViewState(), 160, 50).canvas.toLines(theme);
 		const viewColors = laneColorsByRole(view, TYPED_NAMES);
 		assert.equal(new Set(viewColors.values()).size, viewColors.size);
+		// Strip and /legion agree on each type's color (root never steals one).
+		const stripPalette = resolveRolePalette(theme, out.canvas.roles());
+		const viewPalette = resolveRolePalette(theme, renderLegionView({ nodes: TYPED, sampler, now: sec(60), rate: 0 }, initialViewState(), 160, 50).canvas.roles());
+		for (const role of ["centurion", "scout", "worker", "reviewer"]) assert.equal(viewPalette.get(role), stripPalette.get(role), role);
 	});
 }
 

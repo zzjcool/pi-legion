@@ -14,7 +14,6 @@ export interface VizTheme {
 }
 
 export const ROLE_TOKENS: Readonly<Record<string, string>> = {
-	root: "accent",
 	centurion: "accent",
 	planner: "syntaxKeyword",
 	worker: "syntaxVariable",
@@ -53,6 +52,9 @@ export const ROLE_COLOR_PREFIX = "role:";
 
 /** Deferred per-type color; resolved by `resolveRolePalette` when a canvas is painted. */
 export function roleColor(role: string): string {
+	// The ledger root is the user's own pi session, not an agent type: keep it
+	// neutral so it never takes a type's color (centurion owns accent).
+	if (role.toLowerCase() === "root") return "text";
 	return `${ROLE_COLOR_PREFIX}${role.toLowerCase()}`;
 }
 
