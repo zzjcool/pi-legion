@@ -3,6 +3,7 @@ import { matchesKey, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
+	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
@@ -327,30 +328,67 @@ function viewerSettings(settings: ReturnType<ExtensionAPI["getSettings"]>): Chat
 	};
 }
 
+function reportOverlayOpenError(
+	controller: ReturnType<typeof createLiveOverlay>,
+	ui: ExtensionUIContext | undefined,
+	error: unknown,
+): void {
+	try {
+		controller.close();
+	} catch {
+		// Closing is best effort too; never leak a status-open failure to the host.
+	}
+	try {
+		if (ui !== undefined && typeof ui.notify === "function") {
+			ui.notify(`Unable to open Legion activity: ${String(error)}`, "error");
+		}
+	} catch {
+		// Some UI contexts cannot display notifications; keep the failure silent.
+	}
+}
+
 function openLiveOverlay(
 	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
+	ui: ExtensionUIContext,
+	cwd: string,
 	controller: ReturnType<typeof createLiveOverlay>,
 	nodeId: string,
 ): void {
 	const factory = createLiveOverlayFactory(controller, nodeId, {
-		cwd: ctx.cwd,
+		cwd,
 		settings: viewerSettings(pi.getSettings()),
 	});
-	void ctx.ui.custom(factory, {
+	void ui.custom(factory, {
 		overlay: true,
 		overlayOptions: { width: "100%" },
 		onHandle: (handle) => controller.getCurrent()?.attachOverlayHandle(handle),
-	}).catch((error: unknown) => {
-		controller.close();
-		notify(ctx, `Unable to open Legion activity: ${String(error)}`, "error");
-	});
+	}).catch((error: unknown) => reportOverlayOpenError(controller, ui, error));
+}
+
+export function createStatusNodeOpener(
+	pi: ExtensionAPI,
+	controller: ReturnType<typeof createLiveOverlay>,
+	getUi: () => ExtensionUIContext | undefined,
+	getCwd: () => string | undefined,
+): (nodeId: string) => void {
+	return (nodeId) => {
+		let ui: ExtensionUIContext | undefined;
+		try {
+			if (controller.getCurrent()?.nodeId === nodeId) return;
+			ui = getUi();
+			const cwd = getCwd();
+			if (ui === undefined || cwd === undefined) return;
+			openLiveOverlay(pi, ui, cwd, controller, nodeId);
+		} catch (error) {
+			reportOverlayOpenError(controller, ui, error);
+		}
+	};
 }
 
 export function registerLegionCommand(
 	pi: ExtensionAPI,
 	deps: LegionCommandDeps,
-): void {
+): ReturnType<typeof createLiveOverlay> {
 	const liveOverlay = createLiveOverlay(treeForLiveSource(deps));
 	let warnedNonTui = false;
 
@@ -393,7 +431,7 @@ export function registerLegionCommand(
 					);
 					return;
 				}
-				openLiveOverlay(pi, ctx, liveOverlay, node.id);
+				openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, node.id);
 				return;
 			}
 
@@ -418,7 +456,7 @@ export function registerLegionCommand(
 						handleInput(data) {
 							if (!tree.getState().searchMode && matchesKey(data, "o")) {
 								const selectedId = tree.getState().selectedId;
-								if (selectedId) openLiveOverlay(pi, ctx, liveOverlay, selectedId);
+								if (selectedId) openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, selectedId);
 								return;
 							}
 							tree.handleInput?.(data);
@@ -427,7 +465,7 @@ export function registerLegionCommand(
 							const result = tree.handleMouse?.(event);
 							if (event.type === "click" && event.button === "left" && result?.handled) {
 								const selectedId = tree.getState().selectedId;
-								if (selectedId) openLiveOverlay(pi, ctx, liveOverlay, selectedId);
+								if (selectedId) openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, selectedId);
 							}
 							return result;
 						},
@@ -444,4 +482,5 @@ export function registerLegionCommand(
 			}
 		},
 	});
+	return liveOverlay;
 }

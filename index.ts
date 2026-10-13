@@ -16,6 +16,7 @@ import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/p
 import type {
 	ExtensionAPI,
 	ExtensionContext,
+	ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
@@ -54,6 +55,7 @@ import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
 import {
+	createStatusNodeOpener,
 	publishSupervisorEvent,
 	publishUIRequest,
 	registerLegionCommand,
@@ -642,7 +644,8 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	// completed child to one line so visibility does not cost a screen.
 	pi.registerMessageRenderer(SUBAGENT_NOTIFY_TYPE, renderSubagentNotice);
 
-	let lastUi: ExtensionContext["ui"] | undefined;
+	let lastUi: ExtensionUIContext | undefined;
+	let statusNodeOpener: ((nodeId: string) => void) | undefined;
 	let lastModelRegistry: ExtensionContext["modelRegistry"] | undefined;
 	let lastConfirm: ((message: string) => Promise<boolean>) | undefined;
 	// turn_start/turn_end maintain this so a flush window can wait out a
@@ -652,6 +655,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	const rpcEventSource = supervisor as LegionSupervisor & RpcEventSource;
 	const runtime = createSessionRuntime({
 		sendMessage: (message, options) => pi.sendMessage(message, options),
+		onStatusNodeClick: (nodeId) => statusNodeOpener?.(nodeId),
 		eventBus: legionBus,
 		getTreeNodes: () => {
 			const identity = legionIdentity;
@@ -705,7 +709,17 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		getModelRegistry: () => lastModelRegistry,
 	});
 	registerSummaryCommand(pi);
-	registerLegionCommand(pi, { bus: legionBus, runtime, supervisor: rpcEventSource });
+	const liveOverlayController = registerLegionCommand(pi, {
+		bus: legionBus,
+		runtime,
+		supervisor: rpcEventSource,
+	});
+	statusNodeOpener = createStatusNodeOpener(
+		pi,
+		liveOverlayController,
+		() => lastUi,
+		() => lastCwd,
+	);
 
 	// ── Master switch ────────────────────────────────────────────────────
 	registerToggleCommand(pi, {

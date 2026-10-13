@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import {
 	applyStatus,
 	createStatusBoard,
@@ -47,6 +47,56 @@ function assertLinesFit(lines: string[], width: number): void {
 			`line exceeds width ${width}: visible=${visibleWidth(line)} raw=${JSON.stringify(line)}`,
 		);
 	}
+}
+
+function mouseEvent(
+	type: TuiMouseEvent["type"],
+	y: number,
+	button: TuiMouseEvent["button"] = "left",
+): TuiMouseEvent {
+	return {
+		type,
+		button,
+		x: 1,
+		y,
+		screenX: 1,
+		screenY: y,
+		width: 120,
+		height: 10,
+		shift: false,
+		alt: false,
+		ctrl: false,
+	};
+}
+
+function activeTreeNode(nodeId: string, name: string): StatusEntry[] {
+	return [
+		{ name: "root", nodeId: "root", parentId: null, depth: 0, agent: "ceo", state: "working", startedAt: 0 },
+		{ name, nodeId, parentId: "root", depth: 1, agent: "worker", state: "working", startedAt: 1 },
+	];
+}
+
+function mountStatusWidget(entries: StatusEntry[], opened: string[]): {
+	board: ReturnType<typeof createStatusBoard>;
+	component: ReturnType<WidgetFactory>;
+} {
+	let factory: WidgetFactory | undefined;
+	const tui = { requestRender() {} };
+	const ctx: StatusUi = {
+		hasUI: true,
+		ui: {
+			theme,
+			setStatus() {},
+			setWidget(_key, content) {
+				if (typeof content === "function") factory = content;
+			},
+		},
+	};
+	const board = createStatusBoard({ onNodeClick: (nodeId) => opened.push(nodeId) });
+	board.bind(ctx);
+	board.paint(entries, 5_000);
+	assert.equal(typeof factory, "function");
+	return { board, component: factory!(tui, theme) };
 }
 
 function treeEntries(): StatusEntry[] {
@@ -581,6 +631,147 @@ test("status board totals count aged-out nodes but exclude the ledger root", () 
 	assert.equal(typeof factory, "function");
 	const lines = factory!(tui, theme).render(120).map(stripTerminalSequences);
 	assert.equal(lines[0], "⏳ Legion · 2 agents · 2 running · Σ 3 agents · 3K tok");
+});
+
+test("status widget opens tree nodes only after a matching left press and click", () => {
+	const opened: string[] = [];
+	const { component } = mountStatusWidget(treeEntries(), opened);
+	const lines = component.render(120);
+	const centurionHeadline = lines.findIndex((line) => stripTerminalSequences(line).includes("● centurion"));
+	assert.ok(centurionHeadline > 0, lines.join("\n"));
+	assert.equal(component.handleMouse(mouseEvent("press", 0)), undefined, "the header press is not handled");
+	assert.deepEqual(component.handleMouse(mouseEvent("press", centurionHeadline)), { handled: true });
+	assert.deepEqual(component.handleMouse(mouseEvent("click", centurionHeadline + 1)), { handled: true }, "the detail row shares its node id");
+	assert.deepEqual(opened, ["root.centurion"]);
+	assert.equal(component.handleMouse(mouseEvent("click", centurionHeadline + 1)), undefined, "click without a fresh press has no latch");
+	assert.deepEqual(opened, ["root.centurion"]);
+});
+
+test("status widget clears a node-click latch when any other row is pressed", () => {
+	const opened: string[] = [];
+	const { component } = mountStatusWidget(treeEntries(), opened);
+	const lines = component.render(120);
+	const centurionHeadline = lines.findIndex((line) => stripTerminalSequences(line).includes("● centurion"));
+	assert.ok(centurionHeadline > 0, lines.join("\n"));
+	assert.deepEqual(component.handleMouse(mouseEvent("press", centurionHeadline)), { handled: true });
+	assert.equal(component.handleMouse(mouseEvent("press", 0)), undefined);
+	assert.equal(component.handleMouse(mouseEvent("click", centurionHeadline)), undefined);
+	assert.deepEqual(opened, []);
+});
+
+test("status widget ignores a click whose row differs from the pressed node", () => {
+	const opened: string[] = [];
+	const { component } = mountStatusWidget(treeEntries(), opened);
+	const lines = component.render(120);
+	const centurionHeadline = lines.findIndex((line) => stripTerminalSequences(line).includes("● centurion"));
+	const workerHeadline = lines.findIndex((line) => stripTerminalSequences(line).includes("worker-a2 (worker)"));
+	assert.ok(centurionHeadline > 0, lines.join("\n"));
+	assert.ok(workerHeadline > centurionHeadline, lines.join("\n"));
+	assert.deepEqual(component.handleMouse(mouseEvent("press", centurionHeadline)), { handled: true });
+	assert.equal(component.handleMouse(mouseEvent("click", workerHeadline)), undefined);
+	assert.deepEqual(opened, []);
+});
+
+test("status widget associates a collapsed tree row with its node id", () => {
+	const opened: string[] = [];
+	const { component } = mountStatusWidget(
+		[
+			{ name: "root", nodeId: "root", parentId: null, depth: 0, agent: "ceo", state: "working", startedAt: 0 },
+			{ name: "terminal", nodeId: "root.terminal", parentId: "root", depth: 1, agent: "centurion", state: "settled", startedAt: 1 },
+			{ name: "archived", nodeId: "root.terminal.archived", parentId: "root.terminal", depth: 2, agent: "worker", state: "settled", startedAt: 2 },
+			// This active record keeps the terminal path visible by identity while
+			// being a sibling in the rendered graph, leaving the terminal branch collapsed.
+			{ name: "worker", nodeId: "root.terminal.archived.worker", parentId: "root", depth: 1, agent: "worker", state: "working", startedAt: 3 },
+		],
+		opened,
+	);
+	const lines = component.render(120);
+	const collapsed = lines.findIndex((line) => stripTerminalSequences(line).includes("terminal +1 collapsed"));
+	assert.ok(collapsed > 0, lines.join("\n"));
+	assert.deepEqual(component.handleMouse(mouseEvent("press", collapsed)), { handled: true });
+	assert.deepEqual(component.handleMouse(mouseEvent("click", collapsed)), { handled: true });
+	assert.deepEqual(opened, ["root.terminal"]);
+});
+
+test("legacy flat status rows are not clickable", () => {
+	const opened: string[] = [];
+	const { component } = mountStatusWidget(entries, opened);
+	const lines = component.render(120);
+	assert.match(lines[0] ?? "", /Async agents/);
+	assert.equal(component.handleMouse(mouseEvent("press", 0)), undefined);
+	assert.equal(component.handleMouse(mouseEvent("press", 1)), undefined);
+	assert.equal(component.handleMouse(mouseEvent("click", 1)), undefined);
+	assert.deepEqual(opened, []);
+});
+
+test("status widget drops a pressed node when its row remaps after repaint", () => {
+	const opened: string[] = [];
+	const { board, component } = mountStatusWidget(activeTreeNode("root.x", "node-X"), opened);
+	const initialLines = component.render(120).map(stripTerminalSequences);
+	const xRow = initialLines.findIndex((line) => line.includes("● node-X"));
+	assert.ok(xRow > 0, initialLines.join("\n"));
+	assert.deepEqual(component.handleMouse(mouseEvent("press", xRow)), { handled: true });
+
+	board.paint(activeTreeNode("root.y", "node-Y"), 6_000);
+	const repaintedLines = component.render(120).map(stripTerminalSequences);
+	assert.match(repaintedLines[xRow] ?? "", /node-Y/, repaintedLines.join("\n"));
+	assert.equal(component.handleMouse(mouseEvent("click", xRow)), undefined);
+	assert.deepEqual(opened, []);
+});
+
+test("status widget still opens a node when its row mapping survives repaint", () => {
+	const opened: string[] = [];
+	const { board, component } = mountStatusWidget(activeTreeNode("root.x", "node-X"), opened);
+	const lines = component.render(120).map(stripTerminalSequences);
+	const xRow = lines.findIndex((line) => line.includes("● node-X"));
+	assert.ok(xRow > 0, lines.join("\n"));
+	assert.deepEqual(component.handleMouse(mouseEvent("press", xRow)), { handled: true });
+
+	board.paint(activeTreeNode("root.x", "node-X updated"), 6_000);
+	const repaintedLines = component.render(120).map(stripTerminalSequences);
+	assert.match(repaintedLines[xRow] ?? "", /node-X updated/, repaintedLines.join("\n"));
+	assert.deepEqual(component.handleMouse(mouseEvent("click", xRow)), { handled: true });
+	assert.deepEqual(opened, ["root.x"]);
+});
+
+test("status widget ignores right presses and wheel events", () => {
+	const opened: string[] = [];
+	const { component } = mountStatusWidget(activeTreeNode("root.x", "node-X"), opened);
+	const lines = component.render(120).map(stripTerminalSequences);
+	const xRow = lines.findIndex((line) => line.includes("● node-X"));
+	assert.ok(xRow > 0, lines.join("\n"));
+
+	assert.deepEqual(component.handleMouse(mouseEvent("press", xRow)), { handled: true });
+	assert.equal(component.handleMouse(mouseEvent("press", xRow, "right")), undefined);
+	assert.equal(component.handleMouse(mouseEvent("click", xRow)), undefined, "a right press clears the earlier left latch");
+	assert.deepEqual(opened, []);
+
+	for (const type of ["wheel", "release", "move", "drag"] as const) {
+		assert.equal(component.handleMouse(mouseEvent(type, xRow)), undefined, `${type} events stay unhandled`);
+	}
+	assert.deepEqual(opened, []);
+});
+
+test("status widget keeps token overview headers non-clickable while node rows remain clickable", () => {
+	const opened: string[] = [];
+	const entries: StatusEntry[] = [
+		{ name: "root", nodeId: "root", parentId: null, depth: 0, agent: "ceo", state: "working", startedAt: 0, tokensTotal: 900 },
+		{ name: "node-X", nodeId: "root.x", parentId: "root", depth: 1, agent: "worker", state: "working", startedAt: 1, tokensTotal: 1_200 },
+		{ name: "done", nodeId: "root.done", parentId: "root", depth: 1, agent: "worker", state: "settled", startedAt: 2, finishedAt: 3_000, tokensTotal: 800 },
+	];
+	const { component } = mountStatusWidget(entries, opened);
+	const lines = component.render(120).map(stripTerminalSequences);
+	assert.match(lines[0] ?? "", /Σ 2 agents/);
+	assert.match(lines[0] ?? "", /2K tok/);
+	assert.equal(component.handleMouse(mouseEvent("press", 0)), undefined);
+	assert.equal(component.handleMouse(mouseEvent("click", 0)), undefined);
+	assert.deepEqual(opened, []);
+
+	const xRow = lines.findIndex((line) => line.includes("● node-X"));
+	assert.ok(xRow > 0, lines.join("\n"));
+	assert.deepEqual(component.handleMouse(mouseEvent("press", xRow)), { handled: true });
+	assert.deepEqual(component.handleMouse(mouseEvent("click", xRow + 1)), { handled: true });
+	assert.deepEqual(opened, ["root.x"]);
 });
 
 test("formatWidgetLines crash replica exceeds a 66-column terminal before truncation", () => {

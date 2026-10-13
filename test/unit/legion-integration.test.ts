@@ -24,6 +24,7 @@ import { assistantMsg, sessionHeader, toolResult, userMsg } from "../helpers/fix
 import { stripTerminalSequences, type Component, type OverlayHandle } from "@earendil-works/pi-tui";
 import type { LegionEvent } from "../../src/extension/event-bus.ts";
 import {
+	createStatusNodeOpener,
 	publishSupervisorEvent,
 	publishUIRequest,
 	registerLegionCommand,
@@ -551,6 +552,7 @@ interface OpenCustomCall {
 class FakeCommandUi {
 	readonly calls: OpenCustomCall[] = [];
 	readonly notifications: Array<{ message: string; level: string }> = [];
+	customMode: "normal" | "reject" | "throwSynchronously" | "invokeFactorySynchronously" = "normal";
 	readonly theme = { fg: (_color: string, text: string) => text };
 	readonly tui = { requestRender() {}, terminal: { rows: 8 } };
 
@@ -563,6 +565,7 @@ class FakeCommandUi {
 		) => Component | Promise<Component>,
 		options?: { overlay?: boolean; overlayOptions?: { width?: string }; onHandle?: (handle: OverlayHandle) => void },
 	): Promise<T> {
+		if (this.customMode === "throwSynchronously") throw new Error("custom threw synchronously");
 		let resolve!: (value: T) => void;
 		let reject!: (error: unknown) => void;
 		const promise = new Promise<T>((resolvePromise, rejectPromise) => {
@@ -571,6 +574,23 @@ class FakeCommandUi {
 		});
 		const call: OpenCustomCall = { options, promise };
 		this.calls.push(call);
+		if (this.customMode === "reject") {
+			reject(new Error("custom rejected"));
+			return promise;
+		}
+		if (this.customMode === "invokeFactorySynchronously") {
+			const created = factory(
+				this.tui as never,
+				this.theme as never,
+				undefined as never,
+				(value) => resolve(value),
+			);
+			void Promise.resolve(created).then((component) => {
+				call.component = component;
+				options?.onHandle?.(testOverlayHandle());
+			}, reject);
+			return promise;
+		}
 		try {
 			const created = factory(
 				this.tui as never,
@@ -617,13 +637,14 @@ function commandHarness(
 		},
 		getSettings() { return {}; },
 	};
-	registerLegionCommand(pi as never, { bus, runtime, supervisor: rpc });
+	const controller = registerLegionCommand(pi as never, { bus, runtime, supervisor: rpc });
 	const ctx = { hasUI: true, mode: "tui", cwd: "/tmp", ui };
 	return {
 		bus,
 		rpc,
 		ui,
 		runtime,
+		controller,
 		handler: (args: string, context: unknown) => command!.handler(args, context),
 		completions: (prefix: string) => command?.getArgumentCompletions?.(prefix) ?? null,
 		ctx,
@@ -680,6 +701,87 @@ test("/legion mounts the paged tree; j/o opens a node overlay and q/Esc close bo
 	await treeOpen;
 	assert.equal(tree.getState().visibleIds.length > 0, true);
 	assert.equal(harness.rpc.subscriptions.length, 0);
+});
+
+test("status widget opener shares the live overlay controller and safely ignores duplicate or unavailable opens", async () => {
+	const harness = commandHarness();
+	let ui: unknown = harness.ctx.ui;
+	let cwd: string | undefined = "/tmp";
+	const opener = createStatusNodeOpener(
+		{ getSettings() { return {}; } } as never,
+		harness.controller,
+		() => ui as never,
+		() => cwd,
+	);
+
+	opener("root.worker");
+	opener("root.worker");
+	await Promise.resolve();
+	assert.equal(harness.ui.calls.length, 1, "the same open node is not remounted or flashed");
+	assert.equal(harness.controller.getCurrent()?.nodeId, "root.worker");
+
+	ui = undefined;
+	opener("root.other");
+	assert.equal(harness.ui.calls.length, 1, "no UI is a safe no-op");
+	ui = harness.ctx.ui;
+	cwd = undefined;
+	opener("root.other");
+	assert.equal(harness.ui.calls.length, 1, "no cwd is a safe no-op");
+
+	cwd = "/tmp";
+	await harness.handler("other", harness.ctx);
+	assert.equal(harness.ui.calls.length, 2, "/legion and the widget use the same overlay controller");
+	assert.equal(harness.controller.getCurrent()?.nodeId, "root.other");
+	const overlay = harness.ui.calls[1]?.component as Component | undefined;
+	assert.ok(overlay);
+	overlay.handleInput?.("\u001b");
+	await harness.ui.calls[1]!.promise;
+	await harness.ui.calls[0]!.promise;
+	assert.equal(harness.controller.getCurrent(), undefined);
+});
+
+test("status widget opener closes and reports rejected or synchronously throwing UI opens", async () => {
+	for (const mode of ["reject", "throwSynchronously", "invokeFactorySynchronously", "settingsSynchronously"] as const) {
+		const harness = commandHarness();
+		let failSettings = false;
+		const opener = createStatusNodeOpener(
+			{
+				getSettings() {
+					if (failSettings) throw new Error("getSettings threw synchronously");
+					return {};
+				},
+			} as never,
+			harness.controller,
+			() => harness.ctx.ui as never,
+			() => "/tmp",
+		);
+		opener("root.worker");
+		await Promise.resolve();
+		assert.equal(harness.controller.getCurrent()?.nodeId, "root.worker", `${mode}: setup opens an existing node`);
+
+		if (mode !== "settingsSynchronously") harness.ui.customMode = mode;
+		if (mode === "invokeFactorySynchronously") {
+			harness.controller.open = (() => {
+				throw new Error("factory threw synchronously");
+			}) as typeof harness.controller.open;
+		}
+		failSettings = mode === "settingsSynchronously";
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown): void => { unhandled.push(reason); };
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			opener("root.other");
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+
+		assert.equal(harness.controller.getCurrent(), undefined, `${mode}: current node is closed`);
+		assert.equal(harness.ui.notifications.length, 1, `${mode}: UI receives an error notification`);
+		assert.match(harness.ui.notifications[0]?.message ?? "", /^Unable to open Legion activity:/);
+		assert.equal(harness.ui.notifications[0]?.level, "error");
+		assert.deepEqual(unhandled, [], `${mode}: no unhandled promise rejection`);
+	}
 });
 
 test("/legion <name> opens the selected floating overlay and Esc unsubscribes only that node", async () => {

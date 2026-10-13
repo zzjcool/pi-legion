@@ -115,6 +115,8 @@ export interface SessionRuntimeDeps {
 	getTreeNodes?: () => readonly TreeNodeSnapshot[] | undefined;
 	/** Optional name-to-tree mapping for live RPC jobs backed by M2 ChildRecord.nodeId. */
 	getTreeIdentity?: (name: string) => LegionTreeIdentity | undefined;
+	/** Open the live activity viewer for a node selected in the resident status widget. */
+	onStatusNodeClick?: (nodeId: string) => void;
 	/** Error hook for an optional PI_LEGION_DB feed. */
 	onDbEventSourceError?: (error: unknown) => void;
 	/**
@@ -198,7 +200,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const refreshMs = deps.refreshMs ?? DEFAULT_REFRESH_MS;
 	const jobs = new Map<string, TrackedJob>();
 	const finished = new Map<string, CollectSnapshot>();
-	const board = createStatusBoard();
+	const board = createStatusBoard({ onNodeClick: deps.onStatusNodeClick });
 	const tree = new Map<string, TreeNodeSnapshot>();
 	const activity = new Map<string, { turn?: number; turnStartedAt?: number; tools: string[] }>();
 	const eventOverrides = new Map<string, { ts: number; status?: TreeNodeSnapshot["status"]; phase?: string }>();

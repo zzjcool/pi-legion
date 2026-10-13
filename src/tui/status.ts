@@ -11,6 +11,8 @@ import {
 	hyperlink,
 	stripTerminalSequences,
 	truncateToWidth,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { isThinkingLevel } from "../shared/types.ts";
@@ -214,6 +216,12 @@ interface TreeStatusEntry {
 	children: TreeStatusEntry[];
 }
 
+type WidgetRow = { text: string; nodeId?: string };
+
+function widgetRow(text: string, nodeId?: string): WidgetRow {
+	return nodeId === undefined ? { text } : { text, nodeId };
+}
+
 const RUNNING_STATES = new Set(["starting", "working", "running"]);
 const ACTIVE_STATES = new Set([...RUNNING_STATES, "blocked"]);
 const TERMINAL_STATES = new Set([
@@ -340,7 +348,11 @@ function filterLiveTree(entries: StatusEntry[]): StatusEntry[] {
 	});
 }
 
-function renderTreeWidgetLines(entries: StatusEntry[], now: number, totals?: StatusTotals): string[] {
+function renderTreeWidgetLines(
+	entries: StatusEntry[],
+	now: number,
+	totals?: StatusTotals,
+): WidgetRow[] {
 	// The resident widget is a live-activity view: completed agents drop out
 	// once nothing in their subtree is still running (the centurion waiting on
 	// its squad counts as running and keeps the branch alive). Full history
@@ -359,7 +371,7 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number, totals?: Sta
 	const header = overviewBits.length > 0
 		? `⏳ Legion · ${liveEntries.length} agents · ${running} running · ${overviewBits.join(" · ")}`
 		: `⏳ Legion · ${liveEntries.length} agents · ${running} running`;
-	const lines = [header];
+	const lines: WidgetRow[] = [widgetRow(header)];
 	const activeMemo = new Map<string, boolean>();
 	const visited = new Set<string>();
 
@@ -373,8 +385,8 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number, totals?: Sta
 		const { entry } = node;
 		const activeSubtree = hasActiveSubtree(node, activeMemo);
 		// A terminal node whose subtree is still running is waiting on
-	// downstream work (e.g. a centurion between turns while its squad
-	// executes) — render it as "waiting" instead of a dead settled state.
+		// downstream work (e.g. a centurion between turns while its squad
+		// executes) — render it as "waiting" instead of a dead settled state.
 		const effectiveEntry = !isActiveEntry(entry) && activeSubtree
 			? { ...entry, state: "waiting" as const, herdrStatus: "waiting" as const }
 			: entry;
@@ -385,17 +397,21 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number, totals?: Sta
 			? osc8NodeLink(entry.nodeId, entry.name)
 			: cleanDisplayText(entry.name);
 		if (collapse) {
-			lines.push(
+			lines.push(widgetRow(
 				`${branch}▸ ${linkedName} +${descendantCount(node)} collapsed`,
-			);
+				entry.nodeId,
+			));
 			return;
 		}
 
 		const headline = headlineBits(effectiveEntry, now);
 		headline[0] = `${linkedName}${roleSuffix(effectiveEntry)}`;
-		lines.push(`${branch}● ${headline.join(" · ")}`);
+		lines.push(widgetRow(`${branch}● ${headline.join(" · ")}`, entry.nodeId));
 		const detailPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
-		lines.push(`${detailPrefix}  ⎿  ${detailBits(effectiveEntry, now).map(cleanDisplayText).join(" · ")}`);
+		lines.push(widgetRow(
+			`${detailPrefix}  ⎿  ${detailBits(effectiveEntry, now).map(cleanDisplayText).join(" · ")}`,
+			entry.nodeId,
+		));
 		const childPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
 		for (const [index, child] of node.children.entries()) {
 			visit(child, childPrefix, index === node.children.length - 1);
@@ -411,6 +427,28 @@ function renderTreeWidgetLines(entries: StatusEntry[], now: number, totals?: Sta
 	return lines;
 }
 
+function formatWidgetRows(entries: StatusEntry[], now: number, totals?: StatusTotals): WidgetRow[] {
+	if (entries.length === 0) return [];
+	if (entries.some((entry) => entry.nodeId !== undefined || entry.parentId !== undefined || entry.depth !== undefined)) {
+		return renderTreeWidgetLines(entries, now, totals);
+	}
+	if (entries.length === 1) {
+		return formatEntryLines(entries[0]!, now, { head: "", detail: "" })
+			.map((text) => ({ text }));
+	}
+	const rows: WidgetRow[] = [{ text: "● Async agents · herdr" }];
+	for (const [index, entry] of entries.entries()) {
+		const last = index === entries.length - 1;
+		rows.push(
+			...formatEntryLines(entry, now, {
+				head: last ? "└─ " : "├─ ",
+				detail: last ? "   " : "│  ",
+			}).map((text) => ({ text })),
+		);
+	}
+	return rows;
+}
+
 /**
  * Compact status roster. Entries carrying Legion identity render as a tree;
  * callers without tree metadata keep the historical flat format.
@@ -420,24 +458,7 @@ export function formatWidgetLines(
 	now: number,
 	totals?: StatusTotals,
 ): string[] {
-	if (entries.length === 0) return [];
-	if (entries.some((entry) => entry.nodeId !== undefined || entry.parentId !== undefined || entry.depth !== undefined)) {
-		return renderTreeWidgetLines(entries, now, totals);
-	}
-	if (entries.length === 1) {
-		return formatEntryLines(entries[0]!, now, { head: "", detail: "" });
-	}
-	const lines = [`● Async agents · herdr`];
-	for (const [index, entry] of entries.entries()) {
-		const last = index === entries.length - 1;
-		lines.push(
-			...formatEntryLines(entry, now, {
-				head: last ? "└─ " : "├─ ",
-				detail: last ? "   " : "│  ",
-			}),
-		);
-	}
-	return lines;
+	return formatWidgetRows(entries, now, totals).map((row) => row.text);
 }
 
 type Theme = {
@@ -451,6 +472,7 @@ export type WidgetFactory = (
 	theme: Theme,
 ) => {
 	render: (width?: number) => string[];
+	handleMouse: (event: TuiMouseEvent) => TuiMouseEventResult | undefined;
 	dispose?: () => void;
 };
 
@@ -514,15 +536,26 @@ export interface StatusBoard {
  * Calling `setWidget` on the tool-execute context after it returns is a
  * no-op (stale ctx). The factory keeps a TUI handle that outlives that ctx.
  */
-export function createStatusBoard(): StatusBoard {
+export function createStatusBoard(options: { onNodeClick?: (nodeId: string) => void } = {}): StatusBoard {
 	let ctx: StatusUi | undefined;
 	let ui: StatusUi["ui"] | undefined;
 	let entries: StatusEntry[] = [];
 	let registered = false;
 	let tui: WidgetTui | undefined;
 
-	const renderLines = (now: number, theme: Theme): string[] =>
-		themeLines(formatWidgetLines(visiblePanelEntries(entries), now, statusTotals(entries)), theme);
+	const renderLines = (now: number, theme: Theme): {
+		lines: string[];
+		nodeIdsByRow: Array<string | undefined>;
+	} => {
+		const visible = visiblePanelEntries(entries);
+		const totals = statusTotals(entries);
+		const rows = formatWidgetRows(visible, now, totals);
+		const nodeIdsByRow = rows.map((row) => row.nodeId);
+		return {
+			lines: themeLines(formatWidgetLines(visible, now, totals), theme),
+			nodeIdsByRow,
+		};
+	};
 
 	const safe = (fn: () => void): void => {
 		try {
@@ -560,8 +593,32 @@ export function createStatusBoard(): StatusBoard {
 				STATUS_WIDGET_KEY,
 				(nextTui, theme) => {
 					tui = nextTui;
+					let nodeIdsByRow: Array<string | undefined> = [];
+					let latchedNodeId: string | undefined;
 					return {
-						render: (width) => fitLines(renderLines(Date.now(), theme), width),
+						render: (width) => {
+							const rendered = renderLines(Date.now(), theme);
+							// Build the identity map before styling or width fitting can change the display rows.
+							nodeIdsByRow = rendered.nodeIdsByRow;
+							return fitLines(rendered.lines, width);
+						},
+						handleMouse: (event) => {
+							if (event.type === "press") {
+								latchedNodeId = undefined;
+								if (event.button !== "left") return undefined;
+								const nodeId = nodeIdsByRow[event.y];
+								if (nodeId === undefined) return undefined;
+								latchedNodeId = nodeId;
+								return { handled: true };
+							}
+							if (event.type !== "click" || event.button !== "left") return undefined;
+							const nodeId = nodeIdsByRow[event.y];
+							if (latchedNodeId === undefined || nodeId !== latchedNodeId) return undefined;
+							const clickedNodeId = latchedNodeId;
+							latchedNodeId = undefined;
+							options.onNodeClick?.(clickedNodeId);
+							return { handled: true };
+						},
 						dispose: () => {
 							if (tui === nextTui) {
 								tui = undefined;
