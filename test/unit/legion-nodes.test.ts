@@ -50,6 +50,34 @@ test("node slugs use the REV-4 grammar, normalize hostile names, and cannot cont
 	assert.notEqual(nodeIdForChild("root", "a.b"), nodeIdForChild("root.a", "b"));
 });
 
+test("subtree recursive query defaults to the 64-level corruption guard", () => {
+	const bindings: unknown[][] = [];
+	const fakeDb = {
+		prepare() {
+			return {
+				all(...parameters: unknown[]) {
+					bindings.push(parameters);
+					return [];
+				},
+			};
+		},
+	};
+	assert.deepEqual(getSubtree(fakeDb as never, "root"), []);
+	assert.equal(bindings[0]?.[1], 64);
+});
+
+test("subtree query terminates on a corrupt cycle at its default depth cap", () => {
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root" });
+		const child = insertNode(db, { parentId: "root", name: "child", role: "worker" });
+		db.prepare("UPDATE nodes SET parent_id = ? WHERE id = ?").run(child.id, "root");
+		assert.equal(getSubtree(db, "root").length, 65);
+	} finally {
+		db.close();
+	}
+});
+
 test("legion nodes enforce parent-local duplicate names and find helpers", () => {
 	const db = openLegionDb(":memory:");
 	try {

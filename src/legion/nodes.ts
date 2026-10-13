@@ -2,6 +2,7 @@ import type { DatabaseSync, SqliteRow } from "./db.ts";
 import { withTransaction } from "./db.ts";
 
 const NODE_SLUG_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+export const DEFAULT_SUBTREE_MAX_DEPTH = 64;
 
 export const NODE_STATUSES = [
 	"starting",
@@ -260,7 +261,7 @@ export function getSubtree(
 	rootId: string,
 	options: { maxDepth?: number; includeRoot?: boolean } = {},
 ): LegionNode[] {
-	const maxDepth = options.maxDepth ?? Number.MAX_SAFE_INTEGER;
+	const maxDepth = options.maxDepth ?? DEFAULT_SUBTREE_MAX_DEPTH;
 	if (!Number.isSafeInteger(maxDepth) || maxDepth < 0) {
 		throw new TypeError("maxDepth must be a non-negative safe integer");
 	}
