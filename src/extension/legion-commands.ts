@@ -431,7 +431,10 @@ export function registerLegionCommand(
 							openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, nodeId);
 						}
 					},
-				}));
+				}), {
+					overlay: true,
+					overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 },
+				});
 				return;
 			}
 			if (query) {

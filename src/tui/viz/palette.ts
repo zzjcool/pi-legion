@@ -13,6 +13,7 @@ export interface VizTheme {
 }
 
 export const ROLE_TOKENS: Readonly<Record<string, string>> = {
+	root: "accent",
 	centurion: "accent",
 	planner: "syntaxKeyword",
 	worker: "syntaxVariable",

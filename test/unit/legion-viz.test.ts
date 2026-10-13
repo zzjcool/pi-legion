@@ -7,7 +7,7 @@ import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
 import { assignLanes, liveAt, maxLanesFor, renderRailway } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { buildLog, computeStats } from "../../src/tui/viz/panels.ts";
-import { handleViewKey, initialViewState, renderLegionView } from "../../src/tui/viz/view.ts";
+import { createLegionViewFactory, handleViewKey, initialViewState, renderLegionView } from "../../src/tui/viz/view.ts";
 import { ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
 
@@ -268,4 +268,28 @@ test("status board: railway strip replaces the roster when enabled and hides wit
 	assert.ok(snap.rate > 0);
 	board.paint(entries.slice(0, 1), now + 1000);
 	board.clear();
+});
+
+test("rate: chart buckets are trailing 60s averages (bursts smoothed, last bucket == header now)", () => {
+	const sampler = new RateSampler();
+	// Session-file token counts arrive in bursts: +6000 tokens in one refresh.
+	for (let t = 0; t <= 240; t += 2) sampler.record(sec(t), [ROOT, node("a", { tokens: t >= 120 ? 6000 : 0 })]);
+	const b = sampler.buckets(sec(0), sec(240), 120);
+	assert.ok(Math.max(...b.total) <= 6000 / 60 + 1e-6, `peak ${Math.max(...b.total)}`);
+	const now = sec(170);
+	const last = sampler.buckets(sec(0), now, 85).total.at(-1)!;
+	assert.ok(Math.abs(last - sampler.totalRate(now)) < 1e-6);
+});
+
+test("legion view: root is not listed as an agent type and the factory fills the terminal height", () => {
+	const { nodes, sampler, now } = scenario();
+	const data = { nodes: nodes.map((n) => n.id === "root" ? { ...n, name: "root", role: "root" } : n), sampler, now, rate: sampler.totalRate(now) };
+	const { canvas } = renderLegionView(data, initialViewState(), 160, 50);
+	const legend = canvas.toPlain().find((l) => l.includes("⣿ worker"))!;
+	assert.ok(!legend.includes("⣿ root"), legend);
+	assert.equal(roleToken("root"), "accent");
+	const factory = createLegionViewFactory({ getData: () => data });
+	const component = factory({ requestRender() {}, terminal: { rows: 37 } }, plainTheme, undefined, () => {});
+	assert.equal(component.render(100).length, 37);
+	component.dispose();
 });

@@ -181,7 +181,8 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 		};
 		return {
 			render(width: number): string[] {
-				const rows = Math.max(6, (tui.terminal.rows ?? 24) - 1);
+				// Rendered as a full-screen overlay: own the whole terminal height.
+				const rows = Math.max(6, tui.terminal.rows ?? 24);
 				return renderLegionView(options.getData(), state, width, rows).canvas.toLines(theme);
 			},
 			handleInput(data: string): void {

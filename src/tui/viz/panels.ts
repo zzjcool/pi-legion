@@ -244,7 +244,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	const ly = r.y + r.h - 1;
 	let lx = r.x + 1;
 	const roles: string[] = [];
-	for (const node of dfsOrder(nodes)) if (!roles.includes(node.role)) roles.push(node.role);
+	for (const node of dfsOrder(nodes)) if (isAgent(node) && !roles.includes(node.role)) roles.push(node.role);
 	for (const role of roles) {
 		const w = Array.from(role).length + 4;
 		if (lx + w > r.x + r.w - 1) break;

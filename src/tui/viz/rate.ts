@@ -108,39 +108,40 @@ export class RateSampler {
 		return [...this.series.keys()];
 	}
 
-	/** Bucketed tok/s for [from, to], stacked by role. */
-	buckets(from: number, to: number, count: number): RateSeries {
+	/**
+	 * Bucketed tok/s for [from, to], stacked by role. Each bucket is the
+	 * trailing-window average ending at the bucket edge (window = max(bucket
+	 * span, RATE_WINDOW_MS)), so the last bucket equals the header "now" and
+	 * bursty per-turn token flushes do not render as spikes.
+	 */
+	buckets(from: number, to: number, count: number, windowMs = RATE_WINDOW_MS): RateSeries {
 		const n = Math.max(1, Math.floor(count));
 		const span = Math.max(1, to - from);
 		const times = Array.from({ length: n }, (_, i) => from + (span * (i + 1)) / n);
 		const byRole = new Map<string, number[]>();
 		const total = new Array<number>(n).fill(0);
-		for (const s of this.series.values()) {
+		for (const [id, s] of this.series) {
 			const row = byRole.get(s.role) ?? new Array<number>(n).fill(0);
-			let prev = interpolate(s, from);
+			const rates = this.nodeBuckets(id, from, to, n, windowMs);
 			for (let i = 0; i < n; i++) {
-				const value = interpolate(s, times[i]!);
-				const rate = Math.max(0, (value - prev) / (span / n / 1000));
-				row[i] = row[i]! + rate;
-				total[i] = total[i]! + rate;
-				prev = value;
+				row[i] = row[i]! + rates[i]!;
+				total[i] = total[i]! + rates[i]!;
 			}
 			byRole.set(s.role, row);
 		}
 		return { times, byRole, total };
 	}
 
-	nodeBuckets(nodeId: string, from: number, to: number, count: number): number[] {
+	nodeBuckets(nodeId: string, from: number, to: number, count: number, windowMs = RATE_WINDOW_MS): number[] {
 		const s = this.series.get(nodeId);
 		const n = Math.max(1, Math.floor(count));
 		if (!s) return new Array<number>(n).fill(0);
 		const span = Math.max(1, to - from);
+		const w = Math.max(span / n, windowMs, 1);
 		const out: number[] = [];
-		let prev = interpolate(s, from);
 		for (let i = 0; i < n; i++) {
-			const value = interpolate(s, from + (span * (i + 1)) / n);
-			out.push(Math.max(0, (value - prev) / (span / n / 1000)));
-			prev = value;
+			const t = from + (span * (i + 1)) / n;
+			out.push(Math.max(0, (interpolate(s, t) - interpolate(s, t - w)) / (w / 1000)));
 		}
 		return out;
 	}
