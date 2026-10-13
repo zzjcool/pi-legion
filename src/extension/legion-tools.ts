@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createCappedOutput, resolveMaxOutputBytes } from "../shared/output-cap.ts";
+import { acquireVerifySlot, queueNote, resolveVerifyQueueConfig } from "../runs/verify-queue.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -700,7 +701,20 @@ export async function runVerification(
 	return { passed, commandCount: commands.length, outputFile, message: passed ? "verification passed" : "verification failed" };
 }
 
-export function runLegionCommand(command: string, cwd: string, timeoutMs: number): Promise<LegionCommandResult> {
+/** legion-verify command behind the tree-wide verify queue (wait not charged to timeout). */
+export async function runLegionCommand(command: string, cwd: string, timeoutMs: number): Promise<LegionCommandResult> {
+	const config = resolveVerifyQueueConfig();
+	const slot = await acquireVerifySlot(command, config);
+	try {
+		const result = await runLegionCommandNow(command, cwd, timeoutMs);
+		const note = queueNote(slot, config.limit);
+		return note ? { ...result, stderr: `${note}${result.stderr}` } : result;
+	} finally {
+		slot.release();
+	}
+}
+
+export function runLegionCommandNow(command: string, cwd: string, timeoutMs: number): Promise<LegionCommandResult> {
 	const limit = timeoutMs > 0 ? timeoutMs : 600_000;
 	return new Promise((resolve) => {
 		let timedOut = false;

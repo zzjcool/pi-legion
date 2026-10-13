@@ -13,6 +13,7 @@
 
 import { spawn } from "node:child_process";
 import { createCappedOutput, resolveMaxOutputBytes } from "../shared/output-cap.ts";
+import { acquireVerifySlot, queueNote, resolveVerifyQueueConfig } from "./verify-queue.ts";
 import type {
 	AcceptanceCriterion,
 	AcceptanceResult,
@@ -86,7 +87,29 @@ export function verifyCommandOf(
 	return undefined;
 }
 
-export function defaultVerifyRunner(
+/**
+ * Default verify runner: waits for a tree-wide verify slot (see
+ * verify-queue.ts), then runs the command with its full timeout — queue wait
+ * is not charged against `timeoutMs`.
+ */
+export async function defaultVerifyRunner(
+	command: string,
+	cwd: string,
+	timeoutMs: number = DEFAULT_VERIFY_TIMEOUT_MS,
+): Promise<CommandResult> {
+	const config = resolveVerifyQueueConfig();
+	const slot = await acquireVerifySlot(command, config);
+	try {
+		const result = await runVerifyCommand(command, cwd, timeoutMs);
+		const note = queueNote(slot, config.limit);
+		return note ? { ...result, stderr: `${note}${result.stderr}` } : result;
+	} finally {
+		slot.release();
+	}
+}
+
+/** Run one verify command now (no queue), output-capped and timed out. */
+export function runVerifyCommand(
 	command: string,
 	cwd: string,
 	timeoutMs: number = DEFAULT_VERIFY_TIMEOUT_MS,

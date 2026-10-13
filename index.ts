@@ -55,6 +55,7 @@ import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
 import { restoreHostNodeOptions } from "./src/supervisor/child-memory.ts";
+import { setVerifyQueueListener } from "./src/runs/verify-queue.ts";
 import { applyEventRetention, checkpoint, formatHygieneReport, hygieneEnabled, runStartupHygiene } from "./src/runs/hygiene.ts";
 import {
 	createStatusNodeOpener,
@@ -476,6 +477,15 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";
 	if (isChild) restoreHostNodeOptions();
+	else {
+		// Root UI: surface verify-queue waits instead of a silent stall.
+		setVerifyQueueListener((event) => {
+			try {
+				if (event.phase === "waiting") lastUi?.setStatus("legion-verify", `verify queued ${Math.round(event.waitedMs / 1000)}s · ${event.holders}/${event.limit} slots busy`);
+				else lastUi?.setStatus("legion-verify", undefined);
+			} catch { /* no UI */ }
+		});
+	}
 	const supervisor = deps.supervisor ?? new RpcSupervisor({
 		onSpawnRefused: (message) => {
 			try { lastUi?.notify(`pi-legion: ${message}`, "error"); } catch { /* no UI (child / print mode) */ }
