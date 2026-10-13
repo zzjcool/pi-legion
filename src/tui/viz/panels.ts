@@ -3,7 +3,7 @@
 import { Canvas, ellipsize } from "./canvas.ts";
 import type { Rect } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
-import { nodeToken, roleToken } from "./palette.ts";
+import { nodeToken, roleColor } from "./palette.ts";
 import type { RateSampler } from "./rate.ts";
 
 export type Pane = "galaxy" | "chart" | "log";
@@ -157,7 +157,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 		const b = pos.get(node.id);
 		if (!a || !b) continue;
 		const dist = Math.hypot(b[0] - a[0], b[1] - a[1]);
-		const col = node.status === "running" ? roleToken(node.role) : node.status === "failed" ? "error" : "borderMuted";
+		const col = node.status === "running" ? roleColor(node.role) : node.status === "failed" ? "error" : "borderMuted";
 		for (let t = 0; t < dist; t += 1.7) dot(a[0] + ((b[0] - a[0]) * t) / dist, a[1] + ((b[1] - a[1]) * t) / dist, col, 1);
 	}
 	const maxTokens = Math.max(1, ...nodes.map((node) => node.tokens));
@@ -167,7 +167,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 		if (!p) continue;
 		const [x, y] = p;
 		const isCenter = node === center;
-		const col = isCenter ? roleToken(node.role) : nodeToken(node);
+		const col = isCenter ? roleColor(node.role) : nodeToken(node);
 		let rad = isCenter ? Math.max(2, Math.min(5, PH / 14)) : Math.max(node.status === "failed" ? 1.5 : 0.8, 0.8 + Math.sqrt(node.tokens / maxTokens) * Math.min(4, PH / 16));
 		radii.set(node.id, rad);
 		if (node.status === "running" && !isCenter) {
@@ -234,7 +234,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 				const sx = side > 0 ? lx + rw : lx - rw - len;
 				if (!free(sx, ly + dy, len)) continue;
 				const selected = node.id === selectedId;
-				cv.text(sx, ly + dy, label, node === center ? roleToken(node.role) : nodeToken(node), { bold: true, inverse: selected });
+				cv.text(sx, ly + dy, label, node === center ? roleColor(node.role) : nodeToken(node), { bold: true, inverse: selected });
 				occupied.push({ x: sx, y: ly + dy, w: len });
 				placed = true;
 			}
@@ -248,7 +248,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	for (const role of roles) {
 		const w = Array.from(role).length + 4;
 		if (lx + w > r.x + r.w - 1) break;
-		cv.set(lx, ly, "⣿", roleToken(role));
+		cv.set(lx, ly, "⣿", roleColor(role));
 		cv.text(lx + 2, ly, role, "dim");
 		lx += w;
 	}
@@ -345,10 +345,10 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 			const y = axisY - 1 - j;
 			if (top >= j + 1) {
 				const band = bands.find((b) => b.top >= center) ?? bands[bands.length - 1];
-				if (band) cv.set(plotX + i, y, "█", roleToken(band.role));
+				if (band) cv.set(plotX + i, y, "█", roleColor(band.role));
 			} else if (top > j) {
 				const eighth = Math.round((top - j) * 8);
-				if (eighth > 0) cv.set(plotX + i, y, PARTIAL[eighth]!, roleToken(bands[bands.length - 1]?.role ?? "worker"));
+				if (eighth > 0) cv.set(plotX + i, y, PARTIAL[eighth]!, roleColor(bands[bands.length - 1]?.role ?? "worker"));
 				break;
 			}
 		}
@@ -393,7 +393,7 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 		const rate = data.sampler.nodeRate(selected.id, data.now);
 		const share = stats.total > 0 ? (selected.tokens / stats.total) * 100 : 0;
 		return [
-			[`▸ ${selected.name}`, roleToken(selected.role)],
+			[`▸ ${selected.name}`, roleColor(selected.role)],
 			[`${formatCount(rate)} tok/s now · ${formatCount(selected.tokens)} tok`, "text"],
 			[`${share.toFixed(1)}% of run · ━ bright line`, "dim"],
 		];
@@ -418,9 +418,9 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 		const top = stats.byRole[0]?.tokens ?? 1;
 		for (const entry of stats.byRole.slice(0, Math.max(0, roomForRoles))) {
 			const name = ellipsize(entry.role, 10);
-			cv.text(sx, y, name, roleToken(entry.role));
+			cv.text(sx, y, name, roleColor(entry.role));
 			const barW = Math.max(0, Math.round((entry.tokens / Math.max(1, top)) * 9));
-			cv.text(sx + 11, y, "▆".repeat(barW), roleToken(entry.role));
+			cv.text(sx + 11, y, "▆".repeat(barW), roleColor(entry.role));
 			const t = formatCount(entry.tokens);
 			cv.text(r.x + r.w - t.length, y, t, "dim");
 			y++;
@@ -438,7 +438,7 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 				const pct = stats.total > 0 ? Math.round((entry.tokens / stats.total) * 100) : 0;
 				const label = `${entry.role} ${pct}%`;
 				if (x + label.length + 2 > r.x + r.w) break;
-				cv.set(x, y, "■", roleToken(entry.role));
+				cv.set(x, y, "■", roleColor(entry.role));
 				cv.text(x + 2, y, label, "dim");
 				x += label.length + 4;
 			}
@@ -507,14 +507,14 @@ export function drawLog(
 		if (r.w > timeW + graphW + 10) {
 			for (let d = 1; d < Math.min(event.node.depth, graphW / 2 + 1); d++) cv.set(gx + (d - 1) * 2, y, "│", "borderMuted");
 			const dx = gx + Math.min(event.node.depth - 1, graphW / 2 - 1) * 2;
-			cv.set(dx, y, event.kind === "spawn" ? "●" : "┘", event.kind === "spawn" ? roleToken(event.node.role) : "borderMuted");
+			cv.set(dx, y, event.kind === "spawn" ? "●" : "┘", event.kind === "spawn" ? roleColor(event.node.role) : "borderMuted");
 		}
 		const tx = r.w > timeW + graphW + 10 ? gx + graphW + 1 : gx;
 		const [glyph, glyphCol] = KIND_GLYPH[event.kind];
 		cv.set(tx, y, glyph, glyphCol, { bold: true });
 		const nameW = Math.min(16, Math.max(6, Math.floor((r.x + r.w - tx - 2) * 0.45)));
 		const name = ellipsize(event.node.name, nameW);
-		cv.text(tx + 2, y, name, dim ? "dim" : roleToken(event.node.role), { bold: !dim, inverse: isCursor });
+		cv.text(tx + 2, y, name, dim ? "dim" : roleColor(event.node.role), { bold: !dim, inverse: isCursor });
 		const detail = event.kind === "spawn"
 			? `${event.parentName ?? "root"} → ${event.node.role}`
 			: `${event.kind === "settled" ? "done" : event.kind} · ${formatCount(event.node.tokens)} tok`;

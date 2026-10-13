@@ -4,7 +4,7 @@ import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { Canvas, ellipsize } from "./canvas.ts";
 import { computeLayout, type LayoutKind } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
-import { roleToken, type VizTheme } from "./palette.ts";
+import { roleColor, type VizTheme } from "./palette.ts";
 import { buildLog, dfsOrder, drawChart, drawGalaxy, drawLog, frame, type Pane, type ViewData } from "./panels.ts";
 
 export interface LegionViewState {
@@ -49,14 +49,14 @@ export function renderLegionView(data: ViewData, state: LegionViewState, cols: n
 		cv.text(0, 1, ellipsize(parts.join(" · "), W), "dim");
 		if (badge) {
 			const b = ellipsize(badge, Math.max(0, W - 12 - Array.from(root?.name ?? "").length));
-			if (b.length > 4) cv.text(W - Array.from(b).length, 0, b, roleToken(selected!.role), { inverse: true });
+			if (b.length > 4) cv.text(W - Array.from(b).length, 0, b, roleColor(selected!.role), { inverse: true });
 		}
 	} else {
 		let x = cv.text(0, 0, "⚔ /legion ", "accent", { bold: true });
 		x = cv.text(x, 0, `${root?.name ?? "legion"}  `, "text", { bold: true });
 		const badgeW = Array.from(badge).length;
 		cv.text(x, 0, ellipsize(parts.join(" · "), Math.max(0, W - x - badgeW - 1)), "dim");
-		if (badge) cv.text(Math.max(0, W - badgeW), 0, ellipsize(badge, W), roleToken(selected!.role), { inverse: true });
+		if (badge) cv.text(Math.max(0, W - badgeW), 0, ellipsize(badge, W), roleColor(selected!.role), { inverse: true });
 	}
 
 	const galaxyInner = frame(cv, layout.galaxy, portrait ? "galaxy" : "galaxy · structure", state.focus === "galaxy");

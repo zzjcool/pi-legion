@@ -560,7 +560,19 @@ export function createStatusBoard(options: {
 	onNodeClick?: (nodeId: string) => void;
 	strip?: StatusStripStyle;
 	sampler?: RateSampler;
+	/** Railway repaint cadence while a subagent is live (default 1000ms). */
+	tickMs?: number;
+	setInterval?: (fn: () => void, ms: number) => unknown;
+	clearInterval?: (handle: unknown) => void;
 } = {}): StatusBoard {
+	const tickMs = options.tickMs ?? 1000;
+	const startInterval = options.setInterval ?? ((fn: () => void, ms: number) => {
+		const handle = setInterval(fn, ms);
+		(handle as { unref?: () => void }).unref?.();
+		return handle;
+	});
+	const stopInterval = options.clearInterval ?? ((handle: unknown) => clearInterval(handle as ReturnType<typeof setInterval>));
+	let ticker: unknown;
 	const sampler = options.sampler ?? new RateSampler();
 	const strip: StatusStripStyle = options.strip ?? "tree";
 	let ctx: StatusUi | undefined;
@@ -595,7 +607,23 @@ export function createStatusBoard(options: {
 		}
 	};
 
+	const hasLiveAgent = (): boolean => nodesFromEntries(entries).some((node) => node.status === "running" && node.parentId !== null && node.id !== "root");
+	const stopTicker = (): void => {
+		if (ticker !== undefined) stopInterval(ticker);
+		ticker = undefined;
+	};
+	/** Railway clocks, lanes and tok/s advance with time: repaint every tickMs while anything is live, never when idle. */
+	const syncTicker = (): void => {
+		if (strip !== "railway" || !registered || !tui || !hasLiveAgent()) return stopTicker();
+		if (ticker !== undefined) return;
+		ticker = startInterval(() => {
+			if (!registered || !tui || !hasLiveAgent()) return stopTicker();
+			tui.requestRender();
+		}, tickMs);
+	};
+
 	const dropWidget = (): void => {
+		stopTicker();
 		if (registered && ui) {
 			safe(() => ui!.setWidget(STATUS_WIDGET_KEY, undefined));
 		}
@@ -616,6 +644,7 @@ export function createStatusBoard(options: {
 		}
 		if (registered && tui) {
 			tui.requestRender();
+			syncTicker();
 			return;
 		}
 		safe(() => {
@@ -651,6 +680,7 @@ export function createStatusBoard(options: {
 						},
 						dispose: () => {
 							if (tui === nextTui) {
+								stopTicker();
 								tui = undefined;
 								registered = false;
 							}
@@ -661,6 +691,7 @@ export function createStatusBoard(options: {
 			);
 			registered = true;
 		});
+		syncTicker();
 	};
 
 	return {

@@ -1,6 +1,6 @@
 /** Tiny cell grid: every cell is one terminal column wide, so widths are exact. */
 
-import type { VizTheme } from "./palette.ts";
+import { ROLE_COLOR_PREFIX, resolveRolePalette, type VizTheme } from "./palette.ts";
 
 export interface Cell {
 	ch: string;
@@ -44,8 +44,19 @@ export class Canvas {
 		return col;
 	}
 
-	toLines(theme: VizTheme): string[] {
-		return this.cells.map((row) => renderRow(row, theme));
+	/** Agent types referenced by deferred `role:` colors in this canvas. */
+	roles(): Set<string> {
+		const roles = new Set<string>();
+		for (const row of this.cells) for (const cell of row) {
+			if (cell.color?.startsWith(ROLE_COLOR_PREFIX)) roles.add(cell.color.slice(ROLE_COLOR_PREFIX.length));
+		}
+		return roles;
+	}
+
+	toLines(theme: VizTheme, palette = resolveRolePalette(theme, this.roles())): string[] {
+		const resolve = (color: string | undefined): string | undefined =>
+			color?.startsWith(ROLE_COLOR_PREFIX) ? palette.get(color.slice(ROLE_COLOR_PREFIX.length)) ?? "text" : color;
+		return this.cells.map((row) => renderRow(row.map((cell) => cell.color?.startsWith(ROLE_COLOR_PREFIX) ? { ...cell, color: resolve(cell.color) } : cell), theme));
 	}
 
 	toPlain(): string[] {

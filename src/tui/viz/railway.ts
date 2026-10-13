@@ -9,7 +9,7 @@
 
 import { Canvas, ellipsize } from "./canvas.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
-import { roleToken, type VizTheme } from "./palette.ts";
+import { roleColor, type VizTheme } from "./palette.ts";
 
 export const RAIL_MAX_LANES = 4;
 export const RAIL_MAX_LANES_NARROW = 3;
@@ -92,7 +92,7 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	const tc = (c: number): number => now - windowMs + (c + 1) * dt;
 	const canvas = new Canvas(width, rows + 1);
 	const byId = new Map(nodes.map((node) => [node.id, node]));
-	const color = (node: VizNode): string => roleToken(node.role);
+	const color = (node: VizNode): string => roleColor(node.role);
 
 	// rowsAt[c+1] = lane map at column c (c = -1 is the column before the window).
 	const rowsAt: Array<Map<string, number>> = [];

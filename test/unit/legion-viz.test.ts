@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
-import { FALLBACK_TOKENS, nodeToken, roleToken } from "../../src/tui/viz/palette.ts";
+import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleToken } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
 import { assignLanes, liveAt, maxLanesFor, renderRailway } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
@@ -76,7 +76,7 @@ test("viz: role colors are theme tokens; unknown roles pick a stable syntax toke
 	assert.equal(roleToken("quantum-tinkerer"), custom);
 	assert.equal(nodeToken({ role: "worker", status: "failed" }), "error");
 	assert.equal(nodeToken({ role: "worker", status: "retired" }), "dim");
-	assert.equal(nodeToken({ role: "worker", status: "settled" }), "syntaxVariable");
+	assert.equal(nodeToken({ role: "worker", status: "settled" }), "role:worker");
 });
 
 test("viz: nodesFromEntries keeps tree identity and reattaches orphans", () => {
@@ -307,4 +307,109 @@ test("viz: duplicate child names from nested supervisors are disambiguated by pa
 	];
 	const names = nodesFromEntries(entries).map((n) => n.name);
 	assert.deepEqual(names, ["root", "centurion-0", "scout-0", "centurion-0/scout-0"]);
+});
+
+// ---- per-type colors with pi's real themes -------------------------------------------------
+const PI_THEME_DIR = new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/", import.meta.url);
+async function loadPiTheme(kind: "dark" | "system"): Promise<any | undefined> {
+	try {
+		const th = await import(new URL("theme.js", PI_THEME_DIR).href);
+		if (kind === "dark") return th.loadThemeFromPath(new URL("dark.json", PI_THEME_DIR).pathname, "truecolor");
+		const sys = await import(new URL("system-theme.js", PI_THEME_DIR).href);
+		const { colors } = sys.generateSystemThemeColors({});
+		const fs = await import("node:fs");
+		const os = await import("node:os");
+		const path = `${os.tmpdir()}/pi-legion-viz-system-theme-${process.pid}.json`;
+		fs.writeFileSync(path, JSON.stringify({ name: "system-test", colors }));
+		return th.loadThemeFromPath(path, "truecolor");
+	} catch {
+		return undefined;
+	}
+}
+
+function laneColorsByRole(lines: string[], names: Record<string, string>): Map<string, string> {
+	const out = new Map<string, string>();
+	for (const line of lines) {
+		for (const [name, role] of Object.entries(names)) {
+			const m = line.match(new RegExp(`(\\x1b\\[[0-9;]*m)(?:\\x1b\\[1m)?${name}`)) ?? line.match(new RegExp(`(\\x1b\\[38;[0-9;]*m)[^\\x1b]*${name}`));
+			if (m) out.set(role, m[1]!);
+		}
+	}
+	return out;
+}
+
+const TYPED = [ROOT,
+	node("centurion-0", { role: "centurion", startedAt: sec(0) }),
+	node("scout-0", { role: "scout", startedAt: sec(1) }),
+	node("worker-0", { role: "worker", startedAt: sec(2) }),
+	node("reviewer-0", { role: "reviewer", startedAt: sec(3) }),
+];
+const TYPED_NAMES = { "centurion-0": "centurion", "scout-0": "scout", "worker-0": "worker", "reviewer-0": "reviewer" };
+
+for (const kind of ["dark", "system"] as const) {
+	test(`railway: every agent type gets a distinct ANSI color with pi's real ${kind} theme`, async (t) => {
+		const theme = await loadPiTheme(kind);
+		if (!theme) return t.skip("pi-coding-agent themes not installed");
+		const out = renderRailway({ nodes: TYPED, now: sec(60), width: 140, rate: 100 })!;
+		const lines = out.canvas.toLines(theme);
+		const colors = laneColorsByRole(lines, TYPED_NAMES);
+		assert.equal(colors.size, 4, JSON.stringify([...colors]));
+		assert.equal(new Set(colors.values()).size, 4, `colors collide: ${JSON.stringify([...colors])}`);
+		// The palette-index tier only has ~6 hues (minus error/dim), so check the five most common types there.
+		const roles = kind === "dark"
+			? ["centurion", "scout", "worker", "reviewer", "advisor", "planner", "x-custom"]
+			: ["centurion", "scout", "worker", "reviewer", "planner"];
+		const palette = resolveRolePalette(theme, roles);
+		const ansi = [...palette.values()].map((token) => theme.getFgAnsi(token));
+		assert.equal(new Set(ansi).size, palette.size, JSON.stringify([...palette]));
+		assert.equal(palette.get("centurion"), "accent");
+		if (kind === "dark") {
+			assert.equal(palette.get("scout"), "syntaxNumber");
+			assert.equal(palette.get("worker"), "syntaxVariable");
+			assert.equal(palette.get("reviewer"), "syntaxFunction");
+			assert.equal(palette.get("advisor"), "syntaxString");
+			assert.equal(palette.get("planner"), "syntaxKeyword");
+		} else {
+			// system theme without a reported palette: accent and syntaxNumber are both ANSI 5.
+			assert.equal(theme.getFgAnsi("accent"), theme.getFgAnsi("syntaxNumber"));
+			assert.notEqual(palette.get("scout"), "syntaxNumber");
+		}
+		// The /legion view uses the same resolution.
+		const sampler = new RateSampler();
+		const view = renderLegionView({ nodes: TYPED, sampler, now: sec(60), rate: 0 }, initialViewState(), 160, 50).canvas.toLines(theme);
+		const viewColors = laneColorsByRole(view, TYPED_NAMES);
+		assert.equal(new Set(viewColors.values()).size, viewColors.size);
+	});
+}
+
+test("status board: railway repaints every second while a subagent is live and stops when idle", () => {
+	const intervals = new Map<number, () => void>();
+	let nextId = 1;
+	let renders = 0;
+	let factory: WidgetFactory | undefined;
+	const board = createStatusBoard({
+		strip: "railway",
+		setInterval: (fn, ms) => {
+			assert.equal(ms, 1000);
+			intervals.set(nextId, fn);
+			return nextId++;
+		},
+		clearInterval: (id) => intervals.delete(id as number),
+	});
+	board.bind({ hasUI: true, ui: { theme: plainTheme, setStatus() {}, setWidget(_k, content) { factory = typeof content === "function" ? content : undefined; } } });
+	const now = Date.now();
+	const live: StatusEntry[] = [
+		{ name: "root", agent: "root", state: "running", startedAt: now, nodeId: "root", parentId: null, depth: 0 },
+		{ name: "scout-0", agent: "scout", state: "running", startedAt: now, nodeId: "root.s", parentId: "root", depth: 1 },
+	];
+	board.paint(live, now);
+	factory!({ requestRender() { renders++; } }, plainTheme).render(100);
+	board.paint(live, now + 500);
+	assert.equal(intervals.size, 1);
+	const before = renders;
+	[...intervals.values()][0]!();
+	assert.equal(renders, before + 1);
+	board.paint(live.map((e) => e.nodeId === "root.s" ? { ...e, state: "settled", finishedAt: now + 900 } : e), now + 1000);
+	assert.equal(intervals.size, 0, "ticker must stop when no subagent is live");
+	board.clear();
 });
