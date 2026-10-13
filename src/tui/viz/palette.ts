@@ -83,7 +83,7 @@ export const DISTINCT_FALLBACK_TOKENS = [
 	"bashMode",
 ] as const;
 
-/** ANSI prefix a token renders with (used to detect identical-looking tokens). */
+/** ANSI prefix a token renders with. */
 export function tokenAnsi(theme: VizTheme, token: string): string {
 	try {
 		if (typeof theme.getFgAnsi === "function") return theme.getFgAnsi(token);
@@ -91,6 +91,58 @@ export function tokenAnsi(theme: VizTheme, token: string): string {
 	} catch {
 		return `?${token}`;
 	}
+}
+
+type Swatch = { kind: "rgb"; l: number; a: number; b: number } | { kind: "key"; key: string };
+
+function xterm256(n: number): [number, number, number] {
+	if (n >= 232) {
+		const v = 8 + 10 * (n - 232);
+		return [v, v, v];
+	}
+	const i = n - 16;
+	const step = [0, 95, 135, 175, 215, 255];
+	return [step[Math.floor(i / 36)]!, step[Math.floor(i / 6) % 6]!, step[i % 6]!];
+}
+
+function oklab(r: number, g: number, b: number): Swatch {
+	const lin = (c: number) => {
+		const v = c / 255;
+		return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+	};
+	const [R, G, B] = [lin(r), lin(g), lin(b)];
+	const l = Math.cbrt(0.4122214708 * R + 0.5363325363 * G + 0.0514459929 * B);
+	const m = Math.cbrt(0.2119034982 * R + 0.6806995451 * G + 0.1073969566 * B);
+	const s = Math.cbrt(0.0883024619 * R + 0.2817188376 * G + 0.6299787005 * B);
+	return {
+		kind: "rgb",
+		l: 0.2104542553 * l + 0.793617785 * m - 0.0040720468 * s,
+		a: 1.9779984951 * l - 2.428592205 * m + 0.4505937099 * s,
+		b: 0.0259040371 * l + 0.7827717662 * m - 0.808675766 * s,
+	};
+}
+
+/**
+ * What a token actually looks like: an OKLab color for truecolor / 256-color
+ * output, or an opaque key for the 16 terminal-defined palette slots (whose
+ * real color is unknown, so only the same slot counts as equal).
+ */
+export function tokenSwatch(theme: VizTheme, token: string): Swatch {
+	const ansi = tokenAnsi(theme, token);
+	const rgb = /38;2;(\d+);(\d+);(\d+)/.exec(ansi);
+	if (rgb) return oklab(Number(rgb[1]), Number(rgb[2]), Number(rgb[3]));
+	const idx = /38;5;(\d+)/.exec(ansi);
+	if (idx && Number(idx[1]) >= 16) return oklab(...xterm256(Number(idx[1])));
+	const basic = /(?:^|\[|;)(3[0-7]|9[0-7])m/.exec(ansi);
+	return { kind: "key", key: idx ? `p${idx[1]}` : basic ? `b${basic[1]}` : ansi };
+}
+
+/** OKLab distance below which two colors read as the same (~JND); pi's own dark/light role tokens are >= 0.04 apart, the system-theme accent/syntaxNumber clash is ~0.002. */
+export const MIN_TYPE_COLOR_DISTANCE = 0.025;
+
+export function swatchesClash(x: Swatch, y: Swatch): boolean {
+	if (x.kind === "key" || y.kind === "key") return x.kind === y.kind && (x as { key: string }).key === (y as { key: string }).key;
+	return Math.hypot(x.l - y.l, x.a - y.a, x.b - y.b) < MIN_TYPE_COLOR_DISTANCE;
 }
 
 const ROLE_ORDER = Object.keys(ROLE_TOKENS);
@@ -107,13 +159,19 @@ export function resolveRolePalette(theme: VizTheme, roles: Iterable<string>): Ma
 		const ib = ROLE_ORDER.indexOf(b);
 		return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
 	});
-	const used = new Set([tokenAnsi(theme, "error"), tokenAnsi(theme, "dim")]);
+	// Compare what the colors LOOK like, not their escape bytes: pi's system
+	// theme derives accent and syntaxNumber from the same palette slot, giving
+	// e.g. #b38eb9 vs #b38fb8 in truecolor — different bytes, same pink.
+	const used: Swatch[] = [tokenSwatch(theme, "error"), tokenSwatch(theme, "dim")];
 	const out = new Map<string, string>();
 	for (const role of unique) {
 		const preferred = roleToken(role);
 		const candidates = [preferred, ...FALLBACK_TOKENS.slice(hash(role) % FALLBACK_TOKENS.length), ...DISTINCT_FALLBACK_TOKENS];
-		const pick = candidates.find((token) => !used.has(tokenAnsi(theme, token))) ?? preferred;
-		used.add(tokenAnsi(theme, pick));
+		const pick = candidates.find((token) => {
+			const swatch = tokenSwatch(theme, token);
+			return !used.some((other) => swatchesClash(swatch, other));
+		}) ?? preferred;
+		used.push(tokenSwatch(theme, pick));
 		out.set(role, pick);
 	}
 	return out;

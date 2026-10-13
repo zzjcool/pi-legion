@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
-import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken } from "../../src/tui/viz/palette.ts";
+import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
 import { assignLanes, liveAt, maxLanesFor, renderRailway } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
@@ -311,12 +311,18 @@ test("viz: duplicate child names from nested supervisors are disambiguated by pa
 
 // ---- per-type colors with pi's real themes -------------------------------------------------
 const PI_THEME_DIR = new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/", import.meta.url);
-async function loadPiTheme(kind: "dark" | "system"): Promise<any | undefined> {
+const hexRgb = (h: string) => ({ r: parseInt(h.slice(1, 3), 16), g: parseInt(h.slice(3, 5), 16), b: parseInt(h.slice(5, 7), 16) });
+/** xfce4-terminal's default (Tango) palette, as reported to pi over OSC 4. */
+const XFCE_PALETTE = ["#000000", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf",
+	"#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec"].map(hexRgb);
+async function loadPiTheme(kind: "dark" | "system" | "system-truecolor"): Promise<any | undefined> {
 	try {
 		const th = await import(new URL("theme.js", PI_THEME_DIR).href);
 		if (kind === "dark") return th.loadThemeFromPath(new URL("dark.json", PI_THEME_DIR).pathname, "truecolor");
 		const sys = await import(new URL("system-theme.js", PI_THEME_DIR).href);
-		const { colors } = sys.generateSystemThemeColors({});
+		const { colors } = sys.generateSystemThemeColors(kind === "system" ? {} : {
+			foreground: hexRgb("#ffffff"), background: hexRgb("#000000"), palette: XFCE_PALETTE, saturation: 1,
+		});
 		const fs = await import("node:fs");
 		const os = await import("node:os");
 		const path = `${os.tmpdir()}/pi-legion-viz-system-theme-${process.pid}.json`;
@@ -346,7 +352,7 @@ const TYPED = [{ ...ROOT, name: "root", role: "root" },
 ];
 const TYPED_NAMES = { "centurion-0": "centurion", "scout-0": "scout", "worker-0": "worker", "reviewer-0": "reviewer" };
 
-for (const kind of ["dark", "system"] as const) {
+for (const kind of ["dark", "system", "system-truecolor"] as const) {
 	test(`railway: every agent type gets a distinct ANSI color with pi's real ${kind} theme`, async (t) => {
 		const theme = await loadPiTheme(kind);
 		if (!theme) return t.skip("pi-coding-agent themes not installed");
@@ -356,7 +362,7 @@ for (const kind of ["dark", "system"] as const) {
 		assert.equal(colors.size, 4, JSON.stringify([...colors]));
 		assert.equal(new Set(colors.values()).size, 4, `colors collide: ${JSON.stringify([...colors])}`);
 		// The palette-index tier only has ~6 hues (minus error/dim), so check the five most common types there.
-		const roles = kind === "dark"
+		const roles = kind !== "system"
 			? ["centurion", "scout", "worker", "reviewer", "advisor", "planner", "x-custom"]
 			: ["centurion", "scout", "worker", "reviewer", "planner"];
 		const palette = resolveRolePalette(theme, roles);
@@ -369,6 +375,16 @@ for (const kind of ["dark", "system"] as const) {
 			assert.equal(palette.get("reviewer"), "syntaxFunction");
 			assert.equal(palette.get("advisor"), "syntaxString");
 			assert.equal(palette.get("planner"), "syntaxKeyword");
+		} else if (kind === "system-truecolor") {
+			// The user's xfce4-terminal: palette reported, truecolor output. accent and
+			// syntaxNumber come out as byte-different but visually identical pinks.
+			assert.notEqual(theme.getFgAnsi("accent"), theme.getFgAnsi("syntaxNumber"));
+			assert.ok(swatchesClash(tokenSwatch(theme, "accent"), tokenSwatch(theme, "syntaxNumber")));
+			assert.notEqual(palette.get("scout"), "syntaxNumber");
+			const swatches = [...palette.values()].map((token) => tokenSwatch(theme, token));
+			for (let i = 0; i < swatches.length; i++) for (let j = i + 1; j < swatches.length; j++) {
+				assert.ok(!swatchesClash(swatches[i]!, swatches[j]!), `${[...palette.keys()][i]} vs ${[...palette.keys()][j]}`);
+			}
 		} else {
 			// system theme without a reported palette: accent and syntaxNumber are both ANSI 5.
 			assert.equal(theme.getFgAnsi("accent"), theme.getFgAnsi("syntaxNumber"));
