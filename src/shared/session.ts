@@ -294,12 +294,165 @@ function num(v: unknown): number {
 	return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
 
-/** Parse a session file. A missing file yields an empty (not throwing) result. */
+/** Read-chunk size for streaming session parsing (#36). */
+const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
+export const DEFAULT_SESSION_MAX_LINE_BYTES = 32 * 1024 * 1024;
+export const SESSION_MAX_LINE_BYTES_ENV = "PI_LEGION_SESSION_MAX_LINE_BYTES";
+const SESSION_CACHE_MAX_ENTRIES = 64;
+
+/** Per-line cap: one JSONL row larger than this is skipped (counted as torn). */
+export function resolveSessionMaxLineBytes(env: NodeJS.ProcessEnv = process.env): number {
+	const raw = env[SESSION_MAX_LINE_BYTES_ENV]?.trim();
+	const n = raw ? Number(raw) : NaN;
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_SESSION_MAX_LINE_BYTES;
+}
+
+interface SessionParseState {
+	dev: number;
+	ino: number;
+	/** Byte offset just past the last complete line consumed. */
+	offset: number;
+	/** Bytes at the head and just before `offset`; a mismatch means rewrite. */
+	head: Buffer;
+	boundary: Buffer;
+	parsed: ParsedSession;
+}
+
+const FINGERPRINT_BYTES = 256;
+
+function readAt(fd: number, start: number, length: number): Buffer {
+	const buf = Buffer.alloc(Math.max(0, length));
+	const n = length > 0 ? fs.readSync(fd, buf, 0, length, start) : 0;
+	return buf.subarray(0, n);
+}
+
+function fingerprint(fd: number, offset: number): { head: Buffer; boundary: Buffer } {
+	const head = readAt(fd, 0, Math.min(FINGERPRINT_BYTES, offset));
+	const start = Math.max(0, offset - FINGERPRINT_BYTES);
+	return { head, boundary: readAt(fd, start, offset - start) };
+}
+
+function stillValid(fd: number, stat: fs.Stats, state: SessionParseState): boolean {
+	if (state.dev !== stat.dev || state.ino !== stat.ino || stat.size < state.offset) return false;
+	const now = fingerprint(fd, state.offset);
+	return now.head.equals(state.head) && now.boundary.equals(state.boundary);
+}
+
+/** Incremental parse cache: append-only session files are only read past `offset`. */
+const sessionParseCache = new Map<string, SessionParseState>();
+
+/** Test hook: drop all incremental parse state. */
+export function clearSessionParseCache(): void {
+	sessionParseCache.clear();
+}
+
+function applyLine(parsed: ParsedSession, raw: string): void {
+	const line = raw.trim();
+	if (!line) return;
+	const event = decodeEvent(line);
+	if (!event) {
+		parsed.tornLines += 1;
+		return;
+	}
+	applyEvent(parsed, event);
+}
+
+/**
+ * Stream complete lines from `fd` starting at `start`, never holding more than
+ * one chunk plus one (capped) line in memory. Returns the offset just past the
+ * last complete line; a trailing partial line is left for the next call.
+ */
+function consumeLines(fd: number, start: number, size: number, parsed: ParsedSession, maxLineBytes: number): number {
+	const chunk = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
+	let pos = start;
+	let consumed = start;
+	let pending: Buffer[] = [];
+	let pendingBytes = 0;
+	let skipping = false;
+	while (pos < size) {
+		const n = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
+		if (n <= 0) break;
+		let lineStart = 0;
+		for (let i = 0; i < n; i++) {
+			if (chunk[i] !== 0x0a) continue;
+			if (skipping) {
+				parsed.tornLines += 1;
+				skipping = false;
+			} else {
+				const piece = chunk.subarray(lineStart, i);
+				const text = pendingBytes ? Buffer.concat([...pending, piece]).toString("utf8") : piece.toString("utf8");
+				applyLine(parsed, text);
+			}
+			pending = [];
+			pendingBytes = 0;
+			lineStart = i + 1;
+			consumed = pos + i + 1;
+		}
+		if (lineStart < n && !skipping) {
+			const rest = Buffer.from(chunk.subarray(lineStart, n));
+			pendingBytes += rest.length;
+			if (pendingBytes > maxLineBytes) {
+				// An oversized row (typically a giant tool result) is not worth
+				// materialising; drop it and resynchronise at the next newline.
+				pending = [];
+				pendingBytes = 0;
+				skipping = true;
+			} else pending.push(rest);
+		}
+		pos += n;
+	}
+	return consumed;
+}
+
+function finalizeParsed(parsed: ParsedSession): ParsedSession {
+	const last = parsed.turns.at(-1);
+	parsed.lastTurnMissing = Boolean(last && last.assistants.length === 0);
+	parsed.lastTurnOutput = last?.assistants.at(-1)?.text ?? null;
+	return parsed;
+}
+
+/**
+ * Parse a session file. A missing file yields an empty (not throwing) result.
+ *
+ * Streams the file in chunks instead of `readFileSync` + `split` (#36), and
+ * keeps an incremental per-path cache so repeated polls of a growing
+ * append-only session only parse the newly appended bytes. A trailing partial
+ * line (a write in progress) is parsed provisionally for this call but never
+ * committed to the cache, matching the previous whole-file semantics.
+ */
 export function parseSessionFile(path: string): ParsedSession {
+	let fd: number | undefined;
 	try {
-		return parseSessionText(fs.readFileSync(path, "utf-8"));
+		fd = fs.openSync(path, "r");
+		const stat = fs.fstatSync(fd);
+		let state = sessionParseCache.get(path);
+		if (!state || !stillValid(fd, stat, state)) {
+			state = { dev: stat.dev, ino: stat.ino, offset: 0, head: Buffer.alloc(0), boundary: Buffer.alloc(0), parsed: emptyParsedSession() };
+		}
+		const maxLineBytes = resolveSessionMaxLineBytes();
+		const before = state.offset;
+		state.offset = consumeLines(fd, state.offset, stat.size, state.parsed, maxLineBytes);
+		if (state.offset !== before) Object.assign(state, fingerprint(fd, state.offset));
+		sessionParseCache.delete(path);
+		sessionParseCache.set(path, state);
+		if (sessionParseCache.size > SESSION_CACHE_MAX_ENTRIES) {
+			const oldest = sessionParseCache.keys().next().value;
+			if (oldest !== undefined) sessionParseCache.delete(oldest);
+		}
+		const result = structuredClone(state.parsed);
+		if (state.offset < stat.size && stat.size - state.offset <= maxLineBytes) {
+			const tail = Buffer.allocUnsafe(stat.size - state.offset);
+			const n = fs.readSync(fd, tail, 0, tail.length, state.offset);
+			applyLine(result, tail.subarray(0, n).toString("utf8"));
+		}
+		return finalizeParsed(result);
 	} catch {
+		sessionParseCache.delete(path);
 		return emptyParsedSession();
+	} finally {
+		if (fd !== undefined) {
+			try { fs.closeSync(fd); } catch { /* ignore */ }
+		}
 	}
 }
 
