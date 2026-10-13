@@ -19,6 +19,7 @@ import { isThinkingLevel } from "../shared/types.ts";
 import { nodesFromEntries, type VizNode } from "./viz/model.ts";
 import { RateSampler } from "./viz/rate.ts";
 import { railwayLines, type RailScroll } from "./viz/railway.ts";
+import { IDLE_STOP_HINT, IDLE_STOP_HINT_SHORT } from "../extension/legion-stop.ts";
 
 export const STATUS_WIDGET_KEY = "pi-legion-status";
 export const STATUS_FOOTER_KEY = "pi-legion";
@@ -548,6 +549,10 @@ export interface StatusBoard {
 	vizSnapshot?(now?: number): StatusVizSnapshot;
 	paint(entries: StatusEntry[], now: number): void;
 	clear(): void;
+	/** Show the idle stop hint in the railway header (main agent idle, children live). */
+	setIdleHint?(on: boolean): void;
+	/** The TUI the widget is mounted in, when registered (for focus/overlay checks). */
+	getTui?(): unknown;
 }
 
 /**
@@ -582,6 +587,7 @@ export function createStatusBoard(options: {
 	let tui: WidgetTui | undefined;
 	let railScroll: RailScroll = { offset: 0 };
 	let railWindow: { offset: number; total: number; maxLanes: number } | undefined;
+	let idleHint = false;
 
 	const renderLines = (now: number, theme: Theme, width?: number): {
 		lines: string[];
@@ -590,7 +596,8 @@ export function createStatusBoard(options: {
 	} => {
 		if (strip === "railway" && hasTreeIdentity(entries) && width !== undefined && width >= 20) {
 			const nodes = nodesFromEntries(entries);
-			const rendered = railwayLines({ nodes, now, width, rate: sampler.totalRate(now), scroll: railScroll }, theme);
+			const hint = idleHint ? { hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT } : {};
+			const rendered = railwayLines({ nodes, now, width, rate: sampler.totalRate(now), scroll: railScroll, ...hint }, theme);
 			// Persist the clamped window (anchored on the top lane's agent) so later
 			// renders follow ends/starts without jumping; resets to 0 when all fit.
 			railWindow = rendered.window;
@@ -729,6 +736,14 @@ export function createStatusBoard(options: {
 			entries = next;
 			if (hasTreeIdentity(next)) sampler.record(_now, nodesFromEntries(next));
 			paint();
+		},
+		setIdleHint(on) {
+			if (idleHint === on) return;
+			idleHint = on;
+			tui?.requestRender();
+		},
+		getTui() {
+			return tui;
 		},
 		vizSnapshot(now = Date.now()) {
 			return { nodes: nodesFromEntries(entries), sampler, now, rate: sampler.totalRate(now) };

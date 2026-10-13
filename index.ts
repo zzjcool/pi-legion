@@ -60,7 +60,9 @@ import {
 	publishUIRequest,
 	registerLegionCommand,
 	type RpcEventSource,
+	confirmAndStopNode,
 } from "./src/extension/legion-commands.ts";
+import { createIdleEscStop, liveJobs } from "./src/extension/legion-stop.ts";
 import { DEFAULT_FLUSH_MS, DEFAULT_JOIN_MODE } from "./src/extension/join.ts";
 import { registerChildGuard } from "./src/extension/child-guard.ts";
 import { ALLOW_NESTED_ENV } from "./src/extension/budget.ts";
@@ -720,16 +722,33 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		getModelRegistry: () => lastModelRegistry,
 	});
 	registerSummaryCommand(pi);
+	// User stop controls (/legion stop, idle Esc, `x` in /legion): a thin wrapper
+	// over the subagent tool's `stop` action — graceful retire of tracked children.
+	const stopChildren = async (params: { name?: string; all?: boolean }): Promise<{ ok: boolean; text: string }> => {
+		const result = await stopAction({
+			params,
+			runtime,
+			retire: async (name) => {
+				await runtime.get(name)?.retire?.();
+			},
+		});
+		const text = result.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
+		const details = result.details as { error?: string } | undefined;
+		runtime.refreshUi();
+		return { ok: !details?.error, text };
+	};
 	const liveOverlayController = registerLegionCommand(pi, {
 		bus: legionBus,
 		runtime,
 		supervisor: rpcEventSource,
+		stop: stopChildren,
 	});
 	statusNodeOpener = createStatusNodeOpener(
 		pi,
 		liveOverlayController,
 		() => lastUi,
 		() => lastCwd,
+		(ui, nodeId) => void confirmAndStopNode(ui, { runtime, stop: stopChildren }, nodeId),
 	);
 
 	// ── Master switch ────────────────────────────────────────────────────
@@ -885,7 +904,34 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		},
 	});
 
+	let lastCtx: ExtensionContext | undefined;
+	let escUi: ExtensionUIContext | undefined;
+	let escUnsubscribe: (() => void) | undefined;
+	const idleEscStop = createIdleEscStop({
+		isIdle: () => lastCtx?.isIdle?.() ?? false,
+		editorEmpty: () => !(lastUi?.getEditorText?.() ?? "").trim(),
+		uiBusy: () => {
+			const tui = runtime.statusTui() as { hasOverlay?: () => boolean; getFocusedComponent?: () => unknown } | undefined;
+			if (!tui) return true;
+			if (tui.hasOverlay?.()) return true;
+			const focused = tui.getFocusedComponent?.() as { getText?: unknown } | null | undefined;
+			// Only the prompt editor may have focus: dialogs/selectors keep pi's Esc.
+			return !focused || typeof focused.getText !== "function" || !("onEscape" in focused);
+		},
+		liveCount: () => liveJobs(runtime.activeJobs()).length,
+		confirm: (title, message) => lastUi ? lastUi.confirm(title, message) : Promise.resolve(false),
+		stopAll: async () => {
+			const result = await stopChildren({ all: true });
+			lastUi?.notify(result.text, result.ok ? "info" : "error");
+		},
+	});
 	const bindUi = (_event: unknown, ctx: ExtensionContext): void => {
+		lastCtx = ctx;
+		if (ctx.hasUI && ctx.ui !== escUi && typeof ctx.ui?.onTerminalInput === "function") {
+			escUnsubscribe?.();
+			escUi = ctx.ui;
+			escUnsubscribe = ctx.ui.onTerminalInput(idleEscStop);
+		}
 		lastModelRegistry = ctx.modelRegistry;
 		lastUi = ctx.hasUI ? ctx.ui : undefined;
 		if (ctx.cwd) lastCwd = ctx.cwd;
@@ -916,7 +962,10 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		else if (request.method === "set_editor_text") ui.setEditorText(request.text);
 	});
 
-	pi.on("session_start", bindUi);
+	pi.on("session_start", (event, ctx) => {
+		runtime.setParentIdle(ctx.isIdle?.() ?? true);
+		bindUi(event, ctx);
+	});
 	pi.on("session_info_changed", bindUi);
 	pi.on("turn_start", (event, ctx) => {
 		parentTurnActive = true;
@@ -926,8 +975,14 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		parentTurnActive = false;
 		bindUi(event, ctx);
 	});
-	pi.on("agent_start", bindUi);
-	pi.on("agent_end", bindUi);
+	pi.on("agent_start", (event, ctx) => {
+		runtime.setParentIdle(false);
+		bindUi(event, ctx);
+	});
+	pi.on("agent_end", (event, ctx) => {
+		runtime.setParentIdle(true);
+		bindUi(event, ctx);
+	});
 	pi.on("input", bindUi);
 	pi.on("tool_result", (_event, ctx) => {
 		bindUi(_event, ctx);

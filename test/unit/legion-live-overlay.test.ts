@@ -236,7 +236,7 @@ test("live overlay subscribes only when opened for the requested node and Esc un
 	component.handleInput?.("\u001b");
 	assert.equal(source.unsubscribeCount, 1);
 	assert.equal(source.listeners.size, 0);
-	assert.equal(hideCount, 1, "Esc hides the attached overlay handle");
+	assert.equal(hideCount, 0, "Esc leaves hiding to pi's done(); a second hide would pop the overlay underneath");
 	assert.equal(component.getState().open, false);
 	component.handleInput?.("\u001b");
 	component.dispose();
@@ -951,4 +951,38 @@ test("disk backfill containing clamped streaming text does not repeat its last l
 	} finally {
 		component.close();
 	}
+});
+
+test("live overlay: x opens an in-overlay y/N stop prompt; y calls onStop, other keys cancel", () => {
+	const source = new FakeOverlaySource();
+	const stopped: string[] = [];
+	const component = createLiveOverlay(source).open("root.worker", { maxLines: 5, now: () => 10_000, onStop: (id) => stopped.push(id) });
+	try {
+		component.handleInput?.("x");
+		assert.match(component.render(120)[0]!, /Stop .*\? .*y stop/);
+		component.handleInput?.("n");
+		assert.doesNotMatch(component.render(120)[0]!, /y stop/);
+		assert.deepEqual(stopped, []);
+		component.handleInput?.("x");
+		component.handleInput?.("y");
+		assert.deepEqual(stopped, ["root.worker"]);
+	} finally {
+		component.close();
+	}
+});
+
+test("live overlay close: with pi's done() it does not also hide the handle (would pop the /legion view underneath)", () => {
+	const source = new FakeOverlaySource();
+	let hides = 0;
+	let dones = 0;
+	const component = createLiveOverlay(source).open("root.worker", { maxLines: 5, now: () => 10_000, done: () => { dones++; } });
+	component.attachOverlayHandle({ hide: () => { hides++; } } as never);
+	component.handleInput?.("\x1b");
+	assert.equal(dones, 1);
+	assert.equal(hides, 0);
+	// Without a done callback (direct callers) the handle is still hidden.
+	const bare = createLiveOverlay(source).open("root.worker", { maxLines: 5, now: () => 10_000 });
+	bare.attachOverlayHandle({ hide: () => { hides++; } } as never);
+	bare.close();
+	assert.equal(hides, 1);
 });

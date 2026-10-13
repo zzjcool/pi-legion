@@ -12,6 +12,8 @@ export interface LegionViewState {
 	selectedId?: string;
 	logOffset: number;
 	logCursor: number;
+	/** `x` pressed: an in-view y/N prompt for stopping this agent (dialogs would be hidden behind the full-screen view). */
+	pendingStopId?: string;
 }
 
 export function initialViewState(): LegionViewState {
@@ -76,10 +78,17 @@ export function renderLegionView(data: ViewData, state: LegionViewState, cols: n
 
 	// Footer.
 	const keys: Array<[string, string]> = portrait
-		? [["Tab", "pane"], ["↑↓", ""], ["⏎", "sel"], ["o", "open"], ["esc", ""], ["q", ""]]
-		: [["Tab", "focus"], ["↑↓", "scroll"], ["PgUp/PgDn", "page"], ["Enter", "select agent"], ["o", "open"], ["Esc", "clear"], ["q", "quit"]];
+		? [["Tab", "pane"], ["↑↓", ""], ["⏎", "sel"], ["o", "open"], ["x", "stop"], ["esc", ""], ["q", ""]]
+		: [["Tab", "focus"], ["↑↓", "scroll"], ["PgUp/PgDn", "page"], ["Enter", "select agent"], ["o", "open"], ["x", "stop"], ["Esc", "clear"], ["q", "quit"]];
 	const right = portrait ? state.focus : `focus: ${state.focus}`;
 	const fy = layout.footer.y;
+	const pending = state.pendingStopId ? data.nodes.find((node) => node.id === state.pendingStopId) : undefined;
+	if (pending) {
+		cv.text(0, fy, `Stop ${pending.name}? Its own subagents are retired with it.`, "warning", { bold: true, maxX: W - 1 });
+		const yn = "  y stop · any other key cancel";
+		cv.text(Math.min(W - 1, Array.from(`Stop ${pending.name}? Its own subagents are retired with it.`).length), fy, yn, "dim", { maxX: W - 1 });
+		return { canvas: cv, layout: layout.kind };
+	}
 	let fx = 0;
 	for (const [key, label] of keys) {
 		const w = key.length + (label ? label.length + 1 : 0) + 2;
@@ -103,12 +112,18 @@ function clampLog(state: LegionViewState, count: number, visible: number): void 
 	state.logOffset = Math.max(0, Math.min(state.logOffset, Math.max(0, count - visible)));
 }
 
-export type ViewAction = "none" | "render" | "close" | "open";
+export type ViewAction = "none" | "render" | "close" | "open" | "stop";
 
 /** Pure key handling so it can be unit tested without a terminal. */
 export function handleViewKey(data: string, state: LegionViewState, nodes: readonly VizNode[], page = 10): ViewAction {
 	const events = buildLog(nodes);
 	const order = dfsOrder(nodes).filter(isAgent);
+	if (state.pendingStopId) {
+		const confirmed = matchesKey(data, "y") || data === "Y" || matchesKey(data, Key.enter);
+		if (confirmed) return "stop"; // the host reads and clears pendingStopId
+		delete state.pendingStopId;
+		return "render";
+	}
 	if (matchesKey(data, "q") || matchesKey(data, Key.ctrl("c"))) return "close";
 	if (matchesKey(data, Key.escape)) {
 		if (state.selectedId) {
@@ -126,6 +141,12 @@ export function handleViewKey(data: string, state: LegionViewState, nodes: reado
 		return "render";
 	}
 	if (matchesKey(data, "o")) return state.selectedId ? "open" : "none";
+	if (matchesKey(data, "x")) {
+		const selected = state.selectedId ? nodes.find((node) => node.id === state.selectedId) : undefined;
+		if (!selected || !isAgent(selected) || selected.status !== "running") return "none";
+		state.pendingStopId = selected.id;
+		return "render";
+	}
 	const down = matchesKey(data, Key.down) || matchesKey(data, "j");
 	const up = matchesKey(data, Key.up) || matchesKey(data, "k");
 	if (state.focus === "log") {
@@ -158,6 +179,8 @@ export function handleViewKey(data: string, state: LegionViewState, nodes: reado
 export interface LegionViewOptions {
 	getData(): ViewData;
 	onOpenNode?(nodeId: string): void;
+	/** `x` then `y` on a live selected agent: the host retires it (already confirmed in-view). */
+	onStopNode?(nodeId: string): void;
 	refreshMs?: number;
 }
 
@@ -189,6 +212,11 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 				const action = handleViewKey(data, state, options.getData().nodes, Math.max(1, (tui.terminal.rows ?? 24) - 8));
 				if (action === "close") return close();
 				if (action === "open" && state.selectedId) options.onOpenNode?.(state.selectedId);
+				if (action === "stop" && state.pendingStopId) {
+					const id = state.pendingStopId;
+					delete state.pendingStopId;
+					options.onStopNode?.(id);
+				}
 				tui.requestRender();
 			},
 			invalidate(): void {},
