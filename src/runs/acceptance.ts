@@ -12,6 +12,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createCappedOutput, resolveMaxOutputBytes } from "../shared/output-cap.ts";
 import type {
 	AcceptanceCriterion,
 	AcceptanceResult,
@@ -103,30 +104,37 @@ export function defaultVerifyRunner(
 			cwd,
 			env: process.env,
 		});
-		let stdout = "";
-		let stderr = "";
-		child.stdout?.on("data", (chunk) => {
-			stdout += String(chunk);
-		});
-		child.stderr?.on("data", (chunk) => {
-			stderr += String(chunk);
-		});
+		const cap = resolveMaxOutputBytes();
+		const killOnOverflow = () => {
+			// Destroying the pipes makes any grandchild writer (bash -lc → cmd)
+			// die of SIGPIPE instead of streaming into a closed-over buffer forever.
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			child.kill("SIGKILL");
+			clearTimeout(timer);
+			finish({ code: 1, stdout: out.text(), stderr: err.text() });
+		};
+		const out = createCappedOutput(cap, killOnOverflow);
+		const err = createCappedOutput(cap, killOnOverflow);
+		child.stdout?.on("data", (chunk) => out.push(chunk));
+		child.stderr?.on("data", (chunk) => err.push(chunk));
+		const overflowed = () => out.truncated || err.truncated;
 		const timer = setTimeout(() => {
 			child.kill("SIGTERM");
 			setTimeout(() => child.kill("SIGKILL"), 2_000);
 			finish({
 				code: 1,
-				stdout,
-				stderr: `${stderr}\nverification timed out after ${limit}ms`,
+				stdout: out.text(),
+				stderr: `${err.text()}\nverification timed out after ${limit}ms`,
 			});
 		}, limit);
 		child.on("error", (error) => {
 			clearTimeout(timer);
-			finish({ code: 1, stdout, stderr: String(error) });
+			finish({ code: 1, stdout: out.text(), stderr: String(error) });
 		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
-			finish({ code: code ?? 1, stdout, stderr });
+			finish({ code: overflowed() ? 1 : code ?? 1, stdout: out.text(), stderr: err.text() });
 		});
 	});
 }

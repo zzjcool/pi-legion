@@ -1,6 +1,7 @@
 /** Legion mail/tree/phase tools and the host-side postman loop. */
 
 import { spawn } from "node:child_process";
+import { createCappedOutput, resolveMaxOutputBytes } from "../shared/output-cap.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -702,8 +703,6 @@ export async function runVerification(
 export function runLegionCommand(command: string, cwd: string, timeoutMs: number): Promise<LegionCommandResult> {
 	const limit = timeoutMs > 0 ? timeoutMs : 600_000;
 	return new Promise((resolve) => {
-		let stdout = "";
-		let stderr = "";
 		let timedOut = false;
 		let settled = false;
 		const child = spawn("timeout", ["--signal=TERM", `${Math.max(1, Math.ceil(limit / 1_000))}s`, "bash", "-lc", command], { cwd, env: process.env });
@@ -711,15 +710,27 @@ export function runLegionCommand(command: string, cwd: string, timeoutMs: number
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			resolve({ code, stdout, stderr, ...(timedOut ? { timedOut: true } : {}) });
+			const overflowed = out.truncated || err.truncated;
+			resolve({ code: overflowed ? 1 : code, stdout: out.text(), stderr: `${err.text()}${extraStderr}`, ...(timedOut ? { timedOut: true } : {}) });
 		};
-		child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
-		child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
-		child.on("error", (error) => { stderr += String(error); finish(1); });
+		let extraStderr = "";
+		const cap = resolveMaxOutputBytes();
+		const killOnOverflow = () => {
+			// Destroy pipes so a grandchild writer dies of SIGPIPE, then settle now.
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			child.kill("SIGKILL");
+			finish(1);
+		};
+		const out = createCappedOutput(cap, killOnOverflow);
+		const err = createCappedOutput(cap, killOnOverflow);
+		child.stdout?.on("data", (chunk) => out.push(chunk));
+		child.stderr?.on("data", (chunk) => err.push(chunk));
+		child.on("error", (error) => { extraStderr += String(error); finish(1); });
 		const timer = setTimeout(() => {
 			timedOut = true;
 			child.kill("SIGTERM");
-			stderr += `\nverification timed out after ${limit}ms`;
+			extraStderr += `\nverification timed out after ${limit}ms`;
 			finish(1);
 		}, limit + 1_000);
 		child.on("close", (code) => finish(code ?? 1));
