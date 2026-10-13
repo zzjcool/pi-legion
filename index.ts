@@ -586,9 +586,13 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 				if (!subagentsEnabled(ctx.cwd)) {
 					return fail("subagents are disabled (subagents.enabled: false or /subagents-toggle off). Re-enable with /subagents-toggle on.", ErrorCodes.DISABLED);
 				}
+				const runtime = sessionRuntime;
+				if (!runtime) return fail("session runtime is not initialized", ErrorCodes.INVALID_PARAMS);
+				runtime.bind(ctx);
 				const result = await launchUtilityFamily({
 					pi,
 					ctx,
+					runtime,
 					params,
 					supervisor,
 					uiProxy,
@@ -633,17 +637,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		pi.on("session_shutdown", () => stopLegionRuntime());
 		return;
 	}
-	if (isChild && !allowNested) {
-		pi.on("session_shutdown", async () => {
-			await Promise.all(pendingUtilityRetires.map((retire) => retire().catch(() => {})));
-			stopLegionRuntime();
-		});
-		return;
-	}
-	// The parent transcript records every finish; the renderer keeps a
-	// completed child to one line so visibility does not cost a screen.
-	pi.registerMessageRenderer(SUBAGENT_NOTIFY_TYPE, renderSubagentNotice);
-
 	let lastUi: ExtensionUIContext | undefined;
 	let statusNodeOpener: ((nodeId: string) => void) | undefined;
 	let lastModelRegistry: ExtensionContext["modelRegistry"] | undefined;
@@ -704,6 +697,22 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			}
 		},
 	});
+
+	if (isChild && !allowNested) {
+		pi.on("session_shutdown", async () => {
+			const children = runtime.activeJobs();
+			runtime.dispose();
+			await Promise.all([
+				...children.map((job) => job.retire?.().catch(() => {})),
+				...pendingUtilityRetires.map((retire) => retire().catch(() => {})),
+			]);
+			stopLegionRuntime();
+		});
+		return;
+	}
+	// The parent transcript records every finish; the renderer keeps a
+	// completed child to one line so visibility does not cost a screen.
+	pi.registerMessageRenderer(SUBAGENT_NOTIFY_TYPE, renderSubagentNotice);
 
 	registerProfileCommands(pi, {
 		getModelRegistry: () => lastModelRegistry,
@@ -1784,6 +1793,7 @@ async function launchUtilityFamily(input: {
 	pi: ExtensionAPI;
 	ctx: ExtensionContext;
 	params: VexillatioParams;
+	runtime: SessionRuntime;
 	signal?: AbortSignal;
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
@@ -1807,7 +1817,7 @@ async function launchUtilityFamily(input: {
 		modelOrigin: ModelOrigin;
 	}> = [];
 	for (const step of plan.steps) {
-		const agent = findAgent(catalog.allAgents, step.agent);
+		const agent = findAgent(catalog.agents, step.agent) ?? findAgent(catalog.allAgents, step.agent);
 		if (!agent?.utility) {
 			return fail(
 				`not a utility agent: ${step.agent} (mark it with 'utility: true')`,
@@ -1949,10 +1959,23 @@ async function launchUtilityFamily(input: {
 				stripLegionIdentity: true,
 			});
 			await persistChild(store, runId, orchestrator, handle.name);
+			let retirement: Promise<void> | undefined;
+			const retire = (): Promise<void> => {
+				if (!retirement) {
+					const current = (async () => {
+						await orchestrator.retire(handle.name);
+						await persistChild(store, runId, orchestrator, handle.name);
+					})();
+					retirement = current;
+					void current.catch(() => {
+						if (retirement === current) retirement = undefined;
+					});
+				}
+				return retirement;
+			};
 			input.onUtilityChild(async () => {
 				try {
-					await orchestrator.retire(handle.name);
-					await persistChild(store, runId, orchestrator, handle.name);
+					await retire();
 				} catch {
 					// Shutdown cleanup is best-effort; the supervisor owns final process state.
 				}
@@ -1964,6 +1987,7 @@ async function launchUtilityFamily(input: {
 					agent: item.agent.name,
 					sessionFile: handle.sessionFile,
 					orchestrator,
+					retire,
 				},
 			};
 		} catch (error) {
@@ -1978,11 +2002,27 @@ async function launchUtilityFamily(input: {
 		agent: string;
 		sessionFile: string;
 		orchestrator: Orchestrator;
+		retire: () => Promise<void>;
 	}> = [];
 	for (const launch of launches) {
 		if ("error" in launch) results.push(`✗ ${launch.item.agent.name}: ${launch.error}`);
 		else handles.push(launch.value);
 	}
+
+	const followUtility = (handle: (typeof handles)[number], watch: boolean): void => {
+		followJob(input.runtime, {
+			name: handle.name,
+			runId,
+			agent: handle.agent,
+			sessionFile: handle.sessionFile,
+			timeoutMs,
+			orchestrator: handle.orchestrator,
+			store,
+			watch,
+			retire: handle.retire,
+		});
+	};
+	for (const handle of handles) followUtility(handle, false);
 
 	const collected = await Promise.all(handles.map(async (handle) => {
 		try {
@@ -1991,6 +2031,12 @@ async function launchUtilityFamily(input: {
 				...(input.signal ? { signal: input.signal } : {}),
 			});
 			await persistChild(store, runId, handle.orchestrator, handle.name);
+			if (result.blocked || !shouldRecycleAfterCollect(result.execution.status)) {
+				followUtility(handle, true);
+			} else {
+				await handle.retire();
+				input.runtime.release(handle.name);
+			}
 			const lines = [
 				`── ${handle.name} ──`,
 				`execution: ${result.execution.status}${result.execution.reason ? ` (${result.execution.reason})` : ""}`,
@@ -2000,6 +2046,8 @@ async function launchUtilityFamily(input: {
 			lines.push(`sessionFile: ${handle.sessionFile}`);
 			return lines.join("\n");
 		} catch (error) {
+			if (input.supervisor.isAlive(handle.name)) followUtility(handle, true);
+			else input.runtime.release(handle.name);
 			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
@@ -2123,6 +2171,7 @@ function followJob(
 		orchestrator: Orchestrator;
 		store: RunStore;
 		watch: boolean;
+		retire?: () => Promise<void>;
 		treeIdentity?: { nodeId: string; parentId: string | null; depth: number };
 	},
 ): void {
@@ -2153,6 +2202,10 @@ function followJob(
 		persist: async () =>
 			persistChild(input.store, input.runId, input.orchestrator, input.name),
 		retire: async () => {
+			if (input.retire) {
+				await input.retire();
+				return;
+			}
 			await input.orchestrator.retire(input.name);
 			await persistChild(
 				input.store,
