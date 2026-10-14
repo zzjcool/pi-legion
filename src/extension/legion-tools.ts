@@ -11,7 +11,7 @@ import { Type } from "typebox";
 import type { LegionSettings } from "../shared/types.ts";
 import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
-import type { DatabaseSync } from "../legion/db.ts";
+import { sqliteHasRow, type DatabaseSync } from "../legion/db.ts";
 import type { LegionEventBus } from "./event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
 import {
@@ -768,11 +768,11 @@ function isPhase(value: unknown): value is LegionPhase {
 }
 
 function hasEvent(db: DatabaseSync, nodeId: string, type: string): boolean {
-	return db.prepare("SELECT 1 FROM events WHERE node_id = ? AND type = ? LIMIT 1").get(nodeId, type) !== undefined;
+	return sqliteHasRow(db.prepare("SELECT 1 FROM events WHERE node_id = ? AND type = ? LIMIT 1").get(nodeId, type));
 }
 
 function wasOrphanReportedRecently(db: DatabaseSync, nodeId: string, after: number): boolean {
-	return db.prepare("SELECT 1 FROM events WHERE node_id = ? AND type = 'orphan_detected' AND ts >= ? LIMIT 1").get(nodeId, after) !== undefined;
+	return sqliteHasRow(db.prepare("SELECT 1 FROM events WHERE node_id = ? AND type = 'orphan_detected' AND ts >= ? LIMIT 1").get(nodeId, after));
 }
 
 function isPhaseTerminalChild(status: string): boolean {
