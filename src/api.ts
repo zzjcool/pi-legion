@@ -34,6 +34,7 @@ export {
 	BUILTIN_AGENT_NAMES,
 	BUILTIN_AGENTS_DIR,
 	EXTRA_AGENT_DIRS_ENV,
+	LEGACY_EXTRA_AGENT_DIRS_ENV,
 	discoverAgents,
 	findAgent,
 	findNearestProjectAgentsDir,
@@ -41,6 +42,7 @@ export {
 	formatAgentRoster,
 	loadAgentsFromDir,
 	parseAgentDocument,
+	resolveExtraAgentDirs,
 } from "./agents/agents.ts";
 export type { DiscoverOptions } from "./agents/agents.ts";
 export {

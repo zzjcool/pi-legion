@@ -63,17 +63,72 @@ export const BUILTIN_AGENTS_DIR = path.resolve(
  * or vendored roles without copying them into the writable user agent dir. These
  * load as `user`-level, at LOWER precedence than the real user directory, so a
  * user's own definition of the same name still wins.
+ *
+ * Canonical env: `PI_LEGION_EXTRA_AGENT_DIRS`. The Herdr-era name
+ * `PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS` remains a compatibility alias for at
+ * least one minor version. When both are set, the new name wins (old ignored).
  */
-export const EXTRA_AGENT_DIRS_ENV = "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS";
+export const EXTRA_AGENT_DIRS_ENV = "PI_LEGION_EXTRA_AGENT_DIRS";
 
-/** Split `PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS` into absolute directory paths. */
-function extraAgentDirs(): string[] {
-	const raw = process.env[EXTRA_AGENT_DIRS_ENV];
+/** @deprecated Use {@link EXTRA_AGENT_DIRS_ENV} (`PI_LEGION_EXTRA_AGENT_DIRS`). */
+export const LEGACY_EXTRA_AGENT_DIRS_ENV = "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS";
+
+let legacyExtraAgentDirsWarned = false;
+
+/** @internal Reset one-shot deprecation warn (unit tests). */
+export function resetExtraAgentDirsDeprecationWarnForTests(): void {
+	legacyExtraAgentDirsWarned = false;
+}
+
+function splitExtraAgentDirEntries(raw: string | undefined): string[] {
 	if (!raw) return [];
 	return raw.split(path.delimiter).flatMap((entry) => {
 		const trimmed = entry.trim();
 		return trimmed ? [path.resolve(trimmed)] : [];
 	});
+}
+
+function envHasContent(value: string | undefined): value is string {
+	return value !== undefined && value.trim() !== "";
+}
+
+/**
+ * Resolve PATH-style extra agent dirs from env.
+ *
+ * Priority: `PI_LEGION_EXTRA_AGENT_DIRS` overrides
+ * `PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS` when both are set. Setting the legacy
+ * name alone still works and emits one stderr deprecation warning per process.
+ */
+export function resolveExtraAgentDirs(
+	env: NodeJS.ProcessEnv = process.env,
+	warn: (message: string) => void = (message) => console.warn(message),
+): string[] {
+	const modern = env[EXTRA_AGENT_DIRS_ENV];
+	const legacy = env[LEGACY_EXTRA_AGENT_DIRS_ENV];
+	const hasModern = envHasContent(modern);
+	const hasLegacy = envHasContent(legacy);
+
+	if (hasLegacy && !legacyExtraAgentDirsWarned) {
+		legacyExtraAgentDirsWarned = true;
+		if (hasModern) {
+			warn(
+				`[pi-legion] Both ${EXTRA_AGENT_DIRS_ENV} and ${LEGACY_EXTRA_AGENT_DIRS_ENV} are set; using ${EXTRA_AGENT_DIRS_ENV} (new name wins). Remove the deprecated ${LEGACY_EXTRA_AGENT_DIRS_ENV}.`,
+			);
+		} else {
+			warn(
+				`[pi-legion] ${LEGACY_EXTRA_AGENT_DIRS_ENV} is deprecated; use ${EXTRA_AGENT_DIRS_ENV}. The old name remains as a compatibility alias for at least one minor version.`,
+			);
+		}
+	}
+
+	if (hasModern) return splitExtraAgentDirEntries(modern);
+	if (hasLegacy) return splitExtraAgentDirEntries(legacy);
+	return [];
+}
+
+/** Split env extra-agent-dir entries into absolute directory paths. */
+function extraAgentDirs(): string[] {
+	return resolveExtraAgentDirs();
 }
 
 const VALID_KINDS: ReadonlySet<string> = new Set(AGENT_KINDS);
@@ -600,7 +655,7 @@ export interface DiscoverOptions {
  *
  * Precedence, lowest to highest:
  *   builtin (shipped with the package)
- *   extra dirs (`PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS`)
+ *   extra dirs (`PI_LEGION_EXTRA_AGENT_DIRS`, legacy `PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS`)
  *   user    (`~/.pi/agent/agents`)
  *   project (`<nearest>/.pi/agents`)
  *

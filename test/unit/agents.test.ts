@@ -16,6 +16,10 @@ import {
 	formatAgentRoster,
 	BUILTIN_AGENT_NAMES,
 	BUILTIN_AGENTS_DIR,
+	EXTRA_AGENT_DIRS_ENV,
+	LEGACY_EXTRA_AGENT_DIRS_ENV,
+	resolveExtraAgentDirs,
+	resetExtraAgentDirsDeprecationWarnForTests,
 } from "../../src/agents/agents.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 
@@ -488,6 +492,80 @@ test("discovery: extra agent dirs load below the user dir in precedence", () => 
 		);
 	});
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PI_LEGION_EXTRA_AGENT_DIRS (+ legacy PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS alias)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("resolveExtraAgentDirs: new env alone", () => {
+	withDir((root) => {
+		resetExtraAgentDirsDeprecationWarnForTests();
+		const dir = path.join(root, "new-only");
+		mkdirSync(dir, { recursive: true });
+		const warnings: string[] = [];
+		const resolved = resolveExtraAgentDirs(
+			{ [EXTRA_AGENT_DIRS_ENV]: dir },
+			(message) => warnings.push(message),
+		);
+		assert.deepEqual(resolved, [path.resolve(dir)]);
+		assert.equal(warnings.length, 0, "canonical env must not warn");
+	});
+});
+
+test("resolveExtraAgentDirs: legacy env alone still works with deprecation warn", () => {
+	withDir((root) => {
+		resetExtraAgentDirsDeprecationWarnForTests();
+		const dir = path.join(root, "legacy-only");
+		mkdirSync(dir, { recursive: true });
+		const warnings: string[] = [];
+		const resolved = resolveExtraAgentDirs(
+			{ [LEGACY_EXTRA_AGENT_DIRS_ENV]: dir },
+			(message) => warnings.push(message),
+		);
+		assert.deepEqual(resolved, [path.resolve(dir)]);
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0]!, /deprecated/);
+		assert.match(warnings[0]!, /PI_LEGION_EXTRA_AGENT_DIRS/);
+	});
+});
+
+test("resolveExtraAgentDirs: both set — new name wins, legacy ignored", () => {
+	withDir((root) => {
+		resetExtraAgentDirsDeprecationWarnForTests();
+		const modernDir = path.join(root, "modern");
+		const legacyDir = path.join(root, "legacy");
+		mkdirSync(modernDir, { recursive: true });
+		mkdirSync(legacyDir, { recursive: true });
+		const warnings: string[] = [];
+		const resolved = resolveExtraAgentDirs(
+			{
+				[EXTRA_AGENT_DIRS_ENV]: modernDir,
+				[LEGACY_EXTRA_AGENT_DIRS_ENV]: legacyDir,
+			},
+			(message) => warnings.push(message),
+		);
+		assert.deepEqual(resolved, [path.resolve(modernDir)]);
+		assert.ok(!resolved.includes(path.resolve(legacyDir)));
+		assert.equal(warnings.length, 1);
+		assert.match(warnings[0]!, /new name wins/);
+	});
+});
+
+test("resolveExtraAgentDirs: PATH-style multiple entries on new env", () => {
+	withDir((root) => {
+		resetExtraAgentDirsDeprecationWarnForTests();
+		const a = path.join(root, "a");
+		const b = path.join(root, "b");
+		mkdirSync(a, { recursive: true });
+		mkdirSync(b, { recursive: true });
+		const resolved = resolveExtraAgentDirs(
+			{ [EXTRA_AGENT_DIRS_ENV]: `${a}${path.delimiter}${b}` },
+			() => {},
+		);
+		assert.deepEqual(resolved, [path.resolve(a), path.resolve(b)]);
+	});
+});
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // A frontmatter key that is accepted but does nothing is worse than an unknown
