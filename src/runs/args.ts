@@ -152,6 +152,60 @@ export function childInheritsExtensions(agent: Pick<AgentConfig, "inheritExtensi
 	return raw === "1" || raw === "true" || raw === "on" || raw === "yes";
 }
 
+/** Light pi builtin that registers the `codemode` tool (`-e builtin:codemode`). */
+export const BUILTIN_CODEMODE = "builtin:codemode";
+
+/** True for `builtin:<name>` refs — must not be `path.resolve`d. */
+export function isBuiltinExtensionRef(ext: string): boolean {
+	return ext.trimStart().startsWith("builtin:");
+}
+
+/** Dedup key for an `--extension` value (path or builtin ref). */
+export function extensionDedupeKey(ext: string): string {
+	return isBuiltinExtensionRef(ext) ? ext.trim() : path.resolve(ext);
+}
+
+export function roleListsCodemode(agent: Pick<AgentConfig, "tools">): boolean {
+	return (agent.tools ?? []).some((t) => t === "codemode");
+}
+
+export function isCodemodeExtension(ext: string): boolean {
+	const t = ext.trim();
+	return t === BUILTIN_CODEMODE || t.endsWith("/" + BUILTIN_CODEMODE);
+}
+
+/**
+ * Effective `--extension` values for a child under `--no-extensions`.
+ *
+ * Includes role `extensions` / `subagentOnlyExtensions`, `PI_LEGION_CHILD_EXTENSIONS`,
+ * auto `builtin:codemode` when `tools` lists `codemode` (#89), and the child-guard.
+ */
+export function collectChildExtensions(
+	agent: Pick<AgentConfig, "tools" | "extensions" | "subagentOnlyExtensions">,
+	env: NodeJS.ProcessEnv = process.env,
+): string[] {
+	const list = [
+		...(agent.extensions ?? []),
+		...(agent.subagentOnlyExtensions ?? []),
+		...childExtraExtensions(env),
+	];
+	// #89: codemode is a light builtin (unlike heavy pi-lens). Keep tools:codemode
+	// honest when discovery is disabled via `--no-extensions`.
+	if (roleListsCodemode(agent) && !list.some(isCodemodeExtension)) {
+		list.push(BUILTIN_CODEMODE);
+	}
+	list.push(childGuardExtensionPath());
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const ext of list) {
+		const key = extensionDedupeKey(ext);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(ext);
+	}
+	return out;
+}
+
 /** `--tools a,b`, `--no-extensions` (unless inherited), plus one `--extension` per explicit extension. */
 function pushToolArgs(args: string[], agent: AgentConfig): void {
 	const tools = agent.tools?.filter(Boolean) ?? [];
@@ -164,19 +218,9 @@ function pushToolArgs(args: string[], agent: AgentConfig): void {
 	// silently inherit every extension the parent happens to have loaded
 	// (#43: each host extension such as an LSP stack costs ~1 GB per child).
 	// `--no-extensions` stops discovery; explicit `--extension` paths below
-	// (the role's list + this package for the guard / nested spawning) still load.
+	// (the role's list + auto builtin:codemode + this package for the guard) still load.
 	if (!childInheritsExtensions(agent)) args.push("--no-extensions");
-	const extensions = [
-		...(agent.extensions ?? []),
-		...(agent.subagentOnlyExtensions ?? []),
-		...childExtraExtensions(),
-		childGuardExtensionPath(),
-	];
-	const seen = new Set<string>();
-	for (const ext of extensions) {
-		const resolved = path.resolve(ext);
-		if (seen.has(resolved)) continue;
-		seen.add(resolved);
+	for (const ext of collectChildExtensions(agent)) {
 		args.push("--extension", ext);
 	}
 }

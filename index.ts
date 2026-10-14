@@ -81,7 +81,7 @@ import {
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
-import { expectedModelsFromSettings, runLegionDoctor } from "./src/extension/legion-doctor.ts";
+import { expectedModelsFromSettings, parseDoctorSections, runLegionDoctor } from "./src/extension/legion-doctor.ts";
 import { readFileSync } from "node:fs";
 import {
 	effectiveMaxDepth,
@@ -147,7 +147,7 @@ const SubagentParams = Type.Object({
 				Type.Literal("stop"),
 				Type.Literal("diagnose"),
 			],
-			{ description: "Defaults to launch. diagnose = Legion doctor full self-check (extensions/models/spawn/memory/tools/storage/runtime)." },
+			{ description: "Defaults to launch. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor." },
 		),
 	),
 	agent: Type.Optional(
@@ -207,6 +207,12 @@ const SubagentParams = Type.Object({
 	),
 	team: Type.Optional(
 		Type.String({ description: "Team to use for the launched child and its nested roster" }),
+	),
+	section: Type.Optional(
+		Type.String({
+			description:
+				'diagnose only: optional section filter (summary|extensions|models|spawn|memory|tools|storage|runtime|next), same as `/legion doctor [section]`. Space/comma-separated for multiple.',
+		}),
 	),
 });
 
@@ -898,6 +904,17 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 
 			if (action === "list") return ok(renderAgentList(agents, team, teamWarnings));
 			if (action === "diagnose") {
+				let sections;
+				try {
+					sections = parseDoctorSections(
+						typeof params.section === "string" ? params.section : undefined,
+					);
+				} catch (error) {
+					return fail(
+						error instanceof Error ? error.message : String(error),
+						ErrorCodes.INVALID_PARAMS,
+					);
+				}
 				let settings: unknown;
 				try {
 					settings = JSON.parse(readFileSync(path.join(getAgentDir(), "settings.json"), "utf8"));
@@ -911,6 +928,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 					expectedModels: expectedModelsFromSettings(settings),
 					sampleAgent: agents[0],
 					agents,
+					sections,
 					runtime: {
 						liveJobs: runtime.activeJobs().map((job) => ({
 							name: job.name,

@@ -5,8 +5,10 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { AgentConfig } from "../../src/shared/types.ts";
 import {
+	BUILTIN_CODEMODE,
 	buildPiArgs,
 	childGuardExtensionPath,
+	collectChildExtensions,
 } from "../../src/runs/args.ts";
 import { CHILD_TASK_APPENDIX } from "../../src/extension/child-guard.ts";
 
@@ -140,5 +142,40 @@ test("#43 escape hatches: role inheritExtensions, env inherit, env extra extensi
 		assert.ok(args.includes("--no-extensions"));
 		const exts = args.flatMap((a, i) => (a === "--extension" ? [args[i + 1]] : []));
 		assert.deepEqual(exts, ["/a/provider.ts", "/b/x.ts", childGuardExtensionPath()]);
+	});
+});
+
+
+test("#89 tools:codemode auto-loads builtin:codemode under --no-extensions", () => {
+	withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined }, () => {
+		const args = argvFor({ ...agent(), tools: ["read", "bash", "codemode"] });
+		assert.ok(args.includes("--no-extensions"));
+		const exts = args.flatMap((a, i) => (a === "--extension" ? [args[i + 1]] : []));
+		assert.ok(exts.includes(BUILTIN_CODEMODE), `expected ${BUILTIN_CODEMODE} in ${exts.join(",")}`);
+		assert.equal(exts.filter((e) => e === BUILTIN_CODEMODE).length, 1);
+		assert.ok(exts.includes(childGuardExtensionPath()));
+		// builtin refs must not be path.resolved into cwd/builtin:codemode
+		assert.equal(exts.some((e) => !!e && e.includes("/") && e.endsWith("builtin:codemode")), false);
+	});
+});
+
+test("#89 collectChildExtensions dedupes explicit builtin:codemode", () => {
+	withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined }, () => {
+		const exts = collectChildExtensions({
+			tools: ["codemode"],
+			extensions: [BUILTIN_CODEMODE],
+		});
+		assert.equal(exts.filter((e) => e === BUILTIN_CODEMODE).length, 1);
+		assert.deepEqual(
+			exts,
+			[BUILTIN_CODEMODE, childGuardExtensionPath()],
+		);
+	});
+});
+
+test("#89 no codemode tool → no auto builtin:codemode", () => {
+	withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined }, () => {
+		const exts = argvFor(agent()).flatMap((a, i, args) => (a === "--extension" ? [args[i + 1]] : []));
+		assert.equal(exts.includes(BUILTIN_CODEMODE), false);
 	});
 });

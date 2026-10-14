@@ -2,9 +2,9 @@
  * `/legion doctor` and `subagent action=diagnose`: broad self-check for
  * pi-legion (inspired by `pi list` / `pi auth check` / `pi --help`).
  *
- * Sections are filterable via `/legion doctor [section]` so the main agent can
- * pull only what it needs, then act on the structured Next steps.
- * `subagent({ action: "diagnose" })` returns the full report (no section field).
+ * Sections are filterable via `/legion doctor [section]` or
+ * `subagent({ action: "diagnose", section })` so the main agent can pull only
+ * what it needs, then act on the structured Next steps.
  */
 
 import { execFileSync } from "node:child_process";
@@ -12,12 +12,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	BUILTIN_CODEMODE,
 	CHILD_EXTENSIONS_ENV,
 	CHILD_INHERIT_EXTENSIONS_ENV,
-	childExtraExtensions,
-	childInheritsExtensions,
 	buildPiArgs,
+	childExtraExtensions,
 	childGuardExtensionPath,
+	childInheritsExtensions,
+	collectChildExtensions,
+	isCodemodeExtension,
+	roleListsCodemode,
 } from "../runs/args.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import {
@@ -380,17 +384,10 @@ export function parseDoctorSections(raw: string | undefined): DoctorSection[] | 
 	return out.length ? out : undefined;
 }
 
-function extensionsForRole(agent: AgentConfig, env: NodeJS.ProcessEnv, extras: string[]): string[] {
+function extensionsForRole(agent: AgentConfig, env: NodeJS.ProcessEnv, _extras: string[]): string[] {
 	if (childInheritsExtensions(agent, env)) return ["(all host-discovered extensions)"];
-	const seen = new Set<string>();
-	const out: string[] = [];
-	for (const ext of [...(agent.extensions ?? []), ...(agent.subagentOnlyExtensions ?? []), ...extras, childGuardExtensionPath()]) {
-		const resolved = path.resolve(ext);
-		if (seen.has(resolved)) continue;
-		seen.add(resolved);
-		out.push(ext);
-	}
-	return out;
+	// Same effective list as `buildPiArgs` / `collectChildExtensions` (#89 builtin:codemode).
+	return collectChildExtensions(agent, env);
 }
 
 function scanOrphanTemps(storeRoot: string): { total: number; orphanDead: number; live: number; unknown: number; samples: string[] } {
@@ -622,6 +619,20 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 				fix: `Add pi-lens to ${agent.name}'s extensions: frontmatter, or to ${CHILD_EXTENSIONS_ENV}.`,
 			});
 		}
+		const needsCodemode = roleListsCodemode(agent);
+		const hasCodemode =
+			childInheritsExtensions(agent, env) ||
+			inheritGlobal ||
+			exts.some(isCodemodeExtension);
+		if (needsCodemode && !hasCodemode) {
+			issues.push({
+				severity: "warning",
+				code: "ROLE_MISSING_CODEMODE",
+				section: "extensions",
+				message: `Role "${agent.name}" lists codemode but would not load ${BUILTIN_CODEMODE} under --no-extensions.`,
+				fix: `Add ${BUILTIN_CODEMODE} to ${agent.name}'s extensions: frontmatter, or ensure tools: includes codemode so Legion auto-loads it.`,
+			});
+		}
 	}
 
 	const failures = options.failures ?? recentSpawnFailures();
@@ -822,7 +833,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		push(`- idle strip hints: "${IDLE_STOP_HINT}" / short "${IDLE_STOP_HINT_SHORT}"`);
 		push(`- legion tools registered: ${(runtime.legionTools ?? ["(unknown — typically subagent, vexillatio, legion-* mail/tools)"]).join(", ")}`);
 		push("- slash: `/legion doctor [section]`");
-		push("- tool: `subagent({ action: \"diagnose\" })` — full report; no section field (filter with the slash command)");
+		push("- tool: `subagent({ action: \"diagnose\", section? })` — optional section filter (same as `/legion doctor [section]`)");
 		push("");
 	}
 
@@ -915,6 +926,9 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		}
 		if (issues.some((i) => i.code === "ROLE_MISSING_LENS")) {
 			steps.push("Add pi-lens extension path to roles that list lens_* tools, or to PI_LEGION_CHILD_EXTENSIONS.");
+		}
+		if (issues.some((i) => i.code === "ROLE_MISSING_CODEMODE")) {
+			steps.push(`Add ${BUILTIN_CODEMODE} to roles that list codemode (or keep tools: codemode so Legion auto-loads it).`);
 		}
 		if (issues.some((i) => i.code === "MEMORY_GATE_WOULD_REFUSE")) {
 			steps.push("Stop idle children (`/legion stop`) or lower/disable PI_LEGION_MIN_FREE_MEM_MB before launching more.");
