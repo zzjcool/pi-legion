@@ -22,6 +22,7 @@ shared SQLite ledger records the whole tree.
 - [Legion tools and phases](#legion-tools-and-phases)
 - [Three-layer visualization](#three-layer-visualization)
 - [Settings and budget gates](#settings-and-budget-gates)
+- [Scout guard](#scout-guard)
 - [Team 配置](#team-配置)
 - [Parent/child context conventions](#parentchild-context-conventions)
 - [Delivery and resume](#delivery-and-resume)
@@ -225,6 +226,38 @@ launched role's `maxSubagentDepth = R` counts generations in that role's
 subtree, including itself; when launched by a parent at depth `d`, it inherits
 `C_child = min(C_parent, d + R, 4)` (`R = 1` makes it a leaf), so it can tighten
 the inherited cap but cannot widen it.
+
+### Scout guard
+
+`subagents.scoutGuard` watches the main session. After `threshold` consecutive
+read-like tool calls with no `subagent` launch or `vexillatio` call in
+between, it injects one follow-up reminder and then waits out `cooldownMs`.
+It is on by default. Set it in `~/.pi/agent/settings.json` or the project
+`.pi/settings.json`; a project file overrides the same fields from the user
+file.
+
+```json
+{
+  "subagents": {
+    "scoutGuard": {
+      "enabled": true,
+      "threshold": 8,
+      "cooldownMs": 120000
+    }
+  }
+}
+```
+
+| Field | Default | Meaning |
+| --- | ---: | --- |
+| `enabled` | `true` | Count and remind. `false` skips the guard until it is turned back on. |
+| `threshold` | `8` | Consecutive read-like calls before one reminder. Positive integer. |
+| `cooldownMs` | `120000` | Quiet period after a reminder, in milliseconds. Integer ≥ 0. |
+
+`/scout-guard` turns the guard on for this session and `/no-scout-guard`
+turns it off. Both override `enabled` in memory only; settings files stay
+unchanged. Child sessions do not register these commands. Behavior in full
+is in [docs/design.md §6.4.1](docs/design.md#641-scout-guard-subagentsscoutguard).
 
 ### Team 配置
 
