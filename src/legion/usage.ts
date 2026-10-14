@@ -64,10 +64,17 @@ export function usageTotalTokens(db: DatabaseSync, nodeId: string): number {
 export function attachUsageTotals<T extends { id: string }>(
 	db: DatabaseSync,
 	nodes: T[],
-): Array<T & { tokensTotal?: number }> {
+): Array<T & { tokensTotal?: number; tokensOut?: number }> {
 	return nodes.map((node) => {
-		const total = node.id === "root" ? 0 : usageTotalTokens(db, node.id);
-		return (total > 0 ? { ...node, tokensTotal: total } : { ...node }) as T & { tokensTotal?: number };
+		if (node.id === "root") return { ...node } as T & { tokensTotal?: number; tokensOut?: number };
+		const usage = getUsage(db, node.id);
+		if (!usage) return { ...node } as T & { tokensTotal?: number; tokensOut?: number };
+		const total = usage.tokensIn + usage.tokensOut;
+		return {
+			...node,
+			...(total > 0 ? { tokensTotal: total } : {}),
+			...(usage.tokensOut > 0 ? { tokensOut: usage.tokensOut } : {}),
+		} as T & { tokensTotal?: number; tokensOut?: number };
 	});
 }
 

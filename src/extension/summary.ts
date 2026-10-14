@@ -24,7 +24,7 @@ import type {
 	TaskState,
 	Usage,
 } from "../shared/types.ts";
-import { sendSlashText } from "./slash.ts";
+import { sendSlashText, type LegionSubcommand } from "./slash.ts";
 
 const RUNNING_STATES: ReadonlySet<TaskState> = new Set([
 	"working",
@@ -41,7 +41,7 @@ const OUTCOME_ORDER: readonly ExecutionStatus[] = [
 	"unknown",
 ];
 
-const SUMMARY_USAGE = "Usage: /subagents-summary [--all] [<name>]";
+const SUMMARY_USAGE = "Usage: /legion summary [--all] [<name>]";
 
 /** Session data supplied by the command layer to the pure aggregator. */
 export type SummarySession = ParsedSession;
@@ -725,10 +725,10 @@ function notifyUnknownChild(
 	);
 }
 
-/** Register /subagents-summary on the host Pi extension. */
-export function registerSummaryCommand(pi: ExtensionAPI): void {
+/** Build the `/legion summary [--all] [<name>]` handler. */
+export function createSummaryCommand(pi: ExtensionAPI): LegionSubcommand {
 	let completionCwd = process.cwd();
-	pi.registerCommand("subagents-summary", {
+	return {
 		description: "Summarize subagent runs under the current session",
 		getArgumentCompletions: (prefix) => summaryCompletions(prefix, completionCwd),
 		handler: async (args, ctx) => {
@@ -768,5 +768,5 @@ export function registerSummaryCommand(pi: ExtensionAPI): void {
 				formatSubagentSummary(summary, { cwd: ctx.cwd }),
 			);
 		},
-	});
+	};
 }

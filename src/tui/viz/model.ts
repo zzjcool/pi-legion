@@ -20,8 +20,15 @@ export interface VizNode {
 	startedAt: number;
 	/** Set once the node reaches a terminal display state. */
 	endedAt?: number;
-	/** Cumulative tokens reported for the node. */
+	/** Cumulative tokens reported for the node (input+cache+output; display totals). */
 	tokens: number;
+	/** Cumulative output tokens only; sampled for tok/s. */
+	tokensOut: number;
+	/**
+	 * Cumulative model-generation wall ms (assistant − prior user/toolResult).
+	 * Denominator for tok/s when > 0.
+	 */
+	generationMs: number;
 }
 
 /** Same set the footer/busy label treat as active, so live counts agree everywhere. */
@@ -56,6 +63,8 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 			startedAt: entry.startedAt,
 			...(status !== "running" ? { endedAt: entry.finishedAt ?? entry.startedAt } : {}),
 			tokens: Math.max(0, entry.tokensTotal ?? 0),
+			tokensOut: Math.max(0, entry.tokensOut ?? 0),
+			generationMs: Math.max(0, entry.generationMs ?? 0),
 		});
 	}
 	// Parents that are missing from the snapshot re-attach to the nearest known ancestor.

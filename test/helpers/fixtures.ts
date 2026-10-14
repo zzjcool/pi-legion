@@ -85,7 +85,7 @@ export function assistantMsg(opts: AssistantMsgOptions = {}): string {
 }
 
 /** Tool result; `isError: true` is the per-turn diagnostic signal (F30). */
-export function toolResult(opts: { isError?: boolean; toolName?: string; text?: string } = {}): string {
+export function toolResult(opts: { isError?: boolean; toolName?: string; text?: string; timestamp?: number } = {}): string {
 	const isError = opts.isError ?? false;
 	return JSON.stringify({
 		type: "message",
@@ -99,6 +99,7 @@ export function toolResult(opts: { isError?: boolean; toolName?: string; text?: 
 					text: opts.text ?? (isError ? "(no output)\n\nCommand exited with code 1" : "ok"),
 				},
 			],
+			...(opts.timestamp !== undefined ? { timestamp: opts.timestamp } : {}),
 		},
 	});
 }

@@ -119,7 +119,7 @@ test("idle Esc: consumes bare Esc only when idle + empty editor + editor focus +
 });
 
 const T0 = 1_700_000_000_000;
-const vnode = (id: string, opts: Partial<VizNode> = {}): VizNode => ({ id, name: id, role: "scout", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, ...opts });
+const vnode = (id: string, opts: Partial<VizNode> = {}): VizNode => ({ id, name: id, role: "scout", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, ...opts });
 const ROOT = vnode("root", { name: "centurion-0", role: "centurion", parentId: null, depth: 0 });
 
 test("railway: idle stop hint shows dim on the header, shortens on narrow widths, hidden when not requested", () => {
