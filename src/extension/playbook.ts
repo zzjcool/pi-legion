@@ -7,7 +7,7 @@ export const PLAYBOOK_NAME = "pi-legion-playbook";
 export const PARENT_PLAYBOOK = [
 	"Pi Legion playbook (frozen — do not invent a launch recipe):",
 	"1. Call the `subagent` tool immediately with the matching role from the roster in this prompt. Do not substitute bash/curl/web fetch for a search or research role.",
-	'   One child:  subagent({ agent: "<role>", task: "..." })',
+	'   One child:  subagent({ agent: "<role>", task: "...", name?: "scout-a" })  // optional name= registers that handle (not auto scout-N)',
 	"   Parallel:   subagent({ tasks: [{ agent, task }, { agent, task }] })",
 	"2. Prefer tasks[] for independent parallel work. Child processes are headless RPC children; no pane or tab is created.",
 	"3. Then return control. A completion message wakes this session when idle; if it is still working, the notice waits until the current turn ends. Use `wait` when you need blocking results, and `collect` to inspect a child's session JSONL. Pressing Esc to abort a parent turn gracefully retires its children; a wait interrupted by Esc returns `interrupted (parent turn aborted)` after cascade shutdown. In `pi --print` or JSON mode, session shutdown waits for live async children to settle (up to each child's turn timeout) before retiring them. Use same-turn `wait`/`collect` or `async: false` when that print turn must include the child's result.",
