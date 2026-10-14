@@ -252,7 +252,9 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 		cv.text(lx + 2, ly, role, "dim");
 		lx += w;
 	}
-	for (const [label, col] of [["✗ failed", "error"], ["⣿ retired", "dim"]] as const) {
+	const statuses = new Set(nodes.map((node) => node.status));
+	for (const [status, label, col] of [["failed", "✗ failed", "error"], ["retired", "⣿ retired", "dim"]] as const) {
+		if (!statuses.has(status)) continue;
 		if (lx + label.length + 1 > r.x + r.w - 1) break;
 		cv.text(lx, ly, label, col);
 		lx += label.length + 2;

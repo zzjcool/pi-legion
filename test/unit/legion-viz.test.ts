@@ -334,6 +334,41 @@ test("legion view: root is not listed as an agent type and the factory fills the
 	component.dispose();
 });
 
+test("galaxy legend: running scouts omit failed/retired status glyphs", () => {
+	const sampler = new RateSampler();
+	const now = sec(20);
+	const nodes = [
+		ROOT,
+		node("scout-0", { role: "scout", startedAt: sec(0), tokens: 100, tokensOut: 50, generationMs: 1_000 }),
+		node("scout-1", { role: "scout", startedAt: sec(5), tokens: 80, tokensOut: 40, generationMs: 800 }),
+		node("scout-2", { role: "scout", startedAt: sec(10), tokens: 60, tokensOut: 30, generationMs: 600 }),
+		node("scout-3", { role: "scout", startedAt: sec(15), tokens: 40, tokensOut: 20, generationMs: 400 }),
+	];
+	sampler.record(now, nodes);
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	const legend = renderLegionView(data, initialViewState(), 120, 40).canvas.toPlain().find((l) => l.includes("⣿ scout"))!;
+	assert.ok(legend.includes("⣿ scout"), legend);
+	assert.ok(!legend.includes("✗ failed"), legend);
+	assert.ok(!legend.includes("retired"), legend);
+});
+
+test("galaxy legend: failed and retired glyphs appear only when those statuses exist", () => {
+	const sampler = new RateSampler();
+	const now = sec(40);
+	const nodes = [
+		ROOT,
+		node("scout-0", { role: "scout", startedAt: sec(0), tokens: 100, tokensOut: 50, generationMs: 1_000 }),
+		node("scout-1", { role: "scout", status: "failed", startedAt: sec(5), endedAt: sec(20), tokens: 40, tokensOut: 20, generationMs: 400 }),
+		node("scout-2", { role: "scout", status: "retired", startedAt: sec(10), endedAt: sec(30), tokens: 20, tokensOut: 10, generationMs: 200 }),
+	];
+	sampler.record(now, nodes);
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	const legend = renderLegionView(data, initialViewState(), 120, 40).canvas.toPlain().find((l) => l.includes("⣿ scout"))!;
+	assert.ok(legend.includes("⣿ scout"), legend);
+	assert.ok(legend.includes("✗ failed"), legend);
+	assert.ok(legend.includes("⣿ retired"), legend);
+});
+
 test("viz: duplicate child names from nested supervisors are disambiguated by parent", () => {
 	const entries: StatusEntry[] = [
 		{ name: "root", agent: "root", state: "running", startedAt: T0, nodeId: "root", parentId: null, depth: 0 },
