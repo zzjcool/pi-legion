@@ -102,3 +102,8 @@ For a blocked extension UI request, the RPC supervisor bubbles the request up
 to the root Pi UI for human response by default. A child completion or a
 `legion_mail` message is not a substitute for checking its saved result and
 machine-recorded state.
+
+`pi --print` and JSON mode wait for live async children during session
+shutdown, up to each child's turn timeout. That keeps a just-spawned child
+from being retired before its first assistant message. To put the child's
+result in the same print turn, use `wait`, `collect`, or `async: false`.

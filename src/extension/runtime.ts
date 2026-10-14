@@ -30,7 +30,7 @@ import {
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
-import { DEFAULTS, type AgentKind } from "../shared/types.ts";
+import { DEFAULTS, type AgentKind, type RetireOptions } from "../shared/types.ts";
 import type {
 	EventSubscriptionOptions,
 	SupervisorEvent,
@@ -81,7 +81,7 @@ export interface TrackedJobInput {
 	isAlive?: () => boolean;
 	persist?: (snapshot: CollectSnapshot) => Promise<void>;
 	/** Retire the RPC child after a terminal collect. Blocked children stay alive. */
-	retire?: () => Promise<void>;
+	retire?: (opts?: RetireOptions) => Promise<void>;
 	/**
 	 * Called when collect reports a blocked child. `resume` rewatches after
 	 * the parent approved or denied; `hold` keeps the widget up.
@@ -310,6 +310,11 @@ export interface SessionRuntime {
 		names: string[],
 		opts?: { timeoutMs?: number; signal?: AbortSignal },
 	): Promise<WaitResult[]>;
+	/**
+	 * Non-interactive shutdown: let in-flight collects finish before the
+	 * caller retires whatever is still alive. Watches do not re-arm.
+	 */
+	drainBeforeShutdown(): Promise<void>;
 	dispose(): void;
 }
 
@@ -329,6 +334,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	let dbEventSource: DbEventSource | undefined;
 	let timer: ReturnType<typeof setInterval> | undefined;
 	let disposed = false;
+	let draining = false;
+	let drainPromise: Promise<void> | undefined;
 	let busyRaised = false;
 
 	// Smart join: batch completion notices per runId. The deliver sink merges
@@ -800,6 +807,15 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				try {
 					snapshot = await ensureCollect(job);
 					if (disposed || job.generation !== gen) return;
+					// Print/json shutdown is waiting on this collect. A timeout or
+					// a blocked child must stay tracked so the caller can retire
+					// it; re-arming would start another turn after the process
+					// has already decided to exit.
+					if (draining && !shouldRecycleAfterCollect(snapshot.execution.status)) {
+						hold = true;
+						job.watching = false;
+						return;
+					}
 					if (snapshot.blocked) {
 						job.state = "blocked";
 						refreshUi();
@@ -1085,6 +1101,26 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					waitOne(name, opts.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, opts.signal),
 				),
 			);
+		},
+
+		drainBeforeShutdown() {
+			if (disposed) return Promise.resolve();
+			if (drainPromise) return drainPromise;
+			draining = true;
+			const pending = [...jobs.values()];
+			drainPromise = (async () => {
+				await Promise.all(pending.map(async (job) => {
+					try {
+						await ensureCollect(job);
+					} catch {
+						// The watch records the failure; shutdown still retires the child.
+					}
+				}));
+				// The watch continuation shares this collect and must observe
+				// `draining` before the caller snapshots the jobs it will retire.
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			})();
+			return drainPromise;
 		},
 
 		dispose() {
