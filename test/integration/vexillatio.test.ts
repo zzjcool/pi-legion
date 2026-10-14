@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import herdrSubagents from "../../index.ts";
+import piLegion from "../../index.ts";
 import { ErrorCodes, type AgentConfig } from "../../src/shared/types.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import type { RpcClientOptions, SettleResult } from "../../src/supervisor/types.ts";
@@ -158,7 +158,7 @@ async function withSandbox(
 				...parentEnv,
 			},
 			async () => {
-				herdrSubagents(pi as never, { supervisor });
+				piLegion(pi as never, { supervisor });
 				try {
 					await run({ pi, supervisor, cwd });
 				} finally {

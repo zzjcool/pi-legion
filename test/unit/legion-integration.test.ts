@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import { LegionPostman } from "../../src/extension/legion-tools.ts";
-import herdrSubagents from "../../index.ts";
+import piLegion from "../../index.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "../../src/runs/args.ts";
 import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { createSessionRuntime } from "../../src/extension/runtime.ts";
@@ -102,7 +102,7 @@ test("index root launch honors a per-request team override", async () => {
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
 		for (const name of ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_ALLOW_NESTED", "PI_LEGION_DB", "PI_LEGION_NODE_ID", "PI_SUBAGENTS_TEAM"]) delete process.env[name];
-		herdrSubagents(pi as never, { supervisor });
+		piLegion(pi as never, { supervisor });
 		const tool = tools.get("subagent");
 		assert.ok(tool);
 		await tool.execute("override-team", { agent: "worker", task: "be a backend worker", team: "backend", async: true, worktree: false }, undefined, undefined, {
@@ -147,7 +147,7 @@ test("index root launch creates one reusable ledger, child identity opens it, an
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
 		for (const key of ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_ALLOW_NESTED", LEGION_DB_ENV, LEGION_NODE_ID_ENV, "PI_SUBAGENTS_TEAM"]) delete process.env[key];
-		herdrSubagents(pi as never, { supervisor });
+		piLegion(pi as never, { supervisor });
 		const tool = tools.get("subagent");
 		assert.ok(tool);
 		const launch = await tool.execute("root-test", { agent: "worker", task: "create the first Legion tree", async: true, worktree: false }, undefined, undefined, {
@@ -240,7 +240,7 @@ test("index root launch creates one reusable ledger, child identity opens it, an
 			events: { emit() {} },
 			on(name: string, handler: (...args: unknown[]) => unknown) { childHandlers.set(name, handler); },
 		};
-		herdrSubagents(childPi as never, { supervisor: new FakeSupervisor() });
+		piLegion(childPi as never, { supervisor: new FakeSupervisor() });
 		assert.ok(childTools.has("subagent"));
 		assert.ok(childTools.has("legion_mail"));
 		assert.ok(childTools.has("legion_tree"));
@@ -313,7 +313,7 @@ test("centurion resume recovers a running child and does not revive a settled ch
 		process.env.PI_SUBAGENT_ALLOW_NESTED = "1";
 		process.env[LEGION_DB_ENV] = path.resolve(dbPath);
 		process.env[LEGION_NODE_ID_ENV] = "root.centurion";
-		herdrSubagents(pi as never, { supervisor });
+		piLegion(pi as never, { supervisor });
 		assert.ok(tools.has("legion_mail"));
 		assert.ok(tools.has("legion_tree"));
 		assert.ok(tools.has("legion_phase"), "a resumed centurion keeps the phase-transition tool");
@@ -1423,7 +1423,7 @@ test("a supervisor-injected extension never adopts a legion identity from inheri
 			on(name: string, handler: (...args: unknown[]) => unknown) { handlers.set(name, handler); },
 		};
 		// Supervisor injection is what every unit test harness does.
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		const tool = tools.find((entry) => entry.name === "subagent") as { execute: (...args: unknown[]) => Promise<unknown> };
 		assert.ok(tool, "subagent tool registered");
 		// Launch through the injected fake: must NOT create legion ledger rows.

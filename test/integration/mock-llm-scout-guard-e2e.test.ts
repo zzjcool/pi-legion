@@ -143,7 +143,7 @@ test("e2e: mock-llm scripts N consecutive read-class tool_calls then settles", a
 });
 
 test("e2e: extension harness — notify once, dispatch clears, cooldown blocks second", async () => {
-	const herdrSubagents = (await import("../../index.ts")).default;
+	const piLegion = (await import("../../index.ts")).default;
 	const dir = mkdtempSync(path.join(tmpdir(), "mock-scout-guard-"));
 	const previous = {
 		agentDir: process.env.PI_CODING_AGENT_DIR,
@@ -201,7 +201,7 @@ test("e2e: extension harness — notify once, dispatch clears, cooldown blocks s
 				);
 			},
 		};
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		const handler = events.get("tool_call");
 		assert.equal(typeof handler, "function");
 
@@ -296,7 +296,7 @@ test("e2e: extension harness — notify once, dispatch clears, cooldown blocks s
 });
 
 test("e2e: mock-llm + harness — feed scripted read names into scout-guard", async () => {
-	const herdrSubagents = (await import("../../index.ts")).default;
+	const piLegion = (await import("../../index.ts")).default;
 	const dir = mkdtempSync(path.join(tmpdir(), "mock-scout-guard-feed-"));
 	const previous = {
 		agentDir: process.env.PI_CODING_AGENT_DIR,
@@ -351,7 +351,7 @@ test("e2e: mock-llm + harness — feed scripted read names into scout-guard", as
 				);
 			},
 		};
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		const handler = events.get("tool_call");
 		assert.equal(typeof handler, "function");
 

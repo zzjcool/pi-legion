@@ -121,7 +121,7 @@ const VexillatioParams = Type.Object({
 
 **既有测试文件除 §3 明确授权的 `test/unit/child-mode.test.ts` 两处断言数字修订外一律不修改**；§4 要求的新增测试全部落在两个新文件里。
 
-**断言影响总则（REV-17.5）**：契约导致的注册行为变化若使某既有断言失效，属于本契约的影响面；授权范围以本 §3 该行所列为准，本行已全量扫描（grep `pi.tools\|tools.length\|tools.find\|tools.get\|herdrSubagents(` 全测试目录）并一次列尽。后续若再发现同类冲突，上报照旧。
+**断言影响总则（REV-17.5）**：契约导致的注册行为变化若使某既有断言失效，属于本契约的影响面；授权范围以本 §3 该行所列为准，本行已全量扫描（grep `pi.tools\|tools.length\|tools.find\|tools.get\|piLegion(` 全测试目录）并一次列尽。后续若再发现同类冲突，上报照旧。
 
 ## 4. 验收清单（可机器检查）
 

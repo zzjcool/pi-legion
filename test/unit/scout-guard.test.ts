@@ -446,7 +446,7 @@ test("parent tool_call observes reads and does not block or rewrite bash", async
 	const { mkdtempSync, rmSync } = await import("node:fs");
 	const { tmpdir } = await import("node:os");
 	const path = await import("node:path");
-	const herdrSubagents = (await import("../../index.ts")).default;
+	const piLegion = (await import("../../index.ts")).default;
 	const { FakeSupervisor } = await import("../helpers/fake-supervisor.ts");
 	const dir = mkdtempSync(path.join(tmpdir(), "scout-guard-parent-"));
 	const previous = {
@@ -469,7 +469,7 @@ test("parent tool_call observes reads and does not block or rewrite bash", async
 				events.set(name, handler as (event: { toolName: string; input: { command: string } }, ctx?: { cwd?: string }) => unknown);
 			},
 		};
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		const handler = events.get("tool_call");
 		assert.equal(typeof handler, "function");
 		const event = { toolName: "bash", input: { command: "echo hi" } };
@@ -490,7 +490,7 @@ test("harness: N read-like calls notify once, dispatch clears the streak, cooldo
 	const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
 	const { tmpdir } = await import("node:os");
 	const path = await import("node:path");
-	const herdrSubagents = (await import("../../index.ts")).default;
+	const piLegion = (await import("../../index.ts")).default;
 	const { FakeSupervisor } = await import("../helpers/fake-supervisor.ts");
 	const threshold = 4;
 	const dir = mkdtempSync(path.join(tmpdir(), "scout-guard-harness-"));
@@ -525,7 +525,7 @@ test("harness: N read-like calls notify once, dispatch clears the streak, cooldo
 				events.set(name, handler as (event: { toolName: string; input?: unknown }, ctx?: { cwd?: string }) => unknown);
 			},
 		};
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		const handler = events.get("tool_call");
 		assert.equal(typeof handler, "function");
 		const call = (toolName: string, input: unknown) => {

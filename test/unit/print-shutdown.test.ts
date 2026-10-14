@@ -9,7 +9,7 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import herdrSubagents from "../../index.ts";
+import piLegion from "../../index.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import {
 	NO_ASSISTANT_ABORT_REASON,
@@ -75,7 +75,7 @@ async function withExtension(
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
 		for (const name of ENV_KEYS.slice(2)) delete process.env[name];
-		herdrSubagents(pi as never, { supervisor });
+		piLegion(pi as never, { supervisor });
 		const tool = tools.get("subagent");
 		assert.ok(tool);
 		await run({
