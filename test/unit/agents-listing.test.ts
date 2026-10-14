@@ -431,6 +431,11 @@ test("/legion is the sole slash command and offers unified subcommand completion
 		const command = findCommand(pi);
 		assert.deepEqual(pi.commands.map((entry) => entry.name), ["legion"]);
 		assert.ok(command.description?.includes("manage teams"));
+		const emptyPrefixCompletions = command.getArgumentCompletions?.("");
+		assert.ok(Array.isArray(emptyPrefixCompletions));
+		for (const name of ["team", "agents", "on", "off", "summary", "help", "doctor", "stop"]) {
+			assert.ok(emptyPrefixCompletions.some((item: { value: string }) => item.value === name), `${name} is offered for an empty prefix`);
+		}
 		assert.deepEqual(command.getArgumentCompletions?.("agents "), [
 			{ value: "agents user", label: "user" },
 			{ value: "agents project", label: "project" },
@@ -487,6 +492,23 @@ test("/legion is the sole slash command and offers unified subcommand completion
 		} as never);
 		assert.match(pi.messages.at(-1)?.content ?? "", /Subagents are enabled/);
 	});
+});
+
+test("/legion team list works in headless mode", async () => {
+	await withSandbox(
+		{ settings: { teams: { frontend: { members: ["worker"] } } } },
+		async ({ pi, projectRoot }) => {
+			const command = findCommand(pi);
+			await command.handler("team list", {
+				cwd: projectRoot,
+				mode: "headless",
+				hasUI: false,
+				ui: { notify() {} },
+			} as never);
+			assert.match(pi.messages.at(-1)?.content ?? "", /Subagent teams/);
+			assert.match(pi.messages.at(-1)?.content ?? "", /frontend/);
+		},
+	);
 });
 
 test("command: lists sandboxed + builtin roles, grouped, with file paths", async () => {

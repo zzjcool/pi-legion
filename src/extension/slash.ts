@@ -326,10 +326,7 @@ export interface TeamCommandDeps {
 }
 
 /** Parsed `/legion on|off` arguments. */
-export type ToggleCommandArgs =
-	| { action: "show" }
-	| { action: "on" }
-	| { action: "off" };
+export type ToggleCommandArgs = { action: "on" } | { action: "off" };
 
 /** Pure parser for `/legion on|off` arguments. */
 export function parseToggleCommandArgs(
@@ -340,14 +337,13 @@ export function parseToggleCommandArgs(
 	if (trimmed === "on" || trimmed === "off") {
 		return { ok: true, value: { action: trimmed } };
 	}
-	if (!trimmed) return { ok: true, value: { action: "show" } };
 	return { ok: false, message: usage };
 }
 
 export interface ToggleCommandDeps {
 	/** Whether subagents are currently enabled in THIS session (session-level override included). */
 	sessionEnabled: () => boolean;
-	/** Flip the session-level override (toggle only; never touches settings files). */
+	/** Set the session-level override without touching settings files. */
 	setSessionEnabled: (enabled: boolean) => void;
 	/** Effective `subagents.enabled` from merged settings, for display. */
 	settingsEnabled: (cwd: string) => boolean;
@@ -359,7 +355,7 @@ export interface ToggleCommandDeps {
 export function renderToggleStatus(input: {
 	enabled: boolean;
 	settingsEnabled: boolean;
-	outcome: "shown" | "flipped" | "already-on" | "already-off";
+	outcome: "flipped" | "already-on" | "already-off";
 	running: number;
 }): string {
 	const state = input.enabled ? "enabled" : "disabled";
@@ -380,8 +376,6 @@ export function renderToggleStatus(input: {
 			break;
 		case "already-off":
 			lines.push("Already disabled — nothing to do.");
-			break;
-		default:
 			break;
 	}
 	if (input.running > 0)
@@ -412,17 +406,11 @@ export function createToggleCommand(
 			}
 			const enabled = deps.sessionEnabled();
 			const running = deps.runningChildren();
-			let outcome: "shown" | "flipped" | "already-on" | "already-off" = "shown";
-			let next = enabled;
-			const action = parsed.value.action;
-			if (action === "on") {
-				next = true;
-				outcome = enabled ? "already-on" : "flipped";
-			} else if (action === "off") {
-				next = false;
-				outcome = enabled ? "flipped" : "already-off";
-			}
-			if (parsed.value.action !== "show") deps.setSessionEnabled(next);
+			const next = parsed.value.action === "on";
+			const outcome = enabled === next
+				? next ? "already-on" : "already-off"
+				: "flipped";
+			deps.setSessionEnabled(next);
 			sendSlashText(
 				pi,
 				renderToggleStatus({

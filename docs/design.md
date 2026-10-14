@@ -643,6 +643,8 @@ settings.
 
 解析顺序：会话内覆盖（`/legion on|off`，仅内存，`/reload` 后回落） >
 项目 `.pi/settings.json` > 用户 `~/.pi/agent/settings.json` > 默认 `true`。
+旧 toggle 的 `flip` 与无参数 `show` 用法已由显式 `/legion on` 或
+`/legion off` 取代；每次执行后都会显示最终状态。
 
 关闭后：launch 拒绝（`DISABLED` 错误码，指向 `/legion on`）；
 system prompt 不再注入 playbook/roster；bash 派发 guard 放行手动 herdr

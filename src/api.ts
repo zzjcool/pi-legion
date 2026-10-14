@@ -96,11 +96,14 @@ export { getAgentDir } from "./agents/paths.ts";
 
 export {
 	parseTeamCommandArgs,
+	createAgentsCommand,
 	createTeamCommand,
+	createToggleCommand,
 	renderTeamStatus,
 	sendSlashText,
 	updateSubagentSettingsFile,
 } from "./extension/slash.ts";
+export type { LegionSubcommand } from "./extension/slash.ts";
 export {
 	aggregateSubagentRuns,
 	formatSubagentSummary,

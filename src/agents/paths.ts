@@ -8,7 +8,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 
-/** Directory that holds `settings.json`, `agents/`, and `profiles/`. */
+/** Directory that holds `settings.json` and user-defined `agents/`. */
 export function getAgentDir(): string {
 	const configured = process.env.PI_CODING_AGENT_DIR;
 	if (configured === "~") return os.homedir();

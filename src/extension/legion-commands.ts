@@ -14,6 +14,7 @@ import {
 	createAgentsCommand,
 	createTeamCommand,
 	createToggleCommand,
+	sendSlashText,
 	type LegionSubcommand,
 	type AgentsCommandDeps,
 	type TeamCommandDeps,
@@ -526,7 +527,7 @@ export function registerLegionCommand(
 		"Legion commands:",
 		"  /legion team [list|use <name> [--global]|create <name> a,b,c [--global]]",
 		"  /legion agents [user|project|both]",
-		"  /legion on | off (no argument shows current state)",
+		"  /legion on | off — enable/disable subagents for this session (status is shown after each run)",
 		"  /legion summary [--all] [<name>]",
 		"  /legion doctor [section]",
 		"  /legion stop [name]",
@@ -563,15 +564,15 @@ export function registerLegionCommand(
 			const verbs: { value: string; label: string }[] = [];
 			if (!prefix.includes(" ")) {
 				for (const command of ["team", "agents", "on", "off", "summary", "help"]) {
-					if (command.startsWith(prefix) && prefix.length > 0) {
+					if (command.startsWith(prefix)) {
 						verbs.push({ value: command, label: command });
 					}
 				}
 			}
-			if ("doctor".startsWith(prefix) && prefix.length > 0) {
+			if ("doctor".startsWith(prefix)) {
 				verbs.push({ value: "doctor", label: "doctor [section] — full self-check (extensions/models/spawn/memory/tools/storage/runtime)" });
 			}
-			if (deps.stop && "stop".startsWith(prefix) && prefix.length > 0) {
+			if (deps.stop && "stop".startsWith(prefix)) {
 				verbs.push({ value: "stop", label: "stop [name] — stop one live subagent, or all" });
 			}
 			return [...verbs, ...nodes
@@ -596,7 +597,7 @@ export function registerLegionCommand(
 				return;
 			}
 			if (normalizedKeyword === "help") {
-				pi.sendMessage({ customType: "subagent-slash-text", content: helpText, display: true });
+				sendSlashText(pi, helpText);
 				return;
 			}
 			if (/^doctor(?:\s|$)/i.test(query)) {

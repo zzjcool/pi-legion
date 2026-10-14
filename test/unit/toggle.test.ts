@@ -77,15 +77,13 @@ test("enabled: absent project key keeps the user's value", () => {
 
 // ───────────────────────── /legion on|off args ─────────────────────────
 
-test("toggle: empty args show current state", () => {
-	assert.deepEqual(parseToggleCommandArgs(""), {
-		ok: true,
-		value: { action: "show" },
-	});
-	assert.deepEqual(parseToggleCommandArgs("   "), {
-		ok: true,
-		value: { action: "show" },
-	});
+test("toggle: requires an explicit on/off action", () => {
+	for (const args of ["", "   ", "yes"]) {
+		assert.deepEqual(parseToggleCommandArgs(args), {
+			ok: false,
+			message: "Usage: /legion on|off",
+		});
+	}
 });
 
 test("toggle: on/off parse", () => {
@@ -134,10 +132,10 @@ test("toggle: status distinguishes session override from settings", () => {
 		renderToggleStatus({
 			enabled: true,
 			settingsEnabled: true,
-			outcome: "shown",
+			outcome: "already-on",
 			running: 0,
 		}),
-		"Subagents are enabled — matches settings.",
+		"Subagents are enabled — matches settings.\nAlready enabled — nothing to do.",
 	);
 	// One child grammar.
 	assert.match(
