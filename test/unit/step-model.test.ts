@@ -39,7 +39,8 @@ function agent(over: Partial<AgentConfig> = {}): AgentConfig {
 	};
 }
 
-/** The user's real machine: a loaded profile pins every bundled role. */const PROFILE = {
+/** Example settings pin bundled roles while presets provide overrides. */
+const SETTINGS = {
 	agentOverrides: {
 		scout: { model: "cb/deepseek-v4.1-flash" },
 		planner: { model: "cb/glm-5.3" },
@@ -66,14 +67,14 @@ function fold(
 
 test("step-model: preset beats agentOverrides AFTER loadCatalog folds them in", () => {
 	// Reproduce loadCatalog's real order: overrides are folded onto the agent.
-	const folded = fold(agent({ preset: "strong" }), PROFILE.agentOverrides);
+	const folded = fold(agent({ preset: "strong" }), SETTINGS.agentOverrides);
 	assert.equal(folded.model, "cb/deepseek-v4.1-flash", "precondition: folded");
 
 	const out = resolveStepModel({
 		agent: folded,
 		step: {},
 		params: {},
-		settings: PROFILE,
+		settings: SETTINGS,
 	});
 	// Without the dedicated precedence level this resolves to the override.
 	assert.equal(out.resolved.model, "cb/kimi-k3");
@@ -82,12 +83,12 @@ test("step-model: preset beats agentOverrides AFTER loadCatalog folds them in", 
 });
 
 test("step-model: a per-run tool `model` still beats the preset", () => {
-	const folded = fold(agent({ preset: "strong" }), PROFILE.agentOverrides);
+	const folded = fold(agent({ preset: "strong" }), SETTINGS.agentOverrides);
 	const out = resolveStepModel({
 		agent: folded,
 		step: { model: "cb/glm-5.3" },
 		params: {},
-		settings: PROFILE,
+		settings: SETTINGS,
 	});
 	assert.equal(out.resolved.model, "cb/glm-5.3");
 });
@@ -98,7 +99,7 @@ test("step-model: tool `preset` beats the agent's own frontmatter preset", () =>
 		agent: folded,
 		step: { preset: "strong" },
 		params: {},
-		settings: PROFILE,
+		settings: SETTINGS,
 	});
 	assert.equal(out.resolved.model, "cb/kimi-k3");
 	assert.equal(out.agent.preset, "strong");
@@ -109,7 +110,7 @@ test("step-model: the preset's kind and thinking reach the launched agent", () =
 		agent: agent({ preset: "visual" }),
 		step: {},
 		params: {},
-		settings: PROFILE,
+		settings: SETTINGS,
 	});
 	// This is what orchestrator.launch reads for `--kind` and thinking.
 	assert.equal(out.agent.kind, "cursor");
@@ -120,7 +121,7 @@ test("step-model: the preset's kind and thinking reach the launched agent", () =
 test("step-model: an agentOverrides-supplied preset reference is honoured", () => {
 	const folded = fold(agent({}), { scout: { preset: "strong" } });
 	assert.equal(folded.preset, "strong");
-	const out = resolveStepModel({ agent: folded, step: {}, params: {}, settings: PROFILE });
+	const out = resolveStepModel({ agent: folded, step: {}, params: {}, settings: SETTINGS });
 	assert.equal(out.resolved.model, "cb/kimi-k3");
 });
 
@@ -132,7 +133,7 @@ test("step-model: an agent with no preset is untouched", () => {
 		agent: original,
 		step: {},
 		params: {},
-		settings: PROFILE,
+		settings: SETTINGS,
 	});
 	assert.equal(out.usedPreset, false);
 	// The SAME object is passed through, not a copy.
@@ -161,7 +162,7 @@ test("BUG A1: preset kind + tool `model` override must not ship incoherently", (
 				agent: agent({ preset: "visual" }),
 				step: {},
 				params: { model: "cb/kimi-k3" },
-				settings: PROFILE,
+				settings: SETTINGS,
 			}),
 		/Preset 'visual' selects kind 'cursor'/,
 	);
@@ -248,7 +249,7 @@ test("BUG A1: a coherent preset still launches (guard is not over-eager)", () =>
 		agent: agent({ preset: "visual" }),
 		step: {},
 		params: {},
-		settings: PROFILE,
+		settings: SETTINGS,
 	});
 	assert.equal(out.resolved.model, "grok-4.6");
 	assert.equal(out.agent.kind, "cursor");
@@ -277,7 +278,7 @@ test("step-model: an undefined preset throws (never a silent fallback)", () => {
 				agent: agent({ preset: "nope" }),
 				step: {},
 				params: {},
-				settings: PROFILE,
+				settings: SETTINGS,
 			}),
 		/Preset 'nope' is not defined in subagents\.presets\. Defined: /,
 	);
@@ -312,7 +313,7 @@ test("origin: frontmatter, agentOverrides and preset are explicit choices", () =
 		agent: agent({ preset: "strong" }),
 		step: {},
 		params: {},
-		settings: PROFILE,
+		settings: SETTINGS,
 	});
 	assert.equal(preset.modelOrigin, "explicit");
 });

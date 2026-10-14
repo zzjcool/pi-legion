@@ -51,7 +51,9 @@
     "test:live": "env -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/live/*.test.ts",
     "test:all": "npm run typecheck && npm run test && npm run test:integration",
     "test:docker": "env -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH sh -c 'echo \"RPC mainline Docker checks only; legacy Herdr workspace/kind/notification scenarios are archived under test/legacy/docker and require pi-legion v0.16.x\" && bash test/docker/verify-1-child-guard.sh && bash test/docker/verify-2-task-appendix.sh && bash test/docker/verify-3-readonly.sh && bash test/docker/verify-4-acceptance.sh && bash test/docker/verify-5-blocked.sh && bash test/docker/verify-6-cache.sh && bash test/docker/verify-7-budget.sh && bash test/docker/verify-8-verify-command.sh && bash test/docker/verify-9-worktree.sh && bash test/docker/verify-10-fallback.sh && bash test/docker/verify-11-nested-alias.sh'",
-    "prepublishOnly": "npm run typecheck && npm run test && npm run test:integration"
+    "prepublishOnly": "npm run typecheck && npm run test && npm run test:integration",
+    "mock-llm": "node --experimental-strip-types test/mock-llm/cli.ts",
+    "test:mock-llm": "env -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/unit/mock-llm*.test.ts test/integration/mock-llm*.test.ts test/integration/railway-mock-e2e.test.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

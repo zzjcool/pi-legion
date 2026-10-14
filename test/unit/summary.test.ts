@@ -14,7 +14,7 @@ import {
 	formatSubagentDetail,
 	formatSubagentSummary,
 	formatTokens,
-	registerSummaryCommand,
+	createSummaryCommand,
 	summaryRole,
 } from "../../src/extension/summary.ts";
 import { parseSessionFile } from "../../src/shared/session.ts";
@@ -371,7 +371,7 @@ test("formatSubagentDetail includes RPC fields and omits legacy pane/tab data", 
 	assert.doesNotMatch(output, /worktree:/);
 });
 
-test("registerSummaryCommand registers completion and emits slash text", async () => {
+test("summary subcommand offers completion and emits slash text", async () => {
 	const root = tempRoot();
 	const oldCwd = process.cwd();
 	try {
@@ -393,47 +393,43 @@ test("registerSummaryCommand registers completion and emits slash text", async (
 		});
 		writeFileSync(otherEntry.sessionFile, "");
 		await store.addChild(otherRun.runId, otherEntry);
-		const commands = new Map<string, any>();
 		const messages: string[] = [];
 		const fakePi = {
-			registerCommand(name: string, options: unknown) {
-				commands.set(name, options);
-			},
 			sendMessage(message: { content: string }) {
 				messages.push(message.content);
 			},
 		} as any;
-		registerSummaryCommand(fakePi);
-		const command = commands.get("subagents-summary");
-		assert.ok(command);
-		await command.handler("", { cwd, ui: { notify() {} } });
+		const command = createSummaryCommand(fakePi);
+		await command.handler("", { cwd, ui: { notify() {} } } as never);
 		assert.equal(messages.length, 1);
 		assert.match(messages[0] ?? "", /Subagents session summary/);
 		assert.match(messages[0] ?? "", /2 children/);
 		assert.match(messages[0] ?? "", /planner/);
-		await command.handler("--all", { cwd, ui: { notify() {} } });
+		await command.handler("--all", { cwd, ui: { notify() {} } } as never);
 		assert.match(messages[1] ?? "", /2 children/);
 		assert.match(messages[1] ?? "", /planner/);
 		// error paths: usage noise and unknown-child notify never emit slash text
 		const errors: string[] = [];
-		const errorCtx = { cwd, ui: { notify(msg: string) { errors.push(msg); } } };
+		const errorCtx = { cwd, ui: { notify(msg: string) { errors.push(msg); } } } as never;
 		await command.handler("--bogus", errorCtx);
-		assert.match(errors[0] ?? "", /^Usage: \/subagents-summary/);
+		assert.match(errors[0] ?? "", /^Usage: \/legion summary/);
 		await command.handler("--all --all", errorCtx);
-		assert.match(errors[1] ?? "", /^Usage: \/subagents-summary/);
+		assert.match(errors[1] ?? "", /^Usage: \/legion summary/);
 		await command.handler("nope", errorCtx);
 		assert.match(errors[2] ?? "", /^unknown child: nope/);
 		assert.equal(messages.length, 2);
 		// detail path: a known name renders the detail view via sendSlashText
-		await command.handler("reviewer-0", { cwd, ui: { notify() {} } });
+		await command.handler("reviewer-0", { cwd, ui: { notify() {} } } as never);
 		assert.equal(messages.length, 3);
 		assert.match(messages[2] ?? "", /^reviewer-0 — reviewer/);
 		// The handler establishes the current cwd used by completion lookup.
-		const completions = await command.getArgumentCompletions("rev");
+		const getCompletions = command.getArgumentCompletions;
+		assert.ok(getCompletions);
+		const completions = await getCompletions("rev");
 		assert.deepEqual(completions, [{ value: "reviewer-0", label: "reviewer-0" }]);
-		const allCompletions = await command.getArgumentCompletions("--all p");
+		const allCompletions = await getCompletions("--all p");
 		assert.deepEqual(allCompletions, [{ value: "--all planner-0", label: "planner-0" }]);
-		const unknownFlag = await command.getArgumentCompletions("--x");
+		const unknownFlag = await getCompletions("--x");
 		assert.deepEqual(unknownFlag, []);
 	} finally {
 		process.chdir(oldCwd);

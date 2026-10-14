@@ -10,6 +10,17 @@ import {
 	type DoctorRuntimeSnapshot,
 } from "./legion-doctor.ts";
 import { ALLOW_NESTED_ENV } from "./budget.ts";
+import {
+	createAgentsCommand,
+	createTeamCommand,
+	createToggleCommand,
+	sendSlashText,
+	type LegionSubcommand,
+	type AgentsCommandDeps,
+	type TeamCommandDeps,
+	type ToggleCommandDeps,
+} from "./slash.ts";
+import { createSummaryCommand } from "./summary.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import type {
 	ExtensionAPI,
@@ -80,6 +91,12 @@ export interface LegionCommandDeps {
 	supervisor: RpcEventSource;
 	/** Graceful retire via the subagent `stop` action (see legion-stop.ts). */
 	stop?: (params: { name?: string; all?: boolean }) => Promise<{ ok: boolean; text: string }>;
+	/** Existing user-facing subcommand handlers; absent only in isolated tests. */
+	commands?: {
+		team: TeamCommandDeps;
+		agents: AgentsCommandDeps;
+		toggle: ToggleCommandDeps;
+	};
 }
 
 function stringField(value: unknown, key: string): string | undefined {
@@ -495,9 +512,42 @@ export function registerLegionCommand(
 	const confirmStopNode = (ctx: { ui: ExtensionUIContext }, nodeId: string): Promise<void> => confirmAndStopNode(ctx.ui, deps, nodeId);
 	const overlayStop = (ui: ExtensionUIContext) => deps.stop ? (id: string) => void confirmAndStopNode(ui, deps, id) : undefined;
 
+	const subcommands: Record<string, LegionSubcommand> = {
+		...(deps.commands
+			? {
+					team: createTeamCommand(pi, deps.commands.team),
+					agents: createAgentsCommand(pi, deps.commands.agents),
+					on: createToggleCommand(pi, deps.commands.toggle),
+					off: createToggleCommand(pi, deps.commands.toggle),
+				}
+			: {}),
+		summary: createSummaryCommand(pi),
+	};
+	const helpText = [
+		"Legion commands:",
+		"  /legion team [list|use <name> [--global]|create <name> a,b,c [--global]]",
+		"  /legion agents [user|project|both]",
+		"  /legion on | off — enable/disable subagents for this session (status is shown after each run)",
+		"  /legion summary [--all] [<name>]",
+		"  /legion doctor [section]",
+		"  /legion stop [name]",
+		"  /legion --tree | /legion <node>",
+		"  /legion help",
+	].join("\n");
 	pi.registerCommand(LEGION_COMMAND, {
-		description: "Open the Legion view, /legion doctor, /legion --tree, /legion <name>, or /legion stop [name]",
+		description: "Open the Legion view or manage teams, agents, subagent runs, and settings",
 		getArgumentCompletions(prefix) {
+			const trimmed = prefix.trimStart();
+			if (/^(team|agents|on|off|summary)\s/i.test(trimmed)) {
+				const key = trimmed.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+				if (key === "on" || key === "off") return null;
+				const command = subcommands[key];
+				const completions = command?.getArgumentCompletions?.(trimmed.replace(/^\S+\s*/, ""));
+				return completions?.map((item) => ({
+					value: `${key} ${item.value}`,
+					label: item.label,
+				})) ?? null;
+			}
 			if (deps.stop && /^stop\s/.test(prefix)) {
 				const rest = prefix.replace(/^stop\s+/, "");
 				return stopCompletions(rest, deps.runtime.activeJobs(), deps.runtime.treeNodes())
@@ -512,10 +562,17 @@ export function registerLegionCommand(
 			if (prefix.includes(" ")) return null;
 			const nodes = deps.runtime.treeNodes();
 			const verbs: { value: string; label: string }[] = [];
-			if ("doctor".startsWith(prefix) && prefix.length > 0) {
+			if (!prefix.includes(" ")) {
+				for (const command of ["team", "agents", "on", "off", "summary", "help"]) {
+					if (command.startsWith(prefix)) {
+						verbs.push({ value: command, label: command });
+					}
+				}
+			}
+			if ("doctor".startsWith(prefix)) {
 				verbs.push({ value: "doctor", label: "doctor [section] — full self-check (extensions/models/spawn/memory/tools/storage/runtime)" });
 			}
-			if (deps.stop && "stop".startsWith(prefix) && prefix.length > 0) {
+			if (deps.stop && "stop".startsWith(prefix)) {
 				verbs.push({ value: "stop", label: "stop [name] — stop one live subagent, or all" });
 			}
 			return [...verbs, ...nodes
@@ -529,6 +586,20 @@ export function registerLegionCommand(
 		},
 		async handler(args, ctx) {
 			let query = args.trim();
+			const [keyword = "", ...rest] = query.split(/\s+/);
+			const normalizedKeyword = keyword.toLowerCase();
+			const subcommand = subcommands[normalizedKeyword];
+			if (subcommand) {
+				const subArgs = normalizedKeyword === "on" || normalizedKeyword === "off"
+					? rest.length === 0 ? normalizedKeyword : [normalizedKeyword, ...rest].join(" ")
+					: rest.join(" ");
+				await subcommand.handler(subArgs, ctx);
+				return;
+			}
+			if (normalizedKeyword === "help") {
+				sendSlashText(pi, helpText);
+				return;
+			}
 			if (/^doctor(?:\s|$)/i.test(query)) {
 				const sectionArg = query.replace(/^doctor\s*/i, "").trim();
 				const report = buildDoctorReport(deps, ctx.cwd, sectionArg || undefined);

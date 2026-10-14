@@ -16,11 +16,28 @@ export const RAIL_MAX_LANES_NARROW = 3;
 export const RAIL_NARROW_COLS = 80;
 export const RAIL_WINDOW_MS = 6 * 60 * 1000;
 
+
+/**
+ * Map a timestamp onto the shared railway axis.
+ *
+ * Using `floor(t/dt) - floor(origin/dt) - 1` (instead of `floor((t-origin)/dt)`)
+ * keeps every live lane's glyphs shifting by the exact same column count when
+ * the window slides — required for "all lanes scroll left in sync".
+ * The trailing `- 1` places `now` on the last drawable column (`axisWidth - 1`).
+ */
+export function axisColumn(t: number, now: number, windowMs: number, axisWidth: number): number {
+	if (axisWidth <= 0 || windowMs <= 0) return 0;
+	const dt = windowMs / axisWidth;
+	const originCol = Math.floor((now - windowMs) / dt);
+	return Math.floor(t / dt) - originCol - 1;
+}
+
+
 export interface RailInput {
 	nodes: readonly VizNode[];
 	now: number;
 	width: number;
-	/** tok/s over the shared 60s window. */
+	/** Output tok/s over the shared 60s generation window. */
 	rate: number;
 	windowMs?: number;
 	/** Lane scroll position when more agents are live than lanes fit. */
@@ -135,18 +152,17 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	const nameCol = portrait ? Math.max(8, Math.min(16, Math.floor(width * 0.32))) : Math.min(38, Math.max(24, Math.floor(width * 0.3)));
 	const LX = 1;
 	const AW = Math.max(4, width - LX - nameCol - 2);
-	const dt = windowMs / AW;
-	const tc = (c: number): number => now - windowMs + (c + 1) * dt;
 	const canvas = new Canvas(width, rows + 1);
 	const hit: Array<Array<string | undefined>> = Array.from({ length: rows + 1 }, () => new Array<string | undefined>(width).fill(undefined));
 	const byId = new Map(nodes.map((node) => [node.id, node]));
 	const color = (node: VizNode): string => roleColor(node.role);
 
-	// One shared time axis: column c covers (tc(c-1), tc(c)], the last column is
-	// "now". Only agents live NOW get a lane; ended agents are not drawn at all,
-	// so their labels/ticks can never be compacted onto a surviving row. Every
-	// lane's head sits at the same "now" column, so all lanes scroll in sync.
-	const colOf = (t: number): number => Math.floor((t - (now - windowMs)) / dt - 1e-9);
+	// One shared time axis. Absolute column math (floor(t/dt) − floor(origin/dt))
+	// makes every lane shift by the *same* integer when `now` advances; the older
+	// floor((t − origin)/dt) form crossed quantization boundaries per-lane and
+	// looked like independent scrolling. "now" always lands on the last drawable
+	// column; only agents live NOW get a lane (ended ones vanish and rows compact).
+	const colOf = (t: number): number => axisColumn(t, now, windowMs, AW);
 	const cells = new Map<string, { ch: string; color: string; owner: string }>();
 	let owner = "";
 	// Spawn ticks on the header rule for root-spawned live lanes (first sibling owns it).

@@ -1,0 +1,100 @@
+name: Release
+
+# Semver-style tags only, for example v2.0.0 or v2.0.0-beta.1.
+# A tag such as v2 or v2.0 does not match and will not publish.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          check-latest: true
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: test
+        run: npm test
+
+      - name: test:integration
+        run: npm run test:integration
+
+      - name: test:mock-llm
+        run: npm run test:mock-llm
+
+      # test:docker is omitted. verify-*.sh runs docker with image
+      # pi-herdr-sandbox:latest (override: PI_DOCKER_IMAGE) and copies a host
+      # Pi agent dir (HOST_PI_AGENT, default /root/.pi/agent) that must already
+      # contain settings.json and models.json. GitHub-hosted runners have
+      # neither, so the script fails before any package check. Local
+      # alternative, once that image and Pi home exist:
+      #   npm run test:docker
+
+      - name: Check tag matches package.json version
+        run: |
+          set -euo pipefail
+          pkg_version="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME}"
+          expected="v${pkg_version}"
+          if [ "${tag}" != "${expected}" ]; then
+            echo "::error::Tag ${tag} does not match package.json version ${pkg_version} (expected ${expected}). Bump package.json and push a matching tag together; npm publish uses the version field, not the tag."
+            exit 1
+          fi
+          echo "Tag ${tag} matches package.json ${pkg_version}."
+
+      - name: Read tag annotation
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          out="${RUNNER_TEMP}/tag-annotation.md"
+          git for-each-ref "refs/tags/${tag}" --format='%(contents)' > "${out}"
+          if ! grep -q '[^[:space:]]' "${out}"; then
+            printf '%s\n' "_此 tag 没有 annotation。变更说明见下方自动生成的提交记录。_" > "${out}"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: ${{ runner.temp }}/tag-annotation.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Setup npm auth
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          check-latest: true
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "::error::Repository secret NPM_TOKEN is not set. GitHub Release for this tag was already created. Add an npm automation token as NPM_TOKEN, then re-run this workflow to publish package pi-legion."
+            exit 1
+          fi
+          npm publish --access public

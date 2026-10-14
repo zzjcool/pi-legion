@@ -62,13 +62,19 @@ test("provisionWorktree is idempotent for the same mode and re-runs when the dec
 
 test("provisionWorktree npm-install resolves a package.json to npm install", () => {
 	const wt = fakeWorktree({ "package.json": "{}" });
-	// Substitute the real installer with a no-op sentinel via PATH: the
-	// resolution result is observable through the marker mode alone.
-	const result = provisionWorktree({ worktreePath: wt, mode: "npm-install", timeoutMs: 5_000 });
-	// In a bare temp dir `npm install` on `{}` succeeds fast; assert via marker.
-	assert.equal(result.applied, "npm-install");
-	assert.ok(existsSync(provisionMarkerPath(wt)));
-	rmSync(wt, { recursive: true, force: true });
+	const previous = process.env.npm_config_prefix;
+	// npm scripts export this. A login bash that sources nvm aborts when it
+	// is set, so provisioning must not forward it.
+	process.env.npm_config_prefix = "/";
+	try {
+		const result = provisionWorktree({ worktreePath: wt, mode: "npm-install", timeoutMs: 15_000 });
+		assert.equal(result.applied, "npm-install");
+		assert.ok(existsSync(provisionMarkerPath(wt)));
+	} finally {
+		if (previous === undefined) delete process.env.npm_config_prefix;
+		else process.env.npm_config_prefix = previous;
+		rmSync(wt, { recursive: true, force: true });
+	}
 });
 
 test("provisionWorktree npm-install without any manifest writes the marker without failing", () => {

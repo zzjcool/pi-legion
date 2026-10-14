@@ -4,7 +4,7 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
-import { assignLanes, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
+import { assignLanes, axisColumn, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { buildLog, computeStats } from "../../src/tui/viz/panels.ts";
 import { createLegionViewFactory, handleViewKey, initialViewState, renderLegionView } from "../../src/tui/viz/view.ts";
@@ -15,7 +15,7 @@ const T0 = 1_700_000_000_000;
 const sec = (s: number): number => T0 + s * 1000;
 
 function node(id: string, opts: Partial<VizNode> = {}): VizNode {
-	return { id, name: id, role: id.replace(/-\d+$/, ""), parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, ...opts };
+	return { id, name: id, role: id.replace(/-\d+$/, ""), parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, ...opts };
 }
 const ROOT = node("root", { name: "centurion-0", role: "centurion", parentId: null, depth: 0 });
 
@@ -45,6 +45,9 @@ function scenario(endSec = 600, count = 12): { nodes: VizNode[]; sampler: RateSa
 			startedAt: sec(s.start),
 			...(done ? { endedAt: sec(s.end!) } : {}),
 			tokens: Math.round(s.rate * ((done ? s.end! : t) - s.start)),
+			// Steady generation: output rate == wall rate when genMs tracks elapsed.
+			tokensOut: Math.round(s.rate * ((done ? s.end! : t) - s.start)),
+			generationMs: Math.round(((done ? s.end! : t) - s.start) * 1000),
 		});
 	})];
 	for (let t = 0; t <= endSec; t += 2) sampler.record(sec(t), snap(t));
@@ -177,23 +180,41 @@ test("layout: wide >= 140, stacked in between, portrait when narrow or tall", ()
 	}
 });
 
-test("rate: 60s window average, cumulative counters never regress, late spawns start at zero", () => {
+test("rate: output over generationMs (60s window), cumulative counters never regress, late spawns start at zero", () => {
 	const sampler = new RateSampler();
 	for (let t = 0; t <= 300; t += 5) {
 		sampler.record(sec(t), [ROOT,
-			node("a", { tokens: 100 * t }),
-			...(t >= 100 ? [node("b", { startedAt: sec(100), tokens: 50 * (t - 100) })] : []),
+			node("a", { tokensOut: 100 * t, generationMs: t * 1000 }),
+			...(t >= 100 ? [node("b", { startedAt: sec(100), tokensOut: 50 * (t - 100), generationMs: (t - 100) * 1000 })] : []),
 		]);
 	}
 	assert.ok(Math.abs(sampler.nodeRate("a", sec(300)) - 100) < 1e-6);
 	assert.ok(Math.abs(sampler.totalRate(sec(300)) - 150) < 1e-6);
 	assert.equal(sampler.valueAt("b", sec(100)), 0);
 	assert.equal(RATE_WINDOW_MS, 60_000);
-	sampler.record(sec(305), [node("a", { tokens: 10 })]);
+	// Cumulative counters never regress.
+	sampler.record(sec(305), [node("a", { tokensOut: 10, generationMs: 10 })]);
 	assert.equal(sampler.valueAt("a", sec(305)), 30_000);
+	assert.equal(sampler.genAt("a", sec(305)), 300_000);
 	const buckets = sampler.buckets(sec(200), sec(300), 10);
 	for (const v of buckets.total) assert.ok(Math.abs(v - 150) < 1e-6);
 	assert.deepEqual([...buckets.byRole.keys()].sort(), ["a", "b"]);
+});
+
+test("rate: idle/tool gaps do not dilute output tok/s (generationMs denominator)", () => {
+	const sampler = new RateSampler();
+	// 10s of generation producing 1000 output tokens, then 50s idle (genMs flat).
+	for (let t = 0; t <= 60; t += 1) {
+		const generating = t <= 10;
+		sampler.record(sec(t), [ROOT, node("a", {
+			tokensOut: generating ? t * 100 : 1000,
+			generationMs: generating ? t * 1000 : 10_000,
+		})]);
+	}
+	// Trailing 60s wall includes idle, but denominator is only 10s of generation → 100 tok/s.
+	assert.ok(Math.abs(sampler.totalRate(sec(60)) - 100) < 1e-6);
+	// Wall-clock fallback would have been 1000/60 ≈ 16.7.
+	assert.ok(sampler.totalRate(sec(60)) > 50);
 });
 
 test("rate: header tok/s and chart 'now' share one definition", () => {
@@ -267,10 +288,10 @@ test("status board: railway strip replaces the roster when enabled and hides wit
 	const now = Date.now();
 	const entries: StatusEntry[] = [
 		{ name: "centurion-0", agent: "centurion", state: "running", startedAt: now - 60_000, nodeId: "root", parentId: null, depth: 0 },
-		{ name: "worker-1", agent: "worker", state: "running", startedAt: now - 30_000, nodeId: "root.worker-1", parentId: "root", depth: 1, tokensTotal: 100 },
+		{ name: "worker-1", agent: "worker", state: "running", startedAt: now - 30_000, nodeId: "root.worker-1", parentId: "root", depth: 1, tokensTotal: 100, tokensOut: 50, generationMs: 1_000 },
 	];
 	board.paint(entries, now - 1000);
-	board.paint(entries.map((e) => e.nodeId === "root.worker-1" ? { ...e, tokensTotal: 700 } : e), now);
+	board.paint(entries.map((e) => e.nodeId === "root.worker-1" ? { ...e, tokensTotal: 700, tokensOut: 650, generationMs: 2_000 } : e), now);
 	assert.ok(factory);
 	const lines = factory!({ requestRender() {} }, plainTheme).render(100);
 	assert.equal(lines.length, 2);
@@ -286,8 +307,13 @@ test("status board: railway strip replaces the roster when enabled and hides wit
 
 test("rate: chart buckets are trailing 60s averages (bursts smoothed, last bucket == header now)", () => {
 	const sampler = new RateSampler();
-	// Session-file token counts arrive in bursts: +6000 tokens in one refresh.
-	for (let t = 0; t <= 240; t += 2) sampler.record(sec(t), [ROOT, node("a", { tokens: t >= 120 ? 6000 : 0 })]);
+	// Session-file usage lands in bursts: +6000 output tokens with 60s of generation.
+	for (let t = 0; t <= 240; t += 2) {
+		sampler.record(sec(t), [ROOT, node("a", {
+			tokensOut: t >= 120 ? 6000 : 0,
+			generationMs: t >= 120 ? 60_000 : 0,
+		})]);
+	}
 	const b = sampler.buckets(sec(0), sec(240), 120);
 	assert.ok(Math.max(...b.total) <= 6000 / 60 + 1e-6, `peak ${Math.max(...b.total)}`);
 	const now = sec(170);
@@ -509,18 +535,48 @@ test("railway: all lanes share one time axis — every lane head is at the same 
 		node("scout-3", { startedAt: sec(20), status: "settled", endedAt: sec(100) }),
 	];
 	const startX = (line: string, from: string): number => Array.from(line).findIndex((ch) => from.includes(ch));
-	const heads = (t: number) => {
+	const frame = (t: number) => {
 		const lines = renderRailway({ nodes, now: sec(t), width: 120, rate: 0 })!.canvas.toLines(plainTheme).slice(1).map((l) => Array.from(l));
-		return lines.map((l) => ({ head: l.lastIndexOf("━"), start: startX(l.join(""), "╺╰╭┄") }));
+		return lines.map((l) => ({ head: l.lastIndexOf("━"), start: startX(l.join(""), "╺╰╭┄├") }));
 	};
-	const a = heads(150);
-	assert.equal(a.length, 3);
-	assert.ok(a.every((l) => l.head === a[0]!.head), JSON.stringify(a));
-	// The window is 360s over ~80 columns; after 45s every lane start shifts left by the same amount.
-	const b = heads(195);
+	const a = frame(150);
+	assert.equal(a.length, 3, "ended scout-3 is compacted away");
+	assert.ok(a.every((l) => l.head === a[0]!.head), `heads must share now-column: ${JSON.stringify(a)}`);
+	// Advance now: every on-screen start marker must move left by the *exact* same integer.
+	const b = frame(195);
 	const shifts = a.map((l, i) => l.start - b[i]!.start);
-	assert.ok(shifts[0]! === 0 || a[0]!.start === 0 || shifts.every((s) => s === shifts[0]), JSON.stringify(shifts));
-	assert.ok(shifts.slice(1).every((s) => s > 0 && Math.abs(s - shifts[1]!) <= 1), JSON.stringify({ a, b }));
+	assert.ok(shifts.every((s) => s === shifts[0]), `lockstep shifts: ${JSON.stringify(shifts)}`);
+	assert.ok(shifts[0]! > 0, `window must advance leftward: ${JSON.stringify({ a, b, shifts })}`);
+	assert.ok(b.every((l) => l.head === a[0]!.head), "heads stay glued to the shared now-column");
+});
+
+test("railway: axisColumn shifts every timestamp by the same delta (no per-lane floor drift)", () => {
+	const AW = 80;
+	const windowMs = 360_000;
+	const t0 = sec(100);
+	const t1 = sec(113); // not a multiple of dt — the old floor((t-origin)/dt) desynced here
+	const starts = [sec(0), sec(40), sec(90), sec(100)];
+	const shifts = starts.map((t) => axisColumn(t, t0, windowMs, AW) - axisColumn(t, t1, windowMs, AW));
+	assert.ok(shifts.every((s) => s === shifts[0]), JSON.stringify(shifts));
+	assert.equal(axisColumn(t0, t0, windowMs, AW), AW - 1, "now lands on last drawable column");
+});
+
+test("railway: tick-by-tick lockstep — no lane jumps alone while others stay put", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(0) }),
+		node("scout-1", { startedAt: sec(40), parentId: "worker-0", depth: 2 }),
+		node("scout-2", { startedAt: sec(90) }),
+	];
+	const startsAt = (t: number) =>
+		renderRailway({ nodes, now: sec(t), width: 120, rate: 0 })!.canvas.toLines(plainTheme).slice(1)
+			.map((line) => Array.from(line).findIndex((ch) => "╺╰╭┄├".includes(ch)));
+	let prev = startsAt(100);
+	for (let t = 101; t <= 160; t += 1) {
+		const cur = startsAt(t);
+		const shifts = prev.map((p, i) => p - cur[i]!);
+		assert.ok(shifts.every((s) => s === shifts[0]), `t=${t} shifts=${JSON.stringify(shifts)}`);
+		prev = cur;
+	}
 });
 
 test("railway hit map: every drawn cell maps to the agent whose glyph it is (fork from parent lane, compaction)", () => {
