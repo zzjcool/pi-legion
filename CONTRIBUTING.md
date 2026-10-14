@@ -4,6 +4,48 @@ This package is a Pi extension. The public surface is `index.ts` (the
 `subagent` tool) plus `src/api.ts` (programmatic imports). Please keep those
 two as the only things a downstream should need.
 
+## Project workflow
+
+**Issues first.** A bug or feature found while dogfooding starts as a GitHub
+issue. Include a repro, the expected behaviour, the actual behaviour, and the
+environment (Node version, OS, and the Pi / pi-legion version).
+
+**One concern per pull request.** Link the issue. Open the PR as a draft.
+Mark it **Ready for review** when the change is ready and you expect the
+required check `ci` to pass.
+
+**Merge gate.** Alice (the maintainer bot) merges only after code review has
+passed and the required GitHub Actions check `ci` is green. Do not push
+directly to `master`. Implementers do not merge their own pull requests.
+
+**Before you push.** Run:
+
+```bash
+npm run typecheck
+npm test
+```
+
+Add the unit tests the change needs. Prefer **TDD** (see [Checks](#checks)):
+a failing test in `test/unit` or `test/integration` first, then the production
+code.
+
+**Regression tests.** When you fix a bug, add a unit or integration test in
+the same PR when that is feasible: failing first, then passing. Do not
+`unref()` a timer that must keep the Node test runner alive. `unref()` drops
+the timer from the event-loop refcount, so `node --test` can exit before the
+callback runs. That is the rpc-supervisor retire-timer lesson (`waitForExit`
+and the descendant-sweep delay in `src/supervisor/rpc-supervisor.ts`): a
+timeout the caller is awaiting stays referenced, as with the wait timer in
+`src/extension/runtime.ts`.
+
+**npm release.** A `v*.*.*` tag runs the release workflow
+(`.github/workflows/release.yml`). Publish from that workflow with
+`npm stage publish` and a stage-only token. A maintainer promotes the staged
+version on npm with 2FA. Do not use plain `npm publish` in GitHub Actions.
+
+**Communication.** Coordinate in the team channel, or with Alice. Do not ping
+the maintainer user for a routine review or merge ask.
+
 ## Setup
 
 ```bash
