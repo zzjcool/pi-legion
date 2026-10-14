@@ -13,6 +13,7 @@ import { formatChildTask } from "../extension/child-guard.ts";
 import { buildPiArgs, LEGION_IDENTITY_ENV_KEYS } from "../runs/args.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import { checkMemoryGate, childMemoryEnv } from "./child-memory.ts";
+import { enrichFailureWithAutoDoctor } from "../extension/auto-doctor.ts";
 import { ErrorCodes, SubagentError } from "../shared/types.ts";
 import {
 	InMemoryUIProxy,
@@ -57,6 +58,10 @@ interface ChildRecord {
 	client: RpcClientLike | null;
 	process: RpcProcessHandle | null;
 	tempDir: string;
+	/** Argv passed to the child pi (for doctor / spawn hints). */
+	lastArgs?: string[];
+	/** Spawn cwd (for auto-doctor storeRoot). */
+	cwd?: string;
 	state: ChildState;
 	processAlive: boolean;
 	turnActive: boolean;
@@ -225,8 +230,13 @@ export class RpcSupervisor implements LegionSupervisor {
 		const inFlight = [...this.children.values()].filter((child) => child.state === "starting").length;
 		const gate = checkMemoryGate({ name: input.name, inFlight, ...(this.memoryAvailable ? { available: this.memoryAvailable } : {}) });
 		if (!gate.ok) {
-			this.onSpawnRefused?.(gate.message!);
-			throw new SubagentError(gate.message!, ErrorCodes.INSUFFICIENT_MEMORY);
+			const enriched = enrichFailureWithAutoDoctor(gate.message!, {
+				name: input.name,
+				code: ErrorCodes.INSUFFICIENT_MEMORY,
+				cwd: input.cwd,
+			});
+			this.onSpawnRefused?.(enriched);
+			throw new SubagentError(enriched, ErrorCodes.INSUFFICIENT_MEMORY);
 		}
 		if (input.agent.kind !== "pi") {
 			throw new SubagentError(
@@ -250,6 +260,7 @@ export class RpcSupervisor implements LegionSupervisor {
 			client: null,
 			process: null,
 			tempDir: "",
+			cwd: input.cwd,
 			state: "starting",
 			processAlive: false,
 			turnActive: false,
@@ -294,6 +305,7 @@ export class RpcSupervisor implements LegionSupervisor {
 				includeTask: false,
 			});
 			builtArgs = built.args;
+			registration.lastArgs = builtArgs;
 		} catch (error) {
 			await this.rollbackSpawn(registration);
 			throw error;
@@ -985,8 +997,15 @@ export class RpcSupervisor implements LegionSupervisor {
 
 	private startFailure(child: ChildRecord, message: string): SubagentError {
 		const stderr = child.client?.getStderr?.();
+		const base = `${message}${stderr ? `: ${stderr.trim().slice(0, 500)}` : ""}`;
 		return new SubagentError(
-			`${message}${stderr ? `: ${stderr.trim().slice(0, 500)}` : ""}`,
+			enrichFailureWithAutoDoctor(base, {
+				name: child.name,
+				stderr,
+				args: child.lastArgs,
+				code: ErrorCodes.START_FAILED,
+				cwd: child.cwd,
+			}),
 			ErrorCodes.START_FAILED,
 		);
 	}

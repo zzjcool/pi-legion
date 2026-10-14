@@ -87,6 +87,8 @@ import {
 import { registerSummaryCommand } from "./src/extension/summary.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
+import { expectedModelsFromSettings, runLegionDoctor } from "./src/extension/legion-doctor.ts";
+import { readFileSync } from "node:fs";
 import {
 	effectiveMaxDepth,
 	Orchestrator,
@@ -148,8 +150,9 @@ const SubagentParams = Type.Object({
 				Type.Literal("list"),
 				Type.Literal("wait"),
 				Type.Literal("stop"),
+				Type.Literal("diagnose"),
 			],
-			{ description: "Defaults to launch." },
+			{ description: "Defaults to launch. diagnose = Legion doctor full self-check (extensions/models/spawn/memory/tools/storage/runtime)." },
 		),
 	),
 	agent: Type.Optional(
@@ -870,6 +873,34 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			});
 
 			if (action === "list") return ok(renderAgentList(agents, team, teamWarnings));
+			if (action === "diagnose") {
+				let settings: unknown;
+				try {
+					settings = JSON.parse(readFileSync(path.join(getAgentDir(), "settings.json"), "utf8"));
+				} catch {
+					settings = undefined;
+				}
+				const report = runLegionDoctor({
+					agentDir: getAgentDir(),
+					cwd,
+					storeRoot: store.rootDir,
+					expectedModels: expectedModelsFromSettings(settings),
+					sampleAgent: agents[0],
+					agents,
+					runtime: {
+						liveJobs: runtime.activeJobs().map((job) => ({
+							name: job.name,
+							state: job.state,
+							nodeId: job.nodeId,
+						})),
+						stopAvailable: true,
+						idleEscWired: true,
+						legionTools: ["subagent", "vexillatio"],
+						allowNestedEnv: process.env[ALLOW_NESTED_ENV] === "1",
+					},
+				});
+				return ok(report.text);
+			}
 
 			let activeLegion: LegionRuntimeIdentity | undefined;
 			try {
