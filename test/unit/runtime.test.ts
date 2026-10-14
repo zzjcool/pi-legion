@@ -4,7 +4,7 @@ import { appendFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	createSessionRuntime,
-	formatLastEventAge,
+	formatAliveQuiet,
 	lastJsonlEventAgeMs,
 	renderLiveChildStatus,
 	shouldRecycleAfterCollect,
@@ -1250,12 +1250,14 @@ test("renderLiveChildStatus reports silence and ignores a stale connection failu
 			now,
 		});
 		assert.match(text, /state=working/);
-		assert.match(text, /execution: running \(rpc child alive\)/);
-		assert.match(text, new RegExp(formatLastEventAge(age).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+		assert.equal(text.split("\n")[1], formatAliveQuiet(age));
+		assert.ok(text.indexOf("alive · quiet") < text.indexOf("execution snapshot:"), "quiet age leads before execution snapshot");
+		assert.match(text, /execution snapshot: running \(rpc child alive\)/);
 		assert.match(text, /persisted snapshot is stale: state=retired, execution=failed \(Connection error\.\), acceptance=rejected \(none\)/);
 		assert.doesNotMatch(text, /^worker-0 — state=retired/m);
 		assert.doesNotMatch(text, /^execution: failed/m);
 		assert.doesNotMatch(text, /^acceptance: rejected/m);
+		assert.doesNotMatch(text, /last event/);
 	});
 });
 
@@ -1277,10 +1279,12 @@ test("renderLiveChildStatus keeps a live running snapshot and adds recency", asy
 			now,
 		});
 		assert.match(text, /state=working/);
-		assert.match(text, /collect deadline \(cumulative since launch\) exceeded; child still alive/);
-		assert.match(text, /last event 0s ago/);
-		assert.match(text, /acceptance: unknown \(none\)/);
+		assert.match(text, /^alive · quiet 0s$/m);
+		assert.ok(text.indexOf("alive · quiet 0s") < text.indexOf("execution snapshot:"), "quiet age leads before execution snapshot");
+		assert.match(text, /execution snapshot: running \(collect deadline \(cumulative since launch\) exceeded; child still alive\)/);
+		assert.match(text, /acceptance snapshot: unknown \(none\)/);
 		assert.doesNotMatch(text, /persisted snapshot is stale/);
+		assert.doesNotMatch(text, /last event/);
 	});
 });
 
@@ -1297,10 +1301,29 @@ test("renderLiveChildStatus leaves a dead child's terminal snapshot alone", () =
 		now: 0,
 	});
 	assert.match(text, /state=retired/);
-	assert.match(text, /execution: failed \(Connection error\.\)/);
-	assert.match(text, /acceptance: rejected \(none\)/);
+	assert.match(text, /^execution: failed \(Connection error\.\)$/m);
+	assert.match(text, /^acceptance: rejected \(none\)$/m);
+	assert.doesNotMatch(text, /alive · quiet/);
 	assert.doesNotMatch(text, /last event/);
+	assert.doesNotMatch(text, /snapshot/);
 	assert.doesNotMatch(text, /stale/);
+});
+
+test("renderLiveChildStatus leads with alive · quiet when session is missing", () => {
+	const text = renderLiveChildStatus({
+		name: "worker-0",
+		state: "working",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "",
+		execution: { status: "running" },
+		alive: true,
+		now: 0,
+	});
+	const lines = text.split("\n");
+	assert.equal(lines[1], "alive · quiet unknown");
+	assert.match(text, /execution snapshot: running/);
+	assert.ok(text.indexOf("alive · quiet unknown") < text.indexOf("execution snapshot:"));
 });
 
 test("runtime: a settled session turn freezes, and the next user message resets it", async () => {
