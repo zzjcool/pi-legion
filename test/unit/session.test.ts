@@ -10,6 +10,7 @@ import * as path from "node:path";
 import {
 	deriveOutcome,
 	extractVerdict,
+	isTransientConnectionFailure,
 	parseSessionFile,
 	parseSessionText,
 } from "../../src/shared/session.ts";
@@ -38,6 +39,17 @@ test("stopReason error + message → failed, errorMessage preserved", () => {
 	assert.equal(outcome.status, "failed");
 	assert.equal(outcome.errorMessage, "400 bad model: nope");
 	assert.equal(outcome.stopReason, "error");
+});
+
+test("Connection error is a transient blip; other failures are not", () => {
+	assert.equal(isTransientConnectionFailure("Connection error."), true);
+	assert.equal(isTransientConnectionFailure("Error: Connection error."), true);
+	assert.equal(isTransientConnectionFailure({ reason: "Connection error.", errorMessage: null }), true);
+	assert.equal(isTransientConnectionFailure({ errorMessage: "APIConnectionError: Connection error." }), true);
+	assert.equal(isTransientConnectionFailure("provider failure"), false);
+	assert.equal(isTransientConnectionFailure("connection refused"), false);
+	assert.equal(isTransientConnectionFailure(deriveOutcome(parseLines(userMsg("do it"), assistantMsg({ stopReason: "error", errorMessage: "Connection error." })))), true);
+	assert.equal(isTransientConnectionFailure(deriveOutcome(parseLines(userMsg("do it"), assistantMsg({ stopReason: "error", errorMessage: "400 bad model: nope" })))), false);
 });
 
 test("stopReason error + message containing aborted → aborted (F29)", () => {

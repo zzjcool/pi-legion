@@ -6,6 +6,7 @@
  * and wake the parent when a turn finishes.
  */
 
+import * as fs from "node:fs";
 import {
 	deliverCompletion,
 	formatCompletionNotice,
@@ -28,6 +29,7 @@ import {
 	type StatusUi,
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
+import { isTransientConnectionFailure } from "../shared/session.ts";
 import { DEFAULTS, type AgentKind } from "../shared/types.ts";
 import type {
 	EventSubscriptionOptions,
@@ -75,6 +77,8 @@ export interface TrackedJobInput {
 	parentId?: string | null;
 	depth?: number;
 	collect: (opts?: { signal?: AbortSignal }) => Promise<CollectSnapshot>;
+	/** Live RPC process check. A connection blip is non-terminal only while this is true. */
+	isAlive?: () => boolean;
 	persist?: (snapshot: CollectSnapshot) => Promise<void>;
 	/** Retire the RPC child after a terminal collect. Blocked children stay alive. */
 	retire?: () => Promise<void>;
@@ -147,8 +151,104 @@ const WAIT_INTERRUPTED = Symbol("wait interrupted");
 /** Retire after collect unless the child is still waiting on the user. */
 export function shouldRecycleAfterCollect(status: string): boolean {
 	// `unknown` is terminal for old records without a structured outcome.
-	// `running` means collect timed out while the child is still alive.
+	// `running` means the child is still alive: collect deadline, or a
+	// connection blip that must not be retired.
 	return status !== "blocked" && status !== "running";
+}
+
+/** Pause before re-arming a thrown connection blip so a hot reject cannot spin. */
+const TRANSIENT_CONNECTION_REARM_MS = 200;
+
+function thrownText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+export interface LiveChildStatusInput {
+	name: string;
+	state: string;
+	agent?: string;
+	kind?: string;
+	sessionFile: string;
+	execution?: {
+		status: string;
+		reason?: string;
+		usage?: { input: number; output: number; cost: number } | null;
+	};
+	acceptance?: { status: string; level?: string };
+	/** RPC process is still running. */
+	alive: boolean;
+	now?: number;
+}
+
+/** Milliseconds since the session JSONL was last written, when the file exists. */
+export function lastJsonlEventAgeMs(sessionFile: string, now: number): number | undefined {
+	if (!sessionFile) return undefined;
+	try {
+		return Math.max(0, now - fs.statSync(sessionFile).mtimeMs);
+	} catch {
+		return undefined;
+	}
+}
+
+export function formatLastEventAge(ageMs: number): string {
+	return `last event ${Math.floor(ageMs / 1000)}s ago`;
+}
+
+function persistedSnapshotIsStale(input: LiveChildStatusInput): boolean {
+	if (!input.alive) return false;
+	if (input.state === "retired" || input.state === "exited") return true;
+	const execution = input.execution;
+	if (!execution || execution.status === "running" || execution.status === "unknown") return false;
+	return isTransientConnectionFailure(execution);
+}
+
+/**
+ * Status text for one child.
+ *
+ * A living child always reports how long the session JSONL has been quiet.
+ * A retired/failed record left behind by a connection blip is not the current
+ * state while that process is still alive.
+ */
+export function renderLiveChildStatus(input: LiveChildStatusInput): string {
+	const stale = persistedSnapshotIsStale(input);
+	const state = stale ? "working" : input.state;
+	const execution = stale
+		? { status: "running", reason: "rpc child alive", usage: input.execution?.usage }
+		: input.execution;
+	const lines = [
+		`${input.name} — state=${state} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
+		"supervisor=rpc",
+		`session=${input.sessionFile}`,
+	];
+	if (execution) {
+		lines.push(
+			`execution: ${execution.status}${execution.reason ? ` (${execution.reason})` : ""}`,
+		);
+		if (execution.usage) {
+			lines.push(
+				`usage: in=${execution.usage.input} out=${execution.usage.output} cost=${execution.usage.cost.toFixed(4)}`,
+			);
+		}
+	}
+	if (!stale && input.acceptance) {
+		lines.push(
+			`acceptance: ${input.acceptance.status}${input.acceptance.level ? ` (${input.acceptance.level})` : ""}`,
+		);
+	}
+	if (input.alive) {
+		const age = lastJsonlEventAgeMs(input.sessionFile, input.now ?? Date.now());
+		if (age !== undefined) lines.push(formatLastEventAge(age));
+	}
+	if (stale) {
+		const persistedExecution = input.execution
+			? `execution=${input.execution.status}${input.execution.reason ? ` (${input.execution.reason})` : ""}`
+			: "execution=absent";
+		const persistedAcceptance = input.acceptance
+			? `acceptance=${input.acceptance.status}${input.acceptance.level ? ` (${input.acceptance.level})` : ""}`
+			: "acceptance=absent";
+		lines.push(`persisted snapshot is stale: state=${input.state}, ${persistedExecution}, ${persistedAcceptance}`);
+	}
+	return lines.join("\n");
 }
 
 export interface WaitResult {
@@ -619,6 +719,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			const existing = jobs.get(input.name);
 			if (existing) {
 				existing.collect = input.collect;
+				existing.isAlive = input.isAlive;
 				existing.persist = input.persist;
 				existing.retire = input.retire;
 				existing.timeoutMs = input.timeoutMs;
@@ -674,6 +775,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			void (async () => {
 				let snapshot: CollectSnapshot | undefined;
 				let hold = false;
+				const rearmLiveWatch = () => {
+					// Not terminal. Clear the settled collect promise and watch
+					// again. The next collect blocks until the deadline (or a
+					// real settle), so this is not a busy loop.
+					job.state = "working";
+					job.settledAt = undefined;
+					job.collectPromise = undefined;
+					job.notified = false;
+					job.consumedByTool = false;
+					join.addPending(job.runId, job.name);
+					runtime.watch(name, opts);
+				};
 				try {
 					snapshot = await ensureCollect(job);
 					if (disposed || job.generation !== gen) return;
@@ -698,26 +811,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						return;
 					}
 					if (snapshot.execution.status === "running") {
-						// Not terminal: collect timed out but the agent is alive (F29
-						// discriminator). A notice here would misreport "failed" (the
-						// running status used to fall through to the `failed` default),
-						// and a release would orphan the child — its eventual completion
-						// would never surface. Re-arm instead: clear the settled collect
-						// promise and watch again. collect() blocks until the next
-						// timeout, so this is not a busy loop.
+						// Not terminal: collect deadline, or a connection blip, on a
+						// live child (F29 discriminator, extended for connection
+						// errors). A notice here would misreport "failed", and a
+						// release would orphan the child. Re-arm instead.
 						//
 						// Same skeleton as the blocked-resume branch above, but NOT
 						// handleBlocked: there is no approval to ask about.
-						job.state = "working";
-						job.settledAt = undefined;
-						job.collectPromise = undefined;
-						job.notified = false; // a previous round may have set it
-						job.consumedByTool = false; // ditto
-						// join bookkeeping: this member never reached onTerminal, so the
-						// group's `pending` still contains it. Re-adding is a no-op on a
-						// Set and keeps the branch symmetric with blocked-resume.
-						join.addPending(job.runId, job.name);
-						runtime.watch(name, opts); // generation bumps; this watch returns
+						rearmLiveWatch();
 						return;
 					}
 					job.state = "awaiting";
@@ -744,6 +845,27 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					}
 				} catch (error) {
 					if (disposed || job.generation !== gen) return;
+					if (job.isAlive?.() && isTransientConnectionFailure(thrownText(error))) {
+						// Thrown "Connection error." while the process is up is the
+						// same non-terminal signal as a running snapshot. Hold this
+						// generation so `finally` cannot retire it, pause so a
+						// reject that never awaits cannot spin, then re-arm.
+						hold = true;
+						job.state = "working";
+						job.settledAt = undefined;
+						job.collectPromise = undefined;
+						job.notified = false;
+						job.consumedByTool = false;
+						join.addPending(job.runId, job.name);
+						refreshUi();
+						await new Promise((resolve) => setTimeout(resolve, TRANSIENT_CONNECTION_REARM_MS));
+						if (disposed || job.generation !== gen) return;
+						if (job.isAlive?.()) {
+							rearmLiveWatch();
+							return;
+						}
+						hold = false;
+					}
 					job.state = "awaiting";
 					job.settledAt = now();
 					if (!job.consumedByTool && !job.notified) {

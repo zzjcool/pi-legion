@@ -41,7 +41,7 @@ import {
 	loadSubagentSettings,
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
-import { createSessionRuntime, type SessionRuntime, type TrackedJob, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
+import { createSessionRuntime, renderLiveChildStatus, type SessionRuntime, type TrackedJob, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
@@ -68,6 +68,7 @@ import {
 import { createIdleEscStop, liveJobs } from "./src/extension/legion-stop.ts";
 import { DEFAULT_FLUSH_MS, DEFAULT_JOIN_MODE } from "./src/extension/join.ts";
 import { registerChildGuard } from "./src/extension/child-guard.ts";
+import { registerScoutGuard } from "./src/extension/scout-guard.ts";
 import { ALLOW_NESTED_ENV } from "./src/extension/budget.ts";
 import {
 	applyOnBlockedPolicy,
@@ -745,6 +746,17 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		pi.on("session_shutdown", shutdownRetireAll);
 		return;
 	}
+	// #17: main session only. Children (PI_SUBAGENT_ROLE / PI_SUBAGENT_CHILD)
+	// must not count their own reads or inject this reminder. Nested children
+	// also have isChild set, so they skip this even though they continue below.
+	if (!isChild) {
+		registerScoutGuard(pi, {
+			loadSettings: (cwd) => loadSubagentSettings({
+				userSettingsPath: path.join(getAgentDir(), "settings.json"),
+				projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
+			}),
+		});
+	}
 	// The parent transcript records every finish; the renderer keeps a
 	// completed child to one line so visibility does not cost a screen.
 	pi.registerMessageRenderer(SUBAGENT_NOTIFY_TYPE, renderSubagentNotice);
@@ -1221,7 +1233,18 @@ async function controlAction(input: {
 		orchestrator,
 	};
 
-	if (action === "status") return renderChild(found.child, "status");
+	if (action === "status") {
+		return ok(renderLiveChildStatus({
+			name: found.child.name,
+			state: found.child.state,
+			agent: found.child.agent,
+			kind: found.child.kind,
+			sessionFile: found.child.sessionFile,
+			execution: found.child.execution,
+			acceptance: found.child.acceptance,
+			alive: input.supervisor.isAlive(params.name),
+		}));
+	}
 	if (action === "steer") return steerChild(ctx);
 	if (action === "collect") return collectChild(ctx, input.signal);
 	if (action === "retire") return retireChild(ctx);
@@ -2324,6 +2347,7 @@ function followJob(
 				timeoutMs: input.timeoutMs,
 				...(opts?.signal ? { signal: opts.signal } : {}),
 			}),
+		isAlive: () => input.orchestrator.isChildAlive(input.name),
 		persist: async () =>
 			persistChild(input.store, input.runId, input.orchestrator, input.name),
 		retire: async () => {

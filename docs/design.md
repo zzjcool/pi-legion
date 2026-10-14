@@ -651,6 +651,22 @@ system prompt 不再注入 playbook/roster；bash 派发 guard 放行手动 herd
 命令。已有 children 不受影响——正常完成并通知，`status`/`collect`/
 `wait`/`resume`/`steer` 继续可用。
 
+### 6.4.1 Scout guard `subagents.scoutGuard`
+
+只在主会话生效（子进程带 `PI_SUBAGENT_ROLE`，不计数、不注入）。连续 N 次
+读类工具调用（`read`，以及可判定为只读的 bash：`cat`/`head`/`tail`/`less`/
+`rg`/`grep`/`find`/`ls`/`stat`/`wc`/`file`/`jq`、`git show|log|diff|status|blame`、
+不带 `-i` 的 `sed`）且中间没有成功的 `subagent` / `vexillatio` 派发时，异步
+注入一条 follow-up 提醒，不挡住当前 `tool_call`。
+
+```json
+{ "subagents": { "scoutGuard": { "enabled": true, "threshold": 8, "cooldownMs": 120000 } } }
+```
+
+默认开启，`threshold` 8，`cooldownMs` 120000。提醒发出后计数清零并进入冷却；
+冷却期内不计数、不重复提醒。成功派发立即清零并退出冷却。`edit`/`write` 和
+写类 bash（含 `sed -i`、写重定向）清零但不进入冷却。无法判定的 bash 不计数
+也不清零。`/scout-guard` 开启、`/no-scout-guard` 关闭，只覆盖本会话。
 
 ## 7. 借鉴 pi-subagents：三类处理
 
