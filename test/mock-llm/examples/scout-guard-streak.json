@@ -1,0 +1,53 @@
+{
+  "models": [{ "id": "flash", "name": "Mock Flash" }],
+  "rules": [
+    {
+      "name": "after-streak",
+      "when": { "hasToolResult": true, "turnIndex": 4 },
+      "then": {
+        "type": "text",
+        "content": "{\"ok\": true, \"reason\": \"SCOUT_GUARD_STREAK_OK\"}"
+      }
+    },
+    {
+      "name": "read-0",
+      "when": { "turnIndex": 0 },
+      "then": {
+        "type": "tool_call",
+        "name": "grep",
+        "arguments": { "pattern": "TODO" }
+      }
+    },
+    {
+      "name": "read-1",
+      "when": { "turnIndex": 1, "hasToolResult": true },
+      "then": {
+        "type": "tool_call",
+        "name": "find",
+        "arguments": { "pattern": "*.ts" }
+      }
+    },
+    {
+      "name": "read-2",
+      "when": { "turnIndex": 2, "hasToolResult": true },
+      "then": {
+        "type": "tool_call",
+        "name": "ls",
+        "arguments": { "path": "src" }
+      }
+    },
+    {
+      "name": "read-3",
+      "when": { "turnIndex": 3, "hasToolResult": true },
+      "then": {
+        "type": "tool_call",
+        "name": "read",
+        "arguments": { "path": "a.ts" }
+      }
+    },
+    {
+      "name": "default",
+      "then": { "type": "text", "content": "MOCK_OK" }
+    }
+  ]
+}

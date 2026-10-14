@@ -88,12 +88,16 @@ Then `settings.json`: `"defaultProvider": "mock"`, `"defaultModel": "flash"`.
 | `stop-all` | Call `subagent({ action: "stop", all: true })`, then settle |
 | `declare-verify` | Declare acceptance passed in text |
 | `script` | Load rules from `--script` / `MOCK_LLM_SCRIPT` JSON |
+| _(example)_ | `examples/scout-guard-streak.json` — N read tool_calls then settle (#108 e2e) |
 
 ```bash
 MOCK_LLM_SCENARIO=spawn-scout npm run mock-llm
 npm run mock-llm -- --scenario doctor
 npm run mock-llm -- --script test/mock-llm/examples/custom.json
 ```
+
+
+Scout-guard regression (#108) lives in `test/integration/mock-llm-scout-guard-e2e.test.ts` (picked up by `npm run test:mock-llm`): mock scripts N consecutive read-class tool_calls; light extension harness asserts one `scout-guard-notify` followUp, dispatch clear, and cooldown.
 
 Per-request override: header `x-mock-scenario: child-done` or
 `?scenario=child-done` on the chat URL.
