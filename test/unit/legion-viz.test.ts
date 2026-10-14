@@ -4,7 +4,7 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
-import { assignLanes, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
+import { assignLanes, axisColumn, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { buildLog, computeStats } from "../../src/tui/viz/panels.ts";
 import { createLegionViewFactory, handleViewKey, initialViewState, renderLegionView } from "../../src/tui/viz/view.ts";
@@ -509,18 +509,48 @@ test("railway: all lanes share one time axis — every lane head is at the same 
 		node("scout-3", { startedAt: sec(20), status: "settled", endedAt: sec(100) }),
 	];
 	const startX = (line: string, from: string): number => Array.from(line).findIndex((ch) => from.includes(ch));
-	const heads = (t: number) => {
+	const frame = (t: number) => {
 		const lines = renderRailway({ nodes, now: sec(t), width: 120, rate: 0 })!.canvas.toLines(plainTheme).slice(1).map((l) => Array.from(l));
-		return lines.map((l) => ({ head: l.lastIndexOf("━"), start: startX(l.join(""), "╺╰╭┄") }));
+		return lines.map((l) => ({ head: l.lastIndexOf("━"), start: startX(l.join(""), "╺╰╭┄├") }));
 	};
-	const a = heads(150);
-	assert.equal(a.length, 3);
-	assert.ok(a.every((l) => l.head === a[0]!.head), JSON.stringify(a));
-	// The window is 360s over ~80 columns; after 45s every lane start shifts left by the same amount.
-	const b = heads(195);
+	const a = frame(150);
+	assert.equal(a.length, 3, "ended scout-3 is compacted away");
+	assert.ok(a.every((l) => l.head === a[0]!.head), `heads must share now-column: ${JSON.stringify(a)}`);
+	// Advance now: every on-screen start marker must move left by the *exact* same integer.
+	const b = frame(195);
 	const shifts = a.map((l, i) => l.start - b[i]!.start);
-	assert.ok(shifts[0]! === 0 || a[0]!.start === 0 || shifts.every((s) => s === shifts[0]), JSON.stringify(shifts));
-	assert.ok(shifts.slice(1).every((s) => s > 0 && Math.abs(s - shifts[1]!) <= 1), JSON.stringify({ a, b }));
+	assert.ok(shifts.every((s) => s === shifts[0]), `lockstep shifts: ${JSON.stringify(shifts)}`);
+	assert.ok(shifts[0]! > 0, `window must advance leftward: ${JSON.stringify({ a, b, shifts })}`);
+	assert.ok(b.every((l) => l.head === a[0]!.head), "heads stay glued to the shared now-column");
+});
+
+test("railway: axisColumn shifts every timestamp by the same delta (no per-lane floor drift)", () => {
+	const AW = 80;
+	const windowMs = 360_000;
+	const t0 = sec(100);
+	const t1 = sec(113); // not a multiple of dt — the old floor((t-origin)/dt) desynced here
+	const starts = [sec(0), sec(40), sec(90), sec(100)];
+	const shifts = starts.map((t) => axisColumn(t, t0, windowMs, AW) - axisColumn(t, t1, windowMs, AW));
+	assert.ok(shifts.every((s) => s === shifts[0]), JSON.stringify(shifts));
+	assert.equal(axisColumn(t0, t0, windowMs, AW), AW - 1, "now lands on last drawable column");
+});
+
+test("railway: tick-by-tick lockstep — no lane jumps alone while others stay put", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(0) }),
+		node("scout-1", { startedAt: sec(40), parentId: "worker-0", depth: 2 }),
+		node("scout-2", { startedAt: sec(90) }),
+	];
+	const startsAt = (t: number) =>
+		renderRailway({ nodes, now: sec(t), width: 120, rate: 0 })!.canvas.toLines(plainTheme).slice(1)
+			.map((line) => Array.from(line).findIndex((ch) => "╺╰╭┄├".includes(ch)));
+	let prev = startsAt(100);
+	for (let t = 101; t <= 160; t += 1) {
+		const cur = startsAt(t);
+		const shifts = prev.map((p, i) => p - cur[i]!);
+		assert.ok(shifts.every((s) => s === shifts[0]), `t=${t} shifts=${JSON.stringify(shifts)}`);
+		prev = cur;
+	}
 });
 
 test("railway hit map: every drawn cell maps to the agent whose glyph it is (fork from parent lane, compaction)", () => {
