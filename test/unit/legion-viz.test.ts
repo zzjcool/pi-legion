@@ -791,6 +791,62 @@ test("railway: a finished sibling drops off at once while others stay live; no �
 	assert.match(text, /2 live/);
 });
 
+test("railway lane shows current-turn elapsed beside the lifetime total", () => {
+	const startedAt = sec(0);
+	const now = startedAt + (1 * 3600 + 3 * 60) * 1_000;
+	const turnStartedAt = now - (12 * 60 + 12) * 1_000;
+	const nodes = [
+		ROOT,
+		node("worker-0", {
+			role: "worker",
+			startedAt,
+			currentTurnStartedAt: turnStartedAt,
+		}),
+	];
+	const live = renderRailway({ nodes, now, width: 120, rate: 0 })!;
+	assert.match(live.canvas.toLines(plainTheme).join("\n"), /worker · 12m12s \/ 1h03m/);
+
+	const frozenNodes = [
+		ROOT,
+		node("worker-0", {
+			role: "worker",
+			startedAt,
+			currentTurnStartedAt: turnStartedAt,
+			currentTurnEndedAt: turnStartedAt + (12 * 60 + 12) * 1_000,
+		}),
+	];
+	const later = now + 90_000;
+	const frozen = renderRailway({ nodes: frozenNodes, now: later, width: 120, rate: 0 })!;
+	assert.match(frozen.canvas.toLines(plainTheme).join("\n"), /worker · 12m12s \/ 1h04m/);
+
+	const reset = renderRailway({
+		nodes: [ROOT, node("worker-0", { role: "worker", startedAt, currentTurnStartedAt: later })],
+		now: later + 42_000,
+		width: 120,
+		rate: 0,
+	})!;
+	assert.match(reset.canvas.toLines(plainTheme).join("\n"), /worker · 42s \/ 1h05m/);
+});
+
+test("viz: nodesFromEntries copies current-turn bounds onto railway nodes", () => {
+	const nodes = nodesFromEntries([
+		{
+			name: "worker-0",
+			agent: "worker",
+			state: "working",
+			startedAt: sec(0),
+			nodeId: "root.worker",
+			parentId: "root",
+			depth: 1,
+			currentTurnStartedAt: sec(10),
+			currentTurnEndedAt: sec(20),
+		},
+	]);
+	const worker = nodes.find((item) => item.id === "root.worker");
+	assert.equal(worker?.currentTurnStartedAt, sec(10));
+	assert.equal(worker?.currentTurnEndedAt, sec(20));
+});
+
 test("status board entries: settled/awaiting-success children are not live lanes", () => {
 	const entries: StatusEntry[] = [
 		{ name: "root", agent: "root", state: "running", startedAt: sec(0), nodeId: "root", parentId: null, depth: 0 },

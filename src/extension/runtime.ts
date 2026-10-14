@@ -263,6 +263,14 @@ export interface WaitResult {
 	missing?: boolean;
 }
 
+interface NodeActivity {
+	turn?: number;
+	turnStartedAt?: number;
+	/** Set when the in-flight turn settles; cleared by the next turn_start. */
+	turnEndedAt?: number;
+	tools: string[];
+}
+
 export interface SessionRuntime {
 	bind(ctx: StatusUi): void;
 	track(input: TrackedJobInput): TrackedJob;
@@ -315,7 +323,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		...(deps.statusStrip ? { strip: deps.statusStrip } : {}),
 	});
 	const tree = new Map<string, TreeNodeSnapshot>();
-	const activity = new Map<string, { turn?: number; turnStartedAt?: number; tools: string[] }>();
+	const activity = new Map<string, NodeActivity>();
 	const eventOverrides = new Map<string, { ts: number; status?: TreeNodeSnapshot["status"]; phase?: string }>();
 	let ledgerDb: DatabaseSync | undefined;
 	let dbEventSource: DbEventSource | undefined;
@@ -518,12 +526,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			const current = activity.get(event.nodeId) ?? { tools: [] };
 			current.turn = typeof data?.turn === "number" ? data.turn : (current.turn ?? 0) + 1;
 			current.turnStartedAt = event.ts;
+			current.turnEndedAt = undefined;
 			activity.set(event.nodeId, current);
 		} else if (event.type === "agent_settled") {
-			// The in-flight turn is over; drop its start so the widget stops
-			// timing a turn that has already settled.
+			// Freeze the turn at this event. The next turn_start replaces it.
 			const current = activity.get(event.nodeId);
-			if (current) current.turnStartedAt = undefined;
+			if (current?.turnStartedAt !== undefined && current.turnEndedAt === undefined) {
+				current.turnEndedAt = event.ts;
+			}
 		} else if (event.type === "tool_call") {
 			const current = activity.get(event.nodeId) ?? { tools: [] };
 			const toolName = typeof data?.toolName === "string" ? data.toolName : typeof data?.name === "string" ? data.name : undefined;
@@ -1134,6 +1144,9 @@ function statusEntryFromJob(
 		...(live.currentTurnStartedAt !== undefined
 			? { currentTurnStartedAt: live.currentTurnStartedAt }
 			: {}),
+		...(live.currentTurnEndedAt !== undefined
+			? { currentTurnEndedAt: live.currentTurnEndedAt }
+			: {}),
 		...(live.usageTotal
 			? { tokensTotal: live.usageTotal }
 			: node?.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
@@ -1151,7 +1164,7 @@ function statusEntryFromJob(
 
 function statusEntryFromNode(
 	node: TreeNodeSnapshot,
-	activity?: { turn?: number; turnStartedAt?: number; tools: string[] },
+	activity?: NodeActivity,
 ): StatusEntry {
 	return {
 		name: node.name,
@@ -1168,6 +1181,7 @@ function statusEntryFromNode(
 		...(node.tokensOut ? { tokensOut: node.tokensOut } : {}),
 		...(activity?.turn !== undefined ? { turns: activity.turn } : {}),
 		...(activity?.turnStartedAt !== undefined ? { currentTurnStartedAt: activity.turnStartedAt } : {}),
+		...(activity?.turnEndedAt !== undefined ? { currentTurnEndedAt: activity.turnEndedAt } : {}),
 		...(activity?.tools.length ? { lastTools: activity.tools } : {}),
 		nodeId: node.id,
 		parentId: node.parentId,

@@ -5,6 +5,7 @@ import {
 	applyStatus,
 	createStatusBoard,
 	formatBusyLabel,
+	formatAgentElapsed,
 	formatElapsed,
 	formatFooterStatus,
 	formatWidgetLines,
@@ -149,10 +150,18 @@ function treeEntries(): StatusEntry[] {
 	];
 }
 
-test("formatElapsed rounds to seconds", () => {
+test("formatElapsed rounds to seconds and breaks out minutes and hours", () => {
 	assert.equal(formatElapsed(0), "0s");
 	assert.equal(formatElapsed(1_400), "1s");
 	assert.equal(formatElapsed(12_499), "12s");
+	assert.equal(formatElapsed(42_000), "42s");
+	assert.equal(formatElapsed(59_600), "1m00s");
+	assert.equal(formatElapsed((12 * 60 + 12) * 1_000), "12m12s");
+	assert.equal(formatElapsed((12 * 60 + 2) * 1_000), "12m02s");
+	assert.equal(formatElapsed((1 * 3600 + 3 * 60) * 1_000), "1h03m");
+	assert.equal(formatElapsed(3_600_000), "1h00m");
+	assert.equal(formatElapsed((1 * 3600 + 3 * 60 + 12) * 1_000), "1h03m");
+	assert.equal(formatElapsed(-1_500), "0s");
 });
 
 test("formatFooterStatus is empty when nothing is running", () => {
@@ -429,7 +438,7 @@ test("formatWidgetLines includes throughput at exactly one second of generation"
 	assert.match(lines[1] ?? "", /· 1K t\/s$/);
 });
 
-test("formatWidgetLines appends current-turn elapsed for live in-flight turns", () => {
+test("formatWidgetLines shows current-turn elapsed beside the lifetime total", () => {
 	assert.deepEqual(
 		formatWidgetLines(
 			[
@@ -445,29 +454,71 @@ test("formatWidgetLines appends current-turn elapsed for live in-flight turns", 
 			5_000_000,
 		),
 		[
-			"● worker-0 (worker) · 4999s",
-			"  ⎿  working · turn 4 (787s)",
+			"● worker-0 (worker) · 13m07s / 1h23m",
+			"  ⎿  working · turn 4",
 		],
 	);
 });
 
-test("formatWidgetLines omits current-turn elapsed without a start, once settled, or for terminal entries", () => {
-	const cases: Array<{ entry: Parameters<typeof formatWidgetLines>[0][number]; label: string }> = [
+test("formatAgentElapsed freezes a settled turn and resets when the next turn starts", () => {
+	const base = {
+		name: "worker-0",
+		agent: "worker",
+		state: "working",
+		startedAt: 0,
+		turns: 3,
+	} satisfies StatusEntry;
+	const frozen = {
+		...base,
+		currentTurnStartedAt: 1_000,
+		currentTurnEndedAt: 1_000 + (12 * 60 + 12) * 1_000,
+	};
+	const atHour = (1 * 3600 + 3 * 60) * 1_000;
+	assert.equal(formatAgentElapsed(frozen, atHour), "12m12s / 1h03m");
+	// The lifetime clock keeps moving; the settled turn does not.
+	assert.equal(formatAgentElapsed(frozen, atHour + 90_000), "12m12s / 1h04m");
+	assert.equal(
+		formatWidgetLines([frozen], atHour)[0],
+		"● worker-0 (worker) · 12m12s / 1h03m",
+	);
+
+	const reset = { ...base, currentTurnStartedAt: atHour, currentTurnEndedAt: undefined };
+	assert.equal(formatAgentElapsed(reset, atHour + 42_000), "42s / 1h03m");
+	assert.equal(formatAgentElapsed(reset, atHour + 47_000), "47s / 1h03m");
+
+	const longTurn = {
+		...base,
+		currentTurnStartedAt: 0,
+		currentTurnEndedAt: (1 * 3600 + 3 * 60 + 12) * 1_000,
+	};
+	assert.equal(formatAgentElapsed(longTurn, 2 * 3_600_000), "1h03m12s / 2h00m");
+});
+
+test("formatWidgetLines omits current-turn elapsed without a start and freezes terminal entries", () => {
+	const cases: Array<{ entry: StatusEntry; label: string }> = [
 		{ label: "no turn start", entry: { name: "w", agent: "worker", state: "working", startedAt: 0, turns: 2 } },
 		{ label: "settled turn", entry: { name: "w", agent: "worker", state: "working", startedAt: 0, turns: 2, currentTurnStartedAt: undefined } },
-		{ label: "terminal node", entry: { name: "w", agent: "worker", state: "settled", startedAt: 0, finishedAt: 1_000, turns: 2, currentTurnStartedAt: 0 } },
+		{ label: "idle without a freeze point", entry: { name: "w", agent: "worker", state: "waiting", startedAt: 0, turns: 2, currentTurnStartedAt: 0 } },
 	];
 	for (const { entry, label } of cases) {
 		const lines = formatWidgetLines([entry], 5_000_000).join("\n");
-		assert.doesNotMatch(lines, /turn \d+ \(/, `${label}: no elapsed suffix expected`);
+		assert.doesNotMatch(lines, / \/ /, `${label}: no current/total pair expected`);
 		assert.match(lines, /turn 2/, `${label}: turn count stays`);
 	}
+	// A terminal entry with only a start freezes at finishedAt, not at now.
+	const terminal = formatWidgetLines(
+		[{ name: "w", agent: "worker", state: "settled", startedAt: 0, finishedAt: 42_000, turns: 2, currentTurnStartedAt: 0 }],
+		5_000_000,
+	);
+	assert.equal(terminal[0], "● w (worker) · 42s / 42s");
+	assert.match(terminal[1] ?? "", /turn 2$/);
 	// Clock skew clamps to zero instead of going negative.
 	const skewed = formatWidgetLines(
 		[{ name: "w", agent: "worker", state: "working", startedAt: 0, turns: 2, currentTurnStartedAt: 9_999_999 }],
 		5_000_000,
-	).join("\n");
-	assert.match(skewed, /turn 2 \(0s\)/);
+	);
+	assert.match(skewed[0] ?? "", /0s \/ /);
+	assert.match(skewed[1] ?? "", /turn 2$/);
 });
 
 test("applyStatus paints above the editor and in the footer", () => {
@@ -861,7 +912,7 @@ test("status board keeps short titles intact on a wide terminal", () => {
 	board.paint(entries.slice(0, 1), 5_000);
 	const lines = factory!(tui, theme).render(120);
 	assertLinesFit(lines, 120);
-	assert.match(lines[0] ?? "", /^● worker-0 \(worker\) · \d+s$/);
+	assert.match(lines[0] ?? "", /^● worker-0 \(worker\) · (?:\d+s|\d+m\d{2}s|\d+h\d{2}m)$/);
 	assert.equal(lines[1], "  ⎿  working");
 	assert.ok(!(lines[0] ?? "").includes("…") && !(lines[0] ?? "").includes("..."));
 });

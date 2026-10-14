@@ -82,14 +82,39 @@ test("progressFromSession: in-flight turn exposes its start timestamp", () => {
 	});
 });
 
-test("progressFromSession: a settled last turn has no current-turn start", () => {
+test("progressFromSession: a settled last turn freezes its start and end", () => {
 	const parsed = parseSessionText(
 		[
 			userMsg("go", { timestamp: 1_000 }),
 			assistantMsg({ stopReason: "stop", text: "done", timestamp: 9_000 }),
 		].join("\n"),
 	);
+	assert.equal(progressFromSession(parsed).currentTurnStartedAt, 1_000);
+	assert.equal(progressFromSession(parsed).currentTurnEndedAt, 9_000);
+});
+
+test("progressFromSession: the next user message resets a frozen turn", () => {
+	const parsed = parseSessionText(
+		[
+			userMsg("go", { timestamp: 1_000 }),
+			assistantMsg({ stopReason: "stop", text: "done", timestamp: 9_000 }),
+			userMsg("again", { timestamp: 20_000 }),
+		].join("\n"),
+	);
+	assert.equal(progressFromSession(parsed).currentTurnStartedAt, 20_000);
+	assert.equal(progressFromSession(parsed).currentTurnEndedAt, undefined);
+	assert.equal(progressFromSession(parsed).turns, 2);
+});
+
+test("progressFromSession: a settled turn without an end timestamp is not frozen", () => {
+	const parsed = parseSessionText(
+		[
+			userMsg("go", { timestamp: 1_000 }),
+			assistantMsg({ stopReason: "stop", text: "done" }),
+		].join("\n"),
+	);
 	assert.equal(progressFromSession(parsed).currentTurnStartedAt, undefined);
+	assert.equal(progressFromSession(parsed).currentTurnEndedAt, undefined);
 });
 
 test("progressFromSession: timestamps are absent when the session omits them", () => {
@@ -169,4 +194,19 @@ test("progressFromSession: generationMs sums assistant − user/toolResult inter
 	assert.equal(live.generationMs, 4_000);
 	assert.equal(live.tokensOut, 150);
 	assert.equal(live.usageTotal, 170);
+});
+
+test("mergeProgress: a later in-flight turn clears a frozen end", () => {
+	const merged = mergeProgress(
+		{ currentTurnStartedAt: 1_000, currentTurnEndedAt: 9_000 },
+		{ currentTurnStartedAt: 20_000 },
+	);
+	assert.equal(merged.currentTurnStartedAt, 20_000);
+	assert.equal(merged.currentTurnEndedAt, undefined);
+	const frozen = mergeProgress(
+		{ currentTurnStartedAt: 1_000 },
+		{ currentTurnStartedAt: 4_000, currentTurnEndedAt: 8_000 },
+	);
+	assert.equal(frozen.currentTurnStartedAt, 4_000);
+	assert.equal(frozen.currentTurnEndedAt, 8_000);
 });

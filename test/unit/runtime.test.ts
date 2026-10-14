@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	createSessionRuntime,
@@ -14,6 +14,7 @@ import type { CollectSnapshot } from "../../src/extension/runtime.ts";
 import { withTempDir } from "../helpers/tmp.ts";
 import { assistantMsg, modelChange, sessionHeader, userMsg } from "../helpers/fixtures.ts";
 import type { TreeNodeSnapshot } from "../../src/tui/tree-view.ts";
+import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 
 function snapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
 	return {
@@ -1151,9 +1152,14 @@ test("runtime: session jsonl fills the live current-turn elapsed", async () => {
 			collect: () => new Promise(() => {}),
 		});
 		// The board renders with the real clock, so assert shape, not a fixed
-		// second count: the in-flight turn (started at 4_000) shows a suffix.
-		assert.match(rendered.join("\n"), /turn 2 \(\d+s\) · bash/);
-		assert.equal(runtime.statusEntries().find((entry) => entry.name === "worker-0")?.tokensTotal, 1_100);
+		// second count: the in-flight turn (started at 4_000) sits beside the total.
+		const text = rendered.join("\n");
+		assert.match(text, / \/ /);
+		assert.match(text, /turn 2 · bash/);
+		const live = runtime.statusEntries().find((entry) => entry.name === "worker-0");
+		assert.equal(live?.currentTurnStartedAt, 4_000);
+		assert.equal(live?.currentTurnEndedAt, undefined);
+		assert.equal(live?.tokensTotal, 1_100);
 		runtime.dispose();
 	});
 });
@@ -1295,4 +1301,78 @@ test("renderLiveChildStatus leaves a dead child's terminal snapshot alone", () =
 	assert.match(text, /acceptance: rejected \(none\)/);
 	assert.doesNotMatch(text, /last event/);
 	assert.doesNotMatch(text, /stale/);
+});
+
+test("runtime: a settled session turn freezes, and the next user message resets it", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = join(dir, "worker-0.jsonl");
+		writeFileSync(
+			sessionFile,
+			[
+				sessionHeader(),
+				userMsg("go", { timestamp: 1_000 }),
+				assistantMsg({ stopReason: "stop", text: "done", timestamp: 9_000 }),
+			].join("\n") + "\n",
+		);
+		const runtime = createSessionRuntime({
+			sendMessage() {},
+			now: () => 20_000,
+		});
+		try {
+			runtime.track({
+				name: "worker-0",
+				runId: "r-1",
+				agent: "worker",
+				sessionFile,
+				timeoutMs: 1_000,
+				collect: () => new Promise(() => {}),
+			});
+			const frozen = runtime.statusEntries().find((entry) => entry.name === "worker-0");
+			assert.equal(frozen?.currentTurnStartedAt, 1_000);
+			assert.equal(frozen?.currentTurnEndedAt, 9_000);
+
+			appendFileSync(sessionFile, userMsg("again", { timestamp: 30_000 }) + "\n");
+			const reset = runtime.statusEntries().find((entry) => entry.name === "worker-0");
+			assert.equal(reset?.currentTurnStartedAt, 30_000);
+			assert.equal(reset?.currentTurnEndedAt, undefined);
+			assert.equal(reset?.turns, 2);
+		} finally {
+			runtime.dispose();
+		}
+	});
+});
+
+test("runtime: turn_start resets a frozen current turn on tree nodes", () => {
+	const nodes = [
+		statusTreeNode("root", null, "root", 0),
+		statusTreeNode("root.worker", "root", "worker", 1),
+	];
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => nodes,
+		now: () => 50_000,
+	});
+	try {
+		const entry = () => runtime.statusEntries().find((item) => item.nodeId === "root.worker");
+		eventBus.emit({ nodeId: "root.worker", type: "turn_start", data: { turn: 2 }, ts: 40_000 });
+		assert.equal(entry()?.turns, 2);
+		assert.equal(entry()?.currentTurnStartedAt, 40_000);
+		assert.equal(entry()?.currentTurnEndedAt, undefined);
+
+		eventBus.emit({ nodeId: "root.worker", type: "agent_settled", data: null, ts: 46_000 });
+		assert.equal(entry()?.currentTurnStartedAt, 40_000);
+		assert.equal(entry()?.currentTurnEndedAt, 46_000);
+		// A second settle must not move the frozen endpoint.
+		eventBus.emit({ nodeId: "root.worker", type: "agent_settled", data: null, ts: 49_000 });
+		assert.equal(entry()?.currentTurnEndedAt, 46_000);
+
+		eventBus.emit({ nodeId: "root.worker", type: "turn_start", data: { turn: 3 }, ts: 48_000 });
+		assert.equal(entry()?.turns, 3);
+		assert.equal(entry()?.currentTurnStartedAt, 48_000);
+		assert.equal(entry()?.currentTurnEndedAt, undefined);
+	} finally {
+		runtime.dispose();
+	}
 });

@@ -40,8 +40,13 @@ export interface StatusEntry {
 	turns?: number;
 	lastTools?: string[];
 	phase?: string;
-	/** Unix ms start of the agent's current turn (only for live, in-flight turns). */
+	/**
+	 * Unix ms start of the agent's current turn. Kept after the turn settles
+	 * so the headline can freeze that turn until the next one starts.
+	 */
 	currentTurnStartedAt?: number;
+	/** Unix ms the current turn settled. Absent while the turn is still in flight. */
+	currentTurnEndedAt?: number;
 	/** Cumulative tokens (input+cache+output); from session jsonl (fresh) or ledger usage (≤30s stale). */
 	tokensTotal?: number;
 	/** Cumulative output tokens only; numerator for tok/s / t/s. */
@@ -73,8 +78,26 @@ export function statusTotals(entries: StatusEntry[]): StatusTotals | undefined {
 	};
 }
 
+/**
+ * Elapsed time. Sub-hour values keep seconds (`42s`, `12m12s`). Hour-scale
+ * lifetime totals drop leftover seconds (`1h03m`). Pass `hourSeconds` for the
+ * current-turn side, which stays precise to the second (`1h03m12s`).
+ */
+function formatElapsedParts(ms: number, hourSeconds: boolean): string {
+	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) {
+		const hoursMinutes = `${hours}h${String(minutes).padStart(2, "0")}m`;
+		return hourSeconds ? `${hoursMinutes}${String(seconds).padStart(2, "0")}s` : hoursMinutes;
+	}
+	if (minutes > 0) return `${minutes}m${String(seconds).padStart(2, "0")}s`;
+	return `${seconds}s`;
+}
+
 export function formatElapsed(ms: number): string {
-	return `${Math.max(0, Math.round(ms / 1000))}s`;
+	return formatElapsedParts(ms, false);
 }
 
 /** Compact token count: 950 -> "950", 1200 -> "1.2K", 2500000 -> "2.5M". */
@@ -88,17 +111,53 @@ function formatTokensCompact(value: number): string {
 }
 
 /**
- * Elapsed of the CURRENT turn, next to the total elapsed in the headline.
- * Undefined when the turn's start is unknown, the last turn already settled
- * (no live turn to time), or the entry itself is terminal.
+ * Elapsed of the current turn, shown next to the lifetime elapsed.
+ *
+ * An in-flight turn ticks with `now`. Once `currentTurnEndedAt` is set the
+ * value stays frozen until the next turn replaces the start. A terminal entry
+ * with no explicit end freezes at `finishedAt` so the clock does not run on
+ * after the agent exits. Undefined when the start is unknown, or when the
+ * entry is neither active nor terminal and the turn was not frozen.
  */
 function currentTurnElapsedMs(
-	entry: Pick<StatusEntry, "state" | "herdrStatus" | "currentTurnStartedAt">,
+	entry: Pick<StatusEntry, "state" | "herdrStatus" | "finishedAt" | "currentTurnStartedAt" | "currentTurnEndedAt">,
 	now: number,
 ): number | undefined {
 	if (entry.currentTurnStartedAt === undefined) return undefined;
-	if (!ACTIVE_STATES.has(entry.herdrStatus ?? entry.state)) return undefined;
-	return Math.max(0, now - entry.currentTurnStartedAt);
+	const start = entry.currentTurnStartedAt;
+	if (entry.currentTurnEndedAt !== undefined) {
+		return Math.max(0, entry.currentTurnEndedAt - start);
+	}
+	const status = entry.herdrStatus ?? entry.state;
+	if (TERMINAL_STATES.has(status)) {
+		if (entry.finishedAt === undefined) return undefined;
+		return Math.max(0, entry.finishedAt - start);
+	}
+	if (!ACTIVE_STATES.has(status)) return undefined;
+	return Math.max(0, now - start);
+}
+
+/** Lifetime elapsed. Frozen once the entry's own state is terminal. */
+function lifetimeElapsedMs(
+	entry: Pick<StatusEntry, "state" | "startedAt" | "finishedAt">,
+	now: number,
+): number {
+	const elapsedEnd = TERMINAL_STATES.has(entry.state) ? entry.finishedAt ?? now : now;
+	return elapsedEnd - entry.startedAt;
+}
+
+/**
+ * Headline clock: `12m12s / 1h03m` (current turn / lifetime). Lifetime only
+ * when this turn has no timing yet.
+ */
+export function formatAgentElapsed(
+	entry: Pick<StatusEntry, "state" | "herdrStatus" | "startedAt" | "finishedAt" | "currentTurnStartedAt" | "currentTurnEndedAt">,
+	now: number,
+): string {
+	const total = formatElapsed(lifetimeElapsedMs(entry, now));
+	const turnElapsed = currentTurnElapsedMs(entry, now);
+	if (turnElapsed === undefined) return total;
+	return `${formatElapsedParts(turnElapsed, true)} / ${total}`;
 }
 
 function activeEntries(entries: StatusEntry[]): StatusEntry[] {
@@ -183,8 +242,7 @@ function headlineBits(entry: StatusEntry, now: number): string[] {
 	if (entry.kind && entry.kind !== "pi") bits.push(entry.kind);
 	const model = formatModel(entry);
 	if (model) bits.push(model);
-	const elapsedEnd = TERMINAL_STATES.has(entry.state) ? entry.finishedAt ?? now : now;
-	bits.push(formatElapsed(elapsedEnd - entry.startedAt));
+	bits.push(formatAgentElapsed(entry, now));
 	if (entry.tokensTotal && entry.tokensTotal > 0) bits.push(`${formatTokensCompact(entry.tokensTotal)} tok`);
 	return bits;
 }
@@ -192,10 +250,7 @@ function headlineBits(entry: StatusEntry, now: number): string[] {
 function detailBits(entry: StatusEntry, now: number): string[] {
 	const status = entryStatus(entry);
 	const bits = [entry.phase ? `${entry.phase}/${status}` : status];
-	const turnElapsed = currentTurnElapsedMs(entry, now);
-	if (entry.turns && entry.turns > 0) {
-		bits.push(`turn ${entry.turns}${turnElapsed !== undefined ? ` (${formatElapsed(turnElapsed)})` : ""}`);
-	}
+	if (entry.turns && entry.turns > 0) bits.push(`turn ${entry.turns}`);
 	if (entry.lastTools?.length) {
 		bits.push(entry.lastTools.slice(0, 2).join(", "));
 	}
