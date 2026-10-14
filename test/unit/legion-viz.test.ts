@@ -719,3 +719,40 @@ test("railway: root-spawned lanes get a ┬ spawn connector from the header; sib
 	assert.equal(out.hit[2]![sx], "scout-1");
 	for (const line of out.canvas.toLines(ansiTheme)) assert.equal(visibleWidth(line), 120);
 });
+
+test("railway: a finished sibling drops off at once while others stay live; no ┴ merge-back on the header", () => {
+	const nodes = [
+		ROOT,
+		node("search-0", { role: "scout", startedAt: sec(0) }),
+		node("search-1", { role: "scout", startedAt: sec(0), status: "settled", endedAt: sec(210) }),
+		node("search-2", { role: "scout", startedAt: sec(0) }),
+	];
+	const out = renderRailway({ nodes, now: sec(300), width: 110, rate: 0 })!;
+	assert.deepEqual(out.shown.map((n) => n.id), ["search-0", "search-2"]);
+	const text = out.canvas.toLines(plainTheme).join("\n");
+	assert.ok(!text.includes("search-1"), "finished lane and label are gone");
+	for (const ch of ["┴", "┼", "┿"]) assert.ok(!text.includes(ch), `no merge-back/crossing glyph ${ch} left by the ended lane`);
+	assert.match(text, /2 live/);
+});
+
+test("status board entries: settled/awaiting-success children are not live lanes", () => {
+	const entries: StatusEntry[] = [
+		{ name: "root", agent: "root", state: "running", startedAt: sec(0), nodeId: "root", parentId: null, depth: 0 },
+		{ name: "search-0", agent: "scout", state: "working", startedAt: sec(0), nodeId: "root.0", parentId: "root", depth: 1 },
+		{ name: "search-1", agent: "scout", state: "settled", startedAt: sec(0), finishedAt: sec(30), nodeId: "root.1", parentId: "root", depth: 1 },
+		{ name: "search-2", agent: "scout", state: "failed", startedAt: sec(0), finishedAt: sec(30), nodeId: "root.2", parentId: "root", depth: 1 },
+	];
+	const out = renderRailway({ nodes: nodesFromEntries(entries), now: sec(60), width: 120, rate: 0 })!;
+	assert.deepEqual(out.shown.map((n) => n.name), ["search-0"]);
+});
+
+test("railway: root spawn connector hangs DOWN from the header (┬ above │ above ╰), never above it", () => {
+	const nodes = [ROOT, node("a-0", { role: "scout", startedAt: sec(10) }), node("b-0", { role: "worker", startedAt: sec(10) })];
+	const out = renderRailway({ nodes, now: sec(60), width: 120, rate: 0 })!;
+	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+	const x = lines[0]!.indexOf("┬");
+	assert.ok(x > 0, "spawn tick on the header rule");
+	assert.equal(lines[1]![x], "├", "first sibling's ╰ becomes ├ as the shared vertical continues down");
+	assert.equal(lines[2]![x], "╰", "vertical ends turning right into the lowest lane");
+	for (const line of lines) for (const ch of ["┴", "╯", "╭", "┘"]) assert.ok(!line.includes(ch), `no upward glyph ${ch}`);
+});
