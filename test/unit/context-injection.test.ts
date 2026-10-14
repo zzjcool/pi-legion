@@ -14,7 +14,7 @@ import {
 	readConventionContext,
 	resolveContextValue,
 } from "../../src/agents/context.ts";
-import herdrSubagents from "../../index.ts";
+import piLegion from "../../index.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import {
 	loadSubagentSettings,
@@ -68,7 +68,7 @@ function withRegisteredExtension<T>(
 				events.set(name, handler as ExtensionEvent);
 			},
 		};
-		herdrSubagents(pi as never);
+		piLegion(pi as never);
 		return run(events);
 	} finally {
 		if (previous.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -560,7 +560,7 @@ test("parent extension no longer registers a pane-era bash dispatch interceptor"
 			events: { emit() {} },
 			on(name: string, handler: unknown) { events.set(name, handler as ExtensionEvent); },
 		};
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		// Scout guard observes tool_call. The old interceptor blocked or rewrote bash.
 		const handler = events.get("tool_call");
 		assert.equal(typeof handler, "function");

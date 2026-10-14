@@ -20,7 +20,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import herdrSubagents from "../../index.ts";
+import piLegion from "../../index.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import {
 	parseAgentsScopeArg,
@@ -125,7 +125,7 @@ async function withSandbox(
 		}
 
 		const pi = fakePi();
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		await run({ pi, messages: pi.messages, projectRoot });
 	} finally {
 		if (previous.child === undefined) delete process.env.PI_SUBAGENT_CHILD;

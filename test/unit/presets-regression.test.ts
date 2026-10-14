@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import herdrSubagents from "../../index.ts";
+import piLegion from "../../index.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 const BROKEN = "---\nname: broken\ndescription: b\npreset: nonexistent\n---\np\n";
@@ -65,7 +65,7 @@ async function runBatch(params: {
 	let threw: Error | undefined;
 	let parameters: Tool["parameters"] = {};
 	try {
-		herdrSubagents(pi as never, { supervisor });
+		piLegion(pi as never, { supervisor });
 		const tool = tools.find((entry) => entry.name === "subagent") as unknown as Tool | undefined;
 		assert.ok(tool, "subagent tool must be registered");
 		parameters = tool.parameters;

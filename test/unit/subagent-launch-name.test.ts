@@ -11,7 +11,7 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import herdrSubagents, { resolveExplicitLaunchName } from "../../index.ts";
+import piLegion, { resolveExplicitLaunchName } from "../../index.ts";
 import { getChildByName, getSubtree } from "../../src/legion/nodes.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
 import { renderLegionStatus } from "../../src/extension/legion-status.ts";
@@ -85,7 +85,7 @@ function indexHarness(agents: Record<string, string> = { "scout.md": SCOUT_FILE,
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
 	for (const name of ENV_KEYS.slice(2)) delete process.env[name];
-	herdrSubagents(pi as never, { supervisor });
+	piLegion(pi as never, { supervisor });
 	const tool = tools.get("subagent");
 	assert.ok(tool);
 	return {

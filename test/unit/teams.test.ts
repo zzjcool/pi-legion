@@ -40,7 +40,7 @@ import {
 import { createSessionRuntime, type WaitResult } from "../../src/extension/runtime.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
-import herdrSubagents from "../../index.ts";
+import piLegion from "../../index.ts";
 
 const savedTeamEnv = process.env[TEAM_ENV];
 delete process.env[TEAM_ENV];
@@ -942,7 +942,7 @@ function indexHarness(
 			else handlers.set(name, handler);
 		},
 	};
-	herdrSubagents(pi as never, { supervisor, ...(verifyRunner ? { verifyRunner } : {}) });
+	piLegion(pi as never, { supervisor, ...(verifyRunner ? { verifyRunner } : {}) });
 	const tool = tools.find((entry) => entry.name === "subagent") as {
 		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }>;
 	};

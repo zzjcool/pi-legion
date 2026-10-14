@@ -479,7 +479,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
-export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {
+export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {
 	cascadePromise = undefined;
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";

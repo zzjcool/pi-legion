@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import herdrSubagents from "../../index.ts";
+import piLegion from "../../index.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 function fakePi() {
@@ -27,7 +27,7 @@ test("child process without nested dispatch registers only vexillatio", () => {
 	process.env.PI_SUBAGENT_CHILD = "1";
 	try {
 		const pi = fakePi();
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		// REV-17.6: a non-nested child gets only the utility dispatch tool (§2.2).
 		assert.equal(pi.tools.length, 1);
 	} finally {
@@ -49,7 +49,7 @@ test("nested-allowed RPC child registers vexillatio and subagent", () => {
 	process.env.PI_SUBAGENT_ALLOW_NESTED = "1";
 	try {
 		const pi = fakePi();
-		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		// REV-17.6: nested-enabled roles register vexillatio in addition to subagent (§2.2).
 		assert.equal(pi.tools.length, 2);
 	} finally {
