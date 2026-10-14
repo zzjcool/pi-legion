@@ -542,6 +542,22 @@ export interface TeamConfig {
 	members: TeamMember[];
 }
 
+/**
+ * Main-session scout guard (issue #17).
+ *
+ * After `threshold` consecutive read-like tool calls with no subagent or
+ * vexillatio dispatch, the parent session gets one follow-up reminder and
+ * then waits `cooldownMs`. Defaults: enabled, threshold 8, cooldown 120000.
+ * `/scout-guard` and `/no-scout-guard` override `enabled` for this session.
+ */
+export interface ScoutGuardSettings {
+	enabled?: boolean;
+	/** Positive integer. Default 8. */
+	threshold?: number;
+	/** Integer >= 0. Default 120000. */
+	cooldownMs?: number;
+}
+
 export interface SubagentsSettings {
 	/**
 	 * Master switch (default true). `false` stops new launches, system-prompt
@@ -603,6 +619,8 @@ export interface SubagentsSettings {
 	joinMode?: "each" | "smart";
 	/** smart-mode group flush window (ms). Default 10000. */
 	joinFlushMs?: number;
+	/** Main-session recon reminder. Absent fields use scout-guard defaults. */
+	scoutGuard?: ScoutGuardSettings;
 }
 
 /**
