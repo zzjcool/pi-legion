@@ -549,7 +549,11 @@ test("before_agent_start still fails loudly for a broken explicit context refere
 
 test("parent extension no longer registers a pane-era bash dispatch interceptor", () => {
 	const dir = mkdtempSync(path.join(tmpdir(), "ctx-parent-rpc-"));
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	const previousRole = process.env.PI_SUBAGENT_ROLE;
 	try {
+		process.env.PI_CODING_AGENT_DIR = dir;
+		delete process.env.PI_SUBAGENT_ROLE;
 		const events = new Map<string, ExtensionEvent>();
 		const pi = {
 			registerMessageRenderer() {}, registerTool() {}, registerCommand() {}, sendMessage() {},
@@ -557,8 +561,17 @@ test("parent extension no longer registers a pane-era bash dispatch interceptor"
 			on(name: string, handler: unknown) { events.set(name, handler as ExtensionEvent); },
 		};
 		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
-		assert.equal(events.has("tool_call"), false);
+		// Scout guard observes tool_call. The old interceptor blocked or rewrote bash.
+		const handler = events.get("tool_call");
+		assert.equal(typeof handler, "function");
+		const event = { toolName: "bash", input: { command: "echo hi" } };
+		assert.equal(handler?.(event, { cwd: dir }), undefined);
+		assert.equal(event.input.command, "echo hi");
 	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		if (previousRole === undefined) delete process.env.PI_SUBAGENT_ROLE;
+		else process.env.PI_SUBAGENT_ROLE = previousRole;
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

@@ -287,6 +287,7 @@ export type {
 	OnBlockedPolicy,
 	PresetConfig,
 	RunRecord,
+	ScoutGuardSettings,
 	StopReason,
 	SubagentsSettings,
 	SystemPromptMode,

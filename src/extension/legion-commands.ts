@@ -528,6 +528,7 @@ export function registerLegionCommand(
 		"  /legion team [list|use <name> [--global]|create <name> a,b,c [--global]]",
 		"  /legion agents [user|project|both]",
 		"  /legion on | off — enable/disable subagents for this session (status is shown after each run)",
+		"  /scout-guard | /no-scout-guard — session override for the main-session scout guard",
 		"  /legion summary [--all] [<name>]",
 		"  /legion doctor [section]",
 		"  /legion stop [name]",

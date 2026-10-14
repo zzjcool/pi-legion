@@ -426,10 +426,12 @@ test("renderAgentsListing: alias and unenforced fields are surfaced", () => {
 
 // ────────────────────── command wiring (real factory) ──────────────────────
 
-test("/legion is the sole slash command and offers unified subcommand completions", async () => {
+test("/legion is the management command; scout-guard is a separate session pair", async () => {
 	await withSandbox({ settings: { teams: { frontend: { members: ["worker"] } } } }, async ({ pi }) => {
 		const command = findCommand(pi);
-		assert.deepEqual(pi.commands.map((entry) => entry.name), ["legion"]);
+		// #57 folded the old /subagents-* commands into /legion. #17 keeps
+		// /scout-guard and /no-scout-guard as their own session overrides.
+		assert.deepEqual(pi.commands.map((entry) => entry.name), ["scout-guard", "no-scout-guard", "legion"]);
 		assert.ok(command.description?.includes("manage teams"));
 		const emptyPrefixCompletions = command.getArgumentCompletions?.("");
 		assert.ok(Array.isArray(emptyPrefixCompletions));
