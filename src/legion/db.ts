@@ -9,7 +9,12 @@ export type SqliteBindValue = string | number | bigint | null | Uint8Array;
 export type SqliteRow = Record<string, string | number | bigint | null | Uint8Array>;
 
 export interface LegionStatementSync {
-	get(...parameters: SqliteBindValue[]): SqliteRow | undefined;
+	/**
+	 * Fetch one row. Node's `node:sqlite` returns `undefined` on a miss;
+	 * Bun's `bun:sqlite` returns `null`. Callers must treat both as absent
+	 * (see {@link sqliteHasRow}).
+	 */
+	get(...parameters: SqliteBindValue[]): SqliteRow | null | undefined;
 	all(...parameters: SqliteBindValue[]): SqliteRow[];
 	run(...parameters: SqliteBindValue[]): {
 		changes: number | bigint;
@@ -95,6 +100,14 @@ CREATE TABLE messages (
 );
 CREATE INDEX idx_messages_inbox ON messages(to_node, delivered, id);
 `;
+
+/**
+ * True when a prepared-statement `.get()` returned a real row.
+ * Bun returns `null` for no match; Node returns `undefined` — both are misses.
+ */
+export function sqliteHasRow(row: SqliteRow | null | undefined): boolean {
+	return row != null;
+}
 
 /** Resolve the tree ledger location specified by contract §4.1. */
 export function legionDbPath(rootRunDir: string): string {

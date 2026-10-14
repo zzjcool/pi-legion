@@ -8,6 +8,7 @@ import {
 	LEGION_DB_USER_VERSION,
 	legionDbPath,
 	openLegionDb,
+	sqliteHasRow,
 } from "../../src/legion/db.ts";
 import { insertNode } from "../../src/legion/nodes.ts";
 
@@ -101,4 +102,10 @@ test("WAL busy handler retries successfully after the competing supervisor relea
 		child.close();
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
+});
+
+test("sqliteHasRow treats Bun null and Node undefined as miss", () => {
+	assert.equal(sqliteHasRow(undefined), false);
+	assert.equal(sqliteHasRow(null), false);
+	assert.equal(sqliteHasRow({ found: 1 }), true);
 });

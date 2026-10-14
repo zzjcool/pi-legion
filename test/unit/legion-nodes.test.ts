@@ -112,3 +112,39 @@ test("legion nodes update status and heartbeat then scan status and stale timest
 		db.close();
 	}
 });
+
+test("childNameExists treats Bun null and Node undefined misses the same (empty parent)", () => {
+	// Bun's bun:sqlite `.get()` returns null on miss; Node's node:sqlite returns
+	// undefined. `row !== undefined` falsely reported "root already exists" and
+	// broke every createRootLegion / subagent / vexillatio launch under Bun.
+	for (const miss of [null, undefined] as const) {
+		const fakeDb = {
+			prepare() {
+				return { get() { return miss; } };
+			},
+		};
+		assert.equal(childNameExists(fakeDb as never, null, "root"), false, `miss=${String(miss)}`);
+	}
+	const hitDb = {
+		prepare() {
+			return { get() { return { found: 1 }; } };
+		},
+	};
+	assert.equal(childNameExists(hitDb as never, null, "root"), true);
+});
+
+test("insertNode can create the tree root on an empty ledger", () => {
+	const db = openLegionDb(":memory:");
+	try {
+		assert.equal(childNameExists(db, null, "root"), false);
+		const root = insertNode(db, { parentId: null, name: "root", role: "root" }, () => 1);
+		assert.equal(root.id, "root");
+		assert.equal(childNameExists(db, null, "root"), true);
+		assert.throws(
+			() => insertNode(db, { parentId: null, name: "root", role: "root" }, () => 2),
+			NodeNameConflictError,
+		);
+	} finally {
+		db.close();
+	}
+});

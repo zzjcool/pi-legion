@@ -1,5 +1,5 @@
 import type { DatabaseSync, SqliteRow } from "./db.ts";
-import { withTransaction } from "./db.ts";
+import { sqliteHasRow, withTransaction } from "./db.ts";
 
 const NODE_SLUG_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 export const DEFAULT_SUBTREE_MAX_DEPTH = 64;
@@ -245,7 +245,7 @@ export function childNameExists(
 					"SELECT 1 AS found FROM nodes WHERE parent_id IS ? AND name = ? LIMIT 1",
 				)
 				.get(parentId, slug);
-	return row !== undefined;
+	return sqliteHasRow(row);
 }
 
 export function getChildren(db: DatabaseSync, parentId: string): LegionNode[] {
