@@ -17,11 +17,25 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - Doctor diagnose help no longer repeats itself; storage section shows hygiene sweep state (#86).
 - Bundled roles no longer advertise unloaded `lens_*` tools (#75).
 - Non-interactive `pi --print` waits for async children before cascade retire (#77).
+- Roles load `builtin:codemode`; doctor diagnose shows a dedicated section (#89 / #90 → #93).
+- Doctor role-tool→extension gates are data-driven / extensible (#97 / #99).
+- Launch honors `name=` so `/legion status <name>` matches the railway label (#101 / #104).
+- Galaxy legend shows failed/retired glyphs only when those states are present (#102 / #103).
+- Live child status leads with `alive · quiet Ns`; long quiet emphasizes living over a stale execution snapshot (#81 / #92 / #105).
+- npm `package.json` description/keywords aligned with Legion 2.x RPC (no Herdr panes) (#106 / #111).
 
 ### Added
 
 - `/legion status` human-readable summary; doctor slash list covers team / agents / on|off / summary (#76).
 - README documents scout-guard settings and `/scout-guard` / `/no-scout-guard` (#74 / #71).
+- Scout-guard mock-llm e2e: notify ×1, cooldown, and dispatch clear (#108 / #113).
+
+### Changed
+
+- CONTRIBUTING/CI docs aligned with 2.x RPC; verify-12/13 paths point at `test/legacy/docker/` (#95 / #100, #107 / #112).
+- README: remove duplicate Child extensions heading (#94 / #98).
+- `design.md` historical banner; landed F38–F46 marked ✅ / Historical (#80 / #83 → #91).
+- CI PR job runs `test:integration` (#79 / #88).
 
 ## [2.0.0] - 2026-10-14
 
