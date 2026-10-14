@@ -87,6 +87,8 @@ import {
 import { registerSummaryCommand } from "./src/extension/summary.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
+import { expectedModelsFromSettings, runLegionDoctor } from "./src/extension/legion-doctor.ts";
+import { readFileSync } from "node:fs";
 import {
 	effectiveMaxDepth,
 	Orchestrator,
@@ -148,8 +150,9 @@ const SubagentParams = Type.Object({
 				Type.Literal("list"),
 				Type.Literal("wait"),
 				Type.Literal("stop"),
+				Type.Literal("diagnose"),
 			],
-			{ description: "Defaults to launch." },
+			{ description: "Defaults to launch. diagnose = Legion doctor (extensions/providers/memory)." },
 		),
 	),
 	agent: Type.Optional(
@@ -870,6 +873,20 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			});
 
 			if (action === "list") return ok(renderAgentList(agents, team, teamWarnings));
+			if (action === "diagnose") {
+				let settings: unknown;
+				try {
+					settings = JSON.parse(readFileSync(path.join(getAgentDir(), "settings.json"), "utf8"));
+				} catch {
+					settings = undefined;
+				}
+				const report = runLegionDoctor({
+					agentDir: getAgentDir(),
+					expectedModels: expectedModelsFromSettings(settings),
+					sampleAgent: agents[0],
+				});
+				return ok(report.text);
+			}
 
 			let activeLegion: LegionRuntimeIdentity | undefined;
 			try {

@@ -206,6 +206,23 @@ subtree, including itself; when launched by a parent at depth `d`, it inherits
 `C_child = min(C_parent, d + R, 4)` (`R = 1` makes it a leaf), so it can tighten
 the inherited cap but cannot widen it.
 
+### Self-diagnosis (`/legion doctor`)
+
+When a child exits with `Model "…" not found` or `No models available`, the
+usual cause after #43 is that the model provider is registered by a host
+package (for example `pi-any-endpoint`) that children no longer load.
+
+- `/legion doctor` — prints a report into the chat (works outside TUI too).
+- `subagent({ action: "diagnose" })` — same report as tool output, so the
+  main agent can call it without waiting for you.
+
+The report covers: child `--no-extensions` policy and env knobs, host
+`settings.packages` with resolved `--extension` paths, a sample child argv,
+host vs `--no-extensions` model lists (and which package restores models),
+team/roster models that would be missing, memory-gate / child V8 flags, and
+recent spawn failures recorded in this process. Spawn failures that look like
+a missing model also append a short fix hint automatically.
+
 ### Child extensions
 
 Children start with `--no-extensions`, so they do not load the host's

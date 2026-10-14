@@ -13,6 +13,7 @@ import { formatChildTask } from "../extension/child-guard.ts";
 import { buildPiArgs, LEGION_IDENTITY_ENV_KEYS } from "../runs/args.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import { checkMemoryGate, childMemoryEnv } from "./child-memory.ts";
+import { withSpawnFailureHint } from "../extension/spawn-hints.ts";
 import { ErrorCodes, SubagentError } from "../shared/types.ts";
 import {
 	InMemoryUIProxy,
@@ -57,6 +58,8 @@ interface ChildRecord {
 	client: RpcClientLike | null;
 	process: RpcProcessHandle | null;
 	tempDir: string;
+	/** Argv passed to the child pi (for doctor / spawn hints). */
+	lastArgs?: string[];
 	state: ChildState;
 	processAlive: boolean;
 	turnActive: boolean;
@@ -294,6 +297,7 @@ export class RpcSupervisor implements LegionSupervisor {
 				includeTask: false,
 			});
 			builtArgs = built.args;
+			registration.lastArgs = builtArgs;
 		} catch (error) {
 			await this.rollbackSpawn(registration);
 			throw error;
@@ -985,8 +989,13 @@ export class RpcSupervisor implements LegionSupervisor {
 
 	private startFailure(child: ChildRecord, message: string): SubagentError {
 		const stderr = child.client?.getStderr?.();
+		const base = `${message}${stderr ? `: ${stderr.trim().slice(0, 500)}` : ""}`;
 		return new SubagentError(
-			`${message}${stderr ? `: ${stderr.trim().slice(0, 500)}` : ""}`,
+			withSpawnFailureHint(base, {
+				name: child.name,
+				stderr,
+				args: child.lastArgs,
+			}),
 			ErrorCodes.START_FAILED,
 		);
 	}

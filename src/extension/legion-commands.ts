@@ -1,6 +1,9 @@
 import { readFileSync, statSync } from "node:fs";
+import * as path from "node:path";
 import { matchesKey, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { resolveStopTarget, runLegionStop, stopCompletions, type StopDeps } from "./legion-stop.ts";
+import { expectedModelsFromSettings, runLegionDoctor } from "./legion-doctor.ts";
+import { getAgentDir } from "../agents/paths.ts";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -414,6 +417,21 @@ export async function confirmAndStopNode(ui: ExtensionUIContext, deps: Pick<Legi
 	});
 }
 
+
+function buildDoctorReport() {
+	const agentDir = getAgentDir();
+	let settings: unknown;
+	try {
+		settings = JSON.parse(readFileSync(path.join(agentDir, "settings.json"), "utf8"));
+	} catch {
+		settings = undefined;
+	}
+	return runLegionDoctor({
+		agentDir,
+		expectedModels: expectedModelsFromSettings(settings),
+	});
+}
+
 export function registerLegionCommand(
 	pi: ExtensionAPI,
 	deps: LegionCommandDeps,
@@ -430,7 +448,7 @@ export function registerLegionCommand(
 	const overlayStop = (ui: ExtensionUIContext) => deps.stop ? (id: string) => void confirmAndStopNode(ui, deps, id) : undefined;
 
 	pi.registerCommand(LEGION_COMMAND, {
-		description: "Open the Legion view (galaxy · tok/s · log), /legion --tree, /legion <name>, or /legion stop [name] (no name = all)",
+		description: "Open the Legion view, /legion doctor, /legion --tree, /legion <name>, or /legion stop [name]",
 		getArgumentCompletions(prefix) {
 			if (deps.stop && /^stop\s/.test(prefix)) {
 				const rest = prefix.replace(/^stop\s+/, "");
@@ -439,10 +457,14 @@ export function registerLegionCommand(
 			}
 			if (prefix.includes(" ")) return null;
 			const nodes = deps.runtime.treeNodes();
-			const stopItem = deps.stop && "stop".startsWith(prefix) && prefix.length > 0
-				? [{ value: "stop", label: "stop [name] — stop one live subagent, or all" }]
-				: [];
-			return [...stopItem, ...nodes
+			const verbs: { value: string; label: string }[] = [];
+			if ("doctor".startsWith(prefix) && prefix.length > 0) {
+				verbs.push({ value: "doctor", label: "doctor — diagnose child extensions / providers / memory" });
+			}
+			if (deps.stop && "stop".startsWith(prefix) && prefix.length > 0) {
+				verbs.push({ value: "stop", label: "stop [name] — stop one live subagent, or all" });
+			}
+			return [...verbs, ...nodes
 				.filter((node) => node.name.startsWith(prefix) || node.id.startsWith(prefix))
 				.map((node) => ({
 					value: nodes.filter((candidate) => candidate.name === node.name).length > 1
@@ -452,14 +474,30 @@ export function registerLegionCommand(
 				}))];
 		},
 		async handler(args, ctx) {
+			let query = args.trim();
+			if (/^doctor(?:\s|$)/i.test(query)) {
+				const report = buildDoctorReport();
+				pi.sendMessage({
+					customType: "legion-doctor",
+					content: report.text,
+					display: true,
+				});
+				notify(
+					ctx,
+					report.ok
+						? "Legion doctor: OK (full report above)"
+						: `Legion doctor: ${report.issues.filter((i) => i.severity === "error").length} error(s) — see report`,
+					report.ok ? "info" : "warning",
+				);
+				return;
+			}
 			if (ctx.mode !== "tui") {
 				if (!warnedNonTui) {
 					warnedNonTui = true;
-					notify(ctx, "/legion is available only in TUI mode", "warning");
+					notify(ctx, "/legion is available only in TUI mode (except /legion doctor)", "warning");
 				}
 				return;
 			}
-			let query = args.trim();
 			const stopMatch = deps.stop ? /^stop(?:\s+(.*))?$/.exec(query) : null;
 			if (stopMatch && deps.stop) {
 				await runLegionStop(stopMatch[1] ?? "", stopDeps(ctx));
