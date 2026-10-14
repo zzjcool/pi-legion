@@ -340,7 +340,6 @@ Coverage:
 | runtime | Live children, tree statuses, acceptance-ish / active nodes |
 
 ### Child extensions
-### Child extensions
 
 Children start with `--no-extensions`, so they do not load the host's
 discovered extensions (settings `packages`, `~/.pi/agent/extensions`, project

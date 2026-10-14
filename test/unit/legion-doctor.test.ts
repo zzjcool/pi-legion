@@ -485,3 +485,67 @@ test("#90 diagnose section filter + invalid section (parseDoctorSections)", () =
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+
+test("#97 doctor wires role-tool gates: lens warns + next steps; codemode auto-load green", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-97-"));
+	try {
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		const env = {
+			...process.env,
+			PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+			PI_LEGION_CHILD_EXTENSIONS: undefined,
+		};
+		const lensOnly = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			env,
+			agents: [
+				{
+					name: "scout",
+					description: "d",
+					kind: "pi",
+					filePath: "/f.md",
+					tools: ["read", "lens_diagnostics", "bash"],
+					systemPrompt: "",
+					systemPromptMode: "replace",
+					inheritProjectContext: true,
+					inheritSkills: false,
+					source: "user",
+				},
+			],
+		});
+		assert.ok(lensOnly.issues.some((i) => i.code === "ROLE_MISSING_LENS"));
+		assert.match(lensOnly.text, /Add pi-lens extension path to roles that list lens_\* tools/);
+
+		const codemodeRole = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			env,
+			agents: [
+				{
+					name: "worker",
+					description: "d",
+					kind: "pi",
+					filePath: "/f.md",
+					tools: ["read", "bash", "codemode"],
+					systemPrompt: "",
+					systemPromptMode: "replace",
+					inheritProjectContext: true,
+					inheritSkills: false,
+					source: "user",
+				},
+			],
+		});
+		// #89 auto-load → effective argv has builtin:codemode → gate stays green
+		assert.equal(codemodeRole.issues.filter((i) => i.code === "ROLE_MISSING_CODEMODE").length, 0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
