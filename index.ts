@@ -52,7 +52,7 @@ import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
-import { allocateSiblingNames, makeName } from "./src/shared/name.ts";
+import { allocateSiblingNames, isValidAgentName, makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
 import { restoreHostNodeOptions } from "./src/supervisor/child-memory.ts";
 import { setVerifyQueueListener } from "./src/runs/verify-queue.ts";
@@ -190,7 +190,10 @@ const SubagentParams = Type.Object({
 		),
 	),
 	name: Type.Optional(
-		Type.String({ description: "Child handle name (control actions, including wait and stop)" }),
+		Type.String({
+			description:
+				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On control actions (status/wait/stop/…): addresses that child.",
+		}),
 	),
 	all: Type.Optional(
 		Type.Boolean({
@@ -1508,6 +1511,8 @@ async function launchFamily(input: {
 
 	const plan = buildPlan(params);
 	if (!plan.ok) return fail(plan.message, ErrorCodes.INVALID_PARAMS);
+	const nameGate = resolveExplicitLaunchName(params.name, plan.steps.length);
+	if (!nameGate.ok) return fail(nameGate.message, ErrorCodes.INVALID_PARAMS);
 
 	onUpdate?.({
 		content: [
@@ -1587,6 +1592,7 @@ async function launchFamily(input: {
 		results: [],
 		handles: [],
 		timeoutByName: new Map(),
+		...(nameGate.name ? { launchName: nameGate.name } : {}),
 	};
 
 	const interruptedResult = async (): Promise<AgentToolResult<unknown> | undefined> => {
@@ -1670,6 +1676,8 @@ interface LaunchSession {
 	results: string[];
 	handles: string[];
 	timeoutByName: Map<string, number>;
+	/** Explicit child name for this single-step launch; omit to auto-allocate. */
+	launchName?: string;
 }
 
 /**
@@ -1748,11 +1756,13 @@ async function launchStep(
 			return;
 		}
 
-		// Let `launch()` allocate from the supervisor-local registry; the index
-		// must not race separate subagent tool calls.
+		// Honor `name=` when the caller asked for one; otherwise let `launch()`
+		// allocate from the supervisor-local registry (scout-N). The index must
+		// not race separate subagent tool calls for auto names.
 		const handle = await session.orchestrator.launch({
 			agent: launchedAgent,
 			task: step.task,
+			...(session.launchName ? { name: session.launchName } : {}),
 			...(session.teamOverride ? { team: session.teamOverride } : {}),
 			...(resolved.model ? { model: resolved.model } : {}),
 			// The origin decides whether an unacceptable model is refused or
@@ -2257,6 +2267,41 @@ async function launchUtilityFamily(input: {
 				: {}),
 		},
 	};
+}
+
+/**
+ * Resolve an explicit `name=` on launch.
+ *
+ * Prefer honoring the caller's handle over auto `role-N`, so `/legion status <name>`
+ * and control actions match the tool parameter. Multi-step `tasks[]` cannot share
+ * one name; invalid grammar is refused rather than silently sanitized into a
+ * different handle the caller would not find.
+ */
+export function resolveExplicitLaunchName(
+	requested: string | undefined,
+	stepCount: number,
+): { ok: true; name?: string } | { ok: false; message: string } {
+	if (requested === undefined) return { ok: true };
+	const trimmed = requested.trim();
+	if (!trimmed) {
+		return { ok: false, message: "`name` must not be blank when provided." };
+	}
+	if (stepCount > 1) {
+		return {
+			ok: false,
+			message:
+				"`name` applies only to a single (agent+task) launch, not tasks[] with multiple steps.",
+		};
+	}
+	const normalized = trimmed.toLowerCase();
+	if (!isValidAgentName(normalized)) {
+		return {
+			ok: false,
+			message:
+				`invalid child name "${trimmed}": must match [a-z][a-z0-9_-]{0,31} (lowercase letter first, max 32 chars).`,
+		};
+	}
+	return { ok: true, name: normalized };
 }
 
 export function buildPlan(params: {
