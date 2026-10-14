@@ -79,18 +79,22 @@ are blocked before merge. `test:live` and `test:docker` stay out of that job.
 ```bash
 npm run typecheck
 npm test                 # test/unit/*.test.ts
-npm run test:integration # fake herdr, no live binary
+npm run test:integration # FakeSupervisor / nested fakes; no live `pi` binary
 npm run test:all         # typecheck + unit + integration
 npm run test:mock-llm    # also part of the required ci check
 ```
 
-`npm run test:live` talks to a real herdr. It skips itself unless `HERDR_ENV=1`
-and `herdr` is on `PATH`. Do not fail CI on it.
+`npm run test:live` is a **pi RPC live** smoke (`test/live/rpc-live.test.ts`).
+It skips itself when the `pi` binary is missing from `PATH` (see the probe at
+the top of that file). Do not fail CI on it.
 
 Prefer **TDD** for behaviour changes: a failing test in `test/unit` or
 `test/integration` first, then the production code. Integration tests should
-go through `createHerdrClient(createFakeRunner(fake))` so argv construction
-and JSON parsing stay covered.
+drive the orchestrator through `FakeSupervisor` (`test/helpers/fake-supervisor.ts`)
+so nesting / launch / collect stay covered without a live `pi`. The herdr-era
+helpers `createHerdrClient` / `createFakeRunner` remain as **deprecated legacy**
+exports (see `src/api.ts` and `test/legacy/`); use them only when touching the
+archived Herdr backend.
 
 ## Mock LLM
 
@@ -109,16 +113,19 @@ dummy key is always the literal `mock`.
 
 ## Docker verification
 
-`test/docker/` runs the package inside `pi-herdr-sandbox:latest` with a copy
-of the **host** Pi config (`~/.pi/agent/settings.json`, `models.json`,
-`auth.json` if present). The copy is disposable (`/tmp/pi-herdr-docker-home`
-by default); the container cannot write back to your real `~/.pi`.
+`test/docker/` runs the package inside the RPC / pi-legion sandbox image.
+Default image and staging path names are **historical** (`pi-herdr-sandbox:latest`,
+`/tmp/pi-herdr-docker-home`; override with `PI_DOCKER_IMAGE` / `DOCKER_PI_HOME`).
+Content is the 2.x RPC sandbox, not a live herdr pane host. The scripts copy
+the **host** Pi config (`~/.pi/agent/settings.json`, `models.json`, `auth.json`
+if present) into that disposable home; the container cannot write back to your
+real `~/.pi`.
 
 ```bash
-# image must already exist
+# image must already exist (historical default name)
 docker image inspect pi-herdr-sandbox:latest >/dev/null
 
-bash test/docker/verify-1-child-guard.sh      # child herdr interceptor
+bash test/docker/verify-1-child-guard.sh      # RPC child-guard / ledger block
 bash test/docker/verify-2-task-appendix.sh    # frozen task appendix
 bash test/docker/verify-3-readonly.sh         # read-only bash denylist
 bash test/docker/verify-4-acceptance.sh       # collect → verified
@@ -163,7 +170,7 @@ them by hand.
 | `src/runs/acceptance.ts` | `verification-output` command |
 | `test/mock-llm/` | Scriptable OpenAI mock for offline pi / legion |
 | `agents/*.md` | bundled roles |
-| `docs/design.md` | measured herdr findings (F1–F46) |
+| `docs/design.md` | design notes / F1–F46 (incl. historical herdr-era measurements; see file banner) |
 | `README.md` | what is actually wired today |
 
 Do not import from `src/` in downstream packages — use
