@@ -34,9 +34,11 @@ jobs:
       - name: test
         run: npm test
 
+      - name: test:integration
+        run: npm run test:integration
+
       - name: test:mock-llm
         run: npm run test:mock-llm
 
-      # Not in this job: test:integration (release.yml), test:live (needs a
-      # real herdr), test:docker (needs image pi-herdr-sandbox:latest plus a
-      # host Pi agent dir). See release.yml.
+      # Not in this job: test:live (needs a real herdr), test:docker (needs
+      # image pi-herdr-sandbox:latest plus a host Pi agent dir). See release.yml.

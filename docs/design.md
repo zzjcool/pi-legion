@@ -1,5 +1,9 @@
 # pi-legion 设计文档
 
+> **⚠️ 历史实验笔记（非现行契约）**  
+> 本文记录 herdr / pane 时代的实测与设计推演。**运行时契约以 [README](../README.md) 与 [CONTRIBUTING](../CONTRIBUTING.md) 为准**（Pi Legion 2.x = headless Pi RPC + `legion.db`；herdr pane 执行已归档到 `src/backends/legacy/`）。  
+> 下文 F 条中标 **✅ landed** 的是已在当前 master 落地的修复；未标注的早期结论仍有参考价值，但不要当作「今日仍坏」的缺口清单。
+
 > 基于 10 组实测实验（exp1–exp10）得出的设计。所有结论都标注了实验依据，
 > 未经验证的假设明确标记为「待验证」。
 
@@ -20,7 +24,7 @@
 
 ### 实现状态（相对本文档）
 
-下面 F 条目里不少写的是「当时的缺口」。当前运行时已经钉死、以 [README](../README.md) 为准：
+下面 F 条目里不少写的是「当时的缺口」（文首 banner 已说明：契约以 README + CONTRIBUTING 为准）。当前运行时已经钉死：
 
 - 子进程强制加载 child-guard：拦 `herdr agent prompt|wait|send-keys|start`、外 pane read、只读角色写操作
 - 任务卡自动附录（禁止 wakeup、必须 `{"ok":…}`）
@@ -1133,12 +1137,24 @@ index.ts(132,4): error TS7006: Parameter 'signal' implicitly has an 'any' type.
 
 ---
 
-## 16. 交付前安全/健壮性审计（F38–F45）
+## 16. 交付前安全/健壮性审计（F38–F46）— Historical findings（✅ landed）
 
 对全部模块做了对抗式输入扫描（畸形会话文件、路径穿越、恶意配置、并发写）。
-以下 8 条是真缺陷，其余区域已验证健壮。
+以下条目**当时**是真缺陷；对照当前 master 均已落地（见各条 ✅），勿再当 open gap。
 
-### F38 — ReDoS：glob → RegExp 的嵌套量词（安全）
+| # | 当时缺口 | master 落点（摘要） |
+| --- | --- | --- |
+| F38 | glob→RegExp ReDoS | `matchesScopePattern` 双指针 glob，**不用 RegExp** |
+| F39 | `openSync`/`closeSync` fd 泄漏 | session 预创建改 `writeFileSync(..., { flag: "wx" })` |
+| F40 | `JSON.parse` 标量拖垮会话解析 | `decodeEvent` 非对象计入 `tornLines` |
+| F41 | `tasks[]` 条目未校验 | `firstInvalidStep` / 启动前校验 agent+task |
+| F42 | 空白 `task` 被 `Boolean` 放行 | 存在性按 `trim()` |
+| F43 | 角色 `timeoutMs` 被忽略 | launch 记入 `timeoutByName`，follow/wait 使用 |
+| F44 | `acceptance.criteria` 静默丢弃 | `pendingCriteria` + command 才升 `verified` |
+| F45 | 未生效配置看起来生效 | `UNENFORCED_FIELDS` 现为空；list 不再假警告 |
+| F46 | 嵌套 YAML acceptance 未解析 | `parseAcceptance` + `parseIndentedBlock` |
+
+### F38 — ✅ landed — ReDoS：glob → RegExp 的嵌套量词（安全）
 
 `modelScope.allow` 的 glob 被翻译成 `.*`，于是 `*a*a*a…b` 变成 `.*a.*a.*a…b`——
 嵌套量词在**不匹配**的输入上指数回溯。
@@ -1153,7 +1169,7 @@ index.ts(132,4): error TS7006: Parameter 'signal' implicitly has an 'any' type.
 **修法**：不用正则，改用双指针贪心 glob 匹配（只回溯最近一个 `*`）。
 修复后 n=6400 仅 2ms。
 
-### F39 — fd 泄漏：`openSync`/`closeSync` 无保护
+### F39 — ✅ landed — fd 泄漏：`openSync`/`closeSync` 无保护
 
 ```ts
 const fd = fs.openSync(file, "w", 0o600);
@@ -1166,7 +1182,7 @@ launcher 为**每个 child** 创建一个 session 文件，所以泄漏会随 fa
 **修法**：`fs.writeFileSync(file, "", { flag: "wx", mode: 0o600 })`——
 由 Node 自己管理描述符，并且 `wx` 顺带消除了 `existsSync` 检查留下的 TOCTOU 窗口。
 
-### F40 — `JSON.parse("null")` 拖垮整个会话解析
+### F40 — ✅ landed — `JSON.parse("null")` 拖垮整个会话解析
 
 `JSON.parse` 对标量是成功的：`null` / `42` / `true` / `"x"`。
 随后 `event.type` 在 `null` 上抛异常，**整个 `parseSessionText` 崩溃**，
@@ -1174,7 +1190,7 @@ launcher 为**每个 child** 创建一个 session 文件，所以泄漏会随 fa
 
 **修法**：非对象、非数组的标量按损坏行计入 `tornLines`，继续解析其余行。
 
-### F41 — `tasks[]` 的条目未校验
+### F41 — ✅ landed — `tasks[]` 的条目未校验
 
 单任务路径用 `Boolean(params.agent && params.task)` 把关，但数组路径直接放行：
 
@@ -1185,12 +1201,12 @@ tasks:[{task:"do it"}]            → 放行，agent 名为 undefined
 
 **修法**：每个 step 在分配任何资源之前校验 `agent` 与 `task`。
 
-### F42 — `Boolean("   ")` 为真：纯空白 task 被放行
+### F42 — ✅ landed — `Boolean("   ")` 为真：纯空白 task 被放行
 
 即使单任务路径，`task: "   "` 也会通过，生成一个毫无意义的 `Task:` prompt。
 **修法**：存在性按 `trim()` 后的内容判定，而非 `Boolean()`。
 
-### F43 — `timeoutMs` 被解析却从不生效
+### F43 — ✅ landed — `timeoutMs` 被解析却从不生效
 
 5 个自带角色都声明了预算，运行时却全部忽略，永远用全局默认 15 分钟：
 
@@ -1202,7 +1218,7 @@ DEFAULTS.turnTimeoutMs: 900000 (15min) ← 实际生效
 
 **修法**：`collect` 采用 `agent.timeoutMs`（按 child 记录，逐个子 agent 生效）。
 
-### F44 — `acceptance.criteria` 被静默丢弃
+### F44 — ✅ landed — `acceptance.criteria` 被静默丢弃
 
 角色可以声明 `must: "测试通过"` 这类**语义**验收条件，代码解析后就不管了。
 调用方无法知道「没有任何东西验证过它」。
@@ -1213,7 +1229,7 @@ DEFAULTS.turnTimeoutMs: 900000 (15min) ← 实际生效
 **修法**：criteria 作为**待验证清单**回传调用方（`pendingCriteria`），
 且 `level` 保持 `attested`——**`verified` 只留给真正被人核对过的证据**。
 
-### F45 — 配置字段「看起来生效、实际无效」
+### F45 — ✅ landed — 配置字段「看起来生效、实际无效」
 
 自带角色携带 `onBlocked` / `allowNestedSubagents` / `fallbackModels` / `toolTimeoutMs`，
 全部被解析、全部不生效。其中 `allowNestedSubagents: false` 最危险——
@@ -1228,7 +1244,7 @@ DEFAULTS.turnTimeoutMs: 900000 (15min) ← 实际生效
 **原则**：**一个被接受却不做事的键，比一个未知的键更危险**——
 用户会相信它已经在保护自己。
 
-### F46 — 嵌套 YAML 块从未被解析：自带角色的 acceptance 全部丢失
+### F46 — ✅ landed — 嵌套 YAML 块从未被解析：自带角色的 acceptance 全部丢失
 
 frontmatter 解析器是**扁平的**（只处理 `key: value`）；一个嵌套块会以
 **剥掉公共缩进后的原始文本**返回：

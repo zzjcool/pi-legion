@@ -23,7 +23,13 @@ directly to `master`. Implementers do not merge their own pull requests.
 ```bash
 npm run typecheck
 npm test
+npm run test:integration   # or npm run test:all
 ```
+
+The required GitHub Actions check `ci` runs typecheck, unit, integration, and
+mock-llm. Run `npm run test:integration` (or `npm run test:all`) locally
+before you push, especially when the change touches `src/runs/`, `src/legion/`,
+or `src/extension/runtime.ts`.
 
 Add the unit tests the change needs. Prefer **TDD** (see [Checks](#checks)):
 a failing test in `test/unit` or `test/integration` first, then the production
@@ -59,11 +65,23 @@ there is no compile step to ship).
 
 ## Checks
 
+The required GitHub Actions check `ci` (`.github/workflows/ci.yml`, on pull
+requests and pushes to `master`) runs, in order:
+
+1. `npm run typecheck`
+2. `npm test` (unit)
+3. `npm run test:integration`
+4. `npm run test:mock-llm`
+
+A failing integration step fails `ci`, so nesting and orchestrator regressions
+are blocked before merge. `test:live` and `test:docker` stay out of that job.
+
 ```bash
 npm run typecheck
 npm test                 # test/unit/*.test.ts
 npm run test:integration # fake herdr, no live binary
 npm run test:all         # typecheck + unit + integration
+npm run test:mock-llm    # also part of the required ci check
 ```
 
 `npm run test:live` talks to a real herdr. It skips itself unless `HERDR_ENV=1`
