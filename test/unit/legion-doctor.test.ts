@@ -15,7 +15,7 @@ import {
 } from "../../src/extension/legion-doctor.ts";
 import { clearSpawnFailures, recordSpawnFailure } from "../../src/extension/spawn-hints.ts";
 import { HYGIENE_DEFAULTS, HYGIENE_LAST_FILE } from "../../src/runs/hygiene.ts";
-import { buildPiArgs } from "../../src/runs/args.ts";
+import { BUILTIN_CODEMODE, buildPiArgs } from "../../src/runs/args.ts";
 
 test("parseListModels reads pi --list-models table", () => {
 	const out = parseListModels(`provider      model                               context  max-out  thinking  images
@@ -141,10 +141,10 @@ test("doctor flags CHILD_NO_MODELS and covers all sections", () => {
 			assert.ok(report.text.includes(line), `doctor slash list missing: ${line}`);
 		}
 		assert.match(report.text, /- slash: `\/legion doctor \[section\]`/);
-		assert.match(report.text, /- tool: `subagent\(\{ action: "diagnose" \}\)`/);
-		assert.doesNotMatch(report.text, /subagent\(\{ action: "diagnose" \}\) or `subagent\(\{ action: "diagnose" \}\)`/);
+		assert.match(report.text, /- tool: `subagent\(\{ action: "diagnose", section\? \}\)`/);
+		assert.doesNotMatch(report.text, /no section field/);
 		const tools = report.text.split("## Tools / commands")[1]?.split("\n## ")[0] ?? "";
-		assert.equal((tools.match(/subagent\(\{ action: "diagnose" \}\)/g) ?? []).length, 1);
+		assert.equal((tools.match(/subagent\(\{ action: "diagnose"/g) ?? []).length, 1);
 		assert.equal(report.issues.some((issue) => issue.code === "HYGIENE_SWEEP_STALE"), false);
 		assert.match(report.text, /\/scout-guard \| \/no-scout-guard/);
 		assert.match(report.text, /\/legion on \| \/legion off/);
@@ -392,5 +392,96 @@ test("hygiene sweep hint stays out of unrelated doctor sections", () => {
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 		rmSync(store, { recursive: true, force: true });
+	}
+});
+
+
+test("#89 bundled roles with tools:codemode load builtin:codemode; doctor stays green", () => {
+	const roles = loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin").filter((agent) =>
+		(agent.tools ?? []).includes("codemode"),
+	);
+	assert.ok(roles.length >= 5, `expected several codemode roles, got ${roles.map((r) => r.name)}`);
+
+	const prevInherit = process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+	const prevExtra = process.env.PI_LEGION_CHILD_EXTENSIONS;
+	delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+	delete process.env.PI_LEGION_CHILD_EXTENSIONS;
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-codemode-"));
+	try {
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		for (const agent of roles) {
+			const args = buildPiArgs({
+				agent,
+				task: "t",
+				sessionFile: path.join(dir, "session.jsonl"),
+				tempDir: dir,
+			}).args;
+			assert.ok(args.includes("--no-extensions"));
+			const extensions = args.flatMap((arg, i) => (arg === "--extension" ? [args[i + 1] ?? ""] : []));
+			assert.ok(
+				extensions.includes(BUILTIN_CODEMODE),
+				`${agent.name} argv missing ${BUILTIN_CODEMODE}: ${extensions.join(",")}`,
+			);
+		}
+
+		const report = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+			agents: roles,
+		});
+		assert.equal(report.issues.filter((issue) => issue.code === "ROLE_MISSING_CODEMODE").length, 0);
+	} finally {
+		if (prevInherit === undefined) delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+		else process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = prevInherit;
+		if (prevExtra === undefined) delete process.env.PI_LEGION_CHILD_EXTENSIONS;
+		else process.env.PI_LEGION_CHILD_EXTENSIONS = prevExtra;
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("#90 diagnose section filter + invalid section (parseDoctorSections)", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-sec90-"));
+	try {
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		const storage = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			sections: parseDoctorSections("storage"),
+			env: { ...process.env, PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined },
+		});
+		assert.match(storage.text, /## Storage \/ hygiene/);
+		assert.doesNotMatch(storage.text, /## Extensions/);
+		assert.doesNotMatch(storage.text, /## Tools \/ commands/);
+		assert.ok(storage.sections.includes("storage"));
+		assert.ok(storage.sections.includes("next"));
+
+		const tools = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			sections: parseDoctorSections("tools"),
+			env: { ...process.env, PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined },
+		});
+		assert.match(tools.text, /## Tools \/ commands/);
+		assert.match(tools.text, /section\?/);
+		assert.doesNotMatch(tools.text, /## Storage \/ hygiene/);
+
+		assert.throws(() => parseDoctorSections("storage nope"), /Unknown doctor section "nope"/);
+		assert.deepEqual(parseDoctorSections("storage,tools"), ["storage", "tools"]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
