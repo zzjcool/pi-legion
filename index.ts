@@ -41,7 +41,7 @@ import {
 	loadSubagentSettings,
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
-import { createSessionRuntime, type SessionRuntime, type TrackedJob, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
+import { createSessionRuntime, renderLiveChildStatus, type SessionRuntime, type TrackedJob, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
@@ -1221,7 +1221,18 @@ async function controlAction(input: {
 		orchestrator,
 	};
 
-	if (action === "status") return renderChild(found.child, "status");
+	if (action === "status") {
+		return ok(renderLiveChildStatus({
+			name: found.child.name,
+			state: found.child.state,
+			agent: found.child.agent,
+			kind: found.child.kind,
+			sessionFile: found.child.sessionFile,
+			execution: found.child.execution,
+			acceptance: found.child.acceptance,
+			alive: input.supervisor.isAlive(params.name),
+		}));
+	}
 	if (action === "steer") return steerChild(ctx);
 	if (action === "collect") return collectChild(ctx, input.signal);
 	if (action === "retire") return retireChild(ctx);
@@ -2324,6 +2335,7 @@ function followJob(
 				timeoutMs: input.timeoutMs,
 				...(opts?.signal ? { signal: opts.signal } : {}),
 			}),
+		isAlive: () => input.orchestrator.isChildAlive(input.name),
 		persist: async () =>
 			persistChild(input.store, input.runId, input.orchestrator, input.name),
 		retire: async () => {
