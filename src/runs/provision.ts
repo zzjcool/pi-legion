@@ -78,6 +78,12 @@ function installCommandFor(worktreePath: string): string | null {
 	return null;
 }
 
+function shellEnv(): NodeJS.ProcessEnv {
+	const env = { ...process.env };
+	delete env.npm_config_prefix;
+	return env;
+}
+
 function resolveCommand(mode: string, worktreePath: string): string | null {
 	if (mode === BOOTSTRAP_MODE_INSTALL) return installCommandFor(worktreePath);
 	const trimmed = mode.trim();
@@ -112,6 +118,10 @@ export function provisionWorktree(opts: {
 			cwd: opts.worktreePath,
 			stdio: ["ignore", "pipe", "pipe"],
 			timeout: opts.timeoutMs ?? 600_000,
+			// npm lifecycle scripts export npm_config_prefix. A login shell
+			// that sources nvm then refuses to start and `npm` disappears
+			// from PATH. Local installs do not need that prefix.
+			env: shellEnv(),
 		});
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
