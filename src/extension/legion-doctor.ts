@@ -12,7 +12,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	BUILTIN_CODEMODE,
 	CHILD_EXTENSIONS_ENV,
 	CHILD_INHERIT_EXTENSIONS_ENV,
 	buildPiArgs,
@@ -20,9 +19,11 @@ import {
 	childGuardExtensionPath,
 	childInheritsExtensions,
 	collectChildExtensions,
-	isCodemodeExtension,
-	roleListsCodemode,
 } from "../runs/args.ts";
+import {
+	collectRoleToolExtensionIssues,
+	roleToolGateNextSteps,
+} from "../runs/role-tool-gates.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import {
 	CHILD_MAX_OLD_SPACE_ENV,
@@ -604,34 +605,12 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	}
 
 	const agents = options.agents ?? (options.sampleAgent ? [options.sampleAgent] : []);
+	// #97: extensible tool→extension gates (lens #70, codemode #89, …).
 	for (const agent of agents) {
-		const needsLens = (agent.tools ?? []).some((t) => /lens|symbol_search|project_report|module_report|read_symbol|read_enclosing/i.test(t));
-		const exts = extensionsForRole(agent, env, extras);
-		const hasLens =
-			childInheritsExtensions(agent, env) ||
-			exts.some((e) => /pi-lens/i.test(e));
-		if (needsLens && !hasLens && !inheritGlobal) {
-			issues.push({
-				severity: "warning",
-				code: "ROLE_MISSING_LENS",
-				section: "extensions",
-				message: `Role "${agent.name}" lists lens tools but would not load pi-lens under --no-extensions.`,
-				fix: `Add pi-lens to ${agent.name}'s extensions: frontmatter, or to ${CHILD_EXTENSIONS_ENV}.`,
-			});
-		}
-		const needsCodemode = roleListsCodemode(agent);
-		const hasCodemode =
-			childInheritsExtensions(agent, env) ||
-			inheritGlobal ||
-			exts.some(isCodemodeExtension);
-		if (needsCodemode && !hasCodemode) {
-			issues.push({
-				severity: "warning",
-				code: "ROLE_MISSING_CODEMODE",
-				section: "extensions",
-				message: `Role "${agent.name}" lists codemode but would not load ${BUILTIN_CODEMODE} under --no-extensions.`,
-				fix: `Add ${BUILTIN_CODEMODE} to ${agent.name}'s extensions: frontmatter, or ensure tools: includes codemode so Legion auto-loads it.`,
-			});
+		const inherits = childInheritsExtensions(agent, env) || inheritGlobal;
+		const exts = inherits ? [] : extensionsForRole(agent, env, extras);
+		for (const issue of collectRoleToolExtensionIssues(agent, exts, { inheritsExtensions: inherits })) {
+			issues.push(issue);
 		}
 	}
 
@@ -924,12 +903,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 			steps.push(`export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}  # then restart pi`);
 			steps.push(`# or role frontmatter extensions: […] / inheritExtensions: true (more RAM)`);
 		}
-		if (issues.some((i) => i.code === "ROLE_MISSING_LENS")) {
-			steps.push("Add pi-lens extension path to roles that list lens_* tools, or to PI_LEGION_CHILD_EXTENSIONS.");
-		}
-		if (issues.some((i) => i.code === "ROLE_MISSING_CODEMODE")) {
-			steps.push(`Add ${BUILTIN_CODEMODE} to roles that list codemode (or keep tools: codemode so Legion auto-loads it).`);
-		}
+		steps.push(...roleToolGateNextSteps(issues));
 		if (issues.some((i) => i.code === "MEMORY_GATE_WOULD_REFUSE")) {
 			steps.push("Stop idle children (`/legion stop`) or lower/disable PI_LEGION_MIN_FREE_MEM_MB before launching more.");
 		}
