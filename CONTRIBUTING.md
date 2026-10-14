@@ -122,7 +122,8 @@ if present) into that disposable home; the container cannot write back to your
 real `~/.pi`.
 
 ```bash
-# image must already exist (historical default name)
+# image must already exist (historical default name; do not rename a local tag
+# just to match docs — override with PI_DOCKER_IMAGE if yours differs)
 docker image inspect pi-herdr-sandbox:latest >/dev/null
 
 bash test/docker/verify-1-child-guard.sh      # RPC child-guard / ledger block
@@ -136,19 +137,26 @@ bash test/docker/verify-8-verify-command.sh   # criterion.command + timeout
 bash test/docker/verify-9-worktree.sh         # git worktree cwd
 bash test/docker/verify-10-fallback.sh        # fallbackModels
 bash test/docker/verify-11-nested-alias.sh    # nested + alias + completionGuard
-bash test/docker/verify-12-workspace.sh       # pi install + child pinned to parent Space
-bash test/docker/verify-13-kinds.sh           # kind/model matrix; live CodeBuddy when mounted
 ```
 
-Or all at once:
+Or all at once (RPC mainline **1–11** only):
 
 ```bash
 npm run test:docker
 ```
 
-`verify-13-kinds.sh` is **not** in `npm run test:docker`: it bind-mounts host
-`codebuddy` / `cursor-agent` and (unless `LIVE_KIND_PROBES=0`) calls live
-CodeBuddy. The numbered 1–12 scripts stay offline/mock.
+**Legacy Herdr / Space / kind checks** live under `test/legacy/docker/` (need
+pi-legion **0.16.x** Herdr-era setup). They are **not** part of
+`npm run test:docker`:
+
+```bash
+bash test/legacy/docker/verify-12-workspace.sh  # Herdr Space pin (legacy)
+bash test/legacy/docker/verify-13-kinds.sh      # kind/model matrix; live CodeBuddy when mounted
+```
+
+`verify-13-kinds.sh` also bind-mounts host `codebuddy` / `cursor-agent` and
+(unless `LIVE_KIND_PROBES=0`) calls live CodeBuddy. The numbered 1–11 scripts
+under `test/docker/` stay offline/mock.
 
 Override paths with `HOST_PI_AGENT`, `DOCKER_PI_HOME`, `PI_DOCKER_IMAGE`.
 
