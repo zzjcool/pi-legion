@@ -131,7 +131,28 @@ function pushModelArgs(args: string[], input: BuildArgsInput): void {
 	if (modelArg) args.push("--model", modelArg);
 }
 
-/** `--tools a,b`, plus one `--extension` per explicitly listed extension. */
+export const CHILD_INHERIT_EXTENSIONS_ENV = "PI_LEGION_CHILD_INHERIT_EXTENSIONS";
+/** Extra extension paths every child loads explicitly (comma or path-delimiter separated). */
+export const CHILD_EXTENSIONS_ENV = "PI_LEGION_CHILD_EXTENSIONS";
+
+export function childExtraExtensions(env: NodeJS.ProcessEnv = process.env): string[] {
+	const raw = env[CHILD_EXTENSIONS_ENV];
+	if (!raw) return [];
+	return raw.split(new RegExp(`[,${path.delimiter === ";" ? ";" : ":"}]`)).map((p) => p.trim()).filter(Boolean);
+}
+
+/**
+ * Escape hatch (#43): role frontmatter `inheritExtensions: true`, or
+ * `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` for every child, restores the old
+ * behaviour of loading all host-discovered extensions.
+ */
+export function childInheritsExtensions(agent: Pick<AgentConfig, "inheritExtensions">, env: NodeJS.ProcessEnv = process.env): boolean {
+	if (agent.inheritExtensions === true) return true;
+	const raw = env[CHILD_INHERIT_EXTENSIONS_ENV]?.trim().toLowerCase();
+	return raw === "1" || raw === "true" || raw === "on" || raw === "yes";
+}
+
+/** `--tools a,b`, `--no-extensions` (unless inherited), plus one `--extension` per explicit extension. */
 function pushToolArgs(args: string[], agent: AgentConfig): void {
 	const tools = agent.tools?.filter(Boolean) ?? [];
 	if (tools.length > 0) {
@@ -140,10 +161,15 @@ function pushToolArgs(args: string[], agent: AgentConfig): void {
 	}
 
 	// Only pass through what the agent explicitly lists: a child must not
-	// silently inherit every extension the parent happens to have loaded.
+	// silently inherit every extension the parent happens to have loaded
+	// (#43: each host extension such as an LSP stack costs ~1 GB per child).
+	// `--no-extensions` stops discovery; explicit `--extension` paths below
+	// (the role's list + this package for the guard / nested spawning) still load.
+	if (!childInheritsExtensions(agent)) args.push("--no-extensions");
 	const extensions = [
 		...(agent.extensions ?? []),
 		...(agent.subagentOnlyExtensions ?? []),
+		...childExtraExtensions(),
 		childGuardExtensionPath(),
 	];
 	const seen = new Set<string>();

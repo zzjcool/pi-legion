@@ -31,6 +31,7 @@ export const OVERRIDE_FIELDS = [
 	// booleans
 	"inheritProjectContext",
 	"inheritSkills",
+	"inheritExtensions",
 	"defaultProgress",
 	"async",
 	"completionGuard",

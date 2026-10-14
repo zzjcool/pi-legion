@@ -120,6 +120,12 @@ export interface AgentConfig {
 	systemPromptMode: SystemPromptMode;
 	inheritProjectContext: boolean;
 	inheritSkills: boolean;
+	/**
+	 * Load the host's discovered extensions (settings `packages`, project
+	 * extensions) in the child. Default false: children get `--no-extensions`
+	 * plus only explicit `--extension` paths (#43).
+	 */
+	inheritExtensions?: boolean;
 
 	// ── behavior ──
 	output?: string;
