@@ -18,6 +18,8 @@
  * still starts a new turn immediately.
  */
 
+import { isTransientConnectionFailure } from "../shared/session.ts";
+
 export const SUBAGENT_NOTIFY_TYPE = "subagent-notify";
 
 export type CompletionStatus = "completed" | "failed" | "stopped" | "running";
@@ -228,10 +230,16 @@ export function collectFailureInput(
 	name: string,
 	error: unknown,
 ): CompletionInput {
+	const raw = error instanceof Error ? error.message : String(error);
+	// Live children never reach here: watch() re-arms a connection blip.
+	// A dead child's notice names that, instead of a bare "Connection error."
+	const reason = isTransientConnectionFailure(raw)
+		? `${raw} (RPC child is not alive)`
+		: raw;
 	return {
 		name,
-		execution: { status: "failed", reason: String(error) },
-		output: String(error),
+		execution: { status: "failed", reason },
+		output: raw,
 		recycled: false,
 	};
 }

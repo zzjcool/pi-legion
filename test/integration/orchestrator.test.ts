@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { Orchestrator, preCreateSessionFile } from "../../src/runs/orchestrator.ts";
+import { COLLECT_DEADLINE_REASON, Orchestrator, preCreateSessionFile, TRANSIENT_CONNECTION_REASON } from "../../src/runs/orchestrator.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import { RunStore } from "../../src/runs/store.ts";
-import { userMsg } from "../helpers/fixtures.ts";
+import { assistantMsg, userMsg } from "../helpers/fixtures.ts";
 
 function agent(over: Partial<AgentConfig> = {}): AgentConfig {
 	return {
@@ -377,6 +377,7 @@ test("a live child timeout stays working and does not write a terminal output ar
 		const handle = await h.orchestrator.launch({ agent: agent(), task: "continue working", worktree: false });
 		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 2 });
 		assert.equal(collected.execution.status, "running");
+		assert.equal(collected.execution.reason, COLLECT_DEADLINE_REASON);
 		assert.equal(collected.outputFile, undefined);
 		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
 		assert.equal(existsSync(path.join(h.runDir, `${handle.name}.output.md`)), false);
@@ -493,6 +494,85 @@ test("launch failure rolls back a worktree and permits a retry with the same chi
 		assert.equal(existsSync(worktreePath), true, "same-name retry can allocate the worktree again");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("a live child's Connection error stays running and is not retired", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "keep going", worktree: false });
+		appendFileSync(handle.sessionFile, `${assistantMsg({ stopReason: "error", errorMessage: "Connection error.", text: "" })}\n`);
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 2 });
+		assert.equal(collected.execution.status, "running");
+		assert.equal(collected.execution.reason, TRANSIENT_CONNECTION_REASON);
+		assert.equal(collected.acceptance.status, "unknown");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
+		assert.equal(h.supervisor.isAlive(handle.name), true);
+		assert.equal(h.supervisor.calls.filter((call) => call.method === "retire").length, 0);
+		assert.equal(existsSync(path.join(h.runDir, `${handle.name}.output.md`)), false);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a settled Connection error on a live child waits, then stays running", async () => {
+	const h = harness({ immediateTimeout: false });
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "retry the request", worktree: false });
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: "Connection error." });
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 1_000 });
+		assert.equal(collected.execution.status, "running");
+		assert.equal(collected.execution.reason, TRANSIENT_CONNECTION_REASON);
+		assert.equal(h.supervisor.isAlive(handle.name), true);
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a Connection error becomes terminal only after the RPC child exits", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "fail closed", worktree: false });
+		appendFileSync(handle.sessionFile, `${assistantMsg({ stopReason: "error", errorMessage: "Connection error.", text: "" })}\n`);
+		h.supervisor.exit(handle.name);
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 50 });
+		assert.equal(collected.execution.status, "failed");
+		assert.match(collected.execution.reason ?? "", /Connection error/);
+		assert.equal(h.supervisor.isAlive(handle.name), false);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a live child that recovers past a Connection error collects the real outcome", async () => {
+	const runDir = tempDir("rpc-orchestrator-");
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	let clock = 0;
+	let appended = false;
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir,
+		cwd: "/tmp/project",
+		now: () => clock,
+		sleep: async (ms) => {
+			clock += ms;
+			if (!appended) {
+				appended = true;
+				const child = orchestrator.childrenSnapshot()[0];
+				if (child) appendFileSync(child.sessionFile, `${assistantMsg({ stopReason: "stop", text: '{"ok":true}' })}\n`);
+			}
+		},
+	});
+	try {
+		const handle = await orchestrator.launch({ agent: agent(), task: "recover", worktree: false });
+		supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: "Connection error." });
+		const collected = await orchestrator.collect(handle.name, { timeoutMs: 5_000 });
+		assert.equal(collected.execution.status, "success");
+		assert.equal(supervisor.isAlive(handle.name), true);
+		assert.equal(orchestrator.childrenSnapshot()[0]?.state, "awaiting");
+	} finally {
+		rmSync(runDir, { recursive: true, force: true });
 	}
 });
 
