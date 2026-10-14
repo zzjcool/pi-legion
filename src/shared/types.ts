@@ -392,6 +392,13 @@ export interface ParsedSession {
 	/** True when the last user prompt has no assistant reply (F29 abort signal). */
 	lastTurnMissing: boolean;
 	tornLines: number;
+	/**
+	 * Cumulative model-generation wall time in ms: each completed assistant
+	 * message timestamp minus the preceding user or toolResult timestamp when
+	 * both are known. Tool/idle gaps are excluded. Approximate — session JSONL
+	 * records finished assistant messages, not mid-stream token boundaries.
+	 */
+	generationMs: number;
 }
 
 export interface TurnRecord {

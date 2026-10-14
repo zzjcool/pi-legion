@@ -302,26 +302,27 @@ test("formatWidgetLines adds model, thinking, kind, tools, and worktree", () => 
 	);
 });
 
-test("formatWidgetLines shows cumulative tokens and average throughput", () => {
+test("formatWidgetLines shows cumulative tokens and output/generation throughput", () => {
 	const lines = formatWidgetLines(
-		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_200 }],
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_200, tokensOut: 600, generationMs: 2_000 }],
 		5_000,
 	);
 	assert.match(lines[0] ?? "", /· 1\.2K tok$/);
-	assert.match(lines[1] ?? "", /· 240 t\/s$/);
+	assert.match(lines[1] ?? "", /· 300 t\/s$/);
 });
 
-test("formatWidgetLines uses finishedAt for terminal throughput", () => {
+test("formatWidgetLines t/s uses generationMs not wall clock / finishedAt", () => {
 	const lines = formatWidgetLines(
-		[{ name: "worker-0", agent: "worker", state: "settled", startedAt: 0, finishedAt: 4_000, tokensTotal: 1_000 }],
+		[{ name: "worker-0", agent: "worker", state: "settled", startedAt: 0, finishedAt: 4_000, tokensTotal: 1_000, tokensOut: 400, generationMs: 2_000 }],
 		5_000,
 	);
-	assert.match(lines[1] ?? "", /· 250 t\/s$/);
+	// 400 out / 2s gen = 200 t/s; old wall formula would be 1000/4s = 250
+	assert.match(lines[1] ?? "", /· 200 t\/s$/);
 });
 
-test("formatWidgetLines omits throughput below one second but keeps token headline", () => {
+test("formatWidgetLines omits throughput without generationMs but keeps token headline", () => {
 	const lines = formatWidgetLines(
-		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 4_500, tokensTotal: 800 }],
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 800, tokensOut: 400 }],
 		5_000,
 	);
 	assert.match(lines[0] ?? "", /· 800 tok$/);
@@ -412,18 +413,18 @@ test("formatWidgetLines shows token totals without Sigma when every agent is liv
 	);
 });
 
-test("formatWidgetLines computes throughput using the original 1.5-second duration", () => {
+test("formatWidgetLines computes throughput from output over generationMs", () => {
 	const lines = formatWidgetLines(
-		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_200 }],
-		1_500,
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_200, tokensOut: 1_200, generationMs: 1_500 }],
+		5_000,
 	);
 	assert.match(lines[1] ?? "", /· 800 t\/s$/);
 });
 
-test("formatWidgetLines includes throughput at exactly one second", () => {
+test("formatWidgetLines includes throughput at exactly one second of generation", () => {
 	const lines = formatWidgetLines(
-		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_000 }],
-		1_000,
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_000, tokensOut: 1_000, generationMs: 1_000 }],
+		5_000,
 	);
 	assert.match(lines[1] ?? "", /· 1K t\/s$/);
 });
