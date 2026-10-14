@@ -634,21 +634,12 @@ test("bundled roles do not pin a vendor model", () => {
 	}
 });
 
-test("every bundled role thinks at max", () => {
+test("bundled roles leave thinking configurable", () => {
 	for (const agent of loadBundledAgents()) {
-		// cursor-kind roles map thinking onto cursor's effort levels (xhigh),
-		// not pi's max — they must simply DECLARE a level.
-		if (agent.kind === "cursor") {
-			assert.ok(
-				agent.thinking,
-				`bundled cursor role ${agent.name} must declare thinking`,
-			);
-			continue;
-		}
 		assert.equal(
 			agent.thinking,
-			"max",
-			`bundled role ${agent.name} must think at max`,
+			undefined,
+			`bundled role ${agent.name} must not hard-code thinking`,
 		);
 	}
 });

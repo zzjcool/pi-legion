@@ -22,6 +22,8 @@ shared SQLite ledger records the whole tree.
 - [Legion tools and phases](#legion-tools-and-phases)
 - [Three-layer visualization](#three-layer-visualization)
 - [Settings and budget gates](#settings-and-budget-gates)
+- [Team 配置](#team-配置)
+- [Parent/child context conventions](#parentchild-context-conventions)
 - [Delivery and resume](#delivery-and-resume)
 - [Herdr transition and role migration](#herdr-transition-and-role-migration)
 - [Development](#development)
@@ -205,6 +207,36 @@ launched role's `maxSubagentDepth = R` counts generations in that role's
 subtree, including itself; when launched by a parent at depth `d`, it inherits
 `C_child = min(C_parent, d + R, 4)` (`R = 1` makes it a leaf), so it can tighten
 the inherited cap but cannot widen it.
+
+### Team 配置
+
+Use `subagents.team` to select the default named team from `subagents.teams`.
+The `PI_SUBAGENTS_TEAM` environment variable takes precedence over
+`subagents.team`; if neither selects a named team, the full discovered roster
+is used. Team definitions have a description and an ordered `members` list;
+each member can be a role-name string or an object with an `agent` name and
+per-member overrides. Object member overrides (for example `model` or
+`thinking`) take precedence over those fields in the role card's frontmatter;
+omitted override fields continue to use their normal role/configuration
+values.
+
+See [docs/subagents-teams.md](docs/subagents-teams.md) for four editable
+frontend/backend × premium/value team templates. The model IDs in that template
+are placeholders for your provider, not required defaults.
+
+### Parent/child context conventions
+
+Settings can provide `subagents.parentContext` and `subagents.childContext`
+inline or through `@path` references. If either setting is omitted, Legion
+looks for `subagents-parent-context.md` or `subagents-child-context.md`
+respectively in the directory containing that settings file. These are
+convention-based fallbacks: an explicit setting takes precedence, and setting
+either field to `false` disables its context. The convention filenames are
+`PARENT_CONTEXT_CONVENTION` and `CHILD_CONTEXT_CONVENTION` in
+[`src/agents/settings.ts`](src/agents/settings.ts#L30-L31); missing convention
+files simply contribute no context. The repository examples are
+[`examples/subagents-parent-context.md`](examples/subagents-parent-context.md)
+and [`examples/subagents-child-context.md`](examples/subagents-child-context.md).
 
 ### Self-diagnosis (`/legion doctor`)
 
