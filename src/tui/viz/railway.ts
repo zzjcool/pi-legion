@@ -4,7 +4,9 @@
  * Only agents live now get a lane (oldest first, then shallowest), drawn on a
  * single shared time axis that ends at "now". When an agent ends its lane and
  * label disappear and the rows below shift up — no empty rows are ever kept.
- * The strip is hidden entirely when no subagent is live.
+ * The strip is hidden entirely when no subagent is live. A spawn fork that
+ * slides off the left stays pinned there until that agent ends, so the parent
+ * vertical remains traceable.
  */
 
 import { Canvas, ellipsize } from "./canvas.ts";
@@ -178,32 +180,41 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		const start = colOf(node.startedAt);
 		const c0 = Math.max(0, start);
 		for (let c = c0; c < AW; c++) put(c, r, "━", col);
-		if (start < 0) { put(0, r, "┄", col); continue; }
-		// Fork tick: join the nearest shown live ancestor's lane; otherwise a plain start cap.
+		// Fork tick: join the nearest shown live ancestor's lane; otherwise the
+		// root trunk (header). When the spawn column has scrolled off the left,
+		// pin the fork to column 0 so a live child keeps its parent vertical,
+		// even if the parent lane itself has left the window. The lane body
+		// still ends at "now" and keeps scrolling; ended agents have no lane.
+		const forkX = Math.max(0, start);
 		let parent = node.parentId ? byId.get(node.parentId) : undefined;
 		let p: number | undefined;
 		while (parent && isAgent(parent) && p === undefined) {
 			p = current.lanes.get(parent.id);
 			parent = parent.parentId ? byId.get(parent.parentId) : undefined;
 		}
-		if (p === r) { put(start, r, "╺", col); continue; }
+		if (p === r) { put(forkX, r, start < 0 ? "┄" : "╺", col); continue; }
 		// No visible ancestor lane: the child was spawned from the root, whose
 		// implicit trunk is the header rule (row -1). Siblings forking at the same
 		// x share one vertical: an earlier sibling's ╰ becomes ├ when a later
-		// sibling's connector passes through it.
+		// sibling's connector passes through it. A ┄ continuation (spawn already
+		// off-screen, no fork of its own) joins the same way a ━ lane does.
 		const from = p ?? -1;
-		put(start, r, from < r ? "╰" : "╭", col);
+		put(forkX, r, from < r ? "╰" : "╭", col);
 		for (let y = Math.min(from, r) + 1; y < Math.max(from, r); y++) {
-			const cell = cells.get(`${start},${y}`);
-			if (!cell) put(start, y, "│", col);
-			else if (cell.ch === "━") cell.ch = "┿"; // crossing another lane: that lane keeps the cell
+			const cell = cells.get(`${forkX},${y}`);
+			if (!cell) put(forkX, y, "│", col);
+			else if (cell.ch === "━" || cell.ch === "┄") cell.ch = "┿"; // crossing another lane: that lane keeps the cell
 			else if (cell.ch === "╰" && from < r) cell.ch = "├";
 			else if (cell.ch === "╭" && from > r) cell.ch = "├";
 		}
-		if (from < 0) { if (!headerTicks.has(start)) headerTicks.set(start, { color: col, owner: id }); continue; }
-		const pc = cells.get(`${start},${from}`);
+		if (from < 0) { if (!headerTicks.has(forkX)) headerTicks.set(forkX, { color: col, owner: id }); continue; }
+		const pc = cells.get(`${forkX},${from}`);
 		// The branch point is part of the child's fork, so clicking it opens the child.
-		if (pc && pc.ch === "━") put(start, from, from < r ? "┳" : "┻", pc.color);
+		// A parent that itself starts on this column (╰/╭, including a fork pinned to
+		// the left edge) grows a downward arm so the vertical actually meets the child.
+		if (pc && (pc.ch === "━" || pc.ch === "┄")) put(forkX, from, from < r ? "┳" : "┻", pc.color);
+		else if (pc && pc.ch === "╰" && from < r) pc.ch = "├";
+		else if (pc && pc.ch === "╭" && from > r) pc.ch = "├";
 	}
 
 	// Header: plain rule; the only glyphs on it are ┬ spawn ticks of live root-spawned lanes.
