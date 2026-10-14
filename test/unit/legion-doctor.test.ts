@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { BUILTIN_AGENTS_DIR, loadAgentsFromDir } from "../../src/agents/agents.ts";
 import {
 	DOCTOR_SECTIONS,
 	LEGION_SLASH_HELP_LINES,
@@ -13,6 +14,7 @@ import {
 } from "../../src/extension/legion-doctor.ts";
 import { clearSpawnFailures, recordSpawnFailure } from "../../src/extension/spawn-hints.ts";
 import { HYGIENE_LAST_FILE } from "../../src/runs/hygiene.ts";
+import { buildPiArgs } from "../../src/runs/args.ts";
 
 test("parseListModels reads pi --list-models table", () => {
 	const out = parseListModels(`provider      model                               context  max-out  thinking  images
@@ -194,6 +196,62 @@ test("doctor OK when child inherits or sees models", () => {
 		assert.equal(report.ok, true);
 		assert.equal(report.issues.filter((i) => i.severity === "error").length, 0);
 	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+const LENS_TOOL = /lens|symbol_search|project_report|module_report|read_symbol|read_enclosing/i;
+
+test("#70 bundled planner/reviewer/worker do not promise lens tools under --no-extensions", () => {
+	const roles = loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin").filter((agent) =>
+		["planner", "reviewer", "worker"].includes(agent.name),
+	);
+	assert.deepEqual(roles.map((agent) => agent.name).sort(), ["planner", "reviewer", "worker"]);
+
+	const prevInherit = process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+	const prevExtra = process.env.PI_LEGION_CHILD_EXTENSIONS;
+	delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+	delete process.env.PI_LEGION_CHILD_EXTENSIONS;
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-lens-"));
+	try {
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		for (const agent of roles) {
+			assert.equal(
+				(agent.tools ?? []).some((tool) => LENS_TOOL.test(tool)),
+				false,
+				`${agent.name} tools`,
+			);
+			assert.doesNotMatch(agent.systemPrompt, /pi-lens|lens_|module_report|read_symbol|symbol_search/);
+			const args = buildPiArgs({
+				agent,
+				task: "t",
+				sessionFile: path.join(dir, "session.jsonl"),
+				tempDir: dir,
+			}).args;
+			assert.ok(args.includes("--no-extensions"));
+			const extensions = args.flatMap((arg, i) => (arg === "--extension" ? [args[i + 1] ?? ""] : []));
+			assert.equal(extensions.some((ext) => /pi-lens/i.test(ext)), false);
+		}
+
+		const report = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+			agents: roles,
+		});
+		assert.equal(report.issues.filter((issue) => issue.code === "ROLE_MISSING_LENS").length, 0);
+	} finally {
+		if (prevInherit === undefined) delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+		else process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = prevInherit;
+		if (prevExtra === undefined) delete process.env.PI_LEGION_CHILD_EXTENSIONS;
+		else process.env.PI_LEGION_CHILD_EXTENSIONS = prevExtra;
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
