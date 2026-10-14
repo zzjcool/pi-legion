@@ -514,6 +514,40 @@ export function isTransientConnectionFailure(
 }
 
 /**
+ * Session ended with a user prompt and no assistant reply.
+ * This is a model/stream failure when the child finished on its own.
+ * A parent `session_shutdown` that kills the child first must not reuse it;
+ * see `attributeParentSessionShutdown`.
+ */
+export const NO_ASSISTANT_ABORT_REASON = "no assistant message for the last prompt";
+
+/**
+ * Parent process shutdown retired the child before any assistant message
+ * was written. Distinct from {@link NO_ASSISTANT_ABORT_REASON}.
+ */
+export const PARENT_SESSION_SHUTDOWN_ABORT_REASON =
+	"parent session shutdown retired the child before it produced an assistant message";
+
+/** True when the last turn (or the whole file) has no assistant message. */
+export function lastTurnHasNoAssistant(parsed: ParsedSession): boolean {
+	const last = parsed.turns.at(-1);
+	return parsed.turns.length === 0 || !last || last.assistants.length === 0;
+}
+
+/**
+ * Rewrite a missing-assistant abort when the parent session shut down and
+ * retired the child. A turn the child actually settled keeps `deriveOutcome`.
+ */
+export function attributeParentSessionShutdown(execution: Execution, parsed: ParsedSession): Execution {
+	if (execution.status === "success" || !lastTurnHasNoAssistant(parsed)) return execution;
+	return {
+		...execution,
+		status: "aborted",
+		reason: PARENT_SESSION_SHUTDOWN_ABORT_REASON,
+	};
+}
+
+/**
  * Derive the execution outcome from a parsed session.
  *
  * Order matters: "no reply to the last prompt" is checked BEFORE stopReason,
@@ -542,10 +576,11 @@ export function deriveOutcome(parsed: ParsedSession): Execution {
 	}
 
 	// F29: hard kill / interrupt before any reply was persisted.
+	// Parent-session cascade shutdown rewrites this in the orchestrator.
 	if (last.assistants.length === 0) {
 		return {
 			status: "aborted",
-			reason: "no assistant message for the last prompt",
+			reason: NO_ASSISTANT_ABORT_REASON,
 			turns: turns.length,
 			toolErrors: parsed.toolErrors,
 			lastTurn: { stopReason: null, toolErrors: last.toolErrors },
@@ -558,7 +593,7 @@ export function deriveOutcome(parsed: ParsedSession): Execution {
 	if (!final) {
 		return {
 			status: "aborted",
-			reason: "no assistant message for the last prompt",
+			reason: NO_ASSISTANT_ABORT_REASON,
 			turns: turns.length,
 			toolErrors: parsed.toolErrors,
 		};

@@ -10,7 +10,7 @@ export const PARENT_PLAYBOOK = [
 	'   One child:  subagent({ agent: "<role>", task: "..." })',
 	"   Parallel:   subagent({ tasks: [{ agent, task }, { agent, task }] })",
 	"2. Prefer tasks[] for independent parallel work. Child processes are headless RPC children; no pane or tab is created.",
-	"3. Then return control. A completion message wakes this session when idle; if it is still working, the notice waits until the current turn ends. Use `wait` when you need blocking results, and `collect` to inspect a child's session JSONL. Pressing Esc to abort a parent turn gracefully retires its children; a wait interrupted by Esc returns `interrupted (parent turn aborted)` after cascade shutdown.",
+	"3. Then return control. A completion message wakes this session when idle; if it is still working, the notice waits until the current turn ends. Use `wait` when you need blocking results, and `collect` to inspect a child's session JSONL. Pressing Esc to abort a parent turn gracefully retires its children; a wait interrupted by Esc returns `interrupted (parent turn aborted)` after cascade shutdown. In `pi --print` or JSON mode, session shutdown waits for live async children to settle (up to each child's turn timeout) before retiring them. Use same-turn `wait`/`collect` or `async: false` when that print turn must include the child's result.",
 	"4. Later control is only through `subagent({ action, name, message })`; use `stop` to gracefully retire one child or all tracked children. If a child exits oddly (Model not found, missing tools, memory refused, …), call `subagent({ action: \"diagnose\" })` or ask the user to run `/legion doctor` / `/legion doctor models` — children use `--no-extensions`, so provider packages must be passed explicitly. Do not tell a child to message or prompt the parent directly.",
 	"5. A collect timeout with a live RPC child is a progress signal, not a verdict. Check status or session JSONL before deciding to steer or resume.",
 	"6. Isolation is YOUR call. Pass `worktree: true` when another parent may write this repo or the child must ship via MR; pass `worktree: false` to share the checkout. Omit it for the role default.",
@@ -22,7 +22,7 @@ export const PARENT_PLAYBOOK = [
 export const TOOL_DESCRIPTION = [
 	PARENT_PLAYBOOK,
 	"Roles: the system prompt lists every loaded role. Prefer the matching role over doing that work yourself.",
-	"Launch is async by default. Outcomes come from the child session JSONL.",
+	"Launch is async by default. Outcomes come from the child session JSONL. In non-interactive `pi --print` / JSON mode, shutdown waits for those children before retiring them; pass `async: false` or call `wait`/`collect` in the same turn to fold the result into the print output.",
 	"Actions: launch (default), continue, steer, resume, status, collect, wait, list, retire, stop, diagnose. `diagnose` prints the Legion doctor report (host vs child extensions/providers/models/memory). `wait` is event-driven: it returns when a child settles, times out, or the parent turn is aborted; an Esc abort also gracefully retires children owned by that turn. `stop` explicitly and gracefully retires selected children.",
 ].join(" ");
 

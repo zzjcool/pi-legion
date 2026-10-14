@@ -57,7 +57,8 @@ vexillatio 工具 execute 也要把 signal 传进来（找到它的 registerTool
 ## 语义边界（不变）
 
 - **stop action 不变**：显式停止仍走全链。
-- **主 pi 正常退出（quit）不变**：session_shutdown 已级联。
+- **主 pi 正常退出（quit）不变**：交互 TUI 的 session_shutdown 仍立即级联 retire。
+- **非交互 print/JSON（#72）**：`ctx.mode` 为 `print` 或 `json` 时，session_shutdown 先等仍活着的 async 子 agent 结算（上限为各子的 turn timeout），再 retire 尚未结束的。避免 `--print` 在首包前把刚 spawn 的子进程记成 `no assistant message for the last prompt`。父会话关机导致的无 assistant abort 原因改为 parent session shutdown，与模型自己没写出 assistant 区分。
 - **SIGKILL/崩溃不覆盖**：孤儿扫描 + resume 语义不变（这是既定接受的风险）。
 - **children 的 children**：retire 链本身递归（孙进程 sweep 在 rpc-supervisor 的 retireChild 里），无需额外处理。
 - **blocked children**：一并 retire（stop 语义一致）。
