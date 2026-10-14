@@ -1,5 +1,5 @@
 /**
- * Master switch: `subagents.enabled` setting + `/subagents-toggle`.
+ * Master switch: `subagents.enabled` setting + `/legion on|off`.
  *
  * Covers parse/merge of the new key and the toggle command's pure surface
  * (parser + status renderer), plus the launch refusal semantics that live
@@ -75,7 +75,7 @@ test("enabled: absent project key keeps the user's value", () => {
 	assert.equal(kept.enabled, false);
 });
 
-// ───────────────────────── /subagents-toggle args ─────────────────────────
+// ───────────────────────── /legion on|off args ─────────────────────────
 
 test("toggle: empty args show current state", () => {
 	assert.deepEqual(parseToggleCommandArgs(""), {
@@ -88,8 +88,8 @@ test("toggle: empty args show current state", () => {
 	});
 });
 
-test("toggle: on/off/flip parse", () => {
-	for (const action of ["on", "off", "flip"] as const) {
+test("toggle: on/off parse", () => {
+	for (const action of ["on", "off"] as const) {
 		assert.deepEqual(parseToggleCommandArgs(action), {
 			ok: true,
 			value: { action },
@@ -100,11 +100,15 @@ test("toggle: on/off/flip parse", () => {
 test("toggle: rejects unknown or extra arguments", () => {
 	assert.deepEqual(parseToggleCommandArgs("yes"), {
 		ok: false,
-		message: "Usage: /subagents-toggle [on|off]",
+		message: "Usage: /legion on|off",
 	});
 	assert.deepEqual(parseToggleCommandArgs("on off"), {
 		ok: false,
-		message: "Usage: /subagents-toggle [on|off]",
+		message: "Usage: /legion on|off",
+	});
+	assert.deepEqual(parseToggleCommandArgs("on on"), {
+		ok: false,
+		message: "Usage: /legion on|off",
 	});
 });
 
