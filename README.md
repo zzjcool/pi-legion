@@ -14,6 +14,8 @@ shared SQLite ledger records the whole tree.
 > `@zzjcool/pi-herdr-subagents` (through 0.14.3; renamed after an npm name
 > collision), then as `pi-herdr-swarm` (0.15.0), before becoming `pi-legion`
 > in 0.16.0. **2.0.0: the legion era — recursive centurion tree on pi RPC transport; herdr pane execution archived to legacy**
+>
+> **What changed in 2.x?** See [CHANGELOG.md](CHANGELOG.md) (Keep a Changelog). Published notes also land on [GitHub Releases](https://github.com/zzjcool/pi-legion/releases).
 
 ## Contents
 
@@ -27,6 +29,7 @@ shared SQLite ledger records the whole tree.
 - [Parent/child context conventions](#parentchild-context-conventions)
 - [Delivery and resume](#delivery-and-resume)
 - [Herdr transition and role migration](#herdr-transition-and-role-migration)
+- [Changelog](CHANGELOG.md)
 - [Development](#development)
 
 ## Architecture
@@ -403,7 +406,8 @@ Version **0.16.x is the final Herdr-era line**. Pi Legion 2.x is RPC-only:
 child execution uses headless `pi --mode rpc` processes, and the legacy backend
 is archived under `src/backends/legacy/`, not offered as a v2 runtime option.
 Pin to `pi-legion` 0.16.x if a workflow must stay on the former Herdr-based
-execution model.
+execution model. A short breaking-change summary lives in
+[CHANGELOG.md](CHANGELOG.md#200---2026-10-14).
 
 Pi Legion 2.x supports `kind: pi` only. Migrate a custom role that uses another
 CLI kind by changing its frontmatter, for example:
@@ -446,5 +450,8 @@ Use `writeMockPiHome()` from `test/mock-llm` to generate an isolated
 
 See [CONTRIBUTING.md](CONTRIBUTING.md#project-workflow) for the project
 workflow: issues, pull requests, the merge gate, and npm releases.
+
+Version history for consumers: [CHANGELOG.md](CHANGELOG.md). Tag-by-tag
+release bodies: [GitHub Releases](https://github.com/zzjcool/pi-legion/releases).
 
 MIT. See [LICENSE](LICENSE).
