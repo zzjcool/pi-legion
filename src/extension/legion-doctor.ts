@@ -2,8 +2,9 @@
  * `/legion doctor` and `subagent action=diagnose`: broad self-check for
  * pi-legion (inspired by `pi list` / `pi auth check` / `pi --help`).
  *
- * Sections are filterable via `/legion doctor <section>` so the main agent can
+ * Sections are filterable via `/legion doctor [section]` so the main agent can
  * pull only what it needs, then act on the structured Next steps.
+ * `subagent({ action: "diagnose" })` returns the full report (no section field).
  */
 
 import { execFileSync } from "node:child_process";
@@ -81,6 +82,15 @@ export const DOCTOR_SECTIONS = [
 ] as const;
 
 export type DoctorSection = (typeof DOCTOR_SECTIONS)[number];
+
+/**
+ * Doctor warns when `.hygiene-last.json` is missing or older than this.
+ * Shorter than the 14-day run-retention default so a week without a root
+ * restart surfaces before retention pruning goes quiet (#85).
+ */
+export const HYGIENE_SWEEP_STALE_DAYS = 7;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 export interface DoctorPackage {
 	source: string;
@@ -419,6 +429,61 @@ function formatBytes(n: number): string {
 	return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
 }
 
+interface HygieneLastMarker {
+	at?: number;
+	removedTempDirs?: number;
+	prunedRuns?: number;
+	deletedEvents?: number;
+	freedBytes?: number;
+	errors?: number;
+}
+
+function readHygieneLast(storeRoot: string): HygieneLastMarker | undefined {
+	const last = readJson(path.join(storeRoot, HYGIENE_LAST_FILE));
+	if (!last || typeof last !== "object") return undefined;
+	return last as HygieneLastMarker;
+}
+
+function hygieneSweepAt(last: HygieneLastMarker | undefined): number | undefined {
+	return typeof last?.at === "number" && Number.isFinite(last.at) ? last.at : undefined;
+}
+
+/**
+ * Mirrors `envNumber` in hygiene.ts: blank or non-finite / negative values
+ * fall back to the built-in default, so doctor labels those as default.
+ */
+function hygieneConfigSource(env: NodeJS.ProcessEnv, key: string): "default" | "env" {
+	const raw = env[key]?.trim();
+	if (!raw) return "default";
+	const n = Number(raw);
+	return Number.isFinite(n) && n >= 0 ? "env" : "default";
+}
+
+function formatHygieneToggleSource(env: NodeJS.ProcessEnv): string {
+	const raw = env[HYGIENE_ENV.disable]?.trim();
+	if (!raw) return `default; ${HYGIENE_ENV.disable}`;
+	return `env ${HYGIENE_ENV.disable}=${raw}`;
+}
+
+/** Effective `resolveHygieneConfig()` values, each tagged default or env. */
+function formatHygieneConfigLines(env: NodeJS.ProcessEnv): string[] {
+	const hy = resolveHygieneConfig(env);
+	const rows: Array<[string, string, string]> = [
+		["retentionDays", `${hy.retentionDays}d`, HYGIENE_ENV.retentionDays],
+		["staleNodeHours", `${hy.staleNodeHours}h`, HYGIENE_ENV.staleNodeHours],
+		["legacyTempHours", `${hy.legacyTempHours}h`, HYGIENE_ENV.legacyTempHours],
+		["eventRetentionDays", `${hy.eventRetentionDays}d`, HYGIENE_ENV.eventRetentionDays],
+		["eventMaxRows", String(hy.eventMaxRows), HYGIENE_ENV.eventMaxRows],
+	];
+	return rows.map(([label, value, envKey]) => {
+		const source = hygieneConfigSource(env, envKey);
+		return `    ${label}=${value} (${source === "env" ? `env ${envKey}` : "default"})`;
+	});
+}
+
+const HYGIENE_SWEEP_HINT =
+	`Restart the root pi session so startup hygiene runs, or check ${HYGIENE_ENV.disable}=0.`;
+
 export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	const env = options.env ?? process.env;
 	const agentDir = options.agentDir ?? getAgentDir();
@@ -593,12 +658,26 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 
 	const storeRoot = options.storeRoot ?? (options.cwd ? path.join(options.cwd, ".pi-subagents") : undefined);
 	const orphans = storeRoot ? scanOrphanTemps(storeRoot) : undefined;
+	const hygieneLast = storeRoot ? readHygieneLast(storeRoot) : undefined;
 	if (orphans && orphans.orphanDead > 0) {
 		issues.push({
 			severity: "info",
 			code: "ORPHAN_TEMPS",
 			section: "storage",
 			message: `${orphans.orphanDead} rpc-child temp dir(s) have a dead owner (startup hygiene will remove them).`,
+		});
+	}
+	const sweepAt = hygieneSweepAt(hygieneLast);
+	const sweepStale = storeRoot !== undefined && (sweepAt === undefined || Date.now() - sweepAt > HYGIENE_SWEEP_STALE_DAYS * DAY_MS);
+	if (sweepStale) {
+		issues.push({
+			severity: "info",
+			code: "HYGIENE_SWEEP_STALE",
+			section: "storage",
+			message: sweepAt === undefined
+				? `No ${HYGIENE_LAST_FILE} marker — startup hygiene has not recorded a sweep.`
+				: `Last hygiene sweep ${new Date(sweepAt).toISOString()} is older than ${HYGIENE_SWEEP_STALE_DAYS} days.`,
+			fix: HYGIENE_SWEEP_HINT,
 		});
 	}
 
@@ -742,24 +821,22 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		push(`- idle Esc stop wired: ${runtime.idleEscWired === undefined ? "(unknown)" : runtime.idleEscWired ? "yes" : "no"}`);
 		push(`- idle strip hints: "${IDLE_STOP_HINT}" / short "${IDLE_STOP_HINT_SHORT}"`);
 		push(`- legion tools registered: ${(runtime.legionTools ?? ["(unknown — typically subagent, vexillatio, legion-* mail/tools)"]).join(", ")}`);
-		push("- diagnose: `subagent({ action: \"diagnose\" })` or `subagent({ action: \"diagnose\" })` with section via `/legion doctor <section>`");
+		push("- slash: `/legion doctor [section]`");
+		push("- tool: `subagent({ action: \"diagnose\" })` — full report; no section field (filter with the slash command)");
 		push("");
 	}
 
 	if (want(selected, "storage")) {
 		push("## Storage / hygiene");
-		push(`- hygiene enabled: ${hygieneEnabled(env)}`);
-		const hy = resolveHygieneConfig(env);
-		push(`- retention: runs ${hy.retentionDays}d, stale nodes ${hy.staleNodeHours}h, legacy temps ${hy.legacyTempHours}h, events ${hy.eventRetentionDays}d / max ${hy.eventMaxRows}`);
-		push(`- env: ${HYGIENE_ENV.disable}, ${HYGIENE_ENV.retentionDays}, ${HYGIENE_ENV.staleNodeHours}, …`);
+		push(`- hygiene enabled: ${hygieneEnabled(env)} (${formatHygieneToggleSource(env)})`);
+		push("- resolveHygieneConfig():");
+		for (const line of formatHygieneConfigLines(env)) push(line);
 		if (!storeRoot) {
 			push("- storeRoot: (not provided — pass cwd/storeRoot for db/orphan stats)");
 		} else {
 			push(`- storeRoot: ${homeize(storeRoot, home)}`);
-			const lastPath = path.join(storeRoot, HYGIENE_LAST_FILE);
-			const last = readJson(lastPath) as { at?: number; removedTempDirs?: number; prunedRuns?: number; deletedEvents?: number; freedBytes?: number; errors?: number } | undefined;
-			if (last?.at) {
-				push(`- last sweep: ${new Date(last.at).toISOString()} (removedTemps=${last.removedTempDirs ?? 0}, prunedRuns=${last.prunedRuns ?? 0}, deletedEvents=${last.deletedEvents ?? 0}, freed=${formatBytes(last.freedBytes ?? 0)}, errors=${last.errors ?? 0})`);
+			if (sweepAt !== undefined) {
+				push(`- last sweep: ${new Date(sweepAt).toISOString()} (removedTemps=${hygieneLast?.removedTempDirs ?? 0}, prunedRuns=${hygieneLast?.prunedRuns ?? 0}, deletedEvents=${hygieneLast?.deletedEvents ?? 0}, freed=${formatBytes(hygieneLast?.freedBytes ?? 0)}, errors=${hygieneLast?.errors ?? 0})`);
 			} else {
 				push("- last sweep: (no marker yet — written on next root-session startup hygiene)");
 			}
@@ -844,6 +921,9 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		}
 		if (issues.some((i) => i.code === "ORPHAN_TEMPS")) {
 			steps.push("Orphan temps clear on next root session start; or restart pi to trigger hygiene.");
+		}
+		if (selected.has("storage") && issues.some((i) => i.code === "HYGIENE_SWEEP_STALE")) {
+			steps.push(HYGIENE_SWEEP_HINT);
 		}
 		if (issues.some((i) => i.code === "STALE_VERIFY_SLOTS")) {
 			steps.push("Stale verify locks are reclaimed automatically; delete slot-*.lock under the lock dir if a slot stays stuck.");
