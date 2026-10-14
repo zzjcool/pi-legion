@@ -52,7 +52,7 @@ import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
-import { makeName } from "./src/shared/name.ts";
+import { allocateSiblingNames, makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
 import { restoreHostNodeOptions } from "./src/supervisor/child-memory.ts";
 import { setVerifyQueueListener } from "./src/runs/verify-queue.ts";
@@ -2009,25 +2009,18 @@ async function launchUtilityFamily(input: {
 	if (!run) return fail("vexillatio parent run is not available", ErrorCodes.NOT_FOUND);
 	const runId = run.runId;
 	const timeoutMs = input.params.timeoutMs ?? 600_000;
-	const existingNames = new Set(
-		store.listRuns().flatMap((existingRun) => existingRun.children.map((child) => child.name)),
+	// §2.6: continue numbering from this parent's existing children only —
+	// do NOT scan store.listRuns() (that made names climb across sessions, #42).
+	const existingNames: string[] = legion
+		? getChildren(legion.db, legion.nodeId).map((child) => child.name)
+		: run.children.map((child) => child.name);
+	const allocated = allocateSiblingNames(
+		prepared.map((item) => item.agent.name),
+		existingNames,
+		(name) => input.supervisor.isAlive(name),
 	);
-	if (legion) {
-		for (const child of getChildren(legion.db, legion.nodeId)) existingNames.add(child.name);
-	}
 	const names = new Map<UtilityTaskItem, string>();
-	const nameCounters = new Map<string, number>();
-	for (const item of prepared) {
-		let index = nameCounters.get(item.agent.name) ?? 0;
-		for (;; index += 1) {
-			const candidate = makeName(item.agent.name, index);
-			if (existingNames.has(candidate) || input.supervisor.isAlive(candidate)) continue;
-			existingNames.add(candidate);
-			names.set(item.step, candidate);
-			nameCounters.set(item.agent.name, index + 1);
-			break;
-		}
-	}
+	for (let i = 0; i < prepared.length; i++) names.set(prepared[i]!.step, allocated[i]!);
 
 	const results: string[] = [];
 	const stillRunning = new Set<string>();
