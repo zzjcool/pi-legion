@@ -1,0 +1,19 @@
+{
+  "models": [{ "id": "flash", "name": "Mock Flash" }],
+  "rules": [
+    {
+      "name": "after-tool",
+      "when": { "hasToolResult": true },
+      "then": { "type": "text", "content": "tool said: {{lastToolContent}}" }
+    },
+    {
+      "name": "greet",
+      "when": { "promptIncludes": "ping" },
+      "then": { "type": "text", "content": "pong-from-script" }
+    },
+    {
+      "name": "default",
+      "then": { "type": "text", "content": "custom-default" }
+    }
+  ]
+}

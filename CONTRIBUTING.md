@@ -32,6 +32,21 @@ Prefer **TDD** for behaviour changes: a failing test in `test/unit` or
 go through `createHerdrClient(createFakeRunner(fake))` so argv construction
 and JSON parsing stay covered.
 
+## Mock LLM
+
+For offline Pi / legion smoke without provider quota, start the scriptable
+OpenAI-compatible mock (see [`test/mock-llm/README.md`](test/mock-llm/README.md)):
+
+```bash
+npm run mock-llm                 # default scenario=echo on :8765
+npm run test:mock-llm            # engine + HTTP + optional pi --print smoke
+```
+
+`test/docker/mock-llm.mjs` launches the same CLI (default scenario `tool-once`
+for legacy inside-*.sh). Point Pi at it with `writeMockPiHome({ baseUrl })` or
+the `providers.mock` block in that README. Never commit real API keys; the
+dummy key is always the literal `mock`.
+
 ## Docker verification
 
 `test/docker/` runs the package inside `pi-herdr-sandbox:latest` with a copy
@@ -86,6 +101,7 @@ them by hand.
 | `src/extension/runtime.ts` | status widget, watch, auto-recycle |
 | `src/extension/blocked.ts` | `onBlocked` confirm / auto-approve / notify |
 | `src/runs/acceptance.ts` | `verification-output` command |
+| `test/mock-llm/` | Scriptable OpenAI mock for offline pi / legion |
 | `agents/*.md` | bundled roles |
 | `docs/design.md` | measured herdr findings (F1–F46) |
 | `README.md` | what is actually wired today |

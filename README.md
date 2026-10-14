@@ -334,4 +334,20 @@ npm run test:integration  # integration tests
 npm run test:all          # typecheck + unit + integration tests
 ```
 
+### Mock LLM (offline pi / legion smoke)
+
+A scriptable OpenAI-compatible server lives under [`test/mock-llm/`](test/mock-llm/README.md).
+It registers with Pi like any local gateway (`models.json` → `api: "openai-completions"`),
+so spawn / stop / doctor / verify paths can run without real API keys:
+
+```bash
+npm run mock-llm                 # http://127.0.0.1:8765/v1  scenario=echo
+npm run test:mock-llm            # unit + integration smoke for the mock
+MOCK_LLM_SCENARIO=spawn-scout npm run mock-llm
+```
+
+Use `writeMockPiHome()` from `test/mock-llm` to generate an isolated
+`PI_CODING_AGENT_DIR` with dummy `apiKey: "mock"` only — never copy host
+`auth.json` into fixtures.
+
 MIT. See [LICENSE](LICENSE).
