@@ -32,17 +32,20 @@ directly.
 
 ## Legion visualization
 
-In an interactive Pi session, `/legion` opens the paged Legion tree. Navigate
-with `j`/`k` or the arrow keys, use Enter/Space to expand or collapse, `/` to
-search, and PageUp/PageDown to scroll; `q` or Esc closes the tree. Press `o` on
-the selected node, or use a component-routed mouse click in the full-screen
-tree, to open its live overlay. `/legion <name>` opens a node directly. If
-short names are ambiguous, use the full node ID shown in command completion.
-`/legion status` prints the whole tree in the chat (the same lines as
-`legion_tree`). `/legion status <name>` prints one node with the same text as
+In an interactive Pi session, bare `/legion` opens the **galaxy / tok-s / log**
+full view (when a viz snapshot is available and you did not pass `--tree`).
+Tab switches panes; arrows move or scroll; Enter selects an agent; `o` opens
+its live overlay; `q` or Esc closes. `/legion --tree` opens the classic paged
+tree (`j`/`k`, Enter/Space fold, `/` search, PageUp/PageDown). `/legion <name>`
+opens a node overlay directly; if short names are ambiguous, use the full node
+ID from completion. `/legion status` prints the whole tree in chat (same lines
+as `legion_tree`); `/legion status <name>` prints one node like
 `subagent({ action: "status", name })`. Esc closes an overlay and unsubscribes
-its node's live feed. OSC 8 links are visual anchors only; they do not open
-overlays or route clicks.
+its live feed. OSC 8 links are visual anchors only.
+
+To stop live children yourself: `/legion stop` (or `/legion stop <name>`), idle
+Esc with an empty editor (confirm "Stop N running subagents?"), or `x` then `y`
+on the selected live agent in the `/legion` view or overlay.
 
 ## Tree tools and phases
 
