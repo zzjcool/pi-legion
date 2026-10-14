@@ -47,3 +47,32 @@ export function makeName(agent: string, index: number): string {
 	// Defensive: if truncation somehow produced something invalid, fall back.
 	return VALID_NAME.test(name) ? name : `agent${suffix}`;
 }
+
+/**
+ * Allocate sibling names for a batch of agent roles under one parent (#42 / §2.6).
+ *
+ * Only `existing` (this parent's current children) and `isAlive` (in-process
+ * supervisor) constrain the sequence — historical runs from other sessions
+ * must not push the counter up.
+ */
+export function allocateSiblingNames(
+	agentNames: readonly string[],
+	existing: Iterable<string>,
+	isAlive: (name: string) => boolean = () => false,
+): string[] {
+	const taken = new Set(existing);
+	const counters = new Map<string, number>();
+	const out: string[] = [];
+	for (const agent of agentNames) {
+		let index = counters.get(agent) ?? 0;
+		for (;; index += 1) {
+			const candidate = makeName(agent, index);
+			if (taken.has(candidate) || isAlive(candidate)) continue;
+			taken.add(candidate);
+			counters.set(agent, index + 1);
+			out.push(candidate);
+			break;
+		}
+	}
+	return out;
+}
