@@ -141,10 +141,12 @@ snapshot of the same tree:
   Live jobs that are not in the tree yet are listed under that summary.
 - `/legion status <name>` prints one node with the same text as
   `subagent({ action: "status", name })`. Living children lead with
-  `alive · quiet Ns` (session JSONL mtime), then demote the run-store
-  execution/acceptance fields as snapshots so an old collect-deadline or
-  connection blip does not look like the current verdict. A ledger-only node
-  still uses the same renderer with the fields the tree has.
+  `alive · quiet Ns` (session JSONL mtime); after ~30s of silence the line
+  becomes `alive · quiet Ns (living)` so 「活着但安静」is obvious. Run-store
+  execution/acceptance fields are labeled snapshots, and collect-deadline /
+  transient-connection reasons are omitted from the snapshot line while the
+  child is alive so they do not steal attention from quiet age. A ledger-only
+  node still uses the same renderer with the fields the tree has.
 - Quiet age is not a heartbeat: there is no child-side progress ping. Minutes
   of silence can still mean the model is reasoning (especially high-thinking
   turns). Quiet alone does not mean the child is stuck; pair it with `alive`.

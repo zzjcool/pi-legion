@@ -1251,9 +1251,12 @@ test("renderLiveChildStatus reports silence and ignores a stale connection failu
 		});
 		assert.match(text, /state=working/);
 		assert.equal(text.split("\n")[1], formatAliveQuiet(age));
+		assert.match(text.split("\n")[1]!, /\(living\)/, "long quiet marks living");
 		assert.ok(text.indexOf("alive · quiet") < text.indexOf("execution snapshot:"), "quiet age leads before execution snapshot");
-		assert.match(text, /execution snapshot: running \(rpc child alive\)/);
+		assert.match(text, /^execution snapshot: running$/m, "progress-signal reason omitted while alive");
+		assert.doesNotMatch(text, /execution snapshot: running \(rpc child alive\)/);
 		assert.match(text, /persisted snapshot is stale: state=retired, execution=failed \(Connection error\.\), acceptance=rejected \(none\)/);
+		assert.ok(text.indexOf("execution snapshot:") < text.indexOf("supervisor=rpc"), "snapshot before path meta");
 		assert.doesNotMatch(text, /^worker-0 — state=retired/m);
 		assert.doesNotMatch(text, /^execution: failed/m);
 		assert.doesNotMatch(text, /^acceptance: rejected/m);
@@ -1280,8 +1283,10 @@ test("renderLiveChildStatus keeps a live running snapshot and adds recency", asy
 		});
 		assert.match(text, /state=working/);
 		assert.match(text, /^alive · quiet 0s$/m);
+		assert.doesNotMatch(text, /\(living\)/, "fresh quiet stays compact");
 		assert.ok(text.indexOf("alive · quiet 0s") < text.indexOf("execution snapshot:"), "quiet age leads before execution snapshot");
-		assert.match(text, /execution snapshot: running \(collect deadline \(cumulative since launch\) exceeded; child still alive\)/);
+		assert.match(text, /^execution snapshot: running$/m, "collect-deadline reason omitted while alive");
+		assert.doesNotMatch(text, /collect deadline/);
 		assert.match(text, /acceptance snapshot: unknown \(none\)/);
 		assert.doesNotMatch(text, /persisted snapshot is stale/);
 		assert.doesNotMatch(text, /last event/);
@@ -1324,6 +1329,37 @@ test("renderLiveChildStatus leads with alive · quiet when session is missing", 
 	assert.equal(lines[1], "alive · quiet unknown");
 	assert.match(text, /execution snapshot: running/);
 	assert.ok(text.indexOf("alive · quiet unknown") < text.indexOf("execution snapshot:"));
+});
+
+test("renderLiveChildStatus long-quiet alive worker: (living) leads; collect-deadline reason stays off the snapshot", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = join(dir, "worker-0.jsonl");
+		writeFileSync(sessionFile, "{\"type\":\"message\"}\n");
+		const now = Date.now();
+		utimesSync(sessionFile, new Date(now - 90_000), new Date(now - 90_000));
+		const text = renderLiveChildStatus({
+			name: "worker-0",
+			state: "working",
+			agent: "worker",
+			kind: "pi",
+			sessionFile,
+			execution: {
+				status: "running",
+				reason: "collect deadline (cumulative since launch) exceeded; child still alive",
+			},
+			acceptance: { status: "unknown", level: "none" },
+			alive: true,
+			now,
+		});
+		const lines = text.split("\n");
+		assert.equal(lines[0], "worker-0 — state=working agent=worker kind=pi");
+		assert.match(lines[1]!, /^alive · quiet \d+s \(living\)$/);
+		assert.equal(lines[2], "execution snapshot: running");
+		assert.ok(text.indexOf("alive · quiet") < text.indexOf("execution snapshot:"));
+		assert.ok(text.indexOf("execution snapshot:") < text.indexOf("supervisor=rpc"));
+		assert.doesNotMatch(text, /collect deadline|child still alive/);
+		assert.match(text, /acceptance snapshot: unknown \(none\)/);
+	});
 });
 
 test("runtime: a settled session turn freezes, and the next user message resets it", async () => {
