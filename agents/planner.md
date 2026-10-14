@@ -1,8 +1,7 @@
 ---
 name: planner
 description: 规划员：把任务拆成可并行/可验收的实施计划，冻结接口，指定文件归属
-thinking: max
-tools: read, grep, find, ls
+tools: read, grep, find, ls, bash, codemode, lens_diagnostics, symbol_search, project_report, module_report, read_symbol, read_enclosing, pi_lens_activate_tools
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
