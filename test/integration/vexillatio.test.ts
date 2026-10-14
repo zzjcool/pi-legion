@@ -473,7 +473,7 @@ test("vexillatio avoids a live same-name subagent and returns on collect timeout
 			const output = second.content.map((part) => part.text ?? "").join("\n");
 			assert.match(output, /── scout-1 ──/);
 			assert.match(output, /execution: running/);
-			assert.match(output, /collect timed out after 50ms/);
+			assert.match(output, /collect deadline \(cumulative since launch\) exceeded; child still alive/);
 			assert.match(output, /sessionFile:/);
 			assert.equal(supervisor.isAlive("scout-1"), true, "timed-out utility remains alive and controllable");
 			assert.deepEqual(supervisor.spawns.map((spawn) => spawn.input.name), ["scout-0", "scout-1"]);
@@ -493,7 +493,7 @@ test("vexillatio tracks a timed-out utility until completion clears its Legion a
 		}, context(cwd, { footer }));
 		const output = result.content.map((part) => part.text ?? "").join("\n");
 		assert.match(output, /execution: running/);
-		assert.match(output, /collect timed out after 50ms/);
+		assert.match(output, /collect deadline \(cumulative since launch\) exceeded; child still alive/);
 		assert.deepEqual(
 			(result.details as { stillRunning?: string[] } | undefined)?.stillRunning,
 			["scout-0"],

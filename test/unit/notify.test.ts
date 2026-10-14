@@ -163,6 +163,13 @@ test("formatCollectFailure wraps an exception as a failed notice", () => {
 	assert.doesNotMatch(notice.content, /RPC child retired/);
 });
 
+test("formatCollectFailure does not present a bare Connection error as the failure reason", () => {
+	const notice = formatCollectFailure("worker-0", new Error("Connection error."));
+	assert.equal(notice.status, "failed");
+	assert.match(notice.content, /Connection error\. \(RPC child is not alive\)/);
+	assert.doesNotMatch(notice.content, /execution: failed \(Connection error\.\)/);
+});
+
 test("completionDeliveryOptions follows up instead of steering", () => {
 	assert.deepEqual(completionDeliveryOptions(true), {
 		triggerTurn: true,
@@ -255,7 +262,7 @@ test("U3: formatCompletionNotice fails loud on a running snapshot (B)", () => {
 				name: "worker-1",
 				execution: {
 					status: "running",
-					reason: "collect timed out after 900000ms; the agent is still alive",
+					reason: "collect deadline (cumulative since launch) exceeded; child still alive",
 				},
 				output: "",
 			}),
