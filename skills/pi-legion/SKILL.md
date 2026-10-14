@@ -38,8 +38,11 @@ search, and PageUp/PageDown to scroll; `q` or Esc closes the tree. Press `o` on
 the selected node, or use a component-routed mouse click in the full-screen
 tree, to open its live overlay. `/legion <name>` opens a node directly. If
 short names are ambiguous, use the full node ID shown in command completion.
-Esc closes an overlay and unsubscribes its node's live feed. OSC 8 links are
-visual anchors only; they do not open overlays or route clicks.
+`/legion status` prints the whole tree in the chat (the same lines as
+`legion_tree`). `/legion status <name>` prints one node with the same text as
+`subagent({ action: "status", name })`. Esc closes an overlay and unsubscribes
+its node's live feed. OSC 8 links are visual anchors only; they do not open
+overlays or route clicks.
 
 ## Tree tools and phases
 
@@ -91,6 +94,9 @@ subagent({ action: "steer", name: "worker-0", message: "Focus on the parser test
 subagent({ action: "resume", name: "worker-0" })
 subagent({ action: "retire", name: "worker-0" })
 ```
+
+A person can read that same status without a tool call: `/legion status` for
+the tree, `/legion status <name>` for one child.
 
 For a blocked extension UI request, the RPC supervisor bubbles the request up
 to the root Pi UI for human response by default. A child completion or a

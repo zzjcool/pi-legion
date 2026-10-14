@@ -786,6 +786,27 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		runtime,
 		supervisor: rpcEventSource,
 		stop: stopChildren,
+		childStatus: (name, cwd) => {
+			try {
+				const found = findChild(runStoreFor(cwd).listRuns(), name);
+				if (!found) return undefined;
+				const child = found.child;
+				return {
+					name: child.name,
+					state: child.state,
+					agent: child.agent,
+					kind: child.kind,
+					sessionFile: child.sessionFile,
+					...(child.execution ? { execution: child.execution } : {}),
+					...(child.acceptance
+						? { acceptance: { status: child.acceptance.status, level: child.acceptance.level } }
+						: {}),
+					alive: supervisor.isAlive(child.name),
+				};
+			} catch {
+				return undefined;
+			}
+		},
 		commands: {
 			team: { loadCatalog: commandCatalogLoader },
 			agents: { loadCatalog: commandCatalogLoader },

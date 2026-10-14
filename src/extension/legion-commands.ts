@@ -4,11 +4,16 @@ import { matchesKey, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { resolveStopTarget, runLegionStop, stopCompletions, type StopDeps } from "./legion-stop.ts";
 import {
 	DOCTOR_SECTIONS,
+	LEGION_SLASH_HELP_LINES,
 	expectedModelsFromSettings,
 	parseDoctorSections,
 	runLegionDoctor,
 	type DoctorRuntimeSnapshot,
 } from "./legion-doctor.ts";
+import {
+	renderLegionStatus,
+	type LegionChildStatusFacts,
+} from "./legion-status.ts";
 import { ALLOW_NESTED_ENV } from "./budget.ts";
 import {
 	createAgentsCommand,
@@ -91,6 +96,11 @@ export interface LegionCommandDeps {
 	supervisor: RpcEventSource;
 	/** Graceful retire via the subagent `stop` action (see legion-stop.ts). */
 	stop?: (params: { name?: string; all?: boolean }) => Promise<{ ok: boolean; text: string }>;
+	/**
+	 * Persisted child snapshot used by `subagent({ action: "status" })`.
+	 * Undefined when this process has no run-store record for `name`.
+	 */
+	childStatus?: (name: string, cwd: string) => LegionChildStatusFacts | undefined;
 	/** Existing user-facing subcommand handlers; absent only in isolated tests. */
 	commands?: {
 		team: TeamCommandDeps;
@@ -179,6 +189,32 @@ function subscribeTextDeltas(
 
 function nodeLabel(nodeId: string, name: string): string {
 	return `${name} (${nodeId})`;
+}
+
+/** Completions for `/legion status <prefix>`: tree nodes, then live jobs the tree does not already name. */
+function statusArgumentCompletions(
+	prefix: string,
+	deps: LegionCommandDeps,
+): Array<{ value: string; label: string }> {
+	const nodes = deps.runtime.treeNodes();
+	const out: Array<{ value: string; label: string }> = [];
+	const seen = new Set<string>();
+	const add = (value: string, label: string): void => {
+		if (!value.startsWith(prefix) || seen.has(value)) return;
+		seen.add(value);
+		out.push({ value: `status ${value}`, label });
+	};
+	for (const node of nodes) {
+		const value = nodes.filter((candidate) => candidate.name === node.name).length > 1
+			? node.id
+			: node.name;
+		add(value, nodeLabel(node.id, node.name));
+	}
+	for (const job of deps.runtime.activeJobs()) {
+		if (job.state === "retired") continue;
+		add(job.name, `${job.name} (live)`);
+	}
+	return out;
 }
 
 function resolveNode(
@@ -525,15 +561,7 @@ export function registerLegionCommand(
 	};
 	const helpText = [
 		"Legion commands:",
-		"  /legion team [list|use <name> [--global]|create <name> a,b,c [--global]]",
-		"  /legion agents [user|project|both]",
-		"  /legion on | off — enable/disable subagents for this session (status is shown after each run)",
-		"  /scout-guard | /no-scout-guard — session override for the main-session scout guard",
-		"  /legion summary [--all] [<name>]",
-		"  /legion doctor [section]",
-		"  /legion stop [name]",
-		"  /legion --tree | /legion <node>",
-		"  /legion help",
+		...LEGION_SLASH_HELP_LINES.map((line) => `  ${line}`),
 	].join("\n");
 	pi.registerCommand(LEGION_COMMAND, {
 		description: "Open the Legion view or manage teams, agents, subagent runs, and settings",
@@ -554,6 +582,9 @@ export function registerLegionCommand(
 				return stopCompletions(rest, deps.runtime.activeJobs(), deps.runtime.treeNodes())
 					.map((item) => ({ value: `stop ${item.value}`, label: item.label }));
 			}
+			if (/^status\s/i.test(trimmed)) {
+				return statusArgumentCompletions(trimmed.replace(/^status\s+/i, ""), deps);
+			}
 			if (/^doctor(\s|$)/i.test(prefix)) {
 				const rest = prefix.replace(/^doctor\s*/i, "");
 				return DOCTOR_SECTIONS
@@ -569,6 +600,12 @@ export function registerLegionCommand(
 						verbs.push({ value: command, label: command });
 					}
 				}
+			}
+			if ("status".startsWith(prefix)) {
+				verbs.push({
+					value: "status",
+					label: "status [name] — tree summary, or one node (same text as subagent status)",
+				});
 			}
 			if ("doctor".startsWith(prefix)) {
 				verbs.push({ value: "doctor", label: "doctor [section] — full self-check (extensions/models/spawn/memory/tools/storage/runtime)" });
@@ -599,6 +636,23 @@ export function registerLegionCommand(
 			}
 			if (normalizedKeyword === "help") {
 				sendSlashText(pi, helpText);
+				return;
+			}
+			if (normalizedKeyword === "status") {
+				const report = renderLegionStatus({
+					query: rest.join(" "),
+					nodes: deps.runtime.treeNodes(),
+					jobs: deps.runtime.activeJobs(),
+					lookupChild: deps.childStatus
+						? (name) => deps.childStatus!(name, ctx.cwd)
+						: undefined,
+					now: Date.now(),
+				});
+				if (!report.ok) {
+					notify(ctx, report.text, "error");
+					return;
+				}
+				sendSlashText(pi, report.text);
 				return;
 			}
 			if (/^doctor(?:\s|$)/i.test(query)) {

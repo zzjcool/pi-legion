@@ -50,6 +50,24 @@ import { IDLE_STOP_HINT, IDLE_STOP_HINT_SHORT } from "./legion-stop.ts";
 import type { AgentConfig } from "../shared/types.ts";
 import { recentSpawnFailures, type SpawnFailureRecord } from "./spawn-hints.ts";
 
+/**
+ * Canonical slash surface. `/legion help` and the doctor Tools section both
+ * print these lines so the two lists cannot drift.
+ */
+export const LEGION_SLASH_HELP_LINES = [
+	"/legion — open the Legion view (TUI)",
+	"/legion status [name] — whole-tree summary, or one node (same text as subagent status)",
+	"/legion team [list|use <name> [--global]|create <name> a,b,c [--global]]",
+	"/legion agents [user|project|both]",
+	"/legion on | /legion off — enable/disable subagents for this session (status is shown after each run)",
+	"/scout-guard | /no-scout-guard — session override for the main-session scout guard",
+	"/legion summary [--all] [<name>]",
+	"/legion doctor [section]",
+	"/legion stop [name|all]",
+	"/legion --tree | /legion <node>",
+	"/legion help",
+] as const;
+
 export const DOCTOR_SECTIONS = [
 	"summary",
 	"extensions",
@@ -718,7 +736,8 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 
 	if (want(selected, "tools")) {
 		push("## Tools / commands");
-		push("- slash: `/legion` (view), `/legion doctor [section]`, `/legion stop [name|all]`, `/legion --tree`, `/legion <name>`");
+		push("- slash:");
+		for (const line of LEGION_SLASH_HELP_LINES) push(`    ${line}`);
 		push(`- stop wired: ${runtime.stopAvailable === undefined ? "(unknown)" : runtime.stopAvailable ? "yes" : "no"}`);
 		push(`- idle Esc stop wired: ${runtime.idleEscWired === undefined ? "(unknown)" : runtime.idleEscWired ? "yes" : "no"}`);
 		push(`- idle strip hints: "${IDLE_STOP_HINT}" / short "${IDLE_STOP_HINT_SHORT}"`);
