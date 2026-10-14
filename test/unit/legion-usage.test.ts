@@ -28,7 +28,7 @@ test("attachUsageTotals preserves snapshots, skips root, and omits zero totals",
 
 		assert.deepEqual(attachUsageTotals(db, nodes), [
 			root,
-			{ ...worker, tokensTotal: 150 },
+			{ ...worker, tokensTotal: 150, tokensOut: 30 },
 			idle,
 		]);
 		assert.deepEqual(nodes, [root, worker, idle], "the input snapshot is not mutated");

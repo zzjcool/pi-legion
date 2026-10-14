@@ -44,6 +44,13 @@ export interface StatusEntry {
 	currentTurnStartedAt?: number;
 	/** Cumulative tokens (input+cache+output); from session jsonl (fresh) or ledger usage (≤30s stale). */
 	tokensTotal?: number;
+	/** Cumulative output tokens only; numerator for tok/s / t/s. */
+	tokensOut?: number;
+	/**
+	 * Cumulative model-generation wall ms from the session (assistant − prior
+	 * user/toolResult). Denominator for t/s when known.
+	 */
+	generationMs?: number;
 	/** Legion tree identity; omitted for callers that still use the flat roster. */
 	nodeId?: string;
 	parentId?: string | null;
@@ -195,12 +202,9 @@ function detailBits(entry: StatusEntry, now: number): string[] {
 	if (entry.worktreeBranch) {
 		bits.push(`wt ${formatWorktreeBranch(entry.worktreeBranch)}`);
 	}
-	if (entry.tokensTotal && entry.tokensTotal > 0) {
-		const end = TERMINAL_STATES.has(entry.state) ? entry.finishedAt ?? now : now;
-		const elapsedMs = Math.max(0, end - entry.startedAt);
-		if (elapsedMs >= 1_000) {
-			bits.push(`${formatTokensCompact(Math.round(entry.tokensTotal / (elapsedMs / 1_000)))} t/s`);
-		}
+	// Output tok/s over generation time (same definition as railway /legion).
+	if (entry.tokensOut && entry.tokensOut > 0 && entry.generationMs && entry.generationMs >= 1_000) {
+		bits.push(`${formatTokensCompact(Math.round(entry.tokensOut / (entry.generationMs / 1_000)))} t/s`);
 	}
 	return bits;
 }
@@ -539,7 +543,7 @@ export interface StatusVizSnapshot {
 	nodes: VizNode[];
 	sampler: RateSampler;
 	now: number;
-	/** Shared tok/s definition (trailing 60s window). */
+	/** Shared output tok/s (ΔtokensOut / ΔgenerationMs over trailing 60s). */
 	rate: number;
 }
 
