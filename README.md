@@ -95,7 +95,15 @@ The `subagent` control actions include event-driven `wait` and graceful `stop`:
 `subagent({ action: "wait", name: "worker-0" })` returns as soon as the child
 settles (or the parent turn is interrupted with Esc). Aborting a parent turn
 with Esc gracefully retires its tracked children, including those being waited
-on or collected; the cascade is silent. To stop children explicitly, use
+on or collected; the cascade is silent. Launch stays async by default. Under
+`pi --print` or JSON mode the process would otherwise exit at the end of the
+parent turn and retire those children before they write an assistant message.
+That shutdown waits for each live async child to settle, bounded by the
+child's turn timeout, and only then retires whatever is still running. A
+child killed by that shutdown is recorded as aborted because the parent
+session shut down, not because the model produced no reply. To include the
+child's result in the same print turn, call `wait` or `collect` before the
+turn ends, or launch with `async: false`. To stop children explicitly, use
 `subagent({ action: "stop", name: "worker-0" })` or
 `subagent({ action: "stop", all: true })`; this runs the normal graceful-retire
 sequence for each selected child.

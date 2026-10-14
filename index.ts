@@ -97,6 +97,7 @@ import {
 	DEFAULT_ON_BLOCKED,
 	ErrorCodes,
 	type ModelOrigin,
+	type RetireOptions,
 	SubagentError,
 } from "./src/shared/types.ts";
 
@@ -562,14 +563,22 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			timer.unref?.();
 		}
 	});
-	const pendingUtilityRetires: Array<() => Promise<void>> = [];
+	const pendingUtilityRetires: Array<(opts?: RetireOptions) => Promise<void>> = [];
 	let sessionRuntime: SessionRuntime | undefined;
-	const shutdownRetireAll = async (): Promise<void> => {
+	const shutdownRetireAll = async (_event?: unknown, ctx?: { mode?: string }): Promise<void> => {
+		// pi --print / JSON exits when the parent turn ends. Async children
+		// have only just been spawned; retiring them here aborts the run
+		// before the first model call. Interactive quit still retires immediately.
+		const mode = ctx?.mode;
+		if (mode === "print" || mode === "json") {
+			await sessionRuntime?.drainBeforeShutdown();
+		}
 		const children = sessionRuntime?.activeJobs() ?? [];
 		sessionRuntime?.dispose();
+		const shutdownRetire: RetireOptions = { cause: "session-shutdown" };
 		await Promise.all([
-			...children.map((job) => job.retire?.().catch(() => {})),
-			...pendingUtilityRetires.map((retire) => retire().catch(() => {})),
+			...children.map((job) => job.retire?.(shutdownRetire).catch(() => {})),
+			...pendingUtilityRetires.map((retire) => retire(shutdownRetire).catch(() => {})),
 		]);
 		stopLegionRuntime();
 	};
@@ -1945,7 +1954,7 @@ async function launchUtilityFamily(input: {
 	legion?: LegionRuntimeIdentity;
 	eventBus: LegionEventBus;
 	onLegion: (identity: LegionRuntimeIdentity) => void;
-	onUtilityChild: (retire: () => Promise<void>) => void;
+	onUtilityChild: (retire: (opts?: RetireOptions) => Promise<void>) => void;
 }): Promise<AgentToolResult<unknown>> {
 	const plan = buildUtilityPlan(input.params);
 	if (!plan.ok) return fail(plan.message, ErrorCodes.INVALID_PARAMS);
@@ -2120,10 +2129,10 @@ async function launchUtilityFamily(input: {
 			});
 			await persistChild(store, runId, orchestrator, handle.name);
 			let retirement: Promise<void> | undefined;
-			const retire = (): Promise<void> => {
+			const retire = (opts?: RetireOptions): Promise<void> => {
 				if (!retirement) {
 					const current = (async () => {
-						await orchestrator.retire(handle.name);
+						await orchestrator.retire(handle.name, opts);
 						await persistChild(store, runId, orchestrator, handle.name);
 					})();
 					retirement = current;
@@ -2133,9 +2142,9 @@ async function launchUtilityFamily(input: {
 				}
 				return retirement;
 			};
-			input.onUtilityChild(async () => {
+			input.onUtilityChild(async (opts) => {
 				try {
-					await retire();
+					await retire(opts);
 				} catch {
 					// Shutdown cleanup is best-effort; the supervisor owns final process state.
 				}
@@ -2162,7 +2171,7 @@ async function launchUtilityFamily(input: {
 		agent: string;
 		sessionFile: string;
 		orchestrator: Orchestrator;
-		retire: () => Promise<void>;
+		retire: (opts?: RetireOptions) => Promise<void>;
 	}> = [];
 	for (const launch of launches) {
 		if ("error" in launch) results.push(`✗ ${launch.item.agent.name}: ${launch.error}`);
@@ -2340,7 +2349,7 @@ function followJob(
 		orchestrator: Orchestrator;
 		store: RunStore;
 		watch: boolean;
-		retire?: () => Promise<void>;
+		retire?: (opts?: RetireOptions) => Promise<void>;
 		treeIdentity?: { nodeId: string; parentId: string | null; depth: number };
 	},
 ): void {
@@ -2371,12 +2380,12 @@ function followJob(
 		isAlive: () => input.orchestrator.isChildAlive(input.name),
 		persist: async () =>
 			persistChild(input.store, input.runId, input.orchestrator, input.name),
-		retire: async () => {
+		retire: async (opts) => {
 			if (input.retire) {
-				await input.retire();
+				await input.retire(opts);
 				return;
 			}
-			await input.orchestrator.retire(input.name);
+			await input.orchestrator.retire(input.name, opts);
 			await persistChild(
 				input.store,
 				input.runId,

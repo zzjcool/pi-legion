@@ -31,6 +31,7 @@ import {
 import { canUseCachedCollect } from "../extension/recycle.ts";
 import {
 	countAssistantMessages,
+	attributeParentSessionShutdown,
 	deriveOutcome,
 	emptyParsedSession,
 	extractVerdict,
@@ -51,6 +52,7 @@ import {
 	MAX_NESTED_PATH_ENTRIES,
 	type ModelOrigin,
 	type NestedPathEntry,
+	type RetireOptions,
 	type RunRecord,
 	SubagentError,
 	type Usage,
@@ -239,6 +241,8 @@ export class Orchestrator {
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly nameCounter = new Map<string, number>();
 	private readonly pendingWaits = new Map<string, Promise<SettleResult>>();
+	/** Children retired because the parent session is shutting down. */
+	private readonly parentShutdownRetire = new Set<string>();
 
 	constructor(deps: OrchestratorDeps) {
 		this.supervisor = deps.supervisor ?? new RpcSupervisor();
@@ -860,6 +864,11 @@ export class Orchestrator {
 				execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
 			}
 		}
+		// A parent shutdown can resolve the in-flight wait by killing the child.
+		// That is not the child settling a turn with no assistant reply.
+		if (this.parentShutdownRetire.has(name) && wait !== "settled") {
+			execution = attributeParentSessionShutdown(execution, parsed);
+		}
 		return this.finishCollect(child, parsed, execution, deadline);
 	}
 
@@ -1098,10 +1107,18 @@ export class Orchestrator {
 		return cached;
 	}
 
-	async retire(name: string): Promise<ChildRecord> {
+	async retire(name: string, opts?: RetireOptions): Promise<ChildRecord> {
 		const child = this.requireChild(name);
+		if (opts?.cause === "session-shutdown") this.parentShutdownRetire.add(name);
 		if (child.state === "retired") return child;
-		if (!child.execution && fs.existsSync(child.sessionFile)) child.execution = deriveOutcome(parseSessionFile(child.sessionFile));
+		const sessionExists = fs.existsSync(child.sessionFile);
+		const parsed = sessionExists ? parseSessionFile(child.sessionFile) : emptyParsedSession();
+		if (!child.execution && sessionExists) child.execution = deriveOutcome(parsed);
+		// Stamp the cause before killing so an in-flight collect cannot
+		// overwrite it with "no assistant message" after the process dies.
+		if (opts?.cause === "session-shutdown" && this.supervisor.isAlive(name)) {
+			child.execution = attributeParentSessionShutdown(child.execution ?? deriveOutcome(parsed), parsed);
+		}
 		if (this.supervisor.isAlive(name)) await this.supervisor.retire(name);
 		if (child.nodeId && this.legion) {
 			if (child.execution && child.execution.status !== "unknown" && child.execution.status !== "running") {

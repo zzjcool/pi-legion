@@ -8,7 +8,10 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+	attributeParentSessionShutdown,
 	deriveOutcome,
+	NO_ASSISTANT_ABORT_REASON,
+	PARENT_SESSION_SHUTDOWN_ABORT_REASON,
 	extractVerdict,
 	isTransientConnectionFailure,
 	parseSessionFile,
@@ -71,7 +74,14 @@ test("stopReason toolUse as last assistant → aborted (killed mid-tool)", () =>
 test("user msg with no assistant reply → aborted, lastTurnMissing true (F29)", () => {
 	const parsed = parseLines(userMsg("do it"));
 	assert.equal(parsed.lastTurnMissing, true);
-	assert.equal(deriveOutcome(parsed).status, "aborted");
+	const outcome = deriveOutcome(parsed);
+	assert.equal(outcome.status, "aborted");
+	assert.equal(outcome.reason, NO_ASSISTANT_ABORT_REASON);
+	const shutdown = attributeParentSessionShutdown(outcome, parsed);
+	assert.equal(shutdown.status, "aborted");
+	assert.equal(shutdown.reason, PARENT_SESSION_SHUTDOWN_ABORT_REASON);
+	const settled = deriveOutcome(parseLines(userMsg("do it"), assistantMsg({ stopReason: "stop", text: "done" })));
+	assert.equal(attributeParentSessionShutdown(settled, parseLines(userMsg("do it"), assistantMsg({ stopReason: "stop", text: "done" }))).reason, undefined);
 });
 
 test("no messages at all → unknown", () => {

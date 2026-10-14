@@ -246,6 +246,14 @@ export interface Execution {
 	completedAt?: string;
 }
 
+/**
+ * Why a still-live child is being retired.
+ * `session-shutdown` is the parent process leaving, not a model failure.
+ */
+export interface RetireOptions {
+	cause?: "session-shutdown";
+}
+
 export interface Usage {
 	input: number;
 	output: number;
