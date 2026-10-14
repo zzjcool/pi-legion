@@ -1,7 +1,7 @@
 {
   "name": "pi-legion",
   "version": "2.0.0",
-  "description": "Herdr-backed subagents for Pi: visible, steerable, resumable child agents in Herdr panes",
+  "description": "Pi Legion v2: recursive centurion trees on headless Pi RPC; shared SQLite WAL legion.db. Four-stage planning/implementing/reviewing/verifying state machine, parent/child/sibling legion_mail, three-layer /legion UI, upward MR trees, squad resume.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -15,9 +15,12 @@
   "keywords": [
     "pi-package",
     "pi",
-    "herdr",
+    "pi-extension",
+    "legion",
+    "rpc",
     "subagents",
-    "agents"
+    "agents",
+    "centurion"
   ],
   "publishConfig": {
     "access": "public"
