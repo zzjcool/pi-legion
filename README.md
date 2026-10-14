@@ -382,4 +382,7 @@ Use `writeMockPiHome()` from `test/mock-llm` to generate an isolated
 `PI_CODING_AGENT_DIR` with dummy `apiKey: "mock"` only — never copy host
 `auth.json` into fixtures.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md#project-workflow) for the project
+workflow: issues, pull requests, the merge gate, and npm releases.
+
 MIT. See [LICENSE](LICENSE).
