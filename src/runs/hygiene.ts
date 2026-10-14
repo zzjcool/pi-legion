@@ -47,6 +47,9 @@ export const HYGIENE_DEFAULTS: HygieneConfig = {
 	eventMaxRows: 200_000,
 };
 
+/** Written under storeRoot after each startup sweep so doctor can show "last sweep". */
+export const HYGIENE_LAST_FILE = ".hygiene-last.json";
+
 export const HYGIENE_ENV = {
 	disable: "PI_LEGION_HYGIENE",
 	retentionDays: "PI_LEGION_RUN_RETENTION_DAYS",
@@ -247,6 +250,23 @@ export function runStartupHygiene(opts: HygieneOptions): HygieneReport {
 		} catch (error) {
 			report.errors.push(`${dbPath}: ${String(error)}`);
 		}
+	}
+	try {
+		fs.writeFileSync(
+			path.join(opts.storeRoot, HYGIENE_LAST_FILE),
+			`${JSON.stringify({
+				at: now,
+				removedTempDirs: report.removedTempDirs.length,
+				abandonedNodes: report.abandonedNodes.length,
+				prunedRuns: report.prunedRuns.length,
+				deletedEvents: report.deletedEvents,
+				freedBytes: report.freedBytes,
+				errors: report.errors.length,
+			})}\n`,
+			{ mode: 0o600 },
+		);
+	} catch {
+		/* best-effort marker for doctor */
 	}
 	return report;
 }

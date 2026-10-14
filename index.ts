@@ -152,7 +152,7 @@ const SubagentParams = Type.Object({
 				Type.Literal("stop"),
 				Type.Literal("diagnose"),
 			],
-			{ description: "Defaults to launch. diagnose = Legion doctor (extensions/providers/memory)." },
+			{ description: "Defaults to launch. diagnose = Legion doctor full self-check (extensions/models/spawn/memory/tools/storage/runtime)." },
 		),
 	),
 	agent: Type.Optional(
@@ -882,8 +882,22 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 				}
 				const report = runLegionDoctor({
 					agentDir: getAgentDir(),
+					cwd,
+					storeRoot: store.rootDir,
 					expectedModels: expectedModelsFromSettings(settings),
 					sampleAgent: agents[0],
+					agents,
+					runtime: {
+						liveJobs: runtime.activeJobs().map((job) => ({
+							name: job.name,
+							state: job.state,
+							nodeId: job.nodeId,
+						})),
+						stopAvailable: true,
+						idleEscWired: true,
+						legionTools: ["subagent", "vexillatio"],
+						allowNestedEnv: process.env[ALLOW_NESTED_ENV] === "1",
+					},
 				});
 				return ok(report.text);
 			}

@@ -1,10 +1,9 @@
 /**
- * `/legion doctor` and `subagent action=diagnose`: self-check for child spawn /
- * extension / provider issues (inspired by `pi list` / `pi auth check`).
+ * `/legion doctor` and `subagent action=diagnose`: broad self-check for
+ * pi-legion (inspired by `pi list` / `pi auth check` / `pi --help`).
  *
- * The report is meant for both humans and the main agent — especially after
- * `#43` made children start with `--no-extensions`, so provider packages like
- * `pi-any-endpoint` no longer register models in the child by default.
+ * Sections are filterable via `/legion doctor <section>` so the main agent can
+ * pull only what it needs, then act on the structured Next steps.
  */
 
 import { execFileSync } from "node:child_process";
@@ -28,9 +27,42 @@ import {
 	availableMemoryMb,
 	childNodeOptions,
 	resolveMemoryGateConfig,
+	checkMemoryGate,
 } from "../supervisor/child-memory.ts";
+import {
+	HYGIENE_ENV,
+	HYGIENE_LAST_FILE,
+	dirBytes,
+	hygieneEnabled,
+	resolveHygieneConfig,
+} from "../runs/hygiene.ts";
+import { TEMP_OWNER_FILE, ownerState } from "../runs/owner.ts";
+import { legionDbPath } from "../legion/db.ts";
+import {
+	VERIFY_CONCURRENCY_ENV,
+	VERIFY_LOCK_DIR_ENV,
+	VERIFY_QUEUE_MAX_MS_ENV,
+	inspectVerifySlots,
+	resolveVerifyQueueConfig,
+} from "../runs/verify-queue.ts";
+import { ALLOW_NESTED_ENV } from "./budget.ts";
+import { IDLE_STOP_HINT, IDLE_STOP_HINT_SHORT } from "./legion-stop.ts";
 import type { AgentConfig } from "../shared/types.ts";
 import { recentSpawnFailures, type SpawnFailureRecord } from "./spawn-hints.ts";
+
+export const DOCTOR_SECTIONS = [
+	"summary",
+	"extensions",
+	"models",
+	"spawn",
+	"memory",
+	"tools",
+	"storage",
+	"runtime",
+	"next",
+] as const;
+
+export type DoctorSection = (typeof DOCTOR_SECTIONS)[number];
 
 export interface DoctorPackage {
 	source: string;
@@ -46,12 +78,40 @@ export interface DoctorIssue {
 	code: string;
 	message: string;
 	fix?: string;
+	section?: DoctorSection;
+}
+
+export interface DoctorLiveJob {
+	name: string;
+	state: string;
+	nodeId?: string;
+}
+
+export interface DoctorTreeNode {
+	id: string;
+	name: string;
+	status: string;
+	phase?: string;
+}
+
+export interface DoctorRuntimeSnapshot {
+	liveJobs?: readonly DoctorLiveJob[];
+	treeNodes?: readonly DoctorTreeNode[];
+	/** True when /legion stop is wired. */
+	stopAvailable?: boolean;
+	/** True when idle Esc → cascade stop is registered. */
+	idleEscWired?: boolean;
+	/** Known legion tool names registered in this process. */
+	legionTools?: readonly string[];
+	/** Nested spawn allowed in this process (child with ALLOW_NESTED). */
+	allowNestedEnv?: boolean;
 }
 
 export interface DoctorReport {
 	ok: boolean;
 	text: string;
 	issues: DoctorIssue[];
+	sections: DoctorSection[];
 	hostModelCount: number;
 	childModelCount: number;
 	packages: DoctorPackage[];
@@ -60,22 +120,22 @@ export interface DoctorReport {
 export interface DoctorOptions {
 	agentDir?: string;
 	env?: NodeJS.ProcessEnv;
-	/** `pi` CLI path; defaults to `process.argv[1]` / PATH `pi`. */
 	piCli?: string;
-	/** Sample role used for the argv preview (defaults to a minimal stub). */
 	sampleAgent?: AgentConfig;
-	/** Models the current team / roster expects children to use (`provider/id` or `id`). */
+	/** All discovered roles (for per-role extension preview). */
+	agents?: readonly AgentConfig[];
 	expectedModels?: string[];
-	/** Skip spawning `pi --list-models` (unit tests). */
 	probeModels?: boolean;
-	/** Injected model lists when probeModels is false. */
 	hostModels?: string[];
 	childModels?: string[];
-	/** Optional override for recent spawn failures. */
 	failures?: readonly SpawnFailureRecord[];
-	/** Exec helper for probing; defaults to execFileSync. */
 	runPi?: (args: string[], timeoutMs: number) => string;
 	cwd?: string;
+	/** `.pi-subagents` root for storage section. */
+	storeRoot?: string;
+	runtime?: DoctorRuntimeSnapshot;
+	/** Limit to these sections (plus always `next` when issues exist). */
+	sections?: readonly DoctorSection[];
 }
 
 function readJson(file: string): unknown {
@@ -90,7 +150,6 @@ function packageNameFromSource(source: string): string {
 	const s = source.trim();
 	if (s.startsWith("npm:")) {
 		const rest = s.slice(4);
-		// npm:@scope/name@version or npm:name@version
 		const m = /^(@[^/]+\/[^@]+|[^@]+)(?:@.+)?$/.exec(rest);
 		return m?.[1] ?? rest;
 	}
@@ -128,14 +187,9 @@ function extensionEntries(pkgRoot: string): string[] {
 	const pi = (pkg as { pi?: { extensions?: unknown } }).pi;
 	const raw = pi?.extensions;
 	const list = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
-	const out: string[] = [];
-	for (const entry of list) {
-		if (typeof entry !== "string" || !entry.trim()) continue;
-		const resolved = path.resolve(pkgRoot, entry);
-		if (fs.existsSync(resolved)) out.push(resolved);
-		else out.push(resolved); // still report; doctor flags missing
-	}
-	return out;
+	return list
+		.filter((entry): entry is string => typeof entry === "string" && Boolean(entry.trim()))
+		.map((entry) => path.resolve(pkgRoot, entry));
 }
 
 function keywordsOf(pkgRoot: string): string[] {
@@ -209,14 +263,12 @@ function defaultRunPi(piCli: string, cwd: string | undefined) {
 	};
 }
 
-/** Parse `pi --list-models` table into `provider/id` strings. */
 export function parseListModels(output: string): string[] {
 	const lines = output.split(/\r?\n/);
 	const models: string[] = [];
 	for (const line of lines) {
 		if (/^provider\b/i.test(line) || !line.trim()) continue;
 		if (/^No models available/i.test(line)) return [];
-		// provider  model  context ...
 		const m = /^(\S+)\s+(\S+)\s+/.exec(line);
 		if (!m) continue;
 		const provider = m[1];
@@ -230,7 +282,6 @@ export function parseListModels(output: string): string[] {
 function modelMatches(expected: string, available: readonly string[]): boolean {
 	const e = expected.includes(":") ? expected.slice(0, expected.lastIndexOf(":")) : expected;
 	if (available.includes(e)) return true;
-	// expected may be bare `workbuddy/foo` while list is `any-endpoint/workbuddy/foo`
 	return available.some((a) => a === e || a.endsWith(`/${e}`) || a.split("/").slice(1).join("/") === e);
 }
 
@@ -285,13 +336,84 @@ function homeize(p: string, home: string): string {
 	return p;
 }
 
+function want(sections: ReadonlySet<DoctorSection>, name: DoctorSection): boolean {
+	return sections.has(name);
+}
+
+export function parseDoctorSections(raw: string | undefined): DoctorSection[] | undefined {
+	if (!raw?.trim()) return undefined;
+	const parts = raw.trim().split(/[\s,]+/).filter(Boolean);
+	const out: DoctorSection[] = [];
+	for (const part of parts) {
+		const key = part.toLowerCase() as DoctorSection;
+		if ((DOCTOR_SECTIONS as readonly string[]).includes(key)) out.push(key);
+		else throw new Error(`Unknown doctor section "${part}". Available: ${DOCTOR_SECTIONS.join(", ")}`);
+	}
+	return out.length ? out : undefined;
+}
+
+function extensionsForRole(agent: AgentConfig, env: NodeJS.ProcessEnv, extras: string[]): string[] {
+	if (childInheritsExtensions(agent, env)) return ["(all host-discovered extensions)"];
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const ext of [...(agent.extensions ?? []), ...(agent.subagentOnlyExtensions ?? []), ...extras, childGuardExtensionPath()]) {
+		const resolved = path.resolve(ext);
+		if (seen.has(resolved)) continue;
+		seen.add(resolved);
+		out.push(ext);
+	}
+	return out;
+}
+
+function scanOrphanTemps(storeRoot: string): { total: number; orphanDead: number; live: number; unknown: number; samples: string[] } {
+	const runsRoot = path.join(storeRoot, "runs");
+	let total = 0;
+	let orphanDead = 0;
+	let live = 0;
+	let unknown = 0;
+	const samples: string[] = [];
+	try {
+		for (const runEnt of fs.readdirSync(runsRoot, { withFileTypes: true })) {
+			if (!runEnt.isDirectory()) continue;
+			const runDir = path.join(runsRoot, runEnt.name);
+			for (const ent of fs.readdirSync(runDir, { withFileTypes: true })) {
+				if (!ent.isDirectory() || !ent.name.startsWith("rpc-child-")) continue;
+				total++;
+				const state = ownerState(path.join(runDir, ent.name, TEMP_OWNER_FILE));
+				if (state === "dead") {
+					orphanDead++;
+					if (samples.length < 5) samples.push(`${runEnt.name}/${ent.name} (dead owner)`);
+				} else if (state === "live") live++;
+				else {
+					unknown++;
+					if (samples.length < 5) samples.push(`${runEnt.name}/${ent.name} (no/.legacy owner)`);
+				}
+			}
+		}
+	} catch { /* missing store */ }
+	return { total, orphanDead, live, unknown, samples };
+}
+
+function formatBytes(n: number): string {
+	if (n < 1024) return `${n} B`;
+	if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+	if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+	return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
 export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	const env = options.env ?? process.env;
 	const agentDir = options.agentDir ?? getAgentDir();
 	const home = env.HOME ?? env.USERPROFILE ?? os.homedir();
 	const issues: DoctorIssue[] = [];
 	const packages = loadHostPackages(agentDir);
-	const inherit = childInheritsExtensions({ inheritExtensions: options.sampleAgent?.inheritExtensions }, env);
+	const selected = new Set<DoctorSection>(
+		options.sections?.length ? options.sections : DOCTOR_SECTIONS,
+	);
+	// Always keep next when filtering so the model gets actions.
+	if (options.sections?.length) selected.add("next");
+
+	const inheritGlobal = childInheritsExtensions({}, env);
 	const extras = childExtraExtensions(env);
 	const sample = sampleAgentConfig(options.sampleAgent);
 	const argv = previewChildArgv(sample, env);
@@ -303,24 +425,22 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	const runPi = options.runPi ?? defaultRunPi(piCli, options.cwd);
 	let hostModels = options.hostModels ?? [];
 	let childModels = options.childModels ?? [];
-	let probeError: string | undefined;
-	if (probe) {
+	if (probe && (want(selected, "models") || want(selected, "summary") || want(selected, "extensions"))) {
 		try {
 			hostModels = parseListModels(runPi(["--list-models"], 15_000));
 			childModels = parseListModels(runPi(["--no-extensions", "--list-models"], 15_000));
 		} catch (error) {
-			probeError = error instanceof Error ? error.message : String(error);
 			issues.push({
 				severity: "warning",
 				code: "PROBE_FAILED",
-				message: `Could not run pi --list-models: ${probeError}`,
+				section: "models",
+				message: `Could not run pi --list-models: ${error instanceof Error ? error.message : String(error)}`,
 			});
 		}
 	}
 
-	// Which provider packages restore child models?
 	const restoring: { pkg: DoctorPackage; path: string; models: number }[] = [];
-	if (probe && !inherit && childModels.length === 0 && hostModels.length > 0) {
+	if (probe && !inheritGlobal && childModels.length === 0 && hostModels.length > 0 && want(selected, "models")) {
 		const candidates = packages.filter((p) => p.likelyProvider || p.name === "pi-any-endpoint");
 		const tryList = candidates.length > 0 ? candidates : packages.filter((p) => p.name !== "pi-legion");
 		for (const pkg of tryList) {
@@ -345,10 +465,11 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	].filter((ext, i, all) => all.indexOf(ext) === i);
 	const providerExtHome = providerExtPaths.map((ext) => homeize(ext, home));
 
-	if (!inherit && noExtensions && hostModels.length > 0 && childModels.length === 0) {
+	if (!inheritGlobal && noExtensions && hostModels.length > 0 && childModels.length === 0) {
 		issues.push({
 			severity: "error",
 			code: "CHILD_NO_MODELS",
+			section: "models",
 			message:
 				`Host has ${hostModels.length} model(s) but a child with --no-extensions sees none. ` +
 				`Providers are registered by host packages that children no longer load (#43).`,
@@ -356,22 +477,24 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 				? `export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}`
 				: `Add the provider package extension path to ${CHILD_EXTENSIONS_ENV}, or set role extensions: / inheritExtensions: true.`,
 		});
-	} else if (!inherit && noExtensions && hostModels.length > childModels.length && childModels.length > 0) {
+	} else if (!inheritGlobal && noExtensions && hostModels.length > childModels.length && childModels.length > 0) {
 		issues.push({
 			severity: "warning",
 			code: "CHILD_FEWER_MODELS",
+			section: "models",
 			message: `Child --no-extensions sees ${childModels.length}/${hostModels.length} host models.`,
 		});
 	}
 
 	const expected = options.expectedModels ?? [];
-	const missing = inherit
+	const missing = inheritGlobal
 		? expected.filter((m) => !modelMatches(m, hostModels))
 		: expected.filter((m) => !modelMatches(m, childModels));
-	if (missing.length > 0 && (childModels.length === 0 || !inherit)) {
+	if (missing.length > 0 && (childModels.length === 0 || !inheritGlobal)) {
 		issues.push({
 			severity: "error",
 			code: "TEAM_MODELS_MISSING",
+			section: "models",
 			message: `Team/roster model(s) invisible to children: ${missing.join(", ")}`,
 			fix: providerExtHome.length
 				? `export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}`
@@ -384,6 +507,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 			issues.push({
 				severity: "warning",
 				code: "PACKAGE_UNRESOLVED",
+				section: "extensions",
 				message: `settings package not found on disk: ${pkg.source}`,
 			});
 		}
@@ -392,20 +516,37 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 				issues.push({
 					severity: "warning",
 					code: "EXTENSION_MISSING",
+					section: "extensions",
 					message: `${pkg.name} extension path missing: ${ext}`,
 				});
 			}
 		}
 	}
 
-	const gate = resolveMemoryGateConfig(env);
-	const availableMb = availableMemoryMb();
-	const failures = options.failures ?? recentSpawnFailures();
+	const agents = options.agents ?? (options.sampleAgent ? [options.sampleAgent] : []);
+	for (const agent of agents) {
+		const needsLens = (agent.tools ?? []).some((t) => /lens|symbol_search|project_report|module_report|read_symbol|read_enclosing/i.test(t));
+		const exts = extensionsForRole(agent, env, extras);
+		const hasLens =
+			childInheritsExtensions(agent, env) ||
+			exts.some((e) => /pi-lens/i.test(e));
+		if (needsLens && !hasLens && !inheritGlobal) {
+			issues.push({
+				severity: "warning",
+				code: "ROLE_MISSING_LENS",
+				section: "extensions",
+				message: `Role "${agent.name}" lists lens tools but would not load pi-lens under --no-extensions.`,
+				fix: `Add pi-lens to ${agent.name}'s extensions: frontmatter, or to ${CHILD_EXTENSIONS_ENV}.`,
+			});
+		}
+	}
 
+	const failures = options.failures ?? recentSpawnFailures();
 	if (failures.some((f) => f.hadNoExtensions !== false && /not found|No models/i.test(f.stderr ?? f.message))) {
 		issues.push({
 			severity: "error",
 			code: "RECENT_MODEL_SPAWN_FAIL",
+			section: "spawn",
 			message: "A recent child spawn failed with a model/provider error under --no-extensions.",
 			fix: providerExtHome.length
 				? `export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}`
@@ -413,109 +554,297 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		});
 	}
 
+	const gate = resolveMemoryGateConfig(env);
+	const availableMb = availableMemoryMb();
+	const inFlight = options.runtime?.liveJobs?.filter((j) => j.state === "starting").length ?? 0;
+	const gateProbe = checkMemoryGate({
+		name: "(doctor)",
+		inFlight,
+		config: gate,
+		available: () => availableMb,
+	});
+	if (!gateProbe.ok) {
+		issues.push({
+			severity: "warning",
+			code: "MEMORY_GATE_WOULD_REFUSE",
+			section: "memory",
+			message: gateProbe.message ?? `Memory gate would refuse a new child (${availableMb} MB free).`,
+			fix: `Free memory, stop children with /legion stop, or set ${MIN_FREE_MEM_ENV}=0.`,
+		});
+	}
+
+	const storeRoot = options.storeRoot ?? (options.cwd ? path.join(options.cwd, ".pi-subagents") : undefined);
+	const orphans = storeRoot ? scanOrphanTemps(storeRoot) : undefined;
+	if (orphans && orphans.orphanDead > 0) {
+		issues.push({
+			severity: "info",
+			code: "ORPHAN_TEMPS",
+			section: "storage",
+			message: `${orphans.orphanDead} rpc-child temp dir(s) have a dead owner (startup hygiene will remove them).`,
+		});
+	}
+
+	const verify = inspectVerifySlots(resolveVerifyQueueConfig(env));
+	const staleVerify = verify.holders.filter((h) => h.alive === false);
+	if (staleVerify.length) {
+		issues.push({
+			severity: "warning",
+			code: "STALE_VERIFY_SLOTS",
+			section: "memory",
+			message: `${staleVerify.length} verify slot(s) held by dead pids — will be reclaimed on next acquire.`,
+			fix: `Remove ${staleVerify.map((h) => h.file).join(", ")} if stuck.`,
+		});
+	}
+
+	const runtime = options.runtime ?? {};
 	const lines: string[] = [];
-	lines.push("# Legion doctor");
-	lines.push("");
-	lines.push(`Agent dir: ${homeize(agentDir, home)}`);
-	lines.push(`Pi CLI: ${piCli}`);
-	lines.push("");
+	const push = (...xs: string[]) => { for (const x of xs) lines.push(x); };
 
-	lines.push("## Child extension policy");
-	lines.push(`- inheritExtensions (role/env): ${inherit ? "yes (loads all host extensions)" : "no"}`);
-	lines.push(`- child argv includes --no-extensions: ${noExtensions ? "yes" : "no"}`);
-	lines.push(`- ${CHILD_INHERIT_EXTENSIONS_ENV}=${env[CHILD_INHERIT_EXTENSIONS_ENV] ?? "(unset)"}`);
-	lines.push(`- ${CHILD_EXTENSIONS_ENV}=${env[CHILD_EXTENSIONS_ENV] ?? "(unset)"}`);
-	lines.push(`- extra extension paths: ${extras.length ? extras.map((p) => homeize(p, home)).join(", ") : "(none)"}`);
-	lines.push(`- guard extension: ${homeize(childGuardExtensionPath(), home)}`);
-	lines.push("");
+	push("# Legion doctor", "");
+	push(`Agent dir: ${homeize(agentDir, home)}`);
+	push(`Pi CLI: ${piCli}`);
+	push(`Sections: ${[...selected].join(", ")}`);
+	push("");
 
-	lines.push("## Host packages (settings.packages)");
-	if (packages.length === 0) lines.push("(none)");
-	for (const pkg of packages) {
-		const tag = pkg.likelyProvider ? " [provider?]" : "";
-		const root = pkg.root ? homeize(pkg.root, home) : "(missing)";
-		lines.push(`- ${pkg.source} → ${root}${tag}`);
-		for (const ext of pkg.extensionPaths) {
-			const ok = fs.existsSync(ext) ? "" : " MISSING";
-			lines.push(`    --extension ${homeize(ext, home)}${ok}`);
+	if (want(selected, "summary")) {
+		push("## Summary");
+		const errN = issues.filter((i) => i.severity === "error").length;
+		const warnN = issues.filter((i) => i.severity === "warning").length;
+		push(`- status: ${errN ? "FAIL" : warnN ? "WARN" : "OK"} (${errN} error(s), ${warnN} warning(s))`);
+		push(`- child --no-extensions: ${noExtensions ? "yes" : "no"}; inherit: ${inheritGlobal ? "yes" : "no"}`);
+		push(`- models host/child: ${hostModels.length}/${childModels.length}`);
+		push(`- live children: ${runtime.liveJobs?.length ?? "(unknown — pass runtime)"}`);
+		push(`- free memory: ${availableMb} MB (gate min ${gate.minFreeMb})`);
+		if (storeRoot) push(`- store: ${homeize(storeRoot, home)}`);
+		push("");
+	}
+
+	if (want(selected, "extensions")) {
+		push("## Extensions");
+		push(`- inheritExtensions (env/role default): ${inheritGlobal ? "yes (loads all host extensions)" : "no"}`);
+		push(`- child argv includes --no-extensions: ${noExtensions ? "yes" : "no"}`);
+		push(`- ${CHILD_INHERIT_EXTENSIONS_ENV}=${env[CHILD_INHERIT_EXTENSIONS_ENV] ?? "(unset)"}`);
+		push(`- ${CHILD_EXTENSIONS_ENV}=${env[CHILD_EXTENSIONS_ENV] ?? "(unset)"}`);
+		push(`- extra extension paths: ${extras.length ? extras.map((p) => homeize(p, home)).join(", ") : "(none)"}`);
+		push(`- guard extension: ${homeize(childGuardExtensionPath(), home)}`);
+		push("");
+		push("### Host packages (settings.packages)");
+		if (packages.length === 0) push("(none)");
+		for (const pkg of packages) {
+			const tag = pkg.likelyProvider ? " [provider?]" : "";
+			const root = pkg.root ? homeize(pkg.root, home) : "(missing)";
+			push(`- ${pkg.source} → ${root}${tag}`);
+			for (const ext of pkg.extensionPaths) {
+				const ok = fs.existsSync(ext) ? "" : " MISSING";
+				push(`    --extension ${homeize(ext, home)}${ok}`);
+			}
 		}
-	}
-	lines.push("");
-
-	lines.push(`## Sample child argv (${sample.name})`);
-	lines.push("```");
-	lines.push(argv.join(" "));
-	lines.push("```");
-	lines.push(`Explicit --extension count: ${explicitExts.length}`);
-	lines.push("");
-
-	lines.push("## Models");
-	lines.push(`- host (normal discovery): ${hostModels.length}`);
-	lines.push(`- child (--no-extensions): ${childModels.length}`);
-	if (hostModels.length && childModels.length === 0) {
-		lines.push("- child sees NO models — providers come from host packages that `--no-extensions` skips.");
-	}
-	if (restoring.length) {
-		lines.push("- packages that restore models when passed via `--extension`:");
-		for (const r of restoring) {
-			lines.push(`    ${r.pkg.name}: ${homeize(r.path, home)} (${r.models} models)`);
+		push("");
+		push("### Per-role effective extensions");
+		const roles = agents.length ? agents : [sample];
+		for (const agent of roles.slice(0, 24)) {
+			const inherit = childInheritsExtensions(agent, env);
+			const list = extensionsForRole(agent, env, extras);
+			push(`- ${agent.name}: inheritExtensions=${inherit ? "true" : "false"} → ${list.map((e) => (e.startsWith("(") ? e : homeize(e, home))).join(", ")}`);
 		}
+		if (roles.length > 24) push(`  … +${roles.length - 24} more roles`);
+		push("");
 	}
-	if (expected.length) {
-		lines.push(`- expected (team/roster): ${expected.join(", ") || "(none)"}`);
-		if (missing.length) lines.push(`- MISSING for children: ${missing.join(", ")}`);
-	}
-	if (hostModels.length <= 12) {
-		for (const m of hostModels) lines.push(`    host: ${m}`);
-	} else {
-		for (const m of hostModels.slice(0, 8)) lines.push(`    host: ${m}`);
-		lines.push(`    ... +${hostModels.length - 8} more`);
-	}
-	lines.push("");
 
-	lines.push("## Memory gate / child V8");
-	lines.push(`- available: ${availableMb} MB`);
-	lines.push(`- ${MIN_FREE_MEM_ENV}=${gate.minFreeMb} (0 = off)`);
-	lines.push(`- ${CHILD_RESERVE_ENV}=${gate.reserveMb}`);
-	lines.push(`- child NODE_OPTIONS: ${childNodeOptions(env) ?? "(unchanged)"}`);
-	lines.push(`- ${CHILD_MAX_OLD_SPACE_ENV}=${env[CHILD_MAX_OLD_SPACE_ENV] ?? "(default)"}`);
-	lines.push(`- ${CHILD_SEMI_SPACE_ENV}=${env[CHILD_SEMI_SPACE_ENV] ?? "(default)"}`);
-	lines.push("");
-
-	lines.push("## Recent spawn failures");
-	if (failures.length === 0) lines.push("(none recorded in this process)");
-	for (const f of failures.slice(0, 5)) {
-		const when = new Date(f.ts).toISOString();
-		lines.push(`- ${when} ${f.name}: ${(f.stderr ?? f.message).trim().slice(0, 240).replace(/\s+/g, " ")}`);
+	if (want(selected, "models")) {
+		push("## Models / providers");
+		push(`- host (normal discovery): ${hostModels.length}`);
+		push(`- child (--no-extensions): ${childModels.length}`);
+		if (hostModels.length && childModels.length === 0) {
+			push("- child sees NO models — providers come from host packages that `--no-extensions` skips.");
+		}
+		if (restoring.length) {
+			push("- packages that restore models when passed via `--extension`:");
+			for (const r of restoring) {
+				push(`    ${r.pkg.name}: ${homeize(r.path, home)} (${r.models} models)`);
+			}
+		}
+		if (expected.length) {
+			push(`- expected (team/roster): ${expected.join(", ")}`);
+			if (missing.length) push(`- MISSING for children: ${missing.join(", ")}`);
+		}
+		const show = hostModels.slice(0, 12);
+		for (const m of show) push(`    host: ${m}`);
+		if (hostModels.length > show.length) push(`    ... +${hostModels.length - show.length} more`);
+		push("");
 	}
-	lines.push("");
 
-	lines.push("## Issues");
-	if (issues.length === 0) lines.push("None. Children should see the same providers the doctor probe showed.");
-	for (const issue of issues) {
-		lines.push(`- [${issue.severity}] ${issue.code}: ${issue.message}`);
-		if (issue.fix) lines.push(`    fix: ${issue.fix}`);
+	if (want(selected, "spawn")) {
+		push("## Spawn");
+		push(`### Sample child argv (${sample.name})`);
+		push("```");
+		push(argv.join(" "));
+		push("```");
+		push(`- explicit --extension count: ${explicitExts.length}`);
+		push(`- nested spawn env ${ALLOW_NESTED_ENV}=${env[ALLOW_NESTED_ENV] ?? "(unset)"}`);
+		push(`- runtime.allowNestedEnv: ${runtime.allowNestedEnv ?? "(unknown)"}`);
+		push(`- roles with allowNestedSubagents: ${
+			agents.filter((a) => a.allowNestedSubagents).map((a) => a.name).join(", ") || "(none listed)"
+		}`);
+		push("");
+		push("### Recent spawn failures");
+		if (failures.length === 0) push("(none recorded in this process)");
+		for (const f of failures.slice(0, 8)) {
+			const when = new Date(f.ts).toISOString();
+			push(`- ${when} ${f.name}: ${(f.stderr ?? f.message).trim().slice(0, 280).replace(/\s+/g, " ")}`);
+		}
+		push("");
 	}
-	lines.push("");
 
-	lines.push("## Suggested fixes");
-	if (providerExtHome.length) {
-		lines.push(`1. Prefer narrow: \`export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}\``);
-		lines.push("   (or add those paths under each role's `extensions:` frontmatter).");
-		lines.push(`2. Broad (more RAM): \`export ${CHILD_INHERIT_EXTENSIONS_ENV}=1\` or role \`inheritExtensions: true\`.`);
-	} else if (issues.some((i) => i.code === "CHILD_NO_MODELS")) {
-		lines.push(`1. Find the provider package under ${homeize(path.join(agentDir, "npm/node_modules"), home)} and set ${CHILD_EXTENSIONS_ENV} to its pi.extensions entry.`);
-		lines.push(`2. Or \`export ${CHILD_INHERIT_EXTENSIONS_ENV}=1\` (loads every host extension — costly).`);
-	} else {
-		lines.push("No extension change required for models. If spawn still fails, check Recent spawn failures and role model ids.");
+	if (want(selected, "memory")) {
+		push("## Memory");
+		push(`- available: ${availableMb} MB`);
+		push(`- gate: ${MIN_FREE_MEM_ENV}=${gate.minFreeMb} (0=off), ${CHILD_RESERVE_ENV}=${gate.reserveMb}`);
+		push(`- gate probe (inFlight=${inFlight}): ${gateProbe.ok ? "would allow spawn" : "would REFUSE"}`);
+		push(`- child NODE_OPTIONS: ${childNodeOptions(env) ?? "(unchanged)"}`);
+		push(`- ${CHILD_MAX_OLD_SPACE_ENV}=${env[CHILD_MAX_OLD_SPACE_ENV] ?? "(default)"}`);
+		push(`- ${CHILD_SEMI_SPACE_ENV}=${env[CHILD_SEMI_SPACE_ENV] ?? "(default)"}`);
+		push("");
+		push("### Verify concurrency");
+		push(`- ${VERIFY_CONCURRENCY_ENV}=${verify.config.limit} (0=unlimited)`);
+		push(`- ${VERIFY_QUEUE_MAX_MS_ENV}=${verify.config.maxWaitMs}`);
+		push(`- lock dir: ${homeize(verify.config.lockDir, home)} (${VERIFY_LOCK_DIR_ENV})`);
+		push(`- slots in use: ${verify.inUse}/${verify.config.limit || "∞"}`);
+		for (const h of verify.holders) {
+			push(`    slot-${h.index}: pid=${h.pid ?? "?"} alive=${h.alive ?? "?"} cmd=${(h.command ?? "").slice(0, 80)}`);
+		}
+		push("");
 	}
-	lines.push("Re-run `/legion doctor` or `subagent action=diagnose` after changing env (restart pi so env is picked up).");
+
+	if (want(selected, "tools")) {
+		push("## Tools / commands");
+		push("- slash: `/legion` (view), `/legion doctor [section]`, `/legion stop [name|all]`, `/legion --tree`, `/legion <name>`");
+		push(`- stop wired: ${runtime.stopAvailable === undefined ? "(unknown)" : runtime.stopAvailable ? "yes" : "no"}`);
+		push(`- idle Esc stop wired: ${runtime.idleEscWired === undefined ? "(unknown)" : runtime.idleEscWired ? "yes" : "no"}`);
+		push(`- idle strip hints: "${IDLE_STOP_HINT}" / short "${IDLE_STOP_HINT_SHORT}"`);
+		push(`- legion tools registered: ${(runtime.legionTools ?? ["(unknown — typically subagent, vexillatio, legion-* mail/tools)"]).join(", ")}`);
+		push("- diagnose: `subagent({ action: \"diagnose\" })` or `subagent({ action: \"diagnose\" })` with section via `/legion doctor <section>`");
+		push("");
+	}
+
+	if (want(selected, "storage")) {
+		push("## Storage / hygiene");
+		push(`- hygiene enabled: ${hygieneEnabled(env)}`);
+		const hy = resolveHygieneConfig(env);
+		push(`- retention: runs ${hy.retentionDays}d, stale nodes ${hy.staleNodeHours}h, legacy temps ${hy.legacyTempHours}h, events ${hy.eventRetentionDays}d / max ${hy.eventMaxRows}`);
+		push(`- env: ${HYGIENE_ENV.disable}, ${HYGIENE_ENV.retentionDays}, ${HYGIENE_ENV.staleNodeHours}, …`);
+		if (!storeRoot) {
+			push("- storeRoot: (not provided — pass cwd/storeRoot for db/orphan stats)");
+		} else {
+			push(`- storeRoot: ${homeize(storeRoot, home)}`);
+			const lastPath = path.join(storeRoot, HYGIENE_LAST_FILE);
+			const last = readJson(lastPath) as { at?: number; removedTempDirs?: number; prunedRuns?: number; deletedEvents?: number; freedBytes?: number; errors?: number } | undefined;
+			if (last?.at) {
+				push(`- last sweep: ${new Date(last.at).toISOString()} (removedTemps=${last.removedTempDirs ?? 0}, prunedRuns=${last.prunedRuns ?? 0}, deletedEvents=${last.deletedEvents ?? 0}, freed=${formatBytes(last.freedBytes ?? 0)}, errors=${last.errors ?? 0})`);
+			} else {
+				push("- last sweep: (no marker yet — written on next root-session startup hygiene)");
+			}
+			const runsRoot = path.join(storeRoot, "runs");
+			let runCount = 0;
+			let dbBytes = 0;
+			let largestName = "";
+			let largestSize = 0;
+			try {
+				for (const ent of fs.readdirSync(runsRoot, { withFileTypes: true })) {
+					if (!ent.isDirectory()) continue;
+					runCount++;
+					const dbPath = legionDbPath(path.join(runsRoot, ent.name));
+					try {
+						const size = fs.statSync(dbPath).size;
+						dbBytes += size;
+						if (size > largestSize) {
+							largestSize = size;
+							largestName = ent.name;
+						}
+					} catch { /* no db */ }
+				}
+			} catch { /* missing */ }
+			push(`- runs: ${runCount}; legion.db total ≈ ${formatBytes(dbBytes)}${largestName ? `; largest ${largestName} (${formatBytes(largestSize)})` : ""}`);
+			if (orphans) {
+				push(`- rpc-child temps: ${orphans.total} (live=${orphans.live}, dead-owner=${orphans.orphanDead}, unknown=${orphans.unknown})`);
+				for (const s of orphans.samples) push(`    ${s}`);
+			}
+			try {
+				push(`- store bytes (approx): ${formatBytes(dirBytes(storeRoot))}`);
+			} catch { /* ignore */ }
+		}
+		push("");
+	}
+
+	if (want(selected, "runtime")) {
+		push("## Session / runtime");
+		const jobs = runtime.liveJobs ?? [];
+		const nodes = runtime.treeNodes ?? [];
+		if (!options.runtime) {
+			push("(no runtime snapshot — `/legion doctor` in a live session fills this; `diagnose` from the tool does too)");
+		} else {
+			push(`- live jobs: ${jobs.length}`);
+			for (const j of jobs.slice(0, 20)) {
+				push(`    ${j.name} state=${j.state}${j.nodeId ? ` node=${j.nodeId}` : ""}`);
+			}
+			if (jobs.length > 20) push(`    … +${jobs.length - 20} more`);
+			const byStatus = new Map<string, number>();
+			for (const n of nodes) byStatus.set(n.status, (byStatus.get(n.status) ?? 0) + 1);
+			push(`- tree nodes: ${nodes.length}${byStatus.size ? ` (${[...byStatus.entries()].map(([k, v]) => `${k}=${v}`).join(", ")})` : ""}`);
+			const pending = nodes.filter((n) => /running|starting|blocked|working/i.test(n.status) || /verify|accept/i.test(n.phase ?? ""));
+			push(`- active / acceptance-ish: ${pending.length}`);
+			for (const n of pending.slice(0, 15)) {
+				push(`    ${n.name} (${n.id}) status=${n.status}${n.phase ? ` phase=${n.phase}` : ""}`);
+			}
+		}
+		push("");
+	}
+
+	if (want(selected, "next")) {
+		push("## Issues");
+		const shown = options.sections?.length
+			? issues.filter((i) => !i.section || selected.has(i.section) || i.section === "next")
+			: issues;
+		if (shown.length === 0) push("None.");
+		for (const issue of shown) {
+			push(`- [${issue.severity}] ${issue.code}${issue.section ? ` @${issue.section}` : ""}: ${issue.message}`);
+			if (issue.fix) push(`    fix: ${issue.fix}`);
+		}
+		push("");
+		push("## Next steps (actionable)");
+		const steps: string[] = [];
+		if (providerExtHome.length && issues.some((i) => i.code === "CHILD_NO_MODELS" || i.code === "TEAM_MODELS_MISSING" || i.code === "RECENT_MODEL_SPAWN_FAIL")) {
+			steps.push(`export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}  # then restart pi`);
+			steps.push(`# or role frontmatter extensions: […] / inheritExtensions: true (more RAM)`);
+		}
+		if (issues.some((i) => i.code === "ROLE_MISSING_LENS")) {
+			steps.push("Add pi-lens extension path to roles that list lens_* tools, or to PI_LEGION_CHILD_EXTENSIONS.");
+		}
+		if (issues.some((i) => i.code === "MEMORY_GATE_WOULD_REFUSE")) {
+			steps.push("Stop idle children (`/legion stop`) or lower/disable PI_LEGION_MIN_FREE_MEM_MB before launching more.");
+		}
+		if (issues.some((i) => i.code === "ORPHAN_TEMPS")) {
+			steps.push("Orphan temps clear on next root session start; or restart pi to trigger hygiene.");
+		}
+		if (issues.some((i) => i.code === "STALE_VERIFY_SLOTS")) {
+			steps.push("Stale verify locks are reclaimed automatically; delete slot-*.lock under the lock dir if a slot stays stuck.");
+		}
+		if (steps.length === 0) {
+			steps.push("No blocking fixes. Re-run `/legion doctor` after changing env (restart pi). Use `/legion doctor models` etc. to focus.");
+		} else {
+			steps.push("Re-run `/legion doctor` or `subagent({ action: \"diagnose\" })` after changes (restart pi so env is picked up).");
+		}
+		for (let i = 0; i < steps.length; i++) push(`${i + 1}. ${steps[i]}`);
+		push("");
+		push(`Available sections: ${DOCTOR_SECTIONS.join(", ")}`);
+	}
 
 	const ok = !issues.some((i) => i.severity === "error");
 	return {
 		ok,
 		text: lines.join("\n"),
 		issues,
+		sections: [...selected],
 		hostModelCount: hostModels.length,
 		childModelCount: childModels.length,
 		packages,

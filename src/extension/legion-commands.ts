@@ -2,7 +2,14 @@ import { readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { matchesKey, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { resolveStopTarget, runLegionStop, stopCompletions, type StopDeps } from "./legion-stop.ts";
-import { expectedModelsFromSettings, runLegionDoctor } from "./legion-doctor.ts";
+import {
+	DOCTOR_SECTIONS,
+	expectedModelsFromSettings,
+	parseDoctorSections,
+	runLegionDoctor,
+	type DoctorRuntimeSnapshot,
+} from "./legion-doctor.ts";
+import { ALLOW_NESTED_ENV } from "./budget.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import type {
 	ExtensionAPI,
@@ -418,7 +425,11 @@ export async function confirmAndStopNode(ui: ExtensionUIContext, deps: Pick<Legi
 }
 
 
-function buildDoctorReport() {
+function buildDoctorReport(
+	deps: LegionCommandDeps,
+	ctxCwd: string,
+	sectionArg?: string,
+) {
 	const agentDir = getAgentDir();
 	let settings: unknown;
 	try {
@@ -426,9 +437,46 @@ function buildDoctorReport() {
 	} catch {
 		settings = undefined;
 	}
+	let sections;
+	try {
+		sections = parseDoctorSections(sectionArg);
+	} catch (error) {
+		return {
+			ok: false,
+			text: error instanceof Error ? error.message : String(error),
+			issues: [{ severity: "error" as const, code: "BAD_SECTION", message: String(error) }],
+			sections: [] as const,
+			hostModelCount: 0,
+			childModelCount: 0,
+			packages: [],
+		};
+	}
+	const runtime: DoctorRuntimeSnapshot = {
+		liveJobs: deps.runtime.activeJobs().map((job) => ({
+			name: job.name,
+			state: job.state,
+			nodeId: job.nodeId,
+		})),
+		treeNodes: deps.runtime.treeNodes().map((node) => ({
+			id: node.id,
+			name: node.name,
+			status: node.status,
+			phase: "phase" in node && typeof (node as { phase?: unknown }).phase === "string"
+				? (node as { phase: string }).phase
+				: undefined,
+		})),
+		stopAvailable: Boolean(deps.stop),
+		idleEscWired: true,
+		legionTools: ["subagent", "vexillatio"],
+		allowNestedEnv: process.env[ALLOW_NESTED_ENV] === "1",
+	};
 	return runLegionDoctor({
 		agentDir,
+		cwd: ctxCwd,
+		storeRoot: path.join(ctxCwd, ".pi-subagents"),
 		expectedModels: expectedModelsFromSettings(settings),
+		runtime,
+		sections,
 	});
 }
 
@@ -455,11 +503,17 @@ export function registerLegionCommand(
 				return stopCompletions(rest, deps.runtime.activeJobs(), deps.runtime.treeNodes())
 					.map((item) => ({ value: `stop ${item.value}`, label: item.label }));
 			}
+			if (/^doctor(\s|$)/i.test(prefix)) {
+				const rest = prefix.replace(/^doctor\s*/i, "");
+				return DOCTOR_SECTIONS
+					.filter((section) => section.startsWith(rest))
+					.map((section) => ({ value: `doctor ${section}`, label: `doctor ${section}` }));
+			}
 			if (prefix.includes(" ")) return null;
 			const nodes = deps.runtime.treeNodes();
 			const verbs: { value: string; label: string }[] = [];
 			if ("doctor".startsWith(prefix) && prefix.length > 0) {
-				verbs.push({ value: "doctor", label: "doctor — diagnose child extensions / providers / memory" });
+				verbs.push({ value: "doctor", label: "doctor [section] — full self-check (extensions/models/spawn/memory/tools/storage/runtime)" });
 			}
 			if (deps.stop && "stop".startsWith(prefix) && prefix.length > 0) {
 				verbs.push({ value: "stop", label: "stop [name] — stop one live subagent, or all" });
@@ -476,7 +530,8 @@ export function registerLegionCommand(
 		async handler(args, ctx) {
 			let query = args.trim();
 			if (/^doctor(?:\s|$)/i.test(query)) {
-				const report = buildDoctorReport();
+				const sectionArg = query.replace(/^doctor\s*/i, "").trim();
+				const report = buildDoctorReport(deps, ctx.cwd, sectionArg || undefined);
 				pi.sendMessage({
 					customType: "legion-doctor",
 					content: report.text,

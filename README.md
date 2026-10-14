@@ -208,21 +208,39 @@ the inherited cap but cannot widen it.
 
 ### Self-diagnosis (`/legion doctor`)
 
-When a child exits with `Model "…" not found` or `No models available`, the
-usual cause after #43 is that the model provider is registered by a host
-package (for example `pi-any-endpoint`) that children no longer load.
+When something about subagents misbehaves (model not found, spawn exit, memory
+gate, missing lens tools, orphan temps, …), ask Legion rather than guessing —
+same idea as `pi list` / `pi auth check`.
 
-- `/legion doctor` — prints a report into the chat (works outside TUI too).
-- `subagent({ action: "diagnose" })` — same report as tool output, so the
+- `/legion doctor` — full report in the chat (works outside TUI too).
+- `/legion doctor <section>` — one of: `summary`, `extensions`, `models`,
+  `spawn`, `memory`, `tools`, `storage`, `runtime`, `next`.
+- `subagent({ action: "diagnose" })` — same full report as tool output so the
   main agent can call it without waiting for you.
 
-The report covers: child `--no-extensions` policy and env knobs, host
-`settings.packages` with resolved `--extension` paths, a sample child argv,
-host vs `--no-extensions` model lists (and which package restores models),
-team/roster models that would be missing, memory-gate / child V8 flags, and
-recent spawn failures recorded in this process. Spawn failures that look like
-a missing model also append a short fix hint automatically.
+The report is structured for the model: each section ends in **Issues** /
+**Next steps** with copy-pasteable fixes (env exports, role frontmatter,
+`/legion stop`, …). Spawn failures that look like a missing model also append
+a short Hint automatically. **Gated auto-doctor:** on model-not-found,
+`INSUFFICIENT_MEMORY`, extension load failures, and child exit during
+startup / first prompt, the tool error itself includes a focused doctor
+snippet (relevant sections + Next steps) so the main agent can self-fix
+without anyone typing `/legion doctor`. Full `/legion doctor` remains for
+manual deep dives.
 
+Coverage:
+
+| Section | What it checks |
+| --- | --- |
+| extensions | Host `packages`, resolved `--extension` paths, `--no-extensions` / inherit knobs, per-role effective extension list |
+| models | Host vs child model lists, which package restores providers, team/roster gaps |
+| spawn | Sample child argv, recent spawn failures + stderr, nested-spawn flags |
+| memory | Free RAM, memory gate, child V8 flags, verify concurrency slots in use |
+| tools | `/legion` commands, stop / idle-Esc / strip hints, tool names |
+| storage | `legion.db` sizes, orphan `rpc-child-*` temps, last hygiene sweep marker |
+| runtime | Live children, tree statuses, acceptance-ish / active nodes |
+
+### Child extensions
 ### Child extensions
 
 Children start with `--no-extensions`, so they do not load the host's

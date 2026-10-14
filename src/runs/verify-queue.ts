@@ -143,3 +143,53 @@ export function queueNote(slot: VerifySlot, limit: number): string {
 	if (slot.waitedMs >= 1_000) return `[verify queue: waited ${Math.round(slot.waitedMs / 1000)}s for one of ${limit} slots]\n`;
 	return "";
 }
+
+/** Read-only view of verify slot files for `/legion doctor`. */
+export interface VerifySlotInfo {
+	index: number;
+	file: string;
+	pid?: number;
+	host?: string;
+	command?: string;
+	at?: number;
+	alive?: boolean;
+}
+
+export function inspectVerifySlots(config: VerifyQueueConfig = resolveVerifyQueueConfig()): {
+	config: VerifyQueueConfig;
+	holders: VerifySlotInfo[];
+	inUse: number;
+} {
+	const holders: VerifySlotInfo[] = [];
+	if (config.limit <= 0) return { config, holders, inUse: 0 };
+	for (let i = 0; i < config.limit; i++) {
+		const file = path.join(config.lockDir, `slot-${i}.lock`);
+		if (!fs.existsSync(file)) continue;
+		let pid: number | undefined;
+		let host: string | undefined;
+		let command: string | undefined;
+		let at: number | undefined;
+		try {
+			const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+			if (typeof raw.pid === "number") pid = raw.pid;
+			if (typeof raw.host === "string") host = raw.host;
+			if (typeof raw.command === "string") command = raw.command;
+			if (typeof raw.at === "number") at = raw.at;
+		} catch {
+			const owner = readOwnerFile(file);
+			pid = owner?.pid;
+			host = owner?.host;
+			at = owner?.at;
+		}
+		holders.push({
+			index: i,
+			file,
+			pid,
+			host,
+			command,
+			at,
+			alive: typeof pid === "number" ? isPidAlive(pid) : undefined,
+		});
+	}
+	return { config, holders, inUse: holders.length };
+}

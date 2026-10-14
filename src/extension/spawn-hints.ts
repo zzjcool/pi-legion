@@ -62,6 +62,7 @@ export function spawnFailureHint(input: {
 	);
 }
 
+/** Short hint only. Spawn paths use `enrichFailureWithAutoDoctor` for auto snippets. */
 export function withSpawnFailureHint(message: string, input: {
 	stderr?: string;
 	args?: readonly string[];
