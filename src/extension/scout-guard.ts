@@ -3,8 +3,11 @@
  *
  * Counts consecutive read-like tool calls in the parent session. When the
  * streak reaches N with no subagent/vexillatio dispatch in between, inject
- * one follow-up reminder. The tool_call hook only updates state; the
- * reminder is scheduled so it cannot block the current tool call.
+ * one follow-up reminder. First-class read tools (`read`, `grep`, `find`,
+ * `ls`) count the same as read-only bash; playbooks prefer those over bash,
+ * so ignoring them let a main-session scout miss the threshold. The
+ * tool_call hook only updates state; the reminder is scheduled so it cannot
+ * block the current tool call.
  *
  * Children carry PI_SUBAGENT_ROLE and must not run this logic.
  */
@@ -74,6 +77,12 @@ const PACKAGE_WRITE = new Set([
 ]);
 
 const DISPATCH_TOOLS = new Set(["subagent", "vexillatio"]);
+/**
+ * Pi built-in read-only tools (`createReadOnlyTools`): `read`, `grep`,
+ * `find`, `ls`. `find` here is the read-only search tool, not shell `find
+ * -delete` (that path is classified from bash).
+ */
+const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
 const WRITE_TOOLS = new Set(["edit", "write"]);
 
 export function initialScoutGuardState(): ScoutGuardState {
@@ -132,7 +141,7 @@ export function classifyScoutToolCall(toolName: string, input: unknown): ScoutTo
 	if (DISPATCH_TOOLS.has(toolName)) {
 		return isDispatchCall(toolName, input) ? "dispatch" : "ignore";
 	}
-	if (toolName === "read") return "read";
+	if (READ_TOOLS.has(toolName)) return "read";
 	if (WRITE_TOOLS.has(toolName)) return "write";
 	if (toolName !== "bash") return "ignore";
 	const command = record(input)?.command;

@@ -304,10 +304,11 @@ gate, missing lens tools, orphan temps, …), ask Legion rather than guessing �
 same idea as `pi list` / `pi auth check`.
 
 - `/legion doctor` — full report in the chat (works outside TUI too).
-- `/legion doctor <section>` — one of: `summary`, `extensions`, `models`,
+- `/legion doctor [section]` — one of: `summary`, `extensions`, `models`,
   `spawn`, `memory`, `tools`, `storage`, `runtime`, `next`.
 - `subagent({ action: "diagnose" })` — same full report as tool output so the
-  main agent can call it without waiting for you.
+  main agent can call it without waiting for you. The tool has no section
+  field; filter with `/legion doctor [section]`.
 
 The report is structured for the model: each section ends in **Issues** /
 **Next steps** with copy-pasteable fixes (env exports, role frontmatter,
@@ -328,7 +329,7 @@ Coverage:
 | spawn | Sample child argv, recent spawn failures + stderr, nested-spawn flags |
 | memory | Free RAM, memory gate, child V8 flags, verify concurrency slots in use |
 | tools | `/legion` slash list (status, team, agents, summary, on/off, scout-guard, doctor, stop), idle-Esc / strip hints, tool names |
-| storage | `legion.db` sizes, orphan `rpc-child-*` temps, last hygiene sweep marker |
+| storage | `legion.db` sizes, orphan `rpc-child-*` temps, effective hygiene limits (default vs env), last sweep marker plus a hint when it is missing or stale |
 | runtime | Live children, tree statuses, acceptance-ish / active nodes |
 
 ### Child extensions
