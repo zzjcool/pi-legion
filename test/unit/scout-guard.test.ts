@@ -140,6 +140,9 @@ test("bash classification: listed readers count, writes reset, ambiguous is igno
 
 test("tool classification: read counts, edit/write reset, only launches dispatch", () => {
 	assert.equal(classifyScoutToolCall("read", { path: "a" }), "read");
+	assert.equal(classifyScoutToolCall("grep", { pattern: "TODO" }), "read");
+	assert.equal(classifyScoutToolCall("find", { pattern: "*.ts" }), "read");
+	assert.equal(classifyScoutToolCall("ls", { path: "src" }), "read");
 	assert.equal(classifyScoutToolCall("bash", { command: "rg TODO src" }), "read");
 	assert.equal(classifyScoutToolCall("edit", { path: "a" }), "write");
 	assert.equal(classifyScoutToolCall("write", { path: "a" }), "write");
@@ -151,7 +154,7 @@ test("tool classification: read counts, edit/write reset, only launches dispatch
 	assert.equal(classifyScoutToolCall("subagent", { action: "status" }), "ignore");
 	assert.equal(classifyScoutToolCall("subagent", { action: "collect", name: "worker-0" }), "ignore");
 	assert.equal(classifyScoutToolCall("subagent", { action: "continue", name: "worker-0" }), "ignore");
-	assert.equal(classifyScoutToolCall("grep", { pattern: "TODO" }), "ignore");
+	assert.equal(classifyScoutToolCall("codemode", { code: "1" }), "ignore");
 	assert.equal(classifyScoutToolCall("bash", {}), "ignore");
 });
 
@@ -301,7 +304,7 @@ test("hook: N consecutive reads inject one followUp reminder and do not block to
 	}
 	assert.equal(guard.reminders().length, 0);
 	assert.equal(guard.queued.length, 0);
-	const eighth = guard.call("bash", { command: "rg TODO src" });
+	const eighth = guard.call("grep", { pattern: "TODO" });
 	assert.equal(eighth, undefined);
 	assert.equal(guard.reminders().length, 0, "sendMessage must not run inside tool_call");
 	assert.equal(guard.queued.length, 1);
@@ -479,6 +482,100 @@ test("parent tool_call observes reads and does not block or rewrite bash", async
 		else process.env.PI_SUBAGENT_CHILD = previous.child;
 		if (previous.role === undefined) delete process.env[CHILD_ROLE_ENV];
 		else process.env[CHILD_ROLE_ENV] = previous.role;
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("harness: N read-like calls notify once, dispatch clears the streak, cooldown blocks a second inject", async () => {
+	const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const path = await import("node:path");
+	const herdrSubagents = (await import("../../index.ts")).default;
+	const { FakeSupervisor } = await import("../helpers/fake-supervisor.ts");
+	const threshold = 4;
+	const dir = mkdtempSync(path.join(tmpdir(), "scout-guard-harness-"));
+	const previous = {
+		agentDir: process.env.PI_CODING_AGENT_DIR,
+		child: process.env.PI_SUBAGENT_CHILD,
+		role: process.env[CHILD_ROLE_ENV],
+		utility: process.env.PI_SUBAGENT_UTILITY_CHILD,
+	};
+	try {
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({
+			subagents: { scoutGuard: { enabled: true, threshold, cooldownMs: 120_000 } },
+		}));
+		process.env.PI_CODING_AGENT_DIR = dir;
+		delete process.env.PI_SUBAGENT_CHILD;
+		delete process.env[CHILD_ROLE_ENV];
+		delete process.env.PI_SUBAGENT_UTILITY_CHILD;
+
+		const sent: Array<{ message: SentMessage; options?: SentOptions }> = [];
+		const events = new Map<string, (event: { toolName: string; input?: unknown }, ctx?: { cwd?: string }) => unknown>();
+		let hookReturned = true;
+		const pi = {
+			registerMessageRenderer() {},
+			registerTool() {},
+			registerCommand() {},
+			sendMessage(message: SentMessage, options?: SentOptions) {
+				assert.equal(hookReturned, true, "followUp must not run inside tool_call");
+				sent.push({ message, options });
+			},
+			events: { emit() {} },
+			on(name: string, handler: unknown) {
+				events.set(name, handler as (event: { toolName: string; input?: unknown }, ctx?: { cwd?: string }) => unknown);
+			},
+		};
+		herdrSubagents(pi as never, { supervisor: new FakeSupervisor() });
+		const handler = events.get("tool_call");
+		assert.equal(typeof handler, "function");
+		const call = (toolName: string, input: unknown) => {
+			hookReturned = false;
+			const result = handler?.({ toolName, input }, { cwd: dir });
+			hookReturned = true;
+			assert.equal(result, undefined);
+		};
+		const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+		const reminders = () => sent.filter((entry) => entry.message.customType === SCOUT_GUARD_NOTIFY_TYPE);
+		const reads: Array<[string, unknown]> = [
+			["grep", { pattern: "TODO" }],
+			["find", { pattern: "*.ts" }],
+			["ls", { path: "src" }],
+			["read", { path: "a.ts" }],
+		];
+		const readAt = (index: number) => {
+			const [toolName, input] = reads[index % reads.length]!;
+			call(toolName, input);
+		};
+
+		for (let index = 0; index < threshold - 1; index += 1) readAt(index);
+		call("subagent", { action: "launch", agent: "scout", task: "survey the tree" });
+		for (let index = 0; index < threshold - 1; index += 1) readAt(index);
+		await flush();
+		assert.equal(reminders().length, 0, "dispatch clears the streak before it reaches N");
+
+		readAt(threshold - 1);
+		assert.equal(reminders().length, 0, "the Nth read only schedules the followUp");
+		await flush();
+		assert.equal(reminders().length, 1);
+		const [reminder] = reminders();
+		assert.ok(reminder);
+		assert.equal(reminder.message.customType, SCOUT_GUARD_NOTIFY_TYPE);
+		assert.equal(reminder.message.display, true);
+		assert.match(reminder.message.content, new RegExp(`连续 ${threshold} 次`));
+		assert.deepEqual(reminder.options, { triggerTurn: true, deliverAs: "followUp" });
+
+		for (let index = 0; index < threshold; index += 1) readAt(index);
+		await flush();
+		assert.equal(reminders().length, 1, "cooldown prevents a second inject");
+	} finally {
+		if (previous.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous.agentDir;
+		if (previous.child === undefined) delete process.env.PI_SUBAGENT_CHILD;
+		else process.env.PI_SUBAGENT_CHILD = previous.child;
+		if (previous.role === undefined) delete process.env[CHILD_ROLE_ENV];
+		else process.env[CHILD_ROLE_ENV] = previous.role;
+		if (previous.utility === undefined) delete process.env.PI_SUBAGENT_UTILITY_CHILD;
+		else process.env.PI_SUBAGENT_UTILITY_CHILD = previous.utility;
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
