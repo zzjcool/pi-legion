@@ -37,7 +37,7 @@ export interface RailInput {
 	nodes: readonly VizNode[];
 	now: number;
 	width: number;
-	/** tok/s over the shared 60s window. */
+	/** Output tok/s over the shared 60s generation window. */
 	rate: number;
 	windowMs?: number;
 	/** Lane scroll position when more agents are live than lanes fit. */

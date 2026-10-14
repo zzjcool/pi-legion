@@ -35,6 +35,11 @@ function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
 }
 
+/** Mutable clock used while folding events; not part of ParsedSession. */
+export interface GenerationClock {
+	awaitingSince?: number;
+}
+
 export function emptyParsedSession(): ParsedSession {
 	return {
 		output: "",
@@ -46,6 +51,7 @@ export function emptyParsedSession(): ParsedSession {
 		toolErrors: 0,
 		lastTurnMissing: false,
 		tornLines: 0,
+		generationMs: 0,
 	};
 }
 
@@ -156,7 +162,8 @@ function currentTurn(parsed: ParsedSession): TurnRecord {
 function applyAssistant(
 	parsed: ParsedSession,
 	message: Record<string, unknown>,
-	timestamp?: number,
+	timestamp: number | undefined,
+	clock: GenerationClock,
 ): void {
 	const turn = currentTurn(parsed);
 	const stopReason = asStopReason(message.stopReason);
@@ -174,6 +181,15 @@ function applyAssistant(
 	});
 	if (timestamp !== undefined) turn.endedAt = timestamp;
 
+	if (
+		timestamp !== undefined &&
+		clock.awaitingSince !== undefined &&
+		timestamp >= clock.awaitingSince
+	) {
+		parsed.generationMs += timestamp - clock.awaitingSince;
+	}
+	clock.awaitingSince = undefined;
+
 	accumulateUsage(parsed.usage, message);
 	if (typeof message.model === "string") parsed.model = message.model;
 	if (stopReason) parsed.stopReason = stopReason;
@@ -184,6 +200,8 @@ function applyAssistant(
 function applyToolResult(
 	parsed: ParsedSession,
 	message: Record<string, unknown>,
+	timestamp: number | undefined,
+	clock: GenerationClock,
 ): void {
 	const turn = parsed.turns.at(-1);
 	if (!turn) return;
@@ -192,6 +210,8 @@ function applyToolResult(
 		turn.toolErrors += 1;
 		parsed.toolErrors += 1;
 	}
+	// Tool completion starts the next generation window (model resumes).
+	if (timestamp !== undefined) clock.awaitingSince = timestamp;
 }
 
 /**
@@ -202,6 +222,7 @@ function applyToolResult(
 export function parseSessionText(text: string): ParsedSession {
 	const parsed = emptyParsedSession();
 	if (!text) return parsed;
+	const clock: GenerationClock = {};
 
 	for (const raw of text.split("\n")) {
 		const line = raw.trim();
@@ -212,7 +233,7 @@ export function parseSessionText(text: string): ParsedSession {
 			parsed.tornLines += 1;
 			continue;
 		}
-		applyEvent(parsed, event);
+		applyEvent(parsed, event, clock);
 	}
 
 	const last = parsed.turns.at(-1);
@@ -255,6 +276,7 @@ function decodeEvent(line: string): Record<string, unknown> | null {
 function applyEvent(
 	parsed: ParsedSession,
 	event: Record<string, unknown>,
+	clock: GenerationClock,
 ): void {
 	if (event.type === "model_change") {
 		const model =
@@ -265,6 +287,7 @@ function applyEvent(
 	if (event.type !== "message") return;
 	const message = event.message as Record<string, unknown> | undefined;
 	if (!message || typeof message !== "object") return;
+	const ts = messageTimestamp(event, message);
 
 	switch (message.role) {
 		case "user":
@@ -273,17 +296,17 @@ function applyEvent(
 				assistants: [],
 				toolResults: 0,
 				toolErrors: 0,
-				...(messageTimestamp(event, message) !== undefined
-					? { startedAt: messageTimestamp(event, message) }
-					: {}),
+				...(ts !== undefined ? { startedAt: ts } : {}),
 			});
+			// User prompt opens a generation window.
+			if (ts !== undefined) clock.awaitingSince = ts;
 			break;
 		case "assistant":
-			applyAssistant(parsed, message, messageTimestamp(event, message));
+			applyAssistant(parsed, message, ts, clock);
 			break;
 		case "toolResult":
 		case "tool":
-			applyToolResult(parsed, message);
+			applyToolResult(parsed, message, ts, clock);
 			break;
 		default:
 			break;
@@ -316,6 +339,8 @@ interface SessionParseState {
 	head: Buffer;
 	boundary: Buffer;
 	parsed: ParsedSession;
+	/** Generation-interval clock; survives across incremental polls. */
+	clock: GenerationClock;
 }
 
 const FINGERPRINT_BYTES = 256;
@@ -346,7 +371,7 @@ export function clearSessionParseCache(): void {
 	sessionParseCache.clear();
 }
 
-function applyLine(parsed: ParsedSession, raw: string): void {
+function applyLine(parsed: ParsedSession, raw: string, clock: GenerationClock): void {
 	const line = raw.trim();
 	if (!line) return;
 	const event = decodeEvent(line);
@@ -354,7 +379,7 @@ function applyLine(parsed: ParsedSession, raw: string): void {
 		parsed.tornLines += 1;
 		return;
 	}
-	applyEvent(parsed, event);
+	applyEvent(parsed, event, clock);
 }
 
 /**
@@ -362,7 +387,14 @@ function applyLine(parsed: ParsedSession, raw: string): void {
  * one chunk plus one (capped) line in memory. Returns the offset just past the
  * last complete line; a trailing partial line is left for the next call.
  */
-function consumeLines(fd: number, start: number, size: number, parsed: ParsedSession, maxLineBytes: number): number {
+function consumeLines(
+	fd: number,
+	start: number,
+	size: number,
+	parsed: ParsedSession,
+	clock: GenerationClock,
+	maxLineBytes: number,
+): number {
 	const chunk = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
 	let pos = start;
 	let consumed = start;
@@ -381,7 +413,7 @@ function consumeLines(fd: number, start: number, size: number, parsed: ParsedSes
 			} else {
 				const piece = chunk.subarray(lineStart, i);
 				const text = pendingBytes ? Buffer.concat([...pending, piece]).toString("utf8") : piece.toString("utf8");
-				applyLine(parsed, text);
+				applyLine(parsed, text, clock);
 			}
 			pending = [];
 			pendingBytes = 0;
@@ -427,11 +459,19 @@ export function parseSessionFile(path: string): ParsedSession {
 		const stat = fs.fstatSync(fd);
 		let state = sessionParseCache.get(path);
 		if (!state || !stillValid(fd, stat, state)) {
-			state = { dev: stat.dev, ino: stat.ino, offset: 0, head: Buffer.alloc(0), boundary: Buffer.alloc(0), parsed: emptyParsedSession() };
+			state = {
+				dev: stat.dev,
+				ino: stat.ino,
+				offset: 0,
+				head: Buffer.alloc(0),
+				boundary: Buffer.alloc(0),
+				parsed: emptyParsedSession(),
+				clock: {},
+			};
 		}
 		const maxLineBytes = resolveSessionMaxLineBytes();
 		const before = state.offset;
-		state.offset = consumeLines(fd, state.offset, stat.size, state.parsed, maxLineBytes);
+		state.offset = consumeLines(fd, state.offset, stat.size, state.parsed, state.clock, maxLineBytes);
 		if (state.offset !== before) Object.assign(state, fingerprint(fd, state.offset));
 		sessionParseCache.delete(path);
 		sessionParseCache.set(path, state);
@@ -443,7 +483,8 @@ export function parseSessionFile(path: string): ParsedSession {
 		if (state.offset < stat.size && stat.size - state.offset <= maxLineBytes) {
 			const tail = Buffer.allocUnsafe(stat.size - state.offset);
 			const n = fs.readSync(fd, tail, 0, tail.length, state.offset);
-			applyLine(result, tail.subarray(0, n).toString("utf8"));
+			// Provisional tail must not mutate the cached clock.
+			applyLine(result, tail.subarray(0, n).toString("utf8"), { ...state.clock });
 		}
 		return finalizeParsed(result);
 	} catch {

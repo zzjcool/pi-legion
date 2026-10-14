@@ -22,6 +22,8 @@ const TERMINAL_STATUSES = new Set<NodeStatus>(["settled", "failed", "retired"]);
 export interface TreeNodeSnapshot extends LegionNode {
 	/** Snapshot from legion.db usage table (≤30s granularity). */
 	tokensTotal?: number;
+	/** Output tokens from the usage ledger (for tok/s when session is unavailable). */
+	tokensOut?: number;
 	turn?: number;
 	turns?: number;
 	tools?: readonly string[];

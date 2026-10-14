@@ -1137,6 +1137,10 @@ function statusEntryFromJob(
 		...(live.usageTotal
 			? { tokensTotal: live.usageTotal }
 			: node?.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
+		...(live.tokensOut
+			? { tokensOut: live.tokensOut }
+			: node?.tokensOut ? { tokensOut: node.tokensOut } : {}),
+		...(live.generationMs ? { generationMs: live.generationMs } : {}),
 		...(identity ? {
 			nodeId: identity.nodeId,
 			parentId: identity.parentId,
@@ -1161,6 +1165,7 @@ function statusEntryFromNode(
 		...(node.kind ? { kind: node.kind } : {}),
 		...(node.model ? { model: node.model } : {}),
 		...(node.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
+		...(node.tokensOut ? { tokensOut: node.tokensOut } : {}),
 		...(activity?.turn !== undefined ? { turns: activity.turn } : {}),
 		...(activity?.turnStartedAt !== undefined ? { currentTurnStartedAt: activity.turnStartedAt } : {}),
 		...(activity?.tools.length ? { lastTools: activity.tools } : {}),

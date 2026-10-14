@@ -44,6 +44,7 @@ test("progressFromSession: turns and in-flight tools come from the last assistan
 		turns: 1,
 		lastTools: ["edit"],
 		usageTotal: 24,
+		tokensOut: 4,
 	});
 });
 
@@ -76,6 +77,8 @@ test("progressFromSession: in-flight turn exposes its start timestamp", () => {
 		lastTools: ["bash"],
 		currentTurnStartedAt: 10_000,
 		usageTotal: 24,
+		tokensOut: 4,
+		generationMs: 2_000,
 	});
 });
 
@@ -106,7 +109,9 @@ test("progressFromSession: token usage includes input, cache, and output", () =>
 			}),
 		].join("\n"),
 	);
-	assert.equal(progressFromSession(parsed).usageTotal, 1_000);
+	const live = progressFromSession(parsed);
+	assert.equal(live.usageTotal, 1_000);
+	assert.equal(live.tokensOut, 400);
 });
 
 test("progressFromSession: all-zero token usage stays absent", () => {
@@ -119,7 +124,10 @@ test("progressFromSession: all-zero token usage stays absent", () => {
 			}),
 		].join("\n"),
 	);
-	assert.equal(progressFromSession(parsed).usageTotal, undefined);
+	const live = progressFromSession(parsed);
+	assert.equal(live.usageTotal, undefined);
+	assert.equal(live.tokensOut, undefined);
+	assert.equal(live.generationMs, undefined);
 });
 
 test("mergeProgress: later sources win, empty parts do not clobber", () => {
@@ -127,13 +135,15 @@ test("mergeProgress: later sources win, empty parts do not clobber", () => {
 		mergeProgress(
 			{ model: "launch/model" },
 			{},
-			{ model: "cursor/gpt-4.1", lastTools: ["edit"], turns: 3, usageTotal: 420 },
+			{ model: "cursor/gpt-4.1", lastTools: ["edit"], turns: 3, usageTotal: 420, tokensOut: 80, generationMs: 5_000 },
 		),
 		{
 			model: "cursor/gpt-4.1",
 			lastTools: ["edit"],
 			turns: 3,
 			usageTotal: 420,
+			tokensOut: 80,
+			generationMs: 5_000,
 		},
 	);
 });
@@ -143,4 +153,20 @@ test("mergeProgress: currentTurnStartedAt merges like other fields", () => {
 	assert.equal(merged.currentTurnStartedAt, 5_000);
 	const kept = mergeProgress({ currentTurnStartedAt: 1_000 }, {});
 	assert.equal(kept.currentTurnStartedAt, 1_000);
+});
+
+test("progressFromSession: generationMs sums assistant − user/toolResult intervals", () => {
+	const parsed = parseSessionText(
+		[
+			userMsg("go", { timestamp: 1_000 }),
+			assistantMsg({ stopReason: "toolUse", tools: ["bash"], timestamp: 3_000, usage: { input: 10, output: 100 } }),
+			toolResult({ timestamp: 8_000 }),
+			assistantMsg({ stopReason: "stop", text: "done", timestamp: 10_000, usage: { input: 10, output: 50 } }),
+		].join("\n"),
+	);
+	const live = progressFromSession(parsed);
+	// (3000-1000) + (10000-8000) = 4000; tool gap 3000→8000 excluded
+	assert.equal(live.generationMs, 4_000);
+	assert.equal(live.tokensOut, 150);
+	assert.equal(live.usageTotal, 170);
 });

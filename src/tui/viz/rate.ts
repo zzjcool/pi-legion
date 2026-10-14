@@ -1,10 +1,17 @@
 /**
  * Minimal in-memory token-rate sampling.
  *
- * The ledger only stores cumulative tokens per node, so the runtime records a
- * (timestamp, cumulative tokens) sample for every node on each UI refresh.
- * Every tok/s figure in the UI (railway header, /legion header, chart "now")
- * uses ONE definition: tokens gained over the trailing 60s window / 60.
+ * Every tok/s figure in the UI (railway header, /legion header, chart "now",
+ * tree detail t/s) uses ONE definition:
+ *
+ *   numerator   = Δ cumulative output tokens over the trailing window
+ *   denominator = Δ cumulative generationMs over the same window
+ *                 (falls back to wall-clock window only when generationMs
+ *                  is unavailable / zero for that node)
+ *
+ * generationMs comes from session JSONL: sum of (assistant_ts − prior
+ * user/toolResult_ts). Idle and tool gaps are excluded. Approximate —
+ * usage lands when each assistant message completes, not mid-stream.
  */
 
 import type { VizNode } from "./model.ts";
@@ -16,7 +23,10 @@ const MAX_SAMPLES_PER_NODE = 4096;
 interface Series {
 	role: string;
 	ts: number[];
+	/** Cumulative output tokens. */
 	value: number[];
+	/** Cumulative generation wall ms (parallel to value). */
+	gen: number[];
 }
 
 export interface RateSeries {
@@ -47,30 +57,42 @@ export class RateSampler {
 			if (node.id === "root") continue;
 			let s = this.series.get(node.id);
 			if (!s) {
-				s = { role: node.role, ts: [], value: [] };
+				s = { role: node.role, ts: [], value: [], gen: [] };
 				this.series.set(node.id, s);
 				// A node born after sampling began starts from zero at its spawn time.
 				if (node.startedAt > this.first && node.startedAt < now) {
 					s.ts.push(node.startedAt);
 					s.value.push(0);
+					s.gen.push(0);
 				}
 			}
 			s.role = node.role;
 			const last = s.value[s.value.length - 1];
+			const lastGen = s.gen[s.gen.length - 1];
 			const lastTs = s.ts[s.ts.length - 1];
 			// Cumulative counters never decrease; ignore regressions from stale sources.
-			const value = last === undefined ? node.tokens : Math.max(last, node.tokens);
+			const value = last === undefined ? node.tokensOut : Math.max(last, node.tokensOut);
+			const gen = lastGen === undefined ? node.generationMs : Math.max(lastGen, node.generationMs);
 			if (lastTs !== undefined && now <= lastTs) {
 				s.value[s.value.length - 1] = value;
+				s.gen[s.gen.length - 1] = gen;
 				continue;
 			}
-			if (last !== undefined && value === last && s.value.length >= 2 && s.value[s.value.length - 2] === last) {
+			if (
+				last !== undefined &&
+				value === last &&
+				gen === lastGen &&
+				s.value.length >= 2 &&
+				s.value[s.value.length - 2] === last &&
+				s.gen[s.gen.length - 2] === lastGen
+			) {
 				// Collapse flat runs: move the trailing sample forward.
 				s.ts[s.ts.length - 1] = now;
 				continue;
 			}
 			s.ts.push(now);
 			s.value.push(value);
+			s.gen.push(gen);
 			this.prune(s, now);
 		}
 	}
@@ -83,19 +105,36 @@ export class RateSampler {
 		if (drop > 0) {
 			s.ts.splice(0, drop);
 			s.value.splice(0, drop);
+			s.gen.splice(0, drop);
 		}
 	}
 
-	/** Cumulative tokens at time t (linear between samples, clamped at the ends). */
+	/** Cumulative output tokens at time t (linear between samples, clamped at the ends). */
 	valueAt(nodeId: string, t: number): number {
 		const s = this.series.get(nodeId);
 		if (!s || s.ts.length === 0) return 0;
-		return interpolate(s, t);
+		return interpolate(s.ts, s.value, t);
 	}
 
+	/** Cumulative generationMs at time t. */
+	genAt(nodeId: string, t: number): number {
+		const s = this.series.get(nodeId);
+		if (!s || s.ts.length === 0) return 0;
+		return interpolate(s.ts, s.gen, t);
+	}
+
+	/**
+	 * Output tok/s over the trailing window: ΔtokensOut / (ΔgenerationMs/1000).
+	 * When the node has no generationMs samples in the window, falls back to
+	 * wall-clock window length so a ledger-only path still yields a number.
+	 */
 	nodeRate(nodeId: string, now: number, windowMs = RATE_WINDOW_MS): number {
 		if (windowMs <= 0) return 0;
-		return Math.max(0, (this.valueAt(nodeId, now) - this.valueAt(nodeId, now - windowMs)) / (windowMs / 1000));
+		const dOut = Math.max(0, this.valueAt(nodeId, now) - this.valueAt(nodeId, now - windowMs));
+		if (dOut <= 0) return 0;
+		const dGen = Math.max(0, this.genAt(nodeId, now) - this.genAt(nodeId, now - windowMs));
+		const seconds = dGen > 0 ? dGen / 1000 : windowMs / 1000;
+		return dOut / seconds;
 	}
 
 	totalRate(now: number, windowMs = RATE_WINDOW_MS): number {
@@ -141,7 +180,7 @@ export class RateSampler {
 		const out: number[] = [];
 		for (let i = 0; i < n; i++) {
 			const t = from + (span * (i + 1)) / n;
-			out.push(Math.max(0, (interpolate(s, t) - interpolate(s, t - w)) / (w / 1000)));
+			out.push(this.nodeRate(nodeId, t, w));
 		}
 		return out;
 	}
@@ -152,8 +191,7 @@ export class RateSampler {
 	}
 }
 
-function interpolate(s: Series, t: number): number {
-	const { ts, value } = s;
+function interpolate(ts: number[], value: number[], t: number): number {
 	if (ts.length === 0) return 0;
 	if (t <= ts[0]!) return value[0]!;
 	const last = ts.length - 1;

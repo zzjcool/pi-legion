@@ -12,7 +12,7 @@ export interface ViewData {
 	nodes: readonly VizNode[];
 	sampler: RateSampler;
 	now: number;
-	/** Shared 60s-window tok/s used by every header. */
+	/** Shared output tok/s (ΔtokensOut / ΔgenerationMs over trailing 60s). */
 	rate: number;
 }
 
@@ -100,7 +100,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	const kids = childrenMap(nodes);
 	const roots = kids.get(null) ?? [];
 	const virtualRoot: VizNode | undefined = roots.length === 1 ? undefined : {
-		id: "\u0000center", name: "legion", role: "centurion", parentId: null, depth: 0, status: "running", startedAt: data.now, tokens: 0,
+		id: "\u0000center", name: "legion", role: "centurion", parentId: null, depth: 0, status: "running", startedAt: data.now, tokens: 0, tokensOut: 0, generationMs: 0,
 	};
 	const childrenOf = (node: VizNode): VizNode[] => node === virtualRoot ? roots : kids.get(node.id) ?? [];
 	const center = virtualRoot ?? roots[0]!;
@@ -298,10 +298,10 @@ export function computeStats(data: ViewData, buckets: number): ChartStats {
 		total += node.tokens;
 		roleTotals.set(node.role, (roleTotals.get(node.role) ?? 0) + node.tokens);
 	}
-	const elapsed = Math.max(1, (to - from) / 1000);
 	return {
 		now: data.rate,
-		avg: total / elapsed,
+		// Same definition as header "now", averaged over the chart window.
+		avg: data.sampler.totalRate(to, Math.max(1, to - from)),
 		peak,
 		peakAt,
 		total,

@@ -947,8 +947,10 @@ export class RpcSupervisor implements LegionSupervisor {
 		for (const pid of pids) signal(pid, "SIGTERM");
 
 		await new Promise<void>((resolve) => {
-			const timer = setTimeout(resolve, this.signalTimeoutMs);
-			timer.unref();
+			// NOT unref'd: this timer may be the only thing driving the
+			// caller's await; unref'd it could let the event loop drain
+			// (and node:test abort the test) before the timeout fires.
+			setTimeout(resolve, this.signalTimeoutMs);
 		});
 
 		for (const pgid of pgids) signal(-pgid, "SIGKILL");
@@ -980,8 +982,10 @@ export class RpcSupervisor implements LegionSupervisor {
 				resolve(exited);
 			};
 			const onExit = () => finish(true);
+			// NOT unref'd: retire awaits this timeout to escalate SIGTERM
+			// to SIGKILL. An unref'd timer lets the event loop drain first,
+			// so node:test cancels the wait and the signal is never sent.
 			const timer = setTimeout(() => finish(false), timeoutMs);
-			timer.unref?.();
 			process.once("exit", onExit);
 			if (processHasExited(process)) finish(true);
 		});
