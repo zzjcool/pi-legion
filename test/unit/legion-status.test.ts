@@ -107,6 +107,41 @@ test("legion status name matches renderLiveChildStatus, including a stale live c
 	});
 });
 
+test("legion status highlights alive · quiet before execution snapshot", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = `${dir}/worker-0.jsonl`;
+		writeFileSync(sessionFile, "{\"type\":\"message\"}\n");
+		const now = Date.now();
+		utimesSync(sessionFile, new Date(now - 90_000), new Date(now - 90_000));
+		const facts: LegionChildStatusFacts = {
+			name: "worker-0",
+			state: "working",
+			agent: "worker",
+			kind: "pi",
+			sessionFile,
+			execution: {
+				status: "running",
+				reason: "collect deadline (cumulative since launch) exceeded; child still alive",
+			},
+			acceptance: { status: "unknown", level: "none" },
+			alive: true,
+		};
+		const report = renderLegionStatus({
+			query: "worker-0",
+			nodes: [],
+			lookupChild: () => facts,
+			now,
+		});
+		assert.equal(report.ok, true);
+		assert.equal(report.text, renderLiveChildStatus({ ...facts, now }));
+		const lines = report.text.split("\n");
+		assert.equal(lines[0], "worker-0 — state=working agent=worker kind=pi");
+		assert.match(lines[1]!, /^alive · quiet \d+s$/);
+		assert.ok(report.text.indexOf("alive · quiet") < report.text.indexOf("execution snapshot:"));
+		assert.match(report.text, /execution snapshot: running \(collect deadline/);
+	});
+});
+
 test("legion status falls back to the tree node when no child record exists", () => {
 	const worker = node({
 		id: "root.worker-0",
@@ -208,7 +243,8 @@ test("/legion status sends chat text outside TUI and completes names", async () 
 	assert.match(messages.at(-1) ?? "", /root\.worker-0 role=worker status=running/);
 	await command.handler("status worker-0", ctx);
 	assert.match(messages.at(-1) ?? "", /worker-0 — state=working agent=worker kind=pi/);
-	assert.match(messages.at(-1) ?? "", /execution: running/);
+	assert.match(messages.at(-1) ?? "", /alive · quiet/);
+	assert.match(messages.at(-1) ?? "", /execution snapshot: running/);
 	await command.handler("status missing", ctx);
 	assert.match(notes.at(-1) ?? "", /Unknown Legion node "missing"/);
 });

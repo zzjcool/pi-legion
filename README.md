@@ -140,10 +140,14 @@ snapshot of the same tree:
   (`id role=… status=… phase=… model=… depth=…`), plus a count of each status.
   Live jobs that are not in the tree yet are listed under that summary.
 - `/legion status <name>` prints one node with the same text as
-  `subagent({ action: "status", name })`: state, session file, execution,
-  acceptance, and how long that session file has been quiet. A run-store child
-  record supplies those fields; a ledger-only node still uses the same
-  renderer with the fields the tree has.
+  `subagent({ action: "status", name })`. Living children lead with
+  `alive · quiet Ns` (session JSONL mtime), then demote the run-store
+  execution/acceptance fields as snapshots so an old collect-deadline or
+  connection blip does not look like the current verdict. A ledger-only node
+  still uses the same renderer with the fields the tree has.
+- Quiet age is not a heartbeat: there is no child-side progress ping. Minutes
+  of silence can still mean the model is reasoning (especially high-thinking
+  turns). Quiet alone does not mean the child is stuck; pair it with `alive`.
 - Both forms work outside the TUI. A short name that matches more than one
   node needs the full node id (`/legion status <node-id>`).
 

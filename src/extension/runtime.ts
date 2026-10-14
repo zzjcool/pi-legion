@@ -190,6 +190,16 @@ export function lastJsonlEventAgeMs(sessionFile: string, now: number): number | 
 	}
 }
 
+/**
+ * Lead line for a living child: process is up, session JSONL quiet for N seconds.
+ * `ageMs` undefined means the session file is missing or unreadable.
+ */
+export function formatAliveQuiet(ageMs: number | undefined): string {
+	if (ageMs === undefined) return "alive · quiet unknown";
+	return `alive · quiet ${Math.floor(ageMs / 1000)}s`;
+}
+
+/** @deprecated Prefer {@link formatAliveQuiet}; kept for older call sites. */
 export function formatLastEventAge(ageMs: number): string {
 	return `last event ${Math.floor(ageMs / 1000)}s ago`;
 }
@@ -203,11 +213,12 @@ function persistedSnapshotIsStale(input: LiveChildStatusInput): boolean {
 }
 
 /**
- * Status text for one child.
+ * Status text for one child (`/legion status <name>` and `subagent status`).
  *
- * A living child always reports how long the session JSONL has been quiet.
- * A retired/failed record left behind by a connection blip is not the current
- * state while that process is still alive.
+ * Living children lead with `alive · quiet Ns` so a long silent reasoning
+ * stretch is obvious before any execution/acceptance snapshot. A retired or
+ * failed record left by a connection blip is not treated as current state
+ * while the RPC process is still alive.
  */
 export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const stale = persistedSnapshotIsStale(input);
@@ -217,12 +228,20 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		: input.execution;
 	const lines = [
 		`${input.name} — state=${state} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
+	];
+	if (input.alive) {
+		const age = lastJsonlEventAgeMs(input.sessionFile, input.now ?? Date.now());
+		lines.push(formatAliveQuiet(age));
+	}
+	lines.push(
 		"supervisor=rpc",
 		`session=${input.sessionFile}`,
-	];
+	);
+	// Alive children demote the store snapshot so quiet age stays the eye-catcher.
+	const executionLabel = input.alive ? "execution snapshot" : "execution";
 	if (execution) {
 		lines.push(
-			`execution: ${execution.status}${execution.reason ? ` (${execution.reason})` : ""}`,
+			`${executionLabel}: ${execution.status}${execution.reason ? ` (${execution.reason})` : ""}`,
 		);
 		if (execution.usage) {
 			lines.push(
@@ -231,13 +250,10 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		}
 	}
 	if (!stale && input.acceptance) {
+		const acceptanceLabel = input.alive ? "acceptance snapshot" : "acceptance";
 		lines.push(
-			`acceptance: ${input.acceptance.status}${input.acceptance.level ? ` (${input.acceptance.level})` : ""}`,
+			`${acceptanceLabel}: ${input.acceptance.status}${input.acceptance.level ? ` (${input.acceptance.level})` : ""}`,
 		);
-	}
-	if (input.alive) {
-		const age = lastJsonlEventAgeMs(input.sessionFile, input.now ?? Date.now());
-		if (age !== undefined) lines.push(formatLastEventAge(age));
 	}
 	if (stale) {
 		const persistedExecution = input.execution
