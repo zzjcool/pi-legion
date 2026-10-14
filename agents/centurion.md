@@ -2,9 +2,8 @@
 name: centurion
 description: 百夫长/组长：携带一支团队递归派生的指挥角色，负责冻结契约、调度组员、推进四阶段状态机并整队交付。
 kind: pi
-thinking: max
 allowNestedSubagents: true
-maxSubagentDepth: 2
+maxSubagentDepth: 3
 timeoutMs: 1800000
 worktree: true
 # team: 可选默认队（须真实存在于 settings.teams）；省略 = 全 roster（REV-15）
