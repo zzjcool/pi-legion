@@ -137,6 +137,15 @@ scripts should include a `when: { hasToolResult: true }` rule.
 `model`, `role`, `scenario`. First match wins. Templates in text:
 `{{lastToolContent}}`, `{{role}}`, `{{model}}`, `{{scenario}}`, `{{turnIndex}}`.
 
+## Legion e2e suite
+
+`npm run test:mock-llm` also runs:
+
+- `test/integration/mock-llm-pi-smoke.test.ts` — `pi --print` against the mock
+- `test/integration/railway-mock-e2e.test.ts` — spawn connectors + lockstep scroll
+- `test/integration/mock-llm-legion-e2e.test.ts` — stop one/all + idle Esc, idle hint,
+  auto-doctor on model-miss / memory refuse, verify concurrency ≤ 2
+
 ## Library API
 
 ```ts
