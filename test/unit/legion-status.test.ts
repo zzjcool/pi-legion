@@ -136,9 +136,11 @@ test("legion status highlights alive · quiet before execution snapshot", async 
 		assert.equal(report.text, renderLiveChildStatus({ ...facts, now }));
 		const lines = report.text.split("\n");
 		assert.equal(lines[0], "worker-0 — state=working agent=worker kind=pi");
-		assert.match(lines[1]!, /^alive · quiet \d+s$/);
+		assert.match(lines[1]!, /^alive · quiet \d+s \(living\)$/);
 		assert.ok(report.text.indexOf("alive · quiet") < report.text.indexOf("execution snapshot:"));
-		assert.match(report.text, /execution snapshot: running \(collect deadline/);
+		assert.match(report.text, /^execution snapshot: running$/m);
+		assert.doesNotMatch(report.text, /collect deadline/);
+		assert.ok(report.text.indexOf("execution snapshot:") < report.text.indexOf("supervisor=rpc"));
 	});
 });
 

@@ -190,18 +190,33 @@ export function lastJsonlEventAgeMs(sessionFile: string, now: number): number | 
 	}
 }
 
+/** Quiet age at or above this is treated as a long silent stretch (P2a). */
+export const LONG_QUIET_MS = 30_000;
+
 /**
  * Lead line for a living child: process is up, session JSONL quiet for N seconds.
  * `ageMs` undefined means the session file is missing or unreadable.
+ * Long quiet (>= {@link LONG_QUIET_MS}) adds `(living)` so 「活着但安静」reads first.
  */
 export function formatAliveQuiet(ageMs: number | undefined): string {
 	if (ageMs === undefined) return "alive · quiet unknown";
-	return `alive · quiet ${Math.floor(ageMs / 1000)}s`;
+	const secs = Math.floor(ageMs / 1000);
+	if (ageMs >= LONG_QUIET_MS) return `alive · quiet ${secs}s (living)`;
+	return `alive · quiet ${secs}s`;
 }
 
 /** @deprecated Prefer {@link formatAliveQuiet}; kept for older call sites. */
 export function formatLastEventAge(ageMs: number): string {
 	return `last event ${Math.floor(ageMs / 1000)}s ago`;
+}
+
+/**
+ * Collect-deadline / transient-connection / "still alive" reasons are progress
+ * signals, not verdicts. Showing them next to quiet age steals the eye.
+ */
+export function isAliveProgressSignalReason(reason: string | undefined): boolean {
+	if (!reason) return false;
+	return /still alive|rpc child alive|transient connection/i.test(reason);
 }
 
 function persistedSnapshotIsStale(input: LiveChildStatusInput): boolean {
@@ -212,13 +227,27 @@ function persistedSnapshotIsStale(input: LiveChildStatusInput): boolean {
 	return isTransientConnectionFailure(execution);
 }
 
+function formatExecutionStatusLine(
+	alive: boolean,
+	execution: { status: string; reason?: string },
+): string {
+	const label = alive ? "execution snapshot" : "execution";
+	// Alive + progress-signal reason: status only — quiet age owns the liveness story.
+	if (alive && isAliveProgressSignalReason(execution.reason)) {
+		return `${label}: ${execution.status}`;
+	}
+	return `${label}: ${execution.status}${execution.reason ? ` (${execution.reason})` : ""}`;
+}
+
 /**
  * Status text for one child (`/legion status <name>` and `subagent status`).
  *
  * Living children lead with `alive · quiet Ns` so a long silent reasoning
- * stretch is obvious before any execution/acceptance snapshot. A retired or
- * failed record left by a connection blip is not treated as current state
- * while the RPC process is still alive.
+ * stretch is obvious before any execution/acceptance snapshot. Progress-signal
+ * reasons (collect deadline, transient connection) are omitted from the
+ * snapshot line while alive so they do not steal attention from quiet age.
+ * A retired or failed record left by a connection blip is not treated as
+ * current state while the RPC process is still alive.
  */
 export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const stale = persistedSnapshotIsStale(input);
@@ -233,16 +262,13 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		const age = lastJsonlEventAgeMs(input.sessionFile, input.now ?? Date.now());
 		lines.push(formatAliveQuiet(age));
 	}
-	lines.push(
+	// Quiet age first; path metadata after snapshots so old store lines stay below.
+	const meta = [
 		"supervisor=rpc",
 		`session=${input.sessionFile}`,
-	);
-	// Alive children demote the store snapshot so quiet age stays the eye-catcher.
-	const executionLabel = input.alive ? "execution snapshot" : "execution";
+	];
 	if (execution) {
-		lines.push(
-			`${executionLabel}: ${execution.status}${execution.reason ? ` (${execution.reason})` : ""}`,
-		);
+		lines.push(formatExecutionStatusLine(input.alive, execution));
 		if (execution.usage) {
 			lines.push(
 				`usage: in=${execution.usage.input} out=${execution.usage.output} cost=${execution.usage.cost.toFixed(4)}`,
@@ -255,6 +281,7 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 			`${acceptanceLabel}: ${input.acceptance.status}${input.acceptance.level ? ` (${input.acceptance.level})` : ""}`,
 		);
 	}
+	lines.push(...meta);
 	if (stale) {
 		const persistedExecution = input.execution
 			? `execution=${input.execution.status}${input.execution.reason ? ` (${input.execution.reason})` : ""}`
