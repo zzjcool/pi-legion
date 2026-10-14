@@ -1,7 +1,7 @@
 ---
 name: worker
 description: 实现者：按冻结计划写代码、跑测试，完成后自报 verdict
-tools: read, edit, write, grep, find, ls, bash, subagent, codemode, lens_diagnostics, symbol_search, project_report, module_report, read_symbol, read_enclosing, pi_lens_activate_tools
+tools: read, edit, write, grep, find, ls, bash, subagent, codemode
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
@@ -27,9 +27,8 @@ maxSubagentDepth: 3
 
 ## 工具纪律（读代码的正确姿势）
 
-- 你有 pi-lens 工具：看模块结构用 `module_report`，读单个函数/类的完整源码用 `read_symbol`（比 grep 片段读快且省 token），找符号位置用 `symbol_search`，改完后对涉及文件跑 `lens_diagnostics` 查类型/错误。
 - `grep`/`find` 工具底层就是 ripgrep/fd，优先于 bash 管道。只在需要管道（如 `git diff | grep`）时才用 bash。
-- **禁止对同一文件碎片化 grep 超过 3 次**——超过说明该用 `module_report`/`read_symbol` 整体看了。
+- **禁止对同一文件碎片化 grep 超过 3 次**——超过就用 `read` 把相关段落整段读完。
 - 多个独立的读操作（批量读文件、批量检查）用 `codemode` 的 `Promise.allSettled` 并行发，不要串行。
 
 ## 职责边界

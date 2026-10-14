@@ -339,6 +339,8 @@ itself (guard and nested spawning) and every path listed in the role's
 | `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` | Every child loads all host extensions, as before. |
 | `PI_LEGION_CHILD_EXTENSIONS=/a.ts,/b.ts` | Extra extension paths every child loads explicitly, e.g. a provider extension the child's model needs. |
 
+Bundled planner, reviewer, and worker do not list `lens_*` tools. pi-lens starts an LSP stack (~1 GB per child, #43) and is not part of the default `--no-extensions` child. To give a role those tools, add the tool names to its `tools:` list and point `extensions:` / `subagentOnlyExtensions` (or `PI_LEGION_CHILD_EXTENSIONS`) at the pi-lens extension file. `/legion doctor` reports `ROLE_MISSING_LENS` when a role lists the tools without that path.
+
 ### Child memory controls
 
 | Env | Default | Effect |
