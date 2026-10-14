@@ -105,4 +105,8 @@ jobs:
             exit 1
           fi
           npm install -g npm@^11.15.0
-          npm stage publish
+          if ! npm stage publish; then
+            echo "::error::npm stage publish failed. CI only stages the package and does not put it live. After a successful stage, a maintainer must complete npm 2FA (npm stage approve) to formally publish."
+            exit 1
+          fi
+          echo "Staged only. pi-legion is not live. A maintainer must complete npm 2FA (npm stage approve) to formally publish."
