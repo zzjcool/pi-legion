@@ -358,6 +358,18 @@ itself (guard and nested spawning) and every path listed in the role's
 
 Bundled planner, reviewer, and worker do not list `lens_*` tools. pi-lens starts an LSP stack (~1 GB per child, #43) and is not part of the default `--no-extensions` child. To give a role those tools, add the tool names to its `tools:` list and point `extensions:` / `subagentOnlyExtensions` (or `PI_LEGION_CHILD_EXTENSIONS`) at the pi-lens extension file. `/legion doctor` reports `ROLE_MISSING_LENS` when a role lists the tools without that path.
 
+### Extra agent directories
+
+PATH-style directories scanned for agent `*.md` definitions. They load as
+user-level, **below** the real user agents dir in precedence (a same-name file
+in `~/.pi/agent/agents` still wins). Useful for hermetic installs (Nix store,
+container, read-only mount).
+
+| Env | Effect |
+| --- | --- |
+| `PI_LEGION_EXTRA_AGENT_DIRS` | Canonical name. Colon-/semicolon-separated absolute dirs (`path.delimiter`). |
+| `PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS` | Deprecated compatibility alias (kept for at least one minor version). If **both** are set, `PI_LEGION_EXTRA_AGENT_DIRS` wins and the legacy value is ignored (one stderr warning). |
+
 ### Child memory controls
 
 | Env | Default | Effect |
