@@ -9,15 +9,15 @@
  * vertical remains traceable.
  */
 
+import { formatAgentElapsed } from "../status.ts";
 import { Canvas, ellipsize } from "./canvas.ts";
-import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
+import { formatCount, isAgent, type VizNode } from "./model.ts";
 import { roleColor, type VizTheme } from "./palette.ts";
 
 export const RAIL_MAX_LANES = 4;
 export const RAIL_MAX_LANES_NARROW = 3;
 export const RAIL_NARROW_COLS = 80;
 export const RAIL_WINDOW_MS = 6 * 60 * 1000;
-
 
 /**
  * Map a timestamp onto the shared railway axis.
@@ -268,8 +268,15 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 			const nameW = Math.min(16, longest, Math.max(6, avail - 8));
 			canvas.text(nameX + 2, y, ellipsize(node.name, nameW), col, { bold: true });
 			const room = Math.max(0, avail - nameW - 1);
-			const full = `${node.role} · ${formatDuration(now - node.startedAt)}`;
-			const detail = ellipsize(Array.from(full).length <= room ? full : formatDuration(now - node.startedAt), room);
+			const elapsed = formatAgentElapsed({
+				state: node.status,
+				startedAt: node.startedAt,
+				...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
+				...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
+				...(node.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: node.currentTurnEndedAt } : {}),
+			}, now);
+			const full = `${node.role} · ${elapsed}`;
+			const detail = ellipsize(Array.from(full).length <= room ? full : elapsed, room);
 			canvas.text(nameX + 3 + nameW, y, detail, "dim");
 		}
 		if (overflow) canvas.text(width - overflow.length, y, overflow, "text", { bold: true });

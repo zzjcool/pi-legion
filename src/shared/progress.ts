@@ -10,8 +10,13 @@ export interface LiveProgress {
 	model?: string;
 	turns?: number;
 	lastTools?: string[];
-	/** Unix ms start of the in-flight turn, when the session records it. */
+	/**
+	 * Unix ms start of the latest turn, whether it is still in flight or has
+	 * just settled. Absent when the session did not record a timestamp.
+	 */
 	currentTurnStartedAt?: number;
+	/** Unix ms the latest turn settled. Absent while that turn is still in flight. */
+	currentTurnEndedAt?: number;
 	/** Cumulative input+cache+output (display totals; not used for tok/s). */
 	usageTotal?: number;
 	/** Cumulative output tokens only (numerator for tok/s). */
@@ -33,12 +38,29 @@ export function progressFromSession(parsed: ParsedSession): LiveProgress {
 		...(parsed.model ? { model: parsed.model } : {}),
 		...(parsed.turns.length > 0 ? { turns: parsed.turns.length } : {}),
 		...(lastTools.length > 0 ? { lastTools } : {}),
-		...(turnInFlight && lastTurn?.startedAt !== undefined
-			? { currentTurnStartedAt: lastTurn.startedAt }
-			: {}),
+		...turnClock(lastTurn, turnInFlight),
 		...(total > 0 ? { usageTotal: total } : {}),
 		...(tokensOut > 0 ? { tokensOut } : {}),
 		...(parsed.generationMs > 0 ? { generationMs: parsed.generationMs } : {}),
+	};
+}
+
+/**
+ * In-flight turns expose only a start, so the headline keeps ticking.
+ * A completed turn with both timestamps freezes at `endedAt` until the next
+ * user message replaces the turn. A completed turn missing either timestamp
+ * has nothing to freeze.
+ */
+function turnClock(
+	lastTurn: { startedAt?: number; endedAt?: number } | undefined,
+	turnInFlight: boolean,
+): Pick<LiveProgress, "currentTurnStartedAt" | "currentTurnEndedAt"> {
+	if (lastTurn?.startedAt === undefined) return {};
+	if (turnInFlight) return { currentTurnStartedAt: lastTurn.startedAt };
+	if (lastTurn.endedAt === undefined) return {};
+	return {
+		currentTurnStartedAt: lastTurn.startedAt,
+		currentTurnEndedAt: lastTurn.endedAt,
 	};
 }
 
@@ -55,7 +77,12 @@ export function mergeProgress(...parts: Array<LiveProgress | undefined>): LivePr
 		if (part.model) out.model = part.model;
 		if (part.turns && part.turns > 0) out.turns = part.turns;
 		if (part.lastTools?.length) out.lastTools = part.lastTools;
-		if (part.currentTurnStartedAt !== undefined) out.currentTurnStartedAt = part.currentTurnStartedAt;
+		if (part.currentTurnStartedAt !== undefined) {
+			out.currentTurnStartedAt = part.currentTurnStartedAt;
+			// A later in-flight turn has no end and must clear a frozen one.
+			if (part.currentTurnEndedAt !== undefined) out.currentTurnEndedAt = part.currentTurnEndedAt;
+			else delete out.currentTurnEndedAt;
+		}
 		if (part.usageTotal && part.usageTotal > 0) out.usageTotal = part.usageTotal;
 		if (part.tokensOut && part.tokensOut > 0) out.tokensOut = part.tokensOut;
 		if (part.generationMs && part.generationMs > 0) out.generationMs = part.generationMs;

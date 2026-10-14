@@ -29,6 +29,10 @@ export interface VizNode {
 	 * Denominator for tok/s when > 0.
 	 */
 	generationMs: number;
+	/** Unix ms start of the current turn, when the status entry recorded one. */
+	currentTurnStartedAt?: number;
+	/** Unix ms the current turn settled. Absent while it is still in flight. */
+	currentTurnEndedAt?: number;
 }
 
 /** Same set the footer/busy label treat as active, so live counts agree everywhere. */
@@ -65,6 +69,8 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 			tokens: Math.max(0, entry.tokensTotal ?? 0),
 			tokensOut: Math.max(0, entry.tokensOut ?? 0),
 			generationMs: Math.max(0, entry.generationMs ?? 0),
+			...(entry.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: entry.currentTurnStartedAt } : {}),
+			...(entry.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: entry.currentTurnEndedAt } : {}),
 		});
 	}
 	// Parents that are missing from the snapshot re-attach to the nearest known ancestor.
