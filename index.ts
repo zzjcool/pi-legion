@@ -68,6 +68,7 @@ import {
 import { createIdleEscStop, liveJobs } from "./src/extension/legion-stop.ts";
 import { DEFAULT_FLUSH_MS, DEFAULT_JOIN_MODE } from "./src/extension/join.ts";
 import { registerChildGuard } from "./src/extension/child-guard.ts";
+import { registerScoutGuard } from "./src/extension/scout-guard.ts";
 import { ALLOW_NESTED_ENV } from "./src/extension/budget.ts";
 import {
 	applyOnBlockedPolicy,
@@ -744,6 +745,17 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	if (isChild && !allowNested) {
 		pi.on("session_shutdown", shutdownRetireAll);
 		return;
+	}
+	// #17: main session only. Children (PI_SUBAGENT_ROLE / PI_SUBAGENT_CHILD)
+	// must not count their own reads or inject this reminder. Nested children
+	// also have isChild set, so they skip this even though they continue below.
+	if (!isChild) {
+		registerScoutGuard(pi, {
+			loadSettings: (cwd) => loadSubagentSettings({
+				userSettingsPath: path.join(getAgentDir(), "settings.json"),
+				projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
+			}),
+		});
 	}
 	// The parent transcript records every finish; the renderer keeps a
 	// completed child to one line so visibility does not cost a screen.
