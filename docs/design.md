@@ -654,10 +654,11 @@ system prompt 不再注入 playbook/roster；bash 派发 guard 放行手动 herd
 ### 6.4.1 Scout guard `subagents.scoutGuard`
 
 只在主会话生效（子进程带 `PI_SUBAGENT_ROLE`，不计数、不注入）。连续 N 次
-读类工具调用（`read`，以及可判定为只读的 bash：`cat`/`head`/`tail`/`less`/
-`rg`/`grep`/`find`/`ls`/`stat`/`wc`/`file`/`jq`、`git show|log|diff|status|blame`、
-不带 `-i` 的 `sed`）且中间没有成功的 `subagent` / `vexillatio` 派发时，异步
-注入一条 follow-up 提醒，不挡住当前 `tool_call`。
+读类工具调用（first-class `read`/`grep`/`find`/`ls`，以及可判定为只读的 bash：
+`cat`/`head`/`tail`/`less`/`rg`/`grep`/`find`/`ls`/`stat`/`wc`/`file`/`jq`、
+`git show|log|diff|status|blame`、不带 `-i` 的 `sed`）且中间没有成功的
+`subagent` / `vexillatio` 派发时，异步注入一条 follow-up 提醒，不挡住当前
+`tool_call`。
 
 ```json
 { "subagents": { "scoutGuard": { "enabled": true, "threshold": 8, "cooldownMs": 120000 } } }
