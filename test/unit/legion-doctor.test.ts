@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import {
 	DOCTOR_SECTIONS,
+	LEGION_SLASH_HELP_LINES,
 	expectedModelsFromSettings,
 	parseDoctorSections,
 	parseListModels,
@@ -133,6 +134,12 @@ test("doctor flags CHILD_NO_MODELS and covers all sections", () => {
 		assert.match(report.text, /## Spawn/);
 		assert.match(report.text, /## Memory/);
 		assert.match(report.text, /## Tools \/ commands/);
+		for (const line of LEGION_SLASH_HELP_LINES) {
+			assert.ok(report.text.includes(line), `doctor slash list missing: ${line}`);
+		}
+		assert.match(report.text, /\/scout-guard \| \/no-scout-guard/);
+		assert.match(report.text, /\/legion on \| \/legion off/);
+		assert.match(report.text, /\/legion status \[name\]/);
 		assert.match(report.text, /## Storage \/ hygiene/);
 		assert.match(report.text, /## Session \/ runtime/);
 		assert.match(report.text, /## Next steps/);

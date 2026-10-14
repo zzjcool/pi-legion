@@ -29,6 +29,7 @@ import {
 	type AgentsCommandDeps,
 } from "../../src/extension/slash.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
+import { LEGION_SLASH_HELP_LINES } from "../../src/extension/legion-doctor.ts";
 
 interface SentMessage {
 	customType: string;
@@ -427,7 +428,7 @@ test("renderAgentsListing: alias and unenforced fields are surfaced", () => {
 // ────────────────────── command wiring (real factory) ──────────────────────
 
 test("/legion is the management command; scout-guard is a separate session pair", async () => {
-	await withSandbox({ settings: { teams: { frontend: { members: ["worker"] } } } }, async ({ pi }) => {
+	await withSandbox({ settings: { teams: { frontend: { members: ["worker"] } } } }, async ({ pi, projectRoot }) => {
 		const command = findCommand(pi);
 		// #57 folded the old /subagents-* commands into /legion. #17 keeps
 		// /scout-guard and /no-scout-guard as their own session overrides.
@@ -435,7 +436,7 @@ test("/legion is the management command; scout-guard is a separate session pair"
 		assert.ok(command.description?.includes("manage teams"));
 		const emptyPrefixCompletions = command.getArgumentCompletions?.("");
 		assert.ok(Array.isArray(emptyPrefixCompletions));
-		for (const name of ["team", "agents", "on", "off", "summary", "help", "doctor", "stop"]) {
+		for (const name of ["team", "agents", "on", "off", "summary", "status", "help", "doctor", "stop"]) {
 			assert.ok(emptyPrefixCompletions.some((item: { value: string }) => item.value === name), `${name} is offered for an empty prefix`);
 		}
 		assert.deepEqual(command.getArgumentCompletions?.("agents "), [
@@ -470,6 +471,17 @@ test("/legion is the management command; scout-guard is a separate session pair"
 		const help = pi.messages.at(-1)?.content;
 		assert.match(help ?? "", /\/legion team/);
 		assert.match(help ?? "", /\/legion summary/);
+		for (const line of LEGION_SLASH_HELP_LINES) {
+			assert.ok(help?.includes(line), `help missing: ${line}`);
+		}
+		await command.handler("status", {
+			cwd: projectRoot,
+			mode: "headless",
+			hasUI: false,
+			ui: { notify() {} },
+		} as never);
+		assert.match(pi.messages.at(-1)?.content ?? "", /Legion status · 0 nodes/);
+		assert.match(pi.messages.at(-1)?.content ?? "", /No legion nodes/);
 		await command.handler("team list", {
 			cwd: process.cwd(),
 			hasUI: false,

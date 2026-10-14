@@ -88,6 +88,8 @@ subagent({ agent: "scout", task: "Map the export code path and report relevant f
 
 No manual child-process launch is needed. Use `/legion` to inspect the tree;
 see [Three-layer visualization](#three-layer-visualization) for navigation.
+`/legion status` prints that tree in the chat, and `/legion status <name>`
+prints one node — see [Status](#status-legion-status).
 
 The `subagent` control actions include event-driven `wait` and graceful `stop`:
 `subagent({ action: "wait", name: "worker-0" })` returns as soon as the child
@@ -117,6 +119,22 @@ parent retires its own subtree on shutdown):
 While the main agent is idle and subagents are live, the railway header shows
 a dim `esc stop all · /legion stop [name]` hint (shortened on narrow terminals,
 hidden while the main agent is working).
+
+### Status (`/legion status`)
+
+The railway and `/legion` view are TUI surfaces. `/legion status` is the chat
+snapshot of the same tree:
+
+- `/legion status` prints every node with the same lines as `legion_tree`
+  (`id role=… status=… phase=… model=… depth=…`), plus a count of each status.
+  Live jobs that are not in the tree yet are listed under that summary.
+- `/legion status <name>` prints one node with the same text as
+  `subagent({ action: "status", name })`: state, session file, execution,
+  acceptance, and how long that session file has been quiet. A run-store child
+  record supplies those fields; a ledger-only node still uses the same
+  renderer with the fields the tree has.
+- Both forms work outside the TUI. A short name that matches more than one
+  node needs the full node id (`/legion status <node-id>`).
 
 ## Legion tools and phases
 
@@ -301,7 +319,7 @@ Coverage:
 | models | Host vs child model lists, which package restores providers, team/roster gaps |
 | spawn | Sample child argv, recent spawn failures + stderr, nested-spawn flags |
 | memory | Free RAM, memory gate, child V8 flags, verify concurrency slots in use |
-| tools | `/legion` commands, stop / idle-Esc / strip hints, tool names |
+| tools | `/legion` slash list (status, team, agents, summary, on/off, scout-guard, doctor, stop), idle-Esc / strip hints, tool names |
 | storage | `legion.db` sizes, orphan `rpc-child-*` temps, last hygiene sweep marker |
 | runtime | Live children, tree statuses, acceptance-ish / active nodes |
 
