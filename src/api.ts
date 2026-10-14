@@ -94,41 +94,16 @@ export type { ActiveTeam } from "./agents/teams.ts";
 export type { LoadSettingsOptions } from "./agents/settings.ts";
 export { getAgentDir } from "./agents/paths.ts";
 
-// ── model profiles (cheap / medium / strong) ────────────────────────────────
-export {
-	TIER_AGENTS,
-	agentsForRoleTier,
-	buildClassificationContext,
-	buildProfileFile,
-	classifyModel,
-	filterDominatedModels,
-	inferProfileBand,
-	pickTierModels,
-} from "./profiles/classify.ts";
-export type {
-	ProfileKind,
-	RecommendedRoleTier,
-	SubagentProfileFile,
-} from "./profiles/classify.ts";
-export {
-	DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
-	PROFILES_DIR_NAME,
-	applySubagentProfile,
-	checkSubagentProfile,
-	generateProfilesForProvider,
-	listSubagentProfiles,
-	readSubagentProfile,
-	refreshProviderModelCatalog,
-	resolveProfilePaths,
-} from "./profiles/profiles.ts";
 export {
 	parseTeamCommandArgs,
-	registerProfileCommands,
-	registerTeamCommand,
+	createAgentsCommand,
+	createTeamCommand,
+	createToggleCommand,
 	renderTeamStatus,
 	sendSlashText,
 	updateSubagentSettingsFile,
 } from "./extension/slash.ts";
+export type { LegionSubcommand } from "./extension/slash.ts";
 export {
 	aggregateSubagentRuns,
 	formatSubagentSummary,
@@ -136,7 +111,6 @@ export {
 	formatTokens,
 	formatCost,
 	formatDuration,
-	registerSummaryCommand,
 	summaryRole,
 } from "./extension/summary.ts";
 export type {

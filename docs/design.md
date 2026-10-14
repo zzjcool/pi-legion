@@ -584,7 +584,7 @@ preset 规则：
   （`src/agents/step-model.ts`），只在该步骤确实引用了 preset 时生效
 - **响亮失败**：引用了未定义的 preset 是错误（列出已定义的 preset），绝不静默
   回退到父会话模型。报错会指明 model 的真实来源，不把责任误归于 preset
-- preset 刻意高于 agentOverrides：profile 通过 agentOverrides 钉死角色模型（`loadCatalog`
+- preset 刻意高于 agentOverrides：通过 `agentOverrides` 钉死的角色模型（`loadCatalog`
   会先把它们折进 `agent.model`），若 preset 放在 frontmatter 同级则对它不可达。
   未引用 preset 的 agent 行为不变
 - 解析逻辑抽到 `src/agents/step-model.ts`（纯函数，便于单测）
@@ -636,41 +636,21 @@ Team selection is resolved as `PI_SUBAGENTS_TEAM` > `subagents.team` >
 string/object members, with `*` expanding all roles once and later object
 members applying the normal agent-override fields. Project team entries replace
 same-named user entries. Non-default team names are passed to child pane/tab
-processes as `PI_SUBAGENTS_TEAM`; `/subagents-team` manages project or user
+processes as `PI_SUBAGENTS_TEAM`; `/legion team` manages project or user
 settings.
 
 ### 6.4 总开关 `subagents.enabled`
 
-解析顺序：会话内覆盖（`/subagents-toggle`，仅内存，`/reload` 后回落） >
+解析顺序：会话内覆盖（`/legion on|off`，仅内存，`/reload` 后回落） >
 项目 `.pi/settings.json` > 用户 `~/.pi/agent/settings.json` > 默认 `true`。
+旧 toggle 的 `flip` 与无参数 `show` 用法已由显式 `/legion on` 或
+`/legion off` 取代；每次执行后都会显示最终状态。
 
-关闭后：launch 拒绝（`DISABLED` 错误码，指向 `/subagents-toggle on`）；
+关闭后：launch 拒绝（`DISABLED` 错误码，指向 `/legion on`）；
 system prompt 不再注入 playbook/roster；bash 派发 guard 放行手动 herdr
 命令。已有 children 不受影响——正常完成并通知，`status`/`collect`/
 `wait`/`resume`/`steer` 继续可用。
 
-### 6.4 模型档位 profile（对齐 pi-subagents）
-
-角色不写死供应商模型。按 **cheap / medium / strong** 三档绑定：
-
-| 档 | 角色 |
-| --- | --- |
-| cheap | scout, prototype |
-| medium | planner |
-| strong | worker, reviewer, designer |
-
-（advisor 为 cursor kind 自带模型，不参与 pi 档位。）
-
-流程：`/subagents-refresh-provider-models` 拉供应商目录 →
-`/subagents-generate-profiles` 写出 `<provider>.quota`（偏省）和
-`<provider>.quality`（偏强）→ `/subagents-load-profile` 写入
-`~/.pi/agent/settings.json` 的 `agentOverrides`。
-
-Profile 文件在 `~/.pi/agent/profiles/pi-legion/`。加载只替换
-`agentOverrides`（以及 profile 里显式带的 `subagents` 键），`modelScope` /
-`herdr` 等其它设置保留。项目 `.pi/settings.json` 覆盖用户设置。
-
----
 
 ## 7. 借鉴 pi-subagents：三类处理
 

@@ -78,13 +78,6 @@ import {
 	SUBAGENT_NOTIFY_TYPE,
 } from "./src/extension/notify.ts";
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
-import {
-	registerProfileCommands,
-	registerAgentsCommand,
-	registerTeamCommand,
-	registerToggleCommand,
-} from "./src/extension/slash.ts";
-import { registerSummaryCommand } from "./src/extension/summary.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
 import { expectedModelsFromSettings, runLegionDoctor } from "./src/extension/legion-doctor.ts";
@@ -634,7 +627,7 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 					return ok("interrupted (parent turn aborted)");
 				}
 				if (!subagentsEnabled(ctx.cwd)) {
-					return fail("subagents are disabled (subagents.enabled: false or /subagents-toggle off). Re-enable with /subagents-toggle on.", ErrorCodes.DISABLED);
+					return fail("subagents are disabled (subagents.enabled: false or /legion off). Re-enable with /legion on.", ErrorCodes.DISABLED);
 				}
 				const runtime = sessionRuntime;
 				if (!runtime) return fail("session runtime is not initialized", ErrorCodes.INVALID_PARAMS);
@@ -689,7 +682,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	}
 	let lastUi: ExtensionUIContext | undefined;
 	let statusNodeOpener: ((nodeId: string) => void) | undefined;
-	let lastModelRegistry: ExtensionContext["modelRegistry"] | undefined;
 	let lastConfirm: ((message: string) => Promise<boolean>) | undefined;
 	// turn_start/turn_end maintain this so a flush window can wait out a
 	// busy parent instead of queueing behind the whole turn (join extends
@@ -757,10 +749,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 	// completed child to one line so visibility does not cost a screen.
 	pi.registerMessageRenderer(SUBAGENT_NOTIFY_TYPE, renderSubagentNotice);
 
-	registerProfileCommands(pi, {
-		getModelRegistry: () => lastModelRegistry,
-	});
-	registerSummaryCommand(pi);
 	// User stop controls (/legion stop, idle Esc, `x` in /legion): a thin wrapper
 	// over the subagent tool's `stop` action — graceful retire of tracked children.
 	const stopChildren = async (params: { name?: string; all?: boolean }): Promise<{ ok: boolean; text: string }> => {
@@ -776,11 +764,36 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		runtime.refreshUi();
 		return { ok: !details?.error, text };
 	};
+	const commandCatalogLoader = (input: {
+		sessionCwd: string;
+		runCwd: string;
+		scope: AgentScope | undefined;
+	}) => loadCatalog(input.sessionCwd, input.runCwd, input.scope);
 	const liveOverlayController = registerLegionCommand(pi, {
 		bus: legionBus,
 		runtime,
 		supervisor: rpcEventSource,
 		stop: stopChildren,
+		commands: {
+			team: { loadCatalog: commandCatalogLoader },
+			agents: { loadCatalog: commandCatalogLoader },
+			toggle: {
+				sessionEnabled: () => subagentsEnabled(lastCwd),
+				setSessionEnabled: (enabled) => {
+					sessionEnabledOverride = enabled;
+				},
+				settingsEnabled: (cwd) =>
+					loadSubagentSettings({
+						userSettingsPath: path.join(getAgentDir(), "settings.json"),
+						projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
+					}).enabled !== false,
+				runningChildren: () =>
+					runtime
+						.activeJobs()
+						.filter((job) => job.state === "working" || job.state === "blocked")
+						.length,
+			},
+		},
 	});
 	statusNodeOpener = createStatusNodeOpener(
 		pi,
@@ -789,37 +802,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 		() => lastCwd,
 		(ui, nodeId) => void confirmAndStopNode(ui, { runtime, stop: stopChildren }, nodeId),
 	);
-
-	// ── Master switch ────────────────────────────────────────────────────
-	registerToggleCommand(pi, {
-		sessionEnabled: () => subagentsEnabled(lastCwd),
-		setSessionEnabled: (enabled) => {
-			sessionEnabledOverride = enabled;
-		},
-		settingsEnabled: (cwd) =>
-			loadSubagentSettings({
-				userSettingsPath: path.join(getAgentDir(), "settings.json"),
-				projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
-			}).enabled !== false,
-		runningChildren: () =>
-			runtime
-				.activeJobs()
-				.filter((job) => job.state === "working" || job.state === "blocked")
-				.length,
-	});
-
-	// The human-facing roster: what the model gets injected into its system
-	// prompt each turn, but on demand and with resolved models. The catalog
-	// loading is the same function the tool uses, so the two listings cannot
-	// drift apart. Re-loads on every invocation — cheap (a few stat+read calls)
-	// and always fresh after an agent file is edited.
-	const commandCatalogLoader = (input: {
-		sessionCwd: string;
-		runCwd: string;
-		scope: AgentScope | undefined;
-	}) => loadCatalog(input.sessionCwd, input.runCwd, input.scope);
-	registerAgentsCommand(pi, { loadCatalog: commandCatalogLoader });
-	registerTeamCommand(pi, { loadCatalog: commandCatalogLoader });
 
 	pi.registerTool({
 		name: "subagent",
@@ -848,8 +830,8 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			// disable with live children remains observable and collectable.
 			if (!subagentsEnabled(ctx.cwd) && (action === "launch" || !action)) {
 				return fail(
-					"subagents are disabled (subagents.enabled: false or /subagents-toggle off). " +
-						"Existing children are unaffected; re-enable with /subagents-toggle on.",
+					"subagents are disabled (subagents.enabled: false or /legion off). " +
+						"Existing children are unaffected; re-enable with /legion on.",
 					ErrorCodes.DISABLED,
 				);
 			}
@@ -999,7 +981,6 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 			escUi = ctx.ui;
 			escUnsubscribe = ctx.ui.onTerminalInput(idleEscStop);
 		}
-		lastModelRegistry = ctx.modelRegistry;
 		lastUi = ctx.hasUI ? ctx.ui : undefined;
 		if (ctx.cwd) lastCwd = ctx.cwd;
 		runtime.bind(ctx);
@@ -1061,13 +1042,13 @@ export default function herdrSubagents(pi: ExtensionAPI, deps: ExtensionSupervis
 /**
  * Load the effective agent catalog for a request.
  *
- * User settings (`~/.pi/agent/settings.json`, including a loaded profile) merge
+ * User settings (`~/.pi/agent/settings.json`) merge
  * with project `.pi/settings.json`. Agent directories are resolved from the
  * run's `cwd`. Bundled roles are included unless `subagents.disableBuiltins`
  * opts out.
  *
  * Also returns the discovery directories, for listings that tell the user
- * WHERE the roles came from (the /subagents-agents command).
+ * WHERE the roles came from (the /legion agents command).
  */
 export function loadCatalog(
 	sessionCwd: string,
@@ -1781,7 +1762,7 @@ export function unknownAgentLine(
 ): string {
 	const available = agents.map((a) => a.name).join(", ") || "none";
 	if (teamName) {
-		return `✗ unknown agent "${requested}" in team "${teamName}". Available: ${available}. Switch with /subagents-team use ${teamName} (or "default").`;
+		return `✗ unknown agent "${requested}" in team "${teamName}". Available: ${available}. Switch with /legion team use ${teamName} (or "default").`;
 	}
 	return `✗ unknown agent "${requested}". Available: ${available}`;
 }

@@ -24,11 +24,10 @@ import {
 } from "../../src/agents/settings.ts";
 import {
 	parseTeamCommandArgs,
-	registerTeamCommand,
+	createTeamCommand,
 	renderAgentsListing,
 	updateSubagentSettingsFile,
 } from "../../src/extension/slash.ts";
-import { readSubagentProfile } from "../../src/profiles/profiles.ts";
 import { formatAgentRoster } from "../../src/agents/agents.ts";
 import {
 	loadCatalog,
@@ -438,7 +437,8 @@ function teamCommandHarness(
 			messages.push(message);
 		},
 	} as never;
-	registerTeamCommand(pi, { loadCatalog: () => catalog });
+	const command = createTeamCommand(pi, { loadCatalog: () => catalog });
+	handler = command.handler;
 	return {
 		messages,
 		notifications,
@@ -484,7 +484,7 @@ test("slash: use/create success messages are exact and environment override is d
 		assert.deepEqual(harness.notifications, []);
 		assert.deepEqual(harness.messages.map((message) => message.content), [
 			`Subagent team set to "frontend" in ${settingsPath}. Environment ${TEAM_ENV} is set and overrides this setting. Next prompt will use it.`,
-			"Created subagent team backend. Select it with /subagents-team use backend",
+			"Created subagent team backend. Select it with /legion team use backend",
 		]);
 		const saved = JSON.parse(readFileSync(settingsPath, "utf8")) as Record<string, any>;
 		assert.deepEqual(saved.keep, { value: true });
@@ -554,7 +554,7 @@ test("slash: --global use/create update temporary user settings only", async () 
 		assert.match(harness.messages[0]?.content ?? "", /in .*\/user-agent-dir\/settings\.json/);
 		assert.equal(
 			harness.messages[1]?.content,
-			"Created subagent team backend. Select it with /subagents-team use backend",
+			"Created subagent team backend. Select it with /legion team use backend",
 		);
 		assert.deepEqual(harness.notifications, []);
 	} finally {
@@ -767,7 +767,7 @@ test("launch refusal: only a real team-filtered role gets team wording", () => {
 			{ name: "frontend", source: "settings" },
 			settings,
 		),
-		'✗ unknown agent "worker" in team "frontend". Available: designer. Switch with /subagents-team use frontend (or "default").',
+		'✗ unknown agent "worker" in team "frontend". Available: designer. Switch with /legion team use frontend (or "default").',
 	);
 	assert.equal(
 		unknownAgentLineForCatalog(
@@ -891,22 +891,6 @@ test("control wait: team-overridden role definition wins over allAgents", async 
 		assert.deepEqual(requests, [{ names: ["worker-existing"], timeoutMs: 17 }]);
 	} finally {
 		runtime.dispose();
-		rmSync(dir, { recursive: true, force: true });
-	}
-});
-
-test("profiles: malformed JSON error includes the file path", () => {
-	const dir = mkdtempSync(path.join(tmpdir(), "teams-profile-json-"));
-	try {
-		const profiles = path.join(dir, "profiles", "pi-legion");
-		mkdirSync(profiles, { recursive: true });
-		const file = path.join(profiles, "broken.json");
-		writeFileSync(file, "{ invalid");
-		assert.throws(
-			() => readSubagentProfile("broken", { agentDir: dir }),
-			new RegExp(`Invalid JSON in '${file.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}'`),
-		);
-	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

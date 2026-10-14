@@ -1,17 +1,6 @@
-/**
- * Slash commands for model profiles (cheap / medium / strong).
- *
- * Same names as pi-subagents so the workflow is familiar:
- *   /subagents-profiles
- *   /subagents-load-profile <name>
- *   /subagents-refresh-provider-models <provider> [--force] [--no-probe]
- *   /subagents-generate-profiles <provider> [--no-probe]
- *   /subagents-check-profile <name> [--no-probe]
- *
- * Plus the human-facing roster listing:
- *   /subagents-agents [user|project|both]
- */
+/** Slash command handlers for the `/legion` command and its subcommands. */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
 	ExtensionAPI,
@@ -23,20 +12,6 @@ import type {
 	AgentScope,
 	SubagentsSettings,
 } from "../shared/types.ts";
-import {
-	applySubagentProfile,
-	checkSubagentProfile,
-	DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
-	generateProfilesForProvider,
-	getProfileWorkerModel,
-	listSubagentProfiles,
-	PROFILES_DIR_NAME,
-	readSubagentProfile,
-	refreshProviderModelCatalog,
-	readSettingsFile,
-	writeJsonFile,
-	type ModelRegistryLike,
-} from "../profiles/profiles.ts";
 import { classifyModelOrigin, resolveStepModel } from "../agents/step-model.ts";
 import { checkModelScope } from "../agents/model-scope.ts";
 import { nativeModelFor } from "../runs/kind.ts";
@@ -50,18 +25,24 @@ import { getAgentDir } from "../agents/paths.ts";
 
 export const SLASH_TEXT_RESULT_TYPE = "subagent-slash-text";
 
+export interface LegionSubcommand {
+	description: string;
+	getArgumentCompletions?: (prefix: string) => Array<{ value: string; label: string }> | null;
+	handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+}
+
 export type TeamCommandArgs =
 	| { action: "show" }
 	| { action: "list" }
 	| { action: "use"; name: string; global: boolean }
 	| { action: "create"; name: string; members: string[]; global: boolean };
 
-/** Pure parser for /subagents-team arguments. */
+/** Pure parser for /legion team arguments. */
 export function parseTeamCommandArgs(
 	args: string,
 ): { ok: true; value: TeamCommandArgs } | { ok: false; message: string } {
 	const usage =
-		"Usage: /subagents-team [list|use <name> [--global]|create <name> a,b,c [--global]]";
+		"Usage: /legion team [list|use <name> [--global]|create <name> a,b,c [--global]]";
 	const trimmed = args.trim();
 	if (!trimmed) return { ok: true, value: { action: "show" } };
 	const tokens = trimmed.split(/\s+/).filter(Boolean);
@@ -92,10 +73,6 @@ export function parseTeamCommandArgs(
 	};
 }
 
-export interface ProfileCommandDeps {
-	getModelRegistry?: () => ModelRegistryLike | undefined;
-}
-
 export function sendSlashText(pi: ExtensionAPI, text: string): void {
 	pi.sendMessage({
 		customType: SLASH_TEXT_RESULT_TYPE,
@@ -117,92 +94,6 @@ async function withSlashStatus<T>(
 	}
 }
 
-export function parseSingleRequiredArg(
-	args: string,
-	usage: string,
-): { ok: true; value: string } | { ok: false; message: string } {
-	const parts = args.trim().split(/\s+/).filter(Boolean);
-	if (parts.length !== 1) return { ok: false, message: usage };
-	const value = parts[0];
-	if (!value) return { ok: false, message: usage };
-	return { ok: true, value };
-}
-
-function stripFlag(
-	args: string,
-	flag: string,
-): { rest: string; present: boolean } {
-	const pattern = new RegExp(`(?:^|\\s)${flag}(?=\\s|$)`);
-	const present = pattern.test(args);
-	return { rest: args.replace(pattern, " ").trim(), present };
-}
-
-export function parseProviderArgs(
-	args: string,
-	usage: string,
-):
-	| { ok: true; provider: string; force: boolean; probe: boolean }
-	| { ok: false; message: string } {
-	let rest = args.trim();
-	const forceA = stripFlag(rest, "--force");
-	rest = forceA.rest;
-	const forceB = stripFlag(rest, "force");
-	rest = forceB.rest;
-	const noProbe = stripFlag(rest, "--no-probe");
-	rest = noProbe.rest;
-	const parsed = parseSingleRequiredArg(rest, usage);
-	if (parsed.ok === false) return parsed;
-	return {
-		ok: true,
-		provider: parsed.value,
-		force: forceA.present || forceB.present,
-		probe: !noProbe.present,
-	};
-}
-
-function parseNamedArgs(
-	args: string,
-	usage: string,
-):
-	| { ok: true; name: string; probe: boolean }
-	| { ok: false; message: string } {
-	const noProbe = stripFlag(args.trim(), "--no-probe");
-	const parsed = parseSingleRequiredArg(noProbe.rest, usage);
-	if (parsed.ok === false) return parsed;
-	return { ok: true, name: parsed.value, probe: !noProbe.present };
-}
-
-function profileCompletions(prefix: string) {
-	if (prefix.includes(" ")) return null;
-	return listSubagentProfiles()
-		.filter((name) => name.startsWith(prefix))
-		.map((name) => ({ value: name, label: name }));
-}
-
-function providerCompletions(
-	prefix: string,
-	getRegistry: ProfileCommandDeps["getModelRegistry"],
-	fallback?: ModelRegistryLike,
-) {
-	if (prefix.includes(" ")) return null;
-	const registry = fallback ?? getRegistry?.();
-	if (!registry) return null;
-	const available = registry.getAvailable();
-	if (!Array.isArray(available)) return null;
-	const providers = [
-		...new Set(
-			available
-				.map((model) =>
-					typeof model?.provider === "string" ? model.provider : "",
-				)
-				.filter(Boolean),
-		),
-	].sort((a, b) => a.localeCompare(b));
-	return providers
-		.filter((provider) => provider.startsWith(prefix))
-		.map((provider) => ({ value: provider, label: provider }));
-}
-
 function notifyError(ctx: ExtensionCommandContext, error: unknown): void {
 	ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 }
@@ -219,272 +110,7 @@ function assertCreatableTeamName(
 	}
 }
 
-async function maybeSwitchSessionModel(
-	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
-	workerModel: string,
-	lines: string[],
-): Promise<void> {
-	if (
-		typeof pi.setModel !== "function" ||
-		typeof ctx.modelRegistry?.find !== "function" ||
-		typeof ctx.modelRegistry?.getAvailable !== "function"
-	) {
-		lines.push(`Profile worker model: ${workerModel}`);
-		return;
-	}
-
-	const shouldSwitch = ctx.hasUI
-		? await ctx.ui.confirm(
-				"",
-				`Profile loaded. Also switch this session to the profile worker model?\n\n${workerModel}`,
-			)
-		: false;
-	if (!shouldSwitch) return;
-
-	const available = ctx.modelRegistry.getAvailable();
-	const match = available.find(
-		(model) => `${model.provider}/${model.id}` === workerModel.split(":")[0],
-	);
-	if (!match) {
-		lines.push(
-			`Could not switch current session model: '${workerModel}' is not available in the current model registry.`,
-		);
-		return;
-	}
-	const model = ctx.modelRegistry.find(match.provider, match.id);
-	if (!model) {
-		lines.push(
-			`Could not switch current session model: '${workerModel}' is not available in the current model registry.`,
-		);
-		return;
-	}
-	const success = await pi.setModel(model);
-	if (success) {
-		lines.push(`Current session model switched to: ${match.provider}/${match.id}`);
-	} else {
-		lines.push(
-			`Could not switch current session model to '${workerModel}': no API key or provider access is available.`,
-		);
-	}
-}
-
-/** Register the five profile slash commands on a Pi extension. */
-export function registerProfileCommands(
-	pi: ExtensionAPI,
-	deps: ProfileCommandDeps = {},
-): void {
-	pi.registerCommand("subagents-profiles", {
-		description: "List saved subagent model profiles",
-		handler: async (_args, _ctx) => {
-			const profiles = listSubagentProfiles();
-			if (profiles.length === 0) {
-				sendSlashText(
-					pi,
-					`Subagent profiles\n\nNo subagent profiles found in ~/.pi/agent/profiles/${PROFILES_DIR_NAME}/`,
-				);
-				return;
-			}
-			sendSlashText(pi, `Subagent profiles\n\n${profiles.join("\n")}`);
-		},
-	});
-
-	pi.registerCommand("subagents-load-profile", {
-		description: "Load a subagent profile into ~/.pi/agent/settings.json",
-		getArgumentCompletions: (prefix) => profileCompletions(prefix),
-		handler: async (args, ctx) => {
-			const parsed = parseSingleRequiredArg(
-				args,
-				"Usage: /subagents-load-profile <name>",
-			);
-			if (parsed.ok === false) {
-				ctx.ui.notify(parsed.message, "error");
-				return;
-			}
-			try {
-				await withSlashStatus(
-					ctx,
-					`Loading profile ${parsed.value}…`,
-					async () => {
-						const { profile } = readSubagentProfile(parsed.value);
-						const workerModel = getProfileWorkerModel(profile);
-						const result = applySubagentProfile(parsed.value);
-						const lines = [
-							`Loaded subagent profile: ${parsed.value}`,
-							`Profile: ${result.filePath}`,
-							`Updated: ${result.settingsPath}`,
-						];
-						if (workerModel) {
-							await maybeSwitchSessionModel(pi, ctx, workerModel, lines);
-						}
-						sendSlashText(pi, lines.join("\n"));
-					},
-				);
-			} catch (error) {
-				notifyError(ctx, error);
-			}
-		},
-	});
-
-	pi.registerCommand("subagents-refresh-provider-models", {
-		description: "Refresh the cached model catalog for one provider",
-		getArgumentCompletions: (prefix) =>
-			providerCompletions(prefix, deps.getModelRegistry),
-		handler: async (args, ctx) => {
-			const parsed = parseProviderArgs(
-				args,
-				"Usage: /subagents-refresh-provider-models <provider> [--force] [--no-probe]",
-			);
-			if (parsed.ok === false) {
-				ctx.ui.notify(parsed.message, "error");
-				return;
-			}
-			try {
-				await withSlashStatus(
-					ctx,
-					`Refreshing provider models for ${parsed.provider}…`,
-					async () => {
-						const result = await refreshProviderModelCatalog(
-							pi,
-							ctx.modelRegistry,
-							parsed.provider,
-							{
-								force: parsed.force,
-								probe: parsed.probe,
-								maxAgeDays: DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
-							},
-						);
-						const lines = [
-							"Provider model catalog",
-							`Provider: ${parsed.provider}`,
-							`Status: ${result.reused ? "fresh cache reused" : "refreshed"}`,
-							`File: ${result.filePath}`,
-							`Models: ${result.catalog.models.length}`,
-							`Refreshed at: ${result.catalog.refreshedAt}`,
-						];
-						if (result.heuristicFallbackCount > 0) {
-							const n = result.heuristicFallbackCount;
-							lines.push(
-								`Warning: ${n} model${n === 1 ? " was" : "s were"} classified with name heuristics fallback.`,
-							);
-						}
-						sendSlashText(pi, lines.join("\n"));
-					},
-				);
-			} catch (error) {
-				notifyError(ctx, error);
-			}
-		},
-	});
-
-	pi.registerCommand("subagents-generate-profiles", {
-		description:
-			"Generate <provider>.quota and <provider>.quality subagent profiles",
-		getArgumentCompletions: (prefix) =>
-			providerCompletions(prefix, deps.getModelRegistry),
-		handler: async (args, ctx) => {
-			const parsed = parseProviderArgs(
-				args,
-				"Usage: /subagents-generate-profiles <provider> [--force] [--no-probe]",
-			);
-			if (parsed.ok === false) {
-				ctx.ui.notify(parsed.message, "error");
-				return;
-			}
-			try {
-				await withSlashStatus(
-					ctx,
-					`Generating profiles for ${parsed.provider}…`,
-					async () => {
-						const result = await generateProfilesForProvider(
-							pi,
-							ctx.modelRegistry,
-							parsed.provider,
-							{
-								maxAgeDays: DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
-								forceRefresh: parsed.force,
-								probe: parsed.probe,
-							},
-						);
-						const lines = [
-							"Generated subagent profiles",
-							`Provider: ${parsed.provider}`,
-							`Catalog: ${result.catalogPath}`,
-							`Quota: ${result.quotaPath}`,
-							`  cheap=${result.quotaModels.cheap}`,
-							`  medium=${result.quotaModels.medium}`,
-							`  strong=${result.quotaModels.strong}`,
-							`Quality: ${result.qualityPath}`,
-							`  cheap=${result.qualityModels.cheap}`,
-							`  medium=${result.qualityModels.medium}`,
-							`  strong=${result.qualityModels.strong}`,
-						];
-						if (result.selectedHeuristicFallbackCount > 0) {
-							const n = result.selectedHeuristicFallbackCount;
-							lines.push(
-								`Warning: generated profiles depend on heuristic-only classification for ${n} selected model${n === 1 ? "" : "s"}.`,
-							);
-						} else if (result.heuristicFallbackCount > 0) {
-							const n = result.heuristicFallbackCount;
-							lines.push(
-								`Warning: provider catalog still contains ${n} heuristic-classified model${n === 1 ? "" : "s"}.`,
-							);
-						}
-						sendSlashText(pi, lines.join("\n"));
-					},
-				);
-			} catch (error) {
-				notifyError(ctx, error);
-			}
-		},
-	});
-
-	pi.registerCommand("subagents-check-profile", {
-		description: "Check whether a saved profile still points to usable models",
-		getArgumentCompletions: (prefix) => profileCompletions(prefix),
-		handler: async (args, ctx) => {
-			const parsed = parseNamedArgs(
-				args,
-				"Usage: /subagents-check-profile <name> [--no-probe]",
-			);
-			if (parsed.ok === false) {
-				ctx.ui.notify(parsed.message, "error");
-				return;
-			}
-			try {
-				await withSlashStatus(
-					ctx,
-					`Checking profile ${parsed.name}…`,
-					async () => {
-						const result = await checkSubagentProfile(
-							pi,
-							ctx.modelRegistry,
-							parsed.name,
-							{ probe: parsed.probe },
-						);
-						const lines = [
-							"Subagent profile check",
-							`Profile: ${result.profileName}`,
-							`File: ${result.filePath}`,
-							"",
-							...result.results.map((entry) => {
-								const probeMsg = entry.probe.message
-									? ` (${entry.probe.message.split(/\r?\n/, 1)[0]})`
-									: "";
-								return `${entry.agent} → ${entry.model} — registry ${entry.inRegistry ? "ok" : "missing"}; probe ${entry.probe.status}${probeMsg}`;
-							}),
-						];
-						sendSlashText(pi, lines.join("\n"));
-					},
-				);
-				} catch (error) {
-				notifyError(ctx, error);
-			}
-		},
-	});
-}
-
-// ── /subagents-agents ───────────────────────────────────────────────────────
+// ── /legion agents ─────────────────────────────────────────────────────────
 
 const AGENT_SCOPES = ["user", "project", "both"] as const;
 
@@ -502,7 +128,7 @@ export function parseAgentsScopeArg(
 }
 
 /**
- * Render the /subagents-agents listing.
+ * Render the /legion agents listing.
  *
  * Pure function of its inputs so tests can drive it directly. `dispatchModel`
  * is the parent session model as `provider/id` (when known) — supplied so the
@@ -699,33 +325,25 @@ export interface TeamCommandDeps {
 	};
 }
 
-/** Parsed `/subagents-toggle` arguments. `on`/`off` are explicit; `flip` inverts. */
-export type ToggleCommandArgs =
-	| { action: "show" }
-	| { action: "flip" }
-	| { action: "on" }
-	| { action: "off" };
+/** Parsed `/legion on|off` arguments. */
+export type ToggleCommandArgs = { action: "on" } | { action: "off" };
 
-/** Pure parser for `/subagents-toggle` arguments. */
+/** Pure parser for `/legion on|off` arguments. */
 export function parseToggleCommandArgs(
 	args: string,
 ): { ok: true; value: ToggleCommandArgs } | { ok: false; message: string } {
-	const usage = "Usage: /subagents-toggle [on|off]";
+	const usage = "Usage: /legion on|off";
 	const trimmed = args.trim();
-	if (!trimmed) return { ok: true, value: { action: "show" } };
-	const tokens = trimmed.split(/\s+/).filter(Boolean);
-	if (tokens.length > 1) return { ok: false, message: usage };
-	const action = tokens[0];
-	if (action === "on" || action === "off")
-		return { ok: true, value: { action } };
-	if (action === "flip") return { ok: true, value: { action: "flip" } };
+	if (trimmed === "on" || trimmed === "off") {
+		return { ok: true, value: { action: trimmed } };
+	}
 	return { ok: false, message: usage };
 }
 
 export interface ToggleCommandDeps {
 	/** Whether subagents are currently enabled in THIS session (session-level override included). */
 	sessionEnabled: () => boolean;
-	/** Flip the session-level override (toggle only; never touches settings files). */
+	/** Set the session-level override without touching settings files. */
 	setSessionEnabled: (enabled: boolean) => void;
 	/** Effective `subagents.enabled` from merged settings, for display. */
 	settingsEnabled: (cwd: string) => boolean;
@@ -733,11 +351,11 @@ export interface ToggleCommandDeps {
 	runningChildren: () => number;
 }
 
-/** Render the status line shown after `/subagents-toggle`. */
+/** Render the status line shown after `/legion on|off`. */
 export function renderToggleStatus(input: {
 	enabled: boolean;
 	settingsEnabled: boolean;
-	outcome: "shown" | "flipped" | "already-on" | "already-off";
+	outcome: "flipped" | "already-on" | "already-off";
 	running: number;
 }): string {
 	const state = input.enabled ? "enabled" : "disabled";
@@ -759,8 +377,6 @@ export function renderToggleStatus(input: {
 		case "already-off":
 			lines.push("Already disabled — nothing to do.");
 			break;
-		default:
-			break;
 	}
 	if (input.running > 0)
 		lines.push(
@@ -769,12 +385,12 @@ export function renderToggleStatus(input: {
 	return lines.join("\n");
 }
 
-/** Register `/subagents-toggle [on|off]`: session-level enable/disable without touching files. */
-export function registerToggleCommand(
+/** Build the `/legion on|off` session-level enable/disable handler. */
+export function createToggleCommand(
 	pi: ExtensionAPI,
 	deps: ToggleCommandDeps,
-): void {
-	pi.registerCommand("subagents-toggle", {
+): LegionSubcommand {
+	return {
 		description:
 			"Temporarily disable/enable subagents for this session (no files are changed)",
 		getArgumentCompletions: (prefix) => {
@@ -790,20 +406,11 @@ export function registerToggleCommand(
 			}
 			const enabled = deps.sessionEnabled();
 			const running = deps.runningChildren();
-			let outcome: "shown" | "flipped" | "already-on" | "already-off" = "shown";
-			let next = enabled;
-			const action = parsed.value.action;
-			if (action === "flip") {
-				next = !enabled;
-				outcome = "flipped";
-			} else if (action === "on") {
-				next = true;
-				outcome = enabled ? "already-on" : "flipped";
-			} else if (action === "off") {
-				next = false;
-				outcome = enabled ? "flipped" : "already-off";
-			}
-			if (parsed.value.action !== "show") deps.setSessionEnabled(next);
+			const next = parsed.value.action === "on";
+			const outcome = enabled === next
+				? next ? "already-on" : "already-off"
+				: "flipped";
+			deps.setSessionEnabled(next);
 			sendSlashText(
 				pi,
 				renderToggleStatus({
@@ -814,17 +421,17 @@ export function registerToggleCommand(
 				}),
 			);
 		},
-	});
+	};
 }
 
-/** Register /subagents-agents [user|project|both] on a Pi extension. */
-export function registerAgentsCommand(
+/** Build the `/legion agents [user|project|both]` handler. */
+export function createAgentsCommand(
 	pi: ExtensionAPI,
 	deps: AgentsCommandDeps,
-): void {
-	pi.registerCommand("subagents-agents", {
+): LegionSubcommand {
+	return {
 		description:
-			"List available subagent roles (use /subagents-agents [user|project|both] to pick a scope)",
+			"List available subagent roles (use /legion agents [user|project|both] to pick a scope)",
 		getArgumentCompletions: (prefix) => {
 			if (prefix.includes(" ")) return null;
 			return AGENT_SCOPES.filter((scope) => scope.startsWith(prefix)).map(
@@ -832,7 +439,7 @@ export function registerAgentsCommand(
 			);
 		},
 		handler: async (args, ctx) => {
-			const usage = "Usage: /subagents-agents [user|project|both]";
+			const usage = "Usage: /legion agents [user|project|both]";
 			const parsed = parseAgentsScopeArg(args, usage);
 			if (parsed.ok === false) {
 				ctx.ui.notify(parsed.message, "error");
@@ -873,7 +480,7 @@ export function registerAgentsCommand(
 				notifyError(ctx, error);
 			}
 		},
-	});
+	};
 }
 
 /** Render the current team status for the no-argument command. */
@@ -891,6 +498,28 @@ export function renderTeamStatus(input: {
 	];
 	for (const warning of input.warnings ?? []) lines.push(`Warning: ${warning}`);
 	return lines.join("\n");
+}
+
+function readSettingsFile(filePath: string): Record<string, unknown> {
+	if (!fs.existsSync(filePath)) return {};
+	const raw = fs.readFileSync(filePath, "utf-8");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw) as unknown;
+	} catch (error) {
+		throw new Error(
+			`Invalid JSON in '${filePath}': ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error(`File '${filePath}' must contain a JSON object.`);
+	}
+	return parsed as Record<string, unknown>;
+}
+
+function writeJsonFile(filePath: string, value: unknown): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
 }
 
 /** Preserve all unrelated settings while changing one subagents field. */
@@ -912,14 +541,36 @@ export function updateSubagentSettingsFile(
 	writeJsonFile(filePath, document);
 }
 
-/** Register /subagents-team [list|use|create]. */
-export function registerTeamCommand(
+/** Build the `/legion team [list|use|create]` handler. */
+export function createTeamCommand(
 	pi: ExtensionAPI,
 	deps: TeamCommandDeps,
-): void {
-	pi.registerCommand("subagents-team", {
+): LegionSubcommand {
+	let completionCwd = process.cwd();
+	return {
 		description: "Show, list, switch, or create subagent teams",
+		getArgumentCompletions: (prefix) => {
+			const trimmed = prefix.trimStart();
+			if (!trimmed.includes(" ")) {
+				return ["list", "use", "create"]
+					.filter((value) => value.startsWith(trimmed))
+					.map((value) => ({ value, label: value }));
+			}
+			const useMatch = /^use\s+(.*)$/.exec(trimmed);
+			if (!useMatch) return null;
+			const namePrefix = useMatch[1] ?? "";
+			if (namePrefix.includes(" ")) return null;
+			const catalog = deps.loadCatalog({
+				sessionCwd: completionCwd,
+				runCwd: completionCwd,
+				scope: undefined,
+			});
+			return listTeamNames(catalog.settings)
+				.filter((name) => name.startsWith(namePrefix))
+				.map((name) => ({ value: `use ${name}`, label: name }));
+		},
 		handler: async (args, ctx) => {
+			completionCwd = ctx.cwd;
 			const parsed = parseTeamCommandArgs(args);
 			if (parsed.ok === false) {
 				ctx.ui.notify(parsed.message, "error");
@@ -1019,12 +670,12 @@ export function registerTeamCommand(
 					});
 					sendSlashText(
 						pi,
-						`Created subagent team ${command.name}. Select it with /subagents-team use ${command.name}`,
+						`Created subagent team ${command.name}. Select it with /legion team use ${command.name}`,
 					);
 				});
 			} catch (error) {
 				notifyError(ctx, error);
 			}
 		},
-	});
+	};
 }

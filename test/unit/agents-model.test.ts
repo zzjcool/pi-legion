@@ -478,7 +478,7 @@ test("settings: loadSubagentSettings reports malformed JSON with the path", () =
 	}
 });
 
-test("settings: a project file overlays a user profile's agentOverrides", () => {
+test("settings: a project file overlays user agentOverrides", () => {
 	const dir = mkdtempSync(path.join(tmpdir(), "settings-test-"));
 	try {
 		const user = path.join(dir, "user.json");

@@ -1,5 +1,5 @@
 /**
- * /subagents-agents command tests.
+ * `/legion agents` command tests.
  *
  * Drives the real extension factory (like presets-regression.test.ts) so the
  * whole path is covered: registerCommand wiring → loadCatalog → discovery →
@@ -24,7 +24,7 @@ import herdrSubagents from "../../index.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import {
 	parseAgentsScopeArg,
-	registerAgentsCommand,
+	createAgentsCommand,
 	renderAgentsListing,
 	type AgentsCommandDeps,
 } from "../../src/extension/slash.ts";
@@ -140,10 +140,10 @@ async function withSandbox(
 	}
 }
 
-/** The /subagents-agents command as registered by the factory. */
+/** The single `/legion` command as registered by the extension. */
 function findCommand(pi: FakePi): RegisteredCommand {
-	const command = pi.commands.find((c) => c.name === "subagents-agents");
-	assert.ok(command, "subagents-agents command must be registered");
+	const command = pi.commands.find((c) => c.name === "legion");
+	assert.ok(command, "legion command must be registered");
 	return command;
 }
 
@@ -155,11 +155,11 @@ async function invoke(
 ): Promise<string | undefined> {
 	const command = findCommand(pi);
 	pi.messages.length = 0;
-	await command.handler(args, {
+	await command.handler(`agents ${args}`.trim(), {
 		cwd,
 		hasUI: false,
 		ui: { notify() {} },
-	});
+	} as never);
 	return pi.messages.find((m) => typeof m.content === "string")?.content;
 }
 
@@ -426,23 +426,89 @@ test("renderAgentsListing: alias and unenforced fields are surfaced", () => {
 
 // ────────────────────── command wiring (real factory) ──────────────────────
 
-test("command: registered with a description and scope completions", async () => {
-	await withSandbox({}, async ({ pi }) => {
-		const command = pi.commands.find((c) => c.name === "subagents-agents");
-		assert.ok(command, "command must be registered");
-		assert.ok(command.description?.includes("subagent roles"));
-		const completions = command.getArgumentCompletions?.("");
-		assert.deepEqual(completions, [
-			{ value: "user", label: "user" },
-			{ value: "project", label: "project" },
-			{ value: "both", label: "both" },
+test("/legion is the sole slash command and offers unified subcommand completions", async () => {
+	await withSandbox({ settings: { teams: { frontend: { members: ["worker"] } } } }, async ({ pi }) => {
+		const command = findCommand(pi);
+		assert.deepEqual(pi.commands.map((entry) => entry.name), ["legion"]);
+		assert.ok(command.description?.includes("manage teams"));
+		const emptyPrefixCompletions = command.getArgumentCompletions?.("");
+		assert.ok(Array.isArray(emptyPrefixCompletions));
+		for (const name of ["team", "agents", "on", "off", "summary", "help", "doctor", "stop"]) {
+			assert.ok(emptyPrefixCompletions.some((item: { value: string }) => item.value === name), `${name} is offered for an empty prefix`);
+		}
+		assert.deepEqual(command.getArgumentCompletions?.("agents "), [
+			{ value: "agents user", label: "user" },
+			{ value: "agents project", label: "project" },
+			{ value: "agents both", label: "both" },
 		]);
-		// A prefix filters; a token with a space stops completing.
-		assert.deepEqual(command.getArgumentCompletions?.("pr"), [
-			{ value: "project", label: "project" },
+		assert.deepEqual(command.getArgumentCompletions?.("agents pr"), [
+			{ value: "agents project", label: "project" },
 		]);
-		assert.equal(command.getArgumentCompletions?.("user x"), null);
+		assert.equal(command.getArgumentCompletions?.("agents user x"), null);
+		assert.deepEqual(command.getArgumentCompletions?.("team "), [
+			{ value: "team list", label: "list" },
+			{ value: "team use", label: "use" },
+			{ value: "team create", label: "create" },
+		]);
+		assert.deepEqual(command.getArgumentCompletions?.("team use f"), [
+			{ value: "team use frontend", label: "frontend" },
+		]);
+		assert.deepEqual(command.getArgumentCompletions?.("summary --"), [
+			{ value: "summary --all", label: "--all" },
+		]);
+		assert.deepEqual(command.getArgumentCompletions?.("o"), [
+			{ value: "on", label: "on" },
+			{ value: "off", label: "off" },
+		]);
+		await command.handler("help", {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: { notify() {} },
+		} as never);
+		const help = pi.messages.at(-1)?.content;
+		assert.match(help ?? "", /\/legion team/);
+		assert.match(help ?? "", /\/legion summary/);
+		await command.handler("team list", {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: { notify() {} },
+		} as never);
+		assert.match(pi.messages.at(-1)?.content ?? "", /Subagent teams/);
+		await command.handler("summary --bogus", {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: { notify(text: string) { assert.match(text, /Usage: \/legion summary/); } },
+		} as never);
+		await command.handler("off", {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: { notify() {} },
+		} as never);
+		assert.match(pi.messages.at(-1)?.content ?? "", /Subagents are disabled/);
+		await command.handler("on", {
+			cwd: process.cwd(),
+			hasUI: false,
+			ui: { notify() {} },
+		} as never);
+		assert.match(pi.messages.at(-1)?.content ?? "", /Subagents are enabled/);
 	});
+});
+
+test("/legion team list works in headless mode", async () => {
+	await withSandbox(
+		{ settings: { teams: { frontend: { members: ["worker"] } } } },
+		async ({ pi, projectRoot }) => {
+			const command = findCommand(pi);
+			await command.handler("team list", {
+				cwd: projectRoot,
+				mode: "headless",
+				hasUI: false,
+				ui: { notify() {} },
+			} as never);
+			assert.match(pi.messages.at(-1)?.content ?? "", /Subagent teams/);
+			assert.match(pi.messages.at(-1)?.content ?? "", /frontend/);
+		},
+	);
 });
 
 test("command: lists sandboxed + builtin roles, grouped, with file paths", async () => {
@@ -507,7 +573,7 @@ test("command: invalid scope notifies an error and sends nothing", async () => {
 		async ({ pi, messages, projectRoot }) => {
 			const notified: Array<{ text: string; level: string }> = [];
 			const command = findCommand(pi);
-			await command.handler("banana", {
+			await command.handler("agents banana", {
 				cwd: projectRoot,
 				hasUI: false,
 				ui: {
@@ -515,11 +581,11 @@ test("command: invalid scope notifies an error and sends nothing", async () => {
 						notified.push({ text, level });
 					},
 				},
-			});
+				} as never);
 			assert.equal(messages.length, 0);
 			assert.equal(notified.length, 1);
 			assert.equal(notified[0]?.level, "error");
-			assert.match(notified[0]?.text ?? "", /Usage: \/subagents-agents/);
+			assert.match(notified[0]?.text ?? "", /Usage: \/legion agents/);
 		},
 	);
 });
@@ -567,36 +633,27 @@ test("command: no roles at all → helpful empty state", async () => {
 test("command: a loadCatalog failure surfaces as ui.notify error, nothing sent", async () => {
 	// e.g. malformed settings.json → loadSubagentSettings throws inside
 	// loadCatalog. The handler must route that to notifyError, not crash.
-	const commands: Array<{
-		name: string;
-		handler: (args: string, ctx: unknown) => Promise<void>;
-	}> = [];
 	const messages: SentMessage[] = [];
 	const pi = {
-		registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
-			commands.push({ name, handler: options.handler });
-		},
 		sendMessage(message: SentMessage) {
 			messages.push(message);
 		},
 	};
-	registerAgentsCommand(pi as never, {
+	const command = createAgentsCommand(pi as never, {
 		loadCatalog: () => {
 			throw new Error("Invalid JSON in 'settings.json': boom");
 		},
 	});
-	const command = commands.find((c) => c.name === "subagents-agents");
-	assert.ok(command);
 	const notified: Array<{ text: string; level: string }> = [];
 	await command.handler("", {
 		cwd: "/repo",
 		hasUI: false,
 		ui: {
-			notify(text: string, level: string) {
-				notified.push({ text, level });
+			notify(text: string, level?: "error" | "info" | "warning") {
+				notified.push({ text, level: level ?? "info" });
 			},
 		},
-	});
+	} as never);
 	assert.equal(messages.length, 0, "no listing must be sent on failure");
 	assert.equal(notified.length, 1);
 	assert.equal(notified[0]?.level, "error");
@@ -617,19 +674,11 @@ test("AgentsCommandDeps: loadCatalog receives the parsed scope untouched", async
 		},
 	};
 	// Drive through a fake pi registering ONLY the agents command.
-	const commands: RegisteredCommand[] = [];
-	const pi = {
-		registerCommand(name: string, options: Omit<RegisteredCommand, "name">) {
-			commands.push({ name, ...options });
-		},
-	};
-	registerAgentsCommand(pi as never, deps);
-	const command = commands.find((c) => c.name === "subagents-agents");
-	assert.ok(command);
+	const command = createAgentsCommand({ sendMessage() {} } as never, deps);
 	await command.handler("project", {
 		cwd: "/repo",
 		hasUI: false,
 		ui: { notify() {} },
-	});
+	} as never);
 	assert.deepEqual(seen, [{ sessionCwd: "/repo", scope: "project" }]);
 });
