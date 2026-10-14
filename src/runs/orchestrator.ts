@@ -35,6 +35,7 @@ import {
 	emptyParsedSession,
 	extractVerdict,
 	isLastTurnComplete,
+	isTransientConnectionFailure,
 	parseSessionFile,
 } from "../shared/session.ts";
 import { encodeNestedPath, parseNestedPathEnv } from "../shared/nested-path.ts";
@@ -117,6 +118,10 @@ export interface CollectResult {
 }
 
 export const COLLECT_GRACE_EXTENSIONS = 2;
+/** Shown when the launch-time collect budget elapses and the child is still in-turn. */
+export const COLLECT_DEADLINE_REASON = "collect deadline (cumulative since launch) exceeded; child still alive";
+/** Shown when a live child's session ends on an OpenAI/GPT connection blip. */
+export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC child still alive";
 const LINEAGE_ENV = "PI_SUBAGENT_PARENT_PATH";
 const MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 const UTILITY_CHILD_ENV = "PI_SUBAGENT_UTILITY_CHILD";
@@ -809,7 +814,10 @@ export class Orchestrator {
 		const timeoutMs = opts.timeoutMs ?? DEFAULTS.turnTimeoutMs;
 		let deadline = this.now() + timeoutMs;
 		const initial = parseSessionFile(child.sessionFile);
-		let wait: "settled" | "timeout" | "blocked" | "gone" | "aborted" = isLastTurnComplete(initial)
+		// A connection blip writes stopReason "error" before the client retries.
+		// That looks like a finished turn, but the RPC child is still in it.
+		// Skipping the supervisor wait here is what retired a live worker.
+		let wait: "settled" | "timeout" | "blocked" | "gone" | "aborted" = isLastTurnComplete(initial) && !this.liveConnectionBlip(child, initial)
 			? "settled"
 			: await this.awaitSupervisor(child, deadline, opts.signal);
 		if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
@@ -822,20 +830,65 @@ export class Orchestrator {
 			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
-		const parsed = parseSessionFile(child.sessionFile);
+		let parsed = parseSessionFile(child.sessionFile);
 		if (wait === "settled" && countAssistantMessages(parsed) > 0) {
 			await this.waitForQuiet(child.sessionFile, deadline, opts.signal);
 			if (opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (opts.signal?.aborted) return abortedSnapshot();
-		const current = parseSessionFile(child.sessionFile);
-		let execution = deriveOutcome(current);
-		if (wait === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(current)) {
-			execution = { ...execution, status: "running", reason: `collect timed out after ${timeoutMs}ms; the RPC child is still alive` };
-		} else if (wait === "gone" && current.turns.length === 0) {
+		parsed = parseSessionFile(child.sessionFile);
+		let execution = deriveOutcome(parsed);
+		if (wait === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(parsed)) {
+			// `timeoutMs` is the budget from launch, not the length of this status check.
+			execution = { ...execution, status: "running", reason: COLLECT_DEADLINE_REASON };
+		} else if (wait === "gone" && parsed.turns.length === 0) {
 			execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
+		} else if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
+			// Same non-terminal signal as the deadline path: watch() re-arms on
+			// `running` and does not retire. An already-settled blip has to keep
+			// waiting here, or the next collect would reproduce it instantly.
+			if (wait !== "timeout") {
+				const held = await this.waitOutTransientConnection(child, deadline, opts.signal);
+				if (held === "aborted" || opts.signal?.aborted) return abortedSnapshot();
+				if (held === "blocked") return this.blockedResult(child);
+				parsed = parseSessionFile(child.sessionFile);
+				execution = deriveOutcome(parsed);
+			}
+			if (this.supervisor.isAlive(name) && (isTransientConnectionFailure(execution) || !isLastTurnComplete(parsed))) {
+				execution = { ...execution, status: "running", reason: TRANSIENT_CONNECTION_REASON };
+			} else if (!this.supervisor.isAlive(name) && parsed.turns.length === 0) {
+				execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
+			}
 		}
-		return this.finishCollect(child, current, execution, deadline);
+		return this.finishCollect(child, parsed, execution, deadline);
+	}
+
+	/** True when the session's latest outcome is a connection blip and the process is up. */
+	private liveConnectionBlip(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>): boolean {
+		return this.supervisor.isAlive(child.name) && isTransientConnectionFailure(deriveOutcome(parsed));
+	}
+
+	/**
+	 * Hold a live child whose session currently ends on a connection blip.
+	 *
+	 * Returns once the session moves past that blip, the process exits, a UI
+	 * approval arrives, the parent aborts, or the cumulative deadline passes.
+	 */
+	private async waitOutTransientConnection(
+		child: ChildRecord,
+		deadline: number,
+		signal?: AbortSignal,
+	): Promise<"aborted" | "blocked" | "done"> {
+		const maxPolls = Math.max(1, Math.ceil(Math.max(0, deadline - this.now()) / POLL_INTERVAL_MS));
+		for (let poll = 0; poll < maxPolls; poll += 1) {
+			if (signal?.aborted) return "aborted";
+			if (this.pendingDialogs(child.name).length) return "blocked";
+			if (!this.supervisor.isAlive(child.name)) return "done";
+			if (!isTransientConnectionFailure(deriveOutcome(parseSessionFile(child.sessionFile)))) return "done";
+			if (this.now() >= deadline) return "done";
+			if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return "aborted";
+		}
+		return "done";
 	}
 
 	private interruptedCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>): CollectResult {
@@ -915,6 +968,9 @@ export class Orchestrator {
 	private settleDisposition(result: SettleResult, name: string): "settled" | "timeout" | "gone" {
 		if (result.settled) return "settled";
 		if (result.reason === "timeout" || (!result.abnormal && this.supervisor.isAlive(name))) return "timeout";
+		// A connection blip reported as an abnormal settle must not look like
+		// the process exited while that process is still alive.
+		if (this.supervisor.isAlive(name) && isTransientConnectionFailure(result.reason)) return "timeout";
 		return "gone";
 	}
 
@@ -1073,6 +1129,11 @@ export class Orchestrator {
 	}
 
 	childrenSnapshot(): ChildRecord[] { return [...this.children.values()]; }
+
+	/** Whether the RPC process for this child is still running. */
+	isChildAlive(name: string): boolean {
+		return this.supervisor.isAlive(name);
+	}
 
 	restore(record: RunRecord): void {
 		for (const child of record.children) {

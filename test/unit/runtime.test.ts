@@ -1,9 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	createSessionRuntime,
+	formatLastEventAge,
+	lastJsonlEventAgeMs,
+	renderLiveChildStatus,
 	shouldRecycleAfterCollect,
 } from "../../src/extension/runtime.ts";
 import { SUBAGENT_NOTIFY_TYPE } from "../../src/extension/notify.ts";
@@ -1153,4 +1156,143 @@ test("runtime: session jsonl fills the live current-turn elapsed", async () => {
 		assert.equal(runtime.statusEntries().find((entry) => entry.name === "worker-0")?.tokensTotal, 1_100);
 		runtime.dispose();
 	});
+});
+
+test("watch re-arms a thrown Connection error while the RPC child is alive", async () => {
+	const messages: SentMessage[] = [];
+	let calls = 0;
+	let retired = 0;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "worker-0",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/worker-0.jsonl",
+		timeoutMs: 1_000,
+		isAlive: () => true,
+		collect: async () => {
+			calls += 1;
+			if (calls === 1) throw new Error("Connection error.");
+			return joinSnapshot({ output: "recovered" });
+		},
+		retire: async () => {
+			retired += 1;
+		},
+	});
+	runtime.watch("worker-0");
+	await waitFor(() => messages.length === 1, "completion after the connection re-arm");
+	assert.equal(calls, 2);
+	assert.match(messages[0]!.content, /Background task completed: \*\*worker-0/);
+	assert.doesNotMatch(messages[0]!.content, /Connection error/);
+	assert.doesNotMatch(messages[0]!.content, /failed/);
+	await waitFor(() => retired === 1, "terminal success still retires");
+	runtime.dispose();
+});
+
+test("a thrown Connection error is a failure once the RPC child is gone", async () => {
+	const messages: SentMessage[] = [];
+	let calls = 0;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "worker-0",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/worker-0.jsonl",
+		timeoutMs: 1_000,
+		isAlive: () => false,
+		collect: async () => {
+			calls += 1;
+			throw new Error("Connection error.");
+		},
+	});
+	runtime.watch("worker-0");
+	await waitFor(() => messages.length === 1, "failure notice");
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(calls, 1);
+	assert.equal(messages.length, 1);
+	assert.match(messages[0]!.content, /Background task failed/);
+	assert.match(messages[0]!.content, /RPC child is not alive/);
+	runtime.dispose();
+});
+
+test("renderLiveChildStatus reports silence and ignores a stale connection failure", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = join(dir, "worker-0.jsonl");
+		writeFileSync(sessionFile, "{\"type\":\"message\"}\n");
+		const now = Date.now();
+		utimesSync(sessionFile, new Date(now - 358_000), new Date(now - 358_000));
+		const age = lastJsonlEventAgeMs(sessionFile, now);
+		assert.ok(age !== undefined);
+		assert.ok(Math.abs(age - 358_000) < 2_000, `age ${age}`);
+		const text = renderLiveChildStatus({
+			name: "worker-0",
+			state: "retired",
+			agent: "worker",
+			kind: "pi",
+			sessionFile,
+			execution: { status: "failed", reason: "Connection error." },
+			acceptance: { status: "rejected", level: "none" },
+			alive: true,
+			now,
+		});
+		assert.match(text, /state=working/);
+		assert.match(text, /execution: running \(rpc child alive\)/);
+		assert.match(text, new RegExp(formatLastEventAge(age).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+		assert.match(text, /persisted snapshot is stale: state=retired, execution=failed \(Connection error\.\), acceptance=rejected \(none\)/);
+		assert.doesNotMatch(text, /^worker-0 — state=retired/m);
+		assert.doesNotMatch(text, /^execution: failed/m);
+		assert.doesNotMatch(text, /^acceptance: rejected/m);
+	});
+});
+
+test("renderLiveChildStatus keeps a live running snapshot and adds recency", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = join(dir, "worker-0.jsonl");
+		writeFileSync(sessionFile, "\n");
+		const now = Date.now();
+		utimesSync(sessionFile, new Date(now), new Date(now));
+		const text = renderLiveChildStatus({
+			name: "worker-0",
+			state: "working",
+			agent: "worker",
+			kind: "pi",
+			sessionFile,
+			execution: { status: "running", reason: "collect deadline (cumulative since launch) exceeded; child still alive" },
+			acceptance: { status: "unknown", level: "none" },
+			alive: true,
+			now,
+		});
+		assert.match(text, /state=working/);
+		assert.match(text, /collect deadline \(cumulative since launch\) exceeded; child still alive/);
+		assert.match(text, /last event 0s ago/);
+		assert.match(text, /acceptance: unknown \(none\)/);
+		assert.doesNotMatch(text, /persisted snapshot is stale/);
+	});
+});
+
+test("renderLiveChildStatus leaves a dead child's terminal snapshot alone", () => {
+	const text = renderLiveChildStatus({
+		name: "worker-0",
+		state: "retired",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "/tmp/does-not-exist.jsonl",
+		execution: { status: "failed", reason: "Connection error." },
+		acceptance: { status: "rejected", level: "none" },
+		alive: false,
+		now: 0,
+	});
+	assert.match(text, /state=retired/);
+	assert.match(text, /execution: failed \(Connection error\.\)/);
+	assert.match(text, /acceptance: rejected \(none\)/);
+	assert.doesNotMatch(text, /last event/);
+	assert.doesNotMatch(text, /stale/);
 });

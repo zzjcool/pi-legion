@@ -498,6 +498,22 @@ export function parseSessionFile(path: string): ParsedSession {
 }
 
 /**
+ * OpenAI/GPT client blip. The SDK's APIConnectionError message is exactly
+ * "Connection error."; wrappers keep that substring.
+ *
+ * A matching snapshot is not a verdict while the RPC child is still alive:
+ * the client retries, and the session can look terminal for the whole gap.
+ */
+export function isTransientConnectionFailure(
+	input: { reason?: string | null; errorMessage?: string | null } | string | null | undefined,
+): boolean {
+	const text = typeof input === "string" || input == null
+		? input ?? ""
+		: `${input.reason ?? ""} ${input.errorMessage ?? ""}`;
+	return /connection error/i.test(text);
+}
+
+/**
  * Derive the execution outcome from a parsed session.
  *
  * Order matters: "no reply to the last prompt" is checked BEFORE stopReason,
