@@ -38,6 +38,10 @@ export interface DescendantInfo {
 
 /** Injectable options for process lifecycle handling in RpcSupervisor. */
 export interface RpcSupervisorOptions {
+	/** Called with the refusal text when the memory gate blocks a spawn (UI notify hook). */
+	onSpawnRefused?: (message: string) => void;
+	/** Override the available-memory probe (MB) in tests. */
+	memoryAvailable?: () => number;
 	/** Replace the Pi client constructor in unit tests. */
 	clientFactory?: RpcClientFactory;
 	/** In-memory by default; M1-integration supplies a real TUI consumer. */

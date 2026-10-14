@@ -221,6 +221,21 @@ itself (guard and nested spawning) and every path listed in the role's
 | `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` | Every child loads all host extensions, as before. |
 | `PI_LEGION_CHILD_EXTENSIONS=/a.ts,/b.ts` | Extra extension paths every child loads explicitly, e.g. a provider extension the child's model needs. |
 
+### Child memory controls
+
+| Env | Default | Effect |
+| --- | ---: | --- |
+| `PI_LEGION_CHILD_SEMI_SPACE_MB` | 1 | Child pi `--max-semi-space-size` (via `NODE_OPTIONS`). `0` = off. |
+| `PI_LEGION_CHILD_MAX_OLD_SPACE_MB` | 1024 | Soft child heap cap `--max-old-space-size`. `0` = off. A host `NODE_OPTIONS` value wins. |
+| `PI_LEGION_MIN_FREE_MEM_MB` | 1024 | Memory gate: a spawn is refused (`INSUFFICIENT_MEMORY`, plus a UI notice) when available memory minus reservations falls below this. `0` = off. |
+| `PI_LEGION_CHILD_RESERVE_MB` | 160 | Per-child reservation for children still starting, so a parallel burst cannot all pass one reading. |
+| `PI_LEGION_VERIFY_CONCURRENCY` | 2 | Machine-wide limit on concurrent acceptance / legion-verify commands, using slot lock files. `0` = unlimited. |
+| `PI_LEGION_VERIFY_QUEUE_MAX_MS` | 1800000 | Overall queue-wait cap. After it expires the command runs without a slot. Queue wait does not count toward the command timeout. |
+| `PI_LEGION_VERIFY_LOCK_DIR` | `$TMPDIR/pi-legion-verify-<uid>` | Slot directory. Set it to scope the limit more narrowly. |
+
+The child restores the host `NODE_OPTIONS` when its extension loads, so bash
+commands it runs (`tsc`, `npm test`) keep the default heap.
+
 ### Storage hygiene
 
 Each root pi session runs one deferred, best-effort sweep of `.pi-subagents/`

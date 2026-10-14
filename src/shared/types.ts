@@ -658,6 +658,7 @@ export const ErrorCodes = {
 	NOT_FOUND: "NOT_FOUND",
 	RETIRE_FAILED: "RETIRE_FAILED",
 	INVALID_PARAMS: "INVALID_PARAMS",
+	INSUFFICIENT_MEMORY: "INSUFFICIENT_MEMORY",
 } as const;
 
 // =============================================================================
