@@ -58,7 +58,7 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           expected="v${pkg_version}"
           if [ "${tag}" != "${expected}" ]; then
-            echo "::error::Tag ${tag} does not match package.json version ${pkg_version} (expected ${expected}). Bump package.json and push a matching tag together; npm publish uses the version field, not the tag."
+            echo "::error::Tag ${tag} does not match package.json version ${pkg_version} (expected ${expected}). Bump package.json and push a matching tag together; npm stage publish uses the version field, not the tag."
             exit 1
           fi
           echo "Tag ${tag} matches package.json ${pkg_version}."
@@ -88,13 +88,21 @@ jobs:
           registry-url: https://registry.npmjs.org
           cache: npm
 
-      - name: Publish to npm
+      # CI only stages the package on npm. It does not formally publish.
+      # A maintainer must complete npm 2FA (`npm stage approve`) afterwards.
+      # NPM_TOKEN is a granular token with Read and write (stage only), which
+      # can stage and cannot publish directly.
+      # Requires npm CLI >= 11.15 and Node >= 22.14. node-version 22 with
+      # check-latest already satisfies the Node requirement. Node 22 still
+      # bundles npm 10, so install the npm 11 CLI before staging.
+      - name: Stage on npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::Repository secret NPM_TOKEN is not set. GitHub Release for this tag was already created. Add an npm automation token as NPM_TOKEN, then re-run this workflow to publish package pi-legion."
+            echo "::error::Repository secret NPM_TOKEN is not set. GitHub Release for this tag was already created. Add the granular npm token (Read and write, stage only) as NPM_TOKEN, then re-run. This step only stages pi-legion; a maintainer must approve it with npm 2FA before it is published."
             exit 1
           fi
-          npm publish --access public
+          npm install -g npm@^11.15.0
+          npm stage publish
