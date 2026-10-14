@@ -786,3 +786,134 @@ test("railway: root spawn connector hangs DOWN from the header (┬ above │ ab
 	assert.equal(lines[2]![x], "╰", "vertical ends turning right into the lowest lane");
 	for (const line of lines) for (const ch of ["┴", "╯", "╭", "┘"]) assert.ok(!line.includes(ch), `no upward glyph ${ch}`);
 });
+
+/** Left edge of the time axis (lane rows reserve column 0 as padding). */
+function axisLeft(lines: string[][]): number {
+	const x = lines[1]!.findIndex((ch) => ch !== " ");
+	assert.ok(x > 0, "lane has an axis");
+	return x;
+}
+
+test("railway: live spawn vertical pins to the left edge after the fork scrolls off", () => {
+	const windowMs = 60_000;
+	const width = 80;
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(0) }),
+		node("scout-1", { startedAt: sec(10), parentId: "worker-0", depth: 2 }),
+		node("late", { startedAt: sec(580) }),
+	];
+	const frame = (t: number, list: VizNode[] = nodes) => {
+		const out = renderRailway({ nodes: list, now: sec(t), width, rate: 0, windowMs })!;
+		const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+		return { out, lines };
+	};
+	const startAt = (lines: string[][], row: number) => lines[row]!.findIndex((ch) => "╺╰╭┄├".includes(ch));
+
+	// Inside the window the fork stays on the spawn column, not glued to the edge.
+	const on = frame(30, [ROOT, node("worker-0", { startedAt: sec(0) }), node("scout-1", { startedAt: sec(10), parentId: "worker-0", depth: 2 })]);
+	const onFork = on.lines[1]!.indexOf("┳");
+	assert.ok(onFork > axisLeft(on.lines), "on-screen branch is to the right of the axis edge");
+	assert.equal(on.lines[2]![onFork], "╰");
+	assert.equal(on.out.hit[2]![onFork], "scout-1");
+	assert.equal(on.lines[1]![axisLeft(on.lines)], "·", "no pinned connector while the fork is still in view");
+
+	// Parent lane still visible, but the fork time has left the window: the
+	// vertical sticks to the left edge (├ into the parent, ╰ into the child).
+	const pinned = frame(600, [ROOT, node("worker-0", { startedAt: sec(0) }), node("scout-1", { startedAt: sec(10), parentId: "worker-0", depth: 2 })]);
+	const edge = axisLeft(pinned.lines);
+	assert.equal(pinned.lines[0]![edge], "┬");
+	assert.equal(pinned.lines[1]![edge], "├");
+	assert.equal(pinned.lines[2]![edge], "╰");
+	assert.equal(pinned.out.hit[0]![edge], "worker-0");
+	assert.equal(pinned.out.hit[1]![edge], "worker-0");
+	assert.equal(pinned.out.hit[2]![edge], "scout-1");
+	assert.ok(pinned.lines[0]!.join("").includes("−1m"), "window label stays put");
+	assert.equal(startAt(pinned.lines, 1), edge);
+	assert.equal(startAt(pinned.lines, 2), edge);
+
+	// Newer spawn keeps scrolling left; already-pinned forks stay on the edge.
+	const early = frame(600);
+	const later = frame(620);
+	const lateRow = 3;
+	assert.ok(startAt(later.lines, lateRow) < startAt(early.lines, lateRow), "in-window spawn still moves left");
+	assert.ok(startAt(later.lines, lateRow) > edge, "in-window spawn has not reached the pin");
+	assert.equal(startAt(later.lines, 1), edge);
+	assert.equal(startAt(later.lines, 2), edge);
+	assert.equal(later.lines[1]![edge], "├", "parent vertical stays on the edge while a newer spawn scrolls");
+	assert.equal(later.lines[2]![edge], "╰");
+	const heads = later.lines.slice(1).map((line) => line.lastIndexOf("━"));
+	assert.ok(heads.every((h) => h === heads[0] && h > edge), "lane heads stay on the shared now-column");
+	for (const line of later.lines.slice(1)) assert.notEqual(line[edge], "┄", "scrolled live lanes are not reduced to a continuation dash");
+	for (const line of later.out.canvas.toLines(ansiTheme)) assert.equal(visibleWidth(line), width);
+
+	// Once the late spawn also leaves the window it joins the pinned spine
+	// instead of losing its connector.
+	const allOff = frame(700);
+	assert.equal(allOff.lines[0]![edge], "┬");
+	assert.equal(allOff.lines[1]![edge], "├");
+	assert.equal(allOff.lines[2]![edge], "├", "child stays on the spine when a later root spawn passes through");
+	assert.equal(allOff.lines[3]![edge], "╰");
+	assert.equal(allOff.out.hit[3]![edge], "late");
+	assert.equal(allOff.out.hit[2]![edge], "scout-1");
+});
+
+test("railway: parent and child that share a spawn column meet on one downward vertical", () => {
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(10) }),
+		node("scout-1", { startedAt: sec(10), parentId: "worker-0", depth: 2 }),
+	];
+	const out = renderRailway({ nodes, now: sec(40), width: 80, rate: 0, windowMs: 360_000 })!;
+	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+	const x = lines[0]!.indexOf("┬");
+	assert.ok(x > axisLeft(lines), "shared spawn is still inside the window");
+	assert.equal(lines[1]![x], "├");
+	assert.equal(lines[2]![x], "╰");
+	assert.equal(out.hit[1]![x], "worker-0");
+	assert.equal(out.hit[2]![x], "scout-1");
+});
+
+test("railway: pinned spawn vertical remains after the parent lane is gone", () => {
+	const windowMs = 60_000;
+	const nodes = [ROOT,
+		node("worker-0", { startedAt: sec(0), status: "settled", endedAt: sec(20) }),
+		node("scout-1", { startedAt: sec(10), parentId: "worker-0", depth: 2 }),
+	];
+	const out = renderRailway({ nodes, now: sec(600), width: 80, rate: 0, windowMs })!;
+	const lines = out.canvas.toLines(plainTheme).map((l) => Array.from(l));
+	assert.deepEqual(out.shown.map((n) => n.id), ["scout-1"]);
+	const edge = axisLeft(lines);
+	assert.equal(lines[0]![edge], "┬", "root trunk tick stands in for the scrolled-off parent");
+	assert.equal(lines[1]![edge], "╰");
+	assert.equal(out.hit[0]![edge], "scout-1");
+	assert.equal(out.hit[1]![edge], "scout-1");
+	assert.equal(lines[1]!.join("").includes("┄"), false);
+	assert.ok(!lines.flat().join("").includes("worker-0"));
+
+	// Child ends too: nothing live, so the pinned vertical is gone with the lane.
+	const done = nodes.map((n) => n.id === "scout-1" ? { ...n, status: "settled" as const, endedAt: sec(30) } : n);
+	assert.equal(renderRailway({ nodes: done, now: sec(600), width: 80, rate: 0, windowMs }), undefined);
+});
+
+test("status board: scrolled railway keeps the spawn vertical for a live child", () => {
+	let factory: WidgetFactory | undefined;
+	const ctx: StatusUi = { hasUI: true, ui: { theme: plainTheme, setStatus() {}, setWidget(_k, c) { factory = typeof c === "function" ? c : undefined; } } };
+	const board = createStatusBoard({ strip: "railway" });
+	board.bind(ctx);
+	const now = Date.now();
+	const entries: StatusEntry[] = [
+		{ name: "centurion-0", agent: "centurion", state: "running", startedAt: now - 3_600_000, nodeId: "root", parentId: null, depth: 0 },
+		{ name: "worker-0", agent: "worker", state: "working", startedAt: now - 1_200_000, nodeId: "root.w", parentId: "root", depth: 1 },
+		{ name: "scout-1", agent: "scout", state: "working", startedAt: now - 1_140_000, nodeId: "root.w.s", parentId: "root.w", depth: 2 },
+	];
+	board.paint(entries, now);
+	const lines = factory!({ requestRender() {} }, plainTheme).render(100).map((l) => Array.from(stripTerminalSequences(l)));
+	const edge = axisLeft(lines);
+	assert.equal(lines[0]![edge], "┬");
+	assert.equal(lines[1]![edge], "├");
+	assert.equal(lines[2]![edge], "╰");
+	assert.match(lines[1]!.join(""), /worker-0/);
+	assert.match(lines[2]!.join(""), /scout-1/);
+	assert.equal(lines[1]!.join("").includes("┄"), false);
+	assert.equal(lines[2]!.join("").includes("┄"), false);
+	board.clear();
+});
