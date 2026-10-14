@@ -15,6 +15,7 @@ import {
 	type LegionSettings,
 	type ModelScopeConfig,
 	type OnBlockedPolicy,
+	type ScoutGuardSettings,
 	type SubagentsSettings,
 	type TeamConfig,
 	type TeamMember,
@@ -479,6 +480,7 @@ export function parseSubagentSettings(
 	if (legion !== undefined) out.legion = legion;
 
 	readJoinFields(input, out, filePath);
+	setIf(out, "scoutGuard", parseScoutGuard(input.scoutGuard, filePath));
 
 	// THE WHITELIST: every key read above must be assigned, or it is silently
 	// discarded. `presets` is the newest key and the easiest to drop here.
@@ -764,5 +766,28 @@ export function resolveSubagentSettings(
 	if (project.joinFlushMs !== undefined)
 		out.joinFlushMs = project.joinFlushMs;
 
+	if (project.scoutGuard) {
+		out.scoutGuard = { ...(user.scoutGuard ?? {}), ...project.scoutGuard };
+	}
+
+	return out;
+}
+
+function parseScoutGuard(
+	value: unknown,
+	filePath: string,
+): ScoutGuardSettings | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid 'scoutGuard'; expected an object.`,
+		);
+	}
+	const out: ScoutGuardSettings = {};
+	setIf(out, "enabled", requiredBoolean(value.enabled, "scoutGuard.enabled", filePath));
+	const threshold = positiveInt(value.threshold, "scoutGuard.threshold", filePath);
+	if (threshold !== undefined) out.threshold = threshold;
+	const cooldownMs = nonNegativeInt(value.cooldownMs, "scoutGuard.cooldownMs", filePath);
+	if (cooldownMs !== undefined) out.cooldownMs = cooldownMs;
 	return out;
 }
