@@ -35,6 +35,7 @@ import {
 	type ActiveTeam,
 } from "./src/agents/teams.ts";
 import { resolveModel } from "./src/agents/model-resolution.ts";
+import { providerForModel, type ProviderLookup } from "./src/runs/provider-pin.ts";
 import { resolveStepModel } from "./src/agents/step-model.ts";
 import { checkModelScope } from "./src/agents/model-scope.ts";
 import {
@@ -1589,6 +1590,7 @@ async function launchFamily(input: {
 		dispatchModel: ctx.model
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: undefined,
+		modelRegistry: ctx.modelRegistry,
 		results: [],
 		handles: [],
 		timeoutByName: new Map(),
@@ -1673,6 +1675,8 @@ interface LaunchSession {
 	runtime: SessionRuntime;
 	onUpdate?: AgentToolUpdateCallback;
 	dispatchModel: string | undefined;
+	/** Parent registry, used to pin `--provider` for ambiguous model ids (#123). */
+	modelRegistry: ProviderLookup | undefined;
 	results: string[];
 	handles: string[];
 	timeoutByName: Map<string, number>;
@@ -1765,6 +1769,11 @@ async function launchStep(
 			...(session.launchName ? { name: session.launchName } : {}),
 			...(session.teamOverride ? { team: session.teamOverride } : {}),
 			...(resolved.model ? { model: resolved.model } : {}),
+			// Pin the provider (#123): a bare id like `workbuddy/...` may also
+			// exist under a static auth-less provider in models.json; under
+			// `--no-extensions` the child would resolve it there and die with
+			// "No API key found". The parent registry knows the live provider.
+			...(resolved.model ? { modelProvider: providerForModel(session.modelRegistry, resolved.model) } : {}),
 			// The origin decides whether an unacceptable model is refused or
 			// dropped, and only this layer can tell them apart (a parent model
 			// arrives as the same `dispatch` source as a per-run override).
@@ -2150,6 +2159,8 @@ async function launchUtilityFamily(input: {
 				task: item.step.task,
 				name: names.get(item.step),
 				...(item.resolved.model ? { model: item.resolved.model } : {}),
+				// Provider pin (#123) — see launchStep for the rationale.
+				...(item.resolved.model ? { modelProvider: providerForModel(input.ctx.modelRegistry, item.resolved.model) } : {}),
 				modelOrigin: item.modelOrigin,
 				...(item.step.worktree !== undefined ? { worktree: item.step.worktree } : {}),
 				utilityDispatch: true,

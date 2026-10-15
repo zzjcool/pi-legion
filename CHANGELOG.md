@@ -13,6 +13,10 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- Dispatched children now receive `--provider` pinned from the parent's model
+  registry, so a bare model id (`workbuddy/…`) that also exists under a static
+  auth-less provider in `models.json` can no longer hijack the child start
+  (`No API key found for …`) (#123).
 - Scout-guard now counts first-class `grep` / `find` / `ls` tool calls as reads (#87).
 - Doctor diagnose help no longer repeats itself; storage section shows hygiene sweep state (#86).
 - Bundled roles no longer advertise unloaded `lens_*` tools (#75).
