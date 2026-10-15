@@ -68,6 +68,7 @@ export const LEGION_SLASH_HELP_LINES = [
 	"/legion on | /legion off — enable/disable subagents for this session (status is shown after each run)",
 	"/scout-guard | /no-scout-guard — session override for the main-session scout guard",
 	"/legion summary [--all] [<name>]",
+	"/legion timing [--json] [<name>] — wall / generation / other timing for children",
 	"/legion doctor [section]",
 	"/legion stop [name|all]",
 	"/legion --tree | /legion <node>",

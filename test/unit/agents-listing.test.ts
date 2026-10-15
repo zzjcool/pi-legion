@@ -436,7 +436,7 @@ test("/legion is the management command; scout-guard is a separate session pair"
 		assert.ok(command.description?.includes("manage teams"));
 		const emptyPrefixCompletions = command.getArgumentCompletions?.("");
 		assert.ok(Array.isArray(emptyPrefixCompletions));
-		for (const name of ["team", "agents", "on", "off", "summary", "status", "help", "doctor", "stop"]) {
+		for (const name of ["team", "agents", "on", "off", "summary", "timing", "status", "help", "doctor", "stop"]) {
 			assert.ok(emptyPrefixCompletions.some((item: { value: string }) => item.value === name), `${name} is offered for an empty prefix`);
 		}
 		assert.deepEqual(command.getArgumentCompletions?.("agents "), [
