@@ -37,6 +37,13 @@ test("memory gate: floor + per-starting-child reservation, 0 disables", () => {
 	assert.match(r.message!, /insufficient memory to start subagent scout-3: 1250 MB available, 1300 MB required/);
 	assert.match(r.message!, /PI_LEGION_MIN_FREE_MEM_MB=0/);
 	assert.equal(checkMemoryGate({ name: "a", inFlight: 9, config: { minFreeMb: 0, reserveMb: 100 }, available: () => 0 }).ok, true);
+	// #131: ten concurrent (inFlight=9 → ×10) with default floor+reserve math
+	const ten = { minFreeMb: 1024, reserveMb: 160 };
+	assert.equal(checkMemoryGate({ name: "w9", inFlight: 9, config: ten, available: () => 2624 }).ok, true);
+	const refuseTen = checkMemoryGate({ name: "w9", inFlight: 9, config: ten, available: () => 2469 });
+	assert.equal(refuseTen.ok, false);
+	assert.equal(refuseTen.requiredMb, 2624);
+	assert.match(refuseTen.message!, /2469 MB available, 2624 MB required/);
 	assert.deepEqual(resolveMemoryGateConfig({ PI_LEGION_MIN_FREE_MEM_MB: "64", PI_LEGION_CHILD_RESERVE_MB: "x" }), { minFreeMb: 64, reserveMb: 160 });
 	assert.ok(availableMemoryMb() > 0);
 });
