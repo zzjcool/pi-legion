@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
-import { RateSampler, RATE_WINDOW_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
+import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { buildLog, computeStats } from "../../src/tui/viz/panels.ts";
@@ -277,6 +277,53 @@ test("rate: header now stays non-zero while an agent is live", () => {
 	assert.ok(Math.abs(now - 80) < 1e-6, `expected ~80 got ${now}`);
 	// Unfiltered still includes settled "a" residual → higher than live-only.
 	assert.ok(sampler.totalRate(sec(120)) > now);
+});
+
+test("rate: tiny in-window ΔgenerationMs + large ΔtokensOut cannot spike to M tok/s", () => {
+	const sampler = new RateSampler();
+	// Warm a 60s wall history with zero tokens, then dump a huge output flush
+	// paired with only 1ms of generation — the old formula was 2_100_000 tok/s.
+	for (let t = 0; t <= 60; t += 1) {
+		sampler.record(sec(t), [ROOT, node("a", { tokensOut: 0, generationMs: 0 })]);
+	}
+	sampler.record(sec(61), [ROOT, node("a", {
+		tokensOut: 2_100,
+		generationMs: 1, // 1ms — below MIN_RATE_GENERATION_MS
+	})]);
+	const live = [ROOT, node("a", { tokensOut: 2_100, generationMs: 1 })];
+	const now = sampler.nowRate(sec(61), live);
+	assert.ok(now < 1_000_000, `expected <1M got ${now}`);
+	// Falls back to wall-clock window (RATE_WINDOW_MS): 2100 / 60 ≈ 35.
+	assert.ok(Math.abs(now - 2_100 / (RATE_WINDOW_MS / 1000)) < 1e-6, `expected wall fallback got ${now}`);
+	assert.equal(MIN_RATE_GENERATION_MS, 1_000);
+});
+
+test("rate: sub-second ΔgenerationMs floor; ≥1s still uses generation denominator", () => {
+	const sampler = new RateSampler();
+	// Steady 100 tok/s for 90s with matching generationMs — floor must not bite.
+	for (let t = 0; t <= 90; t += 1) {
+		sampler.record(sec(t), [ROOT, node("a", {
+			tokensOut: t * 100,
+			generationMs: t * 1000,
+		})]);
+	}
+	const steady = sampler.nowRate(sec(90), [ROOT, node("a", { tokensOut: 9_000, generationMs: 90_000 })]);
+	assert.ok(Math.abs(steady - 100) < 1e-6, `steady expected ~100 got ${steady}`);
+
+	// Exactly MIN_RATE_GENERATION_MS of gen in-window: still trust gen denom.
+	const edge = new RateSampler();
+	edge.record(sec(0), [ROOT, node("b", { tokensOut: 0, generationMs: 0 })]);
+	edge.record(sec(60), [ROOT, node("b", { tokensOut: 500, generationMs: MIN_RATE_GENERATION_MS })]);
+	const atFloor = edge.nodeRate("b", sec(60));
+	assert.ok(Math.abs(atFloor - 500) < 1e-6, `at 1s floor expected 500 got ${atFloor}`);
+
+	// Just below floor → wall fallback, not gen (would be 500/0.999 ≈ 500.5, but
+	// more importantly not 500000 if dGen were 1ms).
+	const under = new RateSampler();
+	under.record(sec(0), [ROOT, node("c", { tokensOut: 0, generationMs: 0 })]);
+	under.record(sec(60), [ROOT, node("c", { tokensOut: 500, generationMs: MIN_RATE_GENERATION_MS - 1 })]);
+	const below = under.nodeRate("c", sec(60));
+	assert.ok(Math.abs(below - 500 / 60) < 1e-6, `below floor expected wall got ${below}`);
 });
 
 test("rate: header tok/s and chart 'now' share one definition", () => {

@@ -6,8 +6,9 @@
  *
  *   numerator   = Δ cumulative output tokens over the trailing window
  *   denominator = Δ cumulative generationMs over the same window
- *                 (falls back to wall-clock window only when generationMs
- *                  is unavailable / zero for that node)
+ *                 (falls back to wall-clock window when generationMs is
+ *                  unavailable / zero, or when in-window ΔgenerationMs is
+ *                  below MIN_RATE_GENERATION_MS — same 1s floor as tree t/s)
  *
  * generationMs comes from session JSONL: sum of (assistant_ts − prior
  * user/toolResult_ts). Idle and tool gaps are excluded. Approximate —
@@ -22,6 +23,12 @@
 import type { VizNode } from "./model.ts";
 
 export const RATE_WINDOW_MS = 60_000;
+/**
+ * Min in-window ΔgenerationMs before trusting gen as the tok/s denominator.
+ * Matches tree-row t/s gate (`generationMs >= 1000` in status.ts). Below this,
+ * fall back to wall-clock window length so a 1ms gen flush cannot spike to M.
+ */
+export const MIN_RATE_GENERATION_MS = 1_000;
 const DEFAULT_RETENTION_MS = 6 * 60 * 60 * 1000;
 const MAX_SAMPLES_PER_NODE = 4096;
 
@@ -130,15 +137,16 @@ export class RateSampler {
 
 	/**
 	 * Output tok/s over the trailing window: ΔtokensOut / (ΔgenerationMs/1000).
-	 * When the node has no generationMs samples in the window, falls back to
-	 * wall-clock window length so a ledger-only path still yields a number.
+	 * When in-window ΔgenerationMs is 0 or below MIN_RATE_GENERATION_MS, falls
+	 * back to wall-clock window length so a ledger-only path still yields a
+	 * number and a sub-second gen flush cannot report M-level TPS.
 	 */
 	nodeRate(nodeId: string, now: number, windowMs = RATE_WINDOW_MS): number {
 		if (windowMs <= 0) return 0;
 		const dOut = Math.max(0, this.valueAt(nodeId, now) - this.valueAt(nodeId, now - windowMs));
 		if (dOut <= 0) return 0;
 		const dGen = Math.max(0, this.genAt(nodeId, now) - this.genAt(nodeId, now - windowMs));
-		const seconds = dGen > 0 ? dGen / 1000 : windowMs / 1000;
+		const seconds = dGen >= MIN_RATE_GENERATION_MS ? dGen / 1000 : windowMs / 1000;
 		return dOut / seconds;
 	}
 
