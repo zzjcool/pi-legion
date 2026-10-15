@@ -11,6 +11,18 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [2.0.3] — 2026-10-15
+
+### Fixed
+
+- `maxChildrenPerNode` only counts **live/running** children; `retire` (including
+  Already-retired no-op) frees the budget slot so a full tree can launch again
+  after retire. Session keep for resume does **not** occupy the concurrent slot
+  (#142 / #143).
+- Header tok/s uses `MIN_RATE_GENERATION_MS=1000` (same floor as tree rows): when
+  the in-window generation delta is under 1s, fall back to wall-clock so tiny
+  `dGen` cannot explode rates into the millions (#140 / #141).
+
 ## [2.0.2] — 2026-10-16
 
 ### Fixed
@@ -131,6 +143,9 @@ branch — pin `pi-legion@0.16.x` if you still need that model. See
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v2.0.3...HEAD
+[2.0.3]: https://github.com/zzjcool/pi-legion/compare/v2.0.2...v2.0.3
+[2.0.2]: https://github.com/zzjcool/pi-legion/compare/v2.0.1...v2.0.2
+[2.0.1]: https://github.com/zzjcool/pi-legion/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/zzjcool/pi-legion/releases/tag/v2.0.0
 [0.16.x]: https://github.com/zzjcool/pi-legion/releases
