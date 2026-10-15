@@ -11,7 +11,21 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [2.0.2] — 2026-10-16
+
 ### Fixed
+
+- Child worktree launches are suppressed when the parent checkout is itself a
+  linked git worktree (`git-dir` ≠ `git-common-dir`): role defaults and unset
+  launch flags collapse to `worktree: false`, matching the centurion-child
+  precedent. Explicit `launch: true` / per-child `step` flags still win.
+- `worktreeBootstrap: "npm-install"` no longer fires `npm install` on a stray
+  `package.json` without a lockfile (observed: Java/Maven repos carrying
+  package.json for docs/tooling); without a lockfile the mode records the
+  marker and skips, so non-npm worktrees launch instead of failing after the
+  10-minute bootstrap budget.
+
+### Fixed in 2.0.1 (inherited from prior entries)
 
 - Railway / `/legion` header "now" tok/s is 0 when no agent is running; only live nodes count toward now (chart buckets still use the full trailing window) (#136).
 - Narrow/stacked `/legion` header truncates long run + selection badges without overwriting `⚔ /legion`; galaxy legend reserves room for failed/retired glyphs before roles (#125).
