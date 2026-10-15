@@ -179,3 +179,61 @@ test("#89 no codemode tool → no auto builtin:codemode", () => {
 		assert.equal(exts.includes(BUILTIN_CODEMODE), false);
 	});
 });
+
+test("#123 modelProvider pins --provider next to --model", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "args-provider-"));
+	try {
+		const built = buildPiArgs({
+			agent: agent(),
+			task: "recon",
+			sessionFile: "/tmp/s.jsonl",
+			tempDir: dir,
+			model: "workbuddy/hy4-preview-ioa",
+			thinking: "high",
+			modelProvider: "any-endpoint",
+		});
+		const mIdx = built.args.indexOf("--model");
+		assert.ok(mIdx >= 0, "argv must carry --model");
+		const pIdx = built.args.indexOf("--provider");
+		assert.ok(pIdx >= 0, "argv must carry --provider");
+		assert.equal(built.args[mIdx + 1], "workbuddy/hy4-preview-ioa:high");
+		assert.equal(built.args[pIdx + 1], "any-endpoint");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("#123 no modelProvider → no --provider flag", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "args-noprovider-"));
+	try {
+		const built = buildPiArgs({
+			agent: agent(),
+			task: "recon",
+			sessionFile: "/tmp/s.jsonl",
+			tempDir: dir,
+			model: "workbuddy/hy4-preview-ioa",
+		});
+		assert.ok(built.args.includes("--model"));
+		assert.equal(built.args.includes("--provider"), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("#123 no model → neither --model nor --provider", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "args-nomodel-"));
+	try {
+		const built = buildPiArgs({
+			agent: agent(),
+			task: "recon",
+			sessionFile: "/tmp/s.jsonl",
+			tempDir: dir,
+			modelProvider: "any-endpoint",
+		});
+		assert.equal(built.args.includes("--model"), false);
+		// --provider without --model is rejected by pi; both move together.
+		assert.equal(built.args.includes("--provider"), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

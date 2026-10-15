@@ -76,6 +76,8 @@ export interface BuildArgsInput {
 	sessionFile: string;
 	/** Resolved model id, may already include a `:thinking` suffix. */
 	model?: string;
+	/** Provider id for `--provider` when the resolved model id is ambiguous. */
+	modelProvider?: string;
 	thinking?: string | false;
 	/** Where to write an oversized task / system prompt. */
 	tempDir: string;
@@ -128,7 +130,17 @@ export function buildPiArgs(input: BuildArgsInput): BuildArgsResult {
 /** `--model provider/id[:thinking]`, omitted when no model resolved. */
 function pushModelArgs(args: string[], input: BuildArgsInput): void {
 	const modelArg = applyThinkingSuffix(input.model, input.thinking);
-	if (modelArg) args.push("--model", modelArg);
+	if (!modelArg) return;
+	args.push("--model", modelArg);
+	// Pin the provider so a bare model id cannot be hijacked by a colliding
+	// static provider in models.json (#123: `workbuddy/...` ids also exist under
+	// a provider with no usable auth; under `--no-extensions` the child resolved
+	// them there and died with "No API key found"). Models may carry their own
+	// slash (e.g. `any-endpoint/workbuddy/hy4-preview-ioa`), so only the longest
+	// known provider prefix qualifies; an id with no provider stays bare, and
+	// `--provider` without `--model` is rejected by pi, so both move together.
+	const provider = input.modelProvider;
+	if (provider) args.push("--provider", provider);
 }
 
 export const CHILD_INHERIT_EXTENSIONS_ENV = "PI_LEGION_CHILD_INHERIT_EXTENSIONS";

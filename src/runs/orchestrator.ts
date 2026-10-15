@@ -495,6 +495,8 @@ export class Orchestrator {
 		name?: string;
 		team?: string;
 		model?: string;
+		/** Provider id pinning `--provider` for an ambiguous bare model id (#123). */
+		modelProvider?: string;
 		thinking?: string | false;
 		worktree?: boolean;
 		modelOrigin?: ModelOrigin;
@@ -602,6 +604,7 @@ export class Orchestrator {
 					cwd: worktreePath ?? this.cwd,
 					env: childEnv,
 					...(model ? { model } : {}),
+					...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
 					...(input.stripLegionIdentity ? { stripLegionIdentity: true } : {}),
 					...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
 					...(input.agent.allowNestedSubagents !== undefined && !input.agent.utility ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
