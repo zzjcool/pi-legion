@@ -11,11 +11,26 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
-### Changed
+## [2.0.4] — 2026-10-15
 
-- TUI context viewer (status-bar / railway click): floating modal with dim mask,
-  title bar marking **主** vs **子**, and Esc / mask / Esc-hint close without
-  retire or stop (#147).
+### Added
+
+- `/legion timing [--json] [<name>]`: subagent wall / generation / other timing table
+  (reuses session summary parsers; live wall marked `+`; footer span vs sum_wall)
+  (#148 / #150).
+- `/legion` independent **timing** panel (4th pane): wide right-top / stacked bottom /
+  portrait between chart↔log; fields align CLI timing; Tab / ↑↓ / Enter / `o` →
+  context float (#151 / #152).
+- TUI context viewer is a floating modal (dim mask, title **主**/**子**); Esc / mask
+  closes without retire or stop (#147 / #149).
+
+### Fixed
+
+- `subagent({ action: "status" })` without `name` returns a live-children overview
+  (consistent with wait/stop `all` and slash `/legion status`) (#145 / #146).
+- Chart `tok/s · by role` x-domain freezes while idle: `to` advances only on
+  substantive `tokensOut` / `generationMs` samples (not wall-clock / flat-collapse)
+  (#153 / #154).
 
 ## [2.0.3] — 2026-10-15
 
@@ -149,7 +164,8 @@ branch — pin `pi-legion@0.16.x` if you still need that model. See
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v2.0.4...HEAD
+[2.0.4]: https://github.com/zzjcool/pi-legion/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/zzjcool/pi-legion/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/zzjcool/pi-legion/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/zzjcool/pi-legion/compare/v2.0.0...v2.0.1
