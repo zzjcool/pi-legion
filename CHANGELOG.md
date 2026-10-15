@@ -11,6 +11,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Changed
+
+- TUI context viewer (status-bar / railway click): floating modal with dim mask,
+  title bar marking **主** vs **子**, and Esc / mask / Esc-hint close without
+  retire or stop (#147).
+
 ## [2.0.3] — 2026-10-15
 
 ### Fixed

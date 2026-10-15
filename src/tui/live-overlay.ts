@@ -21,6 +21,9 @@ import {
 } from "./chat-items.ts";
 
 export interface LiveOverlayNode extends Pick<LegionNode, "id" | "name" | "role" | "model" | "status" | "createdAt" | "updatedAt"> {
+	/** Null parent = root/主 agent; set for 子 agents so the modal title can mark 主/子. */
+	parentId?: string | null;
+	depth?: number;
 	turn?: number;
 	turns?: number;
 	sessionFile?: string | null;
@@ -147,6 +150,11 @@ const DEFAULT_BACKFILL_TURNS = 3;
 const DEFAULT_TERMINAL_ROWS = 24;
 const TOOL_COLLAPSED_PREVIEW_LINES = 10;
 const BACKFILL_POLL_INTERVAL_MS = 250;
+/** Outer dim mask rows when the terminal is tall enough for a clear floating modal. */
+const MODAL_MARGIN_Y_COMFORTABLE = 1;
+/** Outer dim mask columns (left/right) outside the modal border. */
+const MODAL_MARGIN_X_COMFORTABLE = 2;
+const MODAL_CLOSE_HINT = "Esc";
 
 /**
  * Build an on-demand context-viewer controller. Calling `open` subscribes to
@@ -287,7 +295,13 @@ function createSession(
 		return value;
 	};
 
-	const bodyPageSize = (): number => Math.max(0, currentTerminalRows() - 1);
+	/** Full terminal width last passed to render/handleMouse (modal chrome uses this). */
+	let terminalWidth = 80;
+
+	const layoutFor = (width = terminalWidth): ModalLayout =>
+		resolveModalLayout(currentTerminalRows(), Math.max(1, Math.floor(width)));
+
+	const bodyPageSize = (): number => layoutFor().bodyRows;
 
 	const mountNewItems = (): void => {
 		for (const item of mountedItems) {
@@ -661,13 +675,10 @@ function createSession(
 	};
 
 	let stopPending = false;
-	const headerLine = (width: number): string => {
-		const safeWidth = Math.max(1, Math.floor(width));
+
+	const titlePlain = (): string => {
 		const node = sourceNode();
-		if (!node) {
-			const missing = `● ${nodeId} · node unavailable`;
-			return style(options.theme, "dim", fitLine(missing, safeWidth));
-		}
+		if (!node) return `● ${nodeId} · node unavailable`;
 		const status = node.status;
 		const completed = status === "settled" || status === "failed" || status === "retired";
 		const elapsedEnd = completed ? node.updatedAt : now();
@@ -677,14 +688,42 @@ function createSession(
 			? `${Math.max(0, Math.round((now() - turnStartedAt) / 1_000))}s`
 			: undefined;
 		const turnLabel = `turn ${turnNumber}${turnElapsed !== undefined ? ` (${turnElapsed})` : ""}`;
-		const details = [
+		const kind = contextKindLabel(node, nodeId);
+		return [
 			`● ${safeText(node.name)} (${safeText(node.role)})`,
+			kind,
 			...(node.model ? [safeText(node.model)] : []),
 			turnLabel,
 			elapsed,
 			status,
-		];
-		return style(options.theme, completed ? "dim" : "accent", fitLine(details.join(" · "), safeWidth));
+		].join(" · ");
+	};
+
+	const titleBarInner = (innerWidth: number): string => {
+		const safeWidth = Math.max(1, Math.floor(innerWidth));
+		const node = sourceNode();
+		const completed = node !== undefined &&
+			(node.status === "settled" || node.status === "failed" || node.status === "retired");
+		if (stopPending) {
+			return style(
+				options.theme,
+				"accent",
+				fitLine(
+					`Stop ${safeText(node?.name ?? nodeId)}? Its own subagents are retired with it.  y stop · any other key cancel`,
+					safeWidth,
+				),
+			);
+		}
+		const closeHint = ` ${MODAL_CLOSE_HINT} `;
+		const closeWidth = visibleWidth(closeHint);
+		const titleBudget = Math.max(1, safeWidth - closeWidth);
+		const coloredTitle = style(
+			options.theme,
+			!node || completed ? "dim" : "accent",
+			fitLine(titlePlain(), titleBudget),
+		);
+		const pad = Math.max(0, titleBudget - visibleWidth(stripTerminalSequences(coloredTitle)));
+		return coloredTitle + " ".repeat(pad) + style(options.theme, "dim", closeHint);
 	};
 
 	const close = (): void => {
@@ -741,15 +780,22 @@ function createSession(
 	const component: LiveOverlayComponent = {
 		nodeId,
 		render(width) {
-			contentWidth = Math.max(1, Math.floor(width));
+			terminalWidth = Math.max(1, Math.floor(width));
+			const layout = layoutFor(terminalWidth);
+			contentWidth = layout.innerWidth;
 			lastBodyLines = renderBody(contentWidth);
 			syncScroll(lastBodyLines);
 			const start = Math.max(0, scrollTop);
-			const end = start + bodyPageSize();
-			const header = stopPending
-				? style(options.theme, "accent", fitLine(`Stop ${safeText(sourceNode()?.name ?? nodeId)}? Its own subagents are retired with it.  y stop · any other key cancel`, contentWidth))
-				: headerLine(contentWidth);
-			return [header, ...lastBodyLines.slice(start, end)];
+			const end = start + layout.bodyRows;
+			const visible = lastBodyLines.slice(start, end);
+			while (visible.length < layout.bodyRows) visible.push("");
+			return paintModalFrame({
+				layout,
+				theme: options.theme,
+				titleInner: titleBarInner(layout.innerWidth),
+				bodyLines: visible,
+				footerHint: "↑↓ scroll · Esc close · click mask to dismiss",
+			});
 		},
 		handleInput(data) {
 			if (!open) return;
@@ -794,20 +840,33 @@ function createSession(
 		},
 		handleMouse(event: TuiMouseEvent) {
 			if (!open) return undefined;
+			terminalWidth = Math.max(1, Math.floor(event.width));
+			const layout = layoutFor(terminalWidth);
+			contentWidth = layout.innerWidth;
 			if (event.type === "wheel" && event.wheelDelta) {
+				// Wheel anywhere over the overlay scrolls the modal body (mask included).
 				scrollBy(event.wheelDelta);
 				return { handled: true };
 			}
-			contentWidth = Math.max(1, Math.floor(event.width));
 			lastBodyLines = renderBody(contentWidth);
 			clampScroll(lastBodyLines);
-			const viewportY = event.y - 1;
-			if (viewportY < 0 || viewportY >= bodyPageSize()) return undefined;
-			const transcriptY = viewportY + scrollTop;
-			if (transcriptY >= lastBodyLines.length) return undefined;
+			const hit = hitTestModal(layout, event.x, event.y);
+			if (hit.zone === "mask" || hit.zone === "close") {
+				if (event.type === "click" && event.button === "left") {
+					// Esc / mask / close: dismiss only — never retire or stop (esc-no-retire-v3).
+					close();
+					return { handled: true };
+				}
+				return { handled: true };
+			}
+			if (hit.zone !== "body" || hit.bodyY === undefined) return { handled: true };
+			const transcriptY = hit.bodyY + scrollTop;
+			if (transcriptY >= lastBodyLines.length) return { handled: true };
 			return transcript.handleMouse({
 				...event,
+				x: hit.bodyX ?? 0,
 				y: transcriptY,
+				width: layout.innerWidth,
 				height: lastBodyLines.length,
 			});
 		},
@@ -871,4 +930,126 @@ function style(
 	line: string,
 ): string {
 	return theme ? theme.fg(color, line) : line;
+}
+
+/** Label the viewed agent as 主 (root) or 子 (child) for the modal title bar. */
+export function contextKindLabel(node: LiveOverlayNode | undefined, nodeId: string): "主" | "子" {
+	if (node?.parentId === null || node?.depth === 0 || nodeId === "root") return "主";
+	if (node?.parentId !== undefined && node.parentId !== null) return "子";
+	if (node?.depth !== undefined && node.depth > 0) return "子";
+	// Infer from Legion id shape: root has no dots; children are parent.child…
+	return nodeId === "root" || !nodeId.includes(".") ? "主" : "子";
+}
+
+export interface ModalLayout {
+	rows: number;
+	cols: number;
+	marginY: number;
+	marginX: number;
+	titleRow: number;
+	bodyStartRow: number;
+	footerRow: number;
+	bodyRows: number;
+	innerWidth: number;
+	/** Column where modal border (│/┏) starts. */
+	frameCol: number;
+	/** Absolute screen x range of the Esc close hint in the title bar. */
+	closeColStart: number;
+	closeColEnd: number;
+}
+
+export function resolveModalLayout(rows: number, cols: number): ModalLayout {
+	const safeRows = Math.max(1, Math.floor(rows));
+	const safeCols = Math.max(1, Math.floor(cols));
+	// Prefer a 1-row dim mask; collapse it on short terminals so body still has room.
+	const marginY = safeRows >= 6 ? MODAL_MARGIN_Y_COMFORTABLE : 0;
+	const marginX = safeCols >= 24 ? MODAL_MARGIN_X_COMFORTABLE : safeCols >= 12 ? 1 : 0;
+	const chromeY = 2 * marginY + 2; // masks + title + footer
+	const bodyRows = Math.max(1, safeRows - chromeY);
+	const frameCol = marginX;
+	const innerWidth = Math.max(1, safeCols - 2 * marginX - 2);
+	const titleRow = marginY;
+	const bodyStartRow = marginY + 1;
+	const footerRow = marginY + 1 + bodyRows;
+	const closeWidth = visibleWidth(` ${MODAL_CLOSE_HINT} `);
+	const closeColEnd = frameCol + 1 + innerWidth;
+	const closeColStart = Math.max(frameCol + 1, closeColEnd - closeWidth);
+	return {
+		rows: safeRows,
+		cols: safeCols,
+		marginY,
+		marginX,
+		titleRow,
+		bodyStartRow,
+		footerRow,
+		bodyRows,
+		innerWidth,
+		frameCol,
+		closeColStart,
+		closeColEnd,
+	};
+}
+
+type ModalHitZone = "mask" | "close" | "title" | "body" | "footer";
+
+function hitTestModal(
+	layout: ModalLayout,
+	x: number,
+	y: number,
+): { zone: ModalHitZone; bodyX?: number; bodyY?: number } {
+	if (y < layout.marginY || y >= layout.rows - layout.marginY) return { zone: "mask" };
+	if (x < layout.frameCol || x >= layout.frameCol + layout.innerWidth + 2) return { zone: "mask" };
+	if (y === layout.titleRow) {
+		if (x >= layout.closeColStart && x < layout.closeColEnd) return { zone: "close" };
+		return { zone: "title" };
+	}
+	if (y === layout.footerRow) return { zone: "footer" };
+	if (y >= layout.bodyStartRow && y < layout.bodyStartRow + layout.bodyRows) {
+		return {
+			zone: "body",
+			bodyX: Math.max(0, x - (layout.frameCol + 1)),
+			bodyY: y - layout.bodyStartRow,
+		};
+	}
+	return { zone: "mask" };
+}
+
+function padToInner(line: string, innerWidth: number): string {
+	const clipped = fitLine(line, innerWidth);
+	const pad = Math.max(0, innerWidth - visibleWidth(stripTerminalSequences(clipped)));
+	return clipped + " ".repeat(pad);
+}
+
+function paintModalFrame(input: {
+	layout: ModalLayout;
+	theme: LiveOverlayTheme | undefined;
+	titleInner: string;
+	bodyLines: readonly string[];
+	footerHint: string;
+}): string[] {
+	const { layout, theme, titleInner, bodyLines, footerHint } = input;
+	const dim = (s: string) => style(theme, "dim", s);
+	const accent = (s: string) => style(theme, "accent", s);
+	const lines: string[] = [];
+	const maskLine = dim(" ".repeat(layout.cols));
+	const leftMask = dim(" ".repeat(layout.marginX));
+	const rightMaskWidth = Math.max(0, layout.cols - layout.marginX - layout.innerWidth - 2);
+	const rightMask = dim(" ".repeat(rightMaskWidth));
+	const top = leftMask + accent("┏") + padToInner(titleInner, layout.innerWidth) + accent("┓") + rightMask;
+	const bottom = leftMask +
+		accent("┗") +
+		padToInner(dim(` ${footerHint} `), layout.innerWidth) +
+		accent("┛") +
+		rightMask;
+
+	for (let i = 0; i < layout.marginY; i++) lines.push(maskLine);
+	lines.push(top);
+	for (let i = 0; i < layout.bodyRows; i++) {
+		const body = padToInner(bodyLines[i] ?? "", layout.innerWidth);
+		lines.push(leftMask + accent("┃") + body + accent("┃") + rightMask);
+	}
+	lines.push(bottom);
+	for (let i = 0; i < layout.marginY; i++) lines.push(maskLine);
+	while (lines.length < layout.rows) lines.push(maskLine);
+	return lines.slice(0, layout.rows);
 }
