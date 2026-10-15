@@ -31,9 +31,9 @@ interrupted (parent turn ended; children still running)
 - `session_shutdown` → `shutdownRetireAll`（交互立刻 retire；`--print` / JSON 先 `drainBeforeShutdown` 再 retire）
 - SIGINT / 进程退出 = 主进程退出 = retire
 
-### D. TUI 提示（Nova 跟进）
+### D. TUI 提示
 
-常驻 `/legion stop` 提示（aboveEditor / tree strip / 宽度截断）不在本契约的核心实现范围；hint 常量去掉 `esc stop all` 前缀，idle 门控与 railway 截断由 Nova 单独落地。
+有 live child 时，aboveEditor 状态栏常驻 `/legion stop [name|all]`（短版 `/legion stop`）：railway header 在宽度挤压下可截断摘要以保短 hint；`PI_LEGION_STRIP=tree` 在 header 下另起一行短提示。无 idle 门控。
 
 ## 语义边界
 

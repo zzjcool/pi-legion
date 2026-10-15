@@ -1,7 +1,7 @@
 /**
  * Broader mock-llm e2e for legion behaviours that previously needed a live model:
  * multi-child railway (connectors / vanish / lockstep), stop one+all,
- * idle strip hint vs main busy, auto-doctor on model-miss / memory refuse,
+ * persistent stop strip hint while live, auto-doctor on model-miss / memory refuse,
  * verify concurrency ≤2.
  *
  * Always uses dummy apiKey "mock" — never copies host auth.json or real keys.
@@ -177,7 +177,7 @@ test("e2e: mock stop-all scenario + /legion stop one/all", async () => {
 	}
 });
 
-test("e2e: idle hint shows only when setIdleHint(true); hidden while main busy", async () => {
+test("e2e: stop hint is persistent on railway while live children exist", async () => {
 	const mock = await startMockLlm({ scenario: "echo", port: 0 });
 	const homeDir = mkdtempSync(path.join(tmpdir(), "mle2e-hint-"));
 	try {
@@ -207,11 +207,7 @@ test("e2e: idle hint shows only when setIdleHint(true); hidden while main busy",
 			now,
 		);
 		const comp = factory!({ requestRender() {} }, plain);
-		assert.doesNotMatch(comp.render(120)[0]!, /legion stop/, "default: main busy / no idle hint");
-		board.setIdleHint!(true);
-		assert.match(comp.render(120)[0]!, new RegExp(IDLE_STOP_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-		board.setIdleHint!(false);
-		assert.doesNotMatch(comp.render(120)[0]!, /legion stop/, "cleared when main streams again");
+		assert.match(comp.render(120)[0]!, new RegExp(IDLE_STOP_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "hint while live (no idle gate)");
 		board.clear();
 	} finally {
 		await mock.close();
