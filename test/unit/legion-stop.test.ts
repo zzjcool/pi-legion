@@ -92,15 +92,16 @@ const T0 = 1_700_000_000_000;
 const vnode = (id: string, opts: Partial<VizNode> = {}): VizNode => ({ id, name: id, role: "scout", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, ...opts });
 const ROOT = vnode("root", { name: "centurion-0", role: "centurion", parentId: null, depth: 0 });
 
-test("railway: stop hint shows dim on the header, shortens on narrow widths, hidden when not requested", () => {
+test("railway: stop hint shows dim on the header, shortens on narrow widths, truncates under squeeze", () => {
 	const nodes = [ROOT, vnode("scout-1")];
 	const wide = renderRailway({ nodes, now: T0 + 60_000, width: 120, rate: 0, hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT })!;
 	assert.match(wide.canvas.toPlain()[0]!, /\/legion stop \[name\|all\]/);
 	const narrow = renderRailway({ nodes, now: T0 + 60_000, width: 50, rate: 0, hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT })!;
 	assert.match(narrow.canvas.toPlain()[0]!, / \/legion stop /);
 	assert.doesNotMatch(narrow.canvas.toPlain()[0]!, /name\|all/);
+	// Width 40 used to drop the hint entirely; now reserve/truncate so short form survives.
 	const tiny = renderRailway({ nodes, now: T0 + 60_000, width: 40, rate: 0, hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT })!;
-	assert.doesNotMatch(tiny.canvas.toPlain()[0]!, /legion stop/);
+	assert.match(tiny.canvas.toPlain()[0]!, /\/legion stop/);
 	for (const r of [wide, narrow, tiny]) for (const line of r.canvas.toPlain()) assert.equal(Array.from(line).length, r.canvas.width);
 	const none = renderRailway({ nodes, now: T0 + 60_000, width: 120, rate: 0 })!;
 	assert.doesNotMatch(none.canvas.toPlain()[0]!, /legion stop/);
@@ -124,7 +125,7 @@ test("legion view: x on a live selected agent asks to stop; ended or no selectio
 	assert.equal(handleViewKey("x", state, nodes), "none");
 });
 
-test("status board: idle hint follows setIdleHint (hidden while the main agent streams)", async () => {
+test("status board: stop hint is persistent while live children exist (no idle gate)", async () => {
 	const { createStatusBoard } = await import("../../src/tui/status.ts");
 	let factory: ((tui: { requestRender(): void }, theme: unknown) => { render(w: number): string[] }) | undefined;
 	const plain = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
@@ -136,10 +137,23 @@ test("status board: idle hint follows setIdleHint (hidden while the main agent s
 		{ name: "scout-1", agent: "scout", state: "running", startedAt: now - 30_000, nodeId: "root.s", parentId: "root", depth: 1 },
 	], now);
 	const comp = factory!({ requestRender() {} }, plain);
-	assert.doesNotMatch(comp.render(120)[0]!, /legion stop/);
-	board.setIdleHint!(true);
-	assert.match(comp.render(120)[0]!, /\/legion stop \[name\|all\]/);
-	board.setIdleHint!(false);
-	assert.doesNotMatch(comp.render(120)[0]!, /legion stop/);
+	assert.match(comp.render(120)[0]!, /\/legion stop \[name\|all\]/, "railway: hint while live");
+	board.clear();
+});
+
+test("status board: tree strip shows short /legion stop hint while live", async () => {
+	const { createStatusBoard } = await import("../../src/tui/status.ts");
+	let factory: ((tui: { requestRender(): void }, theme: unknown) => { render(w: number): string[] }) | undefined;
+	const plain = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+	const board = createStatusBoard({ strip: "tree" });
+	board.bind({ hasUI: true, ui: { theme: plain, setStatus() {}, setWidget(_k: string, c: unknown) { factory = typeof c === "function" ? c as never : undefined; } } } as never);
+	const now = Date.now();
+	board.paint([
+		{ name: "centurion-0", agent: "centurion", state: "running", startedAt: now - 60_000, nodeId: "root", parentId: null, depth: 0 },
+		{ name: "scout-1", agent: "scout", state: "running", startedAt: now - 30_000, nodeId: "root.s", parentId: "root", depth: 1 },
+	], now);
+	const lines = factory!({ requestRender() {} }, plain).render(120);
+	assert.match(lines[1]!, /\/legion stop$/, "tree strip short hint on its own row");
+	assert.doesNotMatch(lines.join("\n"), /name\|all/);
 	board.clear();
 });

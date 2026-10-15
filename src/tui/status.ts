@@ -608,8 +608,6 @@ export interface StatusBoard {
 	vizSnapshot?(now?: number): StatusVizSnapshot;
 	paint(entries: StatusEntry[], now: number): void;
 	clear(): void;
-	/** Show the idle stop hint in the railway header (main agent idle, children live). */
-	setIdleHint?(on: boolean): void;
 	/** The TUI the widget is mounted in, when registered (for focus/overlay checks). */
 	getTui?(): unknown;
 }
@@ -646,7 +644,6 @@ export function createStatusBoard(options: {
 	let tui: WidgetTui | undefined;
 	let railScroll: RailScroll = { offset: 0 };
 	let railWindow: { offset: number; total: number; maxLanes: number } | undefined;
-	let idleHint = false;
 
 	const renderLines = (now: number, theme: Theme, width?: number): {
 		lines: string[];
@@ -655,7 +652,8 @@ export function createStatusBoard(options: {
 	} => {
 		if (strip === "railway" && hasTreeIdentity(entries) && width !== undefined && width >= 20) {
 			const nodes = nodesFromEntries(entries);
-			const hint = idleHint ? { hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT } : {};
+			// Live-child gate: railway only renders when lanes exist; always show stop hint.
+			const hint = { hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT };
 			const rendered = railwayLines({ nodes, now, width, rate: sampler.nowRate(now, nodes), scroll: railScroll, ...hint }, theme);
 			// Persist the clamped window (anchored on the top lane's agent) so later
 			// renders follow ends/starts without jumping; resets to 0 when all fit.
@@ -666,10 +664,14 @@ export function createStatusBoard(options: {
 		railWindow = undefined;
 		const visible = visiblePanelEntries(entries);
 		const totals = statusTotals(entries);
-		const rows = formatWidgetRows(visible, now, totals);
+		let rows = formatWidgetRows(visible, now, totals);
+		// Tree strip + Legion identity: short stop hint on its own row (survives width squeeze).
+		if (strip === "tree" && hasTreeIdentity(entries) && rows.length > 0) {
+			rows = [rows[0]!, { text: IDLE_STOP_HINT_SHORT }, ...rows.slice(1)];
+		}
 		const nodeIdsByRow = rows.map((row) => row.nodeId);
 		return {
-			lines: themeLines(formatWidgetLines(visible, now, totals), theme),
+			lines: themeLines(rows.map((row) => row.text), theme),
 			hitAt: (_x, y) => nodeIdsByRow[y],
 		};
 	};
@@ -795,11 +797,6 @@ export function createStatusBoard(options: {
 			entries = next;
 			if (hasTreeIdentity(next)) sampler.record(_now, nodesFromEntries(next));
 			paint();
-		},
-		setIdleHint(on) {
-			if (idleHint === on) return;
-			idleHint = on;
-			tui?.requestRender();
 		},
 		getTui() {
 			return tui;

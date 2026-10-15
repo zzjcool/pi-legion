@@ -44,9 +44,9 @@ export interface RailInput {
 	windowMs?: number;
 	/** Lane scroll position when more agents are live than lanes fit. */
 	scroll?: RailScroll;
-	/** Dim hint on the header rule (e.g. stop controls while the main agent is idle). */
+	/** Dim hint on the header rule (e.g. `/legion stop` while children are live). */
 	hint?: string;
-	/** Shorter variant used when the full hint does not fit. */
+	/** Shorter variant used when the full hint does not fit; truncated further under squeeze. */
 	hintShort?: string;
 }
 
@@ -234,18 +234,41 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	const winLabel = ` −${Math.max(1, Math.round(windowMs / 60000))}m `;
 	canvas.text(LX + 1, 0, winLabel, "dim");
 	const range = above || below ? ` · ${scrollIndicator(current.offset, rows, live)} ${above ? "▲" : " "}${below ? "▼" : " "}` : "";
-	const header = portrait
+	const headerFull = portrait
 		? ` ${live} live${range} · ${rateText} `
 		: ` legion ${live} live${range} · ${rateText} `;
-	const headerX = Math.max(LX + 1 + winLabel.length, width - header.length - 1);
-	canvas.text(headerX, 0, header, "accent", { bold: true, maxX: width - 1 });
+	// Hint sits between the window label and the right-hand summary. Prefer the
+	// full string, then short; when width squeezes, shrink the summary so the
+	// short `/legion stop` still fits, and only then ellipsize the hint.
+	const labelEnd = LX + 1 + winLabel.length;
+	const hx = labelEnd + 1;
+	let header = headerFull;
+	let headerX = Math.max(labelEnd, width - Array.from(header).length - 1);
+	let hintPick: string | undefined;
 	if (input.hint) {
-		// Between the window label and the summary, with a rule gap on both sides.
-		const hx = LX + 1 + winLabel.length + 1;
-		const room = headerX - 1 - hx;
-		const pick = [input.hint, input.hintShort].find((text) => text && Array.from(text).length + 2 <= room);
-		if (pick) canvas.text(hx, 0, ` ${pick} `, "dim");
+		const short = input.hintShort ?? input.hint;
+		const shortBlock = Array.from(short).length + 2; // leading+trailing spaces
+		const gap = 1; // rule cell between hint and summary
+		const needHeaderX = hx + shortBlock + gap;
+		if (headerX < needHeaderX) {
+			// Pull/truncate the summary so short hint keeps a slot.
+			headerX = Math.min(width - 1, Math.max(needHeaderX, labelEnd));
+			const avail = Math.max(0, width - 1 - headerX);
+			header = avail >= 3 ? ` ${ellipsize(headerFull.trim(), avail - 2)} ` : "";
+			if (header) headerX = Math.max(labelEnd, width - Array.from(header).length - 1);
+			// Re-assert short reservation if summary still crowds the hint.
+			if (header && headerX < needHeaderX) {
+				headerX = needHeaderX;
+				const clipped = Math.max(0, width - 1 - headerX);
+				header = clipped >= 3 ? ` ${ellipsize(headerFull.trim(), clipped - 2)} ` : "";
+			}
+		}
+		const room = Math.max(0, (header ? headerX - 1 : width - 1) - hx);
+		hintPick = [input.hint, input.hintShort].find((text) => text && Array.from(text).length + 2 <= room);
+		if (!hintPick && room >= 3) hintPick = ellipsize(short, room - 2);
 	}
+	if (header) canvas.text(headerX, 0, header, "accent", { bold: true, maxX: width - 1 });
+	if (hintPick) canvas.text(hx, 0, ` ${hintPick} `, "dim");
 	for (const [c, tick] of headerTicks) {
 		if (canvas.get(LX + c, 0)?.ch !== "─") continue; // never draw over header text
 		canvas.set(LX + c, 0, "┬", tick.color);

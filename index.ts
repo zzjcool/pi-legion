@@ -993,7 +993,6 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	});
 
 	pi.on("session_start", (event, ctx) => {
-		runtime.setParentIdle(ctx.isIdle?.() ?? true);
 		bindUi(event, ctx);
 	});
 	pi.on("session_info_changed", bindUi);
@@ -1006,11 +1005,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		bindUi(event, ctx);
 	});
 	pi.on("agent_start", (event, ctx) => {
-		runtime.setParentIdle(false);
 		bindUi(event, ctx);
 	});
 	pi.on("agent_end", (event, ctx) => {
-		runtime.setParentIdle(true);
 		bindUi(event, ctx);
 	});
 	pi.on("input", bindUi);

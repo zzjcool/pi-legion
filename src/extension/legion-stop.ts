@@ -113,6 +113,6 @@ export async function runLegionStop(arg: string, deps: StopDeps): Promise<string
 	return say(result.text, result.ok ? "info" : "error");
 }
 
-/** Dim hint shown in the railway header while children are live (Nova may redesign gating). */
+/** Dim hint shown in the status strip while children are live (aboveEditor / tree). */
 export const IDLE_STOP_HINT = "/legion stop [name|all]";
 export const IDLE_STOP_HINT_SHORT = "/legion stop";

@@ -809,7 +809,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		for (const line of LEGION_SLASH_HELP_LINES) push(`    ${line}`);
 		push(`- stop wired: ${runtime.stopAvailable === undefined ? "(unknown)" : runtime.stopAvailable ? "yes" : "no"}`);
 		push(`- idle Esc stop wired: ${runtime.idleEscWired === undefined ? "(unknown)" : runtime.idleEscWired ? "yes" : "no"}`);
-		push(`- idle strip hints: "${IDLE_STOP_HINT}" / short "${IDLE_STOP_HINT_SHORT}"`);
+		push(`- stop strip hints: "${IDLE_STOP_HINT}" / short "${IDLE_STOP_HINT_SHORT}"`);
 		push(`- legion tools registered: ${(runtime.legionTools ?? ["(unknown — typically subagent, vexillatio, legion-* mail/tools)"]).join(", ")}`);
 		push("- slash: `/legion doctor [section]`");
 		push("- tool: `subagent({ action: \"diagnose\", section? })` — optional section filter (same as `/legion doctor [section]`)");
