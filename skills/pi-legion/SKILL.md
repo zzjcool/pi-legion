@@ -93,10 +93,15 @@ Steer, inspect, collect, resume, or retire children with the `subagent` tool:
 ```text
 subagent({ action: "status", name: "worker-0" })
 subagent({ action: "collect", name: "worker-0" })
+subagent({ action: "wait", all: true })
+subagent({ action: "wait", name: "worker-0" })
 subagent({ action: "steer", name: "worker-0", message: "Focus on the parser tests." })
 subagent({ action: "resume", name: "worker-0" })
 subagent({ action: "retire", name: "worker-0" })
 ```
+
+`wait` always needs a target: pass `all: true` for every live child, or `name`
+for one child (mutually exclusive). A bare `action: "wait"` is rejected.
 
 A person can read that same status without a tool call: `/legion status` for
 the tree, `/legion status <name>` for one child.

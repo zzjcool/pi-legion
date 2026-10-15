@@ -44,5 +44,8 @@ test("resolveWaitTargets: an untracked name fails with the unknown-child wording
 test("resolveWaitTargets: neither name nor all is rejected", () => {
 	const result = resolveWaitTargets({}, [{ name: "a", state: "working" }]);
 	assert.equal(result.ok, false);
-	if (!result.ok) assert.match(result.message, /`name` or `all` is required for wait/);
+	if (!result.ok) {
+		assert.match(result.message, /`name` or `all` is required for wait/);
+		assert.match(result.message, /try all:true or name:"child-name"/);
+	}
 });
