@@ -369,6 +369,93 @@ test("galaxy legend: failed and retired glyphs appear only when those statuses e
 	assert.ok(legend.includes("⣿ retired"), legend);
 });
 
+test("viz #125: narrow 80x24 + long names keep /legion, truncate labels, reserve failed legend", () => {
+	const sampler = new RateSampler();
+	const now = sec(60);
+	const longRoot = node("root", {
+		name: "centurion-with-a-very-long-run-name-that-should-truncate",
+		role: "centurion",
+		parentId: null,
+		depth: 0,
+	});
+	const nodes = [
+		longRoot,
+		node("worker-0", {
+			name: "super-long-worker-agent-name-overflow-check-aaaaaaaa",
+			role: "worker",
+			startedAt: sec(0),
+			tokens: 500,
+			tokensOut: 250,
+			generationMs: 5_000,
+		}),
+		node("scout-0", {
+			name: "another-extremely-long-scout-name-bbbbbbbbbbbbbbbb",
+			role: "scout",
+			startedAt: sec(10),
+			parentId: "worker-0",
+			depth: 2,
+			tokens: 200,
+			tokensOut: 100,
+			generationMs: 2_000,
+		}),
+		node("planner-0", {
+			name: "planner-with-insanely-long-identifier-cccccccccccc",
+			role: "planner",
+			startedAt: sec(20),
+			tokens: 300,
+			tokensOut: 150,
+			generationMs: 3_000,
+		}),
+		node("reviewer-0", {
+			name: "reviewer-name-that-is-way-too-long-for-narrow-term",
+			role: "reviewer",
+			startedAt: sec(30),
+			tokens: 100,
+			tokensOut: 50,
+			generationMs: 1_000,
+		}),
+		node("failed-0", {
+			name: "failed-agent-with-long-name-dddddddddddddddddddd",
+			role: "worker",
+			status: "failed",
+			startedAt: sec(5),
+			endedAt: sec(40),
+			tokens: 50,
+			tokensOut: 25,
+			generationMs: 500,
+		}),
+	];
+	sampler.record(now, nodes);
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	for (const [w, h] of [[80, 24], [79, 24], [60, 24], [46, 24], [100, 40]] as const) {
+		const state = initialViewState();
+		state.selectedId = "worker-0";
+		const { canvas } = renderLegionView(data, state, w, h);
+		const plain = canvas.toPlain();
+		const ansi = canvas.toLines(ansiTheme);
+		assert.equal(ansi.length, h, `${w}x${h} height`);
+		for (const line of ansi) assert.equal(visibleWidth(line), w, `${w}x${h} width`);
+		assert.match(plain[0]!, /⚔ \/legion/, `${w}x${h} header keeps /legion: ${plain[0]}`);
+		assert.ok(plain[0]!.includes("…"), `${w}x${h} long names ellipsize: ${plain[0]}`);
+		const legend = plain.find((l) => l.includes("✗ failed"));
+		assert.ok(legend, `${w}x${h} missing failed legend glyph`);
+		assert.ok(!legend!.includes("retired"), `${w}x${h} no retired without retired nodes: ${legend}`);
+	}
+	const rail = renderRailway({ nodes, now, width: 80, rate: data.rate })!;
+	const railPlain = rail.canvas.toPlain();
+	assert.equal(rail.canvas.height, 5);
+	assert.ok(railPlain.every((l) => l.length === 80));
+	assert.ok(railPlain.slice(1).every((l) => l.includes("…") || l.includes("▶")));
+	assert.match(railPlain.join("\n"), /[╰╭├│┳]/); // spawn verticals present
+	for (const width of [46, 60, 79, 80]) {
+		const out = renderRailway({ nodes, now, width, rate: data.rate })!;
+		for (const line of out.canvas.toLines(ansiTheme)) {
+			assert.ok(visibleWidth(line) <= width, `rail ${width}: ${visibleWidth(line)}`);
+		}
+		assert.ok(out.canvas.toPlain().some((l) => l.includes("…")), `rail ${width} truncates long names`);
+	}
+});
+
 test("viz: duplicate child names from nested supervisors are disambiguated by parent", () => {
 	const entries: StatusEntry[] = [
 		{ name: "root", agent: "root", state: "running", startedAt: T0, nodeId: "root", parentId: null, depth: 0 },
