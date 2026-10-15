@@ -7,7 +7,7 @@ import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } 
 import { assignLanes, axisColumn, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
-import { buildLog, computeStats, timingRowsFromNodes } from "../../src/tui/viz/panels.ts";
+import { buildLog, chartWindow, computeStats, timingRowsFromNodes } from "../../src/tui/viz/panels.ts";
 import { createLegionViewFactory, handleViewKey, initialViewState, MIN_SELECTION_BADGE_W, renderLegionView } from "../../src/tui/viz/view.ts";
 import { cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
@@ -326,6 +326,79 @@ test("rate: sub-second ΔgenerationMs floor; ≥1s still uses generation denomin
 	under.record(sec(60), [ROOT, node("c", { tokensOut: 500, generationMs: MIN_RATE_GENERATION_MS - 1 })]);
 	const below = under.nodeRate("c", sec(60));
 	assert.ok(Math.abs(below - 500 / 60) < 1e-6, `below floor expected wall got ${below}`);
+});
+
+test("rate: lastChangeAt advances only on tokensOut/gen change, not flat-collapse", () => {
+	const sampler = new RateSampler();
+	const a0 = node("a", { tokensOut: 0, generationMs: 0 });
+	sampler.record(sec(0), [ROOT, a0]);
+	assert.equal(sampler.lastChangeAt, sec(0));
+	// Steady climb — each tick changes counters → lastChangeAt tracks.
+	sampler.record(sec(10), [ROOT, node("a", { tokensOut: 100, generationMs: 10_000 })]);
+	assert.equal(sampler.lastChangeAt, sec(10));
+	sampler.record(sec(20), [ROOT, node("a", { tokensOut: 200, generationMs: 20_000 })]);
+	assert.equal(sampler.lastChangeAt, sec(20));
+	// Two flat samples then collapse: counters unchanged → lastChangeAt frozen.
+	const flat = node("a", { tokensOut: 200, generationMs: 20_000 });
+	sampler.record(sec(30), [ROOT, flat]);
+	assert.equal(sampler.lastChangeAt, sec(20), "first flat sample does not change counters after prior equal push");
+	sampler.record(sec(40), [ROOT, flat]);
+	assert.equal(sampler.lastChangeAt, sec(20), "flat-collapse must not advance lastChangeAt");
+	sampler.record(sec(90), [ROOT, flat]);
+	assert.equal(sampler.lastChangeAt, sec(20), "prolonged idle flat-collapse still frozen");
+	// New tokens → advance again.
+	sampler.record(sec(100), [ROOT, node("a", { tokensOut: 300, generationMs: 30_000 })]);
+	assert.equal(sampler.lastChangeAt, sec(100));
+});
+
+test("chartWindow: no new samples → domain stable (does not follow wall now)", () => {
+	const sampler = new RateSampler();
+	const live = (t: number, out: number, gen: number) =>
+		node("worker-1", { startedAt: sec(0), tokensOut: out, generationMs: gen, tokens: out });
+	sampler.record(sec(0), [ROOT, live(0, 0, 0)]);
+	sampler.record(sec(30), [ROOT, live(30, 3000, 30_000)]);
+	sampler.record(sec(60), [ROOT, live(60, 6000, 60_000)]);
+	const nodes = [ROOT, live(60, 6000, 60_000)];
+	const atChange = chartWindow({ nodes, sampler, now: sec(60), rate: 0 });
+	assert.equal(atChange.to, sec(60));
+	assert.equal(atChange.from, Math.min(sec(0), sec(60) - 60_000));
+
+	// Wall clock keeps ticking; flat-collapse may move sample ts, but domain freezes.
+	const flat = live(60, 6000, 60_000);
+	for (const t of [70, 80, 120, 180]) sampler.record(sec(t), [ROOT, flat]);
+	const idleNow = sec(180);
+	const frozen = chartWindow({ nodes: [ROOT, flat], sampler, now: idleNow, rate: 0 });
+	assert.equal(frozen.to, atChange.to, "to must not follow wall now while idle");
+	assert.equal(frozen.from, atChange.from, "from stays relative to frozen to");
+	assert.ok(frozen.to < idleNow, "trailing empty time: to < wall now");
+
+	// New data unlocks the window.
+	sampler.record(sec(200), [ROOT, live(200, 8000, 80_000)]);
+	const advanced = chartWindow({
+		nodes: [ROOT, live(200, 8000, 80_000)],
+		sampler,
+		now: sec(200),
+		rate: 0,
+	});
+	assert.equal(advanced.to, sec(200));
+	assert.ok(advanced.to > frozen.to);
+	assert.equal(advanced.from, Math.min(sec(0), sec(200) - 60_000));
+});
+
+test("chartWindow: from stays min(earliest, to−60s) against frozen to", () => {
+	const sampler = new RateSampler();
+	// Long run: earliest is far before to−60s → from == earliest (full history).
+	const early = node("old", { startedAt: sec(0), tokensOut: 100, generationMs: 1000 });
+	sampler.record(sec(0), [ROOT, early]);
+	for (let t = 60; t <= 600; t += 60) {
+		sampler.record(sec(t), [ROOT, node("old", { startedAt: sec(0), tokensOut: t * 10, generationMs: t * 1000 })]);
+	}
+	const nodes = [ROOT, node("old", { startedAt: sec(0), tokensOut: 6000, generationMs: 600_000 })];
+	const w = chartWindow({ nodes, sampler, now: sec(900), rate: 0 });
+	assert.equal(w.to, sec(600), "idle wall now does not extend to");
+	assert.equal(w.from, sec(0), "earliest wins over to−60s when run is long");
+	// Short run near the end of a late start: from == to−60s when earliest is fresher... 
+	// earliest at sec(0) is older than to−60s=sec(540), so min keeps sec(0). Already asserted.
 });
 
 test("rate: header tok/s and chart 'now' share one definition", () => {
