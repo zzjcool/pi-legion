@@ -1446,3 +1446,68 @@ test("runtime: turn_start resets a frozen current turn on tree nodes", () => {
 		runtime.dispose();
 	}
 });
+
+test("runtime: Esc/wait interrupt does not clear busy activity", async () => {
+	const busy: Array<{ active: boolean; label?: string; children?: readonly string[] }> = [];
+	let resolveCollect!: (snapshot: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		emitBusy(active, label, children) {
+			busy.push({ active, label, children });
+		},
+		now: () => 1_000,
+	});
+	runtime.track({
+		name: "scout",
+		runId: "r-1",
+		agent: "scout",
+		sessionFile: "/tmp/scout.jsonl",
+		timeoutMs: 1_000,
+		collect: () => new Promise<CollectSnapshot>((resolve) => { resolveCollect = resolve; }),
+	});
+	assert.equal(busy.at(-1)?.active, true);
+	assert.deepEqual(busy.at(-1)?.children, ["scout"]);
+	assert.equal(busy.at(-1)?.label, "1 subagent (scout)");
+
+	const controller = new AbortController();
+	const pending = runtime.wait(["scout"], { timeoutMs: 5_000, signal: controller.signal });
+	controller.abort();
+	assert.deepEqual(await pending, [{ name: "scout", interrupted: true }]);
+	assert.equal(busy.at(-1)?.active, true, "Esc must not clear legion activity");
+	assert.deepEqual(busy.at(-1)?.children, ["scout"]);
+
+	resolveCollect(snapshot());
+	await waitFor(() => busy.some((entry) => entry.active === false), "busy clears after settle");
+	runtime.dispose();
+});
+
+test("runtime: emitBusy passes live child slugs for OSC id=legion/<slug>", () => {
+	const busy: Array<{ active: boolean; children?: readonly string[] }> = [];
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		emitBusy(active, _label, children) {
+			busy.push({ active, children });
+		},
+		now: () => 1_000,
+	});
+	runtime.track({
+		name: "worker",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/w.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => snapshot(),
+	});
+	runtime.track({
+		name: "reviewer",
+		runId: "r-1",
+		agent: "reviewer",
+		sessionFile: "/tmp/r.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => snapshot(),
+	});
+	assert.deepEqual([...(busy.at(-1)?.children ?? [])].sort(), ["reviewer", "worker"]);
+	runtime.dispose();
+	assert.equal(busy.at(-1)?.active, false);
+	assert.deepEqual(busy.at(-1)?.children, []);
+});

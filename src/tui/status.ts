@@ -195,7 +195,7 @@ export function formatAgentElapsed(
 	return `${formatElapsedParts(turnElapsed, true)} / ${total}`;
 }
 
-function activeEntries(entries: StatusEntry[]): StatusEntry[] {
+export function activeEntries(entries: StatusEntry[]): StatusEntry[] {
 	return entries.filter((entry) =>
 		entry.parentId !== null && entry.depth !== 0 && ACTIVE_STATES.has(entry.herdrStatus ?? entry.state),
 	);
@@ -238,7 +238,7 @@ export function formatBusyLabel(entries: StatusEntry[]): string | undefined {
 		names.length > 0
 			? ` (${names.slice(0, 3).join(", ")}${names.length > 3 ? ", …" : ""})`
 			: "";
-	return `⏳ ${active.length} subagent${active.length === 1 ? "" : "s"}${who}`;
+	return `${active.length} subagent${active.length === 1 ? "" : "s"}${who}`;
 }
 
 function roleSuffix(entry: StatusEntry): string {
