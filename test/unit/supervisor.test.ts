@@ -662,7 +662,9 @@ test("unexpected process exit immediately resolves waitSettled as abnormal", asy
 });
 
 test("ten concurrent children keep commands, events, stats, and exits isolated", async () => {
-	const h = harness();
+	// #131: host free-mem must not gate this isolation assertion (default minFree+10×reserve can
+	// INSUFFICIENT_MEMORY on low-RAM boxes). Stub the probe; product gate stays intact.
+	const h = harness({ memoryAvailable: () => 1_000_000 });
 	try {
 		const inputs = Array.from({ length: 10 }, (_, index) =>
 			testInput(h.root, `root.worker-${index}`),
@@ -714,6 +716,52 @@ test("ten concurrent children keep commands, events, stats, and exits isolated",
 			h.clients.map((_, index) =>
 				h.supervisor.retire(`root.worker-${index}`).catch(() => {}),
 			),
+		);
+		h.close();
+	}
+});
+
+test("memory gate refuses ten-concurrent spawn when free mem is insufficient", async () => {
+	// #131: gate assertion lives here (not in the isolation test). Issue numbers:
+	// PI_LEGION_MIN_FREE_MEM_MB=1024 + 160 MB × 10 starting = 2624 required; 2469 available → refuse.
+	const prevMin = process.env.PI_LEGION_MIN_FREE_MEM_MB;
+	const prevReserve = process.env.PI_LEGION_CHILD_RESERVE_MB;
+	process.env.PI_LEGION_MIN_FREE_MEM_MB = "1024";
+	process.env.PI_LEGION_CHILD_RESERVE_MB = "160";
+	const h = harness({ memoryAvailable: () => 2469 });
+	try {
+		const inputs = Array.from({ length: 10 }, (_, index) =>
+			testInput(h.root, `root.worker-${index}`),
+		);
+		const results = await Promise.allSettled(
+			inputs.map((input) => h.supervisor.spawnChild(input)),
+		);
+		const rejected = results.filter(
+			(r): r is PromiseRejectedResult => r.status === "rejected",
+		);
+		assert.ok(rejected.length >= 1, "at least one spawn must hit INSUFFICIENT_MEMORY");
+		for (const r of rejected) {
+			const err = r.reason as { code?: string; message?: string };
+			assert.equal(err.code, "INSUFFICIENT_MEMORY");
+			assert.match(String(err.message), /insufficient memory/);
+			assert.match(String(err.message), /2624 MB required/);
+		}
+		const fulfilled = results.filter((r) => r.status === "fulfilled").length;
+		assert.equal(fulfilled + rejected.length, 10);
+		assert.ok(fulfilled < 10, "burst must not fully succeed under insufficient free mem");
+	} finally {
+		if (prevMin === undefined) delete process.env.PI_LEGION_MIN_FREE_MEM_MB;
+		else process.env.PI_LEGION_MIN_FREE_MEM_MB = prevMin;
+		if (prevReserve === undefined) delete process.env.PI_LEGION_CHILD_RESERVE_MB;
+		else process.env.PI_LEGION_CHILD_RESERVE_MB = prevReserve;
+		await Promise.all(
+			Array.from({ length: 10 }, async (_, index) => {
+				try {
+					await h.supervisor.retire(`root.worker-${index}`);
+				} catch {
+					/* never registered (gate refused before spawn) */
+				}
+			}),
 		);
 		h.close();
 	}
