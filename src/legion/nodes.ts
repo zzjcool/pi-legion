@@ -21,6 +21,13 @@ export const NON_TERMINAL_NODE_STATUSES = [
 	"retired",
 ] as const satisfies readonly NodeStatus[];
 
+/** Statuses that occupy a maxChildrenPerNode concurrency slot (not retired/session-only). */
+export const LIVE_CHILD_STATUSES = [
+	"starting",
+	"running",
+	"blocked",
+] as const satisfies readonly NodeStatus[];
+
 export interface LegionNode {
 	id: string;
 	parentId: string | null;
