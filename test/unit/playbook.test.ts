@@ -76,3 +76,10 @@ test("playbook explains RPC timeout and steering semantics", () => {
 	assert.match(PARENT_PLAYBOOK, /session JSONL/);
 	assert.match(PARENT_PLAYBOOK, /Do not tell a child to message or prompt the parent/);
 });
+
+test("playbook documents status overview vs single child (#145)", () => {
+	assert.match(PARENT_PLAYBOOK, /`status` with no name/);
+	assert.match(PARENT_PLAYBOOK, /`all: true`/);
+	assert.match(TOOL_DESCRIPTION, /`status` with no name \(or `all: true`\)/);
+	assert.match(TOOL_DESCRIPTION, /with `name` returns that one child/);
+});
