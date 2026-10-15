@@ -6,7 +6,8 @@ import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, s
 import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
-import { buildLog, computeStats } from "../../src/tui/viz/panels.ts";
+import { breakdown } from "../../src/shared/timing-breakdown.ts";
+import { buildLog, computeStats, timingRowsFromNodes } from "../../src/tui/viz/panels.ts";
 import { createLegionViewFactory, handleViewKey, initialViewState, MIN_SELECTION_BADGE_W, renderLegionView } from "../../src/tui/viz/view.ts";
 import { cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
@@ -174,9 +175,10 @@ test("layout: wide >= 140, stacked in between, portrait when narrow or tall", ()
 	assert.equal(selectLayout(120, 40), "stacked");
 	for (const [w, h] of [[46, 60], [60, 70], [100, 40], [160, 50]] as const) {
 		const l = computeLayout(w, h);
-		for (const r of [l.galaxy, l.chart, l.log]) {
+		for (const r of [l.galaxy, l.chart, l.timing, l.log]) {
 			assert.ok(r.x >= 0 && r.x + r.w <= w && r.y >= 0 && r.y + r.h <= h - 1, `${w}x${h} ${JSON.stringify(r)}`);
 		}
+		assert.ok(l.timing.w > 0 && l.timing.h > 0, `${w}x${h} timing present`);
 	}
 });
 
@@ -353,6 +355,7 @@ test("legion view: no clipping at 46x60, 60x70, 100x40, 160x50 (dark/light theme
 			const plain = canvas.toLines(plainTheme).map(stripTerminalSequences);
 			assert.ok(plain.some((l) => l.includes("galaxy")));
 			assert.ok(plain.some((l) => l.includes("tok/s")));
+			assert.ok(plain.some((l) => l.includes("timing")), `${w}x${h} missing timing`);
 			assert.ok(plain.some((l) => l.includes("log --graph")));
 		}
 	}
@@ -364,6 +367,8 @@ test("legion view: Tab cycles panes, Enter in log selects, Esc clears then exits
 	assert.equal(state.focus, "galaxy");
 	assert.equal(handleViewKey("\t", state, nodes), "render");
 	assert.equal(state.focus, "chart");
+	handleViewKey("\t", state, nodes);
+	assert.equal(state.focus, "timing");
 	handleViewKey("\t", state, nodes);
 	assert.equal(state.focus, "log");
 	handleViewKey("\x1b[B", state, nodes);
@@ -792,10 +797,20 @@ test("layout: tall terminals cap galaxy/chart heights; few events hand log space
 			assert.ok(l.galaxy.h <= Math.round(w * 0.65), `${w}x${h} galaxy ${l.galaxy.h}`);
 			assert.equal(l.galaxy.w, w);
 			assert.equal(l.chart.y, l.galaxy.y + l.galaxy.h);
-			assert.equal(l.log.y, l.chart.y + l.chart.h);
+			assert.equal(l.timing.y, l.chart.y + l.chart.h);
+			assert.equal(l.log.y, l.timing.y + l.timing.h);
+			assert.ok(l.timing.h >= 3, `${w}x${h} timing ${l.timing.h}`);
 		}
-		if (l.kind === "stacked") assert.ok(l.galaxy.h <= 24);
-		for (const r of [l.galaxy, l.chart, l.log]) assert.ok(r.y + r.h <= h - 1 && r.x + r.w <= w);
+		if (l.kind === "stacked") {
+			assert.ok(l.galaxy.h <= 24);
+			assert.ok(l.timing.w > 0 && l.timing.h > 0);
+		}
+		if (l.kind === "wide") {
+			assert.equal(l.timing.x, l.galaxy.w);
+			assert.equal(l.log.x, l.timing.x);
+			assert.equal(l.log.y, l.timing.y + l.timing.h);
+		}
+		for (const r of [l.galaxy, l.chart, l.timing, l.log]) assert.ok(r.y + r.h <= h - 1 && r.x + r.w <= w);
 	}
 	const many = computeLayout(110, 120, { logEvents: 200 });
 	const few = computeLayout(110, 120, { logEvents: 4 });
@@ -1311,4 +1326,77 @@ test("status board: scrolled railway keeps the spawn vertical for a live child",
 	assert.equal(lines[1]!.join("").includes("┄"), false);
 	assert.equal(lines[2]!.join("").includes("┄"), false);
 	board.clear();
+});
+
+
+test("timing panel #151: rows derive wall(+)/gen/other from VizNode; narrow hides gen/other", () => {
+	const now = sec(600);
+	const nodes = [
+		ROOT,
+		node("worker-0", {
+			role: "worker",
+			startedAt: sec(0),
+			status: "settled",
+			endedAt: sec(120),
+			generationMs: 60_000,
+		}),
+		node("scout-0", {
+			role: "scout",
+			startedAt: sec(100),
+			status: "running",
+			generationMs: 0, // no turn data → —
+		}),
+	];
+	const rows = timingRowsFromNodes(nodes, now);
+	assert.equal(rows.length, 2);
+	assert.equal(rows[0]!.node.id, "worker-0");
+	assert.equal(rows[0]!.wallMs, 120_000);
+	assert.equal(rows[0]!.generationMs, 60_000);
+	assert.equal(rows[0]!.otherMs, 60_000);
+	assert.equal(rows[0]!.liveWall, false);
+	assert.equal(rows[1]!.node.id, "scout-0");
+	assert.equal(rows[1]!.liveWall, true);
+	assert.equal(rows[1]!.wallMs, now - sec(100));
+	assert.equal(rows[1]!.generationMs, null);
+	assert.equal(rows[1]!.otherMs, null);
+
+	const sampler = new RateSampler();
+	const data = { nodes, sampler, now, rate: 0 };
+	const wide = renderLegionView(data, initialViewState(), 160, 50);
+	assert.equal(wide.layout, "wide");
+	const widePlain = wide.canvas.toPlain().join("\n");
+	assert.match(widePlain, /timing/);
+	assert.match(widePlain, /worker-0/);
+	assert.match(widePlain, /2m00s/); // wall settled
+	assert.match(widePlain, /1m00s/); // gen or other
+	assert.match(widePlain, /\+/); // live scout wall
+
+	const narrow = renderLegionView(data, initialViewState(), 46, 60);
+	assert.equal(narrow.layout, "portrait");
+	const narrowPlain = narrow.canvas.toPlain().join("\n");
+	assert.match(narrowPlain, /timing/);
+	assert.match(narrowPlain, /scout-0/);
+});
+
+test("timing panel #151: Tab focuses timing; Enter selects; o opens (does not retire)", () => {
+	const { nodes } = scenario();
+	const state = initialViewState();
+	handleViewKey("\t", state, nodes); // chart
+	handleViewKey("\t", state, nodes); // timing
+	assert.equal(state.focus, "timing");
+	assert.equal(handleViewKey("\x1b[B", state, nodes), "render");
+	assert.equal(state.timingCursor, 1);
+	assert.equal(handleViewKey("\r", state, nodes), "render");
+	const rows = timingRowsFromNodes(nodes, Date.now());
+	assert.equal(state.selectedId, rows[1]!.node.id);
+	assert.equal(handleViewKey("o", state, nodes), "open");
+	// Esc clears selection only — host closes float separately; view does not retire.
+	assert.equal(handleViewKey("\x1b", state, nodes), "render");
+	assert.equal(state.selectedId, undefined);
+});
+
+test("shared breakdown matches #150 other = max(0, wall-gen)", () => {
+	assert.deepEqual(breakdown(1000, 400), { wall_ms: 1000, generation_ms: 400, other_ms: 600 });
+	assert.deepEqual(breakdown(1000, null), { wall_ms: 1000, generation_ms: null, other_ms: null });
+	assert.deepEqual(breakdown(100, 500), { wall_ms: 100, generation_ms: 500, other_ms: 0 });
 });

@@ -1,26 +1,39 @@
-/** /legion full view: galaxy + tok/s chart + git-log history with linked selection. */
+/** /legion full view: galaxy + tok/s chart + timing + git-log history with linked selection. */
 
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { Canvas, cellWidth, ellipsize } from "./canvas.ts";
 import { computeLayout, type LayoutKind } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
 import { roleColor, type VizTheme } from "./palette.ts";
-import { buildLog, dfsOrder, drawChart, drawGalaxy, drawLog, frame, type Pane, type ViewData } from "./panels.ts";
+import {
+	buildLog,
+	dfsOrder,
+	drawChart,
+	drawGalaxy,
+	drawLog,
+	drawTiming,
+	frame,
+	timingRowsFromNodes,
+	type Pane,
+	type ViewData,
+} from "./panels.ts";
 
 export interface LegionViewState {
 	focus: Pane;
 	selectedId?: string;
 	logOffset: number;
 	logCursor: number;
+	timingOffset: number;
+	timingCursor: number;
 	/** `x` pressed: an in-view y/N prompt for stopping this agent (dialogs would be hidden behind the full-screen view). */
 	pendingStopId?: string;
 }
 
 export function initialViewState(): LegionViewState {
-	return { focus: "galaxy", logOffset: 0, logCursor: 0 };
+	return { focus: "galaxy", logOffset: 0, logCursor: 0, timingOffset: 0, timingCursor: 0 };
 }
 
-const PANES: Pane[] = ["galaxy", "chart", "log"];
+const PANES: Pane[] = ["galaxy", "chart", "timing", "log"];
 
 /** Min grapheme cells before painting a selection badge. Shared by portrait + landscape so a truncated stub never paints (#128). Was portrait `>4` vs landscape `>0`. */
 export const MIN_SELECTION_BADGE_W = 5;
@@ -72,8 +85,26 @@ export function renderLegionView(data: ViewData, state: LegionViewState, cols: n
 	drawGalaxy(cv, galaxyInner, data, state.selectedId);
 	const chartInner = frame(cv, layout.chart, portrait ? "tok/s · by role" : "tok/s · stacked by role", state.focus === "chart");
 	drawChart(cv, chartInner, data, selected, !portrait);
+
+	const timingRows = timingRowsFromNodes(data.nodes, data.now);
+	const timingVisible = Math.max(1, layout.timing.h - 3);
+	clampList(state, "timing", timingRows.length, timingVisible);
+	const timingInner = frame(
+		cv,
+		layout.timing,
+		portrait ? "timing" : "timing · wall/gen/other",
+		state.focus === "timing",
+		portrait ? undefined : "↑↓ · ⏎ sel · o open",
+	);
+	drawTiming(cv, timingInner, timingRows, {
+		offset: state.timingOffset,
+		cursor: state.timingCursor,
+		focused: state.focus === "timing",
+		...(state.selectedId ? { selectedId: state.selectedId } : {}),
+	});
+
 	const events = buildLog(data.nodes);
-	clampLog(state, events.length, Math.max(1, layout.log.h - 3));
+	clampList(state, "log", events.length, Math.max(1, layout.log.h - 3));
 	const logInner = frame(cv, layout.log, "log --graph", state.focus === "log", portrait ? undefined : "↑↓ scroll · ⏎ select");
 	drawLog(cv, logInner, events, {
 		offset: state.logOffset,
@@ -112,11 +143,23 @@ function statusLabel(node: VizNode): string {
 	return node.status === "settled" ? "done" : node.status;
 }
 
-function clampLog(state: LegionViewState, count: number, visible: number): void {
-	state.logCursor = Math.max(0, Math.min(state.logCursor, count - 1));
-	if (state.logCursor < state.logOffset) state.logOffset = state.logCursor;
-	if (state.logCursor >= state.logOffset + visible) state.logOffset = state.logCursor - visible + 1;
-	state.logOffset = Math.max(0, Math.min(state.logOffset, Math.max(0, count - visible)));
+function clampList(
+	state: LegionViewState,
+	which: "log" | "timing",
+	count: number,
+	visible: number,
+): void {
+	if (which === "log") {
+		state.logCursor = Math.max(0, Math.min(state.logCursor, count - 1));
+		if (state.logCursor < state.logOffset) state.logOffset = state.logCursor;
+		if (state.logCursor >= state.logOffset + visible) state.logOffset = state.logCursor - visible + 1;
+		state.logOffset = Math.max(0, Math.min(state.logOffset, Math.max(0, count - visible)));
+		return;
+	}
+	state.timingCursor = Math.max(0, Math.min(state.timingCursor, count - 1));
+	if (state.timingCursor < state.timingOffset) state.timingOffset = state.timingCursor;
+	if (state.timingCursor >= state.timingOffset + visible) state.timingOffset = state.timingCursor - visible + 1;
+	state.timingOffset = Math.max(0, Math.min(state.timingOffset, Math.max(0, count - visible)));
 }
 
 export type ViewAction = "none" | "render" | "close" | "open" | "stop";
@@ -124,6 +167,7 @@ export type ViewAction = "none" | "render" | "close" | "open" | "stop";
 /** Pure key handling so it can be unit tested without a terminal. */
 export function handleViewKey(data: string, state: LegionViewState, nodes: readonly VizNode[], page = 10): ViewAction {
 	const events = buildLog(nodes);
+	const timingRows = timingRowsFromNodes(nodes, Date.now());
 	const order = dfsOrder(nodes).filter(isAgent);
 	if (state.pendingStopId) {
 		const confirmed = matchesKey(data, "y") || data === "Y" || matchesKey(data, Key.enter);
@@ -167,6 +211,21 @@ export function handleViewKey(data: string, state: LegionViewState, nodes: reado
 			const event = events[state.logCursor];
 			if (!event) return "none";
 			state.selectedId = state.selectedId === event.node.id ? undefined : event.node.id;
+			if (state.selectedId === undefined) delete state.selectedId;
+		} else return "none";
+		return "render";
+	}
+	if (state.focus === "timing") {
+		if (down) state.timingCursor = Math.min(timingRows.length - 1, state.timingCursor + 1);
+		else if (up) state.timingCursor = Math.max(0, state.timingCursor - 1);
+		else if (matchesKey(data, Key.pageDown)) state.timingCursor = Math.min(timingRows.length - 1, state.timingCursor + page);
+		else if (matchesKey(data, Key.pageUp)) state.timingCursor = Math.max(0, state.timingCursor - page);
+		else if (matchesKey(data, Key.home)) state.timingCursor = 0;
+		else if (matchesKey(data, Key.end)) state.timingCursor = Math.max(0, timingRows.length - 1);
+		else if (matchesKey(data, Key.enter)) {
+			const row = timingRows[state.timingCursor];
+			if (!row) return "none";
+			state.selectedId = state.selectedId === row.node.id ? undefined : row.node.id;
 			if (state.selectedId === undefined) delete state.selectedId;
 		} else return "none";
 		return "render";
