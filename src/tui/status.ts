@@ -598,7 +598,7 @@ export interface StatusVizSnapshot {
 	nodes: VizNode[];
 	sampler: RateSampler;
 	now: number;
-	/** Shared output tok/s (ΔtokensOut / ΔgenerationMs over trailing 60s). */
+	/** Header "now" tok/s (live agents only; 0 when none running). */
 	rate: number;
 }
 
@@ -656,7 +656,7 @@ export function createStatusBoard(options: {
 		if (strip === "railway" && hasTreeIdentity(entries) && width !== undefined && width >= 20) {
 			const nodes = nodesFromEntries(entries);
 			const hint = idleHint ? { hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT } : {};
-			const rendered = railwayLines({ nodes, now, width, rate: sampler.totalRate(now), scroll: railScroll, ...hint }, theme);
+			const rendered = railwayLines({ nodes, now, width, rate: sampler.nowRate(now, nodes), scroll: railScroll, ...hint }, theme);
 			// Persist the clamped window (anchored on the top lane's agent) so later
 			// renders follow ends/starts without jumping; resets to 0 when all fit.
 			railWindow = rendered.window;
@@ -805,7 +805,8 @@ export function createStatusBoard(options: {
 			return tui;
 		},
 		vizSnapshot(now = Date.now()) {
-			return { nodes: nodesFromEntries(entries), sampler, now, rate: sampler.totalRate(now) };
+			const nodes = nodesFromEntries(entries);
+			return { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
 		},
 		clear() {
 			entries = [];
