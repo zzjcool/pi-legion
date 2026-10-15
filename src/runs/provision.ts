@@ -58,7 +58,13 @@ function writeMarker(worktreePath: string, mode: string): void {
 	fs.renameSync(tmp, file);
 }
 
-/** Repo-relative manifests, in resolution order, for the npm-install mode. */
+/** Repo-relative manifests, in resolution order, for the npm-install mode.
+ *
+ * The bare package.json fallback was removed: a package.json without any
+ * lockfile is far more often a non-npm repo caught by mistake (Java/Maven
+ * repos carry stray package.json files for docs/tooling) than a real npm
+ * project (which always has a lockfile). Without a lockfile we skip
+ * provisioning instead of firing npm install into a Java checkout. */
 function installCommandFor(worktreePath: string): string | null {
 	if (fs.existsSync(path.join(worktreePath, "pnpm-lock.yaml"))) {
 		return "pnpm install --frozen-lockfile";
@@ -71,9 +77,6 @@ function installCommandFor(worktreePath: string): string | null {
 	}
 	if (fs.existsSync(path.join(worktreePath, "package-lock.json"))) {
 		return "npm ci";
-	}
-	if (fs.existsSync(path.join(worktreePath, "package.json"))) {
-		return "npm install";
 	}
 	return null;
 }

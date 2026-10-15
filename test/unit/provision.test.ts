@@ -60,8 +60,22 @@ test("provisionWorktree is idempotent for the same mode and re-runs when the dec
 	rmSync(wt, { recursive: true, force: true });
 });
 
-test("provisionWorktree npm-install resolves a package.json to npm install", () => {
-	const wt = fakeWorktree({ "package.json": "{}" });
+test("provisionWorktree npm-install skips a stray package.json without a lockfile", () => {
+	// Java/Maven repos carry stray package.json files for docs/tooling.
+	// Without a lockfile the npm-install mode must not fire npm install
+	// into a non-npm checkout — it records the marker and moves on.
+	const wt = fakeWorktree({ "package.json": "{\"name\":\"maven-repo-docs\"}" });
+	const result = provisionWorktree({ worktreePath: wt, mode: "npm-install" });
+	assert.equal(result.applied, "npm-install");
+	assert.ok(existsSync(provisionMarkerPath(wt)));
+	rmSync(wt, { recursive: true, force: true });
+});
+
+test("provisionWorktree npm-install resolves a package-lock.json to npm ci", () => {
+	const wt = fakeWorktree({
+		"package.json": "{}",
+		"package-lock.json": "{\"lockfileVersion\":3}",
+	});
 	const previous = process.env.npm_config_prefix;
 	// npm scripts export this. A login bash that sources nvm aborts when it
 	// is set, so provisioning must not forward it.
@@ -70,6 +84,8 @@ test("provisionWorktree npm-install resolves a package.json to npm install", () 
 		const result = provisionWorktree({ worktreePath: wt, mode: "npm-install", timeoutMs: 15_000 });
 		assert.equal(result.applied, "npm-install");
 		assert.ok(existsSync(provisionMarkerPath(wt)));
+		// npm ci with a stub lockfile has no deps to install; assert it did
+		// not fail the launch.
 	} finally {
 		if (previous === undefined) delete process.env.npm_config_prefix;
 		else process.env.npm_config_prefix = previous;
