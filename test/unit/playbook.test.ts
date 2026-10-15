@@ -60,14 +60,14 @@ test("legacy herdr commands remain available for manual v0.16.x workflows", () =
 });
 
 test("playbook keeps the explicit wait action available", () => {
-	assert.match(PARENT_PLAYBOOK, /Use `wait` when you need blocking results/);
+	assert.match(PARENT_PLAYBOOK, /Use `wait` with `name` or `all: true` when you need blocking results/);
 	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire/);
 });
 
 test("playbook describes event-driven waits and graceful stop", () => {
 	assert.match(PARENT_PLAYBOOK, /use `stop` to gracefully retire one child or all tracked children/);
 	assert.match(TOOL_DESCRIPTION, /collect, wait, list, retire, stop/);
-	assert.match(TOOL_DESCRIPTION, /`wait` is event-driven/);
+	assert.match(TOOL_DESCRIPTION, /it is event-driven/);
 	assert.match(TOOL_DESCRIPTION, /Esc does not retire children/);
 });
 
@@ -82,4 +82,10 @@ test("playbook documents status overview vs single child (#145)", () => {
 	assert.match(PARENT_PLAYBOOK, /`all: true`/);
 	assert.match(TOOL_DESCRIPTION, /`status` with no name \(or `all: true`\)/);
 	assert.match(TOOL_DESCRIPTION, /with `name` returns that one child/);
+});
+
+test("playbook requires name or all for wait (#161)", () => {
+	assert.match(TOOL_DESCRIPTION, /`wait` REQUIRES `name` or `all: true`/);
+	assert.match(TOOL_DESCRIPTION, /action: "wait", all: true/);
+	assert.match(PARENT_PLAYBOOK, /Use `wait` with `name` or `all: true`/);
 });
