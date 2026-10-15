@@ -143,7 +143,7 @@ const SubagentParams = Type.Object({
 				Type.Literal("stop"),
 				Type.Literal("diagnose"),
 			],
-			{ description: "Defaults to launch. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor." },
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor." },
 		),
 	),
 	agent: Type.Optional(
@@ -188,12 +188,12 @@ const SubagentParams = Type.Object({
 	name: Type.Optional(
 		Type.String({
 			description:
-				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On control actions (wait/stop/collect/…): addresses that child. For status: omit (or pass all:true) for a live-children overview; pass name for one child.",
+				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On wait: REQUIRED unless all:true (mutually exclusive with all). On other control actions (stop/collect/…): addresses that child. For status: omit (or pass all:true) for a live-children overview; pass name for one child.",
 		}),
 	),
 	all: Type.Optional(
 		Type.Boolean({
-			description: "wait: wait for active children; stop: stop every non-retired child; status: overview of all live (non-retired) children under cwd",
+			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of all live (non-retired) children under cwd",
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -1118,7 +1118,7 @@ async function controlAction(input: {
 		}
 		if (!params.name && !params.all) {
 			return fail(
-				"`name` or `all` is required for wait",
+				"`name` or `all` is required for wait (try all:true or name:\"child-name\")",
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
@@ -2597,7 +2597,7 @@ export function resolveWaitTargets(
 		return { ok: true, names: live.map((job) => job.name) };
 	}
 	const name = params.name;
-	if (!name) return { ok: false, message: "`name` or `all` is required for wait" };
+	if (!name) return { ok: false, message: "`name` or `all` is required for wait (try all:true or name:\"child-name\")" };
 	if (live.some((job) => job.name === name)) {
 		return { ok: true, names: [name] };
 	}
