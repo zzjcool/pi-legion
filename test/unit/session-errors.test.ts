@@ -63,7 +63,7 @@ test("summarizeSessionErrors shows recent titles and marks large logs", () => {
 
 		const summary = summarizeSessionErrors({ storeRoot: store, recentLimit: 5 });
 		assert.ok(summary.total >= 12);
-		assert.ok(summary.byCode.INVALID_PARAMS >= 1);
+		assert.ok((summary.byCode.INVALID_PARAMS ?? 0) >= 1);
 		assert.equal(summary.recent.length, 5);
 		assert.equal(summary.large, true);
 		assert.equal(summary.truncated, true);
