@@ -1,5 +1,8 @@
 # ESC 级联关闭契约（v2，2026-10-13 冻结）
 
+> **v3 推翻（2026-10-15）**：ESC / 父 turn abort **不再**级联 retire children。当前语义以 `docs/contracts/esc-no-retire-v3.md` 为准。下文保留 v2 冻结原文，仅供历史考古。
+
+
 ## 背景
 
 v1（esc-abort-v1.md，已随 e66c85f 合入）冻结了「ESC ≠ 杀 children」语义。用户裁决推翻：turn 是 children 的 owner，turn 被 abort 时 children 应级联关闭，否则是资源泄漏。

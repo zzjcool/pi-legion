@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-	createIdleEscStop,
 	IDLE_STOP_HINT,
+	IDLE_STOP_HINT_SHORT,
 	resolveStopTarget,
 	runLegionStop,
 	stopCompletions,
@@ -88,52 +88,22 @@ test("legion stop: runLegionStop — one, all, not found, nested, nothing runnin
 	assert.equal(d.calls.length, 0);
 });
 
-test("idle Esc: consumes bare Esc only when idle + empty editor + editor focus + live children, then confirms", async () => {
-	const state = { idle: true, empty: true, busy: false, live: 3, answer: true };
-	const log: string[] = [];
-	const handler = createIdleEscStop({
-		isIdle: () => state.idle,
-		editorEmpty: () => state.empty,
-		uiBusy: () => state.busy,
-		liveCount: () => state.live,
-		confirm: async (_t, message) => { log.push(message); return state.answer; },
-		stopAll: async () => { log.push("stopAll"); },
-	});
-	const flush = () => new Promise((r) => setImmediate(r));
-	for (const [key, value] of [["idle", false], ["empty", false], ["busy", true], ["live", 0]] as const) {
-		const saved = state[key];
-		(state as Record<string, unknown>)[key] = value;
-		assert.equal(handler("\x1b"), undefined, `passes through when ${key}=${value}`);
-		(state as Record<string, unknown>)[key] = saved;
-	}
-	assert.equal(handler("\x1b[A"), undefined, "escape sequences are not Esc");
-	assert.equal(handler("q"), undefined);
-	assert.deepEqual(handler("\x1b"), { consume: true });
-	assert.equal(handler("\x1b"), undefined, "no second prompt while one is open");
-	await flush(); await flush();
-	assert.deepEqual(log, ["Stop 3 running subagents?", "stopAll"]);
-	state.answer = false;
-	handler("\x1b");
-	await flush(); await flush();
-	assert.deepEqual(log.slice(2), ["Stop 3 running subagents?"], "declined: nothing stopped");
-});
-
 const T0 = 1_700_000_000_000;
 const vnode = (id: string, opts: Partial<VizNode> = {}): VizNode => ({ id, name: id, role: "scout", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, ...opts });
 const ROOT = vnode("root", { name: "centurion-0", role: "centurion", parentId: null, depth: 0 });
 
-test("railway: idle stop hint shows dim on the header, shortens on narrow widths, hidden when not requested", () => {
+test("railway: stop hint shows dim on the header, shortens on narrow widths, hidden when not requested", () => {
 	const nodes = [ROOT, vnode("scout-1")];
-	const wide = renderRailway({ nodes, now: T0 + 60_000, width: 120, rate: 0, hint: IDLE_STOP_HINT, hintShort: "esc stop all" })!;
-	assert.match(wide.canvas.toPlain()[0]!, /esc stop all · \/legion stop \[name\]/);
-	const narrow = renderRailway({ nodes, now: T0 + 60_000, width: 60, rate: 0, hint: IDLE_STOP_HINT, hintShort: "esc stop all" })!;
-	assert.match(narrow.canvas.toPlain()[0]!, / esc stop all /);
-	assert.doesNotMatch(narrow.canvas.toPlain()[0]!, /legion stop/);
-	const tiny = renderRailway({ nodes, now: T0 + 60_000, width: 30, rate: 0, hint: IDLE_STOP_HINT, hintShort: "esc stop all" })!;
-	assert.doesNotMatch(tiny.canvas.toPlain()[0]!, /esc/);
+	const wide = renderRailway({ nodes, now: T0 + 60_000, width: 120, rate: 0, hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT })!;
+	assert.match(wide.canvas.toPlain()[0]!, /\/legion stop \[name\|all\]/);
+	const narrow = renderRailway({ nodes, now: T0 + 60_000, width: 50, rate: 0, hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT })!;
+	assert.match(narrow.canvas.toPlain()[0]!, / \/legion stop /);
+	assert.doesNotMatch(narrow.canvas.toPlain()[0]!, /name\|all/);
+	const tiny = renderRailway({ nodes, now: T0 + 60_000, width: 40, rate: 0, hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT })!;
+	assert.doesNotMatch(tiny.canvas.toPlain()[0]!, /legion stop/);
 	for (const r of [wide, narrow, tiny]) for (const line of r.canvas.toPlain()) assert.equal(Array.from(line).length, r.canvas.width);
 	const none = renderRailway({ nodes, now: T0 + 60_000, width: 120, rate: 0 })!;
-	assert.doesNotMatch(none.canvas.toPlain()[0]!, /esc/);
+	assert.doesNotMatch(none.canvas.toPlain()[0]!, /legion stop/);
 });
 
 test("legion view: x on a live selected agent asks to stop; ended or no selection is a no-op", () => {
@@ -166,10 +136,10 @@ test("status board: idle hint follows setIdleHint (hidden while the main agent s
 		{ name: "scout-1", agent: "scout", state: "running", startedAt: now - 30_000, nodeId: "root.s", parentId: "root", depth: 1 },
 	], now);
 	const comp = factory!({ requestRender() {} }, plain);
-	assert.doesNotMatch(comp.render(120)[0]!, /esc stop all/);
+	assert.doesNotMatch(comp.render(120)[0]!, /legion stop/);
 	board.setIdleHint!(true);
-	assert.match(comp.render(120)[0]!, /esc stop all · \/legion stop \[name\]/);
+	assert.match(comp.render(120)[0]!, /\/legion stop \[name\|all\]/);
 	board.setIdleHint!(false);
-	assert.doesNotMatch(comp.render(120)[0]!, /esc stop all/);
+	assert.doesNotMatch(comp.render(120)[0]!, /legion stop/);
 	board.clear();
 });

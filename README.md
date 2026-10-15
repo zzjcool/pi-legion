@@ -96,9 +96,9 @@ prints one node — see [Status](#status-legion-status).
 
 The `subagent` control actions include event-driven `wait` and graceful `stop`:
 `subagent({ action: "wait", name: "worker-0" })` returns as soon as the child
-settles (or the parent turn is interrupted with Esc). Aborting a parent turn
-with Esc gracefully retires its tracked children, including those being waited
-on or collected; the cascade is silent. Launch stays async by default. Under
+settles (or the parent turn is interrupted with Esc). Esc only ends the parent
+wait — children keep running and settle still notifies; retire them with
+`/legion stop` or by exiting the session. Launch stays async by default. Under
 `pi --print` or JSON mode the process would otherwise exit at the end of the
 parent turn and retire those children before they write an assistant message.
 That shutdown waits for each live async child to settle, bounded by the
@@ -113,23 +113,20 @@ sequence for each selected child.
 
 ### Stopping async subagents yourself
 
-Async children keep running after the main turn ends, so Esc-abort no longer
-reaches them. Three user controls run the same graceful `stop` (a stopped
-parent retires its own subtree on shutdown):
+Esc never retires children (see `docs/contracts/esc-no-retire-v3.md`). Two user
+controls run graceful `stop` (a stopped parent retires its own subtree on
+shutdown); process exit / session shutdown also retires:
 
 - **`/legion stop`** stops every live subagent; **`/legion stop <name>`** stops
   one (`all` is an alias for no name). Names complete from the live children;
   nested agents complete as `parent/name` and are reported as owned by their
   parent (stop the parent to retire them).
-- **Esc** while the main agent is idle, the editor is empty, no dialog or
-  overlay is open and subagents are live asks "Stop N running subagents?".
-  In every other state Esc keeps pi's normal behaviour.
 - **`x`** on the selected live agent in the `/legion` view or its live
   overlay asks `y` to confirm in place, then stops it.
 
-While the main agent is idle and subagents are live, the railway header shows
-a dim `esc stop all · /legion stop [name]` hint (shortened on narrow terminals,
-hidden while the main agent is working).
+While subagents are live, the railway header can show a dim
+`/legion stop [name|all]` hint (shortened on narrow terminals; idle gating /
+tree-strip coverage is a TUI follow-up).
 
 ### Status (`/legion status`)
 

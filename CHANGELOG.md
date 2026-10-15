@@ -39,6 +39,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- Esc no longer retires children; only `/legion stop` or session exit retires (esc-no-retire-v3, #134).
 - Prefer `PI_LEGION_EXTRA_AGENT_DIRS` over legacy `PI_HERDR_SUBAGENTS_*` (alias; new name wins if both set) (#109 / #114).
 - CONTRIBUTING/CI docs aligned with 2.x RPC; verify-12/13 paths point at `test/legacy/docker/` (#95 / #100, #107 / #112).
 - README: remove duplicate Child extensions heading (#94 / #98).

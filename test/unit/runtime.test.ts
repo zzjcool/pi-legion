@@ -755,11 +755,11 @@ test("runtime.wait: parent abort interrupts promptly, clears its timer, and rest
 	runtime.dispose();
 });
 
-test("runtime.wait: an interrupted unwatched job is not re-armed before the session cascade", async () => {
+test("runtime.wait: an interrupted unwatched job is re-armed so settle still notifies", async () => {
 	let resolveCollect!: (snapshot: CollectSnapshot) => void;
-	const messages: unknown[] = [];
+	const messages: Array<{ content: string }> = [];
 	const runtime = createSessionRuntime({
-		sendMessage(message) { messages.push(message); },
+		sendMessage(message) { messages.push(message as { content: string }); },
 	});
 	runtime.track({
 		name: "unwatched",
@@ -773,10 +773,11 @@ test("runtime.wait: an interrupted unwatched job is not re-armed before the sess
 	const pending = runtime.wait(["unwatched"], { timeoutMs: 5_000, signal: controller.signal });
 	controller.abort();
 	assert.deepEqual(await pending, [{ name: "unwatched", interrupted: true }]);
-	assert.equal(runtime.get("unwatched")?.watching, false, "the session cascade, not waitOne, owns post-abort cleanup");
-	resolveCollect(joinSnapshot({ output: "retired by cascade" }));
-	await new Promise((resolve) => setImmediate(resolve));
-	assert.equal(messages.length, 0, "aborted waits do not arm a completion notification");
+	assert.equal(runtime.get("unwatched")?.consumedByTool, false, "abort restores notification ownership");
+	assert.equal(runtime.get("unwatched")?.watching, true, "waitOne re-arms watch after interrupt (esc-no-retire-v3)");
+	resolveCollect(joinSnapshot({ output: "still running after abort" }));
+	await waitFor(() => messages.length === 1, "completion notify after re-armed watch");
+	assert.match(messages[0]!.content, /still running after abort/);
 	runtime.dispose();
 });
 

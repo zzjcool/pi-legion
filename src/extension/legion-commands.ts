@@ -519,7 +519,7 @@ function buildDoctorReport(
 				: undefined,
 		})),
 		stopAvailable: Boolean(deps.stop),
-		idleEscWired: true,
+		idleEscWired: false,
 		legionTools: ["subagent", "vexillatio"],
 		allowNestedEnv: process.env[ALLOW_NESTED_ENV] === "1",
 	};

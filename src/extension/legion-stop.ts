@@ -3,10 +3,9 @@
  *   - `/legion stop` (all) / `/legion stop <name>` — thin wrapper over the
  *     subagent tool's `stop` action (graceful retire; a retired parent's own
  *     session shutdown retires its subtree, so stopping a parent cascades).
- *   - Esc while the main agent is idle, the editor is empty and children are
- *     live → confirm → stop all.
  *   - `x` on the selected agent in the /legion view → confirm → stop it.
- * Everything here is pure/injectable so it can be unit tested.
+ * Esc no longer stops children (esc-no-retire-v3); only `/legion stop` or
+ * process exit retires. Everything here is pure/injectable for unit tests.
  */
 
 export interface StopJob {
@@ -114,37 +113,6 @@ export async function runLegionStop(arg: string, deps: StopDeps): Promise<string
 	return say(result.text, result.ok ? "info" : "error");
 }
 
-export interface IdleEscDeps {
-	/** Main agent not streaming / running a turn. */
-	isIdle(): boolean;
-	editorEmpty(): boolean;
-	/** An overlay, dialog or non-editor component has focus. */
-	uiBusy(): boolean;
-	liveCount(): number;
-	confirm(title: string, message: string): Promise<boolean>;
-	stopAll(): Promise<void>;
-}
-
-/**
- * Raw terminal input hook: consumes a bare Esc only when the main agent is
- * idle, the editor is empty, nothing else owns focus and children are live.
- * Every other key (and Esc in any other state) passes through to pi.
- */
-export function createIdleEscStop(deps: IdleEscDeps): (data: string) => { consume: true } | undefined {
-	let prompting = false;
-	return (data) => {
-		if (data !== "\x1b" || prompting) return undefined;
-		const count = deps.liveCount();
-		if (count === 0 || !deps.isIdle() || !deps.editorEmpty() || deps.uiBusy()) return undefined;
-		prompting = true;
-		void deps.confirm("Stop subagents", `Stop ${count} running subagent${count === 1 ? "" : "s"}?`)
-			.then((yes) => (yes ? deps.stopAll() : undefined))
-			.catch(() => {})
-			.finally(() => { prompting = false; });
-		return { consume: true };
-	};
-}
-
-/** Dim hint shown in the railway header while the main agent is idle and children are live. */
-export const IDLE_STOP_HINT = "esc stop all · /legion stop [name]";
-export const IDLE_STOP_HINT_SHORT = "esc stop all";
+/** Dim hint shown in the railway header while children are live (Nova may redesign gating). */
+export const IDLE_STOP_HINT = "/legion stop [name|all]";
+export const IDLE_STOP_HINT_SHORT = "/legion stop";

@@ -42,7 +42,7 @@ import {
 	loadSubagentSettings,
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
-import { createSessionRuntime, renderLiveChildStatus, type SessionRuntime, type TrackedJob, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
+import { createSessionRuntime, renderLiveChildStatus, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
@@ -66,7 +66,6 @@ import {
 	type RpcEventSource,
 	confirmAndStopNode,
 } from "./src/extension/legion-commands.ts";
-import { createIdleEscStop, liveJobs } from "./src/extension/legion-stop.ts";
 import { DEFAULT_FLUSH_MS, DEFAULT_JOIN_MODE } from "./src/extension/join.ts";
 import { registerChildGuard } from "./src/extension/child-guard.ts";
 import { registerScoutGuard } from "./src/extension/scout-guard.ts";
@@ -101,10 +100,6 @@ import {
 	type RetireOptions,
 	SubagentError,
 } from "./src/shared/types.ts";
-
-// The parent turn owns its child lifetime. Parallel tool aborts in one turn
-// share this graceful-retire cascade; turn_start begins a fresh cycle.
-let cascadePromise: Promise<void> | undefined;
 
 // ---------------------------------------------------------------------------
 // Parameters
@@ -481,7 +476,6 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 }
 
 export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {
-	cascadePromise = undefined;
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";
 	if (isChild) restoreHostNodeOptions();
@@ -592,49 +586,6 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		]);
 		stopLegionRuntime();
 	};
-	let cascadingJobs = new Set<TrackedJob>();
-	let cascadingUtilityRetires = new Set<() => Promise<void>>();
-	const cascadeRetireAll = (): Promise<void> => {
-		const jobs = (sessionRuntime?.activeJobs() ?? []).filter(
-			(job) => job.state !== "retired" && !cascadingJobs.has(job),
-		);
-		const utilityRetires = pendingUtilityRetires.filter(
-			(retire) => !cascadingUtilityRetires.has(retire),
-		);
-		if (!cascadePromise) cascadePromise = Promise.resolve();
-		if (jobs.length === 0 && utilityRetires.length === 0) return cascadePromise;
-		for (const job of jobs) {
-			cascadingJobs.add(job);
-			sessionRuntime?.cancelWatch(job.name);
-		}
-		for (const retire of utilityRetires) cascadingUtilityRetires.add(retire);
-		const retirements = [
-			...jobs.map((job) => async () => job.retire?.()),
-			...utilityRetires.map((retire) => async () => retire()),
-		];
-		cascadePromise = cascadePromise.then(async () => {
-			// allSettled waits for every graceful retire without turning a child
-			// failure into a user-visible result or skipping runtime release.
-			await Promise.allSettled(retirements.map((retire) => retire()));
-			for (const job of jobs) sessionRuntime?.release(job.name);
-		});
-		return cascadePromise;
-	};
-	// Register before the child early-return paths below: a command-chain child
-	// may use vexillatio across multiple turns without creating a session runtime.
-	pi.on("turn_start", () => {
-		cascadePromise = undefined;
-		cascadingJobs = new Set();
-		cascadingUtilityRetires = new Set();
-	});
-	// An async launch has already returned when ESC lands: no subagent-family
-	// tool call is in flight to observe the abort signal, so the run's settle
-	// event is the last chance to retire this turn's children. Never awaited —
-	// a graceful retire may take seconds and must not stall the settle path.
-	pi.on("agent_settled", (event) => {
-		if (!event.aborted) return;
-		void cascadeRetireAll();
-	});
 	if (process.env[UTILITY_CHILD_ENV] !== "1") {
 		pi.registerTool({
 			name: "vexillatio",
@@ -643,8 +594,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			parameters: VexillatioParams,
 			async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
 				if (signal?.aborted) {
-					await cascadeRetireAll();
-					return ok("interrupted (parent turn aborted)");
+					return ok("interrupted (parent turn ended; children still running)");
 				}
 				if (!subagentsEnabled(ctx.cwd)) {
 					return fail("subagents are disabled (subagents.enabled: false or /legion off). Re-enable with /legion on.", ErrorCodes.DISABLED);
@@ -673,8 +623,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					onUtilityChild: (retire) => pendingUtilityRetires.push(retire),
 				});
 				if (signal?.aborted) {
-					await cascadeRetireAll();
-					return ok("interrupted (parent turn aborted)");
+					return ok("interrupted (parent turn ended; children still running)");
 				}
 				return result;
 			},
@@ -874,8 +823,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			runtime.bind(ctx);
 			const action = params.action ?? "launch";
 			if (signal?.aborted && action !== "stop") {
-				await cascadeRetireAll();
-				return ok("interrupted (parent turn aborted)");
+				return ok("interrupted (parent turn ended; children still running)");
 			}
 			// Master switch: refuse NEW launches with a pointer to the toggle;
 			// control actions (status/collect/wait/…) must stay available so a
@@ -940,7 +888,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 							nodeId: job.nodeId,
 						})),
 						stopAvailable: true,
-						idleEscWired: true,
+						idleEscWired: false,
 						legionTools: ["subagent", "vexillatio"],
 						allowNestedEnv: process.env[ALLOW_NESTED_ENV] === "1",
 					},
@@ -960,8 +908,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				return fail(`legion runtime initialization failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
 			}
 			if (signal?.aborted && action !== "stop") {
-				await cascadeRetireAll();
-				return ok("interrupted (parent turn aborted)");
+				return ok("interrupted (parent turn ended; children still running)");
 			}
 
 			// Control actions address an EXISTING child; launch-family actions
@@ -985,8 +932,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					legion: activeLegion,
 				});
 				if (signal?.aborted && action !== "stop") {
-					await cascadeRetireAll();
-					return ok("interrupted (parent turn aborted)");
+					return ok("interrupted (parent turn ended; children still running)");
 				}
 				return result;
 			}
@@ -1010,41 +956,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				onUpdate,
 			});
 			if (signal?.aborted) {
-				await cascadeRetireAll();
-				return ok("interrupted (parent turn aborted)");
+				return ok("interrupted (parent turn ended; children still running)");
 			}
 			return result;
 		},
 	});
 
-	let lastCtx: ExtensionContext | undefined;
-	let escUi: ExtensionUIContext | undefined;
-	let escUnsubscribe: (() => void) | undefined;
-	const idleEscStop = createIdleEscStop({
-		isIdle: () => lastCtx?.isIdle?.() ?? false,
-		editorEmpty: () => !(lastUi?.getEditorText?.() ?? "").trim(),
-		uiBusy: () => {
-			const tui = runtime.statusTui() as { hasOverlay?: () => boolean; getFocusedComponent?: () => unknown } | undefined;
-			if (!tui) return true;
-			if (tui.hasOverlay?.()) return true;
-			const focused = tui.getFocusedComponent?.() as { getText?: unknown } | null | undefined;
-			// Only the prompt editor may have focus: dialogs/selectors keep pi's Esc.
-			return !focused || typeof focused.getText !== "function" || !("onEscape" in focused);
-		},
-		liveCount: () => liveJobs(runtime.activeJobs()).length,
-		confirm: (title, message) => lastUi ? lastUi.confirm(title, message) : Promise.resolve(false),
-		stopAll: async () => {
-			const result = await stopChildren({ all: true });
-			lastUi?.notify(result.text, result.ok ? "info" : "error");
-		},
-	});
 	const bindUi = (_event: unknown, ctx: ExtensionContext): void => {
-		lastCtx = ctx;
-		if (ctx.hasUI && ctx.ui !== escUi && typeof ctx.ui?.onTerminalInput === "function") {
-			escUnsubscribe?.();
-			escUi = ctx.ui;
-			escUnsubscribe = ctx.ui.onTerminalInput(idleEscStop);
-		}
 		lastUi = ctx.hasUI ? ctx.ui : undefined;
 		if (ctx.cwd) lastCwd = ctx.cwd;
 		runtime.bind(ctx);
@@ -1367,13 +1285,13 @@ async function collectChild(
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<unknown>> {
 	try {
-		if (signal?.aborted) return ok("interrupted (parent turn aborted)");
+		if (signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
 		const pending = signal
 			? ctx.runtime.consumeCollectInterruptible(ctx.name, signal)
 			: ctx.runtime.consumeCollect(ctx.name);
 		if (pending) {
 			const collected = await pending;
-			if (!collected || signal?.aborted) return ok("interrupted (parent turn aborted)");
+			if (!collected || signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
 			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
 			return ok(renderCollect(ctx.name, collected));
 		}
@@ -1392,7 +1310,7 @@ async function collectChild(
 			...(signal ? { signal } : {}),
 		});
 		if (signal?.aborted || collected.execution.reason === "aborted by parent") {
-			return ok("interrupted (parent turn aborted)");
+			return ok("interrupted (parent turn ended; children still running)");
 		}
 		const retireAlreadyFinishedJob = shouldRecycleAfterCollect(collected.execution.status) && !collected.blocked;
 		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: !retireAlreadyFinishedJob });
@@ -1602,7 +1520,7 @@ async function launchFamily(input: {
 		for (const name of session.handles) await abandonLaunchedChild(session, name);
 		session.handles.length = 0;
 		return {
-			content: [{ type: "text", text: session.results.join("\n") || "interrupted (parent turn aborted)" }],
+			content: [{ type: "text", text: session.results.join("\n") || "interrupted (parent turn ended; children still running)" }],
 			details: { runId: run.runId, handles: [], async: params.async ?? true },
 		};
 	};
@@ -1913,7 +1831,7 @@ function resolveStep(
 async function collectInline(session: LaunchSession, signal?: AbortSignal): Promise<void> {
 	for (const name of session.handles) {
 		if (signal?.aborted) {
-			session.results.push("interrupted (parent turn aborted)");
+			session.results.push("interrupted (parent turn ended; children still running)");
 			return;
 		}
 		try {
@@ -1922,7 +1840,7 @@ async function collectInline(session: LaunchSession, signal?: AbortSignal): Prom
 				...(signal ? { signal } : {}),
 			});
 			if (signal?.aborted || collected.execution.reason === "aborted by parent") {
-				session.results.push("interrupted (parent turn aborted)");
+				session.results.push("interrupted (parent turn ended; children still running)");
 				return;
 			}
 			session.results.push(renderCollect(name, collected));
@@ -2265,7 +2183,7 @@ async function launchUtilityFamily(input: {
 			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
-	if (input.signal?.aborted) return ok("interrupted (parent turn aborted)");
+	if (input.signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
 	results.push(...collected);
 	return {
 		content: [{ type: "text", text: results.join("\n\n") || "No utility agents were launched." }],
@@ -2583,18 +2501,10 @@ async function abandonLaunchedChild(session: LaunchSession, name: string): Promi
 		session.runtime.release(name);
 		return;
 	}
-	child.execution = { status: "failed", reason: "launch abandoned because parent turn aborted" };
-	child.acceptance = { status: "rejected", level: "none", reason: "aborted by parent" };
-	try {
-		await session.orchestrator.retire(name);
-		await persistChild(session.store, session.runId, session.orchestrator, name);
-		session.runtime.release(name);
-		session.results.push(`✗ ${name}: abandoned because parent turn aborted (child retired)`);
-	} catch (error) {
-		await persistChild(session.store, session.runId, session.orchestrator, name);
-		followLaunched(session, name, { watch: true });
-		session.results.push(`✗ ${name}: abandon retire failed: ${String(error)}; completion remains watched`);
-	}
+	// Esc / parent-turn abort must not retire: child keeps running; follow+watch
+	// so settle still notifies the parent (esc-no-retire-v3).
+	followLaunched(session, name, { watch: true });
+	session.results.push(`▶ ${name}: parent turn ended; child still running (watched)`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2647,7 +2557,7 @@ export function renderWait(results: WaitResult[]): string {
 			parts.push(`── ${result.name} ──\nstill running`);
 		} else if (result.interrupted) {
 			interrupted += 1;
-			parts.push(`── ${result.name} ──\ninterrupted (parent turn aborted)`);
+			parts.push(`── ${result.name} ──\ninterrupted (parent turn ended; children still running)`);
 		} else {
 			parts.push(`── ${result.name} ──\nnot tracked (no live job, no finished cache)`);
 		}
