@@ -44,21 +44,23 @@ export function renderLegionView(data: ViewData, state: LegionViewState, cols: n
 		`${agents.length} agents`,
 		...(failed ? [`${failed} failed`] : []),
 	];
-	const badge = selected ? ` ${selected.name} (${selected.role} · ${statusLabel(selected)}) ` : "";
+	const badgeRaw = selected ? ` ${selected.name} (${selected.role} · ${statusLabel(selected)}) ` : "";
+	// Cap the selection badge so a long agent name never overwrites "⚔ /legion" / the run name.
+	const badgeCap = Math.max(0, Math.min(Array.from(badgeRaw).length, Math.floor(W * 0.45), W - 14));
+	const badge = badgeRaw ? ellipsize(badgeRaw, badgeCap) : "";
+	const badgeW = Array.from(badge).length;
 	if (portrait) {
 		cv.text(0, 0, "⚔ /legion ", "accent", { bold: true });
-		cv.text(10, 0, ellipsize(root?.name ?? "", Math.max(0, W - 10)), "text", { bold: true });
+		const rootRoom = Math.max(0, W - 10 - (badgeW > 0 ? badgeW + 1 : 0));
+		cv.text(10, 0, ellipsize(root?.name ?? "", rootRoom), "text", { bold: true });
 		cv.text(0, 1, ellipsize(parts.join(" · "), W), "dim");
-		if (badge) {
-			const b = ellipsize(badge, Math.max(0, W - 12 - Array.from(root?.name ?? "").length));
-			if (b.length > 4) cv.text(W - Array.from(b).length, 0, b, roleColor(selected!.role), { inverse: true });
-		}
+		if (badgeW > 4) cv.text(W - badgeW, 0, badge, roleColor(selected!.role), { inverse: true });
 	} else {
 		let x = cv.text(0, 0, "⚔ /legion ", "accent", { bold: true });
-		x = cv.text(x, 0, `${root?.name ?? "legion"}  `, "text", { bold: true });
-		const badgeW = Array.from(badge).length;
+		const rootRoom = Math.max(0, W - x - badgeW - 1);
+		x = cv.text(x, 0, ellipsize(`${root?.name ?? "legion"}  `, rootRoom), "text", { bold: true });
 		cv.text(x, 0, ellipsize(parts.join(" · "), Math.max(0, W - x - badgeW - 1)), "dim");
-		if (badge) cv.text(Math.max(0, W - badgeW), 0, ellipsize(badge, W), roleColor(selected!.role), { inverse: true });
+		if (badgeW > 0) cv.text(W - badgeW, 0, badge, roleColor(selected!.role), { inverse: true });
 	}
 
 	const galaxyInner = frame(cv, layout.galaxy, portrait ? "galaxy" : "galaxy · structure", state.focus === "galaxy");

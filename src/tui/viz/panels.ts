@@ -241,20 +241,24 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 		}
 	}
 	// Legend: roles that actually appear (dynamic), then status hints.
+	// Reserve room for failed/retired glyphs first so a narrow panel still matches live scout (#102/#125).
 	const ly = r.y + r.h - 1;
 	let lx = r.x + 1;
 	const roles: string[] = [];
 	for (const node of dfsOrder(nodes)) if (isAgent(node) && !roles.includes(node.role)) roles.push(node.role);
+	const statuses = new Set(nodes.map((node) => node.status));
+	const statusItems = ([["failed", "✗ failed", "error"], ["retired", "⣿ retired", "dim"]] as const)
+		.filter(([status]) => statuses.has(status));
+	const statusBudget = statusItems.reduce((sum, [, label]) => sum + label.length + 2, 0);
+	const roleLimit = r.x + r.w - 1 - statusBudget;
 	for (const role of roles) {
 		const w = Array.from(role).length + 4;
-		if (lx + w > r.x + r.w - 1) break;
+		if (lx + w > roleLimit) break;
 		cv.set(lx, ly, "⣿", roleColor(role));
 		cv.text(lx + 2, ly, role, "dim");
 		lx += w;
 	}
-	const statuses = new Set(nodes.map((node) => node.status));
-	for (const [status, label, col] of [["failed", "✗ failed", "error"], ["retired", "⣿ retired", "dim"]] as const) {
-		if (!statuses.has(status)) continue;
+	for (const [, label, col] of statusItems) {
 		if (lx + label.length + 1 > r.x + r.w - 1) break;
 		cv.text(lx, ly, label, col);
 		lx += label.length + 2;
