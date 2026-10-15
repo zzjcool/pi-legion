@@ -188,12 +188,12 @@ const SubagentParams = Type.Object({
 	name: Type.Optional(
 		Type.String({
 			description:
-				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On control actions (status/wait/stop/…): addresses that child.",
+				"Child handle name. On launch (single agent+task): registers this exact name (lowercase [a-z][a-z0-9_-]{0,31}) instead of auto scout-N; collisions refuse. On control actions (wait/stop/collect/…): addresses that child. For status: omit (or pass all:true) for a live-children overview; pass name for one child.",
 		}),
 	),
 	all: Type.Optional(
 		Type.Boolean({
-			description: "wait: wait for active children; stop: stop every non-retired child",
+			description: "wait: wait for active children; stop: stop every non-retired child; status: overview of all live (non-retired) children under cwd",
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -1167,6 +1167,39 @@ async function controlAction(input: {
 		});
 	}
 
+	// status: no name (or all:true) → live-children overview; named → one child.
+	if (action === "status") {
+		if (params.name && params.all) {
+			return fail(
+				"`name` and `all` are mutually exclusive for status.",
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		if (!params.name) {
+			const live = listLiveChildrenForStatus(store.listRuns());
+			return ok(
+				renderStatusOverview(
+					live.map((child) => ({
+						child,
+						alive: input.supervisor.isAlive(child.name),
+					})),
+				),
+			);
+		}
+		const found = findChild(store.listRuns(), params.name);
+		if (!found) return unknownChild(params.name, store, cwd);
+		return ok(renderLiveChildStatus({
+			name: found.child.name,
+			state: found.child.state,
+			agent: found.child.agent,
+			kind: found.child.kind,
+			sessionFile: found.child.sessionFile,
+			execution: found.child.execution,
+			acceptance: found.child.acceptance,
+			alive: input.supervisor.isAlive(params.name),
+		}));
+	}
+
 	if (!params.name) {
 		return fail(
 			`\`name\` is required for the "${action}" action.`,
@@ -1200,18 +1233,6 @@ async function controlAction(input: {
 		orchestrator,
 	};
 
-	if (action === "status") {
-		return ok(renderLiveChildStatus({
-			name: found.child.name,
-			state: found.child.state,
-			agent: found.child.agent,
-			kind: found.child.kind,
-			sessionFile: found.child.sessionFile,
-			execution: found.child.execution,
-			acceptance: found.child.acceptance,
-			alive: input.supervisor.isAlive(params.name),
-		}));
-	}
 	if (action === "steer") return steerChild(ctx);
 	if (action === "collect") return collectChild(ctx, input.signal);
 	if (action === "retire") return retireChild(ctx);
@@ -1224,7 +1245,7 @@ async function controlAction(input: {
 interface ChildContext {
 	action: string;
 	params: SubagentParams;
-	/** Always set: `controlAction` rejects a request without a name. */
+	/** Always set: named control actions reject a request without a name. */
 	name: string;
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
@@ -2507,6 +2528,53 @@ async function abandonLaunchedChild(session: LaunchSession, name: string): Promi
 // ---------------------------------------------------------------------------
 // wait (§1.5): block for results instead of relying on async notices
 // ---------------------------------------------------------------------------
+
+/**
+ * Live (non-retired / non-exited) children under this cwd for status overview.
+ *
+ * Names can be reused after retire; prefer the newest live record per name
+ * (same preference as {@link pickChildByName}).
+ */
+export function listLiveChildrenForStatus(
+	runs: ReturnType<RunStore["listRuns"]>,
+): NonNullable<ReturnType<RunStore["findChild"]>>[] {
+	const ranked = [...runs].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	const seen = new Set<string>();
+	const out: NonNullable<ReturnType<RunStore["findChild"]>>[] = [];
+	for (const run of ranked) {
+		for (const child of run.children) {
+			if (child.state === "retired" || child.state === "exited") continue;
+			if (seen.has(child.name)) continue;
+			seen.add(child.name);
+			out.push(child);
+		}
+	}
+	return out;
+}
+
+/** Multi-child status text: one {@link renderLiveChildStatus} block per live child. */
+export function renderStatusOverview(
+	children: Array<{
+		child: NonNullable<ReturnType<RunStore["findChild"]>>;
+		alive: boolean;
+	}>,
+): string {
+	if (children.length === 0) return "No live children.";
+	const noun = children.length === 1 ? "child" : "children";
+	const blocks = children.map(({ child, alive }) =>
+		renderLiveChildStatus({
+			name: child.name,
+			state: child.state,
+			agent: child.agent,
+			kind: child.kind,
+			sessionFile: child.sessionFile,
+			execution: child.execution,
+			acceptance: child.acceptance,
+			alive,
+		}),
+	);
+	return [`Status · ${children.length} live ${noun}`, "", blocks.join("\n\n")].join("\n");
+}
 
 /**
  * Resolve which children a wait targets.
