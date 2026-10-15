@@ -549,3 +549,135 @@ test("#97 doctor wires role-tool gates: lens warns + next steps; codemode auto-l
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("doctor verify concurrency: empty config shows defaults, no STALE_VERIFY_SLOTS", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-vq-empty-"));
+	const lockDir = mkdtempSync(path.join(tmpdir(), "legion-vq-empty-"));
+	try {
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		const report = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			sections: ["memory"],
+			env: {
+				HOME: process.env.HOME,
+				PI_LEGION_MIN_FREE_MEM_MB: "0",
+				PI_LEGION_VERIFY_LOCK_DIR: lockDir,
+				// empty / unset concurrency → defaults (2 / 30min)
+			},
+		});
+		assert.match(report.text, /### Verify concurrency/);
+		assert.match(report.text, /PI_LEGION_VERIFY_CONCURRENCY=2 \(0=unlimited\)/);
+		assert.match(report.text, /PI_LEGION_VERIFY_QUEUE_MAX_MS=1800000/);
+		assert.match(report.text, /slots in use: 0\/2/);
+		assert.equal(report.issues.some((i) => i.code === "STALE_VERIFY_SLOTS"), false);
+		assert.doesNotMatch(report.text, /Stale verify locks/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(lockDir, { recursive: true, force: true });
+	}
+});
+
+test("doctor verify concurrency: live holders = rate-limit in use; dead holders → STALE then recover", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-vq-rl-"));
+	const lockDir = mkdtempSync(path.join(tmpdir(), "legion-vq-rl-"));
+	try {
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		writeFileSync(
+			path.join(lockDir, "slot-0.lock"),
+			JSON.stringify({ pid: process.pid, host: "host", at: Date.now(), command: "npm test" }) + "\n",
+		);
+		writeFileSync(
+			path.join(lockDir, "slot-1.lock"),
+			JSON.stringify({ pid: 2 ** 22 + 42, host: "host", at: 1, command: "tsc" }) + "\n",
+		);
+
+		const triggered = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			sections: ["memory"],
+			env: {
+				HOME: process.env.HOME,
+				PI_LEGION_MIN_FREE_MEM_MB: "0",
+				PI_LEGION_VERIFY_CONCURRENCY: "2",
+				PI_LEGION_VERIFY_QUEUE_MAX_MS: "60000",
+				PI_LEGION_VERIFY_LOCK_DIR: lockDir,
+			},
+		});
+		assert.match(triggered.text, /### Verify concurrency/);
+		assert.match(triggered.text, /PI_LEGION_VERIFY_CONCURRENCY=2/);
+		assert.match(triggered.text, /PI_LEGION_VERIFY_QUEUE_MAX_MS=60000/);
+		assert.match(triggered.text, /slots in use: 2\/2/);
+		assert.match(triggered.text, /slot-0: pid=/);
+		assert.match(triggered.text, /cmd=npm test/);
+		assert.match(triggered.text, /cmd=tsc/);
+		const stale = triggered.issues.find((i) => i.code === "STALE_VERIFY_SLOTS");
+		assert.ok(stale, "dead-pid slot must raise STALE_VERIFY_SLOTS");
+		assert.equal(stale?.severity, "warning");
+		assert.match(stale?.message ?? "", /1 verify slot/);
+		assert.match(triggered.text, /Stale verify locks are reclaimed automatically/);
+
+		// Recovery: clear locks → empty again, no STALE.
+		rmSync(path.join(lockDir, "slot-0.lock"), { force: true });
+		rmSync(path.join(lockDir, "slot-1.lock"), { force: true });
+		const recovered = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			sections: ["memory"],
+			env: {
+				HOME: process.env.HOME,
+				PI_LEGION_MIN_FREE_MEM_MB: "0",
+				PI_LEGION_VERIFY_CONCURRENCY: "2",
+				PI_LEGION_VERIFY_LOCK_DIR: lockDir,
+			},
+		});
+		assert.match(recovered.text, /slots in use: 0\/2/);
+		assert.equal(recovered.issues.some((i) => i.code === "STALE_VERIFY_SLOTS"), false);
+		assert.doesNotMatch(recovered.text, /Stale verify locks/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(lockDir, { recursive: true, force: true });
+	}
+});
+
+test("doctor verify concurrency: unlimited (0) skips slot inspection", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-vq-off-"));
+	const lockDir = mkdtempSync(path.join(tmpdir(), "legion-vq-off-"));
+	try {
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		// Even with a lock file present, limit=0 → inspect returns empty / no STALE.
+		writeFileSync(
+			path.join(lockDir, "slot-0.lock"),
+			JSON.stringify({ pid: 2 ** 22 + 7, host: "host", at: 1 }) + "\n",
+		);
+		const report = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			sections: ["memory"],
+			env: {
+				HOME: process.env.HOME,
+				PI_LEGION_MIN_FREE_MEM_MB: "0",
+				PI_LEGION_VERIFY_CONCURRENCY: "0",
+				PI_LEGION_VERIFY_LOCK_DIR: lockDir,
+			},
+		});
+		assert.match(report.text, /PI_LEGION_VERIFY_CONCURRENCY=0 \(0=unlimited\)/);
+		assert.match(report.text, /slots in use: 0\/∞/);
+		assert.equal(report.issues.some((i) => i.code === "STALE_VERIFY_SLOTS"), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(lockDir, { recursive: true, force: true });
+	}
+});
