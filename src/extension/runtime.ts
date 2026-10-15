@@ -1186,6 +1186,17 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	return runtime;
 }
 
+
+/** Latest visible activity ms across tree / session / turn clocks. */
+function latestActivityAt(...candidates: Array<number | undefined>): number | undefined {
+	let best: number | undefined;
+	for (const value of candidates) {
+		if (value === undefined || !Number.isFinite(value)) continue;
+		best = best === undefined ? value : Math.max(best, value);
+	}
+	return best;
+}
+
 function statusEntryFromJob(
 	job: TrackedJob,
 	identity?: LegionTreeIdentity,
@@ -1203,6 +1214,12 @@ function statusEntryFromJob(
 				: executionStatus === "failed" || executionStatus === "truncated" || executionStatus === undefined ? "failed"
 					: "retired";
 	const finishedAt = terminalNode ? node.updatedAt : job.settledAt;
+	const lastActivityAt = latestActivityAt(
+		node?.updatedAt,
+		live.currentTurnStartedAt,
+		live.currentTurnEndedAt,
+		finishedAt,
+	);
 	return {
 		name: job.name,
 		agent: job.agent,
@@ -1229,6 +1246,7 @@ function statusEntryFromJob(
 			? { tokensOut: live.tokensOut }
 			: node?.tokensOut ? { tokensOut: node.tokensOut } : {}),
 		...(live.generationMs ? { generationMs: live.generationMs } : {}),
+		...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
 		...(identity ? {
 			nodeId: identity.nodeId,
 			parentId: identity.parentId,
@@ -1241,6 +1259,11 @@ function statusEntryFromNode(
 	node: TreeNodeSnapshot,
 	activity?: NodeActivity,
 ): StatusEntry {
+	const lastActivityAt = latestActivityAt(
+		node.updatedAt,
+		activity?.turnStartedAt,
+		activity?.turnEndedAt,
+	);
 	return {
 		name: node.name,
 		agent: node.role,
@@ -1258,6 +1281,7 @@ function statusEntryFromNode(
 		...(activity?.turnStartedAt !== undefined ? { currentTurnStartedAt: activity.turnStartedAt } : {}),
 		...(activity?.turnEndedAt !== undefined ? { currentTurnEndedAt: activity.turnEndedAt } : {}),
 		...(activity?.tools.length ? { lastTools: activity.tools } : {}),
+		...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
 		nodeId: node.id,
 		parentId: node.parentId,
 		depth: node.depth,

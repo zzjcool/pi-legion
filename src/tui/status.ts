@@ -47,6 +47,11 @@ export interface StatusEntry {
 	currentTurnStartedAt?: number;
 	/** Unix ms the current turn settled. Absent while the turn is still in flight. */
 	currentTurnEndedAt?: number;
+	/**
+	 * Unix ms of the agent's last visible activity (edit / reply / status or
+	 * output refresh). Not the run wall-clock start.
+	 */
+	lastActivityAt?: number;
 	/** Cumulative tokens (input+cache+output); from session jsonl (fresh) or ledger usage (≤30s stale). */
 	tokensTotal?: number;
 	/** Cumulative output tokens only; numerator for tok/s / t/s. */
@@ -98,6 +103,21 @@ function formatElapsedParts(ms: number, hourSeconds: boolean): string {
 
 export function formatElapsed(ms: number): string {
 	return formatElapsedParts(ms, false);
+}
+
+/**
+ * Relative age for railway "last activity" (`3s ago` / `2m ago` / `1h ago`).
+ * Missing timestamp → `—` (placeholder; see #159).
+ */
+export function formatActivityAgo(lastActivityAt: number | undefined, now: number): string {
+	if (lastActivityAt === undefined || !Number.isFinite(lastActivityAt)) return "—";
+	const secs = Math.max(0, Math.floor((now - lastActivityAt) / 1000));
+	if (secs < 60) return `${secs}s ago`;
+	const mins = Math.floor(secs / 60);
+	if (mins < 60) return `${mins}m ago`;
+	const hours = Math.floor(mins / 60);
+	if (hours < 48) return `${hours}h ago`;
+	return `${Math.floor(hours / 24)}d ago`;
 }
 
 /** Compact token count: 950 -> "950", 1200 -> "1.2K", 2500000 -> "2.5M". */
