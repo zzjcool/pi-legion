@@ -55,6 +55,12 @@ import { ALLOW_NESTED_ENV } from "./budget.ts";
 import { IDLE_STOP_HINT, IDLE_STOP_HINT_SHORT } from "./legion-stop.ts";
 import type { AgentConfig } from "../shared/types.ts";
 import { recentSpawnFailures, type SpawnFailureRecord } from "./spawn-hints.ts";
+import {
+	formatSessionErrorTitle,
+	sessionErrorsLogPath,
+	summarizeSessionErrors,
+	type SessionErrorSummary,
+} from "./session-errors.ts";
 
 /**
  * Canonical slash surface. `/legion help` and the doctor Tools section both
@@ -84,6 +90,7 @@ export const DOCTOR_SECTIONS = [
 	"tools",
 	"storage",
 	"runtime",
+	"errors",
 	"next",
 ] as const;
 
@@ -170,6 +177,8 @@ export interface DoctorOptions {
 	runtime?: DoctorRuntimeSnapshot;
 	/** Limit to these sections (plus always `next` when issues exist). */
 	sections?: readonly DoctorSection[];
+	/** Injected session-error summary (tests); defaults to reading storeRoot log. */
+	sessionErrors?: SessionErrorSummary;
 }
 
 function readJson(file: string): unknown {
@@ -648,8 +657,20 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	}
 
 	const storeRoot = options.storeRoot ?? (options.cwd ? path.join(options.cwd, ".pi-subagents") : undefined);
+	const sessionErrors = options.sessionErrors ?? summarizeSessionErrors({ storeRoot });
 	const orphans = storeRoot ? scanOrphanTemps(storeRoot) : undefined;
 	const hygieneLast = storeRoot ? readHygieneLast(storeRoot) : undefined;
+	if (sessionErrors.total > 0) {
+		issues.push({
+			severity: "info",
+			code: "SESSION_ERRORS",
+			section: "errors",
+			message: `${sessionErrors.total} session error(s) recorded (see Errors section / log).`,
+			fix: sessionErrors.logPath
+				? `Inspect ${sessionErrors.logPath}`
+				: "Re-run after a tool failure to populate the session-errors log under .pi-subagents/.",
+		});
+	}
 	if (orphans && orphans.orphanDead > 0) {
 		issues.push({
 			severity: "info",
@@ -699,6 +720,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		const errN = issues.filter((i) => i.severity === "error").length;
 		const warnN = issues.filter((i) => i.severity === "warning").length;
 		push(`- status: ${errN ? "FAIL" : warnN ? "WARN" : "OK"} (${errN} error(s), ${warnN} warning(s))`);
+		push(`- session errors: ${sessionErrors.total}${sessionErrors.logPath ? ` (log ${homeize(sessionErrors.logPath, home)})` : ""}`);
 		push(`- child --no-extensions: ${noExtensions ? "yes" : "no"}; inherit: ${inheritGlobal ? "yes" : "no"}`);
 		push(`- models host/child: ${hostModels.length}/${childModels.length}`);
 		push(`- live children: ${runtime.liveJobs?.length ?? "(unknown — pass runtime)"}`);
@@ -859,6 +881,38 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 			try {
 				push(`- store bytes (approx): ${formatBytes(dirBytes(storeRoot))}`);
 			} catch { /* ignore */ }
+		}
+		push("");
+	}
+
+	if (want(selected, "errors")) {
+		push("## Session errors");
+		push(`- count: ${sessionErrors.total}`);
+		const codes = Object.entries(sessionErrors.byCode)
+			.sort((a, b) => b[1] - a[1])
+			.map(([code, n]) => `${code}=${n}`)
+			.join(", ");
+		if (codes) push(`- by code: ${codes}`);
+		const logPath = sessionErrors.logPath ?? sessionErrorsLogPath(storeRoot);
+		if (logPath) {
+			push(`- log: ${homeize(logPath, home)} (${formatBytes(sessionErrors.logBytes)})`);
+		} else {
+			push("- log: (no storeRoot — errors stay in-process only until a tool runs with a cwd)");
+		}
+		if (sessionErrors.total === 0) {
+			push("(none recorded)");
+		} else {
+			push("### Recent");
+			for (const row of sessionErrors.recent) {
+				push(`- ${formatSessionErrorTitle(row)}`);
+			}
+			if (sessionErrors.large || sessionErrors.truncated) {
+				push("");
+				push(
+					`Summary only — full journal at ${homeize(logPath ?? "(unset)", home)}. ` +
+					"Open that file for the complete history (doctor never dumps the whole log here).",
+				);
+			}
 		}
 		push("");
 	}
