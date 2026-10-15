@@ -33,6 +33,10 @@ export interface VizNode {
 	currentTurnStartedAt?: number;
 	/** Unix ms the current turn settled. Absent while it is still in flight. */
 	currentTurnEndedAt?: number;
+	/** Completed turn count (1-based latest); used to gate round clocks on the strip. */
+	turns?: number;
+	/** Unix ms of last visible activity for this seat (not run wall-clock start). */
+	lastActivityAt?: number;
 }
 
 /** Same set the footer/busy label treat as active, so live counts agree everywhere. */
@@ -71,6 +75,8 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 			generationMs: Math.max(0, entry.generationMs ?? 0),
 			...(entry.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: entry.currentTurnStartedAt } : {}),
 			...(entry.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: entry.currentTurnEndedAt } : {}),
+			...(entry.turns !== undefined && entry.turns > 0 ? { turns: entry.turns } : {}),
+			...(entry.lastActivityAt !== undefined ? { lastActivityAt: entry.lastActivityAt } : {}),
 		});
 	}
 	// Parents that are missing from the snapshot re-attach to the nearest known ancestor.

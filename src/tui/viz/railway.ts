@@ -9,7 +9,7 @@
  * vertical remains traceable.
  */
 
-import { formatAgentElapsed } from "../status.ts";
+import { formatAgentElapsed, formatActivityAgo } from "../status.ts";
 import { Canvas, ellipsize } from "./canvas.ts";
 import { formatCount, isAgent, type VizNode } from "./model.ts";
 import { roleColor, type VizTheme } from "./palette.ts";
@@ -139,6 +139,51 @@ export function maxLanesFor(width: number): number {
 
 export function formatRate(rate: number): string {
 	return `${formatCount(rate)} tok/s`;
+}
+
+
+/**
+ * Wide-lane detail after the name: role, optional turn/lifetime clocks (only
+ * from turn ≥2), and last-activity age. Round-1 hides both current-turn and
+ * lifetime clocks (#159).
+ */
+export function formatRailLaneDetail(node: VizNode, now: number): string {
+	const parts: string[] = [node.role];
+	if ((node.turns ?? 0) >= 2) {
+		parts.push(formatAgentElapsed({
+			state: node.status,
+			startedAt: node.startedAt,
+			...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
+			...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
+			...(node.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: node.currentTurnEndedAt } : {}),
+		}, now));
+	}
+	parts.push(formatActivityAgo(node.lastActivityAt, now));
+	return parts.join(" · ");
+}
+
+/** Pick the richest lane detail that fits `room` (role → clocks → ago). */
+export function fitRailLaneDetail(node: VizNode, now: number, room: number): string {
+	if (room <= 0) return "";
+	const ago = formatActivityAgo(node.lastActivityAt, now);
+	const clocks = (node.turns ?? 0) >= 2
+		? formatAgentElapsed({
+			state: node.status,
+			startedAt: node.startedAt,
+			...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
+			...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
+			...(node.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: node.currentTurnEndedAt } : {}),
+		}, now)
+		: undefined;
+	const candidates = [
+		clocks ? `${node.role} · ${clocks} · ${ago}` : `${node.role} · ${ago}`,
+		...(clocks ? [`${clocks} · ${ago}`, clocks] : []),
+		ago,
+	];
+	for (const candidate of candidates) {
+		if (Array.from(candidate).length <= room) return candidate;
+	}
+	return ellipsize(ago, room);
 }
 
 export function renderRailway(input: RailInput): RailRender | undefined {
@@ -285,21 +330,15 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		const overflow = i === 0 && above ? " ▲" : i === rows - 1 && below ? " ▼" : "";
 		const avail = width - (nameX + 2) - overflow.length;
 		if (portrait) {
-			canvas.text(nameX + 2, y, ellipsize(node.name, avail), col, { bold: true });
+			const ago = formatActivityAgo(node.lastActivityAt, now);
+			const label = ago === "—" ? node.name : `${node.name} · ${ago}`;
+			canvas.text(nameX + 2, y, ellipsize(label, avail), col, { bold: true });
 		} else {
 			const longest = Math.max(...current.shown.map((n) => Array.from(n.name).length));
 			const nameW = Math.min(16, longest, Math.max(6, avail - 8));
 			canvas.text(nameX + 2, y, ellipsize(node.name, nameW), col, { bold: true });
 			const room = Math.max(0, avail - nameW - 1);
-			const elapsed = formatAgentElapsed({
-				state: node.status,
-				startedAt: node.startedAt,
-				...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
-				...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
-				...(node.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: node.currentTurnEndedAt } : {}),
-			}, now);
-			const full = `${node.role} · ${elapsed}`;
-			const detail = ellipsize(Array.from(full).length <= room ? full : elapsed, room);
+			const detail = fitRailLaneDetail(node, now, room);
 			canvas.text(nameX + 3 + nameW, y, detail, "dim");
 		}
 		if (overflow) canvas.text(width - overflow.length, y, overflow, "text", { bold: true });
