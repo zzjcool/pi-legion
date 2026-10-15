@@ -4,13 +4,13 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
-import { assignLanes, axisColumn, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
+import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
 import { buildLog, chartWindow, computeStats, timingRowsFromNodes } from "../../src/tui/viz/panels.ts";
 import { createLegionViewFactory, handleViewKey, initialViewState, MIN_SELECTION_BADGE_W, renderLegionView } from "../../src/tui/viz/view.ts";
 import { cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
-import { createStatusBoard, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
+import { createStatusBoard, formatActivityAgo, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
 
 const T0 = 1_700_000_000_000;
 const sec = (s: number): number => T0 + s * 1000;
@@ -1201,32 +1201,111 @@ test("railway lane shows current-turn elapsed beside the lifetime total", () => 
 		node("worker-0", {
 			role: "worker",
 			startedAt,
+			turns: 3,
 			currentTurnStartedAt: turnStartedAt,
+			lastActivityAt: turnStartedAt,
 		}),
 	];
 	const live = renderRailway({ nodes, now, width: 120, rate: 0 })!;
-	assert.match(live.canvas.toLines(plainTheme).join("\n"), /worker · 12m12s \/ 1h03m/);
+	assert.match(live.canvas.toLines(plainTheme).join("\n"), /12m12s \/ 1h03m · 12m ago/);
 
 	const frozenNodes = [
 		ROOT,
 		node("worker-0", {
 			role: "worker",
 			startedAt,
+			turns: 3,
 			currentTurnStartedAt: turnStartedAt,
 			currentTurnEndedAt: turnStartedAt + (12 * 60 + 12) * 1_000,
+			lastActivityAt: turnStartedAt + (12 * 60 + 12) * 1_000,
 		}),
 	];
 	const later = now + 90_000;
 	const frozen = renderRailway({ nodes: frozenNodes, now: later, width: 120, rate: 0 })!;
-	assert.match(frozen.canvas.toLines(plainTheme).join("\n"), /worker · 12m12s \/ 1h04m/);
+	assert.match(frozen.canvas.toLines(plainTheme).join("\n"), /12m12s \/ 1h04m · 1m ago/);
 
 	const reset = renderRailway({
-		nodes: [ROOT, node("worker-0", { role: "worker", startedAt, currentTurnStartedAt: later })],
+		nodes: [ROOT, node("worker-0", { role: "worker", startedAt, turns: 4, currentTurnStartedAt: later, lastActivityAt: later })],
 		now: later + 42_000,
 		width: 120,
 		rate: 0,
 	})!;
-	assert.match(reset.canvas.toLines(plainTheme).join("\n"), /worker · 42s \/ 1h05m/);
+	assert.match(reset.canvas.toLines(plainTheme).join("\n"), /42s \/ 1h05m · 42s ago/);
+});
+
+test("#159 railway: turn 1 hides current-turn and lifetime clocks; ≥2 shows them", () => {
+	const startedAt = sec(0);
+	const now = startedAt + 90_000;
+	const turn1 = [
+		ROOT,
+		node("worker-0", {
+			role: "worker",
+			startedAt,
+			turns: 1,
+			currentTurnStartedAt: startedAt,
+			lastActivityAt: now - 3_000,
+		}),
+	];
+	const t1 = renderRailway({ nodes: turn1, now, width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
+	assert.match(t1, /worker · 3s ago/);
+	assert.doesNotMatch(t1, /\d+[smh] \/ /);
+	assert.doesNotMatch(t1, /1h|90s \//);
+
+	const noTurns = [
+		ROOT,
+		node("worker-0", { role: "worker", startedAt, currentTurnStartedAt: startedAt, lastActivityAt: now - 5_000 }),
+	];
+	const missing = renderRailway({ nodes: noTurns, now, width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
+	assert.match(missing, /worker · 5s ago/);
+	assert.doesNotMatch(missing, / \/ /);
+
+	const turn2 = [
+		ROOT,
+		node("worker-0", {
+			role: "worker",
+			startedAt,
+			turns: 2,
+			currentTurnStartedAt: now - 12_000,
+			lastActivityAt: now - 12_000,
+		}),
+	];
+	const t2 = renderRailway({ nodes: turn2, now, width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
+	assert.match(t2, /12s \/ 1m30s · 12s ago/);
+});
+
+test("#159 railway: last-activity ago refreshes; missing → —", () => {
+	const startedAt = sec(0);
+	const base = node("worker-0", { role: "worker", startedAt, turns: 1 });
+	const none = renderRailway({ nodes: [ROOT, base], now: sec(30), width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
+	assert.match(none, /worker · —/);
+
+	const early = renderRailway({
+		nodes: [ROOT, { ...base, lastActivityAt: sec(10) }],
+		now: sec(13),
+		width: 120,
+		rate: 0,
+	})!.canvas.toLines(plainTheme).join("\n");
+	assert.match(early, /worker · 3s ago/);
+
+	const later = renderRailway({
+		nodes: [ROOT, { ...base, lastActivityAt: sec(20) }],
+		now: sec(80),
+		width: 120,
+		rate: 0,
+	})!.canvas.toLines(plainTheme).join("\n");
+	assert.match(later, /worker · 1m ago/);
+
+	assert.equal(formatActivityAgo(undefined, sec(0)), "—");
+	assert.equal(formatActivityAgo(sec(0), sec(3)), "3s ago");
+	assert.equal(formatActivityAgo(sec(0), sec(120)), "2m ago");
+	assert.equal(formatRailLaneDetail(node("w", { role: "worker", turns: 1, lastActivityAt: sec(0) }), sec(4)), "worker · 4s ago");
+	assert.equal(
+		formatRailLaneDetail(
+			node("w", { role: "worker", turns: 2, startedAt: sec(0), currentTurnStartedAt: sec(50), lastActivityAt: sec(50) }),
+			sec(60),
+		),
+		"worker · 10s / 1m00s · 10s ago",
+	);
 });
 
 test("viz: nodesFromEntries copies current-turn bounds onto railway nodes", () => {
@@ -1241,11 +1320,15 @@ test("viz: nodesFromEntries copies current-turn bounds onto railway nodes", () =
 			depth: 1,
 			currentTurnStartedAt: sec(10),
 			currentTurnEndedAt: sec(20),
+			turns: 2,
+			lastActivityAt: sec(20),
 		},
 	]);
 	const worker = nodes.find((item) => item.id === "root.worker");
 	assert.equal(worker?.currentTurnStartedAt, sec(10));
 	assert.equal(worker?.currentTurnEndedAt, sec(20));
+	assert.equal(worker?.turns, 2);
+	assert.equal(worker?.lastActivityAt, sec(20));
 });
 
 test("status board entries: settled/awaiting-success children are not live lanes", () => {
