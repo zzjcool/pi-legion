@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
-import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
+import { RateSampler, RATE_WINDOW_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { buildLog, computeStats } from "../../src/tui/viz/panels.ts";
@@ -150,7 +150,7 @@ test("railway: header shows live count and shared tok/s; long names are truncate
 test("railway: rendered width never exceeds the terminal columns", () => {
 	const { nodes, sampler, now } = scenario();
 	for (let width = 20; width <= 220; width += 3) {
-		const out = renderRailway({ nodes, now, width, rate: sampler.totalRate(now) });
+		const out = renderRailway({ nodes, now, width, rate: sampler.nowRate(now, nodes) });
 		if (!out) continue;
 		for (const line of out.canvas.toLines(ansiTheme)) assert.ok(visibleWidth(line) <= width, `width ${width}: ${visibleWidth(line)}`);
 	}
@@ -217,9 +217,71 @@ test("rate: idle/tool gaps do not dilute output tok/s (generationMs denominator)
 	assert.ok(sampler.totalRate(sec(60)) > 50);
 });
 
+test("rate: header now is 0 when all agents stopped (settled residual window ignored)", () => {
+	const sampler = new RateSampler();
+	// Steady generation for 90s, then settle; keep painting settled snapshots for another 30s.
+	for (let t = 0; t <= 120; t += 2) {
+		const done = t >= 90;
+		const elapsed = done ? 90 : t;
+		sampler.record(sec(t), [ROOT, node("a", {
+			status: done ? "settled" : "running",
+			startedAt: T0,
+			...(done ? { endedAt: sec(90) } : {}),
+			tokensOut: elapsed * 100,
+			generationMs: elapsed * 1000,
+		})]);
+	}
+	const settled = [ROOT, node("a", {
+		status: "settled",
+		startedAt: T0,
+		endedAt: sec(90),
+		tokensOut: 9000,
+		generationMs: 90_000,
+	})];
+	// Unfiltered trailing window still sees Δtokens from before settle.
+	assert.ok(sampler.totalRate(sec(120)) > 0);
+	assert.deepEqual(liveRateNodeIds(settled), []);
+	assert.equal(sampler.nowRate(sec(120), settled), 0);
+	assert.equal(sampler.totalRate(sec(120), RATE_WINDOW_MS, []), 0);
+});
+
+test("rate: header now stays non-zero while an agent is live", () => {
+	const sampler = new RateSampler();
+	// a generates through t=100 then settles; b runs from t=60. At t=120 the
+	// unfiltered 60s window still includes a's late tokens, but nowRate only b.
+	for (let t = 0; t <= 120; t += 2) {
+		const aDone = t >= 100;
+		const aElapsed = aDone ? 100 : t;
+		const nodes: VizNode[] = [ROOT, node("a", {
+			status: aDone ? "settled" : "running",
+			startedAt: T0,
+			...(aDone ? { endedAt: sec(100) } : {}),
+			tokensOut: aElapsed * 100,
+			generationMs: aElapsed * 1000,
+		})];
+		if (t >= 60) {
+			nodes.push(node("b", {
+				startedAt: sec(60),
+				tokensOut: 80 * (t - 60),
+				generationMs: (t - 60) * 1000,
+			}));
+		}
+		sampler.record(sec(t), nodes);
+	}
+	const live = [ROOT,
+		node("a", { status: "settled", startedAt: T0, endedAt: sec(100), tokensOut: 10_000, generationMs: 100_000 }),
+		node("b", { startedAt: sec(60), tokensOut: 4800, generationMs: 60_000 }),
+	];
+	assert.deepEqual(liveRateNodeIds(live), ["b"]);
+	const now = sampler.nowRate(sec(120), live);
+	assert.ok(Math.abs(now - 80) < 1e-6, `expected ~80 got ${now}`);
+	// Unfiltered still includes settled "a" residual → higher than live-only.
+	assert.ok(sampler.totalRate(sec(120)) > now);
+});
+
 test("rate: header tok/s and chart 'now' share one definition", () => {
 	const { nodes, sampler, now } = scenario();
-	const rate = sampler.totalRate(now);
+	const rate = sampler.nowRate(now, nodes);
 	const stats = computeStats({ nodes, sampler, now, rate }, 80);
 	assert.equal(stats.now, rate);
 	assert.ok(stats.peak >= rate);
@@ -299,9 +361,13 @@ test("status board: railway strip replaces the roster when enabled and hides wit
 	assert.match(lines[1]!, /worker-1/);
 	for (const line of lines) assert.ok(visibleWidth(line) <= 100);
 	const snap = board.vizSnapshot!(now);
-	assert.equal(snap.rate, snap.sampler.totalRate(now));
+	assert.equal(snap.rate, snap.sampler.nowRate(now, snap.nodes));
 	assert.ok(snap.rate > 0);
+	// All children gone / not running → header now is 0 even if sampler still holds history.
 	board.paint(entries.slice(0, 1), now + 1000);
+	const idleSnap = board.vizSnapshot!(now + 1000);
+	assert.equal(idleSnap.rate, 0);
+	assert.ok(idleSnap.sampler.totalRate(now + 1000) > 0, "chart window may still hold Δtokens");
 	board.clear();
 });
 

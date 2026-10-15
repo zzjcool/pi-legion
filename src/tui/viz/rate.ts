@@ -12,6 +12,11 @@
  * generationMs comes from session JSONL: sum of (assistant_ts − prior
  * user/toolResult_ts). Idle and tool gaps are excluded. Approximate —
  * usage lands when each assistant message completes, not mid-stream.
+ *
+ * Header / snap "now" (`nowRate` / `totalRate` with live node ids) only sums
+ * agents that are still `running`. Settled/retired series keep contributing to
+ * chart buckets/avg so the history window stays accurate; once nothing is live,
+ * "now" is forced to 0 even if the 60s window still holds Δtokens.
  */
 
 import type { VizNode } from "./model.ts";
@@ -137,10 +142,24 @@ export class RateSampler {
 		return dOut / seconds;
 	}
 
-	totalRate(now: number, windowMs = RATE_WINDOW_MS): number {
+	/**
+	 * Sum of node rates. When `onlyNodeIds` is set (including empty), only those
+	 * series contribute — used for header "now". Omit it for chart buckets/avg
+	 * so settled agents still paint their trailing-window history.
+	 */
+	totalRate(now: number, windowMs = RATE_WINDOW_MS, onlyNodeIds?: Iterable<string>): number {
+		const filter = onlyNodeIds === undefined ? undefined : new Set(onlyNodeIds);
 		let sum = 0;
-		for (const id of this.series.keys()) sum += this.nodeRate(id, now, windowMs);
+		for (const id of this.series.keys()) {
+			if (filter && !filter.has(id)) continue;
+			sum += this.nodeRate(id, now, windowMs);
+		}
 		return sum;
+	}
+
+	/** Header / snap "now" tok/s: live (running) agents only; none live → 0. */
+	nowRate(now: number, nodes: readonly VizNode[], windowMs = RATE_WINDOW_MS): number {
+		return this.totalRate(now, windowMs, liveRateNodeIds(nodes));
 	}
 
 	nodeIds(): string[] {
@@ -150,8 +169,8 @@ export class RateSampler {
 	/**
 	 * Bucketed tok/s for [from, to], stacked by role. Each bucket is the
 	 * trailing-window average ending at the bucket edge (window = max(bucket
-	 * span, RATE_WINDOW_MS)), so the last bucket equals the header "now" and
-	 * bursty per-turn token flushes do not render as spikes.
+	 * span, RATE_WINDOW_MS)), including settled series so history stays painted.
+	 * Header "now" may be lower (live-only); bursty flushes stay smoothed.
 	 */
 	buckets(from: number, to: number, count: number, windowMs = RATE_WINDOW_MS): RateSeries {
 		const n = Math.max(1, Math.floor(count));
@@ -189,6 +208,11 @@ export class RateSampler {
 		this.series.clear();
 		this.first = undefined;
 	}
+}
+
+/** Node ids that contribute to header "now" tok/s (running agents; root excluded). */
+export function liveRateNodeIds(nodes: readonly VizNode[]): string[] {
+	return nodes.filter((n) => n.id !== "root" && n.status === "running").map((n) => n.id);
 }
 
 function interpolate(ts: number[], value: number[], t: number): number {

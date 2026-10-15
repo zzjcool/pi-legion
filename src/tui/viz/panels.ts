@@ -12,7 +12,7 @@ export interface ViewData {
 	nodes: readonly VizNode[];
 	sampler: RateSampler;
 	now: number;
-	/** Shared output tok/s (ΔtokensOut / ΔgenerationMs over trailing 60s). */
+	/** Header "now" tok/s (live agents only; 0 when none running). Chart avg/buckets keep full-series windows. */
 	rate: number;
 }
 
@@ -308,7 +308,7 @@ export function computeStats(data: ViewData, buckets: number): ChartStats {
 	}
 	return {
 		now: data.rate,
-		// Same definition as header "now", averaged over the chart window.
+		// Full-series window average (includes settled); differs from header "now" on purpose.
 		avg: data.sampler.totalRate(to, Math.max(1, to - from)),
 		peak,
 		peakAt,
