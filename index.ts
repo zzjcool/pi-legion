@@ -80,6 +80,7 @@ import {
 } from "./src/extension/notify.ts";
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
+import { configureSessionErrors, recordSessionError } from "./src/extension/session-errors.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
 import { expectedModelsFromSettings, parseDoctorSections, runLegionDoctor } from "./src/extension/legion-doctor.ts";
 import { readFileSync } from "node:fs";
@@ -210,7 +211,7 @@ const SubagentParams = Type.Object({
 	section: Type.Optional(
 		Type.String({
 			description:
-				'diagnose only: optional section filter (summary|extensions|models|spawn|memory|tools|storage|runtime|next), same as `/legion doctor [section]`. Space/comma-separated for multiple.',
+				'diagnose only: optional section filter (summary|extensions|models|spawn|memory|tools|storage|runtime|errors|next), same as `/legion doctor [section]`. Space/comma-separated for multiple.',
 		}),
 	),
 });
@@ -837,6 +838,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			}
 			const cwd = params.cwd ?? ctx.cwd;
 			const store = runStoreFor(cwd);
+			configureSessionErrors({ storeRoot: store.rootDir, tool: "subagent", action });
 			const catalog = loadCatalog(ctx.cwd, cwd, params.agentScope);
 			const { allAgents, settings } = catalog;
 			const teamName = action === "launch" ? params.team : undefined;
@@ -2911,5 +2913,6 @@ function ok(text: string): AgentToolResult<unknown> {
  * `details` and the message text carries the failure signal.
  */
 function fail(text: string, code: string): AgentToolResult<unknown> {
+	recordSessionError({ code, message: text });
 	return { content: [{ type: "text", text }], details: { error: code } };
 }

@@ -311,7 +311,7 @@ same idea as `pi list` / `pi auth check`.
 
 - `/legion doctor` — full report in the chat (works outside TUI too).
 - `/legion doctor [section]` — one of: `summary`, `extensions`, `models`,
-  `spawn`, `memory`, `tools`, `storage`, `runtime`, `next`.
+  `spawn`, `memory`, `tools`, `storage`, `runtime`, `errors`, `next`.
 - `subagent({ action: "diagnose" })` — same full report as tool output so the
   main agent can call it without waiting for you. The tool has no section
   field; filter with `/legion doctor [section]`.
@@ -326,6 +326,12 @@ snippet (relevant sections + Next steps) so the main agent can self-fix
 without anyone typing `/legion doctor`. Full `/legion doctor` remains for
 manual deep dives.
 
+**Session errors (#160):** tool validation / call failures from `subagent`
+(and similar) append to `.pi-subagents/session-errors.jsonl` (JSONL, rotated
+to ~500 lines). `/legion doctor` / `diagnose` show counts, by-code tallies,
+and the last few one-line titles under the `errors` section; when the log is
+large they print only that summary plus the log path.
+
 Coverage:
 
 | Section | What it checks |
@@ -337,6 +343,7 @@ Coverage:
 | tools | `/legion` slash list (status, team, agents, summary, on/off, scout-guard, doctor, stop), idle-Esc / strip hints, tool names |
 | storage | `legion.db` sizes, orphan `rpc-child-*` temps, effective hygiene limits (default vs env), last sweep marker plus a hint when it is missing or stale |
 | runtime | Live children, tree statuses, acceptance-ish / active nodes |
+| errors | Recent session/tool errors (validation failures, etc.) as a short summary; full journal at `.pi-subagents/session-errors.jsonl` (rotated ~500 lines). Large logs: summary + path only — doctor never dumps the whole file |
 
 ### Child extensions
 
