@@ -26,6 +26,7 @@ import {
 	type ToggleCommandDeps,
 } from "./slash.ts";
 import { createSummaryCommand } from "./summary.ts";
+import { createTimingCommand } from "./timing.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import type {
 	ExtensionAPI,
@@ -561,6 +562,7 @@ export function registerLegionCommand(
 				}
 			: {}),
 		summary: createSummaryCommand(pi),
+		timing: createTimingCommand(pi),
 	};
 	const helpText = [
 		"Legion commands:",
@@ -570,7 +572,7 @@ export function registerLegionCommand(
 		description: "Open the Legion view or manage teams, agents, subagent runs, and settings",
 		getArgumentCompletions(prefix) {
 			const trimmed = prefix.trimStart();
-			if (/^(team|agents|on|off|summary)\s/i.test(trimmed)) {
+			if (/^(team|agents|on|off|summary|timing)\s/i.test(trimmed)) {
 				const key = trimmed.split(/\s+/, 1)[0]?.toLowerCase() ?? "";
 				if (key === "on" || key === "off") return null;
 				const command = subcommands[key];
@@ -598,7 +600,7 @@ export function registerLegionCommand(
 			const nodes = deps.runtime.treeNodes();
 			const verbs: { value: string; label: string }[] = [];
 			if (!prefix.includes(" ")) {
-				for (const command of ["team", "agents", "on", "off", "summary", "help"]) {
+				for (const command of ["team", "agents", "on", "off", "summary", "timing", "help"]) {
 					if (command.startsWith(prefix)) {
 						verbs.push({ value: command, label: command });
 					}
