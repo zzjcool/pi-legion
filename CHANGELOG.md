@@ -14,6 +14,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 ### Fixed
 
 - Narrow/stacked `/legion` header truncates long run + selection badges without overwriting `⚔ /legion`; galaxy legend reserves room for failed/retired glyphs before roles (#125).
+- Galaxy legend `statusBudget` counts grapheme cells (not `String.length`); selection badge min width unified for portrait + landscape (#128).
 - Dispatched children now receive `--provider` pinned from the parent's model
   registry, so a bare model id (`workbuddy/…`) that also exists under a static
   auth-less provider in `models.json` can no longer hijack the child start

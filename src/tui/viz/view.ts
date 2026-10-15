@@ -1,7 +1,7 @@
 /** /legion full view: galaxy + tok/s chart + git-log history with linked selection. */
 
 import { Key, matchesKey } from "@earendil-works/pi-tui";
-import { Canvas, ellipsize } from "./canvas.ts";
+import { Canvas, cellWidth, ellipsize } from "./canvas.ts";
 import { computeLayout, type LayoutKind } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
 import { roleColor, type VizTheme } from "./palette.ts";
@@ -21,6 +21,9 @@ export function initialViewState(): LegionViewState {
 }
 
 const PANES: Pane[] = ["galaxy", "chart", "log"];
+
+/** Min grapheme cells before painting a selection badge. Shared by portrait + landscape so a truncated stub never paints (#128). Was portrait `>4` vs landscape `>0`. */
+export const MIN_SELECTION_BADGE_W = 5;
 
 export function renderLegionView(data: ViewData, state: LegionViewState, cols: number, rows: number): { canvas: Canvas; layout: LayoutKind } {
 	const W = Math.max(1, Math.floor(cols));
@@ -46,21 +49,23 @@ export function renderLegionView(data: ViewData, state: LegionViewState, cols: n
 	];
 	const badgeRaw = selected ? ` ${selected.name} (${selected.role} · ${statusLabel(selected)}) ` : "";
 	// Cap the selection badge so a long agent name never overwrites "⚔ /legion" / the run name.
-	const badgeCap = Math.max(0, Math.min(Array.from(badgeRaw).length, Math.floor(W * 0.45), W - 14));
+	const badgeCap = Math.max(0, Math.min(cellWidth(badgeRaw), Math.floor(W * 0.45), W - 14));
 	const badge = badgeRaw ? ellipsize(badgeRaw, badgeCap) : "";
-	const badgeW = Array.from(badge).length;
+	const badgeW = cellWidth(badge);
+	const showBadge = badgeW >= MIN_SELECTION_BADGE_W;
 	if (portrait) {
 		cv.text(0, 0, "⚔ /legion ", "accent", { bold: true });
-		const rootRoom = Math.max(0, W - 10 - (badgeW > 0 ? badgeW + 1 : 0));
+		const rootRoom = Math.max(0, W - 10 - (showBadge ? badgeW + 1 : 0));
 		cv.text(10, 0, ellipsize(root?.name ?? "", rootRoom), "text", { bold: true });
 		cv.text(0, 1, ellipsize(parts.join(" · "), W), "dim");
-		if (badgeW > 4) cv.text(W - badgeW, 0, badge, roleColor(selected!.role), { inverse: true });
+		if (showBadge) cv.text(W - badgeW, 0, badge, roleColor(selected!.role), { inverse: true });
 	} else {
 		let x = cv.text(0, 0, "⚔ /legion ", "accent", { bold: true });
-		const rootRoom = Math.max(0, W - x - badgeW - 1);
+		const reservedBadge = showBadge ? badgeW : 0;
+		const rootRoom = Math.max(0, W - x - reservedBadge - 1);
 		x = cv.text(x, 0, ellipsize(`${root?.name ?? "legion"}  `, rootRoom), "text", { bold: true });
-		cv.text(x, 0, ellipsize(parts.join(" · "), Math.max(0, W - x - badgeW - 1)), "dim");
-		if (badgeW > 0) cv.text(W - badgeW, 0, badge, roleColor(selected!.role), { inverse: true });
+		cv.text(x, 0, ellipsize(parts.join(" · "), Math.max(0, W - x - reservedBadge - 1)), "dim");
+		if (showBadge) cv.text(W - badgeW, 0, badge, roleColor(selected!.role), { inverse: true });
 	}
 
 	const galaxyInner = frame(cv, layout.galaxy, portrait ? "galaxy" : "galaxy · structure", state.focus === "galaxy");
