@@ -1070,7 +1070,7 @@ test("index stop action retires multiple RPC children and persists their retired
 	}
 });
 
-test("index launch abort retires the child spawned while the parent turn was canceled", async () => {
+test("index launch abort keeps the child running and watches for settle", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
 		{ "worker.md": WORKER_FILE },
@@ -1091,7 +1091,7 @@ test("index launch abort retires the child spawned while the parent turn was can
 		const controller = new AbortController();
 		const pending = harness.tool.execute(
 			"launch-abort",
-			{ agent: "worker", task: "do not keep a canceled launch", async: true, worktree: false },
+			{ agent: "worker", task: "keep running after parent abort", async: true, worktree: false },
 			controller.signal,
 			undefined,
 			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
@@ -1102,20 +1102,24 @@ test("index launch abort retires the child spawned while the parent turn was can
 		const result = await pending;
 		const handle = harness.supervisor.spawns[0]?.input;
 		if (!handle) throw new Error("expected the child spawn to complete");
-		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
-		assert.equal(harness.supervisor.isAlive(handle.name), false, "an abandoned launch is retired without starting a watch");
-		const records = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") }).listRuns();
-		const child = records.flatMap((run) => run.children).find((entry) => entry.name === handle.name);
-		assert.equal(child?.state, "retired");
-		assert.equal(child?.execution?.status, "failed", "the abandoned launch persists a failed run outcome");
-		assert.equal(harness.sentMessages.length, 0, "the abandoned child was never watched");
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn ended; children still running\)|parent turn ended; child still running/);
+		assert.equal(harness.supervisor.isAlive(handle.name), true, "Esc must not retire a just-spawned child");
+		assert.equal(
+			harness.supervisor.calls.some((call) => call.method === "retire"),
+			false,
+			"launch abort must not call retire",
+		);
+		assert.ok(
+			(result.content ?? []).map((item) => item.text ?? "").join("\n").includes("still running"),
+			"tool result notes the child is still watched",
+		);
 	} finally {
 		releaseSpawn();
 		await harness.cleanup();
 	}
 });
 
-test("index wait abort retires tracked children before returning interrupted", async () => {
+test("index wait abort returns interrupted without retiring tracked children", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
 		{ "worker.md": WORKER_FILE },
@@ -1136,27 +1140,19 @@ test("index wait abort retires tracked children before returning interrupted", a
 		);
 		controller.abort();
 		const result = await pending;
-		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
-		assert.deepEqual(
-			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
-			[name],
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn ended; children still running\)/);
+		assert.equal(
+			harness.supervisor.calls.some((call) => call.method === "retire"),
+			false,
+			"wait abort must not retire children",
 		);
-		assert.equal(harness.supervisor.isAlive(name), false, "aborting wait cascades retirement to the tracked child");
-		assert.equal(harness.sentMessages.length, 0, "the silent cascade cancels completion notifications");
-		const secondWait = await harness.tool.execute(
-			"wait-after-cascade",
-			{ action: "wait", all: true },
-			undefined,
-			undefined,
-			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
-		);
-		assert.match((secondWait.content ?? []).map((item) => item.text ?? "").join("\n"), /no running children/);
+		assert.equal(harness.supervisor.isAlive(name), true, "child keeps running after wait interrupt");
 	} finally {
 		await harness.cleanup();
 	}
 });
 
-test("agent_settled aborted retires async children after the launch tool returned", async () => {
+test("agent_settled aborted leaves async children running (no cascade)", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
 		{ "worker.md": WORKER_FILE },
@@ -1168,18 +1164,18 @@ test("agent_settled aborted retires async children after the launch tool returne
 		const name = harness.supervisor.spawns[0]?.input.name;
 		if (!name) throw new Error("worker child did not spawn");
 		assert.equal(harness.supervisor.isAlive(name), true, "the async child is live after the launch tool returned");
-		// ESC lands with no subagent-family tool call in flight: the launch tool
-		// already returned, so agent_settled{aborted} is the only abort signal.
+		// ESC after async launch returned: v3 does not cascade on agent_settled.
 		harness.emitSettled(true);
-		for (let attempt = 0; attempt < 100 && harness.supervisor.isAlive(name); attempt++) {
+		for (let attempt = 0; attempt < 20; attempt++) {
+			if (harness.supervisor.calls.some((call) => call.method === "retire")) break;
 			await new Promise((resolve) => setTimeout(resolve, 10));
 		}
-		assert.deepEqual(
-			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
-			[name],
+		assert.equal(
+			harness.supervisor.calls.some((call) => call.method === "retire"),
+			false,
+			"agent_settled aborted must not retire async children",
 		);
-		assert.equal(harness.supervisor.isAlive(name), false, "agent_settled aborted cascades retirement to the async child");
-		assert.equal(harness.sentMessages.length, 0, "the cascade stays silent: no completion notification");
+		assert.equal(harness.supervisor.isAlive(name), true, "async child keeps running after aborted settle");
 	} finally {
 		await harness.cleanup();
 	}
@@ -1212,7 +1208,7 @@ test("agent_settled without abort leaves async children running", async () => {
 	}
 });
 
-test("index collect abort returns promptly and cascades retirement to the RPC child", async () => {
+test("index collect abort returns promptly without retiring the RPC child", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
 		{ "worker.md": WORKER_FILE },
@@ -1233,18 +1229,19 @@ test("index collect abort returns promptly and cascades retirement to the RPC ch
 		);
 		controller.abort();
 		const result = await pending;
-		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
-		assert.deepEqual(
-			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
-			[name],
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn ended; children still running\)/);
+		assert.equal(
+			harness.supervisor.calls.some((call) => call.method === "retire"),
+			false,
+			"collect abort must not retire",
 		);
-		assert.equal(harness.supervisor.isAlive(name), false, "collect abort cascades retirement to the child");
+		assert.equal(harness.supervisor.isAlive(name), true, "collect abort leaves the child running");
 	} finally {
 		await harness.cleanup();
 	}
 });
 
-test("vexillatio collect abort returns promptly and retires utility children", async () => {
+test("vexillatio collect abort returns promptly without retiring utility children", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
 		{ "scout.md": UTILITY_FILE },
@@ -1289,111 +1286,14 @@ test("vexillatio collect abort returns promptly and retires utility children", a
 		]);
 		if (timeout) clearTimeout(timeout);
 		assert.ok(result, "aborted collect returns without waiting for the 600s timeout");
-		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
-		assert.equal(harness.supervisor.isAlive(name), false, "the utility child is retired by cascade");
-		assert.deepEqual(
-			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
-			[name],
-		);
-	} finally {
-		await harness.cleanup();
-	}
-});
-
-test("turn_start resets the cascade promise for the next turn", async () => {
-	const harness = indexHarness(
-		{ disableBuiltins: true },
-		{ "worker.md": WORKER_FILE },
-		{ autoSettle: false, immediateTimeout: false },
-	);
-	try {
-		for (let turn = 0; turn < 2; turn += 1) {
-			harness.startTurn();
-			await invokeIndex(harness, {
-				agent: "worker",
-				task: `turn ${turn + 1}`,
-				async: true,
-				worktree: false,
-			});
-			const name = harness.supervisor.spawns.at(-1)?.input.name;
-			if (!name) throw new Error("worker child did not spawn");
-			const controller = new AbortController();
-			const pending = harness.tool.execute(
-				`turn-${turn + 1}-wait-abort`,
-				{ action: "wait", name },
-				controller.signal,
-				undefined,
-				{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
-			);
-			controller.abort();
-			const result = await pending;
-			assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn aborted\)/);
-		}
-		assert.deepEqual(
-			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name),
-			harness.supervisor.spawns.map((spawn) => spawn.input.name),
-		);
-	} finally {
-		await harness.cleanup();
-	}
-});
-
-test("parallel aborted waits share one in-flight cascade retirement", async () => {
-	const harness = indexHarness(
-		{ disableBuiltins: true },
-		{ "worker.md": WORKER_FILE },
-		{ autoSettle: false, immediateTimeout: false },
-	);
-	let releaseRetires: () => void = () => {};
-	try {
-		await invokeIndex(harness, {
-			tasks: [
-				{ agent: "worker", task: "first" },
-				{ agent: "worker", task: "second" },
-			],
-			async: true,
-			worktree: false,
-		});
-		const names = harness.supervisor.spawns.map((spawn) => spawn.input.name);
-		assert.equal(names.length, 2);
-		const retireGate = new Promise<void>((resolve) => { releaseRetires = resolve; });
-		let retireCalls = 0;
-		let resolveAllRetiresStarted!: () => void;
-		const allRetiresStarted = new Promise<void>((resolve) => { resolveAllRetiresStarted = resolve; });
-		const originalRetire = harness.supervisor.retire.bind(harness.supervisor);
-		harness.supervisor.retire = async (name: string) => {
-			retireCalls += 1;
-			if (retireCalls === names.length) resolveAllRetiresStarted();
-			await retireGate;
-			await originalRetire(name);
-		};
-		const controller = new AbortController();
-		const waits = names.map((name, index) => harness.tool.execute(
-			`parallel-wait-abort-${index}`,
-			{ action: "wait", name },
-			controller.signal,
-			undefined,
-			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
-		));
-		controller.abort();
-		await allRetiresStarted;
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		assert.equal(retireCalls, names.length, "both simultaneous aborts share the same in-flight cascade");
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn ended; children still running\)/);
+		assert.equal(harness.supervisor.isAlive(name), true, "utility child keeps running after Esc");
 		assert.equal(
-			harness.supervisor.calls.filter((call) => call.method === "retire").length,
-			0,
-			"runtime release waits until every parallel retire has settled",
+			harness.supervisor.calls.some((call) => call.method === "retire"),
+			false,
+			"vexillatio abort must not cascade retire",
 		);
-		releaseRetires();
-		const results = await Promise.all(waits);
-		assert.ok(results.every((result) => /interrupted \(parent turn aborted\)/.test((result.content ?? []).map((item) => item.text ?? "").join("\n"))));
-		assert.deepEqual(
-			harness.supervisor.calls.filter((call) => call.method === "retire").map((call) => call.name).sort(),
-			[...names].sort(),
-		);
-		assert.ok(names.every((name) => !harness.supervisor.isAlive(name)));
 	} finally {
-		releaseRetires();
 		await harness.cleanup();
 	}
 });

@@ -237,7 +237,7 @@ test("renderWait: summary line counts done and still-running", () => {
 	assert.match(rendered, /── c ──\nnot tracked/);
 	assert.match(rendered, /1 done, 1 still running/);
 	const interrupted = renderWait([{ name: "wait", interrupted: true }]);
-	assert.match(interrupted, /── wait ──\ninterrupted \(parent turn aborted\)/);
+	assert.match(interrupted, /── wait ──\ninterrupted \(parent turn ended; children still running\)/);
 	assert.match(interrupted, /0 done, 0 still running/);
 	assert.match(interrupted, /1 interrupted/);
 });

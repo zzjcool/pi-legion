@@ -2,6 +2,8 @@
 
 > **v2 修订（2026-10-13）**：ESC / 父 turn abort 的语义已改为级联优雅关闭由该 turn 拥有的 children，推翻 v1 下文的「ESC ≠ 杀 children」决定。下文保留 v1 冻结原文，仅供历史考古；当前语义以 `docs/contracts/esc-cascade-v2.md` 为准。
 
+> **v3 说明（2026-10-15）**：v3（`esc-no-retire-v3.md`）再次回到 v1 的「ESC ≠ 杀 children」原则；与 v1 不同的是保留 session_shutdown drain/归因与显式 `/legion stop`。v2 级联语义已推翻。
+
 ## 目标
 
 1. 主 pi 按 ESC（或 RPC abort）打断当前 turn 时，正在执行的 `subagent` 工具调用必须尽快感知并优雅收场，不能钉住事件循环。

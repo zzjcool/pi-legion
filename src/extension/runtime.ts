@@ -300,7 +300,7 @@ export interface WaitResult {
 	snapshot?: CollectSnapshot;
 	/** Still running when the timeout fired. */
 	stillRunning?: boolean;
-	/** The parent turn aborted while this wait was pending. */
+	/** The parent turn ended while this wait was pending; children still running. */
 	interrupted?: boolean;
 	/** Not tracked live and no finished cache (pre-validated upstream). */
 	missing?: boolean;
@@ -709,9 +709,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			}
 			const outcome = await Promise.race(racers);
 			if (outcome === WAIT_INTERRUPTED) {
-				// The session-level abort cascade retires this job, so do not arm
-				// a completion watcher for a child that is about to be closed.
+				// Esc / parent-turn abort does not retire children (esc-no-retire-v3).
+				// Re-arm watch so settle still notifies the parent.
 				job.consumedByTool = false;
+				if (!job.watching) runtime.watch(name);
 				return { name, interrupted: true };
 			}
 			const snapshot = outcome;

@@ -1,6 +1,6 @@
 /**
  * Broader mock-llm e2e for legion behaviours that previously needed a live model:
- * multi-child railway (connectors / vanish / lockstep), stop one+all + idle Esc,
+ * multi-child railway (connectors / vanish / lockstep), stop one+all,
  * idle strip hint vs main busy, auto-doctor on model-miss / memory refuse,
  * verify concurrency ≤2.
  *
@@ -21,7 +21,6 @@ import {
 import { enrichFailureWithAutoDoctor } from "../../src/extension/auto-doctor.ts";
 import { clearSpawnFailures } from "../../src/extension/spawn-hints.ts";
 import {
-	createIdleEscStop,
 	IDLE_STOP_HINT,
 	runLegionStop,
 	type StopJob,
@@ -133,7 +132,7 @@ test("e2e: mock-llm multi-spawn + railway connectors, vanish, lockstep scroll", 
 	}
 });
 
-test("e2e: mock stop-all scenario + /legion stop one/all + idle Esc confirm", async () => {
+test("e2e: mock stop-all scenario + /legion stop one/all", async () => {
 	const mock = await startMockLlm({ scenario: "stop-all", port: 0 });
 	try {
 		const first = await chat(mock.baseUrl, [{ role: "user", content: "stop everything" }]);
@@ -173,32 +172,6 @@ test("e2e: mock stop-all scenario + /legion stop one/all + idle Esc confirm", as
 		assert.match(await runLegionStop("all", deps), /Stopped 3 children/);
 		assert.deepEqual(calls, [{ all: true }]);
 
-		const log: string[] = [];
-		const state = { idle: true, empty: true, busy: false, live: 3, answer: true };
-		const handler = createIdleEscStop({
-			isIdle: () => state.idle,
-			editorEmpty: () => state.empty,
-			uiBusy: () => state.busy,
-			liveCount: () => state.live,
-			confirm: async (_t, message) => {
-				log.push(message);
-				return state.answer;
-			},
-			stopAll: async () => {
-				log.push("stopAll");
-				await deps.stop({ all: true });
-			},
-		});
-		const flush = () => new Promise((r) => setImmediate(r));
-		assert.deepEqual(handler("\x1b"), { consume: true });
-		await flush();
-		await flush();
-		assert.deepEqual(log, ["Stop 3 running subagents?", "stopAll"]);
-		state.busy = true;
-		assert.equal(handler("\x1b"), undefined, "busy UI does not consume Esc");
-		state.busy = false;
-		state.idle = false;
-		assert.equal(handler("\x1b"), undefined, "main agent streaming: Esc not idle-stop");
 	} finally {
 		await mock.close();
 	}
@@ -234,11 +207,11 @@ test("e2e: idle hint shows only when setIdleHint(true); hidden while main busy",
 			now,
 		);
 		const comp = factory!({ requestRender() {} }, plain);
-		assert.doesNotMatch(comp.render(120)[0]!, /esc stop all/, "default: main busy / no idle hint");
+		assert.doesNotMatch(comp.render(120)[0]!, /legion stop/, "default: main busy / no idle hint");
 		board.setIdleHint!(true);
 		assert.match(comp.render(120)[0]!, new RegExp(IDLE_STOP_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		board.setIdleHint!(false);
-		assert.doesNotMatch(comp.render(120)[0]!, /esc stop all/, "cleared when main streams again");
+		assert.doesNotMatch(comp.render(120)[0]!, /legion stop/, "cleared when main streams again");
 		board.clear();
 	} finally {
 		await mock.close();

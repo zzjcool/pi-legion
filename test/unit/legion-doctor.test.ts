@@ -107,7 +107,7 @@ test("doctor flags CHILD_NO_MODELS and covers all sections", () => {
 				liveJobs: [{ name: "scout-0", state: "starting" }],
 				treeNodes: [{ id: "root.scout-0", name: "scout-0", status: "running", phase: "verify" }],
 				stopAvailable: true,
-				idleEscWired: true,
+				idleEscWired: false,
 				legionTools: ["subagent", "vexillatio"],
 			},
 			agents: [
