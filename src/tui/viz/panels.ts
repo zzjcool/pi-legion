@@ -5,8 +5,9 @@ import type { Rect } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
 import { nodeToken, roleColor } from "./palette.ts";
 import type { RateSampler } from "./rate.ts";
+import { breakdown } from "../../shared/timing-breakdown.ts";
 
-export type Pane = "galaxy" | "chart" | "log";
+export type Pane = "galaxy" | "chart" | "timing" | "log";
 
 export interface ViewData {
 	nodes: readonly VizNode[];
@@ -534,5 +535,151 @@ export function drawLog(
 		const thumb = Math.max(1, Math.round((rows / events.length) * rows));
 		const pos = Math.round((state.offset / Math.max(1, events.length - rows)) * (rows - thumb));
 		for (let i = 0; i < rows; i++) cv.set(r.x + r.w - 1, r.y + 1 + i, i >= pos && i < pos + thumb ? "┃" : "│", i >= pos && i < pos + thumb ? "scrollbarThumb" : "scrollbarTrack");
+	}
+}
+
+// ---------------------------------------------------------------- timing (#151)
+// TUI scope = current view VizNodes; CLI `/legion timing` = cwd RunStore children.
+// Formula matches #150 (wall / gen / other); the node set can differ.
+
+export interface TimingRow {
+	node: VizNode;
+	wallMs: number;
+	generationMs: number | null;
+	otherMs: number | null;
+	liveWall: boolean;
+}
+
+/**
+ * Build timing rows from viz nodes (agents only).
+ * VizNode has no turn count: generationMs === 0 → gen/other shown as — (no turn data).
+ */
+export function timingRowsFromNodes(nodes: readonly VizNode[], now: number): TimingRow[] {
+	const rows: TimingRow[] = [];
+	for (const node of nodes) {
+		if (!isAgent(node)) continue;
+		const end = node.endedAt ?? now;
+		const wallMs = Math.max(0, end - node.startedAt);
+		const liveWall = node.status === "running" && node.endedAt === undefined;
+		// No turn data on VizNode → treat 0 generationMs as absent (align "无 turn → —").
+		const generationMs = node.generationMs > 0 ? node.generationMs : null;
+		const parts = breakdown(wallMs, generationMs);
+		rows.push({
+			node,
+			wallMs: parts.wall_ms,
+			generationMs: parts.generation_ms,
+			otherMs: parts.other_ms,
+			liveWall,
+		});
+	}
+	rows.sort((a, b) => a.node.startedAt - b.node.startedAt || a.node.name.localeCompare(b.node.name));
+	return rows;
+}
+
+function formatTimingCell(ms: number | null, opts: { live?: boolean } = {}): string {
+	if (ms === null) return "—";
+	const rendered = formatDuration(ms);
+	return opts.live ? `${rendered}+` : rendered;
+}
+
+function roleAbbrev(role: string): string {
+	const t = role.trim();
+	if (!t) return "";
+	if (t.length <= 4) return t;
+	return t.slice(0, 3);
+}
+
+export interface TimingDrawState {
+	offset: number;
+	cursor: number;
+	focused: boolean;
+	selectedId?: string;
+}
+
+export function drawTiming(
+	cv: Canvas,
+	r: Rect,
+	rows: readonly TimingRow[],
+	state: TimingDrawState,
+): void {
+	if (r.w < 8 || r.h < 2) return;
+	const showExtra = r.w >= 36;
+	const showRole = r.w >= 28;
+	const header = showExtra
+		? "name" + (showRole ? " · role" : "") + "   wall    gen   other"
+		: "name" + (showRole ? " · role" : "") + "   wall";
+	cv.text(r.x, r.y, ellipsize(header, r.w), "dim");
+
+	const footerH = rows.length > 0 && r.h >= 4 ? 1 : 0;
+	const rowsAvail = Math.max(0, r.h - 1 - footerH);
+	for (let i = 0; i < rowsAvail; i++) {
+		const index = state.offset + i;
+		const row = rows[index];
+		if (!row) break;
+		const y = r.y + 1 + i;
+		const isCursor = state.focused && index === state.cursor;
+		const highlight = state.selectedId === row.node.id;
+		const dim = state.selectedId !== undefined && !highlight;
+
+		const wall = formatTimingCell(row.wallMs, { live: row.liveWall });
+		const gen = formatTimingCell(row.generationMs);
+		const other = formatTimingCell(row.otherMs);
+
+		const wallW = showExtra ? 8 : Math.max(6, Math.min(10, r.w - 12));
+		const genW = 7;
+		const otherW = 7;
+		const metaW = showExtra ? wallW + 1 + genW + 1 + otherW : wallW;
+		const nameBudget = Math.max(4, r.w - metaW - (showRole ? 5 : 1));
+
+		let name = ellipsize(row.node.name, nameBudget);
+		if (showRole) {
+			const abbr = roleAbbrev(row.node.role);
+			const room = nameBudget - cellWidth(name) - 1;
+			if (abbr && room >= cellWidth(abbr)) {
+				name = `${name} ${abbr}`;
+			}
+		}
+
+		cv.text(r.x, y, ellipsize(name, nameBudget), dim ? "dim" : roleColor(row.node.role), {
+			bold: !dim,
+			inverse: isCursor,
+		});
+
+		const metaX = r.x + r.w - metaW;
+		if (showExtra) {
+			cv.text(metaX, y, wall.padStart(wallW), highlight ? "text" : "dim", { maxX: r.x + r.w });
+			cv.text(metaX + wallW + 1, y, gen.padStart(genW), "dim", { maxX: r.x + r.w });
+			cv.text(metaX + wallW + 1 + genW + 1, y, other.padStart(otherW), "dim", { maxX: r.x + r.w });
+		} else {
+			cv.text(metaX, y, wall.padStart(wallW), highlight ? "text" : "dim", { maxX: r.x + r.w });
+		}
+		if (isCursor && highlight) cv.set(r.x + r.w - 1, y, "◂", "accent", { bold: true });
+	}
+
+	if (footerH && rows.length > 0) {
+		const started = rows.map((row) => row.node.startedAt);
+		const ended = rows.map((row) => (row.liveWall ? null : row.node.endedAt ?? row.node.startedAt + row.wallMs));
+		const ends = ended.filter((v): v is number => v !== null);
+		const span =
+			started.length && ends.length
+				? Math.max(0, Math.max(...ends) - Math.min(...started))
+				: null;
+		const sumWall = rows.reduce((sum, row) => sum + row.wallMs, 0);
+		const fy = r.y + r.h - 1;
+		const spanText = span === null ? "—" : formatDuration(span);
+		cv.text(r.x, fy, ellipsize(`span ${spanText} · sum ${formatDuration(sumWall)}`, r.w), "dim");
+	}
+
+	if (rows.length > rowsAvail && rowsAvail > 0) {
+		const thumb = Math.max(1, Math.round((rowsAvail / rows.length) * rowsAvail));
+		const pos = Math.round((state.offset / Math.max(1, rows.length - rowsAvail)) * (rowsAvail - thumb));
+		for (let i = 0; i < rowsAvail; i++) {
+			cv.set(
+				r.x + r.w - 1,
+				r.y + 1 + i,
+				i >= pos && i < pos + thumb ? "┃" : "│",
+				i >= pos && i < pos + thumb ? "scrollbarThumb" : "scrollbarTrack",
+			);
+		}
 	}
 }

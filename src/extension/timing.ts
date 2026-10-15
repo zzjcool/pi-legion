@@ -25,6 +25,9 @@ import {
 	type SummarySession,
 	type SubagentSummary,
 } from "./summary.ts";
+import { breakdown } from "../shared/timing-breakdown.ts";
+
+export { breakdown } from "../shared/timing-breakdown.ts";
 
 const TIMING_USAGE = "Usage: /legion timing [--json] [<name>]";
 
@@ -70,18 +73,15 @@ export function timingChildFromSummary(child: SummaryChild): TimingChild {
 	const generation_ms = sessionHasTurns(child.session)
 		? child.session.generationMs
 		: null;
-	const other_ms =
-		generation_ms === null
-			? null
-			: Math.max(0, child.durationMs - generation_ms);
+	const parts = breakdown(child.durationMs, generation_ms);
 	return {
 		name: child.child.name,
 		role: child.role,
 		state: child.child.state,
 		live: child.running,
-		wall_ms: child.durationMs,
-		generation_ms,
-		other_ms,
+		wall_ms: parts.wall_ms,
+		generation_ms: parts.generation_ms,
+		other_ms: parts.other_ms,
 		turns: child.turns,
 		startedAtMs: child.startedAtMs,
 		endedAtMs: child.endedAtMs,
