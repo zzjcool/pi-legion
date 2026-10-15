@@ -52,13 +52,13 @@ function agent(name = "worker", overrides: Partial<AgentConfig> = {}): AgentConf
 	};
 }
 
-function fixture(options: { maxActiveNodes?: number } = {}) {
+function fixture(options: { maxActiveNodes?: number; maxChildrenPerNode?: number } = {}) {
 	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-orchestrator-"));
 	const runStore = new RunStore({ rootDir: path.join(rootDir, ".pi-subagents") });
 	const rootRun = runStore.createRun({ task: "root task", cwd: rootDir, nodeId: "root", maxDepth: 4, herdr: { supervisor: "rpc" } });
 	const db = openLegionDb(":memory:");
 	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
-	const settings = { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: options.maxActiveNodes ?? 30 };
+	const settings = { maxDepth: 4, maxChildrenPerNode: options.maxChildrenPerNode ?? 8, maxActiveNodes: options.maxActiveNodes ?? 30 };
 	const context = {
 		db,
 		dbPath: path.join(runStore.runDir(rootRun.runId), "legion.db"),
@@ -387,6 +387,47 @@ test("retireAll marks an unfinished squad aborted and queued mail cannot revive 
 		postman.stop();
 	} finally {
 		await supervisor.retire(name).catch(() => {});
+		fx.cleanup();
+	}
+});
+
+test("retire frees maxChildrenPerNode slots so launch can refill to the cap (#142)", async () => {
+	const fx = fixture({ maxChildrenPerNode: 2 });
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir: fx.runStore.runDir(fx.rootRun.runId),
+		cwd: fx.rootDir,
+		maxDepth: 4,
+		legion: fx.context,
+	});
+	try {
+		const first = await orchestrator.launch({ agent: agent("worker"), task: "slot-1", name: "slot-1", worktree: false });
+		const second = await orchestrator.launch({ agent: agent("worker"), task: "slot-2", name: "slot-2", worktree: false });
+		assert.equal(getNode(fx.db, first.child.nodeId!)?.status, "running");
+		assert.equal(getNode(fx.db, second.child.nodeId!)?.status, "running");
+		await assert.rejects(
+			() => orchestrator.launch({ agent: agent("worker"), task: "over fanout", name: "slot-3", worktree: false }),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.BUDGET_EXCEEDED &&
+				/max_children_per_node/.test(error.message),
+		);
+		await orchestrator.retire(first.name);
+		await orchestrator.retire(second.name);
+		// Already-retired no-op must leave slots free (session kept for resume).
+		await orchestrator.retire(first.name);
+		assert.equal(getNode(fx.db, first.child.nodeId!)?.status, "retired");
+		assert.equal(existsSync(first.sessionFile), true, "retire keeps session for resume");
+		const third = await orchestrator.launch({ agent: agent("worker"), task: "reuse slot", name: "slot-3", worktree: false });
+		const fourth = await orchestrator.launch({ agent: agent("worker"), task: "reuse slot again", name: "slot-4", worktree: false });
+		assert.equal(third.child.nodeId, "root.slot-3");
+		assert.equal(fourth.child.nodeId, "root.slot-4");
+		await assert.rejects(
+			() => orchestrator.launch({ agent: agent("worker"), task: "cap again", name: "slot-5", worktree: false }),
+			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED,
+		);
+	} finally {
 		fx.cleanup();
 	}
 });

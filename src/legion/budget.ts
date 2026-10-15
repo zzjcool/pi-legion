@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "./db.ts";
+import { LIVE_CHILD_STATUSES } from "./nodes.ts";
 import { withTransaction } from "./db.ts";
 import { appendEvent } from "./events.ts";
 
@@ -64,14 +65,15 @@ export function checkLaunchBudget(
 ): BudgetDecision {
 	validateRequest(request);
 	const limits = normalizeLimits(options.limits);
+	const liveStatuses = LIVE_CHILD_STATUSES.map(() => "?").join(", ");
 	const row = db
 		.prepare(
 			`SELECT
-				(SELECT COUNT(*) FROM nodes WHERE parent_id IS ?) AS child_count,
+				(SELECT COUNT(*) FROM nodes WHERE parent_id IS ? AND status IN (${liveStatuses})) AS child_count,
 				(SELECT COUNT(*) FROM nodes WHERE status IN ('running', 'starting')) AS active_count,
 				CASE WHEN ? IS NULL THEN 1 ELSE EXISTS(SELECT 1 FROM nodes WHERE id = ?) END AS parent_exists`,
 		)
-		.get(request.parentId, request.parentId, request.parentId);
+		.get(request.parentId, ...LIVE_CHILD_STATUSES, request.parentId, request.parentId);
 	const counts = {
 		children: Number(row?.child_count ?? 0),
 		activeNodes: Number(row?.active_count ?? 0),
@@ -86,7 +88,7 @@ export function checkLaunchBudget(
 	if (counts.children >= limits.maxChildrenPerNode) {
 		return denied(
 			"max_children_per_node",
-			`parent already has ${counts.children} children; maxChildrenPerNode is ${limits.maxChildrenPerNode}`,
+			`parent already has ${counts.children} live children; maxChildrenPerNode is ${limits.maxChildrenPerNode}`,
 			base,
 		);
 	}

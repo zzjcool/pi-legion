@@ -11,12 +11,19 @@ test("legion budget applies default and override gates for depth, fanout, and ac
 		insertNode(db, { parentId: null, name: "root", role: "root" });
 		assert.deepEqual(DEFAULT_LEGION_BUDGETS, { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: 30 });
 		assert.equal(checkLaunchBudget(db, { parentId: "root", depth: 1 }).allowed, true);
+		// Settled/retired children must not occupy maxChildrenPerNode (#142).
 		for (let index = 0; index < 8; index += 1) {
-			insertNode(db, { parentId: "root", name: `child-${index}`, role: "worker", status: index < 3 ? "running" : "settled" });
+			insertNode(db, { parentId: "root", name: `hist-${index}`, role: "worker", status: index < 3 ? "settled" : "retired" });
+		}
+		assert.equal(checkLaunchBudget(db, { parentId: "root", depth: 1 }).allowed, true, "terminal children do not fill the fanout budget");
+		for (let index = 0; index < 8; index += 1) {
+			insertNode(db, { parentId: "root", name: `live-${index}`, role: "worker", status: index === 0 ? "blocked" : "running" });
 		}
 		const fanout = checkLaunchBudget(db, { parentId: "root", depth: 1 });
 		assert.equal(fanout.allowed, false);
 		if (!fanout.allowed) assert.equal(fanout.reason, "max_children_per_node");
+		updateNode(db, "root.live-0", { status: "retired" });
+		assert.equal(checkLaunchBudget(db, { parentId: "root", depth: 1 }).allowed, true, "retire frees a maxChildrenPerNode slot");
 		const depth = checkLaunchBudget(db, { parentId: "root", depth: 5 }, { limits: { maxChildrenPerNode: 20 } });
 		assert.equal(depth.allowed, false);
 		if (!depth.allowed) assert.equal(depth.reason, "max_depth");

@@ -18,7 +18,7 @@ import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
 import { withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
-import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
+import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode, LIVE_CHILD_STATUSES } from "../legion/nodes.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { evaluatePhaseTransition, isLegionPhase, isTerminalPhase } from "../legion/state-machine.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
@@ -341,7 +341,8 @@ export class Orchestrator {
 		const depthCeiling = input.utility
 			? parent.depth + 1
 			: Math.min(legion.settings?.maxDepth ?? this.maxDepthValue, MAX_NESTED_PATH_ENTRIES);
-		const childCount = Number(legion.db.prepare("SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ?").get(legion.nodeId)?.count ?? 0);
+		const liveStatuses = LIVE_CHILD_STATUSES.map(() => "?").join(", ");
+		const childCount = Number(legion.db.prepare(`SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ? AND status IN (${liveStatuses})`).get(legion.nodeId, ...LIVE_CHILD_STATUSES)?.count ?? 0);
 		const maxChildren = previous ? Math.max(legion.settings?.maxChildrenPerNode ?? 8, childCount + 1) : legion.settings?.maxChildrenPerNode;
 		const activeReservation = previous && (previous.status === "starting" || previous.status === "running") ? 1 : 0;
 		const limits: LegionBudgetLimits = { maxDepth: depthCeiling, maxChildrenPerNode: maxChildren, maxActiveNodes: (legion.settings?.maxActiveNodes ?? 30) + activeReservation };
