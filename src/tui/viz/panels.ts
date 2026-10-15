@@ -1,6 +1,6 @@
 /** Panel renderers for the /legion full view. All drawing is clipped to its rect. */
 
-import { Canvas, ellipsize } from "./canvas.ts";
+import { Canvas, cellWidth, ellipsize } from "./canvas.ts";
 import type { Rect } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
 import { nodeToken, roleColor } from "./palette.ts";
@@ -249,19 +249,21 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	const statuses = new Set(nodes.map((node) => node.status));
 	const statusItems = ([["failed", "✗ failed", "error"], ["retired", "⣿ retired", "dim"]] as const)
 		.filter(([status]) => statuses.has(status));
-	const statusBudget = statusItems.reduce((sum, [, label]) => sum + label.length + 2, 0);
+	// Budget in grapheme cells (not String.length) so multi-byte / emoji labels do not squeeze roles (#128).
+	const statusBudget = statusItems.reduce((sum, [, label]) => sum + cellWidth(label) + 2, 0);
 	const roleLimit = r.x + r.w - 1 - statusBudget;
 	for (const role of roles) {
-		const w = Array.from(role).length + 4;
+		const w = cellWidth(role) + 4;
 		if (lx + w > roleLimit) break;
 		cv.set(lx, ly, "⣿", roleColor(role));
 		cv.text(lx + 2, ly, role, "dim");
 		lx += w;
 	}
 	for (const [, label, col] of statusItems) {
-		if (lx + label.length + 1 > r.x + r.w - 1) break;
+		const lw = cellWidth(label);
+		if (lx + lw + 1 > r.x + r.w - 1) break;
 		cv.text(lx, ly, label, col);
-		lx += label.length + 2;
+		lx += lw + 2;
 	}
 }
 

@@ -87,6 +87,11 @@ function isWide(code: number): boolean {
 	);
 }
 
+/** Grapheme / cell count (UTF-16-safe). Prefer over `String.length` for layout budgets. */
+export function cellWidth(value: string): number {
+	return Array.from(value).length;
+}
+
 /** Truncate plain text to `width` single-width cells with an ellipsis. */
 export function ellipsize(value: string, width: number): string {
 	const chars = Array.from(value).map(sanitizeChar);

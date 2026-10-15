@@ -7,8 +7,8 @@ import { RateSampler, RATE_WINDOW_MS } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { buildLog, computeStats } from "../../src/tui/viz/panels.ts";
-import { createLegionViewFactory, handleViewKey, initialViewState, renderLegionView } from "../../src/tui/viz/view.ts";
-import { ellipsize } from "../../src/tui/viz/canvas.ts";
+import { createLegionViewFactory, handleViewKey, initialViewState, MIN_SELECTION_BADGE_W, renderLegionView } from "../../src/tui/viz/view.ts";
+import { cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
 
 const T0 = 1_700_000_000_000;
@@ -453,6 +453,84 @@ test("viz #125: narrow 80x24 + long names keep /legion, truncate labels, reserve
 			assert.ok(visibleWidth(line) <= width, `rail ${width}: ${visibleWidth(line)}`);
 		}
 		assert.ok(out.canvas.toPlain().some((l) => l.includes("…")), `rail ${width} truncates long names`);
+	}
+});
+
+test("viz #128: cellWidth counts graphemes; statusBudget stays UTF-16-safe", () => {
+	assert.equal(cellWidth("abc"), 3);
+	assert.equal(cellWidth("🚀"), 1); // surrogate pair: String.length === 2
+	assert.equal(cellWidth("✗ failed"), Array.from("✗ failed").length);
+	assert.equal(cellWidth("⣿ retired"), Array.from("⣿ retired").length);
+	assert.notEqual(cellWidth("🚀x"), "🚀x".length);
+
+	const sampler = new RateSampler();
+	const now = sec(60);
+	const nodes = [
+		ROOT,
+		node("scout-0", { role: "scout", startedAt: sec(0), tokens: 10, tokensOut: 5, generationMs: 100 }),
+		node("worker-0", { role: "worker", status: "failed", startedAt: sec(1), endedAt: sec(40), tokens: 10, tokensOut: 5, generationMs: 100 }),
+		node("planner-0", { role: "planner", status: "retired", startedAt: sec(2), endedAt: sec(50), tokens: 10, tokensOut: 5, generationMs: 100 }),
+		node("reviewer-0", { role: "reviewer", startedAt: sec(3), tokens: 10, tokensOut: 5, generationMs: 100 }),
+		node("designer-0", { role: "designer", startedAt: sec(4), tokens: 10, tokensOut: 5, generationMs: 100 }),
+	];
+	sampler.record(now, nodes);
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	// Narrow galaxy must still reserve failed+retired before roles (budget via cellWidth).
+	for (const [w, h] of [[46, 24], [60, 24], [80, 24]] as const) {
+		const plain = renderLegionView(data, initialViewState(), w, h).canvas.toPlain();
+		const legend = plain.find((l) => l.includes("✗ failed") || l.includes("⣿ retired") || l.includes("⣿ scout"));
+		assert.ok(legend, `${w}x${h} missing legend row`);
+		assert.ok(legend!.includes("✗ failed"), `${w}x${h} failed glyph: ${legend}`);
+		assert.ok(legend!.includes("⣿ retired"), `${w}x${h} retired glyph: ${legend}`);
+		assert.equal(visibleWidth(plain[0]!), w);
+	}
+});
+
+test("viz #128: selection badge min width unified across portrait + landscape", () => {
+	assert.equal(MIN_SELECTION_BADGE_W, 5);
+	const sampler = new RateSampler();
+	const now = sec(30);
+	const long = "super-long-worker-agent-name-overflow-check-aaaaaaaa";
+	const nodes = [
+		node("root", { name: "centurion-with-a-very-long-run-name-that-should-truncate", role: "centurion", parentId: null, depth: 0 }),
+		node("worker-0", { name: long, role: "worker", startedAt: sec(0), tokens: 100, tokensOut: 50, generationMs: 1_000 }),
+	];
+	sampler.record(now, nodes);
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+
+	// Portrait (W<80): when badgeCap forces badgeW < MIN, no inverse badge paints; /legion intact.
+	{
+		const state = initialViewState();
+		state.selectedId = "worker-0";
+		const tiny = 18; // badgeCap = min(..., floor(18*0.45)=8, 18-14=4) → 4 < MIN
+		const { canvas } = renderLegionView(data, state, tiny, 40);
+		const plain = canvas.toPlain();
+		const ansi = canvas.toLines(ansiTheme);
+		assert.match(plain[0]!, /⚔ \/legion/);
+		assert.ok(!ansi[0]!.includes("\x1b[7m"), `portrait tiny must hide stub badge: ${ansi[0]}`);
+	}
+
+	// Landscape stacked (100×40 not tall): real selection badge paints with inverse.
+	{
+		const state = initialViewState();
+		state.selectedId = "worker-0";
+		const { canvas, layout } = renderLegionView(data, state, 100, 40);
+		assert.notEqual(layout, "portrait");
+		const plain = canvas.toPlain();
+		const ansi = canvas.toLines(ansiTheme);
+		assert.match(plain[0]!, /⚔ \/legion/);
+		assert.ok(ansi[0]!.includes("\x1b[7m"), `landscape must show selection badge: ${ansi[0]}`);
+		assert.ok(plain[0]!.includes("…") || plain[0]!.includes("worker"), plain[0]);
+	}
+
+	// Portrait 46×24 with selection still keeps /legion + ellipsis (no regression vs #125).
+	{
+		const state = initialViewState();
+		state.selectedId = "worker-0";
+		const { canvas } = renderLegionView(data, state, 46, 24);
+		const plain = canvas.toPlain();
+		assert.match(plain[0]!, /⚔ \/legion/);
+		assert.ok(plain[0]!.includes("…"), plain[0]);
 	}
 });
 
