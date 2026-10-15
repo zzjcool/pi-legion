@@ -650,6 +650,10 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		return;
 	}
 	let lastUi: ExtensionUIContext | undefined;
+	/** Child slugs currently reported as OSC id=legion/<slug>. */
+	const childOscIds = new Set<string>();
+	/** Extension activity sources forwarded from children via RPC. */
+	const childActivitySources = new Set<string>();
 	let statusNodeOpener: ((nodeId: string) => void) | undefined;
 	let lastConfirm: ((message: string) => Promise<boolean>) | undefined;
 	// turn_start/turn_end maintain this so a flush window can wait out a
@@ -686,9 +690,41 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			},
 			options,
 		) ?? (() => {}),
-		emitBusy: (active, label) => {
+		emitBusy: (active, label, children = []) => {
 			try { pi.events.emit("pi-legion:busy", active ? { active: true, label } : { active: false }); }
 			catch { /* optional display integration */ }
+			const ui = lastUi as (ExtensionUIContext & {
+				setActivity?: (source: string, activity: { message?: string } | undefined) => void;
+				setProgramRecord?: (status: { state: "working" | "clear"; id: string; message?: string }) => void;
+			}) | undefined;
+			const next = new Set(active ? children : []);
+			// Drop RPC-fan-in activities for retired children (and everything on full clear).
+			if (typeof ui?.setActivity === "function") {
+				for (const source of [...childActivitySources]) {
+					const slug = source.startsWith("legion/") ? source.slice("legion/".length).split("/")[0] : undefined;
+					if (!active || !slug || !next.has(slug)) {
+						try { ui.setActivity(source, undefined); } catch { /* ignore */ }
+						childActivitySources.delete(source);
+					}
+				}
+				try {
+					ui.setActivity("legion", active ? { message: label } : undefined);
+				} catch { /* setActivity is optional until Pi ships it */ }
+			}
+			if (typeof ui?.setProgramRecord === "function") {
+				for (const slug of [...childOscIds]) {
+					if (!next.has(slug)) {
+						try { ui.setProgramRecord({ id: `legion/${slug}`, state: "clear" }); } catch { /* ignore */ }
+						childOscIds.delete(slug);
+					}
+				}
+				for (const slug of next) {
+					try {
+						ui.setProgramRecord({ id: `legion/${slug}`, state: "working", message: slug });
+						childOscIds.add(slug);
+					} catch { /* ignore */ }
+				}
+			}
 		},
 	});
 	sessionRuntime = runtime;
@@ -990,6 +1026,36 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		else if (request.method === "setWidget") ui.setWidget(request.widgetKey, request.widgetLines, { placement: request.widgetPlacement });
 		else if (request.method === "setTitle") ui.setTitle(request.title);
 		else if (request.method === "set_editor_text") ui.setEditorText(request.text);
+		else if (request.method === "setActivity") {
+			const uiExt = ui as ExtensionUIContext & {
+				setActivity?: (source: string, activity: { message?: string } | undefined) => void;
+			};
+			if (typeof uiExt.setActivity !== "function") return;
+			const source = `legion/${pending.childName}/${request.source}`;
+			if (request.activity) {
+				childActivitySources.add(source);
+				uiExt.setActivity(source, request.activity);
+			} else {
+				childActivitySources.delete(source);
+				uiExt.setActivity(source, undefined);
+			}
+		} else if (request.method === "setProgramRecord") {
+			const record = request.record;
+			const uiExt = ui as ExtensionUIContext & {
+				setProgramRecord?: (status: {
+					state: "idle" | "working" | "blocked" | "done" | "error" | "clear";
+					id: string;
+					app?: string;
+					kind?: "permission" | "question" | "auth";
+					message?: string;
+				}) => void;
+			};
+			if (typeof uiExt.setProgramRecord !== "function") return;
+			const id = record.id.startsWith("legion/")
+				? record.id
+				: `legion/${pending.childName}/${record.id}`;
+			uiExt.setProgramRecord({ ...record, id });
+		}
 	});
 
 	pi.on("session_start", (event, ctx) => {

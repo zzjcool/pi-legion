@@ -17,6 +17,8 @@ import { enrichFailureWithAutoDoctor } from "../extension/auto-doctor.ts";
 import { ErrorCodes, SubagentError } from "../shared/types.ts";
 import {
 	InMemoryUIProxy,
+	extensionActivityToUIRequest,
+	isExtensionActivity,
 	isExtensionUIRequest,
 	type ExtensionUIResponse,
 	type UIProxy,
@@ -630,6 +632,15 @@ export class RpcSupervisor implements LegionSupervisor {
 				childName: child.name,
 				request: event,
 				respond: (response) => this.sendUIResponse(child, event.id, response),
+			});
+			return;
+		}
+
+		// Child-side setActivity / setProgramRecord → parent OSC busy fan-in (no PTY OSC parse).
+		if (isExtensionActivity(event)) {
+			this.uiProxy.enqueue({
+				childName: child.name,
+				request: extensionActivityToUIRequest(event),
 			});
 			return;
 		}

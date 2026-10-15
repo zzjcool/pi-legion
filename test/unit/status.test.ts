@@ -181,12 +181,12 @@ test("formatFooterStatus is empty when nothing is running", () => {
 	assert.equal(formatBusyLabel([root]), undefined);
 });
 
-test("formatBusyLabel matches the herdr overlay copy", () => {
+test("formatBusyLabel lists live children without a leading emoji", () => {
 	assert.equal(formatBusyLabel([]), undefined);
-	assert.equal(formatBusyLabel(entries.slice(0, 1)), "⏳ 1 subagent (worker-0)");
+	assert.equal(formatBusyLabel(entries.slice(0, 1)), "1 subagent (worker-0)");
 	assert.equal(
 		formatBusyLabel(entries),
-		"⏳ 2 subagents (worker-0, reviewer-1)",
+		"2 subagents (worker-0, reviewer-1)",
 	);
 });
 

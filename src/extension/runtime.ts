@@ -24,6 +24,7 @@ import {
 	createStatusBoard,
 	type StatusStripStyle,
 	type StatusVizSnapshot,
+	activeEntries,
 	formatBusyLabel,
 	type StatusEntry,
 	type StatusUi,
@@ -112,7 +113,11 @@ export interface LegionTreeIdentity {
 
 export interface SessionRuntimeDeps {
 	sendMessage: SendMessageApi["sendMessage"];
-	emitBusy?: (active: boolean, label?: string) => void;
+	/**
+	 * Raise/clear parent busy. When active, `children` lists live child slugs for
+	 * hierarchical OSC ids (`legion/<slug>`). Cleared with `active=false`.
+	 */
+	emitBusy?: (active: boolean, label?: string, children?: readonly string[]) => void;
 	now?: () => number;
 	refreshMs?: number;
 	/** Shared extension-lifetime bus; all visual refreshes are driven through it. */
@@ -532,14 +537,15 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 
 	const syncBusy = (list: StatusEntry[] = entries()): void => {
 		const label = formatBusyLabel(list);
+		const children = activeEntries(list).map((entry) => entry.name);
 		if (label !== undefined) {
-			deps.emitBusy?.(true, label);
+			deps.emitBusy?.(true, label, children);
 			busyRaised = true;
 			return;
 		}
 		if (busyRaised) {
 			busyRaised = false;
-			deps.emitBusy?.(false);
+			deps.emitBusy?.(false, undefined, []);
 		}
 	};
 
@@ -1178,7 +1184,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			board.clear();
 			if (busyRaised) {
 				busyRaised = false;
-				deps.emitBusy?.(false);
+				deps.emitBusy?.(false, undefined, []);
 			}
 		},
 	};
