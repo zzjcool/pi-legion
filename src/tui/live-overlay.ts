@@ -150,10 +150,20 @@ const DEFAULT_BACKFILL_TURNS = 3;
 const DEFAULT_TERMINAL_ROWS = 24;
 const TOOL_COLLAPSED_PREVIEW_LINES = 10;
 const BACKFILL_POLL_INTERVAL_MS = 250;
-/** Outer dim mask rows when the terminal is tall enough for a clear floating modal. */
-const MODAL_MARGIN_Y_COMFORTABLE = 1;
-/** Outer dim mask columns (left/right) outside the modal border. */
-const MODAL_MARGIN_X_COMFORTABLE = 2;
+/**
+ * #157: Cap the floating context modal by terminal ratio so large transcripts do
+ * not stretch the shell near-fullscreen. Content scrolls inside the body; the
+ * dim mask around the frame keeps the host chat / /legion underlay visible.
+ * Tuned on 80×24 + 160×50 dumps (≈75% × ≈65% feels clearly smaller than full
+ * screen without feeling cramped). Floor sizes kick in on mid terminals; on
+ * very small terminals we still fill the screen so body remains usable.
+ */
+const MODAL_MAX_WIDTH_RATIO = 0.75;
+const MODAL_MAX_HEIGHT_RATIO = 0.65;
+/** Prefer at least this frame width once the terminal itself is wide enough. */
+const MODAL_MIN_FRAME_COLS = 40;
+/** Prefer at least this frame height once the terminal itself is tall enough. */
+const MODAL_MIN_FRAME_ROWS = 8;
 const MODAL_CLOSE_HINT = "Esc";
 
 /**
@@ -676,9 +686,18 @@ function createSession(
 
 	let stopPending = false;
 
+	/** Slim title: name + 主/子 only. Run meta lives in the footer band (#157). */
 	const titlePlain = (): string => {
 		const node = sourceNode();
 		if (!node) return `● ${nodeId} · node unavailable`;
+		const kind = contextKindLabel(node, nodeId);
+		return `● ${safeText(node.name)} · ${kind}`;
+	};
+
+	/** Agent/run meta shown below the message body (footer band), not in the title. */
+	const metaPlain = (): string => {
+		const node = sourceNode();
+		if (!node) return "node unavailable";
 		const status = node.status;
 		const completed = status === "settled" || status === "failed" || status === "retired";
 		const elapsedEnd = completed ? node.updatedAt : now();
@@ -688,10 +707,8 @@ function createSession(
 			? `${Math.max(0, Math.round((now() - turnStartedAt) / 1_000))}s`
 			: undefined;
 		const turnLabel = `turn ${turnNumber}${turnElapsed !== undefined ? ` (${turnElapsed})` : ""}`;
-		const kind = contextKindLabel(node, nodeId);
 		return [
-			`● ${safeText(node.name)} (${safeText(node.role)})`,
-			kind,
+			safeText(node.role),
 			...(node.model ? [safeText(node.model)] : []),
 			turnLabel,
 			elapsed,
@@ -724,6 +741,11 @@ function createSession(
 		);
 		const pad = Math.max(0, titleBudget - visibleWidth(stripTerminalSequences(coloredTitle)));
 		return coloredTitle + " ".repeat(pad) + style(options.theme, "dim", closeHint);
+	};
+
+	const metaBarInner = (innerWidth: number): string => {
+		const safeWidth = Math.max(1, Math.floor(innerWidth));
+		return style(options.theme, "dim", fitLine(metaPlain(), safeWidth));
 	};
 
 	const close = (): void => {
@@ -789,12 +811,17 @@ function createSession(
 			const end = start + layout.bodyRows;
 			const visible = lastBodyLines.slice(start, end);
 			while (visible.length < layout.bodyRows) visible.push("");
+			const footerHint = layout.showMeta
+				? "↑↓ scroll · Esc close · click mask to dismiss"
+				// Tiny terminals collapse the dedicated meta row into the bottom chrome.
+				: `${metaPlain()} · ↑↓ · Esc`;
 			return paintModalFrame({
 				layout,
 				theme: options.theme,
 				titleInner: titleBarInner(layout.innerWidth),
 				bodyLines: visible,
-				footerHint: "↑↓ scroll · Esc close · click mask to dismiss",
+				metaInner: layout.showMeta ? metaBarInner(layout.innerWidth) : undefined,
+				footerHint,
 			});
 		},
 		handleInput(data) {
@@ -948,11 +975,17 @@ export interface ModalLayout {
 	marginX: number;
 	titleRow: number;
 	bodyStartRow: number;
+	/** Fixed meta row below the scrollable body; null when collapsed into the footer. */
+	metaRow: number | null;
 	footerRow: number;
 	bodyRows: number;
 	innerWidth: number;
+	/** Inclusive frame height in rows (title + body + optional meta + footer). */
+	frameRows: number;
 	/** Column where modal border (│/┏) starts. */
 	frameCol: number;
+	/** Whether a dedicated meta row is painted below the body. */
+	showMeta: boolean;
 	/** Absolute screen x range of the Esc close hint in the title bar. */
 	closeColStart: number;
 	closeColEnd: number;
@@ -961,16 +994,28 @@ export interface ModalLayout {
 export function resolveModalLayout(rows: number, cols: number): ModalLayout {
 	const safeRows = Math.max(1, Math.floor(rows));
 	const safeCols = Math.max(1, Math.floor(cols));
-	// Prefer a 1-row dim mask; collapse it on short terminals so body still has room.
-	const marginY = safeRows >= 6 ? MODAL_MARGIN_Y_COMFORTABLE : 0;
-	const marginX = safeCols >= 24 ? MODAL_MARGIN_X_COMFORTABLE : safeCols >= 12 ? 1 : 0;
-	const chromeY = 2 * marginY + 2; // masks + title + footer
-	const bodyRows = Math.max(1, safeRows - chromeY);
+	const ratioCols = Math.max(1, Math.floor(safeCols * MODAL_MAX_WIDTH_RATIO));
+	const ratioRows = Math.max(1, Math.floor(safeRows * MODAL_MAX_HEIGHT_RATIO));
+	// Small terminals: fill the screen so the body stays usable. Otherwise cap by ratio
+	// (and a modest floor) so the shell stays clearly smaller than the host window.
+	const frameCols = safeCols < MODAL_MIN_FRAME_COLS
+		? safeCols
+		: Math.min(safeCols, Math.max(MODAL_MIN_FRAME_COLS, ratioCols));
+	const frameRows = safeRows < MODAL_MIN_FRAME_ROWS
+		? safeRows
+		: Math.min(safeRows, Math.max(MODAL_MIN_FRAME_ROWS, ratioRows));
+	const marginX = Math.max(0, Math.floor((safeCols - frameCols) / 2));
+	const marginY = Math.max(0, Math.floor((safeRows - frameRows) / 2));
+	// Need title + ≥1 body + meta + footer (=4) for a dedicated meta band.
+	const showMeta = frameRows >= 4;
+	const chromeInside = 2 + (showMeta ? 1 : 0); // title + optional meta + footer
+	const bodyRows = Math.max(1, frameRows - chromeInside);
 	const frameCol = marginX;
-	const innerWidth = Math.max(1, safeCols - 2 * marginX - 2);
+	const innerWidth = Math.max(1, frameCols - 2);
 	const titleRow = marginY;
 	const bodyStartRow = marginY + 1;
-	const footerRow = marginY + 1 + bodyRows;
+	const metaRow = showMeta ? bodyStartRow + bodyRows : null;
+	const footerRow = showMeta ? metaRow! + 1 : bodyStartRow + bodyRows;
 	const closeWidth = visibleWidth(` ${MODAL_CLOSE_HINT} `);
 	const closeColEnd = frameCol + 1 + innerWidth;
 	const closeColStart = Math.max(frameCol + 1, closeColEnd - closeWidth);
@@ -981,28 +1026,33 @@ export function resolveModalLayout(rows: number, cols: number): ModalLayout {
 		marginX,
 		titleRow,
 		bodyStartRow,
+		metaRow,
 		footerRow,
 		bodyRows,
 		innerWidth,
+		frameRows,
 		frameCol,
+		showMeta,
 		closeColStart,
 		closeColEnd,
 	};
 }
 
-type ModalHitZone = "mask" | "close" | "title" | "body" | "footer";
+type ModalHitZone = "mask" | "close" | "title" | "body" | "meta" | "footer";
 
 function hitTestModal(
 	layout: ModalLayout,
 	x: number,
 	y: number,
 ): { zone: ModalHitZone; bodyX?: number; bodyY?: number } {
-	if (y < layout.marginY || y >= layout.rows - layout.marginY) return { zone: "mask" };
+	const frameBottom = layout.marginY + layout.frameRows;
+	if (y < layout.marginY || y >= frameBottom) return { zone: "mask" };
 	if (x < layout.frameCol || x >= layout.frameCol + layout.innerWidth + 2) return { zone: "mask" };
 	if (y === layout.titleRow) {
 		if (x >= layout.closeColStart && x < layout.closeColEnd) return { zone: "close" };
 		return { zone: "title" };
 	}
+	if (layout.metaRow !== null && y === layout.metaRow) return { zone: "meta" };
 	if (y === layout.footerRow) return { zone: "footer" };
 	if (y >= layout.bodyStartRow && y < layout.bodyStartRow + layout.bodyRows) {
 		return {
@@ -1025,9 +1075,11 @@ function paintModalFrame(input: {
 	theme: LiveOverlayTheme | undefined;
 	titleInner: string;
 	bodyLines: readonly string[];
+	/** Fixed meta band below the body; omitted when layout.showMeta is false. */
+	metaInner?: string;
 	footerHint: string;
 }): string[] {
-	const { layout, theme, titleInner, bodyLines, footerHint } = input;
+	const { layout, theme, titleInner, bodyLines, metaInner, footerHint } = input;
 	const dim = (s: string) => style(theme, "dim", s);
 	const accent = (s: string) => style(theme, "accent", s);
 	const lines: string[] = [];
@@ -1047,6 +1099,10 @@ function paintModalFrame(input: {
 	for (let i = 0; i < layout.bodyRows; i++) {
 		const body = padToInner(bodyLines[i] ?? "", layout.innerWidth);
 		lines.push(leftMask + accent("┃") + body + accent("┃") + rightMask);
+	}
+	if (layout.showMeta) {
+		const meta = padToInner(metaInner ?? "", layout.innerWidth);
+		lines.push(leftMask + accent("┃") + meta + accent("┃") + rightMask);
 	}
 	lines.push(bottom);
 	for (let i = 0; i < layout.marginY; i++) lines.push(maskLine);
