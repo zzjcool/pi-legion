@@ -24,15 +24,47 @@ export function worktreePathFor(runDir: string, name: string): string {
  * Per-step tool field wins, then the top-level `subagent({ worktree })`
  * argument, then the role default. The parent (group) agent is supposed to
  * pick this; the role default is only the fallback when it omits the field.
+ *
+ * Nesting suppression: when the parent cwd is itself a child worktree
+ * (git-dir ≠ git-common-dir), the role default and launch fallback collapse
+ * to false — a worktree of a worktree only re-pays the bootstrap tax.
+ * Explicit `launch: true`/`step: true` still wins: the caller saw the
+ * suppression and insisted.
  */
 export function resolveLaunchWorktree(opts: {
 	roleDefault?: boolean;
 	launch?: boolean;
 	step?: boolean;
+	parentInWorktree?: boolean;
 }): boolean {
 	if (typeof opts.step === "boolean") return opts.step;
 	if (typeof opts.launch === "boolean") return opts.launch;
+	if (opts.parentInWorktree) return false;
 	return opts.roleDefault === true;
+}
+
+/**
+ * True when cwd is itself a linked git worktree (child of a main checkout).
+ * Detected via `git rev-parse --git-dir` vs `--git-common-dir`: they differ
+ * inside any linked worktree, including ones created by other agent runs.
+ * Non-git directories report both as ".git" and are treated as not-in-worktree;
+ * the later createChildWorktree call owns the "not a repo" error.
+ */
+export function isInsideChildWorktree(cwd: string): boolean {
+	try {
+		const gitDir = execFileSync("git", ["-C", cwd, "rev-parse", "--git-dir"], {
+			stdio: ["ignore", "pipe", "pipe"],
+			encoding: "utf8",
+		}).trim();
+		const commonDir = execFileSync(
+			"git",
+			["-C", cwd, "rev-parse", "--git-common-dir"],
+			{ stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" },
+		).trim();
+		return gitDir !== commonDir && gitDir !== "" && commonDir !== "";
+	} catch {
+		return false;
+	}
 }
 
 /** Branch the child commits on. Unique per launch so two workers never collide. */

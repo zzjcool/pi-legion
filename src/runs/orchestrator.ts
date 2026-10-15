@@ -64,6 +64,7 @@ import { nativeModelFor } from "./kind.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
 import {
 	createChildWorktree,
+	isInsideChildWorktree,
 	removeChildWorktree,
 	resolveLaunchWorktree,
 } from "./worktree.ts";
@@ -535,7 +536,11 @@ export class Orchestrator {
 			? true
 			: this.legion && parentRole === "centurion"
 				? false
-				: resolveLaunchWorktree({ roleDefault: input.agent.worktree, launch: input.worktree });
+				: resolveLaunchWorktree({
+					roleDefault: input.agent.worktree,
+					launch: input.worktree,
+					parentInWorktree: isInsideChildWorktree(this.cwd),
+				});
 		let worktreePath = previous?.worktreePath;
 		let worktreeBranch = previous?.worktreeBranch;
 		let createdWorktree = false;

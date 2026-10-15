@@ -7,6 +7,7 @@ import * as path from "node:path";
 import {
 	createChildWorktree,
 	isGitRepo,
+	isInsideChildWorktree,
 	removeChildWorktree,
 	resolveLaunchWorktree,
 	worktreeBranchFor,
@@ -69,6 +70,64 @@ test("resolveLaunchWorktree lets the parent override the role default", () => {
 		true,
 		"per-child field wins over the top-level launch flag",
 	);
+});
+
+test("resolveLaunchWorktree suppresses role default when the parent sits in a child worktree", () => {
+	assert.equal(
+		resolveLaunchWorktree({ roleDefault: true, parentInWorktree: true }),
+		false,
+		"role default collapses inside a child worktree",
+	);
+	assert.equal(
+		resolveLaunchWorktree({ parentInWorktree: true }),
+		false,
+	);
+	assert.equal(
+		resolveLaunchWorktree({
+			roleDefault: true,
+			launch: true,
+			parentInWorktree: true,
+		}),
+		true,
+		"explicit launch flag wins over suppression",
+	);
+	assert.equal(
+		resolveLaunchWorktree({
+			roleDefault: true,
+			step: true,
+			parentInWorktree: true,
+		}),
+		true,
+		"explicit per-child field wins over suppression",
+	);
+	assert.equal(
+		resolveLaunchWorktree({ roleDefault: true, launch: false, parentInWorktree: false }),
+		false,
+		"suppression off: role default still applies outside worktrees",
+	);
+});
+
+test("isInsideChildWorktree detects linked worktrees only", () => {
+	if (!hasGit()) return;
+	const repo = initRepo();
+	try {
+		assert.equal(isInsideChildWorktree(repo), false, "plain repo is not a child worktree");
+		const wt = mkdtempSync(path.join(tmpdir(), "wt-linked-"));
+		rmSync(wt, { recursive: true });
+		execFileSync("git", ["-C", repo, "worktree", "add", "-b", "probe-wt", wt], {
+			stdio: "ignore",
+		});
+		try {
+			assert.equal(isInsideChildWorktree(wt), true, "linked worktree is detected");
+		} finally {
+			execFileSync("git", ["-C", repo, "worktree", "remove", "--force", wt], {
+				stdio: "ignore",
+			});
+		}
+		assert.equal(isInsideChildWorktree(tmpdir()), false, "non-git dir reports false, not throw");
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+	}
 });
 
 test("createChildWorktree refuses a non-git cwd", () => {
