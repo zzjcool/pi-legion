@@ -304,6 +304,8 @@ function liveNode(
 		status: node.status,
 		createdAt: node.createdAt,
 		updatedAt: node.updatedAt,
+		parentId: node.parentId,
+		depth: node.depth,
 		...(node.turn === undefined ? {} : { turn: node.turn }),
 		...(node.turns === undefined ? {} : { turns: node.turns }),
 		sessionFile: node.sessionFile,
@@ -432,7 +434,8 @@ function openLiveOverlay(
 	});
 	void ui.custom(factory, {
 		overlay: true,
-		overlayOptions: { width: "100%" },
+		// Full-screen host overlay so the viewer paints its own dim mask + floating frame.
+		overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 },
 		onHandle: (handle) => controller.getCurrent()?.attachOverlayHandle(handle),
 	}).catch((error: unknown) => reportOverlayOpenError(controller, ui, error));
 }

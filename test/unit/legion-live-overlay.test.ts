@@ -15,7 +15,9 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+	contextKindLabel,
 	createLiveOverlay,
+	resolveModalLayout,
 	type LiveOverlayEvent,
 	type LiveOverlayListener,
 	type LiveOverlayNode,
@@ -35,6 +37,20 @@ class FakeOverlaySource implements LiveOverlaySource {
 	private nextSubscription = 0;
 	private readonly nodes = new Map<string, LiveOverlayNode>([
 		[
+			"root",
+			{
+				id: "root",
+				name: "root",
+				role: "orchestrator",
+				model: "test/model",
+				status: "running",
+				parentId: null,
+				depth: 0,
+				createdAt: 1_000,
+				updatedAt: 1_000,
+			},
+		],
+		[
 			"root.worker",
 			{
 				id: "root.worker",
@@ -42,6 +58,8 @@ class FakeOverlaySource implements LiveOverlaySource {
 				role: "worker",
 				model: "test/model",
 				status: "running",
+				parentId: "root",
+				depth: 1,
 				createdAt: 1_000,
 				updatedAt: 1_000,
 			},
@@ -54,6 +72,8 @@ class FakeOverlaySource implements LiveOverlaySource {
 				role: "worker",
 				model: null,
 				status: "running",
+				parentId: "root",
+				depth: 1,
 				createdAt: 1_000,
 				updatedAt: 1_000,
 			},
@@ -591,9 +611,9 @@ test("tool mouse events are mapped through the viewer header and scroll offset i
 	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
 	try {
 		const before = component.render(80);
-		const headerLines = 1;
+		const layout = resolveModalLayout(40, 80);
 		const visibleToolLine = before.findIndex((line) => stripTerminalSequences(line).includes("read"));
-		assert.ok(visibleToolLine >= headerLines, "tool component appears in the visible transcript");
+		assert.ok(visibleToolLine >= layout.bodyStartRow, "tool component appears in the modal body");
 		const result = component.handleMouse?.(mouseEvent(visibleToolLine));
 		assert.equal(result?.handled, true, "mouse hit reaches the tool component/wrapper");
 	} finally {
@@ -655,7 +675,8 @@ test("ctrl+o expands tools, pgdn scrolls, and Esc closes the viewer", () => {
 		component.handleInput?.("k");
 		assert.equal(component.getState().scrollTop, 0, "k scrolls up one line");
 		component.handleInput?.("G");
-		const maxScrollTop = Math.max(0, expanded.split("\n").length - 3);
+		const pageSize = resolveModalLayout(4, 80).bodyRows;
+		const maxScrollTop = Math.max(0, expanded.split("\n").length - pageSize);
 		assert.equal(component.getState().scrollTop, maxScrollTop, "G moves to the transcript end");
 		component.handleInput?.("k");
 		assert.equal(component.getState().scrollTop, Math.max(0, maxScrollTop - 1));
@@ -959,9 +980,9 @@ test("live overlay: x opens an in-overlay y/N stop prompt; y calls onStop, other
 	const component = createLiveOverlay(source).open("root.worker", { maxLines: 5, now: () => 10_000, onStop: (id) => stopped.push(id) });
 	try {
 		component.handleInput?.("x");
-		assert.match(component.render(120)[0]!, /Stop .*\? .*y stop/);
+		assert.match(stripTerminalSequences(component.render(120).join("\n")), /Stop .*\? .*y stop/);
 		component.handleInput?.("n");
-		assert.doesNotMatch(component.render(120)[0]!, /y stop/);
+		assert.doesNotMatch(stripTerminalSequences(component.render(120).join("\n")), /y stop/);
 		assert.deepEqual(stopped, []);
 		component.handleInput?.("x");
 		component.handleInput?.("y");
@@ -985,4 +1006,120 @@ test("live overlay close: with pi's done() it does not also hide the handle (wou
 	bare.attachOverlayHandle({ hide: () => { hides++; } } as never);
 	bare.close();
 	assert.equal(hides, 1);
+});
+
+
+test("contextKindLabel marks root as 主 and children as 子", () => {
+	assert.equal(contextKindLabel({ id: "root", name: "root", role: "orchestrator", model: null, status: "running", parentId: null, depth: 0, createdAt: 0, updatedAt: 0 }, "root"), "主");
+	assert.equal(contextKindLabel({ id: "root.worker", name: "worker", role: "worker", model: null, status: "running", parentId: "root", depth: 1, createdAt: 0, updatedAt: 0 }, "root.worker"), "子");
+	assert.equal(contextKindLabel(undefined, "root.worker"), "子");
+	assert.equal(contextKindLabel(undefined, "root"), "主");
+});
+
+test("live overlay paints a floating modal: dim mask, title with 主/子, Esc close; Esc does not stop", () => {
+	const source = new FakeOverlaySource();
+	const stopped: string[] = [];
+	const component = createLiveOverlay(source).open("root.worker", {
+		terminalRows: 24,
+		now: () => 5_000,
+		onStop: (id) => stopped.push(id),
+	});
+	try {
+		const rendered = component.render(80);
+		assert.equal(rendered.length, 24, "modal fills the terminal with mask + frame");
+		const plain = rendered.map((line) => stripTerminalSequences(line));
+		assert.match(plain.join("\n"), /worker \(worker\).*子/);
+		assert.match(plain.join("\n"), /Esc/);
+		assert.match(plain.join("\n"), /┏|┃|┗/);
+		assert.ok(plain.some((line) => line.includes("┃")), "vertical modal borders present");
+		const layout = resolveModalLayout(24, 80);
+		assert.equal(plain[0], " ".repeat(80), "top row is dim mask (spaces)");
+		component.handleInput?.("\u001b");
+		assert.equal(component.getState().open, false);
+		assert.equal(stopped.length, 0, "Esc closes the modal only — does not call onStop/retire");
+	} finally {
+		component.dispose();
+	}
+});
+
+test("clicking the dim mask or Esc hint closes the modal without stopping", () => {
+	const source = new FakeOverlaySource();
+	const stopped: string[] = [];
+	const component = createLiveOverlay(source).open("root.worker", {
+		terminalRows: 24,
+		now: () => 5_000,
+		onStop: (id) => stopped.push(id),
+	});
+	try {
+		component.render(80);
+		const layout = resolveModalLayout(24, 80);
+		const maskClick = component.handleMouse?.({
+			type: "click",
+			button: "left",
+			x: 0,
+			y: 0,
+			screenX: 0,
+			screenY: 0,
+			width: 80,
+			height: 24,
+			shift: false,
+			alt: false,
+			ctrl: false,
+		});
+		assert.equal(maskClick?.handled, true);
+		assert.equal(component.getState().open, false);
+		assert.equal(stopped.length, 0);
+
+		const again = createLiveOverlay(source).open("root.worker", {
+			terminalRows: 24,
+			now: () => 5_000,
+			onStop: (id: string) => { stopped.push(id); },
+		});
+		again.render(80);
+		const closeClick = again.handleMouse?.({
+			type: "click",
+			button: "left",
+			x: layout.closeColStart,
+			y: layout.titleRow,
+			screenX: layout.closeColStart,
+			screenY: layout.titleRow,
+			width: 80,
+			height: 24,
+			shift: false,
+			alt: false,
+			ctrl: false,
+		});
+		assert.equal(closeClick?.handled, true);
+		assert.equal(again.getState().open, false);
+		assert.equal(stopped.length, 0, "close-hint click does not stop the agent");
+	} finally {
+		component.dispose();
+	}
+});
+
+test("switching the open node updates modal title and content to the selected agent", () => {
+	const source = new FakeOverlaySource();
+	source.backfill = (nodeId) => {
+		const text = nodeId === "root.other" ? "other-agent-context" : "worker-agent-context";
+		const messages = [{ role: "user" as const, content: text, timestamp: 1 }];
+		return { messages, cursor: cursor(1, 0, messages.length, 64) };
+	};
+	const overlay = createLiveOverlay(source);
+	const first = overlay.open("root.worker", { terminalRows: 24, now: () => 5_000 });
+	const firstPlain = stripTerminalSequences(first.render(80).join("\n"));
+	assert.match(firstPlain, /worker \(worker\).*子/);
+	assert.match(firstPlain, /worker-agent-context/);
+	assert.doesNotMatch(firstPlain, /other-agent-context/);
+
+	const second = overlay.open("root.other", { terminalRows: 24, now: () => 5_000 });
+	assert.equal(first.getState().open, false);
+	const secondPlain = stripTerminalSequences(second.render(80).join("\n"));
+	assert.match(secondPlain, /other \(worker\).*子/);
+	assert.match(secondPlain, /other-agent-context/);
+	assert.doesNotMatch(secondPlain, /worker-agent-context/);
+
+	const root = overlay.open("root", { terminalRows: 24, now: () => 5_000 });
+	const rootPlain = stripTerminalSequences(root.render(80).join("\n"));
+	assert.match(rootPlain, /root \(orchestrator\).*主/);
+	root.close();
 });
