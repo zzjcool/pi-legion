@@ -300,7 +300,7 @@ test("live overlay streams text/tool/settled events into a bounded recent-messag
 		assert.ok(state.activity.length <= 3);
 		assert.deepEqual(state.activity, ["✓ read", "↻ turn 1", "✓ agent turn settled"]);
 		const rendered = component.render(100).join("\n");
-		assert.match(rendered, /worker \(worker\)/);
+		assert.match(rendered, /● worker · 子/);
 		assert.match(rendered, /running/);
 		assert.match(state.text, /hello world/);
 		assert.doesNotMatch(rendered, /ignored/);
@@ -1028,18 +1028,47 @@ test("live overlay paints a floating modal: dim mask, title with 主/子, Esc cl
 		const rendered = component.render(80);
 		assert.equal(rendered.length, 24, "modal fills the terminal with mask + frame");
 		const plain = rendered.map((line) => stripTerminalSequences(line));
-		assert.match(plain.join("\n"), /worker \(worker\).*子/);
+		assert.match(plain.join("\n"), /● worker · 子/);
 		assert.match(plain.join("\n"), /Esc/);
 		assert.match(plain.join("\n"), /┏|┃|┗/);
 		assert.ok(plain.some((line) => line.includes("┃")), "vertical modal borders present");
 		const layout = resolveModalLayout(24, 80);
+		assert.ok(layout.marginY > 0, "ratio layout leaves a top dim mask");
 		assert.equal(plain[0], " ".repeat(80), "top row is dim mask (spaces)");
+		// Meta band sits below the body (role / model / turn / elapsed / status).
+		assert.ok(layout.metaRow !== null && layout.showMeta);
+		assert.match(plain[layout.metaRow!] ?? "", /worker · test\/model · turn 0 · 4s · running/);
+		assert.ok(layout.metaRow! > layout.bodyStartRow, "meta is below the message body");
 		component.handleInput?.("\u001b");
 		assert.equal(component.getState().open, false);
 		assert.equal(stopped.length, 0, "Esc closes the modal only — does not call onStop/retire");
 	} finally {
 		component.dispose();
 	}
+});
+
+test("resolveModalLayout caps frame by window ratio and keeps meta below the body", () => {
+	const large = resolveModalLayout(50, 160);
+	assert.equal(large.frameRows, Math.floor(50 * 0.65));
+	assert.equal(large.innerWidth + 2, Math.floor(160 * 0.75));
+	assert.ok(large.marginY >= 8, "large terminal leaves a clear vertical mask");
+	assert.ok(large.marginX >= 18, "large terminal leaves a clear horizontal mask");
+	assert.equal(large.showMeta, true);
+	assert.ok(large.metaRow !== null);
+	assert.ok(large.metaRow! > large.bodyStartRow);
+	assert.equal(large.footerRow, large.metaRow! + 1);
+	assert.ok(large.frameRows < large.rows, "frame is shorter than the terminal");
+	assert.ok(large.innerWidth + 2 < large.cols, "frame is narrower than the terminal");
+
+	const small = resolveModalLayout(24, 80);
+	assert.equal(small.frameRows, Math.floor(24 * 0.65));
+	assert.equal(small.innerWidth + 2, Math.floor(80 * 0.75));
+	assert.ok(small.marginY > 0 && small.marginX > 0);
+
+	const tiny = resolveModalLayout(4, 80);
+	assert.equal(tiny.frameRows, 4, "tiny terminals still fill height so body stays usable");
+	assert.equal(tiny.bodyRows, 1);
+	assert.equal(tiny.showMeta, true);
 });
 
 test("clicking the dim mask or Esc hint closes the modal without stopping", () => {
@@ -1107,19 +1136,19 @@ test("switching the open node updates modal title and content to the selected ag
 	const overlay = createLiveOverlay(source);
 	const first = overlay.open("root.worker", { terminalRows: 24, now: () => 5_000 });
 	const firstPlain = stripTerminalSequences(first.render(80).join("\n"));
-	assert.match(firstPlain, /worker \(worker\).*子/);
+	assert.match(firstPlain, /● worker · 子/);
 	assert.match(firstPlain, /worker-agent-context/);
 	assert.doesNotMatch(firstPlain, /other-agent-context/);
 
 	const second = overlay.open("root.other", { terminalRows: 24, now: () => 5_000 });
 	assert.equal(first.getState().open, false);
 	const secondPlain = stripTerminalSequences(second.render(80).join("\n"));
-	assert.match(secondPlain, /other \(worker\).*子/);
+	assert.match(secondPlain, /● other · 子/);
 	assert.match(secondPlain, /other-agent-context/);
 	assert.doesNotMatch(secondPlain, /worker-agent-context/);
 
 	const root = overlay.open("root", { terminalRows: 24, now: () => 5_000 });
 	const rootPlain = stripTerminalSequences(root.render(80).join("\n"));
-	assert.match(rootPlain, /root \(orchestrator\).*主/);
+	assert.match(rootPlain, /● root · 主/);
 	root.close();
 });
