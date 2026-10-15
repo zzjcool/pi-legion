@@ -280,10 +280,16 @@ export interface ChartStats {
 	byRole: Array<{ role: string; tokens: number }>;
 }
 
+/**
+ * Chart x-domain. `to` advances only on substantive RateSampler changes
+ * (tokensOut / generationMs); wall-clock `now` alone does not scroll the axis.
+ * `from` stays relative to that frozen `to` (earliest start, or to−60s).
+ */
 export function chartWindow(data: ViewData): { from: number; to: number } {
 	const starts = data.nodes.filter(isAgent).map((node) => node.startedAt);
-	const from = Math.min(data.sampler.startedAt ?? data.now, ...(starts.length ? starts : [data.now]));
-	return { from: Math.min(from, data.now - 60_000), to: data.now };
+	const earliest = Math.min(data.sampler.startedAt ?? data.now, ...(starts.length ? starts : [data.now]));
+	const to = data.sampler.lastChangeAt ?? data.sampler.startedAt ?? data.now;
+	return { from: Math.min(earliest, to - 60_000), to };
 }
 
 export function computeStats(data: ViewData, buckets: number): ChartStats {

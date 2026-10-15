@@ -53,6 +53,8 @@ export class RateSampler {
 	private readonly series = new Map<string, Series>();
 	private readonly retentionMs: number;
 	private first: number | undefined;
+	/** Wall time of the latest tokensOut/gen change across all series (not flat-collapse moves). */
+	private lastChange: number | undefined;
 
 	constructor(options: { retentionMs?: number } = {}) {
 		this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
@@ -60,6 +62,15 @@ export class RateSampler {
 
 	get startedAt(): number | undefined {
 		return this.first;
+	}
+
+	/**
+	 * Latest timestamp where any series recorded a substantive tokensOut or
+	 * generationMs change. Flat-collapse (advancing a flat trailing sample to
+	 * `now`) does not move this — chart x-axis freezes until real data arrives.
+	 */
+	get lastChangeAt(): number | undefined {
+		return this.lastChange;
 	}
 
 	record(now: number, nodes: readonly VizNode[]): void {
@@ -85,9 +96,11 @@ export class RateSampler {
 			// Cumulative counters never decrease; ignore regressions from stale sources.
 			const value = last === undefined ? node.tokensOut : Math.max(last, node.tokensOut);
 			const gen = lastGen === undefined ? node.generationMs : Math.max(lastGen, node.generationMs);
+			const changed = last === undefined || value !== last || gen !== lastGen;
 			if (lastTs !== undefined && now <= lastTs) {
 				s.value[s.value.length - 1] = value;
 				s.gen[s.gen.length - 1] = gen;
+				if (changed) this.noteChange(lastTs);
 				continue;
 			}
 			if (
@@ -99,14 +112,21 @@ export class RateSampler {
 				s.gen[s.gen.length - 2] === lastGen
 			) {
 				// Collapse flat runs: move the trailing sample forward.
+				// Does NOT advance lastChangeAt — chart x-axis stays frozen.
 				s.ts[s.ts.length - 1] = now;
 				continue;
 			}
 			s.ts.push(now);
 			s.value.push(value);
 			s.gen.push(gen);
+			if (changed) this.noteChange(now);
 			this.prune(s, now);
 		}
+	}
+
+	private noteChange(at: number): void {
+		if (!Number.isFinite(at)) return;
+		this.lastChange = this.lastChange === undefined ? at : Math.max(this.lastChange, at);
 	}
 
 	private prune(s: Series, now: number): void {
@@ -215,6 +235,7 @@ export class RateSampler {
 	clear(): void {
 		this.series.clear();
 		this.first = undefined;
+		this.lastChange = undefined;
 	}
 }
 
