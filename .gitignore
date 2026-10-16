@@ -16,3 +16,9 @@ STATE.md
 
 # agent reports are not stored in the repo
 reports/
+
+# TUI QA 证据产物（playbook §7）
+test/tui/artifacts/
+
+# crash dumps from container runs
+core
