@@ -7,12 +7,22 @@
 # 产物默认写 test/tui/artifacts/<ts>-smoke/（playbook §7）。
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# ROOT 解析优先级：PLUGIN_ROOT 显式指定 > 脚本在仓库内（test/docker/ 下）> 报错。
+# harness 需要仓库里的 test/mock-llm（npm run mock-llm）。裸跑镜像（无挂载）时给出明确用法。
+if [ -n "${PLUGIN_ROOT:-}" ] && [ -d "$PLUGIN_ROOT/test/mock-llm" ]; then
+  ROOT="$PLUGIN_ROOT"
+elif [ -d "$(cd "$(dirname "$0")/../.." 2>/dev/null && pwd)/test/mock-llm" ]; then
+  ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+else
+  echo "FAIL: test/mock-llm not found（需挂载仓库或设 PLUGIN_ROOT 指向仓库根）。"
+  echo "  本地仓库内:  bash test/docker/verify-tui-visual.sh"
+  echo "  裸镜像:      docker run --rm -v \$(pwd):/plugin -w /plugin ghcr.io/zzjcool/pi-legion/tui-sandbox:latest bash test/docker/verify-tui-visual.sh"
+  exit 1
+fi
 ART="${TUI_ARTIFACTS_DIR:-$ROOT/test/tui/artifacts}/$(date +%Y%m%d-%H%M%S)-smoke"
 mkdir -p "$ART"
 COLS="${TUI_COLS:-120}" ROWS="${TUI_ROWS:-40}"
 SCENARIO="${MOCK_LLM_SCENARIO:-echo}"
-RENDERER="${ANSI2PNG:-$ROOT/test/tui/ansi2png.py}"
 
 cleanup() {
   tmux kill-server 2>/dev/null || true
@@ -67,7 +77,9 @@ cp "$ART/boot.ansi" "$ART/frame-1.ansi"
 tmux send-keys -t qa "MOCK_SAY: hello from tui-visual-smoke" C-m
 stable > "$ART/frame-2.ansi" || echo "WARN: frame-2 unstable (streaming?), captured anyway"
 
-# ── 5. 渲染 PNG（取证）─────────────────────────────────────────────────
+# ── 5. 渲染 PNG（取证）：优先仓库内渲染器，回退镜像烧录的 /opt/tui/ansi2png.py ──
+RENDERER="${ANSI2PNG:-$ROOT/test/tui/ansi2png.py}"
+if [ ! -f "$RENDERER" ]; then RENDERER=/opt/tui/ansi2png.py; fi
 python3 "$RENDERER" "$ART/frame-2.ansi" "$ART/frame-2.png" --cols "$COLS"
 
 # ── 6. 冒烟断言（明文优先，playbook 铁律 1）────────────────────────────
