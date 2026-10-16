@@ -1,0 +1,24 @@
+# TUI QA sandbox: pi-legion TUI 视觉验证的运行环境（见 docs/tui-qa-playbook.md）。
+# 需求来自 playbook §1.4：可控终端尺寸的 tmux + 真实 pi + mock LLM + ANSI 取证。
+# 发布到 ghcr.io/<owner>/pi-legion/tui-sandbox（CI 或手动 docker push）。
+
+FROM node:24-slim
+
+# tmux 驱动 TUI；python3+PIL 渲染 ANSI 帧；fonts-noto-cjk 保证 CJK 不渲染成方框
+# （playbook §1.4：CJK 缺字会掩盖宽度/溢出缺陷本身）。
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      tmux python3 python3-pil fonts-noto-cjk curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 全局安装 pi coding agent（TUI 被测对象）。版本可用 build-arg 固定。
+ARG PI_VERSION=latest
+RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}"
+
+# 渲染器与 harness 落库在镜像内固定路径（playbook §11：单一实现，不派生副本）。
+COPY test/tui/ansi2png.py /opt/tui/ansi2png.py
+COPY test/docker/verify-tui-visual.sh /opt/tui/verify-tui-visual.sh
+
+WORKDIR /root/work
+
+# verify-tui-visual.sh 负责起 mock + tmux + 捕获 + 渲染，并自带冒烟断言
+CMD ["bash", "/opt/tui/verify-tui-visual.sh"]
