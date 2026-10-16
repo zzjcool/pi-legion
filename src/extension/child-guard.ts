@@ -52,7 +52,8 @@ export function blockChildMessage(reason: string): string {
 }
 
 export function isReadOnlyRole(role: string | undefined): boolean {
-	return role === "read-only";
+	// #172: tolerate case/spacing from env-supplied PI_SUBAGENT_ACCEPTANCE_ROLE.
+	return role?.trim().toLowerCase() === "read-only";
 }
 
 export interface ChildGuardEnv {

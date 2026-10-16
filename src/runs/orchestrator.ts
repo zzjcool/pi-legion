@@ -132,9 +132,20 @@ const CHILD_ENV = "PI_SUBAGENT_CHILD";
 const POLL_INTERVAL_MS = 500;
 
 function parseDepthCeiling(raw: string | undefined): number | undefined {
-	if (raw === undefined || !/^\d+$/.test(raw.trim())) return undefined;
-	const value = Number(raw.trim());
-	return Number.isInteger(value) && value >= 0 ? value : undefined;
+	// Genuinely unset / blank → no env ceiling (settings + hard cap still apply).
+	if (raw === undefined) return undefined;
+	const t = raw.trim();
+	if (t === "") return undefined;
+	// #173: illegal values fail closed to leaf-only (0), matching contract :361 —
+	// never widen to the hard cap via `undefined` → +Infinity.
+	if (!/^\d+$/.test(t)) {
+		console.error(
+			`[pi-legion] ${MAX_DEPTH_ENV}=${JSON.stringify(t)} is not a non-negative integer; treating as 0 (leaf only).`,
+		);
+		return 0;
+	}
+	const value = Number(t);
+	return Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 /** Root/process ceiling: inherited env, settings, and the saturated path cap. */
