@@ -482,7 +482,7 @@ function createSession(
 					consumedFinalizedText ||
 					message.role !== "assistant" ||
 					!Array.isArray(message.content) ||
-					!messageText(message.content).includes(finalizedText)
+					!finalizedText.includes(messageText(message.content))
 				) {
 					return message;
 				}
@@ -558,7 +558,6 @@ function createSession(
 
 	const updateStreamingText = (delta: string): void => {
 		if (!delta) return;
-		if (finalizedAssistantText) finalizedAssistantText = "";
 		streamingText = clampStreamingText(`${streamingText}${delta}`);
 		appendActivityText(delta);
 		chat.updateStreamingText(streamingText, sourceNode()?.model ?? initialNode?.model ?? undefined);
