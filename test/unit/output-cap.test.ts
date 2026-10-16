@@ -66,3 +66,13 @@ test("normal small output still exact", async () => {
 	const r = await defaultVerifyRunner("printf ok", process.cwd(), 10_000);
 	assert.deepEqual([r.code, r.stdout], [0, "ok"]);
 });
+
+test("env resolution: floored value below 1 falls back to default (#174)", () => {
+	assert.equal(resolveMaxOutputBytes({ PI_LEGION_MAX_OUTPUT_BYTES: "0.5" }), DEFAULT_MAX_OUTPUT_BYTES);
+	assert.equal(resolveMaxOutputBytes({ PI_LEGION_MAX_OUTPUT_BYTES: "0.9" }), DEFAULT_MAX_OUTPUT_BYTES);
+	assert.equal(resolveMaxOutputBytes({ PI_LEGION_MAX_OUTPUT_BYTES: "0" }), DEFAULT_MAX_OUTPUT_BYTES);
+	assert.equal(resolveMaxOutputBytes({ PI_LEGION_MAX_OUTPUT_BYTES: "1" }), 1);
+	assert.equal(resolveMaxOutputBytes({ PI_LEGION_MAX_OUTPUT_BYTES: "1.5" }), 1);
+	assert.equal(resolveMaxOutputBytes({ PI_LEGION_MAX_OUTPUT_BYTES: "4096.9" }), 4096);
+});
+

@@ -18,7 +18,7 @@ import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
 import { withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
-import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode, LIVE_CHILD_STATUSES } from "../legion/nodes.ts";
+import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { evaluatePhaseTransition, isLegionPhase, isTerminalPhase } from "../legion/state-machine.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
@@ -132,9 +132,20 @@ const CHILD_ENV = "PI_SUBAGENT_CHILD";
 const POLL_INTERVAL_MS = 500;
 
 function parseDepthCeiling(raw: string | undefined): number | undefined {
-	if (raw === undefined || !/^\d+$/.test(raw.trim())) return undefined;
-	const value = Number(raw.trim());
-	return Number.isInteger(value) && value >= 0 ? value : undefined;
+	// Genuinely unset / blank → no env ceiling (settings + hard cap still apply).
+	if (raw === undefined) return undefined;
+	const t = raw.trim();
+	if (t === "") return undefined;
+	// #173: illegal values fail closed to leaf-only (0), matching contract :361 —
+	// never widen to the hard cap via `undefined` → +Infinity.
+	if (!/^\d+$/.test(t)) {
+		console.error(
+			`[pi-legion] ${MAX_DEPTH_ENV}=${JSON.stringify(t)} is not a non-negative integer; treating as 0 (leaf only).`,
+		);
+		return 0;
+	}
+	const value = Number(t);
+	return Number.isInteger(value) && value >= 0 ? value : 0;
 }
 
 /** Root/process ceiling: inherited env, settings, and the saturated path cap. */
@@ -341,9 +352,11 @@ export class Orchestrator {
 		const depthCeiling = input.utility
 			? parent.depth + 1
 			: Math.min(legion.settings?.maxDepth ?? this.maxDepthValue, MAX_NESTED_PATH_ENTRIES);
-		const liveStatuses = LIVE_CHILD_STATUSES.map(() => "?").join(", ");
-		const childCount = Number(legion.db.prepare(`SELECT COUNT(*) AS count FROM nodes WHERE parent_id = ? AND status IN (${liveStatuses})`).get(legion.nodeId, ...LIVE_CHILD_STATUSES)?.count ?? 0);
-		const maxChildren = previous ? Math.max(legion.settings?.maxChildrenPerNode ?? 8, childCount + 1) : legion.settings?.maxChildrenPerNode;
+		// Resume must NOT inflate maxChildrenPerNode (#180). Retired nodes free
+		// slots (#142); turning one live again re-charges the fanout cap — same
+		// gate as a fresh launch. activeReservation below still covers the node's
+		// own maxActiveNodes slot when it is already starting/running.
+		const maxChildren = legion.settings?.maxChildrenPerNode ?? 8;
 		const activeReservation = previous && (previous.status === "starting" || previous.status === "running") ? 1 : 0;
 		const limits: LegionBudgetLimits = { maxDepth: depthCeiling, maxChildrenPerNode: maxChildren, maxActiveNodes: (legion.settings?.maxActiveNodes ?? 30) + activeReservation };
 		const gate = withLaunchBudget(legion.db, { parentId: legion.nodeId, depth: parent.depth + 1, nodeId: input.nodeId }, () => {

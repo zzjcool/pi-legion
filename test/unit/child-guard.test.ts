@@ -73,12 +73,23 @@ test("formatChildTask worktreeBranch tells the child to ship via MR", () => {
 	assert.doesNotMatch(formatChildTask("implement it"), /isolated git worktree/);
 });
 
+test("isReadOnlyRole is case-insensitive (#172)", () => {
+	assert.equal(isReadOnlyRole("read-only"), true);
+	assert.equal(isReadOnlyRole("READ-ONLY"), true);
+	assert.equal(isReadOnlyRole("Read-Only"), true);
+	assert.equal(isReadOnlyRole("  read-only  "), true);
+	assert.equal(isReadOnlyRole("writer"), false);
+	assert.equal(isReadOnlyRole("WRITER"), false);
+	assert.equal(isReadOnlyRole(undefined), false);
+});
+
 test("read-only role: writes and herdr prompts are blocked, recon commands pass", () => {
 	assert.equal(isReadOnlyRole("read-only"), true);
 	assert.equal(isReadOnlyRole("writer"), false);
 
 	const env = { acceptanceRole: "read-only" as const };
 	assert.ok(forbiddenChildReason("rm -rf /tmp/x", env));
+	assert.ok(forbiddenChildReason("rm -rf /tmp/x", { acceptanceRole: "READ-ONLY" }));
 	assert.ok(forbiddenChildReason("git commit -am wip", env));
 	assert.ok(forbiddenChildReason("echo hi > /tmp/out", env));
 	assert.ok(forbiddenChildReason("npm install left-pad", env));
