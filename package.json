@@ -49,6 +49,7 @@
     "LICENSE"
   ],
   "scripts": {
+    "preinstall": "node -e \"const ua=process.env.npm_config_user_agent||'';if(!ua.includes('pnpm')){console.error('Use pnpm to install dependencies (see CONTRIBUTING.md).');process.exit(1)}\"",
     "typecheck": "tsc --noEmit",
     "test": "env -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/unit/*.test.ts",
     "test:integration": "env -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/integration/*.test.ts",
