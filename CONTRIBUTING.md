@@ -21,13 +21,13 @@ directly to `master`. Implementers do not merge their own pull requests.
 **Before you push.** Run:
 
 ```bash
-npm run typecheck
-npm test
-npm run test:integration   # or npm run test:all
+pnpm run typecheck
+pnpm test
+pnpm run test:integration   # or pnpm run test:all
 ```
 
 The required GitHub Actions check `ci` runs typecheck, unit, integration, and
-mock-llm. Run `npm run test:integration` (or `npm run test:all`) locally
+mock-llm. Run `pnpm run test:integration` (or `pnpm run test:all`) locally
 before you push, especially when the change touches `src/runs/`, `src/legion/`,
 or `src/extension/runtime.ts`.
 
@@ -45,9 +45,10 @@ timeout the caller is awaiting stays referenced, as with the wait timer in
 `src/extension/runtime.ts`.
 
 **npm release.** A `v*.*.*` tag runs the release workflow
-(`.github/workflows/release.yml`). Publish from that workflow with
-`npm stage publish` and a stage-only token. A maintainer promotes the staged
-version on npm with 2FA. Do not use plain `npm publish` in GitHub Actions.
+(`.github/workflows/release.yml`). Dependencies are installed with **pnpm**;
+staging still uses the npm CLI (`npm stage publish`) and a stage-only token.
+A maintainer promotes the staged version on npm with 2FA. Do not use plain
+`npm publish` in GitHub Actions.
 
 **Communication.** Coordinate in the team channel, or with Alice. Do not ping
 the maintainer user for a routine review or merge ask.
@@ -57,34 +58,36 @@ the maintainer user for a routine review or merge ask.
 ```bash
 git clone https://github.com/zzjcool/pi-legion.git
 cd pi-legion
-npm install
+pnpm install
 ```
 
-Requires Node.js 22+ (`node --experimental-strip-types` is how tests run;
-there is no compile step to ship).
+Requires Node.js 22+ and **pnpm** 9+ (`packageManager` in `package.json`;
+`node --experimental-strip-types` is how tests run; there is no compile step
+to ship). Prefer Corepack (`corepack enable`) or install pnpm 9.x. Do not use
+`npm install` in this repo.
 
 ## Checks
 
 The required GitHub Actions check `ci` (`.github/workflows/ci.yml`, on pull
 requests and pushes to `master`) runs, in order:
 
-1. `npm run typecheck`
-2. `npm test` (unit)
-3. `npm run test:integration`
-4. `npm run test:mock-llm`
+1. `pnpm run typecheck`
+2. `pnpm test` (unit)
+3. `pnpm run test:integration`
+4. `pnpm run test:mock-llm`
 
 A failing integration step fails `ci`, so nesting and orchestrator regressions
 are blocked before merge. `test:live` and `test:docker` stay out of that job.
 
 ```bash
-npm run typecheck
-npm test                 # test/unit/*.test.ts
-npm run test:integration # FakeSupervisor / nested fakes; no live `pi` binary
-npm run test:all         # typecheck + unit + integration
-npm run test:mock-llm    # also part of the required ci check
+pnpm run typecheck
+pnpm test                 # test/unit/*.test.ts
+pnpm run test:integration # FakeSupervisor / nested fakes; no live `pi` binary
+pnpm run test:all         # typecheck + unit + integration
+pnpm run test:mock-llm    # also part of the required ci check
 ```
 
-`npm run test:live` is a **pi RPC live** smoke (`test/live/rpc-live.test.ts`).
+`pnpm run test:live` is a **pi RPC live** smoke (`test/live/rpc-live.test.ts`).
 It skips itself when the `pi` binary is missing from `PATH` (see the probe at
 the top of that file). Do not fail CI on it.
 
@@ -102,8 +105,8 @@ For offline Pi / legion smoke without provider quota, start the scriptable
 OpenAI-compatible mock (see [`test/mock-llm/README.md`](test/mock-llm/README.md)):
 
 ```bash
-npm run mock-llm                 # default scenario=echo on :8765
-npm run test:mock-llm            # engine + HTTP + optional pi --print smoke
+pnpm run mock-llm                 # default scenario=echo on :8765
+pnpm run test:mock-llm            # engine + HTTP + optional pi --print smoke
 ```
 
 `test/docker/mock-llm.mjs` launches the same CLI (default scenario `tool-once`
@@ -142,12 +145,12 @@ bash test/docker/verify-11-nested-alias.sh    # nested + alias + completionGuard
 Or all at once (RPC mainline **1–11** only):
 
 ```bash
-npm run test:docker
+pnpm run test:docker
 ```
 
 **Legacy Herdr / Space / kind checks** live under `test/legacy/docker/` (need
 pi-legion **0.16.x** Herdr-era setup). They are **not** part of
-`npm run test:docker`:
+`pnpm run test:docker`:
 
 ```bash
 bash test/legacy/docker/verify-12-workspace.sh  # Herdr Space pin (legacy)

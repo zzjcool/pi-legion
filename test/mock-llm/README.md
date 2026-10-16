@@ -11,7 +11,7 @@ Pi discovers it the same way as Ollama / vLLM: a provider block in
 
 ```bash
 # from repo root
-npm run mock-llm
+pnpm run mock-llm
 # → mock-llm listening on http://127.0.0.1:8765/v1 scenario=echo
 ```
 
@@ -91,13 +91,13 @@ Then `settings.json`: `"defaultProvider": "mock"`, `"defaultModel": "flash"`.
 | _(example)_ | `examples/scout-guard-streak.json` — N read tool_calls then settle (#108 e2e) |
 
 ```bash
-MOCK_LLM_SCENARIO=spawn-scout npm run mock-llm
-npm run mock-llm -- --scenario doctor
-npm run mock-llm -- --script test/mock-llm/examples/custom.json
+MOCK_LLM_SCENARIO=spawn-scout pnpm run mock-llm
+pnpm run mock-llm -- --scenario doctor
+pnpm run mock-llm -- --script test/mock-llm/examples/custom.json
 ```
 
 
-Scout-guard regression (#108) lives in `test/integration/mock-llm-scout-guard-e2e.test.ts` (picked up by `npm run test:mock-llm`): mock scripts N consecutive read-class tool_calls; light extension harness asserts one `scout-guard-notify` followUp, dispatch clear, and cooldown.
+Scout-guard regression (#108) lives in `test/integration/mock-llm-scout-guard-e2e.test.ts` (picked up by `pnpm run test:mock-llm`): mock scripts N consecutive read-class tool_calls; light extension harness asserts one `scout-guard-notify` followUp, dispatch clear, and cooldown.
 
 Per-request override: header `x-mock-scenario: child-done` or
 `?scenario=child-done` on the chat URL.
@@ -143,7 +143,7 @@ scripts should include a `when: { hasToolResult: true }` rule.
 
 ## Legion e2e suite
 
-`npm run test:mock-llm` also runs:
+`pnpm run test:mock-llm` also runs:
 
 - `test/integration/mock-llm-pi-smoke.test.ts` — `pi --print` against the mock
 - `test/integration/railway-mock-e2e.test.ts` — spawn connectors + lockstep scroll
