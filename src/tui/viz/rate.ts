@@ -1,23 +1,24 @@
 /**
  * Minimal in-memory token-rate sampling.
  *
- * Every tok/s figure in the UI (railway header, /legion header, chart "now",
- * tree detail t/s) uses ONE definition:
+ * Two UI surfaces show throughput with different definitions:
  *
- *   numerator   = Δ cumulative output tokens over the trailing window
- *   denominator = Δ cumulative generationMs over the same window
- *                 (falls back to wall-clock window when generationMs is
- *                  unavailable / zero, or when in-window ΔgenerationMs is
- *                  below MIN_RATE_GENERATION_MS — same 1s floor as tree t/s)
+ * - Header / snap "now" (`nowRate`): 60s trailing window + live (running)
+ *   agents only. Numerator = Δ cumulative output tokens; denominator =
+ *   Δ cumulative generationMs over the same window (falls back to wall-clock
+ *   window when generationMs is unavailable / zero, or when in-window
+ *   ΔgenerationMs is below MIN_RATE_GENERATION_MS — same 1s floor as the
+ *   tree-row gate). Once nothing is live, "now" is 0 even if the window
+ *   still holds Δtokens.
+ * - Tree-row label (`avg t/s` in status.ts): lifetime cumulative average
+ *   `tokensOut / (generationMs/1000)` — no window, no live filter.
  *
  * generationMs comes from session JSONL: sum of (assistant_ts − prior
  * user/toolResult_ts). Idle and tool gaps are excluded. Approximate —
  * usage lands when each assistant message completes, not mid-stream.
  *
- * Header / snap "now" (`nowRate` / `totalRate` with live node ids) only sums
- * agents that are still `running`. Settled/retired series keep contributing to
- * chart buckets/avg so the history window stays accurate; once nothing is live,
- * "now" is forced to 0 even if the 60s window still holds Δtokens.
+ * Settled/retired series keep contributing to chart buckets/avg so the
+ * history window stays accurate.
  */
 
 import type { VizNode } from "./model.ts";

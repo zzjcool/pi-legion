@@ -143,7 +143,7 @@ test("railway: header shows live count and shared tok/s; long names are truncate
 	const nodes = [ROOT, node("a-very-long-agent-name-that-overflows", { role: "worker" })];
 	const out = renderRailway({ nodes, now: sec(30), width: 46, rate: 1234 })!;
 	const lines = out.canvas.toPlain();
-	assert.match(lines[0]!, /1 live · 1\.2k tok\/s/);
+	assert.match(lines[0]!, /1 live · 1\.2k now tok\/s/);
 	assert.match(lines[1]!, /…/);
 	assert.equal(ellipsize("abcdef", 4), "abc…");
 });
@@ -411,7 +411,7 @@ test("rate: header tok/s and chart 'now' share one definition", () => {
 	const { canvas } = renderLegionView({ nodes, sampler, now, rate }, initialViewState(), 160, 50);
 	const header = canvas.toPlain()[0]!;
 	const label = rate >= 1000 ? `${(rate / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(Math.round(rate));
-	assert.ok(header.includes(`${label} tok/s`), header);
+	assert.ok(header.includes(`${label} now tok/s`), header);
 });
 
 test("legion view: no clipping at 46x60, 60x70, 100x40, 160x50 (dark/light themes alike)", () => {
@@ -482,7 +482,7 @@ test("status board: railway strip replaces the roster when enabled and hides wit
 	assert.ok(factory);
 	const lines = factory!({ requestRender() {} }, plainTheme).render(100);
 	assert.equal(lines.length, 2);
-	assert.match(lines[0]!, /1 live · \d+ tok\/s/);
+	assert.match(lines[0]!, /1 live · \d+ now tok\/s/);
 	assert.match(lines[1]!, /worker-1/);
 	for (const line of lines) assert.ok(visibleWidth(line) <= 100);
 	const snap = board.vizSnapshot!(now);

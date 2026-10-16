@@ -138,7 +138,7 @@ export function maxLanesFor(width: number): number {
 }
 
 export function formatRate(rate: number): string {
-	return `${formatCount(rate)} tok/s`;
+	return `${formatCount(rate)} now tok/s`;
 }
 
 
