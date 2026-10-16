@@ -21,27 +21,30 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
       - name: Setup Node 22
         uses: actions/setup-node@v7
         with:
           node-version: 22
           check-latest: true
-          cache: npm
+          cache: pnpm
 
       - name: Install
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: typecheck
-        run: npm run typecheck
+        run: pnpm run typecheck
 
       - name: test
-        run: npm test
+        run: pnpm test
 
       - name: test:integration
-        run: npm run test:integration
+        run: pnpm run test:integration
 
       - name: test:mock-llm
-        run: npm run test:mock-llm
+        run: pnpm run test:mock-llm
 
       # test:docker is omitted. verify-*.sh runs docker with image
       # pi-herdr-sandbox:latest (override: PI_DOCKER_IMAGE) and copies a host
@@ -49,7 +52,7 @@ jobs:
       # contain settings.json and models.json. GitHub-hosted runners have
       # neither, so the script fails before any package check. Local
       # alternative, once that image and Pi home exist:
-      #   npm run test:docker
+      #   pnpm run test:docker
 
       - name: Check tag matches package.json version
         run: |
@@ -86,8 +89,8 @@ jobs:
           node-version: 22
           check-latest: true
           registry-url: https://registry.npmjs.org
-          cache: npm
 
+      # Deps are installed with pnpm above. Staging still uses the npm CLI.
       # CI only stages the package on npm. It does not formally publish.
       # A maintainer must complete npm 2FA (`npm stage approve`) afterwards.
       # NPM_TOKEN is a granular token with Read and write (stage only), which
