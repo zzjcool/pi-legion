@@ -80,9 +80,12 @@ export function resetExtraAgentDirsDeprecationWarnForTests(): void {
 	legacyExtraAgentDirsWarned = false;
 }
 
+/** Split EXTRA_AGENT_DIRS: colon+semicolon (+comma) on POSIX; comma+semicolon on Windows (drive letters). */
+const EXTRA_AGENT_DIRS_SEP = path.delimiter === ";" ? /[,;]/ : /[;:,]/;
+
 function splitExtraAgentDirEntries(raw: string | undefined): string[] {
 	if (!raw) return [];
-	return raw.split(path.delimiter).flatMap((entry) => {
+	return raw.split(EXTRA_AGENT_DIRS_SEP).flatMap((entry) => {
 		const trimmed = entry.trim();
 		return trimmed ? [path.resolve(trimmed)] : [];
 	});
@@ -142,6 +145,12 @@ const VALID_ACCEPTANCE_LEVELS: ReadonlySet<string> = new Set([
 	"none",
 	"attested",
 	"verified",
+]);
+
+const VALID_ACCEPTANCE_ROLES: ReadonlySet<string> = new Set([
+	"read-only",
+	"writer",
+	"unknown",
 ]);
 
 /** Raw frontmatter values are `unknown`: a YAML scalar or collection may appear. */
@@ -318,7 +327,7 @@ function parseScalar(raw: string): Scalar {
 	return stripQuotes(value);
 }
 
-function parseAcceptance(value: unknown): AcceptanceConfig | undefined {
+function parseAcceptance(value: unknown, agentName?: string): AcceptanceConfig | undefined {
 	const raw = str(value);
 	if (!raw) return undefined;
 
@@ -340,9 +349,15 @@ function parseAcceptance(value: unknown): AcceptanceConfig | undefined {
 	if (!level || !VALID_ACCEPTANCE_LEVELS.has(level)) return undefined;
 
 	const out: AcceptanceConfig = { level: level as AcceptanceConfig["level"] };
-	const role = str(parsed.role);
-	if (role === "read-only" || role === "writer" || role === "unknown") {
-		out.role = role;
+	// #172: author-facing role strings are case-insensitive; keep hyphenated canonical forms.
+	const role = str(parsed.role)?.toLowerCase();
+	if (role && VALID_ACCEPTANCE_ROLES.has(role)) {
+		out.role = role as AcceptanceConfig["role"];
+	} else if (role) {
+		const who = agentName ? `agent "${agentName}"` : "agent";
+		console.error(
+			`[pi-legion] ${who}: unknown acceptance.role ${JSON.stringify(role)}; expected read-only | writer | unknown.`,
+		);
 	}
 	const criteria = parseCriteria(parsed.criteria);
 	if (criteria) out.criteria = criteria;
@@ -528,7 +543,7 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "disabled", bool(fm.disabled));
 	setIf(config, "worktree", bool(fm.worktree));
 	setIf(config, "steer", bool(fm.steer));
-	setIf(config, "acceptance", parseAcceptance(fm.acceptance));
+	setIf(config, "acceptance", parseAcceptance(fm.acceptance, config.name));
 	setIf(config, "toolBudget", parseBudget(fm.toolBudget));
 	setIf(config, "turnBudget", parseTurnBudget(fm.turnBudget));
 	// Writers share a checkout with every other parent Pi in this repo.

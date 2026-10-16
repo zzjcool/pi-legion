@@ -11,12 +11,12 @@
 export const DEFAULT_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 export const MAX_OUTPUT_BYTES_ENV = "PI_LEGION_MAX_OUTPUT_BYTES";
 
-/** Resolve the per-stream cap from env; garbage / <=0 → default. */
+/** Resolve the per-stream cap from env; garbage / floored < 1 → default (#174). */
 export function resolveMaxOutputBytes(env: NodeJS.ProcessEnv = process.env): number {
 	const raw = env[MAX_OUTPUT_BYTES_ENV]?.trim();
 	if (!raw) return DEFAULT_MAX_OUTPUT_BYTES;
 	const n = Number(raw);
-	return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_MAX_OUTPUT_BYTES;
+	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_MAX_OUTPUT_BYTES;
 }
 
 export interface CappedOutput {

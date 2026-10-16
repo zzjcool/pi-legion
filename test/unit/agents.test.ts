@@ -1022,3 +1022,104 @@ test("findAgent matches canonical name and alias", () => {
 	assert.equal(findAgent(agents, "worker")?.name, "worker");
 	assert.equal(findAgent(agents, "nobody"), undefined);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #172: acceptance.role case-insensitivity + unknown-role warn
+// #176: EXTRA_AGENT_DIRS colon AND semicolon
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("acceptance.role is case-insensitive (#172)", () => {
+	const cases: Array<[string, string | undefined, boolean]> = [
+		["read-only", "read-only", false],
+		["READ-ONLY", "read-only", false],
+		["Read-Only", "read-only", false],
+		["writer", "writer", true],
+		["WRITER", "writer", true],
+		["Writer", "writer", true],
+		["unknown", "unknown", false],
+		["UNKNOWN", "unknown", false],
+		["readonly", undefined, false],
+		["read_only", undefined, false],
+	];
+	for (const [wrote, expectedRole, expectWorktree] of cases) {
+		const doc = [
+			"---",
+			`name: role-${wrote}`,
+			"description: d",
+			"acceptance:",
+			"  level: attested",
+			`  role: ${wrote}`,
+			"---",
+			"body",
+		].join("\n");
+		const agent = parseAgentDocument(doc, `/x/role-${wrote}.md`, "user");
+		assert.ok(agent, wrote);
+		assert.equal(agent.acceptance?.role, expectedRole, `role for ${JSON.stringify(wrote)}`);
+		if (expectWorktree) {
+			assert.equal(agent.worktree, true, `auto-worktree for ${JSON.stringify(wrote)}`);
+		} else if (expectedRole === "read-only" || expectedRole === undefined) {
+			assert.equal(agent.worktree, undefined, `no auto-worktree for ${JSON.stringify(wrote)}`);
+		}
+	}
+});
+
+test("acceptance.role unknown string warns (#172)", () => {
+	const errors: string[] = [];
+	const prev = console.error;
+	console.error = (...args: unknown[]) => {
+		errors.push(args.map(String).join(" "));
+	};
+	try {
+		const doc = [
+			"---",
+			"name: bad-role",
+			"description: d",
+			"acceptance:",
+			"  level: attested",
+			"  role: readonly",
+			"---",
+			"body",
+		].join("\n");
+		const agent = parseAgentDocument(doc, "/x/bad-role.md", "user");
+		assert.ok(agent);
+		assert.equal(agent.acceptance?.role, undefined);
+		assert.equal(errors.length, 1);
+		assert.match(errors[0]!, /unknown acceptance\.role/);
+		assert.match(errors[0]!, /bad-role/);
+	} finally {
+		console.error = prev;
+	}
+});
+
+test("resolveExtraAgentDirs: semicolon-separated entries (#176)", () => {
+	withDir((root) => {
+		resetExtraAgentDirsDeprecationWarnForTests();
+		const a = path.join(root, "a");
+		const b = path.join(root, "b");
+		mkdirSync(a, { recursive: true });
+		mkdirSync(b, { recursive: true });
+		const resolved = resolveExtraAgentDirs(
+			{ [EXTRA_AGENT_DIRS_ENV]: `${a};${b}` },
+			() => {},
+		);
+		assert.deepEqual(resolved, [path.resolve(a), path.resolve(b)]);
+	});
+});
+
+test("resolveExtraAgentDirs: mixed colon and semicolon (#176)", () => {
+	withDir((root) => {
+		resetExtraAgentDirsDeprecationWarnForTests();
+		const a = path.join(root, "a");
+		const b = path.join(root, "b");
+		const c = path.join(root, "c");
+		mkdirSync(a, { recursive: true });
+		mkdirSync(b, { recursive: true });
+		mkdirSync(c, { recursive: true });
+		const resolved = resolveExtraAgentDirs(
+			{ [EXTRA_AGENT_DIRS_ENV]: `${a}:${b};${c}` },
+			() => {},
+		);
+		assert.deepEqual(resolved, [path.resolve(a), path.resolve(b), path.resolve(c)]);
+	});
+});
+
