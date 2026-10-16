@@ -19,6 +19,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG PI_VERSION=latest
 RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}"
 
+# 注册 any-endpoint provider：真模型沙箱（test/docker/run-tui-real.sh）靠它读宿主
+# auth.json。挂宿主 package 不行——settings.json 里的 npm: 包与绝对路径扩展要重跑
+# 安装，直接烧进镜像最稳（做法对齐 pi-async/test/docker/tools/Dockerfile）。
+ARG ANY_ENDPOINT_VERSION=0.1.3
+RUN pi install npm:pi-any-endpoint@${ANY_ENDPOINT_VERSION}
+
+# 不加这条，tmux 每次捕获都会带一行 warning banner，且 modified Enter 键行为异常。
+RUN echo "set -g extended-keys on" > /root/.tmux.conf
+
+# 登记被测插件的挂载点（源码在运行期才挂载，构建时目录为空，故 || true）。
+# 不登记的话容器里 pi 只认镜像自带的包，本仓库插件不会被加载。
+RUN mkdir -p /plugin && pi install /plugin || true
+
 # 渲染器与 harness 落库在镜像内固定路径（playbook §11：单一实现，不派生副本）。
 COPY test/tui/ansi2png.py /opt/tui/ansi2png.py
 COPY test/docker/verify-tui-visual.sh /opt/tui/verify-tui-visual.sh
