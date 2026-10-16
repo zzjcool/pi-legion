@@ -432,6 +432,80 @@ test("retire frees maxChildrenPerNode slots so launch can refill to the cap (#14
 	}
 });
 
+
+test("resume cannot exceed maxChildrenPerNode — no Math.max relaxation (#180)", async () => {
+	const fx = fixture({ maxChildrenPerNode: 8 });
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir: fx.runStore.runDir(fx.rootRun.runId),
+		cwd: fx.rootDir,
+		maxDepth: 4,
+		legion: fx.context,
+	});
+	const live = () =>
+		Number(
+			fx.db
+				.prepare("SELECT COUNT(*) AS c FROM nodes WHERE parent_id = 'root' AND status IN ('starting','running','blocked')")
+				.get()?.c ?? 0,
+		);
+	try {
+		const names: string[] = [];
+		for (let i = 0; i < 8; i += 1) {
+			const handle = await orchestrator.launch({
+				agent: agent("worker"),
+				task: `slot-${i}`,
+				name: `worker-${i}`,
+				worktree: false,
+			});
+			names.push(handle.name);
+		}
+		assert.equal(live(), 8);
+		await assert.rejects(
+			() => orchestrator.launch({ agent: agent("worker"), task: "fresh-9", name: "worker-9", worktree: false }),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.BUDGET_EXCEEDED &&
+				/max_children_per_node/.test(error.message),
+			"9th fresh launch must still be denied",
+		);
+		await orchestrator.retire(names[0]!);
+		assert.equal(live(), 7, "retire frees a slot");
+		// Legit refill back to the cap.
+		await orchestrator.launch({ agent: agent("worker"), task: "refill", name: "worker-9", worktree: false });
+		assert.equal(live(), 8);
+		// Resume of the retired node must NOT inflate past the cap (#180).
+		await assert.rejects(
+			() =>
+				orchestrator.launch({
+					agent: agent("worker"),
+					task: "resume-retired",
+					name: names[0]!,
+					worktree: false,
+				}),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.BUDGET_EXCEEDED &&
+				/max_children_per_node/.test(error.message),
+			"resume at cap must be denied — must not create a 9th live child",
+		);
+		assert.equal(live(), 8, "live children stay at the cap after denied resume");
+		// Below-cap resume still works.
+		await orchestrator.retire(names[1]!);
+		assert.equal(live(), 7);
+		const resumed = await orchestrator.launch({
+			agent: agent("worker"),
+			task: "legit-resume",
+			name: names[1]!,
+			worktree: false,
+		});
+		assert.equal(resumed.name, names[1]);
+		assert.equal(live(), 8);
+	} finally {
+		fx.cleanup();
+	}
+});
+
 test("legion launch refusal is atomic, records budget_refused, and removes run reservation", async () => {
 	const fx = fixture({ maxActiveNodes: 1 });
 	const supervisor = new FakeSupervisor();
