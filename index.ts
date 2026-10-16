@@ -42,6 +42,7 @@ import {
 	loadSubagentSettings,
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
+import { resolveTeamContext } from "./src/agents/context.ts";
 import { createSessionRuntime, renderLiveChildStatus, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
@@ -476,7 +477,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const childRun = store.readRun(input.node.runId);
 	if (!childRun) throw new Error(`child run.json not found: ${input.node.runId}`);
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
-	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: catalog.settings.childContext, parentPath: parentRun.path, legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
+	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
 	orchestrator.restore(parentRun);
 	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
@@ -666,7 +667,11 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		if (Array.isArray(tools) && !tools.includes("subagent") && !tools.includes("vexillatio")) return;
 		if (ctx?.cwd) lastCwd = ctx.cwd;
 		const catalog = loadCatalog(lastCwd, lastCwd, undefined);
-		const parentContext = catalog.settings.parentContext?.trim();
+		const parentContext = resolveTeamContext(
+			"parent",
+			catalog.settings,
+			catalog.team,
+		);
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${PARENT_PLAYBOOK}\n\n${renderParentRoster(
 				catalog.agents,
@@ -1196,7 +1201,7 @@ async function controlAction(input: {
 					runDir: input.store.runDir(found.runId),
 					cwd: input.cwd,
 					maxDepth: input.settings.legion?.maxDepth,
-					childContext: input.settings.childContext,
+					childContext: resolveTeamContext("child", input.settings, input.team),
 					...teamForChildren(input.team),
 					...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: input.store } } : {}),
 					onBudgetRefused: input.onBudgetRefused,
@@ -1257,7 +1262,7 @@ async function controlAction(input: {
 		runDir: store.runDir(found.runId),
 		cwd,
 		maxDepth: input.settings.legion?.maxDepth,
-		childContext: input.settings.childContext,
+		childContext: resolveTeamContext("child", input.settings, input.team),
 		verifyRunner: input.verifyRunner,
 		worktreeBootstrap: input.settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: input.settings.legion?.worktreeBootstrapTimeoutMs,
@@ -1541,7 +1546,7 @@ async function launchFamily(input: {
 		cwd,
 		maxDepth: settings.legion?.maxDepth,
 		maxSpawns: settings.maxSubagentSpawnsPerSession ?? null,
-		childContext: settings.childContext,
+		childContext: resolveTeamContext("child", settings, input.team),
 		verifyRunner: input.verifyRunner,
 		worktreeBootstrap: settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
@@ -2112,7 +2117,7 @@ async function launchUtilityFamily(input: {
 			cwd,
 			maxDepth: catalog.settings.legion?.maxDepth,
 			maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null,
-			childContext: catalog.settings.childContext,
+			childContext: resolveTeamContext("child", catalog.settings, catalog.team),
 			team: catalog.team,
 			onBudgetRefused: input.onBudgetRefused,
 			...(legion ? {

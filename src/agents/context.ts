@@ -1,6 +1,8 @@
 /**
  * Extra prompt context injected by settings: `subagents.parentContext` and
- * `subagents.childContext`.
+ * `subagents.childContext`, plus optional per-team overrides on
+ * `subagents.teams.<name>.parentContext` / `childContext` (see
+ * `resolveTeamContext`).
  *
  * Both keys accept either inline markdown or a file reference in pi's own
  * `@path` form. This exists so machine-specific operating discipline (parallel
@@ -17,6 +19,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { SubagentsSettings } from "../shared/types.ts";
 
 export interface ResolvedContext {
 	/** Final markdown text, or undefined when nothing is configured. */
@@ -115,4 +118,83 @@ export function parseContextSetting(
 	}
 	const joined = parts.filter(Boolean).join("\n\n").trim();
 	return joined || undefined;
+}
+
+export type ContextKind = "parent" | "child";
+
+const CONTEXT_FIELD: Record<ContextKind, "parentContext" | "childContext"> = {
+	parent: "parentContext",
+	child: "childContext",
+};
+
+/**
+ * Resolve parent or child context for the active team.
+ *
+ * Order (each side independent):
+ * 1. If `teams[activeTeam.name]` exists:
+ *    - `false` → no inject (stop; no global fallthrough)
+ *    - string / string[] → team value only (replace global; `@path` via baseDir)
+ *    - omitted → continue
+ * 2. Global `subagents.parentContext` / `childContext` (already resolved at
+ *    settings load, including convention-file fallthrough)
+ *
+ * Unknown team names and the reserved `default` team (no `teams.default`)
+ * skip step 1 and use global only — matching today's behaviour.
+ *
+ * `baseDir` anchors team-level `@path` when the team field still holds a raw
+ * `@path` / array (programmatic TeamConfig). Settings load resolves team
+ * `@path` against the declaring settings file directory.
+ */
+export function resolveTeamContext(
+	kind: ContextKind,
+	settings: SubagentsSettings,
+	activeTeam: { name: string },
+	baseDir?: string,
+): string | undefined {
+	const field = CONTEXT_FIELD[kind];
+	const teams = settings.teams;
+	const teamConfig =
+		teams && Object.hasOwn(teams, activeTeam.name)
+			? teams[activeTeam.name]
+			: undefined;
+
+	if (teamConfig) {
+		const teamValue = teamConfig[field];
+		if (teamValue === false) return undefined;
+		if (teamValue !== undefined) {
+			return resolveTeamContextValue(
+				teamValue,
+				`teams.${activeTeam.name}.${field}`,
+				baseDir,
+			);
+		}
+	}
+
+	const global = settings[field];
+	if (typeof global !== "string") return undefined;
+	const trimmed = global.trim();
+	return trimmed || undefined;
+}
+
+/**
+ * Resolve a team context field.
+ * Settings load pre-resolves `@path` / arrays to a final string (or keeps
+ * `false`). Plain strings are final markdown. Arrays still need `baseDir`
+ * (programmatic TeamConfig in tests).
+ */
+function resolveTeamContextValue(
+	value: string | string[],
+	field: string,
+	baseDir: string | undefined,
+): string | undefined {
+	if (Array.isArray(value)) {
+		if (baseDir === undefined) {
+			throw new Error(
+				`Subagent settings '${field}' is an array; baseDir is required to resolve it.`,
+			);
+		}
+		return parseContextSetting(value, field, baseDir);
+	}
+	const trimmed = value.trim();
+	return trimmed || undefined;
 }

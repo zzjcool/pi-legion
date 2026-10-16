@@ -13,6 +13,7 @@ import {
 	parseContextSetting,
 	readConventionContext,
 	resolveContextValue,
+	resolveTeamContext,
 } from "../../src/agents/context.ts";
 import piLegion from "../../index.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -679,6 +680,258 @@ test("planKindStart keeps a pi task prompt free of the context", () => {
 		});
 		assert.ok(!plan.taskText.includes("pi discipline"));
 	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+
+// ── #171 team-level parent/child context ────────────────────────────────
+
+test("resolveTeamContext: two teams inject different parent copy", () => {
+	const settings = {
+		parentContext: "global parent",
+		teams: {
+			alpha: {
+				members: ["worker"],
+				parentContext: "alpha parent workflow",
+			},
+			beta: {
+				members: ["worker"],
+				parentContext: "beta parent workflow",
+			},
+		},
+	};
+	assert.equal(
+		resolveTeamContext("parent", settings, { name: "alpha" }),
+		"alpha parent workflow",
+	);
+	assert.equal(
+		resolveTeamContext("parent", settings, { name: "beta" }),
+		"beta parent workflow",
+	);
+});
+
+test("resolveTeamContext: omitted team field falls back to global", () => {
+	const settings = {
+		parentContext: "global parent",
+		childContext: "global child",
+		teams: {
+			alpha: { members: ["worker"] },
+		},
+	};
+	assert.equal(
+		resolveTeamContext("parent", settings, { name: "alpha" }),
+		"global parent",
+	);
+	assert.equal(
+		resolveTeamContext("child", settings, { name: "alpha" }),
+		"global child",
+	);
+});
+
+test("resolveTeamContext: team false disables without falling through", () => {
+	const settings = {
+		parentContext: "global parent",
+		childContext: "global child",
+		teams: {
+			quiet: {
+				members: ["worker"],
+				parentContext: false as const,
+				childContext: false as const,
+			},
+		},
+	};
+	assert.equal(
+		resolveTeamContext("parent", settings, { name: "quiet" }),
+		undefined,
+	);
+	assert.equal(
+		resolveTeamContext("child", settings, { name: "quiet" }),
+		undefined,
+	);
+});
+
+test("resolveTeamContext: unknown team and default use global only", () => {
+	const settings = {
+		parentContext: "global parent",
+		teams: {
+			alpha: { members: ["worker"], parentContext: "alpha only" },
+		},
+	};
+	assert.equal(
+		resolveTeamContext("parent", settings, { name: "missing" }),
+		"global parent",
+	);
+	assert.equal(
+		resolveTeamContext("parent", settings, { name: "default" }),
+		"global parent",
+	);
+});
+
+test("resolveTeamContext: sides are independent (false parent, team child)", () => {
+	const settings = {
+		parentContext: "global parent",
+		childContext: "global child",
+		teams: {
+			mixed: {
+				members: ["worker"],
+				parentContext: false as const,
+				childContext: "team child only",
+			},
+		},
+	};
+	assert.equal(
+		resolveTeamContext("parent", settings, { name: "mixed" }),
+		undefined,
+	);
+	assert.equal(
+		resolveTeamContext("child", settings, { name: "mixed" }),
+		"team child only",
+	);
+});
+
+test("settings load resolves team @path relative to the settings file", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "ctx-team-path-"));
+	try {
+		writeFileSync(path.join(dir, "alpha-parent.md"), "alpha from file");
+		writeFileSync(
+			path.join(dir, "settings.json"),
+			JSON.stringify({
+				subagents: {
+					parentContext: "global parent",
+					teams: {
+						alpha: {
+							members: ["worker"],
+							parentContext: "@alpha-parent.md",
+							childContext: "alpha child inline",
+						},
+					},
+				},
+			}),
+		);
+		const settings = loadSubagentSettings({
+			userSettingsPath: path.join(dir, "settings.json"),
+		});
+		assert.equal(settings.teams?.alpha?.parentContext, "alpha from file");
+		assert.equal(settings.teams?.alpha?.childContext, "alpha child inline");
+		assert.equal(
+			resolveTeamContext("parent", settings, { name: "alpha" }),
+			"alpha from file",
+		);
+		assert.equal(
+			resolveTeamContext("parent", settings, { name: "default" }),
+			"global parent",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("settings load: team @path missing is a loud error", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "ctx-team-missing-"));
+	try {
+		writeFileSync(
+			path.join(dir, "settings.json"),
+			JSON.stringify({
+				subagents: {
+					teams: {
+						alpha: {
+							members: ["worker"],
+							parentContext: "@nope.md",
+						},
+					},
+				},
+			}),
+		);
+		assert.throws(
+			() =>
+				loadSubagentSettings({
+					userSettingsPath: path.join(dir, "settings.json"),
+				}),
+			/teams\.alpha\.parentContext.*nope\.md.*cannot be read/,
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("before_agent_start injects team parentContext when PI_SUBAGENTS_TEAM is set", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "ctx-team-inject-"));
+	const agentDir = path.join(dir, "agent");
+	const projectRoot = path.join(dir, "project");
+	mkdirSync(agentDir);
+	mkdirSync(projectRoot);
+	const previous = process.env.PI_SUBAGENTS_TEAM;
+	try {
+		writeFileSync(
+			path.join(agentDir, "settings.json"),
+			JSON.stringify({
+				subagents: {
+					parentContext: "global parent must not win",
+					teams: {
+						fe: {
+							members: ["*"],
+							parentContext: "fe team parent workflow",
+						},
+						be: {
+							members: ["*"],
+							parentContext: "be team parent workflow",
+						},
+					},
+				},
+			}),
+		);
+		process.env.PI_SUBAGENTS_TEAM = "fe";
+		const fePrompt = withRegisteredExtension(agentDir, (events) =>
+			invokeBeforeAgentStart(events, projectRoot),
+		);
+		assert.ok(fePrompt.includes("fe team parent workflow"));
+		assert.ok(!fePrompt.includes("global parent must not win"));
+		assert.ok(!fePrompt.includes("be team parent workflow"));
+
+		process.env.PI_SUBAGENTS_TEAM = "be";
+		const bePrompt = withRegisteredExtension(agentDir, (events) =>
+			invokeBeforeAgentStart(events, projectRoot),
+		);
+		assert.ok(bePrompt.includes("be team parent workflow"));
+		assert.ok(!bePrompt.includes("fe team parent workflow"));
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_TEAM;
+		else process.env.PI_SUBAGENTS_TEAM = previous;
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("before_agent_start: team parentContext false skips global", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "ctx-team-false-inject-"));
+	const agentDir = path.join(dir, "agent");
+	const projectRoot = path.join(dir, "project");
+	mkdirSync(agentDir);
+	mkdirSync(projectRoot);
+	const previous = process.env.PI_SUBAGENTS_TEAM;
+	try {
+		writeFileSync(
+			path.join(agentDir, "settings.json"),
+			JSON.stringify({
+				subagents: {
+					parentContext: "global parent must be skipped",
+					teams: {
+						quiet: {
+							members: ["*"],
+							parentContext: false,
+						},
+					},
+				},
+			}),
+		);
+		process.env.PI_SUBAGENTS_TEAM = "quiet";
+		const systemPrompt = withRegisteredExtension(agentDir, (events) =>
+			invokeBeforeAgentStart(events, projectRoot),
+		);
+		assert.ok(!systemPrompt.includes("global parent must be skipped"));
+	} finally {
+		if (previous === undefined) delete process.env.PI_SUBAGENTS_TEAM;
+		else process.env.PI_SUBAGENTS_TEAM = previous;
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

@@ -296,12 +296,20 @@ per-member overrides. Object member overrides (for example `model` or
 omitted override fields continue to use their normal role/configuration
 values.
 
-See [docs/subagents-teams.md](docs/subagents-teams.md) for four editable
-frontend/backend × premium/value team templates. The model IDs in that template
-are placeholders for your provider, not required defaults. For running a
-multi-agent QA hunting round in this repo, see
-[docs/qa-hunting-round.md](docs/qa-hunting-round.md) (round orchestration)
-and [docs/tui-qa-playbook.md](docs/tui-qa-playbook.md) (evidence rules).
+Teams may also set optional `parentContext` / `childContext` (same value forms
+as the global keys, including `@path` and `false`). When the active team
+defines a side, that value **replaces** the global context for that side — it
+does not merge. Omit the field to fall back to global (or convention files);
+set `false` to disable that side with no fallthrough. Unknown team names keep
+today's warn + full roster behaviour and still use global context.
+
+See [docs/subagents-teams.md](docs/subagents-teams.md) for editable
+frontend/backend team templates with **distinct workflow text** (not only
+different models). The model IDs in that template are placeholders for your
+provider, not required defaults. For running a multi-agent QA hunting round in
+this repo, see [docs/qa-hunting-round.md](docs/qa-hunting-round.md) (round
+orchestration) and [docs/tui-qa-playbook.md](docs/tui-qa-playbook.md)
+(evidence rules).
 
 ### Parent/child context conventions
 
@@ -310,8 +318,11 @@ inline or through `@path` references. If either setting is omitted, Legion
 looks for `subagents-parent-context.md` or `subagents-child-context.md`
 respectively in the directory containing that settings file. These are
 convention-based fallbacks: an explicit setting takes precedence, and setting
-either field to `false` disables its context. The convention filenames are
-`PARENT_CONTEXT_CONVENTION` and `CHILD_CONTEXT_CONVENTION` in
+either field to `false` disables its context. Named teams can override each
+side via `subagents.teams.<name>.parentContext` /
+`childContext` (replace, never merge; see [Team 配置](#team-配置)). The
+convention filenames are `PARENT_CONTEXT_CONVENTION` and
+`CHILD_CONTEXT_CONVENTION` in
 [`src/agents/settings.ts`](src/agents/settings.ts#L30-L31); missing convention
 files simply contribute no context. The repository examples are
 [`examples/subagents-parent-context.md`](examples/subagents-parent-context.md)
