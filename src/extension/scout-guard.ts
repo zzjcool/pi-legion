@@ -49,6 +49,12 @@ export interface ScoutGuardDeps {
 	 */
 	schedule?: (run: () => void) => void;
 	env?: NodeJS.ProcessEnv;
+	/**
+	 * When false, subagent/vexillatio launch is forbidden (session `/legion off`
+	 * or `subagents.enabled: false`). Scout-guard must not nag to dispatch.
+	 * Defaults to always-enabled when omitted.
+	 */
+	subagentsEnabled?: (cwd: string) => boolean;
 }
 
 const READ_HEADS = new Set([
@@ -92,6 +98,11 @@ export function initialScoutGuardState(): ScoutGuardState {
 /** Exact reminder copy. N is the configured threshold. */
 export function scoutGuardReminder(threshold: number): string {
 	return `连续 ${threshold} 次文件类调用且未派发 subagent——若这是侦察工作，请停下来拆 scout（规则：侦察必须并行）。`;
+}
+
+/** One-liner while subagents cannot launch (#182). */
+export function scoutGuardPausedNotice(): string {
+	return "subagent 已禁用，scout-guard 暂停";
 }
 
 export function resolveScoutGuardConfig(
@@ -187,6 +198,8 @@ export function registerScoutGuard(pi: ExtensionAPI, deps: ScoutGuardDeps = {}):
 	const schedule = deps.schedule ?? deferScoutReminder;
 	let sessionEnabled: boolean | undefined;
 	let state = initialScoutGuardState();
+	/** At most one pause notice per continuous subagents-disabled period (#182). */
+	let pausedNoticeSent = false;
 
 	const readConfig = (cwd: string): ResolvedScoutGuardConfig => {
 		try {
@@ -224,9 +237,34 @@ export function registerScoutGuard(pi: ExtensionAPI, deps: ScoutGuardDeps = {}):
 	});
 
 	pi.on("tool_call", (event, ctx) => {
-		const config = readConfig(ctx?.cwd || process.cwd());
+		const cwd = ctx?.cwd || process.cwd();
+		const config = readConfig(cwd);
 		// Disabled is a full bypass: do not count, reset, cool down, or notify.
 		if (!config.enabled) return;
+		// #182: when subagents cannot launch, the "拆 scout" nag is misleading.
+		const canDispatch = deps.subagentsEnabled?.(cwd) ?? true;
+		if (!canDispatch) {
+			if (!pausedNoticeSent) {
+				pausedNoticeSent = true;
+				const content = scoutGuardPausedNotice();
+				schedule(() => {
+					try {
+						pi.sendMessage(
+							{ customType: SCOUT_GUARD_NOTIFY_TYPE, content, display: true },
+							{ triggerTurn: false, deliverAs: "followUp" },
+						);
+					} catch {
+						// Parent session may already be gone.
+					}
+				});
+			}
+			return;
+		}
+		if (pausedNoticeSent) {
+			// Re-enabled: allow a fresh pause notice next time, and start clean.
+			pausedNoticeSent = false;
+			state = initialScoutGuardState();
+		}
 		const kind = classifyScoutToolCall(event.toolName, event.input);
 		const next = stepScoutGuard(state, kind, config, now());
 		state = next.state;
