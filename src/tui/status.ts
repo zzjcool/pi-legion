@@ -277,9 +277,9 @@ function detailBits(entry: StatusEntry, now: number): string[] {
 	if (entry.worktreeBranch) {
 		bits.push(`wt ${formatWorktreeBranch(entry.worktreeBranch)}`);
 	}
-	// Output tok/s over generation time (same definition as railway /legion).
+	// Lifetime avg output tok/s over generationMs (not the header 60s window / live-only nowRate).
 	if (entry.tokensOut && entry.tokensOut > 0 && entry.generationMs && entry.generationMs >= 1_000) {
-		bits.push(`${formatTokensCompact(Math.round(entry.tokensOut / (entry.generationMs / 1_000)))} t/s`);
+		bits.push(`${formatTokensCompact(Math.round(entry.tokensOut / (entry.generationMs / 1_000)))} avg t/s`);
 	}
 	return bits;
 }
@@ -618,13 +618,13 @@ export interface StatusVizSnapshot {
 	nodes: VizNode[];
 	sampler: RateSampler;
 	now: number;
-	/** Header "now" tok/s (live agents only; 0 when none running). */
+	/** Header "now" tok/s (60s window, live nodes only; 0 when none running). */
 	rate: number;
 }
 
 export interface StatusBoard {
 	bind(ctx: StatusUi): void;
-	/** Live data for the /legion view (same sampler and rate definition as the strip). */
+	/** Live data for the /legion view (same sampler; rate is header nowRate). */
 	vizSnapshot?(now?: number): StatusVizSnapshot;
 	paint(entries: StatusEntry[], now: number): void;
 	clear(): void;
