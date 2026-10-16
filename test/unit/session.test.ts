@@ -16,6 +16,8 @@ import {
 	isTransientConnectionFailure,
 	parseSessionFile,
 	parseSessionText,
+	resolveSessionMaxLineBytes,
+	DEFAULT_SESSION_MAX_LINE_BYTES,
 } from "../../src/shared/session.ts";
 import {
 	assistantMsg,
@@ -351,3 +353,14 @@ test("turn timestamps fall back to the ISO entry timestamp, then stay absent", (
 	assert.equal(bare.turns[0]?.startedAt, undefined);
 	assert.equal(bare.turns[0]?.endedAt, undefined);
 });
+
+test("resolveSessionMaxLineBytes: floored value below 1 falls back (#174)", () => {
+	assert.equal(resolveSessionMaxLineBytes({}), DEFAULT_SESSION_MAX_LINE_BYTES);
+	assert.equal(resolveSessionMaxLineBytes({ PI_LEGION_SESSION_MAX_LINE_BYTES: "0.5" }), DEFAULT_SESSION_MAX_LINE_BYTES);
+	assert.equal(resolveSessionMaxLineBytes({ PI_LEGION_SESSION_MAX_LINE_BYTES: "0" }), DEFAULT_SESSION_MAX_LINE_BYTES);
+	assert.equal(resolveSessionMaxLineBytes({ PI_LEGION_SESSION_MAX_LINE_BYTES: "1" }), 1);
+	assert.equal(resolveSessionMaxLineBytes({ PI_LEGION_SESSION_MAX_LINE_BYTES: "1.9" }), 1);
+	assert.equal(resolveSessionMaxLineBytes({ PI_LEGION_SESSION_MAX_LINE_BYTES: "1024.5" }), 1024);
+	assert.equal(resolveSessionMaxLineBytes({ PI_LEGION_SESSION_MAX_LINE_BYTES: "abc" }), DEFAULT_SESSION_MAX_LINE_BYTES);
+});
+
