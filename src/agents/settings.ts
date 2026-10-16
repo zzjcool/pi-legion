@@ -645,6 +645,34 @@ function parseTeamMember(
 	return { agent, ...parseAgentOverride(override, field, filePath) };
 }
 
+
+/** Validate team parentContext/childContext; resolve `@path` against settings dir. */
+function parseTeamContextField(
+	value: unknown,
+	field: string,
+	filePath: string,
+	bad: InvalidTeamSetting,
+): string | false | undefined {
+	if (value === undefined) return undefined;
+	if (value === false) return false;
+	try {
+		const resolved = parseContextSetting(value, field, path.dirname(filePath));
+		// Empty after resolve → treat as omitted (fall through at resolve time).
+		// Callers that want "disable" must use false.
+		return resolved;
+	} catch (error) {
+		// parseContextSetting already builds a clear message; rethrow as-is
+		// except for the shape error which we map to the team field wording.
+		if (
+			error instanceof Error &&
+			error.message.includes("expected a non-empty string")
+		) {
+			bad(field, "expected a non-empty string, string array, or false");
+		}
+		throw error;
+	}
+}
+
 /** Validate the named team map and its ordered member references. */
 function parseTeams(
 	value: unknown,
@@ -670,10 +698,25 @@ function parseTeams(
 		if (raw.description !== undefined && typeof raw.description !== "string") {
 			bad(`${field}.description`, "expected a string");
 		}
-		out[name] = {
+		const team: TeamConfig = {
 			...(raw.description !== undefined ? { description: raw.description } : {}),
 			members,
 		};
+		const parentCtx = parseTeamContextField(
+			raw.parentContext,
+			`${field}.parentContext`,
+			filePath,
+			bad,
+		);
+		if (parentCtx !== undefined) team.parentContext = parentCtx;
+		const childCtx = parseTeamContextField(
+			raw.childContext,
+			`${field}.childContext`,
+			filePath,
+			bad,
+		);
+		if (childCtx !== undefined) team.childContext = childCtx;
+		out[name] = team;
 	}
 	return out;
 }

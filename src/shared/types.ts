@@ -548,6 +548,19 @@ export type TeamMember =
 export interface TeamConfig {
 	description?: string;
 	members: TeamMember[];
+	/**
+	 * Same forms as `subagents.parentContext` (inline / `@path` / array).
+	 * Replaces the global parent context for this team; `false` disables
+	 * parent injection without falling through to global/convention.
+	 * Omitted → fall back to global `subagents.parentContext` (or convention).
+	 */
+	parentContext?: string | string[] | false;
+	/**
+	 * Same forms as `subagents.childContext`. Replaces the global child
+	 * context for this team; `false` disables child injection (no fallthrough).
+	 * Omitted → fall back to global `subagents.childContext` (or convention).
+	 */
+	childContext?: string | string[] | false;
 }
 
 /**
