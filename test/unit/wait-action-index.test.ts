@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { renderWait, stopAction, waitAction } from "../../index.ts";
+import { buildWaitTimeoutDetails, renderWait, stopAction, waitAction, WAIT_PARENT_DECISIONS, WAIT_TIMEOUT_HINT } from "../../index.ts";
 import {
 	createSessionRuntime,
 	type CollectSnapshot,
@@ -228,16 +228,119 @@ test("stopAction: all retires active children sequentially and releases each tar
 test("renderWait: summary line counts done and still-running", () => {
 	const rendered = renderWait([
 		{ name: "a", snapshot: snapshot("A-out") },
-		{ name: "b", stillRunning: true },
+		{ name: "b", stillRunning: true, elapsedMs: 42 },
 		{ name: "c", missing: true },
 	]);
 	assert.match(rendered, /── a ──/);
 	assert.match(rendered, /A-out/);
-	assert.match(rendered, /── b ──\nstill running/);
+	assert.match(rendered, /── b ──\nstill running \(elapsed 42ms\)/);
 	assert.match(rendered, /── c ──\nnot tracked/);
 	assert.match(rendered, /1 done, 1 still running/);
+	assert.match(rendered, /status: still_running/);
+	assert.match(rendered, /decisions: extend, steer_again, stop, force_stop/);
 	const interrupted = renderWait([{ name: "wait", interrupted: true }]);
 	assert.match(interrupted, /── wait ──\ninterrupted \(parent turn ended; children still running\)/);
 	assert.match(interrupted, /0 done, 0 still running/);
 	assert.match(interrupted, /1 interrupted/);
+	assert.doesNotMatch(interrupted, /status:/);
+});
+
+test("buildWaitTimeoutDetails: wait_timeout includes decisions and does not imply stop", () => {
+	const details = buildWaitTimeoutDetails([
+		{ name: "done", snapshot: snapshot("ok") },
+		{ name: "live", stillRunning: true, timedOut: true, elapsedMs: 12_345 },
+	]);
+	assert.ok(details);
+	assert.equal(details!.status, "wait_timeout");
+	assert.equal(details!.done, 1);
+	assert.deepEqual(details!.stillRunning, [{ name: "live", elapsedMs: 12_345 }]);
+	assert.deepEqual(details!.decisions, [...WAIT_PARENT_DECISIONS]);
+	assert.equal(details!.hint, WAIT_TIMEOUT_HINT);
+});
+
+test("buildWaitTimeoutDetails: still_running when no timedOut flag", () => {
+	const details = buildWaitTimeoutDetails([
+		{ name: "live", stillRunning: true, elapsedMs: 100 },
+	]);
+	assert.equal(details?.status, "still_running");
+});
+
+test("buildWaitTimeoutDetails: undefined when nothing still running", () => {
+	assert.equal(
+		buildWaitTimeoutDetails([{ name: "a", snapshot: snapshot("x") }]),
+		undefined,
+	);
+});
+
+test("waitAction: timeout details land in tool details (no auto-stop)", async () => {
+	const base = runtimeWith([{ name: "live", agent: "worker" }]);
+	const runtime: SessionRuntime = {
+		...base,
+		wait: (names) =>
+			Promise.resolve(
+				names.map(
+					(name) =>
+						({
+							name,
+							stillRunning: true,
+							timedOut: true,
+							elapsedMs: 500,
+						}) as WaitResult,
+				),
+			),
+	};
+	const { store, cwd } = tempStore();
+	const res = await waitAction({
+		params: { action: "wait", name: "live", timeoutMs: 50 },
+		runtime,
+		agents: [agent("worker")],
+		store,
+		cwd,
+	});
+	const details = res.details as {
+		status?: string;
+		stillRunning?: Array<{ name: string; elapsedMs: number }>;
+		decisions?: string[];
+		hint?: string;
+	};
+	assert.equal(details.status, "wait_timeout");
+	assert.deepEqual(details.stillRunning, [{ name: "live", elapsedMs: 500 }]);
+	assert.deepEqual(details.decisions, [...WAIT_PARENT_DECISIONS]);
+	assert.equal(details.hint, WAIT_TIMEOUT_HINT);
+	assert.match(text(res), /status: wait_timeout/);
+	assert.match(text(res), /decisions: extend, steer_again, stop, force_stop/);
+	assert.match(text(res), /hint: wait does not stop children/);
+	// Children stay tracked — wait must not retire.
+	assert.ok(runtime.get("live"));
+	base.dispose();
+});
+
+test("stopAction: force:true passes graceful:false to retire", async () => {
+	const runtime = runtimeWith([{ name: "stubborn", agent: "worker" }]);
+	const calls: Array<{ name: string; opts?: { graceful?: boolean } }> = [];
+	const result = await stopAction({
+		params: { name: "stubborn", force: true },
+		runtime,
+		retire: async (name, opts) => {
+			calls.push({ name, opts });
+		},
+	});
+	assert.deepEqual(calls, [{ name: "stubborn", opts: { graceful: false } }]);
+	assert.match(text(result), /force-stopped 1 child: stubborn/);
+	assert.equal(runtime.get("stubborn"), undefined);
+	runtime.dispose();
+});
+
+test("stopAction: omit force keeps graceful default (no graceful:false)", async () => {
+	const runtime = runtimeWith([{ name: "soft", agent: "worker" }]);
+	const calls: Array<{ name: string; opts?: { graceful?: boolean } }> = [];
+	await stopAction({
+		params: { name: "soft" },
+		runtime,
+		retire: async (name, opts) => {
+			calls.push({ name, opts });
+		},
+	});
+	assert.deepEqual(calls, [{ name: "soft", opts: undefined }]);
+	runtime.dispose();
 });

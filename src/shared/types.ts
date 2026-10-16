@@ -252,6 +252,12 @@ export interface Execution {
  */
 export interface RetireOptions {
 	cause?: "session-shutdown";
+	/**
+	 * When false, skip graceful stdin-close and escalate via retire hardening
+	 * (SIGTERM → SIGKILL + descendant sweep). Default / omitted = graceful.
+	 * Used by `subagent({ action: "stop", force: true })` (#179).
+	 */
+	graceful?: boolean;
 }
 
 export interface Usage {

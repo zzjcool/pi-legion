@@ -1141,7 +1141,12 @@ export class Orchestrator {
 		if (opts?.cause === "session-shutdown" && this.supervisor.isAlive(name)) {
 			child.execution = attributeParentSessionShutdown(child.execution ?? deriveOutcome(parsed), parsed);
 		}
-		if (this.supervisor.isAlive(name)) await this.supervisor.retire(name);
+		if (this.supervisor.isAlive(name)) {
+			await this.supervisor.retire(
+				name,
+				opts?.graceful === false ? { graceful: false } : {},
+			);
+		}
 		if (child.nodeId && this.legion) {
 			if (child.execution && child.execution.status !== "unknown" && child.execution.status !== "running") {
 				this.recordSettled(child, child.execution);

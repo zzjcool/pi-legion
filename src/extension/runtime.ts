@@ -300,6 +300,13 @@ export interface WaitResult {
 	snapshot?: CollectSnapshot;
 	/** Still running when the timeout fired. */
 	stillRunning?: boolean;
+	/**
+	 * True when this wait hit its per-child timeout (vs a non-terminal
+	 * collect snapshot). Used by waitAction to label status `wait_timeout`.
+	 */
+	timedOut?: boolean;
+	/** Wall-clock ms since the tracked job was spawned (for parent decide UX). */
+	elapsedMs?: number;
 	/** The parent turn ended while this wait was pending; children still running. */
 	interrupted?: boolean;
 	/** Not tracked live and no finished cache (pre-validated upstream). */
@@ -736,7 +743,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					job.notified = false;
 					runtime.watch(name);
 				}
-				return { name, stillRunning: true };
+				return {
+					name,
+					stillRunning: true,
+					elapsedMs: Math.max(0, now() - job.spawnedAt),
+				};
 			}
 			if (jobs.get(name) === job) {
 				try {
@@ -752,7 +763,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				// The watch is still in flight and shares this collect promise —
 				// restore auto-notify or the result would never surface.
 				job.consumedByTool = false;
-				return { name, stillRunning: true };
+				return {
+					name,
+					stillRunning: true,
+					timedOut: true,
+					elapsedMs: Math.max(0, now() - job.spawnedAt),
+				};
 			}
 			throw error;
 		} finally {
