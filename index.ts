@@ -747,6 +747,8 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				userSettingsPath: path.join(getAgentDir(), "settings.json"),
 				projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
 			}),
+			// #182: suppress "拆 scout" nag while launches are forbidden.
+			subagentsEnabled: (cwd) => subagentsEnabled(cwd),
 		});
 	}
 	// The parent transcript records every finish; the renderer keeps a
