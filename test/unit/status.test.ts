@@ -317,7 +317,7 @@ test("formatWidgetLines shows cumulative tokens and output/generation throughput
 		5_000,
 	);
 	assert.match(lines[0] ?? "", /· 1\.2K tok$/);
-	assert.match(lines[1] ?? "", /· 300 t\/s$/);
+	assert.match(lines[1] ?? "", /· 300 avg t\/s$/);
 });
 
 test("formatWidgetLines t/s uses generationMs not wall clock / finishedAt", () => {
@@ -325,8 +325,8 @@ test("formatWidgetLines t/s uses generationMs not wall clock / finishedAt", () =
 		[{ name: "worker-0", agent: "worker", state: "settled", startedAt: 0, finishedAt: 4_000, tokensTotal: 1_000, tokensOut: 400, generationMs: 2_000 }],
 		5_000,
 	);
-	// 400 out / 2s gen = 200 t/s; old wall formula would be 1000/4s = 250
-	assert.match(lines[1] ?? "", /· 200 t\/s$/);
+	// 400 out / 2s gen = 200 avg t/s; old wall formula would be 1000/4s = 250
+	assert.match(lines[1] ?? "", /· 200 avg t\/s$/);
 });
 
 test("formatWidgetLines omits throughput without generationMs but keeps token headline", () => {
@@ -427,7 +427,7 @@ test("formatWidgetLines computes throughput from output over generationMs", () =
 		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_200, tokensOut: 1_200, generationMs: 1_500 }],
 		5_000,
 	);
-	assert.match(lines[1] ?? "", /· 800 t\/s$/);
+	assert.match(lines[1] ?? "", /· 800 avg t\/s$/);
 });
 
 test("formatWidgetLines includes throughput at exactly one second of generation", () => {
@@ -435,7 +435,7 @@ test("formatWidgetLines includes throughput at exactly one second of generation"
 		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_000, tokensOut: 1_000, generationMs: 1_000 }],
 		5_000,
 	);
-	assert.match(lines[1] ?? "", /· 1K t\/s$/);
+	assert.match(lines[1] ?? "", /· 1K avg t\/s$/);
 });
 
 test("formatWidgetLines shows current-turn elapsed beside the lifetime total", () => {
