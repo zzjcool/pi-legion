@@ -327,7 +327,8 @@ const SESSION_CACHE_MAX_ENTRIES = 64;
 export function resolveSessionMaxLineBytes(env: NodeJS.ProcessEnv = process.env): number {
 	const raw = env[SESSION_MAX_LINE_BYTES_ENV]?.trim();
 	const n = raw ? Number(raw) : NaN;
-	return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_SESSION_MAX_LINE_BYTES;
+	// #174: require floored value >= 1 — (0,1) must not become cap=0.
+	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_SESSION_MAX_LINE_BYTES;
 }
 
 interface SessionParseState {
