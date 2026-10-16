@@ -3,6 +3,8 @@
  *   - `/legion stop` (all) / `/legion stop <name>` — thin wrapper over the
  *     subagent tool's `stop` action (graceful retire; a retired parent's own
  *     session shutdown retires its subtree, so stopping a parent cascades).
+ *   - `/legion stop --force` / `-f` — same targets with `force: true` (hard
+ *     retire; see #179 / StopDeps.force).
  *   - `x` on the selected agent in the /legion view → confirm → stop it.
  * Esc no longer stops children (esc-no-retire-v3); only `/legion stop` or
  * process exit retires. Everything here is pure/injectable for unit tests.
@@ -49,6 +51,18 @@ function jobForNode(node: StopNode, live: readonly StopJob[]): StopJob | undefin
 	return live.find((job) => job.nodeId === node.id) ?? (node.depth <= 1 ? live.find((job) => !job.nodeId && job.name === node.name) : undefined);
 }
 
+/** Strip `--force` / `-f` from `/legion stop` args; remainder is the name|all query. */
+export function parseStopArg(arg: string): { query: string; force: boolean } {
+	const tokens = arg.trim().split(/\s+/).filter(Boolean);
+	let force = false;
+	const rest: string[] = [];
+	for (const token of tokens) {
+		if (token === "--force" || token === "-f") force = true;
+		else rest.push(token);
+	}
+	return { query: rest.join(" "), force };
+}
+
 export function resolveStopTarget(arg: string, jobs: readonly StopJob[], nodes: readonly StopNode[]): StopTarget {
 	const query = arg.trim();
 	if (query === "" || query === "all") return { kind: "all" };
@@ -69,21 +83,32 @@ export function resolveStopTarget(arg: string, jobs: readonly StopJob[], nodes: 
 	return { kind: "notFound", query };
 }
 
-/** Completions for `/legion stop <prefix>`: `all`, live child names, then nested live agents as parent/name. */
+/** Completions for `/legion stop <prefix>`: optional `--force`, `all`, live names, nested parent/name. */
 export function stopCompletions(prefix: string, jobs: readonly StopJob[], nodes: readonly StopNode[]): Array<{ value: string; label: string }> {
+	const { query, force } = parseStopArg(prefix);
+	const flagPrefix = force ? "--force " : "";
 	const live = liveJobs(jobs);
 	const byId = new Map(nodes.map((node) => [node.id, node]));
-	const out: Array<{ value: string; label: string }> = [{ value: "all", label: `all (${live.length} live)` }];
-	for (const job of live) out.push({ value: job.name, label: job.name });
+	const out: Array<{ value: string; label: string }> = [{ value: `${flagPrefix}all`, label: `all (${live.length} live)` }];
+	for (const job of live) out.push({ value: `${flagPrefix}${job.name}`, label: job.name });
 	const seen = new Set(out.map((item) => item.value));
 	for (const node of nodes) {
 		if (node.depth <= 1 || !isLiveNode(node)) continue;
 		const label = nodeLabel(node, byId);
-		if (seen.has(label)) continue;
-		seen.add(label);
-		out.push({ value: label, label: `${label} (nested)` });
+		const value = `${flagPrefix}${label}`;
+		if (seen.has(value)) continue;
+		seen.add(value);
+		out.push({ value, label: `${label} (nested)` });
 	}
-	return out.filter((item) => item.value.startsWith(prefix));
+	const trimmed = prefix.trim();
+	const offerForce =
+		!force && (trimmed === "" || "--force".startsWith(trimmed) || trimmed === "-f" || (trimmed.startsWith("-") && "-f".startsWith(trimmed)));
+	const names = out.filter((item) => {
+		const bare = force ? item.value.slice(flagPrefix.length) : item.value;
+		return bare.startsWith(query);
+	});
+	if (offerForce) names.unshift({ value: "--force", label: "--force (hard retire)" });
+	return names;
 }
 
 export interface StopDeps {
@@ -91,16 +116,16 @@ export interface StopDeps {
 	nodes(): readonly StopNode[];
 	/**
 	 * Retire via the subagent `stop` action; resolves to its summary text.
-	 * Nova follow-up (#179): `/legion stop --force` may pass `force: true`
-	 * (hard retire). Default remains graceful.
+	 * `/legion stop --force` passes `force: true` (hard retire). Default remains graceful.
 	 */
 	stop(params: { name?: string; all?: boolean; force?: boolean }): Promise<{ ok: boolean; text: string }>;
 	notify(message: string, type: "info" | "warning" | "error"): void;
 }
 
-/** `/legion stop [name|all]`. Returns the notified message (for tests). */
+/** `/legion stop [--force|-f] [name|all]`. Returns the notified message (for tests). */
 export async function runLegionStop(arg: string, deps: StopDeps): Promise<string> {
-	const target = resolveStopTarget(arg, deps.jobs(), deps.nodes());
+	const { query, force } = parseStopArg(arg);
+	const target = resolveStopTarget(query, deps.jobs(), deps.nodes());
 	const say = (message: string, type: "info" | "warning" | "error" = "info"): string => {
 		deps.notify(message, type);
 		return message;
@@ -113,10 +138,11 @@ export async function runLegionStop(arg: string, deps: StopDeps): Promise<string
 		return say(`${target.label} is owned by ${target.owner}; stop ${target.owner} to retire it with its subtree (/legion stop ${target.owner}).`, "warning");
 	}
 	if (target.kind === "all" && liveJobs(deps.jobs()).length === 0) return say("Nothing running: no live subagents.");
-	const result = await deps.stop(target.kind === "all" ? { all: true } : { name: target.name });
+	const base = target.kind === "all" ? { all: true as const } : { name: target.name };
+	const result = await deps.stop(force ? { ...base, force: true } : base);
 	return say(result.text, result.ok ? "info" : "error");
 }
 
 /** Dim hint shown in the status strip while children are live (aboveEditor / tree). */
-export const IDLE_STOP_HINT = "/legion stop [name|all]";
+export const IDLE_STOP_HINT = "/legion stop [--force] [name|all]";
 export const IDLE_STOP_HINT_SHORT = "/legion stop";
