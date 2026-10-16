@@ -548,29 +548,52 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 		}
 	}
+	// #37/#38/#40/#181: one best-effort storage sweep per root process.
+	// Deferred 1.5s so interactive first paint is not blocked; unref so a long
+	// idle session can exit. Short --print sessions exit before the timer —
+	// flushHygieneIfPending on session_shutdown still runs the sweep once.
 	let hygieneScheduled = false;
+	let hygieneCompleted = false;
+	let pendingHygiene: { storeRoot: string; timer?: ReturnType<typeof setTimeout>; notify?: (text: string) => void } | undefined;
+	const flushHygieneIfPending = (): void => {
+		if (hygieneCompleted || !pendingHygiene || !hygieneEnabled()) return;
+		hygieneCompleted = true;
+		if (pendingHygiene.timer) {
+			clearTimeout(pendingHygiene.timer);
+			pendingHygiene.timer = undefined;
+		}
+		const { storeRoot, notify } = pendingHygiene;
+		try {
+			const report = runStartupHygiene({ storeRoot, protectRunIds: legionIdentity ? [legionIdentity.rootRunId] : [] });
+			const text = formatHygieneReport(report);
+			if (text) notify?.(text);
+		} catch (error) {
+			console.error(`[pi-legion] storage sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	};
 	pi.on("session_start", (_event, ctx) => {
 		try { initializeLegionRuntime({ cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile() }); }
 		catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
-		// #37/#38/#40: one deferred, best-effort storage sweep per root process.
 		if (!isChild && !hygieneScheduled && hygieneEnabled()) {
 			hygieneScheduled = true;
 			const storeRoot = runStoreFor(ctx.cwd).rootDir;
 			const timer = setTimeout(() => {
-				try {
-					const report = runStartupHygiene({ storeRoot, protectRunIds: legionIdentity ? [legionIdentity.rootRunId] : [] });
-					const text = formatHygieneReport(report);
-					if (text) ctx.ui?.notify?.(text, "info");
-				} catch (error) {
-					console.error(`[pi-legion] storage sweep failed: ${error instanceof Error ? error.message : String(error)}`);
-				}
+				flushHygieneIfPending();
 			}, 1_500);
 			timer.unref?.();
+			pendingHygiene = {
+				storeRoot,
+				timer,
+				notify: (text) => ctx.ui?.notify?.(text, "info"),
+			};
 		}
 	});
 	const pendingUtilityRetires: Array<(opts?: RetireOptions) => Promise<void>> = [];
 	let sessionRuntime: SessionRuntime | undefined;
 	const shutdownRetireAll = async (_event?: unknown, ctx?: { mode?: string }): Promise<void> => {
+		// #181: short --print exits before the deferred timer; flush now so
+		// orphan rpc-child-* dirs still get swept on a clean exit.
+		if (!isChild) flushHygieneIfPending();
 		// pi --print / JSON exits when the parent turn ends. Async children
 		// have only just been spawned; retiring them here aborts the run
 		// before the first model call. Interactive quit still retires immediately.
