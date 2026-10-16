@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
 	IDLE_STOP_HINT,
 	IDLE_STOP_HINT_SHORT,
+	parseStopArg,
 	resolveStopTarget,
 	runLegionStop,
 	stopCompletions,
@@ -44,15 +45,34 @@ test("legion stop: parsing — no arg and `all` stop all; names, ids and parent/
 	assert.deepEqual(resolveStopTarget("scout-9", JOBS, NODES), { kind: "notFound", query: "scout-9" }, "retired children are not targets");
 });
 
-test("legion stop: completion lists all, live children and nested parent/name", () => {
+test("legion stop: completion lists --force, all, live children and nested parent/name", () => {
 	const all = stopCompletions("", JOBS, NODES).map((c) => c.value);
-	assert.deepEqual(all, ["all", "scout-0", "scout-1", "centurion-1", "centurion-1/scout-0"]);
+	assert.deepEqual(all, ["--force", "all", "scout-0", "scout-1", "centurion-1", "centurion-1/scout-0"]);
 	assert.deepEqual(stopCompletions("cen", JOBS, NODES).map((c) => c.value), ["centurion-1", "centurion-1/scout-0"]);
 	assert.match(stopCompletions("a", JOBS, NODES)[0]!.label, /3 live/);
+	assert.deepEqual(stopCompletions("--force", JOBS, NODES).map((c) => c.value), [
+		"--force all",
+		"--force scout-0",
+		"--force scout-1",
+		"--force centurion-1",
+		"--force centurion-1/scout-0",
+	]);
+	assert.deepEqual(stopCompletions("--force sc", JOBS, NODES).map((c) => c.value), [
+		"--force scout-0",
+		"--force scout-1",
+	]);
+	assert.deepEqual(stopCompletions("-f", JOBS, NODES).map((c) => c.value), [
+		"--force all",
+		"--force scout-0",
+		"--force scout-1",
+		"--force centurion-1",
+		"--force centurion-1/scout-0",
+	]);
+	assert.deepEqual(stopCompletions("--fo", JOBS, NODES).map((c) => c.value), ["--force"]);
 });
 
 function deps(jobs = JOBS) {
-	const calls: Array<{ name?: string; all?: boolean }> = [];
+	const calls: Array<{ name?: string; all?: boolean; force?: boolean }> = [];
 	const notes: Array<[string, string]> = [];
 	return {
 		calls,
@@ -60,9 +80,15 @@ function deps(jobs = JOBS) {
 		deps: {
 			jobs: () => jobs,
 			nodes: () => NODES,
-			stop: async (params: { name?: string; all?: boolean }) => {
+			stop: async (params: { name?: string; all?: boolean; force?: boolean }) => {
 				calls.push(params);
-				return { ok: true, text: params.all ? "Stopped 3 children: scout-0, scout-1, centurion-1." : `Stopped 1 child: ${params.name}.` };
+				const mode = params.force ? "force-stopped" : "Stopped";
+				return {
+					ok: true,
+					text: params.all
+						? `${mode} 3 children: scout-0, scout-1, centurion-1.`
+						: `${mode} 1 child: ${params.name}.`,
+				};
 			},
 			notify: (message: string, type: string) => notes.push([message, type]),
 		},
@@ -92,10 +118,37 @@ const T0 = 1_700_000_000_000;
 const vnode = (id: string, opts: Partial<VizNode> = {}): VizNode => ({ id, name: id, role: "scout", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, ...opts });
 const ROOT = vnode("root", { name: "centurion-0", role: "centurion", parentId: null, depth: 0 });
 
+test("legion stop: parseStopArg strips --force/-f anywhere in the arg", () => {
+	assert.deepEqual(parseStopArg(""), { query: "", force: false });
+	assert.deepEqual(parseStopArg("--force"), { query: "", force: true });
+	assert.deepEqual(parseStopArg("-f all"), { query: "all", force: true });
+	assert.deepEqual(parseStopArg("scout-1 --force"), { query: "scout-1", force: true });
+	assert.deepEqual(parseStopArg("--force scout-1"), { query: "scout-1", force: true });
+	assert.deepEqual(parseStopArg("scout-1"), { query: "scout-1", force: false });
+});
+
+test("legion stop: --force passes force:true; omit stays graceful", async () => {
+	let d = deps();
+	assert.match(await runLegionStop("--force scout-1", d.deps), /force-stopped 1 child: scout-1/);
+	assert.deepEqual(d.calls, [{ name: "scout-1", force: true }]);
+	d = deps();
+	await runLegionStop("-f", d.deps);
+	assert.deepEqual(d.calls, [{ all: true, force: true }]);
+	d = deps();
+	await runLegionStop("scout-1 --force", d.deps);
+	assert.deepEqual(d.calls, [{ name: "scout-1", force: true }]);
+	d = deps();
+	await runLegionStop("scout-1", d.deps);
+	assert.deepEqual(d.calls, [{ name: "scout-1" }], "no force key when graceful");
+	d = deps();
+	assert.match(await runLegionStop("--force ghost", d.deps), /No live subagent named "ghost"/);
+	assert.equal(d.calls.length, 0, "force does not bypass notFound");
+});
+
 test("railway: stop hint shows dim on the header, shortens on narrow widths, truncates under squeeze", () => {
 	const nodes = [ROOT, vnode("scout-1")];
 	const wide = renderRailway({ nodes, now: T0 + 60_000, width: 120, rate: 0, hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT })!;
-	assert.match(wide.canvas.toPlain()[0]!, /\/legion stop \[name\|all\]/);
+	assert.match(wide.canvas.toPlain()[0]!, /\/legion stop \[--force\] \[name\|all\]/);
 	const narrow = renderRailway({ nodes, now: T0 + 60_000, width: 50, rate: 0, hint: IDLE_STOP_HINT, hintShort: IDLE_STOP_HINT_SHORT })!;
 	assert.match(narrow.canvas.toPlain()[0]!, / \/legion stop /);
 	assert.doesNotMatch(narrow.canvas.toPlain()[0]!, /name\|all/);
@@ -137,7 +190,7 @@ test("status board: stop hint is persistent while live children exist (no idle g
 		{ name: "scout-1", agent: "scout", state: "running", startedAt: now - 30_000, nodeId: "root.s", parentId: "root", depth: 1 },
 	], now);
 	const comp = factory!({ requestRender() {} }, plain);
-	assert.match(comp.render(120)[0]!, /\/legion stop \[name\|all\]/, "railway: hint while live");
+	assert.match(comp.render(120)[0]!, /\/legion stop \[--force\] \[name\|all\]/, "railway: hint while live");
 	board.clear();
 });
 

@@ -95,8 +95,8 @@ export interface LegionCommandDeps {
 	bus: LegionEventBus;
 	runtime: LegionCommandRuntime;
 	supervisor: RpcEventSource;
-	/** Graceful retire via the subagent `stop` action (see legion-stop.ts). */
-	stop?: (params: { name?: string; all?: boolean }) => Promise<{ ok: boolean; text: string }>;
+	/** Retire via the subagent `stop` action (see legion-stop.ts); pass `force: true` for hard retire. */
+	stop?: (params: { name?: string; all?: boolean; force?: boolean }) => Promise<{ ok: boolean; text: string }>;
 	/**
 	 * Persisted child snapshot used by `subagent({ action: "status" })`.
 	 * Undefined when this process has no run-store record for `name`.
