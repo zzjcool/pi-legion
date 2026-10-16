@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { availableMemoryMb, checkMemoryGate, childMemoryEnv, childNodeOptions, resolveMemoryGateConfig, restoreHostNodeOptions, HOST_NODE_OPTIONS_ENV } from "../../src/supervisor/child-memory.ts";
+import { availableMemoryMb, checkMemoryGate, childMemoryEnv, childNodeOptions, resolveMemoryGateConfig, restoreHostNodeOptions, HOST_NODE_OPTIONS_ENV, MIN_CHILD_MAX_OLD_SPACE_MB } from "../../src/supervisor/child-memory.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 
 test("child NODE_OPTIONS adds semi-space + old-space caps, keeps host options, 0 disables", () => {
@@ -70,3 +70,37 @@ test("supervisor refuses spawn with INSUFFICIENT_MEMORY, notifies, and starts no
 		if (prev === undefined) delete process.env.PI_LEGION_MIN_FREE_MEM_MB; else process.env.PI_LEGION_MIN_FREE_MEM_MB = prev;
 	}
 });
+
+test("OLD_SPACE below usable minimum clamps up; 0 still disables (#175)", () => {
+	assert.match(
+		childNodeOptions({ PI_LEGION_CHILD_MAX_OLD_SPACE_MB: "1", PI_LEGION_CHILD_SEMI_SPACE_MB: "0" })!,
+		new RegExp(`--max-old-space-size=${MIN_CHILD_MAX_OLD_SPACE_MB}`),
+	);
+	assert.match(
+		childNodeOptions({ PI_LEGION_CHILD_MAX_OLD_SPACE_MB: "1.5", PI_LEGION_CHILD_SEMI_SPACE_MB: "0" })!,
+		new RegExp(`--max-old-space-size=${MIN_CHILD_MAX_OLD_SPACE_MB}`),
+	);
+	assert.match(
+		childNodeOptions({ PI_LEGION_CHILD_MAX_OLD_SPACE_MB: "8", PI_LEGION_CHILD_SEMI_SPACE_MB: "0" })!,
+		new RegExp(`--max-old-space-size=${MIN_CHILD_MAX_OLD_SPACE_MB}`),
+	);
+	assert.equal(
+		childNodeOptions({ PI_LEGION_CHILD_MAX_OLD_SPACE_MB: "0", PI_LEGION_CHILD_SEMI_SPACE_MB: "0" }),
+		undefined,
+	);
+	assert.equal(
+		childNodeOptions({ PI_LEGION_CHILD_MAX_OLD_SPACE_MB: "1024", PI_LEGION_CHILD_SEMI_SPACE_MB: "0" }),
+		"--max-old-space-size=1024",
+	);
+	// Fractional below 1 used to floor to 0 (disabled); now clamps to MIN.
+	assert.match(
+		childNodeOptions({ PI_LEGION_CHILD_MAX_OLD_SPACE_MB: "0.5", PI_LEGION_CHILD_SEMI_SPACE_MB: "0" })!,
+		new RegExp(`--max-old-space-size=${MIN_CHILD_MAX_OLD_SPACE_MB}`),
+	);
+	// Semi-space must not inherit the old-space minimum.
+	assert.match(
+		childNodeOptions({ PI_LEGION_CHILD_MAX_OLD_SPACE_MB: "0", PI_LEGION_CHILD_SEMI_SPACE_MB: "1" })!,
+		/--max-semi-space-size=1/,
+	);
+});
+

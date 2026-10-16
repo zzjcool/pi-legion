@@ -25,16 +25,35 @@ export const CHILD_RESERVE_ENV = "PI_LEGION_CHILD_RESERVE_MB";
 /** Measured: an idle child is ~100 MB PSS, a long scout session peaks ~160 MB RSS. */
 export const DEFAULT_CHILD_MAX_OLD_SPACE_MB = 1024;
 export const DEFAULT_CHILD_SEMI_SPACE_MB = 1;
+/**
+ * Empirically: old-space below ~8 MB fails to start on Node v20/v24 (rc 133/134/139).
+ * Clamp positive values up to this floor (#175); `0` remains the disable sentinel.
+ */
+export const MIN_CHILD_MAX_OLD_SPACE_MB = 16;
 /** Floor of free memory that must remain after reserving the new child. */
 export const DEFAULT_MIN_FREE_MEM_MB = 1024;
 /** Per-child reservation for spawns that are still starting up. */
 export const DEFAULT_CHILD_RESERVE_MB = 160;
 
-function envMb(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+function envMb(
+	env: NodeJS.ProcessEnv,
+	key: string,
+	fallback: number,
+	minPositive?: number,
+): number {
 	const raw = env[key]?.trim();
 	if (!raw) return fallback;
 	const n = Number(raw);
-	return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+	if (!Number.isFinite(n) || n < 0) return fallback;
+	if (n === 0) return 0; // 0 = disabled
+	const floored = Math.floor(n);
+	if (minPositive !== undefined && floored < minPositive) {
+		console.error(
+			`[pi-legion] ${key}=${raw} is below the usable minimum ${minPositive} MB; using ${minPositive}.`,
+		);
+		return minPositive;
+	}
+	return floored;
 }
 
 /** Child NODE_OPTIONS: host options + memory flags (each disabled by 0). */
@@ -42,7 +61,12 @@ export function childNodeOptions(env: NodeJS.ProcessEnv = process.env): string |
 	const host = env.NODE_OPTIONS?.trim() ?? "";
 	const flags: string[] = [];
 	const semi = envMb(env, CHILD_SEMI_SPACE_ENV, DEFAULT_CHILD_SEMI_SPACE_MB);
-	const old = envMb(env, CHILD_MAX_OLD_SPACE_ENV, DEFAULT_CHILD_MAX_OLD_SPACE_MB);
+	const old = envMb(
+		env,
+		CHILD_MAX_OLD_SPACE_ENV,
+		DEFAULT_CHILD_MAX_OLD_SPACE_MB,
+		MIN_CHILD_MAX_OLD_SPACE_MB,
+	);
 	if (semi > 0 && !/--max-semi-space-size/.test(host)) flags.push(`--max-semi-space-size=${semi}`);
 	if (old > 0 && !/--max-old-space-size/.test(host)) flags.push(`--max-old-space-size=${old}`);
 	const merged = [host, ...flags].filter(Boolean).join(" ");

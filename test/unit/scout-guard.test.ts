@@ -13,6 +13,7 @@ import {
 	classifyScoutToolCall,
 	registerScoutGuard,
 	resolveScoutGuardConfig,
+	scoutGuardPausedNotice,
 	scoutGuardReminder,
 	stepScoutGuard,
 	initialScoutGuardState,
@@ -256,6 +257,7 @@ function guardPi(input?: {
 	now?: () => number;
 	schedule?: (run: () => void) => void;
 	env?: NodeJS.ProcessEnv;
+	subagentsEnabled?: (cwd: string) => boolean;
 }) {
 	const sent: Array<{ message: SentMessage; options?: SentOptions }> = [];
 	const queued: Array<() => void> = [];
@@ -278,6 +280,7 @@ function guardPi(input?: {
 		now: input?.now ?? (() => 0),
 		schedule: input?.schedule ?? ((run) => queued.push(run)),
 		env: input?.env,
+		subagentsEnabled: input?.subagentsEnabled,
 	});
 	const call = (toolName: string, toolInput?: unknown) =>
 		events.get("tool_call")?.({ toolName, input: toolInput }, { cwd: "/work" });
@@ -578,4 +581,50 @@ test("harness: N read-like calls notify once, dispatch clears the streak, cooldo
 		else process.env.PI_SUBAGENT_UTILITY_CHILD = previous.utility;
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+test("#182: subagents disabled suppresses 拆 scout nag; one pause notice; restores after re-enable", () => {
+	let enabled = false;
+	const guard = guardPi({
+		loadSettings: () => ({ scoutGuard: { threshold: 8, cooldownMs: 120_000 } }),
+		subagentsEnabled: () => enabled,
+	});
+	const read = () => guard.call("read", { path: "f" });
+	for (let i = 0; i < 12; i += 1) read();
+	guard.flush();
+	const reminders = guard.reminders();
+	assert.equal(reminders.length, 1, "exactly one pause notice while disabled");
+	assert.equal(reminders[0]?.message.content, scoutGuardPausedNotice());
+	assert.equal(reminders[0]?.options?.triggerTurn, false);
+	assert.ok(!reminders.some((r) => r.message.content.includes("拆 scout")), "no dispatch nag while disabled");
+
+	// Still disabled: no second pause notice, still no dispatch nag.
+	for (let i = 0; i < 12; i += 1) read();
+	guard.flush();
+	assert.equal(guard.reminders().length, 1);
+
+	// Re-enable: normal threshold/cooldown resume from a clean streak.
+	enabled = true;
+	for (let i = 0; i < 7; i += 1) read();
+	guard.flush();
+	assert.equal(guard.reminders().length, 1, "below threshold after re-enable");
+	read();
+	guard.flush();
+	assert.equal(guard.reminders().length, 2);
+	assert.equal(guard.reminders()[1]?.message.content, REMINDER_8);
+	assert.equal(guard.reminders()[1]?.options?.triggerTurn, true);
+});
+
+test("#182: settings subagents.enabled false via subagentsEnabled also skips dispatch nag", () => {
+	const guard = guardPi({
+		loadSettings: () => ({ scoutGuard: { threshold: 3, cooldownMs: 0 } }),
+		subagentsEnabled: () => false,
+	});
+	guard.call("read", {});
+	guard.call("read", {});
+	guard.call("read", {});
+	guard.call("read", {});
+	guard.flush();
+	assert.equal(guard.reminders().length, 1);
+	assert.equal(guard.reminders()[0]?.message.content, scoutGuardPausedNotice());
 });
