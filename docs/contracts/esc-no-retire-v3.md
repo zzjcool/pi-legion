@@ -33,14 +33,14 @@ interrupted (parent turn ended; children still running)
 
 ### D. TUI 提示
 
-有 live child 时，aboveEditor 状态栏常驻 `/legion stop [name|all]`（短版 `/legion stop`）：railway header 在宽度挤压下可截断摘要以保短 hint；`PI_LEGION_STRIP=tree` 在 header 下另起一行短提示。无 idle 门控。
+有 live child 时，aboveEditor 状态栏常驻 `/legion stop [--force] [name|all]`（短版 `/legion stop`）：railway header 在宽度挤压下可截断摘要以保短 hint；`PI_LEGION_STRIP=tree` 在 header 下另起一行短提示。无 idle 门控。
 
 ## 语义边界
 
 | 动作 | children |
 |---|---|
 | Esc 打断 wait / 父 turn | 继续跑；re-arm watch；settle 通知 |
-| `/legion stop` / `stop` action | graceful retire |
+| `/legion stop` / `stop` action | graceful retire; `--force` / `force:true` → hard retire |
 | 主进程退出 / session_shutdown | drain（print/json）+ retire |
 | SIGINT | 进程退出 → retire |
 

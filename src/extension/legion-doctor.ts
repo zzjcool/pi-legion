@@ -80,7 +80,7 @@ export const LEGION_SLASH_HELP_LINES = [
 	"/legion summary [--all] [<name>]",
 	"/legion timing [--json] [<name>] — wall / generation / other timing for children",
 	"/legion doctor [section]",
-	"/legion stop [name|all]",
+	"/legion stop [--force|-f] [name|all]",
 	"/legion --tree | /legion <node>",
 	"/legion help",
 ] as const;

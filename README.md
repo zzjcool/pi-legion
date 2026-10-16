@@ -166,16 +166,17 @@ controls run graceful `stop` (a stopped parent retires its own subtree on
 shutdown); process exit / session shutdown also retires:
 
 - **`/legion stop`** stops every live subagent; **`/legion stop <name>`** stops
-  one (`all` is an alias for no name). Names complete from the live children;
+  one (`all` is an alias for no name). Add **`--force`** / **`-f`** for hard
+  retire (same as tool `force: true`). Names complete from the live children;
   nested agents complete as `parent/name` and are reported as owned by their
   parent (stop the parent to retire them).
 - **`x`** on the selected live agent in the `/legion` view or its live
-  overlay asks `y` to confirm in place, then stops it.
+  overlay asks `y` to confirm in place, then stops it (graceful; use
+  `/legion stop --force <name>` for hard retire).
 - **Tool**: `subagent({ action: "stop", name })` is graceful; pass
   `force: true` for hard retire (SIGTERM → SIGKILL + descendant sweep per
   `docs/retire-hardening-contract.md`). Example:
   `subagent({ action: "stop", name: "worker-0", force: true })`.
-  TUI `/legion stop --force` is an optional follow-up (same `force: true`).
 
 **`wait` ≠ stop.** A `wait` timeout (or still-running result) does **not**
 retire children. The tool result includes live child names, elapsed ms, and
@@ -183,8 +184,8 @@ suggested decisions (`extend` / `steer_again` / `stop` / `force_stop`); the
 parent chooses the next tool call. See `docs/contracts/wait-not-stop.md`.
 
 While subagents are live, the railway header can show a dim
-`/legion stop [name|all]` hint (shortened on narrow terminals; idle gating /
-tree-strip coverage is a TUI follow-up).
+`/legion stop [--force] [name|all]` hint (shortened on narrow terminals; idle
+gating / tree-strip coverage is a TUI follow-up).
 
 ### Status (`/legion status`)
 
