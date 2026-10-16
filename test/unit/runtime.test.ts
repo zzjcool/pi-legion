@@ -690,7 +690,11 @@ test("runtime.wait: timeout yields stillRunning, resets consumedByTool, auto-not
 	});
 	runtime.watch("slow");
 	const results = await runtime.wait(["slow"], { timeoutMs: 50 });
-	assert.deepEqual(results, [{ name: "slow", stillRunning: true }]);
+	assert.equal(results.length, 1);
+	assert.equal(results[0]?.name, "slow");
+	assert.equal(results[0]?.stillRunning, true);
+	assert.equal(results[0]?.timedOut, true, "timeout path sets timedOut for #179");
+	assert.ok(typeof results[0]?.elapsedMs === "number");
 	assert.equal(runtime.get("slow")?.consumedByTool, false, "timeout resets the flag");
 	// The in-flight watch completes later and the notice is delivered as usual.
 	resolveCollect(joinSnapshot({ output: "finally" }));
@@ -837,7 +841,10 @@ test("runtime.wait: a blocked snapshot yields stillRunning, keeps the job, and r
 	// no watch is in flight it restarts one (fresh collect) instead of
 	// orphaning the child.
 	const results = await runtime.wait(["b"], { timeoutMs: 5_000 });
-	assert.deepEqual(results, [{ name: "b", stillRunning: true }]);
+	assert.equal(results[0]?.name, "b");
+	assert.equal(results[0]?.stillRunning, true);
+	assert.equal(results[0]?.timedOut, undefined, "blocked snapshot is not a wait timeout");
+	assert.ok(typeof results[0]?.elapsedMs === "number");
 	const job = runtime.get("b");
 	assert.ok(job, "job still tracked");
 	assert.equal(job.consumedByTool, false, "consumedByTool reset");
@@ -875,7 +882,10 @@ test("runtime.wait: a non-terminal (running) snapshot keeps the job active and u
 	});
 	// No watch(): the only collect is the one wait() itself shares.
 	const results = await runtime.wait(["r"], { timeoutMs: 5_000 });
-	assert.deepEqual(results, [{ name: "r", stillRunning: true }]);
+	assert.equal(results[0]?.name, "r");
+	assert.equal(results[0]?.stillRunning, true);
+	assert.equal(results[0]?.timedOut, undefined);
+	assert.ok(typeof results[0]?.elapsedMs === "number");
 	const job = runtime.get("r");
 	assert.ok(job, "job still tracked");
 	assert.equal(job.consumedByTool, false, "consumedByTool reset");

@@ -202,6 +202,12 @@ const SubagentParams = Type.Object({
 			description: "wait: per-child timeout in ms; event-driven completion returns early (default: role turnTimeoutMs)",
 		}),
 	),
+	force: Type.Optional(
+		Type.Boolean({
+			description:
+			'stop only: when true, hard-retire via SIGTERM→SIGKILL + descendant sweep (retire hardening). Omit/false = graceful retire. Example: subagent({ action: "stop", name: "worker-0", force: true }).',
+		}),
+	),
 	message: Type.Optional(
 		Type.String({ description: "Text for steer/continue" }),
 	),
@@ -757,12 +763,17 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 
 	// User stop controls (/legion stop, idle Esc, `x` in /legion): a thin wrapper
 	// over the subagent tool's `stop` action — graceful retire of tracked children.
-	const stopChildren = async (params: { name?: string; all?: boolean }): Promise<{ ok: boolean; text: string }> => {
+	// Nova follow-up: `/legion stop --force` can pass `force: true` here (#179).
+	const stopChildren = async (params: {
+		name?: string;
+		all?: boolean;
+		force?: boolean;
+	}): Promise<{ ok: boolean; text: string }> => {
 		const result = await stopAction({
 			params,
 			runtime,
-			retire: async (name) => {
-				await runtime.get(name)?.retire?.();
+			retire: async (name, opts) => {
+				await runtime.get(name)?.retire?.(opts);
 			},
 		});
 		const text = result.content.map((part) => (part.type === "text" ? part.text : "")).join("\n");
@@ -1161,13 +1172,16 @@ async function controlAction(input: {
 	}
 
 	if (action === "stop") {
+		const force = params.force === true;
+		const retireOpts = force ? { graceful: false as const } : undefined;
 		return stopAction({
 			params,
 			runtime: input.runtime,
-			retire: async (name) => {
+			retire: async (name, opts) => {
+				const merged = opts ?? retireOpts;
 				const job = input.runtime.get(name);
 				if (job?.retire) {
-					await job.retire();
+					await job.retire(merged);
 					return;
 				}
 				// A completion watch can retire/release a target after stop snapshots
@@ -1188,7 +1202,7 @@ async function controlAction(input: {
 					onBudgetRefused: input.onBudgetRefused,
 				});
 				orchestrator.restore(found.run);
-				await orchestrator.retire(name);
+				await orchestrator.retire(name, merged);
 				await persistChild(input.store, found.runId, orchestrator, name);
 			},
 		});
@@ -2634,6 +2648,63 @@ export function resolveWaitTargets(
 	};
 }
 
+/** Parent-side decision hints when wait leaves children live (#179). */
+export const WAIT_PARENT_DECISIONS = [
+	"extend",
+	"steer_again",
+	"stop",
+	"force_stop",
+] as const;
+
+export type WaitParentDecision = (typeof WAIT_PARENT_DECISIONS)[number];
+
+export const WAIT_TIMEOUT_HINT =
+	"wait does not stop children; choose stop/force_stop or extend/steer";
+
+export interface WaitStillRunningChild {
+	name: string;
+	elapsedMs: number;
+	budgetMs?: number;
+}
+
+/** Structured wait result when children are still live after wait (#179). */
+export interface WaitTimeoutDetails {
+	status: "wait_timeout" | "budget_exceeded" | "still_running";
+	done: number;
+	stillRunning: WaitStillRunningChild[];
+	decisions: WaitParentDecision[];
+	hint: string;
+}
+
+/** Build parent-decision payload when wait leaves children live. Does not stop them. */
+export function buildWaitTimeoutDetails(
+	results: WaitResult[],
+): WaitTimeoutDetails | undefined {
+	const stillRunning: WaitStillRunningChild[] = [];
+	let timedOut = false;
+	let done = 0;
+	for (const result of results) {
+		if (result.snapshot) {
+			done += 1;
+			continue;
+		}
+		if (!result.stillRunning) continue;
+		if (result.timedOut) timedOut = true;
+		stillRunning.push({
+			name: result.name,
+			elapsedMs: result.elapsedMs ?? 0,
+		});
+	}
+	if (stillRunning.length === 0) return undefined;
+	return {
+		status: timedOut ? "wait_timeout" : "still_running",
+		done,
+		stillRunning,
+		decisions: [...WAIT_PARENT_DECISIONS],
+		hint: WAIT_TIMEOUT_HINT,
+	};
+}
+
 /** Render one wait result, reusing the collect shape for finished children. */
 export function renderWait(results: WaitResult[]): string {
 	let done = 0;
@@ -2646,7 +2717,9 @@ export function renderWait(results: WaitResult[]): string {
 			parts.push(renderCollect(result.name, result.snapshot));
 		} else if (result.stillRunning) {
 			running += 1;
-			parts.push(`── ${result.name} ──\nstill running`);
+			const elapsed =
+				result.elapsedMs !== undefined ? ` (elapsed ${result.elapsedMs}ms)` : "";
+			parts.push(`── ${result.name} ──\nstill running${elapsed}`);
 		} else if (result.interrupted) {
 			interrupted += 1;
 			parts.push(`── ${result.name} ──\ninterrupted (parent turn ended; children still running)`);
@@ -2656,14 +2729,23 @@ export function renderWait(results: WaitResult[]): string {
 	}
 	parts.push(`${done} done, ${running} still running`);
 	if (interrupted > 0) parts.push(`${interrupted} interrupted`);
+	const details = buildWaitTimeoutDetails(results);
+	if (details) {
+		parts.push(`status: ${details.status}`);
+		parts.push(`decisions: ${details.decisions.join(", ")}`);
+		parts.push(`hint: ${details.hint}`);
+	}
 	return parts.join("\n");
 }
 
-/** Gracefully retire a named child or every child tracked by this session. */
+/**
+ * Retire a named child or every child tracked by this session.
+ * `force: true` → hard path (graceful:false / SIGTERM→SIGKILL); omit/false → graceful.
+ */
 export async function stopAction(input: {
-	params: { name?: string; all?: boolean };
+	params: { name?: string; all?: boolean; force?: boolean };
 	runtime: SessionRuntime;
-	retire: (name: string) => Promise<void>;
+	retire: (name: string, opts?: RetireOptions) => Promise<void>;
 }): Promise<AgentToolResult<unknown>> {
 	const { params, runtime, retire } = input;
 	if (params.name && params.all) {
@@ -2672,6 +2754,8 @@ export async function stopAction(input: {
 	if (!params.name && !params.all) {
 		return fail("`name` or `all` is required for stop", ErrorCodes.INVALID_PARAMS);
 	}
+	const force = params.force === true;
+	const retireOpts: RetireOptions | undefined = force ? { graceful: false } : undefined;
 	const jobs = runtime.activeJobs();
 	const active = jobs.filter((job) => job.state !== "retired");
 	let targets: string[];
@@ -2696,18 +2780,19 @@ export async function stopAction(input: {
 		try {
 			// The runtime job may have been released after the target snapshot was
 			// taken. The retire adapter can then resolve its persisted run record.
-			await retire(name);
+			await retire(name, retireOpts);
 			runtime.release(name);
 			stopped.push(name);
 		} catch (error) {
-			// If the graceful-retire chain fails, restore the completion watcher so a
+			// If the retire chain fails, restore the completion watcher so a
 			// still-live child is not orphaned by the explicit stop attempt.
 			if (runtime.get(name)) runtime.rewatch(name);
 			failures.push(`${name}: ${String(error)}`);
 		}
 	}
+	const mode = force ? "force-stopped" : "Stopped";
 	const summary = stopped.length
-		? `Stopped ${stopped.length} child${stopped.length === 1 ? "" : "ren"}: ${stopped.join(", ")}.`
+		? `${mode} ${stopped.length} child${stopped.length === 1 ? "" : "ren"}: ${stopped.join(", ")}.`
 		: "No children were stopped.";
 	return failures.length
 		? fail(`${summary}\nFailed to stop: ${failures.join("; ")}`, ErrorCodes.RETIRE_FAILED)
@@ -2759,7 +2844,11 @@ export async function waitAction(input: {
 			}),
 		);
 	const results = await runtime.wait(targets.names, { timeoutMs, ...(signal ? { signal } : {}) });
-	return ok(renderWait(results));
+	const text = renderWait(results);
+	const details = buildWaitTimeoutDetails(results);
+	return details
+		? { content: [{ type: "text", text }], details }
+		: ok(text);
 }
 
 export function renderAgentList(
