@@ -287,7 +287,10 @@ values.
 
 See [docs/subagents-teams.md](docs/subagents-teams.md) for four editable
 frontend/backend × premium/value team templates. The model IDs in that template
-are placeholders for your provider, not required defaults.
+are placeholders for your provider, not required defaults. For running a
+multi-agent QA hunting round in this repo, see
+[docs/qa-hunting-round.md](docs/qa-hunting-round.md) (round orchestration)
+and [docs/tui-qa-playbook.md](docs/tui-qa-playbook.md) (evidence rules).
 
 ### Parent/child context conventions
 

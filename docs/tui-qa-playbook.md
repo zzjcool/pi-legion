@@ -2,7 +2,7 @@
 
 > **给谁看**：任何要在本仓库做「视觉/交互验证」的 agent 或人。读完即可执行。
 >
-> **为什么有这份文档**：`CONTRIBUTING.md` 只覆盖 `typecheck` / `test` / `test:docker`，而本仓库有冻结的 TUI 契约（`docs/tui-viewer-contract.md`），其验收项（T1 渲染对齐主上下文、T5 follow-end、T12 流式去重）本质是**渲染与交互**断言，无法用普通单测覆盖。本手册补上这一段：如何在容器里跑真实 TUI、如何截图取证、如何造确定性复现、如何把发现变成 issue。
+> **为什么有这份文档**：`CONTRIBUTING.md` 只覆盖 `typecheck` / `test` / `test:docker`，而本仓库有冻结的 TUI 契约（`docs/tui-viewer-contract.md`），其验收项（T1 渲染对齐主上下文、T5 follow-end、T12 流式去重）本质是**渲染与交互**断言，无法用普通单测覆盖。本手册补上这一段：如何在容器里跑真实 TUI、如何截图取证、如何造确定性复现、如何把发现变成 issue。多 agent 整轮狩猎的编排见 `docs/qa-hunting-round.md`。
 
 ---
 

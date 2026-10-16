@@ -11,6 +11,12 @@ node_modules/
 *.log
 .DS_Store
 
+# local pi settings/credentials (contains auth.json — never commit)
+.pi/
+
+# QA hunting round evidence (repros are inlined in the issues)
+.qa-hunt/
+
 # transient agent handoff notes (not part of the package)
 STATE.md
 

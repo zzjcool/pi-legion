@@ -6,8 +6,13 @@ FROM node:24-slim
 
 # tmux 驱动 TUI；python3+PIL 渲染 ANSI 帧；fonts-noto-cjk 保证 CJK 不渲染成方框
 # （playbook §1.4：CJK 缺字会掩盖宽度/溢出缺陷本身）。
+# ripgrep/fd-find：pi 会话启动会 shell 出去找 rg/fd，两个都没有就每次从 GitHub
+# 下载静态二进制到 ~/.pi/agent/bin（容器层，重建即丢 + 起手 10s 网络抖动）。
+# getToolPath() 会退回 PATH 且认 `fdfind` 别名，Debian 包直接满足。
 RUN apt-get update && apt-get install -y --no-install-recommends \
       tmux python3 python3-pil fonts-noto-cjk curl ca-certificates \
+      ripgrep fd-find \
+    && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
 # 全局安装 pi coding agent（TUI 被测对象）。版本可用 build-arg 固定。
