@@ -89,8 +89,12 @@ export function stopCompletions(prefix: string, jobs: readonly StopJob[], nodes:
 export interface StopDeps {
 	jobs(): readonly StopJob[];
 	nodes(): readonly StopNode[];
-	/** Graceful retire via the subagent `stop` action; resolves to its summary text. */
-	stop(params: { name?: string; all?: boolean }): Promise<{ ok: boolean; text: string }>;
+	/**
+	 * Retire via the subagent `stop` action; resolves to its summary text.
+	 * Nova follow-up (#179): `/legion stop --force` may pass `force: true`
+	 * (hard retire). Default remains graceful.
+	 */
+	stop(params: { name?: string; all?: boolean; force?: boolean }): Promise<{ ok: boolean; text: string }>;
 	notify(message: string, type: "info" | "warning" | "error"): void;
 }
 

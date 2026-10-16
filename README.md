@@ -109,7 +109,8 @@ child's result in the same print turn, call `wait` or `collect` before the
 turn ends, or launch with `async: false`. To stop children explicitly, use
 `subagent({ action: "stop", name: "worker-0" })` or
 `subagent({ action: "stop", all: true })`; this runs the normal graceful-retire
-sequence for each selected child.
+sequence for each selected child. Pass `force: true` to escalate to hard retire
+when a child ignores soft steer / graceful close.
 
 ### Stopping async subagents yourself
 
@@ -123,6 +124,16 @@ shutdown); process exit / session shutdown also retires:
   parent (stop the parent to retire them).
 - **`x`** on the selected live agent in the `/legion` view or its live
   overlay asks `y` to confirm in place, then stops it.
+- **Tool**: `subagent({ action: "stop", name })` is graceful; pass
+  `force: true` for hard retire (SIGTERM → SIGKILL + descendant sweep per
+  `docs/retire-hardening-contract.md`). Example:
+  `subagent({ action: "stop", name: "worker-0", force: true })`.
+  TUI `/legion stop --force` is an optional follow-up (same `force: true`).
+
+**`wait` ≠ stop.** A `wait` timeout (or still-running result) does **not**
+retire children. The tool result includes live child names, elapsed ms, and
+suggested decisions (`extend` / `steer_again` / `stop` / `force_stop`); the
+parent chooses the next tool call. See `docs/contracts/wait-not-stop.md`.
 
 While subagents are live, the railway header can show a dim
 `/legion stop [name|all]` hint (shortened on narrow terminals; idle gating /
