@@ -18,6 +18,7 @@ import {
 	contextKindLabel,
 	createLiveOverlay,
 	resolveModalLayout,
+	resolveModalOverlayOptions,
 	type LiveOverlayEvent,
 	type LiveOverlayListener,
 	type LiveOverlayNode,
@@ -1016,7 +1017,7 @@ test("contextKindLabel marks root as 主 and children as 子", () => {
 	assert.equal(contextKindLabel(undefined, "root"), "主");
 });
 
-test("live overlay paints a floating modal: dim mask, title with 主/子, Esc close; Esc does not stop", () => {
+test("live overlay paints a floating modal: title with 主/子, Esc close; Esc does not stop", () => {
 	const source = new FakeOverlaySource();
 	const stopped: string[] = [];
 	const component = createLiveOverlay(source).open("root.worker", {
@@ -1026,15 +1027,20 @@ test("live overlay paints a floating modal: dim mask, title with 主/子, Esc cl
 	});
 	try {
 		const rendered = component.render(80);
-		assert.equal(rendered.length, 24, "modal fills the terminal with mask + frame");
+		// #193: the component paints the frame rect only. Painting a full-terminal
+		// mask is impossible to make transparent — pi-tui drops every base cell in
+		// the overlay rectangle — so the surrounding screen is left to the host.
+		assert.equal(rendered.length, resolveModalLayout(24, 80).frameRows, "modal renders the frame rect only");
 		const plain = rendered.map((line) => stripTerminalSequences(line));
 		assert.match(plain.join("\n"), /● worker · 子/);
 		assert.match(plain.join("\n"), /Esc/);
 		assert.match(plain.join("\n"), /┏|┃|┗/);
 		assert.ok(plain.some((line) => line.includes("┃")), "vertical modal borders present");
+		assert.ok(
+			plain.every((line) => line.startsWith("┏") || line.startsWith("┃") || line.startsWith("┗")),
+			"every painted row is frame chrome — no mask cells of its own",
+		);
 		const layout = resolveModalLayout(24, 80);
-		assert.ok(layout.marginY > 0, "ratio layout leaves a top dim mask");
-		assert.equal(plain[0], " ".repeat(80), "top row is dim mask (spaces)");
 		// Meta band sits below the body (role / model / turn / elapsed / status).
 		assert.ok(layout.metaRow !== null && layout.showMeta);
 		assert.match(plain[layout.metaRow!] ?? "", /worker · test\/model · turn 0 · 4s · running/);
@@ -1050,20 +1056,28 @@ test("live overlay paints a floating modal: dim mask, title with 主/子, Esc cl
 test("resolveModalLayout caps frame by window ratio and keeps meta below the body", () => {
 	const large = resolveModalLayout(50, 160);
 	assert.equal(large.frameRows, Math.floor(50 * 0.65));
-	assert.equal(large.innerWidth + 2, Math.floor(160 * 0.75));
-	assert.ok(large.marginY >= 8, "large terminal leaves a clear vertical mask");
-	assert.ok(large.marginX >= 18, "large terminal leaves a clear horizontal mask");
+	assert.equal(large.innerWidth + 2, 160, "frame-local width fills the overlay rect it is mounted at");
+	assert.equal(large.marginY, 0, "frame-local layout has no host mask margins to paint");
+	assert.equal(large.marginX, 0);
 	assert.equal(large.showMeta, true);
 	assert.ok(large.metaRow !== null);
 	assert.ok(large.metaRow! > large.bodyStartRow);
 	assert.equal(large.footerRow, large.metaRow! + 1);
 	assert.ok(large.frameRows < large.rows, "frame is shorter than the terminal");
-	assert.ok(large.innerWidth + 2 < large.cols, "frame is narrower than the terminal");
+
+	// The host overlay geometry is a percentage of the terminal, so pi-tui
+	// re-derives it on every frame and the frame survives a resize (absolute cells
+	// would freeze at open-time size and truncate the bottom border). Height is
+	// left unset: the component renders exactly the frame rows, so its own height
+	// is the rect — a cap would disagree with the minimum frame height on small
+	// terminals and cut the border off.
+	const overlay = resolveModalOverlayOptions();
+	assert.equal(overlay.width, "75%", "overlay width tracks the frame ratio");
+	assert.equal(overlay.maxHeight, undefined, "height comes from the component's own frame rows");
+	assert.equal(overlay.anchor, "center");
 
 	const small = resolveModalLayout(24, 80);
 	assert.equal(small.frameRows, Math.floor(24 * 0.65));
-	assert.equal(small.innerWidth + 2, Math.floor(80 * 0.75));
-	assert.ok(small.marginY > 0 && small.marginX > 0);
 
 	const tiny = resolveModalLayout(4, 80);
 	assert.equal(tiny.frameRows, 4, "tiny terminals still fill height so body stays usable");
@@ -1071,7 +1085,7 @@ test("resolveModalLayout caps frame by window ratio and keeps meta below the bod
 	assert.equal(tiny.showMeta, true);
 });
 
-test("clicking the dim mask or Esc hint closes the modal without stopping", () => {
+test("clicking the Esc hint closes the modal without stopping; clicks outside the frame never reach it", async () => {
 	const source = new FakeOverlaySource();
 	const stopped: string[] = [];
 	const component = createLiveOverlay(source).open("root.worker", {
@@ -1082,22 +1096,15 @@ test("clicking the dim mask or Esc hint closes the modal without stopping", () =
 	try {
 		component.render(80);
 		const layout = resolveModalLayout(24, 80);
-		const maskClick = component.handleMouse?.({
-			type: "click",
-			button: "left",
-			x: 0,
-			y: 0,
-			screenX: 0,
-			screenY: 0,
-			width: 80,
-			height: 24,
-			shift: false,
-			alt: false,
-			ctrl: false,
-		});
-		assert.equal(maskClick?.handled, true);
-		assert.equal(component.getState().open, false);
-		assert.equal(stopped.length, 0);
+		// #193: the overlay covers the frame rect only, so pi-tui never dispatches
+		// outside clicks to this component — they land on the host chat / /legion
+		// view that stays visible behind the frame. Prove it by dispatching a click
+		// through the real compositor at a coordinate outside the frame.
+		const { assertOutsideClickReachesHost } = await import("../helpers/modal-composite.ts");
+		const outside = assertOutsideClickReachesHost({ rows: 24, cols: 80 });
+		assert.equal(outside.componentGotClick, false, "click outside the frame is not delivered to the modal");
+		assert.equal(outside.modalStillOpen, true, "outside click does not dismiss the modal");
+		assert.equal(outside.hostHandledClick, true, "the click reached the host underlay instead");
 
 		const again = createLiveOverlay(source).open("root.worker", {
 			terminalRows: 24,
@@ -1123,6 +1130,50 @@ test("clicking the dim mask or Esc hint closes the modal without stopping", () =
 		assert.equal(stopped.length, 0, "close-hint click does not stop the agent");
 	} finally {
 		component.dispose();
+	}
+});
+
+// #193 regression: drive the REAL pi-tui overlay compositor, because the bug is
+// invisible at component level — it lives in how pi-tui replaces base cells.
+// Kept in a dedicated file: it needs a TUI instance and a fake terminal.
+// #193 regression: drive the REAL pi-tui overlay compositor, because the bug is
+// invisible at component level — it lives in how pi-tui replaces base cells.
+//
+// The assertion is deliberately absolute (wipedRows === 0), NOT
+// `visibleRows >= totalRows - frameRows`: that threshold is derived from the code
+// under test, so the pre-fix full-screen geometry also satisfies it (9/24 visible,
+// threshold 9) and the regression would pass. Only on sizes where the frame is
+// actually inset from the terminal does "nothing wiped" hold; where the layout
+// intentionally fills the screen (tiny terminals) we assert that instead.
+test("the open modal leaves the host underlay visible (real pi-tui composite)", async () => {
+	const { assertUnderlayVisible } = await import("../helpers/modal-composite.ts");
+	for (const [rows, cols] of [[24, 80], [50, 160], [40, 120]] as const) {
+		const result = assertUnderlayVisible({ rows, cols });
+		assert.ok(result.frameInset, `${cols}x${rows}: frame must be inset from the terminal`);
+		assert.equal(
+			result.wipedRows,
+			0,
+			`${cols}x${rows}: host underlay must survive untouched (frame ${result.frameRows}x${result.frameCols}, wiped ${result.wipedRows})`,
+		);
+	}
+});
+
+test("the modal frame survives a terminal resize (geometry is re-derived)", async () => {
+	const { assertUnderlayVisibleAfterResize } = await import("../helpers/modal-composite.ts");
+	for (const [from, to] of [
+		[{ rows: 24, cols: 80 }, { rows: 50, cols: 160 }],
+		[{ rows: 24, cols: 80 }, { rows: 12, cols: 40 }],
+		[{ rows: 50, cols: 160 }, { rows: 24, cols: 80 }],
+	] as const) {
+		const result = assertUnderlayVisibleAfterResize(from, to);
+		assert.equal(
+			result.bounds.height,
+			result.componentRows,
+			`${from.cols}x${from.rows} -> ${to.cols}x${to.rows}: overlay rect must match the rendered frame ` +
+				`(rect ${result.bounds.height} vs rendered ${result.componentRows}) — absolute geometry freezes at open size`,
+		);
+		assert.ok(result.bottomBorder, `${from.cols}x${from.rows} -> ${to.cols}x${to.rows}: bottom border must survive the resize`);
+		assert.ok(result.footerHint, `${from.cols}x${from.rows} -> ${to.cols}x${to.rows}: Esc footer hint must survive the resize`);
 	}
 });
 

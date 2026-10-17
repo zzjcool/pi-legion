@@ -8,6 +8,8 @@ import {
 	visibleWidth,
 	type Component,
 	type OverlayHandle,
+	type OverlayOptions,
+	type SizeValue,
 	type TUI,
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
@@ -152,19 +154,57 @@ const TOOL_COLLAPSED_PREVIEW_LINES = 10;
 const BACKFILL_POLL_INTERVAL_MS = 250;
 /**
  * #157: Cap the floating context modal by terminal ratio so large transcripts do
- * not stretch the shell near-fullscreen. Content scrolls inside the body; the
- * dim mask around the frame keeps the host chat / /legion underlay visible.
+ * not stretch the shell near-fullscreen. Content scrolls inside the body.
  * Tuned on 80×24 + 160×50 dumps (≈75% × ≈65% feels clearly smaller than full
  * screen without feeling cramped). Floor sizes kick in on mid terminals; on
  * very small terminals we still fill the screen so body remains usable.
+ *
+ * #193: the surrounding area is NOT painted by the viewer. pi-tui's overlay
+ * compositor discards every base cell inside the overlay rectangle (there is no
+ * transparency option in `OverlayOptions`), so any mask this component paints is
+ * opaque by construction. The host underlay (chat / /legion) stays visible only
+ * because the overlay is anchored to the frame rect alone — see
+ * `resolveModalOverlayOptions()`.
  */
 const MODAL_MAX_WIDTH_RATIO = 0.75;
 const MODAL_MAX_HEIGHT_RATIO = 0.65;
-/** Prefer at least this frame width once the terminal itself is wide enough. */
-const MODAL_MIN_FRAME_COLS = 40;
 /** Prefer at least this frame height once the terminal itself is tall enough. */
 const MODAL_MIN_FRAME_ROWS = 8;
 const MODAL_CLOSE_HINT = "Esc";
+
+/**
+ * Host overlay geometry for the floating frame: cover the frame rect only.
+ *
+ * pi-tui composites an overlay by replacing every base cell inside its
+ * rectangle, and `OverlayOptions` has no transparency mechanism. A full-screen
+ * overlay therefore hides the host chat / /legion underlay completely, and
+ * because the viewer's mask cells are spaces with no background of their own,
+ * the wiped area renders as the terminal's default background — the "black
+ * modal" bug (#193). Anchoring the overlay to the frame rect instead leaves
+ * every cell outside the frame to the host, which paints it.
+ *
+ * The frame is centered horizontally and vertically by the host (`anchor:
+ * "center"`); this module only declares what fraction of the terminal the
+ * frame should occupy.
+ */
+export function resolveModalOverlayOptions(): {
+	width: SizeValue;
+	anchor: "center";
+} & OverlayOptions {
+	// Percentages, not absolute cells: pi resolves `overlayOptions()` once when the
+	// overlay is shown, so absolute numbers freeze at the open-time terminal size and
+	// the frame gets truncated on resize (bottom border and footer disappear).
+	// pi-tui re-derives percentages from the current terminal every frame.
+	//
+	// No `maxHeight`: the component renders exactly the frame rows for whatever
+	// width it is given, so its own height is already the right rect height. A
+	// percentage cap would disagree with it on small terminals (the layout has a
+	// minimum frame height), cutting the bottom border off.
+	return {
+		width: `${MODAL_MAX_WIDTH_RATIO * 100}%`,
+		anchor: "center",
+	};
+}
 
 /**
  * Build an on-demand context-viewer controller. Calling `open` subscribes to
@@ -811,7 +851,7 @@ function createSession(
 			const visible = lastBodyLines.slice(start, end);
 			while (visible.length < layout.bodyRows) visible.push("");
 			const footerHint = layout.showMeta
-				? "↑↓ scroll · Esc close · click mask to dismiss"
+				? "↑↓ scroll · Esc close"
 				// Tiny terminals collapse the dedicated meta row into the bottom chrome.
 				: `${metaPlain()} · ↑↓ · Esc`;
 			return paintModalFrame({
@@ -870,16 +910,16 @@ function createSession(
 			const layout = layoutFor(terminalWidth);
 			contentWidth = layout.innerWidth;
 			if (event.type === "wheel" && event.wheelDelta) {
-				// Wheel anywhere over the overlay scrolls the modal body (mask included).
+				// Wheel over the frame scrolls the modal body.
 				scrollBy(event.wheelDelta);
 				return { handled: true };
 			}
 			lastBodyLines = renderBody(contentWidth);
 			clampScroll(lastBodyLines);
 			const hit = hitTestModal(layout, event.x, event.y);
-			if (hit.zone === "mask" || hit.zone === "close") {
+			if (hit.zone === "close") {
 				if (event.type === "click" && event.button === "left") {
-					// Esc / mask / close: dismiss only — never retire or stop (esc-no-retire-v3).
+					// Esc / close hint: dismiss only — never retire or stop (esc-no-retire-v3).
 					close();
 					return { handled: true };
 				}
@@ -985,44 +1025,49 @@ export interface ModalLayout {
 	frameCol: number;
 	/** Whether a dedicated meta row is painted below the body. */
 	showMeta: boolean;
-	/** Absolute screen x range of the Esc close hint in the title bar. */
+	/**
+	 * x range of the Esc close hint in the title bar, RELATIVE to the frame rect
+	 * (pi-tui hands the component `screenX - layout.col`, not the screen column).
+	 */
 	closeColStart: number;
 	closeColEnd: number;
 }
 
+/**
+ * Layout of the floating frame. All row/col values are relative to the frame
+ * rect the component is mounted at (#193): the host sizes that rect
+ * (`resolveModalOverlayOptions()`) and centers it, and the component paints
+ * nothing outside it, so the host chat / /legion underlay stays visible.
+ *
+ * `rows` is the terminal height (used for the height ratio); `cols` is the
+ * frame rect width handed to `render()`.
+ */
 export function resolveModalLayout(rows: number, cols: number): ModalLayout {
 	const safeRows = Math.max(1, Math.floor(rows));
 	const safeCols = Math.max(1, Math.floor(cols));
-	const ratioCols = Math.max(1, Math.floor(safeCols * MODAL_MAX_WIDTH_RATIO));
 	const ratioRows = Math.max(1, Math.floor(safeRows * MODAL_MAX_HEIGHT_RATIO));
-	// Small terminals: fill the screen so the body stays usable. Otherwise cap by ratio
-	// (and a modest floor) so the shell stays clearly smaller than the host window.
-	const frameCols = safeCols < MODAL_MIN_FRAME_COLS
-		? safeCols
-		: Math.min(safeCols, Math.max(MODAL_MIN_FRAME_COLS, ratioCols));
+	// Small terminals: fill the screen so the body stays usable. Otherwise cap by
+	// ratio (and a modest floor) so the shell stays clearly smaller than the host.
 	const frameRows = safeRows < MODAL_MIN_FRAME_ROWS
 		? safeRows
 		: Math.min(safeRows, Math.max(MODAL_MIN_FRAME_ROWS, ratioRows));
-	const marginX = Math.max(0, Math.floor((safeCols - frameCols) / 2));
-	const marginY = Math.max(0, Math.floor((safeRows - frameRows) / 2));
 	// Need title + ≥1 body + meta + footer (=4) for a dedicated meta band.
 	const showMeta = frameRows >= 4;
 	const chromeInside = 2 + (showMeta ? 1 : 0); // title + optional meta + footer
 	const bodyRows = Math.max(1, frameRows - chromeInside);
-	const frameCol = marginX;
-	const innerWidth = Math.max(1, frameCols - 2);
-	const titleRow = marginY;
-	const bodyStartRow = marginY + 1;
+	const innerWidth = Math.max(1, safeCols - 2);
+	const titleRow = 0;
+	const bodyStartRow = 1;
 	const metaRow = showMeta ? bodyStartRow + bodyRows : null;
 	const footerRow = showMeta ? metaRow! + 1 : bodyStartRow + bodyRows;
 	const closeWidth = visibleWidth(` ${MODAL_CLOSE_HINT} `);
-	const closeColEnd = frameCol + 1 + innerWidth;
-	const closeColStart = Math.max(frameCol + 1, closeColEnd - closeWidth);
+	const closeColEnd = 1 + innerWidth;
+	const closeColStart = Math.max(1, closeColEnd - closeWidth);
 	return {
 		rows: safeRows,
 		cols: safeCols,
-		marginY,
-		marginX,
+		marginY: 0,
+		marginX: 0,
 		titleRow,
 		bodyStartRow,
 		metaRow,
@@ -1030,37 +1075,34 @@ export function resolveModalLayout(rows: number, cols: number): ModalLayout {
 		bodyRows,
 		innerWidth,
 		frameRows,
-		frameCol,
+		frameCol: 0,
 		showMeta,
 		closeColStart,
 		closeColEnd,
 	};
 }
 
-type ModalHitZone = "mask" | "close" | "title" | "body" | "meta" | "footer";
+type ModalHitZone = "close" | "title" | "body" | "meta" | "footer";
 
 function hitTestModal(
 	layout: ModalLayout,
 	x: number,
 	y: number,
 ): { zone: ModalHitZone; bodyX?: number; bodyY?: number } {
-	const frameBottom = layout.marginY + layout.frameRows;
-	if (y < layout.marginY || y >= frameBottom) return { zone: "mask" };
-	if (x < layout.frameCol || x >= layout.frameCol + layout.innerWidth + 2) return { zone: "mask" };
+	// x/y are relative to the frame rect (#193): pi-tui dispatches
+	// `screenX - layout.col`, and never dispatches outside the rect at all, so
+	// there is no mask zone to hit-test.
 	if (y === layout.titleRow) {
 		if (x >= layout.closeColStart && x < layout.closeColEnd) return { zone: "close" };
 		return { zone: "title" };
 	}
 	if (layout.metaRow !== null && y === layout.metaRow) return { zone: "meta" };
 	if (y === layout.footerRow) return { zone: "footer" };
-	if (y >= layout.bodyStartRow && y < layout.bodyStartRow + layout.bodyRows) {
-		return {
-			zone: "body",
-			bodyX: Math.max(0, x - (layout.frameCol + 1)),
-			bodyY: y - layout.bodyStartRow,
-		};
-	}
-	return { zone: "mask" };
+	return {
+		zone: "body",
+		bodyX: Math.max(0, x - 1),
+		bodyY: y - layout.bodyStartRow,
+	};
 }
 
 function padToInner(line: string, innerWidth: number): string {
@@ -1082,29 +1124,24 @@ function paintModalFrame(input: {
 	const dim = (s: string) => style(theme, "dim", s);
 	const accent = (s: string) => style(theme, "accent", s);
 	const lines: string[] = [];
-	const maskLine = dim(" ".repeat(layout.cols));
-	const leftMask = dim(" ".repeat(layout.marginX));
-	const rightMaskWidth = Math.max(0, layout.cols - layout.marginX - layout.innerWidth - 2);
-	const rightMask = dim(" ".repeat(rightMaskWidth));
-	const top = leftMask + accent("┏") + padToInner(titleInner, layout.innerWidth) + accent("┓") + rightMask;
-	const bottom = leftMask +
-		accent("┗") +
+	// #193: the component paints the frame rect only — no side/top/bottom mask.
+	// Every cell outside it belongs to the host, which already painted the chat or
+	// the /legion view; painting spaces here would wipe it (the composite has no
+	// transparency) and render as the terminal's default background.
+	const top = accent("┏") + padToInner(titleInner, layout.innerWidth) + accent("┓");
+	const bottom = accent("┗") +
 		padToInner(dim(` ${footerHint} `), layout.innerWidth) +
-		accent("┛") +
-		rightMask;
+		accent("┛");
 
-	for (let i = 0; i < layout.marginY; i++) lines.push(maskLine);
 	lines.push(top);
 	for (let i = 0; i < layout.bodyRows; i++) {
 		const body = padToInner(bodyLines[i] ?? "", layout.innerWidth);
-		lines.push(leftMask + accent("┃") + body + accent("┃") + rightMask);
+		lines.push(accent("┃") + body + accent("┃"));
 	}
 	if (layout.showMeta) {
 		const meta = padToInner(metaInner ?? "", layout.innerWidth);
-		lines.push(leftMask + accent("┃") + meta + accent("┃") + rightMask);
+		lines.push(accent("┃") + meta + accent("┃"));
 	}
 	lines.push(bottom);
-	for (let i = 0; i < layout.marginY; i++) lines.push(maskLine);
-	while (lines.length < layout.rows) lines.push(maskLine);
-	return lines.slice(0, layout.rows);
+	return lines;
 }

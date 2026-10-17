@@ -37,6 +37,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	createLiveOverlay,
 	createLiveOverlayFactory,
+	resolveModalOverlayOptions,
 	type LiveOverlayBackfillCursor,
 	type LiveOverlayBackfillResult,
 	type LiveOverlayListener,
@@ -428,6 +429,11 @@ function openLiveOverlay(
 	nodeId: string,
 	onStop?: (nodeId: string) => void,
 ): void {
+	// #193: the overlay must cover the floating frame only. A full-screen overlay
+	// would make pi-tui discard every host cell (its composite has no transparency
+	// option), so the area around the frame collapsed to the terminal's default
+	// background — the "black modal". Anchoring to the frame rect leaves the rest of
+	// the screen to the host, which paints the chat / /legion view there.
 	const factory = createLiveOverlayFactory(controller, nodeId, {
 		...(onStop ? { onStop } : {}),
 		cwd,
@@ -435,8 +441,9 @@ function openLiveOverlay(
 	});
 	void ui.custom(factory, {
 		overlay: true,
-		// Full-screen host overlay so the viewer paints its own dim mask + floating frame.
-		overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 },
+		// Percentages (not absolute cells) so pi-tui re-derives the rect from the
+		// current terminal every frame; the frame survives resize.
+		overlayOptions: resolveModalOverlayOptions(),
 		onHandle: (handle) => controller.getCurrent()?.attachOverlayHandle(handle),
 	}).catch((error: unknown) => reportOverlayOpenError(controller, ui, error));
 }
