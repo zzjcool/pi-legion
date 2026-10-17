@@ -23,7 +23,7 @@ COLS ?= 120
 ROWS ?= 40
 SCENARIO ?= echo
 
-.PHONY: help build run it print shell status clean down smoke tui-visual
+.PHONY: help build rebuild run it print shell status clean down smoke tui-visual
 
 help: ## 显示帮助
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -33,6 +33,10 @@ build: ## 构建沙箱镜像（>300s，tee 到 /tmp/pi-legion-build.log）
 	@echo "构建中 → /tmp/pi-legion-build.log"
 	@docker build -t "$(IMAGE)" -f "$(DOCK)/Dockerfile.tui-sandbox" "$(ROOT)" 2>&1 \
 	  | tee /tmp/pi-legion-build.log | tail -3
+
+rebuild: clean ## 重建镜像 + 换掉容器（改 Dockerfile / 升 pi 版本后跑这个）
+	@$(MAKE) build
+	@echo "==> 镜像已重建；旧容器已删，make run 会用新镜像重新 start"
 
 up: ## 只起真模型容器，不进 pi
 	@bash "$(DOCK)/run-tui-real.sh" --print "Reply with the single word OK" >/dev/null
@@ -59,11 +63,14 @@ tui-visual: ## mock 模型确定性 TUI 回归（SCENARIO/COLS/ROWS 可调）
 	  -v "$(ROOT)":/plugin -w /plugin "$(IMAGE)" \
 	  bash test/docker/verify-tui-visual.sh
 
-status: ## 容器与镜像状态
+status: ## 容器与镜像状态（含子 agent 扩展注入是否就位）
 	@docker ps -a --filter name=$(NAME) \
 	  --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
 	@docker images --format '{{.Repository}}:{{.Tag}}\t{{.ID}}' \
 	  | grep -E 'tui-sandbox' || echo "（镜像 $(IMAGE) 未构建）"
+	@echo "--- 子 agent provider 注入 ---"
+	@docker exec $(NAME) printenv PI_LEGION_CHILD_EXTENSIONS 2>/dev/null \
+	  || echo "  PI_LEGION_CHILD_EXTENSIONS 未设置（容器未运行或镜像缺 any-endpoint → 子 agent 会报 Unknown provider）"
 
 down: clean
 clean: ## 删真模型容器（镜像保留）

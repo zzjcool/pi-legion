@@ -131,28 +131,25 @@ function formatTokensCompact(value: number): string {
 }
 
 /**
- * Elapsed of the current turn, shown next to the lifetime elapsed.
+ * Elapsed since the most recent task (turn) started, shown next to the
+ * lifetime elapsed.
  *
- * An in-flight turn ticks with `now`. Once `currentTurnEndedAt` is set the
- * value stays frozen until the next turn replaces the start. A terminal entry
- * with no explicit end freezes at `finishedAt` so the clock does not run on
- * after the agent exits. Undefined when the start is unknown, or when the
- * entry is neither active nor terminal and the turn was not frozen.
+ * Ticks with `now` for as long as the agent itself is live — including the
+ * quiet gap after a turn settles and before the next message arrives, which
+ * is part of "time since the last task started". It freezes only when the
+ * agent ends: a terminal entry clamps at `finishedAt` so the clock does not
+ * run on after the agent exits. Undefined when the turn start is unknown, or
+ * when the entry is neither active nor terminal (an idle seat has no
+ * meaningful running clock).
  */
 function currentTurnElapsedMs(
-	entry: Pick<StatusEntry, "state" | "herdrStatus" | "finishedAt" | "currentTurnStartedAt" | "currentTurnEndedAt">,
+	entry: Pick<StatusEntry, "state" | "herdrStatus" | "finishedAt" | "currentTurnStartedAt">,
 	now: number,
 ): number | undefined {
 	if (entry.currentTurnStartedAt === undefined) return undefined;
 	const start = entry.currentTurnStartedAt;
-	if (entry.currentTurnEndedAt !== undefined) {
-		return Math.max(0, entry.currentTurnEndedAt - start);
-	}
 	const status = entry.herdrStatus ?? entry.state;
-	if (TERMINAL_STATES.has(status)) {
-		if (entry.finishedAt === undefined) return undefined;
-		return Math.max(0, entry.finishedAt - start);
-	}
+	if (TERMINAL_STATES.has(status)) return Math.max(0, (entry.finishedAt ?? now) - start);
 	if (!ACTIVE_STATES.has(status)) return undefined;
 	return Math.max(0, now - start);
 }
@@ -167,16 +164,34 @@ function lifetimeElapsedMs(
 }
 
 /**
- * Headline clock: `12m12s / 1h03m` (current turn / lifetime). Lifetime only
- * when this turn has no timing yet.
+ * How close `currentTurnStartedAt` may sit to `startedAt` and still count as
+ * the same event (round 1). Only a fallback for entries that report no turn
+ * count: the turn start comes from the session's first user message while
+ * `startedAt` is the process spawn, so they differ by the spawn handshake
+ * (~1s) even on round 1.
+ */
+export const SAME_TURN_START_MS = 5_000;
+
+/**
+ * Headline clock: `12m12s / 1h03m` (since last task start / lifetime).
+ *
+ * Lifetime only when the leading clock adds nothing: either this turn has no
+ * timing yet, or it is still round 1 — that turn started with the agent, so
+ * the two clocks are one fact and `16s / 17s` is just the spawn gap.
  */
 export function formatAgentElapsed(
-	entry: Pick<StatusEntry, "state" | "herdrStatus" | "startedAt" | "finishedAt" | "currentTurnStartedAt" | "currentTurnEndedAt">,
+	entry: Pick<StatusEntry, "state" | "herdrStatus" | "startedAt" | "finishedAt" | "currentTurnStartedAt" | "turns">,
 	now: number,
 ): string {
 	const total = formatElapsed(lifetimeElapsedMs(entry, now));
 	const turnElapsed = currentTurnElapsedMs(entry, now);
 	if (turnElapsed === undefined) return total;
+	if (entry.turns !== undefined) {
+		if (entry.turns <= 1) return total;
+	} else if (entry.currentTurnStartedAt !== undefined
+		&& Math.abs(entry.currentTurnStartedAt - entry.startedAt) <= SAME_TURN_START_MS) {
+		return total;
+	}
 	return `${formatElapsedParts(turnElapsed, true)} / ${total}`;
 }
 
@@ -267,7 +282,7 @@ function headlineBits(entry: StatusEntry, now: number): string[] {
 	return bits;
 }
 
-function detailBits(entry: StatusEntry, now: number): string[] {
+function detailBits(entry: StatusEntry): string[] {
 	const status = entryStatus(entry);
 	const bits = [entry.phase ? `${entry.phase}/${status}` : status];
 	if (entry.turns && entry.turns > 0) bits.push(`turn ${entry.turns}`);
@@ -291,7 +306,7 @@ function formatEntryLines(
 ): string[] {
 	return [
 		`${prefix.head}● ${headlineBits(entry, now).join(" · ")}`,
-		`${prefix.detail}  ⎿  ${detailBits(entry, now).join(" · ")}`,
+		`${prefix.detail}  ⎿  ${detailBits(entry).join(" · ")}`,
 	];
 }
 
@@ -496,7 +511,7 @@ function renderTreeWidgetLines(
 		lines.push(widgetRow(`${branch}● ${headline.join(" · ")}`, entry.nodeId));
 		const detailPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
 		lines.push(widgetRow(
-			`${detailPrefix}  ⎿  ${detailBits(effectiveEntry, now).map(cleanDisplayText).join(" · ")}`,
+			`${detailPrefix}  ⎿  ${detailBits(effectiveEntry).map(cleanDisplayText).join(" · ")}`,
 			entry.nodeId,
 		));
 		const childPrefix = `${ancestors}${isLast ? "   " : "│  "}`;
@@ -552,7 +567,7 @@ type Theme = {
 	fg(color: string, text: string): string;
 };
 
-type WidgetTui = { requestRender(): void };
+export type WidgetTui = { requestRender(): void };
 
 export type WidgetFactory = (
 	tui: WidgetTui,
@@ -618,7 +633,7 @@ export interface StatusVizSnapshot {
 	nodes: VizNode[];
 	sampler: RateSampler;
 	now: number;
-	/** Header "now" tok/s (60s window, live nodes only; 0 when none running). */
+	/** Header tok/s (60s window, live nodes only; 0 when none running). */
 	rate: number;
 }
 
@@ -629,7 +644,7 @@ export interface StatusBoard {
 	paint(entries: StatusEntry[], now: number): void;
 	clear(): void;
 	/** The TUI the widget is mounted in, when registered (for focus/overlay checks). */
-	getTui?(): unknown;
+	getTui?(): WidgetTui | undefined;
 }
 
 /**

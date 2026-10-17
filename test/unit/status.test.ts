@@ -10,6 +10,7 @@ import {
 	formatFooterStatus,
 	formatWidgetLines,
 	statusTotals,
+	SAME_TURN_START_MS,
 	STATUS_FOOTER_KEY,
 	STATUS_WIDGET_KEY,
 	STATUS_WIDGET_PLACEMENT,
@@ -460,7 +461,7 @@ test("formatWidgetLines shows current-turn elapsed beside the lifetime total", (
 	);
 });
 
-test("formatAgentElapsed freezes a settled turn and resets when the next turn starts", () => {
+test("formatAgentElapsed keeps ticking after a turn settles and freezes when the agent ends", () => {
 	const base = {
 		name: "worker-0",
 		agent: "worker",
@@ -468,30 +469,55 @@ test("formatAgentElapsed freezes a settled turn and resets when the next turn st
 		startedAt: 0,
 		turns: 3,
 	} satisfies StatusEntry;
-	const frozen = {
-		...base,
-		currentTurnStartedAt: 1_000,
-		currentTurnEndedAt: 1_000 + (12 * 60 + 12) * 1_000,
-	};
-	const atHour = (1 * 3600 + 3 * 60) * 1_000;
-	assert.equal(formatAgentElapsed(frozen, atHour), "12m12s / 1h03m");
-	// The lifetime clock keeps moving; the settled turn does not.
-	assert.equal(formatAgentElapsed(frozen, atHour + 90_000), "12m12s / 1h04m");
+	const turnStartedAt = 60_000;
+
+	// In flight: both clocks run.
+	const inFlight = { ...base, currentTurnStartedAt: turnStartedAt };
+	assert.equal(formatAgentElapsed(inFlight, 120_000), "1m00s / 2m00s");
+
+	// Turn settled at 90s, agent still live: the clock reads "since the last
+	// task started", so the quiet gap keeps counting (not 30s, not frozen).
+	const settledTurn = { ...base, currentTurnStartedAt: turnStartedAt, currentTurnEndedAt: 90_000 };
+	assert.equal(formatAgentElapsed(settledTurn, 150_000), "1m30s / 2m30s");
 	assert.equal(
-		formatWidgetLines([frozen], atHour)[0],
-		"● worker-0 (worker) · 12m12s / 1h03m",
+		formatWidgetLines([settledTurn], 150_000)[0],
+		"● worker-0 (worker) · 1m30s / 2m30s",
 	);
 
-	const reset = { ...base, currentTurnStartedAt: atHour, currentTurnEndedAt: undefined };
-	assert.equal(formatAgentElapsed(reset, atHour + 42_000), "42s / 1h03m");
-	assert.equal(formatAgentElapsed(reset, atHour + 47_000), "47s / 1h03m");
+	// The agent itself ended at 150s: both clocks clamp there.
+	const ended = { ...base, state: "settled", finishedAt: 150_000, currentTurnStartedAt: turnStartedAt, currentTurnEndedAt: 90_000 };
+	assert.equal(formatAgentElapsed(ended, 150_000), "1m30s / 2m30s");
+	assert.equal(formatAgentElapsed(ended, 300_000), "1m30s / 2m30s", "ended agent stops ticking");
 
-	const longTurn = {
-		...base,
-		currentTurnStartedAt: 0,
-		currentTurnEndedAt: (1 * 3600 + 3 * 60 + 12) * 1_000,
-	};
-	assert.equal(formatAgentElapsed(longTurn, 2 * 3_600_000), "1h03m12s / 2h00m");
+	// The next turn resets the leading clock.
+	const reset = { ...base, currentTurnStartedAt: 200_000 };
+	assert.equal(formatAgentElapsed(reset, 200_000 + 42_000), "42s / 4m02s");
+	assert.equal(formatAgentElapsed(reset, 200_000 + 47_000), "47s / 4m07s");
+
+	// A turn that starts with the agent (round 1) collapses to the lifetime.
+	// `turns: 1` must accompany `currentTurnStartedAt: 0`: base carries turns: 3.
+	const longTurn = { ...base, turns: 1, currentTurnStartedAt: 0 };
+	assert.equal(formatAgentElapsed(longTurn, (1 * 3600 + 3 * 60 + 12) * 1_000), "1h03m");
+
+	// The spawn gap, for entries that report no turn count: the session's first
+	// user message lands ~1s after the process spawn, so the two starts are not
+	// byte-equal but it is still round 1.
+	const noCount = { name: "w", agent: "worker", state: "working", startedAt: 0 } satisfies StatusEntry;
+	assert.equal(
+		formatAgentElapsed({ ...noCount, currentTurnStartedAt: 1_000 }, 17_000),
+		"17s",
+		"1s spawn gap must not print 16s / 17s",
+	);
+	assert.equal(
+		formatAgentElapsed({ ...noCount, currentTurnStartedAt: SAME_TURN_START_MS }, 17_000),
+		"17s",
+		"at the tolerance edge still round 1",
+	);
+	assert.equal(
+		formatAgentElapsed({ ...noCount, currentTurnStartedAt: SAME_TURN_START_MS + 1_000 }, 17_000),
+		"11s / 17s",
+		"past the tolerance it is a real second turn",
+	);
 });
 
 test("formatWidgetLines omits current-turn elapsed without a start and freezes terminal entries", () => {
@@ -506,18 +532,19 @@ test("formatWidgetLines omits current-turn elapsed without a start and freezes t
 		assert.match(lines, /turn 2/, `${label}: turn count stays`);
 	}
 	// A terminal entry with only a start freezes at finishedAt, not at now.
+	// Round 1 (turns: 1) spans the whole life, so the two collapse to one value.
 	const terminal = formatWidgetLines(
-		[{ name: "w", agent: "worker", state: "settled", startedAt: 0, finishedAt: 42_000, turns: 2, currentTurnStartedAt: 0 }],
+		[{ name: "w", agent: "worker", state: "settled", startedAt: 0, finishedAt: 42_000, turns: 1, currentTurnStartedAt: 0 }],
 		5_000_000,
 	);
-	assert.equal(terminal[0], "● w (worker) · 42s / 42s");
-	assert.match(terminal[1] ?? "", /turn 2$/);
+	assert.equal(terminal[0], "● w (worker) · 42s");
+	assert.match(terminal[1] ?? "", /turn 1$/);
 	// Clock skew clamps to zero instead of going negative.
 	const skewed = formatWidgetLines(
 		[{ name: "w", agent: "worker", state: "working", startedAt: 0, turns: 2, currentTurnStartedAt: 9_999_999 }],
 		5_000_000,
 	);
-	assert.match(skewed[0] ?? "", /0s \/ /);
+	assert.match(skewed[0] ?? "", /0s/);
 	assert.match(skewed[1] ?? "", /turn 2$/);
 });
 
@@ -915,4 +942,16 @@ test("status board keeps short titles intact on a wide terminal", () => {
 	assert.match(lines[0] ?? "", /^● worker-0 \(worker\) · (?:\d+s|\d+m\d{2}s|\d+h\d{2}m)$/);
 	assert.equal(lines[1], "  ⎿  working");
 	assert.ok(!(lines[0] ?? "").includes("…") && !(lines[0] ?? "").includes("..."));
+});
+
+test("formatAgentElapsed drops a leading clock that repeats the lifetime", () => {
+	const base = { name: "w", agent: "worker", state: "working", startedAt: 0 } satisfies StatusEntry;
+	// Round 1: the turn starts when the agent starts, so both clocks agree and
+	// `1m19s / 1m19s` would print the same fact twice.
+	assert.equal(formatAgentElapsed({ ...base, currentTurnStartedAt: 0 }, 79_000), "1m19s");
+	assert.equal(formatAgentElapsed({ ...base, currentTurnStartedAt: 0 }, 600_000), "10m00s");
+	// A later turn (or a turn that started after the agent) is a real second fact.
+	assert.equal(formatAgentElapsed({ ...base, currentTurnStartedAt: 10_000 }, 79_000), "1m09s / 1m19s");
+	// No turn start at all: lifetime only (unchanged).
+	assert.equal(formatAgentElapsed(base, 79_000), "1m19s");
 });

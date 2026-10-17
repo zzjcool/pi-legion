@@ -27,6 +27,10 @@ for f in auth.json models-store.json; do
   [ -f "$HOST_AGENT/$f" ] || { echo "FAIL: $HOST_AGENT/$f 不存在（宿主需先 /login）。"; exit 1; }
 done
 
+# Provider 由宿主包注册，但子 agent 默认 --no-extensions（#43），看不到它就会
+# “Unknown provider”。把镜像里 pi-any-endpoint 的扩展路径喂给每个子 agent。
+CHILD_EXT=/root/.pi/agent/npm/node_modules/pi-any-endpoint/extensions/index.ts
+
 # 插件按 cwd 落盘（cwd/.pi-subagents/），源码是 ro 挂载，所以工作目录必须是
 # 容器内的可写目录，不能 cd 进挂载的仓库（pi-async README 同款坑）。
 start() {
@@ -36,12 +40,16 @@ start() {
     -v "$HOST_AGENT/auth.json:$HOST_AGENT/auth.json:ro" \
     -v "$HOST_AGENT/models-store.json:$HOST_AGENT/models-store.json" \
     -e TERM=xterm-256color \
+    -e PI_LEGION_CHILD_EXTENSIONS="$CHILD_EXT" \
     "$IMAGE" sleep infinity >/dev/null
   echo "==> pi version:  $(docker exec "$NAME" pi --version)"
   echo "==> models:"
   docker exec "$NAME" pi --list-models 2>&1 | sed 's/^/    /' | head -10
   docker exec "$NAME" pi --list-models 2>&1 | grep -q "$MODEL" \
     || echo "WARN: model '$MODEL' not in catalog — check models-store.json mount" >&2
+  # 重建/换镜像后这条最容易静默失效（扩展路径不存在 → 子 agent 又没模型）。
+  docker exec "$NAME" test -f "$CHILD_EXT" \
+    || echo "WARN: $CHILD_EXT 不存在 —— 子 agent 会报 Unknown provider" >&2
 }
 
 MODE="${1:-}"

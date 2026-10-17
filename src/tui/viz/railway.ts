@@ -18,6 +18,19 @@ export const RAIL_MAX_LANES = 4;
 export const RAIL_MAX_LANES_NARROW = 3;
 export const RAIL_NARROW_COLS = 80;
 export const RAIL_WINDOW_MS = 6 * 60 * 1000;
+/**
+ * Floor for the time axis. The right-hand column is measured from what the
+ * lanes actually need and the axis takes whatever is left, but never less
+ * than this — otherwise a long detail would push the graph off the line.
+ */
+export const RAIL_AXIS_MIN_COLS = 10;
+/** Widest a lane name column may grow (it is content-driven, not reserved). */
+export const RAIL_NAME_MAX_COLS = 16;
+/**
+ * Narrowest the lane-name column may shrink. Short names would otherwise
+ * collapse the column to 1 and leave the label cramped against the ▶ marker.
+ */
+export const RAIL_NAME_MIN_COLS = 6;
 
 /**
  * Map a timestamp onto the shared railway axis.
@@ -39,7 +52,7 @@ export interface RailInput {
 	nodes: readonly VizNode[];
 	now: number;
 	width: number;
-	/** Header "now" tok/s (live agents only; 0 when none running). */
+	/** Header tok/s (live agents only; 0 when none running). */
 	rate: number;
 	windowMs?: number;
 	/** Lane scroll position when more agents are live than lanes fit. */
@@ -138,52 +151,129 @@ export function maxLanesFor(width: number): number {
 }
 
 export function formatRate(rate: number): string {
-	return `${formatCount(rate)} now tok/s`;
+	return `${formatCount(rate)} tok/s`;
 }
 
 
 /**
- * Wide-lane detail after the name: role, optional turn/lifetime clocks (only
- * from turn ≥2), and last-activity age. Round-1 hides both current-turn and
- * lifetime clocks (#159).
+ * Wide-lane detail after the name: role, turn/lifetime clocks, and
+ * last-activity age.
+ *
+ * The leading clock is "time since the last task started": it keeps ticking
+ * through the quiet gap after a turn settles (the old behavior froze at that
+ * turn's end) and stops when the agent itself ends.
+ *
+ * Clocks show from round 1. #159 gated them behind `turns >= 2`, but a child
+ * is usually dispatched with a single user message, so in practice that gate
+ * hid the clocks almost always and left the lane with a bare `role · 1s ago`
+ * (~13 cols) — the axis then absorbed the rest of the line. A round-1 agent
+ * has a real start time and a real lifetime; show both.
  */
 export function formatRailLaneDetail(node: VizNode, now: number): string {
 	const parts: string[] = [node.role];
-	if ((node.turns ?? 0) >= 2) {
-		parts.push(formatAgentElapsed({
-			state: node.status,
-			startedAt: node.startedAt,
-			...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
-			...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
-			...(node.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: node.currentTurnEndedAt } : {}),
-		}, now));
-	}
+	parts.push(formatAgentElapsed({
+		state: node.status,
+		startedAt: node.startedAt,
+		...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
+		...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
+	}, now));
 	parts.push(formatActivityAgo(node.lastActivityAt, now));
 	return parts.join(" · ");
 }
 
-/** Pick the richest lane detail that fits `room` (role → clocks → ago). */
-export function fitRailLaneDetail(node: VizNode, now: number, room: number): string {
-	if (room <= 0) return "";
+/** Lane detail candidates, richest first (role → clocks → ago). */
+export function laneDetailCandidates(node: VizNode, now: number): string[] {
 	const ago = formatActivityAgo(node.lastActivityAt, now);
-	const clocks = (node.turns ?? 0) >= 2
-		? formatAgentElapsed({
-			state: node.status,
-			startedAt: node.startedAt,
-			...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
-			...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
-			...(node.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: node.currentTurnEndedAt } : {}),
-		}, now)
-		: undefined;
-	const candidates = [
-		clocks ? `${node.role} · ${clocks} · ${ago}` : `${node.role} · ${ago}`,
-		...(clocks ? [`${clocks} · ${ago}`, clocks] : []),
+	const clocks = formatAgentElapsed({
+		state: node.status,
+		startedAt: node.startedAt,
+		...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
+		...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
+	}, now);
+	return [
+		`${node.role} · ${clocks} · ${ago}`,
+		`${clocks} · ${ago}`,
+		clocks,
 		ago,
 	];
+}
+
+/**
+ * Width of the lane-name column: as wide as the longest name, clamped to
+ * `RAIL_NAME_MAX_COLS` and never below `RAIL_NAME_MIN_COLS`.
+ *
+ * Planning and painting must agree on this, otherwise the axis is sized for
+ * one width while the row is drawn at another and the tail gets clipped.
+ */
+export function railNameWidth(shown: readonly VizNode[]): number {
+	const longest = shown.length ? Math.max(...shown.map((n) => Array.from(n.name).length)) : 0;
+	return Math.max(RAIL_NAME_MIN_COLS, Math.min(RAIL_NAME_MAX_COLS, longest));
+}
+
+/**
+ * Pick the richest lane detail that fits `room` (role → clocks → ago).
+ *
+ * Callers pass the room shared by every lane, so a field that does not fit
+ * one lane is dropped from all of them instead of stripping the role from a
+ * single long-named row.
+ */
+export function fitRailLaneDetail(node: VizNode, now: number, room: number): string {
+	if (room <= 0) return "";
+	const candidates = laneDetailCandidates(node, now);
 	for (const candidate of candidates) {
 		if (Array.from(candidate).length <= room) return candidate;
 	}
-	return ellipsize(ago, room);
+	return ellipsize(candidates[candidates.length - 1]!, room);
+}
+
+export interface RailColumnPlan {
+	/** Width reserved for the lane name. */
+	nameW: number;
+	/** Index into each lane's candidate list (0 = richest). */
+	grade: number;
+	/** Columns the right-hand block needs, including the ▶ marker. */
+	needed: number;
+}
+
+/**
+ * Measure the right-hand column from the lanes themselves.
+ *
+ * The name/detail block is content-driven: the axis takes whatever the
+ * terminal has left, down to `RAIL_AXIS_MIN_COLS`. Short labels hand the slack
+ * back to the graph; long ones shrink it — so a row always fills the line
+ * instead of trailing blank space after the detail text.
+ */
+export function railColumnPlan(
+	shown: readonly VizNode[],
+	now: number,
+	portrait: boolean,
+	width: number,
+	reserve = 0,
+): RailColumnPlan {
+	if (shown.length === 0) return { nameW: 0, grade: 0, needed: 0 };
+	const nameW = railNameWidth(shown);
+	if (portrait) {
+		const label = Math.max(...shown.map((n) => {
+			const ago = formatActivityAgo(n.lastActivityAt, now);
+			return Array.from(ago === "—" ? n.name : `${n.name} · ${ago}`).length;
+		}));
+		return { nameW, grade: 0, needed: label + 2 + reserve };
+	}
+	const candidates = shown.map((n) => laneDetailCandidates(n, now));
+	const grades = Array.from(
+		{ length: Math.max(...candidates.map((c) => c.length)) },
+		(_, g) => Math.max(...candidates.map((c) => Array.from(c[Math.min(g, c.length - 1)]!).length)),
+	);
+	// Richest grade that still leaves the axis its floor.
+	const budget = Math.max(0, width - 1 - reserve - RAIL_AXIS_MIN_COLS - nameW - 3);
+	let grade = grades.length - 1;
+	for (let g = 0; g < grades.length; g++) {
+		if (grades[g]! <= budget) {
+			grade = g;
+			break;
+		}
+	}
+	return { nameW, grade, needed: nameW + grades[grade]! + 3 + reserve };
 }
 
 export function renderRailway(input: RailInput): RailRender | undefined {
@@ -196,9 +286,14 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 	if (rows === 0) return undefined;
 	const portrait = width < RAIL_NARROW_COLS;
 	const windowMs = input.windowMs ?? RAIL_WINDOW_MS;
-	const nameCol = portrait ? Math.max(8, Math.min(16, Math.floor(width * 0.32))) : Math.min(38, Math.max(24, Math.floor(width * 0.3)));
+	const live = current.total;
+	const above = current.offset > 0;
+	const below = current.offset + rows < live;
+	// Column widths are measured before the canvas exists: the axis gets the
+	// slack, the lanes get what they need.
+	const plan = railColumnPlan(current.shown, now, portrait, width, above || below ? 2 : 0);
 	const LX = 1;
-	const AW = Math.max(4, width - LX - nameCol - 2);
+	const AW = Math.max(RAIL_AXIS_MIN_COLS, Math.min(width - LX - 1, width - LX - plan.needed));
 	const canvas = new Canvas(width, rows + 1);
 	const hit: Array<Array<string | undefined>> = Array.from({ length: rows + 1 }, () => new Array<string | undefined>(width).fill(undefined));
 	const byId = new Map(nodes.map((node) => [node.id, node]));
@@ -272,9 +367,6 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		hit[y0 + r]![LX + c] = cell.owner;
 	}
 
-	const live = current.total;
-	const above = current.offset > 0;
-	const below = current.offset + rows < live;
 	const rateText = formatRate(input.rate);
 	const winLabel = ` −${Math.max(1, Math.round(windowMs / 60000))}m `;
 	canvas.text(LX + 1, 0, winLabel, "dim");
@@ -334,12 +426,14 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 			const label = ago === "—" ? node.name : `${node.name} · ${ago}`;
 			canvas.text(nameX + 2, y, ellipsize(label, avail), col, { bold: true });
 		} else {
-			const longest = Math.max(...current.shown.map((n) => Array.from(n.name).length));
-			const nameW = Math.min(16, longest, Math.max(6, avail - 8));
+			// Paint with the same width the plan measured (clamped to what is
+			// actually available): mismatched widths sized the axis for one layout
+			// and drew another, clipping the tail of the detail text.
+			const nameW = Math.min(plan.nameW, Math.max(1, avail));
 			canvas.text(nameX + 2, y, ellipsize(node.name, nameW), col, { bold: true });
-			const room = Math.max(0, avail - nameW - 1);
-			const detail = fitRailLaneDetail(node, now, room);
-			canvas.text(nameX + 3 + nameW, y, detail, "dim");
+			const candidates = laneDetailCandidates(node, now);
+			const detail = candidates[Math.min(plan.grade, candidates.length - 1)]!;
+			canvas.text(nameX + 3 + nameW, y, detail, "dim", { maxX: width - overflow.length });
 		}
 		if (overflow) canvas.text(width - overflow.length, y, overflow, "text", { bold: true });
 	});

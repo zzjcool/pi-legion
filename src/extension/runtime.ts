@@ -27,6 +27,7 @@ import {
 	formatBusyLabel,
 	type StatusEntry,
 	type StatusUi,
+	type WidgetTui,
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
@@ -346,8 +347,8 @@ export interface SessionRuntime {
 	refreshUi(): void;
 	/** Live visualization data (nodes + token-rate sampler) for the /legion view. */
 	vizSnapshot(): StatusVizSnapshot;
-	/** TUI hosting the status widget (unknown shape; used for overlay/focus checks). */
-	statusTui(): unknown;
+	/** TUI hosting the status widget (used for overlay/focus checks). */
+	statusTui(): WidgetTui | undefined;
 	/** Forward join config to the internal coordinator (settings wiring). */
 	setJoinConfig(config: JoinConfig): void;
 	/**
@@ -1167,8 +1168,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				await Promise.all(pending.map(async (job) => {
 					try {
 						await ensureCollect(job);
+						return true;
 					} catch {
 						// The watch records the failure; shutdown still retires the child.
+						return false;
 					}
 				}));
 				// The watch continuation shares this collect and must observe

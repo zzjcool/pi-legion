@@ -13,7 +13,7 @@ export interface ViewData {
 	nodes: readonly VizNode[];
 	sampler: RateSampler;
 	now: number;
-	/** Header "now" tok/s (live agents only; 0 when none running). Chart avg/buckets keep full-series windows. */
+	/** Header tok/s (live agents only; 0 when none running). Chart avg/buckets keep full-series windows. */
 	rate: number;
 }
 
@@ -303,7 +303,7 @@ export function computeStats(data: ViewData, buckets: number): ChartStats {
 			peakIndex = i;
 		}
 	});
-	// "now" is the shared header definition, never the last bucket.
+	// The header tok/s is the shared definition, never the last bucket.
 	peak = Math.max(peak, data.rate);
 	const peakAt = peakIndex >= 0 && peak > data.rate ? series.times[peakIndex]! : to;
 	const roleTotals = new Map<string, number>();
@@ -315,7 +315,7 @@ export function computeStats(data: ViewData, buckets: number): ChartStats {
 	}
 	return {
 		now: data.rate,
-		// Full-series window average (includes settled); differs from header "now" on purpose.
+		// Full-series window average (includes settled); differs from the header tok/s on purpose.
 		avg: data.sampler.totalRate(to, Math.max(1, to - from)),
 		peak,
 		peakAt,
@@ -333,7 +333,7 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	const statsBelow = statsW === 0 ? Math.min(selected ? 4 : 3, Math.max(0, r.h - 6)) : 0;
 	const axisW = 6;
 	const plotX = r.x + axisW;
-	// With side stats, keep room for the "◂ now" label so it never runs into the stats column.
+	// With side stats, keep room for the "◂ N" label so it never runs into the stats column.
 	const plotW = Math.max(4, r.w - axisW - statsW - (statsW ? 9 : 0) - 1);
 	const plotTop = r.y + 1;
 	const plotH = Math.max(1, r.h - 2 - statsBelow);
@@ -394,14 +394,13 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	if (stats.peak > 0) yLabel(max, plotTop);
 	if (plotH >= 5 && max >= 20) yLabel(max / 2, axisY - 1 - Math.floor(plotH / 2));
 	yLabel(0, axisY - 1);
-	// X axis with "now" at the right edge.
+	// X axis: elapsed time since the window start; the right edge is the present.
 	cv.text(plotX - 1, axisY, "└" + "─".repeat(plotW), "borderMuted", { maxX: plotX + plotW });
 	cv.text(plotX, axisY, "0m", "dim");
 	const mid = formatDuration((to - from) / 2);
 	if (plotW > 24) cv.text(plotX + Math.floor(plotW / 2) - Math.floor(mid.length / 2), axisY, mid, "dim");
-	cv.text(plotX + plotW - 3, axisY, "now", "text", { bold: true });
 	const nowLabel = `◂ ${formatCount(stats.now)}`;
-	if (statsW === 0) cv.text(r.x, r.y, `now ${formatCount(stats.now)} tok/s`, "accent", { bold: true, maxX: Math.max(r.x, plotX + plotW - 22) });
+	if (statsW === 0) cv.text(r.x, r.y, `${formatCount(stats.now)} tok/s`, "accent", { bold: true, maxX: Math.max(r.x, plotX + plotW - 22) });
 	else cv.text(plotX + plotW + 1, axisY - 1 - Math.min(plotH - 1, Math.floor(rowsFor(stats.now))), nowLabel, "text", { maxX: r.x + r.w - statsW - 1 });
 
 	const selLines = (): Array<[string, string]> => {
@@ -410,14 +409,14 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 		const share = stats.total > 0 ? (selected.tokens / stats.total) * 100 : 0;
 		return [
 			[`▸ ${selected.name}`, roleColor(selected.role)],
-			[`${formatCount(rate)} tok/s now · ${formatCount(selected.tokens)} tok`, "text"],
+			[`${formatCount(rate)} tok/s · ${formatCount(selected.tokens)} tok`, "text"],
 			[`${share.toFixed(1)}% of run · ━ bright line`, "dim"],
 		];
 	};
 	if (statsW) {
 		const sx = r.x + r.w - statsW;
 		const rows: Array<[string, string, string]> = [
-			["now", `${formatCount(stats.now)} tok/s`, "text"],
+			["rate", `${formatCount(stats.now)} tok/s`, "text"],
 			["avg", `${formatCount(stats.avg)} tok/s`, "text"],
 			["peak", stats.peak > 0 ? `${formatCount(stats.peak)} @ ${formatDuration(stats.peakAt - from)}` : "—", "text"],
 			["total", `${formatCount(stats.total)} tok`, "text"],

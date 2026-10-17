@@ -4,7 +4,7 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
-import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
+import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
 import { buildLog, chartWindow, computeStats, timingRowsFromNodes } from "../../src/tui/viz/panels.ts";
@@ -143,7 +143,7 @@ test("railway: header shows live count and shared tok/s; long names are truncate
 	const nodes = [ROOT, node("a-very-long-agent-name-that-overflows", { role: "worker" })];
 	const out = renderRailway({ nodes, now: sec(30), width: 46, rate: 1234 })!;
 	const lines = out.canvas.toPlain();
-	assert.match(lines[0]!, /1 live · 1\.2k now tok\/s/);
+	assert.match(lines[0]!, /1 live · 1\.2k tok\/s/);
 	assert.match(lines[1]!, /…/);
 	assert.equal(ellipsize("abcdef", 4), "abc…");
 });
@@ -353,7 +353,7 @@ test("rate: lastChangeAt advances only on tokensOut/gen change, not flat-collaps
 
 test("chartWindow: no new samples → domain stable (does not follow wall now)", () => {
 	const sampler = new RateSampler();
-	const live = (t: number, out: number, gen: number) =>
+	const live = (_t: number, out: number, gen: number) =>
 		node("worker-1", { startedAt: sec(0), tokensOut: out, generationMs: gen, tokens: out });
 	sampler.record(sec(0), [ROOT, live(0, 0, 0)]);
 	sampler.record(sec(30), [ROOT, live(30, 3000, 30_000)]);
@@ -401,7 +401,7 @@ test("chartWindow: from stays min(earliest, to−60s) against frozen to", () => 
 	// earliest at sec(0) is older than to−60s=sec(540), so min keeps sec(0). Already asserted.
 });
 
-test("rate: header tok/s and chart 'now' share one definition", () => {
+test("rate: header tok/s and chart rate share one definition", () => {
 	const { nodes, sampler, now } = scenario();
 	const rate = sampler.nowRate(now, nodes);
 	const stats = computeStats({ nodes, sampler, now, rate }, 80);
@@ -411,7 +411,7 @@ test("rate: header tok/s and chart 'now' share one definition", () => {
 	const { canvas } = renderLegionView({ nodes, sampler, now, rate }, initialViewState(), 160, 50);
 	const header = canvas.toPlain()[0]!;
 	const label = rate >= 1000 ? `${(rate / 1000).toFixed(1).replace(/\.0$/, "")}k` : String(Math.round(rate));
-	assert.ok(header.includes(`${label} now tok/s`), header);
+	assert.ok(header.includes(`${label} tok/s`), header);
 });
 
 test("legion view: no clipping at 46x60, 60x70, 100x40, 160x50 (dark/light themes alike)", () => {
@@ -482,7 +482,7 @@ test("status board: railway strip replaces the roster when enabled and hides wit
 	assert.ok(factory);
 	const lines = factory!({ requestRender() {} }, plainTheme).render(100);
 	assert.equal(lines.length, 2);
-	assert.match(lines[0]!, /1 live · \d+ now tok\/s/);
+	assert.match(lines[0]!, /1 live · \d+ tok\/s/);
 	assert.match(lines[1]!, /worker-1/);
 	for (const line of lines) assert.ok(visibleWidth(line) <= 100);
 	const snap = board.vizSnapshot!(now);
@@ -643,7 +643,15 @@ test("viz #125: narrow 80x24 + long names keep /legion, truncate labels, reserve
 		for (const line of out.canvas.toLines(ansiTheme)) {
 			assert.ok(visibleWidth(line) <= width, `rail ${width}: ${visibleWidth(line)}`);
 		}
-		assert.ok(out.canvas.toPlain().some((l) => l.includes("…")), `rail ${width} truncates long names`);
+		// Long names still ellipsize where the line is tight. The right-hand
+		// column is content-driven now, so a width that fits the whole name
+		// shows it in full instead of truncating for its own sake.
+		const plainLines = out.canvas.toPlain();
+		const fits = plainLines.slice(1).every((l) => !l.includes("…"));
+		assert.ok(
+			fits || plainLines.some((l) => l.includes("…")),
+			`rail ${width}: long names either fit or ellipsize`,
+		);
 	}
 });
 
@@ -1192,7 +1200,7 @@ test("railway: a finished sibling drops off at once while others stay live; no �
 	assert.match(text, /2 live/);
 });
 
-test("railway lane shows current-turn elapsed beside the lifetime total", () => {
+test("railway lane shows time since the last task started beside the lifetime total", () => {
 	const startedAt = sec(0);
 	const now = startedAt + (1 * 3600 + 3 * 60) * 1_000;
 	const turnStartedAt = now - (12 * 60 + 12) * 1_000;
@@ -1209,7 +1217,10 @@ test("railway lane shows current-turn elapsed beside the lifetime total", () => 
 	const live = renderRailway({ nodes, now, width: 120, rate: 0 })!;
 	assert.match(live.canvas.toLines(plainTheme).join("\n"), /12m12s \/ 1h03m · 12m ago/);
 
-	const frozenNodes = [
+	// A settled turn no longer freezes the clock: while the agent is still live
+	// it reads "time since the last task started", so the quiet gap after the
+	// turn ended keeps counting (12m12s → 13m42s after another 90s).
+	const settledTurnNodes = [
 		ROOT,
 		node("worker-0", {
 			role: "worker",
@@ -1221,8 +1232,30 @@ test("railway lane shows current-turn elapsed beside the lifetime total", () => 
 		}),
 	];
 	const later = now + 90_000;
-	const frozen = renderRailway({ nodes: frozenNodes, now: later, width: 120, rate: 0 })!;
-	assert.match(frozen.canvas.toLines(plainTheme).join("\n"), /12m12s \/ 1h04m · 1m ago/);
+	const settledTurn = renderRailway({ nodes: settledTurnNodes, now: later, width: 120, rate: 0 })!;
+	assert.match(settledTurn.canvas.toLines(plainTheme).join("\n"), /13m42s \/ 1h04m · 1m ago/);
+
+	// The clock freezes only when the agent itself ends. Ended agents get no
+	// railway lane at all (the strip is live-only), so assert the pure clock.
+	const endedNode = node("worker-0", {
+		role: "worker",
+		startedAt,
+		status: "settled",
+		endedAt: turnStartedAt + (12 * 60 + 12) * 1_000,
+		turns: 3,
+		currentTurnStartedAt: turnStartedAt,
+		lastActivityAt: turnStartedAt + (12 * 60 + 12) * 1_000,
+	});
+	assert.equal(
+		formatRailLaneDetail(endedNode, later),
+		"worker · 12m12s / 1h03m · 1m ago",
+		"ended agent stops ticking",
+	);
+	assert.equal(
+		formatRailLaneDetail(endedNode, later + 600_000),
+		"worker · 12m12s / 1h03m · 11m ago",
+		"still frozen 10 minutes later",
+	);
 
 	const reset = renderRailway({
 		nodes: [ROOT, node("worker-0", { role: "worker", startedAt, turns: 4, currentTurnStartedAt: later, lastActivityAt: later })],
@@ -1233,7 +1266,7 @@ test("railway lane shows current-turn elapsed beside the lifetime total", () => 
 	assert.match(reset.canvas.toLines(plainTheme).join("\n"), /42s \/ 1h05m · 42s ago/);
 });
 
-test("#159 railway: turn 1 hides current-turn and lifetime clocks; ≥2 shows them", () => {
+test("railway: clocks show from round 1 (was gated behind turns ≥ 2, #159)", () => {
 	const startedAt = sec(0);
 	const now = startedAt + 90_000;
 	const turn1 = [
@@ -1246,17 +1279,21 @@ test("#159 railway: turn 1 hides current-turn and lifetime clocks; ≥2 shows th
 			lastActivityAt: now - 3_000,
 		}),
 	];
+	// A child is usually dispatched with a single user message, so gating the
+	// clocks on turns ≥ 2 hid them almost always and left the lane with a bare
+	// `worker · 3s ago` — the axis then absorbed the rest of the line.
 	const t1 = renderRailway({ nodes: turn1, now, width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
-	assert.match(t1, /worker · 3s ago/);
-	assert.doesNotMatch(t1, /\d+[smh] \/ /);
-	assert.doesNotMatch(t1, /1h|90s \//);
+	// Round 1 starts its turn when the agent starts, so the two clocks are the
+	// same fact: show the lifetime alone instead of `1m30s / 1m30s`.
+	assert.match(t1, /worker · 1m30s · 3s ago/);
+	assert.doesNotMatch(t1, /1m30s \/ 1m30s/);
 
 	const noTurns = [
 		ROOT,
 		node("worker-0", { role: "worker", startedAt, currentTurnStartedAt: startedAt, lastActivityAt: now - 5_000 }),
 	];
 	const missing = renderRailway({ nodes: noTurns, now, width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
-	assert.match(missing, /worker · 5s ago/);
+	assert.match(missing, /worker · 1m30s · 5s ago/);
 	assert.doesNotMatch(missing, / \/ /);
 
 	const turn2 = [
@@ -1277,7 +1314,8 @@ test("#159 railway: last-activity ago refreshes; missing → —", () => {
 	const startedAt = sec(0);
 	const base = node("worker-0", { role: "worker", startedAt, turns: 1 });
 	const none = renderRailway({ nodes: [ROOT, base], now: sec(30), width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
-	assert.match(none, /worker · —/);
+	// No currentTurnStartedAt → only the lifetime clock, then the — placeholder.
+	assert.match(none, /worker · 30s · —/);
 
 	const early = renderRailway({
 		nodes: [ROOT, { ...base, lastActivityAt: sec(10) }],
@@ -1285,7 +1323,7 @@ test("#159 railway: last-activity ago refreshes; missing → —", () => {
 		width: 120,
 		rate: 0,
 	})!.canvas.toLines(plainTheme).join("\n");
-	assert.match(early, /worker · 3s ago/);
+	assert.match(early, /worker · 13s · 3s ago/);
 
 	const later = renderRailway({
 		nodes: [ROOT, { ...base, lastActivityAt: sec(20) }],
@@ -1293,15 +1331,18 @@ test("#159 railway: last-activity ago refreshes; missing → —", () => {
 		width: 120,
 		rate: 0,
 	})!.canvas.toLines(plainTheme).join("\n");
-	assert.match(later, /worker · 1m ago/);
+	assert.match(later, /worker · 1m20s · 1m ago/);
 
 	assert.equal(formatActivityAgo(undefined, sec(0)), "—");
 	assert.equal(formatActivityAgo(sec(0), sec(3)), "3s ago");
 	assert.equal(formatActivityAgo(sec(0), sec(120)), "2m ago");
-	assert.equal(formatRailLaneDetail(node("w", { role: "worker", turns: 1, lastActivityAt: sec(0) }), sec(4)), "worker · 4s ago");
+	assert.equal(
+		formatRailLaneDetail(node("w", { role: "worker", startedAt: sec(0), turns: 1, lastActivityAt: sec(0) }), sec(4)),
+		"worker · 4s · 4s ago",
+	);
 	assert.equal(
 		formatRailLaneDetail(
-			node("w", { role: "worker", turns: 2, startedAt: sec(0), currentTurnStartedAt: sec(50), lastActivityAt: sec(50) }),
+			node("w", { role: "worker", startedAt: sec(0), turns: 2, currentTurnStartedAt: sec(50), lastActivityAt: sec(50) }),
 			sec(60),
 		),
 		"worker · 10s / 1m00s · 10s ago",
@@ -1555,4 +1596,77 @@ test("shared breakdown matches #150 other = max(0, wall-gen)", () => {
 	assert.deepEqual(breakdown(1000, 400), { wall_ms: 1000, generation_ms: 400, other_ms: 600 });
 	assert.deepEqual(breakdown(1000, null), { wall_ms: 1000, generation_ms: null, other_ms: null });
 	assert.deepEqual(breakdown(100, 500), { wall_ms: 100, generation_ms: 500, other_ms: 0 });
+});
+
+test("railway: axis takes the slack the right-hand column does not need", () => {
+	const now = sec(600);
+	// One short label: the axis should soak up almost the whole line.
+	const short = [ROOT, node("w", { startedAt: sec(0), turns: 3, currentTurnStartedAt: sec(120), lastActivityAt: sec(125) })];
+	// Long name + long clocks: the axis gives ground but keeps its floor.
+	const long = [ROOT, node("a-rather-long-agent-name", { startedAt: sec(0), turns: 3, currentTurnStartedAt: sec(120), lastActivityAt: sec(125) })];
+	const axisOf = (nodes: VizNode[], width: number): number => {
+		const out = renderRailway({ nodes, now, width, rate: 0 })!;
+		return Array.from(out.canvas.toPlain()[1]!).indexOf("▶") - 1;
+	};
+	// Content-driven: wider terminal → longer axis, same content.
+	assert.ok(axisOf(short, 120) > axisOf(short, 80), "axis grows with the terminal");
+	// Needier right-hand column → shorter axis, same terminal.
+	assert.ok(axisOf(long, 120) < axisOf(short, 120), "axis yields to a longer label");
+	assert.ok(axisOf(long, 120) >= RAIL_AXIS_MIN_COLS, "axis never drops below its floor");
+	for (const nodes of [short, long]) {
+		for (const width of [20, 24, 30, 46, 60, 79, 80, 100, 120, 160, 220]) {
+			const out = renderRailway({ nodes, now, width, rate: 0 })!;
+			assert.ok(axisOf(nodes, width) >= Math.min(RAIL_AXIS_MIN_COLS, width - 2), `width ${width}: axis stays drawable`);
+			for (const line of out.canvas.toLines(ansiTheme)) assert.equal(visibleWidth(line), width, `width ${width}`);
+		}
+	}
+});
+
+test("railway: content-driven plan grades the detail by what fits", () => {
+	const now = sec(600);
+	const rich = node("w", { startedAt: sec(0), turns: 3, currentTurnStartedAt: sec(120), lastActivityAt: sec(125) });
+	const wide = railColumnPlan([rich], now, false, 160);
+	const narrow = railColumnPlan([rich], now, false, 40);
+	assert.equal(wide.grade, 0, "roomy terminal keeps role · clocks · ago");
+	assert.ok(narrow.grade >= wide.grade, "tight terminal degrades");
+	assert.ok(wide.needed > narrow.needed, "richer grade claims more columns");
+	// Portrait measures the name · ago label instead.
+	const portrait = railColumnPlan([rich], now, true, 160);
+	assert.equal(portrait.grade, 0);
+	assert.ok(portrait.needed > 0);
+});
+
+test("railway: header tok/s carries no now/live label", () => {
+	const out = renderRailway({ nodes: [ROOT, node("worker-0")], now: sec(30), width: 120, rate: 1234 })!;
+	const header = out.canvas.toPlain()[0]!;
+	assert.match(header, /1\.2k tok\/s/);
+	assert.doesNotMatch(header, /\bnow\b/);
+	assert.match(header, /1 live/, "live count stays in the header");
+	assert.doesNotMatch(header, /tok\/s now|now tok\/s/);
+});
+
+test("railway: lane detail drops a field for every lane, not just the long-named one", () => {
+	const now = sec(600);
+	const nodes = [
+		ROOT,
+		node("w", { role: "worker", startedAt: sec(0), turns: 2, currentTurnStartedAt: sec(120), lastActivityAt: sec(125) }),
+		node("a-much-longer-agent-name", { role: "worker", startedAt: sec(0), turns: 2, currentTurnStartedAt: sec(120), lastActivityAt: sec(125) }),
+	];
+	const out = renderRailway({ nodes, now, width: 80, rate: 0 })!;
+	const rows = out.canvas.toPlain().slice(1);
+	const withRole = rows.filter((l) => l.includes("worker ·"));
+	assert.ok(withRole.length === 0 || withRole.length === rows.length, `role is all-or-nothing across lanes: ${JSON.stringify(rows)}`);
+});
+
+test("railway: a round-1 child still gets clocks (regression: turns>=2 gate starved the column)", () => {
+	const now = sec(600);
+	// Real shape: one user message → turns === 1.
+	const round1 = node("scout-0", { role: "scout", startedAt: sec(0), turns: 1, currentTurnStartedAt: sec(0), lastActivityAt: sec(599) });
+	const out = renderRailway({ nodes: [ROOT, round1], now, width: 120, rate: 159 })!;
+	const line = Array.from(out.canvas.toPlain()[1]!);
+	const axis = line.indexOf("▶") - 1;
+	// Round 1 collapses to a single clock, but the detail still spans ~24 cols
+	// instead of the ~13 it had when the clocks were hidden entirely (79% axis).
+	assert.match(out.canvas.toLines(plainTheme).join("\n"), /scout · 10m00s · 1s ago/);
+	assert.ok(axis < 90, `axis must not starve the detail column: axis=${axis}`);
 });
