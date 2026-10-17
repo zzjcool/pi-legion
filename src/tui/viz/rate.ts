@@ -3,13 +3,13 @@
  *
  * Two UI surfaces show throughput with different definitions:
  *
- * - Header / snap "now" (`nowRate`): 60s trailing window + live (running)
+ * - Header / snap tok/s (`nowRate`): 60s trailing window + live (running)
  *   agents only. Numerator = Δ cumulative output tokens; denominator =
  *   Δ cumulative generationMs over the same window (falls back to wall-clock
  *   window when generationMs is unavailable / zero, or when in-window
  *   ΔgenerationMs is below MIN_RATE_GENERATION_MS — same 1s floor as the
- *   tree-row gate). Once nothing is live, "now" is 0 even if the window
- *   still holds Δtokens.
+ *   tree-row gate). Once nothing is live, the header rate is 0 even if the
+ *   window still holds Δtokens.
  * - Tree-row label (`avg t/s` in status.ts): lifetime cumulative average
  *   `tokensOut / (generationMs/1000)` — no window, no live filter.
  *
@@ -173,7 +173,7 @@ export class RateSampler {
 
 	/**
 	 * Sum of node rates. When `onlyNodeIds` is set (including empty), only those
-	 * series contribute — used for header "now". Omit it for chart buckets/avg
+	 * series contribute — used for the header tok/s. Omit it for chart buckets/avg
 	 * so settled agents still paint their trailing-window history.
 	 */
 	totalRate(now: number, windowMs = RATE_WINDOW_MS, onlyNodeIds?: Iterable<string>): number {
@@ -186,7 +186,7 @@ export class RateSampler {
 		return sum;
 	}
 
-	/** Header / snap "now" tok/s: live (running) agents only; none live → 0. */
+	/** Header / snap tok/s: live (running) agents only; none live → 0. */
 	nowRate(now: number, nodes: readonly VizNode[], windowMs = RATE_WINDOW_MS): number {
 		return this.totalRate(now, windowMs, liveRateNodeIds(nodes));
 	}
@@ -240,7 +240,7 @@ export class RateSampler {
 	}
 }
 
-/** Node ids that contribute to header "now" tok/s (running agents; root excluded). */
+/** Node ids that contribute to the header tok/s (running agents; root excluded). */
 export function liveRateNodeIds(nodes: readonly VizNode[]): string[] {
 	return nodes.filter((n) => n.id !== "root" && n.status === "running").map((n) => n.id);
 }

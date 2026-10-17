@@ -193,10 +193,15 @@ commands without an LLM. Passing verification advances the squad to `done`.
 1. **Railway strip above the input:** one git-graph lane per live subagent
    (max 4, 3 below 80 columns; oldest/shallowest first, `+N` for the rest).
    When an agent ends its lane merges back and lower lanes shift up. The
-   header shows the live count and tok/s (trailing 60s average). Hidden when
-   no subagent is live. Set `PI_LEGION_STRIP=tree` for the classic roster.
+   header shows the live count and tok/s (trailing 60s average). The lane
+   label reads `role · <time since the last task started> / <lifetime> · <age
+   of last activity>`; the leading clock keeps ticking through the quiet gap
+   after a turn settles and freezes only when the agent itself ends. The lane
+   column is measured from what the labels need and the time axis takes the
+   rest (down to a floor), so a row always fills the line. Hidden when no
+   subagent is live. Set `PI_LEGION_STRIP=tree` for the classic roster.
 2. **`/legion` full view:** galaxy graph of the agent tree, stacked tok/s
-   chart by agent type (peak marker, now/avg/peak/total, per-role share), and
+   chart by agent type (peak marker, rate/avg/peak/total, per-role share), and
    a scrollable `log --graph` history. Tab switches panes, arrows scroll or
    move the selection, Enter selects an agent (its own rate line, tok/s,
    tokens and share are overlaid), `o` opens its live overlay, `x` stops it

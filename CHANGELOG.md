@@ -11,6 +11,33 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Changed
+
+- Railway lane clock: the leading clock is now "time since the last task
+  started" — it keeps ticking through the quiet gap after a turn settles
+  (previously it froze at that turn's end, i.e. the *previous* task's elapsed)
+  and freezes only when the agent itself ends.
+- Railway lane clocks show from round 1. #159 gated them behind `turns >= 2`,
+  but a child is usually dispatched with a single user message, so that gate
+  hid the clocks almost always and starved the detail column.
+- Round 1 prints one clock, not two: that turn starts with the agent, so
+  `16s / 17s` was one fact plus the spawn gap.
+- Railway column is content-driven: the right-hand name/detail block takes what
+  the labels need and the time axis absorbs the rest (floor
+  `RAIL_AXIS_MIN_COLS`), so a row fills the line instead of trailing blanks.
+
+### Fixed
+
+- Dropped the `now` / `live` wording from every tok/s surface. "now" meant two
+  different things at once (the live-only header rate vs. the chart's x-axis
+  right edge), which read as a bug; the stat row key is now `rate`.
+- Rail lane detail drops a field for *every* lane when it fits none, instead of
+  stripping the role from one long-named row only.
+- `make rebuild` rebuilds the sandbox image and swaps the container.
+- Real-model sandbox: children get `PI_LEGION_CHILD_EXTENSIONS` so they load
+  the provider package (#43) — without it every subagent failed with
+  `Unknown provider "any-endpoint"`.
+
 ## [2.0.4] — 2026-10-15
 
 ### Added

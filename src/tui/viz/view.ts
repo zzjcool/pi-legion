@@ -55,7 +55,7 @@ export function renderLegionView(data: ViewData, state: LegionViewState, cols: n
 	const failed = agents.filter((node) => node.status === "failed").length;
 	const parts = [
 		`live ${live}`,
-		`${formatCount(data.rate)} now tok/s`,
+		`${formatCount(data.rate)} tok/s`,
 		elapsed,
 		`${agents.length} agents`,
 		...(failed ? [`${failed} failed`] : []),
