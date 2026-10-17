@@ -130,6 +130,9 @@ export type {
 export { Orchestrator, preCreateSessionFile, effectiveMaxDepth } from "./runs/orchestrator.ts";
 export type { BudgetRefusedEvent, CollectResult, OrchestratorDeps } from "./runs/orchestrator.ts";
 export { RpcSupervisor } from "./supervisor/rpc-supervisor.ts";
+export { InProcessSupervisor } from "./supervisor/inprocess-supervisor.ts";
+export { RoutingSupervisor } from "./supervisor/routing-supervisor.ts";
+export { resolveSpawnMode, DEFAULT_SPAWN_MODE, DEFAULT_INPROCESS_MAX_ACTIVE } from "./supervisor/spawn-mode.ts";
 export { InMemoryUIProxy, isExtensionUIRequest } from "./supervisor/ui-proxy.ts";
 export type {
 	ChildHandle,
@@ -142,6 +145,16 @@ export type {
 	SupervisorEvent,
 	UsageSnapshot,
 } from "./supervisor/types.ts";
+export type {
+	InProcessSession,
+	InProcessSessionFactory,
+	InProcessSupervisorOptions,
+} from "./supervisor/inprocess-supervisor.ts";
+export type {
+	RoutingSupervisorOptions,
+	SupervisorBackend,
+} from "./supervisor/routing-supervisor.ts";
+export type { InProcessLimits, SpawnMode } from "./shared/types.ts";
 export type {
 	ExtensionUIRequest,
 	ExtensionUIResponse,

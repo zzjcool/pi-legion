@@ -18,6 +18,8 @@ import {
 	type AcceptanceConfig,
 	type AcceptanceCriterion,
 	type OnBlockedPolicy,
+	type SpawnMode,
+	SPAWN_MODES,
 	type SystemPromptMode,
 	type ToolBudgetConfig,
 	type TurnBudgetConfig,
@@ -173,6 +175,16 @@ function int(value: unknown): number | undefined {
 		return Number(value.trim());
 	return undefined;
 }
+
+function spawnModeOf(value: unknown, filePath: string): SpawnMode | undefined {
+	if (value === undefined || value === null || value === "") return undefined;
+	const raw = typeof value === "string" ? value.trim() : String(value);
+	if ((SPAWN_MODES as readonly string[]).includes(raw)) return raw as SpawnMode;
+	throw new Error(
+		`Agent '${filePath}' has invalid spawnMode '${raw}'; expected one of: ${SPAWN_MODES.join(", ")}.`,
+	);
+}
+
 
 /**
  * Accept `tools: read, bash`, `tools: [read, bash]`, and block-list spellings.
@@ -543,6 +555,7 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "disabled", bool(fm.disabled));
 	setIf(config, "worktree", bool(fm.worktree));
 	setIf(config, "steer", bool(fm.steer));
+	setIf(config, "spawnMode", spawnModeOf(fm.spawnMode, config.filePath));
 	setIf(config, "acceptance", parseAcceptance(fm.acceptance, config.name));
 	setIf(config, "toolBudget", parseBudget(fm.toolBudget));
 	setIf(config, "turnBudget", parseTurnBudget(fm.turnBudget));

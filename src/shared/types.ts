@@ -46,6 +46,11 @@ export const AGENT_KINDS = [
 
 export type AgentKind = (typeof AGENT_KINDS)[number];
 
+/** How Legion launches a child session. Omit / default = rpc. */
+export const SPAWN_MODES = ["rpc", "inprocess"] as const;
+export type SpawnMode = (typeof SPAWN_MODES)[number];
+
+
 /**
  * How the model a child starts with was chosen.
  *
@@ -149,6 +154,11 @@ export interface AgentConfig {
 	kind: AgentKind;
 	worktree?: boolean;
 	steer?: boolean;
+	/**
+	 * Launch backend for this role. Omit = `rpc` (subprocess RpcClient).
+	 * `inprocess` uses createAgentSession in the parent Node process.
+	 */
+	spawnMode?: SpawnMode;
 	onBlocked?: OnBlockedPolicy;
 
 	// ── provenance ──
@@ -585,6 +595,21 @@ export interface ScoutGuardSettings {
 	cooldownMs?: number;
 }
 
+
+/**
+ * Concurrency / depth / wait limits for the in-process supervisor (#197).
+ * Keys are independent of RPC / legion.* budgets — never fall back to those.
+ * Omitted fields are unlimited except `maxActive`, which defaults to 8 when
+ * the whole `inprocess` object is present without `maxActive`.
+ */
+export interface InProcessLimits {
+	maxSpawnsPerSession?: number;
+	maxDepth?: number;
+	maxActive?: number;
+	maxChildrenPerNode?: number;
+	waitTimeoutMs?: number;
+}
+
 export interface SubagentsSettings {
 	/**
 	 * Master switch (default true). `false` stops new launches, system-prompt
@@ -648,6 +673,11 @@ export interface SubagentsSettings {
 	joinFlushMs?: number;
 	/** Main-session recon reminder. Absent fields use scout-guard defaults. */
 	scoutGuard?: ScoutGuardSettings;
+	/**
+	 * Limits for `spawnMode: "inprocess"` children only (#197).
+	 * RPC path never reads these keys.
+	 */
+	inprocess?: InProcessLimits;
 }
 
 /**
