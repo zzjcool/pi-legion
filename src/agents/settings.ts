@@ -16,7 +16,9 @@ import {
 	type ModelScopeConfig,
 	type OnBlockedPolicy,
 	type ScoutGuardSettings,
+	type InProcessLimits,
 	type SubagentsSettings,
+	SPAWN_MODES,
 	type TeamConfig,
 	type TeamMember,
 } from "../shared/types.ts";
@@ -481,6 +483,7 @@ export function parseSubagentSettings(
 
 	readJoinFields(input, out, filePath);
 	setIf(out, "scoutGuard", parseScoutGuard(input.scoutGuard, filePath));
+	setIf(out, "inprocess", parseInProcessLimits(input.inprocess, filePath));
 
 	// THE WHITELIST: every key read above must be assigned, or it is silently
 	// discarded. `presets` is the newest key and the easiest to drop here.
@@ -537,6 +540,7 @@ function overrideFieldExpected(field: string): string | undefined {
 	if (["description", "model", "preset", "output", "systemPrompt"].includes(field)) return "a string";
 	if (field === "thinking") return "a string or false";
 	if (field === "kind") return `one of: ${AGENT_KINDS.join(", ")}`;
+	if (field === "spawnMode") return `one of: ${SPAWN_MODES.join(", ")}`;
 	if (field === "onBlocked") return "a valid onBlocked policy";
 	if (field === "systemPromptMode") return "replace or append";
 	if (["inheritProjectContext", "inheritSkills", "inheritExtensions", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer"].includes(field)) return "a boolean";
@@ -550,6 +554,7 @@ function isValidOverrideField(field: string, value: unknown): boolean {
 	if (["description", "model", "preset", "output", "systemPrompt"].includes(field)) return typeof value === "string";
 	if (field === "thinking") return typeof value === "string" || value === false;
 	if (field === "kind") return typeof value === "string" && (AGENT_KINDS as readonly string[]).includes(value);
+	if (field === "spawnMode") return typeof value === "string" && (SPAWN_MODES as readonly string[]).includes(value);
 	if (field === "onBlocked") return typeof value === "string" && VALID_ON_BLOCKED_POLICIES.has(value);
 	if (field === "systemPromptMode") return value === "replace" || value === "append";
 	if (["inheritProjectContext", "inheritSkills", "inheritExtensions", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer"].includes(field)) return typeof value === "boolean";
@@ -561,6 +566,44 @@ function isValidOverrideField(field: string, value: unknown): boolean {
 
 function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+
+function parseInProcessLimits(
+	value: unknown,
+	filePath: string,
+): InProcessLimits | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid 'inprocess'; expected an object.`,
+		);
+	}
+	const out: InProcessLimits = {};
+	const maxSpawnsPerSession = positiveInt(
+		value.maxSpawnsPerSession,
+		"inprocess.maxSpawnsPerSession",
+		filePath,
+	);
+	if (maxSpawnsPerSession !== undefined) out.maxSpawnsPerSession = maxSpawnsPerSession;
+	const maxDepth = nonNegativeInt(value.maxDepth, "inprocess.maxDepth", filePath);
+	if (maxDepth !== undefined) out.maxDepth = maxDepth;
+	const maxActive = positiveInt(value.maxActive, "inprocess.maxActive", filePath);
+	if (maxActive !== undefined) out.maxActive = maxActive;
+	const maxChildrenPerNode = nonNegativeInt(
+		value.maxChildrenPerNode,
+		"inprocess.maxChildrenPerNode",
+		filePath,
+	);
+	if (maxChildrenPerNode !== undefined) out.maxChildrenPerNode = maxChildrenPerNode;
+	const waitTimeoutMs = positiveInt(
+		value.waitTimeoutMs,
+		"inprocess.waitTimeoutMs",
+		filePath,
+	);
+	if (waitTimeoutMs !== undefined) out.waitTimeoutMs = waitTimeoutMs;
+	// Unknown keys are ignored (same as other settings blobs).
+	return out;
 }
 
 /** Validate the types of the supported fields in one override object. */
@@ -619,6 +662,15 @@ function parseAgentOverrides(
 		if (normalized.utility !== undefined && typeof normalized.utility !== "boolean") {
 			throw new Error(
 				`Subagent settings in '${filePath}' have invalid 'agentOverrides.${name}.utility'; expected a boolean.`,
+			);
+		}
+		if (
+			normalized.spawnMode !== undefined &&
+			(typeof normalized.spawnMode !== "string" ||
+				!(SPAWN_MODES as readonly string[]).includes(normalized.spawnMode))
+		) {
+			throw new Error(
+				`Subagent settings in '${filePath}' have invalid 'agentOverrides.${name}.spawnMode'; expected one of: ${SPAWN_MODES.join(", ")}.`,
 			);
 		}
 		parsed[name] = normalized as AgentOverride;

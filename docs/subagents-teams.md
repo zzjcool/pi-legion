@@ -98,3 +98,7 @@ under `"subagents"`. `PI_SUBAGENTS_TEAM` takes precedence over that configured
 `subagents.team` value when selecting the team. See the README's [Team
 配置](../README.md#team-配置) section for the selection, context resolve order,
 and override semantics.
+
+## spawnMode (rpc | inprocess)
+
+See [inprocess-supervisor.md](./inprocess-supervisor.md) (#197).

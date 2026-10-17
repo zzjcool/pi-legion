@@ -59,6 +59,7 @@ import {
 } from "../shared/types.ts";
 import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
 import type { LegionSupervisor, SettleResult, SpawnInput } from "../supervisor/types.ts";
+import { isInProcessSpawn } from "../supervisor/spawn-mode.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
 import { nativeModelFor } from "./kind.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
@@ -358,7 +359,18 @@ export class Orchestrator {
 		// own maxActiveNodes slot when it is already starting/running.
 		const maxChildren = legion.settings?.maxChildrenPerNode ?? 8;
 		const activeReservation = previous && (previous.status === "starting" || previous.status === "running") ? 1 : 0;
-		const limits: LegionBudgetLimits = { maxDepth: depthCeiling, maxChildrenPerNode: maxChildren, maxActiveNodes: (legion.settings?.maxActiveNodes ?? 30) + activeReservation };
+		// In-process children use subagents.inprocess.* only — do not spend RPC legion.* slots (#197).
+		const limits: LegionBudgetLimits = isInProcessSpawn(input.agent)
+			? {
+					maxDepth: MAX_NESTED_PATH_ENTRIES,
+					maxChildrenPerNode: Number.MAX_SAFE_INTEGER,
+					maxActiveNodes: Number.MAX_SAFE_INTEGER,
+			  }
+			: {
+					maxDepth: depthCeiling,
+					maxChildrenPerNode: maxChildren,
+					maxActiveNodes: (legion.settings?.maxActiveNodes ?? 30) + activeReservation,
+			  };
 		const gate = withLaunchBudget(legion.db, { parentId: legion.nodeId, depth: parent.depth + 1, nodeId: input.nodeId }, () => {
 			if (previous) {
 				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team }, this.now);
@@ -527,6 +539,13 @@ export class Orchestrator {
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
+		const inProcess = isInProcessSpawn(input.agent);
+		if (inProcess && (input.worktree === true || input.agent.worktree === true)) {
+			throw new SubagentError(
+				`spawnMode "inprocess" cannot combine with worktree isolation; use spawnMode "rpc" or set worktree: false`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
 		const generated = input.name ?? (this.legion ? this.allocateLegionName(input.agent.name) : this.allocateName(input.agent.name));
 		const name = this.legion ? this.legionLocalName(generated) : generated;
 		const nodeId = this.legion ? nodeIdForChild(this.legion.nodeId, name) : undefined;
@@ -534,8 +553,8 @@ export class Orchestrator {
 		const previous = this.children.get(name) ?? (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
 		if (previous && !this.children.has(name)) this.children.set(name, previous);
 		// A utility dispatch is a hard leaf, not a nested command-chain launch.
-		// The frozen contract therefore skips assertWithinBudgets entirely.
-		if (!input.utilityDispatch) this.assertWithinBudgets(Boolean(previous));
+		// In-process children use subagents.inprocess.* budgets (never RPC keys).
+		if (!input.utilityDispatch && !inProcess) this.assertWithinBudgets(Boolean(previous));
 		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		const models = this.planModelCandidates({
 			agent: input.agent,
@@ -555,6 +574,12 @@ export class Orchestrator {
 					launch: input.worktree,
 					parentInWorktree: isInsideChildWorktree(this.cwd),
 				});
+		if (inProcess && worktree) {
+			throw new SubagentError(
+				`spawnMode "inprocess" cannot use worktree isolation for '${name}'`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
 		let worktreePath = previous?.worktreePath;
 		let worktreeBranch = previous?.worktreeBranch;
 		let createdWorktree = false;

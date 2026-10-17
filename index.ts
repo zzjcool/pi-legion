@@ -20,6 +20,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
+import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
+import { RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
 import type { LegionSupervisor } from "./src/supervisor/types.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
@@ -496,10 +498,28 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			} catch { /* no UI */ }
 		});
 	}
-	const supervisor = deps.supervisor ?? new RpcSupervisor({
-		onSpawnRefused: (message) => {
-			try { lastUi?.notify(`pi-legion: ${message}`, "error"); } catch { /* no UI (child / print mode) */ }
-		},
+	const onSpawnRefused = (message: string) => {
+		try { lastUi?.notify(`pi-legion: ${message}`, "error"); } catch { /* no UI (child / print mode) */ }
+	};
+	// Mutable host cwd so inprocess limits can re-read project settings as the
+	// extension follows the parent session's working directory (#197).
+	let lastCwd = process.cwd();
+	const supervisor = deps.supervisor ?? new RoutingSupervisor({
+		rpc: new RpcSupervisor({ onSpawnRefused }),
+		inprocess: new InProcessSupervisor({
+			onSpawnRefused,
+			getLimits: () => {
+				try {
+					return loadSubagentSettings({
+						userSettingsPath: path.join(getAgentDir(), "settings.json"),
+						projectSettingsPath: path.join(lastCwd, ".pi", "settings.json"),
+					}).inprocess;
+				} catch {
+					return undefined;
+				}
+			},
+		}),
+		onSpawnRefused,
 	});
 	const verifyRunner = deps.verifyRunner;
 	const legionBus = createLegionEventBus();
@@ -524,7 +544,6 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			return true;
 		}
 	};
-	let lastCwd = process.cwd();
 	let legionIdentity: LegionRuntimeIdentity | undefined;
 	const stopLegionRuntime = (): void => {
 		if (!legionIdentity) return;

@@ -11,6 +11,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Added
+
+- Optional in-process `AgentSession` spawn mode (#197): `spawnMode: "rpc" | "inprocess"`
+  (default rpc), `InProcessSupervisor` + `RoutingSupervisor`, and separate
+  `subagents.inprocess.*` limit keys. See `docs/inprocess-supervisor.md`.
+
 ### Changed
 
 - Railway lane clock: the leading clock is now "time since the last task
