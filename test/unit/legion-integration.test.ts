@@ -30,7 +30,7 @@ import {
 	registerLegionCommand,
 	type RpcEventSource,
 } from "../../src/extension/legion-commands.ts";
-import type { LiveOverlayComponent } from "../../src/tui/live-overlay.ts";
+import { resolveModalOverlayOptions, type LiveOverlayComponent } from "../../src/tui/live-overlay.ts";
 import type { TreeNodeSnapshot, TreeViewComponent } from "../../src/tui/tree-view.ts";
 import type { SupervisorEvent } from "../../src/supervisor/types.ts";
 
@@ -660,7 +660,11 @@ function testOverlayHandle(): OverlayHandle {
 
 interface OpenCustomCall {
 	component?: Component;
-	options?: { overlay?: boolean; overlayOptions?: { width?: string }; onHandle?: (handle: OverlayHandle) => void };
+	options?: {
+		overlay?: boolean;
+		overlayOptions?: () => { width: number; minWidth: number; maxHeight: number; anchor: string };
+		onHandle?: (handle: OverlayHandle) => void;
+	};
 	promise: Promise<unknown>;
 }
 
@@ -678,7 +682,11 @@ class FakeCommandUi {
 			keybindings: never,
 			done: (result: T) => void,
 		) => Component | Promise<Component>,
-		options?: { overlay?: boolean; overlayOptions?: { width?: string }; onHandle?: (handle: OverlayHandle) => void },
+		options?: {
+			overlay?: boolean;
+			overlayOptions?: () => { width: number; minWidth: number; maxHeight: number; anchor: string };
+			onHandle?: (handle: OverlayHandle) => void;
+		},
 	): Promise<T> {
 		if (this.customMode === "throwSynchronously") throw new Error("custom threw synchronously");
 		let resolve!: (value: T) => void;
@@ -783,7 +791,7 @@ test("/legion mounts the paged tree; j/o opens a node overlay and q/Esc close bo
 	await Promise.resolve();
 	assert.equal(harness.ui.calls.length, 2);
 	assert.equal(harness.ui.calls[1]?.options?.overlay, true);
-	assert.deepEqual(harness.ui.calls[1]?.options?.overlayOptions, { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 });
+	assert.deepEqual(harness.ui.calls[1]?.options?.overlayOptions, resolveModalOverlayOptions());
 	assert.deepEqual(harness.rpc.subscriptions.map(({ name, options }) => ({ name, options })), [
 		{ name: "worker", options: { includeTextDelta: true } },
 	]);
@@ -904,7 +912,11 @@ test("/legion <name> opens the selected floating overlay and Esc unsubscribes on
 	await harness.handler("worker", harness.ctx);
 	assert.equal(harness.ui.calls.length, 1);
 	assert.equal(harness.ui.calls[0]?.options?.overlay, true);
-	assert.deepEqual(harness.ui.calls[0]?.options?.overlayOptions, { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 });
+	// #193: the modal must be mounted over the frame rect only, never full-screen,
+	// or pi-tui wipes every host cell (no transparency) and the underlay goes black.
+	// Percentages, so the rect is re-derived from the live terminal on resize.
+	assert.deepEqual(harness.ui.calls[0]?.options?.overlayOptions, resolveModalOverlayOptions());
+	assert.notDeepEqual(harness.ui.calls[0]?.options?.overlayOptions, { width: "100%", maxHeight: "100%" });
 	assert.deepEqual(harness.rpc.subscriptions.map((subscription) => subscription.name), ["worker"]);
 	const overlay = harness.ui.calls[0]?.component as Component | undefined;
 	assert.ok(overlay);

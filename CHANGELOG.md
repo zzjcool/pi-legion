@@ -37,6 +37,17 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - Real-model sandbox: children get `PI_LEGION_CHILD_EXTENSIONS` so they load
   the provider package (#43) — without it every subagent failed with
   `Unknown provider "any-endpoint"`.
+- Subagent detail modal: the area around the frame is no longer black. It was
+  mounted as a full-screen overlay, and pi-tui composites an overlay by
+  discarding every base cell in its rectangle (there is no transparency option),
+  so the viewer's own dim-mask spaces were erasing the host chat / `/legion`
+  view and leaving the terminal's default background. The overlay now covers the
+  frame rect only, so the host paints everything around it (#193).
+  - Geometry is a percentage width with no `maxHeight`, so pi-tui re-derives the
+    rect every frame; absolute cells froze at the open-time terminal size and
+    clipped the frame's bottom border and Esc hint after a resize.
+  - "Click the mask to dismiss" is gone — clicks outside the frame now reach the
+    host, as they should. Esc and the title-bar Esc hint still close the modal.
 
 ## [2.0.4] — 2026-10-15
 
