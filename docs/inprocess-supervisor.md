@@ -62,9 +62,23 @@ Orchestrator
          ├─ spawnMode rpc        → RpcSupervisor   (unchanged)
          └─ spawnMode inprocess  → InProcessSupervisor
                                       createAgentSession + SessionManager.inMemory
+                                      (tools / model / systemPrompt wired)
 ```
 
 `InProcessSupervisor` implements the full contract: `spawnChild` / `prompt` / `steer` / `followUp` / `abort` / `waitSettled` / `isAlive` / `stats` / `retire`. Retire calls `session.dispose()` — no SIG / descendant sweep. Events fan-in with the same coarse types as RPC (`agent_*`, `turn_*`, `tool_execution_*`) for rail / TUI. OSC hierarchical activity (#166) may be stubbed here.
+
+## Session factory (v1 whitelist)
+
+Production `defaultSessionFactory` calls `createAgentSession` with:
+
+| Option | Source |
+|---|---|
+| `tools` | `agent.tools` (omit when unset → SDK default). Non-utility roles also get `vexillatio`, same as RPC `pushToolArgs`. |
+| `model` / `thinkingLevel` | Resolved spawn `model` (+ `thinking` / `modelProvider`), via `ModelRuntime` + `resolveCliModel` — same string Orchestrator already picked for RPC. |
+| system prompt | `DefaultResourceLoader` `systemPromptOverride` (replace) or `appendSystemPromptOverride` (append) from `agent.systemPrompt` + `systemPromptMode`. `childContext` is joined once here (RPC-aligned); do not double-inject. |
+| extensions | Default `noExtensions: true` + explicit `additionalExtensionPaths` from role / `PI_LEGION_CHILD_EXTENSIONS` / auto `builtin:codemode` + child-guard. Does **not** reload parent MCP wholesale. `inheritExtensions: true` restores host discovery. |
+
+See `buildInProcessSessionPlan` / `test/unit/inprocess-supervisor.test.ts`.
 
 ## Refusals
 
