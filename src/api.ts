@@ -145,9 +145,14 @@ export type {
 	SupervisorEvent,
 	UsageSnapshot,
 } from "./supervisor/types.ts";
+export {
+	buildInProcessSessionPlan,
+} from "./supervisor/inprocess-supervisor.ts";
 export type {
 	InProcessSession,
 	InProcessSessionFactory,
+	InProcessSessionFactoryInput,
+	InProcessSessionPlan,
 	InProcessSupervisorOptions,
 } from "./supervisor/inprocess-supervisor.ts";
 export type {

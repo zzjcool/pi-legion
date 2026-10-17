@@ -2,12 +2,19 @@
  * LegionSupervisor backed by in-process AgentSession (#197).
  *
  * Uses createAgentSession + SessionManager.inMemory (or an injectable factory
- * for unit tests). Does NOT use RpcClient. Process-tree / SIG retire is skipped.
+ * for unit tests). Production factory wires role tools / model / system prompt
+ * (#199). Does NOT use RpcClient. Process-tree / SIG retire is skipped.
  */
 
 import { formatChildTask } from "../extension/child-guard.ts";
 import {
+	applyThinkingSuffix,
+	childInheritsExtensions,
+	collectChildExtensions,
+} from "../runs/args.ts";
+import {
 	ErrorCodes,
+	isThinkingLevel,
 	type InProcessLimits,
 	SubagentError,
 } from "../shared/types.ts";
@@ -44,12 +51,109 @@ export interface InProcessSession {
 	getSessionStats?(): unknown;
 }
 
-export type InProcessSessionFactory = (input: {
+/** Input to the production / injectable session factory (#199). */
+export interface InProcessSessionFactoryInput {
 	name: string;
 	cwd: string;
 	agent: SpawnInput["agent"];
 	sessionFile: string;
-}) => Promise<InProcessSession>;
+	/** Resolved model id from Orchestrator (same source as RPC `--model`). */
+	model?: string;
+	modelProvider?: string;
+	thinking?: string | false;
+	/**
+	 * Settings-injected child context. Joined with the role prompt here the
+	 * same way RPC's `pushSystemPromptArgs` does — Orchestrator must not also
+	 * inject it through another path for the same spawn.
+	 */
+	childContext?: string;
+}
+
+export type InProcessSessionFactory = (
+	input: InProcessSessionFactoryInput,
+) => Promise<InProcessSession>;
+
+/**
+ * Pure createAgentSession plan derived from spawn input (#199).
+ * Unit-tested without constructing a real SDK session.
+ */
+export interface InProcessSessionPlan {
+	cwd: string;
+	/** Undefined → omit `tools` so the SDK keeps its default selection. */
+	tools?: string[];
+	modelRef?: string;
+	modelProvider?: string;
+	/** Combined role prompt (+ childContext); undefined when neither is set. */
+	systemPromptText?: string;
+	systemPromptMode: "replace" | "append";
+	noExtensions: boolean;
+	additionalExtensionPaths: string[];
+	noSkills: boolean;
+	noContextFiles: boolean;
+}
+
+/**
+ * Build the v1 in-process session plan: role tools whitelist, resolved model
+ * ref, and system prompt (replace/append) aligned with RPC child argv.
+ */
+export function buildInProcessSessionPlan(
+	input: InProcessSessionFactoryInput,
+): InProcessSessionPlan {
+	const tools = resolveInProcessTools(input.agent);
+	const modelRef = applyThinkingSuffix(input.model, input.thinking);
+	const { text: systemPromptText, mode: systemPromptMode } =
+		resolveInProcessSystemPrompt(input);
+
+	const noExtensions = !childInheritsExtensions(input.agent);
+	const additionalExtensionPaths = noExtensions
+		? collectChildExtensions(input.agent)
+		: [];
+
+	return {
+		cwd: input.cwd,
+		...(tools ? { tools } : {}),
+		...(modelRef ? { modelRef } : {}),
+		...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
+		...(systemPromptText ? { systemPromptText } : {}),
+		systemPromptMode,
+		noExtensions,
+		additionalExtensionPaths,
+		noSkills: input.agent.inheritSkills === false,
+		noContextFiles: input.agent.inheritProjectContext === false,
+	};
+}
+
+/** Mirror RPC `pushToolArgs` whitelist (+ vexillatio for non-utility roles). */
+function resolveInProcessTools(
+	agent: SpawnInput["agent"],
+): string[] | undefined {
+	const tools = (agent.tools ?? []).filter(Boolean);
+	if (tools.length === 0) return undefined;
+	if (!agent.utility && !tools.includes("vexillatio")) {
+		tools.push("vexillatio");
+	}
+	return tools;
+}
+
+/** Mirror RPC `pushSystemPromptArgs` join + mode rules. */
+function resolveInProcessSystemPrompt(input: InProcessSessionFactoryInput): {
+	text?: string;
+	mode: "replace" | "append";
+} {
+	const systemPrompt = input.agent.systemPrompt?.trim();
+	const childContext = input.childContext?.trim();
+	if (!systemPrompt && !childContext) {
+		return { mode: input.agent.systemPromptMode };
+	}
+	const text = [systemPrompt, childContext].filter(Boolean).join("\n\n");
+	// When only childContext is present, never replace the SDK base prompt.
+	const mode = systemPrompt
+		? input.agent.systemPromptMode
+		: input.agent.systemPromptMode === "replace"
+			? "append"
+			: input.agent.systemPromptMode;
+	return { text, mode };
+}
 
 export interface InProcessSupervisorOptions {
 	uiProxy?: UIProxy;
@@ -116,19 +220,82 @@ function recordOf(value: unknown): Record<string, unknown> | null {
 		: null;
 }
 
-async function defaultSessionFactory(input: {
-	name: string;
-	cwd: string;
-	agent: SpawnInput["agent"];
-	sessionFile: string;
-}): Promise<InProcessSession> {
-	const { createAgentSession, SessionManager } = await import(
-		"@earendil-works/pi-coding-agent"
-	);
-	const { session } = await createAgentSession({
-		cwd: input.cwd,
+async function defaultSessionFactory(
+	input: InProcessSessionFactoryInput,
+): Promise<InProcessSession> {
+	const {
+		createAgentSession,
+		SessionManager,
+		DefaultResourceLoader,
+		getAgentDir,
+		ModelRuntime,
+		resolveCliModel,
+	} = await import("@earendil-works/pi-coding-agent");
+
+	const plan = buildInProcessSessionPlan(input);
+	const agentDir = getAgentDir();
+
+	const loaderOptions: ConstructorParameters<typeof DefaultResourceLoader>[0] = {
+		cwd: plan.cwd,
+		agentDir,
+		noExtensions: plan.noExtensions,
+		...(plan.additionalExtensionPaths.length > 0
+			? { additionalExtensionPaths: plan.additionalExtensionPaths }
+			: {}),
+		...(plan.noSkills ? { noSkills: true } : {}),
+		...(plan.noContextFiles ? { noContextFiles: true } : {}),
+	};
+
+	if (plan.systemPromptText) {
+		if (plan.systemPromptMode === "replace") {
+			loaderOptions.systemPromptOverride = () => plan.systemPromptText;
+			// Avoid host APPEND_SYSTEM.md appending onto a replaced role prompt.
+			loaderOptions.appendSystemPromptOverride = () => [];
+		} else {
+			loaderOptions.appendSystemPromptOverride = (base) => [
+				...base,
+				plan.systemPromptText!,
+			];
+		}
+	}
+
+	const resourceLoader = new DefaultResourceLoader(loaderOptions);
+	await resourceLoader.reload();
+
+	const createOptions: Parameters<typeof createAgentSession>[0] = {
+		cwd: plan.cwd,
 		sessionManager: SessionManager.inMemory(),
-	});
+		resourceLoader,
+		...(plan.tools ? { tools: plan.tools } : {}),
+	};
+
+	if (plan.modelRef) {
+		const modelRuntime = await ModelRuntime.create();
+		const resolved = resolveCliModel({
+			cliModel: plan.modelRef,
+			...(plan.modelProvider ? { cliProvider: plan.modelProvider } : {}),
+			modelRuntime,
+		});
+		if (resolved.error || !resolved.model) {
+			throw new SubagentError(
+				`inprocess model resolve failed for '${plan.modelRef}'` +
+					(resolved.error ? `: ${resolved.error}` : ""),
+				ErrorCodes.START_FAILED,
+			);
+		}
+		createOptions.modelRuntime = modelRuntime;
+		createOptions.model = resolved.model;
+		if (resolved.thinkingLevel && isThinkingLevel(resolved.thinkingLevel)) {
+			createOptions.thinkingLevel = resolved.thinkingLevel;
+		} else if (
+			typeof input.thinking === "string" &&
+			isThinkingLevel(input.thinking)
+		) {
+			createOptions.thinkingLevel = input.thinking;
+		}
+	}
+
+	const { session } = await createAgentSession(createOptions);
 	return session;
 }
 
@@ -213,6 +380,14 @@ export class InProcessSupervisor implements LegionSupervisor {
 					cwd: input.cwd,
 					agent: input.agent,
 					sessionFile: input.sessionFile,
+					...(input.model !== undefined ? { model: input.model } : {}),
+					...(input.modelProvider !== undefined
+						? { modelProvider: input.modelProvider }
+						: {}),
+					...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
+					...(input.childContext !== undefined
+						? { childContext: input.childContext }
+						: {}),
 				});
 				registration.session = session;
 				registration.unsubscribeSession = session.subscribe((event) =>
@@ -672,4 +847,3 @@ export class InProcessSupervisor implements LegionSupervisor {
 	}
 }
 
-// Silence unused import if tree-shaken oddly — AsyncLocalStorage used via depth helper.

@@ -5,7 +5,9 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
 	InProcessSupervisor,
+	buildInProcessSessionPlan,
 	type InProcessSession,
+	type InProcessSessionFactoryInput,
 } from "../../src/supervisor/inprocess-supervisor.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
@@ -222,5 +224,155 @@ test("routing: inprocess vs rpc by spawnMode; name cannot cross backends", async
 		await routing.retire("root.ip");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess plan: tools + model + systemPrompt replace/append", () => {
+	const baseAgent = testAgent({
+		tools: ["read", "bash"],
+		systemPrompt: "You are scout.",
+		systemPromptMode: "replace",
+		inheritSkills: false,
+		inheritProjectContext: false,
+	});
+	const plan = buildInProcessSessionPlan({
+		name: "root.scout",
+		cwd: "/tmp/ws",
+		agent: baseAgent,
+		sessionFile: "/tmp/ws/scout.jsonl",
+		model: "anthropic/claude-sonnet-4-5",
+		thinking: "high",
+		childContext: "machine notes",
+	});
+	assert.deepEqual(plan.tools, ["read", "bash", "vexillatio"]);
+	assert.equal(plan.modelRef, "anthropic/claude-sonnet-4-5:high");
+	assert.equal(plan.systemPromptMode, "replace");
+	assert.equal(plan.systemPromptText, "You are scout.\n\nmachine notes");
+	assert.equal(plan.noExtensions, true);
+	assert.equal(plan.noSkills, true);
+	assert.equal(plan.noContextFiles, true);
+	assert.ok(plan.additionalExtensionPaths.some((p) => p.includes("index.ts")));
+
+	const appendPlan = buildInProcessSessionPlan({
+		name: "root.scout",
+		cwd: "/tmp/ws",
+		agent: testAgent({
+			tools: undefined,
+			systemPrompt: "Extra.",
+			systemPromptMode: "append",
+			utility: true,
+		}),
+		sessionFile: "/tmp/s.jsonl",
+	});
+	assert.equal(appendPlan.tools, undefined);
+	assert.equal(appendPlan.systemPromptMode, "append");
+	assert.equal(appendPlan.systemPromptText, "Extra.");
+	assert.equal(appendPlan.modelRef, undefined);
+});
+
+test("inprocess plan: omit tools leaves SDK default; utility skips vexillatio", () => {
+	const empty = buildInProcessSessionPlan({
+		name: "u",
+		cwd: "/tmp",
+		agent: testAgent({ tools: [], utility: true, systemPrompt: "" }),
+		sessionFile: "/tmp/u.jsonl",
+	});
+	assert.equal(empty.tools, undefined);
+	assert.equal(empty.systemPromptText, undefined);
+
+	const util = buildInProcessSessionPlan({
+		name: "u2",
+		cwd: "/tmp",
+		agent: testAgent({ tools: ["read"], utility: true }),
+		sessionFile: "/tmp/u2.jsonl",
+	});
+	assert.deepEqual(util.tools, ["read"]);
+});
+
+test("inprocess: spawnChild forwards model/thinking/childContext to factory", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-fwd-"));
+	const captured: InProcessSessionFactoryInput[] = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async (input) => {
+			captured.push(input);
+			const session = new FakeSession();
+			return session;
+		},
+	});
+	try {
+		await supervisor.spawnChild({
+			...testInput(root),
+			model: "openai/gpt-4.1",
+			modelProvider: "openai",
+			thinking: "low",
+			childContext: "ctx",
+		});
+		assert.equal(captured.length, 1);
+		assert.equal(captured[0]!.model, "openai/gpt-4.1");
+		assert.equal(captured[0]!.modelProvider, "openai");
+		assert.equal(captured[0]!.thinking, "low");
+		assert.equal(captured[0]!.childContext, "ctx");
+		assert.deepEqual(captured[0]!.agent.tools, ["read"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: refuses kind!==pi", async () => {
+	const h = harness();
+	try {
+		await assert.rejects(
+			() =>
+				h.supervisor.spawnChild(
+					testInput(h.root, "root.x", testAgent({ kind: "claude" })),
+				),
+			(error: unknown) =>
+				error instanceof Error &&
+				(error as { code?: string }).code === ErrorCodes.INVALID_PARAMS,
+		);
+	} finally {
+		h.close();
+	}
+});
+
+test("inprocess: maxDepth / maxChildrenPerNode / maxSpawnsPerSession", async () => {
+	const depth = harness({ maxActive: 8, maxDepth: 0 });
+	try {
+		await assert.rejects(
+			() => depth.supervisor.spawnChild(testInput(depth.root)),
+			(error: unknown) =>
+				(error as { code?: string }).code === ErrorCodes.BUDGET_EXCEEDED &&
+				/inprocess nesting limit/.test((error as Error).message),
+		);
+	} finally {
+		depth.close();
+	}
+
+	const children = harness({ maxActive: 8, maxChildrenPerNode: 1 });
+	try {
+		await children.supervisor.spawnChild(testInput(children.root, "root.a"));
+		await assert.rejects(
+			() => children.supervisor.spawnChild(testInput(children.root, "root.b")),
+			(error: unknown) =>
+				(error as { code?: string }).code === ErrorCodes.BUDGET_EXCEEDED &&
+				/maxChildrenPerNode/.test((error as Error).message),
+		);
+	} finally {
+		children.close();
+	}
+
+	const spawns = harness({ maxActive: 8, maxSpawnsPerSession: 1 });
+	try {
+		await spawns.supervisor.spawnChild(testInput(spawns.root, "one"));
+		await spawns.supervisor.retire("one");
+		await assert.rejects(
+			() => spawns.supervisor.spawnChild(testInput(spawns.root, "two")),
+			(error: unknown) =>
+				(error as { code?: string }).code === ErrorCodes.BUDGET_EXCEEDED &&
+				/spawn budget exhausted/.test((error as Error).message),
+		);
+	} finally {
+		spawns.close();
 	}
 });
