@@ -71,6 +71,7 @@ function readSettings(): unknown {
 export function buildAutoDoctorSnippet(kind: AutoDoctorKind, opts?: {
 	cwd?: string;
 	name?: string;
+	spawnMode?: "rpc" | "inprocess";
 }): string {
 	const settings = readSettings();
 	const report = runLegionDoctor({
@@ -80,6 +81,7 @@ export function buildAutoDoctorSnippet(kind: AutoDoctorKind, opts?: {
 		probeModels: false,
 		expectedModels: expectedModelsFromSettings(settings),
 		sections: [...SECTIONS[kind]],
+		spawnMode: opts?.spawnMode,
 		// Failures already recorded by the caller; doctor will pick them up.
 	});
 	let body = report.text.trim();
@@ -108,25 +110,41 @@ export function enrichFailureWithAutoDoctor(
 		cwd?: string;
 		/** When false, skip recording into the recent-failure ring. Default true. */
 		record?: boolean;
+		/** Prefer inprocess hints when known (#212). */
+		spawnMode?: "rpc" | "inprocess";
 	} = {},
 ): string {
 	const kind = classifyFailure({ message, stderr: input.stderr, code: input.code });
+	// Infer rpc when argv shows --no-extensions and caller did not tag spawnMode (#212).
+	const spawnMode =
+		input.spawnMode ??
+		(input.args?.includes("--no-extensions") ? "rpc" as const : undefined);
 	if (input.record !== false) {
 		recordSpawnFailure({
 			name: input.name ?? "?",
 			message,
 			stderr: input.stderr,
-			hadNoExtensions: input.args?.includes("--no-extensions"),
+			hadNoExtensions:
+				spawnMode === "inprocess" ? false : input.args?.includes("--no-extensions"),
+			spawnMode,
 		});
 	}
 	if (!kind) return message;
 
 	const parts = [message];
-	const hint = spawnFailureHint({ stderr: input.stderr ?? message, args: input.args });
+	const hint = spawnFailureHint({
+		stderr: input.stderr ?? message,
+		args: input.args,
+		spawnMode,
+	});
 	if (hint) parts.push("", hint);
 
 	try {
-		parts.push("", buildAutoDoctorSnippet(kind, { cwd: input.cwd, name: input.name }));
+		parts.push("", buildAutoDoctorSnippet(kind, {
+			cwd: input.cwd,
+			name: input.name,
+			spawnMode,
+		}));
 	} catch (error) {
 		parts.push(
 			"",
