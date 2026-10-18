@@ -20,6 +20,7 @@ shared SQLite ledger records the whole tree.
 ## Contents
 
 - [Architecture](#architecture)
+- [Headless child contract](#headless-child-contract)
 - [Quick start](#quick-start)
 - [Legion tools and phases](#legion-tools-and-phases)
 - [Three-layer visualization](#three-layer-visualization)
@@ -62,6 +63,18 @@ Transport, state, decision-making, and display are separate layers:
   owns machine state and validates phase transitions.
 - **Display:** the event bus feeds the resident tree, the `/legion` full view,
   and an on-demand live overlay.
+
+## Headless child contract
+
+Legion children are **rpc only** (`pi --mode rpc`). Headless modes have no
+interactive tool-approval UI. Project `.pi/settings.json` / project extensions
+load under headless only after `/trust` (or `defaultProjectTrust=always`), or
+when you opt in with `subagents.rpc.approve: true` (appends `--approve`). Legion
+`onBlocked` is a parent subagent block strategy — **not** a pi tool-approval
+replacement; keep the layers separate.
+
+Full mapping (exit → `SettleResult` → node state) and the three upstream headless
+modes vs legion: [docs/headless-child-contract.md](docs/headless-child-contract.md).
 
 ## Quick start
 

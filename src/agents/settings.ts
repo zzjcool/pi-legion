@@ -17,6 +17,7 @@ import {
 	type OnBlockedPolicy,
 	type ScoutGuardSettings,
 	type InProcessLimits,
+	type RpcSettings,
 	type SubagentsSettings,
 	SPAWN_MODES,
 	type TeamConfig,
@@ -484,6 +485,7 @@ export function parseSubagentSettings(
 	readJoinFields(input, out, filePath);
 	setIf(out, "scoutGuard", parseScoutGuard(input.scoutGuard, filePath));
 	setIf(out, "inprocess", parseInProcessLimits(input.inprocess, filePath));
+	setIf(out, "rpc", parseRpcSettings(input.rpc, filePath));
 
 	// THE WHITELIST: every key read above must be assigned, or it is silently
 	// discarded. `presets` is the newest key and the easiest to drop here.
@@ -603,6 +605,22 @@ function parseInProcessLimits(
 	);
 	if (waitTimeoutMs !== undefined) out.waitTimeoutMs = waitTimeoutMs;
 	// Unknown keys are ignored (same as other settings blobs).
+	return out;
+}
+
+function parseRpcSettings(
+	value: unknown,
+	filePath: string,
+): RpcSettings | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid 'rpc'; expected an object.`,
+		);
+	}
+	const out: RpcSettings = {};
+	setIf(out, "approve", requiredBoolean(value.approve, "rpc.approve", filePath));
+	// Unknown keys ignored; v1 does not accept / emit --no-approve.
 	return out;
 }
 
@@ -863,6 +881,14 @@ export function resolveSubagentSettings(
 
 	if (project.scoutGuard) {
 		out.scoutGuard = { ...(user.scoutGuard ?? {}), ...project.scoutGuard };
+	}
+
+	if (project.inprocess) {
+		out.inprocess = { ...(user.inprocess ?? {}), ...project.inprocess };
+	}
+
+	if (project.rpc) {
+		out.rpc = { ...(user.rpc ?? {}), ...project.rpc };
 	}
 
 	return out;

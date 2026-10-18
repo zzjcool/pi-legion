@@ -610,6 +610,19 @@ export interface InProcessLimits {
 	waitTimeoutMs?: number;
 }
 
+/**
+ * RPC-child spawn knobs (#193). Opt-in only — default stays no `--approve`.
+ * v1 does not emit `--no-approve`.
+ */
+export interface RpcSettings {
+	/**
+	 * When true, child `pi --mode rpc` argv includes `--approve` so project
+	 * `.pi/settings.json` / project resources / extension discovery can load
+	 * without a prior `/trust` decision. Default false (omit the flag).
+	 */
+	approve?: boolean;
+}
+
 export interface SubagentsSettings {
 	/**
 	 * Master switch (default true). `false` stops new launches, system-prompt
@@ -678,6 +691,11 @@ export interface SubagentsSettings {
 	 * RPC path never reads these keys.
 	 */
 	inprocess?: InProcessLimits;
+	/**
+	 * RPC-child spawn options (#193). Default omits `--approve`; set
+	 * `rpc.approve: true` to append it. Not an inherit-parent-trust channel.
+	 */
+	rpc?: RpcSettings;
 }
 
 /**

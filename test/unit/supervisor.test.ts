@@ -896,3 +896,125 @@ test("defaultPiCliPath prefers the host pi install over the repo devDependency",
 		else process.env.PI_SUBAGENT_CLI = originalEnv;
 	}
 });
+
+test("#193 mapping: unexpected exit 0 is abnormal (green exit ≠ settled)", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const waiting = h.supervisor.waitSettled("root.worker", 5_000);
+		h.clients[0]!.process.exit(0, null);
+		assert.deepEqual(await waiting, {
+			settled: false,
+			abnormal: true,
+			reason: "Pi RPC process exited before agent_settled",
+			exitCode: 0,
+			signal: null,
+		});
+	} finally {
+		h.close();
+	}
+});
+
+test("#193 mapping: unexpected nonzero exit is abnormal with exitCode", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const waiting = h.supervisor.waitSettled("root.worker", 5_000);
+		h.clients[0]!.process.exit(42, null);
+		assert.deepEqual(await waiting, {
+			settled: false,
+			abnormal: true,
+			reason: "Pi RPC process exited before agent_settled",
+			exitCode: 42,
+			signal: null,
+		});
+	} finally {
+		h.close();
+	}
+});
+
+test("#193 mapping: unexpected signal exit is abnormal with signal", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const waiting = h.supervisor.waitSettled("root.worker", 5_000);
+		h.clients[0]!.process.exit(null, "SIGKILL");
+		assert.deepEqual(await waiting, {
+			settled: false,
+			abnormal: true,
+			reason: "Pi RPC process exited before agent_settled",
+			exitCode: null,
+			signal: "SIGKILL",
+		});
+	} finally {
+		h.close();
+	}
+});
+
+test("#193 mapping: retireRequested + signal → abnormal:false retired", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const client = h.clients[0]!;
+		client.process.ignoreInputClose = true;
+		const waiting = h.supervisor.waitSettled("root.worker", 5_000);
+		const retiring = h.supervisor.retire("root.worker");
+		// Fake process exits on SIGTERM from retire escalate path.
+		await retiring;
+		const result = await waiting;
+		assert.equal(result.settled, false);
+		assert.equal(result.abnormal, false);
+		assert.match(result.reason ?? "", /retired/i);
+		assert.ok(
+			result.signal === "SIGTERM" ||
+				result.signal === "SIGKILL" ||
+				result.exitCode !== undefined,
+			"retired result should carry exitCode and/or signal",
+		);
+	} finally {
+		h.close();
+	}
+});
+
+test("#193 mapping: agent_settled → settled:true abnormal:false", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const waiting = h.supervisor.waitSettled("root.worker", 1_000);
+		emitSettled(h.clients[0]!);
+		assert.deepEqual(await waiting, {
+			settled: true,
+			abnormal: false,
+			aborted: false,
+		});
+	} finally {
+		await h.supervisor.retire("root.worker");
+		h.close();
+	}
+});
+
+test("#193 spawn approve:true puts --approve on RpcClient argv", async () => {
+	const h = harness();
+	try {
+		const input = { ...testInput(h.root), approve: true };
+		await h.supervisor.spawnChild(input);
+		const args = h.clients[0]!.options.args ?? [];
+		assert.ok(args.includes("--approve"));
+		assert.equal(args.includes("--no-approve"), false);
+	} finally {
+		await h.supervisor.retire("root.worker");
+		h.close();
+	}
+});
+
+test("#193 spawn default argv omits --approve", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const args = h.clients[0]!.options.args ?? [];
+		assert.equal(args.includes("--approve"), false);
+	} finally {
+		await h.supervisor.retire("root.worker");
+		h.close();
+	}
+});

@@ -108,6 +108,11 @@ export interface OrchestratorDeps {
 	worktreeBootstrapTimeoutMs?: number;
 	team?: ActiveTeam;
 	childContext?: string;
+	/**
+	 * When true, RPC child argv includes `--approve` (`subagents.rpc.approve`).
+	 * Default false / omitted.
+	 */
+	rpcApprove?: boolean;
 	onBudgetRefused?: (event: BudgetRefusedEvent) => void;
 }
 
@@ -246,6 +251,7 @@ export class Orchestrator {
 	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
 	private readonly childContext?: string;
+	private readonly rpcApprove: boolean;
 	private readonly onBudgetRefused?: (event: BudgetRefusedEvent) => void;
 	private readonly legion?: OrchestratorLegionContext;
 	private readonly requestedDepthCap?: number;
@@ -279,6 +285,7 @@ export class Orchestrator {
 		this.worktreeBootstrapTimeoutMs = deps.worktreeBootstrapTimeoutMs;
 		this.team = deps.team;
 		this.childContext = deps.childContext?.trim() || undefined;
+		this.rpcApprove = deps.rpcApprove === true;
 		this.onBudgetRefused = deps.onBudgetRefused;
 		this.legion = deps.legion;
 	}
@@ -654,6 +661,7 @@ export class Orchestrator {
 					...(input.agent.allowNestedSubagents !== undefined && !input.agent.utility ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
 					...(worktreeBranch ? { worktreeBranch } : {}),
 					...(this.childContext ? { childContext: this.childContext } : {}),
+					...(this.rpcApprove ? { approve: true } : {}),
 				};
 				try {
 					result = await this.supervisor.spawnChild(spawnInput);

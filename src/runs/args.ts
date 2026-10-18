@@ -97,6 +97,12 @@ export interface BuildArgsInput {
 	 * the child Pi process so the session records it as the first user turn.
 	 */
 	includeTask?: boolean;
+	/**
+	 * When true, append `--approve` so headless pi trusts the project cwd for
+	 * settings / resources / extension discovery (#193). Default false: omit
+	 * the flag (v1 never emits `--no-approve`).
+	 */
+	approve?: boolean;
 }
 
 export interface BuildArgsResult {
@@ -123,6 +129,8 @@ export function buildPiArgs(input: BuildArgsInput): BuildArgsResult {
 	pushSkillArgs(args, input.agent);
 	pushSystemPromptArgs(args, tempFiles, input);
 	if (input.includeTask !== false) pushTaskArg(args, tempFiles, input);
+	// Opt-in project trust for headless rpc (#193). Never emit --no-approve in v1.
+	if (input.approve === true) args.push("--approve");
 
 	return { args, tempFiles };
 }
