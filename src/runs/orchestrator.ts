@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
 import type { LegionSettings } from "../shared/types.ts";
-import { LEGION_DB_ENV, LEGION_IDENTITY_ENV_KEYS, LEGION_NODE_ID_ENV, legionIdentityEnv } from "./args.ts";
+import { LEGION_IDENTITY_ENV_KEYS, legionIdentityEnv } from "./args.ts";
 import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
@@ -54,12 +54,13 @@ import {
 	type NestedPathEntry,
 	type RetireOptions,
 	type RunRecord,
+	type SpawnMode,
 	SubagentError,
 	type Usage,
 } from "../shared/types.ts";
 import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
 import type { LegionSupervisor, SettleResult, SpawnInput } from "../supervisor/types.ts";
-import { isInProcessSpawn } from "../supervisor/spawn-mode.ts";
+import { isInProcessSpawn, resolveSpawnMode } from "../supervisor/spawn-mode.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
 import { nativeModelFor } from "./kind.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
@@ -546,23 +547,12 @@ export class Orchestrator {
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
-		const inProcess = isInProcessSpawn(input.agent);
-		if (inProcess && (input.worktree === true || input.agent.worktree === true)) {
-			throw new SubagentError(
-				`spawnMode "inprocess" cannot combine with worktree isolation; use spawnMode "rpc" or set worktree: false`,
-				ErrorCodes.INVALID_PARAMS,
-			);
-		}
 		const generated = input.name ?? (this.legion ? this.allocateLegionName(input.agent.name) : this.allocateName(input.agent.name));
 		const name = this.legion ? this.legionLocalName(generated) : generated;
 		const nodeId = this.legion ? nodeIdForChild(this.legion.nodeId, name) : undefined;
 		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
 		const previous = this.children.get(name) ?? (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
 		if (previous && !this.children.has(name)) this.children.set(name, previous);
-		// A utility dispatch is a hard leaf, not a nested command-chain launch.
-		// In-process children use subagents.inprocess.* budgets (never RPC keys).
-		if (!input.utilityDispatch && !inProcess) this.assertWithinBudgets(Boolean(previous));
-		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		const models = this.planModelCandidates({
 			agent: input.agent,
 			...(input.model !== undefined ? { model: input.model } : {}),
@@ -581,6 +571,47 @@ export class Orchestrator {
 					launch: input.worktree,
 					parentInWorktree: isInsideChildWorktree(this.cwd),
 				});
+		// Spawn-mode arbitration (contract D2). `resolveSpawnMode` only reports the
+		// configured intent; the launch context decides whether an OMITTED mode can
+		// actually run in-process. An omitted mode falls back to rpc when this
+		// launch needs worktree isolation (a hard requirement of the in-process
+		// backend). An explicit value is never downgraded (invariant I6) — a bad
+		// explicit combination still throws below.
+		// `kind !== "pi"` is NOT re-tested here: the early guard above (before this
+		// arbitration) already refuses it, so such a clause would be dead code.
+		const explicitMode = input.agent.spawnMode !== undefined;
+		const mode: SpawnMode =
+			!explicitMode && worktree === true
+				? "rpc"
+				: resolveSpawnMode(input.agent);
+		const inProcess = mode === "inprocess";
+		// Downstream must see the arbitrated result, otherwise RoutingSupervisor
+		// re-resolves the omitted field to `inprocess` on its own and throws
+		// "cannot combine with worktree: true" — the arbitration would be moot.
+		// `worktree` is normalized too: a role card that pins `worktree: true`
+		// (e.g. `agents/worker.md`) keeps that raw value even when THIS launch
+		// resolved to no isolation (`parentRole === "centurion"`, an explicit
+		// `launch({ worktree: false })`, or the nested-worktree suppression), and
+		// leaking it makes `{spawnMode:"inprocess", worktree:true}` reach
+		// routing-supervisor.ts:79 / inprocess-supervisor.ts:342, which reject it
+		// with INVALID_PARAMS. That shape is exactly the "centurion dispatches
+		// worker" production path, so it must be normalized to `worktree: false`.
+		// The `&& worktree` short-circuit keeps the rpc path returning the
+		// original object (invariant I3: zero diff on the RPC backend).
+		// reserveNode() and SpawnInput.agent below both receive this clone.
+		const agent: AgentConfig = mode === input.agent.spawnMode && worktree
+			? input.agent
+			: { ...input.agent, spawnMode: mode, ...(worktree ? {} : { worktree: false }) };
+		// A utility dispatch is a hard leaf, not a nested command-chain launch.
+		// In-process children use subagents.inprocess.* budgets (never RPC keys).
+		if (!input.utilityDispatch && !inProcess) this.assertWithinBudgets(Boolean(previous));
+		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
+		// Only an EXPLICIT inprocess can reach this: the arbitration above already
+		// routed every omitted-mode launch that needs a worktree to rpc, so I1
+		// (explicit inprocess + worktree stays a loud throw) holds. This replaces
+		// the old gate, which inspected the raw `worktree` fields and therefore
+		// rejected callers that explicitly overrode a worktree role with
+		// `launch({ worktree: false })` — that override now wins as it should.
 		if (inProcess && worktree) {
 			throw new SubagentError(
 				`spawnMode "inprocess" cannot use worktree isolation for '${name}'`,
@@ -633,7 +664,7 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent: input.agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models.candidates[0], utility: Boolean(input.utilityDispatch && input.agent.utility) });
+				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models.candidates[0], utility: Boolean(input.utilityDispatch && input.agent.utility) });
 				reserved = true;
 				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models.candidates[0] ? { model: models.candidates[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
 			}
@@ -649,7 +680,7 @@ export class Orchestrator {
 				const spawnInput: SpawnInput = {
 					name,
 					task: input.task,
-					agent: input.agent,
+					agent,
 					sessionFile,
 					tempDir,
 					cwd: worktreePath ?? this.cwd,
