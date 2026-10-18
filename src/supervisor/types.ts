@@ -5,6 +5,7 @@
 import type { RpcClientOptions as PiRpcClientOptions } from "@earendil-works/pi-coding-agent";
 import type { Writable } from "node:stream";
 import type { BuildArgsInput } from "../runs/args.ts";
+import type { ChildLaunchContext } from "./child-context.ts";
 import type { UIProxy } from "./ui-proxy.ts";
 
 /**
@@ -17,6 +18,18 @@ export interface SpawnInput extends Omit<BuildArgsInput, "cwd" | "includeTask"> 
 	cwd: string;
 	/** Environment overlay passed to RpcClient. */
 	env?: Record<string, string>;
+	/**
+	 * In-process lineage identity (spawn-default-inprocess-v3 D5).
+	 *
+	 * Deliberately NOT named `childContext`: that inherited `BuildArgsInput`
+	 * field is the *string* settings-injected prompt context, and an interface
+	 * cannot narrow an inherited member to an object type (TS2430). The two
+	 * channels are unrelated — one is prompt text, this one is identity.
+	 *
+	 * Only the inprocess backend consumes it; RPC keeps using env lineage.
+	 * Absent → InProcessSupervisor derives a minimal fallback context.
+	 */
+	childLaunchContext?: ChildLaunchContext;
 	/** Whether to remove Legion lineage identity from the inherited environment. */
 	stripLegionIdentity?: boolean;
 	/** Optional Pi CLI entry point override. */
