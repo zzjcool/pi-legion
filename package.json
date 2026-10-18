@@ -1,6 +1,6 @@
 {
   "name": "pi-legion",
-  "version": "2.0.4",
+  "version": "3.0.0",
   "description": "Pi Legion v2: recursive centurion trees on headless Pi RPC; shared SQLite WAL legion.db. Four-stage planning/implementing/reviewing/verifying state machine, parent/child/sibling legion_mail, three-layer /legion UI, upward MR trees, squad resume.",
   "type": "module",
   "license": "MIT",

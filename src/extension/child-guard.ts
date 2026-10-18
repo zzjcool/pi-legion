@@ -1,12 +1,18 @@
 /**
- * Guards that run inside an RPC child Pi process.
+ * Guards that run inside a child Pi session.
  *
  * The child extension enforces budgets and read-only role protections. A
  * nested dispatch can only use the subagent tool; bash must never access the
  * tree ledger directly.
+ *
+ * Two transports exist (#197): RPC children are separate `pi --mode rpc`
+ * processes (identity arrives via env), in-process children are
+ * `createAgentSession` sessions inside the parent Node process (identity
+ * arrives via the AsyncLocalStorage child context).
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { currentChildContext, type ChildLaunchContext } from "../supervisor/child-context.ts";
 import {
 	budgetExceededReason,
 	childBudgetFromEnv,
@@ -311,6 +317,38 @@ export function childGuardEnvFromProcess(env: NodeJS.ProcessEnv = process.env): 
 		: {};
 }
 
+/**
+ * Read-only role for an in-process child, from the AsyncLocalStorage child
+ * context injected by the orchestrator.
+ *
+ * Why this is not `process.env`: in-process children share the parent's
+ * `process.env` — they do not get a fresh env of their own. Reading
+ * `PI_SUBAGENT_ACCEPTANCE_ROLE` from env in an in-process child therefore sees
+ * the *parent's* value (or nothing, when the parent is a root session). Either
+ * direction is wrong: a parent `writer` would make a read-only child's write
+ * bans silently disappear, and a parent read-only role would wrongly ban a
+ * `writer` child.
+ */
+export function childGuardEnvFromContext(
+	ctx: ChildLaunchContext | undefined = currentChildContext(),
+): ChildGuardEnv {
+	return ctx?.acceptanceRole ? { acceptanceRole: ctx.acceptanceRole } : {};
+}
+
+/**
+ * Effective child-guard env: the in-process child context wins, env is the
+ * RPC fallback. `childGuardEnvFromProcess` stays authoritative for RPC
+ * children, whose process really does own the env values.
+ */
+export function effectiveChildGuardEnv(
+	ctx: ChildLaunchContext | undefined = currentChildContext(),
+	env: NodeJS.ProcessEnv = process.env,
+): ChildGuardEnv {
+	const fromContext = childGuardEnvFromContext(ctx);
+	if (fromContext.acceptanceRole !== undefined) return fromContext;
+	return childGuardEnvFromProcess(env);
+}
+
 /** Child-only extension: intercept tools; do not register the parent tool. */
 export function registerChildGuard(pi: ExtensionAPI): void {
 	const budget = childBudgetFromEnv();
@@ -327,7 +365,7 @@ export function registerChildGuard(pi: ExtensionAPI): void {
 		}
 		if (event.toolName !== "bash") return;
 		const command = typeof event.input.command === "string" ? event.input.command : "";
-		const reason = forbiddenChildReason(command, childGuardEnvFromProcess());
+		const reason = forbiddenChildReason(command, effectiveChildGuardEnv());
 		if (reason) return { block: true, reason: blockChildMessage(reason) };
 		if (budget.toolTimeoutMs && budget.toolTimeoutMs > 0) {
 			event.input.command = wrapBashWithTimeout(command, budget.toolTimeoutMs);

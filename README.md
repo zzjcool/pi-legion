@@ -20,6 +20,7 @@ shared SQLite ledger records the whole tree.
 ## Contents
 
 - [Architecture](#architecture)
+- [Spawn mode](#spawn-mode)
 - [Headless child contract](#headless-child-contract)
 - [Quick start](#quick-start)
 - [Legion tools and phases](#legion-tools-and-phases)
@@ -63,6 +64,35 @@ Transport, state, decision-making, and display are separate layers:
   owns machine state and validates phase transitions.
 - **Display:** the event bus feeds the resident tree, the `/legion` full view,
   and an on-demand live overlay.
+
+## Spawn mode
+
+`spawnMode` picks the backend that runs one child. Per role it comes from agent
+frontmatter → `subagents.agentOverrides.<role>` → team member override:
+
+```yaml
+# agents/scout.md
+---
+spawnMode: inprocess   # or: rpc
+---
+```
+
+**Default:** omitting `spawnMode` means `inprocess` — the child runs as an
+`AgentSession` inside the parent Node process ([`createAgentSession`]), which
+trades process isolation for spawn latency.
+
+**Automatic fallback to `rpc`:** when `spawnMode` is omitted *and* the resolved
+spawn cannot be in-process, Legion launches it over `pi --mode rpc` instead.
+That happens when the role needs an OS worktree (`worktree: true` — the writer
+and centurion default) or when `kind !== "pi"`.
+
+**Explicit is strict:** `spawnMode: "inprocess"` with `worktree: true` is
+refused with `INVALID_PARAMS` rather than silently downgraded, so a role that
+asks for in-process never gets a different transport behind its back.
+
+Limits for the in-process backend are separate (`subagents.inprocess.*`) and are
+not shared with the `legion.*` tree budgets — see
+[docs/inprocess-supervisor.md](docs/inprocess-supervisor.md).
 
 ## Headless child contract
 
