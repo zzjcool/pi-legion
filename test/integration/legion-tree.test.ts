@@ -15,6 +15,16 @@ import { RunStore } from "../../src/runs/store.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 
+/**
+ * Role pinned to the RPC backend.
+ *
+ * This e2e asserts RPC-only observables: the child's lineage env
+ * (`PI_LEGION_DB` / `PI_LEGION_NODE_ID` / `PI_SUBAGENTS_TEAM`), the
+ * `worktreeBranch` passed to RPC spawn, and the ledger budget gates. In-process
+ * children carry identity through an in-process context instead of env and are
+ * budgeted by `subagents.inprocess.*`, so an implicit default would leave these
+ * assertions checking nothing.
+ */
 function agent(name: string, overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
 		name,
@@ -26,6 +36,7 @@ function agent(name: string, overrides: Partial<AgentConfig> = {}): AgentConfig 
 		systemPrompt: `You are the ${name}.`,
 		source: "project",
 		filePath: `/fixtures/${name}.md`,
+		spawnMode: "rpc",
 		...overrides,
 	};
 }

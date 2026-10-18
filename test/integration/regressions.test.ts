@@ -129,9 +129,12 @@ test("regression: role depth never widens parent depth and spawn budget is enfor
 	try {
 		const supervisor = new FakeSupervisor();
 		const orchestrator = new Orchestrator({ supervisor, runDir, cwd: "/tmp", parentPath: [{ runId: "r-parent" }], maxDepth: 2, maxSpawns: 1 });
-		await orchestrator.launch({ agent: agent({ maxSubagentDepth: 4 }), task: "allowed", worktree: false });
+		// Both assertions below are RPC-only: the `PI_SUBAGENT_MAX_DEPTH` ceiling is
+		// the RPC lineage env channel, and `maxSpawns` is the RPC spawn budget
+		// (in-process children use `subagents.inprocess.*`). Pin the mode.
+		await orchestrator.launch({ agent: agent({ maxSubagentDepth: 4, spawnMode: "rpc" }), task: "allowed", worktree: false });
 		assert.equal(Number(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_MAX_DEPTH), 2);
-		await assert.rejects(() => orchestrator.launch({ agent: agent(), task: "budget" }), (error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED);
+		await assert.rejects(() => orchestrator.launch({ agent: agent({ spawnMode: "rpc" }), task: "budget" }), (error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED);
 	} finally { rmSync(runDir, { recursive: true, force: true }); }
 });
 

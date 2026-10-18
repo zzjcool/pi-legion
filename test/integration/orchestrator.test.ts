@@ -310,8 +310,11 @@ test("RPC child kind and spawn budget are refused before any process is created"
 	}
 
 	const limited = new Orchestrator({ supervisor: new FakeSupervisor(), runDir: tempDir("rpc-budget-"), cwd: "/tmp", maxSpawns: 0 });
+	// `maxSpawns` is an RPC-only gate: in-process children are budgeted by
+	// `subagents.inprocess.*` and deliberately skip `assertWithinBudgets`, so the
+	// mode is pinned here to keep asserting the RPC budget refusal.
 	await assert.rejects(
-		() => limited.launch({ agent: agent(), task: "over budget" }),
+		() => limited.launch({ agent: agent({ spawnMode: "rpc" }), task: "over budget" }),
 		(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED,
 	);
 });
@@ -418,7 +421,9 @@ test("restore rehydrates persisted children and the run spawn budget", async () 
 		assert.equal(restored.childrenSnapshot()[0]?.ownerToken, handle.child.ownerToken);
 		assert.equal(restored.budget().used, 1);
 		await assert.rejects(
-			() => restored.launch({ agent: agent(), task: "over restored budget", worktree: false }),
+			// The restored `maxSpawns` budget is an RPC-only gate (in-process children
+			// use `subagents.inprocess.*`), so pin the mode to exercise it.
+			() => restored.launch({ agent: agent({ spawnMode: "rpc" }), task: "over restored budget", worktree: false }),
 			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED,
 		);
 	} finally {
