@@ -18,9 +18,12 @@
  *     the whole buffer now (the common "all children done" path).
  *  3. Otherwise buffer it; the window starts at the FIRST onTerminal.
  *
- * Window expiry: if the parent is mid-turn (parentBusy) and we have not
- * already extended MAX_BUSY_EXTENSIONS times, open another flushMs window;
- * otherwise flush what is buffered. Pending members survive — a straggler
+ * Window expiry: flush what is buffered, once. The window exists only to
+ * collect stragglers from one batch — it is NEVER extended because the parent
+ * session happens to be busy. A turn-level busy signal was the wrong predictor
+ * (the parent is busy for the whole tool loop by definition) and it stacked a
+ * second delay on top of the runtime's run-scoped outbox, which is the single
+ * place a completion may be held. Pending members survive — a straggler
  * finishing later starts a fresh batch of its own.
  */
 
@@ -34,14 +37,10 @@ export type JoinMode = "each" | "smart";
 
 export const DEFAULT_JOIN_MODE: JoinMode = "smart";
 export const DEFAULT_FLUSH_MS = 10_000;
-/** Max times a busy parent extends a window (total ≤ (1+3)×flushMs). */
-export const MAX_BUSY_EXTENSIONS = 3;
 
 export interface JoinConfig {
 	mode: JoinMode;
 	flushMs: number;
-	/** Reports whether the parent is mid-turn; absent means "never busy". */
-	parentBusy?: () => boolean;
 }
 
 /** Default: smart mode with a ten-second window. */
@@ -76,7 +75,6 @@ interface Group {
 	/** Names tracked but not yet terminal (blocked members are excluded). */
 	pending: Set<string>;
 	buffered: BufferedEntry[];
-	extensions: number;
 	timer?: JoinSchedulerHandle;
 }
 
@@ -162,7 +160,6 @@ export class JoinCoordinator {
 			return;
 		}
 		if (!group.timer) {
-			group.extensions = 0;
 			group.timer = this.scheduleFn(this.config.flushMs, () => {
 				this.onWindowExpired(entry.runId);
 			});
@@ -190,7 +187,7 @@ export class JoinCoordinator {
 	private ensureGroup(runId: string): Group {
 		let group = this.groups.get(runId);
 		if (!group) {
-			group = { pending: new Set(), buffered: [], extensions: 0 };
+			group = { pending: new Set(), buffered: [] };
 			this.groups.set(runId, group);
 		}
 		return group;
@@ -200,14 +197,6 @@ export class JoinCoordinator {
 		const group = this.groups.get(runId);
 		if (!group || this.disposed) return;
 		group.timer = undefined;
-		const busy = this.config.parentBusy?.() ?? false;
-		if (busy && group.extensions < MAX_BUSY_EXTENSIONS) {
-			group.extensions += 1;
-			group.timer = this.scheduleFn(this.config.flushMs, () => {
-				this.onWindowExpired(runId);
-			});
-			return;
-		}
 		this.flush(runId);
 	}
 

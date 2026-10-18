@@ -12,6 +12,7 @@ import {
 	formatCompletionNotice,
 	formatGroupedNotice,
 	collectFailureInput,
+	type CompletionNotice,
 	type SendMessageApi,
 } from "./notify.ts";
 import {
@@ -19,6 +20,7 @@ import {
 	DEFAULT_JOIN_MODE,
 	JoinCoordinator,
 	type JoinConfig,
+	type JoinSchedulerHandle,
 } from "./join.ts";
 import {
 	createStatusBoard,
@@ -144,11 +146,47 @@ export interface SessionRuntimeDeps {
 	) => () => void;
 	/** Batching config; applied via setJoinConfig right after construction. */
 	joinConfig?: JoinConfig;
+	/** Injectable timer for the MAX_PENDING_AGE_MS overflow (tests fire it manually); default = unref'd setTimeout. */
+	scheduleNoticeOverflow?: (ms: number, fn: () => void) => JoinSchedulerHandle;
 }
 
 const DEFAULT_REFRESH_MS = 500;
+/**
+ * Hard cap on how long a completion notice may stay hidden behind a live
+ * parent agent run (D-B). 80s = 2× the (1+3)×10s that the old join window
+ * could reach while a busy parent kept extending it. Past this the notice is
+ * force-sent even though the run is still going: reverting to the old
+ * "queued as a followUp" behaviour after 80s is better than hiding it forever.
+ */
+export const MAX_PENDING_AGE_MS = 80_000;
 /** Fallback per-child timeout for wait(); index.ts passes the role value. */
 const DEFAULT_WAIT_TIMEOUT_MS = DEFAULTS.turnTimeoutMs;
+
+/** Default timer for the MAX_PENDING_AGE_MS overflow (unref'd, like join's). */
+function defaultNoticeOverflow(
+	ms: number,
+	fn: () => void,
+): JoinSchedulerHandle {
+	const id = setTimeout(fn, ms);
+	id.unref?.();
+	return { cancel: () => clearTimeout(id) };
+}
+
+/** A completion notice held because the parent agent run is still active (D-A). */
+interface QueuedNotice {
+	notice: CompletionNotice;
+	triggerTurn: boolean;
+	enqueuedAt: number;
+}
+
+export interface NoticeQueueStats {
+	/** Notices currently held. */
+	pending: number;
+	/** now() - enqueuedAt of the oldest held notice; 0 when empty. */
+	oldestAgeMs: number;
+	/** Lifetime count of MAX_PENDING_AGE_MS overflows that forced a send (D-B observability). */
+	forcedFlushes: number;
+}
 
 /** A wait() promise that must settle by the deadline. */
 class WaitTimeoutError extends Error {}
@@ -385,6 +423,12 @@ export interface SessionRuntime {
 	statusTui(): WidgetTui | undefined;
 	/** Forward join config to the internal coordinator (settings wiring). */
 	setJoinConfig(config: JoinConfig): void;
+	/** Parent agent run started (pi `agent_start`): hold completion notices until settle (D-A/D-C). */
+	notifyParentRunStart(): void;
+	/** Parent agent run settled (pi `agent_settled`): send every held notice now, then repaint (D-A/D-D). */
+	notifyParentSettled(): void;
+	/** Introspection seam for tests/doctor: deferred-notice queue state (D-B observability). */
+	noticeQueueStats(): NoticeQueueStats;
 	/**
 	 * Explicit wait: suppress auto-notify on the targets via consumedByTool
 	 * and aggregate their results. A timeout restores auto-notify.
@@ -429,6 +473,66 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		mode: DEFAULT_JOIN_MODE,
 		flushMs: DEFAULT_FLUSH_MS,
 	};
+
+	// Run-scoped completion outbox (D-A). The host only drains
+	// `agent.followUpQueue` inside a live run, so a `followUp` sent while the
+	// parent run is active sits invisible until the user types again. When a
+	// run is active we therefore hold the formatted notice here and burst it
+	// out on `agent_settled` (D-D). This is the ONLY deferral point: the join
+	// window above batches stragglers and never waits on a busy parent (D-I).
+	//
+	// D-H: the default is `false`, so a host (or a test) that never signals a
+	// run start keeps today's immediate-send behaviour byte for byte.
+	let parentRunActive = false;
+	const outbox: QueuedNotice[] = [];
+	let outboxTimer: JoinSchedulerHandle | undefined;
+	let forcedFlushes = 0;
+
+	const armOutboxTimer = (): void => {
+		if (outboxTimer || outbox.length === 0 || disposed) return;
+		const oldest = outbox[0]!;
+		const delay = Math.max(0, oldest.enqueuedAt + MAX_PENDING_AGE_MS - now());
+		outboxTimer = (deps.scheduleNoticeOverflow ?? defaultNoticeOverflow)(delay, () => {
+			outboxTimer = undefined;
+			if (outbox.length === 0) return;
+			forcedFlushes += 1;
+			flushOutbox();
+		});
+	};
+
+	// FIFO, one message per notice: the grouped shape belongs to the join layer.
+	// N held notices = N host `_runAgentPrompt` calls; the common case is 1 per
+	// run, so the batch is not merged into a synthetic grouped notice.
+	const flushOutbox = (): void => {
+		outboxTimer?.cancel();
+		outboxTimer = undefined;
+		if (outbox.length === 0) return;
+		// One splice: anything enqueued by a re-entrant send belongs to the next
+		// batch, so a settle can never double-deliver what it already flushed.
+		const batch = outbox.splice(0);
+		for (const item of batch) {
+			// A rejected send is dropped, not requeued (same as before).
+			deliverCompletion(
+				{ sendMessage: deps.sendMessage },
+				item.notice,
+				item.triggerTurn,
+			);
+		}
+	};
+
+	/** The single completion exit: send now, or hold until the run settles. */
+	const sendCompletionNotice = (
+		notice: CompletionNotice,
+		triggerTurn: boolean,
+	): void => {
+		if (!parentRunActive) {
+			deliverCompletion({ sendMessage: deps.sendMessage }, notice, triggerTurn);
+			return;
+		}
+		outbox.push({ notice, triggerTurn, enqueuedAt: now() });
+		armOutboxTimer();
+	};
+
 	const join = new JoinCoordinator({
 		deliver: (batch) => {
 			if (disposed) return;
@@ -444,8 +548,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				batch.length === 1 &&
 				(joinConfig.mode === "each" || join.allSettled(first.runId))
 			) {
-				deliverCompletion(
-					{ sendMessage: deps.sendMessage },
+				sendCompletionNotice(
 					formatCompletionNotice(first.input),
 					first.triggerTurn,
 				);
@@ -464,8 +567,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						!batch.some((e) => e.name === job.name),
 				)
 				.map((job) => job.name);
-			deliverCompletion(
-				{ sendMessage: deps.sendMessage },
+			sendCompletionNotice(
 				formatGroupedNotice({
 					runId: first.runId,
 					entries: batch.map((e) => ({ ...e.input, status: e.status })),
@@ -813,6 +915,19 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		}
 	};
 
+	// A generation bump means this continuation no longer owns the job. When no
+	// newer watch took over (!watching) nothing else will ever release it, and
+	// the widget/OSC busy state would stay "working" forever — the phantom row.
+	// `cancelWatch` invalidates the generation without releasing (that is how
+	// stop() drops a watcher), so this is the only path that can clean up.
+	//
+	// Blocked-hold jobs are intentionally unwatched: they stay tracked on
+	// purpose so the parent can approve/resume them, so they are exempt.
+	const releaseIfOrphaned = (job: TrackedJob): void => {
+		if (job.watching || job.state === "blocked") return;
+		runtime.release(job.name);
+	};
+
 	const runtime: SessionRuntime = {
 		bind(next) {
 			// The board is the only consumer of the UI handle; keep no second copy.
@@ -896,11 +1011,19 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					job.notified = false;
 					job.consumedByTool = false;
 					join.addPending(job.runId, job.name);
+					// Repaint before the new watch takes over so the panel cannot
+					// hold the old row's final second. watch() repaints too; this is
+					// an idempotent second guarantee.
+					refreshUi();
 					runtime.watch(name, opts);
 				};
 				try {
 					snapshot = await ensureCollect(job);
-					if (disposed || job.generation !== gen) return;
+					if (disposed) return;
+					if (job.generation !== gen) {
+						releaseIfOrphaned(job);
+						return;
+					}
 					// Print/json shutdown is waiting on this collect. A timeout or
 					// a blocked child must stay tracked so the caller can retire
 					// it; re-arming would start another turn after the process
@@ -915,7 +1038,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						refreshUi();
 						const next =
 							(await job.handleBlocked?.(snapshot)) ?? "hold";
-						if (disposed || job.generation !== gen) return;
+						if (disposed) return;
+						if (job.generation !== gen) {
+							releaseIfOrphaned(job);
+							return;
+						}
 						if (next === "resume") {
 							job.settledAt = undefined;
 							job.collectPromise = undefined;
@@ -943,6 +1070,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					}
 					job.state = "awaiting";
 					job.settledAt = now();
+					// Repaint immediately: the row flips to a terminal state here, and
+					// waiting for the 500ms sampler leaves a phantom "working" row.
+					refreshUi();
 					if (!job.consumedByTool && !job.notified) {
 						job.notified = true;
 						join.onTerminal({
@@ -964,7 +1094,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						});
 					}
 				} catch (error) {
-					if (disposed || job.generation !== gen) return;
+					if (disposed) return;
+					if (job.generation !== gen) {
+						releaseIfOrphaned(job);
+						return;
+					}
 					if (job.isAlive?.() && isTransientConnectionFailure(thrownText(error))) {
 						// Thrown "Connection error." while the process is up is the
 						// same non-terminal signal as a running snapshot. Hold this
@@ -979,7 +1113,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						join.addPending(job.runId, job.name);
 						refreshUi();
 						await new Promise((resolve) => setTimeout(resolve, TRANSIENT_CONNECTION_REARM_MS));
-						if (disposed || job.generation !== gen) return;
+						if (disposed) return;
+						if (job.generation !== gen) {
+							releaseIfOrphaned(job);
+							return;
+						}
 						if (job.isAlive?.()) {
 							rearmLiveWatch();
 							return;
@@ -988,6 +1126,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					}
 					job.state = "awaiting";
 					job.settledAt = now();
+					refreshUi();
 					if (!job.consumedByTool && !job.notified) {
 						job.notified = true;
 						// Collect failures join the batch too, as a failed entry.
@@ -1186,6 +1325,25 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			join.setConfig(config);
 		},
 
+		notifyParentRunStart() {
+			parentRunActive = true;
+		},
+
+		notifyParentSettled() {
+			parentRunActive = false;
+			flushOutbox();
+			refreshUi();
+		},
+
+		noticeQueueStats(): NoticeQueueStats {
+			const oldest = outbox[0];
+			return {
+				pending: outbox.length,
+				oldestAgeMs: oldest ? Math.max(0, now() - oldest.enqueuedAt) : 0,
+				forcedFlushes,
+			};
+		},
+
 		async wait(names, opts = {}) {
 			return Promise.all(
 				names.map((name) =>
@@ -1223,6 +1381,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			jobs.clear();
 			finished.clear();
 			join.dispose();
+			// Shutdown drops held notices unsent: the child's session file and the
+			// `finished` cache survive, so `collect` can still recover them.
+			outboxTimer?.cancel();
+			outboxTimer = undefined;
+			outbox.length = 0;
 			if (timer) clearInterval(timer);
 			timer = undefined;
 			for (const unsubscribe of busUnsubscribers) unsubscribe();

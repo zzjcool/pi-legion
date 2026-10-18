@@ -907,6 +907,7 @@ function indexHarness(
 	tool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
 	utilityTool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
 	startTurn(): void;
+	startRun(): void;
 	emitSettled(aborted: boolean): void;
 	shutdown(): Promise<void>;
 	cleanup(): Promise<void>;
@@ -933,12 +934,14 @@ function indexHarness(
 	const sentMessages: unknown[] = [];
 	const handlers = new Map<string, (...args: any[]) => unknown>();
 	const turnStartHandlers: Array<(...args: any[]) => unknown> = [];
+	const agentStartHandlers: Array<(...args: any[]) => unknown> = [];
 	const pi = {
 		registerTool(tool: unknown) { tools.push(tool as Record<string, unknown>); },
 		registerCommand() {}, registerMessageRenderer() {}, sendMessage(message: unknown) { sentMessages.push(message); },
 		events: { emit() {} },
 		on(name: string, handler: (...args: any[]) => unknown) {
 			if (name === "turn_start") turnStartHandlers.push(handler);
+			else if (name === "agent_start") agentStartHandlers.push(handler);
 			else handlers.set(name, handler);
 		},
 	};
@@ -955,6 +958,12 @@ function indexHarness(
 		cwd, supervisor, sentMessages, tool, utilityTool,
 		startTurn() {
 			for (const handler of turnStartHandlers) handler({}, { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } });
+		},
+		startRun() {
+			// `agent_start` opens the run-scoped completion window. Fire every
+			// registered handler; the index also binds UI here, which is inert in
+			// this harness (hasUI: false).
+			for (const handler of agentStartHandlers) handler({}, { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } });
 		},
 		emitSettled(aborted: boolean): void {
 			handlers.get("agent_settled")?.({ type: "agent_settled", aborted }, { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } });
@@ -1479,6 +1488,55 @@ test("index verify: without verify the worker path keeps its attested semantics"
 			worktree: false,
 		});
 		assert.deepEqual(calls, [], "no verify supplied: the extension must not guess a command");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+/** Poll until `pred()` holds, so no test waits on a fixed long sleep. */
+async function waitForTeams(pred: () => boolean, label: string, capMs = 1_000): Promise<void> {
+	const start = Date.now();
+	while (!pred()) {
+		if (Date.now() - start > capMs) throw new Error(`timeout: ${label}`);
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+}
+
+test("T8: index — a completion during the parent run is delivered on agent_settled, not before", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: true },
+	);
+	try {
+		// The run is live: the index's `agent_start` handler turns on the
+		// outbox hold. Before this wiring `agent_settled` had no handler at all,
+		// so a `followUp` sat in agent.followUpQueue until the user typed again.
+		harness.startRun();
+		await invokeIndex(harness, { agent: "worker", task: "finish inside the run", async: true, worktree: false });
+
+		// The completion is produced only when the watch's collect resolves, and
+		// the real orchestrator gates that on DEFAULTS.settleQuietMs (2.5s) of
+		// session quiet — so a fixed ~100ms window would observe nothing on
+		// either version of the code and prove nothing. The child's `retire`
+		// call is the observable cue that the notice was produced: watch() emits
+		// the notice (onTerminal) BEFORE awaiting retire.
+		await waitForTeams(
+			() => harness.supervisor.calls.some((call) => call.method === "retire"),
+			"child collected and retired",
+			8_000,
+		);
+		assert.equal(
+			harness.sentMessages.length,
+			0,
+			"no completion message may reach the host during a live run",
+		);
+
+		harness.emitSettled(false);
+		await waitForTeams(() => harness.sentMessages.length === 1, "notice flushed at agent_settled");
+		const sent = harness.sentMessages[0] as { customType: string; content: string };
+		assert.equal(sent.customType, "subagent-notify");
+		assert.match(sent.content, /Background task completed/);
 	} finally {
 		await harness.cleanup();
 	}

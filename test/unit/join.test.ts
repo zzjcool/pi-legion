@@ -2,7 +2,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	JoinCoordinator,
-	MAX_BUSY_EXTENSIONS,
 	type JoinEntry,
 	type JoinSchedulerHandle,
 } from "../../src/extension/join.ts";
@@ -42,7 +41,6 @@ function manualSchedule() {
 function harness(over: {
 	mode?: "each" | "smart";
 	flushMs?: number;
-	busy?: () => boolean;
 } = {}) {
 	const timers = manualSchedule();
 	const delivered: Batch[] = [];
@@ -53,7 +51,6 @@ function harness(over: {
 	join.setConfig({
 		mode: over.mode ?? "smart",
 		flushMs: over.flushMs ?? 10_000,
-		...(over.busy ? { parentBusy: over.busy } : {}),
 	});
 	return { join, delivered, timers };
 }
@@ -124,27 +121,32 @@ test("join: window expiry with stragglers flushes only the finished ones", () =>
 	);
 });
 
-test("join: a busy parent extends the window at most MAX_BUSY_EXTENSIONS times", () => {
-	let busy = true;
-	const { join, delivered, timers } = harness({ busy: () => busy });
+// Regression guard, NOT a discriminating test: with the busy-extension signal
+// removed from the join config, the old code would flush here too, so this
+// cannot go red on unfixed code. It exists to stop busy-driven extension from
+// being reintroduced. The discriminating assertions live in runtime.test.ts
+// (T1/T2/T3).
+test("join: one window per batch — expiry never re-arms", () => {
+	const { join, delivered, timers } = harness();
 	join.addPending("r-1", "a");
 	join.addPending("r-1", "slow");
 	join.onTerminal(entry("a"));
-	for (let i = 0; i < MAX_BUSY_EXTENSIONS; i += 1) {
-		assert.equal(delivered.length, 0, `extension ${i}: still waiting`);
-		timers.fireLast();
-	}
-	// Extension budget exhausted (total (1+MAX)×flushMs) → flush even while busy.
+	assert.equal(delivered.length, 0, "buffered behind the window");
+	assert.equal(timers.pending.length, 1, "exactly one window armed");
 	timers.fireLast();
-	assert.equal(delivered.length, 1, "forced flush after the extension budget");
-	assert.deepEqual(
-		delivered[0]?.map((e) => e.name),
-		["a"],
+	assert.equal(delivered.length, 1, "expiry flushes what is buffered");
+	// The window is a batching delay only. Extending it while the parent is
+	// busy was both the wrong predictor (turn-level, always busy in the tool
+	// loop) and a second delay stacked on the runtime outbox: never re-arm.
+	assert.equal(
+		timers.pending.length,
+		1,
+		"no second window may be scheduled at expiry",
 	);
 });
 
-test("join: an idle parent flushes at the first window expiry", () => {
-	const { join, delivered, timers } = harness({ busy: () => false });
+test("join: the first window expiry flushes (no busy gate)", () => {
+	const { join, delivered, timers } = harness();
 	join.addPending("r-1", "a");
 	join.addPending("r-1", "slow");
 	join.onTerminal(entry("a"));

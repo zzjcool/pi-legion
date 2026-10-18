@@ -778,10 +778,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	const childActivitySources = new Set<string>();
 	let statusNodeOpener: ((nodeId: string) => void) | undefined;
 	let lastConfirm: ((message: string) => Promise<boolean>) | undefined;
-	// turn_start/turn_end maintain this so a flush window can wait out a
-	// busy parent instead of queueing behind the whole turn (join extends
-	// the window at most MAX_BUSY_EXTENSIONS times).
-	let parentTurnActive = false;
+	// Run-scoped completion deferral lives in the runtime outbox (D-A): a child
+	// finishing while this agent run is still active is held until
+	// `agent_settled` instead of being queued as an undrained followUp.
 	const rpcEventSource = supervisor as LegionSupervisor & RpcEventSource;
 	const runtime = createSessionRuntime({
 		sendMessage: (message, options) => pi.sendMessage(message, options),
@@ -1017,7 +1016,6 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			runtime.setJoinConfig({
 				mode: settings.joinMode ?? DEFAULT_JOIN_MODE,
 				flushMs: settings.joinFlushMs ?? DEFAULT_FLUSH_MS,
-				parentBusy: () => parentTurnActive,
 			});
 
 			if (action === "list") return ok(renderAgentList(agents, team, teamWarnings));
@@ -1193,17 +1191,20 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	});
 	pi.on("session_info_changed", bindUi);
 	pi.on("turn_start", (event, ctx) => {
-		parentTurnActive = true;
 		bindUi(event, ctx);
 	});
 	pi.on("turn_end", (event, ctx) => {
-		parentTurnActive = false;
 		bindUi(event, ctx);
 	});
 	pi.on("agent_start", (event, ctx) => {
+		runtime.notifyParentRunStart();
 		bindUi(event, ctx);
 	});
 	pi.on("agent_end", (event, ctx) => {
+		bindUi(event, ctx);
+	});
+	pi.on("agent_settled", (event, ctx) => {
+		runtime.notifyParentSettled();
 		bindUi(event, ctx);
 	});
 	pi.on("input", bindUi);
