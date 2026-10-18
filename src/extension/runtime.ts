@@ -1318,6 +1318,13 @@ function statusEntryFromNode(
 		activity?.turnStartedAt,
 		activity?.turnEndedAt,
 	);
+	// An in-process child has no tracked job for its whole first run: spawnChild()
+	// awaits the whole agent run, so the job (and its sessionFile plumbing in
+	// statusEntryFromJob) does not exist yet. The node row does carry the session
+	// file, so parse it directly — otherwise the ledger only has a tokens_out row
+	// after settle and the token rate reads 0 for the agent's entire lifetime.
+	const live = node.sessionFile ? progressFromSessionFile(node.sessionFile) : {};
+	const tokensOut = live.tokensOut ?? node.tokensOut;
 	return {
 		name: node.name,
 		agent: node.role,
@@ -1329,8 +1336,9 @@ function statusEntryFromNode(
 		...(node.phase ? { phase: node.phase } : {}),
 		...(node.kind ? { kind: node.kind } : {}),
 		...(node.model ? { model: node.model } : {}),
-		...(node.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
-		...(node.tokensOut ? { tokensOut: node.tokensOut } : {}),
+		...(live.usageTotal ? { tokensTotal: live.usageTotal } : node.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
+		...(tokensOut ? { tokensOut } : {}),
+		...(live.generationMs ? { generationMs: live.generationMs } : {}),
 		...(activity?.turn !== undefined ? { turns: activity.turn } : {}),
 		...(activity?.turnStartedAt !== undefined ? { currentTurnStartedAt: activity.turnStartedAt } : {}),
 		...(activity?.turnEndedAt !== undefined ? { currentTurnEndedAt: activity.turnEndedAt } : {}),

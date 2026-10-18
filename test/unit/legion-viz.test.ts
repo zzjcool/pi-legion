@@ -1670,3 +1670,24 @@ test("railway: a round-1 child still gets clocks (regression: turns>=2 gate star
 	assert.match(out.canvas.toLines(plainTheme).join("\n"), /scout · 10m00s · 1s ago/);
 	assert.ok(axis < 90, `axis must not starve the detail column: axis=${axis}`);
 });
+
+test("rate: a long tool call drives a live agent's rate to 0 once the window empties", () => {
+	const sampler = new RateSampler();
+	// Real shape: 40s of generation (6000 output tokens), then a 180s build with
+	// no new assistant message, then generation resumes. usage lands only when an
+	// assistant message completes, so both counters are flat across the build.
+	const flat = [ROOT, node("a", { startedAt: T0, tokensOut: 6000, generationMs: 40_000 })];
+	for (let t = 0; t <= 260; t += 1) {
+		const out = t <= 40 ? t * 150 : t <= 220 ? 6000 : 6000 + (t - 220) * 150;
+		const gen = t <= 40 ? t * 1000 : t <= 220 ? 40_000 : 40_000 + (t - 220) * 1000;
+		sampler.record(sec(t), [ROOT, node("a", { startedAt: T0, tokensOut: out, generationMs: gen })]);
+	}
+	// Inside the window the last burst still holds.
+	assert.ok(Math.abs(sampler.nowRate(sec(90), flat) - 150) < 1e-6);
+	// Past 60s of no change the trailing window is empty: 0, never a stale number.
+	assert.equal(sampler.nowRate(sec(120), flat), 0);
+	assert.equal(sampler.nowRate(sec(220), flat), 0);
+	// The new tokens land on the next message and the live rate returns.
+	const woken = [ROOT, node("a", { startedAt: T0, tokensOut: 12_000, generationMs: 80_000 })];
+	assert.ok(sampler.nowRate(sec(260), woken) > 0);
+});

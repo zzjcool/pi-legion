@@ -126,6 +126,34 @@ Production `defaultSessionFactory` calls `createAgentSession` with:
 
 See `buildInProcessSessionPlan` / `test/unit/inprocess-supervisor.test.ts`.
 
+## Observability: live token rate during the first run
+
+`spawnChild` awaits the whole first agent run (`await session.prompt(...)`), unlike
+RPC, whose preflight returns as soon as the child accepts the prompt. The parent
+therefore has **no tracked job** for the child's entire first run, so
+`statusEntryFromJob` — the only path that reads live session progress — does not
+apply yet. The status board sees only the ledger node row.
+
+That row must still render a live token rate, which needs two facts the ledger
+does not carry during a run:
+
+| Fact | Ledger during a run | Source used instead |
+|---|---|---|
+| `tokensOut` | empty until settle: `pollUsage` skips nodes whose status is not `running`, and a spawning node is `starting` | `nodes.session_file` parsed directly |
+| `generationMs` | never stored (`usage` has no such column) | same session parse |
+
+`statusEntryFromNode` reads `node.sessionFile` through `progressFromSessionFile`
+for both, falling back to the ledger for nodes with no session file (rebuilt or
+foreign rows). Without this the railway header showed `0 tok/s` for the whole
+in-process lifetime while `rpc` looked correct.
+
+`generationMs` itself is the sum of measured model-call lengths
+(`message.durationMs`, or entry-to-entry write times). It must never be derived
+from the nested `message.timestamp`, which marks when generation *started* and
+yields only prompt-to-first-token latency — that mistake pinned the denominator
+near zero, so `tok/s` silently fell back to a wall-clock window and stopped being
+a decode rate.
+
 ## Refusals
 
 - `kind !== "pi"` → `INVALID_PARAMS` regardless of `spawnMode`: only `pi` roles

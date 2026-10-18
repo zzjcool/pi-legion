@@ -16,6 +16,7 @@ import { inbox, MAIL_DELIVERY, sendMail } from "../../src/legion/mail.ts";
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import { appendEvent } from "../../src/legion/events.ts";
 import { getUsage } from "../../src/legion/usage.ts";
+import { liveRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
@@ -1587,6 +1588,59 @@ test("a supervisor-injected extension never adopts a legion identity from inheri
 		else process.env[LEGION_DB_ENV] = prevDb;
 		if (prevNode === undefined) delete process.env[LEGION_NODE_ID_ENV];
 		else process.env[LEGION_NODE_ID_ENV] = prevNode;
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("runtime: a node with no tracked job still reports live tok/s from its session file", async () => {
+	// in-process spawnChild() awaits the whole first agent run, so the parent has
+	// NO tracked job for the child's entire first run. The status board then only
+	// has the DB node path. The usage ledger has no row until settle, so unless the
+	// node's sessionFile is parsed directly the token rate reads 0 for the whole
+	// lifetime — the exact "in-process shows 0 tok/s, RPC is fine" split.
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-node-live-"));
+	try {
+		const sessionFile = path.join(dir, "worker.jsonl");
+		const base = "2026-01-01T00:00:00.000Z";
+		writeFileSync(sessionFile, [
+			JSON.stringify({ type: "session", id: "s-node-live", cwd: dir, timestamp: base }),
+			userMsg("go", { timestamp: 1_000 }),
+			assistantMsg({ stopReason: "toolUse", tools: ["bash"], timestamp: 2_000, usage: { output: 500 } }),
+			toolResult({ timestamp: 3_000 }),
+		].join("\n") + "\n", "utf8");
+
+		const nodes: TreeNodeSnapshot[] = [
+			makeNode("root", null, "centurion-0", 0, "running"),
+			{ ...makeNode("root.worker", "root", "worker", 1, "running"), sessionFile },
+		];
+		const runtime = createSessionRuntime({
+			sendMessage() {},
+			eventBus: createLegionEventBus(),
+			getTreeNodes: () => nodes,
+			now: () => NOW,
+		});
+
+		const entry = runtime.statusEntries().find((item) => item.nodeId === "root.worker");
+		assert.equal(entry?.tokensOut, 500, "live tokensOut comes from the session file, not the empty ledger");
+		assert.ok(entry?.generationMs !== undefined, "generationMs must exist so tok/s has its denominator");
+		assert.equal(entry?.state, "running", "the node maps to a live state so nowRate counts it");
+
+		// End-to-end: the railway header math must see a non-zero rate for this node.
+		const { nodesFromEntries } = await import("../../src/tui/viz/model.ts");
+		const { RateSampler } = await import("../../src/tui/viz/rate.ts");
+		const vizNodes = nodesFromEntries(runtime.statusEntries());
+		const worker = vizNodes.find((item) => item.id === "root.worker")!;
+		assert.equal(worker.tokensOut, 500, "viz keeps the live token count");
+		assert.ok(worker.generationMs > 0, "viz keeps the live generation denominator");
+		assert.equal(worker.status, "running");
+		assert.deepEqual(liveRateNodeIds(vizNodes).includes("root.worker"), true, "the in-process node counts as live");
+		// Two samples with a growing counter: the sampler must produce a positive rate.
+		const sampler = new RateSampler();
+		sampler.record(NOW - 30_000, [{ ...worker, tokensOut: 500, generationMs: 1_000 }]);
+		const later = { ...worker, tokensOut: 800, generationMs: 2_000 };
+		sampler.record(NOW, [later]);
+		assert.ok(sampler.nowRate(NOW, [later]) > 0, "a node with live session data yields a non-zero tok/s");
+	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

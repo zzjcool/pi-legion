@@ -11,6 +11,29 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tok/s` is a decode rate again, and in-process children show it while they
+  run.** Two independent causes, both fixed:
+  - `generationMs` (the denominator) was derived from the nested
+    `message.timestamp`, which marks when generation *started*. It captured only
+    prompt→first-token latency — a real 1506s session accumulated 616ms — so the
+    `MIN_RATE_GENERATION_MS` floor always tripped and `tok/s` silently fell back
+    to a 60s wall-clock window that counted tool wait as generation, and the tree
+    row's `avg t/s` (gated on `generationMs >= 1000`) never rendered at all. It
+    now sums the measured call length (`message.durationMs`) or, when absent,
+    entry-to-entry write times. Nested timestamps stay a last resort for
+    synthetic sessions, paired so the two clock axes are never mixed.
+  - The railway header showed `0 tok/s` for an in-process child's entire
+    lifetime while `rpc` looked correct: `spawnChild` awaits the whole first run,
+    so no tracked job exists and the status board only had the ledger node row —
+    which has no `generationMs` and, because `pollUsage` skips non-`running`
+    nodes, no `tokens_out` until settle either. `statusEntryFromNode` now parses
+    `node.sessionFile` directly and falls back to the ledger.
+- A live agent stopped by a tool call longer than the 60s window still decays to
+  `0 tok/s`. That is the honest answer for the trailing window and is now pinned
+  by tests instead of being "fixed" into a stale number later.
+
 ## [3.0.2] — 2026-10-18
 
 ### Changed

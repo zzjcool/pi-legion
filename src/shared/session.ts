@@ -37,7 +37,17 @@ function emptyUsage(): Usage {
 
 /** Mutable clock used while folding events; not part of ParsedSession. */
 export interface GenerationClock {
+	/** Nested Unix-ms timestamp of the message that opened this generation window. */
 	awaitingSince?: number;
+	/**
+	 * Same window edge expressed as the enclosing entry's write instant.
+	 *
+	 * Sessions may carry only the nested timestamp, only the entry ISO timestamp,
+	 * or both. Measuring an end against a start from a different axis yields a
+	 * nonsense span, so each window records both edges and `applyAssistant`
+	 * pairs like with like.
+	 */
+	awaitingWall?: number;
 }
 
 export function emptyParsedSession(): ParsedSession {
@@ -126,10 +136,13 @@ function accumulateUsage(
 }
 
 /**
- * Turn-boundary timestamps for the current-turn elapsed display.
+ * Turn-boundary timestamp for the current-turn elapsed display.
  *
- * The nested message `timestamp` is Unix ms (session-format.md); fall back to
- * the ISO 8601 entry timestamp for entries written without the nested value.
+ * Prefers the nested message `timestamp` (Unix ms, session-format.md) — for the
+ * elapsed display the moment generation began is exactly what we want — and
+ * falls back to the ISO 8601 entry timestamp for entries written without it.
+ * Generation *duration* is measured elsewhere (`applyAssistant`): the nested
+ * value marks a start, not a completion, and `durationMs` carries the length.
  */
 function messageTimestamp(
 	event: Record<string, unknown>,
@@ -143,6 +156,19 @@ function messageTimestamp(
 		if (Number.isFinite(ms)) return ms;
 	}
 	return undefined;
+}
+
+/**
+ * The instant a message was written, on the same Unix-ms axis as
+ * `message.timestamp`. Used for the generation clock so start and end share a
+ * basis; a session that only carries the entry ISO timestamp would otherwise
+ * mix a wall-clock instant into a Unix-ms subtraction.
+ */
+function entryWrittenAt(event: Record<string, unknown>): number | undefined {
+	const outer = event.timestamp;
+	if (typeof outer !== "string") return undefined;
+	const ms = Date.parse(outer);
+	return Number.isFinite(ms) ? ms : undefined;
 }
 
 /** Find (or create) the turn an assistant/toolResult message belongs to. */
@@ -163,6 +189,7 @@ function applyAssistant(
 	parsed: ParsedSession,
 	message: Record<string, unknown>,
 	timestamp: number | undefined,
+	wall: number | undefined,
 	clock: GenerationClock,
 ): void {
 	const turn = currentTurn(parsed);
@@ -181,7 +208,21 @@ function applyAssistant(
 	});
 	if (timestamp !== undefined) turn.endedAt = timestamp;
 
-	if (
+	// Generation time spans the wait for the model plus the model call itself. Two
+	// strictly paired sources, never mixed:
+	//   1. `durationMs` — an exact length reported by the provider, axis-free.
+	//   2. entry-to-entry (`wall` − `awaitingWall`) — both edges are write instants,
+	//      so a session that omits nested timestamps still measures correctly.
+	// Subtracting the nested `message.timestamp` is NOT the completion instant: it
+	// marks when generation began, so it captures only prompt→first-token latency
+	// (2-7ms on real sessions). It survives as a last resort for synthetic or
+	// legacy sessions that carry no entry timestamps at all.
+	const measured = message.durationMs;
+	if (typeof measured === "number" && Number.isFinite(measured) && measured >= 0) {
+		parsed.generationMs += measured;
+	} else if (wall !== undefined && clock.awaitingWall !== undefined && wall >= clock.awaitingWall) {
+		parsed.generationMs += wall - clock.awaitingWall;
+	} else if (
 		timestamp !== undefined &&
 		clock.awaitingSince !== undefined &&
 		timestamp >= clock.awaitingSince
@@ -189,6 +230,7 @@ function applyAssistant(
 		parsed.generationMs += timestamp - clock.awaitingSince;
 	}
 	clock.awaitingSince = undefined;
+	clock.awaitingWall = undefined;
 
 	accumulateUsage(parsed.usage, message);
 	if (typeof message.model === "string") parsed.model = message.model;
@@ -201,6 +243,7 @@ function applyToolResult(
 	parsed: ParsedSession,
 	message: Record<string, unknown>,
 	timestamp: number | undefined,
+	wall: number | undefined,
 	clock: GenerationClock,
 ): void {
 	const turn = parsed.turns.at(-1);
@@ -212,6 +255,7 @@ function applyToolResult(
 	}
 	// Tool completion starts the next generation window (model resumes).
 	if (timestamp !== undefined) clock.awaitingSince = timestamp;
+	if (wall !== undefined) clock.awaitingWall = wall;
 }
 
 /**
@@ -288,6 +332,9 @@ function applyEvent(
 	const message = event.message as Record<string, unknown> | undefined;
 	if (!message || typeof message !== "object") return;
 	const ts = messageTimestamp(event, message);
+	// The entry write instant, on the same Unix-ms axis as `message.timestamp`.
+	// Generation timing uses it so both window edges share one basis.
+	const wall = entryWrittenAt(event);
 
 	switch (message.role) {
 		case "user":
@@ -300,13 +347,14 @@ function applyEvent(
 			});
 			// User prompt opens a generation window.
 			if (ts !== undefined) clock.awaitingSince = ts;
+			if (wall !== undefined) clock.awaitingWall = wall;
 			break;
 		case "assistant":
-			applyAssistant(parsed, message, ts, clock);
+			applyAssistant(parsed, message, ts, wall, clock);
 			break;
 		case "toolResult":
 		case "tool":
-			applyToolResult(parsed, message, ts, clock);
+			applyToolResult(parsed, message, ts, wall, clock);
 			break;
 		default:
 			break;
