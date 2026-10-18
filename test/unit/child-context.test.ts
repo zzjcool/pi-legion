@@ -12,6 +12,7 @@ import {
 	type ChildLaunchContext,
 	currentChildContext,
 	runInChildContext,
+	runOutsideChildContext,
 } from "../../src/supervisor/child-context.ts";
 import {
 	inProcessDepth,
@@ -113,14 +114,59 @@ test("inprocess-depth: concurrent branches do not share depth", async () => {
 	assert.equal(inProcessDepth(), 0);
 });
 
-test("ALS stores are registered on globalThis so module re-evaluation cannot reset them", () => {
-	// jiti may re-evaluate these modules with `moduleCache: false`. A module-level
-	// `const store = new AsyncLocalStorage()` would then be a fresh, empty store.
-	// Guard the globalThis registration that makes identity survive that reload.
-	const childKey = Symbol.for("pi-legion.child-context.als");
-	const depthKey = Symbol.for("pi-legion.inprocess-depth.als");
-	const holder = globalThis as unknown as Record<symbol, unknown>;
-	assert.equal(typeof holder[childKey], "object");
-	assert.equal(typeof holder[depthKey], "object");
-	assert.ok(holder[childKey] && holder[depthKey]);
+test("child-context: a value written by one module instance is visible to a re-loaded one (REV2-4)", async () => {
+	// D5's real requirement: jiti re-evaluates this module with `moduleCache:false`
+	// and the store must survive. `?reload=` forces a genuine second module
+	// instance with its own module scope, which is exactly what a module-level
+	// `const store = new AsyncLocalStorage()` gets wrong. Note this is NOT the
+	// same as "two concurrent contexts don't interfere" — AsyncLocalStorage gives
+	// that for free and such a test cannot fail a module-level implementation.
+	const first = await import("../../src/supervisor/child-context.ts");
+	// SAFETY: the `?reload=` suffix is a TypeScript-hostile but valid ESM/Node
+	// specifier trick to force a second module instance; the resolved module has
+	// exactly the shape of the statically-imported one, which TS cannot see.
+	const second = (await import(
+		"../../src/supervisor/child-context.ts?reload=rev2-4" as string
+	)) as typeof first;
+	// Precondition: these really are two distinct module instances.
+	assert.notEqual(first, second);
+	assert.notEqual(first.runInChildContext, second.runInChildContext);
+
+	let seenBySecond: ReturnType<typeof first.currentChildContext>;
+	let seenBySecondDepth: number | undefined;
+	const depthFirst = await import("../../src/supervisor/inprocess-depth.ts");
+	// SAFETY: same `?reload=` trick as above; shape equals the static import.
+	const depthSecond = (await import(
+		"../../src/supervisor/inprocess-depth.ts?reload=rev2-4" as string
+	)) as typeof depthFirst;
+	assert.notEqual(depthFirst, depthSecond);
+
+	await first.runInChildContext(ctx("written-by-first"), async () => {
+		seenBySecond = second.currentChildContext();
+	});
+	await depthFirst.runAtAbsoluteDepth(3, async () => {
+		seenBySecondDepth = depthSecond.inProcessDepth();
+	});
+
+	assert.equal(
+		seenBySecond?.nodeId,
+		"written-by-first",
+		"a re-loaded module instance must read the same store",
+	);
+	assert.equal(
+		seenBySecondDepth,
+		3,
+		"the depth store must also be shared across module instances",
+	);
+});
+
+test("child-context: runOutsideChildContext hides the child identity (REV2-7)", async () => {
+	await runInChildContext(ctx("inner-node"), async () => {
+		assert.equal(currentChildContext()?.nodeId, "inner-node");
+		const seenOutside = runOutsideChildContext(() => currentChildContext());
+		assert.equal(seenOutside, undefined);
+		// Stepping out must not affect the surrounding scope.
+		assert.equal(currentChildContext()?.nodeId, "inner-node");
+	});
+	assert.equal(currentChildContext(), undefined);
 });
