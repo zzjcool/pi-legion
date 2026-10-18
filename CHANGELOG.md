@@ -19,6 +19,9 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- TUI: drop the footer `N agents running` segment (#192); the aboveEditor
+  widget already shows the same count. `STATUS_FOOTER_KEY` / `formatFooterStatus`
+  remain exported but `@deprecated` (soft-land).
 - Railway lane clock: the leading clock is now "time since the last task
   started" — it keeps ticking through the quiet gap after a turn settles
   (previously it froze at that turn's end, i.e. the *previous* task's elapsed)

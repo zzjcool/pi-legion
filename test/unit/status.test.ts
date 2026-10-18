@@ -7,11 +7,9 @@ import {
 	formatBusyLabel,
 	formatAgentElapsed,
 	formatElapsed,
-	formatFooterStatus,
 	formatWidgetLines,
 	statusTotals,
 	SAME_TURN_START_MS,
-	STATUS_FOOTER_KEY,
 	STATUS_WIDGET_KEY,
 	STATUS_WIDGET_PLACEMENT,
 	type StatusEntry,
@@ -165,10 +163,7 @@ test("formatElapsed rounds to seconds and breaks out minutes and hours", () => {
 	assert.equal(formatElapsed(-1_500), "0s");
 });
 
-test("formatFooterStatus is empty when nothing is running", () => {
-	assert.equal(formatFooterStatus([]), undefined);
-	assert.equal(formatFooterStatus(entries.slice(0, 1)), "1 agent running");
-	assert.equal(formatFooterStatus(entries), "2 agents running");
+test("formatBusyLabel ignores the ledger root (not an async child agent)", () => {
 	const root: StatusEntry = {
 		name: "root",
 		nodeId: "root",
@@ -178,8 +173,7 @@ test("formatFooterStatus is empty when nothing is running", () => {
 		state: "running",
 		startedAt: 0,
 	};
-	assert.equal(formatFooterStatus([root]), undefined, "the parent session itself is not an async child agent");
-	assert.equal(formatBusyLabel([root]), undefined);
+	assert.equal(formatBusyLabel([root]), undefined, "the parent session itself is not an async child agent");
 });
 
 test("formatBusyLabel matches the herdr overlay copy", () => {
@@ -548,7 +542,7 @@ test("formatWidgetLines omits current-turn elapsed without a start and freezes t
 	assert.match(skewed[1] ?? "", /turn 2$/);
 });
 
-test("applyStatus paints above the editor and in the footer", () => {
+test("applyStatus paints above the editor without footer status", () => {
 	const widgets: unknown[] = [];
 	const statuses: unknown[] = [];
 	const ctx: StatusUi = {
@@ -574,14 +568,12 @@ test("applyStatus paints above the editor and in the footer", () => {
 	assert.equal(widget.options.placement, STATUS_WIDGET_PLACEMENT);
 	assert.equal(widget.options.placement, "aboveEditor");
 	assert.match(widget.content[0] ?? "", /Async agents/);
-	assert.deepEqual(statuses, [
-		{ key: STATUS_FOOTER_KEY, text: "2 agents running" },
-	]);
+	assert.deepEqual(statuses, [], "footer N agents running removed (#192)");
 
 	applyStatus(ctx, [], 5_000);
 	const cleared = widgets[1] as { content: undefined };
 	assert.equal(cleared.content, undefined);
-	assert.deepEqual(statuses[1], { key: STATUS_FOOTER_KEY, text: undefined });
+	assert.deepEqual(statuses, [], "clearing the widget must not write footer status");
 });
 
 test("applyStatus is a no-op without UI", () => {
@@ -645,7 +637,7 @@ test("status board registers a persistent factory and then requestRender", () =>
 	board.paint([], 7_000);
 	const cleared = widgets.at(-1) as { content: undefined };
 	assert.equal(cleared.content, undefined);
-	assert.deepEqual(statuses.at(-1), { key: STATUS_FOOTER_KEY, text: undefined });
+	assert.deepEqual(statuses, [], "status board must not write footer status (#192)");
 });
 
 test("status board totals count aged-out nodes but exclude the ledger root", () => {
