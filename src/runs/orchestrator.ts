@@ -709,7 +709,10 @@ export class Orchestrator {
 									...(input.stripLegionIdentity
 										? {}
 										: { parentNodeId: this.legion.nodeId, dbPath: this.legion.dbPath }),
-									parentPath: this.childPath(name),
+									// The nested path is lineage too: LEGION_IDENTITY_ENV_KEYS
+									// strips PI_SUBAGENT_PARENT_PATH on the rpc side, so the
+									// in-process channel must not hand it back.
+									...(input.stripLegionIdentity ? {} : { parentPath: this.childPath(name) }),
 									...(agent.acceptance?.role ? { acceptanceRole: agent.acceptance.role } : {}),
 									allowNested: input.agent.allowNestedSubagents === true && !input.agent.utility,
 									utility: Boolean(input.utilityDispatch && input.agent.utility),

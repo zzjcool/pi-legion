@@ -350,11 +350,16 @@ test("identity: stripLegionIdentity masks node lineage on the in-process channel
 			utilityDispatch: true,
 			stripLegionIdentity: true,
 		});
-		const ctx = seen[0] as { nodeId?: string; parentNodeId?: string; dbPath?: string } | undefined;
+		const ctx = seen[0] as
+			| { nodeId?: string; parentNodeId?: string; dbPath?: string; parentPath?: unknown[] }
+			| undefined;
 		assert.ok(ctx, "a stripped in-process spawn still gets a scope");
 		assert.equal(ctx.nodeId, undefined, "no node id may leak through the ALS channel");
 		assert.equal(ctx.dbPath, undefined, "no db path may leak through the ALS channel");
 		assert.equal(ctx.parentNodeId, undefined, "no parent node may leak either");
+		// Mirrors vexillatio.test.ts, which asserts PI_SUBAGENT_PARENT_PATH is
+		// stripped on the rpc side: the path carries runId/agent lineage.
+		assert.equal(ctx.parentPath, undefined, "the nested path is lineage too");
 	} finally {
 		db.close();
 		rmSync(root, { recursive: true, force: true });
