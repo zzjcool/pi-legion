@@ -21,30 +21,27 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
       - name: Setup Node 22
         uses: actions/setup-node@v7
         with:
           node-version: 22
           check-latest: true
-          cache: pnpm
+          cache: npm
 
       - name: Install
-        run: pnpm install --frozen-lockfile
+        run: npm ci
 
       - name: typecheck
-        run: pnpm run typecheck
+        run: npm run typecheck
 
       - name: test
-        run: pnpm test
+        run: npm test
 
       - name: test:integration
-        run: pnpm run test:integration
+        run: npm run test:integration
 
       - name: test:mock-llm
-        run: pnpm run test:mock-llm
+        run: npm run test:mock-llm
 
       # test:docker is omitted. verify-*.sh runs docker with image
       # pi-herdr-sandbox:latest (override: PI_DOCKER_IMAGE) and copies a host
@@ -52,7 +49,7 @@ jobs:
       # contain settings.json and models.json. GitHub-hosted runners have
       # neither, so the script fails before any package check. Local
       # alternative, once that image and Pi home exist:
-      #   pnpm run test:docker
+      #   npm run test:docker
 
       - name: Check tag matches package.json version
         run: |
@@ -69,8 +66,8 @@ jobs:
       # npm always packs package.json, so an install-phase script declared here
       # reaches every consumer. Pi installs extensions with plain `npm install`,
       # so a pnpm-only `preinstall` guard (3.0.0) made `pi update --extensions`
-      # fail for everyone. devEngines.packageManager gives the same contributor
-      # guard without executing anything in a consumer install.
+      # fail for everyone. Keep the manifest script-free: contributors install
+      # with npm like every consumer does.
       - name: Reject install-phase scripts in the published manifest
         run: |
           set -euo pipefail
@@ -79,11 +76,29 @@ jobs:
               .scripts?.['${script}'] ?? ''")
             if [ -n "${declared}" ]; then
               echo "::error::scripts.${script} runs in every consumer install."
-              echo "::error::Use devEngines.packageManager instead."
+              echo "::error::Remove it; the manifest must stay script-free."
               exit 1
             fi
           done
           echo "No install-phase scripts in the published manifest."
+
+      # A package-manager guard in package.json would break consumers: npm
+      # enforces devEngines.packageManager for every command in the checkout
+      # (including `pi install git:...` -> npm install) and corepack refuses
+      # to run npm when `packageManager` names pnpm. See issue #210.
+      - name: Reject package-manager enforcement
+        run: |
+          set -euo pipefail
+          for field in devEngines packageManager; do
+            declared=$(node -p "const m=require('./package.json');\
+              m['${field}'] === undefined ? '' : 'declared'")
+            if [ -n "${declared}" ]; then
+              echo "::error::package.json ${field} blocks npm consumers."
+              echo "::error::See issue #210 before reintroducing it."
+              exit 1
+            fi
+          done
+          echo "No package-manager enforcement in the published manifest."
 
       - name: Read tag annotation
         run: |
@@ -109,7 +124,7 @@ jobs:
           check-latest: true
           registry-url: https://registry.npmjs.org
 
-      # Deps are installed with pnpm above. Staging still uses the npm CLI.
+      # Deps are installed with npm above. Staging still uses the npm CLI.
       # CI only stages the package on npm. It does not formally publish.
       # A maintainer must complete npm 2FA (`npm stage approve`) afterwards.
       # NPM_TOKEN is a granular token with Read and write (stage only), which
@@ -117,15 +132,11 @@ jobs:
       # Requires npm CLI >= 11.15 and Node >= 22.14. node-version 22 with
       # check-latest already satisfies the Node requirement. Node 22 still
       # bundles npm 10, so install the npm 11 CLI before staging.
-      #
-      # Packing with pnpm and staging the tarball from a scratch directory keeps
-      # `devEngines.packageManager` (pnpm) from rejecting the npm CLI, and keeps
-      # npm stage from reading repo-root manifests left by `pnpm install`.
       - name: Pack tarball
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/pack"
-          pnpm pack --pack-destination "${RUNNER_TEMP}/pack"
+          npm pack --pack-destination "${RUNNER_TEMP}/pack"
           ls -l "${RUNNER_TEMP}/pack"
 
       - name: Stage on npm

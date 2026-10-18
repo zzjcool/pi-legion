@@ -53,9 +53,9 @@
     "test": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/unit/*.test.ts",
     "test:integration": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/integration/*.test.ts",
     "test:live": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/live/*.test.ts",
-    "test:all": "pnpm run typecheck && pnpm run test && pnpm run test:integration",
+    "test:all": "node --run typecheck && node --run test && node --run test:integration",
     "test:docker": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH sh -c 'echo \"RPC mainline Docker checks only; legacy Herdr workspace/kind/notification scenarios are archived under test/legacy/docker and require pi-legion v0.16.x\" && bash test/docker/verify-1-child-guard.sh && bash test/docker/verify-2-task-appendix.sh && bash test/docker/verify-3-readonly.sh && bash test/docker/verify-4-acceptance.sh && bash test/docker/verify-5-blocked.sh && bash test/docker/verify-6-cache.sh && bash test/docker/verify-7-budget.sh && bash test/docker/verify-8-verify-command.sh && bash test/docker/verify-9-worktree.sh && bash test/docker/verify-10-fallback.sh && bash test/docker/verify-11-nested-alias.sh'",
-    "prepublishOnly": "pnpm run typecheck && pnpm run test && pnpm run test:integration",
+    "prepublishOnly": "node --run typecheck && node --run test && node --run test:integration",
     "mock-llm": "node --experimental-strip-types test/mock-llm/cli.ts",
     "test:mock-llm": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/unit/mock-llm*.test.ts test/integration/mock-llm*.test.ts test/integration/railway-mock-e2e.test.ts",
     "test:tui-visual": "docker build -q -f test/docker/Dockerfile.tui-sandbox -t ghcr.io/zzjcool/pi-legion/tui-sandbox:latest . >/dev/null && docker run --rm -v $(pwd):/plugin -w /plugin ghcr.io/zzjcool/pi-legion/tui-sandbox:latest bash test/docker/verify-tui-visual.sh"
@@ -93,16 +93,7 @@
     "typebox": "^1.3.30",
     "typescript": "^5.6.0"
   },
-  "packageManager": "pnpm@9.15.9",
   "engines": {
-    "node": ">=22",
-    "pnpm": ">=9"
-  },
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": ">=9",
-      "onFail": "error"
-    }
+    "node": ">=22"
   }
 }

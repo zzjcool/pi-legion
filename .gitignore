@@ -1,6 +1,12 @@
 # dependencies
 node_modules/
 
+# package managers: package-lock.json is the committed lockfile (npm is the
+# reference path). Contributors who prefer pnpm/yarn may generate a local
+# lockfile; it is not committed, so two lockfiles can never drift apart (#210).
+pnpm-lock.yaml
+yarn.lock
+
 # npm pack output
 *.tgz
 

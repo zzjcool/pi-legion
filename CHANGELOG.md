@@ -11,6 +11,36 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Changed
+
+- **Reverted the pnpm migration (#162): npm is the reference path again, and
+  the repository no longer enforces any package manager (#210).** Both previous
+  attempts to force contributors onto pnpm broke npm consumers: 3.0.0 shipped a
+  `preinstall` guard that failed every consumer install, and 3.0.1 replaced it
+  with `devEngines.packageManager` (`onFail: "error"`), which npm enforces for
+  *every* non-global command in the checkout. The practical effect was that
+  `npm run`, `npm pack`, `npm exec`, `npx` (and therefore MCP servers launched
+  with `npx`) all failed with `EBADDEVENGINES` inside the repo, and
+  `pi install git:<repo>` failed too, because that path is `git clone` +
+  `npm install --omit=dev --legacy-peer-deps`.
+- `package.json`: dropped `devEngines` (it makes npm reject the whole checkout),
+  `packageManager` (corepack then refuses to run npm at all) and `engines.pnpm`.
+  `engines.node` stays `>=22`.
+- `scripts.test:all` and `scripts.prepublishOnly` compose via `node --run`
+  instead of `pnpm run`, so `npm run` and `pnpm run` both work and no script
+  names a package manager binary. (`node --run` does not execute pre/post hooks;
+  there are none in this manifest.)
+- Lockfile: `pnpm-lock.yaml` is replaced by `package-lock.json`, and
+  `pnpm-lock.yaml` / `yarn.lock` are gitignored so two lockfiles cannot drift
+  apart again. `src/runs/provision.ts` still detects all four lockfiles, so
+  contributors who prefer pnpm can keep using it locally.
+- CI and release install with `npm ci` (no `pnpm/action-setup`, no `cache:
+  pnpm`), and the release workflow packs with `npm pack` again — the
+  `pnpm pack` → scratch-directory workaround for `devEngines` is gone.
+- `test/unit/publish-manifest.test.ts` now forbids `devEngines` and
+  `packageManager` in the manifest and asserts the scripts stay package-manager
+  neutral. `release.yml` fails the tag build if either field comes back.
+
 ## [3.0.1] — 2026-10-18
 
 ### Fixed
