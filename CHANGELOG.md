@@ -23,8 +23,10 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 - **BREAKING (#197):** `spawnMode` now defaults to `inprocess`, not `rpc`.
   When the key is omitted and the resolved spawn needs an OS worktree
-  (`worktree: true` — the writer/centurion default) or has `kind !== "pi"`,
-  Legion falls back to `rpc` automatically. An explicit
+  (`worktree: true` — the writer/centurion default), Legion falls back to
+  `rpc` automatically. Non-`pi` roles are unaffected by this fallback: they
+  are refused with `INVALID_PARAMS` before the backend is chosen, because
+  only `kind: pi` children are supported at all. An explicit
   `spawnMode: "inprocess"` combined with `worktree: true` is still refused
   with `INVALID_PARAMS` — the fallback only covers the implicit default.
 - **BREAKING (#197):** omitting the whole `subagents.inprocess` block no
