@@ -2982,40 +2982,23 @@ export async function stopAction(input: {
 
 	// Stop every watcher before any retire starts: a later target must not finish
 	// its own watch (and notify/release) while an earlier target is being retired.
-	//
-	// A2: each target is also held against the orphan release for the duration of
-	// its retire attempt. `cancelWatch` bumps the generation without releasing, so
-	// the in-flight continuation sees itself as orphaned — but the child is still
-	// alive until retire settles, and the `rewatch` compensation below is the only
-	// thing that can keep it visible if retire fails. Without the hold the release
-	// deletes the job first, `runtime.get(name)` is undefined, and a live child
-	// leaks untracked/unwatched (invisible to `stop` and `session_shutdown`).
-	for (const name of targets) {
-		runtime.setStopHold(name, true);
-		runtime.cancelWatch(name);
-	}
+	for (const name of targets) runtime.cancelWatch(name);
 
 	const stopped: string[] = [];
 	const failures: string[] = [];
-	try {
-		for (const name of targets) {
-			try {
-				// The runtime job may have been released after the target snapshot was
-				// taken. The retire adapter can then resolve its persisted run record.
-				await retire(name, retireOpts);
-				runtime.release(name);
-				stopped.push(name);
-			} catch (error) {
-				// If the retire chain fails, restore the completion watcher so a
-				// still-live child is not orphaned by the explicit stop attempt.
-				if (runtime.get(name)) runtime.rewatch(name);
-				failures.push(`${name}: ${String(error)}`);
-			}
+	for (const name of targets) {
+		try {
+			// The runtime job may have been released after the target snapshot was
+			// taken. The retire adapter can then resolve its persisted run record.
+			await retire(name, retireOpts);
+			runtime.release(name);
+			stopped.push(name);
+		} catch (error) {
+			// If the retire chain fails, restore the completion watcher so a
+			// still-live child is not orphaned by the explicit stop attempt.
+			if (runtime.get(name)) runtime.rewatch(name);
+			failures.push(`${name}: ${String(error)}`);
 		}
-	} finally {
-		// Success released the job anyway; failure cleared `watching:false` via
-		// rewatch. Either way the stop window is over.
-		for (const name of targets) runtime.setStopHold(name, false);
 	}
 	const mode = force ? "force-stopped" : "Stopped";
 	const summary = stopped.length

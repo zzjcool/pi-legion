@@ -105,14 +105,6 @@ export interface TrackedJob extends TrackedJobInput {
 	settledAt?: number;
 	unsubscribeRpcEvents?: () => void;
 	collectPromise?: Promise<CollectSnapshot>;
-	/**
-	 * An explicit `stop` is between `cancelWatch` and the end of its retire
-	 * attempt (A2). While set, a stale watch continuation must NOT release the
-	 * job: the child is still alive until retire settles, and a failed retire
-	 * has to be able to rewatch it. Cleared by the stop's `finally`, by a new
-	 * `watch`/`rewatch`, and with the job on `release`.
-	 */
-	stopHold?: boolean;
 }
 
 export interface LegionTreeIdentity {
@@ -416,12 +408,6 @@ export interface SessionRuntime {
 	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<CollectSnapshot | undefined> | undefined;
 	/** Invalidate an in-flight notification watch without dropping the job. */
 	cancelWatch(name: string): void;
-	/**
-	 * Stop seam (A2): protect the job from the orphan release while `retire` is
-	 * in flight, so a failed retire can still `rewatch` a live child. The
-	 * caller must clear the hold in a `finally`.
-	 */
-	setStopHold(name: string, hold: boolean): void;
 	rewatch(name: string, opts?: { triggerTurn?: boolean }): void;
 	release(name: string): void;
 	get(name: string): TrackedJob | undefined;
@@ -506,12 +492,19 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		if (outboxTimer || outbox.length === 0 || disposed) return;
 		const oldest = outbox[0]!;
 		const delay = Math.max(0, oldest.enqueuedAt + MAX_PENDING_AGE_MS - now());
-		// `handle` is captured before assignment so a callback can prove it is the
-		// LIVE arm. A cancelled-but-still-invoked timer (a zombie queued before the
-		// cancel landed) must be a strict no-op: otherwise it would clear the live
-		// timer's handle and force-send a notice that is nowhere near its cap.
+		// `live` proves this callback is the CURRENT arm. A cancelled-but-still-
+		// invoked timer (a zombie queued before the cancel landed) must be a strict
+		// no-op: otherwise it would clear the live timer's handle and force-send a
+		// notice that is nowhere near its cap.
+		//
+		// A boolean — not a closure over the handle — because an injected scheduler
+		// is free to invoke the callback synchronously, before the `const` binding
+		// is initialized (TDZ). `live` is assigned above the call, so it is always
+		// safe to read from inside the callback.
+		let live = true;
 		const handle: JoinSchedulerHandle = (deps.scheduleNoticeOverflow ?? defaultNoticeOverflow)(delay, () => {
-			if (outboxTimer !== handle) return;
+			if (!live) return;
+			live = false;
 			outboxTimer = undefined;
 			if (outbox.length === 0) return;
 			const next = outbox[0]!;
@@ -525,7 +518,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			forcedFlushes += 1;
 			flushOutbox();
 		});
-		outboxTimer = handle;
+		outboxTimer = {
+			cancel: () => {
+				live = false;
+				handle.cancel();
+			},
+		};
 	};
 
 	// FIFO, one message per notice: the grouped shape belongs to the join layer.
@@ -943,28 +941,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		}
 	};
 
-	// A generation bump means this continuation no longer owns the job. When no
-	// newer watch took over (!watching) nothing else will ever release it, and
-	// the widget/OSC busy state would stay "working" forever — the phantom row.
-	// `cancelWatch` invalidates the generation without releasing (that is how
-	// stop() drops a watcher), so this is the only path that can clean up.
-	//
-	// Two exemptions, both about NOT deleting something still wanted:
-	//  - Blocked-hold jobs are intentionally unwatched: they stay tracked on
-	//    purpose so the parent can approve/resume them.
-	//  - A job under an explicit stop (`stopHold`, A2) is still alive until
-	//    retire settles; a failed retire must be able to rewatch it.
-	//
-	// Identity guard (A1): `release(name)` is keyed by NAME, so a stale
-	// continuation landing after the name was reused would delete the NEW job.
-	// Release only when the map still points at the very object this
-	// continuation was watching.
-	const releaseIfOrphaned = (job: TrackedJob): void => {
-		if (job.watching || job.state === "blocked" || job.stopHold) return;
-		if (jobs.get(job.name) !== job) return;
-		runtime.release(job.name);
-	};
-
 	const runtime: SessionRuntime = {
 		bind(next) {
 			// The board is the only consumer of the UI handle; keep no second copy.
@@ -1033,8 +1009,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			const triggerTurn = opts.triggerTurn !== false;
 			const gen = (job.generation += 1);
 			job.watching = true;
-			// A fresh watch owns the job outright: any stop window is over for it.
-			job.stopHold = false;
 			job.state = "working";
 			refreshUi();
 			void (async () => {
@@ -1058,11 +1032,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				};
 				try {
 					snapshot = await ensureCollect(job);
-					if (disposed) return;
-					if (job.generation !== gen) {
-						releaseIfOrphaned(job);
-						return;
-					}
+					if (disposed || job.generation !== gen) return;
 					// Print/json shutdown is waiting on this collect. A timeout or
 					// a blocked child must stay tracked so the caller can retire
 					// it; re-arming would start another turn after the process
@@ -1077,11 +1047,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						refreshUi();
 						const next =
 							(await job.handleBlocked?.(snapshot)) ?? "hold";
-						if (disposed) return;
-						if (job.generation !== gen) {
-							releaseIfOrphaned(job);
-							return;
-						}
+						if (disposed || job.generation !== gen) return;
 						if (next === "resume") {
 							job.settledAt = undefined;
 							job.collectPromise = undefined;
@@ -1133,11 +1099,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						});
 					}
 				} catch (error) {
-					if (disposed) return;
-					if (job.generation !== gen) {
-						releaseIfOrphaned(job);
-						return;
-					}
+					if (disposed || job.generation !== gen) return;
 					if (job.isAlive?.() && isTransientConnectionFailure(thrownText(error))) {
 						// Thrown "Connection error." while the process is up is the
 						// same non-terminal signal as a running snapshot. Hold this
@@ -1152,11 +1114,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						join.addPending(job.runId, job.name);
 						refreshUi();
 						await new Promise((resolve) => setTimeout(resolve, TRANSIENT_CONNECTION_REARM_MS));
-						if (disposed) return;
-						if (job.generation !== gen) {
-							releaseIfOrphaned(job);
-							return;
-						}
+						if (disposed || job.generation !== gen) return;
 						if (job.isAlive?.()) {
 							rearmLiveWatch();
 							return;
@@ -1257,12 +1215,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			job.watching = false;
 			job.consumedByTool = false;
 			refreshUi();
-		},
-
-		setStopHold(name, hold) {
-			const job = jobs.get(name);
-			if (!job) return;
-			job.stopHold = hold;
 		},
 
 		rewatch(name, opts) {
@@ -1426,8 +1378,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			jobs.clear();
 			finished.clear();
 			join.dispose();
-			// Shutdown drops held notices unsent: the child's session file and the
-			// `finished` cache survive, so `collect` can still recover them.
+			// Shutdown drops held notices unsent: the child's session file survives,
+			// so `collect` can still recover the result from disk. The `finished`
+			// cache does NOT survive — it was cleared two statements up.
 			outboxTimer?.cancel();
 			outboxTimer = undefined;
 			outbox.length = 0;
