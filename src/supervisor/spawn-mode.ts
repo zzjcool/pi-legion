@@ -5,8 +5,16 @@
 import type { AgentConfig, SpawnMode } from "../shared/types.ts";
 import { SPAWN_MODES } from "../shared/types.ts";
 
-/** Default backend when `spawnMode` is omitted. */
-export const DEFAULT_SPAWN_MODE: SpawnMode = "rpc";
+/**
+ * Default backend when `spawnMode` is omitted.
+ *
+ * `inprocess` is only the *intent* here: `Orchestrator.launch` arbitrates an
+ * omitted mode down to `rpc` when the launch actually needs worktree
+ * isolation or the role is not `kind: pi` (see the arbitration comment in
+ * `src/runs/orchestrator.ts`). This resolver stays a pure config read and
+ * must never inspect `worktree`.
+ */
+export const DEFAULT_SPAWN_MODE: SpawnMode = "inprocess";
 
 /** Safe default for `inprocess.maxActive` when the inprocess block is set without it. */
 export const DEFAULT_INPROCESS_MAX_ACTIVE = 8;

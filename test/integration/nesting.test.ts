@@ -32,11 +32,21 @@ async function withEnvironment<T>(values: Record<string, string | undefined>, ac
 	}
 }
 
+/**
+ * Role pinned to the RPC backend.
+ *
+ * Every gate in this file is RPC-only: the nested `PI_SUBAGENT_MAX_DEPTH`
+ * ceiling is carried in the child's env (the RPC lineage channel) and the
+ * spawn budget is asserted by `assertWithinBudgets`, which in-process children
+ * deliberately skip in favour of `subagents.inprocess.*`. With `inprocess` as
+ * the default backend these launches would silently bypass both, so the mode
+ * is pinned here to keep the RPC semantics under test.
+ */
 function role(name: string, maxSubagentDepth?: number): AgentConfig {
 	return {
 		name, description: name, systemPromptMode: "append", inheritProjectContext: true,
 		inheritSkills: false, kind: "pi", systemPrompt: "role prompt", source: "user",
-		filePath: `/${name}.md`, allowNestedSubagents: true,
+		filePath: `/${name}.md`, allowNestedSubagents: true, spawnMode: "rpc",
 		...(maxSubagentDepth !== undefined ? { maxSubagentDepth } : {}),
 	};
 }
