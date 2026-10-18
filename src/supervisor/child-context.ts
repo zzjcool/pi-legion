@@ -24,7 +24,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { SpawnMode } from "../shared/types.ts";
+import type { NestedPathEntry, SpawnMode } from "../shared/types.ts";
 
 /** Lineage identity of one in-process child session. Never routed via process.env. */
 export interface ChildLaunchContext {
@@ -34,8 +34,11 @@ export interface ChildLaunchContext {
 	parentNodeId?: string;
 	/** Absolute path to legion.db. */
 	dbPath?: string;
-	/** The caller's nested path segments, so the child's orchestrator can continue it. */
-	parentPath?: string[];
+	/**
+	 * The caller's nested path segments, so the child's orchestrator can continue it.
+	 * Same shape as the RPC lineage path (`NestedPathEntry`), not bare strings.
+	 */
+	parentPath?: NestedPathEntry[];
 	/** The role's `acceptance.role` (read-only / writer / …). */
 	acceptanceRole?: string;
 	/** Whether this child may spawn children of its own (maps to allowNestedSubagents). */

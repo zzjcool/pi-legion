@@ -2,7 +2,7 @@
 
 Default backend for children. **In-process by default**, with an automatic `rpc`
 fallback when the resolved spawn needs an OS worktree (`worktree: true`, the
-writer/centurion default) or has `kind !== "pi"`. An explicit
+writer/centurion default) or is not a `pi` role. An explicit
 `spawnMode: "inprocess"` combined with `worktree: true` is still **refused**
 with `INVALID_PARAMS` — the fallback only covers the implicit default.
 

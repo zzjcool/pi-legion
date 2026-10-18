@@ -16,6 +16,7 @@ import { currentChildContext } from "../../src/supervisor/child-context.ts";
 import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
+import type { NestedPathEntry } from "../../src/shared/types.ts";
 import { deriveOutcome, parseSessionFile } from "../../src/shared/session.ts";
 import {
 	SessionManager,
@@ -584,7 +585,7 @@ test("inprocess: child context is active during the first prompt", async () => {
 				nodeId: "node-7",
 				parentNodeId: "node-1",
 				dbPath: "/tmp/legion.db",
-				parentPath: ["root"],
+				parentPath: [{ runId: "root" }],
 				acceptanceRole: "read-only",
 				allowNested: true,
 				utility: true,
@@ -595,7 +596,7 @@ test("inprocess: child context is active during the first prompt", async () => {
 		assert.equal(seenDuringPrompt?.nodeId, "node-7");
 		assert.equal(seenDuringPrompt?.acceptanceRole, "read-only");
 		assert.equal(seenDuringPrompt?.allowNested, true);
-		assert.deepEqual(seenDuringPrompt?.parentPath, ["root"]);
+		assert.deepEqual(seenDuringPrompt?.parentPath, [{ runId: "root" }]);
 		// Depth and context are independent scopes; both must be live.
 		assert.equal(depthDuringPrompt, 1);
 		// Root chain after the spawn turn.
@@ -885,7 +886,7 @@ test("inprocess: mutating the caller's context template does not affect a spawne
 	});
 	const template = {
 		nodeId: "node-A",
-		parentPath: ["root", "a"],
+		parentPath: [{ runId: "root" }, { runId: "a" }],
 		allowNested: false,
 		utility: false,
 		spawnMode: "inprocess" as const,
@@ -897,7 +898,7 @@ test("inprocess: mutating the caller's context template does not affect a spawne
 		});
 		// Caller reuses its template for another spawn: node A must keep node A.
 		template.nodeId = "node-B";
-		template.parentPath.push("b");
+		template.parentPath.push({ runId: "b" });
 		await supervisor.prompt("root.worker", "turn2");
 		assert.deepEqual(seen, ["node-A", "node-A"]);
 	} finally {
@@ -907,7 +908,7 @@ test("inprocess: mutating the caller's context template does not affect a spawne
 
 test("inprocess: parentPath array is copied, not aliased (REV2-3)", async () => {
 	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-snap2-"));
-	let seenPath: string[] | undefined;
+	let seenPath: NestedPathEntry[] | undefined;
 	class ProbeSession extends FakeSession {
 		override async prompt(text: string): Promise<void> {
 			seenPath = currentChildContext()?.parentPath;
@@ -918,7 +919,7 @@ test("inprocess: parentPath array is copied, not aliased (REV2-3)", async () => 
 		limits: { maxActive: 8 },
 		sessionFactory: async () => new ProbeSession(),
 	});
-	const parentPath = ["root"];
+	const parentPath: NestedPathEntry[] = [{ runId: "root-run", agent: "root" }];
 	try {
 		await supervisor.spawnChild({
 			...testInput(root),
@@ -930,8 +931,8 @@ test("inprocess: parentPath array is copied, not aliased (REV2-3)", async () => 
 				spawnMode: "inprocess",
 			},
 		});
-		parentPath.push("mutated-after-spawn");
-		assert.deepEqual(seenPath, ["root"]);
+		parentPath.push({ runId: "mutated-after-spawn" });
+		assert.deepEqual(seenPath, [{ runId: "root-run", agent: "root" }]);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

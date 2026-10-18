@@ -11,6 +11,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-10-18
+
 ### Added
 
 - In-process `AgentSession` spawn mode (#197): `spawnMode: "rpc" | "inprocess"`,

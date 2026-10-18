@@ -693,6 +693,24 @@ export class Orchestrator {
 					...(worktreeBranch ? { worktreeBranch } : {}),
 					...(this.childContext ? { childContext: this.childContext } : {}),
 					...(this.rpcApprove ? { approve: true } : {}),
+					// D5: in-process children cannot inherit lineage through env (they share
+					// the parent's process.env and would read the PARENT's identity, or none
+					// at the root). Hand the arbitrator a real identity scope instead. Only
+					// the in-process backend consumes it; RPC lineage stays on env (I3).
+					...(inProcess && this.legion
+						? {
+								childLaunchContext: {
+									...(nodeId ? { nodeId } : {}),
+									parentNodeId: this.legion.nodeId,
+									dbPath: this.legion.dbPath,
+									parentPath: this.childPath(name),
+									...(agent.acceptance?.role ? { acceptanceRole: agent.acceptance.role } : {}),
+									allowNested: input.agent.allowNestedSubagents === true && !input.agent.utility,
+									utility: Boolean(input.utilityDispatch && input.agent.utility),
+									spawnMode: "inprocess" as const,
+								},
+							}
+						: {}),
 				};
 				try {
 					result = await this.supervisor.spawnChild(spawnInput);

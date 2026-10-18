@@ -78,13 +78,15 @@ spawnMode: inprocess   # or: rpc
 ```
 
 **Default:** omitting `spawnMode` means `inprocess` — the child runs as an
-`AgentSession` inside the parent Node process ([`createAgentSession`]), which
+`AgentSession` inside the parent Node process (`createAgentSession`), which
 trades process isolation for spawn latency.
 
 **Automatic fallback to `rpc`:** when `spawnMode` is omitted *and* the resolved
 spawn cannot be in-process, Legion launches it over `pi --mode rpc` instead.
 That happens when the role needs an OS worktree (`worktree: true` — the writer
-and centurion default) or when `kind !== "pi"`.
+and centurion default). A `kind !== "pi"` role is rejected earlier with
+`INVALID_PARAMS` (only `kind: pi` children are supported at all), so it never
+reaches this fallback.
 
 **Explicit is strict:** `spawnMode: "inprocess"` with `worktree: true` is
 refused with `INVALID_PARAMS` rather than silently downgraded, so a role that
@@ -96,7 +98,8 @@ not shared with the `legion.*` tree budgets — see
 
 ## Headless child contract
 
-Legion children are **rpc only** (`pi --mode rpc`). Headless modes have no
+Legion children on the **`rpc` backend** are rpc only (`pi --mode rpc`).
+Headless modes have no
 interactive tool-approval UI. Project `.pi/settings.json` / project extensions
 load under headless only after `/trust` (or `defaultProjectTrust=always`), or
 when you opt in with `subagents.rpc.approve: true` (appends `--approve`). Legion

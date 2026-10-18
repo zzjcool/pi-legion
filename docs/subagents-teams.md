@@ -102,8 +102,9 @@ and override semantics.
 ## spawnMode (rpc | inprocess)
 
 Omitted → `inprocess`, with an automatic `rpc` fallback when the resolved spawn
-needs an OS worktree (`worktree: true`, the writer/centurion default) or has
-`kind !== "pi"`. An explicit `spawnMode: "inprocess"` + `worktree: true` is
+needs an OS worktree (`worktree: true`, the writer/centurion default). A
+non-`pi` role is rejected before this point, so it never reaches the fallback.
+An explicit `spawnMode: "inprocess"` + `worktree: true` is
 still refused with `INVALID_PARAMS`. Precedence: frontmatter →
 `subagents.agentOverrides.<role>` → team member override.
 

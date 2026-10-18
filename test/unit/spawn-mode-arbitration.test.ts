@@ -233,3 +233,70 @@ test("arbitration: centurion parent dispatching a worker card passes the real ro
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+// ── D5/D8: the identity channel has a producer, not just consumers ──────────
+//
+// `childLaunchContext` is what carries lineage into an in-process child (it
+// cannot use env: the child shares the parent's `process.env`). Consumers
+// (`child-guard`, `index.ts`) read it, but a consumer-only channel is dead:
+// every in-process child would silently fall back to "no nodeId / no dbPath"
+// and never attach legion identity. This drives a REAL Orchestrator and
+// asserts the supervisor actually receives the lineage.
+test("identity: orchestrator passes legion lineage to an in-process child (D5)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "spawn-identity-"));
+	const repo = gitRepo(root);
+	const store = new RunStore({ rootDir: path.join(repo, ".pi-subagents") });
+	const rootRun = store.createRun({ task: "identity", cwd: repo, maxDepth: 4, nodeId: "root", herdr: { supervisor: "rpc" } });
+	const dbPath = legionDbPath(store.runDir(rootRun.runId));
+	const db = openLegionDb(dbPath);
+	const seen: unknown[] = [];
+	const uiProxy = new InMemoryUIProxy();
+	const record = (input: { name: string; sessionFile: string; childLaunchContext?: unknown }) => {
+		seen.push(input.childLaunchContext);
+		return { name: input.name, sessionFile: input.sessionFile, pid: 1 };
+	};
+	const supervisor = new RoutingSupervisor({
+		rpc: { uiProxy, isAlive: () => false, spawnChild: async (i: never) => record(i) } as unknown as RpcSupervisor,
+		inprocess: { uiProxy, isAlive: () => false, spawnChild: async (i: never) => record(i) } as unknown as InProcessSupervisor,
+		uiProxy,
+	});
+	try {
+		insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+		insertNode(db, { id: "root.centurion-0", parentId: "root", name: "centurion-0", role: "centurion", runId: rootRun.runId, status: "running" });
+		const orchestrator = new Orchestrator({
+			supervisor,
+			runDir: store.runDir(rootRun.runId),
+			cwd: repo,
+			maxDepth: 4,
+			legion: {
+				db,
+				dbPath,
+				nodeId: "root.centurion-0",
+				runId: rootRun.runId,
+				runStore: store,
+				settings: { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: 30 },
+				eventBus: createLegionEventBus(),
+			},
+		});
+		// A centurion parent suppresses the worktree, so this really goes in-process.
+		const handle = await orchestrator.launch({ agent: workerCard(), task: "Implement the slice." });
+		const ctx = seen[0] as { nodeId?: string; parentNodeId?: string; dbPath?: string; spawnMode?: string; utility?: boolean; allowNested?: boolean; parentPath?: unknown[] } | undefined;
+		assert.ok(ctx, "an in-process spawn must carry a launch context");
+		assert.equal(ctx.nodeId, handle.child.nodeId, "the child's own node id");
+		assert.equal(ctx.parentNodeId, "root.centurion-0", "the dispatching node");
+		assert.equal(ctx.dbPath, dbPath, "legion.db so the child can attach");
+		assert.equal(ctx.spawnMode, "inprocess");
+		// This orchestrator has no `deps.parentPath`, so `childPath(name)` is just
+		// this run plus the child step — the point is that a real path is threaded
+		// through (not undefined), and that its last entry names the child.
+		assert.equal(ctx.parentPath?.length, 1, "a real nested path is threaded through");
+		assert.deepEqual(
+			(ctx.parentPath?.[0] as { agent?: string } | undefined)?.agent,
+			handle.name,
+			"the path's last step names this child",
+		);
+	} finally {
+		db.close();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
