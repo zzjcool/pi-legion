@@ -116,3 +116,23 @@ test("inprocess limits: invalid shape throws", () => {
 		/inprocess\.maxActive/,
 	);
 });
+
+test("#193 rpc.approve: parse + project merge", () => {
+	const parsed = parseSubagentSettings(
+		{ subagents: { rpc: { approve: true } } },
+		"/tmp/settings.json",
+	);
+	assert.deepEqual(parsed.rpc, { approve: true });
+
+	const omitted = parseSubagentSettings({ subagents: {} }, "/tmp/settings.json");
+	assert.equal(omitted.rpc, undefined);
+
+	assert.throws(
+		() =>
+			parseSubagentSettings(
+				{ subagents: { rpc: { approve: "yes" } } },
+				"/tmp/settings.json",
+			),
+		/rpc\.approve/,
+	);
+});

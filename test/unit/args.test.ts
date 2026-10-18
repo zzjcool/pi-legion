@@ -237,3 +237,39 @@ test("#123 no model → neither --model nor --provider", () => {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+test("#193 buildPiArgs default omits --approve / -a / --no-approve", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "args-no-approve-"));
+	try {
+		const built = buildPiArgs({
+			agent: agent(),
+			task: "recon",
+			sessionFile: "/tmp/s.jsonl",
+			tempDir: dir,
+		});
+		assert.equal(built.args.includes("--approve"), false);
+		assert.equal(built.args.includes("-a"), false);
+		assert.equal(built.args.includes("--no-approve"), false);
+		assert.equal(built.args.includes("-na"), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("#193 buildPiArgs approve:true appends --approve only", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "args-approve-"));
+	try {
+		const built = buildPiArgs({
+			agent: agent(),
+			task: "recon",
+			sessionFile: "/tmp/s.jsonl",
+			tempDir: dir,
+			approve: true,
+		});
+		assert.ok(built.args.includes("--approve"));
+		assert.equal(built.args.includes("--no-approve"), false);
+		assert.equal(built.args.filter((a) => a === "--approve").length, 1);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});

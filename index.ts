@@ -103,6 +103,7 @@ import {
 	type ModelOrigin,
 	type RetireOptions,
 	SubagentError,
+	type SubagentsSettings,
 } from "./src/shared/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -479,7 +480,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const childRun = store.readRun(input.node.runId);
 	if (!childRun) throw new Error(`child run.json not found: ${input.node.runId}`);
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
-	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
+	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
 	orchestrator.restore(parentRun);
 	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
@@ -1288,6 +1289,7 @@ async function controlAction(input: {
 					maxDepth: input.settings.legion?.maxDepth,
 					childContext: resolveTeamContext("child", input.settings, input.team),
 					...teamForChildren(input.team),
+					...rpcApproveFrom(input.settings),
 					...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: input.store } } : {}),
 					onBudgetRefused: input.onBudgetRefused,
 				});
@@ -1352,6 +1354,7 @@ async function controlAction(input: {
 		worktreeBootstrap: input.settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: input.settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
+		...rpcApproveFrom(input.settings),
 		...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: store } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
 	});
@@ -1636,6 +1639,7 @@ async function launchFamily(input: {
 		worktreeBootstrap: settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
+		...rpcApproveFrom(settings),
 		...(legion ? { legion: { db: legion.db, dbPath: legion.dbPath, nodeId: legion.nodeId, runId: run.runId, parentNodeId: legion.parentNodeId ?? undefined, parentRunId: legion.parentRunId ?? undefined, runStore: store, settings: legion.settings, eventBus: legion.eventBus } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
 	});
@@ -2204,6 +2208,7 @@ async function launchUtilityFamily(input: {
 			maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null,
 			childContext: resolveTeamContext("child", catalog.settings, catalog.team),
 			team: catalog.team,
+			...rpcApproveFrom(catalog.settings),
 			onBudgetRefused: input.onBudgetRefused,
 			...(legion ? {
 				legion: {
@@ -2993,6 +2998,11 @@ export function renderParentRoster(
 /** Only selected teams and explicit env overrides need to reach child processes. */
 function teamForChildren(team: ActiveTeam): { team?: ActiveTeam } {
 	return team.name !== DEFAULT_TEAM || team.source === "env" ? { team } : {};
+}
+
+/** Opt-in `--approve` for RPC children (`subagents.rpc.approve`, #193). */
+function rpcApproveFrom(settings: Pick<SubagentsSettings, "rpc">): { rpcApprove?: boolean } {
+	return settings.rpc?.approve === true ? { rpcApprove: true } : {};
 }
 
 /** Prefer a role under the active team, then fall back for existing children. */
