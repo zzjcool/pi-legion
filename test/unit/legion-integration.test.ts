@@ -52,6 +52,19 @@ function agent(name = "worker", overrides: Partial<AgentConfig> = {}): AgentConf
 	};
 }
 
+/**
+ * Role pinned to the RPC backend.
+ *
+ * Legion ledger budgets (`maxChildrenPerNode`, `maxActiveNodes`, `maxDepth`) are
+ * RPC-side gates: in-process children are budgeted by `subagents.inprocess.*`
+ * only, so they deliberately bypass the ledger table. Since the default spawn
+ * mode is `inprocess`, any test that asserts an RPC ledger gate must pin
+ * `spawnMode: "rpc"` explicitly — otherwise it silently tests nothing.
+ */
+function rpcAgent(name = "worker", overrides: Partial<AgentConfig> = {}): AgentConfig {
+	return agent(name, { spawnMode: "rpc", ...overrides });
+}
+
 function fixture(options: { maxActiveNodes?: number; maxChildrenPerNode?: number } = {}) {
 	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-orchestrator-"));
 	const runStore = new RunStore({ rootDir: path.join(rootDir, ".pi-subagents") });
@@ -402,12 +415,12 @@ test("retire frees maxChildrenPerNode slots so launch can refill to the cap (#14
 		legion: fx.context,
 	});
 	try {
-		const first = await orchestrator.launch({ agent: agent("worker"), task: "slot-1", name: "slot-1", worktree: false });
-		const second = await orchestrator.launch({ agent: agent("worker"), task: "slot-2", name: "slot-2", worktree: false });
+		const first = await orchestrator.launch({ agent: rpcAgent("worker"), task: "slot-1", name: "slot-1", worktree: false });
+		const second = await orchestrator.launch({ agent: rpcAgent("worker"), task: "slot-2", name: "slot-2", worktree: false });
 		assert.equal(getNode(fx.db, first.child.nodeId!)?.status, "running");
 		assert.equal(getNode(fx.db, second.child.nodeId!)?.status, "running");
 		await assert.rejects(
-			() => orchestrator.launch({ agent: agent("worker"), task: "over fanout", name: "slot-3", worktree: false }),
+			() => orchestrator.launch({ agent: rpcAgent("worker"), task: "over fanout", name: "slot-3", worktree: false }),
 			(error: unknown) =>
 				error instanceof SubagentError &&
 				error.code === ErrorCodes.BUDGET_EXCEEDED &&
@@ -419,12 +432,12 @@ test("retire frees maxChildrenPerNode slots so launch can refill to the cap (#14
 		await orchestrator.retire(first.name);
 		assert.equal(getNode(fx.db, first.child.nodeId!)?.status, "retired");
 		assert.equal(existsSync(first.sessionFile), true, "retire keeps session for resume");
-		const third = await orchestrator.launch({ agent: agent("worker"), task: "reuse slot", name: "slot-3", worktree: false });
-		const fourth = await orchestrator.launch({ agent: agent("worker"), task: "reuse slot again", name: "slot-4", worktree: false });
+		const third = await orchestrator.launch({ agent: rpcAgent("worker"), task: "reuse slot", name: "slot-3", worktree: false });
+		const fourth = await orchestrator.launch({ agent: rpcAgent("worker"), task: "reuse slot again", name: "slot-4", worktree: false });
 		assert.equal(third.child.nodeId, "root.slot-3");
 		assert.equal(fourth.child.nodeId, "root.slot-4");
 		await assert.rejects(
-			() => orchestrator.launch({ agent: agent("worker"), task: "cap again", name: "slot-5", worktree: false }),
+			() => orchestrator.launch({ agent: rpcAgent("worker"), task: "cap again", name: "slot-5", worktree: false }),
 			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED,
 		);
 	} finally {
@@ -453,7 +466,7 @@ test("resume cannot exceed maxChildrenPerNode — no Math.max relaxation (#180)"
 		const names: string[] = [];
 		for (let i = 0; i < 8; i += 1) {
 			const handle = await orchestrator.launch({
-				agent: agent("worker"),
+				agent: rpcAgent("worker"),
 				task: `slot-${i}`,
 				name: `worker-${i}`,
 				worktree: false,
@@ -462,7 +475,7 @@ test("resume cannot exceed maxChildrenPerNode — no Math.max relaxation (#180)"
 		}
 		assert.equal(live(), 8);
 		await assert.rejects(
-			() => orchestrator.launch({ agent: agent("worker"), task: "fresh-9", name: "worker-9", worktree: false }),
+			() => orchestrator.launch({ agent: rpcAgent("worker"), task: "fresh-9", name: "worker-9", worktree: false }),
 			(error: unknown) =>
 				error instanceof SubagentError &&
 				error.code === ErrorCodes.BUDGET_EXCEEDED &&
@@ -472,13 +485,13 @@ test("resume cannot exceed maxChildrenPerNode — no Math.max relaxation (#180)"
 		await orchestrator.retire(names[0]!);
 		assert.equal(live(), 7, "retire frees a slot");
 		// Legit refill back to the cap.
-		await orchestrator.launch({ agent: agent("worker"), task: "refill", name: "worker-9", worktree: false });
+		await orchestrator.launch({ agent: rpcAgent("worker"), task: "refill", name: "worker-9", worktree: false });
 		assert.equal(live(), 8);
 		// Resume of the retired node must NOT inflate past the cap (#180).
 		await assert.rejects(
 			() =>
 				orchestrator.launch({
-					agent: agent("worker"),
+					agent: rpcAgent("worker"),
 					task: "resume-retired",
 					name: names[0]!,
 					worktree: false,
@@ -494,7 +507,7 @@ test("resume cannot exceed maxChildrenPerNode — no Math.max relaxation (#180)"
 		await orchestrator.retire(names[1]!);
 		assert.equal(live(), 7);
 		const resumed = await orchestrator.launch({
-			agent: agent("worker"),
+			agent: rpcAgent("worker"),
 			task: "legit-resume",
 			name: names[1]!,
 			worktree: false,
@@ -518,7 +531,7 @@ test("legion launch refusal is atomic, records budget_refused, and removes run r
 	});
 	try {
 		await assert.rejects(
-			() => orchestrator.launch({ agent: agent(), task: "over active budget", worktree: false }),
+			() => orchestrator.launch({ agent: rpcAgent(), task: "over active budget", worktree: false }),
 			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED,
 		);
 		assert.equal(supervisor.spawns.length, 0);

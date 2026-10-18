@@ -12,6 +12,8 @@ import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
+import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
+import { InMemoryUIProxy } from "../../src/supervisor/ui-proxy.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 
@@ -28,6 +30,21 @@ function agent(name: string, overrides: Partial<AgentConfig> = {}): AgentConfig 
 		filePath: `/fixtures/${name}.md`,
 		...overrides,
 	};
+}
+
+/**
+ * Role pinned to the RPC backend.
+ *
+ * Use this ONLY where the assertion reads an RPC-only observable: the child's
+ * lineage env (`PI_LEGION_DB` / `PI_LEGION_NODE_ID` / `PI_SUBAGENTS_TEAM`) or the
+ * `worktreeBranch` passed to RPC spawn. In-process children carry identity in an
+ * in-process context instead of env, so a defaulted worker would make
+ * `spawns.every(...)` assertions vacuously true on an empty spawn list.
+ * Everywhere else the suite must keep running on the default backend — that is
+ * what catches default-flip regressions.
+ */
+function rpcAgent(name: string, overrides: Partial<AgentConfig> = {}): AgentConfig {
+	return agent(name, { spawnMode: "rpc", ...overrides });
 }
 
 function phaseTool(db: ReturnType<typeof openLegionDb>, nodeId: string, cwd: string, runDir: string, runCommand?: LegionCommandRunner) {
@@ -84,6 +101,65 @@ async function finishChild(input: {
 	await input.store.updateChild(input.runId, handle.name, (child) => Object.assign(child, input.orchestrator.childrenSnapshot().find((record) => record.name === handle.name)));
 	return handle;
 }
+
+test("M2 default spawn mode: a centurion parent dispatches a worktree:true worker card on the default backend", async () => {
+	// Regression guard for the `centurion dispatches worker` production path.
+	//
+	// `agents/worker.md` pins `worktree: true` and sets no spawnMode, while a
+	// centurion parent forces the launch worktree to false (`parentRole ===
+	// "centurion"`). With the default backend now `inprocess`, the arbitrated
+	// agent must have BOTH fields normalized, or the real router rejects the
+	// self-contradictory `{spawnMode:"inprocess", worktree:true}` pair with
+	// INVALID_PARAMS on every nested dispatch. FakeSupervisor cannot see this (it
+	// only checks kind), so this case deliberately wires a real RoutingSupervisor
+	// with recording backend stubs: the router's own guard runs for real, only the
+	// would-be child process is replaced.
+	const sandbox = mkdtempSync(path.join(tmpdir(), "legion-tree-default-mode-"));
+	const repo = path.join(sandbox, "repo");
+	mkdirSync(repo, { recursive: true });
+	const git = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+	git(["init", "-q"]);
+	git(["config", "user.email", "legion-test@example.invalid"]);
+	git(["config", "user.name", "Legion integration test"]);
+	writeFileSync(path.join(repo, "README.md"), "fixture\n");
+	git(["add", "README.md"]);
+	git(["commit", "-m", "test fixture", "-q"]);
+
+	const store = new RunStore({ rootDir: path.join(repo, ".pi-subagents") });
+	const rootRun = store.createRun({ task: "default mode nested dispatch", cwd: repo, maxDepth: 4, nodeId: "root", herdr: { supervisor: "rpc" } });
+	const dbPath = legionDbPath(store.runDir(rootRun.runId));
+	const db = openLegionDb(dbPath);
+	const seen: Array<{ mode: string | undefined; worktree: boolean | undefined }> = [];
+	const record = (input: { agent: AgentConfig }) => {
+		seen.push({ mode: input.agent.spawnMode, worktree: input.agent.worktree });
+		return { name: "recorded", sessionFile: path.join(repo, "unused.jsonl"), pid: 1 };
+	};
+	const uiProxy = new InMemoryUIProxy();
+	const supervisor = new RoutingSupervisor({
+		rpc: { uiProxy, isAlive: () => false, spawnChild: async (input: { agent: AgentConfig }) => record(input) } as never,
+		inprocess: { uiProxy, isAlive: () => false, spawnChild: async (input: { agent: AgentConfig }) => record(input) } as never,
+		uiProxy,
+	});
+	try {
+		insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+		insertNode(db, { id: "root.centurion-0", parentId: "root", name: "centurion-0", role: "centurion", runId: rootRun.runId, status: "running" });
+		const orchestrator = new Orchestrator({
+			supervisor,
+			runDir: store.runDir(rootRun.runId),
+			cwd: repo,
+			maxDepth: 4,
+			legion: { db, dbPath, nodeId: "root.centurion-0", runId: rootRun.runId, runStore: store, settings: { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: 30 }, eventBus: createLegionEventBus() },
+		});
+		// Exactly the worker role-card shape: worktree pinned true, spawnMode omitted.
+		const handle = await orchestrator.launch({ agent: agent("worker", { worktree: true }), task: "Implement the slice." });
+		assert.equal(handle.child.worktreePath, undefined, "a centurion parent suppresses its workers' worktrees");
+		assert.equal(handle.child.nodeId, "root.centurion-0.worker-0");
+		assert.deepEqual(seen, [{ mode: "inprocess", worktree: false }], "default backend, worktree normalized away");
+	} finally {
+		db.close();
+		rmSync(sandbox, { recursive: true, force: true });
+	}
+});
 
 test("M2 tree e2e: root → centurion worktree → parallel workers → review → verify → done", async () => {
 	const sandbox = mkdtempSync(path.join(tmpdir(), "legion-tree-e2e-"));
@@ -162,8 +238,9 @@ test("M2 tree e2e: root → centurion worktree → parallel workers → review �
 
 		const workerText = "Implementation complete; no reviewer verdict is claimed.";
 		const workerHandles = await Promise.all([
-			teamOrchestrator.launch({ agent: agent("worker"), task: "Implement first independent slice.", worktree: false }),
-			teamOrchestrator.launch({ agent: agent("worker"), task: "Implement second independent slice.", worktree: false }),
+			// Pinned: the assertions below read these children's RPC lineage env.
+			teamOrchestrator.launch({ agent: rpcAgent("worker"), task: "Implement first independent slice.", worktree: false }),
+			teamOrchestrator.launch({ agent: rpcAgent("worker"), task: "Implement second independent slice.", worktree: false }),
 		]);
 		for (const handle of workerHandles) {
 			if (store.findChild(centurionRun.runId, handle.name)) await store.updateChild(centurionRun.runId, handle.name, (child) => Object.assign(child, handle.child));

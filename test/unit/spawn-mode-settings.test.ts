@@ -5,16 +5,17 @@ import { parseSubagentSettings } from "../../src/agents/settings.ts";
 import { applyAgentOverrides } from "../../src/agents/overrides.ts";
 import { resolveSpawnMode, DEFAULT_SPAWN_MODE } from "../../src/supervisor/spawn-mode.ts";
 
-test("spawnMode: omit defaults to rpc", () => {
+test("spawnMode: omit defaults to inprocess", () => {
+	assert.equal(DEFAULT_SPAWN_MODE, "inprocess");
 	assert.equal(resolveSpawnMode({}), DEFAULT_SPAWN_MODE);
-	assert.equal(resolveSpawnMode({ spawnMode: undefined }), "rpc");
+	assert.equal(resolveSpawnMode({ spawnMode: undefined }), DEFAULT_SPAWN_MODE);
 	const agent = parseAgentDocument(
 		"---\nname: scout\ndescription: d\n---\nbody",
 		"/a.md",
 		"user",
 	);
 	assert.equal(agent?.spawnMode, undefined);
-	assert.equal(resolveSpawnMode(agent!), "rpc");
+	assert.equal(resolveSpawnMode(agent!), DEFAULT_SPAWN_MODE);
 });
 
 test("spawnMode: frontmatter parses rpc and inprocess", () => {

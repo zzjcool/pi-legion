@@ -59,6 +59,7 @@ import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName, makeName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
 import { restoreHostNodeOptions } from "./src/supervisor/child-memory.ts";
+import { currentChildContext } from "./src/supervisor/child-context.ts";
 import { setVerifyQueueListener } from "./src/runs/verify-queue.ts";
 import { applyEventRetention, checkpoint, formatHygieneReport, hygieneEnabled, runStartupHygiene } from "./src/runs/hygiene.ts";
 import {
@@ -283,8 +284,8 @@ function settingsForLegion(settings: ReturnType<typeof loadSubagentSettings>): L
 	return { ...DEFAULT_LEGION_SETTINGS, ...(settings.legion ?? {}), phaseTimeouts: { ...DEFAULT_LEGION_SETTINGS.phaseTimeouts, ...(settings.legion?.phaseTimeouts ?? {}) } };
 }
 
-function runStoreFor(cwd: string): RunStore {
-	const sharedDbPath = process.env[LEGION_DB_ENV];
+function runStoreFor(cwd: string, dbPathOverride?: string): RunStore {
+	const sharedDbPath = dbPathOverride ?? process.env[LEGION_DB_ENV];
 	if (sharedDbPath && path.isAbsolute(sharedDbPath)) {
 		const storeRoot = path.dirname(path.dirname(path.dirname(sharedDbPath)));
 		return new RunStore({ rootDir: storeRoot });
@@ -361,9 +362,17 @@ function resolveLegionIdentity(input: {
 	cached?: LegionRuntimeIdentity;
 	/** This process's session file (identity credential). From ctx.sessionManager. */
 	sessionFile?: string | undefined;
+	/**
+	 * In-process child identity (#197 D8): the orchestrator names the ledger row
+	 * this session owns. Wins over `process.env.PI_LEGION_DB/NODE_ID` because an
+	 * in-process child shares the parent's env and would otherwise read the
+	 * *parent's* identity — or nothing at all when the parent is root.
+	 */
+	legionNode?: { dbPath: string; nodeId: string } | undefined;
 }): LegionRuntimeIdentity | undefined {
-	const dbPath = process.env[LEGION_DB_ENV];
-	const nodeId = process.env[LEGION_NODE_ID_ENV];
+	const injected = input.legionNode;
+	const dbPath = injected?.dbPath ?? process.env[LEGION_DB_ENV];
+	const nodeId = injected?.nodeId ?? process.env[LEGION_NODE_ID_ENV];
 	if (Boolean(dbPath) !== Boolean(nodeId)) throw new Error("PI_LEGION_DB and PI_LEGION_NODE_ID must be set together");
 	if (dbPath && nodeId) {
 		if (!path.isAbsolute(dbPath)) throw new Error("PI_LEGION_DB must be an absolute path");
@@ -487,8 +496,19 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 }
 
 export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {
-	const isChild = process.env.PI_SUBAGENT_CHILD === "1";
-	const allowNested = process.env[ALLOW_NESTED_ENV] === "1";
+	// #197 D8: a session is a child if either transport says so. RPC children
+	// are separate processes marked in env; in-process children share the
+	// parent's `process.env`, so their marker can only come from the
+	// AsyncLocalStorage child context the orchestrator injects.
+	//
+	// Security note: the ALS context does not survive `spawn()`, so a real
+	// subprocess (`bash npm test`, a nested CLI, …) cannot inherit this
+	// identity. That is exactly the isolation the env channel lacked — see the
+	// "healthy ghost nodes" incident documented at the identity credential
+	// check in `resolveLegionIdentity`. Do not replace this with env injection.
+	const childContext = currentChildContext();
+	const isChild = process.env.PI_SUBAGENT_CHILD === "1" || childContext !== undefined;
+	const allowNested = process.env[ALLOW_NESTED_ENV] === "1" || childContext?.allowNested === true;
 	if (isChild) restoreHostNodeOptions();
 	else {
 		// Root UI: surface verify-queue waits instead of a silent stall.
@@ -556,13 +576,15 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		legionIdentity.db.close();
 		legionIdentity = undefined;
 	};
-	const initializeLegionRuntime = (ctx: Pick<ExtensionContext, "cwd"> & { sessionFile?: string }): void => {
-		const store = runStoreFor(ctx.cwd);
+	const initializeLegionRuntime = (ctx: Pick<ExtensionContext, "cwd"> & { sessionFile?: string; legionNode?: { dbPath: string; nodeId: string } }): void => {
+		// The injected node's dbPath is authoritative: an in-process child shares the
+		// parent's env, so PI_LEGION_DB here belongs to the parent (or is unset).
+		const store = runStoreFor(ctx.cwd, ctx.legionNode?.dbPath);
 		const settings = loadSubagentSettings({
 			userSettingsPath: path.join(getAgentDir(), "settings.json"),
 			projectSettingsPath: path.join(ctx.cwd, ".pi", "settings.json"),
 		});
-		const next = resolveLegionIdentity({ pi, supervisor, store, cwd: ctx.cwd, settings, eventBus: legionBus, cached: legionIdentity, sessionFile: ctx.sessionFile });
+		const next = resolveLegionIdentity({ pi, supervisor, store, cwd: ctx.cwd, settings, eventBus: legionBus, cached: legionIdentity, sessionFile: ctx.sessionFile, legionNode: ctx.legionNode });
 		if (legionIdentity && next !== legionIdentity) stopLegionRuntime();
 		legionIdentity = next;
 	};
@@ -573,6 +595,33 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			// the session_start handler re-runs this with the real credential.
 			try { initializeLegionRuntime({ cwd: process.cwd() }); }
 			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
+		}
+		// #197 D8: an in-process child never sees `session_start` — the SDK emits it
+		// from `bindExtensions`, which only rpc / print / interactive modes call;
+		// `createAgentSession` does not. So the handler further down is dead for
+		// this transport and the injected identity is attached here instead.
+		//
+		// It is attached on the first ctx-bearing event rather than at extension
+		// load: the identity credential (this session's transcript file) only
+		// exists on `ctx.sessionManager`, and skipping it would defeat the
+		// ghost-node guard inside `resolveLegionIdentity`.
+		if (childContext?.nodeId && childContext.dbPath) {
+			const legionNode = { dbPath: childContext.dbPath, nodeId: childContext.nodeId };
+			let attached = false;
+			const attachInjectedChildIdentity = (_event: unknown, ctx?: { cwd?: string; sessionManager?: { getSessionFile?: () => string | undefined } }): void => {
+				if (attached) return;
+				attached = true;
+				try {
+					initializeLegionRuntime({
+						cwd: ctx?.cwd ?? process.cwd(),
+						legionNode,
+						sessionFile: ctx?.sessionManager?.getSessionFile?.(),
+					});
+				} catch (error) {
+					console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			};
+			pi.on("before_agent_start", attachInjectedChildIdentity);
 		}
 	}
 	// #37/#38/#40/#181: one best-effort storage sweep per root process.

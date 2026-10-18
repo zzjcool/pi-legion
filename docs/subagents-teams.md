@@ -101,4 +101,13 @@ and override semantics.
 
 ## spawnMode (rpc | inprocess)
 
-See [inprocess-supervisor.md](./inprocess-supervisor.md) (#197).
+Omitted → `inprocess`, with an automatic `rpc` fallback when the resolved spawn
+needs an OS worktree (`worktree: true`, the writer/centurion default). A
+non-`pi` role is rejected before this point, so it never reaches the fallback.
+An explicit `spawnMode: "inprocess"` + `worktree: true` is
+still refused with `INVALID_PARAMS`. Precedence: frontmatter →
+`subagents.agentOverrides.<role>` → team member override.
+
+See [inprocess-supervisor.md](./inprocess-supervisor.md) (#197) for the backend
+details, the separate `subagents.inprocess.*` limits, and the
+AsyncLocalStorage identity channel.

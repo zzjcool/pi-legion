@@ -11,14 +11,34 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-10-18
+
 ### Added
 
-- Optional in-process `AgentSession` spawn mode (#197): `spawnMode: "rpc" | "inprocess"`
-  (default rpc), `InProcessSupervisor` + `RoutingSupervisor`, and separate
+- In-process `AgentSession` spawn mode (#197): `spawnMode: "rpc" | "inprocess"`,
+  `InProcessSupervisor` + `RoutingSupervisor`, and separate
   `subagents.inprocess.*` limit keys. See `docs/inprocess-supervisor.md`.
 
 ### Changed
 
+- **BREAKING (#197):** `spawnMode` now defaults to `inprocess`, not `rpc`.
+  When the key is omitted and the resolved spawn needs an OS worktree
+  (`worktree: true` — the writer/centurion default) or has `kind !== "pi"`,
+  Legion falls back to `rpc` automatically. An explicit
+  `spawnMode: "inprocess"` combined with `worktree: true` is still refused
+  with `INVALID_PARAMS` — the fallback only covers the implicit default.
+- **BREAKING (#197):** omitting the whole `subagents.inprocess` block no
+  longer means "unlimited". The in-process supervisor now falls back to the
+  `legion.*` defaults (`maxDepth: 4`, `maxChildrenPerNode: 8`,
+  `maxActive: 30`); an explicit block that omits `maxActive` still gets 8.
+  `maxSpawnsPerSession` / `waitTimeoutMs` keep no default.
+- #197 in-process children read their identity (node id, db path, acceptance
+  role, nesting budget) from an AsyncLocalStorage child context instead of
+  `PI_SUBAGENT_*` / `PI_LEGION_*` env. In-process sessions share the parent's
+  `process.env`, so the env channel delivered the parent's values — or none at
+  all in a root parent — and mis-scoped read-only role enforcement. ALS does
+  not cross `spawn()`, so `bash` subprocesses can no longer inherit a tree
+  identity.
 - TUI: drop the footer `N agents running` segment (#192); the aboveEditor
   widget already shows the same count. `STATUS_FOOTER_KEY` / `formatFooterStatus`
   remain exported but `@deprecated` (soft-land).
@@ -211,7 +231,8 @@ branch — pin `pi-legion@0.16.x` if you still need that model. See
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v2.0.4...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/zzjcool/pi-legion/compare/v2.0.4...v3.0.0
 [2.0.4]: https://github.com/zzjcool/pi-legion/compare/v2.0.3...v2.0.4
 [2.0.3]: https://github.com/zzjcool/pi-legion/compare/v2.0.2...v2.0.3
 [2.0.2]: https://github.com/zzjcool/pi-legion/compare/v2.0.1...v2.0.2

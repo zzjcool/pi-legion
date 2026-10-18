@@ -1,8 +1,13 @@
 # Headless child contract
 
-Legion children are **headless Pi RPC processes**. This document pins the trust /
-approve surface and the exit → settle mapping so operators and agents do not
-confuse upstream pi behaviour with legion's own `onBlocked` policy.
+This document pins the trust / approve surface and the exit → settle mapping of
+the **`rpc` backend** so operators and agents do not confuse upstream pi
+behaviour with legion's own `onBlocked` policy.
+
+On the `rpc` backend, legion children are **headless Pi RPC processes**. The
+default backend is `inprocess` (an `AgentSession` inside the parent Node
+process), which has no child process, no argv and therefore no trust/approve
+surface — see [inprocess-supervisor.md](./inprocess-supervisor.md).
 
 ## Modes (upstream pi) vs legion
 
@@ -12,8 +17,9 @@ confuse upstream pi behaviour with legion's own `onBlocked` policy.
 | `--mode json` | No | Not used |
 | `--mode rpc` | No | **Yes — rpc only** |
 
-Legion always launches children via `RpcClient` → `pi --mode rpc`. Print and
-json modes are listed only for contrast; they are not legion child transports.
+On the `rpc` backend legion always launches children via `RpcClient` →
+`pi --mode rpc`. Print and json modes are listed only for contrast; they are
+never legion child transports.
 
 ## Project trust under headless
 

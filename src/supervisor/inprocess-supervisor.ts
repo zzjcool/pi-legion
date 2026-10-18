@@ -1,9 +1,11 @@
 /**
  * LegionSupervisor backed by in-process AgentSession (#197).
  *
- * Uses createAgentSession + SessionManager.inMemory (or an injectable factory
- * for unit tests). Production factory wires role tools / model / system prompt
- * (#199). Does NOT use RpcClient. Process-tree / SIG retire is skipped.
+ * Uses createAgentSession + `SessionManager.open(input.sessionFile, ...)` so the
+ * child transcript lands on the file the Orchestrator pre-created (D7; an
+ * in-memory manager would leave it empty), or an injectable factory in unit
+ * tests. Production factory wires role tools / model / system prompt (#199).
+ * Does NOT use RpcClient. Process-tree / SIG retire is skipped.
  */
 
 import { formatChildTask } from "../extension/child-guard.ts";
@@ -17,12 +19,19 @@ import {
 	isThinkingLevel,
 	type InProcessLimits,
 	SubagentError,
+	DEFAULT_LEGION_SETTINGS,
 } from "../shared/types.ts";
 import {
 	DEFAULT_INPROCESS_MAX_ACTIVE,
 } from "./spawn-mode.ts";
 import {
+	type ChildLaunchContext,
+	runInChildContext,
+	runOutsideChildContext,
+} from "./child-context.ts";
+import {
 	inProcessDepth,
+	runAtAbsoluteDepth,
 	runAtInProcessChildDepthAsync,
 } from "./inprocess-depth.ts";
 import {
@@ -40,6 +49,30 @@ import type {
 	UsageSnapshot,
 } from "./types.ts";
 
+/**
+ * Stats shape this supervisor reads. Permissive on purpose: it must be
+ * structurally assignable from the SDK's `SessionStats` (nested `tokens` +
+ * `cost`) AND from lightweight test doubles that report flat counters. Both
+ * shapes are declared, and both are actually read in `stats()` — a shape that
+ * is declared but never read would silently report zero (REV2-6).
+ */
+export interface InProcessSessionStats {
+	/** Flat counters (test doubles). */
+	tokensIn?: number;
+	tokensOut?: number;
+	costUsd?: number;
+	totalCost?: number;
+	/** SDK `SessionStats` shape. */
+	tokens?: {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		total?: number;
+	};
+	cost?: number;
+}
+
 /** Narrow session surface InProcessSupervisor needs from AgentSession. */
 export interface InProcessSession {
 	subscribe(listener: (event: unknown) => void): () => void;
@@ -48,7 +81,7 @@ export interface InProcessSession {
 	followUp?(text: string): Promise<unknown>;
 	abort?(): Promise<unknown>;
 	dispose(): void;
-	getSessionStats?(): unknown;
+	getSessionStats?(): InProcessSessionStats | Promise<InProcessSessionStats>;
 }
 
 /** Input to the production / injectable session factory (#199). */
@@ -157,7 +190,10 @@ function resolveInProcessSystemPrompt(input: InProcessSessionFactoryInput): {
 
 export interface InProcessSupervisorOptions {
 	uiProxy?: UIProxy;
-	/** Injected in tests; production uses createAgentSession + SessionManager.inMemory. */
+	/**
+	 * Injected in tests; production uses createAgentSession +
+	 * `SessionManager.open(input.sessionFile, ...)` (D7 transcript persistence).
+	 */
 	sessionFactory?: InProcessSessionFactory;
 	/** Limits for this supervisor instance (inprocess.* only). */
 	limits?: InProcessLimits;
@@ -196,6 +232,8 @@ interface ChildRecord {
 	abortedPending: boolean;
 	spawnDepth: number;
 	parentKey: string;
+	/** Identity reused by every later dispatch into this child (tools inherit it). */
+	context: ChildLaunchContext;
 }
 
 const COARSE_EVENT_TYPES = new Set([
@@ -212,6 +250,42 @@ const COARSE_EVENT_TYPES = new Set([
 function parentKeyOf(name: string): string {
 	const idx = name.lastIndexOf(".");
 	return idx === -1 ? "" : name.slice(0, idx);
+}
+
+/**
+ * Identity scope for one in-process child (spawn-default-inprocess-v3 D5).
+ *
+ * A caller may hand over a full `childLaunchContext`; when it does not, we
+ * still establish a minimal context so that the child never observes "no
+ * identity" and mistakes itself for the root session. The fallback is derived
+ * from the spawn input only — it carries no db/node lineage, which is exactly
+ * why partial identity must not be mistaken for a complete one downstream.
+ */
+function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
+	const provided = input.childLaunchContext;
+	if (provided) {
+		// REV2-3: store a deep-enough snapshot, never the caller's live object.
+		// A caller that reuses one template object (or one `parentPath` array)
+		// across spawns would otherwise mutate the identity of an already-spawned
+		// child for its later dispatches — the A-becomes-B leak D5 exists to kill.
+		return {
+			...provided,
+			// Element-level copy too: after the path became `NestedPathEntry[]`
+			// (objects), `[...path]` would still alias every entry, so a caller
+			// mutating `template.parentPath[0].runId` would rewrite an
+			// already-spawned child's lineage — the exact A-becomes-B leak.
+			...(provided.parentPath
+				? { parentPath: provided.parentPath.map((entry) => ({ ...entry })) }
+				: {}),
+		};
+	}
+	const acceptanceRole = input.agent.acceptance?.role;
+	return {
+		allowNested: input.allowNestedSubagents === true,
+		utility: Boolean(input.agent.utility),
+		spawnMode: "inprocess",
+		...(acceptanceRole ? { acceptanceRole } : {}),
+	};
 }
 
 function recordOf(value: unknown): Record<string, unknown> | null {
@@ -262,9 +336,16 @@ async function defaultSessionFactory(
 	const resourceLoader = new DefaultResourceLoader(loaderOptions);
 	await resourceLoader.reload();
 
+	// D7 — the transcript must land on the file the Orchestrator pre-created
+	// (`orchestrator.ts` `preCreateSessionFile`). With `SessionManager.inMemory()`
+	// `getSessionFile()` returns undefined and nothing is ever written, so
+	// `deriveOutcome(parseSessionFile(...))` sees an empty file and every
+	// in-process child "succeeds with zero output". `open()` on the pre-created
+	// empty file works and reports that path. Deliberately no try/catch fallback
+	// to inMemory: a silent fallback would restore exactly that zero-output bug.
 	const createOptions: Parameters<typeof createAgentSession>[0] = {
 		cwd: plan.cwd,
-		sessionManager: SessionManager.inMemory(),
+		sessionManager: SessionManager.open(input.sessionFile, undefined, plan.cwd),
 		resourceLoader,
 		...(plan.tools ? { tools: plan.tools } : {}),
 	};
@@ -319,15 +400,40 @@ export class InProcessSupervisor implements LegionSupervisor {
 		this.onSpawnRefused = options.onSpawnRefused;
 	}
 
-	private limits(): InProcessLimits {
+	/**
+	 * Effective in-process limits.
+	 *
+	 * RECORDED CONTRACT CHANGE (spawn-default-inprocess-v3 D4): the old rule was
+	 * "no `subagents.inprocess` block → unlimited". Now that inprocess is the
+	 * default backend, "no config" would mean unbounded recursive spawning, so
+	 * an absent block falls back to the same safe numbers RPC uses
+	 * (`DEFAULT_LEGION_SETTINGS.maxDepth/maxChildrenPerNode/maxActiveNodes`).
+	 *
+	 * An *explicit* block keeps `DEFAULT_INPROCESS_MAX_ACTIVE` when it omits
+	 * `maxActive` (existing behaviour; tests depend on it).
+	 * `maxSpawnsPerSession` / `waitTimeoutMs` stay undefined by default — same
+	 * asymmetry as the RPC knobs, which have no defaults either.
+	 */
+	private limits(): Required<
+		Pick<InProcessLimits, "maxDepth" | "maxChildrenPerNode" | "maxActive">
+	> &
+		InProcessLimits {
 		const configured = this.getLimits();
-		// No inprocess block → no limits (unlimited).
-		if (configured === undefined) return {};
-		// Documented safe default when maxActive omitted from an explicit block.
-		if (configured.maxActive === undefined) {
-			return { maxActive: DEFAULT_INPROCESS_MAX_ACTIVE, ...configured };
+		if (configured === undefined) {
+			return {
+				maxDepth: DEFAULT_LEGION_SETTINGS.maxDepth,
+				maxChildrenPerNode: DEFAULT_LEGION_SETTINGS.maxChildrenPerNode,
+				maxActive: DEFAULT_LEGION_SETTINGS.maxActiveNodes,
+			};
 		}
-		return configured;
+		return {
+			...configured,
+			maxDepth: configured.maxDepth ?? DEFAULT_LEGION_SETTINGS.maxDepth,
+			maxChildrenPerNode:
+				configured.maxChildrenPerNode ??
+				DEFAULT_LEGION_SETTINGS.maxChildrenPerNode,
+			maxActive: configured.maxActive ?? DEFAULT_INPROCESS_MAX_ACTIVE,
+		};
 	}
 
 	async spawnChild(input: SpawnInput): Promise<ChildHandle> {
@@ -369,52 +475,60 @@ export class InProcessSupervisor implements LegionSupervisor {
 				this.subscriptionsBeforeSpawn.get(input.name) ?? new Set(),
 			spawnDepth: inProcessDepth() + 1,
 			parentKey: parentKeyOf(input.name),
+			context: resolveChildLaunchContext(input),
 		};
 		this.subscriptionsBeforeSpawn.delete(input.name);
 		this.children.set(input.name, registration);
 
 		try {
-			return await runAtInProcessChildDepthAsync(async () => {
-				const session = await this.sessionFactory({
-					name: input.name,
-					cwd: input.cwd,
-					agent: input.agent,
-					sessionFile: input.sessionFile,
-					...(input.model !== undefined ? { model: input.model } : {}),
-					...(input.modelProvider !== undefined
-						? { modelProvider: input.modelProvider }
-						: {}),
-					...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
-					...(input.childContext !== undefined
-						? { childContext: input.childContext }
-						: {}),
-				});
-				registration.session = session;
-				registration.unsubscribeSession = session.subscribe((event) =>
-					this.handleSessionEvent(registration, event),
-				);
-				registration.state = "idle";
-				this.spawnCount += 1;
-				this.beginTurn(registration);
-				await session.prompt(
-					formatChildTask(input.task, {
-						allowNested: input.allowNestedSubagents === true,
-						...(input.worktreeBranch
-							? { worktreeBranch: input.worktreeBranch }
+			return await runAtInProcessChildDepthAsync(() =>
+				// Identity scope: the session factory and the first prompt both run
+				// inside it, so every tool the child executes during that turn
+				// inherits the child's context instead of seeing the root's.
+				runInChildContext(registration.context, async () => {
+					const session = await this.sessionFactory({
+						name: input.name,
+						cwd: input.cwd,
+						agent: input.agent,
+						sessionFile: input.sessionFile,
+						...(input.model !== undefined ? { model: input.model } : {}),
+						...(input.modelProvider !== undefined
+							? { modelProvider: input.modelProvider }
 							: {}),
-					}),
-				);
-				if (!this.isAlive(input.name)) {
-					throw new SubagentError(
-						`in-process session ended after its first prompt: ${input.name}`,
-						ErrorCodes.START_FAILED,
+						...(input.thinking !== undefined
+							? { thinking: input.thinking }
+							: {}),
+						...(input.childContext !== undefined
+							? { childContext: input.childContext }
+							: {}),
+					});
+					registration.session = session;
+					registration.unsubscribeSession = session.subscribe((event) =>
+						this.handleSessionEvent(registration, event),
 					);
-				}
-				return {
-					name: registration.name,
-					sessionFile: registration.sessionFile,
-				};
-			});
+					registration.state = "idle";
+					this.spawnCount += 1;
+					this.beginTurn(registration);
+					await session.prompt(
+						formatChildTask(input.task, {
+							allowNested: input.allowNestedSubagents === true,
+							...(input.worktreeBranch
+								? { worktreeBranch: input.worktreeBranch }
+								: {}),
+						}),
+					);
+					if (!this.isAlive(input.name)) {
+						throw new SubagentError(
+							`in-process session ended after its first prompt: ${input.name}`,
+							ErrorCodes.START_FAILED,
+						);
+					}
+					return {
+						name: registration.name,
+						sessionFile: registration.sessionFile,
+					};
+				}),
+			);
 		} catch (error) {
 			await this.rollbackSpawn(registration);
 			if (error instanceof SubagentError) {
@@ -443,11 +557,30 @@ export class InProcessSupervisor implements LegionSupervisor {
 		const child = this.requireChild(name);
 		this.assertCanSend(child);
 		if (!child.turnActive) return;
-		await child.session?.abort?.();
+		// Same identity scope and nesting depth as the child's own turn: abort can
+		// settle tool promises whose continuations still run inside it.
+		await runAtAbsoluteDepth(child.spawnDepth, () =>
+			runInChildContext(child.context, async () => {
+				await child.session?.abort?.();
+			}),
+		);
 	}
 
 	waitSettled(name: string, timeoutMs = 900_000, signal?: AbortSignal): Promise<SettleResult> {
 		const child = this.requireChild(name);
+		return runAtAbsoluteDepth(child.spawnDepth, () =>
+			runInChildContext(child.context, () =>
+				this.awaitSettled(child, timeoutMs, signal),
+			),
+		);
+	}
+
+	private awaitSettled(
+		child: ChildRecord,
+		timeoutMs: number,
+		signal: AbortSignal | undefined,
+	): Promise<SettleResult> {
+		const name = child.name;
 		const limits = this.limits();
 		const effectiveTimeout =
 			timeoutMs === 900_000 && limits.waitTimeoutMs !== undefined
@@ -524,14 +657,15 @@ export class InProcessSupervisor implements LegionSupervisor {
 		try {
 			const raw = await child.session.getSessionStats?.();
 			if (!raw) return null;
+			// REV2-6: the real AgentSession reports `tokens: {input, output}` + `cost`
+			// (agent-session.d.ts SessionStats), while test doubles use flat counters.
+			// Reading only the flat keys made production usage read as 0 and let
+			// stats() overwrite the correct usage the Orchestrator had already
+			// written to the transcript.
 			return {
-				tokensIn: Number((raw as UsageSnapshot).tokensIn ?? 0),
-				tokensOut: Number((raw as UsageSnapshot).tokensOut ?? 0),
-				costUsd: Number(
-					(raw as UsageSnapshot).costUsd ??
-						(raw as { totalCost?: number }).totalCost ??
-						0,
-				),
+				tokensIn: Number(raw.tokensIn ?? raw.tokens?.input ?? 0),
+				tokensOut: Number(raw.tokensOut ?? raw.tokens?.output ?? 0),
+				costUsd: Number(raw.costUsd ?? raw.totalCost ?? raw.cost ?? 0),
 			};
 		} catch {
 			return null;
@@ -622,7 +756,24 @@ export class InProcessSupervisor implements LegionSupervisor {
 		}
 	}
 
-	private async dispatch(
+	private dispatch(
+		child: ChildRecord,
+		kind: "prompt" | "steer" | "followUp",
+		text: string,
+	): Promise<void> {
+		// Every turn is dispatched inside the child's identity scope AND at the
+		// child's recorded absolute nesting depth. The Orchestrator drives turn 2+
+		// from the root chain, where `inProcessDepth()` is 0; without pinning the
+		// recorded depth here a grandchild would look like a first-generation
+		// child and `maxDepth` would never fire (REV2-1).
+		return runAtAbsoluteDepth(child.spawnDepth, () =>
+			runInChildContext(child.context, () =>
+				this.dispatchInContext(child, kind, text),
+			),
+		);
+	}
+
+	private async dispatchInContext(
 		child: ChildRecord,
 		kind: "prompt" | "steer" | "followUp",
 		text: string,
@@ -749,6 +900,17 @@ export class InProcessSupervisor implements LegionSupervisor {
 	}
 
 	private publishEvent(child: ChildRecord, record: Record<string, unknown>): void {
+		// Sessions emit synchronously from inside the child's await chain, so a
+		// parent-side listener would otherwise run with the child's ALS identity
+		// (currentChildContext() would report the child). Host callbacks run at
+		// root identity (REV2-7).
+		runOutsideChildContext(() => this.publishEventAtRoot(child, record));
+	}
+
+	private publishEventAtRoot(
+		child: ChildRecord,
+		record: Record<string, unknown>,
+	): void {
 		const type = record.type;
 		if (typeof type !== "string") return;
 		if (type === "message_update") {

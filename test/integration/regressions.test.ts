@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { parseSessionText, deriveOutcome, isLastTurnComplete } from "../../src/shared/session.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { assistantMsg, sessionHeader, userMsg } from "../helpers/fixtures.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -129,9 +130,12 @@ test("regression: role depth never widens parent depth and spawn budget is enfor
 	try {
 		const supervisor = new FakeSupervisor();
 		const orchestrator = new Orchestrator({ supervisor, runDir, cwd: "/tmp", parentPath: [{ runId: "r-parent" }], maxDepth: 2, maxSpawns: 1 });
-		await orchestrator.launch({ agent: agent({ maxSubagentDepth: 4 }), task: "allowed", worktree: false });
+		// Both assertions below are RPC-only: the `PI_SUBAGENT_MAX_DEPTH` ceiling is
+		// the RPC lineage env channel, and `maxSpawns` is the RPC spawn budget
+		// (in-process children use `subagents.inprocess.*`). Pin the mode.
+		await orchestrator.launch({ agent: agent({ maxSubagentDepth: 4, spawnMode: "rpc" }), task: "allowed", worktree: false });
 		assert.equal(Number(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_MAX_DEPTH), 2);
-		await assert.rejects(() => orchestrator.launch({ agent: agent(), task: "budget" }), (error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED);
+		await assert.rejects(() => orchestrator.launch({ agent: agent({ spawnMode: "rpc" }), task: "budget" }), (error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED);
 	} finally { rmSync(runDir, { recursive: true, force: true }); }
 });
 
@@ -143,7 +147,18 @@ test("regression: worktree can be disabled for a writer and remains after RPC re
 	try {
 		execFileSync("git", ["init", "-q", repo]);
 		execFileSync("git", ["-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"]);
-		const supervisor = new FakeSupervisor();
+		// A REAL RoutingSupervisor whose rpc backend is the in-memory FakeSupervisor.
+		// The rule under test — `worktree:true` role + `launch({worktree:false})` must
+		// not produce `{spawnMode:"inprocess", worktree:true}` — is enforced by the
+		// router itself (routing-supervisor.ts:79). Asserting it against a bare
+		// FakeSupervisor is a false green: the fake only checks `kind !== "pi"`.
+		const rpc = new FakeSupervisor();
+		const inprocess = {
+			uiProxy: rpc.uiProxy,
+			isAlive: () => false,
+			spawnChild: async (input: { name: string; sessionFile: string }) => ({ name: input.name, sessionFile: input.sessionFile, pid: 1 }),
+		} as never;
+		const supervisor = new RoutingSupervisor({ rpc: rpc as never, inprocess, uiProxy: rpc.uiProxy });
 		const orchestrator = new Orchestrator({ supervisor, runDir, cwd: repo });
 		const optedOut = await orchestrator.launch({ agent: agent({ worktree: true }), task: "share", worktree: false });
 		assert.equal(optedOut.child.worktreePath, undefined);

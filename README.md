@@ -20,6 +20,7 @@ shared SQLite ledger records the whole tree.
 ## Contents
 
 - [Architecture](#architecture)
+- [Spawn mode](#spawn-mode)
 - [Headless child contract](#headless-child-contract)
 - [Quick start](#quick-start)
 - [Legion tools and phases](#legion-tools-and-phases)
@@ -64,9 +65,41 @@ Transport, state, decision-making, and display are separate layers:
 - **Display:** the event bus feeds the resident tree, the `/legion` full view,
   and an on-demand live overlay.
 
+## Spawn mode
+
+`spawnMode` picks the backend that runs one child. Per role it comes from agent
+frontmatter → `subagents.agentOverrides.<role>` → team member override:
+
+```yaml
+# agents/scout.md
+---
+spawnMode: inprocess   # or: rpc
+---
+```
+
+**Default:** omitting `spawnMode` means `inprocess` — the child runs as an
+`AgentSession` inside the parent Node process (`createAgentSession`), which
+trades process isolation for spawn latency.
+
+**Automatic fallback to `rpc`:** when `spawnMode` is omitted *and* the resolved
+spawn cannot be in-process, Legion launches it over `pi --mode rpc` instead.
+That happens when the role needs an OS worktree (`worktree: true` — the writer
+and centurion default). A `kind !== "pi"` role is rejected earlier with
+`INVALID_PARAMS` (only `kind: pi` children are supported at all), so it never
+reaches this fallback.
+
+**Explicit is strict:** `spawnMode: "inprocess"` with `worktree: true` is
+refused with `INVALID_PARAMS` rather than silently downgraded, so a role that
+asks for in-process never gets a different transport behind its back.
+
+Limits for the in-process backend are separate (`subagents.inprocess.*`) and are
+not shared with the `legion.*` tree budgets — see
+[docs/inprocess-supervisor.md](docs/inprocess-supervisor.md).
+
 ## Headless child contract
 
-Legion children are **rpc only** (`pi --mode rpc`). Headless modes have no
+Legion children on the **`rpc` backend** are rpc only (`pi --mode rpc`).
+Headless modes have no
 interactive tool-approval UI. Project `.pi/settings.json` / project extensions
 load under headless only after `/trust` (or `defaultProjectTrust=always`), or
 when you opt in with `subagents.rpc.approve: true` (appends `--approve`). Legion

@@ -46,7 +46,7 @@ export const AGENT_KINDS = [
 
 export type AgentKind = (typeof AGENT_KINDS)[number];
 
-/** How Legion launches a child session. Omit / default = rpc. */
+/** How Legion launches a child session: omit → `inprocess` (with automatic rpc fallback when the agent needs a worktree or `kind !== "pi"`). */
 export const SPAWN_MODES = ["rpc", "inprocess"] as const;
 export type SpawnMode = (typeof SPAWN_MODES)[number];
 
@@ -155,8 +155,12 @@ export interface AgentConfig {
 	worktree?: boolean;
 	steer?: boolean;
 	/**
-	 * Launch backend for this role. Omit = `rpc` (subprocess RpcClient).
-	 * `inprocess` uses createAgentSession in the parent Node process.
+	 * Launch backend for this role. Omit → `inprocess` (createAgentSession in
+	 * the parent Node process), with automatic rpc fallback when the resolved
+	 * spawn needs a worktree (`worktree: true`, the writer/centurion default)
+	 * or `kind !== "pi"`. An explicit `inprocess` + `worktree: true` is still
+	 * refused with `INVALID_PARAMS` — the fallback only applies to the implicit
+	 * default, never to an explicit request.
 	 */
 	spawnMode?: SpawnMode;
 	onBlocked?: OnBlockedPolicy;
@@ -599,8 +603,11 @@ export interface ScoutGuardSettings {
 /**
  * Concurrency / depth / wait limits for the in-process supervisor (#197).
  * Keys are independent of RPC / legion.* budgets — never fall back to those.
- * Omitted fields are unlimited except `maxActive`, which defaults to 8 when
- * the whole `inprocess` object is present without `maxActive`.
+ *
+ * Defaults mirror `legion.*` when the whole `inprocess` block is absent:
+ * `maxDepth: 4` / `maxChildrenPerNode: 8` / `maxActive: 30`. With an explicit
+ * block that omits `maxActive`, `maxActive` is 8. `maxSpawnsPerSession` and
+ * `waitTimeoutMs` have no default (unlimited).
  */
 export interface InProcessLimits {
 	maxSpawnsPerSession?: number;

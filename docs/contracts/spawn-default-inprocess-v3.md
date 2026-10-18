@@ -118,8 +118,13 @@ export interface ChildLaunchContext {
     parentNodeId?: string;
     /** legion.db 绝对路径 */
     dbPath?: string;
-    /** 调用方的 nested path 分段，供子会话的 orchestrator 续接 */
-    parentPath?: string[];
+    /**
+     * Nested path segments — value equals the RPC `PI_SUBAGENT_PARENT_PATH`
+     * (encodeNestedPath(childPath(name))), i.e. it ALREADY includes this child.
+     * Currently unread; a future consumer must pass it straight to
+     * Orchestrator's `deps.parentPath`, never append to it.
+     */
+    parentPath?: NestedPathEntry[];
     /** role 的 acceptance.role（read-only / writer / …） */
     acceptanceRole?: string;
     /** 是否允许该子会话再派子（对应 allowNestedSubagents） */
@@ -275,7 +280,8 @@ runAtAbsoluteDepth(child.spawnDepth, () => runInChildContext(child.context, () =
 ### REV2-3（D5 快照）`ChildRecord.context` 必须是深拷贝快照
 禁止把调用方传入的对象（含 `parentPath` 数组）以活引用存进 `ChildRecord` —— 调用方复用模板对象
 会让**已 spawn 子会话的后续派发身份**跟着变（A 的身份变成 B 的），正是 D5 要消灭的串身份。
-**要求**：`{ ...provided, ...(provided.parentPath ? { parentPath: [...provided.parentPath] } : {}) }`，
+**要求**：元素级深拷贝（`parentPath` 是对象数组，`[...path]` 仍会共享每个
+`NestedPathEntry`）：`{ ...provided, ...(provided.parentPath ? { parentPath: provided.parentPath.map((e) => ({ ...e })) } : {}) }`，
 并补一条「spawn 后修改调用方模板不影响已 spawn 子会话」的测试。
 
 ### REV2-4（D5 判别性测试）globalThis 存储必须有能证伪模块级实现的测试

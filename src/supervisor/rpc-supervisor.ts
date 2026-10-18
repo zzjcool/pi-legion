@@ -297,6 +297,9 @@ export class RpcSupervisor implements LegionSupervisor {
 				cliPath: _cliPath,
 				tempDir: _tempDir,
 				stripLegionIdentity: _stripLegionIdentity,
+				// In-process identity never travels over the RPC channel; drop it so an
+				// accidental spread cannot leak a lineage object into argv building.
+				childLaunchContext: _childLaunchContext,
 				...buildInput
 			} = input;
 			const built = buildPiArgs({
