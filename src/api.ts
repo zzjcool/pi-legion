@@ -235,6 +235,7 @@ export {
 	formatAlreadyRecycled,
 } from "./extension/recycle.ts";
 export {
+	activeEntries,
 	applyStatus,
 	createStatusBoard,
 	formatBusyLabel,
