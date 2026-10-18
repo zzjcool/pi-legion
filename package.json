@@ -1,6 +1,6 @@
 {
   "name": "pi-legion",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "Pi Legion v2: recursive centurion trees on headless Pi RPC; shared SQLite WAL legion.db. Four-stage planning/implementing/reviewing/verifying state machine, parent/child/sibling legion_mail, three-layer /legion UI, upward MR trees, squad resume.",
   "type": "module",
   "license": "MIT",
@@ -49,7 +49,6 @@
     "LICENSE"
   ],
   "scripts": {
-    "preinstall": "node -e \"const ua=process.env.npm_config_user_agent||'';if(!ua.includes('pnpm')){console.error('Use pnpm to install dependencies (see CONTRIBUTING.md).');process.exit(1)}\"",
     "typecheck": "tsc --noEmit",
     "test": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/unit/*.test.ts",
     "test:integration": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/integration/*.test.ts",
@@ -98,5 +97,12 @@
   "engines": {
     "node": ">=22",
     "pnpm": ">=9"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": ">=9",
+      "onFail": "error"
+    }
   }
 }

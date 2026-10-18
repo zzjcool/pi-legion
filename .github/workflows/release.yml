@@ -66,6 +66,24 @@ jobs:
           fi
           echo "Tag ${tag} matches package.json ${pkg_version}."
 
+      # npm always packs package.json, so an install-phase script declared here
+      # reaches every consumer. Pi installs extensions with plain `npm install`,
+      # so a pnpm-only `preinstall` guard (3.0.0) made `pi update --extensions`
+      # fail for everyone. devEngines.packageManager gives the same contributor
+      # guard without executing anything in a consumer install.
+      - name: Reject install-phase scripts in the published manifest
+        run: |
+          set -euo pipefail
+          for script in preinstall install postinstall; do
+            declared=$(node -p "require('./package.json').scripts?.['${script}'] ?? ''")
+            if [ -n "${declared}" ]; then
+              echo "::error::scripts.${script} runs in every consumer install."
+              echo "::error::Use devEngines.packageManager instead."
+              exit 1
+            fi
+          done
+          echo "No install-phase scripts in the published manifest."
+
       - name: Read tag annotation
         run: |
           set -euo pipefail

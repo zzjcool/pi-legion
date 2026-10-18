@@ -11,6 +11,28 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [3.0.1] — 2026-10-18
+
+### Fixed
+
+- **Published manifest no longer ships a `preinstall` hook.** 3.0.0 added a
+  pnpm-only `preinstall` guard meant for repository contributors, and npm always
+  packs `package.json`, so the hook shipped to every consumer. Pi installs
+  extensions with `npm install <spec> --prefix <agentDir>/npm --legacy-peer-deps`,
+  so `pi update --extensions` failed with
+  `Use pnpm to install dependencies (see CONTRIBUTING.md).` — npm exited 1 and
+  rolled the previously installed version back, which left the
+  "Package Updates Available" notice pointing at the same outdated version on
+  every start. The pnpm-only intent now lives in `devEngines.packageManager`,
+  which npm enforces for the repository root (`EBADDEVENGINES`) and ignores when
+  the package is installed as a dependency. `packageManager`, `engines.pnpm`, and
+  `CONTRIBUTING.md` are unchanged.
+- `test/unit/publish-manifest.test.ts` guards the published manifest against
+  install-phase scripts (`preinstall` / `install` / `postinstall`) and asserts the
+  pnpm requirement stays declared, so this cannot ship again silently.
+- `release.yml` now fails the tag build when a published install-phase script was
+  reintroduced, before anything is staged.
+
 ## [3.0.0] — 2026-10-18
 
 ### Added
