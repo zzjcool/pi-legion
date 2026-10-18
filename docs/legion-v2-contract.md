@@ -208,7 +208,7 @@ description: 百夫长/组长：携带一支团队递归派生的指挥角色。
 kind: pi
 allowNestedSubagents: true
 maxSubagentDepth: 2          # R=本角色子树代数上限（含自身；与所在深度无关；只收紧不放宽）：1=叶子禁派生；2=可派一层组员、组员不可再派；3=组员（如孙代 centurion）可再派一层
-worktree: true               # 子树 worktree：本人 cwd 即队的工作区（§9）
+worktree: true               # 子树 worktree：本人 cwd 即队的工作区（§9；该权限经 REV-17 收为 centurion 专属）
 team:                        # 可选：默认队（须是 settings.teams 里真实存在的队名）；省略 = 全 roster 可选；launch 可覆盖（subagent({team:"fe-premium"})）
 ---
 ```
@@ -321,6 +321,8 @@ legion_phase({ to, note?, evidence? })                // 仅 centurion（§7）
 ## 9. 隔离与交付（子树 worktree、MR 树）
 
 - **per-subtree worktree**：centurion launch 时由**其父**创建（复用现有 `createChildWorktree`：`git worktree add -b pi-subagent/<slug>-<nonce>`，D8 仅 git）；centurion 的 cwd 即该 worktree；**组员一律 `worktree:false` 原地干活**。隔离边界从"每个 writer"上移到"每个子树"，MR 数量从 O(组员数) 降到 O(子树数)。**N 并行隔离 writer** = 根直派 N 个 centurion（各 1 worktree），centurion 内组员 inprocess；不要给每个 worker 开 worktree
+- **worktree 仅 centurion 可用**（REV-17，#214）：`worktree: true` 是 centurion 角色的专属权限，不存在其他持有者。判定以角色名 `centurion` 为准：centurion 卡一律拿到子树 worktree（嵌套 centurion 拿 nested worktree，不受「父是 centurion ⇒ 组员不隔离」压制）；centurion 的组员一律不拿；其余角色（`worker` / `prototype` / `scout` / `reviewer` / `planner` / `advisor` / `designer`，含用户自建 writer 角色）既不自动获得、也不会因 `acceptance.role: writer` 而获得 worktree
+- **违规处理为降级，不是报错**（REV-17）：非 centurion 角色卡声明 `worktree: true`、或 `subagent({ worktree: true })` 显式传参，一律**降级为 `worktree: false`**，并 `console.warn` 一次（每 Orchestrator 实例一次，同 `depthWarningEmitted` 语义）。**不抛错**——抛错会阻断 launch，而降级的语义是「回到契约本来的边界」；被降级的组员与父共享 checkout，其改动留在父的工作区里
 - 孙代 centurion 在子树 worktree 内再开 nested worktree（git 原生支持），递归成立
 - **MR 树**（D6）：每棵子树一个 squash MR → 父节点（或其队）合并 → 逐级上交 → 根合入默认分支。合并权在各级父节点，叶子永不 merge（现有纪律的递归推广）
 - 文件所有权清单随契约（§7.2）逐层传递；契约矛盾 = 正确拒绝，上报修订后重派
@@ -414,7 +416,7 @@ interface LegionEventBus {
 
 ### M2 军团树（组织层：db + centurion + 状态机 + 邮件）
 
-- **归属**：新增 `src/legion/{db,nodes,events,usage,mail,state-machine,budget,rebuild}.ts`、`agents/centurion.md`、`src/extension/legion-tools.ts`；修改 `orchestrator.ts`（launch 落库/树命名/预算查库/子树 worktree）、`src/runs/worktree.ts`（subtree 模式）、`src/runs/args.ts`（env 增 `PI_LEGION_DB`/`PI_LEGION_NODE_ID`）、`src/agents/agents.ts`、`index.ts`（队级 resume、collect 落库）
+- **归属**：新增 `src/legion/{db,nodes,events,usage,mail,state-machine,budget,rebuild}.ts`、`agents/centurion.md`、`src/extension/legion-tools.ts`；修改 `orchestrator.ts`（launch 落库/树命名/预算查库/子树 worktree——经 REV-17 收为 centurion 专属，非 centurion 请求 warns 一次后降级）、`src/runs/worktree.ts`（subtree 模式）、`src/runs/args.ts`（env 增 `PI_LEGION_DB`/`PI_LEGION_NODE_ID`）、`src/agents/agents.ts`、`index.ts`（队级 resume、collect 落库）
 - **验收**：(a) 三层树 e2e：CEO→centurion→workers×2 全阶段走通（契约落盘→并行实施→review verdict→verify 实跑→done 收队 + squash MR）；(b) rework 循环：review major→回 implementing→复审通过；(c) rework≥2 → failed 上抛；(d) kill centurion 进程 → 孤儿报警 → resume 恢复整队、settled 组员不复活、运行中组员上下文延续；(e) `maxActiveNodes` 超限拒派 + 事件；(f) 邮件：同级/父子/父←子通、跨子树拒发并提示路由、retired 收件人唤醒投递、终态收件人退信；(g) WAL 压测：60 模拟 supervisor 并发写 5 分钟，busy 超时率 <0.1%；(h) `legion-rebuild` 从 run.json+jsonl 重建 nodes/events；(i) 非 pi kind 明确拒绝
 
 ### M3 可视化
@@ -459,3 +461,4 @@ interface LegionEventBus {
 | 2026-10-11 | REV-14 | §10.1 点击双通道降级：OSC 8 超链接仅作视觉锚点（宿主 TUI 截获链接点击去 openBrowser，pi-tui tui-alt-screen.js:1097-1104 + extensions types 无 URL 回调 API——worker-14 读源码实证）；浮窗打开 = 组件鼠标事件 + 键盘路径（/legion <name>）。鼠标事件在全屏模式路由到组件（tree-view 自管分页的点击 handler 已支持），regular 模式无鼠标为宿主限制。触发：worker-14 按 §15-2 正确拒绝（WIP 已由合并权人固化 2dff211） |
 | 2026-10-11 | REV-15 | §6.1 centurion 角色卡的 `team: be-value` 改为可选省略：be-value 是示例值，仓库/用户 settings 均未定义该队，不覆盖时子进程收警告并退化全 roster。team 字段语义 = 可选的默认队绑定（须真实存在），省略即全 roster。触发：reviewer-6 对 PR #13 的范围外观察 |
 | 2026-10-12 | REV-16 | §3.2 retire 链加固：SIGTERM 超时后升级 SIGKILL（新 option `killTimeoutMs`，默认 1s），并在 retire 时枚举子 pi 的后代进程（/proc 祖先链），按进程组 SIGTERM→SIGKILL 清场（排除 supervisor 自身进程组与子 pi 自身 pid）。触发：2026-10-12 孤儿 `node --test` 进程泄露事故（两个 PPID=1 进程各烧 4h20m CPU，SIGTERM 无效，人工 SIGKILL 收场）。子契约：`docs/retire-hardening-contract.md`（FROZEN-1） |
+| 2026-10-19 | REV-17 | §9 worktree 收为 centurion 专属（权限变更，按 §15-4 走修订）：① 判定以角色名 `centurion` 为准，centurion 卡一律拿子树 worktree、嵌套 centurion 拿 nested worktree；② 其余角色一律不拿——删除「`acceptance.role: writer` 自动补 `worktree: true`」的隐式默认，`agents/worker.md` 从 `worktree: true` 改为显式 `worktree: false`（`agents/centurion.md` 的 `true` 与 `agents/prototype.md` 的 `false` 不变）；③ 违规一律**降级为 `false` + `console.warn` 一次**，**不抛错**（抛错会阻断 launch）；`subagent({ worktree: true })` 显式传参同样降级。不改 `resolveLaunchWorktree` 的优先级链（不变式 I5），不新增事件类型，不改 `spawnMode` 仲裁逻辑。原因：issue #214（worktree 收为 centurion 专属，与 §9 已冻结的「组员一律 `worktree: false`」对齐；实现向契约收敛，隔离边界继续由「每棵子树」承载） |

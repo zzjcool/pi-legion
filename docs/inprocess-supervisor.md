@@ -1,8 +1,8 @@
 # In-process AgentSession mode (#197)
 
 Default backend for children. **In-process by default**, with an automatic `rpc`
-fallback when the resolved spawn needs an OS worktree (`worktree: true`, the
-writer/centurion default). An explicit
+fallback when the resolved spawn needs an OS worktree (`worktree: true`, which
+only a `centurion` can hold — #214). An explicit
 `spawnMode: "inprocess"` combined with `worktree: true` is still **refused**
 with `INVALID_PARAMS` — the fallback only covers the implicit default.
 
@@ -15,8 +15,10 @@ with `INVALID_PARAMS` — the fallback only covers the implicit default.
 
 There is no single global default in the config sense: omitting `spawnMode`
 means "inprocess if this role can run in-process, otherwise rpc". Roles that
-default to `worktree: true` (writer, centurion) therefore resolve to `rpc`
-unless they opt out of the worktree.
+resolve to `worktree: true` therefore resolve to `rpc` unless they opt out of
+the worktree — and since #214 that is only `centurion`: every other role is
+downgraded to `worktree: false` with a one-time warning, so it stays
+in-process.
 
 **Non-goals:** no OS worktree isolation; no promise of process crash containment; OpenAaaS Go in-process transport is out of scope.
 
@@ -29,7 +31,7 @@ Per agent (frontmatter → `agentOverrides` → team member override):
 ---
 name: scout
 description: Fast read-only recon
-spawnMode: inprocess   # omit = inprocess (worktree roles auto-fall back to rpc)
+spawnMode: inprocess   # omit = inprocess (only a centurion resolves to a worktree, hence rpc)
 worktree: false        # explicit inprocess + worktree: true is still refused
 ---
 ```
@@ -161,6 +163,9 @@ a decode rate.
   worktree fallback
 - `worktree: true` + explicit `inprocess` → `INVALID_PARAMS` (an omitted
   `spawnMode` falls back to `rpc` instead)
+- A non-centurion requesting `worktree: true` is **not** a refusal: it is
+  downgraded to `worktree: false` with a one-time warning (#214), so the launch
+  proceeds in-process. `worktree` is reserved for `centurion`.
 - Invalid `spawnMode` string → loud throw at settings / frontmatter parse
 
 ## Tests

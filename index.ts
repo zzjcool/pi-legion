@@ -124,7 +124,7 @@ const TaskItem = Type.Object({
 	worktree: Type.Optional(
 		Type.Boolean({
 			description:
-				"Parent decides isolation for this child. true = own git branch, child opens an MR. false = write the current checkout.",
+				"Parent decides isolation for this child. true = own git branch, child opens an MR. false = write the current checkout. Reserved for `centurion` (#214): any other role asking for true is downgraded to false with a one-time warning.",
 		}),
 	),
 	verify: Type.Optional(
@@ -176,7 +176,7 @@ const SubagentParams = Type.Object({
 	worktree: Type.Optional(
 		Type.Boolean({
 			description:
-				"Parent decides isolation. true = isolated git branch, child opens an MR. false = edit the current checkout. Omit to use the role default (bundled worker: true).",
+				"Parent decides isolation. true = isolated git branch, child opens an MR. false = edit the current checkout. Reserved for `centurion` (#214): only a centurion gets a subtree worktree, every other role is downgraded to false with a one-time warning — dispatch a centurion when you need an isolated delivery unit.",
 		}),
 	),
 	verify: Type.Optional(

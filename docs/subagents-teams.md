@@ -102,11 +102,15 @@ and override semantics.
 ## spawnMode (rpc | inprocess)
 
 Omitted → `inprocess`, with an automatic `rpc` fallback when the resolved spawn
-needs an OS worktree (`worktree: true`, the writer/centurion default). A
-non-`pi` role is rejected before this point, so it never reaches the fallback.
-An explicit `spawnMode: "inprocess"` + `worktree: true` is
-still refused with `INVALID_PARAMS`. Precedence: frontmatter →
+needs an OS worktree (`worktree: true`, which only a `centurion` can hold —
+#214). A non-`pi` role is rejected before this point, so it never reaches the
+fallback. An explicit `spawnMode: "inprocess"` + `worktree: true` is still
+refused with `INVALID_PARAMS`. Precedence: frontmatter →
 `subagents.agentOverrides.<role>` → team member override.
+
+`worktree: true` is centurion-only: any other role that asks for it is
+downgraded to `worktree: false` with a one-time warning, so squad members always
+run in-process in the centurion's subtree worktree.
 
 See [inprocess-supervisor.md](./inprocess-supervisor.md) (#197) for the backend
 details, the separate `subagents.inprocess.*` limits, and the
