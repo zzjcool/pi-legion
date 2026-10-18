@@ -53,8 +53,12 @@ import {
 } from "../runs/verify-queue.ts";
 import { ALLOW_NESTED_ENV } from "./budget.ts";
 import { IDLE_STOP_HINT, IDLE_STOP_HINT_SHORT } from "./legion-stop.ts";
-import type { AgentConfig } from "../shared/types.ts";
-import { recentSpawnFailures, type SpawnFailureRecord } from "./spawn-hints.ts";
+import type { AgentConfig, SpawnMode } from "../shared/types.ts";
+import { resolveSpawnMode } from "../supervisor/spawn-mode.ts";
+import {
+	recentSpawnFailures,
+	type SpawnFailureRecord,
+} from "./spawn-hints.ts";
 import {
 	formatSessionErrorTitle,
 	sessionErrorsLogPath,
@@ -179,6 +183,11 @@ export interface DoctorOptions {
 	sections?: readonly DoctorSection[];
 	/** Injected session-error summary (tests); defaults to reading storeRoot log. */
 	sessionErrors?: SessionErrorSummary;
+	/**
+	 * Override resolved spawn backend for diagnosis (#212).
+	 * When omitted, uses `resolveSpawnMode(sampleAgent)` (default inprocess).
+	 */
+	spawnMode?: SpawnMode;
 }
 
 function readJson(file: string): unknown {
@@ -345,6 +354,23 @@ function sampleAgentConfig(agent?: AgentConfig): AgentConfig {
 	);
 }
 
+
+/** Fix text for inprocess model/provider gaps — never recommends PI_LEGION_CHILD_EXTENSIONS (#212). */
+export function inprocessModelFix(): string {
+	return (
+		"Declare the provider statically in models.json (agent dir / project), " +
+		"or set role frontmatter extensions: […] / inheritExtensions: true."
+	);
+}
+
+/** RPC-only fix that exports PI_LEGION_CHILD_EXTENSIONS when paths are known. */
+function rpcChildExtensionsFix(providerExtHome: readonly string[]): string | undefined {
+	if (providerExtHome.length) {
+		return `export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}`;
+	}
+	return `Add the provider package extension path to ${CHILD_EXTENSIONS_ENV}, or set role extensions: / inheritExtensions: true.`;
+}
+
 function previewChildArgv(agent: AgentConfig, env: NodeJS.ProcessEnv): string[] {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "legion-doctor-"));
 	try {
@@ -506,9 +532,18 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 
 	const inheritGlobal = childInheritsExtensions({}, env);
 	const extras = childExtraExtensions(env);
-	const sample = sampleAgentConfig(options.sampleAgent);
-	const argv = previewChildArgv(sample, env);
-	const noExtensions = argv.includes("--no-extensions");
+	const sample = sampleAgentConfig(
+		options.spawnMode && options.sampleAgent
+			? { ...options.sampleAgent, spawnMode: options.spawnMode }
+			: options.spawnMode
+				? { ...sampleAgentConfig(), spawnMode: options.spawnMode }
+				: options.sampleAgent,
+	);
+	const spawnMode: SpawnMode = resolveSpawnMode(sample);
+	const isInprocess = spawnMode === "inprocess";
+	// Argv preview is RPC-shaped; only meaningful when default/sample backend is rpc (#212).
+	const argv = isInprocess ? [] : previewChildArgv(sample, env);
+	const noExtensions = isInprocess ? false : argv.includes("--no-extensions");
 	const explicitExts = argv.flatMap((a, i) => (a === "--extension" ? [argv[i + 1]!] : []));
 
 	const probe = options.probeModels !== false;
@@ -556,7 +591,10 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	].filter((ext, i, all) => all.indexOf(ext) === i);
 	const providerExtHome = providerExtPaths.map((ext) => homeize(ext, home));
 
-	if (!inheritGlobal && noExtensions && hostModels.length > 0 && childModels.length === 0) {
+	// CHILD_NO_MODELS / CHILD_FEWER_MODELS come from the RPC CLI probe
+	// (`pi --no-extensions --list-models`). Skip them when default backend is
+	// inprocess — that probe is a false lead for ModelRuntime children (#212).
+	if (!isInprocess && !inheritGlobal && noExtensions && hostModels.length > 0 && childModels.length === 0) {
 		issues.push({
 			severity: "error",
 			code: "CHILD_NO_MODELS",
@@ -564,11 +602,9 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 			message:
 				`Host has ${hostModels.length} model(s) but a child with --no-extensions sees none. ` +
 				`Providers are registered by host packages that children no longer load (#43).`,
-			fix: providerExtHome.length
-				? `export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}`
-				: `Add the provider package extension path to ${CHILD_EXTENSIONS_ENV}, or set role extensions: / inheritExtensions: true.`,
+			fix: rpcChildExtensionsFix(providerExtHome),
 		});
-	} else if (!inheritGlobal && noExtensions && hostModels.length > childModels.length && childModels.length > 0) {
+	} else if (!isInprocess && !inheritGlobal && noExtensions && hostModels.length > childModels.length && childModels.length > 0) {
 		issues.push({
 			severity: "warning",
 			code: "CHILD_FEWER_MODELS",
@@ -578,18 +614,19 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	}
 
 	const expected = options.expectedModels ?? [];
-	const missing = inheritGlobal
+	// Inprocess shares host discovery after extension drain — compare roster to host.
+	const missing = inheritGlobal || isInprocess
 		? expected.filter((m) => !modelMatches(m, hostModels))
 		: expected.filter((m) => !modelMatches(m, childModels));
-	if (missing.length > 0 && (childModels.length === 0 || !inheritGlobal)) {
+	if (missing.length > 0 && (isInprocess || childModels.length === 0 || !inheritGlobal)) {
 		issues.push({
 			severity: "error",
 			code: "TEAM_MODELS_MISSING",
 			section: "models",
-			message: `Team/roster model(s) invisible to children: ${missing.join(", ")}`,
-			fix: providerExtHome.length
-				? `export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}`
-				: undefined,
+			message: isInprocess
+				? `Team/roster model(s) not visible on the host registry (inprocess resolves via ModelRuntime): ${missing.join(", ")}`
+				: `Team/roster model(s) invisible to children: ${missing.join(", ")}`,
+			fix: isInprocess ? inprocessModelFix() : rpcChildExtensionsFix(providerExtHome),
 		});
 	}
 
@@ -625,16 +662,30 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 	}
 
 	const failures = options.failures ?? recentSpawnFailures();
-	if (failures.some((f) => f.hadNoExtensions !== false && /not found|No models/i.test(f.stderr ?? f.message))) {
-		issues.push({
-			severity: "error",
-			code: "RECENT_MODEL_SPAWN_FAIL",
-			section: "spawn",
-			message: "A recent child spawn failed with a model/provider error under --no-extensions.",
-			fix: providerExtHome.length
-				? `export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}`
-				: undefined,
-		});
+	const modelFailRe = /not found|No models|Unknown provider|inprocess model resolve failed/i;
+	const recentModelFails = failures.filter((f) => modelFailRe.test(f.stderr ?? f.message));
+	if (recentModelFails.length > 0) {
+		// Default backend (or tagged failure) decides the fix — never recommend
+		// PI_LEGION_CHILD_EXTENSIONS for inprocess (#212).
+		const treatAsInprocess =
+			isInprocess || recentModelFails.every((f) => f.spawnMode === "inprocess");
+		if (treatAsInprocess) {
+			issues.push({
+				severity: "error",
+				code: "RECENT_MODEL_SPAWN_FAIL",
+				section: "spawn",
+				message: "A recent inprocess child spawn failed to resolve a model/provider.",
+				fix: inprocessModelFix(),
+			});
+		} else if (recentModelFails.some((f) => f.hadNoExtensions !== false)) {
+			issues.push({
+				severity: "error",
+				code: "RECENT_MODEL_SPAWN_FAIL",
+				section: "spawn",
+				message: "A recent child spawn failed with a model/provider error under --no-extensions.",
+				fix: rpcChildExtensionsFix(providerExtHome),
+			});
+		}
 	}
 
 	const gate = resolveMemoryGateConfig(env);
@@ -721,8 +772,14 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		const warnN = issues.filter((i) => i.severity === "warning").length;
 		push(`- status: ${errN ? "FAIL" : warnN ? "WARN" : "OK"} (${errN} error(s), ${warnN} warning(s))`);
 		push(`- session errors: ${sessionErrors.total}${sessionErrors.logPath ? ` (log ${homeize(sessionErrors.logPath, home)})` : ""}`);
-		push(`- child --no-extensions: ${noExtensions ? "yes" : "no"}; inherit: ${inheritGlobal ? "yes" : "no"}`);
-		push(`- models host/child: ${hostModels.length}/${childModels.length}`);
+		push(`- spawnMode (sample/default): ${spawnMode}`);
+		if (isInprocess) {
+			push(`- child backend: inprocess (ModelRuntime; no --no-extensions argv); inherit: ${inheritGlobal ? "yes" : "no"}`);
+			push(`- models host (inprocess uses host registry after extension drain): ${hostModels.length}`);
+		} else {
+			push(`- child --no-extensions: ${noExtensions ? "yes" : "no"}; inherit: ${inheritGlobal ? "yes" : "no"}`);
+			push(`- models host/child: ${hostModels.length}/${childModels.length}`);
+		}
 		push(`- live children: ${runtime.liveJobs?.length ?? "(unknown — pass runtime)"}`);
 		push(`- free memory: ${availableMb} MB (gate min ${gate.minFreeMb})`);
 		if (storeRoot) push(`- store: ${homeize(storeRoot, home)}`);
@@ -731,8 +788,13 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 
 	if (want(selected, "extensions")) {
 		push("## Extensions");
+		push(`- spawnMode (sample/default): ${spawnMode}`);
 		push(`- inheritExtensions (env/role default): ${inheritGlobal ? "yes (loads all host extensions)" : "no"}`);
-		push(`- child argv includes --no-extensions: ${noExtensions ? "yes" : "no"}`);
+		if (isInprocess) {
+			push("- child argv --no-extensions: n/a (inprocess has no child argv)");
+		} else {
+			push(`- child argv includes --no-extensions: ${noExtensions ? "yes" : "no"}`);
+		}
 		push(`- ${CHILD_INHERIT_EXTENSIONS_ENV}=${env[CHILD_INHERIT_EXTENSIONS_ENV] ?? "(unset)"}`);
 		push(`- ${CHILD_EXTENSIONS_ENV}=${env[CHILD_EXTENSIONS_ENV] ?? "(unset)"}`);
 		push(`- extra extension paths: ${extras.length ? extras.map((p) => homeize(p, home)).join(", ") : "(none)"}`);
@@ -763,10 +825,19 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 
 	if (want(selected, "models")) {
 		push("## Models / providers");
+		push(`- spawnMode (sample/default): ${spawnMode}`);
 		push(`- host (normal discovery): ${hostModels.length}`);
-		push(`- child (--no-extensions): ${childModels.length}`);
-		if (hostModels.length && childModels.length === 0) {
-			push("- child sees NO models — providers come from host packages that `--no-extensions` skips.");
+		if (isInprocess) {
+			push("- child probe (`pi --no-extensions --list-models`): skipped as doctor signal for inprocess (#212)");
+			push(`- rpc-shaped probe count (informational only): ${childModels.length}`);
+			if (hostModels.length === 0) {
+				push("- host sees NO models — declare providers in models.json or load provider extensions for inprocess.");
+			}
+		} else {
+			push(`- child (--no-extensions): ${childModels.length}`);
+			if (hostModels.length && childModels.length === 0) {
+				push("- child sees NO models — providers come from host packages that `--no-extensions` skips.");
+			}
 		}
 		if (restoring.length) {
 			push("- packages that restore models when passed via `--extension`:");
@@ -786,11 +857,18 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 
 	if (want(selected, "spawn")) {
 		push("## Spawn");
-		push(`### Sample child argv (${sample.name})`);
-		push("```");
-		push(argv.join(" "));
-		push("```");
-		push(`- explicit --extension count: ${explicitExts.length}`);
+		push(`- spawnMode (sample/default): ${spawnMode}`);
+		if (isInprocess) {
+			push(`### Sample child (${sample.name}) — inprocess`);
+			push("- no child argv (ModelRuntime + additionalExtensionPaths from role/env)");
+			push("- do not treat `pi --no-extensions --list-models` as the primary diagnosis for inprocess (#212)");
+		} else {
+			push(`### Sample child argv (${sample.name})`);
+			push("```");
+			push(argv.join(" "));
+			push("```");
+			push(`- explicit --extension count: ${explicitExts.length}`);
+		}
 		push(`- nested spawn env ${ALLOW_NESTED_ENV}=${env[ALLOW_NESTED_ENV] ?? "(unset)"}`);
 		push(`- runtime.allowNestedEnv: ${runtime.allowNestedEnv ?? "(unknown)"}`);
 		push(`- roles with allowNestedSubagents: ${
@@ -954,9 +1032,18 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		push("");
 		push("## Next steps (actionable)");
 		const steps: string[] = [];
-		if (providerExtHome.length && issues.some((i) => i.code === "CHILD_NO_MODELS" || i.code === "TEAM_MODELS_MISSING" || i.code === "RECENT_MODEL_SPAWN_FAIL")) {
+		const modelIssue = issues.some((i) =>
+			i.code === "CHILD_NO_MODELS" || i.code === "TEAM_MODELS_MISSING" || i.code === "RECENT_MODEL_SPAWN_FAIL",
+		);
+		if (modelIssue && isInprocess) {
+			steps.push(
+				"Inprocess: declare the provider in models.json, or set role extensions: […] / inheritExtensions: true — then restart pi (#212).",
+			);
+		} else if (modelIssue && providerExtHome.length) {
 			steps.push(`export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}  # then restart pi`);
 			steps.push(`# or role frontmatter extensions: […] / inheritExtensions: true (more RAM)`);
+		} else if (modelIssue) {
+			steps.push(`# set role frontmatter extensions: […] / inheritExtensions: true, or export ${CHILD_EXTENSIONS_ENV}=<paths>`);
 		}
 		steps.push(...roleToolGateNextSteps(issues));
 		if (issues.some((i) => i.code === "MEMORY_GATE_WOULD_REFUSE")) {

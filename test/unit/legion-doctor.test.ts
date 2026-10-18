@@ -110,6 +110,19 @@ test("doctor flags CHILD_NO_MODELS and covers all sections", () => {
 				idleEscWired: false,
 				legionTools: ["subagent", "vexillatio"],
 			},
+			sampleAgent: {
+				name: "scout",
+				description: "d",
+				kind: "pi",
+				filePath: "/f.md",
+				tools: ["read", "lens_diagnostics", "bash"],
+				systemPrompt: "",
+				systemPromptMode: "replace",
+				inheritProjectContext: true,
+				inheritSkills: false,
+				source: "user",
+				spawnMode: "rpc",
+			},
 			agents: [
 				{
 					name: "scout",
@@ -122,6 +135,7 @@ test("doctor flags CHILD_NO_MODELS and covers all sections", () => {
 					inheritProjectContext: true,
 					inheritSkills: false,
 					source: "user",
+					spawnMode: "rpc",
 				},
 			],
 		});
@@ -679,5 +693,148 @@ test("doctor verify concurrency: unlimited (0) skips slot inspection", () => {
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 		rmSync(lockDir, { recursive: true, force: true });
+	}
+});
+
+test("#212 doctor inprocess: no PI_LEGION_CHILD_EXTENSIONS; models.json-style fix", () => {
+	clearSpawnFailures();
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-212-"));
+	try {
+		const npmRoot = path.join(dir, "npm", "node_modules", "pi-any-endpoint");
+		mkdirSync(path.join(npmRoot, "extensions"), { recursive: true });
+		writeFileSync(
+			path.join(npmRoot, "package.json"),
+			JSON.stringify({
+				name: "pi-any-endpoint",
+				keywords: ["pi", "provider"],
+				description: "Pi provider for any compatible endpoint",
+				pi: { extensions: ["./extensions/index.ts"] },
+			}),
+		);
+		writeFileSync(path.join(npmRoot, "extensions", "index.ts"), "export default {};\n");
+		writeFileSync(
+			path.join(dir, "settings.json"),
+			JSON.stringify({ packages: ["npm:pi-any-endpoint@0.1.2"] }),
+		);
+
+		recordSpawnFailure({
+			name: "scout-0",
+			message: "inprocess model resolve failed for 'workbuddy/hy4'",
+			stderr: "Unknown provider: workbuddy",
+			spawnMode: "inprocess",
+			hadNoExtensions: false,
+		});
+
+		const sampleAgent = {
+			name: "scout",
+			description: "d",
+			kind: "pi" as const,
+			filePath: "/f.md",
+			tools: ["read", "bash"],
+			systemPrompt: "",
+			systemPromptMode: "replace" as const,
+			inheritProjectContext: true,
+			inheritSkills: false,
+			source: "user" as const,
+			// omit spawnMode → default inprocess
+		};
+
+		const report = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/workbuddy/hy4-preview-ioa"],
+			childModels: [], // rpc probe empty — must NOT drive CHILD_NO_MODELS under inprocess
+			expectedModels: ["missing-provider/no-such-model"],
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+			sampleAgent,
+			agents: [sampleAgent],
+			failures: [
+				{
+					ts: Date.now(),
+					name: "scout-0",
+					message: "inprocess model resolve failed for 'workbuddy/hy4'",
+					stderr: "Unknown provider: workbuddy",
+					spawnMode: "inprocess",
+					hadNoExtensions: false,
+				},
+			],
+		});
+
+		assert.equal(report.issues.some((i) => i.code === "CHILD_NO_MODELS"), false);
+		assert.ok(report.issues.some((i) => i.code === "TEAM_MODELS_MISSING"));
+		assert.ok(report.issues.some((i) => i.code === "RECENT_MODEL_SPAWN_FAIL"));
+		assert.doesNotMatch(report.text, /export PI_LEGION_CHILD_EXTENSIONS=/);
+		assert.match(report.text, /spawnMode \(sample\/default\): inprocess/);
+		assert.match(report.text, /models\.json/);
+		assert.match(report.text, /inheritExtensions|extensions:/);
+		const team = report.issues.find((i) => i.code === "TEAM_MODELS_MISSING");
+		assert.ok(team?.fix);
+		assert.doesNotMatch(team!.fix!, /PI_LEGION_CHILD_EXTENSIONS/);
+		assert.match(team!.fix!, /models\.json/);
+		const recent = report.issues.find((i) => i.code === "RECENT_MODEL_SPAWN_FAIL");
+		assert.ok(recent?.fix);
+		assert.doesNotMatch(recent!.fix!, /PI_LEGION_CHILD_EXTENSIONS/);
+	} finally {
+		clearSpawnFailures();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("#212 doctor rpc still recommends PI_LEGION_CHILD_EXTENSIONS", () => {
+	clearSpawnFailures();
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-212-rpc-"));
+	try {
+		const npmRoot = path.join(dir, "npm", "node_modules", "pi-any-endpoint");
+		mkdirSync(path.join(npmRoot, "extensions"), { recursive: true });
+		writeFileSync(
+			path.join(npmRoot, "package.json"),
+			JSON.stringify({
+				name: "pi-any-endpoint",
+				keywords: ["provider"],
+				pi: { extensions: ["./extensions/index.ts"] },
+			}),
+		);
+		writeFileSync(path.join(npmRoot, "extensions", "index.ts"), "export default {};\n");
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: ["npm:pi-any-endpoint@0.1.2"] }));
+
+		const sampleAgent = {
+			name: "scout",
+			description: "d",
+			kind: "pi" as const,
+			filePath: "/f.md",
+			tools: ["read", "bash"],
+			systemPrompt: "",
+			systemPromptMode: "replace" as const,
+			inheritProjectContext: true,
+			inheritSkills: false,
+			source: "user" as const,
+			spawnMode: "rpc" as const,
+		};
+
+		const report = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: [],
+			expectedModels: ["x"],
+			sampleAgent,
+			agents: [sampleAgent],
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+		});
+
+		assert.ok(report.issues.some((i) => i.code === "CHILD_NO_MODELS"));
+		assert.match(report.text, /export PI_LEGION_CHILD_EXTENSIONS=/);
+		assert.match(report.text, /spawnMode \(sample\/default\): rpc/);
+	} finally {
+		clearSpawnFailures();
+		rmSync(dir, { recursive: true, force: true });
 	}
 });
