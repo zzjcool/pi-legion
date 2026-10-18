@@ -656,7 +656,8 @@ export class Orchestrator {
 						? this.depth + 1
 						: Math.min(this.maxDepthValue, this.depth + roleDepth, MAX_NESTED_PATH_ENTRIES),
 					nodeId,
-					herdr: { supervisor: "rpc", node_id: nodeId },
+					// #209: the run record carries the ARBITRATED backend, not a literal.
+					herdr: { supervisor: mode, node_id: nodeId },
 				});
 				createdRunId = run.runId;
 				sessionFile = this.legion.runStore.sessionFileFor(run.runId, name);
@@ -740,6 +741,8 @@ export class Orchestrator {
 				previous.acceptance = undefined;
 				previous.outputFile = undefined;
 				previous.model = startedModel;
+				// A resume re-arbitrates the backend; keep the record truthful (#209).
+				previous.spawnMode = mode;
 				this.children.set(name, previous);
 			}
 			const child = previous ?? this.recordChild({
@@ -747,6 +750,7 @@ export class Orchestrator {
 				...(nodeId ? { nodeId } : {}),
 				agent: input.agent,
 				sessionFile: result.sessionFile,
+				spawnMode: mode,
 				...(startedModel ? { model: startedModel } : {}),
 				...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
 				...(worktreePath ? { worktreePath } : {}),
@@ -762,6 +766,8 @@ export class Orchestrator {
 				agent: input.agent.name,
 				kind: input.agent.kind,
 				child,
+				// #209: callers render this instead of assuming the RPC backend.
+				spawnMode: mode,
 			};
 		} catch (error) {
 			if (spawned) await this.supervisor.retire(name).catch(() => {});
@@ -843,6 +849,8 @@ export class Orchestrator {
 		nodeId?: string;
 		agent: AgentConfig;
 		sessionFile: string;
+		/** Arbitrated spawn backend (#209); persisted so later operators see the truth. */
+		spawnMode: SpawnMode;
 		model?: string;
 		thinking?: string | false;
 		worktreePath?: string;
@@ -862,6 +870,7 @@ export class Orchestrator {
 			...(input.agent.completionGuard ? { completionGuard: true } : {}),
 			...(input.model ? { model: input.model } : {}),
 			...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
+			spawnMode: input.spawnMode,
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
 		};

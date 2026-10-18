@@ -104,6 +104,7 @@ import {
 	ErrorCodes,
 	type ModelOrigin,
 	type RetireOptions,
+	type SpawnMode,
 	SubagentError,
 	type SubagentsSettings,
 } from "./src/shared/types.ts";
@@ -294,6 +295,19 @@ function runStoreFor(cwd: string, dbPathOverride?: string): RunStore {
 	return new RunStore({ rootDir: path.join(cwd, ".pi-subagents") });
 }
 
+/**
+ * Backend THIS process was started on (#209), for `run.json`'s `herdr.supervisor`.
+ *
+ * A host/root session and an RPC child are both ordinary `pi` processes, so the
+ * historic `rpc` marker is the truth for them. An in-process child shares this
+ * process, and its backend travels on the ALS child context — the one case where
+ * the truthful marker is not `rpc`. Reading it from there (instead of writing a
+ * literal) is what stops the record from claiming RPC for an inprocess child.
+ */
+function currentProcessSpawnMode(): SpawnMode {
+	return currentChildContext()?.spawnMode ?? "rpc";
+}
+
 function notice(pi: ExtensionAPI, text: string): void {
 	pi.sendMessage({ customType: SUBAGENT_NOTIFY_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
 }
@@ -400,6 +414,9 @@ function resolveLegionIdentity(input: {
 		const nodeRuns = input.store.listRuns().filter((run) => run.nodeId === nodeId || run.herdr.node_id === nodeId);
 		let nodeRun = nodeRuns.at(-1);
 		if (!nodeRun) {
+			// Contract D3: a run synthesized while attaching to an already-existing
+			// node has no launch arbitration behind it, so it keeps the historic
+			// marker instead of inventing a backend.
 			nodeRun = input.store.createRun({ task: node.taskSummary ?? `Resume ${node.role} node ${node.id}`, cwd: input.cwd, path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH), maxDepth: effectiveMaxDepth(input.settings.legion?.maxDepth), nodeId, herdr: { supervisor: "rpc", node_id: nodeId } });
 		}
 		if (node.runId !== nodeRun.runId) updateLegionRunId(db, nodeId, nodeRun.runId);
@@ -443,7 +460,7 @@ async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input:
 }
 
 function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; store: RunStore; cwd: string; task: string; settings: ReturnType<typeof loadSubagentSettings>; maxDepth: number; eventBus: LegionEventBus }): LegionRuntimeIdentity {
-	const rootRun = input.store.createRun({ task: input.task, cwd: input.cwd, maxDepth: input.maxDepth, nodeId: "root", herdr: { supervisor: "rpc" } });
+	const rootRun = input.store.createRun({ task: input.task, cwd: input.cwd, maxDepth: input.maxDepth, nodeId: "root", herdr: { supervisor: currentProcessSpawnMode() } });
 	const dbPath = path.resolve(legionDbPath(input.store.runDir(rootRun.runId)));
 	const db = openLegionDb(dbPath);
 	const now = Date.now();
@@ -1385,6 +1402,7 @@ async function controlAction(input: {
 			sessionFile: found.child.sessionFile,
 			execution: found.child.execution,
 			acceptance: found.child.acceptance,
+			spawnMode: found.child.spawnMode,
 			alive,
 			...(owner ? { owner } : {}),
 		}));
@@ -1660,7 +1678,7 @@ async function launchFamily(input: {
 			task: plan.task,
 			cwd,
 			maxDepth,
-			...(legion ? { path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH), nodeId: legion.nodeId, herdr: { supervisor: "rpc" as const, node_id: legion.nodeId } } : { herdr: { supervisor: "rpc" as const } }),
+			...(legion ? { path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH), nodeId: legion.nodeId, herdr: { supervisor: currentProcessSpawnMode(), node_id: legion.nodeId } } : { herdr: { supervisor: currentProcessSpawnMode() } }),
 		});
 		if (legion && legion.nodeId !== "root" && legion.parentRunId) {
 			const node = getNode(legion.db, legion.nodeId);
@@ -1927,7 +1945,7 @@ async function launchStep(
 			return;
 		}
 		session.results.push(
-			`▶ ${handle.name} (${effective.name}) supervisor=rpc`,
+			`▶ ${handle.name} (${effective.name}) supervisor=${handle.spawnMode}`,
 		);
 		// An inherited model the target CLI cannot express is dropped on purpose
 		// (the parent's pi model means nothing to cursor). Say so, or the user
@@ -2234,7 +2252,7 @@ async function launchUtilityFamily(input: {
 			cwd: input.cwd,
 			maxDepth: effectiveMaxDepth(catalog.settings.legion?.maxDepth),
 			path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH),
-			herdr: { supervisor: "rpc" },
+			herdr: { supervisor: currentProcessSpawnMode() },
 		});
 	if (!run) return fail("vexillatio parent run is not available", ErrorCodes.NOT_FOUND);
 	const runId = run.runId;
@@ -2765,6 +2783,7 @@ export function renderStatusOverview(
 			sessionFile: child.sessionFile,
 			execution: child.execution,
 			acceptance: child.acceptance,
+			spawnMode: child.spawnMode,
 			alive,
 			...(owner ? { owner } : {}),
 		}),
@@ -3124,34 +3143,6 @@ function findChild(
 	const picked = pickChildByName(runs, name);
 	if (!picked) return null;
 	return { runId: picked.run.runId, run: picked.run, child: picked.child };
-}
-
-function renderChild(
-	child: NonNullable<ReturnType<RunStore["findChild"]>>,
-	action: string,
-): AgentToolResult<unknown> {
-	const lines = [
-		`${child.name} — state=${child.state} agent=${child.agent ?? "?"} kind=${child.kind ?? "?"}`,
-		"supervisor=rpc",
-		`session=${child.sessionFile}`,
-	];
-	if (child.execution) {
-		lines.push(
-			`execution: ${child.execution.status}${child.execution.reason ? ` (${child.execution.reason})` : ""}`,
-		);
-		if (child.execution.usage) {
-			lines.push(
-				`usage: in=${child.execution.usage.input} out=${child.execution.usage.output} cost=${child.execution.usage.cost.toFixed(4)}`,
-			);
-		}
-	}
-	if (child.acceptance)
-		lines.push(
-			`acceptance: ${child.acceptance.status} (${child.acceptance.level})`,
-		);
-	if (action === "collect" && !child.execution)
-		lines.push("(not yet collected — call collect while the agent is alive)");
-	return ok(lines.join("\n"));
 }
 
 function renderCollect(

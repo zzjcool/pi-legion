@@ -140,7 +140,9 @@ test("legion status highlights alive · quiet before execution snapshot", async 
 		assert.ok(report.text.indexOf("alive · quiet") < report.text.indexOf("execution snapshot:"));
 		assert.match(report.text, /^execution snapshot: running$/m);
 		assert.doesNotMatch(report.text, /collect deadline/);
-		assert.ok(report.text.indexOf("execution snapshot:") < report.text.indexOf("supervisor=rpc"));
+		// #209: anchor on the `supervisor=` prefix — the fixture has no spawnMode,
+		// so the value renders `unknown` and a literal `rpc` anchor would be a lie.
+		assert.ok(report.text.indexOf("execution snapshot:") < report.text.indexOf("supervisor="));
 	});
 });
 

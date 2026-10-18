@@ -364,6 +364,13 @@ export interface ChildRecord {
 	thinking?: string | false;
 	/** Models that were requested but cannot be represented by the RPC child. */
 	modelDropped?: string[];
+	/**
+	 * Backend this child was actually spawned on, as arbitrated by
+	 * `Orchestrator.launch` (#209). Optional because run.json records written
+	 * before the field existed have no value — readers must render those as
+	 * unknown, never guess a backend.
+	 */
+	spawnMode?: SpawnMode;
 }
 
 export interface RunRecord {
@@ -373,8 +380,11 @@ export interface RunRecord {
 	cwd: string;
 
 	herdr: {
-		/** Current transport marker under the historic run.json key. */
-		supervisor?: "rpc";
+		/**
+		 * Transport marker under the historic run.json key: the arbitrated backend
+		 * of the run's own process (#209). Absent on legacy records.
+		 */
+		supervisor?: SpawnMode;
 		/** Reserved for M2 tree identity. */
 		node_id?: string;
 	};
@@ -482,6 +492,11 @@ export interface Handle {
 	 * silently defeated the ownership audit.
 	 */
 	child: ChildRecord;
+	/**
+	 * Backend the orchestrator actually chose for this launch (arbitration
+	 * result, #209). Callers render this instead of assuming `rpc`.
+	 */
+	spawnMode: SpawnMode;
 }
 
 // =============================================================================
