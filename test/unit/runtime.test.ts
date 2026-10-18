@@ -65,6 +65,17 @@ async function waitFor(pred: () => boolean, label: string): Promise<void> {
 	}
 }
 
+/**
+ * Deterministic drain, NOT a sleep: when this returns, every continuation
+ * queued by an already-resolved promise has run. Unlike `setTimeout(n)` this
+ * carries a happens-before guarantee, so it cannot be "too short" on a slow
+ * machine — which is what made the old `setTimeout(20)` guard fake-green.
+ */
+async function drainContinuations(): Promise<void> {
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
 test("runtime: async watch notifies the parent once and drops the widget entry", async () => {
 	const messages: unknown[] = [];
 	const busy: unknown[] = [];
@@ -1766,12 +1777,15 @@ test("T2: runtime — two runIds finishing in one parent run flush as a FIFO bur
 test("T3: runtime — a notice held past MAX_PENDING_AGE_MS is force-sent while the run is still active", async () => {
 	const messages: unknown[] = [];
 	const overflow = manualOverflow();
-	let resolveCollect!: (value: CollectSnapshot) => void;
+	// B4: an ADVANCEABLE fake clock, not a frozen `() => 1_000`. A frozen clock
+	// makes `Math.max(0, enqueuedAt + MAX_PENDING_AGE_MS - now())` a constant, so
+	// an arithmetic bug would go unnoticed. T3b below asserts the REMAINING age.
+	let t = 1_000;
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
 			messages.push(message);
 		},
-		now: () => 1_000,
+		now: () => t,
 		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
 	});
 
@@ -1782,31 +1796,150 @@ test("T3: runtime — a notice held past MAX_PENDING_AGE_MS is force-sent while 
 		agent: "worker",
 		sessionFile: "/tmp/stuck.jsonl",
 		timeoutMs: 1_000,
-		collect: () =>
-			new Promise<CollectSnapshot>((resolve) => {
-				resolveCollect = resolve;
-			}),
+		collect: async () => joinSnapshot({ output: "stuck-out" }),
 	});
 	runtime.watch("stuck");
-	resolveCollect(joinSnapshot({ output: "stuck-out" }));
 
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
 	assert.equal(overflow.timers.length, 1, "exactly one overflow timer armed");
 	assert.equal(overflow.timers[0]!.ms, MAX_PENDING_AGE_MS, "delay is the hard cap from enqueue");
 	assert.equal(messages.length, 0);
 
+	// The arm fires when the notice actually reaches the cap.
+	t += MAX_PENDING_AGE_MS;
 	overflow.timers[0]!.fn();
 	assert.equal(messages.length, 1, "the cap force-sends even during a live run");
 	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1, "the overflow is counted");
 	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
+});
+
+test("T3b: runtime — an early-firing arm re-arms for the remaining age instead of force-sending", async () => {
+	const messages: unknown[] = [];
+	const overflow = manualOverflow();
+	let t = 1_000;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => t,
+		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "aged",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/aged.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "aged-out" }),
+	});
+	runtime.watch("aged");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+	assert.equal(overflow.timers[0]!.ms, MAX_PENDING_AGE_MS);
+
+	// 30s elapsed, then the arm fires even though it was scheduled for 80s. The
+	// fancier case a real timer exhibits after a coarse wake-up / clock step: it
+	// must NOT force-send early, and it must re-arm for the age REMAINING.
+	t += 30_000;
+	overflow.timers[0]!.fn();
+	assert.equal(messages.length, 0, "an early fire must not force-send");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "nothing was force-flushed");
+	assert.equal(overflow.timers.length, 2, "the arm re-armed");
+	assert.equal(
+		overflow.timers[1]!.ms,
+		MAX_PENDING_AGE_MS - 30_000,
+		"the re-arm carries the REMAINING age, not the full cap",
+	);
+
+	const oldestAge = runtime.noticeQueueStats().oldestAgeMs;
+	assert.equal(oldestAge, 30_000, "the held notice is 30s old");
+
+	// At the cap the live arm force-sends exactly once.
+	t += MAX_PENDING_AGE_MS - 30_000;
+	overflow.timers[1]!.fn();
+	assert.equal(messages.length, 1, "at the cap the notice is force-sent");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
+});
+
+test("T3c: runtime — a stale arm that fires after its cancel is a no-op (B2 zombie guard)", async () => {
+	const messages: unknown[] = [];
+	const overflow = manualOverflow();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => 1_000,
+		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "zombie",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/zombie.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "zombie-out" }),
+	});
+	runtime.watch("zombie");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+	assert.equal(overflow.timers.length, 1);
+
+	// Settle: cancels the arm and delivers the notice.
+	runtime.notifyParentSettled();
+	assert.equal(overflow.timers[0]!.canceled, true, "settle cancelled the arm");
+	assert.equal(messages.length, 1);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+
+	// The cancelled callback fires anyway (a real timer can be queued before the
+	// cancel lands). It must not re-send, and it must not increment the counter.
+	overflow.timers[0]!.fn();
+	assert.equal(messages.length, 1, "a zombie arm never double-delivers");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "a zombie arm is not counted");
+
+	// A second notice must arm a FRESH timer; if the zombie had clobbered the
+	// handle, this arm would be skipped and the notice would hang forever.
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "second",
+		runId: "r-2",
+		agent: "worker",
+		sessionFile: "/tmp/second.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "second-out" }),
+	});
+	runtime.watch("second");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "second notice held");
+	assert.equal(overflow.timers.length, 2, "a fresh arm is scheduled after the zombie fired");
+
+	// The discriminating part: fire the ZOMBIE arm again now that the outbox is
+	// NON-empty. An unguarded callback would force-send a notice that is 0s old
+	// and count a bogus forced flush. The live-handle check must make it inert —
+	// the empty-outbox guard alone cannot, because the outbox is not empty here.
+	overflow.timers[0]!.fn();
+	assert.equal(messages.length, 1, "the zombie must not flush the fresh notice");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "a zombie is never counted");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the fresh notice is still held");
+	runtime.dispose();
 });
 
 test("T4: runtime — agent_settled cancels the overflow timer and does not double-send", async () => {
 	const messages: unknown[] = [];
 	const overflow = manualOverflow();
+	// B2: the send is counted by CALLS, and the settle→late-fire window is a real
+	// macrotask tick. With a no-op `cancel()` and no tick, the old assertion
+	// (`messages.length === 1`) was satisfied by the empty-outbox guard alone and
+	// could never go red. Here delivery is counted per host call, so a second
+	// delivery would be visible even if the outbox were re-populated.
+	let sends = 0;
 	let resolveCollect!: (value: CollectSnapshot) => void;
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
+			sends += 1;
 			messages.push(message);
 		},
 		now: () => 1_000,
@@ -1831,12 +1964,59 @@ test("T4: runtime — agent_settled cancels the overflow timer and does not doub
 
 	runtime.notifyParentSettled();
 	assert.equal(overflow.timers[0]!.canceled, true, "settle cancels the pending cap");
-	assert.equal(messages.length, 1, "settle delivered it once");
+	assert.equal(sends, 1, "settle delivered it once");
 
-	// A late fire of the already-cancelled timer must not send again.
+	// Let a real macrotask pass so any deferred duplicate would have landed,
+	// then fire the (cancelled) arm. Both together must leave exactly one send.
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(sends, 1, "no deferred duplicate after the settle macrotask");
 	overflow.timers[0]!.fn();
-	assert.equal(messages.length, 1, "no duplicate delivery after the settle");
+	assert.equal(sends, 1, "no duplicate delivery after the settle");
 	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "the cap never counted");
+	runtime.dispose();
+});
+
+test("T4b: runtime — cap fires FIRST, then agent_settled arrives: exactly one send, one forced flush (B3)", async () => {
+	// The D-B × D-D crossing that nothing covered: the hard cap wins the race
+	// against `agent_settled`. Both paths run; the notice must be delivered once
+	// (by the cap) and the later settle must find an empty outbox.
+	const messages: unknown[] = [];
+	const overflow = manualOverflow();
+	let t = 1_000;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => t,
+		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "capped",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/capped.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "capped-out" }),
+	});
+	runtime.watch("capped");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+	assert.equal(messages.length, 0, "held while the run is live");
+
+	// 1) cap fires (at the cap) while the run is STILL active → force-send.
+	t += MAX_PENDING_AGE_MS;
+	overflow.timers[0]!.fn();
+	assert.equal(messages.length, 1, "the cap delivers during the live run");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1, "counted as a forced flush");
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+
+	// 2) settle arrives afterwards → nothing left to flush, no second send.
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the later settle must not re-deliver");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1, "still exactly one forced flush");
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
 });
 
 test("T5: runtime — a cancelled watch whose collect lands later is released, not left as a working ghost", async () => {
@@ -1867,6 +2047,7 @@ test("T5: runtime — a cancelled watch whose collect lands later is released, n
 	resolveCollect(joinSnapshot());
 	await waitFor(() => runtime.activeJobs().length === 0, "orphaned job released");
 	assert.equal(runtime.get("ghost"), undefined, "no phantom row");
+	runtime.dispose();
 });
 
 test("T6: runtime — a stale continuation never releases a job a newer watch owns", async () => {
@@ -1899,7 +2080,11 @@ test("T6: runtime — a stale continuation never releases a job a newer watch ow
 	assert.equal(job.watching, true);
 
 	resolvers[0]!(joinSnapshot({ output: "stale" }));
-	await new Promise((resolve) => setTimeout(resolve, 20));
+	// B5: a happens-before drain, not a fixed 20ms sleep. Resolving the stale
+	// collect queues its continuations as microtasks; one setImmediate turn
+	// guarantees they have all run, on any machine speed. A fixed sleep is only
+	// "probably enough" — which is exactly how the old guard stayed fake-green.
+	await drainContinuations();
 	assert.equal(runtime.activeJobs().length, 1, "the stale continuation must not release the job");
 	assert.equal(runtime.get("owned")?.watching, true, "the newer watch still owns it");
 	assert.equal(messages.length, 0, "the stale snapshot is never notified");
@@ -1908,6 +2093,7 @@ test("T6: runtime — a stale continuation never releases a job a newer watch ow
 	await waitFor(() => messages.length === 1, "the live watch notifies");
 	assert.match(messages[0]!.content, /live/);
 	assert.equal(messages.length, 1, "exactly one notice from the owning watch");
+	runtime.dispose();
 });
 
 test("T7: runtime — without a run-start signal a completion is still sent immediately", async () => {
@@ -1933,4 +2119,247 @@ test("T7: runtime — without a run-start signal a completion is still sent imme
 	await waitFor(() => messages.length === 1, "immediate notify without a run signal");
 	assert.match(messages[0]!.content, /Background task completed/);
 	assert.equal(runtime.noticeQueueStats().pending, 0, "nothing was held");
+	runtime.dispose();
+});
+
+// ═════════════ A1/A2 + blocked-hold exemptions: releasing must never delete a live child ═════════════
+
+test("C1: runtime — a name reused by a NEW job survives the OLD job's stale continuation (A1)", async () => {
+	// Regression for A1: `releaseIfOrphaned` used to call `release(job.name)`,
+	// and `release(name)` deletes `jobs.get(name)` — the NEW job. The identity
+	// guard must make the stale continuation a no-op once the name was reused.
+	const staleResolvers: Array<(value: CollectSnapshot) => void> = [];
+	const liveResolvers: Array<(value: CollectSnapshot) => void> = [];
+	const messages: unknown[] = [];
+	let collectCall = 0;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+	});
+
+	// A: tracked and watched, then explicitly released (stop/retire path).
+	runtime.track({
+		name: "w",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/w.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				collectCall += 1;
+				staleResolvers.push(resolve);
+			}),
+	});
+	runtime.watch("w");
+	runtime.release("w");
+	assert.equal(runtime.get("w"), undefined, "A is gone");
+
+	// B: the SAME name is reused by a brand-new job with a new runId.
+	runtime.track({
+		name: "w",
+		runId: "r-2",
+		agent: "worker",
+		sessionFile: "/tmp/w2.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				liveResolvers.push(resolve);
+			}),
+	});
+	runtime.watch("w");
+	const fresh = runtime.get("w");
+	assert.ok(fresh);
+	assert.equal(fresh.runId, "r-2", "the new job is tracked under the reused name");
+	assert.equal(fresh.watching, true);
+
+	// A's collect now lands late. Its generation is stale; releasing by name
+	// would delete the live B. It must be a strict no-op.
+	staleResolvers[0]!(joinSnapshot({ output: "stale-A" }));
+	await drainContinuations();
+
+	const survivor = runtime.get("w");
+	assert.ok(survivor, "the NEW job must still be tracked after the stale continuation");
+	assert.equal(survivor.runId, "r-2", "the stale continuation did not replace the job");
+	assert.equal(survivor.watching, true, "the new job is still being watched");
+	assert.equal(messages.length, 0, "the stale snapshot was not notified");
+	assert.equal(collectCall, 1, "the stale job's collect ran exactly once");
+
+	// And the new job still notifies normally.
+	liveResolvers[0]!(joinSnapshot({ output: "live-B" }));
+	await waitFor(() => messages.length === 1, "the new job notifies");
+	assert.match(
+		(messages[0] as { content: string }).content,
+		/live-B/,
+		"the surviving job delivers its own completion",
+	);
+	runtime.dispose();
+});
+
+test("C2: runtime — a failed stop keeps the job tracked and rewatchable (A2)", async () => {
+	// Regression for A2: `cancelWatch` bumps the generation without releasing,
+	// so the in-flight continuation looks orphaned and used to delete the job.
+	// `runtime.get(name)` then returned undefined and stopAction's rewatch
+	// compensation was skipped → the live child leaked untracked/unwatched.
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const messages: unknown[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+	});
+
+	runtime.track({
+		name: "stubborn",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/stubborn.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("stubborn");
+
+	// The exact stopAction sequence: hold, cancel, then a FAILED retire.
+	runtime.setStopHold("stubborn", true);
+	runtime.cancelWatch("stubborn");
+	assert.equal(runtime.get("stubborn")?.watching, false, "the watcher is dropped");
+
+	// The in-flight collect lands during the retire window.
+	resolveCollect(joinSnapshot({ output: "late" }));
+	await drainContinuations();
+
+	// HARD ACCEPTANCE: the job still exists, so the compensation can rewatch it.
+	const survivor = runtime.get("stubborn");
+	assert.ok(survivor, "retire failure must not orphan the live child");
+	assert.equal(survivor.watching, false, "the watch is still dropped mid-stop");
+	assert.equal(survivor.stopHold, true, "the job is protected for the stop window");
+
+	// stopAction's compensation now works (it is a no-op if get() is undefined).
+	runtime.rewatch("stubborn");
+	const restored = runtime.get("stubborn");
+	assert.ok(restored);
+	assert.equal(restored.watching, true, "rewatch restored watching");
+	assert.equal(restored.stopHold, false, "a fresh watch ends the stop window");
+
+	// The clear happens in stopAction's `finally`, so clearing it again is safe.
+	runtime.setStopHold("stubborn", false);
+	runtime.release("stubborn");
+	assert.equal(messages.length, 0, "no spurious notice from the failed stop");
+	runtime.dispose();
+});
+
+test("C2b: stopAction — a failed retire leaves the child tracked and watching (A2, real export)", async () => {
+	const { stopAction } = await import("../../index.ts");
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({ sendMessage() {} });
+
+	runtime.track({
+		name: "stubborn",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/stubborn.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("stubborn");
+
+	const result = await stopAction({
+		params: { name: "stubborn" },
+		runtime,
+		retire: async () => {
+			// The in-flight collect lands while retire is failing, which is the
+			// trigger for the orphan release.
+			resolveCollect(joinSnapshot({ output: "late" }));
+			await new Promise((r) => setTimeout(r, 0));
+			throw new Error("retire failed: child did not respond");
+		},
+	});
+
+	const text = (result.content as Array<{ text?: string }>)
+		.map((c) => c.text ?? "")
+		.join("\n");
+	assert.match(text, /No children were stopped/, "the stop reports the failure");
+	assert.match(text, /retire failed: child did not respond/);
+
+	const survivor = runtime.get("stubborn");
+	assert.ok(survivor, "the live child must remain tracked after a failed retire");
+	assert.equal(survivor.watching, true, "the compensation rewatch restored the watcher");
+	runtime.dispose();
+});
+
+test("C3: runtime — a blocked-hold job stays tracked when its watch is cancelled (exemption)", async () => {
+	// Third exemption in `releaseIfOrphaned`: a blocked child is intentionally
+	// unwatched so the parent can approve/resume it. It must survive a cancel.
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	let releaseBlocked!: (choice: "resume" | "hold") => void;
+	const runtime = createSessionRuntime({ sendMessage() {} });
+
+	runtime.track({
+		name: "waiting",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/waiting.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+		handleBlocked: () =>
+			new Promise<"resume" | "hold">((resolve) => {
+				releaseBlocked = resolve;
+			}),
+	});
+	runtime.watch("waiting");
+
+	// collect reports blocked → the job flips to "blocked" and awaits approval.
+	resolveCollect(joinSnapshot({ blocked: true }));
+	await waitFor(() => runtime.get("waiting")?.state === "blocked", "job flipped to blocked");
+
+	// Drop the watcher while the approval is still pending (stop semantics).
+	runtime.cancelWatch("waiting");
+	assert.equal(runtime.get("waiting")?.watching, false);
+
+	// The handler now answers "hold": the job must stay tracked so the parent
+	// can still find and resume it.
+	releaseBlocked("hold");
+	await drainContinuations();
+
+	const survivor = runtime.get("waiting");
+	assert.ok(survivor, "a blocked-held job must never be released as an orphan");
+	assert.equal(survivor.state, "blocked", "it is still in the blocked state");
+	assert.equal(survivor.watching, false, "nobody is watching it");
+	runtime.dispose();
+});
+
+test("C4: runtime — dispose() drops the held outbox without sending", async () => {
+	const messages: unknown[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "held-at-shutdown",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/held.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "never-sent" }),
+	});
+	runtime.watch("held-at-shutdown");
+
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+	assert.equal(messages.length, 0, "nothing was sent during the live run");
+
+	runtime.dispose();
+	assert.equal(runtime.noticeQueueStats().pending, 0, "dispose discards the outbox");
+	assert.equal(messages.length, 0, "dispose must not deliver a dropped notice");
 });

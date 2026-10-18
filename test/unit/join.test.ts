@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	JoinCoordinator,
+	type JoinConfig,
 	type JoinEntry,
 	type JoinSchedulerHandle,
 } from "../../src/extension/join.ts";
@@ -121,20 +122,33 @@ test("join: window expiry with stragglers flushes only the finished ones", () =>
 	);
 });
 
-// Regression guard, NOT a discriminating test: with the busy-extension signal
-// removed from the join config, the old code would flush here too, so this
-// cannot go red on unfixed code. It exists to stop busy-driven extension from
-// being reintroduced. The discriminating assertions live in runtime.test.ts
-// (T1/T2/T3).
-test("join: one window per batch — expiry never re-arms", () => {
+// Discriminating against REINTRODUCTION, not against today's snapshot: the
+// busy-extension hook is deleted from `JoinConfig`, so a `parentBusy` injected
+// here is inert data the coordinator must ignore. The old implementation read
+// it, re-armed at expiry, and would produce `pending.length === 2` /
+// `delivered.length === 0` — i.e. this test DOES go red if the busy-extension
+// path is brought back (verified by re-adding `MAX_BUSY_EXTENSIONS` + the
+// `parentBusy` re-arm to join.ts).
+test("join: one window per batch — expiry never re-arms even if a busy hook is present", () => {
 	const { join, delivered, timers } = harness();
+	// `as unknown as JoinConfig`: `parentBusy` is no longer part of the type; the
+	// cast is the whole point — it proves the coordinator ignores stray wiring.
+	join.setConfig({
+		mode: "smart",
+		flushMs: 10_000,
+		parentBusy: () => true,
+	} as unknown as JoinConfig);
 	join.addPending("r-1", "a");
 	join.addPending("r-1", "slow");
 	join.onTerminal(entry("a"));
 	assert.equal(delivered.length, 0, "buffered behind the window");
 	assert.equal(timers.pending.length, 1, "exactly one window armed");
 	timers.fireLast();
-	assert.equal(delivered.length, 1, "expiry flushes what is buffered");
+	assert.equal(
+		delivered.length,
+		1,
+		"expiry flushes what is buffered even though the busy hook says 'busy'",
+	);
 	// The window is a batching delay only. Extending it while the parent is
 	// busy was both the wrong predictor (turn-level, always busy in the tool
 	// loop) and a second delay stacked on the runtime outbox: never re-arm.

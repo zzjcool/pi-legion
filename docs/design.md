@@ -219,12 +219,13 @@ launch (async) ──→ 子 pane 跑
        │
        ├─ TUI：输入框上方 aboveEditor widget（live agent 面板）
        │        （pi-subagents fleet-status；footer 不再重复计数，见 #192）
-       └─ collect 在后台等 turn 结束
+       └─ collect 在后台等 run 结束
               │
               └─ runtime 完成通道（唯一的延迟源，按 **run** 级判定）
 ```
 
-完成通知的投递分两段，**只有一处延迟**：
+完成通知的投递分两段，**只有一处 run 级延迟**：join 窗口是纯批处理延迟，二者串行叠加
+（最坏串联约 10s + 80s）——除此之外不存在第二个"等父会话忙完"的延迟源。
 
 1. **join 批处理窗口**（`src/extension/join.ts`，默认 10s）：同一 runId 的多个 child
    一起启动、先后结束，窗口把 straggler 合成一条消息（`Background tasks completed
@@ -250,7 +251,8 @@ launch (async) ──→ 子 pane 跑
 失败/中止保留完整块，details 只供 TUI 不进 LLM 上下文。
 
 > print/json 模式：`session_shutdown` → `dispose()` 丢弃未投递的 pending。child 的
-> session 文件与 `finished` 缓存仍在，`collect` 可补救。
+> session 文件仍在，可用 `collect` 从磁盘恢复；但 `finished` 缓存**不**保留
+> （`dispose()` 里 `jobs.clear()` / `finished.clear()` 就在丢弃 outbox 前两行）。
 
 父 agent 的正确用法：`subagent` 工具 launch 之后把控制权交回用户，等 completion
 message，而不是轮询，也不是让孩子来拍自己。
