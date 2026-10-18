@@ -221,15 +221,36 @@ launch (async) ──→ 子 pane 跑
        │        （pi-subagents fleet-status；footer 不再重复计数，见 #192）
        └─ collect 在后台等 turn 结束
               │
-              └─ pi.sendMessage({ customType: "subagent-notify" },
-                    { triggerTurn: true, deliverAs: "followUp" })
-                 父会话空闲则立刻唤醒；若父会话还在跑当前 turn（工具循环），
-                 等这一轮结束后再投递，避免 steer 打断正在干的事。
-                 所有状态都 display:true（transcript 留下完成/失败记录）；
-                 成功由 notice-renderer 压成单行并按 pane 宽度硬截断
-                 （控制字符已消毒，ctrl+o 展开），
-                 失败/中止保留完整块，details 只供 TUI 不进 LLM 上下文。
+              └─ runtime 完成通道（唯一的延迟源，按 **run** 级判定）
 ```
+
+完成通知的投递分两段，**只有一处延迟**：
+
+1. **join 批处理窗口**（`src/extension/join.ts`，默认 10s）：同一 runId 的多个 child
+   一起启动、先后结束，窗口把 straggler 合成一条消息（`Background tasks completed
+   (N of M)`）。窗口**只做批处理**，到期无条件 flush 到下一个环节，**不**因为父会话忙
+   而延长——turn 级的 busy 是错误预测器（工具循环里父会话按定义就是忙的），而且会在
+   outbox 之外叠加第二层延迟。
+2. **run 级 outbox**（`src/extension/runtime.ts`，`MAX_PENDING_AGE_MS = 80_000`）：
+   父 **run** 活跃时不 `pi.sendMessage`，通知入 FIFO 队列；`agent_settled` 到达后
+   一次性 burst 发出（一条通知一条消息），并重绘 UI。硬上限 80s（= 2× 旧的
+   `(1+3)×10s`）到点强制发送并计入 `noticeQueueStats().forcedFlushes`，宁可回到旧
+   行为也不无限隐藏。父 run 不活跃时**立即**发送（含 `mode: "each"`、单成员批次、
+   `triggerTurn:false` 项）。
+
+为什么不能只发 `followUp`：宿主只在 **live run 内部** drain `agent.followUpQueue`，
+所以父 run 活跃时发出去的 followUp 会一直躺在队列里，直到用户再发一条消息才出现。
+这正是「完成通知看起来没来」的根因。发送时形状不变——
+`pi.sendMessage({ customType: "subagent-notify" }, { triggerTurn: true, deliverAs: "followUp" })`
+——只是**时机**改到 run 结束时。
+
+所有状态都 display:true（transcript 留下完成/失败记录）；
+成功由 notice-renderer 压成单行并按 pane 宽度硬截断
+（控制字符已消毒，ctrl+o 展开），
+失败/中止保留完整块，details 只供 TUI 不进 LLM 上下文。
+
+> print/json 模式：`session_shutdown` → `dispose()` 丢弃未投递的 pending。child 的
+> session 文件与 `finished` 缓存仍在，`collect` 可补救。
 
 父 agent 的正确用法：`subagent` 工具 launch 之后把控制权交回用户，等 completion
 message，而不是轮询，也不是让孩子来拍自己。

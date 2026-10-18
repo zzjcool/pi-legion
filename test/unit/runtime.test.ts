@@ -6,6 +6,7 @@ import {
 	createSessionRuntime,
 	formatAliveQuiet,
 	lastJsonlEventAgeMs,
+	MAX_PENDING_AGE_MS,
 	renderLiveChildStatus,
 	shouldRecycleAfterCollect,
 } from "../../src/extension/runtime.ts";
@@ -1657,4 +1658,279 @@ test("renderLiveChildStatus: no owner field emits no owner line", () => {
 	});
 	assert.doesNotMatch(text, /^owner: /m);
 	assert.match(text, /^worker-0 — state=working /m);
+});
+
+// ═════════ run-scoped completion outbox: hold until agent_settled (D-A…D-G) ═════════
+
+/** Manual overflow timer: the test fires it itself (never a real 80s wait). */
+function manualOverflow() {
+	const timers: Array<{ ms: number; fn: () => void; canceled: boolean }> = [];
+	const scheduleNoticeOverflow = (ms: number, fn: () => void) => {
+		const slot = { ms, fn, canceled: false };
+		timers.push(slot);
+		return {
+			cancel: () => {
+				slot.canceled = true;
+			},
+		};
+	};
+	return { timers, scheduleNoticeOverflow };
+}
+
+test("T1: runtime — a completion during the parent run is held until agent_settled, then sent", async () => {
+	const messages: unknown[] = [];
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message, options) {
+			messages.push({ message, options });
+		},
+		now: () => 1_000,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "held",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/held.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("held");
+	resolveCollect(joinSnapshot({ output: "held output" }));
+
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held in the outbox");
+	// The whole point: nothing reaches the host while the run is live, because
+	// the host only drains followUp inside a live run.
+	assert.equal(messages.length, 0, "a live parent run holds the notice");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0);
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "settle flushes the held notice");
+	const sent = messages[0] as {
+		message: { customType: string; content: string };
+		options: { triggerTurn: boolean; deliverAs: string };
+	};
+	assert.equal(sent.message.customType, SUBAGENT_NOTIFY_TYPE);
+	assert.equal(sent.options.triggerTurn, true);
+	assert.equal(sent.options.deliverAs, "followUp");
+	assert.match(sent.message.content, /Background task completed/);
+	assert.match(sent.message.content, /held output/);
+	assert.equal(runtime.noticeQueueStats().pending, 0, "outbox drained");
+});
+
+test("T2: runtime — two runIds finishing in one parent run flush as a FIFO burst at settle", async () => {
+	const messages: Array<{ content: string }> = [];
+	const resolvers = new Map<string, (value: CollectSnapshot) => void>();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as { content: string });
+		},
+	});
+
+	runtime.notifyParentRunStart();
+	for (const [name, runId] of [["first", "r-1"], ["second", "r-2"]] as const) {
+		runtime.track({
+			name,
+			runId,
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("first")!(joinSnapshot({ output: "first-out" }));
+	resolvers.get("second")!(joinSnapshot({ output: "second-out" }));
+
+	await waitFor(() => runtime.noticeQueueStats().pending === 2, "both notices held");
+	assert.equal(messages.length, 0, "no notice escapes a live run");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 2, "both survive the burst");
+	assert.match(messages[0]!.content, /first/);
+	assert.match(messages[0]!.content, /first-out/);
+	assert.match(messages[1]!.content, /second/);
+	assert.match(messages[1]!.content, /second-out/);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	// FIFO, one message per notice: the grouped shape belongs to the join layer.
+	assert.notEqual(messages[0]!.content, messages[1]!.content);
+});
+
+test("T3: runtime — a notice held past MAX_PENDING_AGE_MS is force-sent while the run is still active", async () => {
+	const messages: unknown[] = [];
+	const overflow = manualOverflow();
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => 1_000,
+		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "stuck",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/stuck.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("stuck");
+	resolveCollect(joinSnapshot({ output: "stuck-out" }));
+
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+	assert.equal(overflow.timers.length, 1, "exactly one overflow timer armed");
+	assert.equal(overflow.timers[0]!.ms, MAX_PENDING_AGE_MS, "delay is the hard cap from enqueue");
+	assert.equal(messages.length, 0);
+
+	overflow.timers[0]!.fn();
+	assert.equal(messages.length, 1, "the cap force-sends even during a live run");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1, "the overflow is counted");
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+});
+
+test("T4: runtime — agent_settled cancels the overflow timer and does not double-send", async () => {
+	const messages: unknown[] = [];
+	const overflow = manualOverflow();
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => 1_000,
+		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "raced",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/raced.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("raced");
+	resolveCollect(joinSnapshot());
+	await waitFor(() => overflow.timers.length === 1, "overflow armed");
+
+	runtime.notifyParentSettled();
+	assert.equal(overflow.timers[0]!.canceled, true, "settle cancels the pending cap");
+	assert.equal(messages.length, 1, "settle delivered it once");
+
+	// A late fire of the already-cancelled timer must not send again.
+	overflow.timers[0]!.fn();
+	assert.equal(messages.length, 1, "no duplicate delivery after the settle");
+	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "the cap never counted");
+});
+
+test("T5: runtime — a cancelled watch whose collect lands later is released, not left as a working ghost", async () => {
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({ sendMessage() {} });
+
+	runtime.track({
+		name: "ghost",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/ghost.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("ghost");
+	assert.equal(runtime.activeJobs().length, 1);
+
+	// cancelWatch bumps the generation and clears `watching` but never releases
+	// (stop() semantics): the watch continuation is now the only owner left.
+	runtime.cancelWatch("ghost");
+	assert.equal(runtime.get("ghost")?.watching, false);
+
+	// The in-flight collect still resolves. Without the orphan release the job
+	// stays in the map forever and the widget/OSC keeps reporting "working".
+	resolveCollect(joinSnapshot());
+	await waitFor(() => runtime.activeJobs().length === 0, "orphaned job released");
+	assert.equal(runtime.get("ghost"), undefined, "no phantom row");
+});
+
+test("T6: runtime — a stale continuation never releases a job a newer watch owns", async () => {
+	const messages: Array<{ content: string }> = [];
+	const resolvers: Array<(value: CollectSnapshot) => void> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as { content: string });
+		},
+	});
+
+	runtime.track({
+		name: "owned",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/owned.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolvers.push(resolve);
+			}),
+	});
+	runtime.watch("owned");
+	// A newer watch takes the job over (generation 2) — this is the `rewatch`
+	// path: the old generation's collect resolving must not release it.
+	runtime.rewatch("owned");
+	const job = runtime.get("owned");
+	assert.ok(job);
+	assert.equal(job.generation, 2, "rewatch bumped the generation");
+	assert.equal(job.watching, true);
+
+	resolvers[0]!(joinSnapshot({ output: "stale" }));
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(runtime.activeJobs().length, 1, "the stale continuation must not release the job");
+	assert.equal(runtime.get("owned")?.watching, true, "the newer watch still owns it");
+	assert.equal(messages.length, 0, "the stale snapshot is never notified");
+
+	resolvers[1]!(joinSnapshot({ output: "live" }));
+	await waitFor(() => messages.length === 1, "the live watch notifies");
+	assert.match(messages[0]!.content, /live/);
+	assert.equal(messages.length, 1, "exactly one notice from the owning watch");
+});
+
+test("T7: runtime — without a run-start signal a completion is still sent immediately", async () => {
+	const messages: Array<{ content: string }> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as { content: string });
+		},
+	});
+
+	// D-H: `parentRunActive` defaults to false, so a host (or test) that never
+	// announces a run keeps today's immediate-send behaviour. Flip this default
+	// and every existing caller silently stops delivering.
+	runtime.track({
+		name: "immediate",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/immediate.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "no-run-signal" }),
+	});
+	runtime.watch("immediate");
+	await waitFor(() => messages.length === 1, "immediate notify without a run signal");
+	assert.match(messages[0]!.content, /Background task completed/);
+	assert.equal(runtime.noticeQueueStats().pending, 0, "nothing was held");
 });

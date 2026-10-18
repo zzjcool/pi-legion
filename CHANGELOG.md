@@ -33,6 +33,18 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - A live agent stopped by a tool call longer than the 60s window still decays to
   `0 tok/s`. That is the honest answer for the trailing window and is now pinned
   by tests instead of being "fixed" into a stale number later.
+- **Completion notices no longer wait for the user's next message.** A child
+  finishing while the parent agent run was still active was sent as a
+  `followUp`, and the host only drains that queue inside a live run: the notice
+  sat invisible until the next prompt. Notices are now held by the extension and
+  flushed as one burst on `agent_settled` (hard cap `MAX_PENDING_AGE_MS`, 80 s,
+  after which they are force-sent). The join window no longer extends itself on a
+  busy parent — that turn-level signal was the wrong predictor and doubled the
+  delay.
+- **No more phantom `working` rows.** `awaiting`/re-armed states repaint
+  immediately, `agent_settled` repaints once, and a watch continuation whose
+  generation was invalidated now releases its job instead of leaving it tracked
+  forever (it never releases a job another watch owns).
 
 ## [3.0.2] — 2026-10-18
 
