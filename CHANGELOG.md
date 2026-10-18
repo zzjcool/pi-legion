@@ -42,13 +42,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   busy parent — that turn-level signal was the wrong predictor and doubled the
   delay.
 - **No more phantom `working` rows.** `awaiting`/re-armed states repaint
-  immediately, `agent_settled` repaints once, and a watch continuation whose
-  generation was invalidated now releases the job it was watching instead of
-  leaving it tracked forever. The release is **identity-checked**: it happens
-  only when that same job object is still the one tracked under the name, so a
-  stale continuation can never delete a newer job that reused the name. While an
-  explicit `stop` has a `retire` in flight the job is held (not released), so a
-  failed retire can still rewatch a live child instead of leaking it untracked.
+  immediately and `agent_settled` repaints once, so the widget board never holds
+  a stale row past a state change.
 
 ### Known limits (deliberately out of scope)
 
