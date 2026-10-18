@@ -300,3 +300,63 @@ test("identity: orchestrator passes legion lineage to an in-process child (D5)",
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+// ── stripLegionIdentity must mask BOTH channels ─────────────────────────────
+//
+// vexillatio dispatches a read-only helper with `stripLegionIdentity: true` so
+// it cannot adopt the caller's Legion tree identity. On the rpc backend that is
+// done by deleting the PI_LEGION_* env keys; the in-process channel must mask
+// the equivalent fields, otherwise the env keys are gone but the child still
+// receives nodeId/dbPath through AsyncLocalStorage and attaches anyway.
+test("identity: stripLegionIdentity masks node lineage on the in-process channel", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "spawn-strip-"));
+	const repo = gitRepo(root);
+	const store = new RunStore({ rootDir: path.join(repo, ".pi-subagents") });
+	const rootRun = store.createRun({ task: "strip", cwd: repo, maxDepth: 4, nodeId: "root", herdr: { supervisor: "rpc" } });
+	const dbPath = legionDbPath(store.runDir(rootRun.runId));
+	const db = openLegionDb(dbPath);
+	const seen: unknown[] = [];
+	const uiProxy = new InMemoryUIProxy();
+	const record = (input: { name: string; sessionFile: string; childLaunchContext?: unknown }) => {
+		seen.push(input.childLaunchContext);
+		return { name: input.name, sessionFile: input.sessionFile, pid: 1 };
+	};
+	const supervisor = new RoutingSupervisor({
+		rpc: { uiProxy, isAlive: () => false, spawnChild: async (i: never) => record(i) } as unknown as RpcSupervisor,
+		inprocess: { uiProxy, isAlive: () => false, spawnChild: async (i: never) => record(i) } as unknown as InProcessSupervisor,
+		uiProxy,
+	});
+	try {
+		insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+		insertNode(db, { id: "root.centurion-0", parentId: "root", name: "centurion-0", role: "centurion", runId: rootRun.runId, status: "running" });
+		const orchestrator = new Orchestrator({
+			supervisor,
+			runDir: store.runDir(rootRun.runId),
+			cwd: repo,
+			maxDepth: 4,
+			legion: {
+				db,
+				dbPath,
+				nodeId: "root.centurion-0",
+				runId: rootRun.runId,
+				runStore: store,
+				settings: { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: 30 },
+				eventBus: createLegionEventBus(),
+			},
+		});
+		await orchestrator.launch({
+			agent: workerCard(),
+			task: "Stripped dispatch.",
+			utilityDispatch: true,
+			stripLegionIdentity: true,
+		});
+		const ctx = seen[0] as { nodeId?: string; parentNodeId?: string; dbPath?: string } | undefined;
+		assert.ok(ctx, "a stripped in-process spawn still gets a scope");
+		assert.equal(ctx.nodeId, undefined, "no node id may leak through the ALS channel");
+		assert.equal(ctx.dbPath, undefined, "no db path may leak through the ALS channel");
+		assert.equal(ctx.parentNodeId, undefined, "no parent node may leak either");
+	} finally {
+		db.close();
+		rmSync(root, { recursive: true, force: true });
+	}
+});

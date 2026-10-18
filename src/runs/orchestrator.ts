@@ -697,12 +697,18 @@ export class Orchestrator {
 					// the parent's process.env and would read the PARENT's identity, or none
 					// at the root). Hand the arbitrator a real identity scope instead. Only
 					// the in-process backend consumes it; RPC lineage stays on env (I3).
+					//
+					// `stripLegionIdentity` (vexillatio) must mask lineage on BOTH
+					// channels: the env keys are deleted above, so the context must not
+					// hand back the same identity through ALS. Keep the scope (so the
+					// child still knows it is not the root) but omit node/db lineage.
 					...(inProcess && this.legion
 						? {
 								childLaunchContext: {
-									...(nodeId ? { nodeId } : {}),
-									parentNodeId: this.legion.nodeId,
-									dbPath: this.legion.dbPath,
+									...(!input.stripLegionIdentity && nodeId ? { nodeId } : {}),
+									...(input.stripLegionIdentity
+										? {}
+										: { parentNodeId: this.legion.nodeId, dbPath: this.legion.dbPath }),
 									parentPath: this.childPath(name),
 									...(agent.acceptance?.role ? { acceptanceRole: agent.acceptance.role } : {}),
 									allowNested: input.agent.allowNestedSubagents === true && !input.agent.utility,

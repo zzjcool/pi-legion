@@ -933,6 +933,15 @@ test("inprocess: parentPath array is copied, not aliased (REV2-3)", async () => 
 		});
 		parentPath.push({ runId: "mutated-after-spawn" });
 		assert.deepEqual(seenPath, [{ runId: "root-run", agent: "root" }]);
+		// Element-level aliasing: `[...path]` alone would still share every entry,
+		// so mutating an EXISTING entry must not reach the stored snapshot.
+		parentPath[0]!.runId = "HIJACKED";
+		parentPath[0]!.agent = "HIJACKED";
+		assert.deepEqual(
+			seenPath,
+			[{ runId: "root-run", agent: "root" }],
+			"mutating an existing path entry must not rewrite the spawned child's lineage",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

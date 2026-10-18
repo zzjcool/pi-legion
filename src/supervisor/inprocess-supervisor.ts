@@ -270,8 +270,12 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		// child for its later dispatches — the A-becomes-B leak D5 exists to kill.
 		return {
 			...provided,
+			// Element-level copy too: after the path became `NestedPathEntry[]`
+			// (objects), `[...path]` would still alias every entry, so a caller
+			// mutating `template.parentPath[0].runId` would rewrite an
+			// already-spawned child's lineage — the exact A-becomes-B leak.
 			...(provided.parentPath
-				? { parentPath: [...provided.parentPath] }
+				? { parentPath: provided.parentPath.map((entry) => ({ ...entry })) }
 				: {}),
 		};
 	}

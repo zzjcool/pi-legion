@@ -2,7 +2,7 @@
 
 Default backend for children. **In-process by default**, with an automatic `rpc`
 fallback when the resolved spawn needs an OS worktree (`worktree: true`, the
-writer/centurion default) or is not a `pi` role. An explicit
+writer/centurion default). An explicit
 `spawnMode: "inprocess"` combined with `worktree: true` is still **refused**
 with `INVALID_PARAMS` — the fallback only covers the implicit default.
 
@@ -128,8 +128,9 @@ See `buildInProcessSessionPlan` / `test/unit/inprocess-supervisor.test.ts`.
 
 ## Refusals
 
-- `kind !== "pi"` + explicit `inprocess` → `INVALID_PARAMS` (an omitted
-  `spawnMode` falls back to `rpc` instead)
+- `kind !== "pi"` → `INVALID_PARAMS` regardless of `spawnMode`: only `pi` roles
+  are supported, so a non-`pi` role is refused up front and never reaches the
+  worktree fallback
 - `worktree: true` + explicit `inprocess` → `INVALID_PARAMS` (an omitted
   `spawnMode` falls back to `rpc` instead)
 - Invalid `spawnMode` string → loud throw at settings / frontmatter parse
