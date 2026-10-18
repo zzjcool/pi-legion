@@ -559,11 +559,11 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "acceptance", parseAcceptance(fm.acceptance, config.name));
 	setIf(config, "toolBudget", parseBudget(fm.toolBudget));
 	setIf(config, "turnBudget", parseTurnBudget(fm.turnBudget));
-	// Writers share a checkout with every other parent Pi in this repo.
-	// Default them onto an isolated worktree so they ship via MR instead.
-	if (config.worktree === undefined && config.acceptance?.role === "writer") {
-		config.worktree = true;
-	}
+	// #214 / contract §9: only centurion holds worktree isolation. Writers no
+	// longer auto-default to worktree:true — members work in-place; parallel
+	// isolated writers are N root-dispatched centurions. Explicit worktree:true
+	// on a non-centurion is still demoted at launch (warn once / force false).
+	// centurion.md pins worktree:true itself; no auto-default here.
 }
 
 /** Transitional blocked-policy frontmatter retained for approval handling. */

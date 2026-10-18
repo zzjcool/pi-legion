@@ -11,8 +11,9 @@ test("playbook text describes RPC launch and frozen child guidance", () => {
 	assert.match(PARENT_PLAYBOOK, /subagent\(\{ agent:/);
 	assert.match(PARENT_PLAYBOOK, /matching role/);
 	assert.match(PARENT_PLAYBOOK, /Forbidden/);
-	assert.match(PARENT_PLAYBOOK, /Isolation is YOUR call/);
+	assert.match(PARENT_PLAYBOOK, /Isolation belongs to centurion/);
 	assert.match(PARENT_PLAYBOOK, /worktree: true/);
+	assert.match(PARENT_PLAYBOOK, /dispatch N centurions/);
 	assert.match(PARENT_PLAYBOOK, /headless RPC children/);
 	assert.match(PARENT_PLAYBOOK, /verify:/);
 	assert.match(TOOL_DESCRIPTION, /async by default/);

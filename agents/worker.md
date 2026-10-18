@@ -19,7 +19,7 @@ acceptance:
 kind: pi
 placement: split-down
 steer: true
-worktree: true
+worktree: false
 maxSubagentDepth: 3
 ---
 
@@ -38,7 +38,7 @@ maxSubagentDepth: 3
 - **跑不动的命令**（交互式、需要确认）走默认放行，不要挂起等待。
 - **禁止开新的 worker/写操作子 agent**。你唯一允许的嵌套派生是只读的 advisor，
   且仅限失败升级场景（见 AGENTS.md「失败止损」：重试 2 次仍失败时咨询，按裁决执行）。
-- **隔离工作区**：你在独立 git worktree / 分支上干活，不要写父会话的 checkout。改动通过 merge request / pull request 合回默认分支，不要本地 merge，不要 push 到 main/master。
+- **工作区**：在 centurion 子树 worktree（或父会话 cwd）**原地**改代码；隔离与 MR 由 centurion（或根会话）收队。不要本地 merge，不要 push 到 main/master。
 - **bugfix 先红后绿**：修 bug 类任务，第一步先写一个能复现该 bug 的失败测试并跑出失败，修复后同一测试必须转绿；两次输出都原样贴进报告。不复现就修复的，视为未验收。
 
 ## 工作流程
@@ -50,14 +50,14 @@ maxSubagentDepth: 3
    - 全部步骤完成、交活前才跑一次项目的**全量档**（完整测试套件/CI 等效命令）；交活后插件会自动再验证一遍判定验收，不需要中途反复跑全量。全量失败按「失败止损」处理：重试不超过 2 次，仍失败升级咨询 advisor。
    - 项目找不到任何验证入口时，在报告里写明依据（查过哪些地方），不要自己编命令冒充。
 3. 把最终那次 full 验证输出**原样**（含命令与结果）放进最终报告。
-4. push 前逐文件重读完整 diff（`git diff main...HEAD`）：检查遗留的调试代码、console.log/print、注释掉的老逻辑、无关改动混入；发现问题先修再 push。
-5. push 当前分支并打开 MR/PR；把 URL 写进报告和 verdict reason。MR 由主 agent 审查后统一合回，你不要自己 merge。
-6. 写报告到指定路径（任务里会给），格式：做了什么 / 测试覆盖 / 验证输出 / MR 链接 / 未决问题。
+4. 交活前逐文件重读完整 diff：检查遗留的调试代码、console.log/print、注释掉的老逻辑、无关改动混入；发现问题先修。
+5. 不要自己开独立 worktree / 不要自己开 MR；隔离与合回由 centurion（或根会话）收队。把改动说明写进报告。
+6. 写报告到指定路径（任务里会给），格式：做了什么 / 测试覆盖 / 验证输出 / 未决问题。
 
 最后输出 verdict：
 
 ```json
-{"ok": true, "reason": "N files changed, typecheck+test green, mr: <url>"}
+{"ok": true, "reason": "N files changed, typecheck+test green"}
 ```
 
 无法完成时（如依赖缺失、计划矛盾、无法开 MR）：

@@ -105,7 +105,7 @@ async function finishChild(input: {
 test("M2 default spawn mode: a centurion parent dispatches a worktree:true worker card on the default backend", async () => {
 	// Regression guard for the `centurion dispatches worker` production path.
 	//
-	// `agents/worker.md` pins `worktree: true` and sets no spawnMode, while a
+	// A legacy worker card may still pin `worktree: true` with no spawnMode; a
 	// centurion parent forces the launch worktree to false (`parentRole ===
 	// "centurion"`). With the default backend now `inprocess`, the arbitrated
 	// agent must have BOTH fields normalized, or the real router rejects the

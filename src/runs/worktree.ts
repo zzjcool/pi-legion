@@ -1,10 +1,11 @@
 /**
  * Per-child git worktree isolation.
  *
- * Writer roles default to `worktree: true`. Each child gets its own branch
- * under the run directory (`git worktree add -b`) so concurrent parent Pis
- * do not share a dirty checkout. The child commits there and opens an MR;
- * retire leaves the tree on disk (same rationale as keeping the session file).
+ * Only the `centurion` role may hold `worktree: true` (#214 / contract §9).
+ * Squad members work in-place inside the centurion subtree (or parent cwd).
+ * When isolation is granted, the child gets its own branch under the run
+ * directory (`git worktree add -b`); retire leaves the tree on disk (same
+ * rationale as keeping the session file).
  */
 
 import { execFileSync } from "node:child_process";

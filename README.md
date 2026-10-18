@@ -83,14 +83,16 @@ trades process isolation for spawn latency.
 
 **Automatic fallback to `rpc`:** when `spawnMode` is omitted *and* the resolved
 spawn cannot be in-process, Legion launches it over `pi --mode rpc` instead.
-That happens when the role needs an OS worktree (`worktree: true` — the writer
-and centurion default). A `kind !== "pi"` role is rejected earlier with
-`INVALID_PARAMS` (only `kind: pi` children are supported at all), so it never
-reaches this fallback.
+That happens when the role needs an OS worktree (`worktree: true` — only the
+`centurion` role may hold this; see Isolation below). A `kind !== "pi"` role is
+rejected earlier with `INVALID_PARAMS` (only `kind: pi` children are supported
+at all), so it never reaches this fallback.
 
 **Explicit is strict:** `spawnMode: "inprocess"` with `worktree: true` is
-refused with `INVALID_PARAMS` rather than silently downgraded, so a role that
-asks for in-process never gets a different transport behind its back.
+refused with `INVALID_PARAMS` (message prefers `set worktree: false`) rather
+than silently downgraded, so a role that asks for in-process never gets a
+different transport behind its back. Non-centurion requests for `worktree: true`
+are demoted to `false` with a once-per-run warning instead of throwing.
 
 Limits for the in-process backend are separate (`subagents.inprocess.*`) and are
 not shared with the `legion.*` tree budgets — see
@@ -488,9 +490,12 @@ another connection holds the db.
 ## Delivery and resume
 
 A centurion owns a Git worktree for its subtree; its worker/scout/reviewer
-children work in that subtree, and a nested centurion gets a nested worktree.
-Each subtree is delivered as a squash MR to its parent level. MRs move upward
-through the tree until the root reviews and merges into the default branch.
+children work in that subtree (`worktree: false`, typically in-process), and a
+nested centurion gets a nested worktree. **Parallel isolated writers:** dispatch
+N centurions from the root (each owns one worktree); do not give every worker
+its own worktree. Each subtree is delivered as a squash MR to its parent level.
+MRs move upward through the tree until the root reviews and merges into the
+default branch.
 
 Resuming follows the tree's saved sessions and node records. If a supervisor
 process ends, its child processes do not become detached workers; resuming the
