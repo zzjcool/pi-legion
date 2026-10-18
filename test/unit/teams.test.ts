@@ -971,6 +971,7 @@ function indexHarness(
 }
 
 const WORKER_FILE = "---\nname: worker\ndescription: worker role\n---\nworker prompt\n";
+const RPC_WORKER_FILE = "---\nname: rpcworker\ndescription: worker role pinned to rpc\nspawnMode: rpc\n---\nworker prompt\n";
 const UTILITY_FILE = "---\nname: scout\ndescription: read-only utility role\nutility: true\ntools: read, grep, find, ls\nkind: pi\n---\nscout prompt\n";
 const DESIGNER_FILE = "---\nname: designer\ndescription: designer role\nkind: cursor\n---\ndesigner prompt\n";
 
@@ -1298,6 +1299,28 @@ test("vexillatio collect abort returns promptly without retiring utility childre
 	}
 });
 
+test("index mainline: the launch line and the child record carry the arbitrated spawnMode (#209)", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE, "rpcworker.md": RPC_WORKER_FILE },
+	);
+	try {
+		// Same role shape as before but pinned to the rpc backend, so both
+		// arbitration outcomes are observable through the same harness.
+		const inprocess = await invokeIndex(harness, { agent: "worker", task: "default backend", async: true, worktree: false });
+		assert.match(inprocess, /supervisor=inprocess/, "an omitted spawnMode with worktree:false arbitrates to inprocess");
+		const rpc = await invokeIndex(harness, { agent: "rpcworker", task: "pinned backend", async: true, worktree: false });
+		assert.match(rpc, /supervisor=rpc/, "an explicit spawnMode: rpc keeps rendering rpc");
+		assert.doesNotMatch(rpc, /supervisor=inprocess/);
+
+		const children = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") })
+			.listRuns()
+			.flatMap((run) => run.children);
+		assert.equal(children.find((child) => child.agent === "worker")?.spawnMode, "inprocess", "ChildRecord echoes the arbitrated mode");
+		assert.equal(children.find((child) => child.agent === "rpcworker")?.spawnMode, "rpc");
+	} finally { await harness.cleanup(); }
+});
+
 test("index mainline: the selected team reaches RPC children", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true, team: "frontend", teams: { frontend: { members: ["worker"] } } },
@@ -1308,7 +1331,9 @@ test("index mainline: the selected team reaches RPC children", async () => {
 			tasks: [{ agent: "worker", task: "first" }, { agent: "worker", task: "second" }],
 			async: true, worktree: false,
 		});
-		assert.match(text, /supervisor=rpc/);
+		// #209 D4: the role declares no spawnMode and worktree is false, so the
+		// arbitrated backend is inprocess — the launch line must say so, not `rpc`.
+		assert.match(text, /supervisor=inprocess/);
 		assert.equal(harness.supervisor.spawns.length, 2);
 		for (const spawn of harness.supervisor.spawns) {
 			assert.equal(spawn.input.env?.PI_SUBAGENTS_TEAM, "frontend");
@@ -1323,7 +1348,7 @@ test("index mainline: a launch team override selects the roster and reaches the 
 	);
 	try {
 		const text = await invokeIndex(harness, { agent: "worker", task: "use backend squad", team: "backend", async: true, worktree: false });
-		assert.match(text, /supervisor=rpc/);
+		assert.match(text, /supervisor=inprocess/);
 		assert.equal(harness.supervisor.spawns.length, 1);
 		assert.equal(harness.supervisor.spawns[0]?.input.env?.PI_SUBAGENTS_TEAM, "backend");
 		const designer = await invokeIndex(harness, { agent: "designer", task: "not in backend", team: "backend", async: true, worktree: false });
@@ -1336,7 +1361,7 @@ test("index mainline: default team omits inherited team env and RPC ignores lega
 	const harness = indexHarness({ disableBuiltins: true }, { "worker.md": WORKER_FILE });
 	try {
 		const text = await invokeIndex(harness, { agent: "worker", task: "plain", async: true, worktree: false, placement: "new-tab" });
-		assert.match(text, /supervisor=rpc/);
+		assert.match(text, /supervisor=inprocess/);
 		assert.equal(harness.supervisor.spawns.length, 1);
 		assert.equal(harness.supervisor.spawns[0]?.input.env?.PI_SUBAGENTS_TEAM, undefined);
 		assert.equal(harness.supervisor.spawns[0]?.input.cwd, harness.cwd);

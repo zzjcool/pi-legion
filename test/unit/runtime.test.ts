@@ -1267,7 +1267,10 @@ test("renderLiveChildStatus reports silence and ignores a stale connection failu
 		assert.match(text, /^execution snapshot: running$/m, "progress-signal reason omitted while alive");
 		assert.doesNotMatch(text, /execution snapshot: running \(rpc child alive\)/);
 		assert.match(text, /persisted snapshot is stale: state=retired, execution=failed \(Connection error\.\), acceptance=rejected \(none\)/);
-		assert.ok(text.indexOf("execution snapshot:") < text.indexOf("supervisor=rpc"), "snapshot before path meta");
+		// #209: the meta line is `supervisor=<mode>|unknown`; anchor on the prefix
+		// (this fixture carries no spawnMode) so the intent — snapshot before the
+		// path meta — survives a truthful backend.
+		assert.ok(text.indexOf("execution snapshot:") < text.indexOf("supervisor="), "snapshot before path meta");
 		assert.doesNotMatch(text, /^worker-0 — state=retired/m);
 		assert.doesNotMatch(text, /^execution: failed/m);
 		assert.doesNotMatch(text, /^acceptance: rejected/m);
@@ -1342,6 +1345,57 @@ test("renderLiveChildStatus leads with alive · quiet when session is missing", 
 	assert.ok(text.indexOf("alive · quiet unknown") < text.indexOf("execution snapshot:"));
 });
 
+test("renderLiveChildStatus prints the arbitrated spawnMode, and unknown when absent (#209)", () => {
+	const base = {
+		name: "worker-0",
+		state: "working",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "/tmp/does-not-exist.jsonl",
+		alive: false,
+		now: 0,
+	};
+	const inprocess = renderLiveChildStatus({ ...base, spawnMode: "inprocess" });
+	assert.match(inprocess, /^supervisor=inprocess$/m, "the real backend is rendered, not a literal rpc");
+	assert.doesNotMatch(inprocess, /supervisor=rpc/);
+	// The session path stays on the line right after supervisor=, in that order.
+	const inprocessLines = inprocess.split("\n");
+	assert.equal(inprocessLines.indexOf("supervisor=inprocess"), inprocessLines.indexOf("session=/tmp/does-not-exist.jsonl") - 1);
+
+	// A legacy record (or a tree-only fallback) has no spawnMode: say unknown
+	// rather than claim the RPC backend the bug reported.
+	const unknown = renderLiveChildStatus(base);
+	assert.match(unknown, /^supervisor=unknown$/m);
+	assert.doesNotMatch(unknown, /supervisor=rpc/);
+
+	const rpc = renderLiveChildStatus({ ...base, spawnMode: "rpc" });
+	assert.match(rpc, /^supervisor=rpc$/m);
+});
+
+test("renderLiveChildStatus keeps the supervisor meta after every snapshot line", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = join(dir, "worker-0.jsonl");
+		writeFileSync(sessionFile, "{\"type\":\"message\"}\n");
+		const now = Date.now();
+		utimesSync(sessionFile, new Date(now - 90_000), new Date(now - 90_000));
+		const text = renderLiveChildStatus({
+			name: "worker-0",
+			state: "working",
+			agent: "worker",
+			kind: "pi",
+			sessionFile,
+			execution: { status: "running" },
+			acceptance: { status: "unknown", level: "none" },
+			spawnMode: "inprocess",
+			alive: true,
+			now,
+		});
+		assert.match(text, /^supervisor=inprocess$/m);
+		assert.ok(text.indexOf("execution snapshot:") < text.indexOf("supervisor=inprocess"));
+		assert.ok(text.indexOf("acceptance snapshot:") < text.indexOf("supervisor=inprocess"));
+	});
+});
+
 test("renderLiveChildStatus long-quiet alive worker: (living) leads; collect-deadline reason stays off the snapshot", async () => {
 	await withTempDir(async (dir) => {
 		const sessionFile = join(dir, "worker-0.jsonl");
@@ -1367,7 +1421,7 @@ test("renderLiveChildStatus long-quiet alive worker: (living) leads; collect-dea
 		assert.match(lines[1]!, /^alive · quiet \d+s \(living\)$/);
 		assert.equal(lines[2], "execution snapshot: running");
 		assert.ok(text.indexOf("alive · quiet") < text.indexOf("execution snapshot:"));
-		assert.ok(text.indexOf("execution snapshot:") < text.indexOf("supervisor=rpc"));
+		assert.ok(text.indexOf("execution snapshot:") < text.indexOf("supervisor="));
 		assert.doesNotMatch(text, /collect deadline|child still alive/);
 		assert.match(text, /acceptance snapshot: unknown \(none\)/);
 	});
@@ -1534,7 +1588,8 @@ test("renderLiveChildStatus: owner dead + not alive turns a persisted working in
 	);
 	// The owner line sits after the state lead and before path metadata.
 	assert.ok(text.indexOf("owner: dead (pid gone)") > text.indexOf("state=failed"));
-	assert.ok(text.indexOf("owner: dead (pid gone)") < text.indexOf("supervisor=rpc"));
+	// #209-2: omitted spawnMode renders unknown, never a guessed rpc.
+	assert.ok(text.indexOf("owner: dead (pid gone)") < text.indexOf("supervisor=unknown"));
 	// Dead is a verdict, not a stale-snapshot rewrite: no stale re-classification.
 	assert.doesNotMatch(text, /persisted snapshot is stale/);
 	// A dead child has no quiet-age lead.

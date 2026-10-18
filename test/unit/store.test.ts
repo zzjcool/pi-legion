@@ -95,6 +95,28 @@ test("create/read round-trip preserves RPC run identity", () => {
 	assert.deepEqual(read.herdr, { supervisor: "rpc", node_id: "root" });
 });
 
+test("create/read round-trip preserves a non-rpc supervisor after #209 widened the field", () => {
+	const store = newStore();
+	// `herdr.supervisor` used to be typed as the literal "rpc"; it is now the
+	// arbitrated SpawnMode, so an inprocess run must survive the round-trip.
+	const created = store.createRun({
+		task: "inprocess parent",
+		cwd: "/proj",
+		herdr: { supervisor: "inprocess", node_id: "root" },
+	});
+	assert.deepEqual(store.readRun(created.runId)?.herdr, { supervisor: "inprocess", node_id: "root" });
+});
+
+test("a child record's spawnMode round-trips and stays optional for legacy records (#209)", async () => {
+	const store = newStore();
+	const run = store.createRun({ task: "t", cwd: "/p" });
+	await store.addChild(run.runId, { ...makeChild("worker-0"), spawnMode: "inprocess" });
+	// Legacy records written before the field existed simply omit it.
+	await store.addChild(run.runId, makeChild("worker-1"));
+	assert.equal(store.findChild(run.runId, "worker-0")?.spawnMode, "inprocess");
+	assert.equal(store.findChild(run.runId, "worker-1")?.spawnMode, undefined);
+});
+
 test("readRun returns null for a missing run", () => {
 	const store = newStore();
 	assert.equal(store.readRun("r-doesnotexist"), null);

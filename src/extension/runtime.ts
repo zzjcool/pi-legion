@@ -181,6 +181,12 @@ export interface LiveChildStatusInput {
 		usage?: { input: number; output: number; cost: number } | null;
 	};
 	acceptance?: { status: string; level?: string };
+	/**
+	 * Backend the child was actually spawned on (#209). Absent for records written
+	 * before run.json carried it, and for tree-only fallbacks — renders `unknown`,
+	 * never a guessed `rpc`.
+	 */
+	spawnMode?: string;
 	/** RPC process is still running. */
 	alive: boolean;
 	/**
@@ -293,7 +299,7 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	if (input.owner !== undefined) lines.push(ownerLine(input.owner));
 	// Quiet age first; path metadata after snapshots so old store lines stay below.
 	const meta = [
-		"supervisor=rpc",
+		`supervisor=${input.spawnMode ?? "unknown"}`,
 		`session=${input.sessionFile}`,
 	];
 	if (execution) {
