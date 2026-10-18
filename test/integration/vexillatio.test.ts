@@ -482,7 +482,7 @@ test("vexillatio avoids a live same-name subagent and returns on collect timeout
 	);
 });
 
-test("vexillatio tracks a timed-out utility until completion clears its Legion and footer state", async () => {
+test("vexillatio tracks a timed-out utility until completion clears its Legion and widget state", async () => {
 	const supervisor = new FirstTimeoutSupervisor();
 	await withSandbox({}, async ({ pi, cwd }) => {
 		const footer: CapturedFooter = {};
@@ -500,7 +500,7 @@ test("vexillatio tracks a timed-out utility until completion clears its Legion a
 			"the tool details name the utility that remains under a watch",
 		);
 		assert.equal(supervisor.isAlive("scout-0"), true);
-		assert.equal(footer.status, "1 agent running");
+		assert.equal(footer.status, undefined, "footer N agents running removed (#192); widget owns the count");
 		assert.equal(footer.widgetVisible, true);
 		assert.match(footer.widgetText ?? "", /scout-0/);
 		const runId = (result.details as { runId?: string } | undefined)?.runId;
@@ -592,7 +592,7 @@ test("vexillatio tasks[] keeps and retires both timed-out utilities independentl
 				(result.details as { stillRunning?: string[] } | undefined)?.stillRunning,
 				["scout-0", "scout-1"],
 			);
-			assert.equal(footer.status, "2 agents running");
+			assert.equal(footer.status, undefined, "footer N agents running removed (#192); widget owns the count");
 			assert.equal(footer.widgetVisible, true);
 			assert.equal(supervisor.isAlive("scout-0"), true);
 			assert.equal(supervisor.isAlive("scout-1"), true);
@@ -609,7 +609,7 @@ test("vexillatio tasks[] keeps and retires both timed-out utilities independentl
 					2_000,
 				),
 				true,
-				"both watches notify and retire their child, then clear the shared footer",
+				"both watches notify and retire their child, then clear the shared widget",
 			);
 			const notices = pi.messages.map((message) => JSON.stringify(message) ?? "");
 			assert.ok(notices.some((message) => message.includes("scout-0")));
