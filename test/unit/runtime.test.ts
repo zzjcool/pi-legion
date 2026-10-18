@@ -1511,3 +1511,95 @@ test("runtime: emitBusy passes live child slugs for OSC id=legion/<slug>", () =>
 	assert.equal(busy.at(-1)?.active, false);
 	assert.deepEqual(busy.at(-1)?.children, []);
 });
+
+// ── #209-3: run-dir owner liveness in status ────────────────────────────
+
+test("renderLiveChildStatus: owner dead + not alive turns a persisted working into failed", () => {
+	const text = renderLiveChildStatus({
+		name: "worker-2",
+		state: "working",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "/tmp/does-not-exist.jsonl",
+		execution: { status: "running" },
+		alive: false,
+		owner: "dead",
+		now: 0,
+	});
+	const lines = text.split("\n");
+	assert.equal(lines[0], "worker-2 — state=failed agent=worker kind=pi");
+	assert.ok(
+		lines.includes("owner: dead (pid gone)"),
+		`owner explanation line missing:\n${text}`,
+	);
+	// The owner line sits after the state lead and before path metadata.
+	assert.ok(text.indexOf("owner: dead (pid gone)") > text.indexOf("state=failed"));
+	assert.ok(text.indexOf("owner: dead (pid gone)") < text.indexOf("supervisor=rpc"));
+	// Dead is a verdict, not a stale-snapshot rewrite: no stale re-classification.
+	assert.doesNotMatch(text, /persisted snapshot is stale/);
+	// A dead child has no quiet-age lead.
+	assert.doesNotMatch(text, /alive · quiet/);
+});
+
+test("renderLiveChildStatus: owner unknown keeps state=working (no false verdict)", () => {
+	const text = renderLiveChildStatus({
+		name: "worker-2",
+		state: "working",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "/tmp/does-not-exist.jsonl",
+		execution: { status: "running" },
+		alive: false,
+		owner: "unknown",
+		now: 0,
+	});
+	assert.match(text, /^worker-2 — state=working /m);
+	assert.doesNotMatch(text, /state=failed/);
+	assert.match(text, /^owner: unknown$/m);
+});
+
+test("renderLiveChildStatus: alive child ignores owner (in-memory liveness wins)", () => {
+	const text = renderLiveChildStatus({
+		name: "worker-0",
+		state: "working",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "",
+		execution: { status: "running" },
+		alive: true,
+		owner: "dead",
+		now: 0,
+	});
+	assert.match(text, /^worker-0 — state=working /m);
+	assert.doesNotMatch(text, /state=failed/);
+});
+
+test("renderLiveChildStatus: owner dead leaves a terminal state alone", () => {
+	const text = renderLiveChildStatus({
+		name: "worker-0",
+		state: "retired",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "/tmp/does-not-exist.jsonl",
+		execution: { status: "success" },
+		alive: false,
+		owner: "dead",
+		now: 0,
+	});
+	assert.match(text, /^worker-0 — state=retired /m);
+	assert.doesNotMatch(text, /state=failed/);
+});
+
+test("renderLiveChildStatus: no owner field emits no owner line", () => {
+	const text = renderLiveChildStatus({
+		name: "worker-0",
+		state: "working",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "/tmp/does-not-exist.jsonl",
+		alive: false,
+		now: 0,
+	});
+	assert.doesNotMatch(text, /^owner: /m);
+	assert.match(text, /^worker-0 — state=working /m);
+});

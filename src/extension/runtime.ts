@@ -183,6 +183,13 @@ export interface LiveChildStatusInput {
 	acceptance?: { status: string; level?: string };
 	/** RPC process is still running. */
 	alive: boolean;
+	/**
+	 * Run-dir ownership verdict (#209-3), from `owner.json`.
+	 * `alive` is this process's in-memory child registry, which never contains
+	 * a child launched by another session — so a foreign record must be judged
+	 * by the owner marker instead. Only consulted when `alive` is false.
+	 */
+	owner?: "live" | "dead" | "unknown";
 	now?: number;
 }
 
@@ -245,6 +252,12 @@ function formatExecutionStatusLine(
 	return `${label}: ${execution.status}${execution.reason ? ` (${execution.reason})` : ""}`;
 }
 
+/** One-line ownership verdict appended to a status block (#209-3). */
+function ownerLine(owner: "live" | "dead" | "unknown"): string {
+	if (owner === "dead") return "owner: dead (pid gone)";
+	return `owner: ${owner}`;
+}
+
 /**
  * Status text for one child (`/legion status <name>` and `subagent status`).
  *
@@ -257,7 +270,15 @@ function formatExecutionStatusLine(
  */
 export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	const stale = persistedSnapshotIsStale(input);
-	const state = stale ? "working" : input.state;
+	// #209-3: a persisted `working` snapshot whose run-dir owner pid is gone is
+	// dead, not working. `stale` (alive process + retired/failed snapshot) keeps
+	// owning the opposite direction, so the two never fight over one record.
+	const ownerDead = input.owner === "dead" && !input.alive;
+	const state = stale
+		? "working"
+		: ownerDead && input.state === "working"
+			? "failed"
+			: input.state;
 	const execution = stale
 		? { status: "running", reason: "rpc child alive", usage: input.execution?.usage }
 		: input.execution;
@@ -268,6 +289,8 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		const age = lastJsonlEventAgeMs(input.sessionFile, input.now ?? Date.now());
 		lines.push(formatAliveQuiet(age));
 	}
+	// After the liveness lead: who owns the run dir, and whether that pid is gone.
+	if (input.owner !== undefined) lines.push(ownerLine(input.owner));
 	// Quiet age first; path metadata after snapshots so old store lines stay below.
 	const meta = [
 		"supervisor=rpc",

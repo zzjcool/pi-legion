@@ -94,6 +94,7 @@ import {
 	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
+import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
 import {
 	type AgentConfig,
@@ -1317,6 +1318,7 @@ async function controlAction(input: {
 		return stopAction({
 			params,
 			runtime: input.runtime,
+			store: input.store,
 			retire: async (name, opts) => {
 				const merged = opts ?? retireOpts;
 				const job = input.runtime.get(name);
@@ -1358,18 +1360,23 @@ async function controlAction(input: {
 			);
 		}
 		if (!params.name) {
-			const live = listLiveChildrenForStatus(store.listRuns());
+			const runs = store.listRuns();
+			const live = listLiveChildrenForStatus(runs);
 			return ok(
 				renderStatusOverview(
-					live.map((child) => ({
-						child,
-						alive: input.supervisor.isAlive(child.name),
-					})),
+					live.map((child) => {
+						const alive = input.supervisor.isAlive(child.name);
+						const owner = ownerVerdictFor(store, runs, child.name, alive);
+						return { child, alive, ...(owner ? { owner } : {}) };
+					}),
 				),
 			);
 		}
-		const found = findChild(store.listRuns(), params.name);
+		const runs = store.listRuns();
+		const found = findChild(runs, params.name);
 		if (!found) return unknownChild(params.name, store, cwd);
+		const alive = input.supervisor.isAlive(params.name);
+		const owner = ownerVerdictFor(store, runs, params.name, alive);
 		return ok(renderLiveChildStatus({
 			name: found.child.name,
 			state: found.child.state,
@@ -1378,7 +1385,8 @@ async function controlAction(input: {
 			sessionFile: found.child.sessionFile,
 			execution: found.child.execution,
 			acceptance: found.child.acceptance,
-			alive: input.supervisor.isAlive(params.name),
+			alive,
+			...(owner ? { owner } : {}),
 		}));
 	}
 
@@ -2742,11 +2750,13 @@ export function renderStatusOverview(
 	children: Array<{
 		child: NonNullable<ReturnType<RunStore["findChild"]>>;
 		alive: boolean;
+		/** Run-dir ownership verdict (#209-3); see {@link renderLiveChildStatus}. */
+		owner?: "live" | "dead" | "unknown";
 	}>,
 ): string {
 	if (children.length === 0) return "No live children.";
 	const noun = children.length === 1 ? "child" : "children";
-	const blocks = children.map(({ child, alive }) =>
+	const blocks = children.map(({ child, alive, owner }) =>
 		renderLiveChildStatus({
 			name: child.name,
 			state: child.state,
@@ -2756,6 +2766,7 @@ export function renderStatusOverview(
 			execution: child.execution,
 			acceptance: child.acceptance,
 			alive,
+			...(owner ? { owner } : {}),
 		}),
 	);
 	return [`Status · ${children.length} live ${noun}`, "", blocks.join("\n\n")].join("\n");
@@ -2883,12 +2894,37 @@ export function renderWait(results: WaitResult[]): string {
 }
 
 /**
+ * Run-dir ownership verdict for a child THIS process does not track (#209-3).
+ *
+ * `supervisor.isAlive` is an in-memory registry of children spawned by this
+ * process, so it is always false for a foreign run (another session, or a
+ * restart). The run dir's `owner.json` pid is the durable liveness marker; it
+ * only needs to be consulted when the in-memory answer is "not alive".
+ */
+function ownerVerdictFor(
+	store: RunStore,
+	runs: ReturnType<RunStore["listRuns"]>,
+	name: string,
+	alive: boolean,
+): "live" | "dead" | "unknown" | undefined {
+	if (alive) return undefined;
+	const picked = pickChildByName(runs, name);
+	if (!picked) return "unknown";
+	return ownerState(path.join(store.runDir(picked.run.runId), RUN_OWNER_FILE));
+}
+
+/**
  * Retire a named child or every child tracked by this session.
  * `force: true` → hard path (graceful:false / SIGTERM→SIGKILL); omit/false → graceful.
  */
 export async function stopAction(input: {
 	params: { name?: string; all?: boolean; force?: boolean };
 	runtime: SessionRuntime;
+	/**
+	 * Run store used to resolve a named target this session does not track
+	 * (foreign/restarted runs). Omitted callers keep the runtime-only scope.
+	 */
+	store?: RunStore;
 	retire: (name: string, opts?: RetireOptions) => Promise<void>;
 }): Promise<AgentToolResult<unknown>> {
 	const { params, runtime, retire } = input;
@@ -2906,11 +2942,21 @@ export async function stopAction(input: {
 	if (params.all) {
 		targets = active.map((job) => job.name);
 	} else {
-		const target = jobs.find((job) => job.name === params.name);
+		// Local const so the earlier `name`/`all` guard narrows through the lookup.
+		const name = params.name;
+		const target = name ? jobs.find((job) => job.name === name) : undefined;
 		if (!target) {
-			return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
+			// Not tracked by this session, but a foreign/restarted run may still
+			// own a persisted record — the same records `status` can display. Fall
+			// back to it so stop and retire agree on what is reachable.
+			const found = input.store && name ? findChild(input.store.listRuns(), name) : null;
+			if (!found) {
+				return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
+			}
+			targets = found.child.state === "retired" ? [] : [found.child.name];
+		} else {
+			targets = target.state === "retired" ? [] : [target.name];
 		}
-		targets = target.state === "retired" ? [] : [target.name];
 	}
 	if (targets.length === 0) return ok("No non-retired children to stop.");
 

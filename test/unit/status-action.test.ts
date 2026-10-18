@@ -8,8 +8,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import * as path from "node:path";
 import piLegion, {
 	listLiveChildrenForStatus,
@@ -250,6 +250,148 @@ test("#145 status with no children returns empty overview", async () => {
 		const overview = await harness.invoke({ action: "status" });
 		assert.equal(overview.text.trim(), "No live children.");
 		assert.doesNotMatch(overview.text, /name` is required/i);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// ── #209-3: foreign dead child must not report state=working ─────────────
+
+/**
+ * Build a run dir whose `owner.json` names a pid that cannot exist, plus a
+ * child record still persisted as `working`. This is the shape left behind by
+ * a crashed/killed session: nothing will ever rewrite that state.
+ */
+function foreignDeadRun(
+	cwd: string,
+	runId: string,
+	name: string,
+	extra: Partial<ChildRecord> = {},
+): void {
+	const runDir = path.join(cwd, ".pi-subagents", "runs", runId);
+	mkdirSync(runDir, { recursive: true });
+	writeFileSync(
+		path.join(runDir, "owner.json"),
+		`${JSON.stringify({ pid: 999999999, host: hostname(), at: Date.now() })}\n`,
+	);
+	const child = childStub({
+		name,
+		state: "working",
+		execution: { status: "running" },
+		...extra,
+	});
+	writeFileSync(
+		path.join(runDir, "run.json"),
+		`${JSON.stringify(runStub(runId, [child]), null, "\t")}\n`,
+	);
+}
+
+test("#209-3 status overview reports a foreign dead child as state=failed", async () => {
+	const harness = indexHarness();
+	try {
+		foreignDeadRun(harness.cwd, "r-dead0001", "worker-2");
+
+		const overview = await harness.invoke({ action: "status", all: true });
+		assert.match(overview.text, /Status · 1 live child/);
+		assert.match(overview.text, /worker-2 — state=failed/);
+		assert.doesNotMatch(overview.text, /worker-2 — state=working/);
+		assert.match(overview.text, /owner: dead \(pid gone\)/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#209-3 named status reports a foreign dead child as state=failed", async () => {
+	const harness = indexHarness();
+	try {
+		foreignDeadRun(harness.cwd, "r-dead0002", "worker-2");
+
+		const named = await harness.invoke({ action: "status", name: "worker-2" });
+		assert.match(named.text, /worker-2 — state=failed/);
+		assert.match(named.text, /owner: dead \(pid gone\)/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#209-3 a live in-process child is unaffected by the owner fallback", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({
+			agent: "scout",
+			task: "still running",
+			name: "scout-a",
+			async: true,
+			worktree: false,
+		});
+		const overview = await harness.invoke({ action: "status", all: true });
+		assert.match(overview.text, /scout-a — state=working/);
+		assert.doesNotMatch(overview.text, /state=failed/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#209-3 an owner.json without a pid keeps state=working (unknown, not dead)", async () => {
+	const harness = indexHarness();
+	try {
+		const runDir = path.join(harness.cwd, ".pi-subagents", "runs", "r-noowner1");
+		mkdirSync(runDir, { recursive: true });
+		writeFileSync(
+			path.join(runDir, "run.json"),
+			`${JSON.stringify(runStub("r-noowner1", [childStub({ name: "worker-2" })]), null, "\t")}\n`,
+		);
+		const overview = await harness.invoke({ action: "status", all: true });
+		assert.match(overview.text, /worker-2 — state=working/);
+		assert.doesNotMatch(overview.text, /state=failed/);
+		assert.match(overview.text, /owner: unknown/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// ── #209-3: stop must reach a foreign record, not only in-memory jobs ────
+
+test("#209-3 stop retires a foreign record that exists in the store", async () => {
+	const harness = indexHarness();
+	try {
+		foreignDeadRun(harness.cwd, "r-dead0003", "worker-2");
+
+		const result = await harness.invoke({ action: "stop", name: "worker-2" });
+		assert.doesNotMatch(result.text, /not tracked by this session/);
+		assert.equal(result.details?.error, undefined, result.text);
+		assert.match(result.text, /Stopped 1 child: worker-2/);
+
+		// The persisted record actually moved to retired.
+		const runFile = path.join(harness.cwd, ".pi-subagents", "runs", "r-dead0003", "run.json");
+		const persisted = JSON.parse(readFileSync(runFile, "utf8")) as RunRecord;
+		assert.equal(persisted.children[0]?.state, "retired");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#209-3 stop keeps the original error when neither runtime nor store knows the name", async () => {
+	const harness = indexHarness();
+	try {
+		const result = await harness.invoke({ action: "stop", name: "ghost" });
+		assert.match(result.text, /unknown child: ghost \(not tracked by this session\)\./);
+		assert.equal(result.details?.error, ErrorCodes.NOT_FOUND);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#209-3 stop on an already-retired foreign record reports nothing to stop", async () => {
+	const harness = indexHarness();
+	try {
+		foreignDeadRun(harness.cwd, "r-dead0004", "worker-2", {
+			state: "retired",
+			execution: { status: "success" },
+		});
+		const result = await harness.invoke({ action: "stop", name: "worker-2" });
+		assert.doesNotMatch(result.text, /not tracked by this session/);
+		assert.match(result.text, /No non-retired children to stop/);
 	} finally {
 		await harness.cleanup();
 	}
