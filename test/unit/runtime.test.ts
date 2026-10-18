@@ -2288,14 +2288,20 @@ test("C4: runtime — dispose() drops the held outbox without sending", async ()
 	assert.equal(overflow.timers[0]!.canceled, true, "dispose cancels the pending overflow arm");
 });
 
-// ═════ D-D①②③ repaint guards: the only defence against a stuck "working" row ═════
+// ═════ D-D①②③ repaint guards: the pinned defence against a stuck "working" row ═════
 //
-// After the D-D④ revert these three `refreshUi()` calls are the sole code
+// After the D-D④ revert these three `refreshUi()` calls are the pinned code
 // defence against the 「界面一直 working」 symptom: the watch continuation flips
 // the job to a terminal state, and nothing else repaints until the sampler ticks
 // (500ms default) — long enough for a phantom row to be the thing the user sees.
 // Each test below therefore pins the repaint AT the flip, and each was verified
 // to go RED when its own `refreshUi()` is deleted (see the report).
+//
+// Scope note: three of the terminal-flip repaints are pinned here, not all of
+// them. Two same-family repaints remain uncovered on purpose-of-time, not by
+// design: the transient-connection re-arm repaint and the catch-path flip that
+// also lands on `awaiting`. Deleting either one keeps the suite green today, so
+// do not read these guards as "every flip is covered".
 
 /** A UI double that stores the widget factory and counts repaint requests. */
 function captureBoard(): {
@@ -2401,6 +2407,58 @@ test("T-R1: an awaiting flip repaints AT the flip, before the notice and before 
 		1,
 		"exactly one busy-clear: the flip's repaint does the work and release has nothing left to say",
 	);
+	runtime.dispose();
+});
+
+test("T-R4: a collect FAILURE repaints at its awaiting flip too (catch path, not the success path)", async () => {
+	// T-R1 exercises the success branch's flip. The catch branch has its own
+	// `refreshUi()` (a rejected collect is a terminal failure), and it used to be
+	// completely uncovered: deleting it left the whole suite green. Same three
+	// discriminators as T-R1, applied to a rejecting collect.
+	const timeline: string[] = [];
+	const seen: Array<{ active: boolean; label?: string; state?: string; tracked: boolean }> = [];
+	let rejectCollect!: (error: Error) => void;
+	let runtimeRef: { get(name: string): { state: string } | undefined } | undefined;
+	const runtime = createSessionRuntime({
+		sendMessage() {
+			timeline.push("send");
+		},
+		emitBusy(active, label) {
+			timeline.push(active ? "busy" : "idle");
+			const job = runtimeRef?.get("worker-0");
+			seen.push({ active, label, state: job?.state, tracked: job !== undefined });
+		},
+		getTreeIdentity: (name) => ({ nodeId: `root.${name}`, parentId: "root", depth: 1 }),
+		now: () => 1_000,
+		refreshMs: 700_000,
+	});
+	runtimeRef = runtime;
+
+	runtime.track({
+		name: "worker-0",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/w.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((_resolve, reject) => {
+				rejectCollect = reject;
+			}),
+	});
+	runtime.watch("worker-0");
+	assert.equal(timeline.at(-1), "busy", "a working child raises busy before the failure");
+
+	rejectCollect(new Error("collect exploded"));
+	await waitFor(() => timeline.includes("send"), "failure notice delivered");
+
+	const idle = seen.find((entry) => entry.active === false);
+	assert.ok(idle, "the failure flip cleared busy");
+	assert.ok(
+		timeline.indexOf("idle") < timeline.indexOf("send"),
+		`the failure repaint must land at the flip, before the notice (timeline: ${timeline.join(" → ")})`,
+	);
+	assert.equal(idle.state, "awaiting", "the repaint ran while the job was still tracked in `awaiting`");
+	assert.equal(idle.tracked, true, "the catch-path flip repaint sees the job, a release repaint would not");
 	runtime.dispose();
 });
 

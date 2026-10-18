@@ -492,12 +492,19 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		if (outboxTimer || outbox.length === 0 || disposed) return;
 		const oldest = outbox[0]!;
 		const delay = Math.max(0, oldest.enqueuedAt + MAX_PENDING_AGE_MS - now());
-		// `handle` is captured before assignment so a callback can prove it is the
-		// LIVE arm. A cancelled-but-still-invoked timer (a zombie queued before the
-		// cancel landed) must be a strict no-op: otherwise it would clear the live
-		// timer's handle and force-send a notice that is nowhere near its cap.
+		// `live` proves this callback is the CURRENT arm. A cancelled-but-still-
+		// invoked timer (a zombie queued before the cancel landed) must be a strict
+		// no-op: otherwise it would clear the live timer's handle and force-send a
+		// notice that is nowhere near its cap.
+		//
+		// A boolean — not a closure over the handle — because an injected scheduler
+		// is free to invoke the callback synchronously, before the `const` binding
+		// is initialized (TDZ). `live` is assigned above the call, so it is always
+		// safe to read from inside the callback.
+		let live = true;
 		const handle: JoinSchedulerHandle = (deps.scheduleNoticeOverflow ?? defaultNoticeOverflow)(delay, () => {
-			if (outboxTimer !== handle) return;
+			if (!live) return;
+			live = false;
 			outboxTimer = undefined;
 			if (outbox.length === 0) return;
 			const next = outbox[0]!;
@@ -511,7 +518,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			forcedFlushes += 1;
 			flushOutbox();
 		});
-		outboxTimer = handle;
+		outboxTimer = {
+			cancel: () => {
+				live = false;
+				handle.cancel();
+			},
+		};
 	};
 
 	// FIFO, one message per notice: the grouped shape belongs to the join layer.

@@ -240,7 +240,7 @@ launch (async) ──→ 子 pane 跑
    `triggerTurn:false` 项）。
 
    上限是 **per-notice** 而不是 per-run：到点判定用 notice 自己的 `enqueuedAt` 算
-   （`runtime.ts:494` 的 `armOutboxTimer` 从 `outbox[0]` 起算，
+   （`runtime.ts` 的 `armOutboxTimer` 从 `outbox[0]` 起算，
    `noticeQueueStats().oldestAgeMs` 也报最老一条）。所以父 run 持续 10 分钟时，不是
    给整个 run 记一个 80s 预算、也不是因为 run 还在跑就无限顺延：队列里最老一条到点就
    触发（`flushOutbox` 一次 `splice(0)`，连同队列里更年轻的 notice 一起按 FIFO burst
@@ -259,7 +259,7 @@ launch (async) ──→ 子 pane 跑
 
 > print/json 模式：`session_shutdown` → `dispose()` 丢弃未投递的 pending。child 的
 > session 文件仍在，可用 `collect` 从磁盘恢复；但 `finished` 缓存**不**保留
-> （`dispose()` 里 `jobs.clear()` / `finished.clear()` 就在丢弃 outbox 前两行）。
+> （`dispose()` 开头就 `jobs.clear()` / `finished.clear()`，此后才丢弃 outbox）。
 
 父 agent 的正确用法：`subagent` 工具 launch 之后把控制权交回用户，等 completion
 message，而不是轮询，也不是让孩子来拍自己。
