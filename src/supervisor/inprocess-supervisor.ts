@@ -294,6 +294,121 @@ function recordOf(value: unknown): Record<string, unknown> | null {
 		: null;
 }
 
+/**
+ * Provider registrations an extension queued during loading (#209-1).
+ *
+ * Structurally typed on purpose: this file reaches the SDK through a dynamic
+ * `import()` (no static SDK type imports), so only the three arrays the drain
+ * touches are declared — and `unknown` for the payloads, which are just
+ * forwarded to the model runtime.
+ */
+export interface ExtensionRegistrationQueues {
+	pendingProviderRegistrations: Array<{
+		name: string;
+		config: unknown;
+		extensionPath?: string;
+	}>;
+	pendingNativeProviderRegistrations: Array<{
+		provider: unknown;
+		extensionPath?: string;
+	}>;
+	pendingVirtualModelRegistrations: Array<{
+		definition: unknown;
+		extensionPath?: string;
+	}>;
+}
+
+/** Minimal `ModelRuntime` surface the drain needs (structurally typed). */
+export interface ModelRuntimeLike {
+	registerProvider(name: string, config: unknown): void;
+	registerNativeProvider(provider: unknown): void;
+	registerVirtualModel(definition: unknown): void;
+	/** Must reset the *synchronous* catalog snapshot the resolver reads. */
+	refresh(options?: { allowNetwork?: boolean }): Promise<unknown>;
+}
+
+/** The `{ type, message }` diagnostic shape the SDK's runtime APIs return. */
+export interface DiagnosticLike {
+	type: "info" | "warning" | "error";
+	message: string;
+}
+
+function registrationDiagnostic(
+	what: string,
+	extensionPath: string | undefined,
+	error: unknown,
+): DiagnosticLike {
+	const message = error instanceof Error ? error.message : String(error);
+	return {
+		type: "error",
+		message: `Extension "${extensionPath ?? "<unknown>"}" failed to register ${what}: ${message}`,
+	};
+}
+
+/**
+ * Drain extension provider registrations into a `ModelRuntime` (#209-1).
+ *
+ * `DefaultResourceLoader.reload()` really does load and execute the extension
+ * files, but before the extension runner binds, `pi.registerProvider()` and
+ * friends only push onto `runtime.pending*Registrations`. Nothing in Legion
+ * binds that runner for a child session, so the queues were never consumed and
+ * an extension-provided provider (e.g. `pi-any-endpoint`) was invisible.
+ *
+ * Consuming the queues alone is not enough: `registerProvider()` kicks off its
+ * catalog refresh fire-and-forget (`void this.refresh(...)`) while
+ * `resolveCliModel()` reads the *synchronous* `getModels()` snapshot. The
+ * awaited offline refresh below is what makes the extension's self-discovered
+ * catalog land in that snapshot (`allowNetwork: false` — `pi-any-endpoint`
+ * reads offline `stored.models`, so no network is involved).
+ *
+ * Failures are collected as diagnostics and never thrown: a broken extension
+ * must not fail the child spawn. Queues are emptied either way so a retry does
+ * not replay them onto the next runtime.
+ */
+export async function drainExtensionRegistrations(
+	resourceLoader: { getExtensions(): { runtime: ExtensionRegistrationQueues } },
+	modelRuntime: ModelRuntimeLike,
+): Promise<DiagnosticLike[]> {
+	const diagnostics: DiagnosticLike[] = [];
+	const { runtime } = resourceLoader.getExtensions();
+
+	for (const { name, config, extensionPath } of runtime.pendingProviderRegistrations) {
+		try {
+			modelRuntime.registerProvider(name, config);
+		} catch (error) {
+			diagnostics.push(
+				registrationDiagnostic(`provider "${name}"`, extensionPath, error),
+			);
+		}
+	}
+	runtime.pendingProviderRegistrations = [];
+
+	for (const { provider, extensionPath } of runtime.pendingNativeProviderRegistrations) {
+		try {
+			modelRuntime.registerNativeProvider(provider);
+		} catch (error) {
+			diagnostics.push(
+				registrationDiagnostic("native provider", extensionPath, error),
+			);
+		}
+	}
+	runtime.pendingNativeProviderRegistrations = [];
+
+	for (const { definition, extensionPath } of runtime.pendingVirtualModelRegistrations) {
+		try {
+			modelRuntime.registerVirtualModel(definition);
+		} catch (error) {
+			diagnostics.push(
+				registrationDiagnostic("virtual model", extensionPath, error),
+			);
+		}
+	}
+	runtime.pendingVirtualModelRegistrations = [];
+
+	await modelRuntime.refresh({ allowNetwork: false });
+	return diagnostics;
+}
+
 async function defaultSessionFactory(
 	input: InProcessSessionFactoryInput,
 ): Promise<InProcessSession> {
@@ -336,6 +451,24 @@ async function defaultSessionFactory(
 	const resourceLoader = new DefaultResourceLoader(loaderOptions);
 	await resourceLoader.reload();
 
+	// #209-1: the extension files above were loaded and executed, but their
+	// provider registrations are still sitting in `runtime.pending*Registrations`
+	// (they only take effect once an extension runner binds, which a child
+	// session without `createAgentSessionServices()` never does). Drain them into
+	// the runtime handed to `createAgentSession` so extension-provided providers
+	// are resolvable by both the `--model` resolve below and the session itself.
+	const modelRuntime = await ModelRuntime.create();
+	for (const diagnostic of await drainExtensionRegistrations(
+		resourceLoader,
+		modelRuntime,
+	)) {
+		if (diagnostic.type === "error") {
+			// Non-fatal by design (same as the SDK): the spawn only fails if the
+			// model itself cannot be resolved.
+			console.warn(`[pi-legion] inprocess child '${input.name}': ${diagnostic.message}`);
+		}
+	}
+
 	// D7 — the transcript must land on the file the Orchestrator pre-created
 	// (`orchestrator.ts` `preCreateSessionFile`). With `SessionManager.inMemory()`
 	// `getSessionFile()` returns undefined and nothing is ever written, so
@@ -347,11 +480,16 @@ async function defaultSessionFactory(
 		cwd: plan.cwd,
 		sessionManager: SessionManager.open(input.sessionFile, undefined, plan.cwd),
 		resourceLoader,
+		// Injected unconditionally — including when `plan.modelRef` is empty. Left
+		// out, `createAgentSession` would build its own runtime and be blind to
+		// the extension providers drained above all over again.
+		modelRuntime,
 		...(plan.tools ? { tools: plan.tools } : {}),
 	};
 
 	if (plan.modelRef) {
-		const modelRuntime = await ModelRuntime.create();
+		// Same runtime instance as the drain: its snapshot is the one that
+		// contains the extension-registered providers.
 		const resolved = resolveCliModel({
 			cliModel: plan.modelRef,
 			...(plan.modelProvider ? { cliProvider: plan.modelProvider } : {}),
@@ -364,7 +502,6 @@ async function defaultSessionFactory(
 				ErrorCodes.START_FAILED,
 			);
 		}
-		createOptions.modelRuntime = modelRuntime;
 		createOptions.model = resolved.model;
 		if (resolved.thinkingLevel && isThinkingLevel(resolved.thinkingLevel)) {
 			createOptions.thinkingLevel = resolved.thinkingLevel;
