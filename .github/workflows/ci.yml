@@ -18,30 +18,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
       - name: Setup Node 22
         uses: actions/setup-node@v7
         with:
           node-version: 22
           check-latest: true
-          cache: pnpm
+          cache: npm
 
       - name: Install
-        run: pnpm install --frozen-lockfile
+        run: npm ci
 
       - name: typecheck
-        run: pnpm run typecheck
+        run: npm run typecheck
 
       - name: test
-        run: pnpm test
+        run: npm test
 
       - name: test:integration
-        run: pnpm run test:integration
+        run: npm run test:integration
 
       - name: test:mock-llm
-        run: pnpm run test:mock-llm
+        run: npm run test:mock-llm
 
       # Not in this job: test:live (needs a real herdr), test:docker (needs
-      # image pi-herdr-sandbox:latest plus a host Pi agent dir). See release.yml.
+      # image pi-herdr-sandbox:latest plus a host Pi agent dir).
+      # See release.yml.

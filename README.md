@@ -522,11 +522,11 @@ another CLI, keep it on the 0.16.x line or replace it with a Pi role.
 ## Development
 
 ```bash
-pnpm install
-pnpm run typecheck
-pnpm test                  # unit tests
-pnpm run test:integration  # integration tests
-pnpm run test:all          # typecheck + unit + integration tests
+npm install
+npm run typecheck
+npm test                  # unit tests
+npm run test:integration  # integration tests
+npm run test:all          # typecheck + unit + integration tests
 ```
 
 ### Mock LLM (offline pi / legion smoke)
@@ -536,9 +536,9 @@ It registers with Pi like any local gateway (`models.json` → `api: "openai-com
 so spawn / stop / doctor / verify paths can run without real API keys:
 
 ```bash
-pnpm run mock-llm                 # http://127.0.0.1:8765/v1  scenario=echo
-pnpm run test:mock-llm            # unit + integration smoke for the mock
-MOCK_LLM_SCENARIO=spawn-scout pnpm run mock-llm
+npm run mock-llm                 # http://127.0.0.1:8765/v1  scenario=echo
+npm run test:mock-llm            # unit + integration smoke for the mock
+MOCK_LLM_SCENARIO=spawn-scout npm run mock-llm
 ```
 
 Use `writeMockPiHome()` from `test/mock-llm` to generate an isolated
@@ -547,7 +547,7 @@ Use `writeMockPiHome()` from `test/mock-llm` to generate an isolated
 
 See [CONTRIBUTING.md](CONTRIBUTING.md#project-workflow) for the project
 workflow: issues, pull requests, the merge gate, and releases
-(deps via pnpm; npm stage publish for staging).
+(deps via npm; npm stage publish for staging).
 
 Version history for consumers: [CHANGELOG.md](CHANGELOG.md). Tag-by-tag
 release bodies: [GitHub Releases](https://github.com/zzjcool/pi-legion/releases).
