@@ -6,9 +6,11 @@ import * as path from "node:path";
 import {
 	InProcessSupervisor,
 	buildInProcessSessionPlan,
+	drainExtensionRegistrations,
 	type InProcessSession,
 	type InProcessSessionFactoryInput,
 	type InProcessSessionStats,
+	type ModelRuntimeLike,
 } from "../../src/supervisor/inprocess-supervisor.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
@@ -1101,4 +1103,166 @@ test("inprocess: onEvent listeners run at root identity, not the child's (REV2-7
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+// ── #209-1: extension provider registrations must reach the model runtime ──
+//
+// `defaultSessionFactory` itself stays module-private (D2): these tests pin the
+// pure drain it calls, with a fake loader and a fake runtime. No network.
+
+type Queues = Parameters<typeof drainExtensionRegistrations>[0] extends {
+	getExtensions(): { runtime: infer R };
+}
+	? R
+	: never;
+
+function emptyQueues(): Queues {
+	return {
+		pendingProviderRegistrations: [],
+		pendingNativeProviderRegistrations: [],
+		pendingVirtualModelRegistrations: [],
+	};
+}
+
+function fakeLoader(runtime: Queues) {
+	return { getExtensions: () => ({ runtime }) };
+}
+
+interface FakeRuntime extends ModelRuntimeLike {
+	/** Payloads the drain handed over, in call order across all three kinds. */
+	calls: Array<{ kind: "provider" | "native" | "virtual"; payload: unknown; name?: string }>;
+	refreshOptions: Array<{ allowNetwork?: boolean } | undefined>;
+	/** Set inside the awaited refresh; false at return time proves it was not awaited. */
+	refreshResolved: boolean;
+	refreshStartedAfterCalls: boolean;
+}
+
+function fakeRuntime(options: { failProvider?: string; failNative?: boolean } = {}): FakeRuntime {
+	const runtime: FakeRuntime = {
+		calls: [],
+		refreshOptions: [],
+		refreshResolved: false,
+		refreshStartedAfterCalls: false,
+		registerProvider(name: string, config: unknown): void {
+			if (options.failProvider === name) {
+				throw new Error(`provider "${name}" is malformed`);
+			}
+			runtime.calls.push({ kind: "provider", payload: config, name });
+		},
+		registerNativeProvider(provider: unknown): void {
+			if (options.failNative) throw new Error("native provider rejected");
+			runtime.calls.push({ kind: "native", payload: provider });
+		},
+		registerVirtualModel(definition: unknown): void {
+			runtime.calls.push({ kind: "virtual", payload: definition });
+		},
+		async refresh(refreshOptions?: { allowNetwork?: boolean }): Promise<unknown> {
+			runtime.refreshStartedAfterCalls = runtime.calls.length > 0;
+			runtime.refreshOptions.push(refreshOptions);
+			// Yield a macrotask: an un-awaited refresh would still be pending when
+			// the drain returns, leaving this flag false.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			runtime.refreshResolved = true;
+			return { aborted: false, errors: new Map() };
+		},
+	};
+	return runtime;
+}
+
+test("#209-1 drain: every queue is consumed, then refresh is awaited offline", async () => {
+	const runtime = emptyQueues();
+	runtime.pendingProviderRegistrations.push({
+		name: "any-endpoint",
+		config: { baseUrl: "https://example.invalid/v1" },
+		extensionPath: "/plugins/pi-any-endpoint/dist/index.js",
+	});
+	runtime.pendingNativeProviderRegistrations.push({
+		provider: { id: "native-one" },
+		extensionPath: "/plugins/native.js",
+	});
+	runtime.pendingVirtualModelRegistrations.push({
+		definition: { provider: "any-endpoint", id: "virtual-one" },
+		extensionPath: "/plugins/virtual.js",
+	});
+	const modelRuntime = fakeRuntime();
+
+	const diagnostics = await drainExtensionRegistrations(
+		fakeLoader(runtime),
+		modelRuntime,
+	);
+
+	assert.deepEqual(diagnostics, []);
+	// Each register* exactly once, with the queued payload (not a copy of the queue).
+	assert.deepEqual(modelRuntime.calls, [
+		{ kind: "provider", name: "any-endpoint", payload: { baseUrl: "https://example.invalid/v1" } },
+		{ kind: "native", payload: { id: "native-one" } },
+		{ kind: "virtual", payload: { provider: "any-endpoint", id: "virtual-one" } },
+	]);
+	// All three queues emptied on the loader's own runtime object, so a later
+	// session built from the same loader cannot replay them.
+	assert.deepEqual(runtime.pendingProviderRegistrations, []);
+	assert.deepEqual(runtime.pendingNativeProviderRegistrations, []);
+	assert.deepEqual(runtime.pendingVirtualModelRegistrations, []);
+	// Offline refresh, awaited: that is what lands the extension catalog in the
+	// synchronous snapshot `resolveCliModel` reads.
+	assert.deepEqual(modelRuntime.refreshOptions, [{ allowNetwork: false }]);
+	assert.equal(modelRuntime.refreshResolved, true, "refresh must be awaited");
+	assert.equal(modelRuntime.refreshStartedAfterCalls, true, "refresh must run after the registrations");
+});
+
+test("#209-1 drain: a throwing registerProvider is reported, not fatal", async () => {
+	const runtime = emptyQueues();
+	runtime.pendingProviderRegistrations.push(
+		{
+			name: "broken",
+			config: { baseUrl: "not-a-url" },
+			extensionPath: "/plugins/broken.js",
+		},
+		{
+			name: "any-endpoint",
+			config: { baseUrl: "https://example.invalid/v1" },
+			extensionPath: "/plugins/pi-any-endpoint/dist/index.js",
+		},
+	);
+	runtime.pendingNativeProviderRegistrations.push({
+		provider: { id: "native-one" },
+		extensionPath: "/plugins/native.js",
+	});
+	const modelRuntime = fakeRuntime({ failProvider: "broken" });
+
+	const diagnostics = await drainExtensionRegistrations(
+		fakeLoader(runtime),
+		modelRuntime,
+	);
+
+	// One diagnostic naming the failing extension, and no throw.
+	assert.equal(diagnostics.length, 1);
+	assert.equal(diagnostics[0]!.type, "error");
+	assert.match(diagnostics[0]!.message, /\/plugins\/broken\.js/);
+	assert.match(diagnostics[0]!.message, /malformed/);
+	// The healthy registrations still went through, including the later ones.
+	assert.deepEqual(modelRuntime.calls, [
+		{ kind: "provider", name: "any-endpoint", payload: { baseUrl: "https://example.invalid/v1" } },
+		{ kind: "native", payload: { id: "native-one" } },
+	]);
+	// Queues are emptied even on failure, and the refresh still happens.
+	assert.deepEqual(runtime.pendingProviderRegistrations, []);
+	assert.deepEqual(runtime.pendingNativeProviderRegistrations, []);
+	assert.deepEqual(modelRuntime.refreshOptions, [{ allowNetwork: false }]);
+	assert.equal(modelRuntime.refreshResolved, true);
+});
+
+test("#209-1 drain: empty queues register nothing but still refresh offline", async () => {
+	const runtime = emptyQueues();
+	const modelRuntime = fakeRuntime();
+
+	const diagnostics = await drainExtensionRegistrations(
+		fakeLoader(runtime),
+		modelRuntime,
+	);
+
+	assert.deepEqual(diagnostics, []);
+	assert.deepEqual(modelRuntime.calls, []);
+	assert.deepEqual(modelRuntime.refreshOptions, [{ allowNetwork: false }]);
+	assert.equal(modelRuntime.refreshResolved, true);
 });
