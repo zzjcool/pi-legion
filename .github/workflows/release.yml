@@ -66,6 +66,25 @@ jobs:
           fi
           echo "Tag ${tag} matches package.json ${pkg_version}."
 
+      # npm always packs package.json, so an install-phase script declared here
+      # reaches every consumer. Pi installs extensions with plain `npm install`,
+      # so a pnpm-only `preinstall` guard (3.0.0) made `pi update --extensions`
+      # fail for everyone. devEngines.packageManager gives the same contributor
+      # guard without executing anything in a consumer install.
+      - name: Reject install-phase scripts in the published manifest
+        run: |
+          set -euo pipefail
+          for script in preinstall install postinstall; do
+            declared=$(node -p "require('./package.json')\
+              .scripts?.['${script}'] ?? ''")
+            if [ -n "${declared}" ]; then
+              echo "::error::scripts.${script} runs in every consumer install."
+              echo "::error::Use devEngines.packageManager instead."
+              exit 1
+            fi
+          done
+          echo "No install-phase scripts in the published manifest."
+
       - name: Read tag annotation
         run: |
           set -euo pipefail
@@ -98,18 +117,36 @@ jobs:
       # Requires npm CLI >= 11.15 and Node >= 22.14. node-version 22 with
       # check-latest already satisfies the Node requirement. Node 22 still
       # bundles npm 10, so install the npm 11 CLI before staging.
+      #
+      # Packing with pnpm and staging the tarball from a scratch directory keeps
+      # `devEngines.packageManager` (pnpm) from rejecting the npm CLI, and keeps
+      # npm stage from reading repo-root manifests left by `pnpm install`.
+      - name: Pack tarball
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/pack"
+          pnpm pack --pack-destination "${RUNNER_TEMP}/pack"
+          ls -l "${RUNNER_TEMP}/pack"
+
       - name: Stage on npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::Repository secret NPM_TOKEN is not set. GitHub Release for this tag was already created. Add the granular npm token (Read and write, stage only) as NPM_TOKEN, then re-run. This step only stages pi-legion; a maintainer must approve it with npm 2FA before it is published."
+            echo "::error::Repository secret NPM_TOKEN is not set."
+            echo "::error::The GitHub Release exists but nothing was staged."
+            echo "::error::Add the stage-only token as NPM_TOKEN, then re-run."
             exit 1
           fi
           npm install -g npm@^11.15.0
-          if ! npm stage publish; then
-            echo "::error::npm stage publish failed. CI only stages the package and does not put it live. After a successful stage, a maintainer must complete npm 2FA (npm stage approve) to formally publish."
+          tarball=$(ls "${RUNNER_TEMP}"/pack/pi-legion-*.tgz)
+          mkdir -p "${RUNNER_TEMP}/stage"
+          cd "${RUNNER_TEMP}/stage"
+          if ! npm stage publish "${tarball}"; then
+            echo "::error::npm stage publish failed; nothing is live."
+            echo "::error::A maintainer must approve the stage with 2FA."
             exit 1
           fi
-          echo "Staged only. pi-legion is not live. A maintainer must complete npm 2FA (npm stage approve) to formally publish."
+          echo "Staged only. pi-legion is not live."
+          echo "A maintainer must run: npm stage approve <stage-id>"
