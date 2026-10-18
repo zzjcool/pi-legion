@@ -1366,8 +1366,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			jobs.clear();
 			finished.clear();
 			join.dispose();
-			// Shutdown drops held notices unsent: the child's session file and the
-			// `finished` cache survive, so `collect` can still recover them.
+			// Shutdown drops held notices unsent: the child's session file survives,
+			// so `collect` can still recover the result from disk. The `finished`
+			// cache does NOT survive — it was cleared two statements up.
 			outboxTimer?.cancel();
 			outboxTimer = undefined;
 			outbox.length = 0;

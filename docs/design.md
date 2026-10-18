@@ -239,6 +239,13 @@ launch (async) ──→ 子 pane 跑
    行为也不无限隐藏。父 run 不活跃时**立即**发送（含 `mode: "each"`、单成员批次、
    `triggerTurn:false` 项）。
 
+   上限是 **per-notice** 而不是 per-run：到点判定用 notice 自己的 `enqueuedAt` 算
+   （`runtime.ts:494` 的 `armOutboxTimer` 从 `outbox[0]` 起算，
+   `noticeQueueStats().oldestAgeMs` 也报最老一条）。所以父 run 持续 10 分钟时，不是
+   给整个 run 记一个 80s 预算、也不是因为 run 还在跑就无限顺延：队列里最老一条到点就
+   触发（`flushOutbox` 一次 `splice(0)`，连同队列里更年轻的 notice 一起按 FIFO burst
+   发出）。T3d 把「arm 与 oldestAgeMs 都跟最老一条」钉成测试。
+
 为什么不能只发 `followUp`：宿主只在 **live run 内部** drain `agent.followUpQueue`，
 所以父 run 活跃时发出去的 followUp 会一直躺在队列里，直到用户再发一条消息才出现。
 这正是「完成通知看起来没来」的根因。发送时形状不变——
