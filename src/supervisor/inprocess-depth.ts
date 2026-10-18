@@ -47,6 +47,24 @@ export async function runAtInProcessChildDepthAsync<T>(
 	return store.run(inProcessDepth() + 1, fn);
 }
 
+/**
+ * Run async `fn` at an absolute depth (REV2-1).
+ *
+ * `runAtInProcessChildDepthAsync` computes `current + 1`, which is right only
+ * while the caller is itself nested. The Orchestrator drives every turn after
+ * the first from the **root** chain (`orchestrator.ts` `prompt`/`followUp`), so
+ * there `inProcessDepth()` is 0 and `current + 1` would always be 1 — the
+ * recorded nesting would collapse and `maxDepth` could never fire, allowing
+ * unbounded recursion across generations. Dispatching with the child's own
+ * recorded depth (its `spawnDepth`) restores the real nesting level.
+ */
+export async function runAtAbsoluteDepth<T>(
+	depth: number,
+	fn: () => Promise<T>,
+): Promise<T> {
+	return store.run(depth, fn);
+}
+
 /** @internal */
 export function resetInProcessDepthForTests(): void {
 	// AsyncLocalStorage has no global clear; tests should avoid leaking across awaits.

@@ -8,6 +8,7 @@ import {
 	buildInProcessSessionPlan,
 	type InProcessSession,
 	type InProcessSessionFactoryInput,
+	type InProcessSessionStats,
 } from "../../src/supervisor/inprocess-supervisor.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
@@ -15,6 +16,12 @@ import { currentChildContext } from "../../src/supervisor/child-context.ts";
 import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
+import { deriveOutcome, parseSessionFile } from "../../src/shared/session.ts";
+import {
+	SessionManager,
+	type SessionStats as SdkSessionStats,
+} from "@earendil-works/pi-coding-agent";
+import { statSync, writeFileSync } from "node:fs";
 
 class FakeSession implements InProcessSession {
 	readonly listeners = new Set<(event: unknown) => void>();
@@ -51,7 +58,7 @@ class FakeSession implements InProcessSession {
 		this.disposed = true;
 	}
 
-	getSessionStats() {
+	getSessionStats(): InProcessSessionStats {
 		return { tokensIn: 1, tokensOut: 2, costUsd: 0.01 };
 	}
 
@@ -675,6 +682,412 @@ test("inprocess: later dispatches reuse the child's context", async () => {
 		assert.equal(seen.length, 4);
 		assert.ok(seen.every((entry) => entry?.endsWith(":node-9")));
 		assert.equal(currentChildContext(), undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── REV2-1: depth must survive the ROOT-chain turn-2+ dispatch ────────────
+
+test("inprocess: maxDepth holds across generations driven from the root chain (REV2-1)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-rev21-"));
+	const rejections: string[] = [];
+	const spawned: number[] = [];
+	let supervisor: InProcessSupervisor;
+
+	/**
+	 * Production timing:
+	 *  - turn 1 is dispatched by spawnChild (inside runAtInProcessChildDepthAsync)
+	 *  - turn 2+ is dispatched by the Orchestrator from the ROOT chain
+	 *  - each generation spawns its child DURING one of its own turns
+	 * Pre-fix, a spawn issued from a turn-2 await saw depth 0 → every child
+	 * recorded spawnDepth 1 → maxDepth never fired.
+	 */
+	const factory = async (input: InProcessSessionFactoryInput) => {
+		return new RootChainSpawner(input.name);
+	};
+
+	class RootChainSpawner extends FakeSession {
+		readonly name: string;
+		private turns = 0;
+		constructor(name: string) {
+			super();
+			this.name = name;
+		}
+		override async prompt(text: string): Promise<void> {
+			this.turns += 1;
+			const spawnerDepth = inProcessDepth();
+			await super.prompt(text);
+			// Turn 1 is the spawnChild-dispatched turn (no spawn there: it would
+			// collide with the turn-2 name). Every spawn happens on turn 2, which
+			// the Orchestrator dispatches from the ROOT chain — the buggy path.
+			if (this.turns === 2) {
+				const childName = `${this.name}.child`;
+				try {
+					await supervisor.spawnChild(testInput(root, childName));
+					const record = (
+						supervisor as unknown as {
+							children: Map<string, { spawnDepth: number }>;
+						}
+					).children.get(childName);
+					spawned.push(record?.spawnDepth ?? -1);
+					assert.equal(
+						record?.spawnDepth,
+						spawnerDepth + 1,
+						`${childName}: child depth must be spawner depth + 1`,
+					);
+				} catch (error) {
+					rejections.push((error as Error).message);
+				}
+			}
+			// Settle the turn so the next dispatch goes through prompt(), not steer().
+			this.settle();
+		}
+	}
+
+	supervisor = new InProcessSupervisor({
+		getLimits: () => undefined, // maxDepth 4 by default
+		sessionFactory: factory,
+	});
+	try {
+		await supervisor.spawnChild(testInput(root, "root.g1"));
+		// Drive generations one at a time from the ROOT chain.
+		const names = ["root.g1"];
+		for (let gen = 1; gen <= 6; gen += 1) {
+			const name = names[names.length - 1]!;
+			if (!supervisor.isAlive(name)) break;
+			await supervisor.prompt(name, `turn2 of ${name}`); // ROOT-chain dispatch
+			const next = `${name}.child`;
+			if (supervisor.isAlive(next)) names.push(next);
+			else break;
+		}
+
+		// Four levels are allowed (root.g1 is depth 1) …
+		assert.deepEqual(spawned, [2, 3, 4]);
+		// … and the fifth is refused, with the nesting-limit message.
+		assert.equal(rejections.length, 1);
+		assert.match(rejections[0]!, /nesting limit/);
+		assert.match(rejections[0]!, /max 4/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── REV2-2: every omitted key falls back to a safe default ────────────────
+
+test("inprocess: empty block {} falls back to 4/8/8 (REV2-2)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-{}"));
+	const supervisor = new InProcessSupervisor({
+		getLimits: () => ({}), // parseInProcessLimits("{}") yields {}
+		sessionFactory: async () => new FakeSession(),
+	});
+	try {
+		// Distinct parents keep maxChildrenPerNode out of the way until we want it.
+		for (let i = 0; i < 8; i += 1) {
+			await supervisor.spawnChild(testInput(root, `p${i}.child`));
+		}
+		await assert.rejects(
+			() => supervisor.spawnChild(testInput(root, "p8.child")),
+			(error: unknown) =>
+				/inprocess maxActive reached \(8\/8\)/.test((error as Error).message),
+			"empty block must default maxActive to 8, not unlimited",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: partial block {maxActive:50} still defaults maxDepth/maxChildrenPerNode (REV2-2)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-partial-"));
+	const supervisor = new InProcessSupervisor({
+		getLimits: () => ({ maxActive: 50 }), // maxDepth / maxChildrenPerNode omitted
+		sessionFactory: async () => new FakeSession(),
+	});
+	try {
+		// maxChildrenPerNode must default to 8 despite maxActive being raised to 50.
+		for (let i = 0; i < 8; i += 1) {
+			await supervisor.spawnChild(testInput(root, `root.c${i}`));
+		}
+		await assert.rejects(
+			() => supervisor.spawnChild(testInput(root, "root.c8")),
+			(error: unknown) =>
+				(error as { code?: string }).code === ErrorCodes.BUDGET_EXCEEDED &&
+				/maxChildrenPerNode/.test((error as Error).message),
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: partial block {maxChildrenPerNode:50} still defaults maxDepth 4 (REV2-2)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-partial2-"));
+	const rejections: string[] = [];
+	let supervisor: InProcessSupervisor;
+	class Nester extends FakeSession {
+		readonly name: string;
+		private turns = 0;
+		constructor(name: string) {
+			super();
+			this.name = name;
+		}
+		override async prompt(text: string): Promise<void> {
+			this.turns += 1;
+			await super.prompt(text);
+			if (this.turns === 2) {
+				try {
+					await supervisor.spawnChild(testInput(root, `${this.name}.child`));
+				} catch (error) {
+					rejections.push((error as Error).message);
+				}
+			}
+			this.settle();
+		}
+	}
+	supervisor = new InProcessSupervisor({
+		getLimits: () => ({ maxChildrenPerNode: 50 }), // maxDepth omitted
+		sessionFactory: async (i) => new Nester(i.name),
+	});
+	try {
+		await supervisor.spawnChild(testInput(root, "g1"));
+		let name = "g1";
+		for (let gen = 1; gen <= 5; gen += 1) {
+			if (!supervisor.isAlive(name)) break;
+			await supervisor.prompt(name, "turn2");
+			const next = `${name}.child`;
+			if (!supervisor.isAlive(next)) break;
+			name = next;
+		}
+		assert.equal(rejections.length, 1);
+		assert.match(rejections[0]!, /nesting limit/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── REV2-3: the stored context is a snapshot, not the caller's live object ─
+
+test("inprocess: mutating the caller's context template does not affect a spawned child (REV2-3)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-snap-"));
+	const seen: (string | undefined)[] = [];
+	class ProbeSession extends FakeSession {
+		override async prompt(text: string): Promise<void> {
+			seen.push(currentChildContext()?.nodeId);
+			await super.prompt(text);
+		}
+		override async steer(text: string): Promise<void> {
+			seen.push(currentChildContext()?.nodeId);
+			await super.steer(text);
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => new ProbeSession(),
+	});
+	const template = {
+		nodeId: "node-A",
+		parentPath: ["root", "a"],
+		allowNested: false,
+		utility: false,
+		spawnMode: "inprocess" as const,
+	};
+	try {
+		await supervisor.spawnChild({
+			...testInput(root),
+			childLaunchContext: template,
+		});
+		// Caller reuses its template for another spawn: node A must keep node A.
+		template.nodeId = "node-B";
+		template.parentPath.push("b");
+		await supervisor.prompt("root.worker", "turn2");
+		assert.deepEqual(seen, ["node-A", "node-A"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: parentPath array is copied, not aliased (REV2-3)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-snap2-"));
+	let seenPath: string[] | undefined;
+	class ProbeSession extends FakeSession {
+		override async prompt(text: string): Promise<void> {
+			seenPath = currentChildContext()?.parentPath;
+			await super.prompt(text);
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => new ProbeSession(),
+	});
+	const parentPath = ["root"];
+	try {
+		await supervisor.spawnChild({
+			...testInput(root),
+			childLaunchContext: {
+				nodeId: "n1",
+				parentPath,
+				allowNested: false,
+				utility: false,
+				spawnMode: "inprocess",
+			},
+		});
+		parentPath.push("mutated-after-spawn");
+		assert.deepEqual(seenPath, ["root"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── REV2-5: transcript really lands on disk (distinguishes open vs inMemory) ─
+
+test("inprocess: SessionManager.open on a pre-created file persists a parseable transcript (REV2-5)", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-open-"));
+	const file = path.join(root, "child.jsonl");
+	// Exactly what Orchestrator.preCreateSessionFile does.
+	writeFileSync(file, "");
+	assert.equal(statSync(file).size, 0);
+	try {
+		const manager = SessionManager.open(file, undefined, root);
+		// inMemory() would report undefined here and never touch the file.
+		assert.equal(manager.getSessionFile(), file);
+		// open() seeds the session header immediately.
+		assert.ok(statSync(file).size > 0, "open() must write the session header");
+
+		manager.appendMessage({
+			role: "user",
+			content: "hello from inprocess child",
+			timestamp: Date.now(),
+		});
+		const parsed = parseSessionFile(file);
+		assert.equal(parsed.turns.length, 1);
+		// The zero-output bug: an empty file yields status "unknown".
+		assert.notEqual(deriveOutcome(parsed).status, "unknown");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: default factory contract requires a non-inMemory manager (REV2-5)", async () => {
+	// The production factory is not injectable, so pin the property that makes
+	// D7 work: the sessionFile handed to the factory must be a real path that
+	// SessionManager.open can attach to. Regression to inMemory() shows up as
+	// getSessionFile() === undefined and a 0-byte transcript.
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d7-"));
+	const captured: InProcessSessionFactoryInput[] = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async (input) => {
+			captured.push(input);
+			// Mimic the real factory's persistence behaviour.
+			const manager = SessionManager.open(input.sessionFile, undefined, input.cwd);
+			manager.appendMessage({ role: "user", content: "task", timestamp: Date.now() });
+			return new FakeSession();
+		},
+	});
+	try {
+		const input = testInput(root);
+		writeFileSync(input.sessionFile, "");
+		await supervisor.spawnChild(input);
+		assert.equal(captured.length, 1);
+		assert.equal(statSync(input.sessionFile).size > 0, true);
+		assert.equal(parseSessionFile(input.sessionFile).turns.length, 1);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── REV2-6: stats must read the real SDK shape ────────────────────────────
+
+test("inprocess: stats() reads nested SDK tokens/cost (REV2-6)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-stats-"));
+	class SdkStatsSession extends FakeSession {
+		override getSessionStats(): InProcessSessionStats {
+			// Real AgentSession.SessionStats shape (agent-session.d.ts:201-217).
+			// Typed as the SDK type (not a fresh literal) so this double is checked
+			// against the shape production actually returns.
+			const sdk: SdkSessionStats = {
+				sessionFile: "/tmp/s.jsonl",
+				sessionId: "s1",
+				userMessages: 1,
+				assistantMessages: 1,
+				toolCalls: 0,
+				toolResults: 0,
+				totalMessages: 2,
+				tokens: { input: 1234, output: 567, cacheRead: 0, cacheWrite: 0, total: 1801 },
+				cost: 0.0421,
+			};
+			return sdk;
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => new SdkStatsSession(),
+	});
+	try {
+		await supervisor.spawnChild(testInput(root));
+		const stats = await supervisor.stats("root.worker");
+		assert.deepEqual(stats, { tokensIn: 1234, tokensOut: 567, costUsd: 0.0421 });
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: stats() still accepts flat counters from test doubles (REV2-6)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-stats2-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => new FakeSession(), // returns flat {tokensIn:1,...}
+	});
+	try {
+		await supervisor.spawnChild(testInput(root));
+		assert.deepEqual(await supervisor.stats("root.worker"), {
+			tokensIn: 1,
+			tokensOut: 2,
+			costUsd: 0.01,
+		});
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── REV2-7.4: parent-side listeners must not inherit the child identity ───
+
+test("inprocess: onEvent listeners run at root identity, not the child's (REV2-7)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-lsn-"));
+	const seenByListener: (string | undefined)[] = [];
+	const seenInDispatch: (string | undefined)[] = [];
+	class ProbeSession extends FakeSession {
+		override async prompt(text: string): Promise<void> {
+			seenInDispatch.push(currentChildContext()?.nodeId);
+			await super.prompt(text);
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => new ProbeSession(),
+	});
+	try {
+		supervisor.onEvent("root.worker", () => {
+			seenByListener.push(currentChildContext()?.nodeId);
+		});
+		await supervisor.spawnChild({
+			...testInput(root),
+			childLaunchContext: {
+				nodeId: "child-node",
+				allowNested: false,
+				utility: false,
+				spawnMode: "inprocess",
+			},
+		});
+		// Sessions emit synchronously from inside the child's await chain, so
+		// without isolating the listener they'd observe "child-node" here.
+		assert.ok(seenInDispatch.length > 0);
+		assert.deepEqual([...new Set(seenInDispatch)], ["child-node"]);
+		assert.ok(seenByListener.length > 0);
+		assert.deepEqual(
+			[...new Set(seenByListener)],
+			[undefined],
+			"host callbacks must not see the child's ALS identity",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
