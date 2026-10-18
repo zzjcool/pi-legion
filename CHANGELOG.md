@@ -25,8 +25,11 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   "Package Updates Available" notice pointing at the same outdated version on
   every start. The pnpm-only intent now lives in `devEngines.packageManager`,
   which npm enforces for the repository root (`EBADDEVENGINES`) and ignores when
-  the package is installed as a dependency. `packageManager`, `engines.pnpm`, and
-  `CONTRIBUTING.md` are unchanged.
+  the package is installed as a dependency. The repository keeps all of its
+  contributor tooling declarations: `packageManager`, `engines.pnpm` and
+  CONTRIBUTING.md are unchanged. (Note: `pnpm pack` omits `packageManager` from
+  the tarball, which only affects that dev-only field in the published manifest —
+  npm consumers install and load the extension normally.)
 - `test/unit/publish-manifest.test.ts` guards the published manifest against
   install-phase scripts (`preinstall` / `install` / `postinstall`) and asserts the
   pnpm requirement stays declared, so this cannot ship again silently.

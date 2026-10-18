@@ -60,3 +60,15 @@ test("pnpm intent is preserved for contributors", () => {
 	assert.equal(manifest.engines?.pnpm, ">=9");
 	assert.match(manifest.engines?.node ?? "", />=22/);
 });
+
+test("devEngines does not leak into the consumer install path", () => {
+	// `devEngines` must stay a repo-root-only guard: it has to be scoped to
+	// packageManager and must never carry an install-phase script or dependency
+	// requirement that npm would enforce for a consumer (pi installs with npm).
+	const devEngines = manifest.devEngines as Record<string, unknown> | undefined;
+	assert.deepEqual(
+		Object.keys(devEngines ?? {}),
+		["packageManager"],
+		"devEngines must only declare packageManager",
+	);
+});
