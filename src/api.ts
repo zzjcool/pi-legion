@@ -134,6 +134,8 @@ export { InProcessSupervisor } from "./supervisor/inprocess-supervisor.ts";
 export { RoutingSupervisor } from "./supervisor/routing-supervisor.ts";
 export { resolveSpawnMode, DEFAULT_SPAWN_MODE, DEFAULT_INPROCESS_MAX_ACTIVE } from "./supervisor/spawn-mode.ts";
 export { InMemoryUIProxy, isExtensionUIRequest } from "./supervisor/ui-proxy.ts";
+export { runInChildContext, currentChildContext } from "./supervisor/child-context.ts";
+export type { ChildLaunchContext } from "./supervisor/child-context.ts";
 export type {
 	ChildHandle,
 	LegionSupervisor,
@@ -153,6 +155,7 @@ export type {
 	InProcessSessionFactory,
 	InProcessSessionFactoryInput,
 	InProcessSessionPlan,
+	InProcessSessionStats,
 	InProcessSupervisorOptions,
 } from "./supervisor/inprocess-supervisor.ts";
 export type {
