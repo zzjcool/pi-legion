@@ -162,7 +162,10 @@ test("regression: worktree can be disabled for a writer and remains after RPC re
 		const orchestrator = new Orchestrator({ supervisor, runDir, cwd: repo });
 		const optedOut = await orchestrator.launch({ agent: agent({ worktree: true }), task: "share", worktree: false });
 		assert.equal(optedOut.child.worktreePath, undefined);
-		const isolated = await orchestrator.launch({ agent: agent(), task: "isolate", worktree: true });
+		// #214 D4: only a centurion may hold a worktree, so the isolation half of
+		// this regression is exercised with a centurion card. The retire-preserves-
+		// worktree rule is what this case pins, and it is card-name agnostic.
+		const isolated = await orchestrator.launch({ agent: agent({ name: "centurion" }), task: "isolate", worktree: true });
 		assert.ok(isolated.child.worktreePath);
 		assert.ok(existsSync(isolated.child.worktreePath!));
 		await orchestrator.retire(isolated.name);
@@ -170,7 +173,7 @@ test("regression: worktree can be disabled for a writer and remains after RPC re
 	} finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test("regression: worktree is created for a writer role and the branch is passed to RPC spawn", async () => {
+test("regression: worktree is created for a centurion role and the branch is passed to RPC spawn", async () => {
 	const root = tempDir();
 	const repo = path.join(root, "repo");
 	const runDir = path.join(root, "run");
@@ -181,7 +184,9 @@ test("regression: worktree is created for a writer role and the branch is passed
 		execFileSync("git", ["-C", repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "init"]);
 		const supervisor = new FakeSupervisor();
 		const orchestrator = new Orchestrator({ supervisor, runDir, cwd: repo });
-		const handle = await orchestrator.launch({ agent: agent({ worktree: true }), task: "work in isolation" });
+		// #214 D4: worktree is centurion-only, so the "branch reaches RPC spawn"
+		// regression is driven by a centurion card (a worker card would be downgraded).
+		const handle = await orchestrator.launch({ agent: agent({ name: "centurion" }), task: "work in isolation" });
 		assert.ok(handle.child.worktreeBranch);
 		assert.equal(supervisor.spawns[0]?.input.worktreeBranch, handle.child.worktreeBranch);
 	} finally { rmSync(root, { recursive: true, force: true }); }
@@ -207,7 +212,7 @@ test("regression: worktree bootstrap provisions a fresh child worktree once", as
 			supervisor, runDir, cwd: repo,
 			worktreeBootstrap: "printf provisioned > bootstrap-marker.txt",
 		});
-		const handle = await bootstrap.launch({ agent: agent({ worktree: true }), task: "isolated" });
+		const handle = await bootstrap.launch({ agent: agent({ name: "centurion" }), task: "isolated" });
 		assert.ok(handle.child.worktreePath, "worktree created");
 		assert.ok(existsSync(path.join(handle.child.worktreePath, "bootstrap-marker.txt")), "bootstrap command ran inside the worktree");
 		assert.ok(existsSync(provisionMarkerPath(handle.child.worktreePath)), "provision marker written");
@@ -217,7 +222,7 @@ test("regression: worktree bootstrap provisions a fresh child worktree once", as
 		// provisioning runs — the marker-file idempotency that guards a resumed
 		// worktree (different-mode no-op) is pinned in test/unit/provision.test.ts.
 		await bootstrap.retire(handle.name);
-		const relaunched = await bootstrap.launch({ agent: agent({ worktree: true }), task: "resumed", name: handle.name });
+		const relaunched = await bootstrap.launch({ agent: agent({ name: "centurion" }), task: "resumed", name: handle.name });
 		assert.equal(relaunched.child.worktreePath, handle.child.worktreePath, "resume reuses the tree");
 		assert.ok(existsSync(path.join(handle.child.worktreePath, "bootstrap-marker.txt")), "first-pass artifact survives the reuse");
 		const provisionedTrees = (await import("node:fs")).readdirSync(path.join(runDir, "worktrees"), { recursive: false });
@@ -239,7 +244,7 @@ test("regression: worktree bootstrap failure fails the launch and rolls back the
 			worktreeBootstrap: "exit 7",
 		});
 		await assert.rejects(
-			orchestrator.launch({ agent: agent({ worktree: true }), task: "doomed" }),
+			orchestrator.launch({ agent: agent({ name: "centurion" }), task: "doomed" }),
 			(error: unknown) => {
 				assert.ok(error instanceof SubagentError);
 				assert.match((error as SubagentError).message, /worktree bootstrap failed/);

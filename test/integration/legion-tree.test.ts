@@ -102,18 +102,19 @@ async function finishChild(input: {
 	return handle;
 }
 
-test("M2 default spawn mode: a centurion parent dispatches a worktree:true worker card on the default backend", async () => {
+test("M2 default spawn mode: a centurion parent dispatches a worker card on the default backend", async () => {
 	// Regression guard for the `centurion dispatches worker` production path.
 	//
-	// `agents/worker.md` pins `worktree: true` and sets no spawnMode, while a
-	// centurion parent forces the launch worktree to false (`parentRole ===
-	// "centurion"`). With the default backend now `inprocess`, the arbitrated
-	// agent must have BOTH fields normalized, or the real router rejects the
-	// self-contradictory `{spawnMode:"inprocess", worktree:true}` pair with
-	// INVALID_PARAMS on every nested dispatch. FakeSupervisor cannot see this (it
-	// only checks kind), so this case deliberately wires a real RoutingSupervisor
-	// with recording backend stubs: the router's own guard runs for real, only the
-	// would-be child process is replaced.
+	// `agents/worker.md` sets no spawnMode and pins `worktree: false` (#214 D2),
+	// while a centurion parent also forces the launch worktree to false
+	// (`parentRole === "centurion"`). With the default backend now `inprocess`,
+	// the arbitrated agent must carry a normalized `worktree: false`, or the real
+	// router rejects the self-contradictory `{spawnMode:"inprocess",
+	// worktree:true}` pair with INVALID_PARAMS on every nested dispatch.
+	// FakeSupervisor cannot see this (it only checks kind), so this case
+	// deliberately wires a real RoutingSupervisor with recording backend stubs:
+	// the router's own guard runs for real, only the would-be child process is
+	// replaced.
 	const sandbox = mkdtempSync(path.join(tmpdir(), "legion-tree-default-mode-"));
 	const repo = path.join(sandbox, "repo");
 	mkdirSync(repo, { recursive: true });
@@ -150,8 +151,9 @@ test("M2 default spawn mode: a centurion parent dispatches a worktree:true worke
 			maxDepth: 4,
 			legion: { db, dbPath, nodeId: "root.centurion-0", runId: rootRun.runId, runStore: store, settings: { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: 30 }, eventBus: createLegionEventBus() },
 		});
-		// Exactly the worker role-card shape: worktree pinned true, spawnMode omitted.
-		const handle = await orchestrator.launch({ agent: agent("worker", { worktree: true }), task: "Implement the slice." });
+		// Exactly the worker role-card shape after #214 D2: no worktree field, no
+		// explicit spawnMode (the worker card pins `worktree: false`).
+		const handle = await orchestrator.launch({ agent: agent("worker", { worktree: false }), task: "Implement the slice." });
 		assert.equal(handle.child.worktreePath, undefined, "a centurion parent suppresses its workers' worktrees");
 		assert.equal(handle.child.nodeId, "root.centurion-0.worker-0");
 		assert.deepEqual(seen, [{ mode: "inprocess", worktree: false }], "default backend, worktree normalized away");

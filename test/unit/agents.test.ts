@@ -960,7 +960,10 @@ test("acceptance: every bundled role parses its acceptance block", () => {
 	}
 });
 
-test("writer roles default to an isolated worktree", () => {
+test("writer roles no longer default to an isolated worktree (#214 D1)", () => {
+	// D1: the implicit `acceptance.role === writer → worktree: true` default was
+	// deleted. Worktree isolation is centurion-only now, and a *user-defined*
+	// writer role must never be silently pinned onto an isolated tree.
 	const writer = parseAgentDocument(
 		[
 			"---",
@@ -975,15 +978,15 @@ test("writer roles default to an isolated worktree", () => {
 		"/x/coder.md",
 		"user",
 	);
-	assert.equal(writer?.worktree, true);
+	assert.equal(writer?.worktree, undefined, "a writer role is never auto-pinned to a worktree");
 	assert.equal(writer?.acceptance?.role, "writer");
 
-	const optedOut = parseAgentDocument(
+	const optedIn = parseAgentDocument(
 		[
 			"---",
 			"name: coder",
 			"description: writes code",
-			"worktree: false",
+			"worktree: true",
 			"acceptance:",
 			"  level: attested",
 			"  role: writer",
@@ -993,10 +996,10 @@ test("writer roles default to an isolated worktree", () => {
 		"/x/coder.md",
 		"user",
 	);
-	assert.equal(optedOut?.worktree, false);
+	assert.equal(optedIn?.worktree, true, "an explicit frontmatter value still parses");
 
 	const bundled = loadBundledAgents().find((a) => a.name === "worker");
-	assert.equal(bundled?.worktree, true);
+	assert.equal(bundled?.worktree, false, "the bundled worker card pins worktree: false");
 	assert.equal(bundled?.acceptance?.role, "writer");
 });
 
@@ -1041,7 +1044,7 @@ test("acceptance.role is case-insensitive (#172)", () => {
 		["readonly", undefined, false],
 		["read_only", undefined, false],
 	];
-	for (const [wrote, expectedRole, expectWorktree] of cases) {
+	for (const [wrote, expectedRole] of cases) {
 		const doc = [
 			"---",
 			`name: role-${wrote}`,
@@ -1055,11 +1058,12 @@ test("acceptance.role is case-insensitive (#172)", () => {
 		const agent = parseAgentDocument(doc, `/x/role-${wrote}.md`, "user");
 		assert.ok(agent, wrote);
 		assert.equal(agent.acceptance?.role, expectedRole, `role for ${JSON.stringify(wrote)}`);
-		if (expectWorktree) {
-			assert.equal(agent.worktree, true, `auto-worktree for ${JSON.stringify(wrote)}`);
-		} else if (expectedRole === "read-only" || expectedRole === undefined) {
-			assert.equal(agent.worktree, undefined, `no auto-worktree for ${JSON.stringify(wrote)}`);
-		}
+		// #214 D1: `role: writer` no longer implies an isolated worktree.
+		assert.equal(
+			agent.worktree,
+			undefined,
+			`acceptance.role never implies a worktree for ${JSON.stringify(wrote)}`,
+		);
 	}
 });
 

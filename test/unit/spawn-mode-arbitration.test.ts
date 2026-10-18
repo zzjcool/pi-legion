@@ -88,7 +88,12 @@ function agent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 	};
 }
 
-/** `agents/worker.md` shape: worktree pinned true on the role, no spawnMode. */
+/**
+ * A role card that still pins `worktree: true` (the pre-#214 `agents/worker.md`
+ * shape) and sets no spawnMode. #214 D2 flipped the bundled card to
+ * `worktree: false`, but a user card may still pin it — the launch must
+ * downgrade it rather than throw, and downstream must see `worktree: false`.
+ */
 function workerCard(overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return agent({ worktree: true, steer: true, maxSubagentDepth: 3, ...overrides });
 }
@@ -116,7 +121,9 @@ test("arbitration: omitted spawnMode + worktree:true falls back to rpc", async (
 	const h = plainHarness("spawn-arb-worktree-");
 	try {
 		const orchestrator = new Orchestrator({ supervisor: h.supervisor, runDir: h.runDir, cwd: h.repo });
-		const handle = await orchestrator.launch({ agent: agent({ worktree: true }), task: "isolated work" });
+		// #214 D4: only a centurion may hold a worktree; the arbitration under
+		// test (omitted mode + worktree ⇒ rpc) is driven by a centurion card.
+		const handle = await orchestrator.launch({ agent: agent({ name: "centurion", worktree: true }), task: "isolated work" });
 		assert.ok(handle.child.worktreePath, "a resolved worktree must really be created");
 		assert.equal(existsSync(handle.child.worktreePath!), true);
 		assert.deepEqual(h.accepted, [{ name: handle.name, mode: "rpc", worktree: true }]);
@@ -143,7 +150,7 @@ test("arbitration: an explicit rpc mode is never downgraded by a worktree", asyn
 	const h = plainHarness("spawn-arb-explicit-rpc-");
 	try {
 		const orchestrator = new Orchestrator({ supervisor: h.supervisor, runDir: h.runDir, cwd: h.repo });
-		const handle = await orchestrator.launch({ agent: agent({ spawnMode: "rpc", worktree: true }), task: "isolated rpc work" });
+		const handle = await orchestrator.launch({ agent: agent({ name: "centurion", spawnMode: "rpc", worktree: true }), task: "isolated rpc work" });
 		assert.ok(handle.child.worktreePath);
 		assert.deepEqual(h.accepted, [{ name: handle.name, mode: "rpc", worktree: true }]);
 	} finally {
@@ -155,10 +162,12 @@ test("arbitration: explicit inprocess + worktree:true still throws INVALID_PARAM
 	const h = plainHarness("spawn-arb-explicit-inprocess-");
 	try {
 		const orchestrator = new Orchestrator({ supervisor: h.supervisor, runDir: h.runDir, cwd: h.repo });
-		// Both the role-level and launch-level worktree must be loud.
+		// #214 D4 downgrades a non-centurion's worktree BEFORE this gate (warn, not
+		// throw), so the surviving loud path is a centurion card. Both the
+		// role-level and launch-level worktree must be loud.
 		for (const launch of [
-			{ agent: agent({ spawnMode: "inprocess", worktree: true }), task: "conflict" },
-			{ agent: agent({ spawnMode: "inprocess" }), task: "conflict", worktree: true },
+			{ agent: agent({ name: "centurion", spawnMode: "inprocess", worktree: true }), task: "conflict" },
+			{ agent: agent({ name: "centurion", spawnMode: "inprocess" }), task: "conflict", worktree: true },
 		]) {
 			await assert.rejects(
 				() => orchestrator.launch(launch),
@@ -167,6 +176,10 @@ test("arbitration: explicit inprocess + worktree:true still throws INVALID_PARAM
 					assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
 					// Pin the orchestrator's own wording (the TUI surfaces it).
 					assert.match(error.message, /cannot use worktree isolation/);
+					// #214 D5: the message must point at the new rule (worktree is
+					// centurion-only) instead of "use spawnMode rpc" as the first fix.
+					assert.match(error.message, /worktree is reserved for centurion/);
+					assert.doesNotMatch(error.message, /use spawnMode "rpc"/);
 					return true;
 				},
 				"arbitration must not soften an explicit inprocess + worktree combination",

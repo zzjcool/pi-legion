@@ -559,11 +559,6 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "acceptance", parseAcceptance(fm.acceptance, config.name));
 	setIf(config, "toolBudget", parseBudget(fm.toolBudget));
 	setIf(config, "turnBudget", parseTurnBudget(fm.turnBudget));
-	// Writers share a checkout with every other parent Pi in this repo.
-	// Default them onto an isolated worktree so they ship via MR instead.
-	if (config.worktree === undefined && config.acceptance?.role === "writer") {
-		config.worktree = true;
-	}
 }
 
 /** Transitional blocked-policy frontmatter retained for approval handling. */

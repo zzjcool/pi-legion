@@ -19,7 +19,7 @@ acceptance:
 kind: pi
 placement: split-down
 steer: true
-worktree: true
+worktree: false
 maxSubagentDepth: 3
 ---
 
@@ -38,7 +38,7 @@ maxSubagentDepth: 3
 - **跑不动的命令**（交互式、需要确认）走默认放行，不要挂起等待。
 - **禁止开新的 worker/写操作子 agent**。你唯一允许的嵌套派生是只读的 advisor，
   且仅限失败升级场景（见 AGENTS.md「失败止损」：重试 2 次仍失败时咨询，按裁决执行）。
-- **隔离工作区**：你在独立 git worktree / 分支上干活，不要写父会话的 checkout。改动通过 merge request / pull request 合回默认分支，不要本地 merge，不要 push 到 main/master。
+- **隔离工作区**：你在 centurion 派发的子树内原地共享 checkout，不要自己建 git worktree / 分支。改动提交到当前分支并 push，通过 merge request / pull request 合回默认分支，不要本地 merge，不要 push 到 main/master。
 - **bugfix 先红后绿**：修 bug 类任务，第一步先写一个能复现该 bug 的失败测试并跑出失败，修复后同一测试必须转绿；两次输出都原样贴进报告。不复现就修复的，视为未验收。
 
 ## 工作流程

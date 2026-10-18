@@ -257,6 +257,7 @@ export class Orchestrator {
 	private readonly legion?: OrchestratorLegionContext;
 	private readonly requestedDepthCap?: number;
 	private depthWarningEmitted = false;
+	private worktreeWarningEmitted = false;
 	private spawned = 0;
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly nameCounter = new Map<string, number>();
@@ -524,6 +525,17 @@ export class Orchestrator {
 		this.onBudgetRefused?.(event);
 	}
 
+	/** One-shot: a non-centurion asked for worktree isolation; it was downgraded. */
+	private warnWorktreeNotCenturion(roleName: string): void {
+		if (this.worktreeWarningEmitted) return;
+		this.worktreeWarningEmitted = true;
+		console.warn(
+			`[pi-legion] worktree isolation is reserved for centurion; ` +
+			`role '${roleName}' was downgraded to worktree: false (its children share the checkout). ` +
+			`Set worktree: false in the role card to silence this. Dispatch a centurion when you need an isolated subtree.`,
+		);
+	}
+
 	async launch(input: {
 		agent: AgentConfig;
 		task: string;
@@ -562,7 +574,12 @@ export class Orchestrator {
 		let sessionFile = previous?.sessionFile ?? this.sessionFileFor(name);
 		const tempDir = this.runDir;
 		const parentRole = this.legion ? getNode(this.legion.db, this.legion.nodeId)?.role : undefined;
-		const worktree = this.legion && input.agent.name === "centurion"
+		// #214: worktree isolation is centurion-only. A centurion card always gets a
+		// subtree worktree (nested centurions get nested worktrees, §9); a centurion
+		// parent's members never do; everything else falls to the role/launch default
+		// and is then gated below.
+		const isCenturionCard = input.agent.name === "centurion";
+		let worktree = isCenturionCard
 			? true
 			: this.legion && parentRole === "centurion"
 				? false
@@ -571,6 +588,13 @@ export class Orchestrator {
 					launch: input.worktree,
 					parentInWorktree: isInsideChildWorktree(this.cwd),
 				});
+		// #214 D4: only a centurion may hold a worktree. Everyone else — including an
+		// explicit `subagent({ worktree: true })` — is warned once and downgraded.
+		// Downgrading (not throwing) is deliberate: it must never fail a launch.
+		if (worktree && !isCenturionCard) {
+			this.warnWorktreeNotCenturion(input.agent.name);
+			worktree = false;
+		}
 		// Spawn-mode arbitration (contract D2). `resolveSpawnMode` only reports the
 		// configured intent; the launch context decides whether an OMITTED mode can
 		// actually run in-process. An omitted mode falls back to rpc when this
@@ -614,7 +638,7 @@ export class Orchestrator {
 		// `launch({ worktree: false })` — that override now wins as it should.
 		if (inProcess && worktree) {
 			throw new SubagentError(
-				`spawnMode "inprocess" cannot use worktree isolation for '${name}'`,
+				`spawnMode "inprocess" cannot use worktree isolation for '${name}'; worktree is reserved for centurion — set worktree: false to run it in-process`,
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
