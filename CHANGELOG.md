@@ -43,8 +43,21 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   delay.
 - **No more phantom `working` rows.** `awaiting`/re-armed states repaint
   immediately, `agent_settled` repaints once, and a watch continuation whose
-  generation was invalidated now releases its job instead of leaving it tracked
-  forever (it never releases a job another watch owns).
+  generation was invalidated now releases the job it was watching instead of
+  leaving it tracked forever. The release is **identity-checked**: it happens
+  only when that same job object is still the one tracked under the name, so a
+  stale continuation can never delete a newer job that reused the name. While an
+  explicit `stop` has a `retire` in flight the job is held (not released), so a
+  failed retire can still rewatch a live child instead of leaking it untracked.
+
+### Known limits (deliberately out of scope)
+
+- **Blocked prompts and root notices are still sent as bare `followUp`.**
+  `notifyBlocked` (`index.ts`, the blocked-approval prompt) and `notice()`
+  (`index.ts`, the root-level advisory) bypass the run-scoped outbox, so while
+  the parent run is active they sit in the host queue exactly like the
+  completion notices used to. Only completions are covered by this fix; the
+  same treatment for those two paths is a follow-up, not part of this change.
 
 ## [3.0.2] — 2026-10-18
 

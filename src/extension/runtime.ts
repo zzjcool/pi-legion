@@ -105,6 +105,14 @@ export interface TrackedJob extends TrackedJobInput {
 	settledAt?: number;
 	unsubscribeRpcEvents?: () => void;
 	collectPromise?: Promise<CollectSnapshot>;
+	/**
+	 * An explicit `stop` is between `cancelWatch` and the end of its retire
+	 * attempt (A2). While set, a stale watch continuation must NOT release the
+	 * job: the child is still alive until retire settles, and a failed retire
+	 * has to be able to rewatch it. Cleared by the stop's `finally`, by a new
+	 * `watch`/`rewatch`, and with the job on `release`.
+	 */
+	stopHold?: boolean;
 }
 
 export interface LegionTreeIdentity {
@@ -408,6 +416,12 @@ export interface SessionRuntime {
 	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<CollectSnapshot | undefined> | undefined;
 	/** Invalidate an in-flight notification watch without dropping the job. */
 	cancelWatch(name: string): void;
+	/**
+	 * Stop seam (A2): protect the job from the orphan release while `retire` is
+	 * in flight, so a failed retire can still `rewatch` a live child. The
+	 * caller must clear the hold in a `finally`.
+	 */
+	setStopHold(name: string, hold: boolean): void;
 	rewatch(name: string, opts?: { triggerTurn?: boolean }): void;
 	release(name: string): void;
 	get(name: string): TrackedJob | undefined;
@@ -492,12 +506,26 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		if (outboxTimer || outbox.length === 0 || disposed) return;
 		const oldest = outbox[0]!;
 		const delay = Math.max(0, oldest.enqueuedAt + MAX_PENDING_AGE_MS - now());
-		outboxTimer = (deps.scheduleNoticeOverflow ?? defaultNoticeOverflow)(delay, () => {
+		// `handle` is captured before assignment so a callback can prove it is the
+		// LIVE arm. A cancelled-but-still-invoked timer (a zombie queued before the
+		// cancel landed) must be a strict no-op: otherwise it would clear the live
+		// timer's handle and force-send a notice that is nowhere near its cap.
+		const handle: JoinSchedulerHandle = (deps.scheduleNoticeOverflow ?? defaultNoticeOverflow)(delay, () => {
+			if (outboxTimer !== handle) return;
 			outboxTimer = undefined;
 			if (outbox.length === 0) return;
+			const next = outbox[0]!;
+			if (now() < next.enqueuedAt + MAX_PENDING_AGE_MS) {
+				// Fired while the oldest notice is still younger than the cap (a
+				// coarse timer or a backwards clock step). Never force-send early:
+				// re-arm for the remaining age instead.
+				armOutboxTimer();
+				return;
+			}
 			forcedFlushes += 1;
 			flushOutbox();
 		});
+		outboxTimer = handle;
 	};
 
 	// FIFO, one message per notice: the grouped shape belongs to the join layer.
@@ -921,10 +949,19 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	// `cancelWatch` invalidates the generation without releasing (that is how
 	// stop() drops a watcher), so this is the only path that can clean up.
 	//
-	// Blocked-hold jobs are intentionally unwatched: they stay tracked on
-	// purpose so the parent can approve/resume them, so they are exempt.
+	// Two exemptions, both about NOT deleting something still wanted:
+	//  - Blocked-hold jobs are intentionally unwatched: they stay tracked on
+	//    purpose so the parent can approve/resume them.
+	//  - A job under an explicit stop (`stopHold`, A2) is still alive until
+	//    retire settles; a failed retire must be able to rewatch it.
+	//
+	// Identity guard (A1): `release(name)` is keyed by NAME, so a stale
+	// continuation landing after the name was reused would delete the NEW job.
+	// Release only when the map still points at the very object this
+	// continuation was watching.
 	const releaseIfOrphaned = (job: TrackedJob): void => {
-		if (job.watching || job.state === "blocked") return;
+		if (job.watching || job.state === "blocked" || job.stopHold) return;
+		if (jobs.get(job.name) !== job) return;
 		runtime.release(job.name);
 	};
 
@@ -996,6 +1033,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			const triggerTurn = opts.triggerTurn !== false;
 			const gen = (job.generation += 1);
 			job.watching = true;
+			// A fresh watch owns the job outright: any stop window is over for it.
+			job.stopHold = false;
 			job.state = "working";
 			refreshUi();
 			void (async () => {
@@ -1218,6 +1257,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			job.watching = false;
 			job.consumedByTool = false;
 			refreshUi();
+		},
+
+		setStopHold(name, hold) {
+			const job = jobs.get(name);
+			if (!job) return;
+			job.stopHold = hold;
 		},
 
 		rewatch(name, opts) {
