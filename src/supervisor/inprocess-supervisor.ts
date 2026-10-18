@@ -582,7 +582,7 @@ export class InProcessSupervisor implements LegionSupervisor {
 		}
 		if (input.agent.worktree === true) {
 			throw new SubagentError(
-				`spawnMode "inprocess" cannot use worktree isolation for '${input.name}'; use spawnMode "rpc" or set worktree: false`,
+				`spawnMode "inprocess" cannot use worktree isolation for '${input.name}'; set worktree: false`,
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}

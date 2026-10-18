@@ -194,9 +194,14 @@ test("inprocess: refuses worktree:true", async () => {
 				h.supervisor.spawnChild(
 					testInput(h.root, "root.worker", testAgent({ worktree: true })),
 				),
-			(error: unknown) =>
-				error instanceof Error &&
-				(error as { code?: string }).code === ErrorCodes.INVALID_PARAMS,
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.equal((error as { code?: string }).code, ErrorCodes.INVALID_PARAMS);
+				// #214 D3: prefer suggesting worktree:false; do not lead with "use rpc".
+				assert.match(error.message, /set worktree: false/);
+				assert.doesNotMatch(error.message, /use spawnMode ["']rpc["']/);
+				return true;
+			},
 		);
 	} finally {
 		h.close();

@@ -74,9 +74,13 @@ import { provisionWorktree } from "./provision.ts";
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
-	requestedMaxDepth: number;
-	effectiveMaxDepth: number;
 	reason: string;
+	/** Present for maxDepth hard-cap warnings. */
+	requestedMaxDepth?: number;
+	/** Present for maxDepth hard-cap warnings. */
+	effectiveMaxDepth?: number;
+	/** Role name when reason is `worktree_denied_non_centurion` (#214). */
+	agent?: string;
 }
 
 export interface OrchestratorLegionContext {
@@ -257,6 +261,7 @@ export class Orchestrator {
 	private readonly legion?: OrchestratorLegionContext;
 	private readonly requestedDepthCap?: number;
 	private depthWarningEmitted = false;
+	private worktreeDeniedWarningEmitted = false;
 	private spawned = 0;
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly nameCounter = new Map<string, number>();
@@ -524,6 +529,26 @@ export class Orchestrator {
 		this.onBudgetRefused?.(event);
 	}
 
+	/**
+	 * #214: only `name === "centurion"` may hold worktree isolation.
+	 * Non-centurion requests warn once per run (like warnDepthCap) and are
+	 * forced to false — never thrown.
+	 */
+	private warnWorktreeDenied(agentName: string): void {
+		if (this.worktreeDeniedWarningEmitted) return;
+		this.worktreeDeniedWarningEmitted = true;
+		const event: BudgetRefusedEvent = {
+			type: "budget_refused",
+			reason: "worktree_denied_non_centurion",
+			agent: agentName,
+		};
+		console.warn(
+			`[pi-legion] worktree denied for non-centurion role '${agentName}'; forced worktree: false. ` +
+				`Fix the role card (set worktree: false) or dispatch a centurion for isolated parallel writers.`,
+		);
+		this.onBudgetRefused?.(event);
+	}
+
 	async launch(input: {
 		agent: AgentConfig;
 		task: string;
@@ -562,8 +587,18 @@ export class Orchestrator {
 		let sessionFile = previous?.sessionFile ?? this.sessionFileFor(name);
 		const tempDir = this.runDir;
 		const parentRole = this.legion ? getNode(this.legion.db, this.legion.nodeId)?.role : undefined;
-		const worktree = this.legion && input.agent.name === "centurion"
-			? true
+		const isCenturion = input.agent.name === "centurion";
+		// #214 D4: only centurion may hold worktree. Legion path still forces
+		// centurion→true and centurion-parent→member false; non-centurion
+		// requests from any source are demoted below (D1: warn, never throw).
+		let worktree = isCenturion
+			? (this.legion
+				? true
+				: resolveLaunchWorktree({
+					roleDefault: input.agent.worktree,
+					launch: input.worktree,
+					parentInWorktree: isInsideChildWorktree(this.cwd),
+				}))
 			: this.legion && parentRole === "centurion"
 				? false
 				: resolveLaunchWorktree({
@@ -571,6 +606,10 @@ export class Orchestrator {
 					launch: input.worktree,
 					parentInWorktree: isInsideChildWorktree(this.cwd),
 				});
+		if (!isCenturion && worktree === true) {
+			this.warnWorktreeDenied(input.agent.name);
+			worktree = false;
+		}
 		// Spawn-mode arbitration (contract D2). `resolveSpawnMode` only reports the
 		// configured intent; the launch context decides whether an OMITTED mode can
 		// actually run in-process. An omitted mode falls back to rpc when this
@@ -614,7 +653,7 @@ export class Orchestrator {
 		// `launch({ worktree: false })` — that override now wins as it should.
 		if (inProcess && worktree) {
 			throw new SubagentError(
-				`spawnMode "inprocess" cannot use worktree isolation for '${name}'`,
+				`spawnMode "inprocess" cannot use worktree isolation for '${name}'; set worktree: false`,
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}

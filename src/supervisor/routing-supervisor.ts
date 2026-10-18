@@ -78,7 +78,7 @@ export class RoutingSupervisor implements LegionSupervisor {
 			}
 			if (input.agent.worktree === true) {
 				throw new SubagentError(
-					`spawnMode "inprocess" cannot combine with worktree: true for '${input.name}'`,
+					`spawnMode "inprocess" cannot combine with worktree: true for '${input.name}'; set worktree: false`,
 					ErrorCodes.INVALID_PARAMS,
 				);
 			}

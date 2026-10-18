@@ -960,7 +960,7 @@ test("acceptance: every bundled role parses its acceptance block", () => {
 	}
 });
 
-test("writer roles default to an isolated worktree", () => {
+test("writer roles no longer auto-default to worktree; only centurion pins it (#214)", () => {
 	const writer = parseAgentDocument(
 		[
 			"---",
@@ -975,7 +975,7 @@ test("writer roles default to an isolated worktree", () => {
 		"/x/coder.md",
 		"user",
 	);
-	assert.equal(writer?.worktree, true);
+	assert.equal(writer?.worktree, undefined, "custom writers do not auto-gain worktree");
 	assert.equal(writer?.acceptance?.role, "writer");
 
 	const optedOut = parseAgentDocument(
@@ -996,8 +996,11 @@ test("writer roles default to an isolated worktree", () => {
 	assert.equal(optedOut?.worktree, false);
 
 	const bundled = loadBundledAgents().find((a) => a.name === "worker");
-	assert.equal(bundled?.worktree, true);
+	assert.equal(bundled?.worktree, false, "bundled worker is worktree:false per §9");
 	assert.equal(bundled?.acceptance?.role, "writer");
+
+	const centurion = loadBundledAgents().find((a) => a.name === "centurion");
+	assert.equal(centurion?.worktree, true, "only centurion keeps worktree:true");
 });
 
 test("findAgent matches canonical name and alias", () => {
@@ -1029,19 +1032,19 @@ test("findAgent matches canonical name and alias", () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test("acceptance.role is case-insensitive (#172)", () => {
-	const cases: Array<[string, string | undefined, boolean]> = [
-		["read-only", "read-only", false],
-		["READ-ONLY", "read-only", false],
-		["Read-Only", "read-only", false],
-		["writer", "writer", true],
-		["WRITER", "writer", true],
-		["Writer", "writer", true],
-		["unknown", "unknown", false],
-		["UNKNOWN", "unknown", false],
-		["readonly", undefined, false],
-		["read_only", undefined, false],
+	const cases: Array<[string, string | undefined]> = [
+		["read-only", "read-only"],
+		["READ-ONLY", "read-only"],
+		["Read-Only", "read-only"],
+		["writer", "writer"],
+		["WRITER", "writer"],
+		["Writer", "writer"],
+		["unknown", "unknown"],
+		["UNKNOWN", "unknown"],
+		["readonly", undefined],
+		["read_only", undefined],
 	];
-	for (const [wrote, expectedRole, expectWorktree] of cases) {
+	for (const [wrote, expectedRole] of cases) {
 		const doc = [
 			"---",
 			`name: role-${wrote}`,
@@ -1055,11 +1058,8 @@ test("acceptance.role is case-insensitive (#172)", () => {
 		const agent = parseAgentDocument(doc, `/x/role-${wrote}.md`, "user");
 		assert.ok(agent, wrote);
 		assert.equal(agent.acceptance?.role, expectedRole, `role for ${JSON.stringify(wrote)}`);
-		if (expectWorktree) {
-			assert.equal(agent.worktree, true, `auto-worktree for ${JSON.stringify(wrote)}`);
-		} else if (expectedRole === "read-only" || expectedRole === undefined) {
-			assert.equal(agent.worktree, undefined, `no auto-worktree for ${JSON.stringify(wrote)}`);
-		}
+		// #214: writers no longer auto-default to worktree:true.
+		assert.equal(agent.worktree, undefined, `no auto-worktree for ${JSON.stringify(wrote)}`);
 	}
 });
 

@@ -320,7 +320,7 @@ legion_phase({ to, note?, evidence? })                // 仅 centurion（§7）
 
 ## 9. 隔离与交付（子树 worktree、MR 树）
 
-- **per-subtree worktree**：centurion launch 时由**其父**创建（复用现有 `createChildWorktree`：`git worktree add -b pi-subagent/<slug>-<nonce>`，D8 仅 git）；centurion 的 cwd 即该 worktree；**组员一律 `worktree:false` 原地干活**。隔离边界从"每个 writer"上移到"每个子树"，MR 数量从 O(组员数) 降到 O(子树数)
+- **per-subtree worktree**：centurion launch 时由**其父**创建（复用现有 `createChildWorktree`：`git worktree add -b pi-subagent/<slug>-<nonce>`，D8 仅 git）；centurion 的 cwd 即该 worktree；**组员一律 `worktree:false` 原地干活**。隔离边界从"每个 writer"上移到"每个子树"，MR 数量从 O(组员数) 降到 O(子树数)。**N 并行隔离 writer** = 根直派 N 个 centurion（各 1 worktree），centurion 内组员 inprocess；不要给每个 worker 开 worktree
 - 孙代 centurion 在子树 worktree 内再开 nested worktree（git 原生支持），递归成立
 - **MR 树**（D6）：每棵子树一个 squash MR → 父节点（或其队）合并 → 逐级上交 → 根合入默认分支。合并权在各级父节点，叶子永不 merge（现有纪律的递归推广）
 - 文件所有权清单随契约（§7.2）逐层传递；契约矛盾 = 正确拒绝，上报修订后重派

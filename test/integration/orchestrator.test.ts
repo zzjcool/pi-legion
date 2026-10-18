@@ -484,7 +484,7 @@ test("launch failure rolls back a worktree and permits a retry with the same chi
 		const orchestrator = new Orchestrator({ supervisor, runDir, cwd: repo });
 		const worktreePath = path.join(runDir, "worktrees", "worker-retry");
 		await assert.rejects(
-			() => orchestrator.launch({ agent: agent({ worktree: true }), task: "retry after start failure", name: "worker-retry", worktree: true }),
+			() => orchestrator.launch({ agent: agent({ name: "centurion", worktree: true }), task: "retry after start failure", name: "worker-retry", worktree: true }),
 			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.START_FAILED,
 		);
 		assert.equal(existsSync(worktreePath), false, "failed spawn must remove its worktree directory");
@@ -492,7 +492,7 @@ test("launch failure rolls back a worktree and permits a retry with the same chi
 		assert.equal(supervisor.spawns.length, 0);
 
 		rejectStart = false;
-		const handle = await orchestrator.launch({ agent: agent({ worktree: true }), task: "retry same name", name: "worker-retry", worktree: true });
+		const handle = await orchestrator.launch({ agent: agent({ name: "centurion", worktree: true }), task: "retry same name", name: "worker-retry", worktree: true });
 		assert.equal(handle.name, "worker-retry");
 		assert.equal(supervisor.spawns.length, 1);
 		assert.equal(handle.child.worktreePath, worktreePath);
