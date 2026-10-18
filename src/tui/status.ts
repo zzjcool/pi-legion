@@ -22,7 +22,6 @@ import { railwayLines, type RailScroll } from "./viz/railway.ts";
 import { IDLE_STOP_HINT, IDLE_STOP_HINT_SHORT } from "../extension/legion-stop.ts";
 
 export const STATUS_WIDGET_KEY = "pi-legion-status";
-/** @deprecated Footer segment removed (#192); kept for API soft-land. Prefer the aboveEditor widget. */
 export const STATUS_FOOTER_KEY = "pi-legion";
 export const STATUS_WIDGET_PLACEMENT = "aboveEditor" as const;
 
@@ -205,7 +204,7 @@ export function activeEntries(entries: StatusEntry[]): StatusEntry[] {
 /**
  * Panel-visibility gate for the status board: with any Legion-identity
  * entries present, the board mirrors the live-tree filter (completed
- * branches age out; busy counts stay consistent with the widget).
+ * branches age out; footer/busy counts stay consistent with the widget).
  * Legacy flat rosters keep the historical always-shown behavior.
  */
 function hasTreeIdentity(entries: StatusEntry[]): boolean {
@@ -218,15 +217,11 @@ export function visiblePanelEntries(entries: StatusEntry[]): StatusEntry[] {
 	);
 	if (!hasTreeIdentity) return entries;
 	const live = filterLiveTree(entries);
-	// Busy labels key off activeEntries(); keep the ledger root row out
+	// Footer/busy labels key off activeEntries(); keep the ledger root row out
 	// of the visible set entirely (it is not an agent).
 	return live.filter((entry) => entry.nodeId !== "root");
 }
 
-/**
- * @deprecated Footer `N agents running` removed (#192); the aboveEditor widget
- * already shows the same count. Kept for API soft-land — do not call from new code.
- */
 export function formatFooterStatus(entries: StatusEntry[]): string | undefined {
 	const active = activeEntries(entries);
 	if (active.length === 0) return undefined;
@@ -744,14 +739,17 @@ export function createStatusBoard(options: {
 		if (registered && ui) {
 			safe(() => ui!.setWidget(STATUS_WIDGET_KEY, undefined));
 		}
+		if (ui) safe(() => ui!.setStatus(STATUS_FOOTER_KEY, undefined));
 		registered = false;
 		tui = undefined;
 	};
 
 	const paint = (): void => {
 		if (!ctx || !liveHasUi(ctx)) return;
-		// Widget uses the live-tree visibility filter (completed branches age out).
+		// Footer and widget share the live-tree visibility filter so the counts
+		// stay consistent ("N agents running" refers to visible live agents).
 		const visible = visiblePanelEntries(entries);
+		safe(() => ctx!.ui.setStatus(STATUS_FOOTER_KEY, formatFooterStatus(visible)));
 		if (visible.length === 0) {
 			dropWidget();
 			return;
@@ -869,6 +867,7 @@ export function applyStatus(
 			themed.length ? themed : undefined,
 			{ placement: STATUS_WIDGET_PLACEMENT },
 		);
+		ctx.ui.setStatus(STATUS_FOOTER_KEY, formatFooterStatus(entries));
 	} catch (error) {
 		if (!isStaleUiError(error)) throw error;
 	}

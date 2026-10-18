@@ -217,8 +217,8 @@ herdr 写权限对准父 pane，打断父会话，也依赖父 agent 名叫 `orc
 ```text
 launch (async) ──→ 子 pane 跑
        │
-       ├─ TUI：输入框上方 aboveEditor widget（live agent 面板）
-       │        （pi-subagents fleet-status；footer 不再重复计数，见 #192）
+       ├─ TUI：输入框下方 widget + footer `N agents running`
+       │        （pi-subagents fleet-status / setStatus）
        └─ collect 在后台等 turn 结束
               │
               └─ pi.sendMessage({ customType: "subagent-notify" },

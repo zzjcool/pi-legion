@@ -234,7 +234,6 @@ export {
 	canUseCachedCollect,
 	formatAlreadyRecycled,
 } from "./extension/recycle.ts";
-/** STATUS_FOOTER_KEY / formatFooterStatus are @deprecated (#192 footer drop); soft-land re-exports. */
 export {
 	activeEntries,
 	applyStatus,
