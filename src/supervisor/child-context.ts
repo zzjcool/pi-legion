@@ -72,3 +72,16 @@ export function runInChildContext<T>(
 export function currentChildContext(): ChildLaunchContext | undefined {
 	return store.getStore();
 }
+
+/**
+ * Run `fn` outside any child identity (REV2-7).
+ *
+ * Parent-side callbacks are reached synchronously from inside a child's await
+ * chain — an `onEvent` listener is the case in point. Letting such a callback
+ * observe the child's identity makes host code believe it *is* the child (and
+ * inherit the child's spawn permissions). Anything leaving the child's own
+ * execution path must step out of the scope first.
+ */
+export function runOutsideChildContext<T>(fn: () => T): T {
+	return store.exit(fn);
+}

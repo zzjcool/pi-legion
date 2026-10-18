@@ -1,9 +1,11 @@
 /**
  * LegionSupervisor backed by in-process AgentSession (#197).
  *
- * Uses createAgentSession + SessionManager.inMemory (or an injectable factory
- * for unit tests). Production factory wires role tools / model / system prompt
- * (#199). Does NOT use RpcClient. Process-tree / SIG retire is skipped.
+ * Uses createAgentSession + `SessionManager.open(input.sessionFile, ...)` so the
+ * child transcript lands on the file the Orchestrator pre-created (D7; an
+ * in-memory manager would leave it empty), or an injectable factory in unit
+ * tests. Production factory wires role tools / model / system prompt (#199).
+ * Does NOT use RpcClient. Process-tree / SIG retire is skipped.
  */
 
 import { formatChildTask } from "../extension/child-guard.ts";
@@ -25,9 +27,11 @@ import {
 import {
 	type ChildLaunchContext,
 	runInChildContext,
+	runOutsideChildContext,
 } from "./child-context.ts";
 import {
 	inProcessDepth,
+	runAtAbsoluteDepth,
 	runAtInProcessChildDepthAsync,
 } from "./inprocess-depth.ts";
 import {
@@ -49,7 +53,8 @@ import type {
  * Stats shape this supervisor reads. Permissive on purpose: it must be
  * structurally assignable from the SDK's `SessionStats` (nested `tokens` +
  * `cost`) AND from lightweight test doubles that report flat counters. Both
- * shapes are declared so neither side needs a cast at the boundary.
+ * shapes are declared, and both are actually read in `stats()` — a shape that
+ * is declared but never read would silently report zero (REV2-6).
  */
 export interface InProcessSessionStats {
 	/** Flat counters (test doubles). */
@@ -58,7 +63,13 @@ export interface InProcessSessionStats {
 	costUsd?: number;
 	totalCost?: number;
 	/** SDK `SessionStats` shape. */
-	tokens?: { input?: number; output?: number };
+	tokens?: {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		total?: number;
+	};
 	cost?: number;
 }
 
@@ -179,7 +190,10 @@ function resolveInProcessSystemPrompt(input: InProcessSessionFactoryInput): {
 
 export interface InProcessSupervisorOptions {
 	uiProxy?: UIProxy;
-	/** Injected in tests; production uses createAgentSession + SessionManager.inMemory. */
+	/**
+	 * Injected in tests; production uses createAgentSession +
+	 * `SessionManager.open(input.sessionFile, ...)` (D7 transcript persistence).
+	 */
 	sessionFactory?: InProcessSessionFactory;
 	/** Limits for this supervisor instance (inprocess.* only). */
 	limits?: InProcessLimits;
@@ -249,7 +263,18 @@ function parentKeyOf(name: string): string {
  */
 function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 	const provided = input.childLaunchContext;
-	if (provided) return provided;
+	if (provided) {
+		// REV2-3: store a deep-enough snapshot, never the caller's live object.
+		// A caller that reuses one template object (or one `parentPath` array)
+		// across spawns would otherwise mutate the identity of an already-spawned
+		// child for its later dispatches — the A-becomes-B leak D5 exists to kill.
+		return {
+			...provided,
+			...(provided.parentPath
+				? { parentPath: [...provided.parentPath] }
+				: {}),
+		};
+	}
 	const acceptanceRole = input.agent.acceptance?.role;
 	return {
 		allowNested: input.allowNestedSubagents === true,
@@ -528,17 +553,21 @@ export class InProcessSupervisor implements LegionSupervisor {
 		const child = this.requireChild(name);
 		this.assertCanSend(child);
 		if (!child.turnActive) return;
-		// Same identity scope as the spawn turn: abort can settle tool promises
-		// whose continuations still run inside the child's context.
-		await runInChildContext(child.context, async () => {
-			await child.session?.abort?.();
-		});
+		// Same identity scope and nesting depth as the child's own turn: abort can
+		// settle tool promises whose continuations still run inside it.
+		await runAtAbsoluteDepth(child.spawnDepth, () =>
+			runInChildContext(child.context, async () => {
+				await child.session?.abort?.();
+			}),
+		);
 	}
 
 	waitSettled(name: string, timeoutMs = 900_000, signal?: AbortSignal): Promise<SettleResult> {
 		const child = this.requireChild(name);
-		return runInChildContext(child.context, () =>
-			this.awaitSettled(child, timeoutMs, signal),
+		return runAtAbsoluteDepth(child.spawnDepth, () =>
+			runInChildContext(child.context, () =>
+				this.awaitSettled(child, timeoutMs, signal),
+			),
 		);
 	}
 
@@ -624,10 +653,15 @@ export class InProcessSupervisor implements LegionSupervisor {
 		try {
 			const raw = await child.session.getSessionStats?.();
 			if (!raw) return null;
+			// REV2-6: the real AgentSession reports `tokens: {input, output}` + `cost`
+			// (agent-session.d.ts SessionStats), while test doubles use flat counters.
+			// Reading only the flat keys made production usage read as 0 and let
+			// stats() overwrite the correct usage the Orchestrator had already
+			// written to the transcript.
 			return {
-				tokensIn: Number(raw.tokensIn ?? 0),
-				tokensOut: Number(raw.tokensOut ?? 0),
-				costUsd: Number(raw.costUsd ?? raw.totalCost ?? 0),
+				tokensIn: Number(raw.tokensIn ?? raw.tokens?.input ?? 0),
+				tokensOut: Number(raw.tokensOut ?? raw.tokens?.output ?? 0),
+				costUsd: Number(raw.costUsd ?? raw.totalCost ?? raw.cost ?? 0),
 			};
 		} catch {
 			return null;
@@ -723,10 +757,15 @@ export class InProcessSupervisor implements LegionSupervisor {
 		kind: "prompt" | "steer" | "followUp",
 		text: string,
 	): Promise<void> {
-		// Every turn is dispatched inside the child's identity scope — tools run
-		// during these awaits and inherit `currentChildContext()` from here.
-		return runInChildContext(child.context, () =>
-			this.dispatchInContext(child, kind, text),
+		// Every turn is dispatched inside the child's identity scope AND at the
+		// child's recorded absolute nesting depth. The Orchestrator drives turn 2+
+		// from the root chain, where `inProcessDepth()` is 0; without pinning the
+		// recorded depth here a grandchild would look like a first-generation
+		// child and `maxDepth` would never fire (REV2-1).
+		return runAtAbsoluteDepth(child.spawnDepth, () =>
+			runInChildContext(child.context, () =>
+				this.dispatchInContext(child, kind, text),
+			),
 		);
 	}
 
@@ -857,6 +896,17 @@ export class InProcessSupervisor implements LegionSupervisor {
 	}
 
 	private publishEvent(child: ChildRecord, record: Record<string, unknown>): void {
+		// Sessions emit synchronously from inside the child's await chain, so a
+		// parent-side listener would otherwise run with the child's ALS identity
+		// (currentChildContext() would report the child). Host callbacks run at
+		// root identity (REV2-7).
+		runOutsideChildContext(() => this.publishEventAtRoot(child, record));
+	}
+
+	private publishEventAtRoot(
+		child: ChildRecord,
+		record: Record<string, unknown>,
+	): void {
 		const type = record.type;
 		if (typeof type !== "string") return;
 		if (type === "message_update") {
