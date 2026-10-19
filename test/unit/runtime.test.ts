@@ -1121,6 +1121,124 @@ test("runtime: persisted tree usage flows to status entries and fills missing li
 	}
 });
 
+test("runtime: treeNodes() keeps the arbitrated spawnMode on the nodes it synthesizes (#209/D5)", () => {
+	// `treeNodes()` builds a snapshot of its own when a tracked job has an
+	// identity but no DB row yet (`runtime.ts` synthesized branch), and returns
+	// that array directly. A merge that only ran inside `snapshotNodes()` left
+	// `spawnMode` off those nodes, so the modal footer lost the segment in the
+	// plain-session (getTreeNodes -> []) and pre-DB-row windows.
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		getTreeNodes: () => [],
+		now: () => 10_000,
+	});
+	try {
+		runtime.track({
+			name: "worker",
+			runId: "worker-run",
+			agent: "worker",
+			sessionFile: "",
+			nodeId: "root.worker",
+			parentId: "root",
+			depth: 1,
+			timeoutMs: 1_000,
+			spawnMode: "inprocess",
+			collect: () => new Promise(() => {}),
+		});
+		// The DB has no row for this node: the only source is the tracked job.
+		const synthesized = runtime.treeNodes().find((node) => node.id === "root.worker");
+		assert.ok(synthesized, "the job with identity and no DB row is synthesized into the tree");
+		assert.equal(
+			synthesized.spawnMode,
+			"inprocess",
+			"the synthesized node carries the arbitrated backend, not just the DB-backed one",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("runtime: treeNodes() merges the arbitrated spawnMode onto a job with no explicit nodeId (#209/D5)", () => {
+	// `child-row-missing` variant: identity comes from `getTreeIdentity`, the DB
+	// row does not exist yet. Same window as above, different identity channel.
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		getTreeNodes: () => [],
+		getTreeIdentity: (name: string) => ({ nodeId: `root.${name}`, parentId: "root", depth: 1 }),
+		now: () => 10_000,
+	});
+	try {
+		runtime.track({
+			name: "worker",
+			runId: "worker-run",
+			agent: "worker",
+			sessionFile: "",
+			timeoutMs: 1_000,
+			spawnMode: "rpc",
+			collect: () => new Promise(() => {}),
+		});
+		assert.equal(
+			runtime.treeNodes().find((node) => node.id === "root.worker")?.spawnMode,
+			"rpc",
+			"a mapped identity must not lose the mode either",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("runtime: treeNodes() merges the job's arbitrated spawnMode onto its snapshot (#209/D5)", () => {
+	const nodes = [
+		statusTreeNode("root", null, "root", 0),
+		statusTreeNode("root.worker", "root", "worker", 1),
+	];
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		getTreeNodes: () => nodes,
+		now: () => 10_000,
+	});
+	try {
+		// No column in legion.db: the value comes from the tracked job.
+		assert.equal(
+			runtime.treeNodes().find((node) => node.id === "root.worker")?.spawnMode,
+			undefined,
+			"a node with no tracked job has no spawnMode — never a guessed rpc",
+		);
+		runtime.track({
+			name: "worker",
+			runId: "worker-run",
+			agent: "worker",
+			sessionFile: "",
+			nodeId: "root.worker",
+			parentId: "root",
+			depth: 1,
+			timeoutMs: 1_000,
+			spawnMode: "inprocess",
+			collect: () => new Promise(() => {}),
+		});
+		assert.equal(
+			runtime.treeNodes().find((node) => node.id === "root.worker")?.spawnMode,
+			"inprocess",
+			"the arbitrated backend reaches the tree snapshot",
+		);
+		// A legacy job (no spawnMode) does not overwrite the snapshot with a guess.
+		runtime.track({
+			name: "legacy",
+			runId: "legacy-run",
+			agent: "worker",
+			sessionFile: "",
+			nodeId: "root",
+			parentId: null,
+			depth: 0,
+			timeoutMs: 1_000,
+			collect: () => new Promise(() => {}),
+		});
+		assert.equal(runtime.treeNodes().find((node) => node.id === "root")?.spawnMode, undefined);
+	} finally {
+		runtime.dispose();
+	}
+});
+
 test("runtime: session jsonl fills the live current-turn elapsed", async () => {
 	await withTempDir(async (dir) => {
 		const sessionFile = join(dir, "worker-0.jsonl");
@@ -1223,7 +1341,7 @@ test("watch re-arms a thrown Connection error while the RPC child is alive", asy
 	runtime.dispose();
 });
 
-test("a thrown Connection error is a failure once the RPC child is gone", async () => {
+test("a thrown Connection error is a failure once the child is gone", async () => {
 	const messages: SentMessage[] = [];
 	let calls = 0;
 	const runtime = createSessionRuntime({
@@ -1249,7 +1367,8 @@ test("a thrown Connection error is a failure once the RPC child is gone", async 
 	assert.equal(calls, 1);
 	assert.equal(messages.length, 1);
 	assert.match(messages[0]!.content, /Background task failed/);
-	assert.match(messages[0]!.content, /RPC child is not alive/);
+	assert.match(messages[0]!.content, /child is not alive/);
+	assert.doesNotMatch(messages[0]!.content, /RPC child is not alive/);
 	runtime.dispose();
 });
 

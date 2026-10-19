@@ -83,6 +83,7 @@ import {
 	SUBAGENT_NOTIFY_TYPE,
 } from "./src/extension/notify.ts";
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
+import { renderSpawnResult } from "./src/extension/spawn-render.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
 import { configureSessionErrors, recordSessionError } from "./src/extension/session-errors.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
@@ -710,6 +711,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			label: "Vexillatio",
 			description: "Launch only read-only utility agents and return their collected output.",
 			parameters: VexillatioParams,
+			// D4: pi never renders `details` on its own, so without this the
+			// arbitrated spawnMode in `details.handles[].spawnMode` is invisible.
+			renderResult: (result, opts, theme) => renderSpawnResult(result, opts, theme),
 			async execute(_id, params, signal, _onUpdate, ctx: ExtensionContext): Promise<AgentToolResult<unknown>> {
 				if (signal?.aborted) {
 					return ok("interrupted (parent turn ended; children still running)");
@@ -975,6 +979,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		description: TOOL_DESCRIPTION,
 		parameters: SubagentParams,
 
+		// D4: the same renderer as `vexillatio` — it reads both detail shapes.
+		renderResult: (result, opts, theme) => renderSpawnResult(result, opts, theme),
+
 		// The parameter list is fixed by Pi's `ExtensionAPI.registerTool`
 		// contract — an options object is not ours to choose.
 		// pi-lens-ignore: long-parameter-list
@@ -1121,7 +1128,18 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				onUpdate,
 			});
 			if (signal?.aborted) {
-				return ok("interrupted (parent turn ended; children still running)");
+				// The frozen head line still leads, but the machine facts must
+				// survive: `launchFamily` already returns its own interrupted result
+				// (frozen head + `runId` + `spawns`) when it observes the abort; this
+				// outer net only catches an abort seen after that check. Replacing the
+				// whole result with a bare `ok()` used to drop `details.spawns` — the
+				// only record of the arbitrated backend once `handles` is cleared (#209/D3).
+				const details = result.details;
+				const carried =
+					details !== null && typeof details === "object" && !Array.isArray(details)
+						? (details as Record<string, unknown>)
+						: undefined;
+				return ok("interrupted (parent turn ended; children still running)", carried);
 			}
 			return result;
 		},
@@ -1554,7 +1572,7 @@ async function collectChild(
 	}
 }
 
-/** Retire the RPC child while preserving its outcome and session for resume. */
+/** Retire the child while preserving its outcome and session for resume. */
 async function retireChild(
 	ctx: ChildContext,
 ): Promise<AgentToolResult<unknown>> {
@@ -1571,7 +1589,7 @@ async function retireChild(
 		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
 		return ok(
 			`Retired ${ctx.name} (execution=${child.execution?.status ?? "unknown"}). ` +
-				`RPC process stopped; session kept for resume: ${child.sessionFile}`,
+				`Child stopped; session kept for resume: ${child.sessionFile}`,
 		);
 	} catch (error) {
 		return fail(`retire failed: ${String(error)}`, ErrorCodes.RETIRE_FAILED);
@@ -1613,7 +1631,7 @@ async function reviveChild(
 			await orchestrator.steer(name, params.message);
 			followChild(ctx, { watch: true });
 			return ok(
-				`${action === "resume" ? "Resumed" : "Continued"} ${name} (live RPC child steered).`,
+				`${action === "resume" ? "Resumed" : "Continued"} ${name} (live child steered).`,
 			);
 		}
 
@@ -1666,7 +1684,7 @@ async function launchFamily(input: {
 		content: [
 			{
 				type: "text",
-				text: `playbook: ${plan.steps.map((s) => s.agent).join(", ")} → RPC launch → watch`,
+				text: `playbook: ${plan.steps.map((s) => s.agent).join(", ")} → launch → watch`,
 			},
 		],
 		details: {},
@@ -1742,7 +1760,17 @@ async function launchFamily(input: {
 		results: [],
 		handles: [],
 		timeoutByName: new Map(),
+		// #209/D3: the arbitrated mode survives `handles` being cleared on an
+		// abort (interrupted results run after that), so it is kept per name
+		// here — same precedent as `timeoutByName`.
+		spawnByName: new Map(),
 		...(nameGate.name ? { launchName: nameGate.name } : {}),
+	};
+
+	/** `details.spawns` for the handles this request actually resolved. */
+	const spawnDetails = () => {
+		const spawns = [...session.spawnByName.values()];
+		return spawns.length > 0 ? { spawns } : {};
 	};
 
 	const interruptedResult = async (): Promise<AgentToolResult<unknown> | undefined> => {
@@ -1751,7 +1779,7 @@ async function launchFamily(input: {
 		session.handles.length = 0;
 		return {
 			content: [{ type: "text", text: session.results.join("\n") || "interrupted (parent turn ended; children still running)" }],
-			details: { runId: run.runId, handles: [], async: params.async ?? true },
+			details: { runId: run.runId, handles: [], async: params.async ?? true, ...spawnDetails() },
 		};
 	};
 
@@ -1798,13 +1826,13 @@ async function launchFamily(input: {
 
 	if (isAsync && session.handles.length > 0) {
 		session.results.push(
-			"↳ async: a completion message is queued when each RPC child finishes. It wakes this session when idle; otherwise it is delivered after the current turn. Use wait or collect for results. Do not tell children to message the parent.",
+			"↳ async: a completion message is queued when each child finishes. It wakes this session when idle; otherwise it is delivered after the current turn. Use wait or collect for results. Do not tell children to message the parent.",
 		);
 	}
 
 	return {
 		content: [{ type: "text", text: session.results.join("\n") }],
-		details: { runId: run.runId, handles: session.handles, async: isAsync },
+		details: { runId: run.runId, handles: session.handles, async: isAsync, ...spawnDetails() },
 	};
 }
 
@@ -1828,6 +1856,8 @@ interface LaunchSession {
 	results: string[];
 	handles: string[];
 	timeoutByName: Map<string, number>;
+	/** Arbitrated backend per resolved handle; survives an abort clearing `handles`. */
+	spawnByName: Map<string, { name: string; agent: string; spawnMode: SpawnMode }>;
 	/** Explicit child name for this single-step launch; omit to auto-allocate. */
 	launchName?: string;
 }
@@ -1939,6 +1969,13 @@ async function launchStep(
 			await session.store.addChild(session.runId, handle.child);
 		}
 		session.handles.push(handle.name);
+		// Recorded before the abort check below: an interrupted result runs after
+		// `handles` is cleared and still has to name the arbitrated backend.
+		session.spawnByName.set(handle.name, {
+			name: handle.name,
+			agent: effective.name,
+			spawnMode: handle.spawnMode,
+		});
 		if (effective.timeoutMs !== undefined) {
 			session.timeoutByName.set(handle.name, effective.timeoutMs);
 		}
@@ -1963,7 +2000,7 @@ async function launchStep(
 			content: [
 				{
 					type: "text",
-					text: `playbook: ${handle.name} started via RPC`,
+					text: `playbook: ${handle.name} started (supervisor=${handle.spawnMode})`,
 				},
 			],
 			details: {},
@@ -2343,6 +2380,7 @@ async function launchUtilityFamily(input: {
 					name: handle.name,
 					agent: item.agent.name,
 					sessionFile: handle.sessionFile,
+					spawnMode: handle.spawnMode,
 					orchestrator,
 					retire,
 				},
@@ -2358,6 +2396,7 @@ async function launchUtilityFamily(input: {
 		name: string;
 		agent: string;
 		sessionFile: string;
+		spawnMode: SpawnMode;
 		orchestrator: Orchestrator;
 		retire: (opts?: RetireOptions) => Promise<void>;
 	}> = [];
@@ -2373,6 +2412,8 @@ async function launchUtilityFamily(input: {
 			agent: handle.agent,
 			sessionFile: handle.sessionFile,
 			timeoutMs,
+			// Arbitrated at launch; never re-derived here (#209).
+			spawnMode: handle.spawnMode,
 			orchestrator: handle.orchestrator,
 			store,
 			watch,
@@ -2426,7 +2467,7 @@ async function launchUtilityFamily(input: {
 		content: [{ type: "text", text: results.join("\n\n") || "No utility agents were launched." }],
 		details: {
 			runId,
-			handles: handles.map(({ name, agent, sessionFile }) => ({ name, agent, sessionFile })),
+			handles: handles.map(({ name, agent, sessionFile, spawnMode }) => ({ name, agent, sessionFile, spawnMode })),
 			async: false,
 			...(stillRunning.size > 0
 				? { stillRunning: handles.filter(({ name }) => stillRunning.has(name)).map(({ name }) => name) }
@@ -2448,7 +2489,7 @@ async function launchUtilityFamily(input: {
  */
 function interruptedUtilityResult(input: {
 	runId: string;
-	handles: Array<{ name: string; agent: string; sessionFile: string }>;
+	handles: Array<{ name: string; agent: string; sessionFile: string; spawnMode?: SpawnMode }>;
 	stillRunning: Set<string>;
 	results: string[];
 	collected: string[];
@@ -2462,7 +2503,13 @@ function interruptedUtilityResult(input: {
 	// real consumer instead of being a dead signature (#227 review F3).
 	return ok(segments.length > 0 ? `${head}\n\n${segments.join("\n\n")}` : head, {
 		runId: input.runId,
-		handles: input.handles.map(({ name, agent, sessionFile }) => ({ name, agent, sessionFile })),
+		handles: input.handles.map(({ name, agent, sessionFile, spawnMode }) => ({
+			name,
+			agent,
+			sessionFile,
+			// Optional on purpose: a legacy handle must render as absent, never `rpc`.
+			...(spawnMode ? { spawnMode } : {}),
+		})),
 		async: false,
 		interrupted: true,
 		...(stillRunning.length > 0 ? { stillRunning } : {}),
@@ -2614,12 +2661,17 @@ function followJob(
 		watch: boolean;
 		retire?: (opts?: RetireOptions) => Promise<void>;
 		treeIdentity?: { nodeId: string; parentId: string | null; depth: number };
+		/** Arbitrated backend from `Handle.spawnMode`; omitted when unknown (#209). */
+		spawnMode?: SpawnMode;
 	},
 ): void {
 	const child = input.orchestrator
 		.childrenSnapshot()
 		.find((entry) => entry.name === input.name);
 	const existing = runtime.get(input.name);
+	// The caller's Handle owns the arbitration; the persisted ChildRecord records
+	// the same decision. Neither is re-derived here — no handle, no value.
+	const spawnMode = input.spawnMode ?? child?.spawnMode;
 	runtime.track({
 		name: input.name,
 		runId: input.runId,
@@ -2630,6 +2682,7 @@ function followJob(
 		...(child?.model ? { model: child.model } : {}),
 		...(child?.thinking !== undefined ? { thinking: child.thinking } : {}),
 		...(child?.worktreeBranch ? { worktreeBranch: child.worktreeBranch } : {}),
+		...(spawnMode ? { spawnMode } : {}),
 		...(input.treeIdentity ? input.treeIdentity : child?.nodeId ? {
 			nodeId: child.nodeId,
 			parentId: child.nodeId.includes(".") ? child.nodeId.slice(0, child.nodeId.lastIndexOf(".")) : null,
@@ -2706,6 +2759,19 @@ function followChild(ctx: ChildContext, opts: { watch: boolean }): void {
 	});
 }
 
+/**
+ * The arbitrated backend recorded for one handled child of this request.
+ *
+ * Spreads to nothing when unknown, so the caller never has to invent a value.
+ */
+function spawnModeOf(
+	session: LaunchSession,
+	name: string,
+): { spawnMode?: SpawnMode } {
+	const recorded = session.spawnByName.get(name);
+	return recorded ? { spawnMode: recorded.spawnMode } : {};
+}
+
 function followLaunched(
 	session: LaunchSession,
 	name: string,
@@ -2723,6 +2789,8 @@ function followLaunched(
 		orchestrator: session.orchestrator,
 		store: session.store,
 		watch: opts.watch,
+		// Handle-derived, recorded before an abort can clear `handles` (#209).
+		...spawnModeOf(session, name),
 		...(child?.nodeId ? {
 			treeIdentity: {
 				nodeId: child.nodeId,

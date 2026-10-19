@@ -7,18 +7,37 @@ import {
 	TOOL_DESCRIPTION,
 } from "../../src/extension/playbook.ts";
 
-test("playbook text describes RPC launch and frozen child guidance", () => {
+test("playbook text describes the backend-neutral launch and frozen child guidance", () => {
 	assert.match(PARENT_PLAYBOOK, /subagent\(\{ agent:/);
 	assert.match(PARENT_PLAYBOOK, /matching role/);
 	assert.match(PARENT_PLAYBOOK, /Forbidden/);
 	assert.match(PARENT_PLAYBOOK, /Isolation belongs to centurion/);
 	assert.match(PARENT_PLAYBOOK, /worktree: true/);
 	assert.match(PARENT_PLAYBOOK, /dispatch N centurions/);
-	assert.match(PARENT_PLAYBOOK, /headless RPC children/);
+	// D1: children are in-process by default; a separate `pi` process is the
+	// worktree/`spawnMode: rpc` case only.
+	assert.match(PARENT_PLAYBOOK, /Children are in-process by default/);
+	assert.match(PARENT_PLAYBOOK, /pins `spawnMode: rpc`/);
+	assert.doesNotMatch(PARENT_PLAYBOOK, /headless RPC children/);
 	assert.match(PARENT_PLAYBOOK, /verify:/);
 	assert.match(TOOL_DESCRIPTION, /async by default/);
 	assert.match(PARENT_PLAYBOOK, /Esc \/ wait interrupt only ends the parent turn/);
 	assert.doesNotMatch(PARENT_PLAYBOOK, /Same agent type shares one tab/);
+});
+
+test("playbook never narrows a backend-neutral fact to the rpc backend (#209/D1)", () => {
+	// D1's whole point: the parent-facing copy must not present the rpc backend
+	// as the default transport. This is the whole-string guard the review asked
+	// for — it catches a NEW rpc-named sentence, not just the four deleted ones.
+	assert.doesNotMatch(
+		PARENT_PLAYBOOK + TOOL_DESCRIPTION,
+		/headless RPC|via RPC|RPC child|RPC launch/i,
+	);
+	// `--no-extensions` is not an rpc-only fact: in-process children set
+	// `noExtensions = !childInheritsExtensions(...)` too
+	// (`inprocess-supervisor.ts:145`), so the sentence must stay backend-neutral.
+	assert.doesNotMatch(PARENT_PLAYBOOK, /rpc children use `--no-extensions`/);
+	assert.match(PARENT_PLAYBOOK, /without host extensions unless the role inherits them/);
 });
 
 test("shellChunks splits compound commands", () => {
@@ -72,8 +91,9 @@ test("playbook describes event-driven waits and graceful stop", () => {
 	assert.match(TOOL_DESCRIPTION, /Esc does not retire children/);
 });
 
-test("playbook explains RPC timeout and steering semantics", () => {
-	assert.match(PARENT_PLAYBOOK, /collect timeout with a live RPC child is a progress signal/);
+test("playbook explains timeout and steering semantics", () => {
+	assert.match(PARENT_PLAYBOOK, /collect timeout with a live child is a progress signal/);
+	assert.doesNotMatch(PARENT_PLAYBOOK, /live RPC child/);
 	assert.match(PARENT_PLAYBOOK, /session JSONL/);
 	assert.match(PARENT_PLAYBOOK, /Do not tell a child to message or prompt the parent/);
 });

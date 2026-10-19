@@ -49,7 +49,8 @@ test("formatCompletionNotice: success is displayed and carries renderer details"
 	assert.match(notice.content, /execution: success/);
 	assert.match(notice.content, /done the thing/);
 	assert.match(notice.content, /Session file: \/tmp\/worker-0\.jsonl/);
-	assert.match(notice.content, /RPC child retired/);
+	assert.match(notice.content, /Child retired\./);
+	assert.doesNotMatch(notice.content, /RPC child retired/);
 });
 
 test("formatCompletionNotice: failure is displayed", () => {
@@ -160,13 +161,13 @@ test("formatCollectFailure wraps an exception as a failed notice", () => {
 	const notice = formatCollectFailure("w1", new Error("gone"));
 	assert.equal(notice.status, "failed");
 	assert.match(notice.content, /gone/);
-	assert.doesNotMatch(notice.content, /RPC child retired/);
+	assert.doesNotMatch(notice.content, /Child retired\./);
 });
 
 test("formatCollectFailure does not present a bare Connection error as the failure reason", () => {
 	const notice = formatCollectFailure("worker-0", new Error("Connection error."));
 	assert.equal(notice.status, "failed");
-	assert.match(notice.content, /Connection error\. \(RPC child is not alive\)/);
+	assert.match(notice.content, /Connection error\. \(child is not alive\)/);
 	assert.doesNotMatch(notice.content, /execution: failed \(Connection error\.\)/);
 });
 
@@ -395,20 +396,20 @@ test("formatGroupedNotice: multiple entries merge into one notice with a header"
 	assert.match(notice.content, /Run: r-1/);
 	assert.match(notice.content, /- worker-0 \(worker\): completed — acceptance: accepted \(attested\)/);
 	assert.match(notice.content, /- worker-1 \(worker\): completed — acceptance: accepted \(attested\)/);
-	assert.match(notice.content, /\(RPC child retired\)/);
+	assert.match(notice.content, /\(child retired\)/);
 });
 
 test("formatGroupedNotice: retirement markers are per-entry, not a blanket footer", () => {
 	// A wait()-released sibling can race the flush window: a blanket retirement
-	// footer would be inaccurate while another RPC child is still alive.
+	// footer would be inaccurate while another child is still alive.
 	const notice = formatGroupedNotice({
 		entries: [
 			groupedEntry({ name: "kept", recycled: false }),
 			groupedEntry({ name: "gone" }),
 		],
 	});
-	assert.match(notice.content, /- gone \(worker\): completed .*\(RPC child retired\)/);
-	assert.doesNotMatch(notice.content, /- kept \(worker\): completed .*RPC child retired/);
+	assert.match(notice.content, /- gone \(worker\): completed .*\(child retired\)/);
+	assert.doesNotMatch(notice.content, /- kept \(worker\): completed .*child retired/);
 	assert.doesNotMatch(notice.content, /pane recycled/i);
 });
 

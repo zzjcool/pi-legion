@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import type { AgentConfig, SubagentsSettings } from "../../src/shared/types.ts";
 import {
 	applyTeam,
@@ -904,8 +905,14 @@ function indexHarness(
 	cwd: string;
 	supervisor: FakeSupervisor;
 	sentMessages: unknown[];
-	tool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
-	utilityTool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }> };
+	tool: {
+		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }>;
+		renderResult?: (...args: unknown[]) => { render(width: number): string[] };
+	};
+	utilityTool: {
+		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }>;
+		renderResult?: (...args: unknown[]) => { render(width: number): string[] };
+	};
 	startTurn(): void;
 	startRun(): void;
 	emitSettled(aborted: boolean): void;
@@ -947,10 +954,12 @@ function indexHarness(
 	};
 	piLegion(pi as never, { supervisor, ...(verifyRunner ? { verifyRunner } : {}) });
 	const tool = tools.find((entry) => entry.name === "subagent") as {
-		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }>;
+		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }>;
+		renderResult?: (...args: unknown[]) => { render(width: number): string[] };
 	};
 	const utilityTool = tools.find((entry) => entry.name === "vexillatio") as {
-		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }> }>;
+		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }>;
+		renderResult?: (...args: unknown[]) => { render(width: number): string[] };
 	};
 	assert.ok(tool, "subagent tool registered through the index entry point");
 	assert.ok(utilityTool, "vexillatio tool registered through the index entry point");
@@ -988,11 +997,19 @@ async function invokeIndex(
 	harness: ReturnType<typeof indexHarness>,
 	params: Record<string, unknown>,
 ): Promise<string> {
-	const result = await harness.tool.execute(
+	const result = await invokeIndexRaw(harness, params);
+	return (result.content ?? []).map((item) => item.text ?? "").join("\n");
+}
+
+/** Same call, keeping `details` so D3 machine facts can be asserted. */
+function invokeIndexRaw(
+	harness: ReturnType<typeof indexHarness>,
+	params: Record<string, unknown>,
+): Promise<{ content?: Array<{ text?: string }>; details?: unknown }> {
+	return harness.tool.execute(
 		"teams-test", params, undefined, undefined,
 		{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
 	);
-	return (result.content ?? []).map((item) => item.text ?? "").join("\n");
 }
 
 test("session shutdown retires active RPC children while preserving their run record", async () => {
@@ -1113,6 +1130,17 @@ test("index launch abort keeps the child running and watches for settle", async 
 		const handle = harness.supervisor.spawns[0]?.input;
 		if (!handle) throw new Error("expected the child spawn to complete");
 		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /interrupted \(parent turn ended; children still running\)|parent turn ended; child still running/);
+		// #209/D3: the interrupted path runs AFTER `handles` is cleared, so the
+		// arbitrated backend must survive in the parallel `spawns` field. Pin
+		// both halves of that shape: handles empty, spawns still populated.
+		const details = (result as { details?: unknown }).details as
+			| { handles?: unknown[]; spawns?: Array<{ name: string; agent: string; spawnMode: string }> }
+			| undefined;
+		assert.deepEqual(details?.handles, [], "the abort clears the pre-existing handles list");
+		assert.equal(details?.spawns?.length, 1, "the resolved handle still reports its backend");
+		assert.equal(details?.spawns?.[0]?.name, handle.name);
+		assert.equal(details?.spawns?.[0]?.agent, "worker");
+		assert.equal(details?.spawns?.[0]?.spawnMode, "inprocess", "the arbitrated value, never a re-derivation");
 		assert.equal(harness.supervisor.isAlive(handle.name), true, "Esc must not retire a just-spawned child");
 		assert.equal(
 			harness.supervisor.calls.some((call) => call.method === "retire"),
@@ -1327,6 +1355,78 @@ test("index mainline: the launch line and the child record carry the arbitrated 
 			.flatMap((run) => run.children);
 		assert.equal(children.find((child) => child.agent === "worker")?.spawnMode, "inprocess", "ChildRecord echoes the arbitrated mode");
 		assert.equal(children.find((child) => child.agent === "rpcworker")?.spawnMode, "rpc");
+	} finally { await harness.cleanup(); }
+});
+
+test("index mainline: launch-family details expose the arbitrated spawnMode as spawns (#209/D3)", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE, "rpcworker.md": RPC_WORKER_FILE },
+	);
+	try {
+		const inprocess = await invokeIndexRaw(harness, { agent: "worker", task: "default backend", async: true, worktree: false });
+		const inprocessDetails = inprocess.details as
+			| { spawns?: Array<{ name: string; agent: string; spawnMode: string }>; handles?: string[] }
+			| undefined;
+		assert.equal(inprocessDetails?.spawns?.length, 1, "one resolved handle, one spawn entry");
+		assert.equal(inprocessDetails?.spawns?.[0]?.agent, "worker");
+		assert.equal(inprocessDetails?.spawns?.[0]?.spawnMode, "inprocess", "the arbitrated value, not a re-derivation");
+		assert.equal(inprocessDetails?.spawns?.[0]?.name, inprocessDetails?.handles?.[0]);
+		// Additive only: the pre-existing keys are untouched.
+		assert.ok(Array.isArray(inprocessDetails?.handles));
+		assert.match((inprocess.details as { runId?: string }).runId ?? "", /^r-[0-9a-z]+$/i);
+		assert.equal((inprocess.details as { async?: boolean }).async, true);
+		assert.equal(
+			(inprocess.details as { isError?: unknown }).isError,
+			undefined,
+			"details never carry isError",
+		);
+
+		const rpc = await invokeIndexRaw(harness, { agent: "rpcworker", task: "pinned backend", async: true, worktree: false });
+		const rpcSpawns = (rpc.details as { spawns?: Array<{ spawnMode: string }> } | undefined)?.spawns;
+		assert.equal(rpcSpawns?.[0]?.spawnMode, "rpc", "a role pinned to rpc reports rpc");
+	} finally { await harness.cleanup(); }
+});
+
+test("index mainline: a launch with no resolved handle omits spawns entirely (#209/D3)", async () => {
+	const harness = indexHarness({ disableBuiltins: true }, { "worker.md": WORKER_FILE });
+	try {
+		const result = await invokeIndexRaw(harness, { agent: "ghost", task: "no such role", async: true, worktree: false });
+		assert.match((result.content ?? []).map((item) => item.text ?? "").join("\n"), /unknown agent/);
+		assert.equal(
+			(result.details as { spawns?: unknown }).spawns,
+			undefined,
+			"present only when non-empty, matching the stillRunning convention",
+		);
+	} finally { await harness.cleanup(); }
+});
+
+test("index mainline: both tools register a renderResult that shows the summary line (#209/D4)", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE, "scout.md": UTILITY_FILE },
+	);
+	try {
+		assert.equal(typeof harness.tool.renderResult, "function", "subagent registers renderResult");
+		assert.equal(typeof harness.utilityTool.renderResult, "function", "vexillatio registers renderResult");
+
+		const launch = await invokeIndexRaw(harness, { agent: "worker", task: "render me", async: true, worktree: false });
+		const theme = {
+			fg: (_color: string, text: string) => text,
+			bg: (_color: string, text: string) => text,
+			bold: (text: string) => text,
+		};
+		const rendered = harness.tool
+			.renderResult!(launch, { expanded: false, isPartial: false }, theme)
+			.render(200)
+			.map((line: string) => stripTerminalSequences(line));
+		assert.match(rendered[0] ?? "", /spawn: worker-0=inprocess/, "the TUI card names the arbitrated backend");
+		// The summary line goes through `details`, never through `content`.
+		assert.doesNotMatch(
+			(launch.content ?? []).map((item) => item.text ?? "").join("\n"),
+			/spawn: worker-0=inprocess|spawn: scout-0=rpc/,
+			"the model-facing content stays free of the summary",
+		);
 	} finally { await harness.cleanup(); }
 });
 
@@ -1606,11 +1706,19 @@ test("vexillatio interrupt returns the results it already collected (#227 D4)", 
 		assert.match(text, /first utility finished/, "the completed child's body survives the interrupt");
 		assert.match(text, /execution: running \(aborted by parent\)/, "an interrupted collect is still reported as running, never as success");
 		const details = (settled as { details?: unknown }).details as
-			| { runId?: string; handles?: Array<{ name: string; agent: string; sessionFile: string }>; async?: boolean; interrupted?: boolean; stillRunning?: string[] }
+			| { runId?: string; handles?: Array<{ name: string; agent: string; sessionFile: string; spawnMode?: string }>; async?: boolean; interrupted?: boolean; stillRunning?: string[] }
 			| undefined;
 		assert.equal(details?.interrupted, true, "details mark the interruption");
 		assert.equal(details?.async, false);
 		assert.equal(details?.handles?.length, 2, "details keep one handle per launched utility");
+		// #209/D3: vexillatio publishes the arbitrated backend per handle. This is
+		// the producer side of `spawnModeSummary`'s `handles[].spawnMode` read —
+		// without it the renderer's vexillatio branch has no facts to show.
+		assert.equal(
+			details?.handles?.[0]?.spawnMode,
+			"inprocess",
+			"a utility launched with default arbitration reports its backend",
+		);
 		// F7: "non-empty" cannot distinguish a right run id from a constant, so pin
 		// it to the run directory this interrupt actually wrote to.
 		assert.match(details?.runId ?? "", /^r-[0-9a-z]+$/i, "details carry a real run id, not a placeholder");

@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { LegionEvent } from "../extension/event-bus.ts";
 import type { LegionNode, NodeStatus } from "../legion/nodes.ts";
+import type { SpawnMode } from "../shared/types.ts";
 import { osc8NodeLink } from "./status.ts";
 
 const TREE_HEADER = "Legion tree · j/k move · enter toggle · / search · pgup/pgdn scroll · esc/q close";
@@ -30,6 +31,13 @@ export interface TreeNodeSnapshot extends LegionNode {
 	lastTools?: readonly string[];
 	/** Unix ms start of the current turn, when known (bus events or snapshots). */
 	turnStartedAt?: number;
+	/**
+	 * Arbitrated backend for this child (#209), merged from the tracked job at
+	 * snapshot time — `legion.db` has no spawn_mode column. Absent for legacy
+	 * records and for nodes never launched in this session; readers must render
+	 * that as unknown, never as `rpc`.
+	 */
+	spawnMode?: SpawnMode;
 }
 
 export interface TreeViewTheme {

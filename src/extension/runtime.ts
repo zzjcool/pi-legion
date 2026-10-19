@@ -34,7 +34,12 @@ import {
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
-import { DEFAULTS, type AgentKind, type RetireOptions } from "../shared/types.ts";
+import {
+	DEFAULTS,
+	type AgentKind,
+	type RetireOptions,
+	type SpawnMode,
+} from "../shared/types.ts";
 import type {
 	EventSubscriptionOptions,
 	SupervisorEvent,
@@ -76,6 +81,12 @@ export interface TrackedJobInput {
 	model?: string;
 	thinking?: string | false;
 	worktreeBranch?: string;
+	/**
+	 * Arbitrated backend for this child (`Handle.spawnMode`, #209). Optional:
+	 * a job tracked from a legacy record has no value and must render as
+	 * unknown rather than a guessed `rpc`.
+	 */
+	spawnMode?: SpawnMode;
 	/** Legion tree identity supplied by the host when the M2 ChildRecord is available. */
 	nodeId?: string;
 	parentId?: string | null;
@@ -629,7 +640,30 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			for (const nodeId of activity.keys()) if (!tree.has(nodeId)) activity.delete(nodeId);
 			for (const nodeId of eventOverrides.keys()) if (!tree.has(nodeId)) eventOverrides.delete(nodeId);
 		}
-		return [...tree.values()].map((node) => ({ ...node }));
+		const nodes = [...tree.values()].map((node) => ({ ...node }));
+		return mergeSpawnModes(nodes);
+	};
+
+	/**
+	 * #209/D5: the arbitrated backend lives on the tracked job, never in
+	 * legion.db (no column, no migration), so it is merged onto the matching
+	 * snapshot. Unmatched jobs contribute nothing rather than a guess.
+	 *
+	 * Shared by `snapshotNodes()` and `treeNodes()`: the latter synthesizes
+	 * nodes of its own (a job with identity but no DB row yet) and returns that
+	 * array directly, so a merge that only ran in `snapshotNodes()` would drop
+	 * the mode in the pre-DB-row window and in a plain session where
+	 * `getTreeNodes()` yields `[]`.
+	 */
+	const mergeSpawnModes = (
+		nodes: TreeNodeSnapshot[],
+	): TreeNodeSnapshot[] => {
+		for (const job of jobs.values()) {
+			if (job.spawnMode === undefined) continue;
+			const match = storedNodeForJob(job, nodes);
+			if (match) match.spawnMode = job.spawnMode;
+		}
+		return nodes;
 	};
 
 	const storedNodeForJob = (
@@ -969,6 +1003,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				existing.model = input.model;
 				existing.thinking = input.thinking;
 				existing.worktreeBranch = input.worktreeBranch;
+				// Only a known value overwrites: a re-follow without the handle must
+				// not erase the mode an earlier launch established.
+				if (input.spawnMode !== undefined) existing.spawnMode = input.spawnMode;
 				if (input.nodeId !== undefined || identity.nodeId !== undefined) existing.nodeId = input.nodeId ?? identity.nodeId;
 				if (input.parentId !== undefined || identity.parentId !== undefined) existing.parentId = input.parentId ?? identity.parentId;
 				if (input.depth !== undefined || identity.depth !== undefined) existing.depth = input.depth ?? identity.depth;
@@ -1308,7 +1345,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				if (index >= 0) result[index] = next;
 				else result.push(next);
 			}
-			return result;
+			// The synthesized nodes above are built from job facts, not from a DB
+			// row, so they carry no `spawnMode` of their own: run the same merge
+			// the snapshot path uses before handing the array out (#209/D5).
+			return mergeSpawnModes(result);
 		},
 
 		statusEntries() {

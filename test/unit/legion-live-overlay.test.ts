@@ -97,6 +97,11 @@ class FakeOverlaySource implements LiveOverlaySource {
 		return this.nodes.get(nodeId);
 	}
 
+	/** Replace a node fixture so a test can vary one field (e.g. spawnMode). */
+	setNode(node: LiveOverlayNode): void {
+		this.nodes.set(node.id, node);
+	}
+
 	emit(nodeId: string, event: LiveOverlayEvent): void {
 		for (const { nodeId: subscribedNode, listener } of this.listeners.values()) {
 			if (subscribedNode === nodeId) listener({ ...event, nodeId });
@@ -1051,6 +1056,85 @@ test("live overlay paints a floating modal: title with 主/子, Esc close; Esc d
 	} finally {
 		component.dispose();
 	}
+});
+
+/**
+ * Render the modal for a node and return the footer (meta) band, which is the
+ * only place the arbitrated spawnMode is allowed to surface (#209/D5).
+ */
+function metaBandFor(node: LiveOverlayNode): string {
+	const source = new FakeOverlaySource();
+	source.setNode(node);
+	const component = createLiveOverlay(source).open(node.id, {
+		terminalRows: 24,
+		now: () => 5_000,
+	});
+	try {
+		const layout = resolveModalLayout(24, 80);
+		assert.ok(layout.metaRow !== null && layout.showMeta, "the meta band is visible at 24x80");
+		const lines = component.render(80).map((line) => stripTerminalSequences(line));
+		return lines[layout.metaRow!] ?? "";
+	} finally {
+		component.dispose();
+	}
+}
+
+test("live overlay meta band shows the arbitrated spawn mode when known (#209/D5)", () => {
+	const base = {
+		id: "root.worker",
+		name: "worker",
+		role: "worker",
+		model: "test/model",
+		status: "running" as const,
+		parentId: "root",
+		depth: 1,
+		createdAt: 1_000,
+		updatedAt: 1_000,
+	};
+	assert.match(metaBandFor({ ...base, spawnMode: "rpc" }), /spawn rpc/);
+	assert.match(metaBandFor({ ...base, spawnMode: "inprocess" }), /spawn inprocess/);
+});
+
+test("live overlay meta band keeps the spawn segment visible at the default 24x80 width (#209/D5)", () => {
+	// `resolveModalLayout(24, 80)` gives innerWidth 78 and the band is clipped by
+	// `fitLine`. Appended last after a REAL model id, `spawn inprocess` was cut
+	// to `spawn inpr...`: the segment the whole change exists to show vanished
+	// on the default layout. It now sits before the model, so role + spawn win.
+	const band = metaBandFor({
+		id: "root.worker",
+		name: "worker",
+		role: "worker",
+		model: "workbuddy/deepseek-v4.1-flash",
+		status: "running",
+		parentId: "root",
+		depth: 1,
+		createdAt: 1_000,
+		updatedAt: 1_000,
+		spawnMode: "inprocess",
+	});
+	assert.match(band, /spawn inprocess/, "the full segment survives the 78-column clip");
+	assert.doesNotMatch(band, /spawn inpr\.\.\.|spawn inpro\.\.\./, "no truncated spawn segment");
+	// role and the spawn segment both precede the model id.
+	assert.match(band, /worker · spawn inprocess · workbuddy\/deepseek-v4\.1-flash/);
+});
+
+test("live overlay meta band omits the spawn segment when the mode is unknown (#209/D5)", () => {
+	const band = metaBandFor({
+		id: "root.other",
+		name: "other",
+		role: "worker",
+		model: null,
+		status: "running",
+		parentId: "root",
+		depth: 1,
+		createdAt: 1_000,
+		updatedAt: 1_000,
+	});
+	// A legacy / tree-only node must not be labelled with a guessed backend.
+	assert.doesNotMatch(band, /spawn /);
+	assert.doesNotMatch(band, /rpc/);
+	// The rest of the footer is unchanged.
+	assert.match(band, /worker · turn 0 · 4s · running/);
 });
 
 test("resolveModalLayout caps frame by window ratio and keeps meta below the body", () => {

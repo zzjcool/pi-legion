@@ -16,6 +16,7 @@ import {
 import type { KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { LegionNode } from "../legion/nodes.ts";
+import type { SpawnMode } from "../shared/types.ts";
 import {
 	createChatItemFactory,
 	type ChatItem,
@@ -30,6 +31,11 @@ export interface LiveOverlayNode extends Pick<LegionNode, "id" | "name" | "role"
 	turns?: number;
 	sessionFile?: string | null;
 	worktreePath?: string | null;
+	/**
+	 * Arbitrated backend for this child (#209). Absent for legacy nodes and for
+	 * the root — the footer omits the segment rather than printing a default.
+	 */
+	spawnMode?: SpawnMode;
 }
 
 /** A normalized tree-bus or RPC event associated with one Legion node. */
@@ -748,6 +754,14 @@ function createSession(
 		const turnLabel = `turn ${turnNumber}${turnElapsed !== undefined ? ` (${turnElapsed})` : ""}`;
 		return [
 			safeText(node.role),
+			// #209/D5: only when the arbitrated backend is known. A legacy or
+			// tree-only node has no value — omit the segment, never print `rpc`.
+			//
+			// Placed before `model` on purpose: the band is clipped by `fitLine`
+			// to the modal inner width (78 cols at the default 24x80), and a real
+			// model id (e.g. `workbuddy/deepseek-v4.1-flash`) used to push the
+			// trailing segment into `spawn inpr...`. role + spawn survive now.
+			...(node.spawnMode ? [`spawn ${node.spawnMode}`] : []),
 			...(node.model ? [safeText(node.model)] : []),
 			turnLabel,
 			elapsed,

@@ -312,6 +312,8 @@ function liveNode(
 		...(node.turns === undefined ? {} : { turns: node.turns }),
 		sessionFile: node.sessionFile,
 		worktreePath: node.worktreePath,
+		// #209/D5: absent for legacy nodes; the footer omits the segment entirely.
+		...(node.spawnMode === undefined ? {} : { spawnMode: node.spawnMode }),
 	};
 }
 

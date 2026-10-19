@@ -197,7 +197,7 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 		input.sessionFile ? `Session file: ${input.sessionFile}` : undefined,
 		input.recycled === false
 			? undefined
-			: "RPC child retired. Resume from the session file if you need this child again.",
+			: "Child retired. Resume from the session file if you need this child again.",
 	]
 		.filter((line) => line !== undefined)
 		.join("\n");
@@ -234,7 +234,7 @@ export function collectFailureInput(
 	// Live children never reach here: watch() re-arms a connection blip.
 	// A dead child's notice names that, instead of a bare "Connection error."
 	const reason = isTransientConnectionFailure(raw)
-		? `${raw} (RPC child is not alive)`
+		? `${raw} (child is not alive)`
 		: raw;
 	return {
 		name,
@@ -275,8 +275,8 @@ export interface GroupedCompletionInput {
  *   Still running: slow-2 (notifies separately when it finishes)
  *
  * Retirement is per-entry (a wait()-released sibling can race the flush, so a
- * blanket footer could be inaccurate): entries whose RPC child is retired
- * carry an inline "(RPC child retired)" marker.
+ * blanket footer could be inaccurate): entries whose child is retired
+ * carry an inline "(child retired)" marker.
  * Aggregate status: any failed → "failed"; else any stopped → "stopped";
  * else "completed". `display` follows the single-notice rule.
  */
@@ -311,8 +311,8 @@ export function formatGroupedNotice(
 			? ` — acceptance: ${entry.acceptance.status}${entry.acceptance.level ? ` (${entry.acceptance.level})` : ""}`
 			: "";
 		// Retirement is per-entry truth: a wait()-consumed sibling may already
-		// be released while another RPC child is still alive, so no blanket footer.
-		const recycled = entry.recycled === false ? "" : " (RPC child retired)";
+		// be released while another child is still alive, so no blanket footer.
+		const recycled = entry.recycled === false ? "" : " (child retired)";
 		lines.push(`- ${label}: ${entry.status}${reason}${acceptance}${recycled}`);
 		// Prefer the durable full-text artifact over the session file as the
 		// recovery pointer: one `read` beats re-deriving from jsonl/chat store.
