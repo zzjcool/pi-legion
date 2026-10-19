@@ -341,42 +341,20 @@ test("settings: defaultOnBlocked validates and merges", () => {
 	assert.equal(merged.defaultOnBlocked, "forward");
 });
 
-test("settings: validates herdr numeric fields", () => {
-	assert.throws(() =>
-		parseSubagentSettings(
-			{ subagents: { herdr: { maxConcurrentAgents: 0 } } },
-			"/s.json",
-		),
-	);
-	assert.throws(() =>
-		parseSubagentSettings(
-			{ subagents: { herdr: { startRetries: -1 } } },
-			"/s.json",
-		),
-	);
-	assert.deepEqual(
-		parseSubagentSettings(
-			{ subagents: { herdr: { maxConcurrentAgents: 3 } } },
-			"/s.json",
-		),
-		{
-			herdr: { maxConcurrentAgents: 3 },
-		},
-	);
-});
-
-test("settings: retains and warns for legacy defaultPlacement during migration", () => {
+test("settings: a residual subagents.herdr block is silently dropped by the whitelist", () => {
+	// v4 deleted the herdr settings surface, so the parser and its deprecation
+	// warning are gone. An existing settings file must keep loading, with the
+	// key ignored exactly like any other unknown key (contract D5).
 	const original = console.warn;
 	const warnings: string[] = [];
 	try {
 		console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
 		const settings = parseSubagentSettings(
-			{ subagents: { herdr: { defaultPlacement: "new-tab" } } },
+			{ subagents: { herdr: { defaultPlacement: "new-tab", maxConcurrentAgents: 3 } } },
 			"/legacy/settings.json",
 		);
-		assert.equal(settings.herdr?.defaultPlacement, "new-tab");
-		assert.equal(warnings.length, 1);
-		assert.match(warnings[0] ?? "", /deprecated and ignored/);
+		assert.equal("herdr" in settings, false, "the key must not survive parsing");
+		assert.equal(warnings.length, 0, "no deprecation warning remains");
 	} finally {
 		console.warn = original;
 	}
@@ -384,15 +362,10 @@ test("settings: retains and warns for legacy defaultPlacement during migration",
 
 test("settings: project settings win over user settings", () => {
 	const merged = resolveSubagentSettings(
-		{
-			defaultModel: "user",
-			herdr: { maxConcurrentAgents: 2, startRetries: 5 },
-		},
-		{ defaultModel: "project", herdr: { maxConcurrentAgents: 9 } },
+		{ defaultModel: "user" },
+		{ defaultModel: "project" },
 	);
 	assert.equal(merged.defaultModel, "project");
-	assert.equal(merged.herdr?.maxConcurrentAgents, 9);
-	assert.equal(merged.herdr?.startRetries, 5); // preserved from user
 });
 
 test("settings: agentOverrides shallow-merge across scopes", () => {

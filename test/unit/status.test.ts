@@ -192,7 +192,7 @@ test("formatWidgetLines keeps the compact roster when no extra fields are set", 
 		"  ⎿  working",
 	]);
 	const lines = formatWidgetLines(entries, 5_000);
-	assert.equal(lines[0], "● Async agents · herdr");
+	assert.equal(lines[0], "● Async agents");
 	assert.equal(lines[1], "├─ ● worker-0 (worker) · 4s");
 	assert.equal(lines[2], "│    ⎿  working");
 	assert.equal(lines[3], "└─ ● reviewer-1 (reviewer) · 3s");

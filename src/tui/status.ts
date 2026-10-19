@@ -552,7 +552,7 @@ function formatWidgetRows(entries: StatusEntry[], now: number, totals?: StatusTo
 		return formatEntryLines(entries[0]!, now, { head: "", detail: "" })
 			.map((text) => ({ text }));
 	}
-	const rows: WidgetRow[] = [{ text: "● Async agents · herdr" }];
+	const rows: WidgetRow[] = [{ text: "● Async agents" }];
 	for (const [index, entry] of entries.entries()) {
 		const last = index === entries.length - 1;
 		rows.push(

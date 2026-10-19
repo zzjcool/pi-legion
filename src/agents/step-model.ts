@@ -9,18 +9,14 @@
  *   1. A referenced preset's kind/model/thinking reach the child, and its
  *      model beats `agentOverrides` (which `loadCatalog` folds into
  *      `agent.model` before anything here runs).
- *   2. `kind` and the FINAL model are coherent, or the launch is refused
- *      loudly instead of dropping the model at start (`nativeModelFor`).
  *
- * Invariant 2 is checked on the resolved model, NOT on the preset's own
- * `model`: the launched model can come from a level above or below the preset
- * (a per-run tool `model`, `defaultModel`, the dispatch model, an override),
- * so validating the preset's own pair would let an incoherent pair ship.
+ * v4 runs `kind: pi` only, so there is no second invariant to police here:
+ * the resolved model always belongs to the one supported kind.
  */
 
 import type { AgentConfig, ModelOrigin, PresetConfig } from "../shared/types.ts";
 import { providerOf, resolveModel, type ResolvedModel } from "./model-resolution.ts";
-import { assertKindModelCoherent, expandPreset } from "./presets.ts";
+import { expandPreset } from "./presets.ts";
 
 export interface StepModelInput {
 	/** The catalog agent, with `agentOverrides` already folded in. */
@@ -59,9 +55,8 @@ export interface StepModelResult {
 /**
  * Resolve the model (and the effective agent) a step will launch with.
  *
- * Throws when a referenced preset is undefined, or when the resolved
- * kind/model pair would be silently dropped at start. Callers are expected to
- * turn those into a refusal line rather than letting them escape.
+ * Throws when a referenced preset is undefined. Callers are expected to turn
+ * that into a refusal line rather than letting it escape.
  */
 export function resolveStepModel(input: StepModelInput): StepModelResult {
 	const override = input.step.model ?? input.params.model;
@@ -88,18 +83,8 @@ export function resolveStepModel(input: StepModelInput): StepModelResult {
 		settings: input.settings as Parameters<typeof resolveModel>[0]["settings"],
 	});
 
-	// Only a preset can make the kind disagree with the launched model in a way
-	// this module is responsible for. An agent that merely sets `kind` keeps its
-	// pre-existing behaviour (that is an older, separate concern).
-	if (expanded) {
-		const origin = classifyModelOrigin(resolved, override);
-		assertKindModelCoherent(
-			effective.kind,
-			resolved.model,
-			expanded.presetName,
-			origin.label,
-		);
-	}
+	// Only a preset can change the kind, and v4 accepts `pi` alone, so nothing
+	// here can leave the kind and the launched model incoherent.
 
 	return {
 		resolved,

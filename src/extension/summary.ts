@@ -617,7 +617,7 @@ export function formatSubagentDetail(input: SummaryDetailInput): string {
 	if (child.thinking !== undefined) stateBits.push(`thinking: ${child.thinking}`);
 	const lines = [title, `  ${stateBits.join(" · ")}`];
 
-	const runBits = [`run: ${run.runId}`, `supervisor: ${run.herdr.supervisor ?? "legacy"}`];
+	const runBits = [`run: ${run.runId}`, `supervisor: ${run.herdr.supervisor ?? "unknown"}`];
 	lines.push(`  ${runBits.join(" · ")}`);
 
 	const startedAtMs = parseTimestamp(child.spawnedAt);
