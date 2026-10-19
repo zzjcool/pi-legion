@@ -132,7 +132,12 @@ export type { BudgetRefusedEvent, CollectResult, OrchestratorDeps } from "./runs
 export { RpcSupervisor } from "./supervisor/rpc-supervisor.ts";
 export { InProcessSupervisor } from "./supervisor/inprocess-supervisor.ts";
 export { RoutingSupervisor } from "./supervisor/routing-supervisor.ts";
-export { resolveSpawnMode, DEFAULT_SPAWN_MODE, DEFAULT_INPROCESS_MAX_ACTIVE } from "./supervisor/spawn-mode.ts";
+export {
+	resolveSpawnMode,
+	DEFAULT_SPAWN_MODE,
+	DEFAULT_INPROCESS_MAX_ACTIVE,
+	DEFAULT_INPROCESS_SPAWN_START_TIMEOUT_MS,
+} from "./supervisor/spawn-mode.ts";
 export { InMemoryUIProxy, isExtensionUIRequest } from "./supervisor/ui-proxy.ts";
 export { runInChildContext, currentChildContext } from "./supervisor/child-context.ts";
 export type { ChildLaunchContext } from "./supervisor/child-context.ts";

@@ -8,7 +8,9 @@
  * Does NOT use RpcClient. Process-tree / SIG retire is skipped.
  */
 
+import { statSync } from "node:fs";
 import { formatChildTask } from "../extension/child-guard.ts";
+import { parseSessionFile } from "../shared/session.ts";
 import {
 	applyThinkingSuffix,
 	childInheritsExtensions,
@@ -22,7 +24,9 @@ import {
 	DEFAULT_LEGION_SETTINGS,
 } from "../shared/types.ts";
 import {
+	POLL_INTERVAL_MS,
 	DEFAULT_INPROCESS_MAX_ACTIVE,
+	DEFAULT_INPROCESS_SPAWN_START_TIMEOUT_MS,
 } from "./spawn-mode.ts";
 import {
 	type ChildLaunchContext,
@@ -199,7 +203,25 @@ export interface InProcessSupervisorOptions {
 	limits?: InProcessLimits;
 	/** Resolve limits dynamically (settings reload). Wins over static `limits`. */
 	getLimits?: () => InProcessLimits | undefined;
+	/**
+	 * Diagnostics for a child the supervisor could not use. Two cases:
+	 *  - a spawn refused before any session existed (budget / limits), and
+	 *  - since #227, a child whose **first turn failed at runtime** (the prompt
+	 *    was rejected after `spawnChild` already returned its handle).
+	 */
 	onSpawnRefused?: (message: string) => void;
+	/**
+	 * Called at most once per spawn when the child had still not accepted its
+	 * first prompt when `spawnStartTimeoutMs` elapsed (#227 D1). Not an error:
+	 * the handle was returned anyway.
+	 */
+	onSpawnDelayed?: (message: string) => void;
+	/**
+	 * How long to wait for first-prompt acceptance before returning anyway.
+	 * Defaults to `DEFAULT_INPROCESS_SPAWN_START_TIMEOUT_MS`; tests inject a
+	 * short value instead of waiting 15s.
+	 */
+	spawnStartTimeoutMs?: number;
 }
 
 interface EventSubscription {
@@ -232,6 +254,12 @@ interface ChildRecord {
 	abortedPending: boolean;
 	spawnDepth: number;
 	parentKey: string;
+	/**
+	 * Failure surfaced by an `error` event during the current turn (#227 D3).
+	 * Cleared when the next turn starts and consumed by the next `agent_settled`,
+	 * which is the only place it becomes visible (as `SettleResult.reason`).
+	 */
+	pendingFailure?: string;
 	/** Identity reused by every later dispatch into this child (tools inherit it). */
 	context: ChildLaunchContext;
 }
@@ -292,6 +320,20 @@ function recordOf(value: unknown): Record<string, unknown> | null {
 	return typeof value === "object" && value !== null && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: null;
+}
+
+/** Human-readable text for a rejected prompt / emitted `error` payload. */
+function failureMessage(error: unknown): string {
+	if (error instanceof Error) return error.message;
+	const record = recordOf(error);
+	if (record) {
+		// SDK `error` events carry the failing assistant message under `error`
+		// (or a bare `message`), and that message holds the provider text.
+		const nested = recordOf(record.error) ?? recordOf(record.message);
+		const text = nested?.errorMessage ?? record.message ?? record.error;
+		if (typeof text === "string" && text.trim() !== "") return text;
+	}
+	return String(error);
 }
 
 /**
@@ -526,6 +568,8 @@ export class InProcessSupervisor implements LegionSupervisor {
 	private readonly sessionFactory: InProcessSessionFactory;
 	private readonly getLimits: () => InProcessLimits | undefined;
 	private readonly onSpawnRefused?: (message: string) => void;
+	private readonly onSpawnDelayed?: (message: string) => void;
+	private readonly spawnStartTimeoutMs: number;
 	readonly uiProxy: UIProxy;
 	private spawnCount = 0;
 
@@ -535,6 +579,9 @@ export class InProcessSupervisor implements LegionSupervisor {
 		this.getLimits = options.getLimits
 			?? (() => options.limits);
 		this.onSpawnRefused = options.onSpawnRefused;
+		this.onSpawnDelayed = options.onSpawnDelayed;
+		this.spawnStartTimeoutMs =
+			options.spawnStartTimeoutMs ?? DEFAULT_INPROCESS_SPAWN_START_TIMEOUT_MS;
 	}
 
 	/**
@@ -623,6 +670,11 @@ export class InProcessSupervisor implements LegionSupervisor {
 				// inside it, so every tool the child executes during that turn
 				// inherits the child's context instead of seeing the root's.
 				runInChildContext(registration.context, async () => {
+					// #227 D1: the acceptance baseline is the transcript size at the
+					// moment *this spawn* starts (a missing file counts as 0), so a
+					// line the factory or a previous turn already wrote cannot pass
+					// for this child having accepted the prompt.
+					const baselineSize = this.sessionFileSize(registration.sessionFile);
 					const session = await this.sessionFactory({
 						name: input.name,
 						cwd: input.cwd,
@@ -645,21 +697,31 @@ export class InProcessSupervisor implements LegionSupervisor {
 					);
 					registration.state = "idle";
 					this.spawnCount += 1;
+					// `beginTurn` must precede the prompt (R2): the turn's events are
+					// already streaming by the time this frame yields.
 					this.beginTurn(registration);
-					await session.prompt(
-						formatChildTask(input.task, {
-							allowNested: input.allowNestedSubagents === true,
-							...(input.worktreeBranch
-								? { worktreeBranch: input.worktreeBranch }
-								: {}),
-						}),
+					// #227 D1/D2: start the first turn and hand it to a background
+					// drain instead of awaiting the whole agent run here. The drain is
+					// created *inside* this ALS scope on purpose, so every later
+					// continuation (and any tool promise it settles) still runs at the
+					// child's identity and nesting depth (R1).
+					const promptSettled = this.drainFirstTurn(
+						registration,
+						session.prompt(
+							formatChildTask(input.task, {
+								allowNested: input.allowNestedSubagents === true,
+								...(input.worktreeBranch
+									? { worktreeBranch: input.worktreeBranch }
+									: {}),
+							}),
+						),
 					);
-					if (!this.isAlive(input.name)) {
-						throw new SubagentError(
-							`in-process session ended after its first prompt: ${input.name}`,
-							ErrorCodes.START_FAILED,
-						);
-					}
+					// Return once the child has *accepted* the turn, not when it ends.
+					await this.awaitFirstTurnAccepted(
+						registration,
+						baselineSize,
+						promptSettled,
+					);
 					return {
 						name: registration.name,
 						sessionFile: registration.sessionFile,
@@ -673,6 +735,126 @@ export class InProcessSupervisor implements LegionSupervisor {
 			}
 			throw error;
 		}
+	}
+
+	/** Bytes in the child transcript so far; a missing file counts as 0 (#227 D1). */
+	private sessionFileSize(sessionFile: string): number {
+		try {
+			return statSync(sessionFile).size;
+		} catch {
+			return 0;
+		}
+	}
+
+	/**
+	 * Has this child accepted the prompt? True once its transcript holds a user
+	 * turn *and* has grown past the pre-spawn baseline (`F7`: the SDK appends the
+	 * user message before running the agent).
+	 *
+	 * Contract F7 forbids using `isLastTurnComplete` here: while the prompt is
+	 * merely accepted the last turn legitimately has a user message and no
+	 * assistant yet, so that predicate would contradict itself.
+	 */
+	private firstTurnAccepted(child: ChildRecord, baselineSize: number): boolean {
+		if (this.sessionFileSize(child.sessionFile) <= baselineSize) return false;
+		return parseSessionFile(child.sessionFile).turns.length > 0;
+	}
+
+	/**
+	 * Resolve when the child has accepted the first prompt, when the prompt has
+	 * already settled (it then certainly was accepted — a fast turn is done and
+	 * waiting for the bound would only add latency), or when the start bound
+	 * elapses (#227 D1). The bound is never an error: the caller returns its
+	 * handle either way and is told once through `onSpawnDelayed`.
+	 */
+	private awaitFirstTurnAccepted(
+		child: ChildRecord,
+		baselineSize: number,
+		promptSettled: Promise<void>,
+	): Promise<void> {
+		const deadline = Date.now() + this.spawnStartTimeoutMs;
+		return new Promise((resolve) => {
+			let timer: NodeJS.Timeout | undefined;
+			let done = false;
+			const finish = (delayed: boolean): void => {
+				if (done) return;
+				done = true;
+				if (timer) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				if (delayed) {
+					this.onSpawnDelayed?.(
+						`in-process child '${child.name}' did not accept its first prompt within ` +
+							`${this.spawnStartTimeoutMs}ms; returning the handle anyway (its first turn ` +
+							"keeps running in the background)",
+					);
+				}
+				resolve();
+			};
+			const tick = (): void => {
+				if (done) return;
+				if (this.firstTurnAccepted(child, baselineSize)) return finish(false);
+				const remaining = deadline - Date.now();
+				if (remaining <= 0) return finish(true);
+				// Reuse the shared poll cadence, but never oversleep the bound.
+				timer = setTimeout(tick, Math.min(POLL_INTERVAL_MS, remaining));
+			};
+			// Both handlers are supplied: `drainFirstTurn` resolves rather than
+			// rejects, but a throwing diagnostic callback must not turn this into an
+			// unhandled rejection on a promise nobody awaits.
+			void promptSettled.then(
+				() => finish(false),
+				() => finish(false),
+			);
+			tick();
+		});
+	}
+
+	/**
+	 * Detach the first turn's completion from `spawnChild` (#227 D2).
+	 *
+	 * Resolves (never rejects) once the prompt settles, so both callers can
+	 * await it without risking an unhandled rejection.
+	 */
+	private drainFirstTurn(
+		child: ChildRecord,
+		prompt: Promise<unknown>,
+	): Promise<void> {
+		return prompt.then(
+			() => {
+				// Normal completion. `agent_settled` already carried the turn state
+				// (the SDK emits it in the run's `finally`, before this resolves), so
+				// only a child that died mid-turn needs reconciling here.
+				if (!this.isAlive(child.name) && child.turnActive) {
+					child.turnActive = false;
+				}
+			},
+			(error: unknown) => {
+				const message = failureMessage(error);
+				// Never `rollbackSpawn` here: the handle was already handed to the
+				// caller, and rollback would `children.delete` it out from under it.
+				child.turnActive = false;
+				if (child.state !== "retiring") child.state = "idle";
+				const result: SettleResult = {
+					settled: false,
+					abnormal: false,
+					reason: `child turn failed: ${message}`,
+				};
+				child.lastTurnResult = result;
+				this.resolveWaiters(child, result);
+				// #227 D2: the callback's semantics now also cover a child failing at
+				// runtime, not just a refused spawn.
+				this.onSpawnRefused?.(message);
+				// ...and leave a machine-readable trace for D3's settle mapping, so
+				// the failure survives a later `agent_settled` rather than only
+				// living in the transient `lastTurnResult`.
+				this.handleSessionEvent(child, {
+					type: "error",
+					message: `child turn failed: ${message}`,
+				});
+			},
+		);
 	}
 
 	async prompt(name: string, text: string): Promise<void> {
@@ -943,8 +1125,11 @@ export class InProcessSupervisor implements LegionSupervisor {
 	}
 
 	private beginTurn(child: ChildRecord): void {
+		// "clear first, set later" (R2): a stale result from a previous turn must
+		// never satisfy the `waitSettled` fast path for the new one.
 		child.lastTurnResult = undefined;
 		child.exitResult = undefined;
+		child.pendingFailure = undefined;
 		child.turnActive = true;
 		child.state = "running";
 	}
@@ -1010,12 +1195,28 @@ export class InProcessSupervisor implements LegionSupervisor {
 			child.abortedPending = this.eventContainsAbort(event, child.abortedPending);
 			return;
 		}
+		if (event.type === "error") {
+			// #227 D3: `error` used to fall through to the bottom `return` and be
+			// dropped entirely (F8), so a failed child looked identical to a clean
+			// one once `agent_settled` landed. Remember it and let the settle below
+			// turn it into a visible fact. Deliberately NOT read from ALS: an
+			// `error` can arrive on the drain chain, outside this child's scope.
+			child.pendingFailure = failureMessage(event);
+			return;
+		}
 		if (event.type !== "agent_settled") return;
 		const result: SettleResult = {
 			settled: true,
 			abnormal: false,
 			aborted: child.abortedPending,
 		};
+		// Only surface `reason` when there is a recorded failure: adding it
+		// unconditionally would change the shape every clean settle returns, and
+		// `aborted` stays the sole stop-reason signal (no invented stopReason).
+		if (!result.aborted && child.pendingFailure) {
+			result.reason = child.pendingFailure;
+		}
+		child.pendingFailure = undefined;
 		child.abortedPending = false;
 		child.turnActive = false;
 		child.lastTurnResult = result;
