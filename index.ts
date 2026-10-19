@@ -740,9 +740,10 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					},
 					onUtilityChild: (retire) => pendingUtilityRetires.push(retire),
 				});
-				if (signal?.aborted) {
-					return ok("interrupted (parent turn ended; children still running)");
-				}
+				// `launchUtilityFamily` already folds the abort into its own return
+				// (head line + collected segments + `interrupted` details, #227 D4).
+				// Returning `result` unconditionally is what keeps that work visible;
+				// re-checking `signal.aborted` here would throw it away again.
 				return result;
 			},
 		});
@@ -2413,7 +2414,13 @@ async function launchUtilityFamily(input: {
 			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
-	if (input.signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
+	if (input.signal?.aborted) return interruptedUtilityResult({
+		runId,
+		handles,
+		stillRunning,
+		results,
+		collected,
+	});
 	results.push(...collected);
 	return {
 		content: [{ type: "text", text: results.join("\n\n") || "No utility agents were launched." }],
@@ -2424,6 +2431,41 @@ async function launchUtilityFamily(input: {
 			...(stillRunning.size > 0
 				? { stillRunning: handles.filter(({ name }) => stillRunning.has(name)).map(({ name }) => name) }
 				: {}),
+		},
+	};
+}
+
+/**
+ * Build the interrupted vexillatio result from what the collect loop already produced.
+ *
+ * `#227 D4`: an abort must not throw away work that already finished. The frozen
+ * head line stays first and verbatim (`test/unit/teams.test.ts` matches it with a
+ * regex), the collected segments are appended below it, and `details` carries the
+ * same machine facts a non-interrupted return publishes plus `interrupted: true`.
+ *
+ * With no handles (every launch failed) the text degrades to the head line plus
+ * the failure lines only — no empty segment.
+ */
+function interruptedUtilityResult(input: {
+	runId: string;
+	handles: Array<{ name: string; agent: string; sessionFile: string }>;
+	stillRunning: Set<string>;
+	results: string[];
+	collected: string[];
+}): AgentToolResult<unknown> {
+	const head = "interrupted (parent turn ended; children still running)";
+	const segments = [...input.results, ...input.collected].filter((segment) => segment.length > 0);
+	const stillRunning = input.handles
+		.filter(({ name }) => input.stillRunning.has(name))
+		.map(({ name }) => name);
+	return {
+		content: [{ type: "text", text: segments.length > 0 ? `${head}\n\n${segments.join("\n\n")}` : head }],
+		details: {
+			runId: input.runId,
+			handles: input.handles.map(({ name, agent, sessionFile }) => ({ name, agent, sessionFile })),
+			async: false,
+			interrupted: true,
+			...(stillRunning.length > 0 ? { stillRunning } : {}),
 		},
 	};
 }
@@ -3203,8 +3245,19 @@ function renderCollect(
 	return lines.join("\n");
 }
 
-function ok(text: string): AgentToolResult<unknown> {
-	return { content: [{ type: "text", text }], details: {} };
+/**
+ * Render a success/neutral result to the model.
+ *
+ * `details` defaults to `{}`; callers that already computed machine facts
+ * (runId/handles for an interrupted collect) pass them through instead of
+ * discarding them (#227 D4). `isError` is deliberately never set — the
+ * rendering chain and every assertion in this repo work without it.
+ */
+function ok(
+	text: string,
+	details: Record<string, unknown> = {},
+): AgentToolResult<unknown> {
+	return { content: [{ type: "text", text }], details };
 }
 
 /**

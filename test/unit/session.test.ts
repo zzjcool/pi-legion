@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+	ABORT_WITHOUT_REASON,
 	attributeParentSessionShutdown,
 	deriveOutcome,
 	NO_ASSISTANT_ABORT_REASON,
@@ -364,3 +365,40 @@ test("resolveSessionMaxLineBytes: floored value below 1 falls back (#174)", () =
 	assert.equal(resolveSessionMaxLineBytes({ PI_LEGION_SESSION_MAX_LINE_BYTES: "abc" }), DEFAULT_SESSION_MAX_LINE_BYTES);
 });
 
+
+// ── #227 D3b: a reason-less abort must be readable as the parent's abort ─────
+
+test("stopReason error + bare abort message → aborted with ABORT_WITHOUT_REASON (#227 D3b)", () => {
+	// Upstream writes a reason-less AbortController cancellation as
+	// `stopReason:"error"` + the engine's bare message. Before D3b that was
+	// indistinguishable from a real provider failure; only the reason changes,
+	// the status stays `aborted` (the assertion above at "F29" is unchanged).
+	for (const message of [
+		"This operation was aborted",
+		"The operation was aborted",
+		"operation aborted",
+	]) {
+		const outcome = deriveOutcome(parseLines(userMsg("do it"), assistantMsg({ stopReason: "error", errorMessage: message })));
+		assert.equal(outcome.status, "aborted", `${message} stays aborted`);
+		assert.equal(outcome.reason, ABORT_WITHOUT_REASON, `${message} names the reason-less abort`);
+		assert.equal(outcome.errorMessage, message, "the original engine message stays observable");
+	}
+});
+
+test("an aborted message that carries a reason is not rewritten (#227 D3b)", () => {
+	// The new branch is anchored to the whole message and must not swallow a
+	// timeout (or any longer, meaningful) abort: those keep their own text.
+	const timeout = deriveOutcome(parseLines(
+		userMsg("do it"),
+		assistantMsg({ stopReason: "error", errorMessage: "The operation was aborted due to timeout" }),
+	));
+	assert.equal(timeout.status, "aborted");
+	assert.notEqual(timeout.reason, ABORT_WITHOUT_REASON, "a timeout is not a reason-less parent abort");
+	assert.equal(timeout.reason, "The operation was aborted due to timeout");
+
+	const longer = deriveOutcome(parseLines(
+		userMsg("do it"),
+		assistantMsg({ stopReason: "error", errorMessage: "This operation was aborted by the provider" }),
+	));
+	assert.notEqual(longer.reason, ABORT_WITHOUT_REASON, "a longer message keeps its own text");
+});

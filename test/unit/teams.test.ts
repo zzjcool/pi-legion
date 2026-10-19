@@ -1541,3 +1541,126 @@ test("T8: index — a completion during the parent run is delivered on agent_set
 		await harness.cleanup();
 	}
 });
+
+test("vexillatio interrupt returns the results it already collected (#227 D4)", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "scout.md": UTILITY_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.startTurn();
+		// Two utilities: the first finishes normally, the second is still in-turn
+		// when the parent aborts — the exact shape issue #227 lost results from.
+		// No waitSettled stub is needed: FakeSupervisor parks an unsettled wait on
+		// `child.waiters`, so the real settle resolves the first collect and the
+		// abort signal resolves the second (see the harness `:1254` case).
+		const controller = new AbortController();
+		const pending = harness.utilityTool.execute(
+			"vexillatio-interrupt",
+			{
+				task: "two parallel utility recon tasks",
+				tasks: [
+					{ agent: "scout", task: "finish before the interrupt", cwd: harness.cwd },
+					{ agent: "scout", task: "stay in-turn until the interrupt", cwd: harness.cwd },
+				],
+				cwd: harness.cwd,
+				timeoutMs: 600_000,
+			},
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		// Settle the first utility so its collect has a real result to keep.
+		let first: string | undefined;
+		for (let attempt = 0; attempt < 200; attempt++) {
+			first = harness.supervisor.spawns[0]?.input.name;
+			if (first) break;
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		if (!first) throw new Error("the first utility child did not spawn");
+		harness.supervisor.settle(first, { text: '{"ok":true,"reason":"first utility finished"}' });
+		// Retiring the finished utility is what proves its collect returned.
+		const retireDeadline = Date.now() + 8_000;
+		while (!harness.supervisor.calls.some((call) => call.method === "retire" && call.name === first)) {
+			if (Date.now() > retireDeadline) throw new Error("the completed utility was never collected and retired");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		const second = harness.supervisor.spawns[1]?.input.name;
+		if (!second) throw new Error("the second utility child did not spawn");
+		assert.equal(harness.supervisor.isAlive(second), true, "the second utility is still in-turn");
+
+		controller.abort();
+		const settled = await Promise.race([
+			pending,
+			new Promise<undefined>((resolve) => { setTimeout(() => resolve(undefined), 5_000); }),
+		]);
+		assert.ok(settled, "an interrupted vexillatio still returns instead of hanging");
+		const text = (settled.content ?? []).map((item) => item.text ?? "").join("\n");
+		// The frozen head line stays first and verbatim (esc-no-retire-v3 §22).
+		assert.match(text, /interrupted \(parent turn ended; children still running\)/);
+		// ...and the already-collected work is still in the result body.
+		assert.match(text, /── scout-0 ──/, "the completed child's segment survives the interrupt");
+		assert.match(text, /── scout-1 ──/, "the interrupted child's segment is rendered too");
+		assert.match(text, /execution: /, "each segment keeps its execution line");
+		assert.match(text, /first utility finished/, "the completed child's body survives the interrupt");
+		assert.match(text, /execution: running \(aborted by parent\)/, "an interrupted collect is still reported as running, never as success");
+		const details = (settled as { details?: unknown }).details as
+			| { runId?: string; handles?: Array<{ name: string; agent: string; sessionFile: string }>; async?: boolean; interrupted?: boolean; stillRunning?: string[] }
+			| undefined;
+		assert.equal(details?.interrupted, true, "details mark the interruption");
+		assert.equal(details?.async, false);
+		assert.equal(details?.handles?.length, 2, "details keep one handle per launched utility");
+		assert.ok(details?.runId, "details carry the parent run id");
+		assert.deepEqual(details?.stillRunning, [second], "the still-running utility is named, the retired one is not");
+		assert.equal(harness.supervisor.isAlive(second), true, "an interrupt must not retire the child that is still running");
+		assert.equal(
+			harness.supervisor.calls.filter((call) => call.method === "retire" && call.name === second).length,
+			0,
+			"the abort path never cascades a retire",
+		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("vexillatio interrupt keeps launch-failure lines and emits no empty segment (#227 D4)", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "scout.md": UTILITY_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.startTurn();
+		const controller = new AbortController();
+		// Every launch fails and the parent aborts in the same breath: the result
+		// must stay the head line plus the `✗ <agent>: <error>` lines — no blank
+		// segment where the collected results would have gone.
+		harness.supervisor.spawnChild = async () => {
+			controller.abort();
+			throw new Error("spawn refused for the interrupt test");
+		};
+		const result = await harness.utilityTool.execute(
+			"vexillatio-interrupt-no-handles",
+			{ agent: "scout", task: "never launches", cwd: harness.cwd, timeoutMs: 600_000 },
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		const text = (result.content ?? []).map((item) => item.text ?? "").join("\n");
+		const head = "interrupted (parent turn ended; children still running)";
+		assert.ok(text.startsWith(head), "the frozen head line still leads the result");
+		assert.match(text, /✗ scout: spawn refused for the interrupt test/, "a launch failure is never dropped by the interrupt");
+		assert.doesNotMatch(text, /\n\n\n/, "no empty segment is inserted between the head line and the failure");
+		assert.equal(text, `${head}\n\n✗ scout: spawn refused for the interrupt test`);
+		const details = (result as { details?: unknown }).details as
+			| { runId?: string; handles?: unknown[]; interrupted?: boolean; stillRunning?: string[] }
+			| undefined;
+		assert.equal(details?.interrupted, true);
+		assert.deepEqual(details?.handles, []);
+		assert.equal(details?.stillRunning, undefined, "nothing survives to report as still running");
+		assert.ok(details?.runId, "the run id is reported even when every launch failed");
+	} finally {
+		await harness.cleanup();
+	}
+});

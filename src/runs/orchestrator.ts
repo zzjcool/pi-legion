@@ -1002,9 +1002,18 @@ export class Orchestrator {
 		}
 		if (opts.signal?.aborted) return abortedSnapshot();
 		parsed = parseSessionFile(child.sessionFile);
+		// #227 D5: a child whose process is gone cannot produce another message.
+		// When its last turn already ended with a terminal assistant message there
+		// is nothing left to wait for, and stamping the collect-deadline `running`
+		// snapshot on it would make watch() re-arm forever on a process that will
+		// never settle. Finish the completed turn instead.
+		if (wait === "timeout" && !this.supervisor.isAlive(name) && isLastTurnComplete(parsed)) {
+			return this.finishCollect(child, parsed, deriveOutcome(parsed), deadline);
+		}
 		let execution = deriveOutcome(parsed);
 		if (wait === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(parsed)) {
-			// `timeoutMs` is the budget from launch, not the length of this status check.
+			// `timeoutMs` is measured from THIS collect call, not from the launch;
+			// the constant's "cumulative since launch" wording is historical (D6).
 			execution = { ...execution, status: "running", reason: COLLECT_DEADLINE_REASON };
 		} else if (wait === "gone" && parsed.turns.length === 0) {
 			execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };

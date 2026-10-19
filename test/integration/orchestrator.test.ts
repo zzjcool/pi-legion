@@ -593,3 +593,51 @@ test("RPC child with a non-success stop reason is not reported as accepted", asy
 		h.cleanup();
 	}
 });
+
+// ── #227 D5: a dead child with a finished turn must not burn the deadline ────
+
+test("collect: a dead child whose last turn already finished returns the result, not COLLECT_DEADLINE_REASON (#227 D5)", async () => {
+	const h = harness({ immediateTimeout: false });
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "finish, then die", worktree: false });
+		// Drive the exact D5 precondition: the collect is already parked on the
+		// supervisor when the child writes its final message and then dies, so the
+		// wait resolves as `timeout` even though the process is gone and the turn
+		// is complete. (A real supervisor can produce that ordering by racing its
+		// wait timer against the exit.)
+		const supervisor = h.supervisor as unknown as {
+			waitSettled(name: string, timeoutMs?: number): Promise<{ settled: boolean; abnormal: boolean; reason?: string }>;
+		};
+		supervisor.waitSettled = async () => {
+			appendFileSync(handle.sessionFile, `${assistantMsg({ text: "completed before the process died" })}\n`);
+			h.supervisor.exit(handle.name);
+			return { settled: false, abnormal: false, reason: "timeout" };
+		};
+		const started = Date.now();
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 60_000 });
+		// A dead child cannot settle again: waiting out the deadline is pure spin.
+		assert.ok(Date.now() - started < 5_000, "a dead child must not be waited on until the collect deadline");
+		assert.notEqual(collected.execution.reason, COLLECT_DEADLINE_REASON, "a dead child is never reported as a live deadline hit");
+		assert.equal(collected.execution.status, "success", "the completed turn is the outcome");
+		assert.match(collected.output, /completed before the process died/);
+		assert.equal(h.supervisor.isAlive(handle.name), false);
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "awaiting", "a finished turn settles the lifecycle state");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("collect: a dead child mid-turn keeps its aborted outcome instead of a deadline (#227 D5)", async () => {
+	const h = harness({ immediateTimeout: true });
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "die mid-turn", worktree: false });
+		await h.supervisor.prompt(handle.name, "second prompt that never gets an answer");
+		h.supervisor.exit(handle.name);
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 2 });
+		assert.notEqual(collected.execution.reason, COLLECT_DEADLINE_REASON, "a dead child never reports the live deadline reason");
+		assert.equal(collected.execution.status, "aborted", "an unfinished turn on a dead child is an abort, not a live wait");
+		assert.equal(h.supervisor.isAlive(handle.name), false);
+	} finally {
+		h.cleanup();
+	}
+});

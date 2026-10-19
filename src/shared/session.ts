@@ -577,6 +577,25 @@ export const NO_ASSISTANT_ABORT_REASON = "no assistant message for the last prom
 export const PARENT_SESSION_SHUTDOWN_ABORT_REASON =
 	"parent session shutdown retired the child before it produced an assistant message";
 
+/**
+ * The parent turn ended and the abort signal carried no reason (#227 D3b).
+ *
+ * Upstream writes a reason-less `AbortController` cancellation as
+ * `stopReason:"error"` with a bare `"This operation was aborted"` message, which
+ * used to be indistinguishable from a real provider failure. The status stays
+ * `aborted`; only the reason becomes self-describing.
+ */
+export const ABORT_WITHOUT_REASON =
+	"parent turn ended (abort signal without a reason)";
+
+/**
+ * The exact messages `AbortSignal`/`AbortController` produce with no reason.
+ * Anchored to the whole message so a longer, meaningful error (a provider
+ * message that merely mentions aborting) does not get rewritten.
+ */
+const REASONLESS_ABORT_MESSAGE =
+	/^(this operation was aborted|the operation was aborted|operation aborted)$/i;
+
 /** True when the last turn (or the whole file) has no assistant message. */
 export function lastTurnHasNoAssistant(parsed: ParsedSession): boolean {
 	const last = parsed.turns.at(-1);
@@ -679,11 +698,20 @@ function outcomeFromFinalMessage(
 			// F29: a graceful interrupt surfaces as `error` with an abort-ish message.
 			const msg = final.errorMessage ?? "";
 			if (/abort/i.test(msg)) {
+				// #227 D3b: a reason-less AbortController cancellation reaches us as
+				// the bare engine message. Name it as the parent's abort instead of
+				// echoing text that reads like a provider failure. Anything carrying
+				// more (notably a `timeout`, or a longer provider sentence) keeps the
+				// original message — status is `aborted` either way.
+				const reason =
+					REASONLESS_ABORT_MESSAGE.test(msg.trim()) && !/timeout/i.test(msg)
+						? ABORT_WITHOUT_REASON
+						: msg;
 				return {
 					status: "aborted",
 					stopReason: "error",
 					errorMessage: msg,
-					reason: msg,
+					reason,
 					...base,
 				};
 			}
