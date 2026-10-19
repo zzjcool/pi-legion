@@ -1498,3 +1498,89 @@ test("inprocess: an error event becomes visible on settle without inventing a st
 		rmSync(root, { recursive: true, force: true });
 	}
 });
+
+// ── #227 D1a: a prompt rejected BEFORE acceptance must fail the spawn ──────
+//
+// Regression this guards: making `spawnChild` non-blocking swallowed the
+// pre-acceptance reject. `Orchestrator.launch` only downgrades to the next
+// `fallbackModels` entry when `spawnChild` *throws* `SubagentError`
+// (`canFallbackStart`, orchestrator.ts:235-240). Returning a handle instead
+// silently disabled the fallback chain for a child that fails instantly —
+// the real trigger is no model / no API key / mid-compaction, where the SDK
+// throws before `appendMessage`, so no user line ever reaches the transcript
+// (agent-session.js:1568-1581).
+
+test("inprocess: a first prompt rejected before acceptance fails the spawn (D1a)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d1a-"));
+	// Exactly the failing shape: the prompt throws immediately and — like the
+	// SDK on a missing key — never writes a user line for this turn.
+	class NoKeySession extends FakeSession {
+		override async prompt(): Promise<void> {
+			throw new Error("No API key found for provider 'any-endpoint'.");
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		spawnStartTimeoutMs: 5_000,
+		sessionFactory: async () => new NoKeySession(),
+	});
+	try {
+		await assert.rejects(
+			() => supervisor.spawnChild(testInput(root)),
+			(error: unknown) => {
+				// START_FAILED is what `canFallbackStart` requires to retry.
+				assert.equal((error as { code?: string }).code, ErrorCodes.START_FAILED);
+				// Provider text must survive for doctor + fallback diagnostics.
+				assert.match((error as Error).message, /No API key found for provider/);
+				return true;
+			},
+		);
+		// Fully rolled back: no ghost child holding a name or a budget slot.
+		const children = (supervisor as unknown as { children: Map<string, unknown> }).children;
+		assert.equal(children.has("root.worker"), false, "no ghost child after a failed spawn");
+		assert.equal(supervisor.isAlive("root.worker"), false);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: a prompt rejected AFTER acceptance still returns the handle (D1a counterpart)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d1a2-"));
+	// The other half of D1a: the turn really started (a user line landed), so the
+	// spawn succeeded and the later failure is a runtime failure (D2), not a
+	// spawn failure. This is the behaviour the pre-fix code applied to BOTH
+	// cases — it must survive the fix for the accepted case only.
+	class AcceptThenFail extends FakeSession {
+		private readonly file: string;
+		constructor(file: string) {
+			super();
+			this.file = file;
+		}
+		override prompt(text: string): Promise<void> {
+			this.prompts.push(text);
+			const manager = SessionManager.open(this.file, undefined, path.dirname(this.file));
+			manager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
+			this.emit({ type: "agent_start" });
+			return new Promise<void>((_resolve, reject) => {
+				setTimeout(() => reject(new Error("stream broke mid-turn")), 120);
+			});
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		spawnStartTimeoutMs: 50,
+		sessionFactory: async (input) => new AcceptThenFail(input.sessionFile),
+	});
+	try {
+		const handle = await supervisor.spawnChild(testInput(root));
+		assert.equal(handle.name, "root.worker");
+		// Committed to a handle because the turn was accepted before it failed.
+		const children = (supervisor as unknown as { children: Map<string, unknown> }).children;
+		assert.equal(children.has("root.worker"), true, "an accepted turn must not be rolled back");
+		await new Promise<void>((resolve) => setTimeout(resolve, 200));
+		const settled = await supervisor.waitSettled("root.worker", 1_000);
+		assert.match(settled.reason ?? "", /child turn failed/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});

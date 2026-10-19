@@ -139,6 +139,17 @@ appends the user message before it runs the agent) — with
 is still returned and `onSpawnDelayed` is called once. The turn itself keeps
 running on a background drain, inside the child's identity scope.
 
+The one exception is **rejection before acceptance** (#227 D1a): no model, no
+API key, or a compaction in progress makes the SDK throw before it appends the
+user message, so nothing ever lands in the transcript. In that case
+`spawnChild` still **throws** `SubagentError(..., START_FAILED)` and rolls the
+child back rather than returning a handle. That is deliberate: `Orchestrator`
+only retries the next `fallbackModels` entry when the spawn throws
+(`canFallbackStart`), so returning a handle there would silently disable the
+fallback chain. A turn that was accepted and *then* failed stays a runtime
+failure: the handle is returned, `SettleResult.reason` reads
+`child turn failed: …`, and `onSpawnRefused` reports it.
+
 So the *reason* the ledger needs a direct read has changed, but the read is
 still required. Two windows remain uncovered by `statusEntryFromJob`:
 
