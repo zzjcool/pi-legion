@@ -235,6 +235,29 @@ interface SettleWaiter {
 	cleanup?: () => void;
 }
 
+/**
+ * Shared hand-off between the first turn's drain and the acceptance gate
+ * (#227 D1a).
+ *
+ * The drain is the only place that learns *how* the prompt ended, while the gate
+ * is the only place that knows whether the turn had been accepted by then.
+ * `rejected` is set by the drain; `released` is set by the gate once
+ * `spawnChild` has committed to returning a handle for this child — after that
+ * point a failure is a runtime failure (D2), never a spawn failure.
+ */
+interface FirstTurnGate {
+	/** The prompt rejected. */
+	rejected?: { message: string };
+	/** `spawnChild` is returning a handle; the failure is no longer a spawn error. */
+	released: boolean;
+	/**
+	 * The D2 runtime-failure bookkeeping has run for `rejected`. Exactly-once:
+	 * a rejection can be recorded before the gate commits (so the drain defers)
+	 * and still need applying afterwards.
+	 */
+	applied?: boolean;
+}
+
 type ChildState = "starting" | "running" | "idle" | "retiring" | "exited" | "retired";
 
 interface ChildRecord {
@@ -705,6 +728,7 @@ export class InProcessSupervisor implements LegionSupervisor {
 					// created *inside* this ALS scope on purpose, so every later
 					// continuation (and any tool promise it settles) still runs at the
 					// child's identity and nesting depth (R1).
+					const gate: FirstTurnGate = { released: false };
 					const promptSettled = this.drainFirstTurn(
 						registration,
 						session.prompt(
@@ -715,12 +739,14 @@ export class InProcessSupervisor implements LegionSupervisor {
 									: {}),
 							}),
 						),
+						gate,
 					);
 					// Return once the child has *accepted* the turn, not when it ends.
 					await this.awaitFirstTurnAccepted(
 						registration,
 						baselineSize,
 						promptSettled,
+						gate,
 					);
 					return {
 						name: registration.name,
@@ -771,18 +797,28 @@ export class InProcessSupervisor implements LegionSupervisor {
 		child: ChildRecord,
 		baselineSize: number,
 		promptSettled: Promise<void>,
+		gate: FirstTurnGate,
 	): Promise<void> {
 		const deadline = Date.now() + this.spawnStartTimeoutMs;
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
 			let timer: NodeJS.Timeout | undefined;
 			let done = false;
+			/**
+			 * Commit to returning a handle for this child. From here on the drain
+			 * treats a later failure as a runtime failure (D2), not a spawn error.
+			 */
 			const finish = (delayed: boolean): void => {
 				if (done) return;
 				done = true;
+				gate.released = true;
 				if (timer) {
 					clearTimeout(timer);
 					timer = undefined;
 				}
+				// A rejection recorded before this commit still has to become the
+				// visible runtime failure (D2): the drain deferred it because the
+				// spawn had not yet committed to returning a handle.
+				this.applyFirstTurnFailure(child, gate);
 				if (delayed) {
 					this.onSpawnDelayed?.(
 						`in-process child '${child.name}' did not accept its first prompt within ` +
@@ -792,21 +828,55 @@ export class InProcessSupervisor implements LegionSupervisor {
 				}
 				resolve();
 			};
+			/**
+			 * #227 D1a: the prompt failed and nothing was accepted, so this child
+			 * never started. Returning a handle here would let `Orchestrator.launch`
+			 * believe the spawn succeeded and silently disable the `fallbackModels`
+			 * chain (`canFallbackStart` only reacts to a thrown SubagentError). Fail
+			 * the spawn instead; the caller's existing catch rolls the child back.
+			 */
+			const fail = (message: string): void => {
+				done = true;
+				if (timer) {
+					clearTimeout(timer);
+					timer = undefined;
+				}
+				reject(new SubagentError(message, ErrorCodes.START_FAILED));
+			};
 			const tick = (): void => {
 				if (done) return;
 				if (this.firstTurnAccepted(child, baselineSize)) return finish(false);
+				if (gate.rejected) return fail(gate.rejected.message);
 				const remaining = deadline - Date.now();
 				if (remaining <= 0) return finish(true);
 				// Reuse the shared poll cadence, but never oversleep the bound.
 				timer = setTimeout(tick, Math.min(POLL_INTERVAL_MS, remaining));
 			};
-			// Both handlers are supplied: `drainFirstTurn` resolves rather than
-			// rejects, but a throwing diagnostic callback must not turn this into an
+			/**
+			 * The prompt settled. `drainFirstTurn` reports the rejection through
+			 * `gate` and then resolves, so this is the one place that decides
+			 * between "spawn succeeded" and "spawn failed" (#227 D1a).
+			 *
+			 * A plain `finish(false)` here would be exactly the regression: a
+			 * pre-acceptance reject would read as a successful spawn.
+			 */
+			const onSettled = (): void => {
+				if (done) return;
+				// Accepted at any point → the turn ran, so a failure is a runtime
+				// failure (D2) and `spawnChild` still returns its handle.
+				if (this.firstTurnAccepted(child, baselineSize)) return finish(false);
+				// Rejected without ever being accepted → the child never started.
+				// Report it as a spawn failure so `canFallbackStart` can retry.
+				if (gate.rejected) return fail(gate.rejected.message);
+				// Prompt resolved but no user line is visible yet (a fake whose
+				// transcript is not on disk, or a write still in flight): the turn
+				// ended, so there is nothing left to wait for.
+				finish(false);
+			};
+			// `drainFirstTurn` deliberately resolves rather than rejects, and the
+			// second handler keeps a throwing diagnostic callback from becoming an
 			// unhandled rejection on a promise nobody awaits.
-			void promptSettled.then(
-				() => finish(false),
-				() => finish(false),
-			);
+			void promptSettled.then(onSettled, onSettled);
 			tick();
 		});
 	}
@@ -820,6 +890,7 @@ export class InProcessSupervisor implements LegionSupervisor {
 	private drainFirstTurn(
 		child: ChildRecord,
 		prompt: Promise<unknown>,
+		gate: FirstTurnGate,
 	): Promise<void> {
 		return prompt.then(
 			() => {
@@ -832,29 +903,53 @@ export class InProcessSupervisor implements LegionSupervisor {
 			},
 			(error: unknown) => {
 				const message = failureMessage(error);
-				// Never `rollbackSpawn` here: the handle was already handed to the
-				// caller, and rollback would `children.delete` it out from under it.
-				child.turnActive = false;
-				if (child.state !== "retiring") child.state = "idle";
-				const result: SettleResult = {
-					settled: false,
-					abnormal: false,
-					reason: `child turn failed: ${message}`,
-				};
-				child.lastTurnResult = result;
-				this.resolveWaiters(child, result);
-				// #227 D2: the callback's semantics now also cover a child failing at
-				// runtime, not just a refused spawn.
-				this.onSpawnRefused?.(message);
-				// ...and leave a machine-readable trace for D3's settle mapping, so
-				// the failure survives a later `agent_settled` rather than only
-				// living in the transient `lastTurnResult`.
-				this.handleSessionEvent(child, {
-					type: "error",
-					message: `child turn failed: ${message}`,
-				});
+				// #227 D1a: publish the failure for the acceptance gate *first*, so
+				// the gate can turn a pre-acceptance reject into a spawn failure.
+				gate.rejected = { message };
+				// Until `spawnChild` commits to returning a handle, this is a spawn
+				// failure: the caller's catch runs `rollbackSpawn` + rethrow, and it
+				// owns the waiter/diagnostic reporting. Doing it here as well would
+				// report twice and leave state on a child that is being torn down.
+				if (!gate.released) return;
+				this.applyFirstTurnFailure(child, gate);
 			},
 		);
+	}
+
+	/**
+	 * Turn a rejected first prompt into the visible runtime failure (#227 D2).
+	 *
+	 * Exactly-once per rejection, because it can be reached from two places: the
+	 * drain (the usual path, after `spawnChild` committed to a handle) and
+	 * `awaitFirstTurnAccepted`'s `finish()` (a prompt that rejected before the
+	 * gate committed and then had its turn accepted anyway).
+	 *
+	 * Never `rollbackSpawn` here: the handle was already handed to the caller,
+	 * and rollback would `children.delete` it out from under them.
+	 */
+	private applyFirstTurnFailure(child: ChildRecord, gate: FirstTurnGate): void {
+		const message = gate.rejected?.message;
+		if (message === undefined || gate.applied) return;
+		gate.applied = true;
+		child.turnActive = false;
+		if (child.state !== "retiring") child.state = "idle";
+		const result: SettleResult = {
+			settled: false,
+			abnormal: false,
+			reason: `child turn failed: ${message}`,
+		};
+		child.lastTurnResult = result;
+		this.resolveWaiters(child, result);
+		// #227 D2: the callback's semantics now also cover a child failing at
+		// runtime, not just a refused spawn.
+		this.onSpawnRefused?.(message);
+		// ...and leave a machine-readable trace for D3's settle mapping, so the
+		// failure survives a later `agent_settled` rather than only living in the
+		// transient `lastTurnResult`.
+		this.handleSessionEvent(child, {
+			type: "error",
+			message: `child turn failed: ${message}`,
+		});
 	}
 
 	async prompt(name: string, text: string): Promise<void> {
