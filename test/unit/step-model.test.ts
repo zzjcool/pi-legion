@@ -10,12 +10,8 @@
  * silent no-op and left all 381 tests green, so the folded shape is built
  * explicitly here via `applyAgentOverrides`.
  *
- * BUG A1 — the coherence guard ran BEFORE resolution, validating the preset's
- * own pair. A per-run tool `model`, `defaultModel` or the dispatch model can
- * supply the launched model instead, so an incoherent (kind, model) pair
- * shipped and `nativeModelFor` dropped the model at start with no error.
- * `resolveStepModel` now checks the RESOLVED model; these tests pin all three
- * reachable variants.
+ * v4 runs `kind: pi` only, so the old kind/model coherence guard (BUG A1) no
+ * longer exists: there is no second kind for a resolved model to disagree with.
  */
 
 import { test } from "node:test";
@@ -49,7 +45,6 @@ const SETTINGS = {
 	presets: {
 		cheap: { kind: "pi" as const, model: "cb/deepseek-v4.1-flash" },
 		strong: { kind: "pi" as const, model: "cb/kimi-k3" },
-		visual: { kind: "cursor" as const, model: "grok-4.6" },
 	},
 };
 
@@ -107,14 +102,14 @@ test("step-model: tool `preset` beats the agent's own frontmatter preset", () =>
 
 test("step-model: the preset's kind and thinking reach the launched agent", () => {
 	const out = resolveStepModel({
-		agent: agent({ preset: "visual" }),
+		agent: agent({ preset: "strong" }),
 		step: {},
 		params: {},
 		settings: SETTINGS,
 	});
 	// This is what orchestrator.launch reads for `--kind` and thinking.
-	assert.equal(out.agent.kind, "cursor");
-	assert.equal(out.resolved.model, "grok-4.6");
+	assert.equal(out.agent.kind, "pi");
+	assert.equal(out.resolved.model, "cb/kimi-k3");
 	assert.equal(out.usedPreset, true);
 });
 
@@ -148,125 +143,6 @@ test("step-model: no preset + no overrides falls through to defaultModel", () =>
 		settings: { defaultModel: "cb/fallback" },
 	});
 	assert.equal(out.resolved.model, "cb/fallback");
-});
-
-// ──────────── BUG A1: coherence is checked on the RESOLVED model ────────────
-
-test("BUG A1: preset kind + tool `model` override must not ship incoherently", () => {
-	// preset switches the kind to cursor; the tool then overrides the MODEL to
-	// a pi-shaped id, which cursor cannot accept. The old guard validated the
-	// preset's own pair, passed, and let `nativeModelFor` silently drop it.
-	assert.throws(
-		() =>
-			resolveStepModel({
-				agent: agent({ preset: "visual" }),
-				step: {},
-				params: { model: "cb/kimi-k3" },
-				settings: SETTINGS,
-			}),
-		/Preset 'visual' selects kind 'cursor'/,
-	);
-});
-
-test("BUG A1: a kind-only preset + defaultModel must not ship incoherently", () => {
-	// The model arrives from a level BELOW the preset, so it is not on
-	// `effective.model` when a pre-resolution guard would look.
-	assert.throws(
-		() =>
-			resolveStepModel({
-				agent: agent(),
-				step: { preset: "cursorOnly" },
-				params: {},
-				settings: {
-					presets: { cursorOnly: { kind: "cursor" } },
-					defaultModel: "cb/kimi-k3",
-				},
-			}),
-		/Preset 'cursorOnly' selects kind 'cursor'/,
-	);
-});
-
-test("BUG A1: a kind-only preset + the dispatch model must not ship incoherently", () => {
-	assert.throws(
-		() =>
-			resolveStepModel({
-				agent: agent(),
-				step: { preset: "cursorOnly" },
-				params: {},
-				dispatchModel: "cb/kimi-k3",
-				settings: { presets: { cursorOnly: { kind: "cursor" } } },
-			}),
-		/Preset 'cursorOnly' selects kind 'cursor'/,
-	);
-});
-
-test("BUG A1: the refusal names the real model source, not the preset", () => {
-	// The preset never mentioned a model; blaming it would misdirect the user.
-	assert.throws(
-		() =>
-			resolveStepModel({
-				agent: agent(),
-				step: { preset: "cursorOnly" },
-				params: {},
-				settings: {
-					presets: { cursorOnly: { kind: "cursor" } },
-					defaultModel: "cb/kimi-k3",
-				},
-			}),
-		/from subagents\.defaultModel/,
-	);
-});
-
-test("BUG A1: a tool `model` override and the parent model are blamed apart", () => {
-	// Both arrive as `source.type === "dispatch"`, but one was chosen by the
-	// caller and the other is merely the parent's model. The message must not
-	// call the parent's model an "override".
-	assert.throws(
-		() =>
-			resolveStepModel({
-				agent: agent(),
-				step: { preset: "cursorOnly" },
-				params: { model: "cb/kimi-k3" },
-				settings: { presets: { cursorOnly: { kind: "cursor" } } },
-			}),
-		/from the per-run model override/,
-	);
-	assert.throws(
-		() =>
-			resolveStepModel({
-				agent: agent(),
-				step: { preset: "cursorOnly" },
-				params: {},
-				dispatchModel: "cb/kimi-k3",
-				settings: { presets: { cursorOnly: { kind: "cursor" } } },
-			}),
-		/from the parent session model/,
-	);
-});
-
-test("BUG A1: a coherent preset still launches (guard is not over-eager)", () => {
-	const out = resolveStepModel({
-		agent: agent({ preset: "visual" }),
-		step: {},
-		params: {},
-		settings: SETTINGS,
-	});
-	assert.equal(out.resolved.model, "grok-4.6");
-	assert.equal(out.agent.kind, "cursor");
-});
-
-test("BUG A1: a kind-only preset with a COMPATIBLE model is allowed", () => {
-	const out = resolveStepModel({
-		agent: agent(),
-		step: { preset: "cursorOnly" },
-		params: {},
-		settings: {
-			presets: { cursorOnly: { kind: "cursor" } },
-			defaultModel: "grok-4.6",
-		},
-	});
-	assert.equal(out.agent.kind, "cursor");
-	assert.equal(out.resolved.model, "grok-4.6");
 });
 
 // ───────────────────────── loud undefined preset ─────────────────────────

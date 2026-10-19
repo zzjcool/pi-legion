@@ -17,36 +17,19 @@ export type AgentScope = "user" | "project" | "both";
 
 export type SystemPromptMode = "replace" | "append";
 
-/** Agent kinds parsed from role files; the RPC supervisor accepts only `pi`. */
-export const AGENT_KINDS = [
-	"pi",
-	"claude",
-	"codex",
-	"gemini",
-	"cursor",
-	"devin",
-	"agy",
-	"cline",
-	"omp",
-	"mastracode",
-	"opencode",
-	"copilot",
-	"kimi",
-	"kiro",
-	"droid",
-	"amp",
-	"grok",
-	"hermes",
-	"kilo",
-	"qodercli",
-	"qwen",
-	"maki",
-	"muse",
-] as const;
+/**
+ * Agent kinds accepted from role files, presets and overrides.
+ *
+ * v4 runs `pi` only. The field and the type stay (plumbing and `run.json`
+ * records depend on them), but a non-`pi` value is ignored at parse time and
+ * the role launches as `pi` — see `parseAgentDocument` / `parsePreset` /
+ * `parseAgentOverride`, which report the ignored value once.
+ */
+export const AGENT_KINDS = ["pi"] as const;
 
 export type AgentKind = (typeof AGENT_KINDS)[number];
 
-/** How Legion launches a child session: omit → `inprocess` (with automatic rpc fallback when the agent needs a worktree or `kind !== "pi"`). */
+/** How Legion launches a child session: omit → `inprocess` (with automatic rpc fallback when the agent needs a worktree). */
 export const SPAWN_MODES = ["rpc", "inprocess"] as const;
 export type SpawnMode = (typeof SPAWN_MODES)[number];
 
@@ -362,8 +345,6 @@ export interface ChildRecord {
 	/** Model actually started with (resolved + fallback). */
 	model?: string;
 	thinking?: string | false;
-	/** Models that were requested but cannot be represented by the RPC child. */
-	modelDropped?: string[];
 	/**
 	 * Backend this child was actually spawned on, as arbitrated by
 	 * `Orchestrator.launch` (#209). Optional because run.json records written
@@ -523,32 +504,15 @@ export interface Handle {
 // =============================================================================
 
 /**
- * One named kind+model+thinking bundle in `subagents.presets`.
+ * One named (`kind`) model+thinking bundle in `subagents.presets`.
  *
- * `kind` and `model` travel together — a preset whose model does not fit the
- * target kind is rejected at expansion time (see `assertKindModelCoherent`),
- * because `nativeModelFor()` would otherwise silently drop the model.
+ * `kind` is kept for shape compatibility but only `pi` is accepted; any other
+ * value is ignored (reported once) and the preset applies as `pi`.
  */
 export interface PresetConfig {
 	kind?: AgentKind;
 	model?: string;
 	thinking?: string | false;
-}
-
-/** @deprecated Transitional herdr.* settings retained until v3. */
-export interface HerdrSettings {
-	/** @deprecated Parsed for transition compatibility; ignored by RPC v2. */
-	defaultPlacement?: "split-down" | "split-right" | "new-tab";
-	/** @deprecated Legacy concurrency hint; ignored by RPC v2. */
-	maxConcurrentAgents?: number;
-	/** @deprecated Legacy Herdr launch retry setting. */
-	startRetries?: number;
-	/** @deprecated Legacy Herdr launch retry setting. */
-	startRetryBackoffMs?: number;
-	/** @deprecated Legacy session retention setting. */
-	sessionRetentionDays?: number;
-	/** @deprecated Legacy session retention setting. */
-	sessionRetentionMaxBytesPerRun?: number;
 }
 
 export interface LegionPhaseTimeouts {
@@ -718,8 +682,6 @@ export interface SubagentsSettings {
 	disableBuiltins?: boolean;
 	disableThinking?: boolean;
 	maxSubagentSpawnsPerSession?: number;
-	/** @deprecated Transitional herdr.* keys are parsed and ignored by RPC v2. */
-	herdr?: HerdrSettings;
 	legion?: LegionSettings;
 	/** Completion-notice merge mode. Default "smart". */
 	joinMode?: "each" | "smart";
@@ -785,10 +747,7 @@ export class SubagentError extends Error {
 }
 
 export const ErrorCodes = {
-	HERDR_UNAVAILABLE: "HERDR_UNAVAILABLE",
 	DISABLED: "DISABLED",
-	/** @deprecated Legacy Herdr client error retained for API compatibility. */
-	PANE_BUSY: "PANE_BUSY",
 	START_FAILED: "START_FAILED",
 	START_TIMEOUT: "START_TIMEOUT",
 	NAME_TAKEN: "NAME_TAKEN",
@@ -807,20 +766,8 @@ export const ErrorCodes = {
 // =============================================================================
 
 export const DEFAULTS = {
-	/** @deprecated Legacy Herdr start-retry settings retained by the archived backend. */
-	startRetries: 40,
-	startRetryBackoffMs: 150,
 	/** F8: agent wait covers a turn; generous default. */
 	turnTimeoutMs: 900_000,
 	/** jsonl quiet window before declaring a turn settled. */
 	settleQuietMs: 2_500,
-	/** @deprecated Legacy Herdr concurrency hint retained during migration. */
-	maxConcurrentAgents: 6,
-	/** @deprecated Legacy Herdr session retention setting. */
-	sessionRetentionDays: 7,
-	/** @deprecated Legacy Herdr probe settings; retained for the archived backend. */
-	startTimeoutMs: 45_000,
-	binaryProbeTimeoutMs: 3_000,
-	/** @deprecated Legacy Herdr command timeout retained for the archived backend. */
-	commandTimeoutMs: 15_000,
 } as const;

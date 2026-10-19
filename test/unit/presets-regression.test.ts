@@ -180,31 +180,3 @@ test("launch: a per-step preset overrides the role's preset", async () => {
 	});
 	assert.equal(result.supervisor.spawns[0]?.input.model, "cb/kimi-k3");
 });
-
-// The main chain has one supported kind; old CLI/model compatibility tests are
-// now explicit refusals rather than fake-herdr starts for non-pi agents.
-test("e2e: inherited non-pi roles receive migration guidance without an RPC spawn", async () => {
-	const result = await runBatch({
-		settings: {},
-		agents: { "websearch.md": "---\nname: websearch\ndescription: search\nkind: cursor\n---\np\n" },
-		tasks: [{ agent: "websearch", task: "search" }],
-		dispatchModel: "cb/kimi-k3",
-	});
-	assert.equal(result.threw, undefined);
-	assert.match(result.text, /✗ websearch: /);
-	assert.match(result.text, /only supports pi children/);
-	assert.match(result.text, /pin pi-legion v0\.16\.x/);
-	assert.equal(result.supervisor.spawns.length, 0);
-});
-
-test("e2e: explicit non-pi model choices are refused with migration guidance", async () => {
-	const result = await runBatch({
-		settings: {},
-		agents: { "websearch.md": "---\nname: websearch\ndescription: search\nkind: cursor\nmodel: cb/kimi-k3\n---\np\n" },
-		tasks: [{ agent: "websearch", task: "search" }],
-		dispatchModel: "cb/kimi-k3",
-	});
-	assert.match(result.text, /only supports pi children/);
-	assert.match(result.text, /pin pi-legion v0\.16\.x/);
-	assert.equal(result.supervisor.spawns.length, 0);
-});

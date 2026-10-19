@@ -16,7 +16,7 @@ export const PARENT_PLAYBOOK = [
 	"6. Isolation belongs to centurion. For N parallel isolated writers, dispatch N centurions (each owns one worktree); members stay `worktree: false` in-process. Passing `worktree: true` on a non-centurion warns once and is forced false.",
 	"7. Launch with `verify: [\"npm run typecheck\", \"npm test\"]` when the project has a mechanical verifier. The extension runs those commands itself in the child worktree at collect time; the child does not need to paste test output.",
 	"Utility agents (`utility: true`, e.g. scout) can be dispatched by ANY role via the separate `vexillatio` tool — read-only helpers, always leaf, no depth budget. The `subagent` tool stays for the command chain (worker/centurion).",
-	"Forbidden: direct bash access to legion.db, hand-launching child Pi processes, or using herdr pane/tab/agent commands for dispatch.",
+	"Forbidden: direct bash access to legion.db, or launching child Pi processes by hand (use the subagent tool).",
 ].join("\n");
 
 export const TOOL_DESCRIPTION = [

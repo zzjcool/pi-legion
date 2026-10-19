@@ -62,7 +62,7 @@ import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
 import type { LegionSupervisor, SettleResult, SpawnInput } from "../supervisor/types.ts";
 import { isInProcessSpawn, resolveSpawnMode } from "../supervisor/spawn-mode.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
-import { nativeModelFor } from "./kind.ts";
+import { applyThinkingSuffix } from "./args.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
 import {
 	createChildWorktree,
@@ -688,7 +688,7 @@ export class Orchestrator {
 					timeoutMs: this.worktreeBootstrapTimeoutMs,
 				});
 			}
-			const effectiveModel = models.candidates;
+			const effectiveModel = models;
 			if (this.legion && nodeId && !previous && this.legion.runStore) {
 				const roleDepth = input.agent.maxSubagentDepth === undefined
 					? Number.POSITIVE_INFINITY
@@ -712,9 +712,9 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models.candidates[0], utility: Boolean(input.utilityDispatch && input.agent.utility) });
+				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility) });
 				reserved = true;
-				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models.candidates[0] ? { model: models.candidates[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
+				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
 			}
 			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId);
 			if (input.stripLegionIdentity) {
@@ -838,19 +838,13 @@ export class Orchestrator {
 		model?: string;
 		origin: ModelOrigin;
 		thinking?: string | false;
-	}): { candidates: Array<string | undefined>; dropped: string[] } {
+	}): Array<string | undefined> {
 		const requested = modelCandidates(input.model ?? input.agent.model, input.agent.fallbackModels);
-		const thinking = input.thinking ?? input.agent.thinking;
-		const candidates: Array<string | undefined> = [];
-		const dropped: string[] = [];
-		for (const model of requested) {
-			if (!model || nativeModelFor("pi", model, thinking) !== undefined) candidates.push(model);
-			else dropped.push(model);
-		}
-		if (dropped.length && input.origin === "explicit" && candidates.length === 0) {
-			throw new SubagentError(`model '${dropped.join(", ")}' cannot be used with kind 'pi'.`, ErrorCodes.INVALID_PARAMS);
-		}
-		return { candidates: candidates.length ? candidates : [undefined], dropped };
+		// Every candidate now belongs to the one supported kind, so the model the
+		// caller asked for is the model the child starts with; an unset model is
+		// the only case that leaves the choice to the child's own configuration.
+		const candidates = requested.filter((model): model is string => Boolean(model));
+		return candidates.length ? candidates : [undefined];
 	}
 
 	private assertWithinBudgets(existingChild = false): void {

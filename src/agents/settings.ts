@@ -11,7 +11,6 @@ import {
 	AGENT_KINDS,
 	DEFAULT_LEGION_SETTINGS,
 	type AgentOverride,
-	type HerdrSettings,
 	type LegionSettings,
 	type ModelScopeConfig,
 	type OnBlockedPolicy,
@@ -88,8 +87,6 @@ function nonNegativeInt(
 }
 
 const VALID_JOIN_MODES: ReadonlySet<string> = new Set(["each", "smart"]);
-const LEGACY_PLACEMENTS = ["split-down", "split-right", "new-tab"] as const;
-const warnedHerdrSettings = new Set<string>();
 
 const VALID_ON_BLOCKED_POLICIES: ReadonlySet<string> = new Set([
 	"forward",
@@ -116,73 +113,6 @@ function readJoinFields(
 	if (flushMs !== undefined) out.joinFlushMs = flushMs;
 }
 
-function parseHerdrSettings(
-	value: unknown,
-	filePath: string,
-): HerdrSettings | undefined {
-	if (value === undefined) return undefined;
-	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		throw new Error(
-			`Subagent settings in '${filePath}' have invalid 'herdr'; expected an object.`,
-		);
-	}
-	const input = value as Record<string, unknown>;
-	const out: HerdrSettings = {};
-	if (!warnedHerdrSettings.has(filePath)) {
-		warnedHerdrSettings.add(filePath);
-		console.warn(
-			`[pi-legion] Settings 'subagents.herdr' in ${filePath} are deprecated and ignored by the RPC supervisor; remove them when migrating from v0.16.x.`,
-		);
-	}
-
-	const placement = input.defaultPlacement;
-	if (placement !== undefined) {
-		if (typeof placement !== "string" || !LEGACY_PLACEMENTS.includes(placement as (typeof LEGACY_PLACEMENTS)[number])) {
-			throw new Error(
-				`Subagent settings in '${filePath}' have invalid 'herdr.defaultPlacement'; ` +
-					`expected one of: ${[...LEGACY_PLACEMENTS].join(", ")}.`,
-			);
-		}
-		out.defaultPlacement = placement as NonNullable<HerdrSettings["defaultPlacement"]>;
-	}
-
-	const maxAgents = positiveInt(
-		input.maxConcurrentAgents,
-		"herdr.maxConcurrentAgents",
-		filePath,
-	);
-	if (maxAgents !== undefined) out.maxConcurrentAgents = maxAgents;
-
-	const retries = nonNegativeInt(
-		input.startRetries,
-		"herdr.startRetries",
-		filePath,
-	);
-	if (retries !== undefined) out.startRetries = retries;
-
-	const backoff = nonNegativeInt(
-		input.startRetryBackoffMs,
-		"herdr.startRetryBackoffMs",
-		filePath,
-	);
-	if (backoff !== undefined) out.startRetryBackoffMs = backoff;
-
-	const days = positiveInt(
-		input.sessionRetentionDays,
-		"herdr.sessionRetentionDays",
-		filePath,
-	);
-	if (days !== undefined) out.sessionRetentionDays = days;
-
-	const bytes = positiveInt(
-		input.sessionRetentionMaxBytesPerRun,
-		"herdr.sessionRetentionMaxBytesPerRun",
-		filePath,
-	);
-	if (bytes !== undefined) out.sessionRetentionMaxBytesPerRun = bytes;
-
-	return out;
-}
 
 const LEGION_PHASES = [
 	"planning",
@@ -477,8 +407,6 @@ export function parseSubagentSettings(
 	const modelScope = parseModelScopeConfig(input.modelScope, { filePath });
 	if (modelScope) out.modelScope = modelScope;
 
-	const herdr = parseHerdrSettings(input.herdr, filePath);
-	if (herdr) out.herdr = herdr;
 	const legion = parseLegionSettings(input.legion, filePath);
 	if (legion !== undefined) out.legion = legion;
 
@@ -639,6 +567,15 @@ function parseAgentOverride(
 	// though older settings files may still carry it in an agent override.
 	const normalized: Record<string, unknown> = { ...value };
 	delete normalized.placement;
+	// A non-`pi` kind is reported once and ignored rather than rejected: the key
+	// is still legal, it only has one accepted value in v4.
+	if (normalized.kind !== undefined && !isValidOverrideField("kind", normalized.kind)) {
+		console.error(
+			`[pi-legion] settings override '${field}' in ${filePath} sets kind ${JSON.stringify(normalized.kind)}; ` +
+				`v4 supports kind: pi only, so that field is ignored and the agent launches as kind: pi.`,
+		);
+		delete normalized.kind;
+	}
 	for (const [key, member] of Object.entries(normalized)) {
 		const expected = overrideFieldExpected(key);
 		if (
@@ -814,7 +751,7 @@ export function loadSubagentSettings(
 
 /**
  * Merge project settings over user settings.
- * `herdr`, `legion`, `agentOverrides`, `teams` and `presets` shallow-merge;
+ * `legion`, `agentOverrides`, `teams` and `presets` shallow-merge;
  * `legion.phaseTimeouts` also merges per phase. `modelScope` is replaced
  * wholesale. A project team with the same name replaces the user's complete
  * team definition.
@@ -862,10 +799,6 @@ export function resolveSubagentSettings(
 		};
 	}
 	if (project.team !== undefined) out.team = project.team;
-
-	if (project.herdr) {
-		out.herdr = { ...(user.herdr ?? {}), ...project.herdr };
-	}
 
 	if (project.legion !== undefined || user.legion !== undefined) {
 		out.legion = mergeLegionSettings(user.legion, project.legion);

@@ -297,18 +297,7 @@ test("blocked RPC confirmation is correlated through UIProxy and stays live unti
 	}
 });
 
-test("RPC child kind and spawn budget are refused before any process is created", async () => {
-	const h = harness();
-	try {
-		await assert.rejects(
-			() => h.orchestrator.launch({ agent: agent({ kind: "cursor" }), task: "unsupported" }),
-			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.INVALID_PARAMS && /pin pi-legion v0\.16\.x/.test(error.message),
-		);
-		assert.equal(h.supervisor.spawns.length, 0);
-	} finally {
-		h.cleanup();
-	}
-
+test("RPC spawn budget is refused before any process is created", async () => {
 	const limited = new Orchestrator({ supervisor: new FakeSupervisor(), runDir: tempDir("rpc-budget-"), cwd: "/tmp", maxSpawns: 0 });
 	// `maxSpawns` is an RPC-only gate: in-process children are budgeted by
 	// `subagents.inprocess.*` and deliberately skip `assertWithinBudgets`, so the
