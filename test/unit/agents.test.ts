@@ -165,22 +165,25 @@ test("agent: invalid kind degrades to pi instead of failing", () => {
 	assert.equal(a.kind, "pi");
 });
 
-test("agent: valid non-pi kind is honored", () => {
-	const a = parseAgentDocument(
-		"---\nname: r\ndescription: d\nkind: cursor\n---\np",
-		"/f.md",
-		"user",
-	);
-	assert.equal(a?.kind, "cursor");
-});
-
-test("agent: herdr grok kind is honored rather than coerced to pi", () => {
-	const a = parseAgentDocument(
-		"---\nname: r\ndescription: d\nkind: grok\n---\np",
-		"/f.md",
-		"user",
-	);
-	assert.equal(a?.kind, "grok");
+test("agent: a non-pi kind is ignored and reported once, the role launches as pi", () => {
+	const original = console.error;
+	const errors: string[] = [];
+	try {
+		console.error = (...args: unknown[]) => errors.push(args.map(String).join(" "));
+		const a = parseAgentDocument(
+			"---\nname: r\ndescription: d\nkind: cursor\n---\np",
+			"/f.md",
+			"user",
+		);
+		assert.equal(a?.kind, "pi");
+		assert.equal(errors.length, 1, "the ignored kind is reported exactly once");
+		// Names the role, the value the user wrote, and what happened to it.
+		assert.match(errors[0] ?? "", /agent 'r'/);
+		assert.match(errors[0] ?? "", /"cursor"/);
+		assert.match(errors[0] ?? "", /v4 supports kind: pi only/);
+	} finally {
+		console.error = original;
+	}
 });
 
 test("agent: tools parse from comma string and array spellings", () => {
@@ -727,7 +730,7 @@ test("formatAgentRoster lists user roles so the parent can pick search without l
 		{
 			name: "search",
 			description: "联网检索，只返回带出处的事实",
-			kind: "cursor",
+			kind: "pi",
 			source: "user",
 			model: "auto",
 			systemPrompt: "",
@@ -749,7 +752,7 @@ test("formatAgentRoster lists user roles so the parent can pick search without l
 		},
 	]);
 	assert.match(roster, /Available subagent roles/);
-	assert.match(roster, /- search \[user\] \(kind=cursor, model=auto\)/);
+	assert.match(roster, /- search \[user\] \(model=auto\)/);
 	assert.match(roster, /- worker \[builtin\] — 实现者/);
 	assert.doesNotMatch(roster, /kind=pi/);
 });

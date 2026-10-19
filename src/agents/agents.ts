@@ -460,7 +460,7 @@ export function parseAgentDocument(
 		inheritProjectContext: bool(fm.inheritProjectContext) ?? true,
 		inheritSkills: bool(fm.inheritSkills) ?? false,
 		...(bool(fm.inheritExtensions) !== undefined ? { inheritExtensions: bool(fm.inheritExtensions) } : {}),
-		kind: enumOr<AgentKind>(fm.kind, VALID_KINDS, "pi"),
+		kind: parseKind(fm.kind, name),
 		systemPrompt: body,
 		source,
 		filePath,
@@ -496,17 +496,23 @@ function setIf<T extends object, K extends keyof T>(
 }
 
 /**
- * Pick a value only when it is a member of `allowed`.
- * An invalid enum degrades to the default rather than failing the whole file,
- * so a typo in one field cannot break discovery.
+ * Resolve the role's `kind`.
+ *
+ * v4 runs `pi` only. The key stays legal frontmatter (and `AgentConfig.kind`
+ * stays), but a value outside `AGENT_KINDS` is ignored: the role launches as
+ * `pi` and this is reported once, naming the role and the value it tried to
+ * set. Silently coercing would leave the user believing a non-pi CLI is in
+ * play, so an invalid/absent value is the only case that speaks up.
  */
-function enumOr<T extends string>(
-	value: unknown,
-	allowed: ReadonlySet<string>,
-	fallback: T,
-): T {
+function parseKind(value: unknown, agentName: string): AgentKind {
 	const raw = str(value);
-	return raw && allowed.has(raw) ? (raw as T) : fallback;
+	if (raw === undefined || raw === "") return "pi";
+	if (VALID_KINDS.has(raw)) return raw as AgentKind;
+	console.error(
+		`[pi-legion] agent '${agentName}' sets kind ${JSON.stringify(raw)}; ` +
+			`v4 supports kind: pi only, so that field is ignored and the role launches as kind: pi.`,
+	);
+	return "pi";
 }
 
 /** `systemPromptMode` is a closed set of two; anything else means `replace`. */

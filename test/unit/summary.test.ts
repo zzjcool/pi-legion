@@ -206,18 +206,13 @@ test("aggregateSubagentRuns groups by agent, prefers execution snapshots, and fa
 	}
 });
 
-test("legacy non-pi records retain usage safeguards, and awaiting execution counts as outcome and running", async () => {
+test("awaiting execution counts as both an outcome and running", async () => {
 	const root = tempRoot();
 	try {
 		const cwd = path.join(root, "project");
 		const now = Date.parse("2026-01-01T05:00:00.000Z");
 		const store = new RunStore({ rootDir: path.join(cwd, ".pi-subagents"), now: () => now });
-		const run = store.createRun({ task: "non-pi fixture", cwd });
-		const cursor = child(root, "reviewer-0", "2026-01-01T04:59:00.000Z", {
-			kind: "cursor",
-			agent: "reviewer",
-			sessionFile: path.join(root, "cursor.jsonl"),
-		});
+		const run = store.createRun({ task: "awaiting fixture", cwd });
 		const awaiting = child(root, "worker-0", "2026-01-01T04:58:00.000Z", {
 			kind: "pi",
 			agent: "worker",
@@ -229,9 +224,7 @@ test("legacy non-pi records retain usage safeguards, and awaiting execution coun
 				usage: { input: 4_000, output: 500, cacheRead: 0, cacheWrite: 0, cost: 0.01 },
 			},
 		});
-		writeFileSync(cursor.sessionFile, sessionText({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }));
 		writeFileSync(awaiting.sessionFile, "");
-		await store.addChild(run.runId, cursor);
 		await store.addChild(run.runId, awaiting);
 		const runs = store.listRuns();
 		const sessions = new Map(
@@ -240,9 +233,6 @@ test("legacy non-pi records retain usage safeguards, and awaiting execution coun
 			),
 		);
 		const summary = aggregateSubagentRuns(runs, { now, sessions });
-		const cursorGroup = summary.groups.find((group) => group.role === "reviewer");
-		assert.ok(cursorGroup);
-		assert.equal(cursorGroup.usage, null);
 		assert.equal(summary.totals.usage?.input, 4_000);
 		const workerGroup = summary.groups.find((group) => group.role === "worker");
 		assert.ok(workerGroup);
@@ -285,39 +275,6 @@ test("a missing or empty session file yields no usage, not parser-shaped zeros",
 		const rendered = formatSubagentSummary(summary);
 		assert.match(rendered, /\| reviewer \| 1 \| unknown \| — \| — \| — \|/);
 		assert.doesNotMatch(rendered, /\$0\.000/);
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("a running legacy child does not display stale session usage", async () => {
-	const root = tempRoot();
-	try {
-		const cwd = path.join(root, "project");
-		const now = Date.parse("2026-01-01T05:00:00.000Z");
-		const store = new RunStore({ rootDir: path.join(cwd, ".pi-subagents"), now: () => now });
-		const run = store.createRun({ task: "stale cursor usage fixture", cwd });
-		const cursor = child(root, "worker-0", "2026-01-01T04:00:00.000Z", {
-			kind: "cursor",
-			agent: "worker",
-			state: "working",
-			sessionFile: path.join(root, "cursor-live.jsonl"),
-		});
-		// The file holds a COMPLETED earlier turn's usage; the child is still
-		// working, so that partial number must not surface as settled usage.
-		writeFileSync(cursor.sessionFile, sessionText({ input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.01 }));
-		await store.addChild(run.runId, cursor);
-		const runs = store.listRuns();
-		const sessions = new Map(
-			runs.flatMap((record) =>
-				record.children.map((entry) => [entry.sessionFile, parseSessionFile(entry.sessionFile)] as const),
-			),
-		);
-		const summary = aggregateSubagentRuns(runs, { now, sessions });
-		const group = summary.groups[0];
-		assert.ok(group);
-		assert.equal(group.usage, null);
-		assert.equal(summary.totals.usage, null);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

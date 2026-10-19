@@ -260,14 +260,23 @@ test("M1 maxDepth above the hard cap warns once and emits the structured refusal
 });
 
 
-test("legacy herdr settings remain readable but warn and do not affect RPC behavior", () => {
+test("a residual subagents.herdr block is silently dropped and no longer warns", () => {
+	// v4 deleted the herdr settings surface along with the archived backend, so
+	// the transitional parser and its deprecation warning are gone. An existing
+	// settings file keeps loading; the key is ignored like any unknown key.
 	const warnings: string[] = [];
-	const original = console.warn;
+	const errors: string[] = [];
+	const originalWarn = console.warn;
+	const originalError = console.error;
 	try {
 		console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(" "));
+		console.error = (...args: unknown[]) => errors.push(args.map(String).join(" "));
 		const parsed = parseSubagentSettings({ subagents: { herdr: { defaultPlacement: "new-tab", maxConcurrentAgents: 3 } } }, "/tmp/legacy-settings.json");
-		assert.deepEqual(parsed.herdr, { defaultPlacement: "new-tab", maxConcurrentAgents: 3 });
-		assert.equal(warnings.length, 1);
-		assert.match(warnings[0] ?? "", /deprecated and ignored/);
-	} finally { console.warn = original; }
+		assert.equal("herdr" in parsed, false, "the dead key must not survive parsing");
+		assert.deepEqual(warnings, [], "the deprecation warning went away with the parser");
+		assert.deepEqual(errors, [], "a dropped key is silent, not an error");
+	} finally {
+		console.warn = originalWarn;
+		console.error = originalError;
+	}
 });

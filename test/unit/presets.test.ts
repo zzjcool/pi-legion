@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
 	parsePresets,
 	requirePreset,
-	assertKindModelCoherent,
 	applyPreset,
 	resolvePresetName,
 } from "../../src/agents/presets.ts";
@@ -47,15 +46,23 @@ test("presets: rejects a non-object preset entry", () => {
 	);
 });
 
-test("presets: rejects an unknown kind", () => {
-	assert.throws(
-		() =>
-			parsePresets(
-				{ cheap: { kind: "not-a-kind", model: "cb/flash" } },
-				{ filePath: "/s.json" },
-			),
-		/presets\.cheap\.kind/,
-	);
+test("presets: a non-pi kind is ignored (reported once) rather than rejected", () => {
+	const original = console.error;
+	const errors: string[] = [];
+	try {
+		console.error = (...args: unknown[]) => errors.push(args.map(String).join(" "));
+		const out = parsePresets(
+			{ cheap: { kind: "not-a-kind", model: "cb/flash" } },
+			{ filePath: "/s.json" },
+		);
+		// The model survives; only the kind field is dropped (v4 = kind: pi only).
+		assert.deepEqual(out, { cheap: { model: "cb/flash" } });
+		assert.equal(errors.length, 1, "the ignored kind is reported exactly once");
+		assert.match(errors[0] ?? "", /preset 'cheap'/);
+		assert.match(errors[0] ?? "", /v4 supports kind: pi only/);
+	} finally {
+		console.error = original;
+	}
 });
 
 test("presets: rejects an empty model and a non-string thinking", () => {
@@ -75,14 +82,12 @@ test("presets: accepts a full and a partial preset; thinking: false is kept", ()
 	const out = parsePresets(
 		{
 			strong: { kind: "pi", model: "cb/kimi-k3", thinking: "high" },
-			cursor: { kind: "cursor", model: "grok-4.6" },
 			quiet: { thinking: false },
 		},
 		{ filePath: "/s.json" },
 	);
 	assert.deepEqual(out, {
 		strong: { kind: "pi", model: "cb/kimi-k3", thinking: "high" },
-		cursor: { kind: "cursor", model: "grok-4.6" },
 		quiet: { thinking: false },
 	});
 });
@@ -138,65 +143,18 @@ test("presets: requirePreset says 'None are defined' for an empty/absent map", (
 	);
 });
 
-// ─────────────────────────── assertKindModelCoherent ───────────────────────────
-
-test("presets: coherence guard rejects a pi-shaped model on cursor", () => {
-	// nativeModelFor("cursor", "cb/kimi-k3") is undefined — the model would be
-	// silently dropped at start, so the guard must throw first.
-	assert.throws(
-		() => assertKindModelCoherent("cursor", "cb/kimi-k3", "strong"),
-		/Preset 'strong' selects kind 'cursor', but the resolved model 'cb\/kimi-k3'/,
-	);
-});
-
-test("presets: coherence guard accepts a pi-shaped model on pi", () => {
-	assert.doesNotThrow(() =>
-		assertKindModelCoherent("pi", "cb/kimi-k3", "strong"),
-	);
-});
-
-test("presets: coherence guard accepts a cursor slug on cursor and no model", () => {
-	assert.doesNotThrow(() =>
-		assertKindModelCoherent("cursor", "grok-4.6", "cur"),
-	);
-	assert.doesNotThrow(() =>
-		assertKindModelCoherent("pi", undefined, "quiet"),
-	);
-});
-
-test("presets: the guard reports where the model came from", () => {
-	// The preset may not be the source of the model at all: a tool `model`,
-	// `defaultModel` or the dispatch model can supply it. The message must not
-	// claim the preset set a model it never mentioned.
-	assert.throws(
-		() =>
-			assertKindModelCoherent(
-				"cursor",
-				"cb/kimi-k3",
-				"visual",
-				"subagents.defaultModel",
-			),
-		/from subagents\.defaultModel/,
-	);
-	// Omitting the origin keeps the message valid without inventing a source.
-	assert.throws(
-		() => assertKindModelCoherent("cursor", "cb/kimi-k3", "visual"),
-		/Preset 'visual' selects kind 'cursor'/,
-	);
-});
-
 // ─────────────────────────── applyPreset ───────────────────────────
 
 test("presets: applyPreset replaces kind/model/thinking atomically", () => {
-	const out = applyPreset(agent({ kind: "pi", model: "old" }), "cur", {
-		kind: "cursor",
-		model: "grok-4.6",
+	const out = applyPreset(agent({ kind: "pi", model: "old" }), "strong", {
+		kind: "pi",
+		model: "cb/kimi-k3",
 		thinking: "high",
 	});
-	assert.equal(out.kind, "cursor");
-	assert.equal(out.model, "grok-4.6");
+	assert.equal(out.kind, "pi");
+	assert.equal(out.model, "cb/kimi-k3");
 	assert.equal(out.thinking, "high");
-	assert.equal(out.preset, "cur");
+	assert.equal(out.preset, "strong");
 });
 
 test("presets: applyPreset records provenance and copies the agent", () => {

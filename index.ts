@@ -1952,9 +1952,8 @@ async function launchStep(
 			// `--no-extensions` the child would resolve it there and die with
 			// "No API key found". The parent registry knows the live provider.
 			...(resolved.model ? { modelProvider: providerForModel(session.modelRegistry, resolved.model) } : {}),
-			// The origin decides whether an unacceptable model is refused or
-			// dropped, and only this layer can tell them apart (a parent model
-			// arrives as the same `dispatch` source as a per-run override).
+			// The origin distinguishes a deliberate per-run model from the parent's
+			// model falling through; the launch line reports which one won.
 			modelOrigin: model.modelOrigin,
 			worktree: resolveLaunchWorktree({
 				roleDefault: effective.worktree,
@@ -1986,16 +1985,6 @@ async function launchStep(
 		session.results.push(
 			`▶ ${handle.name} (${effective.name}) supervisor=${handle.spawnMode}`,
 		);
-		// An inherited model the target CLI cannot express is dropped on purpose
-		// (the parent's pi model means nothing to cursor). Say so, or the user
-		// reasonably believes the child is running the model they see on the
-		// parent — the same silent surprise this whole guard exists to remove.
-		if (handle.child.modelDropped?.length) {
-			session.results.push(
-				`  ⚠ ${effective.name} runs on ${effective.kind}'s own default: ` +
-					`${handle.child.modelDropped.join(", ")} does not apply to that CLI.`,
-			);
-		}
 		session.onUpdate?.({
 			content: [
 				{
