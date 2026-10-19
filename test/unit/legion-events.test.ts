@@ -13,11 +13,13 @@ import {
 } from "../../src/legion/events.ts";
 import { insertNode } from "../../src/legion/nodes.ts";
 
-test("legion events enforce the exact 14-type set and JSON-round-trip data", () => {
+test("legion events enforce the exact 15-type set and JSON-round-trip data", () => {
 	const db = openLegionDb(":memory:");
 	try {
 		insertNode(db, { parentId: null, name: "root", role: "root" });
-		assert.equal(LEGION_EVENT_TYPES.length, 14);
+		assert.equal(LEGION_EVENT_TYPES.length, 15);
+		// #233: node_abandoned is written by hygiene, so it belongs to the closed set.
+		assert.ok((LEGION_EVENT_TYPES as readonly string[]).includes("node_abandoned"));
 		const one = appendEvent(db, "root", "node_launched", { source: "test" }, { now: () => 99 });
 		const two = appendEvent(db, "root", "phase_change", undefined, { now: () => 100 });
 		assert.deepEqual(one.data, { source: "test" });
