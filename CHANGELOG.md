@@ -11,8 +11,68 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [3.0.3] — 2026-10-19
+
+### Changed
+
+- **`spawnChild` returns as soon as the child accepts the prompt, not when its
+  first turn finishes (#227/#228).** The in-process backend used to await the
+  whole first agent run, so for 8–18 minutes the launch produced no job: the
+  status board showed a single ledger row with no token rate, and the parent
+  turn was blocked for the duration. Acceptance is defined in the child
+  transcript (a user line past the spawn-time size, `turns.length > 0`);
+  `isLastTurnComplete` is deliberately not required, because an accepted prompt
+  legitimately has no assistant line yet. The prompt promise is drained in the
+  background inside the same ALS child scope, so depth/identity semantics are
+  unchanged. A 15 s start bound is not an error — the handle is returned anyway
+  and `onSpawnDelayed` fires once. See `docs/inprocess-supervisor.md`.
+- **`worktree: true` is centurion-only (#214).** Members stay in-process; only a
+  centurion gets an OS worktree for the squad it leads. Roles that declared
+  `worktree: true` on a leaf no longer pay the clone/bootstrap cost, and the
+  isolation they still need is the centurion's. See REV-17.
+
 ### Fixed
 
+- **A first prompt rejected before acceptance no longer produces a ghost
+  child (#227 D1a / #230).** The non-blocking spawn above had a regression: when
+  the SDK threw before `appendMessage` (no model, no API key, mid-compaction)
+  the spawn still returned a handle, which disabled the `fallbackModels` chain —
+  `Orchestrator.launch` only retries the next model when `spawnChild` throws. A
+  reject **before** acceptance now throws `SubagentError(START_FAILED)` and takes
+  the existing rollback path; a reject **after** acceptance keeps the handle and
+  reports `SettleResult.reason = "child turn failed: …"`.
+- **An interrupted `vexillatio` keeps the work it already collected (#227/#229).**
+  The frozen head line stays first and verbatim, then the collected segments (in
+  handle order) and any `✗ <agent>: <error>` launch failures follow, with
+  `details.stillRunning` telling you what is still live. A reason-less abort is
+  now named (`ABORT_WITHOUT_REASON`) instead of surfacing as bare engine text,
+  and `Orchestrator.collect` no longer stamps a deadline on a child whose last
+  turn already finished.
+- **Foreign children are judged by their run-directory owner (#209-3 / #215).**
+  `status` reported a long-dead child as `working` and `stop` could not reach it,
+  because both consulted only the in-memory liveness registry, which is empty by
+  construction for a run this process never spawned. Both now resolve the owner
+  from the run directory.
+- **The rendered `supervisor=` is the arbitrated backend (#209-2 / #216).**
+  `supervisor=rpc` was a literal in three render paths, so an in-process child
+  was labeled `rpc`. `RunRecord.herdr.supervisor` widens to `SpawnMode`, handles
+  carry `spawnMode`, and legacy runs with no such field render `unknown`.
+- **Extensions that register providers work in the default backend
+  (#209-1 / #213).** The in-process session factory loaded additional extension
+  paths into `DefaultResourceLoader` but resolved models through a bare
+  `ModelRuntime.create()`, so non-builtin providers were unreachable. Registered
+  providers are now drained into the model runtime and their catalog refresh is
+  awaited before `resolveCliModel()` reads the synchronous snapshot.
+- **`legion-doctor` no longer implies RPC-only remedies for in-process
+  children (#212 / #222).** In-process spawns got a false-lead
+  `PI_LEGION_CHILD_EXTENSIONS` recommendation and RPC CLI-probe issues
+  (`CHILD_NO_MODELS` / `CHILD_FEWER_MODELS`); model gaps now point at
+  `models.json`, role extensions, or `inheritExtensions`.
+- **An `orphan detected` notice now carries its detection time.** The notice is
+  queued through the outbox and can be delivered tens of minutes later; it used
+  to look identical to a fresh scan, so the same dead node was triaged repeatedly.
+  It now leads with `detected at <ISO>`. `staleMs` is intentionally unchanged —
+  it is the value at scan time, matching the persisted `orphan_detected` event.
 - **`tok/s` is a decode rate again, and in-process children show it while they
   run.** Two independent causes, both fixed:
   - `generationMs` (the denominator) was derived from the nested
