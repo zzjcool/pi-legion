@@ -253,7 +253,13 @@ export class LegionPostman {
 			this.eventBus?.emit(event);
 			reported.add(node.id);
 			this.sendRootMessage(
-				`Legion orphan detected: ${node.id} (${node.role}, status=${node.status}) has no active supervisor and no heartbeat for ${Math.max(0, timestamp - node.updatedAt)}ms. Resume requires CEO approval.`,
+				// The notice can be delivered long after detection: it is queued through
+				// `subagent-notify` and the outbox flushes at `MAX_PENDING_AGE_MS` or at
+				// `agent_settled`. A stale `staleMs` alone therefore reads as "detected
+				// just now" when the value can be tens of minutes old, which makes a
+				// replayed notice look like a fresh detection. Stamp the detection time
+				// so a late delivery is self-evident.
+				`Legion orphan detected at ${new Date(timestamp).toISOString()}: ${node.id} (${node.role}, status=${node.status}) has no active supervisor and no heartbeat for ${Math.max(0, timestamp - node.updatedAt)}ms. Resume requires CEO approval.`,
 			);
 		}
 	}

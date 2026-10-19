@@ -304,7 +304,13 @@ test("postman injects active/retired-recipient mail, bounces terminal mail, and 
 			intervalMs: 10_000,
 		});
 		await rootPostman.tick();
-		assert.ok(received.some((entry) => entry.includes("Legion orphan detected: root.team")));
+		assert.ok(received.some((entry) => entry.includes("Legion orphan detected") && entry.includes(": root.team")));
+		// The notice carries its detection time so a delayed delivery cannot be
+		// mistaken for a fresh detection (#227 follow-up).
+		assert.ok(
+			received.some((entry) => entry.startsWith("Legion orphan detected at ") && entry.includes(new Date(now).toISOString())),
+			"the orphan notice stamps when the scan ran, not just how stale the node was",
+		);
 		assert.ok(readEventsAfter(db, 0).some((event) => event.nodeId === "root.team" && event.type === "orphan_detected"));
 		orphanUnsubscribe();
 		postman.stop();

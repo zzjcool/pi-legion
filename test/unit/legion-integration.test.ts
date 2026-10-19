@@ -318,7 +318,7 @@ test("centurion resume recovers a running child and does not revive a settled ch
 		const orphanMessages: string[] = [];
 		const rootPostman = new LegionPostman({ db, nodeId: "root", supervisor: rootSupervisor, settings: { orphanStaleMs: 100 }, now: () => now + 1_000, sendRootMessage: (message) => orphanMessages.push(message), intervalMs: 10_000 });
 		await rootPostman.tick();
-		assert.ok(orphanMessages.some((message) => message.includes("Legion orphan detected: root.centurion")));
+		assert.ok(orphanMessages.some((message) => message.includes("Legion orphan detected") && message.includes(": root.centurion")));
 		assert.ok(readEventsAfter(db, 0).some((event) => event.nodeId === "root.centurion" && event.type === "orphan_detected"));
 		rootPostman.stop();
 		process.env.PI_CODING_AGENT_DIR = agentDir;
