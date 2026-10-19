@@ -107,13 +107,22 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
- * Relative age for railway "last activity" (`3s ago` / `2m ago` / `1h ago`).
- * Missing timestamp → `—` (placeholder; see #159).
+ * Age floor for the railway "last activity" field. Below it the field is
+ * dropped entirely instead of reading `1s ago` on every live lane.
+ */
+export const ACTIVITY_AGO_MIN_SECS = 60;
+
+/**
+ * Relative age for railway "last activity" (`2m ago` / `1h ago`).
+ *
+ * Missing timestamp → `—` (placeholder; see #159). Anything fresher than a
+ * minute → `""`, meaning "say nothing": a lane that just printed activity is
+ * already visibly live, so `1s ago` was pure noise on every running agent.
  */
 export function formatActivityAgo(lastActivityAt: number | undefined, now: number): string {
 	if (lastActivityAt === undefined || !Number.isFinite(lastActivityAt)) return "—";
 	const secs = Math.max(0, Math.floor((now - lastActivityAt) / 1000));
-	if (secs < 60) return `${secs}s ago`;
+	if (secs < ACTIVITY_AGO_MIN_SECS) return "";
 	const mins = Math.floor(secs / 60);
 	if (mins < 60) return `${mins}m ago`;
 	const hours = Math.floor(mins / 60);

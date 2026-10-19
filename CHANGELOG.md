@@ -11,6 +11,17 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Changed
+
+- **The railway lane only shows "last activity" once it is worth a word.**
+  A lane used to end with `· 1s ago` on every running agent — the tallest,
+  least informative field in the label, and it crowded out the role/clocks
+  that actually distinguish lanes. Ages under a minute are now dropped
+  entirely; from 60s up the field reads `1m ago` / `2h ago` / `3d ago` as
+  before, and a missing timestamp still shows `—`. `formatActivityAgo`
+  returns `""` for the dropped case, so the field simply disappears from the
+  detail candidates instead of leaving a dangling separator.
+
 ## [3.0.3] — 2026-10-19
 
 ### Changed
