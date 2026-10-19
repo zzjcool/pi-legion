@@ -16,6 +16,20 @@ function statusText(rows: { rssKb?: number; peakKb?: number; extra?: string }): 
 	return `${lines.join("\n")}\n`;
 }
 
+test("readProcRss never throws across a batch of stale pids (UI-refresh contract)", () => {
+	// The probe runs on every widget refresh, so a dead pid is the NORMAL case,
+	// not an error. Guard the whole batch path: mixed valid/invalid/stale input
+	// must degrade to `undefined` without throwing, every time.
+	const batch = [0, -1, 2_147_483_600, Number.NaN, Number.POSITIVE_INFINITY, process.pid];
+	for (const pid of batch) {
+		assert.doesNotThrow(() => readProcRss(pid), `pid ${pid} must not throw`);
+	}
+	// Repeated calls are equally safe (a refresh loop hits this constantly).
+	assert.doesNotThrow(() => {
+		for (let i = 0; i < 5; i += 1) readProcRss(2_147_483_600);
+	});
+});
+
 test("parseProcStatus reads VmRSS and VmHWM in megabytes", () => {
 	assert.deepEqual(parseProcStatus(statusText({ rssKb: 155_648, peakKb: 204_800 })), {
 		rssMb: 152,
