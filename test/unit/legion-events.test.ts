@@ -29,6 +29,8 @@ test("legion events enforce the exact 15-type set and JSON-round-trip data", () 
 		assert.deepEqual(readEventsAfter(db, 0, { nodeId: "missing" }), []);
 		assert.throws(() => appendEvent(db, "root", "unknown" as never), /invalid legion event type/);
 		assert.throws(() => appendEvent(db, "root", "node_launched", () => {}), /serializable/);
+		// hygiene.ts writes this type, so it must belong to the closed set. (#233)
+		assert.doesNotThrow(() => appendEvent(db, "root", "node_abandoned"));
 	} finally {
 		db.close();
 	}

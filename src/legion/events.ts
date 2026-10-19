@@ -19,6 +19,7 @@ export const LEGION_EVENT_TYPES = [
 	"mail_delivered",
 	"mail_bounced",
 	"budget_refused",
+	"node_abandoned",
 	"orphan_detected",
 	"tree_finalized",
 ] as const;
@@ -40,6 +41,13 @@ export interface AppendEventOptions {
 export interface ReadEventsOptions {
 	nodeId?: string;
 	limit?: number;
+}
+
+export interface ReadEventRowsOptions {
+	nodeId?: string;
+	limit?: number;
+	/** Called for a row that cannot be decoded; the row is skipped, not thrown. */
+	onInvalidRow?: (error: unknown, rowId: number) => void;
 }
 
 export function appendEvent<T>(
@@ -79,23 +87,28 @@ export function readEventsAfter(
 	cursor: number,
 	options: ReadEventsOptions = {},
 ): LegionEvent[] {
-	assertCursor(cursor);
-	const limit = options.limit ?? 1_000;
-	if (!Number.isSafeInteger(limit) || limit < 1) {
-		throw new TypeError("event limit must be a positive safe integer");
+	return selectEventRows(db, cursor, options).map(mapEvent);
+}
+
+/**
+ * Per-row tolerant read: an undecodable row is reported through `onInvalidRow` and
+ * skipped instead of throwing, so one poisoned row cannot stall an event consumer.
+ * `readEventsAfter` stays strict for callers that must fail loudly.
+ */
+export function readEventsAfterTolerant(
+	db: DatabaseSync,
+	cursor: number,
+	options: ReadEventRowsOptions = {},
+): LegionEvent[] {
+	const events: LegionEvent[] = [];
+	for (const row of selectEventRows(db, cursor, options)) {
+		try {
+			events.push(mapEvent(row));
+		} catch (error) {
+			options.onInvalidRow?.(error, Number(row.id));
+		}
 	}
-	const rows = options.nodeId
-		? db
-				.prepare(
-					"SELECT id, node_id, type, data, ts FROM events WHERE id > ? AND node_id = ? ORDER BY id LIMIT ?",
-				)
-				.all(cursor, options.nodeId, limit)
-		: db
-				.prepare(
-					"SELECT id, node_id, type, data, ts FROM events WHERE id > ? ORDER BY id LIMIT ?",
-				)
-				.all(cursor, limit);
-	return rows.map(mapEvent);
+	return events;
 }
 
 export function getEventById(db: DatabaseSync, id: number): LegionEvent | null {
@@ -147,6 +160,29 @@ function mapEvent(row: SqliteRow): LegionEvent {
 		data,
 		ts: Number(row.ts),
 	};
+}
+
+function selectEventRows(
+	db: DatabaseSync,
+	cursor: number,
+	options: ReadEventsOptions,
+): SqliteRow[] {
+	assertCursor(cursor);
+	const limit = options.limit ?? 1_000;
+	if (!Number.isSafeInteger(limit) || limit < 1) {
+		throw new TypeError("event limit must be a positive safe integer");
+	}
+	return options.nodeId
+		? db
+				.prepare(
+					"SELECT id, node_id, type, data, ts FROM events WHERE id > ? AND node_id = ? ORDER BY id LIMIT ?",
+				)
+				.all(cursor, options.nodeId, limit)
+		: db
+				.prepare(
+					"SELECT id, node_id, type, data, ts FROM events WHERE id > ? ORDER BY id LIMIT ?",
+				)
+				.all(cursor, limit);
 }
 
 function assertCursor(cursor: number): void {

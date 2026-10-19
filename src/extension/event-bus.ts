@@ -2,7 +2,7 @@ import type { DatabaseSync } from "../legion/db.ts";
 import {
 	LEGION_EVENT_TYPES as STORED_LEGION_EVENT_TYPES,
 	getDataVersion,
-	readEventsAfter,
+	readEventsAfterTolerant,
 } from "../legion/events.ts";
 import type { LegionEventType as StoredLegionEventType } from "../legion/events.ts";
 
@@ -193,13 +193,27 @@ export function createDbEventSource(
 			// Drain all batches for this dirty version so the cursor cannot strand
 			// events when a busy producer commits more than one batch at once.
 			for (;;) {
-				const batch = readEventsAfter(db, cursor, { limit: EVENT_BATCH_SIZE });
+				let skipped = 0;
+				const batch = readEventsAfterTolerant(db, cursor, {
+					limit: EVENT_BATCH_SIZE,
+					onInvalidRow: (error, rowId) => {
+						skipped += 1;
+						reportError(error);
+						// Advance past the undecodable row so one bad row cannot stall the stream.
+						if (rowId > cursor) cursor = rowId;
+					},
+				});
 				for (const event of batch) {
 					currentBus.emit(event);
-					cursor = event.id;
+					// Rows are ascending, but onInvalidRow may already have moved the cursor
+					// past a poison row in this same batch. Never let a decoded row rewind it,
+					// or the skipped row is re-read and re-reported on the next poll.
+					if (event.id > cursor) cursor = event.id;
 					if (!running || bus !== currentBus) return;
 				}
-				if (batch.length < EVENT_BATCH_SIZE) break;
+				// Skips count toward fullness: a batch of only poison rows still read
+				// a full page, so it must not be mistaken for the tail of the log.
+				if (batch.length + skipped < EVENT_BATCH_SIZE) break;
 			}
 			lastDataVersion = dataVersion;
 		} catch (error) {

@@ -1,19 +1,24 @@
 /**
  * Ledger event bus: the 250ms cross-process poll.
  *
- * This file is BOTH a measurement and a regression gate for a real defect
+ * This file is BOTH a measurement and a regression gate for the fix of #233
  * (reports/perf-2026-10-19/REPORT.md, P2):
  *
- *   `src/runs/hygiene.ts` writes an event of type `node_abandoned`, but
- *   `LEGION_EVENT_TYPES` does not contain it and `mapEvent` throws on an
- *   unknown type. `createDbEventSource` records the error and leaves the
- *   cursor unadvanced, so every subsequent poll re-reads the same poisoned
- *   batch and throws again: the cross-process view stalls permanently while
- *   burning a poll every 250ms.
+ *   `src/runs/hygiene.ts` writes an event of type `node_abandoned`. As long as
+ *   `LEGION_EVENT_TYPES` did not contain it, `mapEvent` threw on the row and
+ *   `createDbEventSource` left the cursor unadvanced, so every subsequent poll
+ *   re-read the same poisoned batch: the cross-process view stalled permanently
+ *   while burning a poll every 250ms.
  *
  * Fixed in #233: `node_abandoned` is now part of `LEGION_EVENT_TYPES`, so the
- * writer, the retention list and the read-side closed set agree again. The
- * `FIXED (was #233)` case below is the regression guard.
+ * writer, the retention list and the read-side closed set agree again. Two
+ * guards cover the two halves of that fix independently:
+ *
+ *   - `FIXED (was #233)` — the closed set now accepts the row hygiene writes.
+ *   - `a poison event row does not stall the cursor` — a row that is STILL
+ *     undecodable (a future type outside the set) must be stepped over and
+ *     reported once, not freeze the poll. The closed set alone would fix only
+ *     today's instance.
  */
 
 import { test } from "node:test";
@@ -99,11 +104,40 @@ test("FIXED (was #233): hygiene's node_abandoned row does not stall the poll", (
 		const source = createDbEventSource(h.db, { onError: (e) => errors.push(String(e)) });
 		try {
 			source.start(bus);
-			// The poison row must no longer stop the stream: every valid event
-			// before AND after it is delivered, and the cursor reaches the end.
+			// The row must no longer stop the stream: every valid event before AND
+			// after it is delivered, and the cursor reaches the end.
 			assert.deepEqual(delivered, ["node_launched", "node_settled"]);
 			assert.equal(source.getCursor(), 3, "the cursor must advance past all three rows");
 			assert.deepEqual(errors, []);
+		} finally {
+			source.stop();
+		}
+	});
+});
+
+test("a poison event row does not stall the cursor", () => {
+	withBench((h) => {
+		seedRoot(h);
+		appendEvent(h.db, "root", "node_launched", { at: 1 });
+		// An event type outside the closed set: the row cannot be decoded at all.
+		// The closed-set fix above cannot help here, only read-side tolerance can.
+		h.db
+			.prepare("INSERT INTO events (node_id, type, data, ts) VALUES (?, 'definitely_not_a_type', ?, ?)")
+			.run("root", "{}", 2);
+		appendEvent(h.db, "root", "phase_change", { at: 3 });
+
+		const bus = createLegionEventBus();
+		const delivered: string[] = [];
+		bus.on("node_launched", () => { delivered.push("node_launched"); });
+		bus.on("phase_change", () => { delivered.push("phase_change"); });
+		const errors: string[] = [];
+		const source = createDbEventSource(h.db, { onError: (e) => errors.push(String(e)) });
+		try {
+			source.start(bus);
+			assert.deepEqual(delivered, ["node_launched", "phase_change"], "valid rows around the poison row still arrive");
+			assert.equal(source.getCursor(), 3, "the cursor steps over the undecodable row");
+			assert.equal(errors.length, 1, "the undecodable row is reported exactly once");
+			assert.match(errors[0] ?? "", /unknown legion event type: definitely_not_a_type/);
 		} finally {
 			source.stop();
 		}
