@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { createCappedOutput, resolveMaxOutputBytes, DEFAULT_MAX_OUTPUT_BYTES } from "../../src/shared/output-cap.ts";
 import { defaultVerifyRunner } from "../../src/runs/acceptance.ts";
 import { runLegionCommand } from "../../src/extension/legion-tools.ts";
-import { createCommandRunner } from "../../src/backends/legacy/runner.ts";
 
 test("capped output keeps head, marks truncation, fires overflow once", () => {
 	let fired = 0;
@@ -52,14 +51,6 @@ test("runLegionCommand kills an infinite `yes` at the cap", async () => {
 	assert.ok(r.stdout.length < 70_000);
 	assert.match(r.stdout, /output truncated/);
 	assert.equal(r.timedOut, undefined);
-});
-
-test("legacy runner kills an infinite stream at the cap", async () => {
-	const run = createCommandRunner({ bin: "yes", env: { ...process.env, PI_LEGION_MAX_OUTPUT_BYTES: "65536" } });
-	const r = await run([], { timeoutMs: 20_000 });
-	assert.notEqual(r.code, 0);
-	assert.ok(r.stdout.length < 70_000);
-	assert.match(r.stdout, /output truncated/);
 });
 
 test("normal small output still exact", async () => {

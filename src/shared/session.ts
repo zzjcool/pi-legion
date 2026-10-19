@@ -120,19 +120,28 @@ function userTextOf(content: unknown): string {
 	return parts.join(" ");
 }
 
-/** Accumulate token usage from an assistant message into the running total. */
+/**
+ * Accumulate token usage from an assistant message into the running total.
+ *
+ * Returns this message's context size — `input + cacheRead + cacheWrite`, the
+ * prompt the model actually saw. `usage` is a lifetime sum across every
+ * message, so it cannot answer "how full is the context right now"; the caller
+ * keeps only the LAST returned value. `undefined` when the message carried no
+ * usage object (nothing was reported, which is not the same as zero).
+ */
 function accumulateUsage(
 	target: Usage,
 	message: Record<string, unknown>,
-): void {
+): number | undefined {
 	const usage = message.usage as Record<string, unknown> | undefined;
-	if (!usage || typeof usage !== "object") return;
+	if (!usage || typeof usage !== "object") return undefined;
 	const cost = usage.cost as Record<string, unknown> | undefined;
 	target.input += num(usage.input);
 	target.output += num(usage.output);
 	target.cacheRead += num(usage.cacheRead);
 	target.cacheWrite += num(usage.cacheWrite);
 	target.cost += num(cost?.total);
+	return num(usage.input) + num(usage.cacheRead) + num(usage.cacheWrite);
 }
 
 /**
@@ -232,7 +241,10 @@ function applyAssistant(
 	clock.awaitingSince = undefined;
 	clock.awaitingWall = undefined;
 
-	accumulateUsage(parsed.usage, message);
+	const contextTokens = accumulateUsage(parsed.usage, message);
+	// Later assistant messages overwrite earlier ones: the newest prompt size is
+	// the one that describes the context the model is holding now.
+	if (contextTokens !== undefined) parsed.lastContextTokens = contextTokens;
 	if (typeof message.model === "string") parsed.model = message.model;
 	if (stopReason) parsed.stopReason = stopReason;
 	// `output`: the last non-empty text anywhere (kept for display/back-compat).

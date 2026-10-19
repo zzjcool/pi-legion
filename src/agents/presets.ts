@@ -8,15 +8,15 @@
  *
  * Two invariants live here:
  *
- *  1. ATOMICITY — `kind` and `model` come from the same preset object.
- *     `nativeModelFor("cursor", "cb/kimi-k3")` returns `undefined`, so a
- *     mismatched pair would silently drop the model and start the child on
- *     the CLI default. `assertKindModelCoherent` rejects that combination
- *     at expansion time instead of letting the launch proceed.
+ *  1. ATOMICITY — `kind`, `model` and `thinking` come from the same preset
+ *     object, so a preset can never ship half of one bundle and half another.
  *
  *  2. LOUD UNDEFINED — a referenced preset name with no matching entry is
  *     an error that names the defined presets, never a silent fallback to
  *     the dispatch model (mirrors `checkModelScope`'s out-of-scope error).
+ *
+ * v4 runs `kind: pi` only: a preset that names another kind is reported once
+ * and applied as `pi` (see `parsePreset`).
  */
 
 import {
@@ -27,7 +27,6 @@ import {
 	type AgentKind,
 	type PresetConfig,
 } from "../shared/types.ts";
-import { nativeModelFor } from "../runs/kind.ts";
 
 const VALID_KINDS: ReadonlySet<string> = new Set(AGENT_KINDS);
 
@@ -71,13 +70,17 @@ function parsePreset(
 	const out: PresetConfig = {};
 
 	if (input.kind !== undefined) {
+		// A non-`pi` kind is no longer a validation error (the field is still a
+		// legal key, it just only accepts one value). Report the ignored value once
+		// and apply the preset as `pi`, the single supported kind.
 		if (typeof input.kind !== "string" || !VALID_KINDS.has(input.kind)) {
-			throw new Error(
-				`Subagent settings in '${filePath}' have invalid '${label}.kind'; ` +
-					`expected one of: ${AGENT_KINDS.join(", ")}.`,
+			console.error(
+				`[pi-legion] preset '${name}' in ${filePath} sets kind ${JSON.stringify(input.kind)}; ` +
+					`v4 supports kind: pi only, so that field is ignored and the preset applies as kind: pi.`,
 			);
+		} else {
+			out.kind = input.kind as AgentKind;
 		}
-		out.kind = input.kind as AgentKind;
 	}
 
 	if (input.model !== undefined) {
@@ -150,36 +153,6 @@ export function requirePreset(
 		`Preset '${name}' is not defined in subagents.presets. ${suffix}`,
 		ErrorCodes.INVALID_PARAMS,
 	);
-}
-
-/**
- * Throw when `nativeModelFor(kind, model)` would silently drop the model.
- *
- * Reuses `nativeModelFor` rather than re-implementing the shape test, so the
- * guard can never disagree with the argv builder about what a kind accepts.
- *
- * `model` is the RESOLVED model — whichever precedence level actually won —
- * not the preset's own `model`, because a per-run tool `model`, `defaultModel`,
- * an override or the dispatch model can all beat or fill in for the preset.
- * The message therefore names the preset's KIND as the origin and reports
- * where the model came from, rather than implying the preset set it.
- */
-export function assertKindModelCoherent(
-	kind: AgentKind,
-	model: string | undefined,
-	presetName: string,
-	modelOrigin?: string,
-): void {
-	if (!model) return;
-	if (nativeModelFor(kind, model) === undefined) {
-		const origin = modelOrigin ? ` (from ${modelOrigin})` : "";
-		throw new SubagentError(
-			`Preset '${presetName}' selects kind '${kind}', but the resolved model '${model}'${origin} ` +
-				`cannot be used with that kind and would be silently dropped at start. ` +
-				`Fix the preset's kind or the model source.`,
-			ErrorCodes.INVALID_PARAMS,
-		);
-	}
 }
 
 /**

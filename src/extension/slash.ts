@@ -14,7 +14,6 @@ import type {
 } from "../shared/types.ts";
 import { classifyModelOrigin, resolveStepModel } from "../agents/step-model.ts";
 import { checkModelScope } from "../agents/model-scope.ts";
-import { nativeModelFor } from "../runs/kind.ts";
 import {
 	DEFAULT_TEAM,
 	TEAM_ENV,
@@ -199,7 +198,6 @@ function renderOneAgent(
 	lines.push(`    ${agent.description}`);
 
 	const details: string[] = [];
-	if (agent.kind !== "pi") details.push(`kind=${agent.kind}`);
 	if (agent.alias?.length) details.push(`alias: ${agent.alias.join(", ")}`);
 
 	// Model resolution mirrors the launch path (resolveStepModel) so the line
@@ -247,9 +245,6 @@ function renderOneAgent(
  *     params are empty).
  *   - `checkModelScope` — an out-of-scope model is flagged exactly like
  *     `launchStep` would flag it (error-severity for explicit models).
- *   - `nativeModelFor` — a model the target kind cannot express is either a
- *     launch refusal (explicit origin, mirroring `planModelCandidates`) or a
- *     documented drop to the CLI's own default (inherited origin).
  */
 function modelLine(
 	agent: AgentConfig,
@@ -273,22 +268,6 @@ function modelLine(
 				? `✗ outside model scope — a launch would refuse this`
 				: `⚠ outside model scope — a launch would warn`,
 		);
-	}
-
-	// Kind/model coherence: a model the target CLI cannot express.
-	if (agent.kind !== "pi") {
-		const native = nativeModelFor(agent.kind, model, agent.thinking);
-		if (native === undefined) {
-			if (origin === "explicit") {
-				parts.push(
-					`✗ cannot be used with kind '${agent.kind}' — a launch would refuse this`,
-				);
-			} else {
-				parts.push(
-					`dropped at launch: kind '${agent.kind}' runs on its own default`,
-				);
-			}
-		}
 	}
 
 	return parts.join(" · ");

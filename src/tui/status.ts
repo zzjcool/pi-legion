@@ -66,6 +66,25 @@ export interface StatusEntry {
 	nodeId?: string;
 	parentId?: string | null;
 	depth?: number;
+	/**
+	 * Backend the child was actually spawned on (#209). Absent for legacy
+	 * records and for tree-only rows — consumers render `unknown`, never `rpc`.
+	 */
+	spawnMode?: string;
+	/**
+	 * Own OS process of an `rpc` child. Never persisted (pids are host-scoped),
+	 * so a row restored from disk has none. `inprocess` children have none by
+	 * definition — they share this process.
+	 */
+	pid?: number;
+	/** Prompt size of the last assistant message; absolute tokens, not a ratio. */
+	contextTokens?: number;
+	/**
+	 * Resident memory of this child in MB. Only ever set for a child with its own
+	 * process (D2): an `inprocess` child has no separate RSS and must render
+	 * blank rather than a share of the host figure.
+	 */
+	rss?: number;
 }
 
 /** Session-wide totals for the tree header: every launched agent (incl. aged-out), root excluded. */
@@ -552,7 +571,7 @@ function formatWidgetRows(entries: StatusEntry[], now: number, totals?: StatusTo
 		return formatEntryLines(entries[0]!, now, { head: "", detail: "" })
 			.map((text) => ({ text }));
 	}
-	const rows: WidgetRow[] = [{ text: "● Async agents · herdr" }];
+	const rows: WidgetRow[] = [{ text: "● Async agents" }];
 	for (const [index, entry] of entries.entries()) {
 		const last = index === entries.length - 1;
 		rows.push(

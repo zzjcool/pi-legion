@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
 	createSessionRuntime,
 	formatAliveQuiet,
+	formatContextTokens,
 	lastJsonlEventAgeMs,
 	MAX_PENDING_AGE_MS,
 	renderLiveChildStatus,
@@ -1502,6 +1503,99 @@ test("renderLiveChildStatus prints the arbitrated spawnMode, and unknown when ab
 
 	const rpc = renderLiveChildStatus({ ...base, spawnMode: "rpc" });
 	assert.match(rpc, /^supervisor=rpc$/m);
+});
+
+test("renderLiveChildStatus appends a context line from the child's own session (D4)", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = join(dir, "worker-0.jsonl");
+		writeFileSync(
+			sessionFile,
+			[
+				JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "go" }] } }),
+				JSON.stringify({
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "done" }],
+						stopReason: "stop",
+						usage: { input: 24_000, output: 300, cacheRead: 300, cacheWrite: 0, cost: { total: 0.02 } },
+					},
+				}),
+			].join("\n") + "\n",
+		);
+		const text = renderLiveChildStatus({
+			name: "worker-0",
+			state: "working",
+			agent: "worker",
+			kind: "pi",
+			sessionFile,
+			alive: false,
+			now: 0,
+		});
+		// 24000 + 300 + 0 → 24.3K. Absolute tokens: JSONL has no contextWindow,
+		// so any percentage here would be fabricated.
+		assert.match(text, /^context: ctx=24\.3K tok$/m);
+		assert.doesNotMatch(text, /%/);
+		// Appended after the snapshots, before the path meta: every pre-existing
+		// line keeps its text and order.
+		assert.ok(text.indexOf("context:") < text.indexOf("supervisor="), "context before path meta");
+		assert.match(text, /^supervisor=unknown$/m);
+
+		// No assistant message yet → no line at all (unknown, not zero).
+		const emptyFile = join(dir, "empty.jsonl");
+		writeFileSync(emptyFile, `${JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "go" }] } })}\n`);
+		const noContext = renderLiveChildStatus({
+			name: "worker-0",
+			state: "working",
+			agent: "worker",
+			kind: "pi",
+			sessionFile: emptyFile,
+			alive: false,
+			now: 0,
+		});
+		assert.doesNotMatch(noContext, /^context: /m);
+	});
+});
+
+test("formatContextTokens prints absolute token counts, never a percentage", () => {
+	assert.equal(formatContextTokens(0), "0");
+	assert.equal(formatContextTokens(950), "950");
+	assert.equal(formatContextTokens(24_300), "24.3K");
+	assert.equal(formatContextTokens(1_400_000), "1.4M");
+});
+
+test("renderLiveChildStatus: an rpc child reports its own rss, an inprocess child never does (D2)", () => {
+	const base = {
+		name: "worker-0",
+		state: "working",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "",
+		alive: false,
+		now: 0,
+	};
+	// This host process is the one pid guaranteed to have a readable status file.
+	const rpc = renderLiveChildStatus({ ...base, spawnMode: "rpc", pid: process.pid });
+	if (process.platform !== "linux") {
+		// Non-Linux degrades to no memory line rather than a wrong number.
+		assert.doesNotMatch(rpc, /^memory: /m);
+	} else {
+		assert.match(rpc, /^memory: rss=\d+m( peak=\d+m)?$/m, `expected a per-child rss line:\n${rpc}`);
+	}
+
+	// An inprocess child shares this process: it must NOT be handed a per-child
+	// rss (D2 forbids apportioning the host figure across children). It reports
+	// the host number once, and says it is shared.
+	const inprocess = renderLiveChildStatus({ ...base, spawnMode: "inprocess" });
+	if (process.platform !== "linux") {
+		assert.doesNotMatch(inprocess, /^memory: /m);
+	} else {
+		assert.match(inprocess, /^memory: host rss=\d+m \(shared by inprocess children\)$/m);
+		assert.doesNotMatch(inprocess, /^memory: rss=/m);
+	}
+
+	// No pid and no mode: nothing honest to say, so no line at all.
+	assert.doesNotMatch(renderLiveChildStatus(base), /^memory: /m);
 });
 
 test("renderLiveChildStatus keeps the supervisor meta after every snapshot line", async () => {

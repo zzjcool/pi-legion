@@ -16,19 +16,6 @@
  * ```
  */
 
-// ── deprecated herdr transport ──────────────────────────────────────────────
-/** @deprecated Use `RpcSupervisor` for the v2 execution path. */
-export {
-	createHerdrClient,
-	parseHerdrResponse,
-	mapHerdrErrorCode,
-	readPaneDiagnostic,
-	SubagentError,
-} from "./backends/legacy/client.ts";
-/** @deprecated Only for pi-legion v0.16.x Herdr workflows. */
-export { createCommandRunner, resolveHerdrBin } from "./backends/legacy/runner.ts";
-export type { RunnerOptions } from "./backends/legacy/runner.ts";
-
 // ── agent definitions ───────────────────────────────────────────────────────
 export {
 	BUILTIN_AGENT_NAMES,
@@ -66,7 +53,6 @@ export type {
 } from "./agents/model-resolution.ts";
 export {
 	applyPreset,
-	assertKindModelCoherent,
 	expandPreset,
 	parsePresets,
 	requirePreset,
@@ -191,13 +177,6 @@ export {
 	THINKING_LEVELS,
 } from "./runs/args.ts";
 export type { BuildArgsInput, BuildArgsResult } from "./runs/args.ts";
-export {
-	cursorModel,
-	isPiShapedModel,
-	nativeModelFor,
-	planKindStart,
-} from "./runs/kind.ts";
-export type { KindStartPlan } from "./runs/kind.ts";
 export {
 	createChildWorktree,
 	isGitRepo,
@@ -326,16 +305,3 @@ export type {
 	TurnBudgetConfig,
 	Usage,
 } from "./shared/types.ts";
-/** @deprecated v0.16.x pane backend compatibility types. */
-export type {
-	AgentInfo,
-	AgentStartResult,
-	CommandRunner,
-	HerdrClient,
-	HerdrError,
-	HerdrResult,
-	PaneInfo,
-	ProcessInfo,
-	ReadSource,
-	TabInfo,
-} from "./backends/legacy/types.ts";

@@ -306,14 +306,13 @@ test("renderAgentsListing: model line reports the resolved model + provenance", 
 
 test("renderAgentsListing: no model anywhere → agent CLI default", () => {
 	const text = renderAgentsListing({
-		agents: [stubAgent({ name: "free", kind: "cursor" })],
+		agents: [stubAgent({ name: "free" })],
 		scope: "user",
 		projectAgentsDir: null,
 		builtinAgentsDir: "/pkg/agents",
 		settings: {},
 	});
-	// kind=cursor is surfaced, and no model resolves
-	assert.match(text, /kind=cursor/);
+	// No model resolves anywhere, so the listing says so instead of guessing.
 	assert.match(text, /model: \(agent CLI default\)/);
 });
 
@@ -359,39 +358,6 @@ test("renderAgentsListing: modelScope violation — inherited model is a warning
 		dispatchModel: "cb/glm-5.3",
 	});
 	assert.match(text, /⚠ outside model scope — a launch would warn/);
-});
-
-test("renderAgentsListing: explicit pi-shaped model on a cursor role is a launch refusal", () => {
-	const text = renderAgentsListing({
-		agents: [
-			stubAgent({ name: "websearch", kind: "cursor", model: "cb/kimi-k3" }),
-		],
-		scope: "user",
-		projectAgentsDir: null,
-		builtinAgentsDir: "/pkg/agents",
-		settings: {},
-	});
-	// `planModelCandidates` refuses an explicit model the kind cannot express.
-	assert.match(
-		text,
-		/✗ cannot be used with kind 'cursor' — a launch would refuse this/,
-	);
-});
-
-test("renderAgentsListing: inherited pi-shaped model on a cursor role is a documented drop", () => {
-	const text = renderAgentsListing({
-		agents: [stubAgent({ name: "websearch", kind: "cursor" })],
-		scope: "user",
-		projectAgentsDir: null,
-		builtinAgentsDir: "/pkg/agents",
-		settings: {},
-		dispatchModel: "cb/kimi-k3",
-	});
-	// The launch path drops the model and warns; the child runs on the CLI default.
-	assert.match(
-		text,
-		/dropped at launch: kind 'cursor' runs on its own default/,
-	);
 });
 
 test("renderAgentsListing: unresolvable configuration is reported, not guessed", () => {

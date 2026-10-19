@@ -22,7 +22,6 @@ import {
 	resolveSubagentSettings,
 } from "../../src/agents/settings.ts";
 import { buildPiArgs } from "../../src/runs/args.ts";
-import { planKindStart } from "../../src/runs/kind.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 
 function agent(over: Partial<AgentConfig> = {}): AgentConfig {
@@ -648,42 +647,6 @@ test("buildPiArgs omits the system-prompt flag without prompts", () => {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
-
-// ── kind.ts: non-pi prompt composition ──────────────────────────────────
-
-test("planKindStart rides childContext in a non-pi task prompt", () => {
-	const plan = planKindStart({
-		agent: agent({ kind: "cursor", systemPrompt: "role prompt" }),
-		task: "do the thing",
-		sessionFile: "/tmp/s.jsonl",
-		tempDir: "/tmp/unused",
-		childContext: "cursor discipline",
-	});
-	const roleIdx = plan.taskText.indexOf("role prompt");
-	const ctxIdx = plan.taskText.indexOf("cursor discipline");
-	const taskIdx = plan.taskText.indexOf("do the thing");
-	assert.ok(
-		roleIdx >= 0 && ctxIdx > roleIdx && taskIdx > ctxIdx,
-		"order: role < context < task",
-	);
-});
-
-test("planKindStart keeps a pi task prompt free of the context", () => {
-	const dir = mkdtempSync(path.join(tmpdir(), "ctx-kind-pi-"));
-	try {
-		const plan = planKindStart({
-			agent: agent(),
-			task: "do the thing",
-			sessionFile: "/tmp/s.jsonl",
-			tempDir: dir,
-			childContext: "pi discipline",
-		});
-		assert.ok(!plan.taskText.includes("pi discipline"));
-	} finally {
-		rmSync(dir, { recursive: true, force: true });
-	}
-});
-
 
 // ── #171 team-level parent/child context ────────────────────────────────
 

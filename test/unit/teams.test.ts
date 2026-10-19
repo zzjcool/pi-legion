@@ -618,7 +618,6 @@ test("catalog: filters agents, keeps allAgents, and team overrides precede defau
 								model: "team/model",
 								onBlocked: "forward",
 								timeoutMs: 17,
-								kind: "claude",
 								tools: ["read"],
 							}],
 						},
@@ -646,7 +645,7 @@ test("catalog: filters agents, keeps allAgents, and team overrides precede defau
 		assert.equal(catalog.agents[0]?.model, "team/model");
 		assert.equal(catalog.agents[0]?.onBlocked, "forward");
 		assert.equal(catalog.agents[0]?.timeoutMs, 17);
-		assert.equal(catalog.agents[0]?.kind, "claude");
+		assert.equal(catalog.agents[0]?.kind, "pi");
 		assert.deepEqual(catalog.agents[0]?.tools, ["read"]);
 		assert.equal(catalog.allAgents[1]?.model, "fallback/model");
 		assert.equal(catalog.allAgents[1]?.onBlocked, "notify");
@@ -797,8 +796,8 @@ test("launch refusal: only a real team-filtered role gets team wording", () => {
 });
 
 test("control resolution prefers team override, then recovers a filtered role from allAgents", () => {
-	const baseWorker = agent("worker", { timeoutMs: 2_000, kind: "pi" });
-	const teamWorker = agent("worker", { timeoutMs: 17, kind: "claude" });
+	const baseWorker = agent("worker", { timeoutMs: 2_000, model: "base/model" });
+	const teamWorker = agent("worker", { timeoutMs: 17, model: "team/model" });
 	const designer = agent("designer");
 	const currentTeam = [teamWorker, designer];
 	const resolve = (agents: AgentConfig[], allAgents: AgentConfig[], role: string | undefined) =>
@@ -884,7 +883,7 @@ test("control wait: team-overridden role definition wins over allAgents", async 
 		await waitAction({
 			params: { action: "wait", name: "worker-existing" },
 			runtime,
-			agents: [agent("worker", { kind: "claude", timeoutMs: 17 })],
+			agents: [agent("worker", { timeoutMs: 17 })],
 			allAgents: [agent("worker", { timeoutMs: 2_000 })],
 			store,
 			cwd: dir,
@@ -991,7 +990,7 @@ function indexHarness(
 const WORKER_FILE = "---\nname: worker\ndescription: worker role\n---\nworker prompt\n";
 const RPC_WORKER_FILE = "---\nname: rpcworker\ndescription: worker role pinned to rpc\nspawnMode: rpc\n---\nworker prompt\n";
 const UTILITY_FILE = "---\nname: scout\ndescription: read-only utility role\nutility: true\ntools: read, grep, find, ls\nkind: pi\n---\nscout prompt\n";
-const DESIGNER_FILE = "---\nname: designer\ndescription: designer role\nkind: cursor\n---\ndesigner prompt\n";
+const DESIGNER_FILE = "---\nname: designer\ndescription: designer role\n---\ndesigner prompt\n";
 
 async function invokeIndex(
 	harness: ReturnType<typeof indexHarness>,
@@ -1477,7 +1476,7 @@ test("index mainline: default team omits inherited team env and RPC ignores lega
 	} finally { await harness.cleanup(); }
 });
 
-test("index mainline: environment default team reaches child and non-pi role receives migration guidance", async () => {
+test("index mainline: environment default team reaches the child", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true, team: "frontend", teams: { frontend: { members: ["designer"] } } },
 		{ "worker.md": WORKER_FILE, "designer.md": DESIGNER_FILE },
@@ -1485,11 +1484,10 @@ test("index mainline: environment default team reaches child and non-pi role rec
 	const previous = process.env[TEAM_ENV];
 	try {
 		process.env[TEAM_ENV] = "default";
-		await invokeIndex(harness, { agent: "worker", task: "default role", async: false, worktree: false });
+		const text = await invokeIndex(harness, { agent: "worker", task: "default role", async: false, worktree: false });
+		assert.match(text, /supervisor=inprocess/);
 		assert.equal(harness.supervisor.spawns[0]?.input.env?.PI_SUBAGENTS_TEAM, "default");
-		const result = await invokeIndex(harness, { agent: "designer", task: "unsupported non-pi", async: false, worktree: false });
-		assert.match(result, /kind: pi|v0\.16\.x/);
-		assert.equal(harness.supervisor.spawns.length, 1, "non-pi kinds never reach RpcSupervisor.spawnChild");
+		assert.equal(harness.supervisor.spawns.length, 1);
 	} finally {
 		restoreEnv(TEAM_ENV, previous);
 		await harness.cleanup();
