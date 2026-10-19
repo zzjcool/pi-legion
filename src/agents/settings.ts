@@ -27,6 +27,7 @@ import {
 	readConventionContext,
 } from "./context.ts";
 import { OVERRIDE_FIELDS } from "./overrides.ts";
+import { ignoredKindMessage, reportIgnoredOnce } from "../shared/ignored-kind.ts";
 import { parseModelScopeConfig } from "./model-scope.ts";
 import { parsePresets } from "./presets.ts";
 
@@ -570,9 +571,9 @@ function parseAgentOverride(
 	// A non-`pi` kind is reported once and ignored rather than rejected: the key
 	// is still legal, it only has one accepted value in v4.
 	if (normalized.kind !== undefined && !isValidOverrideField("kind", normalized.kind)) {
-		console.error(
-			`[pi-legion] settings override '${field}' in ${filePath} sets kind ${JSON.stringify(normalized.kind)}; ` +
-				`v4 supports kind: pi only, so that field is ignored and the agent launches as kind: pi.`,
+		reportIgnoredOnce(
+			`override:${field}`,
+			ignoredKindMessage({ origin: `settings override '${field}'`, subject: `in ${filePath}`, value: normalized.kind }),
 		);
 		delete normalized.kind;
 	}

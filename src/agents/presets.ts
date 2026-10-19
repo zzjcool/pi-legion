@@ -27,6 +27,7 @@ import {
 	type AgentKind,
 	type PresetConfig,
 } from "../shared/types.ts";
+import { ignoredKindMessage, reportIgnoredOnce } from "../shared/ignored-kind.ts";
 
 const VALID_KINDS: ReadonlySet<string> = new Set(AGENT_KINDS);
 
@@ -74,9 +75,9 @@ function parsePreset(
 		// legal key, it just only accepts one value). Report the ignored value once
 		// and apply the preset as `pi`, the single supported kind.
 		if (typeof input.kind !== "string" || !VALID_KINDS.has(input.kind)) {
-			console.error(
-				`[pi-legion] preset '${name}' in ${filePath} sets kind ${JSON.stringify(input.kind)}; ` +
-					`v4 supports kind: pi only, so that field is ignored and the preset applies as kind: pi.`,
+			reportIgnoredOnce(
+				`preset:${name}`,
+				ignoredKindMessage({ origin: `preset '${name}'`, subject: `in ${filePath}`, value: input.kind }),
 			);
 		} else {
 			out.kind = input.kind as AgentKind;
