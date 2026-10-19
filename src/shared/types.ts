@@ -412,6 +412,16 @@ export interface ParsedSession {
 	lastTurnMissing: boolean;
 	tornLines: number;
 	/**
+	 * Context size of the FINAL assistant message of the session: its
+	 * `input + cacheRead + cacheWrite`, i.e. the prompt the model actually saw.
+	 *
+	 * Unlike `usage` (a cumulative total across every message) this is a current
+	 * value, so it stops growing when the session stops. Optional because a
+	 * session with no assistant message has no context yet — and there is no
+	 * percentage to derive: session JSONL carries no `contextWindow`.
+	 */
+	lastContextTokens?: number;
+	/**
 	 * Cumulative model-generation wall time in ms: each completed assistant
 	 * message timestamp minus the preceding user or toolResult timestamp when
 	 * both are known. Tool/idle gaps are excluded. Approximate — session JSONL
@@ -478,6 +488,15 @@ export interface Handle {
 	 * result, #209). Callers render this instead of assuming `rpc`.
 	 */
 	spawnMode: SpawnMode;
+	/**
+	 * OS process of an `rpc` child, when the supervisor reported one.
+	 *
+	 * Deliberately not persisted (no `run.json` / `legion.db` field): a pid is
+	 * only meaningful inside the host that spawned it, so a later session would
+	 * read a number that now belongs to some unrelated process. `inprocess`
+	 * children have no pid of their own — they share this process.
+	 */
+	pid?: number;
 }
 
 // =============================================================================

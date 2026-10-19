@@ -56,7 +56,7 @@ import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
-import { allocateSiblingNames, isValidAgentName, makeName } from "./src/shared/name.ts";
+import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
 import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
 import { restoreHostNodeOptions } from "./src/supervisor/child-memory.ts";
 import { currentChildContext } from "./src/supervisor/child-context.ts";
@@ -925,9 +925,17 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		stop: stopChildren,
 		childStatus: (name, cwd) => {
 			try {
-				const found = findChild(runStoreFor(cwd).listRuns(), name);
+				const store = runStoreFor(cwd);
+				const runs = store.listRuns();
+				const found = findChild(runs, name);
 				if (!found) return undefined;
 				const child = found.child;
+				const alive = supervisor.isAlive(child.name);
+				// Run-dir ownership verdict (#209-3), the same one `subagent status`
+				// uses: `alive` is this process's in-memory registry and never holds a
+				// child launched elsewhere, so a foreign record needs the owner marker.
+				// Undefined while alive — liveness already wins there.
+				const owner = ownerVerdictFor(store, runs, child.name, alive);
 				return {
 					name: child.name,
 					state: child.state,
@@ -938,7 +946,11 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					...(child.acceptance
 						? { acceptance: { status: child.acceptance.status, level: child.acceptance.level } }
 						: {}),
-					alive: supervisor.isAlive(child.name),
+					// run.json records the arbitrated backend; a legacy record has none,
+					// and `renderLiveChildStatus` renders that as `unknown` — never `rpc`.
+					...(child.spawnMode ? { spawnMode: child.spawnMode } : {}),
+					alive,
+					...(owner ? { owner } : {}),
 				};
 			} catch {
 				return undefined;
@@ -1404,7 +1416,10 @@ async function controlAction(input: {
 					live.map((child) => {
 						const alive = input.supervisor.isAlive(child.name);
 						const owner = ownerVerdictFor(store, runs, child.name, alive);
-						return { child, alive, ...(owner ? { owner } : {}) };
+						// A pid only exists for a child this process actually tracks; a
+						// record from another session has none, and none is invented.
+						const pid = input.runtime.get(child.name)?.pid;
+						return { child, alive, ...(owner ? { owner } : {}), ...(pid ? { pid } : {}) };
 					}),
 				),
 			);
@@ -1764,6 +1779,7 @@ async function launchFamily(input: {
 		// abort (interrupted results run after that), so it is kept per name
 		// here — same precedent as `timeoutByName`.
 		spawnByName: new Map(),
+		pidByName: new Map(),
 		...(nameGate.name ? { launchName: nameGate.name } : {}),
 	};
 
@@ -1858,6 +1874,13 @@ interface LaunchSession {
 	timeoutByName: Map<string, number>;
 	/** Arbitrated backend per resolved handle; survives an abort clearing `handles`. */
 	spawnByName: Map<string, { name: string; agent: string; spawnMode: SpawnMode }>;
+	/**
+	 * Own process of an `rpc` child, keyed by name — same reason `timeoutByName`
+	 * exists: `Handle.pid` is not persisted, so a re-follow from `ChildRecord`
+	 * cannot recover it. Kept out of `spawnByName` so `details.spawns` (a
+	 * renderer input) keeps its published shape.
+	 */
+	pidByName: Map<string, number>;
 	/** Explicit child name for this single-step launch; omit to auto-allocate. */
 	launchName?: string;
 }
@@ -1975,6 +1998,7 @@ async function launchStep(
 			agent: effective.name,
 			spawnMode: handle.spawnMode,
 		});
+		if (handle.pid) session.pidByName.set(handle.name, handle.pid);
 		if (effective.timeoutMs !== undefined) {
 			session.timeoutByName.set(handle.name, effective.timeoutMs);
 		}
@@ -2370,6 +2394,7 @@ async function launchUtilityFamily(input: {
 					agent: item.agent.name,
 					sessionFile: handle.sessionFile,
 					spawnMode: handle.spawnMode,
+					...(handle.pid ? { pid: handle.pid } : {}),
 					orchestrator,
 					retire,
 				},
@@ -2386,6 +2411,7 @@ async function launchUtilityFamily(input: {
 		agent: string;
 		sessionFile: string;
 		spawnMode: SpawnMode;
+		pid?: number;
 		orchestrator: Orchestrator;
 		retire: (opts?: RetireOptions) => Promise<void>;
 	}> = [];
@@ -2403,6 +2429,7 @@ async function launchUtilityFamily(input: {
 			timeoutMs,
 			// Arbitrated at launch; never re-derived here (#209).
 			spawnMode: handle.spawnMode,
+			...(handle.pid ? { pid: handle.pid } : {}),
 			orchestrator: handle.orchestrator,
 			store,
 			watch,
@@ -2652,6 +2679,13 @@ function followJob(
 		treeIdentity?: { nodeId: string; parentId: string | null; depth: number };
 		/** Arbitrated backend from `Handle.spawnMode`; omitted when unknown (#209). */
 		spawnMode?: SpawnMode;
+		/**
+		 * Own process of an `rpc` child (`Handle.pid`), for the memory probe.
+		 * Omitted when the caller has no handle at hand — a rebuilt orchestrator
+		 * only knows `ChildRecord`, and a pid is not persisted, so it must not be
+		 * guessed or looked up elsewhere.
+		 */
+		pid?: number;
 	},
 ): void {
 	const child = input.orchestrator
@@ -2672,6 +2706,7 @@ function followJob(
 		...(child?.thinking !== undefined ? { thinking: child.thinking } : {}),
 		...(child?.worktreeBranch ? { worktreeBranch: child.worktreeBranch } : {}),
 		...(spawnMode ? { spawnMode } : {}),
+		...(input.pid ? { pid: input.pid } : {}),
 		...(input.treeIdentity ? input.treeIdentity : child?.nodeId ? {
 			nodeId: child.nodeId,
 			parentId: child.nodeId.includes(".") ? child.nodeId.slice(0, child.nodeId.lastIndexOf(".")) : null,
@@ -2749,16 +2784,21 @@ function followChild(ctx: ChildContext, opts: { watch: boolean }): void {
 }
 
 /**
- * The arbitrated backend recorded for one handled child of this request.
+ * The arbitrated backend recorded for one handled child of this request, plus
+ * the OS process of that child when the launch reported one.
  *
  * Spreads to nothing when unknown, so the caller never has to invent a value.
  */
 function spawnModeOf(
 	session: LaunchSession,
 	name: string,
-): { spawnMode?: SpawnMode } {
+): { spawnMode?: SpawnMode; pid?: number } {
 	const recorded = session.spawnByName.get(name);
-	return recorded ? { spawnMode: recorded.spawnMode } : {};
+	const pid = session.pidByName.get(name);
+	return {
+		...(recorded ? { spawnMode: recorded.spawnMode } : {}),
+		...(pid ? { pid } : {}),
+	};
 }
 
 function followLaunched(
@@ -2869,11 +2909,17 @@ export function renderStatusOverview(
 		alive: boolean;
 		/** Run-dir ownership verdict (#209-3); see {@link renderLiveChildStatus}. */
 		owner?: "live" | "dead" | "unknown";
+		/**
+		 * Own process of an `rpc` child, when this session launched it. A pid is
+		 * not persisted, so a record from another session has none — and none is
+		 * invented here (D3).
+		 */
+		pid?: number;
 	}>,
 ): string {
 	if (children.length === 0) return "No live children.";
 	const noun = children.length === 1 ? "child" : "children";
-	const blocks = children.map(({ child, alive, owner }) =>
+	const blocks = children.map(({ child, alive, owner, pid }) =>
 		renderLiveChildStatus({
 			name: child.name,
 			state: child.state,
@@ -2885,6 +2931,7 @@ export function renderStatusOverview(
 			spawnMode: child.spawnMode,
 			alive,
 			...(owner ? { owner } : {}),
+			...(pid ? { pid } : {}),
 		}),
 	);
 	return [`Status · ${children.length} live ${noun}`, "", blocks.join("\n\n")].join("\n");

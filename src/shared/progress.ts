@@ -22,6 +22,13 @@ export interface LiveProgress {
 	/** Cumulative output tokens only (numerator for tok/s). */
 	tokensOut?: number;
 	/**
+	 * Prompt size of the last assistant message (`input+cacheRead+cacheWrite`):
+	 * how full the context is right now, not a lifetime total. Absolute value
+	 * only — session JSONL records no `contextWindow`, so there is no honest
+	 * percentage to show.
+	 */
+	contextTokens?: number;
+	/**
 	 * Cumulative model-generation wall ms from the session (denominator for
 	 * tok/s). See ParsedSession.generationMs.
 	 */
@@ -41,6 +48,9 @@ export function progressFromSession(parsed: ParsedSession): LiveProgress {
 		...turnClock(lastTurn, turnInFlight),
 		...(total > 0 ? { usageTotal: total } : {}),
 		...(tokensOut > 0 ? { tokensOut } : {}),
+		...(parsed.lastContextTokens !== undefined && parsed.lastContextTokens > 0
+			? { contextTokens: parsed.lastContextTokens }
+			: {}),
 		...(parsed.generationMs > 0 ? { generationMs: parsed.generationMs } : {}),
 	};
 }
@@ -85,6 +95,7 @@ export function mergeProgress(...parts: Array<LiveProgress | undefined>): LivePr
 		}
 		if (part.usageTotal && part.usageTotal > 0) out.usageTotal = part.usageTotal;
 		if (part.tokensOut && part.tokensOut > 0) out.tokensOut = part.tokensOut;
+		if (part.contextTokens && part.contextTokens > 0) out.contextTokens = part.contextTokens;
 		if (part.generationMs && part.generationMs > 0) out.generationMs = part.generationMs;
 	}
 	return out;

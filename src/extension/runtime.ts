@@ -33,6 +33,7 @@ import {
 	type WidgetTui,
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
+import { readProcRss } from "../supervisor/proc-memory.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
 import {
 	DEFAULTS,
@@ -87,6 +88,12 @@ export interface TrackedJobInput {
 	 * unknown rather than a guessed `rpc`.
 	 */
 	spawnMode?: SpawnMode;
+	/**
+	 * OS process of an `rpc` child (`Handle.pid`), for the memory probe only.
+	 * Optional: an `inprocess` child has no process of its own, and a legacy
+	 * record has no value. Never persisted — a pid is host-scoped.
+	 */
+	pid?: number;
 	/** Legion tree identity supplied by the host when the M2 ChildRecord is available. */
 	nodeId?: string;
 	parentId?: string | null;
@@ -245,6 +252,20 @@ export interface LiveChildStatusInput {
 	 * by the owner marker instead. Only consulted when `alive` is false.
 	 */
 	owner?: "live" | "dead" | "unknown";
+	/**
+	 * Own OS process of an `rpc` child (`Handle.pid`), when this session owns it.
+	 *
+	 * Only a pid of THIS host is ever supplied — pids are not persisted, so a
+	 * record from a previous session has none. `inprocess` children have none by
+	 * definition: they share this process.
+	 */
+	pid?: number;
+	/**
+	 * Context size of the last assistant message. Explicit override; otherwise
+	 * derived from `sessionFile` through `progressFromSessionFile` — the same
+	 * `accumulateUsage` source of truth the widget reads.
+	 */
+	contextTokens?: number;
 	now?: number;
 }
 
@@ -313,6 +334,43 @@ function ownerLine(owner: "live" | "dead" | "unknown"): string {
 	return `owner: ${owner}`;
 }
 
+/** Compact token count: `950`, `24.3K`, `1.4M` — absolute, never a percentage. */
+export function formatContextTokens(value: number): string {
+	if (!Number.isFinite(value) || value <= 0) return "0";
+	const unit = value >= 1_000_000 ? "M" : value >= 1_000 ? "K" : "";
+	const divisor = unit === "M" ? 1_000_000 : unit === "K" ? 1_000 : 1;
+	if (!unit) return String(Math.round(value));
+	return `${(value / divisor).toFixed(1).replace(/\.0$/, "")}${unit}`;
+}
+
+/** Context size of the child's own session, when it has one to read. */
+function contextTokensFor(sessionFile: string): number | undefined {
+	if (!sessionFile) return undefined;
+	const live = progressFromSessionFile(sessionFile);
+	return live.contextTokens;
+}
+
+/**
+ * Memory line for one child, following D2: only an `rpc` child owns a process,
+ * so only it gets a per-child RSS. An `inprocess` child runs INSIDE this host
+ * process — apportioning the host RSS across children would be invented data,
+ * so it reports the shared host figure and says so.
+ *
+ * `undefined` when there is nothing honest to print (no pid, non-Linux host,
+ * pid already gone).
+ */
+function memoryLine(input: LiveChildStatusInput): string | undefined {
+	if (input.spawnMode === "inprocess") {
+		const host = readProcRss(process.pid);
+		if (!host) return undefined;
+		return `memory: host rss=${host.rssMb}m (shared by inprocess children)`;
+	}
+	if (input.pid === undefined) return undefined;
+	const own = readProcRss(input.pid);
+	if (!own) return undefined;
+	return `memory: rss=${own.rssMb}m${own.peakMb !== undefined ? ` peak=${own.peakMb}m` : ""}`;
+}
+
 /**
  * Status text for one child (`/legion status <name>` and `subagent status`).
  *
@@ -365,6 +423,12 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 			`${acceptanceLabel}: ${input.acceptance.status}${input.acceptance.level ? ` (${input.acceptance.level})` : ""}`,
 		);
 	}
+	// Live resource facts. Appended as their own lines: every line above keeps
+	// its text and position, so existing readers of this block stay valid.
+	const contextTokens = input.contextTokens ?? contextTokensFor(input.sessionFile);
+	if (contextTokens !== undefined) lines.push(`context: ctx=${formatContextTokens(contextTokens)} tok`);
+	const memory = memoryLine(input);
+	if (memory) lines.push(memory);
 	lines.push(...meta);
 	if (stale) {
 		const persistedExecution = input.execution
@@ -1452,6 +1516,20 @@ function latestActivityAt(...candidates: Array<number | undefined>): number | un
 	return best;
 }
 
+/**
+ * Resident memory of a tracked job in MB, or `undefined` when there is no
+ * honest number to report (D2).
+ *
+ * Only an `rpc` child owns a process. An `inprocess` child runs inside this
+ * host, so it has no RSS of its own: apportioning the host figure across
+ * children would invent data the user then decides on. Those rows stay blank
+ * and the host figure is reported once, by name, elsewhere.
+ */
+function rssFor(job: TrackedJob): number | undefined {
+	if (job.spawnMode === "inprocess" || job.pid === undefined) return undefined;
+	return readProcRss(job.pid)?.rssMb;
+}
+
 function statusEntryFromJob(
 	job: TrackedJob,
 	identity?: LegionTreeIdentity,
@@ -1469,6 +1547,7 @@ function statusEntryFromJob(
 				: executionStatus === "failed" || executionStatus === "truncated" || executionStatus === undefined ? "failed"
 					: "retired";
 	const finishedAt = terminalNode ? node.updatedAt : job.settledAt;
+	const rss = rssFor(job);
 	const lastActivityAt = latestActivityAt(
 		node?.updatedAt,
 		live.currentTurnStartedAt,
@@ -1501,6 +1580,10 @@ function statusEntryFromJob(
 			? { tokensOut: live.tokensOut }
 			: node?.tokensOut ? { tokensOut: node.tokensOut } : {}),
 		...(live.generationMs ? { generationMs: live.generationMs } : {}),
+		...(live.contextTokens ? { contextTokens: live.contextTokens } : {}),
+		...(job.pid ? { pid: job.pid } : {}),
+		...(job.spawnMode ? { spawnMode: job.spawnMode } : {}),
+		...(rss !== undefined ? { rss } : {}),
 		...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
 		...(identity ? {
 			nodeId: identity.nodeId,
@@ -1537,9 +1620,11 @@ function statusEntryFromNode(
 		...(node.phase ? { phase: node.phase } : {}),
 		...(node.kind ? { kind: node.kind } : {}),
 		...(node.model ? { model: node.model } : {}),
+		...(node.spawnMode ? { spawnMode: node.spawnMode } : {}),
 		...(live.usageTotal ? { tokensTotal: live.usageTotal } : node.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
 		...(tokensOut ? { tokensOut } : {}),
 		...(live.generationMs ? { generationMs: live.generationMs } : {}),
+		...(live.contextTokens ? { contextTokens: live.contextTokens } : {}),
 		...(activity?.turn !== undefined ? { turns: activity.turn } : {}),
 		...(activity?.turnStartedAt !== undefined ? { currentTurnStartedAt: activity.turnStartedAt } : {}),
 		...(activity?.turnEndedAt !== undefined ? { currentTurnEndedAt: activity.turnEndedAt } : {}),

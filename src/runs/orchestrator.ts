@@ -815,6 +815,9 @@ export class Orchestrator {
 				child,
 				// #209: callers render this instead of assuming the RPC backend.
 				spawnMode: mode,
+				// Only an `rpc` child owns a process; `inprocess` reports no pid, so no
+				// value is invented. Never persisted — a pid is host-scoped.
+				...(result.pid ? { pid: result.pid } : {}),
 			};
 		} catch (error) {
 			if (spawned) await this.supervisor.retire(name).catch(() => {});
