@@ -30,7 +30,7 @@ shared SQLite ledger records the whole tree.
 - [Team 配置](#team-配置)
 - [Parent/child context conventions](#parentchild-context-conventions)
 - [Delivery and resume](#delivery-and-resume)
-- [Herdr transition and role migration](#herdr-transition-and-role-migration)
+- [Supported kinds](#supported-kinds)
 - [Changelog](CHANGELOG.md)
 - [Development](#development)
 
@@ -84,9 +84,8 @@ trades process isolation for spawn latency.
 **Automatic fallback to `rpc`:** when `spawnMode` is omitted *and* the resolved
 spawn cannot be in-process, Legion launches it over `pi --mode rpc` instead.
 That happens when the role needs an OS worktree (`worktree: true` — only the
-`centurion` role may hold this; see Isolation below). A `kind !== "pi"` role is
-rejected earlier with `INVALID_PARAMS` (only `kind: pi` children are supported
-at all), so it never reaches this fallback.
+`centurion` role may hold this; see
+[Delivery and resume](#delivery-and-resume)).
 
 **Explicit is strict:** `spawnMode: "inprocess"` with `worktree: true` is
 refused with `INVALID_PARAMS` (message prefers `set worktree: false`) rather
@@ -505,17 +504,13 @@ process ends, its child processes do not become detached workers; resuming the
 parent restores the squad, while already-settled children are not restarted.
 Keep the run records and session files while the tree may need to resume.
 
-## Herdr transition and role migration
+## Supported kinds
 
-Version **0.16.x is the final Herdr-era line**. Pi Legion 2.x is RPC-only:
-child execution uses headless `pi --mode rpc` processes, and the legacy backend
-is archived under `src/backends/legacy/`, not offered as a v2 runtime option.
-Pin to `pi-legion` 0.16.x if a workflow must stay on the former Herdr-based
-execution model. A short breaking-change summary lives in
-[CHANGELOG.md](CHANGELOG.md#200---2026-10-14).
-
-Pi Legion 2.x supports `kind: pi` only. Migrate a custom role that uses another
-CLI kind by changing its frontmatter, for example:
+Pi Legion runs `kind: pi` roles only. `kind` is still a legal frontmatter key,
+but `pi` is the only accepted value: a non-`pi` value is ignored (one note on
+stderr) and the role launches as `kind: pi`. The same holds for
+`subagents.presets.<role>.kind` and `subagents.agentOverrides.<role>.kind` —
+those three spots are the only places a role's `kind` can come from.
 
 ```yaml
 ---
@@ -524,8 +519,16 @@ kind: pi
 ---
 ```
 
-A non-Pi kind is rejected by v2. If that role must continue to run through
-another CLI, keep it on the 0.16.x line or replace it with a Pi role.
+Child execution is Pi either way: in-process by default, with an automatic
+`rpc` fallback when the resolved spawn needs an OS worktree (see
+[Spawn mode](#spawn-mode)).
+
+Version **0.16.x was the final Herdr-era line** — it launched children in Herdr
+panes instead of Pi processes. That backend was archived under
+`src/backends/legacy/` for 2.x and 3.x, and is gone in v4. Pin to
+`pi-legion@0.16.x` if a workflow must stay on that former execution model; a
+short breaking-change summary lives in
+[CHANGELOG.md](CHANGELOG.md#200---2026-10-14).
 
 ## Development
 

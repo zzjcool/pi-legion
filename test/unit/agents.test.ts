@@ -186,6 +186,24 @@ test("agent: a non-pi kind is ignored and reported once, the role launches as pi
 	}
 });
 
+test("agent: the ignored-kind report is deduplicated across catalog reloads", () => {
+	// The catalog is re-read on several UI paths, not once per process. Without
+	// dedupe the same role emits the same stderr line a dozen times as the user
+	// moves through the UI, which reads as a dozen problems.
+	const original = console.error;
+	const errors: string[] = [];
+	try {
+		console.error = (...args: unknown[]) => errors.push(args.map(String).join(" "));
+		const doc = "---\nname: reloaded\ndescription: d\nkind: gemini\n---\np";
+		for (let i = 0; i < 3; i += 1) {
+			assert.equal(parseAgentDocument(doc, "/f.md", "user")?.kind, "pi");
+		}
+		assert.equal(errors.length, 1, "three parses of the same role report once");
+	} finally {
+		console.error = original;
+	}
+});
+
 test("agent: tools parse from comma string and array spellings", () => {
 	const s = parseAgentDocument(
 		"---\nname: r\ndescription: d\ntools: read, bash\n---\np",

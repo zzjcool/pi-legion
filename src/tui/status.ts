@@ -307,7 +307,8 @@ function formatWorktreeBranch(branch: string): string {
 
 function headlineBits(entry: StatusEntry, now: number): string[] {
 	const bits = [`${entry.name}${roleSuffix(entry)}`];
-	if (entry.kind && entry.kind !== "pi") bits.push(entry.kind);
+	// `entry.kind` is deliberately not rendered: v4 has one kind (`pi`), so the
+	// label would repeat a constant on every row.
 	const model = formatModel(entry);
 	if (model) bits.push(model);
 	bits.push(formatAgentElapsed(entry, now));

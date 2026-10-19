@@ -28,8 +28,9 @@ const crashEntry: StatusEntry = {
 	agent: "search",
 	state: "working",
 	startedAt: 0,
-	kind: "cursor",
-	model: "auto-smart[optimize_for=balanced]:max",
+	// v4 dropped the `· cursor` label, so the model id carries the extra width
+	// this replica needs to stay a 73-column headline on a 66-column terminal.
+	model: "auto-smart[optimize_for=balanced]:max:balanced",
 };
 
 const theme = { fg: (_color: string, text: string) => text };
@@ -287,12 +288,11 @@ test("formatWidgetLines adds model, thinking, kind, tools, and worktree", () => 
 		formatWidgetLines(
 			[
 				{
-					name: "cursor-0",
+					name: "worker-2",
 					agent: "reviewer",
 					state: "working",
 					startedAt: 1_000,
-					kind: "cursor",
-					model: "cursor/gpt-4.1",
+					model: "cb/gpt-5.1",
 					herdrStatus: "working",
 					lastTools: ["edit"],
 				},
@@ -300,7 +300,8 @@ test("formatWidgetLines adds model, thinking, kind, tools, and worktree", () => 
 			5_000,
 		),
 		[
-			"● cursor-0 (reviewer) · cursor · cursor/gpt-4.1 · 4s",
+			// v4 has one kind, so the headline no longer repeats it.
+			"● worker-2 (reviewer) · cb/gpt-5.1 · 4s",
 			"  ⎿  working · edit",
 		],
 	);
@@ -849,7 +850,7 @@ test("formatWidgetLines crash replica exceeds a 66-column terminal before trunca
 	const [headline] = formatWidgetLines([crashEntry], 0);
 	assert.equal(
 		headline,
-		"● search-0 (search) · cursor · auto-smart[optimize_for=balanced]:max · 0s",
+		"● search-0 (search) · auto-smart[optimize_for=balanced]:max:balanced · 0s",
 	);
 	assert.equal(visibleWidth(headline ?? ""), 73);
 	assert.ok(visibleWidth(headline ?? "") > 66);

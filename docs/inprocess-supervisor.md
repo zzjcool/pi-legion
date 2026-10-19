@@ -11,7 +11,7 @@ with `INVALID_PARAMS` — the fallback only covers the implicit default.
 | Mode | Good for | Avoid when |
 |---|---|---|
 | `inprocess` (default; auto-fallback below) | Short, trusted fan-out; lower spawn latency; simpler approval / UI fan-in | Need OS worktree, separate credentials, crash isolation |
-| `rpc` (fallback: worktree / non-pi kind; or explicit `spawnMode: rpc`) | Long runs, untrusted tasks, need crash / env / cwd isolation, **worktree** | Cold-start cost dominates |
+| `rpc` (fallback: worktree; or explicit `spawnMode: rpc`) | Long runs, untrusted tasks, need crash / env / cwd isolation, **worktree** | Cold-start cost dominates |
 
 There is no single global default in the config sense: omitting `spawnMode`
 means "inprocess if this role can run in-process, otherwise rpc". Roles that
@@ -187,9 +187,6 @@ a decode rate.
 
 ## Refusals
 
-- `kind !== "pi"` → `INVALID_PARAMS` regardless of `spawnMode`: only `pi` roles
-  are supported, so a non-`pi` role is refused up front and never reaches the
-  worktree fallback
 - `worktree: true` + explicit `inprocess` → `INVALID_PARAMS` (an omitted
   `spawnMode` falls back to `rpc` instead)
 - A non-centurion requesting `worktree: true` is **not** a refusal: it is

@@ -271,7 +271,7 @@ export {
 export type { LiveProgress } from "./shared/progress.ts";
 
 // ── shared vocabulary ───────────────────────────────────────────────────────
-export { AGENT_KINDS } from "./shared/types.ts";
+export { AGENT_KINDS, SubagentError } from "./shared/types.ts";
 export type {
 	AcceptanceConfig,
 	AcceptanceCriterion,

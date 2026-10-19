@@ -30,6 +30,7 @@ import {
 	stripQuotes,
 } from "./frontmatter.ts";
 import { getAgentDir } from "./paths.ts";
+import { ignoredKindMessage, reportIgnoredOnce } from "../shared/ignored-kind.ts";
 
 export const BUILTIN_AGENT_NAMES = [
 	"scout",
@@ -508,9 +509,9 @@ function parseKind(value: unknown, agentName: string): AgentKind {
 	const raw = str(value);
 	if (raw === undefined || raw === "") return "pi";
 	if (VALID_KINDS.has(raw)) return raw as AgentKind;
-	console.error(
-		`[pi-legion] agent '${agentName}' sets kind ${JSON.stringify(raw)}; ` +
-			`v4 supports kind: pi only, so that field is ignored and the role launches as kind: pi.`,
+	reportIgnoredOnce(
+		`agent:${agentName}:${raw}`,
+		ignoredKindMessage({ origin: "agent", subject: `'${agentName}'`, value: raw }),
 	);
 	return "pi";
 }

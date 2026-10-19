@@ -129,6 +129,100 @@ test("DB event source uses data_version, advances its cursor and goes quiet afte
 	}
 });
 
+test("DB event source skips an undecodable row instead of stalling on it", () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "legion-event-bus-poison-"));
+	const file = path.join(directory, "legion.db");
+	const writer = openLegionDb(file);
+	const timers = makeClock();
+	insertNode(writer, { parentId: null, name: "root", role: "root" }, () => 1);
+	const insert = writer.prepare("INSERT INTO events (node_id, type, data, ts) VALUES (?, ?, ?, ?)");
+	insert.run("root", "node_launched", "{}", 1);
+	insert.run("root", "definitely_not_a_type", "{}", 2);
+	insert.run("root", "phase_change", "{}", 3);
+	// A separate reader connection: same-connection writes never dirty data_version.
+	const reader = openLegionDb(file);
+	const bus = createLegionEventBus();
+	const delivered: string[] = [];
+	bus.on("node_launched", (event) => delivered.push(event.type));
+	bus.on("phase_change", (event) => delivered.push(event.type));
+	const errors: unknown[] = [];
+	let source: DbEventSource | undefined;
+	try {
+		source = createDbEventSource(reader, {
+			pollMs: 250,
+			clock: timers.clock,
+			onError: (error) => errors.push(error),
+		});
+		source.start(bus);
+		assert.deepEqual(delivered, ["node_launched", "phase_change"]);
+		assert.equal(source.getCursor(), 3, "the cursor steps over the poison row");
+		assert.equal(errors.length, 1, "the undecodable row is reported exactly once");
+		assert.match(String(errors[0]), /unknown legion event type: definitely_not_a_type/);
+
+		timers.tick();
+		assert.equal(errors.length, 1, "an unchanged ledger does not re-report the skipped row");
+		assert.equal(source.getCursor(), 3, "polling again does not move the cursor backwards");
+
+		// A later commit after the poison row must flow through without re-reading it.
+		insert.run("root", "phase_change", "{}", 4);
+		timers.tick();
+		assert.deepEqual(delivered, ["node_launched", "phase_change", "phase_change"]);
+		assert.equal(source.getCursor(), 4, "the new row advances the cursor");
+		assert.equal(errors.length, 1, "the skipped row is never reported a second time");
+	} finally {
+		source?.stop();
+		writer.close();
+		reader.close();
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("a poison row at the tail of a batch is never re-reported", () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "legion-event-bus-poison-tail-"));
+	const file = path.join(directory, "legion.db");
+	const writer = openLegionDb(file);
+	const timers = makeClock();
+	insertNode(writer, { parentId: null, name: "root", role: "root" }, () => 1);
+	const insert = writer.prepare("INSERT INTO events (node_id, type, data, ts) VALUES (?, ?, ?, ?)");
+	// The poison row is the LAST row of the first batch: the skipped-row cursor
+	// must not be rewound by the valid rows decoded ahead of it in that batch.
+	insert.run("root", "node_launched", "{}", 1);
+	insert.run("root", "definitely_not_a_type", "{}", 2);
+	const reader = openLegionDb(file);
+	const bus = createLegionEventBus();
+	const delivered: string[] = [];
+	bus.on("node_launched", (event) => delivered.push(event.type));
+	bus.on("phase_change", (event) => delivered.push(event.type));
+	const errors: unknown[] = [];
+	let source: DbEventSource | undefined;
+	try {
+		source = createDbEventSource(reader, {
+			pollMs: 250,
+			clock: timers.clock,
+			onError: (error) => errors.push(error),
+		});
+		source.start(bus);
+		assert.deepEqual(delivered, ["node_launched"]);
+		assert.equal(source.getCursor(), 2, "the cursor stays past the skipped tail row");
+		assert.equal(errors.length, 1);
+
+		insert.run("root", "phase_change", "{}", 3);
+		timers.tick();
+		assert.deepEqual(delivered, ["node_launched", "phase_change"], "new rows after the poison row still arrive");
+		assert.equal(source.getCursor(), 3);
+		assert.equal(errors.length, 1, "the skipped tail row is not reported again on the next poll");
+
+		timers.tick();
+		assert.equal(errors.length, 1);
+		assert.equal(source.getCursor(), 3);
+	} finally {
+		source?.stop();
+		writer.close();
+		reader.close();
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
 test("same-connection writes leave data_version unchanged; process emit handles them directly", () => {
 	const db = openLegionDb(":memory:");
 	const timers = makeClock();

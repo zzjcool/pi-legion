@@ -18,6 +18,13 @@ test("legion events enforce the exact 15-type set and JSON-round-trip data", () 
 	try {
 		insertNode(db, { parentId: null, name: "root", role: "root" });
 		assert.equal(LEGION_EVENT_TYPES.length, 15);
+		// A duplicate entry would keep the length plausible while the set stays
+		// wrong, which is exactly how the set drifted from its writer before.
+		assert.equal(
+			new Set(LEGION_EVENT_TYPES).size,
+			LEGION_EVENT_TYPES.length,
+			"every event type appears once",
+		);
 		// #233: node_abandoned is written by hygiene, so it belongs to the closed set.
 		assert.ok((LEGION_EVENT_TYPES as readonly string[]).includes("node_abandoned"));
 		const one = appendEvent(db, "root", "node_launched", { source: "test" }, { now: () => 99 });
@@ -29,6 +36,8 @@ test("legion events enforce the exact 15-type set and JSON-round-trip data", () 
 		assert.deepEqual(readEventsAfter(db, 0, { nodeId: "missing" }), []);
 		assert.throws(() => appendEvent(db, "root", "unknown" as never), /invalid legion event type/);
 		assert.throws(() => appendEvent(db, "root", "node_launched", () => {}), /serializable/);
+		// hygiene.ts writes this type, so it must belong to the closed set. (#233)
+		assert.doesNotThrow(() => appendEvent(db, "root", "node_abandoned"));
 	} finally {
 		db.close();
 	}
