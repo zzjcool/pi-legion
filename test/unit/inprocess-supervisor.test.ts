@@ -1271,3 +1271,230 @@ test("#209-1 drain: empty queues register nothing but still refresh offline", as
 	assert.deepEqual(modelRuntime.refreshOptions, [{ allowNetwork: false }]);
 	assert.equal(modelRuntime.refreshResolved, true);
 });
+
+// ── #227 D1/D2/D3: spawnChild returns on *acceptance*, not turn end ────────
+//
+// The bug: `spawnChild` awaited `session.prompt()` to the end of the whole
+// agent run, so the ledger stayed without a job/sessionFile for the child's
+// entire first turn (8–18 min in the field) and `collect` budgets started too
+// late. These four cases pin the new contract: return on acceptance, drain the
+// rest in the background inside the child's ALS scope, and keep a failed first
+// turn visible.
+
+test("inprocess: a never-resolving first prompt still returns the handle at the start bound (#227 D1)", { timeout: 5_000 }, async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d1-"));
+	const delayed: string[] = [];
+	// A session that accepts the prompt and then runs "forever": this is the
+	// shape of a real child mid-turn, not an error case.
+	class HangingSession extends FakeSession {
+		override prompt(text: string): Promise<void> {
+			this.prompts.push(text);
+			this.emit({ type: "agent_start" });
+			return new Promise<void>(() => {});
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		spawnStartTimeoutMs: 50,
+		onSpawnDelayed: (message) => delayed.push(message),
+		sessionFactory: async () => new HangingSession(),
+	});
+	try {
+		const startedAt = Date.now();
+		const handle = await supervisor.spawnChild(testInput(root));
+		const elapsed = Date.now() - startedAt;
+		assert.equal(handle.name, "root.worker");
+		// The bound is 50ms; anything near the 15s default would fail here.
+		assert.ok(elapsed < 1_000, `spawnChild must not await the turn (took ${elapsed}ms)`);
+		// Alive: a delayed start is not a failure.
+		assert.equal(supervisor.isAlive("root.worker"), true);
+		// Told exactly once through the diagnostic hook.
+		assert.equal(delayed.length, 1);
+		assert.match(delayed[0]!, /did not accept its first prompt/);
+		assert.match(delayed[0]!, /50ms/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: a rejected first prompt keeps the child (no rollback delete) and reports the reason (#227 D2)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d2-"));
+	const refused: string[] = [];
+	// Emits `agent_start` (so the turn really started), stays in-turn past the
+	// start bound, then rejects. Spawn therefore returns first and the failure
+	// lands *after* the caller already holds the handle — the R3 shape.
+	class RejectingSession extends FakeSession {
+		override prompt(text: string): Promise<void> {
+			this.prompts.push(text);
+			this.emit({ type: "agent_start" });
+			return new Promise<void>((_resolve, reject) => {
+				setTimeout(() => reject(new Error("provider exploded")), 120);
+			});
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		spawnStartTimeoutMs: 50,
+		onSpawnRefused: (message) => refused.push(message),
+		sessionFactory: async () => new RejectingSession(),
+	});
+	try {
+		const handle = await supervisor.spawnChild(testInput(root));
+		assert.equal(handle.name, "root.worker");
+		// Registered while the turn is still active: the drain's catch must
+		// resolve THIS waiter (not just set `lastTurnResult` for later callers).
+		const pending = supervisor.waitSettled("root.worker", 1_000);
+		await new Promise<void>((resolve) => setTimeout(resolve, 200));
+		const resolved = await pending;
+		assert.match(resolved.reason ?? "", /child turn failed/);
+		// D2/R3: rollbackSpawn would have `children.delete`d this record.
+		assert.equal(
+			(supervisor as unknown as { children: Map<string, unknown> }).children.has("root.worker"),
+			true,
+			"a failed first turn must not delete the already-returned handle",
+		);
+		assert.equal(refused.length, 1);
+		assert.match(refused[0]!, /provider exploded/);
+		// The failure is visible to a waiter rather than reading as a clean turn.
+		const settled = await supervisor.waitSettled("root.worker", 1_000);
+		assert.equal(settled.settled, false);
+		assert.match(settled.reason ?? "", /child turn failed/);
+		assert.match(settled.reason ?? "", /provider exploded/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: a drained prompt failure survives a later agent_settled (#227 D2 finally + D3)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d2c-"));
+	class LateSettleAfterReject extends FakeSession {
+		override prompt(text: string): Promise<void> {
+			this.prompts.push(text);
+			this.emit({ type: "agent_start" });
+			return new Promise<void>((_resolve, reject) => {
+				setTimeout(() => reject(new Error("stream broke mid-turn")), 120);
+			});
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		spawnStartTimeoutMs: 50,
+		sessionFactory: async () => new LateSettleAfterReject(),
+	});
+	try {
+		await supervisor.spawnChild(testInput(root));
+		await new Promise<void>((resolve) => setTimeout(resolve, 200));
+		const record = (supervisor as unknown as {
+			children: Map<string, { session: FakeSession | null }>;
+		}).children.get("root.worker");
+		// The settle arrives AFTER the drain already recorded the failure. Only
+		// the error event handed to handleSessionEvent can still make it visible.
+		record?.session?.settle();
+		const settled = await supervisor.waitSettled("root.worker", 1_000);
+		assert.match(
+			settled.reason ?? "",
+			/child turn failed: stream broke mid-turn/,
+			"the drained failure must survive a later agent_settled",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: the background drain does not swallow agent_start/agent_settled (#227 D2)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d2b-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		spawnStartTimeoutMs: 5_000,
+		sessionFactory: async () => new FakeSession(),
+	});
+	try {
+		const seen: string[] = [];
+		supervisor.onEvent("root.worker", (event) => {
+			seen.push(event.type);
+		});
+		await supervisor.spawnChild(testInput(root));
+		// FakeSession.prompt is non-blocking (F10) and settles on demand; the
+		// settle events arrive after spawnChild has already returned.
+		supervisor.onEvent("root.worker", (event) => {
+			seen.push(event.type);
+		});
+		const sessions = (supervisor as unknown as {
+			children: Map<string, { session: FakeSession | null }>;
+		}).children.get("root.worker");
+		sessions?.session?.settle();
+		await new Promise<void>((resolve) => setTimeout(resolve, 20));
+		assert.ok(seen.includes("agent_start"), `missing agent_start in ${JSON.stringify(seen)}`);
+		assert.ok(seen.includes("agent_settled"), `missing agent_settled in ${JSON.stringify(seen)}`);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: an accepted first prompt returns before the start bound (#227 D1 condition a)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d1b-"));
+	// The factory seeds the transcript exactly like production does, and the
+	// prompt writes the user line for *this* turn — F7's acceptance signal.
+	class AcceptingSession extends FakeSession {
+		private readonly file: string;
+		constructor(file: string) {
+			super();
+			this.file = file;
+		}
+		override prompt(text: string): Promise<void> {
+			this.prompts.push(text);
+			// F7: the SDK appends the user message before it runs the agent, so
+			// acceptance is observable while the turn is still in flight.
+			const manager = SessionManager.open(this.file, undefined, path.dirname(this.file));
+			manager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
+			this.emit({ type: "agent_start" });
+			this.emit({ type: "turn_start" });
+			// Never resolves: the run keeps going. Only condition (a) — the user
+			// line appearing in the transcript — can end the wait before the bound.
+			return new Promise<void>(() => {});
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		// Far longer than the assertion below: passing proves condition (a) fired
+		// rather than the bound.
+		spawnStartTimeoutMs: 5_000,
+		sessionFactory: async (input) => new AcceptingSession(input.sessionFile),
+	});
+	try {
+		const startedAt = Date.now();
+		await supervisor.spawnChild(testInput(root));
+		const elapsed = Date.now() - startedAt;
+		assert.ok(elapsed < 1_000, `acceptance must return early (took ${elapsed}ms)`);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: an error event becomes visible on settle without inventing a stopReason (#227 D3)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-d3-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		spawnStartTimeoutMs: 5_000,
+		sessionFactory: async () => new FakeSession(),
+	});
+	try {
+		await supervisor.spawnChild(testInput(root));
+		const record = (supervisor as unknown as {
+			children: Map<string, { session: FakeSession | null }>;
+		}).children.get("root.worker");
+		const session = record?.session;
+		assert.ok(session);
+		// A provider failure that still settles the run (F8): today `error` was
+		// dropped, so the settle looked clean.
+		session.emit({ type: "error", message: "model refused the request" });
+		session.settle();
+		const settled = await supervisor.waitSettled("root.worker", 1_000);
+		assert.equal(settled.settled, true);
+		assert.equal(settled.abnormal, false);
+		assert.equal(settled.aborted, false);
+		assert.match(settled.reason ?? "", /model refused the request/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
