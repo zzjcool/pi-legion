@@ -11,9 +11,44 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-10-19
+
+### Added
+
+- **The arbitrated launch backend is now visible (#209).** In-process has been
+  the default since #197, but the backend a launch actually resolved to only
+  ever appeared as a substring of one result line, so a user could not tell
+  `inprocess` from `rpc`. Three surfaces now name it, always from
+  `Handle.spawnMode` (the arbitration result) and never re-derived:
+  - `subagent` and `vexillatio` results carry `details.spawns[]` /
+    `handles[].spawnMode`, and a shared `renderResult`
+    (`src/extension/spawn-render.ts`) prepends `spawn: scout-0=inprocess` to the
+    tool card. The line lives in `details`, not `content`, so it stays out of
+    the LLM context.
+  - The `/legion` node modal footer appends `spawn <mode>` through
+    `TrackedJobInput` → `TreeNodeSnapshot` → `LiveOverlayNode` → `metaPlain()`.
+    No `legion.db` column and no schema-version bump; the value is threaded from
+    the live job.
+  - An unknown or legacy mode is **omitted**, never guessed as `rpc`.
+
+  `pi` does not render a tool result's `details` on its own — `renderResult` is
+  its only consumer — so the field alone would have been invisible. The
+  renderer is hardened accordingly: a hostile `details` (throwing getter) is
+  treated as a missing fact instead of throwing into the host's silent
+  fallback, and `\r` / binary control bytes are normalized before the collapsed
+  line cap is counted, matching the host fallback's own sanitization.
+
 ### Changed
 
-- **The railway lane only shows "last activity" once it is worth a word.**
+- **Parent-facing guidance no longer calls every child an "RPC child".** The
+  playbook, the collect/retire notices and the async tail now say "child" and
+  describe in-process as the default, naming the rpc backend only where it is
+  genuinely meant. The internal settle reasons, the auto-doctor classifier
+  regex and the frozen interrupted head line are unchanged. The
+  `--no-extensions` guidance is backend-neutral again: in-process children do
+  not inherit host extensions either.
+
+- **The railway lane only shows "last activity" once it is worth a word (#231).**
   A lane used to end with `· 1s ago` on every running agent — the tallest,
   least informative field in the label, and it crowded out the role/clocks
   that actually distinguish lanes. Ages under a minute are now dropped
@@ -21,6 +56,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   before, and a missing timestamp still shows `—`. `formatActivityAgo`
   returns `""` for the dropped case, so the field simply disappears from the
   detail candidates instead of leaving a dangling separator.
+
+  Contract: `docs/spawn-mode-visibility-v1.md` (D1–D8, with the round-1 errata).
 
 ## [3.0.3] — 2026-10-19
 
