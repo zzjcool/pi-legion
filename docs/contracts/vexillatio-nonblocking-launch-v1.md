@@ -30,7 +30,7 @@
 判定实现细则（冻结）：
 - 拉起点 = `spawnChild` 调用时刻的 `statSync(sessionFile).size`（文件不存在记为 0）。
 - 出现 user 行 = `parseSessionFile(file).turns.length > 0 && fileSize > baseline`。**不得**用 `isLastTurnComplete`（`F7` 已经证明 prompt resolve 时末轮为「有 user、无 assistant」，用它是自相矛盾的门）。
-- 轮询间隔复用 `POLL_INTERVAL_MS`（存于 `src/shared/types.ts`，worker 从既有代码 import，不要新造常量）。
+- 轮询间隔复用 `POLL_INTERVAL_MS = 500` 的既有 cadence。**勘误（见 §7 v1.1）**：该常量实际是 `src/runs/orchestrator.ts:143` 的 module-private 常量，从未存在于 `src/shared/types.ts`；Worker A 在 `src/supervisor/spawn-mode.ts` 导出同名同值常量（与 `DEFAULT_INPROCESS_*` 并列），inprocess-supervisor 从那里 import，**不要**去改 `orchestrator.ts`。
 - 兜底超时**不是错误**：到点照常返回 handle（会话已创建即持久化了 transcript），只是记录 `onSpawnDelayed` 一次（`InProcessSupervisorOptions` 新增可选回调，用于诊断；无默认实现）。
 
 **D2 — 后台 drain 必须保住 ALS 身份/深度与错误可见性（最大风险点）。**
@@ -80,7 +80,7 @@
 | 文件 | 动作 |
 |---|---|
 | `src/supervisor/inprocess-supervisor.ts` | D1 / D2 / D3 |
-| `src/supervisor/spawn-mode.ts` | 新增导出常量 `DEFAULT_INPROCESS_SPAWN_START_TIMEOUT_MS = 15_000`（与 `DEFAULT_INPROCESS_MAX_ACTIVE` 并列） |
+| `src/supervisor/spawn-mode.ts` | 新增导出常量 `DEFAULT_INPROCESS_SPAWN_START_TIMEOUT_MS = 15_000` 与勘误后的 `POLL_INTERVAL_MS = 500`（均与 `DEFAULT_INPROCESS_MAX_ACTIVE` 并列） |
 | `src/api.ts` | 若导出面需要（`InProcessSupervisorOptions` 已导出）；仅在新增类型被外部引用时改 |
 | `docs/inprocess-supervisor.md` | 改写 `spawnChild awaits the whole first agent run` 那段（现 `:130-137`），改为新语义；同步 `runtime.ts:1478-1482` 注释所指事实变化（**只改文档**，`runtime.ts` 属 Worker B 边界外、也不改） |
 | `test/unit/inprocess-supervisor.test.ts` | 新增 D1/D2/D3 用例；**必须保住**既有 `child context is active during the first prompt`(`:569`) 与 `maxDepth holds across generations driven from the root chain (REV2-1)`(`:700`) 与 `onEvent listeners run at root identity`(`:1071`) 三条 |
@@ -149,3 +149,4 @@ npm run test:integration
 | 日期 | 版本 | 修订 | 原因 |
 |---|---|---|---|
 | 2026-10-19 | v1 | 首次冻结 | #227 三缺陷拆分：D1/D2/D3(A)、D4/D3b/D5(B)；D6/D7 显式排除 |
+| 2026-10-19 | v1.1 | 勘误 §1 D1 轮询常量位置：`src/shared/types.ts` → 实为 `src/runs/orchestrator.ts:143` 私有常量，改由 `src/supervisor/spawn-mode.ts` 导出同值常量；§2 Worker A 文件表同步 | Worker A 指出契约原文事实错误；`grep` 确认 `POLL_INTERVAL_MS` 从未在 `src/shared/types.ts` 出现过。属笔误型而非设计型矛盾，advisor 裁决按勘误继续（不回退重派），父会话在此落库 |
