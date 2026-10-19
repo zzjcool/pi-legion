@@ -33,6 +33,13 @@
 - 轮询间隔复用 `POLL_INTERVAL_MS = 500` 的既有 cadence。**勘误（见 §7 v1.1）**：该常量实际是 `src/runs/orchestrator.ts:143` 的 module-private 常量，从未存在于 `src/shared/types.ts`；Worker A 在 `src/supervisor/spawn-mode.ts` 导出同名同值常量（与 `DEFAULT_INPROCESS_*` 并列），inprocess-supervisor 从那里 import，**不要**去改 `orchestrator.ts`。
 - 兜底超时**不是错误**：到点照常返回 handle（会话已创建即持久化了 transcript），只是记录 `onSpawnDelayed` 一次（`InProcessSupervisorOptions` 新增可选回调，用于诊断；无默认实现）。
 
+**D1a — 「受理前 reject」仍必须让 spawn 失败（fallback 链保命条款，父会话审查补入）。**
+`session.prompt(...)` 的 reject 分两种，**不得**合并处理：
+- **受理前 reject**（`firstTurnAccepted === false`：会话文件未长过 baseline、无 user turn。真实触发：无 model / 无 API key / 压缩中，见 `agent-session.js:1568-1581` —— 这些抛错发生在 `appendMessage` 与 `preflightResult("started")` **之前**）→ `spawnChild` **必须抛出** `SubagentError(原始 message, ErrorCodes.START_FAILED)`，走既有 `rollbackSpawn` + `onSpawnRefused` + rethrow，使 `Orchestrator.launch` 的 `canFallbackStart`（`orchestrator.ts:235-240`）能继续降级到下一个模型。**不得**返回 handle。
+- **受理后 reject**（`firstTurnAccepted === true`：首轮已开跑才炸）→ 按 D2 返回 handle，`lastTurnResult.reason = "child turn failed: <msg>"`，`onSpawnRefused` 上报。
+
+理由：非阻塞改造若把「受理前拒绝」也吞掉，会静默废掉 `fallbackModels`（已实测：HEAD 抛错 / 首版实现返回 handle，`canFallbackStart` 失效）。这是 #227 之外的回归，必须有先红后绿用例守住。
+
 **D2 — 后台 drain 必须保住 ALS 身份/深度与错误可见性（最大风险点）。**
 - 复用现有的 `runAtInProcessChildDepthAsync(...)` + `runInChildContext(registration.context, ...)` 作用域，把「settle 之后的收尾」放进去；`beginTurn` 保持在 prompt 之前（现状即是）。
 - **事件会脱出 ALS 作用域**：`agent_start` 在 `await session.prompt()` 之前同步 emit（`agent-session.js:1601→1631`），但 `agent_settled` 在 `_runAgentPrompt` 的 `finally` 里 emit，那时已在 drain 的后续微任务链上。因此 `updateTurnState` 里做 settle 状态流转时**不得依赖** `currentChildContext()`；`publishEvent` 已有 `runOutsideChildContext`（REV2-7），不要动。
@@ -102,20 +109,21 @@
 ## 3. 验收（机器可检查，父会话在 collect 时执行）
 
 每个 worker 的 `verify`：
-```
+```bash
 npm run typecheck
 npm test
 npm run test:integration
 ```
 首个非零退出即 rejected。另需人工核对的断言锚点（reviewer 用）：
 
-1. 新增 inprocess 用例：用一个**故意永不 resolve** 的 `prompt()`（模拟 8~18 分钟的子轮），断言 `spawnChild` 在 `spawnStartTimeoutMs` 量级内返回（用注入的短超时，如 50ms，不真等 15s）。
-2. 新增 inprocess 用例：`prompt()` 拒 + 只有 `agent_start` 时——`spawnChild` 仍返回 handle 且 `children.has(name) === true`（**不得**被 rollback 删号）；随后 `waitSettled` 能拿到 `reason` 含 `child turn failed`。
-3. 新增 inprocess 用例：`onEvent` 仍收到 `agent_start` / `agent_settled`（后台 drain 不丢事件）。
-4. 新增 teams 用例：abort 后 vexillatio 文本同时含冻结头行**和** `── <name> ──` / `execution:` / 子结果正文；`details.interrupted === true`；`details.handles.length > 0`；`details.runId` 非空；child 未被 retire。
-5. 新增 orchestrator 用例：子进程已死且本轮已有终态 assistant → `collect` 不返回 `COLLECT_DEADLINE_REASON`。
-6. 新增 session 用例：`stopReason:"error"` + `"This operation was aborted"` → `reason === ABORT_WITHOUT_REASON`；`+ "The operation was aborted due to timeout"` → 仍是 timeout 语义（不得被新分支吞掉）。
-7. 既有绿线不回退：`inprocess-supervisor.test.ts` 33 例、`teams.test.ts`、`orchestrator.test.ts` 25 例、`session.test.ts` 全部。
+1. 新增 inprocess 用例：`prompt` 立即 reject 且**不写会话文件** → `assert.rejects(spawnChild)`，`error.code === START_FAILED`，`children.has(name) === false`（无幽灵子）、`isAlive === false`。**必须在修复前是红的**（D1a）。
+2. 新增 inprocess 用例（对照）：`prompt` 先写一条 user 行再 reject → `spawnChild` 正常返回 handle、`children.has(name) === true`、`waitSettled` 的 `reason` 含 `child turn failed`。
+3. 新增 inprocess 用例：用一个**故意永不 resolve** 的 `prompt()`（模拟 8~18 分钟的子轮），断言 `spawnChild` 在 `spawnStartTimeoutMs` 量级内返回（用注入的短超时，如 50ms，不真等 15s）。
+4. 新增 inprocess 用例：`onEvent` 仍收到 `agent_start` / `agent_settled`（后台 drain 不丢事件）。
+5. 新增 teams 用例：abort 后 vexillatio 文本同时含冻结头行**和** `── <name> ──` / `execution:` / 子结果正文；`details.interrupted === true`；`details.handles.length > 0`；`details.runId` 非空；child 未被 retire。
+6. 新增 orchestrator 用例：子进程已死且本轮已有终态 assistant → `collect` 不返回 `COLLECT_DEADLINE_REASON`（注：Worker B 已披露该分支在 HEAD 上不可观测，属防御性收尾，非行为修复——reviewer 不应据此判「假覆盖」）。
+7. 新增 session 用例：`stopReason:"error"` + `"This operation was aborted"` → `reason === ABORT_WITHOUT_REASON`；`+ "The operation was aborted due to timeout"` → 仍是 timeout 语义（不得被新分支吞掉）。
+8. 既有绿线不回退：`inprocess-supervisor.test.ts` 33 例、`teams.test.ts`、`orchestrator.test.ts` 25 例、`session.test.ts` 全部。
 
 ## 4. 明确不做（reviewer 判「缺失」前先读本节）
 
@@ -150,3 +158,4 @@ npm run test:integration
 |---|---|---|---|
 | 2026-10-19 | v1 | 首次冻结 | #227 三缺陷拆分：D1/D2/D3(A)、D4/D3b/D5(B)；D6/D7 显式排除 |
 | 2026-10-19 | v1.1 | 勘误 §1 D1 轮询常量位置：`src/shared/types.ts` → 实为 `src/runs/orchestrator.ts:143` 私有常量，改由 `src/supervisor/spawn-mode.ts` 导出同值常量；§2 Worker A 文件表同步 | Worker A 指出契约原文事实错误；`grep` 确认 `POLL_INTERVAL_MS` 从未在 `src/shared/types.ts` 出现过。属笔误型而非设计型矛盾，advisor 裁决按勘误继续（不回退重派），父会话在此落库 |
+| 2026-10-19 | v1.2 | 新增 **D1a**：首次 prompt 在「受理之前」reject 时 `spawnChild` 仍须抛出（保 `fallbackModels`）；§3 验收清单同步为 8 条 | 父会话审查 PR #228 实测发现回归：非阻塞改造把受理前 reject 吞成「已 spawn」，`canFallbackStart` 失效。HEAD 抛错 / 首版实现返回 handle，属 #227 之外的回归，必须以先红后绿用例守住 |
