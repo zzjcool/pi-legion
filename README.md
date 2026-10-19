@@ -244,7 +244,10 @@ commands without an LLM. Passing verification advances the squad to `done`.
    header shows the live count and tok/s (trailing 60s average). The lane
    label reads `role · <time since the last task started> / <lifetime> · <age
    of last activity>`; the leading clock keeps ticking through the quiet gap
-   after a turn settles and freezes only when the agent itself ends. The lane
+   after a turn settles and freezes only when the agent itself ends. The
+   last-activity age only appears once it is at least a minute old — a lane
+   that just saw activity is already visibly live, so `1s ago` on every
+   running agent was noise; a missing timestamp still shows `—`. The lane
    column is measured from what the labels need and the time axis takes the
    rest (down to a floor), so a row always fills the line. Hidden when no
    subagent is live. Set `PI_LEGION_STRIP=tree` for the classic roster.

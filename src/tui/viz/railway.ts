@@ -156,8 +156,8 @@ export function formatRate(rate: number): string {
 
 
 /**
- * Wide-lane detail after the name: role, turn/lifetime clocks, and
- * last-activity age.
+ * Wide-lane detail after the name: role, turn/lifetime clocks, and — once it
+ * is at least a minute old — the last-activity age.
  *
  * The leading clock is "time since the last task started": it keeps ticking
  * through the quiet gap after a turn settles (the old behavior froze at that
@@ -170,32 +170,35 @@ export function formatRate(rate: number): string {
  * has a real start time and a real lifetime; show both.
  */
 export function formatRailLaneDetail(node: VizNode, now: number): string {
-	const parts: string[] = [node.role];
-	parts.push(formatAgentElapsed({
-		state: node.status,
-		startedAt: node.startedAt,
-		...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
-		...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
-	}, now));
-	parts.push(formatActivityAgo(node.lastActivityAt, now));
-	return parts.join(" · ");
+	return laneDetailParts(node, now).join(" · ");
+}
+
+/**
+ * Lane detail fields, richest first: role, clocks, then last-activity age —
+ * the age is omitted entirely while it is under a minute, because a lane that
+ * just saw activity is already visibly live and `1s ago` was pure noise.
+ */
+function laneDetailParts(node: VizNode, now: number): string[] {
+	const ago = formatActivityAgo(node.lastActivityAt, now);
+	return [
+		node.role,
+		formatAgentElapsed({
+			state: node.status,
+			startedAt: node.startedAt,
+			...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
+			...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
+		}, now),
+		...(ago ? [ago] : []),
+	];
 }
 
 /** Lane detail candidates, richest first (role → clocks → ago). */
 export function laneDetailCandidates(node: VizNode, now: number): string[] {
-	const ago = formatActivityAgo(node.lastActivityAt, now);
-	const clocks = formatAgentElapsed({
-		state: node.status,
-		startedAt: node.startedAt,
-		...(node.endedAt !== undefined ? { finishedAt: node.endedAt } : {}),
-		...(node.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: node.currentTurnStartedAt } : {}),
-	}, now);
-	return [
-		`${node.role} · ${clocks} · ${ago}`,
-		`${clocks} · ${ago}`,
-		clocks,
-		ago,
-	];
+	const parts = laneDetailParts(node, now);
+	// Drop fields from the left: the role goes first, the clocks are the last
+	// thing to give up. A fresh lane has no age field, so it ends at the clocks
+	// instead of paying for a `1s ago` suffix it never shows.
+	return parts.map((_, start) => parts.slice(start).join(" · "));
 }
 
 /**
@@ -255,7 +258,7 @@ export function railColumnPlan(
 	if (portrait) {
 		const label = Math.max(...shown.map((n) => {
 			const ago = formatActivityAgo(n.lastActivityAt, now);
-			return Array.from(ago === "—" ? n.name : `${n.name} · ${ago}`).length;
+			return Array.from(ago === "" || ago === "—" ? n.name : `${n.name} · ${ago}`).length;
 		}));
 		return { nameW, grade: 0, needed: label + 2 + reserve };
 	}
@@ -423,7 +426,7 @@ export function renderRailway(input: RailInput): RailRender | undefined {
 		const avail = width - (nameX + 2) - overflow.length;
 		if (portrait) {
 			const ago = formatActivityAgo(node.lastActivityAt, now);
-			const label = ago === "—" ? node.name : `${node.name} · ${ago}`;
+			const label = ago === "" || ago === "—" ? node.name : `${node.name} · ${ago}`;
 			canvas.text(nameX + 2, y, ellipsize(label, avail), col, { bold: true });
 		} else {
 			// Paint with the same width the plan measured (clamped to what is

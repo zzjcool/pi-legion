@@ -1263,7 +1263,7 @@ test("railway lane shows time since the last task started beside the lifetime to
 		width: 120,
 		rate: 0,
 	})!;
-	assert.match(reset.canvas.toLines(plainTheme).join("\n"), /42s \/ 1h05m · 42s ago/);
+	assert.match(reset.canvas.toLines(plainTheme).join("\n"), /42s \/ 1h05m$/m, "34s→42s of quiet is under a minute: no age field");
 });
 
 test("railway: clocks show from round 1 (was gated behind turns ≥ 2, #159)", () => {
@@ -1285,7 +1285,8 @@ test("railway: clocks show from round 1 (was gated behind turns ≥ 2, #159)", (
 	const t1 = renderRailway({ nodes: turn1, now, width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
 	// Round 1 starts its turn when the agent starts, so the two clocks are the
 	// same fact: show the lifetime alone instead of `1m30s / 1m30s`.
-	assert.match(t1, /worker · 1m30s · 3s ago/);
+	assert.match(t1, /worker · 1m30s\b(?! · )/, "3s of quiet is under a minute: no age field");
+	assert.doesNotMatch(t1, /3s ago/);
 	assert.doesNotMatch(t1, /1m30s \/ 1m30s/);
 
 	const noTurns = [
@@ -1293,7 +1294,7 @@ test("railway: clocks show from round 1 (was gated behind turns ≥ 2, #159)", (
 		node("worker-0", { role: "worker", startedAt, currentTurnStartedAt: startedAt, lastActivityAt: now - 5_000 }),
 	];
 	const missing = renderRailway({ nodes: noTurns, now, width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
-	assert.match(missing, /worker · 1m30s · 5s ago/);
+	assert.match(missing, /worker · 1m30s\b(?! · )/, "5s of quiet is under a minute: no age field");
 	assert.doesNotMatch(missing, / \/ /);
 
 	const turn2 = [
@@ -1307,10 +1308,10 @@ test("railway: clocks show from round 1 (was gated behind turns ≥ 2, #159)", (
 		}),
 	];
 	const t2 = renderRailway({ nodes: turn2, now, width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
-	assert.match(t2, /12s \/ 1m30s · 12s ago/);
+	assert.match(t2, /12s \/ 1m30s\b(?! · )/, "12s of quiet is under a minute: no age field");
 });
 
-test("#159 railway: last-activity ago refreshes; missing → —", () => {
+test("#159 railway: last-activity age refreshes and only shows once it is worth a word", () => {
 	const startedAt = sec(0);
 	const base = node("worker-0", { role: "worker", startedAt, turns: 1 });
 	const none = renderRailway({ nodes: [ROOT, base], now: sec(30), width: 120, rate: 0 })!.canvas.toLines(plainTheme).join("\n");
@@ -1323,7 +1324,7 @@ test("#159 railway: last-activity ago refreshes; missing → —", () => {
 		width: 120,
 		rate: 0,
 	})!.canvas.toLines(plainTheme).join("\n");
-	assert.match(early, /worker · 13s · 3s ago/);
+	assert.match(early, /worker · 13s\b(?! · )/, "3s of quiet reads as nothing, not `3s ago`");
 
 	const later = renderRailway({
 		nodes: [ROOT, { ...base, lastActivityAt: sec(20) }],
@@ -1334,18 +1335,27 @@ test("#159 railway: last-activity ago refreshes; missing → —", () => {
 	assert.match(later, /worker · 1m20s · 1m ago/);
 
 	assert.equal(formatActivityAgo(undefined, sec(0)), "—");
-	assert.equal(formatActivityAgo(sec(0), sec(3)), "3s ago");
+	assert.equal(formatActivityAgo(sec(0), sec(3)), "", "sub-minute age is omitted entirely");
+	assert.equal(formatActivityAgo(sec(0), sec(59)), "");
+	assert.equal(formatActivityAgo(sec(0), sec(60)), "1m ago");
 	assert.equal(formatActivityAgo(sec(0), sec(120)), "2m ago");
 	assert.equal(
 		formatRailLaneDetail(node("w", { role: "worker", startedAt: sec(0), turns: 1, lastActivityAt: sec(0) }), sec(4)),
-		"worker · 4s · 4s ago",
+		"worker · 4s",
 	);
 	assert.equal(
 		formatRailLaneDetail(
 			node("w", { role: "worker", startedAt: sec(0), turns: 2, currentTurnStartedAt: sec(50), lastActivityAt: sec(50) }),
 			sec(60),
 		),
-		"worker · 10s / 1m00s · 10s ago",
+		"worker · 10s / 1m00s",
+	);
+	assert.equal(
+		formatRailLaneDetail(
+			node("w", { role: "worker", startedAt: sec(0), turns: 2, currentTurnStartedAt: sec(50), lastActivityAt: sec(50) }),
+			sec(170),
+		),
+		"worker · 2m00s / 2m50s · 2m ago",
 	);
 });
 
@@ -1665,10 +1675,14 @@ test("railway: a round-1 child still gets clocks (regression: turns>=2 gate star
 	const out = renderRailway({ nodes: [ROOT, round1], now, width: 120, rate: 159 })!;
 	const line = Array.from(out.canvas.toPlain()[1]!);
 	const axis = line.indexOf("▶") - 1;
-	// Round 1 collapses to a single clock, but the detail still spans ~24 cols
-	// instead of the ~13 it had when the clocks were hidden entirely (79% axis).
-	assert.match(out.canvas.toLines(plainTheme).join("\n"), /scout · 10m00s · 1s ago/);
-	assert.ok(axis < 90, `axis must not starve the detail column: axis=${axis}`);
+	// Round 1 collapses to a single clock, and the lane saw activity 1s ago so
+	// no age field is spent on it (` · 1s ago` was the widest, least informative
+	// part of the label). The detail is ~19 cols instead of the ~13 it had when
+	// the clocks were hidden entirely.
+	const text = out.canvas.toLines(plainTheme).join("\n");
+	assert.match(text, /scout · 10m00s\b(?! · )/, "fresh activity omits the age field");
+	assert.doesNotMatch(text, /1s ago/);
+	assert.ok(axis < 100, `axis must not starve the detail column: axis=${axis}`);
 });
 
 test("rate: a long tool call drives a live agent's rate to 0 once the window empties", () => {
