@@ -7,6 +7,7 @@
  */
 
 import type { StatusEntry } from "../status.ts";
+import { SPAWN_MODES, type SpawnMode } from "../../shared/types.ts";
 
 export type VizStatus = "running" | "settled" | "failed" | "retired";
 
@@ -37,12 +38,36 @@ export interface VizNode {
 	turns?: number;
 	/** Unix ms of last visible activity for this seat (not run wall-clock start). */
 	lastActivityAt?: number;
+	/**
+	 * Arbitrated backend the child was spawned on (#209). Optional: a row restored
+	 * from disk has none, and consumers must render `unknown` — never guess `rpc`.
+	 */
+	spawnMode?: SpawnMode;
+	/** Own OS process of an `rpc` child; `inprocess` children have none by definition. */
+	pid?: number;
+	/** Prompt size of the last assistant message; absolute tokens, not a ratio. */
+	contextTokens?: number;
+	/**
+	 * Resident memory of this child in MB. Only ever set for a child with its own
+	 * process (D2): an `inprocess` child has no separate RSS, so it renders `—`
+	 * rather than a share of the host figure.
+	 */
+	rss?: number;
 }
 
 /** Same set the footer/busy label treat as active, so live counts agree everywhere. */
 const RUNNING = new Set(["starting", "working", "running", "blocked"]);
 const SETTLED = new Set(["settled", "success", "completed", "done"]);
 const FAILED = new Set(["failed", "aborted", "error", "truncated"]);
+
+/**
+ * `StatusEntry.spawnMode` is a plain string (it can come off disk or from an old
+ * caller). Only a real mode reaches `VizNode`; anything else stays absent so the
+ * panel prints `unknown` instead of echoing an unvalidated backend name.
+ */
+function asSpawnMode(value: string | undefined): SpawnMode | undefined {
+	return value !== undefined && (SPAWN_MODES as readonly string[]).includes(value) ? (value as SpawnMode) : undefined;
+}
 
 export function displayStatus(state: string | undefined): VizStatus {
 	const value = (state ?? "").toLowerCase();
@@ -61,6 +86,7 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 		if (seen.has(id)) continue;
 		seen.add(id);
 		const status = id === "root" ? "running" : displayStatus(entry.herdrStatus ?? entry.state);
+		const spawnMode = asSpawnMode(entry.spawnMode);
 		out.push({
 			id,
 			name: entry.name,
@@ -77,6 +103,10 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 			...(entry.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: entry.currentTurnEndedAt } : {}),
 			...(entry.turns !== undefined && entry.turns > 0 ? { turns: entry.turns } : {}),
 			...(entry.lastActivityAt !== undefined ? { lastActivityAt: entry.lastActivityAt } : {}),
+			...(spawnMode ? { spawnMode } : {}),
+			...(entry.pid !== undefined ? { pid: entry.pid } : {}),
+			...(entry.contextTokens !== undefined ? { contextTokens: entry.contextTokens } : {}),
+			...(entry.rss !== undefined ? { rss: entry.rss } : {}),
 		});
 	}
 	// Parents that are missing from the snapshot re-attach to the nearest known ancestor.

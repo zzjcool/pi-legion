@@ -17,6 +17,13 @@ export interface LegionLayout {
 	/** Subagent wall/gen/other table (#151). */
 	timing: Rect;
 	log: Rect;
+	/**
+	 * Agent status table (role/state/supervisor/ctx/rss/turns). Zero-area in
+	 * portrait: 46×24 already packs four panes into 19 of 21 body rows, so the
+	 * fifth cannot fit (D1). A zero-height rect keeps `frame()` from painting and
+	 * `availablePanes()` (view.ts) keeps Tab off it.
+	 */
+	status: Rect;
 	footer: Rect;
 }
 
@@ -35,6 +42,35 @@ export const TIMING_BAND_MIN = 5;
 export const TIMING_BAND_MAX = 10;
 /** Below this bottom height, stacked prefers a timing strip over side-by-side. */
 export const STACKED_TIMING_SIDE_MIN = 8;
+/** Status band: enough rows for a header plus a few agents, never a tall empty box. */
+export const STATUS_BAND_MIN = 5;
+export const STATUS_BAND_MAX = 12;
+/**
+ * Rows the log keeps when a status band is carved out above it. Below this the
+ * band is dropped entirely rather than shrinking the log to a header-only stub —
+ * the same trade `timing` already makes against `log` in portrait.
+ */
+export const STATUS_LOG_RESERVE = 4;
+
+/**
+ * Height of a status band carved out of `avail` rows while leaving `reserve`
+ * rows for whatever sits below it. Returns 0 when the band cannot reach
+ * STATUS_BAND_MIN — callers then hand the whole area to the neighbouring pane,
+ * and the zero-height rect is what makes Tab skip it.
+ */
+function statusBandHeight(avail: number, reserve: number, share: number): number {
+	const cap = Math.min(STATUS_BAND_MAX, avail - reserve);
+	if (cap < STATUS_BAND_MIN) return 0;
+	return Math.min(cap, Math.max(STATUS_BAND_MIN, Math.round(avail * share)));
+}
+
+/**
+ * A pane that could not be placed (D1). Zero-area, so `frame()` paints nothing
+ * and `availablePanes()` (view.ts) keeps Tab off it.
+ */
+function noRect(): Rect {
+	return { x: 0, y: 0, w: 0, h: 0 };
+}
 
 /** Terminal cells are ~2:1 (tall), so rows*2 >= cols means the window looks taller than wide. */
 export function isTall(cols: number, rows: number): boolean {
@@ -73,6 +109,9 @@ export function computeLayout(cols: number, rows: number, hints: LayoutHints = {
 			Math.max(TIMING_BAND_MIN, Math.round(bodyH * 0.42)),
 			Math.max(TIMING_BAND_MIN, bodyH - 6),
 		);
+		// Right column: timing, then log, then the status band closes it (D1).
+		const statusH = statusBandHeight(bodyH - timingH, STATUS_LOG_RESERVE, 0.25);
+		const logH = Math.max(0, bodyH - timingH - statusH);
 		return {
 			kind,
 			header,
@@ -80,7 +119,8 @@ export function computeLayout(cols: number, rows: number, hints: LayoutHints = {
 			galaxy: { x: 0, y: bodyY, w: leftW, h: galaxyH },
 			chart: { x: 0, y: bodyY + galaxyH, w: leftW, h: chartH },
 			timing: { x: leftW, y: bodyY, w: rightW, h: timingH },
-			log: { x: leftW, y: bodyY + timingH, w: rightW, h: Math.max(0, bodyH - timingH) },
+			log: { x: leftW, y: bodyY + timingH, w: rightW, h: logH },
+			status: statusH > 0 ? { x: leftW, y: bodyY + timingH + logH, w: rightW, h: statusH } : noRect(),
 		};
 	}
 	if (kind === "stacked") {
@@ -91,6 +131,10 @@ export function computeLayout(cols: number, rows: number, hints: LayoutHints = {
 		// Prefer timing|log side-by-side; strip when the bottom band is too short (#151).
 		if (bottomH >= STACKED_TIMING_SIDE_MIN) {
 			const timingW = Math.floor(W * 0.45);
+			const rightW = W - timingW;
+			// Right column of the bottom band: log on top, status closing it (D1).
+			const statusH = statusBandHeight(bottomH, STATUS_LOG_RESERVE, 0.35);
+			const logH = Math.max(0, bottomH - statusH);
 			return {
 				kind,
 				header,
@@ -98,10 +142,14 @@ export function computeLayout(cols: number, rows: number, hints: LayoutHints = {
 				galaxy: { x: 0, y: bodyY, w: galaxyW, h: topH },
 				chart: { x: galaxyW, y: bodyY, w: W - galaxyW, h: topH },
 				timing: { x: 0, y: bottomY, w: timingW, h: bottomH },
-				log: { x: timingW, y: bottomY, w: W - timingW, h: bottomH },
+				log: { x: timingW, y: bottomY, w: rightW, h: logH },
+				status: statusH > 0 ? { x: timingW, y: bottomY + logH, w: rightW, h: statusH } : noRect(),
 			};
 		}
 		const timingH = Math.min(TIMING_BAND_MAX, Math.max(TIMING_BAND_MIN, Math.round(bottomH * 0.4)), Math.max(3, bottomH - 3));
+		const afterTiming = Math.max(0, bottomH - timingH);
+		const statusH = statusBandHeight(afterTiming, STATUS_LOG_RESERVE, 0.35);
+		const logH = Math.max(0, afterTiming - statusH);
 		return {
 			kind,
 			header,
@@ -109,7 +157,8 @@ export function computeLayout(cols: number, rows: number, hints: LayoutHints = {
 			galaxy: { x: 0, y: bodyY, w: galaxyW, h: topH },
 			chart: { x: galaxyW, y: bodyY, w: W - galaxyW, h: topH },
 			timing: { x: 0, y: bottomY, w: W, h: timingH },
-			log: { x: 0, y: bottomY + timingH, w: W, h: Math.max(0, bottomH - timingH) },
+			log: { x: 0, y: bottomY + timingH, w: W, h: logH },
+			status: statusH > 0 ? { x: 0, y: bottomY + timingH + logH, w: W, h: statusH } : noRect(),
 		};
 	}
 	// Portrait: galaxy (aspect-limited), chart (fixed band), timing (compact), log gets the rest.
@@ -151,5 +200,7 @@ export function computeLayout(cols: number, rows: number, hints: LayoutHints = {
 		chart: { x: 0, y: bodyY + galaxyH, w: W, h: chartH },
 		timing: { x: 0, y: bodyY + galaxyH + chartH, w: W, h: Math.max(0, timingH) },
 		log: { x: 0, y: bodyY + galaxyH + chartH + Math.max(0, timingH), w: W, h: Math.max(0, logH) },
+		// D1: portrait has no room for a fifth pane — zero-area, so frame()/Tab skip it.
+		status: noRect(),
 	};
 }

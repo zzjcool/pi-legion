@@ -5,11 +5,11 @@ import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
-import { computeLayout, selectLayout } from "../../src/tui/viz/layout.ts";
+import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
-import { buildLog, chartWindow, computeStats, timingRowsFromNodes } from "../../src/tui/viz/panels.ts";
-import { createLegionViewFactory, handleViewKey, initialViewState, MIN_SELECTION_BADGE_W, renderLegionView } from "../../src/tui/viz/view.ts";
-import { cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
+import { buildLog, chartWindow, computeStats, drawStatus, frame, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes } from "../../src/tui/viz/panels.ts";
+import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, MIN_SELECTION_BADGE_W, renderLegionView } from "../../src/tui/viz/view.ts";
+import { Canvas, cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, formatActivityAgo, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
 
 const T0 = 1_700_000_000_000;
@@ -175,10 +175,13 @@ test("layout: wide >= 140, stacked in between, portrait when narrow or tall", ()
 	assert.equal(selectLayout(120, 40), "stacked");
 	for (const [w, h] of [[46, 60], [60, 70], [100, 40], [160, 50]] as const) {
 		const l = computeLayout(w, h);
-		for (const r of [l.galaxy, l.chart, l.timing, l.log]) {
+		for (const r of [l.galaxy, l.chart, l.timing, l.log, l.status]) {
 			assert.ok(r.x >= 0 && r.x + r.w <= w && r.y >= 0 && r.y + r.h <= h - 1, `${w}x${h} ${JSON.stringify(r)}`);
 		}
 		assert.ok(l.timing.w > 0 && l.timing.h > 0, `${w}x${h} timing present`);
+		// D1: portrait cannot fit a fifth pane, so its status rect is zero-area.
+		if (l.kind === "portrait") assert.equal(l.status.h, 0, `${w}x${h} portrait status is zero-height`);
+		else assert.ok(l.status.h > 0, `${w}x${h} ${l.kind} status present`);
 	}
 });
 
@@ -430,6 +433,13 @@ test("legion view: no clipping at 46x60, 60x70, 100x40, 160x50 (dark/light theme
 			assert.ok(plain.some((l) => l.includes("tok/s")));
 			assert.ok(plain.some((l) => l.includes("timing")), `${w}x${h} missing timing`);
 			assert.ok(plain.some((l) => l.includes("log --graph")));
+			// D1: the status pane only exists where the layout placed it; portrait
+			// keeps its four-pane board and must not grow a status title.
+			if (computeLayout(w, h).status.h > 0) {
+				assert.ok(plain.some((l) => l.includes("status")), `${w}x${h} missing status`);
+			} else {
+				assert.ok(!plain.some((l) => l.includes("status")), `${w}x${h} portrait must not draw status`);
+			}
 		}
 	}
 });
@@ -443,6 +453,12 @@ test("legion view: Tab cycles panes, Enter in log selects, Esc clears then exits
 	handleViewKey("\t", state, nodes);
 	assert.equal(state.focus, "timing");
 	handleViewKey("\t", state, nodes);
+	assert.equal(state.focus, "log");
+	handleViewKey("\t", state, nodes);
+	assert.equal(state.focus, "status");
+	// Back to log so the log-pane assertions below stay meaningful; this also
+	// covers the reverse half of the ring.
+	assert.equal(handleViewKey("\x1b[Z", state, nodes), "render");
 	assert.equal(state.focus, "log");
 	handleViewKey("\x1b[B", state, nodes);
 	assert.equal(state.logCursor, 1);
@@ -890,8 +906,18 @@ test("layout: tall terminals cap galaxy/chart heights; few events hand log space
 			assert.equal(l.timing.x, l.galaxy.w);
 			assert.equal(l.log.x, l.timing.x);
 			assert.equal(l.log.y, l.timing.y + l.timing.h);
+			// Right column is three stacked segments: timing, log, status (D1).
+			assert.equal(l.status.x, l.timing.x, `${w}x${h} status shares the right column`);
+			assert.equal(l.status.w, l.timing.w, `${w}x${h} status matches the column width`);
+			assert.equal(l.status.y, l.log.y + l.log.h, `${w}x${h} status sits under the log`);
+			assert.equal(l.status.y + l.status.h, h - 1, `${w}x${h} status reaches the footer rule`);
 		}
-		for (const r of [l.galaxy, l.chart, l.timing, l.log]) assert.ok(r.y + r.h <= h - 1 && r.x + r.w <= w);
+		// D1: portrait hands back a zero-area status rect instead of overflowing.
+		if (l.kind === "portrait") {
+			assert.equal(l.status.h, 0, `${w}x${h} portrait status zero-height`);
+			assert.equal(l.status.w, 0, `${w}x${h} portrait status zero-width`);
+		}
+		for (const r of [l.galaxy, l.chart, l.timing, l.log, l.status]) assert.ok(r.y + r.h <= h - 1 && r.x + r.w <= w);
 	}
 	const many = computeLayout(110, 120, { logEvents: 200 });
 	const few = computeLayout(110, 120, { logEvents: 4 });
@@ -1704,4 +1730,243 @@ test("rate: a long tool call drives a live agent's rate to 0 once the window emp
 	// The new tokens land on the next message and the live rate returns.
 	const woken = [ROOT, node("a", { startedAt: T0, tokensOut: 12_000, generationMs: 80_000 })];
 	assert.ok(sampler.nowRate(sec(260), woken) > 0);
+});
+
+// ------------------------------------------------- status panel (D1/D2/D7)
+
+/** Three agents covering every honesty case: rpc w/ rss+ctx, inprocess, and a legacy row with no mode at all. */
+function statusNodes(): VizNode[] {
+	return [
+		ROOT,
+		node("scout-0", { role: "scout", spawnMode: "rpc", pid: 4242, contextTokens: 24_300, rss: 152, turns: 3 }),
+		node("worker-0", { role: "worker", spawnMode: "inprocess", contextTokens: 51_200, turns: 7 }),
+		node("legacy-0", { role: "reviewer" }),
+	];
+}
+
+/** Render the with-border width `w` so `frame()` hands `drawStatus` a real inner rect. */
+function statusPanel(w: number, nodes: readonly VizNode[], h = 8): string[] {
+	const cv = new Canvas(w, h);
+	const inner = frame(cv, { x: 0, y: 0, w, h }, "status", true);
+	drawStatus(cv, inner, nodes, { offset: 0, cursor: 0, focused: true });
+	return cv.toPlain();
+}
+
+test("status panel D7: field set grades by absolute width (72/52/36/20) and drops below 20", () => {
+	const nodes = statusNodes();
+	// w >= 72: name · role · state · supervisor · ctx · rss · turns
+	const wide = statusPanel(80, nodes);
+	const wideHeader = wide[1]!;
+	for (const label of ["name", "role", "state", "sup", "ctx", "rss", "turns"]) {
+		assert.ok(wideHeader.includes(label), `80-wide header missing ${label}: ${wideHeader}`);
+	}
+	assert.match(wide.join("\n"), /scout-0\s+sco\s+running\s+rpc\s+24\.3k\s+152m\s+3/);
+
+	// w >= 52: name · state · supervisor · ctx
+	const mid = statusPanel(60, nodes);
+	assert.ok(mid[1]!.includes("sup") && mid[1]!.includes("ctx"), mid[1]);
+	assert.ok(!mid[1]!.includes("rss") && !mid[1]!.includes("turns"), mid[1]);
+	assert.match(mid.join("\n"), /scout-0\s+running\s+rpc\s+24\.3k/);
+
+	// w >= 36: name · state · ctx
+	const small = statusPanel(40, nodes);
+	assert.ok(small[1]!.includes("ctx"), small[1]);
+	assert.ok(!small[1]!.includes("sup"), small[1]);
+
+	// w >= 20: name · state
+	const tiny = statusPanel(24, nodes);
+	assert.ok(tiny[1]!.includes("name") && tiny[1]!.includes("state"), tiny[1]);
+	assert.ok(!tiny[1]!.includes("ctx"), tiny[1]);
+
+	// w < 20: nothing drawn at all (fails the D7 floor, not a column of stubs).
+	const inner = { x: 1, y: 1, w: 19, h: 6 };
+	const cv = new Canvas(21, 8);
+	drawStatus(cv, inner, nodes, { offset: 0, cursor: 0, focused: true });
+	for (const line of cv.toPlain()) assert.match(line, /^ +$/, `19-wide must stay blank: ${line}`);
+});
+
+test("status panel D7: every row is exactly the pane width at each grade (no overflow past the rect)", () => {
+	const nodes = statusNodes();
+	for (const w of [21, 24, 35, 36, 40, 51, 52, 60, 71, 72, 80, 120]) {
+		const lines = statusPanel(w, nodes);
+		for (const line of lines) assert.equal(Array.from(line).length, w, `w=${w}: ${line}`);
+	}
+	// Long names are ellipsized, never allowed to push the trailing columns off.
+	const long = [ROOT, node("a-really-quite-long-agent-name-that-would-overflow", { role: "worker", spawnMode: "rpc", rss: 99, contextTokens: 1000, turns: 2 })];
+	for (const w of [24, 40, 60, 80]) {
+		const lines = statusPanel(w, long);
+		for (const line of lines) assert.equal(Array.from(line).length, w, `long w=${w}: ${line}`);
+		assert.ok(lines.join("\n").includes("…"), `long w=${w} should ellipsize`);
+	}
+	// Guard: too narrow or too short to hold a header + row is a silent no-op.
+	for (const r of [{ x: 0, y: 0, w: 19, h: 6 }, { x: 0, y: 0, w: 40, h: 1 }]) {
+		const cv = new Canvas(40, 8);
+		drawStatus(cv, r, nodes, { offset: 0, cursor: 0, focused: true });
+		assert.match(cv.toPlain()[0]!, /^ +$/);
+	}
+});
+
+test("status panel D2/D6: inprocess rss is —, missing spawnMode is unknown (never a guessed rpc)", () => {
+	const nodes = statusNodes();
+	const wide = statusPanel(90, nodes).join("\n");
+	// rpc child: real per-process rss, lowercase unit (legion-viz.test.ts:927 glyph class).
+	assert.match(wide, /scout-0\s+sco\s+running\s+rpc\s+24\.3k\s+152m\s+3/);
+	assert.doesNotMatch(wide, /\d+[MG]B?\b/, "rss units stay lowercase m");
+	// inprocess child: no pid, so no honest rss — an em dash, not a share of the host.
+	assert.match(wide, /worker-0\s+wor\s+running\s+inprocess\s+51\.2k\s+—\s+7/);
+	// Legacy row: no spawnMode → `unknown`. Never `rpc`.
+	assert.match(wide, /legacy-0\s+rev\s+running\s+unknown/);
+	const row = wide.split("\n").find((l) => l.includes("legacy-0"))!;
+	assert.ok(!row.includes("rpc"), `legacy row must not guess rpc: ${row}`);
+	// A ctx the row never recorded is also an em dash, not a zero.
+	assert.match(row, /—/);
+});
+
+test("status panel: rpc rss survives, inprocess never reports a remembered value", () => {
+	// Even if a value leaked onto an inprocess node, D2 forbids showing it:
+	// the child has no process, so the number would be a fabricated share.
+	const nodes = [ROOT, node("waz", { role: "worker", spawnMode: "inprocess", rss: 999 })];
+	const text = statusPanel(90, nodes).join("\n");
+	const row = text.split("\n").find((l) => l.includes("waz"))!;
+	assert.match(row, /—/, `inprocess rss must render —: ${row}`);
+	assert.doesNotMatch(row, /999/);
+});
+
+test("status panel: root is not a table row; footer counts agents and hidden overflow", () => {
+	const nodes = statusNodes();
+	assert.deepEqual(statusRowsFromNodes(nodes).map((n) => n.name), ["legacy-0", "scout-0", "worker-0"]);
+	const lines = statusPanel(80, nodes, 8);
+	assert.ok(!lines.join("\n").includes("centurion-0"), "root belongs to the header, not the table");
+	assert.match(lines.join("\n"), /3 agents · 3 live/);
+	// Fewer body rows than agents → the footer admits the truncation.
+	const cramped = statusPanel(80, nodes, 6);
+	assert.match(cramped.join("\n"), /3 agents · 3 live · \+1 more/, cramped.join("\n"));
+});
+
+test("status panel: scroll offset windows the rows and the cursor is the focused one", () => {
+	const nodes = statusNodes();
+	const cv = new Canvas(90, 6);
+	const inner = frame(cv, { x: 0, y: 0, w: 90, h: 6 }, "status", true);
+	// inner h=4 (framed 6) → header 1 + footer 1 → 2 body rows.
+	assert.equal(statusVisibleRows(6, 3), 2);
+	drawStatus(cv, inner, nodes, { offset: 1, cursor: 1, focused: true });
+	const text = cv.toPlain().join("\n");
+	assert.ok(!text.includes("legacy-0"), "offset 1 skips the first row");
+	assert.ok(text.includes("scout-0") && text.includes("worker-0"));
+	// focused=false paints no cursor, so nothing in the panel is inverse.
+	const blurred = new Canvas(90, 6);
+	drawStatus(blurred, frame(blurred, { x: 0, y: 0, w: 90, h: 6 }, "status", false), nodes, {
+		offset: 0,
+		cursor: 0,
+		focused: false,
+	});
+	assert.ok(blurred.cells.every((row) => row.every((cell) => !cell.inverse)));
+});
+
+test("status panel: Enter selects the focused agent and toggles it off", () => {
+	const nodes = statusNodes();
+	const rows = statusRowsFromNodes(nodes);
+	const state = initialViewState();
+	state.focus = "status";
+	state.statusCursor = 1;
+	assert.equal(handleViewKey("\r", state, nodes), "render");
+	assert.equal(state.selectedId, rows[1]!.id);
+	assert.equal(handleViewKey("\r", state, nodes), "render");
+	assert.equal(state.selectedId, undefined);
+	// Cursor navigation is clamped to the agent count (root excluded).
+	state.statusCursor = 0;
+	assert.equal(handleViewKey("\x1b[A", state, nodes), "render");
+	assert.equal(state.statusCursor, 0);
+	handleViewKey("\x1b[F", state, nodes); // End
+	assert.equal(state.statusCursor, rows.length - 1);
+	handleViewKey("\x1b[H", state, nodes); // Home
+	assert.equal(state.statusCursor, 0);
+});
+
+test("status panel D1: Tab skips the zero-area status pane in portrait, keeps it in wide/stacked", () => {
+	const { nodes } = scenario();
+	const portrait = computeLayout(46, 24);
+	assert.equal(portrait.kind, "portrait");
+	assert.equal(portrait.status.h, 0);
+	const portraitPanes = availablePanes(portrait);
+	assert.deepEqual(portraitPanes, ["galaxy", "chart", "timing", "log"]);
+	assert.ok(!portraitPanes.includes("status"));
+	// status → Tab wraps back to galaxy rather than parking on an undrawn pane.
+	const state = initialViewState();
+	state.focus = "log";
+	assert.equal(handleViewKey("\t", state, nodes, 10, portraitPanes), "render");
+	assert.equal(state.focus, "galaxy");
+	assert.equal(handleViewKey("\x1b[Z", state, nodes, 10, portraitPanes), "render");
+	assert.equal(state.focus, "log");
+
+	const wide = computeLayout(160, 50);
+	assert.ok(wide.status.h > 0);
+	assert.deepEqual(availablePanes(wide), ["galaxy", "chart", "timing", "log", "status"]);
+	const stacked = computeLayout(120, 40);
+	assert.ok(stacked.status.h > 0);
+	assert.ok(availablePanes(stacked).includes("status"));
+
+	// Default 4th/5th arg still walks every pane, so existing callers are unchanged.
+	const legacy = initialViewState();
+	legacy.focus = "log";
+	handleViewKey("\t", legacy, nodes);
+	assert.equal(legacy.focus, "status");
+});
+
+test("status panel D1: portrait renders no status pane; wide/stacked render the table", () => {
+	const nodes = statusNodes();
+	const sampler = new RateSampler();
+	sampler.record(sec(60), nodes);
+	const data = { nodes, sampler, now: sec(60), rate: 0 };
+
+	const portraitPlain = renderLegionView(data, initialViewState(), 46, 24).canvas.toPlain().join("\n");
+	assert.ok(!portraitPlain.includes("status · agents"), "portrait draws no status pane");
+
+	for (const [w, h] of [[160, 50], [120, 40]] as const) {
+		const panel = renderLegionView(data, initialViewState(), w, h).canvas.toPlain().join("\n");
+		assert.match(panel, /status · agents/, `${w}x${h} missing status pane`);
+		assert.match(panel, /scout-0/, `${w}x${h} missing an agent row`);
+	}
+	// The whole board still explains itself in one line per rendered row.
+	for (const [w, h] of [[160, 50], [120, 40], [100, 26]] as const) {
+		const { canvas } = renderLegionView(data, initialViewState(), w, h);
+		for (const line of canvas.toLines(ansiTheme)) assert.equal(visibleWidth(line), w, `${w}x${h}`);
+	}
+});
+
+test("status panel: VizNode new fields stay optional so bare literals keep compiling", () => {
+	// panels.ts:103-105 / legion-stop.test.ts:92 / this file's `node()` build these
+	// literals without the new keys — they must stay valid without defaults.
+	const bare: VizNode = { id: "x", name: "x", role: "worker", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0 };
+	assert.equal(bare.spawnMode, undefined);
+	assert.equal(bare.pid, undefined);
+	assert.equal(bare.contextTokens, undefined);
+	assert.equal(bare.rss, undefined);
+	const nodes = nodesFromEntries([
+		{ name: "r", agent: "rpc-child", state: "working", startedAt: T0, nodeId: "root.r", parentId: "root", depth: 1, spawnMode: "rpc", pid: 7, contextTokens: 900, rss: 42 },
+		{ name: "l", agent: "worker", state: "working", startedAt: T0, nodeId: "root.l", parentId: "root", depth: 1 },
+	]);
+	const rpc = nodes.find((n) => n.id === "root.r")!;
+	assert.equal(rpc.spawnMode, "rpc");
+	assert.equal(rpc.pid, 7);
+	assert.equal(rpc.contextTokens, 900);
+	assert.equal(rpc.rss, 42);
+	const legacy = nodes.find((n) => n.id === "root.l")!;
+	// Absent, not `undefined`-valued: the projection omits the key entirely.
+	assert.ok(!("spawnMode" in legacy));
+	assert.ok(!("rss" in legacy));
+	assert.ok(!("pid" in legacy));
+	// An unrecognised mode is dropped rather than echoed as a backend name.
+	const odd = nodesFromEntries([{ name: "o", agent: "x", state: "working", startedAt: T0, nodeId: "root.o", parentId: "root", depth: 1, spawnMode: "bogus" }]);
+	assert.ok(!("spawnMode" in odd.find((n) => n.id === "root.o")!));
+});
+
+test("layout D1: status band never starves the log it sits under", () => {
+	for (const [w, h] of [[160, 50], [220, 105], [139, 69], [120, 40], [100, 26], [80, 24]] as const) {
+		const l = computeLayout(w, h);
+		if (l.status.h === 0) continue;
+		assert.ok(l.status.h >= 5, `${w}x${h} status band ${l.status.h} below its floor`);
+		assert.ok(l.log.h >= STATUS_LOG_RESERVE, `${w}x${h} log ${l.log.h} starved by status`);
+		assert.equal(l.status.y, l.log.y + l.log.h, `${w}x${h} status directly under the log`);
+	}
 });
