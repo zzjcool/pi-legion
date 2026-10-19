@@ -1611,7 +1611,14 @@ test("vexillatio interrupt returns the results it already collected (#227 D4)", 
 		assert.equal(details?.interrupted, true, "details mark the interruption");
 		assert.equal(details?.async, false);
 		assert.equal(details?.handles?.length, 2, "details keep one handle per launched utility");
-		assert.ok(details?.runId, "details carry the parent run id");
+		// F7: "non-empty" cannot distinguish a right run id from a constant, so pin
+		// it to the run directory this interrupt actually wrote to.
+		assert.match(details?.runId ?? "", /^r-[0-9a-z]+$/i, "details carry a real run id, not a placeholder");
+		assert.equal(
+			existsSync(path.join(harness.cwd, ".pi-subagents", "runs", details?.runId ?? "")),
+			true,
+			"the reported run id names a run directory that exists on disk",
+		);
 		assert.deepEqual(details?.stillRunning, [second], "the still-running utility is named, the retired one is not");
 		assert.equal(harness.supervisor.isAlive(second), true, "an interrupt must not retire the child that is still running");
 		assert.equal(
@@ -1659,7 +1666,89 @@ test("vexillatio interrupt keeps launch-failure lines and emits no empty segment
 		assert.equal(details?.interrupted, true);
 		assert.deepEqual(details?.handles, []);
 		assert.equal(details?.stillRunning, undefined, "nothing survives to report as still running");
-		assert.ok(details?.runId, "the run id is reported even when every launch failed");
+		assert.match(details?.runId ?? "", /^r-[0-9a-z]+$/i, "the run id is reported even when every launch failed");
+		assert.equal(
+			existsSync(path.join(harness.cwd, ".pi-subagents", "runs", details?.runId ?? "")),
+			true,
+			"the reported run id names a run directory that exists on disk",
+		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// #227 review F6: the two interrupt cases above cover all-success and all-failed.
+// The mixed shape (one launch refused, one collected, then an abort) is the only
+// one where the segment order is observable, so pin it before someone reorders
+// the concatenation and silently buries the failure line.
+test("vexillatio interrupt keeps failure lines before collected segments (#227 D4)", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "scout.md": UTILITY_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.startTurn();
+		const controller = new AbortController();
+		// Three tasks so all three states coexist at abort time: one launch is
+		// refused, one finishes, and one is still in-turn when the parent aborts.
+		// Only this mixed shape makes the segment order observable.
+		const originalSpawn = harness.supervisor.spawnChild.bind(harness.supervisor);
+		let spawns = 0;
+		harness.supervisor.spawnChild = async (input) => {
+			spawns += 1;
+			if (spawns === 1) throw new Error("spawn refused for the mixed interrupt test");
+			return originalSpawn(input);
+		};
+		const pending = harness.utilityTool.execute(
+			"vexillatio-interrupt-mixed",
+			{
+				task: "one refused, one collected, one in-turn",
+				tasks: [
+					{ agent: "scout", task: "never launches", cwd: harness.cwd },
+					{ agent: "scout", task: "finish before the interrupt", cwd: harness.cwd },
+					{ agent: "scout", task: "stay in-turn until the interrupt", cwd: harness.cwd },
+				],
+				cwd: harness.cwd,
+				timeoutMs: 600_000,
+			},
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		for (let i = 0; i < 400 && harness.supervisor.spawns.length < 2; i += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+		}
+		const names = harness.supervisor.spawns.map((spawn) => spawn.input.name);
+		assert.equal(names.length, 2, "the two runnable utilities spawned");
+		const [finished, inTurn] = names as [string, string];
+		harness.supervisor.settle(finished, { text: "collected-before-the-interrupt" });
+		for (let i = 0; i < 600; i += 1) {
+			if (harness.supervisor.calls.some((call) => call.method === "retire" && call.name === finished)) break;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		assert.equal(harness.supervisor.isAlive(inTurn), true, "the third utility is still in-turn at abort time");
+		controller.abort();
+		const settled = await Promise.race([
+			pending,
+			new Promise<undefined>((resolve) => { setTimeout(() => resolve(undefined), 5_000); }),
+		]);
+		assert.ok(settled, "the mixed interrupt still returns");
+		const text = (settled.content ?? []).map((item) => item.text ?? "").join("\n");
+		const head = "interrupted (parent turn ended; children still running)";
+		const failedAt = text.indexOf("✗ scout: spawn refused for the mixed interrupt test");
+		const collectedAt = text.indexOf("collected-before-the-interrupt");
+		assert.ok(text.startsWith(head), "the frozen head line still leads the result");
+		assert.ok(failedAt > 0, "the launch failure survives the interrupt");
+		assert.ok(collectedAt > 0, "the collected segment survives the interrupt");
+		assert.ok(failedAt < collectedAt, "failure lines stay ahead of the collected segments");
+		const details = (settled as { details?: unknown }).details as
+			| { handles?: Array<{ name: string }>; interrupted?: boolean; stillRunning?: string[] }
+			| undefined;
+		assert.equal(details?.interrupted, true, "details mark the interruption");
+		assert.equal(details?.handles?.length, 2, "the refused launch has no handle");
+		assert.deepEqual(details?.handles?.map((handle) => handle.name), names);
+		assert.deepEqual(details?.stillRunning, [inTurn], "only the in-turn utility is still running");
 	} finally {
 		await harness.cleanup();
 	}

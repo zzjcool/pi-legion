@@ -132,7 +132,15 @@ export interface CollectResult {
 }
 
 export const COLLECT_GRACE_EXTENSIONS = 2;
-/** Shown when the launch-time collect budget elapses and the child is still in-turn. */
+/**
+ * Shown when this collect() call's budget elapses and the child is still in-turn.
+ *
+ * The "cumulative since launch" wording below is legacy: `collect()` starts its
+ * deadline from the moment it is called (`orchestrator.ts` `let deadline = ...`),
+ * not from launch. The literal is user-visible and asserted in integration tests,
+ * so D6 of `docs/contracts/vexillatio-nonblocking-launch-v1.md` deliberately left
+ * it untouched; do not read it as the actual budget origin.
+ */
 export const COLLECT_DEADLINE_REASON = "collect deadline (cumulative since launch) exceeded; child still alive";
 /** Shown when a live child's session ends on an OpenAI/GPT connection blip. */
 export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC child still alive";
@@ -1004,16 +1012,21 @@ export class Orchestrator {
 		parsed = parseSessionFile(child.sessionFile);
 		// #227 D5: a child whose process is gone cannot produce another message.
 		// When its last turn already ended with a terminal assistant message there
-		// is nothing left to wait for, and stamping the collect-deadline `running`
-		// snapshot on it would make watch() re-arm forever on a process that will
-		// never settle. Finish the completed turn instead.
+		// is nothing left to wait for, so finish the completed turn here.
+		//
+		// This is defensive rather than an observable behaviour fix: the
+		// collect-deadline branch below is already gated on `isAlive(name)`, so a
+		// dead child never received the `running` snapshot. Keeping the guard makes
+		// the intent explicit instead of relying on that coincidence — see D5 and
+		// the disclosure in the #227 contract.
 		if (wait === "timeout" && !this.supervisor.isAlive(name) && isLastTurnComplete(parsed)) {
 			return this.finishCollect(child, parsed, deriveOutcome(parsed), deadline);
 		}
 		let execution = deriveOutcome(parsed);
 		if (wait === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(parsed)) {
-			// `timeoutMs` is measured from THIS collect call, not from the launch;
-			// the constant's "cumulative since launch" wording is historical (D6).
+			// `timeoutMs` is measured from THIS collect call, not from the launch (D6).
+			// The constant's "cumulative since launch" wording is legacy; see its
+			// docstring for why it was left as-is.
 			execution = { ...execution, status: "running", reason: COLLECT_DEADLINE_REASON };
 		} else if (wait === "gone" && parsed.turns.length === 0) {
 			execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };

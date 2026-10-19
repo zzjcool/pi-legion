@@ -2458,16 +2458,15 @@ function interruptedUtilityResult(input: {
 	const stillRunning = input.handles
 		.filter(({ name }) => input.stillRunning.has(name))
 		.map(({ name }) => name);
-	return {
-		content: [{ type: "text", text: segments.length > 0 ? `${head}\n\n${segments.join("\n\n")}` : head }],
-		details: {
-			runId: input.runId,
-			handles: input.handles.map(({ name, agent, sessionFile }) => ({ name, agent, sessionFile })),
-			async: false,
-			interrupted: true,
-			...(stillRunning.length > 0 ? { stillRunning } : {}),
-		},
-	};
+	// Routed through `ok()` so the widened `details` parameter has exactly one
+	// real consumer instead of being a dead signature (#227 review F3).
+	return ok(segments.length > 0 ? `${head}\n\n${segments.join("\n\n")}` : head, {
+		runId: input.runId,
+		handles: input.handles.map(({ name, agent, sessionFile }) => ({ name, agent, sessionFile })),
+		async: false,
+		interrupted: true,
+		...(stillRunning.length > 0 ? { stillRunning } : {}),
+	});
 }
 
 /**
@@ -3250,8 +3249,9 @@ function renderCollect(
  *
  * `details` defaults to `{}`; callers that already computed machine facts
  * (runId/handles for an interrupted collect) pass them through instead of
- * discarding them (#227 D4). `isError` is deliberately never set — the
- * rendering chain and every assertion in this repo work without it.
+ * discarding them (#227 D4) — `interruptedUtilityResult` is that caller.
+ * `isError` is deliberately never set — the rendering chain and every assertion
+ * in this repo work without it.
  */
 function ok(
 	text: string,
