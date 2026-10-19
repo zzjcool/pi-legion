@@ -193,16 +193,22 @@ test("#145 status without name returns multi-child overview (not INVALID_PARAMS)
 			worktree: false,
 		});
 
+		// #232 removed collect()'s settle-quiet wait, so a child whose turn already
+		// finished is auto-recycled as soon as its background watch collects it —
+		// `scout-a` may legitimately be `retired` by the time status runs, and
+		// `status` reports live (non-retired) children only.
+		//
+		// Pin the behaviour this test is actually about: `status` without a name
+		// answers with the overview shape instead of rejecting, and it lists the
+		// children the store currently reports as live.
 		const overview = await harness.invoke({ action: "status" });
 		assert.doesNotMatch(overview.text, /name` is required/i);
 		assert.notEqual(overview.details?.error, ErrorCodes.INVALID_PARAMS);
-		assert.match(overview.text, /Status · 2 live children/);
-		assert.match(overview.text, /scout-a/);
+		assert.match(overview.text, /^Status · \d+ live child/);
 		assert.match(overview.text, /worker-b/);
 
 		const viaAll = await harness.invoke({ action: "status", all: true });
-		assert.match(viaAll.text, /Status · 2 live children/);
-		assert.match(viaAll.text, /scout-a/);
+		assert.match(viaAll.text, /^Status · \d+ live child/);
 		assert.match(viaAll.text, /worker-b/);
 	} finally {
 		await harness.cleanup();

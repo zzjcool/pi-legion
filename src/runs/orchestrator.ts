@@ -30,7 +30,6 @@ import {
 } from "../extension/budget.ts";
 import { canUseCachedCollect } from "../extension/recycle.ts";
 import {
-	countAssistantMessages,
 	attributeParentSessionShutdown,
 	deriveOutcome,
 	emptyParsedSession,
@@ -1001,10 +1000,19 @@ export class Orchestrator {
 		}
 		if (wait === "blocked") return this.blockedResult(child);
 		let parsed = parseSessionFile(child.sessionFile);
-		if (wait === "settled" && countAssistantMessages(parsed) > 0) {
-			await this.waitForQuiet(child.sessionFile, deadline, opts.signal);
-			if (opts.signal?.aborted) return abortedSnapshot();
-		}
+		// #232: no settle-quiet wait here.
+		//
+		// `wait === "settled"` already means the supervisor observed the turn end
+		// (`waitSettled` resolves on the settle event, not on a stat poll), and
+		// callers only reach `collect()` after `cachedCollect()` found the child
+		// finished. Re-polling `statSync(sessionFile).size` for `settleQuietMs`
+		// (2500ms) after that confirmed terminal state produced no information: an
+		// append-only transcript cannot grow once the turn is complete. It cost
+		// ~2.0s of dead time per successful collect and scaled with fan-out width.
+		//
+		// The partial-write hazard the wait was guarding against is covered by the
+		// re-parse below: `parseSessionFile` leaves a trailing partial line out of
+		// its committed cache (#36), so a mid-write tail is never read as a verdict.
 		if (opts.signal?.aborted) return abortedSnapshot();
 		parsed = parseSessionFile(child.sessionFile);
 		// #227 D5: a child whose process is gone cannot produce another message.
@@ -1255,20 +1263,6 @@ export class Orchestrator {
 			}
 			timer = setTimeout(() => finish(false), ms);
 		});
-	}
-
-	private async waitForQuiet(sessionFile: string, deadline: number, signal?: AbortSignal): Promise<void> {
-		let previous = -1;
-		let quietSince = this.now();
-		const maxPolls = Math.max(1, Math.ceil(DEFAULTS.turnTimeoutMs / POLL_INTERVAL_MS));
-		for (let poll = 0; poll < maxPolls; poll += 1) {
-			if (signal?.aborted) return;
-			const size = artifactSize(sessionFile);
-			if (size !== previous) { previous = size; quietSince = this.now(); }
-			else if (this.now() - quietSince >= DEFAULTS.settleQuietMs) return;
-			if (this.now() >= deadline) return;
-			if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return;
-		}
 	}
 
 	cachedCollect(name: string): CollectResult | undefined {
