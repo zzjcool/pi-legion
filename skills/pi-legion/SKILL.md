@@ -82,9 +82,8 @@ Keep the run/session records while the squad may need to resume. The
 
 A Git worktree is workspace separation, not a security sandbox. Read-only
 checks remain guardrails rather than a process boundary; never rely on them to
-protect against intentional writes. Pi Legion v2 supports `kind: pi`; for a
-role that requires a non-Pi CLI, use the Herdr-era 0.16.x release line rather
-than expecting v2 to launch it.
+protect against intentional writes. Pi Legion runs `kind: pi` roles only; the
+`kind` frontmatter key is still legal but `pi` is the only accepted value.
 
 ## Later control
 

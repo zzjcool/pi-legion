@@ -19,7 +19,6 @@ export const LEGION_EVENT_TYPES = [
 	"mail_delivered",
 	"mail_bounced",
 	"budget_refused",
-	"node_abandoned",
 	"orphan_detected",
 	"tree_finalized",
 ] as const;

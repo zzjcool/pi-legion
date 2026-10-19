@@ -107,10 +107,10 @@ the top of that file). Do not fail CI on it.
 Prefer **TDD** for behaviour changes: a failing test in `test/unit` or
 `test/integration` first, then the production code. Integration tests should
 drive the orchestrator through `FakeSupervisor` (`test/helpers/fake-supervisor.ts`)
-so nesting / launch / collect stay covered without a live `pi`. The herdr-era
-helpers `createHerdrClient` / `createFakeRunner` remain as **deprecated legacy**
-exports (see `src/api.ts` and `test/legacy/`); use them only when touching the
-archived Herdr backend.
+so nesting / launch / collect stay covered without a live `pi`. The old
+herdr-era `createHerdrClient` / `createFakeRunner` helpers are **gone** as of
+v4.0.0, together with `src/backends/legacy/` and `test/legacy/`; everything
+runs as `kind: pi`, in-process or over `pi --mode rpc`.
 
 ## Mock LLM
 
@@ -160,19 +160,6 @@ Or all at once (RPC mainline **1–11** only):
 ```bash
 npm run test:docker
 ```
-
-**Legacy Herdr / Space / kind checks** live under `test/legacy/docker/` (need
-pi-legion **0.16.x** Herdr-era setup). They are **not** part of
-`npm run test:docker`:
-
-```bash
-bash test/legacy/docker/verify-12-workspace.sh  # Herdr Space pin (legacy)
-bash test/legacy/docker/verify-13-kinds.sh      # kind/model matrix; live CodeBuddy when mounted
-```
-
-`verify-13-kinds.sh` also bind-mounts host `codebuddy` / `cursor-agent` and
-(unless `LIVE_KIND_PROBES=0`) calls live CodeBuddy. The numbered 1–11 scripts
-under `test/docker/` stay offline/mock.
 
 Override paths with `HOST_PI_AGENT`, `DOCKER_PI_HOME`, `PI_DOCKER_IMAGE`.
 

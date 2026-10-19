@@ -11,6 +11,50 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [4.0.0] — 2026-10-19
+
+Pi-only runtime. Relative to 3.1.0 this line removes every non-`pi` agent kind,
+the archived Herdr backend behind it, and the settings / error codes that only
+the Herdr transport read.
+
+### Breaking
+
+- **Kinds collapse to `pi`.** `AGENT_KINDS` is now `["pi"]`; the
+  `cursor` / `claude` / `codex` / `gemini` and other third-party CLI kinds are
+  gone, and with them the `cursorModel` / `nativeModelFor` / `planKindStart`
+  model translation and the "model dropped, runs on its own default" notice
+  (a `pi` child expresses every model, so the case no longer exists). `kind` is
+  still a legal frontmatter key, but `pi` is the only accepted value: a non-`pi`
+  value is ignored — one note on stderr per role (deduplicated, because the
+  catalog is re-read on several UI paths) naming the role and the original
+  value — and the role launches as `kind: pi`. The same applies to
+  `subagents.presets.<role>.kind` and `subagents.agentOverrides.<role>.kind`,
+  the three places a role's `kind` can come from. No legacy prefix aliases.
+- **Herdr backend removed.** `src/backends/legacy/` and `test/legacy/` are
+  deleted, together with the deprecated `pi-legion/api` re-exports that only
+  served them (`createHerdrClient`, `parseHerdrResponse`, `mapHerdrErrorCode`,
+  `readPaneDiagnostic`, `createCommandRunner`, `resolveHerdrBin`, `HerdrClient`
+  and their types). `pi-legion@0.16.x` stays the pin for the Herdr-era
+  execution model; the `spawnMode: rpc` / `inprocess` backends are unaffected —
+  those are two ways of running **Pi**, not third-party transports.
+- **Dead `herdr.*` settings removed.** `subagents.herdr.*` is no longer parsed
+  (a leftover block is silently ignored, as it has been ignored since 2.0.0),
+  the seven `herdr` constants are gone from `DEFAULTS`, and
+  `ErrorCodes.HERDR_UNAVAILABLE` / `ErrorCodes.PANE_BUSY` are removed.
+  `RunRecord.herdr` and `StatusEntry.herdrStatus` stay: they carry live
+  `{supervisor, node_id}` state, not backend selection.
+
+### Fixed
+
+- **A poison event row no longer freezes the cross-process event poller
+  (#233).** `node_abandoned` was missing from the event-type closed set, so a
+  snapshot row of that type could not be decoded; the 250 ms poller then threw
+  on the same row forever, its cursor never advanced, and no later event was
+  ever delivered. The closed set now contains `node_abandoned` (15 types), and
+  the poller advances past a single poison row instead of freezing: the row is
+  reported once through `onError`, the cursor steps over it, and the remaining
+  events in that batch are still delivered.
+
 ## [3.1.0] — 2026-10-19
 
 ### Added
@@ -436,12 +480,13 @@ First **Pi Legion** line on headless Pi RPC. Relative to the final Herdr-era
 
 Last line that runs children in Herdr panes. Not developed further on this
 branch — pin `pi-legion@0.16.x` if you still need that model. See
-[Herdr transition](README.md#herdr-transition-and-role-migration) in the README.
+[Herdr transition](README.md#supported-kinds) in the README.
 
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v3.0.2...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/zzjcool/pi-legion/compare/v3.1.0...v4.0.0
 [3.0.2]: https://github.com/zzjcool/pi-legion/compare/v3.0.1...v3.0.2
 [3.0.1]: https://github.com/zzjcool/pi-legion/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/zzjcool/pi-legion/compare/v2.0.4...v3.0.0
