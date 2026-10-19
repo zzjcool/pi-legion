@@ -7,6 +7,12 @@ export const LEGION_EVENT_TYPES = [
 	"node_retired",
 	"node_resumed",
 	"node_blocked",
+	/**
+	 * Written by hygiene's `markAbandoned` (#233). It was missing from this set
+	 * while both the writer and `RETAINED_EVENT_TYPES` already treated it as a
+	 * real event, so `mapEvent` threw on read and froze the db event cursor.
+	 */
+	"node_abandoned",
 	"phase_change",
 	"phase_timeout",
 	"mail_sent",

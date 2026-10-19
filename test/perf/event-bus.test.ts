@@ -11,8 +11,9 @@
  *   batch and throws again: the cross-process view stalls permanently while
  *   burning a poll every 250ms.
  *
- * The last test below pins the CURRENT (buggy) behaviour so the fix has a
- * failing-first test to turn around. Flip its assertion when the fix lands.
+ * Fixed in #233: `node_abandoned` is now part of `LEGION_EVENT_TYPES`, so the
+ * writer, the retention list and the read-side closed set agree again. The
+ * `FIXED (was #233)` case below is the regression guard.
  */
 
 import { test } from "node:test";
@@ -80,33 +81,29 @@ test("readEventsAfter rejects no valid type and is fast enough for a 250ms poll"
 	});
 });
 
-test("REGRESSION (open defect): a node_abandoned row permanently stalls the cursor", () => {
+test("FIXED (was #233): hygiene's node_abandoned row does not stall the poll", () => {
 	withBench((h) => {
 		seedRoot(h);
 		appendEvent(h.db, "root", "node_launched", { at: 1 });
-		// This is exactly what src/runs/hygiene.ts:164 writes.
+		// Exactly what src/runs/hygiene.ts markAbandoned writes.
 		h.db
 			.prepare("INSERT INTO events (node_id, type, data, ts) VALUES (?, 'node_abandoned', ?, ?)")
 			.run("root", "{}", 2);
+		appendEvent(h.db, "root", "node_settled", { at: 3 });
 
 		const bus = createLegionEventBus();
 		const delivered: string[] = [];
 		bus.on("node_launched", () => { delivered.push("node_launched"); });
+		bus.on("node_settled", () => { delivered.push("node_settled"); });
 		const errors: string[] = [];
 		const source = createDbEventSource(h.db, { onError: (e) => errors.push(String(e)) });
 		try {
 			source.start(bus);
-			const firstCursor = source.getCursor();
-			source.poll();
-			const secondCursor = source.getCursor();
-
-			// CURRENT behaviour: the batch throws before any event is emitted, so
-			// even the valid node_launched row ahead of it stays undelivered.
-			assert.equal(delivered.length, 0, "the valid event is starved by the poisoned row");
-			assert.equal(firstCursor, 0, "the cursor never advances");
-			assert.equal(secondCursor, firstCursor, "polling again cannot make progress");
-			assert.ok(errors.length > 0, "each poll re-reports the same error");
-			assert.match(errors[0] ?? "", /unknown legion event type: node_abandoned/);
+			// The poison row must no longer stop the stream: every valid event
+			// before AND after it is delivered, and the cursor reaches the end.
+			assert.deepEqual(delivered, ["node_launched", "node_settled"]);
+			assert.equal(source.getCursor(), 3, "the cursor must advance past all three rows");
+			assert.deepEqual(errors, []);
 		} finally {
 			source.stop();
 		}
