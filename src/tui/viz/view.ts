@@ -47,7 +47,7 @@ export function initialViewState(): LegionViewState {
 }
 
 /** Tab order (D8): `status` last, so the existing galaxy→chart→timing→log walk is unchanged. */
-export const PANES: readonly Pane[] = ["galaxy", "chart", "timing", "log", "status"];
+const PANES: readonly Pane[] = ["galaxy", "chart", "timing", "log", "status"];
 
 /**
  * Panes this layout actually placed. Portrait leaves no room for a fifth pane
