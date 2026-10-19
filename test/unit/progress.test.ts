@@ -45,6 +45,9 @@ test("progressFromSession: turns and in-flight tools come from the last assistan
 		lastTools: ["edit"],
 		usageTotal: 24,
 		tokensOut: 4,
+		// D4: the fixture's assistant carries input:10/cache:0, so the current
+		// context size is 10. Adding the key makes this deepEqual STRONGER.
+		contextTokens: 10,
 	});
 });
 
@@ -78,6 +81,8 @@ test("progressFromSession: in-flight turn exposes its start timestamp", () => {
 		currentTurnStartedAt: 10_000,
 		usageTotal: 24,
 		tokensOut: 4,
+		// D4: last assistant carries input:10/cache:0 → context size 10.
+		contextTokens: 10,
 		generationMs: 2_000,
 	});
 });
