@@ -1078,18 +1078,31 @@ export class Orchestrator {
 	 * cheap signal that changes first — the artifact size — and only pays for a
 	 * `parseSessionFile` when that size moved. Unchanged artifacts reuse the
 	 * previous parse. The poll interval also backs off geometrically
-	 * (`POLL_INTERVAL_MS` → `TRANSIENT_POLL_CAP_MS`), so a default 900s deadline
-	 * costs ~330 cheap stat checks instead of 1800 full parses. The backoff never
-	 * shortens the wait: sleeps are clamped to the remaining budget and every
-	 * iteration sleeps strictly > 0ms, so the loop cannot busy-spin.
+	 * (`POLL_INTERVAL_MS` → `TRANSIENT_POLL_CAP_MS`), so the default 900s deadline
+	 * costs 228 cheap stat checks and a single parse instead of 1800 full parses.
+	 * The backoff never shortens the wait: sleeps are clamped to the remaining
+	 * budget and every iteration sleeps strictly > 0ms, so the loop cannot
+	 * busy-spin.
+	 *
+	 * Accepted tradeoff of that backoff: a UI approval raising `pendingDialogs`
+	 * is now observed within `TRANSIENT_POLL_CAP_MS` (4s), not within the old flat
+	 * 500ms. Only the blocked-detection latency degrades — the approval itself is
+	 * not dropped, and the child's own settle/exit paths do not go through this
+	 * loop.
+	 *
+	 * The seed below stats *before* parsing on purpose: an append landing between
+	 * the two calls then makes the next `size !== parsedSize` comparison true
+	 * (over-parse, safe). Parsing first would fold that append into `parsed` while
+	 * `parsedSize` also saw it, so the loop would consider the file unchanged and
+	 * never notice a recovery until the deadline expired.
 	 */
 	private async waitOutTransientConnection(
 		child: ChildRecord,
 		deadline: number,
 		signal?: AbortSignal,
 	): Promise<"aborted" | "blocked" | "done"> {
-		let parsed = parseSessionFile(child.sessionFile);
 		let parsedSize = artifactSize(child.sessionFile);
+		let parsed = parseSessionFile(child.sessionFile);
 		let interval = POLL_INTERVAL_MS;
 		for (;;) {
 			if (signal?.aborted) return "aborted";

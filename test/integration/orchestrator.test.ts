@@ -117,10 +117,9 @@ test("U7: a growing session artifact extends the RPC collect deadline", async ()
 	// #232 removed collect()'s settle-quiet wait, which used to inflate the total
 	// virtual time and made a `spent > timeoutMs` assertion pass for the wrong
 	// reason. #232 ② then turned the growth window from one flat 500ms sleep into
-	// 50ms sampling, so a wall-clock assertion here would again be measuring poll
-	// rhythm, not the deadline. The extension is pinned on what the deadline does:
-	// a growth window that observed growth buys one more RPC wait, with a budget
-	// that grew by the extended deadline.
+	// 50ms sampling, so a bare wall-clock assertion would again be measuring poll
+	// rhythm. This pins both: the deadline extension the fixture is about, and the
+	// early return ② added.
 	const runDir = tempDir("rpc-orchestrator-growing-");
 	const supervisor = new FakeSupervisor({ immediateTimeout: true });
 	let clock = 0;
@@ -142,6 +141,7 @@ test("U7: a growing session artifact extends the RPC collect deadline", async ()
 	try {
 		const handle = await orchestrator.launch({ agent: agent(), task: "long response", worktree: false });
 		sessionFile = handle.sessionFile;
+		const startedAt = clock;
 		const result = await orchestrator.collect(handle.name, { timeoutMs });
 
 		// The child never settled, so the collect reports it as still running...
@@ -153,10 +153,18 @@ test("U7: a growing session artifact extends the RPC collect deadline", async ()
 		const firstBudget = waits[0] as number;
 		const secondBudget = waits[1] as number;
 		assert.equal(firstBudget, timeoutMs, "the first wait gets the collect budget");
+		// The second budget is the re-armed deadline minus the virtual time already
+		// spent. Before #232 ② the caller had already burned a flat 500ms growth
+		// window, so the extension bought only 500ms of extra budget; returning as
+		// soon as the artifact grew leaves nearly the whole extra timeout.
 		assert.ok(
-			secondBudget - firstBudget >= timeoutMs / 2,
+			secondBudget - firstBudget >= timeoutMs * 0.9,
 			`the extension must add a full timeout to the deadline: first wait ${firstBudget}ms, second ${secondBudget}ms`,
 		);
+		// Total virtual time, in closed form: 50ms (the sampling step on which growth
+		// was observed) + 500ms (the second growth window, which saw no growth and
+		// so granted nothing). The pre-#232 rhythm was 500 + 500 = 1000ms.
+		assert.equal(clock - startedAt, 550, `the growth window cost ${clock - startedAt}ms of virtual time; #232 ② returns as soon as growth is seen`);
 	} finally {
 		rmSync(runDir, { recursive: true, force: true });
 	}

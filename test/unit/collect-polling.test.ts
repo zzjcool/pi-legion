@@ -194,7 +194,13 @@ test("#232 ③: the blip poll backs off geometrically and stays far below remain
 	}
 });
 
-test("#232 ③: growth inside the blip window is still detected and ends the hold", async () => {
+test("#232 ③ behaviour lock: early growth inside the blip window ends the hold (not a regression guard)", async () => {
+	// BEHAVIOUR LOCK, not a #232 regression guard: the pre-#232 flat 500ms poll
+	// also noticed growth on its first tick, so this case passes on both
+	// implementations. It exists so the recovery path keeps an explicit test now
+	// that the cadence is variable and size-guarded. The regression guard for the
+	// size guard is the late-growth case below, where the old and new cadences
+	// genuinely disagree.
 	let sessionFile = "";
 	let appended = false;
 	const h = harness(() => {
@@ -214,6 +220,61 @@ test("#232 ③: growth inside the blip window is still detected and ends the hol
 			h.clock() - startedAt <= LEGACY_POLL_INTERVAL_MS,
 			`recovery must end the hold at the first poll (spent ${h.clock() - startedAt}ms of a 900s window)`,
 		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#232 ③: growth is still detected long after the backoff has reached its cap", async () => {
+	// The dangerous shape for the size guard: the hold has backed off to the 4s
+	// cap and the artifact then changes. A guard that latched the wrong baseline
+	// (or stopped stat'ing entirely) would silently wait out the whole deadline
+	// and report a `running` snapshot for a child that had already recovered.
+	// The recovery here happens at t=60s, ~21 polls in, deep in the capped regime.
+	let sessionFile = "";
+	let appended = false;
+	const recoverAtMs = 60_000;
+	const h = harness(() => {
+		if (appended || h.clock() < recoverAtMs) return;
+		appended = true;
+		appendFileSync(sessionFile, `${assistantMsg({ stopReason: "stop", text: '{"ok":true}' })}\n`);
+	}, { immediateTimeout: false });
+	try {
+		sessionFile = await blipChild(h);
+		const startedAt = h.clock();
+		const collected = await h.orchestrator.collect("worker-0", { timeoutMs: 900_000 });
+		const spent = h.clock() - startedAt;
+
+		assert.equal(appended, true, "the fixture did recover the child");
+		assert.equal(collected.execution.status, "success", "late growth must still be seen, not waited out");
+		assert.match(collected.output, /"ok":true/);
+		// The recovery is noticed at the first poll tick at or after 60s, i.e. at
+		// most one capped interval later. It must not run to the 900s deadline.
+		assert.ok(
+			spent >= recoverAtMs && spent <= recoverAtMs + 4_000,
+			`late growth was noticed at ${spent}ms; expected just after ${recoverAtMs}ms (cap 4s) and never the full 900s deadline`,
+		);
+		// Proof the hold really was in the capped regime by then, not still at 500ms.
+		assert.ok(Math.max(...h.sleeps) === 4_000, `expected the backoff to be at its cap, intervals were ${[...new Set(h.sleeps)].join(",")}`);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#232: the settled fast path does no polling at all (CI-enforced twin of the perf guard)", async () => {
+	// D3's "last-turn-complete fast path: no sleeps at all" needs a gate in the
+	// CI job. test:perf is NOT part of .github/workflows/ci.yml, so the perf case
+	// that pins this cannot fail a pull request; this one can.
+	const h = harness(undefined, { autoSettle: { text: "done", stopReason: "stop" } });
+	try {
+		await h.orchestrator.launch({ agent: agent(), task: "do the thing", name: "worker-0", worktree: false });
+		const startedAt = h.clock();
+		const collected = await h.orchestrator.collect("worker-0");
+
+		assert.equal(collected.execution.status, "success");
+		assert.equal(h.clock() - startedAt, 0, `an already-settled turn burned ${h.clock() - startedAt}ms of virtual sleeps`);
+		assert.deepEqual(h.sleeps, [], "the settled path must not ask for a single sleep");
+		assert.equal(h.settleWaits.length, 0, "an already-complete last turn skips the supervisor wait entirely");
 	} finally {
 		h.cleanup();
 	}
