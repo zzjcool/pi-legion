@@ -16,6 +16,13 @@ export interface UpsertUsageInput {
 	costUsd?: number;
 }
 
+/**
+ * Chunk size for `WHERE node_id IN (...)` in {@link attachUsageTotals}.
+ * Stays under the common `SQLITE_MAX_VARIABLE_NUMBER` of 999 (some builds use
+ * 32766); contract trees are far smaller, but `getSubtree` is unbounded.
+ */
+export const USAGE_IN_CHUNK = 500;
+
 export function upsertUsage(
 	db: DatabaseSync,
 	input: UpsertUsageInput,
@@ -61,21 +68,68 @@ export function usageTotalTokens(db: DatabaseSync, nodeId: string): number {
 	return usage ? usage.tokensIn + usage.tokensOut : 0;
 }
 
+/**
+ * Annotate a node snapshot with per-node usage totals (#235).
+ *
+ * Signature and output shape are unchanged from the previous N+1 path:
+ * - `root` is never annotated (even if a usage row exists)
+ * - `tokensTotal` / `tokensOut` appear only when strictly > 0
+ * - the input array / objects are not mutated
+ *
+ * Implementation: one (or chunked) `WHERE node_id IN (...)` query + Map lookup,
+ * instead of one `getUsage` prepare/execute per node.
+ */
 export function attachUsageTotals<T extends { id: string }>(
 	db: DatabaseSync,
 	nodes: T[],
 ): Array<T & { tokensTotal?: number; tokensOut?: number }> {
+	type Annotated = T & { tokensTotal?: number; tokensOut?: number };
+	if (nodes.length === 0) return [];
+
+	const ids: string[] = [];
+	const seen = new Set<string>();
+	for (const node of nodes) {
+		if (node.id === "root") continue;
+		assertNodeId(node.id);
+		if (seen.has(node.id)) continue;
+		seen.add(node.id);
+		ids.push(node.id);
+	}
+
+	const usageById = loadUsageByNodeIds(db, ids);
+
 	return nodes.map((node) => {
-		if (node.id === "root") return { ...node } as T & { tokensTotal?: number; tokensOut?: number };
-		const usage = getUsage(db, node.id);
-		if (!usage) return { ...node } as T & { tokensTotal?: number; tokensOut?: number };
+		if (node.id === "root") return { ...node } as Annotated;
+		const usage = usageById.get(node.id);
+		if (!usage) return { ...node } as Annotated;
 		const total = usage.tokensIn + usage.tokensOut;
 		return {
 			...node,
 			...(total > 0 ? { tokensTotal: total } : {}),
 			...(usage.tokensOut > 0 ? { tokensOut: usage.tokensOut } : {}),
-		} as T & { tokensTotal?: number; tokensOut?: number };
+		} as Annotated;
 	});
+}
+
+/** Batch-load usage rows for the given node ids (chunked for SQLite bind limits). */
+function loadUsageByNodeIds(db: DatabaseSync, ids: string[]): Map<string, UsageSnapshot> {
+	const usageById = new Map<string, UsageSnapshot>();
+	if (ids.length === 0) return usageById;
+
+	for (let i = 0; i < ids.length; i += USAGE_IN_CHUNK) {
+		const chunk = ids.slice(i, i + USAGE_IN_CHUNK);
+		const placeholders = chunk.map(() => "?").join(",");
+		const rows = db
+			.prepare(
+				`SELECT node_id, tokens_in, tokens_out, cost_usd, updated_at FROM usage WHERE node_id IN (${placeholders})`,
+			)
+			.all(...chunk);
+		for (const row of rows) {
+			const usage = mapUsage(row);
+			usageById.set(usage.nodeId, usage);
+		}
+	}
+	return usageById;
 }
 
 function mapUsage(row: SqliteRow): UsageSnapshot {

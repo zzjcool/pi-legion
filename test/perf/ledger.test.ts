@@ -3,8 +3,8 @@
  * heartbeat sits on.
  *
  * Findings these numbers back (see reports/perf-2026-10-19/REPORT.md):
- *   - `attachUsageTotals` is an N+1: one `getUsage` per node, ~72% of the
- *     `snapshotNodes()` cost that runs on the 500ms refresh and on every event.
+ *   - `attachUsageTotals` (#235 FIXED): one (chunked) `WHERE node_id IN (...)`
+ *     + Map lookup; output shape unchanged (root skipped; totals only when >0).
  *   - `heartbeatNode` (#236 P1 FIXED): single-column `updated_at` write, no
  *     `SELECT *` read-back; `refreshHeartbeats` wraps the loop in one
  *     transaction so the tick pays one fsync under `synchronous=FULL`.
@@ -23,7 +23,7 @@ import { buildTree, medianMs, usPerOp, withBench } from "./fixtures.ts";
 
 const NODES = 200;
 
-test("snapshotNodes: attachUsageTotals dominates the recursive CTE", () => {
+test("FIXED (#235) snapshotNodes: batched attachUsageTotals no longer dominates the CTE", () => {
 	withBench((h) => {
 		buildTree(h.db, NODES);
 		const subtree = getSubtree(h.db, "root");
@@ -31,15 +31,30 @@ test("snapshotNodes: attachUsageTotals dominates the recursive CTE", () => {
 		const usageMs = medianMs(() => { attachUsageTotals(h.db, subtree); });
 		const bothMs = medianMs(() => { attachUsageTotals(h.db, getSubtree(h.db, "root")); });
 
-		// Attach is the N+1; it must be the larger half of the snapshot.
 		assert.ok(subtree.length >= NODES - 1, `expected a ${NODES}-node tree, got ${subtree.length}`);
+		// Flip: one IN-query must not be the larger half of the snapshot.
 		assert.ok(
-			usageMs > treeMs,
-			`N+1 usage (${usageMs.toFixed(2)}ms) should exceed the single CTE (${treeMs.toFixed(2)}ms)`,
+			usageMs < treeMs,
+			`batched usage (${usageMs.toFixed(2)}ms) should no longer dominate the CTE (${treeMs.toFixed(2)}ms)`,
 		);
 		// Loose ceiling: catches an order-of-magnitude regression only.
 		assert.ok(bothMs < 400, `snapshot of ${subtree.length} nodes took ${bothMs.toFixed(1)}ms`);
 	});
+});
+
+test("FIXED (#235) contract-scale attachUsageTotals (30/60/120) stays under loose ceiling", () => {
+	for (const n of [30, 60, 120]) {
+		withBench((h) => {
+			buildTree(h.db, n);
+			const subtree = getSubtree(h.db, "root");
+			assert.ok(subtree.length >= n - 1, `expected ~${n} nodes, got ${subtree.length}`);
+			const usageMs = medianMs(() => { attachUsageTotals(h.db, subtree); });
+			const bothMs = medianMs(() => { attachUsageTotals(h.db, getSubtree(h.db, "root")); });
+			// Pre-fix attach alone was ~2.5ms at 120; keep a wide ceiling for CI boxes.
+			assert.ok(usageMs < 50, `attach @${n} took ${usageMs.toFixed(2)}ms`);
+			assert.ok(bothMs < 100, `snapshot @${n} took ${bothMs.toFixed(2)}ms`);
+		});
+	}
 });
 
 test("FIXED (#236 P1) heartbeat: batched-beats-autocommit — one txn + updated_at-only", () => {
