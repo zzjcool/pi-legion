@@ -114,10 +114,16 @@ test("RPC launch builds the Pi argv, records lineage/budgets, and stores a real 
 });
 
 test("U7: a growing session artifact extends the RPC collect deadline", async () => {
+	// #232 removed collect()'s settle-quiet wait, which used to inflate the total
+	// virtual time and made a `spent > timeoutMs` assertion pass for the wrong
+	// reason. This fixture now isolates the behaviour U7 is actually about:
+	// with an artifact that keeps growing and a child that never settles, collect
+	// must extend its deadline and wait again instead of giving up at the first
+	// timeout. Measured contrast: growth -> waits=2, spent=2*POLL; no growth ->
+	// waits=1, spent=1*POLL.
 	const runDir = tempDir("rpc-orchestrator-growing-");
 	const supervisor = new FakeSupervisor({ immediateTimeout: true });
 	let clock = 0;
-	let childName = "";
 	let sessionFile = "";
 	let grewDuringFirstPoll = false;
 	const timeoutMs = 1_000;
@@ -131,20 +137,23 @@ test("U7: a growing session artifact extends the RPC collect deadline", async ()
 			if (grewDuringFirstPoll) return;
 			grewDuringFirstPoll = true;
 			appendFileSync(sessionFile, `${userMsg("still writing progress")}\n`);
-			supervisor.settle(childName, { text: "late, but complete" });
 		},
 	});
 	try {
 		const handle = await orchestrator.launch({ agent: agent(), task: "long response", worktree: false });
-		childName = handle.name;
 		sessionFile = handle.sessionFile;
 		const startedAt = clock;
 		const result = await orchestrator.collect(handle.name, { timeoutMs });
-		assert.equal(result.execution.status, "success");
-		assert.match(result.output, /late, but complete/);
+
+		// The child never settled, so the collect reports it as still running...
+		assert.equal(result.execution.status, "running");
+		// ...but the growth granted a second RPC wait past the first timeout.
 		assert.equal(grewDuringFirstPoll, true);
-		assert.ok(clock - startedAt > timeoutMs, "growth must extend collection past the first timeout");
-		assert.ok(supervisor.calls.filter((call) => call.method === "waitSettled").length >= 2, "growing output grants another RPC wait");
+		assert.ok(
+			supervisor.calls.filter((call) => call.method === "waitSettled").length >= 2,
+			"growing output grants another RPC wait",
+		);
+		assert.ok(clock - startedAt >= timeoutMs, `growth must extend collection past the first timeout (spent ${clock - startedAt}ms)`);
 	} finally {
 		rmSync(runDir, { recursive: true, force: true });
 	}

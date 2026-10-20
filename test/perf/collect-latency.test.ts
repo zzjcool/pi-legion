@@ -2,14 +2,14 @@
  * Collect latency — the largest measured single-point loss
  * (reports/perf-2026-10-19/REPORT.md, P1).
  *
- * `Orchestrator.collect()` already receives `wait === "settled"` from the
- * supervisor (the child's turn ended), yet then awaits `waitForQuiet`, which
- * polls `statSync(sessionFile)` until the size has been stable for
- * `DEFAULTS.settleQuietMs` (2500ms). Measured on the real Orchestrator against
- * FakeSupervisor: 2509ms of collect time, ~2007ms of it that quiet window.
+ * Fixed in #232. `collect()` used to receive `wait === "settled"` from the
+ * supervisor and then still await `waitForQuiet`, polling
+ * `statSync(sessionFile)` until the size had been stable for
+ * `DEFAULTS.settleQuietMs` (2500ms): 2509ms of collect time, ~2007ms of it that
+ * quiet window. The wait is gone; these cases now assert it stays gone.
  *
- * The orchestrator takes injected `now`/`sleep` (see OrchestratorDeps), so this
- * measures the wait precisely on a virtual clock instead of sleeping for real.
+ * The orchestrator takes injected `now`/`sleep` (see OrchestratorDeps), so the
+ * latency is measured on a virtual clock instead of sleeping for real.
  */
 
 import { test } from "node:test";
@@ -82,7 +82,7 @@ test("the settled session is already terminal before the quiet wait runs", async
 	}
 });
 
-test("collect() sleeps through the whole settleQuietMs window (P1 dead time)", async () => {
+test("collect() no longer waits for a quiet window after the turn settled (#232)", async () => {
 	const h = harness();
 	try {
 		await h.orchestrator.launch({ agent: agent(), task: "do the thing", name: "worker-0" });
@@ -90,16 +90,13 @@ test("collect() sleeps through the whole settleQuietMs window (P1 dead time)", a
 		await h.orchestrator.collect("worker-0");
 		const spent = h.elapsed() - before;
 
-		// The turn is already settled when collect() starts, so every virtual ms
-		// it sleeps here is pure latency. waitForQuiet alone is worth
-		// DEFAULT_settleQuietMs, polled in POLL_INTERVAL_MS increments.
+		// Regression guard for #232: the old implementation slept the full
+		// settleQuietMs window (2500ms) here even though `waitSettled` had already
+		// reported the turn complete. Nothing in collect() may consume that window.
 		assert.ok(
-			spent >= DEFAULTS.settleQuietMs,
-			`collect() slept ${spent}ms, expected at least the ${DEFAULTS.settleQuietMs}ms quiet window`,
+			spent < DEFAULTS.settleQuietMs,
+			`collect() slept ${spent}ms; the ${DEFAULTS.settleQuietMs}ms settle-quiet wait came back (#232)`,
 		);
-		// Pin the observed magnitude so a fix makes this number drop visibly.
-		// Seen: 2500 (quiet) + 500 (artifact grace) = 3000.
-		assert.ok(spent < 10 * DEFAULTS.settleQuietMs, `collect() slept ${spent}ms, expected a bounded window`);
 	} finally {
 		h.cleanup();
 	}
