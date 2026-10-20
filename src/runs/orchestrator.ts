@@ -61,7 +61,6 @@ import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
 import type { LegionSupervisor, SettleResult, SpawnInput } from "../supervisor/types.ts";
 import { isInProcessSpawn, resolveSpawnMode } from "../supervisor/spawn-mode.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
-import { applyThinkingSuffix } from "./args.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
 import {
 	createChildWorktree,
@@ -148,6 +147,10 @@ const MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 const UTILITY_CHILD_ENV = "PI_SUBAGENT_UTILITY_CHILD";
 const CHILD_ENV = "PI_SUBAGENT_CHILD";
 const POLL_INTERVAL_MS = 500;
+/** Ceiling for the geometric backoff in `waitOutTransientConnection`. */
+const TRANSIENT_POLL_CAP_MS = 4_000;
+/** Growth sampling step while waiting out one `POLL_INTERVAL_MS` grace window. */
+const ARTIFACT_GROWTH_POLL_MS = 50;
 
 function parseDepthCeiling(raw: string | undefined): number | undefined {
 	// Genuinely unset / blank → no env ceiling (settings + hard cap still apply).
@@ -1070,22 +1073,43 @@ export class Orchestrator {
 	 *
 	 * Returns once the session moves past that blip, the process exits, a UI
 	 * approval arrives, the parent aborts, or the cumulative deadline passes.
+	 *
+	 * #232: the wait is a poll over an append-only file, so it watches the one
+	 * cheap signal that changes first — the artifact size — and only pays for a
+	 * `parseSessionFile` when that size moved. Unchanged artifacts reuse the
+	 * previous parse. The poll interval also backs off geometrically
+	 * (`POLL_INTERVAL_MS` → `TRANSIENT_POLL_CAP_MS`), so a default 900s deadline
+	 * costs ~330 cheap stat checks instead of 1800 full parses. The backoff never
+	 * shortens the wait: sleeps are clamped to the remaining budget and every
+	 * iteration sleeps strictly > 0ms, so the loop cannot busy-spin.
 	 */
 	private async waitOutTransientConnection(
 		child: ChildRecord,
 		deadline: number,
 		signal?: AbortSignal,
 	): Promise<"aborted" | "blocked" | "done"> {
-		const maxPolls = Math.max(1, Math.ceil(Math.max(0, deadline - this.now()) / POLL_INTERVAL_MS));
-		for (let poll = 0; poll < maxPolls; poll += 1) {
+		let parsed = parseSessionFile(child.sessionFile);
+		let parsedSize = artifactSize(child.sessionFile);
+		let interval = POLL_INTERVAL_MS;
+		for (;;) {
 			if (signal?.aborted) return "aborted";
 			if (this.pendingDialogs(child.name).length) return "blocked";
 			if (!this.supervisor.isAlive(child.name)) return "done";
-			if (!isTransientConnectionFailure(deriveOutcome(parseSessionFile(child.sessionFile)))) return "done";
-			if (this.now() >= deadline) return "done";
-			if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return "aborted";
+			if (!isTransientConnectionFailure(deriveOutcome(parsed))) return "done";
+			const remaining = deadline - this.now();
+			if (remaining <= 0) return "done";
+			const sleptFrom = this.now();
+			if (await this.sleepOrAbort(Math.min(interval, remaining), signal)) return "aborted";
+			// A sleep dep that never advances the clock would make this loop a busy
+			// spin; stop holding instead of hammering the filesystem.
+			if (this.now() <= sleptFrom) return "done";
+			const size = artifactSize(child.sessionFile);
+			if (size !== parsedSize) {
+				parsed = parseSessionFile(child.sessionFile);
+				parsedSize = size;
+			}
+			interval = Math.min(interval * 2, TRANSIENT_POLL_CAP_MS);
 		}
-		return "done";
 	}
 
 	private interruptedCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>): CollectResult {
@@ -1229,11 +1253,24 @@ export class Orchestrator {
 		} catch { return undefined; }
 	}
 
+	/**
+	 * Did the session artifact grow inside one `POLL_INTERVAL_MS` window?
+	 *
+	 * #232: this used to sleep the whole window and stat twice. The window is
+	 * unchanged (a grace extension is still only granted to an artifact that is
+	 * genuinely growing), but it is now sampled at `ARTIFACT_GROWTH_POLL_MS` and
+	 * returns on the first observed growth. The sleeps stay on the injected
+	 * `now`/`sleep` deps, so `test/perf/collect-latency.test.ts` can drive them
+	 * on its virtual clock.
+	 */
 	private async collectArtifactGrowing(child: ChildRecord, signal?: AbortSignal): Promise<boolean> {
 		const before = artifactSize(child.sessionFile);
 		if (before <= 0 || signal?.aborted) return false;
-		if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return false;
-		return artifactSize(child.sessionFile) > before;
+		for (let waited = 0; waited < POLL_INTERVAL_MS; waited += ARTIFACT_GROWTH_POLL_MS) {
+			if (await this.sleepOrAbort(Math.min(ARTIFACT_GROWTH_POLL_MS, POLL_INTERVAL_MS - waited), signal)) return false;
+			if (artifactSize(child.sessionFile) > before) return true;
+		}
+		return false;
 	}
 
 	private async sleepOrAbort(ms: number, signal?: AbortSignal): Promise<boolean> {

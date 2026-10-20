@@ -83,21 +83,25 @@ test("the settled session is already terminal before the quiet wait runs", async
 });
 
 test("collect() no longer waits for a quiet window after the turn settled (#232)", async () => {
-	const h = harness();
-	try {
-		await h.orchestrator.launch({ agent: agent(), task: "do the thing", name: "worker-0" });
-		const before = h.elapsed();
-		await h.orchestrator.collect("worker-0");
-		const spent = h.elapsed() - before;
+const h = harness();
+try {
+await h.orchestrator.launch({ agent: agent(), task: "do the thing", name: "worker-0" });
+const before = h.elapsed();
+await h.orchestrator.collect("worker-0");
+const spent = h.elapsed() - before;
 
-		// Regression guard for #232: the old implementation slept the full
-		// settleQuietMs window (2500ms) here even though `waitSettled` had already
-		// reported the turn complete. Nothing in collect() may consume that window.
-		assert.ok(
-			spent < DEFAULTS.settleQuietMs,
-			`collect() slept ${spent}ms; the ${DEFAULTS.settleQuietMs}ms settle-quiet wait came back (#232)`,
-		);
-	} finally {
-		h.cleanup();
-	}
+// Regression guard for #232: the old implementation slept the full
+// settleQuietMs window (2500ms) here even though `waitSettled` had already
+// reported the turn complete. The guard is deliberately far below that (and
+// below the 50ms growth-sampling step #232 ② introduced), so any wait
+// reintroduced on the settled path trips it — a `< settleQuietMs` bound
+// would still pass with 2.4s of new sleep.
+assert.equal(
+spent,
+0,
+`collect() burned ${spent}ms of sleeps on an already-settled turn; the settled path must not sleep at all (#232)`,
+);
+} finally {
+h.cleanup();
+}
 });

@@ -116,11 +116,11 @@ test("RPC launch builds the Pi argv, records lineage/budgets, and stores a real 
 test("U7: a growing session artifact extends the RPC collect deadline", async () => {
 	// #232 removed collect()'s settle-quiet wait, which used to inflate the total
 	// virtual time and made a `spent > timeoutMs` assertion pass for the wrong
-	// reason. This fixture now isolates the behaviour U7 is actually about:
-	// with an artifact that keeps growing and a child that never settles, collect
-	// must extend its deadline and wait again instead of giving up at the first
-	// timeout. Measured contrast: growth -> waits=2, spent=2*POLL; no growth ->
-	// waits=1, spent=1*POLL.
+	// reason. #232 ② then turned the growth window from one flat 500ms sleep into
+	// 50ms sampling, so a wall-clock assertion here would again be measuring poll
+	// rhythm, not the deadline. The extension is pinned on what the deadline does:
+	// a growth window that observed growth buys one more RPC wait, with a budget
+	// that grew by the extended deadline.
 	const runDir = tempDir("rpc-orchestrator-growing-");
 	const supervisor = new FakeSupervisor({ immediateTimeout: true });
 	let clock = 0;
@@ -142,18 +142,21 @@ test("U7: a growing session artifact extends the RPC collect deadline", async ()
 	try {
 		const handle = await orchestrator.launch({ agent: agent(), task: "long response", worktree: false });
 		sessionFile = handle.sessionFile;
-		const startedAt = clock;
 		const result = await orchestrator.collect(handle.name, { timeoutMs });
 
 		// The child never settled, so the collect reports it as still running...
 		assert.equal(result.execution.status, "running");
 		// ...but the growth granted a second RPC wait past the first timeout.
 		assert.equal(grewDuringFirstPoll, true);
+		const waits = supervisor.calls.filter((call) => call.method === "waitSettled").map((call) => call.timeoutMs ?? 0);
+		assert.equal(waits.length, 2, "growth grants exactly one more RPC wait; the next window saw no growth");
+		const firstBudget = waits[0] as number;
+		const secondBudget = waits[1] as number;
+		assert.equal(firstBudget, timeoutMs, "the first wait gets the collect budget");
 		assert.ok(
-			supervisor.calls.filter((call) => call.method === "waitSettled").length >= 2,
-			"growing output grants another RPC wait",
+			secondBudget - firstBudget >= timeoutMs / 2,
+			`the extension must add a full timeout to the deadline: first wait ${firstBudget}ms, second ${secondBudget}ms`,
 		);
-		assert.ok(clock - startedAt >= timeoutMs, `growth must extend collection past the first timeout (spent ${clock - startedAt}ms)`);
 	} finally {
 		rmSync(runDir, { recursive: true, force: true });
 	}
@@ -553,6 +556,9 @@ test("a live child that recovers past a Connection error collects the real outco
 	const supervisor = new FakeSupervisor({ immediateTimeout: false });
 	let clock = 0;
 	let appended = false;
+	// #232 ②/③ made the blip hold interval-variable and size-guarded, so the
+	// driver keys off the first poll tick after the hold starts ("the child
+	// recovers right after the first sleep") instead of a fixed 500ms cadence.
 	const orchestrator = new Orchestrator({
 		supervisor,
 		runDir,
@@ -570,10 +576,14 @@ test("a live child that recovers past a Connection error collects the real outco
 	try {
 		const handle = await orchestrator.launch({ agent: agent(), task: "recover", worktree: false });
 		supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: "Connection error." });
+		const startedAt = clock;
 		const collected = await orchestrator.collect(handle.name, { timeoutMs: 5_000 });
 		assert.equal(collected.execution.status, "success");
 		assert.equal(supervisor.isAlive(handle.name), true);
 		assert.equal(orchestrator.childrenSnapshot()[0]?.state, "awaiting");
+		// The recovery was seen on the first poll, so the hold did not burn the
+		// deadline: one interval, not the whole 5_000ms window.
+		assert.ok(clock - startedAt <= 500, `recovery must end the blip hold on the first poll (spent ${clock - startedAt}ms)`);
 	} finally {
 		rmSync(runDir, { recursive: true, force: true });
 	}

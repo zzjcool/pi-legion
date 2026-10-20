@@ -23,7 +23,7 @@
 |---|---|---|
 | R1 | `index.ts:613` 工具 execute 把 signal 参数命名 `_signal` 直接丢弃，全仓无 AbortSignal 处理 | scout-0 |
 | R2 | pi 核心 abort 只在批次边界检查 signal，不强杀 in-flight tool promise，等它自然 resolve | scout-1 |
-| R3 | `Orchestrator.collect` 内部 deadline 续期（COLLECT_GRACE_EXTENSIONS=2）+ waitForQuiet（2.5s 安静窗口轮询）+ applyVerification（600s cap）使 collect 实际可等 3×timeoutMs+600s | scout-0 |
+| R3 | `Orchestrator.collect` 内部 deadline 续期（COLLECT_GRACE_EXTENSIONS=2）+ 轮询等待点（2.5s 安静窗口 `waitForQuiet`，已由 #232 / PR #244 删除；现存 `waitOutTransientConnection` + `collectArtifactGrowing`）+ applyVerification（600s cap）使 collect 实际可等 3×timeoutMs+600s | scout-0 |
 | R4 | 无显式 stop 命令，LLM 只能逐个 retire | scout-0 |
 
 ## 冻结决定
@@ -68,7 +68,7 @@ async execute(_id, params, signal, onUpdate, ctx) {
 
 - 三个可中断等待点全部接 signal：
   1. `awaitSupervisor` 内 `supervisor.waitSettled(...)` → supervisor 层新增可选 signal 参数：`waitSettled(name, timeoutMs, signal?)`，在 signal abort 时同步 resolve `{ settled:false, abnormal:false, reason:"aborted by parent" }` 并清 timer（`resolveWaiters` 已有清 timer 逻辑，需给单 waiter 提前退出路径——最简单：waiter 注册时若 signal 存在则挂 listener，abort 时从 child.waiters 删除自己 + clearTimeout + resolve）。
-  2. `waitForQuiet` 轮询循环：每轮检查 `signal?.aborted` → return。
+  2. `waitOutTransientConnection` / `collectArtifactGrowing` 轮询循环：每轮检查 `signal?.aborted` → return。（原文写作 `waitForQuiet`；该方法已由 #232 / PR #244 删除，`signal` 语义不变，仍覆盖 collect 内两个轮询等待点。）
   3. `applyVerification`：`RunVerifyRunner.verify(...)` 若不支持 signal，则在 `finishCollect` 前后不做额外处理（保持现状），但 collect 整体 deadline 检查点加 `signal?.aborted` 短路。
 - `waitSettled` 的 signal 参数是**可选**追加参数，向后兼容（默认 undefined 行为不变）——已有调用点不传即不变。
 
@@ -98,7 +98,7 @@ subagent({action:"stop", all: true})          // 全部 live children
 |---|---|---|
 | index.ts | execute signal 接线、waitAction signal 透传、stop action、TOOL_DESCRIPTION | worker |
 | src/extension/runtime.ts | waitOne signal 臂、WaitResult.interrupted、renderWait、wait opts.signal | worker |
-| src/runs/orchestrator.ts | collect opts.signal、waitForQuiet/awaitSupervisor 短路 | worker |
+| src/runs/orchestrator.ts | collect opts.signal、轮询等待点/awaitSupervisor 短路 | worker |
 | src/supervisor/rpc-supervisor.ts | waitSettled 可选 signal 参数 | worker |
 | src/supervisor/types.ts | LegionSupervisor 接口 waitSettled 签名（如有） | worker |
 | src/extension/playbook.ts | TOOL_DESCRIPTION / PARENT_PLAYBOOK 同步 stop + wait 说明 | worker |
@@ -126,7 +126,7 @@ subagent({action:"stop", all: true})          // 全部 live children
 - index.ts:595-935（execute、controlAction、launchFamily 分派）
 - index.ts:1765-1810（waitAction）
 - runtime.ts:440-547（ensureCollect/waitOne）、831-838（wait）
-- orchestrator.ts:769-941（collect/awaitSupervisor/waitForQuiet/retire）
+- orchestrator.ts:769-941（collect/awaitSupervisor/轮询等待点/retire；原 `waitForQuiet` 已由 #232 / PR #244 删除）
 - rpc-supervisor.ts:353-396（waitSettled/isAlive）、760-838（retireChild）
 - 4 个单测锚点：`test/unit/supervisor.test.ts:295` 等现有 waitSettled 测试不变（可选第三参数不破坏旧签名）。
 - `waitSettled` 当前在 `src/supervisor/types.ts:81` 接口里，改为 `waitSettled(name: string, timeoutMs?: number, signal?: AbortSignal): Promise<SettleResult>`；唯一非测试调用点 `orchestrator.ts:800`。

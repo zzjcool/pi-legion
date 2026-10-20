@@ -38,6 +38,16 @@ same root cause drives `waitOutTransientConnection` (worst case 1800 full
 `parseSessionFile` calls, ~500ms `POLL_INTERVAL_MS` cadence) and
 `collectArtifactGrowing`.
 
+> **Status after #232** (kept for the measurement record; the numbers above are
+the pre-fix baseline): `waitForQuiet` is gone (PR #244). The two remaining poll
+loops keep their channel but had their *cost* cut:
+> `waitOutTransientConnection` re-parses only when the artifact size changed and
+> backs off 500ms → 4s (default 900s deadline: 1800 full parses → 1 parse, 228
+> cheap polls); `collectArtifactGrowing` samples the grace window at 50ms so it
+> returns as soon as the artifact grows instead of always one full 500ms later.
+> Fixing the *channel* (subscribing `onEvent`) stays open — see #232.
+> Pinned by `test/unit/collect-polling.test.ts`.
+
 Test: `test/perf/collect-latency.test.ts` (virtual clock: the injected
 `now`/`sleep` deps measure the window without sleeping).
 
