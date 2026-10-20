@@ -11,7 +11,7 @@ import { Type } from "typebox";
 import type { LegionSettings } from "../shared/types.ts";
 import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
-import { sqliteHasRow, type DatabaseSync } from "../legion/db.ts";
+import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
 import type { LegionEventBus } from "./event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
 import {
@@ -137,9 +137,13 @@ export class LegionPostman {
 	}
 
 	private refreshHeartbeats(children: readonly LegionNode[]): void {
-		for (const child of children) {
-			if (this.supervisor.isAlive(child.name)) heartbeatNode(this.db, child.id, this.now);
-		}
+		const alive = children.filter((child) => this.supervisor.isAlive(child.name));
+		if (alive.length === 0) return;
+		// One transaction for the whole tick: avoids per-child implicit
+		// autocommit fsync under PRAGMA synchronous=FULL (#236 P1).
+		withTransaction(this.db, () => {
+			for (const child of alive) heartbeatNode(this.db, child.id, this.now);
+		});
 	}
 
 	private async deliverChildren(children: readonly LegionNode[]): Promise<void> {
