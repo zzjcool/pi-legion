@@ -391,7 +391,8 @@ export function resolveSessionMaxLineBytes(env: NodeJS.ProcessEnv = process.env)
 	return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_SESSION_MAX_LINE_BYTES;
 }
 
-interface SessionParseState {
+/** Append-only JSONL byte cursor shared by parseSessionFile and live-overlay (#234). */
+export interface SessionByteCursor {
 	dev: number;
 	ino: number;
 	/** Byte offset just past the last complete line consumed. */
@@ -399,6 +400,9 @@ interface SessionParseState {
 	/** Bytes at the head and just before `offset`; a mismatch means rewrite. */
 	head: Buffer;
 	boundary: Buffer;
+}
+
+interface SessionParseState extends SessionByteCursor {
 	parsed: ParsedSession;
 	/** Generation-interval clock; survives across incremental polls. */
 	clock: GenerationClock;
@@ -412,16 +416,28 @@ function readAt(fd: number, start: number, length: number): Buffer {
 	return buf.subarray(0, n);
 }
 
-function fingerprint(fd: number, offset: number): { head: Buffer; boundary: Buffer } {
+export function sessionFileFingerprint(fd: number, offset: number): { head: Buffer; boundary: Buffer } {
 	const head = readAt(fd, 0, Math.min(FINGERPRINT_BYTES, offset));
 	const start = Math.max(0, offset - FINGERPRINT_BYTES);
 	return { head, boundary: readAt(fd, start, offset - start) };
 }
 
-function stillValid(fd: number, stat: fs.Stats, state: SessionParseState): boolean {
+export function sessionFileStillValid(
+	fd: number,
+	stat: fs.Stats,
+	state: Pick<SessionByteCursor, "dev" | "ino" | "offset" | "head" | "boundary">,
+): boolean {
 	if (state.dev !== stat.dev || state.ino !== stat.ino || stat.size < state.offset) return false;
-	const now = fingerprint(fd, state.offset);
+	const now = sessionFileFingerprint(fd, state.offset);
 	return now.head.equals(state.head) && now.boundary.equals(state.boundary);
+}
+
+function fingerprint(fd: number, offset: number): { head: Buffer; boundary: Buffer } {
+	return sessionFileFingerprint(fd, offset);
+}
+
+function stillValid(fd: number, stat: fs.Stats, state: SessionParseState): boolean {
+	return sessionFileStillValid(fd, stat, state);
 }
 
 /** Incremental parse cache: append-only session files are only read past `offset`. */
@@ -445,23 +461,24 @@ function applyLine(parsed: ParsedSession, raw: string, clock: GenerationClock): 
 
 /**
  * Stream complete lines from `fd` starting at `start`, never holding more than
- * one chunk plus one (capped) line in memory. Returns the offset just past the
- * last complete line; a trailing partial line is left for the next call.
+ * one chunk plus one (capped) line in memory. A trailing partial line is left
+ * for the next call (offset stays before it). Oversized rows are skipped and
+ * counted in `tornLines` — same policy as parseSessionFile (#36).
  */
-function consumeLines(
+export function readCompleteSessionLines(
 	fd: number,
 	start: number,
 	size: number,
-	parsed: ParsedSession,
-	clock: GenerationClock,
 	maxLineBytes: number,
-): number {
+): { offset: number; lines: string[]; tornLines: number } {
 	const chunk = Buffer.allocUnsafe(SESSION_READ_CHUNK_BYTES);
 	let pos = start;
 	let consumed = start;
 	let pending: Buffer[] = [];
 	let pendingBytes = 0;
 	let skipping = false;
+	const lines: string[] = [];
+	let tornLines = 0;
 	while (pos < size) {
 		const n = fs.readSync(fd, chunk, 0, Math.min(chunk.length, size - pos), pos);
 		if (n <= 0) break;
@@ -469,12 +486,12 @@ function consumeLines(
 		for (let i = 0; i < n; i++) {
 			if (chunk[i] !== 0x0a) continue;
 			if (skipping) {
-				parsed.tornLines += 1;
+				tornLines += 1;
 				skipping = false;
 			} else {
 				const piece = chunk.subarray(lineStart, i);
 				const text = pendingBytes ? Buffer.concat([...pending, piece]).toString("utf8") : piece.toString("utf8");
-				applyLine(parsed, text, clock);
+				lines.push(text);
 			}
 			pending = [];
 			pendingBytes = 0;
@@ -494,7 +511,107 @@ function consumeLines(
 		}
 		pos += n;
 	}
-	return consumed;
+	return { offset: consumed, lines, tornLines };
+}
+
+/**
+ * Stream complete lines from `fd` starting at `start`, never holding more than
+ * one chunk plus one (capped) line in memory. Returns the offset just past the
+ * last complete line; a trailing partial line is left for the next call.
+ */
+function consumeLines(
+	fd: number,
+	start: number,
+	size: number,
+	parsed: ParsedSession,
+	clock: GenerationClock,
+	maxLineBytes: number,
+): number {
+	const { offset, lines, tornLines } = readCompleteSessionLines(fd, start, size, maxLineBytes);
+	for (const text of lines) applyLine(parsed, text, clock);
+	parsed.tornLines += tornLines;
+	return offset;
+}
+
+/** Result of an incremental JSONL append read (#234). */
+export interface SessionJsonlDelta {
+	/** Fingerprint cursor after committing complete lines. */
+	cursor: SessionByteCursor;
+	/** Newly completed lines since `previous` (provisional excluded). */
+	lines: string[];
+	/** Trailing incomplete bytes for this call only — do not commit. */
+	provisional: string;
+	fileSize: number;
+	/** True when `previous` was discarded (rewrite / truncate / inode change). */
+	reset: boolean;
+	/** Oversized lines skipped while scanning this delta. */
+	tornLines: number;
+}
+
+function emptyByteCursor(stat: fs.Stats): SessionByteCursor {
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		offset: 0,
+		head: Buffer.alloc(0),
+		boundary: Buffer.alloc(0),
+	};
+}
+
+/**
+ * Seek to `previous.offset` and parse only appended bytes (#234).
+ *
+ * Same rewrite detection and trailing-partial policy as `parseSessionFile`:
+ * provisional bytes are returned for this call but must not be committed by the
+ * caller. Pass `undefined` for a cold read from byte 0. Missing files yield
+ * `undefined`.
+ */
+export function readSessionJsonlDelta(
+	path: string,
+	previous: SessionByteCursor | undefined,
+): SessionJsonlDelta | undefined {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(path, "r");
+		const stat = fs.fstatSync(fd);
+		const reset = !previous || !sessionFileStillValid(fd, stat, previous);
+		const cursor = reset
+			? emptyByteCursor(stat)
+			: {
+				dev: previous.dev,
+				ino: previous.ino,
+				offset: previous.offset,
+				head: previous.head,
+				boundary: previous.boundary,
+			};
+		const maxLineBytes = resolveSessionMaxLineBytes();
+		const before = cursor.offset;
+		const read = readCompleteSessionLines(fd, cursor.offset, stat.size, maxLineBytes);
+		cursor.offset = read.offset;
+		cursor.dev = stat.dev;
+		cursor.ino = stat.ino;
+		if (cursor.offset !== before) Object.assign(cursor, sessionFileFingerprint(fd, cursor.offset));
+		let provisional = "";
+		if (cursor.offset < stat.size && stat.size - cursor.offset <= maxLineBytes) {
+			const tail = Buffer.allocUnsafe(stat.size - cursor.offset);
+			const n = fs.readSync(fd, tail, 0, tail.length, cursor.offset);
+			provisional = tail.subarray(0, n).toString("utf8");
+		}
+		return {
+			cursor,
+			lines: read.lines,
+			provisional,
+			fileSize: stat.size,
+			reset,
+			tornLines: read.tornLines,
+		};
+	} catch {
+		return undefined;
+	} finally {
+		if (fd !== undefined) {
+			try { fs.closeSync(fd); } catch { /* ignore */ }
+		}
+	}
 }
 
 function finalizeParsed(parsed: ParsedSession): ParsedSession {
