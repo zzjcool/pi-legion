@@ -356,10 +356,19 @@ function contextTokensFor(sessionFile: string): number | undefined {
  * process — apportioning the host RSS across children would be invented data,
  * so it reports the shared host figure and says so.
  *
- * `undefined` when there is nothing honest to print (no pid, non-Linux host,
- * pid already gone).
+ * A memory figure describes a process that is running NOW, so a child that the
+ * liveness check reports gone gets no line at all (§6). Its pid may already
+ * belong to an unrelated process: reading `/proc/<pid>` then would print a
+ * stranger's RSS under this child's name — fabricated attribution that looks
+ * real, the exact thing D2 forbids. v1 keeps no last-known cache, so there is
+ * nothing honest left to show.
+ *
+ * `undefined` when there is nothing honest to print (child not alive, no pid,
+ * non-Linux host, pid already gone).
  */
 function memoryLine(input: LiveChildStatusInput): string | undefined {
+	// §6 pid-reuse race: never probe a pid whose process is already gone.
+	if (!input.alive) return undefined;
 	if (input.spawnMode === "inprocess") {
 		const host = readProcRss(process.pid);
 		if (!host) return undefined;
@@ -1524,9 +1533,17 @@ function latestActivityAt(...candidates: Array<number | undefined>): number | un
  * host, so it has no RSS of its own: apportioning the host figure across
  * children would invent data the user then decides on. Those rows stay blank
  * and the host figure is reported once, by name, elsewhere.
+ *
+ * §6 pid-reuse race: a pid outlives nothing — once the child exits, the kernel
+ * may hand the same number to an unrelated process, and its RSS would land on
+ * this row as the child's memory. So the pid is only read while the caller's
+ * liveness check says the child is still up; a job with no `isAlive` hook
+ * (legacy / re-followed record) has unverifiable liveness and stays blank too.
  */
 function rssFor(job: TrackedJob): number | undefined {
 	if (job.spawnMode === "inprocess" || job.pid === undefined) return undefined;
+	// `isAlive` undefined is not permission to read: unknown is not alive.
+	if (!job.isAlive || !job.isAlive()) return undefined;
 	return readProcRss(job.pid)?.rssMb;
 }
 
