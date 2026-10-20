@@ -1079,16 +1079,23 @@ export class Orchestrator {
 	 * `parseSessionFile` when that size moved. Unchanged artifacts reuse the
 	 * previous parse. The poll interval also backs off geometrically
 	 * (`POLL_INTERVAL_MS` → `TRANSIENT_POLL_CAP_MS`), so the default 900s deadline
-	 * costs 228 cheap stat checks and a single parse instead of 1800 full parses.
-	 * The backoff never shortens the wait: sleeps are clamped to the remaining
-	 * budget and every iteration sleeps strictly > 0ms, so the loop cannot
-	 * busy-spin.
+	 * costs 229 stats (the seed stat plus 228 sleeps, one stat each) and a single
+	 * parse instead of 1800 full parses. The backoff never shortens the wait:
+	 * sleeps are clamped to the remaining budget and every iteration sleeps
+	 * strictly > 0ms, so the loop cannot busy-spin.
 	 *
-	 * Accepted tradeoff of that backoff: a UI approval raising `pendingDialogs`
-	 * is now observed within `TRANSIENT_POLL_CAP_MS` (4s), not within the old flat
-	 * 500ms. Only the blocked-detection latency degrades — the approval itself is
-	 * not dropped, and the child's own settle/exit paths do not go through this
-	 * loop.
+	 * Accepted tradeoff, stated plainly because it is a real regression in
+	 * observation latency: **this loop is the only detector for both the blip
+	 * clearing and the child exiting while it holds** (per D2 the orchestrator
+	 * does not subscribe to `onEvent`, and `waitSettled` has already returned
+	 * `timeout` by the time we get here). So during the hold, an exit or a settle
+	 * appended to the session is observed within one capped interval —
+	 * up to `TRANSIENT_POLL_CAP_MS` (4s) — where the pre-#232 flat 500ms cadence
+	 * observed it within 500ms. The same applies to a UI approval raising
+	 * `pendingDialogs`. Nothing is dropped and no return value changes
+	 * (`TRANSIENT_CONNECTION_REASON`, `"done"`); only the latency with which the
+	 * loop notices grows, and it is bounded by the cap rather than by the
+	 * deadline. This is the documented reason the cap is 4s and not larger.
 	 *
 	 * The seed below stats *before* parsing on purpose: an append landing between
 	 * the two calls then makes the next `size !== parsedSize` comparison true

@@ -37,15 +37,65 @@ const LEGACY_POLL_INTERVAL_MS = 500;
  * `fs.openSync` wrapper that counts opens of one armed path. Installed once for
  * the file; it only counts while a target is armed, so tests may interleave.
  */
-const nodeFs = createRequire(import.meta.url)("node:fs") as { openSync: (...args: unknown[]) => number };
+const nodeFs = createRequire(import.meta.url)("node:fs") as {
+	openSync: (...args: unknown[]) => number;
+	statSync: (...args: unknown[]) => unknown;
+};
 const realOpenSync = nodeFs.openSync;
+const realStatSync = nodeFs.statSync;
 let openTarget: string | null = null;
 let opens = 0;
+
+/**
+ * Seed-race injection for `waitOutTransientConnection`.
+ *
+ * Arms a session file plus a callback that fires exactly once, immediately
+ * BEFORE the first `statSync` of that file during the hold — i.e. between the
+ * seed's size reading and the seed's parse, whichever order the implementation
+ * uses, and with the size reading observing the append.
+ *
+ * Firing *before* the stat is what makes the two orderings differ:
+ *
+ *   stat-then-parse (current): the stat returns the post-append size and the
+ *     parse that follows already contains the recovery, so the hold ends on its
+ *     first iteration check (spent 0ms).
+ *   parse-then-stat (pre-fix): the parse runs before the append and misses the
+ *     recovery, then the stat folds the append into `parsedSize`. The stale
+ *     `parsed` keeps reporting a blip while the size never changes again, so
+ *     `size !== parsedSize` stays false and the append is only picked up after
+ *     the deadline — the stall this test exists to prevent.
+ *
+ * `parseSessionFile` stats through `fstatSync(fd)`, not `statSync(path)`, and no
+ * `statSync` of the session file happens before the hold, so "first statSync"
+ * unambiguously identifies the seed size reading in either ordering.
+ */
+let raceTarget: string | null = null;
+let raceAppend: (() => void) | null = null;
+let raceFired = false;
+
+function fireSeedRace(file: unknown): void {
+	if (raceTarget === null || file !== raceTarget || raceFired) return;
+	raceFired = true;
+	raceAppend?.();
+}
+
 nodeFs.openSync = (...args: unknown[]) => {
 	if (openTarget !== null && args[0] === openTarget) opens += 1;
 	return realOpenSync(...args);
 };
+nodeFs.statSync = (...args: unknown[]) => {
+	fireSeedRace(args[0]);
+	return realStatSync(...args);
+};
 syncBuiltinESMExports();
+
+/** Append once, between the hold's seed size reading and its seed parse. */
+function injectBetweenSeedStatAndParse(file: string, append: () => void): () => void {
+	raceTarget = file;
+	raceAppend = append;
+	raceFired = false;
+	return () => { raceTarget = null; raceAppend = null; };
+}
 
 function countOpensOf(file: string): { count(): number; stop(): void } {
 	opens = 0;
@@ -225,12 +275,92 @@ test("#232 ③ behaviour lock: early growth inside the blip window ends the hold
 	}
 });
 
+test("#232 ③: an append landing between the seed stat and the seed parse is not missed", async () => {
+	// Regression guard for the seed ordering (stat before parse). The window is a
+	// single pair of synchronous calls inside waitOutTransientConnection, so it is
+	// injected through fs: the append fires immediately before the seed's
+	// statSync, and therefore between the seed's size reading and its parse.
+	//
+	// Pre-fix (parse before stat) the parse ran first and missed the recovery,
+	// while the stat that followed folded it into `parsedSize` — so
+	// `size !== parsedSize` stayed false for the rest of the hold and the outcome
+	// was identical but only reached when the deadline expired (measured: 900000ms
+	// of waiting instead of 0ms).
+	const h = harness(undefined, { immediateTimeout: false });
+	let disarm: (() => void) | undefined;
+	try {
+		const sessionFile = await blipChild(h);
+		let appended = false;
+		disarm = injectBetweenSeedStatAndParse(sessionFile, () => {
+			appended = true;
+			appendFileSync(sessionFile, `${assistantMsg({ stopReason: "stop", text: '{"ok":true}' })}\n`);
+		});
+		const startedAt = h.clock();
+		const collected = await h.orchestrator.collect("worker-0", { timeoutMs: 900_000 });
+		const spent = h.clock() - startedAt;
+
+		assert.equal(appended, true, "the fixture did append inside the seed window");
+		assert.equal(collected.execution.status, "success", "a recovery appended during the seed must not be missed");
+		assert.match(collected.output, /"ok":true/);
+		// Seen on the first iteration check, i.e. without waiting at all. Pre-fix
+		// this assertion read 900000ms: the whole deadline.
+		assert.equal(spent, 0, `the seed-time append was noticed after ${spent}ms of waiting; it must be noticed immediately`);
+		assert.deepEqual(h.sleeps, [], "no poll may be needed: the recovery is in the seed parse itself");
+	} finally {
+		disarm?.();
+		h.cleanup();
+	}
+});
+
+test("#232 ③: an exit during the hold is noticed within one capped interval, far below the deadline", async () => {
+	// During the hold the loop's isAlive() is the ONLY exit detector (D2: no
+	// onEvent subscription, and waitSettled already returned "timeout"). The
+	// backoff therefore bounds exit-observation latency, and nothing else in the
+	// suite bounded it — so it could silently grow without a failing test.
+	//
+	// The child dies once the virtual clock passes `exitAtMs`, driven from the
+	// harness's post-sleep hook (the virtual clock only moves inside sleeps).
+	const exitAtMs = 60_000;
+	let exited = false;
+	const h = harness(() => {
+		if (exited || h.clock() < exitAtMs) return;
+		exited = true;
+		h.supervisor.exit("worker-0");
+	}, { immediateTimeout: false });
+	try {
+		await blipChild(h);
+		const startedAt = h.clock();
+		const collected = await h.orchestrator.collect("worker-0", { timeoutMs: 900_000 });
+		const spent = h.clock() - startedAt;
+
+		assert.equal(exited, true, "the fixture did kill the child mid-hold");
+		// The exit is observed at the first poll tick at or after the death. Tick 17
+		// is t=59500ms and tick 18 is t=63500ms, so the bound below is the cap.
+		assert.ok(
+			spent >= exitAtMs && spent <= exitAtMs + 4_000,
+			`an exit during the hold was noticed at ${spent}ms; expected just after ${exitAtMs}ms and bounded by the 4s cap, never the 900s deadline`,
+		);
+		assert.notEqual(collected.execution.reason, TRANSIENT_CONNECTION_REASON, "a dead child is no longer a live blip");
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("#232 ③: growth is still detected long after the backoff has reached its cap", async () => {
-	// The dangerous shape for the size guard: the hold has backed off to the 4s
-	// cap and the artifact then changes. A guard that latched the wrong baseline
-	// (or stopped stat'ing entirely) would silently wait out the whole deadline
-	// and report a `running` snapshot for a child that had already recovered.
-	// The recovery here happens at t=60s, ~21 polls in, deep in the capped regime.
+	// What this actually proves: growth at t=60s is still seen, and the hold ends
+	// at the first tick at or after that — so the size guard keeps stat'ing and
+	// keeps comparing against a live baseline deep in the capped regime.
+	//
+	// What it does NOT prove: it cannot observe a *wrongly latched* baseline,
+	// because a baseline that is too old makes `size !== parsedSize` permanently
+	// TRUE (over-parse — the safe failure, just wasted work), not permanently
+	// false. The assertion that fails if the guard stops working is the cadence
+	// check at the end (the backoff must actually be at its 4s cap), not the
+	// timing bound — the pre-#232 flat 500ms loop also ends promptly here.
+	//
+	// Cadence grid: cumulative virtual time reaches 59500ms on tick 17 and
+	// 63500ms on tick 18 (500+1000+2000, then 4000s), so a recovery triggered at
+	// 60s is observed on tick 18.
 	let sessionFile = "";
 	let appended = false;
 	const recoverAtMs = 60_000;

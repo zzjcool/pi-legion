@@ -161,10 +161,16 @@ test("U7: a growing session artifact extends the RPC collect deadline", async ()
 			secondBudget - firstBudget >= timeoutMs * 0.9,
 			`the extension must add a full timeout to the deadline: first wait ${firstBudget}ms, second ${secondBudget}ms`,
 		);
-		// Total virtual time, in closed form: 50ms (the sampling step on which growth
-		// was observed) + 500ms (the second growth window, which saw no growth and
-		// so granted nothing). The pre-#232 rhythm was 500 + 500 = 1000ms.
-		assert.equal(clock - startedAt, 550, `the growth window cost ${clock - startedAt}ms of virtual time; #232 ② returns as soon as growth is seen`);
+		// Total virtual time, bounded rather than pinned: an exact sum is a function
+		// of ARTIFACT_GROWTH_POLL_MS + POLL_INTERVAL_MS, and a legitimate retune of
+		// either constant must not break a test that is not about them. The real
+		// discrimination is the extension-budget assertion above; this bound just
+		// catches a return to the pre-#232 rhythm. Observed after the fix: 550ms;
+		// pre-#232: 1000ms.
+		assert.ok(
+			clock - startedAt <= timeoutMs * 0.9,
+			`the growth window cost ${clock - startedAt}ms of virtual time; #232 ② returns as soon as growth is seen, so it must stay well under the ${timeoutMs}ms timeout`,
+		);
 	} finally {
 		rmSync(runDir, { recursive: true, force: true });
 	}
