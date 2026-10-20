@@ -5,15 +5,18 @@
  * Findings these numbers back (see reports/perf-2026-10-19/REPORT.md):
  *   - `attachUsageTotals` is an N+1: one `getUsage` per node, ~72% of the
  *     `snapshotNodes()` cost that runs on the 500ms refresh and on every event.
- *   - `heartbeatNode` -> `updateNode` is one implicit transaction (one fsync
- *     under the default `synchronous=FULL`) per child per 2s tick.
- *   - every `prepare()` recompiles: the data layer keeps no statement cache.
+ *   - `heartbeatNode` (#236 P1 FIXED): single-column `updated_at` write, no
+ *     `SELECT *` read-back; `refreshHeartbeats` wraps the loop in one
+ *     transaction so the tick pays one fsync under `synchronous=FULL`.
+ *   - every `prepare()` recompiles: the data layer keeps no statement cache
+ *     (still open — out of scope for #236 P1).
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { getSubtree, getChildren, getNode, updateNode } from "../../src/legion/nodes.ts";
+import { getSubtree, getChildren, getNode, heartbeatNode, updateNode } from "../../src/legion/nodes.ts";
+import { withTransaction } from "../../src/legion/db.ts";
 import { attachUsageTotals } from "../../src/legion/usage.ts";
 import { appendEvent, getDataVersion, readEventsAfter } from "../../src/legion/events.ts";
 import { buildTree, medianMs, usPerOp, withBench } from "./fixtures.ts";
@@ -39,28 +42,34 @@ test("snapshotNodes: attachUsageTotals dominates the recursive CTE", () => {
 	});
 });
 
-test("heartbeat: one implicit transaction per child (a batch pays one fsync)", () => {
+test("FIXED (#236 P1) heartbeat: batched-beats-autocommit — one txn + updated_at-only", () => {
 	withBench((h) => {
 		buildTree(h.db, 60);
 		const children = getChildren(h.db, "root");
 		assert.ok(children.length >= 8, `expected child rows, got ${children.length}`);
 
+		// Baseline: the pre-fix path (full updateNode{} + per-child autocommit).
 		const autocommit = medianMs(() => {
 			for (const child of children) updateNode(h.db, child.id, {});
 		}, 7);
+		// Production path after #236 P1: slim heartbeatNode inside one transaction.
 		const batched = medianMs(() => {
-			h.db.exec("BEGIN IMMEDIATE");
-			for (const child of children) updateNode(h.db, child.id, {});
-			h.db.exec("COMMIT");
+			withTransaction(h.db, () => {
+				for (const child of children) heartbeatNode(h.db, child.id);
+			});
 		}, 7);
 
-		// The batch pays one fsync instead of N. This is the measurable gap the
-		// "wrap heartbeats in a transaction" fix is meant to close.
+		// Flip: the fixed path must beat per-child autocommit (one fsync vs N).
 		assert.ok(
-			autocommit > batched,
-			`per-child autocommit (${autocommit.toFixed(2)}ms) should cost more than one batch (${batched.toFixed(2)}ms)`,
+			batched < autocommit,
+			`batched heartbeats (${batched.toFixed(2)}ms) should beat per-child autocommit (${autocommit.toFixed(2)}ms)`,
 		);
-		assert.ok(autocommit < 2_000, `heartbeat loop took ${autocommit.toFixed(0)}ms for ${children.length} children`);
+		assert.ok(batched < 2_000, `batched heartbeat loop took ${batched.toFixed(0)}ms for ${children.length} children`);
+
+		// Orphan / staleNodeHours still see the touch.
+		const before = getNode(h.db, children[0]!.id)!.updatedAt;
+		withTransaction(h.db, () => { heartbeatNode(h.db, children[0]!.id, () => before + 1_000); });
+		assert.equal(getNode(h.db, children[0]!.id)!.updatedAt, before + 1_000);
 	});
 });
 

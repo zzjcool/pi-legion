@@ -366,12 +366,23 @@ export function updateNode(
 	return updated;
 }
 
+/**
+ * Touch only `updated_at` for a live child. Empty-patch heartbeats must not
+ * run the full `updateNode` CASE ladder or a `SELECT *` read-back — orphan
+ * detection / `staleNodeHours` only need the timestamp (#236 P1).
+ */
 export function heartbeatNode(
 	db: DatabaseSync,
 	id: string,
 	now: () => number = () => Date.now(),
-): LegionNode {
-	return updateNode(db, id, {}, now);
+): { id: string; updatedAt: number } {
+	const timestamp = now();
+	assertTimestamp(timestamp, "clock");
+	const result = db
+		.prepare("UPDATE nodes SET updated_at = ? WHERE id = ?")
+		.run(timestamp, id);
+	if (Number(result.changes) === 0) throw new Error(`node not found: ${id}`);
+	return { id, updatedAt: timestamp };
 }
 
 export function listNodesByStatus(

@@ -102,6 +102,7 @@ test("legion nodes update status and heartbeat then scan status and stale timest
 		insertNode(db, { parentId: null, name: "root", role: "root", status: "settled" }, () => 10);
 		const worker = insertNode(db, { parentId: "root", name: "worker", role: "worker", status: "starting" }, () => 20);
 		assert.equal(heartbeatNode(db, worker.id, () => 35).updatedAt, 35);
+		assert.equal(getNode(db, worker.id)?.updatedAt, 35);
 		const updated = updateNode(db, worker.id, { status: "running", phase: "implementing", phaseSince: 40 }, () => 40);
 		assert.equal(updated.status, "running");
 		assert.deepEqual(listNodesByStatus(db, ["running", "starting"]).map((node) => node.id), [worker.id]);
