@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearSessionParseCache, parseSessionFile, parseSessionText } from "../../src/shared/session.ts";
+import { clearSessionParseCache, parseSessionFile, parseSessionText, readSessionJsonlDelta } from "../../src/shared/session.ts";
 
 const user = (t: string) => JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: t }] } });
 const asst = (t: string) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: t }], stopReason: "stop", usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } });
@@ -77,4 +77,30 @@ test("oversized single line is skipped as torn without materialising it", () => 
 
 test("missing file yields empty", () => {
 	assert.equal(parseSessionFile("/nonexistent/x.jsonl").turns.length, 0);
+});
+
+test("readSessionJsonlDelta seeks from previous.offset and leaves provisional uncommitted", () => {
+	const f = tmp();
+	fs.writeFileSync(f, `${user("a")}\n${asst("one")}\n`);
+	const first = readSessionJsonlDelta(f, undefined);
+	assert.ok(first);
+	assert.equal(first.lines.length, 2);
+	assert.equal(first.provisional, "");
+	assert.equal(first.cursor.offset, fs.statSync(f).size);
+
+	const a2 = asst("two");
+	fs.appendFileSync(f, `${user("b")}\n${a2.slice(0, 24)}`);
+	const mid = readSessionJsonlDelta(f, first.cursor);
+	assert.ok(mid);
+	assert.equal(mid.reset, false);
+	assert.equal(mid.lines.length, 1, "only the complete user line is committed");
+	assert.ok(mid.provisional.startsWith(a2.slice(0, 8)));
+	assert.equal(mid.cursor.offset, first.cursor.offset + Buffer.byteLength(`${user("b")}\n`));
+
+	fs.appendFileSync(f, `${a2.slice(24)}\n`);
+	const done = readSessionJsonlDelta(f, mid.cursor);
+	assert.ok(done);
+	assert.equal(done.lines.length, 1);
+	assert.equal(done.provisional, "");
+	assert.equal(done.cursor.offset, fs.statSync(f).size);
 });

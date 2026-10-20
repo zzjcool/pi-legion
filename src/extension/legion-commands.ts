@@ -48,9 +48,9 @@ import {
 import type { StatusVizSnapshot } from "../tui/status.ts";
 import { createLegionViewFactory } from "../tui/viz/view.ts";
 import {
-	parseSessionMessages,
 	type ChatItemSettings,
 } from "../tui/chat-items.ts";
+import { readSessionMessagesFile } from "../tui/session-messages-file.ts";
 import {
 	createTreeViewFactory,
 	type TreeNodeSnapshot,
@@ -255,13 +255,13 @@ function readSessionBackfill(
 	sessionFile: string,
 	_maxBackfillTurns: number,
 ): LiveOverlayBackfillResult | undefined {
-	// Take the size before parsing: if the append-only file grows during the
-	// parse, the next poll sees that newer size and can safely re-read it.
-	const fileSize = readSessionSize(sessionFile);
-	if (fileSize === undefined) return undefined;
+	// Incremental reader (#234): cold cache reads from byte 0 once; later polls
+	// seek past the fingerprint offset. Take size via the reader so a concurrent
+	// append is visible on the next tick.
 	try {
-		const messages = parseSessionMessages(readFileSync(sessionFile, "utf8"));
-		return { messages, cursor: sessionCursor(messages, fileSize) };
+		const loaded = readSessionMessagesFile(sessionFile);
+		if (!loaded) return undefined;
+		return { messages: loaded.messages, cursor: sessionCursor(loaded.messages, loaded.fileSize) };
 	} catch {
 		return undefined;
 	}
@@ -271,27 +271,29 @@ function readSessionDelta(
 	sessionFile: string,
 	cursor: LiveOverlayBackfillCursor,
 ): LiveOverlayBackfillResult | undefined {
-	// The append-only JSONL file is only reparsed after its byte size changes.
+	// Size gate first: unchanged append-only file ⇒ no open/parse (#234).
 	const fileSize = readSessionSize(sessionFile);
 	if (fileSize === undefined || fileSize === cursor.fileSize) return undefined;
-	let messages: ReturnType<typeof parseSessionMessages>;
+	let loaded: ReturnType<typeof readSessionMessagesFile>;
 	try {
-		messages = parseSessionMessages(readFileSync(sessionFile, "utf8"));
+		loaded = readSessionMessagesFile(sessionFile);
 	} catch {
 		return undefined;
 	}
-	const nextCursor = sessionCursor(messages, fileSize);
+	if (!loaded) return undefined;
+	const messages = loaded.messages;
+	const nextCursor = sessionCursor(messages, loaded.fileSize);
 	if (
 		nextCursor.messageCount < cursor.messageCount ||
 		nextCursor.turnCount < cursor.turnCount ||
 		nextCursor.assistantMessageCount < cursor.assistantMessageCount ||
-		fileSize < cursor.fileSize
+		loaded.fileSize < cursor.fileSize
 	) {
 		// Do not move a monotonic cursor backwards during a concurrent partial write.
 		return undefined;
 	}
-	// Return the full parsed transcript; the viewer compares the message cursor
-	// and appends only new entries. This covers assistant appends within a turn.
+	// Return the accumulated transcript; the viewer slices by message cursor.
+	// Hot path only parsed bytes past the shared session.ts fingerprint offset.
 	return { messages, cursor: nextCursor };
 }
 
