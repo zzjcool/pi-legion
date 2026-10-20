@@ -1575,7 +1575,9 @@ test("renderLiveChildStatus: an rpc child reports its own rss, an inprocess chil
 		now: 0,
 	};
 	// This host process is the one pid guaranteed to have a readable status file.
-	const rpc = renderLiveChildStatus({ ...base, spawnMode: "rpc", pid: process.pid });
+	// `alive: true` is the precondition for reading a child pid at all (§6), and
+	// picks up no extra line beyond the rss one that this test asserts on.
+	const rpc = renderLiveChildStatus({ ...base, spawnMode: "rpc", pid: process.pid, alive: true });
 	if (process.platform !== "linux") {
 		// Non-Linux degrades to no memory line rather than a wrong number.
 		assert.doesNotMatch(rpc, /^memory: /m);
@@ -1586,7 +1588,7 @@ test("renderLiveChildStatus: an rpc child reports its own rss, an inprocess chil
 	// An inprocess child shares this process: it must NOT be handed a per-child
 	// rss (D2 forbids apportioning the host figure across children). It reports
 	// the host number once, and says it is shared.
-	const inprocess = renderLiveChildStatus({ ...base, spawnMode: "inprocess" });
+	const inprocess = renderLiveChildStatus({ ...base, spawnMode: "inprocess", alive: true });
 	if (process.platform !== "linux") {
 		assert.doesNotMatch(inprocess, /^memory: /m);
 	} else {
@@ -1596,6 +1598,65 @@ test("renderLiveChildStatus: an rpc child reports its own rss, an inprocess chil
 
 	// No pid and no mode: nothing honest to say, so no line at all.
 	assert.doesNotMatch(renderLiveChildStatus(base), /^memory: /m);
+});
+
+test("renderLiveChildStatus: a pid is only read while the child still owns it (pid-reuse race, §6)", () => {
+	const base = {
+		name: "worker-0",
+		state: "working",
+		agent: "worker",
+		kind: "pi",
+		sessionFile: "",
+		now: 0,
+	};
+	// alive=false + a pid: the kernel may already have handed this pid to an
+	// unrelated process, so any /proc read would report SOMEONE ELSE's rss as
+	// this child's memory — fabricated attribution, which D2 forbids.
+	for (const spawnMode of ["rpc", "inprocess"] as const) {
+		const dead = renderLiveChildStatus({ ...base, spawnMode, pid: process.pid, alive: false });
+		assert.doesNotMatch(dead, /^memory: /m, `a dead ${spawnMode} child must print no memory line:\n${dead}`);
+	}
+
+	// alive=true + a live pid: the number belongs to this child, so it is honest.
+	const live = renderLiveChildStatus({ ...base, spawnMode: "rpc", pid: process.pid, alive: true });
+	if (process.platform !== "linux") {
+		assert.doesNotMatch(live, /^memory: /m);
+	} else {
+		assert.match(live, /^memory: rss=\d+m( peak=\d+m)?$/m, `expected a per-child rss line:\n${live}`);
+	}
+});
+
+test("runtime: status entries keep rss only for a job whose process is still alive (§6)", () => {
+	const runtime = createSessionRuntime({ sendMessage() {}, now: () => 10_000 });
+	const job = (name: string, extra: { isAlive?: () => boolean }) => ({
+		name,
+		runId: `${name}-run`,
+		agent: "worker",
+		sessionFile: "",
+		timeoutMs: 1_000,
+		spawnMode: "rpc" as const,
+		pid: process.pid,
+		collect: () => new Promise<never>(() => {}),
+		...extra,
+	});
+	try {
+		// A live job: its own pid is still its own, so the rss is a real number.
+		runtime.track(job("live", { isAlive: () => true }));
+		// Reported gone by the RPC liveness check: never read its pid again.
+		runtime.track(job("dead", { isAlive: () => false }));
+		// Legacy job with no isAlive hook: unreadable liveness, so stay blank.
+		runtime.track(job("legacy", {}));
+
+		const byName = new Map(runtime.statusEntries().map((entry) => [entry.name, entry]));
+		if (process.platform === "linux") {
+			assert.equal(typeof byName.get("live")?.rss, "number", "a live job reports its own rss");
+		}
+		assert.equal(byName.get("dead")?.rss, undefined, "a pid whose process is gone must never be read");
+		assert.equal(byName.get("legacy")?.rss, undefined, "unknown liveness is not a licence to read /proc");
+		assert.equal(byName.get("dead")?.pid, process.pid, "the pid itself still surfaces (D3): only the probe is withheld");
+	} finally {
+		runtime.dispose();
+	}
 });
 
 test("renderLiveChildStatus keeps the supervisor meta after every snapshot line", async () => {
