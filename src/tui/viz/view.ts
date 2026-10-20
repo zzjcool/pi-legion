@@ -2,7 +2,7 @@
 
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { Canvas, cellWidth, ellipsize } from "./canvas.ts";
-import { computeLayout, type LayoutKind } from "./layout.ts";
+import { computeLayout, type LayoutKind, type LegionLayout } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
 import { roleColor, type VizTheme } from "./palette.ts";
 import {
@@ -11,8 +11,11 @@ import {
 	drawChart,
 	drawGalaxy,
 	drawLog,
+	drawStatus,
 	drawTiming,
 	frame,
+	statusRowsFromNodes,
+	statusVisibleRows,
 	timingRowsFromNodes,
 	type Pane,
 	type ViewData,
@@ -25,15 +28,35 @@ export interface LegionViewState {
 	logCursor: number;
 	timingOffset: number;
 	timingCursor: number;
+	statusOffset: number;
+	statusCursor: number;
 	/** `x` pressed: an in-view y/N prompt for stopping this agent (dialogs would be hidden behind the full-screen view). */
 	pendingStopId?: string;
 }
 
 export function initialViewState(): LegionViewState {
-	return { focus: "galaxy", logOffset: 0, logCursor: 0, timingOffset: 0, timingCursor: 0 };
+	return {
+		focus: "galaxy",
+		logOffset: 0,
+		logCursor: 0,
+		timingOffset: 0,
+		timingCursor: 0,
+		statusOffset: 0,
+		statusCursor: 0,
+	};
 }
 
-const PANES: Pane[] = ["galaxy", "chart", "timing", "log"];
+/** Tab order (D8): `status` last, so the existing galaxy→chart→timing→log walk is unchanged. */
+const PANES: readonly Pane[] = ["galaxy", "chart", "timing", "log", "status"];
+
+/**
+ * Panes this layout actually placed. Portrait leaves no room for a fifth pane
+ * and returns a zero-height `status` rect (D1); Tab must skip what is not drawn
+ * rather than park the focus on an invisible box.
+ */
+export function availablePanes(layout: LegionLayout): Pane[] {
+	return PANES.filter((pane) => layout[pane].h > 0);
+}
 
 /** Min grapheme cells before painting a selection badge. Shared by portrait + landscape so a truncated stub never paints (#128). Was portrait `>4` vs landscape `>0`. */
 export const MIN_SELECTION_BADGE_W = 5;
@@ -114,6 +137,25 @@ export function renderLegionView(data: ViewData, state: LegionViewState, cols: n
 		origin,
 	});
 
+	// Status table (D1/D7). Portrait hands back a zero-area rect, so `frame()`
+	// paints nothing and `drawStatus` bails on `r.w < 20` — no special case here.
+	const statusRows = statusRowsFromNodes(data.nodes);
+	const statusVisible = Math.max(1, statusVisibleRows(layout.status.h, statusRows.length));
+	clampList(state, "status", statusRows.length, statusVisible);
+	const statusInner = frame(
+		cv,
+		layout.status,
+		portrait ? "status" : "status · agents",
+		state.focus === "status",
+		statusInnerHint(layout.kind),
+	);
+	drawStatus(cv, statusInner, statusRows, {
+		offset: state.statusOffset,
+		cursor: state.statusCursor,
+		focused: state.focus === "status",
+		...(state.selectedId ? { selectedId: state.selectedId } : {}),
+	});
+
 	// Footer.
 	const keys: Array<[string, string]> = portrait
 		? [["Tab", "pane"], ["↑↓", ""], ["⏎", "sel"], ["o", "open"], ["x", "stop"], ["esc", ""], ["q", ""]]
@@ -143,31 +185,44 @@ function statusLabel(node: VizNode): string {
 	return node.status === "settled" ? "done" : node.status;
 }
 
+/**
+ * Key hint on the status title rule. Suppressed in portrait, where the pane is
+ * zero-area and never drawn at all.
+ */
+function statusInnerHint(kind: LayoutKind): string | undefined {
+	return kind === "portrait" ? undefined : "↑↓ scroll · ⏎ select";
+}
+
 function clampList(
 	state: LegionViewState,
-	which: "log" | "timing",
+	which: "log" | "timing" | "status",
 	count: number,
 	visible: number,
 ): void {
-	if (which === "log") {
-		state.logCursor = Math.max(0, Math.min(state.logCursor, count - 1));
-		if (state.logCursor < state.logOffset) state.logOffset = state.logCursor;
-		if (state.logCursor >= state.logOffset + visible) state.logOffset = state.logCursor - visible + 1;
-		state.logOffset = Math.max(0, Math.min(state.logOffset, Math.max(0, count - visible)));
-		return;
-	}
-	state.timingCursor = Math.max(0, Math.min(state.timingCursor, count - 1));
-	if (state.timingCursor < state.timingOffset) state.timingOffset = state.timingCursor;
-	if (state.timingCursor >= state.timingOffset + visible) state.timingOffset = state.timingCursor - visible + 1;
-	state.timingOffset = Math.max(0, Math.min(state.timingOffset, Math.max(0, count - visible)));
+	const [cursorKey, offsetKey] = which === "log"
+		? (["logCursor", "logOffset"] as const)
+		: which === "status"
+			? (["statusCursor", "statusOffset"] as const)
+			: (["timingCursor", "timingOffset"] as const);
+	state[cursorKey] = Math.max(0, Math.min(state[cursorKey], count - 1));
+	if (state[cursorKey] < state[offsetKey]) state[offsetKey] = state[cursorKey];
+	if (state[cursorKey] >= state[offsetKey] + visible) state[offsetKey] = state[cursorKey] - visible + 1;
+	state[offsetKey] = Math.max(0, Math.min(state[offsetKey], Math.max(0, count - visible)));
 }
 
 export type ViewAction = "none" | "render" | "close" | "open" | "stop";
 
 /** Pure key handling so it can be unit tested without a terminal. */
-export function handleViewKey(data: string, state: LegionViewState, nodes: readonly VizNode[], page = 10): ViewAction {
+export function handleViewKey(
+	data: string,
+	state: LegionViewState,
+	nodes: readonly VizNode[],
+	page = 10,
+	panes: readonly Pane[] = PANES,
+): ViewAction {
 	const events = buildLog(nodes);
 	const timingRows = timingRowsFromNodes(nodes, Date.now());
+	const statusRows = statusRowsFromNodes(nodes);
 	const order = dfsOrder(nodes).filter(isAgent);
 	if (state.pendingStopId) {
 		const confirmed = matchesKey(data, "y") || data === "Y" || matchesKey(data, Key.enter);
@@ -183,12 +238,16 @@ export function handleViewKey(data: string, state: LegionViewState, nodes: reado
 		}
 		return "close";
 	}
-	if (matchesKey(data, Key.tab)) {
-		state.focus = PANES[(PANES.indexOf(state.focus) + 1) % PANES.length]!;
-		return "render";
-	}
-	if (matchesKey(data, Key.shift("tab"))) {
-		state.focus = PANES[(PANES.indexOf(state.focus) + PANES.length - 1) % PANES.length]!;
+	if (matchesKey(data, Key.tab) || matchesKey(data, Key.shift("tab"))) {
+		// `panes` defaults to every pane so existing callers keep the full walk;
+		// the host passes `availablePanes(layout)` so Tab skips the zero-area
+		// status pane in portrait (D1).
+		const ring = panes.length > 0 ? panes : PANES;
+		const step = matchesKey(data, Key.tab) ? 1 : ring.length - 1;
+		const at = ring.indexOf(state.focus);
+		// A focus outside `ring` (e.g. status after a resize to portrait) restarts
+		// the walk at a pane that is actually drawn.
+		state.focus = ring[(at < 0 ? (step > 0 ? 0 : ring.length - 1) : (at + step) % ring.length)]!;
 		return "render";
 	}
 	if (matchesKey(data, "o")) return state.selectedId ? "open" : "none";
@@ -230,6 +289,21 @@ export function handleViewKey(data: string, state: LegionViewState, nodes: reado
 		} else return "none";
 		return "render";
 	}
+	if (state.focus === "status") {
+		if (down) state.statusCursor = Math.min(statusRows.length - 1, state.statusCursor + 1);
+		else if (up) state.statusCursor = Math.max(0, state.statusCursor - 1);
+		else if (matchesKey(data, Key.pageDown)) state.statusCursor = Math.min(statusRows.length - 1, state.statusCursor + page);
+		else if (matchesKey(data, Key.pageUp)) state.statusCursor = Math.max(0, state.statusCursor - page);
+		else if (matchesKey(data, Key.home)) state.statusCursor = 0;
+		else if (matchesKey(data, Key.end)) state.statusCursor = Math.max(0, statusRows.length - 1);
+		else if (matchesKey(data, Key.enter)) {
+			const row = statusRows[state.statusCursor];
+			if (!row) return "none";
+			state.selectedId = state.selectedId === row.id ? undefined : row.id;
+			if (state.selectedId === undefined) delete state.selectedId;
+		} else return "none";
+		return "render";
+	}
 	if (down || up || matchesKey(data, Key.right) || matchesKey(data, Key.left)) {
 		if (order.length === 0) return "none";
 		const step = down || matchesKey(data, Key.right) ? 1 : -1;
@@ -261,6 +335,12 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 		const state = initialViewState();
 		const timer = setInterval(() => tui.requestRender(), options.refreshMs ?? 1000);
 		(timer as { unref?: () => void }).unref?.();
+		/**
+		 * Panes the last painted frame actually placed, so Tab walks what the user
+		 * can see: portrait leaves no room for a fifth pane (D1). Before the first
+		 * paint this stays at the full ring, which is also `handleViewKey`'s default.
+		 */
+		let panes: Pane[] = [...PANES];
 		let closed = false;
 		const close = (): void => {
 			if (closed) return;
@@ -272,10 +352,17 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 			render(width: number): string[] {
 				// Rendered as a full-screen overlay: own the whole terminal height.
 				const rows = Math.max(6, tui.terminal.rows ?? 24);
+				panes = availablePanes(computeLayout(width, rows));
 				return renderLegionView(options.getData(), state, width, rows).canvas.toLines(theme);
 			},
 			handleInput(data: string): void {
-				const action = handleViewKey(data, state, options.getData().nodes, Math.max(1, (tui.terminal.rows ?? 24) - 8));
+				const action = handleViewKey(
+					data,
+					state,
+					options.getData().nodes,
+					Math.max(1, (tui.terminal.rows ?? 24) - 8),
+					panes,
+				);
 				if (action === "close") return close();
 				if (action === "open" && state.selectedId) options.onOpenNode?.(state.selectedId);
 				if (action === "stop" && state.pendingStopId) {

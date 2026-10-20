@@ -7,7 +7,7 @@ import { nodeToken, roleColor } from "./palette.ts";
 import type { RateSampler } from "./rate.ts";
 import { breakdown } from "../../shared/timing-breakdown.ts";
 
-export type Pane = "galaxy" | "chart" | "timing" | "log";
+export type Pane = "galaxy" | "chart" | "timing" | "log" | "status";
 
 export interface ViewData {
 	nodes: readonly VizNode[];
@@ -686,5 +686,198 @@ export function drawTiming(
 				i >= pos && i < pos + thumb ? "scrollbarThumb" : "scrollbarTrack",
 			);
 		}
+	}
+}
+
+// ---------------------------------------------------------------- status (D1)
+// The `/legion status` table, on the board. Every new field is optional on
+// VizNode (D6), so a missing `spawnMode` prints `unknown` — never a guessed
+// `rpc` — and an `inprocess` child prints `—` for rss instead of a share of the
+// host figure it does not own (D2).
+
+export interface StatusDrawState {
+	offset: number;
+	cursor: number;
+	focused: boolean;
+	selectedId?: string;
+}
+
+export interface StatusColumn {
+	key: "name" | "role" | "state" | "supervisor" | "ctx" | "rss" | "turns";
+	label: string;
+	width: number;
+	align: "left" | "right";
+}
+
+/** Placeholder for "there is no honest value here" — never a fabricated number. */
+const NO_VALUE = "\u2014";
+
+/** Agents in the status table, oldest first. The root row is the run, not an agent. */
+export function statusRowsFromNodes(nodes: readonly VizNode[]): VizNode[] {
+	return nodes
+		.filter(isAgent)
+		.sort((a, b) => a.startedAt - b.startedAt || a.name.localeCompare(b.name));
+}
+
+/**
+ * D7 width grading in **absolute columns**, never a ratio (the `drawTiming`
+ * convention): the row always keeps `name · state`, and the optional fields come
+ * back one at a time as the rect grows. `undefined` = below the 20-column floor,
+ * so the pane paints nothing instead of a column of stubs.
+ *
+ * The widths sum exactly to `width`, so a row can never spill past its rect.
+ */
+export function statusColumns(width: number): StatusColumn[] | undefined {
+	if (width < 20) return undefined;
+	const state: StatusColumn = { key: "state", label: "state", width: 7, align: "left" };
+	if (width < 36) {
+		return [{ key: "name", label: "name", width: width - 8, align: "left" }, state];
+	}
+	if (width < 52) {
+		return [
+			{ key: "name", label: "name", width: width - 15, align: "left" },
+			state,
+			{ key: "ctx", label: "ctx", width: 6, align: "right" },
+		];
+	}
+	if (width < 72) {
+		return [
+			{ key: "name", label: "name", width: width - 25, align: "left" },
+			state,
+			{ key: "supervisor", label: "sup", width: 9, align: "left" },
+			{ key: "ctx", label: "ctx", width: 6, align: "right" },
+		];
+	}
+	return [
+		{ key: "name", label: "name", width: width - 43, align: "left" },
+		{ key: "role", label: "role", width: 4, align: "left" },
+		state,
+		{ key: "supervisor", label: "sup", width: 9, align: "left" },
+		{ key: "ctx", label: "ctx", width: 6, align: "right" },
+		{ key: "rss", label: "rss", width: 6, align: "right" },
+		{ key: "turns", label: "turns", width: 5, align: "right" },
+	];
+}
+
+/**
+ * Rows `drawStatus` can paint for a pane whose **outer** (framed) height is
+ * `outerH`. Exported so the view clamps the scroll offset with the draw layer's
+ * own arithmetic instead of the off-by-one `layout.h - 3` it uses for timing.
+ */
+export function statusVisibleRows(outerH: number, total: number): number {
+	const innerH = Math.max(0, outerH - 2);
+	const footerH = total > 0 && innerH >= 4 ? 1 : 0;
+	return Math.max(0, innerH - 1 - footerH);
+}
+
+/** `unknown` for a missing mode (D6): a legacy row is not evidence of `rpc`. */
+function statusSupervisor(node: VizNode): string {
+	return node.spawnMode ?? "unknown";
+}
+
+/**
+ * D2: only an `rpc` child owns a process, so only it has an honest RSS. An
+ * `inprocess` child shares this host process — apportioning the host figure
+ * across children would be fabricated data the user then decides on, so it
+ * prints `—`. Lowercase `m` keeps the panel inside the plain glyph set.
+ */
+function statusRss(node: VizNode): string {
+	if (node.spawnMode === "inprocess") return NO_VALUE;
+	if (node.rss === undefined || !Number.isFinite(node.rss) || node.rss < 0) return NO_VALUE;
+	return `${Math.round(node.rss)}m`;
+}
+
+function statusValue(node: VizNode, key: StatusColumn["key"]): string {
+	switch (key) {
+		case "name":
+			return node.name;
+		case "role":
+			return roleAbbrev(node.role);
+		case "state":
+			return node.status === "settled" ? "done" : node.status;
+		case "supervisor":
+			return statusSupervisor(node);
+		case "ctx":
+			return node.contextTokens !== undefined && node.contextTokens > 0 ? formatCount(node.contextTokens) : NO_VALUE;
+		case "rss":
+			return statusRss(node);
+		case "turns":
+			return node.turns !== undefined && node.turns > 0 ? String(node.turns) : NO_VALUE;
+	}
+}
+
+function statusColor(node: VizNode, key: StatusColumn["key"], dim: boolean): string {
+	if (dim) return "dim";
+	if (key === "name") return roleColor(node.role);
+	if (key === "state") {
+		if (node.status === "failed") return "error";
+		if (node.status === "settled") return "success";
+		if (node.status === "running") return "accent";
+		return "dim";
+	}
+	return "dim";
+}
+
+/** Ellipsize then pad to exactly `width` cells (grapheme-safe, never overflows). */
+function padCell(value: string, width: number, align: "left" | "right"): string {
+	const clipped = ellipsize(value, width);
+	const pad = " ".repeat(Math.max(0, width - cellWidth(clipped)));
+	return align === "right" ? pad + clipped : clipped + pad;
+}
+
+/**
+ * Status table: header row, one row per agent, optional footer.
+ *
+ * `r` is the **inner** rect `frame()` hands back, so the header line sits on the
+ * first row inside the border. Every `cv.text` is ellipsized to its column *and*
+ * carries `maxX` — the pane never writes past its own rect the way `drawLog`
+ * can on a very narrow terminal.
+ */
+export function drawStatus(
+	cv: Canvas,
+	r: Rect,
+	nodes: readonly VizNode[],
+	state: StatusDrawState,
+): void {
+	if (r.w < 20 || r.h < 2) return;
+	const columns = statusColumns(r.w);
+	if (!columns) return;
+	const maxX = r.x + r.w;
+	const rows = statusRowsFromNodes(nodes);
+	const footerH = rows.length > 0 && r.h >= 4 ? 1 : 0;
+	const rowsAvail = Math.max(0, r.h - 1 - footerH);
+
+	// Header: labels only. Panel content never lands on the title rule.
+	let x = r.x;
+	columns.forEach((column, index) => {
+		cv.text(x, r.y, padCell(column.label, column.width, column.align), "dim", { maxX });
+		x += column.width + (index < columns.length - 1 ? 1 : 0);
+	});
+
+	for (let i = 0; i < rowsAvail; i++) {
+		const index = state.offset + i;
+		const node = rows[index];
+		if (!node) break;
+		const y = r.y + 1 + i;
+		const isCursor = state.focused && index === state.cursor;
+		const highlight = state.selectedId === node.id;
+		const dim = state.selectedId !== undefined && !highlight;
+		let cx = r.x;
+		columns.forEach((column, ci) => {
+			cv.text(cx, y, padCell(statusValue(node, column.key), column.width, column.align), statusColor(node, column.key, dim), {
+				...(column.key === "name" && !dim ? { bold: true } : {}),
+				...(column.key === "name" && isCursor ? { inverse: true } : {}),
+				maxX,
+			});
+			cx += column.width + (ci < columns.length - 1 ? 1 : 0);
+		});
+	}
+
+	if (footerH) {
+		const live = rows.filter((node) => node.status === "running").length;
+		const hidden = Math.max(0, rows.length - rowsAvail);
+		const parts = [`${rows.length} agents`, `${live} live`];
+		if (hidden > 0) parts.push(`+${hidden} more`);
+		cv.text(r.x, r.y + r.h - 1, ellipsize(parts.join(" · "), r.w), "dim", { maxX });
 	}
 }
