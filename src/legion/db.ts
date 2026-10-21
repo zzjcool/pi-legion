@@ -5,6 +5,18 @@ import { createRequire } from "node:module";
 export const LEGION_DB_USER_VERSION = 1;
 export const LEGION_DB_BUSY_TIMEOUT_MS = 5_000;
 
+/**
+ * Bound on one connection's compiled-statement cache.
+ *
+ * The ledger has ~29 distinct static SQL texts behind the 46 `prepare()` call
+ * sites (many sites share a text), plus a handful of dynamically-shaped
+ * families — `usage.ts`'s chunked `IN (?,?,…)` (stable chunk length at runtime)
+ * and `hygiene.ts`'s retention `NOT IN (…)` lists. 64 holds everything a
+ * connection reuses with 2x headroom, while an unbounded map keyed on SQL text
+ * would grow with every distinct chunk size ever requested.
+ */
+export const LEGION_STMT_CACHE_LIMIT = 64;
+
 export type SqliteBindValue = string | number | bigint | null | Uint8Array;
 export type SqliteRow = Record<string, string | number | bigint | null | Uint8Array>;
 
@@ -41,6 +53,7 @@ const SQLITE_DRIVERS: readonly SqliteDriver[] = [
 ];
 let cachedSqliteConstructor: SqliteDatabaseConstructor | null | undefined;
 const transactionDepth = new WeakMap<DatabaseSync, number>();
+const statementCaches = new WeakMap<DatabaseSync, Map<string, LegionStatementSync>>();
 let savepointSequence = 0;
 
 const SCHEMA_V1 = `
@@ -131,6 +144,8 @@ export function openLegionDb(dbPath: string): DatabaseSync {
 	const Database = sqliteDatabaseConstructor();
 	const db = new Database(dbPath);
 	try {
+		// Compiled statements are reused for every one of the call sites above.
+		attachStatementCache(db);
 		db.exec(`PRAGMA busy_timeout = ${LEGION_DB_BUSY_TIMEOUT_MS};`);
 		db.exec("PRAGMA foreign_keys = ON;");
 		db.exec("PRAGMA journal_mode = WAL;");
@@ -140,6 +155,55 @@ export function openLegionDb(dbPath: string): DatabaseSync {
 		db.close();
 		throw error;
 	}
+}
+
+/**
+ * Serve every `prepare()` on this connection from a bounded per-connection LRU.
+ *
+ * The cache sits *inside* `prepare` rather than at the call sites: each call
+ * still enters the data layer (so instrumentation that counts
+ * `prepare(sql)` keeps counting), and all call sites get the reuse for free.
+ *
+ * A compiled statement is reusable — `.get()`/`.all()`/`.run()` re-execute it
+ * with the new bindings, cached `PRAGMA` statements re-read the current value,
+ * and a statement survives `ALTER`/`VACUUM` on the same connection. Statements
+ * are keyed on the exact SQL text: two texts that differ only in whitespace are
+ * deliberately two entries, because SQL text is the only identity SQLite offers.
+ */
+function attachStatementCache(db: DatabaseSync): void {
+	if (statementCaches.has(db)) return;
+	const prepare = db.prepare;
+	const close = db.close;
+	const cache = new Map<string, LegionStatementSync>();
+	statementCaches.set(db, cache);
+	db.prepare = (sql: string): LegionStatementSync => {
+		const cached = cache.get(sql);
+		if (cached) {
+			// Re-insert so Map order stays least-recently-used first.
+			cache.delete(sql);
+			cache.set(sql, cached);
+			return cached;
+		}
+		const statement = prepare.call(db, sql);
+		cache.set(sql, statement);
+		if (cache.size > LEGION_STMT_CACHE_LIMIT) {
+			const oldest = cache.keys().next();
+			if (!oldest.done) cache.delete(oldest.value);
+		}
+		return statement;
+	};
+	db.close = (): void => {
+		// Drop our references before the driver finalizes them, so the cache
+		// cannot outlive the connection and nothing is released twice.
+		cache.clear();
+		statementCaches.delete(db);
+		close.call(db);
+	};
+}
+
+/** Compiled statements a connection currently holds; 0 once it is closed. */
+export function legionStatementCacheSize(db: DatabaseSync): number {
+	return statementCaches.get(db)?.size ?? 0;
 }
 
 /** Run a short synchronous write transaction. Nested ledger helpers use savepoints. */
