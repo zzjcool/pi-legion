@@ -47,12 +47,12 @@ const EXPECTED_COLUMNS: Record<string, readonly string[]> = {
 };
 
 const EXPECTED_INDEXES = [
-	{ table: "nodes", name: "idx_nodes_parent" },
-	{ table: "nodes", name: "idx_nodes_status" },
-	{ table: "events", name: "idx_events_node" },
-	{ table: "events", name: "idx_events_type_ts" },
-	{ table: "messages", name: "idx_messages_inbox" },
-	{ table: "messages", name: "idx_messages_rate" },
+	{ table: "nodes", name: "idx_nodes_parent", columns: ["parent_id"] },
+	{ table: "nodes", name: "idx_nodes_status", columns: ["status", "updated_at"] },
+	{ table: "events", name: "idx_events_node", columns: ["node_id", "id"] },
+	{ table: "events", name: "idx_events_type_ts", columns: ["type", "ts"] },
+	{ table: "messages", name: "idx_messages_inbox", columns: ["to_node", "delivered", "id"] },
+	{ table: "messages", name: "idx_messages_rate", columns: ["from_node", "created_at"] },
 ] as const;
 
 const EXPECTED_EVENTS = [
@@ -139,40 +139,43 @@ test("legion v2 contract §4.2 keeps the frozen four-table schema", () => {
 		);
 	}
 
+	// Capture the column list too, not just the name: the index SET below compares
+	// names only, so a reordered tuple would otherwise slip through. Order is
+	// load-bearing (e.g. a swapped idx_messages_inbox tuple stops serving the
+	// delivery-less inbox read, mail.ts `inbox()`; a swapped idx_messages_rate
+	// tuple costs ~40x on the rate-limit COUNT -- see legion-mail-rate-index.test.ts).
 	const actualIndexes = Array.from(
-		sql.matchAll(/^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)\s+ON\s+([a-z_][a-z0-9_]*)\s*\(/gim),
-		(match) => ({ name: match[1] ?? "", table: match[2] ?? "" }),
-	).map(({ name, table }) => `${table}.${name}`);
+		sql.matchAll(/^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-z_][a-z0-9_]*)\s+ON\s+([a-z_][a-z0-9_]*)\s*\(([^)]*)\)/gim),
+		(match) => ({
+			name: match[1] ?? "",
+			table: match[2] ?? "",
+			columns: (match[3] ?? "").split(",").map((column) => column.trim()).filter((column) => column.length > 0),
+		}),
+	);
+	const actualIndexKeys = actualIndexes.map(({ name, table }) => `${table}.${name}`);
 	const expectedIndexes = EXPECTED_INDEXES.map(({ name, table }) => `${table}.${name}`);
-	const missingIndexes = expectedIndexes.filter((index) => !actualIndexes.includes(index));
-	const unexpectedIndexes = actualIndexes.filter((index) => !expectedIndexes.includes(index));
+	const missingIndexes = expectedIndexes.filter((index) => !actualIndexKeys.includes(index));
+	const unexpectedIndexes = actualIndexKeys.filter((index) => !expectedIndexes.includes(index));
 	assert.deepEqual(
-		[...actualIndexes].sort(),
+		[...actualIndexKeys].sort(),
 		[...expectedIndexes].sort(),
 		`Schema sentinel: §4.2 index set changed (missing: ${missingIndexes.join(", ") || "none"}; unexpected: ${unexpectedIndexes.join(", ") || "none"}). If the contract schema is intentionally revised, update this test explicitly.`,
 	);
 
-	// The index SET above compares names only, so the contract could reorder an
-	// index's columns without this sentinel noticing. Column order is load-bearing
-	// for the rate-limit COUNT (see legion-mail-rate-index.test.ts: the reversed
-	// tuple keeps the same plan and covering check but costs ~40x more), so assert
-	// the DDL text of idx_messages_rate names its columns in order.
-	const rateIndexDdl = sql.match(
-		/^\s*CREATE\s+INDEX\s+idx_messages_rate\s+ON\s+messages\s*\(([^)]*)\)/im,
-	);
-	assert.ok(
-		rateIndexDdl,
-		"Schema sentinel: §4.2 is missing `CREATE INDEX idx_messages_rate ON messages(from_node, created_at)`; update this test explicitly when revising the contract.",
-	);
-	const rateIndexColumns = (rateIndexDdl[1] ?? "")
-		.split(",")
-		.map((column) => column.trim())
-		.filter((column) => column.length > 0);
-	assert.deepEqual(
-		rateIndexColumns,
-		["from_node", "created_at"],
-		`Schema sentinel: §4.2 idx_messages_rate column order changed (found: ${JSON.stringify(rateIndexColumns)}); it must stay (from_node, created_at) or the rate-limit COUNT loses its covering seek. If the contract schema is intentionally revised, update this test explicitly.`,
-	);
+	// Ordered tuple per known index, so reordering one is a test failure rather
+	// than a silent plan change.
+	for (const expected of EXPECTED_INDEXES) {
+		const actual = actualIndexes.find((index) => index.name === expected.name && index.table === expected.table);
+		assert.ok(
+			actual,
+			`Schema sentinel: §4.2 is missing CREATE INDEX ${expected.name} ON ${expected.table}; update this test explicitly when revising the contract.`,
+		);
+		assert.deepEqual(
+			actual.columns,
+			[...expected.columns],
+			`Schema sentinel: §4.2 ${expected.name} column order changed (found: ${JSON.stringify(actual.columns)}; expected: ${JSON.stringify([...expected.columns])}). Index tuples are load-bearing for the queries they serve. If the contract schema is intentionally revised, update this test explicitly.`,
+		);
+	}
 });
 
 test("legion v2 contract §4.3 keeps exactly the frozen 14 event names", () => {
