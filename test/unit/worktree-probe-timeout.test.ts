@@ -1,10 +1,11 @@
 /**
  * Behavioural coverage for the git budgets in `src/runs/worktree.ts` (#237 B).
  *
- * The probe that used to live here asserted `GIT_WORKTREE_TIMEOUT_MS >
- * GIT_PROBE_TIMEOUT_MS` — two literals in the same file, referencing no call
- * site, so deleting every `timeout:` key in the module left it green. It is
- * replaced by real fixtures that fake `git` on PATH:
+ * A probe here once asserted `GIT_WORKTREE_TIMEOUT_MS > GIT_PROBE_TIMEOUT_MS` —
+ * two literals in the same file, referencing no call site, so deleting every
+ * `timeout:` key in the module left it green. It was removed rather than
+ * replaced: the source-scan below constrains the wiring directly. Real fixtures
+ * that fake `git` on PATH cover the behaviour:
  *
  *   1. a shim that never answers, proving the two probes actually stop waiting
  *      and report the right outcome (`false`, and START_FAILED for launch);
@@ -13,9 +14,13 @@
  *   3. a shim that emulates git < 2.31 by echoing `--path-format=...` as a
  *      revision, proving the worktree-dir probe cannot be fooled into
  *      reporting a main checkout as a linked worktree;
- *   4. a source-level wiring assertion that every `execFileSync("git", ...)`
+ *   4. the legacy fallback exercised directly against real repos, pinning that
+ *      old git gets identical answers;
+ *   5. source-level wiring assertions that every `execFileSync("git", ...)`
  *      call site carries a `timeout:` on the budget its comment justifies —
- *      this is what actually breaks if the wiring is removed.
+ *      this is what actually breaks if the wiring is removed;
+ *   6. positive and negative coverage for `isGitRepo` (public API via
+ *      `src/api.ts`), so a hardcoded `return false` cannot pass.
  *
  * Kept in its own file so `worktree.test.ts` imports only symbols that predate
  * the timeout hardening: that file has to stay copyable onto a pristine
@@ -33,7 +38,6 @@ import { fileURLToPath } from "node:url";
 import {
 	createChildWorktree,
 	GIT_PROBE_TIMEOUT_MS,
-	GIT_WORKTREE_TIMEOUT_MS,
 	isGitRepo,
 	isInsideChildWorktree,
 	probeLegacyGitDirs,
@@ -378,12 +382,13 @@ function gitCallSites(): string[] {
 
 test("every git exec in worktree.ts carries a timeout", () => {
 	const sites = gitCallSites();
-	// path-format probe, the legacy pair (2), the --is-inside-work-tree probe,
-	// worktree add, worktree remove. A new git call site must come with a budget.
+	// Source literals, not runtime calls: the path-format probe, the legacy
+	// rev-parse probe (one `read()` helper invoked for both flags), the
+	// --is-inside-work-tree probe, worktree add, and worktree remove.
 	assert.equal(
 		sites.length,
 		5,
-		`expected the 5 git execs (3 git-dir probes, 1 --is-inside-work-tree probe, worktree add, worktree remove); found ${sites.length}`,
+		`expected 5 git execs — path-format probe, legacy rev-parse probe, --is-inside-work-tree probe, worktree add, worktree remove; found ${sites.length}`,
 	);
 	for (const site of sites) {
 		assert.match(
@@ -402,7 +407,7 @@ test("the probe budget stays on the fast probes and the bigger one on worktree a
 	assert.equal(
 		probing.length,
 		3,
-		"the fast sites are the path-format probe, the legacy pair, and --is-inside-work-tree",
+		"the fast sites are the path-format probe, the legacy rev-parse probe, and --is-inside-work-tree",
 	);
 	for (const site of probing) {
 		assert.match(site, /rev-parse/, `every probe site runs rev-parse:\n${site}`);
@@ -421,10 +426,6 @@ test("the probe budget stays on the fast probes and the bigger one on worktree a
 			`rev-parse must not borrow the worktree budget:\n${site}`,
 		);
 	}
-	assert.ok(
-		GIT_WORKTREE_TIMEOUT_MS > GIT_PROBE_TIMEOUT_MS,
-		`worktree add/remove (${GIT_WORKTREE_TIMEOUT_MS}ms) must exceed the probe budget (${GIT_PROBE_TIMEOUT_MS}ms)`,
-	);
 });
 
 /**
@@ -436,6 +437,15 @@ test("a healthy rev-parse probe stays well inside GIT_PROBE_TIMEOUT_MS", { skip:
 	const repo = initRepo();
 	try {
 		mkdirSync(path.join(repo, "sub"), { recursive: true });
+		// Positive coverage for isGitRepo (public API via src/api.ts): a real repo
+		// must answer true. Without this the function is only ever asserted false,
+		// so a hardcoded `return false` would keep the whole suite green.
+		assert.equal(isGitRepo(repo), true, "isGitRepo is true for a real git repository");
+		assert.equal(
+			isGitRepo(path.join(repo, "sub")),
+			true,
+			"isGitRepo is true from a subdirectory of a real git repository",
+		);
 		for (const cwd of [repo, path.join(repo, "sub")]) {
 			const started = process.hrtime.bigint();
 			assert.equal(isInsideChildWorktree(cwd), false, `probe succeeds for ${cwd}`);

@@ -135,9 +135,15 @@ export function isInsideChildWorktree(cwd: string): boolean {
 }
 
 /**
- * Strict shape check for `--path-format=absolute` output: exactly two non-empty
- * absolute paths. An echoed option, a third line, or the lone `.git` an old git
- * prints are all rejections, not values to interpret.
+ * Capability test for `--path-format` (git >= 2.31), and the shape guard that
+ * makes it safe: returns the two git-dir paths only when git answered with
+ * exactly two non-empty absolute paths.
+ *
+ * There is deliberately no separate capability probe or cache — one would cost
+ * a process on every supported call and, worse, a probe that times out on a hung
+ * path would have to be cached as a lie ("unsupported") or re-paid forever.
+ * This runs on output the caller already had to fetch, and rejects what old git
+ * produces (an echoed option, a third line, or a lone `.git`).
  */
 function parseAbsoluteGitDirs(out: string): [string, string] | null {
 	const lines = out
@@ -146,9 +152,11 @@ function parseAbsoluteGitDirs(out: string): [string, string] | null {
 		.filter((line) => line !== "");
 	if (lines.length !== 2) return null;
 	const [gitDir, commonDir] = lines as [string, string];
-	// POSIX-style check: on Windows git prints `C:/...`, which fails here and
-	// falls back to the legacy probe — whose path.resolve normalizes the relative
-	// half correctly regardless.
+	// Requires both paths absolute. Note this is `path.isAbsolute`, which is
+	// platform-specific: on Windows `path.isAbsolute("C:/foo")` is true, so native
+	// `C:/...` output passes here and the legacy probe is NOT reached. The
+	// rejection branch only fires for a genuinely relative/non-path line, which
+	// is what an old git echoing the option produces on every platform.
 	if (!path.isAbsolute(gitDir) || !path.isAbsolute(commonDir)) return null;
 	return [gitDir, commonDir];
 }
@@ -162,6 +170,8 @@ function parseAbsoluteGitDirs(out: string): [string, string] | null {
  * symlinked spelling reintroduces the very subdirectory false positive this
  * branch exists to fix (verified: /tmp/link->/tmp/repo, cwd /tmp/link/a yields
  * `/tmp/repo/.git` vs `../../.git`, which resolves to `/tmp/.git`).
+ *
+ * This IS the capability fallback referenced above.
  *
  * Exported for the regression test that pins the fallback's semantics without
  * requiring an actual old git on the machine.
@@ -185,15 +195,6 @@ export function probeLegacyGitDirs(cwd: string): boolean {
 		return false;
 	}
 }
-
-/**
- * Whether this git understands `rev-parse --path-format` (git >= 2.31)?
- * There is deliberately no capability probe or cache: a probe would cost a
- * process on every supported call and, worse, a probe that times out on a hung
- * path would have to be cached as a lie ("unsupported") or re-paid forever.
- * `parseAbsoluteGitDirs` is the capability test — it runs on output the caller
- * already had to fetch, and rejects what old git produces.
- */
 
 /** Branch the child commits on. Unique per launch so two workers never collide. */
 export function worktreeBranchFor(name: string, nonce?: string): string {
