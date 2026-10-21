@@ -527,7 +527,15 @@ export function drawLog(
 		const tx = r.w > timeW + graphW + 10 ? gx + graphW + 1 : gx;
 		const [glyph, glyphCol] = KIND_GLYPH[event.kind];
 		cv.set(tx, y, glyph, glyphCol, { bold: true });
-		const nameW = Math.min(16, Math.max(6, Math.floor((r.x + r.w - tx - 2) * 0.45)));
+		// Room between the glyph and the border: `r.x + r.w` is the border column, so the
+		// last cell the name may use is `r.x + r.w - 1`. The old `Math.max(6, …)` floor
+		// ignored this room, so on a narrow pane `nameW` stayed 6 with 1–2 cells left and
+		// the name ran through the border (#251). `nameW <= nameRoom` also bounds the detail
+		// below: its budget is `r.x + r.w - (tx + 3 + nameW)` cells, so the detail's last
+		// cell is `tx + 3 + nameW + budget - 1 <= r.x + r.w - 1`. `nameRoom <= 0` degrades
+		// to "" (ellipsize(_, 0) === "") instead of printing a truncated name past the rect.
+		const nameRoom = r.x + r.w - (tx + 2);
+		const nameW = Math.min(16, Math.max(0, Math.floor(nameRoom * 0.45)));
 		const name = ellipsize(event.node.name, nameW);
 		cv.text(tx + 2, y, name, dim ? "dim" : roleColor(event.node.role), { bold: !dim, inverse: isCursor });
 		const detail = event.kind === "spawn"
