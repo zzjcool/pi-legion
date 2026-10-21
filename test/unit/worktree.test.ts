@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -40,6 +40,11 @@ function initRepo(): string {
 		},
 	});
 	return dir;
+}
+
+/** Real directories (git has no tracked files to create them for us). */
+function mkdirs(...dirs: string[]): void {
+	for (const dir of dirs) mkdirSync(dir, { recursive: true });
 }
 
 test("worktreePathFor nests under the run dir", () => {
@@ -127,6 +132,97 @@ test("isInsideChildWorktree detects linked worktrees only", () => {
 		assert.equal(isInsideChildWorktree(tmpdir()), false, "non-git dir reports false, not throw");
 	} finally {
 		rmSync(repo, { recursive: true, force: true });
+	}
+});
+
+/**
+ * #237 P10 regression. A subdirectory must answer exactly like its repo root.
+ *
+ * Pre-fix this asserted `false` for `repo/src/legion` on the *left* comparison
+ * and failed there: `--git-dir` is absolute from a subdirectory while
+ * `--git-common-dir` is relative, so the plain string compare saw "different"
+ * and reported every subdirectory of a plain repo as a linked worktree. That
+ * false positive silently suppressed worktree creation for launches whose cwd
+ * was a subdirectory of a normal checkout.
+ */
+test("isInsideChildWorktree answers the same for a repo root and its subdirectories", {
+	skip: !hasGit(),
+}, () => {
+	const repo = initRepo();
+	const wt = path.join(mkdtempSync(path.join(tmpdir(), "wt-sub-")), "linked");
+	const repoSub = path.join(repo, "src", "legion");
+	const wtSub = path.join(wt, "src", "legion");
+	try {
+		mkdirs(repoSub);
+		execFileSync("git", ["-C", repo, "worktree", "add", "-b", "probe-sub", wt], {
+			stdio: "ignore",
+		});
+		mkdirs(wtSub);
+
+		// Plain checkout: root and every depth below it are "not a child worktree".
+		assert.equal(isInsideChildWorktree(repo), false, "plain repo root");
+		assert.equal(isInsideChildWorktree(path.join(repo, "src")), false, "plain repo 1 level deep");
+		assert.equal(
+			isInsideChildWorktree(repoSub),
+			false,
+			"plain repo subdirectory must answer like its root (this is the #237 bug)",
+		);
+
+		// Linked worktree: root and every depth below it are "inside a child worktree".
+		assert.equal(isInsideChildWorktree(wt), true, "linked worktree root");
+		assert.equal(
+			isInsideChildWorktree(wtSub),
+			true,
+			"linked worktree subdirectory must answer like its root",
+		);
+
+		// The root/subdirectory answer is identical by construction — state it once
+		// as an explicit invariant so a future short-circuit cannot drift.
+		assert.equal(
+			isInsideChildWorktree(repoSub),
+			isInsideChildWorktree(repo),
+			"plain repo: subdirectory == root",
+		);
+		assert.equal(
+			isInsideChildWorktree(wtSub),
+			isInsideChildWorktree(wt),
+			"linked worktree: subdirectory == root",
+		);
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+		rmSync(path.dirname(wt), { recursive: true, force: true });
+	}
+});
+
+/**
+ * Companion guard for the #237 assertion above: a plain checkout must answer
+ * `false` at every depth, including from a subdirectory whose cwd is itself a
+ * *symlink* into the checkout. `git rev-parse --git-dir` reports an absolute
+ * path anchored at the symlink target while `--git-common-dir` reports a
+ * relative one, so this is precisely the shape that makes a naive
+ * "resolve both against `cwd`" fix reintroduce the false positive.
+ */
+test("a plain checkout answers false from a symlinked subdirectory too", {
+	skip: !hasGit(),
+}, () => {
+	const repo = initRepo();
+	const sub = path.join(repo, "src", "legion");
+	const linkParent = mkdtempSync(path.join(tmpdir(), "wt-symlink-"));
+	const link = path.join(linkParent, "via-link");
+	try {
+		mkdirs(sub);
+		symlinkSync(repo, link);
+		for (const cwd of [repo, sub]) {
+			assert.equal(isInsideChildWorktree(cwd), false, `plain checkout probe for ${cwd}`);
+		}
+		assert.equal(
+			isInsideChildWorktree(path.join(link, "src", "legion")),
+			false,
+			"a symlinked subdirectory of a plain checkout is still not a child worktree",
+		);
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+		rmSync(linkParent, { recursive: true, force: true });
 	}
 });
 
