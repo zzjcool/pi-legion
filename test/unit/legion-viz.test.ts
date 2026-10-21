@@ -2108,3 +2108,66 @@ test("#251: a selected + focused log row keeps the ◂/scrollbar column outside 
 		assert.equal(row[borderCol - 1], "◂", `inner w=${innerW}: ◂ belongs at r.x + r.w - 1 |${row.join("")}|`);
 	}
 });
+
+test("#251: the maxX guard is load-bearing — it clips the clock, not one cell early", () => {
+	// This test exists to fail if `drawLog`'s `maxX` writes are removed or get the wrong
+	// value. Commit 1's `nameW` bound alone already stops the *name* from breaching, so a
+	// border sweep cannot see the guard; these two probes can.
+	//
+	// (1) Removal probe. The time column is the one write with no budget of its own:
+	// `padStart(timeW - 1)` pads short clocks and is a no-op for long ones, so a clock
+	// wider than its column is clipped by `maxX` alone. At inner w=8 a 9-cell clock
+	// ("10000h00m") must stop at the last inner cell; without `maxX` its final "m" lands
+	// on the border at r.x + r.w.
+	const origin = T0 - 10_000 * 3_600_000; // → "10000h00m", 9 cells
+	const spawn: LogEvent[] = [{ ts: T0, kind: "spawn", node: node("worker-0"), parentName: "centurion-0" }];
+	for (const [innerW, why] of [[8, "runs onto the border without maxX"]] as const) {
+		const r = { x: 1, y: 1, w: innerW, h: 4 };
+		const border = r.x + r.w;
+		const cv = new Canvas(innerW + 12, 6);
+		for (let y = r.y; y < r.y + r.h; y++) cv.set(border, y, "│", "borderMuted");
+		drawLog(cv, r, spawn, { offset: 0, cursor: 0, focused: false, origin });
+		const row = Array.from(cv.toPlain()[r.y + 1]!);
+		assert.equal(row[border], "│", `inner w=${innerW}: the clock ${why} |${cv.toPlain()[r.y + 1]}|`);
+	}
+
+	// (1b) Clipping happens at the *last legal cell*, not earlier: at inner w=9 the same
+	// 9-cell clock fills the rect exactly, so its final "m" must be the last inner cell.
+	// The off-by-one `maxX: r.x + r.w - 1` (exclusive!) blanks it.
+	{
+		const r = { x: 1, y: 1, w: 9, h: 4 };
+		const border = r.x + r.w;
+		const cv = new Canvas(21, 6);
+		for (let y = r.y; y < r.y + r.h; y++) cv.set(border, y, "│", "borderMuted");
+		drawLog(cv, r, spawn, { offset: 0, cursor: 0, focused: false, origin });
+		const row = Array.from(cv.toPlain()[r.y + 1]!);
+		assert.equal(row[border], "│", `inner w=9: the clock ran onto the border`);
+		assert.equal(row[border - 1], "m", `inner w=9: the clock was clipped a cell early |${cv.toPlain()[r.y + 1]}|`);
+	}
+
+	// (2) Off-by-one probe on the common wide path. The header is ellipsized to exactly
+	// `r.w` cells, so a header that saturates its budget writes every column up to and
+	// including r.x + r.w - 1. `maxX: r.x + r.w` keeps that last cell; the exclusive
+	// `r.x + r.w - 1` drops it — the wide-terminal regression this pins.
+	for (const innerW of [30, 40, 60]) {
+		// "2 events · highlight: " is 21 cells, so this name makes the raw header exactly
+		// `innerW` cells — the most `ellipsize(_, r.w)` can return.
+		const selected = node("z".repeat(innerW - 21));
+		const events: LogEvent[] = [
+			{ ts: T0, kind: "spawn", node: node("worker-0"), parentName: "centurion-0" },
+			{ ts: T0, kind: "spawn", node: selected, parentName: "centurion-0" },
+		];
+		const cv = new Canvas(innerW + 12, 6);
+		const r = { x: 1, y: 1, w: innerW, h: 4 };
+		const border = r.x + r.w;
+		for (let y = r.y; y < r.y + r.h; y++) cv.set(border, y, "│", "borderMuted");
+		drawLog(cv, r, events, { offset: 0, cursor: 0, focused: false, selectedId: selected.id, origin: T0 });
+		const row = Array.from(cv.toPlain()[r.y]!);
+		assert.equal(row[border], "│", `inner w=${innerW}: header reached the border`);
+		assert.equal(
+			row[border - 1],
+			"…",
+			`inner w=${innerW}: header's last cell was clipped a cell early (maxX must be the exclusive bound r.x + r.w) |${cv.toPlain()[r.y]}|`,
+		);
+	}
+});

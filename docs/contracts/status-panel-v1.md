@@ -148,7 +148,7 @@
 
 | 风险 | 裁决 |
 | --- | --- |
-| `drawLog` 内框 `w<=14` 写出 rect 右边界（`panels.ts:530-532`） | **顺手修**：给该 `cv.text` 补 `maxX: r.x + r.w - 1`。属 P2 范围，单独 commit，附回归断言。理由：Worker B 正在改同一文件，且新面板极易复制此模式。 |
+| `drawLog` 内框 `w<=14` 写出 rect 右边界（`panels.ts:530-532`） | **顺手修**：给该 `cv.text` 补 `maxX: r.x + r.w`。属 P2 范围，单独 commit，附回归断言。理由：Worker B 正在改同一文件，且新面板极易复制此模式。**勘误**：`Canvas.text` 的 `maxX` 是**排他上界**（`canvas.ts:39` `if (col >= limit) break`），而 `frame()` 返回的是内框、其右边框列即 `r.x + r.w`，所以「保住最后一个合法内格且不碰边框」的值是 `r.x + r.w`（与 `frame()` / `drawStatus` 一致）。本文早期写的 `r.x + r.w - 1` 会少吃一格，已按 #251 评审改为 `r.x + r.w`。 |
 | view 层 `layout.timing.h - 3` 与 draw 层 `innerH-1-footerH` off-by-one（`view.ts:90`） | **本契约不修**。改动会影响 `timingVisible` 语义与既有断言，独立提 issue。新面板**必须**用精确公式，不照抄 `-3`。 |
 | portrait 零面积 status 被 Tab 跳过 | 由 `availablePanes` 保证；`handleViewKey` 缺省参数保证既有测试不变 |
 | pid 跨进程不可见 | 接受。viz 显示 `—`，不猜。 |

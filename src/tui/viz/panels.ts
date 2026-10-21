@@ -503,8 +503,14 @@ export function drawLog(
 	state: { offset: number; cursor: number; focused: boolean; selectedId?: string; origin: number },
 ): void {
 	if (r.w < 8 || r.h < 2) return;
+	// Belt and braces (#251): the border column is `r.x + r.w` (this is the INNER rect
+	// `frame()` hands back), and `Canvas.text`'s `maxX` is exclusive, so `r.x + r.w` is
+	// exactly "the last inner cell, never the border" — the same value `frame()` and
+	// `drawStatus` use. The budgets below already keep every write inside it; this is
+	// what stops a future edit to those budgets from silently running onto the border.
+	const maxX = r.x + r.w;
 	const filter = state.selectedId ? events.find((e) => e.node.id === state.selectedId)?.node.name : undefined;
-	cv.text(r.x, r.y, ellipsize(`${events.length} events${filter ? ` · highlight: ${filter}` : ""}`, r.w), "dim");
+	cv.text(r.x, r.y, ellipsize(`${events.length} events${filter ? ` · highlight: ${filter}` : ""}`, r.w), "dim", { maxX });
 	const rows = r.h - 1;
 	const maxDepth = Math.max(1, ...events.map((e) => e.node.depth));
 	const graphW = Math.min(8, maxDepth * 2);
@@ -517,7 +523,7 @@ export function drawLog(
 		const isCursor = state.focused && index === state.cursor;
 		const highlight = state.selectedId === event.node.id;
 		const dim = state.selectedId !== undefined && !highlight;
-		cv.text(r.x, y, formatDuration(event.ts - state.origin).padStart(timeW - 1), "dim");
+		cv.text(r.x, y, formatDuration(event.ts - state.origin).padStart(timeW - 1), "dim", { maxX });
 		const gx = r.x + timeW;
 		if (r.w > timeW + graphW + 10) {
 			for (let d = 1; d < Math.min(event.node.depth, graphW / 2 + 1); d++) cv.set(gx + (d - 1) * 2, y, "│", "borderMuted");
@@ -537,11 +543,11 @@ export function drawLog(
 		const nameRoom = r.x + r.w - (tx + 2);
 		const nameW = Math.min(16, Math.max(0, Math.floor(nameRoom * 0.45)));
 		const name = ellipsize(event.node.name, nameW);
-		cv.text(tx + 2, y, name, dim ? "dim" : roleColor(event.node.role), { bold: !dim, inverse: isCursor });
+		cv.text(tx + 2, y, name, dim ? "dim" : roleColor(event.node.role), { bold: !dim, inverse: isCursor, maxX });
 		const detail = event.kind === "spawn"
 			? `${event.parentName ?? "root"} → ${event.node.role}`
 			: `${event.kind === "settled" ? "done" : event.kind} · ${formatCount(event.node.tokens)} tok`;
-		cv.text(tx + 3 + nameW, y, ellipsize(detail, Math.max(0, r.x + r.w - (tx + 3 + nameW))), highlight ? "text" : "dim");
+		cv.text(tx + 3 + nameW, y, ellipsize(detail, Math.max(0, r.x + r.w - (tx + 3 + nameW))), highlight ? "text" : "dim", { maxX });
 		if (isCursor && highlight) cv.set(r.x + r.w - 1, y, "◂", "accent", { bold: true });
 	}
 	if (events.length > rows) {
