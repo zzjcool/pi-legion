@@ -17,6 +17,12 @@ export const LEGION_DB_BUSY_TIMEOUT_MS = 5_000;
  */
 export const LEGION_STMT_CACHE_LIMIT = 64;
 
+/**
+ * `exec()` texts that can change the schema and therefore invalidate compiled
+ * statements. Deliberately matched anywhere in the text (see `attachStatementCache`).
+ */
+const SCHEMA_MUTATION_PATTERN = /\b(?:ALTER|CREATE|DROP|REINDEX|VACUUM)\b/i;
+
 export type SqliteBindValue = string | number | bigint | null | Uint8Array;
 export type SqliteRow = Record<string, string | number | bigint | null | Uint8Array>;
 
@@ -164,19 +170,33 @@ export function openLegionDb(dbPath: string): DatabaseSync {
  * still enters the data layer (so instrumentation that counts
  * `prepare(sql)` keeps counting), and all call sites get the reuse for free.
  *
- * A compiled statement is reusable — `.get()`/`.all()`/`.run()` re-execute it
- * with the new bindings, cached `PRAGMA` statements re-read the current value,
- * and a statement survives `ALTER`/`VACUUM` on the same connection. Statements
- * are keyed on the exact SQL text: two texts that differ only in whitespace are
- * deliberately two entries, because SQL text is the only identity SQLite offers.
+ * Statements are keyed on the exact SQL text: two texts that differ only in
+ * whitespace are deliberately two entries, because SQL text is the only
+ * identity SQLite offers.
+ *
+ * Reuse is safe for data changes — `.get()`/`.all()`/`.run()` re-execute with
+ * the new bindings, so a cached statement always sees committed rows. It is NOT
+ * safe across a schema change: after `ALTER TABLE ... ADD COLUMN`, a cached
+ * `SELECT *` executed with `.all()` keeps reporting the schema it compiled
+ * against (`.get()` happens to refresh, which makes the hazard easy to miss).
+ * Any `exec()` whose text mentions a schema-mutating keyword therefore drops
+ * every cached statement, so the next `prepare()` recompiles against the new
+ * schema. That covers `migrate()`'s `SCHEMA_V1` (`CREATE TABLE/INDEX`),
+ * `hygiene.ts`'s `VACUUM`, and any future `ALTER`/`DROP`. `rebuild.ts` only
+ * issues `DELETE FROM`, which is a data change, so it needs no invalidation.
+ *
+ * Invalidation protects future `prepare()` calls; a handle the caller already
+ * holds stays live with the schema it compiled against, as it would without
+ * this cache.
  */
 function attachStatementCache(db: DatabaseSync): void {
 	if (statementCaches.has(db)) return;
-	const prepare = db.prepare;
-	const close = db.close;
+	const prepare = db.prepare as (sql: string, ...rest: unknown[]) => LegionStatementSync;
+	const exec = db.exec as (sql: string, ...rest: unknown[]) => void;
+	const close = db.close as (...rest: unknown[]) => void;
 	const cache = new Map<string, LegionStatementSync>();
 	statementCaches.set(db, cache);
-	db.prepare = (sql: string): LegionStatementSync => {
+	db.prepare = (sql: string, ...rest: unknown[]): LegionStatementSync => {
 		const cached = cache.get(sql);
 		if (cached) {
 			// Re-insert so Map order stays least-recently-used first.
@@ -184,7 +204,7 @@ function attachStatementCache(db: DatabaseSync): void {
 			cache.set(sql, cached);
 			return cached;
 		}
-		const statement = prepare.call(db, sql);
+		const statement = prepare.call(db, sql, ...rest);
 		cache.set(sql, statement);
 		if (cache.size > LEGION_STMT_CACHE_LIMIT) {
 			const oldest = cache.keys().next();
@@ -192,12 +212,19 @@ function attachStatementCache(db: DatabaseSync): void {
 		}
 		return statement;
 	};
-	db.close = (): void => {
+	db.exec = (sql: string, ...rest: unknown[]): void => {
+		// Match anywhere in the text: `exec` runs multi-statement SQL (SCHEMA_V1)
+		// and over-matching only costs a recompile, while under-matching would
+		// serve statements compiled against a schema that no longer exists.
+		if (SCHEMA_MUTATION_PATTERN.test(sql)) cache.clear();
+		exec.call(db, sql, ...rest);
+	};
+	db.close = (...rest: unknown[]): void => {
 		// Drop our references before the driver finalizes them, so the cache
 		// cannot outlive the connection and nothing is released twice.
 		cache.clear();
 		statementCaches.delete(db);
-		close.call(db);
+		close.call(db, ...rest);
 	};
 }
 

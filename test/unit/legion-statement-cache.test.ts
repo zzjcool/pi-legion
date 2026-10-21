@@ -131,22 +131,76 @@ test("statements cache per connection, not globally", () => {
 	const two = openLegionDb(":memory:");
 	try {
 		const sql = "SELECT 1 AS one";
+		// Base size, not a hardcoded count: opening a fresh database runs the
+		// migration's schema DDL, which invalidates the cache on the way through.
 		const baseOne = legionStatementCacheSize(one);
 		const baseTwo = legionStatementCacheSize(two);
 		const fromOne = one.prepare(sql);
-		// A module-level cache would hand connection two a statement bound to one;
-		// it would then throw "statement has been finalized" once `one` closes.
-		assert.notEqual(two.prepare(sql), fromOne, "connections must not share compiled statements");
+		const fromTwo = two.prepare(sql);
+		// Impersonality, stated so the assertion cannot pass for the wrong reason
+		// (e.g. a global cache that throws after `one` closed): both connections
+		// are open here, and each serves its own statement of the same SQL.
+		assert.notEqual(fromTwo, fromOne, "connections must not share compiled statements");
+		assert.equal(fromTwo.get()?.one, 1, "the second connection's statement is usable while both are open");
+		assert.equal(fromOne.get()?.one, 1, "the first connection's statement is usable while both are open");
+		assert.equal(one.prepare(sql), fromOne, "each connection caches its own copy");
+		assert.equal(two.prepare(sql), fromTwo, "each connection caches its own copy");
 		assert.equal(legionStatementCacheSize(one), baseOne + 1);
 		assert.equal(legionStatementCacheSize(two), baseTwo + 1);
 
 		one.close();
 		assert.equal(legionStatementCacheSize(one), 0, "closing a connection releases its cache");
 		assert.equal(legionStatementCacheSize(two), baseTwo + 1, "closing one connection leaves the other intact");
+		// Still genuinely isolated: `one`'s driver statements were finalized by its
+		// close, yet `two`'s cached statement keeps working.
 		assert.equal(Number(two.prepare(sql).get()?.one), 1, "the surviving connection still works");
 	} finally {
 		closeQuietly(one);
 		two.close();
+	}
+});
+
+test("a schema-mutating exec() invalidates cached statements", () => {
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root" });
+		// `.all()` is the shape that exposes the hazard: a cached `SELECT *`
+		// keeps reporting the pre-ALTER column set, so callers would silently
+		// read stale rows after a migration.
+		const starred = db.prepare("SELECT * FROM nodes WHERE parent_id IS NULL");
+		const cachedSize = legionStatementCacheSize(db);
+		assert.ok(cachedSize > 0, "precondition: something is cached");
+		assert.equal(Object.hasOwn(starred.all()[0] ?? {}, "hazard_column"), false);
+
+		db.exec("ALTER TABLE nodes ADD COLUMN hazard_column TEXT");
+		assert.equal(legionStatementCacheSize(db), 0, "ALTER TABLE must drop the cache");
+		const afterAlter = db.prepare("SELECT * FROM nodes WHERE parent_id IS NULL").all()[0] ?? {};
+		assert.equal(
+			Object.hasOwn(afterAlter, "hazard_column"),
+			true,
+			"after ADD COLUMN, prepare() must see the new column set, not the compiled-against one",
+		);
+
+		db.exec("ALTER TABLE nodes DROP COLUMN hazard_column");
+		const afterDrop = db.prepare("SELECT * FROM nodes WHERE parent_id IS NULL").all()[0] ?? {};
+		assert.equal(Object.hasOwn(afterDrop, "hazard_column"), false, "after DROP COLUMN, the column is gone");
+
+		// VACUUM and CREATE are schema-mutating too, and the migration's own
+		// schema DDL goes through this same exec() path.
+		assert.ok(db.prepare("SELECT * FROM nodes WHERE parent_id IS NULL"));
+		db.exec("VACUUM;");
+		assert.equal(legionStatementCacheSize(db), 0, "VACUUM must drop the cache");
+		assert.ok(db.prepare("SELECT COUNT(*) AS n FROM nodes"));
+		db.exec("CREATE INDEX idx_probe ON nodes(status)");
+		assert.equal(legionStatementCacheSize(db), 0, "CREATE INDEX must drop the cache");
+
+		// A data-only exec() must NOT drop the cache, or every call pays a recompile.
+		assert.ok(db.prepare("SELECT COUNT(*) AS n FROM nodes"));
+		db.exec("BEGIN IMMEDIATE;");
+		db.exec("COMMIT;");
+		assert.ok(legionStatementCacheSize(db) > 0, "transaction control must not invalidate compiled statements");
+	} finally {
+		db.close();
 	}
 });
 

@@ -8,8 +8,9 @@
  *   - `heartbeatNode` (#236 P1 FIXED): single-column `updated_at` write, no
  *     `SELECT *` read-back; `refreshHeartbeats` wraps the loop in one
  *     transaction so the tick pays one fsync under `synchronous=FULL`.
- *   - every `prepare()` recompiles: the data layer keeps no statement cache
- *     (still open — out of scope for #236 P1).
+ *   - statement cache (#236 P2 FIXED): `prepare()` is served from a bounded
+ *     per-connection LRU, so 46 call sites stop recompiling. A cached statement
+ *     is reused for data changes; a schema-mutating `exec()` drops the cache.
  */
 
 import { test } from "node:test";
@@ -19,7 +20,7 @@ import { getSubtree, getChildren, getNode, heartbeatNode, updateNode } from "../
 import { withTransaction } from "../../src/legion/db.ts";
 import { attachUsageTotals } from "../../src/legion/usage.ts";
 import { appendEvent, getDataVersion, readEventsAfter } from "../../src/legion/events.ts";
-import { buildTree, medianMs, usPerOp, withBench } from "./fixtures.ts";
+import { buildTree, medianMs, rawPrepare, usPerOp, withBench } from "./fixtures.ts";
 
 const NODES = 200;
 
@@ -88,17 +89,26 @@ test("FIXED (#236 P1) heartbeat: batched-beats-autocommit — one txn + updated_
 	});
 });
 
-test("prepare() recompiles: a reused statement is cheaper than prepare-per-call", () => {
+test("FIXED (#236 P2) statement cache: prepare() is a lookup, compilation is not", () => {
 	withBench((h) => {
 		buildTree(h.db, 50);
 		const sql = "SELECT * FROM nodes WHERE id = ?";
-		const fresh = usPerOp(() => { h.db.prepare(sql).get("root"); }, 1_000);
-		const reused = h.db.prepare(sql);
-		const cached = usPerOp(() => { reused.get("root"); }, 1_000);
 
+		// Behaviour first — this is the part that cannot pass without a cache.
+		assert.equal(h.db.prepare(sql), h.db.prepare(sql), "identical SQL must reuse one compiled statement");
+		assert.notEqual(
+			h.db.prepare(sql),
+			rawPrepare(h.db, sql),
+			"the raw driver must still compile: the cache is the data layer, not the driver",
+		);
+
+		// Then the price. The "fresh" side bypasses the cache and compiles for
+		// real; comparing cached-vs-cached would measure noise and flake.
+		const compile = usPerOp(() => { rawPrepare(h.db, sql).get("root"); }, 1_000);
+		const cached = usPerOp(() => { h.db.prepare(sql).get("root"); }, 1_000);
 		assert.ok(
-			cached < fresh,
-			`reused (${cached.toFixed(1)}us) should beat prepare-per-call (${fresh.toFixed(1)}us)`,
+			compile > cached,
+			`compiling (${compile.toFixed(1)}us) should cost more than a cache hit (${cached.toFixed(1)}us)`,
 		);
 	});
 });

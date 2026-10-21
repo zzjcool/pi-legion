@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { openLegionDb, type DatabaseSync } from "../../src/legion/db.ts";
+import { openLegionDb, type DatabaseSync, type LegionStatementSync } from "../../src/legion/db.ts";
 import { insertNode } from "../../src/legion/nodes.ts";
 import { upsertUsage } from "../../src/legion/usage.ts";
 
@@ -86,6 +86,23 @@ export function buildTree(db: DatabaseSync, total: number): string[] {
 		frontier = next;
 	}
 	return ids;
+}
+
+/**
+ * Compile a statement directly on the driver, bypassing the data layer's
+ * statement cache (#236 P2). The cache installs an *own* `prepare` on the
+ * connection, so the prototype's `prepare` is still the raw driver call.
+ *
+ * Measurement helper only: use it to price compilation itself, never to
+ * reach production behaviour.
+ */
+export function rawPrepare(db: DatabaseSync, sql: string): LegionStatementSync {
+	const prototype = Object.getPrototypeOf(db) as { prepare?: (sql: string) => LegionStatementSync };
+	const driverPrepare = prototype.prepare;
+	if (typeof driverPrepare !== "function") {
+		throw new TypeError("driver offers no prototype prepare to bypass the statement cache");
+	}
+	return driverPrepare.call(db, sql);
 }
 
 /**
