@@ -123,7 +123,15 @@ export interface EventSourceClock {
 export interface DbEventSourceOptions {
 	/** Contract §10.2 recommends 200–500ms; default is 250ms. */
 	pollMs?: number;
-	/** Resume after this persisted event id. Defaults to the beginning of the log. */
+	/**
+	 * Resume after this persisted event id. Defaults to the beginning of the log.
+	 *
+	 * The default is deliberately "replay everything": a caller that attaches to
+	 * a ledger it did not just write should seed this at the current tail instead
+	 * (`maxEventId(db)` from `src/legion/events.ts`) — that is what the production
+	 * attach path in `index.ts` does (#238, `createLegionRuntime`). A caller that
+	 * really wants the full replay passes `cursor: 0` explicitly.
+	 */
 	cursor?: number;
 	/** Injectable interval scheduler for deterministic tests and embedding. */
 	clock?: EventSourceClock;

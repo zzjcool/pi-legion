@@ -51,7 +51,7 @@ import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./sr
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
 import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
-import { appendEvent } from "./src/legion/events.ts";
+import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
@@ -323,6 +323,42 @@ function notice(pi: ExtensionAPI, text: string): void {
 	pi.sendMessage({ customType: SUBAGENT_NOTIFY_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
 }
 
+/**
+ * #238: create and start the DB event source that feeds the legion bus on attach.
+ *
+ * This is the production attach path and it is exported so a unit test can drive
+ * it directly (same seam style as `buildPlan`/`resolveWaitTargets`): the seeding
+ * behaviour is a property of THIS call, not of `createDbEventSource`, and a test
+ * that only exercised the factory would keep passing if this seed were removed.
+ *
+ * Seeding at `MAX(id)` matters because `createDbEventSource`'s own default is 0,
+ * i.e. "replay the whole log". On a ledger with history that re-delivered every
+ * stored event through `onWidgetEvent` — one full `snapshotNodes()` plus a
+ * repaint each, ~2.5s of blocked UI at 120 nodes / 1000 events — to reach a
+ * state the DB already describes.
+ *
+ * Rows committed in the window between this seed query and the first poll are
+ * not lost: `poll()` only skips when `lastDataVersion` matches, that variable
+ * starts `undefined` (so the first poll always reads), and the cursor is only
+ * ever advanced from ids actually returned by `SELECT ... WHERE id > cursor`.
+ * A row committed after the seed is therefore either picked up by the first
+ * poll or dirties `data_version` and is picked up on the next tick. The seed is
+ * not atomic with `start()`, but it does not need to be.
+ *
+ * Note the drain loop's early `return`: it exits BEFORE `lastDataVersion` is
+ * assigned (that assignment is after the loop), so an interrupted drain leaves
+ * the version unlatched. That errs safe — the next poll re-reads from the
+ * cursor instead of skipping — but it is a re-read, not a "set then return".
+ */
+export function attachLegionRuntime(input: {
+	db: DatabaseSync;
+	eventBus: LegionEventBus;
+}): DbEventSource {
+	const dbEventSource = createDbEventSource(input.db, { cursor: maxEventId(input.db) });
+	dbEventSource.start(input.eventBus);
+	return dbEventSource;
+}
+
 function createLegionRuntime(input: {
 	pi: ExtensionAPI;
 	supervisor: LegionSupervisor;
@@ -339,8 +375,7 @@ function createLegionRuntime(input: {
 }): LegionRuntimeIdentity {
 	const self = getNode(input.db, input.nodeId);
 	const eventBus = input.eventBus;
-	const dbEventSource = createDbEventSource(input.db);
-	dbEventSource.start(eventBus);
+	const dbEventSource = attachLegionRuntime(input);
 	const postman = new LegionPostman({
 		db: input.db,
 		nodeId: input.nodeId,
