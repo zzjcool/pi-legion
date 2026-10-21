@@ -121,6 +121,21 @@ reused statement    9.2 us/op
 getNode x400       15.7 ms -> 4.8 ms  (3.2x)
 ```
 
+> **Status after #236 P2** (kept for the measurement record; the numbers above
+> are the pre-fix baseline): `prepare()` is now served from a bounded
+> per-connection LRU (cap 64) installed *inside* the data layer, so all 46 call
+> sites reuse compiled statements without being touched. Re-measured on the
+> same harness: prepare-per-call 30.96/28.43/31.75 → 8.86/9.61/11.89 us/op,
+> `getNode` x400 17.36/17.34/16.99 → 4.64/4.63/6.49 ms (3.6x). The `getSubtree`
+> snapshot barely moves (0.64 → 0.47 ms) because it was already few statements.
+> A schema-mutating `exec()` (`ALTER`/`CREATE`/`DROP`/`REINDEX`/`VACUUM`)
+> invalidates the cache, since a cached `SELECT *` keeps the column set it
+> compiled against. Pinned by `test/unit/legion-statement-cache.test.ts`
+> (asserts statement identity, compile counts and invalidation — not timing).
+> `synchronous` / `temp_store` / `cache_size` / `mmap_size` stay untouched: P3
+> is a maintainer口径 decision, and the recon here measured those at near-zero
+> benefit (0.33 MB db, 85 pages; default `cache_size` already holds 512 pages).
+
 ### P7 · `structuredClone` spends the incremental-parse win
 
 `parseSessionFile` keeps a dev/ino/offset fingerprint cache (#36) but then

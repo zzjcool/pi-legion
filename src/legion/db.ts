@@ -5,6 +5,24 @@ import { createRequire } from "node:module";
 export const LEGION_DB_USER_VERSION = 1;
 export const LEGION_DB_BUSY_TIMEOUT_MS = 5_000;
 
+/**
+ * Bound on one connection's compiled-statement cache.
+ *
+ * The ledger has ~29 distinct static SQL texts behind the 46 `prepare()` call
+ * sites (many sites share a text), plus a handful of dynamically-shaped
+ * families — `usage.ts`'s chunked `IN (?,?,…)` (stable chunk length at runtime)
+ * and `hygiene.ts`'s retention `NOT IN (…)` lists. 64 holds everything a
+ * connection reuses with 2x headroom, while an unbounded map keyed on SQL text
+ * would grow with every distinct chunk size ever requested.
+ */
+export const LEGION_STMT_CACHE_LIMIT = 64;
+
+/**
+ * `exec()` texts that can change the schema and therefore invalidate compiled
+ * statements. Deliberately matched anywhere in the text (see `attachStatementCache`).
+ */
+const SCHEMA_MUTATION_PATTERN = /\b(?:ALTER|CREATE|DROP|REINDEX|VACUUM)\b/i;
+
 export type SqliteBindValue = string | number | bigint | null | Uint8Array;
 export type SqliteRow = Record<string, string | number | bigint | null | Uint8Array>;
 
@@ -41,6 +59,7 @@ const SQLITE_DRIVERS: readonly SqliteDriver[] = [
 ];
 let cachedSqliteConstructor: SqliteDatabaseConstructor | null | undefined;
 const transactionDepth = new WeakMap<DatabaseSync, number>();
+const statementCaches = new WeakMap<DatabaseSync, Map<string, LegionStatementSync>>();
 let savepointSequence = 0;
 
 const SCHEMA_V1 = `
@@ -131,6 +150,8 @@ export function openLegionDb(dbPath: string): DatabaseSync {
 	const Database = sqliteDatabaseConstructor();
 	const db = new Database(dbPath);
 	try {
+		// Compiled statements are reused for every one of the call sites above.
+		attachStatementCache(db);
 		db.exec(`PRAGMA busy_timeout = ${LEGION_DB_BUSY_TIMEOUT_MS};`);
 		db.exec("PRAGMA foreign_keys = ON;");
 		db.exec("PRAGMA journal_mode = WAL;");
@@ -140,6 +161,76 @@ export function openLegionDb(dbPath: string): DatabaseSync {
 		db.close();
 		throw error;
 	}
+}
+
+/**
+ * Serve every `prepare()` on this connection from a bounded per-connection LRU.
+ *
+ * The cache sits *inside* `prepare` rather than at the call sites: each call
+ * still enters the data layer (so instrumentation that counts
+ * `prepare(sql)` keeps counting), and all call sites get the reuse for free.
+ *
+ * Statements are keyed on the exact SQL text: two texts that differ only in
+ * whitespace are deliberately two entries, because SQL text is the only
+ * identity SQLite offers.
+ *
+ * Reuse is safe for data changes — `.get()`/`.all()`/`.run()` re-execute with
+ * the new bindings, so a cached statement always sees committed rows. It is NOT
+ * safe across a schema change: after `ALTER TABLE ... ADD COLUMN`, a cached
+ * `SELECT *` executed with `.all()` keeps reporting the schema it compiled
+ * against (`.get()` happens to refresh, which makes the hazard easy to miss).
+ * Any `exec()` whose text mentions a schema-mutating keyword therefore drops
+ * every cached statement, so the next `prepare()` recompiles against the new
+ * schema. That covers `migrate()`'s `SCHEMA_V1` (`CREATE TABLE/INDEX`),
+ * `hygiene.ts`'s `VACUUM`, and any future `ALTER`/`DROP`. `rebuild.ts` only
+ * issues `DELETE FROM`, which is a data change, so it needs no invalidation.
+ *
+ * Invalidation protects future `prepare()` calls; a handle the caller already
+ * holds stays live with the schema it compiled against, as it would without
+ * this cache.
+ */
+function attachStatementCache(db: DatabaseSync): void {
+	if (statementCaches.has(db)) return;
+	const prepare = db.prepare as (sql: string, ...rest: unknown[]) => LegionStatementSync;
+	const exec = db.exec as (sql: string, ...rest: unknown[]) => void;
+	const close = db.close as (...rest: unknown[]) => void;
+	const cache = new Map<string, LegionStatementSync>();
+	statementCaches.set(db, cache);
+	db.prepare = (sql: string, ...rest: unknown[]): LegionStatementSync => {
+		const cached = cache.get(sql);
+		if (cached) {
+			// Re-insert so Map order stays least-recently-used first.
+			cache.delete(sql);
+			cache.set(sql, cached);
+			return cached;
+		}
+		const statement = prepare.call(db, sql, ...rest);
+		cache.set(sql, statement);
+		if (cache.size > LEGION_STMT_CACHE_LIMIT) {
+			const oldest = cache.keys().next();
+			if (!oldest.done) cache.delete(oldest.value);
+		}
+		return statement;
+	};
+	db.exec = (sql: string, ...rest: unknown[]): void => {
+		// Match anywhere in the text: `exec` runs multi-statement SQL (SCHEMA_V1)
+		// and over-matching only costs a recompile, while under-matching would
+		// serve statements compiled against a schema that no longer exists.
+		if (SCHEMA_MUTATION_PATTERN.test(sql)) cache.clear();
+		exec.call(db, sql, ...rest);
+	};
+	db.close = (...rest: unknown[]): void => {
+		// Drop our references before the driver finalizes them, so the cache
+		// cannot outlive the connection and nothing is released twice.
+		cache.clear();
+		statementCaches.delete(db);
+		close.call(db, ...rest);
+	};
+}
+
+/** Compiled statements a connection currently holds; 0 once it is closed. */
+export function legionStatementCacheSize(db: DatabaseSync): number {
+	return statementCaches.get(db)?.size ?? 0;
 }
 
 /** Run a short synchronous write transaction. Nested ledger helpers use savepoints. */
