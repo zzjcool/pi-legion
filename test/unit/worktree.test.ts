@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -195,28 +195,34 @@ test("isInsideChildWorktree answers the same for a repo root and its subdirector
 });
 
 /**
- * `git rev-parse` is a metadata read, so it must finish far inside
- * GIT_PROBE_TIMEOUT_MS. If this ever starts failing, the probe budget is being
- * charged to something that is not a probe (e.g. a network path), which is
- * exactly the hang the timeout exists to bound.
- *
- * Kept in a separate file (worktree-probe-timeout.test.ts) so that
- * worktree.test.ts imports only symbols that predate the timeout hardening:
- * that file must be copyable onto a pristine `origin/master` export to prove
- * the subdirectory regression fails there on an *assertion*, not an import.
+ * Companion guard for the #237 assertion above: a plain checkout must answer
+ * `false` at every depth, including from a subdirectory whose cwd is itself a
+ * *symlink* into the checkout. `git rev-parse --git-dir` reports an absolute
+ * path anchored at the symlink target while `--git-common-dir` reports a
+ * relative one, so this is precisely the shape that makes a naive
+ * "resolve both against `cwd`" fix reintroduce the false positive.
  */
-test("a plain checkout always looks like a plain checkout", {
+test("a plain checkout answers false from a symlinked subdirectory too", {
 	skip: !hasGit(),
 }, () => {
 	const repo = initRepo();
 	const sub = path.join(repo, "src", "legion");
+	const linkParent = mkdtempSync(path.join(tmpdir(), "wt-symlink-"));
+	const link = path.join(linkParent, "via-link");
 	try {
 		mkdirs(sub);
+		symlinkSync(repo, link);
 		for (const cwd of [repo, sub]) {
 			assert.equal(isInsideChildWorktree(cwd), false, `plain checkout probe for ${cwd}`);
 		}
+		assert.equal(
+			isInsideChildWorktree(path.join(link, "src", "legion")),
+			false,
+			"a symlinked subdirectory of a plain checkout is still not a child worktree",
+		);
 	} finally {
 		rmSync(repo, { recursive: true, force: true });
+		rmSync(linkParent, { recursive: true, force: true });
 	}
 });
 
