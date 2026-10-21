@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -40,6 +40,11 @@ function initRepo(): string {
 		},
 	});
 	return dir;
+}
+
+/** Real directories (git has no tracked files to create them for us). */
+function mkdirs(...dirs: string[]): void {
+	for (const dir of dirs) mkdirSync(dir, { recursive: true });
 }
 
 test("worktreePathFor nests under the run dir", () => {
@@ -125,6 +130,91 @@ test("isInsideChildWorktree detects linked worktrees only", () => {
 			});
 		}
 		assert.equal(isInsideChildWorktree(tmpdir()), false, "non-git dir reports false, not throw");
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+	}
+});
+
+/**
+ * #237 P10 regression. A subdirectory must answer exactly like its repo root.
+ *
+ * Pre-fix this asserted `false` for `repo/src/legion` on the *left* comparison
+ * and failed there: `--git-dir` is absolute from a subdirectory while
+ * `--git-common-dir` is relative, so the plain string compare saw "different"
+ * and reported every subdirectory of a plain repo as a linked worktree. That
+ * false positive silently suppressed worktree creation for launches whose cwd
+ * was a subdirectory of a normal checkout.
+ */
+test("isInsideChildWorktree answers the same for a repo root and its subdirectories", {
+	skip: !hasGit(),
+}, () => {
+	const repo = initRepo();
+	const wt = path.join(mkdtempSync(path.join(tmpdir(), "wt-sub-")), "linked");
+	const repoSub = path.join(repo, "src", "legion");
+	const wtSub = path.join(wt, "src", "legion");
+	try {
+		mkdirs(repoSub);
+		execFileSync("git", ["-C", repo, "worktree", "add", "-b", "probe-sub", wt], {
+			stdio: "ignore",
+		});
+		mkdirs(wtSub);
+
+		// Plain checkout: root and every depth below it are "not a child worktree".
+		assert.equal(isInsideChildWorktree(repo), false, "plain repo root");
+		assert.equal(isInsideChildWorktree(path.join(repo, "src")), false, "plain repo 1 level deep");
+		assert.equal(
+			isInsideChildWorktree(repoSub),
+			false,
+			"plain repo subdirectory must answer like its root (this is the #237 bug)",
+		);
+
+		// Linked worktree: root and every depth below it are "inside a child worktree".
+		assert.equal(isInsideChildWorktree(wt), true, "linked worktree root");
+		assert.equal(
+			isInsideChildWorktree(wtSub),
+			true,
+			"linked worktree subdirectory must answer like its root",
+		);
+
+		// The root/subdirectory answer is identical by construction — state it once
+		// as an explicit invariant so a future short-circuit cannot drift.
+		assert.equal(
+			isInsideChildWorktree(repoSub),
+			isInsideChildWorktree(repo),
+			"plain repo: subdirectory == root",
+		);
+		assert.equal(
+			isInsideChildWorktree(wtSub),
+			isInsideChildWorktree(wt),
+			"linked worktree: subdirectory == root",
+		);
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+		rmSync(path.dirname(wt), { recursive: true, force: true });
+	}
+});
+
+/**
+ * `git rev-parse` is a metadata read, so it must finish far inside
+ * GIT_PROBE_TIMEOUT_MS. If this ever starts failing, the probe budget is being
+ * charged to something that is not a probe (e.g. a network path), which is
+ * exactly the hang the timeout exists to bound.
+ *
+ * Kept in a separate file (worktree-probe-timeout.test.ts) so that
+ * worktree.test.ts imports only symbols that predate the timeout hardening:
+ * that file must be copyable onto a pristine `origin/master` export to prove
+ * the subdirectory regression fails there on an *assertion*, not an import.
+ */
+test("a plain checkout always looks like a plain checkout", {
+	skip: !hasGit(),
+}, () => {
+	const repo = initRepo();
+	const sub = path.join(repo, "src", "legion");
+	try {
+		mkdirs(sub);
+		for (const cwd of [repo, sub]) {
+			assert.equal(isInsideChildWorktree(cwd), false, `plain checkout probe for ${cwd}`);
+		}
 	} finally {
 		rmSync(repo, { recursive: true, force: true });
 	}

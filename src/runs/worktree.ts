@@ -50,19 +50,33 @@ export function resolveLaunchWorktree(opts: {
  * inside any linked worktree, including ones created by other agent runs.
  * Non-git directories report both as ".git" and are treated as not-in-worktree;
  * the later createChildWorktree call owns the "not a repo" error.
+ *
+ * Both paths MUST be resolved before comparing (#237 P10). Without
+ * `--path-format=absolute`, git reports the two inconsistently from a
+ * subdirectory: `--git-dir` comes back absolute (`/repo/.git`) while
+ * `--git-common-dir` stays relative (`../../.git`), so a bare string compare
+ * claims "inside a linked worktree" for *every* subdirectory of a plain repo
+ * — which then suppresses worktree creation for the launch. One invocation
+ * returning both values keeps them consistent (and halves the process count).
+ *
+ * `fs.realpathSync` is deliberately NOT applied: git already canonicalizes its
+ * first path segment via getcwd(), so a symlinked cwd reports the same path for
+ * both values (verified for a symlinked repo root, its subdirectory, and a
+ * symlinked linked-worktree path). Adding realpathSync would introduce a
+ * throw-on-ENOENT path for zero behavioural gain.
  */
 export function isInsideChildWorktree(cwd: string): boolean {
 	try {
-		const gitDir = execFileSync("git", ["-C", cwd, "rev-parse", "--git-dir"], {
-			stdio: ["ignore", "pipe", "pipe"],
-			encoding: "utf8",
-		}).trim();
-		const commonDir = execFileSync(
+		const out = execFileSync(
 			"git",
-			["-C", cwd, "rev-parse", "--git-common-dir"],
-			{ stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" },
+			["-C", cwd, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+			{
+				stdio: ["ignore", "pipe", "pipe"],
+				encoding: "utf8",
+			},
 		).trim();
-		return gitDir !== commonDir && gitDir !== "" && commonDir !== "";
+		const [gitDir, commonDir] = out.split("\n").map((line) => line.trim());
+		return Boolean(gitDir && commonDir) && gitDir !== commonDir;
 	} catch {
 		return false;
 	}
