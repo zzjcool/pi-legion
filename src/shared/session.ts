@@ -381,7 +381,7 @@ function num(v: unknown): number {
 const SESSION_READ_CHUNK_BYTES = 1024 * 1024;
 export const DEFAULT_SESSION_MAX_LINE_BYTES = 32 * 1024 * 1024;
 export const SESSION_MAX_LINE_BYTES_ENV = "PI_LEGION_SESSION_MAX_LINE_BYTES";
-const SESSION_CACHE_MAX_ENTRIES = 64;
+export const SESSION_CACHE_MAX_ENTRIES = 64;
 
 /** Per-line cap: one JSONL row larger than this is skipped (counted as torn). */
 export function resolveSessionMaxLineBytes(env: NodeJS.ProcessEnv = process.env): number {
@@ -446,6 +446,11 @@ const sessionParseCache = new Map<string, SessionParseState>();
 /** Test hook: drop all incremental parse state. */
 export function clearSessionParseCache(): void {
 	sessionParseCache.clear();
+}
+
+/** Test hook: number of cached paths, so the LRU cap is asserted not assumed. */
+export function sessionParseCacheSize(): number {
+	return sessionParseCache.size;
 }
 
 function applyLine(parsed: ParsedSession, raw: string, clock: GenerationClock): void {
@@ -614,6 +619,45 @@ export function readSessionJsonlDelta(
 	}
 }
 
+/**
+ * Snapshot the cache object for one caller (#237 P7).
+ *
+ * `state.parsed` is mutated IN PLACE across polls: `accumulateUsage` adds into
+ * the existing `usage` object, `currentTurn` pushes turns, `applyAssistant`
+ * pushes into a turn's `assistants` and writes `turn.endedAt`, and
+ * `applyToolResult` bumps `turn.toolResults`/`toolErrors`. The caller must never
+ * receive those objects, because the provisional tail below is parsed into the
+ * returned value: sharing a turn would push the provisional assistant into the
+ * CACHED turn, and the next poll's real commit would count it a second time
+ * (a silent, permanent over-count in `turns`/`assistants`).
+ *
+ * The depth here is the minimum that makes every write point above land on a
+ * fresh object — not "as deep as structuredClone":
+ *   - `usage`  — mutated in place, so it needs its own object.
+ *   - `turns`  — grown with `push`, so it needs its own array.
+ *   - each turn — `endedAt`/`toolResults`/`toolErrors` are written back, so the
+ *     turn objects themselves must be fresh.
+ *   - each turn's `assistants` — grown with `push`, so it needs its own array.
+ *   - each assistant and its `tools` — nothing in production writes these
+ *     today (they are built once as a literal), but copying them costs ~0.01ms
+ *     on a 5MB session and leaves no aliased array in the returned view at all.
+ * Anything deeper is pure waste; `structuredClone` here was 88-96% of the warm
+ * parse (P7).
+ */
+function projectForCaller(parsed: ParsedSession): ParsedSession {
+	return {
+		...parsed,
+		usage: { ...parsed.usage },
+		turns: parsed.turns.map((turn): TurnRecord => ({
+			...turn,
+			assistants: turn.assistants.map((assistant): TurnRecord["assistants"][number] => ({
+				...assistant,
+				tools: assistant.tools.slice(),
+			})),
+		})),
+	};
+}
+
 function finalizeParsed(parsed: ParsedSession): ParsedSession {
 	const last = parsed.turns.at(-1);
 	parsed.lastTurnMissing = Boolean(last && last.assistants.length === 0);
@@ -657,7 +701,7 @@ export function parseSessionFile(path: string): ParsedSession {
 			const oldest = sessionParseCache.keys().next().value;
 			if (oldest !== undefined) sessionParseCache.delete(oldest);
 		}
-		const result = structuredClone(state.parsed);
+		const result = projectForCaller(state.parsed);
 		if (state.offset < stat.size && stat.size - state.offset <= maxLineBytes) {
 			const tail = Buffer.allocUnsafe(stat.size - state.offset);
 			const n = fs.readSync(fd, tail, 0, tail.length, state.offset);

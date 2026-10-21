@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearSessionParseCache, parseSessionFile, parseSessionText, readSessionJsonlDelta } from "../../src/shared/session.ts";
+import { clearSessionParseCache, countAssistantMessages, deriveOutcome, parseSessionFile, parseSessionText, readSessionJsonlDelta, SESSION_CACHE_MAX_ENTRIES, sessionParseCacheSize } from "../../src/shared/session.ts";
 
 const user = (t: string) => JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: t }] } });
 const asst = (t: string) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: t }], stopReason: "stop", usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } });
@@ -57,6 +57,132 @@ test("callers cannot corrupt the cache by mutating the result", () => {
 	const r = parseSessionFile(f);
 	r.turns.length = 0;
 	assert.equal(parseSessionFile(f).turns.length, 1);
+});
+
+/*
+ * The five hazard scenarios below are the ones that make a *shallow* copy
+ * unsafe (#237 P7). `turns.slice()` alone satisfies the test above and still
+ * corrupts the cache, so each mutation point in the parse fold gets its own
+ * assertion here.
+ */
+
+test("callers cannot corrupt the cache through the returned usage object", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	fs.writeFileSync(f, `${user("a")}\n${asst("one")}\n`);
+	const r = parseSessionFile(f);
+	const cached = { ...r.usage };
+	r.usage.input = 9999;
+	r.usage.cost = 9999;
+	const next = parseSessionFile(f);
+	assert.equal(next.usage.input, cached.input);
+	assert.equal(next.usage.cost, cached.cost);
+	assert.notEqual(next.usage, r.usage, "the returned usage must be its own object");
+});
+
+test("callers cannot retro-mutate a cached turn", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	fs.writeFileSync(f, `${user("a")}\n${asst("one")}\n${user("b")}\n${asst("two")}\n`);
+	const r = parseSessionFile(f);
+	const turn = r.turns[0];
+	assert.ok(turn);
+	const before = { endedAt: turn.endedAt, toolResults: turn.toolResults, toolErrors: turn.toolErrors };
+	turn.endedAt = 0;
+	turn.toolResults = 99;
+	turn.toolErrors = 99;
+	const next = parseSessionFile(f);
+	assert.deepEqual(
+		{ endedAt: next.turns[0]?.endedAt, toolResults: next.turns[0]?.toolResults, toolErrors: next.turns[0]?.toolErrors },
+		before,
+	);
+	assert.notEqual(next.turns[0], turn, "turns must be fresh objects, not shared");
+});
+
+test("callers cannot grow a cached turn's assistants array", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	fs.writeFileSync(f, `${user("a")}\n${asst("one")}\n`);
+	const r = parseSessionFile(f);
+	const assistants = r.turns[0]?.assistants;
+	assert.ok(assistants);
+	const length = assistants.length;
+	assistants.push({ stopReason: "stop", errorMessage: null, text: "injected", tools: [] });
+	const next = parseSessionFile(f);
+	assert.equal(next.turns[0]?.assistants.length, length);
+	assert.equal(countAssistantMessages(next), length);
+	assert.notEqual(next.turns[0]?.assistants, assistants, "assistants must be its own array");
+});
+
+/*
+ * The provisional-tail guard — the assertion that actually decides the copy
+ * depth. The last assistant line is written WITHOUT a trailing newline, so the
+ * first parse applies it provisionally via `applyLine(result, ...)`. That
+ * provisional parse walks `currentTurn(result)` → `result.turns.at(-1)`.
+ *
+ * If the returned turn is the cached turn, the provisional assistant is pushed
+ * into the CACHE; when the newline lands and the line is committed for real,
+ * `applyAssistant` pushes it again → 2, then 3. A `turns.slice()`-only
+ * projection fails here while passing every other test in this file.
+ */
+test("a provisional tail line is not committed into the cache twice", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	const body = `${user("a")}\n${asst("one")}\n${user("b")}\n${asst("two")}`;
+	fs.writeFileSync(f, body); // no trailing newline: line is provisional
+
+	const first = parseSessionFile(f);
+	assert.equal(countAssistantMessages(first), 2, "provisional parse sees both assistants");
+	assert.deepEqual(first.turns.map((t) => t.assistants.length), [1, 1]);
+
+	fs.appendFileSync(f, "\n"); // the write completes; now it is committed
+	const second = parseSessionFile(f);
+	assert.equal(countAssistantMessages(second), 2, "the committed line must not be counted again");
+	assert.deepEqual(second.turns.map((t) => t.assistants.length), [1, 1]);
+	assert.equal(second.lastTurnOutput, "two");
+
+	// Same again for a single-turn session whose provisional line lands in the
+	// turn the cache already holds — the tightest form of the hazard.
+	const g = tmp();
+	clearSessionParseCache();
+	fs.writeFileSync(g, `${user("c")}\n${asst("three")}\n${asst("four")}`);
+	assert.equal(countAssistantMessages(parseSessionFile(g)), 2);
+	fs.appendFileSync(g, "\n");
+	const single = parseSessionFile(g);
+	assert.equal(countAssistantMessages(single), 2);
+	assert.deepEqual(single.turns.map((t) => t.assistants.length), [2]);
+});
+
+test("deriveOutcome usage does not drift when the session grows", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	fs.writeFileSync(f, `${user("a")}\n${asst("one")}\n`);
+	const before = deriveOutcome(parseSessionFile(f)).usage;
+	assert.ok(before);
+	const snapshot = { ...before };
+
+	// `deriveOutcome` hands `parsed.usage` straight to the caller, so a shared
+	// usage object would let the cache keep accumulating into a held snapshot.
+	fs.appendFileSync(f, `${user("b")}\n${asst("two")}\n`);
+	const after = parseSessionFile(f);
+	assert.deepEqual({ ...before }, snapshot, "a held usage snapshot must not move");
+	assert.ok(after.usage.input > snapshot.input, "the growing parse still accumulates");
+	assert.deepEqual({ ...deriveOutcome(after).usage }, { ...after.usage });
+});
+
+test("the parse cache is bounded by SESSION_CACHE_MAX_ENTRIES", () => {
+	clearSessionParseCache();
+	assert.equal(sessionParseCacheSize(), 0);
+	const files = Array.from({ length: SESSION_CACHE_MAX_ENTRIES + 3 }, () => tmp());
+	for (const file of files) {
+		fs.writeFileSync(file, `${user("a")}\n${asst("one")}\n`);
+		parseSessionFile(file);
+	}
+	assert.equal(sessionParseCacheSize(), SESSION_CACHE_MAX_ENTRIES);
+	// The first three were evicted (LRU), so they re-parse from byte 0 and still
+	// produce the same view.
+	assert.equal(countAssistantMessages(parseSessionFile(files[0] as string)), 1);
+	clearSessionParseCache();
 });
 
 test("oversized single line is skipped as torn without materialising it", () => {
