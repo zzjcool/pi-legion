@@ -18,6 +18,7 @@ interface ToolResult {
 
 interface RegisteredTool {
 	name: string;
+	parameters: unknown;
 	execute: (...args: unknown[]) => Promise<ToolResult>;
 }
 
@@ -412,6 +413,60 @@ test("non-utility child allowlists include vexillatio without widening subagent 
 		assert.equal(spawn.args[toolsIndex + 1], "read,grep,find,ls,vexillatio");
 		assert.equal(spawn.args[toolsIndex + 1]?.includes("subagent"), false);
 		assert.equal(spawn.input.env?.PI_SUBAGENT_UTILITY_CHILD, undefined);
+	});
+});
+
+test("vexillatio schema accepts tasks[] without a top-level task", async () => {
+	// `tool.execute` in this suite bypasses pi's argument validation, so the
+	// registered schema must be checked directly: a required `task` rejected
+	// every `{ tasks: [...] }` call before `execute` ran (pi reports
+	// `task: must have required properties task`), which is exactly how models
+	// copy the `subagent({ tasks })` shape.
+	const { Value } = await import("typebox/value");
+	await withSandbox({}, async ({ pi }) => {
+		const tool = pi.tools.get("vexillatio");
+		assert.ok(tool, "vexillatio tool must be registered");
+		const schema = tool.parameters as Parameters<typeof Value.Check>[0];
+		assert.deepEqual(Value.Errors(schema, { tasks: [{ agent: "scout", task: "Inspect area A." }] }), []);
+		assert.deepEqual(Value.Errors(schema, { task: "Inspect area A." }), []);
+		assert.deepEqual(
+			Value.Errors(schema, {
+				task: "Both shapes.",
+				tasks: [{ agent: "scout", task: "Inspect area A." }],
+			}),
+			[],
+		);
+		assert.equal(
+			Value.Check(schema, {}),
+			true,
+			"an empty request passes the schema and is refused by the planner instead (next test)",
+		);
+	});
+});
+
+test("vexillatio launches tasks[]-only requests and labels the parent run", async () => {
+	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
+		const result = await invoke(pi, "vexillatio", {
+			tasks: [
+				{ agent: "scout", task: "Inspect area A." },
+				{ agent: "scout", task: "Inspect area B." },
+			],
+			cwd,
+			timeoutMs: 10_000,
+		}, context(cwd));
+		const output = result.content.map((part) => part.text ?? "").join("\n");
+		assert.match(output, /scout-0/);
+		assert.match(output, /scout-1/);
+		assert.equal(supervisor.spawns.length, 2);
+	});
+});
+
+test("vexillatio refuses a request with neither task nor tasks[]", async () => {
+	await withSandbox({}, async ({ pi, supervisor, cwd }) => {
+		const result = await invoke(pi, "vexillatio", { timeoutMs: 10_000 }, context(cwd));
+		assert.equal((result.details as { error?: string } | undefined)?.error, ErrorCodes.INVALID_PARAMS);
+		assert.match(result.content[0]?.text ?? "", /Provide one of/);
+		assert.equal(supervisor.spawns.length, 0);
 	});
 });
 

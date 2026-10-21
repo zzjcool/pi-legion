@@ -41,7 +41,8 @@ utility: true        # 布尔；缺省 false。utility 与 allowNestedSubagents 
 
 ```ts
 const VexillatioParams = Type.Object({
-    task: Type.String({ description: "Recon task; one clear question list" }),
+    // REV-17.10: Optional —— `tasks[]` 是完整请求（与 `subagent({ tasks })` 同形）。
+    task: Type.Optional(Type.String({ description: "Recon task; one clear question list" })),
     agent: Type.Optional(Type.String({ description: "Utility agent name (default: scout)" })),
     tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel recon launches" })),
     cwd: Type.Optional(Type.String()),
@@ -161,3 +162,4 @@ const VexillatioParams = Type.Object({
 | 2026-10-12 | REV-17.7 | 新增 §2.7 工具白名单注入规则（`pushToolArgs` 对非 utility 角色追加 vexillatio）；§3 新增 `src/runs/args.ts` 所有权 + 两个 `read,bash` 断言授权（orchestrator.test:99 / supervisor.test:265）。分支已合入 master 最新（PR #22） | worker-6 完成全部实现后指出：受限角色（显式 tools: 白名单）调不到未列名的 vexillatio，需在 args 层追加且两个既有断言未授权——拒绝正确；从原会话恢复继续，勿重写已完成的 90% |
 | 2026-10-13 | REV-17.8 | 三路 review 门禁退回后的修复授权：M1=非 legion 派发者子记录持久化（persistChild 改 findChild 守卫式 addChild+updateChild，补集成测试）；M3=package.json 四脚本加 `-u PI_SUBAGENT_UTILITY_CHILD`；测试缺口补：跨通道同名续接（subagent 先派 scout-0 后 vexillatio 应派 scout-1）与超时行为（不 autoSettle 场景）；契约自身修正：§2.2 步骤 4 措辞（child 走 addChild 惯例/root 走 createRootLegion）、rpc-supervisor/types.ts 追认、§3 新增 package.json。四个 minor 采纳：abort signal 贯通、strip 列表常量化、verify 字段报错、child-mode 越授权改动追认；其余 minor（F5 重构收敛等）记档不阻塞 | 四路 reviewer 独立印证 3 major（M1 探针实证 children:[]、M2 部署惰性、M3 32 假失败实测）；采纳 worker-0/2/3 交叉发现 |
 | 2026-10-19 | REV-17.9 | §2.2 步骤 3 补中断返回语义：父轮结束时返回已收集结果 + `details.interrupted`，冻结头行保持逐字（#227 D4） | issue #227 缺陷 2（中断丢弃已收集结果，`index.ts:2416` / `:743-745` 两层丢弃）；`docs/contracts/vexillatio-nonblocking-launch-v1.md` 冻结 |
+| 2026-10-21 | REV-17.10 | §2.2 参数形状修订：`task` 改为可选，`tasks[]` 成为完整请求（两者同传时 `tasks[]` 生效、`task` 仅作父 run 标签），空请求由 `buildUtilityPlan` 拒绝。请求形状与 `subagent` 对齐并写进 playbook | 实测复现：模型照 `subagent({ tasks })` 形状调 vexillatio，pi 的 typebox 校验在 `execute` 之前就拒绝（`task: must have required properties task`），会话里 5 次调用中 2 次因此重试；集成测试直连 `tool.execute` 绕过 schema 校验，故补 schema 级断言 |

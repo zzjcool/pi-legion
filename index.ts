@@ -234,7 +234,17 @@ const SubagentParams = Type.Object({
 type SubagentParams = Static<typeof SubagentParams>;
 
 const VexillatioParams = Type.Object({
-	task: Type.String({ description: "Recon task: one clear question list" }),
+	// Optional on purpose: `tasks[]` is a complete request on its own, exactly like
+	// `subagent({ tasks })`. Leaving this required made pi's own argument check
+	// reject `{ tasks: [...] }` before `execute` ran, so every `tasks[]`-only call
+	// failed with `task: must have required properties task` and had to be retried
+	// with a dummy `task` label (models copy the `subagent` shape).
+	task: Type.Optional(
+		Type.String({
+			description:
+				"Recon task: one clear question list. Optional when `tasks[]` is provided (then it only labels the parent run).",
+		}),
+	),
 	agent: Type.Optional(Type.String({ description: "Utility agent name (default: scout)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel recon launches" })),
 	cwd: Type.Optional(Type.String()),
@@ -2156,10 +2166,16 @@ type UtilityPlan =
 	| { ok: false; message: string };
 
 function buildUtilityPlan(params: VexillatioParams): UtilityPlan {
-	if (!params.task.trim()) return { ok: false, message: "`task` must not be blank." };
-	const steps: UtilityTaskItem[] = params.tasks?.length
-		? params.tasks
-		: [{ agent: params.agent?.trim() || "scout", task: params.task }];
+	const singleTask = params.task ?? "";
+	const parallel = params.tasks?.length ? params.tasks : undefined;
+	// `tasks[]` wins and `task` degrades to a parent-run label, so both shapes
+	// accepted by the schema reach a launch: `{ task }`, `{ tasks }`, `{ task, tasks }`.
+	if (!parallel && !singleTask.trim()) {
+		return { ok: false, message: "Provide one of: `task` (single recon) or `tasks[]` (parallel recon)." };
+	}
+	const steps: UtilityTaskItem[] = parallel
+		? parallel
+		: [{ agent: params.agent?.trim() || "scout", task: singleTask }];
 	const unsupportedVerify = steps.findIndex((item) => item.verify !== undefined);
 	if (unsupportedVerify >= 0) {
 		return {

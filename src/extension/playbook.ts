@@ -15,7 +15,7 @@ export const PARENT_PLAYBOOK = [
 	"5. A collect timeout with a live child is a progress signal, not a verdict. Check status or session JSONL before deciding to steer or resume.",
 	"6. Isolation belongs to centurion. For N parallel isolated writers, dispatch N centurions (each owns one worktree); members stay `worktree: false` in-process. Passing `worktree: true` on a non-centurion warns once and is forced false.",
 	"7. Launch with `verify: [\"npm run typecheck\", \"npm test\"]` when the project has a mechanical verifier. The extension runs those commands itself in the child worktree at collect time; the child does not need to paste test output.",
-	"Utility agents (`utility: true`, e.g. scout) can be dispatched by ANY role via the separate `vexillatio` tool — read-only helpers, always leaf, no depth budget. The `subagent` tool stays for the command chain (worker/centurion).",
+	"Utility agents (`utility: true`, e.g. scout) can be dispatched by ANY role via the separate `vexillatio` tool — read-only helpers, always leaf, no depth budget. Its request shape matches `subagent`: either `vexillatio({ task, agent? })` or `vexillatio({ tasks: [{ agent, task }, …] })` (no top-level `task` needed; passing both only labels the parent run). The `subagent` tool stays for the command chain (worker/centurion).",
 	"Forbidden: direct bash access to legion.db, or launching child Pi processes by hand (use the subagent tool).",
 ].join("\n");
 
