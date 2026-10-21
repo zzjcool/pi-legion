@@ -52,6 +52,7 @@ const EXPECTED_INDEXES = [
 	{ table: "events", name: "idx_events_node" },
 	{ table: "events", name: "idx_events_type_ts" },
 	{ table: "messages", name: "idx_messages_inbox" },
+	{ table: "messages", name: "idx_messages_rate" },
 ] as const;
 
 const EXPECTED_EVENTS = [

@@ -25,6 +25,7 @@ const INDEX_COLUMNS = {
 	idx_events_node: ["node_id", "id"],
 	idx_events_type_ts: ["type", "ts"],
 	idx_messages_inbox: ["to_node", "delivered", "id"],
+	idx_messages_rate: ["from_node", "created_at"],
 } as const;
 
 test("legion db v1 schema snapshot matches contract columns and indexes", () => {
