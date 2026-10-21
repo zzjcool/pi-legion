@@ -7,7 +7,7 @@ import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } 
 import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
-import { buildLog, chartWindow, computeStats, drawStatus, frame, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes } from "../../src/tui/viz/panels.ts";
+import { buildLog, chartWindow, computeStats, drawLog, drawStatus, frame, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
 import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, MIN_SELECTION_BADGE_W, renderLegionView } from "../../src/tui/viz/view.ts";
 import { Canvas, cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, formatActivityAgo, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
@@ -1968,5 +1968,206 @@ test("layout D1: status band never starves the log it sits under", () => {
 		assert.ok(l.status.h >= 5, `${w}x${h} status band ${l.status.h} below its floor`);
 		assert.ok(l.log.h >= STATUS_LOG_RESERVE, `${w}x${h} log ${l.log.h} starved by status`);
 		assert.equal(l.status.y, l.log.y + l.log.h, `${w}x${h} status directly under the log`);
+	}
+});
+
+// ------------------------------------------------- log pane border discipline (#251)
+//
+// `Canvas.set`/`text` clamp to the *canvas*, and the log pane is flush against the
+// screen's right edge, so an overlong write lands on the pane's border but never
+// past the canvas. `visibleWidth(line) === w` therefore cannot see this bug — that
+// is why these tests index the *cells inside the rect* instead.
+
+/** Log events shaped like a real run: spawn+settled pairs, both cursor states irrelevant here. */
+function logEvents(count = 12): LogEvent[] {
+	const events: LogEvent[] = [];
+	for (let i = 0; i < count; i++) {
+		const agent = node(`worker-${i}`, {
+			startedAt: T0 + i * 1000,
+			...(i % 2 ? { status: "settled" as const, endedAt: T0 + i * 1000 + 500 } : {}),
+			tokens: 1234 * (i + 1),
+		});
+		events.push({ ts: agent.startedAt, kind: "spawn", node: agent, parentName: "centurion-0" });
+		if (agent.endedAt !== undefined) events.push({ ts: agent.endedAt, kind: "settled", node: agent });
+	}
+	return events.sort((a, b) => b.ts - a.ts || (a.kind === "spawn" ? 1 : -1));
+}
+
+test("#251: drawLog never writes on the pane's right border at inner widths 8..20", () => {
+	const events = logEvents();
+	for (let innerW = 8; innerW <= 20; innerW++) {
+		// outer = inner + 2 border cells, plus 4 spare columns so a write that escaped
+		// the rect would still land on the canvas and be visible to the assertions.
+		const outer = { x: 1, y: 1, w: innerW + 2, h: 10 };
+		const cv = new Canvas(outer.w + 6, 12);
+		const inner = { x: outer.x + 1, y: outer.y + 1, w: innerW, h: outer.h - 2 };
+		// Paint the frame() border first, exactly as `renderLegionView` does.
+		const borderCol = inner.x + inner.w;
+		for (let y = outer.y; y < outer.y + outer.h; y++) {
+			cv.set(inner.x - 1, y, "│", "borderMuted");
+			cv.set(borderCol, y, "│", "borderMuted");
+		}
+		drawLog(cv, inner, events, { offset: 0, cursor: 0, focused: true, origin: T0 });
+		const plain = cv.toPlain();
+
+		for (let y = inner.y; y < inner.y + inner.h; y++) {
+			const row = plain[y]!;
+			assert.equal(
+				Array.from(row)[borderCol],
+				"│",
+				`inner w=${innerW} y=${y}: log wrote over the right border (col ${borderCol}) |${row}|`,
+			);
+			// Nothing may land past the rect at all (belt and braces: the frame column
+			// is the last legal cell of this pane).
+			for (let x = borderCol + 1; x < outer.w + 6; x++) {
+				assert.equal(
+					Array.from(row)[x],
+					" ",
+					`inner w=${innerW} y=${y}: log wrote past the rect at col ${x} |${row}|`,
+				);
+			}
+		}
+		// ...and the pane still says something: the header and the glyph survive.
+		assert.ok(plain.join("\n").includes(`${events.length} even`), `inner w=${innerW} lost its header`);
+	}
+});
+
+test("#251: drawLog degrades to glyph-only instead of spilling a truncated name", () => {
+	// A short history (no scrollbar) so the per-row assertions below are not read
+	// through the scrollbar column — the scrollbar/glyph collision is pre-existing (D5).
+	const events = logEvents(3);
+	const cv = new Canvas(16, 10);
+	// w=8 is the guard floor: timeW 7 + glyph leaves name/detail 0 cells.
+	for (const innerW of [8, 9, 10]) {
+		const inner = { x: 1, y: 1, w: innerW, h: 8 };
+		const borderCol = inner.x + inner.w;
+		cv.cells.forEach((row) => row.forEach((cell) => Object.assign(cell, { ch: " ", color: undefined, bold: false, inverse: false })));
+		for (let y = inner.y; y < inner.y + inner.h; y++) cv.set(borderCol, y, "│", "borderMuted");
+		drawLog(cv, inner, events, { offset: 0, cursor: 0, focused: false, origin: T0 });
+		const plain = cv.toPlain();
+		for (let y = inner.y + 1; y < inner.y + inner.h; y++) {
+			const row = Array.from(plain[y]!);
+			const body = row.slice(inner.x, borderCol).join("");
+			// Nothing of the name/detail may survive at these widths, inside the rect
+			// or past it (the canvas is wide enough that a spill would be visible).
+			const wide = row.join("");
+			// Pre-fix this row carried `worke…` (the `Math.max(6, …)` floor ignored the
+			// available room), so match the name *prefix*, not the whole name.
+			assert.doesNotMatch(wide, /work/, `inner w=${innerW} y=${y} leaked a name: ${wide}`);
+			assert.doesNotMatch(wide, /centurion|settled|→/, `inner w=${innerW} y=${y} leaked a detail: ${wide}`);
+			// ...but a row that had an event is still the time column + kind glyph.
+			if (y <= inner.y + Math.min(events.length, inner.h - 1)) {
+				assert.match(body, /[+✓✗○]/, `inner w=${innerW} y=${y} dropped its glyph: ${body}`);
+				assert.match(body, /\d+s/, `inner w=${innerW} y=${y} dropped its time column: ${body}`);
+			}
+		}
+	}
+});
+
+test("#251: the log pane's right border survives at the 11-16 column breakpoint", () => {
+	const { nodes, sampler, now } = scenario();
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	// 11..16 (portrait) are the widths recon measured as overflowing: computeLayout
+	// gives log = {x: 0, w: W}, frame() hands drawLog inner w = W-2 = 9..14.
+	for (const [w, h] of [[11, 40], [12, 40], [13, 40], [14, 40], [15, 40], [16, 40]] as const) {
+		const { canvas } = renderLegionView(data, initialViewState(), w, h);
+		const plain = canvas.toPlain();
+		const log = computeLayout(w, h).log;
+		assert.ok(log.h >= 3, `${w}x${h}: log pane ${log.h} rows — breakpoint drifted, revisit this test`);
+		const borderCol = log.x + log.w - 1;
+		// The left/right rules plus the top/bottom rules are the border row set; the
+		// frame() side columns must still be the vertical rule on every body row.
+		for (let y = log.y + 1; y < log.y + log.h - 1; y++) {
+			const cell = Array.from(plain[y]!)[borderCol];
+			assert.ok(
+				cell === "│" || cell === "┃",
+				`${w}x${h} y=${y}: log content overwrote the right border (got ${JSON.stringify(cell)}): |${plain[y]}|`,
+			);
+		}
+	}
+});
+
+test("#251: a selected + focused log row keeps the ◂/scrollbar column outside the text budget", () => {
+	const { nodes } = scenario();
+	const events = buildLog(nodes);
+	// Short list → no scrollbar, so the ◂ at r.x + r.w - 1 is observable. With a
+	// scrollbar present the pre-existing D5 collision hides it; that is not this bug.
+	const short = events.slice(0, 3);
+	const target = short[1]!.node.id;
+	for (let innerW = 8; innerW <= 20; innerW++) {
+		const cv = new Canvas(innerW + 8, 12);
+		const inner = { x: 1, y: 1, w: innerW, h: 10 };
+		const borderCol = inner.x + inner.w;
+		for (let y = inner.y; y < inner.y + inner.h; y++) cv.set(borderCol, y, "│", "borderMuted");
+		// cursor 1 + highlight on the same row: the ◂ at r.x + r.w - 1 is the last legal cell.
+		drawLog(cv, inner, short, { offset: 0, cursor: 1, focused: true, selectedId: target, origin: T0 });
+		const plain = cv.toPlain();
+		// offset 0 + cursor 1 → the highlighted row is the second body row, not the first.
+		const row = Array.from(plain[inner.y + 2]!);
+		assert.equal(row[borderCol], "│", `inner w=${innerW}: ◂ ran into the border |${row.join("")}|`);
+		assert.equal(row[borderCol - 1], "◂", `inner w=${innerW}: ◂ belongs at r.x + r.w - 1 |${row.join("")}|`);
+	}
+});
+
+test("#251: the maxX guard is load-bearing — it clips the clock, not one cell early", () => {
+	// This test exists to fail if `drawLog`'s `maxX` writes are removed or get the wrong
+	// value. Commit 1's `nameW` bound alone already stops the *name* from breaching, so a
+	// border sweep cannot see the guard; these two probes can.
+	//
+	// (1) Removal probe. The time column is the one write with no budget of its own:
+	// `padStart(timeW - 1)` pads short clocks and is a no-op for long ones, so a clock
+	// wider than its column is clipped by `maxX` alone. At inner w=8 a 9-cell clock
+	// ("10000h00m") must stop at the last inner cell; without `maxX` its final "m" lands
+	// on the border at r.x + r.w.
+	const origin = T0 - 10_000 * 3_600_000; // → "10000h00m", 9 cells
+	const spawn: LogEvent[] = [{ ts: T0, kind: "spawn", node: node("worker-0"), parentName: "centurion-0" }];
+	for (const [innerW, why] of [[8, "runs onto the border without maxX"]] as const) {
+		const r = { x: 1, y: 1, w: innerW, h: 4 };
+		const border = r.x + r.w;
+		const cv = new Canvas(innerW + 12, 6);
+		for (let y = r.y; y < r.y + r.h; y++) cv.set(border, y, "│", "borderMuted");
+		drawLog(cv, r, spawn, { offset: 0, cursor: 0, focused: false, origin });
+		const row = Array.from(cv.toPlain()[r.y + 1]!);
+		assert.equal(row[border], "│", `inner w=${innerW}: the clock ${why} |${cv.toPlain()[r.y + 1]}|`);
+	}
+
+	// (1b) Clipping happens at the *last legal cell*, not earlier: at inner w=9 the same
+	// 9-cell clock fills the rect exactly, so its final "m" must be the last inner cell.
+	// The off-by-one `maxX: r.x + r.w - 1` (exclusive!) blanks it.
+	{
+		const r = { x: 1, y: 1, w: 9, h: 4 };
+		const border = r.x + r.w;
+		const cv = new Canvas(21, 6);
+		for (let y = r.y; y < r.y + r.h; y++) cv.set(border, y, "│", "borderMuted");
+		drawLog(cv, r, spawn, { offset: 0, cursor: 0, focused: false, origin });
+		const row = Array.from(cv.toPlain()[r.y + 1]!);
+		assert.equal(row[border], "│", `inner w=9: the clock ran onto the border`);
+		assert.equal(row[border - 1], "m", `inner w=9: the clock was clipped a cell early |${cv.toPlain()[r.y + 1]}|`);
+	}
+
+	// (2) Off-by-one probe on the common wide path. The header is ellipsized to exactly
+	// `r.w` cells, so a header that saturates its budget writes every column up to and
+	// including r.x + r.w - 1. `maxX: r.x + r.w` keeps that last cell; the exclusive
+	// `r.x + r.w - 1` drops it — the wide-terminal regression this pins.
+	for (const innerW of [30, 40, 60]) {
+		// "2 events · highlight: " is 21 cells, so this name makes the raw header exactly
+		// `innerW` cells — the most `ellipsize(_, r.w)` can return.
+		const selected = node("z".repeat(innerW - 21));
+		const events: LogEvent[] = [
+			{ ts: T0, kind: "spawn", node: node("worker-0"), parentName: "centurion-0" },
+			{ ts: T0, kind: "spawn", node: selected, parentName: "centurion-0" },
+		];
+		const cv = new Canvas(innerW + 12, 6);
+		const r = { x: 1, y: 1, w: innerW, h: 4 };
+		const border = r.x + r.w;
+		for (let y = r.y; y < r.y + r.h; y++) cv.set(border, y, "│", "borderMuted");
+		drawLog(cv, r, events, { offset: 0, cursor: 0, focused: false, selectedId: selected.id, origin: T0 });
+		const row = Array.from(cv.toPlain()[r.y]!);
+		assert.equal(row[border], "│", `inner w=${innerW}: header reached the border`);
+		assert.equal(
+			row[border - 1],
+			"…",
+			`inner w=${innerW}: header's last cell was clipped a cell early (maxX must be the exclusive bound r.x + r.w) |${cv.toPlain()[r.y]}|`,
+		);
 	}
 });
