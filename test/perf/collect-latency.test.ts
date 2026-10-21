@@ -19,7 +19,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
-import { DEFAULTS, type AgentConfig } from "../../src/shared/types.ts";
+import type { AgentConfig } from "../../src/shared/types.ts";
 import { parseSessionFile } from "../../src/shared/session.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
@@ -92,10 +92,18 @@ test("collect() no longer waits for a quiet window after the turn settled (#232)
 
 		// Regression guard for #232: the old implementation slept the full
 		// settleQuietMs window (2500ms) here even though `waitSettled` had already
-		// reported the turn complete. Nothing in collect() may consume that window.
-		assert.ok(
-			spent < DEFAULTS.settleQuietMs,
-			`collect() slept ${spent}ms; the ${DEFAULTS.settleQuietMs}ms settle-quiet wait came back (#232)`,
+		// reported the turn complete. The guard is deliberately far below that (and
+		// below the 50ms growth-sampling step #232 ② introduced), so any wait
+		// reintroduced on the settled path trips it — a `< settleQuietMs` bound
+		// would still pass with 2.4s of new sleep.
+		//
+		// NOTE: test:perf is not part of the CI job, so this case does not gate
+		// merges. The CI-enforced twin lives in test/unit/collect-polling.test.ts
+		// ("the settled fast path does no polling at all").
+		assert.equal(
+			spent,
+			0,
+			`collect() burned ${spent}ms of sleeps on an already-settled turn; the settled path must not sleep at all (#232)`,
 		);
 	} finally {
 		h.cleanup();

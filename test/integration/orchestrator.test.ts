@@ -116,11 +116,10 @@ test("RPC launch builds the Pi argv, records lineage/budgets, and stores a real 
 test("U7: a growing session artifact extends the RPC collect deadline", async () => {
 	// #232 removed collect()'s settle-quiet wait, which used to inflate the total
 	// virtual time and made a `spent > timeoutMs` assertion pass for the wrong
-	// reason. This fixture now isolates the behaviour U7 is actually about:
-	// with an artifact that keeps growing and a child that never settles, collect
-	// must extend its deadline and wait again instead of giving up at the first
-	// timeout. Measured contrast: growth -> waits=2, spent=2*POLL; no growth ->
-	// waits=1, spent=1*POLL.
+	// reason. #232 ② then turned the growth window from one flat 500ms sleep into
+	// 50ms sampling, so a bare wall-clock assertion would again be measuring poll
+	// rhythm. This pins both: the deadline extension the fixture is about, and the
+	// early return ② added.
 	const runDir = tempDir("rpc-orchestrator-growing-");
 	const supervisor = new FakeSupervisor({ immediateTimeout: true });
 	let clock = 0;
@@ -149,11 +148,29 @@ test("U7: a growing session artifact extends the RPC collect deadline", async ()
 		assert.equal(result.execution.status, "running");
 		// ...but the growth granted a second RPC wait past the first timeout.
 		assert.equal(grewDuringFirstPoll, true);
+		const waits = supervisor.calls.filter((call) => call.method === "waitSettled").map((call) => call.timeoutMs ?? 0);
+		assert.equal(waits.length, 2, "growth grants exactly one more RPC wait; the next window saw no growth");
+		const firstBudget = waits[0] as number;
+		const secondBudget = waits[1] as number;
+		assert.equal(firstBudget, timeoutMs, "the first wait gets the collect budget");
+		// The second budget is the re-armed deadline minus the virtual time already
+		// spent. Before #232 ② the caller had already burned a flat 500ms growth
+		// window, so the extension bought only 500ms of extra budget; returning as
+		// soon as the artifact grew leaves nearly the whole extra timeout.
 		assert.ok(
-			supervisor.calls.filter((call) => call.method === "waitSettled").length >= 2,
-			"growing output grants another RPC wait",
+			secondBudget - firstBudget >= timeoutMs * 0.9,
+			`the extension must add a full timeout to the deadline: first wait ${firstBudget}ms, second ${secondBudget}ms`,
 		);
-		assert.ok(clock - startedAt >= timeoutMs, `growth must extend collection past the first timeout (spent ${clock - startedAt}ms)`);
+		// Total virtual time, bounded rather than pinned: an exact sum is a function
+		// of ARTIFACT_GROWTH_POLL_MS + POLL_INTERVAL_MS, and a legitimate retune of
+		// either constant must not break a test that is not about them. The real
+		// discrimination is the extension-budget assertion above; this bound just
+		// catches a return to the pre-#232 rhythm. Observed after the fix: 550ms;
+		// pre-#232: 1000ms.
+		assert.ok(
+			clock - startedAt <= timeoutMs * 0.9,
+			`the growth window cost ${clock - startedAt}ms of virtual time; #232 ② returns as soon as growth is seen, so it must stay well under the ${timeoutMs}ms timeout`,
+		);
 	} finally {
 		rmSync(runDir, { recursive: true, force: true });
 	}
@@ -553,6 +570,9 @@ test("a live child that recovers past a Connection error collects the real outco
 	const supervisor = new FakeSupervisor({ immediateTimeout: false });
 	let clock = 0;
 	let appended = false;
+	// #232 ②/③ made the blip hold interval-variable and size-guarded, so the
+	// driver keys off the first poll tick after the hold starts ("the child
+	// recovers right after the first sleep") instead of a fixed 500ms cadence.
 	const orchestrator = new Orchestrator({
 		supervisor,
 		runDir,
@@ -570,10 +590,14 @@ test("a live child that recovers past a Connection error collects the real outco
 	try {
 		const handle = await orchestrator.launch({ agent: agent(), task: "recover", worktree: false });
 		supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: "Connection error." });
+		const startedAt = clock;
 		const collected = await orchestrator.collect(handle.name, { timeoutMs: 5_000 });
 		assert.equal(collected.execution.status, "success");
 		assert.equal(supervisor.isAlive(handle.name), true);
 		assert.equal(orchestrator.childrenSnapshot()[0]?.state, "awaiting");
+		// The recovery was seen on the first poll, so the hold did not burn the
+		// deadline: one interval, not the whole 5_000ms window.
+		assert.ok(clock - startedAt <= 500, `recovery must end the blip hold on the first poll (spent ${clock - startedAt}ms)`);
 	} finally {
 		rmSync(runDir, { recursive: true, force: true });
 	}

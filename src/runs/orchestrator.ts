@@ -61,7 +61,6 @@ import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
 import type { LegionSupervisor, SettleResult, SpawnInput } from "../supervisor/types.ts";
 import { isInProcessSpawn, resolveSpawnMode } from "../supervisor/spawn-mode.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
-import { applyThinkingSuffix } from "./args.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
 import {
 	createChildWorktree,
@@ -148,6 +147,10 @@ const MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 const UTILITY_CHILD_ENV = "PI_SUBAGENT_UTILITY_CHILD";
 const CHILD_ENV = "PI_SUBAGENT_CHILD";
 const POLL_INTERVAL_MS = 500;
+/** Ceiling for the geometric backoff in `waitOutTransientConnection`. */
+const TRANSIENT_POLL_CAP_MS = 4_000;
+/** Growth sampling step while waiting out one `POLL_INTERVAL_MS` grace window. */
+const ARTIFACT_GROWTH_POLL_MS = 50;
 
 function parseDepthCeiling(raw: string | undefined): number | undefined {
 	// Genuinely unset / blank → no env ceiling (settings + hard cap still apply).
@@ -1070,22 +1073,63 @@ export class Orchestrator {
 	 *
 	 * Returns once the session moves past that blip, the process exits, a UI
 	 * approval arrives, the parent aborts, or the cumulative deadline passes.
+	 *
+	 * #232: the wait is a poll over an append-only file, so it watches the one
+	 * cheap signal that changes first — the artifact size — and only pays for a
+	 * `parseSessionFile` when that size moved. Unchanged artifacts reuse the
+	 * previous parse. The poll interval also backs off geometrically
+	 * (`POLL_INTERVAL_MS` → `TRANSIENT_POLL_CAP_MS`), so the default 900s deadline
+	 * costs 229 stats (the seed stat plus 228 sleeps, one stat each) and a single
+	 * parse instead of 1800 full parses. The backoff never shortens the wait:
+	 * sleeps are clamped to the remaining budget and every iteration sleeps
+	 * strictly > 0ms, so the loop cannot busy-spin.
+	 *
+	 * Accepted tradeoff, stated plainly because it is a real regression in
+	 * observation latency: **this loop is the only detector for both the blip
+	 * clearing and the child exiting while it holds** (per D2 the orchestrator
+	 * does not subscribe to `onEvent`, and `waitSettled` has already returned
+	 * `timeout` by the time we get here). So during the hold, an exit or a settle
+	 * appended to the session is observed within one capped interval —
+	 * up to `TRANSIENT_POLL_CAP_MS` (4s) — where the pre-#232 flat 500ms cadence
+	 * observed it within 500ms. The same applies to a UI approval raising
+	 * `pendingDialogs`. Nothing is dropped and no return value changes
+	 * (`TRANSIENT_CONNECTION_REASON`, `"done"`); only the latency with which the
+	 * loop notices grows, and it is bounded by the cap rather than by the
+	 * deadline. This is the documented reason the cap is 4s and not larger.
+	 *
+	 * The seed below stats *before* parsing on purpose: an append landing between
+	 * the two calls then makes the next `size !== parsedSize` comparison true
+	 * (over-parse, safe). Parsing first would fold that append into `parsed` while
+	 * `parsedSize` also saw it, so the loop would consider the file unchanged and
+	 * never notice a recovery until the deadline expired.
 	 */
 	private async waitOutTransientConnection(
 		child: ChildRecord,
 		deadline: number,
 		signal?: AbortSignal,
 	): Promise<"aborted" | "blocked" | "done"> {
-		const maxPolls = Math.max(1, Math.ceil(Math.max(0, deadline - this.now()) / POLL_INTERVAL_MS));
-		for (let poll = 0; poll < maxPolls; poll += 1) {
+		let parsedSize = artifactSize(child.sessionFile);
+		let parsed = parseSessionFile(child.sessionFile);
+		let interval = POLL_INTERVAL_MS;
+		for (;;) {
 			if (signal?.aborted) return "aborted";
 			if (this.pendingDialogs(child.name).length) return "blocked";
 			if (!this.supervisor.isAlive(child.name)) return "done";
-			if (!isTransientConnectionFailure(deriveOutcome(parseSessionFile(child.sessionFile)))) return "done";
-			if (this.now() >= deadline) return "done";
-			if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return "aborted";
+			if (!isTransientConnectionFailure(deriveOutcome(parsed))) return "done";
+			const remaining = deadline - this.now();
+			if (remaining <= 0) return "done";
+			const sleptFrom = this.now();
+			if (await this.sleepOrAbort(Math.min(interval, remaining), signal)) return "aborted";
+			// A sleep dep that never advances the clock would make this loop a busy
+			// spin; stop holding instead of hammering the filesystem.
+			if (this.now() <= sleptFrom) return "done";
+			const size = artifactSize(child.sessionFile);
+			if (size !== parsedSize) {
+				parsed = parseSessionFile(child.sessionFile);
+				parsedSize = size;
+			}
+			interval = Math.min(interval * 2, TRANSIENT_POLL_CAP_MS);
 		}
-		return "done";
 	}
 
 	private interruptedCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>): CollectResult {
@@ -1229,11 +1273,24 @@ export class Orchestrator {
 		} catch { return undefined; }
 	}
 
+	/**
+	 * Did the session artifact grow inside one `POLL_INTERVAL_MS` window?
+	 *
+	 * #232: this used to sleep the whole window and stat twice. The window is
+	 * unchanged (a grace extension is still only granted to an artifact that is
+	 * genuinely growing), but it is now sampled at `ARTIFACT_GROWTH_POLL_MS` and
+	 * returns on the first observed growth. The sleeps stay on the injected
+	 * `now`/`sleep` deps, so `test/perf/collect-latency.test.ts` can drive them
+	 * on its virtual clock.
+	 */
 	private async collectArtifactGrowing(child: ChildRecord, signal?: AbortSignal): Promise<boolean> {
 		const before = artifactSize(child.sessionFile);
 		if (before <= 0 || signal?.aborted) return false;
-		if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return false;
-		return artifactSize(child.sessionFile) > before;
+		for (let waited = 0; waited < POLL_INTERVAL_MS; waited += ARTIFACT_GROWTH_POLL_MS) {
+			if (await this.sleepOrAbort(Math.min(ARTIFACT_GROWTH_POLL_MS, POLL_INTERVAL_MS - waited), signal)) return false;
+			if (artifactSize(child.sessionFile) > before) return true;
+		}
+		return false;
 	}
 
 	private async sleepOrAbort(ms: number, signal?: AbortSignal): Promise<boolean> {

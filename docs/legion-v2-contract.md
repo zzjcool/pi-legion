@@ -101,7 +101,9 @@ interface LegionSupervisor {
 | `pane close` 杀进程 | stdin close 优雅退出；超时 SIGTERM；仍超时 SIGKILL；后代进程按进程组清场（REV-16） |
 | `run.json` herdr 字段 | 载体改为 `{supervisor: "rpc", node_id}`，`paneId/tabId` 删除 |
 
-### 3.3 判定链不变：成败仍以 session jsonl 为唯一权威（F26–F33）。collect 复用 `waitForQuiet` + `parseSessionFile` + `deriveOutcome`，收割后顺手写 `node_settled` 事件 + 更新 nodes 行。
+### 3.3 判定链不变：成败仍以 session jsonl 为唯一权威（F26–F33）。collect 复用 `parseSessionFile` + `deriveOutcome`（+ `waitSettled` 的 settle 事件）收割，收割后顺手写 `node_settled` 事件 + 更新 nodes 行。
+
+> 修订（#232）：原文此处写作「collect 复用 `waitForQuiet` + ...」。`waitForQuiet`（2.5s 安静窗口 stat 轮询）已由 #232 / PR #244 删除——`waitSettled` 本身就是事件驱动的，`settled` 之后再对 append-only 文件轮询 size 得不到任何新信息。判定链的输入与权威性未变。
 
 ### 3.4 每节点身份：`ownerToken` 语义改为「树根 session id + node id」；多会话同 repo 隔离靠 node id 命名空间（替代 `parentPaneId` 过滤）。
 
