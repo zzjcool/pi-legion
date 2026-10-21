@@ -179,6 +179,7 @@ CREATE TABLE messages (              -- 邮件（§8）
   created_at   INTEGER NOT NULL
 );
 CREATE INDEX idx_messages_inbox ON messages(to_node, delivered, id);
+CREATE INDEX idx_messages_rate ON messages(from_node, created_at);   -- from_node 维度的限速 COUNT（§8，REV-19）
 ```
 
 ### 4.3 事件类型枚举（闭集，新增需修订契约）
@@ -465,3 +466,4 @@ interface LegionEventBus {
 | 2026-10-12 | REV-16 | §3.2 retire 链加固：SIGTERM 超时后升级 SIGKILL（新 option `killTimeoutMs`，默认 1s），并在 retire 时枚举子 pi 的后代进程（/proc 祖先链），按进程组 SIGTERM→SIGKILL 清场（排除 supervisor 自身进程组与子 pi 自身 pid）。触发：2026-10-12 孤儿 `node --test` 进程泄露事故（两个 PPID=1 进程各烧 4h20m CPU，SIGTERM 无效，人工 SIGKILL 收场）。子契约：`docs/retire-hardening-contract.md`（FROZEN-1） |
 | 2026-10-19 | REV-17 | §9 worktree 收为 centurion 专属（权限变更，按 §15-4 走修订）：① 判定以角色名 `centurion` 为准，centurion 卡一律拿子树 worktree、嵌套 centurion 拿 nested worktree；② 其余角色一律不拿——删除「`acceptance.role: writer` 自动补 `worktree: true`」的隐式默认，`agents/worker.md` 从 `worktree: true` 改为显式 `worktree: false`（`agents/centurion.md` 的 `true` 与 `agents/prototype.md` 的 `false` 不变）；③ 违规一律**降级为 `false` + `console.warn` 一次**，**不抛错**（抛错会阻断 launch）；`subagent({ worktree: true })` 显式传参同样降级。不改 `resolveLaunchWorktree` 的优先级链（不变式 I5），不新增事件类型，不改 `spawnMode` 仲裁逻辑。原因：issue #214（worktree 收为 centurion 专属，与 §9 已冻结的「组员一律 `worktree: false`」对齐；实现向契约收敛，隔离边界继续由「每棵子树」承载） |
 | 2026-10-19 | REV-18 | v4 收紧为仅 kind: pi；AGENT_KINDS 收敛为 ["pi"]；非 pi 值忽略并按 pi 启动。字段不删（值域收窄）；`spawnMode` 的 `rpc`/`inprocess` 不受影响。契约：`docs/contracts/drop-non-pi-kinds-v4.md`（D1，v4.0.0） |
+| 2026-10-21 | REV-19 | §4.2 新增索引 `idx_messages_rate ON messages(from_node, created_at)`（schema 变更，按 §15-4 走修订）。原因：`sendMail` 的限速 COUNT（`src/legion/mail.ts`，`WHERE from_node = ? AND created_at > ?`）在**写事务内**执行且 `messages` 无任何保留策略（`DELETE FROM messages` 仅见于 `rebuild.ts` 且只在 `preserveMessages === false`），实测 50k 行时由 `SCAN messages` 变为覆盖索引 `SEARCH`，成本随运行时长单调劣化。零行为变更：COUNT 结果不变，仅查询计划改变。**不改 `user_version`**（仍为 1），因此**既有 legion.db 不会获得该索引**——`migrate()` 在 `user_version === 1` 时提前返回，`SCHEMA_V1` 只在版本 0 执行；接受此代价，因为 legion.db 契约上是**可重建**的树级索引（§4.4），`legion-rebuild` 重建即得。不新增「打开时补建索引」后门（会让契约漂移）。不引入 `messages` 保留策略（另立产品决策：归属、是否借用 `eventRetentionDays`、bounce 风暴是否单独限流）。触发：issue #237 P9 |
