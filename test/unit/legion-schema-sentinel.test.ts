@@ -151,6 +151,28 @@ test("legion v2 contract §4.2 keeps the frozen four-table schema", () => {
 		[...expectedIndexes].sort(),
 		`Schema sentinel: §4.2 index set changed (missing: ${missingIndexes.join(", ") || "none"}; unexpected: ${unexpectedIndexes.join(", ") || "none"}). If the contract schema is intentionally revised, update this test explicitly.`,
 	);
+
+	// The index SET above compares names only, so the contract could reorder an
+	// index's columns without this sentinel noticing. Column order is load-bearing
+	// for the rate-limit COUNT (see legion-mail-rate-index.test.ts: the reversed
+	// tuple keeps the same plan and covering check but costs ~40x more), so assert
+	// the DDL text of idx_messages_rate names its columns in order.
+	const rateIndexDdl = sql.match(
+		/^\s*CREATE\s+INDEX\s+idx_messages_rate\s+ON\s+messages\s*\(([^)]*)\)/im,
+	);
+	assert.ok(
+		rateIndexDdl,
+		"Schema sentinel: §4.2 is missing `CREATE INDEX idx_messages_rate ON messages(from_node, created_at)`; update this test explicitly when revising the contract.",
+	);
+	const rateIndexColumns = (rateIndexDdl[1] ?? "")
+		.split(",")
+		.map((column) => column.trim())
+		.filter((column) => column.length > 0);
+	assert.deepEqual(
+		rateIndexColumns,
+		["from_node", "created_at"],
+		`Schema sentinel: §4.2 idx_messages_rate column order changed (found: ${JSON.stringify(rateIndexColumns)}); it must stay (from_node, created_at) or the rate-limit COUNT loses its covering seek. If the contract schema is intentionally revised, update this test explicitly.`,
+	);
 });
 
 test("legion v2 contract §4.3 keeps exactly the frozen 14 event names", () => {

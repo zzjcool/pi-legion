@@ -97,6 +97,37 @@ test("mail rate-limit COUNT is served by idx_messages_rate, never a messages sca
 	}
 });
 
+test("idx_messages_rate is (from_node, created_at) in that order — the plan alone cannot tell", () => {
+	// The plan is tuple-order BLIND: with the tuple reversed to
+	// (created_at, from_node) SQLite still reports "SEARCH messages USING COVERING
+	// INDEX idx_messages_rate", only dropping the from_node? term from the detail.
+	// Measured at 50k rows with 5k in-window rows: 5.7us/call correctly ordered vs
+	// 227us/call reversed, because only (from_node, created_at) can seek one
+	// sender and range-scan the window without visiting every in-window row.
+	// So the column order needs its own assertion.
+	const db = openLegionDb(":memory:");
+	try {
+		const columns = db
+			.prepare("PRAGMA index_info(idx_messages_rate)")
+			.all()
+			// index_info returns rows in index order, not seqno-sorted, but sort on
+			// seqno anyway so a driver's row order cannot make this flaky.
+			.sort((left, right) => Number(left.seqno) - Number(right.seqno))
+			.map((row) => String(row.name));
+		assert.deepEqual(
+			columns,
+			["from_node", "created_at"],
+			"idx_messages_rate must be (from_node, created_at): the reversed tuple still satisfies the plan test and the covering check, but costs ~40x more per COUNT",
+		);
+		assert.ok(
+			db.prepare("PRAGMA index_list(messages)").all().some((row) => String(row.name) === "idx_messages_rate" && Number(row.unique) === 0),
+			"idx_messages_rate must exist and must not be UNIQUE (the COUNT filters, it does not need uniqueness)",
+		);
+	} finally {
+		db.close();
+	}
+});
+
 test("mail rate-limit COUNT returns the same rows with and without the index (zero behaviour change)", () => {
 	const db = openLegionDb(":memory:");
 	try {
