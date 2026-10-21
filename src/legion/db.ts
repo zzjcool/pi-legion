@@ -118,6 +118,10 @@ CREATE TABLE messages (
   created_at   INTEGER NOT NULL
 );
 CREATE INDEX idx_messages_inbox ON messages(to_node, delivered, id);
+-- Serves the per-sender rate-limit COUNT that sendMail runs inside its write
+-- transaction (mail.ts): without it that COUNT is a full SCAN of messages, which
+-- degrades monotonically because messages has no retention policy.
+CREATE INDEX idx_messages_rate ON messages(from_node, created_at);
 `;
 
 /**
