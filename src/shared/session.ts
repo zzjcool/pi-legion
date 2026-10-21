@@ -453,6 +453,11 @@ export function sessionParseCacheSize(): number {
 	return sessionParseCache.size;
 }
 
+/** Test hook: whether a path is cached, so eviction order is asserted, not inferred. */
+export function sessionParseCacheHas(path: string): boolean {
+	return sessionParseCache.has(path);
+}
+
 function applyLine(parsed: ParsedSession, raw: string, clock: GenerationClock): void {
 	const line = raw.trim();
 	if (!line) return;
@@ -639,10 +644,12 @@ export function readSessionJsonlDelta(
  *     turn objects themselves must be fresh.
  *   - each turn's `assistants` — grown with `push`, so it needs its own array.
  *   - each assistant and its `tools` — nothing in production writes these
- *     today (they are built once as a literal), but copying them costs ~0.01ms
- *     on a 5MB session and leaves no aliased array in the returned view at all.
- * Anything deeper is pure waste; `structuredClone` here was 88-96% of the warm
- * parse (P7).
+ *     today (they are built once as a literal), but a caller can, and the
+ *     whole point is that no mutation any caller makes reaches the cache. It
+ *     costs ~0.01ms on a 5MB session and removes the last aliased object.
+ * Anything deeper is pure waste. For scale: `structuredClone` at this call site
+ * cost ~2.2x a warm parse that does no copy at all (P7), and the ~1ms/file it
+ * burned is what this function gives back.
  */
 function projectForCaller(parsed: ParsedSession): ParsedSession {
 	return {

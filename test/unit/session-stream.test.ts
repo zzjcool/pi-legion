@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { clearSessionParseCache, countAssistantMessages, deriveOutcome, parseSessionFile, parseSessionText, readSessionJsonlDelta, SESSION_CACHE_MAX_ENTRIES, sessionParseCacheSize } from "../../src/shared/session.ts";
+import { clearSessionParseCache, countAssistantMessages, deriveOutcome, parseSessionFile, parseSessionText, readSessionJsonlDelta, SESSION_CACHE_MAX_ENTRIES, sessionParseCacheHas, sessionParseCacheSize } from "../../src/shared/session.ts";
 
 const user = (t: string) => JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: t }] } });
 const asst = (t: string) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: t }], stopReason: "stop", usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } });
+const asstWithTools = (t: string, tools: string[]) => JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: t }, ...tools.map((name) => ({ type: "toolCall", name }))], stopReason: "toolUse", usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } } } });
 const tool = (err: boolean) => JSON.stringify({ type: "message", message: { role: "toolResult", isError: err, content: [{ type: "text", text: "x" }] } });
 
 function tmp(): string {
@@ -170,6 +171,41 @@ test("deriveOutcome usage does not drift when the session grows", () => {
 	assert.deepEqual({ ...deriveOutcome(after).usage }, { ...after.usage });
 });
 
+/*
+ * The assistant OBJECT layer, not just its array.
+ *
+ * The cheapest version of D1 that passes every other test in this file is
+ * `assistants: t.assistants.slice()` — a fresh array whose elements are still
+ * the cached assistant objects. Nothing in the production fold writes an
+ * assistant after constructing it (they are built once as a literal at
+ * `session.ts:208`), so that variant looks correct and silently reintroduces
+ * the alias: a caller writing `assistants[0].text` poisons the cache, and
+ * `finalizeParsed` then reports the poisoned text as `lastTurnOutput` on the
+ * NEXT parse. Any future "simplification" of the projection must fail here.
+ */
+test("callers cannot mutate a cached assistant object or its tools array", () => {
+	clearSessionParseCache();
+	const f = tmp();
+	const text = `${user("a")}\n${asstWithTools("one", ["bash", "read"])}\n`;
+	fs.writeFileSync(f, text);
+	const truth = parseSessionText(text);
+
+	const r = parseSessionFile(f);
+	const assistant = r.turns[0]?.assistants[0];
+	assert.ok(assistant);
+	assert.deepEqual(assistant.tools, ["bash", "read"]);
+
+	assistant.text = "HACKED";
+	assistant.tools.push("EVIL");
+
+	const next = parseSessionFile(f);
+	assert.equal(next.turns[0]?.assistants[0]?.text, truth.turns[0]?.assistants[0]?.text);
+	assert.equal(next.lastTurnOutput, truth.lastTurnOutput);
+	assert.deepEqual(next.turns[0]?.assistants[0]?.tools, truth.turns[0]?.assistants[0]?.tools);
+	assert.notEqual(next.turns[0]?.assistants[0], assistant, "assistant objects must not be shared");
+	assert.notEqual(next.turns[0]?.assistants[0]?.tools, assistant.tools, "tools must not be shared");
+});
+
 test("the parse cache is bounded by SESSION_CACHE_MAX_ENTRIES", () => {
 	clearSessionParseCache();
 	assert.equal(sessionParseCacheSize(), 0);
@@ -179,9 +215,40 @@ test("the parse cache is bounded by SESSION_CACHE_MAX_ENTRIES", () => {
 		parseSessionFile(file);
 	}
 	assert.equal(sessionParseCacheSize(), SESSION_CACHE_MAX_ENTRIES);
-	// The first three were evicted (LRU), so they re-parse from byte 0 and still
-	// produce the same view.
+	// Evicted paths must still parse correctly from byte 0.
 	assert.equal(countAssistantMessages(parseSessionFile(files[0] as string)), 1);
+	clearSessionParseCache();
+});
+
+/*
+ * The cap is an LRU, not a FIFO: `parseSessionFile` deletes then re-sets the
+ * entry on every call, so a cache HIT re-seats the path as most-recently-used.
+ * This is the only assertion that distinguishes the two orders.
+ *
+ * Fill to exactly the cap, touch the OLDEST entry, then insert one more. Under
+ * LRU the touched path survives and the next-oldest goes; under FIFO the
+ * touched path is evicted for still being the oldest.
+ */
+test("the parse cache evicts the least-recently-used path, not the oldest", () => {
+	clearSessionParseCache();
+	const files = Array.from({ length: SESSION_CACHE_MAX_ENTRIES }, () => tmp());
+	for (const file of files) {
+		fs.writeFileSync(file, `${user("a")}\n${asst("one")}\n`);
+		parseSessionFile(file);
+	}
+	assert.equal(sessionParseCacheSize(), SESSION_CACHE_MAX_ENTRIES);
+
+	// Insertion order is files[0] .. files[63]; touch the head so it moves to tail.
+	parseSessionFile(files[0] as string);
+
+	const overflow = tmp();
+	fs.writeFileSync(overflow, `${user("a")}\n${asst("one")}\n`);
+	parseSessionFile(overflow);
+	assert.equal(sessionParseCacheSize(), SESSION_CACHE_MAX_ENTRIES);
+
+	assert.equal(sessionParseCacheHas(files[0] as string), true, "a touched entry must survive (FIFO would drop it)");
+	assert.equal(sessionParseCacheHas(files[1] as string), false, "the least-recently-used entry is the one evicted");
+	assert.equal(sessionParseCacheHas(overflow), true);
 	clearSessionParseCache();
 });
 
