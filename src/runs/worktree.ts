@@ -20,6 +20,26 @@ export function worktreePathFor(runDir: string, name: string): string {
 }
 
 /**
+ * Budget for the git plumbing probes (`rev-parse`): a handful of stat/read on
+ * the repo metadata, measured in single-digit milliseconds on a warm local
+ * checkout. 5s is ~1000x headroom, and short enough that a hung NFS/network
+ * path (see the #227-series bare-child hangs) surfaces as a probe failure
+ * instead of freezing the parent event loop.
+ *
+ * NOT the budget for mutating commands — see GIT_WORKTREE_TIMEOUT_MS.
+ */
+export const GIT_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Budget for `git worktree add` / `git worktree remove`. These copy the checkout
+ * and may run hooks or a slow `post-checkout`, so they need a far bigger budget
+ * than the probes: 120s is generous for a large repo on slow storage while still
+ * bounding a hang. Deliberately separate from GIT_PROBE_TIMEOUT_MS — one shared
+ * value would either be absurdly loose for `rev-parse` or too tight for `add`.
+ */
+export const GIT_WORKTREE_TIMEOUT_MS = 120_000;
+
+/**
  * Who decides whether this launch gets an isolated worktree.
  *
  * Per-step tool field wins, then the top-level `subagent({ worktree })`
@@ -73,6 +93,7 @@ export function isInsideChildWorktree(cwd: string): boolean {
 			{
 				stdio: ["ignore", "pipe", "pipe"],
 				encoding: "utf8",
+				timeout: GIT_PROBE_TIMEOUT_MS,
 			},
 		).trim();
 		const [gitDir, commonDir] = out.split("\n").map((line) => line.trim());
@@ -92,6 +113,7 @@ export function isGitRepo(cwd: string): boolean {
 	try {
 		execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
 			stdio: "ignore",
+			timeout: GIT_PROBE_TIMEOUT_MS,
 		});
 		return true;
 	} catch {
@@ -125,7 +147,7 @@ export function createChildWorktree(opts: {
 			execFileSync(
 				"git",
 				["-C", opts.repoCwd, "worktree", "add", "-b", branch, dest, "HEAD"],
-				{ stdio: ["ignore", "pipe", "pipe"] },
+				{ stdio: ["ignore", "pipe", "pipe"], timeout: GIT_WORKTREE_TIMEOUT_MS },
 			);
 			return { path: dest, branch };
 		} catch (error) {
@@ -160,7 +182,7 @@ export function removeChildWorktree(opts: {
 		execFileSync(
 			"git",
 			["-C", opts.repoCwd, "worktree", "remove", "--force", opts.dest],
-			{ stdio: "ignore" },
+			{ stdio: "ignore", timeout: GIT_WORKTREE_TIMEOUT_MS },
 		);
 	} catch {
 		try {
