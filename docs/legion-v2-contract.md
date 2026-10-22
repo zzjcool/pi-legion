@@ -429,7 +429,7 @@ interface LegionEventBus {
 ### M2 军团树（组织层：db + centurion + 状态机 + 邮件）
 
 - **归属**：新增 `src/legion/{db,nodes,events,usage,mail,state-machine,budget,rebuild}.ts`、`agents/centurion.md`、`src/extension/legion-tools.ts`；修改 `orchestrator.ts`（launch 落库/树命名/预算查库/子树 worktree——经 REV-17 收为 centurion 专属，非 centurion 请求 warns 一次后降级）、`src/runs/worktree.ts`（subtree 模式）、`src/runs/args.ts`（env 增 `PI_LEGION_DB`/`PI_LEGION_NODE_ID`）、`src/agents/agents.ts`、`index.ts`（队级 resume、collect 落库）
-- **验收**：(a) 三层树 e2e：CEO→centurion→workers×2 全阶段走通（契约落盘→并行实施→review verdict→verify 实跑→done 收队 + squash MR）；(b) rework 循环：review major→回 implementing→复审通过；(c) rework≥2 → failed 上抛；(d) kill centurion 进程 → 孤儿报警 → resume 恢复整队、settled 组员不复活、运行中组员上下文延续；(e) `maxActiveNodes` 超限拒派 + 事件；(f) 邮件：同级/父子/父←子通、跨子树拒发并提示路由、retired 收件人唤醒投递、终态收件人退信；(g) WAL 压测：60 模拟 supervisor 并发写 5 分钟，busy 超时率 <0.1%；(h) `legion-rebuild` 从 run.json+jsonl 重建 nodes/events；(i) 非 pi kind 明确拒绝
+- **验收**：(a) 三层树 e2e：CEO→centurion→workers×2 全阶段走通（契约落盘→并行实施→review verdict→verify 实跑→done 收队 + squash MR）；(b) rework 循环：review major→回 implementing→复审通过；(c) rework≥2 → failed 上抛；(d) kill centurion 进程 → 孤儿报警 → resume 恢复整队、settled 组员不复活、运行中组员上下文延续；(e) `maxActiveNodes` 超限拒派 + 事件；(f) 邮件：同级/父子/父←子通、跨子树拒发并提示路由、retired 收件人唤醒投递、终态收件人退信；(g) WAL 压测：60 模拟 supervisor 并发写 5 分钟，busy 超时率 <0.1%（**实测 2026-10-22 通过**：60 个 `fork` 子进程、各持一连接、共享一库，postman 节奏每 ~2s 一短事务，300s 内 9004 次尝试 / 9004 提交 / 0 次 busy = 0.000%；成功事务 p50 1.03ms / p95 1.99ms / p99 4.92ms。复跑：`npm run test:wal-stress`；CI 快速守卫 `test/unit/wal-concurrency.test.ts` 只钉住 busy_timeout 生效、WAL/超时前置条件与零 busy，**不证明** 5 分钟跨进程结论）；(h) `legion-rebuild` 从 run.json+jsonl 重建 nodes/events；(i) 非 pi kind 明确拒绝
 
 ### M3 可视化
 

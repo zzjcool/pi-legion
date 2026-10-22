@@ -58,6 +58,7 @@
     "prepublishOnly": "node --run typecheck && node --run test && node --run test:integration",
     "mock-llm": "node --experimental-strip-types test/mock-llm/cli.ts",
     "test:perf": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/perf/*.test.ts",
+    "test:wal-stress": "node --experimental-strip-types test/stress/wal-stress.ts",
     "test:mock-llm": "env -u PI_SUBAGENT_ROLE -u PI_SUBAGENT_ACCEPTANCE_ROLE -u PI_SUBAGENT_ALLOW_NESTED -u PI_SUBAGENT_CHILD -u PI_SUBAGENT_UTILITY_CHILD -u PI_SUBAGENT_MAX_DEPTH -u PI_SUBAGENT_PARENT_PATH -u PI_LEGION_DB -u PI_LEGION_NODE_ID node --experimental-strip-types --test test/unit/mock-llm*.test.ts test/integration/mock-llm*.test.ts test/integration/railway-mock-e2e.test.ts",
     "test:tui-visual": "docker build -q -f test/docker/Dockerfile.tui-sandbox -t ghcr.io/zzjcool/pi-legion/tui-sandbox:latest . >/dev/null && docker run --rm -v $(pwd):/plugin -w /plugin ghcr.io/zzjcool/pi-legion/tui-sandbox:latest bash test/docker/verify-tui-visual.sh"
   },
