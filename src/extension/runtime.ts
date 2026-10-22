@@ -897,14 +897,39 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * absent, and its event is dropped). A burst therefore costs a leading snapshot
 	 * plus one flush — a constant 2, down from 2×N.
 	 *
-	 * Semantics of the mid-burst window: events 2..N are vetted against the tree as
-	 * of burst start rather than re-read per event (what `master` did). The only
-	 * way to observe that is an external writer bumping `node.updatedAt` *between*
-	 * two events of the same synchronous burst; and even then the flush re-vets
-	 * every override (`override.ts >= node.updatedAt` in `snapshotNodes()`), so the
-	 * painted state converges to what a per-event re-read would have reached. No
-	 * paint and no `statusEntries()` call can happen inside the emit loop, so the
-	 * mid-burst values are not observable from outside it.
+	 * Semantics of the mid-burst window — a DOCUMENTED LIMITATION, not a claim of
+	 * equivalence. Events 2..N are vetted against the tree as of burst start
+	 * instead of being re-read per event (what `master` does). This is observable
+	 * only when something writes the ledger between two events of the same
+	 * synchronous burst, i.e. under a concurrent writer process: this process's own
+	 * writes do not re-read (`getTreeNodes()` re-reads SQLite on every call, so an
+	 * external writer's commit IS visible to a per-event read but not to a burst).
+	 * Sibling bus subscribers also run inside the burst and can read
+	 * `treeNodes()` (`legion-commands.ts`), so mid-burst state is reachable.
+	 *
+	 * Measured across 2352 burst/row combinations on a shared ledger: identical to a
+	 * per-event re-read in every case with no mid-burst write, and diverging in
+	 * exactly the 208 that have one. Both directions occur — the coalesced paint can
+	 * miss a veto `master` applied, and can also apply one `master` correctly
+	 * skipped. So neither "re-read at flush" nor "re-read at burst start" fixes it:
+	 * reproducing a SEQUENCE of per-event reads is not possible with a constant
+	 * number of reads. The canonical case (row `starting@5`, burst `node_settled@10`
+	 * then `node_retired@30`, row bumped to `@20` mid-burst) paints `settled` here
+	 * and `retired` on master, because `master`'s re-read resets the in-memory row to
+	 * raw `starting` so `node_retired`'s guard passes, while the coalesced path still
+	 * sees the first event's own `settled` override there.
+	 *
+	 * It IS sticky, and this is not fixed: the override wins on `ts` (`30 >= 20`)
+	 * exactly as `master`'s own override does, so the next `snapshotNodes()` does NOT
+	 * re-vet it away. It lasts until the row moves again. Fixing it needs per-event
+	 * re-reads, i.e. reverting the optimisation. `runtime.test.ts` pins the actual
+	 * behaviour so a reader is not told it converges.
+	 *
+	 * One sub-case IS closed, because it costs no extra read in the common burst: an
+	 * event for a node that is absent from `tree` (its row only landed mid-burst)
+	 * takes a fresh snapshot before applying, so `applyTreeEvent`'s `tree.get()`
+	 * miss cannot silently drop it. The common burst never triggers it, keeping the
+	 * constant-2 property.
 	 *
 	 * Microtask, not macrotask: the burst this targets is one synchronous emit
 	 * loop (`legion-tools.ts` emits N `mail_sent` events back-to-back; the db event
@@ -918,15 +943,32 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		burstPending = true;
 		queueMicrotask(() => {
 			burstPending = false;
-			// `dispose()` tore the board down and closed the ledger: a flush here
-			// would touch a closed db.
-			if (!disposed) refreshUi();
+			// The old inline path ran `refreshUi()` INSIDE the bus handler, so a throw
+			// from `getTreeNodes()`/`board.paint()` was contained by
+			// `createLegionEventBus`'s per-subscriber try/catch. A microtask has no
+			// such wrapper, so an uncaught throw here would kill the host process. The
+			// bus's job is to isolate a subscriber's failure; report through the same
+			// channel a throwing handler uses instead of escaping onto the microtask
+			// queue. No `disposed` guard: `refreshUi()` already returns early when
+			// disposed, and this callback calls no other paint-path code.
+			try {
+				refreshUi();
+			} catch (error) {
+				if (deps.eventBus?.reportError) deps.eventBus.reportError(error, "deferred-handler");
+				else throw error;
+			}
 		});
 	};
 
 	const onWidgetEvent = (event: LegionEvent): void => {
 		// Leading snapshot, once per burst (see `scheduleTreeFlush`).
 		if (!burstPending) snapshotNodes();
+		// A row that only landed mid-burst is absent from `tree`, and
+		// `applyTreeEvent` drops an event when `tree.get()` misses. For a
+		// process-only event such as `node_launched` the flush cannot repair that
+		// (`node_launched` has no ledger row to re-read), so pay one snapshot for
+		// exactly this case. The common burst never reaches it.
+		else if (!tree.has(event.nodeId)) snapshotNodes();
 		applyTreeEvent(event);
 		scheduleTreeFlush();
 	};

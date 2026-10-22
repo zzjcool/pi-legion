@@ -46,6 +46,17 @@ export type LegionEventHandler = (event: LegionEvent) => void;
 export interface LegionEventBus {
 	on(type: LegionEventType, handler: LegionEventHandler): () => void;
 	emit(event: LegionEvent): void;
+	/**
+	 * Report an error raised OUTSIDE a subscriber's synchronous dispatch window
+	 * (a deferred repaint) through the same `onHandlerError` channel a throwing
+	 * handler uses. `createLegionEventBus` isolates a handler's throw so one bad
+	 * consumer cannot break delivery; a subscriber that defers work past its own
+	 * dispatch window would otherwise escape that isolation entirely (#238).
+	 *
+	 * Optional so any structural stand-in for a bus keeps working; a runtime with
+	 * no channel rethrows instead.
+	 */
+	reportError?(error: unknown, context: "deferred-handler"): void;
 }
 
 export interface LegionEventBusOptions {
@@ -108,6 +119,21 @@ export function createLegionEventBus(
 						// Error reporting must not break synchronous delivery to other consumers.
 					}
 				}
+			}
+		},
+		reportError(error) {
+			// The throw happened after the dispatch window closed, so there is no
+			// `event`/`handler` to attribute it to: pass a neutral synthetic event and
+			// a no-op handler. An unconfigured `onHandlerError` stays silent, which is
+			// exactly what `emit()` already does for a throwing handler.
+			try {
+				options.onHandlerError?.(
+					error,
+					{ nodeId: "", type: "ui_request", data: null, ts: 0 },
+					() => {},
+				);
+			} catch {
+				// Error reporting must never itself break delivery.
 			}
 		},
 	};

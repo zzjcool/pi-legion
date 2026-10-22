@@ -3144,8 +3144,10 @@ test("#238: the burst-start snapshot is what applyTreeEvent reads — a node cre
 		// Tick 1 establishes the one-node tree.
 		eventBus.emit({ nodeId: "root", type: "phase_change", data: { from: "planning", to: "implementing" }, ts: 40_000 });
 		await settleFlush();
-		// The supervisor launches a child between ticks.
-		nodes = [...nodes, statusTreeNode("root.worker", "root", "worker", 1)];
+		// The ledger row starts non-running, so "the event landed" is distinguishable
+		// from the fixture's default. (`statusTreeNode()` defaults to "running", which
+		// would make a "running" assertion pass even if the event were dropped.)
+		nodes = [...nodes, { ...statusTreeNode("root.worker", "root", "worker", 1), status: "starting" }];
 		// Tick 2, event #1 targets the node that did not exist at the last snapshot.
 		eventBus.emit({ nodeId: "root.worker", type: "node_launched", data: null, ts: 41_000 });
 		eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "planning", to: "implementing" }, ts: 42_000 });
@@ -3154,7 +3156,7 @@ test("#238: the burst-start snapshot is what applyTreeEvent reads — a node cre
 		assert.equal(
 			worker?.status,
 			"running",
-			"the first event of a burst was vetted against a current tree (not a stale one, which would drop it)",
+			"node_launched applied (the row said starting; a dropped event would leave it starting)",
 		);
 		assert.equal(worker?.phase, "implementing", "the later event of the same burst also landed");
 	} finally {
@@ -3162,13 +3164,15 @@ test("#238: the burst-start snapshot is what applyTreeEvent reads — a node cre
 	}
 });
 
-test("#238: a burst's mid-burst events re-read no snapshot, but the flush converges to the latest event", async () => {
-	// The semantic difference the coalescing introduces, made explicit: events
-	// 2..N are vetted against the tree as of burst start instead of a per-event
-	// re-read. `snapshotNodes()` re-vets every override it replays, so the
-	// painted result still reflects the LAST applicable event. Events that go
-	// backwards in time must still be vetoed (that is `applyTreeEvent`'s own
-	// guard, untouched here).
+test("#238: within one burst the LAST forward event wins and a stale one is still vetoed", async () => {
+	// NOTE the scope: this covers a burst with NO mid-burst ledger write, where the
+	// coalesced paint does equal a per-event re-read. It is NOT a claim that any
+	// burst converges — the mid-burst-write case is pinned (and deliberately shown
+	// to diverge) by the "KNOWN LIMITATION" test below.
+	//
+	// Events 2..N are vetted against the tree as of burst start. Events that go
+	// backwards in time must still be vetoed — that is `applyTreeEvent`'s own
+	// guard, untouched here.
 	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
 	const eventBus = createLegionEventBus();
 	const runtime = createSessionRuntime({
@@ -3201,12 +3205,17 @@ test("#238: a burst's mid-burst events re-read no snapshot, but the flush conver
 	}
 });
 
-test("#238: dispose() during the pending flush window does not touch the torn-down ledger", async () => {
-	// The flush is deferred, so `dispose()` can land in between. To flush then
-	// would repaint a cleared board and (in the PI_LEGION_DB branch) read a
-	// closed database.
+test("#238: dispose() during the pending flush window neither reads the ledger nor repaints", async () => {
+	// The flush is deferred, so `dispose()` can land in between — that window is
+	// reachable (a burst opened, dispose called before the microtask drains).
+	// `refreshUi()`'s own `if (disposed) return` is the single source of truth for
+	// it; `scheduleTreeFlush` deliberately carries no second guard. Both halves are
+	// asserted because they are guarded at different points: the snapshot happens
+	// INSIDE `refreshUi()` after its guard, and the paint happens after that, so
+	// dropping the guard is caught by the read count and by the repaint count.
 	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
 	const counting = countingTree(nodes);
+	const board = captureBoard();
 	const eventBus = createLegionEventBus();
 	const runtime = createSessionRuntime({
 		sendMessage() {},
@@ -3214,14 +3223,21 @@ test("#238: dispose() during the pending flush window does not touch the torn-do
 		getTreeNodes: counting.getTreeNodes,
 		now: () => 50_000,
 	});
+	runtime.bind(board.ui);
 	eventBus.emit({ nodeId: "root.worker", type: "node_launched", data: null, ts: 40_000 });
-	const atDispose = counting.calls();
+	const readsAtDispose = counting.calls();
+	const repaintsAtDispose = board.requestRenderCount();
 	runtime.dispose();
 	await settleFlush();
 	assert.equal(
 		counting.calls(),
-		atDispose,
-		"the pending flush was dropped after dispose instead of reading the ledger again",
+		readsAtDispose,
+		"the pending flush was dropped after dispose instead of reading the ledger",
+	);
+	assert.equal(
+		board.requestRenderCount(),
+		repaintsAtDispose,
+		"and it did not repaint a torn-down board",
 	);
 });
 
@@ -3268,6 +3284,153 @@ test("#238: only the paint is deferred — applyTreeEvent's state is readable sy
 		assert.ok(
 			board.requestRenderCount() > repaintsBefore,
 			"and the deferred paint does happen",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: a throw on the deferred paint is isolated like a bus handler error, not an uncaught crash", async () => {
+	// The coalescing moved `refreshUi()` out of the bus handler's synchronous
+	// dispatch window — and therefore out of the per-subscriber try/catch that
+	// `createLegionEventBus` wraps around each handler. Before this guard, a
+	// `getTreeNodes()` failure on the paint read (a real SQLITE_IOERR shape)
+	// escaped the microtask as an uncaught exception and killed the host process,
+	// where the inline `master` shape delivered it to `onHandlerError` and kept
+	// running. A perf change must not upgrade a contained error to a crash.
+	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
+	const failures: unknown[] = [];
+	const eventBus = createLegionEventBus({ onHandlerError: (error) => { failures.push(error); } });
+	let reads = 0;
+	let failPaintRead = false;
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => {
+			reads += 1;
+			// Throw only on the flush read, i.e. the read the coalescing deferred.
+			if (failPaintRead) throw new Error("SQLITE_IOERR: disk I/O error (paint read)");
+			return nodes;
+		},
+		now: () => 50_000,
+	});
+	let uncaught: unknown;
+	const onUncaught = (error: unknown) => { uncaught = error; };
+	process.once("uncaughtException", onUncaught);
+	try {
+		eventBus.emit({ nodeId: "root.worker", type: "node_launched", data: null, ts: 40_000 });
+		failPaintRead = true;
+		// If the error escaped, this await would reject the process instead.
+		await settleFlush();
+		assert.equal(uncaught, undefined, "the deferred paint's throw must not reach the microtask queue as uncaught");
+		assert.equal(failures.length, 1, "the throw is reported through the bus's own error channel");
+		assert.match(
+			String((failures[0] as Error).message),
+			/SQLITE_IOERR/,
+			"the original error reaches the reporter unreplaced",
+		);
+		// The runtime survives: a later event still paints normally.
+		failPaintRead = false;
+		reads = 0;
+		eventBus.emit({ nodeId: "root.worker", type: "node_settled", data: null, ts: 41_000 });
+		await settleFlush();
+		assert.ok(reads > 0, "the board keeps refreshing after a failed paint");
+		assert.equal(
+			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state,
+			"settled",
+			"state still advances after the contained failure",
+		);
+	} finally {
+		process.removeListener("uncaughtException", onUncaught);
+		runtime.dispose();
+	}
+});
+
+test("#238: KNOWN LIMITATION pinned — a mid-burst ledger write can make the painted status differ from a per-event re-read", async () => {
+	// This is not an endorsement: it pins the measured divergence documented on
+	// `scheduleTreeFlush` so nobody "confirms" convergence that does not exist.
+	//
+	// A concurrent writer (another process on the shared legion.db) commits a new
+	// row between two events of ONE synchronous burst. A per-event re-read
+	// (`master`) re-seeds its in-memory row from that commit, so `node_retired`'s
+	// "not already settled/failed" guard sees raw `starting` and applies
+	// `retired`. The coalesced path never re-reads mid-burst, so it still sees the
+	// first event's own `settled` override and keeps `settled`.
+	//
+	// Master paints: retired. HEAD paints: settled. Both are "the last applicable
+	// event" under their own read sequence — reproducing a SEQUENCE of reads is not
+	// possible with a constant number of reads, which is why this is bounded and
+	// documented rather than fixed. If this assertion ever flips to "retired",
+	// someone restored per-event re-reads: update the comment in runtime.ts.
+	let row: TreeNodeSnapshot = { ...statusTreeNode("root.worker", "root", "worker", 1), status: "starting", updatedAt: 5 };
+	const nodes = () => [statusTreeNode("root", null, "root", 0), row];
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: nodes,
+		now: () => 50_000,
+	});
+	// A sibling subscriber writing the row mid-burst, the shape legion-commands has.
+	eventBus.on("node_settled", () => { row = { ...row, updatedAt: 20 }; });
+	try {
+		eventBus.emit({ nodeId: "root.worker", type: "node_settled", data: null, ts: 10 });
+		eventBus.emit({ nodeId: "root.worker", type: "node_retired", data: null, ts: 30 });
+		await settleFlush();
+		assert.equal(
+			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state,
+			"settled",
+			"the coalesced burst vets the second event against burst-start facts, so it paints settled (master paints retired)",
+		);
+		// And it stays until the row moves again: this is the sticky half.
+		eventBus.emit({ nodeId: "root.worker", type: "node_retired", data: null, ts: 31 });
+		await settleFlush();
+		assert.equal(
+			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state,
+			"settled",
+			"a settled/failed row is never re-labelled retired, so the override is not repaired by a later snapshot",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: a node whose ledger row lands MID-burst still gets its first event applied (leading snapshot alone is not enough)", async () => {
+	// The leading snapshot closes the trap only at BURST START. A row that appears
+	// between two events of ONE synchronous tick was still absent from `tree`, and
+	// `applyTreeEvent` returns early on a `tree.get()` miss — and because
+	// `node_launched` is a process-only event with no ledger row, the trailing
+	// flush can never repair it.
+	//
+	// The insert has to happen INSIDE the burst to be a real mid-burst case: a row
+	// that lands before the first emit is picked up by the leading snapshot and
+	// proves nothing. A sibling bus subscriber doing the writing is the production
+	// shape (another consumer of the same bus, e.g. an orchestrator that inserts a
+	// node then emits its launch).
+	const rootNode = statusTreeNode("root", null, "root", 0);
+	let nodes = [rootNode];
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => nodes,
+		now: () => 50_000,
+	});
+	// Registered AFTER the runtime's own subscription, so it runs after the
+	// runtime handled event #1 — i.e. strictly inside the same burst.
+	eventBus.on("mail_sent", () => {
+		nodes = [...nodes, { ...statusTreeNode("root.worker", "root", "worker", 1), status: "starting" }];
+	});
+	try {
+		// Event #1 opens the burst and, as a side effect, the row appears.
+		eventBus.emit({ nodeId: "root", type: "mail_sent", data: null, ts: 40_000 });
+		// Event #2, same tick, targets a node `tree` has never seen.
+		eventBus.emit({ nodeId: "root.worker", type: "node_launched", data: null, ts: 41_000 });
+		await settleFlush();
+		assert.equal(
+			runtime.treeNodes().find((node) => node.id === "root.worker")?.status,
+			"running",
+			"the unknown-node snapshot let node_launched apply; without it the event is dropped and the row stays 'starting'",
 		);
 	} finally {
 		runtime.dispose();
