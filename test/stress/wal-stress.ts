@@ -29,20 +29,22 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { LEGION_DB_BUSY_TIMEOUT_MS, openLegionDb } from "../../src/legion/db.ts";
-import { insertNode } from "../../src/legion/nodes.ts";
+import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import {
 	WAL_STRESS_DEFAULT_DURATION_MS,
 	WAL_STRESS_DEFAULT_START_RAMP_MS,
 	WAL_STRESS_DEFAULT_SUPERVISORS,
+	WAL_STRESS_MIN_COMMIT_FRACTION,
 	WAL_STRESS_POSTMAN_INTERVAL_MS,
 	WAL_STRESS_WORKLOADS,
+	expectedTransactions,
 	heartbeatEventTransaction,
 	isBusyError,
 	offeredTxPerSecond,
 	percentile,
 	type Workload,
 } from "./wal-contract.ts";
-import type { WorkerConfig, WorkerStats } from "./wal-worker.ts";
+import { intervalMsFor, type WorkerConfig, type WorkerStats } from "./wal-worker.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_ENTRY = path.join(HERE, "wal-worker.ts");
@@ -119,9 +121,17 @@ function parseArgs(argv: readonly string[]): Options {
 			case "--keep-db":
 				options.keepDb = true;
 				break;
-			case "--assert-busy-rate":
-				options.assertBusyRatePct = Number(value());
+			case "--assert-busy-rate": {
+				// Validated here, not at the comparison site: `busyRatePct >= NaN` is always
+				// false, so an unparseable value used to disable the gate silently.
+				const raw = value();
+				const parsed = Number(raw);
+				if (!Number.isFinite(parsed) || parsed < 0) {
+					throw new Error(`--assert-busy-rate must be a non-negative number, got ${JSON.stringify(raw)}`);
+				}
+				options.assertBusyRatePct = parsed;
 				break;
+			}
 			case "--help":
 			case "-h":
 				printUsage();
@@ -153,13 +163,27 @@ function printUsage(): void {
 	);
 }
 
-/** Seed the tree: one root plus one node row per simulated supervisor. */
+/**
+ * Seed the tree: one root plus one node row per simulated supervisor.
+ *
+ * Idempotent, because `--db <path>` is documented as "reuse a ledger path" and a
+ * second run against the same file used to die on `NodeNameConflictError`
+ * ("a child named root already exists"). Rows that are already there are reused
+ * rather than re-inserted, so re-running against a kept ledger measures a growing
+ * ledger (more rows, more WAL) instead of crashing.
+ */
 function seedLedger(dbFile: string, supervisors: number): string[] {
 	const db = openLegionDb(dbFile);
 	try {
-		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" });
+		if (!getNode(db, "root")) {
+			insertNode(db, { parentId: null, name: "root", role: "root", status: "running" });
+		}
+		// Existing children are counted so a reused ledger keeps growing rather than
+		// colliding: reap no rows, just pick the next free index.
+		let startIndex = 0;
+		while (getNode(db, `root.sim-${String(startIndex).padStart(2, "0")}`)) startIndex += 1;
 		const nodeIds: string[] = [];
-		for (let i = 0; i < supervisors; i += 1) {
+		for (let i = startIndex; i < startIndex + supervisors; i += 1) {
 			// Simulated supervisors are leaves that beat their own row: the same
 			// UPDATE the real postman issues for a live child.
 			const node = insertNode(db, {
@@ -203,7 +227,6 @@ function runProcessMode(options: Options, nodeIds: readonly string[], startAt: n
 						dbFile: options.dbFile as string,
 						nodeId,
 						durationMs: options.durationMs,
-						intervalMs: options.workload === "postman" ? WAL_STRESS_POSTMAN_INTERVAL_MS : 0,
 						startAt,
 						startRampMs: options.startRampMs,
 						workload: options.workload,
@@ -266,7 +289,7 @@ async function runInProcessMode(options: Options, nodeIds: readonly string[], st
 				const firstTickAt = Math.max(startAt + startOffset, Date.now());
 				await new Promise((resolve) => setTimeout(resolve, Math.max(0, firstTickAt - Date.now())));
 				const deadline = firstTickAt + options.durationMs;
-				const intervalMs = options.workload === "postman" ? WAL_STRESS_POSTMAN_INTERVAL_MS : 0;
+				const intervalMs = intervalMsFor(options.workload);
 				let seq = 0;
 				while (Date.now() < deadline) {
 					seq += 1;
@@ -316,6 +339,8 @@ interface Totals {
 	sampleOtherErrors: string[];
 	badPreconditions: string[];
 	workerLatencies: { nodeId: string; p50: number }[];
+	/** Per-process `openLegionDb` cost, for the startup-vs-contention split. */
+	openMs: number[];
 }
 
 function totalsFrom(results: readonly ChildResult[]): Totals {
@@ -329,6 +354,7 @@ function totalsFrom(results: readonly ChildResult[]): Totals {
 		sampleOtherErrors: [],
 		badPreconditions: [],
 		workerLatencies: [],
+		openMs: [],
 	};
 	for (const result of results) {
 		const stats = result.stats;
@@ -353,12 +379,53 @@ function totalsFrom(results: readonly ChildResult[]): Totals {
 			totals.badPreconditions.push(`${stats.nodeId}: busy_timeout=${String(stats.observedBusyTimeout)}`);
 		}
 		totals.workerLatencies.push({ nodeId: stats.nodeId, p50: percentile(stats.latencies, 50) ?? 0 });
+		totals.openMs.push(stats.openMs);
 	}
 	return totals;
 }
 
 function fmt(value: number | null, digits = 3): string {
 	return value === null ? "n/a" : value.toFixed(digits);
+}
+
+/**
+ * Why a run is not a valid measurement, independent of its busy rate.
+ *
+ * A low busy rate is only meaningful on a run that actually did work. The gate
+ * used to test `attempts === 0` and nothing else, so a ledger whose every write
+ * failed printed `0.000% => PASS` and exited 0 — a safety criterion reporting
+ * green on a totally broken run, which is worse than no test at all. Every
+ * "this run cannot speak" condition is collected here, and the caller fails the
+ * process on any of them *before* it is allowed to consider the threshold.
+ *
+ * The busy rate is item 5 in the list on purpose: it is the *last* thing checked.
+ */
+function invalidRunReasons(options: Options, totals: Totals, failures: readonly string[]): string[] {
+	const reasons: string[] = [];
+	for (const failure of failures) reasons.push(`worker did not exit cleanly: ${failure}`);
+
+	if (totals.attempts === 0) {
+		reasons.push("no transaction was attempted at all (attempts = 0)");
+	}
+	if (totals.otherFailures > 0) {
+		const first = totals.sampleOtherErrors[0];
+		reasons.push(
+			`${totals.otherFailures} transaction(s) failed for a NON-busy reason` +
+				(first ? ` (first: ${first})` : "") +
+				" — the write path is broken, so its busy rate is not a measurement",
+		);
+	}
+	const expected = expectedTransactions(options.workload, options.supervisors, options.durationMs);
+	const floor = Math.floor(expected * WAL_STRESS_MIN_COMMIT_FRACTION);
+	if (totals.committed < floor) {
+		reasons.push(
+			`only ${totals.committed} transaction(s) committed against ${expected} offered ` +
+				`(floor ${floor} = ${Math.round(WAL_STRESS_MIN_COMMIT_FRACTION * 100)}% of offered) ` +
+				"— the denominator is too small to report a rate over",
+		);
+	}
+	for (const message of totals.badPreconditions) reasons.push(`precondition violated: ${message}`);
+	return reasons;
 }
 
 /** Print the report the contract asks for; return the busy rate in percent. */
@@ -401,12 +468,29 @@ function report(
 	if (totals.busyLatencies.length > 0) {
 		console.log(`busy-failed txn latency p50 ${fmt(percentile(totals.busyLatencies, 50))} ms   max ${fmt(percentile(totals.busyLatencies, 100))} ms`);
 	}
+	if (totals.openMs.length > 0) {
+		console.log(`openLegionDb latency    p50 ${fmt(percentile(totals.openMs, 50))} ms   p95 ${fmt(percentile(totals.openMs, 95))} ms   max ${fmt(percentile(totals.openMs, 100))} ms  (startup cost, separate from write contention)`);
+	}
 	if (worst.length > 0 && worst[0]!.p50 > 0) {
 		console.log(`slowest supervisors by p50: ${worst.map((w) => `${w.nodeId}=${w.p50.toFixed(2)}ms`).join(", ")}`);
 	}
 	const shape = contractShape ? "contract scenario (60 x 300s postman)" : "NON-CONTRACT SHAPE (reduced supervisors or duration)";
+	const invalid = invalidRunReasons(options, totals, failures);
+	const expected = expectedTransactions(options.workload, options.supervisors, options.durationMs);
+	// `saturate` has no offered count (it is whatever the machine absorbs), so the
+	// number is a floor there; saying "expected offered" would be a lie.
+	const expectedLabel = options.workload === "saturate" ? `floor ${expected}` : `expected ~${expected} offered`;
 	console.log(`\nshape          ${shape}`);
-	console.log(`verdict        busy timeout rate ${fmt(busyRatePct)}% vs contract <${CONTRACT_BUSY_RATE_PCT}% => ${busyRatePct < CONTRACT_BUSY_RATE_PCT ? "PASS" : "EXCEEDS THRESHOLD (a finding, not a harness error)"}`);
+	// The denominator is printed on the verdict line itself: a reader must not be
+	// able to take "0.000%" away without also seeing what it was measured over.
+	console.log(
+		`population     ${totals.committed} committed / ${totals.attempts} attempts / ${totals.busyFailures} busy / ${totals.otherFailures} other (${expectedLabel})`,
+	);
+	if (invalid.length > 0) {
+		console.log(`verdict        NOT A MEASUREMENT — ${invalid.length} reason(s), busy rate ${fmt(busyRatePct)}% is meaningless here`);
+	} else {
+		console.log(`verdict        busy timeout rate ${fmt(busyRatePct)}% vs contract <${CONTRACT_BUSY_RATE_PCT}% => ${busyRatePct < CONTRACT_BUSY_RATE_PCT ? "PASS" : "EXCEEDS THRESHOLD (a finding, not a harness error)"}`);
+	}
 	if (!contractShape && options.mode === "process" && options.workload === "postman") {
 		console.log(`               note: this run does not authorise a M2-(g) claim; only 60 supervisors x 300 s does.`);
 	}
@@ -459,13 +543,15 @@ async function main(): Promise<void> {
 		console.log(`\nledger kept at ${options.dbFile}`);
 	}
 
-	const harnessBroken = failures.length > 0 || totals.badPreconditions.length > 0 || totals.attempts === 0;
-	if (harnessBroken) {
-		console.error("\nHARNESS FAILURE: the run did not complete cleanly; the busy rate above is not trustworthy.");
+	const invalid = invalidRunReasons(options, totals, failures);
+	if (invalid.length > 0) {
+		console.error("\nHARNESS FAILURE: this run is not a valid measurement; its busy rate must not be reported or trusted.");
+		for (const reason of invalid) console.error(`  - ${reason}`);
 		process.exit(1);
 	}
 	if (options.assertBusyRatePct !== null && busyRatePct >= options.assertBusyRatePct) {
-		console.error(`\nbusy rate ${fmt(busyRatePct)}% >= --assert-busy-rate ${options.assertBusyRatePct}%`);
+		console.error(`\nbusy rate ${fmt(busyRatePct)}% >= --assert-busy-rate ${options.assertBusyRatePct}% ` +
+			`(${totals.busyFailures} busy / ${totals.attempts} attempts, ${totals.committed} committed)`);
 		process.exit(2);
 	}
 }

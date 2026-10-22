@@ -19,6 +19,7 @@ import { openLegionDb } from "../../src/legion/db.ts";
 import {
 	WAL_STRESS_EXPECTED_BUSY_TIMEOUT_MS,
 	WAL_STRESS_EXPECTED_JOURNAL_MODE,
+	WAL_STRESS_POSTMAN_INTERVAL_MS,
 	heartbeatEventTransaction,
 	isBusyError,
 	type Workload,
@@ -31,13 +32,29 @@ export interface WorkerConfig {
 	nodeId: string;
 	/** How long this worker keeps ticking, measured from its first tick. */
 	durationMs: number;
-	/** 0 = saturate (never sleep); otherwise one transaction per window. */
-	intervalMs: number;
+	/**
+	 * Which offered load to apply. `runWorker` derives the cadence from this, so the
+	 * label and the behaviour cannot disagree.
+	 *
+	 * It used to read `intervalMs` instead and ignore `workload`, which meant a
+	 * `postman` config carrying `intervalMs: 0` ran fully saturated while still
+	 * reporting itself as the contract scenario. `intervalMs` is gone for that
+	 * reason: there is exactly one source of truth for the cadence.
+	 */
+	workload: Workload;
 	/** Absolute epoch ms the run begins; `startRampMs` is spread from here. */
 	startAt: number;
 	/** Over how long this worker's first tick is spread, measured from `startAt`. */
 	startRampMs: number;
-	workload: Workload;
+}
+
+/**
+ * Per-window sleep implied by a workload; 0 means "never sleep".
+ *
+ * The only place the cadence is decided, so `postman` cannot silently saturate.
+ */
+export function intervalMsFor(workload: Workload): number {
+	return workload === "postman" ? WAL_STRESS_POSTMAN_INTERVAL_MS : 0;
 }
 
 export interface WorkerStats {
@@ -54,7 +71,11 @@ export interface WorkerStats {
 	sampleOtherErrors: string[];
 	observedJournalMode: unknown;
 	observedBusyTimeout: number | null;
-	/** Spawn-to-first-tick overhead: separates "slow to start" from "slow to write". */
+	/**
+	 * `openLegionDb` cost in ms: separates "slow to start" (60 processes racing to
+	 * migrate/attach a WAL file) from "slow to write" (lock contention once the
+	 * cadence is running). Reported by the driver as a p50/p95 line.
+	 */
 	openMs: number;
 }
 
@@ -104,6 +125,7 @@ export async function runWorker(cfg: WorkerConfig): Promise<WorkerStats> {
 		await sleep(firstTickAt - Date.now());
 
 		const deadline = firstTickAt + cfg.durationMs;
+		const intervalMs = intervalMsFor(cfg.workload);
 		let seq = 0;
 		while (Date.now() < deadline) {
 			seq += 1;
@@ -125,8 +147,8 @@ export async function runWorker(cfg: WorkerConfig): Promise<WorkerStats> {
 					}
 				}
 			}
-			if (cfg.intervalMs > 0) {
-				const wait = firstTickAt + seq * cfg.intervalMs - Date.now();
+			if (intervalMs > 0) {
+				const wait = firstTickAt + seq * intervalMs - Date.now();
 				if (wait > 0) await sleep(wait);
 			}
 		}

@@ -68,13 +68,61 @@ export function offeredTxPerSecond(workload: Workload, supervisors: number): num
 }
 
 /**
+ * Minimum committed fraction of the *offered* transaction count for a run to be
+ * a measurement of anything.
+ *
+ * A run whose writes all fail still reports "busy rate 0.000%", which is why the
+ * gate cannot look at the busy rate alone: the rate needs a denominator that
+ * actually did work. 80% leaves room for the cadence losing a tick to scheduler
+ * jitter (a tick whose deadline has already passed is skipped, not queued) and
+ * for start-up skew across 60 forked processes, while still failing loudly on a
+ * ledger whose writes are broken.
+ */
+export const WAL_STRESS_MIN_COMMIT_FRACTION = 0.8;
+
+/**
+ * Transactions a healthy run of this shape should commit.
+ *
+ * One transaction per supervisor per cadence window, for the length of the run.
+ * `saturate` has no expectation: its offered count is whatever the machine can
+ * absorb, so only a floor (one per supervisor) is meaningful and the caller
+ * applies that.
+ */
+export function expectedTransactions(
+	workload: Workload,
+	supervisors: number,
+	durationMs: number,
+): number {
+	if (workload !== "postman") return supervisors;
+	return supervisors * Math.floor(durationMs / WAL_STRESS_POSTMAN_INTERVAL_MS);
+}
+
+/**
  * The single write transaction every simulated supervisor repeats.
  *
- * Deliberately the *production* helpers rather than hand-written SQL: this is
- * `LegionPostman.refreshHeartbeats`' `UPDATE nodes SET updated_at` plus one
- * `events` insert, committed together — the two writes a real postman tick
- * actually issues (`src/extension/legion-tools.ts`, `#236 P1`). A tight
- * `INSERT` loop would measure the lock, not the system.
+ * This is deliberately the *production* helpers rather than hand-written SQL, but
+ * it is **not** a byte-for-byte mirror of one real postman tick, and the comment
+ * here used to claim it was. The real `LegionPostman.refreshHeartbeats`
+ * (`src/extension/legion-tools.ts`) issues exactly one statement per tick:
+ * `heartbeatNode`'s `UPDATE nodes SET updated_at`, wrapped in a
+ * `withTransaction` that covers *all* of that tick's children. `phase_change`
+ * events are written by phase transitions
+ * (`state-machine.ts`, `legion-tools.ts`'s `advance*`/`forcePhase` paths,
+ * `orchestrator.ts`) — never by the 2 s heartbeat.
+ *
+ * So this helper is a deliberately *heavier* tick than production's single
+ * UPDATE: it adds one `events` insert — an append to an AUTOINCREMENT table with
+ * two indexes — to the same transaction. Two consequences, both intentional:
+ *
+ *  - the measured busy rate is **conservative**: this shape holds the write lock
+ *    longer than a heartbeat-only tick would, so a real squad cannot be worse;
+ *  - it keeps the run realistic rather than degenerate: a squad's ledger does
+ *    take event writes continuously (the postman's own delivery/retention paths
+ *    and every phase transition), and a pure 9000× single-column UPDATE would
+ *    overstate how cheap contention is.
+ *
+ * If the intent is ever to tighten this to production's exact tick, drop the
+ * `appendEvent` call and re-measure — the reported rate should only improve.
  */
 export function heartbeatEventTransaction(
 	db: DatabaseSync,
