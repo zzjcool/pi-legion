@@ -51,6 +51,7 @@ import { createDbEventSource, type DbEventSource } from "./event-bus.ts";
 import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
 import { getSubtree } from "../legion/nodes.ts";
 import { attachUsageTotals } from "../legion/usage.ts";
+import { maxEventId } from "../legion/events.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 
 export interface CollectSnapshot {
@@ -883,7 +884,15 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		try {
 			ledgerDb = openLegionDb(process.env.PI_LEGION_DB);
 			snapshotNodes();
+			// Seed at the tail for the same reason as the extension's attach path
+			// (`attachLegionRuntime` in index.ts, #238): this branch attaches to a ledger
+			// written by another process, and replaying its history only to reach a state
+			// `snapshotNodes()` already read is pure overhead. It matters for embedders
+			// using the public `createSessionRuntime` with PI_LEGION_DB and no
+			// `getTreeNodes` — unreachable from the extension itself, which always passes
+			// `getTreeNodes` — so keep the two call sites consistent.
 			dbEventSource = createDbEventSource(ledgerDb, {
+				cursor: maxEventId(ledgerDb),
 				onError: deps.onDbEventSourceError,
 			});
 			if (deps.eventBus) dbEventSource.start(deps.eventBus);

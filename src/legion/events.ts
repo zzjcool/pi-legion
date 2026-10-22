@@ -120,6 +120,30 @@ export function getEventById(db: DatabaseSync, id: number): LegionEvent | null {
 	return row ? mapEvent(row) : null;
 }
 
+/**
+ * Highest persisted event id, or `0` for an empty log.
+ *
+ * #238: a caller that attaches to a ledger it did not just write uses this to
+ * seed `createDbEventSource`'s `cursor` at the current tail, so attach does not
+ * replay the whole history. The SQL deliberately does NOT begin with the
+ * `SELECT id, node_id, type, data, ts FROM events WHERE id > ?` prefix: the
+ * instrumented `DatabaseSync` doubles in `test/unit/legion-event-bus.test.ts`
+ * count event SELECTs by that exact prefix and assert exact counts, so a
+ * differently-shaped statement must stay outside that counter.
+ */
+export function maxEventId(db: DatabaseSync): number {
+	const value = Number(
+		db.prepare("SELECT COALESCE(MAX(id), 0) AS id FROM events").get()?.id ?? 0,
+	);
+	// Only two shapes can reach here: 0 (empty log) or a positive safe integer.
+	// The column is an INTEGER PRIMARY KEY, a non-numeric write is refused with
+	// "datatype mismatch", and `node:sqlite` refuses to return an id it cannot
+	// represent exactly as a JS number ("Value is too large to be represented as a
+	// JavaScript number"). So this is a narrowing, not a recovery path — and a seed
+	// of 0 is safe regardless, because it only means "no history to skip".
+	return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
 /** PRAGMA data_version changes only when another connection commits. */
 export function getDataVersion(db: DatabaseSync): number {
 	return Number(db.prepare("PRAGMA data_version;").get()?.data_version ?? 0);
