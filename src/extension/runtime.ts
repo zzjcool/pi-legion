@@ -899,37 +899,40 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 *
 	 * Semantics of the mid-burst window — a DOCUMENTED LIMITATION, not a claim of
 	 * equivalence. Events 2..N are vetted against the tree as of burst start
-	 * instead of being re-read per event (what `master` does). This is observable
-	 * only when something writes the ledger between two events of the same
-	 * synchronous burst, i.e. under a concurrent writer process: this process's own
-	 * writes do not re-read (`getTreeNodes()` re-reads SQLite on every call, so an
-	 * external writer's commit IS visible to a per-event read but not to a burst).
-	 * Sibling bus subscribers also run inside the burst and can read
-	 * `treeNodes()` (`legion-commands.ts`), so mid-burst state is reachable.
+	 * instead of being re-read per event (what `master` does).
 	 *
-	 * Measured across 2352 burst/row combinations on a shared ledger: identical to a
-	 * per-event re-read in every case with no mid-burst write, and diverging in
-	 * exactly the 208 that have one. Both directions occur — the coalesced paint can
-	 * miss a veto `master` applied, and can also apply one `master` correctly
-	 * skipped. So neither "re-read at flush" nor "re-read at burst start" fixes it:
-	 * reproducing a SEQUENCE of per-event reads is not possible with a constant
-	 * number of reads. The canonical case (row `starting@5`, burst `node_settled@10`
-	 * then `node_retired@30`, row bumped to `@20` mid-burst) paints `settled` here
-	 * and `retired` on master, because `master`'s re-read resets the in-memory row to
-	 * raw `starting` so `node_retired`'s guard passes, while the coalesced path still
-	 * sees the first event's own `settled` override there.
+	 * The divergence class is: ANY mid-burst write that changes a row in this
+	 * subtree. Not just a write to the event's own node — `snapshotNodes()` clears
+	 * and rebuilds the whole `tree` while `eventOverrides` survives, so a sibling
+	 * process committing any row here can change whether a later event's
+	 * `event.ts >= node.updatedAt` guard passes. Reachable in production because
+	 * `getTreeNodes()` re-reads SQLite on every call, so a concurrent writer's
+	 * commit IS visible to a per-event read but not to a burst; sibling bus
+	 * subscribers also read `treeNodes()` inside the burst
+	 * (`legion-commands.ts`).
 	 *
-	 * It IS sticky, and this is not fixed: the override wins on `ts` (`30 >= 20`)
-	 * exactly as `master`'s own override does, so the next `snapshotNodes()` does NOT
-	 * re-vet it away. It lasts until the row moves again. Fixing it needs per-event
-	 * re-reads, i.e. reverting the optimisation. `runtime.test.ts` pins the actual
-	 * behaviour so a reader is not told it converges.
+	 * Sampled rather than exhaustively enumerated: a differential harness over
+	 * burst/row combinations (row status x row `updatedAt` x mid-burst bump x event
+	 * pair) showed the coalesced paint matching a per-event re-read in every case
+	 * with no mid-burst write, and diverging in both directions once there is one —
+	 * the coalesced path can miss a veto `master` applied, and can also apply one
+	 * `master` correctly skipped. So neither "re-read at the flush" nor "re-read at
+	 * burst start" fixes it: reproducing a SEQUENCE of per-event reads is not
+	 * possible with a constant number of reads, which is why this is bounded and
+	 * documented instead of repaired. `test/unit/runtime.test.ts` pins one concrete
+	 * instance (the "KNOWN LIMITATION" test) so the behaviour is asserted rather
+	 * than described.
 	 *
-	 * One sub-case IS closed, because it costs no extra read in the common burst: an
-	 * event for a node that is absent from `tree` (its row only landed mid-burst)
-	 * takes a fresh snapshot before applying, so `applyTreeEvent`'s `tree.get()`
-	 * miss cannot silently drop it. The common burst never triggers it, keeping the
-	 * constant-2 property.
+	 * It IS sticky, and this is not fixed: the override wins on `ts`, exactly as
+	 * `master`'s own override does, so the next `snapshotNodes()` does NOT re-vet it
+	 * away. It lasts until the row moves again. Fixing it needs per-event re-reads,
+	 * i.e. reverting the optimisation.
+	 *
+	 * One sub-case IS closed, at no cost to the common burst: an event for a node
+	 * that is absent from `tree` but belongs to THIS subtree (its row only landed
+	 * mid-burst) takes a fresh snapshot before applying, so `applyTreeEvent`'s
+	 * `tree.get()` miss cannot silently drop it. Foreign-subtree node ids — the
+	 * normal shape of a shared-ledger poll batch — cost zero extra reads.
 	 *
 	 * Microtask, not macrotask: the burst this targets is one synchronous emit
 	 * loop (`legion-tools.ts` emits N `mail_sent` events back-to-back; the db event
@@ -938,6 +941,36 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * TUI's next frame. A macrotask would need an explicit `flush()` seam or a
 	 * timer and would delay the paint by a tick for no coalescing benefit.
 	 */
+	/**
+	 * The subtree this runtime renders, derived from the FIRST populated snapshot.
+	 * `snapshotNodes()` calls `deps.getTreeNodes()`, which the extension supplies
+	 * as `getSubtree(db, identity.nodeId)` — so the shallowest node id in that
+	 * result IS this session's subtree root, and every node it can ever show is
+	 * that id or a strict descendant of it (`parent.child`).
+	 *
+	 * This is what bounds the unknown-node snapshot below (#238 review): the
+	 * DbEventSource emits EVERY row on the shared legion.db, so a sibling
+	 * subtree's batch routinely lands on this bus with `nodeId`s this session can
+	 * never render. Paying a snapshot per such event would be backwards — a
+	 * 40-event foreign batch cost 41 reads, worse than master's 80/2 ratio implied.
+	 * `undefined` means "not yet known" (empty tree / a host with no tree), in
+	 * which case an unknown node is treated as possibly-ours and gets the read.
+	 */
+	const subtreeRootId = (): string | undefined => {
+		let best: string | undefined;
+		for (const id of tree.keys()) {
+			if (best === undefined || id.length < best.length) best = id;
+		}
+		return best;
+	};
+
+	/** True when `nodeId` is the subtree root itself or a strict descendant of it. */
+	const isInOwnSubtree = (nodeId: string): boolean => {
+		const rootId = subtreeRootId();
+		if (rootId === undefined) return true;
+		return nodeId === rootId || nodeId.startsWith(`${rootId}.`);
+	};
+
 	const scheduleTreeFlush = (): void => {
 		if (burstPending) return;
 		burstPending = true;
@@ -954,8 +987,17 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			try {
 				refreshUi();
 			} catch (error) {
-				if (deps.eventBus?.reportError) deps.eventBus.reportError(error, "deferred-handler");
-				else throw error;
+				// Reporting must never itself break delivery, and must never re-enter
+				// the microtask queue as an uncaught throw: `reportError` is optional
+				// precisely so structural bus stand-ins keep working, and such a stand-in
+				// would otherwise reintroduce the host-killing crash this guard exists
+				// to prevent. Swallowing is the lesser evil — a lost repaint report
+				// never costs the process.
+				try {
+					deps.eventBus?.reportError?.(error, "deferred-handler");
+				} catch {
+					// Isolated reporting failure: the board simply skips this frame.
+				}
 			}
 		});
 	};
@@ -963,12 +1005,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const onWidgetEvent = (event: LegionEvent): void => {
 		// Leading snapshot, once per burst (see `scheduleTreeFlush`).
 		if (!burstPending) snapshotNodes();
-		// A row that only landed mid-burst is absent from `tree`, and
-		// `applyTreeEvent` drops an event when `tree.get()` misses. For a
-		// process-only event such as `node_launched` the flush cannot repair that
-		// (`node_launched` has no ledger row to re-read), so pay one snapshot for
-		// exactly this case. The common burst never reaches it.
-		else if (!tree.has(event.nodeId)) snapshotNodes();
+		// A node whose row only landed mid-burst is absent from `tree`, and
+		// `applyTreeEvent` returns early on a `tree.get()` miss, so the event is
+		// dropped and the flush cannot repair it: a just-launched child's ledger row
+		// still says whatever the pre-launch write left (`starting` or nothing), so
+		// re-reading cannot produce the `running` transition that a STORED
+		// `node_launched` event carries. Pay one snapshot for exactly this case.
+		//
+		// Gated on subtree ownership: foreign-subtree events are the normal shape of
+		// a shared-ledger poll batch and can never create a node here, so they cost
+		// ZERO extra reads. Without the gate a 40-event foreign batch cost 41 reads;
+		// with it, 2 (leading + flush).
+		else if (!tree.has(event.nodeId) && isInOwnSubtree(event.nodeId)) snapshotNodes();
 		applyTreeEvent(event);
 		scheduleTreeFlush();
 	};

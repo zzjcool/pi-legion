@@ -53,8 +53,15 @@ export interface LegionEventBus {
 	 * consumer cannot break delivery; a subscriber that defers work past its own
 	 * dispatch window would otherwise escape that isolation entirely (#238).
 	 *
-	 * Optional so any structural stand-in for a bus keeps working; a runtime with
-	 * no channel rethrows instead.
+	 * There is deliberately NO `event`/`handler` argument: the throw happened after
+	 * dispatch, so there is no real event to attribute it to, and fabricating one
+	 * (a synthetic `ui_request` on an empty nodeId) would make any consumer that
+	 * groups by `event.nodeId` record a phantom event on a node that never exists.
+	 * Consumers that need correlation should use `context`.
+	 *
+	 * Optional so any structural stand-in for a bus keeps working; a caller with no
+	 * channel must contain the error itself rather than rethrow it onto the
+	 * microtask queue (which is a host-killing crash, the very bug this prevents).
 	 */
 	reportError?(error: unknown, context: "deferred-handler"): void;
 }
@@ -63,8 +70,17 @@ export interface LegionEventBusOptions {
 	/** Optional observer for isolated subscriber failures. Failures here are isolated too. */
 	onHandlerError?: (
 		error: unknown,
-		event: LegionEvent,
-		handler: LegionEventHandler,
+		/**
+		 * The event whose handler threw, or `null` for a failure reported outside a
+		 * dispatch window (`reportError`, e.g. a deferred repaint). `null` means "no
+		 * event", never "an event with no node": do not group it by `nodeId`.
+		 */
+		event: LegionEvent | null,
+		/**
+		 * The failing handler, or a short origin tag for a deferred failure
+		 * (`"deferred-handler"`) where no single handler is responsible.
+		 */
+		handler: LegionEventHandler | string,
 	) => void;
 }
 
@@ -121,17 +137,14 @@ export function createLegionEventBus(
 				}
 			}
 		},
-		reportError(error) {
-			// The throw happened after the dispatch window closed, so there is no
-			// `event`/`handler` to attribute it to: pass a neutral synthetic event and
-			// a no-op handler. An unconfigured `onHandlerError` stays silent, which is
-			// exactly what `emit()` already does for a throwing handler.
+		reportError(error, context) {
+			// No `event`/`handler` to attribute this to: the throw happened after the
+			// dispatch window closed. Pass only what is real (the error and the
+			// origin) — a synthetic event would be a fabricated fact. An unconfigured
+			// `onHandlerError` stays silent, which is what `emit()` already does for a
+			// throwing handler; `index.ts` wires one so the containment is not silent.
 			try {
-				options.onHandlerError?.(
-					error,
-					{ nodeId: "", type: "ui_request", data: null, ts: 0 },
-					() => {},
-				);
+				options.onHandlerError?.(error, null, context);
 			} catch {
 				// Error reporting must never itself break delivery.
 			}

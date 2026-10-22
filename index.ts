@@ -607,7 +607,23 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		onSpawnRefused,
 	});
 	const verifyRunner = deps.verifyRunner;
-	const legionBus = createLegionEventBus();
+	// #238: the resident status widget defers its repaint to a microtask, which puts
+	// a paint failure outside the per-subscriber try/catch in `createLegionEventBus`.
+	// The runtime funnels that failure through `reportError` → `onHandlerError`, so
+	// a handler must actually be configured or the containment is silent. A widget
+	// repaint that throws (a stale UI context, a SQLITE_IOERR on the tree read) must
+	// never take the host down, and must leave a trace.
+	const legionBus = createLegionEventBus({
+		onHandlerError: (error, event, handler) => {
+			const detail = error instanceof Error ? error.message : String(error);
+			// `event === null` means a deferred failure with no event to attribute;
+			// `handler` is then an origin tag rather than a subscriber function.
+			const where = event
+				? `${event.type} node=${event.nodeId}`
+				: typeof handler === "string" ? handler : "deferred";
+			console.error(`[pi-legion] legion event handler failed (${where}): ${detail}`);
+		},
+	});
 	const rpcUIProxy = (supervisor as LegionSupervisor & { uiProxy?: UIProxy }).uiProxy;
 	const uiProxy = deps.uiProxy ?? rpcUIProxy ?? new InMemoryUIProxy();
 	const onBudgetRefused = deps.onBudgetRefused ?? ((event) => {

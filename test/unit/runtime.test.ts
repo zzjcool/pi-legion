@@ -17,7 +17,7 @@ import { withTempDir } from "../helpers/tmp.ts";
 import { assistantMsg, modelChange, sessionHeader, userMsg } from "../helpers/fixtures.ts";
 import type { TreeNodeSnapshot } from "../../src/tui/tree-view.ts";
 import type { StatusUi } from "../../src/tui/status.ts";
-import { createLegionEventBus } from "../../src/extension/event-bus.ts";
+import { createLegionEventBus, type LegionEventBus } from "../../src/extension/event-bus.ts";
 
 function snapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
 	return {
@@ -3433,6 +3433,151 @@ test("#238: a node whose ledger row lands MID-burst still gets its first event a
 			"the unknown-node snapshot let node_launched apply; without it the event is dropped and the row stays 'starting'",
 		);
 	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: a foreign-subtree burst costs no extra snapshots (shared-ledger poll batches are the normal case)", async () => {
+	// `getTreeNodes()` is per-subtree (`getSubtree(db, identity.nodeId)`), but the
+	// DbEventSource emits EVERY row on the shared legion.db. So a sibling
+	// subtree's poll batch routinely delivers events whose `nodeId` this session
+	// can never render — and that batch is exactly the "one synchronous emit loop"
+	// this optimisation exists for.
+	//
+	// Paying an extra snapshot per unknown node made that shape cost 1 read per
+	// event (41 reads for a 40-event foreign batch, vs master's 80): worse than the
+	// per-event behaviour it replaced. The gate is subtree ownership, so an event
+	// that can never create a node here costs zero extra reads.
+	const ownNodes = [
+		{ ...statusTreeNode("root.a", null, "a", 0), status: "running" as const },
+		{ ...statusTreeNode("root.a.w0", "root.a", "w0", 1), status: "running" as const },
+	];
+	const counting = countingTree(ownNodes);
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: counting.getTreeNodes,
+		now: () => 50_000,
+	});
+	try {
+		const atBurstStart = counting.calls();
+		// 40 events from a sibling subtree (root.b.*), all unknown to this runtime.
+		for (let i = 0; i < 40; i += 1) {
+			eventBus.emit({ nodeId: `root.b.w${i % 4}`, type: "mail_sent", data: { i }, ts: 40_000 + i });
+		}
+		assert.equal(
+			counting.calls() - atBurstStart,
+			1,
+			"a foreign-subtree burst takes the leading snapshot only — NOT one extra read per foreign event",
+		);
+		await settleFlush();
+		assert.equal(
+			counting.calls() - atBurstStart,
+			2,
+			"and one flush: a 40-event foreign batch costs 2 reads (master cost 80, the buggy gate cost 41)",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: an in-subtree mid-burst node still gets created (the gate must not regress the trap)", async () => {
+	// The complement of the test above: gating on ownership must keep the original
+	// trap closed for nodes that ARE ours. A sibling subscriber inserts the row
+	// between two events of ONE synchronous burst, so the leading snapshot cannot
+	// have seen it; only the ownership check can admit the extra read.
+	const rootNode = { ...statusTreeNode("root.a", null, "a", 0), status: "running" as const };
+	let nodes: TreeNodeSnapshot[] = [rootNode];
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => nodes,
+		now: () => 50_000,
+	});
+	// Registered after the runtime's own subscription, so it runs after the runtime
+	// handled event #1 — i.e. strictly inside the same burst.
+	eventBus.on("mail_sent", () => {
+		nodes = [...nodes, { ...statusTreeNode("root.a.worker", "root.a", "worker", 1), status: "starting" }];
+	});
+	try {
+		eventBus.emit({ nodeId: "root.a", type: "mail_sent", data: null, ts: 40_000 });
+		// Same tick, and a STRICT DESCENDANT of this runtime's subtree root.
+		eventBus.emit({ nodeId: "root.a.worker", type: "node_launched", data: null, ts: 41_000 });
+		await settleFlush();
+		assert.equal(
+			runtime.treeNodes().find((node) => node.id === "root.a.worker")?.status,
+			"running",
+			"node_launched applied to the mid-burst row (it would stay 'starting' if the event were dropped)",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: a foreign-subtree event that merely looks similar is still rejected (prefix, not substring)", async () => {
+	// Guards the gate itself: `root.a2` must not be treated as inside `root.a`.
+	// A naive `includes`/`startsWith(rootId)` without the separator would admit it
+	// and buy a pointless read per event on a same-prefixed sibling subtree.
+	const nodes = [{ ...statusTreeNode("root.a", null, "a", 0), status: "running" as const }];
+	const counting = countingTree(nodes);
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: counting.getTreeNodes,
+		now: () => 50_000,
+	});
+	try {
+		const atBurstStart = counting.calls();
+		eventBus.emit({ nodeId: "root.a2", type: "node_launched", data: null, ts: 40_000 });
+		eventBus.emit({ nodeId: "root.ab", type: "node_launched", data: null, ts: 41_000 });
+		await settleFlush();
+		assert.equal(
+			counting.calls() - atBurstStart,
+			2,
+			"same-prefixed sibling subtrees are foreign: leading + flush only, no per-event reads",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: a bus stand-in WITHOUT reportError still cannot kill the process from the deferred paint", async () => {
+	// `reportError` is optional so structural stand-ins keep working. A runtime
+	// that rethrew when the channel was absent would hand such a stand-in exactly
+	// the host-killing crash this whole guard exists to prevent — on the microtask
+	// queue, where nothing can catch it. Containment must not depend on the bus
+	// implementing the optional member.
+	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
+	const real = createLegionEventBus();
+	// Structural stand-in: same surface the runtime needs, minus `reportError`.
+	const bus = { on: real.on, emit: real.emit } as unknown as LegionEventBus;
+	let failPaintRead = false;
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus: bus,
+		getTreeNodes: () => {
+			if (failPaintRead) throw new Error("SQLITE_IOERR: paint read");
+			return nodes;
+		},
+		now: () => 50_000,
+	});
+	let uncaught: unknown;
+	const onUncaught = (error: unknown) => { uncaught = error; };
+	process.once("uncaughtException", onUncaught);
+	try {
+		bus.emit({ nodeId: "root.worker", type: "node_launched", data: null, ts: 40_000 });
+		failPaintRead = true;
+		await settleFlush();
+		assert.equal(
+			uncaught,
+			undefined,
+			"with no reportError channel the failure is swallowed, not rethrown onto the microtask queue",
+		);
+	} finally {
+		process.removeListener("uncaughtException", onUncaught);
 		runtime.dispose();
 	}
 });
