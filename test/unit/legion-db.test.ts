@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
 	LEGION_DB_BUSY_TIMEOUT_MS,
 	LEGION_DB_USER_VERSION,
+	assertLegionJournalMode,
 	legionDbPath,
 	openLegionDb,
 	sqliteHasRow,
@@ -62,6 +63,137 @@ test("legion db uses WAL and contract busy timeout and resolves run path", () =>
 	} finally {
 		db.close();
 		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+/**
+ * The WAL precondition exists because `PRAGMA journal_mode = WAL` can decline
+ * without raising. A fixture that reliably reproduces that decline does not
+ * exist for `node:sqlite`: every candidate we probed (read-only directory, a
+ * directory squatting `<db>-wal` or `<db>-shm`, a writer holding a conflicting
+ * lock) either still reached `wal` or threw straight out of the driver, which is
+ * precisely the failure the precondition is meant to *replace*. Those paths are
+ * therefore covered by injecting the observed mode into the validation seam
+ * instead of pretending a real fixture exists, and the half that can be pinned
+ * for real — that `openLegionDb` actually routes the driver's answer through
+ * that seam — is pinned below by driving a genuine `:memory:` connection, whose
+ * mode is `memory` and never `wal`, through `openLegionDb` itself.
+ */
+test("journal mode validation refuses any mode but wal", () => {
+	for (const mode of ["delete", "truncate", "persist", "memory", "off", "", "WAL"]) {
+		assert.throws(
+			() => assertLegionJournalMode(mode, false, "/tmp/ledger.db"),
+			/\/tmp\/ledger\.db is not in WAL mode/,
+			`a file database reporting ${JSON.stringify(mode)} must be refused`,
+		);
+	}
+	// Refusal is not a stylistic complaint: the message must carry the value the
+	// driver actually reported, or the startup failure cannot be diagnosed.
+	assert.throws(
+		() => assertLegionJournalMode("delete", false, "/tmp/ledger.db"),
+		/reported "delete" \(expected "wal"\)/,
+	);
+	// An absent answer is a refusal too, never a pass: `undefined`/`null` mean the
+	// driver gave us nothing to verify, which is the assumption this check exists
+	// to remove.
+	assert.throws(() => assertLegionJournalMode(undefined, false), /reported "undefined"/);
+	assert.throws(() => assertLegionJournalMode(null, false), /reported "null"/);
+	// ...and the accepting side, pinned to the exact token SQLite returns. The
+	// comparison is case-sensitive, so lowercase `wal` passes while the
+	// capitalised `WAL` in the rejection list above does not — which matches the
+	// driver, since SQLite always reports the lowercase token.
+	assert.doesNotThrow(() => assertLegionJournalMode("wal", false));
+});
+
+test("a file database is held to the WAL precondition", () => {
+	// Guard against over-generalising the in-memory exemption below: `memory` is
+	// only tolerable when `main` really is a memory database.
+	assert.throws(
+		() => assertLegionJournalMode("memory", false, "/tmp/ledger.db"),
+		/a file database|reported "memory"/,
+	);
+});
+
+/**
+ * Force the driver to report a non-WAL journal mode, so the *wiring* of the
+ * precondition can be tested on a file database.
+ *
+ * This is deliberately not a filesystem fixture. Probing `node:sqlite` for a
+ * mount or permission that leaves `PRAGMA journal_mode = WAL` quietly on a
+ * rollback journal produced none: a read-only directory, a directory squatting
+ * `<db>-wal` / `<db>-shm`, and a competing writer holding a lock each either
+ * still reached `wal` or threw straight out of the driver — the very crash the
+ * precondition exists to turn into a diagnosable startup error. The portability
+ * that matters here is therefore pinned where it is real: at the driver seam.
+ *
+ * Returns `null` when the driver's `prepare` is not patchable, matching how
+ * `legion-statement-cache.test.ts` skips.
+ */
+function reportJournalMode(probe: { prepare(sql: string): unknown }, reported: string) {
+	const prototype = Object.getPrototypeOf(probe) as {
+		prepare: (sql: string) => { get(): unknown };
+	};
+	const descriptor = Object.getOwnPropertyDescriptor(prototype, "prepare");
+	if (!descriptor?.configurable) return null;
+	const original = prototype.prepare;
+	prototype.prepare = function patched(this: unknown, sql: string) {
+		const statement = original.call(this, sql);
+		if (!sql.includes("journal_mode = WAL")) return statement;
+		return { get: () => ({ journal_mode: reported }) };
+	};
+	return () => {
+		prototype.prepare = original;
+	};
+}
+
+test("openLegionDb fails loudly when a file database reports a non-WAL journal mode", (t) => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "legion-wal-refused-"));
+	const file = path.join(directory, "ledger.db");
+	const probe = openLegionDb(file);
+	const restore = reportJournalMode(probe, "delete");
+	probe.close();
+	if (!restore) {
+		fs.rmSync(directory, { recursive: true, force: true });
+		t.skip("driver prepare() is not instrumentable");
+		return;
+	}
+	try {
+		// The assertion that guards the defect: a real file database whose PRAGMA
+		// answer is not `wal` must throw from openLegionDb, not be handed back.
+		assert.throws(
+			() => openLegionDb(file),
+			/is not in WAL mode: PRAGMA journal_mode = WAL reported "delete" \(expected "wal"\)/,
+			"a file database that did not reach WAL must fail at open, loudly",
+		);
+	} finally {
+		restore();
+	}
+	// Causality, stated so the test cannot pass for the wrong reason: with the
+	// driver answering honestly again, the same file opens fine.
+	const reopened = openLegionDb(file);
+	try {
+		assert.equal(reopened.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
+	} finally {
+		reopened.close();
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("openLegionDb does not hold an in-memory database to the WAL precondition", () => {
+	// SQLite does not implement WAL for in-memory databases and reports `memory`
+	// forever. That is benign — the database cannot outlive the process — and it is
+	// the one non-WAL answer openLegionDb is expected to accept. 41 unit-test call
+	// sites depend on it, so a blanket `!== "wal"` throw would take the suite down.
+	const db = openLegionDb(":memory:");
+	try {
+		assert.equal(db.prepare("PRAGMA journal_mode").get()?.journal_mode, "memory");
+		assert.equal(
+			db.prepare("PRAGMA database_list").get()?.file,
+			"",
+			"an in-memory `main` reports an empty file — that is the signal the exemption keys on",
+		);
+	} finally {
+		db.close();
 	}
 });
 

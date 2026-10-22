@@ -132,6 +132,54 @@ export function sqliteHasRow(row: SqliteRow | null | undefined): boolean {
 	return row != null;
 }
 
+/**
+ * The journal mode the ledger must actually run in (contract §4.1).
+ */
+export const LEGION_DB_REQUIRED_JOURNAL_MODE = "wal";
+
+/**
+ * Refuse a connection whose journal mode is not the one the ledger assumes.
+ *
+ * `PRAGMA journal_mode = WAL` is a *query*: it returns the mode now in effect,
+ * and that mode need not be `wal` — SQLite is entitled to answer with the mode
+ * it settled on rather than to fail, which is how a connection ends up on a
+ * rollback journal while the caller believes WAL is live. (Mounts without
+ * working shared memory and read-only media are the usual causes; probing
+ * `node:sqlite` here, those conditions happened to raise instead, and a
+ * conflicting lock raised too — so the silent path is not something this
+ * repository can reproduce on demand, which is exactly why the check is a
+ * precondition on the returned value rather than a test fixture.)
+ *
+ * Every durability argument the ledger makes (single-writer serialisation,
+ * readers that never block the writer, the WAL checkpoint that
+ * `runStartupHygiene` performs on each ledger it sweeps at startup, and the one
+ * `stopLegionRuntime` folds in before close) assumes WAL is actually live, so
+ * the reported value is treated as a precondition rather than a best effort.
+ * Failing at `openLegionDb` surfaces it at startup instead of as data loss.
+ *
+ * `:memory:` is the one deliberate exemption: SQLite does not implement WAL for
+ * in-memory databases and reports `memory` forever, which is correct there
+ * because the database cannot outlive the process. `memoryDatabase` is what
+ * distinguishes that benign case from a *file* that reported `memory` (a real
+ * failure — it means no rollback journal and no WAL).
+ */
+export function assertLegionJournalMode(
+	mode: unknown,
+	memoryDatabase: boolean,
+	database: string = "legion.db",
+): void {
+	const observed = typeof mode === "string" ? mode : String(mode);
+	if (memoryDatabase && observed === "memory") return;
+	if (observed === LEGION_DB_REQUIRED_JOURNAL_MODE) return;
+	throw new Error(
+		`${database} is not in WAL mode: PRAGMA journal_mode = WAL reported "${observed}" ` +
+			`(expected "${LEGION_DB_REQUIRED_JOURNAL_MODE}"). WAL is a precondition of the ledger's ` +
+			"durability and reader/writer isolation, so this connection is refused rather than " +
+			"silently running on a rollback journal. A mount without working shared-memory " +
+			"support, or read-only media, is the usual cause.",
+	);
+}
+
 /** Resolve the tree ledger location specified by contract §4.1. */
 export function legionDbPath(rootRunDir: string): string {
 	if (typeof rootRunDir !== "string" || rootRunDir.trim().length === 0) {
@@ -143,6 +191,11 @@ export function legionDbPath(rootRunDir: string): string {
 /**
  * Open one supervisor's connection to the shared tree ledger. SQLite is loaded
  * lazily so importing the extension does not require a driver until v2 is used.
+ *
+ * The WAL switch is — unusually for a PRAGMA — a request, not a command, so its
+ * returned mode is verified rather than assumed; see
+ * {@link assertLegionJournalMode}. A file database that cannot reach `wal`
+ * throws here, at startup, instead of quietly running on a rollback journal.
  */
 export function openLegionDb(dbPath: string): DatabaseSync {
 	if (typeof dbPath !== "string" || dbPath.trim().length === 0) {
@@ -158,7 +211,9 @@ export function openLegionDb(dbPath: string): DatabaseSync {
 		attachStatementCache(db);
 		db.exec(`PRAGMA busy_timeout = ${LEGION_DB_BUSY_TIMEOUT_MS};`);
 		db.exec("PRAGMA foreign_keys = ON;");
-		db.exec("PRAGMA journal_mode = WAL;");
+		// One query both requests WAL and reports the mode that actually resulted.
+		const journalMode = db.prepare("PRAGMA journal_mode = WAL;").get()?.journal_mode;
+		assertLegionJournalMode(journalMode, isMemoryLegionDb(db), dbPath);
 		migrate(db);
 		return db;
 	} catch (error) {
@@ -329,6 +384,20 @@ function sqliteDatabaseConstructor(): SqliteDatabaseConstructor {
 	}
 	cachedSqliteConstructor = null;
 	throw new AggregateError(failures, "no supported synchronous SQLite driver is available");
+}
+
+/**
+ * True when this connection's `main` database lives in memory rather than on
+ * disk. `PRAGMA database_list` reports an empty `file` for `:memory:` and for
+ * the `file::memory:` URIs, and the resolved path for a real file — asking
+ * SQLite beats pattern-matching the path the caller passed, because the driver
+ * is what decides. A missing row means we cannot tell, so it is treated as a
+ * file: the WAL check then applies and the failure is loud rather than silent.
+ */
+function isMemoryLegionDb(db: DatabaseSync): boolean {
+	const row = db.prepare("PRAGMA database_list;").get();
+	if (row == null) return false;
+	return String(row.file ?? "").length === 0;
 }
 
 function readUserVersion(db: DatabaseSync): number {
