@@ -359,7 +359,18 @@ function treeForLiveSource(
 				deps.bus.on(type, (event) => {
 					if (event.nodeId !== nodeId) return;
 					if (event.id === undefined && !processEventTypes.has(event.type)) return;
-					refresh();
+					// #261: `text_delta` is one streamed token. The token carries no tree state, so
+					// the snapshot below would only re-read what it already has — and
+					// `deps.runtime.treeNodes()` is a synchronous SQLite subtree scan (~0.95–1.09 ms
+					// p50 at 120 nodes), once per token for the whole life of the modal. Usage rows
+					// land via other paths, so a skipped snapshot defers their pickup to the next
+					// non-delta event (the backfill poll keeps the transcript current). Same
+					// exclusion the /legion tree view's subscription in this file and the status
+					// board in runtime.ts already apply.
+					//
+					// The listener below still fires: this event's only job here is the transcript,
+					// so do not re-add a refresh on the `text_delta` branch.
+					if (event.type !== "text_delta") refresh();
 					listener({
 						...(event.id === undefined ? {} : { id: event.id }),
 						domain: event.id === undefined ? "process" : "stored",
@@ -433,6 +444,17 @@ function openLiveOverlay(
 	nodeId: string,
 	onStop?: (nodeId: string) => void,
 ): void {
+	// #261/H1: every caller path funnels here (the view's `o`, the classic tree's
+	// `o`, a mouse click, `/legion <node>`, the status widget). Opening the same
+	// node twice used to mount a second host overlay while the first stayed
+	// pending: `controller.open()` closes the previous session but cannot resolve
+	// the previous `ui.custom()` promise, whose `done` is passed by pi into the
+	// factory. The orphaned `/legion` command promise never settled, and pi queues
+	// every later prompt behind it — the modal was there but frozen. Guarding the
+	// already-open node keeps that promise alive so closing it resolves normally.
+	// `controller.getCurrent()` is set synchronously by `open()`, so this also
+	// catches a double-open arriving in the same stdin chunk.
+	if (controller.getCurrent()?.nodeId === nodeId) return;
 	// #193: the overlay must cover the floating frame only. A full-screen overlay
 	// would make pi-tui discard every host cell (its composite has no transparency
 	// option), so the area around the frame collapsed to the terminal's default
