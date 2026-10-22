@@ -191,4 +191,9 @@ All `execFileSync`, so they block the parent event loop; provision adds one
   4–5x. WAL-safe against corruption but can lose the last transactions on power
   loss. Needs an explicit decision; the contract only fixes WAL + `busy_timeout`.
 - The contract asks for a 60-supervisor concurrent-WAL stress run
-  (`docs/legion-v2-contract.md`, "busy timeout rate < 0.1%"). Still unimplemented.
+  (`docs/legion-v2-contract.md`, "busy timeout rate < 0.1%"). **Implemented
+  2026-10-22** as `npm run test:wal-stress` (`test/stress/wal-stress.ts` +
+  `wal-worker.ts`): 60 forked processes x 1 connection each x postman cadence
+  (1 txn / 2 s) x 300 s -> 9004 attempts, 0 busy (0.000%), p50 1.03 ms /
+  p95 1.99 ms / p99 4.92 ms. That measurement does not revisit the
+  `synchronous` question above: it ran on the shipped `FULL`.
