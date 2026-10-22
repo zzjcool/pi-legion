@@ -2972,3 +2972,304 @@ test("C2b: stopAction — a failed retire leaves the child tracked and watching"
 	);
 	runtime.dispose();
 });
+
+// ── #238: one snapshot per event burst, not two per event ────────────────
+
+/** A `getTreeNodes` double that counts reads, so a burst's snapshot cost is observable. */
+function countingTree(nodes: TreeNodeSnapshot[]): {
+	getTreeNodes: () => TreeNodeSnapshot[];
+	calls: () => number;
+} {
+	let calls = 0;
+	return {
+		getTreeNodes: () => {
+			calls += 1;
+			return nodes;
+		},
+		calls: () => calls,
+	};
+}
+
+/** Single drain point for a coalesced flush: longer than the microtask queue. */
+async function settleFlush(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+	await new Promise((resolve) => setImmediate(resolve));
+}
+
+test("#238: a burst of events in one tick costs ONE tree snapshot, not 2 per event", async () => {
+	// The core regression: `onWidgetEvent` used to call `snapshotNodes()`
+	// directly and then `refreshUi()` → `statusEntries()` → `snapshotNodes()`
+	// again, so N back-to-back events cost 2N recursive-CTE subtree scans plus
+	// 2N usage batch queries. `legion-tools.ts` emits N `mail_sent` events in a
+	// synchronous loop, which is exactly this shape.
+	//
+	// Deliberately asserted on the call COUNT, not on elapsed time: a wall-clock
+	// assertion would be flaky on a busy box, and the snapshot count IS the cost.
+	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
+	const counting = countingTree(nodes);
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: counting.getTreeNodes,
+		now: () => 50_000,
+	});
+	try {
+		const atBurstStart = counting.calls();
+		// One synchronous tick: 20 events, no await between them.
+		for (let i = 0; i < 20; i += 1) {
+			eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "planning", to: i % 2 === 0 ? "implementing" : "planning" }, ts: 40_000 + i });
+		}
+		// Leading snapshot only: the flush is still pending, so no paint path ran.
+		assert.equal(
+			counting.calls() - atBurstStart,
+			1,
+			"the burst start takes exactly one snapshot (for applyTreeEvent's `tree` read), not one per event",
+		);
+		await settleFlush();
+		assert.equal(
+			counting.calls() - atBurstStart,
+			2,
+			"the flushed burst costs 2 snapshots total (leading + one paint) — master cost 40 for these 20 events",
+		);
+		assert.ok(
+			counting.calls() - atBurstStart < 20,
+			"a burst must be cheaper than one snapshot per event, which is the whole point of the coalescing",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: coalescing does not mean 'never refresh' — a single event still snapshots and paints", async () => {
+	// Control for the test above: an implementation that batched and then never
+	// flushed would satisfy "few snapshots" while breaking the widget.
+	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
+	const counting = countingTree(nodes);
+	const board = captureBoard();
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: counting.getTreeNodes,
+		now: () => 50_000,
+	});
+	runtime.bind(board.ui);
+	try {
+		const atBurstStart = counting.calls();
+		const repaintsBefore = board.requestRenderCount();
+		eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "planning", to: "implementing" }, ts: 40_000 });
+		await settleFlush();
+		assert.equal(
+			counting.calls() - atBurstStart,
+			2,
+			"a lone event behaves exactly like a lone burst: one leading snapshot + one paint snapshot",
+		);
+		assert.ok(
+			board.requestRenderCount() > repaintsBefore,
+			"the flush must actually paint, not just snapshot",
+		);
+		// The paint carries the event's fact: the flush re-read the ledger snapshot
+		// that `applyTreeEvent` overrode, so the phase reaches the board.
+		assert.equal(
+			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.phase,
+			"implementing",
+			"the flushed snapshot carries the event's phase override",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: a burst keeps applyTreeEvent's per-event order, so turn_start/agent_settled still compute the same state", async () => {
+	// D2: `applyTreeEvent` is a state machine, not a render. `turn_start` bumps
+	// the turn and clears the frozen endpoint; `agent_settled` freezes it; a
+	// second settle must not move it; the next turn_start clears it again. The
+	// coalescing defers ONLY the snapshot/paint, so all of it must still hold —
+	// and it must hold for events arriving inside ONE tick, which is the case
+	// the old per-event flush happened to cover by accident.
+	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => nodes,
+		now: () => 50_000,
+	});
+	try {
+		const entry = () => runtime.statusEntries().find((item) => item.nodeId === "root.worker");
+		// Same sequence as the pre-existing "turn_start resets a frozen current
+		// turn" test, but with every emit inside one synchronous burst.
+		eventBus.emit({ nodeId: "root.worker", type: "turn_start", data: { turn: 2 }, ts: 40_000 });
+		eventBus.emit({ nodeId: "root.worker", type: "agent_settled", data: null, ts: 46_000 });
+		eventBus.emit({ nodeId: "root.worker", type: "agent_settled", data: null, ts: 49_000 });
+		await settleFlush();
+		assert.equal(entry()?.turns, 2, "turn_start's increment survived the coalesced flush");
+		assert.equal(entry()?.currentTurnStartedAt, 40_000);
+		assert.equal(
+			entry()?.currentTurnEndedAt,
+			46_000,
+			"the FIRST settle froze the endpoint and the second (later, ts=49_000) did not move it",
+		);
+
+		// A later turn_start clears the frozen endpoint again, in its own tick.
+		eventBus.emit({ nodeId: "root.worker", type: "turn_start", data: { turn: 3 }, ts: 48_000 });
+		await settleFlush();
+		assert.equal(entry()?.turns, 3);
+		assert.equal(entry()?.currentTurnStartedAt, 48_000);
+		assert.equal(entry()?.currentTurnEndedAt, undefined, "a new turn clears the frozen endpoint");
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: the burst-start snapshot is what applyTreeEvent reads — a node created mid-cycle is visible to its first event", async () => {
+	// D2's trap, isolated. `applyTreeEvent` guards on `tree.get(event.nodeId)`,
+	// and `tree` is populated ONLY by `snapshotNodes()`. If the implementation
+	// deferred the snapshot to the end of the burst, the first event of a tick
+	// would be applied against the previous tick's tree: a node launched since
+	// then is absent, so its launch event is silently dropped. This pins the
+	// leading snapshot: the tree grows between two ticks, and the very first
+	// event of the second tick must still land.
+	let nodes = [statusTreeNode("root", null, "root", 0)];
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => nodes,
+		now: () => 50_000,
+	});
+	try {
+		// Tick 1 establishes the one-node tree.
+		eventBus.emit({ nodeId: "root", type: "phase_change", data: { from: "planning", to: "implementing" }, ts: 40_000 });
+		await settleFlush();
+		// The supervisor launches a child between ticks.
+		nodes = [...nodes, statusTreeNode("root.worker", "root", "worker", 1)];
+		// Tick 2, event #1 targets the node that did not exist at the last snapshot.
+		eventBus.emit({ nodeId: "root.worker", type: "node_launched", data: null, ts: 41_000 });
+		eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "planning", to: "implementing" }, ts: 42_000 });
+		await settleFlush();
+		const worker = runtime.treeNodes().find((node) => node.id === "root.worker");
+		assert.equal(
+			worker?.status,
+			"running",
+			"the first event of a burst was vetted against a current tree (not a stale one, which would drop it)",
+		);
+		assert.equal(worker?.phase, "implementing", "the later event of the same burst also landed");
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: a burst's mid-burst events re-read no snapshot, but the flush converges to the latest event", async () => {
+	// The semantic difference the coalescing introduces, made explicit: events
+	// 2..N are vetted against the tree as of burst start instead of a per-event
+	// re-read. `snapshotNodes()` re-vets every override it replays, so the
+	// painted result still reflects the LAST applicable event. Events that go
+	// backwards in time must still be vetoed (that is `applyTreeEvent`'s own
+	// guard, untouched here).
+	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => nodes,
+		now: () => 50_000,
+	});
+	try {
+		eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "planning", to: "implementing" }, ts: 40_000 });
+		eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "implementing", to: "verifying" }, ts: 41_000 });
+		eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "verifying", to: "done" }, ts: 42_000 });
+		await settleFlush();
+		assert.equal(
+			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.phase,
+			"done",
+			"the flush paints the last event's state, not the first",
+		);
+
+		// A stale event (ts older than what already landed) must not win.
+		eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "done", to: "failed" }, ts: 30_000 });
+		await settleFlush();
+		assert.equal(
+			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.phase,
+			"done",
+			"an event older than the applied override is vetoed, burst or not",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});
+
+test("#238: dispose() during the pending flush window does not touch the torn-down ledger", async () => {
+	// The flush is deferred, so `dispose()` can land in between. To flush then
+	// would repaint a cleared board and (in the PI_LEGION_DB branch) read a
+	// closed database.
+	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
+	const counting = countingTree(nodes);
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: counting.getTreeNodes,
+		now: () => 50_000,
+	});
+	eventBus.emit({ nodeId: "root.worker", type: "node_launched", data: null, ts: 40_000 });
+	const atDispose = counting.calls();
+	runtime.dispose();
+	await settleFlush();
+	assert.equal(
+		counting.calls(),
+		atDispose,
+		"the pending flush was dropped after dispose instead of reading the ledger again",
+	);
+});
+
+test("#238: only the paint is deferred — applyTreeEvent's state is readable synchronously after emit", async () => {
+	// This is the guarantee that lets the two pre-existing synchronous tests
+	// (runtime.test.ts "turn_start resets a frozen current turn", and
+	// legion-integration.test.ts "session runtime paints injected machine facts")
+	// stay byte-for-byte unchanged. Stating it as a test keeps it from being
+	// weakened later by someone who reads "coalesced" as "deferred".
+	//
+	// The boundary is exact: `applyTreeEvent` runs inside the emit (so `tree`,
+	// `eventOverrides` and `activity` are already updated), while the board paint
+	// — the only thing `refreshUi()` does beyond re-reading those — is deferred.
+	const nodes = [statusTreeNode("root", null, "root", 0), statusTreeNode("root.worker", "root", "worker", 1)];
+	const board = captureBoard();
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => nodes,
+		now: () => 50_000,
+	});
+	runtime.bind(board.ui);
+	try {
+		const repaintsBefore = board.requestRenderCount();
+		eventBus.emit({ nodeId: "root.worker", type: "phase_change", data: { from: "planning", to: "implementing" }, ts: 40_000 });
+		// NO await: exactly how both pre-existing tests read state.
+		assert.equal(
+			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.phase,
+			"implementing",
+			"statusEntries() reflects the event synchronously — the state machine is not deferred",
+		);
+		assert.equal(
+			runtime.treeNodes().find((node) => node.id === "root.worker")?.phase,
+			"implementing",
+			"treeNodes() reflects the event synchronously too",
+		);
+		assert.equal(
+			board.requestRenderCount(),
+			repaintsBefore,
+			"only the board paint is deferred — that is the half the coalescing is allowed to touch",
+		);
+		await settleFlush();
+		assert.ok(
+			board.requestRenderCount() > repaintsBefore,
+			"and the deferred paint does happen",
+		);
+	} finally {
+		runtime.dispose();
+	}
+});

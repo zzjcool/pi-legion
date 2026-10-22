@@ -869,10 +869,66 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		}
 	};
 
+	/**
+	 * True between the first event of a burst and its trailing flush. It is both
+	 * the "a flush is already scheduled" guard and the "a burst is open" marker
+	 * that tells `onWidgetEvent` whether this event needs the leading snapshot.
+	 */
+	let burstPending = false;
+
+	/**
+	 * #238: a burst of bus events in one tick costs ONE tree snapshot + paint
+	 * instead of 2×N. `snapshotNodes()` is a synchronous recursive-CTE subtree
+	 * scan plus a usage batch query, and `refreshUi()` → `statusEntries()` ran it
+	 * a second time per event.
+	 *
+	 * What stays synchronous, per event, in arrival order (D2): `applyTreeEvent`
+	 * is an incremental state machine, not a render. `event.ts >= node.updatedAt`
+	 * lets a later event veto an earlier one, `turn_start` increments the turn and
+	 * clears the frozen endpoint, and `agent_settled` freezes it — so batching or
+	 * reordering these would change the state they compute. They run in the bus
+	 * callback exactly as before.
+	 *
+	 * What is coalesced: the trailing snapshot + paint only. The *leading*
+	 * snapshot is deliberately NOT coalesced: `applyTreeEvent` reads `tree`, which
+	 * only `snapshotNodes()` populates, so the first event of a burst must see a
+	 * current tree or it would project this tick's status/phase delta against
+	 * whatever the previous tick left behind (a node launched since then is simply
+	 * absent, and its event is dropped). A burst therefore costs a leading snapshot
+	 * plus one flush — a constant 2, down from 2×N.
+	 *
+	 * Semantics of the mid-burst window: events 2..N are vetted against the tree as
+	 * of burst start rather than re-read per event (what `master` did). The only
+	 * way to observe that is an external writer bumping `node.updatedAt` *between*
+	 * two events of the same synchronous burst; and even then the flush re-vets
+	 * every override (`override.ts >= node.updatedAt` in `snapshotNodes()`), so the
+	 * painted state converges to what a per-event re-read would have reached. No
+	 * paint and no `statusEntries()` call can happen inside the emit loop, so the
+	 * mid-burst values are not observable from outside it.
+	 *
+	 * Microtask, not macrotask: the burst this targets is one synchronous emit
+	 * loop (`legion-tools.ts` emits N `mail_sent` events back-to-back; the db event
+	 * source drains a poll batch the same way), and a microtask drains the whole
+	 * burst with no timer seam, no extra flush API, and no added latency before the
+	 * TUI's next frame. A macrotask would need an explicit `flush()` seam or a
+	 * timer and would delay the paint by a tick for no coalescing benefit.
+	 */
+	const scheduleTreeFlush = (): void => {
+		if (burstPending) return;
+		burstPending = true;
+		queueMicrotask(() => {
+			burstPending = false;
+			// `dispose()` tore the board down and closed the ledger: a flush here
+			// would touch a closed db.
+			if (!disposed) refreshUi();
+		});
+	};
+
 	const onWidgetEvent = (event: LegionEvent): void => {
-		snapshotNodes();
+		// Leading snapshot, once per burst (see `scheduleTreeFlush`).
+		if (!burstPending) snapshotNodes();
 		applyTreeEvent(event);
-		refreshUi();
+		scheduleTreeFlush();
 	};
 	const busUnsubscribers = deps.eventBus
 		? LEGION_EVENT_TYPES
