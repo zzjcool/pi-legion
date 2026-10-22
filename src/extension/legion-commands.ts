@@ -359,7 +359,13 @@ function treeForLiveSource(
 				deps.bus.on(type, (event) => {
 					if (event.nodeId !== nodeId) return;
 					if (event.id === undefined && !processEventTypes.has(event.type)) return;
-					refresh();
+					// #261: `text_delta` is one streaming token. It can never change a node's status,
+					// phase, or usage, so the full-tree snapshot below would return identical data —
+					// `deps.runtime.treeNodes()` is a synchronous SQLite subtree scan (1.37 ms at
+					// 120 nodes), once per token for the whole life of the modal. Same exclusion the
+					// /legion tree view (:743) and the status board (runtime.ts:879) already apply.
+					// The listener still fires: it is what streams the delta into the modal body.
+					if (event.type !== "text_delta") refresh();
 					listener({
 						...(event.id === undefined ? {} : { id: event.id }),
 						domain: event.id === undefined ? "process" : "stored",
