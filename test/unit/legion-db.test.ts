@@ -5,7 +5,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	LEGION_DB_BUSY_TIMEOUT_MS,
-	LEGION_DB_REQUIRED_JOURNAL_MODE,
 	LEGION_DB_USER_VERSION,
 	assertLegionJournalMode,
 	legionDbPath,
@@ -58,7 +57,7 @@ test("legion db uses WAL and contract busy timeout and resolves run path", () =>
 	const file = legionDbPath(path.join(directory, "root-run"));
 	const db = openLegionDb(file);
 	try {
-		assert.equal(db.prepare("PRAGMA journal_mode").get()?.journal_mode, LEGION_DB_REQUIRED_JOURNAL_MODE);
+		assert.equal(db.prepare("PRAGMA journal_mode").get()?.journal_mode, "wal");
 		assert.equal(Number(db.prepare("PRAGMA busy_timeout").get()?.timeout), LEGION_DB_BUSY_TIMEOUT_MS);
 		assert.ok(fs.existsSync(file));
 	} finally {
@@ -99,7 +98,10 @@ test("journal mode validation refuses any mode but wal", () => {
 	// to remove.
 	assert.throws(() => assertLegionJournalMode(undefined, false), /reported "undefined"/);
 	assert.throws(() => assertLegionJournalMode(null, false), /reported "null"/);
-	// ...and the reverse: a mode SQLite reports capitalised is still WAL.
+	// ...and the accepting side, pinned to the exact token SQLite returns. The
+	// comparison is case-sensitive, so lowercase `wal` passes while the
+	// capitalised `WAL` in the rejection list above does not — which matches the
+	// driver, since SQLite always reports the lowercase token.
 	assert.doesNotThrow(() => assertLegionJournalMode("wal", false));
 });
 

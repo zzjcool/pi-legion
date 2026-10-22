@@ -151,10 +151,11 @@ export const LEGION_DB_REQUIRED_JOURNAL_MODE = "wal";
  * precondition on the returned value rather than a test fixture.)
  *
  * Every durability argument the ledger makes (single-writer serialisation,
- * readers that never block the writer, the checkpoint that `hygiene.ts` runs at
- * shutdown) assumes WAL is actually live, so the reported value is treated as a
- * precondition rather than a best effort. Failing at `openLegionDb` surfaces it
- * at startup instead of as data loss.
+ * readers that never block the writer, the WAL checkpoint that
+ * `runStartupHygiene` performs on each ledger it sweeps at startup, and the one
+ * `stopLegionRuntime` folds in before close) assumes WAL is actually live, so
+ * the reported value is treated as a precondition rather than a best effort.
+ * Failing at `openLegionDb` surfaces it at startup instead of as data loss.
  *
  * `:memory:` is the one deliberate exemption: SQLite does not implement WAL for
  * in-memory databases and reports `memory` forever, which is correct there
