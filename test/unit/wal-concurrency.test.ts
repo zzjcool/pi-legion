@@ -11,15 +11,18 @@
  *    therefore has discriminating power: the *same* workload with `busy_timeout`
  *    forced to 0 fails on `SQLITE_BUSY`. Without that control, "zero busy
  *    failures" would be unfalsifiable — a single-threaded fixture that never
- *    overlaps two writers passes no matter what the timeout is (verified: 12
- *    same-thread connections with `busy_timeout = 0` commit 96/96 with zero busy
- *    errors, because each synchronous transaction finishes before the next
- *    begins).
+ *    overlaps two writers passes no matter what the timeout is. That is not
+ *    asserted from memory: the "same-thread fixture is vacuous" test below runs
+ *    12 connections on this thread with `busy_timeout = 0` and requires them to
+ *    commit cleanly, which is precisely why the real assertion has to use
+ *    threads.
  * 3. **Zero `SQLITE_BUSY` at concurrent short-write load**, using
  *    `heartbeatEventTransaction` from `test/stress/wal-contract.ts` — the very
  *    helper the 5-minute driver runs, so the two cannot drift apart.
  * 4. **Preconditions**: every connection reports `PRAGMA journal_mode = wal` and
- *    `PRAGMA busy_timeout = LEGION_DB_BUSY_TIMEOUT_MS`.
+ *    `PRAGMA busy_timeout = 5000`, the literal §4.1 of the contract fixes. The
+ *    5000 is pinned as a literal (not merely compared against the constant that
+ *    sets it), so changing the constant without a contract revision fails here.
  * 5. **The classifier is tight**: a constraint violation is not counted as a lock
  *    timeout, so a driver cannot reach "0 busy failures" by laundering real
  *    errors into the busy bucket.
@@ -63,10 +66,9 @@ import {
 	openLegionDb,
 } from "../../src/legion/db.ts";
 import { insertNode } from "../../src/legion/nodes.ts";
-// `heartbeatEventTransaction` is not called from this file: the worker body below
-// `require`s `wal-contract.ts` so each thread runs the production helper. Only the
-// classifier is needed here, for the unit-level assertion on it.
-import { isBusyError } from "../stress/wal-contract.ts";
+// Used directly by the same-thread vacuity test; the worker *threads* require this
+// same module so every thread runs the identical helper as the 5-minute driver.
+import { heartbeatEventTransaction, isBusyError } from "../stress/wal-contract.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC_DB = path.join(HERE, "..", "..", "src", "legion", "db.ts");
@@ -75,18 +77,26 @@ const CONTRACT = path.join(HERE, "..", "stress", "wal-contract.ts");
 /** Concurrent writers; the task's suggested 8–12 range. */
 const THREADS = 8;
 
+/**
+ * `PRAGMA busy_timeout=5000` as written in the contract (`docs/legion-v2-contract.md`
+ * §4.1, "连接约定"). Hardcoded on purpose: a test that reads the timeout back
+ * through the same constant the implementation used cannot detect a wrong value.
+ */
+const CONTRACT_BUSY_TIMEOUT_LITERAL = 5_000;
+const CONTRACT_DOC = path.join(HERE, "..", "..", "docs", "legion-v2-contract.md");
+
 interface Ledger {
 	file: string;
 	cleanup(): void;
 }
 
-function freshLedger(name: string): Ledger {
+function freshLedger(name: string, nodes = THREADS): Ledger {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), `legion-wal-${name}-`));
 	const file = path.join(dir, "legion.db");
 	const db = openLegionDb(file);
 	try {
 		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" });
-		for (let i = 0; i < THREADS; i += 1) {
+		for (let i = 0; i < nodes; i += 1) {
 			insertNode(db, {
 				parentId: "root",
 				name: `sim-${String(i).padStart(2, "0")}`,
@@ -217,10 +227,19 @@ test("every connection to a WAL ledger honours busy_timeout (M2-(g) precondition
 				LEGION_DB_REQUIRED_JOURNAL_MODE,
 				`connection ${index} is not on WAL`,
 			);
+			// Literal 5000 from the contract (§4.1: `PRAGMA busy_timeout=5000`), not the
+			// implementation constant that is used to set it. Comparing against
+			// `LEGION_DB_BUSY_TIMEOUT_MS` alone cannot fail on a wrong value: mutating
+			// the constant to 200 kept the old assertion green.
 			assert.equal(
 				Number(db.prepare("PRAGMA busy_timeout").get()?.timeout),
+				CONTRACT_BUSY_TIMEOUT_LITERAL,
+				`connection ${index} does not carry the contract busy timeout ${CONTRACT_BUSY_TIMEOUT_LITERAL}ms`,
+			);
+			assert.equal(
 				LEGION_DB_BUSY_TIMEOUT_MS,
-				`connection ${index} does not carry the contract busy timeout`,
+				CONTRACT_BUSY_TIMEOUT_LITERAL,
+				"LEGION_DB_BUSY_TIMEOUT_MS drifted from the contract literal; that needs a contract revision",
 			);
 		}
 	} finally {
@@ -311,6 +330,62 @@ test(`${THREADS} concurrent writers commit every heartbeat/event transaction wit
 	} finally {
 		ledger.cleanup();
 	}
+});
+
+/**
+ * Why the assertions above must use threads, proven rather than asserted.
+ *
+ * Twelve connections driving the same transaction *on one thread* with
+ * `busy_timeout = 0` commit every transaction, because each synchronous
+ * transaction finishes before the next one starts: one thread can never overlap
+ * two writers. So "0 busy failures" from a same-thread fixture carries no
+ * information about contention — which is exactly the false comfort this file
+ * must not give. Also pins that the contract doc still contains the literal
+ * `busy_timeout` value the preconditions test hardcodes.
+ */
+test("a same-thread fixture is vacuous: busy_timeout=0 still commits, so contention must come from threads", () => {
+	const SAME_THREAD_CONNECTIONS = THREADS + 4;
+	// One seeded row per connection: without it the writes fail on "node not found"
+	// and the test measures the wrong thing (it did, before this was sized).
+	const ledger = freshLedger("same-thread", SAME_THREAD_CONNECTIONS);
+	const connections = Array.from({ length: SAME_THREAD_CONNECTIONS }, () => openLegionDb(ledger.file));
+	let attempts = 0;
+	let committed = 0;
+	let busy = 0;
+	try {
+		for (const db of connections) db.exec("PRAGMA busy_timeout = 0;");
+		for (let round = 0; round < 3; round += 1) {
+			for (const [index, db] of connections.entries()) {
+				attempts += 1;
+				try {
+					heartbeatEventTransaction(db, `root.sim-${String(index).padStart(2, "0")}`, round);
+					committed += 1;
+				} catch (error) {
+					if (isBusyError(error)) busy += 1;
+				}
+			}
+		}
+	} finally {
+		for (const db of connections) db.close();
+		ledger.cleanup();
+	}
+	// busy_timeout=0, yet no collision: this is the vacuity, stated as a fact.
+	assert.equal(busy, 0, "a same-thread run should never collide, which is why it cannot prove anything");
+	assert.equal(committed, attempts, "every same-thread transaction commits regardless of busy_timeout");
+	assert.equal(attempts, SAME_THREAD_CONNECTIONS * 3, "the fixture should attempt exactly connections x rounds");
+});
+
+/**
+ * The contract doc is the source of truth for the timeout literal; if §4.1 stops
+ * saying 5000, the guard above is pinning a number nobody agreed to.
+ */
+test("contract §4.1 still fixes the busy_timeout literal this guard pins", () => {
+	const text = fs.readFileSync(CONTRACT_DOC, "utf8");
+	assert.match(
+		text,
+		new RegExp(`PRAGMA busy_timeout=${CONTRACT_BUSY_TIMEOUT_LITERAL}\\b`),
+		`contract §4.1 no longer states busy_timeout=${CONTRACT_BUSY_TIMEOUT_LITERAL}; a contract revision is required`,
+	);
 });
 
 /**
