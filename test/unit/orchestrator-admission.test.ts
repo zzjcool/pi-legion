@@ -23,8 +23,14 @@ import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { InProcessSupervisor, type InProcessSession } from "../../src/supervisor/inprocess-supervisor.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { resetAdmissionQueuesForTests } from "../../src/supervisor/admission-queue.ts";
+import { RunStore } from "../../src/runs/store.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { insertNode } from "../../src/legion/nodes.ts";
+import { createLegionEventBus } from "../../src/extension/event-bus.ts";
+import { inProcessDepth, runAtAbsoluteDepth } from "../../src/supervisor/inprocess-depth.ts";
+import { runInChildContext, type ChildLaunchContext } from "../../src/supervisor/child-context.ts";
+import { getNode } from "../../src/legion/nodes.ts";
 import { ErrorCodes, SubagentError, type AgentConfig, type ChildRecord } from "../../src/shared/types.ts";
-import { withTempDir } from "../helpers/tmp.ts";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -354,6 +360,369 @@ test("A23: an orphaned queued record reports the lost-queue message and can be r
 		assert.equal(retired.state, "retired");
 		assert.ok(retired.retiredAt);
 		assert.deepEqual(h.spawned(), [], "no orphan is ever spawned");
+	} finally {
+		h.cleanup();
+	}
+});
+
+// ── A21 (production shape): the window only exists when launch() awaits ────
+//
+// The A21 case above runs WITHOUT a legion context, and that makes it blind to
+// the very bug it documents. Evidence (measured, not assumed): without `legion`,
+// `launch()` reaches `await this.supervisor.spawnChild(...)` with no prior await,
+// and `spawnChild` registers the child in `this.children` synchronously before
+// its own first await — so launch #1 already raised `siblings` to 1 before #2
+// probes. The in-flight reservation is never consulted, and deleting it leaves
+// the case green.
+//
+// The real window is the legion path: `reserveNode` (sync, ledger only) then
+// `await persistParentReservation(...)` sit BETWEEN the probe and `spawnChild`,
+// while the in-process fanout gate reads the supervisor's in-memory set — still
+// empty for every one of the nine. That is the shape that produced the user's
+// `inprocess maxChildrenPerNode reached for '<root>' (8/8)`, so it is the one
+// that must be guarded. This case fails when `inflightFor` is neutered.
+
+test("A21 (legion shape): the reservation is what queues the ninth, not luck", async () => {
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-ledger-"));
+	const runStore = new RunStore({ rootDir: path.join(root, ".pi-subagents") });
+	const rootRun = runStore.createRun({ task: "root", cwd: root, nodeId: "root", maxDepth: 4, herdr: { supervisor: "rpc" } });
+	const db = openLegionDb(":memory:");
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+	const spawned: string[] = [];
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 8 },
+		sessionFactory: async (input) => {
+			spawned.push(input.name);
+			return new SyncSession(input.sessionFile);
+		},
+	});
+	const runDir = runStore.runDir(rootRun.runId);
+	const orchestrator = new Orchestrator({
+		supervisor: new RoutingSupervisor({ inprocess }),
+		runDir,
+		cwd: root,
+		maxDepth: 4,
+		legion: {
+			db,
+			dbPath: path.join(runDir, "legion.db"),
+			nodeId: "root",
+			parentNodeId: null,
+			parentRunId: null,
+			runId: rootRun.runId,
+			runStore,
+			settings: { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: 30 },
+			eventBus: createLegionEventBus(),
+		},
+	});
+	try {
+		const handles = await Promise.all(
+			Array.from({ length: 9 }, (_value, index) =>
+				orchestrator.launch({ agent: agent(), task: `step-${index}`, name: `worker-${index}`, worktree: false })),
+		);
+		assert.equal(spawned.length, 8, `expected 8 spawns, saw ${spawned.length}: ${spawned.join(",")}`);
+		const ninth = handles[8]!;
+		assert.equal(ninth.queued, true, "without the reservation all nine admit and the ninth throws maxChildrenPerNode");
+		assert.equal(ninth.child.state, "queued");
+		assert.ok(handles.slice(0, 8).every((handle) => handle.queued !== true));
+	} finally {
+		orchestrator.flushLaunchQueue("test cleanup");
+		resetAdmissionQueuesForTests();
+		db.close();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── A3: a timed-out queued item leaves NOTHING behind ─────────────────────
+//
+// The contract's zero-residue rule (§8 A3): after `launchQueueTimeoutMs` the
+// record is `retired`, and there is no ledger row, no child run directory, no
+// session file and no worktree. This is the assertion that keeps a queue entry
+// from quietly becoming a half-created child — the failure mode `reserveNode`
+// would cause if it ran at enqueue time (R3/F10).
+//
+// The whole timeout path was previously untested: `launchQueue` was declared in
+// the harness but no case ever passed it, so `abandonQueued(..., "timeout")` had
+// zero coverage.
+
+test("A3: a timed-out queued launch retires with no ledger row, no session file, no run dir", async () => {
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-timeout-"));
+	const runStore = new RunStore({ rootDir: path.join(root, ".pi-subagents") });
+	const rootRun = runStore.createRun({ task: "root", cwd: root, nodeId: "root", maxDepth: 4, herdr: { supervisor: "rpc" } });
+	const db = openLegionDb(":memory:");
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+	const spawned: string[] = [];
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 1 },
+		sessionFactory: async (input) => {
+			spawned.push(input.name);
+			return new SyncSession(input.sessionFile);
+		},
+	});
+	const runDir = runStore.runDir(rootRun.runId);
+	// A controllable clock: only the queue's deadline is advanced, so the test
+	// never waits a real 15 minutes.
+	let clock = 1_000_000;
+	const notices: string[] = [];
+	const orchestrator = new Orchestrator({
+		supervisor: new RoutingSupervisor({ inprocess }),
+		runDir,
+		cwd: root,
+		maxDepth: 4,
+		now: () => clock,
+		launchQueue: { timeoutMs: 1_000, maxPending: 8 },
+		onLaunchQueueNotice: (line) => notices.push(line),
+		legion: {
+			db,
+			dbPath: path.join(runDir, "legion.db"),
+			nodeId: "root",
+			parentNodeId: null,
+			parentRunId: null,
+			runId: rootRun.runId,
+			runStore,
+			settings: { maxDepth: 4, maxChildrenPerNode: 1, maxActiveNodes: 30 },
+			eventBus: createLegionEventBus(),
+		},
+	});
+	try {
+		const first = await orchestrator.launch({ agent: agent(), task: "holder", name: "worker-0", worktree: false });
+		assert.equal(getNode(db, first.child.nodeId!)?.status, "running", "the slot holder is really live");
+		const queued = await orchestrator.launch({ agent: agent(), task: "waits", name: "worker-1", worktree: false });
+		assert.equal(queued.queued, true);
+		const childRunCountBefore = runStore.listRuns().length;
+		const nodesBefore = db.prepare("SELECT id FROM nodes ORDER BY id").all().map((row) => row.id as string);
+
+		// Cross the deadline, then let the pump's own decision run (no test-side retire).
+		clock += 2_000;
+		// The fallback watchdog is a REAL timer armed at enqueue time
+		// (`min(expiry, now + LAUNCH_QUEUE_RECHECK_MS)` = 1000 ms here); jumping the
+		// injected clock does not shorten it, so wait one recheck window.
+		await new Promise((resolve) => setTimeout(resolve, 1_200));
+
+		assert.equal(orchestrator.launchQueueEntries().length, 0, "the item left the queue");
+		const retired = orchestrator.childrenSnapshot().find((child) => child.name === "worker-1");
+		assert.equal(retired?.state, "retired", "a timed-out launch is retired, not failed");
+		assert.ok(retired?.retiredAt, "and carries the stamp");
+		assert.ok(
+			notices.some((line) => line.includes("launch queue timed out after")),
+			`expected the timeout notice, saw: ${JSON.stringify(notices)}`,
+		);
+		// Zero residue, item by item.
+		assert.equal(getNode(db, queued.child.nodeId!), null, "no ledger row was ever written");
+		assert.deepEqual(
+			db.prepare("SELECT id FROM nodes ORDER BY id").all().map((row) => row.id as string),
+			nodesBefore,
+			"the ledger is byte-identical to before the queued launch",
+		);
+		assert.equal(runStore.listRuns().length, childRunCountBefore, "no child run directory was created");
+		assert.equal(fs.existsSync(path.join(runDir, "worker-1.jsonl")), false, "no session file was created");
+		assert.equal(spawned.includes("worker-1"), false, "and nothing was spawned");
+	} finally {
+		orchestrator.flushLaunchQueue("test cleanup");
+		resetAdmissionQueuesForTests();
+		db.close();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── A18: admission replays the ALS depth/identity captured at enqueue ──────
+//
+// A queued launch can be admitted much later, from a different call chain (a
+// slot-release broadcast, the fallback timer). If the replay ran at the ROOT's
+// depth instead of the enqueue-time depth, a grandchild would be recorded at
+// depth 1 and `maxDepth` could never fire — the same class of bug the
+// in-process supervisor already fixed for turn 2+ (`runAtAbsoluteDepth`).
+
+test("A18: an admitted launch keeps the depth and child context it was created in", async () => {
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-depth-"));
+	const runDir = path.join(root, "run");
+	fs.mkdirSync(runDir, { recursive: true });
+	const spawnDepths: number[] = [];
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 1 },
+		sessionFactory: async (input) => {
+			// Recorded INSIDE the factory, i.e. at the depth the spawn really runs at.
+			spawnDepths.push(inProcessDepth());
+			return new SyncSession(input.sessionFile);
+		},
+	});
+	const orchestrator = new Orchestrator({
+		supervisor: new RoutingSupervisor({ inprocess }),
+		runDir,
+		cwd: runDir,
+		maxDepth: 8,
+	});
+	try {
+		// Hold the only slot, then enqueue from depth 2 (as a grandchild would).
+		const holder = await orchestrator.launch({ agent: agent(), task: "holder", name: "worker-0", worktree: false });
+		assert.ok(holder.name);
+		const parentContext: ChildLaunchContext = {
+			nodeId: "root.branch",
+			allowNested: true,
+			utility: false,
+			spawnMode: "inprocess",
+		};
+		// Same parentKey as the holder (`""`, both are root-level names) so the
+		// fanout gate is genuinely full; only the ALS scope differs.
+		const queuedHandle = await runAtAbsoluteDepth(2, () =>
+			runInChildContext(parentContext, () =>
+				orchestrator.launch({ agent: agent(), task: "deep", name: "worker-1", worktree: false })));
+		assert.equal(queuedHandle.queued, true, "enqueued from the nested scope");
+		assert.equal(queuedHandle.child.name, "worker-1");
+
+		// Admission happens later, from the root chain (this await releases the slot).
+		await orchestrator.retire("worker-0");
+		await new Promise((resolve) => setTimeout(resolve, 120));
+
+		// Depth is the observable the bug class actually breaks: admitted from the
+		// root chain, an unreplayed launch would spawn at depth 1 and `maxDepth`
+		// could never fire. (`currentChildContext()` inside the factory is NOT a
+		// valid probe here: the in-process supervisor deliberately REPLACES the
+		// ambient context with the child's own identity via
+		// `resolveChildLaunchContext`, so it never echoes the enqueue-time scope.)
+		// `spawnDepths[0]` is the holder (launched from the root chain, depth 1);
+		// the last entry is the admitted child, enqueued from absolute depth 2.
+		assert.equal(
+			spawnDepths.at(-1),
+			3,
+			`the admitted child must spawn at depth 3, saw ${JSON.stringify(spawnDepths)}`,
+		);
+	} finally {
+		orchestrator.flushLaunchQueue("test cleanup");
+		resetAdmissionQueuesForTests();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── A22 (D2-c): a replayed launch that loses the real gate re-queues ──────
+//
+// I-O1 makes `probeAdmission` consultative; `assertWithinLimits` stays the
+// authority. D2-c is the narrow case where the replay of an ALREADY-WAITING item
+// loses that authority: another launch took the slot between the probe and the
+// gate, so the re-probe can attribute the refusal to a queueable gate. The
+// contract then requires: back into the queue, deadline preserved (never
+// restarted, so a stuck item still times out), caller never sees a failure, and
+// no immediate re-pump (that would busy-loop while probe and gate disagree).
+//
+// The mismatch is staged the contract's way — the gate refuses WHILE the probe
+// also reports the slot as taken — not by making the gate refuse arbitrarily.
+
+test("A22: a replayed launch refused by the real gate is re-queued, not failed", async () => {
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-requeue-"));
+	const runDir = path.join(root, "run");
+	fs.mkdirSync(runDir, { recursive: true });
+	const spawned: string[] = [];
+	/** Staged disagreement: the probe reports the fanout slot as taken. */
+	let slotTakenByOther = false;
+	/** The authoritative gate refuses exactly one replay. */
+	let replayRefusals = 0;
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 1 },
+		sessionFactory: async (input) => {
+			spawned.push(input.name);
+			return new SyncSession(input.sessionFile);
+		},
+	});
+	const realCounts = inprocess.admissionCounts.bind(inprocess);
+	inprocess.admissionCounts = (name: string) => {
+		const snapshot = realCounts(name);
+		return slotTakenByOther ? { ...snapshot, siblings: 1 } : snapshot;
+	};
+	const realSpawn = inprocess.spawnChild.bind(inprocess);
+	inprocess.spawnChild = async (input) => {
+		if (input.name === "worker-alu" && replayRefusals < 1) {
+			replayRefusals += 1;
+			// The other launch claims the slot in the tiny window between this
+			// replay's probe and the authoritative gate — the D2-c disagreement.
+			slotTakenByOther = true;
+			throw new SubagentError(
+				"inprocess maxChildrenPerNode reached for '<root>' (1/1)",
+				ErrorCodes.BUDGET_EXCEEDED,
+			);
+		}
+		return realSpawn(input);
+	};
+	const notices: string[] = [];
+	const orchestrator = new Orchestrator({
+		supervisor: new RoutingSupervisor({ inprocess }),
+		runDir,
+		cwd: runDir,
+		maxDepth: 4,
+		onLaunchQueueNotice: (line) => notices.push(line),
+	});
+	try {
+		const holder = await orchestrator.launch({ agent: agent(), task: "holder", name: "worker-0", worktree: false });
+		assert.ok(holder.name);
+		const queued = await orchestrator.launch({ agent: agent(), task: "retry", name: "worker-alu", worktree: false });
+		assert.equal(queued.queued, true, "over-cap launch queues first");
+		const waitedBefore = orchestrator.launchQueueEntries()[0]!.waitedMs;
+
+		// Free the real slot: the pump replays it; the replay's own spawn claims the
+		// slot and is refused by the gate, so the catch's re-probe can attribute it.
+		await orchestrator.retire("worker-0");
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.equal(replayRefusals, 1, "the replay hit the authoritative gate");
+		assert.equal(spawned.includes("worker-alu"), false, "the refused replay spawned nothing");
+		const entries = orchestrator.launchQueueEntries();
+		assert.equal(entries.length, 1, "D2-c: the item went BACK into the queue");
+		assert.equal(entries[0]!.name, "worker-alu");
+		// W1's `AdmissionQueue` assigns `seq` itself, so a re-queue lands at the back.
+		// What protects the caller is the DEADLINE: it keeps counting instead of
+		// restarting, so a launch that keeps losing the gate still times out.
+		assert.ok(
+			entries[0]!.waitedMs >= waitedBefore,
+			"its deadline is not reset (wait keeps counting, so a stuck item still times out)",
+		);
+		assert.equal(
+			notices.some((line) => line.includes("✗")),
+			false,
+			"the caller never saw a failure line for this launch",
+		);
+
+		// The disagreement clears; the fallback recheck admits it on the next pass.
+		slotTakenByOther = false;
+		await new Promise((resolve) => setTimeout(resolve, 1_300));
+		assert.equal(spawned.includes("worker-alu"), true, "the re-queued launch eventually runs");
+		assert.equal(orchestrator.launchQueueEntries().length, 0, "and leaves the queue");
+	} finally {
+		orchestrator.flushLaunchQueue("test cleanup");
+		resetAdmissionQueuesForTests();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── A10 (orchestrator layer): overflow refuses, and leaves no ghost record ──
+//
+// The queue's own overflow return is covered in
+// `test/unit/admission-queue.test.ts`; what is NOT covered there is the
+// orchestrator's obligation around it (D6): the refusal must not leave a half-
+// built `ChildRecord` in `this.children`, or `status` would report a child that
+// can never run and a later `launch` with the same name would look taken.
+
+test("A10: launch-queue overflow is a hard refusal that leaves no ghost child", async () => {
+	const h = harness({ limits: { maxChildrenPerNode: 1 }, launchQueue: { maxPending: 1 } });
+	try {
+		await h.orchestrator.launch({ agent: agent(), task: "holder", name: "worker-0", worktree: false });
+		const queued = await h.orchestrator.launch({ agent: agent(), task: "fits", name: "worker-1", worktree: false });
+		assert.equal(queued.queued, true, "the queue holds one item");
+		await assert.rejects(
+			() => h.orchestrator.launch({ agent: agent(), task: "overflow", name: "worker-2", worktree: false }),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.BUDGET_EXCEEDED &&
+				/launch queue overflow \(1\/1\)/.test(error.message),
+			"overflow refuses immediately (D6), it does not wait",
+		);
+		assert.equal(h.orchestrator.launchQueueEntries().length, 1, "the queue did not grow");
+		assert.equal(
+			h.orchestrator.childrenSnapshot().some((child) => child.name === "worker-2"),
+			false,
+			"the refused launch left no ghost record behind",
+		);
+		assert.equal(h.spawned().includes("worker-2"), false, "and nothing spawned");
 	} finally {
 		h.cleanup();
 	}

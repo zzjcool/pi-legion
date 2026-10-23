@@ -29,6 +29,9 @@ import {
 	renderAgentsListing,
 	updateSubagentSettingsFile,
 } from "../../src/extension/slash.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { insertNode } from "../../src/legion/nodes.ts";
+import { appendEvent, readEventsAfterTolerant } from "../../src/legion/events.ts";
 import { formatAgentRoster } from "../../src/agents/agents.ts";
 import {
 	loadCatalog,
@@ -2116,17 +2119,44 @@ test("#266 A13: the launch-queue events live in the process-only set and never i
 		"the stored event closed set must stay exactly as it is (D12/A13)",
 	);
 	assert.equal(STORED_EVENT_TYPES.length, 15);
-	// Direction 2: the process-only set gained exactly the two queue events.
-	const added = [...LEGION_PROCESS_EVENT_TYPES].filter(
-		(type) => !["node_launched", "node_steered", "node_retired", "node_aborted", "ui_request",
-			"text_delta", "tool_call", "agent_settled", "turn_start"].includes(type),
+	// Direction 2: the process-only set, compared WHOLE rather than "everything
+	// that is not one of these nine". A filter-based check cannot see an
+	// equal-size substitution (add a third type while dropping one of the nine),
+	// so the full literal plus a length assertion is what actually pins it.
+	assert.deepEqual(
+		[...LEGION_PROCESS_EVENT_TYPES],
+		[
+			"node_launched", "node_steered", "node_retired", "node_aborted", "ui_request",
+			"text_delta", "tool_call", "agent_settled", "turn_start",
+			"launch_queued", "launch_admitted",
+		],
+		"the process-only set is exactly the previous nine plus the two queue events (D12)",
 	);
-	assert.deepEqual(added, ["launch_queued", "launch_admitted"], "exactly two new process events (D12)");
+	assert.equal(LEGION_PROCESS_EVENT_TYPES.length, 11);
 	assert.ok(!(STORED_EVENT_TYPES as readonly string[]).includes("launch_queued"));
 	assert.ok(!(STORED_EVENT_TYPES as readonly string[]).includes("launch_admitted"));
 	// The union the bus subscribes to still contains both, so consumers see them.
 	assert.ok(BUS_EVENT_TYPES.includes("launch_queued"));
 	assert.ok(BUS_EVENT_TYPES.includes("launch_admitted"));
+	// Third clause of A13: a stored append must still READ back after the change.
+	// A writer emitting a type `mapEvent` cannot read is the #233 freeze, and it is
+	// only observable by appending and reading, not by comparing constant lists.
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { id: "root", parentId: null, name: "root", role: "root", status: "running" });
+		appendEvent(db, "root", "node_launched", { name: "probe" });
+		appendEvent(db, "root", "budget_refused", { reason: "max_children_per_node" });
+		assert.doesNotThrow(
+			() => readEventsAfterTolerant(db, 0),
+			"appending a stored event must never wedge the event cursor",
+		);
+		assert.deepEqual(readEventsAfterTolerant(db, 0).map((event) => event.type), [
+			"node_launched",
+			"budget_refused",
+		]);
+	} finally {
+		db.close();
+	}
 });
 
 test("#266 A20: async:false reports the real queue wait per child instead of just looking slow", async () => {
