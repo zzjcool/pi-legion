@@ -494,6 +494,11 @@ export class Orchestrator {
 		for (let index = seen; index < seen + 1000; index += 1) {
 			const candidate = makeName(agentName, index);
 			if (this.children.has(candidate) || this.supervisor.isAlive(candidate)) continue;
+			// #266 D4: an automatically allocated name must not collide with a QUEUED
+			// item either. The queue is process-level, so a sibling instance's pending
+			// launch is invisible to `this.children` / `isAlive` — allocating its name
+			// here would make the new (legitimate) launch fail with NAME_TAKEN.
+			if (this.isQueuedHere(candidate)) continue;
 			this.nameCounter.set(agentName, index + 1);
 			return candidate;
 		}
@@ -827,10 +832,22 @@ export class Orchestrator {
 		// D4: the name-occupancy check must cover QUEUED records too. `previous`
 		// deliberately ignores them (D3-a: its placeholder session path is not a resume
 		// credential) and a queued child is not `alive`, so without this clause a
-		// second `launch({name})` — exactly the shape `resume`/`continue` take when it
-		// sees `isAlive === false` — enqueues the SAME name twice and only fails later,
-		// at admission, with a confusing `child is already alive`.
-		if (this.children.get(name)?.state === "queued" || this.isQueuedHere(name)) {
+		// second `launch({name})` would enqueue the SAME name twice and only fail
+		// later, at admission, with a confusing `child is already alive`.
+		//
+		// The two cases are NOT the same refusal (I-O3 / §13.3.1):
+		//  - the item is still in THIS process's queue → `NAME_TAKEN` (a live launch is
+		//    in flight under that name; wait, steer it, or stop it);
+		//  - the record is a leftover from a previous process → the queue is gone and it
+		//    can never start, so `resume`/`continue` must get the "re-dispatch it"
+		//    message instead of a `NAME_TAKEN` that implies something is running.
+		// That second branch is what keeps I-O3's promise and lets a caller relaunch
+		// the same name after a restart.
+		const queuedHere = this.children.get(name)?.state === "queued";
+		if (queuedHere || this.isQueuedHere(name)) {
+			if (queuedHere && !this.isQueuedHere(name)) {
+				throw new SubagentError(launchQueueLostMessage(name), ErrorCodes.BUDGET_EXCEEDED);
+			}
 			throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		}
 		// Only an EXPLICIT inprocess can reach this: the arbitration above already
@@ -1651,20 +1668,37 @@ export class Orchestrator {
 			this.queueWatchdog = undefined;
 		}
 		if (!queue) return [];
+		// The queue is shared with every other Orchestrator on this run dir, so a
+		// flush must only clear what THIS instance can finish clearing: the items it
+		// holds a guard for. Clearing a sibling's item would dequeue it without
+		// settling the owner's guard or retiring the owner's record, leaving a
+		// permanent `queued` zombie (and a `collect` that never returns). The owner's
+		// own abort/flush path — or the D6 deadline — retires its items.
+		const mine = queue.entries().filter((entry) => this.launchGuards.has(entry.name)).map((entry) => entry.name);
+		if (mine.length === 0) return [];
+		const removed = new Set<string>();
+		for (const name of mine) {
+			if (queue.remove(name)) removed.add(name);
+		}
 		const names: string[] = [];
-		for (const item of queue.flush()) {
-			const child = this.children.get(item.name);
+		for (const item of queue.entries()) {
+			// `entries()` is re-read below only to keep `seq` order for `removed`.
+			void item;
+		}
+		for (const name of mine) {
+			if (!removed.has(name)) continue;
+			const child = this.children.get(name);
 			if (child && child.state === "queued") {
 				child.state = "retired";
 				child.retiredAt = new Date(this.now()).toISOString();
 				child.queuePosition = undefined;
 				this.onChildUpdate(child);
 			}
-			const guard = this.launchGuards.get(item.name);
-			this.launchGuards.delete(item.name);
+			const guard = this.launchGuards.get(name);
+			this.launchGuards.delete(name);
 			guard?.settle({ kind: "rejected", reason: "flushed", message: `launch queue flushed (${reason})` });
-			this.notice(`launch queue flushed: ${item.name} (${reason})`);
-			names.push(item.name);
+			this.notice(`launch queue flushed: ${name} (${reason})`);
+			names.push(name);
 		}
 		return names;
 	}

@@ -21,7 +21,7 @@ import type {
 import { Type, type Static } from "typebox";
 import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
-import { RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
+import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
 import type { LegionSupervisor } from "./src/supervisor/types.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
@@ -695,8 +695,20 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	let lastCwd = process.cwd();
 	const supervisor = deps.supervisor ?? new RoutingSupervisor({
 		rpc: new RpcSupervisor({ onSpawnRefused }),
+		// The in-process supervisor is constructed here (not by RoutingSupervisor) so
+		// it can read live settings per spawn. That means `onSlotReleased` must be
+		// wired EXPLICITLY: RoutingSupervisor only adds it when it builds the
+		// backend itself (`options.inprocess ?? new InProcessSupervisor({...})`).
+		// Passing a pre-built instance used to drop the hook silently, so a freed
+		// slot never woke a launch-queue pump in production — admission then waited
+		// for the fallback recheck instead of firing on the release (#266 D2-d-2).
 		inprocess: new InProcessSupervisor({
 			onSpawnRefused,
+			// The event payload is not needed here: every Orchestrator on this run dir
+			// re-probes its own items, so a bare wake-up edge is the whole contract.
+			onSlotReleased: () => {
+				notifyInProcessSlotReleased();
+			},
 			getLimits: () => {
 				try {
 					return loadSubagentSettings({

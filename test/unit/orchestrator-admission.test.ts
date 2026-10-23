@@ -142,6 +142,37 @@ function harness(
 	};
 }
 
+/**
+ * Await `work`, but fail loudly if it never settles.
+ *
+ * Several admission defects had the same symptom: a promise that simply never
+ * resolves (an unsettled guard, a bare await on a queue wait). `assert.rejects`
+ * would turn that into a suite hang rather than a failing case, and node's own
+ * "unsettled top-level await" only surfaces after the whole file's timeout. This
+ * turns a non-settling promise into an immediate, legible verdict.
+ */
+async function settleWithin(
+	work: Promise<unknown>,
+	timeoutMs: number,
+): Promise<{ kind: "resolved" } | { kind: "rejected"; error: unknown } | { kind: "hang" }> {
+	const settled = work.then(
+		() => ({ kind: "resolved" as const }),
+		(error: unknown) => ({ kind: "rejected" as const, error }),
+	);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			settled,
+			new Promise<{ kind: "hang" }>((resolve) => {
+				timer = setTimeout(() => resolve({ kind: "hang" }), timeoutMs);
+				timer.unref?.();
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 // ── A21 (D2-b): the in-flight reservation is what makes same-tick fanout work ──
 
 test("A21: eight same-tick launches all spawn, the ninth is queued (D2-b in-flight reservation)", async () => {
@@ -799,33 +830,47 @@ function multiInstanceHarness(boomName?: string) {
 	};
 }
 
-test("#266 review-1: a control-action instance must not pump a sibling's queue", async () => {
-	// Before the fix: `pumpAdmissions` fell back to `{admitted: true}` for items it
-	// held no payload for, so any instance could admit somebody else's item through
-	// a probe it cannot judge. `retire()` wakes the pump unconditionally, so the
-	// mere act of retiring an UNRELATED child launched the queued one — through the
-	// authoritative gate, reproducing the exact `maxChildrenPerNode reached` line
-	// #266 exists to delete.
+test("#266 review-1: a control-action instance never admits anything", async () => {
+	// Two independent guards keep this property, and this case pins the one the
+	// others do not:
+	//  - `schedulePump` returns early when the instance owns no launch guards, and
+	//  - `pumpAdmissions`' probe answers "skip" (not "admit") for items it holds no
+	//    payload for.
+	// Removing EITHER alone leaves the queue intact, so a test asserting only "the
+	// item is still queued" cannot tell them apart (`review-6` pins the probe half via
+	// the notice stream). What is unique to the pump guard is that a control-action
+	// instance must not run a pump at all — observably, it must not consume the
+	// fallback deadline of somebody else's item, so the item's wait keeps counting
+	// down instead of being expired early by a stranger's timer.
 	const h = multiInstanceHarness();
 	try {
 		const owner = h.launchInstance();
 		await owner.launch({ agent: agent(), task: "a", name: "a", worktree: false });
-		const queued = await owner.launch({ agent: agent(), task: "b", name: "b", worktree: false });
-		assert.equal(queued.queued, true);
+		for (const name of ["b", "c", "d"]) {
+			const queued = await owner.launch({ agent: agent(), task: name, name, worktree: false });
+			assert.equal(queued.queued, true, `${name} must wait`);
+		}
 		for (const child of owner.childrenSnapshot()) await h.runStore.addChild(h.rootRun.runId, child);
 
-		// The `stop` adapter shape: restore() records, hold no launch payloads.
+		// A control-action instance with no guards of its own, restored from disk.
 		const control = h.launchInstance();
 		control.restore(h.persistedRun());
+		// It reports the queue (peek) but must never drive it.
+		assert.deepEqual(control.launchQueueEntries().map((entry) => entry.name), ["b", "c", "d"]);
 		await control.retire("a");
+		await new Promise((resolve) => setTimeout(resolve, 1_400));
 
-		assert.deepEqual(h.spawned, ["a"], "retiring an unrelated child must not start the queued one");
-		assert.deepEqual(owner.launchQueueEntries().map((entry) => entry.name), ["b"], "the queue is untouched");
-		assert.equal(
-			owner.childrenSnapshot().find((child) => child.name === "b")?.state,
-			"queued",
-			"and the record is still queued",
+		// The cap is 1 and `a` is gone: exactly ONE admission may follow, and the
+		// other two must still be waiting — a control instance that pumped would
+		// advertise "admit" for all of them at once and blow through the cap.
+		assert.ok(
+			h.spawned.length <= 2,
+			`the cap is 1, so at most one launch may follow the retire; spawned: ${h.spawned.join(",")}`,
 		);
+		assert.equal(h.spawned.includes("c"), false, "the control instance must not admit c");
+		assert.equal(h.spawned.includes("d"), false, "nor d");
+		const stillQueued = owner.childrenSnapshot().filter((child) => child.state === "queued").map((child) => child.name);
+		assert.ok(stillQueued.length >= 1, `the cap must still hold, queued: ${stillQueued.join(",")}`);
 	} finally {
 		h.cleanup();
 	}
@@ -868,9 +913,16 @@ test("#266 review-3: collect on a queued child returns when its admission fails"
 		await A.launch({ agent: agent(), task: "b", name: "b", worktree: false });
 		const collecting = A.collect("b", { timeoutMs: 5_000 });
 		await A.retire("a");
-		await assert.rejects(
-			() => collecting,
-			(error: unknown) => error instanceof SubagentError && /session factory exploded/.test(error.message),
+		// Bounded on purpose: before the fix the promise simply never settled (the
+		// guard was deleted from the map before `abandonQueued` looked it up), so an
+		// unbounded `await assert.rejects` would just hang the suite instead of
+		// failing it. The race turns a hang into a legible failure.
+		const outcome = await settleWithin(collecting, 3_000);
+		assert.equal(outcome.kind, "rejected", `collect must settle, saw: ${outcome.kind}`);
+		assert.ok(
+			outcome.kind === "rejected" &&
+				outcome.error instanceof SubagentError &&
+				/session factory exploded/.test(outcome.error.message),
 			"the admission failure must reach the waiting collect",
 		);
 	} finally {
@@ -890,11 +942,17 @@ test("#266 review-4: collect on a queued child honours the abort signal", async 
 		const abort = new AbortController();
 		const collecting = A.collect("b", { timeoutMs: 60_000, signal: abort.signal });
 		setTimeout(() => abort.abort(), 20);
-		await assert.rejects(
-			() => collecting,
-			(error: unknown) =>
-				error instanceof SubagentError && /aborted by parent while queued/.test(error.message),
-			"an abort must end the queue wait",
+		// Bounded: the pre-fix code awaited the enqueue-time promise bare, so an abort
+		// left it pending for the FULL collect budget (60 s here, 15 min in
+		// production). An unbounded `await assert.rejects` would turn that regression
+		// into a suite hang instead of a legible failure.
+		const outcome = await settleWithin(collecting, 2_000);
+		assert.equal(outcome.kind, "rejected", `an abort must end the queue wait, saw: ${outcome.kind}`);
+		assert.ok(
+			outcome.kind === "rejected" &&
+				outcome.error instanceof SubagentError &&
+				/aborted by parent while queued/.test(outcome.error.message),
+			"and must report the abort, not a timeout",
 		);
 	} finally {
 		h.cleanup();
@@ -924,5 +982,176 @@ test("#266 review-5 (D4): a queued name cannot be launched twice", async () => {
 		assert.deepEqual(A.launchQueueEntries().map((entry) => entry.name), ["b"], "the queue did not grow a duplicate");
 	} finally {
 		h.cleanup();
+	}
+});
+
+test("#266 review-6: an instance must not judge a sibling's queue item", async () => {
+	// `pumpAdmissions` scans the WHOLE shared queue, so an instance that owns at
+	// least one item also walks past its siblings' items. Answering for them is
+	// wrong in both directions:
+	//  - `?? {admitted:true}` (the pre-fix fallback) spawns a launch this instance
+	//    holds no payload for — 1b92fd3 and 1d38aa1 fixed that;
+	//  - treating "no guard" as a LOST item is just as wrong: it retires a live
+	//    sibling's launch with the I-O3 "queue was lost when the previous process
+	//    exited" line, which is false here (the owner is alive and about to admit it).
+	//
+	// The observable that separates a correct skip from either failure is the
+	// NOTICE stream: a healthy run reports only "queued(k)" and "started after
+	// queued", never a lost-item line. Verified: neutering the skip makes this case
+	// fail on the "queue was lost" assertion.
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-sibling-"));
+	const runDir = path.join(root, "run");
+	fs.mkdirSync(runDir, { recursive: true });
+	const spawned: string[] = [];
+	const notices: string[] = [];
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 1 },
+		sessionFactory: async (input) => {
+			spawned.push(input.name);
+			return new SyncSession(input.sessionFile);
+		},
+	});
+	const supervisor = new RoutingSupervisor({ inprocess });
+	// Two launch-family instances over one run dir — the shape `index.ts` creates for
+	// a command chain and a parallel recon family.
+	const make = () => new Orchestrator({
+		supervisor,
+		runDir,
+		cwd: root,
+		maxDepth: 4,
+		onLaunchQueueNotice: (line) => notices.push(line),
+	});
+	const a = make();
+	const b = make();
+	try {
+		await a.launch({ agent: agent(), task: "holder", name: "a", worktree: false });
+		await a.launch({ agent: agent(), task: "owned-by-a", name: "b", worktree: false });
+		await b.launch({ agent: agent(), task: "owned-by-b", name: "c", worktree: false });
+		assert.deepEqual(a.launchQueueEntries().map((entry) => entry.name), ["b", "c"], "one shared queue");
+		assert.deepEqual(spawned, ["a"]);
+
+		// Freeing the single slot wakes both instances; only each owner may admit its own.
+		await a.retire("a");
+		await new Promise((resolve) => setTimeout(resolve, 600));
+
+		assert.deepEqual(spawned, ["a", "b"], "exactly one admission per freed slot, admitted by its owner");
+		assert.deepEqual(a.launchQueueEntries().map((entry) => entry.name), ["c"], "the sibling's item is still waiting");
+		assert.equal(
+			notices.some((line) => /never started|queue was lost|failed to start/.test(line)),
+			false,
+			`no item may be declared lost while its owner is alive; notices: ${JSON.stringify(notices)}`,
+		);
+	} finally {
+		resetAdmissionQueuesForTests();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#266 review-7 (I-O3): relaunching an orphaned queued name says 'queue lost', not NAME_TAKEN", async () => {
+	// The D4 name gate and I-O3 must not collapse into one answer. A `queued` record
+	// whose item is NOT in this process's queue is a leftover from a previous
+	// process: it can never start, so `resume`/`continue` (which reach `launch` with
+	// that name after seeing `isAlive === false`) must be told to re-dispatch — a
+	// NAME_TAKEN would imply something is running and block the retry forever.
+	// Conversely a name that IS live in this process's queue stays NAME_TAKEN.
+	const h = multiInstanceHarness();
+	try {
+		// A run dir with one orphaned queued child and an EMPTY live queue.
+		await h.runStore.addChild(h.rootRun.runId, {
+			name: "ghost-0",
+			sessionFile: path.join(h.runDir, "ghost-0.jsonl"),
+			ownerToken: "t-ghost",
+			state: "queued",
+			spawnedAt: new Date(1_000).toISOString(),
+		});
+		const fresh = h.launchInstance();
+		fresh.restore(h.persistedRun());
+		assert.deepEqual(fresh.launchQueueEntries(), [], "no live queue in this process");
+		await assert.rejects(
+			() => fresh.launch({ agent: agent(), task: "retry", name: "ghost-0", worktree: false }),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.BUDGET_EXCEEDED &&
+				/never started: the launch queue was lost/.test(error.message),
+			"an orphaned queued name must be re-dispatchable, not NAME_TAKEN",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#266 review-8 (D4): auto-allocated names skip a sibling's queued name", async () => {
+	// `allocateName` only consulted `this.children` + `supervisor.isAlive`. The queue
+	// is process-level, so a sibling instance's pending launch is invisible to both —
+	// allocating that name would hand back a taken name, and the D4 gate would then
+	// refuse the new (perfectly legitimate) launch.
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-alloc-"));
+	const runDir = path.join(root, "run");
+	fs.mkdirSync(runDir, { recursive: true });
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 1 },
+		sessionFactory: async (input) => new SyncSession(input.sessionFile),
+	});
+	const supervisor = new RoutingSupervisor({ inprocess });
+	const make = () => new Orchestrator({ supervisor, runDir, cwd: root, maxDepth: 4 });
+	const a = make();
+	const b = make();
+	try {
+		await a.launch({ agent: agent(), task: "holder", name: "worker-0", worktree: false });
+		// A takes the next auto name and it QUEUES (the cap is 1) — so it never
+		// reaches the supervisor's registry, and `isAlive` cannot see it.
+		const queuedName = a.allocateName("worker");
+		assert.equal(queuedName, "worker-1");
+		const queued = await a.launch({ agent: agent(), task: "queued", name: queuedName, worktree: false });
+		assert.equal(queued.queued, true, "the item really waits in the shared queue");
+		assert.equal(supervisor.isAlive(queuedName), false, "and is invisible to supervisor.isAlive");
+
+		// B's counter starts at 0: it skips worker-0 (alive) and must ALSO skip the
+		// name A is waiting on. Without the queue check it returns "worker-1" here.
+		assert.notEqual(b.allocateName("worker"), queuedName, "an auto name must skip the shared queue");
+	} finally {
+		resetAdmissionQueuesForTests();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#266 review-9 (D7): flushing one instance clears only its own queue items", async () => {
+	// `flushLaunchQueue` became reachable from control-action instances in 1b92fd3
+	// (via `peekAdmissionQueue`). Flushing the whole shared queue would dequeue a
+	// sibling's item without settling the sibling's guard or retiring its record —
+	// leaving a permanent `queued` zombie whose `collect` never returns.
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-flush-"));
+	const runDir = path.join(root, "run");
+	fs.mkdirSync(runDir, { recursive: true });
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 1 },
+		sessionFactory: async (input) => new SyncSession(input.sessionFile),
+	});
+	const supervisor = new RoutingSupervisor({ inprocess });
+	const make = () => new Orchestrator({ supervisor, runDir, cwd: root, maxDepth: 4 });
+	const a = make();
+	const b = make();
+	try {
+		await a.launch({ agent: agent(), task: "holder", name: "a", worktree: false });
+		await a.launch({ agent: agent(), task: "owned-by-a", name: "b", worktree: false });
+		await b.launch({ agent: agent(), task: "owned-by-b", name: "c", worktree: false });
+		assert.deepEqual(a.launchQueueEntries().map((entry) => entry.name), ["b", "c"], "one shared queue");
+
+		const flushed = a.flushLaunchQueue("parent turn ended");
+		assert.deepEqual(flushed, ["b"], "only the owner's own item is flushed");
+		assert.deepEqual(a.launchQueueEntries().map((entry) => entry.name), ["c"], "the sibling's item survives");
+		assert.equal(
+			a.childrenSnapshot().find((child) => child.name === "b")?.state,
+			"retired",
+			"the flushed item's record is retired",
+		);
+		// The surviving item is still owned and still admittable — not a zombie.
+		assert.equal(b.childrenSnapshot().find((child) => child.name === "c")?.state, "queued");
+	} finally {
+		resetAdmissionQueuesForTests();
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
