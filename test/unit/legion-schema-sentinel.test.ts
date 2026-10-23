@@ -225,6 +225,10 @@ test("legion v2 contract §11.1 keeps the three frozen gate defaults", () => {
 		["maxDepth", "4"],
 		["maxChildrenPerNode", "8"],
 		["maxActiveNodes", "30"],
+		// #266: the admission queue's own bound. Registered here because it is a
+		// hard cap in the same table, and the row is what tells operators that a
+		// saturated queue refusing a launch is a limit, not a bug.
+		["maxQueuedLaunches", "32"],
 	] as const) {
 		const row = tableRows.find((cells) => cells[0]?.includes(`\`${name}\``));
 		assert.ok(row, `Schema sentinel: §11.1 is missing the ${name} default row; update this test explicitly when revising the contract.`);

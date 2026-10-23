@@ -40,6 +40,7 @@ import {
 } from "../../index.ts";
 import { createSessionRuntime, type WaitResult } from "../../src/extension/runtime.ts";
 import { RunStore } from "../../src/runs/store.ts";
+import { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import piLegion from "../../index.ts";
 
@@ -1855,6 +1856,327 @@ test("vexillatio interrupt keeps failure lines before collected segments (#227 D
 		assert.equal(details?.handles?.length, 2, "the refused launch has no handle");
 		assert.deepEqual(details?.handles?.map((handle) => handle.name), names);
 		assert.deepEqual(details?.stillRunning, [inTurn], "only the in-turn utility is still running");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// #266 W4: launch admission queue wiring end to end through the index adapter.
+//
+// These run against a REAL `InProcessSupervisor` (its counting, its gate and its
+// slot-release hook are the production ones) because the whole point of the
+// queue is that the *supervisor's* fanout cap stops producing `✗ … reached`
+// lines. Only the SDK session factory is faked, so no model is contacted.
+// ---------------------------------------------------------------------------
+
+/**
+ * Index harness whose supervisor is a real in-process backend.
+ *
+ * `FakeSupervisor` cannot serve these cases: it has no `admissionCounts()`, so
+ * the Orchestrator's probe correctly admits everything and nothing ever queues —
+ * a false green for exactly the bug #266 fixes.
+ */
+function inprocessHarness(
+	settings: Record<string, unknown>,
+	agents: Record<string, string>,
+	options: { maxChildrenPerNode?: number; maxActive?: number } = {},
+): {
+	cwd: string;
+	supervisor: InProcessSupervisor;
+	sessions: Array<{ name: string; settle(): void }>;
+	sentMessages: Array<{ content?: unknown }>;
+	tool: { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }> };
+	/** Observe each child session creation (fires during the launch phase). */
+	onSession(fn: (name: string) => void): void;
+	/** Observe the D9 notice channel (`onLaunchQueueNotice` → `pi.sendMessage`). */
+	onNotice(fn: (content: string) => void): void;
+	cleanup(): Promise<void>;
+} {
+	const cwd = mkdtempSync(path.join(tmpdir(), "teams-index-queue-"));
+	const names = [
+		"PI_SUBAGENT_CHILD", "PI_SUBAGENT_UTILITY_CHILD", "PI_CODING_AGENT_DIR",
+		"PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV,
+	];
+	const previous = new Map(names.map((name) => [name, process.env[name]]));
+	const agentDir = path.join(cwd, "agentdir");
+	const extraDir = path.join(cwd, "extra-agents");
+	mkdirSync(agentDir, { recursive: true });
+	mkdirSync(extraDir, { recursive: true });
+	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: settings }));
+	for (const [file, content] of Object.entries(agents)) writeFileSync(path.join(extraDir, file), content);
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraDir;
+	delete process.env.PI_SUBAGENT_CHILD;
+	delete process.env.PI_SUBAGENT_UTILITY_CHILD;
+	for (const name of ["PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV]) delete process.env[name];
+
+	const sessions: Array<{ name: string; settle(): void }> = [];
+	let onSession: ((name: string) => void) | undefined;
+	const supervisor = new InProcessSupervisor({
+		limits: {
+			maxActive: options.maxActive ?? 30,
+			maxChildrenPerNode: options.maxChildrenPerNode ?? 8,
+		},
+		sessionFactory: async (input) => {
+			const listeners = new Set<(event: unknown) => void>();
+			onSession?.(input.name);
+			sessions.push({
+				name: input.name,
+				settle() {
+					// `collect` derives the outcome from the transcript, so a settle event
+					// alone is not enough: the turn must actually be written.
+					writeFileSync(
+						input.sessionFile,
+						`${JSON.stringify({ type: "message", message: { role: "user", content: "task" } })}\n` +
+						`${JSON.stringify({
+							type: "message",
+							message: {
+								role: "assistant",
+								content: [{ type: "text", text: '{"ok":true,"reason":"fake inprocess child completed"}' }],
+								stopReason: "stop",
+								model: "test/glm-5.3-flash",
+							},
+						})}\n`,
+					);
+					for (const listener of [...listeners]) listener({ type: "agent_settled" });
+				},
+			});
+			return {
+				subscribe(listener: (event: unknown) => void) {
+					listeners.add(listener);
+					return () => listeners.delete(listener);
+				},
+				async prompt(text: string) {
+					// The transcript's first user line is the acceptance signal (#227 D1).
+					writeFileSync(
+						input.sessionFile,
+						`${JSON.stringify({ type: "message", message: { role: "user", content: text } })}\n`,
+					);
+					for (const listener of [...listeners]) listener({ type: "agent_start" });
+				},
+				dispose() {},
+			};
+		},
+	});
+	const tools: Array<Record<string, unknown>> = [];
+	const sentMessages: Array<{ content?: unknown }> = [];
+	// The extension starts a `setInterval` for its status widget; without running
+	// the shutdown handler the test file never drains and the runner reports a
+	// pending promise for the whole file.
+	const handlers = new Map<string, (...args: unknown[]) => unknown>();
+	let onNotice: ((content: string) => void) | undefined;
+	const pi = {
+		registerTool(tool: unknown) { tools.push(tool as Record<string, unknown>); },
+		registerCommand() {}, registerMessageRenderer() {},
+		sendMessage(message: unknown) {
+			sentMessages.push(message as { content?: unknown });
+			const content = (message as { content?: unknown }).content;
+			if (typeof content === "string") onNotice?.(content);
+		},
+		events: { emit() {} },
+		on(name: string, handler: (...args: unknown[]) => unknown) { handlers.set(name, handler); },
+	};
+	piLegion(pi as never, { supervisor });
+	const tool = tools.find((entry) => entry.name === "subagent") as {
+		execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }>;
+	};
+	assert.ok(tool, "subagent tool registered through the index entry point");
+	return {
+		cwd, supervisor, sessions, sentMessages, tool,
+		async cleanup() {
+			for (const session of sessions) session.settle();
+			await handlers.get("session_shutdown")?.({ mode: "interactive" });
+			for (const [name, value] of previous) restoreEnv(name, value);
+			rmSync(cwd, { recursive: true, force: true });
+		},
+		/** Runs inside the session factory, i.e. during the launch phase. */
+		onSession(fn: (name: string) => void) { onSession = fn; },
+		/** Observe every `pi.sendMessage` content (the D9 notice channel). */
+		onNotice(fn: (content: string) => void) { onNotice = fn; },
+	};
+}
+
+const QUEUE_WORKER_FILE = "---\nname: worker\ndescription: worker role\n---\nworker prompt\n";
+
+test("#266 A1: a 12-step tasks[] fanout against maxChildrenPerNode 8 queues the last four instead of failing", async () => {
+	const harness = inprocessHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": QUEUE_WORKER_FILE },
+		{ maxChildrenPerNode: 8 },
+	);
+	try {
+		const result = await harness.tool.execute(
+			"queue-fanout",
+			{
+				tasks: Array.from({ length: 12 }, (_value, index) => ({ agent: "worker", task: `step-${index}` })),
+				async: true,
+				worktree: false,
+			},
+			undefined, undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		const text = (result.content ?? []).map((item) => item.text ?? "").join("\n");
+		const launchLines = text.split("\n").filter((line) => line.startsWith("▶ "));
+		const queuedLines = launchLines.filter((line) => / queued\(\d+\)$/.test(line));
+		// D9-1: the exact contract shape, e.g.
+		// `▶ scout-7 (scout) supervisor=inprocess queued(3)`.
+		assert.equal(launchLines.length, 12, `every step reported a launch line, saw:\n${launchLines.join("\n")}`);
+		assert.equal(queuedLines.length, 4, `the four over the cap are queue lines, saw:\n${queuedLines.join("\n")}`);
+		for (const line of queuedLines) {
+			assert.match(line, /^▶ \S+ \(worker\) supervisor=inprocess queued\([1-4]\)$/, `queue suffix appended in place: ${line}`);
+		}
+		// The whole point of the issue: no user-visible budget refusal anywhere.
+		assert.doesNotMatch(text, /BUDGET_EXCEEDED/);
+		assert.doesNotMatch(text, /maxChildrenPerNode reached/);
+		assert.doesNotMatch(text, /✗/, `no refusal line at all, saw:\n${text}`);
+		// details.spawns keeps its published shape (a renderer input) — no queue keys added.
+		const details = result.details as { spawns?: Array<Record<string, unknown>> } | undefined;
+		assert.equal(details?.spawns?.length, 12);
+		for (const spawn of details?.spawns ?? []) {
+			assert.deepEqual(
+				Object.keys(spawn).sort(),
+				["agent", "name", "spawnMode"],
+				"the launch line gained a suffix; details.spawns did not change shape",
+			);
+		}
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#266 A5: an aborted turn drops queued launches and reports them, spawning nothing extra", async () => {
+	const harness = inprocessHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": QUEUE_WORKER_FILE },
+		{ maxChildrenPerNode: 1 },
+	);
+	try {
+		const controller = new AbortController();
+		// Abort as soon as the queue actually holds an item: the `queued(N)` notice
+		// is emitted synchronously inside `launch()`, so this is the earliest point
+		// where a flush has something to drop. Aborting earlier would prove nothing.
+		let aborted = false;
+		harness.onNotice((content) => {
+			if (aborted || !/ queued\(\d+\)$/.test(content)) return;
+			aborted = true;
+			controller.abort();
+		});
+		const result = await harness.tool.execute(
+			"queue-abort",
+			{
+				tasks: Array.from({ length: 4 }, (_value, index) => ({ agent: "worker", task: `step-${index}` })),
+				async: true,
+				worktree: false,
+			},
+			controller.signal,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		const text = (result.content ?? []).map((item) => item.text ?? "").join("\n");
+		assert.match(text, /interrupted \(parent turn ended; children still running\)/, "the frozen head line still leads");
+		assert.match(
+			text,
+			/^\d+ queued launch\(es\) dropped: \S+/m,
+			`the dropped launches are named, saw:\n${text}`,
+		);
+		const dropped = Number(/^(\d+) queued launch\(es\) dropped/m.exec(text)?.[1] ?? "0");
+		assert.ok(dropped > 0, `at least one queued launch was actually dropped, saw:\n${text}`);
+		// Zero spawns for the flushed items: the only child that ever ran is the
+		// one admitted on the fast path before the abort.
+		const flushedNames = (/^\d+ queued launch\(es\) dropped: (.+)$/m.exec(text)?.[1] ?? "")
+			.split(", ")
+			.filter(Boolean);
+		for (const name of flushedNames) {
+			assert.ok(
+				!harness.sessions.some((session) => session.name === name),
+				`the flushed item ${name} never spawned`,
+			);
+		}
+		assert.equal(harness.sessions.length, 1, "one slot, one spawn — the abort added none");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#266 A13: the launch-queue events live in the process-only set and never in the stored closed set", async () => {
+	const { LEGION_PROCESS_EVENT_TYPES, LEGION_EVENT_TYPES: BUS_EVENT_TYPES } =
+		await import("../../src/extension/event-bus.ts");
+	const { LEGION_EVENT_TYPES: STORED_EVENT_TYPES } = await import("../../src/legion/events.ts");
+	// Direction 1: the persisted closed set is byte-for-byte unchanged. Adding a
+	// type here is the #233 incident (a writer emits a row `mapEvent` cannot read,
+	// which freezes the DB event cursor permanently).
+	assert.deepEqual(
+		[...STORED_EVENT_TYPES],
+		[
+			"node_launched", "node_settled", "node_failed", "node_retired", "node_resumed",
+			"node_blocked", "node_abandoned", "phase_change", "phase_timeout", "mail_sent",
+			"mail_delivered", "mail_bounced", "budget_refused", "orphan_detected", "tree_finalized",
+		],
+		"the stored event closed set must stay exactly as it is (D12/A13)",
+	);
+	assert.equal(STORED_EVENT_TYPES.length, 15);
+	// Direction 2: the process-only set gained exactly the two queue events.
+	const added = [...LEGION_PROCESS_EVENT_TYPES].filter(
+		(type) => !["node_launched", "node_steered", "node_retired", "node_aborted", "ui_request",
+			"text_delta", "tool_call", "agent_settled", "turn_start"].includes(type),
+	);
+	assert.deepEqual(added, ["launch_queued", "launch_admitted"], "exactly two new process events (D12)");
+	assert.ok(!(STORED_EVENT_TYPES as readonly string[]).includes("launch_queued"));
+	assert.ok(!(STORED_EVENT_TYPES as readonly string[]).includes("launch_admitted"));
+	// The union the bus subscribes to still contains both, so consumers see them.
+	assert.ok(BUS_EVENT_TYPES.includes("launch_queued"));
+	assert.ok(BUS_EVENT_TYPES.includes("launch_admitted"));
+});
+
+test("#266 A20: async:false reports the real queue wait per child instead of just looking slow", async () => {
+	const harness = inprocessHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": QUEUE_WORKER_FILE },
+		{ maxChildrenPerNode: 1 },
+	);
+	try {
+		// `async:false` collects inline, one child at a time, so each queued item
+		// must be admitted before its collect resolves. Settling each child as it
+		// appears frees the single slot the next one needs.
+		let settled = 0;
+		const settleNext = (): void => {
+			// Only settle a child that has not settled yet: the queue advances on
+			// the retire that follows collect, so settling the same one twice would
+			// stall the chain.
+			if (settled < harness.sessions.length) {
+				harness.sessions[settled]?.settle();
+				settled += 1;
+			}
+		};
+		const ticker = setInterval(settleNext, 10);
+		let text: string;
+		try {
+			const result = await harness.tool.execute(
+				"queue-async-false",
+				{
+					tasks: Array.from({ length: 3 }, (_value, index) => ({ agent: "worker", task: `step-${index}` })),
+					async: false,
+					worktree: false,
+				},
+				undefined, undefined,
+				{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+			);
+			text = (result.content ?? []).map((item) => item.text ?? "").join("\n");
+		} finally {
+			clearInterval(ticker);
+		}
+		// All three results are present — nothing was dropped by queueing.
+		const collected = text.split("\n").filter((line) => line.startsWith("── "));
+		assert.equal(collected.length, 3, `all three steps were collected, saw:\n${text}`);
+		// The two over the cap report their own real wait (D8/A20).
+		const waitLines = text.split("\n").filter((line) => /^↳ \S+ waited \d+s in the launch queue$/.test(line));
+		assert.equal(waitLines.length, 2, `each queued child reports its wait, saw:\n${text}`);
+		for (const line of waitLines) {
+			assert.match(line, /^↳ worker-\d+ waited \d+s in the launch queue$/);
+		}
+		assert.doesNotMatch(text, /BUDGET_EXCEEDED/);
+		assert.doesNotMatch(text, /maxChildrenPerNode reached/);
 	} finally {
 		await harness.cleanup();
 	}

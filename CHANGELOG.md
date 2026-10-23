@@ -11,6 +11,33 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Added
+
+- **Launch admission queue (#266).** A launch that exceeds a *concurrency* gate
+  (`maxChildrenPerNode`, `maxActive`, ledger `max_children_per_node` /
+  `max_active_nodes`) no longer fails with `BUDGET_EXCEEDED`. It is enqueued,
+  the caller gets `▶ scout-7 (scout) supervisor=inprocess queued(3)` and treats
+  the work as dispatched, and the child starts automatically when a slot frees.
+  Previously a 12-step fan-out against `maxChildrenPerNode: 8` ran 8 children and
+  reported 4 errors — and nothing ever retried them, because the parent was
+  already inside `wait` and the freed slot had no subscriber.
+  - New settings: `subagents.inprocess.maxQueuedLaunches` (default **32**) and
+    `subagents.inprocess.launchQueueTimeoutMs` (default **900000**). Both are
+    shared by the in-process and RPC paths — one scheduler, not two.
+  - Depth, spawn-per-session, memory, name-collision and config errors are still
+    refused synchronously, byte-identically to before: only gates that a slot
+    release can satisfy are queueable. `maxChildrenPerNode: 0` is a hard refusal
+    (0 means "no children", so waiting can never satisfy it).
+  - A queued launch reserves nothing: no ledger row, no child run directory, no
+    worktree, no session file. `timeout`/`overflow`/`stop` are reported by name;
+    `stop` dequeues without ever spawning, and a parent-turn abort flushes the
+    queue and says how many launches it dropped.
+  - `subagent({action:"status"})` shows `state=queued`, `collect`/`wait` block
+    until admission instead of reading the placeholder session path, and
+    `async: false` reports `↳ <name> waited Ns in the launch queue`.
+  - Two new process-only events (`launch_queued`, `launch_admitted`) and a
+    `legion-queue: N queued` status pill.
+
 ## [4.0.0] — 2026-10-19
 
 Pi-only runtime. Relative to 3.1.0 this line removes every non-`pi` agent kind,

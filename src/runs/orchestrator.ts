@@ -1839,7 +1839,7 @@ export class Orchestrator {
 	}
 
 	async collect(name: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CollectResult> {
-		const child = this.requireChild(name);
+		let child = this.requireChild(name);
 		const timeoutMs = opts.timeoutMs ?? DEFAULTS.turnTimeoutMs;
 		// D8/A12: a queued child has no session yet. Block until it is admitted
 		// (then fall through to the normal path) or until it leaves the queue
@@ -1855,6 +1855,12 @@ export class Orchestrator {
 			if (admission.kind === "rejected") {
 				throw new SubagentError(admission.message, ErrorCodes.BUDGET_EXCEEDED);
 			}
+			// Admission REPLACES the placeholder record (`admitQueued` deletes it and
+			// the real launch registers a new one). Reading further through the old
+			// object would use its placeholder `sessionFile` — which for the legion
+			// path is a DIFFERENT file than the spawned child's run-dir transcript, so
+			// the outcome would be derived from a file nobody ever wrote.
+			child = this.requireChild(name);
 		}
 		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(child.sessionFile));
 		if (opts.signal?.aborted) return abortedSnapshot();

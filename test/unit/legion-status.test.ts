@@ -398,3 +398,73 @@ test("/legion status sends chat text outside TUI and completes names", async () 
 	await command.handler("status missing", ctx);
 	assert.match(notes.at(-1) ?? "", /Unknown Legion node "missing"/);
 });
+
+// ---------------------------------------------------------------------------
+// #266 A11 / D9-4: a queued child renders as `state=queued`, never `unknown`.
+// ---------------------------------------------------------------------------
+
+test("#266 A11: a queued child renders state=queued with its expected backend, not unknown", () => {
+	// The queued record is a real run.json child (D3-a): it has a placeholder
+	// sessionFile that does not exist yet and no execution snapshot at all.
+	// `alive` is false because nothing was spawned, which is exactly the state
+	// that used to fall through to `unknown child` / `supervisor=unknown`.
+	const facts: LegionChildStatusFacts = {
+		name: "scout-7",
+		state: "queued",
+		agent: "scout",
+		kind: "pi",
+		sessionFile: "/tmp/pi-legion-never-created/scout-7.jsonl",
+		spawnMode: "inprocess",
+		alive: false,
+	};
+	const rendered = renderLiveChildStatus(facts);
+	assert.match(rendered, /state=queued/, "the queue state is shown literally (D9-4)");
+	assert.match(rendered, /supervisor=inprocess/, "the expected backend is reported, not omitted");
+	assert.doesNotMatch(rendered, /unknown child/, "a queued child is a known child");
+	assert.doesNotMatch(rendered, /state=unknown/);
+	// No liveness/memory line can be honest for a child that never ran.
+	assert.doesNotMatch(rendered, /quiet/, "alive=false prints no quiet line");
+	assert.doesNotMatch(rendered, /memory:/, "alive=false prints no memory line");
+
+	// The same record through the named status route must not degrade either.
+	const report = renderLegionStatus({ nodes: [], jobs: [], lookupChild: () => facts, query: "scout-7" });
+	assert.equal(report.ok, true);
+	assert.match(report.text, /state=queued/);
+	assert.match(report.text, /supervisor=inprocess/);
+	assert.doesNotMatch(report.text, /unknown/i);
+});
+
+test("#266 A11: a queued child is a live child, so status overview lists it", async () => {
+	const { listLiveChildrenForStatus, renderStatusOverview } = await import("../../index.ts");
+	const queuedChild = {
+		name: "scout-7",
+		sessionFile: "/tmp/pi-legion-never-created/scout-7.jsonl",
+		ownerToken: "tok",
+		state: "queued" as const,
+		spawnedAt: "2026-01-01T00:00:00.000Z",
+		agent: "scout",
+		kind: "pi" as const,
+		spawnMode: "inprocess" as const,
+		queuePosition: 3,
+	};
+	const runs = [{
+		schemaVersion: 1 as const,
+		runId: "r-queued",
+		task: "t",
+		cwd: "/tmp",
+		herdr: { supervisor: "inprocess" as const, node_id: "root" },
+		path: [],
+		depth: 0,
+		maxDepth: 3,
+		budget: { spawned: 0, limit: null, granted: 0 },
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+		children: [queuedChild],
+	}];
+	const live = listLiveChildrenForStatus(runs);
+	assert.equal(live.length, 1, "a queued child is live for status purposes (D9)");
+	assert.equal(live[0]?.state, "queued");
+	const overview = renderStatusOverview([{ child: live[0]!, alive: false }]);
+	assert.match(overview, /state=queued/);
+	assert.match(overview, /supervisor=inprocess/);
+});

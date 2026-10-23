@@ -6,7 +6,16 @@ import {
 } from "../legion/events.ts";
 import type { LegionEventType as StoredLegionEventType } from "../legion/events.ts";
 
-/** Process-only activity. These events are never written to the closed DB enum. */
+/**
+ * Process-only activity. These events are never written to the closed DB enum.
+ *
+ * Launch-admission-queue (issue #266, contract D12) belongs here and ONLY here:
+ * queue residency is a fact about *this* process (the queue lives in memory and
+ * dies with it), so persisting it would be meaningless. Adding a type to
+ * `src/legion/events.ts` instead would freeze the DB event cursor (#233); the
+ * mirrored pair of assertions in `test/unit/teams.test.ts` (A13) guards both
+ * directions of that boundary.
+ */
 export const LEGION_PROCESS_EVENT_TYPES = [
 	"node_launched",
 	"node_steered",
@@ -17,6 +26,8 @@ export const LEGION_PROCESS_EVENT_TYPES = [
 	"tool_call",
 	"agent_settled",
 	"turn_start",
+	"launch_queued",
+	"launch_admitted",
 ] as const;
 export type LegionProcessEventType = (typeof LEGION_PROCESS_EVENT_TYPES)[number];
 

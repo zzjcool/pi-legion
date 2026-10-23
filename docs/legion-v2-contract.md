@@ -375,6 +375,7 @@ interface LegionEventBus {
 | `maxDepth`（全树深度） | 4 | 硬顶 = `MAX_NESTED_PATH_ENTRIES`（血缘路径在 4 处饱和；settings/env 超 4 截断——告警在 M1-integration 的 launch 路径接入，M0 阶段截断静默可接受）。每进程生效上限 C：根 `C = min(env 运营者覆盖, settings.legion.maxDepth, 4)`；深度 d、上限 C 的父 launch 角色 R：先过闸门 `d+1 > C` → BUDGET_EXCEEDED；再经 `PI_SUBAGENT_MAX_DEPTH` 下发 `C子 = min(C, d + R, 4)`（R 缺省=不收紧；非法值按叶子 R=1 处理；语义 = 子树代数含自身，位置无关，只收紧不放宽）。不变量：C子 ≤ C父，且每进程 depth ≤ maxDepth |
 | `maxChildrenPerNode`（单节点扇出） | 8 | 父 supervisor 查自己 **live** 子节点数（`starting`/`running`/`blocked`；`settled`/`failed`/`retired` 不占槽，session 可保留 resume） |
 | `maxActiveNodes`（全树并发 running+starting） | 30 | **全树真闸门**（替代只当 hint 的 maxConcurrentAgents）：launch 前一条 SQL，超限 BUDGET_EXCEEDED + `budget_refused` 事件 |
+| `maxQueuedLaunches`（准入队列上限，#266） | 32 | 只有扇出/并发两类闸门可排队（`max_children_per_node`、`max_active_nodes`，以及 in-process 的 `maxChildrenPerNode`/`maxActive`）；队列满 → 立即硬拒 `launch queue overflow (N/32)`，不留账本行。`maxDepth`/`max_active_nodes` 之外的深度与 spawn 预算**永不排队**。键名 `subagents.inprocess.maxQueuedLaunches`，两个后端共用同一个值 |
 
 ### 11.2 心跳与孤儿：postman 循环每次刷新直接子节点 `updated_at`。根 supervisor 每 60s 扫描：非终态 + `updated_at` 超 90s = `orphan_detected` 事件 + mail 通知 CEO。恢复 = resume 链（CEO 裁决，auto-resume 默认关）。孤儿判定可判定化：**非终态 ∧ 无活跃进程 ∧ 心跳超时**。
 

@@ -20,9 +20,14 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import { RunStore } from "../../src/runs/store.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { insertNode } from "../../src/legion/nodes.ts";
+import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { InProcessSupervisor, type InProcessSession } from "../../src/supervisor/inprocess-supervisor.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { resetAdmissionQueuesForTests } from "../../src/supervisor/admission-queue.ts";
+import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import type { AgentConfig, ChildRecord } from "../../src/shared/types.ts";
 
 function agent(overrides: Partial<AgentConfig> = {}): AgentConfig {
@@ -38,6 +43,18 @@ function agent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 		filePath: "/fake/worker.md",
 		...overrides,
 	};
+}
+
+/**
+ * Role pinned to the RPC backend, for the legion-ledger assertions.
+ *
+ * The legion gates (`maxChildrenPerNode` / `maxActiveNodes`) are RPC-side only:
+ * in-process children are budgeted by `subagents.inprocess.*`, so a test that
+ * means to exercise the ledger must pin `spawnMode: "rpc"` or it silently tests
+ * the in-process bucket instead.
+ */
+function rpcAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
+	return agent({ spawnMode: "rpc", ...overrides });
 }
 
 /**
@@ -211,5 +228,79 @@ test("A2: nine steps against maxActive 4 never have more than four live children
 		assert.equal(h.orchestrator.launchQueueEntries().length, 0, "the queue drained");
 	} finally {
 		h.cleanup();
+	}
+});
+
+// ── A12 (legion path): collect must follow the ADMITTED record ────────────
+
+/**
+ * The RPC/legion path is where the placeholder and the real transcript diverge:
+ * `createRun` + `sessionFileFor(runId, name)` give the child its own run
+ * directory, while the queued placeholder used the PARENT run dir. A `collect`
+ * that keeps reading through the placeholder record after admission therefore
+ * parses a file nobody ever writes and reports an empty/aborted outcome — the
+ * child looks dead the moment it finally starts.
+ *
+ * This case reproduces that divergence on purpose, so it fails if the post-wait
+ * re-read in `collect()` is ever removed.
+ */
+test("A12: a queued legion child's collect reads the spawned run dir, not the placeholder", async () => {
+	const rootDir = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-launch-queue-legion-"));
+	resetAdmissionQueuesForTests();
+	const runStore = new RunStore({ rootDir: path.join(rootDir, ".pi-subagents") });
+	const rootRun = runStore.createRun({
+		task: "root task",
+		cwd: rootDir,
+		nodeId: "root",
+		maxDepth: 4,
+		herdr: { supervisor: "rpc" },
+	});
+	const db = openLegionDb(":memory:");
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir: runStore.runDir(rootRun.runId),
+		cwd: rootDir,
+		maxDepth: 4,
+		legion: {
+			db,
+			dbPath: path.join(runStore.runDir(rootRun.runId), "legion.db"),
+			nodeId: "root",
+			parentNodeId: null,
+			parentRunId: null,
+			runId: rootRun.runId,
+			runStore,
+			settings: { maxDepth: 4, maxChildrenPerNode: 1, maxActiveNodes: 30 },
+			eventBus: createLegionEventBus(),
+		},
+	});
+	try {
+		const first = await orchestrator.launch({ agent: rpcAgent(), task: "first", name: "worker-0", worktree: false });
+		const queued = await orchestrator.launch({ agent: rpcAgent(), task: "second", name: "worker-1", worktree: false });
+		assert.equal(queued.queued, true, "the second launch waits for the fanout slot");
+		const placeholder = queued.sessionFile;
+		const collecting = orchestrator.collect("worker-1", { timeoutMs: 5_000 });
+		// Freeing the slot admits worker-1, which creates its own run + transcript.
+		await orchestrator.retire(first.name);
+		let spawnedHandle = supervisor.spawns.find((spawn) => spawn.input.name === "worker-1");
+		for (let attempt = 0; attempt < 200 && !spawnedHandle; attempt += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			spawnedHandle = supervisor.spawns.find((spawn) => spawn.input.name === "worker-1");
+		}
+		assert.ok(spawnedHandle, "the admitted child must reach the supervisor");
+		assert.notEqual(
+			spawnedHandle.input.sessionFile,
+			placeholder,
+			"the admitted child writes its own run-dir transcript, not the placeholder path",
+		);
+		supervisor.settle("worker-1", { text: '{"ok":true,"reason":"admitted then finished"}' });
+		const result = await collecting;
+		assert.equal(result.execution.status, "success", "collect must read the spawned transcript");
+	} finally {
+		orchestrator.flushLaunchQueue("test cleanup");
+		resetAdmissionQueuesForTests();
+		db.close();
+		fs.rmSync(rootDir, { recursive: true, force: true });
 	}
 });
