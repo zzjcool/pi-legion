@@ -12,7 +12,7 @@ import {
 	SubagentError,
 	type InProcessLimits,
 } from "../shared/types.ts";
-import { InProcessSupervisor } from "./inprocess-supervisor.ts";
+import { InProcessSupervisor, type InProcessSlotEvent } from "./inprocess-supervisor.ts";
 import { RpcSupervisor } from "./rpc-supervisor.ts";
 import { resolveSpawnMode } from "./spawn-mode.ts";
 import type { UIProxy } from "./ui-proxy.ts";
@@ -35,6 +35,61 @@ export interface RoutingSupervisorOptions {
 	uiProxy?: UIProxy;
 	getInprocessLimits?: () => InProcessLimits | undefined;
 	onSpawnRefused?: (message: string) => void;
+	/**
+	 * D2 (issue #266): forwarded to the in-process backend only. A slot is freed
+	 * exclusively by `retired`/`exited` (an `idle` child still holds one), and the
+	 * Orchestrator uses the edge to wake its launch-queue pump (D2-d-2).
+	 */
+	onSlotReleased?: (event: InProcessSlotEvent) => void;
+}
+
+/**
+ * Process-local broadcast of slot releases (D2-d-2).
+ *
+ * The queue lives in the Orchestrator (single choke point, D2), but the
+ * Orchestrator does not necessarily own the supervisor: `index.ts` constructs
+ * one `RoutingSupervisor` per extension load and hands it to five
+ * `new Orchestrator` sites. `OrchestratorDeps` has no supervisor-ownership
+ * guarantee, and the supervisor may also be a test double. So the hook is a
+ * fan-out: whichever supervisor instance is wired with `onSlotReleased`
+ * broadcasts here, and every live Orchestrator subscribes.
+ *
+ * Listeners are kept in a `Set` and are best-effort — a throwing listener must
+ * never break a retire (it only delays an admission until the fallback timer).
+ */
+const slotReleaseListeners = new Set<() => void>();
+
+/** Publish a slot-release edge to every subscribed Orchestrator. */
+export function notifyInProcessSlotReleased(): void {
+	for (const listener of [...slotReleaseListeners]) {
+		try {
+			listener();
+		} catch {
+			/* a listener must never break the retire that triggered it */
+		}
+	}
+}
+
+/** Subscribe to slot-release edges; returns the unsubscribe function. */
+export function subscribeInProcessSlotReleases(listener: () => void): () => void {
+	slotReleaseListeners.add(listener);
+	return () => {
+		slotReleaseListeners.delete(listener);
+	};
+}
+
+/**
+ * Chain a caller-supplied hook behind the process-wide broadcast.
+ *
+ * A throwing subscriber must not swallow the caller's hook (and vice versa):
+ * `notifyInProcessSlotReleased` already isolates its own listeners, and the
+ * caller's hook runs afterwards inside the supervisor's `emitSlotReleased`.
+ */
+function chainSlotRelease(hook: ((event: InProcessSlotEvent) => void) | undefined) {
+	return (event: InProcessSlotEvent): void => {
+		notifyInProcessSlotReleased();
+		hook?.(event);
+	};
 }
 
 /**
@@ -63,6 +118,8 @@ export class RoutingSupervisor implements LegionSupervisor {
 					? { getLimits: options.getInprocessLimits }
 					: {}),
 				...(onSpawnRefused ? { onSpawnRefused } : {}),
+				// D2-d-2: an in-process slot release wakes every launch-queue pump.
+				onSlotReleased: chainSlotRelease(options.onSlotReleased),
 			});
 		this.uiProxy = options.uiProxy ?? this.rpc.uiProxy;
 	}

@@ -19,7 +19,7 @@ import { getUsage } from "../../src/legion/usage.ts";
 import { liveRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
-import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
+import type { AgentConfig } from "../../src/shared/types.ts";
 import { assistantMsg, sessionHeader, toolResult, userMsg } from "../helpers/fixtures.ts";
 
 import { stripTerminalSequences, type Component, type OverlayHandle } from "@earendil-works/pi-tui";
@@ -420,13 +420,13 @@ test("retire frees maxChildrenPerNode slots so launch can refill to the cap (#14
 		const second = await orchestrator.launch({ agent: rpcAgent("worker"), task: "slot-2", name: "slot-2", worktree: false });
 		assert.equal(getNode(fx.db, first.child.nodeId!)?.status, "running");
 		assert.equal(getNode(fx.db, second.child.nodeId!)?.status, "running");
-		await assert.rejects(
-			() => orchestrator.launch({ agent: rpcAgent("worker"), task: "over fanout", name: "slot-3", worktree: false }),
-			(error: unknown) =>
-				error instanceof SubagentError &&
-				error.code === ErrorCodes.BUDGET_EXCEEDED &&
-				/max_children_per_node/.test(error.message),
-		);
+		// #266: over cap now QUEUES instead of throwing; the cap itself still holds.
+		const overCap = await orchestrator.launch({ agent: rpcAgent("worker"), task: "over fanout", name: "slot-3", worktree: false });
+		assert.equal(overCap.queued, true);
+		assert.equal(overCap.child.state, "queued");
+		assert.equal(getNode(fx.db, "root.slot-3"), null, "a queued launch writes no ledger row");
+		// Dequeue it so the slot-refill assertions below stay unambiguous.
+		await orchestrator.retire(overCap.name);
 		await orchestrator.retire(first.name);
 		await orchestrator.retire(second.name);
 		// Already-retired no-op must leave slots free (session kept for resume).
@@ -435,12 +435,19 @@ test("retire frees maxChildrenPerNode slots so launch can refill to the cap (#14
 		assert.equal(existsSync(first.sessionFile), true, "retire keeps session for resume");
 		const third = await orchestrator.launch({ agent: rpcAgent("worker"), task: "reuse slot", name: "slot-3", worktree: false });
 		const fourth = await orchestrator.launch({ agent: rpcAgent("worker"), task: "reuse slot again", name: "slot-4", worktree: false });
+		// A retired slot is FREE: these two must really launch, not queue.
+		assert.ok(!third.queued, "slot-3 launches immediately once the slot is free");
+		assert.ok(!fourth.queued, "slot-4 launches immediately once the slot is free");
 		assert.equal(third.child.nodeId, "root.slot-3");
 		assert.equal(fourth.child.nodeId, "root.slot-4");
-		await assert.rejects(
-			() => orchestrator.launch({ agent: rpcAgent("worker"), task: "cap again", name: "slot-5", worktree: false }),
-			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED,
-		);
+		// #266: an over-cap launch is QUEUED, not rejected; the cap itself is still
+		// enforced (no ledger row, no spawn).
+		const spawnsBefore = supervisor.spawns.length;
+		const fifth = await orchestrator.launch({ agent: rpcAgent("worker"), task: "cap again", name: "slot-5", worktree: false });
+		assert.equal(fifth.queued, true, "over-cap launch waits instead of failing");
+		assert.equal(fifth.child.state, "queued");
+		assert.equal(getNode(fx.db, fifth.child.nodeId!), null, "the cap still holds: no ledger row");
+		assert.equal(supervisor.spawns.length, spawnsBefore, "and nothing was spawned");
 	} finally {
 		fx.cleanup();
 	}
@@ -475,35 +482,35 @@ test("resume cannot exceed maxChildrenPerNode — no Math.max relaxation (#180)"
 			names.push(handle.name);
 		}
 		assert.equal(live(), 8);
-		await assert.rejects(
-			() => orchestrator.launch({ agent: rpcAgent("worker"), task: "fresh-9", name: "worker-9", worktree: false }),
-			(error: unknown) =>
-				error instanceof SubagentError &&
-				error.code === ErrorCodes.BUDGET_EXCEEDED &&
-				/max_children_per_node/.test(error.message),
-			"9th fresh launch must still be denied",
-		);
+		// #266: over cap QUEUES rather than throwing — the cap still holds because the
+		// queued launch reserves nothing in the ledger.
+		const overCapFresh = await orchestrator.launch({ agent: rpcAgent("worker"), task: "fresh-9", name: "worker-9", worktree: false });
+		assert.equal(overCapFresh.queued, true, "9th fresh launch waits");
+		assert.equal(live(), 8, "and does not become a 9th live child");
+		await orchestrator.retire(overCapFresh.name);
 		await orchestrator.retire(names[0]!);
 		assert.equal(live(), 7, "retire frees a slot");
 		// Legit refill back to the cap.
 		await orchestrator.launch({ agent: rpcAgent("worker"), task: "refill", name: "worker-9", worktree: false });
 		assert.equal(live(), 8);
-		// Resume of the retired node must NOT inflate past the cap (#180).
-		await assert.rejects(
-			() =>
-				orchestrator.launch({
-					agent: rpcAgent("worker"),
-					task: "resume-retired",
-					name: names[0]!,
-					worktree: false,
-				}),
-			(error: unknown) =>
-				error instanceof SubagentError &&
-				error.code === ErrorCodes.BUDGET_EXCEEDED &&
-				/max_children_per_node/.test(error.message),
-			"resume at cap must be denied — must not create a 9th live child",
+		// Resume of the retired node must NOT inflate past the cap (#180). #266: the
+		// over-cap resume QUEUES instead of throwing, and — the regression #180 was
+		// really about — the resumed node must NOT turn live: a queued launch writes
+		// no ledger row, so its status stays `retired`.
+		const overCapResume = await orchestrator.launch({
+			agent: rpcAgent("worker"),
+			task: "resume-retired",
+			name: names[0]!,
+			worktree: false,
+		});
+		assert.equal(overCapResume.queued, true, "resume at cap waits");
+		assert.equal(
+			getNode(fx.db, overCapResume.child.nodeId!)?.status,
+			"retired",
+			"the queued resume must not revive the node in the ledger",
 		);
-		assert.equal(live(), 8, "live children stay at the cap after denied resume");
+		assert.equal(live(), 8, "live children stay at the cap after a queued resume");
+		await orchestrator.retire(overCapResume.name);
 		// Below-cap resume still works.
 		await orchestrator.retire(names[1]!);
 		assert.equal(live(), 7);
@@ -520,7 +527,7 @@ test("resume cannot exceed maxChildrenPerNode — no Math.max relaxation (#180)"
 	}
 });
 
-test("legion launch refusal is atomic, records budget_refused, and removes run reservation", async () => {
+test("legion over-cap launch is atomic: queued with no ledger row, no run dir, no spawn", async () => {
 	const fx = fixture({ maxActiveNodes: 1 });
 	const supervisor = new FakeSupervisor();
 	const orchestrator = new Orchestrator({
@@ -531,14 +538,18 @@ test("legion launch refusal is atomic, records budget_refused, and removes run r
 		legion: fx.context,
 	});
 	try {
-		await assert.rejects(
-			() => orchestrator.launch({ agent: rpcAgent(), task: "over active budget", worktree: false }),
-			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED,
-		);
+		// `max_active_nodes` is a QUEUEABLE gate (#266 D1), so this neither throws nor
+		// writes anything: no ledger row, no child run directory, no `budget_refused`
+		// event (which belongs to `reserveNode`, and `reserveNode` never ran).
+		const handle = await orchestrator.launch({ agent: rpcAgent(), task: "over active budget", worktree: false });
+		assert.equal(handle.queued, true);
+		assert.equal(handle.child.state, "queued");
 		assert.equal(supervisor.spawns.length, 0);
 		assert.deepEqual(fx.runStore.listRuns().map((run) => run.runId), [fx.rootRun.runId]);
-		assert.deepEqual(readEventsAfter(fx.db, 0).map((event) => event.type), ["budget_refused"]);
+		assert.deepEqual(readEventsAfter(fx.db, 0).map((event) => event.type), []);
 		assert.deepEqual(fx.db.prepare("SELECT id FROM nodes ORDER BY id").all().map((row) => row.id), ["root"]);
+		// The placeholder session file is a string, never a created file (A15).
+		assert.equal(existsSync(handle.sessionFile), false, "a queued launch creates no session file");
 	} finally {
 		fx.cleanup();
 	}

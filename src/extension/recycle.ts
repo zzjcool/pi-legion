@@ -14,6 +14,10 @@ export function formatAlreadyRecycled(
 
 /** States where collect should return the snapshot already on the child. */
 export function canUseCachedCollect(state: TaskState): boolean {
+	// `queued` is deliberately NOT cacheable (#266 D3/§4.4): the record has no
+	// execution, no acceptance and only a PLACEHOLDER session file, so a cached
+	// collect would hand back a stale/empty snapshot as if the launch had finished.
+	// A queued child must go through `collect`'s wait-for-admission path (D8).
 	return (
 		state === "retired" ||
 		state === "awaiting" ||
