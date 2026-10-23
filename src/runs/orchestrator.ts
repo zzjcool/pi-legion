@@ -1432,8 +1432,21 @@ export class Orchestrator {
 			for (;;) {
 				const lost: string[] = [];
 				const next = queue.next((item) => {
+					const guard = this.launchGuards.get(item.name);
+					if (!guard) {
+						// The queue is process-level and shared, but only the instance that
+						// enqueued an item holds the payload that performs its launch. Admitting
+						// somebody else's item here would run a spawn this instance cannot judge
+						// (and could not record) — the pre-review code fell back to
+						// `{admitted:true}` and did exactly that.
+						//
+						// Skipping is safe and is NOT a lost item: `next()` moves on to the
+						// next candidate (D5-2), the owner's own pump admits it, and if no owner
+						// is left the queue's deadline expires it (D6) through the watchdog.
+						return { admitted: false, queueable: false, gate: "other", message: "" };
+					}
 					try {
-						return this.launchGuards.get(item.name)?.probe() ?? { admitted: true };
+						return guard.probe();
 					} catch {
 						// I-O3: nothing was reserved for this item, so “lost” is the truthful
 						// outcome — never a rejection into an abandoned async frame.
