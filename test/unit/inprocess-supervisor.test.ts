@@ -147,6 +147,21 @@ function unconfiguredHarness() {
 	};
 }
 
+/**
+ * #266: capture a refusal as a value so the whole `message` can be compared.
+ * `assert.rejects` with a predicate cannot express a byte-exact comparison
+ * without repeating the string in the matcher.
+ */
+async function refusalOf(run: () => Promise<unknown>): Promise<Error> {
+	try {
+		await run();
+	} catch (error) {
+		assert.ok(error instanceof Error, "a refusal must be an Error");
+		return error;
+	}
+	assert.fail("expected the spawn to be refused");
+}
+
 test("inprocess: spawn → prompt settle → retire", async () => {
 	const h = harness();
 	try {
@@ -1580,6 +1595,245 @@ test("inprocess: a prompt rejected AFTER acceptance still returns the handle (D1
 		await new Promise<void>((resolve) => setTimeout(resolve, 200));
 		const settled = await supervisor.waitSettled("root.worker", 1_000);
 		assert.match(settled.reason ?? "", /child turn failed/);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── #266 W2: supervisor hooks for the launch admission queue ───────────────
+//
+// Contract: `docs/contracts/launch-admission-queue-v1.md` §4.2 / §13.1 / §13.5.
+// These cases pin three things master had no way to assert:
+//   1. the four refusals are byte-identical to master (A6) now that they are
+//      produced by W1's pure `evaluateInProcessAdmission` (D1-a),
+//   2. `onSlotReleased` fires on `retired`/`exited` only — never on `idle`
+//      (A19/F9/§13.5), exactly once per child,
+//   3. `preflightAdmission` / `admissionCounts` are read-only (I-O1).
+
+test("#266 A6: inprocess maxActive refusal is byte-identical to master", async () => {
+	const h = harness({ maxActive: 1 });
+	try {
+		await h.supervisor.spawnChild(testInput(h.root, "a.one"));
+		const err = await refusalOf(() => h.supervisor.spawnChild(testInput(h.root, "b.two")));
+		// Whole string, including the semicolon and spacing: this is the text
+		// #197 users saw, and the reason D1-a forbids a second implementation.
+		assert.equal(
+			err.message,
+			"inprocess maxActive reached (1/1); raise subagents.inprocess.maxActive to allow more",
+		);
+		assert.equal((err as { code?: string }).code, ErrorCodes.BUDGET_EXCEEDED);
+	} finally {
+		h.close();
+	}
+});
+
+test("#266 A6: inprocess nesting-limit refusal is byte-identical to master", async () => {
+	const h = harness({ maxActive: 8, maxDepth: 0 });
+	try {
+		const err = await refusalOf(() => h.supervisor.spawnChild(testInput(h.root)));
+		assert.equal(
+			err.message,
+			"inprocess nesting limit reached (depth 0, max 0); raise subagents.inprocess.maxDepth to allow deeper nesting",
+		);
+		assert.equal((err as { code?: string }).code, ErrorCodes.BUDGET_EXCEEDED);
+	} finally {
+		h.close();
+	}
+});
+
+test("#266 A6: inprocess spawn-budget refusal is byte-identical to master", async () => {
+	const h = harness({ maxActive: 8, maxSpawnsPerSession: 1 });
+	try {
+		await h.supervisor.spawnChild(testInput(h.root, "one"));
+		await h.supervisor.retire("one");
+		const err = await refusalOf(() => h.supervisor.spawnChild(testInput(h.root, "two")));
+		assert.equal(
+			err.message,
+			"inprocess spawn budget exhausted (1/1); raise subagents.inprocess.maxSpawnsPerSession to allow more",
+		);
+		assert.equal((err as { code?: string }).code, ErrorCodes.BUDGET_EXCEEDED);
+	} finally {
+		h.close();
+	}
+});
+
+test("#266 A6: maxChildrenPerNode refusal is byte-identical to master (named + <root>)", async () => {
+	const named = harness({ maxActive: 8, maxChildrenPerNode: 1 });
+	try {
+		await named.supervisor.spawnChild(testInput(named.root, "root.a"));
+		const err = await refusalOf(() => named.supervisor.spawnChild(testInput(named.root, "root.b")));
+		assert.equal(err.message, "inprocess maxChildrenPerNode reached for 'root' (1/1)");
+		assert.equal((err as { code?: string }).code, ErrorCodes.BUDGET_EXCEEDED);
+	} finally {
+		named.close();
+	}
+
+	// A name with no dot is a root-level child: the parent key renders `<root>`,
+	// which is the one substitution a rewrite could silently get wrong.
+	const root = harness({ maxActive: 8, maxChildrenPerNode: 0 });
+	try {
+		const err = await refusalOf(() => root.supervisor.spawnChild(testInput(root.root, "solo")));
+		assert.equal(err.message, "inprocess maxChildrenPerNode reached for '<root>' (0/0)");
+	} finally {
+		root.close();
+	}
+});
+
+test("#266 A19: onSlotReleased fires on retire, not on agent_settled/idle", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-slots-"));
+	const released: { name: string; parentKey: string; state: string }[] = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => new FakeSession(),
+		onSlotReleased: (event) => released.push(event),
+	});
+	try {
+		const record = (name: string) =>
+			(supervisor as unknown as { children: Map<string, { session: FakeSession | null }> })
+				.children.get(name);
+		const child = await supervisor.spawnChild(testInput(root, "root.worker"));
+		assert.equal(child.name, "root.worker");
+
+		// F9/§13.5: `agent_settled` moves the child to idle, which STILL holds a
+		// slot. Emitting here would make admission jitter — the probe reports a
+		// free slot the real gate then refuses.
+		record("root.worker")!.session!.settle();
+		await supervisor.waitSettled("root.worker", 1_000);
+		assert.deepEqual(released, [], "idle must not release a slot");
+
+		await supervisor.retire("root.worker");
+		assert.deepEqual(released, [
+			{ name: "root.worker", parentKey: "root", state: "retired" },
+		]);
+
+		// Idempotent: a second retire is still a single release.
+		await supervisor.retire("root.worker");
+		assert.equal(released.length, 1, "one departure emits exactly one event");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#266 A19: onSlotReleased fires once with state 'exited' when spawn fails", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-slots-exit-"));
+	const released: { name: string; parentKey: string; state: string }[] = [];
+	class NoKeySession extends FakeSession {
+		override async prompt(): Promise<void> {
+			throw new Error("No API key found for provider 'any-endpoint'.");
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		spawnStartTimeoutMs: 5_000,
+		sessionFactory: async () => new NoKeySession(),
+		onSlotReleased: (event) => released.push(event),
+	});
+	try {
+		await assert.rejects(
+			() => supervisor.spawnChild(testInput(root, "root.worker")),
+			(error: unknown) =>
+				(error as { code?: string }).code === ErrorCodes.START_FAILED,
+		);
+		// `rollbackSpawn` freed the slot on the failure path: a queued sibling
+		// waiting on this fanout slot must be able to proceed.
+		assert.deepEqual(released, [
+			{ name: "root.worker", parentKey: "root", state: "exited" },
+		]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#266 I-O1: preflightAdmission is read-only and reports the queueable gate", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-preflight-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8, maxChildrenPerNode: 1 },
+		sessionFactory: async () => new FakeSession(),
+	});
+	const children = (supervisor as unknown as { children: Map<string, unknown> }).children;
+	try {
+		await supervisor.spawnChild(testInput(root, "root.a"));
+		const sizeBefore = children.size;
+
+		for (let i = 0; i < 5; i += 1) {
+			assert.deepEqual(supervisor.preflightAdmission("root.b"), {
+				admitted: false,
+				queueable: true,
+				gate: "inprocess.maxChildrenPerNode",
+				dimension: "fanout",
+				message: "inprocess maxChildrenPerNode reached for 'root' (1/1)",
+			});
+		}
+		// Advisory probe (§13.1 I-O1): five calls changed nothing, so the
+		// authoritative gate still refuses exactly as before.
+		assert.equal(children.size, sizeBefore, "preflightAdmission must not register a child");
+		await assert.rejects(
+			() => supervisor.spawnChild(testInput(root, "root.b")),
+			(error: unknown) =>
+				(error as { code?: string }).code === ErrorCodes.BUDGET_EXCEEDED &&
+				(error as Error).message === "inprocess maxChildrenPerNode reached for 'root' (1/1)",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#266 D11: maxChildrenPerNode 0 is a hard refusal, never a queueable one", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-preflight-0-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8, maxChildrenPerNode: 0 },
+		sessionFactory: async () => new FakeSession(),
+	});
+	try {
+		// D11/F11: 0 means "no children at all", so `siblings >= 0` can never
+		// become satisfiable — queueing it would disguise a config error as a
+		// 15-minute wait. The distinct gate name makes that assertable.
+		assert.deepEqual(supervisor.preflightAdmission("root.a"), {
+			admitted: false,
+			queueable: false,
+			gate: "inprocess.maxChildrenPerNode.disabled",
+			message: "inprocess maxChildrenPerNode reached for 'root' (0/0)",
+		});
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#266 admissionCounts: same counts and limits as the real gate", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-counts-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8, maxDepth: 3, maxChildrenPerNode: 5, maxSpawnsPerSession: 7 },
+		sessionFactory: async () => new FakeSession(),
+	});
+	try {
+		await supervisor.spawnChild(testInput(root, "root.a"));
+		await supervisor.spawnChild(testInput(root, "root.b"));
+		assert.deepEqual(supervisor.admissionCounts("root.c"), {
+			parentKey: "root",
+			// Two live siblings under `root`, both globally live.
+			siblings: 2,
+			active: 2,
+			spawnCount: 2,
+			depth: inProcessDepth(),
+			limits: {
+				maxDepth: 3,
+				maxChildrenPerNode: 5,
+				maxActive: 8,
+				maxSpawnsPerSession: 7,
+			},
+		});
+
+		// An absent `maxSpawnsPerSession` is passed through as undefined, not
+		// defaulted: "no limit" and "over the limit" are different verdicts.
+		const unconfigured = new InProcessSupervisor({
+			getLimits: () => undefined,
+			sessionFactory: async () => new FakeSession(),
+		});
+		const counts = unconfigured.admissionCounts("root.a");
+		assert.equal(counts.limits.maxSpawnsPerSession, undefined);
+		assert.equal("maxSpawnsPerSession" in counts.limits, false);
+		assert.equal(counts.siblings, 0);
+		assert.equal(counts.active, 0);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
