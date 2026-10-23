@@ -66,6 +66,7 @@ import {
 	acquireAdmissionQueue,
 	evaluateInProcessAdmission,
 	type InProcessAdmissionCounts,
+	peekAdmissionQueue,
 	type QueuedLaunch,
 	queueTimeoutMessage,
 } from "../supervisor/admission-queue.ts";
@@ -823,6 +824,15 @@ export class Orchestrator {
 		// In-process children use subagents.inprocess.* budgets (never RPC keys).
 		if (!input.utilityDispatch && !inProcess) this.assertWithinBudgets(Boolean(previous));
 		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
+		// D4: the name-occupancy check must cover QUEUED records too. `previous`
+		// deliberately ignores them (D3-a: its placeholder session path is not a resume
+		// credential) and a queued child is not `alive`, so without this clause a
+		// second `launch({name})` — exactly the shape `resume`/`continue` take when it
+		// sees `isAlive === false` — enqueues the SAME name twice and only fails later,
+		// at admission, with a confusing `child is already alive`.
+		if (this.children.get(name)?.state === "queued" || this.isQueuedHere(name)) {
+			throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
+		}
 		// Only an EXPLICIT inprocess can reach this: the arbitration above already
 		// routed every omitted-mode launch that needs a worktree to rpc, so I1
 		// (explicit inprocess + worktree stays a loud throw) holds. This replaces
@@ -1202,7 +1212,12 @@ export class Orchestrator {
 	 * shadow the real owner's `launchQueue` settings.
 	 */
 	private existingAdmissionQueue(): AdmissionQueue<LaunchQueuePayload> | undefined {
-		return this.admissionQueueRef;
+		// §6.1/§13.6: a control-action instance (stop/status/collect) must reach the
+		// queue a SIBLING instance created — otherwise `subagent stop <queued>` is a
+		// silent no-op and `status` reports it as "queue lost". `peek` is read-only on
+		// purpose: acquiring here would install an empty queue with default bounds and
+		// shadow the real owner's settings ("first acquisition wins").
+		return this.admissionQueueRef ?? peekAdmissionQueue<LaunchQueuePayload>(this.runDir);
 	}
 
 	/** D9: one user-visible line; a UI hook must never break admission. */
@@ -1296,8 +1311,20 @@ export class Orchestrator {
 		});
 	}
 
-	/** D2-d: wake the pump. `pumping` makes overlapping wakes harmless. */
+	/**
+	 * D2-d: wake the pump. `pumping` makes overlapping wakes harmless.
+	 *
+	 * Guarded on owning at least one launch: the queue is process-level and shared
+	 * by every Orchestrator on this run dir (`index.ts` has five construction
+	 * sites), but only the instance that enqueued an item holds its `LaunchQueuePayload`
+	 * — the closure that actually performs the launch. An instance with no guards is
+	 * a control-action instance (`stop`/`status`/`collect`); letting it pump would
+	 * admit a sibling's items through a probe that cannot judge them, which is how
+	 * retired unrelated children used to spawn somebody else's queued work and
+	 * reproduce the very `maxChildrenPerNode reached` line #266 removes.
+	 */
 	private schedulePump(): void {
+		if (this.launchGuards.size === 0) return;
 		void this.pumpAdmissions();
 	}
 
@@ -1502,6 +1529,14 @@ export class Orchestrator {
 				this.requeue(payload, guard, waitedMs);
 				return;
 			}
+			// The guard was already removed from the map, so `abandonQueued` (which
+			// looks it up again) cannot settle it — settle the local reference here or
+			// a concurrent `collect` waits on a promise nobody will ever resolve.
+			guard?.settle({
+				kind: "rejected",
+				reason: "flushed",
+				message: error instanceof Error ? error.message : String(error),
+			});
 			this.abandonQueued(payload.name, "flushed", error instanceof Error ? error.message : String(error));
 			throw error;
 		} finally {
@@ -1662,7 +1697,13 @@ export class Orchestrator {
 		if (direct) {
 			// The reservation has not started yet: keep the record truthful while we
 			// wait, so a concurrent `status` reads the position, not `launching`.
-			return await direct;
+			//
+			// The bare await is NOT enough: `collect(name, { signal })` is a published
+			// contract and every other branch of `collect` honours `signal`/deadline.
+			// Admission may take the whole `launchQueueTimeoutMs` (15 min), so an abort
+			// must be able to end this wait — otherwise `async:false` keeps the parent
+			// turn blocked long after the caller gave up.
+			return await this.waitForAdmissionOutcome(child, direct, timeoutMs, signal);
 		}
 		const deadline = this.now() + timeoutMs;
 		for (;;) {
@@ -1685,6 +1726,57 @@ export class Orchestrator {
 				};
 			}
 			if (await this.sleepOrAbort(Math.min(POLL_INTERVAL_MS, remaining), signal)) continue;
+		}
+	}
+
+	/**
+	 * Race an enqueue-time `settled` promise against abort and the local deadline.
+	 *
+	 * `settled` resolves at most once and has no cleanup, so losing the race is
+	 * harmless: a later admission still settles it, and nothing here mutates the
+	 * queue. The loser is left pending on purpose — cancelling it would have to
+	 * dequeue the item, which is `stop`'s job, not `collect`'s.
+	 */
+	private async waitForAdmissionOutcome(
+		child: ChildRecord,
+		settled: Promise<AdmitOutcome>,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<AdmitOutcome> {
+		const aborted: AdmitOutcome = {
+			kind: "rejected",
+			reason: "stopped",
+			message: `aborted by parent while queued: '${child.name}'`,
+		};
+		if (signal?.aborted) return aborted;
+		const deadline = this.now() + timeoutMs;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			return await new Promise<AdmitOutcome>((resolve) => {
+				const finish = (outcome: AdmitOutcome): void => {
+					if (timer !== undefined) clearTimeout(timer);
+					if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+					resolve(outcome);
+				};
+				void settled.then(finish, () =>
+					finish({ kind: "rejected", reason: "flushed", message: `launch queue lost: '${child.name}'` }));
+				timer = setTimeout(() => {
+					finish({
+						kind: "rejected",
+						reason: "timeout",
+						message: queueTimeoutMessage(child.name, this.now() - this.enqueuedAtFor(child.name)),
+					});
+				}, Math.max(1, deadline - this.now()));
+				timer.unref?.();
+				if (signal) {
+					onAbort = () => finish(aborted);
+					signal.addEventListener("abort", onAbort, { once: true });
+				}
+			});
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+			if (onAbort && signal) signal.removeEventListener("abort", onAbort);
 		}
 	}
 

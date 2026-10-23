@@ -727,3 +727,202 @@ test("A10: launch-queue overflow is a hard refusal that leaves no ghost child", 
 		h.cleanup();
 	}
 });
+
+// ── Review round: the multi-instance shapes `index.ts` really runs ────────
+//
+// Every earlier case here uses ONE Orchestrator, which is not how production
+// works: `index.ts` has five `new Orchestrator` sites over the same run dir (a
+// launch family, a resume path, a vexillatio family, and the stop/collect/steer
+// control adapters, which `restore()` child records but hold no launch payloads).
+// The queue is process-level, so those instances share it — and four real defects
+// lived only in that shape. Each case below failed before its fix.
+
+/** A session that accepts the prompt, or explodes on demand (`boom`). */
+class MaybeBoomSession implements InProcessSession {
+	private readonly listeners = new Set<(event: unknown) => void>();
+	// Explicit fields, not constructor parameter properties: the suite runs under
+	// `node --experimental-strip-types`, which cannot strip those.
+	private readonly file: string;
+	private readonly boom: boolean;
+	constructor(file: string, boom: boolean) {
+		this.file = file;
+		this.boom = boom;
+	}
+	subscribe(listener: (event: unknown) => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+	async prompt(text: string): Promise<void> {
+		if (this.boom) throw new Error("session factory exploded");
+		fs.appendFileSync(
+			this.file,
+			`${JSON.stringify({ type: "message", message: { role: "user", content: text } })}\n`,
+		);
+	}
+	dispose(): void {}
+}
+
+function multiInstanceHarness(boomName?: string) {
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-multi-"));
+	const runStore = new RunStore({ rootDir: path.join(root, ".pi-subagents") });
+	const rootRun = runStore.createRun({ task: "root", cwd: root, nodeId: "root", maxDepth: 4, herdr: { supervisor: "rpc" } });
+	const runDir = runStore.runDir(rootRun.runId);
+	const spawned: string[] = [];
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 1 },
+		sessionFactory: async (input) => {
+			spawned.push(input.name);
+			return new MaybeBoomSession(input.sessionFile, input.name === boomName);
+		},
+	});
+	const supervisor = new RoutingSupervisor({ inprocess });
+	const make = () => new Orchestrator({ supervisor, runDir, cwd: root, maxDepth: 4 });
+	/** The persisted run, or a loud failure (readRun is nullable by design). */
+	const persistedRun = () => {
+		const record = runStore.readRun(rootRun.runId);
+		if (!record) throw new Error(`run ${rootRun.runId} was not persisted`);
+		return record;
+	};
+	return {
+		root,
+		runStore,
+		rootRun,
+		runDir,
+		spawned,
+		launchInstance: make,
+		persistedRun,
+		cleanup() {
+			resetAdmissionQueuesForTests();
+			fs.rmSync(root, { recursive: true, force: true });
+		},
+	};
+}
+
+test("#266 review-1: a control-action instance must not pump a sibling's queue", async () => {
+	// Before the fix: `pumpAdmissions` fell back to `{admitted: true}` for items it
+	// held no payload for, so any instance could admit somebody else's item through
+	// a probe it cannot judge. `retire()` wakes the pump unconditionally, so the
+	// mere act of retiring an UNRELATED child launched the queued one — through the
+	// authoritative gate, reproducing the exact `maxChildrenPerNode reached` line
+	// #266 exists to delete.
+	const h = multiInstanceHarness();
+	try {
+		const owner = h.launchInstance();
+		await owner.launch({ agent: agent(), task: "a", name: "a", worktree: false });
+		const queued = await owner.launch({ agent: agent(), task: "b", name: "b", worktree: false });
+		assert.equal(queued.queued, true);
+		for (const child of owner.childrenSnapshot()) await h.runStore.addChild(h.rootRun.runId, child);
+
+		// The `stop` adapter shape: restore() records, hold no launch payloads.
+		const control = h.launchInstance();
+		control.restore(h.persistedRun());
+		await control.retire("a");
+
+		assert.deepEqual(h.spawned, ["a"], "retiring an unrelated child must not start the queued one");
+		assert.deepEqual(owner.launchQueueEntries().map((entry) => entry.name), ["b"], "the queue is untouched");
+		assert.equal(
+			owner.childrenSnapshot().find((child) => child.name === "b")?.state,
+			"queued",
+			"and the record is still queued",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#266 review-2: a queued item stays dequeueable from a control-action instance", async () => {
+	// The other half of the same design: a control instance must still SEE the
+	// owner's queue (peek, never acquire) so `subagent stop <queued>` works. Before
+	// the fix `existingAdmissionQueue()` only read `this.admissionQueueRef`, so every
+	// control instance saw an empty queue and `stop` was a silent no-op.
+	const h = multiInstanceHarness();
+	try {
+		const owner = h.launchInstance();
+		await owner.launch({ agent: agent(), task: "a", name: "a", worktree: false });
+		await owner.launch({ agent: agent(), task: "b", name: "b", worktree: false });
+		for (const child of owner.childrenSnapshot()) await h.runStore.addChild(h.rootRun.runId, child);
+
+		const control = h.launchInstance();
+		control.restore(h.persistedRun());
+		assert.deepEqual(control.launchQueueEntries().map((entry) => entry.name), ["b"], "a control instance can see it");
+
+		const retired = await control.retire("b");
+		assert.equal(retired.state, "retired", "stop dequeues a queued item it never enqueued");
+		assert.deepEqual(owner.launchQueueEntries(), [], "the owner's queue lost the item");
+		assert.deepEqual(h.spawned, ["a"], "and nothing was spawned");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#266 review-3: collect on a queued child returns when its admission fails", async () => {
+	// Before the fix `admitQueued` deleted the guard from the map and then let
+	// `abandonQueued` look it up again — so the enqueue-time `settled` promise was
+	// never settled and the matching `collect` hung forever (its timeoutMs ignored,
+	// because that branch awaited the promise directly).
+	const h = multiInstanceHarness("b");
+	try {
+		const A = h.launchInstance();
+		await A.launch({ agent: agent(), task: "a", name: "a", worktree: false });
+		await A.launch({ agent: agent(), task: "b", name: "b", worktree: false });
+		const collecting = A.collect("b", { timeoutMs: 5_000 });
+		await A.retire("a");
+		await assert.rejects(
+			() => collecting,
+			(error: unknown) => error instanceof SubagentError && /session factory exploded/.test(error.message),
+			"the admission failure must reach the waiting collect",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#266 review-4: collect on a queued child honours the abort signal", async () => {
+	// Before the fix that branch awaited `settled` bare, so an abort could not end
+	// it: `async:false` would stay blocked for up to `launchQueueTimeoutMs` (default
+	// 15 min) after the caller gave up. Every other collect branch honours `signal`.
+	const h = multiInstanceHarness();
+	try {
+		const A = h.launchInstance();
+		await A.launch({ agent: agent(), task: "a", name: "a", worktree: false });
+		await A.launch({ agent: agent(), task: "b", name: "b", worktree: false });
+		const abort = new AbortController();
+		const collecting = A.collect("b", { timeoutMs: 60_000, signal: abort.signal });
+		setTimeout(() => abort.abort(), 20);
+		await assert.rejects(
+			() => collecting,
+			(error: unknown) =>
+				error instanceof SubagentError && /aborted by parent while queued/.test(error.message),
+			"an abort must end the queue wait",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#266 review-5 (D4): a queued name cannot be launched twice", async () => {
+	// D4 requires the name-occupancy check to cover queued records. `previous`
+	// deliberately ignores them (D3-a: the placeholder path is not a resume
+	// credential) and a queued child is not `alive`, so both existing gates missed —
+	// and a second `launch({name})` (exactly what `resume`/`continue` do when they
+	// see `isAlive === false`) enqueued the same name twice, failing later at
+	// admission with a confusing error.
+	const h = multiInstanceHarness();
+	try {
+		const A = h.launchInstance();
+		await A.launch({ agent: agent(), task: "a", name: "a", worktree: false });
+		await A.launch({ agent: agent(), task: "b", name: "b", worktree: false });
+		await assert.rejects(
+			() => A.launch({ agent: agent(), task: "again", name: "b", worktree: false }),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.NAME_TAKEN &&
+				/child is already alive: b/.test(error.message),
+			"the name is taken while it sits in the queue",
+		);
+		assert.deepEqual(A.launchQueueEntries().map((entry) => entry.name), ["b"], "the queue did not grow a duplicate");
+	} finally {
+		h.cleanup();
+	}
+});

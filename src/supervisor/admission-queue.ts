@@ -460,6 +460,23 @@ export function acquireAdmissionQueue<T = unknown>(
 	return created;
 }
 
+/**
+ * Read the queue a **different** instance created, without creating one.
+ *
+ * The control-action paths (`subagent stop`/`status`/`collect`) build their own
+ * Orchestrator (`index.ts` has five `new Orchestrator` sites), so an instance
+ * that never launched anything must still be able to see — and dequeue from — the
+ * queue its sibling owns (§13.6 / §6.1). `acquireAdmissionQueue` cannot be used
+ * for that: "first acquisition wins" would install an EMPTY queue with default
+ * bounds and shadow the real owner's settings. This returns `undefined` instead,
+ * so a read-only path can never mutate the registry.
+ */
+export function peekAdmissionQueue<T = unknown>(scope: string): AdmissionQueue<T> | undefined {
+	// SAFETY: one scope has exactly one payload type, the same erasure
+	// `acquireAdmissionQueue` relies on. Nothing is written here.
+	return registry().get(registryKey(scope)) as AdmissionQueue<T> | undefined;
+}
+
 /** Tests only (A17): drop every registered queue so suites cannot pollute each other. */
 export function resetAdmissionQueuesForTests(): void {
 	registry().clear();
