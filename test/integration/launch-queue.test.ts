@@ -22,7 +22,7 @@ import * as path from "node:path";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
-import { insertNode } from "../../src/legion/nodes.ts";
+import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { InProcessSupervisor, type InProcessSession } from "../../src/supervisor/inprocess-supervisor.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
@@ -297,6 +297,128 @@ test("A12: a queued legion child's collect reads the spawned run dir, not the pl
 		supervisor.settle("worker-1", { text: '{"ok":true,"reason":"admitted then finished"}' });
 		const result = await collecting;
 		assert.equal(result.execution.status, "success", "collect must read the spawned transcript");
+	} finally {
+		orchestrator.flushLaunchQueue("test cleanup");
+		resetAdmissionQueuesForTests();
+		db.close();
+		fs.rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+// ── A7 (rpc half): the ledger gate queues through the same scheduler ───────
+//
+// A7 asks for both halves explicitly: the in-process gate is covered above, and
+// "an rpc integration (spawnMode:"rpc" + legion.maxChildrenPerNode:1) → the
+// second launch is queued, and admitted once the first settles". The RPC gate is
+// a DIFFERENT mechanism — it counts `nodes.status` rows in SQLite instead of an
+// in-memory set, and it is checked inside `reserveNode`/`withLaunchBudget` rather
+// than in the supervisor — so nothing above exercises it.
+//
+// The backend is the FakeSupervisor (no child process); the ledger is real, so
+// the counting and the status transitions are the production ones.
+
+test("A7 (rpc): a legion fanout over the cap queues, then admits when the slot frees", async () => {
+	resetAdmissionQueuesForTests();
+	const rootDir = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-launch-queue-rpc-"));
+	const runStore = new RunStore({ rootDir: path.join(rootDir, ".pi-subagents") });
+	const rootRun = runStore.createRun({
+		task: "root task",
+		cwd: rootDir,
+		nodeId: "root",
+		maxDepth: 4,
+		herdr: { supervisor: "rpc" },
+	});
+	const db = openLegionDb(":memory:");
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+	const runDir = runStore.runDir(rootRun.runId);
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir,
+		cwd: rootDir,
+		maxDepth: 4,
+		legion: {
+			db,
+			dbPath: path.join(runDir, "legion.db"),
+			nodeId: "root",
+			parentNodeId: null,
+			parentRunId: null,
+			runId: rootRun.runId,
+			runStore,
+			// The ledger fanout gate, at its minimum non-zero value (D11: 0 would be
+			// a permanent refusal and must never queue).
+			settings: { maxDepth: 4, maxChildrenPerNode: 1, maxActiveNodes: 30 },
+			eventBus: createLegionEventBus(),
+		},
+	});
+	try {
+		const first = await orchestrator.launch({ agent: rpcAgent(), task: "first", name: "rpc-0", worktree: false });
+		assert.equal(first.queued, undefined, "the first launch takes the only slot");
+		assert.equal(getNode(db, "root.rpc-0")?.status, "running");
+
+		const second = await orchestrator.launch({ agent: rpcAgent(), task: "second", name: "rpc-1", worktree: false });
+		assert.equal(second.queued, true, "the ledger gate queues, it does not refuse");
+		assert.equal(second.child.state, "queued");
+		assert.equal(getNode(db, "root.rpc-1"), null, "a queued launch writes no ledger row (D3)");
+		assert.equal(supervisor.spawns.filter((spawn) => spawn.input.name === "rpc-1").length, 0, "and spawns nothing");
+		assert.deepEqual(orchestrator.launchQueueEntries().map((entry) => entry.name), ["rpc-1"]);
+
+		// Retire the slot holder: the ledger row leaves the live set, the orchestrator
+		// observes the retire and wakes its own pump (D2-d-3 — the rpc path emits no
+		// supervisor hook, so this edge is the only trigger).
+		await orchestrator.retire(first.name);
+		await new Promise((resolve) => setTimeout(resolve, 150));
+
+		assert.deepEqual(orchestrator.launchQueueEntries(), [], "the freed slot admits the queued launch");
+		assert.equal(supervisor.spawns.filter((spawn) => spawn.input.name === "rpc-1").length, 1, "it really spawned");
+		assert.equal(getNode(db, "root.rpc-1")?.status, "running", "and now owns a ledger row");
+	} finally {
+		orchestrator.flushLaunchQueue("test cleanup");
+		resetAdmissionQueuesForTests();
+		db.close();
+		fs.rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("A7 (rpc): the queueable bound is the ledger's own setting, not the supervisor's", async () => {
+	// A cross-bucket regression guard: `subagents.inprocess.*` must never bound an
+	// rpc launch (docs/inprocess-supervisor.md: "never fall back across columns").
+	// The in-process cap here is deliberately 1 while the ledger allows 3, so a
+	// launch that wrongly consulted the in-process bucket would queue when it
+	// should spawn.
+	resetAdmissionQueuesForTests();
+	const rootDir = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-launch-queue-rpc-bucket-"));
+	const runStore = new RunStore({ rootDir: path.join(rootDir, ".pi-subagents") });
+	const rootRun = runStore.createRun({ task: "root task", cwd: rootDir, nodeId: "root", maxDepth: 4, herdr: { supervisor: "rpc" } });
+	const db = openLegionDb(":memory:");
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+	const runDir = runStore.runDir(rootRun.runId);
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const orchestrator = new Orchestrator({
+		supervisor,
+		runDir,
+		cwd: rootDir,
+		maxDepth: 4,
+		legion: {
+			db,
+			dbPath: path.join(runDir, "legion.db"),
+			nodeId: "root",
+			parentNodeId: null,
+			parentRunId: null,
+			runId: rootRun.runId,
+			runStore,
+			settings: { maxDepth: 4, maxChildrenPerNode: 3, maxActiveNodes: 30 },
+			eventBus: createLegionEventBus(),
+		},
+	});
+	try {
+		for (const name of ["a", "b", "c"]) {
+			const handle = await orchestrator.launch({ agent: rpcAgent(), task: name, name, worktree: false });
+			assert.equal(handle.queued, undefined, `${name} fits the ledger cap of 3 and must not queue`);
+		}
+		assert.deepEqual(orchestrator.launchQueueEntries(), []);
+		const running = db.prepare("SELECT COUNT(*) AS n FROM nodes WHERE status = 'running'").get() as { n: number } | undefined;
+		assert.equal(running?.n, 4, "root + three children");
 	} finally {
 		orchestrator.flushLaunchQueue("test cleanup");
 		resetAdmissionQueuesForTests();
