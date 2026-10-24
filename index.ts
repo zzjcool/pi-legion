@@ -1597,16 +1597,28 @@ async function controlAction(input: {
 		}
 		if (!params.name) {
 			const runs = store.listRuns();
-			const live = listLiveChildrenForStatus(runs);
+			// Liveness facts are read once per name and reused by both the filter and
+			// the block, so `status` cannot classify a child one way and render it
+			// another (display-liveness D6 exit 1).
+			const factsByName = new Map<string, StatusLivenessFacts & { pid?: number }>();
+			const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number } => {
+				const cached = factsByName.get(child.name);
+				if (cached) return cached;
+				const alive = input.supervisor.isAlive(child.name);
+				const owner = ownerVerdictFor(store, runs, child.name, alive);
+				// A pid only exists for a child this process actually tracks; a
+				// record from another session has none, and none is invented.
+				const pid = input.runtime.get(child.name)?.pid;
+				const facts = { alive, ...(owner ? { owner } : {}), ...(pid ? { pid } : {}) };
+				factsByName.set(child.name, facts);
+				return facts;
+			};
+			const classified = classifyChildrenForStatus(runs, factsFor);
 			return ok(
 				renderStatusOverview(
-					live.map((child) => {
-						const alive = input.supervisor.isAlive(child.name);
-						const owner = ownerVerdictFor(store, runs, child.name, alive);
-						// A pid only exists for a child this process actually tracks; a
-						// record from another session has none, and none is invented.
-						const pid = input.runtime.get(child.name)?.pid;
-						return { child, alive, ...(owner ? { owner } : {}), ...(pid ? { pid } : {}) };
+					classified.map(({ child, live }) => {
+						const { pid, ...facts } = factsFor(child);
+						return { child, ...facts, ...(pid ? { pid } : {}), live };
 					}),
 				),
 			);
@@ -3215,45 +3227,131 @@ async function abandonLaunchedChild(session: LaunchSession, name: string): Promi
 // ---------------------------------------------------------------------------
 
 /**
- * Live (non-retired / non-exited) children under this cwd for status overview.
+ * Child-record states that are terminal, so a record carrying one is never live
+ * (display-liveness D6, exit 1). `failed`/`settled` live on the execution side
+ * rather than in `TaskState`, but a run.json written by another version (or a
+ * hand-edited record) can carry them and they are terminal either way, so the
+ * set is keyed on strings instead of the narrow state union.
+ */
+const TERMINAL_STATUS_CHILD_STATES = new Set<string>([
+	"retired",
+	"exited",
+	"failed",
+	"settled",
+]);
+
+/** The persisted child record shape, as resolved through the run store. */
+type StatusChildRecord = NonNullable<ReturnType<RunStore["findChild"]>>;
+
+/**
+ * Liveness facts for one child, supplied by the caller.
  *
- * Names can be reused after retire; prefer the newest live record per name
- * (same preference as {@link pickChildByName}).
+ * `alive` is this process's in-memory supervisor answer (it never holds a child
+ * launched by another session); `owner` is the run-dir ownership verdict that
+ * covers that hole (#209-3). See {@link ownerVerdictFor}.
+ */
+export interface StatusLivenessFacts {
+	alive: boolean;
+	/** `undefined` while `alive` — in-memory liveness already decided (#209-3). */
+	owner?: "live" | "dead" | "unknown";
+}
+
+/** One run record after the status filter ran (display-liveness D6 exit 1). */
+export interface StatusChildClassification {
+	child: StatusChildRecord;
+	/**
+	 * Counted in `Status · N live children`. `false` = listed but NOT counted:
+	 * the record's run-dir owner pid is gone (#209-3 / A3).
+	 */
+	live: boolean;
+}
+
+/**
+ * Split the persisted child records under this cwd into `live` and `dead`.
+ *
+ * A record is dead when its owner pid is gone and this process is not running
+ * it — not merely when its `state` says so. `owner === "unknown"` counts as
+ * live: filtering unknown out would hide a child that may well be starting, and
+ * D2 forbids collapsing unknown into dead. Its block still reports
+ * `owner: unknown` + `state=working`, so it is never *displayed* as confirmed
+ * live — it is only not hidden.
+ *
+ * Names can be reused after retire, so the newest record per name wins, except
+ * that a dead record never shadows an older record of the same name that is
+ * still alive (same preference as {@link pickChildByName}).
+ *
+ * Without `factsFor` the filter falls back to the record state alone; that keeps
+ * this callable from a context that has no store (and keeps the pre-liveness
+ * signature working), but the `status` exit must pass facts.
+ */
+export function classifyChildrenForStatus(
+	runs: ReturnType<RunStore["listRuns"]>,
+	factsFor?: (child: StatusChildRecord) => StatusLivenessFacts,
+): StatusChildClassification[] {
+	const ranked = [...runs].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	const candidates: StatusChildClassification[] = [];
+	for (const run of ranked) {
+		for (const child of run.children) {
+			if (TERMINAL_STATUS_CHILD_STATES.has(child.state)) continue;
+			const facts = factsFor?.(child);
+			// Dead = the run dir's owner pid is gone AND this process is not running
+			// it. `owner === "unknown"` (no marker, or no pid in it) is never dead:
+			// unknown must not be collapsed into dead (display-liveness D2).
+			const live = !(facts?.owner === "dead" && !facts.alive);
+			candidates.push({ child, live });
+		}
+	}
+	// Name reuse: a newer DEAD record must not shadow an older record of the
+	// same name that is still live (mirror of `pickChildByName`, which prefers a
+	// live match over a newer retired one). Among equals the newest wins, hence
+	// the newest-first iteration order.
+	const chosen = new Map<string, StatusChildClassification>();
+	for (const entry of candidates) {
+		const prior = chosen.get(entry.child.name);
+		if (!prior || !prior.live) chosen.set(entry.child.name, entry);
+	}
+	return candidates.filter((entry) => chosen.get(entry.child.name) === entry);
+}
+
+/**
+ * Live children under this cwd for the status overview.
+ *
+ * Pass `factsFor` to decide liveness from owner evidence instead of the record
+ * state alone; see {@link classifyChildrenForStatus}.
  */
 export function listLiveChildrenForStatus(
 	runs: ReturnType<RunStore["listRuns"]>,
-): NonNullable<ReturnType<RunStore["findChild"]>>[] {
-	const ranked = [...runs].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-	const seen = new Set<string>();
-	const out: NonNullable<ReturnType<RunStore["findChild"]>>[] = [];
-	for (const run of ranked) {
-		for (const child of run.children) {
-			if (child.state === "retired" || child.state === "exited") continue;
-			if (seen.has(child.name)) continue;
-			seen.add(child.name);
-			out.push(child);
-		}
-	}
-	return out;
+	factsFor?: (child: StatusChildRecord) => StatusLivenessFacts,
+): StatusChildRecord[] {
+	return classifyChildrenForStatus(runs, factsFor).flatMap((entry) =>
+		entry.live ? [entry.child] : [],
+	);
 }
 
-/** Multi-child status text: one {@link renderLiveChildStatus} block per live child. */
-export function renderStatusOverview(
-	children: Array<{
-		child: NonNullable<ReturnType<RunStore["findChild"]>>;
-		alive: boolean;
-		/** Run-dir ownership verdict (#209-3); see {@link renderLiveChildStatus}. */
-		owner?: "live" | "dead" | "unknown";
-		/**
-		 * Own process of an `rpc` child, when this session launched it. A pid is
-		 * not persisted, so a record from another session has none — and none is
-		 * invented here (D3).
-		 */
-		pid?: number;
-	}>,
-): string {
-	if (children.length === 0) return "No live children.";
-	const noun = children.length === 1 ? "child" : "children";
+/** One child block for {@link renderStatusOverview}. */
+export interface StatusChildEntry {
+	child: StatusChildRecord;
+	alive: boolean;
+	/** Run-dir ownership verdict (#209-3); see {@link renderLiveChildStatus}. */
+	owner?: "live" | "dead" | "unknown";
+	/**
+	 * Own process of an `rpc` child, when this session launched it. A pid is
+	 * not persisted, so a record from another session has none — and none is
+	 * invented here (D3).
+	 */
+	pid?: number;
+	/**
+	 * `false` = listed but not counted in the header (owner pid gone, see
+	 * {@link classifyChildrenForStatus}). Absent means live, so callers that only
+	 * hold live children keep their meaning.
+	 */
+	live?: boolean;
+}
+
+/** Multi-child status text: one {@link renderLiveChildStatus} block per child. */
+export function renderStatusOverview(children: StatusChildEntry[]): string {
+	const deadCount = children.filter((entry) => entry.live === false).length;
+	const liveCount = children.length - deadCount;
 	const blocks = children.map(({ child, alive, owner, pid }) =>
 		renderLiveChildStatus({
 			name: child.name,
@@ -3269,7 +3367,19 @@ export function renderStatusOverview(
 			...(pid ? { pid } : {}),
 		}),
 	);
-	return [`Status · ${children.length} live ${noun}`, "", blocks.join("\n\n")].join("\n");
+	const parts: string[] = [];
+	if (liveCount === 0) {
+		// Nothing live. With no record at all this stays the exact literal the
+		// tests pin; with records that are all dead the count line below says so,
+		// instead of implying the run directory is empty.
+		parts.push("No live children.");
+	} else {
+		const noun = liveCount === 1 ? "child" : "children";
+		parts.push(`Status · ${liveCount} live ${noun}`);
+	}
+	if (deadCount > 0) parts.push(`(${deadCount} dead)`);
+	if (blocks.length > 0) parts.push("", blocks.join("\n\n"));
+	return parts.join("\n");
 }
 
 /**

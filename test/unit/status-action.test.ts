@@ -298,9 +298,49 @@ test("#209-3 status overview reports a foreign dead child as state=failed", asyn
 		foreignDeadRun(harness.cwd, "r-dead0001", "worker-2");
 
 		const overview = await harness.invoke({ action: "status", all: true });
-		assert.match(overview.text, /Status · 1 live child/);
+		// display-liveness A3 / §6 repaired this assertion. The old one read
+		// `/Status · 1 live child/` — it counted a child whose owner pid is gone as
+		// live, because the filter only looked at `child.state` and never asked the
+		// owner marker. That made the header contradict its own body: the block
+		// below the header says `state=failed` + `owner: dead (pid gone)`. A dead
+		// child is now listed (so the user still sees what happened) but not
+		// counted as live; the count line is replaced by `No live children.` +
+		// `(1 dead)` so an all-dead run dir is still distinguishable from an empty
+		// one.
+		assert.match(overview.text, /^No live children\./);
+		assert.match(overview.text, /\(1 dead\)/);
+		assert.doesNotMatch(overview.text, /Status · 1 live child/);
+		// Contract §6 keeps the block text itself unchanged (W2 owns it): a dead
+		// child is still reported as failed, with its owner verdict spelled out.
 		assert.match(overview.text, /worker-2 — state=failed/);
 		assert.doesNotMatch(overview.text, /worker-2 — state=working/);
+		assert.match(overview.text, /owner: dead \(pid gone\)/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#209-3 a dead child does not hide a live one, and the header counts only live", async () => {
+	const harness = indexHarness();
+	try {
+		// A3 is a per-child count, not an all-or-nothing gate: a run dir holding
+		// one dead foreign record and one live child of this process must report
+		// `1 live child` and still show the dead block underneath it.
+		foreignDeadRun(harness.cwd, "r-dead0004", "worker-2");
+		await harness.invoke({
+			agent: "scout",
+			task: "still running",
+			name: "scout-a",
+			async: true,
+			worktree: false,
+		});
+
+		const overview = await harness.invoke({ action: "status", all: true });
+		assert.match(overview.text, /Status · 1 live child\b/);
+		assert.doesNotMatch(overview.text, /Status · 2 live/);
+		assert.match(overview.text, /\(1 dead\)/);
+		assert.match(overview.text, /scout-a — state=working/);
+		assert.match(overview.text, /worker-2 — state=failed/);
 		assert.match(overview.text, /owner: dead \(pid gone\)/);
 	} finally {
 		await harness.cleanup();

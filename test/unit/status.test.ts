@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import {
+	activeEntries,
 	applyStatus,
 	createStatusBoard,
 	formatBusyLabel,
@@ -9,6 +10,7 @@ import {
 	formatElapsed,
 	formatWidgetLines,
 	statusTotals,
+	visiblePanelEntries,
 	SAME_TURN_START_MS,
 	STATUS_WIDGET_KEY,
 	STATUS_WIDGET_PLACEMENT,
@@ -947,4 +949,79 @@ test("formatAgentElapsed drops a leading clock that repeats the lifetime", () =>
 	assert.equal(formatAgentElapsed({ ...base, currentTurnStartedAt: 10_000 }, 79_000), "1m09s / 1m19s");
 	// No turn start at all: lifetime only (unchanged).
 	assert.equal(formatAgentElapsed(base, 79_000), "1m19s");
+});
+
+test("D1-a: `awaiting` is alive — it stays visible instead of vanishing as terminal", () => {
+	// Before the contract this file's TERMINAL_STATES listed `awaiting`, and the
+	// widget's `filterLiveTree` drops anything not active, so a centurion waiting
+	// on its squad disappeared from the panel while it was still alive. `awaiting`
+	// means "alive, waiting on downstream" (D1-a), so it must survive the filter.
+	const entries: StatusEntry[] = [
+		{ name: "root", nodeId: "root", parentId: null, depth: 0, agent: "ceo", state: "working", startedAt: 0 },
+		{ name: "centurion", nodeId: "root.c", parentId: "root", depth: 1, agent: "centurion", state: "awaiting", startedAt: 1 },
+	];
+	const visible = visiblePanelEntries(entries).map((entry) => entry.name);
+	assert.ok(visible.includes("centurion"), `awaiting centurion must stay visible, got ${JSON.stringify(visible)}`);
+	const lines = formatWidgetLines(entries, 5_000).map(stripTerminalSequences).join("\n");
+	assert.match(lines, /centurion/, "the awaiting node is rendered");
+	// …and it is *not* rewritten to a terminal-looking label.
+	assert.doesNotMatch(lines, /⎿\s*settled/, "awaiting is not relabelled settled");
+});
+
+test("D1-a: a terminal parent with a live subtree still renders as waiting on downstream", () => {
+	// The synthetic `waiting` relabel stays: a *settled* parent between turns is
+	// genuinely waiting on its squad. This is the case D1-a's fix must not break
+	// while it stops rewriting rows that are already `awaiting`.
+	const entries: StatusEntry[] = [
+		{ name: "root", nodeId: "root", parentId: null, depth: 0, agent: "ceo", state: "working", startedAt: 0 },
+		{ name: "centurion", nodeId: "root.c", parentId: "root", depth: 1, agent: "centurion", state: "settled", finishedAt: 2, startedAt: 1 },
+		{ name: "worker", nodeId: "root.c.w", parentId: "root.c", depth: 2, agent: "worker", state: "working", startedAt: 2 },
+	];
+	const lines = formatWidgetLines(entries, 5_000).map(stripTerminalSequences).join("\n");
+	assert.match(lines, /centurion/, "settled parent with a live child stays visible");
+	assert.match(lines, /waiting/, "and is relabelled as waiting on downstream work");
+});
+
+test("D5: `idle` stays visible as itself and is not counted as busy", () => {
+	const entries: StatusEntry[] = [
+		{ name: "root", nodeId: "root", parentId: null, depth: 0, agent: "ceo", state: "working", startedAt: 0 },
+		{ name: "idle-w", nodeId: "root.i", parentId: "root", depth: 1, agent: "worker", state: "idle", startedAt: 1 },
+		{ name: "busy-w", nodeId: "root.b", parentId: "root", depth: 1, agent: "worker", state: "working", startedAt: 1 },
+	];
+	// Visible: an idle child still holds a concurrency slot, so it must be on
+	// screen (D5) — the old table dropped it, which is what made it look dead.
+	assert.ok(visiblePanelEntries(entries).some((entry) => entry.name === "idle-w"), "idle stays visible");
+	// But not busy: it is not generating, so the busy label counts only the
+	// working child. Conflating "visible" with "busy" is what painted idle as
+	// retired before.
+	assert.deepEqual(activeEntries(entries).map((entry) => entry.name), ["busy-w"]);
+	const header = formatWidgetLines(entries, 5_000).map(stripTerminalSequences)[0] ?? "";
+	// 3 rows are live (root + idle + busy) but only 2 are running: the root row
+	// counts, the idle seat does not. If idle were counted as running this would
+	// read `3 running`, which is exactly the inflation the old table caused.
+	assert.equal(header, "⏳ Legion · 3 agents · 2 running", "idle does not inflate the running count");
+});
+
+test("D5: `queued` is admitted work — visible, and never folded away as terminal", () => {
+	const entries: StatusEntry[] = [
+		{ name: "root", nodeId: "root", parentId: null, depth: 0, agent: "ceo", state: "working", startedAt: 0 },
+		{ name: "q-w", nodeId: "root.q", parentId: "root", depth: 1, agent: "worker", state: "queued", startedAt: 1 },
+	];
+	const visible = visiblePanelEntries(entries).map((entry) => entry.name);
+	assert.ok(visible.includes("q-w"), `a queued child must not be hidden, got ${JSON.stringify(visible)}`);
+	const lines = formatWidgetLines(entries, 5_000).map(stripTerminalSequences).join("\n");
+	assert.match(lines, /q-w/);
+	assert.doesNotMatch(lines, /collapsed/, "queued is not collapsed away like a finished branch");
+});
+
+test("D5: an idle seat keeps no live turn clock", () => {
+	// `currentTurnElapsedMs` only ticks for a *busy* entry: an idle seat is
+	// visible but has no work in flight, so a running clock would accrue against
+	// nothing. Round 2 so the turn clock is a distinct fact from the lifetime.
+	const idle: StatusEntry = {
+		name: "w", agent: "worker", state: "idle", startedAt: 0, turns: 2, currentTurnStartedAt: 1_000,
+	};
+	assert.equal(formatAgentElapsed(idle, 79_000), "1m19s", "no `x / y` pair while idle");
+	const working: StatusEntry = { ...idle, state: "working" };
+	assert.equal(formatAgentElapsed(working, 79_000), "1m18s / 1m19s", "a working seat does tick");
 });

@@ -16,6 +16,11 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { isThinkingLevel } from "../shared/types.ts";
+import {
+	NON_TERMINAL,
+	TERMINAL_STATES as LIVENESS_TERMINAL_STATES,
+	displayStatusFromState,
+} from "../extension/liveness.ts";
 import { nodesFromEntries, type VizNode } from "./viz/model.ts";
 import { RateSampler } from "./viz/rate.ts";
 import { railwayLines, type RailScroll } from "./viz/railway.ts";
@@ -168,8 +173,8 @@ function formatTokensCompact(value: number): string {
  * is part of "time since the last task started". It freezes only when the
  * agent ends: a terminal entry clamps at `finishedAt` so the clock does not
  * run on after the agent exits. Undefined when the turn start is unknown, or
- * when the entry is neither active nor terminal (an idle seat has no
- * meaningful running clock).
+ * when the entry is alive but not doing work — an `idle`/`queued`/`awaiting`
+ * seat has no meaningful running clock.
  */
 function currentTurnElapsedMs(
 	entry: Pick<StatusEntry, "state" | "herdrStatus" | "finishedAt" | "currentTurnStartedAt">,
@@ -179,7 +184,11 @@ function currentTurnElapsedMs(
 	const start = entry.currentTurnStartedAt;
 	const status = entry.herdrStatus ?? entry.state;
 	if (TERMINAL_STATES.has(status)) return Math.max(0, (entry.finishedAt ?? now) - start);
-	if (!ACTIVE_STATES.has(status)) return undefined;
+	// Only a *busy* entry has a live turn clock. An `idle` seat (and a `queued`
+	// one, and an `awaiting` centurion waiting on its squad) is visible but not
+	// working, so it keeps no running clock: the doc above says so, and letting
+	// it tick would show time accruing against nothing.
+	if (!BUSY_STATES.has(status)) return undefined;
 	return Math.max(0, now - start);
 }
 
@@ -226,7 +235,7 @@ export function formatAgentElapsed(
 
 export function activeEntries(entries: StatusEntry[]): StatusEntry[] {
 	return entries.filter((entry) =>
-		entry.parentId !== null && entry.depth !== 0 && ACTIVE_STATES.has(entry.herdrStatus ?? entry.state),
+		entry.parentId !== null && entry.depth !== 0 && BUSY_STATES.has(entry.herdrStatus ?? entry.state),
 	);
 }
 
@@ -358,18 +367,56 @@ function widgetRow(text: string, nodeId?: string): WidgetRow {
 	return nodeId === undefined ? { text } : { text, nodeId };
 }
 
-const RUNNING_STATES = new Set(["starting", "working", "running"]);
-const ACTIVE_STATES = new Set([...RUNNING_STATES, "blocked"]);
-const TERMINAL_STATES = new Set([
-	"settled",
-	"success",
-	"completed",
-	"failed",
-	"aborted",
-	"retired",
-	"awaiting",
-	"unknown",
-]);
+/**
+ * Terminal / active / busy / running: one derivation from the liveness
+ * authority (contract `docs/contracts/display-liveness-v1.md` D1-a, D5).
+ *
+ * This file used to carry its own three tables, and the terminal one disagreed
+ * with every other surface: it listed `awaiting` and `unknown` as terminal
+ * (so a centurion waiting on its squad vanished from the widget) and omitted
+ * `error`/`truncated`/`done` (so those kept a live clock). `TERMINAL_STATES` is
+ * therefore imported, never re-declared.
+ */
+const TERMINAL_STATES: ReadonlySet<string> = LIVENESS_TERMINAL_STATES;
+
+/**
+ * "This row describes something that is still alive": the liveness module's
+ * in-flight labels plus `awaiting`, which D1-a places on the non-terminal side
+ * ("alive, waiting on downstream"). Drives visibility (`filterLiveTree`,
+ * `isActiveEntry`) and the open-ended clocks.
+ *
+ * This stays a known-label set on purpose. D1-a's "use the complement, not a
+ * whitelist" rule governs `liveness()`'s ledger rule, where the question is
+ * *may we declare this lifecycle over?* — the safe answer for an unrecognised
+ * label is "no". Here the question is the opposite one, *may this row count as
+ * alive?*, and a permissive answer would promote the widget's own synthetic
+ * `waiting` label (and any legacy/foreign label) to activity: rows that must
+ * age out would be resurrected and the `N running` count would inflate.
+ */
+const ACTIVE_STATES: ReadonlySet<string> = new Set([...NON_TERMINAL, "awaiting"]);
+
+/**
+ * "This row is doing work": active and not merely holding a slot. An `idle`
+ * seat is alive and visible (D5) but has no running clock and must not keep the
+ * busy label lit forever; same for a `queued` seat that has not started and an
+ * `awaiting` centurion whose squad is the thing actually running.
+ *
+ * Kept separate from `ACTIVE_STATES` because conflating "should I show this?"
+ * with "is this busy?" is precisely the mistake that made `idle`/`awaiting`
+ * disappear instead of being shown grey.
+ */
+const BUSY_STATES: ReadonlySet<string> = new Set(
+	[...ACTIVE_STATES].filter((state) => displayStatusFromState(state) === "running"),
+);
+
+/**
+ * Working states for the header's `N running` count, derived from the busy set
+ * so it can never list a state the panel considers dead. `blocked` is an
+ * approval gate: busy, but not generating, so it does not count as running.
+ */
+const RUNNING_STATES: ReadonlySet<string> = new Set(
+	[...BUSY_STATES].filter((state) => state !== "blocked"),
+);
 
 function cleanDisplayText(value: string): string {
 	return stripTerminalSequences(value)
@@ -523,6 +570,12 @@ function renderTreeWidgetLines(
 		// A terminal node whose subtree is still running is waiting on
 		// downstream work (e.g. a centurion between turns while its squad
 		// executes) — render it as "waiting" instead of a dead settled state.
+		//
+		// D1-a: a row that is *already* `awaiting` is not rewritten. `awaiting`
+		// means "alive, waiting on downstream", so it is active (ACTIVE_STATES)
+		// and this branch never sees it — which is the point: it must neither
+		// vanish from the panel nor be relabelled as a finished state. It renders
+		// grey, as itself, because `themeLines` dims every non-header row.
 		const effectiveEntry = !isActiveEntry(entry) && activeSubtree
 			? { ...entry, state: "waiting" as const, herdrStatus: "waiting" as const }
 			: entry;

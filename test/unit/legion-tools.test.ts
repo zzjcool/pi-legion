@@ -17,7 +17,7 @@ import {
 import { openLegionDb } from "../../src/legion/db.ts";
 import { readEventsAfter } from "../../src/legion/events.ts";
 import { MAIL_DELIVERY, inbox, pendingInbox, sendMail } from "../../src/legion/mail.ts";
-import { getNode, insertNode, updateNode } from "../../src/legion/nodes.ts";
+import { getNode, insertNode, listStaleNodes, updateNode } from "../../src/legion/nodes.ts";
 import { getUsage } from "../../src/legion/usage.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
@@ -316,6 +316,109 @@ test("postman injects active/retired-recipient mail, bounces terminal mail, and 
 		postman.stop();
 		rootPostman.stop();
 	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("A5: a stale unsupervised running orphan is converged to failed with node_abandoned and still reported", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-orphan-converge-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const messages: string[] = [];
+	const now = 10_000;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const orphan = insertNode(db, { parentId: "root", name: "lost-child", role: "worker", status: "running" }, () => 1);
+		const postman = new LegionPostman({
+			db, nodeId: "root", supervisor, settings: { orphanStaleMs: 100 },
+			now: () => now, sendRootMessage: (message) => messages.push(message), intervalMs: 10_000,
+		});
+		await postman.tick();
+		postman.stop();
+
+		// 1. D7: the ledger row itself is terminal — detection alone used to leave it running.
+		assert.equal(getNode(db, orphan.id)?.status, "failed");
+		assert.equal(getNode(db, orphan.id)?.updatedAt, now, "convergence stamps the row instead of leaving the heartbeat frozen");
+
+		// 2. The convergence is a durable fact with its own reason.
+		const abandoned = readEventsAfter(db, 0).filter((event) => event.type === "node_abandoned");
+		assert.deepEqual(abandoned.map((event) => event.nodeId), [orphan.id]);
+		const abandonedData = abandoned[0]?.data as { reason?: string; staleMs?: number; updatedAt?: number } | null;
+		assert.equal(abandonedData?.reason, "no_active_supervisor");
+		assert.equal(abandonedData?.staleMs, 100);
+		assert.equal(abandonedData?.updatedAt, 1, "the event names the frozen heartbeat the scan judged, not the post-convergence row");
+
+		// 3. The pre-existing orphan report is kept untouched.
+		assert.deepEqual(
+			readEventsAfter(db, 0).filter((event) => event.type === "orphan_detected").map((event) => event.nodeId),
+			[orphan.id],
+		);
+
+		// 4. The root notice still goes out, wording unchanged.
+		assert.equal(messages.length, 1);
+		assert.match(messages[0] ?? "", /^Legion orphan detected at /);
+		assert.ok(messages[0]?.includes(`${orphan.id} (worker, status=running) has no active supervisor`), messages[0]);
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("A5: a converged orphan leaves the stale set, so liveness cannot read it back as live", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-orphan-liveness-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const now = 10_000;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => now);
+		const orphan = insertNode(db, { parentId: "root", name: "lost-child", role: "worker", status: "running" }, () => 1);
+		assert.deepEqual(listStaleNodes(db, now - 100).map((node) => node.id), [orphan.id], "the orphan is stale and non-terminal before the scan");
+		const postman = new LegionPostman({
+			db, nodeId: "root", supervisor, settings: { orphanStaleMs: 100 },
+			now: () => now, sendRootMessage: () => {}, intervalMs: 10_000,
+		});
+		await postman.tick();
+		postman.stop();
+		// `liveness()` lands in W1. This pins the ledger precondition it reads: a
+		// terminal row that the stale-node query no longer yields, so its stale-ledger
+		// branch (non-terminal + expired heartbeat → dead) can never fire again.
+		assert.equal(getNode(db, orphan.id)?.status, "failed");
+		assert.deepEqual(listStaleNodes(db, now - 100).map((node) => node.id), [], "a converged row drops out of the stale scan instead of being re-judged");
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("A5: a mixed scan converges only the unsupervised child and leaves the live one running", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-orphan-mixed-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const messages: string[] = [];
+	const now = 10_000;
+	const sessionFile = path.join(rootDir, "live-child.jsonl");
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => now);
+		const live = insertNode(db, { parentId: "root", name: "live-child", role: "worker", status: "running" }, () => 1);
+		const orphan = insertNode(db, { parentId: "root", name: "lost-child", role: "worker", status: "running" }, () => 1);
+		await supervisor.spawnChild({ name: live.name, task: "still working", agent: agent("worker"), sessionFile, tempDir: rootDir, cwd: rootDir });
+		const postman = new LegionPostman({
+			db, nodeId: "root", supervisor, settings: { orphanStaleMs: 100 },
+			now: () => now, sendRootMessage: (message) => messages.push(message), intervalMs: 10_000,
+		});
+		await postman.tick();
+		postman.stop();
+		assert.equal(supervisor.isAlive(live.name), true);
+		assert.equal(getNode(db, live.id)?.status, "running", "a live supervisor must never be converged");
+		assert.equal(getNode(db, live.id)?.updatedAt, now, "the live child heartbeat still advances");
+		assert.equal(readEventsAfter(db, 0).some((event) => event.nodeId === live.id && event.type === "node_abandoned"), false);
+		assert.equal(getNode(db, orphan.id)?.status, "failed", "the unsupervised sibling is still converged in the same scan");
+		assert.equal(messages.length, 1);
+		assert.ok(messages[0]?.includes(`: ${orphan.id} `), messages[0]);
+		assert.equal(messages.some((message) => message.includes(live.id)), false, "no notice is raised for the live child");
+	} finally {
+		await supervisor.retire("live-child").catch(() => {});
 		db.close();
 		rmSync(rootDir, { recursive: true, force: true });
 	}

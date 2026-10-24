@@ -463,6 +463,15 @@ test("#238: attach with no tracked jobs and no new events still paints the tree 
 				sendMessage() {},
 				eventBus: bus,
 				getTreeNodes,
+				// display-liveness-v1 D3: the row below carries `updatedAt: 2` (a
+				// deliberately tiny fixture value). Without a matching clock the
+				// liveness projection reads it as a heartbeat from 1970 — far past the
+				// 90 s orphan horizon — and correctly paints the node dead, which would
+				// have this test assert the wrong thing (it is about SEEDED ATTACH, not
+				// about staleness). Pinning `now` to the fixture's own epoch keeps the
+				// two clocks on one scale, exactly as production does (both are
+				// `Date.now()`).
+				now: () => 2_000,
 			});
 			// Seeded attach: no historical event exists, and none is delivered.
 			const timers = makeClock();

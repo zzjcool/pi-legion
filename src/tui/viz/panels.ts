@@ -2,7 +2,7 @@
 
 import { Canvas, cellWidth, ellipsize } from "./canvas.ts";
 import type { Rect } from "./layout.ts";
-import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
+import { formatCount, formatDuration, isAgent, type VizNode, type VizStatus } from "./model.ts";
 import { nodeToken, roleColor } from "./palette.ts";
 import type { RateSampler } from "./rate.ts";
 import { breakdown } from "../../shared/timing-breakdown.ts";
@@ -477,6 +477,13 @@ export interface LogEvent {
 	parentName?: string;
 }
 
+/** Display states that describe a *finished* lifecycle: the only ones the log knows. */
+const LOG_END_KINDS: ReadonlySet<VizStatus> = new Set<VizStatus>(["settled", "failed", "retired"]);
+
+function isLogEndKind(status: VizStatus): status is Exclude<LogEvent["kind"], "spawn"> {
+	return LOG_END_KINDS.has(status);
+}
+
 export function buildLog(nodes: readonly VizNode[]): LogEvent[] {
 	const byId = new Map(nodes.map((node) => [node.id, node]));
 	const out: LogEvent[] = [];
@@ -484,7 +491,7 @@ export function buildLog(nodes: readonly VizNode[]): LogEvent[] {
 		if (!isAgent(node)) continue;
 		const parentName = node.parentId ? byId.get(node.parentId)?.name : undefined;
 		out.push({ ts: node.startedAt, kind: "spawn", node, ...(parentName ? { parentName } : {}) });
-		if (node.status !== "running" && node.endedAt !== undefined) out.push({ ts: node.endedAt, kind: node.status, node });
+		if (node.endedAt !== undefined && isLogEndKind(node.status)) out.push({ ts: node.endedAt, kind: node.status, node });
 	}
 	return out.sort((a, b) => b.ts - a.ts || (a.kind === "spawn" ? 1 : -1));
 }

@@ -3346,22 +3346,22 @@ test("#238: a throw on the deferred paint is isolated like a bus handler error, 
 	}
 });
 
-test("#238: KNOWN LIMITATION pinned — a mid-burst ledger write can make the painted status differ from a per-event re-read", async () => {
-	// This is not an endorsement: it pins the measured divergence documented on
-	// `scheduleTreeFlush` so nobody "confirms" convergence that does not exist.
+test("#266-liveness A6: a mid-burst ledger write no longer forks the painted status", async () => {
+	// Replaces #238's "KNOWN LIMITATION pinned" test. That one asserted a measured
+	// DIVERGENCE: the coalesced path could paint `settled` where a per-event re-read
+	// would paint `retired`, because events 2..N were vetted against burst-start
+	// facts and `snapshotNodes()` then DELETED an override that looked older than
+	// the ledger row.
 	//
-	// A concurrent writer (another process on the shared legion.db) commits a new
-	// row between two events of ONE synchronous burst. A per-event re-read
-	// (`master`) re-seeds its in-memory row from that commit, so `node_retired`'s
-	// "not already settled/failed" guard sees raw `starting` and applies
-	// `retired`. The coalesced path never re-reads mid-burst, so it still sees the
-	// first event's own `settled` override and keeps `settled`.
+	// display-liveness-v1 D3/D8 removes the race instead of documenting it: an
+	// override is never judged against `node.updatedAt` (a different writer's
+	// clock), and the trailing snapshot projects the row through `liveness()`
+	// rather than ranking timestamps. So the painted status is a function of the
+	// FACTS at paint time, not of the read sequence — which is the property this
+	// case now pins.
 	//
-	// Master paints: retired. HEAD paints: settled. Both are "the last applicable
-	// event" under their own read sequence — reproducing a SEQUENCE of reads is not
-	// possible with a constant number of reads, which is why this is bounded and
-	// documented rather than fixed. If this assertion ever flips to "retired",
-	// someone restored per-event re-reads: update the comment in runtime.ts.
+	// The scenario is unchanged, so the contrast with the old test is exact: a
+	// sibling subscriber commits a newer row mid-burst.
 	let row: TreeNodeSnapshot = { ...statusTreeNode("root.worker", "root", "worker", 1), status: "starting", updatedAt: 5 };
 	const nodes = () => [statusTreeNode("root", null, "root", 0), row];
 	const eventBus = createLegionEventBus();
@@ -3371,24 +3371,38 @@ test("#238: KNOWN LIMITATION pinned — a mid-burst ledger write can make the pa
 		getTreeNodes: nodes,
 		now: () => 50_000,
 	});
-	// A sibling subscriber writing the row mid-burst, the shape legion-commands has.
 	eventBus.on("node_settled", () => { row = { ...row, updatedAt: 20 }; });
 	try {
 		eventBus.emit({ nodeId: "root.worker", type: "node_settled", data: null, ts: 10 });
 		eventBus.emit({ nodeId: "root.worker", type: "node_retired", data: null, ts: 30 });
 		await settleFlush();
+
+		// The child ENDED (`node_settled`). `node_retired` arriving after it must not
+		// relabel an ended child as retired — the same rule #238 pinned, now for a
+		// stated reason rather than as an accident of read order.
 		assert.equal(
 			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state,
 			"settled",
-			"the coalesced burst vets the second event against burst-start facts, so it paints settled (master paints retired)",
+			"a settled child stays settled: a later retire event may not relabel it",
 		);
-		// And it stays until the row moves again: this is the sticky half.
+
+		// A6 (the property that replaced the limitation): reading the same facts
+		// again gives the same answer, however many times, and a further event does
+		// not resurrect the ended child.
+		const first = runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state;
+		for (let i = 0; i < 100; i += 1) {
+			assert.equal(
+				runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state,
+				first,
+				`projection is stable (§A6): read ${i + 2} disagreed with read 1`,
+			);
+		}
 		eventBus.emit({ nodeId: "root.worker", type: "node_retired", data: null, ts: 31 });
 		await settleFlush();
 		assert.equal(
 			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state,
 			"settled",
-			"a settled/failed row is never re-labelled retired, so the override is not repaired by a later snapshot",
+			"still settled after another retire: the projection never promotes an ended child",
 		);
 	} finally {
 		runtime.dispose();
@@ -3578,6 +3592,92 @@ test("#238: a bus stand-in WITHOUT reportError still cannot kill the process fro
 		);
 	} finally {
 		process.removeListener("uncaughtException", onUncaught);
+		runtime.dispose();
+	}
+});
+
+// ── display-liveness-v1: D3 static guard + R2 regression ─────────────────
+
+test("display-liveness A7: no cross-writer timestamp comparison survives in runtime.ts", async () => {
+	// D3 is a code-shape rule that no behavioural test can pin: the failure mode is
+	// a comparison that only misbehaves when one of the two writers is dead. So read
+	// the source and forbid the shape outright.
+	//
+	// Why it is a bug and not a style choice: `event.ts` is stamped by this
+	// process's bus, `node.updatedAt` by the child's heartbeat. `legion-tools.ts`
+	// heartbeats only `isAlive` children, so a dead child's `updatedAt` FREEZES.
+	// Ranking the two ranked different clocks, and the old code deleted an
+	// "older-looking" override and trusted the frozen row — which is exactly how a
+	// finished node got painted back to `running`.
+	const { readFileSync } = await import("node:fs");
+	const source = readFileSync(new URL("../../src/extension/runtime.ts", import.meta.url), "utf8");
+	// Strip comments so the documentation about the removed shape cannot trip this.
+	const code = source
+		.replace(/\/\*[\s\S]*?\*\//g, "")
+		.replace(/^[ \t]*\/\/.*$/gm, "");
+	const offenders = code
+		.split("\n")
+		.map((line, index) => ({ line: line.trim(), number: index + 1 }))
+		.filter(({ line }) => /(event|override)\.ts\s*[<>]=?\s*(node\.)?updatedAt/.test(line));
+	assert.deepEqual(
+		offenders,
+		[],
+		`D3 forbids comparing a bus timestamp with a ledger heartbeat; found: ${JSON.stringify(offenders)}`,
+	);
+});
+
+test("display-liveness A2: a finished child is not pulled back to running by a frozen ledger row", async () => {
+	// The reported bug, in the order it really happens:
+	//   1. the child is alive and settles; the settle event is honoured;
+	//   2. its process dies, so its ledger row keeps the last heartbeat it managed
+	//      — `starting` — and `updatedAt` never advances again;
+	//   3. later refreshes must NOT paint it back to `running`.
+	//
+	// Under the old timestamp race step 3 was fatal: the settled override looked
+	// older than the frozen row, `snapshotNodes()` deleted it, and the panel showed
+	// `running` forever. Under D3 the verdict comes from `liveness()` (expired
+	// heartbeat ⇒ dead), so the stale row can never win.
+	let now = 1_000;
+	const row: TreeNodeSnapshot = {
+		...statusTreeNode("root.worker", "root", "worker", 1),
+		status: "starting",
+		updatedAt: 1_000,
+	};
+	const eventBus = createLegionEventBus();
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		eventBus,
+		getTreeNodes: () => [statusTreeNode("root", null, "root", 0), row],
+		now: () => now,
+	});
+	try {
+		// 1. alive and settling: the heartbeat is still fresh, and the event lands.
+		eventBus.emit({ nodeId: "root.worker", type: "node_settled", data: null, ts: 1_000 });
+		await settleFlush();
+		assert.equal(
+			runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state,
+			"settled",
+			"the settle event is honoured while the child is alive",
+		);
+
+		// 2. the process dies: the row is frozen at `starting` and its heartbeat
+		//    expires (the 90s orphan horizon passes).
+		now = 1_000 + 91_000;
+
+		// 3. every later read must still say the child ENDED, never `running`.
+		for (let i = 0; i < 3; i += 1) {
+			const state = runtime.statusEntries().find((entry) => entry.nodeId === "root.worker")?.state;
+			assert.notEqual(
+				state,
+				"running",
+				`refresh ${i + 1}: a dead child's frozen row must never be painted back to running`,
+			);
+			assert.ok(
+				state === "settled" || state === "failed",
+				`refresh ${i + 1}: the child ended, so it renders as an ending (saw ${state})`,
+			);
+		}
+	} finally {
 		runtime.dispose();
 	}
 });

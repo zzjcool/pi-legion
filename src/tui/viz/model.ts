@@ -2,14 +2,25 @@
  * Shared data model for the Legion visualization (railway strip + /legion view).
  *
  * Subagents spawn dynamically and nest, so nothing here assumes a fixed role
- * list. Node statuses collapse to four display states: `blocked` is a
- * transient in-memory approval flag and renders as running.
+ * list. Node statuses collapse to the display states of contract
+ * `docs/contracts/display-liveness-v1.md` D5: `blocked` is a transient
+ * in-memory approval flag and renders as running, while `idle`/`queued` are
+ * first-class display states (a child can hold a concurrency slot without
+ * working) and an unrecognised label is `unknown` rather than the old
+ * `retired` fallback.
  */
 
 import type { StatusEntry } from "../status.ts";
 import { SPAWN_MODES, type SpawnMode } from "../../shared/types.ts";
+import { displayStatusFromState, isTerminalState, type DisplayStatus } from "../../extension/liveness.ts";
 
-export type VizStatus = "running" | "settled" | "failed" | "retired";
+/**
+ * D5's display vocabulary, imported from the single authority rather than
+ * re-declared. The name `VizStatus` stays because every viz consumer imports
+ * it; the values are `liveness.ts`'s `DisplayStatus` so the panel cannot drift
+ * from the list/tree.
+ */
+export type VizStatus = DisplayStatus;
 
 export interface VizNode {
 	id: string;
@@ -55,11 +66,6 @@ export interface VizNode {
 	rss?: number;
 }
 
-/** Same set the footer/busy label treat as active, so live counts agree everywhere. */
-const RUNNING = new Set(["starting", "working", "running", "blocked"]);
-const SETTLED = new Set(["settled", "success", "completed", "done"]);
-const FAILED = new Set(["failed", "aborted", "error", "truncated"]);
-
 /**
  * `StatusEntry.spawnMode` is a plain string (it can come off disk or from an old
  * caller). Only a real mode reaches `VizNode`; anything else stays absent so the
@@ -69,12 +75,18 @@ function asSpawnMode(value: string | undefined): SpawnMode | undefined {
 	return value !== undefined && (SPAWN_MODES as readonly string[]).includes(value) ? (value as SpawnMode) : undefined;
 }
 
+/**
+ * D5: raw lifecycle state → display state, delegated to `liveness.ts`.
+ *
+ * The three local sets that used to live here (`RUNNING`/`SETTLED`/`FAILED`)
+ * plus the `return "retired"` catch-all are gone: a fourth copy of the state
+ * vocabulary is exactly how the strip, the tree and the rail drifted apart. In
+ * particular `idle`/`queued` no longer collapse into `retired`, and anything
+ * unrecognised (including `undefined`) is `unknown` — an undecided child must
+ * not be painted as finished.
+ */
 export function displayStatus(state: string | undefined): VizStatus {
-	const value = (state ?? "").toLowerCase();
-	if (SETTLED.has(value)) return "settled";
-	if (FAILED.has(value)) return "failed";
-	if (RUNNING.has(value)) return "running";
-	return "retired";
+	return displayStatusFromState(state);
 }
 
 /** Build viz nodes from status entries (root row included when present). */
@@ -85,8 +97,19 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 		const id = entry.nodeId ?? entry.name;
 		if (seen.has(id)) continue;
 		seen.add(id);
-		const status = id === "root" ? "running" : displayStatus(entry.herdrStatus ?? entry.state);
+		const raw = entry.herdrStatus ?? entry.state;
+		const status = id === "root" ? "running" : displayStatus(raw);
 		const spawnMode = asSpawnMode(entry.spawnMode);
+		// `endedAt` means "this lane's lifetime is over", and the rail/log/chart
+		// read it as such: the railway drops the lane, `buildLog` emits an end
+		// event, the timing pane freezes the wall clock. Only a *terminal* status
+		// may claim that. `idle`/`queued` are alive (D5: slot held, not started)
+		// and `unknown` is undecided — stamping an end on any of them would erase a
+		// live child from the strip and fake an end event for it.
+		//
+		// The root row is excluded because its display status is pinned to
+		// `running` above: an end stamp would contradict the status it carries.
+		const ended = id !== "root" && isTerminalState(raw);
 		out.push({
 			id,
 			name: entry.name,
@@ -95,7 +118,7 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 			depth: entry.depth ?? (id === "root" ? 0 : 1),
 			status,
 			startedAt: entry.startedAt,
-			...(status !== "running" ? { endedAt: entry.finishedAt ?? entry.startedAt } : {}),
+			...(ended ? { endedAt: entry.finishedAt ?? entry.startedAt } : {}),
 			tokens: Math.max(0, entry.tokensTotal ?? 0),
 			tokensOut: Math.max(0, entry.tokensOut ?? 0),
 			generationMs: Math.max(0, entry.generationMs ?? 0),

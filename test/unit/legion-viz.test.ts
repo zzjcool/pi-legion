@@ -55,17 +55,73 @@ function scenario(endSec = 600, count = 12): { nodes: VizNode[]; sampler: RateSa
 	return { nodes: snap(endSec), sampler, now: sec(endSec) };
 }
 
-test("viz: blocked and starting display as running; terminal states map to done/failed/retired", () => {
+test("viz: blocked and starting display as running; terminals map to done/failed/retired", () => {
 	assert.equal(displayStatus("starting"), "running");
 	assert.equal(displayStatus("blocked"), "running");
 	assert.equal(displayStatus("running"), "running");
 	assert.equal(displayStatus("working"), "running");
-	// Matches the footer's active set: an idle/awaiting child is not counted as live.
-	assert.equal(displayStatus("idle"), "retired");
-	assert.equal(displayStatus("awaiting"), "retired");
+	// The old assertion here was `displayStatus("idle") === "retired"`, justified
+	// by "an idle/awaiting child is not counted as live". That was wrong twice
+	// over (contract D5): an `idle` child *is* alive — it still holds a
+	// concurrency slot — so painting it `retired` erased a live seat from the
+	// strip and reported it as finished; and `retired` was only ever reached by
+	// the function's `return "retired"` catch-all, i.e. the assertion was locking
+	// in the fallback rather than a decision. `idle` is now a first-class state
+	// rendered grey ("alive, not working").
+	assert.equal(displayStatus("idle"), "idle");
+	// `awaiting` means "alive, waiting on downstream" (D1-a), so it must not be
+	// `retired` either. It is not a display state of its own, so it lands on the
+	// honest third answer: `unknown` — never `retired`, which would claim a
+	// lifecycle that has not ended.
+	assert.equal(displayStatus("awaiting"), "unknown");
 	assert.equal(displayStatus("settled"), "settled");
 	assert.equal(displayStatus("failed"), "failed");
 	assert.equal(displayStatus("retired"), "retired");
+});
+
+test("A4: idle/queued are first-class display states and unknown is not retired", () => {
+	// Contract A4, the four cases the migration table (§6) calls out.
+	assert.equal(displayStatus("idle"), "idle");
+	assert.equal(displayStatus("queued"), "queued");
+	// `undefined` used to reach the `return "retired"` catch-all: a child whose
+	// state we had not read yet was rendered as finished.
+	assert.equal(displayStatus(undefined), "unknown");
+	assert.equal(displayStatus(""), "unknown");
+	// Any label we do not recognise is undecided, not `retired`. Treating it as
+	// finished was the D5 bug; treating it as running would be the D2 bug.
+	assert.equal(displayStatus("weird-state"), "unknown");
+	// Regression: the in-flight collapse must survive the delegation to W1.
+	assert.equal(displayStatus("starting"), "running");
+	// Case-insensitive like every other caller of the mapping.
+	assert.equal(displayStatus("IDLE"), "idle");
+});
+
+test("D5: idle and unknown render grey, queued stays a role colour", () => {
+	// An idle seat is alive but not working: dim, the same as retired.
+	assert.equal(nodeToken({ role: "worker", status: "idle" }), "dim");
+	// An undecided node must not wear a role colour — that would read as active.
+	assert.equal(nodeToken({ role: "worker", status: "unknown" }), "dim");
+	// `queued` is admitted and about to run, so greying it out would be a lie.
+	assert.equal(nodeToken({ role: "worker", status: "queued" }), "role:worker");
+});
+
+test("D5: idle/queued/unknown nodes get no endedAt, so the strip keeps them", () => {
+	const entries: StatusEntry[] = [
+		{ name: "root", agent: "root", state: "running", startedAt: T0, nodeId: "root", parentId: null, depth: 0 },
+		{ name: "idle-w", agent: "worker", state: "idle", startedAt: T0, nodeId: "root.idle", parentId: "root", depth: 1 },
+		{ name: "q-w", agent: "worker", state: "queued", startedAt: T0, nodeId: "root.q", parentId: "root", depth: 1 },
+		{ name: "weird", agent: "scout", state: "weird-state", startedAt: T0, nodeId: "root.weird", parentId: "root", depth: 1 },
+		{ name: "done", agent: "scout", state: "settled", startedAt: T0, finishedAt: T0 + 5, nodeId: "root.done", parentId: "root", depth: 1 },
+	];
+	const byId = new Map(nodesFromEntries(entries).map((n) => [n.id, n]));
+	for (const id of ["root.idle", "root.q", "root.weird"]) {
+		assert.equal(byId.get(id)?.endedAt, undefined, `${id}: a non-terminal node has no end stamp`);
+	}
+	// A terminal node still stamps it — that is what retires the lane.
+	assert.equal(byId.get("root.done")?.endedAt, T0 + 5);
+	assert.equal(byId.get("root.idle")?.status, "idle");
+	assert.equal(byId.get("root.q")?.status, "queued");
+	assert.equal(byId.get("root.weird")?.status, "unknown");
 });
 
 test("viz: role colors are theme tokens; unknown roles pick a stable syntax token", () => {

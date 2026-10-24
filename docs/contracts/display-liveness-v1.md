@@ -51,7 +51,7 @@ if (override && override.ts >= node.updatedAt) { // 第 3 道
   if (override) eventOverrides.delete(node.id);  // ← 永久删除 override
   tree.set(node.id, { ...node });                // ← 采信账本行
 }
-```ts
+```
 
 - `event.ts` 由**父进程**事件总线打时间戳。
 - `node.updatedAt` 由**子进程**写账本时打时间戳（`src/legion/nodes.ts:184`），
@@ -86,7 +86,7 @@ if (override && override.ts >= node.updatedAt) { // 第 3 道
 
 `displayStatus()`（`src/tui/viz/model.ts:72-78`）的兜底是 `return "retired"`，所以：
 
-```ts
+```
 displayStatus("idle")    === "retired"   ← idle 在轨道图上显示成"已退休"
 displayStatus("queued")  === "retired"   ← queued 显示成"已退休"
 displayStatus(undefined) === "retired"
@@ -94,7 +94,7 @@ displayStatus(undefined) === "retired"
 
 ### R4 — 孤儿检测只报告，不收敛
 
-```ts
+```
 // src/extension/legion-tools.ts:251
 const event = appendEvent(this.db, node.id, "orphan_detected", {...});
 this.eventBus?.emit(event);
@@ -142,7 +142,7 @@ this.sendRootMessage(`Legion orphan detected at ...`);
 新增纯函数模块 `src/extension/liveness.ts`（**无 fs / 无 db / 无 timer / 无 clock 读取**，
 所有输入由调用方传入）：
 
-```ts
+```
 export type Liveness = "live" | "dead" | "unknown";
 
 export interface LivenessFacts {
@@ -163,20 +163,51 @@ export function liveness(facts: LivenessFacts): Liveness;
 
 **判定顺序（全序，不是"任一为真"）**：
 
-```text
+```
 1. inMemory 存在且非终态            → live    （最强：本进程正在持有它）
 2. inMemory 存在且是终态            → dead
 3. pidAlive === true               → live    （有进程真在跑）
 4. pidAlive === false              → dead    （进程确认已亡，D4 接受窗口）
 5. ledger 非终态 且 now - updatedAt < staleMs → live   （心跳未过期）
 6. ledger 非终态 且心跳已过期        → dead    （孤儿：D7 收敛）
-7. record 是终态                    → dead
-8. 其余（含全部 undefined）          → unknown （绝不猜）
-```ts
+7. ledger 是终态                    → dead    （账本已落终态：已结束）
+8. record 是终态                    → dead    （调度层已判定结束）
+9. 其余（含全部 undefined）          → unknown （绝不猜）
+```
 
 **为什么是顺序而非并集**：并集会让"某处残留一条 running 账本行"永久压过
 "本进程已确认它死了"。顺序保证**更强的证据胜出**，且 `unknown` 是一个明确的
 第三态而非"当活处理"。
+
+### D1-a — 终态集合与未知标签（2026-10-24 父会话裁决）
+
+W1 实施时发现契约原文漏了两处，此处补全并冻结。
+
+**`TERMINAL_STATES`（账本/记录层终态）**
+
+```
+settled, success, completed, done,
+failed, aborted, error, truncated,
+retired
+```
+
+**`awaiting` 不是终态。** 它表示"活着但在等下游"
+（`src/runs/orchestrator.ts:2271`：`if (execution.status !== "running" && !isRetired()) child.state = "awaiting"`；
+`src/extension/recycle.ts:23` 也把它单列）。把它当终态，会让一个仍在等待的 centurion
+在展示层凭空消失。`awaiting` 归入**非终态**，展示为灰（同 `idle`，见 D5）。
+
+> `src/tui/status.ts:363-372` 现有的 `TERMINAL_STATES` 把 `awaiting` 当终态，且
+> `status.ts:525-528` 先把它改写成 `"waiting"` 再渲染。**W4 必须一并纠正**：
+> `awaiting` 既不消失，也不显示为终态。
+
+**未知标签：用补集，不用白名单。** 判定"非终态"用 `!isTerminalState(status)`，
+**不是** `NON_TERMINAL.has(status)`。认不出的标签不应让我们宣布其生命周期结束；
+白名单式判定会让 W2 传入真实账本行时静默掉进 `unknown`。
+`NON_TERMINAL` 仅作文档性导出，不参与判定。
+
+**`LivenessFacts.ledger.status` 用 `string`，不用 `NodeStatus`。**
+`idle`/`queued` 按 D9 永不进入 `NODE_STATUSES` 闭集，但 D5 要求它们是一等展示态；
+冻结成 `NodeStatus` 会迫使 W2/W4 处处 `as` 强转，反而模糊 D9 的边界。
 
 ### D2 — 三态而非二态
 
@@ -217,6 +248,25 @@ export function liveness(facts: LivenessFacts): Liveness;
 **为什么 `idle` 要显示而不是隐藏**：`idle` 的 child 仍然活着、仍占并发槽（F9），
 两个事实都要传达。标灰是"活着但没在干活"的准确表达。
 
+### D5-a — `LogEvent.kind` 不随 `VizStatus` 放宽（2026-10-24 父会话裁决）
+
+W4 实施时暴露一处契约未覆盖的连带影响，此处冻结。
+
+`src/tui/viz/panels.ts` 的 `LogEvent.kind` 是
+`"spawn" | "settled" | "failed" | "retired"`，`buildLog()` 原先把 `node.status`
+直接塞进去（`node.status !== "running"` 即视为结束）。`VizStatus` 放宽后这行必然报错。
+
+**裁决：`LogEvent.kind` 保持不变，`buildLog` 只对真正的结束态产生结束行。**
+
+```text
+结束态 = settled | failed | retired
+非结束态 = running | idle | queued | unknown   → 只有 spawn 行，没有结束行
+```
+
+理由：`idle`/`queued` 按 D5 **是活的**（占着槽，只是没在干活），`unknown` **未定**。
+把任何一项记成结束都会重新制造"活着的节点在 git-log 里已结束"的错误——
+与本契约要消灭的问题同类。`panels.ts` 归 **W4** 文件所有权。
+
 ### D6 — 所有出口从 `liveness()` 派生
 
 以下出口**必须**调用 `liveness()`，不得自行判定：
@@ -236,10 +286,9 @@ export function liveness(facts: LivenessFacts): Liveness;
 `scanOrphans` 命中（`legion-tools.ts:241-252`）时，除现有事件与消息外，
 **必须**把账本行收敛到终态：
 
-```ts
+```
 updateNode(db, node.id, { status: "failed" }, timestamp);
 appendEvent(db, node.id, "node_abandoned", { reason: "no_active_supervisor", ... });
-```ts
 
 理由：`orphan_detected` 只描述"发现了孤儿"，不改变事实；而用户要的是
 "他没了就没了"。收敛后 `liveness()` 的第 5 步自然给出 `dead`，无需任何展示层特判。
@@ -272,7 +321,7 @@ appendEvent(db, node.id, "node_abandoned", { reason: "no_active_supervisor", ...
 | **W1** | `src/extension/liveness.ts`（新） | D1 `liveness()` + D2 三态 + D5 状态映射表；纯函数，无 I/O |
 | **W2** | `src/extension/runtime.ts` | D3 删除三处时钟比较；D6 出口 2/5/7；D8 纯投影 |
 | **W3** | `index.ts` | D6 出口 1（`listLiveChildrenForStatus` + `renderStatusOverview`） |
-| **W4** | `src/tui/viz/model.ts`, `src/tui/status.ts`, `src/tui/tree-view.ts`, `src/extension/legion-status.ts` | D5 新展示态 + D6 出口 3/4/5/6，集合归一 |
+| **W4** | `src/tui/viz/model.ts`, `src/tui/viz/palette.ts`, `src/tui/viz/panels.ts`, `src/tui/status.ts`, `src/tui/tree-view.ts` | D5 新展示态 + D6 出口 3/4/5/6，集合归一 |
 | **W5** | `src/extension/legion-tools.ts` | D7 孤儿收敛 |
 | **W6** | `docs/`, `CHANGELOG.md` | 文档与迁移说明 |
 
@@ -285,14 +334,15 @@ appendEvent(db, node.id, "node_abandoned", { reason: "no_active_supervisor", ...
 
 | 编号 | 断言 | 归属 |
 |---|---|---|
-| **A1** | `liveness()` 的 8 条判定顺序逐条覆盖；`unknown` 不被展示为 live | W1 |
+| **A1** | `liveness()` 的 9 条判定顺序逐条覆盖；`unknown` 不被展示为 live | W1 |
 | **A2** | 已 `settled` 的节点，账本行冻在 `starting` 且心跳过期 → 渲染为终态，**不被拉回 running**（R2 回归） | W1+W2 |
 | **A3** | `owner: dead` 的 child **不计入** `Status · N live`（改正 `status-action.test.ts:301`） | W3 |
-| **A4** | `displayStatus("idle") === "idle"`、`("queued") === "queued"`、`(undefined) === "unknown"` | W4 |
+| **A4** | `displayStatus("idle") === "idle"`、`("queued") === "queued"`、`("awaiting") === "awaiting"`、`(undefined) === "unknown"` | W4 |
 | **A5** | 孤儿超过 `orphanStaleMs` → 账本行变 `failed` + `node_abandoned` 事件；`liveness()` 随后给 `dead` | W5 |
 | **A6** | 同一组 facts 连续投影 100 次结果恒定（替代 `#238` KNOWN LIMITATION 的收敛断言） | W1+W2 |
 | **A7** | `src/` 中不存在 `event.ts` 与 `updatedAt` 的比较（D3 静态守卫） | W2 |
 | **A8** | `queued`/`idle` 未进入 `NODE_STATUSES`；A16 tripwire 仍绿 | W4 |
+| **A9** | `buildLog` 对 `idle`/`queued`/`unknown` 节点不产生结束行（D5-a） | W4 |
 
 ---
 

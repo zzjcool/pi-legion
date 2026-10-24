@@ -248,6 +248,19 @@ export class LegionPostman {
 			const firstRootChild = this.firstRootChild(node);
 			if (firstRootChild && this.supervisor.isAlive(firstRootChild.name)) continue;
 			if (wasOrphanReportedRecently(this.db, node.id, timestamp - ORPHAN_REPORT_WINDOW_MS)) continue;
+			// D7 (display-liveness v1): converge the ledger, do not merely report.
+			// `orphan_detected` alone only described a suspicion, so a dead child stayed
+			// `running` forever and every display exit had to special-case it. Commit the
+			// fact first and let the event stream describe a state that already exists:
+			// `liveness()` then reads a terminal row and answers `dead` on its own. `node`
+			// is the pre-convergence snapshot — `updateNode` does not mutate it — so
+			// `node.updatedAt` still names the frozen heartbeat this scan judged.
+			updateNode(this.db, node.id, { status: "failed" }, () => timestamp);
+			appendEvent(this.db, node.id, "node_abandoned", {
+				reason: "no_active_supervisor",
+				staleMs,
+				updatedAt: node.updatedAt,
+			}, { now: () => timestamp });
 			const event = appendEvent(this.db, node.id, "orphan_detected", {
 				parentId: node.parentId,
 				updatedAt: node.updatedAt,

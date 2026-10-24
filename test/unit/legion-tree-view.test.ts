@@ -445,3 +445,57 @@ test("tree view shows current-turn elapsed from a snapshot-provided turnStartedA
 		view.dispose();
 	}
 });
+
+test("D6: the tree's terminal set is derived — a terminal node freezes its clock, an active one does not", () => {
+	// This file used to keep its own `TERMINAL_STATUSES`. For the six ledger
+	// statuses the two happen to agree today, so the gain here is anti-drift, not
+	// a behaviour change: `settled`/`failed`/`retired` now come from the same
+	// authority as every other surface, so a future ledger status cannot be
+	// terminal in the panel and non-terminal in the tree.
+	const nodes = [
+		node("root", null, "root", 0, "root", "running"),
+		node("root.done", "root", "done", 1, "worker", "failed"),
+		node("root.busy", "root", "busy", 1, "worker", "blocked"),
+	];
+	const view = createTreeView({ nodes, now: () => BASE_TIME + 60_000 });
+	try {
+		const lines = view.render(100).map(stripTerminalSequences);
+		const done = lines.find((line) => line.includes("done (worker)"));
+		const busy = lines.find((line) => line.includes("busy (worker)"));
+		assert.ok(done && busy);
+		// Terminal ⇒ the lifetime clock clamps at `updatedAt` (BASE_TIME + 100 for
+		// depth 1) instead of running to now+60s.
+		assert.match(done, /\b0s\b/, `a failed node's clock is frozen, got: ${done}`);
+		// `blocked` is active (an approval gate), so its clock keeps running.
+		assert.match(busy, /\b60s\b/, `a blocked node's clock still runs, got: ${busy}`);
+	} finally {
+		view.dispose();
+	}
+});
+
+test("D5: `queued`/`idle` snapshot rows are never folded or dimmed as finished", () => {
+	// `queued`/`idle` cannot reach this view through `NodeStatus` (D9 keeps them
+	// out of the ledger set), but the partition must not misclassify one if a
+	// snapshot ever carries it: calling it terminal would fold the subtree and
+	// freeze the clock for work that has not even started. The cast is the point
+	// of the test — it exercises the union the derived sets add for exactly this
+	// hypothetical.
+	for (const pending of ["queued", "idle"] as const) {
+		const nodes = [
+			node("root", null, "root", 0, "root", "running"),
+			{ ...node("root.p", "root", "p", 1, "worker", "running"), status: pending as TreeNodeSnapshot["status"] },
+			{ ...node("root.p.child", "root.p", "child", 2, "worker", "running"), status: pending as TreeNodeSnapshot["status"] },
+		];
+		const view = createTreeView({ nodes, now: () => BASE_TIME + 60_000 });
+		try {
+			assert.equal(view.isExpanded("root.p"), true, `${pending}: a pending parent is not folded as terminal`);
+			const lines = view.render(100).map(stripTerminalSequences);
+			const row = lines.find((line) => line.includes("p (worker)"));
+			assert.ok(row, `${pending}: row rendered`);
+			assert.match(row, /\b60s\b/, `${pending}: clock keeps running (not terminal), got: ${row}`);
+			assert.ok(lines.some((line) => line.includes("child (worker)")), `${pending}: subtree stays visible`);
+		} finally {
+			view.dispose();
+		}
+	}
+});
