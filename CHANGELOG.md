@@ -11,7 +11,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
-### Added
+## [4.0.0] — 2026-10-24
 
 - **Renewal for a budget casualty (#270).** An agent whose turn budget (`timeoutMs`)
   runs out no longer just reports `failed`. When it measurably progressed and its
@@ -63,9 +63,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [4.0.0] — 2026-10-19
 
-Pi-only runtime. Relative to 3.1.0 this line removes every non-`pi` agent kind,
-the archived Herdr backend behind it, and the settings / error codes that only
-the Herdr transport read.
+A major line — but not only the pi-only collapse. Relative to 3.1.0 this release
+removes every non-`pi` agent kind and the archived Herdr backend behind it, along
+with the settings and error codes that only its transport read. It also carries
+everything else that landed on `master` while that removal was held back: a
+launch admission queue that queues instead of refusing, one liveness verdict
+shared by every display surface, a status panel built on pid / rss /
+context-token data, and ten measured performance fixes.
 
 ### Breaking
 
@@ -94,6 +98,103 @@ the Herdr transport read.
   `RunRecord.herdr` and `StatusEntry.herdrStatus` stay: they carry live
   `{supervisor, node_id}` state, not backend selection.
 
+### Added
+
+- **Launch admission queue (#266).** A launch that exceeds a *concurrency* gate
+  (`maxChildrenPerNode`, `maxActive`, ledger `max_children_per_node` /
+  `max_active_nodes`) no longer fails with `BUDGET_EXCEEDED`. It is enqueued,
+  the caller gets `▶ scout-7 (scout) supervisor=inprocess queued(3)` and treats
+  the work as dispatched, and the child starts automatically when a slot frees.
+  Previously a 12-step fan-out against `maxChildrenPerNode: 8` ran 8 children and
+  reported 4 errors — and nothing ever retried them, because the parent was
+  already inside `wait` and the freed slot had no subscriber.
+  - New settings: `subagents.inprocess.maxQueuedLaunches` (default **32**) and
+    `subagents.inprocess.launchQueueTimeoutMs` (default **900000**). Both are
+    shared by the in-process and RPC paths — one scheduler, not two.
+  - Depth, spawn-per-session, memory, name-collision and config errors are still
+    refused synchronously, byte-identically to before: only gates that a slot
+    release can satisfy are queueable. `maxChildrenPerNode: 0` is a hard refusal
+    (0 means "no children", so waiting can never satisfy it).
+  - A queued launch reserves nothing: no ledger row, no child run directory, no
+    worktree, no session file. `timeout`/`overflow`/`stop` are reported by name;
+    `stop` dequeues without ever spawning, and a parent-turn abort flushes the
+    queue and says how many launches it dropped.
+  - `subagent({action:"status"})` shows `state=queued`, `collect`/`wait` block
+    until admission instead of reading the placeholder session path, and
+    `async: false` reports `↳ <name> waited Ns in the launch queue`.
+  - Two new process-only events (`launch_queued`, `launch_admitted`) and a
+    `legion-queue: N queued` status pill.
+
+
+- **One liveness verdict for every display surface (#liveness).** The list, the
+  text view and the railway chart each decided "is this agent still working?"
+  their own way, and the railway one compared two clocks that no single writer
+  owned: `eventOverrides` vetoed an event against `node.updatedAt`, but the
+  event row is stamped by this process's event bus while `updatedAt` is stamped
+  by the child's heartbeat — and only `isAlive` children are heartbeaten, so a
+  dead child's `updatedAt` freezes. The comparison ranked two clocks and the
+  losing side was the truthful one: a finished node was repainted `running`,
+  forever, because the frozen row never moved again. `src/extension/liveness.ts`
+  replaces all three with one `liveness(facts)` in TOTAL ORDER — `live` /
+  `dead` / `unknown` — with no clock, no fs and no timer of its own. Unknown or
+  unrecognized states now render `unknown` instead of being guessed into
+  `retired`, and `queued` is a first-class display state.
+  - Contract: `docs/contracts/display-liveness-v1.md` (frozen first, then
+    implemented; D1-a and D5-a record two amendments found during the work).
+
+- **A status panel on the `/legion` board (#241, #245).** A fifth pane carries
+  the `/legion status` table onto the full-screen viewer — name · role · state ·
+  supervisor · ctx · rss · turns — graded down by absolute column count
+  (72/52/36/20) so a narrow board keeps name · state instead of a column of
+  stubs. A portrait layout gets a zero-area rect and Tab skips it rather than
+  painting a fifth pane that cannot fit. Only an `rpc` child owns a process, so
+  only it shows rss; an `inprocess` child shows `—` rather than a share of the
+  host figure it does not own, because a fabricated number would get used.
+  - `pid`, `spawnMode`, `contextTokens` and `rss` are optional on `VizNode` and
+    projected conditionally: a missing mode renders `unknown`, never a guessed
+    `rpc`. No new `legion.db` column and no schema-version bump — pid is
+    host-scoped and never persisted, so a rebuild from a `ChildRecord` invents
+    none.
+  - Context tokens are absolute only. Session JSONL carries no context window,
+    so no percentage is computed and none is displayed.
+  - `/legion status` also stopped dropping `spawnMode` and now supplies `owner`.
+
+- **`/legion stop --force` (#179).** The TUI slash command can now hard-retire a
+  child, equivalent to the tool's `force: true`; `--force` / `-f` is listed in
+  the doctor help and the README. This closes the "optional follow-up" that the
+  docs had been carrying.
+
+- **`vexillatio` accepts `tasks[]` on its own.** `task` was required, so a
+  `{tasks: [...]}` call was rejected by the host's typebox pre-validation before
+  Legion ever saw it, and callers had to send a dummy `task` and retry. It is
+  optional now; a `tasks[]`-only launch is legal.
+
+### Changed
+
+- **WAL is now an enforced startup precondition (#236).** `openLegionDb` used to
+  discard the value returned by `PRAGMA journal_mode = WAL`. That PRAGMA is a
+  *query*: the returned mode is the ground truth, and SQLite is entitled to
+  answer with the mode it settled on rather than to fail — which is how a
+  connection ends up on a rollback journal while every reader of the code
+  believes WAL is live. The ledger's durability reasoning (single-writer
+  serialisation, readers that never block the writer, the shutdown checkpoint)
+  rests entirely on WAL, so the observed mode is now captured and verified: a
+  file database that does not report `wal` throws at startup, with the observed
+  mode in the message, instead of surfacing later as data loss. `:memory:` is
+  exempt deliberately, keyed on `PRAGMA database_list` reporting an empty
+  `file` — not on a database name, and not by accident.
+  - The M2-(g) concurrency acceptance now runs as `npm run test:wal-stress`:
+    60 supervisor processes against one ledger, 9004 attempts, 9004 commits, 0
+    busy, p50 1.03 ms / p95 1.99 ms / p99 4.92 ms.
+
+- **The worker role's turn budget is 45 minutes, not 30.** The worker does the
+  heaviest per-dispatch work — several files, its own verification run, and a
+  report — yet it shared centurion's budget while scout gets 10 minutes and
+  reviewer 15. Two dispatches in this repository were cut off mid-work, one
+  with nothing on disk and one that ran out while verifying. 45 rather than 60
+  keeps a genuinely stuck child from holding a concurrency slot for an hour.
+  Only `timeoutMs` changed.
+
 ### Fixed
 
 - **A poison event row no longer freezes the cross-process event poller
@@ -104,6 +205,71 @@ the Herdr transport read.
   the poller advances past a single poison row instead of freezing: the row is
   reported once through `onError`, the cursor steps over it, and the remaining
   events in that batch are still delivered.
+
+- **A finished supervisor's pid is no longer read as its successor's (#250).**
+  `rss` probes re-read `/proc/<pid>` after the child had exited, and Linux
+  reuses pids; the panel could attribute a stranger's memory to a retired node.
+  The probe now closes the race it was silently losing.
+
+- **The log view stays inside its rect on narrow panes (#251).** `drawLog` wrote
+  past its own `maxX` when the pane was squeezed, which corrupted the frame
+  beside it.
+
+- **The live overlay no longer scans the whole tree per token (#261).** A
+  per-token `getTreeNodes()` call made a long child turn quadratic in the number
+  of nodes; the scan is gone and re-opening the node that is already open is
+  guarded.
+
+- **Repository subdirectories are no longer mistaken for child worktrees
+  (#237 P10).** The probe treated any git-visible path below the repo root as an
+  existing worktree, so a dispatch from `src/` could reuse the wrong directory.
+  All git probes are now bounded: `GIT_PROBE_TIMEOUT_MS = 5_000` and
+  `GIT_WORKTREE_TIMEOUT_MS = 120_000`, so a hung `git` can no longer wedge a
+  launch forever.
+
+- **`SubagentError` is exported explicitly again.** It had reached
+  `pi-legion/api` only as a side effect of the legacy client re-exporting it, so
+  removing the Herdr backend silently dropped it from the public surface. It is
+  a deliberate export now, pinned by a test.
+
+### Performance
+
+Ten fixes measured against the baseline in `docs/performance-2026-10-19.md`,
+plus the harness that measured them (#239). Numbers below are the before/after
+from each fix's own commit.
+
+- **`collect()` no longer waits out a fixed settle-quiet window (#232).** An
+  already-settled turn cost a flat ~2.5 s of dead time; that wait is dropped when
+  the turn is settled (2509 ms → 503 ms).
+- **The settle polls back off instead of re-parsing every 500 ms (#232).** The
+  transient-connection wait re-parsed the whole session file on every tick. It
+  now keeps the last parse, re-parses only when the artifact size moved, and
+  backs off 500 ms → 4 s. On an unchanged file in a 900 s window: 1800
+  iterations / 1804 parses → 228 iterations / 5 parses. The blip tolerance is
+  unchanged — sleeps are clamped to the remaining budget and the loop still ends
+  exactly on the deadline.
+- **The `/legion` log view reads the session incrementally (#234).** It seeks
+  past the cached byte offset and projects only the new JSONL lines, instead of
+  re-parsing from the top on every refresh.
+- **`attachUsageTotals` is one batched query (#235/#248).** It accounted for
+  ~72% of the cost of a UI snapshot; it is now a chunked `IN` query instead of a
+  per-node round trip.
+- **Heartbeats are one transaction (#236 P1).** N children meant N commits;
+  eight children now cost one (3.83 ms → 0.99 ms, 3.9×).
+- **Prepared statements are cached per connection (#236 P2).** `getNode` ×400
+  drops 15.7 ms → 4.8 ms.
+- **Session parsing projects its result instead of `structuredClone` (#237 P7).**
+- **The DB event source seeds its cursor at attach instead of replaying the log
+  (#238).** Attaching used to block ~1027 ms on replay.
+- **Widget events are coalesced into one snapshot and one paint per tick
+  (#238).** `legion-tools` emits N `mail_sent` events in one synchronous loop, so
+  every burst cost 2N scans; a burst now costs a constant 2 snapshots — 2575 ms
+  → 4.4 ms for 1000 events over a 120-node ledger. `applyTreeEvent` itself still
+  runs synchronously, per event, in arrival order: it is an incremental state
+  machine, not a render, so deferring or reordering it would change the state it
+  computes.
+- **The messages rate-limit `COUNT` is covered by an index (#237 P9).** 50k rows
+  go from a `SCAN` to ~6.6 µs.
 
 ## [3.1.0] — 2026-10-19
 
@@ -537,6 +703,8 @@ Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 
 [Unreleased]: https://github.com/zzjcool/pi-legion/compare/v4.0.0...HEAD
 [4.0.0]: https://github.com/zzjcool/pi-legion/compare/v3.1.0...v4.0.0
+[3.1.0]: https://github.com/zzjcool/pi-legion/compare/v3.0.3...v3.1.0
+[3.0.3]: https://github.com/zzjcool/pi-legion/compare/v3.0.2...v3.0.3
 [3.0.2]: https://github.com/zzjcool/pi-legion/compare/v3.0.1...v3.0.2
 [3.0.1]: https://github.com/zzjcool/pi-legion/compare/v3.0.0...v3.0.1
 [3.0.0]: https://github.com/zzjcool/pi-legion/compare/v2.0.4...v3.0.0
