@@ -13,6 +13,56 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [4.0.0] — 2026-10-24
 
+- **Renewal for a budget casualty (#270).** An agent whose turn budget (`timeoutMs`)
+  runs out no longer just reports `failed`. When it measurably progressed and its
+  role allows renewal, the completion notice ends with a ready-to-paste
+  `subagent({ action: "continue", … })` plus the evidence (`progressed: 47 tool
+  results, 12 assistant messages, 6 files changed`) and the remaining budget
+  (`renewals: 1/2`). Renewal reuses the existing `continue` path, so the child
+  resumes from its own session file with its context intact. Two dispatches in one
+  day motivated this: one worker was cut off with nothing on disk, another finished
+  its code but ran out during verification.
+  - **Never automatic.** An auto-renewed stuck child would hold a concurrency slot
+    indefinitely; the notice hands over the decision instead.
+  - "Progressed" = ≥ 3 new `toolResult` rows or ≥ 1 changed file since the last
+    baseline. `assistant` messages are shown but never count — a model looping on
+    the same sentence grows that number without doing work.
+  - New agent frontmatter: `renewable` (default **true**; a timed-out `scout` means
+    the task was mis-scoped) and `maxRenewals` (default **2**; `0` disables, each
+    renewal is a fresh full budget). Both are validated in the team-override path
+    like every other numeric/boolean field.
+  - `wait`/`collect` timeouts never propose a renewal: those return while the child
+    is still alive. Only a real termination does, judged by `stopReason: "toolUse"`
+    / missing assistant row (F29) / the host's `terminated` wording — a clean
+    `stop` from an ordinary retry does not spend the budget.
+
+- **Launch admission queue (#266).** A launch that exceeds a *concurrency* gate
+  (`maxChildrenPerNode`, `maxActive`, ledger `max_children_per_node` /
+  `max_active_nodes`) no longer fails with `BUDGET_EXCEEDED`. It is enqueued,
+  the caller gets `▶ scout-7 (scout) supervisor=inprocess queued(3)` and treats
+  the work as dispatched, and the child starts automatically when a slot frees.
+  Previously a 12-step fan-out against `maxChildrenPerNode: 8` ran 8 children and
+  reported 4 errors — and nothing ever retried them, because the parent was
+  already inside `wait` and the freed slot had no subscriber.
+  - New settings: `subagents.inprocess.maxQueuedLaunches` (default **32**) and
+    `subagents.inprocess.launchQueueTimeoutMs` (default **900000**). Both are
+    shared by the in-process and RPC paths — one scheduler, not two.
+  - Depth, spawn-per-session, memory, name-collision and config errors are still
+    refused synchronously, byte-identically to before: only gates that a slot
+    release can satisfy are queueable. `maxChildrenPerNode: 0` is a hard refusal
+    (0 means "no children", so waiting can never satisfy it).
+  - A queued launch reserves nothing: no ledger row, no child run directory, no
+    worktree, no session file. `timeout`/`overflow`/`stop` are reported by name;
+    `stop` dequeues without ever spawning, and a parent-turn abort flushes the
+    queue and says how many launches it dropped.
+  - `subagent({action:"status"})` shows `state=queued`, `collect`/`wait` block
+    until admission instead of reading the placeholder session path, and
+    `async: false` reports `↳ <name> waited Ns in the launch queue`.
+  - Two new process-only events (`launch_queued`, `launch_admitted`) and a
+    `legion-queue: N queued` status pill.
+
+## [4.0.0] — 2026-10-19
+
 A major line — but not only the pi-only collapse. Relative to 3.1.0 this release
 removes every non-`pi` agent kind and the archived Herdr backend behind it, along
 with the settings and error codes that only its transport read. It also carries

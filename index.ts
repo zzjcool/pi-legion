@@ -57,7 +57,12 @@ import { getChildByName, getChildren, getNode, getSubtree, insertNode, type Legi
 import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
-import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/shared/session.ts";
+import {
+	deriveOutcome,
+	isLastTurnComplete,
+	NO_ASSISTANT_ABORT_REASON,
+	parseSessionFile,
+} from "./src/shared/session.ts";
 import { restoreHostNodeOptions } from "./src/supervisor/child-memory.ts";
 import { currentChildContext } from "./src/supervisor/child-context.ts";
 import { setVerifyQueueListener } from "./src/runs/verify-queue.ts";
@@ -81,6 +86,8 @@ import {
 } from "./src/extension/blocked.ts";
 import { formatAlreadyRecycled } from "./src/extension/recycle.ts";
 import {
+	completionStatusOf,
+	type RenewalProposal,
 	SUBAGENT_NOTIFY_TYPE,
 } from "./src/extension/notify.ts";
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
@@ -97,13 +104,18 @@ import {
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
 import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
+import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
+	type ChildRecord,
 	DEFAULTS,
+	DEFAULT_MAX_RENEWALS,
 	DEFAULT_ON_BLOCKED,
+	DEFAULT_RENEWABLE,
 	ErrorCodes,
+	type Execution,
 	type ModelOrigin,
 	type RetireOptions,
 	type SpawnMode,
@@ -984,6 +996,33 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				supervisorName: name,
 			} : undefined;
 		},
+		/**
+		 * subagent-renewal-v1 D3: the one renewal proposal the completion notice
+		 * may carry.
+		 *
+		 * Read from the persisted ChildRecord so a proposal survives process
+		 * boundaries (each tool call is a fresh process). Every "do not offer"
+		 * rule — D1 completed, D7 still running, D5 role opt-out, D8 no baseline —
+		 * lives inside `renewalProposalFor`, so returning its undefined is the
+		 * whole decision.
+		 */
+		getRenewalProposal: (name, execution) => {
+			// Each tool call is a fresh process, so the child record comes off disk
+			// rather than from any in-memory launch state.
+			const cwd = lastCwd;
+			if (!cwd) return undefined;
+			const located = findChild(runStoreFor(cwd).listRuns(), name);
+			if (!located) return undefined;
+			const catalog = loadCatalog(cwd, cwd, undefined);
+			const def = findControlAgent(catalog.agents, catalog.allAgents, located.child.agent);
+			return renewalProposalFor({
+				agent: def,
+				child: located.child,
+				sessionFile: located.child.sessionFile,
+				execution,
+				name,
+			});
+		},
 		subscribeSupervisorEvents: (name, listener, options) => rpcEventSource.onEvent?.(
 			name,
 			(event) => {
@@ -1811,6 +1850,171 @@ async function retireChild(
 }
 
 /**
+ * D8: a fresh progress baseline, taken from the session file as it is NOW.
+ *
+ * A child that has just been spawned (or relaunched from its session) may have
+ * an empty or not-yet-created session file; `lines: 0` is then the honest
+ * answer and everything written afterwards counts as progress. Never throws —
+ * an unreadable file is "nothing written yet", not a launch failure.
+ */
+export function renewalBaselineFor(
+	sessionFile: string,
+	at: number = Date.now(),
+	readLines: (file: string) => string[] | undefined = readSessionLines,
+): { at: number; lines: number } {
+	return { at, lines: readLines(sessionFile)?.length ?? 0 };
+}
+
+/**
+ * D5-a: was this child **cut off by its turn budget** rather than finishing?
+ *
+ * `continue`/`resume` works on every terminal child, but only a budget casualty
+ * should spend a renewal (D6) — otherwise an ordinary retry after a normal
+ * failure quietly eats the budget, and the budget stops meaning anything.
+ *
+ * Judgement order is frozen by D5-a and follows `src/shared/session.ts`'s
+ * measured semantics (F29), most reliable first:
+ *
+ *  1. `stopReason === "toolUse"` — the final assistant row was still waiting on
+ *     a tool when the process went away: the classic budget-exhaustion shape.
+ *  2. No assistant message for the last prompt — F29: a hard kill writes no
+ *     assistant row at all, so "missing reply" IS the abort signal.
+ *  3. `reason` mentions `terminated` — the host's own label, the weakest of the
+ *     three because wording is not a contract.
+ *
+ * A clean `stop` / `length` turn (the user simply asked for another round)
+ * matches none of them and does **not** spend a renewal.
+ *
+ * `shouldRecycleAfterCollect` is deliberately NOT used: it only separates
+ * terminal from non-terminal, which is a different question.
+ */
+export function wasBudgetCut(execution: Execution | undefined): boolean {
+	if (!execution) return false;
+	// 1. Terminated while a tool call was outstanding.
+	if (execution.stopReason === "toolUse") return true;
+	// 2. F29 hard kill: the turn has no assistant row at all.
+	if (
+		execution.reason === NO_ASSISTANT_ABORT_REASON &&
+		execution.stopReason !== "stop" &&
+		execution.stopReason !== "length"
+	) {
+		return true;
+	}
+	// 3. Host wording, last resort.
+	return execution.reason?.toLowerCase().includes("terminated") ?? false;
+}
+
+/**
+ * D3: the renewal proposal to attach to a **real termination** notice, or
+ * `undefined` when the contract says not to offer one.
+ *
+ * Extracted as a pure function (not inlined at the notify call site) because
+ * the whole decision is testable without launching a child: "was the budget
+ * cut + is the role renewable + has it a baseline" is arithmetic, not I/O.
+ *
+ * The four exits, all locked by tests:
+ * - **D1** a `completed` child is never a renewal candidate: it produced a
+ *   verdict, so offering `continue` would relaunch finished work.
+ * - **D7/A3** a `running` snapshot is a `wait`/`collect` deadline on a **live**
+ *   child (`inprocess-supervisor` merely resolved `{settled:false}`); the child
+ *   never lost a budget, so renewing it would spend a fresh one for nothing.
+ * - **D5/A4** `renewable: false` → no proposal at all, so the notice keeps the
+ *   exact pre-W3 bytes (no renewal lines).
+ * - **A2** no measurable progress is still **reported**: the caller passes the
+ *   measurement through and `notify.ts` prints "no measurable progress". The
+ *   proposal is withheld only for the three reasons above, never for "we could
+ *   not tell".
+ *
+ * **A5/D6**: `used >= max` still gets a proposal — the renderer turns it into
+ * `renewals exhausted (used/max) — split the task instead of renewing`. That is
+ * a deliberate hand-off to the human, not silence.
+ *
+ * `maxRenewals: 0` (D6) is "renewal disabled": `renewable` is the role-level
+ * switch, `0` the budget-level one, and both must agree before an offer is made.
+ */
+export function renewalProposalFor(input: {
+	agent: Pick<AgentConfig, "renewable" | "maxRenewals"> | undefined;
+	child: Pick<ChildRecord, "renewalBaseline" | "renewalsUsed">;
+	/** Session file the progress measurement reads; the resume credential (D8). */
+	sessionFile: string;
+	execution: { status: string; reason?: string };
+	name: string;
+	/** Injectable for tests; defaults to W1's measurer over the real session file. */
+	measure?: (sessionFile: string, baseline: { at: number; lines: number }) => {
+		toolResults: number;
+		assistantMessages: number;
+		filesChanged?: number;
+	};
+}): RenewalProposal | undefined {
+	const status = completionStatusOf(
+		input.execution.status,
+		// Acceptance is not part of this decision: D1 keys on the completion
+		// status alone, and `unknown` + a parsed verdict is handled by the
+		// caller's own status, not re-derived here.
+		undefined,
+	);
+	// D1: a finished child is not a renewal candidate.
+	if (status === "completed") return undefined;
+	// D7: `running` is a live child behind a `wait`/`collect` deadline.
+	if (status === "running") return undefined;
+	// D5: the role forbids renewal (e.g. scout: a timed-out search was mis-scoped).
+	if ((input.agent?.renewable ?? DEFAULT_RENEWABLE) === false) return undefined;
+	const max = input.agent?.maxRenewals ?? DEFAULT_MAX_RENEWALS;
+	// D6: `0` disables renewal outright; offering `0/0` would be a lie.
+	if (max <= 0) return undefined;
+	// D8: no baseline means nothing to measure against (#266-era records).
+	const baseline = input.child.renewalBaseline;
+	if (!baseline) return undefined;
+
+	const used = input.child.renewalsUsed ?? 0;
+	// D2 puts the worktree probe last, so the measurement is session-file only.
+	const measured = (input.measure ?? defaultRenewalMeasure)(
+		input.sessionFile,
+		baseline,
+	);
+	return {
+		progress: {
+			toolResults: measured.toolResults,
+			assistantMessages: measured.assistantMessages,
+			...(measured.filesChanged !== undefined
+				? { filesChanged: measured.filesChanged }
+				: {}),
+		},
+		used,
+		max,
+		// D4/A8: renewal IS `continue`; the parent gets a finished command.
+		command: `subagent({ action: "continue", name: "${input.name}", message: "<what to continue>" })`,
+	};
+}
+
+/** Session-file half of {@link renewalProposalFor}; no worktree probe (D2 puts it last). */
+function defaultRenewalMeasure(
+	sessionFile: string,
+	baseline: { at: number; lines: number },
+): { toolResults: number; assistantMessages: number; filesChanged?: number } {
+	return measureProgress({ sessionFile, baseline });
+}
+
+/**
+ * D6/D8: charge one renewal to a child, D5-a's way.
+ *
+ * Split out from `reviveChild` so the arithmetic is testable in isolation: the
+ * caller has already decided (via {@link wasBudgetCut}) whether this continue
+ * was a budget casualty, and only then does the counter move.
+ *
+ * Absent `renewalsUsed` means "never renewed" (#266-era record), so it reads as
+ * 0 rather than throwing. The baseline is the caller's business: it must come
+ * from the **relaunched** session file, which only that layer holds.
+ */
+export function chargeRenewal(
+	child: Pick<ChildRecord, "renewalsUsed">,
+): number {
+	const used = (child.renewalsUsed ?? 0) + 1;
+	child.renewalsUsed = used;
+	return used;
+}
+
+/**
  * Continue or resume a child.
  *
  * A live agent is prompted in place; an exited one is relaunched from its
@@ -1855,6 +2059,32 @@ async function reviveChild(
 			name,
 			...(found.child.model ? { model: found.child.model } : {}),
 		});
+		// D6/D8/D5-a: spend one renewal, but only if this child was actually cut
+		// off by its turn budget.
+		//
+		// `continue` is legal on every terminal child (D4), yet an ordinary retry
+		// after a normal `stop` must not eat the budget — otherwise two harmless
+		// retries would silently exhaust the allowance that exists for genuine
+		// budget casualties. `wasBudgetCut` answers that from the session shape
+		// (F29/D5-a), not from `shouldRecycleAfterCollect` (terminal vs not, a
+		// different question).
+		//
+		// The baseline is reset in both branches. A non-budget continue still
+		// moved the child's own "since" line forward: keeping the old baseline
+		// would count this whole extra turn as progress at the next termination
+		// and overstate how much the child achieved under the current budget.
+		const resumedChild =
+			orchestrator.childrenSnapshot().find((entry) => entry.name === handle.name) ??
+			found.child;
+		// Read the verdict from `found.child`, NOT the orchestrator's record: `launch`
+		// clears `previous.execution` before returning (it is a relaunch), and
+		// `found` is a freshly parsed copy from `store.listRuns()`, so the pre-resume
+		// outcome is still intact there. Reading the orchestrator's object here
+		// would see `undefined` on every single resume and never charge anything.
+		const budgetCut = wasBudgetCut(found.child.execution);
+		resumedChild.renewalBaseline = renewalBaselineFor(handle.sessionFile);
+		if (budgetCut) chargeRenewal(resumedChild);
+		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, handle.name);
 		followChild(ctx, { watch: true });
 		return ok(
 			`Resumed ${handle.name} from its session. Context preserved from ${handle.sessionFile}`,
@@ -3180,6 +3410,39 @@ function followLaunched(
  * persistence is done explicitly here rather than from inside the callback
  * (which would leave floating promises).
  */
+/**
+ * D8: give a child its spawn-time progress baseline exactly once.
+ *
+ * Called before every persist, so whichever launch path created the record
+ * seeds it at (as near as makes no difference) spawn time: `persistChild` runs
+ * immediately after `launch()` on every path — fresh launch, `tasks[]` fan-out,
+ * utility dispatch — and the session file is empty-ish at that moment by
+ * definition (`lines: 0` is then the honest answer, see {@link renewalBaselineFor}).
+ *
+ * The guard is "absent", never "stale":
+ * - a record written before this field existed seeds on its next write, which
+ *   is the first moment anything is known about it;
+ * - a renewed child keeps the baseline `reviveChild` handed it, so D8's
+ *   "count only what happened since the renewal" cannot be undone here.
+ */
+export function seedRenewalState(
+	child: Pick<ChildRecord, "sessionFile" | "renewalBaseline" | "renewalsUsed">,
+	now: number = Date.now(),
+	readLines: (file: string) => string[] | undefined = readSessionLines,
+): void {
+	if (!child.renewalBaseline) {
+		child.renewalBaseline = renewalBaselineFor(child.sessionFile, now, readLines);
+	}
+	if (child.renewalsUsed === undefined) child.renewalsUsed = 0;
+}
+
+/**
+ * Persist the orchestrator's current view of one child.
+ *
+ * RunStore is async while Orchestrator's `onChildUpdate` is synchronous, so
+ * persistence is done explicitly here rather than from inside the callback
+ * (which would leave floating promises).
+ */
 async function persistChild(
 	store: RunStore,
 	runId: string,
@@ -3189,6 +3452,10 @@ async function persistChild(
 ): Promise<void> {
 	const child = orchestrator.childrenSnapshot().find((c) => c.name === name);
 	if (!child) return;
+	// D8: every persist path is a launch path on its first call, so this is where
+	// a fresh child gets its baseline (see `seedRenewalState` for why it is safe
+	// to run unconditionally on later persists too).
+	seedRenewalState(child);
 	try {
 		const recorded = store.findChild(runId, name);
 		if (!recorded) {

@@ -68,6 +68,39 @@ worktree: false        # explicit inprocess + worktree: true is still refused
 Never fall back across columns: in-process limits are read from
 `subagents.inprocess.*` only, never from the `legion.*` keys.
 
+### Renewing a budget casualty (#270)
+
+An agent's `timeoutMs` is enforced by the host, so pi-legion cannot prevent the
+cut — but it can make the loss recoverable. When a child is terminated **and**
+it measurably progressed, the completion notice ends with a ready-made command:
+
+```
+✗ W2 (worker) failed (terminated during tool call)
+progressed: 47 tool results, 12 assistant messages, 6 files changed
+renew: subagent({ action: "continue", name: "W2", message: "<what to continue>" })
+renewals: 1/2
+```
+
+Renewal is `continue` — there is no separate action — so the child resumes from
+its own session file with its context intact. It is **never automatic**: an
+auto-renewed stuck child would hold a concurrency slot indefinitely.
+
+Two role frontmatter keys control it:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `renewable` | `true` | `false` for roles where a timeout means the task was mis-scoped (a timed-out `scout` is a search that was too broad, not work to finish) |
+| `maxRenewals` | `2` | `0` disables renewal. Each renewal is a **fresh full budget**, never an increment |
+
+"Progressed" means ≥ 3 new `toolResult` rows or ≥ 1 changed file since the last
+baseline — `assistant` messages are shown but never count: a model looping on the
+same sentence grows that counter without doing any work. With no progress the
+notice says so instead of offering the command, and once the budget is spent it
+tells you to split the task.
+
+`wait`/`collect` timeouts never produce a proposal: those return while the child
+is still alive, which is the opposite situation.
+
 ### Launch admission queue (#266)
 
 A launch that hits a **queueable** gate waits in an in-memory queue instead of

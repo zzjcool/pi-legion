@@ -7,9 +7,14 @@ import {
 	formatCollectFailure,
 	formatCompletionNotice,
 	formatGroupedNotice,
+	formatRenewalBlock,
+	type CompletionInput,
+	type CompletionNotice,
 	type GroupedEntry,
 	formatNoticeHeadline,
 	previewOutput,
+	type RenewalProgress,
+	type RenewalProposal,
 	sanitizeNoticeField,
 	SUBAGENT_NOTIFY_TYPE,
 } from "../../src/extension/notify.ts";
@@ -452,6 +457,229 @@ test("formatGroupedNotice: a single entry still uses the grouped shape", () => {
 	assert.equal(notice.status, "completed");
 	assert.match(notice.content, /Background tasks completed \(1\):/);
 	assert.match(notice.content, /- worker-0 \(worker\): completed/);
+});
+
+// ──────────────── W3: renewal proposal rendering (D3 / D7 / A1-A5 / A8) ────────────────
+
+test("A3/D7: a notice without a renewal proposal carries zero renewal lines", () => {
+	// D7: `wait {timeoutMs}` / `collect {timeoutMs}` timeouts mean the PARENT gave
+	// up while the child is still alive. Those call sites pass no `renewal` field,
+	// and the absence alone must keep every renewal line out of the notice —
+	// renewing a live child would burn a turn budget it never lost.
+	const notice = formatCompletionNotice({
+		name: "worker-1",
+		agent: "worker",
+		execution: {
+			status: "failed",
+			reason: "collect deadline (cumulative since launch) exceeded; child still alive",
+		},
+		output: "still working",
+		sessionFile: "/runs/r-1/worker-1.jsonl",
+	});
+	assert.doesNotMatch(notice.content, /renew/i);
+	assert.doesNotMatch(notice.content, /progressed:/);
+	assert.doesNotMatch(notice.content, /action: "continue"/);
+	assert.doesNotMatch(notice.content, /exhausted/);
+});
+
+function renewal(over: Partial<RenewalProposal> = {}): RenewalProposal {
+	return {
+		progress: { toolResults: 47, assistantMessages: 12, filesChanged: 6 },
+		used: 1,
+		max: 2,
+		command:
+			'subagent({ action: "continue", name: "W2", message: "<what to continue>" })',
+		...over,
+	};
+}
+
+function terminatedNotice(over: Partial<CompletionInput> = {}): CompletionNotice {
+	return formatCompletionNotice({
+		name: "W2",
+		agent: "worker",
+		execution: { status: "failed", reason: "terminated during tool call" },
+		output: "partial work",
+		sessionFile: "/runs/r-1/worker-3.jsonl",
+		...over,
+	});
+}
+
+test("A1: termination + progress + budget left renders the proposal and the `continue` command", () => {
+	const notice = terminatedNotice({ renewal: renewal() });
+	assert.equal(notice.status, "failed");
+	assert.match(
+		notice.content,
+		/^progressed: 47 tool results, 12 assistant messages, 6 files changed$/m,
+	);
+	// D4/A8: the command is the ready-made `continue`, nothing else.
+	assert.match(notice.content, /^renew: subagent\(\{ action: "continue"/m);
+	assert.match(notice.content, /^renewals: 1\/2$/m);
+	// D3: the judgement basis AND the command, in one notice.
+	assert.match(notice.content, /execution: failed \(terminated during tool call\)/);
+});
+
+test("A1: the renewal block trails the failure body and changes no existing line", () => {
+	const plain = terminatedNotice();
+	const renewed = terminatedNotice({ renewal: renewal() });
+	assert.ok(
+		renewed.content.startsWith(plain.content),
+		"the renewal block is appended, never woven into the existing body",
+	);
+	assert.ok(renewed.content.length > plain.content.length);
+});
+
+test("A2: no measurable progress never offers a renewal", () => {
+	// D2: renewing a child that moved nothing forward just extends the hang by
+	// one full turn budget — the exact reason the role timeout exists. The
+	// frozen shape carries counts, not a verdict: 0 tool results and 0 file
+	// changes is D2-a's "no progress", however many assistant messages piled up
+	// while it looped.
+	const notice = terminatedNotice({
+		renewal: renewal({
+			progress: { toolResults: 0, assistantMessages: 40, filesChanged: 0 },
+		}),
+	});
+	assert.match(
+		notice.content,
+		/no measurable progress since spawn — not offering a renewal/,
+	);
+	assert.doesNotMatch(notice.content, /^renew: /m);
+	assert.doesNotMatch(notice.content, /^renewals: /m);
+	// The counts stay visible: the parent needs them to decide whether to split.
+	assert.match(
+		notice.content,
+		/^progressed: 0 tool results, 40 assistant messages, 0 files changed$/m,
+	);
+});
+
+test("A5: an exhausted renewal budget tells the parent to split the task", () => {
+	const notice = terminatedNotice({ renewal: renewal({ used: 2, max: 2 }) });
+	assert.match(
+		notice.content,
+		/renewals exhausted \(2\/2\) — split the task instead of renewing/,
+	);
+	assert.doesNotMatch(notice.content, /^renew: /m);
+	assert.doesNotMatch(notice.content, /^renewals: /m);
+});
+
+test("A5: maxRenewals 0 reports exhaustion rather than offering a first renewal", () => {
+	// W2 keeps `0` meaningful (renewal disabled), so `used >= max` is 0 >= 0.
+	const notice = terminatedNotice({ renewal: renewal({ used: 0, max: 0 }) });
+	assert.match(notice.content, /renewals exhausted \(0\/0\)/);
+	assert.doesNotMatch(notice.content, /^renew: /m);
+});
+
+test("A2/D2-a: the D2-a verdict comes from W1's thresholds, not a caller claim", () => {
+	// A caller holding only counts must not be able to disagree with W1: 3 tool
+	// results is the bar (2 is not), and assistant messages alone never clear it.
+	const build = (progress: RenewalProgress) =>
+		formatRenewalBlock({
+			progress,
+			used: 0,
+			max: 2,
+			command: 'subagent({ action: "continue", name: "W2", message: "go" })',
+		}).join("\n");
+
+	const assistantOnly = build({
+		toolResults: 2,
+		assistantMessages: 99,
+		filesChanged: 0,
+	});
+	assert.match(assistantOnly, /no measurable progress/);
+	assert.doesNotMatch(assistantOnly, /^renew: /m);
+
+	assert.match(build({ toolResults: 3, assistantMessages: 0 }), /^renew: /m);
+	assert.match(
+		build({ toolResults: 0, assistantMessages: 0, filesChanged: 1 }),
+		/^renew: /m,
+	);
+	// An unmeasurable file count drops out instead of faking progress.
+	assert.match(
+		build({ toolResults: 2, assistantMessages: 5, filesChanged: undefined }),
+		/no measurable progress/,
+	);
+});
+
+test("A1: an unmeasurable filesChanged drops out instead of printing `undefined`", () => {
+	const notice = terminatedNotice({
+		renewal: renewal({
+			progress: { toolResults: 9, assistantMessages: 3 },
+		}),
+	});
+	assert.match(notice.content, /^progressed: 9 tool results, 3 assistant messages$/m);
+	assert.doesNotMatch(notice.content, /undefined/);
+});
+
+test("A8/D4: no `renew` or `extend` action is invented — renewal is `continue`", () => {
+	const notice = terminatedNotice({ renewal: renewal() });
+	assert.doesNotMatch(notice.content, /action: "renew"/);
+	assert.doesNotMatch(notice.content, /action: "extend"/);
+	assert.match(notice.content, /action: "continue"/);
+});
+
+test("D1: a completed child is never offered a renewal", () => {
+	// A verdict means the turn produced output — it is not a budget casualty.
+	const notice = formatCompletionNotice({
+		name: "W2",
+		agent: "worker",
+		execution: { status: "success" },
+		output: "done",
+		renewal: renewal(),
+	});
+	assert.equal(notice.status, "completed");
+	assert.doesNotMatch(notice.content, /renew/i);
+});
+
+test("D3: an aborted (terminated) child still gets the proposal", () => {
+	const notice = formatCompletionNotice({
+		name: "W2",
+		agent: "worker",
+		execution: { status: "aborted", reason: "terminated" },
+		output: "partial",
+		renewal: renewal(),
+	});
+	assert.equal(notice.status, "stopped");
+	assert.match(notice.content, /^renew: /m);
+});
+
+test("regression: a notice without a renewal proposal is byte-identical to the pre-W3 output", () => {
+	// Captured from notify.ts before the renewal block existed; the contract's
+	// §6 "only add, never change" rule lives or dies on this assertion.
+	const failure = formatCompletionNotice({
+		name: "worker-0",
+		agent: "worker",
+		execution: { status: "failed", reason: "terminated during tool call" },
+		output: "boom",
+		sessionFile: "/runs/r-1/worker-0.jsonl",
+	});
+	assert.equal(
+		failure.content,
+		"Background task failed: **worker-0 (worker)**\n\nexecution: failed (terminated during tool call)\n\nboom\n\nSession file: /runs/r-1/worker-0.jsonl\nChild retired. Resume from the session file if you need this child again.",
+	);
+
+	const success = formatCompletionNotice({
+		name: "reviewer-1",
+		execution: { status: "success" },
+		output: "all good",
+		outputFile: "/runs/r-1/reviewer-1.output.md",
+		acceptance: { status: "accepted", level: "attested" },
+	});
+	assert.equal(
+		success.content,
+		"Background task completed: **reviewer-1**\n\nexecution: success\nacceptance: accepted (attested)\n\nall good\nFull output: /runs/r-1/reviewer-1.output.md\nChild retired. Resume from the session file if you need this child again.",
+	);
+
+	const stopped = formatCompletionNotice({
+		name: "w1",
+		agent: "worker",
+		execution: { status: "aborted", reason: "killed" },
+		output: "",
+		recycled: false,
+	});
+	assert.equal(
+		stopped.content,
+		"Background task stopped: **w1 (worker)**\n\nexecution: aborted (killed)\n\n(no output)",
+	);
 });
 
 test("formatGroupedNotice: per-entry previews are capped so the batch stays bounded", () => {

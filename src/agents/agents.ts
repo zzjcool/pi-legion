@@ -558,6 +558,13 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "completionGuard", bool(fm.completionGuard));
 	setIf(config, "maxSubagentDepth", int(fm.maxSubagentDepth));
 	setIf(config, "allowNestedSubagents", bool(fm.allowNestedSubagents));
+	// D5/D6: parsed verbatim and left absent when undeclared — the defaults live
+	// with the consumers (DEFAULT_RENEWABLE / DEFAULT_MAX_RENEWALS), so this
+	// layer never has to guess whether the role was explicit. `int()` returns 0
+	// for `maxRenewals: 0`, and `setIf` only skips `undefined`, so the
+	// "renewal disabled" spelling survives instead of decaying to the default.
+	setIf(config, "renewable", bool(fm.renewable));
+	setIf(config, "maxRenewals", int(fm.maxRenewals));
 	setIf(config, "utility", bool(fm.utility));
 	setIf(config, "disabled", bool(fm.disabled));
 	setIf(config, "worktree", bool(fm.worktree));

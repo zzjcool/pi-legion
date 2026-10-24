@@ -35,6 +35,7 @@ export const OVERRIDE_FIELDS = [
 	"async",
 	"completionGuard",
 	"allowNestedSubagents",
+	"renewable",
 	"utility",
 	"disabled",
 	"worktree",
@@ -44,6 +45,7 @@ export const OVERRIDE_FIELDS = [
 	"timeoutMs",
 	"toolTimeoutMs",
 	"maxSubagentDepth",
+	"maxRenewals",
 	// arrays (a `false` value is meaningful for skills/extensions)
 	"tools",
 	"skills",
