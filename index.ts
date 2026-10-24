@@ -21,6 +21,7 @@ import type {
 import { Type, type Static } from "typebox";
 import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
+import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
 import type { LegionSupervisor } from "./src/supervisor/types.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
@@ -602,8 +603,19 @@ function resolveLegionIdentity(input: {
 		// recovery to the next tick so a failure inside it cannot crash the load
 		// path, and so any notice it emits has a live runtime to go to.
 		if (node.role === "centurion") {
+			// #275: run the recovery at depth 0 explicitly. `queueMicrotask`
+			// INHERITS the AsyncLocalStorage depth (verified: `als.getStore()`
+			// inside a queued microtask still reads the parent's value), so a
+			// recovery queued from a nested context would start already deep and
+			// report `nesting limit reached (depth N, max 4)` for a two-level
+			// chain. `runAtAbsoluteDepth(0, …)` is the mechanism this codebase
+			// already uses for exactly that reason (see inprocess-depth.ts
+			// "REV2-1"): the recovery runs at the TOP of the tree, not under
+			// whatever context happened to enqueue it.
 			queueMicrotask(() => {
-				void resumeLegionTeam({ identity, input }).catch((error: unknown) => {
+				void runAtAbsoluteDepth(0, async () => {
+					await resumeLegionTeam({ identity, input });
+				}).catch((error: unknown) => {
 					const reason = error instanceof Error ? error.message : String(error);
 					console.error(`[pi-legion] team recovery for ${identity.nodeId} failed: ${reason}`);
 				});
