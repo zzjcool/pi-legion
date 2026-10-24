@@ -35,6 +35,7 @@ import {
 import { progressFromSessionFile } from "../shared/progress.ts";
 import { readProcRss } from "../supervisor/proc-memory.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
+import { isTerminalState, liveness } from "./liveness.ts";
 import {
 	DEFAULTS,
 	type AgentKind,
@@ -170,6 +171,16 @@ export interface SessionRuntimeDeps {
 }
 
 const DEFAULT_REFRESH_MS = 500;
+/**
+ * How long a ledger heartbeat stays trustworthy (D3/D7).
+ *
+ * Mirrors `DEFAULT_ORPHAN_STALE_MS` in `legion-tools.ts` and the `orphanStaleMs`
+ * setting default (`src/shared/types.ts`). Duplicated as a literal on purpose:
+ * the TUI refresh path must not read settings on every repaint, and this value is
+ * the horizon for "a row that stopped heartbeating", which is exactly the orphan
+ * definition. Keep the three in sync.
+ */
+const DEFAULT_ORPHAN_STALE_MS = 90_000;
 /**
  * Hard cap on how long a completion notice may stay hidden behind a live
  * parent agent run (D-B). 80s = 2× the (1+3)×10s that the old join window
@@ -690,6 +701,35 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	});
 	join.setConfig(joinConfig);
 
+	/**
+	 * D3/D8: the orphan horizon, matching `legion-tools.ts`'s DEFAULT_ORPHAN_STALE_MS.
+	 *
+	 * `runtime.ts` has no settings dependency (the TUI layer must not read
+	 * settings per repaint), so this mirrors the documented default. A ledger row
+	 * whose heartbeat is older than this cannot describe a live child.
+	 */
+	const orphanStaleMs = (): number => DEFAULT_ORPHAN_STALE_MS;
+
+	/**
+	 * D3/D8: the in-process facts for a node, keyed by tree id.
+	 *
+	 * A tracked job is both the strongest liveness evidence (rules 1/2: this very
+	 * process holds the handle) and the scheduler record. Resolved once per node
+	 * rather than by scanning `jobs` twice.
+	 */
+	const inProcessFactsFor = (
+		nodeId: string,
+	): { inMemory?: { state: string }; record?: { state: string } } => {
+		for (const job of jobs.values()) {
+			if (job.state === undefined) continue;
+			const matches =
+				job.nodeId === nodeId ||
+				(job.nodeId === undefined && deps.getTreeIdentity?.(job.name)?.nodeId === nodeId);
+			if (matches) return { inMemory: { state: job.state }, record: { state: job.state } };
+		}
+		return {};
+	};
+
 	const snapshotNodes = (): TreeNodeSnapshot[] => {
 		const ledger = ledgerDb;
 		const provided = deps.getTreeNodes
@@ -698,18 +738,72 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		if (provided !== undefined) {
 			tree.clear();
 			for (const node of provided) {
+				// D3: no timestamp race. `override.ts` comes from THIS process's event
+				// bus while `node.updatedAt` comes from the CHILD's heartbeat, and a
+				// dead child stops heartbeating (`legion-tools.ts` only heartbeats
+				// `isAlive` children), so its `updatedAt` freezes. Comparing the two
+				// therefore ranked two different clocks, and when the override looked
+				// older the code DELETED it and trusted the frozen row — which pulled
+				// finished nodes back to `running`. That was the whole reported bug.
+				//
+				// D8: render is a projection of facts, not a replay of events. The
+				// lifecycle verdict now comes from `liveness()`; the override only
+				// contributes fields that are NOT a lifecycle claim (`phase`), plus an
+				// optimistic status that must still agree with `liveness()`.
 				const override = eventOverrides.get(node.id);
-				if (override && override.ts >= node.updatedAt) {
-					tree.set(node.id, {
-						...node,
-						...(override.status === undefined ? {} : { status: override.status }),
-						...(override.phase === undefined ? {} : { phase: override.phase }),
-						updatedAt: override.ts,
-					});
-				} else {
-					if (override) eventOverrides.delete(node.id);
-					tree.set(node.id, { ...node });
-				}
+				const verdict = liveness({
+					ledger: { status: node.status, updatedAt: node.updatedAt },
+					...inProcessFactsFor(node.id),
+					now: now(),
+					staleMs: orphanStaleMs(),
+				});
+				// What the verdict decides, and what it does NOT decide:
+				//
+				//  - `dead` wins over a non-terminal row. A row that stopped
+				//    heartbeating cannot describe a live child, so it is rendered as
+				//    failed rather than left looking alive.
+				//  - `unknown` never promotes a row to `running` and never claims death.
+				//  - `live` says the child IS alive; it does not say WHICH alive state.
+				//    The ledger row only advances on heartbeat (coarse), while an event
+				//    says exactly what happened (`node_launched` → running). So a live
+				//    verdict keeps the MORE SPECIFIC of the two: an override status from
+				//    this process's own bus wins over the row, because it is the same
+				//    lifecycle seen at a finer grain. Only a terminal row outranks it —
+				//    a settled/failed row is a fact that no later "running" may erase.
+				//
+				// Two override cases outrank the row, and they cover both directions
+				// the coarse heartbeat cannot express:
+				//  - the override is TERMINAL (`node_settled`) while the row has not
+				//    caught up: the event ends the child now, not on the next heartbeat;
+				//  - both are non-terminal and the event is more specific
+				//    (`node_launched` → running vs a stale `starting` row).
+				// A terminal ROW always wins over a non-terminal override: once the
+				// ledger says settled/failed, no later "running" may erase that.
+				const overrideStatus = override?.status;
+				const rowTerminal = isTerminalState(node.status);
+				const overrideTerminal = overrideStatus !== undefined && isTerminalState(overrideStatus);
+				const status =
+					verdict === "dead" && !rowTerminal
+						? "failed"
+						: overrideStatus !== undefined && !rowTerminal && (overrideTerminal || verdict === "live")
+							? overrideStatus
+							: node.status;
+				tree.set(node.id, {
+					...node,
+					status,
+					...(override?.phase === undefined ? {} : { phase: override.phase }),
+				});
+			}
+			// Only overrides whose optimistic STATUS has now been superseded are
+			// dropped: the tree row above is the authoritative projection, so keeping
+			// a lifecycle claim around would resurrect it on the next event. `phase`
+			// is not a lifecycle claim and must survive — it carries no
+			// live/dead meaning and has no other source between events.
+			for (const [nodeId, override] of eventOverrides) {
+				if (!tree.has(nodeId)) continue;
+				if (override.status === undefined) continue;
+				const current = tree.get(nodeId);
+				if (current !== undefined && current.status !== override.status) eventOverrides.delete(nodeId);
 			}
 			for (const nodeId of activity.keys()) if (!tree.has(nodeId)) activity.delete(nodeId);
 			for (const nodeId of eventOverrides.keys()) if (!tree.has(nodeId)) eventOverrides.delete(nodeId);
@@ -834,16 +928,29 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		const data = event.data && typeof event.data === "object" && !Array.isArray(event.data)
 			? event.data as Record<string, unknown>
 			: undefined;
-		if (node && event.ts >= node.updatedAt) {
+		if (node) {
+			// D3: no cross-writer timestamp race.
+			//
+			// `event.ts` is stamped by THIS process's bus; `node.updatedAt` is stamped
+			// by the CHILD's heartbeat. A dead child stops heartbeating, so its
+			// `updatedAt` freezes and a later real event would fail `event.ts >=
+			// updatedAt` — silently dropped, leaving the panel stuck. Only the
+			// SAME-writer ordering is still meaningful: an event must not undo a
+			// NEWER event from the same bus (that is `previous.ts`, below).
+			//
+			// D8: this is an optimistic update only. `snapshotNodes()` recomputes every
+			// row from facts via `liveness()`, so a stale optimistic status cannot
+			// survive a refresh — which is what makes dropping the clock guard safe.
 			const previous = eventOverrides.get(event.nodeId);
 			if (!previous || event.ts >= previous.ts) {
 				const override = { ...previous, ts: event.ts };
-				const updated = { ...node, updatedAt: event.ts };
+				const updated = { ...node };
 				if (event.type === "node_launched" || event.type === "node_resumed") updated.status = override.status = "running";
 				else if (event.type === "node_settled") updated.status = override.status = "settled";
 				else if (event.type === "node_failed") updated.status = override.status = "failed";
 				else if (event.type === "node_retired" && node.status !== "settled" && node.status !== "failed") updated.status = override.status = "retired";
 				else if (event.type === "node_blocked") updated.status = override.status = "blocked";
+				else if (event.type === "node_abandoned") updated.status = override.status = "failed";
 				else if (event.type === "phase_change" && typeof data?.to === "string") updated.phase = override.phase = data.to;
 				eventOverrides.set(event.nodeId, override);
 				tree.set(event.nodeId, updated);

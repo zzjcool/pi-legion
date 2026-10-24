@@ -177,9 +177,20 @@ export function resolveRolePalette(theme: VizTheme, roles: Iterable<string>): Ma
 	return out;
 }
 
+/**
+ * Colour token for a node's status glyph.
+ *
+ * D5: `idle` is *alive but not working* — it holds a concurrency slot, so it
+ * must stay on screen — and an undecided (`unknown`) node is not active
+ * either. Both render `dim`, which is exactly "present, not doing anything".
+ * `queued` keeps its role colour: it has been admitted and is about to run, so
+ * greying it out would read as "nothing to see here" for work that is pending.
+ */
 export function statusToken(role: string, status: VizStatus): string {
 	if (status === "failed") return "error";
 	if (status === "retired") return "dim";
+	if (status === "idle") return "dim";
+	if (status === "unknown") return "dim";
 	return roleColor(role);
 }
 

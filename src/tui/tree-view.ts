@@ -10,15 +10,40 @@ import {
 	type TUI,
 } from "@earendil-works/pi-tui";
 import type { LegionEvent } from "../extension/event-bus.ts";
-import type { LegionNode, NodeStatus } from "../legion/nodes.ts";
+import type { LegionNode } from "../legion/nodes.ts";
+import { NODE_STATUSES } from "../legion/nodes.ts";
+import { isTerminalState } from "../extension/liveness.ts";
 import type { SpawnMode } from "../shared/types.ts";
 import { osc8NodeLink } from "./status.ts";
 
 const TREE_HEADER = "Legion tree · j/k move · enter toggle · / search · pgup/pgdn scroll · esc/q close";
 const DEFAULT_TERMINAL_ROWS = 24;
 const MAX_ACTIVITY_TOOLS = 2;
-const ACTIVE_STATUSES = new Set<NodeStatus>(["starting", "running", "blocked"]);
-const TERMINAL_STATUSES = new Set<NodeStatus>(["settled", "failed", "retired"]);
+/**
+ * Active/terminal partition, derived from the liveness authority instead of
+ * hand-written here (contract `docs/contracts/display-liveness-v1.md` D1-a,
+ * D6 exit 4).
+ *
+ * The gain is anti-drift rather than a bug fix: `node.status` is `NodeStatus`,
+ * the six-value ledger set, and for those six the old local pair happened to
+ * agree with `isTerminalState`. But it was a fourth independent copy of the
+ * vocabulary, so the next ledger status would be terminal in the panel and
+ * non-terminal here — exactly the divergence D6 forbids.
+ *
+ * `idle`/`queued` are display states that cannot appear here (D9 keeps them out
+ * of `NODE_STATUSES`). They are unioned into the active side anyway so the two
+ * sets stay a partition of anything a snapshot row might carry: calling a
+ * pending row terminal would fold its subtree and freeze its clock for work
+ * that has not started.
+ */
+const ACTIVE_STATUSES: ReadonlySet<string> = new Set<string>([
+	...NODE_STATUSES.filter((status) => !isTerminalState(status)),
+	"idle",
+	"queued",
+]);
+const TERMINAL_STATUSES: ReadonlySet<string> = new Set<string>(
+	NODE_STATUSES.filter((status) => isTerminalState(status)),
+);
 
 export interface TreeNodeSnapshot extends LegionNode {
 	/** Snapshot from legion.db usage table (≤30s granularity). */
