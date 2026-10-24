@@ -508,14 +508,24 @@ const previous = priorRecord && priorRecord.state !== "queued"
 之后才跑）。若只靠计数快照，12 路探测全部看到 0 → 全部放行 → 回到今天的 4 个报错。
 `admitting`（in-flight 保留位）是同 tick 只允许 8 个进入的唯一机制。
 **精确性不承担正确性**：探测只是**咨询性**的；真正权威仍是 `assertWithinLimits`/`withLaunchBudget`。
-探测通过后仍被真闸门拒 → **不计报错**，把项按原 `seq` 重新入队，等下一次触发（D2-c）。
+探测通过后仍被真闸门拒 → **不计报错**，把项重新入队并**保留原 `enqueuedAt`**（排到队尾，但等待计时与超时不重置），等下一次触发（D2-c）。
 **验收**：A1、A2、A18。
 
 #### D2-c — 探测后仍被拒的处理
 **判定**：`launchInternal(…, {admissionAlreadyGranted:true})` 抛出的错误若 `code === BUDGET_EXCEEDED`
 且**能归因到可排队闸门**（由同一 `probeAdmission` 复判，此时其它 launch 已落子，归因可靠）→
-`pumpAdmissions` 捕获、按原 `seq` 重新入队、`this.pumping = false`、**不**立即再 pump（等下一个触发）。
+`pumpAdmissions` 捕获、重新入队、`this.pumping = false`、**不**立即再 pump（等下一个触发）。
 其余错误（含硬拒闸门、NAME_TAKEN、START_FAILED）照原样冒泡。
+
+**重入队保什么、不保什么（2026-10-23 父会话裁决，修订本条的"原 `seq`"措辞）**
+- **保 `enqueuedAt`**（等待计时与 D6 超时截止线）。这是 R7 的实质内容：若重入队盖上新的时间戳，
+  `waitedMs` 会归零（`async:false` 的 `↳ <名称> waited Ns` 会**低报**真实等待），且该项会**重新获得**
+  一个完整 `timeoutMs`，于是「一直输掉准入竞态」的项实际等待可达配置上限的近两倍。
+  实现：`AdmissionQueue.enqueue(payload, meta)` 的 `meta.enqueuedAt` 可选覆盖。
+- **不保 `seq`**：重入队排到队尾。D5 的 FIFO 不赋予任何人优先权，一个刚在准入竞态里输掉的项
+  本就应该让位给等得更久的人；「不被饿死」由 `launchQueueTimeoutMs` 保证，不需要靠保位实现。
+  （原措辞「按原 `seq` 重新入队」要求队列提供 `enqueueWithSeq`，为仅有的优先权收益引入一套
+  有序插入 + `seq` 跨准入/失败存活的机制，代价与收益不成比例，故不采纳。）
 **失败模式**：重入队后立刻再 pump → 忙等自旋（探测与真闸门短暂不自洽时 CPU 打满）。
 **验收**：A7（rpc 路径覆盖这条）。
 

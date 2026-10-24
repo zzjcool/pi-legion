@@ -538,3 +538,66 @@ test("admission queue: generic payload survives enqueue/next", () => {
 	if (next.kind === "admit") next.item.payload.run();
 	assert.equal(ran, 1);
 });
+
+// ── D2-c: `enqueue` can carry an existing `enqueuedAt` ────────────────────
+//
+// The orchestrator's requeue path (a launch that passed the advisory probe but
+// then lost the authoritative gate) must NOT restart the wait. `enqueue`
+// therefore accepts an optional `enqueuedAt`; without it every requeue would
+// stamp "now", which both zeroes `waitedMs` and grants a second full
+// `timeoutMs`. Asserted here at the pure-module level because the queue's
+// deadline arithmetic is this module's whole contract.
+
+test("D2-c: enqueue honors a carried enqueuedAt, so a requeue keeps its deadline", () => {
+	let clock = 1_000;
+	const queue = createAdmissionQueue({ timeoutMs: 100, maxPending: 8, now: () => clock });
+
+	const first = queue.enqueue({ id: 1 }, { name: "x", parentKey: "" });
+	assert.equal(first.ok, true);
+	assert.equal(queue.waitedMs("x"), 0, "a first enqueue starts counting now");
+
+	// Simulate the admission attempt consuming 90 of the 100 ms budget, then the
+	// requeue putting the item back with its ORIGINAL stamp.
+	clock += 90;
+	queue.remove("x");
+	const again = queue.enqueue({ id: 1 }, { name: "x", parentKey: "", enqueuedAt: 1_000 });
+	assert.equal(again.ok, true);
+	assert.equal(queue.waitedMs("x"), 90, "the wait continues instead of restarting");
+
+	// 20 ms later the ORIGINAL deadline (100 ms) has passed, so the item expires.
+	// With a reset stamp it would still have 80 ms of runway left.
+	clock += 20;
+	assert.equal(
+		queue.next(() => ({ admitted: false, queueable: false, gate: "other", message: "" })).kind,
+		"expired",
+		"the original deadline still fires on time",
+	);
+});
+
+test("D2-c: a fresh enqueue without enqueuedAt still starts the clock at now", () => {
+	let clock = 5_000;
+	const queue = createAdmissionQueue({ timeoutMs: 100, maxPending: 8, now: () => clock });
+	queue.enqueue({}, { name: "fresh", parentKey: "" });
+	clock += 40;
+	assert.equal(queue.waitedMs("fresh"), 40, "omitting enqueuedAt means 'now', the normal path");
+});
+
+test("D2-c: a carried enqueuedAt does not change seq ordering", () => {
+	let clock = 1_000;
+	const queue = createAdmissionQueue({ timeoutMs: 100_000, maxPending: 8, now: () => clock });
+	queue.enqueue({}, { name: "a", parentKey: "" });
+	clock += 50; // `b` joins 50 ms later, so the two waits are distinguishable
+	queue.enqueue({}, { name: "b", parentKey: "" });
+	clock += 50;
+	queue.remove("a");
+	// `a` goes back with an OLD stamp but a FRESH seq: D5 gives no one priority, so
+	// it must land behind `b` — while still carrying the longer wait.
+	queue.enqueue({}, { name: "a", parentKey: "", enqueuedAt: 1_000 });
+
+	const entries = queue.entries();
+	assert.deepEqual(entries.map((entry) => entry.name), ["b", "a"], "the requeued item keeps its place at the back");
+	// b waited 50 ms (enqueued at 1050), a waited 100 ms (stamped 1000): position
+	// and deadline are deliberately independent.
+	assert.equal(entries[0]!.waitedMs, 50, "the front item's wait is measured from its own enqueue");
+	assert.equal(entries[1]!.waitedMs, 100, "the requeued item still reports the ORIGINAL elapsed wait");
+});

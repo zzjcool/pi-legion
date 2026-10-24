@@ -1155,3 +1155,106 @@ test("#266 review-9 (D7): flushing one instance clears only its own queue items"
 		fs.rmSync(root, { recursive: true, force: true });
 	}
 });
+
+// ── A22b (D2-c): a requeue keeps the ORIGINAL deadline ───────────────────
+//
+// Review-found gap, fixed alongside the contract wording change. `requeue` used
+// to call `queue.enqueue(...)` without a timestamp, and `enqueue` always stamps
+// `enqueuedAt: now()` — so a requeued item silently started its wait over. Two
+// user-visible consequences, both asserted here:
+//   1. `waitedMs` reset to 0, so `async:false`'s "↳ <name> waited Ns in the launch
+//      queue" line UNDER-reports how long the launch actually waited;
+//   2. the item got a second full `timeoutMs`, so a launch that keeps losing the
+//      admission race could wait nearly twice the configured bound before D6 fired.
+// `seq` is still freshly assigned (the item goes to the back — D5 gives nobody
+// priority); only the deadline is carried.
+
+test("A22b (D2-c): a requeue preserves the original deadline instead of restarting it", async () => {
+	resetAdmissionQueuesForTests();
+	const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? "/tmp", "legion-admission-deadline-"));
+	const runDir = path.join(root, "run");
+	fs.mkdirSync(runDir, { recursive: true });
+	const spawned: string[] = [];
+	let slotTakenByOther = false;
+	let replayRefusals = 0;
+	// A controllable clock: the queue's deadline arithmetic is what is under test,
+	// so it must not depend on wall-clock sleeps.
+	let clock = 1_000_000;
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 30, maxChildrenPerNode: 1 },
+		sessionFactory: async (input) => {
+			spawned.push(input.name);
+			return new SyncSession(input.sessionFile);
+		},
+	});
+	const realCounts = inprocess.admissionCounts.bind(inprocess);
+	inprocess.admissionCounts = (name: string) => {
+		const snapshot = realCounts(name);
+		return slotTakenByOther ? { ...snapshot, siblings: 1 } : snapshot;
+	};
+	const realSpawn = inprocess.spawnChild.bind(inprocess);
+	inprocess.spawnChild = async (input) => {
+		if (input.name === "worker-alu" && replayRefusals < 1) {
+			replayRefusals += 1;
+			slotTakenByOther = true;
+			throw new SubagentError(
+				"inprocess maxChildrenPerNode reached for '<root>' (1/1)",
+				ErrorCodes.BUDGET_EXCEEDED,
+			);
+		}
+		return realSpawn(input);
+	};
+	const notices: string[] = [];
+	const orchestrator = new Orchestrator({
+		supervisor: new RoutingSupervisor({ inprocess }),
+		runDir,
+		cwd: runDir,
+		maxDepth: 4,
+		now: () => clock,
+		launchQueue: { timeoutMs: 10_000, maxPending: 8 },
+		onLaunchQueueNotice: (line) => notices.push(line),
+	});
+	try {
+		await orchestrator.launch({ agent: agent(), task: "holder", name: "worker-0", worktree: false });
+		await orchestrator.launch({ agent: agent(), task: "retry", name: "worker-alu", worktree: false });
+		assert.equal(orchestrator.launchQueueEntries()[0]!.waitedMs, 0, "the queue starts counting at enqueue");
+
+		// Spend 8 s of the 10 s bound, then let the replay lose the real gate.
+		clock += 8_000;
+		assert.equal(orchestrator.launchQueueEntries()[0]!.waitedMs, 8_000, "the wait is counting");
+		await orchestrator.retire("worker-0");
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.equal(replayRefusals, 1, "the replay really hit the authoritative gate");
+
+		const requeued = orchestrator.launchQueueEntries();
+		assert.equal(requeued.length, 1, "D2-c: the item went back into the queue");
+		assert.equal(requeued[0]!.name, "worker-alu");
+		// (1) The wait does NOT restart.
+		assert.equal(
+			requeued[0]!.waitedMs,
+			8_000,
+			`the requeue must keep the original deadline; waitedMs is ${requeued[0]!.waitedMs}`,
+		);
+
+		// (2) The original bound still fires on time: 2 s more reaches 10 s.
+		slotTakenByOther = false;
+		clock += 2_000;
+		// The fallback watchdog re-evaluates the queue against the injected clock.
+		await new Promise((resolve) => setTimeout(resolve, 1_300));
+		assert.equal(
+			orchestrator.launchQueueEntries().length,
+			0,
+			"the original 10 s deadline expires the item; a reset deadline would still hold it",
+		);
+		assert.equal(
+			notices.some((line) => /launch queue timed out after 10s/.test(line)),
+			true,
+			`the timeout must be reported against the FULL wait, saw: ${JSON.stringify(notices)}`,
+		);
+		assert.equal(spawned.includes("worker-alu"), false, "an expired item never spawns");
+	} finally {
+		orchestrator.flushLaunchQueue("test cleanup");
+		resetAdmissionQueuesForTests();
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});

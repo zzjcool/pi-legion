@@ -1590,13 +1590,22 @@ export class Orchestrator {
 			this.abandonQueued(payload.name, "timeout", queueTimeoutMessage(payload.name, elapsed));
 			return;
 		}
-		// `enqueuedAt` is the clock reading the queue will store, so subtracting the
-		// elapsed wait makes the deadline continue where it left off.
+		// The wait so far, so the record's `spawnedAt` stays truthful across a requeue.
 		const carried = this.queuedPlaceholder(payload, elapsed);
 		this.children.set(payload.name, carried);
 		this.onChildUpdate(carried);
 		if (guard) this.launchGuards.set(payload.name, guard);
-		const outcome = queue.enqueue(payload, { name: payload.name, parentKey: payload.parentKey });
+		const outcome = queue.enqueue(payload, {
+			name: payload.name,
+			parentKey: payload.parentKey,
+			// D2-c: carry the ORIGINAL deadline. `seq` is deliberately fresh (the item
+			// goes to the back — D5 gives no one priority), but the wait must not
+			// restart: a fresh stamp would reset `waitedMs` to 0 (under-reporting the
+			// `async:false` "waited Ns" line) and hand the item a second full
+			// `timeoutMs`, so an item that keeps losing the admission race could wait
+			// nearly twice the configured bound before D6 fires.
+			...(guard ? { enqueuedAt: guard.enqueuedAt } : {}),
+		});
 		if (!outcome.ok) {
 			// The queue grew while this item was being admitted; overflow is still a
 			// hard refusal (D6), never an unbounded wait.

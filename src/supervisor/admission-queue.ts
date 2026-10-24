@@ -254,7 +254,25 @@ export interface AdmissionQueue<T = unknown> {
 	readonly size: number;
 	readonly maxPending: number;
 	readonly timeoutMs: number;
-	enqueue(payload: T, meta: { name: string; parentKey: string }): EnqueueOutcome<T>;
+	enqueue(
+		payload: T,
+		meta: {
+			name: string;
+			parentKey: string;
+			/**
+			 * The clock reading this item should be *accounted from* (D2-c).
+			 *
+			 * A requeue must not restart the wait: without an override the queue would
+			 * stamp a fresh `enqueuedAt`, which both under-reports `waitedMs` (the
+			 * `async:false` "waited Ns" line) and hands the item a second full
+			 * `timeoutMs`, so a launch that keeps losing the admission race could wait
+			 * nearly twice the configured bound. The caller passes the ORIGINAL
+			 * timestamp it captured on first enqueue; omitting it means "now", which is
+			 * what a first enqueue wants.
+			 */
+			enqueuedAt?: number;
+		},
+	): EnqueueOutcome<T>;
 	positionOf(name: string): number | undefined;
 	waitedMs(name: string): number | undefined;
 	/** Dequeue and return (stop / abort flush). `undefined` when absent. */
@@ -328,8 +346,11 @@ export function createAdmissionQueue<T = unknown>(options: AdmissionQueueOptions
 			const item: QueuedLaunch<T> = {
 				name: meta.name,
 				parentKey: meta.parentKey,
+				// D2-c: `seq` is always freshly assigned (a requeue lands at the back — D5
+				// gives no one priority), but the DEADLINE is carried over when the caller
+				// re-enqueues an item that already waited.
 				seq: nextSeq,
-				enqueuedAt: now(),
+				enqueuedAt: meta.enqueuedAt ?? now(),
 				payload,
 			};
 			nextSeq += 1;
