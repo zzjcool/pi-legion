@@ -36,6 +36,7 @@ import { progressFromSessionFile } from "../shared/progress.ts";
 import { readProcRss } from "../supervisor/proc-memory.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
 import { isTerminalState, liveness } from "./liveness.ts";
+import type { RenewalProposal } from "./notify.ts";
 import {
 	DEFAULTS,
 	type AgentKind,
@@ -149,6 +150,19 @@ export interface SessionRuntimeDeps {
 	getTreeNodes?: () => readonly TreeNodeSnapshot[] | undefined;
 	/** Optional name-to-tree mapping for live RPC jobs backed by M2 ChildRecord.nodeId. */
 	getTreeIdentity?: (name: string) => LegionTreeIdentity | undefined;
+	/**
+	 * Renewal proposal for a finishing child (subagent-renewal-v1 D3).
+	 *
+	 * Injected rather than imported: the only builder lives in `index.ts`, which
+	 * already imports this module — a direct import would be a cycle. Returning
+	 * `undefined` is the correct answer for every path that must NOT offer a
+	 * renewal (D5 role opt-out, D1 completed, D7 still running, no baseline), so a
+	 * host that never supplies this hook simply gets today's notice verbatim.
+	 */
+	getRenewalProposal?: (
+		name: string,
+		execution: { status: string; reason?: string },
+	) => RenewalProposal | undefined;
 	/** Open the live activity viewer for a node selected in the resident status widget. */
 	onStatusNodeClick?: (nodeId: string) => void;
 	/** Above-input strip style; the extension uses "railway", the default stays "tree". */
@@ -1466,6 +1480,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 								recycled: shouldRecycleAfterCollect(
 									snapshot.execution.status,
 								),
+								// D3: only the terminating path attaches a proposal. The
+								// hook itself returns undefined for every case that must not
+								// offer one (completed / still-running / opted out / no
+								// baseline), so "absent" is meaningful, not a missing wire.
+								...(() => {
+									const renewal = deps.getRenewalProposal?.(job.name, snapshot.execution);
+									return renewal === undefined ? {} : { renewal };
+								})(),
 							},
 							triggerTurn,
 						});

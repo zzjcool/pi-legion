@@ -58,6 +58,19 @@ export type OnBlockedPolicy = "forward" | "auto-approve" | "notify";
  */
 export const DEFAULT_ON_BLOCKED: OnBlockedPolicy = "auto-approve";
 
+/**
+ * D5 default: a role that does not say otherwise may be renewed after its turn
+ * budget is exhausted. Parse leaves the field absent — consumers apply this.
+ */
+export const DEFAULT_RENEWABLE = true;
+
+/**
+ * D6 default: two renewals cover "the task was under-estimated"; a third means
+ * the task split is wrong. `0` is a meaningful value (renewal disabled), so
+ * consumers must test against `undefined`, never falsiness.
+ */
+export const DEFAULT_MAX_RENEWALS = 2;
+
 export type AcceptanceLevel = "none" | "attested" | "verified";
 
 export interface AcceptanceCriterion {
@@ -126,6 +139,16 @@ export interface AgentConfig {
 	completionGuard?: boolean;
 	maxSubagentDepth?: number;
 	allowNestedSubagents?: boolean;
+	/**
+	 * D5: may this role be renewed after an exhausted turn budget?
+	 * Default true (DEFAULT_RENEWABLE); consumers read the field and fall back.
+	 */
+	renewable?: boolean;
+	/**
+	 * D6: how many renewals this role may receive.
+	 * Default 2 (DEFAULT_MAX_RENEWALS); 0 disables renewal.
+	 */
+	maxRenewals?: number;
 	utility?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	turnBudget?: TurnBudgetConfig;
@@ -311,6 +334,20 @@ export interface ChildRecord {
 	state: TaskState;
 	spawnedAt: string;
 	retiredAt?: string;
+
+	// renewal (subagent-renewal contract v1 §6: the budget lives on the child
+	// record in the parent run.json, never in the ledger)
+	/**
+	 * D8: progress baseline taken at spawn and reset after each renewal.
+	 *
+	 * Structurally identical to W1's `ProgressBaseline`; declared inline because
+	 * `src/shared` must not import from `src/runs` (the dependency points the
+	 * other way). Only session rows at or after `lines` count as progress, so
+	 * work done before a renewal can never be re-counted as "still moving".
+	 */
+	renewalBaseline?: { at: number; lines: number };
+	/** D6: renewals already granted to this child. */
+	renewalsUsed?: number;
 
 	// outcome (snapshot taken before child retirement — F27)
 	execution?: Execution;

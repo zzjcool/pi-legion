@@ -22,6 +22,11 @@ import {
 	resetExtraAgentDirsDeprecationWarnForTests,
 } from "../../src/agents/agents.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
+import {
+	DEFAULT_MAX_RENEWALS,
+	DEFAULT_RENEWABLE,
+} from "../../src/shared/types.ts";
+import { applyOverride } from "../../src/agents/overrides.ts";
 
 function withDir<T>(fn: (dir: string) => T): T {
 	const dir = mkdtempSync(path.join(tmpdir(), "agents-test-"));
@@ -1144,3 +1149,81 @@ test("resolveExtraAgentDirs: mixed colon and semicolon (#176)", () => {
 	});
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2 / contract docs/contracts/subagent-renewal-v1.md §3 D5 + D6:
+// `renewable` and `maxRenewals` are role-level knobs for the renewal proposal
+// W3 renders. The parse layer is deliberately dumb: it copies what the role
+// declared and leaves the field ABSENT otherwise, so the defaults
+// (DEFAULT_RENEWABLE / DEFAULT_MAX_RENEWALS) live with the consumers and
+// "undeclared" stays distinguishable from "declared as the default value".
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Parse a two-key role document so each renewal case reads as one assertion. */
+function parseRenewalDoc(fields: string[]): AgentConfig | null {
+	return parseAgentDocument(
+		["---", "name: probe", "description: d", ...fields, "---", "b"].join("\n"),
+		"/x/probe.md",
+		"user",
+	);
+}
+
+test("renewable: false is parsed (D5 / A4 first half)", () => {
+	const agent = parseRenewalDoc(["renewable: false"]);
+	assert.ok(agent);
+	assert.equal(agent.renewable, false, "an explicitly non-renewable role must stay false");
+	// The whole point of D5: this role is never offered a renewal, so the value
+	// cannot be lost between frontmatter and the notification layer.
+	assert.equal(agent.unenforcedFields?.includes("renewable") ?? false, false);
+});
+
+test("renewable: true is parsed", () => {
+	const agent = parseRenewalDoc(["renewable: true"]);
+	assert.ok(agent);
+	assert.equal(agent.renewable, true);
+});
+
+test("renewable: undeclared stays undefined (the default belongs to the consumer)", () => {
+	const agent = parseRenewalDoc([]);
+	assert.ok(agent);
+	assert.equal(
+		agent.renewable,
+		undefined,
+		"parsing must not bake in the default: W3 has to be able to tell " +
+			"'the role said nothing' from 'the role said true'",
+	);
+	assert.equal(DEFAULT_RENEWABLE, true, "D5 default is renewable");
+});
+
+test("maxRenewals: 0 is preserved, not treated as absent (D6)", () => {
+	const agent = parseRenewalDoc(["maxRenewals: 0"]);
+	assert.ok(agent);
+	// 0 means "renewal disabled" (D6), which is a different thing from the
+	// default of 2. A falsy check anywhere on this path would silently turn
+	// "never renew" into "renew twice", so the exact value is asserted.
+	assert.strictEqual(agent.maxRenewals, 0, "0 must survive as 0, never undefined/2");
+	assert.equal(agent.maxRenewals !== undefined, true, "0 is a declared value, not an absent one");
+});
+
+test("maxRenewals: 3 is parsed", () => {
+	const agent = parseRenewalDoc(["maxRenewals: 3"]);
+	assert.ok(agent);
+	assert.equal(agent.maxRenewals, 3);
+});
+
+test("maxRenewals: undeclared stays undefined; the default is 2 (D6)", () => {
+	const agent = parseRenewalDoc([]);
+	assert.ok(agent);
+	assert.equal(agent.maxRenewals, undefined);
+	assert.equal(DEFAULT_MAX_RENEWALS, 2, "D6 default is two renewals");
+});
+
+test("renewal overrides parse and apply (agentOverrides path stays live)", () => {
+	const base = parseRenewalDoc(["renewable: true", "maxRenewals: 2"]);
+	assert.ok(base);
+	// Both fields must be in OVERRIDE_FIELDS, or a project-level override would
+	// validate, parse, and then be dropped by the field-by-field merge.
+	const patched = applyOverride(base, { renewable: false, maxRenewals: 0 });
+	assert.equal(patched.renewable, false);
+	assert.strictEqual(patched.maxRenewals, 0, "an override to 0 must not decay to the default");
+});

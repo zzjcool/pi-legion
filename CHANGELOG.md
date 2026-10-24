@@ -13,6 +13,29 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Added
 
+- **Renewal for a budget casualty (#270).** An agent whose turn budget (`timeoutMs`)
+  runs out no longer just reports `failed`. When it measurably progressed and its
+  role allows renewal, the completion notice ends with a ready-to-paste
+  `subagent({ action: "continue", … })` plus the evidence (`progressed: 47 tool
+  results, 12 assistant messages, 6 files changed`) and the remaining budget
+  (`renewals: 1/2`). Renewal reuses the existing `continue` path, so the child
+  resumes from its own session file with its context intact. Two dispatches in one
+  day motivated this: one worker was cut off with nothing on disk, another finished
+  its code but ran out during verification.
+  - **Never automatic.** An auto-renewed stuck child would hold a concurrency slot
+    indefinitely; the notice hands over the decision instead.
+  - "Progressed" = ≥ 3 new `toolResult` rows or ≥ 1 changed file since the last
+    baseline. `assistant` messages are shown but never count — a model looping on
+    the same sentence grows that number without doing work.
+  - New agent frontmatter: `renewable` (default **true**; a timed-out `scout` means
+    the task was mis-scoped) and `maxRenewals` (default **2**; `0` disables, each
+    renewal is a fresh full budget). Both are validated in the team-override path
+    like every other numeric/boolean field.
+  - `wait`/`collect` timeouts never propose a renewal: those return while the child
+    is still alive. Only a real termination does, judged by `stopReason: "toolUse"`
+    / missing assistant row (F29) / the host's `terminated` wording — a clean
+    `stop` from an ordinary retry does not spend the budget.
+
 - **Launch admission queue (#266).** A launch that exceeds a *concurrency* gate
   (`maxChildrenPerNode`, `maxActive`, ledger `max_children_per_node` /
   `max_active_nodes`) no longer fails with `BUDGET_EXCEEDED`. It is enqueued,

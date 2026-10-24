@@ -8,6 +8,9 @@ inheritProjectContext: true
 inheritSkills: false
 async: true
 timeoutMs: 600000
+# A timed-out scout means the question was too broad, not that work needs
+# finishing — renewing it would just re-run an over-scoped search (#270 D5).
+renewable: false
 acceptance:
   level: attested
   role: read-only
