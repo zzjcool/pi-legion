@@ -6,7 +6,7 @@ systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
 async: true
-timeoutMs: 1800000
+timeoutMs: 2700000
 allowNestedSubagents: true
 acceptance:
   level: verified
