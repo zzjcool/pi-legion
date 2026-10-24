@@ -45,7 +45,7 @@ export const MAX_SEARCHED_STORES = 24;
 export interface CandidateStore {
 	rootDir: string;
 	/** Why this directory is a candidate, for the error message. */
-	reason: "cwd" | "caller-cwd" | "worktree";
+	reason: "cwd" | "caller-cwd" | "sibling" | "worktree";
 	/** Run records found in it (empty when the directory is unreadable). */
 	runs: readonly RunRecord[];
 }
@@ -129,7 +129,7 @@ export function candidateStoreRoots(input: {
 		}
 		for (const entry of entries) {
 			if (!entry.isDirectory() || entry.name === STORE_DIR_NAME) continue;
-			push(path.join(base, entry.name, STORE_DIR_NAME), "caller-cwd");
+			push(path.join(base, entry.name, STORE_DIR_NAME), "sibling");
 		}
 	}
 
@@ -213,7 +213,14 @@ export function knownChildNames(
 /** Where a store sits relative to the cwd the caller used, for the message. */
 function describeRoot(rootDir: string, cwd: string, reason: CandidateStore["reason"]): string {
 	const relative = path.relative(cwd, rootDir);
-	const label = reason === "worktree" ? " (a child's worktree)" : reason === "caller-cwd" ? " (the caller's cwd)" : "";
+	const label =
+		reason === "worktree"
+			? " (a child's worktree)"
+			: reason === "caller-cwd"
+				? " (the caller's cwd)"
+				: reason === "sibling"
+					? " (a neighbouring directory)"
+					: "";
 	if (relative === "" || relative === STORE_DIR_NAME) return `${rootDir}${label}`;
 	return `${rootDir}${label}`;
 }
