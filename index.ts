@@ -103,6 +103,12 @@ import {
 	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
+import {
+	candidateStoreRoots,
+	resolveChildAcrossStores,
+	unknownChildMessage,
+	type CandidateStore,
+} from "./src/runs/store-lookup.ts";
 import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
@@ -131,7 +137,12 @@ import {
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate" }),
-	cwd: Type.Optional(Type.String()),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Directory the child records live under (`<cwd>/.pi-subagents`), used by launch and by every control action. Defaults to the session cwd. A name miss searches the neighbouring stores too, so this is rarely needed.",
+		}),
+	),
 	model: Type.Optional(Type.String()),
 	preset: Type.Optional(
 		Type.String({ description: "Named kind+model+thinking preset" }),
@@ -187,7 +198,12 @@ const SubagentParams = Type.Object({
 	preset: Type.Optional(
 		Type.String({ description: "Named kind+model+thinking preset" }),
 	),
-	cwd: Type.Optional(Type.String()),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Directory the child records live under (`<cwd>/.pi-subagents`) for launch and every control action. Defaults to the session cwd. A name miss also searches neighbouring stores, so setting this is rarely needed.",
+		}),
+	),
 	worktree: Type.Optional(
 		Type.Boolean({
 			description:
@@ -261,7 +277,12 @@ const VexillatioParams = Type.Object({
 	),
 	agent: Type.Optional(Type.String({ description: "Utility agent name (default: scout)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Parallel recon launches" })),
-	cwd: Type.Optional(Type.String()),
+	cwd: Type.Optional(
+		Type.String({
+			description:
+				"Directory the child records live under (`<cwd>/.pi-subagents`) for launch and every control action. Defaults to the session cwd. A name miss also searches neighbouring stores, so setting this is rarely needed.",
+		}),
+	),
 	model: Type.Optional(Type.String()),
 	timeoutMs: Type.Optional(Type.Number({ description: "Per-child wait in ms, default 600000" })),
 });
@@ -1324,6 +1345,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					verifyRunner,
 					store,
 					cwd,
+					// #270: the session cwd is a second store worth searching when the
+					// call passes an explicit `cwd` that differs from it.
+					...(ctx.cwd && ctx.cwd !== cwd ? { callerCwd: ctx.cwd } : {}),
 					agents,
 					allAgents,
 					team,
@@ -1555,6 +1579,11 @@ async function controlAction(input: {
 	verifyRunner?: VerifyRunner;
 	store: RunStore;
 	cwd: string;
+	/**
+	 * #270: the session's own cwd, when the call also passes an explicit `cwd`.
+	 * Child records may live in either store, so both are searched on a miss.
+	 */
+	callerCwd?: string;
 	agents: AgentConfig[];
 	allAgents: AgentConfig[];
 	team: ActiveTeam;
@@ -1663,8 +1692,15 @@ async function controlAction(input: {
 			);
 		}
 		const runs = store.listRuns();
-		const found = findChild(runs, params.name);
-		if (!found) return unknownChild(params.name, store, cwd);
+		// #270: a miss in this store is not a miss overall — a worktree child's
+		// record lives under its own store, which this one cannot enumerate.
+		const found = findChild(runs, params.name) ?? findChildAcrossStores({
+			name: params.name,
+			cwd,
+			callerCwd: input.callerCwd,
+			ownRoot: store.rootDir,
+		});
+		if (!found) return unknownChild(params.name, store, cwd, input.callerCwd);
 		const alive = input.supervisor.isAlive(params.name);
 		const owner = ownerVerdictFor(store, runs, params.name, alive);
 		return ok(renderLiveChildStatus({
@@ -1688,8 +1724,15 @@ async function controlAction(input: {
 		);
 	}
 
-	const found = findChild(store.listRuns(), params.name);
-	if (!found) return unknownChild(params.name, store, cwd);
+	const found =
+		findChild(store.listRuns(), params.name) ??
+		findChildAcrossStores({
+			name: params.name,
+			cwd,
+			callerCwd: input.callerCwd,
+			ownRoot: store.rootDir,
+		});
+	if (!found) return unknownChild(params.name, store, cwd, input.callerCwd);
 
 	const orchestrator = new Orchestrator({
 		supervisor: input.supervisor,
@@ -1752,13 +1795,29 @@ function unknownChild(
 	name: string,
 	store: RunStore,
 	cwd: string,
+	callerCwd?: string,
 ): AgentToolResult<unknown> {
-	const known = store.listRuns().flatMap((run) => run.children.map((child) => child.name));
+	// #270: search the stores that can plausibly hold the record before giving up.
+	// A worktree child's store lives under `<runDir>/worktrees/<name>/.pi-subagents`,
+	// which the root store can never enumerate, so a single-store lookup reports a
+	// miss for a child that plainly exists.
+	// The store already searched comes first, then every other candidate
+	// (caller cwd, worktree stores). `resolveChildAcrossStores` re-searches the
+	// own store too — that is deliberate: it returns the `searched` list the
+	// message needs, and a store with no runs simply drops out of it.
+	const { searched } = resolveChildAcrossStores({
+		name,
+		cwd,
+		callerCwd,
+		roots: [
+			{ rootDir: path.resolve(store.rootDir), reason: "cwd" as const },
+			...candidateStoreRoots({ cwd, callerCwd }).filter(
+				(candidate) => candidate.rootDir !== path.resolve(store.rootDir),
+			),
+		],
+	});
 	return fail(
-		`unknown child: ${name} (no run under ${cwd}/.pi-subagents` +
-			`${known.length ? `; known here: ${known.join(", ")}` : ""}). ` +
-			`Child records are scoped to the \`cwd\` they were launched from — ` +
-			`pass the same \`cwd\` you used for \`launch\`.`,
+		unknownChildMessage({ name, cwd, searched: searched as CandidateStore[] }),
 		ErrorCodes.NOT_FOUND,
 	);
 }
@@ -3988,6 +4047,41 @@ function findControlAgent(
 		agents.find((agent) => agent.name === roleName) ??
 		allAgents.find((agent) => agent.name === roleName)
 	);
+}
+
+/**
+ * #270: resolve a child from another store when this one has no record.
+ *
+ * Only reached on a miss, so the common case (child launched here) costs
+ * nothing. The returned shape matches {@link findChild} so callers do not care
+ * which store answered — except that `runDir` now belongs to the owning store,
+ * which is why the caller re-derives its orchestrator run directory from it.
+ */
+function findChildAcrossStores(input: {
+	name: string;
+	cwd: string;
+	callerCwd?: string | undefined;
+	ownRoot: string;
+}): {
+	runId: string;
+	run: ReturnType<RunStore["listRuns"]>[number];
+	child: NonNullable<ReturnType<RunStore["findChild"]>>;
+} | null {
+	const { found } = resolveChildAcrossStores({
+		name: input.name,
+		cwd: input.cwd,
+		callerCwd: input.callerCwd,
+		roots: candidateStoreRoots({ cwd: input.cwd, callerCwd: input.callerCwd }).filter(
+			(candidate) => path.resolve(candidate.rootDir) !== path.resolve(input.ownRoot),
+		),
+	});
+	if (!found) return null;
+	// Read the owning store again for the full record: `resolveChildAcrossStores`
+	// only reports where the name was seen.
+	const runs = new RunStore({ rootDir: found.storeRoot }).listRuns();
+	const picked = pickChildByName(runs, input.name);
+	if (!picked) return null;
+	return { runId: picked.run.runId, run: picked.run, child: picked.child };
 }
 
 function findChild(
