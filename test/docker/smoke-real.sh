@@ -31,4 +31,17 @@ echo "$L3"
 if echo "$L3" | grep -qi yes; then echo "L3 OK"; else echo "L3 FAIL: subagent missing"; exit 1; fi
 
 echo
-echo "ALL THREE LAYERS PASSED"
+echo "### L4 worktree:true roles can run (git + a HEAD to branch from)"
+# #272: `worktree: true` (centurion) needs git AND a commit. An empty repo passes
+# `rev-parse --is-inside-work-tree` but fails `worktree add ... HEAD`, which then
+# reads as a pi-legion bug instead of a missing sandbox prerequisite.
+L4=$(docker exec "$NAME" bash -lc 'cd /root/work && git rev-parse --short HEAD 2>&1')
+echo "HEAD: $L4"
+if [ -z "$L4" ] || echo "$L4" | grep -qi "fatal\|not a git"; then
+  echo "L4 FAIL: /root/work cannot host a worktree (git or HEAD missing)"
+  exit 1
+fi
+echo "L4 OK"
+
+echo
+echo "ALL LAYERS PASSED"

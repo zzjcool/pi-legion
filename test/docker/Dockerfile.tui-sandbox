@@ -9,9 +9,12 @@ FROM node:24-slim
 # ripgrep/fd-find：pi 会话启动会 shell 出去找 rg/fd，两个都没有就每次从 GitHub
 # 下载静态二进制到 ~/.pi/agent/bin（容器层，重建即丢 + 起手 10s 网络抖动）。
 # getToolPath() 会退回 PATH 且认 `fdfind` 别名，Debian 包直接满足。
+# git: `worktree: true` roles (centurion) need a real repo —
+# `src/runs/worktree.ts` refuses to create a worktree when repoCwd is not one
+# (#272). Without git the container cannot exercise the multi-level chain at all.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       tmux python3 python3-pil fonts-noto-cjk curl ca-certificates \
-      ripgrep fd-find \
+      ripgrep fd-find git \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
@@ -37,6 +40,15 @@ COPY test/tui/ansi2png.py /opt/tui/ansi2png.py
 COPY test/docker/verify-tui-visual.sh /opt/tui/verify-tui-visual.sh
 
 WORKDIR /root/work
+
+# #272: pre-seed a repo with one commit so `worktree: true` roles (centurion) work
+# out of the box. `git worktree add -b <branch> <dest> HEAD` needs a real HEAD —
+# an empty repo passes `rev-parse --is-inside-work-tree` but fails the add, which
+# would look like a pi-legion bug rather than a missing fixture.
+RUN git init -q /root/work \
+    && git -C /root/work -c user.email=sandbox@example.invalid -c user.name="sandbox" \
+       commit -q --allow-empty -m "sandbox baseline (see test/docker/Dockerfile.tui-sandbox)" \
+    && git -C /root/work rev-parse --short HEAD
 
 # verify-tui-visual.sh 负责起 mock + tmux + 捕获 + 渲染，并自带冒烟断言
 CMD ["bash", "/opt/tui/verify-tui-visual.sh"]
