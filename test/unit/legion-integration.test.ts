@@ -1735,8 +1735,16 @@ test("#273: centurion team recovery is deferred out of the loading path", async 
 	// on the load path; it must be queued instead.
 	assert.match(
 		source,
-		/if \(node\.role === "centurion"\) \{[\s\S]{0,300}?queueMicrotask\(/,
+		/if \(node\.role === "centurion"\) \{[\s\S]{0,1200}?queueMicrotask\(/,
 		"team recovery must be queued, not called inline during loading",
+	);
+	// #275: `queueMicrotask` INHERITS the AsyncLocalStorage depth, so a recovery
+	// queued from a nested context would start already deep and report a bogus
+	// `nesting limit reached`. It must run at the top of the tree.
+	assert.match(
+		source,
+		/queueMicrotask\(\(\) => \{[\s\S]{0,200}?runAtAbsoluteDepth\(0,/,
+		"the queued recovery must reset ALS depth to 0 (queueMicrotask inherits it)",
 	);
 	assert.doesNotMatch(
 		source,
