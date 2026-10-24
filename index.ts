@@ -21,7 +21,7 @@ import type {
 import { Type, type Static } from "typebox";
 import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
-import { RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
+import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
 import type { LegionSupervisor } from "./src/supervisor/types.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
@@ -61,6 +61,7 @@ import { deriveOutcome, isLastTurnComplete, parseSessionFile } from "./src/share
 import { restoreHostNodeOptions } from "./src/supervisor/child-memory.ts";
 import { currentChildContext } from "./src/supervisor/child-context.ts";
 import { setVerifyQueueListener } from "./src/runs/verify-queue.ts";
+import { setLaunchQueueListener } from "./src/supervisor/admission-queue.ts";
 import { applyEventRetention, checkpoint, formatHygieneReport, hygieneEnabled, runStartupHygiene } from "./src/runs/hygiene.ts";
 import {
 	createStatusNodeOpener,
@@ -108,6 +109,7 @@ import {
 	type SpawnMode,
 	SubagentError,
 	type SubagentsSettings,
+	type Handle,
 } from "./src/shared/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -319,8 +321,91 @@ function currentProcessSpawnMode(): SpawnMode {
 	return currentChildContext()?.spawnMode ?? "rpc";
 }
 
+/**
+ * The frozen interruption head line (`test/unit/teams.test.ts` matches it, and
+ * `esc-no-retire-v3` records why it leads every interrupted result).
+ */
+const INTERRUPTED_HEAD = "interrupted (parent turn ended; children still running)";
+
 function notice(pi: ExtensionAPI, text: string): void {
 	pi.sendMessage({ customType: SUBAGENT_NOTIFY_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+}
+
+/**
+ * Launch-admission-queue bounds from settings (issue #266, contract D6-a/D10).
+ *
+ * Frozen key names are `subagents.inprocess.maxQueuedLaunches` /
+ * `subagents.inprocess.launchQueueTimeoutMs`. An absent key is *omitted* rather
+ * than defaulted here: the single source of the defaults is
+ * `src/supervisor/admission-queue.ts`, and passing a literal 32/900000 from the
+ * adapter would create a second copy that can drift from the docs and sentinel.
+ */
+function launchQueueBounds(settings: {
+	inprocess?: { maxQueuedLaunches?: number; launchQueueTimeoutMs?: number };
+}): { maxPending?: number; timeoutMs?: number } {
+	const bounds: { maxPending?: number; timeoutMs?: number } = {};
+	if (settings.inprocess?.maxQueuedLaunches !== undefined) bounds.maxPending = settings.inprocess.maxQueuedLaunches;
+	if (settings.inprocess?.launchQueueTimeoutMs !== undefined) bounds.timeoutMs = settings.inprocess.launchQueueTimeoutMs;
+	return bounds;
+}
+
+/**
+ * D9/§13.4: the one user-visible line per queued / admitted / expired / stopped
+ * launch.
+ *
+ * Deliberately `triggerTurn: false` (unlike {@link notice}): admission is a
+ * mid-turn fact about work the caller already asked for, so waking the parent
+ * with a fresh turn for every queue transition would re-enter the agent for a
+ * purely cosmetic line. Anything the caller must act on still arrives through
+ * the tool result and, for `async:false`, the inline `↳ waited Ns` line.
+ */
+function launchQueueNoticeSink(pi: ExtensionAPI): (line: string) => void {
+	return (line: string) => {
+		try {
+			pi.sendMessage(
+				{ customType: SUBAGENT_NOTIFY_TYPE, content: line, display: true },
+				{ triggerTurn: false },
+			);
+		} catch {
+			// Cosmetic: a gone parent session must never break admission.
+		}
+	};
+}
+
+/**
+ * D9-1: the launch line's queue suffix, or `""` for a launch that spawned now.
+ *
+ * `▶ scout-7 (scout) supervisor=inprocess queued(3)` — the position is what the
+ * operator needs to know the launch is waiting rather than broken. Only the
+ * trailing segment is added: the line's published prefix and `details.spawns`
+ * (a renderer input) keep their existing shapes.
+ */
+function launchLineQueueSuffix(handle: Pick<Handle, "queued" | "queuePosition">): string {
+	if (handle.queued !== true) return "";
+	return handle.queuePosition === undefined ? " queued" : ` queued(${handle.queuePosition})`;
+}
+
+/**
+ * D8/A20: the honest wait line for an `async:false` child that queued.
+ *
+ * Read from the admitted `ChildRecord.queueWaitedMs` — never re-derived from a
+ * clock here, or the number would describe the adapter's own latency instead of
+ * the queue's. `""` when the child never waited.
+ */
+function queuedWaitLine(child: { name: string; queueWaitedMs?: number } | undefined): string {
+	if (!child || child.queueWaitedMs === undefined || child.queueWaitedMs <= 0) return "";
+	return `↳ ${child.name} waited ${Math.round(child.queueWaitedMs / 1000)}s in the launch queue`;
+}
+
+/**
+ * D6/D7: report a queue that an abort cleared out.
+ *
+ * "Empty queue and zero spawns" is only half the contract; the caller must also
+ * learn that N launches it asked for never ran. One line, names in `seq` order.
+ */
+function launchQueueFlushLine(flushed: readonly string[]): string {
+	if (flushed.length === 0) return "";
+	return `${flushed.length} queued launch(es) dropped: ${flushed.join(", ")}`;
 }
 
 /**
@@ -553,7 +638,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const childRun = store.readRun(input.node.runId);
 	if (!childRun) throw new Error(`child run.json not found: ${input.node.runId}`);
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
-	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
+	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
 	orchestrator.restore(parentRun);
 	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
@@ -582,6 +667,25 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				else lastUi?.setStatus("legion-verify", undefined);
 			} catch { /* no UI */ }
 		});
+		// #266 D9-3: the launch admission queue's own pill. Deliberately a separate
+		// listener from verify's — different phases, and verify's is poll-driven.
+		// The contract's baseline is `legion-queue: N queued`; the `· 8/8 slots busy`
+		// tail needs `slotsInUse`/`slots`, which the pure queue does not know (the
+		// limit lives in the supervisor), so that dimension is omitted until the
+		// event carries it — the contract allows the omission explicitly.
+		setLaunchQueueListener((event) => {
+			try {
+				if (event.phase === "queued" || event.phase === "admitted") {
+					const suffix = event.slotsInUse !== undefined && event.slots !== undefined
+						? ` · ${event.slotsInUse}/${event.slots} slots busy`
+						: "";
+					lastUi?.setStatus("legion-queue", `legion-queue: ${event.queued} queued${suffix}`);
+					if (event.queued === 0) lastUi?.setStatus("legion-queue", undefined);
+				} else if (event.phase === "overflow" || event.phase === "expired" || event.phase === "flushed") {
+					lastUi?.setStatus("legion-queue", undefined);
+				}
+			} catch { /* no UI */ }
+		});
 	}
 	const onSpawnRefused = (message: string) => {
 		try { lastUi?.notify(`pi-legion: ${message}`, "error"); } catch { /* no UI (child / print mode) */ }
@@ -591,8 +695,20 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	let lastCwd = process.cwd();
 	const supervisor = deps.supervisor ?? new RoutingSupervisor({
 		rpc: new RpcSupervisor({ onSpawnRefused }),
+		// The in-process supervisor is constructed here (not by RoutingSupervisor) so
+		// it can read live settings per spawn. That means `onSlotReleased` must be
+		// wired EXPLICITLY: RoutingSupervisor only adds it when it builds the
+		// backend itself (`options.inprocess ?? new InProcessSupervisor({...})`).
+		// Passing a pre-built instance used to drop the hook silently, so a freed
+		// slot never woke a launch-queue pump in production — admission then waited
+		// for the fallback recheck instead of firing on the release (#266 D2-d-2).
 		inprocess: new InProcessSupervisor({
 			onSpawnRefused,
+			// The event payload is not needed here: every Orchestrator on this run dir
+			// re-probes its own items, so a bare wake-up edge is the whole contract.
+			onSlotReleased: () => {
+				notifyInProcessSlotReleased();
+			},
 			getLimits: () => {
 				try {
 					return loadSubagentSettings({
@@ -1186,6 +1302,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				params,
 				signal,
 				ctx,
+				pi,
 				supervisor,
 				uiProxy,
 				onBudgetRefused,
@@ -1212,7 +1329,16 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					details !== null && typeof details === "object" && !Array.isArray(details)
 						? (details as Record<string, unknown>)
 						: undefined;
-				return ok("interrupted (parent turn ended; children still running)", carried);
+				// #266 D7: the inner interrupted result also carries the launch-queue
+				// flush line (`N queued launch(es) dropped: …`), which a bare head line
+				// would silently erase — the caller would think its launches still ran.
+				// An inner result that already reports the interruption is therefore
+				// kept as-is; only an otherwise-successful result is replaced.
+				const inner = (result.content ?? [])
+					.map((part) => (part.type === "text" ? part.text : ""))
+					.join("\n");
+				if (inner.includes(INTERRUPTED_HEAD)) return ok(inner, carried);
+				return ok(INTERRUPTED_HEAD, carried);
 			}
 			return result;
 		},
@@ -1734,6 +1860,7 @@ async function reviveChild(
 async function launchFamily(input: {
 	params: SubagentParams;
 	ctx: ExtensionContext;
+	pi: ExtensionAPI;
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
 	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
@@ -1811,6 +1938,10 @@ async function launchFamily(input: {
 		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
 		...rpcApproveFrom(settings),
+		// #266 D6-a/D10: queue bounds + the D9 notice channel. The command chain is
+		// the bug's main path (a 12-step `tasks[]` fanout against `maxChildrenPerNode`).
+		launchQueue: launchQueueBounds(settings),
+		onLaunchQueueNotice: launchQueueNoticeSink(input.pi),
 		...(legion ? { legion: { db: legion.db, dbPath: legion.dbPath, nodeId: legion.nodeId, runId: run.runId, parentNodeId: legion.parentNodeId ?? undefined, parentRunId: legion.parentRunId ?? undefined, runStore: store, settings: legion.settings, eventBus: legion.eventBus } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
 	});
@@ -1852,10 +1983,28 @@ async function launchFamily(input: {
 
 	const interruptedResult = async (): Promise<AgentToolResult<unknown> | undefined> => {
 		if (!input.signal?.aborted) return undefined;
+		// #266 D7/A5: a parent turn end empties the launch queue and spawns nothing.
+		// Deliberately only HERE (and in the vexillatio interrupt): Esc/wait
+		// interruptions end the parent's *wait*, not its turn, and must leave
+		// children — queued ones included — running (`esc-no-retire-v3`).
+		const flushed = orchestrator.flushLaunchQueue("parent turn ended");
 		for (const name of session.handles) await abandonLaunchedChild(session, name);
 		session.handles.length = 0;
+		const flushLine = launchQueueFlushLine(flushed);
 		return {
-			content: [{ type: "text", text: session.results.join("\n") || "interrupted (parent turn ended; children still running)" }],
+			content: [{
+				type: "text",
+				text: [
+					// The head line LEADS (same frozen shape as the vexillatio interrupt):
+					// the outer abort net keeps an inner result that already reports the
+					// interruption, and only a leading head makes that detection reliable
+					// — otherwise each `parent turn ended; child still running (watched)`
+					// line reads like a standalone notice and the flush line is lost.
+					INTERRUPTED_HEAD,
+					session.results.join("\n"),
+					flushLine,
+				].filter(Boolean).join("\n"),
+			}],
 			details: { runId: run.runId, handles: [], async: params.async ?? true, ...spawnDetails() },
 		};
 	};
@@ -2068,7 +2217,7 @@ async function launchStep(
 			return;
 		}
 		session.results.push(
-			`▶ ${handle.name} (${effective.name}) supervisor=${handle.spawnMode}`,
+			`▶ ${handle.name} (${effective.name}) supervisor=${handle.spawnMode}${launchLineQueueSuffix(handle)}`,
 		);
 		session.onUpdate?.({
 			content: [
@@ -2168,23 +2317,100 @@ function resolveStep(
 	};
 }
 
+/**
+ * Collect one child, tolerating the transient gap an admission creates.
+ *
+ * `pumpAdmissions` deletes the `queued` placeholder before replaying the real
+ * launch, so between those two steps the name exists in neither the placeholder
+ * map nor the freshly spawned record. `collect()` resolves names through
+ * `requireChild`, so a collect that lands in that window throws
+ * `unknown child: <name>` — a race, not a real failure, and one only a queued
+ * child can hit. The window is a microtask-or-two long (the replay is awaited),
+ * so a short bounded retry is enough; anything genuinely gone still surfaces.
+ *
+ * Only used by the sequential `async:false` path. `async:true` never collects
+ * here — its watcher goes through the same `collect` but is re-armed, so a retry
+ * loop there would fight the watcher instead of helping it.
+ */
+async function collectThroughAdmission(
+	session: LaunchSession,
+	name: string,
+	signal?: AbortSignal,
+): Promise<Awaited<ReturnType<Orchestrator["collect"]>>> {
+	const deadline = Date.now() + ADMISSION_SETTLE_TIMEOUT_MS;
+	for (;;) {
+		try {
+			return await session.orchestrator.collect(name, {
+				timeoutMs: session.timeoutByName.get(name) ?? DEFAULTS.turnTimeoutMs,
+				...(signal ? { signal } : {}),
+			});
+		} catch (error) {
+			const transient = error instanceof SubagentError && error.code === ErrorCodes.NOT_FOUND;
+			if (!transient || Date.now() >= deadline || signal?.aborted) throw error;
+			await new Promise((resolve) => setTimeout(resolve, ADMISSION_SETTLE_POLL_MS));
+		}
+	}
+}
+
+/**
+ * How long a collect may retry across the admission gap before reporting it.
+ *
+ * Deliberately much shorter than a turn timeout: the gap is two `await`s wide,
+ * so anything still missing after this long is not racing — it is gone.
+ */
+const ADMISSION_SETTLE_TIMEOUT_MS = 5_000;
+const ADMISSION_SETTLE_POLL_MS = 25;
+
 /** Wait for each launched child's turn, appending its outcome. */
 async function collectInline(session: LaunchSession, signal?: AbortSignal): Promise<void> {
-	for (const name of session.handles) {
+	// #266 D8: collect children that already hold a slot FIRST.
+	//
+	// A queued handle resolves synchronously (`launch()` returns it before any
+	// spawn), so it lands in `handles` BEFORE the admitted siblings. Collecting in
+	// raw launch order would therefore block on the queued child first — waiting
+	// for a slot that only those very siblings can release once THEY are
+	// collected — i.e. a deadlock, not a wait. Launch order is preserved within
+	// each group, so a run with no queue keeps its exact previous order.
+	const queuedHere = new Set(
+		session.orchestrator
+			.childrenSnapshot()
+			.filter((child) => child.state === "queued")
+			.map((child) => child.name),
+	);
+	const ordered = [
+		...session.handles.filter((name) => !queuedHere.has(name)),
+		...session.handles.filter((name) => queuedHere.has(name)),
+	];
+	for (const name of ordered) {
 		if (signal?.aborted) {
 			session.results.push("interrupted (parent turn ended; children still running)");
 			return;
 		}
 		try {
-			const collected = await session.orchestrator.collect(name, {
-				timeoutMs: session.timeoutByName.get(name) ?? DEFAULTS.turnTimeoutMs,
-				...(signal ? { signal } : {}),
-			});
+			const collected = await collectThroughAdmission(session, name, signal);
 			if (signal?.aborted || collected.execution.reason === "aborted by parent") {
 				session.results.push("interrupted (parent turn ended; children still running)");
 				return;
 			}
 			session.results.push(renderCollect(name, collected));
+			// #266 D8/A20: `async:false` must report the real wait, not just look slow.
+			// Read AFTER collect: `queueWaitedMs` is written at admission, so an item
+			// that is still waiting when the collect deadline fires has no line yet.
+			const waitedLine = queuedWaitLine(
+				session.orchestrator.childrenSnapshot().find((child) => child.name === name),
+			);
+			if (waitedLine) session.results.push(waitedLine);
+			// A finished child must release its slot BEFORE the next collect starts,
+			// or a queue can never drain: `collectInline` is sequential, and the
+			// caller's retire loop runs after every collect (so with `maxChildrenPerNode:
+			// 1` the second child would wait for a slot the first still holds).
+			// Gated on a non-empty queue so the un-queued fast path is unchanged.
+			if (
+				session.orchestrator.launchQueueEntries().length > 0 &&
+				shouldRecycleAfterCollect(collected.execution.status)
+			) {
+				await session.orchestrator.retire(name);
+			}
 		} catch (error) {
 			session.results.push(`✗ ${name}: collect failed: ${String(error)}`);
 		}
@@ -2403,6 +2629,10 @@ async function launchUtilityFamily(input: {
 			childContext: resolveTeamContext("child", catalog.settings, catalog.team),
 			team: catalog.team,
 			...rpcApproveFrom(catalog.settings),
+			// #266: the parallel-recon path shares the same bounds and notice channel
+			// as the command chain — one scheduler for every dispatch family (D2).
+			launchQueue: launchQueueBounds(catalog.settings),
+			onLaunchQueueNotice: launchQueueNoticeSink(input.pi),
 			onBudgetRefused: input.onBudgetRefused,
 			...(legion ? {
 				legion: {
@@ -2528,6 +2758,17 @@ async function launchUtilityFamily(input: {
 			lines.push(`sessionFile: ${handle.sessionFile}`);
 			return lines.join("\n");
 		} catch (error) {
+			// #266: a queued item is never "failed" — it never started. Treating it as
+			// still running keeps it out of the failure list and lets the retry/watch
+			// path own it, instead of retiring a launch the caller only asked to wait on.
+			const queuedNow = handle.orchestrator
+				.childrenSnapshot()
+				.find((entry) => entry.name === handle.name)?.state === "queued";
+			if (queuedNow) {
+				followUtility(handle, true);
+				stillRunning.add(handle.name);
+				return `── ${handle.name} ──\nexecution: queued (waiting for a free slot)\nsessionFile: ${handle.sessionFile}`;
+			}
 			if (input.supervisor.isAlive(handle.name)) {
 				followUtility(handle, true);
 				stillRunning.add(handle.name);
@@ -2538,13 +2779,27 @@ async function launchUtilityFamily(input: {
 			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
-	if (input.signal?.aborted) return interruptedUtilityResult({
-		runId,
-		handles,
-		stillRunning,
-		results,
-		collected,
-	});
+	if (input.signal?.aborted) {
+		// #266 D7/A5: same rule as the command chain — a parent turn end empties
+		// every dispatch family's queue and spawns nothing. Each utility item owns
+		// its own Orchestrator, so each one flushes its own view of the shared queue.
+		const flushed: string[] = [];
+		for (const handle of handles) {
+			const child = handle.orchestrator.childrenSnapshot().find((entry) => entry.name === handle.name);
+			// D9: a queued item produced no result, so it must never be reported as
+			// one. It is either dropped by the flush below (reported by name) or, if
+			// it was already admitted, genuinely still running.
+			if (child?.state === "queued") flushed.push(...handle.orchestrator.flushLaunchQueue("parent turn ended"));
+		}
+		return interruptedUtilityResult({
+			runId,
+			handles,
+			stillRunning,
+			results,
+			collected,
+			flushed,
+		});
+	}
 	results.push(...collected);
 	return {
 		content: [{ type: "text", text: results.join("\n\n") || "No utility agents were launched." }],
@@ -2576,9 +2831,18 @@ function interruptedUtilityResult(input: {
 	stillRunning: Set<string>;
 	results: string[];
 	collected: string[];
+	/** #266 D7: names the abort cleared out of the launch queue (seq order). */
+	flushed?: readonly string[];
 }): AgentToolResult<unknown> {
 	const head = "interrupted (parent turn ended; children still running)";
-	const segments = [...input.results, ...input.collected].filter((segment) => segment.length > 0);
+	// #266 D7: a dropped queued launch is the reason the rest of the result is
+	// short, so it is reported even when nothing was collected at all. Trailing,
+	// like the command chain's line: it reads as a summary of what was cleared.
+	const segments = [
+		...input.results,
+		...input.collected,
+		launchQueueFlushLine(input.flushed ?? []),
+	].filter((segment) => segment.length > 0);
 	const stillRunning = input.handles
 		.filter(({ name }) => input.stillRunning.has(name))
 		.map(({ name }) => name);
@@ -2936,6 +3200,10 @@ async function abandonLaunchedChild(session: LaunchSession, name: string): Promi
 		session.runtime.release(name);
 		return;
 	}
+	// #266: a launch that never started cannot be "still running". Reporting it as
+	// watched would contradict the `N queued launch(es) dropped` line and tell the
+	// caller to wait for a child that will never produce a turn.
+	if (child.state === "queued") return;
 	// Esc / parent-turn abort must not retire: child keeps running; follow+watch
 	// so settle still notifies the parent (esc-no-retire-v3).
 	followLaunched(session, name, { watch: true });

@@ -196,3 +196,57 @@ test("rebuild tolerates malformed run.json and preserves messages by default", (
 		fs.rmSync(sandbox, { recursive: true, force: true });
 	}
 });
+
+test("rebuild skips a queued child: no phantom node, and the rest of the run still rebuilds", () => {
+	// #266 D3/§4.4 (A16): a `queued` child was never started, so it has no ledger
+	// row, no run directory and only a placeholder session path. Rebuilding it
+	// would invent a node for a launch that may still be waiting — or that was
+	// simply lost with the previous process (I-O3). `queued` is deliberately not
+	// part of `NODE_STATUSES` either (it is an Orchestrator state, not a ledger
+	// state), so there is no valid status to map it to.
+	const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "legion-rebuild-queued-"));
+	const runs = path.join(sandbox, "runs");
+	const rootDir = path.join(runs, "r-root");
+	const startedSession = path.join(rootDir, "started.jsonl");
+	fs.mkdirSync(rootDir, { recursive: true });
+	fs.writeFileSync(startedSession, [
+		JSON.stringify({ type: "message", message: { role: "user", content: "task" } }),
+		JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } }),
+	].join("\n"));
+	writeRun(rootDir, {
+		schemaVersion: 1, runId: "r-root", task: "root", cwd: sandbox, herdr: {}, path: [],
+		depth: 0, maxDepth: 4,
+		children: [
+			{
+				name: "started", sessionFile: startedSession, ownerToken: "t-started",
+				state: "working", spawnedAt: new Date(1_000).toISOString(), agent: "worker", kind: "pi",
+			},
+			{
+				name: "waiting", sessionFile: path.join(rootDir, "waiting.jsonl"), ownerToken: "t-waiting",
+				state: "queued", queuePosition: 1,
+				spawnedAt: new Date(2_000).toISOString(), agent: "worker", kind: "pi",
+			},
+		],
+		budget: { spawned: 1, limit: null, granted: 0 },
+		createdAt: new Date(500).toISOString(), updatedAt: new Date(3_000).toISOString(),
+	});
+	const db = openLegionDb(":memory:");
+	try {
+		const result = rebuildLegionDb({ rootRunDir: rootDir, db, now: () => 9_000 });
+		// The root node id comes from the run's own identity, exactly as the sibling
+		// test above asserts (`root`, `root.centurion`, …).
+		assert.equal(getNode(db, "root.waiting"), null, "a queued child never becomes a tree node");
+		const started = getNode(db, "root.started");
+		assert.ok(started, "the sibling that really started is still rebuilt");
+		assert.equal(started.status, "settled");
+		// A queued child is skipped silently: it is a legitimate state, not corruption.
+		assert.equal(
+			result.warnings.some((warning) => warning.message.includes("waiting")),
+			false,
+			"skipping a queued child is not a warning",
+		);
+	} finally {
+		db.close();
+		fs.rmSync(sandbox, { recursive: true, force: true });
+	}
+});

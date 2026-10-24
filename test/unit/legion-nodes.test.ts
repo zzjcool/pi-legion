@@ -2,6 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openLegionDb } from "../../src/legion/db.ts";
 import {
+	LIVE_CHILD_STATUSES,
+	NODE_STATUSES,
+	NON_TERMINAL_NODE_STATUSES,
 	NodeNameConflictError,
 	childNameExists,
 	getChildByName,
@@ -149,3 +152,55 @@ test("insertNode can create the tree root on an empty ledger", () => {
 		db.close();
 	}
 });
+
+// ── #266 A16/D3: `queued` is an ORCHESTRATOR state, never a ledger status ──
+//
+// `TaskState` gained `"queued"` for the launch admission queue, and the contract
+// forbids it from leaking into the ledger's closed status set: `NODE_STATUSES`,
+// the two SQL statements that hardcode six `?` placeholders, `padStatuses`,
+// `validateStatuses`, and the `LIVE_NODE_STATUSES` copy in `legion-status.ts`.
+// The reason is mechanical — `listNodesByStatus`/`listStaleNodes` bind exactly
+// six params, so a seventh member would silently truncate results rather than
+// fail loudly. These assertions are the tripwire for that change.
+
+test("#266 A16: the ledger status set is still exactly six and excludes 'queued'", () => {
+	assert.deepEqual([...NODE_STATUSES], ["starting", "running", "blocked", "settled", "failed", "retired"]);
+	assert.equal(NODE_STATUSES.length, 6, "the six-placeholder SQL puts a hard cap on this set");
+	assert.equal((NODE_STATUSES as readonly string[]).includes("queued"), false, "queued must never be a ledger status");
+	// The slot-holding set is the fanout/active accounting basis; `queued` must not
+	// occupy a slot (that is what makes a waiting launch cost nothing).
+	assert.deepEqual([...LIVE_CHILD_STATUSES], ["starting", "running", "blocked"]);
+	assert.deepEqual([...NON_TERMINAL_NODE_STATUSES], ["starting", "running", "blocked", "retired"]);
+});
+
+test("#266 A16: a seventh status is rejected loudly instead of truncating the SQL", () => {
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" });
+		// Six is the maximum the statements can bind; anything beyond it must throw
+		// from the validator rather than silently dropping a status.
+		assert.throws(
+			() =>
+				listNodesByStatus(db, [
+					"starting",
+					"running",
+					"blocked",
+					"settled",
+					"failed",
+					"retired",
+					"queued" as never,
+				]),
+			/one to six valid node statuses/,
+		);
+		assert.throws(() => listInvalidStatuses(db), /one to six valid node statuses/);
+		// The six-status call still works, i.e. the guard is not rejecting everything.
+		assert.deepEqual(listNodesByStatus(db, [...NODE_STATUSES]).map((node) => node.id), ["root"]);
+	} finally {
+		db.close();
+	}
+});
+
+/** Six valid statuses plus one invalid, to reach the length guard. */
+function listInvalidStatuses(db: Parameters<typeof listNodesByStatus>[0]) {
+	return listNodesByStatus(db, [...NODE_STATUSES, "queued" as never]);
+}

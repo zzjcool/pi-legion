@@ -17,7 +17,7 @@ import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
-import { withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
+import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { evaluatePhaseTransition, isLegionPhase, isTerminalPhase } from "../legion/state-machine.ts";
@@ -58,6 +58,21 @@ import {
 	type Usage,
 } from "../shared/types.ts";
 import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
+import {
+	type AdmissionDimension,
+	type AdmissionQueue,
+	type AdmissionQueueEntry,
+	type AdmissionVerdict,
+	acquireAdmissionQueue,
+	evaluateInProcessAdmission,
+	type InProcessAdmissionCounts,
+	peekAdmissionQueue,
+	type QueuedLaunch,
+	queueTimeoutMessage,
+} from "../supervisor/admission-queue.ts";
+import { type ChildLaunchContext, currentChildContext, runInChildContext } from "../supervisor/child-context.ts";
+import { inProcessDepth, runAtAbsoluteDepth } from "../supervisor/inprocess-depth.ts";
+import { subscribeInProcessSlotReleases } from "../supervisor/routing-supervisor.ts";
 import type { LegionSupervisor, SettleResult, SpawnInput } from "../supervisor/types.ts";
 import { isInProcessSpawn, resolveSpawnMode } from "../supervisor/spawn-mode.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
@@ -117,6 +132,129 @@ export interface OrchestratorDeps {
 	 */
 	rpcApprove?: boolean;
 	onBudgetRefused?: (event: BudgetRefusedEvent) => void;
+	/**
+	 * D6/D10 (launch admission queue): queue bounds. Absent fields fall back to
+	 * the defaults declared in `admission-queue.ts` (32 pending / 900_000 ms).
+	 */
+	launchQueue?: { maxPending?: number; timeoutMs?: number };
+	/** D9: one user-visible line per queued / admitted / expired / stopped launch. */
+	onLaunchQueueNotice?: (line: string) => void;
+}
+
+/**
+ * One queued launch (contract §4.3, issue #266).
+ *
+ * `run()` re-enters `launchInternal` with `admissionAlreadyGranted: true`, so the
+ * name allocated at enqueue time is reused (D4) and the authoritative gates are
+ * re-evaluated at admission time (I-O1).
+ */
+export interface LaunchQueuePayload {
+	readonly name: string;
+	readonly parentKey: string;
+	readonly inProcess: boolean;
+	/** ALS depth captured at enqueue time; admission restores it (A18). */
+	readonly parentDepth: number;
+	/** ALS identity captured at enqueue time; admission restores it (A18). */
+	readonly parentContext?: ChildLaunchContext;
+	/** Run the real launch. */
+	run(): Promise<Handle>;
+	/** Settles when the item leaves the queue. */
+	readonly settled: Promise<AdmitOutcome>;
+}
+
+/** How a queued item left the queue (contract §4.3). */
+export type AdmitOutcome =
+	| { readonly kind: "admitted"; readonly waitedMs: number }
+	| { readonly kind: "rejected"; readonly reason: "timeout" | "stopped" | "flushed"; readonly message: string };
+
+/**
+ * I-O3: what a `queued` record from a *previous* process means. The queue lives
+ * in memory, so such a record can never become live again — say so instead of
+ * reporting `unknown child`, and let `retire` clean it up.
+ */
+function launchQueueLostMessage(name: string): string {
+	return `child '${name}' never started: the launch queue was lost when the previous process exited; re-dispatch it (or relaunch) instead`;
+}
+
+/** Launch parameters (extracted so the queued replay can reuse them verbatim). */
+export interface LaunchInput {
+	agent: AgentConfig;
+	task: string;
+	name?: string;
+	team?: string;
+	model?: string;
+	/** Provider id pinning `--provider` for an ambiguous bare model id (#123). */
+	modelProvider?: string;
+	thinking?: string | false;
+	worktree?: boolean;
+	modelOrigin?: ModelOrigin;
+	/** Vexillatio launch: bypass nested-depth gates while recording its parent-side Legion node. */
+	utilityDispatch?: boolean;
+	/** Mask inherited Legion identity from the spawned child process. */
+	stripLegionIdentity?: boolean;
+}
+
+	/**
+	 * I-O3: a *live* queued item was asked to do something that needs a spawned
+	 * child. D4 freezes the payload at enqueue time, so the only way to change a
+	 * queued launch is to stop it and launch again (§10).
+	 */
+	function queuedNotStartedMessage(name: string): string {
+		return `child '${name}' has not started yet (state=queued); stop it and relaunch to change it`;
+	}
+
+	/** Everything `probeAdmission` needs, captured once per launch attempt. */
+interface AdmissionProbeContext {
+	readonly inProcess: boolean;
+	readonly agent: AgentConfig;
+	readonly nodeId?: string;
+	readonly ledgerPrevious: LegionNode | null;
+	/** Utility nodes are hard leaves; their ledger depth ceiling differs. */
+	readonly utility: boolean;
+}
+
+	/**
+	 * Bookkeeping for one queued item (paired 1:1 with its `queued` ChildRecord).
+	 *
+	 * `settled` is the channel D8 §"other errors bubble to the caller" needs: a
+	 * timeout/stop/flush resolves it with a `rejected` outcome, while a genuine
+	 * spawn failure rejects it with the original error.
+	 */
+	interface LaunchGuard {
+		/** Resolve the item's `settled` promise exactly once. */
+		readonly settle: (outcome: AdmitOutcome) => void;
+		/** Leaves the queue (admitted / timeout / stopped / flushed) — what `collect` awaits. */
+		readonly settled: Promise<AdmitOutcome>;
+		/** Re-run the advisory gate for this item (D2-c attribution, D5 head-of-line skip). */
+		readonly probe: () => AdmissionVerdict;
+		readonly dimension: AdmissionDimension;
+		/** When the item first entered the queue — the requeue path keeps this deadline. */
+		readonly enqueuedAt: number;
+	}
+
+/** The narrow, read-only supervisor surface the probe consumes (I-O1). */
+interface AdmissionProbeSource {
+	admissionCounts(name: string): InProcessAdmissionCounts;
+	preflightAdmission(name: string): AdmissionVerdict;
+}
+
+function asAdmissionProbe(source: unknown): AdmissionProbeSource | undefined {
+	if (!source || typeof source !== "object") return undefined;
+	const candidate = source as Partial<AdmissionProbeSource>;
+	return typeof candidate.admissionCounts === "function" && typeof candidate.preflightAdmission === "function"
+		? (source as AdmissionProbeSource)
+		: undefined;
+}
+
+/**
+ * §4.3: the in-process probe lives on the `InProcessSupervisor` instance. A
+ * `RoutingSupervisor` keeps it as `inprocess`; a bare in-process supervisor (or
+ * a test double) may expose the members itself. Anything else (RPC, fakes)
+ * admits — the probe is advisory only (I-O1).
+ */
+function inProcessProbeOf(supervisor: LegionSupervisor): AdmissionProbeSource | undefined {
+	const routing = supervisor as LegionSupervisor & { inprocess?: unknown };
+	return asAdmissionProbe(routing.inprocess) ?? asAdmissionProbe(supervisor);
 }
 
 export interface CollectResult {
@@ -270,6 +408,9 @@ export class Orchestrator {
 	private readonly onBudgetRefused?: (event: BudgetRefusedEvent) => void;
 	private readonly legion?: OrchestratorLegionContext;
 	private readonly requestedDepthCap?: number;
+	/** D6/D10: queue bounds passed to the process-level queue (first acquisition wins). */
+	private readonly launchQueueBounds: { maxPending?: number; timeoutMs?: number };
+	private readonly onLaunchQueueNotice?: (line: string) => void;
 	private depthWarningEmitted = false;
 	private worktreeDeniedWarningEmitted = false;
 	private spawned = 0;
@@ -278,6 +419,34 @@ export class Orchestrator {
 	private readonly pendingWaits = new Map<string, Promise<SettleResult>>();
 	/** Children retired because the parent session is shutting down. */
 	private readonly parentShutdownRetire = new Set<string>();
+	/**
+	 * D2-b in-flight reservation: admissions this tick already waved through but
+	 * which the authoritative gates cannot see yet (the child only lands in the
+	 * supervisor's `children` map after the first `await` in `spawnChild`).
+	 * Without it, a same-tick fan-out of 12 probes all read 0 live children and
+	 * all pass — which is exactly the bug #266 exists to fix.
+	 */
+	private readonly admitting = new Map<string, { parentKey: string; dimension: AdmissionDimension }>();
+	/** Lazily acquired process-level queue for this run directory (§13.6). */
+	private admissionQueueRef?: AdmissionQueue<LaunchQueuePayload>;
+	/**
+	 * Per-name admission guard: the `settled` channel for `collect`, the re-probe
+	 * closure for D2-c/D5, and the original deadline a requeue must honour.
+	 */
+	private readonly launchGuards = new Map<string, LaunchGuard>();
+	/** D2-d-4: at most one unref'd fallback timer while the queue is non-empty. */
+	private queueWatchdog?: ReturnType<typeof setTimeout>;
+	/** `pumpAdmissions` mutex — a second concurrent pump must never double-admit. */
+	private pumping = false;
+	/**
+	 * D2-d-2 subscription, held only while this instance has pending items.
+	 *
+	 * `index.ts` creates a fresh Orchestrator per control action, so subscribing
+	 * eagerly in the constructor would leak one listener per tool call. Subscribing
+	 * on the first queued item (and dropping it when the queue empties) keeps the
+	 * listener set proportional to real queue owners.
+	 */
+	private unsubscribeSlotReleases?: () => void;
 
 	constructor(deps: OrchestratorDeps) {
 		this.supervisor = deps.supervisor ?? new RpcSupervisor();
@@ -303,6 +472,8 @@ export class Orchestrator {
 		this.childContext = deps.childContext?.trim() || undefined;
 		this.rpcApprove = deps.rpcApprove === true;
 		this.onBudgetRefused = deps.onBudgetRefused;
+		this.launchQueueBounds = deps.launchQueue ?? {};
+		this.onLaunchQueueNotice = deps.onLaunchQueueNotice;
 		this.legion = deps.legion;
 	}
 
@@ -323,6 +494,11 @@ export class Orchestrator {
 		for (let index = seen; index < seen + 1000; index += 1) {
 			const candidate = makeName(agentName, index);
 			if (this.children.has(candidate) || this.supervisor.isAlive(candidate)) continue;
+			// #266 D4: an automatically allocated name must not collide with a QUEUED
+			// item either. The queue is process-level, so a sibling instance's pending
+			// launch is invisible to `this.children` / `isAlive` — allocating its name
+			// here would make the new (legitimate) launch fail with NAME_TAKEN.
+			if (this.isQueuedHere(candidate)) continue;
 			this.nameCounter.set(agentName, index + 1);
 			return candidate;
 		}
@@ -559,22 +735,15 @@ export class Orchestrator {
 		this.onBudgetRefused?.(event);
 	}
 
-	async launch(input: {
-		agent: AgentConfig;
-		task: string;
-		name?: string;
-		team?: string;
-		model?: string;
-		/** Provider id pinning `--provider` for an ambiguous bare model id (#123). */
-		modelProvider?: string;
-		thinking?: string | false;
-		worktree?: boolean;
-		modelOrigin?: ModelOrigin;
-		/** Vexillatio launch: bypass nested-depth gates while recording its parent-side Legion node. */
-		utilityDispatch?: boolean;
-		/** Mask inherited Legion identity from the spawned child process. */
-		stripLegionIdentity?: boolean;
-	}): Promise<Handle> {
+	async launch(
+		input: LaunchInput,
+		/**
+		 * Internal replay of an already-admitted launch (issue #266 D2-c / §4.3).
+		 * Public callers must omit it: admission is decided exactly once, at the
+		 * frozen insertion point below.
+		 */
+		internal: { admissionAlreadyGranted?: boolean } = {},
+	): Promise<Handle> {
 		this.warnDepthCap();
 		if (input.agent.kind !== "pi") {
 			throw new SubagentError(
@@ -586,7 +755,12 @@ export class Orchestrator {
 		const name = this.legion ? this.legionLocalName(generated) : generated;
 		const nodeId = this.legion ? nodeIdForChild(this.legion.nodeId, name) : undefined;
 		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
-		const previous = this.children.get(name) ?? (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
+		// D3-a: a `queued` record carries a PLACEHOLDER session file, so it must never
+		// be mistaken for a resume credential (R8). Only real records resume.
+		const priorRecord = this.children.get(name);
+		const previous = priorRecord && priorRecord.state !== "queued"
+			? priorRecord
+			: (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
 		if (previous && !this.children.has(name)) this.children.set(name, previous);
 		const models = this.planModelCandidates({
 			agent: input.agent,
@@ -655,6 +829,27 @@ export class Orchestrator {
 		// In-process children use subagents.inprocess.* budgets (never RPC keys).
 		if (!input.utilityDispatch && !inProcess) this.assertWithinBudgets(Boolean(previous));
 		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
+		// D4: the name-occupancy check must cover QUEUED records too. `previous`
+		// deliberately ignores them (D3-a: its placeholder session path is not a resume
+		// credential) and a queued child is not `alive`, so without this clause a
+		// second `launch({name})` would enqueue the SAME name twice and only fail
+		// later, at admission, with a confusing `child is already alive`.
+		//
+		// The two cases are NOT the same refusal (I-O3 / §13.3.1):
+		//  - the item is still in THIS process's queue → `NAME_TAKEN` (a live launch is
+		//    in flight under that name; wait, steer it, or stop it);
+		//  - the record is a leftover from a previous process → the queue is gone and it
+		//    can never start, so `resume`/`continue` must get the "re-dispatch it"
+		//    message instead of a `NAME_TAKEN` that implies something is running.
+		// That second branch is what keeps I-O3's promise and lets a caller relaunch
+		// the same name after a restart.
+		const queuedHere = this.children.get(name)?.state === "queued";
+		if (queuedHere || this.isQueuedHere(name)) {
+			if (queuedHere && !this.isQueuedHere(name)) {
+				throw new SubagentError(launchQueueLostMessage(name), ErrorCodes.BUDGET_EXCEEDED);
+			}
+			throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
+		}
 		// Only an EXPLICIT inprocess can reach this: the arbitration above already
 		// routed every omitted-mode launch that needs a worktree to rpc, so I1
 		// (explicit inprocess + worktree stays a loud throw) holds. This replaces
@@ -666,6 +861,38 @@ export class Orchestrator {
 				`spawnMode "inprocess" cannot use worktree isolation for '${name}'; set worktree: false`,
 				ErrorCodes.INVALID_PARAMS,
 			);
+		}
+		// ── Launch admission queue (issue #266, contract §4.3 frozen insertion point) ──
+		// Here and not later on purpose: the name is allocated (D4), the backend is
+		// arbitrated, `assertWithinBudgets`/`isAlive` already passed, the illegal
+		// `inprocess + worktree` combination is rejected, and **nothing has happened
+		// yet** (no worktree, no run dir, no session file, no ledger row). Enqueuing
+		// after `reserveNode` would self-lock the fanout gate on a `starting` row
+		// that belongs to a child nobody started (R3/F10).
+		const probeContext: AdmissionProbeContext = {
+			inProcess,
+			agent,
+			...(nodeId ? { nodeId } : {}),
+			ledgerPrevious,
+			utility: Boolean(input.utilityDispatch && input.agent.utility),
+		};
+		if (!internal.admissionAlreadyGranted) {
+			const verdict = this.probeAdmission(name, probeContext);
+			if (verdict.admitted === false && verdict.queueable === true) {
+				// D1: only the four queueable gates land here. Everything else falls
+				// through to master's own gate below, so its message stays byte-identical
+				// (D1-b: never re-wrap a `BUDGET_EXCEEDED` as a queue decision).
+				return this.enqueueLaunch(input, name, verdict, probeContext, mode);
+			}
+			if (verdict.admitted === true) {
+				// D2-b: reserve the slot in THIS sync block. The child does not reach the
+				// supervisor's registry until the first `await` inside `spawnChild`, so a
+				// same-tick fan-out would otherwise see 0 live children 12 times (R1).
+				this.admitting.set(name, {
+					parentKey: this.admissionParentKey(name, probeContext),
+					dimension: "fanout",
+				});
+			}
 		}
 		let worktreePath = previous?.worktreePath;
 		let worktreeBranch = previous?.worktreeBranch;
@@ -782,6 +1009,9 @@ export class Orchestrator {
 				}
 			}
 			if (!result) throw lastError ?? new SubagentError("RPC child start failed", ErrorCodes.START_FAILED);
+			// The child is in the supervisor's registry now, so the advisory in-flight
+			// reservation is superseded by the real counts (D2-b).
+			this.admitting.delete(name);
 			if (previous) {
 				previous.state = "working";
 				previous.spawnedAt = new Date(this.now()).toISOString();
@@ -822,6 +1052,7 @@ export class Orchestrator {
 				...(result.pid ? { pid: result.pid } : {}),
 			};
 		} catch (error) {
+			this.admitting.delete(name);
 			if (spawned) await this.supervisor.retire(name).catch(() => {});
 			if (reserved && nodeId) this.rollbackReservation(nodeId, reservedNode);
 			if (parentReservationCreated && this.legion?.runStore) {
@@ -840,13 +1071,777 @@ export class Orchestrator {
 		model?: string;
 		origin: ModelOrigin;
 		thinking?: string | false;
-	}): Array<string | undefined> {
-		const requested = modelCandidates(input.model ?? input.agent.model, input.agent.fallbackModels);
+	}): Array<string | undefined> {		const requested = modelCandidates(input.model ?? input.agent.model, input.agent.fallbackModels);
 		// Every candidate now belongs to the one supported kind, so the model the
 		// caller asked for is the model the child starts with; an unset model is
 		// the only case that leaves the choice to the child's own configuration.
 		const candidates = requested.filter((model): model is string => Boolean(model));
 		return candidates.length ? candidates : [undefined];
+	}
+
+	// ── Launch admission queue (issue #266) ─────────────────────────────────
+
+	/**
+	 * `maxChildrenPerNode` groups children by the name before the last dot — the
+	 * exact key `InProcessSupervisor` uses (`parentKeyOf`), so the probe and the
+	 * authoritative gate count the same siblings.
+	 */
+	private admissionParentKey(name: string, ctx: AdmissionProbeContext): string {
+		const probe = ctx.inProcess ? inProcessProbeOf(this.supervisor) : undefined;
+		if (probe) return probe.admissionCounts(name).parentKey;
+		const idx = name.lastIndexOf(".");
+		return idx === -1 ? "" : name.slice(0, idx);
+	}
+
+	/**
+	 * D2-b: in-flight reservations attributable to one parent key.
+	 *
+	 * A reservation must only cover the window in which the backend cannot see the
+	 * child yet. That window is narrow and backend-specific: the in-process
+	 * supervisor registers a child **synchronously** inside `spawnChild`, and the
+	 * legion path inserts its `starting` row synchronously inside `reserveNode`. Once
+	 * either has happened the real counts already include the launch, so counting the
+	 * reservation too would double it and halve the effective cap (measured: a
+	 * 9-launch same-tick fan-out with `maxChildrenPerNode: 8` admitted only 4).
+	 */
+	private inflightFor(parentKey: string, ctx?: AdmissionProbeContext): { fanout: number; active: number } {
+		let fanout = 0;
+		let active = 0;
+		for (const [name, entry] of this.admitting) {
+			if (this.launchAlreadyVisible(name, ctx)) continue;
+			active += 1;
+			if (entry.parentKey === parentKey) fanout += 1;
+		}
+		return { fanout, active };
+	}
+
+	/** Has the backend registered this in-flight launch yet? */
+	private launchAlreadyVisible(name: string, ctx?: AdmissionProbeContext): boolean {
+		const record = this.children.get(name);
+		if (record && record.state !== "queued") return true;
+		if (this.supervisor.isAlive(name)) return true;
+		const legion = this.legion;
+		if (!ctx?.nodeId || !legion) return false;
+		// `reserveNode` inserts the row before the awaited `persistParentReservation`,
+		// so an existing row means the ledger counts this launch already.
+		return getNode(legion.db, ctx.nodeId) !== null;
+	}
+
+	/**
+	 * The advisory admission probe (contract §4.3, I-O1).
+	 *
+	 * Synchronous on purpose: the fast path may not gain a single `await` (D2-b /
+	 * A21). `admissionCounts` and `checkLaunchBudget` are both plain reads.
+	 *
+	 * Nothing here replaces an authoritative gate: an `admitted: true` verdict only
+	 * skips the *queue*, never `assertWithinLimits` / `withLaunchBudget` (I-O1). A
+	 * launch that still loses the real gate is re-queued instead of failing (D2-c).
+	 */
+	private probeAdmission(name: string, ctx: AdmissionProbeContext): AdmissionVerdict {
+		if (ctx.inProcess) {
+			const probe = inProcessProbeOf(this.supervisor);
+			// No readable counts (a test double) → nothing to probe.
+			if (!probe) return { admitted: true };
+			const counts = probe.admissionCounts(name);
+			return evaluateInProcessAdmission(counts, this.inflightFor(counts.parentKey, ctx));
+		}
+		// rpc/legion: the ledger gate. Read-only (`checkLaunchBudget`), never
+		// `withLaunchBudget` — a probe must not insert a `starting` row (R3/F10) and
+		// must not emit `budget_refused`, which belongs to `reserveNode` (D1-b).
+		const legion = this.legion;
+		if (!legion || !ctx.nodeId) return { admitted: true };
+		const parent = getNode(legion.db, legion.nodeId);
+		// `reserveNode` owns `parent_not_found`; do not pre-empt it.
+		if (!parent) return { admitted: true };
+		const maxChildren = legion.settings?.maxChildrenPerNode ?? 8;
+		const depthCeiling = ctx.utility
+			? parent.depth + 1
+			: Math.min(legion.settings?.maxDepth ?? this.maxDepthValue, MAX_NESTED_PATH_ENTRIES);
+		const maxActiveNodes = legion.settings?.maxActiveNodes ?? 30;
+		const decision = checkLaunchBudget(
+			legion.db,
+			{ parentId: legion.nodeId, depth: parent.depth + 1, nodeId: ctx.nodeId },
+			{ limits: { maxDepth: depthCeiling, maxChildrenPerNode: maxChildren, maxActiveNodes } },
+		);
+		if (decision.allowed) return { admitted: true };
+		// D2-b: the ledger snapshot cannot see the rows this tick has not inserted
+		// yet, so the in-flight reservations are added before judging.
+		const inflight = this.inflightFor("", ctx);
+		if (decision.reason === "max_children_per_node") {
+			const children = decision.children + inflight.fanout;
+			if (maxChildren === 0) {
+				// D11: `0` means "no children at all" — waiting cannot satisfy it.
+				return {
+					admitted: false,
+					queueable: false,
+					gate: "ledger.maxChildrenPerNode.disabled",
+					message: `legion launch refused (max_children_per_node): parent already has ${children} live children; maxChildrenPerNode is 0`,
+				};
+			}
+			if (children >= maxChildren) {
+				return {
+					admitted: false,
+					queueable: true,
+					gate: "ledger.maxChildrenPerNode",
+					dimension: "fanout",
+					message: `legion launch refused (max_children_per_node): parent already has ${children} live children; maxChildrenPerNode is ${maxChildren}`,
+				};
+			}
+			return { admitted: true };
+		}
+		if (decision.reason === "max_active_nodes") {
+			const activeNodes = decision.activeNodes + inflight.active;
+			if (activeNodes >= maxActiveNodes) {
+				return {
+					admitted: false,
+					queueable: true,
+					gate: "ledger.maxActiveNodes",
+					dimension: "active",
+					message: `legion launch refused (max_active_nodes): tree already has ${activeNodes} active nodes; maxActiveNodes is ${maxActiveNodes}`,
+				};
+			}
+			return { admitted: true };
+		}
+		// `max_depth` / `parent_not_found`: permanent, never queued (D1).
+		return { admitted: true };
+	}
+
+	/**
+	 * The process-level queue for this run directory (§13.6 / I-O6).
+	 *
+	 * `acquireAdmissionQueue` is idempotent per (pid, runDir), so the five
+	 * `new Orchestrator` sites in `index.ts` share one queue — that is what lets
+	 * `subagent({action:"stop"})` dequeue an item it never enqueued.
+	 */
+	private admissionQueue(): AdmissionQueue<LaunchQueuePayload> {
+		this.admissionQueueRef ??= acquireAdmissionQueue<LaunchQueuePayload>(this.runDir, {
+			...this.launchQueueBounds,
+			now: this.now,
+		});
+		return this.admissionQueueRef;
+	}
+
+	/**
+	 * The queue **if one already exists**, without creating it.
+	 *
+	 * The read-only and control paths must not acquire: acquisition installs an
+	 * empty queue with default bounds, and "first acquisition wins" would then
+	 * shadow the real owner's `launchQueue` settings.
+	 */
+	private existingAdmissionQueue(): AdmissionQueue<LaunchQueuePayload> | undefined {
+		// §6.1/§13.6: a control-action instance (stop/status/collect) must reach the
+		// queue a SIBLING instance created — otherwise `subagent stop <queued>` is a
+		// silent no-op and `status` reports it as "queue lost". `peek` is read-only on
+		// purpose: acquiring here would install an empty queue with default bounds and
+		// shadow the real owner's settings ("first acquisition wins").
+		return this.admissionQueueRef ?? peekAdmissionQueue<LaunchQueuePayload>(this.runDir);
+	}
+
+	/** D9: one user-visible line; a UI hook must never break admission. */
+	private notice(line: string): void {
+		const fn = this.onLaunchQueueNotice;
+		if (!fn) return;
+		try {
+			fn(line);
+		} catch {
+			/* the notice is cosmetic */
+		}
+	}
+
+	/**
+	 * D3/D3-a: enqueue a launch that only hit a *queueable* gate.
+	 *
+	 * The three "must not create" rules hold here (asserted by A3/A15): no ledger
+	 * `nodes` row, no child run directory / `run.json`, no `<name>.jsonl` file.
+	 * `sessionFile` is a placeholder string and `nodeId` is the deterministic id
+	 * the later admission will use — computed, never inserted.
+	 */
+	private enqueueLaunch(
+		input: LaunchInput,
+		name: string,
+		verdict: Extract<AdmissionVerdict, { queueable: true }>,
+		ctx: AdmissionProbeContext,
+		mode: SpawnMode,
+	): Promise<Handle> {
+		const queue = this.admissionQueue();
+		const parentKey = this.admissionParentKey(name, ctx);
+		let settle: (outcome: AdmitOutcome) => void = () => {};
+		const settled = new Promise<AdmitOutcome>((resolve) => {
+			settle = resolve;
+		});
+		const parentDepth = inProcessDepth();
+		const parentContext = currentChildContext();
+		const payload: LaunchQueuePayload = {
+			name,
+			parentKey,
+			inProcess: ctx.inProcess,
+			parentDepth,
+			...(parentContext ? { parentContext } : {}),
+			run: () => this.launch({ ...input, name }, { admissionAlreadyGranted: true }),
+			settled,
+		};
+		const outcome = queue.enqueue(payload, { name, parentKey });
+		if (!outcome.ok) {
+			// D6: overflow refuses immediately — nothing enqueued, nothing recorded,
+			// and any name reservation released.
+			this.children.delete(name);
+			throw new SubagentError(outcome.message, ErrorCodes.BUDGET_EXCEEDED);
+		}
+		// D3-a: one `queued` record in the parent run.json (cross-process `status`
+		// must show it, D9), and nothing else is created.
+		const child: ChildRecord = {
+			name,
+			...(ctx.nodeId ? { nodeId: ctx.nodeId } : {}),
+			sessionFile: this.sessionFileFor(name),
+			ownerToken: ownerToken(),
+			state: "queued",
+			spawnedAt: new Date(this.now()).toISOString(),
+			agent: input.agent.name,
+			kind: input.agent.kind,
+			spawnMode: mode,
+			queuePosition: outcome.position,
+		};
+		this.children.set(name, child);
+		this.onChildUpdate(child);
+		this.launchGuards.set(name, {
+			settle,
+			settled,
+			probe: () => this.probeAdmission(name, ctx),
+			dimension: verdict.dimension,
+			enqueuedAt: this.now(),
+		});
+		this.watchSlotReleases(true);
+		this.notice(`▶ ${name} (${input.agent.name}) supervisor=${mode} queued(${outcome.position})`);
+		// D2-d-1: this enqueue may itself have a free slot behind it.
+		this.schedulePump();
+		// D8: `async` semantics are unchanged — a queued handle returns at once.
+		return Promise.resolve({
+			name,
+			sessionFile: child.sessionFile,
+			runId: path.basename(this.runDir),
+			agent: input.agent.name,
+			kind: input.agent.kind,
+			child,
+			spawnMode: mode,
+			queued: true,
+			queuePosition: outcome.position,
+		});
+	}
+
+	/**
+	 * D2-d: wake the pump. `pumping` makes overlapping wakes harmless.
+	 *
+	 * Guarded on owning at least one launch: the queue is process-level and shared
+	 * by every Orchestrator on this run dir (`index.ts` has five construction
+	 * sites), but only the instance that enqueued an item holds its `LaunchQueuePayload`
+	 * — the closure that actually performs the launch. An instance with no guards is
+	 * a control-action instance (`stop`/`status`/`collect`); letting it pump would
+	 * admit a sibling's items through a probe that cannot judge them, which is how
+	 * retired unrelated children used to spawn somebody else's queued work and
+	 * reproduce the very `maxChildrenPerNode reached` line #266 removes.
+	 */
+	private schedulePump(): void {
+		if (this.launchGuards.size === 0) return;
+		void this.pumpAdmissions();
+	}
+
+	/**
+	 * D2-d-2: subscribe to in-process slot releases only while this instance owns a
+	 * non-empty queue, and drop the subscription as soon as it empties.
+	 *
+	 * The event source is a process-level broadcast (`routing-supervisor.ts`): the
+	 * Orchestrator need not own the supervisor, and `index.ts` hands the same
+	 * `RoutingSupervisor` to five different Orchestrator instances.
+	 */
+	private watchSlotReleases(wanted: boolean): void {
+		if (wanted && !this.unsubscribeSlotReleases) {
+			this.unsubscribeSlotReleases = subscribeInProcessSlotReleases(() => this.schedulePump());
+			return;
+		}
+		if (!wanted && this.unsubscribeSlotReleases) {
+			this.unsubscribeSlotReleases();
+			this.unsubscribeSlotReleases = undefined;
+		}
+	}
+
+	/**
+	 * D2-d-4: exactly one unref'd fallback timer while the queue is non-empty.
+	 *
+	 * A ledger slot can also be freed by *another* process (a sibling session, or
+	 * hygiene) and that release sends no event here (§11 R2), so event edges alone
+	 * would stall the queue. The deadline is capped by `LAUNCH_QUEUE_RECHECK_MS`
+	 * inside `nextDeadlineAt()` and the timer is cleared once the queue empties.
+	 *
+	 * The callback is fully guarded: `pumpAdmissions` never rejects, and a throwing
+	 * timer body would surface as an unhandledRejection long after the instance was
+	 * abandoned (see `pumpAdmissions`).
+	 */
+	private armQueueWatchdog(): void {
+		if (this.queueWatchdog) {
+			clearTimeout(this.queueWatchdog);
+			this.queueWatchdog = undefined;
+		}
+		const queue = this.admissionQueueRef;
+		if (!queue || queue.size === 0) return;
+		let deadline: number | undefined;
+		try {
+			deadline = queue.nextDeadlineAt();
+		} catch {
+			// A queue we cannot even read is a queue we must stop watching.
+			this.abandonLaunchQueue();
+			return;
+		}
+		if (deadline === undefined) return;
+		const timer = setTimeout(() => {
+			this.queueWatchdog = undefined;
+			try {
+				void this.pumpAdmissions();
+			} catch {
+				// `pumpAdmissions` is written not to throw; this is belt-and-braces so a
+			// timer can never become an unhandledRejection/uncaughtException.
+				this.abandonLaunchQueue();
+			}
+		}, Math.max(0, deadline - this.now()));
+		// Never keep the host process alive just to watch an empty queue.
+		timer.unref?.();
+		this.queueWatchdog = timer;
+	}
+
+	/**
+	 * Stop being a queue owner.
+	 *
+	 * Used when this instance can no longer serve the queue: its clock/db can no
+	 * longer be probed (a disposed Orchestrator, e.g. one created per control action
+	 * and then dropped). The registry entry is deliberately left in place — another
+	 * live Orchestrator on the same run directory may still own it — but this
+	 * instance stops pumping, stops its timer and releases its slot listeners.
+	 */
+	private abandonLaunchQueue(): void {
+		if (this.queueWatchdog) {
+			clearTimeout(this.queueWatchdog);
+			this.queueWatchdog = undefined;
+		}
+		this.watchSlotReleases(false);
+		this.admissionQueueRef = undefined;
+	}
+
+	/**
+	 * Admit whatever the queue allows right now (contract §4 / D2-c / D2-d).
+	 *
+	 * Mutually exclusive via `pumping`. Every iteration asks the queue for its next
+	 * decision, which is the ONE place a timeout is evaluated (R7): an item under
+	 * admission has already left the queue and can never expire underneath the
+	 * child it spawned.
+	 *
+	 * **Never rejects.** Every caller is fire-and-forget (`void this.pump…`), so a
+	 * throw here would become an `unhandledRejection` attributed to whatever the
+	 * event loop is doing — typically `database is not open` after a test disposed
+	 * its fixture. A probe that throws means this instance can no longer judge
+	 * admission at all, so the affected items are retired as *lost* (I-O3 wording;
+	 * they never started and nothing was reserved) and the instance goes inert.
+	 */
+	private async pumpAdmissions(): Promise<void> {
+		if (this.pumping) return;
+		this.pumping = true;
+		let probeFailed = false;
+		try {
+			const queue = this.admissionQueue();
+			for (;;) {
+				const lost: string[] = [];
+				const next = queue.next((item) => {
+					const guard = this.launchGuards.get(item.name);
+					if (!guard) {
+						// The queue is process-level and shared, but only the instance that
+						// enqueued an item holds the payload that performs its launch. Admitting
+						// somebody else's item here would run a spawn this instance cannot judge
+						// (and could not record) — the pre-review code fell back to
+						// `{admitted:true}` and did exactly that.
+						//
+						// Skipping is safe and is NOT a lost item: `next()` moves on to the
+						// next candidate (D5-2), the owner's own pump admits it, and if no owner
+						// is left the queue's deadline expires it (D6) through the watchdog.
+						return { admitted: false, queueable: false, gate: "other", message: "" };
+					}
+					try {
+						return guard.probe();
+					} catch {
+						// I-O3: nothing was reserved for this item, so “lost” is the truthful
+						// outcome — never a rejection into an abandoned async frame.
+						lost.push(item.name);
+						return { admitted: false, queueable: false, gate: "other", message: "" };
+					}
+				});
+				if (lost.length > 0) {
+					probeFailed = true;
+					for (const name of lost) this.abandonQueued(name, "flushed", launchQueueLostMessage(name));
+				}
+				if (next.kind === "none") break;
+				if (next.kind === "expired") {
+					// D6: the wait ran out — retire the placeholder, tell the user, and
+					// leave the ledger untouched (nothing was ever reserved).
+					this.abandonQueued(next.item.name, "timeout", next.message);
+					continue;
+				}
+				try {
+					await this.admitQueued(next.item, next.waitedMs);
+				} catch (error) {
+					// A genuine launch failure: the enqueue-time `launch()` promise has
+					// already been returned to the caller, so surface it once and keep the
+					// pump alive for the remaining items.
+					this.onAdmissionFailure(next.item.name, error);
+				}
+			}
+		} catch {
+			// The queue itself became unreadable/closed — stop owning it rather than
+			// retrying forever from a timer.
+			probeFailed = true;
+		} finally {
+			this.pumping = false;
+			if (probeFailed || (this.admissionQueueRef?.size ?? 0) === 0) {
+				// Nothing left to admit, or this instance can no longer judge admission:
+				// leave no active timer and no slot-release listener behind.
+				this.abandonLaunchQueue();
+			} else {
+				this.armQueueWatchdog();
+			}
+		}
+	}
+
+	/** Report one admission failure without tearing down the pump. */
+	private onAdmissionFailure(name: string, error: unknown): void {
+		const detail = error instanceof Error ? error.message : String(error);
+		this.notice(`launch queue: '${name}' failed to start: ${detail}`);
+		this.launchGuards.delete(name);
+		const child = this.children.get(name);
+		if (child && child.state === "queued") {
+			child.state = "exited";
+			this.onChildUpdate(child);
+		}
+	}
+
+	/**
+	 * Take one item out of the queue and run it.
+	 *
+	 * D2-c: the probe is advisory (I-O1), so the replay can still lose the real
+	 * gate. When that refusal is attributable to a *queueable* gate, the item goes
+	 * back into the queue (keeping its original deadline) instead of failing the
+	 * launch. Anything else — a hard gate, `NAME_TAKEN`, `START_FAILED`, a genuine
+	 * spawn failure — is rethrown to the caller unchanged.
+	 */
+	private async admitQueued(item: QueuedLaunch<LaunchQueuePayload>, waitedMs: number): Promise<void> {
+		const payload = item.payload;
+		const guard = this.launchGuards.get(payload.name);
+		this.launchGuards.delete(payload.name);
+		// The placeholder is gone: from here on the real launch path owns the record.
+		this.children.delete(payload.name);
+		// D2-b: reserve the slot for the duration of the real launch.
+		this.admitting.set(payload.name, { parentKey: payload.parentKey, dimension: guard?.dimension ?? "fanout" });
+		try {
+			// A18: restore the ALS depth/identity captured at enqueue time. Without
+			// `runAtAbsoluteDepth` a grandchild admitted from the root chain would be
+			// recorded at depth 1 and `maxDepth` could never fire.
+			const handle = await runAtAbsoluteDepth(payload.parentDepth, () =>
+				payload.parentContext
+					? runInChildContext(payload.parentContext, () => payload.run())
+					: payload.run());
+			// D8/D20: the real wait, for `async:false`'s `↳ name waited Ns` line.
+			handle.child.queueWaitedMs = waitedMs;
+			handle.child.queuePosition = undefined;
+			this.onChildUpdate(handle.child);
+			this.notice(`▶ ${payload.name} started after queued ${Math.round(waitedMs / 1000)}s`);
+			guard?.settle({ kind: "admitted", waitedMs });
+		} catch (error) {
+			const again = guard?.probe() ?? ({ admitted: true } as AdmissionVerdict);
+			const attributable = again.admitted === false && again.queueable === true;
+			if (attributable && error instanceof SubagentError && error.code === ErrorCodes.BUDGET_EXCEEDED) {
+				// D2-c: requeue and do NOT pump again right away — spinning here would
+				// busy-loop while the probe and the real gate briefly disagree.
+				this.requeue(payload, guard, waitedMs);
+				return;
+			}
+			// The guard was already removed from the map, so `abandonQueued` (which
+			// looks it up again) cannot settle it — settle the local reference here or
+			// a concurrent `collect` waits on a promise nobody will ever resolve.
+			guard?.settle({
+				kind: "rejected",
+				reason: "flushed",
+				message: error instanceof Error ? error.message : String(error),
+			});
+			this.abandonQueued(payload.name, "flushed", error instanceof Error ? error.message : String(error));
+			throw error;
+		} finally {
+			this.admitting.delete(payload.name);
+		}
+	}
+
+	/**
+	 * D2-c: put a refused launch back into the queue.
+	 *
+	 * The frozen wording says "original `seq` (`enqueueWithSeq` or equivalent)". A
+	 * re-queue therefore has to preserve the **deadline**, not the position: W1's
+	 * `AdmissionQueue` assigns `seq` itself, so the item goes to the back, but its
+	 * `enqueuedAt + timeoutMs` is carried over so a launch that keeps losing the
+	 * real gate cannot reset its own timeout (R7).
+	 */
+	private requeue(payload: LaunchQueuePayload, guard: LaunchGuard | undefined, waitedMs: number): void {
+		const queue = this.admissionQueue();
+		const elapsed = guard ? this.now() - guard.enqueuedAt : waitedMs;
+		if (guard && elapsed >= queue.timeoutMs) {
+			this.abandonQueued(payload.name, "timeout", queueTimeoutMessage(payload.name, elapsed));
+			return;
+		}
+		// The wait so far, so the record's `spawnedAt` stays truthful across a requeue.
+		const carried = this.queuedPlaceholder(payload, elapsed);
+		this.children.set(payload.name, carried);
+		this.onChildUpdate(carried);
+		if (guard) this.launchGuards.set(payload.name, guard);
+		const outcome = queue.enqueue(payload, {
+			name: payload.name,
+			parentKey: payload.parentKey,
+			// D2-c: carry the ORIGINAL deadline. `seq` is deliberately fresh (the item
+			// goes to the back — D5 gives no one priority), but the wait must not
+			// restart: a fresh stamp would reset `waitedMs` to 0 (under-reporting the
+			// `async:false` "waited Ns" line) and hand the item a second full
+			// `timeoutMs`, so an item that keeps losing the admission race could wait
+			// nearly twice the configured bound before D6 fires.
+			...(guard ? { enqueuedAt: guard.enqueuedAt } : {}),
+		});
+		if (!outcome.ok) {
+			// The queue grew while this item was being admitted; overflow is still a
+			// hard refusal (D6), never an unbounded wait.
+			this.abandonQueued(payload.name, "stopped", outcome.message);
+			return;
+		}
+		carried.queuePosition = outcome.position;
+		this.onChildUpdate(carried);
+		this.armQueueWatchdog();
+	}
+
+	/** The `queued` ChildRecord for an item that (re-)entered the queue. */
+	private queuedPlaceholder(payload: LaunchQueuePayload, waitedMs: number): ChildRecord {
+		const existing = this.children.get(payload.name);
+		const base: ChildRecord = existing ?? {
+			name: payload.name,
+			sessionFile: this.sessionFileFor(payload.name),
+			ownerToken: ownerToken(),
+			state: "queued",
+			spawnedAt: new Date(this.now()).toISOString(),
+			spawnMode: payload.inProcess ? "inprocess" : "rpc",
+		};
+		return {
+			...base,
+			// `spawnedAt` is the record's creation stamp; backdating it by the wait
+			// keeps it truthful across a requeue.
+			spawnedAt: new Date(this.now() - waitedMs).toISOString(),
+			state: "queued",
+			retiredAt: undefined,
+		};
+	}
+
+	/**
+	 * D6/D7: an item left the queue without spawning (timeout / stop / flush).
+	 * The record becomes `retired`, nothing is spawned, nothing reaches the ledger.
+	 */
+	private abandonQueued(
+		name: string,
+		reason: "timeout" | "stopped" | "flushed",
+		message: string,
+	): ChildRecord | undefined {
+		const guard = this.launchGuards.get(name);
+		this.launchGuards.delete(name);
+		const child = this.children.get(name);
+		if (child && child.state === "queued") {
+			child.state = "retired";
+			child.retiredAt = new Date(this.now()).toISOString();
+			child.queuePosition = undefined;
+			this.onChildUpdate(child);
+		}
+		// `stopped` is announced by `retire()`, which owns that user-facing line, but
+		// the waiter MUST still be settled: a `collect` blocked on `settled` would
+		// otherwise hang forever after its item was stopped (D7/D8).
+		if (reason !== "stopped") this.notice(message);
+		guard?.settle({ kind: "rejected", reason, message });
+		return child?.state === "retired" ? child : undefined;
+	}
+
+	/**
+	 * D7 / A5: empty the queue without spawning anything.
+	 *
+	 * Called from the parent turn's abort path and from session shutdown. Returns
+	 * the flushed names in `seq` order so the caller can report them.
+	 */
+	flushLaunchQueue(reason: string): string[] {
+		const queue = this.existingAdmissionQueue();
+		if (this.queueWatchdog) {
+			clearTimeout(this.queueWatchdog);
+			this.queueWatchdog = undefined;
+		}
+		if (!queue) return [];
+		// The queue is shared with every other Orchestrator on this run dir, so a
+		// flush must only clear what THIS instance can finish clearing: the items it
+		// holds a guard for. Clearing a sibling's item would dequeue it without
+		// settling the owner's guard or retiring the owner's record, leaving a
+		// permanent `queued` zombie (and a `collect` that never returns). The owner's
+		// own abort/flush path — or the D6 deadline — retires its items.
+		const mine = queue.entries().filter((entry) => this.launchGuards.has(entry.name)).map((entry) => entry.name);
+		if (mine.length === 0) return [];
+		const removed = new Set<string>();
+		for (const name of mine) {
+			if (queue.remove(name)) removed.add(name);
+		}
+		const names: string[] = [];
+		for (const item of queue.entries()) {
+			// `entries()` is re-read below only to keep `seq` order for `removed`.
+			void item;
+		}
+		for (const name of mine) {
+			if (!removed.has(name)) continue;
+			const child = this.children.get(name);
+			if (child && child.state === "queued") {
+				child.state = "retired";
+				child.retiredAt = new Date(this.now()).toISOString();
+				child.queuePosition = undefined;
+				this.onChildUpdate(child);
+			}
+			const guard = this.launchGuards.get(name);
+			this.launchGuards.delete(name);
+			guard?.settle({ kind: "rejected", reason: "flushed", message: `launch queue flushed (${reason})` });
+			this.notice(`launch queue flushed: ${name} (${reason})`);
+			names.push(name);
+		}
+		return names;
+	}
+
+	/** D9: read-only snapshot of the queue (shared across instances via the registry). */
+	launchQueueEntries(): readonly AdmissionQueueEntry[] {
+		return this.existingAdmissionQueue()?.entries() ?? [];
+	}
+
+	/** D8: is `name` still waiting in a live queue of this process? */
+	private isQueuedHere(name: string): boolean {
+		const queue = this.existingAdmissionQueue();
+		return queue !== undefined && queue.positionOf(name) !== undefined;
+	}
+
+	/**
+	 * I-O3: `queued` records that need a spawned child.
+	 *
+	 * A record left over from a previous process can never become live again — the
+	 * queue is in memory. Say that instead of `unknown child`, so the operator
+	 * knows to re-dispatch. `retire()` is exempt: it may clean such an orphan up.
+	 */
+	private queuedStateMessage(name: string): string | undefined {
+		const child = this.children.get(name);
+		if (!child || child.state !== "queued") return undefined;
+		return this.isQueuedHere(name) ? queuedNotStartedMessage(name) : launchQueueLostMessage(name);
+	}
+
+	/**
+	 * D8/A12: block until a queued child leaves the queue.
+	 *
+	 * Prefers the enqueue-time `settled` promise (same Orchestrator instance). A
+	 * control-action Orchestrator owns no guard, so it polls the record instead —
+	 * never `parseSessionFile` / `waitSettled` on the placeholder path (D8), which
+	 * would spin on a file that does not exist and report a fake result.
+	 */
+	private async waitForAdmission(
+		child: ChildRecord,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<AdmitOutcome> {
+		const direct = this.launchGuards.get(child.name)?.settled;
+		if (direct) {
+			// The reservation has not started yet: keep the record truthful while we
+			// wait, so a concurrent `status` reads the position, not `launching`.
+			//
+			// The bare await is NOT enough: `collect(name, { signal })` is a published
+			// contract and every other branch of `collect` honours `signal`/deadline.
+			// Admission may take the whole `launchQueueTimeoutMs` (15 min), so an abort
+			// must be able to end this wait — otherwise `async:false` keeps the parent
+			// turn blocked long after the caller gave up.
+			return await this.waitForAdmissionOutcome(child, direct, timeoutMs, signal);
+		}
+		const deadline = this.now() + timeoutMs;
+		for (;;) {
+			if (signal?.aborted) {
+				return {
+					kind: "rejected",
+					reason: "stopped",
+					message: `aborted by parent while queued: '${child.name}'`,
+				};
+			}
+			if (child.state !== "queued") {
+				return { kind: "admitted", waitedMs: child.queueWaitedMs ?? 0 };
+			}
+			const remaining = deadline - this.now();
+			if (remaining <= 0) {
+				return {
+					kind: "rejected",
+					reason: "timeout",
+					message: queueTimeoutMessage(child.name, this.now() - this.enqueuedAtFor(child.name)),
+				};
+			}
+			if (await this.sleepOrAbort(Math.min(POLL_INTERVAL_MS, remaining), signal)) continue;
+		}
+	}
+
+	/**
+	 * Race an enqueue-time `settled` promise against abort and the local deadline.
+	 *
+	 * `settled` resolves at most once and has no cleanup, so losing the race is
+	 * harmless: a later admission still settles it, and nothing here mutates the
+	 * queue. The loser is left pending on purpose — cancelling it would have to
+	 * dequeue the item, which is `stop`'s job, not `collect`'s.
+	 */
+	private async waitForAdmissionOutcome(
+		child: ChildRecord,
+		settled: Promise<AdmitOutcome>,
+		timeoutMs: number,
+		signal?: AbortSignal,
+	): Promise<AdmitOutcome> {
+		const aborted: AdmitOutcome = {
+			kind: "rejected",
+			reason: "stopped",
+			message: `aborted by parent while queued: '${child.name}'`,
+		};
+		if (signal?.aborted) return aborted;
+		const deadline = this.now() + timeoutMs;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		try {
+			return await new Promise<AdmitOutcome>((resolve) => {
+				const finish = (outcome: AdmitOutcome): void => {
+					if (timer !== undefined) clearTimeout(timer);
+					if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+					resolve(outcome);
+				};
+				void settled.then(finish, () =>
+					finish({ kind: "rejected", reason: "flushed", message: `launch queue lost: '${child.name}'` }));
+				timer = setTimeout(() => {
+					finish({
+						kind: "rejected",
+						reason: "timeout",
+						message: queueTimeoutMessage(child.name, this.now() - this.enqueuedAtFor(child.name)),
+					});
+				}, Math.max(1, deadline - this.now()));
+				timer.unref?.();
+				if (signal) {
+					onAbort = () => finish(aborted);
+					signal.addEventListener("abort", onAbort, { once: true });
+				}
+			});
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+			if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+		}
+	}
+
+	/** Enqueue timestamp of a live queue item, for the timeout wording. */
+	private enqueuedAtFor(name: string): number {
+		const guard = this.launchGuards.get(name);
+		if (guard) return guard.enqueuedAt;
+		const waited = this.existingAdmissionQueue()?.waitedMs(name);
+		return waited === undefined ? this.now() : this.now() - waited;
 	}
 
 	private assertWithinBudgets(existingChild = false): void {
@@ -928,6 +1923,7 @@ export class Orchestrator {
 
 	async steer(name: string, text: string): Promise<void> {
 		const child = this.requireChild(name);
+		this.refuseQueuedControl(name);
 		await this.supervisor.steer(name, text);
 		this.emitProcess("node_steered", child.nodeId ?? name, { name, text });
 		this.clearBlocked(child);
@@ -935,14 +1931,26 @@ export class Orchestrator {
 
 	async followUp(name: string, text: string): Promise<void> {
 		const child = this.requireChild(name);
+		this.refuseQueuedControl(name);
 		await this.supervisor.followUp(name, text);
 		this.clearBlocked(child);
 	}
 
 	async abort(name: string): Promise<void> {
 		const child = this.requireChild(name);
+		this.refuseQueuedControl(name);
 		await this.supervisor.abort(name);
 		this.emitProcess("node_aborted", child.nodeId ?? name, { name });
+	}
+
+	/**
+	 * I-O3: `steer`/`followUp`/`abort` need a spawned child. A queued one has no
+	 * process and no session, so say why instead of letting the supervisor answer
+	 * `unknown child` (or, worse, address a placeholder path).
+	 */
+	private refuseQueuedControl(name: string): void {
+		const message = this.queuedStateMessage(name);
+		if (message) throw new SubagentError(message, ErrorCodes.BUDGET_EXCEEDED);
 	}
 
 	private requireChild(name: string): ChildRecord {
@@ -979,11 +1987,32 @@ export class Orchestrator {
 	}
 
 	async collect(name: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<CollectResult> {
-		const child = this.requireChild(name);
+		let child = this.requireChild(name);
+		const timeoutMs = opts.timeoutMs ?? DEFAULTS.turnTimeoutMs;
+		// D8/A12: a queued child has no session yet. Block until it is admitted
+		// (then fall through to the normal path) or until it leaves the queue
+		// without starting (timeout / stop / flush) — never `parseSessionFile` or
+		// `waitSettled` on the placeholder path, which would spin on a file that
+		// does not exist and report a fake outcome.
+		if (child.state === "queued") {
+			// I-O3: a `queued` record whose item is not in this process's queue is an
+			// orphan from a previous process — it can never start, so say that rather
+			// than waiting for a timeout that would hide the real reason.
+			if (!this.isQueuedHere(name)) throw new SubagentError(launchQueueLostMessage(name), ErrorCodes.BUDGET_EXCEEDED);
+			const admission = await this.waitForAdmission(child, timeoutMs, opts.signal);
+			if (admission.kind === "rejected") {
+				throw new SubagentError(admission.message, ErrorCodes.BUDGET_EXCEEDED);
+			}
+			// Admission REPLACES the placeholder record (`admitQueued` deletes it and
+			// the real launch registers a new one). Reading further through the old
+			// object would use its placeholder `sessionFile` — which for the legion
+			// path is a DIFFERENT file than the spawned child's run-dir transcript, so
+			// the outcome would be derived from a file nobody ever wrote.
+			child = this.requireChild(name);
+		}
 		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(child.sessionFile));
 		if (opts.signal?.aborted) return abortedSnapshot();
 		if (this.pendingDialogs(name).length) return this.blockedResult(child);
-		const timeoutMs = opts.timeoutMs ?? DEFAULTS.turnTimeoutMs;
 		let deadline = this.now() + timeoutMs;
 		const initial = parseSessionFile(child.sessionFile);
 		// A connection blip writes stopReason "error" before the client retries.
@@ -1342,6 +2371,27 @@ export class Orchestrator {
 		const child = this.requireChild(name);
 		if (opts?.cause === "session-shutdown") this.parentShutdownRetire.add(name);
 		if (child.state === "retired") return child;
+		if (child.state === "queued") {
+			// D7: stopping a queued item is a pure dequeue — no spawn, no ledger row.
+			// I-O3: an orphaned `queued` record from a previous process is retired the
+			// same way; there is no queue entry left to remove.
+			const queuedAt = this.enqueuedAtFor(name);
+			this.existingAdmissionQueue()?.remove(name);
+			this.abandonQueued(
+				name,
+				"stopped",
+				`launch queue stopped ('${name}') after waiting ${Math.round((this.now() - queuedAt) / 1000)}s`,
+			);
+			child.state = "retired";
+			child.retiredAt ??= new Date(this.now()).toISOString();
+			child.queuePosition = undefined;
+			this.onChildUpdate(child);
+			this.emitProcess("node_retired", child.nodeId ?? name, { name });
+			this.notice(`launch queue stopped: ${name}`);
+			// D2-d-3: a dequeue can also free the *queue slot* the next item needed.
+			this.schedulePump();
+			return child;
+		}
 		const sessionExists = fs.existsSync(child.sessionFile);
 		const parsed = sessionExists ? parseSessionFile(child.sessionFile) : emptyParsedSession();
 		if (!child.execution && sessionExists) child.execution = deriveOutcome(parsed);
@@ -1370,6 +2420,11 @@ export class Orchestrator {
 		child.retiredAt = new Date(this.now()).toISOString();
 		this.emitProcess("node_retired", child.nodeId ?? name, { name });
 		this.onChildUpdate(child);
+		// D2-d-3: retiring a child frees a slot. The in-process backend also emits
+		// `onSlotReleased`, but that hook is wired by the supervisor's owner and the
+		// rpc path emits nothing at all — so the orchestrator wakes its own pump on
+		// the edge it just observed. `pumping` makes the duplicate wake harmless.
+		this.schedulePump();
 		return child;
 	}
 

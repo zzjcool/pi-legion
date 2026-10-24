@@ -209,6 +209,8 @@ export interface ModelScopeViolation {
 
 /** Lifecycle state. Independent of execution outcome. */
 export type TaskState =
+	/** D3: name allocated, no ledger row and no session file yet (launch queue). */
+	| "queued"
 	| "launching"
 	| "working"
 	| "awaiting"
@@ -352,6 +354,10 @@ export interface ChildRecord {
 	 * unknown, never guess a backend.
 	 */
 	spawnMode?: SpawnMode;
+	/** D4: 1-based queue position at the moment of enqueue; cleared once admitted. */
+	queuePosition?: number;
+	/** D6/D8: actual queue wait in ms (written on admission; absent when never queued). */
+	queueWaitedMs?: number;
 }
 
 export interface RunRecord {
@@ -497,6 +503,14 @@ export interface Handle {
 	 * children have no pid of their own — they share this process.
 	 */
 	pid?: number;
+	/**
+	 * D4: this launch is still in the queue and has not spawned.
+	 * `child.state === "queued"`, `sessionFile` is a placeholder path, and
+	 * `pid` is necessarily absent.
+	 */
+	queued?: boolean;
+	/** D4: 1-based queue position at enqueue time (always set when `queued === true`). */
+	queuePosition?: number;
 }
 
 // =============================================================================
@@ -613,6 +627,10 @@ export interface InProcessLimits {
 	maxActive?: number;
 	maxChildrenPerNode?: number;
 	waitTimeoutMs?: number;
+	/** D10: queued-launch cap (`positiveInt`, default 32; 0 is invalid). */
+	maxQueuedLaunches?: number;
+	/** D10: longest wait for one queued launch in ms (`positiveInt`, default 900000). */
+	launchQueueTimeoutMs?: number;
 }
 
 /**

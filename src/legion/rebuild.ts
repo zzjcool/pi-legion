@@ -305,6 +305,7 @@ function collectSources(
 		for (const child of run.children) {
 			try {
 				const childSource = sourceFromChild(currentId, child, file, run, clock);
+				if (!childSource) continue;
 				const nestedRun = runs.find((entry) => nodeIdFromPath(entry.run.path) === childSource.id);
 				if (nestedRun) {
 					childSource.runId = nestedRun.run.runId;
@@ -336,7 +337,12 @@ function sourceFromChild(
 	runFile: string,
 	parentRun: RunRecord,
 	clock: () => number,
-): NodeSource {
+): NodeSource | undefined {
+	// #266 D3/§4.4: a `queued` child was never started — it has no ledger row, no
+	// run directory and only a placeholder session path. Rebuilding it into the
+	// tree would invent a node (and a phantom leaf) for a launch that may still be
+	// waiting or may have been dropped with the previous process.
+	if (child.state === "queued") return undefined;
 	const slug = sanitizeNodeSlug(child.name);
 	const id = nodeIdForChild(parentId, slug);
 	let status: NodeSource["status"] = "settled";

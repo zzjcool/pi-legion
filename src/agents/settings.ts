@@ -533,6 +533,21 @@ function parseInProcessLimits(
 		filePath,
 	);
 	if (waitTimeoutMs !== undefined) out.waitTimeoutMs = waitTimeoutMs;
+	// D10: launch-admission-queue bounds. `positiveInt` on purpose — 0 is
+	// invalid, not "queue disabled" (that would silently swallow every queue).
+	// Defaults live in `src/supervisor/admission-queue.ts` (single source).
+	const maxQueuedLaunches = positiveInt(
+		value.maxQueuedLaunches,
+		"inprocess.maxQueuedLaunches",
+		filePath,
+	);
+	if (maxQueuedLaunches !== undefined) out.maxQueuedLaunches = maxQueuedLaunches;
+	const launchQueueTimeoutMs = positiveInt(
+		value.launchQueueTimeoutMs,
+		"inprocess.launchQueueTimeoutMs",
+		filePath,
+	);
+	if (launchQueueTimeoutMs !== undefined) out.launchQueueTimeoutMs = launchQueueTimeoutMs;
 	// Unknown keys are ignored (same as other settings blobs).
 	return out;
 }

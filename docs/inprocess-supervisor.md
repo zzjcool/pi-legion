@@ -62,9 +62,45 @@ worktree: false        # explicit inprocess + worktree: true is still refused
 | Concurrent alive | `legion.maxActiveNodes` | `inprocess.maxActive` (default **30**; **8** when the block is present without `maxActive`) |
 | Children / node | `legion.maxChildrenPerNode` | `inprocess.maxChildrenPerNode` (default **8**) |
 | Wait timeout | agent `timeoutMs` / wait default | `inprocess.waitTimeoutMs` (no default) |
+| Queue depth | `inprocess.maxQueuedLaunches` (shared by both paths) | `inprocess.maxQueuedLaunches` (default **32**) |
+| Queue wait | `inprocess.launchQueueTimeoutMs` (shared by both paths) | `inprocess.launchQueueTimeoutMs` (default **900000** = 15 min) |
 
 Never fall back across columns: in-process limits are read from
 `subagents.inprocess.*` only, never from the `legion.*` keys.
+
+### Launch admission queue (#266)
+
+A launch that hits a **queueable** gate waits in an in-memory queue instead of
+throwing `BUDGET_EXCEEDED`, and is admitted automatically when a slot frees. The
+caller gets `▶ scout-7 (scout) supervisor=inprocess queued(3)` back immediately
+and treats the work as dispatched.
+
+| Gate | Queued? | Why |
+|---|---|---|
+| `inprocess.maxChildrenPerNode` | ✅ | pure concurrency: the slot always frees |
+| `inprocess.maxActive` | ✅ | same |
+| `legion.maxChildrenPerNode` (`max_children_per_node`) | ✅ | same, RPC path |
+| `legion.maxActiveNodes` (`max_active_nodes`) | ✅ | same, RPC path |
+| `maxDepth` / `maxSpawnsPerSession` / ledger `max_depth` | ❌ | waiting cannot satisfy them; a queue would disguise a permanent failure as a 15-minute delay |
+| `maxChildrenPerNode: 0` | ❌ | 0 means "no children at all" — impossible to satisfy |
+| `parent_not_found`, memory gate, `NAME_TAKEN`, unknown/disabled role, `inprocess`+`worktree`, model scope | ❌ | not a concurrency gate |
+
+The two queue bounds are **shared** by both backends on purpose: one scheduler,
+not one per spawn mode. Overflow is an immediate hard refusal
+(`launch queue overflow (32/32)`), a timeout is reported as
+`launch queue timed out after Ns ('<name>')`, and **neither ever creates a
+ledger row, a run directory, a worktree or a session file** — a queued launch has
+reserved nothing yet.
+
+Admission is event-driven (a child reaching `retired`/`exited` frees its slot)
+with one `unref`'d fallback recheck, because the ledger can also be freed by
+another process. An `idle` child (turn ended, not yet collected) **still holds
+its slot**, exactly as before.
+
+Known limit: the queue is in memory, so a process restart drops it. The leftover
+`queued` records in `run.json` are inert — `collect`/`steer` on one says
+`never started: the launch queue was lost …` instead of `unknown child`, and
+`stop` cleans it up.
 
 Omitting an `inprocess.*` key is **not** unlimited. The documented defaults
 mirror `legion.*`, so a deployment with no `subagents.inprocess` block at all

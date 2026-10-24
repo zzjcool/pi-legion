@@ -42,6 +42,11 @@ import {
 	InMemoryUIProxy,
 	type UIProxy,
 } from "./ui-proxy.ts";
+import {
+	type AdmissionVerdict,
+	evaluateInProcessAdmission,
+	type InProcessAdmissionCounts,
+} from "./admission-queue.ts";
 import type {
 	ChildHandle,
 	EventSubscriptionOptions,
@@ -192,6 +197,23 @@ function resolveInProcessSystemPrompt(input: InProcessSessionFactoryInput): {
 	return { text, mode };
 }
 
+/**
+ * D2/§13.1: a child left the live set, so one admission slot came free.
+ *
+ * F9/§13.5 is the reason the state is a two-value closed set: `agent_settled`
+ * moves a child to `idle`, and `idle` **still holds a slot** (the `active`
+ * filter only excludes `exited`/`retired`). Emitting on `idle` would make the
+ * admission probe report free slots that the real gate refuses, i.e. admission
+ * jitter — the consumer re-queues items it just admitted.
+ */
+export interface InProcessSlotEvent {
+	readonly name: string;
+	/** Identical grouping key to assertWithinLimits' maxChildrenPerNode. */
+	readonly parentKey: string;
+	/** Only retired / exited free a slot; idle still holds one (F9). */
+	readonly state: "retired" | "exited";
+}
+
 export interface InProcessSupervisorOptions {
 	uiProxy?: UIProxy;
 	/**
@@ -222,6 +244,12 @@ export interface InProcessSupervisorOptions {
 	 * short value instead of waiting 15s.
 	 */
 	spawnStartTimeoutMs?: number;
+	/**
+	 * D2: called exactly once per child that leaves the live set — `retireChild`'s
+	 * finally, `rollbackSpawn`'s finally, and `disposeRecord` (idempotent across
+	 * all three). Deliberately NOT wired to the `idle` transition (§13.5/A19).
+	 */
+	onSlotReleased?: (event: InProcessSlotEvent) => void;
 }
 
 interface EventSubscription {
@@ -285,6 +313,13 @@ interface ChildRecord {
 	pendingFailure?: string;
 	/** Identity reused by every later dispatch into this child (tools inherit it). */
 	context: ChildLaunchContext;
+	/**
+	 * A19: an admission slot is freed exactly once per departure from the live
+	 * set. All three release points (`retireChild`, `rollbackSpawn`,
+	 * `disposeRecord`) can observe the same record, so the flag — not the call
+	 * site — is what makes `onSlotReleased` fire once.
+	 */
+	slotReleased?: boolean;
 }
 
 const COARSE_EVENT_TYPES = new Set([
@@ -592,6 +627,7 @@ export class InProcessSupervisor implements LegionSupervisor {
 	private readonly getLimits: () => InProcessLimits | undefined;
 	private readonly onSpawnRefused?: (message: string) => void;
 	private readonly onSpawnDelayed?: (message: string) => void;
+	private readonly onSlotReleased?: (event: InProcessSlotEvent) => void;
 	private readonly spawnStartTimeoutMs: number;
 	readonly uiProxy: UIProxy;
 	private spawnCount = 0;
@@ -603,6 +639,7 @@ export class InProcessSupervisor implements LegionSupervisor {
 			?? (() => options.limits);
 		this.onSpawnRefused = options.onSpawnRefused;
 		this.onSpawnDelayed = options.onSpawnDelayed;
+		this.onSlotReleased = options.onSlotReleased;
 		this.spawnStartTimeoutMs =
 			options.spawnStartTimeoutMs ?? DEFAULT_INPROCESS_SPAWN_START_TIMEOUT_MS;
 	}
@@ -1131,43 +1168,70 @@ export class InProcessSupervisor implements LegionSupervisor {
 	}
 
 	private assertWithinLimits(name: string): void {
+		// D1-a: the four gates and their four user-visible messages live in exactly
+		// one place (`evaluateInProcessAdmission`), so `admissionCounts()` /
+		// `preflightAdmission()` and this authoritative gate cannot drift apart.
+		const verdict = evaluateInProcessAdmission(this.admissionCounts(name));
+		if (verdict.admitted) return;
+		this.onSpawnRefused?.(verdict.message);
+		throw new SubagentError(verdict.message, ErrorCodes.BUDGET_EXCEEDED);
+	}
+
+	/**
+	 * Read-only count snapshot for the admission probe (§4.2, I-O1).
+	 *
+	 * The `active` / `siblings` filters are byte-identical to the ones
+	 * `assertWithinLimits` always used (F5): only `exited` / `retired` leave the
+	 * live set, so an `idle` child still holds its slot (F9, §13.5). `maxSpawns`
+	 * is passed through as-is (`undefined` when unconfigured) — the gate treats
+	 * “no limit” and “over the limit” differently.
+	 */
+	admissionCounts(name: string): InProcessAdmissionCounts {
 		const limits = this.limits();
+		const parentKey = parentKeyOf(name);
 		const active = [...this.children.values()].filter(
 			(c) => c.state !== "exited" && c.state !== "retired",
 		);
-		if (limits.maxSpawnsPerSession !== undefined && this.spawnCount >= limits.maxSpawnsPerSession) {
-			const message =
-				`inprocess spawn budget exhausted (${this.spawnCount}/${limits.maxSpawnsPerSession}); ` +
-				`raise subagents.inprocess.maxSpawnsPerSession to allow more`;
-			this.onSpawnRefused?.(message);
-			throw new SubagentError(message, ErrorCodes.BUDGET_EXCEEDED);
-		}
-		if (limits.maxActive !== undefined && active.length >= limits.maxActive) {
-			const message =
-				`inprocess maxActive reached (${active.length}/${limits.maxActive}); ` +
-				`raise subagents.inprocess.maxActive to allow more`;
-			this.onSpawnRefused?.(message);
-			throw new SubagentError(message, ErrorCodes.BUDGET_EXCEEDED);
-		}
-		const nextDepth = inProcessDepth() + 1;
-		if (limits.maxDepth !== undefined && nextDepth > limits.maxDepth) {
-			const message =
-				`inprocess nesting limit reached (depth ${inProcessDepth()}, max ${limits.maxDepth}); ` +
-				`raise subagents.inprocess.maxDepth to allow deeper nesting`;
-			this.onSpawnRefused?.(message);
-			throw new SubagentError(message, ErrorCodes.BUDGET_EXCEEDED);
-		}
-		if (limits.maxChildrenPerNode !== undefined) {
-			const parent = parentKeyOf(name);
-			const siblings = active.filter((c) => c.parentKey === parent).length;
-			if (siblings >= limits.maxChildrenPerNode) {
-				const message =
-					`inprocess maxChildrenPerNode reached for '${parent || "<root>"}' ` +
-					`(${siblings}/${limits.maxChildrenPerNode})`;
-				this.onSpawnRefused?.(message);
-				throw new SubagentError(message, ErrorCodes.BUDGET_EXCEEDED);
-			}
-		}
+		return {
+			parentKey,
+			siblings: active.filter((c) => c.parentKey === parentKey).length,
+			active: active.length,
+			spawnCount: this.spawnCount,
+			depth: inProcessDepth(),
+			limits: {
+				maxDepth: limits.maxDepth,
+				maxChildrenPerNode: limits.maxChildrenPerNode,
+				maxActive: limits.maxActive,
+				...(limits.maxSpawnsPerSession !== undefined
+					? { maxSpawnsPerSession: limits.maxSpawnsPerSession }
+					: {}),
+			},
+		};
+	}
+
+	/**
+	 * Would `name` be refused right now? Pure read: never throws, never mutates
+	 * state, never registers a child (I-O1).
+	 *
+	 * I-O1: the answer is **advisory**. Passing does not authorise a spawn —
+	 * `assertWithinLimits` stays the authority, and a caller that treats this as
+	 * permission will over-admit in the same-tick fanout (R1).
+	 */
+	preflightAdmission(name: string): AdmissionVerdict {
+		return evaluateInProcessAdmission(this.admissionCounts(name));
+	}
+
+	/**
+	 * A19: fire `onSlotReleased` at most once per child, and only for the two
+	 * states that actually free a slot (F9).
+	 */
+	private emitSlotReleased(
+		child: ChildRecord,
+		state: "retired" | "exited",
+	): void {
+		if (child.slotReleased) return;
+		child.slotReleased = true;
+		this.onSlotReleased?.({ name: child.name, parentKey: child.parentKey, state });
 	}
 
 	private dispatch(
@@ -1252,6 +1316,8 @@ export class InProcessSupervisor implements LegionSupervisor {
 			if (this.children.get(child.name) === child) {
 				this.children.delete(child.name);
 			}
+			// A19 release point 2/3: a failed spawn frees its slot immediately.
+			this.emitSlotReleased(child, "exited");
 		}
 	}
 
@@ -1428,6 +1494,8 @@ export class InProcessSupervisor implements LegionSupervisor {
 		} finally {
 			child.session = null;
 			child.state = "retired";
+			// A19 release point 1/3: retiring is the ordinary way a slot comes free.
+			this.emitSlotReleased(child, "retired");
 		}
 	}
 
@@ -1439,6 +1507,13 @@ export class InProcessSupervisor implements LegionSupervisor {
 			/* ignore */
 		}
 		this.children.delete(child.name);
+		// A19 release point 3/3: a record that is discarded while it is ALREADY
+		// retired/exited frees the same slot its own release point covered — the
+		// `slotReleased` flag makes that a no-op. A record discarded in any other
+		// state never freed a slot, so it must not emit one here either.
+		if (child.state === "retired" || child.state === "exited") {
+			this.emitSlotReleased(child, child.state);
+		}
 	}
 }
 
