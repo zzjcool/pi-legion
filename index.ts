@@ -361,7 +361,19 @@ function currentProcessSpawnMode(): SpawnMode {
 const INTERRUPTED_HEAD = "interrupted (parent turn ended; children still running)";
 
 function notice(pi: ExtensionAPI, text: string): void {
-	pi.sendMessage({ customType: SUBAGENT_NOTIFY_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+	// #273: `sendMessage` is a host ACTION and pi throws
+	// "Extension runtime not initialized. Action methods cannot be called during
+	// extension loading." if it is reached before the runtime is up. An error
+	// handler that is more fatal than the error it reports turns "a resume
+	// failed" into "the whole agent process died", which is what happened on the
+	// centurion recovery path. Degrade to stderr instead; the caller still gets
+	// the fact, and nothing crashes.
+	try {
+		pi.sendMessage({ customType: SUBAGENT_NOTIFY_TYPE, content: text, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+	} catch (error) {
+		const reason = error instanceof Error ? error.message : String(error);
+		console.error(`[pi-legion] notice not delivered (${reason}): ${text}`);
+	}
 }
 
 /**
@@ -585,7 +597,18 @@ function resolveLegionIdentity(input: {
 		}
 		if (node.runId !== nodeRun.runId) updateLegionRunId(db, nodeId, nodeRun.runId);
 		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true });
-		if (node.role === "centurion") void resumeLegionTeam({ identity, input });
+		// #273: `createLegionRuntime` runs during extension LOADING, where host
+		// actions (sendMessage, spawn, ui) are not available yet. Defer the team
+		// recovery to the next tick so a failure inside it cannot crash the load
+		// path, and so any notice it emits has a live runtime to go to.
+		if (node.role === "centurion") {
+			queueMicrotask(() => {
+				void resumeLegionTeam({ identity, input }).catch((error: unknown) => {
+					const reason = error instanceof Error ? error.message : String(error);
+					console.error(`[pi-legion] team recovery for ${identity.nodeId} failed: ${reason}`);
+				});
+			});
+		}
 		return identity;
 	}
 	if (input.cached?.nodeId === "root" && path.resolve(input.cached.storeRootDir) === path.resolve(input.store.rootDir)) return input.cached;

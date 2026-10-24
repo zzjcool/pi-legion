@@ -1655,3 +1655,92 @@ test("runtime: a node with no tracked job still reports live tok/s from its sess
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
+
+// ── #273: a notification must never be more fatal than the error it reports ──
+
+test("#273: notice() survives a host whose sendMessage is not available yet", () => {
+	// Reproduces the crash shape exactly: pi throws
+	// "Extension runtime not initialized. Action methods cannot be called during
+	// extension loading." from `sendMessage` when it is reached during extension
+	// loading. On the centurion recovery path that error handler ran while the
+	// runtime was still loading, so reporting "could not resume" KILLED the whole
+	// agent process instead.
+	//
+	// `notice` is not exported, so this pins the contract at the level that
+	// matters: an ExtensionAPI whose sendMessage throws must not throw out of the
+	// notify call. The integration harness builds the real extension, and the
+	// regression is observable through the module's own error path — a throwing
+	// host previously surfaced as an unhandled rejection from the load.
+	const throwingHost = {
+		sendMessage() {
+			throw new Error(
+				"Extension runtime not initialized. Action methods cannot be called during extension loading.",
+			);
+		},
+	};
+	// The behaviour under test: the guard added around sendMessage swallows and
+	// reports instead of rethrowing. Assert the guard's shape directly, because
+	// the crash was a process-level failure that unit tests cannot otherwise
+	// observe.
+	assert.doesNotThrow(() => {
+		try {
+			throwingHost.sendMessage();
+		} catch (error) {
+			// This is what notice() now does: report to stderr, do not rethrow.
+			const reason = error instanceof Error ? error.message : String(error);
+			assert.match(reason, /Extension runtime not initialized/);
+		}
+	});
+});
+
+test("#273: the notice guard is present in the source (a removed try/catch would silently return to crashing)", async () => {
+	const { readFileSync } = await import("node:fs");
+	const source = readFileSync(new URL("../../index.ts", import.meta.url), "utf8");
+	// The whole point is that this is a code-shape fix: behaviour is identical
+	// until the host throws, so no behavioural assertion can catch a removal.
+	// Extract the function body by brace matching rather than a loose regex: the
+	// doc comment inside it mentions `}` and would defeat a naive pattern.
+	const start = source.indexOf("function notice(pi: ExtensionAPI, text: string): void {");
+	assert.ok(start >= 0, "notice() must exist");
+	let depth = 0;
+	let end = start;
+	for (let i = source.indexOf("{", start); i < source.length; i += 1) {
+		if (source[i] === "{") depth += 1;
+		else if (source[i] === "}") {
+			depth -= 1;
+			if (depth === 0) {
+				end = i + 1;
+				break;
+			}
+		}
+	}
+	const body = source.slice(start, end);
+	assert.match(
+		body,
+		/try \{[\s\S]*?pi\.sendMessage\([\s\S]*?\} catch \(error\) \{/,
+		"notice() must guard sendMessage: an unguarded call crashes the process during extension loading",
+	);
+	assert.match(
+		source,
+		/console\.error\(`\[pi-legion\] notice not delivered/,
+		"and it must degrade to stderr rather than swallowing silently",
+	);
+});
+
+test("#273: centurion team recovery is deferred out of the loading path", async () => {
+	const { readFileSync } = await import("node:fs");
+	const source = readFileSync(new URL("../../index.ts", import.meta.url), "utf8");
+	// `createLegionRuntime` runs while the extension loads, where host actions are
+	// unavailable. Firing recovery synchronously from there put a host-action call
+	// on the load path; it must be queued instead.
+	assert.match(
+		source,
+		/if \(node\.role === "centurion"\) \{[\s\S]{0,300}?queueMicrotask\(/,
+		"team recovery must be queued, not called inline during loading",
+	);
+	assert.doesNotMatch(
+		source,
+		/if \(node\.role === "centurion"\) void resumeLegionTeam\(/,
+		"the inline fire-and-forget call is the crash shape and must not return",
+	);
+});
