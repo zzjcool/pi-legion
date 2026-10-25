@@ -130,18 +130,34 @@ test("#43 children get --no-extensions by default, guard + explicit extensions s
 	});
 });
 
-test("#43 escape hatches: role inheritExtensions, env inherit, env extra extensions", () => {
+test("#280: extensions inherit by default; excludeExtensions and inheritExtensions:false narrow it", () => {
+	// Policy flipped in #280: `--no-extensions` is now ALWAYS emitted (it stops pi's
+	// own settings discovery), and the full list arrives via explicit `--extension`
+	// flags. What a card controls is which extensions land in that list.
+	const explicit = "/a/provider.ts";
 	withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined }, () => {
-		assert.ok(!argvFor({ ...agent(), inheritExtensions: true }).includes("--no-extensions"));
-	});
-	for (const v of ["1", "true", "on"]) {
-		withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: v }, () => assert.ok(!argvFor(agent()).includes("--no-extensions")));
-	}
-	withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: "0", PI_LEGION_CHILD_EXTENSIONS: "/a/provider.ts,/b/x.ts" }, () => {
 		const args = argvFor(agent());
-		assert.ok(args.includes("--no-extensions"));
-		const exts = args.flatMap((a, i) => (a === "--extension" ? [args[i + 1]] : []));
-		assert.deepEqual(exts, ["/a/provider.ts", "/b/x.ts", childGuardExtensionPath()]);
+		assert.ok(args.includes("--no-extensions"), "pi discovery is always off; the list is ours");
+	});
+	withEnv({ PI_LEGION_CHILD_EXTENSIONS: explicit }, () => {
+		const exts = argvFor(agent()).flatMap((a, i, all) => (a === "--extension" ? [all[i + 1]] : []));
+		assert.ok(exts!.includes(explicit), "an explicit extra extension still lands");
+		assert.ok(exts!.includes(childGuardExtensionPath()), "the child-guard is unconditional");
+
+		// `inheritExtensions: false` keeps the card's own list and the guard.
+		const hermetic = argvFor({ ...agent(), inheritExtensions: false }).flatMap((a, i, all) =>
+			a === "--extension" ? [all[i + 1]] : [],
+		);
+		assert.ok(hermetic!.includes(explicit), "the card's own extensions survive opting out");
+		assert.ok(hermetic!.includes(childGuardExtensionPath()), "the child-guard is still injected");
+
+		// The env kill-switch flips the whole tree, either spelling.
+		for (const v of ["0", "false", "off", "no"]) {
+			withEnv({ PI_LEGION_CHILD_INHERIT_EXTENSIONS: v }, () => {
+				const off = argvFor(agent()).flatMap((a, i, all) => (a === "--extension" ? [all[i + 1]] : []));
+				assert.ok(off!.includes(explicit), `env=${v} must still load the card's own list`);
+			});
+		}
 	});
 });
 

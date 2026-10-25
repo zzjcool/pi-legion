@@ -100,7 +100,10 @@ test("doctor flags CHILD_NO_MODELS and covers all sections", () => {
 			expectedModels: ["workbuddy/hy4-preview-ioa"],
 			env: {
 				...process.env,
-				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				// #280: inheritance defaults ON, so CHILD_NO_MODELS (a --no-extensions
+				// symptom) only has meaning when a card/operator explicitly opts out.
+				// Pin the opt-out so this stays a test of the detector, not of the default.
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: "0",
 				PI_LEGION_CHILD_EXTENSIONS: undefined,
 			},
 			runtime: {
@@ -121,6 +124,8 @@ test("doctor flags CHILD_NO_MODELS and covers all sections", () => {
 				inheritProjectContext: true,
 				inheritSkills: false,
 				source: "user",
+				// Doctor's own sample agent (not a card file): `spawnMode` is a valid
+				// in-memory input here and selects the rpc CLI probe.
 				spawnMode: "rpc",
 			},
 			agents: [
@@ -135,7 +140,6 @@ test("doctor flags CHILD_NO_MODELS and covers all sections", () => {
 					inheritProjectContext: true,
 					inheritSkills: false,
 					source: "user",
-					spawnMode: "rpc",
 				},
 			],
 		});
@@ -505,9 +509,12 @@ test("#97 doctor wires role-tool gates: lens warns + next steps; codemode auto-l
 	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-97-"));
 	try {
 		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		// #280: with inheritance ON (the default) a lens tool is satisfied by the
+		// inherited host extensions, so the gate has nothing to report. Pin the
+		// opt-out to keep testing the GATE rather than the default.
 		const env = {
 			...process.env,
-			PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+			PI_LEGION_CHILD_INHERIT_EXTENSIONS: "0",
 			PI_LEGION_CHILD_EXTENSIONS: undefined,
 		};
 		const lensOnly = runLegionDoctor({
@@ -825,7 +832,7 @@ test("#212 doctor rpc still recommends PI_LEGION_CHILD_EXTENSIONS", () => {
 			agents: [sampleAgent],
 			env: {
 				...process.env,
-				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: "0",
 				PI_LEGION_CHILD_EXTENSIONS: undefined,
 			},
 		});

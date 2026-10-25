@@ -122,11 +122,24 @@ export interface AgentConfig {
 	inheritProjectContext: boolean;
 	inheritSkills: boolean;
 	/**
-	 * Load the host's discovered extensions (settings `packages`, project
-	 * extensions) in the child. Default false: children get `--no-extensions`
-	 * plus only explicit `--extension` paths (#43).
+	 * Load the host's discovered extensions in the child. Default true (#280):
+	 * a child starts from everything the parent has, then narrows it.
+	 *
+	 * `false` loads ONLY the card's own `extensions` / `subagentOnlyExtensions`
+	 * — the pre-#280 behaviour, kept for roles that must stay hermetic. The
+	 * child-guard is appended regardless; a child that skipped it would break
+	 * the prompt/format contract no matter what the card asked for.
 	 */
 	inheritExtensions?: boolean;
+	/**
+	 * Extensions to subtract from the inherited set (#280).
+	 *
+	 * Entries are either a PATH (`/abs/.../index.ts`, `./rel`, `~/rel` — exact
+	 * file match) or a NAME (`pi-lens`, `pi-any-endpoint` — the package
+	 * directory or a loose `<name>.ts|js` entry). Ignored when
+	 * `inheritExtensions: false`, because there is nothing to subtract from.
+	 */
+	excludeExtensions?: string[];
 
 	// ── behavior ──
 	output?: string;

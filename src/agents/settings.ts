@@ -475,7 +475,7 @@ function overrideFieldExpected(field: string): string | undefined {
 	if (["inheritProjectContext", "inheritSkills", "inheritExtensions", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer", "renewable"].includes(field)) return "a boolean";
 	if (["timeoutMs", "toolTimeoutMs", "maxSubagentDepth", "maxRenewals"].includes(field)) return "a number";
 	if (field === "skills") return "an array of strings or false";
-	if (["tools", "extensions", "subagentOnlyExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return "an array of strings";
+	if (["tools", "extensions", "subagentOnlyExtensions", "excludeExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return "an array of strings";
 	return undefined;
 }
 
@@ -488,7 +488,7 @@ function isValidOverrideField(field: string, value: unknown): boolean {
 	if (["inheritProjectContext", "inheritSkills", "inheritExtensions", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer", "renewable"].includes(field)) return typeof value === "boolean";
 	if (["timeoutMs", "toolTimeoutMs", "maxSubagentDepth", "maxRenewals"].includes(field)) return typeof value === "number";
 	if (field === "skills") return value === false || isStringArray(value);
-	if (["tools", "extensions", "subagentOnlyExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return isStringArray(value);
+	if (["tools", "extensions", "subagentOnlyExtensions", "excludeExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return isStringArray(value);
 	return true;
 }
 

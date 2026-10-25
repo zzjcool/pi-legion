@@ -14,6 +14,7 @@ import {
 	isThinkingLevel,
 } from "../shared/types.ts";
 import { formatChildTask } from "../extension/child-guard.ts";
+import { childInheritsExtensions, discoveredHostExtensions, inheritedExtensions } from "./extension-inheritance.ts";
 
 /** Re-exported for callers that only need the level list. */
 export { THINKING_LEVELS };
@@ -162,15 +163,11 @@ export function childExtraExtensions(env: NodeJS.ProcessEnv = process.env): stri
 }
 
 /**
- * Escape hatch (#43): role frontmatter `inheritExtensions: true`, or
- * `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` for every child, restores the old
- * behaviour of loading all host-discovered extensions.
+ * Re-exported from `extension-inheritance.ts`, which owns the policy (#280).
+ * Kept here because `args.ts` is the historical import site for the rpc argument
+ * builder and `legion-doctor`.
  */
-export function childInheritsExtensions(agent: Pick<AgentConfig, "inheritExtensions">, env: NodeJS.ProcessEnv = process.env): boolean {
-	if (agent.inheritExtensions === true) return true;
-	const raw = env[CHILD_INHERIT_EXTENSIONS_ENV]?.trim().toLowerCase();
-	return raw === "1" || raw === "true" || raw === "on" || raw === "yes";
-}
+export { childInheritsExtensions } from "./extension-inheritance.ts";
 
 /** Light pi builtin that registers the `codemode` tool (`-e builtin:codemode`). */
 export const BUILTIN_CODEMODE = "builtin:codemode";
@@ -195,16 +192,29 @@ export function isCodemodeExtension(ext: string): boolean {
 }
 
 /**
- * Effective `--extension` values for a child under `--no-extensions`.
+ * Effective `--extension` values for a child.
  *
- * Includes role `extensions` / `subagentOnlyExtensions`, `PI_LEGION_CHILD_EXTENSIONS`,
- * auto `builtin:codemode` when `tools` lists `codemode` (#89), and the child-guard.
+ * Order is deliberate: inherited host extensions FIRST (they are ambient
+ * capabilities the child would otherwise lose), then the role's own explicit
+ * list, then `PI_LEGION_CHILD_EXTENSIONS`, then `builtin:codemode` (#89), and
+ * finally the child-guard — which is unconditional and never subject to
+ * `inheritExtensions` / `excludeExtensions`, because a child without it breaks
+ * the prompt/format contract regardless of what the card asked for.
+ *
+ * #280: the inherited set is computed by `inheritedExtensions` and is empty when
+ * the card sets `inheritExtensions: false`; `excludeExtensions` subtracts from
+ * it. Inherited paths are subject to the same dedupe as everything else, so a
+ * card that also names an inherited extension does not load it twice.
  */
 export function collectChildExtensions(
-	agent: Pick<AgentConfig, "tools" | "extensions" | "subagentOnlyExtensions">,
+	agent: Pick<
+		AgentConfig,
+		"tools" | "extensions" | "subagentOnlyExtensions" | "inheritExtensions" | "excludeExtensions"
+	>,
 	env: NodeJS.ProcessEnv = process.env,
 ): string[] {
 	const list = [
+		...inheritedExtensions(agent, discoveredHostExtensions() ?? []),
 		...(agent.extensions ?? []),
 		...(agent.subagentOnlyExtensions ?? []),
 		...childExtraExtensions(env),
@@ -234,12 +244,16 @@ function pushToolArgs(args: string[], agent: AgentConfig): void {
 		args.push("--tools", tools.join(","));
 	}
 
-	// Only pass through what the agent explicitly lists: a child must not
-	// silently inherit every extension the parent happens to have loaded
-	// (#43: each host extension such as an LSP stack costs ~1 GB per child).
-	// `--no-extensions` stops discovery; explicit `--extension` paths below
-	// (the role's list + auto builtin:codemode + this package for the guard) still load.
-	if (!childInheritsExtensions(agent)) args.push("--no-extensions");
+	// #280: pi's own discovery is ALWAYS disabled and the full list is passed
+	// explicitly. `--no-extensions` only drops the settings-discovered set; `-e`
+	// paths (below) and builtins still load, so this is the shape that keeps the
+	// child's extension set exactly equal to what we computed — the inherited set
+	// minus `excludeExtensions`, plus the role's own list, plus the child-guard.
+	//
+	// Letting pi discover as well would silently re-add an extension the card
+	// excluded, and would make rpc disagree with in-process (which builds its
+	// loader with `noExtensions: true` for the same reason).
+	args.push("--no-extensions");
 	for (const ext of collectChildExtensions(agent)) {
 		args.push("--extension", ext);
 	}
