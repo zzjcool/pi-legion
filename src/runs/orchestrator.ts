@@ -772,6 +772,24 @@ export class Orchestrator {
 		const tempDir = this.runDir;
 		const parentRole = this.legion ? getNode(this.legion.db, this.legion.nodeId)?.role : undefined;
 		const isCenturion = input.agent.name === "centurion";
+		// #281: only the ROOT session may dispatch a centurion.
+		//
+		// Every other guard here keys on the CHILD's role, so without this a worker
+		// could dispatch a centurion and silently acquire worktree + rpc isolation
+		// (measured: `subagent({agent:"centurion"})` from a worker launched on rpc
+		// with a fresh worktree). A centurion exists to own an isolated tree and its
+		// own team; nesting one inside another agent's turn produces a second
+		// command chain the root cannot collect, so it is refused rather than
+		// demoted — a demoted centurion can neither create a worktree nor do its job.
+		//
+		// Refused BEFORE any worktree/dir is created, so a rejected dispatch leaves
+		// no artifacts behind.
+		if (isCenturion && this.legion && this.legion.nodeId !== "root") {
+			throw new SubagentError(
+				`only the root session may dispatch a centurion; '${parentRole ?? this.legion.nodeId}' at '${this.legion.nodeId}' cannot`,
+				ErrorCodes.BUDGET_EXCEEDED,
+			);
+		}
 		// #214 D4: only centurion may hold worktree. Legion path still forces
 		// centurion→true and centurion-parent→member false; non-centurion
 		// requests from any source are demoted below (D1: warn, never throw).
