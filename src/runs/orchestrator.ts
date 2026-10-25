@@ -74,7 +74,6 @@ import { type ChildLaunchContext, currentChildContext, runInChildContext } from 
 import { inProcessDepth, runAtAbsoluteDepth } from "../supervisor/inprocess-depth.ts";
 import { subscribeInProcessSlotReleases } from "../supervisor/routing-supervisor.ts";
 import type { LegionSupervisor, SettleResult, SpawnInput } from "../supervisor/types.ts";
-import { isInProcessSpawn, resolveSpawnMode } from "../supervisor/spawn-mode.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
 import {
@@ -844,26 +843,19 @@ export class Orchestrator {
 			this.warnWorktreeDenied(input.agent.name);
 			worktree = false;
 		}
-		// Spawn-mode arbitration (contract D2). `resolveSpawnMode` only reports the
-		// configured intent; the launch context decides whether an OMITTED mode can
-		// actually run in-process. An omitted mode falls back to rpc when this
-		// launch needs worktree isolation (a hard requirement of the in-process
-		// backend). An explicit value is never downgraded (invariant I6) — a bad
-		// explicit combination still throws below.
-		// `kind !== "pi"` is NOT re-tested here: the early guard above (before this
-		// arbitration) already refuses it, so such a clause would be dead code.
-		const explicitMode = input.agent.spawnMode !== undefined;
-		let mode: SpawnMode =
-			!explicitMode && worktree === true
-				? "rpc"
-				: resolveSpawnMode(input.agent);
-		// #279: rpc is reserved for centurion. Checked AFTER arbitration so it also
-		// catches an explicit `spawnMode: rpc`, which `resolveSpawnMode` returns
-		// verbatim and the worktree guard above never sees.
-		if (!isCenturion && mode === "rpc") {
-			this.warnSpawnModeDenied(input.agent.name);
-			mode = "inprocess";
-		}
+		// Spawn-mode arbitration. Role cards no longer carry a `spawnMode` field:
+		// the backend is a property of the LAUNCH, not a role, so a card cannot pin
+		// itself to a process model. rpc exists for exactly one reason — it is the
+		// only backend that can host a worktree child — so the rule collapses to:
+		//
+		//   worktree isolation ⇒ rpc;  everything else ⇒ in-process.
+		//
+		// A centurion is the only role allowed to hold a worktree (#214), so it is
+		// also the only role that reaches rpc (#279). Nothing to deny here anymore:
+		// a non-centurion cannot request worktree in the first place (the guard
+		// above forces it false), and there is no card field left to smuggle a
+		// backend request through.
+		const mode: SpawnMode = worktree === true ? "rpc" : "inprocess";
 		const inProcess = mode === "inprocess";
 		// Downstream must see the arbitrated result, otherwise RoutingSupervisor
 		// re-resolves the omitted field to `inprocess` on its own and throws
@@ -879,9 +871,7 @@ export class Orchestrator {
 		// The `&& worktree` short-circuit keeps the rpc path returning the
 		// original object (invariant I3: zero diff on the RPC backend).
 		// reserveNode() and SpawnInput.agent below both receive this clone.
-		const agent: AgentConfig = mode === input.agent.spawnMode && worktree
-			? input.agent
-			: { ...input.agent, spawnMode: mode, ...(worktree ? {} : { worktree: false }) };
+		const agent: AgentConfig = { ...input.agent, spawnMode: mode, ...(worktree ? {} : { worktree: false }) };
 		// A utility dispatch is a hard leaf, not a nested command-chain launch.
 		//
 		// #279: this check now covers EVERY backend. It used to be `!inProcess`,

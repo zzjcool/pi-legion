@@ -16,7 +16,6 @@ acceptance:
       must: 给出明确决断（做什么/不做什么）+ 至少两条独立理由 + 该决断的代价与最坏情况
       evidence: [decision, reasons, cost]
       severity: required
-placement: split-down
 steer: true
 worktree: false
 onBlocked: auto-approve

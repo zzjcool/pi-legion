@@ -17,7 +17,6 @@ acceptance:
       evidence: [verification-output]
       severity: required
 kind: pi
-placement: split-down
 steer: true
 worktree: false
 maxSubagentDepth: 3

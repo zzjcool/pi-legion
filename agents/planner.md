@@ -16,7 +16,6 @@ acceptance:
       evidence: [plan, acceptance]
       severity: required
 kind: pi
-placement: split-down
 steer: true
 maxSubagentDepth: 1
 ---

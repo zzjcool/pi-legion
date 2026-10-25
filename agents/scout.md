@@ -20,7 +20,6 @@ acceptance:
       evidence: [facts, open-questions]
       severity: required
 kind: pi
-placement: split-down
 steer: true
 maxSubagentDepth: 1
 ---

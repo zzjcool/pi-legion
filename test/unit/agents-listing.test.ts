@@ -496,7 +496,7 @@ test("command: lists sandboxed + builtin roles, grouped, with file paths", async
 		{
 			extraAgents: {
 				"search.md":
-					"---\nname: search\ndescription: web and code search\ncolor: blue\n---\np",
+					"---\nname: search\ndescription: web and code search\n---\np",
 			},
 			projectAgents: {
 				"deploy.md": "---\nname: deploy\ndescription: deploys things\n---\np",

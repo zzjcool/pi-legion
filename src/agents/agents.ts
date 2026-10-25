@@ -19,7 +19,6 @@ import {
 	type AcceptanceCriterion,
 	type OnBlockedPolicy,
 	type SpawnMode,
-	SPAWN_MODES,
 	type SystemPromptMode,
 	type ToolBudgetConfig,
 	type TurnBudgetConfig,
@@ -175,15 +174,6 @@ function int(value: unknown): number | undefined {
 	if (typeof value === "string" && /^\d+$/.test(value.trim()))
 		return Number(value.trim());
 	return undefined;
-}
-
-function spawnModeOf(value: unknown, filePath: string): SpawnMode | undefined {
-	if (value === undefined || value === null || value === "") return undefined;
-	const raw = typeof value === "string" ? value.trim() : String(value);
-	if ((SPAWN_MODES as readonly string[]).includes(raw)) return raw as SpawnMode;
-	throw new Error(
-		`Agent '${filePath}' has invalid spawnMode '${raw}'; expected one of: ${SPAWN_MODES.join(", ")}.`,
-	);
 }
 
 
@@ -438,6 +428,51 @@ function parseTurnBudget(value: unknown): TurnBudgetConfig | undefined {
 }
 
 /**
+ * Every frontmatter key a role card may declare.
+ *
+ * Kept next to the parser on purpose: an unknown key used to be silently
+ * ignored, so a typo (`maxSubagentdepth`, `inheritSkill`) produced a card that
+ * looked accepted but did nothing. That is the worst failure mode for a config
+ * file — the author believes the setting is in effect. Cards are now validated
+ * against this list and an unknown key is a hard error.
+ *
+ * When adding a field, add it here AND parse it; a name in this list that no
+ * parser reads is just as misleading as the reverse.
+ */
+const AGENT_FRONTMATTER_FIELDS: ReadonlySet<string> = new Set([
+	// identity
+	"name", "description", "kind", "model", "thinking", "alias", "aliases",
+	"preset", "team", "output", "fallbackModels",
+	// prompt / context
+	"systemPromptMode", "inheritProjectContext", "inheritSkills", "inheritExtensions",
+	"skillPath", "skills", "defaultReads",
+	// tools
+	"tools", "extensions", "subagentOnlyExtensions",
+	// budgets / guards / lifecycle
+	"defaultProgress", "async", "timeoutMs", "toolTimeoutMs", "completionGuard",
+	"maxSubagentDepth", "allowNestedSubagents", "renewable", "maxRenewals",
+	"utility", "disabled", "worktree", "steer", "onBlocked",
+	"acceptance", "toolBudget", "turnBudget",
+]);
+
+/**
+ * Throw when a card declares a key this parser does not understand.
+ *
+ * Names are compared case-sensitively: YAML keys are case-sensitive, and a
+ * near-miss (`MaxRenewals`) is exactly the typo this is meant to catch.
+ */
+function assertKnownFrontmatter(frontmatter: Record<string, unknown>, filePath: string): void {
+	const unknown = Object.keys(frontmatter).filter((key) => !AGENT_FRONTMATTER_FIELDS.has(key));
+	if (unknown.length === 0) return;
+	const known = [...AGENT_FRONTMATTER_FIELDS].sort().join(", ");
+	throw new Error(
+		`Agent '${filePath}' has unknown frontmatter ${unknown.length === 1 ? "field" : "fields"}: ` +
+			`${unknown.map((key) => `'${key}'`).join(", ")}. ` +
+			`Known fields: ${known}.`,
+	);
+}
+
+/**
  * Convert one markdown document into an AgentConfig.
  * Returns `null` (never throws) when the file is not a usable agent definition.
  */
@@ -448,6 +483,7 @@ export function parseAgentDocument(
 ): AgentConfig | null {
 	const { frontmatter, body } = parseFrontmatter(content);
 	const fm = frontmatter as AgentFrontmatter;
+	assertKnownFrontmatter(fm, filePath);
 
 	const name = str(fm.name);
 	const description = str(fm.description);
@@ -569,7 +605,6 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "disabled", bool(fm.disabled));
 	setIf(config, "worktree", bool(fm.worktree));
 	setIf(config, "steer", bool(fm.steer));
-	setIf(config, "spawnMode", spawnModeOf(fm.spawnMode, config.filePath));
 	setIf(config, "acceptance", parseAcceptance(fm.acceptance, config.name));
 	setIf(config, "toolBudget", parseBudget(fm.toolBudget));
 	setIf(config, "turnBudget", parseTurnBudget(fm.turnBudget));

@@ -20,7 +20,6 @@ acceptance:
       evidence: [review-findings, residual-risks]
       severity: required
 kind: pi
-placement: split-down
 steer: true
 maxSubagentDepth: 1
 ---
