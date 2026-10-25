@@ -1349,15 +1349,18 @@ test("index mainline: the launch line and the child record carry the arbitrated 
 		// arbitration outcomes are observable through the same harness.
 		const inprocess = await invokeIndex(harness, { agent: "worker", task: "default backend", async: true, worktree: false });
 		assert.match(inprocess, /supervisor=inprocess/, "an omitted spawnMode with worktree:false arbitrates to inprocess");
+		// #279: rpc is reserved for centurion. A non-centurion role that pins
+		// `spawnMode: rpc` is demoted to inprocess with a one-time warning — the
+		// reservation is not negotiable, so "explicit value wins" (I6) yields here.
 		const rpc = await invokeIndex(harness, { agent: "rpcworker", task: "pinned backend", async: true, worktree: false });
-		assert.match(rpc, /supervisor=rpc/, "an explicit spawnMode: rpc keeps rendering rpc");
-		assert.doesNotMatch(rpc, /supervisor=inprocess/);
+		assert.match(rpc, /supervisor=inprocess/, "a non-centurion spawnMode: rpc is forced to inprocess");
+		assert.doesNotMatch(rpc, /supervisor=rpc/);
 
 		const children = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") })
 			.listRuns()
 			.flatMap((run) => run.children);
 		assert.equal(children.find((child) => child.agent === "worker")?.spawnMode, "inprocess", "ChildRecord echoes the arbitrated mode");
-		assert.equal(children.find((child) => child.agent === "rpcworker")?.spawnMode, "rpc");
+		assert.equal(children.find((child) => child.agent === "rpcworker")?.spawnMode, "inprocess", "#279: the demotion reaches the ChildRecord too");
 	} finally { await harness.cleanup(); }
 });
 
@@ -1387,7 +1390,9 @@ test("index mainline: launch-family details expose the arbitrated spawnMode as s
 
 		const rpc = await invokeIndexRaw(harness, { agent: "rpcworker", task: "pinned backend", async: true, worktree: false });
 		const rpcSpawns = (rpc.details as { spawns?: Array<{ spawnMode: string }> } | undefined)?.spawns;
-		assert.equal(rpcSpawns?.[0]?.spawnMode, "rpc", "a role pinned to rpc reports rpc");
+		// #279: a non-centurion role pinned to rpc is demoted, and the details
+		// must report the ARBITRATED mode, not the role card's request.
+		assert.equal(rpcSpawns?.[0]?.spawnMode, "inprocess", "#279: details report the demoted mode");
 	} finally { await harness.cleanup(); }
 });
 

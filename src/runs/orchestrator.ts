@@ -413,6 +413,7 @@ export class Orchestrator {
 	private readonly onLaunchQueueNotice?: (line: string) => void;
 	private depthWarningEmitted = false;
 	private worktreeDeniedWarningEmitted = false;
+	private spawnModeDeniedWarningEmitted = false;
 	private spawned = 0;
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly nameCounter = new Map<string, number>();
@@ -534,7 +535,7 @@ export class Orchestrator {
 		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
 	}
 
-	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string; utility?: boolean }): LegionNode | null {
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string; utility?: boolean; inProcess?: boolean }): LegionNode | null {
 		const legion = this.legion;
 		if (!legion) return null;
 		const parent = getNode(legion.db, legion.nodeId);
@@ -559,17 +560,22 @@ export class Orchestrator {
 		const maxChildren = legion.settings?.maxChildrenPerNode ?? 8;
 		const activeReservation = previous && (previous.status === "starting" || previous.status === "running") ? 1 : 0;
 		// In-process children use subagents.inprocess.* only — do not spend RPC legion.* slots (#197).
-		const limits: LegionBudgetLimits = isInProcessSpawn(input.agent)
-			? {
-					maxDepth: MAX_NESTED_PATH_ENTRIES,
-					maxChildrenPerNode: Number.MAX_SAFE_INTEGER,
-					maxActiveNodes: Number.MAX_SAFE_INTEGER,
-			  }
-			: {
-					maxDepth: depthCeiling,
-					maxChildrenPerNode: maxChildren,
-					maxActiveNodes: (legion.settings?.maxActiveNodes ?? 30) + activeReservation,
-			  };
+		//
+		// #279: keyed on the ARBITRATED backend, not the role card's spelling. A role
+		// that pins `spawnMode: rpc` is demoted to in-process before this runs, and
+		// reading the raw card again would charge the rpc buckets for a launch that
+		// never runs there (the two backends have separate limits by design).
+		// #279: in-process launches are budgeted again. #197 granted them unlimited
+		// ledger headroom because rpc was the default and only rpc spent these slots.
+		// Now that rpc is reserved for centurion, every other role runs
+		// in-process — so "unlimited" would mean "avoid rpc, escape the caps", and a
+		// worker could nest without bound. They still get the `inprocess.*` pools
+		// enforced inside the in-process supervisor; this restores the ledger floor.
+		const limits: LegionBudgetLimits = {
+			maxDepth: depthCeiling,
+			maxChildrenPerNode: maxChildren,
+			maxActiveNodes: (legion.settings?.maxActiveNodes ?? 30) + activeReservation,
+		};
 		const gate = withLaunchBudget(legion.db, { parentId: legion.nodeId, depth: parent.depth + 1, nodeId: input.nodeId }, () => {
 			if (previous) {
 				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team }, this.now);
@@ -735,6 +741,32 @@ export class Orchestrator {
 		this.onBudgetRefused?.(event);
 	}
 
+	/**
+	 * #279: only `name === "centurion"` may run on the rpc backend.
+	 *
+	 * `warnWorktreeDenied` above already forces `worktree: false` for everyone
+	 * else, but that guard keys on the worktree REQUEST — a role card that pins
+	 * `spawnMode: rpc` explicitly never consults `resolveSpawnMode`, so it slipped
+	 * through and got a separate process (the exact isolation the worktree rule
+	 * exists to reserve). This closes that bypass. Like the worktree rule it warns
+	 * once per run and demotes, never throws: a stale role card must not turn every
+	 * launch in the tree into a hard failure.
+	 */
+	private warnSpawnModeDenied(agentName: string): void {
+		if (this.spawnModeDeniedWarningEmitted) return;
+		this.spawnModeDeniedWarningEmitted = true;
+		const event: BudgetRefusedEvent = {
+			type: "budget_refused",
+			reason: "spawn_mode_denied_non_centurion",
+			agent: agentName,
+		};
+		console.warn(
+			`[pi-legion] rpc denied for non-centurion role '${agentName}'; forced spawnMode: inprocess. ` +
+				`Fix the role card (remove spawnMode: rpc) or dispatch a centurion when you need an isolated process.`,
+		);
+		this.onBudgetRefused?.(event);
+	}
+
 	async launch(
 		input: LaunchInput,
 		/**
@@ -821,10 +853,17 @@ export class Orchestrator {
 		// `kind !== "pi"` is NOT re-tested here: the early guard above (before this
 		// arbitration) already refuses it, so such a clause would be dead code.
 		const explicitMode = input.agent.spawnMode !== undefined;
-		const mode: SpawnMode =
+		let mode: SpawnMode =
 			!explicitMode && worktree === true
 				? "rpc"
 				: resolveSpawnMode(input.agent);
+		// #279: rpc is reserved for centurion. Checked AFTER arbitration so it also
+		// catches an explicit `spawnMode: rpc`, which `resolveSpawnMode` returns
+		// verbatim and the worktree guard above never sees.
+		if (!isCenturion && mode === "rpc") {
+			this.warnSpawnModeDenied(input.agent.name);
+			mode = "inprocess";
+		}
 		const inProcess = mode === "inprocess";
 		// Downstream must see the arbitrated result, otherwise RoutingSupervisor
 		// re-resolves the omitted field to `inprocess` on its own and throws
@@ -844,8 +883,15 @@ export class Orchestrator {
 			? input.agent
 			: { ...input.agent, spawnMode: mode, ...(worktree ? {} : { worktree: false }) };
 		// A utility dispatch is a hard leaf, not a nested command-chain launch.
-		// In-process children use subagents.inprocess.* budgets (never RPC keys).
-		if (!input.utilityDispatch && !inProcess) this.assertWithinBudgets(Boolean(previous));
+		//
+		// #279: this check now covers EVERY backend. It used to be `!inProcess`,
+		// because #197 gave in-process its own `subagents.inprocess.*` buckets. But
+		// rpc is reserved for centurion, so every other role now runs in-process —
+		// leaving them unchecked here would mean "avoid rpc, escape the depth and
+		// per-session spawn ceilings", and a worker could nest without bound.
+		// The in-process supervisor still enforces its own `inprocess.*` limits;
+		// this is an additional floor, not a replacement.
+		if (!input.utilityDispatch) this.assertWithinBudgets(Boolean(previous));
 		if (this.supervisor.isAlive(name)) throw new SubagentError(`child is already alive: ${name}`, ErrorCodes.NAME_TAKEN);
 		// D4: the name-occupancy check must cover QUEUED records too. `previous`
 		// deliberately ignores them (D3-a: its placeholder session path is not a resume
@@ -959,7 +1005,7 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility) });
+				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess });
 				reserved = true;
 				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
 			}
@@ -1155,14 +1201,14 @@ export class Orchestrator {
 	 * skips the *queue*, never `assertWithinLimits` / `withLaunchBudget` (I-O1). A
 	 * launch that still loses the real gate is re-queued instead of failing (D2-c).
 	 */
-	private probeAdmission(name: string, ctx: AdmissionProbeContext): AdmissionVerdict {
-		if (ctx.inProcess) {
-			const probe = inProcessProbeOf(this.supervisor);
-			// No readable counts (a test double) → nothing to probe.
-			if (!probe) return { admitted: true };
-			const counts = probe.admissionCounts(name);
-			return evaluateInProcessAdmission(counts, this.inflightFor(counts.parentKey, ctx));
-		}
+
+	/**
+	 * The legion ledger gate, shared by the rpc and in-process admission paths
+	 * (#279). Read-only (`checkLaunchBudget`), never `withLaunchBudget` — a probe
+	 * must not insert a `starting` row (R3/F10) and must not emit
+	 * `budget_refused`, which belongs to `reserveNode` (D1-b).
+	 */
+	private probeLedgerAdmission(name: string, ctx: AdmissionProbeContext): ReturnType<Orchestrator["probeAdmission"]> {
 		// rpc/legion: the ledger gate. Read-only (`checkLaunchBudget`), never
 		// `withLaunchBudget` — a probe must not insert a `starting` row (R3/F10) and
 		// must not emit `budget_refused`, which belongs to `reserveNode` (D1-b).
@@ -1220,8 +1266,31 @@ export class Orchestrator {
 			}
 			return { admitted: true };
 		}
-		// `max_depth` / `parent_not_found`: permanent, never queued (D1).
+
 		return { admitted: true };
+	}
+
+	private probeAdmission(name: string, ctx: AdmissionProbeContext): AdmissionVerdict {
+		if (ctx.inProcess) {
+			// #279: the ledger floor applies to in-process launches too. It used to be
+			// skipped entirely (#197 gave in-process unlimited ledger headroom), but
+			// rpc is now reserved for centurion — so "skip the ledger" would
+			// mean every non-centurion role escapes `maxChildrenPerNode` /
+			// `maxActiveNodes`. `reserveNode` already charges these slots, so without
+			// this probe the launch is REFUSED there after admission was granted here.
+			//
+			// Two gates now apply and the stricter wins: this ledger check (fanout /
+			// active / depth) plus the `inprocess.*` pools probed below.
+			const ledgerVerdict = this.probeLedgerAdmission(name, ctx);
+			if (ledgerVerdict.admitted !== true) return ledgerVerdict;
+			const probe = inProcessProbeOf(this.supervisor);
+			// No readable counts (a test double) → nothing to probe.
+			if (!probe) return { admitted: true };
+			const counts = probe.admissionCounts(name);
+			return evaluateInProcessAdmission(counts, this.inflightFor(counts.parentKey, ctx));
+		}
+		return this.probeLedgerAdmission(name, ctx);
+
 	}
 
 	/**

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -62,12 +63,29 @@ function agent(name = "worker", overrides: Partial<AgentConfig> = {}): AgentConf
  * mode is `inprocess`, any test that asserts an RPC ledger gate must pin
  * `spawnMode: "rpc"` explicitly — otherwise it silently tests nothing.
  */
-function rpcAgent(name = "worker", overrides: Partial<AgentConfig> = {}): AgentConfig {
+function rpcAgent(name = "centurion", overrides: Partial<AgentConfig> = {}): AgentConfig {
+	// #279: rpc is reserved for centurion, and the legion ledger gates
+	// (`maxChildrenPerNode` / `maxActiveNodes` / `maxDepth`) only apply to the rpc
+	// backend — in-process children are budgeted by `subagents.inprocess.*` and
+	// bypass the ledger table entirely. A non-centurion role pinned to
+	// rpc is now demoted to inprocess, so such a test would silently assert
+	// nothing (it would queue/launch on a backend the gate does not cover).
 	return agent(name, { spawnMode: "rpc", ...overrides });
 }
 
 function fixture(options: { maxActiveNodes?: number; maxChildrenPerNode?: number } = {}) {
 	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-orchestrator-"));
+	// #279: the RPC-backed roles these gates cover are centurions, and a
+	// centurion forces `worktree: true`, which requires a real git repo.
+	// Init one so the ledger-gate tests exercise the production shape instead of
+	// failing on "not a git repository".
+	const git = (args: string[]) => execFileSync("git", ["-C", rootDir, ...args], { stdio: "ignore" });
+	git(["init", "-q"]);
+	git(["config", "user.email", "legion-test@example.invalid"]);
+	git(["config", "user.name", "Legion integration test"]);
+	writeFileSync(path.join(rootDir, "README.md"), "fixture\n");
+	git(["add", "README.md"]);
+	git(["commit", "-m", "test fixture", "-q"]);
 	const runStore = new RunStore({ rootDir: path.join(rootDir, ".pi-subagents") });
 	const rootRun = runStore.createRun({ task: "root task", cwd: rootDir, nodeId: "root", maxDepth: 4, herdr: { supervisor: "rpc" } });
 	const db = openLegionDb(":memory:");
