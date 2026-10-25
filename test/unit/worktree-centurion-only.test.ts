@@ -229,3 +229,67 @@ test("#214 acceptance: omitted spawnMode worker → inprocess", async () => {
 		h.cleanup();
 	}
 });
+
+test("#279 acceptance: non-centurion role with spawnMode:rpc → warn once/run + forced inprocess; no throw", async () => {
+	// The #214 worktree guard keys on the worktree REQUEST. A role card that pins
+	// `spawnMode: rpc` never consults `resolveSpawnMode`, so it obtained a separate
+	// process — the exact isolation rpc is reserved for — while worktree stayed
+	// false. This case pins that bypass shut.
+	const h = harness("279-role-");
+	const events: unknown[] = [];
+	const warns: string[] = [];
+	const prevWarn = console.warn;
+	console.warn = (...args: unknown[]) => {
+		warns.push(args.map(String).join(" "));
+	};
+	try {
+		const orchestrator = new Orchestrator({
+			supervisor: h.supervisor,
+			runDir: h.runDir,
+			cwd: h.repo,
+			onBudgetRefused: (e) => events.push(e),
+		});
+		// No worktree request at all: the old guard cannot fire, only the new one can.
+		const first = await orchestrator.launch({ agent: agent({ spawnMode: "rpc" }), task: "a" });
+		const second = await orchestrator.launch({ agent: agent({ spawnMode: "rpc" }), task: "b" });
+		assert.equal(h.accepted.length, 2);
+		assert.ok(
+			h.accepted.every((a) => a.mode === "inprocess"),
+			`an explicit spawnMode:rpc must be demoted for a non-centurion role, saw ${h.accepted.map((a) => a.mode).join(",")}`,
+		);
+		assert.equal(events.length, 1, "warn once per run");
+		assert.deepEqual(events[0], {
+			type: "budget_refused",
+			reason: "spawn_mode_denied_non_centurion",
+			agent: "worker",
+		});
+		assert.equal(warns.length, 1);
+		assert.match(warns[0]!, /rpc denied for non-centurion role 'worker'/);
+		assert.match(warns[0]!, /forced spawnMode: inprocess/);
+		// The demotion must reach the child record, not just the supervisor call.
+		assert.equal(first.child.spawnMode, "inprocess");
+		assert.equal(second.child.spawnMode, "inprocess");
+	} finally {
+		console.warn = prevWarn;
+		h.cleanup();
+	}
+});
+
+test("#279 acceptance: a centurion keeps spawnMode:rpc (the reservation still works)", async () => {
+	const h = harness("279-cent-");
+	const events: unknown[] = [];
+	try {
+		const orchestrator = new Orchestrator({
+			supervisor: h.supervisor,
+			runDir: h.runDir,
+			cwd: h.repo,
+			onBudgetRefused: (e) => events.push(e),
+		});
+		await orchestrator.launch({ agent: agent({ name: "centurion", spawnMode: "rpc" }), task: "own the slice" });
+		assert.equal(h.accepted.length, 1);
+		assert.equal(h.accepted[0]!.mode, "rpc", "a centurion must keep its rpc backend");
+		assert.equal(events.length, 0, "no denial event for the reserved role");
+	} finally {
+		h.cleanup();
+	}
+});
