@@ -745,10 +745,16 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
  *    PARENT's database, surfacing later as `database is not open` from whichever
  *    pump or admission probe ran next.
  *
- * Keying by resolved path keeps the reuse (2) while giving each ledger its own
- * lifecycle (1): an entry finds its own handle again, and a shutdown only closes
- * the handle it owns.
+ * Keying by (resolved path, nodeId) keeps the reuse (2) while giving each owner
+ * its own lifecycle (1).
+ *
+ * The path alone is NOT enough: a parent and its in-process child share ONE
+ * ledger file (the child inherits `dbPath` from the orchestrator's launch
+ * context) and differ only by the node row they own. Keying by path made them
+ * collide, so the child's shutdown closed the parent's handle and a sibling's
+ * next spawn failed with `database is not open` (#285 follow-up).
  */
+const legionIdentityKey = (dbPath: string, nodeId: string): string => `${dbPath}\u0000${nodeId}`;
 const legionIdentities = new Map<string, LegionRuntimeIdentity>();
 
 export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {
@@ -873,10 +879,10 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	 * opened. Shutdown handlers pass their own path so a child session teardown
 	 * cannot close the parent's database (#283).
 	 */
-	const stopLegionRuntime = (dbPath?: string): void => {
-		const targets = dbPath === undefined
+	const stopLegionRuntime = (key?: string): void => {
+		const targets = key === undefined
 			? [...legionIdentities.entries()]
-			: (legionIdentities.has(dbPath) ? [[dbPath, legionIdentities.get(dbPath)!] as const] : []);
+			: (legionIdentities.has(key) ? [[key, legionIdentities.get(key)!] as const] : []);
 		for (const [key, identity] of targets) {
 			legionIdentities.delete(key);
 			identity.postman.stop();
@@ -888,9 +894,31 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		}
 	};
 	/** The handle this extension entry owns, if any (see `legionIdentities`). */
-	let ownLegionPath: string | undefined;
+	let ownLegionKey: string | undefined;
 	const ownLegionIdentity = (): LegionRuntimeIdentity | undefined =>
-		ownLegionPath === undefined ? undefined : legionIdentities.get(ownLegionPath);
+		ownLegionKey === undefined ? undefined : legionIdentities.get(ownLegionKey);
+	/**
+	 * Register a resolved identity and make it this entry's own (#283/#285).
+	 *
+	 * One rule for every call site: the map holds at most one live handle per
+	 * ledger path, and an existing handle is only closed when THIS entry is
+	 * replacing the path it already owned. Reassigning across paths never closes
+	 * anything — a sibling entry (parent vs in-process child) may still be using
+	 * the handle, and closing it surfaced as `database is not open` from that
+	 * sibling's next spawn.
+	 */
+	const adoptLegionIdentity = (identity: LegionRuntimeIdentity): void => {
+		const key = legionIdentityKey(identity.dbPath, identity.nodeId);
+		const existing = legionIdentities.get(key);
+		// Only close when this entry is replacing the key it ALREADY owns: that
+		// handle is provably ours. A handle owned by a sibling (same ledger file,
+		// different node) is not ours to close.
+		if (existing && existing !== identity && ownLegionKey === key) {
+			stopLegionRuntime(key);
+		}
+		if (existing !== identity) legionIdentities.set(key, identity);
+		ownLegionKey = key;
+	};
 	const initializeLegionRuntime = (ctx: Pick<ExtensionContext, "cwd"> & { sessionFile?: string; legionNode?: { dbPath: string; nodeId: string } }): void => {
 		// The injected node's dbPath is authoritative: an in-process child shares the
 		// parent's env, so PI_LEGION_DB here belongs to the parent (or is unset).
@@ -903,16 +931,23 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// entry starts with no owned path, but the same database may already have a
 		// live handle from an earlier entry in this process (#283).
 		const targetPath = ctx.legionNode?.dbPath ?? process.env[LEGION_DB_ENV];
-		const cached = targetPath !== undefined && path.isAbsolute(targetPath)
-			? legionIdentities.get(path.resolve(targetPath))
+		const targetNode = ctx.legionNode?.nodeId ?? process.env[LEGION_NODE_ID_ENV];
+		const cached = targetPath !== undefined && targetNode !== undefined && path.isAbsolute(targetPath)
+			? legionIdentities.get(legionIdentityKey(path.resolve(targetPath), targetNode))
 			: ownLegionIdentity();
 		const next = resolveLegionIdentity({ pi, supervisor, store, cwd: ctx.cwd, settings, eventBus: legionBus, cached, sessionFile: ctx.sessionFile, legionNode: ctx.legionNode });
 		if (next === undefined) return;
 		// Index by ledger path: a re-entry for the SAME database reuses the cached
-		// handle, a different database (parent vs its in-process child) gets its own.
-		if (cached && cached !== next) stopLegionRuntime(cached.dbPath);
-		legionIdentities.set(next.dbPath, next);
-		ownLegionPath = next.dbPath;
+		// handle, a different database (parent vs its in-process child) gets its
+		// own slot.
+		//
+		// Never close `cached` here just because this entry resolved elsewhere.
+		// `resolveLegionIdentity` returns a DIFFERENT object for the same path when
+		// the node/session changed, and that earlier handle may still be in use by
+		// the entry that opened it — closing it produced `database is not open`
+		// from a sibling's spawn (#285 follow-up). Only the entry that owns a path
+		// closes it, via its own session_shutdown.
+		adoptLegionIdentity(next);
 	};
 	if (isChild) {
 		registerChildGuard(pi);
@@ -1012,7 +1047,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		]);
 		// Scope to the ledger THIS entry opened: a parent and its in-process child
 		// both register a shutdown handler, and each must close only its own (#283).
-		stopLegionRuntime(ownLegionPath);
+		stopLegionRuntime(ownLegionKey);
 	};
 	if (process.env[UTILITY_CHILD_ENV] !== "1") {
 		pi.registerTool({
@@ -1048,10 +1083,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					legion: ownLegionIdentity(),
 					eventBus: legionBus,
 					onLegion: (identity) => {
-						const previous = ownLegionIdentity();
-						if (previous && previous !== identity) stopLegionRuntime(previous.dbPath);
-						legionIdentities.set(identity.dbPath, identity);
-						ownLegionPath = identity.dbPath;
+						adoptLegionIdentity(identity);
 					},
 					onUtilityChild: (retire) => pendingUtilityRetires.push(retire),
 				});
@@ -1084,7 +1116,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		};
 	});
 	if (process.env[UTILITY_CHILD_ENV] === "1") {
-		pi.on("session_shutdown", () => stopLegionRuntime(ownLegionPath));
+		pi.on("session_shutdown", () => stopLegionRuntime(ownLegionKey));
 		return;
 	}
 	let lastUi: ExtensionUIContext | undefined;
@@ -1426,10 +1458,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					const plan = buildPlan(params);
 					if (plan.ok) activeLegion = createRootLegion({ pi, supervisor, store, cwd, task: plan.task, settings, maxDepth: effectiveMaxDepth(settings.legion?.maxDepth), eventBus: legionBus });
 				}
-				if (activeLegion) {
-						legionIdentities.set(activeLegion.dbPath, activeLegion);
-						ownLegionPath = activeLegion.dbPath;
-					}
+				if (activeLegion) adoptLegionIdentity(activeLegion);
 			} catch (error) {
 				return fail(`legion runtime initialization failed: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
 			}

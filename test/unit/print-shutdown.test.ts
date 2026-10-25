@@ -286,3 +286,113 @@ test("#283: re-entering the extension factory must reuse the legion.db handle", 
 		rmSync(sandbox, { recursive: true, force: true });
 	}
 });
+
+test("#285: a child session sharing the parent's ledger must not close the parent's handle", async () => {
+	// A parent and its IN-PROCESS child share one `legion.db` file: the child
+	// inherits `dbPath` from the orchestrator's launch context and differs only by
+	// the node row it owns. Keying the runtime map by path alone made them collide,
+	// so the child's session_shutdown closed the parent's handle and a sibling's
+	// next spawn failed with `database is not open`.
+	//
+	// The invariant: two entries that share a ledger file but own different nodes
+	// must hold two independent handles, and tearing one down must leave the other
+	// open and usable.
+	const sandbox = mkdtempSync(path.join(tmpdir(), "legion-285-"));
+	const cwd = path.join(sandbox, "project");
+	const agentDir = path.join(sandbox, "agent");
+	const extraAgentsDir = path.join(sandbox, "extra-agents");
+	const storeRoot = path.join(cwd, ".pi-subagents");
+	mkdirSync(cwd, { recursive: true });
+	mkdirSync(agentDir, { recursive: true });
+	mkdirSync(extraAgentsDir, { recursive: true });
+
+	const store = new RunStore({ rootDir: storeRoot });
+	const run = store.createRun({ task: "shared ledger", cwd, maxDepth: 4, nodeId: "root" });
+	const dbPath = legionDbPath(store.runDir(run.runId));
+	const seed = openLegionDb(dbPath);
+	insertNode(seed, { id: "root", parentId: null, name: "root", role: "root", runId: run.runId, status: "running" });
+	insertNode(seed, { id: "root.child-a", parentId: "root", name: "child-a", role: "worker", runId: run.runId, status: "running" });
+	seed.close();
+
+	const previous = new Map(ENV_KEYS.map((name) => [name, process.env[name]]));
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+
+	const boot = (nodeId: string) => {
+		const handlers = new Map<string, (...args: unknown[]) => unknown>();
+		const pi = {
+			registerTool() {},
+			registerCommand() {},
+			registerMessageRenderer() {},
+			sendMessage() {},
+			events: { emit() {} },
+			on(name: string, handler: (...args: unknown[]) => unknown) {
+				handlers.set(name, handler);
+			},
+		};
+		process.env.PI_LEGION_DB = dbPath;
+		process.env.PI_LEGION_NODE_ID = nodeId;
+		piLegion(pi as never, { supervisor });
+		return handlers;
+	};
+	const dbHandles = (): number => {
+		try {
+			return readdirSync("/proc/self/fd").filter((fd) => {
+				try {
+					return readlinkSync(`/proc/self/fd/${fd}`).endsWith("legion.db");
+				} catch {
+					return false;
+				}
+			}).length;
+		} catch {
+			return -1;
+		}
+	};
+	// The real failure mode: using the parent's handle AFTER the child shut down.
+	const canStillQuery = (): boolean => {
+		try {
+			const db = openLegionDb(dbPath);
+			try {
+				db.prepare("SELECT 1").get();
+				return true;
+			} finally {
+				db.close();
+			}
+		} catch {
+			return false;
+		}
+	};
+
+	try {
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
+		for (const name of ENV_KEYS.slice(2)) delete process.env[name];
+		process.env.PI_SUBAGENT_CHILD = "1";
+		process.env.PI_SUBAGENT_ALLOW_NESTED = "1";
+
+		const parentHandlers = boot("root");
+		const before = dbHandles();
+		const childHandlers = boot("root.child-a");
+		const both = dbHandles();
+
+		// Tear the child down; the parent's handle must survive.
+		await childHandlers.get("session_shutdown")?.();
+		const afterChildClose = dbHandles();
+
+		if (before >= 0) {
+			assert.ok(both >= before, "parent and child each hold their own handle");
+			assert.ok(
+				afterChildClose >= before,
+				`the parent's handle must survive the child's shutdown: ${both} -> ${afterChildClose}`,
+			);
+			assert.ok(canStillQuery(), "the ledger must still be openable after the child shut down");
+		}
+
+		await parentHandlers.get("session_shutdown")?.();
+	} finally {
+		for (const [name, value] of previous) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+		rmSync(sandbox, { recursive: true, force: true });
+	}
+});
