@@ -633,26 +633,38 @@ test("formerly unenforced fields are now honoured", () => {
 });
 
 test("Placement is not parsed or reported as an active agent field", () => {
-	const doc = [
+	// `placement` was retired long ago, but six bundled cards kept carrying it and
+	// the parser silently ignored it. Unknown keys are now refused instead, so the
+	// retiral is enforced rather than tolerated: a card that still declares it
+	// fails loudly instead of looking as if the setting were in effect.
+	const legacy = [
 		"---",
 		"name: probe",
 		"description: d",
 		"kind: pi",
 		"placement: new-tab",
 		"tools: [read]",
-		"steer: true",
-		"onBlocked: forward",
 		"---",
 		"body",
 	].join("\n");
-	const agent = parseAgentDocument(doc, "/x/probe.md", "user");
-	assert.ok(agent);
-	assert.deepEqual(
-		agent.unenforcedFields ?? [],
-		[],
-		"fields the runtime honours must not be listed",
+	assert.throws(
+		() => parseAgentDocument(legacy, "/x/probe.md", "user"),
+		/unknown frontmatter field: 'placement'/,
+		"a retired key must be rejected loudly",
 	);
+
+	// The same card without the retired key parses cleanly and never reports a
+	// phantom "unenforced" field.
+	const current = legacy.replace("placement: new-tab\n", "");
+	const agent = parseAgentDocument(current, "/x/probe.md", "user");
+	assert.ok(agent);
+	assert.deepEqual(agent.unenforcedFields ?? [], [], "fields the runtime honours must not be listed");
 	assert.equal("placement" in agent, false, "legacy placement frontmatter is ignored");
+	assert.deepEqual(
+		loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin").map((a) => a.name).sort(),
+		["advisor", "centurion", "designer", "planner", "prototype", "reviewer", "scout", "worker"],
+		"every bundled card must satisfy the strict field list",
+	);
 });
 
 test("acceptance.criteria is no longer reported unenforced (it is surfaced instead)", () => {

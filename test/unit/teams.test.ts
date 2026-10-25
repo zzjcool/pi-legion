@@ -1,5 +1,6 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -923,6 +924,15 @@ function indexHarness(
 	cleanup(): Promise<void>;
 } {
 	const cwd = mkdtempSync(path.join(tmpdir(), "teams-index-rpc-"));
+	// #279: a centurion role forces `worktree: true`, which needs a real git
+	// repo. Seeded here so the rpc/in-process arbitration is testable end to end.
+	const git = (args: string[]) => execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
+	git(["init", "-q"]);
+	git(["config", "user.email", "teams-test@example.invalid"]);
+	git(["config", "user.name", "Teams test"]);
+	writeFileSync(path.join(cwd, "README.md"), "fixture\n");
+	git(["add", "README.md"]);
+	git(["commit", "-m", "fixture", "-q"]);
 	const names = ["PI_SUBAGENT_CHILD", "PI_SUBAGENT_UTILITY_CHILD", "PI_CODING_AGENT_DIR", "PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS", "PI_LEGION_DB", "PI_LEGION_NODE_ID", TEAM_ENV];
 	const previous = new Map(names.map((name) => [name, process.env[name]]));
 	const agentDir = path.join(cwd, "agentdir");
@@ -992,7 +1002,11 @@ function indexHarness(
 }
 
 const WORKER_FILE = "---\nname: worker\ndescription: worker role\n---\nworker prompt\n";
-const RPC_WORKER_FILE = "---\nname: rpcworker\ndescription: worker role pinned to rpc\nspawnMode: rpc\n---\nworker prompt\n";
+// #279: role cards no longer carry `spawnMode` (the backend follows the worktree
+// decision: `worktree === true => rpc`). A centurion is the only role that
+// may hold a worktree, so it is the only role that reaches rpc — this fixture is
+// the rpc-shaped role the backends can still be exercised through.
+const RPC_WORKER_FILE = "---\nname: centurion\ndescription: centurion role\nworktree: true\n---\ncenturion prompt\n";
 const UTILITY_FILE = "---\nname: scout\ndescription: read-only utility role\nutility: true\ntools: read, grep, find, ls\nkind: pi\n---\nscout prompt\n";
 const DESIGNER_FILE = "---\nname: designer\ndescription: designer role\n---\ndesigner prompt\n";
 
@@ -1342,32 +1356,33 @@ test("vexillatio collect abort returns promptly without retiring utility childre
 test("index mainline: the launch line and the child record carry the arbitrated spawnMode (#209)", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
-		{ "worker.md": WORKER_FILE, "rpcworker.md": RPC_WORKER_FILE },
+		{ "worker.md": WORKER_FILE, "centurion.md": RPC_WORKER_FILE },
 	);
 	try {
-		// Same role shape as before but pinned to the rpc backend, so both
-		// arbitration outcomes are observable through the same harness.
+		// Two roles, two arbitrated backends, observable through one harness. The
+		// backend follows the WORKTREE decision now (role cards no longer carry
+		// `spawnMode`): a plain worker gets in-process, a centurion that is
+		// allowed to hold a worktree gets rpc. `worktree: false` on the launch is
+		// what keeps the centurion on the in-process path here, so this pins the
+		// launch-level override rather than a card field.
 		const inprocess = await invokeIndex(harness, { agent: "worker", task: "default backend", async: true, worktree: false });
-		assert.match(inprocess, /supervisor=inprocess/, "an omitted spawnMode with worktree:false arbitrates to inprocess");
-		// #279: rpc is reserved for centurion. A non-centurion role that pins
-		// `spawnMode: rpc` is demoted to inprocess with a one-time warning — the
-		// reservation is not negotiable, so "explicit value wins" (I6) yields here.
-		const rpc = await invokeIndex(harness, { agent: "rpcworker", task: "pinned backend", async: true, worktree: false });
-		assert.match(rpc, /supervisor=inprocess/, "a non-centurion spawnMode: rpc is forced to inprocess");
-		assert.doesNotMatch(rpc, /supervisor=rpc/);
+		assert.match(inprocess, /supervisor=inprocess/, "a worker with worktree:false arbitrates to inprocess");
+		const cent = await invokeIndex(harness, { agent: "centurion", task: "own the slice", async: true });
+		assert.match(cent, /supervisor=rpc/, "a centurion holding a worktree runs on rpc");
+		assert.doesNotMatch(cent, /supervisor=inprocess/);
 
 		const children = new RunStore({ rootDir: path.join(harness.cwd, ".pi-subagents") })
 			.listRuns()
 			.flatMap((run) => run.children);
 		assert.equal(children.find((child) => child.agent === "worker")?.spawnMode, "inprocess", "ChildRecord echoes the arbitrated mode");
-		assert.equal(children.find((child) => child.agent === "rpcworker")?.spawnMode, "inprocess", "#279: the demotion reaches the ChildRecord too");
+		assert.equal(children.find((child) => child.agent === "centurion")?.spawnMode, "rpc", "#279: the worktree decision is what selects rpc");
 	} finally { await harness.cleanup(); }
 });
 
 test("index mainline: launch-family details expose the arbitrated spawnMode as spawns (#209/D3)", async () => {
 	const harness = indexHarness(
 		{ disableBuiltins: true },
-		{ "worker.md": WORKER_FILE, "rpcworker.md": RPC_WORKER_FILE },
+		{ "worker.md": WORKER_FILE, "centurion.md": RPC_WORKER_FILE },
 	);
 	try {
 		const inprocess = await invokeIndexRaw(harness, { agent: "worker", task: "default backend", async: true, worktree: false });
@@ -1388,11 +1403,11 @@ test("index mainline: launch-family details expose the arbitrated spawnMode as s
 			"details never carry isError",
 		);
 
-		const rpc = await invokeIndexRaw(harness, { agent: "rpcworker", task: "pinned backend", async: true, worktree: false });
+		const rpc = await invokeIndexRaw(harness, { agent: "centurion", task: "own the slice", async: true });
 		const rpcSpawns = (rpc.details as { spawns?: Array<{ spawnMode: string }> } | undefined)?.spawns;
-		// #279: a non-centurion role pinned to rpc is demoted, and the details
-		// must report the ARBITRATED mode, not the role card's request.
-		assert.equal(rpcSpawns?.[0]?.spawnMode, "inprocess", "#279: details report the demoted mode");
+		// #209: details report the ARBITRATED backend, never a literal. A centurion
+		// holding a worktree is the rpc case.
+		assert.equal(rpcSpawns?.[0]?.spawnMode, "rpc", "#209: details report the arbitrated backend");
 	} finally { await harness.cleanup(); }
 });
 

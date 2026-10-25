@@ -40,7 +40,6 @@ export const OVERRIDE_FIELDS = [
 	"disabled",
 	"worktree",
 	"steer",
-	"spawnMode",
 	// numbers
 	"timeoutMs",
 	"toolTimeoutMs",

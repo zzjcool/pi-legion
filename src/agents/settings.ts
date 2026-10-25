@@ -18,7 +18,6 @@ import {
 	type InProcessLimits,
 	type RpcSettings,
 	type SubagentsSettings,
-	SPAWN_MODES,
 	type TeamConfig,
 	type TeamMember,
 } from "../shared/types.ts";
@@ -471,7 +470,6 @@ function overrideFieldExpected(field: string): string | undefined {
 	if (["description", "model", "preset", "output", "systemPrompt"].includes(field)) return "a string";
 	if (field === "thinking") return "a string or false";
 	if (field === "kind") return `one of: ${AGENT_KINDS.join(", ")}`;
-	if (field === "spawnMode") return `one of: ${SPAWN_MODES.join(", ")}`;
 	if (field === "onBlocked") return "a valid onBlocked policy";
 	if (field === "systemPromptMode") return "replace or append";
 	if (["inheritProjectContext", "inheritSkills", "inheritExtensions", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer", "renewable"].includes(field)) return "a boolean";
@@ -485,7 +483,6 @@ function isValidOverrideField(field: string, value: unknown): boolean {
 	if (["description", "model", "preset", "output", "systemPrompt"].includes(field)) return typeof value === "string";
 	if (field === "thinking") return typeof value === "string" || value === false;
 	if (field === "kind") return typeof value === "string" && (AGENT_KINDS as readonly string[]).includes(value);
-	if (field === "spawnMode") return typeof value === "string" && (SPAWN_MODES as readonly string[]).includes(value);
 	if (field === "onBlocked") return typeof value === "string" && VALID_ON_BLOCKED_POLICIES.has(value);
 	if (field === "systemPromptMode") return value === "replace" || value === "append";
 	if (["inheritProjectContext", "inheritSkills", "inheritExtensions", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer", "renewable"].includes(field)) return typeof value === "boolean";
@@ -633,15 +630,6 @@ function parseAgentOverrides(
 		if (normalized.utility !== undefined && typeof normalized.utility !== "boolean") {
 			throw new Error(
 				`Subagent settings in '${filePath}' have invalid 'agentOverrides.${name}.utility'; expected a boolean.`,
-			);
-		}
-		if (
-			normalized.spawnMode !== undefined &&
-			(typeof normalized.spawnMode !== "string" ||
-				!(SPAWN_MODES as readonly string[]).includes(normalized.spawnMode))
-		) {
-			throw new Error(
-				`Subagent settings in '${filePath}' have invalid 'agentOverrides.${name}.spawnMode'; expected one of: ${SPAWN_MODES.join(", ")}.`,
 			);
 		}
 		parsed[name] = normalized as AgentOverride;

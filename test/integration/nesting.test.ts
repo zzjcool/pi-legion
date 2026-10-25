@@ -249,21 +249,12 @@ test("M1 maxDepth above the hard cap warns once and emits the structured refusal
 			});
 			assert.equal(orchestrator.maxDepth, 4);
 			await orchestrator.launch({ agent: role("worker"), task: "launch within capped budget" });
-			// Two warnings now: the depth cap AND #279's rpc demotion — `role()` pins
-			// `spawnMode: "rpc"`, which a non-centurion role may no longer use. They
-			// are independent refusals, so both must appear.
-			const depthWarnings = warnings.filter((w) => /hard cap 4/.test(w));
-			assert.equal(depthWarnings.length, 1, `expected exactly one depth-cap warning, got: ${JSON.stringify(warnings)}`);
-			assert.match(depthWarnings[0] ?? "", /hard cap 4/);
-			assert.equal(
-				warnings.filter((w) => /rpc denied for non-centurion role 'worker'/.test(w)).length,
-				1,
-				"#279: the rpc demotion warns once per run too",
-			);
-			assert.deepEqual(
-				events.filter((e) => (e as { reason?: string }).reason === "maxDepth is capped at 4"),
-				[{ type: "budget_refused", requestedMaxDepth: 10, effectiveMaxDepth: 4, reason: "maxDepth is capped at 4" }],
-			);
+			// One warning: the depth cap. (`role()` still pins `spawnMode: "rpc"` for the
+			// argv-shape tests, but the field no longer reaches arbitration, so there is
+			// no second demotion warning any more.)
+			assert.equal(warnings.length, 1, `expected exactly one warning, got: ${JSON.stringify(warnings)}`);
+			assert.match(warnings[0] ?? "", /hard cap 4/);
+			assert.deepEqual(events, [{ type: "budget_refused", requestedMaxDepth: 10, effectiveMaxDepth: 4, reason: "maxDepth is capped at 4" }]);
 		} finally {
 			console.warn = previousWarn;
 			rmSync(runDir, { recursive: true, force: true });

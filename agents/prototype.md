@@ -20,7 +20,6 @@ acceptance:
       evidence: [file-path]
       severity: required
 kind: pi
-placement: split-down
 steer: true
 worktree: false
 maxSubagentDepth: 1

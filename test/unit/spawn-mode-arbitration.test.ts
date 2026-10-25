@@ -172,45 +172,52 @@ test("arbitration: omitted spawnMode + worktree:false stays inprocess", async ()
 	}
 });
 
-test("arbitration: an explicit rpc mode is never downgraded by a worktree (centurion)", async () => {
-	const h = plainHarness("spawn-arb-explicit-rpc-");
+test("arbitration: a centurion holding a worktree runs on rpc", async () => {
+	// Role cards no longer carry `spawnMode`; the backend follows the worktree
+	// decision (`worktree === true => rpc`). A centurion is the only role that
+	// may hold a worktree, so it is the only role that reaches rpc.
+	const h = plainHarness("spawn-arb-cent-rpc-");
 	try {
 		const orchestrator = new Orchestrator({ supervisor: h.supervisor, runDir: h.runDir, cwd: h.repo });
 		const handle = await orchestrator.launch({
-			agent: agent({ name: "centurion", spawnMode: "rpc", worktree: true }),
+			agent: agent({ name: "centurion", worktree: true }),
 			task: "isolated rpc work",
 		});
-		assert.ok(handle.child.worktreePath);
+		assert.ok(handle.child.worktreePath, "the worktree must be created");
 		assert.deepEqual(h.accepted, [{ name: handle.name, mode: "rpc", worktree: true }]);
 	} finally {
 		h.cleanup();
 	}
 });
 
-test("arbitration: explicit inprocess + worktree:true still throws INVALID_PARAMS for centurion (I1)", async () => {
-	const h = plainHarness("spawn-arb-explicit-inprocess-");
+test("arbitration: the inprocess+worktree conflict is still refused at the supervisor boundary", async () => {
+	// The orchestrator can no longer be driven into this shape from a card (there is
+	// no `spawnMode` field to pin), but the supervisor guard is the last line against
+	// an internal caller constructing it, so pin its wording directly.
+	const h = plainHarness("spawn-arb-conflict-");
 	try {
-		const orchestrator = new Orchestrator({ supervisor: h.supervisor, runDir: h.runDir, cwd: h.repo });
-		// Centurion keeps worktree, so explicit inprocess + worktree stays loud.
-		for (const launch of [
-			{ agent: agent({ name: "centurion", spawnMode: "inprocess", worktree: true }), task: "conflict" },
-			{ agent: agent({ name: "centurion", spawnMode: "inprocess" }), task: "conflict", worktree: true },
-		]) {
-			await assert.rejects(
-				() => orchestrator.launch(launch),
-				(error: unknown) => {
-					assert.ok(error instanceof SubagentError);
-					assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
-					// Pin D3 wording: prefer suggesting worktree: false.
-					assert.match(error.message, /cannot use worktree isolation/);
-					assert.match(error.message, /set worktree: false/);
-					assert.doesNotMatch(error.message, /use spawnMode "rpc"/);
-					return true;
-				},
-				"arbitration must not soften an explicit inprocess + worktree combination",
-			);
-		}
-		assert.deepEqual(h.accepted, [], "a refused combination never reaches the router");
+		await assert.rejects(
+			() =>
+				h.supervisor.spawnChild({
+					name: "conflict",
+					sessionFile: path.join(h.runDir, "conflict.jsonl"),
+					tempDir: h.runDir,
+					cwd: h.repo,
+					task: "conflict",
+					agent: agent({ name: "centurion", spawnMode: "inprocess", worktree: true }),
+				}),
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
+				// Pin D3 wording: prefer suggesting worktree: false. (The routing layer
+				// rejects the combination before the in-process supervisor does, so its
+				// "cannot combine with" copy is the one that surfaces here.)
+				assert.match(error.message, /cannot (use|combine with) worktree/);
+				assert.match(error.message, /set worktree: false/);
+				assert.doesNotMatch(error.message, /use spawnMode "rpc"/);
+				return true;
+			},
+		);
 	} finally {
 		h.cleanup();
 	}
