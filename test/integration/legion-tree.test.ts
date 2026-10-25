@@ -15,7 +15,7 @@ import { RunStore } from "../../src/runs/store.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { InMemoryUIProxy } from "../../src/supervisor/ui-proxy.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
-import type { AgentConfig } from "../../src/shared/types.ts";
+import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 
 function agent(name: string, overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
@@ -306,6 +306,101 @@ test("M2 tree e2e: root → centurion worktree → parallel workers → review �
 		assert.equal(store.readRun(rootRun.runId)?.children[0]?.nodeId, centurionNode.id);
 		const tree = execFileSync("git", ["-C", centurion.child.worktreePath!, "branch", "--show-current"], { encoding: "utf8" }).trim();
 		assert.match(tree, /^pi-subagent\/centurion-0-/);
+	} finally {
+		db.close();
+		rmSync(sandbox, { recursive: true, force: true });
+	}
+});
+
+test("#281: only the root session may dispatch a centurion", async () => {
+	// A centurion owns an isolated worktree AND its own command chain. Every other
+	// guard in `launch()` keys on the CHILD's role, so without this rule any agent
+	// could dispatch one and silently acquire worktree + rpc isolation — measured
+	// before the fix: a worker dispatch produced
+	// `supervisor=rpc, worktree .../worktrees/c1, branch pi-subagent/c1-...`.
+	//
+	// Refused rather than demoted: a centurion without a worktree cannot do its
+	// job, and a nested command chain is invisible to the root's collect.
+	const sandbox = mkdtempSync(path.join(tmpdir(), "legion-centurion-guard-"));
+	const repo = path.join(sandbox, "repo");
+	mkdirSync(repo, { recursive: true });
+	const git = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+	git(["init", "-q"]);
+	git(["config", "user.email", "legion-test@example.invalid"]);
+	git(["config", "user.name", "Legion integration test"]);
+	writeFileSync(path.join(repo, "README.md"), "fixture\n");
+	git(["add", "README.md"]);
+	git(["commit", "-m", "test fixture", "-q"]);
+
+	const store = new RunStore({ rootDir: path.join(repo, ".pi-subagents") });
+	const rootRun = store.createRun({ task: "centurion dispatch guard", cwd: repo, maxDepth: 4, nodeId: "root", herdr: { supervisor: "rpc" } });
+	const dbPath = legionDbPath(store.runDir(rootRun.runId));
+	const db = openLegionDb(dbPath);
+	const spawns: string[] = [];
+	const record = (input: { agent: AgentConfig }) => {
+		spawns.push(input.agent.name);
+		return { name: "recorded", sessionFile: path.join(repo, "unused.jsonl"), pid: 1 };
+	};
+	const uiProxy = new InMemoryUIProxy();
+	const supervisor = new RoutingSupervisor({
+		rpc: { uiProxy, isAlive: () => false, spawnChild: async (input: { agent: AgentConfig }) => record(input) } as never,
+		inprocess: { uiProxy, isAlive: () => false, spawnChild: async (input: { agent: AgentConfig }) => record(input) } as never,
+		uiProxy,
+	});
+	const legionFor = (nodeId: string) => ({
+		db, dbPath, nodeId, runId: rootRun.runId, runStore: store,
+		settings: { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: 30 },
+		eventBus: createLegionEventBus(),
+	});
+	try {
+		insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+		insertNode(db, { id: "root.worker-0", parentId: "root", name: "worker-0", role: "worker", runId: rootRun.runId, status: "running" });
+		insertNode(db, { id: "root.centurion-0", parentId: "root", name: "centurion-0", role: "centurion", runId: rootRun.runId, status: "running" });
+
+		// (a) root may dispatch a centurion.
+		const rootOrch = new Orchestrator({
+			supervisor, runDir: store.runDir(rootRun.runId), cwd: repo, maxDepth: 4,
+			legion: legionFor("root"),
+		});
+		const launched = await rootOrch.launch({ agent: agent("centurion", { worktree: true }), task: "own the slice", name: "centurion-a" });
+		assert.equal(launched.child.agent, "centurion");
+		assert.equal(spawns.length, 1);
+
+		// (b) a worker may NOT — refused before any spawn or worktree directory.
+		const workerOrch = new Orchestrator({
+			supervisor, runDir: store.runDir(rootRun.runId), cwd: repo, maxDepth: 4,
+			legion: legionFor("root.worker-0"),
+		});
+		await assert.rejects(
+			() => workerOrch.launch({ agent: agent("centurion", { worktree: true }), task: "escape", name: "centurion-b" }),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.BUDGET_EXCEEDED &&
+				/only the root session may dispatch a centurion/.test(error.message) &&
+				/'worker' at 'root\.worker-0' cannot/.test(error.message),
+			"a non-root dispatch must be refused with a message naming the parent",
+		);
+		assert.equal(spawns.length, 1, "a refused dispatch must not spawn a child process");
+
+		// (c) a centurion may NOT dispatch another centurion (no nested command chains).
+		const centOrch = new Orchestrator({
+			supervisor, runDir: store.runDir(rootRun.runId), cwd: repo, maxDepth: 4,
+			legion: legionFor("root.centurion-0"),
+		});
+		await assert.rejects(
+			() => centOrch.launch({ agent: agent("centurion", { worktree: true }), task: "nested chain", name: "centurion-c" }),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.BUDGET_EXCEEDED &&
+				/only the root session may dispatch a centurion/.test(error.message),
+			"centurion -> centurion is refused as well",
+		);
+		assert.equal(spawns.length, 1, "still no extra spawn");
+
+		// (d) everything else keeps working: a centurion still dispatches a worker.
+		const worker = await centOrch.launch({ agent: agent("worker"), task: "legit slice", name: "worker-b" });
+		assert.equal(worker.child.agent, "worker");
+		assert.equal(spawns.length, 2);
 	} finally {
 		db.close();
 		rmSync(sandbox, { recursive: true, force: true });
