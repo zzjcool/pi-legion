@@ -445,6 +445,7 @@ const AGENT_FRONTMATTER_FIELDS: ReadonlySet<string> = new Set([
 	"preset", "team", "output", "fallbackModels",
 	// prompt / context
 	"systemPromptMode", "inheritProjectContext", "inheritSkills", "inheritExtensions",
+	"excludeExtensions",
 	"skillPath", "skills", "defaultReads",
 	// tools
 	"tools", "extensions", "subagentOnlyExtensions",
@@ -579,6 +580,7 @@ function applyCapabilityFields(
 	setIf(config, "skills", listOrFalse(fm.skills));
 	setIf(config, "skillPath", list(fm.skillPath));
 	setIf(config, "extensions", list(fm.extensions));
+	if (list(fm.excludeExtensions)) config.excludeExtensions = list(fm.excludeExtensions);
 	setIf(config, "subagentOnlyExtensions", list(fm.subagentOnlyExtensions));
 	setIf(config, "alias", list(fm.alias) ?? list(fm.aliases));
 	setIf(config, "output", str(fm.output));

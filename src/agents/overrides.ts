@@ -31,6 +31,7 @@ export const OVERRIDE_FIELDS = [
 	"inheritProjectContext",
 	"inheritSkills",
 	"inheritExtensions",
+	"excludeExtensions",
 	"defaultProgress",
 	"async",
 	"completionGuard",

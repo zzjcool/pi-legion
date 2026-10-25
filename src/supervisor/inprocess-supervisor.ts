@@ -146,10 +146,17 @@ export function buildInProcessSessionPlan(
 	const { text: systemPromptText, mode: systemPromptMode } =
 		resolveInProcessSystemPrompt(input);
 
-	const noExtensions = !childInheritsExtensions(input.agent);
-	const additionalExtensionPaths = noExtensions
-		? collectChildExtensions(input.agent)
-		: [];
+	// #280: pi's own discovery is ALWAYS disabled, and the full extension list is
+	// passed explicitly. Two reasons:
+	//
+	//  - the inherited set is now computed by us (minus `excludeExtensions`), so
+	//    letting pi discover on top of it would re-add an excluded extension
+	//  - `additionalExtensionPaths` loads independently of `noExtensions`, so the
+	//    child-guard arrives either way — but only this shape keeps rpc and
+	//    in-process byte-identical (rpc also emits `--no-extensions` + explicit
+	//    `--extension` flags)
+	const noExtensions = true;
+	const additionalExtensionPaths = collectChildExtensions(input.agent);
 
 	return {
 		cwd: input.cwd,
