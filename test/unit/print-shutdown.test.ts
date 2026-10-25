@@ -6,11 +6,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import piLegion from "../../index.ts";
 import { RunStore } from "../../src/runs/store.ts";
+import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
+import { insertNode } from "../../src/legion/nodes.ts";
 import {
 	NO_ASSISTANT_ABORT_REASON,
 	PARENT_SESSION_SHUTDOWN_ABORT_REASON,
@@ -185,5 +187,102 @@ test("interactive session_shutdown still retires immediately and attributes the 
 			assert.equal(execution.reason, PARENT_SESSION_SHUTDOWN_ABORT_REASON);
 			assert.notEqual(execution.reason, NO_ASSISTANT_ABORT_REASON);
 		});
+	}
+});
+
+test("#283: re-entering the extension factory must reuse the legion.db handle", async () => {
+	// `pi` re-runs the extension factory for every `DefaultResourceLoader.reload()`,
+	// and an in-process child session builds its OWN loader per
+	// `createAgentSession`. One process therefore enters `piLegion` many times.
+	//
+	// The runtime handle used to be a closure-local `let`, reset to undefined on
+	// every entry. That defeated the `cached` short-circuit in
+	// `resolveLegionIdentity`, so each re-entry opened a fresh `legion.db` and
+	// never closed it: measured on a centurion dispatching one in-process scout,
+	// ~2.5k leaked descriptors per 20 s while RSS climbed to 6 GB until V8 aborted
+	// with `JavaScript heap out of memory`.
+	//
+	// This case drives the real open path (PI_LEGION_DB + PI_LEGION_NODE_ID set,
+	// with a real ledger on disk) and counts descriptors pointing at that file.
+	const sandbox = mkdtempSync(path.join(tmpdir(), "legion-283-"));
+	const cwd = path.join(sandbox, "project");
+	const agentDir = path.join(sandbox, "agent");
+	const extraAgentsDir = path.join(sandbox, "extra-agents");
+	const storeRoot = path.join(cwd, ".pi-subagents");
+	mkdirSync(cwd, { recursive: true });
+	mkdirSync(agentDir, { recursive: true });
+	mkdirSync(extraAgentsDir, { recursive: true });
+
+	const store = new RunStore({ rootDir: storeRoot });
+	const run = store.createRun({ task: "re-entry", cwd, maxDepth: 4, nodeId: "root" });
+	const dbPath = legionDbPath(store.runDir(run.runId));
+	const seed = openLegionDb(dbPath);
+	insertNode(seed, { id: "root", parentId: null, name: "root", role: "root", runId: run.runId, status: "running" });
+	seed.close();
+
+	const previous = new Map(ENV_KEYS.map((name) => [name, process.env[name]]));
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	// `piLegion` installs timers and an event bus; without capturing its handlers
+	// the test leaves work pending after the assertions and the runner hangs
+	// ("Promise resolution is still pending"). Keep the latest handler map so the
+	// finally block can shut the runtime down.
+	let handlers = new Map<string, (...args: unknown[]) => unknown>();
+	const fakePi = () => {
+		const own = new Map<string, (...args: unknown[]) => unknown>();
+		handlers = own;
+		return {
+			registerTool() {},
+			registerCommand() {},
+			registerMessageRenderer() {},
+			sendMessage() {},
+			events: { emit() {} },
+			on(name: string, handler: (...args: unknown[]) => unknown) {
+				own.set(name, handler);
+			},
+		};
+	};
+	const countDbFds = (): number => {
+		try {
+			const target = `legion.db`;
+			return readdirSync("/proc/self/fd").filter((fd) => {
+				try {
+					return readlinkSync(`/proc/self/fd/${fd}`).endsWith(target);
+				} catch {
+					return false;
+				}
+			}).length;
+		} catch {
+			return -1; // not Linux
+		}
+	};
+
+	try {
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
+		for (const name of ENV_KEYS.slice(2)) delete process.env[name];
+		// Drive the boot-time attach path (`isChild` + LEGION_DB/NODE_ID present).
+		process.env.PI_SUBAGENT_CHILD = "1";
+		process.env.PI_SUBAGENT_ALLOW_NESTED = "1";
+		process.env.PI_LEGION_DB = dbPath;
+		process.env.PI_LEGION_NODE_ID = "root";
+
+		piLegion(fakePi() as never, { supervisor });
+		const before = countDbFds();
+		for (let i = 0; i < 4; i += 1) piLegion(fakePi() as never, { supervisor });
+		const after = countDbFds();
+
+		if (before >= 0) {
+			assert.ok(
+				after <= before,
+				`re-entering the factory must reuse the ledger handle, not open another: ${before} -> ${after} across 4 re-entries`,
+			);
+		}
+	} finally {
+		await handlers.get("session_shutdown")?.();
+		for (const [name, value] of previous) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+		rmSync(sandbox, { recursive: true, force: true });
 	}
 });

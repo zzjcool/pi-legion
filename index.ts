@@ -712,6 +712,22 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
+/**
+ * The live legion runtime for THIS process, held at module scope rather than in
+ * the `piLegion` closure (#283).
+ *
+ * `pi` re-runs the extension factory for every `DefaultResourceLoader.reload()`,
+ * and an in-process child session creates its own loader
+ * (`inprocess-supervisor.ts` builds one per `createAgentSession`). So a single
+ * process can enter `piLegion` many times. A closure-local `let` reset to
+ * `undefined` on each entry defeated the cache inside `resolveLegionIdentity`,
+ * which then opened a fresh `legion.db` — and never closed it. Measured on a
+ * centurion dispatching one in-process scout: one extra open per entry, ~2.5k
+ * leaked descriptors per 20 s, RSS climbing to 6 GB until V8 aborted with
+ * `JavaScript heap out of memory`.
+ */
+let legionIdentity: LegionRuntimeIdentity | undefined;
+
 export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {
 	// #197 D8: a session is a child if either transport says so. RPC children
 	// are separate processes marked in env; in-process children share the
@@ -829,7 +845,6 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			return true;
 		}
 	};
-	let legionIdentity: LegionRuntimeIdentity | undefined;
 	const stopLegionRuntime = (): void => {
 		if (!legionIdentity) return;
 		legionIdentity.postman.stop();
