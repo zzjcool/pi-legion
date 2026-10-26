@@ -61,15 +61,54 @@ export function childInheritsExtensions(
 
 const execFileAsync = promisify(execFile);
 
-/** Host-discovered package extension paths, resolved once per process. */
-let discovered: string[] | undefined;
-/** In-flight discovery, so concurrent launches share one `pi list`. */
-let discovery: Promise<string[]> | undefined;
+/**
+ * Where the discovery cache lives: `globalThis` under `Symbol.for(...)`.
+ *
+ * A module-level `let` would be invisible to the other module *instances* in
+ * this process. A child's `--extension` load re-evaluates this module with
+ * `moduleCache: false`, and `/reload` plus a cwd change clear pi's extension
+ * cache, so each re-evaluation would start from an empty cache and throw away
+ * the parent's warm result — "discover once per process" would degrade to
+ * "discover once per module instance", and a child spawned from a re-loaded
+ * instance would silently inherit nothing.
+ *
+ * `Symbol.for` is registry-backed and `globalThis` survives re-evaluation; the
+ * same escape hatch is used by `supervisor/child-context.ts`,
+ * `supervisor/inprocess-depth.ts` and `supervisor/admission-queue.ts` for the
+ * same reason.
+ *
+ * Do NOT turn this back into a module-level variable, and do not re-assign the
+ * holder in `resetExtensionDiscoveryCache` — two module instances would then
+ * point at two different holders and the reset would silently stop working.
+ */
+const STORE_KEY = Symbol.for("pi-legion.extension-discovery");
 
-/** Reset the cache. Test seam only. */
+interface DiscoveryStore {
+	/** Resolved extension list, or undefined until a discovery succeeds. */
+	discovered?: string[];
+	/** In-flight discovery, so concurrent launches share one `pi list`. */
+	inFlight?: Promise<string[]>;
+}
+
+/** Symbol-indexed view of globalThis so the cache survives module re-evaluation. */
+type StoreHolder = { [key: symbol]: DiscoveryStore | undefined };
+
+// SAFETY: `globalThis` is an object, so a `Symbol.for`-keyed property on it is
+// readable; the only invariant TypeScript cannot check is that whoever wrote
+// that slot first stored a `DiscoveryStore`. Both sides of that contract live in
+// this file, so the declared slot type is authoritative.
+const store = ((globalThis as unknown as StoreHolder)[STORE_KEY] ??= {});
+
+/**
+ * Reset the cache. Test seam only.
+ *
+ * Clears the holder's FIELDS rather than replacing the holder: a replacement
+ * would be invisible to every other module instance still pointing at the old
+ * object (the exact failure mode the shared holder exists to prevent).
+ */
 export function resetExtensionDiscoveryCache(): void {
-	discovered = undefined;
-	discovery = undefined;
+	delete store.discovered;
+	delete store.inFlight;
 }
 
 /**
@@ -119,42 +158,80 @@ export function parsePiList(output: string): string[] {
 }
 
 /**
- * Ask pi which packages are installed and resolve them to extension files.
+ * Run one `pi list` and resolve it to extension entry paths.
  *
- * Never throws: a host without `pi` on PATH, or a `pi list` failure, degrades to
- * "no discovered extensions" (children still get their explicit list plus the
- * child-guard). Failure to discover must not fail a launch.
+ * Returns `undefined` when discovery itself failed (no `pi` on PATH, non-zero
+ * exit, timeout) so the caller can distinguish "nothing installed" from "could
+ * not ask" — only the latter must stay retryable.
  */
-export async function discoverHostExtensions(env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
-	if (discovered) return discovered;
-	discovery ??= (async () => {
-		let dirs: string[] = [];
-		try {
-			const { stdout } = await execFileAsync("pi", ["list"], {
-				env,
-				timeout: 15_000,
-				maxBuffer: 4 * 1024 * 1024,
-			});
-			dirs = parsePiList(stdout);
-		} catch {
-			dirs = [];
-		}
-		const entries = dirs.flatMap((dir) => resolveExtensionEntries(dir));
-		const seen = new Set<string>();
-		discovered = entries.filter((entry) => {
-			const key = path.resolve(entry);
-			if (seen.has(key)) return false;
-			seen.add(key);
-			return true;
+async function resolveHostExtensions(env: NodeJS.ProcessEnv): Promise<string[] | undefined> {
+	let dirs: string[];
+	try {
+		const { stdout } = await execFileAsync("pi", ["list"], {
+			env,
+			timeout: 15_000,
+			maxBuffer: 4 * 1024 * 1024,
 		});
-		return discovered;
-	})();
-	return discovery;
+		dirs = parsePiList(stdout);
+	} catch {
+		return undefined;
+	}
+	const entries = dirs.flatMap((dir) => resolveExtensionEntries(dir));
+	const seen = new Set<string>();
+	return entries.filter((entry) => {
+		const key = path.resolve(entry);
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
+}
+
+/**
+ * Discover the host's extensions once per process and return them.
+ *
+ * Idempotent and concurrency-safe: the first caller runs `pi list`, concurrent
+ * callers await the same in-flight promise, and once resolved every later call
+ * returns the cache without spawning anything.
+ *
+ * Never throws and never rejects: a host without `pi`, or a failing `pi list`,
+ * degrades to `[]` (children still get their explicit list plus the
+ * child-guard). Failure to discover must not fail a launch.
+ *
+ * A FAILED discovery is deliberately not cached. The previous shape cached `[]`
+ * permanently, so one transient `pi list` error disabled inheritance until the
+ * process restarted. Only the in-flight slot is dropped, which is what lets the
+ * next spawn retry.
+ *
+ * `env` is handed to `execFile` (a caller can point discovery at a specific
+ * PATH); the cache itself is process-wide and does not vary by env.
+ */
+export async function ensureHostExtensions(env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
+	if (store.discovered) return store.discovered;
+	if (!store.inFlight) {
+		store.inFlight = (async () => {
+			try {
+				const resolved = await resolveHostExtensions(env);
+				if (!resolved) return [];
+				store.discovered = resolved;
+				return resolved;
+			} finally {
+				// Success caches through `discovered`; failure must leave nothing behind
+				// but a cleared in-flight slot, or the retry could never start.
+				delete store.inFlight;
+			}
+		})();
+	}
+	return store.inFlight;
+}
+
+/** Historical name for `ensureHostExtensions`; launch paths call that one. */
+export async function discoverHostExtensions(env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
+	return ensureHostExtensions(env);
 }
 
 /** Synchronous read of whatever discovery has already produced. */
 export function discoveredHostExtensions(): string[] | undefined {
-	return discovered;
+	return store.discovered;
 }
 
 /**
