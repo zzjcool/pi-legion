@@ -512,8 +512,9 @@ test("command: lists sandboxed + builtin roles, grouped, with file paths", async
 			assert.match(text, /file: .*deploy\.md/);
 			// …the sandboxed user-level role…
 			assert.match(text, /  search\n    web and code search/);
-			// …and the bundled roles still load.
-			assert.match(text, /builtin \(8\)/);
+			// …and the bundled roles still load. #301 dropped the fixed cast
+			// (planner/reviewer/designer/prototype/advisor), leaving three.
+			assert.match(text, /builtin \(3\)/);
 			assert.match(text, /  worker\n/);
 			// The project directory points at the temp project.
 			assert.match(text, new RegExp(`project: .*${path.basename(projectRoot)}`));

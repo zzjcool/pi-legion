@@ -84,10 +84,18 @@ export const DEFAULT_PHASE_MACHINE: PhaseMachine = {
 		{
 			id: "implementing",
 			timeoutMs: 60 * 60_000,
+			// Entering implementation means planning is over, so no planning child may
+			// still be running. Expressed as a phase-level requirement (ANDed into every
+			// exit, including `aborted`) rather than a role check: the old rule named
+			// `planner`, which stopped working the moment that card was removed.
+			// Phase-level: leaving implementation (in any direction, including a failure)
+			// requires that no child is still running. The old rule named `planner`
+			// specifically, but the intent was "planning is over, nothing is in flight";
+			// naming nobody also means the rule survives the planner card's removal.
+			require: ["children_settled"],
 			next: [
-				{ to: "reviewing", require: ["children_settled", "children_none_failed"] },
-				// Every worker failed: the team cannot succeed, so fail it. Expressed
-				// as a normal edge with its own condition rather than a special case.
+				{ to: "reviewing", require: ["children_present", "children_none_failed"] },
+				// Every child failed: the team cannot succeed, so fail it.
 				{ to: "failed", require: ["children_all_failed"] },
 				{ to: "aborted" },
 			],
@@ -96,7 +104,11 @@ export const DEFAULT_PHASE_MACHINE: PhaseMachine = {
 			id: "reviewing",
 			timeoutMs: 30 * 60_000,
 			next: [
-				{ to: "verifying", require: ["verdict_ok"] },
+				// `verdict_ok` alone would let a team that produced NO review at all walk
+				// straight through (the caller passes `verdictOk: undefined`, and an
+				// undefined verdict is not `false`). Pair it with `children_settled` so a
+				// review actually happened — the old rule required a settled reviewer.
+				{ to: "verifying", require: ["children_present", "children_settled", "verdict_ok"] },
 				{ to: "implementing", require: ["verdict_not_ok"], rework: true },
 				// A bad plan may be sent back by the team lead only.
 				{ to: "planning", actorRole: "centurion", notifyParent: true },
@@ -365,12 +377,20 @@ export function legacyReasonForCondition(
 			// The default machine uses this condition on two different edges with
 			// distinct historical messages.
 			return edge.to === "reviewing" ? "worker_still_active" : "children_not_terminal";
+		case "children_present":
+			// Nothing ran, so there is no verdict to accept. The historical name for
+			// "you need an actual review before verifying" is reviewer_not_settled.
+			return edge.to === "verifying" ? "reviewer_not_settled" : "condition_not_met";
 		case "children_none_failed":
 			return "failed_worker_unhandled";
 		case "children_all_failed":
 			return "all_workers_failed";
 		case "verdict_ok":
-			return "reviewer_not_settled";
+			// Distinguish "no review happened" from "the review said no". The old
+			// switch reported `reviewer_not_settled` for the first and
+			// `review_verdict_not_accepted` for the second, and callers rely on the
+			// difference: one means dispatch a reviewer, the other means rework.
+			return edge.to === "verifying" ? "review_verdict_not_accepted" : "condition_not_met";
 		case "verdict_not_ok":
 			return "review_verdict_not_rejected";
 		case "verification_passed":

@@ -49,7 +49,7 @@ User (CEO) — root Pi session (TUI)
    └─ pi-legion in child mode
       ├─ LegionSupervisor for this squad
       ├─ `legion_mail` / `legion_tree` / `legion_phase` tools
-      ├─ worker / scout / reviewer … children (`worktree: false`)
+      ├─ worker / scout … children (`worktree: false`)
       └─ nested centurions → recursive squads
 ```
 
@@ -64,6 +64,45 @@ Transport, state, decision-making, and display are separate layers:
   owns machine state and validates phase transitions.
 - **Display:** the event bus feeds the resident tree, the `/legion` full view,
   and an on-demand live overlay.
+
+## Bundled roles
+
+Three roles ship with the package:
+
+| Role | Purpose | Tools | Default timeout |
+| --- | --- | --- | --- |
+| `centurion` | Team lead: freeze the contract, dispatch children, drive the phase machine, deliver a reviewable result. Holds the worktree. | pi defaults | 30 min |
+| `worker` | Implementation: write code and run tests against a frozen plan, report a verdict. | read/edit/write/grep/find/ls/bash/codemode | 45 min |
+| `scout` | Read-only recon: produce a fact list, no plan, no implementation. | read/grep/find/ls/bash/codemode | 10 min |
+
+`worker` cannot dispatch nested agents (`maxSubagentDepth: 1`). Anything a worker
+needs to escalate is a `verdict ok:false`, not another layer of children — one
+level keeps the tree's cost and blast radius bounded.
+
+Roles are not a fixed pipeline. Since the phase machine became declarative
+(#298), nothing in the runtime keys on a role being called "worker" or
+"reviewer"; a team shapes its workflow by declaring phases on its lead's card.
+
+```yaml
+# agents/centurion.md
+phases:
+  - id: recon
+    next:
+      - to: build
+        require: [contract_file]
+  - id: build
+    next:
+      - to: done
+        require: [children_settled]
+```
+
+Omitted means the built-in four-phase pipeline
+(`planning → implementing → reviewing → verifying → done`). Conditions are a
+closed vocabulary — `contract_file`, `children_present`, `children_settled`,
+`children_none_failed`, `verdict_ok`, `verdict_not_ok`, `verification_passed`,
+`verification_failed`, `rework_available`, `children_all_failed`, `always` — and
+`done` / `failed` / `aborted` are always available terminals so a team can
+never lose the ability to complete or abort.
 
 ## Spawn mode
 
@@ -124,7 +163,7 @@ subagent({
 ```
 
 The centurion plans the work, writes the squad contract, dispatches ordinary
-roles such as `worker`, `scout`, and `reviewer`, and coordinates the squad
+roles such as `worker` and `scout`, and coordinates the squad
 through its phases. For a single leaf task, dispatch an ordinary role directly:
 
 ```text
@@ -227,7 +266,7 @@ legion_phase({ to, note?, evidence? })
 
 A squad moves through **planning → implementing → reviewing → verifying**.
 Planning produces a non-empty `.pi-legion/contract.md` with file ownership
-and acceptance commands. During reviewing, an independent reviewer supplies
+and acceptance commands. During reviewing, an independent child supplies
 the judgment; in verifying, the supervisor runs the contract's `legion-verify`
 commands without an LLM. Passing verification advances the squad to `done`.
 
@@ -450,9 +489,8 @@ explicitly if a child needs them.
 
 **Cost note.** Inheriting everything includes heavy extensions. pi-lens starts an
 LSP stack (~1 GB per child, #43). If a fleet of children does not need it, add
-`excludeExtensions: [pi-lens]` to those cards. Bundled planner, reviewer, and
-worker do not list `lens_*` tools; give a role those tools by adding the names to
-its `tools:` list.
+`excludeExtensions: [pi-lens]` to those cards. The bundled `worker` does not list
+`lens_*` tools; give a role those tools by adding the names to its `tools:` list.
 
 ### Extra agent directories
 
@@ -503,7 +541,7 @@ another connection holds the db.
 
 ## Delivery and resume
 
-A centurion owns a Git worktree for its subtree; its worker/scout/reviewer
+A centurion owns a Git worktree for its subtree; its worker/scout
 children work in that subtree (`worktree: false`, typically in-process), and a
 nested centurion gets a nested worktree. **Parallel isolated writers:** dispatch
 N centurions from the root (each owns one worktree); do not give every worker

@@ -1,6 +1,5 @@
 import {
 	type PhaseMachine,
-	type PhaseTransitionRule,
 	DEFAULT_PHASE_MACHINE,
 	DEFAULT_MAX_REWORK_COUNT,
 	findPhase,
@@ -8,7 +7,13 @@ import {
 	isTerminalIn,
 	legacyReasonForCondition,
 } from "./phase-machine.ts";
-import { checkPhaseRequirements, type PhaseConditionInput } from "./phase-conditions.ts";
+import {
+	checkPhaseCondition,
+	checkPhaseRequirements,
+	describeFailedCondition,
+	type PhaseCondition,
+	type PhaseConditionInput,
+} from "./phase-conditions.ts";
 
 export const LEGION_PHASES = [
 	"planning",
@@ -154,7 +159,26 @@ function evaluateDeclarative(
 		return allowed(input, reworkCount, now(), false);
 	}
 
-	// Terminal exits keep their non-negotiable preconditions.
+	// A phase-level `require` still binds a FAILURE exit: leaving `implementing`
+	// for `failed` while a child is mid-run would strand that child, so the
+	// requirement is checked before the terminal shortcut.
+	//
+	// `aborted` is deliberately exempt. It is the emergency stop — the parent
+	// retire path — and gating it on "everything is settled" would mean a team
+	// with a wedged child could never be stopped. Availability of the stop button
+	// outranks tidiness.
+	const fromPhase = findPhase(machine, from);
+	const entryRequirement = to === "aborted"
+		? ({ ok: true } as const)
+		: checkPhaseRequirements(fromPhase?.require ?? [], conditionInput(input));
+	if (!entryRequirement.ok) {
+		const legacy = legacyReasonForCondition(entryRequirement.failed, { to });
+		return denied(
+			input,
+			legacy,
+			describeFailedCondition(entryRequirement.failed),
+		);
+	}
 	if (to === "aborted") {
 		if (input.terminalReason !== "parent_retire") {
 			return denied(input, "terminal_reason_required", "aborted requires a parent retire decision");
@@ -182,9 +206,12 @@ function evaluateDeclarative(
 		);
 	}
 	if (rule.actorRole !== undefined && input.actorRole !== rule.actorRole) {
+		// Preserve the historical code for the centurion-only edge so existing
+		// callers and tests keep their meaning; other reserved edges get the
+		// general name.
 		return denied(
 			input,
-			"actor_not_permitted",
+			rule.actorRole === "centurion" ? "centurion_required" : "actor_not_permitted",
 			`only ${rule.actorRole} may transition ${from} → ${to}`,
 		);
 	}
@@ -195,11 +222,29 @@ function evaluateDeclarative(
 		conditionInput(input),
 	);
 	if (!requirement.ok) {
+		// A team whose children ALL failed cannot succeed, so refusing the move it
+		// asked for while leaving it "running" strands it: nobody will ever satisfy
+		// the requirement it just failed. Force the terminal transition instead.
+		// The old code special-cased this for workers; the condition is structural,
+		// so it now covers any team whose dispatched children all failed.
+		if (
+			requirement.failed === "children_none_failed" &&
+			checkPhaseCondition("children_all_failed", conditionInput(input))
+		) {
+			return {
+				...denied(
+					input,
+					"all_workers_failed",
+					`all children failed; the team cannot reach ${to} and must fail`,
+				),
+				forcedTransition: { to: "failed", reworkCount, reason: "all_children_failed" },
+			};
+		}
 		const legacy = legacyReasonForCondition(requirement.failed, rule);
 		return denied(
 			input,
 			legacy,
-			`transition ${from} → ${to} refused: condition '${requirement.failed}' is not met`,
+			describeFailedCondition(requirement.failed),
 		);
 	}
 
@@ -258,110 +303,19 @@ export function evaluatePhaseTransition(
 	input: EvaluatePhaseTransitionInput,
 	now: () => number = () => Date.now(),
 ): PhaseTransitionDecision {
-	const { from, to } = input;
-	const children = input.children ?? [];
-	const reworkCount = input.reworkCount ?? 0;
-	// #298: a declared machine takes over. Every structural rule (new team starts
-	// at the start phase, rework cap, terminal semantics) is re-applied there, so
-	// the two paths cannot drift.
-	// #298: normalize here, not only at parse time. The universal terminals
-	// (`done`/`failed`/`aborted`) must exist for ANY machine that reaches this
-	// function — including one built in code or in a test — because a team that
-	// cannot be aborted is a safety hole. Normalization only ADDS those terminal
-	// phases; taking them is still gated below.
-	if (input.machine !== undefined) {
-		return evaluateDeclarative(input, normalizePhaseMachine(input.machine), now);
-	}
-	if (!isLegionPhase(to) || (from !== null && !isLegionPhase(from))) {
-		return denied(input, "invalid_phase", "phase is not part of the legion state machine");
-	}
-	if (!Number.isInteger(reworkCount) || reworkCount < 0) {
-		return denied(input, "invalid_phase", "reworkCount must be a non-negative integer");
-	}
-	if (from === to) return denied(input, "same_phase", "phase is already current");
-	if (from !== null && isTerminalPhase(from)) {
-		return denied(input, "terminal_phase", `terminal phase ${from} cannot transition`);
-	}
-	if (from === null && to !== "planning") {
-		return denied(input, "invalid_transition", "a new team must start in planning");
-	}
-	if (to === "aborted") {
-		if (input.terminalReason !== "parent_retire") {
-			return denied(input, "terminal_reason_required", "aborted requires a parent retire decision");
-		}
-		return allowed(input, reworkCount, now(), false);
-	}
-	if (from === "implementing" || to === "implementing") {
-		const planner = children.find((child) => child.role === "planner" && child.status === "running");
-		if (planner) {
-			return denied(input, "planner_still_active", `planner child ${planner.id} is still running during implementing`);
-		}
-	}
-	if (to === "failed") return evaluateFailure(input, children, reworkCount, now);
-	if (from === null) return allowed(input, reworkCount, now(), false);
-
-	if (from === "planning" && to === "implementing") {
-		if (!input.contractPath?.trim()) {
-			return denied(input, "contract_path_required", "planning requires a non-empty contract_path");
-		}
-		return allowed(input, reworkCount, now(), false);
-	}
-	if (from === "implementing" && to === "reviewing") {
-		const workers = children.filter((child) => child.role === "worker");
-		if (workers.some((child) => isActiveChild(child.status))) {
-			return denied(input, "worker_still_active", "all worker children must be settled before reviewing");
-		}
-		if (workers.length > 0 && workers.every((child) => child.status === "failed")) {
-			return {
-				...denied(input, "all_workers_failed", "all worker children failed; team must fail"),
-				forcedTransition: { to: "failed", reworkCount, reason: "all_children_failed" },
-			};
-		}
-		const handled = new Set(input.failedWorkerHandledIds ?? []);
-		const unhandled = workers.find((child) => child.status === "failed" && !handled.has(child.id));
-		if (unhandled) {
-			return denied(input, "failed_worker_unhandled", `failed worker ${unhandled.id} must be reworked or transferred to failed`);
-		}
-		return allowed(input, reworkCount, now(), false);
-	}
-	if (from === "reviewing" && to === "verifying") {
-		if (!children.some((child) => child.role === "reviewer" && child.status === "settled")) {
-			return denied(input, "reviewer_not_settled", "at least one reviewer must be settled before verifying");
-		}
-		if (input.reviewerVerdictOk !== true) {
-			return denied(input, "review_verdict_not_accepted", "reviewing requires a settled reviewer verdict ok:true");
-		}
-		return allowed(input, reworkCount, now(), false);
-	}
-	if (from === "reviewing" && to === "implementing") {
-		if (input.reviewerVerdictOk !== false) {
-			return denied(input, "review_verdict_not_rejected", "review rework requires reviewer verdict ok:false");
-		}
-		return evaluateRework(input, reworkCount, now);
-	}
-	if (from === "verifying" && to === "implementing") {
-		if (input.verificationPassed !== false) {
-			return denied(input, "verification_not_failed", "verification rework requires a failing verification result");
-		}
-		return evaluateRework(input, reworkCount, now);
-	}
-	if (from === "reviewing" && to === "planning") {
-		if (input.actorRole !== "centurion") {
-			return denied(input, "centurion_required", "only the centurion may return a bad plan to planning");
-		}
-		return allowed(input, reworkCount, now(), true);
-	}
-	if (from === "verifying" && to === "done") {
-		if (input.verificationPassed !== true) {
-			return denied(input, "verification_not_passed", "done requires all verification commands to pass");
-		}
-		if (children.some((child) => !isTerminalChild(child.status))) {
-			return denied(input, "children_not_terminal", "DONE requires every child node to be terminal");
-		}
-		return allowed(input, reworkCount, now(), false);
-	}
-	return denied(input, "invalid_transition", `transition ${from} → ${to} is not allowed`);
+	// #298: the declarative path is the ONLY path, with the built-in machine as the
+	// default. The old switch was removed rather than kept as a fallback: it gated
+	// `reviewing -> verifying` on a settled `role === "reviewer"`, so once the
+	// bundled reviewer card is gone a team could never leave review. Conditions
+	// express the same intent without naming a role.
+	//
+	// Normalization happens here, not only at parse time: the universal terminals
+	// (`done`/`failed`/`aborted`) must exist for ANY machine reaching this point —
+	// including one built in code — because a team that cannot be aborted is a
+	// safety hole. Normalization only ADDS those terminals; taking them stays gated.
+	return evaluateDeclarative(input, normalizePhaseMachine(input.machine ?? DEFAULT_PHASE_MACHINE), now);
 }
+
 
 export interface PhaseTimeoutInput {
 	/** Phase id; free-form under a declared machine (#298). */
@@ -425,42 +379,7 @@ export function isLegionPhase(value: unknown): value is LegionPhase {
 	return typeof value === "string" && (LEGION_PHASES as readonly string[]).includes(value);
 }
 
-function evaluateRework(
-	input: EvaluatePhaseTransitionInput,
-	reworkCount: number,
-	now: () => number,
-): PhaseTransitionDecision {
-	const next = reworkCount + 1;
-	if (next > MAX_REWORK_COUNT) {
-		return {
-			...denied(input, "rework_limit_exceeded", `rework count ${next} exceeds limit ${MAX_REWORK_COUNT}`),
-			forcedTransition: { to: "failed", reworkCount: next, reason: "rework_exhausted" },
-		};
-	}
-	return allowed(input, next, now(), false);
-}
 
-function evaluateFailure(
-	input: EvaluatePhaseTransitionInput,
-	children: readonly PhaseChild[],
-	reworkCount: number,
-	now: () => number,
-): PhaseTransitionDecision {
-	if (input.terminalReason === "parent_decision") return allowed(input, reworkCount, now(), false);
-	if (input.terminalReason === "rework_exhausted") {
-		if (reworkCount <= MAX_REWORK_COUNT) {
-			return denied(input, "rework_limit_exceeded", `rework_count must exceed ${MAX_REWORK_COUNT} for rework_exhausted`);
-		}
-		return allowed(input, reworkCount, now(), false);
-	}
-	if (input.terminalReason === "all_children_failed") {
-		if (children.length === 0 || children.some((child) => child.status !== "failed")) {
-			return denied(input, "all_children_not_failed", "all_children_failed requires every child to have failed");
-		}
-		return allowed(input, reworkCount, now(), false);
-	}
-	return denied(input, "terminal_reason_required", "failed requires parent decision, all children failed, or exhausted rework");
-}
 
 function allowed(
 	input: EvaluatePhaseTransitionInput,
@@ -496,6 +415,3 @@ function denied(
 	return { allowed: false, from: input.from, to: input.to, reason, message, alarm: true };
 }
 
-function isActiveChild(status: string): boolean {
-	return status === "starting" || status === "running" || status === "blocked";
-}

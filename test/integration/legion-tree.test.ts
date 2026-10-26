@@ -271,7 +271,10 @@ test("M2 tree e2e: root → centurion worktree → parallel workers → review �
 			text: rejectedReviewerText,
 		});
 		assert.equal(getNode(db, rejectedReviewer.child.nodeId!)?.status, "settled");
-		assert.match(await tool.request("verifying"), /reviewer verdict ok:true/);
+		// #301: the refusal no longer names a role. With a settled reviewer that said
+		// `ok:false`, the honest reason is "the latest verdict was a rejection", not
+		// "no reviewer exists" — and the caller still cannot proceed to verifying.
+		assert.match(await tool.request("verifying"), /passing verdict|not a rejection/i);
 		assert.match(await tool.request("implementing"), /Phase changed to implementing/);
 		assert.equal(getNode(db, centurionNode.id)?.reworkCount, 1);
 		assert.match(await tool.request("reviewing"), /Phase changed to reviewing/);

@@ -15,11 +15,8 @@ export interface VizTheme {
 
 export const ROLE_TOKENS: Readonly<Record<string, string>> = {
 	centurion: "accent",
-	planner: "syntaxKeyword",
 	worker: "syntaxVariable",
 	scout: "syntaxNumber",
-	reviewer: "syntaxFunction",
-	advisor: "syntaxString",
 };
 
 /** Fallback pool for roles that are not in the table (deterministic hash pick). */

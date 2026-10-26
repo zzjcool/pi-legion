@@ -41,13 +41,8 @@ import type { PhaseCondition } from "../legion/phase-conditions.ts";
 
 export const BUILTIN_AGENT_NAMES = [
 	"scout",
-	"planner",
-	"reviewer",
 	"worker",
 	"centurion",
-	"advisor",
-	"designer",
-	"prototype",
 ] as const;
 
 /**
