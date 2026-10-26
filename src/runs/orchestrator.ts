@@ -1049,6 +1049,17 @@ export class Orchestrator {
 									allowNested: input.agent.allowNestedSubagents === true && !input.agent.utility,
 									utility: Boolean(input.utilityDispatch && input.agent.utility),
 									spawnMode: "inprocess" as const,
+									// #295: the in-process child shares the HOST's process.env, so
+									// `env` below never reaches its guard. Carry the budget here,
+									// where the child context is the only channel that survives.
+									...(() => {
+										const budget = {
+											...(agent.toolBudget?.maxToolCalls !== undefined ? { maxToolCalls: agent.toolBudget.maxToolCalls } : {}),
+											...(agent.turnBudget?.maxTurns !== undefined ? { maxTurns: agent.turnBudget.maxTurns } : {}),
+											...(agent.toolTimeoutMs !== undefined ? { toolTimeoutMs: agent.toolTimeoutMs } : {}),
+										};
+										return Object.keys(budget).length > 0 ? { budget } : {};
+									})(),
 								},
 							}
 						: {}),
