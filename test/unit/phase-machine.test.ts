@@ -215,3 +215,34 @@ test("#298: the built-in machine validates, and reproduces the old pipeline", ()
 	assert.deepEqual(checkPhaseRequirements([], { children: [] }), { ok: true });
 	assert.equal(checkPhaseRequirements(["always"], { children: [] }).ok, true);
 });
+
+test("#298: a refused transition names the legal exits", () => {
+	// Measured: with a custom `recon -> build` machine, a model described the
+	// available transitions as `recon -> check` and `recon -> done`, neither of
+	// which existed. It had no way to read the machine, so it guessed. The refusal
+	// must therefore carry the answer instead of leaving the model to invent one.
+	// Universal terminals are injected into every non-terminal phase, so an
+	// illegal edge can only be a non-terminal target: `check` is declared but
+	// `recon` lists only `build` and the injected terminals.
+	const refused = decide({ from: "recon", to: "check", machine: RECON_ONLY });
+	assert.equal(refused.allowed, false);
+	if (!refused.allowed) {
+		assert.equal(refused.reason, "invalid_transition");
+		assert.match(refused.message, /legal next phases from 'recon'/);
+		// `done` is injected as a universal terminal, so it IS legal — a card cannot
+		// lose the ability to complete. What must appear is the real shortlist.
+		assert.match(refused.message, /build/);
+	}
+	// A phase with no exits is reported as such rather than an empty list.
+	assert.equal(RECON_ONLY.phases.find((phase) => phase.id === "check")?.next.length, 1);
+});
+
+/** `recon` may only reach `build`; everything else is injected. */
+const RECON_ONLY: PhaseMachine = {
+	start: "recon",
+	phases: [
+		{ id: "recon", next: [{ to: "build" }] },
+		{ id: "build", next: [{ to: "recon" }] },
+		{ id: "check", next: [{ to: "recon" }] },
+	],
+};

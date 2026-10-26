@@ -169,10 +169,16 @@ function evaluateDeclarative(
 	const phase = findPhase(machine, from);
 	const rule = phase?.next.find((candidate) => candidate.to === to);
 	if (!rule) {
+		// Name the legal exits. Without them a model invents plausible ones (measured:
+		// a custom `recon -> build` machine was described as offering `recon -> check`
+		// and `recon -> done`, neither of which existed), then wastes a turn being
+		// refused. The machine already knows the answer; say it.
+		const allowed = (phase?.next ?? []).map((candidate) => candidate.to);
+		const hint = allowed.length > 0 ? `legal next phases from '${from}': ${allowed.join(", ")}` : `phase '${from}' has no exits`;
 		return denied(
 			input,
 			"invalid_transition",
-			`transition ${from} → ${to} is not allowed by this team's machine`,
+			`transition ${from} → ${to} is not allowed by this team's machine (${hint})`,
 		);
 	}
 	if (rule.actorRole !== undefined && input.actorRole !== rule.actorRole) {
