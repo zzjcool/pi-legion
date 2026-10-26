@@ -112,13 +112,91 @@ export function resetExtensionDiscoveryCache(): void {
 }
 
 /**
+ * Expand one declared `pi.extensions` entry into loadable files (#280 R1-a).
+ *
+ * A manifest may name a DIRECTORY (`pi.extensions: ["./extensions"]` — that is
+ * what `pi-diff-review` ships). Handing that path to `pi -e` is fatal: pi's
+ * loader requires an entry point and exits 1 with `Failed to load extension:
+ * Cannot find module`. So a directory is resolved the way pi's own
+ * `discoverAndLoadExtensions` resolves an explicitly configured path: the
+ * directory's own `pi.extensions`, else its `index.ts`/`index.js`, else the
+ * `*.ts`/`*.js` files sitting directly in it.
+ *
+ * `allowNestedManifest` bounds the walk to one extra level: a nested package's
+ * manifest is read, but the directories IT declares expand to their files
+ * instead of recursing again. Without that bound a manifest declaring `"./"`
+ * would re-enter itself forever.
+ *
+ * Returns `[]` when nothing loadable is inside, so the caller can DROP the entry
+ * rather than emit a path that cannot be loaded.
+ */
+function expandDeclaredEntry(entry: string, allowNestedManifest: boolean): string[] {
+	let stat: fs.Stats;
+	try {
+		stat = fs.statSync(entry);
+	} catch {
+		return [];
+	}
+	if (stat.isFile()) return [entry];
+	if (!stat.isDirectory()) return [];
+	if (allowNestedManifest) {
+		const nested = resolveExtensionEntries(entry, false);
+		if (nested.length > 0) return nested;
+	}
+	const index = indexEntryIn(entry);
+	if (index) return [index];
+	return discoverExtensionFiles(entry);
+}
+
+/** `<dir>/index.ts`, else `<dir>/index.js`, else undefined. */
+function indexEntryIn(dir: string): string | undefined {
+	for (const candidate of ["index.ts", "index.js"]) {
+		const entry = path.join(dir, candidate);
+		if (fs.existsSync(entry)) return entry;
+	}
+	return undefined;
+}
+
+/**
+ * The `*.ts`/`*.js` files directly inside `dir`, sorted for a stable argv.
+ *
+ * Deliberately one level: pi's `discoverExtensionsInDir` also recurses into
+ * subdirectories, but a nested package inside an explicitly declared directory
+ * is a shape this project does not need, and recursing would turn a mistyped
+ * path into an unbounded walk.
+ */
+function discoverExtensionFiles(dir: string): string[] {
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	return entries
+		.filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && /\.(ts|js)$/.test(entry.name))
+		.map((entry) => path.join(dir, entry.name))
+		.filter((file) => {
+			try {
+				return fs.statSync(file).isFile();
+			} catch {
+				return false;
+			}
+		})
+		.sort();
+}
+
+/**
  * Resolve a package directory to its extension entry points, exactly like pi's
  * own loader: `package.json`'s `pi.extensions` first, then `index.ts`/`index.js`.
+ *
+ * Declared entries may themselves be directories (R1-a); those expand into
+ * loadable files, and an entry that expands to nothing is dropped so the caller
+ * never sees a path `pi -e` would refuse. Every returned path is a file.
  *
  * A directory with neither is not an extension package (a theme pack, a skill
  * bundle) and contributes nothing.
  */
-export function resolveExtensionEntries(dir: string): string[] {
+export function resolveExtensionEntries(dir: string, allowNestedManifest = true): string[] {
 	const manifestPath = path.join(dir, "package.json");
 	try {
 		if (fs.existsSync(manifestPath)) {
@@ -127,21 +205,27 @@ export function resolveExtensionEntries(dir: string): string[] {
 			};
 			const declared = manifest.pi?.extensions;
 			if (Array.isArray(declared)) {
-				const resolved = declared
-					.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
-					.map((entry) => path.resolve(dir, entry))
-					.filter((entry) => fs.existsSync(entry));
+				// R1-a: directories expand; empty expansions are dropped. Only files
+				// reach the caller, because that is all `-e` can load. Deduped because a
+				// manifest may name both a directory and a file inside it.
+				const resolved: string[] = [];
+				const seen = new Set<string>();
+				for (const entry of declared) {
+					if (typeof entry !== "string" || entry.length === 0) continue;
+					for (const file of expandDeclaredEntry(path.resolve(dir, entry), allowNestedManifest)) {
+						if (seen.has(file)) continue;
+						seen.add(file);
+						resolved.push(file);
+					}
+				}
 				if (resolved.length > 0) return resolved;
 			}
 		}
 	} catch {
 		// Unreadable/invalid manifest: fall through to the index-file convention.
 	}
-	for (const candidate of ["index.ts", "index.js"]) {
-		const entry = path.join(dir, candidate);
-		if (fs.existsSync(entry)) return [entry];
-	}
-	return [];
+	const index = indexEntryIn(dir);
+	return index ? [index] : [];
 }
 
 /** Parse `pi list` output into the package directories it reports. */

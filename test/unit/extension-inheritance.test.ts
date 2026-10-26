@@ -7,7 +7,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -22,10 +22,10 @@ import {
 } from "../../src/runs/extension-inheritance.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { InMemoryUIProxy } from "../../src/supervisor/ui-proxy.ts";
-import type { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
-import type { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
+import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
+import { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
+import { collectChildExtensions } from "../../src/runs/args.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
-import type { AgentConfig } from "../../src/shared/types.ts";
 
 const HOST = [
 	"/host/node_modules/pi-lens/index.ts",
@@ -171,11 +171,20 @@ interface FakeHost {
 	cleanup(): void;
 }
 
-function fakeHost(options: { failFirst?: boolean; alwaysFail?: boolean } = {}): FakeHost {
+function fakeHost(
+	options: {
+		failFirst?: boolean;
+		alwaysFail?: boolean;
+		/** Replace the default `index.ts` layout; return the entry the package resolves to. */
+		layout?: (pkgDir: string) => string;
+	} = {},
+): FakeHost {
 	const root = mkdtempSync(path.join(tmpdir(), "ext-host-"));
 	const pkgDir = path.join(root, "npm", "node_modules", "fake-lens");
 	mkdirSync(pkgDir, { recursive: true });
-	writeFileSync(path.join(pkgDir, "index.ts"), "export default {};\n");
+	const entry = options.layout
+		? options.layout(pkgDir)
+		: (writeFileSync(path.join(pkgDir, "index.ts"), "export default {};\n"), path.join(pkgDir, "index.ts"));
 	const binDir = path.join(root, "bin");
 	mkdirSync(binDir, { recursive: true });
 	const logPath = path.join(root, "calls.log");
@@ -204,7 +213,7 @@ function fakeHost(options: { failFirst?: boolean; alwaysFail?: boolean } = {}): 
 		}
 	};
 	return {
-		entry: path.join(pkgDir, "index.ts"),
+		entry,
 		log(line: string) {
 			writeFileSync(logPath, [...readQuiet(), line].join("\n") + "\n");
 		},
@@ -452,6 +461,162 @@ test("A5: a `pi list` failure does not burn the in-flight slot for later callers
 			assert.deepEqual(after, [], "concurrent callers see the same failure");
 			// …and the slot is released, so a later caller runs a real retry.
 			assert.deepEqual(await ensureHostExtensions(), [host.entry]);
+		});
+	} finally {
+		host.cleanup();
+	}
+});
+
+// ── R1-a: directory-shaped `pi.extensions` entries (contract §7 A11–A13) ────
+
+/** The slice of `AgentConfig` `collectChildExtensions` reads, with inheritance on. */
+function inheritingAgent(): {
+	tools: string[];
+	extensions: string[];
+	inheritExtensions?: boolean;
+	excludeExtensions?: string[];
+} {
+	return { tools: [], extensions: [] };
+}
+
+/**
+ * The `pi-diff-review` shape (F26/F28): the manifest declares a DIRECTORY, the
+ * directory has no `package.json`/`index.ts`, and its only extension is a
+ * loose `review.ts`.
+ */
+function diffReviewLayout(pkgDir: string, files: string[] = ["review.ts"]): string {
+	const extensionsDir = path.join(pkgDir, "extensions");
+	mkdirSync(extensionsDir, { recursive: true });
+	writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+	for (const file of files) writeFileSync(path.join(extensionsDir, file), "export default {};\n");
+	return path.join(extensionsDir, files[0] ?? "review.ts");
+}
+
+test("A11: a directory entry expands to the loadable file inside it, not the directory", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "ext-dir-entry-"));
+	try {
+		// `pi.extensions: ["./extensions"]`, that directory holds only `review.ts`.
+		const pkgDir = path.join(root, "pi-diff-review");
+		const review = diffReviewLayout(pkgDir);
+		const resolved = resolveExtensionEntries(pkgDir);
+		assert.deepEqual(
+			resolved,
+			[review],
+			"the declared DIRECTORY must expand to review.ts — `pi -e <dir>` exits 1 (F28)",
+		);
+		assert.ok(
+			resolved.every((entry) => statSync(entry).isFile()),
+			"every entry handed to `-e` must be a file",
+		);
+
+		// A loose directory also expands to its `*.ts`/`*.js` files, sorted.
+		const multi = path.join(root, "multi");
+		diffReviewLayout(multi, ["b.ts", "a.js", "notes.md"]);
+		assert.deepEqual(resolveExtensionEntries(multi), [
+			path.join(multi, "extensions", "a.js"),
+			path.join(multi, "extensions", "b.ts"),
+		], "both extension-typed files expand; a non-extension file is skipped");
+
+		// A declared directory that IS its own package resolves through its manifest —
+		// the declared shape stays authoritative one level down.
+		const nested = path.join(root, "nested");
+		mkdirSync(path.join(nested, "extensions"), { recursive: true });
+		writeFileSync(path.join(nested, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+		writeFileSync(path.join(nested, "extensions", "decoy.ts"), "export default {};\n");
+		writeFileSync(path.join(nested, "extensions", "package.json"), JSON.stringify({ pi: { extensions: ["./entry.ts"] } }));
+		writeFileSync(path.join(nested, "extensions", "entry.ts"), "export default {};\n");
+		assert.deepEqual(
+			resolveExtensionEntries(nested),
+			[path.join(nested, "extensions", "entry.ts")],
+			"a directory entry with its own manifest resolves through that manifest, not by sweeping files",
+		);
+
+		// Its index file is the second choice, ahead of the loose-file sweep.
+		const withIndex = path.join(root, "with-index");
+		mkdirSync(path.join(withIndex, "extensions"), { recursive: true });
+		writeFileSync(path.join(withIndex, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+		writeFileSync(path.join(withIndex, "extensions", "index.ts"), "export default {};\n");
+		writeFileSync(path.join(withIndex, "extensions", "other.ts"), "export default {};\n");
+		assert.deepEqual(
+			resolveExtensionEntries(withIndex),
+			[path.join(withIndex, "extensions", "index.ts")],
+			"an index entry wins over the loose-file sweep",
+		);
+
+		// A manifest that declares `"./"` must terminate (the sweep is one level).
+		const selfDeclaring = path.join(root, "self-declaring");
+		mkdirSync(selfDeclaring, { recursive: true });
+		writeFileSync(path.join(selfDeclaring, "package.json"), JSON.stringify({ pi: { extensions: ["./"] } }));
+		writeFileSync(path.join(selfDeclaring, "main.ts"), "export default {};\n");
+		assert.deepEqual(resolveExtensionEntries(selfDeclaring), [path.join(selfDeclaring, "main.ts")]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("A12: a directory entry that expands to nothing is dropped, not emitted", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "ext-empty-dir-"));
+	try {
+		// Empty declared directory, and the package has its own index fallback: the
+		// dead directory entry must not appear alongside it.
+		const empty = path.join(root, "empty-declared");
+		mkdirSync(path.join(empty, "extensions"), { recursive: true });
+		writeFileSync(path.join(empty, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+		writeFileSync(path.join(empty, "index.ts"), "export default {};\n");
+		assert.deepEqual(
+			resolveExtensionEntries(empty),
+			[path.join(empty, "index.ts")],
+			"an empty directory entry contributes nothing; the package still falls back to index.ts",
+		);
+
+		// Declared directory with only non-extension files: same verdict.
+		const docsOnly = path.join(root, "docs-only");
+		mkdirSync(path.join(docsOnly, "extensions"), { recursive: true });
+		writeFileSync(path.join(docsOnly, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+		writeFileSync(path.join(docsOnly, "extensions", "README.md"), "# docs\n");
+		assert.deepEqual(resolveExtensionEntries(docsOnly), [], "nothing loadable → dropped entirely");
+
+		// And nothing appears in the child's argv either.
+		const host = fakeHost({ layout: (pkgDir) => diffReviewLayout(pkgDir, []) });
+		try {
+			const extensionsDir = path.dirname(host.entry);
+			await withHostEnv(host, { PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined }, async () => {
+				const resolved = await ensureHostExtensions();
+				assert.deepEqual(resolved, [], "the dead directory is not in the discovered set");
+				assert.equal(
+					collectChildExtensions(inheritingAgent()).includes(extensionsDir),
+					false,
+					"and it never reaches the `--extension` list the child is started with",
+				);
+			});
+		} finally {
+			host.cleanup();
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("A13: no non-file path ever reaches collectChildExtensions", async () => {
+	// The real host on this machine is what the reviewer's defect hit: the set is
+	// resolved from a fake host shaped like `pi-diff-review` (declared directory,
+	// no manifest/index inside) PLUS the live `pi list`, so the assertion covers
+	// both the fixed shape and whatever this machine really has installed.
+	const host = fakeHost({ layout: (pkgDir) => diffReviewLayout(pkgDir) });
+	try {
+		await withHostEnv(host, { PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined }, async () => {
+			await ensureHostExtensions();
+			const list = collectChildExtensions(inheritingAgent());
+			assert.ok(list.length >= 2, "the inherited entry plus the child-guard at minimum");
+			const offenders = list.filter((entry) => {
+				try {
+					return !statSync(entry).isFile();
+				} catch {
+					return true;
+				}
+			});
+			assert.deepEqual(offenders, [], `non-file entries reached the child argv: ${offenders.join(", ")}`);
+			assert.ok(list.includes(host.entry), "the expanded review.ts is what got inherited");
 		});
 	} finally {
 		host.cleanup();
