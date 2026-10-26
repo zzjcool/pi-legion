@@ -47,6 +47,25 @@ export interface ChildLaunchContext {
 	utility: boolean;
 	/** Spawn backend of this child, so the child's doctor/diagnostics can self-report. */
 	spawnMode: SpawnMode;
+	/**
+	 * Per-child budgets, carried here because `process.env` cannot (#295).
+	 *
+	 * The parent computes these in `Orchestrator.lineageEnv` and hands them over
+	 * as `SpawnInput.env`. A spawned rpc child receives that object as its real
+	 * environment, so `childBudgetFromEnv()` finds it. An in-process child shares
+	 * the HOST's `process.env` instead — the object is just a field on the spawn
+	 * input — so the guard saw the parent's (absent) values and `toolBudget: 3`
+	 * permitted 12 tool calls.
+	 *
+	 * Same reasoning as identity above: anything a child must observe per-session
+	 * cannot travel through `process.env` when the child is a Task/AsyncLocalStorage
+	 * scope rather than a process.
+	 */
+	budget?: {
+		maxToolCalls?: number;
+		maxTurns?: number;
+		toolTimeoutMs?: number;
+	};
 }
 
 const STORE_KEY = Symbol.for("pi-legion.child-context.als");
