@@ -14,7 +14,7 @@ import { buildPiArgs, LEGION_IDENTITY_ENV_KEYS } from "../runs/args.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import { checkMemoryGate, childMemoryEnv } from "./child-memory.ts";
 import { enrichFailureWithAutoDoctor } from "../extension/auto-doctor.ts";
-import { ErrorCodes, SubagentError } from "../shared/types.ts";
+import { ErrorCodes, SubagentError, unknownChildError } from "../shared/types.ts";
 import {
 	InMemoryUIProxy,
 	extensionActivityToUIRequest,
@@ -605,7 +605,7 @@ export class RpcSupervisor implements LegionSupervisor {
 	private requireChild(name: string): ChildRecord {
 		const child = this.children.get(name);
 		if (!child) {
-			throw new SubagentError(`unknown child: ${name}`, ErrorCodes.NOT_FOUND);
+			throw unknownChildError(name);
 		}
 		return child;
 	}

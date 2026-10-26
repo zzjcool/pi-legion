@@ -18,6 +18,7 @@ import {
 	pickChildByName,
 } from "../runs/store.ts";
 import { sendSlashText, type LegionSubcommand } from "./slash.ts";
+import { resolveChildAcrossStores, unknownChildMessage } from "../runs/store-lookup.ts";
 import {
 	aggregateSubagentRuns,
 	formatDuration,
@@ -318,14 +319,17 @@ function timingCompletions(
 		}));
 }
 
+/**
+ * Miss reporting for `/legion timing <name>` (#288). Same cross-store lookup and
+ * same message as `status` and `summary`, so a miss reads identically everywhere
+ * and reports what was actually searched instead of advising an unknowable cwd.
+ */
 function notifyUnknownChild(
 	ctx: ExtensionCommandContext,
 	name: string,
 ): void {
-	ctx.ui.notify(
-		`unknown child: ${name} (no run under ${ctx.cwd}/.pi-subagents). Child records are scoped to the cwd they were launched from — pass the same cwd used for launch.`,
-		"error",
-	);
+	const { searched } = resolveChildAcrossStores({ name, cwd: ctx.cwd });
+	ctx.ui.notify(unknownChildMessage({ name, cwd: ctx.cwd, searched }), "error");
 }
 
 function findTimingChild(

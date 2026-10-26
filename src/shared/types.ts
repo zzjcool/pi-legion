@@ -814,6 +814,25 @@ export class SubagentError extends Error {
 	}
 }
 
+/**
+ * The one "name is not in this registry" error (#288).
+ *
+ * Six call sites (four supervisors, the orchestrator, and the stop loop) each
+ * spelled this by hand. They mean exactly the same thing — the caller asked
+ * about a child this process is not tracking — so the text should not drift
+ * between them.
+ *
+ * Deliberately terse. This is a runtime guard, not a lookup diagnostic: the
+ * user-facing miss message with the searched-store list comes from
+ * `unknownChildMessage` in `runs/store-lookup.ts`, which runs a real cross-store
+ * search before giving up. Printing that machinery here would be wrong, because
+ * at this layer a miss genuinely is a programming error (or a race), not a
+ * "wrong cwd" situation.
+ */
+export function unknownChildError(name: string): SubagentError {
+	return new SubagentError(`unknown child: ${name}`, ErrorCodes.NOT_FOUND);
+}
+
 export const ErrorCodes = {
 	DISABLED: "DISABLED",
 	START_FAILED: "START_FAILED",
