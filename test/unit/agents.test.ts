@@ -662,7 +662,11 @@ test("Placement is not parsed or reported as an active agent field", () => {
 	assert.equal("placement" in agent, false, "legacy placement frontmatter is ignored");
 	assert.deepEqual(
 		loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin").map((a) => a.name).sort(),
-		["advisor", "centurion", "designer", "planner", "prototype", "reviewer", "scout", "worker"],
+		// #301: planner/reviewer/designer/prototype/advisor were removed. The phase
+		// machine no longer keys on role names, so a fixed cast list is not needed;
+		// scout (read-only recon), worker (implementation), and centurion (team
+		// lead) are what remains.
+		["centurion", "scout", "worker"],
 		"every bundled card must satisfy the strict field list",
 	);
 });
@@ -712,12 +716,14 @@ test("acceptance.criteria is no longer reported unenforced (it is surfaced inste
 	);
 });
 
-test("the reviewer role is read-only", () => {
-	// `scripts/verify-agents.ts` used to check this. It is a real safety property
-	// (a reviewer that can edit the code it reviews is not a reviewer), so it
-	// belongs in the suite rather than in an unrunnable dev script.
-	const reviewer = loadBundledAgents().find((a) => a.name === "reviewer");
-	assert.ok(reviewer, "the reviewer role must load");
+test("the scout role is read-only", () => {
+	// `scripts/verify-agents.ts` used to check this, originally for `reviewer`. It
+	// is a real safety property (a recon role that can edit what it is reporting on
+	// has changed the thing it was measuring), so it belongs in the suite rather
+	// than in an unrunnable dev script. #301 removed the bundled reviewer; scout is
+	// the remaining read-only role, and the property is what matters, not the name.
+	const reviewer = loadBundledAgents().find((a) => a.name === "scout");
+	assert.ok(reviewer, "the scout role must load");
 
 	// An ABSENT `tools:` list must fail too, not just a writable one. `buildPiArgs`
 	// only emits `--tools` for a non-empty list, so a role with no `tools:` key is
@@ -726,7 +732,7 @@ test("the reviewer role is read-only", () => {
 	// regression this test exists to catch.
 	assert.ok(
 		reviewer.tools?.length,
-		"the reviewer must declare an explicit tool list (an absent list means pi's write-capable defaults)",
+		"the role must declare an explicit tool list (an absent list means pi's write-capable defaults)",
 	);
 	const writable = (reviewer.tools ?? []).filter((t) =>
 		["edit", "write"].includes(t),
@@ -734,7 +740,7 @@ test("the reviewer role is read-only", () => {
 	assert.deepEqual(
 		writable,
 		[],
-		"the reviewer must not be able to edit or write files",
+		"a read-only role must not be able to edit or write files",
 	);
 });
 

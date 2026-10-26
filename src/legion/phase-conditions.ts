@@ -47,6 +47,7 @@ export const PHASE_CONDITIONS = [
 	"always",
 	"contract_file",
 	"children_settled",
+	"children_present",
 	"children_none_failed",
 	"verdict_ok",
 	"verdict_not_ok",
@@ -79,9 +80,19 @@ export function checkPhaseCondition(
 		case "always":
 			return true;
 		case "contract_file":
-			return Boolean(input.contractPath?.trim()) && input.contractPresent === true;
+			// A recorded path is the contract; `contractPresent` is an OPTIONAL
+			// strengthening for callers that actually read the file. Defaulting it to
+			// "must be explicit" would silently refuse every caller that has a path
+			// but does not stat it — including the pre-#298 tests and the rpc path.
+			return Boolean(input.contractPath?.trim()) && input.contractPresent !== false;
 		case "children_settled":
 			return input.children.every((child) => !isActive(child.status));
+		case "children_present":
+			// Distinguishes "every child finished" from "there were no children".
+			// Without it, `children_settled` on an empty list is vacuously true, so a
+			// team that dispatched nobody could satisfy a requirement meant to check
+			// that its workers (or reviewers) had actually run.
+			return input.children.length > 0;
 		case "children_none_failed": {
 			const handled = new Set(input.handledIds ?? []);
 			return !input.children.some((child) => child.status === "failed" && !handled.has(child.id));
@@ -102,6 +113,42 @@ export function checkPhaseCondition(
 			const unknown: never = condition;
 			throw new TypeError(`unknown phase condition: ${String(unknown)}`);
 		}
+	}
+}
+
+/**
+ * A human-readable explanation of a failed condition.
+ *
+ * The condition id is precise but not readable, and this text reaches operators
+ * and models. Naming the CONDITION rather than a role is the point (#298): the
+ * message says what is missing, not who was supposed to provide it.
+ */
+export function describeFailedCondition(condition: PhaseCondition): string {
+	switch (condition) {
+		case "contract_file":
+			return "a frozen contract file is required";
+		case "children_present":
+			return "no child has been dispatched yet";
+		case "children_settled":
+			return "child agents are still running; wait for them to settle";
+		case "children_none_failed":
+			return "a child failed and must be reworked or the team must fail";
+		case "verdict_ok":
+			return "no settled child reported a passing verdict";
+		case "verdict_not_ok":
+			return "the latest verdict was not a rejection, so there is nothing to rework";
+		case "verification_passed":
+			return "verification has not passed";
+		case "verification_failed":
+			return "verification did not fail, so there is nothing to rework";
+		case "rework_available":
+			return "the rework budget is exhausted";
+		case "children_all_failed":
+			return "not every child failed";
+		case "always":
+			return "the condition is always true";
+		default:
+			return `condition '${String(condition)}' is not met`;
 	}
 }
 

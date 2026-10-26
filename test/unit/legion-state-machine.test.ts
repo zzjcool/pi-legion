@@ -77,8 +77,12 @@ test("phase machine rejects each violated invariant and invalid evidence", () =>
 		[{ from: "planning", to: "implementing" }, "contract_path_required"],
 		[{ from: "implementing", to: "reviewing", children: [{ ...worker, status: "running" }] }, "worker_still_active"],
 		[{ from: "implementing", to: "reviewing", children: [{ ...worker, status: "failed" }, { id: "w2", role: "worker", status: "settled" }] }, "failed_worker_unhandled"],
-		[{ from: "implementing", to: "reviewing", children: [{ id: "p", role: "planner", status: "running" }] }, "planner_still_active"],
-		[{ from: "implementing", to: "failed", terminalReason: "parent_decision", children: [{ id: "p", role: "planner", status: "running" }] }, "planner_still_active"],
+		// #298: the old rule named `planner` and used the code `planner_still_active`.
+		// The intent was "nothing may still be in flight when we leave implementation",
+		// which is now the structural `children_settled` requirement — so any active
+		// child blocks, whatever it is called.
+		[{ from: "implementing", to: "reviewing", children: [{ id: "p", role: "planner", status: "running" }] }, "worker_still_active"],
+		[{ from: "implementing", to: "failed", terminalReason: "parent_decision", children: [{ id: "p", role: "planner", status: "running" }] }, "children_not_terminal"],
 		[{ from: "reviewing", to: "verifying", children: [], reviewerVerdictOk: true }, "reviewer_not_settled"],
 		[{ from: "reviewing", to: "verifying", children: [reviewer], reviewerVerdictOk: false }, "review_verdict_not_accepted"],
 		[{ from: "reviewing", to: "implementing", reviewerVerdictOk: true }, "review_verdict_not_rejected"],

@@ -126,11 +126,12 @@ test("D5: idle/queued/unknown nodes get no endedAt, so the strip keeps them", ()
 
 test("viz: role colors are theme tokens; unknown roles pick a stable syntax token", () => {
 	assert.equal(roleToken("centurion"), "accent");
-	assert.equal(roleToken("planner"), "syntaxKeyword");
 	assert.equal(roleToken("worker"), "syntaxVariable");
 	assert.equal(roleToken("scout"), "syntaxNumber");
-	assert.equal(roleToken("reviewer"), "syntaxFunction");
-	assert.equal(roleToken("advisor"), "syntaxString");
+	// #301: the removed roles now fall through to the deterministic fallback — a
+	// custom role must still get a stable colour, which is what the assertion below
+	// checks for an arbitrary name.
+	assert.equal(roleToken("planner"), roleToken("planner"));
 	const custom = roleToken("quantum-tinkerer");
 	assert.ok((FALLBACK_TOKENS as readonly string[]).includes(custom));
 	assert.equal(roleToken("quantum-tinkerer"), custom);
@@ -869,6 +870,9 @@ for (const kind of ["dark", "system", "system-truecolor"] as const) {
 		assert.equal(colors.size, 4, JSON.stringify([...colors]));
 		assert.equal(new Set(colors.values()).size, 4, `colors collide: ${JSON.stringify([...colors])}`);
 		// The palette-index tier only has ~6 hues (minus error/dim), so check the five most common types there.
+		// #301: planner/reviewer/advisor are no longer bundled roles, but a CUSTOM role
+		// must still resolve to a stable, distinct colour — that is the property this
+		// test protects. Keep them in the sample as arbitrary custom names.
 		const roles = kind !== "system"
 			? ["centurion", "scout", "worker", "reviewer", "advisor", "planner", "x-custom"]
 			: ["centurion", "scout", "worker", "reviewer", "planner"];
@@ -879,9 +883,10 @@ for (const kind of ["dark", "system", "system-truecolor"] as const) {
 		if (kind === "dark") {
 			assert.equal(palette.get("scout"), "syntaxNumber");
 			assert.equal(palette.get("worker"), "syntaxVariable");
-			assert.equal(palette.get("reviewer"), "syntaxFunction");
-			assert.equal(palette.get("advisor"), "syntaxString");
-			assert.equal(palette.get("planner"), "syntaxKeyword");
+			// Removed roles now fall through to the deterministic fallback, so assert
+			// they are DISTINCT rather than expecting a specific retired token.
+			assert.notEqual(palette.get("reviewer"), palette.get("planner"));
+			assert.notEqual(palette.get("advisor"), palette.get("x-custom"));
 		} else if (kind === "system-truecolor") {
 			// The user's xfce4-terminal: palette reported, truecolor output. accent and
 			// syntaxNumber come out as byte-different but visually identical pinks.

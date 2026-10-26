@@ -134,7 +134,9 @@ test("centurion phase tool enforces gates, rework, verification, and automatic D
 		const worker = insertNode(db, { parentId: "root.team-a", name: "worker", role: "worker", status: "running" }, () => 101);
 		const premature = await requestLegionPhase(db, "root.team-a", "reviewing", options);
 		assert.equal(premature.ok, false);
-		assert.match(premature.message, /worker.*settled/i);
+		// #298: the rule no longer names a role, so the message describes what is
+		// missing instead of who was supposed to provide it.
+		assert.match(premature.message, /still running|settle/i);
 		assert.equal(getNode(db, "root.team-a")?.phase, "implementing");
 
 		updateNode(db, worker.id, { status: "settled" }, () => 102);

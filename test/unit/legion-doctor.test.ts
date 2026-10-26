@@ -227,11 +227,14 @@ test("doctor OK when child inherits or sees models", () => {
 
 const LENS_TOOL = /lens|symbol_search|project_report|module_report|read_symbol|read_enclosing/i;
 
-test("#70 bundled planner/reviewer/worker do not promise lens tools under --no-extensions", () => {
+test("#70 bundled worker does not promise lens tools under --no-extensions", () => {
+	// #301 removed planner/reviewer, so worker is the remaining write-capable role.
+	// The property under test is unchanged: a bundled role must not list lens_*
+	// tools without also arranging for the extension to load.
 	const roles = loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin").filter((agent) =>
-		["planner", "reviewer", "worker"].includes(agent.name),
+		["worker"].includes(agent.name),
 	);
-	assert.deepEqual(roles.map((agent) => agent.name).sort(), ["planner", "reviewer", "worker"]);
+	assert.deepEqual(roles.map((agent) => agent.name).sort(), ["worker"]);
 
 	const prevInherit = process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
 	const prevExtra = process.env.PI_LEGION_CHILD_EXTENSIONS;
@@ -418,7 +421,17 @@ test("#89 bundled roles with tools:codemode load builtin:codemode; doctor stays 
 	const roles = loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin").filter((agent) =>
 		(agent.tools ?? []).includes("codemode"),
 	);
-	assert.ok(roles.length >= 5, `expected several codemode roles, got ${roles.map((r) => r.name)}`);
+	// #301: planner/reviewer/designer/prototype/advisor were removed, leaving scout
+	// and worker as the roles that explicitly list codemode (centurion declares no
+	// `tools:` list, so it gets pi's defaults rather than an explicit codemode).
+	// The property under test is unchanged: every role that ASKS for codemode must
+	// actually receive builtin:codemode.
+	assert.ok(roles.length > 0, "at least one bundled role must use codemode");
+	assert.deepEqual(
+		roles.map((r) => r.name).sort(),
+		["scout", "worker"],
+		"the remaining codemode-declaring roles",
+	);
 
 	const prevInherit = process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
 	const prevExtra = process.env.PI_LEGION_CHILD_EXTENSIONS;

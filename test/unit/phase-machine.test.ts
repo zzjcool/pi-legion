@@ -153,7 +153,9 @@ test("#298: an edge reserved to an actor is refused for anyone else", () => {
 	};
 	const denied = decide({ from: "a", to: "b", actorRole: "worker", machine });
 	assert.equal(denied.allowed, false);
-	if (!denied.allowed) assert.equal(denied.reason, "actor_not_permitted");
+	// A centurion-only edge keeps the historical code; any other reserved
+	// edge reports the general name.
+	if (!denied.allowed) assert.equal(denied.reason, "centurion_required");
 	assert.equal(decide({ from: "a", to: "b", actorRole: "centurion", machine }).allowed, true);
 });
 
