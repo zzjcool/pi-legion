@@ -88,6 +88,17 @@ interface DiscoveryStore {
 	discovered?: string[];
 	/** In-flight discovery, so concurrent launches share one `pi list`. */
 	inFlight?: Promise<string[]>;
+	/**
+	 * When the last discovery FAILED, in `Date.now()` terms.
+	 *
+	 * A failure is still not cached as `[]` (F23: one blip must not disable
+	 * inheritance until restart), but every caller is not allowed to re-probe
+	 * either: three warm-up points (router, rpc backend, in-process backend) turn
+	 * one spawn into two `pi list` calls when each of them retries. This stamp is
+	 * the short memory that makes the retry storm impossible while keeping the
+	 * failure recoverable — see `FAILURE_TTL_MS`.
+	 */
+	failedAt?: number;
 }
 
 /** Symbol-indexed view of globalThis so the cache survives module re-evaluation. */
@@ -109,6 +120,9 @@ const store = ((globalThis as unknown as StoreHolder)[STORE_KEY] ??= {});
 export function resetExtensionDiscoveryCache(): void {
 	delete store.discovered;
 	delete store.inFlight;
+	// The failure stamp is part of the cache: leaving it behind would make the
+	// next case inherit this one's backoff and silently skip its `pi list`.
+	delete store.failedAt;
 }
 
 /**
@@ -145,7 +159,11 @@ function expandDeclaredEntry(entry: string, allowNestedManifest: boolean): strin
 	}
 	const index = indexEntryIn(entry);
 	if (index) return [index];
-	return discoverExtensionFiles(entry);
+	// The sweep inherits the same depth budget: a declared directory reached from
+	// inside a nested resolution may list its own files, but must not descend into
+	// subdirectories again (otherwise a manifest declaring `"./"` deep in the tree
+	// would walk without a bound).
+	return discoverExtensionFiles(entry, allowNestedManifest);
 }
 
 /** `<dir>/index.ts`, else `<dir>/index.js`, else undefined. */
@@ -158,31 +176,58 @@ function indexEntryIn(dir: string): string | undefined {
 }
 
 /**
- * The `*.ts`/`*.js` files directly inside `dir`, sorted for a stable argv.
+ * Sweep a declared directory the way pi's `collectAutoExtensionEntries` does.
  *
- * Deliberately one level: pi's `discoverExtensionsInDir` also recurses into
- * subdirectories, but a nested package inside an explicitly declared directory
- * is a shape this project does not need, and recursing would turn a mistyped
- * path into an unbounded walk.
+ * Same shape as pi, because anything less silently loses extensions:
+ *
+ *   - `.`-prefixed entries and `node_modules` are skipped (pi skips both; a
+ *     dotfile such as `.eslintrc.js` is never an entry point)
+ *   - a `*.ts`/`*.js` file is collected as-is
+ *   - a subdirectory is resolved as a package of its own, which is what makes
+ *     the documented `extensions/<name>/index.ts` layout loadable at all; a
+ *     subdirectory that resolves to nothing contributes nothing
+ *
+ * `allowNestedDirs` is the depth bound. pi stops after one level
+ * (`collectAutoExtensionEntries` → `resolveExtensionEntries` → no further), and
+ * so do we: the top-level sweep may resolve subdirectories, but a directory
+ * reached from inside a nested resolution sweeps files only. That keeps a
+ * mistyped or self-declaring path from becoming an unbounded walk.
+ *
+ * Sorted, so the child's argv is stable between runs and platforms.
  */
-function discoverExtensionFiles(dir: string): string[] {
+function discoverExtensionFiles(dir: string, allowNestedDirs: boolean): string[] {
 	let entries: fs.Dirent[];
 	try {
 		entries = fs.readdirSync(dir, { withFileTypes: true });
 	} catch {
 		return [];
 	}
-	return entries
-		.filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && /\.(ts|js)$/.test(entry.name))
-		.map((entry) => path.join(dir, entry.name))
-		.filter((file) => {
+	const files: string[] = [];
+	for (const entry of entries) {
+		if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+		const full = path.join(dir, entry.name);
+		let isFile = entry.isFile();
+		let isDir = entry.isDirectory();
+		if (entry.isSymbolicLink()) {
 			try {
-				return fs.statSync(file).isFile();
+				const stats = fs.statSync(full);
+				isFile = stats.isFile();
+				isDir = stats.isDirectory();
 			} catch {
-				return false;
+				continue;
 			}
-		})
-		.sort();
+		}
+		if (isFile) {
+			if (/\.(ts|js)$/.test(entry.name)) files.push(full);
+			continue;
+		}
+		if (isDir && allowNestedDirs) {
+			// `allowNestedManifest: false` is the gate: the nested resolution sweeps
+			// files but never descends into subdirectories itself.
+			files.push(...resolveExtensionEntries(full, false));
+		}
+	}
+	return files.sort();
 }
 
 /**
@@ -271,6 +316,23 @@ async function resolveHostExtensions(env: NodeJS.ProcessEnv): Promise<string[] |
 }
 
 /**
+ * How long a FAILED discovery is remembered, in milliseconds.
+ *
+ * A failure cannot be cached as `[]` (F23), but it cannot be re-probed by every
+ * caller either: three warm-up points sit on one spawn (router + rpc backend +
+ * in-process backend), so an always-failing host pays twice per spawn today, and
+ * `pi list` costs 0.3–0.9 s measured (up to its 15 s timeout in the worst case) —
+ * before the memory gate even runs.
+ *
+ * 5 s covers every warm call of the same spawn with a wide margin (they are
+ * tens of milliseconds apart at most) while staying short enough that a
+ * transient failure costs a bounded window, not the process lifetime. Measured
+ * `pi list` latency (0.3–0.9 s) makes 5 s roughly one order of magnitude above a
+ * single probe, i.e. a retry is never more than a few spawns away.
+ */
+export const FAILURE_TTL_MS = 5_000;
+
+/**
  * Discover the host's extensions once per process and return them.
  *
  * Idempotent and concurrency-safe: the first caller runs `pi list`, concurrent
@@ -281,30 +343,42 @@ async function resolveHostExtensions(env: NodeJS.ProcessEnv): Promise<string[] |
  * degrades to `[]` (children still get their explicit list plus the
  * child-guard). Failure to discover must not fail a launch.
  *
- * A FAILED discovery is deliberately not cached. The previous shape cached `[]`
- * permanently, so one transient `pi list` error disabled inheritance until the
- * process restarted. Only the in-flight slot is dropped, which is what lets the
- * next spawn retry.
+ * A FAILED discovery is deliberately not cached as `[]`. The previous shape
+ * cached `[]` permanently, so one transient `pi list` error disabled inheritance
+ * until the process restarted. Instead the failure stamps `failedAt` and calls
+ * inside `FAILURE_TTL_MS` short-circuit to `[]` without a probe — the backoff
+ * that keeps the three warm-up points idempotent (R2-b). Once the stamp ages out,
+ * the next call probes again, so a failure is never a permanent off switch (F23).
  *
  * `env` is handed to `execFile` (a caller can point discovery at a specific
  * PATH); the cache itself is process-wide and does not vary by env.
  */
 export async function ensureHostExtensions(env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
 	if (store.discovered) return store.discovered;
+	if (store.failedAt !== undefined && Date.now() - store.failedAt < FAILURE_TTL_MS) return [];
 	if (!store.inFlight) {
 		store.inFlight = (async () => {
 			try {
 				const resolved = await resolveHostExtensions(env);
-				if (!resolved) return [];
+				if (!resolved) {
+					store.failedAt = Date.now();
+					return [];
+				}
 				store.discovered = resolved;
+				// A success supersedes any earlier failure, so the backoff stamp must not
+				// outlive it — otherwise a later re-probe (after a reset) would inherit an
+				// unrelated window.
+				delete store.failedAt;
 				return resolved;
 			} catch {
 				// Belt and braces: the contract is "never rejects", and a launch must
 				// never fail because the host could not be asked about packages.
+				store.failedAt = Date.now();
 				return [];
 			} finally {
-				// Success caches through `discovered`; failure must leave nothing behind
-				// but a cleared in-flight slot, or the retry could never start.
+				// Success caches through `discovered`; failure leaves the `failedAt`
+				// stamp behind (the backoff) plus a cleared in-flight slot, or the
+				// retry could never start.
 				delete store.inFlight;
 			}
 		})();

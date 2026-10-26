@@ -793,7 +793,7 @@ interface FakePiHost {
 	cleanup(): void;
 }
 
-function fakePiHost(): FakePiHost {
+function fakePiHost(options: { alwaysFail?: boolean } = {}): FakePiHost {
 	const root = mkdtempSync(path.join(tmpdir(), "legion-warm-host-"));
 	const pkgDir = path.join(root, "npm", "node_modules", "fake-lens");
 	mkdirSync(pkgDir, { recursive: true });
@@ -807,6 +807,9 @@ function fakePiHost(): FakePiHost {
 		[
 			"#!/bin/sh",
 			`echo "pi $*" >> ${JSON.stringify(logPath)}`,
+			// A host whose `pi list` always fails (non-zero exit). The call is
+			// still logged first, so the count is about probes attempted.
+			...(options.alwaysFail ? ["exit 4"] : []),
 			'echo "User packages:"',
 			`echo "    ${pkgDir}"`,
 		].join("\n") + "\n",
@@ -913,6 +916,87 @@ test("A16: router + backend both warming still runs exactly one `pi list`", asyn
 			assert.equal(host.piCalls(), 1, "router warm + backend warm must not add a second `pi list`");
 			await router.retire("root.first").catch(() => {});
 			await router.retire("root.second").catch(() => {});
+		});
+	} finally {
+		h.close();
+		host.cleanup();
+	}
+});
+
+test("A20: a failing `pi list` costs one probe per spawn, not two", async () => {
+	// R2-b/F39: three warm-up points sit on one spawn (router, then the backend).
+	// Before the failure backoff each of them re-probed a failing host, so a
+	// failing `pi list` cost 2× per spawn — before the memory gate, and `pi list`
+	// costs 0.3–0.9 s when it works (up to its timeout when it does not).
+	const host = fakePiHost({ alwaysFail: true });
+	const h = harness({ memoryAvailable: () => 1_000_000 });
+	try {
+		await withFakePiHost(host, async () => {
+			const router = new RoutingSupervisor({ rpc: h.supervisor });
+			const input = (name: string): SpawnInput => ({
+				...testInput(h.root, name),
+				agent: { ...warmAgent({ spawnMode: "rpc", extensions: [] }), name: "worker" } as SpawnInput["agent"],
+			});
+
+			await router.spawnChild(input("root.failing"));
+			assert.equal(
+				host.piCalls(),
+				1,
+				"router warm + backend warm share one failed probe (F39: it used to be 2)",
+			);
+			assert.deepEqual(
+				discoveredHostExtensions(),
+				undefined,
+				"and the failure is still NOT cached as [] (F23), only backed off",
+			);
+			assert.equal(h.clients.length, 1, "precondition: the backend really did spawn");
+
+			// The second spawn inside the window continues off the same backoff.
+			await router.spawnChild(input("root.failing.2"));
+			assert.equal(h.clients.length, 2, "precondition: two real backend spawns happened");
+			assert.equal(
+				host.piCalls(),
+				1,
+				"still one probe: the TTL covers every warm call of these spawns",
+			);
+
+			await router.retire("root.failing").catch(() => {});
+			await router.retire("root.failing.2").catch(() => {});
+		});
+	} finally {
+		h.close();
+		host.cleanup();
+	}
+});
+
+test("A21: the router retries a failing `pi list` once the backoff window passes", async () => {
+	// The recoverability half of R2-b (F23/A21): the backoff must not become the
+	// permanent off switch that the old `cached []` shape was. Ages the stamp the
+	// way wall-clock time would, with the router driving the spawn path.
+	const host = fakePiHost({ alwaysFail: true });
+	const h = harness({ memoryAvailable: () => 1_000_000 });
+	try {
+		await withFakePiHost(host, async () => {
+			const router = new RoutingSupervisor({ rpc: h.supervisor });
+			const input = (name: string): SpawnInput => ({
+				...testInput(h.root, name),
+				agent: { ...warmAgent({ spawnMode: "rpc", extensions: [] }), name: "worker" } as SpawnInput["agent"],
+			});
+			await router.spawnChild(input("root.backoff"));
+			assert.equal(host.piCalls(), 1);
+
+			// Cross the window through the live holder, exactly as elapsed time would.
+			const holder = (globalThis as unknown as Record<symbol, { failedAt?: number } | undefined>)[
+				Symbol.for("pi-legion.extension-discovery")
+			];
+			assert.ok(holder, "discovery state lives on the shared holder");
+			holder.failedAt = Date.now() - 60_000;
+
+			await router.spawnChild(input("root.backoff.2"));
+			assert.equal(host.piCalls(), 2, "past the TTL the router probes again (F23: not a permanent off switch)");
+
+			await router.retire("root.backoff").catch(() => {});
+			await router.retire("root.backoff.2").catch(() => {});
 		});
 	} finally {
 		h.close();

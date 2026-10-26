@@ -7,10 +7,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
+	FAILURE_TTL_MS,
 	childInheritsExtensions,
 	discoveredHostExtensions,
 	ensureHostExtensions,
@@ -260,6 +261,21 @@ function discoveryStore(): object | undefined {
 	return (globalThis as unknown as Record<symbol, object | undefined>)[DISCOVERY_STORE_KEY];
 }
 
+/**
+ * Age the failure stamp past `FAILURE_TTL_MS`.
+ *
+ * R2-b turned a failed discovery into a short backoff instead of an immediate
+ * retry, so every "a failure is not permanent" case has to cross that window the
+ * way real time would. The stamp is aged through the shared holder instead of
+ * faking the clock, so production keeps calling `Date.now()` and the test moves
+ * only the value it wants to move.
+ */
+function expireFailureBackoff(): void {
+	const holder = discoveryStore() as { failedAt?: number } | undefined;
+	assert.ok(holder, "the failure stamp lives on the shared discovery holder");
+	holder.failedAt = Date.now() - FAILURE_TTL_MS - 1;
+}
+
 /** Minimal spawn input for the router-level cases. */
 function spawnInput(overrides: Partial<SpawnInput> = {}): SpawnInput {
 	return {
@@ -399,7 +415,7 @@ test("A4: warm discovery is idempotent — two spawns run one `pi list`", async 
 	}
 });
 
-test("A5: a failed discovery resolves to [] without caching, so the next spawn retries", async () => {
+test("A5: a failed discovery resolves to [] without caching, so a later call retries", async () => {
 	const host = fakeHost({ failFirst: true });
 	try {
 		await withHostEnv(host, {}, async () => {
@@ -411,6 +427,9 @@ test("A5: a failed discovery resolves to [] without caching, so the next spawn r
 				"a failure must NOT be cached as [] (F23: one blip would disable inheritance)",
 			);
 
+			// R2-b: the retry is deferred by `FAILURE_TTL_MS`, not skipped forever —
+			// that is the whole point of ageing the stamp instead of caching `[]`.
+			expireFailureBackoff();
 			const second = await ensureHostExtensions();
 			assert.deepEqual(second, [host.entry], "the retry succeeds once `pi list` works");
 			assert.equal(host.piCalls(), 2, "exactly one retry, then cached");
@@ -459,8 +478,12 @@ test("A5: a `pi list` failure does not burn the in-flight slot for later callers
 				ensureHostExtensions(),
 			]);
 			assert.deepEqual(after, [], "concurrent callers see the same failure");
-			// …and the slot is released, so a later caller runs a real retry.
+			assert.equal(host.piCalls(), 1, "they shared one probe, so the slot did not leak a second");
+			// …and the slot is released: once the R2-b backoff window passes, a later
+			// caller runs a real retry rather than reusing a stuck promise.
+			expireFailureBackoff();
 			assert.deepEqual(await ensureHostExtensions(), [host.entry]);
+			assert.equal(host.piCalls(), 2, "a real retry, not a dead in-flight slot");
 		});
 	} finally {
 		host.cleanup();
@@ -598,10 +621,10 @@ test("A12: a directory entry that expands to nothing is dropped, not emitted", a
 });
 
 test("A13: no non-file path ever reaches collectChildExtensions", async () => {
-	// The real host on this machine is what the reviewer's defect hit: the set is
-	// resolved from a fake host shaped like `pi-diff-review` (declared directory,
-	// no manifest/index inside) PLUS the live `pi list`, so the assertion covers
-	// both the fixed shape and whatever this machine really has installed.
+	// The set is resolved from a fake host shaped like `pi-diff-review` (declared
+	// directory, no manifest/index inside), which is the shape the reviewer's
+	// defect hit. The fake host is the ONLY source: `withHostEnv` replaces PATH
+	// outright, so no live `pi list` result can leak into this assertion.
 	const host = fakeHost({ layout: (pkgDir) => diffReviewLayout(pkgDir) });
 	try {
 		await withHostEnv(host, { PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined }, async () => {
@@ -617,6 +640,171 @@ test("A13: no non-file path ever reaches collectChildExtensions", async () => {
 			});
 			assert.deepEqual(offenders, [], `non-file entries reached the child argv: ${offenders.join(", ")}`);
 			assert.ok(list.includes(host.entry), "the expanded review.ts is what got inherited");
+		});
+	} finally {
+		host.cleanup();
+	}
+});
+
+// ── R2-a: the sweep must mirror pi's `collectAutoExtensionEntries` (§8 A17–A19) ──
+
+/**
+ * The documented pi layout: a package whose manifest declares `./extensions`, and
+ * whose extensions are `<name>/index.ts` SUBDIRECTORIES rather than loose files.
+ * `resolveExtensionEntries` used to sweep only files, so this shipped `[]`.
+ */
+function namedDirsLayout(pkgDir: string, dirs: string[]): string {
+	const extensionsDir = path.join(pkgDir, "extensions");
+	mkdirSync(extensionsDir, { recursive: true });
+	writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+	for (const dir of dirs) {
+		mkdirSync(path.join(extensionsDir, dir), { recursive: true });
+		writeFileSync(path.join(extensionsDir, dir, "index.ts"), "export default {};\n");
+	}
+	return extensionsDir;
+}
+
+test("A17: `extensions/<name>/index.ts` subdirectories are collected, not dropped", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "ext-named-dirs-"));
+	try {
+		const pkgDir = path.join(root, "pkg");
+		const extensionsDir = namedDirsLayout(pkgDir, ["alpha", "beta"]);
+		// Precondition the defect depended on: no manifest and no index file at the
+		// declared directory's own root, so only the subdirectories can resolve.
+		assert.equal(existsSync(path.join(extensionsDir, "package.json")), false);
+		assert.equal(existsSync(path.join(extensionsDir, "index.ts")), false);
+
+		assert.deepEqual(
+			resolveExtensionEntries(pkgDir),
+			[
+				path.join(extensionsDir, "alpha", "index.ts"),
+				path.join(extensionsDir, "beta", "index.ts"),
+			],
+			"pi's documented `extensions/<name>/index.ts` layout must resolve (F34: both were lost)",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("A18: a dotfile in the declared directory is not collected", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "ext-dotfile-"));
+	try {
+		const pkgDir = path.join(root, "pkg");
+		const extensionsDir = namedDirsLayout(pkgDir, ["alpha", "beta"]);
+		// `pi -e` accepts it (exit 0, F37), so this is not a crash guard: it is
+		// behavioural alignment — pi's own `collectAutoExtensionEntries` skips every
+		// `.`-prefixed entry, so we must not hand the child one.
+		writeFileSync(path.join(extensionsDir, ".eslintrc.js"), "module.exports = {};\n");
+		const resolved = resolveExtensionEntries(pkgDir);
+		assert.equal(
+			resolved.some((entry) => path.basename(entry).startsWith(".")),
+			false,
+			`a dotfile is never an extension entry: ${resolved.join(", ")}`,
+		);
+		assert.deepEqual(resolved, [
+			path.join(extensionsDir, "alpha", "index.ts"),
+			path.join(extensionsDir, "beta", "index.ts"),
+		], "and the real extensions are unaffected by the dotfile beside them");
+
+		// A directory whose ONLY content is dotfiles resolves to nothing at all.
+		const dotOnly = path.join(root, "dot-only");
+		mkdirSync(path.join(dotOnly, "extensions"), { recursive: true });
+		writeFileSync(path.join(dotOnly, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+		writeFileSync(path.join(dotOnly, "extensions", ".eslintrc.js"), "module.exports = {};\n");
+		assert.deepEqual(resolveExtensionEntries(dotOnly), [], "dotfiles alone cannot make a loadable entry");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("A19: the subdirectory resolution is bounded — a directory inside a directory is not walked", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "ext-nested-dir-"));
+	try {
+		// `extensions/x/y/index.ts`: `x` is the one subdirectory level R2-a allows,
+		// and it resolves to nothing (no manifest, no index of its own), so `y` must
+		// not be reached. pi stops at the same depth (F33).
+		const pkgDir = path.join(root, "pkg");
+		const extensionsDir = path.join(pkgDir, "extensions");
+		mkdirSync(path.join(extensionsDir, "x", "y"), { recursive: true });
+		writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+		writeFileSync(path.join(extensionsDir, "x", "y", "index.ts"), "export default {};\n");
+		assert.deepEqual(
+			resolveExtensionEntries(pkgDir),
+			[],
+			"the sweep resolves one subdirectory level and stops; a deepening path must not become a walk",
+		);
+
+		// The same bound holds for the SWEEP inside a declared directory: a second
+		// level down never appears even when the first level does resolve.
+		const mixed = path.join(root, "mixed");
+		const mixedExt = path.join(mixed, "extensions");
+		mkdirSync(path.join(mixedExt, "good", "deeper"), { recursive: true });
+		writeFileSync(path.join(mixed, "package.json"), JSON.stringify({ pi: { extensions: ["./extensions"] } }));
+		writeFileSync(path.join(mixedExt, "good", "index.ts"), "export default {};\n");
+		writeFileSync(path.join(mixedExt, "good", "deeper", "index.ts"), "export default {};\n");
+		assert.deepEqual(
+			resolveExtensionEntries(mixed),
+			[path.join(mixedExt, "good", "index.ts")],
+			"one level of subdirectory resolution, and the index of that level wins over deeper files",
+		);
+
+		// A self-declaring manifest one level in must still terminate (the R1-a guard
+		// and the R2-a depth bound are the same mechanism).
+		const selfDeclaring = path.join(root, "self-declaring");
+		mkdirSync(path.join(selfDeclaring, "nested"), { recursive: true });
+		writeFileSync(path.join(selfDeclaring, "package.json"), JSON.stringify({ pi: { extensions: ["./nested"] } }));
+		writeFileSync(path.join(selfDeclaring, "nested", "package.json"), JSON.stringify({ pi: { extensions: ["./main.ts"] } }));
+		writeFileSync(path.join(selfDeclaring, "nested", "main.ts"), "export default {};\n");
+		assert.deepEqual(resolveExtensionEntries(selfDeclaring), [path.join(selfDeclaring, "nested", "main.ts")]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── R2-b: a failed probe is backed off for one spawn (§8 A20–A22) ────────────
+
+test("A21: a failed discovery still retries once the backoff window has passed", async () => {
+	const host = fakeHost({ failFirst: true });
+	try {
+		await withHostEnv(host, {}, async () => {
+			const first = await ensureHostExtensions();
+			assert.deepEqual(first, [], "the failing `pi list` degrades to no extensions");
+			assert.equal(host.piCalls(), 1, "precondition: one probe paid for");
+
+			// Inside the window the failure is remembered without another probe. This is
+			// the R2-b behaviour, not a permanent off switch: the next assertion crosses
+			// the window.
+			assert.deepEqual(await ensureHostExtensions(), []);
+			assert.equal(host.piCalls(), 1, "a second warm inside the TTL must not re-probe");
+
+			expireFailureBackoff();
+			assert.deepEqual(
+				await ensureHostExtensions(),
+				[host.entry],
+				"past `FAILURE_TTL_MS` discovery is retried and succeeds (F23: never permanently off)",
+			);
+			assert.equal(host.piCalls(), 2, "exactly one retry, then cached");
+			assert.deepEqual(await ensureHostExtensions(), [host.entry], "the success is cached again");
+			assert.equal(host.piCalls(), 2);
+		});
+	} finally {
+		host.cleanup();
+	}
+});
+
+test("A22: the success path is unchanged by the failure backoff", async () => {
+	const host = fakeHost();
+	try {
+		await withHostEnv(host, {}, async () => {
+			// Two warm calls (router + backend, or two spawns) still cost one probe,
+			// and the second is a cache hit — the TTL only ever engages on failure.
+			assert.deepEqual(await ensureHostExtensions(), [host.entry]);
+			assert.deepEqual(await ensureHostExtensions(), [host.entry]);
+			assert.deepEqual(discoveredHostExtensions(), [host.entry]);
+			assert.equal(host.piCalls(), 1, "success is cached; the new backoff must never add a probe");
+			const holder = discoveryStore() as { failedAt?: number } | undefined;
+			assert.equal(holder?.failedAt, undefined, "a success records no failure stamp");
 		});
 	} finally {
 		host.cleanup();
