@@ -13,11 +13,19 @@ test("playbook text describes the backend-neutral launch and frozen child guidan
 	assert.match(PARENT_PLAYBOOK, /Forbidden/);
 	assert.match(PARENT_PLAYBOOK, /Isolation belongs to centurion/);
 	assert.match(PARENT_PLAYBOOK, /worktree: true/);
-	assert.match(PARENT_PLAYBOOK, /dispatch N centurions/);
+	// #303: the playbook used to say "For N parallel isolated writers, dispatch N
+	// centurions". That was an instruction to nest a centurion inside a centurion,
+	// which the runtime REFUSES (only the root may dispatch one) — so it told models
+	// to do something that could only fail. It now describes the ownership rule
+	// without prescribing a nested dispatch.
+	assert.match(PARENT_PLAYBOOK, /owns one worktree/);
+	assert.doesNotMatch(PARENT_PLAYBOOK, /dispatch N centurions/);
 	// D1: children are in-process by default; a separate `pi` process is the
 	// worktree/`spawnMode: rpc` case only.
 	assert.match(PARENT_PLAYBOOK, /Children are in-process by default/);
-	assert.match(PARENT_PLAYBOOK, /pins `spawnMode: rpc`/);
+	// The `spawnMode` role field is gone (#290); the playbook must not describe it.
+	assert.doesNotMatch(PARENT_PLAYBOOK, /spawnMode/);
+	assert.match(PARENT_PLAYBOOK, /may hold one/);
 	assert.doesNotMatch(PARENT_PLAYBOOK, /headless RPC children/);
 	assert.match(PARENT_PLAYBOOK, /verify:/);
 	assert.match(TOOL_DESCRIPTION, /async by default/);

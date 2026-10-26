@@ -1,6 +1,6 @@
 ---
 name: centurion
-description: 百夫长/组长：携带一支团队递归派生的指挥角色，负责冻结契约、调度组员、推进四阶段状态机并整队交付。
+description: 百夫长/组长：带领一支子团队，负责冻结契约、调度组员、推进阶段状态机并整队交付。（仅根会话可派发）
 kind: pi
 allowNestedSubagents: true
 maxSubagentDepth: 3
