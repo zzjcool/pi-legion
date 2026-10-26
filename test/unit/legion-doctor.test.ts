@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
@@ -15,7 +15,13 @@ import {
 } from "../../src/extension/legion-doctor.ts";
 import { clearSpawnFailures, recordSpawnFailure } from "../../src/extension/spawn-hints.ts";
 import { HYGIENE_DEFAULTS, HYGIENE_LAST_FILE } from "../../src/runs/hygiene.ts";
-import { BUILTIN_CODEMODE, buildPiArgs } from "../../src/runs/args.ts";
+import { BUILTIN_CODEMODE, buildPiArgs, childGuardExtensionPath } from "../../src/runs/args.ts";
+import { ensureHostExtensions, resetExtensionDiscoveryCache } from "../../src/runs/extension-inheritance.ts";
+
+/** Every value that follows an `--extension` flag, in argv order. */
+function extensionsOf(args: string[]): string[] {
+	return args.flatMap((arg, i) => (arg === "--extension" ? [args[i + 1] ?? ""] : []));
+}
 
 test("parseListModels reads pi --list-models table", () => {
 	const out = parseListModels(`provider      model                               context  max-out  thinking  images
@@ -227,7 +233,7 @@ test("doctor OK when child inherits or sees models", () => {
 
 const LENS_TOOL = /lens|symbol_search|project_report|module_report|read_symbol|read_enclosing/i;
 
-test("#70 bundled worker does not promise lens tools under --no-extensions", () => {
+test("#70 bundled worker does not promise lens tools under --no-extensions", async () => {
 	// #301 removed planner/reviewer, so worker is the remaining write-capable role.
 	// The property under test is unchanged: a bundled role must not list lens_*
 	// tools without also arranging for the extension to load.
@@ -238,11 +244,31 @@ test("#70 bundled worker does not promise lens tools under --no-extensions", () 
 
 	const prevInherit = process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
 	const prevExtra = process.env.PI_LEGION_CHILD_EXTENSIONS;
+	const prevPath = process.env.PATH;
 	delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
 	delete process.env.PI_LEGION_CHILD_EXTENSIONS;
 	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-lens-"));
+	// A fake host whose only package is a `pi-lens`-shaped one. Discovery state is
+	// set by this case (contract §6), never inherited from whatever ran before.
+	const hostRoot = mkdtempSync(path.join(tmpdir(), "legion-doctor-lens-host-"));
+	const hostPkg = path.join(hostRoot, "npm", "node_modules", "pi-lens");
+	mkdirSync(hostPkg, { recursive: true });
+	writeFileSync(path.join(hostPkg, "index.ts"), "export default {};\n");
+	const hostBin = path.join(hostRoot, "bin");
+	mkdirSync(hostBin, { recursive: true });
+	writeFileSync(
+		path.join(hostBin, "pi"),
+		["#!/bin/sh", 'echo "User packages:"', `echo "    ${hostPkg}"`].join("\n") + "\n",
+	);
+	chmodSync(path.join(hostBin, "pi"), 0o755);
+	const lensEntry = path.join(hostPkg, "index.ts");
 	try {
 		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+
+		// 1) The ROLE CARD itself never promises lens: no lens tool, no lens mention
+		//    in its prompt, and no pi-lens path in its own extension list. This is the
+		//    durable half of #70 — it does not depend on what the host happens to
+		//    have installed.
 		for (const agent of roles) {
 			assert.equal(
 				(agent.tools ?? []).some((tool) => LENS_TOOL.test(tool)),
@@ -250,16 +276,49 @@ test("#70 bundled worker does not promise lens tools under --no-extensions", () 
 				`${agent.name} tools`,
 			);
 			assert.doesNotMatch(agent.systemPrompt, /pi-lens|lens_|module_report|read_symbol|symbol_search/);
+			assert.equal(
+				(agent.extensions ?? []).some((ext) => /pi-lens/i.test(ext)),
+				false,
+				`${agent.name} must not name pi-lens itself (#280 inherits it instead)`,
+			);
+		}
+
+		// 2) Cold discovery: nothing phantom appears, and the guard still closes it.
+		resetExtensionDiscoveryCache();
+		for (const agent of roles) {
+			const extensions = extensionsOf(buildPiArgs({
+				agent,
+				task: "t",
+				sessionFile: path.join(dir, "session.jsonl"),
+				tempDir: dir,
+			}).args);
+			assert.equal(extensions.some((ext) => /pi-lens/i.test(ext)), false, "empty host, empty inherited set");
+			assert.equal(extensions.at(-1), childGuardExtensionPath(), "the child-guard is always last");
+		}
+
+		// 3) Warm discovery: the host's pi-lens REALLY reaches the bundled worker.
+		//    That is the point of the wiring (`#280: children inherit every host
+		//    extension by default`) and the reason a bundled role may list lens_*
+		//    tools without naming the extension.
+		process.env.PATH = `${hostBin}${path.delimiter}${prevPath ?? ""}`;
+		resetExtensionDiscoveryCache();
+		await ensureHostExtensions();
+		for (const agent of roles) {
 			const args = buildPiArgs({
 				agent,
 				task: "t",
 				sessionFile: path.join(dir, "session.jsonl"),
 				tempDir: dir,
 			}).args;
-			assert.ok(args.includes("--no-extensions"));
-			const extensions = args.flatMap((arg, i) => (arg === "--extension" ? [args[i + 1] ?? ""] : []));
-			assert.equal(extensions.some((ext) => /pi-lens/i.test(ext)), false);
+			assert.ok(args.includes("--no-extensions"), "pi discovery stays off; the list is ours");
+			const extensions = extensionsOf(args);
+			assert.ok(
+				extensions.includes(lensEntry),
+				`${agent.name} must inherit the host pi-lens: ${extensions.join(",")}`,
+			);
+			assert.equal(extensions.at(-1), childGuardExtensionPath(), "the child-guard is always last");
 		}
+		resetExtensionDiscoveryCache();
 
 		const report = runLegionDoctor({
 			agentDir: dir,
@@ -276,11 +335,15 @@ test("#70 bundled worker does not promise lens tools under --no-extensions", () 
 		});
 		assert.equal(report.issues.filter((issue) => issue.code === "ROLE_MISSING_LENS").length, 0);
 	} finally {
+		resetExtensionDiscoveryCache();
+		if (prevPath === undefined) delete process.env.PATH;
+		else process.env.PATH = prevPath;
 		if (prevInherit === undefined) delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
 		else process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = prevInherit;
 		if (prevExtra === undefined) delete process.env.PI_LEGION_CHILD_EXTENSIONS;
 		else process.env.PI_LEGION_CHILD_EXTENSIONS = prevExtra;
 		rmSync(dir, { recursive: true, force: true });
+		rmSync(hostRoot, { recursive: true, force: true });
 	}
 });
 

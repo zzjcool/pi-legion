@@ -214,6 +214,10 @@ export async function ensureHostExtensions(env: NodeJS.ProcessEnv = process.env)
 				if (!resolved) return [];
 				store.discovered = resolved;
 				return resolved;
+			} catch {
+				// Belt and braces: the contract is "never rejects", and a launch must
+				// never fail because the host could not be asked about packages.
+				return [];
 			} finally {
 				// Success caches through `discovered`; failure must leave nothing behind
 				// but a cleared in-flight slot, or the retry could never start.
@@ -224,10 +228,14 @@ export async function ensureHostExtensions(env: NodeJS.ProcessEnv = process.env)
 	return store.inFlight;
 }
 
-/** Historical name for `ensureHostExtensions`; launch paths call that one. */
-export async function discoverHostExtensions(env: NodeJS.ProcessEnv = process.env): Promise<string[]> {
-	return ensureHostExtensions(env);
-}
+/**
+ * Historical name for the same resolver; kept for callers that still use it.
+ *
+ * Aliased rather than wrapped so both names are literally one function: a
+ * second `async` wrapper would only add a promise layer and a second identity
+ * for the same cache.
+ */
+export const discoverHostExtensions = ensureHostExtensions;
 
 /** Synchronous read of whatever discovery has already produced. */
 export function discoveredHostExtensions(): string[] | undefined {

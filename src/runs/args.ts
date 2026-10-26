@@ -14,7 +14,7 @@ import {
 	isThinkingLevel,
 } from "../shared/types.ts";
 import { formatChildTask } from "../extension/child-guard.ts";
-import { childInheritsExtensions, discoveredHostExtensions, inheritedExtensions } from "./extension-inheritance.ts";
+import { discoveredHostExtensions, inheritedExtensions, matchesExcludedExtension } from "./extension-inheritance.ts";
 
 /** Re-exported for callers that only need the level list. */
 export { THINKING_LEVELS };
@@ -191,6 +191,9 @@ export function isCodemodeExtension(ext: string): boolean {
 	return t === BUILTIN_CODEMODE || t.endsWith("/" + BUILTIN_CODEMODE);
 }
 
+/** This package's name — its extension is never inherited, only guarded explicitly. */
+export const SELF_EXTENSION_NAME = "pi-legion";
+
 /**
  * Effective `--extension` values for a child.
  *
@@ -213,8 +216,22 @@ export function collectChildExtensions(
 	>,
 	env: NodeJS.ProcessEnv = process.env,
 ): string[] {
+	// `env` MUST be forwarded: `PI_LEGION_CHILD_INHERIT_EXTENSIONS=0` is the
+	// operator kill-switch, and dropping it here made the opt-out a no-op for the
+	// inherited half of the list while still applying to everything else.
+	//
+	// Legion's own extension is filtered out of the inherited set. In the
+	// installed-copy layout `pi list` reports the same package the child-guard
+	// already names, and dedupe collapses them; in the source-tree layout the two
+	// paths differ, so the child would load TWO legion factories and die on
+	// `Tool "subagent" conflicts with ...`. Self-exclusion makes both layouts
+	// converge on exactly one, and the guard below still appends it
+	// unconditionally — so a hermetic card does not lose the guard either.
+	const inherited = inheritedExtensions(agent, discoveredHostExtensions() ?? [], env).filter(
+		(ext) => !matchesExcludedExtension(ext, SELF_EXTENSION_NAME),
+	);
 	const list = [
-		...inheritedExtensions(agent, discoveredHostExtensions() ?? []),
+		...inherited,
 		...(agent.extensions ?? []),
 		...(agent.subagentOnlyExtensions ?? []),
 		...childExtraExtensions(env),
