@@ -7,7 +7,6 @@ inheritProjectContext: true
 inheritSkills: false
 async: true
 timeoutMs: 2700000
-allowNestedSubagents: true
 acceptance:
   level: verified
   role: writer

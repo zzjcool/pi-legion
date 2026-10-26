@@ -95,6 +95,7 @@ import {
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
 import { renderSpawnResult } from "./src/extension/spawn-render.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
+import { CHILD_ROLE_ENV } from "./src/extension/child-guard.ts";
 import { configureSessionErrors, recordSessionError } from "./src/extension/session-errors.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
 import { expectedModelsFromSettings, parseDoctorSections, runLegionDoctor } from "./src/extension/legion-doctor.ts";
@@ -1133,9 +1134,18 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			catalog.settings,
 			catalog.team,
 		);
+		// A centurion running as a NESTED child is still a "parent" for templating
+		// purposes — it dispatches its own squad — but it must not be offered itself:
+		// the runtime refuses a non-root centurion dispatch (a nested centurion is
+		// a second command chain the root cannot collect), so listing it invites a
+		// call that can only fail. Leaving it out keeps the roster truthful.
+		const selfRole = process.env[CHILD_ROLE_ENV];
+		const rosterAgents = selfRole
+			? catalog.agents.filter((agent) => agent.name !== selfRole)
+			: catalog.agents;
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${PARENT_PLAYBOOK}\n\n${renderParentRoster(
-				catalog.agents,
+				rosterAgents,
 				catalog.team,
 				catalog.teamWarnings,
 			)}${parentContext ? `\n\n${parentContext}` : ""}`,
