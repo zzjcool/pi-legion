@@ -403,28 +403,63 @@ function parseCriteria(value: unknown): AcceptanceCriterion[] | undefined {
 	return criteria.length > 0 ? criteria : undefined;
 }
 
-function parseBudget(value: unknown): ToolBudgetConfig | undefined {
-	const raw = str(value);
-	if (!raw) return undefined;
-	try {
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		const max = int(parsed.maxToolCalls);
-		return max === undefined ? undefined : { maxToolCalls: max };
-	} catch {
-		return undefined;
-	}
-}
-
-function parseTurnBudget(value: unknown): TurnBudgetConfig | undefined {
-	const raw = str(value);
-	if (!raw) return undefined;
-	try {
-		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		const max = int(parsed.maxTurns);
-		return max === undefined ? undefined : { maxTurns: max };
-	} catch {
-		return undefined;
-	}
+/**
+ * Parse a child budget (`toolBudget` / `turnBudget`) strictly.
+ *
+ * These used to swallow every error and return `undefined`, so a typo became
+ * "no limit" -- the same silent-acceptance failure the frontmatter field check
+ * exists to prevent. Worse, a NEGATIVE number was accepted: `-3` reached the
+ * child, `toolCalls > -3` was true immediately, and the first tool call was
+ * blocked while the author believed they had set a limit of 3.
+ *
+ * `0` is meaningful here ("no calls allowed", per `extension/budget.ts`), so it
+ * must survive rather than decay into "unset". Anything that is not a
+ * non-negative integer is an error naming the file and the field.
+ */
+function parseBudgets(fm: AgentFrontmatter, filePath: string): {
+	tool?: ToolBudgetConfig;
+	turn?: TurnBudgetConfig;
+} {
+	const read = (
+		field: "toolBudget" | "turnBudget",
+		key: "maxToolCalls" | "maxTurns",
+	): number | undefined => {
+		const raw = str(fm[field]);
+		if (!raw) return undefined;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			throw new Error(
+				`Agent '${filePath}' has invalid ${field}: expected a JSON object like '{"${key}": 10}', got '${raw}'.`,
+			);
+		}
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error(
+				`Agent '${filePath}' has invalid ${field}: expected a JSON object with a '${key}' key.`,
+			);
+		}
+		const value = (parsed as Record<string, unknown>)[key];
+		if (value === undefined) return undefined;
+		if (typeof value !== "number" || !Number.isInteger(value)) {
+			throw new Error(
+				`Agent '${filePath}' has invalid ${field}.${key}: expected a non-negative integer, got ${JSON.stringify(value)}.`,
+			);
+		}
+		if (value < 0) {
+			throw new Error(
+				`Agent '${filePath}' has invalid ${field}.${key}: ${value} is negative. ` +
+					`0 means "none allowed"; omit the field for "no limit".`,
+			);
+		}
+		return value;
+	};
+	const toolMax = read("toolBudget", "maxToolCalls");
+	const turnMax = read("turnBudget", "maxTurns");
+	return {
+		...(toolMax !== undefined ? { tool: { maxToolCalls: toolMax } } : {}),
+		...(turnMax !== undefined ? { turn: { maxTurns: turnMax } } : {}),
+	};
 }
 
 /**
@@ -608,8 +643,9 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "worktree", bool(fm.worktree));
 	setIf(config, "steer", bool(fm.steer));
 	setIf(config, "acceptance", parseAcceptance(fm.acceptance, config.name));
-	setIf(config, "toolBudget", parseBudget(fm.toolBudget));
-	setIf(config, "turnBudget", parseTurnBudget(fm.turnBudget));
+	const budgets = parseBudgets(fm, config.filePath);
+	setIf(config, "toolBudget", budgets.tool);
+	setIf(config, "turnBudget", budgets.turn);
 	// #214 / contract §9: only centurion holds worktree isolation. Writers no
 	// longer auto-default to worktree:true — members work in-place; parallel
 	// isolated writers are N root-dispatched centurions. Explicit worktree:true

@@ -1239,3 +1239,34 @@ test("renewal overrides parse and apply (agentOverrides path stays live)", () =>
 	assert.equal(patched.renewable, false);
 	assert.strictEqual(patched.maxRenewals, 0, "an override to 0 must not decay to the default");
 });
+
+test("#293: a malformed budget is an error, not a silent 'no limit'", () => {
+	// These used to return `undefined` on any problem, so a typo read as "unset" —
+	// the child ran with NO limit while the card looked like it had one. A negative
+	// value was worse: `-3` reached the child, `toolCalls > -3` was true at once,
+	// and the first tool call was blocked while the author believed the limit was 3.
+	const card = (budget: string): string =>
+		["---", "name: probe", "description: d", "kind: pi", `toolBudget: ${budget}`, "---", "body"].join("\n");
+
+	assert.throws(() => parseAgentDocument(card("{not json}"), "/x/p.md", "user"), /invalid toolBudget/);
+	assert.throws(
+		() => parseAgentDocument(card('{"maxToolCalls": -3}'), "/x/p.md", "user"),
+		/-3 is negative/,
+	);
+	assert.throws(
+		() => parseAgentDocument(card('{"maxToolCalls": "abc"}'), "/x/p.md", "user"),
+		/expected a non-negative integer/,
+	);
+	assert.throws(
+		() => parseAgentDocument(card('{"maxToolCalls": 1.5}'), "/x/p.md", "user"),
+		/expected a non-negative integer/,
+	);
+
+	// 0 means "no calls allowed" (extension/budget.ts), so it must survive.
+	const zero = parseAgentDocument(card('{"maxToolCalls": 0}'), "/x/p.md", "user");
+	assert.deepEqual(zero?.toolBudget, { maxToolCalls: 0 });
+
+	// Omitting the field still means "no limit".
+	const none = parseAgentDocument(card("{}"), "/x/p.md", "user");
+	assert.equal(none?.toolBudget, undefined);
+});
