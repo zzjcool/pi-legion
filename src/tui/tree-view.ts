@@ -45,6 +45,8 @@ const TERMINAL_STATUSES: ReadonlySet<string> = new Set<string>(
 	NODE_STATUSES.filter((status) => isTerminalState(status)),
 );
 
+import type { PhaseMachine } from "../legion/phase-machine.ts";
+
 export interface TreeNodeSnapshot extends LegionNode {
 	/** Snapshot from legion.db usage table (≤30s granularity). */
 	tokensTotal?: number;
@@ -63,6 +65,15 @@ export interface TreeNodeSnapshot extends LegionNode {
 	 * that as unknown, never as `rpc`.
 	 */
 	spawnMode?: SpawnMode;
+	/**
+	 * #298: the phase machine this node runs under, when known.
+	 *
+	 * Only the team root's card declares one, so children inherit their ancestor's.
+	 * Absent means the built-in four-phase pipeline — renderers should show that
+	 * default rather than nothing, because "no machine" and "the default machine"
+	 * are the same thing to the runtime.
+	 */
+	phaseMachine?: PhaseMachine;
 }
 
 export interface TreeViewTheme {
@@ -294,6 +305,48 @@ export function createTreeView(
 			detail.push(tools.slice(-MAX_ACTIVITY_TOOLS).map((tool) => safeText(tool)).join(", "));
 		}
 		return `${"  ".repeat(Math.max(0, node.depth))}${isSelected ? "│" : " "}   ⎿ ${detail.join(" · ")}`;
+	}
+
+	/**
+	 * The expanded phase machine for the selected node (#298).
+	 *
+	 * Before the machine became declarative this was unnecessary: the seven phases
+	 * were fixed and an operator could hold them in their head. Now each team can
+	 * declare its own phases, so "where is this team and what may it do next" is
+	 * only answerable by reading the machine. The runtime refuses illegal moves and
+	 * names the legal ones, but nothing showed the WHOLE picture — this does.
+	 *
+	 * Rendered only for the node that DECLARES the machine (the team root) and only
+	 * while it is selected, so the tree does not become a wall of config.
+	 */
+	function machineLines(node: TreeNodeSnapshot, isSelected: boolean): string[] {
+		if (!isSelected) return [];
+		// Only a node that DECLARES a machine shows one. Falling back to the built-in
+		// machine here would unfold seven phases under every selected row — a wall of
+		// config on a node that never configured anything, and it shifted every row's
+		// position (breaking scrolling and collapse).
+		const machine = node.phaseMachine;
+		if (!machine || machine.phases.length === 0) return [];
+		const current = node.phase;
+		const indent = "  ".repeat(Math.max(0, node.depth)) + (isSelected ? "│" : " ");
+		const out: string[] = [];
+		out.push(`${indent}     phases · current: ${safeText(current ?? "-")}`);
+		for (const phase of machine.phases) {
+			const here = phase.id === current;
+			const marker = here ? "●" : "○";
+			const timeout = phase.timeoutMs !== undefined ? ` ${Math.round(phase.timeoutMs / 1000)}s` : "";
+			out.push(`${indent}     ${marker} ${safeText(phase.id)}${timeout}${here ? "  ← now" : ""}`);
+			for (const rule of phase.next) {
+				const bits: string[] = [];
+				if (rule.require?.length) bits.push(`if ${rule.require.join(" & ")}`);
+				if (rule.actorRole) bits.push(`by ${rule.actorRole}`);
+				if (rule.rework) bits.push("rework");
+				const suffix = bits.length ? `  (${bits.join(", ")})` : "";
+				out.push(`${indent}         → ${safeText(rule.to)}${suffix}`);
+			}
+			if (phase.next.length === 0) out.push(`${indent}         (terminal)`);
+		}
+		return out;
 	}
 
 	/**
@@ -754,6 +807,9 @@ export function createTreeView(
 			lines.push(fitLine(styleNodeLine(head, node, isSelected), contentWidth));
 			if (childCount > 0 && !isExpanded) continue;
 			lines.push(fitLine(styleNodeLine(rowDetail(node, isSelected), node, isSelected), contentWidth));
+			for (const line of machineLines(node, isSelected)) {
+				lines.push(fitLine(styleNodeLine(line, node, isSelected), contentWidth));
+			}
 		}
 		return lines;
 	}
