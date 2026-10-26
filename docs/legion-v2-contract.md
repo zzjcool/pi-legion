@@ -3,6 +3,15 @@
 > 状态：**FROZEN-1**（2026-10-11 CEO 批准冻结；修订必须走 §15 流程）
 > 依据：2026-10-10/11 军团需求对齐（侦察底稿：`r-584dd563` scout-0/scout-1、`r-20cc52a2` scout-2，共 226 条带行号事实；RPC/SQLite/浮窗三项本机实测通过）
 > 修订规则：见 §15。worker 发现契约矛盾时**停下上报**，禁止自行解释。
+>
+> **阅读须知（2026-10-26）**：本文是 v2 的冻结快照，保留原样作为历史依据。
+> 其中三处已被后续实现取代：一是 §7 的「四阶段状态机 + 按角色名判定迁移」，
+> 已改为每队声明式状态机、按条件判定（`children_settled` / `verdict_ok` …），
+> 不再出现角色名（#298）；二是术语表与架构图里的「组员：scout/worker/reviewer…」，
+> 现只内置 `centurion` / `worker` / `scout`（#301）；三是「每个子节点都是
+> RpcClient 进程」，默认已是进程内 `AgentSession`，只有持 worktree 的 centurion
+> 走 rpc（#279）。
+> 现行行为以 `README.md` 与 `docs/contracts/declarative-phase-machine-v5.md` 为准。
 
 ---
 
