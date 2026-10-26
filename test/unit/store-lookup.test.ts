@@ -236,3 +236,39 @@ test("#270: RunRecord.cwd is carried on the hit so the caller knows the launch d
 	const run: RunRecord | undefined = searched.flatMap((s) => s.runs).find((r) => r.runId === "r-other");
 	assert.equal(run?.cwd, launchCwd, "the run records the cwd it was launched from");
 });
+
+test("#288: summary and timing report a miss with the SAME text store-lookup produces", async () => {
+	// Both commands used to hand-roll their own sentence telling the caller to
+	// "pass the same cwd used for launch" — obsolete once the cross-store lookup
+	// existed, and unactionable, because the caller does not know that cwd.
+	// They now delegate to `unknownChildMessage`, so this pins the delegation
+	// rather than any particular wording: if either command drifts back to its
+	// own phrasing, this fails.
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "legion-288-"));
+	try {
+		const cwd = path.join(root, "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		makeStore(path.join(cwd, STORE_DIR_NAME), [
+			{ runId: "r-present", cwd, children: ["scout-live"] },
+		]);
+
+		const { found, searched } = resolveChildAcrossStores({ name: "no-such-child", cwd });
+		assert.equal(found, null);
+		const expected = unknownChildMessage({ name: "no-such-child", cwd, searched });
+
+		// Property that matters: the miss names the store it searched and lists what
+		// IS there, instead of advising an unknowable cwd.
+		assert.match(expected, /unknown child: no-such-child/);
+		assert.match(expected, /scout-live/, "a miss must list the names that DO exist");
+		assert.doesNotMatch(
+			expected,
+			/pass the same cwd used for launch/,
+			"the obsolete 'pass the same cwd' advice must not come back",
+		);
+		// And it must be stable for an identical input, so both commands can rely on
+		// it (they call it with the same shape).
+		assert.equal(unknownChildMessage({ name: "no-such-child", cwd, searched }), expected);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+});

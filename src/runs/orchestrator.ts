@@ -46,6 +46,7 @@ import {
 	type ChildRecord,
 	DEFAULTS,
 	ErrorCodes,
+	unknownChildError,
 	type Execution,
 	type Handle,
 	MAX_NESTED_PATH_ENTRIES,
@@ -2032,7 +2033,7 @@ export class Orchestrator {
 
 	private requireChild(name: string): ChildRecord {
 		const child = this.children.get(name);
-		if (!child) throw new SubagentError(`unknown child: ${name}`, ErrorCodes.NOT_FOUND);
+		if (!child) throw unknownChildError(name);
 		return child;
 	}
 

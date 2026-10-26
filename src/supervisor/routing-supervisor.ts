@@ -9,6 +9,7 @@
 
 import {
 	ErrorCodes,
+	unknownChildError,
 	SubagentError,
 	type InProcessLimits,
 } from "../shared/types.ts";
@@ -231,6 +232,6 @@ export class RoutingSupervisor implements LegionSupervisor {
 			this.owners.set(name, "rpc");
 			return this.rpc;
 		}
-		throw new SubagentError(`unknown child: ${name}`, ErrorCodes.NOT_FOUND);
+		throw unknownChildError(name);
 	}
 }

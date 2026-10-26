@@ -128,6 +128,7 @@ import {
 	type SpawnMode,
 	SubagentError,
 	type SubagentsSettings,
+	unknownChildError,
 	type Handle,
 } from "./src/shared/types.ts";
 
@@ -1768,7 +1769,7 @@ async function controlAction(input: {
 				// all names but before the serial loop reaches it. Treat that target as
 				// stopped; only rebuild if its persisted record is not already retired.
 				const found = findChild(input.store.listRuns(), name);
-				if (!found) throw new SubagentError(`unknown child: ${name}`, ErrorCodes.NOT_FOUND);
+				if (!found) throw unknownChildError(name);
 				if (found.child.state === "retired") return;
 				const orchestrator = new Orchestrator({
 					supervisor: input.supervisor,

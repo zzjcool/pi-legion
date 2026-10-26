@@ -17,6 +17,7 @@ import {
 	RunStore,
 	pickChildByName,
 } from "../runs/store.ts";
+import { resolveChildAcrossStores, unknownChildMessage } from "../runs/store-lookup.ts";
 import type {
 	ChildRecord,
 	ExecutionStatus,
@@ -715,14 +716,22 @@ function summaryCompletions(
 		.map((name) => ({ value: all ? `--all ${name}` : name, label: name }));
 }
 
+/**
+ * Miss reporting for `/legion summary <name>` (#288).
+ *
+ * Was a hand-rolled sentence telling the caller to "pass the same cwd used for
+ * launch" -- advice that the cross-store lookup had already made obsolete, and
+ * advice the caller could not act on anyway (they do not know that cwd).
+ *
+ * Now it runs the same lookup `status` uses and prints `unknownChildMessage`,
+ * so every named operation reports a miss identically and lists what WAS found.
+ */
 function notifyUnknownChild(
 	ctx: ExtensionCommandContext,
 	name: string,
 ): void {
-	ctx.ui.notify(
-		`unknown child: ${name} (no run under ${ctx.cwd}/.pi-subagents). Child records are scoped to the cwd they were launched from — pass the same cwd used for launch.`,
-		"error",
-	);
+	const { searched } = resolveChildAcrossStores({ name, cwd: ctx.cwd });
+	ctx.ui.notify(unknownChildMessage({ name, cwd: ctx.cwd, searched }), "error");
 }
 
 /** Build the `/legion summary [--all] [<name>]` handler. */

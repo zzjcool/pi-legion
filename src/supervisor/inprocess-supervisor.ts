@@ -18,6 +18,7 @@ import {
 } from "../runs/args.ts";
 import {
 	ErrorCodes,
+	unknownChildError,
 	isThinkingLevel,
 	type InProcessLimits,
 	SubagentError,
@@ -1340,7 +1341,7 @@ export class InProcessSupervisor implements LegionSupervisor {
 	private requireChild(name: string): ChildRecord {
 		const child = this.children.get(name);
 		if (!child) {
-			throw new SubagentError(`unknown child: ${name}`, ErrorCodes.NOT_FOUND);
+			throw unknownChildError(name);
 		}
 		return child;
 	}
