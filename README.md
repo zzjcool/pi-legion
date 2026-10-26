@@ -1,7 +1,7 @@
 ---
 name: pi-legion
 npm: "pi-legion"
-description: "Pi Legion v2: recursive centurion trees on headless Pi RPC; shared SQLite WAL legion.db. Four-stage planning/implementing/reviewing/verifying state machine, parent/child/sibling legion_mail, three-layer /legion UI, upward MR trees, squad resume."
+description: "Pi Legion v2: recursive centurion teams on Pi. Children run in-process by default (rpc only for a worktree-owning centurion); shared SQLite WAL legion.db. Declarative per-team phase machine (built-in default: planning/implementing/reviewing/verifying), parent/child/sibling legion_mail, three-layer /legion UI, upward MR trees, squad resume."
 ---
 
 # pi-legion
@@ -55,8 +55,10 @@ User (CEO) — root Pi session (TUI)
 
 Transport, state, decision-making, and display are separate layers:
 
-- **Transport:** each child is a headless Pi RPC process managed by a
-  `LegionSupervisor`; a centurion can supervise another squad recursively.
+- **Transport:** a child is an `AgentSession` inside the parent process by
+  default; only a worktree-owning centurion runs as a separate `pi --mode rpc`
+  process. A `LegionSupervisor` owns both backends, and a centurion can lead
+  another squad recursively.
 - **State:** all nodes in the tree share the `legion.db` SQLite ledger in WAL
   mode. Per-run `run.json` records and session files remain the resume source
   for each child.
@@ -264,11 +266,17 @@ legion_phase({ to, note?, evidence? })
 - **`legion_phase`** is available to centurions. It requests a state transition;
   the supervisor checks the transition's invariants and records the result.
 
-A squad moves through **planning → implementing → reviewing → verifying**.
-Planning produces a non-empty `.pi-legion/contract.md` with file ownership
-and acceptance commands. During reviewing, an independent child supplies
-the judgment; in verifying, the supervisor runs the contract's `legion-verify`
-commands without an LLM. Passing verification advances the squad to `done`.
+A squad moves through whatever phases its lead declares. With no declaration
+that is the built-in **planning → implementing → reviewing → verifying**:
+planning produces a non-empty `.pi-legion/contract.md` with file ownership and
+acceptance commands; reviewing needs a settled child that returns `ok:true`; in
+verifying the supervisor runs the contract's `legion-verify` commands without an
+LLM. Passing verification advances the squad to `done`.
+
+Because the machine is data, no rule names a role: "the children are settled" and
+"a verdict came back ok" are conditions, not "the worker" and "the reviewer".
+That is what lets a team rename, reorder, or drop phases without touching code —
+and it is why the bundled roster is just `centurion`, `worker`, and `scout`.
 
 ## Three-layer visualization
 
