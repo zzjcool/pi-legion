@@ -11,6 +11,122 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [5.0.0] — 2026-10-26
+
+Major because upgrading **can break an existing role card**: unknown frontmatter
+is now a hard error, and `spawnMode` / `placement` are gone. A card carrying
+either fails to load with a message naming the offending field. That is the point
+— the previous behaviour was to silently ignore them, so a setting that looked
+active did nothing.
+
+**Before upgrading**, remove `spawnMode:` and `placement:` from every card under
+`~/.pi/agent/agents/` and `.pi/agents/`. Nothing else about a card needs to
+change.
+
+### Breaking
+
+- **`spawnMode` is gone from role cards (#290).** The backend is a property of
+  the launch, not of a role: a launch that needs a worktree runs over rpc, and
+  everything else runs in-process. Since only a `centurion` may hold a worktree
+  (#214), a centurion is the only role that can reach rpc. There is no global
+  default to configure because there is no longer a choice to make per role.
+- **Unknown frontmatter is refused (#290).** A card with a field the runtime does
+  not honour is rejected at load, listing the bad keys and the full legal set. The
+  retiral of `placement` was previously "tolerated"; fourteen bundled and local
+  cards still carried it while it did nothing.
+- **Five bundled roles removed (#301).** `planner`, `reviewer`, `designer`,
+  `prototype`, and `advisor` are gone; `centurion`, `worker`, and `scout` remain.
+  They existed because the phase machine keyed its rules on role *names* — a role
+  that merely existed carried workflow meaning. See the declarative machine below.
+- **Children inherit every host extension by default (#280).** The old default was
+  `--no-extensions` plus whatever a card named, which meant a role silently lost
+  host capabilities (a provider extension, a guard) it never knew to name. Use
+  `excludeExtensions: [pi-lens]` on a card, or
+  `PI_LEGION_CHILD_INHERIT_EXTENSIONS=0` globally, to get the old isolation.
+  `inheritExtensions: false` loads only the card's own list.
+
+### Added
+
+- **Declarative phase machine (#298).** A team declares its own phases on its
+  lead's card:
+  ```yaml
+  phases:
+    - id: recon
+      next:
+        - to: build
+          require: [contract_file]
+    - id: build
+      next:
+        - to: done
+          require: [children_settled]
+  ```
+  Omitted means the built-in `planning → implementing → reviewing → verifying`.
+  Conditions are a closed vocabulary (`contract_file`, `children_present`,
+  `children_settled`, `children_none_failed`, `verdict_ok`, `verdict_not_ok`,
+  `verification_passed`, `verification_failed`, `rework_available`,
+  `children_all_failed`, `always`) and **none of them names a role**, which is
+  what lets a team reshape its workflow without touching source.
+  - Conditions live on the **edge**, not the phase: `planning → implementing`
+    needs a contract while `planning → failed` must not, or a team could not fail
+    before it had one.
+  - `done` / `failed` / `aborted` are injected when a card omits them. A team that
+    cannot be aborted is a safety hole. Reaching them is still gated: `failed`
+    needs a terminal reason, `aborted` needs a parent retire, `done` stays
+    supervisor-only. `aborted` is deliberately exempt from phase-level
+    requirements — an emergency stop must not wait for "everything settled".
+  - An invalid machine is rejected at load, reporting every problem at once
+    (unknown condition, duplicate id, unknown target, self-edge, unreachable
+    phase, terminal start).
+- **The tree shows a team's machine (#302).** Selecting a team root unfolds its
+  phases, the current one, and every transition with its conditions.
+- **`legion_phase` refusals name the legal exits (#299).** A refused transition
+  reports `legal next phases from 'recon': build, done, failed, aborted`. Measured:
+  without it a model invented plausible-but-nonexistent transitions and burned a
+  turn being refused.
+
+### Fixed
+
+- **In-process children enforce `toolBudget` / `turnBudget` (#295).** The parent
+  computed budgets into `SpawnInput.env`, which an rpc child receives as its real
+  environment — but an in-process child shares the *host's* `process.env`, so the
+  guard read the parent's (absent) values. A card with `toolBudget: {maxToolCalls:
+  3}` made 12 tool calls and finished normally. Budgets now travel in the
+  async-local child context, the same channel already used for lineage identity,
+  with `process.env` kept as the rpc fallback.
+- **A malformed budget is an error, not "no limit" (#293).** `{not json}` parsed to
+  `undefined` and `{"maxToolCalls": -3}` was accepted, so the guard would have
+  blocked the first call. Both now fail at load naming the file, field, and value.
+- **rpc is reserved for a centurion, and in-process keeps its ledger budget
+  (#279).** In-process launches had been exempted from every legion budget
+  (`Number.MAX_SAFE_INTEGER`), which made "run it in-process" a way to escape
+  depth/spawn/ledger caps. Admission and reservation now share one code path, so a
+  launch cannot be admitted and then rejected.
+- **Runtime handles are keyed by (ledger path, node id) (#283, #285, #287).** Keyed
+  by path alone, a second session sharing the ledger could close the parent's
+  database; the identity is now adopted per node.
+- **Extension inheritance discovery (#280).** `pi list` reports package
+  *directories*, resolved the way pi's own loader does (`package.json`'s
+  `pi.extensions`, else `index.ts` / `index.js`). Single-file `--extension`
+  arguments and builtins cannot be discovered this way — name them explicitly.
+- **One spelling for "unknown child" (#288).** The old message advised "pass the
+  same cwd used for launch", which stopped being actionable once cross-store
+  lookup landed.
+- **Prompt surfaces match the code again (#303, #304).** The parent playbook told a
+  centurion to "dispatch N centurions" — an instruction the runtime refuses
+  (only the root may dispatch one). The roster also listed a centurion to
+  itself. `worker` kept `subagent` in its tool list while its text said not to
+  spawn, and the README described every child as an rpc process.
+
+### Notes
+
+- `toolBudget` / `turnBudget` remain **optional and unused by the bundled cards**.
+  Time, depth, per-node child counts, active-node counts, and the memory floor are
+  the intended bounds; a tool budget is a scalpel for one stubborn role, not a
+  default.
+- Child extension inheritance includes heavy extensions. pi-lens starts an LSP
+  stack (~1 GB per child, #43); add `excludeExtensions: [pi-lens]` where a fleet
+  does not need it.
+
 ## [4.0.0] — 2026-10-24
 
 - **Renewal for a budget casualty (#270).** An agent whose turn budget (`timeoutMs`)
@@ -701,7 +817,8 @@ branch — pin `pi-legion@0.16.x` if you still need that model. See
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v5.0.0...HEAD
+[5.0.0]: https://github.com/zzjcool/pi-legion/compare/v4.0.0...v5.0.0
 [4.0.0]: https://github.com/zzjcool/pi-legion/compare/v3.1.0...v4.0.0
 [3.1.0]: https://github.com/zzjcool/pi-legion/compare/v3.0.3...v3.1.0
 [3.0.3]: https://github.com/zzjcool/pi-legion/compare/v3.0.2...v3.0.3

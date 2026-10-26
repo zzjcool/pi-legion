@@ -1,6 +1,6 @@
 {
   "name": "pi-legion",
-  "version": "4.0.0",
+  "version": "5.0.0",
   "description": "Pi Legion v2: recursive centurion teams on Pi. Children run in-process by default (rpc only for a worktree-owning centurion); shared SQLite WAL legion.db. Declarative per-team phase machine (built-in default: planning/implementing/reviewing/verifying), parent/child/sibling legion_mail, three-layer /legion UI, upward MR trees, squad resume.",
   "type": "module",
   "license": "MIT",
