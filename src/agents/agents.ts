@@ -30,6 +30,14 @@ import {
 } from "./frontmatter.ts";
 import { getAgentDir } from "./paths.ts";
 import { ignoredKindMessage, reportIgnoredOnce } from "../shared/ignored-kind.ts";
+import {
+	type PhaseDefinition,
+	type PhaseMachine,
+	type PhaseTransitionRule,
+	normalizePhaseMachine,
+	validatePhaseMachine,
+} from "../legion/phase-machine.ts";
+import type { PhaseCondition } from "../legion/phase-conditions.ts";
 
 export const BUILTIN_AGENT_NAMES = [
 	"scout",
@@ -404,6 +412,177 @@ function parseCriteria(value: unknown): AcceptanceCriterion[] | undefined {
 }
 
 /**
+ * Read an indented `phases:` block into the machine shape (#298).
+ *
+ * The shared frontmatter parser is flat — nested lists come back as raw text —
+ * so this walks the text itself. The grammar is deliberately tiny and matches
+ * only what a card can express:
+ *
+ * ```text
+ * - id: planning                  # a phase
+ *   require: [contract_file]      # inline condition list
+ *   timeoutMs: 900000
+ *   terminal: false
+ *   next:                         # a list of transitions
+ *     - to: implementing
+ *       require: [contract_file]
+ *       actorRole: centurion
+ *       rework: true
+ *     - to: failed
+ * ```
+ *
+ * Anything outside this shape is an error rather than a silent skip, because a
+ * half-read machine is worse than none: it would run with the transitions it
+ * happened to parse.
+ */
+function parsePhaseBlock(text: string): PhaseMachine | undefined {
+	// `id` is filled from the `- id: ...` line; validatePhaseMachine rejects a
+	// machine where it is missing, so the assertion at the end is safe.
+	type PhaseDraft = Record<string, unknown> & { id: string; next?: Array<Record<string, unknown>> };
+	const phases: PhaseDraft[] = [];
+	let currentPhase: PhaseDraft | undefined;
+	let currentRule: Record<string, unknown> | undefined;
+	// Column where list items live. The first `- ` we see sets it, so the block may
+	// be indented by any amount relative to the document.
+	let itemIndent = -1;
+
+	const scalar = (value: string): unknown => {
+		const trimmed = value.trim();
+		if (trimmed === "true") return true;
+		if (trimmed === "false") return false;
+		if (/^-?\d+$/.test(trimmed)) return Number(trimmed);
+		if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+			const inner = trimmed.slice(1, -1).trim();
+			if (!inner) return [];
+			return inner.split(",").map((part) => part.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+		}
+		return trimmed.replace(/^["']|["']$/g, "");
+	};
+
+	for (const rawLine of text.split("\n")) {
+		if (!rawLine.trim()) continue;
+		const indent = rawLine.length - rawLine.trimStart().length;
+		const line = rawLine.trim();
+
+		if (line.startsWith("- ")) {
+			if (itemIndent === -1) itemIndent = indent;
+			const body = line.slice(2).trim();
+			const entry: Record<string, unknown> = {};
+			const colon = body.indexOf(":");
+			if (colon > 0) entry[body.slice(0, colon).trim()] = scalar(body.slice(colon + 1));
+			// A `- ` at the item column opens a phase; deeper opens a transition.
+			if (indent <= itemIndent) {
+				currentPhase = entry as PhaseDraft;
+				currentPhase.next = [];
+				phases.push(currentPhase);
+				currentRule = undefined;
+			} else if (currentPhase) {
+				currentRule = entry;
+				currentPhase.next!.push(entry);
+			}
+			continue;
+		}
+
+		const colon = line.indexOf(":");
+		if (colon <= 0) continue;
+		const key = line.slice(0, colon).trim();
+		const value = line.slice(colon + 1).trim();
+		const target = currentRule ?? currentPhase;
+		if (!target) continue;
+		if (value === "") {
+			// `next:` with nothing after it — the transitions follow as `- to:` lines.
+			if (key === "next") target.next = target.next ?? [];
+			continue;
+		}
+		target[key] = scalar(value);
+	}
+
+	if (phases.length === 0) return undefined;
+	// Convert the walked drafts into the declared shape explicitly instead of
+	// asserting it. `validatePhaseMachine` runs right after this and rejects
+	// anything malformed, but doing the coercion here means the compiler — not just
+	// the validator — has seen every field.
+	const converted: PhaseDefinition[] = phases.map((draft) => {
+		const rules: PhaseTransitionRule[] = (draft.next ?? []).map((rule) => {
+			const out: PhaseTransitionRule = { to: String(rule.to ?? "") };
+			if (Array.isArray(rule.require)) out.require = rule.require.map(String) as PhaseCondition[];
+			if (typeof rule.actorRole === "string") out.actorRole = rule.actorRole;
+			if (rule.rework === true) out.rework = true;
+			if (rule.notifyParent === true) out.notifyParent = true;
+			return out;
+		});
+		const phase: PhaseDefinition = { id: String(draft.id ?? ""), next: rules };
+		if (Array.isArray(draft.require)) phase.require = draft.require.map(String) as PhaseCondition[];
+		if (typeof draft.timeoutMs === "number") phase.timeoutMs = draft.timeoutMs;
+		if (draft.terminal === true) phase.terminal = true;
+		return phase;
+	});
+	const machine: PhaseMachine = { phases: converted };
+	if (typeof (phases as unknown as { start?: unknown }).start === "string") {
+		machine.start = String((phases as unknown as { start: string }).start);
+	}
+	return machine;
+}
+
+/**
+ * Parse a declared phase machine from `phases:` (#298).
+ *
+ * Accepts the YAML shape directly (a list of phase objects), or the same thing
+ * as a JSON string, matching how `toolBudget` is written.
+ *
+ * Validation happens HERE, at load, and every problem is reported at once. A
+ * machine that only fails mid-run would surface after a team had already spent
+ * tokens on a workflow that could never complete.
+ */
+function parsePhaseMachine(value: unknown, filePath: string): PhaseMachine | undefined {
+	if (value === undefined || value === null) return undefined;
+	let raw: unknown = value;
+	if (typeof value === "string") {
+		const text = value.trim();
+		if (!text) return undefined;
+		// The frontmatter parser is FLAT, so a nested `phases:` block arrives here
+		// as raw text — exactly the situation `parseAcceptance` already handles.
+		// Two spellings are therefore accepted: an indented YAML block (what the
+		// card looks like) and a one-line JSON string (easier to generate).
+		let parsedText: unknown;
+		let wasJson = true;
+		try {
+			parsedText = JSON.parse(text);
+		} catch {
+			wasJson = false;
+			parsedText = parsePhaseBlock(text);
+		}
+		if (!wasJson && parsedText === undefined) {
+			throw new Error(
+				`Agent '${filePath}' has invalid phases: could not read the block. ` +
+					`Expected an indented list of "  - id: <name>" entries, or a JSON string.`,
+			);
+		}
+		raw = parsedText;
+	}
+	// Accept both `[{...}]` and `{ phases: [...] }`.
+	const shaped = Array.isArray(raw)
+		? ({ phases: raw } as unknown)
+		: raw;
+	if (shaped === null || typeof shaped !== "object") {
+		throw new Error(`Agent '${filePath}' has invalid phases: expected a list or an object with a 'phases' key.`);
+	}
+	const machine = shaped as PhaseMachine;
+	if (!Array.isArray(machine.phases)) {
+		throw new Error(`Agent '${filePath}' has invalid phases: 'phases' must be a list.`);
+	}
+	// Inject the universal terminals before validating, so reachability is judged
+	// on the machine as it will actually run.
+	const normalized = normalizePhaseMachine(machine);
+	const errors = validatePhaseMachine(normalized);
+	if (errors.length > 0) {
+		const detail = errors.map((error) => `  - ${error.path}: ${error.message}`).join("\n");
+		throw new Error(`Agent '${filePath}' has an invalid phase machine:\n${detail}`);
+	}
+	return normalized;
+}
+
+/**
  * Parse a child budget (`toolBudget` / `turnBudget`) strictly.
  *
  * These used to swallow every error and return `undefined`, so a typo became
@@ -481,6 +660,7 @@ const AGENT_FRONTMATTER_FIELDS: ReadonlySet<string> = new Set([
 	// prompt / context
 	"systemPromptMode", "inheritProjectContext", "inheritSkills", "inheritExtensions",
 	"excludeExtensions",
+	"phases",
 	"skillPath", "skills", "defaultReads",
 	// tools
 	"tools", "extensions", "subagentOnlyExtensions",
@@ -643,6 +823,8 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "worktree", bool(fm.worktree));
 	setIf(config, "steer", bool(fm.steer));
 	setIf(config, "acceptance", parseAcceptance(fm.acceptance, config.name));
+	const phases = parsePhaseMachine(fm.phases, config.filePath);
+	if (phases) config.phases = phases;
 	const budgets = parseBudgets(fm, config.filePath);
 	setIf(config, "toolBudget", budgets.tool);
 	setIf(config, "turnBudget", budgets.turn);

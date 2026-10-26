@@ -163,6 +163,15 @@ export interface AgentConfig {
 	 */
 	maxRenewals?: number;
 	utility?: boolean;
+	/**
+	 * #298: this role's team defines its own phase machine.
+	 *
+	 * Only meaningful on a team root (a centurion). Omitted means the built-in
+	 * four-phase pipeline, so an undeclared team behaves exactly as before.
+	 * Validated at load: an invalid machine is rejected rather than surfacing
+	 * mid-run after the team has already spent tokens.
+	 */
+	phases?: import("../legion/phase-machine.ts").PhaseMachine;
 	toolBudget?: ToolBudgetConfig;
 	turnBudget?: TurnBudgetConfig;
 	disabled?: boolean;
@@ -584,6 +593,13 @@ export interface LegionPhaseTimeouts {
 	implementing?: number;
 	reviewing?: number;
 	verifying?: number;
+	/**
+	 * #298: a declared phase machine may name phases of its own, so this type
+	 * cannot stay closed. The named fields above keep autocomplete for the
+	 * built-in pipeline; the index signature admits custom ids without turning
+	 * them into `any`.
+	 */
+	[phase: string]: number | undefined;
 }
 
 /** Settings for the v2 legion tree, incrementally consumed by its milestones. */
