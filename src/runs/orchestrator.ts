@@ -20,7 +20,7 @@ import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
 import { upsertUsage } from "../legion/usage.ts";
-import { evaluatePhaseTransition, isLegionPhase, isTerminalPhase } from "../legion/state-machine.ts";
+import { evaluatePhaseTransition, isTerminalPhase } from "../legion/state-machine.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import {
 	ALLOW_NESTED_ENV,
@@ -670,7 +670,11 @@ export class Orchestrator {
 	private abortLegionPhase(nodeId: string): void {
 		if (!this.legion) return;
 		const node = getNode(this.legion.db, nodeId);
-		if (!node || !isLegionPhase(node.phase) || isTerminalPhase(node.phase)) return;
+		// #298: a declared machine may name phases the built-in union does not know,
+		// and an ABORT must never be blocked by that — a team that cannot be stopped
+		// is a safety hole. `isTerminalPhase` still covers the built-in names; a
+		// custom name resolves through the machine when one is attached.
+		if (!node || !node.phase || isTerminalPhase(node.phase)) return;
 		const decision = evaluatePhaseTransition({
 			from: node.phase,
 			to: "aborted",

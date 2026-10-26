@@ -1,3 +1,15 @@
+import {
+	type PhaseMachine,
+	type PhaseTransitionRule,
+	DEFAULT_PHASE_MACHINE,
+	DEFAULT_MAX_REWORK_COUNT,
+	findPhase,
+	normalizePhaseMachine,
+	isTerminalIn,
+	legacyReasonForCondition,
+} from "./phase-machine.ts";
+import { checkPhaseRequirements, type PhaseConditionInput } from "./phase-conditions.ts";
+
 export const LEGION_PHASES = [
 	"planning",
 	"implementing",
@@ -39,7 +51,11 @@ export type PhaseTransitionReason =
 	| "centurion_required"
 	| "children_not_terminal"
 	| "terminal_reason_required"
-	| "all_children_not_failed";
+	| "all_children_not_failed"
+	// #298: a declared machine can refuse for reasons the built-in table had no
+	// name for — an unmet custom condition, or an edge reserved to another actor.
+	| "condition_not_met"
+	| "actor_not_permitted";
 
 export interface PhaseChild {
 	id: string;
@@ -48,8 +64,9 @@ export interface PhaseChild {
 }
 
 export interface EvaluatePhaseTransitionInput {
-	from: LegionPhase | null;
-	to: LegionPhase;
+	/** Phase id. Free-form when a declared machine is supplied (#298). */
+	from: string | null;
+	to: string;
 	reworkCount?: number;
 	contractPath?: string | null;
 	children?: readonly PhaseChild[];
@@ -58,13 +75,21 @@ export interface EvaluatePhaseTransitionInput {
 	verificationPassed?: boolean;
 	actorRole?: string;
 	terminalReason?: "parent_decision" | "all_children_failed" | "rework_exhausted" | "parent_retire";
+	/**
+	 * #298: a declared machine. When present, transitions are evaluated from it
+	 * instead of the built-in table, so a team can define its own workflow.
+	 * Absent means DEFAULT_PHASE_MACHINE — identical to the old behaviour.
+	 */
+	machine?: PhaseMachine;
+	/** Whether the contract file exists and is non-empty (resolved by the caller). */
+	contractPresent?: boolean;
 }
 
 export type PhaseTransitionDecision =
 	| {
 		allowed: true;
-		from: LegionPhase | null;
-		to: LegionPhase;
+		from: string | null;
+		to: string;
 		reworkCount: number;
 		phaseSince: number;
 		notifyParent: boolean;
@@ -72,8 +97,8 @@ export type PhaseTransitionDecision =
 	}
 	| {
 		allowed: false;
-		from: LegionPhase | null;
-		to: LegionPhase;
+		from: string | null;
+		to: string;
 		reason: PhaseTransitionReason;
 		message: string;
 		forcedTransition?: {
@@ -84,6 +109,144 @@ export type PhaseTransitionDecision =
 		alarm: true;
 	};
 
+/**
+ * Evaluate a transition against a declared machine (#298).
+ *
+ * Structural invariants are the same ones the built-in path enforces, applied
+ * from data instead of a switch:
+ *
+ *   - a new team enters the machine's start phase
+ *   - terminal phases cannot transition
+ *   - `to` must be declared in the current phase's `next`
+ *   - rework edges increment past `maxRework` → forced failure
+ *   - `failed` still needs a reason, `aborted` still needs a parent retire
+ *
+ * Everything else — which edge is legal when — comes from the declaration.
+ */
+function evaluateDeclarative(
+	input: EvaluatePhaseTransitionInput,
+	machine: PhaseMachine,
+	now: () => number,
+): PhaseTransitionDecision {
+	const { from, to } = input;
+	const children = input.children ?? [];
+	const reworkCount = input.reworkCount ?? 0;
+	const start = machine.start ?? machine.phases[0]?.id;
+	const maxRework = machine.maxRework ?? DEFAULT_MAX_REWORK_COUNT;
+
+	if (from !== null && !findPhase(machine, from)) {
+		return denied(input, "invalid_phase", `phase '${from}' is not part of this team's machine`);
+	}
+	if (!findPhase(machine, to)) {
+		return denied(input, "invalid_phase", `phase '${to}' is not part of this team's machine`);
+	}
+	if (!Number.isInteger(reworkCount) || reworkCount < 0) {
+		return denied(input, "invalid_phase", "reworkCount must be a non-negative integer");
+	}
+	if (from === to) return denied(input, "same_phase", "phase is already current");
+	if (from !== null && isTerminalIn(machine, from)) {
+		return denied(input, "terminal_phase", `terminal phase ${from} cannot transition`);
+	}
+	if (from === null) {
+		if (to !== start) {
+			return denied(input, "invalid_transition", `a new team must start in ${String(start)}`);
+		}
+		return allowed(input, reworkCount, now(), false);
+	}
+
+	// Terminal exits keep their non-negotiable preconditions.
+	if (to === "aborted") {
+		if (input.terminalReason !== "parent_retire") {
+			return denied(input, "terminal_reason_required", "aborted requires a parent retire decision");
+		}
+		return allowed(input, reworkCount, now(), false);
+	}
+	if (to === "failed") {
+		const failure = evaluateDeclaredFailure(input, children, reworkCount, maxRework, now);
+		if (failure) return failure;
+	}
+
+	const phase = findPhase(machine, from);
+	const rule = phase?.next.find((candidate) => candidate.to === to);
+	if (!rule) {
+		return denied(
+			input,
+			"invalid_transition",
+			`transition ${from} → ${to} is not allowed by this team's machine`,
+		);
+	}
+	if (rule.actorRole !== undefined && input.actorRole !== rule.actorRole) {
+		return denied(
+			input,
+			"actor_not_permitted",
+			`only ${rule.actorRole} may transition ${from} → ${to}`,
+		);
+	}
+
+	// Phase-level requirements AND into this edge.
+	const requirement = checkPhaseRequirements(
+		[...(phase?.require ?? []), ...(rule.require ?? [])],
+		conditionInput(input),
+	);
+	if (!requirement.ok) {
+		const legacy = legacyReasonForCondition(requirement.failed, rule);
+		return denied(
+			input,
+			legacy,
+			`transition ${from} → ${to} refused: condition '${requirement.failed}' is not met`,
+		);
+	}
+
+	if (rule.rework === true) {
+		const next = reworkCount + 1;
+		if (next > maxRework) {
+			return {
+				...denied(input, "rework_limit_exceeded", `rework count ${next} exceeds limit ${maxRework}`),
+				forcedTransition: { to: "failed", reworkCount: next, reason: "rework_exhausted" },
+			};
+		}
+		return allowed(input, next, now(), rule.notifyParent === true);
+	}
+	return allowed(input, reworkCount, now(), rule.notifyParent === true);
+}
+
+/** `failed` is only reachable for a declared reason; returns undefined to continue. */
+function evaluateDeclaredFailure(
+	input: EvaluatePhaseTransitionInput,
+	children: readonly PhaseChild[],
+	reworkCount: number,
+	maxRework: number,
+	now: () => number,
+): PhaseTransitionDecision | undefined {
+	if (input.terminalReason === "parent_decision") return allowed(input, reworkCount, now(), false);
+	if (input.terminalReason === "rework_exhausted") {
+		if (reworkCount <= maxRework) {
+			return denied(input, "rework_limit_exceeded", `rework_count must exceed ${maxRework} for rework_exhausted`);
+		}
+		return allowed(input, reworkCount, now(), false);
+	}
+	if (input.terminalReason === "all_children_failed") {
+		if (children.length === 0 || children.some((child) => child.status !== "failed")) {
+			return denied(input, "all_children_not_failed", "all_children_failed requires every child to have failed");
+		}
+		return allowed(input, reworkCount, now(), false);
+	}
+	return denied(input, "terminal_reason_required", "failed requires parent decision, all children failed, or exhausted rework");
+}
+
+function conditionInput(input: EvaluatePhaseTransitionInput): PhaseConditionInput {
+	return {
+		children: input.children ?? [],
+		...(input.failedWorkerHandledIds ? { handledIds: input.failedWorkerHandledIds } : {}),
+		...(input.contractPath !== undefined ? { contractPath: input.contractPath } : {}),
+		...(input.contractPresent !== undefined ? { contractPresent: input.contractPresent } : {}),
+		...(input.reviewerVerdictOk !== undefined ? { verdictOk: input.reviewerVerdictOk } : {}),
+		...(input.verificationPassed !== undefined ? { verificationPassed: input.verificationPassed } : {}),
+		reworkCount: input.reworkCount ?? 0,
+		...(input.machine?.maxRework !== undefined ? { maxRework: input.machine.maxRework } : {}),
+	};
+}
+
 /** Pure decision function for the §7.1 transition table and entry invariants. */
 export function evaluatePhaseTransition(
 	input: EvaluatePhaseTransitionInput,
@@ -92,6 +255,17 @@ export function evaluatePhaseTransition(
 	const { from, to } = input;
 	const children = input.children ?? [];
 	const reworkCount = input.reworkCount ?? 0;
+	// #298: a declared machine takes over. Every structural rule (new team starts
+	// at the start phase, rework cap, terminal semantics) is re-applied there, so
+	// the two paths cannot drift.
+	// #298: normalize here, not only at parse time. The universal terminals
+	// (`done`/`failed`/`aborted`) must exist for ANY machine that reaches this
+	// function — including one built in code or in a test — because a team that
+	// cannot be aborted is a safety hole. Normalization only ADDS those terminal
+	// phases; taking them is still gated below.
+	if (input.machine !== undefined) {
+		return evaluateDeclarative(input, normalizePhaseMachine(input.machine), now);
+	}
 	if (!isLegionPhase(to) || (from !== null && !isLegionPhase(from))) {
 		return denied(input, "invalid_phase", "phase is not part of the legion state machine");
 	}
@@ -184,14 +358,16 @@ export function evaluatePhaseTransition(
 }
 
 export interface PhaseTimeoutInput {
-	phase: LegionPhase;
+	/** Phase id; free-form under a declared machine (#298). */
+	phase: string;
 	phaseSince: number | null;
 	now?: number;
-	timeouts?: Partial<Record<LegionPhase, number>>;
+	/** Per-phase overrides. Free-form ids when a declared machine is in play. */
+	timeouts?: Partial<Record<string, number>>;
 }
 
 export interface PhaseTimeoutResult {
-	phase: LegionPhase;
+	phase: string;
 	timedOut: boolean;
 	phaseSince: number | null;
 	now: number;
@@ -204,20 +380,26 @@ export function checkPhaseTimeout(
 	input: PhaseTimeoutInput,
 	clock: () => number = () => Date.now(),
 ): PhaseTimeoutResult {
-	if (!isLegionPhase(input.phase)) throw new TypeError(`invalid legion phase: ${String(input.phase)}`);
+	// A declared machine defines its own phase names, so this no longer rejects an
+	// unknown id outright — the caller resolves a timeout first and only asks here
+	// for a declared phase.
+	if (typeof input.phase !== "string" || !input.phase) {
+		throw new TypeError(`invalid legion phase: ${String(input.phase)}`);
+	}
 	const now = input.now ?? clock();
 	if (!Number.isFinite(now)) throw new TypeError("now must be a finite millisecond timestamp");
 	if (input.phaseSince !== null && !Number.isFinite(input.phaseSince)) {
 		throw new TypeError("phaseSince must be null or a finite millisecond timestamp");
 	}
-	const timeoutMs = input.timeouts?.[input.phase] ?? DEFAULT_PHASE_TIMEOUTS[input.phase];
+	const override = input.timeouts?.[input.phase];
+	const timeoutMs = override ?? DEFAULT_PHASE_TIMEOUTS[input.phase as LegionPhase] ?? 0;
 	if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
 		throw new TypeError("phase timeout must be a finite non-negative duration");
 	}
 	const elapsedMs = input.phaseSince === null ? null : Math.max(0, now - input.phaseSince);
 	return {
 		phase: input.phase,
-		timedOut: elapsedMs !== null && !isTerminalPhase(input.phase) && elapsedMs >= timeoutMs,
+		timedOut: elapsedMs !== null && !isTerminalPhase(input.phase) && timeoutMs > 0 && elapsedMs >= timeoutMs,
 		phaseSince: input.phaseSince,
 		now,
 		elapsedMs,
@@ -225,7 +407,7 @@ export function checkPhaseTimeout(
 	};
 }
 
-export function isTerminalPhase(phase: LegionPhase): boolean {
+export function isTerminalPhase(phase: string): boolean {
 	return phase === "done" || phase === "failed" || phase === "aborted";
 }
 

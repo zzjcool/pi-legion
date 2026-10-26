@@ -67,34 +67,29 @@ Transport, state, decision-making, and display are separate layers:
 
 ## Spawn mode
 
-`spawnMode` picks the backend that runs one child. Per role it comes from agent
-frontmatter → `subagents.agentOverrides.<role>` → team member override:
+The backend is a property of the **launch**, not of a role. There is no
+`spawnMode` frontmatter field — a card cannot pin itself to a process model —
+and the rule is simply:
 
-```yaml
-# agents/scout.md
----
-spawnMode: inprocess   # or: rpc
----
-```
+| Launch needs a worktree? | Backend |
+| --- | --- |
+| yes | `rpc` — a separate `pi --mode rpc` process |
+| no | in-process `AgentSession` inside the parent Node process |
 
-**Default:** omitting `spawnMode` means `inprocess` — the child runs as an
-`AgentSession` inside the parent Node process (`createAgentSession`), which
-trades process isolation for spawn latency.
+**Why rpc still exists:** it is the only backend that can host a worktree
+child. Only the `centurion` role may hold a worktree (see
+[Delivery and resume](#delivery-and-resume)), so a centurion is the only role
+that can ever run on rpc — every other role runs in-process, where spawn latency
+is lower and no second process is involved.
 
-**Automatic fallback to `rpc`:** when `spawnMode` is omitted *and* the resolved
-spawn cannot be in-process, Legion launches it over `pi --mode rpc` instead.
-That happens when the role needs an OS worktree (`worktree: true` — only the
-`centurion` role may hold this; see
-[Delivery and resume](#delivery-and-resume)).
+**A non-centurion asking for a worktree** is demoted to `worktree: false` with a
+once-per-run warning rather than throwing, so a stale card does not break every
+launch in the tree.
 
-**Explicit is strict:** `spawnMode: "inprocess"` with `worktree: true` is
-refused with `INVALID_PARAMS` (message prefers `set worktree: false`) rather
-than silently downgraded, so a role that asks for in-process never gets a
-different transport behind its back. Non-centurion requests for `worktree: true`
-are demoted to `false` with a once-per-run warning instead of throwing.
-
-Limits for the in-process backend are separate (`subagents.inprocess.*`) and are
-not shared with the `legion.*` tree budgets — see
+**Both backends share the same budgets.** The legion tree limits
+(`maxDepth` / `maxChildrenPerNode` / `maxActiveNodes`) apply to every launch; the
+in-process pools (`subagents.inprocess.*`) apply on top, and the stricter gate
+wins. Avoiding rpc is never a way to escape a cap. See
 [docs/inprocess-supervisor.md](docs/inprocess-supervisor.md).
 
 ## Headless child contract
@@ -428,20 +423,36 @@ Coverage:
 
 ### Child extensions
 
-Children start with `--no-extensions`, so they do not load the host's
-discovered extensions (settings `packages`, `~/.pi/agent/extensions`, project
-extensions). Each extension a child loads is a memory cost multiplied by every
-concurrent child; an LSP stack is ~1 GB (#43). A child still loads pi-legion
-itself (guard and nested spawning) and every path listed in the role's
-`extensions` / `subagentOnlyExtensions`.
+**A child inherits every extension the parent has**, minus anything it excludes.
+This is the opposite of the pre-4.0.1 default: children used to start with
+`--no-extensions` and load only what a card named, which meant a role silently
+lost host capabilities (a provider extension, a guard) it never knew to name.
+Children now run in-process by default, so "one more extension" no longer means
+another process's worth of memory.
 
 | Knob | Effect |
 | --- | --- |
-| role frontmatter `inheritExtensions: true` | That role loads all host extensions, as before. |
-| `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` | Every child loads all host extensions, as before. |
-| `PI_LEGION_CHILD_EXTENSIONS=/a.ts,/b.ts` | Extra extension paths every child loads explicitly, e.g. a provider extension the child's model needs. |
+| *(default)* | Inherit every host extension. |
+| role frontmatter `excludeExtensions: [pi-lens]` | Subtract specific ones. Accepts a package **name** (`pi-lens`, matches the package dir or a loose `pi-lens.ts`) or an exact **path** (`/abs/.../index.ts`, `~` expands). |
+| role frontmatter `inheritExtensions: false` | Load ONLY the card's own `extensions` / `subagentOnlyExtensions`. Nothing is inherited, so `excludeExtensions` has nothing to subtract. |
+| `PI_LEGION_CHILD_INHERIT_EXTENSIONS=0` | Same as `inheritExtensions: false`, for every child. `1` forces inheritance back on. |
+| `PI_LEGION_CHILD_EXTENSIONS=/a.ts,/b.ts` | Extra paths every child loads explicitly. |
 
-Bundled planner, reviewer, and worker do not list `lens_*` tools. pi-lens starts an LSP stack (~1 GB per child, #43) and is not part of the default `--no-extensions` child. To give a role those tools, add the tool names to its `tools:` list and point `extensions:` / `subagentOnlyExtensions` (or `PI_LEGION_CHILD_EXTENSIONS`) at the pi-lens extension file. `/legion doctor` reports `ROLE_MISSING_LENS` when a role lists the tools without that path.
+The child-guard is appended unconditionally and is not subject to either knob —
+a child without it breaks the prompt/format contract no matter what the card
+asked for.
+
+**Discovery limit.** Host extensions are found by reading `pi list` (which
+reports package *directories*) and resolving each one the way pi's own loader
+does: `package.json`'s `pi.extensions`, else `index.ts`/`index.js`. Single-file
+`--extension` arguments and builtins cannot be discovered this way; name them
+explicitly if a child needs them.
+
+**Cost note.** Inheriting everything includes heavy extensions. pi-lens starts an
+LSP stack (~1 GB per child, #43). If a fleet of children does not need it, add
+`excludeExtensions: [pi-lens]` to those cards. Bundled planner, reviewer, and
+worker do not list `lens_*` tools; give a role those tools by adding the names to
+its `tools:` list.
 
 ### Extra agent directories
 

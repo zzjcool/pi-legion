@@ -49,6 +49,7 @@ import { resolveTeamContext } from "./src/agents/context.ts";
 import { createSessionRuntime, renderLiveChildStatus, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
+import type { PhaseMachine } from "./src/legion/phase-machine.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
 import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
@@ -491,6 +492,26 @@ export function attachLegionRuntime(input: {
 	return dbEventSource;
 }
 
+/**
+ * The phase machine for a legion node, from its role card (#298).
+ *
+ * Reads `phases:` off the agent definition for the node's role. Absent means the
+ * built-in machine, so an undeclared team is unaffected. A card that declares an
+ * invalid machine never reaches here: `parseAgentDocument` rejects it at load.
+ */
+function phaseMachineForRole(role: string | null | undefined, cwd: string, settings: SubagentsSettings): PhaseMachine | undefined {
+	if (!role) return undefined;
+	try {
+		const discovery = discoverAgents(cwd, "user", { includeBuiltin: settings.disableBuiltins !== true });
+		const overridden = applyAgentOverrides(discovery.agents, settings.agentOverrides);
+		return findAgent(overridden, role)?.phases;
+	} catch {
+		// Discovery is best-effort here: a broken project dir must not stop a team
+		// from attaching, and the built-in machine still works.
+		return undefined;
+	}
+}
+
 function createLegionRuntime(input: {
 	pi: ExtensionAPI;
 	supervisor: LegionSupervisor;
@@ -504,6 +525,8 @@ function createLegionRuntime(input: {
 	settings: LegionSettings;
 	eventBus: LegionEventBus;
 	registerTools: boolean;
+	/** #298: the team root's declared phase machine, when its card supplies one. */
+	machine?: PhaseMachine;
 }): LegionRuntimeIdentity {
 	const self = getNode(input.db, input.nodeId);
 	const eventBus = input.eventBus;
@@ -516,6 +539,7 @@ function createLegionRuntime(input: {
 		eventBus,
 		sendRootMessage: (text: string) => notice(input.pi, text),
 		sendSelfMessage: (text: string) => notice(input.pi, text),
+		...(input.machine ? { machine: input.machine } : {}),
 		resumeChild: (node: LegionNode, mail: LegionMailCommand) => resumeLegionChild({
 			pi: input.pi, supervisor: input.supervisor, db: input.db, dbPath: input.dbPath,
 			eventBus, settings: input.settings, cwd: input.cwd, storeRootDir: input.storeRootDir,
@@ -540,7 +564,7 @@ function createLegionRuntime(input: {
 		postman,
 		childNodeId: (name) => getChildByName(input.db, input.nodeId, name)?.id,
 	};
-	if (input.registerTools && input.nodeId !== "root") registerLegionTools(input.pi, { db: input.db, nodeId: input.nodeId, role: self?.role, settings: input.settings, cwd: input.cwd, runDir: input.runDir, eventBus, sendSelfMessage: (text: string) => notice(input.pi, text) });
+	if (input.registerTools && input.nodeId !== "root") registerLegionTools(input.pi, { db: input.db, nodeId: input.nodeId, role: self?.role, settings: input.settings, cwd: input.cwd, runDir: input.runDir, eventBus, sendSelfMessage: (text: string) => notice(input.pi, text), ...(input.machine ? { machine: input.machine } : {}) });
 	postman.start();
 	return identity;
 }
@@ -598,7 +622,8 @@ function resolveLegionIdentity(input: {
 			nodeRun = input.store.createRun({ task: node.taskSummary ?? `Resume ${node.role} node ${node.id}`, cwd: input.cwd, path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH), maxDepth: effectiveMaxDepth(input.settings.legion?.maxDepth), nodeId, herdr: { supervisor: "rpc", node_id: nodeId } });
 		}
 		if (node.runId !== nodeRun.runId) updateLegionRunId(db, nodeId, nodeRun.runId);
-		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true });
+		const machine = phaseMachineForRole(node.role, input.cwd, input.settings);
+		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true, ...(machine ? { machine } : {}) });
 		// #273: `createLegionRuntime` runs during extension LOADING, where host
 		// actions (sendMessage, spawn, ui) are not available yet. Defer the team
 		// recovery to the next tick so a failure inside it cannot crash the load

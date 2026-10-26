@@ -33,9 +33,12 @@ applicable decision for the child cwd:
 
 **Ops:** to load project settings / project extensions in an RPC child, either
 `/trust` that cwd first (writes trust.json) or set `defaultProjectTrust=always`.
-This matters most when `inheritExtensions: true` (or
-`PI_LEGION_CHILD_INHERIT_EXTENSIONS`) re-enables discovery; the default
-`--no-extensions` already blocks most silent project-extension loads.
+Children inherit host extensions by default (4.0.1), so this matters more than
+it used to: a child loads the parent's discovered extensions unless the card
+subtracts them. Note the two axes are different — inheritance is about *which
+extensions*, trust is about whether a *project* may contribute any at all. A
+child's `--no-extensions` still blocks pi's own project-extension discovery, and
+the inherited list is passed explicitly as `--extension` paths.
 
 ### Opt-in `--approve` (legion settings)
 

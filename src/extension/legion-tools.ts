@@ -38,6 +38,7 @@ import {
 	isTerminalPhase,
 	type LegionPhase,
 } from "../legion/state-machine.ts";
+import { isTerminalIn, type PhaseMachine } from "../legion/phase-machine.ts";
 import { upsertUsage } from "../legion/usage.ts";
 
 const POSTMAN_INTERVAL_MS = 2_000;
@@ -66,6 +67,8 @@ export interface LegionPostmanOptions {
 	resumeChild?: (node: LegionNode, mail: LegionMailCommand) => Promise<void>;
 	now?: () => number;
 	intervalMs?: number;
+	/** #298: the team root's declared phase machine (absent = built-in). */
+	machine?: PhaseMachine;
 }
 
 /** Poll and deliver mail only for children hosted by this process. */
@@ -78,6 +81,7 @@ export class LegionPostman {
 	private readonly sendRootMessage: (text: string) => void;
 	private readonly sendSelfMessage: (text: string) => void;
 	private readonly resumeChild?: LegionPostmanOptions["resumeChild"];
+	private readonly machine?: PhaseMachine;
 	private readonly now: () => number;
 	private readonly intervalMs: number;
 	private timer: ReturnType<typeof setInterval> | undefined;
@@ -94,6 +98,7 @@ export class LegionPostman {
 		this.sendRootMessage = options.sendRootMessage ?? (() => {});
 		this.sendSelfMessage = options.sendSelfMessage ?? (() => {});
 		this.resumeChild = options.resumeChild;
+		this.machine = options.machine;
 		this.now = options.now ?? Date.now;
 		this.intervalMs = options.intervalMs ?? POSTMAN_INTERVAL_MS;
 	}
@@ -295,9 +300,23 @@ export class LegionPostman {
 		return false;
 	}
 
+	/**
+	 * Terminal check that respects the team's own machine (#298).
+	 *
+	 * The old code asked `isTerminalPhase`, which only knew the three built-in
+	 * terminal names. Under a declared machine a phase is terminal because the
+	 * DECLARATION says so (`terminal: true` or no exits), so a custom name would
+	 * otherwise be treated as non-terminal and the auto-finish paths would act on
+	 * a team that had already finished.
+	 */
+	private isTerminalPhaseOf(phase: string): boolean {
+		if (this.machine) return isTerminalIn(this.machine, phase);
+		return isTerminalPhase(phase);
+	}
+
 	private failTeamIfAllChildrenFailed(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
-		if (!node?.phase || !isPhase(node.phase) || isTerminalPhase(node.phase)) return;
+		if (!node?.phase || this.isTerminalPhaseOf(node.phase)) return;
 		const children = getChildren(this.db, node.id);
 		if (!children.length || children.some((child) => child.status !== "failed")) return;
 		const decision = evaluatePhaseTransition({
@@ -340,7 +359,7 @@ export class LegionPostman {
 
 	private checkOwnPhaseTimeout(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
-		if (!node?.phase || !isPhase(node.phase) || isTerminalPhase(node.phase)) return;
+		if (!node?.phase || this.isTerminalPhaseOf(node.phase)) return;
 		const timeout = checkPhaseTimeout({
 			phase: node.phase,
 			phaseSince: node.phaseSince,
@@ -377,6 +396,8 @@ export interface RegisterLegionToolsOptions {
 	db: DatabaseSync;
 	nodeId: string;
 	role?: string;
+	/** #298: the team root's declared phase machine (absent = built-in). */
+	machine?: PhaseMachine;
 	settings?: LegionSettings;
 	eventBus?: Pick<LegionEventBus, "emit">;
 	cwd?: string;
@@ -468,7 +489,15 @@ export function registerLegionTools(pi: ExtensionAPI, options: RegisterLegionToo
 			label: "Legion phase",
 			description: "Request a validated centurion phase transition.",
 			parameters: Type.Object({
-				to: Type.Union(PHASES.map((value) => Type.Literal(value))),
+				// #298: the phase list is declared per team, so it cannot be a
+				// compile-time enum here. `requestLegionPhase` validates the value
+				// against the team's own machine and refuses anything unknown with
+				// the list of phases that DO exist.
+				to: Type.String({
+					description:
+						'Target phase. Default machine: planning, implementing, reviewing, verifying. ' +
+						'`done`/`failed`/`aborted` are controlled by the parent or supervisor.',
+				}),
 				note: Type.Optional(Type.String()),
 				evidence: Type.Optional(Type.String()),
 			}),
@@ -483,6 +512,7 @@ export function registerLegionTools(pi: ExtensionAPI, options: RegisterLegionToo
 					now: options.now,
 					runCommand: options.runCommand,
 					sendSelfMessage: options.sendSelfMessage,
+					...(options.machine ? { machine: options.machine } : {}),
 				});
 				return result.ok ? toolOk(result.message) : toolError(result.message, result.code ?? "INVALID_PARAMS");
 			},
@@ -523,6 +553,8 @@ export function formatTree(nodes: readonly LegionNode[]): string {
 export interface PhaseRequestOptions {
 	note?: string;
 	evidence?: string;
+	/** #298: the team's declared phase machine, when its card has one. */
+	machine?: PhaseMachine;
 	cwd: string;
 	runDir?: string;
 	settings?: LegionSettings;
@@ -533,18 +565,22 @@ export interface PhaseRequestOptions {
 }
 
 export type PhaseRequestResult =
-	| { ok: true; phase: LegionPhase; message: string }
+	| { ok: true; phase: string; message: string }
 	| { ok: false; message: string; code?: string };
 
 export async function requestLegionPhase(
 	db: DatabaseSync,
 	nodeId: string,
-	to: LegionPhase,
+	to: string,
 	options: PhaseRequestOptions,
 ): Promise<PhaseRequestResult> {
 	const now = options.now ?? Date.now;
 	const self = getNode(db, nodeId);
 	if (!self || self.role !== "centurion") return { ok: false, code: "INVALID_PARAMS", message: "legion_phase is centurion-only" };
+	// #298: the team's own machine decides which phases exist. `options.machine`
+	// carries the declaration from the node's role card; absent means the built-in
+	// four-phase pipeline.
+	const machine = options.machine;
 	if (to === "done" || to === "failed" || to === "aborted") {
 		return { ok: false, code: "INVALID_PARAMS", message: `${to} is controlled by the parent or supervisor` };
 	}
@@ -552,30 +588,39 @@ export async function requestLegionPhase(
 	const children = getChildren(db, nodeId);
 	const proposedContractPath = path.resolve(self.worktreePath ?? options.cwd, ".pi-legion", "contract.md");
 	let contractText: string | undefined;
-	if (self.phase === "planning" && to === "implementing") {
-		try { contractText = fs.readFileSync(proposedContractPath, "utf8"); } catch { contractText = undefined; }
-	}
-	const latestReviewer = children
-		.filter((child) => child.role === "reviewer" && child.status === "settled" && child.sessionFile)
-		.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
-		.at(-1);
-	const reviewerVerdict = latestReviewer?.sessionFile
-		? extractVerdict(parseSessionFile(latestReviewer.sessionFile).lastTurnOutput ?? "")
+	try { contractText = fs.readFileSync(proposedContractPath, "utf8"); } catch { contractText = undefined; }
+	// #298: NO role names here any more. The old code scanned for a settled
+	// `role === "reviewer"` and for failed `role === "worker"` children, which made
+	// those roles load-bearing: a custom machine could declare any phases it liked
+	// and still be judged by the fixed pipeline's cast list.
+	//
+	// Now the question is asked structurally — "the newest settled child that
+	// reported a verdict" and "failures recorded before this phase began" — so any
+	// role can play any part.
+	const settledWithSession = children
+		.filter((child) => child.status === "settled" && child.sessionFile)
+		.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+	const latestVerdictChild = settledWithSession.at(-1);
+	const lastVerdict = latestVerdictChild?.sessionFile
+		? extractVerdict(parseSessionFile(latestVerdictChild.sessionFile).lastTurnOutput ?? "")
 		: null;
-	const reviewerVerdictOk = reviewerVerdict?.ok;
-	const failedWorkerHandledIds = self.phase === "implementing" && self.reworkCount > 0 && self.phaseSince !== null
-		? children.filter((child) => child.role === "worker" && child.status === "failed" && child.updatedAt < self.phaseSince!).map((child) => child.id)
+	const verdictOk = lastVerdict?.ok;
+	const failedHandledIds = self.phase !== null && self.reworkCount > 0 && self.phaseSince !== null
+		? children.filter((child) => child.status === "failed" && child.updatedAt < self.phaseSince!).map((child) => child.id)
 		: [];
+	const contractPresent = Boolean(contractText?.trim());
 	const decision = evaluatePhaseTransition({
-		from: isPhase(self.phase) ? self.phase : null,
+		from: self.phase ?? null,
 		to,
 		reworkCount: self.reworkCount,
-		contractPath: contractText?.trim() ? proposedContractPath : self.contractPath,
+		contractPath: contractPresent ? proposedContractPath : self.contractPath,
+		contractPresent,
 		children: children.map(({ id, role, status }) => ({ id, role, status })),
-		failedWorkerHandledIds,
-		reviewerVerdictOk,
+		failedWorkerHandledIds: failedHandledIds,
+		reviewerVerdictOk: verdictOk,
 		verificationPassed: readVerificationResult(self),
 		actorRole: self.role,
+		...(machine ? { machine } : {}),
 	}, now);
 
 	if (!decision.allowed) {

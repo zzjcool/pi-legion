@@ -25,7 +25,10 @@ Facts established by recon (do not re-verify):
 ## D1 — Wording (backend-neutral) for parent guidance
 
 Children are **in-process by default**; a separate `pi` process is used only when
-the launch needs a worktree (centurion) or the role pins `spawnMode: rpc`.
+the launch needs a worktree — and since only a centurion may hold one, only a
+centurion reaches `rpc`. (The `spawnMode` role field described here was removed
+in 4.0.1; `handle.spawnMode` below remains the arbitrated backend and is still
+what callers must render.)
 
 Replace "RPC child / headless RPC children / started via RPC / RPC launch" with
 backend-neutral phrasing in these exact places:

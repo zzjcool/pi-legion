@@ -1,38 +1,48 @@
 # In-process AgentSession mode (#197)
 
-Default backend for children. **In-process by default**, with an automatic `rpc`
-fallback when the resolved spawn needs an OS worktree (`worktree: true`, which
-only a `centurion` can hold — #214). An explicit
-`spawnMode: "inprocess"` combined with `worktree: true` is still **refused**
-with `INVALID_PARAMS` — the fallback only covers the implicit default.
+Default backend for children. **In-process by default**, with `rpc` used when
+the launch needs an OS worktree (`worktree: true`, which only a `centurion` can
+hold — #214).
+
+There is no `spawnMode` config field. The backend is derived from the launch:
+
+| Launch needs a worktree? | Backend |
+| --- | --- |
+| no | in-process |
+| yes | `rpc` |
+
+Since only a `centurion` may hold a worktree, only a centurion can reach
+`rpc`; every other role is in-process. A non-centurion card that asks for
+`worktree: true` is demoted to `worktree: false` with a once-per-run warning,
+which also keeps it in-process.
 
 ## When to use
 
+The choice is not per-role — it follows from whether the work needs a worktree.
+
 | Mode | Good for | Avoid when |
 |---|---|---|
-| `inprocess` (default; auto-fallback below) | Short, trusted fan-out; lower spawn latency; simpler approval / UI fan-in | Need OS worktree, separate credentials, crash isolation |
-| `rpc` (fallback: worktree; or explicit `spawnMode: rpc`) | Long runs, untrusted tasks, need crash / env / cwd isolation, **worktree** | Cold-start cost dominates |
+| `inprocess` | Short, trusted fan-out; lower spawn latency; simpler approval / UI fan-in | Need OS worktree, separate credentials, crash isolation |
+| `rpc` | Long runs, untrusted tasks, need crash / env / cwd isolation, **worktree** | Cold-start cost dominates |
 
-There is no single global default in the config sense: omitting `spawnMode`
-means "inprocess if this role can run in-process, otherwise rpc". Roles that
-resolve to `worktree: true` therefore resolve to `rpc` unless they opt out of
-the worktree — and since #214 that is only `centurion`: every other role is
-downgraded to `worktree: false` with a one-time warning, so it stays
-in-process.
+Both backends enforce the same legion tree budgets (`maxDepth` /
+`maxChildrenPerNode` / `maxActiveNodes`); the `subagents.inprocess.*` pools apply
+on top and the stricter gate wins.
 
 **Non-goals:** no OS worktree isolation; no promise of process crash containment; OpenAaaS Go in-process transport is out of scope.
 
 ## Config
 
-Per agent (frontmatter → `agentOverrides` → team member override):
+There is no `spawnMode` key to configure — not in frontmatter, not in
+`agentOverrides`. The old field was removed (4.0.1); a card that still declares
+it is now rejected at load time, because unknown frontmatter is a hard error.
 
 ```yaml
 # agents/scout.md
 ---
 name: scout
 description: Fast read-only recon
-spawnMode: inprocess   # omit = inprocess (only a centurion resolves to a worktree, hence rpc)
-worktree: false        # explicit inprocess + worktree: true is still refused
+worktree: false        # a non-centurion asking for true is demoted + warned
 ---
 ```
 
@@ -40,7 +50,7 @@ worktree: false        # explicit inprocess + worktree: true is still refused
 {
   "subagents": {
     "agentOverrides": {
-      "scout": { "spawnMode": "inprocess" }
+      "scout": { "worktree": false }
     },
     "inprocess": {
       "maxSpawnsPerSession": 32,
@@ -152,8 +162,9 @@ a read-only child's write bans, and a parent read-only role wrongly banned a
 `writer` child.
 
 So in-process identity travels in an `AsyncLocalStorage` child context instead:
-node id, db path, acceptance role, `allowNested`, `utility`, `spawnMode`, and
-the nested parent path. The guards and the legion runtime read that context, and
+node id, db path, acceptance role, `allowNested`, `utility`, `spawnMode` (the
+arbitrated backend, for self-reporting), the per-child `budget`, and the nested
+parent path. The guards and the legion runtime read that context, and
 only fall back to env for RPC children, whose process really does own its env.
 
 Two consequences worth knowing:
@@ -176,8 +187,8 @@ Do not replace this with env injection for in-process children.
 ```
 Orchestrator
     → RoutingSupervisor (LegionSupervisor)
-         ├─ spawnMode rpc        → RpcSupervisor   (unchanged)
-         └─ spawnMode inprocess  → InProcessSupervisor
+         ├─ worktree ⇒ rpc       → RpcSupervisor   (unchanged)
+         └─ otherwise            → InProcessSupervisor
                                       createAgentSession + SessionManager.inMemory
                                       (tools / model / systemPrompt wired)
 ```
@@ -256,12 +267,14 @@ a decode rate.
 
 ## Refusals
 
-- `worktree: true` + explicit `inprocess` → `INVALID_PARAMS` (an omitted
-  `spawnMode` falls back to `rpc` instead)
 - A non-centurion requesting `worktree: true` is **not** a refusal: it is
   downgraded to `worktree: false` with a one-time warning (#214), so the launch
   proceeds in-process. `worktree` is reserved for `centurion`.
-- Invalid `spawnMode` string → loud throw at settings / frontmatter parse
+- `worktree: true` reaching the supervisor with a pinned in-process backend →
+  `INVALID_PARAMS`. Unreachable from a card now that the field is gone; kept as
+  the last line against an internal caller building that shape.
+- Unknown frontmatter (including a leftover `spawnMode:`) → loud throw at parse
+  time
 
 ## Tests
 
