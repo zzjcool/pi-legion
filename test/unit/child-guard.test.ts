@@ -208,3 +208,39 @@ test("read-only role: real redirects are still blocked, including &>file", () =>
 	// The old regex excluded a preceding `&`, so this real write slipped through.
 	assert.ok(forbiddenChildReason("echo hi &> /tmp/out", env));
 });
+
+test("#295: an in-process child takes its budget from the child context, not process.env", async () => {
+	// The parent computes budgets into `SpawnInput.env`. An rpc child receives that
+	// object AS its environment, so `process.env` has it. An in-process child shares
+	// the HOST's environment instead, so reading only `process.env` gave the guard
+	// the parent's values — `toolBudget: 3` permitted 12 tool calls and the run
+	// finished normally.
+	//
+	// The context must win, and `process.env` must remain the rpc fallback.
+	const { runInChildContext } = await import("../../src/supervisor/child-context.ts");
+	const { effectiveChildBudget } = await import("../../src/extension/child-guard.ts");
+
+	const ctx = {
+		allowNested: false,
+		utility: false,
+		spawnMode: "inprocess" as const,
+		budget: { maxToolCalls: 3 },
+	};
+
+	// Context present: it wins even when the process env says something else.
+	await runInChildContext(ctx, async () => {
+		assert.deepEqual(
+			effectiveChildBudget(undefined, { [MAX_TOOL_CALLS_ENV]: "99" }),
+			{ maxToolCalls: 3 },
+			"the child context is authoritative for an in-process child",
+		);
+	});
+
+	// No context (an rpc child, or a root session): fall back to the environment.
+	assert.deepEqual(
+		effectiveChildBudget(undefined, { [MAX_TOOL_CALLS_ENV]: "7" }),
+		{ maxToolCalls: 7 },
+		"rpc children still read their own process env",
+	);
+	assert.deepEqual(effectiveChildBudget(undefined, {}), {}, "nothing configured means no limit");
+});

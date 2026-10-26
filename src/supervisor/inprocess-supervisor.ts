@@ -10,6 +10,7 @@
 
 import { statSync } from "node:fs";
 import { formatChildTask } from "../extension/child-guard.ts";
+import { childBudgetFromEnv } from "../extension/budget.ts";
 import { parseSessionFile } from "../shared/session.ts";
 import {
 	applyThinkingSuffix,
@@ -379,7 +380,22 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		utility: Boolean(input.agent.utility),
 		spawnMode: "inprocess",
 		...(acceptanceRole ? { acceptanceRole } : {}),
+		// #295: read the budgets off `SpawnInput.env` — the same keys the rpc child
+		// gets as its real environment — and carry them in the context, because the
+		// in-process child shares the host's process.env and cannot see them there.
+		...budgetFromSpawnEnv(input.env),
 	};
+}
+
+/** Extract the child budget keys from a spawn env, for the in-process channel. */
+function budgetFromSpawnEnv(env: NodeJS.ProcessEnv | undefined): {
+	budget?: ChildLaunchContext["budget"];
+} {
+	if (!env) return {};
+	const budget = childBudgetFromEnv(env);
+	return budget.maxToolCalls === undefined && budget.maxTurns === undefined && budget.toolTimeoutMs === undefined
+		? {}
+		: { budget };
 }
 
 function recordOf(value: unknown): Record<string, unknown> | null {

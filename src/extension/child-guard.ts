@@ -17,6 +17,7 @@ import {
 	budgetExceededReason,
 	childBudgetFromEnv,
 	wrapBashWithTimeout,
+	type ChildBudget,
 } from "./budget.ts";
 import { shellChunks } from "./playbook.ts";
 
@@ -349,9 +350,32 @@ export function effectiveChildGuardEnv(
 	return childGuardEnvFromProcess(env);
 }
 
+/**
+ * The budget this child session enforces (#295).
+ *
+ * Same precedence as {@link effectiveChildGuardEnv}: the async-local child
+ * context wins, `process.env` is the fallback for rpc children (whose process
+ * really owns those values).
+ *
+ * Why the context is needed at all: the parent computes budgets into
+ * `SpawnInput.env`. An rpc child receives that object as its environment, so
+ * `process.env` has it. An IN-PROCESS child shares the host's `process.env`
+ * instead — the object never becomes environment — so reading only the process
+ * gave the guard the parent's (absent) values and `toolBudget: 3` permitted 12
+ * tool calls.
+ */
+export function effectiveChildBudget(
+	ctx: ChildLaunchContext | undefined = currentChildContext(),
+	env: NodeJS.ProcessEnv = process.env,
+): ChildBudget {
+	const fromContext = ctx?.budget;
+	if (fromContext !== undefined) return fromContext;
+	return childBudgetFromEnv(env);
+}
+
 /** Child-only extension: intercept tools; do not register the parent tool. */
 export function registerChildGuard(pi: ExtensionAPI): void {
-	const budget = childBudgetFromEnv();
+	const budget = effectiveChildBudget();
 	let toolCalls = 0;
 	let turns = 0;
 	pi.on("turn_start", () => { turns += 1; });
