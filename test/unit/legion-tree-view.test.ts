@@ -499,3 +499,37 @@ test("D5: `queued`/`idle` snapshot rows are never folded or dimmed as finished",
 		}
 	}
 });
+
+test("#298: the selected team root shows its phase machine; unselected does not", () => {
+	// The machine is only meaningful for the node that DECLARES it, and only when
+	// that node is selected — otherwise every render would be a wall of config.
+	const machine = {
+		phases: [
+			{ id: "recon", next: [{ to: "build", require: ["contract_file" as const] }] },
+			{ id: "build", next: [{ to: "done", require: ["verdict_ok" as const] }] },
+			{ id: "done", terminal: true, next: [] },
+		],
+	};
+	const nodes: TreeNodeSnapshot[] = [
+		{ ...node("root", null, "root", 0, "root", "running"), phase: "recon" },
+		{
+			...node("root.cent", "root", "cent", 1, "centurion", "running"),
+			phase: "recon",
+			phaseMachine: machine,
+		},
+	];
+
+	const view = createTreeView({ nodes });
+	const strip = (text: string) => stripTerminalSequences(text);
+	const before = view.render(120).map(strip).join("\n");
+	// Selection starts at the root, which declares nothing: no machine shown.
+	assert.doesNotMatch(before, /→ build/);
+
+	// Move onto the centurion row, which declares the machine.
+	assert.ok(view.handleInput, "the tree exposes keyboard input");
+	view.handleInput("j");
+	const after = view.render(120).map(strip).join("\n");
+	assert.match(after, /phases · current: recon/, "the declaring team root shows its machine");
+	assert.match(after, /→ build/, "including the transition and its condition");
+	assert.match(after, /contract_file/, "conditions are named, since they are what gates the move");
+});

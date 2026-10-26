@@ -55,6 +55,7 @@ import { getSubtree } from "../legion/nodes.ts";
 import { attachUsageTotals } from "../legion/usage.ts";
 import { maxEventId } from "../legion/events.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
+import type { PhaseMachine } from "../legion/phase-machine.ts";
 
 export interface CollectSnapshot {
 	execution: { status: string; reason?: string };
@@ -150,6 +151,12 @@ export interface SessionRuntimeDeps {
 	getTreeNodes?: () => readonly TreeNodeSnapshot[] | undefined;
 	/** Optional name-to-tree mapping for live RPC jobs backed by M2 ChildRecord.nodeId. */
 	getTreeIdentity?: (name: string) => LegionTreeIdentity | undefined;
+	/**
+	 * #298: the phase machine for a role, so the tree can show a team's own
+	 * workflow. Injected rather than imported because only the host knows the
+	 * resolved agent catalog (card `phases:` plus any team override).
+	 */
+	getPhaseMachine?: (role: string | null | undefined) => PhaseMachine | undefined;
 	/**
 	 * Renewal proposal for a finishing child (subagent-renewal-v1 D3).
 	 *
@@ -823,7 +830,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			for (const nodeId of eventOverrides.keys()) if (!tree.has(nodeId)) eventOverrides.delete(nodeId);
 		}
 		const nodes = [...tree.values()].map((node) => ({ ...node }));
-		return mergeSpawnModes(nodes);
+		return mergePhaseMachines(mergeSpawnModes(nodes));
 	};
 
 	/**
@@ -844,6 +851,32 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			if (job.spawnMode === undefined) continue;
 			const match = storedNodeForJob(job, nodes);
 			if (match) match.spawnMode = job.spawnMode;
+		}
+		return nodes;
+	};
+
+	/**
+	 * #298: attach the declaring team's machine to the node that owns it.
+	 *
+	 * Only a team root declares `phases:`, so children inherit it downward: showing
+	 * an empty machine on a worker would suggest it has none, when in fact it is
+	 * governed by its lead's. The nearest ancestor that resolves a machine wins.
+	 */
+	const mergePhaseMachines = (nodes: TreeNodeSnapshot[]): TreeNodeSnapshot[] => {
+		const byId = new Map(nodes.map((node) => [node.id, node]));
+		for (const node of nodes) {
+			let cursor: TreeNodeSnapshot | undefined = node;
+			let hops = 0;
+			while (cursor && hops < 64) {
+				const machine = deps.getPhaseMachine?.(cursor.role);
+				if (machine) {
+					node.phaseMachine = machine;
+					break;
+				}
+				const parentId: string | null = cursor.parentId ?? null;
+				cursor = parentId ? byId.get(parentId) : undefined;
+				hops += 1;
+			}
 		}
 		return nodes;
 	};

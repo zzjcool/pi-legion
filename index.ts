@@ -1167,6 +1167,29 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				? attachUsageTotals(identity.db, getSubtree(identity.db, identity.nodeId))
 				: [];
 		},
+		// #298: let the tree render a team's declared workflow. Cached per role
+		// because agent discovery touches the filesystem and the tree re-renders on
+		// every event.
+		getPhaseMachine: (() => {
+			const cache = new Map<string, PhaseMachine | undefined>();
+			return (role) => {
+				if (!role) return undefined;
+				if (cache.has(role)) return cache.get(role);
+				let machine: PhaseMachine | undefined;
+				try {
+					// `loadCatalog` already applies agentOverrides and team selection, so
+					// this is the same definition the launch path resolves.
+					const catalog = loadCatalog(lastCwd, lastCwd, undefined);
+					machine = findAgent(catalog.agents, role)?.phases;
+				} catch {
+					// Discovery must never break rendering: a malformed project dir would
+					// otherwise blank the tree.
+					machine = undefined;
+				}
+				cache.set(role, machine);
+				return machine;
+			};
+		})(),
 		getTreeIdentity: (name) => {
 			const own = ownLegionIdentity();
 			const node = own && getChildByName(own.db, own.nodeId, name);
