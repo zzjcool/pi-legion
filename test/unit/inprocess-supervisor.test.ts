@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -16,6 +16,11 @@ import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import { currentChildContext } from "../../src/supervisor/child-context.ts";
 import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
+import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import {
+	discoveredHostExtensions,
+	resetExtensionDiscoveryCache,
+} from "../../src/runs/extension-inheritance.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
 import type { NestedPathEntry } from "../../src/shared/types.ts";
@@ -1836,5 +1841,107 @@ test("#266 admissionCounts: same counts and limits as the real gate", async () =
 		assert.equal(counts.active, 0);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── R1-b: the in-process backend warms discovery on its own (contract §7 A15) ──
+
+/** A fake `pi` on PATH reporting one package dir, so `pi list` is a real call. */
+function fakePiHost(): { entry: string; pathValue: string; piCalls(): number; cleanup(): void } {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-warm-inprocess-"));
+	const pkgDir = path.join(root, "npm", "node_modules", "fake-lens");
+	mkdirSync(pkgDir, { recursive: true });
+	writeFileSync(path.join(pkgDir, "index.ts"), "export default {};\n");
+	const binDir = path.join(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	const logPath = path.join(root, "calls.log");
+	const shim = path.join(binDir, "pi");
+	writeFileSync(
+		shim,
+		[
+			"#!/bin/sh",
+			`echo "pi $*" >> ${JSON.stringify(logPath)}`,
+			'echo "User packages:"',
+			`echo "    ${pkgDir}"`,
+		].join("\n") + "\n",
+	);
+	chmodSync(shim, 0o755);
+	const lines = (): string[] => {
+		try {
+			return readFileSync(logPath, "utf8").split("\n").filter((line) => line.length > 0);
+		} catch {
+			return [];
+		}
+	};
+	return {
+		entry: path.join(pkgDir, "index.ts"),
+		pathValue: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+		piCalls: () => lines().filter((line) => line.startsWith("pi ")).length,
+		cleanup: () => rmSync(root, { recursive: true, force: true }),
+	};
+}
+
+/** Run `fn` with the fake host first on PATH and a cold discovery cache. */
+async function withFakePiHost<T>(host: ReturnType<typeof fakePiHost>, fn: () => Promise<T>): Promise<T> {
+	const prevPath = process.env.PATH;
+	process.env.PATH = host.pathValue;
+	resetExtensionDiscoveryCache();
+	try {
+		return await fn();
+	} finally {
+		resetExtensionDiscoveryCache();
+		if (prevPath === undefined) delete process.env.PATH;
+		else process.env.PATH = prevPath;
+	}
+}
+
+test("A15: a directly-constructed InProcessSupervisor warms discovery through Orchestrator.launch", async () => {
+	// Same public shape as A14 but on the in-process backend. The plan is built
+	// deep inside the injected session factory, so this also proves the warm-up
+	// happens before the factory (and therefore before `collectChildExtensions`)
+	// reads the sync cache.
+	const host = fakePiHost();
+	const root = mkdtempSync(path.join(tmpdir(), "legion-warm-inprocess-run-"));
+	const plans: string[][] = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			// The production factory calls this exactly here; recording it pins the
+			// ordering against the warm-up.
+			plans.push(buildInProcessSessionPlan({
+				name: "worker",
+				cwd: root,
+				agent: testAgent(),
+				sessionFile: path.join(root, "worker.jsonl"),
+			} as InProcessSessionFactoryInput).additionalExtensionPaths);
+			return new FakeSession();
+		},
+	});
+	try {
+		await withFakePiHost(host, async () => {
+			assert.equal(discoveredHostExtensions(), undefined, "precondition: cold cache");
+			const orchestrator = new Orchestrator({ supervisor, runDir: root, cwd: root, maxDepth: 4 });
+			const handle = await orchestrator.launch({
+				agent: { ...testAgent(), spawnMode: "inprocess" },
+				task: "t",
+				name: "worker",
+				worktree: false,
+			} as never);
+			assert.deepEqual(
+				discoveredHostExtensions(),
+				[host.entry],
+				"InProcessSupervisor.spawnChild must warm discovery itself (R1-b)",
+			);
+			assert.equal(plans.length, 1, "the plan was built once, inside the spawn");
+			assert.ok(
+				plans[0]!.includes(host.entry),
+				"and the factory's plan saw the warm set — the warm-up precedes it",
+			);
+			orchestrator.flushLaunchQueue("test cleanup");
+			await supervisor.retire(handle.name).catch(() => {});
+		});
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+		host.cleanup();
 	}
 });

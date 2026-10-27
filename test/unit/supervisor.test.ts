@@ -8,9 +8,13 @@ import { RpcClient } from "@earendil-works/pi-coding-agent";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+	chmodSync,
+	mkdirSync,
 	mkdtempSync,
 	readdirSync,
+	readFileSync,
 	rmSync,
+	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -31,6 +35,12 @@ import type {
 	SpawnInput,
 } from "../../src/supervisor/types.ts";
 import { currentPgid } from "../../src/supervisor/proc-tree.ts";
+import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
+import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import {
+	discoveredHostExtensions,
+	resetExtensionDiscoveryCache,
+} from "../../src/runs/extension-inheritance.ts";
 
 class FakeRpcProcess implements RpcProcessHandle {
 	readonly pid: number;
@@ -764,6 +774,233 @@ test("memory gate refuses ten-concurrent spawn when free mem is insufficient", a
 			}),
 		);
 		h.close();
+	}
+});
+
+// ── R1-b: the warm-up must cover a backend driven without the router ────────
+
+/**
+ * A fake `pi` on PATH that reports one package dir we control.
+ *
+ * Discovery shells out to `pi list`, so the honest way to drive it is a real
+ * child process: stubbing `execFile` would not exercise the argv or the env
+ * passthrough that the production warm-up relies on.
+ */
+interface FakePiHost {
+	entry: string;
+	pathValue: string;
+	piCalls(): number;
+	cleanup(): void;
+}
+
+function fakePiHost(options: { alwaysFail?: boolean } = {}): FakePiHost {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-warm-host-"));
+	const pkgDir = path.join(root, "npm", "node_modules", "fake-lens");
+	mkdirSync(pkgDir, { recursive: true });
+	writeFileSync(path.join(pkgDir, "index.ts"), "export default {};\n");
+	const binDir = path.join(root, "bin");
+	mkdirSync(binDir, { recursive: true });
+	const logPath = path.join(root, "calls.log");
+	const shim = path.join(binDir, "pi");
+	writeFileSync(
+		shim,
+		[
+			"#!/bin/sh",
+			`echo "pi $*" >> ${JSON.stringify(logPath)}`,
+			// A host whose `pi list` always fails (non-zero exit). The call is
+			// still logged first, so the count is about probes attempted.
+			...(options.alwaysFail ? ["exit 4"] : []),
+			'echo "User packages:"',
+			`echo "    ${pkgDir}"`,
+		].join("\n") + "\n",
+	);
+	chmodSync(shim, 0o755);
+	const lines = (): string[] => {
+		try {
+			return readFileSync(logPath, "utf8").split("\n").filter((line) => line.length > 0);
+		} catch {
+			return [];
+		}
+	};
+	return {
+		entry: path.join(pkgDir, "index.ts"),
+		pathValue: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+		piCalls: () => lines().filter((line) => line.startsWith("pi ")).length,
+		cleanup: () => rmSync(root, { recursive: true, force: true }),
+	};
+}
+
+/** Run `fn` with the fake host first on PATH and a cold discovery cache. */
+async function withFakePiHost<T>(host: FakePiHost, fn: () => Promise<T>): Promise<T> {
+	const prevPath = process.env.PATH;
+	process.env.PATH = host.pathValue;
+	resetExtensionDiscoveryCache();
+	try {
+		return await fn();
+	} finally {
+		resetExtensionDiscoveryCache();
+		if (prevPath === undefined) delete process.env.PATH;
+		else process.env.PATH = prevPath;
+	}
+}
+
+/** The slice of `AgentConfig` these cases need; no `spawnMode` means the default. */
+function warmAgent(overrides: Record<string, unknown> = {}) {
+	return {
+		name: "worker",
+		description: "warm-up test role",
+		kind: "pi" as const,
+		source: "user" as const,
+		filePath: "/tmp/worker.md",
+		systemPrompt: "Follow the role instructions.",
+		systemPromptMode: "append" as const,
+		inheritProjectContext: true,
+		inheritSkills: false,
+		tools: ["read"],
+		...overrides,
+	};
+}
+
+test("A14: a directly-constructed RpcSupervisor warms discovery through Orchestrator.launch", async () => {
+	// The documented public shape (`api.ts:13`): `new Orchestrator({ supervisor:
+	// new RpcSupervisor(), ... })`. It never touches RoutingSupervisor, so the
+	// router-level warm-up (#280 D3) cannot cover it and #280's symptom returns
+	// in full — the child's argv builder would read an empty sync cache.
+	const host = fakePiHost();
+	const h = harness({ memoryAvailable: () => 1_000_000 });
+	try {
+		await withFakePiHost(host, async () => {
+			assert.equal(discoveredHostExtensions(), undefined, "precondition: cold cache");
+			const orchestrator = new Orchestrator({
+				supervisor: h.supervisor,
+				runDir: h.root,
+				cwd: h.root,
+				maxDepth: 4,
+			});
+			const handle = await orchestrator.launch({ agent: warmAgent(), task: "t", name: "worker", worktree: false });
+			assert.deepEqual(
+				discoveredHostExtensions(),
+				[host.entry],
+				"the backend's own spawnChild must have warmed discovery (R1-b)",
+			);
+			assert.ok(
+				(h.clients.at(-1)?.options.args ?? []).includes(host.entry),
+				"and that warm set is what the child is started with",
+			);
+			orchestrator.flushLaunchQueue("test cleanup");
+			await h.supervisor.retire(handle.name).catch(() => {});
+		});
+	} finally {
+		h.close();
+		host.cleanup();
+	}
+});
+
+test("A16: router + backend both warming still runs exactly one `pi list`", async () => {
+	// The router keeps its warm (it runs before parameter validation and covers
+	// both backends), and the backend now warms too (R1-b). Two spawns must still
+	// cost one `pi list`: the second call is a cache hit, not a second probe.
+	const host = fakePiHost();
+	const h = harness({ memoryAvailable: () => 1_000_000 });
+	try {
+		await withFakePiHost(host, async () => {
+			const router = new RoutingSupervisor({ rpc: h.supervisor });
+			const input = (name: string): SpawnInput => ({
+				...testInput(h.root, name),
+				agent: { ...warmAgent({ spawnMode: "rpc", extensions: [] }), name: "worker" } as SpawnInput["agent"],
+			});
+			await router.spawnChild(input("root.first"));
+			await router.spawnChild(input("root.second"));
+			assert.deepEqual(discoveredHostExtensions(), [host.entry], "the router path is warm");
+			assert.equal(h.clients.length, 2, "precondition: two real backend spawns happened");
+			assert.equal(host.piCalls(), 1, "router warm + backend warm must not add a second `pi list`");
+			await router.retire("root.first").catch(() => {});
+			await router.retire("root.second").catch(() => {});
+		});
+	} finally {
+		h.close();
+		host.cleanup();
+	}
+});
+
+test("A20: a failing `pi list` costs one probe per spawn, not two", async () => {
+	// R2-b/F39: three warm-up points sit on one spawn (router, then the backend).
+	// Before the failure backoff each of them re-probed a failing host, so a
+	// failing `pi list` cost 2× per spawn — before the memory gate, and `pi list`
+	// costs 0.3–0.9 s when it works (up to its timeout when it does not).
+	const host = fakePiHost({ alwaysFail: true });
+	const h = harness({ memoryAvailable: () => 1_000_000 });
+	try {
+		await withFakePiHost(host, async () => {
+			const router = new RoutingSupervisor({ rpc: h.supervisor });
+			const input = (name: string): SpawnInput => ({
+				...testInput(h.root, name),
+				agent: { ...warmAgent({ spawnMode: "rpc", extensions: [] }), name: "worker" } as SpawnInput["agent"],
+			});
+
+			await router.spawnChild(input("root.failing"));
+			assert.equal(
+				host.piCalls(),
+				1,
+				"router warm + backend warm share one failed probe (F39: it used to be 2)",
+			);
+			assert.deepEqual(
+				discoveredHostExtensions(),
+				undefined,
+				"and the failure is still NOT cached as [] (F23), only backed off",
+			);
+			assert.equal(h.clients.length, 1, "precondition: the backend really did spawn");
+
+			// The second spawn inside the window continues off the same backoff.
+			await router.spawnChild(input("root.failing.2"));
+			assert.equal(h.clients.length, 2, "precondition: two real backend spawns happened");
+			assert.equal(
+				host.piCalls(),
+				1,
+				"still one probe: the TTL covers every warm call of these spawns",
+			);
+
+			await router.retire("root.failing").catch(() => {});
+			await router.retire("root.failing.2").catch(() => {});
+		});
+	} finally {
+		h.close();
+		host.cleanup();
+	}
+});
+
+test("A21: the router retries a failing `pi list` once the backoff window passes", async () => {
+	// The recoverability half of R2-b (F23/A21): the backoff must not become the
+	// permanent off switch that the old `cached []` shape was. Ages the stamp the
+	// way wall-clock time would, with the router driving the spawn path.
+	const host = fakePiHost({ alwaysFail: true });
+	const h = harness({ memoryAvailable: () => 1_000_000 });
+	try {
+		await withFakePiHost(host, async () => {
+			const router = new RoutingSupervisor({ rpc: h.supervisor });
+			const input = (name: string): SpawnInput => ({
+				...testInput(h.root, name),
+				agent: { ...warmAgent({ spawnMode: "rpc", extensions: [] }), name: "worker" } as SpawnInput["agent"],
+			});
+			await router.spawnChild(input("root.backoff"));
+			assert.equal(host.piCalls(), 1);
+
+			// Cross the window through the live holder, exactly as elapsed time would.
+			const holder = (globalThis as unknown as Record<symbol, { failedAt?: number } | undefined>)[
+				Symbol.for("pi-legion.extension-discovery")
+			];
+			assert.ok(holder, "discovery state lives on the shared holder");
+			holder.failedAt = Date.now() - 60_000;
+
+			await router.spawnChild(input("root.backoff.2"));
+			assert.equal(host.piCalls(), 2, "past the TTL the router probes again (F23: not a permanent off switch)");
+
+			await router.retire("root.backoff").catch(() => {});
+			await router.retire("root.backoff.2").catch(() => {});
+		});
+	} finally {
+		h.close();
+		host.cleanup();
 	}
 });
 

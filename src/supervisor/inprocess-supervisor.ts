@@ -17,6 +17,7 @@ import {
 	childInheritsExtensions,
 	collectChildExtensions,
 } from "../runs/args.ts";
+import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import {
 	ErrorCodes,
 	unknownChildError,
@@ -705,6 +706,20 @@ export class InProcessSupervisor implements LegionSupervisor {
 	}
 
 	async spawnChild(input: SpawnInput): Promise<ChildHandle> {
+		// #280 R1-b: warm host-extension discovery HERE, not only in
+		// `RoutingSupervisor`, because a caller may construct this backend
+		// directly (`new Orchestrator({ supervisor: new RpcSupervisor() })` is the
+		// documented public shape in `api.ts`, and it is `Orchestrator`'s default).
+		// That path bypasses the router entirely, and without this the child's
+		// argv builder would read an empty sync cache and inherit nothing.
+		//
+		// It cannot live in `Orchestrator.launch`: that fast path must not gain an
+		// await before the synchronous admission block
+		// (launch-admission-queue-v1 §13.7 ban 5 / F16).
+		//
+		// Idempotent and never rejects, so the router's own warm call makes this a
+		// map lookup, and a failed `pi list` still leaves a working launch.
+		await ensureHostExtensions();
 		if (input.agent.kind !== "pi") {
 			throw new SubagentError(
 				`InProcessSupervisor only supports pi children (received kind '${input.agent.kind}')`,

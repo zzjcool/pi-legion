@@ -11,6 +11,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { formatChildTask } from "../extension/child-guard.ts";
 import { buildPiArgs, LEGION_IDENTITY_ENV_KEYS } from "../runs/args.ts";
+import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import { checkMemoryGate, childMemoryEnv } from "./child-memory.ts";
 import { enrichFailureWithAutoDoctor } from "../extension/auto-doctor.ts";
@@ -228,6 +229,19 @@ export class RpcSupervisor implements LegionSupervisor {
 	}
 
 	async spawnChild(input: SpawnInput): Promise<ChildHandle> {
+		// #280 R1-b: warm host-extension discovery HERE, not only in
+		// `RoutingSupervisor`. `api.ts` documents `new Orchestrator({ supervisor:
+		// new RpcSupervisor(), ... })` and that is also `Orchestrator`'s default,
+		// so this backend is reachable without ever passing through the router —
+		// without this warm-up the child's argv builder reads an empty sync cache
+		// and the whole of #280 stays broken on that public path.
+		//
+		// It deliberately precedes the memory gate: warming is cheap, idempotent
+		// and never rejects, and doing it first keeps the ordering identical for
+		// admitted and refused spawns. It must NOT move into `Orchestrator.launch`
+		// (launch-admission-queue-v1 §13.7 ban 5 / F16: that fast path may not gain
+		// an await before the synchronous admission block).
+		await ensureHostExtensions();
 		// Memory gate (program level): refuse before any process/temp dir exists.
 		const inFlight = [...this.children.values()].filter((child) => child.state === "starting").length;
 		const gate = checkMemoryGate({ name: input.name, inFlight, ...(this.memoryAvailable ? { available: this.memoryAvailable } : {}) });

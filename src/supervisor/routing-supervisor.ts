@@ -16,6 +16,7 @@ import {
 import { InProcessSupervisor, type InProcessSlotEvent } from "./inprocess-supervisor.ts";
 import { RpcSupervisor } from "./rpc-supervisor.ts";
 import { resolveSpawnMode } from "./spawn-mode.ts";
+import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import type { UIProxy } from "./ui-proxy.ts";
 import type {
 	ChildHandle,
@@ -127,6 +128,19 @@ export class RoutingSupervisor implements LegionSupervisor {
 
 	async spawnChild(input: SpawnInput): Promise<ChildHandle> {
 		const mode = resolveSpawnMode(input.agent);
+		// #280: warm host-extension discovery before anything is spawned.
+		//
+		// This is the one place that sees BOTH backends and sits on an await chain
+		// already, so every spawn path is covered — the tool execute frame, the
+		// postman timer, the team-restore microtask and the launch-queue pump all
+		// funnel through `Orchestrator.launch` → here. It deliberately does NOT live
+		// in `launch()`: that fast path must not gain an await before the
+		// synchronous admission block (launch-admission-queue-v1 §13.7 ban 5).
+		//
+		// `ensureHostExtensions` is idempotent and never rejects, so a warm cache is
+		// a map lookup and a failed `pi list` leaves the child with the explicit
+		// list plus the guard instead of failing the launch.
+		await ensureHostExtensions();
 		if (mode === "inprocess") {
 			if (input.agent.kind !== "pi") {
 				throw new SubagentError(
