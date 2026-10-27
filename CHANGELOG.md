@@ -11,6 +11,86 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [5.0.1] — 2026-10-27
+
+Patch release. **This is the release where 5.0.0's extension-inheritance policy
+starts actually taking effect** — upgrading changes what a child loads, so read
+the first entry before rolling it out to a fleet.
+
+### Fixed
+
+- **Host extensions are inherited again (#280).** 5.0.0 declared "children inherit
+  every host extension by default" and documented the narrowing knobs, but the
+  policy never reached the spawn path: `discoverHostExtensions()` had no callers,
+  the sync getter it fed therefore returned `undefined`, and
+  `inheritedExtensions` was always handed an empty host list. Children kept
+  getting exactly the card's own `extensions` plus the child-guard — the
+  `--no-extensions` behaviour #280 set out to remove, under a new description.
+
+  Discovery is now warmed once per process before a child is spawned. The cache
+  lives on `globalThis` under `Symbol.for` rather than in a module-level `let`,
+  because pi re-evaluates an extension module with `moduleCache: false` for a
+  child's `--extension` load: a module-level variable is invisible across those
+  instances, so a child spawned from a re-loaded instance would have inherited
+  nothing. The same escape hatch already backs `child-context.ts`,
+  `inprocess-depth.ts` and `admission-queue.ts`.
+
+  The warm-up sits in each backend's `spawnChild` (and in `RoutingSupervisor`,
+  which sees both). It is deliberately not in `Orchestrator.launch`: that fast
+  path may not gain an await before the synchronous admission block
+  (`launch-admission-queue-v1` §13.7).
+
+- **`PI_LEGION_CHILD_INHERIT_EXTENSIONS=0` works on the inherited half (#280).**
+  `collectChildExtensions` accepted an `env` argument and then did not forward it
+  to `inheritedExtensions`, so the operator kill-switch applied everywhere except
+  the set it was meant to disable. Harmless while that set was always empty;
+  wrong the moment it is not.
+
+- **A manifest that names a directory no longer breaks rpc children (#280).**
+  `pi.extensions: ["./extensions"]` (what `pi-diff-review` ships) resolved to the
+  directory itself, and `pi -e <dir>` exits 1 with `Failed to load extension:
+  Cannot find module` — so wiring inheritance up would have failed every rpc
+  child of a session with that package installed. Declared entries now resolve the
+  way pi's own loader does: a file as-is, a directory through its own
+  `pi.extensions`, else its `index.ts` / `index.js`, else its `*.ts` / `*.js`
+  files. An entry that expands to nothing is dropped instead of leaving an
+  unloadable path.
+
+- **`extensions/<name>/index.ts` is discovered (#280).** The first sweep collected
+  only files directly inside a declared directory, so pi's documented
+  subdirectory layout resolved to nothing and the package silently contributed
+  zero extensions. The sweep now matches pi's `collectAutoExtensionEntries`:
+  `.`-prefixed names and `node_modules` are skipped, `*.ts` / `*.js` files are
+  collected, and a subdirectory is resolved as a package of its own (one level,
+  as pi does).
+
+- **A failing `pi list` is retried, and costs one probe per spawn (#280).** The
+  old shape cached the failure as `[]` permanently, so one transient error
+  disabled inheritance until the process restarted. Failures now stamp
+  `failedAt` and short-circuit for `FAILURE_TTL_MS` (5 s), which keeps a
+  three-point warm-up from probing twice on the same spawn while still retrying
+  once the window passes.
+
+- **A direct `RpcSupervisor` gets the same warm-up (#280).** `api.ts` documents
+  `new Orchestrator({ supervisor: new RpcSupervisor(), … })`, which never touches
+  `RoutingSupervisor`; warming only there left that path inheriting nothing.
+
+### Notes
+
+- **Cost now matches what 5.0.0 promised.** Inheriting everything includes
+  pi-lens (a ~5.7 MB bundle that starts an LSP stack) on every child. In-process
+  children share the host process, so this is host memory, not a new process.
+  Add `excludeExtensions: [pi-lens]` to a card (or
+  `PI_LEGION_CHILD_INHERIT_EXTENSIONS=0` globally) if a fleet does not need it —
+  before this release those knobs were inert.
+- **This package is never inherited into its own children.** In the source-tree
+  layout `pi list` and the child-guard name different files for the same code, so
+  dedupe could not collapse them and a child loaded two legion factories
+  (`Tool "subagent" conflicts with …`). The guard is still appended
+  unconditionally at the end.
+- Doctor output and the README described the intended behaviour, which is now the
+  actual behaviour; they were not rewritten for this release.
+
 ## [5.0.0] — 2026-10-26
 
 Major because upgrading **can break an existing role card**: unknown frontmatter
