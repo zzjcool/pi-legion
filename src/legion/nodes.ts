@@ -218,6 +218,15 @@ export function insertNode(
 	});
 }
 
+/**
+ * A node that can never consume anything again: a failed process, or a phase that
+ * closed the node out. Shared so mail delivery (bounce/obsolete) and the postman's
+ * own guards cannot drift into two different definitions of "terminal".
+ */
+export function isTerminalNode(node: Pick<LegionNode, "status" | "phase">): boolean {
+	return node.status === "failed" || (node.phase !== null && ["done", "failed", "aborted"].includes(node.phase));
+}
+
 export function getNode(db: DatabaseSync, id: string): LegionNode | null {
 	const row = db.prepare("SELECT * FROM nodes WHERE id = ?").get(id);
 	return row ? mapNode(row) : null;

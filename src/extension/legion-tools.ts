@@ -18,7 +18,12 @@ import { appendEvent } from "../legion/events.ts";
 import {
 	MAIL_BODY_HARD_LIMIT_BYTES,
 	MAIL_BODY_SOFT_LIMIT_BYTES,
+	MAIL_BOUNCE_REASON,
 	MAIL_DELIVERY,
+	formatMail,
+	inbox,
+	isStalePhaseTimeoutNotice,
+	mailReachedTurns,
 	pendingInbox,
 	sendMail,
 	transitionDelivery,
@@ -29,6 +34,7 @@ import {
 	getNode,
 	getSubtree,
 	heartbeatNode,
+	isTerminalNode,
 	listStaleNodes,
 	updateNode,
 	type LegionNode,
@@ -49,6 +55,8 @@ import {
 import { upsertUsage } from "../legion/usage.ts";
 
 const POSTMAN_INTERVAL_MS = 2_000;
+/** Upper bound on ACCEPTED mail one tick may confirm (#322 §3), so a big inbox cannot stall the loop. */
+const ACCEPTED_MAIL_CONFIRM_LIMIT = 20;
 const ORPHAN_SCAN_INTERVAL_MS = 60_000;
 const DEFAULT_ORPHAN_STALE_MS = 90_000;
 const ORPHAN_REPORT_WINDOW_MS = 10 * 60_000;
@@ -130,6 +138,10 @@ export class LegionPostman {
 			const timestamp = this.now();
 			const children = getChildren(this.db, this.nodeId);
 			this.refreshHeartbeats(children);
+			// Confirm before delivering, so a message sent in this very tick stays
+			// ACCEPTED for at least one tick instead of flipping to DELIVERED in the
+			// same pass that queued it.
+			this.confirmAcceptedMail(children);
 			await this.deliverChildren(children);
 			if (this.nodeId === "root") await this.deliverRootInbox();
 			if (timestamp - this.lastUsagePoll >= (this.settings.usagePollMs ?? 30_000)) {
@@ -160,32 +172,104 @@ export class LegionPostman {
 
 	private async deliverChildren(children: readonly LegionNode[]): Promise<void> {
 		for (const child of children) {
-			for (const message of pendingInbox(this.db, child.id)) await this.deliverToChild(child, message);
+			for (const message of pendingInbox(this.db, child.id)) {
+				if (this.discardIfStaleNotice(message)) continue;
+				await this.deliverToChild(child, message);
+			}
 		}
 	}
 
 	private async deliverRootInbox(): Promise<void> {
 		for (const message of pendingInbox(this.db, "root")) {
+			if (this.discardIfStaleNotice(message)) continue;
 			try {
 				this.sendRootMessage(formatMail(message));
-				transitionDelivery(this.db, message.id, MAIL_DELIVERY.INJECTED, this.now);
-				this.emitMail(message.id, message.fromNode, "mail_delivered");
+				transitionDelivery(this.db, message.id, MAIL_DELIVERY.ACCEPTED, this.now);
+				this.emitMail(message.id, message.fromNode, "mail_sent");
 			} catch {
 				// Leave pending for a later tick instead of silently losing mail.
 			}
 		}
 	}
 
+	/**
+	 * #333: never hand a `Phase timeout:` notice to a recipient whose subject phase
+	 * is already over — that is a to-do item that expired before it could be read.
+	 * Applies to both inboxes this postman owns (children, and the root inbox when
+	 * this node is `root`), because a queued notice would otherwise be injected long
+	 * after the team converged.
+	 */
+	private discardIfStaleNotice(message: LegionMessage): boolean {
+		if (!isStalePhaseTimeoutNotice(this.db, message)) return false;
+		try {
+			transitionDelivery(this.db, message.id, MAIL_DELIVERY.OBSOLETE, this.now);
+			this.emitMail(message.id, message.fromNode, "mail_bounced");
+		} catch {
+			// Leave it for the next tick rather than losing the mail silently.
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * One bounded confirmation pass over ACCEPTED mail (#322 §3).
+	 *
+	 * DELIVERED comes from evidence only: the recipient's session file shows the
+	 * exact injected text (see `mailReachedTurns`). OBSOLETE is the #333 rule. Any
+	 * message that cannot be decided stays ACCEPTED for the next tick, and the scan
+	 * stops at `ACCEPTED_MAIL_CONFIRM_LIMIT` messages per tick.
+	 */
+	private confirmAcceptedMail(children: readonly LegionNode[]): void {
+		let remaining = ACCEPTED_MAIL_CONFIRM_LIMIT;
+		const seams: Array<{ id: string; sessionFile: string | null }> = children.map((child) => ({
+			id: child.id,
+			sessionFile: child.sessionFile,
+		}));
+		if (this.nodeId === "root") seams.push({ id: "root", sessionFile: getNode(this.db, "root")?.sessionFile ?? null });
+		for (const seam of seams) {
+			if (remaining <= 0) return;
+			let messages: LegionMessage[];
+			try {
+				messages = inbox(this.db, seam.id, { delivery: MAIL_DELIVERY.ACCEPTED, limit: remaining });
+			} catch {
+				continue;
+			}
+			for (const message of messages) {
+				if (remaining <= 0) return;
+				remaining -= 1;
+				// Delivered wins over obsolete: a notice the recipient did consume is a
+				// fact about the past, not a stale to-do.
+				if (this.mailReachedRecipient(message, seam.sessionFile)) {
+					try {
+						transitionDelivery(this.db, message.id, MAIL_DELIVERY.DELIVERED, this.now);
+						this.emitMail(message.id, message.fromNode, "mail_delivered");
+					} catch {
+						// Unreadable/rotated session: stays ACCEPTED.
+					}
+					continue;
+				}
+				this.discardIfStaleNotice(message);
+			}
+		}
+	}
+
+	private mailReachedRecipient(message: LegionMessage, sessionFile: string | null): boolean {
+		if (!sessionFile) return false;
+		try {
+			return mailReachedTurns(parseSessionFile(sessionFile).turns, message);
+		} catch {
+			return false;
+		}
+	}
+
 	private async deliverToChild(node: LegionNode, message: LegionMessage): Promise<void> {
-		// #313: `MAIL_DELIVERY.INJECTED` is written below as soon as a send call
-		// returns an answer — including `intercepted`, where an input handler ate
-		// the text and the child never saw it. INJECTED therefore means "the send
-		// call returned", never "the child (let alone the model) read it", and it
-		// does not promise a retry either: only a thrown send stays pending. A steer
-		// also waits for the child's next turn boundary (after its current tool
-		// batch), so a child stuck in a long tool never consumes it. The state
-		// machine is unchanged on purpose (#313 D3) and `delivered=` keeps its
-		// existing meaning. Cross the tool-batch wait with `stop`, not mail.
+		// #322: `ACCEPTED` is written below as soon as a send call returns an answer —
+		// including `queued`, where the text waits for the child's next turn boundary
+		// (after its current tool batch) and a child stuck in a long tool never
+		// consumes it. It means "the send call returned", never "the child read it",
+		// and it does not promise a retry either: only a thrown send stays pending.
+		// `DELIVERED` is a separate, later fact with its own evidence. `intercepted`
+		// is NOT accepted: an input handler ate the text, so it bounces.
 		const current = getNode(this.db, node.id) ?? node;
 		const text = formatMail(message);
 		const wasAlive = this.supervisor.isAlive(current.name);
@@ -202,24 +286,26 @@ export class LegionPostman {
 				if (message.urgency === "action-needed") {
 					const disposition = await this.supervisor.steer(current.name, text);
 					if (disposition === "intercepted") {
-						// The one outcome INJECTED would misreport as delivered (#313): an
-						// input handler ate the mail before it was queued, so the child never
-						// sees it. The delivery state machine stays as it is (D3), which makes
-						// a visible warning the only honest signal available here.
-						console.warn(
-							`[pi-legion] mail ${message.id} to ${current.name} was intercepted by an input handler; the child never saw it (delivered=1 records the send, not a read).`,
-						);
+						// The child never saw the text and there is no retry, so the ledger says
+						// so: the mail bounced, with a reason the sender can act on (#322).
+						transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now, {
+							reason: MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER,
+						});
+						this.emitMail(message.id, message.fromNode, "mail_bounced");
+						return;
 					}
 					this.emitProcess("node_steered", current.id, { name: current.name, messageId: message.id });
 				} else {
 					await this.supervisor.followUp(current.name, text);
 				}
 			} else {
+				// In-process backends cannot tell `queued` from `accepted`: `prompt` returns
+				// void, so ACCEPTED here is a backend capability limit, not an observation.
 				await this.supervisor.prompt(current.name, text);
 			}
 			if (wasAlive && message.urgency === "action-needed" && current.status === "blocked") updateNode(this.db, current.id, { status: "running" }, this.now);
-			transitionDelivery(this.db, message.id, MAIL_DELIVERY.INJECTED, this.now);
-			this.emitMail(message.id, message.fromNode, "mail_delivered");
+			transitionDelivery(this.db, message.id, MAIL_DELIVERY.ACCEPTED, this.now);
+			this.emitMail(message.id, message.fromNode, "mail_sent");
 		} catch {
 			// RPC failures leave delivered=0 so the next mailbox tick can retry.
 		}
@@ -1107,10 +1193,6 @@ function verificationPassed(node: LegionNode): boolean | undefined {
 	return readVerificationResult(node);
 }
 
-function isTerminalNode(node: LegionNode): boolean {
-	return node.status === "failed" || ["done", "failed", "aborted"].includes(node.phase ?? "");
-}
-
 function isPhase(value: unknown): value is LegionPhase {
 	return typeof value === "string" && (PHASES as readonly string[]).includes(value);
 }
@@ -1145,10 +1227,6 @@ async function notifyParent(db: DatabaseSync, node: LegionNode, text: string, se
 		urgency: "action-needed",
 	}, { now, ratePer5Min: settings?.mailRatePer5Min });
 	if (result.ok) for (const message of result.messages) emitStoredMailEvent(db, eventBus, node.id, "mail_sent", message.id);
-}
-
-function formatMail(message: LegionMessage): string {
-	return [`[legion mail #${message.id}]`, `From: ${message.fromNode}`, `Subject: ${message.subject}`, `Urgency: ${message.urgency}`, "", message.body].join("\n");
 }
 
 function toolOk(text: string): AgentToolResult<unknown> {
