@@ -144,15 +144,25 @@ export class JoinCoordinator {
 	 * is sitting in the window. Semantics of `remove()` are otherwise unchanged.
 	 */
 	dropBuffered(runId: string, name: string): void {
-		if (this.disposed) return;
-		const group = this.groups.get(runId);
-		if (!group || group.buffered.length === 0) return;
-		const kept = group.buffered.filter((entry) => entry.name !== name);
-		if (kept.length === group.buffered.length) return;
-		group.buffered = kept;
-		if (group.pending.size === 0 && group.buffered.length === 0) {
-			this.dropGroup(runId, group);
-		}
+		this.dropBufferedWhere(runId, (entry) => entry.name === name);
+	}
+
+	/**
+	 * D10: drop the terminal entries of ONE ROUND of one member.
+	 *
+	 * This is what `release()` needs. `release()` acts on a single tracked job, and
+	 * a job carries exactly one round, so the copy it may drop is the one that round
+	 * produced. The name-wide `dropBuffered` above is the REVOKE path (D7): a parent
+	 * asking to see the child again invalidates every copy of the name. Using the
+	 * name-wide form from `release()` would silently swallow an EARLIER round's
+	 * unread notice — the loss D10 exists to prevent (one round = one deliverable
+	 * result).
+	 */
+	dropBufferedRound(runId: string, name: string, round: number): void {
+		this.dropBufferedWhere(
+			runId,
+			(entry) => entry.name === name && entry.round === round,
+		);
 	}
 
 	/** Terminal entry point (success and collect-failure alike). */
@@ -210,6 +220,22 @@ export class JoinCoordinator {
 		}
 		this.groups.clear();
 		this.groupOf.clear();
+	}
+
+	/** One implementation for both drops: keep every entry the predicate rejects. */
+	private dropBufferedWhere(
+		runId: string,
+		matches: (entry: BufferedEntry) => boolean,
+	): void {
+		if (this.disposed) return;
+		const group = this.groups.get(runId);
+		if (!group || group.buffered.length === 0) return;
+		const kept = group.buffered.filter((entry) => !matches(entry));
+		if (kept.length === group.buffered.length) return;
+		group.buffered = kept;
+		if (group.pending.size === 0 && group.buffered.length === 0) {
+			this.dropGroup(runId, group);
+		}
 	}
 
 	private ensureGroup(runId: string): Group {

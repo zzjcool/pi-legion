@@ -295,6 +295,47 @@ test("D8: remove() alone still leaves a buffered entry behind (the W3 orphan sha
 	);
 });
 
+test("D8: dropBufferedRound drops one round and leaves an older unread copy alone (D10)", () => {
+	// `release()` acts on ONE tracked job = one round, so the only copy it may drop
+	// is that round's. Reaching for the name-wide drop there deleted round 1's
+	// still-unread notice when round 2 was the one the parent had just read.
+	const { join, delivered } = harness();
+	join.addPending("r-1", "a");
+	join.addPending("r-1", "b");
+	join.onTerminal(entry("a", "r-1", "success")); // round 1: buffered, unread
+	join.addPending("r-1", "a"); // re-tracked: round 2 joins the group again
+	join.onTerminal({ ...entry("a"), round: 2 }); // round 2: buffered too
+
+	join.dropBufferedRound("r-1", "a", 2);
+	join.onTerminal(entry("b")); // everyone home → flush
+	assert.deepEqual(
+		delivered[0]?.map((e) => `${e.name}#${e.round}`),
+		["a#1", "b#1"],
+		"only round 2 was dropped; round 1 is still deliverable",
+	);
+});
+
+test("D7: dropBuffered keeps its NAME-WIDE meaning — every round of the member", () => {
+	// The counterpart of the case above, pinned on purpose: the revoke path needs
+	// name-wide clearing ("the parent asks to see the child again ⇒ every copy of
+	// that name is stale"), which is why the round-scoped drop is a SEPARATE method
+	// rather than a changed `dropBuffered`.
+	const { join, delivered } = harness();
+	join.addPending("r-1", "a");
+	join.addPending("r-1", "b");
+	join.onTerminal(entry("a"));
+	join.addPending("r-1", "a");
+	join.onTerminal({ ...entry("a"), round: 2 });
+
+	join.dropBuffered("r-1", "a");
+	join.onTerminal(entry("b"));
+	assert.deepEqual(
+		delivered[0]?.map((e) => `${e.name}#${e.round}`),
+		["b#1"],
+		"a revoke clears every round of the name",
+	);
+});
+
 test("D8: dropBuffered on the last member drops the group and cancels its window", () => {
 	const { join, delivered, timers } = harness();
 	join.addPending("r-1", "a");

@@ -562,6 +562,15 @@ export interface SessionRuntime {
 	consumeCollect(name: string): Promise<CollectSnapshot> | undefined;
 	/** Abortable variant used by an in-flight collect tool call. */
 	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<CollectSnapshot | undefined> | undefined;
+	/**
+	 * Undo the claim `consumeCollect*` took for a snapshot the caller never delivered
+	 * (the tool call bailed: the parent turn aborted, or persisting the child failed).
+	 * D2: a claim is earned by a delivery, not by a collect that reached nobody.
+	 *
+	 * Unlike `unclaimReported` (D7) this does NOT drop queued/buffered copies: after the
+	 * tool route bailed, that notice is the ONLY route left to the parent.
+	 */
+	unclaimUndelivered(name: string, snapshot: CollectSnapshot): void;
 	/** Invalidate an in-flight notification watch without dropping the job. */
 	cancelWatch(name: string): void;
 	rewatch(name: string, opts?: { triggerTurn?: boolean }): void;
@@ -736,6 +745,27 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			claimReported(origin.runId, job.name, origin.round);
 		}
 		return snapshot;
+	};
+	/**
+	 * D2 (delivery, not collection): roll back a claim that reached nobody.
+	 *
+	 * The seam has to claim when the snapshot is handed to the caller, because a
+	 * join/outbox flush landing in that same tick must not repeat the result. But the
+	 * CALLER may still bail — `collectChild` returns "interrupted" when the parent turn
+	 * aborted, and fails the tool call when persisting the child throws. Neither hands
+	 * the text to the parent, so the claim has to go back: otherwise the pushed notice
+	 * for a result nobody saw is filtered out forever.
+	 *
+	 * Deliberately narrower than `unclaimReported`: no copies are dropped. The queued /
+	 * buffered notice is the only remaining route to the parent, and D7's question ("the
+	 * parent read it, so revoke") does not apply — nothing was read.
+	 */
+	const unclaimUndelivered = (name: string, snapshot: CollectSnapshot): void => {
+		const origin = snapshotOrigins.get(snapshot);
+		// No origin ⇒ this runtime did not collect it, so it cannot have claimed it.
+		// A non-terminal snapshot never claims either (D2(b)).
+		if (!origin) return;
+		reported.delete(reportKey(origin.runId, name, origin.round));
 	};
 	/**
 	 * D10 #1: the reporting round per child name.
@@ -1715,13 +1745,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				);
 			}
 			jobs.set(job.name, job);
-			// D7: a fresh track (launch / resume / re-follow AFTER a release) is a new
-			// round, so it must be claimable again. Under D10 the revoke is keyed on the
-			// NEW round, which by construction has no claim yet: this call is therefore a
-			// no-op, and deliberately so — the PREVIOUS round's unread copies keep their
-			// own keys and stay deliverable (that is exactly what D10 fixes: "unread ≠
-			// dropped"). `notified: false` above is the job-local copy of this rule.
-			unclaimReported(job.runId, job.name, job.round);
+			// D7 invariant: unclaim only where `notified` is RESET. This branch RESETS
+			// nothing — it *initializes* the flag to `false` on a brand-new job — and the
+			// round it just drew from the monotonic counter cannot have a claim yet, so an
+			// `unclaimReported(job.runId, job.name, job.round)` here would be a provable
+			// no-op whose `dropQueued` / `dropBuffered` / `finished.delete` were
+			// unreachable from this site (it read as a fifth reset point that did nothing).
+			// What actually has to be true here is the positive property: the PREVIOUS
+			// round's unread copies keep their own keys and stay deliverable (D10).
 			// D7b: same one-round rule as the revive branch above — a fresh job must
 			// never be served the previous round's snapshot.
 			finished.delete(job.name);
@@ -1981,6 +2012,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			refreshUi();
 		},
 
+		unclaimUndelivered(name, snapshot) {
+			unclaimUndelivered(name, snapshot);
+		},
+
 		rewatch(name, opts) {
 			const job = jobs.get(name);
 			if (!job || disposed) return;
@@ -2020,7 +2055,16 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			// before the release). Do not delete that filter on the strength of this
 			// line — dropping a buffer entry that was never delivered would silently
 			// swallow the notice, which is why the call is gated on the claim.
-			if (isReported(job.runId, name, job.round)) join.dropBuffered(job.runId, name);
+			//
+			// D10: this job owns ONE round, so only that round's copy may go. The
+			// name-wide drop is the revoke path (`unclaimReported`); using it here
+			// would delete an EARLIER round's still-unread notice along with it —
+			// "one round = one deliverable result" (D10), and the loss is reachable:
+			// round 1 buffered unread → re-track → round 2 buffered → `wait` claims
+			// round 2 → this release would drop round 1 too.
+			if (isReported(job.runId, name, job.round)) {
+				join.dropBufferedRound(job.runId, name, job.round);
+			}
 			join.remove(name);
 			stopTimerIfIdle();
 			refreshUi();

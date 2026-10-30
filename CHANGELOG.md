@@ -25,12 +25,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   - Dedupe collapses onto **one claim per `(runId, name, round)`**. `round` is a
     per-name counter because `runId` is the *parent* run id — every round of a
     same-named child shares it, so a two-part key lets an unread old round win the
-    flush and filter out the new round's real result. Three claim sites, all real
-    deliveries; no unclaim on the delivery side.
+    flush and filter out the new round's real result. Three claim sites — `wait`
+    (before its retire await), the `collect` seam, and a notice that actually went
+    out — and one rollback: when a `collect` claims and then bails (the parent turn
+    aborts, or persisting the child fails), the claim is handed back, because a
+    notice for a result nobody saw must not stay suppressed. Delivery itself never
+    unclaims.
   - `deliverBatch` is the single exit: claimed entries are filtered, survivors
     formatted (grouped headers and the `N of M` count recomputed at delivery time),
     then sent or held. The outbox now holds structure rather than formatted text, so a
     member claimed while a notice waits drops out of the body and the count alike.
+  - Each round is one deliverable result, so releasing a child only ever drops the
+    copy of the round the parent just read: an earlier round's unread notice still
+    arrives.
   - Tool results are **never** suppressed: `wait` / `collect` always return the full
     text, only the passive notice is deduplicated. Claim state stays in memory by
     design — after a process restart the result is still recoverable via `collect`.

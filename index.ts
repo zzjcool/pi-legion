@@ -2031,8 +2031,14 @@ async function steerChild(
 	}
 }
 
-/** Wait for the child's current turn and derive its outcome from the session. */
-async function collectChild(
+/**
+ * Wait for the child's current turn and derive its outcome from the session.
+ *
+ * Exported alongside `waitAction` for the index-layer unit tests: the claim the
+ * runtime seam takes has to be handed back when this call bails (D2), and that
+ * wiring is only observable from here.
+ */
+export async function collectChild(
 	ctx: ChildContext,
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<unknown>> {
@@ -2043,8 +2049,22 @@ async function collectChild(
 			: ctx.runtime.consumeCollect(ctx.name);
 		if (pending) {
 			const collected = await pending;
-			if (!collected || signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
-			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
+			// D2: the seam claims a terminal snapshot on the way out, because a flush in
+			// that tick would otherwise repeat it. Every bail from here hands the result
+			// to NOBODY, so the claim is handed back — a permanently suppressed notice
+			// for a result the parent never saw is the worse failure of the two.
+			if (!collected || signal?.aborted) {
+				if (collected) ctx.runtime.unclaimUndelivered(ctx.name, collected);
+				return ok("interrupted (parent turn ended; children still running)");
+			}
+			try {
+				await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
+			} catch (error) {
+				// Same rule for the other bail: `renderCollect` is never reached, so the
+				// tool result will not carry this snapshot either.
+				ctx.runtime.unclaimUndelivered(ctx.name, collected);
+				throw error;
+			}
 			return ok(renderCollect(ctx.name, collected));
 		}
 
