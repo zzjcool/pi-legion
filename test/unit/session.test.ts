@@ -172,6 +172,102 @@ test("extractVerdict on fenced ```json block parses the JSON inside", () => {
 	assert.deepEqual(extractVerdict('```\n{"ok":false}\n```'), { ok: false });
 });
 
+// ── #311: a BARE verdict on the last line is the shape child-guard asks for ──
+//
+// The injected constraint (`src/extension/child-guard.ts`, `docs/design.md` §3.4)
+// tells every child to end with bare JSON. Before #311 the only cross-run
+// candidate was `first { … last }`, so ONE brace anywhere in the report turned
+// the verdict into `散文 + JSON` and `JSON.parse` failed → `unknown /
+// no machine-readable verdict`, contradicting the injection.
+
+test("#311 extractVerdict: prose containing `{` + bare verdict on the last line", () => {
+	// The issue's decisive control: the report mentions an object shape, so the
+	// first `{` is prose and the naive `first { … last }` span is not JSON.
+	const report = [
+		"## Report",
+		"",
+		"Checked the payload shape `{ version, entries }` and the writer path.",
+		"All green.",
+		"",
+		'{"ok": true, "reason": "README created"}',
+	].join("\n");
+	assert.deepEqual(extractVerdict(report), { ok: true, reason: "README created" });
+});
+
+test("#311 extractVerdict: cross-line pretty-printed verdict", () => {
+	const report = [
+		"Did the work: `{ a, b }` is the shape I used.",
+		"",
+		"{",
+		'  "ok": false,',
+		'  "reason": "two tests still red"',
+		"}",
+	].join("\n");
+	assert.deepEqual(extractVerdict(report), { ok: false, reason: "two tests still red" });
+});
+
+test("#311 extractVerdict: trailing prose after the verdict", () => {
+	// The verdict is NOT the last line, so the last-line candidate cannot answer
+	// this one: only the brace-balance scan reaches back past the trailing note.
+	const report = [
+		"The payload shape is `{ version, entries }`.",
+		'{"ok": true, "reason": "done"}',
+		"",
+		"Full diff is in the report above.",
+	].join("\n");
+	assert.deepEqual(extractVerdict(report), { ok: true, reason: "done" });
+});
+
+test("#311 extractVerdict: blank lines after the verdict", () => {
+	const report = `Shape is \`{ version, entries }\`.\n{"ok": true, "reason": "shipped"}\n\n\n`;
+	assert.deepEqual(extractVerdict(report), { ok: true, reason: "shipped" });
+});
+
+test("#311 extractVerdict: braces inside the verdict's own strings", () => {
+	// A reason that names a closing brace must not be mistaken for the object's
+	// end — the scan has to be string/escape aware.
+	const report = [
+		"Shape is `{ version, entries }`.",
+		'{"ok": true, "reason": "removed the stray } and the \\" quote"}',
+	].join("\n");
+	assert.deepEqual(extractVerdict(report), {
+		ok: true,
+		reason: 'removed the stray } and the " quote',
+	});
+});
+
+test("#311 extractVerdict: last line is the only candidate that can answer", () => {
+	// Prose opens a quote and a brace, and the verdict's reason closes a brace, so
+	// BOTH balance scans fail: masked sees the true `}` as in-string, plain counts
+	// the `}` inside the reason. Only the last-line candidate survives.
+	const report = [
+		'He said "{broken and the reviewer agreed.',
+		'{"ok": true, "reason": "closes } here"}',
+	].join("\n");
+	assert.deepEqual(extractVerdict(report), { ok: true, reason: "closes } here" });
+});
+
+test("#311 extractVerdict: masked balance can fail while plain balance still reads the verdict", () => {
+	// The prose's unbalanced quote flips the string mask, hiding the real `}`;
+	// the plain count still finds the object, and the trailing note means the
+	// last-line candidate cannot (the verdict is not the last line).
+	const report = [
+		'He said "{hi and left the quote open.',
+		'{"ok": true, "reason": "done"}',
+		"",
+		"That is all.",
+	].join("\n");
+	assert.deepEqual(extractVerdict(report), { ok: true, reason: "done" });
+});
+
+test("#311 extractVerdict: a report with no JSON still returns null", () => {
+	const report = [
+		"I looked at { the shape } and could not finish.",
+		"Stopping here — no verdict from me.",
+	].join("\n");
+	assert.equal(extractVerdict(report), null);
+});
+
 // ── Supplementary behaviour required by the spec text ─────────────────────────
 
 test("model_change header populates parsed.model before any assistant message", () => {

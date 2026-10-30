@@ -81,6 +81,21 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **A bare JSON verdict on the last line is no longer reported as `no machine-readable verdict`.**
+  `child-guard` injects “End with machine-readable JSON on its own” and `docs/design.md` says
+  `attested` is “解析末尾 verdict JSON”, but `extractVerdict` only knew three JSON candidates:
+  fenced blocks, `text.trim()`, and the span from the **first** `{` to the **last** `}`. One brace
+  anywhere in the report — an API shape, a code fragment, `{ version, entries }` — turned that span
+  into prose-plus-JSON, `JSON.parse` failed, and a perfectly valid verdict on the final line was
+  thrown away, so the child was recorded `acceptance: unknown` while a sibling whose verdict was
+  byte-identical but wrapped in a fence came back `accepted`. Two candidates are added after the
+  existing ones and before giving up: the **last line** when it is itself a JSON object (what the
+  injection asks for, and it survives trailing blank lines), and a **string/escape-aware brace
+  balance scan backwards from the text's last `}`**, which reaches a verdict that spans lines or is
+  followed by a short trailing note. The existing `\n\s+` collapsed-span compat candidate is kept,
+  moved last because it rewrites the text. Parsing never throws and a report with no JSON still
+  returns `null` (#311).
+
 - **A provider that ends a turn with no content no longer costs a child its whole turn.** Some
   upstreams answer HTTP 200 and then terminate the stream in-band; pi maps that to
   `stopReason: "error"` with an empty assistant message (`finish_reason: error`, measured with
