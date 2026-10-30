@@ -359,11 +359,19 @@ function sampleAgentConfig(agent?: AgentConfig): AgentConfig {
 }
 
 
-/** Fix text for inprocess model/provider gaps — never recommends PI_LEGION_CHILD_EXTENSIONS (#212). */
+/**
+ * Fix text for inprocess model/provider gaps (#212, #329).
+ *
+ * #329: same two levers as `spawn-hints.ts` (#317/#328) — `models.json`, or the
+ * `PI_LEGION_CHILD_EXTENSIONS` path list. The dead switch (`inheritExtensions: true`,
+ * `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`) must not come back here: `true` is the default
+ * policy since #280, so it changes nothing, and when host discovery fails it still yields
+ * 0 extensions — the very state doctor is reporting on.
+ */
 export function inprocessModelFix(): string {
 	return (
 		"Declare the provider statically in models.json (agent dir / project), " +
-		"or set role frontmatter extensions: […] / inheritExtensions: true."
+		`or pass the provider extension explicitly with ${CHILD_EXTENSIONS_ENV}=<path>.`
 	);
 }
 
@@ -372,7 +380,7 @@ function rpcChildExtensionsFix(providerExtHome: readonly string[]): string | und
 	if (providerExtHome.length) {
 		return `export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}`;
 	}
-	return `Add the provider package extension path to ${CHILD_EXTENSIONS_ENV}, or set role extensions: / inheritExtensions: true.`;
+	return `Add the provider package extension path to ${CHILD_EXTENSIONS_ENV}, or add it under the role's extensions: frontmatter.`;
 }
 
 function previewChildArgv(agent: AgentConfig, env: NodeJS.ProcessEnv): string[] {
@@ -1068,15 +1076,16 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		const modelIssue = issues.some((i) =>
 			i.code === "CHILD_NO_MODELS" || i.code === "TEAM_MODELS_MISSING" || i.code === "RECENT_MODEL_SPAWN_FAIL",
 		);
+		// #329: never name the dead inheritance switch here (see `inprocessModelFix`).
 		if (modelIssue && isInprocess) {
 			steps.push(
-				"Inprocess: declare the provider in models.json, or set role extensions: […] / inheritExtensions: true — then restart pi (#212).",
+				`Inprocess: declare the provider in models.json, or pass the provider extension with ${CHILD_EXTENSIONS_ENV}=<path> — then restart pi (#212).`,
 			);
 		} else if (modelIssue && providerExtHome.length) {
 			steps.push(`export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}  # then restart pi`);
-			steps.push(`# or role frontmatter extensions: […] / inheritExtensions: true (more RAM)`);
+			steps.push(`# or role frontmatter extensions: […] (role-scoped only)`);
 		} else if (modelIssue) {
-			steps.push(`# set role frontmatter extensions: […] / inheritExtensions: true, or export ${CHILD_EXTENSIONS_ENV}=<paths>`);
+			steps.push(`# set role frontmatter extensions: […], or export ${CHILD_EXTENSIONS_ENV}=<paths>`);
 		}
 		steps.push(...roleToolGateNextSteps(issues));
 		if (issues.some((i) => i.code === "MEMORY_GATE_WOULD_REFUSE")) {

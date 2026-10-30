@@ -23,6 +23,13 @@ function extensionsOf(args: string[]): string[] {
 	return args.flatMap((arg, i) => (arg === "--extension" ? [args[i + 1] ?? ""] : []));
 }
 
+/** The actionable tail of a report — the only region that carries advice. */
+function nextStepsBlock(text: string): string {
+	const at = text.indexOf("## Next steps (actionable)");
+	assert.ok(at >= 0, "precondition: the report has a next-steps block");
+	return text.slice(at);
+}
+
 test("parseListModels reads pi --list-models table", () => {
 	const out = parseListModels(`provider      model                               context  max-out  thinking  images
 any-endpoint  workbuddy/hy4-preview-ioa           960K     64K      yes       yes   
@@ -779,7 +786,7 @@ test("doctor verify concurrency: unlimited (0) skips slot inspection", () => {
 	}
 });
 
-test("#212 doctor inprocess: no PI_LEGION_CHILD_EXTENSIONS; models.json-style fix", () => {
+test("#212/#329 doctor inprocess: recommends models.json + CHILD_EXTENSIONS, never the dead switch", () => {
 	clearSpawnFailures();
 	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-212-"));
 	try {
@@ -853,14 +860,17 @@ test("#212 doctor inprocess: no PI_LEGION_CHILD_EXTENSIONS; models.json-style fi
 		assert.doesNotMatch(report.text, /export PI_LEGION_CHILD_EXTENSIONS=/);
 		assert.match(report.text, /spawnMode \(sample\/default\): inprocess/);
 		assert.match(report.text, /models\.json/);
-		assert.match(report.text, /inheritExtensions|extensions:/);
+		// #329: the policy is still *reported* — only the dead recommendation is gone.
+		assert.match(report.text, /inheritExtensions \(env\/role default\)/);
 		const team = report.issues.find((i) => i.code === "TEAM_MODELS_MISSING");
 		assert.ok(team?.fix);
-		assert.doesNotMatch(team!.fix!, /PI_LEGION_CHILD_EXTENSIONS/);
 		assert.match(team!.fix!, /models\.json/);
+		assert.match(team!.fix!, /PI_LEGION_CHILD_EXTENSIONS=<path>/);
+		assert.doesNotMatch(team!.fix!, /inheritExtensions|PI_LEGION_CHILD_INHERIT_EXTENSIONS/);
 		const recent = report.issues.find((i) => i.code === "RECENT_MODEL_SPAWN_FAIL");
 		assert.ok(recent?.fix);
-		assert.doesNotMatch(recent!.fix!, /PI_LEGION_CHILD_EXTENSIONS/);
+		assert.match(recent!.fix!, /PI_LEGION_CHILD_EXTENSIONS=<path>/);
+		assert.doesNotMatch(recent!.fix!, /inheritExtensions|PI_LEGION_CHILD_INHERIT_EXTENSIONS/);
 	} finally {
 		clearSpawnFailures();
 		rmSync(dir, { recursive: true, force: true });
@@ -916,6 +926,131 @@ test("#212 doctor rpc still recommends PI_LEGION_CHILD_EXTENSIONS", () => {
 		assert.ok(report.issues.some((i) => i.code === "CHILD_NO_MODELS"));
 		assert.match(report.text, /export PI_LEGION_CHILD_EXTENSIONS=/);
 		assert.match(report.text, /spawnMode \(sample\/default\): rpc/);
+		// #329: this case is the coverage for the edited "paths known" branch (`export …` +
+		// the role-frontmatter alternative). The dead switch must not ride along either.
+		assert.doesNotMatch(report.text, /inheritExtensions: true/);
+		assert.doesNotMatch(nextStepsBlock(report.text), /inheritExtensions|PI_LEGION_CHILD_INHERIT_EXTENSIONS/);
+		assert.match(nextStepsBlock(report.text), /role frontmatter extensions: \[…\] \(role-scoped only\)/);
+	} finally {
+		clearSpawnFailures();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ── #329: the dead inheritance switch stays out of doctor's advice ─────────
+
+/**
+ * #329: `inheritExtensions: true` / `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` are dead advice
+ * (#280 made `true` the default; #317 showed the switch yields 0 extensions when host
+ * discovery fails — the exact state doctor is diagnosing). #328 removed them from
+ * `spawn-hints.ts`; doctor is the second surface where the same child-failure hint lands.
+ *
+ * The Extensions section legitimately echoes the env value, which can be `=1` when a user
+ * still carries the old advice in their shell (`- PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`), so
+ * that one status line is stripped before the whole-text check: the *advice* must be clean,
+ * the report's honest state display is not advice.
+ */
+function assertNoDeadInheritanceAdvice(report: ReturnType<typeof runLegionDoctor>, where: string): void {
+	const adviceText = report.text.replace(/^- PI_LEGION_CHILD_INHERIT_EXTENSIONS=.*$/gm, "");
+	assert.doesNotMatch(adviceText, /inheritExtensions: true/, `${where}: the dead switch must not be printed`);
+	assert.doesNotMatch(
+		adviceText,
+		/PI_LEGION_CHILD_INHERIT_EXTENSIONS=1/,
+		`${where}: the dead env opt-in must not be printed`,
+	);
+	assert.doesNotMatch(
+		nextStepsBlock(report.text),
+		/inheritExtensions|PI_LEGION_CHILD_INHERIT_EXTENSIONS/,
+		`${where}: no next step may recommend the switch`,
+	);
+	for (const issue of report.issues) {
+		if (!issue.fix) continue;
+		assert.doesNotMatch(
+			issue.fix,
+			/inheritExtensions|PI_LEGION_CHILD_INHERIT_EXTENSIONS/,
+			`${where}: the ${issue.code} fix may not recommend the switch`,
+		);
+	}
+}
+
+test("#329: doctor never recommends inheritExtensions: true / PI_LEGION_CHILD_INHERIT_EXTENSIONS=1", () => {
+	clearSpawnFailures();
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-329-"));
+	try {
+		// No `settings.packages`, so `providerExtHome` is empty: the rpc branch then takes the
+		// "paths unknown" fallback, historically the second place that named the dead switch.
+		writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+		const sampleAgent = {
+			name: "scout",
+			description: "d",
+			kind: "pi" as const,
+			filePath: "/f.md",
+			tools: ["read", "bash"],
+			systemPrompt: "",
+			systemPromptMode: "replace" as const,
+			inheritProjectContext: true,
+			inheritSkills: false,
+			source: "user" as const,
+		};
+		const base = {
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: [],
+			expectedModels: ["missing-provider/no-such-model"],
+			agents: [sampleAgent],
+		};
+
+		// Inprocess: the default backend, where #212 originally said "no child extensions advice".
+		const inprocess = runLegionDoctor({
+			...base,
+			sampleAgent,
+			env: { ...process.env, PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined },
+			failures: [
+				{
+					ts: Date.now(),
+					name: "scout-0",
+					message: "inprocess model resolve failed for 'workbuddy/hy4'",
+					stderr: "Unknown provider: workbuddy",
+					spawnMode: "inprocess" as const,
+					hadNoExtensions: false,
+				},
+			],
+		});
+		assert.ok(inprocess.issues.some((i) => i.code === "TEAM_MODELS_MISSING"), "precondition: model advice is present");
+		assert.ok(inprocess.issues.some((i) => i.code === "RECENT_MODEL_SPAWN_FAIL"));
+		assertNoDeadInheritanceAdvice(inprocess, "inprocess");
+		assert.match(
+			nextStepsBlock(inprocess.text),
+			/PI_LEGION_CHILD_EXTENSIONS=<path>/,
+			"the advice names the lever that actually loads the provider",
+		);
+
+		// rpc with unknown provider paths: `rpcChildExtensionsFix` must not fall back to the switch.
+		const rpc = runLegionDoctor({
+			...base,
+			sampleAgent: { ...sampleAgent, spawnMode: "rpc" as const },
+			// `0` is the real opt-out, and CHILD_NO_MODELS only fires when inheritance is off.
+			env: { ...process.env, PI_LEGION_CHILD_INHERIT_EXTENSIONS: "0", PI_LEGION_CHILD_EXTENSIONS: undefined },
+		});
+		assert.ok(rpc.issues.some((i) => i.code === "CHILD_NO_MODELS"), "precondition: rpc model advice is present");
+		assertNoDeadInheritanceAdvice(rpc, "rpc");
+		assert.match(nextStepsBlock(rpc.text), /PI_LEGION_CHILD_EXTENSIONS=<paths>/);
+
+		// A user who still carries the old advice in their shell: the Extensions section echoes
+		// `- PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`, which is a status line, not a recommendation.
+		// The helper strips exactly that line — pin both halves so the strip is not decorative.
+		const stillExported = runLegionDoctor({
+			...base,
+			sampleAgent,
+			env: { ...process.env, PI_LEGION_CHILD_INHERIT_EXTENSIONS: "1", PI_LEGION_CHILD_EXTENSIONS: undefined },
+		});
+		assert.match(
+			stillExported.text,
+			/^- PI_LEGION_CHILD_INHERIT_EXTENSIONS=1$/m,
+			"precondition: the state echo really can print the old value",
+		);
+		assertNoDeadInheritanceAdvice(stillExported, "inprocess with the old switch exported");
 	} finally {
 		clearSpawnFailures();
 		rmSync(dir, { recursive: true, force: true });

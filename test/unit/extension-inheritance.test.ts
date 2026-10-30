@@ -963,24 +963,34 @@ test("#317: the production path — no injected status — reads the shared disc
 			await ensureHostExtensions();
 			assert.equal(hostExtensionDiscoveryState().status, "failed", "precondition: the probe failed");
 
-			// The state is shared through `globalThis[Symbol.for(...)]`, i.e. it survives
-			// module re-evaluation: a second, distinct instance of spawn-hints.ts (what a
-			// re-loaded extension or a different jiti module instance gets) must see the
-			// very same holder.
+			// The state lives on `globalThis[Symbol.for(...)]`, i.e. it survives module
+			// re-evaluation — that is the only reason a re-loaded extension or a different
+			// jiti module instance can see what this process already discovered.
 			const holder = discoveryStore() as { failedAt?: number } | undefined;
 			assert.equal(typeof holder?.failedAt, "number", "the state lives on the shared holder");
-			const freshSpecifier = "../../src/extension/spawn-hints.ts?fresh=1";
-			const fresh = (await import(freshSpecifier)) as typeof import("../../src/extension/spawn-hints.ts");
-			assert.equal(typeof fresh.spawnFailureHint, "function", "precondition: a distinct module instance");
+			// #329: `import("../../src/extension/spawn-hints.ts?fresh=1")` used to stand here and
+			// proved nothing: ESM drops the query when resolving that module's own relative
+			// imports, so it re-evaluated spawn-hints but got the SAME extension-inheritance
+			// instance — a module-local store stayed green. Re-evaluate the module that OWNS the
+			// holder instead: a second instance must read the failure the first one wrote.
+			// (Non-literal specifier so TypeScript does not try to resolve the query.)
+			const freshSpecifier = "../../src/runs/extension-inheritance.ts?fresh=1";
+			const fresh = (await import(freshSpecifier)) as typeof import("../../src/runs/extension-inheritance.ts");
+			assert.notEqual(
+				fresh.hostExtensionDiscoveryState,
+				hostExtensionDiscoveryState,
+				"precondition: this really is a second module instance",
+			);
+			assert.equal(
+				fresh.hostExtensionDiscoveryState().status,
+				"failed",
+				"a second instance of the owner module reads the same shared holder",
+			);
 
-			for (const hint of [
-				spawnFailureHint({ stderr: "Unknown provider: workbuddy/hy4", spawnMode: "inprocess" }),
-				fresh.spawnFailureHint({ stderr: "Unknown provider: workbuddy/hy4", spawnMode: "inprocess" }),
-			]) {
-				assert.ok(hint);
-				assert.match(hint!, /host discovery is failed/, "the un-injected path reads the real state");
-				assert.match(hint!, /the child got 0 host extensions/);
-			}
+			const hint = spawnFailureHint({ stderr: "Unknown provider: workbuddy/hy4", spawnMode: "inprocess" });
+			assert.ok(hint);
+			assert.match(hint!, /host discovery is failed/, "the un-injected path reads the real state");
+			assert.match(hint!, /the child got 0 host extensions/);
 		});
 	} finally {
 		log.restore();

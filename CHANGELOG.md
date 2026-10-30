@@ -131,6 +131,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **`/legion doctor` stopped recommending the dead extension switch (#329).** `inheritExtensions: true`
+  and `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` outlived #328's clean-up in `legion-doctor.ts`: `true` has been
+  the default since #280 and both yield 0 extensions when host discovery fails, so every doctor fix and
+  next step now names only `models.json` / `PI_LEGION_CHILD_EXTENSIONS=<path>`, with a case that pins it.
+  The `?fresh=1` half of the #317 case re-evaluated the wrong module (ESM drops the query when resolving a
+  relative import), so it now re-evaluates `extension-inheritance.ts` and asserts that a second instance
+  reads the shared discovery holder.
 - **The `/legion` track view now paints its own page background, so the detail modal no longer sits
   on a black vertical stripe (#308).** Opening a node's context viewer put a pure-black band between
   the frame's right edge and the terminal's right edge (the left side looked fine). The frame was not
