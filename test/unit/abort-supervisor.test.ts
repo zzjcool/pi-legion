@@ -80,10 +80,24 @@ function bounded<T>(call: Promise<T>, what = "abort()"): Promise<T> {
 interface AbortHarness {
 	readonly supervisor: Pick<
 		LegionSupervisor,
-		"abort" | "isAlive" | "retire" | "waitSettled"
+		"abort" | "steer" | "isAlive" | "retire" | "waitSettled"
 	>;
 	readonly name: string;
 	readonly log: AbortLog;
+	/** Texts that reached the child through the **steer** seam, in call order. */
+	readonly steers: string[];
+	/** Texts that were sent as a fresh **prompt**, in call order. */
+	readonly prompts: string[];
+	/**
+	 * The backend's own record for this child, read straight off the supervisor's
+	 * record map.
+	 *
+	 * `stats()` cannot answer this: it returns `null` for a child with nothing to
+	 * report (these fakes report no usage) exactly as it does for one that is no
+	 * longer alive, so `retired` is only observable where the state machine writes
+	 * it. `undefined` means the child is gone from the registry entirely.
+	 */
+	turnState(): string | undefined;
 	/** Raw value the next `clearQueue` call answers with. */
 	setClearQueueResult(value: unknown): void;
 	/** Make the queue clear reject outright. */
@@ -190,6 +204,9 @@ class FakeAbortClient implements RpcClientLike {
 	clearQueueRejectsAfterMs = 0;
 	/** A never-settling interrupt request (the "child ignores cancellation" case). */
 	abortHangs = false;
+	/** Which seam the supervisor used for a text: the steer one, or a prompt. */
+	readonly steers: string[] = [];
+	readonly prompts: string[] = [];
 	private readonly events = new Set<(event: unknown) => void>();
 	private readonly log: AbortLog;
 
@@ -206,13 +223,15 @@ class FakeAbortClient implements RpcClientLike {
 		return () => this.events.delete(listener);
 	}
 
-	async prompt(): Promise<unknown> {
+	async prompt(text: string): Promise<unknown> {
+		this.prompts.push(text);
 		// `undefined` is what an older backend answers for a prompt, i.e. "a run
 		// started" — the spawn must treat it as accepted, not intercepted.
 		return undefined;
 	}
 
-	async steer(): Promise<unknown> {
+	async steer(text: string): Promise<unknown> {
+		this.steers.push(text);
 		return "queued";
 	}
 
@@ -271,6 +290,13 @@ async function rpcHarness(): Promise<AbortHarness> {
 		supervisor,
 		name,
 		log,
+		steers: clients[0]!.steers,
+		prompts: clients[0]!.prompts,
+		turnState() {
+			return (
+				supervisor as unknown as { children: Map<string, { state?: string }> }
+			).children.get(name)?.state;
+		},
 		setClearQueueResult(value) {
 			clients[0]!.clearQueueResult = value;
 		},
@@ -310,6 +336,9 @@ class FakeAbortSession implements InProcessSession {
 	/** A clear that rejects only after this many ms — the bound answers first. */
 	clearQueueRejectsAfterMs = 0;
 	abortHangs = false;
+	/** Which seam the supervisor used for a text: the steer one, or a prompt. */
+	readonly steers: string[] = [];
+	readonly prompts: string[] = [];
 	private readonly listeners = new Set<(event: unknown) => void>();
 	private readonly log: AbortLog;
 
@@ -322,7 +351,8 @@ class FakeAbortSession implements InProcessSession {
 		return () => this.listeners.delete(listener);
 	}
 
-	async prompt(): Promise<unknown> {
+	async prompt(text: string): Promise<unknown> {
+		this.prompts.push(text);
 		// The SDK emits the turn's opening events before `prompt()` resolves, and
 		// `spawnChild` returns once the prompt is accepted (not when it ends), so
 		// the child is left in an ACTIVE turn — the state abort cares about.
@@ -331,7 +361,8 @@ class FakeAbortSession implements InProcessSession {
 		return undefined;
 	}
 
-	async steer(): Promise<unknown> {
+	async steer(text: string): Promise<unknown> {
+		this.steers.push(text);
 		return "queued";
 	}
 
@@ -390,6 +421,13 @@ async function inprocessHarness(): Promise<AbortHarness> {
 		supervisor,
 		name,
 		log,
+		steers: sessions[0]!.steers,
+		prompts: sessions[0]!.prompts,
+		turnState() {
+			return (
+				supervisor as unknown as { children: Map<string, { state?: string }> }
+			).children.get(name)?.state;
+		},
 		setClearQueueResult(value) {
 			sessions[0]!.clearQueueResultSink.value = value;
 		},
@@ -752,6 +790,159 @@ async function assertJunkTimeoutIsNormalized(
 	}
 }
 
+/*
+ * #314 acceptance (issue wording): "after an abort, `status` shows idle/running
+ * rather than retired, and the child can still be driven with `steer`/`prompt`".
+ *
+ * `isAlive === true` is necessary but not the whole claim: an abort that left the
+ * child registered and mute, or one that wrote a fake end-of-turn, keeps
+ * `isAlive` true as well. So this case drives the child through the same entry
+ * point a caller would, on both sides of the settle:
+ *
+ *  1. steered while the interrupted turn is still winding down, the text takes
+ *     the **steer** seam (`session.steers` / `client.steers`) — which is only
+ *     true while `turnActive` is still set, i.e. `abort` did not fabricate the
+ *     end of a turn whose own settle event has not arrived (#314 D4);
+ *  2. steered again after the child's own `agent_settled`, the same call starts a
+ *     fresh turn (`"accepted"`), so the child is not merely reachable but usable.
+ *
+ * A child that `abort` had retired throws `NOT_FOUND` at step 1 and never reaches
+ * step 2 — the regression this case exists for.
+ */
+async function assertStillDrivableAfterAbort(
+	makeHarness: MakeHarness,
+): Promise<void> {
+	const h = await makeHarness();
+	try {
+		h.setClearQueueResult({ steering: ["s1"], followUp: [] });
+		const outcome = await bounded(h.supervisor.abort(h.name));
+		assert.equal(outcome.status, "interrupted");
+		// Not retired, not unnamed, not dead: the abort only interrupted.
+		assert.equal(h.supervisor.isAlive(h.name), true);
+		assert.notEqual(h.turnState(), "retired");
+		assert.equal(h.turnState(), "running");
+
+		// 1) mid-turn: the steer seam receives the text, and no prompt is sent.
+		const promptsBefore = h.prompts.length;
+		const queued = await h.supervisor.steer(h.name, "take this after the abort");
+		assert.equal(queued, "queued");
+		assert.deepEqual(h.steers, ["take this after the abort"]);
+		assert.equal(
+			h.prompts.length,
+			promptsBefore,
+			"a busy child is steered, never re-prompted",
+		);
+
+		// The interrupted turn ends the way it does in production: on the child's
+		// own event, never on anything the abort handed back.
+		h.settle();
+		assert.equal(h.turnState(), "idle");
+		assert.equal(h.supervisor.isAlive(h.name), true);
+
+		// 2) now idle: the same entry point starts a new turn instead of refusing.
+		const accepted = await h.supervisor.steer(h.name, "next turn after abort");
+		assert.equal(accepted, "accepted");
+		assert.equal(h.prompts[h.prompts.length - 1], "next turn after abort");
+		assert.equal(h.turnState(), "running");
+		assert.equal(h.supervisor.isAlive(h.name), true);
+	} finally {
+		h.close();
+	}
+}
+
+/**
+ * #314 D4: both bounded races clear their timer on the settling path.
+ *
+ * `assertDefaultBound` above only observes the delay handed to `setTimeout`, so
+ * deleting `.finally(clearTimeout)` from either race keeps it green — the timer
+ * is ref'd, and the sole symptom is the test process lingering for one bound
+ * ("still green, just slower"). This case pins the call itself on BOTH paths,
+ * the way `supervisor.test.ts` pins the `waitSettled` guard:
+ *
+ *  - success: both steps settle immediately, so both timers are armed and cleared
+ *    within one tick and only the calls are observable;
+ *  - timeout: the timers fire (that is what answers the caller) and the settling
+ *    path must still clear them.
+ *
+ * Timer identity is compared by handle, so a `clearTimeout` aimed at some other
+ * timer cannot satisfy the assertion. The timeout path asks for a bound nothing
+ * else in this file uses, so no unrelated timer can be mistaken for abort's two.
+ */
+async function assertAbortClearsItsTimers(
+	makeHarness: MakeHarness,
+): Promise<void> {
+	const h = await makeHarness();
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	/** Distinctive marker delay: no other timer in this file asks for it. */
+	const TIMEOUT_PATH_BOUND_MS = 37;
+	let recording = false;
+	let armed: { timer: ReturnType<typeof setTimeout>; delay: number }[] = [];
+	const cleared = new Set<unknown>();
+	try {
+		globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => {
+			const timer = originalSetTimeout(...args);
+			if (recording && typeof args[1] === "number") {
+				armed.push({ timer, delay: args[1] });
+			}
+			return timer;
+		}) as typeof setTimeout;
+		globalThis.clearTimeout = ((handle?: Parameters<typeof clearTimeout>[0]) => {
+			cleared.add(handle);
+			return originalClearTimeout(handle);
+		}) as typeof clearTimeout;
+		const armedFor = (delay: number): typeof armed =>
+			armed.filter((entry) => entry.delay === delay);
+		const clearedAmong = (timers: typeof armed): number =>
+			timers.filter((entry) => cleared.has(entry.timer)).length;
+
+		// Path 1 — success. (`armed` is reset per path; `bounded`'s own 4s guard is
+		// filtered out by delay, not by ordering.)
+		recording = true;
+		armed = [];
+		const outcome = await bounded(h.supervisor.abort(h.name));
+		recording = false;
+		assert.equal(outcome.status, "interrupted");
+		const successTimers = armedFor(DEFAULT_ABORT_TIMEOUT_MS);
+		assert.equal(
+			successTimers.length,
+			2,
+			"one timer for the queue clear, one for the interrupt",
+		);
+		assert.equal(
+			clearedAmong(successTimers),
+			2,
+			"a successful abort clears both of its timers",
+		);
+
+		// Path 2 — timeout: the timers fire, and the settling path clears them anyway.
+		h.hangClearQueue();
+		h.hangAbort();
+		recording = true;
+		armed = [];
+		const timedOut = await bounded(
+			h.supervisor.abort(h.name, { timeoutMs: TIMEOUT_PATH_BOUND_MS }),
+		);
+		recording = false;
+		assert.equal(timedOut.status, "timeout");
+		const timeoutTimers = armedFor(TIMEOUT_PATH_BOUND_MS);
+		assert.equal(
+			timeoutTimers.length,
+			2,
+			"the timeout path arms the same two bounds",
+		);
+		assert.equal(
+			clearedAmong(timeoutTimers),
+			2,
+			"a timed-out abort clears both of its timers too",
+		);
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+		globalThis.clearTimeout = originalClearTimeout;
+		h.close();
+	}
+}
+
 /* ------------------------------------------------------------------ *
  * RPC backend
  * ------------------------------------------------------------------ */
@@ -789,6 +980,12 @@ test("abort rpc: a clear that rejects after the bound still reports interrupted"
 test("abort rpc: a junk timeoutMs falls back to the shared bound", () =>
 	assertJunkTimeoutIsNormalized(rpcHarness));
 
+test("abort rpc: the child is still drivable afterwards (steer, then a new turn)", () =>
+	assertStillDrivableAfterAbort(rpcHarness));
+
+test("abort rpc: both the success and the timeout path clear their timers", () =>
+	assertAbortClearsItsTimers(rpcHarness));
+
 /* ------------------------------------------------------------------ *
  * In-process backend
  * ------------------------------------------------------------------ */
@@ -825,6 +1022,12 @@ test("abort inprocess: a clear that rejects after the bound still reports interr
 
 test("abort inprocess: a junk timeoutMs falls back to the shared bound", () =>
 	assertJunkTimeoutIsNormalized(inprocessHarness));
+
+test("abort inprocess: the child is still drivable afterwards (steer, then a new turn)", () =>
+	assertStillDrivableAfterAbort(inprocessHarness));
+
+test("abort inprocess: both the success and the timeout path clear their timers", () =>
+	assertAbortClearsItsTimers(inprocessHarness));
 
 /* ------------------------------------------------------------------ *
  * Routing (D8)
