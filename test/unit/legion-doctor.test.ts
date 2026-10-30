@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
@@ -918,6 +918,97 @@ test("#212 doctor rpc still recommends PI_LEGION_CHILD_EXTENSIONS", () => {
 		assert.match(report.text, /spawnMode \(sample\/default\): rpc/);
 	} finally {
 		clearSpawnFailures();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ── #317: doctor answers "is inheritance actually wired?" ────────────────────
+
+/**
+ * A `pi` shim on PATH for discovery: either reports one package dir (so the
+ * resolved set has exactly one entry) or fails with stderr, which is the only
+ * honest way to drive `pi list` (same shape as the #70 case above).
+ */
+function discoveryPiHost(options: { fail?: boolean } = {}): {
+	pathValue: string;
+	piCalls: () => number;
+	cleanup(): void;
+} {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-doctor-disc-"));
+	const pkg = path.join(root, "npm", "node_modules", "pi-lens");
+	mkdirSync(pkg, { recursive: true });
+	writeFileSync(path.join(pkg, "index.ts"), "export default {};\n");
+	const bin = path.join(root, "bin");
+	mkdirSync(bin, { recursive: true });
+	const calls = path.join(root, "calls.log");
+	const script = options.fail
+		? ["#!/bin/sh", `echo "pi $*" >> ${JSON.stringify(calls)}`, 'echo "pi list exploded" 1>&2', "exit 4"]
+		: ["#!/bin/sh", `echo "pi $*" >> ${JSON.stringify(calls)}`, 'echo "User packages:"', `echo "    ${pkg}"`];
+	writeFileSync(path.join(bin, "pi"), script.join("\n") + "\n");
+	chmodSync(path.join(bin, "pi"), 0o755);
+	return {
+		pathValue: `${bin}${path.delimiter}${process.env.PATH ?? ""}`,
+		piCalls: () => (existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter(Boolean).length : 0),
+		cleanup: () => rmSync(root, { recursive: true, force: true }),
+	};
+}
+
+test("#317: doctor shows whether host discovery is ok, failed or never probed", async () => {
+	const prevPath = process.env.PATH;
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-317-"));
+	writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ packages: [] }));
+	const doctorText = (): string =>
+		runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			hostModels: ["any-endpoint/x"],
+			childModels: ["any-endpoint/x"],
+			expectedModels: ["x"],
+			sections: ["extensions"],
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+		}).text;
+	// The discovery failure warning is expected here; keep the test output clean
+	// without hiding it from other cases.
+	const originalError = console.error;
+	console.error = () => {};
+	try {
+		// 1) Cold process: doctor must NOT probe on its own (that would cost 0.3–0.9 s
+		//    per doctor run), so the honest answer is `never`.
+		resetExtensionDiscoveryCache();
+		assert.match(doctorText(), /discovered host extensions: 0 \(last probe: never\)/);
+
+		// 2) A failed probe: the count alone looked identical to "empty host" before.
+		const failing = discoveryPiHost({ fail: true });
+		try {
+			process.env.PATH = failing.pathValue;
+			resetExtensionDiscoveryCache();
+			await ensureHostExtensions();
+			assert.match(doctorText(), /discovered host extensions: 0 \(last probe: failed \d+s ago\)/);
+		} finally {
+			failing.cleanup();
+		}
+
+		// 3) A successful probe: the count is the resolved set.
+		const host = discoveryPiHost();
+		try {
+			process.env.PATH = host.pathValue;
+			resetExtensionDiscoveryCache();
+			await ensureHostExtensions();
+			assert.match(doctorText(), /discovered host extensions: 1 \(last probe: ok\)/);
+			// doctor must stay passive: exactly the one warm probe, no extra `pi list`.
+			assert.equal(host.piCalls(), 1, "doctor reports the state, it does not probe it");
+		} finally {
+			host.cleanup();
+		}
+	} finally {
+		console.error = originalError;
+		resetExtensionDiscoveryCache();
+		if (prevPath === undefined) delete process.env.PATH;
+		else process.env.PATH = prevPath;
 		rmSync(dir, { recursive: true, force: true });
 	}
 });

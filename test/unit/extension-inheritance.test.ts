@@ -15,6 +15,7 @@ import {
 	childInheritsExtensions,
 	discoveredHostExtensions,
 	ensureHostExtensions,
+	hostExtensionDiscoveryState,
 	inheritedExtensions,
 	matchesExcludedExtension,
 	parsePiList,
@@ -176,6 +177,8 @@ function fakeHost(
 	options: {
 		failFirst?: boolean;
 		alwaysFail?: boolean;
+		/** Text the failing shim writes to stderr before exiting non-zero. */
+		failMessage?: string;
 		/** Replace the default `index.ts` layout; return the entry the package resolves to. */
 		layout?: (pkgDir: string) => string;
 	} = {},
@@ -197,6 +200,7 @@ function fakeHost(
 		[
 			"#!/bin/sh",
 			`echo "pi $*" >> ${JSON.stringify(logPath)}`,
+			...(options.failMessage ? [`echo ${JSON.stringify(options.failMessage)} 1>&2`] : []),
 			...(options.alwaysFail ? ["exit 4"] : []),
 			`if [ -f ${JSON.stringify(failMarker)} ]; then rm -f ${JSON.stringify(failMarker)}; exit 3; fi`,
 			'echo "User packages:"',
@@ -805,6 +809,125 @@ test("A22: the success path is unchanged by the failure backoff", async () => {
 			assert.equal(host.piCalls(), 1, "success is cached; the new backoff must never add a probe");
 			const holder = discoveryStore() as { failedAt?: number } | undefined;
 			assert.equal(holder?.failedAt, undefined, "a success records no failure stamp");
+		});
+	} finally {
+		host.cleanup();
+	}
+});
+
+// ── #317: discovery failure is visible, and its state is introspectable ─────
+
+/** Capture `console.error` lines (the project's log channel) for one case. */
+function captureConsoleError(): { lines: string[]; restore(): void } {
+	const lines: string[] = [];
+	const original = console.error;
+	console.error = (...args: unknown[]) => {
+		lines.push(args.map((arg) => (typeof arg === "string" ? arg : String(arg))).join(" "));
+	};
+	return {
+		lines,
+		restore() {
+			console.error = original;
+		},
+	};
+}
+
+test("#317: a failed discovery warns exactly once, with the `pi list` stderr", async () => {
+	const host = fakeHost({ alwaysFail: true, failMessage: "boom: pi list is broken" });
+	const log = captureConsoleError();
+	try {
+		await withHostEnv(host, {}, async () => {
+			assert.deepEqual(await ensureHostExtensions(), [], "the failure still degrades to no extensions");
+			assert.equal(host.piCalls(), 1, "precondition: exactly one probe ran");
+			assert.equal(log.lines.length, 1, `expected one warning, got ${JSON.stringify(log.lines)}`);
+			assert.match(log.lines[0]!, /^\[pi-legion\] host extension discovery failed/, "project log prefix");
+			assert.match(log.lines[0]!, /boom: pi list is broken/, "the warning carries the stderr summary");
+			assert.match(log.lines[0]!, /\/legion doctor|PI_LEGION_CHILD_EXTENSIONS/, "and says what to do");
+
+			// Inside the backoff window nothing re-probes, so nothing can re-warn.
+			assert.deepEqual(await ensureHostExtensions(), []);
+			assert.equal(host.piCalls(), 1, "the R2-b backoff is untouched");
+			assert.equal(log.lines.length, 1, "no warning per warm call");
+
+			// Past the window the probe is retried (never-reject stays recoverable),
+			// and the same failure episode still must not spam a second warning: the
+			// `failedAt` stamp is the already-told bit.
+			expireFailureBackoff();
+			assert.deepEqual(await ensureHostExtensions(), []);
+			assert.equal(host.piCalls(), 2, "the failure is still retried after FAILURE_TTL_MS (F23)");
+			assert.equal(log.lines.length, 1, "a repeated failure does not warn twice");
+		});
+	} finally {
+		log.restore();
+		host.cleanup();
+	}
+});
+
+test("#317: an empty `pi list` stderr still warns and never throws", async () => {
+	// No failMessage: the shim exits 4 with no stderr at all. The warning must
+	// degrade to another bounded description instead of throwing on `undefined`.
+	const host = fakeHost({ alwaysFail: true });
+	const log = captureConsoleError();
+	try {
+		await withHostEnv(host, {}, async () => {
+			assert.deepEqual(await ensureHostExtensions(), []);
+			assert.equal(log.lines.length, 1, `expected one warning, got ${JSON.stringify(log.lines)}`);
+			// The reason after the colon must be non-empty: with no stderr the summary
+			// degrades to `error.message` / the exit code instead of printing nothing.
+			assert.match(log.lines[0]!, /failed \(pi list\): [^.\s]/, "a reason is still reported");
+			assert.equal(log.lines[0]!.includes("undefined"), false, "no `undefined` leaked into the message");
+		});
+	} finally {
+		log.restore();
+		host.cleanup();
+	}
+});
+
+test("#317: hostExtensionDiscoveryState separates ok / failed / never probed", async () => {
+	resetExtensionDiscoveryCache();
+	assert.deepEqual(
+		hostExtensionDiscoveryState(),
+		{ status: "unknown", count: 0 },
+		"never probed is its own state, not an empty host",
+	);
+
+	const failing = fakeHost({ alwaysFail: true });
+	const log = captureConsoleError();
+	try {
+		await withHostEnv(failing, {}, async () => {
+			await ensureHostExtensions();
+			const state = hostExtensionDiscoveryState();
+			assert.equal(state.status, "failed", "a failed probe is not reported as an empty host");
+			assert.equal(state.count, 0);
+			assert.equal(typeof state.at, "number", "the stamp doctor renders as `<n>s ago`");
+			assert.ok(Math.abs(Date.now() - state.at!) < 60_000, "and it is the time of THIS probe");
+		});
+	} finally {
+		log.restore();
+		failing.cleanup();
+	}
+
+	// A host that really ships no extension package resolves successfully to 0 —
+	// `ok` with count 0 must stay distinguishable from `failed`.
+	const empty = fakeHost({ layout: () => "" });
+	try {
+		await withHostEnv(empty, {}, async () => {
+			assert.deepEqual(await ensureHostExtensions(), []);
+			assert.deepEqual(
+				hostExtensionDiscoveryState(),
+				{ status: "ok", count: 0 },
+				"an empty host is `ok`, not `failed`",
+			);
+		});
+	} finally {
+		empty.cleanup();
+	}
+
+	const host = fakeHost();
+	try {
+		await withHostEnv(host, {}, async () => {
+			assert.deepEqual(await ensureHostExtensions(), [host.entry]);
+			assert.deepEqual(hostExtensionDiscoveryState(), { status: "ok", count: 1 });
 		});
 	} finally {
 		host.cleanup();
