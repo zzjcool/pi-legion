@@ -23,8 +23,9 @@ import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
-import type { AbortOutcome, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
+import type { AbortOutcome, ChildActivity, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
 import { DEFAULT_ABORT_TIMEOUT_MS } from "./src/supervisor/types.ts";
+import { withInFlightToolLine } from "./src/extension/legion-status.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
 import {
@@ -1374,6 +1375,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				// child launched elsewhere, so a foreign record needs the owner marker.
 				// Undefined while alive — liveness already wins there.
 				const owner = ownerVerdictFor(store, runs, child.name, alive);
+				// #315: same display-only activity fact `subagent status` prints, so the
+				// slash command cannot drift from the tool surface.
+				const activity = supervisor.inFlightTool?.(child.name);
 				return {
 					name: child.name,
 					state: child.state,
@@ -1389,6 +1393,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					...(child.spawnMode ? { spawnMode: child.spawnMode } : {}),
 					alive,
 					...(owner ? { owner } : {}),
+					...(activity ? { activity } : {}),
 				};
 			} catch {
 				return undefined;
@@ -1869,8 +1874,8 @@ async function controlAction(input: {
 			// Liveness facts are read once per name and reused by both the filter and
 			// the block, so `status` cannot classify a child one way and render it
 			// another (display-liveness D6 exit 1).
-			const factsByName = new Map<string, StatusLivenessFacts & { pid?: number }>();
-			const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number } => {
+			const factsByName = new Map<string, StatusLivenessFacts & { pid?: number; activity?: ChildActivity }>();
+			const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; activity?: ChildActivity } => {
 				const cached = factsByName.get(child.name);
 				if (cached) return cached;
 				const alive = input.supervisor.isAlive(child.name);
@@ -1878,17 +1883,33 @@ async function controlAction(input: {
 				// A pid only exists for a child this process actually tracks; a
 				// record from another session has none, and none is invented.
 				const pid = input.runtime.get(child.name)?.pid;
-				const facts = { alive, ...(owner ? { owner } : {}), ...(pid ? { pid } : {}) };
+				// #315: same rule for the in-flight tool — only this process's live
+				// backend can answer, and `undefined` renders no line.
+				const activity = input.supervisor.inFlightTool?.(child.name);
+				const facts = {
+					alive,
+					...(owner ? { owner } : {}),
+					...(pid ? { pid } : {}),
+					...(activity ? { activity } : {}),
+				};
 				factsByName.set(child.name, facts);
 				return facts;
 			};
 			const classified = classifyChildrenForStatus(runs, factsFor);
+			const now = Date.now();
 			return ok(
 				renderStatusOverview(
 					classified.map(({ child, live }) => {
-						const { pid, ...facts } = factsFor(child);
-						return { child, ...facts, ...(pid ? { pid } : {}), live };
+						const { pid, activity, ...facts } = factsFor(child);
+						return {
+							child,
+							...facts,
+							...(pid ? { pid } : {}),
+							...(activity ? { activity } : {}),
+							live,
+						};
 					}),
+					now,
 				),
 			);
 		}
@@ -1904,7 +1925,9 @@ async function controlAction(input: {
 		if (!found) return unknownChild(params.name, store, cwd, input.callerCwd);
 		const alive = input.supervisor.isAlive(params.name);
 		const owner = ownerVerdictFor(store, runs, params.name, alive);
-		return ok(renderLiveChildStatus({
+		// #315: what it is doing and for how long, prepended to the block when this
+		// process is actually running a tool for it.
+		const snapshot = renderLiveChildStatus({
 			name: found.child.name,
 			state: found.child.state,
 			agent: found.child.agent,
@@ -1915,7 +1938,9 @@ async function controlAction(input: {
 			spawnMode: found.child.spawnMode,
 			alive,
 			...(owner ? { owner } : {}),
-		}));
+		});
+		const activity = input.supervisor.inFlightTool?.(found.child.name);
+		return ok(withInFlightToolLine(snapshot, activity, Date.now()));
 	}
 
 	if (!params.name) {
@@ -4022,26 +4047,35 @@ export interface StatusChildEntry {
 	 * hold live children keep their meaning.
 	 */
 	live?: boolean;
+	/**
+	 * Tool call in flight right now (#315). Supplied by the supervisor; absent
+	 * means no activity fact, which renders no line at all.
+	 */
+	activity?: ChildActivity;
 }
 
 /** Multi-child status text: one {@link renderLiveChildStatus} block per child. */
-export function renderStatusOverview(children: StatusChildEntry[]): string {
+export function renderStatusOverview(children: StatusChildEntry[], now: number = Date.now()): string {
 	const deadCount = children.filter((entry) => entry.live === false).length;
 	const liveCount = children.length - deadCount;
-	const blocks = children.map(({ child, alive, owner, pid }) =>
-		renderLiveChildStatus({
-			name: child.name,
-			state: child.state,
-			agent: child.agent,
-			kind: child.kind,
-			sessionFile: child.sessionFile,
-			execution: child.execution,
-			acceptance: child.acceptance,
-			spawnMode: child.spawnMode,
-			alive,
-			...(owner ? { owner } : {}),
-			...(pid ? { pid } : {}),
-		}),
+	const blocks = children.map(({ child, alive, owner, pid, activity }) =>
+		withInFlightToolLine(
+			renderLiveChildStatus({
+				name: child.name,
+				state: child.state,
+				agent: child.agent,
+				kind: child.kind,
+				sessionFile: child.sessionFile,
+				execution: child.execution,
+				acceptance: child.acceptance,
+				spawnMode: child.spawnMode,
+				alive,
+				...(owner ? { owner } : {}),
+				...(pid ? { pid } : {}),
+			}),
+			activity,
+			now,
+		),
 	);
 	const parts: string[] = [];
 	if (liveCount === 0) {

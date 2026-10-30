@@ -194,6 +194,125 @@ export function countClearedQueue(raw: unknown): {
 	};
 }
 
+/**
+ * A tool call a child is inside right now (#315).
+ *
+ * `startedAt` is the HOST clock reading taken when the child's own
+ * `tool_execution_start` event arrived. Elapsed time is always
+ * `Date.now() - startedAt`, i.e. one clock family measuring an age — never two
+ * writers' timestamps arbitrated against each other (display-liveness D3).
+ */
+export interface ChildActivity {
+	/** Tool name exactly as the child's event stream reported it. */
+	readonly tool: string;
+	/** Host `Date.now()` when the start event arrived. */
+	readonly startedAt: number;
+	/**
+	 * Tool call id, when the child's event carried one. Used for exactly one
+	 * thing: matching the end event to the start it belongs to, so a parallel
+	 * call finishing cannot clear a different call still running.
+	 */
+	readonly toolCallId?: string;
+}
+
+/**
+ * A single tool call running at or past this bound gets a display-only marker
+ * (#315).
+ *
+ * Five minutes is chosen against the observable alternative: a child that stops
+ * making progress is currently invisible until its `collect` deadline (900s by
+ * default), because liveness calls any child holding a non-terminal handle
+ * alive. This bound fires well before that deadline, and it costs nothing but a
+ * string — it decides nothing and kills nothing.
+ */
+export const STALL_NOTICE_MS = 300_000;
+
+/**
+ * `451_000ms` → `00:07:31`. Hours are not capped, so an all-day call reads
+ * `30:00:00` instead of silently wrapping to `06:00:00`.
+ */
+export function formatToolElapsed(elapsedMs: number): string {
+	const totalSecs = Math.max(0, Math.floor(elapsedMs / 1000));
+	const pad = (value: number): string => String(value).padStart(2, "0");
+	const hours = pad(Math.floor(totalSecs / 3600));
+	const minutes = pad(Math.floor((totalSecs % 3600) / 60));
+	return `${hours}:${minutes}:${pad(totalSecs % 60)}`;
+}
+
+/**
+ * The one-line activity readout for a child that is inside a tool call (#315):
+ * `working · bash 00:07:31`, plus a marker once that single call has run for
+ * {@link STALL_NOTICE_MS}.
+ *
+ * The `working` prefix comes from the activity fact itself, not from the
+ * persisted child record: a start event with no matching end IS a child inside
+ * a tool call, while the record's `state` is only rewritten at turn boundaries
+ * and can lag (or read `retired` from a stale snapshot).
+ *
+ * **Display only.** This builds a string. It does not decide `liveness()`, does
+ * not abort the call, and does not steer, retire or report anything — the
+ * marker names `abort` as the lever precisely because `steer` cannot reach a
+ * child that is already inside a tool call (#313).
+ */
+export function formatInFlightToolLine(
+	activity: ChildActivity,
+	now: number,
+): string {
+	const elapsed = Math.max(0, now - activity.startedAt);
+	const line = `working · ${activity.tool} ${formatToolElapsed(elapsed)}`;
+	if (elapsed < STALL_NOTICE_MS) return line;
+	const minutes = Math.floor(elapsed / 60_000);
+	return `${line} (long-running tool — no progress for ${minutes}m; \`steer\` cannot interrupt it, \`abort\` can)`;
+}
+
+/**
+ * Fold one child lifecycle event into the in-flight-tool fact (#315).
+ *
+ * Pure and total: an event that says nothing about tool boundaries returns
+ * `current` unchanged, so both backends can call this on every event without
+ * having to classify first.
+ *
+ * `tool_execution_end` clears only the call it names. Ids are optional on both
+ * sides, so the rule is: clear unless BOTH sides name a call and those names
+ * differ (a parallel sibling finishing must not erase the one still running).
+ */
+export function nextInFlightTool(
+	current: ChildActivity | undefined,
+	event: {
+		readonly type?: unknown;
+		readonly toolName?: unknown;
+		readonly toolCallId?: unknown;
+	},
+	now: number,
+): ChildActivity | undefined {
+	if (event.type === "tool_execution_start") {
+		if (typeof event.toolName !== "string" || event.toolName === "") {
+			return current;
+		}
+		return {
+			tool: event.toolName,
+			startedAt: now,
+			...(typeof event.toolCallId === "string"
+				? { toolCallId: event.toolCallId }
+				: {}),
+		};
+	}
+	if (event.type === "tool_execution_end") {
+		if (current === undefined) return undefined;
+		const ended =
+			typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+		if (
+			ended !== undefined &&
+			current.toolCallId !== undefined &&
+			ended !== current.toolCallId
+		) {
+			return current;
+		}
+		return undefined;
+	}
+	return current;
+}
+
 /** The orchestrator's frozen backend seam (legion-v2-contract.md §3.1). */
 export interface LegionSupervisor {
 	spawnChild(input: SpawnInput): Promise<ChildHandle>;
@@ -221,6 +340,19 @@ export interface LegionSupervisor {
 	): Promise<AbortOutcome>;
 	waitSettled(name: string, timeoutMs?: number, signal?: AbortSignal): Promise<SettleResult>;
 	isAlive(name: string): boolean;
+	/**
+	 * The tool call this child is inside right now (#315), or `undefined`.
+	 *
+	 * Optional on purpose. It is a display-only read added after this seam was
+	 * frozen, and a supervisor that cannot answer it — a test double, a backend
+	 * predating #315 — must keep satisfying the contract. Absence means "no
+	 * activity fact", which renders no line at all: the same "no fact, no claim"
+	 * rule every other status source follows. Callers read it as
+	 * `supervisor.inFlightTool?.(name)`.
+	 *
+	 * A dead child never answers: holding no live handle, it can run no tool.
+	 */
+	inFlightTool?(name: string): ChildActivity | undefined;
 	stats(name: string): Promise<UsageSnapshot | null>;
 	retire(name: string, opts?: { graceful?: boolean }): Promise<void>;
 }

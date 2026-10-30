@@ -20,6 +20,7 @@ import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import type { UIProxy } from "./ui-proxy.ts";
 import type {
 	AbortOutcome,
+	ChildActivity,
 	ChildHandle,
 	EventSubscriptionOptions,
 	LegionSupervisor,
@@ -219,6 +220,21 @@ export class RoutingSupervisor implements LegionSupervisor {
 		if (owner === "inprocess") return this.inprocess.isAlive(name);
 		if (owner === "rpc") return this.rpc.isAlive(name);
 		return this.rpc.isAlive(name) || this.inprocess.isAlive(name);
+	}
+
+	/**
+	 * Forward the display-only in-flight tool read to the owning backend (#315).
+	 *
+	 * Same fallback shape as {@link isAlive}: before the first spawn there is no
+	 * owner to route by, so both are asked and the first answer wins. Both answer
+	 * `undefined` for a child they are not running, so the fallback cannot invent
+	 * activity for a foreign record.
+	 */
+	inFlightTool(name: string): ChildActivity | undefined {
+		const owner = this.owners.get(name);
+		if (owner === "inprocess") return this.inprocess.inFlightTool(name);
+		if (owner === "rpc") return this.rpc.inFlightTool(name);
+		return this.inprocess.inFlightTool(name) ?? this.rpc.inFlightTool(name);
 	}
 
 	async stats(name: string): Promise<UsageSnapshot | null> {

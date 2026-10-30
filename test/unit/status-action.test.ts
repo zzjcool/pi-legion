@@ -16,6 +16,7 @@ import piLegion, {
 	renderStatusOverview,
 } from "../../index.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
+import type { LegionSupervisor } from "../../src/supervisor/types.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
 import type { ChildRecord, RunRecord } from "../../src/shared/types.ts";
 
@@ -90,6 +91,13 @@ function indexHarness() {
 		{ execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }> }
 	>();
 	const handlers = new Map<string, (...args: unknown[]) => unknown>();
+	/** Slash commands this extension registered, by name (#315). */
+	const commands = new Map<
+		string,
+		{ handler: (args: string, ctx: unknown) => Promise<void> }
+	>();
+	/** Chat text this extension sent through `pi.sendMessage` (#315). */
+	const sentMessages: string[] = [];
 	const supervisor = new FakeSupervisor({
 		autoSettle: { text: '{"ok":true}' },
 		immediateTimeout: false,
@@ -102,9 +110,13 @@ function indexHarness() {
 			};
 			tools.set(typed.name, typed);
 		},
-		registerCommand() {},
+		registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+			commands.set(name, command);
+		},
 		registerMessageRenderer() {},
-		sendMessage() {},
+		sendMessage(message: { content?: unknown }) {
+			if (typeof message?.content === "string") sentMessages.push(message.content);
+		},
 		events: { emit() {} },
 		on(name: string, handler: (...args: unknown[]) => unknown) {
 			handlers.set(name, handler);
@@ -120,6 +132,8 @@ function indexHarness() {
 		cwd,
 		supervisor,
 		tool,
+		commands,
+		sentMessages,
 		async invoke(params: Record<string, unknown>) {
 			const result = await tool.execute(
 				"status-action-test",
@@ -245,6 +259,124 @@ test("#145 status with name returns single child; unknown → NOT_FOUND", async 
 		const both = await harness.invoke({ action: "status", name: "scout-a", all: true });
 		assert.match(both.text, /mutually exclusive/);
 		assert.equal(both.details?.error, ErrorCodes.INVALID_PARAMS);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// ── #315: "alive but no longer progressing" made visible ─────────────
+
+/**
+ * Teach a harness supervisor to answer the display-only activity read (#315).
+ *
+ * `inFlightTool` is an OPTIONAL member of `LegionSupervisor` for exactly this
+ * reason: a supervisor that cannot answer must keep satisfying the contract, so
+ * absence renders no line. The shared FakeSupervisor predates that member and is
+ * used by dozens of tests, so the fact is attached here the same way a real
+ * backend exposes it rather than widening the double for everyone.
+ */
+function withActivity(
+	supervisor: FakeSupervisor,
+	activity: { tool: string; startedAt: number } | undefined,
+): void {
+	const seam: LegionSupervisor = supervisor;
+	seam.inFlightTool = () => activity;
+}
+
+test("#315 renderStatusOverview prepends the activity lead and renders nothing when absent", () => {
+	const now = 1_000_000;
+	const child = childStub({ name: "worker-0", agent: "worker" });
+	const text = renderStatusOverview(
+		[{ child, alive: true, activity: { tool: "bash", startedAt: now - 12_000 } }],
+		now,
+	);
+	// A lead line for the block: what it is doing, and for how long.
+	assert.match(text, /^working · bash 00:00:12$/m);
+	assert.ok(
+		text.indexOf("working · bash") < text.indexOf("worker-0 — state="),
+		"the activity line leads the block it describes",
+	);
+	// The rest of the block is untouched.
+	assert.match(text, /worker-0 — state=working/);
+
+	// No fact, no line — the overview is byte-identical to the pre-#315 shape.
+	assert.doesNotMatch(renderStatusOverview([{ child, alive: true }], now), /working · /);
+});
+
+test("#315 status with name shows what a live child is running and for how long", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({
+			agent: "scout",
+			task: "probe",
+			name: "scout-a",
+			async: true,
+			worktree: false,
+		});
+		withActivity(harness.supervisor, { tool: "bash", startedAt: Date.now() - 12_000 });
+
+		const byName = await harness.invoke({ action: "status", name: "scout-a" });
+		assert.match(byName.text, /^working · bash 00:00:12\nscout-a — state=/m);
+		// Display only: the liveness verdict and the snapshot are unchanged.
+		assert.match(byName.text, /alive · quiet/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#315 status all marks a single tool past the 5m bound without changing any verdict", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({
+			agent: "worker",
+			task: "build",
+			name: "worker-b",
+			async: true,
+			worktree: false,
+		});
+		withActivity(harness.supervisor, { tool: "bash", startedAt: Date.now() - 12 * 60_000 });
+
+		const overview = await harness.invoke({ action: "status", all: true });
+		assert.match(
+			overview.text,
+			/^working · bash 00:12:00 \(long-running tool — no progress for 12m; `steer` cannot interrupt it, `abort` can\)$/m,
+		);
+		// The marker is a string and nothing else: the child is still listed as
+		// one live child, still tracked, and never retired by rendering a status.
+		assert.match(overview.text, /^Status · 1 live child/m);
+		assert.equal(
+			harness.supervisor.calls.filter((call) => call.method === "retire").length,
+			0,
+			"rendering a status never retires anything",
+		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#315 /legion status <name> reads the same activity fact as subagent status", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({
+			agent: "worker",
+			task: "build",
+			name: "worker-b",
+			async: true,
+			worktree: false,
+		});
+		withActivity(harness.supervisor, { tool: "bash", startedAt: Date.now() - 12_000 });
+
+		const legion = harness.commands.get("legion");
+		assert.ok(legion, "the /legion command must be registered");
+		await legion.handler("status worker-b", {
+			cwd: harness.cwd,
+			mode: "headless",
+			hasUI: false,
+			ui: { notify() {}, setStatus() {} },
+		});
+		// The slash exit builds its facts in index.ts (`childStatus`), so this pins
+		// that wiring, not just the renderer the unit test above covers.
+		assert.match(harness.sentMessages.at(-1) ?? "", /^working · bash 00:00:12$/m);
 	} finally {
 		await harness.cleanup();
 	}
