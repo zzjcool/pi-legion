@@ -131,8 +131,8 @@ interface LegionSupervisor {
 >   `routing.inprocess` 的 `capabilities`）。
 >
 > 同一条能力上限解释了 mailbox 的 `prompt` 分支为什么没有 `intercepted` 告警（#323 2）：那条
-> 分支的 `prompt()` 是 `Promise<void>`，没有 disposition 可读。`delivered=1` 在这条分支上依旧
-> 只表示「send 调用返回了」。
+> 分支的 `prompt()` 是 `Promise<void>`，没有 disposition 可读，它写下的 `ACCEPTED`
+> （`delivered=1`，五值语义见 §8.3.1）只表示「send 调用返回了」，不是「模型读了」。
 
 > **`steer` 的负语义（#313）**：§8.3 表格里 `steer` 那一行的「本轮工具后、下次 LLM 前送达」也是
 > **排队**语义，不是打断。

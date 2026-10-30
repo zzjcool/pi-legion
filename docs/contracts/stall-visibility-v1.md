@@ -84,6 +84,9 @@ example a codemode script) made this call"），只用于把嵌套调用归属�
 - **没有 `parentToolCallId` 时，深度 > 1 不能区分「嵌套」与「并行」**，此时按**并行**报
   ` (+N more)`：这是更弱、但永远为真的说法。把并行硬说成 `inside` 会是假报——本契约要防的
   恰好是相反的错误（把卡住说成在工作）；两个方向都只允许**少报**。
+- **事件里带了 `parentToolCallId`、但那个父帧已经不在栈里**（父调用先结束、或 `agent_settled`
+  清过栈）时按同一规则降级为 ` (+N more)`：归属只承认**栈里**能一路走通的链，不拿一个已经
+  失效的 id 去猜 `inside`。
 - 栈空（`[]`）→ **不出这一行**，与「没有事实」逐字节相同。
 
 `inFlightTool(name)` 返回栈顶（对只实现它的旧后端 / 测试替身保持一帧读取的兼容），
@@ -102,6 +105,11 @@ example a codemode script) made this call"），只用于把嵌套调用归属�
 
 选 5 分钟的理由是对照**可观测的替代方案**：现在父等到 900s 的 `collect` deadline 才知道
 没动静。5 分钟落在这个 deadline 之前很久，且它只花一个字符串。
+
+**计时基准（#331）**：这里的「单条工具持续」指**栈顶那一帧**的 `startedAt`，不是最外层调用的
+起跑时间。栈顶换人（内层工具 start）就等于把标记的时钟重置，所以 `codemode` 里套一串 `bash`
+的 child 可能很久看不到 5 分钟标记——这是已知的**少报**（宁可不报，也不把最外层的年龄算到
+一个刚启动的内层调用头上）。反方向不会发生：它绝不会把新启动的调用报成卡住。
 
 ### D4 — `status` 的行格式
 
@@ -198,7 +206,8 @@ working · bash 00:12:00 (long-running tool — no progress for 12m; `steer` can
 ## 验收
 
 - `test/unit/stall-visibility.test.ts`：`hh:mm:ss` 格式（含不封顶的小时）、5 分钟边界与标记文案、
-  事件折叠（start / 无关事件 / 匹配的 end / 无名 start / `agent_settled` 清空 / 陌生 id 不清栈）、
+  事件折叠（start / 无关事件 / 匹配的 end / 无名 start / `agent_settled` 清空 / 陌生 id 不清栈 /
+  有名与无名混排时陌生 end 只折叠无名帧）、
   嵌套 `codemode → bash`（内层结束外层仍显示）、并行兄弟（显示的那次先结束 → 显示仍在跑的）、
   栈空不出行、两个上下文提示、scout 与 worker 的 `toolTimeoutMs` 取舍。
 - `test/unit/supervisor.test.ts`、`test/unit/inprocess-supervisor.test.ts`：两个后端各自从

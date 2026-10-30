@@ -270,6 +270,27 @@ test("nextInFlightTool: an end without a matching id never erases a live named c
 	);
 });
 
+test("#331 an unmatched end folds the unnamed frame, never a named one", () => {
+	let stack = nextInFlightTool(
+		[],
+		{ type: "tool_execution_start", toolName: "bash" },
+		1_000,
+	);
+	stack = nextInFlightTool(
+		stack,
+		{ type: "tool_execution_start", toolName: "read", toolCallId: "c2" },
+		2_000,
+	);
+	assert.deepEqual(stack.map((entry) => entry.tool), ["bash", "read"]);
+	// `c9` names no frame, so the fold may only fall back to the frame that never
+	// got an id: the named `read(c2)` is demonstrably still running and must stay.
+	assert.deepEqual(
+		nextInFlightTool(stack, { type: "tool_execution_end", toolCallId: "c9" }, 3_000),
+		[{ tool: "read", startedAt: 2_000, toolCallId: "c2" }],
+		"an unmatched end removes only the unnamed frame",
+	);
+});
+
 // ──────────────────── the scout per-bash timeout (#315) ────────────────────
 
 test("#315 scout declares a 600s per-bash timeout and no other bundled role gets one", () => {
