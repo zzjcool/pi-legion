@@ -10,9 +10,32 @@ two as the only things a downstream should need.
 issue. Include a repro, the expected behaviour, the actual behaviour, and the
 environment (Node version, OS, and the Pi / pi-legion version).
 
-**One concern per pull request.** Link the issue. Open the PR as a draft.
+**One concern per pull request.** Link the issue (none needed for a
+`release:` / `chore:` / docs-only PR — say so in the PR body). Open the PR as
+a draft.
 Mark it **Ready for review** when the change is ready and you expect the
 required check `ci` to pass.
+
+**Link every issue you touch, not just the parent.** GitHub only auto-closes an
+issue on a bare `Closes #<n>` line (`Fixes` / `Resolves` also work) in a PR
+body or a commit message. A `fix(#<n>):` subject **names** the issue and closes
+nothing. A fix that says `fix(#280)` while the report actually lives in `#306`
+leaves `#306` open forever, and the next reader cannot tell whether the work
+never landed or was merely forgotten — that is exactly what happened to `#306`
+(fixed in `19ea0cf` … `ac26836`, shipped in 5.0.1, still open for nearly four
+days, hand-closed by the maintainer). So:
+
+- `Closes #<child>` for **the issue being fixed** — the one the reporter filed.
+- `Refs #<parent>` (or `Refs #<sibling>`) for the context issue.
+- `fix(#<child>): …` in a commit subject is a **naming convention only**; it
+  does not close anything. The actual close is a separate bare `Closes #<child>`
+  line, in the PR body or in the commit body — not packed into the subject's
+  parentheses.
+- No `Closes` for a given issue? Then closing it stays a manual step after
+  merge — do it in the same pass, not "later".
+
+**Before you ask for merge.** Re-read the issue you were handed and check the
+PR closes *that* one, not an issue one level up.
 
 **Merge gate.** Alice (the maintainer bot) merges only after code review has
 passed and the required GitHub Actions check `ci` is green. Do not push
@@ -52,6 +75,10 @@ A maintainer promotes the staged version on npm with 2FA. Do not use plain
 
 **Communication.** Coordinate in the team channel, or with Alice. Do not ping
 the maintainer user for a routine review or merge ask.
+
+**Closing issues is part of the work.** Merge is not done until every issue
+the change resolved says `CLOSED`, and every issue it only *partly* resolved
+has the remainder split into a new issue (see `#317`, split out of `#306`).
 
 ## Setup
 

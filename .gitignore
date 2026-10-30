@@ -28,6 +28,7 @@ STATE.md
 
 # agent reports are not stored in the repo
 reports/
+.pi-reports/
 
 # TUI QA 证据产物（playbook §7）
 test/tui/artifacts/
