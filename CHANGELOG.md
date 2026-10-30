@@ -79,6 +79,39 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `timeout` (the request went out, the child had not settled). Contract and the frozen three-state
   table: `docs/contracts/abort-soft-interrupt-v1.md` (#314).
 
+### Changed
+
+- **`SessionRuntime.consumeCollect*` now answers with a `ClaimedCollect`, not a bare snapshot
+  (#320/#327).** The claim-once seam claims a terminal result as it hands the snapshot out, and
+  the caller has to be able to hand that claim back when it bails — which requires knowing
+  whether *this* call took it (`src/api.ts` re-exports `SessionRuntime`, so this is a public
+  surface change, and it is a breaking one):
+  ```ts
+  const { snapshot } = await rt.consumeCollect("worker-0")!;   // was: const snapshot = await …
+  ```
+  `claimedNow` is `true` only for the call that took the round's claim; a caller that delivered
+  the text to nobody rolls it back with `unclaimUndelivered(name, snapshot, claimedNow)`, and a
+  call that did not take the claim leaves the real delivery's claim alone. **This breaks
+  `zzjcool`/api consumers**: the bare-snapshot shape *did* ship — v4.0.0 and v5.0.1 both exported
+  `consumeCollect(name): Promise<CollectSnapshot> | undefined`, and `src/api.ts` calls that surface
+  "safe to depend on" — so the release that carries this change must be a **major**. The migration
+  is the one line above; no compatibility shim is provided (no overload, no `snapshotOnly`
+  switch), because a second shape would keep the claim/copy ambiguity alive for everyone. Contract
+  revision: `docs/contracts/notice-claim-v1.md` (D2).
+
+- **`AbortOutcome` now carries the bound the abort really applied (`timeoutMs`), and the timeout
+  receipt reads it instead of a default of its own (#325).** `abortReceipt` used to format a
+  `timeoutMs = DEFAULT_ABORT_TIMEOUT_MS` parameter that nothing ever passed — the tool surface
+  deliberately takes no bound (it is a `wait`-only parameter) — so the receipt could only ever say
+  "5s", even for a caller that armed a different limit on the supervisor. Both backends now report
+  the normalized, timer-capped bound in the outcome for all three statuses, and the receipt names
+  that number. The receipt text on the tool surface is byte-identical (no bound is ever passed
+  there); the two private `race*Timeout` helpers the backends each carried are one shared
+  `raceWithTimeout` (`src/supervisor/race-timeout.ts`) with the timer cleanup, loser-rejection
+  swallow and timer-delay cap unchanged, and the in-process pre-abort queue clear now runs inside
+  the child's own identity scope (`runAtAbsoluteDepth` + `runInChildContext`), like the interrupt
+  it precedes. Contract revision: `docs/contracts/abort-soft-interrupt-v1.md` (D2/D7).
+
 ### Fixed
 
 - **A provider that ends a turn with no content no longer costs a child its whole turn.** Some
@@ -145,12 +178,15 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   and only that one comes back — per call, not per snapshot, because the watch and the tool call
   await the same `job.collectPromise` and a shared record lets the second call overwrite the
   first's answer. And it did not hand the notification route back: the seam sets
-  `consumedByTool` before the claim, every child is watched in production, so the watch passed
-  its gate first (`!consumedByTool && !notified` → skip `onTerminal`) and was already parked in
-  `retire` when the bail arrived — meaning the repair had to re-arm unconditionally, which it
-  now does (clear the flag, `watch` again; the generation bump keeps the old watch from
+  `consumedByTool` before the claim, the default async path watches every child, so the watch
+  passed its gate first (`!consumedByTool && !notified` → skip `onTerminal`) and was already
+  parked in `retire` when the bail arrived — meaning the repair had to re-arm unconditionally,
+  which it now does (clear the flag, `watch` again; the generation bump keeps the old watch from
   releasing the job, `notified` keeps the round single, `deliverBatch`'s claim filter is the
-  last net). Measured in that production shape: 0 notices before, 1 after. The one case still
+  last net). The old `!job.watching` guard is therefore dead code wherever it would have
+  mattered: in the default shape somebody is always watching, and an `async: false` inline
+  collect registers no watch at all, so the flag is never unset on the path that needs the
+  re-arm. Measured in that production shape: 0 notices before, 1 after. The one case still
   not recovered is a bail that lands only after the watch has already released the child — there
   the result stays readable through a later `collect` and a copy already held in the run outbox
   still arrives, but a copy sitting in the join window goes with the release. Contract revision:

@@ -187,6 +187,21 @@ export {
 } from "./runs/worktree.ts";
 
 // ── parent session: completion notify + input-box status ────────────────────
+//
+// `SessionRuntime.consumeCollect*` answers with `ClaimedCollect`, not a bare
+// snapshot (#320):
+//
+// ```ts
+// const { snapshot, claimedNow } = await rt.consumeCollect("worker-0")!;
+// ```
+//
+// `claimedNow` is `true` only when THIS call took the round's completion claim, so a
+// caller that bails before handing the result to the agent (an aborted parent turn, a
+// failed persist) rolls it back with `unclaimUndelivered(name, snapshot, claimedNow)`
+// — a call that did not take the claim must leave the claim of the delivery that did
+// alone. The flag travels with the return value on purpose: two collects can await the
+// same job promise and therefore see the same snapshot object, so a per-snapshot record
+// would let the second call overwrite the first one's answer.
 export { createSessionRuntime, shouldRecycleAfterCollect } from "./extension/runtime.ts";
 export type {
 	ClaimedCollect,

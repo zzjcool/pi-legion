@@ -14,17 +14,18 @@ import {
 	type ExtensionUIRequest,
 	type ExtensionUIResponse,
 } from "../../src/supervisor/ui-proxy.ts";
-import type {
-	AbortOutcome,
-	ChildHandle,
-	LegionSupervisor,
-	RpcClientOptions,
-	SettleResult,
-	SpawnInput,
-	SteerDisposition,
-	SupervisorEvent,
-	SupervisorEventListener,
-	UsageSnapshot,
+import {
+	type AbortOutcome,
+	type ChildHandle,
+	type LegionSupervisor,
+	type RpcClientOptions,
+	type SettleResult,
+	type SpawnInput,
+	type SteerDisposition,
+	type SupervisorEvent,
+	type SupervisorEventListener,
+	type UsageSnapshot,
+	DEFAULT_ABORT_TIMEOUT_MS,
 } from "../../src/supervisor/types.ts";
 
 export interface FakeSupervisorCall {
@@ -221,6 +222,7 @@ export class FakeSupervisor implements LegionSupervisor {
 	abortOutcome: AbortOutcome = {
 		status: "interrupted",
 		cleared: { steering: 0, followUp: 0 },
+		timeoutMs: DEFAULT_ABORT_TIMEOUT_MS,
 	};
 
 	async abort(
