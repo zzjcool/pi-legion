@@ -2,7 +2,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 
-export const LEGION_DB_USER_VERSION = 1;
+/**
+ * Ledger schema version.
+ *
+ * v1 — initial four-table schema (§4.2).
+ * v2 — no DDL: `messages.delivered` becomes a five-value domain (0 pending,
+ *      1 accepted, 2 bounced, 3 delivered, 4 obsolete — #322). The column was
+ *      already `INTEGER`, so the migration is a version bump plus the semantic
+ *      agreement that the old value `1` now reads as `accepted`.
+ */
+export const LEGION_DB_USER_VERSION = 2;
 export const LEGION_DB_BUSY_TIMEOUT_MS = 5_000;
 
 /**
@@ -113,6 +122,7 @@ CREATE TABLE messages (
   body         TEXT NOT NULL,
   kind         TEXT,
   urgency      TEXT NOT NULL DEFAULT 'info',
+  -- 0=pending 1=accepted 2=bounced 3=delivered 4=obsolete (five-value domain, schema v2 #322)
   delivered    INTEGER NOT NULL DEFAULT 0,
   delivered_at INTEGER,
   created_at   INTEGER NOT NULL
@@ -340,6 +350,18 @@ function migrate(db: DatabaseSync): void {
 		}
 		if (version === 0) {
 			db.exec(SCHEMA_V1);
+			version = 1;
+		}
+		if (version === 1) {
+			// v1 → v2 (#322): messages.delivered widens from 3 values to 5
+			// (0 pending, 1 accepted, 2 bounced, 3 delivered, 4 obsolete).
+			//
+			// Deliberately no DDL: the column is already `INTEGER NOT NULL DEFAULT 0`,
+			// so the value domain is a semantic agreement between writers and readers,
+			// not a constraint SQLite can hold. Existing rows need no backfill — every
+			// v1 `1` was written as "the send call returned", which is exactly what v2
+			// calls `accepted`. A v1 ledger without the `idx_messages_rate` index is not
+			// repaired here either (see contract REV-19).
 			db.exec(`PRAGMA user_version = ${LEGION_DB_USER_VERSION};`);
 		}
 		db.exec("COMMIT;");

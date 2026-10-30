@@ -5,12 +5,18 @@ import {
 	MAIL_BODY_HARD_LIMIT_BYTES,
 	MAIL_BODY_SOFT_LIMIT_BYTES,
 	MAIL_DELIVERY,
+	formatMail,
 	inbox,
+	mailMatchesUserText,
+	mailReachedTurns,
+	mailboxStats,
 	pendingInbox,
 	resolveMailTargets,
 	sendMail,
 	transitionDelivery,
+	type LegionMessage,
 } from "../../src/legion/mail.ts";
+import { readEventsAfter } from "../../src/legion/events.ts";
 import { insertNode, updateNode } from "../../src/legion/nodes.ts";
 
 function makeTree() {
@@ -163,6 +169,155 @@ test("settled nodes can resume through mail; terminal recipients bounce with rec
 		assert.equal(bounced.delivered, MAIL_DELIVERY.BOUNCED);
 		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.BOUNCED }).length, 1);
 		assert.equal(inbox(db, "root.team-a", { delivery: MAIL_DELIVERY.PENDING }).length, 1);
+	} finally {
+		db.close();
+	}
+});
+
+test("delivery states form a five-value domain with the frozen legal edges (#322)", () => {
+	const db = makeTree();
+	try {
+		// The old name is kept only as an alias for out-of-tree imports.
+		assert.equal(MAIL_DELIVERY.INJECTED, MAIL_DELIVERY.ACCEPTED);
+		const first = sendMail(db, { fromNode: "root.team-a", to: "alice", subject: "s", body: "b" }, { now: () => 10 });
+		const second = sendMail(db, { fromNode: "root.team-a", to: "alice", subject: "t", body: "c" }, { now: () => 11 });
+		assert.equal(first.ok && second.ok, true);
+		if (!first.ok || !second.ok) return;
+		const acceptedId = first.messages[0]!.id;
+		const bouncedId = second.messages[0]!.id;
+
+		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.PENDING }).length, 2);
+		transitionDelivery(db, acceptedId, MAIL_DELIVERY.ACCEPTED, () => 20);
+		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+		// ACCEPTED writes no event of its own: `mail_sent` already recorded the send.
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_delivered" || event.type === "mail_bounced").length, 0);
+		// …and it is terminal for the send path: a bounce here would rewrite history.
+		assert.throws(() => transitionDelivery(db, acceptedId, MAIL_DELIVERY.BOUNCED), /cannot transition from 1 to 2/);
+
+		transitionDelivery(db, acceptedId, MAIL_DELIVERY.DELIVERED, () => 30);
+		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.DELIVERED }).length, 1);
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_delivered").length, 1);
+		// Repeating the same terminal verdict is a no-op, event included.
+		transitionDelivery(db, acceptedId, MAIL_DELIVERY.DELIVERED, () => 31);
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_delivered").length, 1);
+		assert.throws(() => transitionDelivery(db, acceptedId, MAIL_DELIVERY.OBSOLETE), /cannot transition from 3 to 4/);
+
+		// A queued message can lose its meaning before anyone hands it over (#333).
+		transitionDelivery(db, bouncedId, MAIL_DELIVERY.OBSOLETE, () => 40);
+		const bouncedEvents = readEventsAfter(db, 0).filter((event) => event.type === "mail_bounced");
+		assert.equal(bouncedEvents.length, 1);
+		assert.deepEqual(bouncedEvents[0]!.data, {
+			messageId: bouncedId,
+			toNode: "root.team-a.alice",
+			reason: "obsolete_after_phase_change",
+		}, "obsolete reuses mail_bounced with its own reason instead of adding an event type");
+	} finally {
+		db.close();
+	}
+});
+
+test("mailboxStats reports the five delivery states per recipient (#322)", () => {
+	const db = makeTree();
+	try {
+		const ids: number[] = [];
+		for (let i = 0; i < 5; i += 1) {
+			const result = sendMail(db, { fromNode: "root.team-a", to: "alice", subject: `m${i}`, body: `body ${i}` }, { now: () => 100 + i });
+			assert.equal(result.ok, true);
+			if (result.ok) ids.push(result.messages[0]!.id);
+		}
+		transitionDelivery(db, ids[1]!, MAIL_DELIVERY.ACCEPTED, () => 200);
+		transitionDelivery(db, ids[2]!, MAIL_DELIVERY.BOUNCED, () => 201);
+		transitionDelivery(db, ids[3]!, MAIL_DELIVERY.ACCEPTED, () => 202);
+		transitionDelivery(db, ids[3]!, MAIL_DELIVERY.DELIVERED, () => 203);
+		transitionDelivery(db, ids[4]!, MAIL_DELIVERY.OBSOLETE, () => 204);
+		assert.deepEqual(mailboxStats(db, "root.team-a.alice"), {
+			pending: 1,
+			accepted: 1,
+			delivered: 1,
+			bounced: 1,
+			obsolete: 1,
+		});
+		assert.deepEqual(mailboxStats(db, "root.team-a.bob"), {
+			pending: 0,
+			accepted: 0,
+			delivered: 0,
+			bounced: 0,
+			obsolete: 0,
+		});
+	} finally {
+		db.close();
+	}
+});
+
+test("the DELIVERED criterion is an exact match over the last 20 turns (#322, narrowed by #338 M2)", () => {
+	const message: LegionMessage = {
+		id: 7,
+		fromNode: "root.team-a",
+		toNode: "root.team-a.alice",
+		subject: "scope",
+		body: "line one\nline two",
+		kind: "notice",
+		urgency: "info",
+		delivered: MAIL_DELIVERY.ACCEPTED,
+		deliveredAt: null,
+		createdAt: 1,
+	};
+	assert.equal(mailMatchesUserText(formatMail(message), message), true, "the injected envelope proves delivery");
+	assert.equal(
+		mailMatchesUserText(message.body, message),
+		false,
+		"#338 M2: the bare body is not proof — it carries no id, so a task card or a quote of the same sentence matches it",
+	);
+	assert.equal(
+		mailMatchesUserText("line one\nline two", { ...message, id: 8, fromNode: "root.team-a.bob" }),
+		false,
+		"a turn whose text happens to equal another mail's body is a coincidence, not a read (#338 M2)",
+	);
+	assert.equal(mailMatchesUserText(` ${formatMail(message)}`, message), false, "whitespace is never trimmed away");
+	assert.equal(mailMatchesUserText(`${message.body} `, message), false);
+	assert.equal(mailMatchesUserText("line one", message), false, "a line of the body is not the mail");
+	assert.equal(
+		mailMatchesUserText(`re: ${formatMail(message)}`, message),
+		false,
+		"a quoted envelope is a mention, not a read",
+	);
+
+	const filler = Array.from({ length: 20 }, (_, index) => ({ userText: `filler ${index}` }));
+	const mailTurn = { userText: formatMail(message) };
+	assert.equal(mailReachedTurns([...filler, mailTurn], message), true, "inside the window");
+	assert.equal(
+		mailReachedTurns([mailTurn, ...filler], message),
+		false,
+		"a mail older than the last 20 turns is not proof of consumption",
+	);
+});
+
+test("inbox pages from an id cursor so a confirmation scan can rotate (#338 M3)", () => {
+	const db = makeTree();
+	try {
+		const ids: number[] = [];
+		for (let index = 0; index < 5; index += 1) {
+			const sent = sendMail(db, {
+				fromNode: "root.team-a", to: "alice", subject: `m${index}`, body: `body ${index}`,
+			}, { now: () => 1_000 + index });
+			assert.equal(sent.ok, true);
+			if (sent.ok) ids.push(sent.messages[0]!.id);
+			transitionDelivery(db, ids[index]!, MAIL_DELIVERY.ACCEPTED, () => 2_000 + index);
+		}
+		assert.deepEqual(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, limit: 2 }).map((m) => m.id), ids.slice(0, 2));
+		assert.deepEqual(
+			inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, limit: 2, afterId: ids[1]! }).map((m) => m.id),
+			ids.slice(2, 4),
+			"afterId continues where the previous page stopped",
+		);
+		assert.deepEqual(
+			inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, limit: 2, afterId: ids[4]! }),
+			[],
+			"past the tail the page is empty, which is what tells the scan to wrap",
+		);
+		// The cursor only moves the window; it never changes which messages are eligible.
+		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, afterId: 0 }).length, 5);
+		assert.throws(() => inbox(db, "root.team-a.alice", { afterId: -1 }), /afterId/);
 	} finally {
 		db.close();
 	}
