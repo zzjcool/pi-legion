@@ -10,7 +10,9 @@ two as the only things a downstream should need.
 issue. Include a repro, the expected behaviour, the actual behaviour, and the
 environment (Node version, OS, and the Pi / pi-legion version).
 
-**One concern per pull request.** Link the issue. Open the PR as a draft.
+**One concern per pull request.** Link the issue (none needed for a
+`release:` / `chore:` / docs-only PR — say so in the PR body). Open the PR as
+a draft.
 Mark it **Ready for review** when the change is ready and you expect the
 required check `ci` to pass.
 
