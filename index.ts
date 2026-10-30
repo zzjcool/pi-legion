@@ -4135,8 +4135,10 @@ export async function waitAction(input: {
 	);
 	if (!targets.ok) {
 		// A name that is merely finished (not live) is still waitable via the
-		// runtime's finished cache — probe it with consumeCollect, which is
-		// side-effect free for a job that is not in the live set.
+		// runtime's finished cache — probe it with consumeCollect. NOTE: since
+		// notice-claim-v1 that probe is NOT side-effect free: a cache hit claims the
+		// result, which is correct here — the wait below returns the same result to the
+		// parent, so the pushed notice for it is suppressed instead of duplicating it.
 		if (params.name && !params.all) {
 			const cached = runtime.consumeCollect(params.name);
 			if (cached) {

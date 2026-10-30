@@ -51,6 +51,13 @@ function defaultJoinConfig(): JoinConfig {
 export interface JoinEntry {
 	runId: string;
 	name: string;
+	/**
+	 * Reporting round of this child (D10). The runtime assigns it from a per-name
+	 * monotonic counter in `track()`; the coordinator only carries it, because one
+	 * round is one deliverable result — two unread rounds of the same child must
+	 * both survive the buffer, which a `(runId, name)` key cannot express.
+	 */
+	round: number;
 	/** Raw collect result; the deliver sink feeds it to formatGroupedNotice. */
 	input: CompletionInput;
 	/** From the triggering watch() call, forwarded to the delivery options. */
@@ -122,6 +129,27 @@ export class JoinCoordinator {
 		const group = this.groups.get(runId);
 		if (!group) return;
 		group.pending.delete(name);
+		if (group.pending.size === 0 && group.buffered.length === 0) {
+			this.dropGroup(runId, group);
+		}
+	}
+
+	/**
+	 * D8: drop the already-TERMINAL entries of one member.
+	 *
+	 * `remove()` only clears `pending` (a member that has already finished lives in
+	 * `buffered`, not in `pending`), so a released child left its buffered entry
+	 * behind as an orphan that fired at window expiry (W3) — most visibly right
+	 * after a `wait()` hit, which retires and releases the very child whose entry
+	 * is sitting in the window. Semantics of `remove()` are otherwise unchanged.
+	 */
+	dropBuffered(runId: string, name: string): void {
+		if (this.disposed) return;
+		const group = this.groups.get(runId);
+		if (!group || group.buffered.length === 0) return;
+		const kept = group.buffered.filter((entry) => entry.name !== name);
+		if (kept.length === group.buffered.length) return;
+		group.buffered = kept;
 		if (group.pending.size === 0 && group.buffered.length === 0) {
 			this.dropGroup(runId, group);
 		}

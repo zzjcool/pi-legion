@@ -3681,3 +3681,1319 @@ test("display-liveness A2: a finished child is not pulled back to running by a f
 		runtime.dispose();
 	}
 });
+
+// ═══════════════ completion claim-once: one result, one route (notice-claim-v1) ═══════════════
+//
+// The two routes that carry a child's terminal result — the tool result
+// (`wait` / `collect`) and the pushed notice (watch → join → outbox → deliver) —
+// share ONE claim per `(runId, name)`. Whatever reaches the parent first wins;
+// the other route goes quiet. These cases pin each window in which the notice
+// used to arrive twice.
+
+test("claim W1: a buffered entry claimed by wait() never reaches the window flush", async () => {
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 150 });
+	for (const name of ["a", "b"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+
+	// W1 window: a finishes first, so its entry waits in the join buffer while b
+	// is still pending. Its watch releases the child right after.
+	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	await waitFor(() => runtime.get("a") === undefined, "a's watch released it");
+
+	// The parent reads a's result explicitly: from here on a has been reported.
+	const waited = await runtime.wait(["a"], { timeoutMs: 500 });
+	assert.equal(waited[0]?.snapshot?.output, "a-out");
+	assert.equal(messages.length, 0, "a was read, not announced");
+
+	// The window expires with b still pending. The claimed entry must not fire.
+	// 2x the window: the expiry has certainly happened, and the claimed entry still
+	// must not have produced anything.
+	await new Promise((resolve) => setTimeout(resolve, 320));
+	assert.equal(messages.length, 0, "the window must not deliver the claimed entry");
+
+	// b is now the only child the parent has not read.
+	resolvers.get("b")!(joinSnapshot({ output: "b-out" }));
+	await waitFor(() => messages.length === 1, "only b notifies");
+	// Shape-agnostic on purpose: whether b flushes alone (legacy single) or the
+	// expired window already happened to be mid-flight (grouped entry) is timing,
+	// not contract. What matters is that b is there and a is not.
+	assert.match(messages[0]!.content, /\*\*b \(worker\)\*\*|^- b \(worker\): completed/m);
+	assert.doesNotMatch(messages[0]!.content, /a \(worker\)/, "a never appears in the notice");
+	assert.doesNotMatch(messages[0]!.content, /a-out/, "a's output is never repeated");
+	// Strict: a second message would land in messages[1] and go unnoticed otherwise.
+	assert.equal(messages.length, 1, "exactly one message for the whole scenario");
+	runtime.dispose();
+});
+
+test("claim W2: a held outbox notice is dropped when wait() delivered the result", async () => {
+	const messages: SentMessage[] = [];
+	let resolveCollect!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+
+	// The parent run is live, so the notice is held (D-A) instead of sent.
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "held",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/held.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("held");
+
+	// W2 window: the child finishes first, so its notice is enqueued for the live
+	// run — this is the deferral the outbox exists for.
+	resolveCollect(joinSnapshot({ output: "held-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held in the outbox");
+	assert.equal(messages.length, 0, "a live run holds the notice");
+
+	// The same turn then reads the result explicitly. The batch is held as ENTRIES
+	// (D4) and only formatted at flush, which is exactly why a claim taken after
+	// enqueue still wins.
+	const waited = await runtime.wait(["held"], { timeoutMs: 500 });
+	assert.equal(waited[0]?.snapshot?.output, "held-out");
+
+	// The held batch is now fully claimed: no message can ever come out of it, so
+	// `noticeQueueStats` must stop reporting it as pending (and still nothing has
+	// been sent — claiming is not delivering).
+	//
+	// NOTE: `pending` is a PROXY for claim timing here, not a delivery contract —
+	// the contract for that is the `messages.length === 0` assertion after settle.
+	assert.equal(runtime.noticeQueueStats().pending, 0, "a fully claimed batch is not pending");
+	assert.equal(runtime.noticeQueueStats().oldestAgeMs, 0);
+	assert.equal(messages.length, 0, "claiming never sends anything");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 0, "the result was already read: zero messages at settle");
+	assert.equal(runtime.noticeQueueStats().pending, 0, "the outbox is drained either way");
+	runtime.dispose();
+});
+
+test("claim D6: a notice sent first does not shorten the collect the parent asks for next", async () => {
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "fast",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/fast.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "fast-out" }),
+	});
+	runtime.watch("fast");
+
+	// Reverse order: the notice wins the race...
+	await waitFor(() => messages.length === 1, "notice delivered first");
+	assert.match(messages[0]!.content, /Background task completed: \*\*fast \(worker\)\*\*/);
+
+	// ...and the tool route that follows still returns the FULL result (D6).
+	const collected = await runtime.consumeCollect("fast");
+	assert.equal(collected?.output, "fast-out", "the collect text is never suppressed");
+	const waited = await runtime.wait(["fast"], { timeoutMs: 50 });
+	assert.equal(waited[0]?.snapshot?.output, "fast-out", "the wait text is never suppressed");
+	assert.equal(messages.length, 1, "still exactly one message: the claim stayed taken");
+	runtime.dispose();
+});
+
+test("claim a wait timeout claims nothing, so the real completion still notifies", async () => {
+	const messages: SentMessage[] = [];
+	let resolveCollect!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "slow",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/slow.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("slow");
+
+	const results = await runtime.wait(["slow"], { timeoutMs: 30 });
+	assert.equal(results[0]?.timedOut, true, "the wait gave up instead of delivering");
+	assert.equal(results[0]?.snapshot, undefined, "no snapshot was handed over");
+	assert.equal(messages.length, 0, "a timeout is not a delivery");
+
+	// The child settles afterwards: the still-unclaimed completion must arrive.
+	resolveCollect(joinSnapshot({ output: "slow-out" }));
+	await waitFor(() => messages.length === 1, "the real completion still notifies");
+	assert.match(messages[0]!.content, /slow-out/);
+	runtime.dispose();
+});
+
+test("claim D7: a fresh track after release reports again — the claim never leaks into round 2", async () => {
+	const messages: SentMessage[] = [];
+	let collects = 0;
+	let resolveRound!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	const track = () =>
+		runtime.track({
+			name: "phoenix",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/phoenix.jsonl",
+			timeoutMs: 1_000,
+			collect: () => {
+				collects += 1;
+				return new Promise<CollectSnapshot>((resolve) => {
+					resolveRound = resolve;
+				});
+			},
+		});
+
+	// Round 1: a normal completion, which claims the result.
+	track();
+	runtime.watch("phoenix");
+	await waitFor(() => collects === 1, "round 1 collect in flight");
+	resolveRound(joinSnapshot({ output: "round-1" }));
+	await waitFor(() => messages.length === 1, "round 1 notified");
+	assert.match(messages[0]!.content, /round-1/);
+
+	// Round 2: round 1's watch RELEASED the job, so this `track()` takes the
+	// NEW-job branch. Round 2 draws a fresh round number, so its claim key is its own
+	// (D10) and its notice cannot be swallowed as "already reported" — that is the
+	// property this case pins. The `existing` branch (steer / continue on a still-live
+	// job) is deliberately NOT covered here: it never resets `notified` on master, so
+	// round 2 is already gated by the legacy flag.
+	track();
+	runtime.watch("phoenix");
+	await waitFor(() => collects === 2, "round 2 collect in flight");
+	resolveRound(joinSnapshot({ output: "round-2" }));
+	await waitFor(() => messages.length === 2, "round 2 notifies again");
+	assert.match(messages[1]!.content, /round-2/);
+	assert.equal(messages.length, 2, "one notice per round, never two for one");
+	runtime.dispose();
+});
+
+test("claim D7: rewatch un-claims a result the tool route already took", async () => {
+	// The other re-arm site: the claim came from `consumeCollect` (the tool route)
+	// while the job is still tracked, and the parent then explicitly asks to be
+	// told again. Without the unclaim in `rewatch` the second round is filtered out
+	// and the parent hears nothing at all.
+	const messages: SentMessage[] = [];
+	let collects = 0;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "re",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/re.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => {
+			collects += 1;
+			return joinSnapshot({ output: `round-${collects}` });
+		},
+	});
+
+	const first = await runtime.consumeCollect("re");
+	assert.equal(first?.output, "round-1", "the tool route read round 1");
+	assert.equal(runtime.get("re") !== undefined, true, "collect does not release the job");
+	assert.equal(messages.length, 0, "reading a result is not a notice");
+
+	runtime.rewatch("re");
+	await waitFor(() => messages.length === 1, "the rewatch round notifies");
+	assert.match(messages[0]!.content, /round-2/);
+	runtime.dispose();
+});
+
+test("claim D4: a grouped outbox entry drops the claimed member and recomputes its header", async () => {
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 60 });
+
+	runtime.notifyParentRunStart();
+	for (const name of ["a", "b", "c"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+
+	// a and b settle, c is still running: the window flushes a + b as ONE grouped
+	// entry, which is then held for the live parent run.
+	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	resolvers.get("b")!(joinSnapshot({ output: "b-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "grouped entry held");
+	assert.equal(messages.length, 0, "held for the live run");
+
+	// The parent reads a before the run settles.
+	const waited = await runtime.wait(["a"], { timeoutMs: 500 });
+	assert.equal(waited[0]?.snapshot?.output, "a-out");
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "one message at settle");
+	const content = messages[0]!.content;
+	assert.match(content, /b \(worker\): completed/);
+	assert.match(content, /b-out/);
+	assert.doesNotMatch(content, /- a \(worker\)/, "the claimed member is gone from the batch");
+	assert.doesNotMatch(content, /a-out/, "its output is gone with it");
+	// The header and footer are recomputed from what survives (D4): one entry out
+	// of the two that were pending, and c — still unread, still alive — remains.
+	assert.match(content, /^Background tasks completed \(1 of 2\):$/m);
+	assert.match(content, /^Still running: c( |$)/m);
+	runtime.dispose();
+});
+
+test("claim D2(a)/D9: a CACHED collect-claim is filtered out of the join window", async () => {
+	// `consumeCollect` is the seam index.ts's collectChild awaits, so a terminal
+	// snapshot returned there is a delivery like any other.
+	//
+	// Branch honesty: the watch's `finally` already released the child by the time
+	// `consumeCollect` runs, so this exercises the FINISHED-CACHE claim
+	// (`claimCachedResult`, keyed with D9's snapshot run id) — not the job branch.
+	// Sibling c is the POSITIVE CONTROL: it proves the window really flushed, so a
+	// green result here cannot be a window that simply never fired.
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 120 });
+	for (const name of ["a", "c", "b"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	await waitFor(() => runtime.get("a") === undefined, "job released ⇒ cache branch");
+	resolvers.get("c")!(joinSnapshot({ output: "c-out" }));
+	await waitFor(() => runtime.get("c") === undefined, "c released");
+
+	// b keeps the group pending, so both entries wait for the window.
+	const collected = await runtime.consumeCollect("a");
+	assert.equal(collected?.output, "a-out");
+
+	await waitFor(() => messages.length === 1, "the window flushed the batch");
+	const content = messages[0]!.content;
+	assert.match(content, /^- c \(worker\): completed/m, "positive control: the flush really ran");
+	assert.match(content, /c-out/);
+	assert.doesNotMatch(content, /- a \(worker\)/, "a was claimed through the cache branch");
+	assert.doesNotMatch(content, /a-out/);
+	runtime.dispose();
+});
+
+test("claim D7b: re-tracking the same name drops the one-round cache (no stale read)", async () => {
+	// `runId` is the PARENT run id, so every round of the same child shares it — a
+	// surviving cache entry would hand the new round the previous round's snapshot.
+	// ANY (re)track starts a new round and must drop the cache (D7b).
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	let resolveR1!: (s: CollectSnapshot) => void;
+	runtime.track({
+		name: "a",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/a.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveR1 = resolve;
+			}),
+	});
+	runtime.watch("a");
+	resolveR1(joinSnapshot({ output: "r1-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "R1 notice held");
+	await waitFor(() => runtime.get("a") === undefined, "R1 released");
+	runtime.track({
+		name: "a",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/a2.jsonl",
+		timeoutMs: 1_000,
+		collect: () => new Promise<CollectSnapshot>(() => {}),
+	});
+	// D7 revokes the copies of a result that was ALREADY DELIVERED. Nobody read this
+	// one, so there is no claim to revoke and the notice must survive the new round
+	// (see "claim D7: an UNREAD queued notice survives a same-name re-track").
+	assert.equal(
+		runtime.noticeQueueStats().pending,
+		1,
+		"an unread copy is not dead weight: it survives the re-track",
+	);
+	runtime.release("a");
+
+	// With no job and no cache, the tool route must report a MISS — never a stale
+	// snapshot from a round the parent did not ask for.
+	const waited = await runtime.wait(["a"], { timeoutMs: 200 });
+	assert.deepEqual(
+		waited,
+		[{ name: "a", missing: true }],
+		"no stale round-1 snapshot may survive the re-track",
+	);
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the unread round-1 notice is still delivered");
+	assert.match(messages[0]!.content, /r1-out/);
+	assert.equal(messages.length, 1, "exactly once");
+	runtime.dispose();
+});
+
+test("claim D7b: the same child's next-round failure is not swallowed by the old cache", async () => {
+	// The critical direction: round 1 succeeded and its snapshot was cached; round 2
+	// throws. Serving (and claiming) that stale snapshot told the parent "success"
+	// AND claimed exactly the key of round 2's failure notice, so the failure was
+	// lost. `runId` is the same in both rounds — a parent run id, not a round id.
+	//
+	// Notices are delivered immediately here (no live parent run), so each round
+	// speaks for itself: round 1's claim is revoked by round 2's track (D7), and
+	// round 2's failure must reach the parent.
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+
+	// Round 1: success, delivered at once.
+	let resolveR1!: (s: CollectSnapshot) => void;
+	runtime.track({
+		name: "a",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/a.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveR1 = resolve;
+			}),
+	});
+	runtime.watch("a");
+	resolveR1(joinSnapshot({ output: "out-success" }));
+	await waitFor(() => messages.length === 1, "round 1 announced");
+	await waitFor(() => runtime.get("a") === undefined, "round 1 released");
+
+	// Round 2 on the SAME (parent run id, name): the collect throws.
+	runtime.track({
+		name: "a",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/a.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => {
+			throw new Error("r2 boom");
+		},
+	});
+	runtime.watch("a");
+	await waitFor(() => messages.length === 2, "round 2's failure reaches the parent");
+	// `collectFailureInput` carries no agent, so the label is the bare name.
+	assert.match(messages[1]!.content, /Background task failed: \*\*a\*\*/);
+	assert.match(messages[1]!.content, /r2 boom/);
+
+	// The parent asks for the result afterwards: no cache survives the re-track, so
+	// this is a miss — never round 1's stale success.
+	const waited = await runtime.wait(["a"], { timeoutMs: 200 });
+	assert.notEqual(waited[0]?.snapshot?.output, "out-success", "no stale success is served");
+	assert.equal(waited[0]?.missing, true, "the round-2 job is gone and the cache was dropped");
+	assert.equal(messages.length, 2, "one notice per round, nothing repeated");
+	runtime.dispose();
+});
+
+test("claim D2(a): waitOne claims BEFORE the retire await, so the window cannot fire in between", async () => {
+	// A pending `retire` is the only way to reach waitOne's terminal branch while the
+	// job (and its buffered entry) is still alive: the claim must already be taken by
+	// then, or a join flush landing inside the retire await delivers the same result
+	// a second time.
+	//
+	// Sibling z is the POSITIVE CONTROL: its unclaimed entry rides in the same batch,
+	// so "z arrived, a did not" proves the window really expired DURING the park —
+	// no bare sleep is load-bearing here.
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const retires: Array<{ name: string; release: () => void }> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 150 });
+	for (const name of ["a", "z", "b"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+			retire: () =>
+				new Promise<void>((resolve) => {
+					retires.push({ name, release: resolve });
+				}),
+		});
+		runtime.watch(name);
+	}
+
+	// a and z finish: the window opens (b is still pending) and both watches park in
+	// the retire await, so both jobs keep their buffered entries.
+	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	await waitFor(() => retires.length === 1, "a's watch is awaiting retire");
+	assert.ok(runtime.get("a"), "the job survives a pending retire");
+	resolvers.get("z")!(joinSnapshot({ output: "z-out" }));
+	await waitFor(() => retires.length === 2, "z's watch is awaiting retire");
+
+	// The explicit wait reaches the terminal branch and parks in its own retire
+	// await — the exact window the claim has to cover.
+	const pendingWait = runtime.wait(["a"], { timeoutMs: 5_000 });
+	await waitFor(() => retires.length === 3, "the wait is parked in the retire await");
+
+	// The window expires while the wait is parked. Positive control: z is delivered.
+	await waitFor(() => messages.length === 1, "the window expired during the retire await");
+	const content = messages[0]!.content;
+	assert.match(content, /^- z \(worker\): completed/m, "positive control: the flush really ran");
+	assert.match(content, /z-out/);
+	assert.doesNotMatch(content, /- a \(worker\)/, "a's claim was taken before the retire await");
+	assert.doesNotMatch(content, /a-out/);
+
+	// Release the wait's park: it returns the snapshot, and still nothing for a.
+	retires[2]!.release();
+	const waited = await pendingWait;
+	assert.equal(waited[0]?.snapshot?.output, "a-out");
+	assert.equal(messages.length, 1, "still exactly one message: z only");
+	for (const gate of retires) gate.release();
+	await drainContinuations();
+	runtime.dispose();
+});
+
+test("claim D2(b): a collect-claimed member is dropped from the batch that flushes right now", async () => {
+	// `consumeCollect` really takes the JOB branch here (a pending retire keeps the
+	// job tracked), so the claim comes from `claimIfTerminal`, not from the finished
+	// cache. The sibling entry d in the same batch is the positive control: it proves
+	// the window actually flushed while a demonstrably stayed out.
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const retires: Array<() => void> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 300 });
+	for (const name of ["a", "d", "b"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+			retire: () =>
+				new Promise<void>((resolve) => {
+					retires.push(resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	resolvers.get("d")!(joinSnapshot({ output: "d-out" }));
+	await waitFor(() => retires.length === 2, "a and d are parked in retire");
+	assert.ok(runtime.get("a"), "a is still TRACKED — this is the job branch");
+
+	const collected = await runtime.consumeCollect("a");
+	assert.equal(collected?.output, "a-out");
+
+	await waitFor(() => messages.length === 1, "the window flushed the batch");
+	const content = messages[0]!.content;
+	assert.match(content, /^- d \(worker\): completed/m, "positive control: the flush really ran");
+	assert.match(content, /d-out/);
+	assert.doesNotMatch(content, /- a \(worker\)/, "a was claimed through the job branch");
+	assert.doesNotMatch(content, /a-out/);
+	runtime.dispose();
+});
+
+test("claim D4: the grouped header collapses to (1) when the only other member was read", async () => {
+	// The `N of 1` shape: the batch is still the grouped notice (it was built from
+	// two members), but after the claim only one survives and nothing is still
+	// running — so the header must say exactly `(1)`.
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	for (const name of ["a", "b"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	// Both settle → ONE grouped entry (2 members) held for the live run.
+	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	resolvers.get("b")!(joinSnapshot({ output: "b-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "grouped entry held");
+
+	const waited = await runtime.wait(["a"], { timeoutMs: 500 });
+	assert.equal(waited[0]?.snapshot?.output, "a-out");
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "one message at settle");
+	const content = messages[0]!.content;
+	assert.match(content, /^Background tasks completed \(1\):$/m, "N of 1: one survivor, nothing still running");
+	assert.doesNotMatch(content, /\d+ of \d+/, "no stale `N of M` header");
+	assert.match(content, /^- b \(worker\): completed/m);
+	assert.doesNotMatch(content, /- a \(worker\)/);
+	runtime.dispose();
+});
+
+// ═════ D7 atomicity (revoked copies) · consumeCollectInterruptible (the real seam) ═════
+
+test("claim D7: re-tracking after a read revokes the held copy (no revived notice)", async () => {
+	// The measured regression: wait read the result (so the queued entry was dead
+	// weight), then a same-(runId, name) track ran. Unclaiming the KEY without
+	// dropping the queued COPY resurrected the already-read notice into the next
+	// settle. `runId` is the parent run id, so this is an everyday continue.
+	//
+	// Under D10 the queued copy carries the round it came from, so it is filtered by
+	// THAT round's claim — and the fresh round's revoke is a no-op (nothing was
+	// claimed for it yet). Same observable, one less mechanism to rely on.
+	const messages: SentMessage[] = [];
+	let resolveCollect!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "held",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/held.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("held");
+	resolveCollect(joinSnapshot({ output: "held-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held in the outbox");
+
+	const waited = await runtime.wait(["held"], { timeoutMs: 500 });
+	assert.equal(waited[0]?.snapshot?.output, "held-out");
+	assert.equal(runtime.noticeQueueStats().pending, 0, "the held copy is dead weight now");
+
+	// The parent continues the same child before the run settles: a new round, so the
+	// old queued copy must be revoked together with the claim (D7 atomically).
+	runtime.track({
+		name: "held",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/held.jsonl",
+		timeoutMs: 1_000,
+		collect: () => new Promise<CollectSnapshot>(() => {}),
+	});
+	runtime.release("held");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 0, "settle sends nothing: a read result is never re-announced");
+	runtime.dispose();
+});
+
+test("claim D2(b): consumeCollectInterruptible claims on the JOB branch", async () => {
+	// Production always passes a signal, so THIS seam — not plain consumeCollect — is
+	// what collectChild actually awaits. A pending retire keeps the job tracked so the
+	// claim is the job-branch one; sibling d is the positive control for the flush.
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const retires: Array<() => void> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 150 });
+	for (const name of ["a", "d", "b"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+			retire: () =>
+				new Promise<void>((resolve) => {
+					retires.push(resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	resolvers.get("d")!(joinSnapshot({ output: "d-out" }));
+	await waitFor(() => retires.length === 2, "a and d are parked in retire");
+	assert.ok(runtime.get("a"), "a is still TRACKED — this is the job branch");
+
+	const collected = await runtime.consumeCollectInterruptible("a", new AbortController().signal);
+	assert.equal(collected?.output, "a-out");
+
+	await waitFor(() => messages.length === 1, "the window flushed the batch");
+	const content = messages[0]!.content;
+	assert.match(content, /^- d \(worker\): completed/m, "positive control: the flush really ran");
+	assert.match(content, /d-out/);
+	assert.doesNotMatch(content, /- a \(worker\)/, "a was claimed through the job branch");
+	assert.doesNotMatch(content, /a-out/);
+	runtime.dispose();
+});
+
+test("claim D2(a)/D9: consumeCollectInterruptible claims on the CACHE branch", async () => {
+	// The other half of the same seam: the watch already released the child, so the
+	// snapshot comes from the finished cache and the claim is `claimCachedResult`.
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 150 });
+	for (const name of ["a", "c", "b"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	await waitFor(() => runtime.get("a") === undefined, "job released ⇒ cache branch");
+	resolvers.get("c")!(joinSnapshot({ output: "c-out" }));
+	await waitFor(() => runtime.get("c") === undefined, "c released");
+
+	const collected = await runtime.consumeCollectInterruptible("a", new AbortController().signal);
+	assert.equal(collected?.output, "a-out");
+
+	await waitFor(() => messages.length === 1, "the window flushed the batch");
+	const content = messages[0]!.content;
+	assert.match(content, /^- c \(worker\): completed/m, "positive control: the flush really ran");
+	assert.match(content, /c-out/);
+	assert.doesNotMatch(content, /- a \(worker\)/, "a was claimed through the cache branch");
+	assert.doesNotMatch(content, /a-out/);
+	runtime.dispose();
+});
+
+test("claim D7b: a revive (existing branch) also drops the one-round cache", async () => {
+	// Both `track()` branches must drop the cache. Here the job is still live
+	// (`consumeCollect` does not release), so the second track takes the EXISTING
+	// branch — the one a `notified`-based reading of D7 leaves alone. If the cached
+	// round-1 snapshot survived, a later read would be served it.
+	const runtime = createSessionRuntime({ sendMessage() {} });
+	let collects = 0;
+	const track = () =>
+		runtime.track({
+			name: "a",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/a.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => {
+				collects += 1;
+				return joinSnapshot({ output: `round-${collects}` });
+			},
+		});
+
+	track();
+	const first = await runtime.consumeCollect("a");
+	assert.equal(first?.output, "round-1");
+	assert.ok(runtime.get("a"), "collect does not release ⇒ the revive branch is reachable");
+
+	track(); // EXISTING branch: the child starts a new round
+	runtime.release("a");
+	const waited = await runtime.wait(["a"], { timeoutMs: 200 });
+	assert.deepEqual(
+		waited,
+		[{ name: "a", missing: true }],
+		"no round-1 snapshot may survive the revive",
+	);
+	runtime.dispose();
+});
+
+test("claim D-B: a cap flush that delivers nothing is not counted as a forced send", async () => {
+	// `forcedFlushes` documents forced SENDS. A cap that fires on a batch whose only
+	// member was already read claims nothing and sends nothing, so counting it would
+	// report a message that never existed.
+	const messages: SentMessage[] = [];
+	const overflow = manualOverflow();
+	let t = 1_000;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+		now: () => t,
+		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
+	});
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "stuck",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/stuck.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "stuck-out" }),
+	});
+	runtime.watch("stuck");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+
+	// The parent reads it before the cap fires; the queued copy is now dead weight.
+	const waited = await runtime.wait(["stuck"], { timeoutMs: 500 });
+	assert.equal(waited[0]?.snapshot?.output, "stuck-out");
+	assert.equal(overflow.timers.length, 1, "the cap arm is still live");
+
+	t += MAX_PENDING_AGE_MS;
+	overflow.timers[0]!.fn();
+	assert.equal(messages.length, 0, "a fully claimed batch sends nothing");
+	assert.equal(
+		runtime.noticeQueueStats().forcedFlushes,
+		0,
+		"a forced flush that sent nothing is not a forced send",
+	);
+	runtime.dispose();
+});
+
+test("claim D7: an UNREAD queued notice survives a same-name re-track", async () => {
+	// D7 revokes the copies of a result the parent ALREADY READ. A notice nobody read
+	// has no claim to revoke, so `stop` + `continue` of the same child must not
+	// silently drop it: `release()` does not unclaim, and the next `track()` takes the
+	// NEW-job branch, whose revoke targets the NEW round and is therefore a no-op —
+	// D10's "one round = one deliverable result".
+	const messages: SentMessage[] = [];
+	let resolveCollect!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "A",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/A.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("A");
+	resolveCollect(joinSnapshot({ output: "unread-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice queued while unread");
+	await waitFor(() => runtime.get("A") === undefined, "A released (the `stop` path)");
+
+	// `continue` / resume the same child: new job, same (runId, name).
+	runtime.track({
+		name: "A",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/A.jsonl",
+		timeoutMs: 1_000,
+		collect: () => new Promise<CollectSnapshot>(() => {}),
+	});
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the unread notice still arrives");
+	assert.match(messages[0]!.content, /unread-out/);
+	assert.equal(messages.length, 1, "exactly once: not dropped, not duplicated");
+	runtime.dispose();
+});
+
+test("claim D4: a terminal sibling parked in retire is not listed as `Still running`", async () => {
+	// `awaiting` is a TERMINAL marker: the completion is already buffered/announced and
+	// the watch is only parked in `retire`. Listing that sibling under `Still running:`
+	// contradicts the completed entry the same burst delivered — and D4 recomputes the
+	// footer at delivery, so the window can be up to 80s wide.
+	//
+	// The reachable shape is a sibling that ended but whose notice was never delivered:
+	// here the host REJECTS alpha's send (the documented "dropped, not requeued"
+	// path), so alpha stays tracked in `awaiting` and unclaimed.
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	let rejectAlpha = true;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			const content = (message as SentMessage).content;
+			if (rejectAlpha && /alpha-out/.test(content)) {
+				rejectAlpha = false;
+				throw new Error("host rejected the alpha notice");
+			}
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 80 });
+	for (const name of ["alpha", "beta", "gamma"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+			// Never resolves: a finished child stays tracked in `awaiting`.
+			retire: () => new Promise<void>(() => {}),
+		});
+		runtime.watch(name);
+	}
+
+	// Window 1 tries to announce alpha alone; the host rejects it, so alpha keeps no
+	// claim and stays in `awaiting` (its retire never lands).
+	resolvers.get("alpha")!(joinSnapshot({ output: "alpha-out" }));
+	await waitFor(() => rejectAlpha === false, "window 1 attempted alpha");
+	assert.equal(messages.length, 0, "the rejected notice is dropped, not requeued");
+	assert.ok(runtime.get("alpha"), "alpha is still tracked (retire is in flight)");
+
+	// Window 2 announces beta. alpha ended a message ago and gamma is genuinely alive,
+	// so the footer may name gamma only.
+	resolvers.get("beta")!(joinSnapshot({ output: "beta-out" }));
+	await waitFor(() => messages.length === 1, "window 2 flushed beta");
+	const second = messages[0]!.content;
+	assert.match(second, /^- beta \(worker\): completed/m);
+	assert.match(second, /^Still running: gamma \(notifies separately/m, "gamma is genuinely still running");
+	assert.doesNotMatch(
+		second,
+		/Still running:[^\n]*alpha/,
+		"a terminal sibling parked in retire is not `still running`",
+	);
+	runtime.dispose();
+});
+
+// ═══════════════ D10: one round = one deliverable result (claim key has a round) ═══════════════
+
+test("claim D10: two unread rounds of one child are both delivered, FIFO", async () => {
+	// `runId` is the PARENT run id, so two rounds of the same child share it. Without
+	// the round in the claim key the first delivery claimed the key and the second
+	// round's notice was filtered — the parent saw the OLD result and never the new one.
+	const messages: SentMessage[] = [];
+	const resolvers: Array<(s: CollectSnapshot) => void> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	const track = () =>
+		runtime.track({
+			name: "A",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/A.jsonl",
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.push(resolve);
+				}),
+		});
+
+	// Round 1 completes; its notice is held for the live run (never read).
+	track();
+	runtime.watch("A");
+	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "round 1 held");
+	await waitFor(() => runtime.get("A") === undefined, "round 1 released");
+
+	// Round 2 on the same (parent run id, name): another unread result, held too.
+	track();
+	runtime.watch("A");
+	resolvers[1]!(joinSnapshot({ output: "round-2-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 2, "both rounds held");
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 2, "both rounds are delivered");
+	assert.match(messages[0]!.content, /round-1-out/, "FIFO: round 1 first");
+	assert.match(messages[1]!.content, /round-2-out/, "round 2 is not swallowed by round 1's claim");
+	assert.equal(messages.length, 2, "one notice per round, no duplicates");
+	runtime.dispose();
+});
+
+test("claim D10: a read round does not suppress the next round's notice", async () => {
+	// The reverse direction of the same key problem: round 1 was READ (so its claim is
+	// legitimate), and round 2 must still be announced — the claim belongs to round 1,
+	// not to the child forever.
+	const messages: SentMessage[] = [];
+	const resolvers: Array<(s: CollectSnapshot) => void> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	const track = () =>
+		runtime.track({
+			name: "A",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/A.jsonl",
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.push(resolve);
+				}),
+		});
+
+	// Round 1: completes, and the parent reads it before the run settles.
+	track();
+	runtime.watch("A");
+	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "round 1 held");
+	const first = await runtime.wait(["A"], { timeoutMs: 500 });
+	assert.equal(first[0]?.snapshot?.output, "round-1-out");
+	assert.equal(runtime.noticeQueueStats().pending, 0, "round 1's copy is dead weight now");
+
+	// Round 2: completes unread.
+	track();
+	runtime.watch("A");
+	resolvers[1]!(joinSnapshot({ output: "round-2-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "round 2 held");
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "only round 2 is announced");
+	assert.match(messages[0]!.content, /round-2-out/);
+	assert.doesNotMatch(messages[0]!.content, /round-1-out/, "round 1 stays suppressed");
+	assert.equal(messages.length, 1, "exactly one message");
+	runtime.dispose();
+});
+
+// ═══════════ F1/F2: the round travels with the snapshot, and survives `persist` ═══════════
+
+test("claim F2: a re-track during `persist` keeps the one-round cache invalid", async () => {
+	// `current` is computed BEFORE `await job.persist()`, and `track()` does not bump
+	// `generation` — so without a re-check the stale round-1 collect writes its snapshot
+	// back over the invalidation `track()` just performed (D7b), and the next `wait`
+	// serves the PREVIOUS round's result.
+	const messages: SentMessage[] = [];
+	let releasePersist!: () => void;
+	let resolveCollect!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	const track = () =>
+		runtime.track({
+			name: "A",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/A.jsonl",
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolveCollect = resolve;
+				}),
+			persist: () =>
+				new Promise<void>((resolve) => {
+					releasePersist = resolve;
+				}),
+		});
+
+	// Round 1 lands but is stuck in `persist`.
+	track();
+	runtime.watch("A");
+	resolveCollect(joinSnapshot({ output: "round-1-out" }));
+	await waitFor(() => typeof releasePersist === "function", "round 1 is persisting");
+
+	// Re-track WHILE persist is still in flight, then let it finish.
+	track();
+	releasePersist();
+	await waitFor(() => runtime.get("A") === undefined, "round 1's watch released the job");
+
+	// The cache must not have been repopulated with round 1's snapshot.
+	const waited = await runtime.wait(["A"], { timeoutMs: 200 });
+	assert.deepEqual(
+		waited,
+		[{ name: "A", missing: true }],
+		"no previous-round snapshot may survive the re-track",
+	);
+	assert.equal("snapshot" in waited[0]!, false, "no stale output was served");
+
+	// Nothing read it, so the notice is the only route — and it must arrive once.
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the unread round-1 notice still arrives");
+	assert.match(messages[0]!.content, /round-1-out/);
+	assert.equal(messages.length, 1, "exactly once: neither swallowed nor duplicated");
+	runtime.dispose();
+});
+
+test("claim F1: a notice carries the round its snapshot was COLLECTED in", async () => {
+	// `track()` on a live job bumps the round mid-collect. The snapshot that lands
+	// afterwards belongs to the OLD round: if its notice is labelled with the live
+	// round instead, that entry's claim steals the NEW round's key and the new round's
+	// real result is filtered out (the parent never sees it).
+	const messages: SentMessage[] = [];
+	const resolvers: Array<(s: CollectSnapshot) => void> = [];
+	const retires: Array<() => void> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	let started = 0;
+	const track = () =>
+		runtime.track({
+			name: "A",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/A.jsonl",
+			timeoutMs: 1_000,
+			collect: () => {
+				const index = started;
+				started += 1;
+				return new Promise<CollectSnapshot>((resolve) => {
+					resolvers[index] = resolve;
+				});
+			},
+			// Never resolves: a finished child stays tracked while parked in retire.
+			retire: () =>
+				new Promise<void>((resolve) => {
+					retires.push(resolve);
+				}),
+		});
+
+	// Round 1 starts collecting, then the child is re-tracked (round 2).
+	track();
+	runtime.watch("A");
+	await waitFor(() => resolvers.length === 1, "round 1 is collecting");
+	track();
+
+	// Round 1's snapshot lands now, AFTER the round bump.
+	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	await waitFor(() => retires.length === 1, "round 1's watch is parked in retire");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "round 1's notice is queued unread");
+
+	// Round 2's own collect lands too (via rewatch: same round label, fresh snapshot).
+	runtime.rewatch("A");
+	await waitFor(() => resolvers.length === 2, "round 2 is collecting");
+	resolvers[1]!(joinSnapshot({ output: "round-2-out" }));
+	await waitFor(() => retires.length === 2, "round 2's watch is parked in retire");
+	await waitFor(() => runtime.noticeQueueStats().pending === 2, "both notices queued");
+
+	// The parent reads A: the live collect is round 2's, so it claims round 2.
+	const pendingWait = runtime.wait(["A"], { timeoutMs: 5_000 });
+	await waitFor(() => retires.length === 3, "the wait is parked in retire");
+	retires[2]!();
+	const waited = await pendingWait;
+	assert.equal(waited[0]?.snapshot?.output, "round-2-out");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "only round 1's notice is still live");
+
+	// Round 2 was read through the tool route, so only ROUND 1's notice may arrive.
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "round 1's unread notice is delivered");
+	assert.match(messages[0]!.content, /round-1-out/);
+	assert.doesNotMatch(messages[0]!.content, /round-2-out/, "round 2 was read, not announced");
+	assert.equal(messages.length, 1, "the old round's entry did not steal the new round's key");
+	for (const release of retires) release();
+	await drainContinuations();
+	runtime.dispose();
+});
+
+test("claim F1: the wait claims the round its snapshot was collected in (no duplicate)", async () => {
+	// The duplicate direction of F1: a `track()` bumps the live round while round 1's
+	// collect is still pending, and the parent then reads that very snapshot through the
+	// tool route. The claim must land on the round the NOTICE carries — i.e. the
+	// snapshot's origin — or the same output is announced on top of the tool result.
+	const messages: SentMessage[] = [];
+	const resolvers: Array<(s: CollectSnapshot) => void> = [];
+	const retires: Array<() => void> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	let started = 0;
+	const track = () =>
+		runtime.track({
+			name: "A",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/A.jsonl",
+			timeoutMs: 1_000,
+			collect: () => {
+				const index = started;
+				started += 1;
+				return new Promise<CollectSnapshot>((resolve) => {
+					resolvers[index] = resolve;
+				});
+			},
+			// Never resolves: a finished child stays tracked while parked in retire.
+			retire: () =>
+				new Promise<void>((resolve) => {
+					retires.push(resolve);
+				}),
+		});
+
+	// Round 1 starts collecting, then the child is re-tracked (round 2).
+	track();
+	runtime.watch("A");
+	await waitFor(() => resolvers.length === 1, "round 1 is collecting");
+	track();
+
+	// Round 1's snapshot lands after the bump: its notice is queued (unread).
+	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	await waitFor(() => retires.length === 1, "round 1's watch is parked in retire");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "round 1's notice is queued unread");
+
+	// The live collect promise is still round 1's, so this tool result IS round 1's
+	// output — and it must claim exactly the round that notice carries.
+	const pendingWait = runtime.wait(["A"], { timeoutMs: 5_000 });
+	await waitFor(() => retires.length === 2, "the wait is parked in retire");
+	retires[1]!();
+	const waited = await pendingWait;
+	assert.equal(waited[0]?.snapshot?.output, "round-1-out");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 0, "the result was read: its notice must not arrive too");
+	runtime.dispose();
+});
+
+test("claim F1: an interruptible collect claims the round its snapshot was collected in", async () => {
+	// Same seam the production `collect` tool uses (`consumeCollectInterruptible`), with
+	// the round bumped mid-collect: the job-branch claim goes through `claimIfTerminal`,
+	// which must read the SNAPSHOT's origin — otherwise the unread notice it should
+	// suppress is delivered next to the tool result.
+	const messages: SentMessage[] = [];
+	const resolvers: Array<(s: CollectSnapshot) => void> = [];
+	const retires: Array<() => void> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	let started = 0;
+	const track = () =>
+		runtime.track({
+			name: "A",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/A.jsonl",
+			timeoutMs: 1_000,
+			collect: () => {
+				const index = started;
+				started += 1;
+				return new Promise<CollectSnapshot>((resolve) => {
+					resolvers[index] = resolve;
+				});
+			},
+			retire: () =>
+				new Promise<void>((resolve) => {
+					retires.push(resolve);
+				}),
+		});
+
+	track();
+	runtime.watch("A");
+	await waitFor(() => resolvers.length === 1, "round 1 is collecting");
+	track(); // round 2 while round 1's collect is pending
+
+	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	await waitFor(() => retires.length === 1, "round 1's watch is parked in retire");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "round 1's notice is queued unread");
+
+	const collected = await runtime.consumeCollectInterruptible("A", new AbortController().signal);
+	assert.equal(collected?.output, "round-1-out", "the cache-free job branch served round 1");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 0, "the read result's notice must not arrive too");
+	runtime.dispose();
+});
