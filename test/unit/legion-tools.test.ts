@@ -15,8 +15,8 @@ import {
 	type LegionCommandRunner,
 } from "../../src/extension/legion-tools.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
-import { readEventsAfter } from "../../src/legion/events.ts";
-import { MAIL_DELIVERY, inbox, pendingInbox, sendMail } from "../../src/legion/mail.ts";
+import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
+import { MAIL_DELIVERY, formatMail, inbox, pendingInbox, sendMail, transitionDelivery } from "../../src/legion/mail.ts";
 import { getNode, insertNode, listStaleNodes, updateNode } from "../../src/legion/nodes.ts";
 import { getUsage } from "../../src/legion/usage.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -59,6 +59,14 @@ function session(text: string): string {
 		{ type: "message", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop", usage: { input: 4, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } } } },
 	];
 	return `${messages.map((line) => JSON.stringify(line)).join("\n")}\n`;
+}
+
+/** A session whose user turns are exactly the given strings, one turn each. */
+function userSession(texts: readonly string[]): string {
+	const lines = texts.map((text) =>
+		JSON.stringify({ type: "message", message: { role: "user", content: text } }),
+	);
+	return `${lines.join("\n")}\n`;
 }
 
 function makePhaseFixture() {
@@ -323,7 +331,7 @@ test("postman injects active/retired-recipient mail, bounces terminal mail, and 
 	}
 });
 
-test("an intercepted steer-mail warns instead of pretending the child saw it (#313)", async () => {
+test("an intercepted steer-mail bounces with a reason instead of claiming acceptance (#322)", async () => {
 	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-postman-intercepted-"));
 	const db = openLegionDb(":memory:");
 	const supervisor = new FakeSupervisor();
@@ -341,6 +349,8 @@ test("an intercepted steer-mail warns instead of pretending the child saw it (#3
 		supervisor.steerDisposition = "intercepted";
 		const mail = sendMail(db, { fromNode: "root.team", to: "active", subject: "do now", body: "work", urgency: "action-needed" }, { now: () => now });
 		assert.equal(mail.ok, true);
+		if (!mail.ok) return;
+		const messageId = mail.messages[0]!.id;
 		const postman = new LegionPostman({
 			db,
 			nodeId: "root.team",
@@ -353,24 +363,209 @@ test("an intercepted steer-mail warns instead of pretending the child saw it (#3
 		await postman.tick();
 		postman.stop();
 
-		// The state machine is unchanged (#313 D3): the send returned, so the mail is
-		// INJECTED and will never be retried…
-		const injected = inbox(db, active.id, { delivery: MAIL_DELIVERY.INJECTED });
-		assert.equal(injected.length, 1);
-		assert.equal(pendingInbox(db, active.id).length, 0, "INJECTED promises no retry");
-		// …which is exactly why the swallowed case must be visible, not silent.
-		assert.equal(warnings.length, 1, `expected exactly one warning, got: ${warnings.join(" | ")}`);
-		assert.match(warnings[0]!, /was intercepted by an input handler/);
-		assert.match(warnings[0]!, /never saw it/);
-		assert.match(
-			warnings[0]!,
-			new RegExp(`mail ${injected[0]!.id} `),
-			"the warning names the message so a parent can act on it",
+		// The child never saw the text and no retry exists, so the ledger says so
+		// (#322): bounced, not accepted — and the state itself carries the news, which
+		// is why the old console.warn is gone.
+		assert.equal(inbox(db, active.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0, "an intercepted send is not ACCEPTED");
+		assert.equal(inbox(db, active.id, { delivery: MAIL_DELIVERY.BOUNCED }).length, 1);
+		assert.equal(pendingInbox(db, active.id).length, 0, "a bounce promises no retry");
+		assert.deepEqual(warnings, [], "the state now tells the truth; no side-channel warning is needed");
+		const bounced = readEventsAfter(db, 0).filter((event) => event.type === "mail_bounced");
+		assert.equal(bounced.length, 1);
+		assert.equal(
+			(bounced[0]!.data as { messageId?: number; reason?: string }).messageId,
+			messageId,
+			"the sender gets a mail_bounced event naming the message",
+		);
+		assert.equal(
+			(bounced[0]!.data as { reason?: string }).reason,
+			"intercepted_by_input_handler",
+			"#322 D2: the reason distinguishes a swallowed send from a terminal recipient",
+		);
+		assert.equal(
+			readEventsAfter(db, 0).filter((event) => event.type === "mail_delivered").length,
+			0,
+			"nothing was delivered, so nothing claims to be",
 		);
 	} finally {
 		console.warn = originalWarn;
 		db.close();
 		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("queued, accepted, and prompted sends all settle on ACCEPTED — never on DELIVERED (#322)", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-postman-accepted-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	mkdirSync(rootDir, { recursive: true });
+	const now = 10;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running" }, () => 2);
+		const busy = insertNode(db, { parentId: "root.team", name: "busy", role: "worker", status: "running", sessionFile: path.join(rootDir, "busy.jsonl") }, () => 3);
+		const idler = insertNode(db, { parentId: "root.team", name: "idler", role: "worker", status: "settled", sessionFile: path.join(rootDir, "idler.jsonl") }, () => 4);
+		await supervisor.spawnChild({ name: busy.name, task: "busy", agent: agent("worker"), sessionFile: busy.sessionFile!, tempDir: rootDir, cwd: rootDir });
+		await supervisor.spawnChild({ name: idler.name, task: "idle", agent: agent("worker"), sessionFile: idler.sessionFile!, tempDir: rootDir, cwd: rootDir });
+		// `queued` is the steer answer while the child is mid-tool-batch: accepted for
+		// pickup at its next turn boundary, and nothing more can be claimed.
+		supervisor.steerDisposition = "queued";
+		assert.equal(sendMail(db, { fromNode: "root.team", to: "busy", subject: "steer", body: "one", urgency: "action-needed" }, { now: () => now }).ok, true);
+		// An `info` send takes `followUp` — still no delivery evidence either.
+		assert.equal(sendMail(db, { fromNode: "root.team", to: "busy", subject: "follow up", body: "two", urgency: "info" }, { now: () => now }).ok, true);
+		// A settled-but-alive recipient goes through `prompt`, which returns void: the
+		// backend cannot even distinguish queued from accepted, so ACCEPTED is its ceiling.
+		assert.equal(sendMail(db, { fromNode: "root.team", to: "idler", subject: "wake", body: "three", urgency: "action-needed" }, { now: () => now }).ok, true);
+		const postman = new LegionPostman({ db, nodeId: "root.team", supervisor, now: () => now, intervalMs: 10_000 });
+		await postman.tick();
+		postman.stop();
+
+		assert.equal(inbox(db, busy.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 2, "queued and followUp are ACCEPTED");
+		assert.equal(inbox(db, idler.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1, "a void prompt is ACCEPTED at best");
+		assert.equal(inbox(db, busy.id, { delivery: MAIL_DELIVERY.DELIVERED }).length + inbox(db, idler.id, { delivery: MAIL_DELIVERY.DELIVERED }).length, 0);
+		assert.equal(pendingInbox(db, busy.id).length + pendingInbox(db, idler.id).length, 0, "a returned send is never retried");
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_sent").length, 3);
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_delivered").length, 0, "no send path may invent delivery");
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("ACCEPTED mail is promoted to DELIVERED only on an exact session-text match (#322)", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-postman-delivered-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	mkdirSync(rootDir, { recursive: true });
+	const exactSession = path.join(rootDir, "exact.jsonl");
+	const nearSession = path.join(rootDir, "near.jsonl");
+	const now = 10;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running" }, () => 2);
+		const exact = insertNode(db, { parentId: "root.team", name: "exact", role: "worker", status: "running", sessionFile: exactSession }, () => 3);
+		const near = insertNode(db, { parentId: "root.team", name: "near", role: "worker", status: "running", sessionFile: nearSession }, () => 4);
+		const exactMail = sendMail(db, { fromNode: "root.team", to: "exact", subject: "scope", body: "implement the parser" }, { now: () => now });
+		const nearMail = sendMail(db, { fromNode: "root.team", to: "near", subject: "scope", body: "implement the lexer" }, { now: () => now });
+		assert.equal(exactMail.ok && nearMail.ok, true);
+		if (!exactMail.ok || !nearMail.ok) return;
+		const exactMessage = exactMail.messages[0]!;
+		const nearMessage = nearMail.messages[0]!;
+		// Both sends already returned: ACCEPTED, and now the children have session turns.
+		transitionDelivery(db, exactMessage.id, MAIL_DELIVERY.ACCEPTED, () => now);
+		transitionDelivery(db, nearMessage.id, MAIL_DELIVERY.ACCEPTED, () => now);
+		// Exact: the user turn is byte-for-byte the envelope the postman injects.
+		writeFileSync(exactSession, userSession([formatMail(exactMessage)]));
+		// Near: the body shows up inside a longer user turn (a child quoting mail back).
+		// A containment test would call this delivered; the frozen criterion must not.
+		writeFileSync(nearSession, userSession([`please continue: ${nearMessage.body} (quoted from mail #${nearMessage.id})`]));
+		const postman = new LegionPostman({ db, nodeId: "root.team", supervisor, now: () => now, intervalMs: 10_000 });
+		await postman.tick();
+		// Idempotency: a second confirmation pass must not rewrite state or duplicate events.
+		await postman.tick();
+		postman.stop();
+
+		assert.equal(inbox(db, exact.id, { delivery: MAIL_DELIVERY.DELIVERED }).length, 1, "an exact user turn proves delivery");
+		assert.equal(inbox(db, near.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1, "a substring is not proof of delivery");
+		assert.equal(inbox(db, near.id, { delivery: MAIL_DELIVERY.DELIVERED }).length, 0);
+		const delivered = readEventsAfter(db, 0).filter((event) => event.type === "mail_delivered");
+		assert.equal(delivered.length, 1, "two ticks write exactly one mail_delivered event");
+		assert.equal((delivered[0]!.data as { messageId?: number }).messageId, exactMessage.id);
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("a phase-timeout notice is still delivered while its phase is current (#333)", async () => {
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const rootMessages: string[] = [];
+	const now = 1001;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running", phase: "reviewing", phaseSince: 100 }, () => 2);
+		appendEvent(db, "root.team", "phase_timeout", { phase: "reviewing", phaseSince: 100, elapsedMs: 1_800_573, timeoutMs: 1_800_000 }, { now: () => 1000 });
+		assert.equal(sendMail(db, {
+			fromNode: "root.team", to: "parent", subject: "Phase timeout: team", kind: "notice", urgency: "action-needed",
+			body: "Legion phase timeout: root.team has been in reviewing for 1800573ms (limit 1800000ms). Work was not killed; decide whether to extend or abort.",
+		}, { now: () => 1000 }).ok, true);
+		const postman = new LegionPostman({ db, nodeId: "root", supervisor, now: () => now, sendRootMessage: (message) => rootMessages.push(message), intervalMs: 10_000 });
+		await postman.tick();
+		postman.stop();
+
+		assert.equal(rootMessages.length, 1, "a live phase timeout still reaches the parent");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 0);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+	} finally {
+		db.close();
+	}
+});
+
+test("a phase-timeout notice whose phase already ended goes OBSOLETE and is never injected (#333)", async () => {
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const rootMessages: string[] = [];
+	const now = 5_001;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running", phase: "reviewing", phaseSince: 100 }, () => 2);
+		appendEvent(db, "root.team", "phase_timeout", { phase: "reviewing", phaseSince: 100, elapsedMs: 1_800_573, timeoutMs: 1_800_000 }, { now: () => 1000 });
+		const mailed = sendMail(db, {
+			fromNode: "root.team", to: "parent", subject: "Phase timeout: team", kind: "notice", urgency: "action-needed",
+			body: "Legion phase timeout: root.team has been in reviewing for 1800573ms (limit 1800000ms). Work was not killed; decide whether to extend or abort.",
+		}, { now: () => 1000 });
+		assert.equal(mailed.ok, true);
+		if (!mailed.ok) return;
+		const messageId = mailed.messages[0]!.id;
+		assert.equal(pendingInbox(db, "root").length, 1, "precondition: the notice is still queued for root");
+		// The #333 sequence: the team converged (reviewing → done) after the notice went out.
+		updateNode(db, "root.team", { phase: "done", phaseSince: 5_000 }, () => 5_000);
+		const postman = new LegionPostman({ db, nodeId: "root", supervisor, now: () => now, sendRootMessage: (message) => rootMessages.push(message), intervalMs: 10_000 });
+		await postman.tick();
+		await postman.tick();
+		postman.stop();
+
+		assert.deepEqual(rootMessages, [], "an expired action-needed must not reach root at all");
+		assert.equal(pendingInbox(db, "root").length, 0);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 1);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
+		const bounced = readEventsAfter(db, 0).filter((event) => event.type === "mail_bounced");
+		assert.equal(bounced.length, 1, "the obsolete verdict is written once, not once per tick");
+		assert.deepEqual(bounced[0]!.data, { messageId, toNode: "root", reason: "obsolete_after_phase_change" });
+	} finally {
+		db.close();
+	}
+});
+
+test("an already-ACCEPTED phase-timeout notice is obsoleted once its phase moves on (#333)", async () => {
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const rootMessages: string[] = [];
+	const now = 5_001;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running", phase: "reviewing", phaseSince: 100 }, () => 2);
+		appendEvent(db, "root.team", "phase_timeout", { phase: "reviewing", phaseSince: 100, elapsedMs: 1_800_573, timeoutMs: 1_800_000 }, { now: () => 1000 });
+		const mailed = sendMail(db, {
+			fromNode: "root.team", to: "parent", subject: "Phase timeout: team", kind: "notice", urgency: "action-needed",
+			body: "Legion phase timeout: root.team has been in reviewing for 1800573ms (limit 1800000ms). Work was not killed; decide whether to extend or abort.",
+		}, { now: () => 1000 });
+		assert.equal(mailed.ok, true);
+		if (!mailed.ok) return;
+		// The notice was handed to root's message queue while the phase was still live…
+		transitionDelivery(db, mailed.messages[0]!.id, MAIL_DELIVERY.ACCEPTED, () => 1_000);
+		// …and only afterwards did the team move on.
+		updateNode(db, "root.team", { phase: "done", phaseSince: 5_000 }, () => 5_000);
+		const postman = new LegionPostman({ db, nodeId: "root", supervisor, now: () => now, sendRootMessage: (message) => rootMessages.push(message), intervalMs: 10_000 });
+		await postman.tick();
+		postman.stop();
+
+		assert.deepEqual(rootMessages, [], "confirmation never re-injects, it only relabels");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 1);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
+	} finally {
+		db.close();
 	}
 });
 

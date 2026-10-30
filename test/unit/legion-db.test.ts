@@ -29,7 +29,7 @@ const INDEX_COLUMNS = {
 	idx_messages_rate: ["from_node", "created_at"],
 } as const;
 
-test("legion db v1 schema snapshot matches contract columns and indexes", () => {
+test("legion db schema snapshot matches contract columns and indexes (v2)", () => {
 	const db = openLegionDb(":memory:");
 	try {
 		assert.equal(Number(db.prepare("PRAGMA user_version").get()?.user_version), LEGION_DB_USER_VERSION);
@@ -241,4 +241,49 @@ test("sqliteHasRow treats Bun null and Node undefined as miss", () => {
 	assert.equal(sqliteHasRow(undefined), false);
 	assert.equal(sqliteHasRow(null), false);
 	assert.equal(sqliteHasRow({ found: 1 }), true);
+});
+
+test("a v1 ledger opens as schema v2 without rewriting a single row (#322)", () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "legion-db-v1-v2-"));
+	const file = path.join(directory, "ledger.db");
+	try {
+		const v1 = openLegionDb(file);
+		try {
+			insertNode(v1, { parentId: null, name: "root", role: "root" });
+			insertNode(v1, { parentId: "root", name: "team", role: "centurion" });
+			// A v1 row: `delivered = 1` meant "the send call returned".
+			v1.prepare(
+				`INSERT INTO messages (from_node, to_node, subject, body, kind, urgency, delivered, created_at)
+				 VALUES (?, ?, ?, ?, 'notice', 'action-needed', 1, ?)`,
+			).run("root.team", "root", "queued before v2", "body kept byte for byte", 12);
+			// Rewind the header so the file looks like one written before v2 existed. v2
+			// adds no DDL — it only widens the meaning of `delivered` — so this is exactly
+			// what an old ledger on disk looks like.
+			v1.exec("PRAGMA user_version = 1;");
+			assert.equal(Number(v1.prepare("PRAGMA user_version").get()?.user_version), 1);
+		} finally {
+			v1.close();
+		}
+
+		const upgraded = openLegionDb(file);
+		try {
+			assert.equal(LEGION_DB_USER_VERSION, 2);
+			assert.equal(Number(upgraded.prepare("PRAGMA user_version").get()?.user_version), 2, "opening upgrades v1 to v2");
+			const row = upgraded.prepare("SELECT * FROM messages").get();
+			assert.equal(Number(row?.delivered), 1, "the old 1 keeps its value and now reads as ACCEPTED");
+			assert.equal(String(row?.subject), "queued before v2");
+			assert.equal(String(row?.body), "body kept byte for byte");
+			assert.equal(Number(row?.created_at), 12);
+			assert.equal(Number(row?.delivered_at), 0, "delivered_at is still NULL for an untouched row");
+			assert.deepEqual(
+				upgraded.prepare("PRAGMA table_info(messages)").all().map((info) => String(info.name)),
+				[...TABLE_COLUMNS.messages],
+				"v1 → v2 changes no columns",
+			);
+		} finally {
+			upgraded.close();
+		}
+	} finally {
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
 });

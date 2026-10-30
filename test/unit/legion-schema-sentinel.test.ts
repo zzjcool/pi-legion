@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { LEGION_DB_USER_VERSION } from "../../src/legion/db.ts";
 
 const contract = readFileSync(
 	fileURLToPath(new URL("../../docs/legion-v2-contract.md", import.meta.url)),
@@ -114,11 +115,19 @@ test("legion v2 contract §4.2 keeps the frozen four-table schema", () => {
 		userVersions.length > 0,
 		"Schema sentinel: §4.2 must declare PRAGMA user_version; update this test explicitly when revising the contract.",
 	);
-	const unexpectedUserVersions = userVersions.filter((version) => version !== "1");
+	// #322 moved the ledger to v2; before that this sentinel only ever read the doc,
+	// so the contract could say `1` while `LEGION_DB_USER_VERSION` said `2` and both
+	// stayed green. The two now have to agree.
+	assert.equal(
+		LEGION_DB_USER_VERSION,
+		Number(userVersions[0]),
+		"Schema sentinel: §4.2's PRAGMA user_version must equal the code's LEGION_DB_USER_VERSION.",
+	);
+	const unexpectedUserVersions = userVersions.filter((version) => version !== "2");
 	assert.deepEqual(
 		unexpectedUserVersions,
 		[],
-		`Schema sentinel: every §4.2 PRAGMA user_version declaration must remain 1 (found: ${userVersions.join(", ")}). If the contract schema is intentionally revised, update this test explicitly.`,
+		`Schema sentinel: every §4.2 PRAGMA user_version declaration must remain 2 (found: ${userVersions.join(", ")}). If the contract schema is intentionally revised, update this test explicitly.`,
 	);
 
 	const expectedTables = Object.keys(EXPECTED_COLUMNS);
