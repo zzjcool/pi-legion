@@ -4,14 +4,14 @@
 
 ## Issue linkage
 
-- [ ] `Closes #<child issue>` — **the issue this actually fixes** (the one the reporter filed)
-- [ ] `Refs #<parent / related issue>` — the context issue
+- [ ] **No issue applies** (release / chore / docs-only) — one-line reason; skip the rest of this block
+- [ ] `Closes #<child>` (a report exists in its own issue) **or** `Refs #<issue>` (the report lives in this issue, or only a parent issue exists) — bare `Closes`, not `fix(#<n>):` in a subject
 - [ ] If the report lives in a different issue than the fix target, **both** numbers are named above
-- [ ] Anything only **partly** fixed has the remainder split into a new issue and referenced here
-- [ ] Whoever closes the leftover issues after merge is named (a missing `Closes` means manual close, not "later")
+- [ ] Anything only partly fixed got a follow-up issue (default owner: the implementer)
 
 See [CONTRIBUTING → Project workflow](CONTRIBUTING.md#project-workflow) for why: `#306`
-was fixed and shipped in 5.0.1 but stayed open because the commits only said `fix(#280)`.
+was fixed and shipped in 5.0.1 but stayed open nearly four days, because no PR body or
+commit message carried a bare `Closes #306` — the commits only said `fix(#280)`.
 
 ## Verification
 

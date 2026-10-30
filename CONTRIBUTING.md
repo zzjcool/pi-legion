@@ -14,16 +14,21 @@ environment (Node version, OS, and the Pi / pi-legion version).
 Mark it **Ready for review** when the change is ready and you expect the
 required check `ci` to pass.
 
-**Link every issue you touch, not just the parent.** GitHub only auto-closes
-what a PR body or commit message explicitly names. A fix that says
-`fix(#280)` while the report actually lives in `#306` leaves `#306` open
-forever, and the next reader cannot tell whether the work never landed or was
-merely forgotten — that is exactly what happened to `#306` (fixed in `19ea0cf`
-… `ac26836`, shipped in 5.0.1, still open for four days). So:
+**Link every issue you touch, not just the parent.** GitHub only auto-closes an
+issue on a bare `Closes #<n>` line (`Fixes` / `Resolves` also work) in a PR
+body or a commit message. A `fix(#<n>):` subject **names** the issue and closes
+nothing. A fix that says `fix(#280)` while the report actually lives in `#306`
+leaves `#306` open forever, and the next reader cannot tell whether the work
+never landed or was merely forgotten — that is exactly what happened to `#306`
+(fixed in `19ea0cf` … `ac26836`, shipped in 5.0.1, still open for nearly four
+days, hand-closed by the maintainer). So:
 
 - `Closes #<child>` for **the issue being fixed** — the one the reporter filed.
 - `Refs #<parent>` (or `Refs #<sibling>`) for the context issue.
-- Same shape in commits when a child issue exists: `fix(#<child>): …`.
+- `fix(#<child>): …` in a commit subject is a **naming convention only**; it
+  does not close anything. The actual close is a separate bare `Closes #<child>`
+  line, in the PR body or in the commit body — not packed into the subject's
+  parentheses.
 - No `Closes` for a given issue? Then closing it stays a manual step after
   merge — do it in the same pass, not "later".
 
