@@ -2524,7 +2524,18 @@ async function reviveChild(
 			`Resumed ${handle.name} from its session. Context preserved from ${handle.sessionFile}`,
 		);
 	} catch (error) {
-		return fail(`${action} failed: ${String(error)}`, ErrorCodes.START_FAILED);
+		// #309 D4: preserve the code the launcher already decided on (e.g.
+		// `CHILD_TERMINAL` for a finished legion node) instead of flattening every
+		// failure into `START_FAILED`. The code rides in `details.error` only —
+		// the body text stays code-free on purpose, because the visible-text
+		// assertions in `test/unit/teams.test.ts` and
+		// `test/integration/launch-queue.test.ts` require that a code never leaks
+		// into what the model reads. A non-`SubagentError` keeps the old code.
+		const code =
+			error instanceof SubagentError && error.code
+				? error.code
+				: ErrorCodes.START_FAILED;
+		return fail(`${action} failed: ${String(error)}`, code);
 	}
 }
 

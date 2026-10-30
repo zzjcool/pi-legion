@@ -132,7 +132,13 @@ export function describeFailedCondition(condition: PhaseCondition): string {
 		case "children_settled":
 			return "child agents are still running; wait for them to settle";
 		case "children_none_failed":
-			return "a child failed and must be reworked or the team must fail";
+			// #309: the exit that a partially failed `implementing` needs. The previous
+			// text advised "rework or the team must fail", and BOTH halves were
+			// unreachable: `implementing` has no rework edge (so `reworkCount` can never
+			// rise from there, so the handled derivation can never fire), and
+			// `to: "failed"` was refused outright. Advice a model cannot follow is
+			// worse than no advice — it burns the turn that would have found the exit.
+			return 'a child failed and must be handled: pass supersedes:[<failed child>] once a replacement has settled, or declare to:"failed" with a reason to fail the team';
 		case "verdict_ok":
 			return "no settled child reported a passing verdict";
 		case "verdict_not_ok":

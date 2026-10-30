@@ -529,7 +529,8 @@ export class Orchestrator {
 
 	private childFromNode(name: string, node: LegionNode): ChildRecord {
 		if (node.status === "failed" || ["done", "failed", "aborted"].includes(node.phase ?? "")) {
-			throw new SubagentError(`legion child is terminal and cannot be resumed: ${node.id}`, ErrorCodes.BUDGET_EXCEEDED);
+			// #309 D4: a terminal child is a state verdict, not a budget one.
+			throw new SubagentError(`legion child is terminal and cannot be resumed: ${node.id}`, ErrorCodes.CHILD_TERMINAL);
 		}
 		if (!node.sessionFile) throw new SubagentError(`legion child has no session to resume: ${node.id}`, ErrorCodes.NOT_FOUND);
 		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
@@ -545,7 +546,10 @@ export class Orchestrator {
 			throw new SubagentError(`legion child already exists: ${input.name}`, ErrorCodes.NAME_TAKEN);
 		}
 		if (previous && (previous.status === "failed" || ["done", "failed", "aborted"].includes(previous.phase ?? ""))) {
-			throw new SubagentError(`legion child is terminal and cannot be resumed: ${input.nodeId}`, ErrorCodes.BUDGET_EXCEEDED);
+			// #309 D4: same verdict as `childFromNode`, same code — a resumed
+			// terminal node (restored child record) lands here, and the caller must
+			// not read it as "out of budget".
+			throw new SubagentError(`legion child is terminal and cannot be resumed: ${input.nodeId}`, ErrorCodes.CHILD_TERMINAL);
 		}
 		const team = input.team ?? input.agent.extraFields?.team ?? this.team?.name;
 		// A utility node is a hard leaf and does not consume the recursive depth

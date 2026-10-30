@@ -2126,19 +2126,25 @@ test("#266 A13: the launch-queue events live in the process-only set and never i
 	const { LEGION_PROCESS_EVENT_TYPES, LEGION_EVENT_TYPES: BUS_EVENT_TYPES } =
 		await import("../../src/extension/event-bus.ts");
 	const { LEGION_EVENT_TYPES: STORED_EVENT_TYPES } = await import("../../src/legion/events.ts");
-	// Direction 1: the persisted closed set is byte-for-byte unchanged. Adding a
-	// type here is the #233 incident (a writer emits a row `mapEvent` cannot read,
-	// which freezes the DB event cursor permanently).
+	// Direction 1: the persisted closed set is the previous 15 plus `node_handled`,
+	// and nothing else. #309 adds `node_handled` deliberately: it is the
+	// handled-audit event `requestLegionPhase` writes on the accepted `supersedes`
+	// path, so writer and reader agree BY CONSTRUCTION. Any other addition here is
+	// still the #233 incident (a writer emits a row `mapEvent` cannot read, which
+	// freezes the DB event cursor permanently).
 	assert.deepEqual(
 		[...STORED_EVENT_TYPES],
 		[
 			"node_launched", "node_settled", "node_failed", "node_retired", "node_resumed",
-			"node_blocked", "node_abandoned", "phase_change", "phase_timeout", "mail_sent",
+			"node_blocked", "node_abandoned",
+			// #309: the handled-audit event, declared next to the other audit event.
+			"node_handled",
+			"phase_change", "phase_timeout", "mail_sent",
 			"mail_delivered", "mail_bounced", "budget_refused", "orphan_detected", "tree_finalized",
 		],
-		"the stored event closed set must stay exactly as it is (D12/A13)",
+		"the stored event closed set is the previous 15 plus node_handled (#309)",
 	);
-	assert.equal(STORED_EVENT_TYPES.length, 15);
+	assert.equal(STORED_EVENT_TYPES.length, 16);
 	// Direction 2: the process-only set, compared WHOLE rather than "everything
 	// that is not one of these nine". A filter-based check cannot see an
 	// equal-size substitution (add a third type while dropping one of the nine),
@@ -2155,6 +2161,9 @@ test("#266 A13: the launch-queue events live in the process-only set and never i
 	assert.equal(LEGION_PROCESS_EVENT_TYPES.length, 11);
 	assert.ok(!(STORED_EVENT_TYPES as readonly string[]).includes("launch_queued"));
 	assert.ok(!(STORED_EVENT_TYPES as readonly string[]).includes("launch_admitted"));
+	// #309: `node_handled` is persisted, so it must never leak into the process-only
+	// set either — the two sets answer different questions.
+	assert.ok(!(LEGION_PROCESS_EVENT_TYPES as readonly string[]).includes("node_handled"));
 	// The union the bus subscribes to still contains both, so consumers see them.
 	assert.ok(BUS_EVENT_TYPES.includes("launch_queued"));
 	assert.ok(BUS_EVENT_TYPES.includes("launch_admitted"));

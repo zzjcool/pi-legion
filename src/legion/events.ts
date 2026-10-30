@@ -13,6 +13,13 @@ export const LEGION_EVENT_TYPES = [
 	 * real event, so `mapEvent` threw on read and froze the db event cursor.
 	 */
 	"node_abandoned",
+	/**
+	 * #309: written by `requestLegionPhase` when a centurion accounts for a failed
+	 * child via `supersedes`. It belongs to the STORED closed set on purpose — the
+	 * writer and `mapEvent` must agree by construction, or reading it back freezes
+	 * the db event cursor (the #233 incident).
+	 */
+	"node_handled",
 	"phase_change",
 	"phase_timeout",
 	"mail_sent",

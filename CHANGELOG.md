@@ -13,6 +13,23 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Added
 
+- **`legion_phase` gained the two arguments a centurion actually needed: `supersedes`
+  and `reason`.** `implementing` had no legal exit for the most common way a squad settles — one child
+  failed, the rest settled. `implementing → reviewing` demands `children_none_failed`, which only
+  tolerates failures listed in `handledIds`; that set had exactly one producer, and its hard
+  precondition was `reworkCount > 0`, which increments only on the two `rework: true` edges —
+  `implementing` has none. `implementing → failed` demands `children_all_failed`, and
+  `to: "failed"` was refused on the tool surface before the state machine ever ran. Meanwhile
+  `terminalReason: "parent_decision"` was already unconditionally accepted by the state machine
+  with zero producers in `src/`. Both gaps are now closed without touching the transition graph: a
+  centurion may declare `to: "failed"` **with a reason** (a missing reason is refused, and `done`/`aborted`
+  stay off-limits because they belong to the parent or supervisor), and may pass
+  `supersedes: [<failed child>]` to name which failures a settled sibling has taken over — an
+  extra source unioned into the existing `reworkCount > 0` / `updatedAt < phaseSince` derivation,
+  never a replacement for it, with a `node_handled` audit event per handled id. The refusal text
+  for the deadlock now names both of those calls instead of two actions that were unreachable in
+  the current code. Contract: `docs/contracts/partial-failure-exit-v1.md` (#309).
+
 - **`status` now says what a live child is doing and for how long — `working · bash 00:07:31` —
   and marks a single tool that has run unchanged for five minutes.** "The process is alive but has
   stopped progressing" was invisible everywhere: the strongest `liveness()` rule calls any child
@@ -57,6 +74,15 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   table: `docs/contracts/abort-soft-interrupt-v1.md` (#314).
 
 ### Fixed
+
+- **A team can no longer deadlock in `implementing` after a partial failure, and two error codes
+  stopped lying.** Covered by the `supersedes` / `reason` entry above; the code-hygiene half is
+  separate: resuming a terminal legion child reported `BUDGET_EXCEEDED` although nothing about a
+  budget was involved, so a parent could not tell "this child is finished" from "this child ran
+  out of budget" — the new `ErrorCodes.CHILD_TERMINAL` says what happened, and `reviveChild`'s
+  catch no longer rewrites every failure to `START_FAILED` (a `SubagentError` keeps its own code,
+  anything else still gets `START_FAILED`). Codes travel only in `details.error`, never in the
+  user-visible text, so no tool output gained a `BUDGET_EXCEEDED` string (#309).
 
 - **Host extension discovery is no longer a silent failure, and `/legion doctor` can say whether
   inheritance is wired at all.** `ensureHostExtensions` kept its never-reject / R2-b backoff
