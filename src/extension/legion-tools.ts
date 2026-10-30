@@ -170,13 +170,15 @@ export class LegionPostman {
 	}
 
 	private async deliverToChild(node: LegionNode, message: LegionMessage): Promise<void> {
-		// #313: `MAIL_DELIVERY.INJECTED` (written below, once a send returns) means
-		// the child session **took** the text — queued, accepted or intercepted by an
-		// input handler — never that it was delivered to the model. A steer waits
-		// for the child's next turn boundary, i.e. after its current tool batch; a
-		// child stuck in a long tool never reads it. The state machine is unchanged
-		// on purpose: the transition still only says "handed over", and `delivered=`
-		// keeps its existing meaning. Cross the tool-batch wait with `stop`, not mail.
+		// #313: `MAIL_DELIVERY.INJECTED` is written below as soon as a send call
+		// returns an answer — including `intercepted`, where an input handler ate
+		// the text and the child never saw it. INJECTED therefore means "the send
+		// call returned", never "the child (let alone the model) read it", and it
+		// does not promise a retry either: only a thrown send stays pending. A steer
+		// also waits for the child's next turn boundary (after its current tool
+		// batch), so a child stuck in a long tool never consumes it. The state
+		// machine is unchanged on purpose (#313 D3) and `delivered=` keeps its
+		// existing meaning. Cross the tool-batch wait with `stop`, not mail.
 		const current = getNode(this.db, node.id) ?? node;
 		const text = formatMail(message);
 		const wasAlive = this.supervisor.isAlive(current.name);
@@ -191,7 +193,16 @@ export class LegionPostman {
 				await this.resumeChild(current, { name: current.name, text });
 			} else if (current.status === "running" || current.status === "starting" || current.status === "blocked") {
 				if (message.urgency === "action-needed") {
-					await this.supervisor.steer(current.name, text);
+					const disposition = await this.supervisor.steer(current.name, text);
+					if (disposition === "intercepted") {
+						// The one outcome INJECTED would misreport as delivered (#313): an
+						// input handler ate the mail before it was queued, so the child never
+						// sees it. The delivery state machine stays as it is (D3), which makes
+						// a visible warning the only honest signal available here.
+						console.warn(
+							`[pi-legion] mail ${message.id} to ${current.name} was intercepted by an input handler; the child never saw it (delivered=1 records the send, not a read).`,
+						);
+					}
 					this.emitProcess("node_steered", current.id, { name: current.name, messageId: message.id });
 				} else {
 					await this.supervisor.followUp(current.name, text);

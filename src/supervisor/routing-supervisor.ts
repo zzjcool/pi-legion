@@ -182,7 +182,8 @@ export class RoutingSupervisor implements LegionSupervisor {
 	/**
 	 * Route the steer and hand the backend's disposition back untouched (#313):
 	 * this facade must never flatten `Promise<SteerDisposition>` into
-	 * `Promise<void>`, or the receipt upstream loses the queued/delivered fact.
+	 * `Promise<void>`, or the receipt upstream loses the
+	 * queued/accepted/intercepted fact.
 	 */
 	steer(name: string, text: string): Promise<SteerDisposition> {
 		return this.backendFor(name).steer(name, text);

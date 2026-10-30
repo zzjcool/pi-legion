@@ -2018,7 +2018,8 @@ export class Orchestrator {
 	 * Steer a running child and pass the supervisor's disposition back (#313).
 	 *
 	 * The receipt layer must be able to say whether the message was queued behind
-	 * the child's tool batch or taken immediately, so this value is returned, not
+	 * the child's tool batch, accepted as a turn this call started, or intercepted
+	 * by an input handler (the child never saw it), so this value is returned, not
 	 * swallowed. Every side effect of a steer (process event, unblocking) stays
 	 * exactly as it was.
 	 */

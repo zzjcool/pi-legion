@@ -368,14 +368,28 @@ export class RpcSupervisor implements LegionSupervisor {
 			}
 			registration.state = "idle";
 			this.beginTurn(registration);
-			await client.prompt(
-				formatChildTask(input.task, {
-					allowNested: input.allowNestedSubagents === true,
-					...(input.worktreeBranch
-						? { worktreeBranch: input.worktreeBranch }
-						: {}),
-				}),
+			const firstTurn = toSteerDisposition(
+				await client.prompt(
+					formatChildTask(input.task, {
+						allowNested: input.allowNestedSubagents === true,
+						...(input.worktreeBranch
+							? { worktreeBranch: input.worktreeBranch }
+							: {}),
+					}),
+				),
+				"prompt",
 			);
+			if (firstTurn === "intercepted") {
+				// An input handler swallowed the launch prompt, so no run started for it
+				// (#313): `agent_start`/`agent_settled` will never arrive to end the turn
+				// `beginTurn` just claimed. Failing the spawn is the only honest answer —
+				// returning a handle that is born `running` would park every waiter and
+				// make the child look busy forever.
+				throw this.startFailure(
+					registration,
+					"first prompt was intercepted by an input handler before any run started",
+				);
+			}
 			if (!this.isAlive(input.name)) {
 				throw this.startFailure(registration, "Pi RPC process exited after its first prompt");
 			}
@@ -572,21 +586,43 @@ export class RpcSupervisor implements LegionSupervisor {
 				// prompt reached the client at a turn boundary. `prompt()` reports a
 				// disposition of its own (`dist/modes/rpc/rpc-client.js:135-137`), and
 				// `"handled"` there means *no run started* — read it, never assume it.
-				return toSteerDisposition(await client.prompt(text), "prompt");
+				const disposition = toSteerDisposition(await client.prompt(text), "prompt");
+				if (disposition === "intercepted") {
+					// `beginTurn` above claimed a turn the client never started, and no
+					// `agent_start`/`agent_settled` will ever arrive to end it. Leaving
+					// `turnActive` set would park every later `waitSettled` on its timeout
+					// and route all further work into `client.steer`, which only queues and
+					// never starts a turn — a permanently mute child that still reports
+					// `running`. Roll the claim back like the rejection path does; the
+					// disposition still travels to the caller (this is not an error).
+					this.abandonTurn(child, "prompt was intercepted before any run started");
+				}
+				return disposition;
 			}
 		} catch (error) {
-			if (!wasActive && child.turnActive) {
-				child.turnActive = false;
-				child.state = "idle";
-				child.lastTurnResult = {
-					settled: false,
-					abnormal: false,
-					reason: "RPC command was rejected",
-				};
-				this.resolveWaiters(child, child.lastTurnResult);
-			}
+			if (!wasActive) this.abandonTurn(child, "RPC command was rejected");
 			throw error;
 		}
+	}
+
+	/**
+	 * Release a turn claim for a turn that never actually started (#313).
+	 *
+	 * `beginTurn` sets `turnActive`/`running` *before* the client is asked, so a
+	 * send that throws — or one whose answer proves no run started (`intercepted`)
+	 * — has to undo it, or the child looks busy forever and every waiter parks on
+	 * the settle timeout.
+	 */
+	private abandonTurn(child: ChildRecord, reason: string): void {
+		if (!child.turnActive) return;
+		child.turnActive = false;
+		child.state = "idle";
+		child.lastTurnResult = {
+			settled: false,
+			abnormal: false,
+			reason,
+		};
+		this.resolveWaiters(child, child.lastTurnResult);
 	}
 
 	private beginTurn(child: ChildRecord): void {

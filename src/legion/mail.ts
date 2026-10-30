@@ -12,16 +12,16 @@ export const MAIL_RATE_WINDOW_MS = 5 * 60 * 1_000;
 export const MAIL_DELIVERY = {
 	PENDING: 0,
 	/**
-	 * Accepted by the child session — NOT proof the model read it (#313).
+	 * A send call returned an answer — NOT proof the child's model read it (#313).
 	 *
-	 * A message becomes INJECTED once the supervisor accepted the text (steer,
-	 * follow-up or prompt returned without throwing), and that answer is
-	 * three-way: `queued` waits for the child's next turn boundary (after its
-	 * current tool batch, before the next LLM call), `accepted` started a turn,
-	 * and `intercepted` was swallowed by an input handler — the child never saw
-	 * it, yet the send still returned without throwing. So INJECTED means "handed
-	 * over", never "the model has seen it". Do not read this value as a delivery
-	 * receipt.
+	 * A message becomes INJECTED once the supervisor's send call returned without
+	 * throwing, and that answer is three-way: `queued` waits for the child's next
+	 * turn boundary (after its current tool batch, before the next LLM call),
+	 * `accepted` started a turn, and `intercepted` was swallowed by an input
+	 * handler — the child never saw it. So INJECTED only records "the send
+	 * returned": it says nothing about a read, and it does NOT promise a retry
+	 * (only a throw leaves the message pending). Do not read this value as a
+	 * delivery receipt.
 	 */
 	INJECTED: 1,
 	BOUNCED: 2,
