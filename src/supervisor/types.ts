@@ -263,7 +263,13 @@ export function formatInFlightToolLine(
 	activity: ChildActivity,
 	now: number,
 ): string {
-	const elapsed = Math.max(0, now - activity.startedAt);
+	// Same non-finite trap as `formatToolElapsed`, one step earlier: `Math.max(0,
+	// NaN)` is `NaN`, and `NaN < STALL_NOTICE_MS` is false, so an unusable clock
+	// would skip the short path and claim “no progress for NaNm”. Both clocks are
+	// `Date.now()` readings (belt-and-braces, not a live case) — but the marker is
+	// a claim, so an unusable clock must render as zero, never as a verdict.
+	const raw = now - activity.startedAt;
+	const elapsed = Number.isFinite(raw) ? Math.max(0, raw) : 0;
 	const line = `working · ${activity.tool} ${formatToolElapsed(elapsed)}`;
 	if (elapsed < STALL_NOTICE_MS) return line;
 	const minutes = Math.floor(elapsed / 60_000);

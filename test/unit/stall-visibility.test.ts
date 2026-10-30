@@ -52,6 +52,17 @@ test("a short in-flight tool renders `working · <tool> hh:mm:ss` with no marker
 		formatInFlightToolLine(activity, 1_000 + STALL_NOTICE_MS - 1),
 		"working · bash 00:04:59",
 	);
+	// An unusable clock must read as "just started", never as a stall verdict:
+	// `NaN < bound` is false, so the raw subtraction would skip the short path and
+	// claim `no progress for NaNm` — a verdict invented from a missing fact.
+	assert.equal(
+		formatInFlightToolLine({ tool: "bash", startedAt: Number.NaN }, 1_000),
+		"working · bash 00:00:00",
+	);
+	assert.equal(
+		formatInFlightToolLine({ tool: "bash", startedAt: 1_000 }, Number.NaN),
+		"working · bash 00:00:00",
+	);
 });
 
 test("a tool at or past STALL_NOTICE_MS appends the display-only marker", () => {
