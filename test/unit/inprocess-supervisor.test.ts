@@ -279,6 +279,24 @@ test("#315 inprocess: the in-flight tool rides the session event stream already 
 		session.emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash" });
 		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
 
+		// #331: the record holds a STACK, so a nested call pushes a second frame
+		// and the inner end removes only that frame.
+		session.emit({ type: "tool_execution_start", toolCallId: "n1", toolName: "codemode", args: {} });
+		session.emit({ type: "tool_execution_start", toolCallId: "n2", toolName: "bash", args: {}, parentToolCallId: "n1" });
+		assert.deepEqual(
+			h.supervisor.inFlightToolStack("root.worker")?.map((entry) => entry.tool),
+			["codemode", "bash"],
+		);
+		assert.equal(h.supervisor.inFlightTool("root.worker")?.tool, "bash", "the display reads the innermost frame");
+		session.emit({ type: "tool_execution_end", toolCallId: "n2", toolName: "bash" });
+		assert.deepEqual(
+			h.supervisor.inFlightToolStack("root.worker")?.map((entry) => entry.tool),
+			["codemode"],
+			"the inner end must not erase the outer call",
+		);
+		session.emit({ type: "tool_execution_end", toolCallId: "n1", toolName: "codemode" });
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+
 		// An abort can end the turn while the tool is still running, so no end
 		// event ever arrives: a settled turn must not keep claiming a tool.
 		session.emit({ type: "tool_execution_start", toolCallId: "t2", toolName: "codemode", args: {} });
@@ -381,6 +399,8 @@ test("#315 routing: inFlightTool is forwarded to the owning backend", async () =
 
 		sessions[0]!.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: {} });
 		assert.equal(routing.inFlightTool("root.ip")?.tool, "bash");
+		// #331: the whole stack is forwarded, not only its top frame.
+		assert.deepEqual(routing.inFlightToolStack("root.ip")?.map((entry) => entry.tool), ["bash"]);
 
 		// A name neither backend runs answers nothing: the pre-spawn fallback
 		// must not invent activity for a record this process does not hold.

@@ -887,6 +887,24 @@ test("#315 rpc: the in-flight tool rides the RPC event stream already consumed",
 		client.emit({ type: "tool_execution_end", toolCallId: "call-1", toolName: "bash" });
 		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
 
+		// #331: the record holds a STACK, so a nested call pushes a second frame
+		// and the inner end removes only that frame.
+		client.emit({ type: "tool_execution_start", toolCallId: "n1", toolName: "codemode" });
+		client.emit({ type: "tool_execution_start", toolCallId: "n2", toolName: "bash", parentToolCallId: "n1" });
+		assert.deepEqual(
+			h.supervisor.inFlightToolStack("root.worker")?.map((entry) => entry.tool),
+			["codemode", "bash"],
+		);
+		assert.equal(h.supervisor.inFlightTool("root.worker")?.tool, "bash", "the display reads the innermost frame");
+		client.emit({ type: "tool_execution_end", toolCallId: "n2", toolName: "bash" });
+		assert.deepEqual(
+			h.supervisor.inFlightToolStack("root.worker")?.map((entry) => entry.tool),
+			["codemode"],
+			"the inner end must not erase the outer call",
+		);
+		client.emit({ type: "tool_execution_end", toolCallId: "n1", toolName: "codemode" });
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+
 		// Abort mid-tool: the turn settles with no end event, so the fact is
 		// dropped at settle instead of outliving the turn it described.
 		client.emit({ type: "tool_execution_start", toolCallId: "call-2", toolName: "codemode" });

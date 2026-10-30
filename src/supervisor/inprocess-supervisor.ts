@@ -55,6 +55,7 @@ import type {
 	ChildActivity,
 	ChildHandle,
 	EventSubscriptionOptions,
+	InFlightToolStack,
 	LegionSupervisor,
 	SettleResult,
 	SpawnInput,
@@ -341,12 +342,13 @@ interface ChildRecord {
 	/** Identity reused by every later dispatch into this child (tools inherit it). */
 	context: ChildLaunchContext;
 	/**
-	 * The tool call this child is inside right now (#315), folded from its own
-	 * session event stream — no extra IPC, no polling. Cleared by the matching
-	 * `tool_execution_end` and by `agent_settled`: a settled turn has no tool
-	 * running, so nothing may be left claiming one. Display-only.
+	 * The tool calls this child is inside right now (#315, #331), folded from its
+	 * own session event stream — no extra IPC, no polling. The stack is LIFO: the
+	 * last frame is the innermost call. A frame is removed by the
+	 * `tool_execution_end` that names it, and `agent_settled` empties the stack.
+	 * Display-only.
 	 */
-	inFlightTool?: ChildActivity;
+	inFlightTools?: InFlightToolStack;
 	/**
 	 * A19: an admission slot is freed exactly once per departure from the live
 	 * set. All three release points (`retireChild`, `rollbackSpawn`,
@@ -1247,7 +1249,15 @@ export class InProcessSupervisor implements LegionSupervisor {
 	 */
 	inFlightTool(name: string): ChildActivity | undefined {
 		if (!this.isAlive(name)) return undefined;
-		return this.children.get(name)?.inFlightTool;
+		const stack = this.children.get(name)?.inFlightTools;
+		return stack?.[stack.length - 1];
+	}
+
+	/** The whole stack (#331), innermost last; same `isAlive` gate as above. */
+	inFlightToolStack(name: string): InFlightToolStack | undefined {
+		if (!this.isAlive(name)) return undefined;
+		const stack = this.children.get(name)?.inFlightTools;
+		return stack !== undefined && stack.length > 0 ? stack : undefined;
 	}
 
 	async stats(name: string): Promise<UsageSnapshot | null> {
@@ -1508,10 +1518,10 @@ export class InProcessSupervisor implements LegionSupervisor {
 	private handleSessionEvent(child: ChildRecord, event: unknown): void {
 		const record = recordOf(event);
 		if (!record || typeof record.type !== "string") return;
-		// #315: the in-flight tool fact rides the event stream this backend
-		// already consumes. Nothing new is asked of the child, and the fold is
-		// total, so an event about anything else leaves the fact untouched.
-		child.inFlightTool = nextInFlightTool(child.inFlightTool, record, Date.now());
+		// #315/#331: the in-flight stack rides the event stream this backend already
+		// consumes. Nothing new is asked of the child, and the fold is total, so an
+		// event about anything else leaves the stack untouched.
+		child.inFlightTools = nextInFlightTool(child.inFlightTools ?? [], record, Date.now());
 		this.updateTurnState(child, record);
 		this.publishEvent(child, record);
 	}
@@ -1553,8 +1563,8 @@ export class InProcessSupervisor implements LegionSupervisor {
 		child.turnActive = false;
 		// #315: an abort can land while a tool is mid-flight, in which case no
 		// `tool_execution_end` ever arrives. A settled turn holds no tool, so the
-		// fact is dropped here rather than outliving the turn it described.
-		child.inFlightTool = undefined;
+		// stack is dropped here rather than outliving the turn it described.
+		child.inFlightTools = [];
 		child.lastTurnResult = result;
 		if (child.state !== "retiring") child.state = "idle";
 		this.resolveWaiters(child, result);

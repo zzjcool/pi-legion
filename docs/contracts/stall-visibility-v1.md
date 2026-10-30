@@ -24,15 +24,23 @@
 ### D1 — 只加事实，不改判定
 
 两个后端（`InProcessSupervisor` / `RpcSupervisor`）各自在自己的 `ChildRecord` 上记录
-**一个**字段：
+**一个字段**（#331 起它的形状是栈，不再是单槽）：
 
 ```ts
 interface ChildActivity {
-  readonly tool: string;        // 子会话事件流原样报来的工具名
-  readonly startedAt: number;   // 事件到达时的 **host** clock
-  readonly toolCallId?: string; // 仅用于把 end 事件匹配回它的 start
+  readonly tool: string;              // 子会话事件流原样报来的工具名
+  readonly startedAt: number;         // 事件到达时的 **host** clock
+  readonly toolCallId?: string;       // 仅用于把 end 事件匹配回它的 start
+  readonly parentToolCallId?: string; // 嵌套归属（codemode → bash），事件流原样带的字段
 }
+// ChildRecord.inFlightTools: ChildActivity[]   —— LIFO 栈，栈顶（最后一项）= 最内层
 ```
+
+**D1 修订（#331）：字段从「单槽」改成「栈」。** 原 D1 把记录冻结成**一个** `ChildActivity`，
+由此产生两处**少报**（内层 end 擦掉外层、并行兄弟先结束就整行消失，见 D2 的修订记录）。
+现在记录的是 `ChildActivity[]`，先进先出序、**栈顶 = 最后启动 = 最内层**；`parentToolCallId`
+是事件流自己带的字段（`ToolExecutionStartEvent.parentToolCallId`，"Set when another tool (for
+example a codemode script) made this call"），只用于把嵌套调用归属到它的外层调用。
 
 数据来源是**子会话已经存在的事件流**（`tool_execution_start` / `tool_execution_end`，
 两个后端的订阅点早已存在）。**不新增 IPC、不新增轮询、不新增 state machine**。
@@ -50,21 +58,41 @@ interface ChildActivity {
 `inFlightTool(name)` 在 child **不是 live** 时一律返回 `undefined`：没有活 handle 的进程不可能
 正卡在一个工具里，记录里残留的字段不能当事实用（display-liveness §6 的同类推论）。
 
-`tool_execution_end` 只清掉它**点名**的那一次调用（两边都有 `toolCallId` 且不相等 → 保留），
-因为并行工具批里先结束的兄弟不能把还在跑的那个擦掉。`agent_settled` 也会清空：一轮结束
-就不会再有工具在飞（abort 打断工具时 `end` 事件可能永远不来）。
+**D2 修订（#331）：折叠与展示都按栈来。**
 
-**单槽设计的两处「少报」（而不是假报）。** D1 的字段只存**一个**调用，所以下面两个方向会
-让那一行提前消失：
+事件折叠（`nextInFlightTool`，纯函数，两个后端在各自已有的事件订阅点上调用）：
 
-1. **嵌套调用（`codemode` → `bash`）**：内层 `tool_execution_end` 与槽位 `toolCallId` 相等，
-   会清掉外层仍在跑的事实 —— status 一行都不出。
-2. **并行批**：槽位只记最后启动的那一次。当前显示的那次先结束时，仍在外跑的兄弟不可见。
+- `tool_execution_start` → **push** 一帧（记 `tool` / `startedAt` / 可选的 `toolCallId`、
+  `parentToolCallId`）。没有工具名的 start 不 push，也不动已有帧（不造事实）。
+- `tool_execution_end` → **只移除它点名的那一帧**（按 `toolCallId` 匹配），**绝不清空整栈**。
+  内层 `bash` 结束时外层 `codemode` 仍然在跑；并行批里先结束的兄弟不能把还在跑的那个擦掉。
+  点名不到任何帧时，只允许落到「没有 id 的那一帧」（两边 id 都可缺），全都有 id 就原样返回——
+  陌生 id 的 end 不能擦掉一个确实还在跑的调用。end 自己不带 id 时按栈语义弹出栈顶。
+- `agent_settled` → **清空整栈**：一轮结束就不会再有工具在飞（abort 打断工具时 `end` 事件
+  可能永远不来）。
 
-两个方向都是**少报，不假报卡住**：`tool_execution_end` 只会清、不会置位，所以不会把已结束的
-调用继续说成在飞；`inFlightTool` 以 `isAlive` 为闸，所以也不会把没在跑的工具报成在跑。本契约
-要防的恰好是相反的错误（把卡住说成在工作），丢掉的是「在工作」的显示，不是「卡住」的幻觉。
-修法方向（先改 D1 允许「栈」，再改 `nextInFlightTool`）见 #331。
+展示取值（`formatInFlightToolLine` / `withInFlightToolLine`）：
+
+- 显示的是**栈顶**（最内层）那一帧：`working · <栈顶 tool> hh:mm:ss`；耗时仍按**栈顶的**
+  `startedAt` 计。
+- **嵌套**（栈顶帧的 `parentToolCallId` 链能一路走到栈里的帧，如 `codemode` → `bash`）：追加
+  ` (inside <最外层 tool> ×N)`，`N` = 这条嵌套链的层数（`codemode → bash` 读 `×2`）。
+- **并行兄弟**（栈里不在该嵌套链上的帧）：追加 ` (+N more)`，`N` = 这些帧的数量。显示的是
+  最近启动的那个（栈顶），兄弟只是被计数。
+- 两个提示可同时出现：`working · bash 00:05:00 (inside codemode ×2) (+1 more)`。5 分钟标记永远
+  在最后。
+- **没有 `parentToolCallId` 时，深度 > 1 不能区分「嵌套」与「并行」**，此时按**并行**报
+  ` (+N more)`：这是更弱、但永远为真的说法。把并行硬说成 `inside` 会是假报——本契约要防的
+  恰好是相反的错误（把卡住说成在工作）；两个方向都只允许**少报**。
+- 栈空（`[]`）→ **不出这一行**，与「没有事实」逐字节相同。
+
+`inFlightTool(name)` 返回栈顶（对只实现它的旧后端 / 测试替身保持一帧读取的兼容），
+`inFlightToolStack(name)` 返回整个栈（展示层读它）；两者都在 child **不是 live** 时一律 `undefined`：没有活 handle 的
+进程不可能正卡在一个工具里，记录里残留的字段不能当事实用（display-liveness §6 的同类推论）。
+
+**为什么这是展示精度修正，不是行为变更**：事件折叠只会 push/移除，不会置位；`inFlightTool*`
+以 `isAlive` 为闸，所以不会把没在跑的工具报成在跑，也不会把已结束的调用继续说成在飞。
+`liveness()`、心跳、孤儿扫描、任何 kill/abort/retire 都不受影响（D5、D7 不变）。
 
 ### D3 — `STALL_NOTICE_MS = 300_000`
 
@@ -85,6 +113,13 @@ worker-0 — state=working agent=worker kind=pi
 alive · quiet 12s
 supervisor=inprocess
 session=/…/worker-0.jsonl
+```
+
+栈里有多帧时（#331），行内带上下文提示（语义见 D2）：
+
+```
+working · bash 00:07:31 (inside codemode ×2)      # 嵌套：外层仍在跑
+working · bash 00:07:31 (+1 more)                 # 并行兄弟：栈顶是最近启动的那个
 ```
 
 - 前缀 **`working`** 来自在飞工具这个事实本身，不是持久化的 `state`：start 事件没有配对的
@@ -145,9 +180,9 @@ working · bash 00:12:00 (long-running tool — no progress for 12m; `steer` can
 
 | 允许 | 禁止 |
 |---|---|
-| `src/supervisor/types.ts` 加 `ChildActivity` / `STALL_NOTICE_MS` / `nextInFlightTool` / `formatInFlightToolLine` / `LegionSupervisor.inFlightTool?` | 改 `src/extension/liveness.ts` 的任何判定 |
+| `src/supervisor/types.ts` 加 `ChildActivity` / `InFlightToolStack` / `STALL_NOTICE_MS` / `nextInFlightTool` / `formatInFlightToolLine` / `inFlightToolStackOf` / `LegionSupervisor.inFlightTool?` / `LegionSupervisor.inFlightToolStack?`（#331） | 改 `src/extension/liveness.ts` 的任何判定 |
 | 两个后端在各自 `ChildRecord` 上记录/清空该字段 | 改 `src/extension/legion-tools.ts` 的心跳与孤儿扫描判据 |
-| `RoutingSupervisor.inFlightTool` 纯转发（不加则工具面为 0：工具面注入的就是 `RoutingSupervisor`） | —— |
+| `RoutingSupervisor.inFlightTool` / `inFlightToolStack` 纯转发（不加则工具面为 0：工具面注入的就是 `RoutingSupervisor`） | —— |
 | `index.ts` / `src/extension/legion-status.ts` 的展示拼接 | 改 `runtime.ts` 的 claim / notice 语义 |
 | `agents/scout.md` 的 `toolTimeoutMs` | 给 `worker` / `centurion` 加默认超时 |
 | 展示层字符串 | 任何自动 `abort` / `stop` / `retire` / kill |
@@ -163,8 +198,9 @@ working · bash 00:12:00 (long-running tool — no progress for 12m; `steer` can
 ## 验收
 
 - `test/unit/stall-visibility.test.ts`：`hh:mm:ss` 格式（含不封顶的小时）、5 分钟边界与标记文案、
-  事件折叠（start / 无关事件 / 匹配的 end / 并行兄弟 / 无名 start）、scout 与 worker 的
-  `toolTimeoutMs` 取舍。
+  事件折叠（start / 无关事件 / 匹配的 end / 无名 start / `agent_settled` 清空 / 陌生 id 不清栈）、
+  嵌套 `codemode → bash`（内层结束外层仍显示）、并行兄弟（显示的那次先结束 → 显示仍在跑的）、
+  栈空不出行、两个上下文提示、scout 与 worker 的 `toolTimeoutMs` 取舍。
 - `test/unit/supervisor.test.ts`、`test/unit/inprocess-supervisor.test.ts`：两个后端各自从
   **已有事件流**记录该事实，`agent_settled` 与 dead child 都不留残留；routing 后端按 owner 转发。
 - `test/unit/status-action.test.ts`、`test/unit/legion-status.test.ts`：三个展示出口的 lead line、

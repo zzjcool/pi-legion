@@ -23,6 +23,7 @@ import type {
 	ChildActivity,
 	ChildHandle,
 	EventSubscriptionOptions,
+	InFlightToolStack,
 	LegionSupervisor,
 	SettleResult,
 	SpawnInput,
@@ -242,6 +243,17 @@ export class RoutingSupervisor implements LegionSupervisor {
 		if (owner === "inprocess") return this.inprocess.inFlightTool(name);
 		if (owner === "rpc") return this.rpc.inFlightTool(name);
 		return this.inprocess.inFlightTool(name) ?? this.rpc.inFlightTool(name);
+	}
+
+	/**
+	 * Forward the whole in-flight stack (#331) the same way, so the status line can
+	 * name nesting and parallel siblings instead of reporting only one frame.
+	 */
+	inFlightToolStack(name: string): InFlightToolStack | undefined {
+		const owner = this.owners.get(name);
+		if (owner === "inprocess") return this.inprocess.inFlightToolStack(name);
+		if (owner === "rpc") return this.rpc.inFlightToolStack(name);
+		return this.inprocess.inFlightToolStack(name) ?? this.rpc.inFlightToolStack(name);
 	}
 
 	async stats(name: string): Promise<UsageSnapshot | null> {
