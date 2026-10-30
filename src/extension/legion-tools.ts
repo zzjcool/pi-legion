@@ -38,7 +38,13 @@ import {
 	isTerminalPhase,
 	type LegionPhase,
 } from "../legion/state-machine.ts";
-import { isTerminalIn, type PhaseMachine } from "../legion/phase-machine.ts";
+import {
+	DEFAULT_PHASE_MACHINE,
+	findPhase,
+	isTerminalIn,
+	normalizePhaseMachine,
+	type PhaseMachine,
+} from "../legion/phase-machine.ts";
 import { upsertUsage } from "../legion/usage.ts";
 
 const POSTMAN_INTERVAL_MS = 2_000;
@@ -642,8 +648,12 @@ export async function requestLegionPhase(
 	// The reason is not decoration: it is what makes the phase_change event
 	// auditable, and it is the successor of a blanket refusal that predates
 	// partial failure being a reachable state.
+	// #309: ONE predicate for the sites that treat a failure declaration
+	// specially — the reason requirement, the machine's terminal reason, and the
+	// success message. Same condition, so read it once.
+	const declaredFailure = to === "failed";
 	const failureReason = typeof options.reason === "string" ? options.reason.trim() : "";
-	if (to === "failed" && !failureReason) {
+	if (declaredFailure && !failureReason) {
 		return { ok: false, code: "INVALID_PARAMS", message: 'to:"failed" requires a reason: pass reason:"<why the team cannot succeed>"' };
 	}
 
@@ -699,6 +709,24 @@ export async function requestLegionPhase(
 	// is handled by both rules is still counted once.
 	const handledIds = [...new Set([...failedHandledIds, ...supersededIds])];
 	const contractPresent = Boolean(contractText?.trim());
+	// #309: a centurion-declared failure is accepted by `state-machine.ts`'s
+	// `evaluateDeclaredFailure` for `terminalReason: "parent_decision"` BEFORE the
+	// edge lookup ever runs (frozen semantics this change must not move). So the
+	// tool must only hand it that reason when the team's own machine actually
+	// declares a `failed` edge out of the CURRENT phase that THIS node may take;
+	// otherwise a card that reserves failure to another actor — or offers no
+	// failure exit at all — would gain one just by asking through `legion_phase`.
+	//
+	// The edge's own `require` conditions are deliberately NOT consulted: a
+	// declared failure asserts that they are precisely what failed, so they are
+	// vacuous for it. `actorRole` answers a different question — WHO may decide a
+	// failure — and that still binds.
+	const effectiveMachine = normalizePhaseMachine(options.machine ?? DEFAULT_PHASE_MACHINE);
+	const failedEdge = self.phase === null
+		? undefined
+		: findPhase(effectiveMachine, self.phase)?.next.find((rule) => rule.to === "failed");
+	const mayDeclareFailure = failedEdge !== undefined
+		&& (failedEdge.actorRole === undefined || failedEdge.actorRole === self.role);
 	const decision = evaluatePhaseTransition({
 		from: self.phase ?? null,
 		to,
@@ -711,7 +739,7 @@ export async function requestLegionPhase(
 		verificationPassed: readVerificationResult(self),
 		actorRole: self.role,
 		...(machine ? { machine } : {}),
-		...(to === "failed" ? { terminalReason: "parent_decision" as const } : {}),
+		...(declaredFailure && mayDeclareFailure ? { terminalReason: "parent_decision" as const } : {}),
 	}, now);
 
 	if (!decision.allowed) {
@@ -752,13 +780,15 @@ export async function requestLegionPhase(
 	}
 	const phaseEvent = appendEvent(db, nodeId, "phase_change", {
 		...decision.event.data,
-		...(to === "failed" ? { terminalReason: "parent_decision", reason: failureReason } : {}),
+		// The persisted reason is capped like `note`/`evidence`/the audit reason; the
+		// RETURNED message keeps the full trimmed text because it is not stored.
+		...(declaredFailure && mayDeclareFailure ? { terminalReason: "parent_decision", reason: failureReason.slice(0, 2_000) } : {}),
 		...(options.note ? { note: options.note.slice(0, 2_000) } : {}),
 		...(options.evidence ? { evidence: options.evidence.slice(0, 2_000) } : {}),
 	}, { now });
 	options.eventBus?.emit(phaseEvent);
 	if (decision.notifyParent) await notifyParent(db, self, options.note ?? "centurion returned to planning", options.settings, now, options.eventBus);
-	if (to === "failed") return { ok: true, phase: decision.to, message: `Team failed by centurion decision: ${failureReason}` };
+	if (declaredFailure) return { ok: true, phase: decision.to, message: `Team failed by centurion decision: ${failureReason}` };
 	if (to !== "verifying") return { ok: true, phase: decision.to, message: `Phase changed to ${decision.to}.` };
 
 	const current = getNode(db, nodeId) ?? self;

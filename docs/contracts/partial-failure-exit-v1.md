@@ -15,7 +15,7 @@
 |---|---|---|
 | `implementing → reviewing` | `children_present` + `children_none_failed` | `children_none_failed` 只容忍出现在 `handledIds` 里的失败节点 |
 | `implementing → failed` | `children_all_failed` | 部分失败不是「全部失败」 |
-| `implementing → aborted` | 无 | 走得到，但 `aborted` 是「放弃」不是「判负」，语义错位 |
+| `implementing → aborted` | — | 工具面对 centurion 硬拦（`aborted is controlled by the parent or supervisor`），只有父级 retire 走得到；且 `aborted` 是「放弃」不是「判负」，语义错位 |
 
 `handledIds` 的**唯一**生产点在 `requestLegionPhase` 的 `failedHandledIds`，硬前提是
 `self.reworkCount > 0`；而 `reworkCount` 只在两条 `rework: true` 的边上自增
@@ -47,6 +47,24 @@ rework 边 → **自锁**。与此同时 `to: "failed"` 在 `requestLegionPhase`
 **判负不是聚变**：它只提交 `implementing → failed` 这一条机器本来就声明的边。非法边
 （例如从终态再判负）照旧由状态机拒绝——工具面不为它开特例。
 
+具体到实现：`terminalReason: "parent_decision"` **仅在**本团队机器的**当前相位确实声明了**
+`{ to: "failed" }` 边、且该边的 `actorRole` 为空或正对本节点时才传入。缺边、或边被保留给
+别的角色时，工具面传的是「没有 terminalReason」，状态机便按它自己的规则拒绝
+（`INVALID_PARAMS` + `failed requires parent decision, all children failed, or exhausted rework`）。
+于是「这张卡不许从这个相位失败」不会被 centurion 的一句话覆盖。
+
+拒绝文案本身**不**含「legal next phases」列表：`evaluateDeclaredFailure` 跑在边查找**之前**
+（`src/legion/state-machine.ts`，本契约不动它），所以 `to:"failed"` 这条路根本到不了那句
+带出口列表的提示。要让这句话变成 `invalid_transition` + 出口列表，得重排
+`evaluateDeclaredFailure` 与边查找的顺序——`state-machine.ts` 的语义变更，另开 follow-up。
+本契约选择让状态机自己说话，不在工具面里再造一个「这条边合法吗」的判定点。
+
+**已知边界（有意，不改）**：`terminalReason: "parent_decision"` 在
+`evaluateDeclaredFailure` 里是无条件放行的（`src/legion/state-machine.ts`，本契约不动它），
+并且那次判定发生在边查找**之前**。因此 `failed` 边自身携带的 `require` 条件**不**参与
+判定——这正是「判负」的含义：条件恰恰是失败掉的东西。`actorRole` 不同，它管的是
+「谁有权裁决」，所以仍然生效。
+
 ### D2 — 让 `handled` 有第二个诚实生产者：显式 `supersedes`
 
 `legion_phase` 新增可选入参 `supersedes?: string[]`，每项是本团队的**直接子节点**
@@ -71,6 +89,11 @@ rework 边 → **自锁**。与此同时 `to: "failed"` 在 `requestLegionPhase`
 同一理由决定了 `children_all_failed` 不能被 `supersedes` 绕开：全部失败时没有
 settled 兄弟，第 3 条校验直接不成立，机器照旧强制判负（`all_children_failed`）。
 两条路互不侵占。
+
+**已知边界（有意，不改）**：第 3 条是**团队级**的——一个 settled 兄弟可以给任意多个
+失败节点作证，且不要求它比失败节点更新。这是冻结规则原样落地的结果，不是实现偏差；
+要收紧成「每个被 supersede 的失败都要有自己的替代者」需要先改这条规则（`settled` 是否
+等价于「成功」本身就是另一个契约问题），不在本次范围。
 
 #### 为什么 `handled` 不持久化
 
@@ -154,7 +177,7 @@ a child failed and must be handled: pass supersedes:[<failed child>] once a repl
 
 | # | 事实 |
 |---|---|
-| 1 | 1 failed + 1 settled + `reworkCount === 0`，`legion_phase{to:"reviewing"}` 被拒，原因仍是 `failed_worker_unhandled` |
+| 1 | 1 failed + 1 settled + `reworkCount === 0`，`legion_phase{to:"reviewing"}` 被拒，文案仍是 `children_none_failed` 那句（`a child failed and must be handled…`），相位不动 |
 | 2 | 同上 + `supersedes:[<failed name>]` → 放行到 `reviewing`，且账本里多一条 `node_handled` |
 | 3 | `supersedes` 指向 settled 兄弟 / 不存在的名字 → 拒绝并点名该 entry，相位不动 |
 | 4 | `legion_phase{to:"failed", reason:"…"}` → `phase === "failed"`，事件带 `terminalReason: "parent_decision"` |
@@ -162,3 +185,5 @@ a child failed and must be handled: pass supersedes:[<failed child>] once a repl
 | 6 | `children_none_failed` 的拒绝文案同时含 `supersedes` 与 `to:"failed"` |
 | 7 | 终态 resume 的错误码是 `CHILD_TERMINAL`，且工具正文不含 `BUDGET_EXCEEDED` |
 | 8 | `src/legion/phase-machine.ts`、`nodes` 表 19 列、§7.1 矩阵、19 条原因表**均未改动** |
+| 9 | 卡声明的机器在当前相位没有 `failed` 边（或该边 `actorRole` 保留给其他角色）时，`to:"failed"` 带 `reason` 仍被拒——工具面不替它开特例 |
+| 10 | `reworkCount > 0` + `updatedAt < phaseSince` 这半个来源单独可证：无 `supersedes` 也能放行，且不写 `node_handled`（自动推导不是署名决定） |
