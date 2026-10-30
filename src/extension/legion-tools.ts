@@ -38,7 +38,13 @@ import {
 	isTerminalPhase,
 	type LegionPhase,
 } from "../legion/state-machine.ts";
-import { isTerminalIn, type PhaseMachine } from "../legion/phase-machine.ts";
+import {
+	DEFAULT_PHASE_MACHINE,
+	findPhase,
+	isTerminalIn,
+	normalizePhaseMachine,
+	type PhaseMachine,
+} from "../legion/phase-machine.ts";
 import { upsertUsage } from "../legion/usage.ts";
 
 const POSTMAN_INTERVAL_MS = 2_000;
@@ -505,7 +511,13 @@ export function registerLegionTools(pi: ExtensionAPI, options: RegisterLegionToo
 		pi.registerTool({
 			name: "legion_phase",
 			label: "Legion phase",
-			description: "Request a validated centurion phase transition.",
+			// #309: a partially failed `implementing` had no legal exit, and this
+			// description advertised neither of the two that now exist. A model only
+			// learns about an argument if the tool tells it.
+			description:
+				"Request a validated centurion phase transition. " +
+				'Pass supersedes:[<failed child>] (a direct failed child name or id; requires a settled sibling) ' +
+				'to account for a failure and keep moving, or declare to:"failed" with reason:"<why the team cannot succeed>" to fail the team.',
 			parameters: Type.Object({
 				// #298: the phase list is declared per team, so it cannot be a
 				// compile-time enum here. `requestLegionPhase` validates the value
@@ -514,15 +526,31 @@ export function registerLegionTools(pi: ExtensionAPI, options: RegisterLegionToo
 				to: Type.String({
 					description:
 						'Target phase. Default machine: planning, implementing, reviewing, verifying. ' +
-						'`done`/`failed`/`aborted` are controlled by the parent or supervisor.',
+						'`done`/`aborted` are controlled by the parent or supervisor; ' +
+						'`failed` is a centurion decision and requires a `reason`.',
 				}),
 				note: Type.Optional(Type.String()),
 				evidence: Type.Optional(Type.String()),
+				reason: Type.Optional(Type.String({
+					description:
+						'Why the team cannot succeed. Only meaningful with to:"failed", which requires it — without a ' +
+						'non-empty reason the transition is refused, because a failure nobody explained is ' +
+						'indistinguishable from a team that gave up. Ignored for every other target phase: it is ' +
+						'not stored and does not appear in the resulting phase_change event.',
+				})),
+				supersedes: Type.Optional(Type.Array(Type.String(), {
+					description:
+						'Failed direct children (name or id) whose work a settled replacement has taken over. ' +
+						'Precondition: every entry must be a direct child with status=failed, and this team must ' +
+						'have at least one settled child; then the failure no longer blocks leaving implementing.',
+				})),
 			}),
 			async execute(_id, params) {
 				const result = await requestLegionPhase(db, nodeId, params.to, {
 					note: params.note,
 					evidence: params.evidence,
+					reason: params.reason,
+					supersedes: params.supersedes,
 					cwd: options.cwd ?? process.cwd(),
 					runDir: options.runDir,
 					settings,
@@ -571,6 +599,21 @@ export function formatTree(nodes: readonly LegionNode[]): string {
 export interface PhaseRequestOptions {
 	note?: string;
 	evidence?: string;
+	/**
+	 * #309: required for `to: "failed"`. The blanket terminal guard used to refuse
+	 * every failure a centurion asked for, which left a team whose children
+	 * PARTLY failed with no exit at all (partial failure satisfies neither
+	 * `children_none_failed` nor `children_all_failed`). A declared failure is the
+	 * release valve; demanding a reason keeps it a decision instead of a shrug.
+	 */
+	reason?: string;
+	/**
+	 * #309: failed direct children (name or id) whose work a settled sibling took
+	 * over. Handled state is deliberately NOT persisted — it is recomputed per
+	 * request, exactly like the `reworkCount > 0` + `updatedAt < phaseSince`
+	 * derivation, and this input is an additional source unioned into it.
+	 */
+	supersedes?: string[];
 	/** #298: the team's declared phase machine, when its card has one. */
 	machine?: PhaseMachine;
 	cwd: string;
@@ -599,11 +642,47 @@ export async function requestLegionPhase(
 	// carries the declaration from the node's role card; absent means the built-in
 	// four-phase pipeline.
 	const machine = options.machine;
-	if (to === "done" || to === "failed" || to === "aborted") {
+	if (to === "done" || to === "aborted") {
 		return { ok: false, code: "INVALID_PARAMS", message: `${to} is controlled by the parent or supervisor` };
+	}
+	// #309: `to: "failed"` is a centurion decision, but only a DECLARED one.
+	// The reason is not decoration: it is what makes the phase_change event
+	// auditable, and it is the successor of a blanket refusal that predates
+	// partial failure being a reachable state.
+	// #309: ONE predicate for the sites that treat a failure declaration
+	// specially — the reason requirement, the machine's terminal reason, and the
+	// success message. Same condition, so read it once.
+	const declaredFailure = to === "failed";
+	const failureReason = typeof options.reason === "string" ? options.reason.trim() : "";
+	if (declaredFailure && !failureReason) {
+		return { ok: false, code: "INVALID_PARAMS", message: 'to:"failed" requires a reason: pass reason:"<why the team cannot succeed>"' };
 	}
 
 	const children = getChildren(db, nodeId);
+	// #309: explicit `supersedes` — the second honest source of `handled`.
+	// Blank entries (and an all-blank array) mean "not provided": no validation,
+	// no event, no union. Otherwise every entry must be a FAILED direct child, and
+	// the team must have a settled child that actually took the work over —
+	// otherwise this argument would launder any failure into an exit.
+	const supersedeEntries = (options.supersedes ?? [])
+		.map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+		.filter((entry) => entry.length > 0);
+	const supersededIds: string[] = [];
+	if (supersedeEntries.length > 0) {
+		for (const entry of supersedeEntries) {
+			const superseded = children.find((child) => child.name === entry || child.id === entry);
+			if (!superseded) {
+				return { ok: false, code: "INVALID_PARAMS", message: `supersedes:[${entry}] is not a child of this team` };
+			}
+			if (superseded.status !== "failed") {
+				return { ok: false, code: "INVALID_PARAMS", message: `supersedes:[${entry}] is not a failed child (status=${superseded.status})` };
+			}
+			if (!supersededIds.includes(superseded.id)) supersededIds.push(superseded.id);
+		}
+		if (!children.some((child) => child.status === "settled")) {
+			return { ok: false, code: "INVALID_PARAMS", message: "supersedes requires a settled sibling that took the work over: no direct child of this team has status=settled" };
+		}
+	}
 	const proposedContractPath = path.resolve(self.worktreePath ?? options.cwd, ".pi-legion", "contract.md");
 	let contractText: string | undefined;
 	try { contractText = fs.readFileSync(proposedContractPath, "utf8"); } catch { contractText = undefined; }
@@ -626,7 +705,38 @@ export async function requestLegionPhase(
 	const failedHandledIds = self.phase !== null && self.reworkCount > 0 && self.phaseSince !== null
 		? children.filter((child) => child.status === "failed" && child.updatedAt < self.phaseSince!).map((child) => child.id)
 		: [];
+	// #309: `supersedes` is an ADDITIONAL source, not a replacement — the rework
+	// derivation above is untouched, and the union is deduplicated so a child that
+	// is handled by both rules is still counted once.
+	const handledIds = [...new Set([...failedHandledIds, ...supersededIds])];
 	const contractPresent = Boolean(contractText?.trim());
+	// #309: a centurion-declared failure is accepted by `state-machine.ts`'s
+	// `evaluateDeclaredFailure` for `terminalReason: "parent_decision"` BEFORE the
+	// edge lookup ever runs (frozen semantics this change must not move). So the
+	// tool must only hand it that reason when the team's own machine actually
+	// declares a `failed` edge out of the CURRENT phase that THIS node may take.
+	//
+	// The guard reads the EFFECTIVE (normalized) machine — the very same machine the
+	// transition below is evaluated against — so the guard and the state machine can
+	// never disagree. Two consequences, both intended:
+	//   - a card that OMITS the `failed` phase still gets it injected, with an edge
+	//     out of every non-terminal phase, and therefore MAY declare failure;
+	//   - a card that DECLARES the `failed` phase but leaves the edge off the current
+	//     phase is refused.
+	// Injection adds no capability (`normalizePhaseMachine`: it only removes the
+	// possibility of a stranded team), because taking an injected terminal stays
+	// gated — here by the reason requirement and by `actorRole`.
+	//
+	// The edge's own `require` conditions are deliberately NOT consulted: a
+	// declared failure asserts that they are precisely what failed, so they are
+	// vacuous for it. `actorRole` answers a different question — WHO may decide a
+	// failure — and that still binds. It binds INSIDE the lookup: a machine that
+	// reserves one `failed` edge to another actor and also offers a plain one is not
+	// order-dependent.
+	const effectiveMachine = normalizePhaseMachine(options.machine ?? DEFAULT_PHASE_MACHINE);
+	const mayDeclareFailure = self.phase !== null && (findPhase(effectiveMachine, self.phase)?.next.some(
+		(rule) => rule.to === "failed" && (rule.actorRole === undefined || rule.actorRole === self.role),
+	) ?? false);
 	const decision = evaluatePhaseTransition({
 		from: self.phase ?? null,
 		to,
@@ -634,11 +744,12 @@ export async function requestLegionPhase(
 		contractPath: contractPresent ? proposedContractPath : self.contractPath,
 		contractPresent,
 		children: children.map(({ id, role, status }) => ({ id, role, status })),
-		failedWorkerHandledIds: failedHandledIds,
+		failedWorkerHandledIds: handledIds,
 		reviewerVerdictOk: verdictOk,
 		verificationPassed: readVerificationResult(self),
 		actorRole: self.role,
 		...(machine ? { machine } : {}),
+		...(declaredFailure && mayDeclareFailure ? { terminalReason: "parent_decision" as const } : {}),
 	}, now);
 
 	if (!decision.allowed) {
@@ -664,13 +775,41 @@ export async function requestLegionPhase(
 		reworkCount: decision.reworkCount,
 		...(self.phase === "planning" && to === "implementing" ? { contractPath: proposedContractPath } : {}),
 	}, now);
+	// #309: the handled-audit trail is written ONLY on the accepted path, right
+	// before the transition it justified and with the same clock, so an auditor
+	// reading the ledger sees "this failure was accounted for" immediately before
+	// "the phase moved". Handled state itself is never stored on the node.
+	const supersedeNote = typeof options.note === "string" ? options.note.trim() : "";
+	for (const handledId of supersededIds) {
+		const handledEvent = appendEvent(db, nodeId, "node_handled", {
+			handledId,
+			byNodeId: nodeId,
+			...(supersedeNote ? { reason: supersedeNote.slice(0, 2_000) } : {}),
+		}, { now });
+		options.eventBus?.emit(handledEvent);
+	}
 	const phaseEvent = appendEvent(db, nodeId, "phase_change", {
 		...decision.event.data,
+		// The persisted reason is capped like `note`/`evidence`/the audit reason; the
+		// RETURNED message keeps the full trimmed text because it is not stored.
+		// Reaching this point implies `mayDeclareFailure` — a `to:"failed"` the machine
+		// let through always had `terminalReason` handed to it — so the guard is not
+		// repeated here.
+		...(declaredFailure ? { terminalReason: "parent_decision", reason: failureReason.slice(0, 2_000) } : {}),
 		...(options.note ? { note: options.note.slice(0, 2_000) } : {}),
 		...(options.evidence ? { evidence: options.evidence.slice(0, 2_000) } : {}),
 	}, { now });
 	options.eventBus?.emit(phaseEvent);
 	if (decision.notifyParent) await notifyParent(db, self, options.note ?? "centurion returned to planning", options.settings, now, options.eventBus);
+	if (declaredFailure) {
+		// #309 review (minor-2): a declared failure is a TERMINAL verdict, so — exactly
+		// like the forced-failure path above and `failTeamIfAllChildrenFailed` — the
+		// parent must hear about it by mail, not only as a tool receipt the centurion's
+		// own model happens to read. Same text as the receipt, one source.
+		const failureNotice = `Team failed by centurion decision: ${failureReason}`;
+		await notifyParent(db, self, failureNotice, options.settings, now, options.eventBus);
+		return { ok: true, phase: decision.to, message: failureNotice };
+	}
 	if (to !== "verifying") return { ok: true, phase: decision.to, message: `Phase changed to ${decision.to}.` };
 
 	const current = getNode(db, nodeId) ?? self;

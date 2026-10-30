@@ -222,7 +222,11 @@ CREATE INDEX idx_messages_rate ON messages(from_node, created_at);   -- from_nod
 
 ### 4.3 事件类型枚举（闭集，新增需修订契约）
 
-`node_launched` `node_settled` `node_failed` `node_retired` `node_resumed` `node_blocked` `phase_change` `phase_timeout` `mail_sent` `mail_delivered` `mail_bounced` `budget_refused` `orphan_detected` `tree_finalized`
+`node_launched` `node_settled` `node_failed` `node_retired` `node_resumed` `node_blocked` `node_abandoned` `node_handled` `phase_change` `phase_timeout` `mail_sent` `mail_delivered` `mail_bounced` `budget_refused` `orphan_detected` `tree_finalized`
+
+共 16 种，与 `src/legion/events.ts` 的 `LEGION_EVENT_TYPES` 逐项对齐：`node_abandoned` 由 hygiene 的
+`markAbandoned` 写（#233），`node_handled` 是 #309 的失败处理审计（见 `docs/contracts/partial-failure-exit-v1.md`），
+两者都**经契约修订**加入——闭集语义未变，写入方与读取方仍由同一份名单保证一致。
 
 **事件粒度**：只记树级语义事件。工具调用级明细留在 session jsonl，不入 events（防低价值流水账）。
 
@@ -284,13 +288,13 @@ PLANNING → IMPLEMENTING → REVIEWING → VERIFYING → DONE
 |---|---|---|
 | →planning | 队创建 | 无 |
 | planning→implementing | centurion 经 `legion_phase` 请求 | `contract_path` 存在且非空（契约已落盘） |
-| implementing→reviewing | 同上 | 全部 worker 子节点 settled（failed 的须已处理：rework 重派或转 failed） |
+| implementing→reviewing | 同上 | 全部 worker 子节点 settled（failed 的须已处理，来源有三：rework 重派、`supersedes` 指名一个已被 settled 兄弟接手的失败、或转 failed） |
 | reviewing→verifying | 同上 | ≥1 个 reviewer settled 且 verdict `ok:true` |
 | reviewing→implementing | 同上（rework） | `rework_count += 1`；>2 拒绝并转 failed |
 | verifying→implementing | 验收命令有红 | 同上（rework） |
 | reviewing→planning | 同上（centurion 裁量：计划本身错了） | 允许，但**必须**写 `phase_change` 事件并 mail 通知上级知悉 |
 | verifying→done | 验收全绿 | **supervisor 自动迁移，无 LLM 参与**（D14） |
-| *→failed | rework 超限 / 组员全部失败 / 上级裁决 | 终态 |
+| *→failed | rework 超限 / 组员全部失败 / 上级裁决 / centurion 声明判负（`legion_phase{to:"failed", reason}`，`terminalReason: parent_decision`） | 终态 |
 | *→aborted | 上级 retire 整队 | 终态 |
 
 不变量（违反即拒绝迁移 + 报警事件）：implementing 中不允许存在 running 的 planner；DONE 时全部子节点必须终态；reviewing 至少一个 reviewer settled 过才可采信 verdict。
@@ -370,7 +374,7 @@ npm test -- --filter <scope>
 legion_mail({ to, subject, body, kind?, urgency? })   // to: 短名|node id|parent|squad|children
   // body 软上限 4KB（超限警告建议走文件），硬上限 32KB 拒发
 legion_tree({ scope?: "children"|"squad"|"subtree"|"tree", depth? })  // 只读节点行摘要
-legion_phase({ to, note?, evidence? })                // 仅 centurion（§7）
+legion_phase({ to, note?, evidence?, reason?, supersedes? })  // 仅 centurion（§7）
 ```
 
 ### 8.5 护栏：每节点发送速率默认 10 封/5 分钟（超限拒发）；投递成功以 RPC 命令 success 落 `delivered=1`（崩溃恢复最坏重复投递，信带 id 可去重——dup 可忍，丢不可忍）；速率/上限进 settings（§11.4）。
@@ -402,7 +406,7 @@ interface LegionEventBus {
 }
 ```
 
-事件类型分两域（REV-13 明确）：**存储域**（对齐 §4.3 的 14 种，经 createDbEventSource 脏检查入总线）与**进程内域**（node_launched/node_steered/node_retired/node_aborted/ui_request + 细粒度观察流 text_delta/tool_call/turn_start/agent_settled，由扩展层在调用 supervisor 方法与接收 uiProxy 回调时同步 emit；事件带 nodeId，不落库）。消费端（面板/树视图/浮窗/未来动画）只订阅总线，永不直连 DB 或进程事件。**喂料端可插拔**：
+事件类型分两域（REV-13 明确）：**存储域**（对齐 §4.3 的 16 种，经 createDbEventSource 脏检查入总线）与**进程内域**（node_launched/node_steered/node_retired/node_aborted/ui_request + 细粒度观察流 text_delta/tool_call/turn_start/agent_settled，由扩展层在调用 supervisor 方法与接收 uiProxy 回调时同步 emit；事件带 nodeId，不落库）。消费端（面板/树视图/浮窗/未来动画）只订阅总线，永不直连 DB 或进程事件。**喂料端可插拔**：
 - 进程内直发（supervisor 执行命令/投递邮件的瞬间，方法调用级零延迟——覆盖"主干戏份"：直接子节点全部活动）
 - 跨进程增量读：UI 进程每 200–500ms `PRAGMA data_version` 脏检查（一次整数比较，实测可用）→ 变了才 `SELECT * FROM events WHERE id > <游标>`（append-only + AUTOINCREMENT 天然游标）
 - **禁止** `fs.watch` 盯 db 文件（WAL 写入不触主文件 mtime，必漏）
@@ -524,3 +528,4 @@ interface LegionEventBus {
 | 2026-10-21 | REV-19 | §4.2 新增索引 `idx_messages_rate ON messages(from_node, created_at)`（schema 变更，按 §15-4 走修订）。原因：`sendMail` 的限速 COUNT（`src/legion/mail.ts`，`WHERE from_node = ? AND created_at > ?`）在**写事务内**执行且 `messages` 无任何保留策略（`DELETE FROM messages` 仅见于 `rebuild.ts` 且只在 `preserveMessages === false`），实测 50k 行时由 `SCAN messages` 变为覆盖索引 `SEARCH`，成本随运行时长单调劣化。零行为变更：COUNT 结果不变，仅查询计划改变。**不改 `user_version`**（仍为 1），因此**既有 legion.db 不会获得该索引**——`migrate()` 在 `user_version === 1` 时提前返回，`SCHEMA_V1` 只在版本 0 执行。**且 `legion-rebuild` 不能修复它**：`rebuildLegionDb()` 拿的是已打开的 connection，事务内只发 `DELETE FROM usage/events/nodes`（以及 `preserveMessages === false` 时的 `DELETE FROM messages`），**没有 DROP/CREATE TABLE，也不重跑 `SCHEMA_V1`**；行删光后索引集合原封不动。实测：旧账本跑完 `rebuildLegionDb()` 与 close+reopen 后均仍为 `["idx_messages_inbox"]`，只有**删掉 legion.db 文件后重新打开**（走版本 0 建库）才会得到 `idx_messages_rate`。故补救方式**仅限重建账本文件本身**（legion.db 是可丢弃的树级索引，§4.4：从 run.json + session jsonl 重新生成），不是跑 rebuild 命令。接受此代价：每棵树各自新建 legion.db，长跑账本才需要人工删库重启。代价度量（50k 行表，200 发送者）：限速 COUNT 由 `SCAN` 的 ~3327 µs/call 降至 ~6.6 µs/call（**~500x**，该量级稳定复现）；写侧索引维护在已开事务内的单行 INSERT 上是**零点几 µs/行量级（低双位数百分比）**，方向确定但**具体倍数机器相关且不可移植**（同一代码在不同环境实测 +32% 到 +47% 不等，勿当常数引用）；一次**含 COMMIT 的**单行写入被 fsync 主导（数百 µs、高方差），索引那零点几 µs 在该噪声内不可分辨。净效应每封信仍是 ms 量级的节省，且随行数增长而扩大。不新增「打开时补建索引」后门（会让契约漂移）。不引入 `messages` 保留策略（另立产品决策：归属、是否借用 `eventRetentionDays`、bounce 风暴是否单独限流）。触发：issue #237 P9 |
 | 2026-10-22 | REV-20 | ① §4.1 显式写下 WAL **前置条件**：`PRAGMA journal_mode=WAL` 是查询、返回值才是实际生效模式，可在不报错的情况下降级，故 `openLegionDb()` 校验返回值、文件库非 `wal` 即抛错（`:memory:` 刻意豁免，由 `PRAGMA database_list` 的空 `file` 判定）。② §4.4 补「可重建」的**实测边界**：phase/phase_since/rework_count/contract_path/task_summary 全部不可恢复（`NodeSource` 无这些字段）；events 塌缩为每节点一条合成事件（phase_change/mail_sent/budget_refused/tree_finalized 等零幸存）；`messages` 无任何重建路径（INSERT 仅存在于 `mail.ts`，`rebuild.ts` 只有条件 DELETE）。按 §15-4 走修订的理由：②是**订正一条会误导持久性推理的既有断言**（原文「可重建」被当成放松丢写的前提），①是把一句被隐含的实现假设升为契约明文。非 schema/事件类型/权限变更，`user_version` 不变；**未触碰** `synchronous` / `journal_mode` 的取值 / `temp_store` / `cache_size` / `mmap_size`（`synchronous=NORMAL` 提案已评估**否决**：生产写速率 0.53–5.47 tx/s，`FULL` 占空比 0.027–0.273%，而 `NORMAL` 会把掉电窗口从单事务放大到上个 checkpoint 以来的全部事务、且长活读者下无界）。触发：issue #236 　**注（对 REV-19 措辞的澄清）**：REV-19 原文写「legion.db 是可丢弃的树级索引」，该断言的语境**仅是**「旧账本拿不到新索引、补救只能删库重开」这一 schema 索引场景，并非「账本可随意丢弃」。本修订不追改 REV-19 的历史正文（修订日志按 §15-1 追加、保留当时的实际决定），而在此澄清其适用范围：可丢弃的**只是索引层**，`messages` 与 phase 状态断点不在重建覆盖内（见 §4.4）。 |
 | 2026-10-30 | REV-21 | #314 abort（软中断）落地后的接口面同步（非 schema / 事件类型 / 权限变更，按 §15-1 追加）：① §3.1 `abort` 缝由 `abort(name): Promise<void>` 收成 `abort(name, opts?: { clearQueued?: boolean; timeoutMs?: number }): Promise<AbortOutcome>`，并补 `AbortOutcome` 三态注——`interrupted`（有一轮在跑、中断请求已送达；可能有部分编辑残留，child 仍活着、可续）/ `no-turn`（原先没有一轮在跑，什么都没做，队列也不清）/ `timeout`（请求发出去了，但 child 没在上限内 settle；不杀、不 retire，回执指向 `stop`），默认 `clearQueued: true`，上限 `DEFAULT_ABORT_TIMEOUT_MS`（5 s）**同时盖住清队列与中断**；契约与逐字回执在 `docs/contracts/abort-soft-interrupt-v1.md`。② §3.1 的 `steer` 负语义段（即对 §8.3 表格 `steer` 行的注）补 abort/stop 分工：要打断卡在工具调用里的子节点的**当前这一轮**用 `abort`（软中断：上下文保留、子节点仍在、可续），拆掉进程那一条才是 `stop`（`force: true` 为硬版本）——原文此处只指向 `stop`，与已落地的 abort/stop 切分矛盾。③ §7.4 阶段超时的上级裁决括号由「steer 续期 / abort 收队」改为「steer 续期 / abort 打断当前轮且 child 仍在 / retire 收队并进 aborted」——「收队」对应 `retire`，`abort` 不回收 child，原文的 `abort 收队` 会让人以为 abort 会终结子节点。原因：issue #314 把 supervisor 里早已实现却零调用点的 `abort` 接到工具面（`SubagentParams.action` 增 `abort`），§3.1 的接口表与 §7.4 的收队语义必须与新 seam 同形，否则同一份契约里两处各说一套。`node_aborted` 事件类型与 payload `{ name }` 未变（进程内域仍按 REV-13 的闭集），不新增事件类型、不改 `user_version`。 |
+| 2026-10-30 | REV-22 | §4.3 事件闭集由 14 补到 **16**（事件类型变更，按 §15-4 走修订）：补记 `node_abandoned`（hygiene 的 `markAbandoned` 写，#233 修复时已进 `src/legion/events.ts` 的 `LEGION_EVENT_TYPES`，但 §4.3 清单漏记）与本 PR（#309）新增的 `node_handled`（`requestLegionPhase` 写；团队用 `supersedes` 认领一个失败 child 时的审计事件，语义见 `docs/contracts/partial-failure-exit-v1.md`）。同一次修订顺带对齐：§10.2 的条数（14→16）、§7.1 的 `implementing→reviewing` 进入条件（「failed 须已处理」补第三来源 `supersedes`）与 `*→failed` 触发（补「centurion 声明判负 `reason`」）、§8.4 的 `legion_phase` 签名（补 `reason?` / `supersedes?`），以及 `test/unit/legion-schema-sentinel.test.ts` 的 `EXPECTED_EVENTS`（该哨兵此前把 §4.3 的 14 名钉住，正是它让清单无法自行追上代码）。闭集语义未变：写入方与读取方仍由同一份 `LEGION_EVENT_TYPES` 保证一致，`mapEvent` 对未知存量类型仍抛错（#233 的游标冻结模式没有被重新引入）；不改 `user_version`、不改 schema、不改 `LEGION_PROCESS_EVENT_TYPES`（仍 11 条）。触发：PR #332 对抗式 review 的 minor-3/4（文档漂移）——原评审把它记成「既有漂移」，但 §4.3 的那条清单是**被哨兵钉死的冻结契约**，所以补记必须走修订而不是改清单了事。 |

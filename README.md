@@ -252,7 +252,7 @@ Child nodes receive these tree-aware tools:
 ```text
 legion_mail({ to, subject, body, kind?, urgency? })
 legion_tree({ scope?: "children" | "squad" | "subtree" | "tree", depth? })
-legion_phase({ to, note?, evidence? })
+legion_phase({ to, note?, evidence?, reason?, supersedes? })
 ```
 
 - **`legion_mail`** sends asynchronous messages over permitted tree edges:
@@ -265,6 +265,10 @@ legion_phase({ to, note?, evidence? })
   not interrupt the nodes being observed.
 - **`legion_phase`** is available to centurions. It requests a state transition;
   the supervisor checks the transition's invariants and records the result.
+  `reason` is the declared-failure verdict: with `to: "failed"` it is required and
+  the team's failure is recorded as a parent decision. `supersedes` lists failed
+  direct children that a settled sibling has taken over, which is what unlocks
+  the exit from `implementing` after a partial failure.
 
 A squad moves through whatever phases its lead declares. With no declaration
 that is the built-in **planning → implementing → reviewing → verifying**:

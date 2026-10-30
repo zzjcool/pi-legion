@@ -862,6 +862,10 @@ export const ErrorCodes = {
 	RETIRE_FAILED: "RETIRE_FAILED",
 	INVALID_PARAMS: "INVALID_PARAMS",
 	INSUFFICIENT_MEMORY: "INSUFFICIENT_MEMORY",
+	// #309 D4: "this child is finished" is not a budget verdict. Sharing
+	// `BUDGET_EXCEEDED` made a caller unable to tell a spent budget from a
+	// terminal child, so the resume refusal gets its own code.
+	CHILD_TERMINAL: "CHILD_TERMINAL",
 } as const;
 
 // =============================================================================

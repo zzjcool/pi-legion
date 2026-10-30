@@ -1,0 +1,235 @@
+# 部分失败的合法出口：`supersedes` 与 `parent_decision`（v1，冻结）
+
+> 语义由 #309 冻结。实现期发现矛盾 → 停下报告，不得重新解释本契约。
+> **本文件是 #309 唯一的 D 编号命名空间**：实现代码与测试注释里的 `#309 Dn` 只解析到这里的
+> D1–D4。`#309` 之外的 `Dn`（例如 `docs/legion-v2-contract.md` 的 D11 = 可视化三层、
+> D12 = SQLite 账本）与本契约无关；本契约没有 D5 及以后的条款。
+
+## 背景：一个没有任何合法出口的状态
+
+默认机器（`src/legion/phase-machine.ts` 的 `DEFAULT_PHASE_MACHINE`）在 `implementing`
+留了三扇门，而「1 个 child failed + N 个 child settled」这种**最常见**的收队形态
+一扇都推不开：
+
+| 出口 | 关卡 | 为什么过不去 |
+|---|---|---|
+| `implementing → reviewing` | `children_present` + `children_none_failed` | `children_none_failed` 只容忍出现在 `handledIds` 里的失败节点 |
+| `implementing → failed` | `children_all_failed` | 部分失败不是「全部失败」 |
+| `implementing → aborted` | — | 工具面对 centurion 硬拦（`aborted is controlled by the parent or supervisor`），只有父级 retire 走得到；且 `aborted` 是「放弃」不是「判负」，语义错位 |
+
+`handledIds` 的**唯一**生产点在 `requestLegionPhase` 的 `failedHandledIds`，硬前提是
+`self.reworkCount > 0`；而 `reworkCount` 只在两条 `rework: true` 的边上自增
+（`reviewing → implementing`、`verifying → implementing`）。`implementing` 没有任何
+rework 边 → **自锁**。与此同时 `to: "failed"` 在 `requestLegionPhase` 里被一句
+`${to} is controlled by the parent or supervisor` 硬拦，状态机根本跑不到。
+
+而状态机一侧其实**早就留好了口子**：`terminalReason: "parent_decision"` 在
+`evaluateDeclaredFailure` 里无条件放行。`src/` 里零生产者——口子造好了，没人走过。
+
+## 冻结决定
+
+### D1 — 让 `parent_decision` 有真实生产者：centurion 可显式判负
+
+`legion_phase` 新增可选入参 `reason?: string`。终态守卫从「三个都硬拦」改成：
+
+| `to` | 条件 | 结果 |
+|---|---|---|
+| `done` | — | 仍然硬拦（supervisor / 父级产物，centurion 不得自行宣告成功） |
+| `aborted` | — | 仍然硬拦（`aborted` 是父级 retire 的紧急停止，不是 centurion 的按钮） |
+| `failed` | `reason` trim 后非空 | 放行，`terminalReason: "parent_decision"` 传给状态机 |
+| `failed` | `reason` 缺失/空白 | 拒绝，文案点名缺 `reason` |
+
+落库走**既有**接受路径（`updateNode` + `appendEvent`），没有新通道。`phase_change`
+事件的 `data` 带上 `terminalReason: "parent_decision"` 与 `reason`，于是「谁、为什么判负」
+是账本里的一条可查事实，而不是模型的一句话。`reason` 与 `note`/`evidence` 一样按 2 000 字符
+截断**落库**（返回给模型的消息保留全文，因为它不落库）。成功回执逐字为
+`Team failed by centurion decision: <reason>`。
+
+判负是**终态裁决**，所以它和另外两条终态路径（budget 强制失败、`failTeamIfAllChildrenFailed`）
+一样**给父级发一封邮件**（`kind: notice`、`urgency: action-needed`，正文与回执同源）。父级不应
+靠轮询账本才能发现一个已经结束的团队。
+
+**判负不是聚变**：它只提交 `implementing → failed` 这一条机器本来就声明的边。非法边
+（例如从终态再判负）照旧由状态机拒绝——工具面不为它开特例。
+
+具体到实现：`terminalReason: "parent_decision"` **仅在**本团队**有效（归一化后）机器的**当前
+相位中存在一条 `{ to: "failed" }` 边、且该边的 `actorRole` 为空或正对本节点时才传入。没有
+可用边、或边被保留给别的角色时，工具面传的是「没有 terminalReason」，状态机便按它自己的
+规则拒绝（`INVALID_PARAMS` + `failed requires parent decision, all children failed, or
+exhausted rework`）。于是「这张卡不许从这个相位失败」不会被 centurion 的一句话覆盖。
+
+**「归一化后」是有意的，两个方向都要看清**：`normalizePhaseMachine` 在卡**根本没声明**
+`failed`/`done`/`aborted` 这些相位时，会把它们补上，并给每个非终止相位追加一条
+`{ to: <该终态> }` 边。因此：
+
+| 卡的写法 | `failed` 边从本相位看 | 可否判负 |
+|---|---|---|
+| 没声明 `failed` 相位 | 注入的，存在 | **可以**（与 `evaluatePhaseTransition` 看到的是同一张机器） |
+| 声明了 `failed` 相位，但本相位的 `next` 里没有它 | 不存在 | 不可以 |
+| 声明了，但 `actorRole` 指向别的角色 | 这条不可由本节点取 | 不可以——**除非**同一相位另有一条未保留的 `failed` 边，那就按那条放行（与书写顺序无关） |
+
+第一行不是漏洞：`normalizePhaseMachine` 的注入从来只**增加可达性、不增加能力**
+（它的文档注释就是这么写的），真正把门的是 `terminalReason` 要求与 `actorRole` 校验。
+所以「卡声明了 `failed` 相位」本身就是一道 opt-out：声明了就按声明的边来，没声明就享受
+注入兜底。判负仍是显式决定，不是默认路径。
+
+拒绝文案本身**不**含「legal next phases」列表：`evaluateDeclaredFailure` 跑在边查找**之前**
+（`src/legion/state-machine.ts`，本契约不动它），所以 `to:"failed"` 这条路根本到不了那句
+带出口列表的提示。要让这句话变成 `invalid_transition` + 出口列表，得重排
+`evaluateDeclaredFailure` 与边查找的顺序——`state-machine.ts` 的语义变更，另开 follow-up。
+本契约选择让状态机自己说话，不在工具面里再造一个「这条边合法吗」的判定点。
+
+**已知边界（有意，不改）**：`terminalReason: "parent_decision"` 在
+`evaluateDeclaredFailure` 里是无条件放行的（`src/legion/state-machine.ts`，本契约不动它），
+并且那次判定发生在边查找**之前**。因此 `failed` 边自身携带的 `require` 条件**不**参与
+判定——这正是「判负」的含义：条件恰恰是失败掉的东西。`actorRole` 不同，它管的是
+「谁有权裁决」，所以仍然生效。
+
+**已知边界（有意，保留）：声明判负不收割子节点，且它必须永远可用**。`planning` / `reviewing` /
+`verifying` 这些相位**没有** phase 级 `require`，所以即使还有一个 `status = "running"` 的
+直接子节点，`to:"failed"` + `reason` 依然会被接受；那个子节点**保持 `running`**——判负只改本
+团队自己的相位，不去 `stop` / `retire` 任何人（子节点的进程归父级持有，只有父级能收）。
+
+这不是遗漏，而是这条口子必须**永远可用**的理由本身：若给判负加一条「子节点必须 settled」之类
+的守卫，一个永不结束的子节点（卡死的工具调用、丢掉的 backend、被宿主挂起的 session）就会
+让团队连「认输」都做不到——#309 要消灭的死锁会原样搬到下一个相位，且更坏：那里连
+`to:"failed"` 都没有替代方案。所以收尾的责任被**显式**留在父级：父级调
+`subagent({ action: "stop" })` 收掉仍在 `running` 的子节点；判负本身只负责让团队不再假装
+还在推进。`test/unit/legion-phase-exit.test.ts` 有一条用例钉住现行为（`reviewing` + 一个
+`running` 的 reviewer → 判负被接受、相位变 `failed`、该 child 仍 `running`）。
+
+### D2 — 让 `handled` 有第二个诚实生产者：显式 `supersedes`
+
+`legion_phase` 新增可选入参 `supersedes?: string[]`，每项是本团队的**直接子节点**
+`name` 或 `id`。校验三条，任一不满足即拒绝（文案点名是哪一项）：
+
+1. 每项都能解析成本团队的直接子节点；
+2. 该子节点 `status === "failed"`；
+3. 团队里**至少有一个 `status === "settled"` 的直接子节点**。
+
+通过后把这些 id **并集**进 `failedHandledIds`，并在接受路径上写一条
+`node_handled` 持久事件（`data = { handledId, byNodeId, reason? }`，`reason` 取自 `note`，不取
+`reason`——后者是团队判负的理由，不是单个失败的审计注解）。空数组等价于
+没传：不校验、不写事件、不改并集。节点表不加列，`reworkCount` 语义与
+`updatedAt < phaseSince` 的时间比较规则一个字都不改。
+
+#### 为什么 `supersedes` 必须要求一个 settled 兄弟
+
+`handled` 这个状态的**语义**是「这个失败已经被处理掉了」，不是「这个失败被一笔勾销」。
+`settled` 兄弟是这句话唯一可验证的证据：有人接着把活干了。少了这一条，`supersedes`
+就退化成一句「我说它没事」，`children_none_failed` 变成可以随口清空的关卡——那正是
+`children_all_failed` 那条边试图防的事，只是换了个方向。
+
+同一理由决定了 `children_all_failed` 不能被 `supersedes` 绕开：全部失败时没有
+settled 兄弟，第 3 条校验直接不成立，机器照旧强制判负（`all_children_failed`）。
+两条路互不侵占。
+
+**已知边界（有意，不改）**：第 3 条是**团队级**的——一个 settled 兄弟可以给任意多个
+失败节点作证，且不要求它比失败节点更新。这是冻结规则原样落地的结果，不是实现偏差；
+要收紧成「每个被 supersede 的失败都要有自己的替代者」需要先改这条规则（`settled` 是否
+等价于「成功」本身就是另一个契约问题），不在本次范围。
+
+#### 为什么 `handled` 不持久化
+
+现有 `handledIds` 是**每次请求时现算**的（`reworkCount > 0` + `updatedAt < phaseSince`），
+不是账本里的一个布尔位。保持这个形状有三个具体好处：
+
+- **没有第二个真相**：入列/出列不需要在两处同步，也就不存在「表里说 handled、条件里
+  说没 handled」的漂移；
+- **rework 后自动失效**：`updatedAt < phaseSince` 让上一轮的「已处理」在新一轮里自动
+  作废——失败的 child 一旦被 retry 成功，它就不再是失败，也就无需谁去撤销标记；
+- **schema 冻结**：`nodes` 表 19 列由 `test/unit/legion-schema-sentinel.test.ts` 守着
+  （`docs/legion-v2-contract.md` D12）。加一列 = 动账本合约，代价远大于收益。
+
+`node_handled` 事件是**审计**（谁在什么时候把哪个失败认定成已处理），不是**状态**。
+读 `handledIds` 的代码一行都不读这个事件——它的存在不改变任何判定。
+
+**「审计可查」是有保留期限的**：`node_handled` 与 `phase_change` **同级**，不享受
+`src/runs/hygiene.ts` 的 `RETAINED_EVENT_TYPES` 豁免（该名单只有 `orphan_detected` /
+`budget_refused` / `node_abandoned`）。所以团队进入终态（`settled` / `failed`）后，这些行会在
+`eventRetentionDays`（默认 30 天）之后被删，或在 `eventMaxRows`（默认 200 000 行）压力下
+按最旧优先被删。它与 `phase_change` 同寿：够用来回答「这次迁移当时凭什么被放行」，但**不是**
+永久凭据——需要长期留存的证据应落在 MR / 契约文件 / 任务摘要里，而不是指望账本。
+
+#### 与 `updatedAt < phaseSince` 的关系
+
+两个来源是**并集**，各自独立：
+
+| 来源 | 归谁 | 何时进 `handledIds` |
+|---|---|---|
+| rework 期间已修复的失败 | 机器自动 | `reworkCount > 0` 且 `child.updatedAt < phaseSince` |
+| 显式 `supersedes` | centurion 主动 | 本次请求带 `supersedes`，且三条校验通过 |
+
+- `supersedes` **不**放宽时间规则：它不把「`updatedAt` 晚于 `phaseSince` 的失败」变成
+  已处理，只是**额外**给出一个由 centurion 署名、带 settled 兄弟作证的来源。
+- 反过来，`updatedAt < phaseSince` **不**因为它存在就自动关闭校验：只要本次请求带了
+  `supersedes`，第 1/2/3 条校验照跑（写进账本的每一条 `node_handled` 都必须成立）。
+- 并集去重：两个来源合起来之后不再重复。注意这一层**不可观测**（消费方
+  `children_none_failed` 自己先 `new Set` 再 `has`），所以它只是防御；**真正可验收、也有测试
+  守住的是 `supersededIds` 自身的去重**（重复 entry 只产生一条 `node_handled`）。不要把那个
+  `new Set` 当作可测试条款。
+
+### D3 — 拒绝文案必须列出真实可达的动作
+
+`children_none_failed` 失败时的文案（`describeFailedCondition`）改成同时给出两条
+**今天真的可调用**的路：
+
+```
+a child failed and must be handled: pass supersedes:[<failed child>] once a replacement has settled, or declare to:"failed" with a reason to fail the team
+```
+
+旧文案（`a child failed and must be reworked or the team must fail`）建议的两个动作在
+今天的代码里**都不可达**：`implementing` 没有 rework 边，`to:"failed"` 被工具面硬拦。
+一句「按它做就一定会再被拒」的提示，比没有提示更贵——模型会照着它重试到预算烧完。
+
+### D4 — 错误码卫生
+
+- 新增 `ErrorCodes.CHILD_TERMINAL`；`orchestrator.ts` 里两处
+  `legion child is terminal and cannot be resumed` 不再冒充 `BUDGET_EXCEEDED`
+  （它们与预算无关，冒用会让上层把「终态」误判成「预算耗尽」）。
+- `index.ts` 的 `reviveChild` catch 不再把所有错误一律改写成 `START_FAILED`：
+  `SubagentError` 且已有明确 `code` 时**保留该 code**，其余维持 `START_FAILED`。
+- 错误码**只走 `details.error`**，不拼进用户可见正文：`test/unit/teams.test.ts` 与
+  `test/integration/launch-queue.test.ts` 都钉了「正文不得出现 `BUDGET_EXCEEDED`」。
+
+## 为什么不用自环 `implementing → implementing`
+
+自环是这个问题最直觉的解法，也是**唯一被机器明确禁止**的解法：
+
+- validate 期 `validatePhaseMachine` 拒自环；
+- 运行期 `evaluateDeclarative` 以 `same_phase` 拒绝（`from === to`）。
+
+更重要的是语义：自环会把「重新派工一轮」编码成一次相位迁移，而 `reworkCount` 的自增
+是挂在 `rework: true` 的**边**上的。让自环兼作 rework 边，等于把「同一相位重来」和
+「预算计数」绑在一起——`updatedAt < phaseSince` 这条时间规则随即失真（`phaseSince`
+被自环刷新，上一轮记下的失败会因为时间戳比较翻转而凭空变成「未处理」）。要凑出的
+效果是「已处理的失败不再挡路」，那就直接、显式地说「已处理」，不要绕道去动迁移图。
+
+因此本契约**不动** `src/legion/phase-machine.ts` 的边表：没有新边，没有新相位，
+`test/unit/legion-state-machine.test.ts` 的 §7.1 矩阵与 19 条原因表原样绿。
+
+## `node_handled` 与事件闭集
+
+`appendEvent` 按闭集 `LEGION_EVENT_TYPES` 校验，`mapEvent` 遇到不认识的存量类型会抛错
+——这正是 #233 的游标冻结事故。所以 `node_handled` 必须**加入闭集**，并同步修订两处
+把该闭集内容钉死的清单断言（`test/unit/legion-events.test.ts` 的条数、
+`test/unit/teams.test.ts` 的 `#266 A13` stored closed set）。**这是清单条数的机械更新，
+不是为了让红灯变绿**：写入方与读取方仍在构造上一致，事故模式没有被重新引入。
+`LEGION_PROCESS_EVENT_TYPES`（仅进程内、不落库）保持 11 条不变。
+
+## 验收清单
+
+| # | 事实 |
+|---|---|
+| 1 | 1 failed + 1 settled + `reworkCount === 0`，`legion_phase{to:"reviewing"}` 被拒，文案仍是 `children_none_failed` 那句（`a child failed and must be handled…`），相位不动 |
+| 2 | 同上 + `supersedes:[<failed name>]` → 放行到 `reviewing`，且账本里多一条 `node_handled` |
+| 3 | `supersedes` 指向 settled 兄弟 / 不存在的名字 → 拒绝并点名该 entry，相位不动 |
+| 4 | `legion_phase{to:"failed", reason:"…"}` → `phase === "failed"`，事件带 `terminalReason: "parent_decision"` |
+| 5 | 缺 `reason` 的 `to:"failed"` 被拒；`to:"done"` / `to:"aborted"` 仍被拒 |
+| 6 | `children_none_failed` 的拒绝文案同时含 `supersedes` 与 `to:"failed"` |
+| 7 | 终态 resume 的错误码是 `CHILD_TERMINAL`，且工具正文不含 `BUDGET_EXCEEDED` |
+| 8 | `src/legion/phase-machine.ts`、`nodes` 表 19 列、§7.1 矩阵、19 条原因表**均未改动** |
+| 9 | 卡声明的机器在当前相位没有 `failed` 边（或该边 `actorRole` 保留给其他角色）时，`to:"failed"` 带 `reason` 仍被拒——工具面不替它开特例 |
+| 10 | `reworkCount > 0` + `updatedAt < phaseSince` 这半个来源单独可证：无 `supersedes` 也能放行，且不写 `node_handled`（自动推导不是署名决定） |
+| 11 | 声明判负不收割子节点：`reviewing` + 一个 `running` 的 reviewer，`to:"failed"` + `reason` 仍被接受，相位变 `failed`，该 child 仍 `running`（收尾归父级的 `stop`） |
+| 12 | 声明判负会**给父级发一封邮件**（`from = 本团队`，正文与工具回执同源 `Team failed by centurion decision: <reason>`） |
