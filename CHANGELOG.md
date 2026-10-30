@@ -11,6 +11,32 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A child's completion notice is delivered once, whichever route won.** A terminal
+  result reaches the parent two ways — the tool result (`wait` / `collect`) and the
+  pushed notice (`watch` → `join` → outbox) — and each kept its own memory
+  (`consumedByTool` / `notified`), judged once when the watch hit terminal. The notice
+  still had to cross the 10s join window and the run-scoped outbox, neither of which
+  knew those flags existed, so four duplicate windows followed: a buffered entry
+  flushed after a `wait` (W1), an outbox entry flushed on `agent_settled` after a
+  `wait` (W2), a buffered entry orphaned by `release()` (W3), and the flags
+  evaporating with the deleted job (W4).
+  - Dedupe collapses onto **one claim per `(runId, name, round)`**. `round` is a
+    per-name counter because `runId` is the *parent* run id — every round of a
+    same-named child shares it, so a two-part key lets an unread old round win the
+    flush and filter out the new round's real result. Three claim sites, all real
+    deliveries; no unclaim on the delivery side.
+  - `deliverBatch` is the single exit: claimed entries are filtered, survivors
+    formatted (grouped headers and the `N of M` count recomputed at delivery time),
+    then sent or held. The outbox now holds structure rather than formatted text, so a
+    member claimed while a notice waits drops out of the body and the count alike.
+  - Tool results are **never** suppressed: `wait` / `collect` always return the full
+    text, only the passive notice is deduplicated. Claim state stays in memory by
+    design — after a process restart the result is still recoverable via `collect`.
+  - Contract and the four implementation-time revisions:
+    `docs/contracts/notice-claim-v1.md`.
+
 ## [5.0.1] — 2026-10-27
 
 Patch release. **This is the release where 5.0.0's extension-inheritance policy
