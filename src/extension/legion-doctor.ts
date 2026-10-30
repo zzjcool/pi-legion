@@ -1083,7 +1083,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 			);
 		} else if (modelIssue && providerExtHome.length) {
 			steps.push(`export ${CHILD_EXTENSIONS_ENV}=${providerExtHome.join(",")}  # then restart pi`);
-			steps.push(`# or role frontmatter extensions: […] (same extensions, more RAM)`);
+			steps.push(`# or role frontmatter extensions: […] (role-scoped only)`);
 		} else if (modelIssue) {
 			steps.push(`# set role frontmatter extensions: […], or export ${CHILD_EXTENSIONS_ENV}=<paths>`);
 		}

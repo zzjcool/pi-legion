@@ -23,6 +23,13 @@ function extensionsOf(args: string[]): string[] {
 	return args.flatMap((arg, i) => (arg === "--extension" ? [args[i + 1] ?? ""] : []));
 }
 
+/** The actionable tail of a report — the only region that carries advice. */
+function nextStepsBlock(text: string): string {
+	const at = text.indexOf("## Next steps (actionable)");
+	assert.ok(at >= 0, "precondition: the report has a next-steps block");
+	return text.slice(at);
+}
+
 test("parseListModels reads pi --list-models table", () => {
 	const out = parseListModels(`provider      model                               context  max-out  thinking  images
 any-endpoint  workbuddy/hy4-preview-ioa           960K     64K      yes       yes   
@@ -919,6 +926,11 @@ test("#212 doctor rpc still recommends PI_LEGION_CHILD_EXTENSIONS", () => {
 		assert.ok(report.issues.some((i) => i.code === "CHILD_NO_MODELS"));
 		assert.match(report.text, /export PI_LEGION_CHILD_EXTENSIONS=/);
 		assert.match(report.text, /spawnMode \(sample\/default\): rpc/);
+		// #329: this case is the coverage for the edited "paths known" branch (`export …` +
+		// the role-frontmatter alternative). The dead switch must not ride along either.
+		assert.doesNotMatch(report.text, /inheritExtensions: true/);
+		assert.doesNotMatch(nextStepsBlock(report.text), /inheritExtensions|PI_LEGION_CHILD_INHERIT_EXTENSIONS/);
+		assert.match(nextStepsBlock(report.text), /role frontmatter extensions: \[…\] \(role-scoped only\)/);
 	} finally {
 		clearSpawnFailures();
 		rmSync(dir, { recursive: true, force: true });
@@ -927,27 +939,22 @@ test("#212 doctor rpc still recommends PI_LEGION_CHILD_EXTENSIONS", () => {
 
 // ── #329: the dead inheritance switch stays out of doctor's advice ─────────
 
-/** The actionable tail of a report — the only region that carries advice. */
-function nextStepsBlock(text: string): string {
-	const at = text.indexOf("## Next steps (actionable)");
-	assert.ok(at >= 0, "precondition: the report has a next-steps block");
-	return text.slice(at);
-}
-
 /**
  * #329: `inheritExtensions: true` / `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` are dead advice
  * (#280 made `true` the default; #317 showed the switch yields 0 extensions when host
  * discovery fails — the exact state doctor is diagnosing). #328 removed them from
  * `spawn-hints.ts`; doctor is the second surface where the same child-failure hint lands.
  *
- * The two literal strings are checked against the whole report; the bare switch NAMES are
- * checked in the advice regions only, because the Extensions section legitimately echoes
- * the env value (`- PI_LEGION_CHILD_INHERIT_EXTENSIONS=(unset)`).
+ * The Extensions section legitimately echoes the env value, which can be `=1` when a user
+ * still carries the old advice in their shell (`- PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`), so
+ * that one status line is stripped before the whole-text check: the *advice* must be clean,
+ * the report's honest state display is not advice.
  */
 function assertNoDeadInheritanceAdvice(report: ReturnType<typeof runLegionDoctor>, where: string): void {
-	assert.doesNotMatch(report.text, /inheritExtensions: true/, `${where}: the dead switch must not be printed`);
+	const adviceText = report.text.replace(/^- PI_LEGION_CHILD_INHERIT_EXTENSIONS=.*$/gm, "");
+	assert.doesNotMatch(adviceText, /inheritExtensions: true/, `${where}: the dead switch must not be printed`);
 	assert.doesNotMatch(
-		report.text,
+		adviceText,
 		/PI_LEGION_CHILD_INHERIT_EXTENSIONS=1/,
 		`${where}: the dead env opt-in must not be printed`,
 	);
@@ -1029,6 +1036,21 @@ test("#329: doctor never recommends inheritExtensions: true / PI_LEGION_CHILD_IN
 		assert.ok(rpc.issues.some((i) => i.code === "CHILD_NO_MODELS"), "precondition: rpc model advice is present");
 		assertNoDeadInheritanceAdvice(rpc, "rpc");
 		assert.match(nextStepsBlock(rpc.text), /PI_LEGION_CHILD_EXTENSIONS=<paths>/);
+
+		// A user who still carries the old advice in their shell: the Extensions section echoes
+		// `- PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`, which is a status line, not a recommendation.
+		// The helper strips exactly that line — pin both halves so the strip is not decorative.
+		const stillExported = runLegionDoctor({
+			...base,
+			sampleAgent,
+			env: { ...process.env, PI_LEGION_CHILD_INHERIT_EXTENSIONS: "1", PI_LEGION_CHILD_EXTENSIONS: undefined },
+		});
+		assert.match(
+			stillExported.text,
+			/^- PI_LEGION_CHILD_INHERIT_EXTENSIONS=1$/m,
+			"precondition: the state echo really can print the old value",
+		);
+		assertNoDeadInheritanceAdvice(stillExported, "inprocess with the old switch exported");
 	} finally {
 		clearSpawnFailures();
 		rmSync(dir, { recursive: true, force: true });

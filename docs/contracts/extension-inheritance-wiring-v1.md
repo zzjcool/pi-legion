@@ -489,7 +489,7 @@ doctor 自身不探测（否则每次 doctor 都要付 0.3–0.9 s 的 `pi list`
 | A26 | doctor 输出在 fake `pi list` 失败 / 成功 / 未探测三种状态下分别含 `failed \d+s ago` / `ok` / `never`，且 doctor 不额外探测 |
 | A27 | `INPROCESS_MODEL_HINT` 不再出现 `inheritExtensions` 与 `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`，且含 `PI_LEGION_CHILD_EXTENSIONS=<path>`、`models.json` |
 | A28 | discovery 为 `failed` / `unknown` 时提示含 `the child got 0 host extensions`；`ok` 时不追加 |
-| A29 | **真生产路径**：fake `pi list` 失败 → `ensureHostExtensions()` → `spawnFailureHint({stderr, spawnMode:"inprocess"})`（**不传** `discoveryStatus`）含 `host discovery is failed`；且同一断言对 `?fresh=1` 重新求值的 spawn-hints 模块实例同样成立（跨模块共享的 `globalThis` holder） |
+| A29 | **真生产路径**：fake `pi list` 失败 → `ensureHostExtensions()` → `spawnFailureHint({stderr, spawnMode:"inprocess"})`（**不传** `discoveryStatus`）含 `host discovery is failed`；且 `import("…extension-inheritance.ts?fresh=1")` 重新求值的实例读同一 `globalThis` holder（`hostExtensionDiscoveryState().status === "failed"`）。**#329 修订**：原文写「同一断言对 `?fresh=1` 重新求值的 **spawn-hints** 模块实例同样成立」，那是空转——ESM 解析相对说明符时丢弃 query，`spawn-hints.ts?fresh=1` 内部的 `./extension-inheritance.ts` 仍解析到**同一个**已缓存实例，底层 store 换成模块内对象也能绿；故改为对 holder 的拥有者模块 `extension-inheritance.ts` 本身重新求值 |
 | A30 | `describeProbeFailure` 退化链钉住：空 stderr + exit 4 → `pi list exited 4`；无 `pi`（`ENOENT`，非数字 code）→ `spawn pi ENOENT` |
 | A31 | rpc `--no-extensions` 分支不再出现 `inheritExtensions` / `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`，`PI_LEGION_CHILD_EXTENSIONS` 仍在句首 |
 
