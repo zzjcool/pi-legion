@@ -309,20 +309,26 @@ function asText(value: unknown): string {
 /**
  * One bounded line explaining why a probe failed.
  *
- * `pi list` can fail with no stderr at all (a killed child, a bare `exit 4`),
- * so the summary degrades from stderr → message → exit code → a generic
- * sentence. It must never throw: a warning is not allowed to fail a launch
- * (#317).
+ * `pi list` can fail with no stderr at all (a killed child, a bare `exit 4`), so
+ * the summary degrades through stderr → exit code → `error.message`. The code
+ * sits BEFORE the message on purpose: Node's `execFile` always fills `message`
+ * with `Command failed: pi list`, so a message-first order would make the exit
+ * code branch unreachable — and `pi list exited 4` says more than the generic
+ * wrapper text. A non-numeric code (`ENOENT`) still falls through to the message
+ * (`spawn pi ENOENT`), which is the actionable one there. It must never throw: a
+ * warning is not allowed to fail a launch (#317).
  */
 function describeProbeFailure(error: unknown): string {
 	const err = error as { stderr?: unknown; message?: unknown; code?: unknown } | undefined;
-	const candidates = [asText(err?.stderr), asText(err?.message)];
-	for (const candidate of candidates) {
-		const flat = candidate.replace(/\s+/g, " ").trim();
-		if (!flat) continue;
-		return flat.length > DISCOVERY_STDERR_LIMIT ? `${flat.slice(0, DISCOVERY_STDERR_LIMIT)}…` : flat;
+	const stderr = asText(err?.stderr).replace(/\s+/g, " ").trim();
+	if (stderr) {
+		return stderr.length > DISCOVERY_STDERR_LIMIT ? `${stderr.slice(0, DISCOVERY_STDERR_LIMIT)}…` : stderr;
 	}
 	if (typeof err?.code === "number") return `pi list exited ${err.code} with no stderr`;
+	const message = asText(err?.message).replace(/\s+/g, " ").trim();
+	if (message) {
+		return message.length > DISCOVERY_STDERR_LIMIT ? `${message.slice(0, DISCOVERY_STDERR_LIMIT)}…` : message;
+	}
 	return "pi list failed with no output";
 }
 
@@ -384,10 +390,15 @@ export const FAILURE_TTL_MS = 5_000;
  *
  * The stamp doubles as the "already told the operator" bit (#317): while it is
  * set, a later failing probe updates the time but stays quiet, so a host that
- * will never have `pi list` working cannot flood the log once per spawn. A
- * success deletes the stamp, so a failure AFTER a recovery warns again — that is
- * a new episode, not a repeat, and it needs no extra state (the frozen contract
- * for the backoff already models exactly this window).
+ * will never have `pi list` working cannot flood the log once per spawn.
+ *
+ * Scope of "once": one warning per PROCESS. A successful probe caches through
+ * `discovered`, and `ensureHostExtensions` short-circuits on that forever — so
+ * once discovery has worked there is no further probe to fail, and the stamp
+ * being deleted on success cannot produce a second warning in production. The
+ * only way back is `resetExtensionDiscoveryCache`, which is a test seam and also
+ * clears the stamp, i.e. a genuinely fresh start. No extra state is needed for
+ * this bound (the frozen backoff already models exactly this window).
  *
  * Never throws: the warning itself must not be able to fail a launch, and an
  * empty `pi list` stderr must not turn into a TypeError here.

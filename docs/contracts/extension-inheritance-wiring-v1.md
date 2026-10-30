@@ -448,9 +448,15 @@ F/A 表继续有效，以下为增量。
 ### R3-b 决策（D6–D9）
 
 **D6 — 失败告警一次，且仍不 reject。** 探测失败时写 `failedAt` 并发一条 `[legion]` 前缀告警，
-内容含 ≤`DISCOVERY_STDERR_LIMIT`（200 字符）的 `pi list` stderr 摘要；stderr 为空时退化到
-`error.message` → exit code → 兜底句，绝不抛。`failedAt` 兼任「已告知」位：stamp 存在时后续失败
-不再刷屏（同一 failure episode 只一条）；成功会删除 stamp，因此「恢复后再失败」是新事件、会再告警一次。
+内容含 ≤`DISCOVERY_STDERR_LIMIT`（200 字符）的 `pi list` stderr 摘要；stderr 为空时按
+**exit code → `error.message`** 顺序退化（code 在 message 之前，因为 `execFile` 的 `message` 恒为
+`Command failed: pi list`，message 优先会让 code 分支不可达），最后才落到兜底句，绝不抛。
+`failedAt` 兼任「已告知」位：stamp 存在时后续失败不再刷屏。
+
+**告警上界是「每进程一次」，不是「每个 episode 一次」**（review 后修订）：成功探测把结果写进
+`discovered` 并永久短路后续探测，所以生产路径上不存在「恢复后再次失败」——唯一的回退手段是测试
+seam `resetExtensionDiscoveryCache()`，它同时清掉 stamp，等价于重新开始。故措辞与代码都按
+「每进程最多一条」表述（D6 旧措辞「恢复后再失败会再告警一次」已删除）。
 **不新增任何持久化字段**，告警体自身也裹 try/catch —— 告警失败不得使 launch 失败。
 
 **D7 — 只读内省。** 新增 `hostExtensionDiscoveryState(): { status: "ok" | "failed" | "unknown"; count: number; at?: number }`。
@@ -469,6 +475,9 @@ doctor 自身不探测（否则每次 doctor 都要付 0.3–0.9 s 的 `pi list`
 `inheritance is enabled but host discovery is <failed|never probed> — the child got 0 host extensions`。
 注入方式：`spawnFailureHint` 新增可选入参 `discoveryStatus`（保持纯函数、不做 IO；缺省读内存态，
 生产路径 `enrichFailureWithAutoDoctor` 无需改动即可获得该提示）。`ok`（含 count 0）不追加。
+该 note **对每个分支都追加**（inprocess / rpc `--no-extensions` / rpc 无 `--no-extensions`），
+因此任何分支都不得再推荐 `inheritExtensions` / `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` —— 否则
+同一条提示会自相矛盾（review 后修订，见 R3-e）。
 
 ### R3-c 验收增量
 
@@ -480,6 +489,9 @@ doctor 自身不探测（否则每次 doctor 都要付 0.3–0.9 s 的 `pi list`
 | A26 | doctor 输出在 fake `pi list` 失败 / 成功 / 未探测三种状态下分别含 `failed \d+s ago` / `ok` / `never`，且 doctor 不额外探测 |
 | A27 | `INPROCESS_MODEL_HINT` 不再出现 `inheritExtensions` 与 `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`，且含 `PI_LEGION_CHILD_EXTENSIONS=<path>`、`models.json` |
 | A28 | discovery 为 `failed` / `unknown` 时提示含 `the child got 0 host extensions`；`ok` 时不追加 |
+| A29 | **真生产路径**：fake `pi list` 失败 → `ensureHostExtensions()` → `spawnFailureHint({stderr, spawnMode:"inprocess"})`（**不传** `discoveryStatus`）含 `host discovery is failed`；且同一断言对 `?fresh=1` 重新求值的 spawn-hints 模块实例同样成立（跨模块共享的 `globalThis` holder） |
+| A30 | `describeProbeFailure` 退化链钉住：空 stderr + exit 4 → `pi list exited 4`；无 `pi`（`ENOENT`，非数字 code）→ `spawn pi ENOENT` |
+| A31 | rpc `--no-extensions` 分支不再出现 `inheritExtensions` / `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`，`PI_LEGION_CHILD_EXTENSIONS` 仍在句首 |
 
 ### R3-d 文件归属增量
 
@@ -493,5 +505,10 @@ doctor 自身不探测（否则每次 doctor 都要付 0.3–0.9 s 的 `pi list`
 - 不改 `#212` 的「inprocess 不给 **argv** 建议」结论：argv 建议仍不出现。但
   `PI_LEGION_CHILD_EXTENSIONS` 不是 argv（F45），inprocess 同样生效，故 #317 起明确推荐它，
   并把旧断言 `doesNotMatch(PI_LEGION_CHILD_EXTENSIONS)` 改写为「不得出现 argv 建议」。
-- rpc 分支提示本轮保留既有措辞（冻结范围只点名 `INPROCESS_MODEL_HINT`）。
+- ~~rpc 分支提示保留既有措辞~~（**review 后修订**）：本 PR 把 discovery note 注入了 rpc 分支，
+  而该分支仍推荐 `inheritExtensions: true` / `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`，同一条提示
+  自相矛盾（note 说的是「继承已开但 discovery 失败 → 子节点 0 条扩展」）。故删掉该子句，
+  `PI_LEGION_CHILD_EXTENSIONS` 与 role `extensions:` 仍保留（A31）。
 - 不做主机级 retry daemon、不改 `FAILURE_TTL_MS`、不改继承/排除策略。
+- 不把「每进程一次」的告警上界写成测试：可达路径只有测试 seam reset（见 D6），加用例等于把
+  合成路径固化成契约；改为在 D6/代码注释/CHANGELOG 里如实表述。

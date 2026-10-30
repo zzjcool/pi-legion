@@ -129,3 +129,22 @@ test("#212 withSpawnFailureHint records inprocess without hadNoExtensions", () =
 	assert.equal(recent[0]!.hadNoExtensions, false);
 	clearSpawnFailures();
 });
+
+test("#317: no spawn hint recommends the dead inheritExtensions switch (rpc branch too)", () => {
+	// The rpc branch used to end with "or set `inheritExtensions: true` /
+	// `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` (costs more memory)". That advice is
+	// dead (`true` is the default since #280) and now also self-contradictory: the
+	// discovery note appended right below says inheritance IS enabled and the child
+	// still got 0 host extensions (#317 review, minor 1).
+	const rpc = spawnFailureHint({
+		stderr: 'Error: Model "workbuddy/hy4:high" not found. Use --list-models',
+		args: ["--no-extensions", "--model", "workbuddy/hy4:high"],
+		spawnMode: "rpc",
+		discoveryStatus: "ok",
+	});
+	assert.ok(rpc);
+	assert.doesNotMatch(rpc!, /inheritExtensions/);
+	assert.doesNotMatch(rpc!, /PI_LEGION_CHILD_INHERIT_EXTENSIONS=1/);
+	assert.match(rpc!, /PI_LEGION_CHILD_EXTENSIONS/, "the lever that still works stays in the first sentence");
+	assert.match(rpc!, /\/legion doctor|action=diagnose/);
+});

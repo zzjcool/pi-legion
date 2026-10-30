@@ -77,6 +77,11 @@ function discoveryNote(status: HostExtensionDiscoveryStatus): string | undefined
  * deterministic; when it is omitted the in-memory discovery holder is read (no
  * probe, no subprocess), which is what production spawn paths want without every
  * caller having to pass it.
+ *
+ * The discovery note is appended to EVERY branch, so no branch may still offer
+ * `inheritExtensions` / `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` as a fix: that
+ * would contradict the note directly below it ("inheritance is enabled but host
+ * discovery is failed — the child got 0 host extensions").
  */
 export function spawnFailureHint(input: {
 	stderr?: string;
@@ -103,10 +108,13 @@ export function spawnFailureHint(input: {
 		"Hint: children start with `--no-extensions`, so host packages that register " +
 		"providers (e.g. `pi-any-endpoint`) are not loaded. The model works in the " +
 		"parent but is unknown to the child.\n" +
+		// #317 review: the dead-switch clause (`inheritExtensions: true` /
+		// `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1`) is gone. The discovery note this
+		// branch now carries says inheritance is already on and still yields 0 host
+		// extensions, so recommending the switch here contradicted the next line.
 		"Fix: set `PI_LEGION_CHILD_EXTENSIONS` to the provider extension path(s), " +
-		"add them under the role's `extensions:` frontmatter, or set " +
-		"`inheritExtensions: true` / `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` " +
-		"(costs more memory). Run `/legion doctor` or `subagent action=diagnose` for paths.",
+		"or add them under the role's `extensions:` frontmatter. " +
+		"Run `/legion doctor` or `subagent action=diagnose` for paths.",
 	);
 }
 

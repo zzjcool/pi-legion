@@ -40,8 +40,9 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   looked exactly like a host that ships no package extensions, because `discoveredHostExtensions()
   ?? []` collapses "could not ask" and "nothing installed" into one empty array. A failure now logs
   one `[pi-legion]`-prefixed warning carrying a bounded `pi list` stderr summary (the `failedAt` stamp doubles as
-  the already-told bit, so a permanently broken probe warns once per failure episode instead of once
-  per warm call, and the warning itself can never throw — empty stderr included). `/legion doctor`'s
+  the already-told bit, so a permanently broken probe warns at most once per process instead of once
+  per warm call; with no stderr the reason falls back to the exit code, then to pi's own message,
+  and the warning itself can never throw). `/legion doctor`'s
   Extensions section answers the question with
   `discovered host extensions: N (last probe: ok | failed <n>s ago | never)`, backed by the new
   read-only `hostExtensionDiscoveryState()` — doctor never probes on its own, so `never` is honest
@@ -50,7 +51,9 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` is a no-op, and neither brings back a host extension when
   discovery failed): it names `PI_LEGION_CHILD_EXTENSIONS=<path>` and a static `models.json`
   provider, and appends "inheritance is enabled but host discovery is failed/never probed — the
-  child got 0 host extensions" when that is the actual situation. Contract revision:
+  child got 0 host extensions" when that is the actual situation — on every spawn-hint branch, so
+  the rpc `--no-extensions` hint lost its own `inheritExtensions` clause too (it would have
+  contradicted the note right below it). Contract revision:
   `docs/contracts/extension-inheritance-wiring-v1.md` §9 (#317).
 - **A `collect` that bails after claiming no longer swallows that round's completion notice.**
   The claim-once seam claims a terminal result as it hands the snapshot to the tool call, and

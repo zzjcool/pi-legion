@@ -27,6 +27,7 @@ import { InMemoryUIProxy } from "../../src/supervisor/ui-proxy.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
 import { collectChildExtensions } from "../../src/runs/args.ts";
+import { spawnFailureHint } from "../../src/extension/spawn-hints.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 
 const HOST = [
@@ -865,21 +866,34 @@ test("#317: a failed discovery warns exactly once, with the `pi list` stderr", a
 
 test("#317: an empty `pi list` stderr still warns and never throws", async () => {
 	// No failMessage: the shim exits 4 with no stderr at all. The warning must
-	// degrade to another bounded description instead of throwing on `undefined`.
+	// degrade to the next description instead of throwing on `undefined`.
 	const host = fakeHost({ alwaysFail: true });
+	const emptyDir = mkdtempSync(path.join(tmpdir(), "ext-no-pi-"));
 	const log = captureConsoleError();
 	try {
 		await withHostEnv(host, {}, async () => {
 			assert.deepEqual(await ensureHostExtensions(), []);
 			assert.equal(log.lines.length, 1, `expected one warning, got ${JSON.stringify(log.lines)}`);
-			// The reason after the colon must be non-empty: with no stderr the summary
-			// degrades to `error.message` / the exit code instead of printing nothing.
+			// The reason after the colon must be non-empty, and with no stderr it is the
+			// EXIT CODE that names the failure (the `error.message` fallback sits after
+			// the code on purpose: `execFile` always fills message with the generic
+			// `Command failed: pi list`, which would make the code branch unreachable).
 			assert.match(log.lines[0]!, /failed \(pi list\): [^.\s]/, "a reason is still reported");
+			assert.match(log.lines[0]!, /pi list exited 4/, "the exit code is the reason when stderr is empty");
 			assert.equal(log.lines[0]!.includes("undefined"), false, "no `undefined` leaked into the message");
+		});
+
+		// No `pi` on PATH at all: `code` is the string `ENOENT`, so the chain falls
+		// through to `error.message` — the other half of the fallback order.
+		await withPathEnv(emptyDir, {}, async () => {
+			assert.deepEqual(await ensureHostExtensions(), []);
+			assert.equal(log.lines.length, 2, `expected a second warning, got ${JSON.stringify(log.lines)}`);
+			assert.match(log.lines[1]!, /spawn pi ENOENT/, "a non-numeric code falls through to the message");
 		});
 	} finally {
 		log.restore();
 		host.cleanup();
+		rmSync(emptyDir, { recursive: true, force: true });
 	}
 });
 
@@ -930,6 +944,46 @@ test("#317: hostExtensionDiscoveryState separates ok / failed / never probed", a
 			assert.deepEqual(hostExtensionDiscoveryState(), { status: "ok", count: 1 });
 		});
 	} finally {
+		host.cleanup();
+	}
+});
+
+test("#317: the production path — no injected status — reads the shared discovery holder", async () => {
+	// The production caller (`enrichFailureWithAutoDoctor` → `spawnFailureHint`) does
+	// NOT pass `discoveryStatus`. If the `?? hostExtensionDiscoveryState().status`
+	// default ever stopped reading the real holder — say it fell back to `"ok"` — the
+	// note would silently never appear in production while every explicitly-injected
+	// case stayed green. So this case goes through the two real modules: discovery
+	// writes the state in `extension-inheritance.ts`, spawn-hints reads it, and
+	// nothing is passed in.
+	const host = fakeHost({ alwaysFail: true, failMessage: "pi list exploded" });
+	const log = captureConsoleError();
+	try {
+		await withHostEnv(host, {}, async () => {
+			await ensureHostExtensions();
+			assert.equal(hostExtensionDiscoveryState().status, "failed", "precondition: the probe failed");
+
+			// The state is shared through `globalThis[Symbol.for(...)]`, i.e. it survives
+			// module re-evaluation: a second, distinct instance of spawn-hints.ts (what a
+			// re-loaded extension or a different jiti module instance gets) must see the
+			// very same holder.
+			const holder = discoveryStore() as { failedAt?: number } | undefined;
+			assert.equal(typeof holder?.failedAt, "number", "the state lives on the shared holder");
+			const freshSpecifier = "../../src/extension/spawn-hints.ts?fresh=1";
+			const fresh = (await import(freshSpecifier)) as typeof import("../../src/extension/spawn-hints.ts");
+			assert.equal(typeof fresh.spawnFailureHint, "function", "precondition: a distinct module instance");
+
+			for (const hint of [
+				spawnFailureHint({ stderr: "Unknown provider: workbuddy/hy4", spawnMode: "inprocess" }),
+				fresh.spawnFailureHint({ stderr: "Unknown provider: workbuddy/hy4", spawnMode: "inprocess" }),
+			]) {
+				assert.ok(hint);
+				assert.match(hint!, /host discovery is failed/, "the un-injected path reads the real state");
+				assert.match(hint!, /the child got 0 host extensions/);
+			}
+		});
+	} finally {
+		log.restore();
 		host.cleanup();
 	}
 });
