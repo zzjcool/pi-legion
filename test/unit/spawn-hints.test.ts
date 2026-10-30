@@ -24,7 +24,7 @@ test("spawnFailureHint mentions --no-extensions and doctor when model missing (r
 	});
 	assert.ok(hint);
 	assert.match(hint!, /--no-extensions/);
-	assert.match(hint!, /PI_LEGION_CHILD_EXTENSIONS|inheritExtensions/);
+	assert.match(hint!, /PI_LEGION_CHILD_EXTENSIONS/);
 	assert.match(hint!, /\/legion doctor|action=diagnose/);
 });
 

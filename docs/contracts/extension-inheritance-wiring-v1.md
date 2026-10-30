@@ -510,5 +510,7 @@ doctor 自身不探测（否则每次 doctor 都要付 0.3–0.9 s 的 `pi list`
   自相矛盾（note 说的是「继承已开但 discovery 失败 → 子节点 0 条扩展」）。故删掉该子句，
   `PI_LEGION_CHILD_EXTENSIONS` 与 role `extensions:` 仍保留（A31）。
 - 不做主机级 retry daemon、不改 `FAILURE_TTL_MS`、不改继承/排除策略。
-- 不把「每进程一次」的告警上界写成测试：可达路径只有测试 seam reset（见 D6），加用例等于把
-  合成路径固化成契约；改为在 D6/代码注释/CHANGELOG 里如实表述。
+- 不新增用例覆盖「恢复后再失败」（生产不可达）：可达路径只有测试 seam reset（见 D6），加用例等于把
+  合成路径固化成契约；改为在 D6/代码注释/CHANGELOG 里如实表述。~~不把「每进程一次」的告警上界写成测试~~
+  （**#329 修订**）：原文这句话与既有断言不符——「重复失败不刷屏」已由
+  `test/unit/extension-inheritance.test.ts:859` 钉住，未覆盖的只是「恢复后再失败」这一条。

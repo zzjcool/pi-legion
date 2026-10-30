@@ -131,6 +131,14 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **`/legion doctor` stopped recommending the dead extension switch (#329).** `inheritExtensions: true`
+  and `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` outlived #328's clean-up in `legion-doctor.ts`: `true` has been
+  the default since #280 and both yield 0 extensions when host discovery fails, so every doctor fix and
+  next step now names only `models.json` / `PI_LEGION_CHILD_EXTENSIONS=<path>`, with a case that pins it.
+  The `?fresh=1` half of the #317 case re-evaluated the wrong module (ESM drops the query when resolving a
+  relative import), so it now re-evaluates `extension-inheritance.ts` and asserts that a second instance
+  reads the shared discovery holder.
+
 - **The five-value mailbox delivery landed against an adversarial review: four majors and six minors
   (#338, follow-up to #322/#333).** The important ones were silent: mail addressed to **root** could never
   be confirmed — `nodes.session_file` was written only on the child path (`reserveNode`), so every
