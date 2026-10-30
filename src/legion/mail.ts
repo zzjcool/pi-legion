@@ -12,13 +12,16 @@ export const MAIL_RATE_WINDOW_MS = 5 * 60 * 1_000;
 export const MAIL_DELIVERY = {
 	PENDING: 0,
 	/**
-	 * Accepted/queued by the child session — NOT proof the model read it (#313).
+	 * Accepted by the child session — NOT proof the model read it (#313).
 	 *
 	 * A message becomes INJECTED once the supervisor accepted the text (steer,
-	 * follow-up or prompt returned without throwing). Pi only hands a steer to the
-	 * model after the child's current tool batch finishes and before its next LLM
-	 * call, so INJECTED means "handed over, waiting for a turn boundary", never
-	 * "the model has seen it". Do not read this value as a delivery receipt.
+	 * follow-up or prompt returned without throwing), and that answer is
+	 * three-way: `queued` waits for the child's next turn boundary (after its
+	 * current tool batch, before the next LLM call), `accepted` started a turn,
+	 * and `intercepted` was swallowed by an input handler — the child never saw
+	 * it, yet the send still returned without throwing. So INJECTED means "handed
+	 * over", never "the model has seen it". Do not read this value as a delivery
+	 * receipt.
 	 */
 	INJECTED: 1,
 	BOUNCED: 2,

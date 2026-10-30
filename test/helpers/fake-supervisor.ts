@@ -118,7 +118,8 @@ export class FakeSupervisor implements LegionSupervisor {
 	private readonly initialUsage: UsageSnapshot | null;
 	/**
 	 * Disposition every `steer` call reports (#313). Defaults to the honest
-	 * `"queued"`; a test that wants a delivered steer sets it explicitly.
+	 * `"queued"`; a test that wants `"accepted"` or `"intercepted"` sets it
+	 * explicitly.
 	 */
 	steerDisposition: SteerDisposition = "queued";
 

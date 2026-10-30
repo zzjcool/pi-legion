@@ -400,8 +400,10 @@ export class RpcSupervisor implements LegionSupervisor {
 	/**
 	 * Use the RPC steer command while running; idle children start a prompt.
 	 *
-	 * Returns the disposition the RPC answered with (#313 D4) — the SDK's
-	 * `disposition` field, normalized by `toSteerDisposition`.
+	 * Returns what actually happened to the text (#313 D4): the disposition the
+	 * RPC answered with, normalized by `toSteerDisposition` — `"intercepted"`
+	 * when an input handler swallowed it, `"queued"` when it waits for the next
+	 * turn boundary, `"accepted"` when this call started a turn.
 	 */
 	steer(name: string, text: string): Promise<SteerDisposition> {
 		const child = this.requireChild(name);
@@ -562,13 +564,15 @@ export class RpcSupervisor implements LegionSupervisor {
 			} else if ((kind === "steer" || kind === "prompt") && wasActive) {
 				// A prompt addressed to a busy child is an immediate correction;
 				// use the explicit RPC steer command, never a second prompt command.
-				// The value is never discarded: it carries the queue/deliver answer.
-				return toSteerDisposition(await client.steer(text));
+				// The value is never discarded: `"handled"` means an input handler
+				// swallowed the text, `"queued"` that it waits for a turn boundary.
+				return toSteerDisposition(await client.steer(text), "steer");
 			} else {
-				await client.prompt(text);
-				// This call started the turn; a busy child would have taken a branch
-				// above, so the prompt reached the client at a turn boundary.
-				return "delivered";
+				// This call started the turn: a busy child took a branch above, so the
+				// prompt reached the client at a turn boundary. `prompt()` reports a
+				// disposition of its own (`dist/modes/rpc/rpc-client.js:135-137`), and
+				// `"handled"` there means *no run started* — read it, never assume it.
+				return toSteerDisposition(await client.prompt(text), "prompt");
 			}
 		} catch (error) {
 			if (!wasActive && child.turnActive) {

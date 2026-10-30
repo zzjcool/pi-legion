@@ -118,6 +118,14 @@ class FakeRpcClient implements RpcClientLike {
 	 * through `toSteerDisposition` is exercised, not bypassed.
 	 */
 	steerDisposition: unknown = "queued";
+	/**
+	 * Raw value this fake's `prompt` resolves with (#313). The real
+	 * `RpcClient.prompt()` returns the RPC reply's `disposition`
+	 * (`dist/modes/rpc/rpc-client.js:135-137`: "If the disposition is 'handled',
+	 * no run started for this prompt"). The default mirrors a plain turn start
+	 * that reported nothing.
+	 */
+	promptDisposition: unknown = undefined;
 	starts = 0;
 	stops = 0;
 	aborts = 0;
@@ -152,9 +160,10 @@ class FakeRpcClient implements RpcClientLike {
 		return "";
 	}
 
-	async prompt(message: string): Promise<void> {
+	async prompt(message: string): Promise<unknown> {
 		this.prompts.push(message);
 		if (this.promptError) throw this.promptError;
+		return this.promptDisposition;
 	}
 
 	async steer(message: string): Promise<unknown> {
@@ -646,25 +655,45 @@ test("steer returns the disposition mapped from the RPC client's raw answer (#31
 		const client = h.clients[0]!;
 
 		// The fake mirrors the SDK vocabulary, so the default is a raw "queued":
-		// busying child + unnormalized answer must not be reported as delivered.
+		// a busy child + unnormalized answer must never be reported as delivery.
 		assert.equal(client.steerDisposition, "queued");
 		assert.equal(await h.supervisor.steer("root.worker", "default answer"), "queued");
 
-		// raw "handled" is the only value that means the input handler took it now.
+		// raw "handled" is the interception signal, not delivery: the text never
+		// reached `_queueSteer`, so the child never saw it.
 		client.steerDisposition = "handled";
-		assert.equal(await h.supervisor.steer("root.worker", "take this now"), "delivered");
+		assert.equal(await h.supervisor.steer("root.worker", "swallowed by a handler"), "intercepted");
 
-		// raw "queued" stays queued through the mapping.
+		// raw "queued" stays queued through the mapping; junk is doubt-shaped and
+		// must not become a delivery claim either.
 		client.steerDisposition = "queued";
 		assert.equal(await h.supervisor.steer("root.worker", "bank this"), "queued");
-		assert.deepEqual(client.steers, ["default answer", "take this now", "bank this"]);
+		client.steerDisposition = {
+			unexpected: "shape",
+		};
+		assert.equal(await h.supervisor.steer("root.worker", "junk answer"), "queued");
+		assert.deepEqual(client.steers, [
+			"default answer",
+			"swallowed by a handler",
+			"bank this",
+			"junk answer",
+		]);
 		assert.equal(client.prompts.length, 1);
 
-		// A steer against an idle child starts the turn, so it did reach the model.
+		// A steer against an idle child starts a turn, so the prompt route answers.
+		client.promptDisposition = undefined;
 		emitSettled(client);
-		assert.equal(await h.supervisor.steer("root.worker", "fresh turn"), "delivered");
+		assert.equal(await h.supervisor.steer("root.worker", "fresh turn"), "accepted");
 		assert.deepEqual(client.prompts.slice(1), ["fresh turn"]);
-		assert.equal(client.steers.length, 3);
+		assert.equal(client.steers.length, 4);
+
+		// …and that prompt's own disposition is read, not assumed: the SDK says
+		// "handled" when no run started for the prompt.
+		client.promptDisposition = "handled";
+		emitSettled(client);
+		assert.equal(await h.supervisor.steer("root.worker", "prompt swallowed"), "intercepted");
+		assert.deepEqual(client.prompts.slice(2), ["prompt swallowed"]);
+		assert.equal(client.steers.length, 4, "an intercepted steer never reaches the steer command");
 		emitSettled(client);
 	} finally {
 		await h.supervisor.retire("root.worker");

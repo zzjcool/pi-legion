@@ -42,16 +42,16 @@ class FakeSession implements InProcessSession {
 	aborts = 0;
 	disposed = false;
 	/**
-	 * #313: the real session accepts a steer at any time, but while a tool batch
-	 * is executing it only banks it for the next LLM call.
+	 * Raw answer `steer()` resolves with (#313).
+	 *
+	 * The real `AgentSession.steer()` returns `"queued"` unconditionally — a
+	 * steer is banked whether or not a tool batch happens to be in flight
+	 * (`dist/core/agent-session.js:1698-1711`). `"handled"` is *not* "taken
+	 * now": it means an input handler swallowed the text before `_queueSteer`
+	 * ran, so the child never sees it. A case that wants that path flips this
+	 * field explicitly; the default is what the SDK really answers.
 	 */
-	toolInFlight = false;
-	private readonly queuedSteerTexts: string[] = [];
-
-	/** Steers accepted but not yet consumed while a tool batch was running. */
-	get queuedSteers(): readonly string[] {
-		return this.queuedSteerTexts;
-	}
+	steerDisposition: RawSteerDisposition = "queued";
 
 	subscribe(listener: (event: unknown) => void): () => void {
 		this.listeners.add(listener);
@@ -64,24 +64,9 @@ class FakeSession implements InProcessSession {
 		this.emit({ type: "turn_start" });
 	}
 
-	/**
-	 * Mirrors `AgentSession.steer()` (#313): `"handled"` means an input handler
-	 * took the text now, `"queued"` means it waits for the current tool batch.
-	 */
 	async steer(text: string): Promise<RawSteerDisposition> {
-		if (this.toolInFlight) {
-			this.queuedSteerTexts.push(text);
-			return "queued";
-		}
 		this.steers.push(text);
-		return "handled";
-	}
-
-	/** #313: the tool batch finished — banked steers reach the next turn. */
-	finishToolBatch(): void {
-		this.toolInFlight = false;
-		this.steers.push(...this.queuedSteerTexts);
-		this.queuedSteerTexts.length = 0;
+		return this.steerDisposition;
 	}
 
 	async followUp(text: string): Promise<void> {
@@ -745,35 +730,51 @@ test("inprocess: later dispatches reuse the child's context", async () => {
 	}
 });
 
-// ── #313: a steer behind an in-flight tool batch is queued, not delivered ─
+// ── #313: a steer reports what happened — queued, accepted or intercepted ──
 
-test("inprocess: steer reports queued behind an in-flight tool batch (#313)", async () => {
+test("inprocess: a steer reports the session's own answer (#313)", async () => {
 	const h = harness();
 	try {
 		await h.supervisor.spawnChild(testInput(h.root));
 		const session = h.sessions[0]!;
-		// A freshly spawned child is already inside its first (active) turn; the
-		// tool batch is what a steer cannot get past in the real session.
-		assert.equal(session.toolInFlight, false);
-		session.toolInFlight = true;
 
+		// The child is inside its first turn, so a steer takes the queue branch.
+		// The real session still answers "queued": queued is all it ever says,
+		// independent of whether a tool batch happens to be in flight.
+		assert.equal(session.steerDisposition, "queued");
 		assert.equal(await h.supervisor.steer("root.worker", "first correction"), "queued");
-		assert.deepEqual(session.steers, [], "nothing reached the model yet");
-		assert.deepEqual(session.queuedSteers, ["first correction"], "the text is banked, not delivered");
+		assert.deepEqual(session.steers, ["first correction"], "the text reached the session's steer seam");
+		assert.equal(session.prompts.length, 1, "a steer never starts a second prompt while the turn runs");
 
-		assert.equal(await h.supervisor.steer("root.worker", "second correction"), "queued");
-		assert.deepEqual(session.steers, []);
-		assert.deepEqual(session.queuedSteers, ["first correction", "second correction"]);
+		// "handled" is the SDK's interception signal: an input handler swallowed the
+		// text before `_queueSteer`, so the child never sees it. Reporting that as
+		// steered/delivered would be the inverse lie.
+		session.steerDisposition = "handled";
+		assert.equal(await h.supervisor.steer("root.worker", "swallowed by a handler"), "intercepted");
+		assert.deepEqual(session.steers, ["first correction", "swallowed by a handler"]);
 
-		// The tool batch ends: both corrections now reach the next LLM call in order.
-		session.finishToolBatch();
-		assert.deepEqual(session.steers, ["first correction", "second correction"]);
-		assert.deepEqual(session.queuedSteers, []);
+		// Back to the SDK's real answer: queued, never a delivery claim.
+		session.steerDisposition = "queued";
+		assert.equal(await h.supervisor.steer("root.worker", "third correction"), "queued");
+	} finally {
+		h.close();
+	}
+});
 
-		// The same call outside a tool batch is consumed immediately.
-		assert.equal(await h.supervisor.steer("root.worker", "third correction"), "delivered");
-		assert.deepEqual(session.steers, ["first correction", "second correction", "third correction"]);
-		assert.deepEqual(session.queuedSteers, []);
+test("inprocess: a steer on an idle child starts a turn and reports accepted (#313)", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const session = h.sessions[0]!;
+		// Let the first turn settle: `turnActive` turns false only on `agent_settled`.
+		session.settle();
+
+		// With no turn running, `steer` degrades to `session.prompt`
+		// (inprocess-supervisor.ts:1323-1328). The session accepted a fresh turn,
+		// nothing was intercepted, and nothing was queued behind a tool batch.
+		assert.equal(await h.supervisor.steer("root.worker", "start a turn with this"), "accepted");
+		assert.deepEqual(session.prompts.slice(1), ["start a turn with this"]);
+		assert.deepEqual(session.steers, [], "no queue to steer into: the prompt path is what ran");
 	} finally {
 		h.close();
 	}

@@ -13,18 +13,20 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
-- **A `steer` receipt now says whether the message was queued or delivered.** `steer` is a
+- **A `steer` receipt now reports what the child's session actually answered.** `steer` is a
   queue, not an interrupt: the text is enqueued and only consumed at the child's next turn
   boundary — after the current batch of tool calls finishes, before the next LLM call — so a
   child stuck inside one long-running command never receives it, and no amount of steering can
-  break into that tool call. The receipt read "Steered <name>." either way, because the
-  disposition the child's session reports back (`handled` vs `queued`) was dropped on the way
-  up through the supervisor seam. It is now carried through and rendered honestly: a message
-  that only made it into the queue says it takes effect after the child's current tool batch
-  finishes, and a plain "steered" is reserved for text the child's session actually consumed.
-  Resuming or continuing a live child carries the same distinction, and the parent playbook
-  plus the v2 contract now state the negative semantics — a tool call in flight is unreachable
-  by `steer`; `stop` (`force: true` for the hard variant) is what actually interrupts.
+  break into that tool call. The receipt read "Steered <name>." whatever happened, because the
+  disposition the child's session reports back (`handled` vs `queued`) was dropped on the way up
+  through the supervisor seam — and `handled` never meant delivered: it is the SDK's
+  interception signal, returned *before* the message is queued, so the child never sees it. The
+  receipt now has three honest shapes: `queued` (it takes effect after the current tool batch
+  finishes), `accepted` (the child was idle, so this call started a turn with it) and
+  `intercepted` (an input handler took it — the child never saw it). Resuming or continuing a
+  live child carries the same distinction, and the parent playbook plus the v2 contract now
+  state the negative semantics — a tool call in flight is unreachable by `steer`; `stop`
+  (`force: true` for the hard variant) is what actually interrupts.
 - **A child's completion notice is delivered once, whichever route won.** A terminal
   result reaches the parent two ways — the tool result (`wait` / `collect`) and the
   pushed notice (`watch` → `join` → outbox) — and each kept its own memory

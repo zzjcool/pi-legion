@@ -171,12 +171,12 @@ export class LegionPostman {
 
 	private async deliverToChild(node: LegionNode, message: LegionMessage): Promise<void> {
 		// #313: `MAIL_DELIVERY.INJECTED` (written below, once a send returns) means
-		// the child session **accepted/queued** the text — not that it was
-		// delivered to the model. A steer waits for the child's next turn
-		// boundary, i.e. after its current tool batch; a child stuck in a long
-		// tool never reads it. The state machine is unchanged on purpose: the
-		// transition still only says "handed over", and `delivered=` keeps its
-		// existing meaning. Cross the tool-batch wait with `stop`, not mail.
+		// the child session **took** the text — queued, accepted or intercepted by an
+		// input handler — never that it was delivered to the model. A steer waits
+		// for the child's next turn boundary, i.e. after its current tool batch; a
+		// child stuck in a long tool never reads it. The state machine is unchanged
+		// on purpose: the transition still only says "handed over", and `delivered=`
+		// keeps its existing meaning. Cross the tool-batch wait with `stop`, not mail.
 		const current = getNode(this.db, node.id) ?? node;
 		const text = formatMail(message);
 		const wasAlive = this.supervisor.isAlive(current.name);

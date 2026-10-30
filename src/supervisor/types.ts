@@ -93,25 +93,43 @@ export interface UsageSnapshot {
 /**
  * What a `steer` call actually achieved (#313).
  *
- * `"queued"` is the honest default: the message is sitting behind the child's
- * in-flight work, not in front of the model. `"delivered"` means the child's
- * input handler consumed it right away.
+ * - `"queued"`: the text sits behind the child's in-flight work and is consumed
+ *   at its next turn boundary — the model has not seen it yet.
+ * - `"accepted"`: the call started a turn with the text (the child was idle, so
+ *   there was no queue to wait in). Still not proof the model read it.
+ * - `"intercepted"`: an input handler consumed the text before it was ever
+ *   queued — the child never saw it.
+ *
+ * There is deliberately no `"delivered"`: no seam observes the model reading the
+ * text, so any such claim would be invented.
  */
-export type SteerDisposition = "queued" | "delivered";
+export type SteerDisposition = "queued" | "accepted" | "intercepted";
 
 /**
- * Normalize the SDK's steer vocabulary (`"handled" | "queued"`) into
- * {@link SteerDisposition} (#313 D2). The only place this mapping happens.
+ * Normalize the SDK's disposition vocabulary into {@link SteerDisposition}
+ * (#313 D2). The only place this mapping happens.
  *
- * Anything that is not literally `"handled"` — `"queued"`, `undefined`, a
- * backend that returns junk, an older SDK that returns nothing — maps to
- * `"queued"`. Rationale: a receipt must never claim delivery on doubt. A
- * false `"queued"` merely understates; a false `"delivered"` would tell a
- * parent its correction landed while the child is still running its previous
- * tool batch.
+ * `"handled"` is the SDK's *interception* signal, never delivery:
+ * `_queueUserInput` returns it **before** `_queueSteer` runs
+ * (`dist/core/agent-session.js:1694-1697`), so an input handler swallowed the
+ * text and the child never saw it. The RPC client says the same from the other
+ * side: `dist/modes/rpc/rpc-client.js:133` — "If the disposition is 'handled',
+ * no run started for this prompt".
+ *
+ * Everything else — `"queued"`, `undefined`, a backend that returns junk, an
+ * older SDK that returns nothing — means the text went in. `route` only decides
+ * what "went in" is called, and only for a child that was idle: a steer has
+ * nowhere to go but the queue (`"queued"`), while a `route` of `"prompt"` means
+ * `prompt()` returned without throwing, i.e. the session accepted a turn with
+ * this text (`"accepted"`) — `"handled"` is the only "no turn started" signal
+ * a prompt can produce.
  */
-export function toSteerDisposition(raw: unknown): SteerDisposition {
-	return raw === "handled" ? "delivered" : "queued";
+export function toSteerDisposition(
+	raw: unknown,
+	route: "steer" | "prompt",
+): SteerDisposition {
+	if (raw === "handled") return "intercepted";
+	return route === "prompt" ? "accepted" : "queued";
 }
 
 /** The orchestrator's frozen backend seam (legion-v2-contract.md §3.1). */
@@ -119,9 +137,10 @@ export interface LegionSupervisor {
 	spawnChild(input: SpawnInput): Promise<ChildHandle>;
 	prompt(name: string, text: string): Promise<void>;
 	/**
-	 * Steer a running child (#313): the returned disposition says whether the
-	 * message was taken now (`"delivered"`) or banked behind the current tool
-	 * batch (`"queued"`). Callers that build a receipt must report it.
+	 * Steer a running child (#313): the returned disposition says what happened
+	 * to the text — `"queued"` behind its current tool batch, `"accepted"` as a
+	 * turn this call started, or `"intercepted"` by an input handler (the child
+	 * never saw it). Callers that build a receipt must report it.
 	 */
 	steer(name: string, text: string): Promise<SteerDisposition>;
 	followUp(name: string, text: string): Promise<void>;

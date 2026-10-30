@@ -2016,21 +2016,45 @@ function unknownChild(
 }
 
 /**
+ * The parenthetical a queued steer carries (#313 D5).
+ *
+ * One constant on purpose: `steerReceipt` renders it for the `steer` tool and
+ * the revive/continue branch reuses it for a live child, so the queue wording
+ * exists exactly once.
+ */
+export const STEER_QUEUED_NOTE =
+	"queued — it takes effect after its current tool batch finishes";
+
+/** The same, for a steer an input handler swallowed before it was ever queued. */
+export const STEER_INTERCEPTED_NOTE =
+	"intercepted by an input handler — the child never saw it";
+
+/**
  * Render the receipt for one accepted `steer` (#313 D5).
  *
- * The only place a steer receipt is built. `queued` is the honest wording: Pi
- * delivers a steer after the child's current tool batch finishes and before
- * its next LLM call, so a message sent into a running tool says nothing about
- * the model having seen it yet. It is not an error and must not read like one,
- * but it must not read as "delivered" either.
+ * The only place a steer receipt is built. The three dispositions are the only
+ * three things a caller can honestly claim, and there is no "delivered":
+ *
+ * - `queued`: Pi consumes a steer after the child's current tool batch finishes
+ *   and before its next LLM call, so a message sent into a running tool says
+ *   nothing about the model having seen it yet. Not an error, and it must not
+ *   read like one — but it must not read as success either.
+ * - `accepted`: the child was idle, so this call started a turn with the text.
+ *   The model still has to read it; this only says the session took the turn.
+ * - `intercepted`: an input handler ate the text before the queue. The child
+ *   never sees it, so the receipt must not open with "Steered".
  */
 export function steerReceipt(
 	name: string,
 	disposition: SteerDisposition,
 ): string {
-	return disposition === "delivered"
-		? `Steered ${name}.`
-		: `Steered ${name} (queued — it takes effect after its current tool batch finishes)`;
+	if (disposition === "intercepted") {
+		return `Steer ${name} was ${STEER_INTERCEPTED_NOTE}`;
+	}
+	if (disposition === "accepted") {
+		return `Steered ${name} (a turn was started with it)`;
+	}
+	return `Steered ${name} (${STEER_QUEUED_NOTE})`;
 }
 
 /**
@@ -2347,17 +2371,19 @@ async function reviveChild(
 
 	try {
 		if (supervisor.isAlive(name)) {
-			// #313 D5: this branch steers a live child too, so it must not claim
-			// delivery it cannot observe. `queued` appends the parenthetical from
-			// `steerReceipt` rather than inventing a third wording.
+			// #313 D5: this branch steers a live child too, so it reports the same
+			// three outcomes as `steerChild`, reusing the receipt notes rather than
+			// writing a second copy of the wording.
 			const disposition = await orchestrator.steer(name, params.message);
 			followChild(ctx, { watch: true });
 			const prefix = `${action === "resume" ? "Resumed" : "Continued"} ${name}`;
-			return ok(
-				disposition === "delivered"
-					? `${prefix} (live child steered).`
-					: `${prefix} (live child steered — queued — it takes effect after its current tool batch finishes).`,
-			);
+			if (disposition === "intercepted") {
+				return ok(`${prefix}, but the steer was ${STEER_INTERCEPTED_NOTE}.`);
+			}
+			if (disposition === "queued") {
+				return ok(`${prefix} (live child steered — ${STEER_QUEUED_NOTE}).`);
+			}
+			return ok(`${prefix} (live child steered).`);
 		}
 
 		const handle = await orchestrator.launch({

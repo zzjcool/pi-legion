@@ -1296,11 +1296,12 @@ export class InProcessSupervisor implements LegionSupervisor {
 	/**
 	 * Dispatch one turn and report what actually happened to `text` (#313 D4).
 	 *
-	 * The disposition is chosen by the branch taken, never by the caller's
-	 * intent: a steer that the session accepted while a turn is running is
-	 * reported as whatever `session.steer()` says (normalized by
-	 * `toSteerDisposition`), a follow-up queued behind an active turn is
-	 * `"queued"`, and a prompt that started the turn is `"delivered"`.
+	 * The caller's intent never decides the answer. A steer the session accepted
+	 * while a turn is running reports the session's own verdict through
+	 * `toSteerDisposition` — `"handled"` means an input handler swallowed it
+	 * (`"intercepted"`), anything else means it is queued. A follow-up behind an
+	 * active turn is `"queued"`, and a prompt that had to start the turn is
+	 * `"accepted"`.
 	 */
 	private async dispatchInContext(
 		child: ChildRecord,
@@ -1318,14 +1319,15 @@ export class InProcessSupervisor implements LegionSupervisor {
 				return "queued";
 			} else if ((kind === "steer" || kind === "prompt") && wasActive && session.steer) {
 				// Never drop this value: the session uses it to say whether an input
-				// handler consumed the text now or banked it behind the tool batch.
-				return toSteerDisposition(await session.steer(text));
+				// handler swallowed the text ("handled") or banked it behind the tool
+				// batch ("queued").
+				return toSteerDisposition(await session.steer(text), "steer");
 			} else {
 				await session.prompt(text);
-				// No steer/followUp seam was usable. If the child was already busy the
-				// prompt still joins the queue behind that turn; only a prompt that
-				// started a fresh turn reached the session immediately.
-				return wasActive ? "queued" : "delivered";
+				// No steer/followUp seam was usable. A prompt that started the turn was
+				// accepted by the session; a prompt sent into a running turn still only
+				// joins the queue behind it.
+				return wasActive ? "queued" : "accepted";
 			}
 		} catch (error) {
 			if (!wasActive && child.turnActive) {
