@@ -23,7 +23,8 @@ import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
-import type { AbortOutcome, ChildActivity, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
+import type { AbortOutcome, InFlightToolStack, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
+import { inFlightToolStackOf } from "./src/supervisor/types.ts";
 import { withInFlightToolLine } from "./src/extension/legion-status.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
@@ -1391,9 +1392,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				// child launched elsewhere, so a foreign record needs the owner marker.
 				// Undefined while alive — liveness already wins there.
 				const owner = ownerVerdictFor(store, runs, child.name, alive);
-				// #315: same display-only activity fact `subagent status` prints, so the
-				// slash command cannot drift from the tool surface.
-				const activity = supervisor.inFlightTool?.(child.name);
+				// #315/#331: same display-only activity fact `subagent status` prints,
+				// so the slash command cannot drift from the tool surface.
+				const inFlightTools = inFlightToolStackOf(supervisor, child.name);
 				return {
 					name: child.name,
 					state: child.state,
@@ -1409,7 +1410,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					...(child.spawnMode ? { spawnMode: child.spawnMode } : {}),
 					alive,
 					...(owner ? { owner } : {}),
-					...(activity ? { activity } : {}),
+					...(inFlightTools ? { inFlightTools } : {}),
 				};
 			} catch {
 				return undefined;
@@ -1906,8 +1907,8 @@ async function controlAction(input: {
 			// Liveness facts are read once per name and reused by both the filter and
 			// the block, so `status` cannot classify a child one way and render it
 			// another (display-liveness D6 exit 1).
-			const factsByName = new Map<string, StatusLivenessFacts & { pid?: number; activity?: ChildActivity }>();
-			const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; activity?: ChildActivity } => {
+			const factsByName = new Map<string, StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack }>();
+			const factsFor = (child: StatusChildRecord): StatusLivenessFacts & { pid?: number; inFlightTools?: InFlightToolStack } => {
 				const cached = factsByName.get(child.name);
 				if (cached) return cached;
 				const alive = input.supervisor.isAlive(child.name);
@@ -1915,14 +1916,14 @@ async function controlAction(input: {
 				// A pid only exists for a child this process actually tracks; a
 				// record from another session has none, and none is invented.
 				const pid = input.runtime.get(child.name)?.pid;
-				// #315: same rule for the in-flight tool — only this process's live
-				// backend can answer, and `undefined` renders no line.
-				const activity = input.supervisor.inFlightTool?.(child.name);
+				// #315/#331: same rule for the in-flight stack — only this process's
+				// live backend can answer, and `undefined` renders no line.
+				const inFlightTools = inFlightToolStackOf(input.supervisor, child.name);
 				const facts = {
 					alive,
 					...(owner ? { owner } : {}),
 					...(pid ? { pid } : {}),
-					...(activity ? { activity } : {}),
+					...(inFlightTools ? { inFlightTools } : {}),
 				};
 				factsByName.set(child.name, facts);
 				return facts;
@@ -1932,12 +1933,12 @@ async function controlAction(input: {
 			return ok(
 				renderStatusOverview(
 					classified.map(({ child, live }) => {
-						const { pid, activity, ...facts } = factsFor(child);
+						const { pid, inFlightTools, ...facts } = factsFor(child);
 						return {
 							child,
 							...facts,
 							...(pid ? { pid } : {}),
-							...(activity ? { activity } : {}),
+							...(inFlightTools ? { inFlightTools } : {}),
 							live,
 						};
 					}),
@@ -2005,8 +2006,8 @@ async function controlAction(input: {
 			alive,
 			...(owner ? { owner } : {}),
 		});
-		const activity = input.supervisor.inFlightTool?.(found.child.name);
-		const rendered = withInFlightToolLine(snapshot, activity, Date.now());
+		const inFlightTools = inFlightToolStackOf(input.supervisor, found.child.name);
+		const rendered = withInFlightToolLine(snapshot, inFlightTools, Date.now());
 		return ok(resolvedNote ? `${resolvedNote}\n${rendered}` : rendered);
 	}
 
@@ -4329,17 +4330,17 @@ export interface StatusChildEntry {
 	 */
 	live?: boolean;
 	/**
-	 * Tool call in flight right now (#315). Supplied by the supervisor; absent
-	 * means no activity fact, which renders no line at all.
+	 * Tool calls in flight right now (#315, #331), innermost last. Supplied by
+	 * the supervisor; absent means no activity fact, which renders no line at all.
 	 */
-	activity?: ChildActivity;
+	inFlightTools?: InFlightToolStack;
 }
 
 /** Multi-child status text: one {@link renderLiveChildStatus} block per child. */
 export function renderStatusOverview(children: StatusChildEntry[], now: number = Date.now()): string {
 	const deadCount = children.filter((entry) => entry.live === false).length;
 	const liveCount = children.length - deadCount;
-	const blocks = children.map(({ child, alive, owner, pid, activity }) =>
+	const blocks = children.map(({ child, alive, owner, pid, inFlightTools }) =>
 		withInFlightToolLine(
 			renderLiveChildStatus({
 				name: child.name,
@@ -4354,7 +4355,7 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				...(owner ? { owner } : {}),
 				...(pid ? { pid } : {}),
 			}),
-			activity,
+			inFlightTools,
 			now,
 		),
 	);

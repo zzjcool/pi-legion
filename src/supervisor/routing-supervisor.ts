@@ -23,6 +23,7 @@ import type {
 	ChildActivity,
 	ChildHandle,
 	EventSubscriptionOptions,
+	InFlightToolStack,
 	LegionSupervisor,
 	SettleResult,
 	SpawnInput,
@@ -102,6 +103,13 @@ function chainSlotRelease(hook: ((event: InProcessSlotEvent) => void) | undefine
  * based on the resolved spawnMode of the target agent / registered child.
  */
 export class RoutingSupervisor implements LegionSupervisor {
+	/**
+	 * Conservative capability report (#323 D1): this facade routes per child, so
+	 * a flag here may only claim what EVERY backend it can route to can answer.
+	 * `promptDisposition` is `false` because an in-process child — the default
+	 * spawn mode — cannot report one; the per-backend flags stay precise.
+	 */
+	readonly capabilities = { promptDisposition: false } as const;
 	readonly rpc: RpcSupervisor;
 	readonly inprocess: InProcessSupervisor;
 	private readonly owners = new Map<string, SupervisorBackend>();
@@ -235,6 +243,17 @@ export class RoutingSupervisor implements LegionSupervisor {
 		if (owner === "inprocess") return this.inprocess.inFlightTool(name);
 		if (owner === "rpc") return this.rpc.inFlightTool(name);
 		return this.inprocess.inFlightTool(name) ?? this.rpc.inFlightTool(name);
+	}
+
+	/**
+	 * Forward the whole in-flight stack (#331) the same way, so the status line can
+	 * name nesting and parallel siblings instead of reporting only one frame.
+	 */
+	inFlightToolStack(name: string): InFlightToolStack | undefined {
+		const owner = this.owners.get(name);
+		if (owner === "inprocess") return this.inprocess.inFlightToolStack(name);
+		if (owner === "rpc") return this.rpc.inFlightToolStack(name);
+		return this.inprocess.inFlightToolStack(name) ?? this.rpc.inFlightToolStack(name);
 	}
 
 	async stats(name: string): Promise<UsageSnapshot | null> {

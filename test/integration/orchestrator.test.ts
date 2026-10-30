@@ -324,6 +324,36 @@ test("blocked RPC confirmation is correlated through UIProxy and stays live unti
 	}
 });
 
+test("#323 3: an intercepted steer leaves a blocked child blocked; a landed one unblocks it", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "ask for approval", worktree: false });
+		h.supervisor.requestUI(handle.name, {
+			type: "extension_ui_request",
+			id: "rpc-confirm-blocked",
+			method: "confirm",
+			title: "Run command?",
+			message: "Allow the child command?",
+		});
+		const result = await h.orchestrator.collect(handle.name, { timeoutMs: 2_000 });
+		assert.equal(result.blocked, true);
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "blocked");
+
+		// An input handler ate the wake-up text, so the child is still waiting:
+		// clearing `blocked` would claim an unblock that never happened.
+		h.supervisor.steerDisposition = "intercepted";
+		assert.equal(await h.orchestrator.steer(handle.name, "wake up"), "intercepted");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "blocked");
+
+		// Positive control: the existing unblocking side effect is untouched.
+		h.supervisor.steerDisposition = "queued";
+		assert.equal(await h.orchestrator.steer(handle.name, "wake up"), "queued");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("RPC spawn budget is refused before any process is created", async () => {
 	const limited = new Orchestrator({ supervisor: new FakeSupervisor(), runDir: tempDir("rpc-budget-"), cwd: "/tmp", maxSpawns: 0 });
 	// `maxSpawns` is an RPC-only gate: in-process children are budgeted by

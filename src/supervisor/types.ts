@@ -229,7 +229,24 @@ export interface ChildActivity {
 	 * call finishing cannot clear a different call still running.
 	 */
 	readonly toolCallId?: string;
+	/**
+	 * The call that made this one, when the child's event stream says so
+	 * (`codemode` → `bash` sets it). It is what tells a nested call apart from a
+	 * parallel sibling: without it, stack depth alone cannot say whether the
+	 * extra frames are *inside* the top call or merely *beside* it (#331).
+	 */
+	readonly parentToolCallId?: string;
 }
+
+/**
+ * The in-flight call stack for one child (#331).
+ *
+ * Oldest first, **innermost last**: `tool_execution_start` pushes, the matching
+ * `tool_execution_end` removes only its own frame, `agent_settled` empties the
+ * whole stack. The display reads the top (last) entry as "the tool it is inside
+ * right now"; every other frame is context (nesting / parallel siblings).
+ */
+export type InFlightToolStack = readonly ChildActivity[];
 
 /**
  * A single tool call running at or past this bound gets a display-only marker
@@ -261,24 +278,40 @@ export function formatToolElapsed(elapsedMs: number): string {
 }
 
 /**
- * The one-line activity readout for a child that is inside a tool call (#315):
- * `working · bash 00:07:31`, plus a marker once that single call has run for
- * {@link STALL_NOTICE_MS}.
+ * The one-line activity readout for a child that is inside tool call(s) (#315,
+ * #331): `working · bash 00:07:31`, plus context hints and a marker once the
+ * top call has run for {@link STALL_NOTICE_MS}.
  *
  * The `working` prefix comes from the activity fact itself, not from the
  * persisted child record: a start event with no matching end IS a child inside
  * a tool call, while the record's `state` is only rewritten at turn boundaries
  * and can lag (or read `retired` from a stale snapshot).
  *
+ * The stack is LIFO (#331): the **last** element is the innermost call — the one
+ * the elapsed clock and the tool name come from. The remaining frames are
+ * context, reported only when the events name their parent:
+ *
+ * - frames that the top names (directly or transitively) through
+ *   `parentToolCallId` are nesting → ` (inside <outermost> ×<depth>)`;
+ * - frames that are NOT on that chain are parallel siblings → ` (+N more)`.
+ *
+ * With no `parentToolCallId` anywhere, a second frame cannot be told apart from
+ * a nested one, so it is reported as a sibling (` (+N more)`): that is the
+ * weaker, always-true claim. Inventing `inside` would be a false one.
+ *
  * **Display only.** This builds a string. It does not decide `liveness()`, does
  * not abort the call, and does not steer, retire or report anything — the
  * marker names `abort` as the lever precisely because `steer` cannot reach a
  * child that is already inside a tool call (#313).
+ *
+ * An empty stack renders the empty string: no fact, no line.
  */
 export function formatInFlightToolLine(
-	activity: ChildActivity,
+	stack: InFlightToolStack,
 	now: number,
 ): string {
+	const activity = stack[stack.length - 1];
+	if (activity === undefined) return "";
 	// Same non-finite trap as `formatToolElapsed`, one step earlier: `Math.max(0,
 	// NaN)` is `NaN`, and `NaN < STALL_NOTICE_MS` is false, so an unusable clock
 	// would skip the short path and claim “no progress for NaNm”. Both clocks are
@@ -286,56 +319,123 @@ export function formatInFlightToolLine(
 	// a claim, so an unusable clock must render as zero, never as a verdict.
 	const raw = now - activity.startedAt;
 	const elapsed = Number.isFinite(raw) ? Math.max(0, raw) : 0;
-	const line = `working · ${activity.tool} ${formatToolElapsed(elapsed)}`;
+	const chain = nestingChain(stack);
+	const hints: string[] = [];
+	if (chain.length > 1) {
+		// The outermost frame of the chain is the one that encloses everything the
+		// line is about; `×N` is the nesting depth it took to get to the top.
+		hints.push(` (inside ${chain[0]!.tool} ×${chain.length})`);
+	}
+	const siblings = stack.length - chain.length;
+	if (siblings > 0) hints.push(` (+${siblings} more)`);
+	const line = `working · ${activity.tool} ${formatToolElapsed(elapsed)}${hints.join("")}`;
 	if (elapsed < STALL_NOTICE_MS) return line;
 	const minutes = Math.floor(elapsed / 60_000);
 	return `${line} (long-running tool — no progress for ${minutes}m; \`steer\` cannot interrupt it, \`abort\` can)`;
 }
 
 /**
- * Fold one child lifecycle event into the in-flight-tool fact (#315).
+ * The nesting chain that ends at the stack top (#331), outermost first.
+ *
+ * A frame is an ancestor when the current frame names it through
+ * `parentToolCallId`. The walk only looks *backwards* (a parent always started
+ * earlier) and visits each index at most once, so cyclic junk in an event
+ * stream cannot loop here. No parent links → `[top]`. The fallback exists
+ * because ids are optional on both sides of the event stream.
+ */
+function nestingChain(stack: InFlightToolStack): InFlightToolStack {
+	const chain: ChildActivity[] = [];
+	let index = stack.length - 1;
+	if (index < 0) return chain;
+	const seen = new Set<number>();
+	while (index >= 0 && !seen.has(index)) {
+		seen.add(index);
+		const current = stack[index]!;
+		chain.unshift(current);
+		const parentId = current.parentToolCallId;
+		if (parentId === undefined) break;
+		let parentIndex = -1;
+		for (let candidate = index - 1; candidate >= 0; candidate -= 1) {
+			if (stack[candidate]!.toolCallId === parentId) {
+				parentIndex = candidate;
+				break;
+			}
+		}
+		if (parentIndex < 0) break;
+		index = parentIndex;
+	}
+	return chain;
+}
+
+/**
+ * Fold one child lifecycle event into the in-flight-tool stack (#315, #331).
  *
  * Pure and total: an event that says nothing about tool boundaries returns
  * `current` unchanged, so both backends can call this on every event without
  * having to classify first.
  *
- * `tool_execution_end` clears only the call it names. Ids are optional on both
- * sides, so the rule is: clear unless BOTH sides name a call and those names
- * differ (a parallel sibling finishing must not erase the one still running).
+ * - `tool_execution_start` pushes a frame (a name-less start is ignored: no
+ *   invented tool);
+ * - `tool_execution_end` removes **only** the frame it names, by `toolCallId` —
+ *   never the whole stack. An inner `bash` ending inside `codemode` leaves the
+ *   outer frame running, and a parallel sibling finishing cannot erase the one
+ *   still in flight;
+ * - `agent_settled` empties the stack: a settled turn holds no tool, and an
+ *   aborted tool may never send its `end` at all.
+ *
+ * An end whose id matches no frame falls back to the topmost frame without an
+ * id (ids are optional on both sides), and otherwise changes nothing: trusting
+ * an unknown id would let a stranger's end erase a live call.
  */
 export function nextInFlightTool(
-	current: ChildActivity | undefined,
+	current: InFlightToolStack,
 	event: {
 		readonly type?: unknown;
 		readonly toolName?: unknown;
 		readonly toolCallId?: unknown;
+		readonly parentToolCallId?: unknown;
 	},
 	now: number,
-): ChildActivity | undefined {
+): InFlightToolStack {
+	if (event.type === "agent_settled") return [];
 	if (event.type === "tool_execution_start") {
 		if (typeof event.toolName !== "string" || event.toolName === "") {
 			return current;
 		}
-		return {
-			tool: event.toolName,
-			startedAt: now,
-			...(typeof event.toolCallId === "string"
-				? { toolCallId: event.toolCallId }
-				: {}),
-		};
+		return [
+			...current,
+			{
+				tool: event.toolName,
+				startedAt: now,
+				...(typeof event.toolCallId === "string"
+					? { toolCallId: event.toolCallId }
+					: {}),
+				...(typeof event.parentToolCallId === "string"
+					? { parentToolCallId: event.parentToolCallId }
+					: {}),
+			},
+		];
 	}
 	if (event.type === "tool_execution_end") {
-		if (current === undefined) return undefined;
+		if (current.length === 0) return current;
 		const ended =
 			typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-		if (
-			ended !== undefined &&
-			current.toolCallId !== undefined &&
-			ended !== current.toolCallId
-		) {
-			return current;
+		// An end that cannot name its call is taken at face value: pop the top
+		// (innermost) frame, which is what a LIFO stream implies.
+		if (ended === undefined) return current.slice(0, -1);
+		for (let index = current.length - 1; index >= 0; index -= 1) {
+			if (current[index]!.toolCallId === ended) {
+				return [...current.slice(0, index), ...current.slice(index + 1)];
+			}
 		}
-		return undefined;
+		// No frame claims that id. The only frame it could still be is one that
+		// never got an id; an all-named stack is left untouched.
+		for (let index = current.length - 1; index >= 0; index -= 1) {
+			if (current[index]!.toolCallId === undefined) {
+				return [...current.slice(0, index), ...current.slice(index + 1)];
+			}
+		}
+		return current;
 	}
 	return current;
 }
@@ -380,8 +480,59 @@ export interface LegionSupervisor {
 	 * A dead child never answers: holding no live handle, it can run no tool.
 	 */
 	inFlightTool?(name: string): ChildActivity | undefined;
+	/**
+	 * The whole in-flight stack (#331), innermost last, or `undefined`.
+	 *
+	 * Optional for the same reason as `inFlightTool`: a backend or test double
+	 * that cannot answer renders no line. {@link inFlightToolStackOf} is the one
+	 * place callers should read it, so a legacy double that only implements
+	 * `inFlightTool` still renders its single frame.
+	 *
+	 * A dead child never answers.
+	 */
+	inFlightToolStack?(name: string): InFlightToolStack | undefined;
+	/**
+	 * What this backend can actually observe (#323).
+	 *
+	 * `promptDisposition: false` means `prompt()` cannot tell "the session
+	 * accepted a turn" apart from "it did not throw": an input handler that
+	 * swallows the prompt is invisible. That is exactly the in-process backend —
+	 * the SDK's `AgentSession.prompt()` returns `void` — so its `accepted` is a
+	 * weaker claim than RPC's, where the reply carries the disposition.
+	 *
+	 * Frozen rule (#323 D1): a caller must never invent a `queued`/`intercepted`
+	 * distinction a backend cannot answer. The flag exists so that difference is
+	 * nameable instead of silently flattened. A facade-level read must never be
+	 * used to tell backends apart — the routing facade reports the intersection of
+	 * every backend it can reach; to distinguish, read the concrete backend
+	 * instance (`RoutingSupervisor.backendFor` resolves it, and `routing.rpc` /
+	 * `routing.inprocess` are the two capabilities it reaches). Contract:
+	 * `docs/legion-v2-contract.md` §3.1.
+	 *
+	 * Optional like `inFlightTool`: a supervisor that cannot answer must keep
+	 * satisfying the seam, and absence means "no capability claimed".
+	 */
+	capabilities?: { readonly promptDisposition: boolean };
 	stats(name: string): Promise<UsageSnapshot | null>;
 	retire(name: string, opts?: { graceful?: boolean }): Promise<void>;
+}
+
+/**
+ * Read the display fact as a stack (#331), with a one-frame fallback.
+ *
+ * `inFlightToolStack` is the precise read. A supervisor that predates #331 (a
+ * test double, an older backend) only implements `inFlightTool`, so its single
+ * call is wrapped as a one-frame stack — same line as before, no invented
+ * context. Absent everywhere → `undefined`, which renders no line at all.
+ */
+export function inFlightToolStackOf(
+	supervisor: Pick<LegionSupervisor, "inFlightTool" | "inFlightToolStack">,
+	name: string,
+): InFlightToolStack | undefined {
+	const stack = supervisor.inFlightToolStack?.(name);
+	if (stack !== undefined && stack.length > 0) return stack;
+	const top = supervisor.inFlightTool?.(name);
+	return top === undefined ? undefined : [top];
 }
 
 /**

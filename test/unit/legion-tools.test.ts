@@ -404,6 +404,46 @@ test("an intercepted steer-mail bounces with a reason instead of claiming accept
 	}
 });
 
+test("an intercepted action-needed mail must not flip a blocked node to running (#323 3)", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-postman-blocked-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const sessionFile = path.join(rootDir, "blocked.jsonl");
+	mkdirSync(rootDir, { recursive: true });
+	const now = 10;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const blocked = insertNode(db, { parentId: "root", name: "stuck", role: "worker", status: "blocked", sessionFile }, () => 2);
+		await supervisor.spawnChild({ name: blocked.name, task: "blocked", agent: agent("worker"), sessionFile, tempDir: rootDir, cwd: rootDir });
+		const postman = new LegionPostman({
+			db,
+			nodeId: "root",
+			supervisor,
+			settings: { usagePollMs: 1 },
+			now: () => now,
+			intervalMs: 10_000,
+		});
+
+		// The wake-up message is swallowed by an input handler: nothing landed, so
+		// "running" would claim an unblock that never happened. #338 makes that send
+		// BOUNCED and returns before the unblock; this pins the consequence on the node.
+		supervisor.steerDisposition = "intercepted";
+		sendMail(db, { fromNode: "root", to: "stuck", subject: "unblock", body: "go", urgency: "action-needed" }, { now: () => now });
+		await postman.tick();
+		assert.equal(getNode(db, blocked.id)?.status, "blocked", "an intercepted send must not report the node as unblocked");
+
+		// Positive control: a send that did land still unblocks, exactly as before.
+		supervisor.steerDisposition = "queued";
+		sendMail(db, { fromNode: "root", to: "stuck", subject: "unblock 2", body: "go", urgency: "action-needed" }, { now: () => now });
+		await postman.tick();
+		postman.stop();
+		assert.equal(getNode(db, blocked.id)?.status, "running", "a landed action-needed mail still unblocks");
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
 test("queued, accepted, and prompted sends all settle on ACCEPTED — never on DELIVERED (#322)", async () => {
 	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-postman-accepted-"));
 	const db = openLegionDb(":memory:");

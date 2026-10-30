@@ -274,6 +274,10 @@ test("#145 status with name returns single child; unknown → NOT_FOUND", async 
  * absence renders no line. The shared FakeSupervisor predates that member and is
  * used by dozens of tests, so the fact is attached here the same way a real
  * backend exposes it rather than widening the double for everyone.
+ *
+ * Deliberately the pre-#331 single-frame shape: it also pins
+ * `inFlightToolStackOf`'s one-frame fallback, so a double that never learned the
+ * stack still renders the line it used to.
  */
 function withActivity(
 	supervisor: FakeSupervisor,
@@ -283,11 +287,20 @@ function withActivity(
 	seam.inFlightTool = () => activity;
 }
 
+/** The #331 shape: a whole stack, innermost last. */
+function withActivityStack(
+	supervisor: FakeSupervisor,
+	stack: readonly { tool: string; startedAt: number; toolCallId?: string; parentToolCallId?: string }[] | undefined,
+): void {
+	const seam: LegionSupervisor = supervisor;
+	seam.inFlightToolStack = () => stack;
+}
+
 test("#315 renderStatusOverview prepends the activity lead and renders nothing when absent", () => {
 	const now = 1_000_000;
 	const child = childStub({ name: "worker-0", agent: "worker" });
 	const text = renderStatusOverview(
-		[{ child, alive: true, activity: { tool: "bash", startedAt: now - 12_000 } }],
+		[{ child, alive: true, inFlightTools: [{ tool: "bash", startedAt: now - 12_000 }] }],
 		now,
 	);
 	// A lead line for the block: what it is doing, and for how long.
@@ -301,6 +314,63 @@ test("#315 renderStatusOverview prepends the activity lead and renders nothing w
 
 	// No fact, no line — the overview is byte-identical to the pre-#315 shape.
 	assert.doesNotMatch(renderStatusOverview([{ child, alive: true }], now), /working · /);
+});
+
+test("#331 renderStatusOverview reads the whole stack, so nesting and siblings are named", () => {
+	const now = 1_000_000;
+	const child = childStub({ name: "worker-0", agent: "worker" });
+
+	// codemode → bash: the inner call is inside the outer one.
+	const nested = renderStatusOverview([
+		{
+			child,
+			alive: true,
+			inFlightTools: [
+				{ tool: "codemode", startedAt: now - 12_000, toolCallId: "c1" },
+				{ tool: "bash", startedAt: now - 12_000, toolCallId: "c2", parentToolCallId: "c1" },
+			],
+		},
+	], now);
+	assert.match(nested, /^working · bash 00:00:12 \(inside codemode ×2\)$/m);
+
+	// Two independent calls: the sibling is counted, not called `inside`.
+	const parallel = renderStatusOverview([
+		{
+			child,
+			alive: true,
+			inFlightTools: [
+				{ tool: "read", startedAt: now - 12_000, toolCallId: "c1" },
+				{ tool: "bash", startedAt: now - 12_000, toolCallId: "c2" },
+			],
+		},
+	], now);
+	assert.match(parallel, /^working · bash 00:00:12 \(\+1 more\)$/m);
+
+	// An empty stack is no fact, exactly like an absent one.
+	assert.doesNotMatch(renderStatusOverview([{ child, alive: true, inFlightTools: [] }], now), /working · /);
+});
+
+test("#331 status reads the stack through the supervisor seam, not just a single frame", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({
+			agent: "worker",
+			task: "build",
+			name: "worker-s",
+			async: true,
+			worktree: false,
+		});
+		withActivityStack(harness.supervisor, [
+			{ tool: "codemode", startedAt: Date.now() - 12_000, toolCallId: "c1" },
+			{ tool: "bash", startedAt: Date.now() - 12_000, toolCallId: "c2", parentToolCallId: "c1" },
+		]);
+
+		const byName = await harness.invoke({ action: "status", name: "worker-s" });
+		// The whole stack reaches the renderer, not the top frame alone.
+		assert.match(byName.text, /^working · bash 00:00:12 \(inside codemode ×2\)\nworker-s — state=/m);
+	} finally {
+		await harness.cleanup();
+	}
 });
 
 test("#315 status with name shows what a live child is running and for how long", async () => {

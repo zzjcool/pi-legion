@@ -30,6 +30,7 @@ import {
 	type ChildHandle,
 	type DescendantInfo,
 	type EventSubscriptionOptions,
+	type InFlightToolStack,
 	type LegionSupervisor,
 	type RpcClientFactory,
 	type RpcClientLike,
@@ -88,12 +89,13 @@ interface ChildRecord {
 	retirePromise?: Promise<void>;
 	abortedPending: boolean;
 	/**
-	 * The tool call this child is inside right now (#315), folded from its own RPC
-	 * event stream — no extra IPC, no polling. Cleared by the matching
-	 * `tool_execution_end` and by `agent_settled`: a settled turn has no tool
-	 * running, so nothing may be left claiming one. Display-only.
+	 * The tool calls this child is inside right now (#315, #331), folded from its
+	 * own RPC event stream — no extra IPC, no polling. The stack is LIFO: the last
+	 * frame is the innermost call. A frame is removed by the `tool_execution_end`
+	 * that names it, and `agent_settled` empties the stack: a settled turn has no
+	 * tool running, so nothing may be left claiming one. Display-only.
 	 */
-	inFlightTool?: ChildActivity;
+	inFlightTools?: InFlightToolStack;
 }
 
 export type { RpcSupervisorOptions } from "./types.ts";
@@ -219,6 +221,12 @@ function usageSnapshot(value: unknown): UsageSnapshot | null {
  * Registry entries are isolated by name and own their event listeners/tempfiles.
  */
 export class RpcSupervisor implements LegionSupervisor {
+	/**
+	 * RPC reads the prompt reply's disposition, so `prompt()` can tell "a run
+	 * started" from "it did not" (#323 D1). See the seam doc for why the
+	 * in-process backend cannot claim this.
+	 */
+	readonly capabilities = { promptDisposition: true } as const;
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly subscriptionsBeforeSpawn = new Map<
 		string,
@@ -401,9 +409,15 @@ export class RpcSupervisor implements LegionSupervisor {
 				// `beginTurn` just claimed. Failing the spawn is the only honest answer —
 				// returning a handle that is born `running` would park every waiter and
 				// make the child look busy forever.
+				//
+				// #323 5: this is a DETERMINISTIC failure — the same input handler eats
+				// the same prompt for every model — so it gets the one code
+				// `canFallbackStart` refuses. `START_FAILED` would make the orchestrator
+				// spawn one process per fallback model and roll each one back.
 				throw this.startFailure(
 					registration,
 					"first prompt was intercepted by an input handler before any run started",
+					ErrorCodes.PROMPT_INTERCEPTED,
 				);
 			}
 			if (!this.isAlive(input.name)) {
@@ -591,7 +605,19 @@ export class RpcSupervisor implements LegionSupervisor {
 	 */
 	inFlightTool(name: string): ChildActivity | undefined {
 		if (!this.isAlive(name)) return undefined;
-		return this.children.get(name)?.inFlightTool;
+		const stack = this.children.get(name)?.inFlightTools;
+		return stack?.[stack.length - 1];
+	}
+
+	/**
+	 * The whole stack (#331), innermost last. Same `isAlive` gate as
+	 * {@link inFlightTool}: a dead child holds no live handle and cannot be inside
+	 * a tool, whatever a leftover record field still says.
+	 */
+	inFlightToolStack(name: string): InFlightToolStack | undefined {
+		if (!this.isAlive(name)) return undefined;
+		const stack = this.children.get(name)?.inFlightTools;
+		return stack !== undefined && stack.length > 0 ? stack : undefined;
 	}
 
 	async stats(name: string): Promise<UsageSnapshot | null> {
@@ -705,7 +731,11 @@ export class RpcSupervisor implements LegionSupervisor {
 	private abandonTurn(child: ChildRecord, reason: string): void {
 		if (!child.turnActive) return;
 		child.turnActive = false;
-		child.state = "idle";
+		// Same invariant `updateTurnState` keeps (#323 4): a concurrent retire has
+		// already moved the record to `retiring`, and rolling a turn back must not
+		// rewrite that into `idle` — `idle` means "holds a live slot, can take a
+		// turn", which a retiring child is about to lose.
+		if (child.state !== "retiring") child.state = "idle";
 		child.lastTurnResult = {
 			settled: false,
 			abnormal: false,
@@ -804,10 +834,10 @@ export class RpcSupervisor implements LegionSupervisor {
 			return;
 		}
 
-		// #315: the in-flight tool fact rides the RPC event stream this backend
+		// #315/#331: the in-flight stack rides the RPC event stream this backend
 		// already consumes. Nothing new is asked of the child, and the fold is
-		// total, so an event about anything else leaves the fact untouched.
-		child.inFlightTool = nextInFlightTool(child.inFlightTool, record, Date.now());
+		// total, so an event about anything else leaves the stack untouched.
+		child.inFlightTools = nextInFlightTool(child.inFlightTools ?? [], record, Date.now());
 
 		this.updateTurnState(child, record);
 
@@ -842,9 +872,9 @@ export class RpcSupervisor implements LegionSupervisor {
 		child.turnActive = false;
 		// #315: an abort or a child-side interruption can end a turn while a tool
 		// is mid-flight, in which case no `tool_execution_end` ever arrives. A
-		// settled turn holds no tool, so the fact is dropped here instead of
+		// settled turn holds no tool, so the stack is dropped here instead of
 		// outliving the turn it described.
-		child.inFlightTool = undefined;
+		child.inFlightTools = [];
 		child.lastTurnResult = result;
 		if (child.state !== "retiring") child.state = "idle";
 		this.resolveWaiters(child, result);
@@ -1179,7 +1209,11 @@ export class RpcSupervisor implements LegionSupervisor {
 		);
 	}
 
-	private startFailure(child: ChildRecord, message: string): SubagentError {
+	private startFailure(
+		child: ChildRecord,
+		message: string,
+		code: string = ErrorCodes.START_FAILED,
+	): SubagentError {
 		const stderr = child.client?.getStderr?.();
 		const base = `${message}${stderr ? `: ${stderr.trim().slice(0, 500)}` : ""}`;
 		return new SubagentError(
@@ -1187,10 +1221,10 @@ export class RpcSupervisor implements LegionSupervisor {
 				name: child.name,
 				stderr,
 				args: child.lastArgs,
-				code: ErrorCodes.START_FAILED,
+				code,
 				cwd: child.cwd,
 			}),
-			ErrorCodes.START_FAILED,
+			code,
 		);
 	}
 

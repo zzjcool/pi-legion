@@ -7,21 +7,31 @@
  * identical to one doing useful work, and the parent finds out only when its
  * `collect` deadline (900s) fires.
  *
- * The fix is one **display-only** fact per child: the tool it is inside right
- * now, plus the host clock reading when that call started. Nothing here decides
- * liveness and nothing here kills, steers or retires anything — these tests pin
- * that boundary as much as the rendering.
+ * The fix is one **display-only** fact per child: the tool calls it is inside
+ * right now (a LIFO stack since #331), plus the host clock reading when each
+ * started. Nothing here decides liveness and nothing here kills, steers or
+ * retires anything — these tests pin that boundary as much as the rendering.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	STALL_NOTICE_MS,
+	type ChildActivity,
 	formatInFlightToolLine,
 	formatToolElapsed,
 	nextInFlightTool,
 } from "../../src/supervisor/types.ts";
 import { loadAgentsFromDir, BUILTIN_AGENTS_DIR } from "../../src/agents/agents.ts";
+
+/** One stack frame; keeps the tests readable without inventing helper types. */
+function frame(
+	tool: string,
+	startedAt: number,
+	ids: { toolCallId?: string; parentToolCallId?: string } = {},
+): ChildActivity {
+	return { tool, startedAt, ...ids };
+}
 
 // ─────────────────────────── formatting ───────────────────────────
 
@@ -42,82 +52,134 @@ test("formatToolElapsed prints hh:mm:ss and does not wrap the hour field", () =>
 });
 
 test("a short in-flight tool renders `working · <tool> hh:mm:ss` with no marker", () => {
-	const activity = { tool: "bash", startedAt: 1_000 };
 	assert.equal(
-		formatInFlightToolLine(activity, 1_000 + 7_000),
+		formatInFlightToolLine([frame("bash", 1_000)], 1_000 + 7_000),
 		"working · bash 00:00:07",
 	);
 	// One millisecond short of the bound: still just the line.
 	assert.equal(
-		formatInFlightToolLine(activity, 1_000 + STALL_NOTICE_MS - 1),
+		formatInFlightToolLine([frame("bash", 1_000)], 1_000 + STALL_NOTICE_MS - 1),
 		"working · bash 00:04:59",
 	);
 	// An unusable clock must read as "just started", never as a stall verdict:
 	// `NaN < bound` is false, so the raw subtraction would skip the short path and
 	// claim `no progress for NaNm` — a verdict invented from a missing fact.
 	assert.equal(
-		formatInFlightToolLine({ tool: "bash", startedAt: Number.NaN }, 1_000),
+		formatInFlightToolLine([frame("bash", Number.NaN)], 1_000),
 		"working · bash 00:00:00",
 	);
 	assert.equal(
-		formatInFlightToolLine({ tool: "bash", startedAt: 1_000 }, Number.NaN),
+		formatInFlightToolLine([frame("bash", 1_000)], Number.NaN),
 		"working · bash 00:00:00",
 	);
+	// No frames at all is no fact: the caller renders no line.
+	assert.equal(formatInFlightToolLine([], 1_000), "");
 });
 
 test("a tool at or past STALL_NOTICE_MS appends the display-only marker", () => {
-	const activity = { tool: "bash", startedAt: 0 };
-	const atBound = formatInFlightToolLine(activity, STALL_NOTICE_MS);
+	const activity = frame("bash", 0);
+	const atBound = formatInFlightToolLine([activity], STALL_NOTICE_MS);
 	assert.equal(
 		atBound,
 		"working · bash 00:05:00 (long-running tool — no progress for 5m; `steer` cannot interrupt it, `abort` can)",
 	);
 	// The marker counts whole minutes past the bound, not seconds.
-	assert.match(formatInFlightToolLine(activity, 12 * 60_000), /no progress for 12m;/);
+	assert.match(formatInFlightToolLine([activity], 12 * 60_000), /no progress for 12m;/);
 	// The tool name is carried through untouched.
 	assert.match(
-		formatInFlightToolLine({ tool: "codemode", startedAt: 0 }, STALL_NOTICE_MS),
+		formatInFlightToolLine([frame("codemode", 0)], STALL_NOTICE_MS),
 		/^working · codemode /,
+	);
+});
+
+test("#331: nesting is named from the top frame's parent chain", () => {
+	// codemode → bash: the inner call is INSIDE the outer one, so the line says
+	// so and counts both frames.
+	const nested = [frame("codemode", 0, { toolCallId: "c1" }), frame("bash", 0, { toolCallId: "c2", parentToolCallId: "c1" })];
+	assert.equal(
+		formatInFlightToolLine(nested, 5_000),
+		"working · bash 00:00:05 (inside codemode ×2)",
+	);
+	// Three levels deep: the outermost frame is the one that encloses everything.
+	const deep = [
+		frame("codemode", 0, { toolCallId: "c1" }),
+		frame("bash", 0, { toolCallId: "c2", parentToolCallId: "c1" }),
+		frame("read", 0, { toolCallId: "c3", parentToolCallId: "c2" }),
+	];
+	assert.equal(
+		formatInFlightToolLine(deep, 5_000),
+		"working · read 00:00:05 (inside codemode ×3)",
+	);
+});
+
+test("#331: parallel siblings are counted, never called `inside`", () => {
+	// Two independent calls: the newest is the one displayed, the other is a
+	// sibling still running — NOT an enclosing call.
+	const parallel = [frame("read", 0, { toolCallId: "c1" }), frame("bash", 0, { toolCallId: "c2" })];
+	assert.equal(
+		formatInFlightToolLine(parallel, 5_000),
+		"working · bash 00:00:05 (+1 more)",
+	);
+	// Without parent ids a second frame cannot be told apart from a nested one,
+	// so it is reported as the weaker, always-true claim.
+	assert.ok(!formatInFlightToolLine(parallel, 5_000).includes("inside"));
+	// Both hints can appear at once: one enclosing call, one sibling.
+	const mixed = [
+		frame("codemode", 0, { toolCallId: "c1" }),
+		frame("read", 0, { toolCallId: "c9" }),
+		frame("bash", 0, { toolCallId: "c2", parentToolCallId: "c1" }),
+	];
+	assert.equal(
+		formatInFlightToolLine(mixed, 5_000),
+		"working · bash 00:00:05 (inside codemode ×2) (+1 more)",
+	);
+	// The stall marker stays last, after the context hints.
+	assert.equal(
+		formatInFlightToolLine(parallel, STALL_NOTICE_MS),
+		"working · bash 00:05:00 (+1 more) (long-running tool — no progress for 5m; `steer` cannot interrupt it, `abort` can)",
 	);
 });
 
 // ─────────────────────── the event-stream fold ───────────────────────
 
-test("nextInFlightTool sets on start, keeps on unrelated events, clears on the matching end", () => {
+test("nextInFlightTool pushes on start, keeps on unrelated events, removes the named end", () => {
 	const started = nextInFlightTool(
-		undefined,
+		[],
 		{ type: "tool_execution_start", toolName: "bash", toolCallId: "c1" },
 		5_000,
 	);
-	assert.deepEqual(started, { tool: "bash", startedAt: 5_000, toolCallId: "c1" });
+	assert.deepEqual(started, [{ tool: "bash", startedAt: 5_000, toolCallId: "c1" }]);
 
-	// Anything that is not a tool boundary leaves the fact exactly as it was:
+	// Anything that is not a tool boundary leaves the stack exactly as it was:
 	// this is what lets both backends call the fold on every single event.
 	for (const type of ["turn_start", "message_update", "agent_start", "unknown"]) {
 		assert.deepEqual(nextInFlightTool(started, { type }, 6_000), started);
 	}
 
-	assert.equal(
+	assert.deepEqual(
 		nextInFlightTool(started, { type: "tool_execution_end", toolCallId: "c1" }, 7_000),
-		undefined,
+		[],
 	);
 	// An end with no live call is a no-op, not an error.
-	assert.equal(
-		nextInFlightTool(undefined, { type: "tool_execution_end", toolCallId: "c1" }, 7_000),
-		undefined,
+	assert.deepEqual(
+		nextInFlightTool([], { type: "tool_execution_end", toolCallId: "c1" }, 7_000),
+		[],
 	);
+	// `agent_settled` empties the whole stack: an aborted tool may never send its
+	// own end, and a settled turn holds no tool.
+	assert.deepEqual(nextInFlightTool(started, { type: "agent_settled" }, 8_000), []);
 });
 
 test("nextInFlightTool: a start without a usable tool name does not invent one", () => {
 	const started = nextInFlightTool(
-		undefined,
+		[],
 		{ type: "tool_execution_start", toolName: "read", toolCallId: "c1" },
 		1_000,
 	);
 	assert.deepEqual(
 		nextInFlightTool(started, { type: "tool_execution_start" }, 2_000),
 		started,
-		"a start with no toolName must not clear or replace the live fact",
+		"a start with no toolName must not add, clear or replace a frame",
 	);
 	assert.deepEqual(
 		nextInFlightTool(started, { type: "tool_execution_start", toolName: "" }, 2_000),
@@ -129,45 +191,103 @@ test("nextInFlightTool: a start without a usable tool name does not invent one",
 	);
 });
 
-test("nextInFlightTool: a parallel sibling finishing does not clear the call still running", () => {
+test("#331 nested codemode → bash: the inner end keeps the outer call on screen", () => {
+	let stack = nextInFlightTool(
+		[],
+		{ type: "tool_execution_start", toolName: "codemode", toolCallId: "c1" },
+		1_000,
+	);
+	stack = nextInFlightTool(
+		stack,
+		{ type: "tool_execution_start", toolName: "bash", toolCallId: "c2", parentToolCallId: "c1" },
+		2_000,
+	);
+	assert.deepEqual(stack.map((entry) => entry.tool), ["codemode", "bash"]);
+	assert.equal(formatInFlightToolLine(stack, 5_000), "working · bash 00:00:03 (inside codemode ×2)");
+
+	// The inner end removes ONLY its own frame. Before #331 this wiped the slot
+	// and `status` printed no line at all while codemode was still running.
+	stack = nextInFlightTool(stack, { type: "tool_execution_end", toolCallId: "c2" }, 6_000);
+	assert.deepEqual(stack.map((entry) => entry.tool), ["codemode"], "the outer call is still in flight");
+	assert.equal(formatInFlightToolLine(stack, 6_000), "working · codemode 00:00:05");
+
+	// The outer end then empties it.
+	assert.deepEqual(nextInFlightTool(stack, { type: "tool_execution_end", toolCallId: "c1" }, 7_000), []);
+});
+
+test("#331 a parallel sibling finishing does not erase the call still running", () => {
 	const first = nextInFlightTool(
-		undefined,
+		[],
 		{ type: "tool_execution_start", toolName: "read", toolCallId: "c1" },
 		1_000,
 	);
-	// The newest start wins: the record holds ONE current call.
 	const second = nextInFlightTool(
 		first,
 		{ type: "tool_execution_start", toolName: "bash", toolCallId: "c2" },
 		2_000,
 	);
-	assert.equal(second?.tool, "bash");
+	assert.deepEqual(second.map((entry) => entry.tool), ["read", "bash"]);
 
-	// c1 ending must not erase c2.
+	// The DISPLAYED call (the newest) finishes first: the sibling must survive
+	// and become the displayed one. Before #331 this left nothing to show.
+	const afterDisplayed = nextInFlightTool(second, { type: "tool_execution_end", toolCallId: "c2" }, 3_000);
+	assert.deepEqual(afterDisplayed.map((entry) => entry.tool), ["read"]);
+	assert.equal(formatInFlightToolLine(afterDisplayed, 4_000), "working · read 00:00:03");
+
+	// The older sibling ending first changes nothing about the displayed one.
 	assert.deepEqual(
-		nextInFlightTool(second, { type: "tool_execution_end", toolCallId: "c1" }, 3_000),
-		second,
+		nextInFlightTool(second, { type: "tool_execution_end", toolCallId: "c1" }, 3_000).map((entry) => entry.tool),
+		["bash"],
 	);
 
-	// c2 ending does clear it.
-	assert.equal(
-		nextInFlightTool(second, { type: "tool_execution_end", toolCallId: "c2" }, 4_000),
-		undefined,
-	);
+	// Both done: no frames, so the renderer emits no line at all.
+	assert.deepEqual(nextInFlightTool(afterDisplayed, { type: "tool_execution_end", toolCallId: "c1" }, 4_000), []);
+});
 
-	// When either side cannot name its call there is nothing to match on, so the
-	// end is taken at face value rather than leaving a stale fact behind forever.
-	assert.equal(
-		nextInFlightTool(first, { type: "tool_execution_end" }, 5_000),
-		undefined,
+test("nextInFlightTool: an end without a matching id never erases a live named call", () => {
+	const named = nextInFlightTool(
+		[],
+		{ type: "tool_execution_start", toolName: "bash", toolCallId: "c1" },
+		1_000,
 	);
-	assert.equal(
+	// A stranger's id matches no frame: leave the stack untouched rather than
+	// erasing a call that is demonstrably still running.
+	assert.deepEqual(
+		nextInFlightTool(named, { type: "tool_execution_end", toolCallId: "c9" }, 2_000),
+		named,
+	);
+	// An id-less end is taken at face value: pop the innermost frame.
+	assert.deepEqual(nextInFlightTool(named, { type: "tool_execution_end" }, 2_000), []);
+	// The same fallback applies when the live frame never had an id either side:
+	// nothing to match on, so the end is taken at face value.
+	assert.deepEqual(
 		nextInFlightTool(
-			nextInFlightTool(undefined, { type: "tool_execution_start", toolName: "bash" }, 1_000),
+			nextInFlightTool([], { type: "tool_execution_start", toolName: "bash" }, 1_000),
 			{ type: "tool_execution_end", toolCallId: "c9" },
 			2_000,
 		),
-		undefined,
+		[],
+	);
+});
+
+test("#331 an unmatched end folds the unnamed frame, never a named one", () => {
+	let stack = nextInFlightTool(
+		[],
+		{ type: "tool_execution_start", toolName: "bash" },
+		1_000,
+	);
+	stack = nextInFlightTool(
+		stack,
+		{ type: "tool_execution_start", toolName: "read", toolCallId: "c2" },
+		2_000,
+	);
+	assert.deepEqual(stack.map((entry) => entry.tool), ["bash", "read"]);
+	// `c9` names no frame, so the fold may only fall back to the frame that never
+	// got an id: the named `read(c2)` is demonstrably still running and must stay.
+	assert.deepEqual(
+		nextInFlightTool(stack, { type: "tool_execution_end", toolCallId: "c9" }, 3_000),
+		[{ tool: "read", startedAt: 2_000, toolCallId: "c2" }],
+		"an unmatched end removes only the unnamed frame",
 	);
 });
 
