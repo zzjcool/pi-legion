@@ -34,19 +34,26 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
-- **A `collect` that bails after claiming no longer silences that round's completion notice.**
+- **A `collect` that bails after claiming no longer swallows that round's completion notice.**
   The claim-once seam claims a terminal result as it hands the snapshot to the tool call, and
   `collectChild` can still bail afterwards — the parent turn aborts, or persisting the child
-  throws — so that claim has to be rolled back. The rollback now does exactly that and nothing
-  more: it is a no-op for a `(runId, name, round)` a real delivery already claimed, so one failed
-  collect can no longer erase the evidence that the parent has the result — which also
-  resurrected an already-read notice into the next flush. On the job branch it additionally
-  hands the notification route back by clearing `consumedByTool` (re-arming the watch when
-  nothing is collecting any more, the same shape as `wait`'s interrupt branch): the watch gate
-  reads that flag at settle, so leaving it set skipped `onTerminal` and this round was never
-  announced, on the very branch where the pending notice is the only route left. The contract
-  (`docs/contracts/notice-claim-v1.md`, D2) already described this behaviour; the code now
-  matches it (#320).
+  throws. Two things were wrong with the rollback. It deleted the claim unconditionally, so a
+  bail on a `(runId, name, round)` a real delivery had already claimed erased the evidence and
+  resurrected an already-read notice into the next flush; the seam now hands out *whether this
+  call took the claim* with the snapshot (`consumeCollect*` returns `{ snapshot, claimedNow }`),
+  and only that one comes back — per call, not per snapshot, because the watch and the tool call
+  await the same `job.collectPromise` and a shared record lets the second call overwrite the
+  first's answer. And it did not hand the notification route back: the seam sets
+  `consumedByTool` before the claim, every child is watched in production, so the watch passed
+  its gate first (`!consumedByTool && !notified` → skip `onTerminal`) and was already parked in
+  `retire` when the bail arrived — meaning the repair had to re-arm unconditionally, which it
+  now does (clear the flag, `watch` again; the generation bump keeps the old watch from
+  releasing the job, `notified` keeps the round single, `deliverBatch`'s claim filter is the
+  last net). Measured in that production shape: 0 notices before, 1 after. The one case still
+  not recovered is a bail that lands only after the watch has already released the child — there
+  the result stays readable through a later `collect` and a copy already held in the run outbox
+  still arrives, but a copy sitting in the join window goes with the release. Contract revision:
+  `docs/contracts/notice-claim-v1.md` (D2, #320).
 - **A `steer` receipt now reports what the child's session actually answered.** `steer` is a
   queue, not an interrupt: the text is enqueued and only consumed at the child's next turn
   boundary — after the current batch of tool calls finishes, before the next LLM call — so a

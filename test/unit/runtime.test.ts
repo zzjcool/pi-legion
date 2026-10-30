@@ -194,7 +194,7 @@ test("runtime: an explicit collect suppresses the completion message", async () 
 	runtime.watch("w1");
 	const pending = runtime.consumeCollect("w1");
 	assert.ok(pending);
-	const collected = await pending;
+	const collected = (await pending).snapshot;
 	assert.equal(collected.execution.status, "success");
 	await waitFor(() => runtime.activeJobs().length === 0, "watcher release");
 	assert.equal(collects, 1, "tool collect and watcher must share one wait");
@@ -262,7 +262,7 @@ test("runtime: collect after watch finished returns the cached snapshot", async 
 	await waitFor(() => runtime.activeJobs().length === 0, "watch finished");
 	const pending = runtime.consumeCollect("w1");
 	assert.ok(pending, "finished collect must stay cached after the widget drops");
-	const collected = await pending;
+	const collected = (await pending).snapshot;
 	assert.equal(collected.output, "cached-output");
 });
 
@@ -1054,7 +1054,7 @@ test("U5: a running snapshot is not cached as a finished result", async () => {
 				output: "half-done",
 			}),
 	});
-	const collected = await runtime.consumeCollect("stale");
+	const collected = (await runtime.consumeCollect("stale"))?.snapshot;
 	assert.ok(collected);
 	assert.equal(collected.execution.status, "running");
 
@@ -1085,10 +1085,10 @@ test("U5: a terminal snapshot is still cached (the exclusion is running-only)", 
 		timeoutMs: 1_000,
 		collect: async () => joinSnapshot({ output: "all good" }),
 	});
-	const first = await runtime.consumeCollect("done");
+	const first = (await runtime.consumeCollect("done"))?.snapshot;
 	assert.equal(first?.output, "all good");
 	runtime.release("done");
-	const cached = await runtime.consumeCollect("done");
+	const cached = (await runtime.consumeCollect("done"))?.snapshot;
 	assert.equal(cached?.output, "all good", "a terminal snapshot stays cached");
 	const results = await runtime.wait(["done"], { timeoutMs: 50 });
 	assert.equal(results[0]?.snapshot?.output, "all good", "wait hits the cache too");
@@ -3823,7 +3823,7 @@ test("claim D6: a notice sent first does not shorten the collect the parent asks
 	assert.match(messages[0]!.content, /Background task completed: \*\*fast \(worker\)\*\*/);
 
 	// ...and the tool route that follows still returns the FULL result (D6).
-	const collected = await runtime.consumeCollect("fast");
+	const collected = (await runtime.consumeCollect("fast"))?.snapshot;
 	assert.equal(collected?.output, "fast-out", "the collect text is never suppressed");
 	const waited = await runtime.wait(["fast"], { timeoutMs: 50 });
 	assert.equal(waited[0]?.snapshot?.output, "fast-out", "the wait text is never suppressed");
@@ -3936,7 +3936,7 @@ test("claim D7: rewatch un-claims a result the tool route already took", async (
 		},
 	});
 
-	const first = await runtime.consumeCollect("re");
+	const first = (await runtime.consumeCollect("re"))?.snapshot;
 	assert.equal(first?.output, "round-1", "the tool route read round 1");
 	assert.equal(runtime.get("re") !== undefined, true, "collect does not release the job");
 	assert.equal(messages.length, 0, "reading a result is not a notice");
@@ -4035,7 +4035,7 @@ test("claim D2(a)/D9: a CACHED collect-claim is filtered out of the join window"
 	await waitFor(() => runtime.get("c") === undefined, "c released");
 
 	// b keeps the group pending, so both entries wait for the window.
-	const collected = await runtime.consumeCollect("a");
+	const collected = (await runtime.consumeCollect("a"))?.snapshot;
 	assert.equal(collected?.output, "a-out");
 
 	await waitFor(() => messages.length === 1, "the window flushed the batch");
@@ -4273,7 +4273,7 @@ test("claim D2(b): a collect-claimed member is dropped from the batch that flush
 	await waitFor(() => retires.length === 2, "a and d are parked in retire");
 	assert.ok(runtime.get("a"), "a is still TRACKED — this is the job branch");
 
-	const collected = await runtime.consumeCollect("a");
+	const collected = (await runtime.consumeCollect("a"))?.snapshot;
 	assert.equal(collected?.output, "a-out");
 
 	await waitFor(() => messages.length === 1, "the window flushed the batch");
@@ -4438,7 +4438,7 @@ test("claim D2(b): consumeCollectInterruptible claims on the JOB branch", async 
 	await waitFor(() => retires.length === 2, "a and d are parked in retire");
 	assert.ok(runtime.get("a"), "a is still TRACKED — this is the job branch");
 
-	const collected = await runtime.consumeCollectInterruptible("a", new AbortController().signal);
+	const collected = (await runtime.consumeCollectInterruptible("a", new AbortController().signal))?.snapshot;
 	assert.equal(collected?.output, "a-out");
 
 	await waitFor(() => messages.length === 1, "the window flushed the batch");
@@ -4480,7 +4480,7 @@ test("claim D2(a)/D9: consumeCollectInterruptible claims on the CACHE branch", a
 	resolvers.get("c")!(joinSnapshot({ output: "c-out" }));
 	await waitFor(() => runtime.get("c") === undefined, "c released");
 
-	const collected = await runtime.consumeCollectInterruptible("a", new AbortController().signal);
+	const collected = (await runtime.consumeCollectInterruptible("a", new AbortController().signal))?.snapshot;
 	assert.equal(collected?.output, "a-out");
 
 	await waitFor(() => messages.length === 1, "the window flushed the batch");
@@ -4513,7 +4513,7 @@ test("claim D7b: a revive (existing branch) also drops the one-round cache", asy
 		});
 
 	track();
-	const first = await runtime.consumeCollect("a");
+	const first = (await runtime.consumeCollect("a"))?.snapshot;
 	assert.equal(first?.output, "round-1");
 	assert.ok(runtime.get("a"), "collect does not release ⇒ the revive branch is reachable");
 
@@ -5055,7 +5055,7 @@ test("claim F1: an interruptible collect claims the round its snapshot was colle
 	resolveB(joinSnapshot({ output: "B-out" }));
 	await waitFor(() => runtime.noticeQueueStats().pending === 2, "the sibling's notice is queued too");
 
-	const collected = await runtime.consumeCollectInterruptible("A", new AbortController().signal);
+	const collected = (await runtime.consumeCollectInterruptible("A", new AbortController().signal))?.snapshot;
 	assert.equal(collected?.output, "round-1-out", "the cache-free job branch served round 1");
 
 	runtime.notifyParentSettled();
@@ -5349,19 +5349,21 @@ test("claim D2: a collect that bails before delivering hands its claim back (min
 	runtime.dispose();
 });
 
-test("claim D2/#320-2: an abort AFTER the job-branch claim hands the notice route back", async () => {
-	// #320 finding 2. `consumeCollect*` sets `consumedByTool` BEFORE the claim lands, and
-	// the watch gate (`!consumedByTool && !notified`) reads that flag at settle. A bail
-	// that only rolls the CLAIM back leaves the flag set forever, so this round's pushed
-	// notice never recovers — and the D2 note ("the queued/buffered notice is the only
-	// route left") is false on exactly this branch.
+test("claim D2/#320-2: a bail AFTER the job-branch claim still lands the notice (watch in flight)", async () => {
+	// #320 finding 2, in the PRODUCTION shape: every child is watched (`followChild` with
+	// `watch: true`), `collect` never cancels that watch, and both await the same
+	// `job.collectPromise`. So the watch's continuation runs FIRST — its gate
+	// (`!consumedByTool && !notified`) sees the flag the seam just set and skips
+	// `onTerminal` — and by the time `collectChild` bails the watch is already parked in
+	// `retire` with `job.watching === true`. That is why the repair may not be gated on
+	// "nobody is watching": there is always somebody watching, so the re-arm is
+	// unconditional and the generation bump makes the old watch skip its `release`.
 	//
-	// The window under test: the claim is taken on the JOB branch → the parent turn
-	// aborts → `collectChild` bails before anything is rendered. Delete either repair in
-	// `unclaimUndelivered` and this goes red: without the `consumedByTool` reset the
-	// gate skips `onTerminal`, without the re-arm nothing is left to deliver, and
-	// without the claim rollback `deliverBatch` filters the notice out.
+	// Delete any of the three repairs in `unclaimUndelivered` and this goes red: the
+	// `consumedByTool` reset (the re-armed gate would skip), the re-arm (nothing is left
+	// to deliver), or the claim rollback (`deliverBatch` filters the notice out).
 	const messages: SentMessage[] = [];
+	const retires: Array<() => void> = [];
 	let resolveCollect!: (s: CollectSnapshot) => void;
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
@@ -5378,47 +5380,59 @@ test("claim D2/#320-2: an abort AFTER the job-branch claim hands the notice rout
 			new Promise<CollectSnapshot>((resolve) => {
 				resolveCollect = resolve;
 			}),
+		// An async retire is what production has (an RPC round trip): the watch's
+		// `finally` parks here, which is the window the rollback runs in.
+		retire: () =>
+			new Promise<void>((resolve) => {
+				retires.push(resolve);
+			}),
 	});
-	// Deliberately unwatched: the collect tool is the only collector, exactly like the
-	// `waitOne` interrupt case — the rollback has to re-arm the watch itself.
+	runtime.watch("x");
+
 	const controller = new AbortController();
 	const pending = runtime.consumeCollectInterruptible("x", controller.signal);
 	assert.ok(pending, "the tracked job answers on the JOB branch");
-	assert.ok(runtime.get("x"), "still tracked ⇒ job branch, not the finished cache");
 	assert.equal(runtime.get("x")?.consumedByTool, true, "the tool call owns the notice route");
 
 	resolveCollect(joinSnapshot({ output: "x-out" }));
+	// The watch got there first and is parked in retire: its gate already skipped.
+	await waitFor(() => retires.length === 1, "the watch is parked in retire");
+	assert.ok(runtime.get("x"), "still tracked ⇒ job branch, not the finished cache");
+	assert.equal(messages.length, 0, "the gate skipped onTerminal, as expected");
+
 	const collected = await pending;
-	assert.equal(collected?.output, "x-out", "the seam handed the claimed snapshot out");
+	assert.equal(collected?.snapshot.output, "x-out", "the seam handed the claimed snapshot out");
+	assert.equal(collected?.claimedNow, true, "this call is the one that took the claim");
+
 	// …and NOW the parent turn aborts: after the claim, before the snapshot is rendered.
 	controller.abort();
-	runtime.unclaimUndelivered("x", collected!);
-	assert.equal(
-		runtime.get("x")?.consumedByTool,
-		false,
-		"the bail hands the notice route back (waitOne's WAIT_INTERRUPTED shape)",
+	runtime.unclaimUndelivered("x", collected!.snapshot, collected!.claimedNow);
+	assert.equal(runtime.get("x")?.consumedByTool, false, "the bail hands the notice route back");
+	assert.ok(
+		runtime.get("x"),
+		"the old watch's release is skipped (generation bumped), so the re-arm has a job to run",
 	);
 
-	await waitFor(() => messages.length === 1, "the terminal onTerminal still lands");
+	await waitFor(() => messages.length === 1, "the re-armed watch delivers the notice");
 	assert.match(messages[0]!.content, /x-out/);
+	assert.equal(messages.length, 1, "exactly one notice, never two");
 	// The result was never delivered, so it must also still be readable.
-	const again = await runtime.consumeCollect("x");
+	const again = (await runtime.consumeCollect("x"))?.snapshot;
 	assert.equal(again?.output, "x-out", "the result survives the bail");
 	runtime.dispose();
 });
 
 test("claim D2/#320-1: a bail never erases a claim a real delivery already took", async () => {
 	// #320 finding 1. `unclaimUndelivered` used to delete the key unconditionally, so a
-	// bail on a `(runId, name, round)` that a REAL delivery had already claimed erased
-	// the evidence and resurrected a result the parent had read. The seam now reports
-	// whether IT took the claim (`claimedNow`); only that one rolls back.
+	// bail on a `(runId, name, round)` that a REAL delivery had already claimed erased the
+	// evidence and resurrected a result the parent had read. `claimedNow` travels with the
+	// seam's return value (per CALL, not per snapshot), and only a `true` comes back.
 	//
-	// Phase A pins the job branch: two collects share one resolved snapshot, the first
-	// delivers, the second finds the key claimed. Recoding `claimedNow` matters here —
-	// a bail that skipped the overwrite would delete the FIRST call's claim and clear
-	// `consumedByTool` with it (red on the flag assertion below).
-	// Phase B pins the cache branch: the resurrected copy is visible as a duplicate
-	// notice for an already-read result, with an unread sibling as positive control.
+	// Phase A (job branch): the round's notice is still held in the outbox when the first
+	// collect delivers it, so master's "delete the claim anyway" resurrects it into the
+	// next flush — an observable consequence, not just a flag assertion.
+	// Phase B (cache branch): same question one layer down, where the delivery claim comes
+	// from the finished cache (D9). An unread sibling is the positive control in both.
 	const messages: SentMessage[] = [];
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
@@ -5426,31 +5440,63 @@ test("claim D2/#320-1: a bail never erases a claim a real delivery already took"
 		},
 	});
 
-	// ── Phase A: judged on the claim the FIRST collect took.
-	runtime.track({
-		name: "held",
-		runId: "r-1",
-		agent: "worker",
-		sessionFile: "/tmp/held.jsonl",
-		timeoutMs: 1_000,
-		collect: async () => joinSnapshot({ output: "held-out" }),
-	});
+	// ── Phase A: job branch with the notice still held.
+	runtime.notifyParentRunStart();
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const retires: Array<() => void> = [];
+	for (const name of ["held", "mate"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+			// Keeps both jobs TRACKED after their terminal snapshot, so `held` is read on
+			// the job branch while its unread notice is still queued.
+			retire: () =>
+				new Promise<void>((resolve) => {
+					retires.push(resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("held")!(joinSnapshot({ output: "held-out" }));
+	resolvers.get("mate")!(joinSnapshot({ output: "mate-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both notices held as one batch");
+	await waitFor(() => retires.length === 2, "both jobs parked in retire ⇒ still tracked");
+
 	const delivered = await runtime.consumeCollect("held");
-	assert.equal(delivered?.output, "held-out", "the tool route delivered this round");
+	assert.equal(delivered?.snapshot.output, "held-out", "the tool route delivered this round");
+	assert.equal(delivered?.claimedNow, true, "the delivery took the claim");
 	const second = await runtime.consumeCollect("held");
-	assert.equal(second?.output, "held-out", "the seam still hands the same snapshot out");
-	runtime.unclaimUndelivered("held", second!);
+	assert.equal(second?.snapshot.output, "held-out", "the seam still hands the same snapshot out");
+	assert.equal(second?.claimedNow, false, "a second call does NOT own that claim");
+	// The bail of the second call: the claim belongs to the first one, so this is a no-op —
+	// not even `consumedByTool` may be reset.
+	runtime.unclaimUndelivered("held", second!.snapshot, second!.claimedNow);
 	assert.equal(
 		runtime.get("held")?.consumedByTool,
 		true,
 		"a claim this call did not take is left alone — the whole rollback is a no-op",
 	);
-	assert.equal(messages.length, 0, "a delivered result is not announced");
-	runtime.release("held");
 
-	// ── Phase B: the outbox copy of an already-read result must stay filtered.
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the unread sibling still arrives");
+	assert.match(messages[0]!.content, /mate-out/, "positive control: the flush really ran");
+	assert.doesNotMatch(
+		messages[0]!.content,
+		/held-out/,
+		"the read result keeps its claim: no second announcement",
+	);
+	assert.equal(messages.length, 1, "exactly one message");
+
+	// ── Phase B: the same question on the cache branch.
 	runtime.notifyParentRunStart();
-	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const cache = new Map<string, (s: CollectSnapshot) => void>();
 	for (const name of ["x", "y"]) {
 		runtime.track({
 			name,
@@ -5460,36 +5506,92 @@ test("claim D2/#320-1: a bail never erases a claim a real delivery already took"
 			timeoutMs: 1_000,
 			collect: () =>
 				new Promise<CollectSnapshot>((resolve) => {
-					resolvers.set(name, resolve);
+					cache.set(name, resolve);
 				}),
 		});
 		runtime.watch(name);
 	}
-	resolvers.get("x")!(joinSnapshot({ output: "x-out" }));
-	resolvers.get("y")!(joinSnapshot({ output: "y-out" }));
-	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both notices held as one batch");
+	cache.get("x")!(joinSnapshot({ output: "x-out" }));
+	cache.get("y")!(joinSnapshot({ output: "y-out" }));
 	await waitFor(
 		() => runtime.get("x") === undefined && runtime.get("y") === undefined,
 		"both released ⇒ the cache branch",
 	);
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the second batch is held too");
 
 	// The parent reads x: a real delivery, claimed from the cache (D9).
 	const read = await runtime.consumeCollect("x");
-	assert.equal(read?.output, "x-out");
-	// A LATER collect on the same name bails (abort / persist failure). The key is
-	// already claimed, so the rollback must leave it alone…
+	assert.equal(read?.snapshot.output, "x-out");
+	assert.equal(read?.claimedNow, true);
+	// A LATER collect on the same name bails (abort / persist failure). The key is already
+	// claimed, so the rollback must leave it alone…
 	const bailed = await runtime.consumeCollect("x");
-	assert.equal(bailed?.output, "x-out");
-	runtime.unclaimUndelivered("x", bailed!);
+	assert.equal(bailed?.snapshot.output, "x-out");
+	assert.equal(bailed?.claimedNow, false, "nobody else may spend that claim");
+	runtime.unclaimUndelivered("x", bailed!.snapshot, bailed!.claimedNow);
 
 	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 1, "the sibling still arrives");
-	assert.match(messages[0]!.content, /y-out/, "positive control: the flush really ran");
+	await waitFor(() => messages.length === 2, "the sibling still arrives");
+	assert.match(messages[1]!.content, /y-out/, "positive control: the flush really ran");
 	assert.doesNotMatch(
-		messages[0]!.content,
+		messages[1]!.content,
 		/x-out/,
 		"the read result keeps its claim: no second announcement",
 	);
-	assert.equal(messages.length, 1, "exactly one message");
+	assert.equal(messages.length, 2, "exactly one message per batch");
+	runtime.dispose();
+});
+
+test("claim D2/#320: collectChild's OWN abort bail hands the claim back (index wiring)", async () => {
+	// `collectChild` has two bail doors and the claim is only restored if the closed one is
+	// wired: `!collected || signal?.aborted` (this case) and a throwing `persistChild`
+	// (minor 4, above). Here the abort lands after the seam's promise is already resolved —
+	// the cache branch answers synchronously, so aborting in the same tick still passes the
+	// function's first `signal.aborted` gate — which is the only way into the
+	// `collected && signal.aborted` combination.
+	//
+	// Delete the `ctx.runtime.unclaimUndelivered(...)` call in that branch and the held
+	// notice stays filtered out forever: red.
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "x",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/x.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "x-out" }),
+	});
+	runtime.watch("x");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the notice is held");
+	await waitFor(() => runtime.get("x") === undefined, "the watch released the child");
+
+	const ctx = {
+		name: "x",
+		found: { runId: "r-1" },
+		runtime,
+		store: {},
+		orchestrator: {},
+	} as unknown as Parameters<typeof collectChild>[0];
+	const controller = new AbortController();
+	const pending = collectChild(ctx, controller.signal);
+	// The seam answered from the finished cache in this same tick; the abort therefore
+	// lands after `await pending` resolved but before `collectChild` looks at the signal.
+	controller.abort();
+	const result = await pending;
+	const text = (result.content as Array<{ text?: string }>)
+		.map((part) => part.text ?? "")
+		.join("\n");
+	assert.match(text, /interrupted/, "the tool call delivered nothing");
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the rollback put the notice back on the wire");
+	assert.match(messages[0]!.content, /x-out/);
+	assert.equal(messages.length, 1, "exactly once");
 	runtime.dispose();
 });

@@ -2176,11 +2176,14 @@ export async function collectChild(
 			// that tick would otherwise repeat it. Every bail from here hands the result
 			// to NOBODY, so the claim is handed back — a permanently suppressed notice
 			// for a result the parent never saw is the worse failure of the two. The
-			// runtime only rolls back a claim THIS call took (#320/1) and restores the
-			// notification route with it (#320/2): a result an earlier delivery already
-			// claimed keeps its evidence.
+			// rollback is told `claimedNow`, the flag this very call got back: only a claim
+			// THIS call took comes back (#320/1), so a result an earlier delivery already
+			// claimed keeps its evidence, and the job branch restores the notification
+			// route with it (#320/2).
 			if (!collected || signal?.aborted) {
-				if (collected) ctx.runtime.unclaimUndelivered(ctx.name, collected);
+				if (collected) {
+					ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
+				}
 				return ok("interrupted (parent turn ended; children still running)");
 			}
 			try {
@@ -2188,10 +2191,10 @@ export async function collectChild(
 			} catch (error) {
 				// Same rule for the other bail: `renderCollect` is never reached, so the
 				// tool result will not carry this snapshot either.
-				ctx.runtime.unclaimUndelivered(ctx.name, collected);
+				ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
 				throw error;
 			}
-			return ok(renderCollect(ctx.name, collected));
+			return ok(renderCollect(ctx.name, collected.snapshot));
 		}
 
 		const cached = ctx.orchestrator.cachedCollect(ctx.name);

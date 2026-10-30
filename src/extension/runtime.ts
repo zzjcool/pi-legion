@@ -559,23 +559,24 @@ export interface SessionRuntime {
 	 * watcher will not also inject a completion message. Returns the shared
 	 * collect promise when we are already tracking the child.
 	 */
-	consumeCollect(name: string): Promise<CollectSnapshot> | undefined;
+	consumeCollect(name: string): Promise<ClaimedCollect> | undefined;
 	/** Abortable variant used by an in-flight collect tool call. */
-	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<CollectSnapshot | undefined> | undefined;
+	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<ClaimedCollect | undefined> | undefined;
 	/**
 	 * Undo the claim `consumeCollect*` took for a snapshot the caller never delivered
 	 * (the tool call bailed: the parent turn aborted, or persisting the child failed).
 	 * D2: a claim is earned by a delivery, not by a collect that reached nobody.
 	 *
-	 * Unlike `unclaimReported` (D7) this does NOT drop queued/buffered copies: after the
-	 * tool route bailed, that notice is the ONLY route left to the parent.
+	 * `claimedNow` is the flag the seam handed out with the snapshot: only a claim THIS
+	 * call took may come back. A key an earlier real delivery claimed is evidence, not
+	 * something a bail may erase.
 	 *
-	 * #320: it is a no-op unless THIS seam call took the claim — a key an earlier real
-	 * delivery already claimed is evidence, not something a bail may erase — and on the
-	 * job branch it also hands the notification route back (`consumedByTool`, plus a
-	 * re-armed watch), so that "only route left" actually exists.
+	 * Unlike `unclaimReported` (D7) this does NOT drop queued/buffered copies: after the
+	 * tool route bailed, that notice is the ONLY route left to the parent. On the job
+	 * branch it therefore also hands the notification route back (`consumedByTool`, plus
+	 * a watch re-arm), so that "only route left" actually exists (#320).
 	 */
-	unclaimUndelivered(name: string, snapshot: CollectSnapshot): void;
+	unclaimUndelivered(name: string, snapshot: CollectSnapshot, claimedNow: boolean): void;
 	/** Invalidate an in-flight notification watch without dropping the job. */
 	cancelWatch(name: string): void;
 	rewatch(name: string, opts?: { triggerTurn?: boolean }): void;
@@ -613,6 +614,21 @@ export interface SessionRuntime {
 	 */
 	drainBeforeShutdown(): Promise<void>;
 	dispose(): void;
+}
+
+/**
+ * #320/1: what the `collect` seam hands its caller — the snapshot, plus whether THIS call
+ * is the one that took the completion claim for its round.
+ *
+ * The flag travels with the RETURN VALUE, not in a table keyed by the snapshot, because it
+ * is a property of the call: the watch and the tool call can await the same
+ * `job.collectPromise` and therefore receive the same object, so a per-snapshot record lets
+ * the second call overwrite the first's `true` with `false` — after which the first call's
+ * bail leaves a claim standing that nobody delivered.
+ */
+export interface ClaimedCollect {
+	snapshot: CollectSnapshot;
+	claimedNow: boolean;
 }
 
 /**
@@ -693,17 +709,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		return true;
 	};
 	/**
-	 * #320/1: whether the claim currently standing for a snapshot was taken by the seam
-	 * call that handed the snapshot out (`true`) or was already there (`false`).
-	 *
-	 * `unclaimUndelivered` may only roll back the former. Without this, a bail on a
-	 * `(runId, name, round)` that a real delivery already claimed deleted the evidence
-	 * and resurrected a result the parent had read — the exact failure the claim exists
-	 * to prevent. Written on every claim attempt (including the `false` case): the
-	 * later bail answers for the LATEST attempt, not for an older delivery.
-	 */
-	const claimedNowFor = new WeakMap<CollectSnapshot, boolean>();
-	/**
 	 * D7: revoke the claim AND every not-yet-sent copy of it, atomically.
 	 *
 	 * "Just delete the claim" is not enough: the outbox may still hold an entry for
@@ -733,13 +738,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	/**
 	 * D9: claim a cached (already-released) result, keyed by the run the SNAPSHOT
 	 * came from — never by "the newest run seen for this name".
+	 *
+	 * Returns whether this call took the claim (#320/1), which the seam hands to the
+	 * caller as `ClaimedCollect.claimedNow`.
 	 */
-	const claimCachedResult = (name: string, cached: FinishedResult): void => {
-		claimedNowFor.set(
-			cached.snapshot,
-			claimReported(cached.runId, name, cached.round),
-		);
-	};
+	const claimCachedResult = (name: string, cached: FinishedResult): boolean =>
+		claimReported(cached.runId, name, cached.round);
 	/**
 	 * F1: the `(runId, round)` a snapshot was COLLECTED in.
 	 *
@@ -765,18 +769,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * D2(b): a blocked / running snapshot is a progress signal, not a result, so it
 	 * is never claimed — claiming it would swallow the real completion later.
 	 */
-	const claimIfTerminal = (job: TrackedJob, snapshot: CollectSnapshot): CollectSnapshot => {
+	const claimIfTerminal = (job: TrackedJob, snapshot: CollectSnapshot): ClaimedCollect => {
 		if (!snapshot.blocked && shouldRecycleAfterCollect(snapshot.execution.status)) {
 			const origin = originOf(snapshot, job);
-			claimedNowFor.set(
-				snapshot,
-				claimReported(origin.runId, job.name, origin.round),
-			);
-		} else {
-			// Not a result: no claim was taken (D2(b)), so a rollback must not imagine one.
-			claimedNowFor.delete(snapshot);
+			return { snapshot, claimedNow: claimReported(origin.runId, job.name, origin.round) };
 		}
-		return snapshot;
+		// Not a result: no claim was taken (D2(b)), and the caller must not imagine one.
+		return { snapshot, claimedNow: false };
 	};
 	/**
 	 * D2 (delivery, not collection): roll back a claim that reached nobody.
@@ -792,34 +791,48 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * buffered notice is the only remaining route to the parent, and D7's question ("the
 	 * parent read it, so revoke") does not apply — nothing was read.
 	 *
-	 * Two #320 refinements, both scoped to the JOB branch, because that is where this
-	 * rollback can still repair something:
+	 * Two #320 refinements:
 	 *
-	 * 1. Only a claim THIS seam call took is rolled back (`claimedNowFor`). A key that
-	 *    a real delivery claimed earlier is not ours to spend.
+	 * 1. Only a claim THIS seam call took comes back (`claimedNow`, handed out with the
+	 *    snapshot so two collects on one snapshot cannot overwrite each other's answer).
+	 *    A key a real delivery claimed earlier is not ours to spend.
 	 * 2. The rollback also hands the NOTIFICATION route back. The seam set
 	 *    `consumedByTool` before the claim, and the watch gate
 	 *    (`!consumedByTool && !notified`) reads it at settle — without clearing the flag
-	 *    (and re-arming a watch when nothing is collecting any more) this round's notice
-	 *    would be suppressed forever, so "the pending notice is the only route left"
-	 *    would be false on exactly the branch that needs it. This is `waitOne`'s
-	 *    WAIT_INTERRUPTED shape, not a new state flag.
+	 *    and re-arming the watch, this round's notice would be suppressed forever, so
+	 *    "the pending notice is the only route left" would be false on exactly the branch
+	 *    that needs it.
+	 *
+	 * The re-arm is UNCONDITIONAL on purpose. In the production shape every child is
+	 * watched, so a watch is almost always in flight here — and by the time the caller
+	 * bails it has already passed its gate (that is why `consumedByTool` was true) and is
+	 * parked in `retire`, with `job.watching` still `true`. Gating the re-arm on
+	 * `!job.watching` therefore made the whole repair dead code. Re-arming is safe: the
+	 * generation bump makes the old watch skip its `release`, `notified` keeps this round
+	 * from `onTerminal`-ing twice, and `deliverBatch`'s claim filter is the last net.
+	 *
+	 * Timing differs from `waitOne`'s WAIT_INTERRUPTED branch, which wins its race BEFORE
+	 * the collect promise resolves (the watch then sees a cleared flag and a live job).
+	 * This path can only happen AFTER the snapshot resolved — the gate has already run —
+	 * so the flag alone is not enough and the watch has to be replaced.
 	 */
-	const unclaimUndelivered = (name: string, snapshot: CollectSnapshot): void => {
+	const unclaimUndelivered = (
+		name: string,
+		snapshot: CollectSnapshot,
+		claimedNow: boolean,
+	): void => {
+		// #320/1: the claim of an earlier delivery is evidence, not a loan.
+		if (!claimedNow) return;
 		const origin = snapshotOrigins.get(snapshot);
 		// No origin ⇒ this runtime did not collect it, so it cannot have claimed it.
-		// A non-terminal snapshot never claims either (D2(b)).
 		if (!origin) return;
-		// #320/1: the claim of an earlier delivery is evidence, not a loan.
-		if (claimedNowFor.get(snapshot) !== true) return;
-		claimedNowFor.delete(snapshot);
 		reported.delete(reportKey(origin.runId, name, origin.round));
 		// #320/2: only the job this collect belonged to owns `consumedByTool`; a job
 		// tracked since then is a different round with its own watch.
 		const job = jobs.get(name);
 		if (!job || job.runId !== origin.runId || job.round !== origin.round) return;
 		job.consumedByTool = false;
-		if (!job.watching) runtime.watch(name);
+		runtime.watch(name);
 	};
 	/**
 	 * D10 #1: the reporting round per child name.
@@ -2005,8 +2018,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			}
 			const cached = finished.get(name);
 			if (cached) {
-				claimCachedResult(name, cached);
-				return Promise.resolve(cached.snapshot);
+				return Promise.resolve({
+					snapshot: cached.snapshot,
+					claimedNow: claimCachedResult(name, cached),
+				});
 			}
 			return undefined;
 		},
@@ -2016,8 +2031,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			if (!job) {
 				const cached = finished.get(name);
 				if (!cached) return undefined;
-				claimCachedResult(name, cached);
-				return Promise.resolve(cached.snapshot);
+				return Promise.resolve({
+					snapshot: cached.snapshot,
+					claimedNow: claimCachedResult(name, cached),
+				});
 			}
 			job.consumedByTool = true;
 			if (signal.aborted) {
@@ -2025,7 +2042,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				return Promise.resolve(undefined);
 			}
 			const pending = ensureCollect(job, signal);
-			return new Promise<CollectSnapshot | undefined>((resolve, reject) => {
+			return new Promise<ClaimedCollect | undefined>((resolve, reject) => {
 				let done = false;
 				const cleanup = () => signal.removeEventListener("abort", onAbort);
 				const onAbort = () => {
@@ -2066,8 +2083,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			refreshUi();
 		},
 
-		unclaimUndelivered(name, snapshot) {
-			unclaimUndelivered(name, snapshot);
+		unclaimUndelivered(name, snapshot, claimedNow) {
+			unclaimUndelivered(name, snapshot, claimedNow);
 		},
 
 		rewatch(name, opts) {
