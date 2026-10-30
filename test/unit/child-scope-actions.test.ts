@@ -161,6 +161,18 @@ function indexHarness() {
 			await store.addChild(run.runId, childStub({ name, state, sessionFile }));
 			return run.runId;
 		},
+		/**
+		 * Persist a child into the session's OWN run without a live job behind it.
+		 * `collect` then has to resolve the name from `run.json`, which is where the
+		 * old cross-run preference handed back another run's node.
+		 */
+		async addOwnChild(name: string, state: ChildRecord["state"], output: string) {
+			const runId = this.sessionRunId();
+			const sessionFile = path.join(store.runDir(runId), `${name}.jsonl`);
+			writeDecoySession(sessionFile, output);
+			await store.addChild(runId, childStub({ name, state, sessionFile }));
+			return sessionFile;
+		},
 		/** The run this session owns: the root legion run created by its first launch. */
 		sessionRunId(): string {
 			const run = store.listRuns().find((candidate) => candidate.nodeId === "root");
@@ -178,27 +190,25 @@ function indexHarness() {
 test("#312 collect: the session's own worker-0 wins over a live same-named node in another run", async () => {
 	const harness = indexHarness();
 	try {
-		await harness.invoke({
-			agent: "worker",
-			task: "the real one",
-			name: "worker-0",
-			async: true,
-			worktree: false,
-		});
-		const ownRunId = harness.sessionRunId();
+		// A child this session owns but does not track in memory — the restarted /
+		// reloaded case, and the only one where `collect` has to resolve a NAME
+		// through the store instead of the runtime's own job table.
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		await harness.addOwnChild("worker-0", "exited", '{"ok": true, "reason": "own-worker-0-ok"}');
 		const decoyRunId = await harness.decoyRun(
 			"worker-0",
 			"working",
 			'{"ok": false, "reason": "decoy-failed-elsewhere"}',
 		);
-		assert.notEqual(decoyRunId, ownRunId);
 
 		const collected = await harness.invoke({ action: "collect", name: "worker-0" });
 		// The direct child's own result, and nothing from the decoy — the silent
-		// wrong-node read is the whole bug.
+		// wrong-node read is the whole bug. The decoy is LIVE and newer, which is
+		// exactly what the pre-#312 preference (live first, then newest) chose.
 		assert.match(collected.text, /own-worker-0-ok/);
 		assert.doesNotMatch(collected.text, /decoy-failed-elsewhere/);
 		assert.match(collected.text, /acceptance: accepted/);
+		assert.doesNotMatch(collected.text, new RegExp(decoyRunId));
 		assert.notEqual(collected.details?.error, ErrorCodes.NOT_FOUND);
 	} finally {
 		await harness.cleanup();
