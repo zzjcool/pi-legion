@@ -11,9 +11,12 @@ import type { CompletionStatus } from "../../src/extension/notify.ts";
 type Batch = Array<JoinEntry & { status: CompletionStatus }>;
 
 function entry(name: string, runId = "r-1", status = "success"): JoinEntry {
+	// `round` is carried but never interpreted here (D10): the coordinator is
+	// round-agnostic, so the fixture only has to satisfy the shape.
 	return {
 		runId,
 		name,
+		round: 1,
 		input: { name, execution: { status }, output: `out-${name}` },
 		triggerTurn: true,
 	};
@@ -254,4 +257,96 @@ test("U4: a running entry mixed into a batch is refused, not merged", () => {
 		/running snapshot is not a completion/,
 	);
 	assert.equal(delivered.length, 0, "the batch must not flush around a running member");
+});
+
+// ─────────────────── D8: dropBuffered — the W3 orphan horizon ───────────────────
+
+test("D8: dropBuffered removes one terminal member and keeps the rest of the group", () => {
+	const { join, delivered } = harness();
+	join.addPending("r-1", "a");
+	join.addPending("r-1", "b");
+	join.onTerminal(entry("a"));
+	// `a` has already reached the parent through the tool route: its buffered
+	// entry is dead weight, `b` is still the notice's only memory.
+	join.dropBuffered("r-1", "a");
+	join.onTerminal(entry("b"));
+	assert.equal(delivered.length, 1);
+	assert.deepEqual(
+		delivered[0]?.map((e) => e.name),
+		["b"],
+		"only the unclaimed member flushes",
+	);
+});
+
+test("D8: remove() alone still leaves a buffered entry behind (the W3 orphan shape)", () => {
+	// Pinned on purpose: `remove()` is pending-only BY CONTRACT, which is why the
+	// runtime needs `dropBuffered` at all. If this ever flips to dropping the
+	// buffer, the W3 bug would look fixed while the batching path breaks.
+	const { join, delivered } = harness();
+	join.addPending("r-1", "a");
+	join.addPending("r-1", "b");
+	join.onTerminal(entry("a"));
+	join.remove("a");
+	join.onTerminal(entry("b"));
+	assert.deepEqual(
+		delivered[0]?.map((e) => e.name),
+		["a", "b"],
+		"remove() does not touch the buffered batch",
+	);
+});
+
+test("D8: dropBufferedRound drops one round and leaves an older unread copy alone (D10)", () => {
+	// `release()` acts on ONE tracked job = one round, so the only copy it may drop
+	// is that round's. Reaching for the name-wide drop there deleted round 1's
+	// still-unread notice when round 2 was the one the parent had just read.
+	const { join, delivered } = harness();
+	join.addPending("r-1", "a");
+	join.addPending("r-1", "b");
+	join.onTerminal(entry("a", "r-1", "success")); // round 1: buffered, unread
+	join.addPending("r-1", "a"); // re-tracked: round 2 joins the group again
+	join.onTerminal({ ...entry("a"), round: 2 }); // round 2: buffered too
+
+	join.dropBufferedRound("r-1", "a", 2);
+	join.onTerminal(entry("b")); // everyone home → flush
+	assert.deepEqual(
+		delivered[0]?.map((e) => `${e.name}#${e.round}`),
+		["a#1", "b#1"],
+		"only round 2 was dropped; round 1 is still deliverable",
+	);
+});
+
+test("D7: dropBuffered keeps its NAME-WIDE meaning — every round of the member", () => {
+	// The counterpart of the case above, pinned on purpose: the revoke path needs
+	// name-wide clearing ("the parent asks to see the child again ⇒ every copy of
+	// that name is stale"), which is why the round-scoped drop is a SEPARATE method
+	// rather than a changed `dropBuffered`.
+	const { join, delivered } = harness();
+	join.addPending("r-1", "a");
+	join.addPending("r-1", "b");
+	join.onTerminal(entry("a"));
+	join.addPending("r-1", "a");
+	join.onTerminal({ ...entry("a"), round: 2 });
+
+	join.dropBuffered("r-1", "a");
+	join.onTerminal(entry("b"));
+	assert.deepEqual(
+		delivered[0]?.map((e) => `${e.name}#${e.round}`),
+		["b#1"],
+		"a revoke clears every round of the name",
+	);
+});
+
+test("D8: dropBuffered on the last member drops the group and cancels its window", () => {
+	const { join, delivered, timers } = harness();
+	join.addPending("r-1", "a");
+	join.addPending("r-1", "b");
+	join.onTerminal(entry("a"));
+	join.remove("b");
+	join.dropBuffered("r-1", "a");
+	assert.equal(timers.pending.at(-1)?.cancelled, true, "the window dies with the group");
+	assert.equal(join.allSettled("r-1"), true);
+	assert.equal(delivered.length, 0, "nothing was delivered");
+	// The group is gone, so a later terminal is not batched into a stale one.
+	join.onTerminal(entry("a"));
+	assert.equal(delivered.length, 1);
 });

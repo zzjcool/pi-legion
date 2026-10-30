@@ -13,6 +13,7 @@ import {
 	formatGroupedNotice,
 	collectFailureInput,
 	type CompletionNotice,
+	type CompletionStatus,
 	type SendMessageApi,
 } from "./notify.ts";
 import {
@@ -20,6 +21,7 @@ import {
 	DEFAULT_JOIN_MODE,
 	JoinCoordinator,
 	type JoinConfig,
+	type JoinEntry,
 	type JoinSchedulerHandle,
 } from "./join.ts";
 import {
@@ -119,6 +121,16 @@ export interface TrackedJobInput {
 
 export interface TrackedJob extends TrackedJobInput {
 	spawnedAt: number;
+	/**
+	 * Reporting round of this child (D10).
+	 *
+	 * `runId` is the PARENT run id, so every steer/continue/resume of the same child
+	 * shares it. One round = one deliverable result, and the round is what makes
+	 * that expressible: the claim key and the delivery entries both carry it.
+	 * Assigned by `track()` from a per-name monotonic counter (never rewound to 1, so
+	 * a new round can never collide with an old round's key).
+	 */
+	round: number;
 	state: string;
 	consumedByTool: boolean;
 	notified: boolean;
@@ -223,17 +235,44 @@ function defaultNoticeOverflow(
 	return { cancel: () => clearTimeout(id) };
 }
 
-/** A completion notice held because the parent agent run is still active (D-A). */
+/**
+ * A terminal entry on its way out: the join entry (which already carries the D10
+ * round) plus its coarse verdict.
+ */
+type DeliverableEntry = JoinEntry & { status: CompletionStatus };
+
+/**
+ * A completion batch held because the parent agent run is still active (D-A).
+ *
+ * D4: the batch is held STRUCTURALLY, never as formatted text. A `wait`/`collect`
+ * that lands while it sits here still wins (that is the W2 duplicate), and the
+ * grouped header (`N of M`, `Still running`) has to be derived from whatever
+ * actually survives — which is only possible if filtering and formatting both
+ * happen at flush time instead of at enqueue time.
+ */
 interface QueuedNotice {
-	notice: CompletionNotice;
+	/** Already claim-filtered once; filtered AGAIN at flush (D5 step 1). */
+	entries: DeliverableEntry[];
 	triggerTurn: boolean;
+	/**
+	 * Whether this batch is a PARTIAL slice of its run (the window expired with
+	 * stragglers still pending), frozen at enqueue time (D5). Recomputing it at
+	 * flush would let a straggler that finished in between change the shape of a
+	 * batch whose shape was already decided: a partial single must keep saying
+	 * `1 of N` even though `join.allSettled()` now returns true.
+	 */
+	partial: boolean;
 	enqueuedAt: number;
 }
 
 export interface NoticeQueueStats {
-	/** Notices currently held. */
+	/**
+	 * Held batches that can still produce a message, i.e. at least one member is
+	 * not claimed yet. A fully claimed batch is already dead: the flush will drop
+	 * it, so counting it would report a notice as waiting that can never land.
+	 */
 	pending: number;
-	/** now() - enqueuedAt of the oldest held notice; 0 when empty. */
+	/** now() - enqueuedAt of the oldest such batch; 0 when none. */
 	oldestAgeMs: number;
 	/** Lifetime count of MAX_PENDING_AGE_MS overflows that forced a send (D-B observability). */
 	forcedFlushes: number;
@@ -523,6 +562,15 @@ export interface SessionRuntime {
 	consumeCollect(name: string): Promise<CollectSnapshot> | undefined;
 	/** Abortable variant used by an in-flight collect tool call. */
 	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<CollectSnapshot | undefined> | undefined;
+	/**
+	 * Undo the claim `consumeCollect*` took for a snapshot the caller never delivered
+	 * (the tool call bailed: the parent turn aborted, or persisting the child failed).
+	 * D2: a claim is earned by a delivery, not by a collect that reached nobody.
+	 *
+	 * Unlike `unclaimReported` (D7) this does NOT drop queued/buffered copies: after the
+	 * tool route bailed, that notice is the ONLY route left to the parent.
+	 */
+	unclaimUndelivered(name: string, snapshot: CollectSnapshot): void;
 	/** Invalidate an in-flight notification watch without dropping the job. */
 	cancelWatch(name: string): void;
 	rewatch(name: string, opts?: { triggerTurn?: boolean }): void;
@@ -562,11 +610,28 @@ export interface SessionRuntime {
 	dispose(): void;
 }
 
+/**
+ * A cached terminal snapshot PLUS the run it came from.
+ *
+ * D9: the run id travels with the snapshot because the cache is keyed by NAME
+ * only, while a claim is keyed by `(runId, name)`. Recovering the run id from
+ * "the last run id seen for this name" therefore picked the NEWEST run, so a
+ * cache hit for a name reused across runs claimed the wrong key — delivering a
+ * notice that was already read (duplicate), or claiming the current run's entry
+ * while handing out an older run's snapshot (swallowed failure).
+ */
+interface FinishedResult {
+	runId: string;
+	/** Round the snapshot belongs to (D10) — a cached hit claims THAT round. */
+	round: number;
+	snapshot: CollectSnapshot;
+}
+
 export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const now = deps.now ?? Date.now;
 	const refreshMs = deps.refreshMs ?? DEFAULT_REFRESH_MS;
 	const jobs = new Map<string, TrackedJob>();
-	const finished = new Map<string, CollectSnapshot>();
+	const finished = new Map<string, FinishedResult>();
 	const board = createStatusBoard({
 		onNodeClick: deps.onStatusNodeClick,
 		...(deps.statusStrip ? { strip: deps.statusStrip } : {}),
@@ -581,6 +646,140 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	let draining = false;
 	let drainPromise: Promise<void> | undefined;
 	let busyRaised = false;
+
+	// ─────────────────── completion claim-once (notice-claim-v1) ───────────────────
+	//
+	// D1: the ONE marker that arbitrates the two delivery routes for a child's
+	// result — the tool result (`wait` / `collect`) and the pushed notice
+	// (watch → join → outbox). It is keyed by `(runId, name, round)` and lives for the
+	// whole session because the notice it has to beat routinely outlives the job:
+	// `waitOne` retires and releases the job while its buffered/queued notice is
+	// still pending (W1–W3). The old `consumedByTool`/`notified` pair lived ON the
+	// job, so a release erased the only evidence that the parent had already been
+	// told (W4) — that is the bug this replaces, not a second copy of it.
+	//
+	// Memory only, by contract: never in run.json / legion.db, and no cross-process
+	// meaning. Recovering a result from disk after a restart is `collect`'s job.
+	const reported = new Set<string>();
+	/**
+	 * D10: the key is `(runId, name, round)`. `\u0000` occurs in no component, so no
+	 * two triples can collide; and because the round comes from a monotonic per-name
+	 * counter, a new round can never be mistaken for an old one.
+	 */
+	const reportKey = (runId: string, name: string, round: number): string =>
+		`${runId}\u0000${name}\u0000${round}`;
+	const isReported = (runId: string, name: string, round: number): boolean =>
+		reported.has(reportKey(runId, name, round));
+	/**
+	 * D2: take the claim for `(runId, name, round)`, where `round` is the reporting
+	 * round handed out monotonically by `track()` (D10). Idempotent and side-effect
+	 * free for a key that is already claimed — there is deliberately no unclaim on the
+	 * DELIVERY side: a timeout / interrupt / still-running result was never claimed,
+	 * and a claim that did happen has already reached the parent.
+	 */
+	const claimReported = (runId: string, name: string, round: number): void => {
+		reported.add(reportKey(runId, name, round));
+	};
+	/**
+	 * D7: revoke the claim AND every not-yet-sent copy of it, atomically.
+	 *
+	 * "Just delete the claim" is not enough: the outbox may still hold an entry for
+	 * this key, and reviving the claim without dropping that entry resurrects an
+	 * already-read notice into the next flush (measured: wait read the result,
+	 * re-`track` of the same child, settle sent it again). The buffered join entry
+	 * is the same hazard in the window layer.
+	 *
+	 * Called from exactly the places that reset `notified` (see D7); `dropQueued`
+	 * and `join` are declared later in this closure and are only touched at CALL
+	 * time, which is always after construction.
+	 */
+	const unclaimReported = (runId: string | undefined, name: string, round: number): void => {
+		if (runId === undefined) return;
+		// The revoke is keyed on the CURRENT round's claim (D10 #5): a round that was
+		// never claimed has no delivered result to revoke, so its queued/buffered copy
+		// is simply an unread result that must survive (D7's `had` gate, now precise).
+		const had = reported.delete(reportKey(runId, name, round));
+		if (!had) return;
+		// A revoked result invalidates every copy of this NAME — all rounds — because
+		// the parent is being asked to look at the child again (D10 #5).
+		dropQueued(runId, name);
+		join.dropBuffered(runId, name);
+		// …and the one-round cache for the name is stale from here on.
+		finished.delete(name);
+	};
+	/**
+	 * D9: claim a cached (already-released) result, keyed by the run the SNAPSHOT
+	 * came from — never by "the newest run seen for this name".
+	 */
+	const claimCachedResult = (name: string, cached: FinishedResult): void => {
+		claimReported(cached.runId, name, cached.round);
+	};
+	/**
+	 * F1: the `(runId, round)` a snapshot was COLLECTED in.
+	 *
+	 * A round is a property of the collect, not of the job: `track()` on an existing
+	 * job bumps `job.round` (D10 #1) WITHOUT touching `generation`, so a snapshot
+	 * that resolves after a re-track would otherwise be attributed to the new round
+	 * while the cache — which captured the origin when the collect started — still
+	 * says the old one. Two labels for one output ⇒ delivered twice, or the new
+	 * round's real result filtered by the old entry's claim. Every consumer therefore
+	 * reads the origin stamped on the snapshot, falling back to the live job only when
+	 * there is no snapshot object at all (the watch's collect-failure path).
+	 */
+	const snapshotOrigins = new WeakMap<CollectSnapshot, { runId: string; round: number }>();
+	const originOf = (
+		snapshot: CollectSnapshot | undefined,
+		job: TrackedJob,
+	): { runId: string; round: number } =>
+		(snapshot ? snapshotOrigins.get(snapshot) : undefined) ?? {
+			runId: job.runId,
+			round: job.round,
+		};
+	/**
+	 * D2(b): a blocked / running snapshot is a progress signal, not a result, so it
+	 * is never claimed — claiming it would swallow the real completion later.
+	 */
+	const claimIfTerminal = (job: TrackedJob, snapshot: CollectSnapshot): CollectSnapshot => {
+		if (!snapshot.blocked && shouldRecycleAfterCollect(snapshot.execution.status)) {
+			const origin = originOf(snapshot, job);
+			claimReported(origin.runId, job.name, origin.round);
+		}
+		return snapshot;
+	};
+	/**
+	 * D2 (delivery, not collection): roll back a claim that reached nobody.
+	 *
+	 * The seam has to claim when the snapshot is handed to the caller, because a
+	 * join/outbox flush landing in that same tick must not repeat the result. But the
+	 * CALLER may still bail — `collectChild` returns "interrupted" when the parent turn
+	 * aborted, and fails the tool call when persisting the child throws. Neither hands
+	 * the text to the parent, so the claim has to go back: otherwise the pushed notice
+	 * for a result nobody saw is filtered out forever.
+	 *
+	 * Deliberately narrower than `unclaimReported`: no copies are dropped. The queued /
+	 * buffered notice is the only remaining route to the parent, and D7's question ("the
+	 * parent read it, so revoke") does not apply — nothing was read.
+	 */
+	const unclaimUndelivered = (name: string, snapshot: CollectSnapshot): void => {
+		const origin = snapshotOrigins.get(snapshot);
+		// No origin ⇒ this runtime did not collect it, so it cannot have claimed it.
+		// A non-terminal snapshot never claims either (D2(b)).
+		if (!origin) return;
+		reported.delete(reportKey(origin.runId, name, origin.round));
+	};
+	/**
+	 * D10 #1: the reporting round per child name.
+	 *
+	 * Monotonic and never rewound: reusing a number would let a new round inherit an
+	 * old round's claim (and so swallow its completion). `track()` — the only writer —
+	 * bumps it on BOTH branches, because both start a new reporting round.
+	 */
+	const roundOfName = new Map<string, number>();
+	const nextRoundFor = (name: string): number => {
+		const next = (roundOfName.get(name) ?? 0) + 1;
+		roundOfName.set(name, next);
+		return next;
+	};
 
 	// Smart join: batch completion notices per runId. The deliver sink merges
 	// the buffered entries into ONE grouped message; an unbatched single-child
@@ -607,6 +806,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 
 	const armOutboxTimer = (): void => {
 		if (outboxTimer || outbox.length === 0 || disposed) return;
+		// Armed off the HEAD entry, as before. A head that is already claimed can
+		// only make the queue flush EARLIER than the live members' own caps (never
+		// later), and the flush re-filters — so this stays a scheduling detail, not a
+		// second source of truth about what is pending.
 		const oldest = outbox[0]!;
 		const delay = Math.max(0, oldest.enqueuedAt + MAX_PENDING_AGE_MS - now());
 		// `live` proves this callback is the CURRENT arm. A cancelled-but-still-
@@ -632,8 +835,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				armOutboxTimer();
 				return;
 			}
-			forcedFlushes += 1;
-			flushOutbox();
+			// `forcedFlushes` counts forced SENDS, not forced flush attempts: a batch
+			// whose members were all claimed by wait/collect delivers nothing, and
+			// reporting it as a forced send would describe a message that never existed.
+			if (flushOutbox() > 0) forcedFlushes += 1;
 		});
 		outboxTimer = {
 			cancel: () => {
@@ -643,37 +848,131 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		};
 	};
 
+	/**
+	 * D7: drop every not-yet-sent copy of `(runId, name)` from the outbox.
+	 *
+	 * The outbox is the one buffer with no per-name undo, so an unclaim that only
+	 * deletes the key leaves the old entry alive and the next flush ships it again
+	 * (the "revived notice", measured). Removing members can invalidate the armed
+	 * overflow timer — it was priced off the entry that used to be at the head — so
+	 * the timer is retired and re-armed off the NEW head (the oldest survivor, i.e.
+	 * the earliest remaining cap). Nothing left to send ⇒ no timer at all.
+	 */
+	const dropQueued = (runId: string, name: string): void => {
+		if (outbox.length === 0) return;
+		let changed = false;
+		for (let index = outbox.length - 1; index >= 0; index -= 1) {
+			const item = outbox[index]!;
+			const kept = item.entries.filter(
+				(entry) => !(entry.runId === runId && entry.name === name),
+			);
+			if (kept.length === item.entries.length) continue;
+			changed = true;
+			if (kept.length === 0) outbox.splice(index, 1);
+			else item.entries = kept;
+		}
+		if (!changed) return;
+		outboxTimer?.cancel();
+		outboxTimer = undefined;
+		armOutboxTimer();
+	};
+
+	/**
+	 * D5: THE single completion exit. Both the join `deliver` sink and the outbox
+	 * flush go through here and nowhere else, so the claim (D3) is consulted at
+	 * the last possible moment — after the join window and after the outbox wait,
+	 * never at `onTerminal` time where a `wait` could still take the result away.
+	 *
+	 * Order is load-bearing:
+	 *  1. filter claimed entries → empty ⇒ return (this IS "read once, never
+	 *     repeated");
+	 *  2. format what survives — single & whole ⇒ legacy `Background task …`
+	 *     shape, otherwise the grouped one with `stillRunning` recomputed NOW;
+	 *  3. send immediately, or hold the STRUCTURE (D4) until the run settles;
+	 *  4. claim only after a real delivery: a host rejection (`false`) must stay
+	 *     claimable so a later route can still deliver it.
+	 */
+	const deliverBatch = (
+		entries: readonly DeliverableEntry[],
+		triggerTurn: boolean,
+		partial: boolean,
+		force = false,
+	): number => {
+		// D10 #4: each entry is judged, and later claimed, on ITS OWN round — so two
+		// unread rounds of one child both survive, while a repeated delivery inside one
+		// round is still filtered.
+		const surviving = entries.filter(
+			(entry) => !isReported(entry.runId, entry.name, entry.round),
+		);
+		if (surviving.length === 0) return 0;
+		let notice: CompletionNotice;
+		if (!partial && surviving.length === 1) {
+			notice = formatCompletionNotice(surviving[0]!.input);
+		} else {
+			// `stillRunning` is derived from the live job table at the moment of
+			// DELIVERY, never stored: a member claimed by `wait`/`collect` while this
+			// batch waited is neither an entry nor "still running", so both the
+			// header (`N of M`) and the footer stay truthful (W1, W2, D4-§6).
+			const delivering = new Set(surviving.map((entry) => entry.name));
+			const stillRunning = [...jobs.values()]
+				.filter(
+					(job) =>
+						job.runId === surviving[0]!.runId &&
+						// `awaiting` is a TERMINAL marker: the watch has already buffered
+						// this child's completion and is merely parked in `retire`. Listing
+						// it as "still running" contradicts the completed entry that the
+						// very same burst delivered (and D4 makes the footer recompute up to
+						// 80s later, so that window is wide). Not done = not retire yet.
+						job.state !== "awaiting" &&
+						job.state !== "retired" &&
+						!isReported(job.runId, job.name, job.round) &&
+						!job.consumedByTool &&
+						!delivering.has(job.name),
+				)
+				.map((job) => job.name);
+			notice = formatGroupedNotice({
+				runId: surviving[0]!.runId,
+				entries: surviving.map((entry) => ({ ...entry.input, status: entry.status })),
+				...(stillRunning.length > 0 ? { stillRunning } : {}),
+			});
+		}
+		if (!force && parentRunActive) {
+			outbox.push({ entries: surviving, triggerTurn, partial, enqueuedAt: now() });
+			armOutboxTimer();
+			return 0;
+		}
+		if (deliverCompletion({ sendMessage: deps.sendMessage }, notice, triggerTurn)) {
+			// Redundant by design, NOT the observable main path: for a batch that came
+			// through this exit the tool route could only have claimed first if it ran
+			// between the filter above and this line. Keeping it means a later entry
+			// for the same key can never be re-delivered; the claim that actually
+			// suppresses notices is the one taken by wait/collect, and the filter at
+			// the top of this function is what reads it.
+			for (const entry of surviving) claimReported(entry.runId, entry.name, entry.round);
+			return 1;
+		}
+		return 0;
+	};
+
 	// FIFO, one message per notice: the grouped shape belongs to the join layer.
 	// N held notices = N host `_runAgentPrompt` calls; the common case is 1 per
 	// run, so the batch is not merged into a synthetic grouped notice.
-	const flushOutbox = (): void => {
+	/** Returns how many messages were actually delivered (0 when all was claimed). */
+	const flushOutbox = (): number => {
 		outboxTimer?.cancel();
 		outboxTimer = undefined;
-		if (outbox.length === 0) return;
+		if (outbox.length === 0) return 0;
 		// One splice: anything enqueued by a re-entrant send belongs to the next
 		// batch, so a settle can never double-deliver what it already flushed.
 		const batch = outbox.splice(0);
+		let sent = 0;
 		for (const item of batch) {
-			// A rejected send is dropped, not requeued (same as before).
-			deliverCompletion(
-				{ sendMessage: deps.sendMessage },
-				item.notice,
-				item.triggerTurn,
-			);
+			// Re-filter + re-format (D4/D5): a claim taken while this notice was
+			// held drops its member, and the header is recomputed from survivors.
+			// `force`: the outbox wait is already over — never re-enqueue.
+			sent += deliverBatch(item.entries, item.triggerTurn, item.partial, true);
 		}
-	};
-
-	/** The single completion exit: send now, or hold until the run settles. */
-	const sendCompletionNotice = (
-		notice: CompletionNotice,
-		triggerTurn: boolean,
-	): void => {
-		if (!parentRunActive) {
-			deliverCompletion({ sendMessage: deps.sendMessage }, notice, triggerTurn);
-			return;
-		}
-		outbox.push({ notice, triggerTurn, enqueuedAt: now() });
-		armOutboxTimer();
+		return sent;
 	};
 
 	const join = new JoinCoordinator({
@@ -687,37 +986,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			// must use the grouped shape so the header can say "1 of N".
 			// (mode "each" delivers immediately per member, so its single-entry
 			// batches are never partial.)
-			if (
-				batch.length === 1 &&
-				(joinConfig.mode === "each" || join.allSettled(first.runId))
-			) {
-				sendCompletionNotice(
-					formatCompletionNotice(first.input),
-					first.triggerTurn,
-				);
-				return;
-			}
-			const triggerTurn = batch.some((e) => e.triggerTurn);
-			// Partial flush: members of the same run still alive notify later.
-			// consumedByTool members were just claimed by an explicit wait() —
-			// the tool result carries them, so they are not "still running".
-			const stillRunning = [...jobs.values()]
-				.filter(
-					(job) =>
-						job.runId === first.runId &&
-						job.state !== "retired" &&
-						!job.consumedByTool &&
-						!batch.some((e) => e.name === job.name),
-				)
-				.map((job) => job.name);
-			sendCompletionNotice(
-				formatGroupedNotice({
-					runId: first.runId,
-					entries: batch.map((e) => ({ ...e.input, status: e.status })),
-					...(stillRunning.length > 0 ? { stillRunning } : {}),
-				}),
-				triggerTurn,
-			);
+			//
+			// D4: decided HERE and carried through the outbox, not re-derived there —
+			// the shape belongs to the batching moment, the members do not.
+			const partial =
+				batch.length !== 1 ||
+				!(joinConfig.mode === "each" || join.allSettled(first.runId));
+			deliverBatch(batch, batch.some((entry) => entry.triggerTurn), partial);
 		},
 	});
 	join.setConfig(joinConfig);
@@ -930,7 +1205,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					job,
 					identity,
 					storedNode,
-					finished.get(job.name)?.execution.status,
+					finished.get(job.name)?.snapshot.execution.status,
 				);
 			});
 		const seen = new Set(jobEntries.flatMap((entry) => entry.nodeId ? [entry.nodeId] : []));
@@ -1221,8 +1496,15 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const ensureCollect = (job: TrackedJob, signal?: AbortSignal): Promise<CollectSnapshot> => {
 		if (!job.collectPromise) {
 			const generation = job.generation;
+			// D7b/D10 #6/F1: the run id AND the round are captured when the collect
+			// STARTS, and stamped onto the snapshot below — `track()` on an existing job
+			// rewrites `job.runId` and bumps `job.round` without touching `generation`.
+			const origin = { runId: job.runId, round: job.round };
 			job.collectPromise = (async () => {
 				const snapshot = await job.collect(signal ? { signal } : undefined);
+				// F1: every later consumer (cache, notice entry, claim) must speak about
+				// the round this result came FROM, never about the live job's current one.
+				snapshotOrigins.set(snapshot, origin);
 				const current = jobs.get(job.name) === job && job.generation === generation;
 				if (current) {
 					try {
@@ -1235,12 +1517,22 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				// Caching it would let a later wait/collect hand out a stale
 				// "still working" snapshot as if it were the final answer. Also do not
 				// revive a result after an explicit stop invalidates this generation.
+				//
+				// F2: re-validate AFTER the `persist` await, and include the round. A
+				// `track()` landing during persist does not bump `generation`, so `current`
+				// alone would let this stale round-1 write-back undo the invalidation
+				// `track()` just performed (D7b) — and the next `wait` would serve the
+				// previous round's result.
+				const stillCurrent =
+					jobs.get(job.name) === job &&
+					job.generation === generation &&
+					job.round === origin.round;
 				if (
-					current &&
+					stillCurrent &&
 					!snapshot.blocked &&
 					snapshot.execution.status !== "running"
 				) {
-					finished.set(job.name, snapshot);
+					finished.set(job.name, { runId: origin.runId, round: origin.round, snapshot });
 				}
 				return snapshot;
 			})();
@@ -1261,7 +1553,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		const job = jobs.get(name);
 		if (!job) {
 			const cached = finished.get(name);
-			if (cached) return { name, snapshot: cached };
+			if (cached) {
+				// D2(a): a cached hit hands the parent the same terminal result, so it
+				// claims too — for the run that snapshot CAME FROM (D9). The job is
+				// already released here, which is precisely the W2 window: the notice for
+				// this child may still be in the outbox.
+				claimCachedResult(name, cached);
+				return { name, snapshot: cached.snapshot };
+			}
 			return { name, missing: true };
 		}
 		job.consumedByTool = true;
@@ -1321,6 +1620,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					// double-reset.
 					job.collectPromise = undefined;
 					job.notified = false;
+					// D7: the next terminal may notify again. F1: the round to revoke is
+					// the one this (non-terminal) snapshot came from.
+					const blockedOrigin = originOf(snapshot, job);
+					unclaimReported(blockedOrigin.runId, name, blockedOrigin.round);
 					runtime.watch(name);
 				}
 				return {
@@ -1329,6 +1632,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					elapsedMs: Math.max(0, now() - job.spawnedAt),
 				};
 			}
+			// D2(a): the snapshot is terminal and IS the delivery — claim it BEFORE
+			// the retire await below, because a join/outbox flush landing inside that
+			// await would otherwise push the same result a second time. F1: the claim
+			// is for the round the snapshot came from, which is also the round its
+			// notice entry carries.
+			const origin = originOf(snapshot, job);
+			claimReported(origin.runId, name, origin.round);
 			if (jobs.get(name) === job) {
 				try {
 					await job.retire?.();
@@ -1393,6 +1703,22 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				if (input.depth !== undefined || identity.depth !== undefined) existing.depth = input.depth ?? identity.depth;
 				existing.settledAt = undefined;
 				existing.state = "working";
+				// D10 #1: steering/continuing a live child starts a NEW reporting round.
+				// The round only affects NEW claims (old rounds keep theirs), so the
+				// `notified` gate above is untouched.
+				existing.round = nextRoundFor(input.name);
+				// D7 invariant: unclaim ONLY where `notified` is reset. This branch
+				// (steer / continue on a still-live job) does NOT reset it on master, so
+				// a second round is already stopped by the legacy
+				// `!consumedByTool && !notified` gate; clearing the claim here would not
+				// re-open that round, it would only erase the evidence that this result
+				// was already delivered.
+				//
+				// D7b: the finished cache is a ONE-ROUND cache. `runId` is the PARENT
+				// run id, so every round of the same child shares it — a surviving
+				// cache entry would hand round N the snapshot of round N-1 and, worse,
+				// claim round N's failure notice. Any (re)track starts a new round.
+				finished.delete(input.name);
 				join.addPending(input.runId, input.name);
 				ensureTimer();
 				refreshUi();
@@ -1402,6 +1728,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				...input,
 				...identity,
 				spawnedAt: input.spawnedAt ?? now(),
+				// D10 #1: a fresh track (launch / resume / re-follow after a release) is
+				// a new round, drawn from the same monotonic per-name counter.
+				round: nextRoundFor(input.name),
 				state: "working",
 				consumedByTool: false,
 				notified: false,
@@ -1416,6 +1745,17 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				);
 			}
 			jobs.set(job.name, job);
+			// D7 invariant: unclaim only where `notified` is RESET. This branch RESETS
+			// nothing — it *initializes* the flag to `false` on a brand-new job — and the
+			// round it just drew from the monotonic counter cannot have a claim yet, so an
+			// `unclaimReported(job.runId, job.name, job.round)` here would be a provable
+			// no-op whose `dropQueued` / `dropBuffered` / `finished.delete` were
+			// unreachable from this site (it read as a fifth reset point that did nothing).
+			// What actually has to be true here is the positive property: the PREVIOUS
+			// round's unread copies keep their own keys and stay deliverable (D10).
+			// D7b: same one-round rule as the revive branch above — a fresh job must
+			// never be served the previous round's snapshot.
+			finished.delete(job.name);
 			join.addPending(job.runId, job.name);
 			ensureTimer();
 			refreshUi();
@@ -1442,6 +1782,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					job.collectPromise = undefined;
 					job.notified = false;
 					job.consumedByTool = false;
+					// D7: this round already reported? Then it is not over: the next
+					// completion must be allowed to notify.
+					unclaimReported(job.runId, job.name, job.round);
 					join.addPending(job.runId, job.name);
 					// Repaint before the new watch takes over so the panel cannot
 					// hold the old row's final second. watch() repaints too; this is
@@ -1473,6 +1816,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 							job.notified = false;
 							job.consumedByTool = false;
 							job.state = "working";
+							// D7: approval resumed the child, so its completion still owes a
+							// notice.
+							unclaimReported(job.runId, job.name, job.round);
 							join.addPending(job.runId, job.name);
 							runtime.watch(name, opts);
 							return;
@@ -1499,9 +1845,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					refreshUi();
 					if (!job.consumedByTool && !job.notified) {
 						job.notified = true;
+						// F1: the entry is labelled with the round the SNAPSHOT came from.
+						// A `track()` during the collect bumps `job.round`, and a notice
+						// labelled with the new round would steal that round's key.
+						const entryOrigin = originOf(snapshot, job);
 						join.onTerminal({
-							runId: job.runId,
+							runId: entryOrigin.runId,
 							name: job.name,
+							round: entryOrigin.round,
 							input: {
 								name: job.name,
 								agent: job.agent,
@@ -1538,6 +1889,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						job.collectPromise = undefined;
 						job.notified = false;
 						job.consumedByTool = false;
+						// D7: the blip was never a verdict — nothing was delivered, so the
+						// real completion must still be able to notify.
+						unclaimReported(job.runId, job.name, job.round);
 						join.addPending(job.runId, job.name);
 						refreshUi();
 						await new Promise((resolve) => setTimeout(resolve, TRANSIENT_CONNECTION_REARM_MS));
@@ -1553,10 +1907,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					refreshUi();
 					if (!job.consumedByTool && !job.notified) {
 						job.notified = true;
-						// Collect failures join the batch too, as a failed entry.
+						// Collect failures join the batch too, as a failed entry. No
+						// snapshot object exists here, so the origin falls back to the
+						// live job (F1's documented fallback).
+						const failureOrigin = originOf(undefined, job);
 						join.onTerminal({
-							runId: job.runId,
+							runId: failureOrigin.runId,
 							name: job.name,
+							round: failureOrigin.round,
 							input: collectFailureInput(job.name, error),
 							triggerTurn,
 						});
@@ -1585,10 +1943,17 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			const job = jobs.get(name);
 			if (job) {
 				job.consumedByTool = true;
-				return ensureCollect(job);
+				// D2(b): `collectChild` (index.ts, not ours) renders this snapshot to
+				// the parent, so a terminal one is a delivery and claims here.
+				return ensureCollect(job).then((snapshot) =>
+					claimIfTerminal(job, snapshot),
+				);
 			}
 			const cached = finished.get(name);
-			if (cached) return Promise.resolve(cached);
+			if (cached) {
+				claimCachedResult(name, cached);
+				return Promise.resolve(cached.snapshot);
+			}
 			return undefined;
 		},
 
@@ -1596,7 +1961,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			const job = jobs.get(name);
 			if (!job) {
 				const cached = finished.get(name);
-				return cached ? Promise.resolve(cached) : undefined;
+				if (!cached) return undefined;
+				claimCachedResult(name, cached);
+				return Promise.resolve(cached.snapshot);
 			}
 			job.consumedByTool = true;
 			if (signal.aborted) {
@@ -1623,7 +1990,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						if (done) return;
 						done = true;
 						cleanup();
-						resolve(snapshot);
+						// D2(b): the snapshot that actually reaches the caller claims.
+						resolve(claimIfTerminal(job, snapshot));
 					},
 					(error: unknown) => {
 						if (done) return;
@@ -1644,6 +2012,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			refreshUi();
 		},
 
+		unclaimUndelivered(name, snapshot) {
+			unclaimUndelivered(name, snapshot);
+		},
+
 		rewatch(name, opts) {
 			const job = jobs.get(name);
 			if (!job || disposed) return;
@@ -1653,6 +2025,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			job.settledAt = undefined;
 			job.state = "working";
 			finished.delete(name);
+			// D7: `rewatch` is the parent explicitly asking to be told again, so the
+			// claim for this round must go — otherwise "report it once more" reports
+			// nothing. `rewatch` does not `track()`, so the round (and therefore the
+			// key) is unchanged: the next completion of this round is deliverable
+			// again, while an older round keeps its own state (D10).
+			unclaimReported(job.runId, job.name, job.round);
 			join.addPending(job.runId, job.name);
 			runtime.watch(name, opts);
 		},
@@ -1666,6 +2044,27 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			job.watching = false;
 			job.unsubscribeRpcEvents?.();
 			job.unsubscribeRpcEvents = undefined;
+			// D8/W3: `remove()` only clears `pending`, so an already-terminal member
+			// sitting in the window buffer would survive the release and fire as an
+			// orphan — exactly what happens after a wait() hit, which claims, retires
+			// and releases a child whose entry is still buffered.
+			//
+			// SAFETY NET / group convergence, NOT the suppression itself: the authority
+			// is `deliverBatch`'s claim filter, which also covers every entry that is
+			// already OUT of the buffer (outbox, mode "each", a group that flushed
+			// before the release). Do not delete that filter on the strength of this
+			// line — dropping a buffer entry that was never delivered would silently
+			// swallow the notice, which is why the call is gated on the claim.
+			//
+			// D10: this job owns ONE round, so only that round's copy may go. The
+			// name-wide drop is the revoke path (`unclaimReported`); using it here
+			// would delete an EARLIER round's still-unread notice along with it —
+			// "one round = one deliverable result" (D10), and the loss is reachable:
+			// round 1 buffered unread → re-track → round 2 buffered → `wait` claims
+			// round 2 → this release would drop round 1 too.
+			if (isReported(job.runId, name, job.round)) {
+				join.dropBufferedRound(job.runId, name, job.round);
+			}
 			join.remove(name);
 			stopTimerIfIdle();
 			refreshUi();
@@ -1698,7 +2097,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				if (!resolvedIdentity) continue;
 				const index = result.findIndex((node) => node.id === resolvedIdentity.nodeId);
 				const previous = index >= 0 ? result[index] : undefined;
-				const executionStatus = finished.get(job.name)?.execution.status;
+				const executionStatus = finished.get(job.name)?.snapshot.execution.status;
 				const status = job.state === "blocked"
 					? "blocked"
 					: job.state === "awaiting"
@@ -1763,9 +2162,16 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		},
 
 		noticeQueueStats(): NoticeQueueStats {
-			const oldest = outbox[0];
+			// Only batches that still have an unclaimed member count: everything else
+			// is already delivered through the other route and will be filtered out at
+			// flush. The FLUSH end is deliberately unchanged — it re-filters, which is
+			// what makes the claim authoritative.
+			const deliverable = outbox.filter((item) =>
+				item.entries.some((entry) => !isReported(entry.runId, entry.name, entry.round)),
+			);
+			const oldest = deliverable[0];
 			return {
-				pending: outbox.length,
+				pending: deliverable.length,
 				oldestAgeMs: oldest ? Math.max(0, now() - oldest.enqueuedAt) : 0,
 				forcedFlushes,
 			};
@@ -1807,6 +2213,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			for (const job of jobs.values()) job.unsubscribeRpcEvents?.();
 			jobs.clear();
 			finished.clear();
+			// D7: the claim table is session state, like the caches above it.
+			reported.clear();
+			roundOfName.clear();
 			join.dispose();
 			// Shutdown drops held notices unsent: the child's session file survives,
 			// so `collect` can still recover the result from disk. The `finished`
