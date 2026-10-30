@@ -2438,13 +2438,18 @@ export async function collectChild(
 	try {
 		if (signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
 		// #312: the runtime's job table is keyed by NAME, while everything below
-		// acts on the node resolved in `ctx.found.runId`. A same-named job belonging
-		// to another run is a DIFFERENT node: consuming its snapshot here would
-		// answer with one node's result and persist it into another's run — the same
-		// silent wrong-node answer the resolver exists to stop, one layer down.
-		const runtimeJob = ctx.runtime.get(ctx.name);
-		const runtimeMatchesScope = runtimeJob?.runId === ctx.found.runId;
-		const pending = !runtimeMatchesScope
+		// acts on the node resolved in `ctx.found.runId`. A TRACKED job belonging to
+		// another run is a different node: consuming its snapshot here would answer
+		// with one node's result and persist it into another's run — the same silent
+		// wrong-node answer the resolver exists to stop, one layer down.
+		//
+		// Only a tracked job can be cross-checked. A released one leaves its finished
+		// cache behind (keyed by the run the snapshot CAME from, D9), and that cache is
+		// the only answer left for the node — the #320 bail wiring collects exactly
+		// that window, so an absent job must not be read as "a different run".
+		const trackedJob = ctx.runtime.get(ctx.name);
+		const foreignJob = trackedJob !== undefined && trackedJob.runId !== ctx.found.runId;
+		const pending = foreignJob
 			? undefined
 			: signal
 				? ctx.runtime.consumeCollectInterruptible(ctx.name, signal)
@@ -2500,7 +2505,7 @@ export async function collectChild(
 		}
 		// Only release a job that IS the node just collected. Releasing by name alone
 		// would drop the tracking of a still-live same-named child in another run.
-		if (runtimeMatchesScope) ctx.runtime.release(ctx.name);
+		if (!foreignJob) ctx.runtime.release(ctx.name);
 		return ok(renderCollect(ctx.name, collected));
 	} catch (error) {
 		return fail(`collect failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
