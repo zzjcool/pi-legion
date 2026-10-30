@@ -54,10 +54,23 @@ interface ChildActivity {
 因为并行工具批里先结束的兄弟不能把还在跑的那个擦掉。`agent_settled` 也会清空：一轮结束
 就不会再有工具在飞（abort 打断工具时 `end` 事件可能永远不来）。
 
+**单槽设计的两处「少报」（而不是假报）。** D1 的字段只存**一个**调用，所以下面两个方向会
+让那一行提前消失：
+
+1. **嵌套调用（`codemode` → `bash`）**：内层 `tool_execution_end` 与槽位 `toolCallId` 相等，
+   会清掉外层仍在跑的事实 —— status 一行都不出。
+2. **并行批**：槽位只记最后启动的那一次。当前显示的那次先结束时，仍在外跑的兄弟不可见。
+
+两个方向都是**少报，不假报卡住**：`tool_execution_end` 只会清、不会置位，所以不会把已结束的
+调用继续说成在飞；`inFlightTool` 以 `isAlive` 为闸，所以也不会把没在跑的工具报成在跑。本契约
+要防的恰好是相反的错误（把卡住说成在工作），丢掉的是「在工作」的显示，不是「卡住」的幻觉。
+修法方向（先改 D1 允许「栈」，再改 `nextInFlightTool`）见 #331。
+
 ### D3 — `STALL_NOTICE_MS = 300_000`
 
 单条工具持续到或超过 5 分钟，追加**展示用**标记。常量在 `src/supervisor/types.ts`，
-两个后端与工具面共用同一个值，不各写一份字面量。
+展示层（`formatInFlightToolLine`）与测试共用同一个值，不各写一份字面量。
+（两个后端不读这个常量，只记录事实；边界判定全部发生在展示层。）
 
 选 5 分钟的理由是对照**可观测的替代方案**：现在父等到 900s 的 `collect` deadline 才知道
 没动静。5 分钟落在这个 deadline 之前很久，且它只花一个字符串。
@@ -120,6 +133,11 @@ working · bash 00:12:00 (long-running tool — no progress for 12m; `steer` can
 - **只给 `scout`**。`worker` / `centurion` 要跑完整构建、测试套件与集成门禁，
   它们的长命令是**正当**的：误杀一次 `npm run test:integration` 的代价高于它防住的那次挂起。
   给它们加默认超时等于把「慢」判成「坏」。
+- **收益的边界（不要读多）**：600000 与本角色的父侧 `timeoutMs` 完全相等，**没有余量**。所以
+  这条预算买到的是「一条卡死的 bash 不再永久钉住 child」（到点被 OS 杀掉，child 还能带着已
+  读到的东西收场），**不是**「当次一定能看到侦察结果」—— 同长的命令照样跑不完，只是失败变
+  成有界的。是否给 scout 留余量（提高 `toolTimeoutMs` 或缩短 `timeoutMs`）属于父会话裁决，
+  不在本契约里改数值。
 - 既有行为不变，并由测试钉住：以 `timeout` 开头的命令不被二次包裹（嵌套 `timeout` 会把外层
   上限压成内层的，并让失败原因报错在错误的那一层）；`toolTimeoutMs` 缺失时命令原样不动。
 
@@ -129,6 +147,7 @@ working · bash 00:12:00 (long-running tool — no progress for 12m; `steer` can
 |---|---|
 | `src/supervisor/types.ts` 加 `ChildActivity` / `STALL_NOTICE_MS` / `nextInFlightTool` / `formatInFlightToolLine` / `LegionSupervisor.inFlightTool?` | 改 `src/extension/liveness.ts` 的任何判定 |
 | 两个后端在各自 `ChildRecord` 上记录/清空该字段 | 改 `src/extension/legion-tools.ts` 的心跳与孤儿扫描判据 |
+| `RoutingSupervisor.inFlightTool` 纯转发（不加则工具面为 0：工具面注入的就是 `RoutingSupervisor`） | —— |
 | `index.ts` / `src/extension/legion-status.ts` 的展示拼接 | 改 `runtime.ts` 的 claim / notice 语义 |
 | `agents/scout.md` 的 `toolTimeoutMs` | 给 `worker` / `centurion` 加默认超时 |
 | 展示层字符串 | 任何自动 `abort` / `stop` / `retire` / kill |
@@ -136,6 +155,10 @@ working · bash 00:12:00 (long-running tool — no progress for 12m; `steer` can
 `inFlightTool` 在 `LegionSupervisor` 上是**可选**成员：它是在接口冻结之后新增的**只读展示**，
 一个答不上来的 supervisor（测试替身、早于 #315 的后端）必须仍然满足契约。答不上来 = 没有
 事实 = 不出那一行。
+
+表里的 `——` 是「这一行没带对应的禁令」：`routing-supervisor.ts` 只多一个纯转发方法
+（按 `owners` 路由到具体后端，与 `isAlive` 同形状），它不记录、不判定、不清空任何事实，
+所以没有需要单独禁掉的东西。
 
 ## 验收
 

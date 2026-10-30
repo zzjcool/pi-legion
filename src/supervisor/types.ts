@@ -230,9 +230,14 @@ export const STALL_NOTICE_MS = 300_000;
 /**
  * `451_000ms` → `00:07:31`. Hours are not capped, so an all-day call reads
  * `30:00:00` instead of silently wrapping to `06:00:00`.
+ *
+ * A non-finite input is floored to the zero clock. `Math.max(0, Math.floor(NaN/1000))`
+ * is still `NaN`, which would render the readout as `NaN:NaN:NaN` — a defect that
+ * looks like data instead of a missing fact. Both clocks on this path are
+ * `Date.now()` readings, so this is belt-and-braces, not a live case.
  */
 export function formatToolElapsed(elapsedMs: number): string {
-	const totalSecs = Math.max(0, Math.floor(elapsedMs / 1000));
+	const totalSecs = Number.isFinite(elapsedMs) ? Math.max(0, Math.floor(elapsedMs / 1000)) : 0;
 	const pad = (value: number): string => String(value).padStart(2, "0");
 	const hours = pad(Math.floor(totalSecs / 3600));
 	const minutes = pad(Math.floor((totalSecs % 3600) / 60));

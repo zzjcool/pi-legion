@@ -35,6 +35,10 @@ test("formatToolElapsed prints hh:mm:ss and does not wrap the hour field", () =>
 	// Sub-second and negative inputs cannot produce a negative clock.
 	assert.equal(formatToolElapsed(-5), "00:00:00");
 	assert.equal(formatToolElapsed(999), "00:00:00");
+	// A non-finite input must not render as `NaN:NaN:NaN`: `Math.max(0, NaN)` is
+	// `NaN`, and a clock made of NaNs reads like data instead of a missing fact.
+	assert.equal(formatToolElapsed(Number.NaN), "00:00:00");
+	assert.equal(formatToolElapsed(Number.POSITIVE_INFINITY), "00:00:00");
 });
 
 test("a short in-flight tool renders `working · <tool> hh:mm:ss` with no marker", () => {

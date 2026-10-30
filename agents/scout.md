@@ -11,10 +11,13 @@ timeoutMs: 600000
 # A read-only recon role has no legitimate long command: its tools are read /
 # grep / find / ls / bash over sources. Without this the SDK bash tool has no
 # default timeout at all, so one hung probe (`wait-output`, a socket, a repo-wide
-# rg on a network mount) pins the child for its whole 600s turn budget and
-# reports nothing (#315). Deliberately scout-only — `worker` and
-# `centurion` must run full builds, test suites and integration
-# gates, where a false kill costs more than the hang it prevents.
+# rg on a network mount) pins the child indefinitely and reports nothing (#315).
+# What this buys is BOUNDED failure, not a result: 600000 is exactly the turn
+# budget above, so there is no headroom — a command that needs longer still will
+# not finish this turn, it just stops pinning the child forever (the OS kills it
+# and the child can still report what it already read). Deliberately scout-only —
+# `worker` and `centurion` must run full builds, test suites and
+# integration gates, where a false kill costs more than the hang it prevents.
 toolTimeoutMs: 600000
 # A timed-out scout means the question was too broad, not that work needs
 # finishing — renewing it would just re-run an over-scoped search (#270 D5).
