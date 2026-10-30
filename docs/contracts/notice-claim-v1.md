@@ -33,7 +33,7 @@
 
 ### D2 — claim 语义：谁先把结果交到父 agent，谁置位
 
-- `claim(runId, name): boolean` —— 首次返回 `true` 并置位；已存在返回 `false`。（修订：实际实现改为 `void`，无调用方需要该返回值。）
+- `claim(runId, name): boolean` —— 首次返回 `true` 并置位；已存在返回 `false`。（修订：实现期一度改为 `void`，因为没有调用方要这个返回值；**#320 修订撤销该改动** —— `claimReported` 重新返回 `boolean`，`collect` 缝要用它区分「本次调用取得的 claim」与「别人已经取得的 claim」，见下方 #320 修订。）
 - 置位点（**只有"真实交付"三处**）：
   1. `waitOne` 拿到终态 snapshot、确定要返回它时（在 `retire` 的 await **之前**，避免 retire 期间的 flush 抢跑）。
   2. `collectChild` 拿到终态 snapshot 并确定返回 `renderCollect` 时。
@@ -43,6 +43,20 @@
 **修订（复审 minor 4，2026-xx）**：上面「三处都是真实交付」在 `collect` 那条上并不严格成立 —— claim 发生在运行时缝里（`consumeCollectInterruptible` 把 snapshot 交出去的那一刻），而**调用方仍可能反悔**：`collectChild` 在 `await pending` 之后还会检查 `signal?.aborted`（父 turn 被 Esc 掉），`persistChild` 抛错则走 `fail("collect failed: …")`。两条路径都没有把文本交给父 agent。裁决：保留缝内的 claim（D2(a) 的抢跑防护要靠它），在 bail 分支调用 `runtime.unclaimUndelivered(name, snapshot)` 回滚。
 
 该回滚**故意比 `unclaimReported`(D7) 更窄**：只删 claim，不清任何副本。理由相反于 D7 —— D7 处理的是「父已读过所以撤销」，此时还没有任何副本落到父手里，待发的通知是唯一剩下的送达路径。
+
+**修订（#320，2026-xx）：回滚收窄到「本次调用取的 claim」，并同时把通知路径交还。**
+
+上面那句「待发的通知是唯一剩下的送达路径」在实现上并不成立，回滚本身有两个缺陷：
+
+1. **它删的可能不是自己取的 claim。** `unclaimUndelivered` 原先无条件 `reported.delete(...)`。同一 `(runId,name,round)` 若已被**真实投递**（wait / collect / 通知）claim 过，一次 bail 就把「父已拿到结果」的证据抹掉，已读通知会在下一次 flush 复活。
+   - 裁决：claim 的「是否本次取得」**随缝的返回值交出**，即 `consumeCollect*` 返回 `{ snapshot, claimedNow }`（`ClaimedCollect`），`unclaimUndelivered(name, snapshot, claimedNow)` 只在 `claimedNow === true` 时回滚。
+   - **不放在按快照索引的表里**：watch 与工具调用共享同一个 `job.collectPromise`，两个 collect 会拿到同一个快照对象；按快照记账时第二次调用会把第一次的 `true` 覆盖成 `false`，之后第一次 bail 直接 return，claim 留下而两份都没交付。按**调用**记账天然没有这个覆盖问题。
+   - `claimedNow === false` 时回滚是完整 no-op（连 `consumedByTool` 都不复位）：claim 存在即证明结果已交付，通知本就该被过滤。
+2. **它没有把通知路径交还。** 缝在 claim 之前就把 `consumedByTool` 置了位，而 watch 的闸门 `!consumedByTool && !notified` 在终态时读它。生产形状下每个 child 都被 watch（`followChild` 的 `watch: true`），快照 resolve 后**watch 的 continuation 先跑**、闸门已看到 `true` 而跳过 `onTerminal`；等 `collectChild` bail 时 watch 正停在 `retire` 的 await 里，`job.watching` 仍为 `true`。因此：
+   - **job 分支**的回滚必须复位 `job.consumedByTool = false` **并无条件** `runtime.watch(name)` 重挂 watch（不设 `!job.watching` 守卫 —— 该守卫会让整个修复变成死代码）。
+   - 安全性：`watch` 的 generation 自增让旧 watch 在 `finally` 处跳过 `release`（job 不被提前摘掉）；`notified` 保证同一轮不会二次 `onTerminal`；`deliverBatch` 的 claim 过滤是最后一张网。
+   - 复位只作用于**本次 collect 所属的那一轮**（`job.runId`/`job.round` 与快照 origin 相等），不碰 collect 期间被 re-track 出来的新一轮。
+   - **时序前提与 `waitOne` 的 `WAIT_INTERRUPTED` 分支不同**：wait 的 interrupt 赢在 collect promise resolve **之前**（watch 随后看到的是「标志已清 + job 还活着」），而本路径只可能发生在 resolve **之后**（闸门已过），所以只清标志不够，必须换一个 watch。
 
 ### D3 — 通知路径在投递前最后一刻查 claim
 

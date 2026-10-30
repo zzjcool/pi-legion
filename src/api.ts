@@ -189,6 +189,7 @@ export {
 // ── parent session: completion notify + input-box status ────────────────────
 export { createSessionRuntime, shouldRecycleAfterCollect } from "./extension/runtime.ts";
 export type {
+	ClaimedCollect,
 	CollectSnapshot,
 	SessionRuntime,
 	SessionRuntimeDeps,
