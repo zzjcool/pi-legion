@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import piLegion from "../../index.ts";
 import { RunStore } from "../../src/runs/store.ts";
+import { RUN_OWNER_FILE, writeOwnerFile } from "../../src/runs/owner.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
 import type { ChildRecord } from "../../src/shared/types.ts";
@@ -171,7 +172,15 @@ function indexHarness() {
 			const sessionFile = path.join(store.runDir(runId), `${name}.jsonl`);
 			writeDecoySession(sessionFile, output);
 			await store.addChild(runId, childStub({ name, state, sessionFile }));
-			return sessionFile;
+			return { runId, sessionFile };
+		},
+		/** The record one run holds for `name`, read back from `run.json`. */
+		childRecord(runId: string, name: string): ChildRecord | undefined {
+			return store.readRun(runId)?.children.find((candidate) => candidate.name === name);
+		},
+		/** Pin a run dir's ownership marker, so #209-3 evidence can be a fixture. */
+		writeOwnerMarker(runId: string, pid: number) {
+			writeOwnerFile(path.join(store.runDir(runId), RUN_OWNER_FILE), pid);
 		},
 		/** The run this session owns: the root legion run created by its first launch. */
 		sessionRunId(): string {
@@ -372,6 +381,120 @@ test("#312 runId: an explicit scope reaches the run the caller names", async () 
 		assert.doesNotMatch(status.text, /ambiguous/);
 		assert.match(status.text, new RegExp(`runs/${scoped}/worker-0\\.jsonl`));
 		assert.doesNotMatch(status.text, new RegExp(`runs/${other}/worker-0\\.jsonl`));
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#312 stop: retires the node it named, not another run's live child with that name", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		// The session's own worker-0 is finished and has no live job behind it, so
+		// `stop` resolves it from `run.json`. The decoy is LIVE and newer — exactly
+		// what the old execution-point re-resolution (`pickChildByName`: live first,
+		// then newest) preferred.
+		const own = await harness.addOwnChild("worker-0", "exited", '{"ok": false, "reason": "own-worker-0-failed"}');
+		const decoyRunId = await harness.decoyRun("worker-0", "working", '{"ok": true, "reason": "decoy-alive"}');
+
+		const stopped = await harness.invoke({ action: "stop", name: "worker-0" });
+		assert.notEqual(stopped.details?.error, ErrorCodes.NOT_FOUND);
+		assert.match(stopped.text, /Stopped 1 child/);
+		// The report and the retire agree: the session's own record is retired…
+		assert.equal(harness.childRecord(own.runId, "worker-0")?.state, "retired");
+		// …and the decoy is untouched. Reporting this session's node while retiring
+		// another run's live one is the whole finding.
+		assert.equal(harness.childRecord(decoyRunId, "worker-0")?.state, "working");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#312 stop: a scope that names another run does not retire this session's live child", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({ agent: "worker", task: "the live one", name: "worker-0", async: true, worktree: false });
+		const decoyRunId = await harness.decoyRun("worker-0", "exited", '{"ok": true, "reason": "decoy"}');
+
+		// The runtime's job table is keyed by NAME, so before the consistency check
+		// the live child answered a call scoped to a different run AND was retired.
+		const stopped = await harness.invoke({ action: "stop", name: "worker-0", runId: decoyRunId });
+		assert.equal(stopped.details?.error, ErrorCodes.NOT_FOUND);
+		assert.match(stopped.text, /ambiguous/);
+		assert.match(stopped.text, new RegExp(`run ${decoyRunId}`));
+		// The live node is named too, so the caller can see which run actually holds it.
+		assert.match(stopped.text, /node root\.worker-0/);
+		assert.match(stopped.text, /Pass `runId`/);
+		// Nothing was retired by the refusal — and the live child is still reachable
+		// without a scope, so the refusal did not orphan it.
+		assert.equal(harness.childRecord(decoyRunId, "worker-0")?.state, "exited");
+		const live = await harness.invoke({ action: "stop", name: "worker-0" });
+		assert.match(live.text, /Stopped 1 child/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#312 collect: an explicit runId collects that run's node, not a live same-named job", async () => {
+	const harness = indexHarness();
+	try {
+		// A live job of THIS session carries the name…
+		await harness.invoke({ agent: "worker", task: "the live one", name: "worker-0", async: true, worktree: false });
+		// …and the run the caller scopes to has its own worker-0 with its own result.
+		const scopedRunId = await harness.decoyRun("worker-0", "exited", '{"ok": true, "reason": "scoped-run-value"}');
+
+		const collected = await harness.invoke({ action: "collect", name: "worker-0", runId: scopedRunId });
+		assert.notEqual(collected.details?.error, ErrorCodes.NOT_FOUND);
+		assert.match(collected.text, /scoped-run-value/);
+		// The other node's snapshot must neither answer this call nor be persisted
+		// into the scoped run: `runtime.get(name)` is not `found.runId`.
+		assert.doesNotMatch(collected.text, /own-worker-0-ok/);
+		assert.match(collected.text, new RegExp(`runs/${scopedRunId}/`));
+		assert.doesNotMatch(collected.text, /runs\/[^/]+\/worker-0\.output\.md[\s\S]*own-worker-0-ok/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#312 status: the owner line comes from the resolved run, not a decoy's run dir", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		const own = await harness.addOwnChild("worker-0", "working", '{"ok": true, "reason": "own"}');
+		const decoyRunId = await harness.decoyRun("worker-0", "working", '{"ok": true, "reason": "decoy"}');
+		// Only the DECOY's run dir is owned by a pid that is gone (#209-3 marker).
+		// The session's own run dir is owned by this live process.
+		harness.writeOwnerMarker(decoyRunId, 999_999);
+
+		const status = await harness.invoke({ action: "status", name: "worker-0" });
+		assert.notEqual(status.details?.error, ErrorCodes.NOT_FOUND);
+		// The block shows the direct child, so it must also report ITS run dir…
+		assert.match(status.text, new RegExp(`runs/${own.runId}/worker-0\\.jsonl`));
+		// …and not the decoy's dead owner, which used to rewrite state=working to
+		// state=failed under the session's own record.
+		assert.match(status.text, /owner: live/);
+		assert.doesNotMatch(status.text, /owner: dead/);
+		assert.doesNotMatch(status.text, /state=failed/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#312 status: a cross-store record that IS this session's child carries no 'not a direct child' note", async () => {
+	const harness = indexHarness();
+	try {
+		await harness.invoke({ agent: "worker", task: "the real one", name: "worker-0", async: true, worktree: false });
+		// A call from another cwd cannot enumerate the session's store, so the
+		// record is found by the #270 cross-store lookup — i.e. it IS this session's
+		// own child. The annotation must not claim otherwise.
+		const elsewhere = path.join(harness.cwd, "elsewhere");
+		mkdirSync(elsewhere, { recursive: true });
+
+		const status = await harness.invoke({ action: "status", name: "worker-0", cwd: elsewhere });
+		assert.notEqual(status.details?.error, ErrorCodes.NOT_FOUND);
+		assert.match(status.text, /worker-0 — state=/);
+		assert.doesNotMatch(status.text, /not a direct child/);
+		assert.doesNotMatch(status.text, /resolved:/);
 	} finally {
 		await harness.cleanup();
 	}
