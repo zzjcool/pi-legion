@@ -35,6 +35,7 @@ import type {
 	SpawnInput,
 } from "../../src/supervisor/types.ts";
 import { currentPgid } from "../../src/supervisor/proc-tree.ts";
+import { ErrorCodes } from "../../src/shared/types.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import {
@@ -111,6 +112,22 @@ class FakeRpcClient implements RpcClientLike {
 	readonly prompts: string[] = [];
 	readonly steers: string[] = [];
 	readonly followUps: string[] = [];
+	/**
+	 * Raw value this fake's `steer` resolves with (#313). Deliberately the SDK's
+	 * own vocabulary — the real `RpcClient.steer()` returns the RPC reply's
+	 * `disposition`, i.e. `"handled" | "queued"` — so RpcSupervisor's mapping
+	 * through `toSteerDisposition` is exercised, not bypassed.
+	 */
+	steerDisposition: unknown = "queued";
+	/**
+	 * Raw value this fake's `prompt` resolves with (#313). The real
+	 * `RpcClient.prompt()` returns the RPC reply's `disposition`
+	 * (`dist/modes/rpc/rpc-client.js:135-137`: "If the disposition is 'handled',
+	 * no run started for this prompt"). A prompt that began a run answers
+	 * `"started"` (`dist/core/agent-session.js:1634` `preflightResult?.("started")`);
+	 * the default mirrors an older backend that reported nothing.
+	 */
+	promptDisposition: unknown = undefined;
 	starts = 0;
 	stops = 0;
 	aborts = 0;
@@ -145,13 +162,15 @@ class FakeRpcClient implements RpcClientLike {
 		return "";
 	}
 
-	async prompt(message: string): Promise<void> {
+	async prompt(message: string): Promise<unknown> {
 		this.prompts.push(message);
 		if (this.promptError) throw this.promptError;
+		return this.promptDisposition;
 	}
 
-	async steer(message: string): Promise<void> {
+	async steer(message: string): Promise<unknown> {
 		this.steers.push(message);
+		return this.steerDisposition;
 	}
 
 	async followUp(message: string): Promise<void> {
@@ -628,6 +647,155 @@ test("steer and follow-up target an active RPC turn without starting another pro
 	} finally {
 		await h.supervisor.retire("root.worker");
 		h.close();
+	}
+});
+
+test("steer returns the disposition mapped from the RPC client's raw answer (#313)", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const client = h.clients[0]!;
+
+		// The fake mirrors the SDK vocabulary, so the default is a raw "queued":
+		// a busy child + unnormalized answer must never be reported as delivery.
+		assert.equal(client.steerDisposition, "queued");
+		assert.equal(await h.supervisor.steer("root.worker", "default answer"), "queued");
+
+		// raw "handled" is the interception signal, not delivery: the text never
+		// reached `_queueSteer`, so the child never saw it.
+		client.steerDisposition = "handled";
+		assert.equal(await h.supervisor.steer("root.worker", "swallowed by a handler"), "intercepted");
+
+		// raw "queued" stays queued through the mapping; junk is doubt-shaped and
+		// must not become a delivery claim either.
+		client.steerDisposition = "queued";
+		assert.equal(await h.supervisor.steer("root.worker", "bank this"), "queued");
+		client.steerDisposition = {
+			unexpected: "shape",
+		};
+		assert.equal(await h.supervisor.steer("root.worker", "junk answer"), "queued");
+		assert.deepEqual(client.steers, [
+			"default answer",
+			"swallowed by a handler",
+			"bank this",
+			"junk answer",
+		]);
+		assert.equal(client.prompts.length, 1);
+
+		// A steer against an idle child starts a turn, so the prompt route answers.
+		client.promptDisposition = undefined;
+		emitSettled(client);
+		assert.equal(await h.supervisor.steer("root.worker", "fresh turn"), "accepted");
+		assert.deepEqual(client.prompts.slice(1), ["fresh turn"]);
+		assert.equal(client.steers.length, 4);
+
+		// The production client answers "started" for a prompt that began a run
+		// (`rpc-client.js:135-137` hands back the reply's disposition; the session's
+		// preflight reports `"started"` at `agent-session.js:1634`). That is
+		// `accepted`: a run did start, so it is neither queued nor intercepted.
+		client.promptDisposition = "started";
+		emitSettled(client);
+		assert.equal(await h.supervisor.steer("root.worker", "started turn"), "accepted");
+		assert.deepEqual(client.prompts.slice(2), ["started turn"]);
+		assert.equal(client.steers.length, 4);
+
+		// …and that prompt's own disposition is read, not assumed: the SDK says
+		// "handled" when no run started for the prompt.
+		client.promptDisposition = "handled";
+		emitSettled(client);
+		assert.equal(await h.supervisor.steer("root.worker", "prompt swallowed"), "intercepted");
+		assert.deepEqual(client.prompts.slice(3), ["prompt swallowed"]);
+		assert.equal(client.steers.length, 4, "an intercepted steer never reaches the steer command");
+		emitSettled(client);
+	} finally {
+		await h.supervisor.retire("root.worker");
+		h.close();
+	}
+});
+
+/**
+ * The supervisor's own turn bookkeeping, which no public surface exposes — and
+ * the only way to prove a turn claim was released rather than merely reported.
+ */
+function turnRecord(supervisor: RpcSupervisor, name: string) {
+	const children = (
+		supervisor as unknown as {
+			children: Map<string, { turnActive: boolean; state: string; lastTurnResult?: unknown }>;
+		}
+	).children;
+	return children.get(name);
+}
+
+test("a prompt intercepted before any run rolls the turn claim back (#313)", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const client = h.clients[0]!;
+		// Let the launch turn settle, so the next steer takes the prompt route.
+		emitSettled(client);
+		client.promptDisposition = "handled";
+
+		assert.equal(await h.supervisor.steer("root.worker", "swallowed by a handler"), "intercepted");
+
+		// "no run started" means the turn `beginTurn` claimed must be released:
+		// otherwise `agent_settled` never comes and the child stays busy forever.
+		const record = turnRecord(h.supervisor, "root.worker")!;
+		assert.equal(record.turnActive, false, "no run started, so no turn may stay claimed");
+		assert.equal(record.state, "idle", "an intercepted prompt does not leave the child running");
+
+		// A waiter sees the rollback immediately — not the 900s default timeout.
+		assert.deepEqual(await h.supervisor.waitSettled("root.worker", 1_000), {
+			settled: false,
+			abnormal: false,
+			reason: "prompt was intercepted before any run started",
+		});
+
+		// And the child is not stuck mute: the next send takes the prompt route again
+		// (a steer would only queue behind a turn that does not exist).
+		client.promptDisposition = undefined;
+		assert.equal(await h.supervisor.steer("root.worker", "try again"), "accepted");
+		assert.deepEqual(client.prompts.slice(-1), ["try again"]);
+		assert.equal(client.steers.length, 0, "no steer was issued after the rollback");
+		emitSettled(client);
+	} finally {
+		await h.supervisor.retire("root.worker").catch(() => {});
+		h.close();
+	}
+});
+
+test("a spawn whose launch prompt is intercepted fails instead of returning a busy handle (#313)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-supervisor-intercept-"));
+	const clients: FakeRpcClient[] = [];
+	const supervisor = new RpcSupervisor({
+		retireTimeoutMs: 100,
+		signalTimeoutMs: 100,
+		enumerateDescendants: () => [],
+		clientFactory: (options) => {
+			const client = new FakeRpcClient(options, 30_000 + clients.length);
+			// The child's input handler swallows its very first prompt.
+			client.promptDisposition = "handled";
+			clients.push(client);
+			return client;
+		},
+	});
+	try {
+		await assert.rejects(
+			() => supervisor.spawnChild(testInput(root)),
+			(error: unknown) => {
+				assert.ok(error instanceof Error);
+				assert.match(error.message, /intercepted by an input handler/);
+				assert.equal((error as { code?: string }).code, ErrorCodes.START_FAILED);
+				return true;
+			},
+		);
+
+		// No half-born handle may survive: nothing alive, no record to wait on.
+		assert.equal(supervisor.isAlive("root.worker"), false);
+		assert.equal(turnRecord(supervisor, "root.worker"), undefined, "the failed spawn leaves no record");
+		assert.equal(clients[0]?.stops, 1, "the failed spawn's client is stopped");
+		assert.deepEqual(readdirSync(root), [], "the failed spawn leaves no session file behind");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
 	}
 });
 

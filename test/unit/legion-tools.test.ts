@@ -323,6 +323,57 @@ test("postman injects active/retired-recipient mail, bounces terminal mail, and 
 	}
 });
 
+test("an intercepted steer-mail warns instead of pretending the child saw it (#313)", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-postman-intercepted-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const sessionFile = path.join(rootDir, "active.jsonl");
+	mkdirSync(rootDir, { recursive: true });
+	const now = 10;
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running" }, () => 2);
+		const active = insertNode(db, { parentId: "root.team", name: "active", role: "worker", status: "running", sessionFile }, () => 3);
+		await supervisor.spawnChild({ name: active.name, task: "active", agent: agent("worker"), sessionFile, tempDir: rootDir, cwd: rootDir });
+		// The child's input handler swallows the mail: it is never queued.
+		supervisor.steerDisposition = "intercepted";
+		const mail = sendMail(db, { fromNode: "root.team", to: "active", subject: "do now", body: "work", urgency: "action-needed" }, { now: () => now });
+		assert.equal(mail.ok, true);
+		const postman = new LegionPostman({
+			db,
+			nodeId: "root.team",
+			supervisor,
+			settings: { usagePollMs: 1 },
+			now: () => now,
+			intervalMs: 10_000,
+		});
+		console.warn = (message?: unknown) => { warnings.push(String(message)); };
+		await postman.tick();
+		postman.stop();
+
+		// The state machine is unchanged (#313 D3): the send returned, so the mail is
+		// INJECTED and will never be retried…
+		const injected = inbox(db, active.id, { delivery: MAIL_DELIVERY.INJECTED });
+		assert.equal(injected.length, 1);
+		assert.equal(pendingInbox(db, active.id).length, 0, "INJECTED promises no retry");
+		// …which is exactly why the swallowed case must be visible, not silent.
+		assert.equal(warnings.length, 1, `expected exactly one warning, got: ${warnings.join(" | ")}`);
+		assert.match(warnings[0]!, /was intercepted by an input handler/);
+		assert.match(warnings[0]!, /never saw it/);
+		assert.match(
+			warnings[0]!,
+			new RegExp(`mail ${injected[0]!.id} `),
+			"the warning names the message so a parent can act on it",
+		);
+	} finally {
+		console.warn = originalWarn;
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
 test("A5: a stale unsupervised running orphan is converged to failed with node_abandoned and still reported", async () => {
 	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-orphan-converge-"));
 	const db = openLegionDb(":memory:");

@@ -87,7 +87,7 @@
 interface LegionSupervisor {
   spawnChild(input: SpawnInput): Promise<ChildHandle>;   // RpcClient 启动 + 首个 prompt
   prompt(name: string, text: string): Promise<void>;
-  steer(name: string, text: string): Promise<void>;      // RPC steer：本轮工具后、下次 LLM 前送达
+  steer(name: string, text: string): Promise<SteerDisposition>;   // RPC steer：入队，回执三态之一（见下注）
   followUp(name: string, text: string): Promise<void>;   // 空闲后送达
   abort(name: string): Promise<void>;
   waitSettled(name: string, timeoutMs?: number): Promise<SettleResult>;  // 事件驱动，替代轮询
@@ -96,6 +96,26 @@ interface LegionSupervisor {
   retire(name: string, opts?: { graceful?: boolean }): Promise<void>;    // stdin close / SIGTERM
 }
 ```
+
+> **`SteerDisposition`（#313）**：`steer()` 返回**它到底做到了什么**，三态之一——`queued`（已入队，
+> 等子节点本轮工具批结束后的 turn 边界）、`accepted`（子节点当时空闲，这一调用为它起了一轮，模型仍需
+> 读）、`intercepted`（被 input handler 拦下，子节点从未看到）。**没有 `delivered`**：没有任何一层能
+> 观察到模型真的读了这段文本，出现这种宣称必是编造。SDK 依据：`AgentSession._queueUserInput` 在
+> `_queueSteer` **之前**就 `return "handled"`（`dist/core/agent-session.js:1694-1697`）；
+> `dist/modes/rpc/rpc-client.js:133` 同样注「disposition 为 `handled` 时这一 prompt 没有起任何一轮」。
+
+> **`steer` 的负语义（#313）**：§8.3 表格里 `steer` 那一行的「本轮工具后、下次 LLM 前送达」也是
+> **排队**语义，不是打断。
+> 工具调用执行期间子节点对 `steer` **不可达**——queue-only，没有自动打断，也没有 abort 后重投；
+> 一个卡在长命令里的子节点永远收不到 steer，文本只在它回到 turn 边界时才被消费。要真正停住子节点
+> 用 `stop`（`force: true` 是硬版本）。父侧还有**二级排队**：父自己正卡在
+> `await subagent({ action: "wait" })` 里时，用户的插话先变成**父自己的** steering 消息、同样等父的
+> turn 边界（SDK：`AgentSession.prompt` 在 streaming 期间按 `streamingBehavior` 走
+> `_queueSteer`/`_queueFollowUp`，`dist/core/agent-session.js:1549-1560`；`AgentSession.steer` 是同一
+> 条队列，`:1708-1717`）。Esc 能让父**立刻**回到 turn 边界并处理它；否则要等该 `wait` 自己结束
+> （返回或超时）才轮得到。而 Esc 只结束父的**这一轮**，**不回收**子节点：
+> `src/extension/runtime.ts:1596` 的 `esc-no-retire-v3` 注释、`index.ts` 的 `INTERRUPTED_HEAD`
+> （`interrupted (parent turn ended; children still running)`）、parent playbook 第 3 条。
 
 `SpawnInput` 承载现有 `buildPiArgs` 全套 flag（`--session`/`--model`/`--tools`/`--extension`/`--append-system-prompt`），经 `RpcClient` 构造参数 `{cliPath, cwd, env, args}` 传入。**M1 验收项 a** 即验证此承载。
 
@@ -325,6 +345,14 @@ npm test -- --filter <scope>
 | idle/settled 但进程在 | `prompt` | 直接开新 turn |
 | retired 且非终态 | **resume 后投递**（D9：`--session` 唤醒，首条消息即此信） | 邮件即召唤令 |
 | 终态（done/failed/aborted） | 退信（delivered=2）+ 回执邮件给发送方 | — |
+
+> **`steer` 行的负语义（#313）**：`steer` 只是排队——收件人正在跑工具调用时**收不到任何东西**，
+> 没有自动打断，也没有 abort 后重投，消息只在下一个 turn 边界被消费；投递方拿到的三态回执
+> （`queued`/`accepted`/`intercepted`）见 §3.1。父侧二级排队同理：父在
+> `await subagent({ action: "wait" })` 里时，用户插话先成为**父自己的** steering 消息、等父的 turn
+> 边界（SDK：`dist/core/agent-session.js:1549-1560` 的 streaming 排队路径）；Esc 能让父**立刻**回到
+> turn 边界并处理它，否则要等该 `wait` 自己结束（返回或超时）才轮得到。Esc 只结束父的这一轮，
+> **不回收**子节点（§3.1 注；`src/extension/runtime.ts:1596`；parent playbook 第 3 条）。
 
 根节点收件箱 → `pi.sendMessage` 注入（复用现有 notify 机制）。**异步无等待**：发送即返回；刻意不做同步请求-响应（两个 LLM 互等 = 死锁 + token 焚烧炉）。
 

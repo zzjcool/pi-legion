@@ -23,7 +23,7 @@ import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
-import type { LegionSupervisor } from "./src/supervisor/types.ts";
+import type { LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
 import {
@@ -2015,17 +2015,70 @@ function unknownChild(
 	);
 }
 
-/** Send a message to a running child without waiting for its reply. */
-async function steerChild(
+/**
+ * The parenthetical a queued steer carries (#313 D5).
+ *
+ * One constant on purpose: `steerReceipt` renders it for the `steer` tool and
+ * the revive/continue branch reuses it for a live child, so the queue wording
+ * exists exactly once.
+ */
+export const STEER_QUEUED_NOTE =
+	"queued — it takes effect after its current tool batch finishes";
+
+/** The same, for a steer an input handler swallowed before it was ever queued. */
+export const STEER_INTERCEPTED_NOTE =
+	"intercepted by an input handler — the child never saw it";
+
+/**
+ * Render the receipt for one accepted `steer` (#313 D5).
+ *
+ * The only place a steer receipt is built. The three dispositions are the only
+ * three things a caller can honestly claim, and there is no "delivered":
+ *
+ * - `queued`: Pi consumes a steer after the child's current tool batch finishes
+ *   and before its next LLM call, so a message sent into a running tool says
+ *   nothing about the model having seen it yet. Not an error, and it must not
+ *   read like one — but it must not read as success either.
+ * - `accepted`: the child was idle, so this call started a turn with the text.
+ *   The model still has to read it; this only says the session took the turn.
+ * - `intercepted`: an input handler ate the text before the queue. The child
+ *   never sees it, so the receipt must not open with "Steered".
+ */
+export function steerReceipt(
+	name: string,
+	disposition: SteerDisposition,
+): string {
+	if (disposition === "intercepted") {
+		return `Steer ${name} was ${STEER_INTERCEPTED_NOTE}`;
+	}
+	if (disposition === "accepted") {
+		return `Steered ${name} (a turn was started with it)`;
+	}
+	return `Steered ${name} (${STEER_QUEUED_NOTE})`;
+}
+
+/**
+ * Send a message to a running child without waiting for its reply.
+ *
+ * Exported so `test/unit/steer-receipt.test.ts` can drive the receipt end to
+ * end (same reason as `waitAction`/`stopAction`).
+ */
+export async function steerChild(
 	ctx: ChildContext,
 ): Promise<AgentToolResult<unknown>> {
 	if (!ctx.params.message) {
 		return fail("`message` is required for steer.", ErrorCodes.INVALID_PARAMS);
 	}
 	try {
-		await ctx.orchestrator.steer(ctx.name, ctx.params.message);
+		// Await into a local so the existing `followChild` call keeps its place
+		// between the steer and the receipt; the receipt itself is still
+		// `ok(steerReceipt(...))` with the disposition this steer reported.
+		const disposition = await ctx.orchestrator.steer(
+			ctx.name,
+			ctx.params.message,
+		);
 		followChild(ctx, { watch: true });
-		return ok(`Steered ${ctx.name}.`);
+		return ok(steerReceipt(ctx.name, disposition));
 	} catch (error) {
 		return fail(`steer failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
 	}
@@ -2318,11 +2371,19 @@ async function reviveChild(
 
 	try {
 		if (supervisor.isAlive(name)) {
-			await orchestrator.steer(name, params.message);
+			// #313 D5: this branch steers a live child too, so it reports the same
+			// three outcomes as `steerChild`, reusing the receipt notes rather than
+			// writing a second copy of the wording.
+			const disposition = await orchestrator.steer(name, params.message);
 			followChild(ctx, { watch: true });
-			return ok(
-				`${action === "resume" ? "Resumed" : "Continued"} ${name} (live child steered).`,
-			);
+			const prefix = `${action === "resume" ? "Resumed" : "Continued"} ${name}`;
+			if (disposition === "intercepted") {
+				return ok(`${prefix}, but the steer was ${STEER_INTERCEPTED_NOTE}.`);
+			}
+			if (disposition === "queued") {
+				return ok(`${prefix} (live child steered — ${STEER_QUEUED_NOTE}).`);
+			}
+			return ok(`${prefix} (live child steered).`);
 		}
 
 		const handle = await orchestrator.launch({

@@ -74,7 +74,7 @@ import {
 import { type ChildLaunchContext, currentChildContext, runInChildContext } from "../supervisor/child-context.ts";
 import { inProcessDepth, runAtAbsoluteDepth } from "../supervisor/inprocess-depth.ts";
 import { subscribeInProcessSlotReleases } from "../supervisor/routing-supervisor.ts";
-import type { LegionSupervisor, SettleResult, SpawnInput } from "../supervisor/types.ts";
+import type { LegionSupervisor, SettleResult, SpawnInput, SteerDisposition } from "../supervisor/types.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
 import {
@@ -2014,12 +2014,22 @@ export class Orchestrator {
 		return child;
 	}
 
-	async steer(name: string, text: string): Promise<void> {
+	/**
+	 * Steer a running child and pass the supervisor's disposition back (#313).
+	 *
+	 * The receipt layer must be able to say whether the message was queued behind
+	 * the child's tool batch, accepted as a turn this call started, or intercepted
+	 * by an input handler (the child never saw it), so this value is returned, not
+	 * swallowed. Every side effect of a steer (process event, unblocking) stays
+	 * exactly as it was.
+	 */
+	async steer(name: string, text: string): Promise<SteerDisposition> {
 		const child = this.requireChild(name);
 		this.refuseQueuedControl(name);
-		await this.supervisor.steer(name, text);
+		const disposition = await this.supervisor.steer(name, text);
 		this.emitProcess("node_steered", child.nodeId ?? name, { name, text });
 		this.clearBlocked(child);
+		return disposition;
 	}
 
 	async followUp(name: string, text: string): Promise<void> {

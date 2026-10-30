@@ -31,6 +31,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { statSync, writeFileSync } from "node:fs";
 
+/** Raw answer from the SDK's `AgentSession.steer()` (#313): `"handled"` | `"queued"`. */
+type RawSteerDisposition = "queued" | "handled";
+
 class FakeSession implements InProcessSession {
 	readonly listeners = new Set<(event: unknown) => void>();
 	readonly prompts: string[] = [];
@@ -38,6 +41,17 @@ class FakeSession implements InProcessSession {
 	readonly followUps: string[] = [];
 	aborts = 0;
 	disposed = false;
+	/**
+	 * Raw answer `steer()` resolves with (#313).
+	 *
+	 * The real `AgentSession.steer()` returns `"queued"` unconditionally — a
+	 * steer is banked whether or not a tool batch happens to be in flight
+	 * (`dist/core/agent-session.js:1698-1711`). `"handled"` is *not* "taken
+	 * now": it means an input handler swallowed the text before `_queueSteer`
+	 * ran, so the child never sees it. A case that wants that path flips this
+	 * field explicitly; the default is what the SDK really answers.
+	 */
+	steerDisposition: RawSteerDisposition = "queued";
 
 	subscribe(listener: (event: unknown) => void): () => void {
 		this.listeners.add(listener);
@@ -50,8 +64,9 @@ class FakeSession implements InProcessSession {
 		this.emit({ type: "turn_start" });
 	}
 
-	async steer(text: string): Promise<void> {
+	async steer(text: string): Promise<RawSteerDisposition> {
 		this.steers.push(text);
+		return this.steerDisposition;
 	}
 
 	async followUp(text: string): Promise<void> {
@@ -679,9 +694,9 @@ test("inprocess: later dispatches reuse the child's context", async () => {
 			seen.push(`prompt:${currentChildContext()?.nodeId}`);
 			await super.prompt(text);
 		}
-		override async steer(text: string): Promise<void> {
+		override async steer(text: string): Promise<RawSteerDisposition> {
 			seen.push(`steer:${currentChildContext()?.nodeId}`);
-			await super.steer(text);
+			return super.steer(text);
 		}
 		override async followUp(text: string): Promise<void> {
 			seen.push(`followUp:${currentChildContext()?.nodeId}`);
@@ -712,6 +727,56 @@ test("inprocess: later dispatches reuse the child's context", async () => {
 		assert.equal(currentChildContext(), undefined);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── #313: a steer reports what happened — queued, accepted or intercepted ──
+
+test("inprocess: a steer reports the session's own answer (#313)", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const session = h.sessions[0]!;
+
+		// The child is inside its first turn, so a steer takes the queue branch.
+		// The real session still answers "queued": queued is all it ever says,
+		// independent of whether a tool batch happens to be in flight.
+		assert.equal(session.steerDisposition, "queued");
+		assert.equal(await h.supervisor.steer("root.worker", "first correction"), "queued");
+		assert.deepEqual(session.steers, ["first correction"], "the text reached the session's steer seam");
+		assert.equal(session.prompts.length, 1, "a steer never starts a second prompt while the turn runs");
+
+		// "handled" is the SDK's interception signal: an input handler swallowed the
+		// text before `_queueSteer`, so the child never sees it. Reporting that as
+		// steered/delivered would be the inverse lie.
+		session.steerDisposition = "handled";
+		assert.equal(await h.supervisor.steer("root.worker", "swallowed by a handler"), "intercepted");
+		assert.deepEqual(session.steers, ["first correction", "swallowed by a handler"]);
+
+		// Back to the SDK's real answer: queued, never a delivery claim.
+		session.steerDisposition = "queued";
+		assert.equal(await h.supervisor.steer("root.worker", "third correction"), "queued");
+	} finally {
+		h.close();
+	}
+});
+
+test("inprocess: a steer on an idle child starts a turn and reports accepted (#313)", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const session = h.sessions[0]!;
+		// Let the first turn settle: `turnActive` turns false only on `agent_settled`.
+		session.settle();
+
+		// With no turn running, `steer` degrades to `session.prompt`
+		// (inprocess-supervisor.ts:1323-1328). The session accepted a fresh turn,
+		// nothing was intercepted, and nothing was queued behind a tool batch.
+		assert.equal(await h.supervisor.steer("root.worker", "start a turn with this"), "accepted");
+		assert.deepEqual(session.prompts.slice(1), ["start a turn with this"]);
+		assert.deepEqual(session.steers, [], "no queue to steer into: the prompt path is what ran");
+	} finally {
+		h.close();
 	}
 });
 
@@ -902,9 +967,9 @@ test("inprocess: mutating the caller's context template does not affect a spawne
 			seen.push(currentChildContext()?.nodeId);
 			await super.prompt(text);
 		}
-		override async steer(text: string): Promise<void> {
+		override async steer(text: string): Promise<RawSteerDisposition> {
 			seen.push(currentChildContext()?.nodeId);
-			await super.steer(text);
+			return super.steer(text);
 		}
 	}
 	const supervisor = new InProcessSupervisor({
