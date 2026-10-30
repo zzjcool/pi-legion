@@ -8,7 +8,7 @@ import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAI
 import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
 import { buildLog, chartWindow, computeStats, drawLog, drawStatus, frame, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
-import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, MIN_SELECTION_BADGE_W, renderLegionView } from "../../src/tui/viz/view.ts";
+import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, LEGION_PAGE_BG, MIN_SELECTION_BADGE_W, paintPageFloor, renderLegionView } from "../../src/tui/viz/view.ts";
 import { Canvas, cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, formatActivityAgo, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
 
@@ -596,6 +596,50 @@ test("legion view: root is not listed as an agent type and the factory fills the
 	const component = factory({ requestRender() {}, terminal: { rows: 37 } }, plainTheme, undefined, () => {});
 	assert.equal(component.render(100).length, 37);
 	component.dispose();
+});
+
+test("viz #308: the /legion page floor is painted only when the theme has a bg token", () => {
+	// The floor is `theme.bg?.(LEGION_PAGE_BG, line)` on every row. Three constraints
+	// pin it: a theme without `bg` must render byte-identical output (it must not
+	// invent a trailing escape), the token must stay one of the seven `ThemeBg`
+	// keys (`theme.bg` throws `Unknown theme color` for anything else), and the
+	// wrap must not change a row's visible width.
+	assert.equal(LEGION_PAGE_BG, "toolPendingBg");
+	assert.deepEqual(paintPageFloor(plainTheme, ["a b", "  "]), ["a b", "  "], "no bg token ⇒ untouched bytes");
+	assert.deepEqual(paintPageFloor(ansiTheme, ["a"]), ["a"], "no bg token ⇒ untouched bytes (ansi theme)");
+
+	const { nodes, sampler, now } = scenario();
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	const factory = createLegionViewFactory({ getData: () => data });
+	const plain = factory({ requestRender() {}, terminal: { rows: 24 } }, plainTheme, undefined, () => {});
+	const ansi = factory({ requestRender() {}, terminal: { rows: 24 } }, ansiTheme, undefined, () => {});
+	const keys: string[] = [];
+	const bgTheme = {
+		...ansiTheme,
+		bg: (key: string, text: string): string => {
+			keys.push(key);
+			return `\x1b[48;5;236m${text}\x1b[49m`;
+		},
+	};
+	const floored = factory({ requestRender() {}, terminal: { rows: 24 } }, bgTheme, undefined, () => {});
+	try {
+		// Byte-identical to the un-wrapped render for a theme that ships no bg.
+		assert.deepEqual(ansi.render(80), renderLegionView(data, initialViewState(), 80, 24).canvas.toLines(ansiTheme));
+		assert.ok(plain.render(80).every((line) => !line.includes("\x1b[48")), "no bg ⇒ no background escape");
+		// Every row wrapped exactly once, in the page-floor token, width untouched.
+		const flooredLines = floored.render(80);
+		assert.equal(flooredLines.length, 24);
+		assert.deepEqual([...new Set(keys)], [LEGION_PAGE_BG], "only the ThemeBg page-floor token is used");
+		for (const line of flooredLines) {
+			assert.ok(line.startsWith("\x1b[48;5;236m"), `row must open with the floor: ${JSON.stringify(line.slice(0, 24))}`);
+			assert.ok(line.endsWith("\x1b[49m"), `row must close the floor: ${JSON.stringify(line.slice(-16))}`);
+			assert.equal(visibleWidth(line), 80, "row width is unchanged (the floor is zero-width escapes)");
+		}
+	} finally {
+		plain.dispose();
+		ansi.dispose();
+		floored.dispose();
+	}
 });
 
 test("galaxy legend: running scouts omit failed/retired status glyphs", () => {

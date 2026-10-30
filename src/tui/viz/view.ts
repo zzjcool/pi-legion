@@ -61,6 +61,42 @@ export function availablePanes(layout: LegionLayout): Pane[] {
 /** Min grapheme cells before painting a selection badge. Shared by portrait + landscape so a truncated stub never paints (#128). Was portrait `>4` vs landscape `>0`. */
 export const MIN_SELECTION_BADGE_W = 5;
 
+/**
+ * #308: the `ThemeBg` token used as the /legion page floor.
+ *
+ * `toolPendingBg` is the only one of the seven `ThemeBg` keys that is a **neutral
+ * surface** rather than a hued panel: dark theme `okhsl(229 5% 24%)`, light theme
+ * `okhsl(248 3% 91%)`, and the `system` theme's `neutral` family — a lifted grey
+ * with no hue identity, which is what a page background is. The alternatives all
+ * carry a color story that would paint the whole page: `selectedBg` /
+ * `userMessageBg` are blue (`blueBg` in both built-in themes), `customMessageBg`
+ * violet, `searchMatchBg` yellow (a highlight), `toolSuccessBg` / `toolErrorBg`
+ * green / red. The trade-off is brightness, not hue: `toolPendingBg` sits ~8 points
+ * lighter than the theme's export-only `pageBg` (`okhsl(262 14% 16%)` dark), which
+ * is the token the upstream theme package does not expose as a renderable color.
+ * The contract (`docs/contracts/legion-page-floor-v1.md`) records the consequence
+ * for the `system` theme, where every `ThemeBg` key renders as `\x1b[49m`.
+ */
+export const LEGION_PAGE_BG = "toolPendingBg";
+
+/**
+ * #308: wrap every /legion row in the page floor.
+ *
+ * pi-tui's overlay compositor inherits styling for the rectangle *beside* an
+ * overlay from a one-shot snapshot of the SGR state active at the first grapheme
+ * after the rect (`extractSegments`). A /legion row ends in plain spaces with no
+ * SGR at all, so that snapshot is empty and the gutter right of the floating
+ * modal fell back to the terminal's default background — a black band on the
+ * right of the frame (#308). Painting the floor on the whole row makes the
+ * inherited state the page background instead.
+ *
+ * `theme.bg` is optional on purpose: a theme that ships no background tokens
+ * (every unit-test fake) gets today's bytes, unchanged.
+ */
+export function paintPageFloor(theme: VizTheme, lines: readonly string[]): string[] {
+	return lines.map((line) => theme.bg?.(LEGION_PAGE_BG, line) ?? line);
+}
+
 export function renderLegionView(data: ViewData, state: LegionViewState, cols: number, rows: number): { canvas: Canvas; layout: LayoutKind } {
 	const W = Math.max(1, Math.floor(cols));
 	const H = Math.max(6, Math.floor(rows));
@@ -353,7 +389,7 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 				// Rendered as a full-screen overlay: own the whole terminal height.
 				const rows = Math.max(6, tui.terminal.rows ?? 24);
 				panes = availablePanes(computeLayout(width, rows));
-				return renderLegionView(options.getData(), state, width, rows).canvas.toLines(theme);
+				return paintPageFloor(theme, renderLegionView(options.getData(), state, width, rows).canvas.toLines(theme));
 			},
 			handleInput(data: string): void {
 				const action = handleViewKey(

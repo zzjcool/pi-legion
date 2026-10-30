@@ -131,6 +131,27 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **The `/legion` track view now paints its own page background, so the detail modal no longer sits
+  on a black vertical stripe (#308).** Opening a node's context viewer put a pure-black band between
+  the frame's right edge and the terminal's right edge (the left side looked fine). The frame was not
+  overflowing — `paintModalFrame` emits exactly the rect width every row. The base row was: the canvas
+  pre-fills `W×H` spaces and `renderRow` only styles a run when it has a color *and* non-blank text, so
+  a row ends in bare spaces with no SGR at all. pi-tui's compositor inherits the styling of the area
+  *beside* an overlay from a one-shot snapshot of the active SGR at the first grapheme after the rect
+  (`extractSegments`), and an empty snapshot means the terminal's default background. Every `/legion`
+  row is now wrapped in `theme.bg?.(LEGION_PAGE_BG, line)` at the view's single render exit
+  (`paintPageFloor` in `src/tui/viz/view.ts`), so the inherited state is the page floor. `theme.bg` is
+  optional in `VizTheme` and the call is optional, so a theme without background tokens (every unit-test
+  fake) still renders the exact bytes it did before, and the row width is unchanged (the wrap is
+  zero-width escapes only). The token is `toolPendingBg` — the only one of the seven `ThemeBg` keys that
+  is a neutral surface rather than a hued panel (blue / violet / yellow / green / red for the rest).
+  **Not fixed in the `system` theme:** with no terminal color report that theme assigns `""` to all
+  seven `ThemeBg` keys, so each renders as `\x1b[49m` (terminal default) and the band stays black —
+  upstream exposes no renderable page-background token. The new regression test keeps ANSI (the #193
+  `wipedRows` criterion strips escapes, which is why it never caught this) and compares the background
+  SGR of both gutters with the base's own: no fix ⇒ every gutter snapshot is `""`. Contract:
+  `docs/contracts/legion-page-floor-v1.md`.
+
 - **The five-value mailbox delivery landed against an adversarial review: four majors and six minors
   (#338, follow-up to #322/#333).** The important ones were silent: mail addressed to **root** could never
   be confirmed — `nodes.session_file` was written only on the child path (`reserveNode`), so every
