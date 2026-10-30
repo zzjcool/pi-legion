@@ -11,6 +11,7 @@ yarn.lock
 *.tgz
 
 # run artifacts produced by the plugin itself
+.pi-reports/
 .pi-subagents/
 
 # local scratch
