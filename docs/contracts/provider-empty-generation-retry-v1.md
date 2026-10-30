@@ -76,21 +76,42 @@ export function isEmptyGeneration(parsed: Pick<ParsedSession, "turns">): boolean
 
 动作：
 
-1. `await supervisor.prompt(name, CONTINUE_PROMPT)`，`CONTINUE_PROMPT` 逐字为
+1. `await supervisor.steer(name, CONTINUE_PROMPT)`（review round 1：`prompt` 返回 `void`，
+   丢掉了 `dispatch()` 算好的 `SteerDisposition`，无法区分「已送达」与「被 input handler 吞掉」。
+   `steer` 对 idle child 与 `prompt` 等价——两个 supervisor 在 `!turnActive` 时都走 `session.prompt`
+   并返回 `"accepted"`——但会把 disposition 交回来），`CONTINUE_PROMPT` 逐字为
    `Your previous turn ended with no output. Continue from where you left off; do not restart the task.`
    （child 仍在同一会话里持有原任务上下文，所以是 continue 不是 restart）；
-2. `providerRetriesUsed += 1`（**仅在 prompt 被接受之后**计费；prompt 抛错说明 child 已死，
-   原判与预算都不动）；
+2. 预算在 `await` 之前**乐观占位**：`providerRetriesUsed += 1` 与 gate 读取相邻且同步执行
+   （否则并发 collect 可各读一次 0、各发一轮 prompt、计到 2，见 review round 1 minor 5）；
+   发送抛错、或 `disposition === "intercepted"`（文本被 input handler 吞掉、child 根本没看到，
+   `abandonTurn` 已回滚）时**退回**该次占位：原判不变、不写 note，并按
+   `src/extension/legion-tools.ts` 处理被吞 mail 的方式留一条 `console.warn`；
 3. 复用 `waitSettled`（经 `awaitSupervisor`，因此仍会尊重 abort 与 UI 阻塞）等这一轮 settle；
-4. 重 `parseSessionFile` + 重 `deriveOutcome`。
+4. 重 `parseSessionFile`，然后走**与首轮完全同一个** outcome 阶梯（`classifyOutcome`：
+   (a) connection blip 持有、(b) `gone` + 空 transcript 的 abort、(c) `parentShutdownRetire` 归因、
+   (d) 活 child 的 `timeout` → `running` 快照），不得只抄其中几条
+   （review round 1 major 1：重试轮以 `Connection error.` 结束——空文本 + `stopReason: error`，
+   同时满足 `isEmptyGeneration`——曾被判 `failed` 并让 `shouldRecycleAfterCollect("failed")`
+   把活 child 回收，而同一消息出现在首轮时是 `running` 持有）。
 
 不变量：
 
-- **只重试一次**：计数器在 `ChildRecord` 上，跨 collect（乃至跨进程 `restore`）保持；
+- **只重试一次**：计数器在 `ChildRecord` 上，**跨 collect（同进程内）**保持；
+  `ChildRecord` 不落盘（无 store 形状可写），进程重启后从 0 开始——重启即新进程、新预算，
+  本契约不声称、也不实现跨进程持久化（review round 1 minor 6）；
 - 不得 `recordSettled` 两次、不得写两份 `.output.md`：重试发生在 `finishCollect` 之前，
   终局只经过那一个出口；
-- 重试轮的 settle 若是 `timeout` 且 child 仍活着、最后一轮尚未完成，则沿用既有的
-  `running` + `COLLECT_DEADLINE_REASON` 快照（不把"还在生成"说成 abort 或 failed）；
+- 重试轮的 settle 若是 `timeout` 且 child 仍活着，则沿用既有的
+  `running` + `COLLECT_DEADLINE_REASON` 快照（不把"还在生成"说成 abort 或 failed）。
+  「活 child + `timeout`」本身就是"这一轮没结束"的充要信号，**不再**额外要求
+  "最后一轮尚无 assistant 记录"——prompt 被接受后 transcript 可能仍停在上一轮
+  （review round 1 minor 3）；
+- D4 的 `(provider returned an empty generation; retried once)` 在**终局处**（`finishCollect`
+  入口）按 `providerRetriesUsed > 0 && failed && errorKind === "provider-empty-generation"`
+  补齐且幂等，而不是只在重试自己那次 collect 里拼：重试等待返回 `running`、之后才以空生成
+  结束时，下一次 collect 因预算已用跳过重试，父级仍能分清"重试过仍失败"与"首次失败"
+  （review round 1 minor 4）；
 - `renewalsUsed` 一行都不动（见 §5）。
 
 ---

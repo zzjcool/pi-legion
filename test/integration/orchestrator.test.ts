@@ -7,6 +7,7 @@ import { COLLECT_DEADLINE_REASON, CONTINUE_PROMPT, Orchestrator, preCreateSessio
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor, type FakeTurn } from "../helpers/fake-supervisor.ts";
 import { RunStore } from "../../src/runs/store.ts";
+import { shouldRecycleAfterCollect } from "../../src/extension/runtime.ts";
 import { assistantMsg, userMsg } from "../helpers/fixtures.ts";
 
 function agent(over: Partial<AgentConfig> = {}): AgentConfig {
@@ -669,30 +670,60 @@ test("collect: a dead child mid-turn keeps its aborted outcome instead of a dead
 /** The in-band failure message pi writes when a provider ends the stream empty. */
 const EMPTY_GENERATION_MESSAGE = "Provider finish_reason: error";
 
-/** Answer the next `prompt` the way a provider would: settle the turn it starts. */
-function settleOnPrompt(supervisor: FakeSupervisor, turn: FakeTurn): void {
-	const original = supervisor.prompt.bind(supervisor);
-	supervisor.prompt = async (name: string, text: string) => {
-		await original(name, text);
-		supervisor.settle(name, turn);
+/**
+ * Answer the next send the way a provider would: settle the turn it starts.
+ *
+ * Both seams are patched: the retry goes out over `steer` (it needs the
+ * disposition), while every other caller still uses `prompt`. Settling INSIDE
+ * the send is also what used to hide the interesting shapes — a retry whose turn
+ * never ends, or one nobody ever saw — so those are driven by
+ * `acceptRetryWithoutTranscript` and `steerDisposition` instead.
+ */
+function settleOnSend(supervisor: FakeSupervisor, turn: FakeTurn): void {
+	const settleAfter = <T>(original: (name: string, text: string) => Promise<T>) =>
+		async (name: string, text: string): Promise<T> => {
+			const result = await original(name, text);
+			supervisor.settle(name, turn);
+			return result;
+		};
+	supervisor.prompt = settleAfter(supervisor.prompt.bind(supervisor));
+	supervisor.steer = settleAfter(supervisor.steer.bind(supervisor));
+}
+
+/**
+ * Accept the retry without writing anything to the transcript.
+ *
+ * Real shape: the child took the prompt at a turn boundary but has not flushed
+ * its new turn yet, and the wait expires. The transcript therefore still ends on
+ * the FAILED turn that triggered the retry — the case where reading
+ * "last turn is complete" as a verdict turned a working child terminal.
+ */
+function acceptRetryWithoutTranscript(supervisor: FakeSupervisor): void {
+	supervisor.steer = async (name: string, text: string) => {
+		supervisor.calls.push({ method: "steer", name, text });
+		const child = supervisor.children.get(name);
+		// The previous turn's `settled` receipt must not be mistaken for the new one.
+		if (child) child.settleResult = undefined;
+		return "accepted";
 	};
 }
 
-const prompts = (supervisor: FakeSupervisor) => supervisor.calls.filter((call) => call.method === "prompt");
+/** Every retry the orchestrator actually sent — it uses `steer`, never `prompt`. */
+const retries = (supervisor: FakeSupervisor) => supervisor.calls.filter((call) => call.method === "steer");
 
-test("#316 D2: a retried empty generation returns the retry's success and costs one prompt", async () => {
+test("#316 D2: a retried empty generation returns the retry's success and costs one retry", async () => {
 	const h = harness({ immediateTimeout: false });
 	try {
 		const handle = await h.orchestrator.launch({ agent: agent(), task: "recover from an empty turn", worktree: false });
-		settleOnPrompt(h.supervisor, { text: '{"ok":true}', stopReason: "stop" });
+		settleOnSend(h.supervisor, { text: '{"ok":true}', stopReason: "stop" });
 		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
 		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 5_000 });
 
 		assert.equal(collected.execution.status, "success");
 		assert.equal(collected.execution.errorKind, undefined, "a recovered child is not tagged as a provider failure");
 		assert.equal(collected.output, '{"ok":true}');
-		assert.equal(prompts(h.supervisor).length, 1, "exactly one retry prompt");
-		assert.equal(prompts(h.supervisor)[0]?.text, CONTINUE_PROMPT);
+		assert.equal(retries(h.supervisor).length, 1, "exactly one retry send");
+		assert.equal(retries(h.supervisor)[0]?.text, CONTINUE_PROMPT);
 		assert.equal(CONTINUE_PROMPT, "Your previous turn ended with no output. Continue from where you left off; do not restart the task.");
 		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, 1);
 		// One artifact, holding the retried turn — not two files, nor the empty turn.
@@ -708,20 +739,20 @@ test("#316 D2: a retry that also comes back empty fails once, says so, and is ne
 	const h = harness({ immediateTimeout: false });
 	try {
 		const handle = await h.orchestrator.launch({ agent: agent(), task: "fail twice", worktree: false });
-		settleOnPrompt(h.supervisor, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		settleOnSend(h.supervisor, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
 		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
 		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 5_000 });
 
 		assert.equal(collected.execution.status, "failed");
 		assert.equal(collected.execution.errorKind, "provider-empty-generation");
 		assert.match(collected.execution.reason ?? "", /retried once/);
-		assert.equal(prompts(h.supervisor).length, 1, "the limit is one, not a loop");
+		assert.equal(retries(h.supervisor).length, 1, "the limit is one, not a loop");
 		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, 1);
 
 		// The budget is on the child record, so a later collect does not spend it again.
 		const again = await h.orchestrator.collect(handle.name, { timeoutMs: 5_000 });
 		assert.equal(again.execution.status, "failed");
-		assert.equal(prompts(h.supervisor).length, 1, "a collect cannot resurrect the retry budget");
+		assert.equal(retries(h.supervisor).length, 1, "a collect cannot resurrect the retry budget");
 	} finally {
 		h.cleanup();
 	}
@@ -736,7 +767,7 @@ test("#316 D2: a failure that produced output is final and never re-prompted", a
 
 		assert.equal(collected.execution.status, "failed");
 		assert.equal(collected.execution.errorKind, undefined);
-		assert.equal(prompts(h.supervisor).length, 0, "only an EMPTY generation is worth another prompt");
+		assert.equal(retries(h.supervisor).length, 0, "only an EMPTY generation is worth another prompt");
 		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, undefined);
 	} finally {
 		h.cleanup();
@@ -754,7 +785,7 @@ test("#316 D2: a dead child is never re-prompted for an empty generation", async
 		assert.equal(collected.execution.status, "failed");
 		assert.equal(collected.execution.errorKind, "provider-empty-generation", "the verdict still names the failure class");
 		assert.doesNotMatch(collected.execution.reason ?? "", /retried once/, "nothing was retried, so nothing may claim it was");
-		assert.equal(prompts(h.supervisor).length, 0, "a dead child cannot take another prompt");
+		assert.equal(retries(h.supervisor).length, 0, "a dead child cannot take another prompt");
 	} finally {
 		h.cleanup();
 	}
@@ -771,8 +802,106 @@ test("#316 D2: an aborted parent turn never retries, even an empty generation", 
 
 		assert.equal(collected.execution.status, "running");
 		assert.equal(collected.execution.reason, "aborted by parent");
-		assert.equal(prompts(h.supervisor).length, 0, "an interrupted collect must not start a new turn");
+		assert.equal(retries(h.supervisor).length, 0, "an interrupted collect must not start a new turn");
 		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, undefined);
+	} finally {
+		h.cleanup();
+	}
+});
+
+// ── #316 review round 1: the retry obeys the same rules as a first turn ──────
+
+test("#316 review: a retry that ends in a Connection error leaves the child running, never retired", async () => {
+	const h = harness({ immediateTimeout: false });
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "blip on the retry", worktree: false });
+		// The retried turn ends in the SDK's connection blip: blank text with
+		// stopReason "error" — which ALSO satisfies `isEmptyGeneration`. The
+		// first-turn path holds exactly this message as `running` (see "a settled
+		// Connection error on a live child waits, then stays running"); the retry
+		// must not classify it worse and turn a live child terminal.
+		settleOnSend(h.supervisor, { text: "", stopReason: "error", errorMessage: "Connection error." });
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 5_000 });
+
+		assert.equal(retries(h.supervisor).length, 1, "the empty first turn is retried once");
+		assert.equal(collected.execution.status, "running", "a live child on a connection blip is working, not failed");
+		assert.equal(collected.execution.reason, TRANSIENT_CONNECTION_REASON);
+		assert.equal(shouldRecycleAfterCollect(collected.execution.status), false, "watch() must not recycle a live child");
+		assert.equal(h.supervisor.calls.filter((call) => call.method === "retire").length, 0, "nothing retires the child");
+		assert.equal(h.supervisor.isAlive(handle.name), true);
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, 1);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#316 review: an intercepted retry is not charged, keeps the verdict, and says so", async () => {
+	const h = harness();
+	const warnings: string[] = [];
+	const realWarn = console.warn;
+	console.warn = (...args: unknown[]) => { warnings.push(args.map((arg) => String(arg)).join(" ")); };
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "retry swallowed by an input handler", worktree: false });
+		// The prompt never landed: an input handler ate it and `abandonTurn` rolled
+		// the turn claim back. Charging the budget here would burn the child's only
+		// retry and tell the parent it was retried when nothing was sent.
+		h.supervisor.steerDisposition = "intercepted";
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 50 });
+
+		assert.equal(retries(h.supervisor).length, 1, "the retry was attempted, once");
+		assert.equal(collected.execution.status, "failed", "an intercepted prompt retried nothing, so the original verdict stands");
+		assert.equal(collected.execution.errorKind, "provider-empty-generation");
+		assert.doesNotMatch(collected.execution.reason ?? "", /retried once/, "nothing landed, so nothing may claim a retry");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed ?? 0, 0, "the claimed budget was refunded");
+		assert.equal(
+			warnings.some((line) => /intercepted/.test(line)),
+			true,
+			"an interception that silently keeps the budget invisible reads as a delivered retry",
+		);
+	} finally {
+		console.warn = realWarn;
+		h.cleanup();
+	}
+});
+
+test("#316 review: a retry that has not ended is running even while the transcript still shows the failure", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "retry in flight", worktree: false });
+		acceptRetryWithoutTranscript(h.supervisor);
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 50 });
+
+		assert.equal(retries(h.supervisor).length, 1, "the retry was sent");
+		assert.equal(collected.execution.status, "running", "an accepted prompt that has not ended is not a new failure");
+		assert.equal(collected.execution.reason, COLLECT_DEADLINE_REASON);
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, 1, "a landed retry is charged");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#316 review: a retried-once child that later fails still says it was retried", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "fail after the retry", worktree: false });
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		const first = await h.orchestrator.collect(handle.name, { timeoutMs: 50 });
+		assert.equal(first.execution.status, "running", "the retried turn is still in flight");
+		assert.equal(retries(h.supervisor).length, 1);
+
+		// The retried turn now ends the same way. The budget is spent, so this
+		// collect cannot send anything — the reason must still tell the parent that
+		// this failure is the retried one, not a first-try failure.
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		const second = await h.orchestrator.collect(handle.name, { timeoutMs: 50 });
+		assert.equal(second.execution.status, "failed");
+		assert.equal(second.execution.errorKind, "provider-empty-generation");
+		assert.match(second.execution.reason ?? "", /retried once/, "a bare reason cannot be told apart from a first failure");
+		assert.equal(retries(h.supervisor).length, 1, "the budget is spent, not refunded");
 	} finally {
 		h.cleanup();
 	}

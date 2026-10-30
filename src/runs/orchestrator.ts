@@ -267,6 +267,15 @@ export interface CollectResult {
 	blocked?: boolean;
 }
 
+/**
+ * What the supervisor observed for one wait: did the turn end, and if not, why.
+ *
+ * `"timeout"` is the only value that means "the wait budget ran out"; `"gone"`
+ * means the process died, `"blocked"` that a child dialog is waiting on the
+ * user and `"aborted"` that the parent turn was interrupted.
+ */
+export type CollectWait = "settled" | "timeout" | "blocked" | "gone" | "aborted";
+
 export const COLLECT_GRACE_EXTENSIONS = 2;
 /**
  * Shown when this collect() call's budget elapses and the child is still in-turn.
@@ -2162,7 +2171,7 @@ export class Orchestrator {
 		// A connection blip writes stopReason "error" before the client retries.
 		// That looks like a finished turn, but the RPC child is still in it.
 		// Skipping the supervisor wait here is what retired a live worker.
-		let wait: "settled" | "timeout" | "blocked" | "gone" | "aborted" = isLastTurnComplete(initial) && !this.liveConnectionBlip(child, initial)
+		let wait: CollectWait = isLastTurnComplete(initial) && !this.liveConnectionBlip(child, initial)
 			? "settled"
 			: await this.awaitSupervisor(child, deadline, opts.signal);
 		if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
@@ -2203,22 +2212,71 @@ export class Orchestrator {
 		if (wait === "timeout" && !this.supervisor.isAlive(name) && isLastTurnComplete(parsed)) {
 			return this.finishCollect(child, parsed, deriveOutcome(parsed), deadline);
 		}
+		// The ladder that turns (transcript, wait verdict) into an outcome lives in
+		// one place, so the retry below cannot classify a turn by weaker rules.
+		const classified = await this.classifyOutcome(child, parsed, wait, deadline, opts.signal);
+		if (classified.kind === "aborted") return abortedSnapshot();
+		if (classified.kind === "blocked") return this.blockedResult(child);
+		// #316 D2: one bounded retry for an empty provider generation, on the SAME
+		// child. Placed after every outcome rewrite in `classifyOutcome` (so an abort
+		// cascade or a deadline snapshot is never retried) and before
+		// `finishCollect` (which is the single place that settles the ledger, writes
+		// `.output.md` and records the child), so a retried turn is reported exactly
+		// once. The retry's own turn goes back through the SAME ladder.
+		const retry = await this.retryEmptyGeneration(child, classified.execution, deadline, opts.signal);
+		if (retry.kind === "aborted") return abortedSnapshot();
+		if (retry.kind === "blocked") return this.blockedResult(child);
+		if (retry.kind === "retried") return this.finishCollect(child, retry.parsed, retry.execution, deadline);
+		return this.finishCollect(child, classified.parsed, classified.execution, deadline);
+	}
+
+	/**
+	 * Turn one parsed session plus the wait verdict into an `Execution`.
+	 *
+	 * The ONLY place the collect outcome ladder runs (#316 review, major 1). The
+	 * first #316 patch re-implemented the two rewrites it remembered inside the
+	 * retry and dropped the rest — the `Connection error` hold, the "child exited
+	 * before writing JSONL" abort and the parent-shutdown attribution. A retried
+	 * turn that ended in `Connection error.` (empty text + `stopReason: "error"`,
+	 * which also satisfies `isEmptyGeneration`) was therefore reported `failed`,
+	 * and `shouldRecycleAfterCollect("failed")` retired a live child that the
+	 * first-turn path holds as `running` forever.
+	 *
+	 * Order matters and is deliberate:
+	 *   1. a live child whose latest message is a connection blip is `running`
+	 *      (and keeps waiting), whatever the wait said;
+	 *   2. `"timeout"` on a live child is `running` — the wait budget ran out while
+	 *      the process is up;
+	 *   3. `"gone"` with an empty transcript is `aborted` (nothing was written);
+	 *   4. a parent shutdown is attributed last, overwriting the rest.
+	 *
+	 * (2) intentionally does NOT also require `!isLastTurnComplete(parsed)`: after
+	 * a prompt was accepted, the transcript can still end on the previous, failed
+	 * turn for a moment (the child has not flushed its new turn yet). Reading that
+	 * as a verdict is exactly how a working child got a terminal outcome.
+	 */
+	private async classifyOutcome(
+		child: ChildRecord,
+		input: ReturnType<typeof parseSessionFile>,
+		wait: CollectWait,
+		deadline: number,
+		signal?: AbortSignal,
+	): Promise<
+		| { kind: "aborted" }
+		| { kind: "blocked" }
+		| { kind: "outcome"; parsed: ReturnType<typeof parseSessionFile>; execution: Execution }
+	> {
+		const name = child.name;
+		let parsed = input;
 		let execution = deriveOutcome(parsed);
-		if (wait === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(parsed)) {
-			// `timeoutMs` is measured from THIS collect call, not from the launch (D6).
-			// The constant's "cumulative since launch" wording is legacy; see its
-			// docstring for why it was left as-is.
-			execution = { ...execution, status: "running", reason: COLLECT_DEADLINE_REASON };
-		} else if (wait === "gone" && parsed.turns.length === 0) {
-			execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
-		} else if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
+		if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
 			// Same non-terminal signal as the deadline path: watch() re-arms on
 			// `running` and does not retire. An already-settled blip has to keep
 			// waiting here, or the next collect would reproduce it instantly.
 			if (wait !== "timeout") {
-				const held = await this.waitOutTransientConnection(child, deadline, opts.signal);
-				if (held === "aborted" || opts.signal?.aborted) return abortedSnapshot();
-				if (held === "blocked") return this.blockedResult(child);
+				const held = await this.waitOutTransientConnection(child, deadline, signal);
+				if (held === "aborted" || signal?.aborted) return { kind: "aborted" };
+				if (held === "blocked") return { kind: "blocked" };
 				parsed = parseSessionFile(child.sessionFile);
 				execution = deriveOutcome(parsed);
 			}
@@ -2227,25 +2285,20 @@ export class Orchestrator {
 			} else if (!this.supervisor.isAlive(name) && parsed.turns.length === 0) {
 				execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
 			}
+		} else if (wait === "timeout" && this.supervisor.isAlive(name)) {
+			// `timeoutMs` is measured from THIS collect call, not from the launch (D6).
+			// The constant's "cumulative since launch" wording is legacy; see its
+			// docstring for why it was left as-is.
+			execution = { ...execution, status: "running", reason: COLLECT_DEADLINE_REASON };
+		} else if (wait === "gone" && parsed.turns.length === 0) {
+			execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
 		}
 		// A parent shutdown can resolve the in-flight wait by killing the child.
 		// That is not the child settling a turn with no assistant reply.
 		if (this.parentShutdownRetire.has(name) && wait !== "settled") {
 			execution = attributeParentSessionShutdown(execution, parsed);
 		}
-		// #316 D2: one bounded retry for an empty provider generation, on the SAME
-		// child. Placed after every outcome rewrite above (so an abort cascade or a
-		// deadline snapshot is never retried) and before `finishCollect` (which is
-		// the single place that settles the ledger, writes `.output.md` and records
-		// the child), so a retried turn is reported exactly once.
-		const retry = await this.retryEmptyGeneration(child, name, execution, deadline, opts.signal);
-		if (retry.kind === "aborted") return abortedSnapshot();
-		if (retry.kind === "blocked") return this.blockedResult(child);
-		if (retry.kind === "retried") {
-			parsed = retry.parsed;
-			execution = retry.execution;
-		}
-		return this.finishCollect(child, parsed, execution, deadline);
+		return { kind: "outcome", parsed, execution };
 	}
 
 	/**
@@ -2267,13 +2320,13 @@ export class Orchestrator {
 	 * user-visible "no measurable progress" allowance, and a plain `failed` collect
 	 * deliberately does not charge them (`test/unit/renewal-wiring.test.ts`).
 	 *
-	 * The counter is charged only after the prompt was actually accepted, so a
-	 * child that died between the liveness check and the prompt keeps its budget
-	 * and its original verdict.
+	 * The counter is claimed before the send is awaited and refunded when the send
+	 * did not land (thrown, or the disposition came back `"intercepted"`), so a
+	 * child that died between the liveness check and the send — or whose prompt an
+	 * input handler swallowed — keeps its budget and its original verdict.
 	 */
 	private async retryEmptyGeneration(
 		child: ChildRecord,
-		name: string,
 		execution: Execution,
 		deadline: number,
 		signal?: AbortSignal,
@@ -2285,35 +2338,76 @@ export class Orchestrator {
 	> {
 		if (execution.status !== "failed" || execution.errorKind !== "provider-empty-generation") return { kind: "skipped" };
 		if (signal?.aborted) return { kind: "aborted" };
+		const name = child.name;
 		if (!this.supervisor.isAlive(name)) return { kind: "skipped" };
 		if ((child.providerRetriesUsed ?? 0) >= EMPTY_GENERATION_RETRY_LIMIT) return { kind: "skipped" };
-		try {
-			await this.supervisor.prompt(name, CONTINUE_PROMPT);
-		} catch {
-			// The child exited between `isAlive` and the prompt. Nothing was sent, so
-			// the original failed verdict stands and no retry is charged.
-			return { kind: "skipped" };
-		}
+		// Claim the budget BEFORE the send is awaited (#316 review, minor 5).
+		//
+		// Read-then-write across an `await` is a TOCTOU: two collects of the same
+		// child (the watch loop and an explicit `collect`) could both read `0`,
+		// both send a prompt, and charge the child twice — two real turns on one
+		// budget. The claim and the check are adjacent and synchronous here, so no
+		// interleaving is possible; a send that turned out not to land refunds it.
 		child.providerRetriesUsed = (child.providerRetriesUsed ?? 0) + 1;
 		this.onChildUpdate(child);
+		let disposition: SteerDisposition;
+		try {
+			// `steer`, not `prompt`: both send the text to this idle child, but only
+			// `steer` returns what actually happened to it (`prompt` resolves void and
+			// would force the caller to assume delivery).
+			disposition = await this.supervisor.steer(name, CONTINUE_PROMPT);
+		} catch {
+			// The child exited between `isAlive` and the send. Nothing was sent, so
+			// the original failed verdict stands and no retry is charged.
+			this.refundEmptyGenerationRetry(child);
+			return { kind: "skipped" };
+		}
+		if (disposition === "intercepted") {
+			// An input handler ate the text before it was ever queued, so the child
+			// never saw it (`src/extension/legion-tools.ts:203-210` does the same for
+			// mail). Nothing was retried: keep the original verdict, do not charge the
+			// budget, and leave a visible trace — silence here reads as "retried once".
+			console.warn(
+				`[pi-legion] #316 retry for ${name} was intercepted by an input handler; the child never saw the continue prompt, so the retry was not charged and the original failure stands.`,
+			);
+			this.refundEmptyGenerationRetry(child);
+			return { kind: "skipped" };
+		}
 		const settled = await this.awaitSupervisor(child, deadline, signal);
 		if (settled === "aborted" || signal?.aborted) return { kind: "aborted" };
 		if (settled === "blocked") return { kind: "blocked" };
-		const parsed = parseSessionFile(child.sessionFile);
-		let retried = deriveOutcome(parsed);
-		if (settled === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(parsed)) {
-			// Same non-terminal signal the untried path uses: the retried turn is
-			// still in flight, so it is neither a new failure nor a settle.
-			retried = { ...retried, status: "running", reason: COLLECT_DEADLINE_REASON };
-		} else if (retried.status === "failed" && retried.errorKind === "provider-empty-generation") {
-			// #316 D4: the parent must be able to tell a retried failure from a
-			// first-try one without reading the transcript.
-			retried = {
-				...retried,
-				reason: retried.reason ? `${retried.reason} ${EMPTY_GENERATION_RETRY_NOTE}` : EMPTY_GENERATION_RETRY_NOTE,
-			};
-		}
-		return { kind: "retried", parsed, execution: retried };
+		// The retried turn is classified by the SAME ladder as a first turn (major 1):
+		// a connection blip stays `running`, a dead child with an empty transcript is
+		// `aborted`, a parent shutdown is attributed, and a still-running turn keeps
+		// its `running` snapshot. Only the note about the spent budget is added
+		// later, at the single terminal exit (`finishCollect`).
+		const classified = await this.classifyOutcome(child, parseSessionFile(child.sessionFile), settled, deadline, signal);
+		if (classified.kind !== "outcome") return { kind: classified.kind };
+		return { kind: "retried", parsed: classified.parsed, execution: classified.execution };
+	}
+
+	/** Give back a claimed retry whose prompt never landed (#316 review, minor 5). */
+	private refundEmptyGenerationRetry(child: ChildRecord): void {
+		child.providerRetriesUsed = Math.max(0, (child.providerRetriesUsed ?? 0) - 1);
+		this.onChildUpdate(child);
+	}
+
+	/**
+	 * #316 D4: tell the parent that this failure is a retried one.
+	 *
+	 * Applied at the terminal exit rather than inside the retry (#316 review, minor
+	 * 4) so the note is STICKY: when the retry's own wait comes back `running` and
+	 * the child only later ends on another empty generation, the next collect skips
+	 * the retry (budget spent) and would otherwise report a bare reason — leaving
+	 * the parent unable to tell "retried once and still failed" from "failed on the
+	 * first try". Keyed off the persisted counter, so it also covers a collect that
+	 * never sends anything.
+	 */
+	private withEmptyGenerationRetryNote(child: ChildRecord, execution: Execution): Execution {
+		if ((child.providerRetriesUsed ?? 0) < 1) return execution;
+		if (execution.status !== "failed" || execution.errorKind !== "provider-empty-generation") return execution;
+		if ((execution.reason ?? "").includes(EMPTY_GENERATION_RETRY_NOTE)) return execution;
+		return { ...execution, reason: execution.reason ? `${execution.reason} ${EMPTY_GENERATION_RETRY_NOTE}` : EMPTY_GENERATION_RETRY_NOTE };
 	}
 
 	/** True when the session's latest outcome is a connection blip and the process is up. */
@@ -2399,7 +2493,7 @@ export class Orchestrator {
 		child: ChildRecord,
 		deadline: number,
 		signal?: AbortSignal,
-	): Promise<"settled" | "timeout" | "blocked" | "gone" | "aborted"> {
+	): Promise<CollectWait> {
 		if (signal?.aborted) return "aborted";
 		if (this.pendingDialogs(child.name).length) return "blocked";
 		let pending = signal ? undefined : this.pendingWaits.get(child.name);
@@ -2442,7 +2536,7 @@ export class Orchestrator {
 				});
 			});
 			if (this.pendingDialogs(child.name).length) return "blocked";
-			const races: Array<Promise<"settled" | "timeout" | "blocked" | "gone" | "aborted">> = [waitForChildEvent];
+			const races: Array<Promise<CollectWait>> = [waitForChildEvent];
 			if (this.uiProxy) races.push(blocked);
 			if (signal) {
 				races.push(new Promise((resolve) => {
@@ -2483,7 +2577,11 @@ export class Orchestrator {
 		return { execution, output: parsed.output, usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance, blocked: true };
 	}
 
-	private async finishCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>, execution: Execution, deadline: number): Promise<CollectResult> {
+	private async finishCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>, input: Execution, deadline: number): Promise<CollectResult> {
+		// Every collect ends here, so this is the one place a sticky "retried once"
+		// note can be applied without either writing it twice or losing it when the
+		// retry's own wait did not see the terminal turn (#316 review, minor 4).
+		const execution = this.withEmptyGenerationRetryNote(child, input);
 		const acceptance = await applyVerification(
 			deriveAcceptance(parsed, execution, child.pendingCriteria, { ...(child.completionGuard ? { completionGuard: true } : {}) }),
 			{ cwd: child.worktreePath ?? this.cwd, criteria: child.pendingCriteria, run: this.verifyRunner, timeoutMs: Math.max(5_000, deadline - this.now()) },

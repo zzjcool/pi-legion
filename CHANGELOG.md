@@ -97,7 +97,11 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   the ledger's `node_failed` event carries that `errorKind`. The retry budget is its own counter
   (`ChildRecord.providerRetriesUsed`, limit **1**), deliberately NOT the renewal budget — renewals
   are a user-granted allowance for "no measurable progress" that a plain failure never charges, and
-  renewal re-runs a child while this continues the same live one. Assistant records also pass the
+  renewal re-runs a child while this continues the same live one. A continue-prompt that an input
+  handler swallowed is nobody's retry: it is not charged to the budget, the original failure stands,
+  and a warning names what happened — the retry also never classifies its own turn by looser rules
+  than a first turn (a `Connection error` on the retry keeps the child `running` instead of retiring
+  it). Assistant records also pass the
   upstream `responseId` through for forensics. Contract:
   `docs/contracts/provider-empty-generation-retry-v1.md` (#316).
 

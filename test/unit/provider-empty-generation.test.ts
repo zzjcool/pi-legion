@@ -154,13 +154,21 @@ function legionFixture() {
 	};
 }
 
-/** Answer the next `prompt` the way a provider would: settle the turn it starts. */
-function settleOnPrompt(supervisor: FakeSupervisor, turn: FakeTurn): void {
-	const original = supervisor.prompt.bind(supervisor);
-	supervisor.prompt = async (name: string, text: string) => {
-		await original(name, text);
-		supervisor.settle(name, turn);
-	};
+/**
+ * Answer the next send the way a provider would: settle the turn it starts.
+ *
+ * Both seams are patched because the in-collect retry goes out over `steer`
+ * (it needs the disposition), while every other caller still uses `prompt`.
+ */
+function settleOnSend(supervisor: FakeSupervisor, turn: FakeTurn): void {
+	const settleAfter = <T>(original: (name: string, text: string) => Promise<T>) =>
+		async (name: string, text: string): Promise<T> => {
+			const result = await original(name, text);
+			supervisor.settle(name, turn);
+			return result;
+		};
+	supervisor.prompt = settleAfter(supervisor.prompt.bind(supervisor));
+	supervisor.steer = settleAfter(supervisor.steer.bind(supervisor));
 }
 
 test("#316 D3: recordSettled puts errorKind on the node_failed event, once", async () => {
@@ -178,7 +186,7 @@ test("#316 D3: recordSettled puts errorKind on the node_failed event, once", asy
 		const handle = await orchestrator.launch({ agent: agent(), task: "the provider will drop this", name: "worker-0", worktree: false });
 		// Both turns fail the same way, so this is the "retried once and still
 		// failed" terminal case: exactly one settle, one event.
-		settleOnPrompt(supervisor, emptyTurn);
+		settleOnSend(supervisor, emptyTurn);
 		supervisor.settle(handle.name, emptyTurn);
 		const collected = await orchestrator.collect(handle.name, { timeoutMs: 5_000 });
 
