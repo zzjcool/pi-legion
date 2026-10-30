@@ -81,6 +81,22 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **`messages.delivered` is a five-value domain now — `pending / accepted / bounced / delivered / obsolete`
+  — and `LEGION_DB_USER_VERSION` moves 1 → 2 (#322).** The old `INJECTED(1)` claimed a delivery the ledger
+  never observed: it was written the moment a send call returned, which covers `queued` (waiting for the
+  child's next turn boundary), `accepted` (a turn started) and `intercepted` (an input handler ate the text
+  and the child never saw a word of it) alike, so a parent had no queryable signal to tell them apart.
+  `ACCEPTED(1)` now says only "the send call returned", `DELIVERED(3)` is written later from evidence, and
+  `intercepted` bounces instead of pretending. The migration adds **no DDL** — the column was already
+  `INTEGER NOT NULL DEFAULT 0`, so v2 is a semantic agreement plus a version bump, and every v1 `1` reads as
+  `accepted` with no backfill. `MAIL_DELIVERY.INJECTED` survives as a `@deprecated` alias of `ACCEPTED`
+  so out-of-tree imports keep compiling; the ledger's own call sites all use the new names. Events are
+  unchanged on purpose (the closed set stays at 16): `ACCEPTED` reuses the `mail_sent` row `sendMail`
+  already wrote, `DELIVERED` reuses `mail_delivered`, `OBSOLETE` reuses `mail_bounced` with
+  `reason: "obsolete_after_phase_change"`. A read-only `mailboxStats(db, nodeId)` exports the five counts
+  for `/legion` status and doctor. Contract: `docs/contracts/mailbox-delivery-v1.md`,
+  `docs/legion-v2-contract.md` §8.3.1/§8.5 (REV-23).
+
 - **`SessionRuntime.consumeCollect*` now answers with a `ClaimedCollect`, not a bare snapshot
   (#320/#327).** The claim-once seam claims a terminal result as it hands the snapshot out, and
   the caller has to be able to hand that claim back when it bails — which requires knowing
@@ -113,6 +129,21 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   it precedes. Contract revision: `docs/contracts/abort-soft-interrupt-v1.md` (D2/D7).
 
 ### Fixed
+
+- **A `Phase timeout:` notice that arrives after its phase ended is no longer handed to the parent as a
+  live to-do item (#333).** A team that runs two or three review rounds reliably exceeds the 30-minute
+  `reviewing` limit, so an `action-needed` phase-timeout notice is not an edge case: the notice was queued,
+  the team went on to converge (next phase, failure, or retire), and *then* the notice reached root, asking
+  for a decision about a node that no longer existed. Nothing ever revoked it — there was no state to revoke
+  it into. Mail whose `kind` is `notice` and whose subject starts with `Phase timeout:` is now checked
+  against the ledger fact that produced it (the `phase_timeout` event's `phase`/`phaseSince`, never the
+  notice's prose) and marked `obsolete` when the sender has left that phase or gone terminal. The check runs
+  in two places: **before delivery** (a queued notice is never injected at all — the path the issue actually
+  took) and in the postman's confirmation pass for mail already `accepted` (that one only relabels; it
+  cannot unqueue text a recipient already holds). `instruction` mail is never auto-obsoleted — whether an
+  instruction expired is a human call — and a `delivered` message is never relabelled, because a
+  consumption that happened is a fact about the past. No new event type: the verdict is `mail_bounced` with
+  `reason: "obsolete_after_phase_change"`.
 
 - **One name, one node: `status` / `collect` / `stop` / `continue` now resolve a child name the same way.**
   In a single root session, `status(name)` and `collect(name)` called ten seconds apart answered with two
