@@ -162,6 +162,20 @@ function groupMembers(pgid: number): number[] {
 }
 
 /**
+ * Whether `pid` leads the process group named after it — the `detached: true`
+ * invariant both runners rely on. Where there is no procfs to ask, the contract
+ * that the caller spawned detached is taken at its word.
+ */
+function leadsOwnGroup(pid: number): boolean {
+	if (process.platform !== "linux") return true;
+	try {
+		return parseProcStatLine(readFileSync(`${PROC_ROOT}/${pid}/stat`, "utf8"))?.pgid === pid;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Live (non-zombie) members of `groupTarget`, leader excluded — `null` where
  * there is no procfs to enumerate and only the `kill(-pgid, 0)` probe is left.
  *
@@ -258,8 +272,17 @@ export async function sweepProcessTree(
 	const condemned = new Set(doomed);
 	for (const pid of groupOnly ?? []) condemned.add(pid);
 	if (escalateGroup || condemned.size > 0) {
-		if (signalTarget(groupTarget, "SIGKILL")) killed += 1;
+		const groupKilled = signalTarget(groupTarget, "SIGKILL");
+		if (groupKilled) killed += 1;
+		// A group leader is a member of its own group, so the signal above already
+		// reached it and a per-pid signal would count one death twice in `killed`.
+		// Only when it really is the leader, though: an out-of-contract root that
+		// does not lead a group is not covered by `-rootPid`, and dropping its
+		// per-pid signal would let the root survive its own sweep.
+		const leaderCoveredByGroup = groupKilled
+			&& (groupTarget === rootPid || (groupTarget === -rootPid && leadsOwnGroup(rootPid)));
 		for (const pid of condemned) {
+			if (pid === rootPid && leaderCoveredByGroup) continue;
 			if (signalTarget(pid, "SIGKILL")) killed += 1;
 		}
 		if (condemned.size > 0) await waitForDeath(condemned, killAfterMs);

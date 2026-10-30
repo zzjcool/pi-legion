@@ -1023,8 +1023,11 @@ export function runLegionCommandNow(command: string, cwd: string, timeoutMs: num
 		// forwarded); a TERM-ignoring leftover that already gave the pipes back
 		// lets `close` fire at once, and that used to be read as a clean exit —
 		// warn, cancel the fallback timer, never sweep. That is this runner's
-		// #310 leak, so 124 / death-by-signal counts as a timeout.
-		const innerTimedOut = (code: number | null): boolean => code === 124 || child.signalCode !== null;
+		// #310 leak, so 124 / death-by-TERM-or-KILL counts as a timeout.
+		// Deliberately *not* "any signal": a command that crashed (SIGSEGV/SIGABRT,
+		// SIGPIPE from a destroyed pipe) must not be reported as a timeout.
+		const innerTimedOut = (code: number | null): boolean =>
+			code === 124 || child.signalCode === "SIGTERM" || child.signalCode === "SIGKILL";
 		const markTimedOut = (): void => {
 			if (timedOut) return;
 			timedOut = true;

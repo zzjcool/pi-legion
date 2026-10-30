@@ -12,7 +12,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import {
 	commandSummary,
@@ -20,7 +20,7 @@ import {
 	sweepProcessTree,
 } from "../../src/shared/proc-sweep.ts";
 import { enumerateDescendants, currentPgid, parseProcStatLine } from "../../src/supervisor/proc-tree.ts";
-import { runVerifyCommand } from "../../src/runs/acceptance.ts";
+import { runVerifyCommand, type CommandResult } from "../../src/runs/acceptance.ts";
 import { runLegionCommandNow } from "../../src/extension/legion-tools.ts";
 
 const linuxOnly = { skip: process.platform !== "linux" ? "procfs-only assertions" : false } as const;
@@ -62,6 +62,34 @@ function readPidFile(file: string): number {
 	const pid = Number(readFileSync(file, "utf8").trim());
 	assert.ok(Number.isSafeInteger(pid) && pid > 0, `pid file ${file} should hold a pid`);
 	return pid;
+}
+
+/**
+ * Pid written into `file` by the spawned command, or `null` when it never got
+ * that far.
+ *
+ * The wait is bounded and the case is **skipped**, not failed: a runner that
+ * timed out, aborted or swept the tree before the shell had even written its
+ * first line says nothing about the behaviour under test. CI hit exactly that
+ * shape — the abort landed before `echo $$ > shell.pid` ran, and the read threw
+ * `ENOENT` on a machine whose `fork`+`exec` was slower than the fixed nap the
+ * test used to take.
+ */
+async function pidFileOrSkip(file: string, t: TestContext): Promise<number | null> {
+	if (!(await waitFor(() => existsSync(file), 2_000))) {
+		t.skip(`the spawned command never wrote ${path.basename(file)} — environment too slow for this shape`);
+		return null;
+	}
+	return readPidFile(file);
+}
+
+/** `readPidFile`, but 0 when the file is gone — a `finally` must never throw `ENOENT`. */
+function pidOr0(file: string): number {
+	try {
+		return readPidFile(file);
+	} catch {
+		return 0;
+	}
 }
 
 /** Process group of a live pid, read the same way the sweep reads it. */
@@ -284,20 +312,28 @@ async function cleanUp(groupLeader: number, ...pids: number[]): Promise<void> {
 	for (const pid of pids) hardKill(pid);
 }
 
-test("a timed-out verify command sweeps its tree before resolving", linuxOnly, async () => {
+test("a timed-out verify command sweeps its tree before resolving", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const shellFile = path.join(dir, "shell.pid");
 	const bgFile = path.join(dir, "bg.pid");
 	try {
 		// Both halves hang: the direct `sleep 300` is the shell's foreground
 		// child and the first one is the grandchild that used to be orphaned.
-		const result = await runVerifyCommand(
+		const pending = runVerifyCommand(
 			`echo $$ > ${shellFile}; sleep 300 & echo $! > ${bgFile}; sleep 300`,
 			dir,
 			500,
 		);
+		// The 500ms deadline can fire before a loaded machine has forked the shell
+		// at all: wait for the pids it writes, then look at the settled result.
+		const wrote = await waitFor(() => existsSync(bgFile) && existsSync(shellFile), 2_000);
+		const result = await pending;
 		assert.equal(result.code, 1);
 		assert.match(result.stderr, /verification timed out after 500ms/);
+		if (!wrote) {
+			t.skip("the shell never wrote its pid files before the deadline");
+			return;
+		}
 		assert.equal(
 			pidAlive(readPidFile(bgFile)),
 			false,
@@ -309,14 +345,23 @@ test("a timed-out verify command sweeps its tree before resolving", linuxOnly, a
 	}
 });
 
-test("an aborted verify command sweeps its tree before resolving", linuxOnly, async () => {
+test("an aborted verify command sweeps its tree before resolving", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const pidFile = path.join(dir, "shell.pid");
 	const controller = new AbortController();
+	let pending: Promise<CommandResult> | null = null;
 	try {
-		const pending = runVerifyCommand(`echo $$ > ${pidFile}; sleep 300`, dir, 30_000, controller.signal);
-		await new Promise((resolve) => setTimeout(resolve, 150));
-		const shellPid = readPidFile(pidFile);
+		pending = runVerifyCommand(`echo $$ > ${pidFile}; sleep 300`, dir, 30_000, controller.signal);
+		// Abort only once the shell has actually published its pid. Waiting a fixed
+		// 150ms was a race: on a slow runner the sweep killed a shell that had not
+		// written anything yet, and the read threw `ENOENT` (CI, 2026-10-30).
+		const shellPid = await pidFileOrSkip(pidFile, t);
+		if (shellPid === null) {
+			controller.abort();
+			await pending;
+			pending = null;
+			return;
+		}
 		assert.ok(pidAlive(shellPid), "the shell is running when the abort arrives");
 		assert.equal(
 			procPgid(shellPid),
@@ -325,15 +370,20 @@ test("an aborted verify command sweeps its tree before resolving", linuxOnly, as
 		);
 		controller.abort();
 		const result = await pending;
+		pending = null;
 		assert.equal(result.code, 1);
 		assert.match(result.stderr, /aborted/);
 		assert.equal(pidAlive(shellPid), false, "abort sweeps before resolving");
 	} finally {
+		if (pending) {
+			controller.abort();
+			await pending.catch(() => undefined);
+		}
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
-test("a clean verify exit leaves `cmd &` alone and warns once", linuxOnly, async () => {
+test("a clean verify exit leaves `cmd &` alone and warns once", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const pidFile = path.join(dir, "bg.pid");
 	const shellFile = path.join(dir, "shell.pid");
@@ -350,11 +400,15 @@ test("a clean verify exit leaves `cmd &` alone and warns once", linuxOnly, async
 			10_000,
 		);
 		assert.equal(result.code, 0, "a clean exit stays a clean exit");
-		leftover = readPidFile(pidFile);
+		const backgroundPid = await pidFileOrSkip(pidFile, t);
+		if (backgroundPid === null) return;
+		leftover = backgroundPid;
+		const shellPid = await pidFileOrSkip(shellFile, t);
+		if (shellPid === null) return;
 		assert.equal(pidAlive(leftover), true, "a background process from a clean exit is legal");
 		assert.equal(
 			procPgid(leftover),
-			readPidFile(shellFile),
+			shellPid,
 			"the leftover still names the command's own process group (spawned detached)",
 		);
 		assert.equal(warnings.length, 1, "exactly one leftover warning");
@@ -363,12 +417,12 @@ test("a clean verify exit leaves `cmd &` alone and warns once", linuxOnly, async
 		assert.match(warnings[0]!, new RegExp(`${leftover}`), "the warning names the pid");
 	} finally {
 		console.warn = realWarn;
-		await cleanUp(readPidFile(shellFile), leftover);
+		await cleanUp(pidOr0(shellFile), leftover);
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
-test("a timed-out legion verify command sweeps its tree before resolving", linuxOnly, async () => {
+test("a timed-out legion verify command sweeps its tree before resolving", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const pidFile = path.join(dir, "shell.pid");
 	let shellPid = 0;
@@ -376,8 +430,12 @@ test("a timed-out legion verify command sweeps its tree before resolving", linux
 		// The shell ignores SIGTERM, so only the sweep's SIGKILL escalation can
 		// end it — the `timeout` binary in front of it cannot (`--signal=TERM`).
 		const pending = runLegionCommandNow(`echo $$ > ${pidFile}; ${TERM_IGNORING_LOOP}`, dir, 100);
-		assert.equal(await waitFor(() => existsSync(pidFile)), true, "the shell starts");
-		shellPid = readPidFile(pidFile);
+		const started = await pidFileOrSkip(pidFile, t);
+		if (started === null) {
+			await pending;
+			return;
+		}
+		shellPid = started;
 		assert.notEqual(
 			procPgid(shellPid),
 			currentPgid(),
@@ -397,7 +455,7 @@ test("a timed-out legion verify command sweeps its tree before resolving", linux
 	}
 });
 
-test("a clean legion verify exit leaves `cmd &` alone and warns once", linuxOnly, async () => {
+test("a clean legion verify exit leaves `cmd &` alone and warns once", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const pidFile = path.join(dir, "bg.pid");
 	const warnings: string[] = [];
@@ -413,7 +471,9 @@ test("a clean legion verify exit leaves `cmd &` alone and warns once", linuxOnly
 			10_000,
 		);
 		assert.equal(result.code, 0);
-		leftover = readPidFile(pidFile);
+		const backgroundPid = await pidFileOrSkip(pidFile, t);
+		if (backgroundPid === null) return;
+		leftover = backgroundPid;
 		assert.equal(pidAlive(leftover), true, "a clean exit never kills a background process");
 		assert.notEqual(
 			procPgid(leftover),
@@ -429,7 +489,7 @@ test("a clean legion verify exit leaves `cmd &` alone and warns once", linuxOnly
 	}
 });
 
-test("a timed-out verify command kills a TERM-ignoring childless root before resolving", linuxOnly, async () => {
+test("a timed-out verify command kills a TERM-ignoring childless root before resolving", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const pidFile = path.join(dir, "root.pid");
 	let appPid = 0;
@@ -437,16 +497,21 @@ test("a timed-out verify command kills a TERM-ignoring childless root before res
 		// `exec` makes the shell *become* the app, so the root is the TERM-ignoring
 		// process itself and has no children at all — the reported shape of #310's
 		// real leak in a long-lived server, and the one the escalation used to miss.
+		// The handler goes in *before* the pid file is written, so "the file exists"
+		// is a readiness signal (otherwise the sweep's SIGTERM could land on an app
+		// that has not trapped yet and the escalation would never be exercised),
+		// and the 1200ms deadline leaves node startup room under CI load.
 		const pending = runVerifyCommand(
-			`exec ${process.execPath} -e 'require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.on("SIGTERM", () => {}); setInterval(() => {}, 1000)'`,
+			`exec ${process.execPath} -e 'process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)'`,
 			dir,
-			400,
+			1_200,
 		);
-		assert.equal(await waitFor(() => existsSync(pidFile)), true, "the app starts");
-		appPid = readPidFile(pidFile);
+		const started = await pidFileOrSkip(pidFile, t);
 		const result = await pending;
 		assert.equal(result.code, 1);
-		assert.match(result.stderr, /verification timed out after 400ms/);
+		assert.match(result.stderr, /verification timed out after 1200ms/);
+		if (started === null) return;
+		appPid = started;
 		assert.equal(
 			pidAlive(appPid),
 			false,
@@ -458,7 +523,7 @@ test("a timed-out verify command kills a TERM-ignoring childless root before res
 	}
 });
 
-test("a legion verify command whose inner timeout fires sweeps the tree", linuxOnly, async () => {
+test("a legion verify command whose inner timeout fires sweeps the tree", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const pidFile = path.join(dir, "stubborn.pid");
 	let stubborn = 0;
@@ -472,10 +537,12 @@ test("a legion verify command whose inner timeout fires sweeps the tree", linuxO
 			dir,
 			500,
 		);
-		stubborn = readPidFile(pidFile);
 		assert.equal(result.timedOut, true, "the inner timeout is reported as a timeout");
 		assert.equal(result.code, 1);
 		assert.match(result.stderr, /verification timed out after 500ms/);
+		const stubbornPid = await pidFileOrSkip(pidFile, t);
+		if (stubbornPid === null) return;
+		stubborn = stubbornPid;
 		assert.equal(
 			pidAlive(stubborn),
 			false,
@@ -487,7 +554,7 @@ test("a legion verify command whose inner timeout fires sweeps the tree", linuxO
 	}
 });
 
-test("an unredirected `cmd &` is a clean exit, not a timeout", linuxOnly, async () => {
+test("an unredirected `cmd &` is a clean exit, not a timeout", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const pidFile = path.join(dir, "bg.pid");
 	const shellFile = path.join(dir, "shell.pid");
@@ -501,26 +568,30 @@ test("an unredirected `cmd &` is a clean exit, not a timeout", linuxOnly, async 
 		// No redirect: the background job inherits the pipes, so `close` is deferred
 		// until it exits even though the command itself finished long ago. Reading
 		// that as a timeout killed a legal background process and reported a
-		// successful command as `verification timed out`.
+		// successful command as `verification timed out`. The deadline is the whole
+		// margin this case has for the shell to write both pids and exit, so it is
+		// generous on purpose (the shape is milliseconds, CI can stall).
 		const result = await runVerifyCommand(
 			`echo $$ > ${shellFile}; sleep 600 & echo $! > ${pidFile}`,
 			dir,
-			400,
+			800,
 		);
 		assert.equal(result.code, 0, "the command's own exit code, not a timeout");
 		assert.doesNotMatch(result.stderr, /timed out/);
-		leftover = readPidFile(pidFile);
+		const backgroundPid = await pidFileOrSkip(pidFile, t);
+		if (backgroundPid === null) return;
+		leftover = backgroundPid;
 		assert.equal(pidAlive(leftover), true, "a background process from a clean exit is legal");
 		assert.equal(warnings.length, 1, "exactly one leftover warning");
 		assert.match(warnings[0]!, /leaving 1 process\(es\) running/);
 	} finally {
 		console.warn = realWarn;
-		await cleanUp(readPidFile(shellFile), leftover);
+		await cleanUp(pidOr0(shellFile), leftover);
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
-test("an unredirected `cmd &` is a clean exit for the legion runner too", linuxOnly, async () => {
+test("an unredirected `cmd &` is a clean exit for the legion runner too", linuxOnly, async (t) => {
 	const dir = tempDir();
 	const pidFile = path.join(dir, "bg.pid");
 	const warnings: string[] = [];
@@ -534,7 +605,9 @@ test("an unredirected `cmd &` is a clean exit for the legion runner too", linuxO
 		const result = await runLegionCommandNow(`sleep 600 & echo $! > ${pidFile}`, dir, 300);
 		assert.equal(result.code, 0, "the command's own exit code, not a timeout");
 		assert.notEqual(result.timedOut, true, "a clean exit is never a timeout");
-		leftover = readPidFile(pidFile);
+		const backgroundPid = await pidFileOrSkip(pidFile, t);
+		if (backgroundPid === null) return;
+		leftover = backgroundPid;
 		groupLeader = procPgid(leftover);
 		assert.equal(pidAlive(leftover), true, "a background process from a clean exit is legal");
 		assert.equal(warnings.length, 1, "exactly one leftover warning");

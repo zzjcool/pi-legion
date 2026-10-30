@@ -64,6 +64,14 @@ sweep 是异步的，并且 runner 的 promise 会 park 到它完成（D1/D2 的
 不计入 `timeoutMs`，这 2.5s 也不计入——但它确实占用 wall clock）。上层若有总预算门禁，需要把这
 2.5s 算进去。grace 是早退的：第一次信号就把全树打死时不会付满窗口。
 
+**补充（二审 minor，不是 2.5s 那个量级）**：D3 里「命令已退出、只是未重定向的 `cmd &` 占着管道」
+那种形状，**卡到 deadline 才 settle**：`close` 要等 stdio 全关，而那个后台进程不到 deadline 不会
+松手（D3 的 `child.exitCode` 判定就是在 deadline 到点那一刻做的）。所以对这条形状而言，最坏延迟
+是 **`timeoutMs` 本身**（fallback timer 是 `limit + 1s`），不是 `graceMs + killAfterMs`。两者不要
+混淆：2.5s 是「我们已经判超时之后，清扫还要多久」，`timeoutMs` 是「命令明明早就结束了，结果还
+要等多久」。上限：`timeoutMs`（未重定向 `cmd &` 且永不退出）与 `graceMs + killAfterMs`（超时后
+的清扫）取其一，不叠加。
+
 ### D5 — 平台降级
 
 - **非 Linux**：没有 procfs，`enumerateDescendants` 与 `groupMembers` 都返回 `[]`，sweep 退化成
