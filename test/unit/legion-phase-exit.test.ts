@@ -260,6 +260,55 @@ test("#309 D1: to failed with a reason is a declared parent_decision", async () 
 	});
 });
 
+test("#309 D1+D2: to failed combined with supersedes audits the handled child first, then the terminal transition", async () => {
+	// The two arguments meet on ONE call: a centurion that gives up also says which
+	// failures it is accounting for. `supersedes` is validated and audited as on any
+	// other accepted transition, and only then does the declared terminal `failed`
+	// land — an auditor reads "this failure was handled" immediately before "the
+	// team was failed". Dropping the audit loop for the failed path, or emitting the
+	// phase_change before it, reorders exactly this assertion.
+	await withFixture(async (db, cwd) => {
+		seedPartialFailure(db);
+		const result = await request(db, cwd, "failed", { reason: "cannot succeed", supersedes: ["worker"] });
+		assert.equal(result.ok, true);
+		assert.equal(getNode(db, TEAM_ID)?.phase, "failed");
+		assert.deepEqual(readEventsAfter(db, 0).map((event) => event.type), ["node_handled", "phase_change"]);
+		const handled = eventsOfType(db, "node_handled");
+		assert.equal(handled.length, 1);
+		assert.equal((handled[0]!.data as Record<string, unknown>).handledId, "root.team-a.worker");
+		const data = eventsOfType(db, "phase_change")[0]!.data as Record<string, unknown>;
+		assert.equal(data.to, "failed");
+		assert.equal(data.terminalReason, "parent_decision");
+		assert.equal(data.reason, "cannot succeed");
+	});
+});
+
+test("#309 D1: a reason on a non-failed target is documented as ignored and never stored", async () => {
+	// `reason` is read only for `to:"failed"`. On every other target it is accepted
+	// and then unused — deliberately, because a stray argument must not invent a new
+	// failure mode — so the silent drop is pinned here rather than left implicit.
+	// A future change that begins recording it, or begins refusing it, must edit
+	// this test on purpose.
+	await withFixture(async (db, cwd) => {
+		const phase = makeTools(db, cwd).get("legion_phase");
+		assert.ok(phase, "a centurion must receive legion_phase");
+		// The schema is where the tool says so, and a model only learns what it is told.
+		assert.match(phase.parameters?.properties?.reason?.description ?? "", /[Ii]gnored/);
+	});
+	await withFixture(async (db, cwd) => {
+		seedPartialFailure(db);
+		// `supersedes` is here only so the transition is ACCEPTED: the point is the
+		// emitted event, not the refusal.
+		const result = await request(db, cwd, "reviewing", { reason: "not a failure declaration", supersedes: ["worker"] });
+		assert.equal(result.ok, true);
+		assert.equal(getNode(db, TEAM_ID)?.phase, "reviewing");
+		const data = eventsOfType(db, "phase_change")[0]!.data as Record<string, unknown>;
+		assert.equal(data.to, "reviewing");
+		assert.equal(data.terminalReason, undefined);
+		assert.ok(!("reason" in data), `a non-failed target must not store the reason: ${JSON.stringify(data)}`);
+	});
+});
+
 test("#309 D1: to failed without a reason stays refused and the team stays put", async () => {
 	await withFixture(async (db, cwd) => {
 		seedPartialFailure(db);

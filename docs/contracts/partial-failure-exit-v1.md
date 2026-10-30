@@ -62,7 +62,7 @@ exhausted rework`）。于是「这张卡不许从这个相位失败」不会被
 |---|---|---|
 | 没声明 `failed` 相位 | 注入的，存在 | **可以**（与 `evaluatePhaseTransition` 看到的是同一张机器） |
 | 声明了 `failed` 相位，但本相位的 `next` 里没有它 | 不存在 | 不可以 |
-| 声明了，但 `actorRole` 指向别的角色 | 存在但不可由本节点取 | 不可以 |
+| 声明了，但 `actorRole` 指向别的角色 | 这条不可由本节点取 | 不可以——**除非**同一相位另有一条未保留的 `failed` 边，那就按那条放行（与书写顺序无关） |
 
 第一行不是漏洞：`normalizePhaseMachine` 的注入从来只**增加可达性、不增加能力**
 （它的文档注释就是这么写的），真正把门的是 `terminalReason` 要求与 `actorRole` 校验。
@@ -91,7 +91,8 @@ exhausted rework`）。于是「这张卡不许从这个相位失败」不会被
 3. 团队里**至少有一个 `status === "settled"` 的直接子节点**。
 
 通过后把这些 id **并集**进 `failedHandledIds`，并在接受路径上写一条
-`node_handled` 持久事件（`data = { handledId, byNodeId, reason? }`）。空数组等价于
+`node_handled` 持久事件（`data = { handledId, byNodeId, reason? }`，`reason` 取自 `note`，不取
+`reason`——后者是团队判负的理由，不是单个失败的审计注解）。空数组等价于
 没传：不校验、不写事件、不改并集。节点表不加列，`reworkCount` 语义与
 `updatedAt < phaseSince` 的时间比较规则一个字都不改。
 
@@ -139,7 +140,10 @@ settled 兄弟，第 3 条校验直接不成立，机器照旧强制判负（`al
   已处理，只是**额外**给出一个由 centurion 署名、带 settled 兄弟作证的来源。
 - 反过来，`updatedAt < phaseSince` **不**因为它存在就自动关闭校验：只要本次请求带了
   `supersedes`，第 1/2/3 条校验照跑（写进账本的每一条 `node_handled` 都必须成立）。
-- 并集去重：同一个 child 同时被两条路覆盖只算一次。
+- 并集去重：两个来源合起来之后不再重复。注意这一层**不可观测**（消费方
+  `children_none_failed` 自己先 `new Set` 再 `has`），所以它只是防御；**真正可验收、也有测试
+  守住的是 `supersededIds` 自身的去重**（重复 entry 只产生一条 `node_handled`）。不要把那个
+  `new Set` 当作可测试条款。
 
 ### D3 — 拒绝文案必须列出真实可达的动作
 

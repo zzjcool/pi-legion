@@ -533,9 +533,10 @@ export function registerLegionTools(pi: ExtensionAPI, options: RegisterLegionToo
 				evidence: Type.Optional(Type.String()),
 				reason: Type.Optional(Type.String({
 					description:
-						'Why the team cannot succeed. Required when to:"failed" — without a non-empty reason ' +
-						'the transition is refused, because a failure nobody explained is indistinguishable ' +
-						'from a team that gave up.',
+						'Why the team cannot succeed. Only meaningful with to:"failed", which requires it — without a ' +
+						'non-empty reason the transition is refused, because a failure nobody explained is ' +
+						'indistinguishable from a team that gave up. Ignored for every other target phase: it is ' +
+						'not stored and does not appear in the resulting phase_change event.',
 				})),
 				supersedes: Type.Optional(Type.Array(Type.String(), {
 					description:
