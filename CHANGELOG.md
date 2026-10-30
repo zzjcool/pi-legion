@@ -34,6 +34,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **A `collect` that bails after claiming no longer silences that round's completion notice.**
+  The claim-once seam claims a terminal result as it hands the snapshot to the tool call, and
+  `collectChild` can still bail afterwards — the parent turn aborts, or persisting the child
+  throws — so that claim has to be rolled back. The rollback now does exactly that and nothing
+  more: it is a no-op for a `(runId, name, round)` a real delivery already claimed, so one failed
+  collect can no longer erase the evidence that the parent has the result — which also
+  resurrected an already-read notice into the next flush. On the job branch it additionally
+  hands the notification route back by clearing `consumedByTool` (re-arming the watch when
+  nothing is collecting any more, the same shape as `wait`'s interrupt branch): the watch gate
+  reads that flag at settle, so leaving it set skipped `onTerminal` and this round was never
+  announced, on the very branch where the pending notice is the only route left. The contract
+  (`docs/contracts/notice-claim-v1.md`, D2) already described this behaviour; the code now
+  matches it (#320).
 - **A `steer` receipt now reports what the child's session actually answered.** `steer` is a
   queue, not an interrupt: the text is enqueued and only consumed at the child's next turn
   boundary — after the current batch of tool calls finishes, before the next LLM call — so a
