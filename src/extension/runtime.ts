@@ -569,6 +569,11 @@ export interface SessionRuntime {
 	 *
 	 * Unlike `unclaimReported` (D7) this does NOT drop queued/buffered copies: after the
 	 * tool route bailed, that notice is the ONLY route left to the parent.
+	 *
+	 * #320: it is a no-op unless THIS seam call took the claim — a key an earlier real
+	 * delivery already claimed is evidence, not something a bail may erase — and on the
+	 * job branch it also hands the notification route back (`consumedByTool`, plus a
+	 * re-armed watch), so that "only route left" actually exists.
 	 */
 	unclaimUndelivered(name: string, snapshot: CollectSnapshot): void;
 	/** Invalidate an in-flight notification watch without dropping the job. */
@@ -676,10 +681,28 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * free for a key that is already claimed — there is deliberately no unclaim on the
 	 * DELIVERY side: a timeout / interrupt / still-running result was never claimed,
 	 * and a claim that did happen has already reached the parent.
+	 *
+	 * Returns whether THIS call is the one that took the claim (#320/1): a `false`
+	 * means a real delivery got there first, and that claim is evidence, not something
+	 * a later rollback may spend.
 	 */
-	const claimReported = (runId: string, name: string, round: number): void => {
-		reported.add(reportKey(runId, name, round));
+	const claimReported = (runId: string, name: string, round: number): boolean => {
+		const key = reportKey(runId, name, round);
+		if (reported.has(key)) return false;
+		reported.add(key);
+		return true;
 	};
+	/**
+	 * #320/1: whether the claim currently standing for a snapshot was taken by the seam
+	 * call that handed the snapshot out (`true`) or was already there (`false`).
+	 *
+	 * `unclaimUndelivered` may only roll back the former. Without this, a bail on a
+	 * `(runId, name, round)` that a real delivery already claimed deleted the evidence
+	 * and resurrected a result the parent had read — the exact failure the claim exists
+	 * to prevent. Written on every claim attempt (including the `false` case): the
+	 * later bail answers for the LATEST attempt, not for an older delivery.
+	 */
+	const claimedNowFor = new WeakMap<CollectSnapshot, boolean>();
 	/**
 	 * D7: revoke the claim AND every not-yet-sent copy of it, atomically.
 	 *
@@ -712,7 +735,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * came from — never by "the newest run seen for this name".
 	 */
 	const claimCachedResult = (name: string, cached: FinishedResult): void => {
-		claimReported(cached.runId, name, cached.round);
+		claimedNowFor.set(
+			cached.snapshot,
+			claimReported(cached.runId, name, cached.round),
+		);
 	};
 	/**
 	 * F1: the `(runId, round)` a snapshot was COLLECTED in.
@@ -742,7 +768,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const claimIfTerminal = (job: TrackedJob, snapshot: CollectSnapshot): CollectSnapshot => {
 		if (!snapshot.blocked && shouldRecycleAfterCollect(snapshot.execution.status)) {
 			const origin = originOf(snapshot, job);
-			claimReported(origin.runId, job.name, origin.round);
+			claimedNowFor.set(
+				snapshot,
+				claimReported(origin.runId, job.name, origin.round),
+			);
+		} else {
+			// Not a result: no claim was taken (D2(b)), so a rollback must not imagine one.
+			claimedNowFor.delete(snapshot);
 		}
 		return snapshot;
 	};
@@ -759,13 +791,35 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * Deliberately narrower than `unclaimReported`: no copies are dropped. The queued /
 	 * buffered notice is the only remaining route to the parent, and D7's question ("the
 	 * parent read it, so revoke") does not apply — nothing was read.
+	 *
+	 * Two #320 refinements, both scoped to the JOB branch, because that is where this
+	 * rollback can still repair something:
+	 *
+	 * 1. Only a claim THIS seam call took is rolled back (`claimedNowFor`). A key that
+	 *    a real delivery claimed earlier is not ours to spend.
+	 * 2. The rollback also hands the NOTIFICATION route back. The seam set
+	 *    `consumedByTool` before the claim, and the watch gate
+	 *    (`!consumedByTool && !notified`) reads it at settle — without clearing the flag
+	 *    (and re-arming a watch when nothing is collecting any more) this round's notice
+	 *    would be suppressed forever, so "the pending notice is the only route left"
+	 *    would be false on exactly the branch that needs it. This is `waitOne`'s
+	 *    WAIT_INTERRUPTED shape, not a new state flag.
 	 */
 	const unclaimUndelivered = (name: string, snapshot: CollectSnapshot): void => {
 		const origin = snapshotOrigins.get(snapshot);
 		// No origin ⇒ this runtime did not collect it, so it cannot have claimed it.
 		// A non-terminal snapshot never claims either (D2(b)).
 		if (!origin) return;
+		// #320/1: the claim of an earlier delivery is evidence, not a loan.
+		if (claimedNowFor.get(snapshot) !== true) return;
+		claimedNowFor.delete(snapshot);
 		reported.delete(reportKey(origin.runId, name, origin.round));
+		// #320/2: only the job this collect belonged to owns `consumedByTool`; a job
+		// tracked since then is a different round with its own watch.
+		const job = jobs.get(name);
+		if (!job || job.runId !== origin.runId || job.round !== origin.round) return;
+		job.consumedByTool = false;
+		if (!job.watching) runtime.watch(name);
 	};
 	/**
 	 * D10 #1: the reporting round per child name.

@@ -5348,3 +5348,148 @@ test("claim D2: a collect that bails before delivering hands its claim back (min
 	assert.equal(messages.length, 1, "exactly once");
 	runtime.dispose();
 });
+
+test("claim D2/#320-2: an abort AFTER the job-branch claim hands the notice route back", async () => {
+	// #320 finding 2. `consumeCollect*` sets `consumedByTool` BEFORE the claim lands, and
+	// the watch gate (`!consumedByTool && !notified`) reads that flag at settle. A bail
+	// that only rolls the CLAIM back leaves the flag set forever, so this round's pushed
+	// notice never recovers — and the D2 note ("the queued/buffered notice is the only
+	// route left") is false on exactly this branch.
+	//
+	// The window under test: the claim is taken on the JOB branch → the parent turn
+	// aborts → `collectChild` bails before anything is rendered. Delete either repair in
+	// `unclaimUndelivered` and this goes red: without the `consumedByTool` reset the
+	// gate skips `onTerminal`, without the re-arm nothing is left to deliver, and
+	// without the claim rollback `deliverBatch` filters the notice out.
+	const messages: SentMessage[] = [];
+	let resolveCollect!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "x",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/x.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	// Deliberately unwatched: the collect tool is the only collector, exactly like the
+	// `waitOne` interrupt case — the rollback has to re-arm the watch itself.
+	const controller = new AbortController();
+	const pending = runtime.consumeCollectInterruptible("x", controller.signal);
+	assert.ok(pending, "the tracked job answers on the JOB branch");
+	assert.ok(runtime.get("x"), "still tracked ⇒ job branch, not the finished cache");
+	assert.equal(runtime.get("x")?.consumedByTool, true, "the tool call owns the notice route");
+
+	resolveCollect(joinSnapshot({ output: "x-out" }));
+	const collected = await pending;
+	assert.equal(collected?.output, "x-out", "the seam handed the claimed snapshot out");
+	// …and NOW the parent turn aborts: after the claim, before the snapshot is rendered.
+	controller.abort();
+	runtime.unclaimUndelivered("x", collected!);
+	assert.equal(
+		runtime.get("x")?.consumedByTool,
+		false,
+		"the bail hands the notice route back (waitOne's WAIT_INTERRUPTED shape)",
+	);
+
+	await waitFor(() => messages.length === 1, "the terminal onTerminal still lands");
+	assert.match(messages[0]!.content, /x-out/);
+	// The result was never delivered, so it must also still be readable.
+	const again = await runtime.consumeCollect("x");
+	assert.equal(again?.output, "x-out", "the result survives the bail");
+	runtime.dispose();
+});
+
+test("claim D2/#320-1: a bail never erases a claim a real delivery already took", async () => {
+	// #320 finding 1. `unclaimUndelivered` used to delete the key unconditionally, so a
+	// bail on a `(runId, name, round)` that a REAL delivery had already claimed erased
+	// the evidence and resurrected a result the parent had read. The seam now reports
+	// whether IT took the claim (`claimedNow`); only that one rolls back.
+	//
+	// Phase A pins the job branch: two collects share one resolved snapshot, the first
+	// delivers, the second finds the key claimed. Recoding `claimedNow` matters here —
+	// a bail that skipped the overwrite would delete the FIRST call's claim and clear
+	// `consumedByTool` with it (red on the flag assertion below).
+	// Phase B pins the cache branch: the resurrected copy is visible as a duplicate
+	// notice for an already-read result, with an unread sibling as positive control.
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+
+	// ── Phase A: judged on the claim the FIRST collect took.
+	runtime.track({
+		name: "held",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/held.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "held-out" }),
+	});
+	const delivered = await runtime.consumeCollect("held");
+	assert.equal(delivered?.output, "held-out", "the tool route delivered this round");
+	const second = await runtime.consumeCollect("held");
+	assert.equal(second?.output, "held-out", "the seam still hands the same snapshot out");
+	runtime.unclaimUndelivered("held", second!);
+	assert.equal(
+		runtime.get("held")?.consumedByTool,
+		true,
+		"a claim this call did not take is left alone — the whole rollback is a no-op",
+	);
+	assert.equal(messages.length, 0, "a delivered result is not announced");
+	runtime.release("held");
+
+	// ── Phase B: the outbox copy of an already-read result must stay filtered.
+	runtime.notifyParentRunStart();
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	for (const name of ["x", "y"]) {
+		runtime.track({
+			name,
+			runId: "r-2",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("x")!(joinSnapshot({ output: "x-out" }));
+	resolvers.get("y")!(joinSnapshot({ output: "y-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both notices held as one batch");
+	await waitFor(
+		() => runtime.get("x") === undefined && runtime.get("y") === undefined,
+		"both released ⇒ the cache branch",
+	);
+
+	// The parent reads x: a real delivery, claimed from the cache (D9).
+	const read = await runtime.consumeCollect("x");
+	assert.equal(read?.output, "x-out");
+	// A LATER collect on the same name bails (abort / persist failure). The key is
+	// already claimed, so the rollback must leave it alone…
+	const bailed = await runtime.consumeCollect("x");
+	assert.equal(bailed?.output, "x-out");
+	runtime.unclaimUndelivered("x", bailed!);
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the sibling still arrives");
+	assert.match(messages[0]!.content, /y-out/, "positive control: the flush really ran");
+	assert.doesNotMatch(
+		messages[0]!.content,
+		/x-out/,
+		"the read result keeps its claim: no second announcement",
+	);
+	assert.equal(messages.length, 1, "exactly one message");
+	runtime.dispose();
+});

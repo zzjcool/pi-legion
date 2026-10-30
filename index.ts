@@ -2175,7 +2175,10 @@ export async function collectChild(
 			// D2: the seam claims a terminal snapshot on the way out, because a flush in
 			// that tick would otherwise repeat it. Every bail from here hands the result
 			// to NOBODY, so the claim is handed back — a permanently suppressed notice
-			// for a result the parent never saw is the worse failure of the two.
+			// for a result the parent never saw is the worse failure of the two. The
+			// runtime only rolls back a claim THIS call took (#320/1) and restores the
+			// notification route with it (#320/2): a result an earlier delivery already
+			// claimed keeps its evidence.
 			if (!collected || signal?.aborted) {
 				if (collected) ctx.runtime.unclaimUndelivered(ctx.name, collected);
 				return ok("interrupted (parent turn ended; children still running)");
