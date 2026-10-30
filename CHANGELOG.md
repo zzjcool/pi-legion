@@ -182,6 +182,21 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   - Contract and the four implementation-time revisions:
     `docs/contracts/notice-claim-v1.md`.
 
+- **A timed-out or aborted verify command no longer leaves its grandchildren running.** Both
+  command runners (`runVerifyCommand` for acceptance, `runLegionCommandNow` for `legion-verify`)
+  killed only the direct child — `bash -lc` / `timeout` — so everything the command had forked
+  was reparented to init and kept running: a `node --test` was still alive 44 minutes after its
+  run with `ppid=1`. Both now spawn `detached: true` (own process group) and, on the timeout,
+  output-cap and abort paths, run the new shared `sweepProcessTree()`
+  (`src/shared/proc-sweep.ts`): group signal first, then every descendant enumerated from
+  procfs (which covers a `setsid` escapee), then `SIGKILL` for whatever outlived the grace — and
+  the runner's promise resolves only **after** that sweep, so a caller that sees a timeout knows
+  the tree is gone. A **normal** exit is deliberately never swept: `cmd &` in a verification
+  command is a legal way to leave a background process behind, so the leftovers are reported
+  instead (one `[legion]` warning naming the command and the surviving pids). `/proc` absent
+  (non-Linux) degrades to the process-group signal and never throws; `ESRCH`/`EPERM` are normal
+  outcomes (#310).
+
 ## [5.0.1] — 2026-10-27
 
 Patch release. **This is the release where 5.0.0's extension-inheritance policy

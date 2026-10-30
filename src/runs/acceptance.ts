@@ -13,6 +13,7 @@
 
 import { spawn } from "node:child_process";
 import { createCappedOutput, resolveMaxOutputBytes } from "../shared/output-cap.ts";
+import { commandSummary, survivingDescendants, sweepProcessTree } from "../shared/proc-sweep.ts";
 import { acquireVerifySlot, queueNote, resolveVerifyQueueConfig } from "./verify-queue.ts";
 import type {
 	AcceptanceCriterion,
@@ -108,32 +109,80 @@ export async function defaultVerifyRunner(
 	}
 }
 
-/** Run one verify command now (no queue), output-capped and timed out. */
+/**
+ * Run one verify command now (no queue), output-capped and timed out.
+ *
+ * The shell runs in its **own process group** (`detached: true`) so the whole
+ * tree can be swept when *we* end the command (#310). Doing so on the timeout,
+ * output-cap and abort paths only — never on a normal exit — is deliberate:
+ * `cmd &` inside a verification command is a legal way to leave a background
+ * process behind, so a clean exit is reported (`survivingDescendants` + one
+ * warning line) instead of killed.
+ */
 export function runVerifyCommand(
 	command: string,
 	cwd: string,
 	timeoutMs: number = DEFAULT_VERIFY_TIMEOUT_MS,
+	signal?: AbortSignal,
 ): Promise<CommandResult> {
 	const limit = timeoutMs > 0 ? timeoutMs : DEFAULT_VERIFY_TIMEOUT_MS;
 	return new Promise((resolve) => {
 		let settled = false;
-		const finish = (result: CommandResult) => {
+		// Set once a sweep is running. A result that arrives mid-sweep is parked
+		// and emitted when the sweep finishes, so the caller that sees a timeout
+		// knows the descendants are already gone (#310).
+		let sweep: Promise<unknown> | null = null;
+		let parked = false;
+
+		const cleanupAbort = () => {
+			if (signal) signal.removeEventListener("abort", onAbort);
+		};
+		const emit = (result: CommandResult) => {
 			if (settled) return;
 			settled = true;
+			clearTimeout(timer);
+			cleanupAbort();
 			resolve(result);
+		};
+		const finish = (result: CommandResult) => {
+			if (settled) return;
+			if (sweep) {
+				if (parked) return;
+				parked = true;
+				void sweep.then(
+					() => emit(result),
+					() => emit(result),
+				);
+				return;
+			}
+			emit(result);
 		};
 
 		const child = spawn("bash", ["-lc", command], {
 			cwd,
 			env: process.env,
+			// Own process group: `bash -lc` forks the real command, so a group id
+			// derived from our own pid would make a tree-wide kill take the host
+			// down with it (#310).
+			detached: true,
 		});
+
+		const sweepTree = (): Promise<unknown> => {
+			if (sweep) return sweep;
+			const pid = child.pid;
+			sweep = pid === undefined
+				? Promise.resolve(null)
+				: sweepProcessTree(pid).catch(() => null);
+			return sweep;
+		};
+		const overflowed = () => out.truncated || err.truncated;
 		const cap = resolveMaxOutputBytes();
 		const killOnOverflow = () => {
 			// Destroying the pipes makes any grandchild writer (bash -lc → cmd)
 			// die of SIGPIPE instead of streaming into a closed-over buffer forever.
 			child.stdout?.destroy();
 			child.stderr?.destroy();
-			child.kill("SIGKILL");
+			sweepTree();
 			clearTimeout(timer);
 			finish({ code: 1, stdout: out.text(), stderr: err.text() });
 		};
@@ -141,24 +190,45 @@ export function runVerifyCommand(
 		const err = createCappedOutput(cap, killOnOverflow);
 		child.stdout?.on("data", (chunk) => out.push(chunk));
 		child.stderr?.on("data", (chunk) => err.push(chunk));
-		const overflowed = () => out.truncated || err.truncated;
 		const timer = setTimeout(() => {
-			child.kill("SIGTERM");
-			setTimeout(() => child.kill("SIGKILL"), 2_000);
+			sweepTree();
 			finish({
 				code: 1,
 				stdout: out.text(),
 				stderr: `${err.text()}\nverification timed out after ${limit}ms`,
 			});
 		}, limit);
+		function onAbort(): void {
+			sweepTree();
+			finish({
+				code: 1,
+				stdout: out.text(),
+				stderr: `${err.text()}\nverification aborted`,
+			});
+		}
+		if (signal) {
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+		}
 		child.on("error", (error) => {
 			clearTimeout(timer);
 			finish({ code: 1, stdout: out.text(), stderr: String(error) });
 		});
 		child.on("close", (code) => {
 			clearTimeout(timer);
+			if (!sweep) reportLeftovers();
 			finish({ code: overflowed() ? 1 : code ?? 1, stdout: out.text(), stderr: err.text() });
 		});
+
+		function reportLeftovers(): void {
+			const pid = child.pid;
+			if (pid === undefined) return;
+			const survivors = survivingDescendants(pid);
+			if (survivors.length === 0) return;
+			console.warn(
+				`[legion] verify command exited leaving ${survivors.length} process(es) running: ${commandSummary(command)} (pids ${survivors.slice(0, 5).join(", ")}${survivors.length > 5 ? ", …" : ""})`,
+			);
+		}
 	});
 }
 

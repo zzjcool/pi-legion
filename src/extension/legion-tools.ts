@@ -2,6 +2,7 @@
 
 import { spawn } from "node:child_process";
 import { createCappedOutput, resolveMaxOutputBytes } from "../shared/output-cap.ts";
+import { commandSummary, survivingDescendants, sweepProcessTree } from "../shared/proc-sweep.ts";
 import { acquireVerifySlot, queueNote, resolveVerifyQueueConfig } from "../runs/verify-queue.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -927,11 +928,11 @@ export async function runVerification(
 }
 
 /** legion-verify command behind the tree-wide verify queue (wait not charged to timeout). */
-export async function runLegionCommand(command: string, cwd: string, timeoutMs: number): Promise<LegionCommandResult> {
+export async function runLegionCommand(command: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<LegionCommandResult> {
 	const config = resolveVerifyQueueConfig();
 	const slot = await acquireVerifySlot(command, config);
 	try {
-		const result = await runLegionCommandNow(command, cwd, timeoutMs);
+		const result = await runLegionCommandNow(command, cwd, timeoutMs, signal);
 		const note = queueNote(slot, config.limit);
 		return note ? { ...result, stderr: `${note}${result.stderr}` } : result;
 	} finally {
@@ -939,26 +940,71 @@ export async function runLegionCommand(command: string, cwd: string, timeoutMs: 
 	}
 }
 
-export function runLegionCommandNow(command: string, cwd: string, timeoutMs: number): Promise<LegionCommandResult> {
+/**
+ * Run one legion-verify command now (no queue), output-capped and timed out.
+ *
+ * `timeout ... bash -lc cmd` runs in its own process group (`detached: true`),
+ * and the timeout, output-cap and abort paths sweep that whole tree before
+ * resolving (#310) — killing the `timeout` process alone used to leave the
+ * shell's own children behind, reparented to init. A normal exit is left
+ * alone on purpose: `cmd &` is a legal way to leave a background process
+ * running, so leftovers are only reported (`survivingDescendants`, one warning
+ * line).
+ */
+export function runLegionCommandNow(command: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<LegionCommandResult> {
 	const limit = timeoutMs > 0 ? timeoutMs : 600_000;
 	return new Promise((resolve) => {
 		let timedOut = false;
 		let settled = false;
-		const child = spawn("timeout", ["--signal=TERM", `${Math.max(1, Math.ceil(limit / 1_000))}s`, "bash", "-lc", command], { cwd, env: process.env });
-		const finish = (code: number) => {
+		// Parked result while a sweep is in flight: the promise must not resolve
+		// before the descendants are gone (#310).
+		let sweep: Promise<unknown> | null = null;
+		let parked = false;
+		const child = spawn("timeout", ["--signal=TERM", `${Math.max(1, Math.ceil(limit / 1_000))}s`, "bash", "-lc", command], {
+			cwd,
+			env: process.env,
+			// Own process group, so a tree-wide kill cannot reach the host (#310).
+			detached: true,
+		});
+		const cleanupAbort = () => {
+			if (signal) signal.removeEventListener("abort", onAbort);
+		};
+		const emit = (code: number) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			cleanupAbort();
 			const overflowed = out.truncated || err.truncated;
 			resolve({ code: overflowed ? 1 : code, stdout: out.text(), stderr: `${err.text()}${extraStderr}`, ...(timedOut ? { timedOut: true } : {}) });
+		};
+		const finish = (code: number) => {
+			if (settled) return;
+			if (sweep) {
+				if (parked) return;
+				parked = true;
+				void sweep.then(
+					() => emit(code),
+					() => emit(code),
+				);
+				return;
+			}
+			emit(code);
+		};
+		const sweepTree = (): Promise<unknown> => {
+			if (sweep) return sweep;
+			const pid = child.pid;
+			sweep = pid === undefined
+				? Promise.resolve(null)
+				: sweepProcessTree(pid).catch(() => null);
+			return sweep;
 		};
 		let extraStderr = "";
 		const cap = resolveMaxOutputBytes();
 		const killOnOverflow = () => {
-			// Destroy pipes so a grandchild writer dies of SIGPIPE, then settle now.
+			// Destroy pipes so a grandchild writer dies of SIGPIPE, then sweep and settle.
 			child.stdout?.destroy();
 			child.stderr?.destroy();
-			child.kill("SIGKILL");
+			sweepTree();
 			finish(1);
 		};
 		const out = createCappedOutput(cap, killOnOverflow);
@@ -968,11 +1014,33 @@ export function runLegionCommandNow(command: string, cwd: string, timeoutMs: num
 		child.on("error", (error) => { extraStderr += String(error); finish(1); });
 		const timer = setTimeout(() => {
 			timedOut = true;
-			child.kill("SIGTERM");
+			sweepTree();
 			extraStderr += `\nverification timed out after ${limit}ms`;
 			finish(1);
 		}, limit + 1_000);
-		child.on("close", (code) => finish(code ?? 1));
+		function onAbort(): void {
+			extraStderr += "\nverification aborted";
+			sweepTree();
+			finish(1);
+		}
+		if (signal) {
+			if (signal.aborted) onAbort();
+			else signal.addEventListener("abort", onAbort, { once: true });
+		}
+		child.on("close", (code) => {
+			if (!sweep) reportLeftovers();
+			finish(code ?? 1);
+		});
+
+		function reportLeftovers(): void {
+			const pid = child.pid;
+			if (pid === undefined) return;
+			const survivors = survivingDescendants(pid);
+			if (survivors.length === 0) return;
+			console.warn(
+				`[legion] verify command exited leaving ${survivors.length} process(es) running: ${commandSummary(command)} (pids ${survivors.slice(0, 5).join(", ")}${survivors.length > 5 ? ", …" : ""})`,
+			);
+		}
 	});
 }
 
