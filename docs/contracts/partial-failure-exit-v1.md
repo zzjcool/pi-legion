@@ -45,6 +45,10 @@ rework 边 → **自锁**。与此同时 `to: "failed"` 在 `requestLegionPhase`
 截断**落库**（返回给模型的消息保留全文，因为它不落库）。成功回执逐字为
 `Team failed by centurion decision: <reason>`。
 
+判负是**终态裁决**，所以它和另外两条终态路径（budget 强制失败、`failTeamIfAllChildrenFailed`）
+一样**给父级发一封邮件**（`kind: notice`、`urgency: action-needed`，正文与回执同源）。父级不应
+靠轮询账本才能发现一个已经结束的团队。
+
 **判负不是聚变**：它只提交 `implementing → failed` 这一条机器本来就声明的边。非法边
 （例如从终态再判负）照旧由状态机拒绝——工具面不为它开特例。
 
@@ -80,6 +84,19 @@ exhausted rework`）。于是「这张卡不许从这个相位失败」不会被
 并且那次判定发生在边查找**之前**。因此 `failed` 边自身携带的 `require` 条件**不**参与
 判定——这正是「判负」的含义：条件恰恰是失败掉的东西。`actorRole` 不同，它管的是
 「谁有权裁决」，所以仍然生效。
+
+**已知边界（有意，保留）：声明判负不收割子节点，且它必须永远可用**。`planning` / `reviewing` /
+`verifying` 这些相位**没有** phase 级 `require`，所以即使还有一个 `status = "running"` 的
+直接子节点，`to:"failed"` + `reason` 依然会被接受；那个子节点**保持 `running`**——判负只改本
+团队自己的相位，不去 `stop` / `retire` 任何人（子节点的进程归父级持有，只有父级能收）。
+
+这不是遗漏，而是这条口子必须**永远可用**的理由本身：若给判负加一条「子节点必须 settled」之类
+的守卫，一个永不结束的子节点（卡死的工具调用、丢掉的 backend、被宿主挂起的 session）就会
+让团队连「认输」都做不到——#309 要消灭的死锁会原样搬到下一个相位，且更坏：那里连
+`to:"failed"` 都没有替代方案。所以收尾的责任被**显式**留在父级：父级调
+`subagent({ action: "stop" })` 收掉仍在 `running` 的子节点；判负本身只负责让团队不再假装
+还在推进。`test/unit/legion-phase-exit.test.ts` 有一条用例钉住现行为（`reviewing` + 一个
+`running` 的 reviewer → 判负被接受、相位变 `failed`、该 child 仍 `running`）。
 
 ### D2 — 让 `handled` 有第二个诚实生产者：显式 `supersedes`
 
@@ -126,6 +143,13 @@ settled 兄弟，第 3 条校验直接不成立，机器照旧强制判负（`al
 
 `node_handled` 事件是**审计**（谁在什么时候把哪个失败认定成已处理），不是**状态**。
 读 `handledIds` 的代码一行都不读这个事件——它的存在不改变任何判定。
+
+**「审计可查」是有保留期限的**：`node_handled` 与 `phase_change` **同级**，不享受
+`src/runs/hygiene.ts` 的 `RETAINED_EVENT_TYPES` 豁免（该名单只有 `orphan_detected` /
+`budget_refused` / `node_abandoned`）。所以团队进入终态（`settled` / `failed`）后，这些行会在
+`eventRetentionDays`（默认 30 天）之后被删，或在 `eventMaxRows`（默认 200 000 行）压力下
+按最旧优先被删。它与 `phase_change` 同寿：够用来回答「这次迁移当时凭什么被放行」，但**不是**
+永久凭据——需要长期留存的证据应落在 MR / 契约文件 / 任务摘要里，而不是指望账本。
 
 #### 与 `updatedAt < phaseSince` 的关系
 
@@ -207,3 +231,5 @@ a child failed and must be handled: pass supersedes:[<failed child>] once a repl
 | 8 | `src/legion/phase-machine.ts`、`nodes` 表 19 列、§7.1 矩阵、19 条原因表**均未改动** |
 | 9 | 卡声明的机器在当前相位没有 `failed` 边（或该边 `actorRole` 保留给其他角色）时，`to:"failed"` 带 `reason` 仍被拒——工具面不替它开特例 |
 | 10 | `reworkCount > 0` + `updatedAt < phaseSince` 这半个来源单独可证：无 `supersedes` 也能放行，且不写 `node_handled`（自动推导不是署名决定） |
+| 11 | 声明判负不收割子节点：`reviewing` + 一个 `running` 的 reviewer，`to:"failed"` + `reason` 仍被接受，相位变 `failed`，该 child 仍 `running`（收尾归父级的 `stop`） |
+| 12 | 声明判负会**给父级发一封邮件**（`from = 本团队`，正文与工具回执同源 `Team failed by centurion decision: <reason>`） |

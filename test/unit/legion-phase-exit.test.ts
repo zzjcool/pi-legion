@@ -21,6 +21,7 @@ import {
 } from "../../src/extension/legion-tools.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
 import { readEventsAfter } from "../../src/legion/events.ts";
+import { inbox } from "../../src/legion/mail.ts";
 import { getNode, insertNode, updateNode } from "../../src/legion/nodes.ts";
 import { describeFailedCondition } from "../../src/legion/phase-conditions.ts";
 import { validatePhaseMachine, type PhaseMachine } from "../../src/legion/phase-machine.ts";
@@ -257,6 +258,14 @@ test("#309 D1: to failed with a reason is a declared parent_decision", async () 
 		assert.equal(data.terminalReason, "parent_decision");
 		assert.equal(data.reason, "worker died");
 		assert.equal(result.message, "Team failed by centurion decision: worker died");
+		// #309 review (minor-2): the verdict must REACH the parent. Before this, the
+		// declared-failure path was the only terminal exit that wrote no mail, so a
+		// parent learned about a failed team only by polling the ledger. The body is
+		// the receipt's own text — one sentence, one source.
+		const mails = inbox(db, "root");
+		assert.equal(mails.length, 1, "a declared failure must put exactly one mail in the parent's inbox");
+		assert.equal(mails[0]!.fromNode, TEAM_ID);
+		assert.equal(mails[0]!.body, "Team failed by centurion decision: worker died");
 	});
 });
 
@@ -272,7 +281,9 @@ test("#309 D1+D2: to failed combined with supersedes audits the handled child fi
 		const result = await request(db, cwd, "failed", { reason: "cannot succeed", supersedes: ["worker"] });
 		assert.equal(result.ok, true);
 		assert.equal(getNode(db, TEAM_ID)?.phase, "failed");
-		assert.deepEqual(readEventsAfter(db, 0).map((event) => event.type), ["node_handled", "phase_change"]);
+		// `mail_sent` trails the transition: the parent is notified AFTER the terminal
+		// fact is on disk, so a mail can never describe a transition that did not land.
+		assert.deepEqual(readEventsAfter(db, 0).map((event) => event.type), ["node_handled", "phase_change", "mail_sent"]);
 		const handled = eventsOfType(db, "node_handled");
 		assert.equal(handled.length, 1);
 		assert.equal((handled[0]!.data as Record<string, unknown>).handledId, "root.team-a.worker");
@@ -322,6 +333,33 @@ test("#309 D1: to failed without a reason stays refused and the team stays put",
 		assert.match(blank.message, /to:"failed" requires a reason/);
 		assert.equal(getNode(db, TEAM_ID)?.phase, "implementing");
 		assert.deepEqual(eventsOfType(db, "phase_change"), []);
+	});
+});
+
+test("#309 review (minor-1): a declared failure is accepted while a child is still running, and it reaps nobody", async () => {
+	// Deliberate, load-bearing behaviour — pinned so that a future "helpful" guard
+	// has to delete this test on purpose.
+	//
+	// `reviewing` has NO phase-level `require`, so `to:"failed"` + `reason` is
+	// accepted even with a `running` reviewer. That is the point: declaring failure
+	// is the escape hatch that must stay reachable in EVERY phase and at EVERY
+	// instant. Adding a `children_settled`-style guard here would rebuild the #309
+	// deadlock one phase later — a child that never settles (wedged tool call, lost
+	// backend) would leave the team with no exit at all, which is exactly the state
+	// this contract exists to remove.
+	//
+	// The cost is stated rather than hidden: declaring failure does NOT harvest
+	// children. The reviewer below stays `running`, and retiring it is the PARENT's
+	// job (`subagent({ action: "stop" })`) because only the parent owns the process.
+	await withFixture(async (db, cwd) => {
+		updateNode(db, TEAM_ID, { phase: "reviewing", phaseSince: PHASE_SINCE + 100 }, () => PHASE_SINCE + 100);
+		insertNode(db, { parentId: TEAM_ID, name: "reviewer", role: "reviewer", status: "running" }, () => PHASE_SINCE + 110);
+		const result = await request(db, cwd, "failed", { reason: "the reviewer is wedged" });
+		assert.equal(result.ok, true, `a running child must not block the escape hatch: ${result.message}`);
+		assert.equal(getNode(db, TEAM_ID)?.phase, "failed");
+		// Nothing reaped it: no status rewrite, no retire event. The parent stops it.
+		assert.equal(getNode(db, "root.team-a.reviewer")?.status, "running", "a declared failure must not harvest a live child");
+		assert.deepEqual(eventsOfType(db, "node_retired"), []);
 	});
 });
 

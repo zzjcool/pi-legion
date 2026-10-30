@@ -62,6 +62,13 @@ const EXPECTED_EVENTS = [
 	"node_retired",
 	"node_resumed",
 	"node_blocked",
+	// `node_abandoned` (hygiene's `markAbandoned`, #233) and `node_handled` (#309)
+	// reached `LEGION_EVENT_TYPES` without the §4.3 list following them, so the
+	// sentinel kept certifying a 14-name contract while the code wrote 16 types.
+	// REV-22 of `docs/legion-v2-contract.md` records the revision; this list moves
+	// with it, on purpose and once.
+	"node_abandoned",
+	"node_handled",
 	"phase_change",
 	"phase_timeout",
 	"mail_sent",
@@ -178,7 +185,7 @@ test("legion v2 contract §4.2 keeps the frozen four-table schema", () => {
 	}
 });
 
-test("legion v2 contract §4.3 keeps exactly the frozen 14 event names", () => {
+test("legion v2 contract §4.3 keeps exactly the frozen 16 event names", () => {
 	const eventsSection = contract.match(/^### 4\.3\b[\s\S]*?(?=^### 4\.4\b)/m)?.[0];
 	assert.ok(eventsSection, "Schema sentinel: contract §4.3 is missing; update this test explicitly when revising the contract.");
 
@@ -201,7 +208,7 @@ test("legion v2 contract §4.3 keeps exactly the frozen 14 event names", () => {
 	assert.deepEqual(
 		[...actualEvents].sort(),
 		[...expectedEvents].sort(),
-		`Schema sentinel: §4.3 must contain exactly 14 events (found ${actualEvents.length}; missing: ${missing.join(", ") || "none"}; unexpected: ${unexpected.join(", ") || "none"}; duplicates: ${duplicates.join(", ") || "none"}). If the contract event set is intentionally revised, update this test explicitly.`,
+		`Schema sentinel: §4.3 must contain exactly 16 events (found ${actualEvents.length}; missing: ${missing.join(", ") || "none"}; unexpected: ${unexpected.join(", ") || "none"}; duplicates: ${duplicates.join(", ") || "none"}). If the contract event set is intentionally revised, update this test explicitly.`,
 	);
 });
 

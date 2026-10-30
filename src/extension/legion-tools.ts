@@ -801,7 +801,15 @@ export async function requestLegionPhase(
 	}, { now });
 	options.eventBus?.emit(phaseEvent);
 	if (decision.notifyParent) await notifyParent(db, self, options.note ?? "centurion returned to planning", options.settings, now, options.eventBus);
-	if (declaredFailure) return { ok: true, phase: decision.to, message: `Team failed by centurion decision: ${failureReason}` };
+	if (declaredFailure) {
+		// #309 review (minor-2): a declared failure is a TERMINAL verdict, so — exactly
+		// like the forced-failure path above and `failTeamIfAllChildrenFailed` — the
+		// parent must hear about it by mail, not only as a tool receipt the centurion's
+		// own model happens to read. Same text as the receipt, one source.
+		const failureNotice = `Team failed by centurion decision: ${failureReason}`;
+		await notifyParent(db, self, failureNotice, options.settings, now, options.eventBus);
+		return { ok: true, phase: decision.to, message: failureNotice };
+	}
 	if (to !== "verifying") return { ok: true, phase: decision.to, message: `Phase changed to ${decision.to}.` };
 
 	const current = getNode(db, nodeId) ?? self;

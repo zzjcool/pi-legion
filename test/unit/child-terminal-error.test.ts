@@ -110,7 +110,7 @@ function makeLegionFixture() {
 	 * ledger row, and the parent run's `children[]` record (`restore()` feeds the
 	 * orchestrator from that record, `reserveNode` re-reads the ledger row).
 	 */
-	const seedChild = async (input: { name: string; status: "failed" | "settled"; phase?: string; withoutSession?: boolean }) => {
+	const seedChild = async (input: { name: string; status: "failed" | "settled"; phase?: string; withoutSession?: boolean; record?: "retired" | "queued" }) => {
 		const nodeId = `root.${input.name}`;
 		const run = runStore.createRun({
 			task: `${input.name} task`,
@@ -130,13 +130,16 @@ function makeLegionFixture() {
 			status: input.status,
 			...(input.phase ? { phase: input.phase } : {}),
 		});
-		if (input.withoutSession) return { run, node, sessionFile };
+		// `withoutSession` alone means "ledger row only" (the tool cannot resolve the
+		// name at all). Asking for a `record` too seeds the OTHER half: a run-store
+		// record whose `sessionFile` is a placeholder, the #266 D3-a queue shape.
+		if (input.withoutSession && !input.record) return { run, node, sessionFile };
 		await runStore.addChild(rootRun.runId, {
 			name: input.name,
 			nodeId: node.id,
 			sessionFile,
 			ownerToken: `${input.name}-token`,
-			state: "retired",
+			state: input.record ?? "retired",
 			spawnedAt: rootRun.createdAt,
 			agent: "worker",
 			kind: "pi",
@@ -334,6 +337,49 @@ test("#309 D4: reviveChild still reports START_FAILED for a non-SubagentError", 
 		assert.match(text, /^continue failed: Error: supervisor backend crashed$/m, `the body keeps the raw error:\n${text}`);
 		assert.doesNotMatch(text, /START_FAILED/, `the code belongs in details.error only:\n${text}`);
 		assert.doesNotMatch(text, /BUDGET_EXCEEDED/, `no budget wording on a spawn failure:\n${text}`);
+	} finally {
+		await extension.cleanup();
+		fx.cleanup();
+	}
+});
+
+test("#309 D4: reviveChild forwards a SECOND launcher code — NOT_FOUND — and still keeps it out of the text", async () => {
+	const fx = makeLegionFixture();
+	const supervisor = new FakeSupervisor();
+	const extension = registerExtension(fx, supervisor);
+	try {
+		// The literal shape the review asked for — a `settled` child with no
+		// `sessionFile` — cannot reach `reviveChild`'s catch on its own: with no
+		// run-store record at all, `controlAction` cannot resolve the name and the
+		// call stops at `unknown child` (also NOT_FOUND, but a LOOKUP failure, not the
+		// catch under test). So the closest constructible shape is seeded here: the
+		// same sessionless ledger row PLUS a `queued` run-store record.
+		//
+		// `queued` is not decoration. It is the one record state whose `sessionFile`
+		// is a PLACEHOLDER (#266 D3-a), so `launch` deliberately refuses to resume
+		// from it and re-reads the ledger (`childFromNode`). That is the site that
+		// raises `legion child has no session to resume` / NOT_FOUND, and it is the
+		// only way to drive a second, non-`CHILD_TERMINAL` SubagentError code through
+		// the catch — which is what proves the passthrough is generic rather than a
+		// special case for one code.
+		await fx.seedChild({ name: "worker-sessionless", status: "settled", withoutSession: true, record: "queued" });
+		const result = await extension.tool.execute(
+			"continue-sessionless-child",
+			{ action: "continue", name: "worker-sessionless", message: "pick the work back up" },
+			undefined,
+			undefined,
+			{ cwd: fx.rootDir, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		const details = result.details as { error?: string } | undefined;
+		assert.equal(details?.error, ErrorCodes.NOT_FOUND, `the second code must survive the catch too: ${details?.error}`);
+		assert.equal(supervisor.spawns.length, 0, "a child with no session must not be relaunched");
+		const text = resultText(result);
+		assert.ok(text.includes("continue failed:"), `the failure is still reported as a failure:\n${text}`);
+		assert.match(text, /legion child has no session to resume: root\.worker-sessionless/, `the message must name the real site, not a lookup miss:\n${text}`);
+		// Both codes, and the family they belong to: the body is for the model, the
+		// code is for the caller. A `NOT_FOUND` splice here would be just as wrong as
+		// the `BUDGET_EXCEEDED` splice #309 removed.
+		assert.doesNotMatch(text, /NOT_FOUND|CHILD_TERMINAL|START_FAILED|BUDGET_EXCEEDED/, `no code may leak into the visible text:\n${text}`);
 	} finally {
 		await extension.cleanup();
 		fx.cleanup();
