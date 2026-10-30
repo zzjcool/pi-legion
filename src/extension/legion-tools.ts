@@ -946,10 +946,15 @@ export async function runLegionCommand(command: string, cwd: string, timeoutMs: 
  * `timeout ... bash -lc cmd` runs in its own process group (`detached: true`),
  * and the timeout, output-cap and abort paths sweep that whole tree before
  * resolving (#310) — killing the `timeout` process alone used to leave the
- * shell's own children behind, reparented to init. A normal exit is left
- * alone on purpose: `cmd &` is a legal way to leave a background process
- * running, so leftovers are only reported (`survivingDescendants`, one warning
- * line).
+ * shell's own children behind, reparented to init. The inner `timeout` is this
+ * runner's real deadline, so an exit of `124` (or death by a signal) counts as
+ * a timeout and is swept too; the `limit + 1s` timer is only a safety net.
+ *
+ * A normal exit is left alone on purpose: `cmd &` is a legal way to leave a
+ * background process running, so leftovers are only reported
+ * (`survivingDescendants`, one warning line) — and a command that has already
+ * exited while an unredirected `cmd &` keeps its pipes open is a normal exit,
+ * not a timeout.
  */
 export function runLegionCommandNow(command: string, cwd: string, timeoutMs: number, signal?: AbortSignal): Promise<LegionCommandResult> {
 	const limit = timeoutMs > 0 ? timeoutMs : 600_000;
@@ -960,6 +965,7 @@ export function runLegionCommandNow(command: string, cwd: string, timeoutMs: num
 		// before the descendants are gone (#310).
 		let sweep: Promise<unknown> | null = null;
 		let parked = false;
+		let leftoversReported = false;
 		const child = spawn("timeout", ["--signal=TERM", `${Math.max(1, Math.ceil(limit / 1_000))}s`, "bash", "-lc", command], {
 			cwd,
 			env: process.env,
@@ -995,10 +1001,35 @@ export function runLegionCommandNow(command: string, cwd: string, timeoutMs: num
 			const pid = child.pid;
 			sweep = pid === undefined
 				? Promise.resolve(null)
-				: sweepProcessTree(pid).catch(() => null);
+				: sweepProcessTree(pid).then(
+					(result) => {
+						// A survivor means a process outlived even SIGKILL (EPERM, a
+						// container boundary). Never report that silently: the whole
+						// point of the sweep is that a timeout can be trusted.
+						if (result.survivors.length > 0) {
+							console.warn(
+								`[legion] verify command sweep left ${result.survivors.length} process(es) running: ${commandSummary(command)} (pids ${result.survivors.slice(0, 5).join(", ")}${result.survivors.length > 5 ? ", …" : ""})`,
+							);
+						}
+						return result;
+					},
+					() => null,
+				);
 			return sweep;
 		};
 		let extraStderr = "";
+		// The inner `timeout(1)` is this runner's real deadline. When it fires it
+		// kills what it can reach and exits 124 (or dies of the signal it
+		// forwarded); a TERM-ignoring leftover that already gave the pipes back
+		// lets `close` fire at once, and that used to be read as a clean exit —
+		// warn, cancel the fallback timer, never sweep. That is this runner's
+		// #310 leak, so 124 / death-by-signal counts as a timeout.
+		const innerTimedOut = (code: number | null): boolean => code === 124 || child.signalCode !== null;
+		const markTimedOut = (): void => {
+			if (timedOut) return;
+			timedOut = true;
+			extraStderr += `\nverification timed out after ${limit}ms`;
+		};
 		const cap = resolveMaxOutputBytes();
 		const killOnOverflow = () => {
 			// Destroy pipes so a grandchild writer dies of SIGPIPE, then sweep and settle.
@@ -1013,9 +1044,18 @@ export function runLegionCommandNow(command: string, cwd: string, timeoutMs: num
 		child.stderr?.on("data", (chunk) => err.push(chunk));
 		child.on("error", (error) => { extraStderr += String(error); finish(1); });
 		const timer = setTimeout(() => {
-			timedOut = true;
+			// `close` waits for stdio to drain, so an unredirected background job
+			// (`bash -lc 'sleep 600 &'`) keeps it pending long after the command
+			// finished. If the direct child itself exited — and did not time out —
+			// this is a normal exit: report the leftovers and keep its own code.
+			const exited = child.exitCode;
+			if (exited !== null && !innerTimedOut(exited)) {
+				reportLeftovers();
+				finish(exited);
+				return;
+			}
+			markTimedOut();
 			sweepTree();
-			extraStderr += `\nverification timed out after ${limit}ms`;
 			finish(1);
 		}, limit + 1_000);
 		function onAbort(): void {
@@ -1028,11 +1068,23 @@ export function runLegionCommandNow(command: string, cwd: string, timeoutMs: num
 			else signal.addEventListener("abort", onAbort, { once: true });
 		}
 		child.on("close", (code) => {
+			// Only when nothing else already ended this command: an output cap or an
+			// abort sets `sweep` first, and `timeout` re-raises the child's death
+			// signal on itself, so a capped `yes` dies of SIGPIPE — that is not a
+			// timeout and must not be reported as one.
+			if (!sweep && innerTimedOut(code)) {
+				markTimedOut();
+				sweepTree();
+				finish(1);
+				return;
+			}
 			if (!sweep) reportLeftovers();
 			finish(code ?? 1);
 		});
 
 		function reportLeftovers(): void {
+			if (leftoversReported) return;
+			leftoversReported = true;
 			const pid = child.pid;
 			if (pid === undefined) return;
 			const survivors = survivingDescendants(pid);

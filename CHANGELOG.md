@@ -189,13 +189,23 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   run with `ppid=1`. Both now spawn `detached: true` (own process group) and, on the timeout,
   output-cap and abort paths, run the new shared `sweepProcessTree()`
   (`src/shared/proc-sweep.ts`): group signal first, then every descendant enumerated from
-  procfs (which covers a `setsid` escapee), then `SIGKILL` for whatever outlived the grace — and
-  the runner's promise resolves only **after** that sweep, so a caller that sees a timeout knows
-  the tree is gone. A **normal** exit is deliberately never swept: `cmd &` in a verification
-  command is a legal way to leave a background process behind, so the leftovers are reported
-  instead (one `[legion]` warning naming the command and the surviving pids). `/proc` absent
-  (non-Linux) degrades to the process-group signal and never throws; `ESRCH`/`EPERM` are normal
-  outcomes (#310).
+  procfs (which covers a `setsid` escapee), then — for as long as the process group still holds a
+  live member, the spawned root included — `SIGKILL` to the group and to every pid the grace left
+  behind, waited for before the runner resolves. That "still a live member" clause is the point:
+  a root that installs a `SIGTERM` handler and never forks used to survive the whole sweep while
+  the timeout result reported no survivors. The runner's promise resolves only **after** that
+  sweep, so a caller that sees a timeout knows the tree is gone; the price is up to
+  `graceMs + killAfterMs` (2.5s) of extra latency on those paths, documented in
+  `docs/contracts/proc-sweep-v1.md`. Two exits are therefore *not* timeouts: a **normal** exit is
+  never swept (`cmd &` in a verification command is a legal way to leave a background process
+  behind — leftovers are reported with one `[legion]` warning naming the command and the pids),
+  and neither is a command that already exited while an unredirected `cmd &` kept its pipes open.
+  `legion-verify` also stops reading its inner `timeout(1)` as a clean exit: `124` (or death by
+  signal) is a timeout, and it is swept too. A sweep that still ends with survivors warns instead
+  of staying silent. `/proc` absent (non-Linux) degrades to the process-group signal and never
+  throws; `ESRCH`/`EPERM` are normal outcomes — but there the clean-exit leftover warning is dead
+  code, because both of its sources are procfs. The `signal` parameter has no production caller
+  yet (abort wiring is a todo). (#310)
 
 ## [5.0.1] — 2026-10-27
 

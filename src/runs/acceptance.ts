@@ -117,7 +117,9 @@ export async function defaultVerifyRunner(
  * output-cap and abort paths only — never on a normal exit — is deliberate:
  * `cmd &` inside a verification command is a legal way to leave a background
  * process behind, so a clean exit is reported (`survivingDescendants` + one
- * warning line) instead of killed.
+ * warning line) instead of killed. Because `close` waits for stdio to drain, a
+ * command that already exited while an unredirected `cmd &` holds the pipes is
+ * a clean exit too — the deadline only ends a command that is still running.
  */
 export function runVerifyCommand(
 	command: string,
@@ -133,6 +135,7 @@ export function runVerifyCommand(
 		// knows the descendants are already gone (#310).
 		let sweep: Promise<unknown> | null = null;
 		let parked = false;
+		let leftoversReported = false;
 
 		const cleanupAbort = () => {
 			if (signal) signal.removeEventListener("abort", onAbort);
@@ -172,7 +175,20 @@ export function runVerifyCommand(
 			const pid = child.pid;
 			sweep = pid === undefined
 				? Promise.resolve(null)
-				: sweepProcessTree(pid).catch(() => null);
+				: sweepProcessTree(pid).then(
+					(result) => {
+						// A survivor means a process outlived even SIGKILL (EPERM, a
+						// container boundary). Never report that silently: the whole
+						// point of the sweep is that a timeout can be trusted.
+						if (result.survivors.length > 0) {
+							console.warn(
+								`[legion] verify command sweep left ${result.survivors.length} process(es) running: ${commandSummary(command)} (pids ${result.survivors.slice(0, 5).join(", ")}${result.survivors.length > 5 ? ", …" : ""})`,
+							);
+						}
+						return result;
+					},
+					() => null,
+				);
 			return sweep;
 		};
 		const overflowed = () => out.truncated || err.truncated;
@@ -191,6 +207,17 @@ export function runVerifyCommand(
 		child.stdout?.on("data", (chunk) => out.push(chunk));
 		child.stderr?.on("data", (chunk) => err.push(chunk));
 		const timer = setTimeout(() => {
+			// `close` waits for stdio to drain, so an unredirected background job
+			// (`bash -lc 'sleep 600 &'`) keeps it pending long after the command
+			// itself finished. Once the direct child has exited the command is
+			// over: report the leftovers and keep its own exit code instead of
+			// mislabelling a success as a timeout and killing a legal process.
+			const exited = child.exitCode;
+			if (exited !== null) {
+				reportLeftovers();
+				finish({ code: overflowed() ? 1 : exited, stdout: out.text(), stderr: err.text() });
+				return;
+			}
 			sweepTree();
 			finish({
 				code: 1,
@@ -221,6 +248,8 @@ export function runVerifyCommand(
 		});
 
 		function reportLeftovers(): void {
+			if (leftoversReported) return;
+			leftoversReported = true;
 			const pid = child.pid;
 			if (pid === undefined) return;
 			const survivors = survivingDescendants(pid);

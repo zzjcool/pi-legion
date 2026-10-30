@@ -13,17 +13,27 @@
  * A normal exit is deliberately never swept: `cmd &` in a verification command
  * is a legal way to leave a background process behind, and killing it would
  * break that usage. Those leftovers are reported instead (see
- * `survivingDescendants`).
+ * `survivingDescendants`). A command that has *exited* while an unreaped
+ * background job keeps its pipes open is a normal exit too — the runners say so
+ * explicitly by reading `child.exitCode` before their own deadline counts as a
+ * timeout.
  *
  * Contract:
  *  - never throws — every syscall is guarded, and `sweepProcessTree` resolves
  *    even for a pid that never existed (`ESRCH`) or that belongs to someone
  *    else (`EPERM`);
+ *  - `rootPid` is watched like any descendant: after an `exec` it is the only
+ *    process there is, so an escalation gated on "a descendant survived" would
+ *    let a root that ignores the first signal live on while reporting
+ *    `survivors: []`;
  *  - `/proc` unavailable (non-Linux) degrades to "signal the process group",
  *    which is still the correct group because the caller spawned detached;
  *  - the returned promise is the completion signal: when it settles, the grace
  *    period and the `SIGKILL` escalation have already run, so a caller that
- *    reports a timeout knows the descendants are gone.
+ *    reports a timeout knows the descendants are gone. That is up to
+ *    `graceMs + killAfterMs` of extra latency (2.5s with the defaults), paid
+ *    only by the paths that end a command themselves — see
+ *    `docs/contracts/proc-sweep-v1.md`.
  */
 
 import { readFileSync, readdirSync } from "node:fs";
@@ -35,7 +45,7 @@ export type SweepResult = {
 	signaled: number;
 	/** Successful `SIGKILL` deliveries (the process group counts once, like `signaled`). */
 	killed: number;
-	/** Descendant pids still alive after the `SIGKILL` escalation, ascending. */
+	/** Pids still alive after the `SIGKILL` escalation (root included), ascending. */
 	survivors: number[];
 };
 
@@ -71,9 +81,10 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Signal one pid or negative process-group id. A dead, reaped or
- * permission-denied target is a normal outcome here, never an error.
+ * permission-denied target is a normal outcome here, never an error. Signal `0`
+ * is the existence probe: no signal is delivered.
  */
-function signalTarget(target: number, signal: NodeJS.Signals): boolean {
+function signalTarget(target: number, signal: NodeJS.Signals | 0): boolean {
 	try {
 		process.kill(target, signal);
 		return true;
@@ -150,6 +161,23 @@ function groupMembers(pgid: number): number[] {
 	return pids;
 }
 
+/**
+ * Live (non-zombie) members of `groupTarget`, leader excluded — `null` where
+ * there is no procfs to enumerate and only the `kill(-pgid, 0)` probe is left.
+ *
+ * This is the "is there anything left to escalate against?" question, asked
+ * after the grace expired. Going through procfs so that a **zombie** counts as
+ * gone keeps it consistent with `isAlive`: an exited process only waits to be
+ * reaped and `kill(-pgid, 0)` still succeeds for it — counting that as a live
+ * group would make every clean sweep report a `SIGKILL` it never needed to
+ * send. The group leader is not listed here; it is in `watched`, so it already
+ * answered for itself.
+ */
+function liveGroupMembers(groupTarget: number): number[] | null {
+	if (process.platform !== "linux" || groupTarget >= 0) return null;
+	return groupMembers(-groupTarget).filter(isAlive);
+}
+
 /** Poll `pids` until all are gone or `timeoutMs` elapses; returns the survivors. */
 async function waitForDeath(pids: Set<number>, timeoutMs: number): Promise<number[]> {
 	const deadline = Date.now() + timeoutMs;
@@ -190,7 +218,13 @@ export async function sweepProcessTree(
 	// there is no group to signal, so the direct child is signalled instead —
 	// exactly what the pre-#310 code did, so nothing regresses there.
 	const groupTarget = process.platform === "win32" ? rootPid : -rootPid;
-	const watched = process.platform === "win32" ? new Set([rootPid, ...known]) : known;
+	// `rootPid` is watched as well, on every platform: it is the process the
+	// caller actually spawned, and after an `exec` it is the *only* process
+	// there is. Watching descendants alone meant a root that installs a SIGTERM
+	// handler and never forks fell through the escalation at the bottom of this
+	// function — no SIGKILL, and `survivors: []`, i.e. a timeout that resolved
+	// while the process lived on.
+	const watched = new Set([rootPid, ...known]);
 
 	let signaled = 0;
 	if (signalTarget(groupTarget, firstSignal)) signaled += 1;
@@ -206,19 +240,32 @@ export async function sweepProcessTree(
 	for (const descendant of safeDescendants(rootPid)) {
 		if (known.has(descendant.pid)) continue;
 		known.add(descendant.pid);
+		watched.add(descendant.pid);
 		if (isAlive(descendant.pid)) doomed.push(descendant.pid);
 	}
 
 	let killed = 0;
-	if (doomed.length > 0) {
+	// The group is SIGKILLed whenever it still has a live member, not only when
+	// an *enumerated* pid survived: a member reachable only by its pgid (a
+	// grandchild reparented to init mid-grace) is covered by this clause alone.
+	const groupOnly = liveGroupMembers(groupTarget);
+	const escalateGroup = groupOnly === null
+		? signalTarget(groupTarget, 0)
+		: groupOnly.length > 0;
+	// Everything the SIGKILL targets has to be waited for afterwards, group-only
+	// members included. Settling the promise while one of them is still on its
+	// way out would make "the tree is gone" a guess, and `survivors` a lie.
+	const condemned = new Set(doomed);
+	for (const pid of groupOnly ?? []) condemned.add(pid);
+	if (escalateGroup || condemned.size > 0) {
 		if (signalTarget(groupTarget, "SIGKILL")) killed += 1;
-		for (const pid of doomed) {
+		for (const pid of condemned) {
 			if (signalTarget(pid, "SIGKILL")) killed += 1;
 		}
-		await waitForDeath(new Set(doomed), killAfterMs);
+		if (condemned.size > 0) await waitForDeath(condemned, killAfterMs);
 	}
 
-	const survivors = [...known].filter(isAlive).sort((a, b) => a - b);
+	const survivors = [...watched].filter(isAlive).sort((a, b) => a - b);
 	return { signaled, killed, survivors };
 }
 
