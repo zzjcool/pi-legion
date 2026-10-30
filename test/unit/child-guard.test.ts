@@ -7,6 +7,7 @@ import {
 	isReadOnlyRole,
 	registerChildGuard,
 } from "../../src/extension/child-guard.ts";
+import { BUILTIN_AGENTS_DIR, loadAgentsFromDir } from "../../src/agents/agents.ts";
 import {
 	MAX_TOOL_CALLS_ENV,
 	MAX_TURNS_ENV,
@@ -158,6 +159,59 @@ test("child-guard wraps bash with timeout after classifying", () => {
 	} finally {
 		if (previous === undefined) delete process.env[TOOL_TIMEOUT_MS_ENV];
 		else process.env[TOOL_TIMEOUT_MS_ENV] = previous;
+	}
+});
+
+test("#315 scout's 600s budget wraps a bash call as `timeout --kill-after=2s 600s bash -lc …`", () => {
+	// The number comes from the shipped scout card, not from a literal: this is
+	// the whole chain #315 froze — card → env → child-guard → wrapped command.
+	const scout = loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin").find(
+		(agent) => agent.name === "scout",
+	);
+	assert.ok(scout?.toolTimeoutMs, "scout must declare a per-bash timeout");
+	const previous = process.env[TOOL_TIMEOUT_MS_ENV];
+	process.env[TOOL_TIMEOUT_MS_ENV] = String(scout.toolTimeoutMs);
+	try {
+		const pi = guardPi();
+		registerChildGuard(pi as never);
+		const handler = pi.events.get("tool_call") as (event: {
+			toolName: string;
+			input: { command: string };
+		}) => unknown;
+		const event = { toolName: "bash" as const, input: { command: "rg -n main src" } };
+		assert.equal(handler(event), undefined);
+		assert.match(event.input.command, /^timeout --kill-after=2s 600s bash -lc /);
+		assert.match(event.input.command, /rg -n main src/);
+
+		// Existing behaviour kept: an already-bounded command is not wrapped a
+		// second time (a nested `timeout` would shrink the outer bound to the
+		// inner one and report the wrong failure).
+		const already = { toolName: "bash" as const, input: { command: "timeout 5s rg foo" } };
+		assert.equal(handler(already), undefined);
+		assert.equal(already.input.command, "timeout 5s rg foo");
+	} finally {
+		if (previous === undefined) delete process.env[TOOL_TIMEOUT_MS_ENV];
+		else process.env[TOOL_TIMEOUT_MS_ENV] = previous;
+	}
+});
+
+test("#315 a role with no toolTimeoutMs keeps its bash commands untouched", () => {
+	// worker / centurion deliberately have no default: a full build or
+	// integration run must not be killed at a bound nobody chose.
+	const previous = process.env[TOOL_TIMEOUT_MS_ENV];
+	delete process.env[TOOL_TIMEOUT_MS_ENV];
+	try {
+		const pi = guardPi();
+		registerChildGuard(pi as never);
+		const handler = pi.events.get("tool_call") as (event: {
+			toolName: string;
+			input: { command: string };
+		}) => unknown;
+		const event = { toolName: "bash" as const, input: { command: "npm run test:integration" } };
+		assert.equal(handler(event), undefined);
+		assert.equal(event.input.command, "npm run test:integration");
+	} finally {
+		if (previous !== undefined) process.env[TOOL_TIMEOUT_MS_ENV] = previous;
 	}
 });
 

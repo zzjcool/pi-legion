@@ -259,6 +259,45 @@ test("inprocess: maxActive limit is independent of RPC keys", async () => {
 	}
 });
 
+test("#315 inprocess: the in-flight tool rides the session event stream already consumed", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const session = h.sessions[0]!;
+		assert.equal(
+			h.supervisor.inFlightTool("root.worker"),
+			undefined,
+			"an idle child is inside no tool",
+		);
+
+		session.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: {} });
+		const started = h.supervisor.inFlightTool("root.worker");
+		assert.equal(started?.tool, "bash");
+		assert.equal(started?.toolCallId, "t1");
+		assert.equal(typeof started?.startedAt, "number");
+
+		session.emit({ type: "tool_execution_end", toolCallId: "t1", toolName: "bash" });
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+
+		// An abort can end the turn while the tool is still running, so no end
+		// event ever arrives: a settled turn must not keep claiming a tool.
+		session.emit({ type: "tool_execution_start", toolCallId: "t2", toolName: "codemode", args: {} });
+		assert.equal(h.supervisor.inFlightTool("root.worker")?.tool, "codemode");
+		session.settle();
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+
+		// A child this backend no longer runs answers nothing, whatever the record
+		// still holds — the fact describes a live process, not a memory.
+		session.emit({ type: "tool_execution_start", toolCallId: "t3", toolName: "bash", args: {} });
+		assert.equal(h.supervisor.inFlightTool("root.worker")?.tool, "bash");
+		await h.supervisor.retire("root.worker");
+		assert.equal(h.supervisor.isAlive("root.worker"), false);
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+	} finally {
+		h.close();
+	}
+});
+
 test("routing: inprocess vs rpc by spawnMode; name cannot cross backends", async () => {
 	const root = mkdtempSync(path.join(tmpdir(), "legion-routing-"));
 	const sessions: FakeSession[] = [];
@@ -296,6 +335,45 @@ test("routing: inprocess vs rpc by spawnMode; name cannot cross backends", async
 
 		sessions[0]!.settle();
 		await routing.retire("root.ip");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#315 routing: inFlightTool is forwarded to the owning backend", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-routing-activity-"));
+	const sessions: FakeSession[] = [];
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			const session = new FakeSession();
+			sessions.push(session);
+			return session;
+		},
+	});
+	const rpc = new RpcSupervisor({
+		clientFactory: () => {
+			throw new Error("rpc factory should not run in this test");
+		},
+		enumerateDescendants: () => [],
+	});
+	const routing = new RoutingSupervisor({ rpc, inprocess });
+	try {
+		await routing.spawnChild(
+			testInput(root, "root.ip", testAgent({ spawnMode: "inprocess" })),
+		);
+		assert.equal(routing.inFlightTool("root.ip"), undefined);
+
+		sessions[0]!.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: {} });
+		assert.equal(routing.inFlightTool("root.ip")?.tool, "bash");
+
+		// A name neither backend runs answers nothing: the pre-spawn fallback
+		// must not invent activity for a record this process does not hold.
+		assert.equal(routing.inFlightTool("root.ghost"), undefined);
+
+		sessions[0]!.settle();
+		await routing.retire("root.ip");
+		assert.equal(routing.inFlightTool("root.ip"), undefined);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

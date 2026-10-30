@@ -107,6 +107,48 @@ test("legion status name matches renderLiveChildStatus, including a stale live c
 	});
 });
 
+test("#315 legion status leads a child block with the tool it is inside", async () => {
+	await withTempDir(async (dir) => {
+		const sessionFile = `${dir}/worker-0.jsonl`;
+		writeFileSync(sessionFile, "{\"type\":\"message\"}\n");
+		const now = 1_000_000;
+		const base: LegionChildStatusFacts = {
+			name: "worker-0",
+			state: "working",
+			agent: "worker",
+			kind: "pi",
+			sessionFile,
+			alive: true,
+			activity: { tool: "bash", startedAt: now - 12_000 },
+		};
+		const report = renderLegionStatus({
+			query: "worker-0",
+			nodes: [],
+			lookupChild: () => base,
+			now,
+		});
+		assert.equal(report.ok, true);
+		assert.match(report.text, /^working · bash 00:00:12$/m);
+		// Same renderer as `subagent status`: the slash command cannot drift.
+		assert.equal(
+			report.text.split("\n")[0],
+			"working · bash 00:00:12",
+			"the activity line leads the block",
+		);
+
+		// No activity fact (a rebuilt record from another session): no line, and
+		// the block is exactly what it was before #315.
+		const { activity: _activity, ...withoutActivity } = base;
+		const plain = renderLegionStatus({
+			query: "worker-0",
+			nodes: [],
+			lookupChild: () => withoutActivity,
+			now,
+		});
+		assert.equal(plain.text, renderLiveChildStatus({ ...withoutActivity, now }));
+	});
+});
+
 test("legion status renders the arbitrated spawnMode from the child record (D5)", async () => {
 	await withTempDir(async (dir) => {
 		const sessionFile = `${dir}/worker-0.jsonl`;

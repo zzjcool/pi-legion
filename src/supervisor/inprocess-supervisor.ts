@@ -52,6 +52,7 @@ import {
 } from "./admission-queue.ts";
 import type {
 	AbortOutcome,
+	ChildActivity,
 	ChildHandle,
 	EventSubscriptionOptions,
 	LegionSupervisor,
@@ -66,6 +67,7 @@ import {
 	countClearedQueue,
 	DEFAULT_ABORT_TIMEOUT_MS,
 	MAX_ABORT_TIMER_DELAY_MS,
+	nextInFlightTool,
 	toSteerDisposition,
 } from "./types.ts";
 
@@ -337,6 +339,13 @@ interface ChildRecord {
 	pendingFailure?: string;
 	/** Identity reused by every later dispatch into this child (tools inherit it). */
 	context: ChildLaunchContext;
+	/**
+	 * The tool call this child is inside right now (#315), folded from its own
+	 * session event stream — no extra IPC, no polling. Cleared by the matching
+	 * `tool_execution_end` and by `agent_settled`: a settled turn has no tool
+	 * running, so nothing may be left claiming one. Display-only.
+	 */
+	inFlightTool?: ChildActivity;
 	/**
 	 * A19: an admission slot is freed exactly once per departure from the live
 	 * set. All three release points (`retireChild`, `rollbackSpawn`,
@@ -1258,6 +1267,19 @@ export class InProcessSupervisor implements LegionSupervisor {
 		return child.state !== "retired" && child.state !== "exited";
 	}
 
+	/**
+	 * The tool call this child is inside right now (#315), or `undefined`.
+	 *
+	 * Gated on {@link isAlive}: a child this backend is not running holds no
+	 * handle and therefore cannot be inside a tool, whatever a leftover record
+	 * field still says (display-liveness §6 — never attribute live activity to a
+	 * process that is gone).
+	 */
+	inFlightTool(name: string): ChildActivity | undefined {
+		if (!this.isAlive(name)) return undefined;
+		return this.children.get(name)?.inFlightTool;
+	}
+
 	async stats(name: string): Promise<UsageSnapshot | null> {
 		const child = this.children.get(name);
 		if (!child || !child.session || !this.isAlive(name)) return null;
@@ -1516,6 +1538,10 @@ export class InProcessSupervisor implements LegionSupervisor {
 	private handleSessionEvent(child: ChildRecord, event: unknown): void {
 		const record = recordOf(event);
 		if (!record || typeof record.type !== "string") return;
+		// #315: the in-flight tool fact rides the event stream this backend
+		// already consumes. Nothing new is asked of the child, and the fold is
+		// total, so an event about anything else leaves the fact untouched.
+		child.inFlightTool = nextInFlightTool(child.inFlightTool, record, Date.now());
 		this.updateTurnState(child, record);
 		this.publishEvent(child, record);
 	}
@@ -1555,6 +1581,10 @@ export class InProcessSupervisor implements LegionSupervisor {
 		child.pendingFailure = undefined;
 		child.abortedPending = false;
 		child.turnActive = false;
+		// #315: an abort can land while a tool is mid-flight, in which case no
+		// `tool_execution_end` ever arrives. A settled turn holds no tool, so the
+		// fact is dropped here rather than outliving the turn it described.
+		child.inFlightTool = undefined;
 		child.lastTurnResult = result;
 		if (child.state !== "retiring") child.state = "idle";
 		this.resolveWaiters(child, result);

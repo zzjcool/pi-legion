@@ -26,6 +26,7 @@ import {
 } from "./ui-proxy.ts";
 import {
 	type AbortOutcome,
+	type ChildActivity,
 	type ChildHandle,
 	type DescendantInfo,
 	type EventSubscriptionOptions,
@@ -46,6 +47,7 @@ import {
 	countClearedQueue,
 	DEFAULT_ABORT_TIMEOUT_MS,
 	MAX_ABORT_TIMER_DELAY_MS,
+	nextInFlightTool,
 	toSteerDisposition,
 } from "./types.ts";
 import { currentPgid, enumerateDescendants } from "./proc-tree.ts";
@@ -84,6 +86,13 @@ interface ChildRecord {
 	unsubscribeRpcEvents?: () => void;
 	retirePromise?: Promise<void>;
 	abortedPending: boolean;
+	/**
+	 * The tool call this child is inside right now (#315), folded from its own RPC
+	 * event stream — no extra IPC, no polling. Cleared by the matching
+	 * `tool_execution_end` and by `agent_settled`: a settled turn has no tool
+	 * running, so nothing may be left claiming one. Display-only.
+	 */
+	inFlightTool?: ChildActivity;
 }
 
 export type { RpcSupervisorOptions } from "./types.ts";
@@ -612,6 +621,19 @@ export class RpcSupervisor implements LegionSupervisor {
 		return child.state !== "retired" && child.state !== "exited";
 	}
 
+	/**
+	 * The tool call this child is inside right now (#315), or `undefined`.
+	 *
+	 * Gated on {@link isAlive}: a child whose process is gone holds no handle and
+	 * therefore cannot be inside a tool, whatever a leftover record field still
+	 * says (display-liveness §6 — never attribute live activity to a process that
+	 * is gone).
+	 */
+	inFlightTool(name: string): ChildActivity | undefined {
+		if (!this.isAlive(name)) return undefined;
+		return this.children.get(name)?.inFlightTool;
+	}
+
 	async stats(name: string): Promise<UsageSnapshot | null> {
 		const child = this.children.get(name);
 		if (!child || !child.client || !this.isAlive(name)) return null;
@@ -822,6 +844,11 @@ export class RpcSupervisor implements LegionSupervisor {
 			return;
 		}
 
+		// #315: the in-flight tool fact rides the RPC event stream this backend
+		// already consumes. Nothing new is asked of the child, and the fold is
+		// total, so an event about anything else leaves the fact untouched.
+		child.inFlightTool = nextInFlightTool(child.inFlightTool, record, Date.now());
+
 		this.updateTurnState(child, record);
 
 		this.publishEvent(child, record);
@@ -853,6 +880,11 @@ export class RpcSupervisor implements LegionSupervisor {
 		};
 		child.abortedPending = false;
 		child.turnActive = false;
+		// #315: an abort or a child-side interruption can end a turn while a tool
+		// is mid-flight, in which case no `tool_execution_end` ever arrives. A
+		// settled turn holds no tool, so the fact is dropped here instead of
+		// outliving the turn it described.
+		child.inFlightTool = undefined;
 		child.lastTurnResult = result;
 		if (child.state !== "retiring") child.state = "idle";
 		this.resolveWaiters(child, result);

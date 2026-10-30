@@ -13,6 +13,30 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Added
 
+- **`status` now says what a live child is doing and for how long — `working · bash 00:07:31` —
+  and marks a single tool that has run unchanged for five minutes.** "The process is alive but has
+  stopped progressing" was invisible everywhere: the strongest `liveness()` rule calls any child
+  holding a non-terminal handle `live`, the heartbeat refreshes for exactly those children, and the
+  orphan scan exempts a node whose first root child is still alive, so a child stuck inside one
+  tool call looked identical to one doing useful work and the parent learned otherwise only when
+  its 900s `collect` deadline fired. Both backends now record the one tool call a child is inside —
+  tool name plus the host clock reading when its own `tool_execution_start` arrived — onto the child
+  record, folded from the session event stream each backend already consumes (no new IPC, no
+  polling, no new state machine). `subagent({ action: "status" })`, the `all: true` overview and
+  `/legion status <name>` lead each block with that fact and, at or past
+  `STALL_NOTICE_MS = 300_000`, append a marker naming how many whole minutes the call has been
+  stuck and which lever can move it — `steer` cannot reach a child that is inside a tool call
+  (#313), `abort` can (#314).
+  **This is display only**: `liveness()` is untouched, no heartbeat or orphan-scan criterion moved,
+  and nothing is ever auto-killed, aborted or retired — the marker names the levers, the parent
+  still pulls them. A child with no in-flight tool renders exactly the pre-#315 block, byte for
+  byte. The one behaviour change is that the read-only `scout` role now declares
+  `toolTimeoutMs: 600000`, because `toolTimeoutMs` had no default and the SDK bash tool has no
+  default timeout, so a single hung probe could pin a recon child for its whole turn budget and
+  report nothing; `worker` and `centurion` deliberately keep no default, since killing a
+  slow-but-progressing build or integration run costs more than the hang it would prevent. Contract and the frozen boundary:
+  `docs/contracts/stall-visibility-v1.md` (#315).
+
 - **`subagent({ action: "abort" })` stops a child's current turn without killing it.** The
   capability was already sitting in the supervisor (`LegionSupervisor.abort`, `RpcSupervisor`,
   `InProcessSupervisor`, `Orchestrator.abort`) with zero call sites and no action on the tool

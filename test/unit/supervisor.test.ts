@@ -818,6 +818,41 @@ test("isAlive is a pure process-state query", async () => {
 	}
 });
 
+test("#315 rpc: the in-flight tool rides the RPC event stream already consumed", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const client = h.clients[0]!;
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+
+		client.emit({ type: "tool_execution_start", toolCallId: "call-1", toolName: "bash" });
+		const started = h.supervisor.inFlightTool("root.worker");
+		assert.equal(started?.tool, "bash");
+		assert.equal(started?.toolCallId, "call-1");
+		assert.equal(typeof started?.startedAt, "number");
+
+		client.emit({ type: "tool_execution_end", toolCallId: "call-1", toolName: "bash" });
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+
+		// Abort mid-tool: the turn settles with no end event, so the fact is
+		// dropped at settle instead of outliving the turn it described.
+		client.emit({ type: "tool_execution_start", toolCallId: "call-2", toolName: "codemode" });
+		assert.equal(h.supervisor.inFlightTool("root.worker")?.tool, "codemode");
+		emitSettled(client);
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+
+		// A dead child answers nothing, whatever the record still holds.
+		client.emit({ type: "tool_execution_start", toolCallId: "call-3", toolName: "bash" });
+		assert.equal(h.supervisor.inFlightTool("root.worker")?.tool, "bash");
+		client.process.exit(9, null);
+		assert.equal(h.supervisor.isAlive("root.worker"), false);
+		assert.equal(h.supervisor.inFlightTool("root.worker"), undefined);
+	} finally {
+		await h.supervisor.retire("root.worker").catch(() => {});
+		h.close();
+	}
+});
+
 test("unexpected process exit immediately resolves waitSettled as abnormal", async () => {
 	const h = harness();
 	try {
