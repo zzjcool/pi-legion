@@ -9,7 +9,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { LegionSettings } from "../shared/types.ts";
+import type { LegionSettings, TurnRecord } from "../shared/types.ts";
 import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
@@ -84,6 +84,13 @@ export interface LegionPostmanOptions {
 	intervalMs?: number;
 	/** #298: the team root's declared phase machine (absent = built-in). */
 	machine?: PhaseMachine;
+	/**
+	 * Test seam for the DELIVERED evidence scan: read the recipient's turns from a
+	 * session file. Defaults to `parseSessionFile(file).turns`, and the postman calls
+	 * it **once per seam per tick** (#338 minor 2), so a counter injected here can
+	 * prove the whole confirmation pass shares one projection.
+	 */
+	parseTurns?: (sessionFile: string) => readonly Pick<TurnRecord, "userText">[];
 }
 
 /** Poll and deliver mail only for children hosted by this process. */
@@ -97,6 +104,9 @@ export class LegionPostman {
 	private readonly sendSelfMessage: (text: string) => void;
 	private readonly resumeChild?: LegionPostmanOptions["resumeChild"];
 	private readonly machine?: PhaseMachine;
+	private readonly parseTurns: (sessionFile: string) => readonly Pick<TurnRecord, "userText">[];
+	/** Per-seam confirmation cursor (#338 M3): the last message id this seam scanned. */
+	private readonly confirmCursor = new Map<string, number>();
 	private readonly now: () => number;
 	private readonly intervalMs: number;
 	private timer: ReturnType<typeof setInterval> | undefined;
@@ -114,6 +124,7 @@ export class LegionPostman {
 		this.sendSelfMessage = options.sendSelfMessage ?? (() => {});
 		this.resumeChild = options.resumeChild;
 		this.machine = options.machine;
+		this.parseTurns = options.parseTurns ?? ((sessionFile) => parseSessionFile(sessionFile).turns);
 		this.now = options.now ?? Date.now;
 		this.intervalMs = options.intervalMs ?? POSTMAN_INTERVAL_MS;
 	}
@@ -216,8 +227,20 @@ export class LegionPostman {
 	 *
 	 * DELIVERED comes from evidence only: the recipient's session file shows the
 	 * exact injected text (see `mailReachedTurns`). OBSOLETE is the #333 rule. Any
-	 * message that cannot be decided stays ACCEPTED for the next tick, and the scan
-	 * stops at `ACCEPTED_MAIL_CONFIRM_LIMIT` messages per tick.
+	 * message that cannot be decided stays ACCEPTED and is rescanned later.
+	 *
+	 * Two bounds keep a 2s loop honest (#338):
+	 *
+	 * - **Per-seam cursor rotation (M3).** Each seam remembers the id it scanned up
+	 *   to and the next tick asks for `id > cursor`, wrapping to the head after the
+	 *   tail. Re-reading the oldest `ACCEPTED_MAIL_CONFIRM_LIMIT` rows every tick let
+	 *   20 undecidable messages hold the window forever, which stops the confirm *and*
+	 *   obsolete paths permanently — a deadlock, not a delay. Rotation guarantees
+	 *   every ACCEPTED message is rescanned, worst case
+	 *   `ceil(inbox / ACCEPTED_MAIL_CONFIRM_LIMIT)` ticks later.
+	 * - **One parse per seam per tick (minor 2).** `parseSessionFile` projects the
+	 *   whole session; parsing it per message paid that cost up to 20 times a tick.
+	 *   The turns are read once and reused by every message judged for that seam.
 	 */
 	private confirmAcceptedMail(children: readonly LegionNode[]): void {
 		let remaining = ACCEPTED_MAIL_CONFIRM_LIMIT;
@@ -225,21 +248,28 @@ export class LegionPostman {
 			id: child.id,
 			sessionFile: child.sessionFile,
 		}));
+		// #338 M1: the root row records this session's file at creation
+		// (`createRootLegion`), so mail addressed to `root` has evidence to compare
+		// against instead of sitting at ACCEPTED forever.
 		if (this.nodeId === "root") seams.push({ id: "root", sessionFile: getNode(this.db, "root")?.sessionFile ?? null });
 		for (const seam of seams) {
 			if (remaining <= 0) return;
 			let messages: LegionMessage[];
 			try {
-				messages = inbox(this.db, seam.id, { delivery: MAIL_DELIVERY.ACCEPTED, limit: remaining });
+				messages = this.nextAcceptedPage(seam.id, remaining);
 			} catch {
 				continue;
 			}
+			if (messages.length === 0) continue;
+			// One projection for the whole seam. `null` means "nothing readable", not
+			// "not delivered": an unreadable or rotated session proves nothing.
+			const turns = seam.sessionFile === null ? null : this.tryParseTurns(seam.sessionFile);
 			for (const message of messages) {
 				if (remaining <= 0) return;
 				remaining -= 1;
 				// Delivered wins over obsolete: a notice the recipient did consume is a
 				// fact about the past, not a stale to-do.
-				if (this.mailReachedRecipient(message, seam.sessionFile)) {
+				if (turns !== null && mailReachedTurns(turns, message)) {
 					try {
 						transitionDelivery(this.db, message.id, MAIL_DELIVERY.DELIVERED, this.now);
 						this.emitMail(message.id, message.fromNode, "mail_delivered");
@@ -253,12 +283,32 @@ export class LegionPostman {
 		}
 	}
 
-	private mailReachedRecipient(message: LegionMessage, sessionFile: string | null): boolean {
-		if (!sessionFile) return false;
+	/**
+	 * The next `limit` ACCEPTED messages of one seam, rotating past the tail (#338 M3).
+	 *
+	 * Cursor state is per seam and in memory: a fresh postman starts at the head,
+	 * which costs at most one extra pass and keeps the ledger free of scan bookkeeping.
+	 */
+	private nextAcceptedPage(seamId: string, limit: number): LegionMessage[] {
+		const cursor = this.confirmCursor.get(seamId) ?? 0;
+		const page = inbox(this.db, seamId, { delivery: MAIL_DELIVERY.ACCEPTED, limit, afterId: cursor });
+		if (page.length > 0) {
+			this.confirmCursor.set(seamId, page[page.length - 1]!.id);
+			return page;
+		}
+		if (cursor === 0) return page;
+		// Tail reached: wrap to the head so an undecidable message cannot starve the
+		// ones behind it.
+		const wrapped = inbox(this.db, seamId, { delivery: MAIL_DELIVERY.ACCEPTED, limit });
+		this.confirmCursor.set(seamId, wrapped.length > 0 ? wrapped[wrapped.length - 1]!.id : 0);
+		return wrapped;
+	}
+
+	private tryParseTurns(sessionFile: string): readonly Pick<TurnRecord, "userText">[] | null {
 		try {
-			return mailReachedTurns(parseSessionFile(sessionFile).turns, message);
+			return this.parseTurns(sessionFile);
 		} catch {
-			return false;
+			return null;
 		}
 	}
 
@@ -288,6 +338,9 @@ export class LegionPostman {
 					if (disposition === "intercepted") {
 						// The child never saw the text and there is no retry, so the ledger says
 						// so: the mail bounced, with a reason the sender can act on (#322).
+						// #338 minor 1: this is NOT a steer, so it does not emit `node_steered`
+						// (the bus signal for an injected steer) — the observable event is the
+						// `mail_bounced` below, carrying `reason: intercepted_by_input_handler`.
 						transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now, {
 							reason: MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER,
 						});
@@ -329,22 +382,30 @@ export class LegionPostman {
 		}
 	}
 
+	/**
+	 * Re-emit the ledger row a delivery transition already wrote onto the bus.
+	 *
+	 * The lookup is by `data.messageId` (#338 minor 6), not by scanning "the newest
+	 * 100 rows of this node+type": the row behind an `ACCEPTED` send was written by
+	 * `sendMail` possibly hundreds of events ago, so a bounded window silently stops
+	 * emitting on a long-lived ledger. `json_extract` is what SQLite's JSON1 module
+	 * provides; a NULL/malformed `data` simply cannot match a message id.
+	 */
 	private emitMail(messageId: number, nodeId: string, type: "mail_sent" | "mail_delivered" | "mail_bounced"): void {
 		if (!this.eventBus) return;
-		const rows = this.db
-			.prepare("SELECT id, node_id, type, data, ts FROM events WHERE node_id = ? AND type = ? ORDER BY id DESC LIMIT 100")
-			.all(nodeId, type);
-		for (const row of rows) {
-			if (typeof row.data !== "string" || safeJson(row.data)?.messageId !== messageId) continue;
-			this.eventBus.emit({
-				id: Number(row.id),
-				nodeId: String(row.node_id),
-				type,
-				data: safeJson(row.data),
-				ts: Number(row.ts),
-			});
-			return;
-		}
+		const row = this.db
+			.prepare(
+				"SELECT id, node_id, type, data, ts FROM events WHERE node_id = ? AND type = ? AND json_extract(data, '$.messageId') = ? ORDER BY id DESC LIMIT 1",
+			)
+			.get(nodeId, type, messageId);
+		if (!row || typeof row.data !== "string") return;
+		this.eventBus.emit({
+			id: Number(row.id),
+			nodeId: String(row.node_id),
+			type,
+			data: safeJson(row.data),
+			ts: Number(row.ts),
+		});
 	}
 
 	private emitProcess(type: "node_steered" | "node_aborted" | "ui_request", nodeId: string, data: unknown): void {

@@ -705,12 +705,17 @@ async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input:
 	}
 }
 
-function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; store: RunStore; cwd: string; task: string; settings: ReturnType<typeof loadSubagentSettings>; maxDepth: number; eventBus: LegionEventBus }): LegionRuntimeIdentity {
+function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; store: RunStore; cwd: string; task: string; settings: ReturnType<typeof loadSubagentSettings>; maxDepth: number; eventBus: LegionEventBus; rootSessionFile?: string | undefined }): LegionRuntimeIdentity {
 	const rootRun = input.store.createRun({ task: input.task, cwd: input.cwd, maxDepth: input.maxDepth, nodeId: "root", herdr: { supervisor: currentProcessSpawnMode() } });
 	const dbPath = path.resolve(legionDbPath(input.store.runDir(rootRun.runId)));
 	const db = openLegionDb(dbPath);
 	const now = Date.now();
-	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: rootRun.runId, status: "running", taskSummary: input.task.slice(0, 2_000), createdAt: now, updatedAt: now }, () => now);
+	// #322/#338 M1: record THIS session's file on the root row. The postman's
+	// DELIVERED evidence scan reads `nodes.session_file` per recipient, and the root
+	// node is a recipient (`to: "parent"` from a top-level centurion) — without
+	// this, every mail addressed to root sat at `ACCEPTED` forever. The child path
+	// writes the same column from `reserveNode`; this is the root equivalent.
+	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: rootRun.runId, status: "running", taskSummary: input.task.slice(0, 2_000), ...(input.rootSessionFile ? { sessionFile: input.rootSessionFile } : {}), createdAt: now, updatedAt: now }, () => now);
 	appendEvent(db, "root", "node_launched", { runId: rootRun.runId, task: input.task }, { now: () => now });
 	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false });
 }
@@ -1539,7 +1544,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				activeLegion = resolveLegionIdentity({ pi, supervisor, store, cwd, settings, eventBus: legionBus, cached: ownLegionIdentity(), sessionFile: ctx.sessionManager?.getSessionFile() });
 				if (!activeLegion && action === "launch" && !isChild) {
 					const plan = buildPlan(params);
-					if (plan.ok) activeLegion = createRootLegion({ pi, supervisor, store, cwd, task: plan.task, settings, maxDepth: effectiveMaxDepth(settings.legion?.maxDepth), eventBus: legionBus });
+					if (plan.ok) activeLegion = createRootLegion({ pi, supervisor, store, cwd, task: plan.task, settings, maxDepth: effectiveMaxDepth(settings.legion?.maxDepth), eventBus: legionBus, rootSessionFile: ctx.sessionManager?.getSessionFile() });
 				}
 				if (activeLegion) adoptLegionIdentity(activeLegion);
 			} catch (error) {
@@ -3536,6 +3541,7 @@ async function launchUtilityFamily(input: {
 			settings: catalog.settings,
 			maxDepth: effectiveMaxDepth(catalog.settings.legion?.maxDepth),
 			eventBus: input.eventBus,
+			rootSessionFile: input.ctx.sessionManager?.getSessionFile(),
 		});
 	}
 	if (legion) input.onLegion(legion);

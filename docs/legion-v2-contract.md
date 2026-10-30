@@ -383,15 +383,17 @@ npm test -- --filter <scope>
 合法迁移（其余一律 `InvalidDeliveryTransitionError`，同值重复为幂等空操作）：`0→1`、`0→2`、`0→4`、`1→3`、`1→4`。
 `1→3` 之后不再回退，`2/3/4` 是终值。写入 `1` 时若收件人已是终态，按 `0→2` 落 `BOUNCED`。
 
-**`DELIVERED` 判据（冻结）**：解析收件人 session 文件（`parseSessionFile`），其**最后 20 个 turn** 的 user 文本中存在一条与**邮差实际注入的文本**（`formatMail(message)`：含 `[legion mail #id]` 信封）或与**邮件 body** **完全相等**的字符串。
+**`DELIVERED` 判据（冻结）**：解析收件人 session 文件（`parseSessionFile`），其**最后 20 个 turn** 的 user 文本中存在一条与**邮差实际注入的文本**（`formatMail(message)`：含 `[legion mail #id]` 信封）**完全相等**的字符串。
+只认**注入信封**这一种形式（#338 M2）：原始 body 不带 message id，任务卡 / 另一封信 / 被引用的原文都能与它整串相等，于是「别处出现过同一句话」会被误读成「这封已送达」。
 刻意用精确相等而非 contains/前缀/去空白/模糊匹配：子节点在报告与 verdict 里会大量引用邮件原文，任何包含式判定都会把「提到过」误读成「看到过」，而这个状态的唯一职责就是把「子节点到底看到没有」这件事答成事实。
-同一条邮件一旦落到 `3`/`4` 就不再被扫描（幂等）；确认扫描每 tick 最多 N=20 封。
+确认扫描每 tick 最多 N=20 封，且 **per-seam 游标轮转**（取 `id > cursor` 的下一批，扫到尾回绕）：某收件箱 M 封 `ACCEPTED` 时一封的确认最坏晚 `ceil(M / N)` 个 tick，而不是被前 20 封永久占住窗口（#338 M3）。
 
-**`OBSOLETE` 判据（冻结，#333）**：仅 `kind === "notice"` 且 `subject` 以 `Phase timeout:` 开头的邮件可被作废（`instruction` 与其它 kind **永不**自动作废——指令过不过期由人判）。
+**`OBSOLETE` 判据（冻结，#333）**：仅 `kind === "notice"` 且 `subject` 以 `Phase timeout:` 开头的邮件可被作废（kind 闭集是 `question|report|handoff|notice`，**没有** `instruction`；其它 kind **永不**自动作废——一个问题 / 一份交接过不过期由人判，#338 M4）。
 “该 phase” 取自产生该通知的 `phase_timeout` 事件（`data.phase`/`data.phaseSince`），**不解析正文**：发件节点当前 `phase`/`phase_since` 与之不同（含之后重新进入同一 phase）或已是终态 ⇒ 已过期。
 求值两处：**投递前**（`PENDING→OBSOLETE`，不再注入，这是 #333 的根因路径）与 **tick 确认**（`ACCEPTED→OBSOLETE`，只改标签不回滚已注入的文本）。`DELIVERED` 优先于 `OBSOLETE`：确实消费过的事实不会被改写成“失效”。
 
 **后端能力上限（`prompt` 分支）**：in-process 后端的 `prompt` 返回 `void`，无 disposition 可读，**无法区分 `queued` 与 `accepted`**，因此这一分支落 `ACCEPTED` 是能力上限而非观测结论；同理 `resumeChild` 首条消息即此信，若被包装成任务卡文本，精确匹配会落空而停在 `ACCEPTED`。
+**root 收件人的证据来源（#338 M1）**：root 行在创建时（`createRootLegion`）写入本进程 `ctx.sessionManager.getSessionFile()`，因此发给 root 的邮件（含 #333 的 `Phase timeout:` 路径）可以升级到 `DELIVERED`；但 `run.json` 不记录 root 会话文件，所以 `rebuildLegionDb` 重建出的账本里该列为 NULL，这些邮件停在 `ACCEPTED`（不误判）。
 
 
 ### 8.4 工具签名（注册给所有子节点，与 `allowNestedSubagents` 无关）
@@ -403,7 +405,7 @@ legion_tree({ scope?: "children"|"squad"|"subtree"|"tree", depth? })  // 只读�
 legion_phase({ to, note?, evidence?, reason?, supersedes? })  // 仅 centurion（§7）
 ```
 
-### 8.5 护栏：每节点发送速率默认 10 封/5 分钟（超限拒发）；投递落值按 §8.3.1 的五值语义——**send 返回即 `ACCEPTED(1)`**（不再声称投递成功）、`intercepted` 落 `BOUNCED(2)`、消费证据落 `DELIVERED(3)`、失效落 `OBSOLETE(4)`；`pendingInbox` 只读 `PENDING(0)`（崩溃恢复最坏重复投递，信带 id 可去重——dup 可忍，丢不可忍）；速率/上限进 settings（§11.4）。只读查询面 `mailboxStats(db, nodeId): { pending, accepted, delivered, bounced, obsolete }`（供 `/legion` 状态与 doctor 用）。
+### 8.5 护栏：每节点发送速率默认 10 封/5 分钟（超限拒发）；投递落值按 §8.3.1 的五值语义——**send 返回即 `ACCEPTED(1)`**（不再声称投递成功）、`intercepted` 落 `BOUNCED(2)`、消费证据落 `DELIVERED(3)`、失效落 `OBSOLETE(4)`；`pendingInbox` 只读 `PENDING(0)`（崩溃恢复最坏重复投递，信带 id 可去重——dup 可忍，丢不可忍）；速率/上限进 settings（§11.4）。只读查询面 `mailboxStats(db, nodeId): { pending, accepted, delivered, bounced, obsolete }`（目前无消费者：D5 只要求导出 + 单测，接线另议，#338 minor 4）。
 
 ## 9. 隔离与交付（子树 worktree、MR 树）
 
@@ -556,3 +558,4 @@ interface LegionEventBus {
 | 2026-10-30 | REV-21 | #314 abort（软中断）落地后的接口面同步（非 schema / 事件类型 / 权限变更，按 §15-1 追加）：① §3.1 `abort` 缝由 `abort(name): Promise<void>` 收成 `abort(name, opts?: { clearQueued?: boolean; timeoutMs?: number }): Promise<AbortOutcome>`，并补 `AbortOutcome` 三态注——`interrupted`（有一轮在跑、中断请求已送达；可能有部分编辑残留，child 仍活着、可续）/ `no-turn`（原先没有一轮在跑，什么都没做，队列也不清）/ `timeout`（请求发出去了，但 child 没在上限内 settle；不杀、不 retire，回执指向 `stop`），默认 `clearQueued: true`，上限 `DEFAULT_ABORT_TIMEOUT_MS`（5 s）**同时盖住清队列与中断**；契约与逐字回执在 `docs/contracts/abort-soft-interrupt-v1.md`。② §3.1 的 `steer` 负语义段（即对 §8.3 表格 `steer` 行的注）补 abort/stop 分工：要打断卡在工具调用里的子节点的**当前这一轮**用 `abort`（软中断：上下文保留、子节点仍在、可续），拆掉进程那一条才是 `stop`（`force: true` 为硬版本）——原文此处只指向 `stop`，与已落地的 abort/stop 切分矛盾。③ §7.4 阶段超时的上级裁决括号由「steer 续期 / abort 收队」改为「steer 续期 / abort 打断当前轮且 child 仍在 / retire 收队并进 aborted」——「收队」对应 `retire`，`abort` 不回收 child，原文的 `abort 收队` 会让人以为 abort 会终结子节点。原因：issue #314 把 supervisor 里早已实现却零调用点的 `abort` 接到工具面（`SubagentParams.action` 增 `abort`），§3.1 的接口表与 §7.4 的收队语义必须与新 seam 同形，否则同一份契约里两处各说一套。`node_aborted` 事件类型与 payload `{ name }` 未变（进程内域仍按 REV-13 的闭集），不新增事件类型、不改 `user_version`。 |
 | 2026-10-30 | REV-22 | §4.3 事件闭集由 14 补到 **16**（事件类型变更，按 §15-4 走修订）：补记 `node_abandoned`（hygiene 的 `markAbandoned` 写，#233 修复时已进 `src/legion/events.ts` 的 `LEGION_EVENT_TYPES`，但 §4.3 清单漏记）与本 PR（#309）新增的 `node_handled`（`requestLegionPhase` 写；团队用 `supersedes` 认领一个失败 child 时的审计事件，语义见 `docs/contracts/partial-failure-exit-v1.md`）。同一次修订顺带对齐：§10.2 的条数（14→16）、§7.1 的 `implementing→reviewing` 进入条件（「failed 须已处理」补第三来源 `supersedes`）与 `*→failed` 触发（补「centurion 声明判负 `reason`」）、§8.4 的 `legion_phase` 签名（补 `reason?` / `supersedes?`），以及 `test/unit/legion-schema-sentinel.test.ts` 的 `EXPECTED_EVENTS`（该哨兵此前把 §4.3 的 14 名钉住，正是它让清单无法自行追上代码）。闭集语义未变：写入方与读取方仍由同一份 `LEGION_EVENT_TYPES` 保证一致，`mapEvent` 对未知存量类型仍抛错（#233 的游标冻结模式没有被重新引入）；不改 `user_version`、不改 schema、不改 `LEGION_PROCESS_EVENT_TYPES`（仍 11 条）。触发：PR #332 对抗式 review 的 minor-3/4（文档漂移）——原评审把它记成「既有漂移」，但 §4.3 的那条清单是**被哨兵钉死的冻结契约**，所以补记必须走修订而不是改清单了事。 |
 | 2026-11-01 | REV-23 | `messages.delivered` 由三值（0/1/2）收宽为**五值**（0 pending / 1 accepted / 2 bounced / 3 delivered / 4 obsolete），`LEGION_DB_USER_VERSION` 1→2，§4.2 的 `PRAGMA user_version` 随之改为 2（**schema 版本变更，按 §15-4 走修订**；但**无 DDL**——列仍是 `INTEGER NOT NULL DEFAULT 0`，五值域是写入方与读取方之间的语义约定，旧行的 `1` 直接按 `accepted` 解释、无需回填；旧账本也不会因此拿到 `idx_messages_rate`，同 REV-19）。同时补 §8.3.1（五值语义 + 迁移边 + `DELIVERED`/`OBSOLETE` 判据 + `prompt` 分支能力上限）并改写 §8.5（不再有「投递成功落 `delivered=1`」这句话）。语义变更要点：`intercepted` 从 `INJECTED + console.warn` 改为 `BOUNCED`（`reason: intercepted_by_input_handler`）；新增 `DELIVERED`（session 最后 20 个 turn 里与注入文本**完全相等**才算）；新增 `OBSOLETE`（仅对 `Phase timeout:` notice，且只在其 phase 已结束/节点已终态时）。**事件闭集不变（仍 16 种）**：`OBSOLETE` 复用 `mail_bounced` 并带 `reason: obsolete_after_phase_change`，`DELIVERED` 复用 `mail_delivered`，`ACCEPTED` 不写新事件（`sendMail` 的 `mail_sent` 已是该事实）。子契约：`docs/contracts/mailbox-delivery-v1.md`。触发：issue #322（信箱缺 accepted/delivered/bounced 三态）与 #333（相位超时 action-needed 到达即失效）。 |
+| 2026-11-02 | REV-24 | §8.3.1 按 #338 的对抗式 review 收紧（**语义修订，非 schema / 非事件类型变更**，按 §15-1 追加）：① `DELIVERED` 判据去掉「或与邮件 **body** 完全相等」这一分支，只认注入信封（`formatMail`）——body 不带 message id，任务卡/别封信/被引用原文都能与它整串相等，误判面过大；② 确认扫描由「每 tick 取最老 20 封」改为 **per-seam 游标轮转**（`id > cursor`，扫到尾回绕）——旧写法下 20 封无法判定的 `ACCEPTED` 会永久占住窗口，确认与作废两条通道一起停摆（死锁，不是延迟）；③ `OBSOLETE` 条款里的 `kind === "instruction"` 更正为「只有 `kind === "notice"` 可作废」，kind 闭集仍是 `question|report|handoff|notice`（`instruction` 从来不存在）；④ 补 root 收件人的证据来源与能力上限：`createRootLegion` 建 root 行时写入本进程会话文件，使发给 root 的邮件可确认到 `DELIVERED`；`run.json` 不记录该文件，故 `rebuildLegionDb` 重建的账本里仍停在 `ACCEPTED`；⑤ §8.5 的 `mailboxStats` 改为「导出 + 单测，目前无消费者」，不再声称已接 `/legion` 状态与 doctor。触发：PR #338 review（4 major + 6 minor）。 |

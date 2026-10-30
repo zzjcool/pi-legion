@@ -287,17 +287,27 @@ export function getMessage(db: DatabaseSync, id: number): LegionMessage | null {
 	return row ? mapMessage(row) : null;
 }
 
+/**
+ * Newest-id-last page of one recipient's inbox.
+ *
+ * `afterId` is the rotation cursor the postman's confirmation scan keeps per seam
+ * (#338 M3): `id > afterId` is the next page, and a page past the tail wraps to the
+ * head. Without it every tick re-read the same oldest 20 rows, so 20 undecidable
+ * `ACCEPTED` messages could occupy the window forever and starve the rest.
+ */
 export function inbox(
 	db: DatabaseSync,
 	toNode: string,
-	options: { delivery?: MailDeliveryStatus; limit?: number } = {},
+	options: { delivery?: MailDeliveryStatus; limit?: number; afterId?: number } = {},
 ): LegionMessage[] {
 	if (!toNode) throw new TypeError("toNode must be a non-empty node id");
 	const limit = options.limit ?? 100;
 	if (!Number.isSafeInteger(limit) || limit < 1) throw new TypeError("inbox limit must be a positive safe integer");
+	const afterId = options.afterId ?? 0;
+	if (!Number.isSafeInteger(afterId) || afterId < 0) throw new TypeError("inbox afterId must be a non-negative safe integer");
 	const rows = options.delivery === undefined
-		? db.prepare("SELECT * FROM messages WHERE to_node = ? ORDER BY id LIMIT ?").all(toNode, limit)
-		: db.prepare("SELECT * FROM messages WHERE to_node = ? AND delivered = ? ORDER BY id LIMIT ?").all(toNode, options.delivery, limit);
+		? db.prepare("SELECT * FROM messages WHERE to_node = ? AND id > ? ORDER BY id LIMIT ?").all(toNode, afterId, limit)
+		: db.prepare("SELECT * FROM messages WHERE to_node = ? AND delivered = ? AND id > ? ORDER BY id LIMIT ?").all(toNode, options.delivery, afterId, limit);
 	return rows.map(mapMessage);
 }
 
@@ -428,25 +438,28 @@ export function formatMail(message: LegionMessage): string {
 }
 
 /**
- * Frozen DELIVERED criterion (#322 D3): **exact string equality**, never a
- * substring, prefix, trimmed or fuzzy comparison.
+ * Frozen DELIVERED criterion (#322 D3, narrowed by #338 M2): **exact string
+ * equality with the injected envelope**, never a substring, prefix, trimmed or
+ * fuzzy comparison.
  *
- * Two exact forms count:
+ * The one accepted form is {@link formatMail} — the exact text the postman hands
+ * to the child. The envelope embeds the message id, so an unrelated user turn can
+ * only collide by reproducing the whole envelope.
  *
- * 1. {@link formatMail} — the envelope the postman actually injects. This is the
- *    form every real delivery takes, and the envelope embeds the message id, so an
- *    unrelated user turn can only collide by reproducing the whole envelope.
- * 2. The raw body — the frozen decision's wording ("a user turn whose text equals
- *    the mail body"). Kept so a caller that injects the body verbatim is also
- *    recognised; it is still an exact match, not a heuristic.
+ * A bare `body` match is deliberately NOT accepted (#338 M2): the body carries no
+ * id and no envelope, so "this sentence appears somewhere in a user turn" is true
+ * for a task card, a quoted report, or a sibling copy of the same text. That is a
+ * mention, not a read — and a `DELIVERED` the ledger cannot prove is exactly the
+ * defect #322 set out to remove (a task text equal to a mail body was the concrete
+ * false positive).
  *
- * Why not something weaker: a child quotes mail back in its own turns constantly
- * (reports, verdicts, review notes). Any containment-based test would mark a
- * message delivered because the child *mentioned* a line of it, and the whole point
- * of the state is to answer "did the child see this?" with a fact.
+ * Why not something weaker still: a child quotes mail back in its own turns
+ * constantly (reports, verdicts, review notes). Any containment-based test would
+ * mark a message delivered because the child *mentioned* a line of it, and the
+ * whole point of the state is to answer "did the child see this?" with a fact.
  */
 export function mailMatchesUserText(userText: string, message: LegionMessage): boolean {
-	return userText === formatMail(message) || userText === message.body;
+	return userText === formatMail(message);
 }
 
 /**
@@ -466,8 +479,11 @@ export function mailReachedTurns(
 /**
  * #333: is this a `Phase timeout:` notice that has already outlived its subject?
  *
- * Only `kind: "notice"` with the frozen subject prefix is eligible — an
- * `instruction` is a human judgement call and is never auto-obsoleted.
+ * Only `kind: "notice"` with the frozen subject prefix is eligible. The mail kind
+ * domain is `question | report | handoff | notice` (#338 M4 — there is no
+ * `instruction` kind), and every other kind is a human judgement call that is
+ * never auto-obsoleted: whether a question or a handed-over task went stale is not
+ * a ledger fact.
  *
  * The timed-out node is the message's *sender*: `checkOwnPhaseTimeout` mails the
  * parent about its own phase. The phase it timed out in is recovered from the
@@ -512,9 +528,13 @@ export interface MailboxStats {
 }
 
 /**
- * Read-only five-value census of one node's inbox (#322 §4). Meant for `/legion`
- * status and `legion-doctor`; unknown `delivered` values (a newer ledger written by
- * another process) are left out of the census rather than crashing the reader.
+ * Read-only five-value census of one node's inbox (#322 D5).
+ *
+ * Nothing renders this yet: D5 asks for the export and its unit test, not for a
+ * caller. It is the query a future `/legion` status or doctor reader would use —
+ * please do not describe it as already wired to one (#338 minor 4). Unknown
+ * `delivered` values (a newer ledger written by another process) are left out of
+ * the census rather than crashing the reader.
  */
 export function mailboxStats(db: DatabaseSync, nodeId: string): MailboxStats {
 	if (!nodeId) throw new TypeError("nodeId must be a non-empty node id");

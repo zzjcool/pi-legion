@@ -249,7 +249,7 @@ test("mailboxStats reports the five delivery states per recipient (#322)", () =>
 	}
 });
 
-test("the DELIVERED criterion is an exact match over the last 20 turns (#322)", () => {
+test("the DELIVERED criterion is an exact match over the last 20 turns (#322, narrowed by #338 M2)", () => {
 	const message: LegionMessage = {
 		id: 7,
 		fromNode: "root.team-a",
@@ -263,7 +263,16 @@ test("the DELIVERED criterion is an exact match over the last 20 turns (#322)", 
 		createdAt: 1,
 	};
 	assert.equal(mailMatchesUserText(formatMail(message), message), true, "the injected envelope proves delivery");
-	assert.equal(mailMatchesUserText(message.body, message), true, "so does a verbatim body");
+	assert.equal(
+		mailMatchesUserText(message.body, message),
+		false,
+		"#338 M2: the bare body is not proof — it carries no id, so a task card or a quote of the same sentence matches it",
+	);
+	assert.equal(
+		mailMatchesUserText("line one\nline two", { ...message, id: 8, fromNode: "root.team-a.bob" }),
+		false,
+		"a turn whose text happens to equal another mail's body is a coincidence, not a read (#338 M2)",
+	);
 	assert.equal(mailMatchesUserText(` ${formatMail(message)}`, message), false, "whitespace is never trimmed away");
 	assert.equal(mailMatchesUserText(`${message.body} `, message), false);
 	assert.equal(mailMatchesUserText("line one", message), false, "a line of the body is not the mail");
@@ -281,4 +290,35 @@ test("the DELIVERED criterion is an exact match over the last 20 turns (#322)", 
 		false,
 		"a mail older than the last 20 turns is not proof of consumption",
 	);
+});
+
+test("inbox pages from an id cursor so a confirmation scan can rotate (#338 M3)", () => {
+	const db = makeTree();
+	try {
+		const ids: number[] = [];
+		for (let index = 0; index < 5; index += 1) {
+			const sent = sendMail(db, {
+				fromNode: "root.team-a", to: "alice", subject: `m${index}`, body: `body ${index}`,
+			}, { now: () => 1_000 + index });
+			assert.equal(sent.ok, true);
+			if (sent.ok) ids.push(sent.messages[0]!.id);
+			transitionDelivery(db, ids[index]!, MAIL_DELIVERY.ACCEPTED, () => 2_000 + index);
+		}
+		assert.deepEqual(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, limit: 2 }).map((m) => m.id), ids.slice(0, 2));
+		assert.deepEqual(
+			inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, limit: 2, afterId: ids[1]! }).map((m) => m.id),
+			ids.slice(2, 4),
+			"afterId continues where the previous page stopped",
+		);
+		assert.deepEqual(
+			inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, limit: 2, afterId: ids[4]! }),
+			[],
+			"past the tail the page is empty, which is what tells the scan to wrap",
+		);
+		// The cursor only moves the window; it never changes which messages are eligible.
+		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, afterId: 0 }).length, 5);
+		assert.throws(() => inbox(db, "root.team-a.alice", { afterId: -1 }), /afterId/);
+	} finally {
+		db.close();
+	}
 });

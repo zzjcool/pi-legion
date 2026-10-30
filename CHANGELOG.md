@@ -90,11 +90,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `intercepted` bounces instead of pretending. The migration adds **no DDL** — the column was already
   `INTEGER NOT NULL DEFAULT 0`, so v2 is a semantic agreement plus a version bump, and every v1 `1` reads as
   `accepted` with no backfill. `MAIL_DELIVERY.INJECTED` survives as a `@deprecated` alias of `ACCEPTED`
-  so out-of-tree imports keep compiling; the ledger's own call sites all use the new names. Events are
+  so out-of-tree imports keep compiling; the ledger's own call sites use the new names, and exactly one
+  unit test keeps the alias pinned (`INJECTED === ACCEPTED`) instead of letting it rot silently. Events are
   unchanged on purpose (the closed set stays at 16): `ACCEPTED` reuses the `mail_sent` row `sendMail`
   already wrote, `DELIVERED` reuses `mail_delivered`, `OBSOLETE` reuses `mail_bounced` with
-  `reason: "obsolete_after_phase_change"`. A read-only `mailboxStats(db, nodeId)` exports the five counts
-  for `/legion` status and doctor. Contract: `docs/contracts/mailbox-delivery-v1.md`,
+  `reason: "obsolete_after_phase_change"`. A read-only `mailboxStats(db, nodeId)` exports the five counts;
+  nothing renders it yet — D5 asks for the export and its unit test, not for a caller. Contract: `docs/contracts/mailbox-delivery-v1.md`,
   `docs/legion-v2-contract.md` §8.3.1/§8.5 (REV-23).
 
 - **`SessionRuntime.consumeCollect*` now answers with a `ClaimedCollect`, not a bare snapshot
@@ -130,6 +131,26 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **The five-value mailbox delivery landed against an adversarial review: four majors and six minors
+  (#338, follow-up to #322/#333).** The important ones were silent: mail addressed to **root** could never
+  be confirmed — `nodes.session_file` was written only on the child path (`reserveNode`), so every
+  `to: "parent"` letter, including the whole #333 `Phase timeout:` path, sat at `accepted` forever.
+  `createRootLegion` now records this process's `ctx.sessionManager.getSessionFile()` on the root row at
+  creation (and the contract says where that stops: a ledger rebuilt from `run.json` still has no root
+  session file, so those letters honestly stay `accepted`). The `DELIVERED` criterion also dropped its
+  "or the user turn equals the mail **body**" branch — a body carries no message id, so a task card, a
+  different letter or a quoted paragraph matched it, and "that sentence appeared somewhere" is a mention,
+  not a read. And the per-tick 20-message confirmation window now **rotates per seam** (`id > cursor`,
+  wrapping at the tail) instead of re-reading the oldest 20: the old shape let 20 undecidable messages hold
+  the window forever, which stops the confirm *and* obsolete paths permanently — a deadlock, not the delay
+  the docs claimed. The `obsolete` rule no longer names a `kind: "instruction"` that never existed (only
+  `kind: "notice"` is eligible), `mailboxStats` is documented as an export with no consumer instead of a
+  wired status surface, each seam's session is parsed once per tick instead of once per message, and a
+  delivery event is re-emitted by `messageId` rather than by scanning the newest 100 rows of that node+type
+  (which went silent on a long-lived ledger). An intercepted send is not a steer, so it emits no
+  `node_steered`; the observable signal is the `mail_bounced` with `reason:
+  intercepted_by_input_handler`. No ledger event type was added — the closed set stays at 16.
+
 - **A `Phase timeout:` notice that arrives after its phase ended is no longer handed to the parent as a
   live to-do item (#333).** A team that runs two or three review rounds reliably exceeds the 30-minute
   `reviewing` limit, so an `action-needed` phase-timeout notice is not an edge case: the notice was queued,
@@ -140,8 +161,9 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   notice's prose) and marked `obsolete` when the sender has left that phase or gone terminal. The check runs
   in two places: **before delivery** (a queued notice is never injected at all — the path the issue actually
   took) and in the postman's confirmation pass for mail already `accepted` (that one only relabels; it
-  cannot unqueue text a recipient already holds). `instruction` mail is never auto-obsoleted — whether an
-  instruction expired is a human call — and a `delivered` message is never relabelled, because a
+  cannot unqueue text a recipient already holds). Mail of any other kind — `question`/`report`/`handoff`, the domain has
+  no `instruction` — is never auto-obsoleted: whether a question or a handed-over task went stale is a
+  human call, and a `delivered` message is never relabelled, because a
   consumption that happened is a fact about the past. No new event type: the verdict is `mail_bounced` with
   `reason: "obsolete_after_phase_change"`.
 
