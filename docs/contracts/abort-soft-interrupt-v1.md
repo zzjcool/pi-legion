@@ -34,7 +34,7 @@ supervisor 一侧其实早就实现了 `abort`（`LegionSupervisor.abort` / `Rpc
 |---|---|---|
 | `clearQueued` | **`true`** | abort 前先清 child 的 steering / follow-up 队列；工具面只暴露这一个开关（`clearQueued: false` 保留队列） |
 | abort 上限 | **`DEFAULT_ABORT_TIMEOUT_MS = 5000`**（`src/supervisor/types.ts`） | 两个后端与工具面回执共用的常量，不是各写一份字面量；后端把非有限 / ≤0 的 `timeoutMs` 归一成它（否则一个坏值会把两步都压成 ~0 ms，让每次 abort 都变成假 `timeout`），合法的值再以 `MAX_ABORT_TIMER_DELAY_MS = 2_147_483_647` 封顶（Node 把超出 32 位有符号上限的延时限**钳成 1 ms**，不封顶等于让一个 `1e12` 这样的值凭空造出假 `timeout`） |
-| 工具面 `timeoutMs` | **只对 `wait` 生效** | `abort` 不接受工具面传入的上限，一律用上面那个常量；`timeoutMs` 参数的说明也只看 `wait` |
+| 工具面 `timeoutMs` | **只对 `wait` 生效** | `abort` 不接受工具面传入的上限，一律用上面那个常量；`timeoutMs` 参数的说明也只看 `wait`。**后端实际生效的上限随 `AbortOutcome.timeoutMs` 交回**（归一 + 封顶之后的值，三态都带），回执读它，不自己再取一次默认值（#325） |
 | `cleared: { steering, followUp }` | 清队列那次调用的**返回值**计数 | 结构缺失 / 不可读（含抛错）→ 计 **0**，不猜 |
 
 计数由 `countClearedQueue`（`src/supervisor/types.ts`）统一做，两个后端不会对同一份返回值给出两个数字。`cleared` 是"真的清掉了多少"的机器事实，不是估计值；`no-turn` 下两个计数恒为 0。
@@ -94,7 +94,7 @@ supervisor 一侧其实早就实现了 `abort`（`LegionSupervisor.abort` / `Rpc
 - `SubagentParams.action` 的 union 增加 `"abort"`（排在 `"steer"` 之后，其余顺序不动）。
 - 唯一新增参数是 `clearQueued`：`Type.Optional(Type.Boolean())`，说明以 "abort only: …" 开头，默认 `true`；`clearQueued: false` 保留队列。**工具面不暴露 `timeoutMs`**——这个参数只属于 `wait`，abort 的上限固定为 `DEFAULT_ABORT_TIMEOUT_MS`（D2）。
 - dispatch：`if (action === "abort") return abortChild(ctx);`；`abortChild` 调 `ctx.orchestrator.abort(ctx.name, opts)`，且**只在 `clearQueued === false` 时构造 opts**——默认路径不传对象，`true` 这个默认值只有后端一处来源。
-- 回执逐字（`abortReceipt(name, outcome, timeoutMs = DEFAULT_ABORT_TIMEOUT_MS)`，`seconds` 为 `timeoutMs/1000`：整秒写整数，否则保留一位小数）：
+- 回执逐字（`abortReceipt(name, outcome)`，`seconds` 取自 **`outcome.timeoutMs`** `/1000`：整秒写整数，否则保留一位小数。**回执没有自己的默认上限**：工具面永不传 `timeoutMs`，所以一个本地默认值只会在后端真的换了上限时报出一个没人用过的数字（#325））：
 
   | 情形 | 文本 |
   |---|---|
@@ -140,7 +140,7 @@ supervisor 层只有机器三态，"人话"只出现在工具面一层：
 
 11. **三条回执逐字**：`#314 abortReceipt: interrupted keeps the context and warns about partial edits`、`#314 abortReceipt: no-turn claims no interrupt`、`#314 abortReceipt: timeout points at stop and formats the bounded wait`。
 12. **dropped 计数后缀**：`#314 abortReceipt: interrupted reports the queued messages it dropped`——`n` 是 steering + followUp 之和，后缀是追加而非替换。
-13. **`use stop` 与 `seconds` 格式化**：timeout 回执含 `use stop`；`2500 → 2.5s`、`10000 → 10s`（`#314 abortReceipt: timeout points at stop and formats the bounded wait`）。
+13. **`use stop` 与 `seconds` 格式化**：timeout 回执含 `use stop`；`2500 → 2.5s`、`10000 → 10s`（`#314 abortReceipt: timeout points at stop and formats the bounded wait`）。`seconds` 只在 `outcome.timeoutMs` 里取（#325）；「后端真的换了上限时回执报的是实际值」由 `#325 abortReceipt: the timeout receipt names the bound the supervisor really applied` 钉住（工具面不传 `timeoutMs`，supervisor 报 2.5 s ⇒ 回执必须写 2.5 s）。
 14. **默认不传 opts 与参数自描述**：`#314 abort on a live child renders the interrupted receipt and passes no clearQueued`（`clearQueued` 为 `undefined`，不是 `true`）；显式关掉的那条是 `#314 abort forwards an explicit clearQueued:false`；参数文案由 `#314 the clearQueued param documents itself as abort-only and default-true` 钉住（`abort only:` / `queued steering/follow-up` / `default true`）。
 15. **no-turn / timeout 都是成功结果**：`#314 abort reports no-turn as a plain success`、`#314 abort timeout is a success whose receipt points at stop`（无 `details.error`、零 retire）。
 16. **NOT_FOUND 两条**：`#314 abort of an unknown name is NOT_FOUND and never reaches the supervisor`（查名先于 supervisor）、`#314 abort reports a supervisor failure as 'abort failed:' + NOT_FOUND`（`abort failed: ` 前缀只由 `abortChild` 的 catch 产生）。
@@ -155,4 +155,8 @@ supervisor 层只有机器三态，"人话"只出现在工具面一层：
   - R0-major：5 s 上限原先只管中断、不管它前面的清队列；RPC 后端上清队列的唯一界是 `RpcClient.send()` 的 30 s 硬编码请求超时，于是回执与 CHANGELOG 声称的 5 s 在真实卡死场景里是假话。→ 清队列并入同一上限（写进 D4，不另立条款）。
   - R2-major：代码注释里的 `#314 Dn` 与本文件编号对不上。→ 本文件即唯一命名空间，D1–D8 覆盖整个改动，验收清单不占用编号。
   - 上面两处在契约文档里曾各有一个临时编号（D11 / D12）；它们**不是本契约的条款**，编号最终收敛为 D1–D8。
+- **#325（实现收敛，不改 D1–D8 的语义）**：
+  - 两个 `race*Timeout` 私有 helper 收敛成一个 `raceWithTimeout`（`src/supervisor/race-timeout.ts`），两个后端共用；timer 清理、败者 rejection 吞掉、`setTimeout` 上界裁剪都在 helper 内，行为逐字不变。
+  - `AbortOutcome` 增加 `timeoutMs`（实际生效的上限，归一 + 封顶后的值，三态都带），`abortReceipt` 改用它 —— 原先那个 `timeoutMs = DEFAULT_ABORT_TIMEOUT_MS` 参数是死参数：工具面永不传值，回执里的 `seconds` 恒为默认，后端真的换了上限时回执会报一个没人用过的数字。
+  - in-process 的 pre-abort `clearQueue` 包进与中断本体相同的 `runAtAbsoluteDepth(child.spawnDepth, () => runInChildContext(child.context, …))`：清队列会 settle 排队消息的 promise，其 continuation 在恢复时继承当时的 ALS store，跑在作用域外就会让宿主代码以为自己是 child（REV2-7 的同一条隐患）。
 - **复审轮 2（#314，最终）**：四处边界澄清，不新增条款、不改 D1–D8 编号：D4 补 turnActive 快照只取一次（取在清队列之前）的窗口语义与“为什么不再验一次”；D2 补 `MAX_ABORT_TIMER_DELAY_MS` 封顶（Node 把过大延时限钳成 1 ms）；D5 收敛“唯一能穿透”的措辞（abort 是唯一能把中断送进工具调用内部的 action，但对方若忽略取消仍会答 `timeout`，杀进程归 `stop`）；D8 补 `node_aborted` 在 `no-turn` / `timeout` 下也照样 emit（既有行为，payload 仍是 `{ name }`）。验收清单第 7 / 9 条各补一条覆盖用例（迟到的 clear 拒绝、`0` / 负数 / `NaN` / `Infinity` 与 `1e12` 两类坏值回落），两条用例已在 rpc / inprocess 两个后端落地，标题与本文件逐字一致。

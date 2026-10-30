@@ -145,10 +145,21 @@ export function toSteerDisposition(
  *
  * `cleared` is the count the preceding queue clear reported (`steering` /
  * `followUp` message counts), not a claim about what the model read.
+ *
+ * `timeoutMs` is the bound that was actually applied (#325): the caller's
+ * `timeoutMs` after the junk fallback and the timer-delay cap, or
+ * `DEFAULT_ABORT_TIMEOUT_MS` when the caller passed nothing. It travels in the
+ * outcome because the receipt has to name the wait it is talking about, and the
+ * tool surface never passes a bound of its own — a receipt reading a default of
+ * its own would report a number nobody used. It is reported for all three
+ * statuses (the bound is normalized before the `turnActive` check), so a reader
+ * never has to wonder whether the field is meaningful.
  */
 export type AbortOutcome = {
 	status: "interrupted" | "no-turn" | "timeout";
 	cleared: { steering: number; followUp: number };
+	/** The bound this call really applied, in milliseconds (see above). */
+	timeoutMs: number;
 };
 
 /**

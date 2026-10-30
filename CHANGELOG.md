@@ -95,6 +95,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   is provided on purpose — the old shape was never published. Contract revision:
   `docs/contracts/notice-claim-v1.md` (D2).
 
+- **`AbortOutcome` now carries the bound the abort really applied (`timeoutMs`), and the timeout
+  receipt reads it instead of a default of its own (#325).** `abortReceipt` used to format a
+  `timeoutMs = DEFAULT_ABORT_TIMEOUT_MS` parameter that nothing ever passed — the tool surface
+  deliberately takes no bound (it is a `wait`-only parameter) — so the receipt could only ever say
+  "5s", even for a caller that armed a different limit on the supervisor. Both backends now report
+  the normalized, timer-capped bound in the outcome for all three statuses, and the receipt names
+  that number. The receipt text on the tool surface is byte-identical (no bound is ever passed
+  there); the two private `race*Timeout` helpers the backends each carried are one shared
+  `raceWithTimeout` (`src/supervisor/race-timeout.ts`) with the timer cleanup, loser-rejection
+  swallow and timer-delay cap unchanged, and the in-process pre-abort queue clear now runs inside
+  the child's own identity scope (`runAtAbsoluteDepth` + `runInChildContext`), like the interrupt
+  it precedes. Contract revision: `docs/contracts/abort-soft-interrupt-v1.md` (D2/D7).
+
 ### Fixed
 
 - **A provider that ends a turn with no content no longer costs a child its whole turn.** Some
