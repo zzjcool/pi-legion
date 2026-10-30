@@ -5542,6 +5542,82 @@ test("claim D2/#320-1: a bail never erases a claim a real delivery already took"
 	runtime.dispose();
 });
 
+test("claim D2/#320-1: the rollback follows the CALL that took the claim, never the snapshot", async () => {
+	// The distinguishing case between "per call" and "per snapshot" bookkeeping (#327).
+	// A and B collect the SAME `job.collectPromise`, so they get the same snapshot
+	// OBJECT: A takes the claim (`claimedNow === true`) and B does not (`false`). A
+	// table keyed by the snapshot therefore has exactly one slot for the two calls —
+	// B's `false` overwrites A's `true` — and A's bail, the only one that may spend
+	// that claim, reads back `false` and returns early. The claim then outlives a
+	// delivery that never happened and the queued notice is filtered out for good:
+	// one result, delivered zero times. Carrying the flag home in the return value
+	// keeps the two calls apart, so the notice still lands — exactly once.
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	const retires: Array<() => void> = [];
+	for (const name of ["held", "mate"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+			// Keeps both jobs TRACKED after their terminal snapshot (the job branch) while
+			// the batch sits unread in the outbox.
+			retire: () =>
+				new Promise<void>((resolve) => {
+					retires.push(resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("held")!(joinSnapshot({ output: "held-out" }));
+	resolvers.get("mate")!(joinSnapshot({ output: "mate-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both notices held as one batch");
+	await waitFor(() => retires.length === 2, "both jobs parked in retire ⇒ still tracked");
+
+	// Two collects, one shared promise: A owns the claim, B does not.
+	const a = await runtime.consumeCollect("held");
+	assert.equal(a?.claimedNow, true, "the first call takes this round's claim");
+	const b = await runtime.consumeCollect("held");
+	assert.equal(b?.claimedNow, false, "the second call gets the result without a claim");
+	assert.equal(
+		a?.snapshot,
+		b?.snapshot,
+		"one job ⇒ one collect promise ⇒ the two calls share the snapshot object",
+	);
+
+	// The bail comes from A — the call that took the claim. It reached nobody, so the
+	// claim goes back and the held notice becomes deliverable.
+	runtime.unclaimUndelivered("held", a!.snapshot, a!.claimedNow);
+	assert.equal(
+		runtime.get("held")?.consumedByTool,
+		false,
+		"the owning call's bail hands the notice route back",
+	);
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the held batch is flushed");
+	assert.match(messages[0]!.content, /mate-out/, "positive control: the flush really ran");
+	assert.equal(
+		(messages[0]!.content.match(/held-out/g) ?? []).length,
+		1,
+		"the bailed call's result is delivered exactly once — never zero, never twice",
+	);
+	assert.equal(messages.length, 1, "one batch, one message");
+	runtime.dispose();
+});
+
 test("claim D2/#320: collectChild's OWN abort bail hands the claim back (index wiring)", async () => {
 	// `collectChild` has two bail doors and the claim is only restored if the closed one is
 	// wired: `!collected || signal?.aborted` (this case) and a throwing `persistChild`
@@ -5593,5 +5669,93 @@ test("claim D2/#320: collectChild's OWN abort bail hands the claim back (index w
 	await waitFor(() => messages.length === 1, "the rollback put the notice back on the wire");
 	assert.match(messages[0]!.content, /x-out/);
 	assert.equal(messages.length, 1, "exactly once");
+	runtime.dispose();
+});
+
+test("claim D2/#320-2: collectChild's JOB-branch bail still lands the notice (live job, retire pending)", async () => {
+	// The end-to-end shape of #320/2 through the real caller (#327), on the branch that
+	// production actually takes: the job is STILL TRACKED and its watch is parked in an
+	// unresolved `retire`, so the watch's gate has already skipped `onTerminal` and the
+	// re-arm is the only thing that can deliver. The cache-branch case above starts from
+	// a released child and never exercises that window.
+	//
+	// The abort has to land in one specific window — after the seam answered with the
+	// claim, before `collectChild` reads `signal?.aborted` — which is exactly one
+	// microtask hop wide. Registering the abort on the seam's promise here (ahead of
+	// `collectChild`'s own `await`) puts it there deterministically instead of relying on
+	// a sleep: the handler is queued first, flips `aborted`, and only then does
+	// `collectChild` resume and bail. Delete the rollback in that branch and this goes
+	// red with zero messages: the claim keeps filtering the notice out forever.
+	const messages: SentMessage[] = [];
+	const retires: Array<() => void> = [];
+	let resolveCollect!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "x",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/x.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+		// An async retire is what production has (an RPC round trip): the watch parks
+		// here, which keeps the job tracked and the notice route in flight.
+		retire: () =>
+			new Promise<void>((resolve) => {
+				retires.push(resolve);
+			}),
+	});
+	runtime.watch("x");
+
+	const controller = new AbortController();
+	const seam = {
+		...runtime,
+		consumeCollectInterruptible(name: string, signal: AbortSignal) {
+			const answered = runtime.consumeCollectInterruptible(name, signal);
+			// Queued before `collectChild` awaits the same promise ⇒ the abort lands
+			// right after the claim, right before the bail check.
+			answered?.then(
+				() => controller.abort(),
+				() => {},
+			);
+			return answered;
+		},
+	};
+	const ctx = {
+		name: "x",
+		found: { runId: "r-1" },
+		runtime: seam,
+		store: {},
+		orchestrator: {},
+	} as unknown as Parameters<typeof collectChild>[0];
+
+	const pending = collectChild(ctx, controller.signal);
+	assert.equal(runtime.get("x")?.consumedByTool, true, "the tool call owns the notice route");
+	resolveCollect(joinSnapshot({ output: "x-out" }));
+	const result = await pending;
+	const text = (result.content as Array<{ text?: string }>)
+		.map((part) => part.text ?? "")
+		.join("\n");
+	assert.match(text, /interrupted/, "the tool call delivered nothing");
+
+	// The bail happened on the JOB branch: the job is still live, its watch is still
+	// parked in retire, and the rollback handed the notice route back.
+	assert.ok(runtime.get("x"), "the job is still tracked (job branch, not the finished cache)");
+	assert.equal(runtime.get("x")?.consumedByTool, false, "the bail restored the notice route");
+	// Two watches have reached retire: the one whose gate skipped (generation bump kept
+	// it from releasing) and the re-armed one. Neither resolving is the point — the job
+	// is still the same live job the notice has to come from.
+	assert.equal(retires.length, 2, "the original watch parked in retire, then the re-armed one");
+	assert.equal(runtime.get("x")?.watching, true, "the re-armed watch is live on the same job");
+
+	await waitFor(() => messages.length === 1, "the re-armed watch delivers the notice");
+	assert.match(messages[0]!.content, /x-out/);
+	assert.equal(messages.length, 1, "exactly one notice, never two");
 	runtime.dispose();
 });

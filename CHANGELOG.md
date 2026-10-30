@@ -79,6 +79,22 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `timeout` (the request went out, the child had not settled). Contract and the frozen three-state
   table: `docs/contracts/abort-soft-interrupt-v1.md` (#314).
 
+### Changed
+
+- **`SessionRuntime.consumeCollect*` now answers with a `ClaimedCollect`, not a bare snapshot
+  (#320/#327).** The claim-once seam claims a terminal result as it hands the snapshot out, and
+  the caller has to be able to hand that claim back when it bails — which requires knowing
+  whether *this* call took it (`src/api.ts` re-exports `SessionRuntime`, so this is a public
+  surface change, and it is a breaking one):
+  ```ts
+  const { snapshot } = await rt.consumeCollect("worker-0")!;   // was: const snapshot = await …
+  ```
+  `claimedNow` is `true` only for the call that took the round's claim; a caller that delivered
+  the text to nobody rolls it back with `unclaimUndelivered(name, snapshot, claimedNow)`, and a
+  call that did not take the claim leaves the real delivery's claim alone. No compatibility shim
+  is provided on purpose — the old shape was never published. Contract revision:
+  `docs/contracts/notice-claim-v1.md` (D2).
+
 ### Fixed
 
 - **A provider that ends a turn with no content no longer costs a child its whole turn.** Some
@@ -148,7 +164,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `consumedByTool` before the claim, every child is watched in production, so the watch passed
   its gate first (`!consumedByTool && !notified` → skip `onTerminal`) and was already parked in
   `retire` when the bail arrived — meaning the repair had to re-arm unconditionally, which it
-  now does (clear the flag, `watch` again; the generation bump keeps the old watch from
+  now does (the old `!job.watching` guard was dead code on that default path — only an
+  `async: false` inline collect, which registers no watch at all, ever sees it unset) (clear the flag, `watch` again; the generation bump keeps the old watch from
   releasing the job, `notified` keeps the round single, `deliverBatch`'s claim filter is the
   last net). Measured in that production shape: 0 notices before, 1 after. The one case still
   not recovered is a bail that lands only after the watch has already released the child — there
