@@ -24,6 +24,7 @@ import type {
 	LegionSupervisor,
 	SettleResult,
 	SpawnInput,
+	SteerDisposition,
 	SupervisorEventListener,
 	UsageSnapshot,
 } from "./types.ts";
@@ -178,8 +179,13 @@ export class RoutingSupervisor implements LegionSupervisor {
 		await this.backendFor(name).prompt(name, text);
 	}
 
-	async steer(name: string, text: string): Promise<void> {
-		await this.backendFor(name).steer(name, text);
+	/**
+	 * Route the steer and hand the backend's disposition back untouched (#313):
+	 * this facade must never flatten `Promise<SteerDisposition>` into
+	 * `Promise<void>`, or the receipt upstream loses the queued/delivered fact.
+	 */
+	steer(name: string, text: string): Promise<SteerDisposition> {
+		return this.backendFor(name).steer(name, text);
 	}
 
 	async followUp(name: string, text: string): Promise<void> {

@@ -36,10 +36,12 @@ import {
 	type RpcSupervisorOptions,
 	type SettleResult,
 	type SpawnInput,
+	type SteerDisposition,
 	type SupervisorEvent,
 	type SupervisorEventListener,
 	type UsageSnapshot,
 } from "./types.ts";
+import { toSteerDisposition } from "./types.ts";
 import { currentPgid, enumerateDescendants } from "./proc-tree.ts";
 
 interface EventSubscription {
@@ -395,10 +397,15 @@ export class RpcSupervisor implements LegionSupervisor {
 		await this.dispatch(child, "prompt", text);
 	}
 
-	/** Use the RPC steer command while running; idle children start a prompt. */
-	async steer(name: string, text: string): Promise<void> {
+	/**
+	 * Use the RPC steer command while running; idle children start a prompt.
+	 *
+	 * Returns the disposition the RPC answered with (#313 D4) — the SDK's
+	 * `disposition` field, normalized by `toSteerDisposition`.
+	 */
+	steer(name: string, text: string): Promise<SteerDisposition> {
 		const child = this.requireChild(name);
-		await this.dispatch(child, "steer", text);
+		return this.dispatch(child, "steer", text);
 	}
 
 	/** Queue a follow-up behind a running turn; idle children start a prompt. */
@@ -541,7 +548,7 @@ export class RpcSupervisor implements LegionSupervisor {
 		child: ChildRecord,
 		kind: "prompt" | "steer" | "followUp",
 		text: string,
-	): Promise<void> {
+	): Promise<SteerDisposition> {
 		this.assertCanSend(child);
 		const client = this.requireClient(child);
 		const wasActive = child.turnActive;
@@ -550,12 +557,18 @@ export class RpcSupervisor implements LegionSupervisor {
 		try {
 			if (kind === "followUp" && wasActive) {
 				await client.followUp(text);
+				// A follow-up is banked behind the turn that is already running.
+				return "queued";
 			} else if ((kind === "steer" || kind === "prompt") && wasActive) {
 				// A prompt addressed to a busy child is an immediate correction;
 				// use the explicit RPC steer command, never a second prompt command.
-				await client.steer(text);
+				// The value is never discarded: it carries the queue/deliver answer.
+				return toSteerDisposition(await client.steer(text));
 			} else {
 				await client.prompt(text);
+				// This call started the turn; a busy child would have taken a branch
+				// above, so the prompt reached the client at a turn boundary.
+				return "delivered";
 			}
 		} catch (error) {
 			if (!wasActive && child.turnActive) {

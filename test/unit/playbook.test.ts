@@ -118,3 +118,32 @@ test("playbook requires name or all for wait (#161)", () => {
 	assert.match(TOOL_DESCRIPTION, /action: "wait", all: true/);
 	assert.match(PARENT_PLAYBOOK, /Use `wait` with `name` or `all: true`/);
 });
+
+test("playbook says steer queues at a turn boundary and stop is the interrupt (#313)", () => {
+	// #313: a `steer` receipt must not read like a delivery claim. `steer` is a
+	// queue the child consumes at a turn boundary, so it cannot reach a child
+	// that is inside a tool call — writing to stdin of a running bash is not a
+	// thing. The playbook has to state the negative semantics, or models keep
+	// "steering" a child that is stuck in one long command and never lands.
+	assert.match(PARENT_PLAYBOOK, /`steer` is a queue, not an interrupt/);
+	assert.match(PARENT_PLAYBOOK, /does not interrupt a tool call that is already executing/);
+	assert.match(PARENT_PLAYBOOK, /next turn boundary/);
+	assert.match(PARENT_PLAYBOOK, /after the current tool batch finishes/);
+	assert.match(PARENT_PLAYBOOK, /never receives a steer/);
+	// …and that `stop` is what actually interrupts.
+	assert.match(PARENT_PLAYBOOK, /To actually stop a child, use `stop`/);
+	assert.match(PARENT_PLAYBOOK, /`force: true` is the hard variant/);
+	// TOOL_DESCRIPTION embeds PARENT_PLAYBOOK, so it inherits the paragraph —
+	// asserting it here pins the embedding (no second copy to drift).
+	assert.match(TOOL_DESCRIPTION, /`steer` is a queue, not an interrupt/);
+	assert.match(TOOL_DESCRIPTION, /To actually stop a child, use `stop`/);
+	// Numbering stays contiguous 1..8 and item 8 sits before the unnumbered
+	// "Utility agents …" paragraph (D7: append, never renumber items 1-7).
+	const item7 = PARENT_PLAYBOOK.indexOf("\n7. ");
+	const item8 = PARENT_PLAYBOOK.indexOf("\n8. ");
+	const utility = PARENT_PLAYBOOK.indexOf("\nUtility agents");
+	assert.ok(item7 > 0, "item 7 must exist");
+	assert.ok(item8 > item7, "item 8 must follow item 7");
+	assert.ok(utility > item8, "item 8 must precede the Utility agents paragraph");
+	assert.doesNotMatch(PARENT_PLAYBOOK, /\n9\. /);
+});

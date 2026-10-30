@@ -31,6 +31,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { statSync, writeFileSync } from "node:fs";
 
+/** Raw answer from the SDK's `AgentSession.steer()` (#313): `"handled"` | `"queued"`. */
+type RawSteerDisposition = "queued" | "handled";
+
 class FakeSession implements InProcessSession {
 	readonly listeners = new Set<(event: unknown) => void>();
 	readonly prompts: string[] = [];
@@ -38,6 +41,17 @@ class FakeSession implements InProcessSession {
 	readonly followUps: string[] = [];
 	aborts = 0;
 	disposed = false;
+	/**
+	 * #313: the real session accepts a steer at any time, but while a tool batch
+	 * is executing it only banks it for the next LLM call.
+	 */
+	toolInFlight = false;
+	private readonly queuedSteerTexts: string[] = [];
+
+	/** Steers accepted but not yet consumed while a tool batch was running. */
+	get queuedSteers(): readonly string[] {
+		return this.queuedSteerTexts;
+	}
 
 	subscribe(listener: (event: unknown) => void): () => void {
 		this.listeners.add(listener);
@@ -50,8 +64,24 @@ class FakeSession implements InProcessSession {
 		this.emit({ type: "turn_start" });
 	}
 
-	async steer(text: string): Promise<void> {
+	/**
+	 * Mirrors `AgentSession.steer()` (#313): `"handled"` means an input handler
+	 * took the text now, `"queued"` means it waits for the current tool batch.
+	 */
+	async steer(text: string): Promise<RawSteerDisposition> {
+		if (this.toolInFlight) {
+			this.queuedSteerTexts.push(text);
+			return "queued";
+		}
 		this.steers.push(text);
+		return "handled";
+	}
+
+	/** #313: the tool batch finished — banked steers reach the next turn. */
+	finishToolBatch(): void {
+		this.toolInFlight = false;
+		this.steers.push(...this.queuedSteerTexts);
+		this.queuedSteerTexts.length = 0;
 	}
 
 	async followUp(text: string): Promise<void> {
@@ -679,9 +709,9 @@ test("inprocess: later dispatches reuse the child's context", async () => {
 			seen.push(`prompt:${currentChildContext()?.nodeId}`);
 			await super.prompt(text);
 		}
-		override async steer(text: string): Promise<void> {
+		override async steer(text: string): Promise<RawSteerDisposition> {
 			seen.push(`steer:${currentChildContext()?.nodeId}`);
-			await super.steer(text);
+			return super.steer(text);
 		}
 		override async followUp(text: string): Promise<void> {
 			seen.push(`followUp:${currentChildContext()?.nodeId}`);
@@ -712,6 +742,40 @@ test("inprocess: later dispatches reuse the child's context", async () => {
 		assert.equal(currentChildContext(), undefined);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── #313: a steer behind an in-flight tool batch is queued, not delivered ─
+
+test("inprocess: steer reports queued behind an in-flight tool batch (#313)", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const session = h.sessions[0]!;
+		// A freshly spawned child is already inside its first (active) turn; the
+		// tool batch is what a steer cannot get past in the real session.
+		assert.equal(session.toolInFlight, false);
+		session.toolInFlight = true;
+
+		assert.equal(await h.supervisor.steer("root.worker", "first correction"), "queued");
+		assert.deepEqual(session.steers, [], "nothing reached the model yet");
+		assert.deepEqual(session.queuedSteers, ["first correction"], "the text is banked, not delivered");
+
+		assert.equal(await h.supervisor.steer("root.worker", "second correction"), "queued");
+		assert.deepEqual(session.steers, []);
+		assert.deepEqual(session.queuedSteers, ["first correction", "second correction"]);
+
+		// The tool batch ends: both corrections now reach the next LLM call in order.
+		session.finishToolBatch();
+		assert.deepEqual(session.steers, ["first correction", "second correction"]);
+		assert.deepEqual(session.queuedSteers, []);
+
+		// The same call outside a tool batch is consumed immediately.
+		assert.equal(await h.supervisor.steer("root.worker", "third correction"), "delivered");
+		assert.deepEqual(session.steers, ["first correction", "second correction", "third correction"]);
+		assert.deepEqual(session.queuedSteers, []);
+	} finally {
+		h.close();
 	}
 });
 
@@ -902,9 +966,9 @@ test("inprocess: mutating the caller's context template does not affect a spawne
 			seen.push(currentChildContext()?.nodeId);
 			await super.prompt(text);
 		}
-		override async steer(text: string): Promise<void> {
+		override async steer(text: string): Promise<RawSteerDisposition> {
 			seen.push(currentChildContext()?.nodeId);
-			await super.steer(text);
+			return super.steer(text);
 		}
 	}
 	const supervisor = new InProcessSupervisor({

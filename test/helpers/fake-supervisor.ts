@@ -20,6 +20,7 @@ import type {
 	RpcClientOptions,
 	SettleResult,
 	SpawnInput,
+	SteerDisposition,
 	SupervisorEvent,
 	SupervisorEventListener,
 	UsageSnapshot,
@@ -115,6 +116,11 @@ export class FakeSupervisor implements LegionSupervisor {
 	private readonly autoSettle?: FakeSupervisorOptions["autoSettle"];
 	private readonly rejectSpawn?: FakeSupervisorOptions["rejectSpawn"];
 	private readonly initialUsage: UsageSnapshot | null;
+	/**
+	 * Disposition every `steer` call reports (#313). Defaults to the honest
+	 * `"queued"`; a test that wants a delivered steer sets it explicitly.
+	 */
+	steerDisposition: SteerDisposition = "queued";
 
 	constructor(options: FakeSupervisorOptions = {}) {
 		this.immediateTimeout = options.immediateTimeout ?? true;
@@ -184,11 +190,12 @@ export class FakeSupervisor implements LegionSupervisor {
 		child.settleResult = undefined;
 	}
 
-	async steer(name: string, text: string): Promise<void> {
+	async steer(name: string, text: string): Promise<SteerDisposition> {
 		const child = this.requireChild(name);
 		this.calls.push({ method: "steer", name, text });
 		appendLines(child.sessionFile, [userLine(text)]);
 		child.settleResult = undefined;
+		return this.steerDisposition;
 	}
 
 	async followUp(name: string, text: string): Promise<void> {

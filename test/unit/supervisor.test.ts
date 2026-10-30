@@ -111,6 +111,13 @@ class FakeRpcClient implements RpcClientLike {
 	readonly prompts: string[] = [];
 	readonly steers: string[] = [];
 	readonly followUps: string[] = [];
+	/**
+	 * Raw value this fake's `steer` resolves with (#313). Deliberately the SDK's
+	 * own vocabulary — the real `RpcClient.steer()` returns the RPC reply's
+	 * `disposition`, i.e. `"handled" | "queued"` — so RpcSupervisor's mapping
+	 * through `toSteerDisposition` is exercised, not bypassed.
+	 */
+	steerDisposition: unknown = "queued";
 	starts = 0;
 	stops = 0;
 	aborts = 0;
@@ -150,8 +157,9 @@ class FakeRpcClient implements RpcClientLike {
 		if (this.promptError) throw this.promptError;
 	}
 
-	async steer(message: string): Promise<void> {
+	async steer(message: string): Promise<unknown> {
 		this.steers.push(message);
+		return this.steerDisposition;
 	}
 
 	async followUp(message: string): Promise<void> {
@@ -624,6 +632,39 @@ test("steer and follow-up target an active RPC turn without starting another pro
 		await h.supervisor.steer("root.worker", "Start a fresh turn while idle.");
 		assert.deepEqual(client.prompts.slice(1), ["Start a fresh turn while idle."]);
 		assert.equal(client.steers.length, 1);
+		emitSettled(client);
+	} finally {
+		await h.supervisor.retire("root.worker");
+		h.close();
+	}
+});
+
+test("steer returns the disposition mapped from the RPC client's raw answer (#313)", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const client = h.clients[0]!;
+
+		// The fake mirrors the SDK vocabulary, so the default is a raw "queued":
+		// busying child + unnormalized answer must not be reported as delivered.
+		assert.equal(client.steerDisposition, "queued");
+		assert.equal(await h.supervisor.steer("root.worker", "default answer"), "queued");
+
+		// raw "handled" is the only value that means the input handler took it now.
+		client.steerDisposition = "handled";
+		assert.equal(await h.supervisor.steer("root.worker", "take this now"), "delivered");
+
+		// raw "queued" stays queued through the mapping.
+		client.steerDisposition = "queued";
+		assert.equal(await h.supervisor.steer("root.worker", "bank this"), "queued");
+		assert.deepEqual(client.steers, ["default answer", "take this now", "bank this"]);
+		assert.equal(client.prompts.length, 1);
+
+		// A steer against an idle child starts the turn, so it did reach the model.
+		emitSettled(client);
+		assert.equal(await h.supervisor.steer("root.worker", "fresh turn"), "delivered");
+		assert.deepEqual(client.prompts.slice(1), ["fresh turn"]);
+		assert.equal(client.steers.length, 3);
 		emitSettled(client);
 	} finally {
 		await h.supervisor.retire("root.worker");

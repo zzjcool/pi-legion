@@ -56,10 +56,12 @@ import type {
 	LegionSupervisor,
 	SettleResult,
 	SpawnInput,
+	SteerDisposition,
 	SupervisorEvent,
 	SupervisorEventListener,
 	UsageSnapshot,
 } from "./types.ts";
+import { toSteerDisposition } from "./types.ts";
 
 /**
  * Stats shape this supervisor reads. Permissive on purpose: it must be
@@ -1033,9 +1035,10 @@ export class InProcessSupervisor implements LegionSupervisor {
 		await this.dispatch(child, "prompt", text);
 	}
 
-	async steer(name: string, text: string): Promise<void> {
+	/** #313 D4: tell the caller whether the steer landed now or was queued. */
+	steer(name: string, text: string): Promise<SteerDisposition> {
 		const child = this.requireChild(name);
-		await this.dispatch(child, "steer", text);
+		return this.dispatch(child, "steer", text);
 	}
 
 	async followUp(name: string, text: string): Promise<void> {
@@ -1277,7 +1280,7 @@ export class InProcessSupervisor implements LegionSupervisor {
 		child: ChildRecord,
 		kind: "prompt" | "steer" | "followUp",
 		text: string,
-	): Promise<void> {
+	): Promise<SteerDisposition> {
 		// Every turn is dispatched inside the child's identity scope AND at the
 		// child's recorded absolute nesting depth. The Orchestrator drives turn 2+
 		// from the root chain, where `inProcessDepth()` is 0; without pinning the
@@ -1290,11 +1293,20 @@ export class InProcessSupervisor implements LegionSupervisor {
 		);
 	}
 
+	/**
+	 * Dispatch one turn and report what actually happened to `text` (#313 D4).
+	 *
+	 * The disposition is chosen by the branch taken, never by the caller's
+	 * intent: a steer that the session accepted while a turn is running is
+	 * reported as whatever `session.steer()` says (normalized by
+	 * `toSteerDisposition`), a follow-up queued behind an active turn is
+	 * `"queued"`, and a prompt that started the turn is `"delivered"`.
+	 */
 	private async dispatchInContext(
 		child: ChildRecord,
 		kind: "prompt" | "steer" | "followUp",
 		text: string,
-	): Promise<void> {
+	): Promise<SteerDisposition> {
 		this.assertCanSend(child);
 		const session = child.session!;
 		const wasActive = child.turnActive;
@@ -1302,10 +1314,18 @@ export class InProcessSupervisor implements LegionSupervisor {
 		try {
 			if (kind === "followUp" && wasActive && session.followUp) {
 				await session.followUp(text);
+				// A follow-up is by definition banked behind the running turn.
+				return "queued";
 			} else if ((kind === "steer" || kind === "prompt") && wasActive && session.steer) {
-				await session.steer(text);
+				// Never drop this value: the session uses it to say whether an input
+				// handler consumed the text now or banked it behind the tool batch.
+				return toSteerDisposition(await session.steer(text));
 			} else {
 				await session.prompt(text);
+				// No steer/followUp seam was usable. If the child was already busy the
+				// prompt still joins the queue behind that turn; only a prompt that
+				// started a fresh turn reached the session immediately.
+				return wasActive ? "queued" : "delivered";
 			}
 		} catch (error) {
 			if (!wasActive && child.turnActive) {

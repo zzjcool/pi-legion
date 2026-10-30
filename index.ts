@@ -23,7 +23,7 @@ import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
-import type { LegionSupervisor } from "./src/supervisor/types.ts";
+import type { LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
 import {
@@ -2015,17 +2015,46 @@ function unknownChild(
 	);
 }
 
-/** Send a message to a running child without waiting for its reply. */
-async function steerChild(
+/**
+ * Render the receipt for one accepted `steer` (#313 D5).
+ *
+ * The only place a steer receipt is built. `queued` is the honest wording: Pi
+ * delivers a steer after the child's current tool batch finishes and before
+ * its next LLM call, so a message sent into a running tool says nothing about
+ * the model having seen it yet. It is not an error and must not read like one,
+ * but it must not read as "delivered" either.
+ */
+export function steerReceipt(
+	name: string,
+	disposition: SteerDisposition,
+): string {
+	return disposition === "delivered"
+		? `Steered ${name}.`
+		: `Steered ${name} (queued — it takes effect after its current tool batch finishes)`;
+}
+
+/**
+ * Send a message to a running child without waiting for its reply.
+ *
+ * Exported so `test/unit/steer-receipt.test.ts` can drive the receipt end to
+ * end (same reason as `waitAction`/`stopAction`).
+ */
+export async function steerChild(
 	ctx: ChildContext,
 ): Promise<AgentToolResult<unknown>> {
 	if (!ctx.params.message) {
 		return fail("`message` is required for steer.", ErrorCodes.INVALID_PARAMS);
 	}
 	try {
-		await ctx.orchestrator.steer(ctx.name, ctx.params.message);
+		// Await into a local so the existing `followChild` call keeps its place
+		// between the steer and the receipt; the receipt itself is still
+		// `ok(steerReceipt(...))` with the disposition this steer reported.
+		const disposition = await ctx.orchestrator.steer(
+			ctx.name,
+			ctx.params.message,
+		);
 		followChild(ctx, { watch: true });
-		return ok(`Steered ${ctx.name}.`);
+		return ok(steerReceipt(ctx.name, disposition));
 	} catch (error) {
 		return fail(`steer failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
 	}
@@ -2318,10 +2347,16 @@ async function reviveChild(
 
 	try {
 		if (supervisor.isAlive(name)) {
-			await orchestrator.steer(name, params.message);
+			// #313 D5: this branch steers a live child too, so it must not claim
+			// delivery it cannot observe. `queued` appends the parenthetical from
+			// `steerReceipt` rather than inventing a third wording.
+			const disposition = await orchestrator.steer(name, params.message);
 			followChild(ctx, { watch: true });
+			const prefix = `${action === "resume" ? "Resumed" : "Continued"} ${name}`;
 			return ok(
-				`${action === "resume" ? "Resumed" : "Continued"} ${name} (live child steered).`,
+				disposition === "delivered"
+					? `${prefix} (live child steered).`
+					: `${prefix} (live child steered — queued — it takes effect after its current tool batch finishes).`,
 			);
 		}
 

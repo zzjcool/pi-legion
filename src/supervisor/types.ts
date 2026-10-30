@@ -90,11 +90,40 @@ export interface UsageSnapshot {
 	costUsd: number;
 }
 
+/**
+ * What a `steer` call actually achieved (#313).
+ *
+ * `"queued"` is the honest default: the message is sitting behind the child's
+ * in-flight work, not in front of the model. `"delivered"` means the child's
+ * input handler consumed it right away.
+ */
+export type SteerDisposition = "queued" | "delivered";
+
+/**
+ * Normalize the SDK's steer vocabulary (`"handled" | "queued"`) into
+ * {@link SteerDisposition} (#313 D2). The only place this mapping happens.
+ *
+ * Anything that is not literally `"handled"` — `"queued"`, `undefined`, a
+ * backend that returns junk, an older SDK that returns nothing — maps to
+ * `"queued"`. Rationale: a receipt must never claim delivery on doubt. A
+ * false `"queued"` merely understates; a false `"delivered"` would tell a
+ * parent its correction landed while the child is still running its previous
+ * tool batch.
+ */
+export function toSteerDisposition(raw: unknown): SteerDisposition {
+	return raw === "handled" ? "delivered" : "queued";
+}
+
 /** The orchestrator's frozen backend seam (legion-v2-contract.md §3.1). */
 export interface LegionSupervisor {
 	spawnChild(input: SpawnInput): Promise<ChildHandle>;
 	prompt(name: string, text: string): Promise<void>;
-	steer(name: string, text: string): Promise<void>;
+	/**
+	 * Steer a running child (#313): the returned disposition says whether the
+	 * message was taken now (`"delivered"`) or banked behind the current tool
+	 * batch (`"queued"`). Callers that build a receipt must report it.
+	 */
+	steer(name: string, text: string): Promise<SteerDisposition>;
 	followUp(name: string, text: string): Promise<void>;
 	abort(name: string): Promise<void>;
 	waitSettled(name: string, timeoutMs?: number, signal?: AbortSignal): Promise<SettleResult>;
