@@ -670,6 +670,13 @@ async function defaultSessionFactory(
  * Host-side in-process adapter for the frozen §3.1 LegionSupervisor contract.
  */
 export class InProcessSupervisor implements LegionSupervisor {
+	/**
+	 * #323 D1: the SDK's `AgentSession.prompt()` returns `void`, so this backend
+	 * cannot tell "a run started" from "the call did not throw" — an input
+	 * handler that swallows the prompt is invisible here. `accepted` therefore
+	 * means exactly "no throw"; no `queued`/`intercepted` is invented.
+	 */
+	readonly capabilities = { promptDisposition: false } as const;
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly subscriptionsBeforeSpawn = new Map<string, Set<EventSubscription>>();
 	private readonly sessionFactory: InProcessSessionFactory;

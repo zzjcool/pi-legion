@@ -128,6 +128,11 @@ class FakeRpcClient implements RpcClientLike {
 	 * the default mirrors an older backend that reported nothing.
 	 */
 	promptDisposition: unknown = undefined;
+	/**
+	 * When set, `prompt()` waits on it before answering. Lets a test interleave a
+	 * retire with an in-flight dispatch (#323 4) instead of racing real timers.
+	 */
+	promptGate?: Promise<unknown>;
 	starts = 0;
 	stops = 0;
 	aborts = 0;
@@ -164,6 +169,7 @@ class FakeRpcClient implements RpcClientLike {
 
 	async prompt(message: string): Promise<unknown> {
 		this.prompts.push(message);
+		if (this.promptGate) await this.promptGate;
 		if (this.promptError) throw this.promptError;
 		return this.promptDisposition;
 	}
@@ -784,7 +790,9 @@ test("a spawn whose launch prompt is intercepted fails instead of returning a bu
 			(error: unknown) => {
 				assert.ok(error instanceof Error);
 				assert.match(error.message, /intercepted by an input handler/);
-				assert.equal((error as { code?: string }).code, ErrorCodes.START_FAILED);
+				// #323 5: deterministic, so it must NOT be the code the model-fallback
+				// chain reacts to.
+				assert.equal((error as { code?: string }).code, ErrorCodes.PROMPT_INTERCEPTED);
 				return true;
 			},
 		);
@@ -796,6 +804,51 @@ test("a spawn whose launch prompt is intercepted fails instead of returning a bu
 		assert.deepEqual(readdirSync(root), [], "the failed spawn leaves no session file behind");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#323 4: rolling back an abandoned turn must not overwrite `retiring` with `idle`", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const client = h.clients[0]!;
+		emitSettled(client);
+
+		// A dispatch that claims a turn, then rejects: that rejection is exactly
+		// the path that calls `abandonTurn`. Hold it open so a retire lands first.
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		client.promptGate = gate;
+		client.promptError = new Error("RPC command was rejected");
+		const pending = h.supervisor.prompt("root.worker", "rollback race");
+		await Promise.resolve();
+
+		// Keep the fake process alive on both signals so `retiring` is the state a
+		// concurrent rollback actually observes (an exiting process would already
+		// be `retired`, which is a different guard).
+		client.process.ignoreInputClose = true;
+		client.process.ignoredSignals.add("SIGTERM");
+		client.process.ignoredSignals.add("SIGKILL");
+		const retiring = h.supervisor.retire("root.worker").catch(() => {});
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		const record = turnRecord(h.supervisor, "root.worker")!;
+		assert.equal(record.state, "retiring", "the retire owns the state from here on");
+
+		release();
+		await pending.catch(() => {});
+		assert.equal(
+			record.state,
+			"retiring",
+			"#323 4: an abandoned turn must keep the same `retiring` guard `updateTurnState` has",
+		);
+
+		// Finish the retire so no timeout survives the test.
+		client.process.exit(0, null);
+		await retiring;
+	} finally {
+		h.close();
 	}
 });
 

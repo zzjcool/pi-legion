@@ -891,6 +891,11 @@ export const ErrorCodes = {
 	// `BUDGET_EXCEEDED` made a caller unable to tell a spent budget from a
 	// terminal child, so the resume refusal gets its own code.
 	CHILD_TERMINAL: "CHILD_TERMINAL",
+	// #323 5: the launch prompt was swallowed by an input handler, so no run ever
+	// started. Deterministic — another model cannot change it — which is why it
+	// must not share `START_FAILED`: `canFallbackStart` would re-spawn a process
+	// per fallback model and roll each one back immediately.
+	PROMPT_INTERCEPTED: "PROMPT_INTERCEPTED",
 } as const;
 
 // =============================================================================

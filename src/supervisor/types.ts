@@ -380,6 +380,28 @@ export interface LegionSupervisor {
 	 * A dead child never answers: holding no live handle, it can run no tool.
 	 */
 	inFlightTool?(name: string): ChildActivity | undefined;
+	/**
+	 * What this backend can actually observe (#323).
+	 *
+	 * `promptDisposition: false` means `prompt()` cannot tell "the session
+	 * accepted a turn" apart from "it did not throw": an input handler that
+	 * swallows the prompt is invisible. That is exactly the in-process backend —
+	 * the SDK's `AgentSession.prompt()` returns `void` — so its `accepted` is a
+	 * weaker claim than RPC's, where the reply carries the disposition.
+	 *
+	 * Frozen rule (#323 D1): a caller must never invent a `queued`/`intercepted`
+	 * distinction a backend cannot answer. The flag exists so that difference is
+	 * nameable instead of silently flattened. A facade-level read must never be
+	 * used to tell backends apart — the routing facade reports the intersection of
+	 * every backend it can reach; to distinguish, read the concrete backend
+	 * instance (`RoutingSupervisor.backendFor` resolves it, and `routing.rpc` /
+	 * `routing.inprocess` are the two capabilities it reaches). Contract:
+	 * `docs/legion-v2-contract.md` §3.1.
+	 *
+	 * Optional like `inFlightTool`: a supervisor that cannot answer must keep
+	 * satisfying the seam, and absence means "no capability claimed".
+	 */
+	capabilities?: { readonly promptDisposition: boolean };
 	stats(name: string): Promise<UsageSnapshot | null>;
 	retire(name: string, opts?: { graceful?: boolean }): Promise<void>;
 }

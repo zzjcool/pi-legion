@@ -340,6 +340,21 @@ test("routing: inprocess vs rpc by spawnMode; name cannot cross backends", async
 	}
 });
 
+test("#323 D1: prompt-disposition capability is declared per backend, honestly", () => {
+	// In-process is the default spawn mode and the SDK's `AgentSession.prompt()`
+	// returns `void`, so "accepted" there can only mean "did not throw". The
+	// flag names that limit instead of letting a caller assume RPC's strength.
+	const inprocess = new InProcessSupervisor({ limits: { maxActive: 1 } });
+	const rpc = new RpcSupervisor({ enumerateDescendants: () => [] });
+	const routing = new RoutingSupervisor({ rpc, inprocess });
+
+	assert.equal(inprocess.capabilities.promptDisposition, false);
+	assert.equal(rpc.capabilities.promptDisposition, true);
+	// The facade routes per child, so it may only claim what EVERY backend it can
+	// route to can answer; in-process cannot answer, hence false.
+	assert.equal(routing.capabilities.promptDisposition, false);
+});
+
 test("#315 routing: inFlightTool is forwarded to the owning backend", async () => {
 	const root = mkdtempSync(path.join(tmpdir(), "legion-routing-activity-"));
 	const sessions: FakeSession[] = [];

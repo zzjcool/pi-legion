@@ -111,6 +111,29 @@ interface LegionSupervisor {
 > （`clearQueued: true`），上限 `DEFAULT_ABORT_TIMEOUT_MS`（5 s）**同时盖住清队列与中断**。
 > 契约与逐字回执：`docs/contracts/abort-soft-interrupt-v1.md`。
 
+> **`capabilities.promptDisposition`（#323 D1）**：`prompt()` 到底能观察到什么，两个后端**不一样**，
+> 所以能力上限写在接口上（可选成员 `capabilities?: { promptDisposition: boolean }`），而不是靠调用方猜：
+>
+> - **in-process**（默认 spawn 模式，`capabilities.promptDisposition === false`）：SDK 的
+>   `AgentSession.prompt()` 返回 `void`，不交回 disposition，所以「被 input handler 吞掉」在这里
+>   **检测不到**。该后端上的 `accepted` **只表示这次调用没有抛错**——既不证明起了一轮，也不证明
+>   模型读了。**调用方**禁止替 in-process 编造 `queued`/`intercepted`（不硬造一个它答不上来的
+>   事实）；后端自己按 `wasActive` 推断出的 `queued`（同一后端 `dispatchInContext` 在轮次已活跃
+>   时给 `steer` 的回包）只算「**最多排队**」的**弱声明**——它说的是「这一调用没有立刻起一轮」，
+>   不是「模型一定会在下个边界读到」。
+> - **rpc**（`promptDisposition === true`）：`prompt()` 的回包带 disposition，`accepted` 才有
+>   「这一调用为它起了一轮」的强度（`intercepted` 由 `handled` 归一化而来，见上一条注）。
+> - **`RoutingSupervisor`** 按子节点路由，所以 facade 上的标志只能声明「它可能路由到的**所有**
+>   后端都能答的事实」。in-process 是默认模式且答案为 `false`，故 facade 报 `false`；逐后端的
+>   精确值以 `RpcSupervisor.capabilities` / `InProcessSupervisor.capabilities` 为准。
+>   **facade 级读取不得用于区分后端**（这个词是交集，不是完整事实）；需要区分时读具体后端
+>   实例（`RoutingSupervisor.backendFor` 选中的那个，公开可见的是 `routing.rpc` /
+>   `routing.inprocess` 的 `capabilities`）。
+>
+> 同一条能力上限解释了 mailbox 的 `prompt` 分支为什么没有 `intercepted` 告警（#323 2）：那条
+> 分支的 `prompt()` 是 `Promise<void>`，没有 disposition 可读。`delivered=1` 在这条分支上依旧
+> 只表示「send 调用返回了」。
+
 > **`steer` 的负语义（#313）**：§8.3 表格里 `steer` 那一行的「本轮工具后、下次 LLM 前送达」也是
 > **排队**语义，不是打断。
 > 工具调用执行期间子节点对 `steer` **不可达**——queue-only，没有自动打断，也没有 abort 后重投；

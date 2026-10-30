@@ -219,6 +219,12 @@ function usageSnapshot(value: unknown): UsageSnapshot | null {
  * Registry entries are isolated by name and own their event listeners/tempfiles.
  */
 export class RpcSupervisor implements LegionSupervisor {
+	/**
+	 * RPC reads the prompt reply's disposition, so `prompt()` can tell "a run
+	 * started" from "it did not" (#323 D1). See the seam doc for why the
+	 * in-process backend cannot claim this.
+	 */
+	readonly capabilities = { promptDisposition: true } as const;
 	private readonly children = new Map<string, ChildRecord>();
 	private readonly subscriptionsBeforeSpawn = new Map<
 		string,
@@ -401,9 +407,15 @@ export class RpcSupervisor implements LegionSupervisor {
 				// `beginTurn` just claimed. Failing the spawn is the only honest answer —
 				// returning a handle that is born `running` would park every waiter and
 				// make the child look busy forever.
+				//
+				// #323 5: this is a DETERMINISTIC failure — the same input handler eats
+				// the same prompt for every model — so it gets the one code
+				// `canFallbackStart` refuses. `START_FAILED` would make the orchestrator
+				// spawn one process per fallback model and roll each one back.
 				throw this.startFailure(
 					registration,
 					"first prompt was intercepted by an input handler before any run started",
+					ErrorCodes.PROMPT_INTERCEPTED,
 				);
 			}
 			if (!this.isAlive(input.name)) {
@@ -705,7 +717,11 @@ export class RpcSupervisor implements LegionSupervisor {
 	private abandonTurn(child: ChildRecord, reason: string): void {
 		if (!child.turnActive) return;
 		child.turnActive = false;
-		child.state = "idle";
+		// Same invariant `updateTurnState` keeps (#323 4): a concurrent retire has
+		// already moved the record to `retiring`, and rolling a turn back must not
+		// rewrite that into `idle` — `idle` means "holds a live slot, can take a
+		// turn", which a retiring child is about to lose.
+		if (child.state !== "retiring") child.state = "idle";
 		child.lastTurnResult = {
 			settled: false,
 			abnormal: false,
@@ -1179,7 +1195,11 @@ export class RpcSupervisor implements LegionSupervisor {
 		);
 	}
 
-	private startFailure(child: ChildRecord, message: string): SubagentError {
+	private startFailure(
+		child: ChildRecord,
+		message: string,
+		code: string = ErrorCodes.START_FAILED,
+	): SubagentError {
 		const stderr = child.client?.getStderr?.();
 		const base = `${message}${stderr ? `: ${stderr.trim().slice(0, 500)}` : ""}`;
 		return new SubagentError(
@@ -1187,10 +1207,10 @@ export class RpcSupervisor implements LegionSupervisor {
 				name: child.name,
 				stderr,
 				args: child.lastArgs,
-				code: ErrorCodes.START_FAILED,
+				code,
 				cwd: child.cwd,
 			}),
-			ErrorCodes.START_FAILED,
+			code,
 		);
 	}
 

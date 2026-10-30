@@ -125,6 +125,25 @@ test("regression: RPC start fallback tries configured models in order", async ()
 	} finally { rmSync(runDir, { recursive: true, force: true }); }
 });
 
+test("regression: a deterministic intercepted launch prompt skips the fallback chain (#323)", async () => {
+	const runDir = tempDir();
+	try {
+		// #323 5: an input handler swallowing the launch prompt is deterministic —
+		// every candidate model would spawn a process and roll it back the same way.
+		const supervisor = new FakeSupervisor({ rejectSpawn: () => new SubagentError("first prompt was intercepted by an input handler before any run started", ErrorCodes.PROMPT_INTERCEPTED) });
+		const orchestrator = new Orchestrator({ supervisor, runDir, cwd: "/tmp/project" });
+		await assert.rejects(
+			() => orchestrator.launch({ agent: agent({ model: "primary/model", fallbackModels: ["fallback/model", "third/model"] }), task: "go", worktree: false }),
+			(error: unknown) => error instanceof SubagentError && error.code === ErrorCodes.PROMPT_INTERCEPTED,
+		);
+		assert.equal(
+			supervisor.calls.filter((call) => call.method === "spawnChild").length,
+			1,
+			"a deterministic failure stops the chain after the first attempt instead of spawning per model",
+		);
+	} finally { rmSync(runDir, { recursive: true, force: true }); }
+});
+
 test("regression: role depth never widens parent depth and spawn budget is enforced", async () => {
 	const runDir = tempDir();
 	try {

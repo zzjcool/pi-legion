@@ -167,6 +167,37 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   consumption that happened is a fact about the past. No new event type: the verdict is `mail_bounced` with
   `reason: "obsolete_after_phase_change"`.
 
+- **The five `steer`-receipt residuals (#323).** The three honest dispositions from #313 are now
+  wired through the edges that still flattened them. The in-process backend can never answer
+  `queued` vs `accepted` — the SDK's `AgentSession.prompt()` returns `void` — so the supervisor seam
+  gained an explicit capability (`capabilities.promptDisposition`: in-process `false`, rpc `true`,
+  and the routing facade reports the intersection, `false`) instead of inventing a disposition that
+  backend cannot observe; the v2 contract now states that `accepted` on in-process means only "the
+  call did not throw". An intercepted mailbox `action-needed` steer no longer flips the node from
+  `blocked` to `running`: #338 already makes that send `bounced` and returns before the unblock, and
+  the orchestrator's own `clearBlocked` path now refuses it for the same reason — nothing landed, so
+  the child is still waiting. `abandonTurn` keeps the same `retiring` guard `updateTurnState` has, so
+  a concurrent rollback can no longer rewrite a retiring child as `idle`. And an intercepted *launch*
+  prompt now fails with the new deterministic code `PROMPT_INTERCEPTED`, which `canFallbackStart`
+  refuses — a swallowed prompt used to re-spawn one process per fallback model and roll each one back
+  right away. The mailbox `prompt` branch keeps no disposition by construction; its comment and the
+  contract now say why. Contract: `docs/legion-v2-contract.md` §3.1.
+- **The in-flight tool fact behind `status` is a stack, so nested and parallel calls stop disappearing
+  (#331).** `working · bash 00:07:31` used to read a single slot: `tool_execution_start` overwrote it
+  and the matching `tool_execution_end` cleared it. Two shapes therefore made the line vanish while a
+  tool was demonstrably still running. A nested call (`codemode` → `bash`) pushed the inner frame into
+  the slot, so the inner end wiped the outer call — `status` showed nothing while `codemode` ran on. A
+  parallel batch kept only the newest call, so when that one finished first the still-running sibling
+  became invisible. Each `ChildRecord` now keeps a LIFO stack (`ChildActivity[]`): a start pushes, an
+  end removes **only** the frame it names (by `toolCallId`), `agent_settled` empties it, and the line
+  reads the top (innermost) frame for the tool name and the clock. When the stack is deeper than one,
+  the line names the context instead of hiding it — ` (inside codemode ×2)` for nesting (from the
+  event stream's own `parentToolCallId`) and ` (+N more)` for parallel siblings, with the weaker
+  `(+N more)` chosen when parent ids cannot tell the two apart. An empty stack renders no line, exactly
+  as before. Display only: `liveness()`, heartbeats, the orphan scan and every kill/abort/retire path
+  are untouched. The seam gained an optional `inFlightToolStack` next to `inFlightTool`, so a doubled
+  supervisor that only answers the single frame keeps working. Contract revision:
+  `docs/contracts/stall-visibility-v1.md` (D1/D2/D4/D7).
 - **One name, one node: `status` / `collect` / `stop` / `continue` now resolve a child name the same way.**
   In a single root session, `status(name)` and `collect(name)` called ten seconds apart answered with two
   different nodes for the same `worker-0`: `status` went through `pickChildByName`, which walks **every**

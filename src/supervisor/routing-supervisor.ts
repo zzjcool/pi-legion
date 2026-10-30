@@ -102,6 +102,13 @@ function chainSlotRelease(hook: ((event: InProcessSlotEvent) => void) | undefine
  * based on the resolved spawnMode of the target agent / registered child.
  */
 export class RoutingSupervisor implements LegionSupervisor {
+	/**
+	 * Conservative capability report (#323 D1): this facade routes per child, so
+	 * a flag here may only claim what EVERY backend it can route to can answer.
+	 * `promptDisposition` is `false` because an in-process child — the default
+	 * spawn mode — cannot report one; the per-backend flags stay precise.
+	 */
+	readonly capabilities = { promptDisposition: false } as const;
 	readonly rpc: RpcSupervisor;
 	readonly inprocess: InProcessSupervisor;
 	private readonly owners = new Map<string, SupervisorBackend>();
