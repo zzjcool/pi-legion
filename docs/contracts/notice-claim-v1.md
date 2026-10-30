@@ -40,7 +40,7 @@
   3. 通知**发送成功**之后（`deliverCompletion` 返回 `true`）。
 - **投递侧没有 unclaim 路径**：超时 / interrupted / stillRunning 都不需要撤销，因为它们从未 claim。
 
-**修订（复审 minor 4，2026-xx）**：上面「三处都是真实交付」在 `collect` 那条上并不严格成立 —— claim 发生在运行时缝里（`consumeCollectInterruptible` 把 snapshot 交出去的那一刻），而**调用方仍可能反悔**：`collectChild` 在 `await pending` 之后还会检查 `signal?.aborted`（父 turn 被 Esc 掉），`persistChild` 抛错则走 `fail("collect failed: …")`。两条路径都没有把文本交给父 agent。裁决：保留缝内的 claim（D2(a) 的抢跑防护要靠它），在 bail 分支调用 `runtime.unclaimUndelivered(name, snapshot)` 回滚。
+**修订（复审 minor 4，2026-xx）**：上面「三处都是真实交付」在 `collect` 那条上并不严格成立 —— claim 发生在运行时缝里（`consumeCollectInterruptible` 把 snapshot 交出去的那一刻），而**调用方仍可能反悔**：`collectChild` 在 `await pending` 之后还会检查 `signal?.aborted`（父 turn 被 Esc 掉），`persistChild` 抛错则走 `fail("collect failed: …")`。两条路径都没有把文本交给父 agent。裁决：保留缝内的 claim（D2(a) 的抢跑防护要靠它），在 bail 分支调用 `runtime.unclaimUndelivered(name, snapshot, claimedNow)` 回滚（第三个参数见下面的 #320 修订）。
 
 该回滚**故意比 `unclaimReported`(D7) 更窄**：只删 claim，不清任何副本。理由相反于 D7 —— D7 处理的是「父已读过所以撤销」，此时还没有任何副本落到父手里，待发的通知是唯一剩下的送达路径。
 
@@ -52,11 +52,13 @@
    - 裁决：claim 的「是否本次取得」**随缝的返回值交出**，即 `consumeCollect*` 返回 `{ snapshot, claimedNow }`（`ClaimedCollect`），`unclaimUndelivered(name, snapshot, claimedNow)` 只在 `claimedNow === true` 时回滚。
    - **不放在按快照索引的表里**：watch 与工具调用共享同一个 `job.collectPromise`，两个 collect 会拿到同一个快照对象；按快照记账时第二次调用会把第一次的 `true` 覆盖成 `false`，之后第一次 bail 直接 return，claim 留下而两份都没交付。按**调用**记账天然没有这个覆盖问题。
    - `claimedNow === false` 时回滚是完整 no-op（连 `consumedByTool` 都不复位）：claim 存在即证明结果已交付，通知本就该被过滤。
-2. **它没有把通知路径交还。** 缝在 claim 之前就把 `consumedByTool` 置了位，而 watch 的闸门 `!consumedByTool && !notified` 在终态时读它。生产形状下每个 child 都被 watch（`followChild` 的 `watch: true`），快照 resolve 后**watch 的 continuation 先跑**、闸门已看到 `true` 而跳过 `onTerminal`；等 `collectChild` bail 时 watch 正停在 `retire` 的 await 里，`job.watching` 仍为 `true`。因此：
-   - **job 分支**的回滚必须复位 `job.consumedByTool = false` **并无条件** `runtime.watch(name)` 重挂 watch（不设 `!job.watching` 守卫 —— 该守卫会让整个修复变成死代码）。
+2. **它没有把通知路径交还。** 缝在 claim 之前就把 `consumedByTool` 置了位，而 watch 的闸门 `!consumedByTool && !notified` 在终态时读它。**默认 async 路径下每个 child 都被 watch**（`followChild` 的 `watch: true`）；`async: false` 的显式内联 collect **不被 watch**（它在同一个 turn 里直接 `collectChild`），那种形状下没有任何 watch 在闸门处抢跑。快照 resolve 后**watch 的 continuation 先跑**、闸门已看到 `true` 而跳过 `onTerminal`；等 `collectChild` bail 时 watch 正停在 `retire` 的 await 里，`job.watching` 仍为 `true`。因此：
+   - **job 分支**的回滚必须复位 `job.consumedByTool = false` **并无条件** `runtime.watch(name)` 重挂 watch（不设 `!job.watching` 守卫 —— 该守卫会让整个修复变成死代码）。换句话说：旧 `!job.watching` 守卫在**默认路径**上恒为死代码（那里永远有人在 watch），只在 `async: false` 的内联形状下才有意义。
    - 安全性：`watch` 的 generation 自增让旧 watch 在 `finally` 处跳过 `release`（job 不被提前摘掉）；`notified` 保证同一轮不会二次 `onTerminal`；`deliverBatch` 的 claim 过滤是最后一张网。
    - 复位只作用于**本次 collect 所属的那一轮**（`job.runId`/`job.round` 与快照 origin 相等），不碰 collect 期间被 re-track 出来的新一轮。
    - **时序前提与 `waitOne` 的 `WAIT_INTERRUPTED` 分支不同**：wait 的 interrupt 赢在 collect promise resolve **之前**（watch 随后看到的是「标志已清 + job 还活着」），而本路径只可能发生在 resolve **之后**（闸门已过），所以只清标志不够，必须换一个 watch。
+
+**公共面（#327）**：`consumeCollect*` 是 `src/api.ts` 的导出面的一部分（该文件自称 "safe to depend on"），返回类型已从 `Promise<CollectSnapshot>` 变成 `Promise<ClaimedCollect>`。**裸 snapshot 这个形状已经发布过**——v4.0.0 与 v5.0.1 都导出 `consumeCollect(name): Promise<CollectSnapshot> | undefined`——所以它对 `pi-legion/api` 的消费者是**破坏性变更**，带着本改动的那次发布**必须是 major**。迁移就是一行：`const { snapshot } = await rt.consumeCollect(n)`；只有需要回滚的那条路径才用第二个字段。**仍然不做兼容层**（不给旧形状留重载 / 不提供 `snapshotOnly` 开关）：多留一个形状会把 claim 与副本的歧义继续摊给所有调用方。
 
 ### D3 — 通知路径在投递前最后一刻查 claim
 

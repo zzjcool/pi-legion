@@ -24,7 +24,6 @@ import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
 import type { AbortOutcome, ChildActivity, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
-import { DEFAULT_ABORT_TIMEOUT_MS } from "./src/supervisor/types.ts";
 import { withInFlightToolLine } from "./src/extension/legion-status.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
@@ -2341,6 +2340,13 @@ export async function steerChild(
 /**
  * Render the receipt for one `abort` (#314 D7).
  *
+ * The bounded wait the `timeout` receipt names comes from `outcome.timeoutMs` —
+ * the bound the backend actually applied — and NOT from a default of this
+ * function's own (#325). The tool surface never passes a `timeoutMs` (it stays a
+ * `wait`-only parameter), so a local default would be a second, silent source of
+ * truth: a caller that arms a different bound on the supervisor would still read
+ * "within 5s" here.
+ *
  * All three statuses are honest outcomes of a *soft* interrupt, and none of
  * them is a failure:
  *
@@ -2357,12 +2363,12 @@ export async function steerChild(
 export function abortReceipt(
 	name: string,
 	outcome: AbortOutcome,
-	timeoutMs = DEFAULT_ABORT_TIMEOUT_MS,
 ): string {
 	if (outcome.status === "no-turn") {
 		return `Nothing to abort: ${name} is not running a turn.`;
 	}
 	if (outcome.status === "timeout") {
+		const timeoutMs = outcome.timeoutMs;
 		const seconds = timeoutMs % 1000 === 0 ? String(timeoutMs / 1000) : (timeoutMs / 1000).toFixed(1);
 		return `Abort sent to ${name}, but it had not settled within ${seconds}s — the running tool may ignore cancellation; use stop (or stop with force) if it must die.`;
 	}

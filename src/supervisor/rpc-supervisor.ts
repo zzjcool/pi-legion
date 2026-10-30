@@ -51,6 +51,7 @@ import {
 	toSteerDisposition,
 } from "./types.ts";
 import { currentPgid, enumerateDescendants } from "./proc-tree.ts";
+import { raceWithTimeout } from "./race-timeout.ts";
 
 interface EventSubscription {
 	listener: SupervisorEventListener;
@@ -481,14 +482,23 @@ export class RpcSupervisor implements LegionSupervisor {
 			MAX_ABORT_TIMER_DELAY_MS,
 		);
 		if (!child.turnActive) {
-			return { status: "no-turn", cleared: { steering: 0, followUp: 0 } };
+			return { status: "no-turn", cleared: { steering: 0, followUp: 0 }, timeoutMs: bound };
 		}
 		let cleared = { steering: 0, followUp: 0 };
 		if (opts?.clearQueued !== false) {
 			try {
-				cleared = await this.raceClearTimeout(
-					Promise.resolve().then(() => this.requireClient(child).clearQueue?.()),
+				// Bounded by the same `bound` as the interrupt (#314 D4), which is the whole
+				// point on this backend: the clear goes through `RpcClient.send()`, whose only
+				// bound is a hard-coded 30 s request timeout, so awaiting it would delay the
+				// interrupt by up to 30 s — exactly on the unresponsive child this path exists
+				// for. A timer win reports `{0, 0}`: what we could learn, never a promise that
+				// the queue is empty.
+				cleared = await raceWithTimeout(
+					Promise.resolve()
+						.then(() => this.requireClient(child).clearQueue?.())
+						.then(countClearedQueue),
 					bound,
+					() => ({ steering: 0, followUp: 0 }),
 				);
 			} catch {
 				// Best effort: a clear that cannot answer must not swallow the interrupt.
@@ -500,57 +510,7 @@ export class RpcSupervisor implements LegionSupervisor {
 			await this.requireClient(child).abort();
 			return "interrupted";
 		})();
-		return { status: await this.raceAbortTimeout(work, bound), cleared };
-	}
-
-	/**
-	 * #314 D4: the pre-abort clear is raced against the same bound as the
-	 * interrupt, and a timer win means `{0, 0}` — the clear's counts are "what we
-	 * could learn", never a promise that the queue is empty.
-	 *
-	 * This bound is the whole point of the fix: on the RPC backend the clear goes
-	 * through `RpcClient.send()`, whose only bound is a hard-coded 30 s request
-	 * timeout, so awaiting it would delay the interrupt itself by up to 30 s —
-	 * exactly on the unresponsive child this path exists for.
-	 *
-	 * Timer cleared on the settling path, and the work's own rejection observed,
-	 * for the same reasons as `raceAbortTimeout` below.
-	 */
-	private raceClearTimeout(
-		work: Promise<unknown>,
-		bound: number,
-	): Promise<{ steering: number; followUp: number }> {
-		work.catch(() => {});
-		let timer: NodeJS.Timeout | undefined;
-		const expiry = new Promise<{ steering: number; followUp: number }>((resolve) => {
-			// NOT unref'd: this timer may be the only thing driving the caller's await.
-			timer = setTimeout(() => resolve({ steering: 0, followUp: 0 }), bound);
-		});
-		return Promise.race([work.then(countClearedQueue), expiry]).finally(() =>
-			clearTimeout(timer),
-		);
-	}
-
-	/**
-	 * #314 D4: `Promise.race([work, timer])`, timer cleared on the settling path.
-	 *
-	 * The losing `work` promise may still reject later (a child that exited while
-	 * the interrupt was pending); that rejection is not the caller's problem once
-	 * the timeout answered, so it is observed here instead of surfacing unhandled.
-	 */
-	private raceAbortTimeout(
-		work: Promise<"interrupted">,
-		bound: number,
-	): Promise<"interrupted" | "timeout"> {
-		work.catch(() => {});
-		let timer: NodeJS.Timeout | undefined;
-		const expiry = new Promise<"timeout">((resolve) => {
-			// NOT unref'd: this timer is usually the only thing driving the caller's
-			// await, and an unref'd one lets the event loop drain before it fires (the
-			// same reason `waitForExit` below keeps its own timer ref'd).
-			timer = setTimeout(() => resolve("timeout"), bound);
-		});
-		return Promise.race([work, expiry]).finally(() => clearTimeout(timer));
+		return { status: await raceWithTimeout<"interrupted" | "timeout">(work, bound, () => "timeout"), cleared, timeoutMs: bound };
 	}
 
 	waitSettled(name: string, timeoutMs = 900_000, signal?: AbortSignal): Promise<SettleResult> {

@@ -40,6 +40,21 @@ initTheme("dark");
 
 const NOTHING_CLEARED = { steering: 0, followUp: 0 };
 
+/**
+ * An `AbortOutcome` with the shared default bound (#325).
+ *
+ * `timeoutMs` is required on the type because the receipt reports the bound that
+ * was really applied; a receipt test therefore has to say which bound it is
+ * talking about instead of inheriting a default from the function under test.
+ */
+function outcome(
+	status: AbortOutcome["status"],
+	cleared = NOTHING_CLEARED,
+	timeoutMs = DEFAULT_ABORT_TIMEOUT_MS,
+): AbortOutcome {
+	return { status, cleared, timeoutMs };
+}
+
 const INTERRUPTED =
 	"Aborted worker-0's current turn (context kept; partial edits may remain)";
 const INTERRUPTED_DROPPED = `${INTERRUPTED} — dropped 3 queued message(s)`;
@@ -52,56 +67,60 @@ const TIMEOUT_DEFAULT = `Abort sent to worker-0, but it had not settled within $
 // ── 1. receipts ─────────────────────────────────────────────────────────
 
 test("#314 abortReceipt: interrupted keeps the context and warns about partial edits", () => {
-	const outcome: AbortOutcome = { status: "interrupted", cleared: NOTHING_CLEARED };
+	const receiptOutcome = outcome("interrupted");
 	// Byte-exact: this string is the contract for the `interrupted` state.
-	assert.equal(abortReceipt("worker-0", outcome), INTERRUPTED);
+	assert.equal(abortReceipt("worker-0", receiptOutcome), INTERRUPTED);
 	// "context kept" is the whole difference from `stop`; "partial edits may
 	// remain" is the part a rollback promise would have to lie about.
-	assert.match(abortReceipt("worker-0", outcome), /context kept/);
-	assert.match(abortReceipt("worker-0", outcome), /partial edits may remain/);
+	assert.match(abortReceipt("worker-0", receiptOutcome), /context kept/);
+	assert.match(abortReceipt("worker-0", receiptOutcome), /partial edits may remain/);
 	// Nothing was dropped, so the receipt must not append a drop clause.
-	assert.doesNotMatch(abortReceipt("worker-0", outcome), /dropped/);
+	assert.doesNotMatch(abortReceipt("worker-0", receiptOutcome), /dropped/);
 });
 
 test("#314 abortReceipt: interrupted reports the queued messages it dropped", () => {
 	// `n` is steering + followUp, not either alone.
-	const dropped = abortReceipt("worker-0", {
-		status: "interrupted",
-		cleared: { steering: 2, followUp: 1 },
-	});
+	const dropped = abortReceipt(
+		"worker-0",
+		outcome("interrupted", { steering: 2, followUp: 1 }),
+	);
 	assert.equal(dropped, INTERRUPTED_DROPPED);
 	// The clause is appended, never replaces the context/partial-edits half: the
 	// same receipt without the dropped messages is its prefix.
-	assert.ok(dropped.startsWith(abortReceipt("worker-0", { status: "interrupted", cleared: NOTHING_CLEARED })));
+	assert.ok(dropped.startsWith(abortReceipt("worker-0", outcome("interrupted"))));
 	// Singular wording does not exist on purpose — the count carries the number.
 	assert.equal(
-		abortReceipt("worker-0", { status: "interrupted", cleared: { steering: 1, followUp: 0 } }),
+		abortReceipt("worker-0", outcome("interrupted", { steering: 1, followUp: 0 })),
 		`${INTERRUPTED} — dropped 1 queued message(s)`,
 	);
 });
 
 test("#314 abortReceipt: no-turn claims no interrupt", () => {
-	assert.equal(
-		abortReceipt("worker-0", { status: "no-turn", cleared: NOTHING_CLEARED }),
-		NO_TURN,
-	);
+	assert.equal(abortReceipt("worker-0", outcome("no-turn")), NO_TURN);
 	// A child that was already idle must not be told it was aborted, and a "never
 	// mind" is not an error either — asserted on the RECEIPT, not on the literal.
-	const receipt = abortReceipt("worker-0", { status: "no-turn", cleared: NOTHING_CLEARED });
+	const receipt = abortReceipt("worker-0", outcome("no-turn"));
 	assert.doesNotMatch(receipt, /^Aborted/);
 	assert.doesNotMatch(receipt, /fail|error/i);
 });
 
 test("#314 abortReceipt: timeout points at stop and formats the bounded wait", () => {
-	const outcome: AbortOutcome = { status: "timeout", cleared: NOTHING_CLEARED };
-	assert.equal(abortReceipt("worker-0", outcome), TIMEOUT_DEFAULT);
+	const timedOut = outcome("timeout");
+	assert.equal(abortReceipt("worker-0", timedOut), TIMEOUT_DEFAULT);
 	// The only actionable hint in the receipt: a timeout kills nothing.
-	assert.match(abortReceipt("worker-0", outcome), /use stop/);
-	assert.doesNotMatch(abortReceipt("worker-0", outcome), /^Aborted/);
+	assert.match(abortReceipt("worker-0", timedOut), /use stop/);
+	assert.doesNotMatch(abortReceipt("worker-0", timedOut), /^Aborted/);
 	// Integral milliseconds render as whole seconds, everything else keeps one
 	// decimal — `2.5s`, never `2.500s` and never `5000`-style raw milliseconds.
-	assert.match(abortReceipt("worker-0", outcome, 2500), /within 2\.5s — /);
-	assert.match(abortReceipt("worker-0", outcome, 10000), /within 10s — /);
+	// Both come from the OUTCOME now (#325): the receipt has no default of its own.
+	assert.match(
+		abortReceipt("worker-0", outcome("timeout", NOTHING_CLEARED, 2_500)),
+		/within 2\.5s — /,
+	);
+	assert.match(
+		abortReceipt("worker-0", outcome("timeout", NOTHING_CLEARED, 10_000)),
+		/within 10s — /,
+	);
 });
 
 // ── 2. tool wiring ──────────────────────────────────────────────────────
@@ -259,10 +278,10 @@ test("#314 abort forwards an explicit clearQueued:false", async () => {
 	const harness = indexHarness();
 	try {
 		const name = await harness.launchLive("worker-0");
-		harness.supervisor.abortOutcome = {
-			status: "interrupted",
-			cleared: { steering: 2, followUp: 1 },
-		};
+		harness.supervisor.abortOutcome = outcome("interrupted", {
+			steering: 2,
+			followUp: 1,
+		});
 		const result = await harness.invoke({ action: "abort", name, clearQueued: false });
 
 		assert.equal(result.text, INTERRUPTED_DROPPED);
@@ -297,7 +316,7 @@ test("#314 abort reports no-turn as a plain success", async () => {
 	const harness = indexHarness();
 	try {
 		const name = await harness.launchLive("worker-0");
-		harness.supervisor.abortOutcome = { status: "no-turn", cleared: NOTHING_CLEARED };
+		harness.supervisor.abortOutcome = outcome("no-turn");
 		const result = await harness.invoke({ action: "abort", name });
 
 		assert.equal(result.text, NO_TURN);
@@ -312,10 +331,10 @@ test("#314 abort timeout is a success whose receipt points at stop", async () =>
 	const harness = indexHarness();
 	try {
 		const name = await harness.launchLive("worker-0");
-		harness.supervisor.abortOutcome = {
-			status: "timeout",
-			cleared: { steering: 1, followUp: 0 },
-		};
+		harness.supervisor.abortOutcome = outcome("timeout", {
+			steering: 1,
+			followUp: 0,
+		});
 		const result = await harness.invoke({ action: "abort", name });
 
 		assert.match(result.text, /use stop/);
@@ -329,6 +348,26 @@ test("#314 abort timeout is a success whose receipt points at stop", async () =>
 			harness.supervisor.calls.filter((call) => call.method === "retire").length,
 			0,
 		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#325 abortReceipt: the timeout receipt names the bound the supervisor really applied", async () => {
+	// The tool surface never passes `timeoutMs` (it stays a `wait`-only parameter),
+	// so a receipt that formats its OWN default reports a number nobody used. Here
+	// the supervisor armed 2.5 s while the tool passed nothing: the receipt has to
+	// say 2.5 s, which is only possible because `AbortOutcome` carries the applied
+	// bound. On the pre-#325 code this prints "within 5s" and fails.
+	const harness = indexHarness();
+	try {
+		const name = await harness.launchLive("worker-0");
+		harness.supervisor.abortOutcome = outcome("timeout", NOTHING_CLEARED, 2_500);
+		const result = await harness.invoke({ action: "abort", name });
+
+		assert.match(result.text, /within 2\.5s — /, "the applied bound, not a local default");
+		assert.doesNotMatch(result.text, /within 5s/, "the receipt must not fall back to the shared default");
+		assert.equal(result.details?.error, undefined);
 	} finally {
 		await harness.cleanup();
 	}

@@ -28,6 +28,8 @@ import {
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
+import { currentChildContext } from "../../src/supervisor/child-context.ts";
+import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
 import { DEFAULT_ABORT_TIMEOUT_MS, MAX_ABORT_TIMER_DELAY_MS } from "../../src/supervisor/types.ts";
 import type {
 	LegionSupervisor,
@@ -336,6 +338,10 @@ class FakeAbortSession implements InProcessSession {
 	/** A clear that rejects only after this many ms — the bound answers first. */
 	clearQueueRejectsAfterMs = 0;
 	abortHangs = false;
+	/** Identity (ALS store + nesting depth) observed inside `clearQueue`. */
+	seenDuringClear?: { context: ReturnType<typeof currentChildContext>; depth: number };
+	/** Identity observed inside `abort()` — the scope the clear has to match. */
+	seenDuringAbort?: { context: ReturnType<typeof currentChildContext>; depth: number };
 	/** Which seam the supervisor used for a text: the steer one, or a prompt. */
 	readonly steers: string[] = [];
 	readonly prompts: string[] = [];
@@ -371,6 +377,7 @@ class FakeAbortSession implements InProcessSession {
 	/** Synchronous on `AgentSession` (`{steering, followUp}`), hence `unknown`. */
 	clearQueue(): unknown {
 		this.log.push("clearQueue");
+		this.seenDuringClear = { context: currentChildContext(), depth: inProcessDepth() };
 		if (this.clearQueueRejectsAfterMs > 0) {
 			const delay = this.clearQueueRejectsAfterMs;
 			return new Promise<unknown>((_resolve, reject) => {
@@ -384,6 +391,7 @@ class FakeAbortSession implements InProcessSession {
 
 	abort(): Promise<unknown> {
 		this.log.push("abort");
+		this.seenDuringAbort = { context: currentChildContext(), depth: inProcessDepth() };
 		if (this.abortHangs) return new Promise<unknown>(() => {});
 		return Promise.resolve();
 	}
@@ -500,6 +508,7 @@ async function assertNoTurn(makeHarness: MakeHarness): Promise<void> {
 		assert.deepEqual(outcome, {
 			status: "no-turn",
 			cleared: { steering: 0, followUp: 0 },
+			timeoutMs: DEFAULT_ABORT_TIMEOUT_MS,
 		});
 		// The whole point: neither call happened.
 		assert.deepEqual(h.log, []);
@@ -553,6 +562,8 @@ async function assertTimeout(makeHarness: MakeHarness): Promise<void> {
 		assert.deepEqual(outcome, {
 			status: "timeout",
 			cleared: { steering: 1, followUp: 0 },
+			// #325: the applied bound travels in the outcome, so the receipt can name it.
+			timeoutMs: 25,
 		});
 		assert.equal(
 			h.supervisor.isAlive(h.name),
@@ -608,6 +619,7 @@ async function assertThrowingClearStillInterrupts(
 		assert.deepEqual(outcome, {
 			status: "interrupted",
 			cleared: { steering: 0, followUp: 0 },
+			timeoutMs: DEFAULT_ABORT_TIMEOUT_MS,
 		});
 		assert.deepEqual(h.log, ["clearQueue", "abort"]);
 	} finally {
@@ -637,6 +649,7 @@ async function assertHangingClearIsBounded(
 		assert.deepEqual(outcome, {
 			status: "interrupted",
 			cleared: { steering: 0, followUp: 0 },
+			timeoutMs: 25,
 		});
 		assert.deepEqual(h.log, ["clearQueue", "abort"]);
 	} finally {
@@ -674,6 +687,7 @@ async function assertLateClearRejectionIsObserved(
 		assert.deepEqual(outcome, {
 			status: "interrupted",
 			cleared: { steering: 0, followUp: 0 },
+			timeoutMs: 25,
 		});
 		assert.deepEqual(h.log, ["clearQueue", "abort"]);
 		// Wait past the fake's 80ms rejection: the abort has already resolved, so
@@ -1030,6 +1044,68 @@ test("abort inprocess: both the success and the timeout path clear their timers"
 	assertAbortClearsItsTimers(inprocessHarness));
 
 /* ------------------------------------------------------------------ *
+ * In-process identity scope for the pre-abort clear (#325)
+ * ------------------------------------------------------------------ */
+
+test("abort inprocess: the pre-abort clear runs in the child's identity scope", async () => {
+	// The clear is not a host-side bookkeeping call: it settles queued-message
+	// promises, and a continuation resumed there inherits whatever ALS store is
+	// active. Run outside the child's scope, host code would resume believing it IS
+	// the child — the REV2-7 hazard the interrupt branch already guards against, so
+	// the clear has to sit in the SAME `runAtAbsoluteDepth` + `runInChildContext`
+	// pair. Both steps are read off the session, so "same scope" is measured, not
+	// assumed: the interrupt itself is the reference.
+	const root = mkdtempSync(path.join(tmpdir(), "legion-abort-identity-"));
+	const log: AbortLog = [];
+	const sessions: FakeAbortSession[] = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			const session = new FakeAbortSession(log);
+			sessions.push(session);
+			return session;
+		},
+	});
+	const name = "root.worker";
+	try {
+		await supervisor.spawnChild({
+			...spawnInput(root, name, { spawnMode: "inprocess" }),
+			childLaunchContext: {
+				nodeId: "node-9",
+				parentNodeId: "node-1",
+				dbPath: "/tmp/legion.db",
+				parentPath: [{ runId: "root" }],
+				acceptanceRole: "writer",
+				allowNested: true,
+				utility: false,
+				spawnMode: "inprocess",
+			},
+		});
+		sessions[0]!.clearQueueResultSink.value = { steering: ["s1"], followUp: [] };
+
+		const outcome = await bounded(supervisor.abort(name));
+		assert.equal(outcome.status, "interrupted");
+
+		const duringClear = sessions[0]!.seenDuringClear;
+		const duringAbort = sessions[0]!.seenDuringAbort;
+		assert.equal(
+			duringClear?.context?.nodeId,
+			"node-9",
+			"the clear runs as the child, not as the host session",
+		);
+		assert.equal(duringClear?.depth, 1, "and at the child's own nesting depth");
+		assert.deepEqual(
+			duringClear?.context,
+			duringAbort?.context,
+			"the same identity the interrupt sees",
+		);
+		assert.equal(duringClear?.depth, duringAbort?.depth, "and the same depth");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+/* ------------------------------------------------------------------ *
  * Routing (D8)
  * ------------------------------------------------------------------ */
 
@@ -1062,6 +1138,7 @@ test("abort routing: forwards (name, opts) to the owning backend and returns its
 		assert.deepEqual(outcome, {
 			status: "interrupted",
 			cleared: { steering: 1, followUp: 2 },
+			timeoutMs: 50,
 		});
 		assert.deepEqual(log, ["clearQueue", "abort"]);
 	} finally {
@@ -1095,6 +1172,7 @@ test("abort routing: forwards opts to the inprocess backend and returns its outc
 		assert.deepEqual(outcome, {
 			status: "interrupted",
 			cleared: { steering: 0, followUp: 0 },
+			timeoutMs: DEFAULT_ABORT_TIMEOUT_MS,
 		});
 		assert.deepEqual(log, ["abort"]);
 	} finally {
