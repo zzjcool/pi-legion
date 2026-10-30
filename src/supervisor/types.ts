@@ -146,25 +146,30 @@ export function toSteerDisposition(
  * `cleared` is the count the preceding queue clear reported (`steering` /
  * `followUp` message counts), not a claim about what the model read.
  *
- * `timeoutMs` is the bound that was actually applied (#325): the caller's
+ * `timeoutMs` is the bound this call applied — or, for `no-turn`, the bound it
+ * WOULD have applied: that status returns before either step arms a timer, so
+ * nothing was bounded at all (#325). The number itself is the caller's
  * `timeoutMs` after the junk fallback and the timer-delay cap, or
  * `DEFAULT_ABORT_TIMEOUT_MS` when the caller passed nothing. It travels in the
  * outcome because the receipt has to name the wait it is talking about, and the
  * tool surface never passes a bound of its own — a receipt reading a default of
  * its own would report a number nobody used. It is reported for all three
- * statuses (the bound is normalized before the `turnActive` check), so a reader
- * never has to wonder whether the field is meaningful.
+ * statuses (normalization happens before the `turnActive` check), so a reader
+ * never has to wonder whether the field is present, only whether a timer ran.
  */
 export type AbortOutcome = {
 	status: "interrupted" | "no-turn" | "timeout";
 	cleared: { steering: number; followUp: number };
-	/** The bound this call really applied, in milliseconds (see above). */
+	/** The bound this call applied, or would have applied on `no-turn` (see above). */
 	timeoutMs: number;
 };
 
 /**
- * Bound for one `abort` (#314 D2), shared by every layer that has to name it:
- * both backends and the tool-surface receipt.
+ * Bound for one `abort` (#314 D2), applied by both backends.
+ *
+ * The tool-surface receipt does NOT read it any more: it formats the bound the
+ * backend reported in `AbortOutcome.timeoutMs` (#325), so this constant stays the
+ * single source of the default bound.
  *
  * It bounds the pre-abort queue clear AND the interrupt that follows it
  * (#314 D4), so a child that answers neither can delay the caller by at most

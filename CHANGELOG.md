@@ -91,9 +91,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   ```
   `claimedNow` is `true` only for the call that took the round's claim; a caller that delivered
   the text to nobody rolls it back with `unclaimUndelivered(name, snapshot, claimedNow)`, and a
-  call that did not take the claim leaves the real delivery's claim alone. No compatibility shim
-  is provided on purpose — the old shape was never published. Contract revision:
-  `docs/contracts/notice-claim-v1.md` (D2).
+  call that did not take the claim leaves the real delivery's claim alone. **This breaks
+  `zzjcool`/api consumers**: the bare-snapshot shape *did* ship — v4.0.0 and v5.0.1 both exported
+  `consumeCollect(name): Promise<CollectSnapshot> | undefined`, and `src/api.ts` calls that surface
+  "safe to depend on" — so the release that carries this change must be a **major**. The migration
+  is the one line above; no compatibility shim is provided (no overload, no `snapshotOnly`
+  switch), because a second shape would keep the claim/copy ambiguity alive for everyone. Contract
+  revision: `docs/contracts/notice-claim-v1.md` (D2).
 
 - **`AbortOutcome` now carries the bound the abort really applied (`timeoutMs`), and the timeout
   receipt reads it instead of a default of its own (#325).** `abortReceipt` used to format a

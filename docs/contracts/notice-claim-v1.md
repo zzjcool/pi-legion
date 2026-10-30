@@ -58,7 +58,7 @@
    - 复位只作用于**本次 collect 所属的那一轮**（`job.runId`/`job.round` 与快照 origin 相等），不碰 collect 期间被 re-track 出来的新一轮。
    - **时序前提与 `waitOne` 的 `WAIT_INTERRUPTED` 分支不同**：wait 的 interrupt 赢在 collect promise resolve **之前**（watch 随后看到的是「标志已清 + job 还活着」），而本路径只可能发生在 resolve **之后**（闸门已过），所以只清标志不够，必须换一个 watch。
 
-**公共面（#327）**：`consumeCollect*` 是 `src/api.ts` 的导出面的一部分（该文件自称 "safe to depend on"），返回类型已从 `Promise<CollectSnapshot>` 变成 `Promise<ClaimedCollect>` —— 这是一处**破坏性变更**。该形状尚未发布，所以**不做兼容层**（不给旧形状留重载 / 不提供 `snapshotOnly` 开关）：调用方改为 `const { snapshot } = await rt.consumeCollect(n)` 即可，只有需要回滚的那条路径才需要第二个字段。
+**公共面（#327）**：`consumeCollect*` 是 `src/api.ts` 的导出面的一部分（该文件自称 "safe to depend on"），返回类型已从 `Promise<CollectSnapshot>` 变成 `Promise<ClaimedCollect>`。**裸 snapshot 这个形状已经发布过**——v4.0.0 与 v5.0.1 都导出 `consumeCollect(name): Promise<CollectSnapshot> | undefined`——所以它对 `pi-legion/api` 的消费者是**破坏性变更**，带着本改动的那次发布**必须是 major**。迁移就是一行：`const { snapshot } = await rt.consumeCollect(n)`；只有需要回滚的那条路径才用第二个字段。**仍然不做兼容层**（不给旧形状留重载 / 不提供 `snapshotOnly` 开关）：多留一个形状会把 claim 与副本的歧义继续摊给所有调用方。
 
 ### D3 — 通知路径在投递前最后一刻查 claim
 

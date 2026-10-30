@@ -2,12 +2,14 @@
  * `raceWithTimeout` (#325) — the one bounded wait both supervisor backends share.
  *
  * The three details that made two identical copies worth keeping are exactly the
- * three that are easy to lose in a refactor, so they are pinned here directly:
+ * three that are easy to lose in a refactor, so they are covered here directly:
  *
  *  - the timer is cleared on the settling path (a leftover timer keeps the
  *    process, and a `node --test` case, alive);
- *  - the loser's rejection is observed (`abort` races a promise that may reject
- *    after the timer already answered — an unhandled rejection fails the run);
+ *  - a loser that settles after the timer answered never reaches the caller and
+ *    never surfaces as an unhandled rejection — a behavioural guarantee of the
+ *    race itself (`Promise.race` subscribes to every input), not a pin on the
+ *    helper's explicit `work.catch`;
  *  - the delay is capped at the largest one `setTimeout` honours (Node collapses
  *    an out-of-range delay to 1 ms, which would fabricate an instant timeout).
  *
@@ -47,22 +49,29 @@ test("raceWithTimeout: a work that settles first wins and leaves no timer behind
 	}
 });
 
-test("raceWithTimeout: an expiring bound answers onTimeout, freshly built per call", async () => {
-	const first = await raceWithTimeout(new Promise<string>(() => {}), 5, () => "timeout");
-	assert.equal(first, "timeout");
-	// A factory, not a value: two callers (or two calls) must never share one
-	// mutable answer object.
+test("raceWithTimeout: an expiring bound answers onTimeout, a fresh value per call", async () => {
+	// A factory, not a value: two calls must never share one mutable answer object,
+	// which is why `onTimeout` is called and its result handed straight back.
 	const answers: Array<{ steering: number; followUp: number }> = [];
-	const second = await raceWithTimeout(new Promise<never>(() => {}), 5, () => {
+	const build = () => {
 		const answer = { steering: 0, followUp: 0 };
 		answers.push(answer);
 		return answer;
-	});
+	};
+	const first = await raceWithTimeout(new Promise<never>(() => {}), 5, build);
+	const second = await raceWithTimeout(new Promise<never>(() => {}), 5, build);
+	assert.deepEqual(first, { steering: 0, followUp: 0 });
 	assert.deepEqual(second, { steering: 0, followUp: 0 });
-	assert.equal(answers.length, 1, "called exactly once, after the bound");
+	assert.equal(answers.length, 2, "called exactly once per call");
+	assert.notEqual(first, second, "each call gets its own object, never a shared one");
 });
 
-test("raceWithTimeout: the loser's late rejection is observed, never unhandled", async () => {
+test("raceWithTimeout: the loser's late rejection never surfaces as unhandled", async () => {
+	// What this asserts is the observable contract, not the helper's explicit
+	// `work.catch(() => {})`: `Promise.race` already subscribes to every input, so
+	// removing that line would not make this red. The case exists because `abort`
+	// currently relies on the behaviour (a child that exits while the interrupt was
+	// pending), and a future non-race implementation would have to keep it.
 	const unhandled: unknown[] = [];
 	const collect = (reason: unknown): void => {
 		unhandled.push(reason);

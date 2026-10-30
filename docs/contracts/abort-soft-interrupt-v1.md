@@ -33,8 +33,8 @@ supervisor 一侧其实早就实现了 `abort`（`LegionSupervisor.abort` / `Rpc
 | 项 | 默认 | 说明 |
 |---|---|---|
 | `clearQueued` | **`true`** | abort 前先清 child 的 steering / follow-up 队列；工具面只暴露这一个开关（`clearQueued: false` 保留队列） |
-| abort 上限 | **`DEFAULT_ABORT_TIMEOUT_MS = 5000`**（`src/supervisor/types.ts`） | 两个后端与工具面回执共用的常量，不是各写一份字面量；后端把非有限 / ≤0 的 `timeoutMs` 归一成它（否则一个坏值会把两步都压成 ~0 ms，让每次 abort 都变成假 `timeout`），合法的值再以 `MAX_ABORT_TIMER_DELAY_MS = 2_147_483_647` 封顶（Node 把超出 32 位有符号上限的延时限**钳成 1 ms**，不封顶等于让一个 `1e12` 这样的值凭空造出假 `timeout`） |
-| 工具面 `timeoutMs` | **只对 `wait` 生效** | `abort` 不接受工具面传入的上限，一律用上面那个常量；`timeoutMs` 参数的说明也只看 `wait`。**后端实际生效的上限随 `AbortOutcome.timeoutMs` 交回**（归一 + 封顶之后的值，三态都带），回执读它，不自己再取一次默认值（#325） |
+| abort 上限 | **`DEFAULT_ABORT_TIMEOUT_MS = 5000`**（`src/supervisor/types.ts`） | **两个后端**共用的常量，不是各写一份字面量（工具面回执不再读它，见下一格）；后端把非有限 / ≤0 的 `timeoutMs` 归一成它（否则一个坏值会把两步都压成 ~0 ms，让每次 abort 都变成假 `timeout`），合法的值再以 `MAX_ABORT_TIMER_DELAY_MS = 2_147_483_647` 封顶（Node 把超出 32 位有符号上限的延时限**钳成 1 ms**，不封顶等于让一个 `1e12` 这样的值凭空造出假 `timeout`） |
+| 工具面 `timeoutMs` | **只对 `wait` 生效** | `abort` 不接受工具面传入的上限，一律用上面那个常量；`timeoutMs` 参数的说明也只看 `wait`。**后端采用的上限随 `AbortOutcome.timeoutMs` 交回**（归一 + 封顶之后的值，三态都带；`no-turn` 交回的是它**本该采用**的那个值），回执读它，不自己再取一次默认值（#325） |
 | `cleared: { steering, followUp }` | 清队列那次调用的**返回值**计数 | 结构缺失 / 不可读（含抛错）→ 计 **0**，不猜 |
 
 计数由 `countClearedQueue`（`src/supervisor/types.ts`）统一做，两个后端不会对同一份返回值给出两个数字。`cleared` 是"真的清掉了多少"的机器事实，不是估计值；`no-turn` 下两个计数恒为 0。
@@ -157,6 +157,6 @@ supervisor 层只有机器三态，"人话"只出现在工具面一层：
   - 上面两处在契约文档里曾各有一个临时编号（D11 / D12）；它们**不是本契约的条款**，编号最终收敛为 D1–D8。
 - **#325（实现收敛，不改 D1–D8 的语义）**：
   - 两个 `race*Timeout` 私有 helper 收敛成一个 `raceWithTimeout`（`src/supervisor/race-timeout.ts`），两个后端共用；timer 清理、败者 rejection 吞掉、`setTimeout` 上界裁剪都在 helper 内，行为逐字不变。
-  - `AbortOutcome` 增加 `timeoutMs`（实际生效的上限，归一 + 封顶后的值，三态都带），`abortReceipt` 改用它 —— 原先那个 `timeoutMs = DEFAULT_ABORT_TIMEOUT_MS` 参数是死参数：工具面永不传值，回执里的 `seconds` 恒为默认，后端真的换了上限时回执会报一个没人用过的数字。
+  - `AbortOutcome` 增加 `timeoutMs`（本调用生效的上限，归一 + 封顶后的值；`no-turn` 是它本该生效的那个值，三态都带），`abortReceipt` 改用它 —— 原先那个 `timeoutMs = DEFAULT_ABORT_TIMEOUT_MS` 参数是死参数：工具面永不传值，回执里的 `seconds` 恒为默认，后端真的换了上限时回执会报一个没人用过的数字。
   - in-process 的 pre-abort `clearQueue` 包进与中断本体相同的 `runAtAbsoluteDepth(child.spawnDepth, () => runInChildContext(child.context, …))`：清队列会 settle 排队消息的 promise，其 continuation 在恢复时继承当时的 ALS store，跑在作用域外就会让宿主代码以为自己是 child（REV2-7 的同一条隐患）。
 - **复审轮 2（#314，最终）**：四处边界澄清，不新增条款、不改 D1–D8 编号：D4 补 turnActive 快照只取一次（取在清队列之前）的窗口语义与“为什么不再验一次”；D2 补 `MAX_ABORT_TIMER_DELAY_MS` 封顶（Node 把过大延时限钳成 1 ms）；D5 收敛“唯一能穿透”的措辞（abort 是唯一能把中断送进工具调用内部的 action，但对方若忽略取消仍会答 `timeout`，杀进程归 `stop`）；D8 补 `node_aborted` 在 `no-turn` / `timeout` 下也照样 emit（既有行为，payload 仍是 `{ name }`）。验收清单第 7 / 9 条各补一条覆盖用例（迟到的 clear 拒绝、`0` / 负数 / `NaN` / `Infinity` 与 `1e12` 两类坏值回落），两条用例已在 rpc / inprocess 两个后端落地，标题与本文件逐字一致。
