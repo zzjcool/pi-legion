@@ -81,6 +81,30 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **A provider that ends a turn with no content no longer costs a child its whole turn.** Some
+  upstreams answer HTTP 200 and then terminate the stream in-band; pi maps that to
+  `stopReason: "error"` with an empty assistant message (`finish_reason: error`, measured with
+  `usage.input === 0` and 2/42 output tokens after 90–175s). Nothing retried it: the SDK's retryable
+  classifier misses the message, the provider-level retry wrapper only covers thrown HTTP errors,
+  and this package's only transient predicate matches `/connection error/i` — whose hold loop polls
+  the session file and never re-prompts, so waiting could not help. `collect()` now recognises the
+  *shape* (`isEmptyGeneration`: last turn has an assistant record, `stopReason: "error"`, blank
+  text, zero tool calls — never `usage`, never the provider's message text) and, while the child is
+  still alive and the parent has not aborted, sends it one `CONTINUE_PROMPT` on the same session and
+  re-derives the outcome; the failure is tagged `Execution.errorKind =
+  "provider-empty-generation"` either way, the parent-visible reason gains
+  `(provider returned an empty generation; retried once)` when the retry also came back empty, and
+  the ledger's `node_failed` event carries that `errorKind`. The retry budget is its own counter
+  (`ChildRecord.providerRetriesUsed`, limit **1**), deliberately NOT the renewal budget — renewals
+  are a user-granted allowance for "no measurable progress" that a plain failure never charges, and
+  renewal re-runs a child while this continues the same live one. A continue-prompt that an input
+  handler swallowed is nobody's retry: it is not charged to the budget, the original failure stands,
+  and a warning names what happened — the retry also never classifies its own turn by looser rules
+  than a first turn (a `Connection error` on the retry keeps the child `running` instead of retiring
+  it). Assistant records also pass the
+  upstream `responseId` through for forensics. Contract:
+  `docs/contracts/provider-empty-generation-retry-v1.md` (#316).
+
 - **A team can no longer deadlock in `implementing` after a partial failure, and two error codes
   stopped lying.** Covered by the `supersedes` / `reason` entry above; the code-hygiene half is
   separate: resuming a terminal legion child reported `BUDGET_EXCEEDED` although nothing about a
