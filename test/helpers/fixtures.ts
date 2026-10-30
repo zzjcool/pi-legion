@@ -56,6 +56,8 @@ export interface AssistantMsgOptions {
 	model?: string;
 	usage?: FixtureUsage;
 	timestamp?: number;
+	/** Upstream provider response id (#316 D3); omitted when absent. */
+	responseId?: string;
 }
 
 /** Assistant message; `content` mixes text parts and toolCall parts. */
@@ -80,6 +82,7 @@ export function assistantMsg(opts: AssistantMsgOptions = {}): string {
 			model: opts.model ?? "test/glm-5.3-flash",
 			usage,
 			...(opts.timestamp !== undefined ? { timestamp: opts.timestamp } : {}),
+			...(opts.responseId !== undefined ? { responseId: opts.responseId } : {}),
 		},
 	});
 }

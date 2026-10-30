@@ -214,6 +214,11 @@ function applyAssistant(
 			typeof message.errorMessage === "string" ? message.errorMessage : null,
 		text,
 		tools: toolsOf(message.content),
+		// #316 D3: carried verbatim so a failure can be traced back to one
+		// upstream response. Never read by any verdict.
+		...(typeof message.responseId === "string"
+			? { responseId: message.responseId }
+			: {}),
 	});
 	if (timestamp !== undefined) turn.endedAt = timestamp;
 
@@ -732,6 +737,12 @@ export function parseSessionFile(path: string): ParsedSession {
  *
  * A matching snapshot is not a verdict while the RPC child is still alive:
  * the client retries, and the session can look terminal for the whole gap.
+ *
+ * Scope: this predicate covers ONLY a "connection error" message. It is not a
+ * general "is this transient?" test and deliberately does not try to be one —
+ * in particular it does NOT cover a provider that returns an empty generation
+ * (`stopReason: "error"` with no content, #316), which is classified by
+ * `Execution.errorKind` / {@link isEmptyGeneration} instead.
  */
 export function isTransientConnectionFailure(
 	input: { reason?: string | null; errorMessage?: string | null } | string | null | undefined,
@@ -775,6 +786,37 @@ export const ABORT_WITHOUT_REASON =
  */
 const REASONLESS_ABORT_MESSAGE =
 	/^(this operation was aborted|the operation was aborted|operation aborted)$/i;
+
+/**
+ * The final assistant turn produced nothing: no text, no tool calls, stopReason "error".
+ *
+ * #316: a provider may answer HTTP 200 and then end the stream in-band with
+ * `finish_reason: error`, which pi surfaces as `stopReason: "error"` with an
+ * EMPTY assistant message (measured: `usage.input === 0`, 2/42 output tokens,
+ * 90-175s elapsed). The child then lost all its work to a transient upstream
+ * fault, because the only transient predicate in this file matches the
+ * connection-error string and that message never contains one.
+ *
+ * The shape is read off the transcript — every clause must hold:
+ *   - the last turn has an assistant record (a hard kill has none),
+ *   - its `stopReason` is `error` (an abort / toolUse / length is not this),
+ *   - its text is blank,
+ *   - it requested no tools (a turn that called a tool did produce output).
+ *
+ * `usage` is intentionally NOT consulted (it is display-only, see
+ * `src/extension/summary.ts`) and `errorMessage` is deliberately not matched:
+ * guessing provider strings is exactly the failure mode that left #316
+ * uncovered in the first place.
+ */
+export function isEmptyGeneration(parsed: Pick<ParsedSession, "turns">): boolean {
+	const final = parsed.turns.at(-1)?.assistants.at(-1);
+	if (!final) return false;
+	return (
+		final.stopReason === "error" &&
+		(final.text ?? "").trim() === "" &&
+		final.tools.length === 0
+	);
+}
 
 /** True when the last turn (or the whole file) has no assistant message. */
 export function lastTurnHasNoAssistant(parsed: ParsedSession): boolean {
@@ -855,7 +897,7 @@ export function deriveOutcome(parsed: ParsedSession): Execution {
 		usage: parsed.usage,
 	};
 
-	return outcomeFromFinalMessage(final, base);
+	return outcomeFromFinalMessage(final, base, isEmptyGeneration(parsed));
 }
 
 /** Map the final assistant message's stop reason onto an execution status. */
@@ -866,6 +908,8 @@ function outcomeFromFinalMessage(
 		errorMessage: string | null;
 	},
 	base: Omit<Execution, "status" | "reason">,
+	/** `isEmptyGeneration` for this session; only the `failed` branch reads it. */
+	emptyGeneration: boolean,
 ): Execution {
 	switch (final.stopReason) {
 		case "stop":
@@ -900,6 +944,10 @@ function outcomeFromFinalMessage(
 				stopReason: "error",
 				errorMessage: msg,
 				reason: msg,
+				// #316 D1: an empty error turn is a provider-side miss, not a
+				// declared failure. Tagged here (never on `aborted`) so the
+				// orchestrator can retry it on the same child exactly once.
+				...(emptyGeneration ? { errorKind: "provider-empty-generation" as const } : {}),
 				...base,
 			};
 		}

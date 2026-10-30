@@ -280,6 +280,24 @@ export const COLLECT_GRACE_EXTENSIONS = 2;
 export const COLLECT_DEADLINE_REASON = "collect deadline (cumulative since launch) exceeded; child still alive";
 /** Shown when a live child's session ends on an OpenAI/GPT connection blip. */
 export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC child still alive";
+/**
+ * #316 D2: the text sent to a child whose last turn produced an empty
+ * generation. Addressed to the still-live child, which already holds the task
+ * in context — hence "continue", never "restart".
+ */
+export const CONTINUE_PROMPT =
+	"Your previous turn ended with no output. Continue from where you left off; do not restart the task.";
+/**
+ * #316 D2: how many in-collect retries one child may spend on an empty
+ * generation. One, because the fault is a single upstream stream termination:
+ * a second identical failure means the provider is persistently broken, and
+ * re-prompting a live child that just failed the same way twice spends real
+ * tokens and wall-clock to learn nothing new. Anything beyond that is the
+ * parent's decision (`continue` / re-dispatch), not an automatic loop.
+ */
+const EMPTY_GENERATION_RETRY_LIMIT = 1;
+/** Appended to the parent-visible failure reason when the one retry also failed (#316 D4). */
+const EMPTY_GENERATION_RETRY_NOTE = "(provider returned an empty generation; retried once)";
 const LINEAGE_ENV = "PI_SUBAGENT_PARENT_PATH";
 const MAX_DEPTH_ENV = "PI_SUBAGENT_MAX_DEPTH";
 const UTILITY_CHILD_ENV = "PI_SUBAGENT_UTILITY_CHILD";
@@ -662,7 +680,14 @@ export class Orchestrator {
 		if (!current || current.status === status) return;
 		updateNode(this.legion.db, child.nodeId, { status }, this.now);
 		const eventType = status === "settled" ? "node_settled" : status === "failed" ? "node_failed" : "node_retired";
-		this.emitStored(child.nodeId, eventType, { execution: execution.status, reason: execution.reason });
+		// #316 D3: `errorKind` rides along so an empty-generation failure is
+		// distinguishable in the ledger from any other `failed`. The existing pair
+		// stays first and unchanged; the field is omitted when there is nothing to say.
+		this.emitStored(child.nodeId, eventType, {
+			execution: execution.status,
+			reason: execution.reason,
+			...(execution.errorKind ? { errorKind: execution.errorKind } : {}),
+		});
 		if (execution.usage) {
 			upsertUsage(this.legion.db, { nodeId: child.nodeId, tokensIn: execution.usage.input + execution.usage.cacheRead + execution.usage.cacheWrite, tokensOut: execution.usage.output, costUsd: execution.usage.cost }, this.now);
 		}
@@ -2208,7 +2233,87 @@ export class Orchestrator {
 		if (this.parentShutdownRetire.has(name) && wait !== "settled") {
 			execution = attributeParentSessionShutdown(execution, parsed);
 		}
+		// #316 D2: one bounded retry for an empty provider generation, on the SAME
+		// child. Placed after every outcome rewrite above (so an abort cascade or a
+		// deadline snapshot is never retried) and before `finishCollect` (which is
+		// the single place that settles the ledger, writes `.output.md` and records
+		// the child), so a retried turn is reported exactly once.
+		const retry = await this.retryEmptyGeneration(child, name, execution, deadline, opts.signal);
+		if (retry.kind === "aborted") return abortedSnapshot();
+		if (retry.kind === "blocked") return this.blockedResult(child);
+		if (retry.kind === "retried") {
+			parsed = retry.parsed;
+			execution = retry.execution;
+		}
 		return this.finishCollect(child, parsed, execution, deadline);
+	}
+
+	/**
+	 * #316 D2: retry an empty provider generation once, in place.
+	 *
+	 * Why a retry instead of a longer wait: `waitOutTransientConnection` only polls
+	 * the session file, so for this failure class no amount of waiting can produce
+	 * another message — the child is alive and idle, and only a new prompt starts
+	 * the turn that recovers its work.
+	 *
+	 * The gates, in order (all must hold):
+	 *   - the derived outcome is `failed` with `errorKind: "provider-empty-generation"`
+	 *     (`isEmptyGeneration` — not a provider message match),
+	 *   - the child is still alive (a dead child cannot take another prompt),
+	 *   - the parent has not aborted (an abort must never become a new turn),
+	 *   - this child has not already spent its one retry (`providerRetriesUsed`).
+	 *
+	 * The retry budget is its OWN counter, never `renewalsUsed`: renewals are a
+	 * user-visible "no measurable progress" allowance, and a plain `failed` collect
+	 * deliberately does not charge them (`test/unit/renewal-wiring.test.ts`).
+	 *
+	 * The counter is charged only after the prompt was actually accepted, so a
+	 * child that died between the liveness check and the prompt keeps its budget
+	 * and its original verdict.
+	 */
+	private async retryEmptyGeneration(
+		child: ChildRecord,
+		name: string,
+		execution: Execution,
+		deadline: number,
+		signal?: AbortSignal,
+	): Promise<
+		| { kind: "skipped" }
+		| { kind: "aborted" }
+		| { kind: "blocked" }
+		| { kind: "retried"; parsed: ReturnType<typeof parseSessionFile>; execution: Execution }
+	> {
+		if (execution.status !== "failed" || execution.errorKind !== "provider-empty-generation") return { kind: "skipped" };
+		if (signal?.aborted) return { kind: "aborted" };
+		if (!this.supervisor.isAlive(name)) return { kind: "skipped" };
+		if ((child.providerRetriesUsed ?? 0) >= EMPTY_GENERATION_RETRY_LIMIT) return { kind: "skipped" };
+		try {
+			await this.supervisor.prompt(name, CONTINUE_PROMPT);
+		} catch {
+			// The child exited between `isAlive` and the prompt. Nothing was sent, so
+			// the original failed verdict stands and no retry is charged.
+			return { kind: "skipped" };
+		}
+		child.providerRetriesUsed = (child.providerRetriesUsed ?? 0) + 1;
+		this.onChildUpdate(child);
+		const settled = await this.awaitSupervisor(child, deadline, signal);
+		if (settled === "aborted" || signal?.aborted) return { kind: "aborted" };
+		if (settled === "blocked") return { kind: "blocked" };
+		const parsed = parseSessionFile(child.sessionFile);
+		let retried = deriveOutcome(parsed);
+		if (settled === "timeout" && this.supervisor.isAlive(name) && !isLastTurnComplete(parsed)) {
+			// Same non-terminal signal the untried path uses: the retried turn is
+			// still in flight, so it is neither a new failure nor a settle.
+			retried = { ...retried, status: "running", reason: COLLECT_DEADLINE_REASON };
+		} else if (retried.status === "failed" && retried.errorKind === "provider-empty-generation") {
+			// #316 D4: the parent must be able to tell a retried failure from a
+			// first-try one without reading the transcript.
+			retried = {
+				...retried,
+				reason: retried.reason ? `${retried.reason} ${EMPTY_GENERATION_RETRY_NOTE}` : EMPTY_GENERATION_RETRY_NOTE,
+			};
+		}
+		return { kind: "retried", parsed, execution: retried };
 	}
 
 	/** True when the session's latest outcome is a connection blip and the process is up. */

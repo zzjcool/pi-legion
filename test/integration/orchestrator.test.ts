@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { COLLECT_DEADLINE_REASON, Orchestrator, preCreateSessionFile, TRANSIENT_CONNECTION_REASON } from "../../src/runs/orchestrator.ts";
+import { COLLECT_DEADLINE_REASON, CONTINUE_PROMPT, Orchestrator, preCreateSessionFile, TRANSIENT_CONNECTION_REASON } from "../../src/runs/orchestrator.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
-import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
+import { FakeSupervisor, type FakeTurn } from "../helpers/fake-supervisor.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { assistantMsg, userMsg } from "../helpers/fixtures.ts";
 
@@ -659,6 +659,120 @@ test("collect: a dead child mid-turn keeps its aborted outcome instead of a dead
 		assert.notEqual(collected.execution.reason, COLLECT_DEADLINE_REASON, "a dead child never reports the live deadline reason");
 		assert.equal(collected.execution.status, "aborted", "an unfinished turn on a dead child is an abort, not a live wait");
 		assert.equal(h.supervisor.isAlive(handle.name), false);
+	} finally {
+		h.cleanup();
+	}
+});
+
+// ── #316: one bounded retry for an empty provider generation ─────────────────
+
+/** The in-band failure message pi writes when a provider ends the stream empty. */
+const EMPTY_GENERATION_MESSAGE = "Provider finish_reason: error";
+
+/** Answer the next `prompt` the way a provider would: settle the turn it starts. */
+function settleOnPrompt(supervisor: FakeSupervisor, turn: FakeTurn): void {
+	const original = supervisor.prompt.bind(supervisor);
+	supervisor.prompt = async (name: string, text: string) => {
+		await original(name, text);
+		supervisor.settle(name, turn);
+	};
+}
+
+const prompts = (supervisor: FakeSupervisor) => supervisor.calls.filter((call) => call.method === "prompt");
+
+test("#316 D2: a retried empty generation returns the retry's success and costs one prompt", async () => {
+	const h = harness({ immediateTimeout: false });
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "recover from an empty turn", worktree: false });
+		settleOnPrompt(h.supervisor, { text: '{"ok":true}', stopReason: "stop" });
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 5_000 });
+
+		assert.equal(collected.execution.status, "success");
+		assert.equal(collected.execution.errorKind, undefined, "a recovered child is not tagged as a provider failure");
+		assert.equal(collected.output, '{"ok":true}');
+		assert.equal(prompts(h.supervisor).length, 1, "exactly one retry prompt");
+		assert.equal(prompts(h.supervisor)[0]?.text, CONTINUE_PROMPT);
+		assert.equal(CONTINUE_PROMPT, "Your previous turn ended with no output. Continue from where you left off; do not restart the task.");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, 1);
+		// One artifact, holding the retried turn — not two files, nor the empty turn.
+		const outputs = readdirSync(h.runDir).filter((file) => file.endsWith(".output.md"));
+		assert.deepEqual(outputs, [`${handle.name}.output.md`]);
+		assert.match(readFileSync(path.join(h.runDir, outputs[0]!), "utf8"), /ok/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#316 D2: a retry that also comes back empty fails once, says so, and is never retried again", async () => {
+	const h = harness({ immediateTimeout: false });
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "fail twice", worktree: false });
+		settleOnPrompt(h.supervisor, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 5_000 });
+
+		assert.equal(collected.execution.status, "failed");
+		assert.equal(collected.execution.errorKind, "provider-empty-generation");
+		assert.match(collected.execution.reason ?? "", /retried once/);
+		assert.equal(prompts(h.supervisor).length, 1, "the limit is one, not a loop");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, 1);
+
+		// The budget is on the child record, so a later collect does not spend it again.
+		const again = await h.orchestrator.collect(handle.name, { timeoutMs: 5_000 });
+		assert.equal(again.execution.status, "failed");
+		assert.equal(prompts(h.supervisor).length, 1, "a collect cannot resurrect the retry budget");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#316 D2: a failure that produced output is final and never re-prompted", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "fail with text", worktree: false });
+		h.supervisor.settle(handle.name, { text: "provider failed", stopReason: "error", errorMessage: "provider failure" });
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 50 });
+
+		assert.equal(collected.execution.status, "failed");
+		assert.equal(collected.execution.errorKind, undefined);
+		assert.equal(prompts(h.supervisor).length, 0, "only an EMPTY generation is worth another prompt");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, undefined);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#316 D2: a dead child is never re-prompted for an empty generation", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "die on the empty turn", worktree: false });
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		h.supervisor.exit(handle.name);
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 50 });
+
+		assert.equal(collected.execution.status, "failed");
+		assert.equal(collected.execution.errorKind, "provider-empty-generation", "the verdict still names the failure class");
+		assert.doesNotMatch(collected.execution.reason ?? "", /retried once/, "nothing was retried, so nothing may claim it was");
+		assert.equal(prompts(h.supervisor).length, 0, "a dead child cannot take another prompt");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#316 D2: an aborted parent turn never retries, even an empty generation", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "cancelled mid-empty-turn", worktree: false });
+		h.supervisor.settle(handle.name, { text: "", stopReason: "error", errorMessage: EMPTY_GENERATION_MESSAGE });
+		const controller = new AbortController();
+		controller.abort();
+		const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 50, signal: controller.signal });
+
+		assert.equal(collected.execution.status, "running");
+		assert.equal(collected.execution.reason, "aborted by parent");
+		assert.equal(prompts(h.supervisor).length, 0, "an interrupted collect must not start a new turn");
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, undefined);
 	} finally {
 		h.cleanup();
 	}

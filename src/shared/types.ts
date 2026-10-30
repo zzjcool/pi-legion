@@ -280,6 +280,17 @@ export interface Execution {
 	stopReason?: StopReason | null;
 	errorMessage?: string | null;
 	reason?: string;
+	/**
+	 * Sub-classification of a `failed` outcome (#316).
+	 *
+	 * `provider-empty-generation` means the final assistant message ended with
+	 * `stopReason: "error"` and carried neither text nor a tool call — a
+	 * provider that answered 200 and then terminated the stream in-band. It is
+	 * the one failure class the orchestrator retries on the same child (once),
+	 * so it must be readable on the execution rather than re-derived by every
+	 * caller. Absent for every other outcome; never set on `aborted`.
+	 */
+	errorKind?: "provider-empty-generation";
 	turns?: number;
 	/** Cumulative tool errors — diagnostic only, never affects status (F30). */
 	toolErrors?: number;
@@ -370,6 +381,15 @@ export interface ChildRecord {
 	renewalBaseline?: { at: number; lines: number };
 	/** D6: renewals already granted to this child. */
 	renewalsUsed?: number;
+	/**
+	 * #316: bounded in-collect retries already spent on an empty generation.
+	 *
+	 * A separate counter on purpose — renewals are a user-facing budget granted
+	 * for "no measurable progress", while this one is an automatic, once-only
+	 * recovery of a provider fault and must never consume (or be consumed by)
+	 * that budget. Absent means 0.
+	 */
+	providerRetriesUsed?: number;
 
 	// outcome (snapshot taken before child retirement — F27)
 	execution?: Execution;
@@ -512,6 +532,11 @@ export interface TurnRecord {
 		errorMessage: string | null;
 		text: string | null;
 		tools: string[];
+		/**
+		 * Provider response id of this assistant message, when the upstream wrote
+		 * one (#316 D3). Pure pass-through for forensics — no verdict reads it.
+		 */
+		responseId?: string;
 	}>;
 	toolResults: number;
 	toolErrors: number;
