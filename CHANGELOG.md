@@ -81,6 +81,24 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **One name, one node: `status` / `collect` / `stop` / `continue` now resolve a child name the same way.**
+  In a single root session, `status(name)` and `collect(name)` called ten seconds apart answered with two
+  different nodes for the same `worker-0`: `status` went through `pickChildByName`, which walks **every**
+  run in the store and prefers a live record and then the newest `createdAt`, while `collect` acted on one
+  run's direct children. Neither reported the disagreement, so a parent chasing its own **failed** child
+  collected another run's **successful** one and believed the work was done; `continue` would then use the
+  wrong node's model and outcome, and `stop` picked the same wrong record and answered
+  `No non-retired children to stop.` — masking that the name was ambiguous at all. The four actions now go
+  through one resolver (`src/runs/child-scope.ts`): the current run's **direct** children win and add no
+  new output; a name that only exists elsewhere is reported with `runId` / `nodeId` / `state` for every
+  candidate (`collect`/`stop`/`continue` refuse it and name both levers — `runId`, or the parent node's
+  scope — instead of acting on it), `status` still shows it but leads with
+  `resolved: <name> is not a direct child of this session — showing the record from run <runId>`, and two
+  or more same-named candidates are an ambiguity every action refuses rather than guesses. `subagent`
+  gained an optional `runId` to name the run a call is scoped to. A session with no run of its own keeps
+  reaching a foreign/restarted run's persisted record (#209-3), which is where `pickChildByName` was still
+  the right answer (#312).
+
 - **A bare JSON verdict on the last line is no longer reported as `no machine-readable verdict`.**
   `child-guard` injects “End with machine-readable JSON on its own” and `docs/design.md` says
   `attested` is “解析末尾 verdict JSON”, but `extractVerdict` only knew three JSON candidates:
