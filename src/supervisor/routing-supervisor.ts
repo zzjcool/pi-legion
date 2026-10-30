@@ -19,6 +19,7 @@ import { resolveSpawnMode } from "./spawn-mode.ts";
 import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import type { UIProxy } from "./ui-proxy.ts";
 import type {
+	AbortOutcome,
 	ChildHandle,
 	EventSubscriptionOptions,
 	LegionSupervisor,
@@ -193,8 +194,16 @@ export class RoutingSupervisor implements LegionSupervisor {
 		await this.backendFor(name).followUp(name, text);
 	}
 
-	async abort(name: string): Promise<void> {
-		await this.backendFor(name).abort(name);
+	/**
+	 * Forward `(name, opts)` to the owning backend and hand its `AbortOutcome`
+	 * back untouched (#314 D8). Flattening this into `Promise<void>` upstream
+	 * would lose the interrupted/no-turn/timeout fact — same rule as `steer`.
+	 */
+	abort(
+		name: string,
+		opts?: { clearQueued?: boolean; timeoutMs?: number },
+	): Promise<AbortOutcome> {
+		return this.backendFor(name).abort(name, opts);
 	}
 
 	waitSettled(

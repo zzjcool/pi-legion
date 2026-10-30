@@ -15,6 +15,7 @@ import {
 	type ExtensionUIResponse,
 } from "../../src/supervisor/ui-proxy.ts";
 import type {
+	AbortOutcome,
 	ChildHandle,
 	LegionSupervisor,
 	RpcClientOptions,
@@ -31,6 +32,14 @@ export interface FakeSupervisorCall {
 	name: string;
 	text?: string;
 	timeoutMs?: number;
+	/** `opts.clearQueued` received by an `abort` call (#314); absent when omitted. */
+	clearQueued?: boolean;
+	/**
+	 * The abort's `opts` argument exactly as received (#314): `undefined` when the
+	 * caller passed no options object at all, which is what the default path owes
+	 * the supervisor.
+	 */
+	abortOpts?: { clearQueued?: boolean; timeoutMs?: number };
 	input?: SpawnInput;
 }
 
@@ -204,9 +213,28 @@ export class FakeSupervisor implements LegionSupervisor {
 		this.calls.push({ method: "followUp", name, text });
 	}
 
-	async abort(name: string): Promise<void> {
+	/**
+	 * Outcome every `abort` call answers with (#314). Defaults to the honest
+	 * `"interrupted"` with nothing dropped; a test that wants `"no-turn"` or
+	 * `"timeout"` sets it explicitly.
+	 */
+	abortOutcome: AbortOutcome = {
+		status: "interrupted",
+		cleared: { steering: 0, followUp: 0 },
+	};
+
+	async abort(
+		name: string,
+		opts?: { clearQueued?: boolean; timeoutMs?: number },
+	): Promise<AbortOutcome> {
 		this.requireChild(name);
-		this.calls.push({ method: "abort", name });
+		this.calls.push({
+			method: "abort",
+			name,
+			...(opts?.clearQueued !== undefined ? { clearQueued: opts.clearQueued } : {}),
+			...(opts !== undefined ? { abortOpts: opts } : {}),
+		});
+		return this.abortOutcome;
 	}
 
 	waitSettled(name: string, timeoutMs?: number): Promise<SettleResult> {

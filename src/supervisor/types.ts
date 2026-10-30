@@ -132,6 +132,68 @@ export function toSteerDisposition(
 	return route === "prompt" ? "accepted" : "queued";
 }
 
+/**
+ * What an `abort` request actually achieved (#314 D1).
+ *
+ * Three honest states, not a boolean:
+ *
+ * - `"interrupted"`: a turn was running and the interrupt request went through.
+ * - `"no-turn"`: nothing was running, so nothing was done — the queue was not
+ *   touched either, and `cleared` is all zeros.
+ * - `"timeout"`: the request went out but the child did not settle within the
+ *   caller's bound. It kills nothing: no retire, no state rewrite.
+ *
+ * `cleared` is the count the preceding queue clear reported (`steering` /
+ * `followUp` message counts), not a claim about what the model read.
+ */
+export type AbortOutcome = {
+	status: "interrupted" | "no-turn" | "timeout";
+	cleared: { steering: number; followUp: number };
+};
+
+/**
+ * Bound for one `abort` (#314 D2), shared by every layer that has to name it:
+ * both backends and the tool-surface receipt.
+ *
+ * It bounds the pre-abort queue clear AND the interrupt that follows it
+ * (#314 D4), so a child that answers neither can delay the caller by at most
+ * about twice this — never by the RPC client's own request timeout.
+ */
+export const DEFAULT_ABORT_TIMEOUT_MS = 5_000;
+
+/**
+ * Largest delay `setTimeout` honours: 2^31 − 1 ms (~24.8 days).
+ *
+ * Node does not saturate an out-of-range delay, it **collapses it to 1 ms**
+ * (`TimeoutOverflowWarning: … does not fit into a 32-bit signed integer`), so an
+ * over-large `timeoutMs` would reproduce exactly the fake instant `"timeout"`
+ * the abort normalization exists to prevent (#314 D2). Both backends therefore
+ * clamp their bound to this value instead of trusting the caller's number.
+ */
+export const MAX_ABORT_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * Count what a queue clear dropped (#314 D2): read `{steering, followUp}` array
+ * lengths off whatever the backend's `clearQueue` returned. Anything else — a
+ * throw or a clear that never answers is handled by the caller — counts 0.
+ *
+ * Both backends call this so the two never disagree about the same payload, and
+ * every call allocates, so no caller can mutate another's counts.
+ */
+export function countClearedQueue(raw: unknown): {
+	steering: number;
+	followUp: number;
+} {
+	const record =
+		typeof raw === "object" && raw !== null
+			? (raw as { steering?: unknown; followUp?: unknown })
+			: undefined;
+	return {
+		steering: Array.isArray(record?.steering) ? record.steering.length : 0,
+		followUp: Array.isArray(record?.followUp) ? record.followUp.length : 0,
+	};
+}
+
 /** The orchestrator's frozen backend seam (legion-v2-contract.md §3.1). */
 export interface LegionSupervisor {
 	spawnChild(input: SpawnInput): Promise<ChildHandle>;
@@ -144,7 +206,19 @@ export interface LegionSupervisor {
 	 */
 	steer(name: string, text: string): Promise<SteerDisposition>;
 	followUp(name: string, text: string): Promise<void>;
-	abort(name: string): Promise<void>;
+	/**
+	 * Soft interrupt (#314): drop the child's queued steering/follow-up messages
+	 * FIRST, then interrupt the running turn, and wait a bounded time for it.
+	 *
+	 * Frozen defaults (#314 D2): `clearQueued` is **true** and `timeoutMs` is
+	 * `DEFAULT_ABORT_TIMEOUT_MS`. The bound covers the clear as well as the
+	 * interrupt, and a timeout never throws (#314 D4) — it returns
+	 * `status:"timeout"` and kills nothing.
+	 */
+	abort(
+		name: string,
+		opts?: { clearQueued?: boolean; timeoutMs?: number },
+	): Promise<AbortOutcome>;
 	waitSettled(name: string, timeoutMs?: number, signal?: AbortSignal): Promise<SettleResult>;
 	isAlive(name: string): boolean;
 	stats(name: string): Promise<UsageSnapshot | null>;
@@ -193,6 +267,11 @@ export interface RpcClientLike {
 	steer(message: string): Promise<unknown>;
 	followUp(message: string): Promise<unknown>;
 	abort(): Promise<void>;
+	/**
+	 * Optional so existing fakes keep satisfying this seam: drop the queued
+	 * steering/follow-up messages and answer their counts (#314 D2).
+	 */
+	clearQueue?(): Promise<unknown>;
 	getSessionStats(): Promise<unknown>;
 }
 

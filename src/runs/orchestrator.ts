@@ -74,7 +74,7 @@ import {
 import { type ChildLaunchContext, currentChildContext, runInChildContext } from "../supervisor/child-context.ts";
 import { inProcessDepth, runAtAbsoluteDepth } from "../supervisor/inprocess-depth.ts";
 import { subscribeInProcessSlotReleases } from "../supervisor/routing-supervisor.ts";
-import type { LegionSupervisor, SettleResult, SpawnInput, SteerDisposition } from "../supervisor/types.ts";
+import type { AbortOutcome, LegionSupervisor, SettleResult, SpawnInput, SteerDisposition } from "../supervisor/types.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
 import { applyVerification, type VerifyRunner } from "./acceptance.ts";
 import {
@@ -2039,11 +2039,23 @@ export class Orchestrator {
 		this.clearBlocked(child);
 	}
 
-	async abort(name: string): Promise<void> {
+	/**
+	 * Abort one child's current turn (#314 D8): guards first (`requireChild`, then
+	 * the queued-child refusal), then the supervisor's soft interrupt, then the
+	 * unchanged `node_aborted` event with its `{ name }` payload.
+	 *
+	 * The three-state outcome is returned as-is — this layer neither invents a
+	 * fourth state nor flattens a timeout into a success.
+	 */
+	async abort(
+		name: string,
+		opts?: { clearQueued?: boolean; timeoutMs?: number },
+	): Promise<AbortOutcome> {
 		const child = this.requireChild(name);
 		this.refuseQueuedControl(name);
-		await this.supervisor.abort(name);
+		const outcome = await this.supervisor.abort(name, opts);
 		this.emitProcess("node_aborted", child.nodeId ?? name, { name });
+		return outcome;
 	}
 
 	/**

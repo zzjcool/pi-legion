@@ -89,7 +89,7 @@ interface LegionSupervisor {
   prompt(name: string, text: string): Promise<void>;
   steer(name: string, text: string): Promise<SteerDisposition>;   // RPC steer：入队，回执三态之一（见下注）
   followUp(name: string, text: string): Promise<void>;   // 空闲后送达
-  abort(name: string): Promise<void>;
+  abort(name: string, opts?: { clearQueued?: boolean; timeoutMs?: number }): Promise<AbortOutcome>; // 软中断：三态，见下注
   waitSettled(name: string, timeoutMs?: number): Promise<SettleResult>;  // 事件驱动，替代轮询
   isAlive(name: string): boolean;                        // 替代 agentGet presence
   stats(name: string): Promise<UsageSnapshot | null>;    // get_session_stats → usage 表
@@ -104,11 +104,19 @@ interface LegionSupervisor {
 > `_queueSteer` **之前**就 `return "handled"`（`dist/core/agent-session.js:1694-1697`）；
 > `dist/modes/rpc/rpc-client.js:133` 同样注「disposition 为 `handled` 时这一 prompt 没有起任何一轮」。
 
+> **`AbortOutcome`（#314）**：`abort()` 返回**它到底做到了什么**，同样是三态，没有第四种——
+> `interrupted`（有一轮在跑，中断请求已送达；可能有部分编辑残留，但 child 仍活着、可续）、
+> `no-turn`（原先没有一轮在跑，什么都没做，队列也不清）、`timeout`（请求发出去了，但 child 没在
+> 上限内 settle；不杀、不 retire，回执指向 `stop`）。默认先清 child 的 steering / follow-up 队列
+> （`clearQueued: true`），上限 `DEFAULT_ABORT_TIMEOUT_MS`（5 s）**同时盖住清队列与中断**。
+> 契约与逐字回执：`docs/contracts/abort-soft-interrupt-v1.md`。
+
 > **`steer` 的负语义（#313）**：§8.3 表格里 `steer` 那一行的「本轮工具后、下次 LLM 前送达」也是
 > **排队**语义，不是打断。
 > 工具调用执行期间子节点对 `steer` **不可达**——queue-only，没有自动打断，也没有 abort 后重投；
-> 一个卡在长命令里的子节点永远收不到 steer，文本只在它回到 turn 边界时才被消费。要真正停住子节点
-> 用 `stop`（`force: true` 是硬版本）。父侧还有**二级排队**：父自己正卡在
+> 一个卡在长命令里的子节点永远收不到 steer，文本只在它回到 turn 边界时才被消费。要打断**当前这一
+> 轮**用 `abort`（软中断：上下文保留、子节点仍可续，见 `docs/contracts/abort-soft-interrupt-v1.md`）；
+> `stop`（`force: true` 是硬版本）是拆掉进程那一条。父侧还有**二级排队**：父自己正卡在
 > `await subagent({ action: "wait" })` 里时，用户的插话先变成**父自己的** steering 消息、同样等父的
 > turn 边界（SDK：`AgentSession.prompt` 在 streaming 期间按 `streamingBehavior` 走
 > `_queueSteer`/`_queueFollowUp`，`dist/core/agent-session.js:1549-1560`；`AgentSession.steer` 是同一
@@ -302,7 +310,7 @@ npm test -- --filter <scope>
 
 ### 7.3 verifying 执行：supervisor 在子树 worktree cwd 逐条执行 `legion-verify` 块内命令（`timeout` 包裹，默认 600s/条，可设），输出落 runDir + 事件记录。空块 = 直通 done（read-only 队常见）。
 
-### 7.4 超时（每阶段独立时钟，默认可设，role/task 可覆盖）：planning 15m / implementing 60m / reviewing 30m / verifying 15m。超时**不自动杀**：写 `phase_timeout` 事件 + mail 通知该 centurion 的上级，由上级裁决（steer 续期 / abort 收队）。确定性优先，避免意外屠杀。
+### 7.4 超时（每阶段独立时钟，默认可设，role/task 可覆盖）：planning 15m / implementing 60m / reviewing 30m / verifying 15m。超时**不自动杀**：写 `phase_timeout` 事件 + mail 通知该 centurion 的上级，由上级裁决（steer 续期 / abort 打断当前轮且 child 仍在 / retire 收队并进 aborted）。确定性优先，避免意外屠杀。
 
 ### 7.5 DONE 收队流（全在 centurion 进程内自动编排）：
 1. verifying 全绿 → supervisor 迁移 phase=done（事件）
@@ -515,3 +523,4 @@ interface LegionEventBus {
 | 2026-10-19 | REV-18 | v4 收紧为仅 kind: pi；AGENT_KINDS 收敛为 ["pi"]；非 pi 值忽略并按 pi 启动。字段不删（值域收窄）；`spawnMode` 的 `rpc`/`inprocess` 不受影响。契约：`docs/contracts/drop-non-pi-kinds-v4.md`（D1，v4.0.0） |
 | 2026-10-21 | REV-19 | §4.2 新增索引 `idx_messages_rate ON messages(from_node, created_at)`（schema 变更，按 §15-4 走修订）。原因：`sendMail` 的限速 COUNT（`src/legion/mail.ts`，`WHERE from_node = ? AND created_at > ?`）在**写事务内**执行且 `messages` 无任何保留策略（`DELETE FROM messages` 仅见于 `rebuild.ts` 且只在 `preserveMessages === false`），实测 50k 行时由 `SCAN messages` 变为覆盖索引 `SEARCH`，成本随运行时长单调劣化。零行为变更：COUNT 结果不变，仅查询计划改变。**不改 `user_version`**（仍为 1），因此**既有 legion.db 不会获得该索引**——`migrate()` 在 `user_version === 1` 时提前返回，`SCHEMA_V1` 只在版本 0 执行。**且 `legion-rebuild` 不能修复它**：`rebuildLegionDb()` 拿的是已打开的 connection，事务内只发 `DELETE FROM usage/events/nodes`（以及 `preserveMessages === false` 时的 `DELETE FROM messages`），**没有 DROP/CREATE TABLE，也不重跑 `SCHEMA_V1`**；行删光后索引集合原封不动。实测：旧账本跑完 `rebuildLegionDb()` 与 close+reopen 后均仍为 `["idx_messages_inbox"]`，只有**删掉 legion.db 文件后重新打开**（走版本 0 建库）才会得到 `idx_messages_rate`。故补救方式**仅限重建账本文件本身**（legion.db 是可丢弃的树级索引，§4.4：从 run.json + session jsonl 重新生成），不是跑 rebuild 命令。接受此代价：每棵树各自新建 legion.db，长跑账本才需要人工删库重启。代价度量（50k 行表，200 发送者）：限速 COUNT 由 `SCAN` 的 ~3327 µs/call 降至 ~6.6 µs/call（**~500x**，该量级稳定复现）；写侧索引维护在已开事务内的单行 INSERT 上是**零点几 µs/行量级（低双位数百分比）**，方向确定但**具体倍数机器相关且不可移植**（同一代码在不同环境实测 +32% 到 +47% 不等，勿当常数引用）；一次**含 COMMIT 的**单行写入被 fsync 主导（数百 µs、高方差），索引那零点几 µs 在该噪声内不可分辨。净效应每封信仍是 ms 量级的节省，且随行数增长而扩大。不新增「打开时补建索引」后门（会让契约漂移）。不引入 `messages` 保留策略（另立产品决策：归属、是否借用 `eventRetentionDays`、bounce 风暴是否单独限流）。触发：issue #237 P9 |
 | 2026-10-22 | REV-20 | ① §4.1 显式写下 WAL **前置条件**：`PRAGMA journal_mode=WAL` 是查询、返回值才是实际生效模式，可在不报错的情况下降级，故 `openLegionDb()` 校验返回值、文件库非 `wal` 即抛错（`:memory:` 刻意豁免，由 `PRAGMA database_list` 的空 `file` 判定）。② §4.4 补「可重建」的**实测边界**：phase/phase_since/rework_count/contract_path/task_summary 全部不可恢复（`NodeSource` 无这些字段）；events 塌缩为每节点一条合成事件（phase_change/mail_sent/budget_refused/tree_finalized 等零幸存）；`messages` 无任何重建路径（INSERT 仅存在于 `mail.ts`，`rebuild.ts` 只有条件 DELETE）。按 §15-4 走修订的理由：②是**订正一条会误导持久性推理的既有断言**（原文「可重建」被当成放松丢写的前提），①是把一句被隐含的实现假设升为契约明文。非 schema/事件类型/权限变更，`user_version` 不变；**未触碰** `synchronous` / `journal_mode` 的取值 / `temp_store` / `cache_size` / `mmap_size`（`synchronous=NORMAL` 提案已评估**否决**：生产写速率 0.53–5.47 tx/s，`FULL` 占空比 0.027–0.273%，而 `NORMAL` 会把掉电窗口从单事务放大到上个 checkpoint 以来的全部事务、且长活读者下无界）。触发：issue #236 　**注（对 REV-19 措辞的澄清）**：REV-19 原文写「legion.db 是可丢弃的树级索引」，该断言的语境**仅是**「旧账本拿不到新索引、补救只能删库重开」这一 schema 索引场景，并非「账本可随意丢弃」。本修订不追改 REV-19 的历史正文（修订日志按 §15-1 追加、保留当时的实际决定），而在此澄清其适用范围：可丢弃的**只是索引层**，`messages` 与 phase 状态断点不在重建覆盖内（见 §4.4）。 |
+| 2026-10-30 | REV-21 | #314 abort（软中断）落地后的接口面同步（非 schema / 事件类型 / 权限变更，按 §15-1 追加）：① §3.1 `abort` 缝由 `abort(name): Promise<void>` 收成 `abort(name, opts?: { clearQueued?: boolean; timeoutMs?: number }): Promise<AbortOutcome>`，并补 `AbortOutcome` 三态注——`interrupted`（有一轮在跑、中断请求已送达；可能有部分编辑残留，child 仍活着、可续）/ `no-turn`（原先没有一轮在跑，什么都没做，队列也不清）/ `timeout`（请求发出去了，但 child 没在上限内 settle；不杀、不 retire，回执指向 `stop`），默认 `clearQueued: true`，上限 `DEFAULT_ABORT_TIMEOUT_MS`（5 s）**同时盖住清队列与中断**；契约与逐字回执在 `docs/contracts/abort-soft-interrupt-v1.md`。② §3.1 的 `steer` 负语义段（即对 §8.3 表格 `steer` 行的注）补 abort/stop 分工：要打断卡在工具调用里的子节点的**当前这一轮**用 `abort`（软中断：上下文保留、子节点仍在、可续），拆掉进程那一条才是 `stop`（`force: true` 为硬版本）——原文此处只指向 `stop`，与已落地的 abort/stop 切分矛盾。③ §7.4 阶段超时的上级裁决括号由「steer 续期 / abort 收队」改为「steer 续期 / abort 打断当前轮且 child 仍在 / retire 收队并进 aborted」——「收队」对应 `retire`，`abort` 不回收 child，原文的 `abort 收队` 会让人以为 abort 会终结子节点。原因：issue #314 把 supervisor 里早已实现却零调用点的 `abort` 接到工具面（`SubagentParams.action` 增 `abort`），§3.1 的接口表与 §7.4 的收队语义必须与新 seam 同形，否则同一份契约里两处各说一套。`node_aborted` 事件类型与 payload `{ name }` 未变（进程内域仍按 REV-13 的闭集），不新增事件类型、不改 `user_version`。 |
