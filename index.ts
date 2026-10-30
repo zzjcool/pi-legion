@@ -108,6 +108,12 @@ import {
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
 import {
+	resolveChildScope,
+	describeChildScopeCandidates,
+	type ChildScopeCandidate,
+	type ChildScopeHit,
+} from "./src/runs/child-scope.ts";
+import {
 	candidateStoreRoots,
 	resolveChildAcrossStores,
 	unknownChildMessage,
@@ -239,6 +245,12 @@ const SubagentParams = Type.Object({
 	all: Type.Optional(
 		Type.Boolean({
 			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of all live (non-retired) children under cwd",
+		}),
+	),
+	runId: Type.Optional(
+		Type.String({
+			description:
+				'control actions (status/collect/stop/continue/resume/steer/abort/retire): name the run that holds the child, instead of the run this session owns. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -1828,34 +1840,50 @@ async function controlAction(input: {
 			params,
 			runtime: input.runtime,
 			store: input.store,
-			retire: async (name, opts) => {
+			// #312: the run this call is scoped to — the explicit `runId`, else the
+			// run this session owns. `stopAction` resolves the name inside it only.
+			runId: params.runId,
+			sessionRunId: input.legion?.runId,
+			retire: async (name, opts, scope) => {
 				const merged = opts ?? retireOpts;
 				const job = input.runtime.get(name);
-				if (job?.retire) {
+				// #312: a live job is a node of exactly ONE run. Retire it only when the
+				// scope agrees (or the caller named no run) — a same-named job in another
+				// run is a different node, and stopping it would retire a child that was
+				// never reported.
+				if (job?.retire && (scope?.runId === undefined || job.runId === scope.runId)) {
 					await job.retire(merged);
 					return;
 				}
-				// A completion watch can retire/release a target after stop snapshots
-				// all names but before the serial loop reaches it. Treat that target as
-				// stopped; only rebuild if its persisted record is not already retired.
-				const found = findChild(input.store.listRuns(), name);
-				if (!found) throw unknownChildError(name);
-				if (found.child.state === "retired") return;
+				// The persisted record is read in the SAME run `stopAction` resolved the
+				// name in — never re-resolved across runs (`pickChildByName` prefers a live
+				// then the newest record), which is how `stop` came to REPORT this session's
+				// `worker-0` and RETIRE another run's live one.
+				//
+				// A completion watch can retire/release a target after stop snapshots all
+				// names but before the serial loop reaches it. Treat a vanished or already
+				// retired target as stopped; only rebuild the orchestrator when there is
+				// still something to retire.
+				const runId = scope?.runId;
+				const run = runId ? input.store.readRun(runId) : null;
+				const child = run?.children.find((candidate) => candidate.name === name);
+				if (!runId || !run || !child) throw unknownChildError(name);
+				if (child.state === "retired") return;
 				const orchestrator = new Orchestrator({
 					supervisor: input.supervisor,
 					uiProxy: input.uiProxy,
-					runDir: input.store.runDir(found.runId),
+					runDir: input.store.runDir(runId),
 					cwd: input.cwd,
 					maxDepth: input.settings.legion?.maxDepth,
 					childContext: resolveTeamContext("child", input.settings, input.team),
 					...teamForChildren(input.team),
 					...rpcApproveFrom(input.settings),
-					...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: input.store } } : {}),
+					...(input.legion ? { legion: { ...input.legion, runId, runStore: input.store } } : {}),
 					onBudgetRefused: input.onBudgetRefused,
 				});
-				orchestrator.restore(found.run);
+				orchestrator.restore(run);
 				await orchestrator.retire(name, merged);
-				await persistChild(input.store, found.runId, orchestrator, name);
+				await persistChild(input.store, runId, orchestrator, name);
 			},
 		});
 	}
@@ -1913,17 +1941,51 @@ async function controlAction(input: {
 			);
 		}
 		const runs = store.listRuns();
+		const directRunId = scopeRunIdFor({
+			runId: params.runId,
+			sessionRunId: input.legion?.runId,
+			trackedRunId: input.runtime.get(params.name)?.runId,
+		});
+		const hit = scopeHitFor({
+			name: params.name,
+			directRunId,
+			explicitRunId: params.runId,
+			runs,
+		});
+		// #312: `status` is the one action that may SHOW a node it does not own, but
+		// two same-named nodes are an ambiguity it must not resolve by preference —
+		// that preference is how `status` and `collect` came to disagree.
+		if (hit.kind === "elsewhere" && hit.candidates.length > 1) {
+			return fail(ambiguousChildMessage("status", params.name, hit.candidates), ErrorCodes.NOT_FOUND);
+		}
+		const scoped =
+			hit.kind === "direct"
+				? foundInScope(runs, directRunId, params.name)
+				: foundElsewhere(runs, params.name, hit);
 		// #270: a miss in this store is not a miss overall — a worktree child's
 		// record lives under its own store, which this one cannot enumerate.
-		const found = findChild(runs, params.name) ?? findChildAcrossStores({
+		const found = scoped ?? findChildAcrossStores({
 			name: params.name,
 			cwd,
 			callerCwd: input.callerCwd,
 			ownRoot: store.rootDir,
 		});
 		if (!found) return unknownChild(params.name, store, cwd, input.callerCwd);
+		// #312: when the record is not this session's own child, say which run it
+		// came from. A direct hit adds nothing — the existing output is unchanged.
+		//
+		// Only an `elsewhere` hit is a foreign record. `absent` means the name is in
+		// no run this store can enumerate and `found` came from the #270 cross-store
+		// lookup — often a child of THIS session whose worktree store is elsewhere,
+		// which this note would have mislabelled as "not a direct child".
+		const resolvedNote =
+			hit.kind === "elsewhere"
+				? `resolved: ${params.name} is not a direct child of this session — showing the record from run ${found.runId}`
+				: undefined;
 		const alive = input.supervisor.isAlive(params.name);
-		const owner = ownerVerdictFor(store, runs, params.name, alive);
+		// #312: the owner verdict belongs to the run dir of the record just resolved
+		// (`found.runId`) — not to whatever `pickChildByName` prefers across runs.
+		const owner = ownerVerdictFor(store, runs, params.name, alive, found.runId);
 		// #315: what it is doing and for how long, prepended to the block when this
 		// process is actually running a tool for it.
 		const snapshot = renderLiveChildStatus({
@@ -1939,7 +2001,8 @@ async function controlAction(input: {
 			...(owner ? { owner } : {}),
 		});
 		const activity = input.supervisor.inFlightTool?.(found.child.name);
-		return ok(withInFlightToolLine(snapshot, activity, Date.now()));
+		const rendered = withInFlightToolLine(snapshot, activity, Date.now());
+		return ok(resolvedNote ? `${resolvedNote}\n${rendered}` : rendered);
 	}
 
 	if (!params.name) {
@@ -1949,8 +2012,43 @@ async function controlAction(input: {
 		);
 	}
 
+	const runs = store.listRuns();
+	const directRunId = scopeRunIdFor({
+		runId: params.runId,
+		sessionRunId: input.legion?.runId,
+		trackedRunId: input.runtime.get(params.name)?.runId,
+	});
+	const hit = scopeHitFor({
+		name: params.name,
+		directRunId,
+		explicitRunId: params.runId,
+		runs,
+	});
+	if (hit.kind === "elsewhere") {
+		// #312: never guess between two same-named nodes, whichever action asked.
+		if (hit.candidates.length > 1) {
+			return fail(ambiguousChildMessage(action, params.name, hit.candidates), ErrorCodes.NOT_FOUND);
+		}
+		// `collect`/`continue` are defined over this session's direct children only,
+		// so a same-named node elsewhere is a refusal that names the candidates —
+		// not the old silent adoption of whatever `pickChildByName` preferred.
+		//
+		// Only when a scope EXISTS: a session with no run of its own has no direct
+		// children to protect, and #209-3 keeps that path reaching a foreign/
+		// restarted run's persisted record (the pre-existing contract tests build
+		// exactly that store, with no launch in this session at all). The bug #312
+		// describes needs a session run whose name resolution was overridden.
+		if (directRunId !== undefined && STRICT_SCOPE_ACTIONS.has(action)) {
+			return fail(notDirectChildMessage(action, params.name, hit.candidates), ErrorCodes.NOT_FOUND);
+		}
+	}
+	// `steer`/`abort`/`retire` keep their pre-#312 reach (one unambiguous record
+	// outside this session's run stays addressable); the scope run is still tried
+	// first, so the common case never depends on the fallback.
 	const found =
-		findChild(store.listRuns(), params.name) ??
+		(hit.kind === "direct"
+			? foundInScope(runs, directRunId, params.name)
+			: foundElsewhere(runs, params.name, hit)) ??
 		findChildAcrossStores({
 			name: params.name,
 			cwd,
@@ -2045,6 +2143,147 @@ function unknownChild(
 	return fail(
 		unknownChildMessage({ name, cwd, searched: searched as CandidateStore[] }),
 		ErrorCodes.NOT_FOUND,
+	);
+}
+
+/**
+ * The run a named control call is scoped to (#312).
+ *
+ * Three sources, in the order the caller can be sure of them:
+ *
+ *   1. `runId` on the call itself — the explicit scope, which wins over every
+ *      inference (that is the escape hatch the refusal messages point at);
+ *   2. the run this session owns, from its legion identity: every child this
+ *      session launched outside a worktree record belongs here;
+ *   3. the run the runtime is currently tracking the name under — the window
+ *      where no legion identity resolves (a reloaded extension, a resumed run)
+ *      but the child is still live and known to this process.
+ *
+ * `undefined` is a real answer: no scope means nothing is a direct child, so a
+ * same-named record elsewhere is reported instead of silently adopted.
+ */
+function scopeRunIdFor(input: {
+	runId?: string | undefined;
+	sessionRunId?: string | undefined;
+	trackedRunId?: string | undefined;
+}): string | undefined {
+	return input.runId ?? input.sessionRunId ?? input.trackedRunId;
+}
+
+/** A resolved child with the run it came from, as every control action needs it. */
+type ResolvedRunChild = NonNullable<ReturnType<typeof findChild>>;
+
+/**
+ * The record `scopeRunId` actually owns for `name`, or `null`.
+ *
+ * This is the whole definition of "a direct child" in the resolver's terms: an
+ * exact `(runId, name)` pair — never "the newest record with that name".
+ */
+function foundInScope(
+	runs: ReturnType<RunStore["listRuns"]>,
+	scopeRunId: string | undefined,
+	name: string,
+): ResolvedRunChild | null {
+	if (!scopeRunId) return null;
+	const run = runs.find((candidate) => candidate.runId === scopeRunId);
+	const child = run?.children.find((candidate) => candidate.name === name);
+	if (!run || !child) return null;
+	return { runId: run.runId, run, child };
+}
+
+/** {@link resolveChildScope}, wired to one store's run records. */
+function scopeHitFor(input: {
+	name: string;
+	/**
+	 * The run whose children count as direct: the explicit `runId` when the caller
+	 * named one, else the run this session owns. Separate from `explicitRunId` on
+	 * purpose — see it below.
+	 */
+	directRunId: string | undefined;
+	/**
+	 * The `runId` the CALLER passed, which is the only thing allowed to narrow the
+	 * cross-run search. The inferred session run must not: with it in the filter a
+	 * name that lives in another run would come back `absent` instead of
+	 * `elsewhere`, and the refusal that tells the caller where it actually is
+	 * would never be reachable.
+	 */
+	explicitRunId?: string | undefined;
+	runs: ReturnType<RunStore["listRuns"]>;
+}): ChildScopeHit {
+	return resolveChildScope({
+		name: input.name,
+		runId: input.explicitRunId,
+		direct: (name) => foundInScope(input.runs, input.directRunId, name)?.child,
+		scan: () =>
+			input.runs.flatMap((run) =>
+				run.children.map((child) => ({
+					runId: run.runId,
+					nodeId: child.nodeId,
+					name: child.name,
+					state: child.state,
+					sessionFile: child.sessionFile,
+				})),
+			),
+	});
+}
+
+/**
+ * The one node an `elsewhere` hit points at, when it is unambiguous.
+ *
+ * `null` for `absent` and for an ambiguity: a caller that cannot name the node
+ * must not pick one, and the ambiguity is reported before this is consulted.
+ */
+function foundElsewhere(
+	runs: ReturnType<RunStore["listRuns"]>,
+	name: string,
+	hit: ChildScopeHit,
+): ResolvedRunChild | null {
+	if (hit.kind !== "elsewhere" || hit.candidates.length !== 1) return null;
+	const only = hit.candidates[0];
+	if (!only) return null;
+	return foundInScope(runs, only.runId, name);
+}
+
+/** Actions that may only ever act on this session's own direct child (#312). */
+const STRICT_SCOPE_ACTIONS = new Set(["collect", "continue", "resume"]);
+
+/**
+ * Two or more same-named nodes and not one of them is this session's child.
+ *
+ * Never resolved by preference: the incident behind #312 is exactly what a
+ * "prefer the live one, then the newest" tie-break produces. The candidates are
+ * printed so the caller can name the run it meant.
+ */
+function ambiguousChildMessage(
+	action: string,
+	name: string,
+	candidates: readonly ChildScopeCandidate[],
+): string {
+	return (
+		`${name} is ambiguous: ${candidates.length} nodes carry that name and none of them is a direct child of this session, so \`${action}\` will not guess.\n` +
+		describeChildScopeCandidates(candidates) +
+		"\nPass `runId` to name the run that holds the one you mean."
+	);
+}
+
+/**
+ * Refuse an action whose contract is "this session's direct child" (#312).
+ *
+ * `collect` used to reach into whatever run `pickChildByName` preferred, which
+ * is how a parent chasing its own FAILED `worker-0` was handed another run's
+ * SUCCESSFUL one — the silent wrong node. The candidates are named so the caller
+ * can either pass `runId` or go through the node's parent instead.
+ */
+function notDirectChildMessage(
+	action: string,
+	name: string,
+	candidates: readonly ChildScopeCandidate[],
+): string {
+	return (
+		`${name} is not a direct child of this session, so \`${action}\` cannot act on it. ` +
+		`${candidates.length} node(s) carry that name:\n` +
+		describeChildScopeCandidates(candidates) +
+		`\n\`${action}\` only acts on this session's direct children; pass \`runId\`, or address the node through its parent's scope, to reach a grandchild.`
 	);
 }
 
@@ -2198,9 +2437,23 @@ export async function collectChild(
 ): Promise<AgentToolResult<unknown>> {
 	try {
 		if (signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
-		const pending = signal
-			? ctx.runtime.consumeCollectInterruptible(ctx.name, signal)
-			: ctx.runtime.consumeCollect(ctx.name);
+		// #312: the runtime's job table is keyed by NAME, while everything below
+		// acts on the node resolved in `ctx.found.runId`. A TRACKED job belonging to
+		// another run is a different node: consuming its snapshot here would answer
+		// with one node's result and persist it into another's run — the same silent
+		// wrong-node answer the resolver exists to stop, one layer down.
+		//
+		// Only a tracked job can be cross-checked. A released one leaves its finished
+		// cache behind (keyed by the run the snapshot CAME from, D9), and that cache is
+		// the only answer left for the node — the #320 bail wiring collects exactly
+		// that window, so an absent job must not be read as "a different run".
+		const trackedJob = ctx.runtime.get(ctx.name);
+		const foreignJob = trackedJob !== undefined && trackedJob.runId !== ctx.found.runId;
+		const pending = foreignJob
+			? undefined
+			: signal
+				? ctx.runtime.consumeCollectInterruptible(ctx.name, signal)
+				: ctx.runtime.consumeCollect(ctx.name);
 		if (pending) {
 			const collected = await pending;
 			// D2: the seam claims a terminal snapshot on the way out, because a flush in
@@ -2250,7 +2503,9 @@ export async function collectChild(
 			await ctx.orchestrator.retire(ctx.name);
 			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name);
 		}
-		ctx.runtime.release(ctx.name);
+		// Only release a job that IS the node just collected. Releasing by name alone
+		// would drop the tracking of a still-live same-named child in another run.
+		if (!foreignJob) ctx.runtime.release(ctx.name);
 		return ok(renderCollect(ctx.name, collected));
 	} catch (error) {
 		return fail(`collect failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
@@ -4246,11 +4501,85 @@ function ownerVerdictFor(
 	runs: ReturnType<RunStore["listRuns"]>,
 	name: string,
 	alive: boolean,
+	runId?: string | undefined,
 ): "live" | "dead" | "unknown" | undefined {
 	if (alive) return undefined;
+	// #312: a named `status` resolved ONE node, so the verdict has to come from
+	// that node's run dir. Reading it through `pickChildByName` mixed the record
+	// this call displays with the owner marker of another run's same-named node —
+	// a child whose own run dir is owned by this live process could render
+	// `owner: dead (pid gone)` and even be rewritten to `state=failed`.
+	if (runId) return ownerState(path.join(store.runDir(runId), RUN_OWNER_FILE));
 	const picked = pickChildByName(runs, name);
 	if (!picked) return "unknown";
 	return ownerState(path.join(store.runDir(picked.run.runId), RUN_OWNER_FILE));
+}
+
+/** The run a resolved `stop` target lives in (#312). */
+export interface StopRetireScope {
+	/**
+	 * The run `stopAction` resolved this name in. The executor must read THIS
+	 * record — re-resolving the name across runs is how `stop` came to report one
+	 * node and retire another.
+	 */
+	runId?: string | undefined;
+}
+
+/** One node `stop` will retire, with the run that owns it (#312). */
+interface StopTarget {
+	name: string;
+	runId: string;
+}
+
+/**
+ * Refuse `stop({name, runId})` when that name's live job sits in another run (#312).
+ *
+ * The runtime's job table is keyed by NAME, so before this check a live child
+ * answered a call scoped to a different run and was retired anyway — the
+ * "reported one node, retired another" failure one layer above the store path.
+ * A live job is a node of exactly one run, so the two are a conflict, never a
+ * preference: neither may be retired by a tie-break. The wording is the same
+ * elsewhere/ambiguity pair the store path uses, because the caller's lever is
+ * the same — name the run that actually holds the node.
+ */
+function stopScopeMismatchMessage(
+	name: string,
+	live: { runId: string; nodeId?: string | undefined; state: string },
+	runs: ReturnType<RunStore["listRuns"]>,
+): string {
+	// The scan names every same-named node; the live job is added on its own
+	// because a just-spawned child may not have a persisted record yet.
+	const scanned = scopeHitFor({ name, directRunId: undefined, explicitRunId: undefined, runs });
+	const candidates = dedupeChildScopeCandidates([
+		...(scanned.kind === "elsewhere" ? scanned.candidates : []),
+		{
+			runId: live.runId,
+			...(live.nodeId ? { nodeId: live.nodeId } : {}),
+			state: live.state,
+		},
+	]);
+	return candidates.length > 1
+		? ambiguousChildMessage("stop", name, candidates)
+		: notDirectChildMessage("stop", name, candidates);
+}
+
+/**
+ * One entry per node: the same run can be seen twice (persisted scan + live job).
+ *
+ * Sorted by `runId` like the resolver's own scan, so the message is stable.
+ */
+function dedupeChildScopeCandidates(
+	candidates: readonly ChildScopeCandidate[],
+): ChildScopeCandidate[] {
+	const seen = new Set<string>();
+	const out: ChildScopeCandidate[] = [];
+	for (const candidate of candidates) {
+		const key = `${candidate.runId}\u0000${candidate.nodeId ?? ""}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		out.push(candidate);
+	}
+	return out.sort((a, b) => a.runId.localeCompare(b.runId));
 }
 
 /**
@@ -4265,7 +4594,22 @@ export async function stopAction(input: {
 	 * (foreign/restarted runs). Omitted callers keep the runtime-only scope.
 	 */
 	store?: RunStore;
-	retire: (name: string, opts?: RetireOptions) => Promise<void>;
+	/**
+	 * #312: the run this call is scoped to (`runId` on the tool call, else the
+	 * session's own run). Only a child of THIS run may be stopped by name; a
+	 * same-named record elsewhere is reported instead of adopted.
+	 */
+	runId?: string | undefined;
+	/** The run this session owns, used when the call names no `runId` (#312). */
+	sessionRunId?: string | undefined;
+	/**
+	 * Retire one already-resolved target.
+	 *
+	 * `scope` carries the run the target was resolved IN, so the executor can act
+	 * on that exact record instead of resolving the name again by preference
+	 * (#312) — one resolver here, one node retired there.
+	 */
+	retire: (name: string, opts?: RetireOptions, scope?: StopRetireScope) => Promise<void>;
 }): Promise<AgentToolResult<unknown>> {
 	const { params, runtime, retire } = input;
 	if (params.name && params.all) {
@@ -4278,39 +4622,85 @@ export async function stopAction(input: {
 	const retireOpts: RetireOptions | undefined = force ? { graceful: false } : undefined;
 	const jobs = runtime.activeJobs();
 	const active = jobs.filter((job) => job.state !== "retired");
-	let targets: string[];
+	let targets: StopTarget[];
 	if (params.all) {
-		targets = active.map((job) => job.name);
+		targets = active.map((job) => ({ name: job.name, runId: job.runId }));
 	} else {
 		// Local const so the earlier `name`/`all` guard narrows through the lookup.
 		const name = params.name;
 		const target = name ? jobs.find((job) => job.name === name) : undefined;
+		if (name && input.runId !== undefined && target && target.runId !== input.runId) {
+			// #312: the job table is keyed by NAME, so a live child answered a call
+			// scoped to another run and got retired anyway — the presented node and the
+			// retired node disagreed again, one layer up (fixing only the store path
+			// would have left this silent). A live job belongs to exactly one run, so
+			// the mismatch is a conflict: refuse it with the wording the store path uses.
+			return fail(
+				stopScopeMismatchMessage(name, target, input.store ? input.store.listRuns() : []),
+				ErrorCodes.NOT_FOUND,
+			);
+		}
 		if (!target) {
-			// Not tracked by this session, but a foreign/restarted run may still
-			// own a persisted record — the same records `status` can display. Fall
-			// back to it so stop and retire agree on what is reachable.
-			const found = input.store && name ? findChild(input.store.listRuns(), name) : null;
+			// Not tracked by this session, but a foreign/restarted run may still own a
+			// persisted record — the same records `status` can display.
+			//
+			// #312: it has to be this session's OWN child. The old fallback took
+			// whatever `pickChildByName` preferred across every run, and when that
+			// happened to be a different run's retired record the whole call collapsed
+			// into `No non-retired children to stop.` — which told the caller nothing
+			// about the name being ambiguous, and hid the node it was trying to stop.
+			const runs = input.store ? input.store.listRuns() : [];
+			const directRunId = scopeRunIdFor({
+				runId: input.runId,
+				sessionRunId: input.sessionRunId,
+				trackedRunId: name ? runtime.get(name)?.runId : undefined,
+			});
+			const found = name ? foundInScope(runs, directRunId, name) : null;
 			if (!found) {
-				return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
+				const hit = name
+					? scopeHitFor({ name, directRunId, explicitRunId: input.runId, runs })
+					: undefined;
+				if (hit?.kind === "elsewhere") {
+					const ambiguous = hit.candidates.length > 1;
+					// A session with no run of its own (#209-3: a foreign or restarted run's
+					// record) has no direct children, so a unique match stays reachable. With
+					// a scope, a name that is not in it is refused instead of adopted — that
+					// adoption is what turned into `No non-retired children to stop.`
+					if (ambiguous || directRunId !== undefined) {
+						const message = ambiguous
+							? ambiguousChildMessage("stop", name ?? "", hit.candidates)
+							: notDirectChildMessage("stop", name ?? "", hit.candidates);
+						return fail(message, ErrorCodes.NOT_FOUND);
+					}
+					const permissive = name ? foundElsewhere(runs, name, hit) : null;
+					if (!permissive) {
+						return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
+					}
+					targets = permissive.child.state === "retired" ? [] : [{ name: permissive.child.name, runId: permissive.runId }];
+				} else {
+					return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
+				}
+			} else {
+				targets = found.child.state === "retired" ? [] : [{ name: found.child.name, runId: found.runId }];
 			}
-			targets = found.child.state === "retired" ? [] : [found.child.name];
 		} else {
-			targets = target.state === "retired" ? [] : [target.name];
+			targets = target.state === "retired" ? [] : [{ name: target.name, runId: target.runId }];
 		}
 	}
 	if (targets.length === 0) return ok("No non-retired children to stop.");
 
 	// Stop every watcher before any retire starts: a later target must not finish
 	// its own watch (and notify/release) while an earlier target is being retired.
-	for (const name of targets) runtime.cancelWatch(name);
+	for (const { name } of targets) runtime.cancelWatch(name);
 
 	const stopped: string[] = [];
 	const failures: string[] = [];
-	for (const name of targets) {
+	for (const { name, runId } of targets) {
 		try {
 			// The runtime job may have been released after the target snapshot was
-			// taken. The retire adapter can then resolve its persisted run record.
-			await retire(name, retireOpts);
+			// taken. `scope` hands the resolve-time run to the executor, which reads
+			// THAT record rather than picking one across runs (#312).
+			await retire(name, retireOpts, { runId });
 			runtime.release(name);
 			stopped.push(name);
 		} catch (error) {

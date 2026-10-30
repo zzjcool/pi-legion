@@ -114,6 +114,47 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **One name, one node: `status` / `collect` / `stop` / `continue` now resolve a child name the same way.**
+  In a single root session, `status(name)` and `collect(name)` called ten seconds apart answered with two
+  different nodes for the same `worker-0`: `status` went through `pickChildByName`, which walks **every**
+  run in the store and prefers a live record and then the newest `createdAt`, while `collect` acted on one
+  run's direct children. Neither reported the disagreement, so a parent chasing its own **failed** child
+  collected another run's **successful** one and believed the work was done; `continue` would then use the
+  wrong node's model and outcome, and `stop` picked the same wrong record and answered
+  `No non-retired children to stop.` — masking that the name was ambiguous at all. The four actions now go
+  through one resolver (`src/runs/child-scope.ts`): the current run's **direct** children win and add no
+  new output; a name that only exists elsewhere is reported with `runId` / `nodeId` / `state` for every
+  candidate (`collect`/`stop`/`continue` refuse it and name both levers — `runId`, or the parent node's
+  scope — instead of acting on it), `status` still shows it but leads with
+  `resolved: <name> is not a direct child of this session — showing the record from run <runId>`, and two
+  or more same-named candidates are an ambiguity every action refuses rather than guesses. `subagent`
+  gained an optional `runId` to name the run a call is scoped to. The scope now travels all the way to the
+  **execution point**, which is where the old resolution leaked back in: `stop` hands the run it resolved the
+  name in to the retire step, which reads THAT record instead of re-resolving the name across runs — so the
+  child it reports and the child it retires are the same one, and a live job carrying the name in another
+  run is refused (with the same candidate list) instead of retired. `collect` only consumes the runtime
+  snapshot whose `runId` matches the resolved node, the `status` block's `owner:` line is read from the
+  resolved node's own run dir (another run's dead owner marker used to render `owner: dead (pid gone)` — and
+  even `state=failed` — under this session's record), and the `resolved:` annotation is emitted only for a
+  genuinely foreign (`elsewhere`) record, not for a #270 cross-store hit that is this session's own child. A
+  session with no run of its own keeps reaching a foreign/restarted run's persisted record (#209-3), which is
+  where `pickChildByName` was still the right answer (#312).
+
+- **A bare JSON verdict on the last line is no longer reported as `no machine-readable verdict`.**
+  `child-guard` injects “End with machine-readable JSON on its own” and `docs/design.md` says
+  `attested` is “解析末尾 verdict JSON”, but `extractVerdict` only knew three JSON candidates:
+  fenced blocks, `text.trim()`, and the span from the **first** `{` to the **last** `}`. One brace
+  anywhere in the report — an API shape, a code fragment, `{ version, entries }` — turned that span
+  into prose-plus-JSON, `JSON.parse` failed, and a perfectly valid verdict on the final line was
+  thrown away, so the child was recorded `acceptance: unknown` while a sibling whose verdict was
+  byte-identical but wrapped in a fence came back `accepted`. Two candidates are added after the
+  existing ones and before giving up: the **last line** when it is itself a JSON object (what the
+  injection asks for, and it survives trailing blank lines), and a **string/escape-aware brace
+  balance scan backwards from the text's last `}`**, which reaches a verdict that spans lines or is
+  followed by a short trailing note. The existing `\n\s+` collapsed-span compat candidate is kept,
+  moved last because it rewrites the text. Parsing never throws and a report with no JSON still
+  returns `null` (#311).
+
 - **A provider that ends a turn with no content no longer costs a child its whole turn.** Some
   upstreams answer HTTP 200 and then terminate the stream in-band; pi maps that to
   `stopReason: "error"` with an empty assistant message (`finish_reason: error`, measured with

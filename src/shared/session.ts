@@ -1040,17 +1040,34 @@ function extractJsonVerdict(
 	}
 	candidates.push(text.trim());
 
-	// Also try the last balanced {...} span, so prose around the JSON still works.
 	const first = text.indexOf("{");
 	const last = text.lastIndexOf("}");
 	if (first !== -1 && last > first) {
-		const span = text.slice(first, last + 1);
-		candidates.push(span);
+		// Also try the first `{` … last `}` span, so prose around the JSON still
+		// works — but ONE brace anywhere in the report poisons it (#311), which is
+		// why the two candidates below exist.
+		candidates.push(text.slice(first, last + 1));
+	}
+
+	// #311/1: the last line, when it is a bare JSON object. This is the shape
+	// `child-guard` injects ("End with machine-readable JSON on its own"), so a
+	// verdict that needs nothing but itself must never be missed. `trimEnd()`
+	// first so trailing blank lines still leave the verdict as the last line.
+	const lastLine = text.trimEnd().split("\n").at(-1)?.trim();
+	if (lastLine) candidates.push(lastLine);
+
+	// #311/2: brace-balance backwards from the end, so a verdict that spans lines
+	// or is followed by a short trailing note is still reachable.
+	candidates.push(...trailingJsonObjects(text));
+
+	if (first !== -1 && last > first) {
 		// The cursor TUI word-wraps long lines, which breaks a streamed verdict
 		// JSON mid-string (`…top reason:\n  arithmetic identity"}`). A newline
 		// inside a JSON string literal is invalid JSON, so joining wrapped lines
 		// is a safe repair: the unwrapped original is still tried first above.
-		candidates.push(span.replace(/\n\s+/g, " "));
+		// Deliberately LAST: it rewrites the text, so it is the least faithful
+		// candidate and only runs once every faithful reading has been refused.
+		candidates.push(text.slice(first, last + 1).replace(/\n\s+/g, " "));
 	}
 
 	for (const candidate of candidates) {
@@ -1068,6 +1085,81 @@ function extractJsonVerdict(
 		return out;
 	}
 	return null;
+}
+
+/**
+ * The object closed by the LAST `}` in `text`, found by counting braces from the
+ * end (#311/2). `text.slice(open, end + 1)` is returned only when the count
+ * returns to zero, so an unbalanced tail yields nothing rather than a truncated
+ * guess. Never throws.
+ *
+ * `mask` marks the characters that sit inside a string literal (see
+ * {@link stringMask}); the masked pass is the accurate one — a `}` inside
+ * `"… } …"` must not close the object — and the unmasked pass is the fallback
+ * for text whose quotes do not pair up (prose that opens a quote and never
+ * closes it inverts the mask, hiding the real closing brace).
+ */
+function trailingJsonObjects(text: string): string[] {
+	const out: string[] = [];
+	for (const mask of [stringMask(text), undefined]) {
+		const span = lastBalancedObject(text, mask);
+		if (span) out.push(span);
+	}
+	return out;
+}
+
+function lastBalancedObject(text: string, mask: Uint8Array | undefined): string | undefined {
+	let end = -1;
+	for (let i = text.length - 1; i >= 0; i -= 1) {
+		if (text[i] !== "}" || mask?.[i] === 1) continue;
+		end = i;
+		break;
+	}
+	if (end === -1) return undefined;
+	let depth = 0;
+	for (let i = end; i >= 0; i -= 1) {
+		if (mask?.[i] === 1) continue;
+		const ch = text[i];
+		if (ch === "}") {
+			depth += 1;
+			continue;
+		}
+		if (ch !== "{") continue;
+		depth -= 1;
+		if (depth === 0) return text.slice(i, end + 1);
+	}
+	return undefined;
+}
+
+/**
+ * Mark every character that sits inside a JSON-style string literal, quotes and
+ * backslash escapes included. A single forward pass, so the backward brace scan
+ * never has to re-derive string state.
+ */
+function stringMask(text: string): Uint8Array {
+	const mask = new Uint8Array(text.length);
+	let inString = false;
+	for (let i = 0; i < text.length; i += 1) {
+		const ch = text[i];
+		if (!inString) {
+			if (ch === '"') {
+				inString = true;
+				mask[i] = 1;
+			}
+			continue;
+		}
+		mask[i] = 1;
+		if (ch === "\\") {
+			// An escaped character is part of the literal even when it is a quote.
+			if (i + 1 < text.length) {
+				mask[i + 1] = 1;
+				i += 1;
+			}
+			continue;
+		}
+		if (ch === '"') inString = false;
+	}
+	return mask;
 }
 
 /** `FAILED: ...` on the first non-empty line means the agent gave up. */
