@@ -23,7 +23,8 @@ import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
-import type { LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
+import type { AbortOutcome, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
+import { DEFAULT_ABORT_TIMEOUT_MS } from "./src/supervisor/types.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
 import {
@@ -172,6 +173,7 @@ const SubagentParams = Type.Object({
 				Type.Literal("launch"),
 				Type.Literal("continue"),
 				Type.Literal("steer"),
+				Type.Literal("abort"),
 				Type.Literal("resume"),
 				Type.Literal("retire"),
 				Type.Literal("status"),
@@ -248,6 +250,12 @@ const SubagentParams = Type.Object({
 		Type.Boolean({
 			description:
 			'stop only: when true, hard-retire via SIGTERM→SIGKILL + descendant sweep (retire hardening). Omit/false = graceful retire. Example: subagent({ action: "stop", name: "worker-0", force: true }).',
+		}),
+	),
+	clearQueued: Type.Optional(
+		Type.Boolean({
+			description:
+				'abort only: clear the child\'s queued steering/follow-up messages before interrupting it (default true). Omit for true. Example: subagent({ action: "abort", name: "worker-0" }).',
 		}),
 	),
 	message: Type.Optional(
@@ -1952,6 +1960,7 @@ async function controlAction(input: {
 	};
 
 	if (action === "steer") return steerChild(ctx);
+	if (action === "abort") return abortChild(ctx);
 	if (action === "collect") return collectChild(ctx, input.signal);
 	if (action === "retire") return retireChild(ctx);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
@@ -2081,6 +2090,67 @@ export async function steerChild(
 		return ok(steerReceipt(ctx.name, disposition));
 	} catch (error) {
 		return fail(`steer failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
+	}
+}
+
+/**
+ * Render the receipt for one `abort` (#314 D7).
+ *
+ * All three statuses are honest outcomes of a *soft* interrupt, and none of
+ * them is a failure:
+ *
+ * - `interrupted`: the turn was cut short. Its context survives (the session is
+ *   not retired), but whatever the interrupted tool had already written to disk
+ *   stays written — a receipt that only promised "context kept" would let a
+ *   caller assume a clean rollback.
+ * - `no-turn`: nothing was running, so nothing was done. Saying "aborted" here
+ *   would claim an interrupt that never happened.
+ * - `timeout`: the abort was sent but the child had not settled inside the
+ *   bounded wait. A tool that ignores cancellation looks exactly like this, so
+ *   the receipt points at `stop` instead of pretending the turn died.
+ */
+export function abortReceipt(
+	name: string,
+	outcome: AbortOutcome,
+	timeoutMs = DEFAULT_ABORT_TIMEOUT_MS,
+): string {
+	if (outcome.status === "no-turn") {
+		return `Nothing to abort: ${name} is not running a turn.`;
+	}
+	if (outcome.status === "timeout") {
+		const seconds = timeoutMs % 1000 === 0 ? String(timeoutMs / 1000) : (timeoutMs / 1000).toFixed(1);
+		return `Abort sent to ${name}, but it had not settled within ${seconds}s — the running tool may ignore cancellation; use stop (or stop with force) if it must die.`;
+	}
+	const dropped = outcome.cleared.steering + outcome.cleared.followUp;
+	const base = `Aborted ${name}'s current turn (context kept; partial edits may remain)`;
+	return dropped > 0 ? `${base} — dropped ${dropped} queued message(s)` : base;
+}
+
+/**
+ * Interrupt a child's current turn without tearing the child down (#314 D7).
+ *
+ * The child keeps its session and context, so it stays continuable — that is
+ * the whole difference from `stop`, which retires the process. Deliberately no
+ * `followChild` here: abort must not register a new watch (the child is already
+ * tracked and settles through its existing one).
+ *
+ * Exported so `test/unit/abort-action.test.ts` can drive the receipt and the
+ * wiring (same reason as `steerChild`/`stopAction`).
+ */
+export async function abortChild(
+	ctx: ChildContext,
+): Promise<AgentToolResult<unknown>> {
+	try {
+		// Only an explicit `clearQueued: false` builds an options object; the
+		// default path passes nothing, so the supervisor's own default (true)
+		// stays the single source of truth.
+		const outcome = await ctx.orchestrator.abort(
+			ctx.name,
+			ctx.params.clearQueued === false ? { clearQueued: false } : undefined,
+		);
+		return ok(abortReceipt(ctx.name, outcome));
+	} catch (error) {
+		return fail(`abort failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
 	}
 }
 

@@ -11,6 +11,27 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Added
+
+- **`subagent({ action: "abort" })` stops a child's current turn without killing it.** The
+  capability was already sitting in the supervisor (`LegionSupervisor.abort`, `RpcSupervisor`,
+  `InProcessSupervisor`, `Orchestrator.abort`) with zero call sites and no action on the tool
+  surface, so the only ways out of a stuck child were `stop` (tear the process down and throw the
+  context away) and `steer` (a queue, so it cannot reach a child that is inside a tool call). The
+  action now clears the child's queued steering/follow-up messages first — `clearQueued`,
+  default `true`, because an abort that lands first lets the child immediately pick up the oldest
+  queued instruction, the opposite of "stop that" — and then asks the child to stop the current
+  turn. Context, transcript and session file survive, so the child can be continued afterwards.
+  The call is bounded: one 5s limit covers the interrupt **and** the queue clear that has to land
+  before it, so the worst case is about twice that bound — and the tool surface takes no bound of
+  its own (`timeoutMs` stays a `wait`-only parameter; a clear that cannot answer counts as zero
+  while the interrupt is still sent). A call that hits the bound answers `timeout` instead of
+  hanging, and it never kills anything: `stop` (`force: true` for the hard variant) remains the
+  path that takes the process down. Three honest receipts — `interrupted` (with the count of
+  queued messages it dropped), `no-turn` (nothing was running; the queue is left alone) and
+  `timeout` (the request went out, the child had not settled). Contract and the frozen three-state
+  table: `docs/contracts/abort-soft-interrupt-v1.md` (#314).
+
 ### Fixed
 
 - **A `steer` receipt now reports what the child's session actually answered.** `steer` is a

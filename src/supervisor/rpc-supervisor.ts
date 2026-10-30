@@ -25,6 +25,7 @@ import {
 	type UIProxy,
 } from "./ui-proxy.ts";
 import {
+	type AbortOutcome,
 	type ChildHandle,
 	type DescendantInfo,
 	type EventSubscriptionOptions,
@@ -41,7 +42,12 @@ import {
 	type SupervisorEventListener,
 	type UsageSnapshot,
 } from "./types.ts";
-import { toSteerDisposition } from "./types.ts";
+import {
+	countClearedQueue,
+	DEFAULT_ABORT_TIMEOUT_MS,
+	MAX_ABORT_TIMER_DELAY_MS,
+	toSteerDisposition,
+} from "./types.ts";
 import { currentPgid, enumerateDescendants } from "./proc-tree.ts";
 
 interface EventSubscription {
@@ -430,11 +436,112 @@ export class RpcSupervisor implements LegionSupervisor {
 		await this.dispatch(child, "followUp", text);
 	}
 
-	async abort(name: string): Promise<void> {
+	/**
+	 * Soft interrupt (#314): clear the queue FIRST (#314 D3), then interrupt the
+	 * running turn, and wait no longer than one `bound` for either step
+	 * (#314 D2 default, #314 D4 bound).
+	 *
+	 * - `requireChild` + `assertCanSend` run first, so a retired/unavailable child
+	 *   keeps throwing `NOT_FOUND` exactly as before;
+	 * - `turnActive === false` ⇒ `"no-turn"`, and nothing is called at all: no
+	 *   clear, no interrupt (#314 D1);
+	 * - the clear is best-effort AND bounded: a throwing, absent or unresponsive
+	 *   `clearQueue` reports zeros and must never hold the interrupt back — the
+	 *   only reason this path runs is that the child is unresponsive (#314 D2
+	 *   counts, #314 D4 bound);
+	 * - a timeout resolves with `"timeout"` and touches neither `turnActive` nor
+	 *   `state` — convergence stays with `agent_settled` (#314 D4).
+	 */
+	async abort(
+		name: string,
+		opts?: { clearQueued?: boolean; timeoutMs?: number },
+	): Promise<AbortOutcome> {
 		const child = this.requireChild(name);
 		this.assertCanSend(child);
-		if (!child.turnActive) return;
-		await this.requireClient(child).abort();
+		// #314 D2: normalize once per call. Node turns any delay outside
+		// `[1, MAX_ABORT_TIMER_DELAY_MS]` into 1 ms, so BOTH kinds of junk — a
+		// non-finite / ≤0 value and an over-large one like `1e12` — would bound the
+		// clear and the interrupt at ~0 and make every abort a fake `"timeout"`:
+		// hence the fallback to the shared default AND the cap at the largest delay
+		// a timer actually honours.
+		const t = opts?.timeoutMs;
+		const bound = Math.min(
+			Number.isFinite(t) && (t as number) > 0
+				? (t as number)
+				: DEFAULT_ABORT_TIMEOUT_MS,
+			MAX_ABORT_TIMER_DELAY_MS,
+		);
+		if (!child.turnActive) {
+			return { status: "no-turn", cleared: { steering: 0, followUp: 0 } };
+		}
+		let cleared = { steering: 0, followUp: 0 };
+		if (opts?.clearQueued !== false) {
+			try {
+				cleared = await this.raceClearTimeout(
+					Promise.resolve().then(() => this.requireClient(child).clearQueue?.()),
+					bound,
+				);
+			} catch {
+				// Best effort: a clear that cannot answer must not swallow the interrupt.
+				// `cleared` already holds the zeros, since a throw means the assignment
+				// above never happened.
+			}
+		}
+		const work = (async (): Promise<"interrupted"> => {
+			await this.requireClient(child).abort();
+			return "interrupted";
+		})();
+		return { status: await this.raceAbortTimeout(work, bound), cleared };
+	}
+
+	/**
+	 * #314 D4: the pre-abort clear is raced against the same bound as the
+	 * interrupt, and a timer win means `{0, 0}` — the clear's counts are "what we
+	 * could learn", never a promise that the queue is empty.
+	 *
+	 * This bound is the whole point of the fix: on the RPC backend the clear goes
+	 * through `RpcClient.send()`, whose only bound is a hard-coded 30 s request
+	 * timeout, so awaiting it would delay the interrupt itself by up to 30 s —
+	 * exactly on the unresponsive child this path exists for.
+	 *
+	 * Timer cleared on the settling path, and the work's own rejection observed,
+	 * for the same reasons as `raceAbortTimeout` below.
+	 */
+	private raceClearTimeout(
+		work: Promise<unknown>,
+		bound: number,
+	): Promise<{ steering: number; followUp: number }> {
+		work.catch(() => {});
+		let timer: NodeJS.Timeout | undefined;
+		const expiry = new Promise<{ steering: number; followUp: number }>((resolve) => {
+			// NOT unref'd: this timer may be the only thing driving the caller's await.
+			timer = setTimeout(() => resolve({ steering: 0, followUp: 0 }), bound);
+		});
+		return Promise.race([work.then(countClearedQueue), expiry]).finally(() =>
+			clearTimeout(timer),
+		);
+	}
+
+	/**
+	 * #314 D4: `Promise.race([work, timer])`, timer cleared on the settling path.
+	 *
+	 * The losing `work` promise may still reject later (a child that exited while
+	 * the interrupt was pending); that rejection is not the caller's problem once
+	 * the timeout answered, so it is observed here instead of surfacing unhandled.
+	 */
+	private raceAbortTimeout(
+		work: Promise<"interrupted">,
+		bound: number,
+	): Promise<"interrupted" | "timeout"> {
+		work.catch(() => {});
+		let timer: NodeJS.Timeout | undefined;
+		const expiry = new Promise<"timeout">((resolve) => {
+			// NOT unref'd: this timer is usually the only thing driving the caller's
+			// await, and an unref'd one lets the event loop drain before it fires (the
+			// same reason `waitForExit` below keeps its own timer ref'd).
+			timer = setTimeout(() => resolve("timeout"), bound);
+		});
+		return Promise.race([work, expiry]).finally(() => clearTimeout(timer));
 	}
 
 	waitSettled(name: string, timeoutMs = 900_000, signal?: AbortSignal): Promise<SettleResult> {

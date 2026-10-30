@@ -137,7 +137,7 @@ test("playbook says steer queues at a turn boundary and stop is the interrupt (#
 	// asserting it here pins the embedding (no second copy to drift).
 	assert.match(TOOL_DESCRIPTION, /`steer` is a queue, not an interrupt/);
 	assert.match(TOOL_DESCRIPTION, /To actually stop a child, use `stop`/);
-	// Numbering stays contiguous 1..8 and item 8 sits before the unnumbered
+	// Numbering stays contiguous and item 8 sits before the unnumbered
 	// "Utility agents …" paragraph (D7: append, never renumber items 1-7).
 	const item7 = PARENT_PLAYBOOK.indexOf("\n7. ");
 	const item8 = PARENT_PLAYBOOK.indexOf("\n8. ");
@@ -145,5 +145,47 @@ test("playbook says steer queues at a turn boundary and stop is the interrupt (#
 	assert.ok(item7 > 0, "item 7 must exist");
 	assert.ok(item8 > item7, "item 8 must follow item 7");
 	assert.ok(utility > item8, "item 8 must precede the Utility agents paragraph");
-	assert.doesNotMatch(PARENT_PLAYBOOK, /\n9\. /);
+	// #314 replaced the old `doesNotMatch(/\n9\. /)` pin: that assertion existed
+	// to prove the list is CONTIGUOUS, not that it may never grow. Item 9 is the
+	// abort paragraph and it belongs between item 8 and the Utility agents
+	// paragraph — a new item inserted anywhere else would break the numbering.
+	const item9 = PARENT_PLAYBOOK.indexOf("\n9. ");
+	assert.ok(item9 > item8, "item 9 must follow item 8");
+	assert.ok(item9 < utility, "item 9 must precede the Utility agents paragraph");
+	assert.equal(
+		PARENT_PLAYBOOK.indexOf("\n10. "),
+		-1,
+		"the list stops at item 9 — a gap would mean an item was dropped",
+	);
+});
+
+test("playbook draws the abort-vs-stop boundary and names abort where steer cannot land (#314)", () => {
+	// (a) abort keeps the context/session, so the child stays continuable.
+	assert.match(PARENT_PLAYBOOK, /`abort` interrupts the child's current turn and keeps its context and session/);
+	assert.match(PARENT_PLAYBOOK, /the child stays alive and can be continued/);
+	// (b) stop is what tears the process down and throws the context away — the
+	// two must not read like the same action.
+	assert.match(PARENT_PLAYBOOK, /`stop` is the one that tears the process down and throws the context away/);
+	// (c) abort works where steer cannot land: a child stuck inside one long
+	// command (#313 — a steer is a queue that only fires at a turn boundary).
+	assert.match(PARENT_PLAYBOOK, /works on a child stuck inside one long-running command, where `steer` cannot land/);
+	assert.match(PARENT_PLAYBOOK, /#313: a steer only queues at a turn boundary/);
+	// Defaults and the "a timeout is not a failure" rule are spelled out, or a
+	// model reads a timeout receipt as "it died".
+	assert.match(PARENT_PLAYBOOK, /queued steering\/follow-up messages are dropped first/);
+	assert.match(PARENT_PLAYBOOK, /`clearQueued: false` keeps them/);
+	assert.match(PARENT_PLAYBOOK, /A timeout receipt is not a failure/);
+	// TOOL_DESCRIPTION carries the action and the same boundary as one sentence
+	// (it embeds PARENT_PLAYBOOK, so this also pins the embedding).
+	assert.match(TOOL_DESCRIPTION, /stop, abort, diagnose/);
+	assert.match(
+		TOOL_DESCRIPTION,
+		/`abort` stops the child's current turn but keeps its context and session \(child stays alive and continuable; queued messages are dropped first\); `stop` is the one that takes the process down\./,
+	);
+	// The rpc-narrowing guard in the test above covers the whole string; keep the
+	// new sentences backend-neutral too.
+	assert.doesNotMatch(
+		PARENT_PLAYBOOK + TOOL_DESCRIPTION,
+		/headless RPC|via RPC|RPC child|RPC launch/i,
+	);
 });
