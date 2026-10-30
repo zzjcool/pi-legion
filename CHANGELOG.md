@@ -174,13 +174,15 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   and only that one comes back — per call, not per snapshot, because the watch and the tool call
   await the same `job.collectPromise` and a shared record lets the second call overwrite the
   first's answer. And it did not hand the notification route back: the seam sets
-  `consumedByTool` before the claim, every child is watched in production, so the watch passed
-  its gate first (`!consumedByTool && !notified` → skip `onTerminal`) and was already parked in
-  `retire` when the bail arrived — meaning the repair had to re-arm unconditionally, which it
-  now does (the old `!job.watching` guard was dead code on that default path — only an
-  `async: false` inline collect, which registers no watch at all, ever sees it unset) (clear the flag, `watch` again; the generation bump keeps the old watch from
+  `consumedByTool` before the claim, the default async path watches every child, so the watch
+  passed its gate first (`!consumedByTool && !notified` → skip `onTerminal`) and was already
+  parked in `retire` when the bail arrived — meaning the repair had to re-arm unconditionally,
+  which it now does (clear the flag, `watch` again; the generation bump keeps the old watch from
   releasing the job, `notified` keeps the round single, `deliverBatch`'s claim filter is the
-  last net). Measured in that production shape: 0 notices before, 1 after. The one case still
+  last net). The old `!job.watching` guard is therefore dead code wherever it would have
+  mattered: in the default shape somebody is always watching, and an `async: false` inline
+  collect registers no watch at all, so the flag is never unset on the path that needs the
+  re-arm. Measured in that production shape: 0 notices before, 1 after. The one case still
   not recovered is a bail that lands only after the watch has already released the child — there
   the result stays readable through a later `collect` and a copy already held in the run outbox
   still arrives, but a copy sitting in the join window goes with the release. Contract revision:
