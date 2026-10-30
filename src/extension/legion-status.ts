@@ -7,7 +7,7 @@
  */
 
 import { NODE_STATUSES, type LegionNode } from "../legion/nodes.ts";
-import type { ChildActivity } from "../supervisor/types.ts";
+import type { InFlightToolStack } from "../supervisor/types.ts";
 import { formatInFlightToolLine } from "../supervisor/types.ts";
 import { formatTree } from "./legion-tools.ts";
 import {
@@ -18,15 +18,18 @@ import {
 /** Child snapshot the status tool already prints. `now` is supplied by the caller. */
 export type LegionChildStatusFacts = Omit<LiveChildStatusInput, "now"> & {
 	/**
-	 * Tool call in flight right now (#315). Read from the supervisor, never
-	 * persisted: it describes this process's live child, so a rebuilt record
-	 * (another session's child) has none and none is invented.
+	 * The tool calls in flight right now (#315, #331), innermost last. Read from
+	 * the supervisor, never persisted: it describes this process's live child, so
+	 * a rebuilt record (another session's child) has none and none is invented.
 	 */
-	activity?: ChildActivity;
+	inFlightTools?: InFlightToolStack;
 };
 
 /**
  * Put the live-activity line at the TOP of one rendered child block (#315).
+ *
+ * The fact is the whole stack (#331) so the line can name nesting and parallel
+ * siblings; an absent or empty stack renders the block unchanged.
  *
  * A lead line, not a footnote: `working · bash 00:07:31` is the answer to "what
  * is it doing, and for how long", and the block below it already leads its own
@@ -34,16 +37,17 @@ export type LegionChildStatusFacts = Omit<LiveChildStatusInput, "now"> & {
  * block's internal line order, so this keeps working if
  * `renderLiveChildStatus` grows or reorders lines.
  *
- * `activity === undefined` renders the block unchanged: no fact, no line. This
- * is display only — it never decides liveness and never stops anything.
+ * `undefined` (or an empty stack) renders the block unchanged: no fact, no
+ * line. This is display only — it never decides liveness and never stops
+ * anything.
  */
 export function withInFlightToolLine(
 	block: string,
-	activity: ChildActivity | undefined,
+	stack: InFlightToolStack | undefined,
 	now: number,
 ): string {
-	if (activity === undefined) return block;
-	return `${formatInFlightToolLine(activity, now)}\n${block}`;
+	if (stack === undefined || stack.length === 0) return block;
+	return `${formatInFlightToolLine(stack, now)}\n${block}`;
 }
 
 export interface LegionStatusJob {
@@ -102,12 +106,13 @@ function liveJobForNode(node: LegionNode, jobs: readonly LegionStatusJob[]): Leg
 }
 
 function renderFacts(facts: LegionChildStatusFacts, now: number | undefined): string {
-	// `activity` is display-only and lives outside `renderLiveChildStatus`, so it
-	// is split off before the snapshot is rendered and prepended afterwards.
-	const { activity, ...snapshot } = facts;
+	// The in-flight stack is display-only and lives outside
+	// `renderLiveChildStatus`, so it is split off before the snapshot is rendered
+	// and prepended afterwards.
+	const { inFlightTools, ...snapshot } = facts;
 	return withInFlightToolLine(
 		renderLiveChildStatus(withNow(snapshot, now)),
-		activity,
+		inFlightTools,
 		now ?? Date.now(),
 	);
 }

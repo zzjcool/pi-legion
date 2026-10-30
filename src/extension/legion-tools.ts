@@ -345,6 +345,7 @@ export class LegionPostman {
 							reason: MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER,
 						});
 						this.emitMail(message.id, message.fromNode, "mail_bounced");
+						// …and this `return` is why a swallowed send never reaches the unblock below (#323 3).
 						return;
 					}
 					this.emitProcess("node_steered", current.id, { name: current.name, messageId: message.id });

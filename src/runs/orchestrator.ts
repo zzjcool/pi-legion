@@ -411,7 +411,11 @@ function canFallbackStart(error: unknown): boolean {
 	return error instanceof SubagentError &&
 		error.code !== ErrorCodes.NOT_FOUND &&
 		error.code !== ErrorCodes.BUDGET_EXCEEDED &&
-		error.code !== ErrorCodes.NAME_TAKEN;
+		error.code !== ErrorCodes.NAME_TAKEN &&
+		// #323 5: the launch prompt was swallowed by an input handler. Nothing about
+		// the model caused that, so the next candidate would be spawned only to be
+		// rolled back the same way — a deterministic failure must stop the chain.
+		error.code !== ErrorCodes.PROMPT_INTERCEPTED;
 }
 
 // pi-lens-ignore: large-class
@@ -2060,13 +2064,17 @@ export class Orchestrator {
 	 * by an input handler (the child never saw it), so this value is returned, not
 	 * swallowed. Every side effect of a steer (process event, unblocking) stays
 	 * exactly as it was.
+	 *
+	 * #323 3: `intercepted` is the one outcome that must NOT unblock. Clearing
+	 * `blocked` says "it can act again", and a child that never saw the text is
+	 * still waiting — only a landed send may make that claim.
 	 */
 	async steer(name: string, text: string): Promise<SteerDisposition> {
 		const child = this.requireChild(name);
 		this.refuseQueuedControl(name);
 		const disposition = await this.supervisor.steer(name, text);
 		this.emitProcess("node_steered", child.nodeId ?? name, { name, text });
-		this.clearBlocked(child);
+		if (disposition !== "intercepted") this.clearBlocked(child);
 		return disposition;
 	}
 

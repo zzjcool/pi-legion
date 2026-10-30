@@ -138,6 +138,26 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   The `?fresh=1` half of the #317 case re-evaluated the wrong module (ESM drops the query when resolving a
   relative import), so it now re-evaluates `extension-inheritance.ts` and asserts that a second instance
   reads the shared discovery holder.
+- **The `/legion` track view now paints its own page background, so the detail modal no longer sits
+  on a black vertical stripe (#308).** Opening a node's context viewer put a pure-black band between
+  the frame's right edge and the terminal's right edge (the left side looked fine). The frame was not
+  overflowing — `paintModalFrame` emits exactly the rect width every row. The base row was: the canvas
+  pre-fills `W×H` spaces and `renderRow` only styles a run when it has a color *and* non-blank text, so
+  a row ends in bare spaces with no SGR at all. pi-tui's compositor inherits the styling of the area
+  *beside* an overlay from a one-shot snapshot of the active SGR at the first grapheme after the rect
+  (`extractSegments`), and an empty snapshot means the terminal's default background. Every `/legion`
+  row is now wrapped in `theme.bg?.(LEGION_PAGE_BG, line)` at the view's single render exit
+  (`paintPageFloor` in `src/tui/viz/view.ts`), so the inherited state is the page floor. `theme.bg` is
+  optional in `VizTheme` and the call is optional, so a theme without background tokens (every unit-test
+  fake) still renders the exact bytes it did before, and the row width is unchanged (the wrap is
+  zero-width escapes only). The token is `toolPendingBg` — the only one of the seven `ThemeBg` keys that
+  is a neutral surface rather than a hued panel (blue / violet / yellow / green / red for the rest).
+  **Not fixed in the `system` theme:** with no terminal color report that theme assigns `""` to all
+  seven `ThemeBg` keys, so each renders as `\x1b[49m` (terminal default) and the band stays black —
+  upstream exposes no renderable page-background token. The new regression test keeps ANSI (the #193
+  `wipedRows` criterion strips escapes, which is why it never caught this) and compares the background
+  SGR of both gutters with the base's own: no fix ⇒ every gutter snapshot is `""`. Contract:
+  `docs/contracts/legion-page-floor-v1.md`.
 
 - **The five-value mailbox delivery landed against an adversarial review: four majors and six minors
   (#338, follow-up to #322/#333).** The important ones were silent: mail addressed to **root** could never
@@ -175,6 +195,37 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   consumption that happened is a fact about the past. No new event type: the verdict is `mail_bounced` with
   `reason: "obsolete_after_phase_change"`.
 
+- **The five `steer`-receipt residuals (#323).** The three honest dispositions from #313 are now
+  wired through the edges that still flattened them. The in-process backend can never answer
+  `queued` vs `accepted` — the SDK's `AgentSession.prompt()` returns `void` — so the supervisor seam
+  gained an explicit capability (`capabilities.promptDisposition`: in-process `false`, rpc `true`,
+  and the routing facade reports the intersection, `false`) instead of inventing a disposition that
+  backend cannot observe; the v2 contract now states that `accepted` on in-process means only "the
+  call did not throw". An intercepted mailbox `action-needed` steer no longer flips the node from
+  `blocked` to `running`: #338 already makes that send `bounced` and returns before the unblock, and
+  the orchestrator's own `clearBlocked` path now refuses it for the same reason — nothing landed, so
+  the child is still waiting. `abandonTurn` keeps the same `retiring` guard `updateTurnState` has, so
+  a concurrent rollback can no longer rewrite a retiring child as `idle`. And an intercepted *launch*
+  prompt now fails with the new deterministic code `PROMPT_INTERCEPTED`, which `canFallbackStart`
+  refuses — a swallowed prompt used to re-spawn one process per fallback model and roll each one back
+  right away. The mailbox `prompt` branch keeps no disposition by construction; its comment and the
+  contract now say why. Contract: `docs/legion-v2-contract.md` §3.1.
+- **The in-flight tool fact behind `status` is a stack, so nested and parallel calls stop disappearing
+  (#331).** `working · bash 00:07:31` used to read a single slot: `tool_execution_start` overwrote it
+  and the matching `tool_execution_end` cleared it. Two shapes therefore made the line vanish while a
+  tool was demonstrably still running. A nested call (`codemode` → `bash`) pushed the inner frame into
+  the slot, so the inner end wiped the outer call — `status` showed nothing while `codemode` ran on. A
+  parallel batch kept only the newest call, so when that one finished first the still-running sibling
+  became invisible. Each `ChildRecord` now keeps a LIFO stack (`ChildActivity[]`): a start pushes, an
+  end removes **only** the frame it names (by `toolCallId`), `agent_settled` empties it, and the line
+  reads the top (innermost) frame for the tool name and the clock. When the stack is deeper than one,
+  the line names the context instead of hiding it — ` (inside codemode ×2)` for nesting (from the
+  event stream's own `parentToolCallId`) and ` (+N more)` for parallel siblings, with the weaker
+  `(+N more)` chosen when parent ids cannot tell the two apart. An empty stack renders no line, exactly
+  as before. Display only: `liveness()`, heartbeats, the orphan scan and every kill/abort/retire path
+  are untouched. The seam gained an optional `inFlightToolStack` next to `inFlightTool`, so a doubled
+  supervisor that only answers the single frame keeps working. Contract revision:
+  `docs/contracts/stall-visibility-v1.md` (D1/D2/D4/D7).
 - **One name, one node: `status` / `collect` / `stop` / `continue` now resolve a child name the same way.**
   In a single root session, `status(name)` and `collect(name)` called ten seconds apart answered with two
   different nodes for the same `worker-0`: `status` went through `pickChildByName`, which walks **every**

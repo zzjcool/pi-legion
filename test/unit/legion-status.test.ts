@@ -119,7 +119,7 @@ test("#315 legion status leads a child block with the tool it is inside", async 
 			kind: "pi",
 			sessionFile,
 			alive: true,
-			activity: { tool: "bash", startedAt: now - 12_000 },
+			inFlightTools: [{ tool: "bash", startedAt: now - 12_000 }],
 		};
 		const report = renderLegionStatus({
 			query: "worker-0",
@@ -138,7 +138,7 @@ test("#315 legion status leads a child block with the tool it is inside", async 
 
 		// No activity fact (a rebuilt record from another session): no line, and
 		// the block is exactly what it was before #315.
-		const { activity: _activity, ...withoutActivity } = base;
+		const { inFlightTools: _inFlightTools, ...withoutActivity } = base;
 		const plain = renderLegionStatus({
 			query: "worker-0",
 			nodes: [],

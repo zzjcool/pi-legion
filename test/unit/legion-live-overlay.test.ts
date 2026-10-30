@@ -1242,6 +1242,50 @@ test("the open modal leaves the host underlay visible (real pi-tui composite)", 
 	}
 });
 
+test("the modal's right gutter keeps the /legion page background (real pi-tui composite, #308)", async () => {
+	// The bug: with the /legion view as the base, the band between the frame's
+	// right edge and the terminal's right edge rendered as the terminal's default
+	// background — a black vertical stripe (#308). `wipedRows` cannot catch it (it
+	// strips escapes, so the band's *text* was always base's); what was missing was
+	// the *style*: pi-tui's compositor snapshots the SGR state of the base row at
+	// the first cell after the overlay rect, and a /legion row ended in spaces
+	// carrying no SGR at all. So this assertion keeps the escapes and compares the
+	// background SGR in force at the first cell of each gutter, before vs after the
+	// modal is composited on top.
+	const { assertOverlayGutterInheritsBase, PAGE_FLOOR_ANSI } = await import("../helpers/modal-composite.ts");
+	for (const [rows, cols] of [[24, 80], [40, 120]] as const) {
+		const probe = assertOverlayGutterInheritsBase({ rows, cols });
+		const tag = `${cols}x${rows}`;
+		assert.ok(
+			probe.bounds.col > 0 && probe.bounds.col + probe.bounds.width < cols,
+			`${tag}: the 75% frame must leave a gutter on BOTH sides (rect ${JSON.stringify(probe.bounds)})`,
+		);
+		assert.ok(probe.gutters.length > 0, `${tag}: the frame must cover at least one row`);
+		for (const gutter of probe.gutters) {
+			const at = `${tag} row ${gutter.row}`;
+			// The frame never paints outside its rect: gutter text is base's.
+			assert.equal(gutter.frameLeft, gutter.baseLeft, `${at}: left gutter text must stay the base's`);
+			assert.equal(gutter.frameRight, gutter.baseRight, `${at}: right gutter text must stay the base's`);
+			// The floor covers the whole row, edge to edge.
+			assert.equal(gutter.rowBg, PAGE_FLOOR_ANSI, `${at}: the /legion page must paint a floor from column 0`);
+			assert.equal(gutter.baseLeftBg, PAGE_FLOOR_ANSI, `${at}: base left gutter must carry the floor`);
+			assert.equal(gutter.baseRightBg, PAGE_FLOOR_ANSI, `${at}: base right gutter must carry the floor`);
+			// …and the composited frame keeps exactly that style on both sides.
+			assert.equal(
+				gutter.frameLeftBg,
+				gutter.baseLeftBg,
+				`${at}: left gutter lost the base background (${JSON.stringify(gutter.frameLeftBg)} vs ${JSON.stringify(gutter.baseLeftBg)})`,
+			);
+			assert.equal(
+				gutter.frameRightBg,
+				gutter.baseRightBg,
+				`${at}: right gutter fell back to the terminal default background ` +
+					`(${JSON.stringify(gutter.frameRightBg)} vs base ${JSON.stringify(gutter.baseRightBg)})`,
+			);
+		}
+	}
+});
+
 test("the modal frame survives a terminal resize (geometry is re-derived)", async () => {
 	const { assertUnderlayVisibleAfterResize } = await import("../helpers/modal-composite.ts");
 	for (const [from, to] of [
