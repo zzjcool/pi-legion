@@ -128,9 +128,17 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   scope — instead of acting on it), `status` still shows it but leads with
   `resolved: <name> is not a direct child of this session — showing the record from run <runId>`, and two
   or more same-named candidates are an ambiguity every action refuses rather than guesses. `subagent`
-  gained an optional `runId` to name the run a call is scoped to. A session with no run of its own keeps
-  reaching a foreign/restarted run's persisted record (#209-3), which is where `pickChildByName` was still
-  the right answer (#312).
+  gained an optional `runId` to name the run a call is scoped to. The scope now travels all the way to the
+  **execution point**, which is where the old resolution leaked back in: `stop` hands the run it resolved the
+  name in to the retire step, which reads THAT record instead of re-resolving the name across runs — so the
+  child it reports and the child it retires are the same one, and a live job carrying the name in another
+  run is refused (with the same candidate list) instead of retired. `collect` only consumes the runtime
+  snapshot whose `runId` matches the resolved node, the `status` block's `owner:` line is read from the
+  resolved node's own run dir (another run's dead owner marker used to render `owner: dead (pid gone)` — and
+  even `state=failed` — under this session's record), and the `resolved:` annotation is emitted only for a
+  genuinely foreign (`elsewhere`) record, not for a #270 cross-store hit that is this session's own child. A
+  session with no run of its own keeps reaching a foreign/restarted run's persisted record (#209-3), which is
+  where `pickChildByName` was still the right answer (#312).
 
 - **A bare JSON verdict on the last line is no longer reported as `no machine-readable verdict`.**
   `child-guard` injects “End with machine-readable JSON on its own” and `docs/design.md` says
