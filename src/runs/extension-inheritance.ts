@@ -287,13 +287,63 @@ export function parsePiList(output: string): string[] {
 }
 
 /**
+ * How much of `pi list`'s stderr the one-shot warning may echo.
+ *
+ * The warning has to be actionable (#317: "could not ask" used to look exactly
+ * like "nothing installed"), but it is also a single log line that must not turn
+ * a stack trace into the operator's terminal.
+ */
+export const DISCOVERY_STDERR_LIMIT = 200;
+
+/** Best-effort text of an unknown error field: never throws. */
+function asText(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (value === undefined || value === null) return "";
+	try {
+		return String(value);
+	} catch {
+		return "";
+	}
+}
+
+/**
+ * One bounded line explaining why a probe failed.
+ *
+ * `pi list` can fail with no stderr at all (a killed child, a bare `exit 4`), so
+ * the summary degrades through stderr → exit code → `error.message`. The code
+ * sits BEFORE the message on purpose: Node's `execFile` always fills `message`
+ * with `Command failed: pi list`, so a message-first order would make the exit
+ * code branch unreachable — and `pi list exited 4` says more than the generic
+ * wrapper text. A non-numeric code (`ENOENT`) still falls through to the message
+ * (`spawn pi ENOENT`), which is the actionable one there. It must never throw: a
+ * warning is not allowed to fail a launch (#317).
+ */
+function describeProbeFailure(error: unknown): string {
+	const err = error as { stderr?: unknown; message?: unknown; code?: unknown } | undefined;
+	const stderr = asText(err?.stderr).replace(/\s+/g, " ").trim();
+	if (stderr) {
+		return stderr.length > DISCOVERY_STDERR_LIMIT ? `${stderr.slice(0, DISCOVERY_STDERR_LIMIT)}…` : stderr;
+	}
+	if (typeof err?.code === "number") return `pi list exited ${err.code} with no stderr`;
+	const message = asText(err?.message).replace(/\s+/g, " ").trim();
+	if (message) {
+		return message.length > DISCOVERY_STDERR_LIMIT ? `${message.slice(0, DISCOVERY_STDERR_LIMIT)}…` : message;
+	}
+	return "pi list failed with no output";
+}
+
+/** One probe's outcome: resolved entries, or the reason the probe could not answer. */
+type DiscoveryProbe = { ok: true; entries: string[] } | { ok: false; reason: string };
+
+/**
  * Run one `pi list` and resolve it to extension entry paths.
  *
- * Returns `undefined` when discovery itself failed (no `pi` on PATH, non-zero
- * exit, timeout) so the caller can distinguish "nothing installed" from "could
- * not ask" — only the latter must stay retryable.
+ * Returns a failure (with a short reason) when discovery itself failed — no `pi`
+ * on PATH, non-zero exit, timeout — so the caller can both distinguish "nothing
+ * installed" from "could not ask" and say which one happened (#317). Only the
+ * latter stays retryable.
  */
-async function resolveHostExtensions(env: NodeJS.ProcessEnv): Promise<string[] | undefined> {
+async function resolveHostExtensions(env: NodeJS.ProcessEnv): Promise<DiscoveryProbe> {
 	let dirs: string[];
 	try {
 		const { stdout } = await execFileAsync("pi", ["list"], {
@@ -302,17 +352,20 @@ async function resolveHostExtensions(env: NodeJS.ProcessEnv): Promise<string[] |
 			maxBuffer: 4 * 1024 * 1024,
 		});
 		dirs = parsePiList(stdout);
-	} catch {
-		return undefined;
+	} catch (error) {
+		return { ok: false, reason: describeProbeFailure(error) };
 	}
 	const entries = dirs.flatMap((dir) => resolveExtensionEntries(dir));
 	const seen = new Set<string>();
-	return entries.filter((entry) => {
-		const key = path.resolve(entry);
-		if (seen.has(key)) return false;
-		seen.add(key);
-		return true;
-	});
+	return {
+		ok: true,
+		entries: entries.filter((entry) => {
+			const key = path.resolve(entry);
+			if (seen.has(key)) return false;
+			seen.add(key);
+			return true;
+		}),
+	};
 }
 
 /**
@@ -333,6 +386,40 @@ async function resolveHostExtensions(env: NodeJS.ProcessEnv): Promise<string[] |
 export const FAILURE_TTL_MS = 5_000;
 
 /**
+ * Record a failed probe (the `failedAt` backoff stamp) and warn ONCE.
+ *
+ * The stamp doubles as the "already told the operator" bit (#317): while it is
+ * set, a later failing probe updates the time but stays quiet, so a host that
+ * will never have `pi list` working cannot flood the log once per spawn.
+ *
+ * Scope of "once": one warning per PROCESS. A successful probe caches through
+ * `discovered`, and `ensureHostExtensions` short-circuits on that forever — so
+ * once discovery has worked there is no further probe to fail, and the stamp
+ * being deleted on success cannot produce a second warning in production. The
+ * only way back is `resetExtensionDiscoveryCache`, which is a test seam and also
+ * clears the stamp, i.e. a genuinely fresh start. No extra state is needed for
+ * this bound (the frozen backoff already models exactly this window).
+ *
+ * Never throws: the warning itself must not be able to fail a launch, and an
+ * empty `pi list` stderr must not turn into a TypeError here.
+ */
+function noteDiscoveryFailure(reason: string): void {
+	const alreadyReported = store.failedAt !== undefined;
+	store.failedAt = Date.now();
+	if (alreadyReported) return;
+	const retryS = Math.round(FAILURE_TTL_MS / 1000);
+	try {
+		console.error(
+			`[pi-legion] host extension discovery failed (pi list): ${reason}. ` +
+				`Children get 0 inherited extensions until a probe succeeds (next attempt after ${retryS}s); ` +
+				"run `/legion doctor` (Extensions) or set PI_LEGION_CHILD_EXTENSIONS=<paths> to load them explicitly.",
+		);
+	} catch {
+		// A log line that cannot be written must not break the spawn either.
+	}
+}
+
+/**
  * Discover the host's extensions once per process and return them.
  *
  * Idempotent and concurrency-safe: the first caller runs `pi list`, concurrent
@@ -350,6 +437,10 @@ export const FAILURE_TTL_MS = 5_000;
  * that keeps the three warm-up points idempotent (R2-b). Once the stamp ages out,
  * the next call probes again, so a failure is never a permanent off switch (F23).
  *
+ * #317 adds visibility only: the failure is now also reported once (see
+ * `noteDiscoveryFailure`) and is readable through `hostExtensionDiscoveryState`.
+ * Neither the never-reject contract nor the backoff semantics changed.
+ *
  * `env` is handed to `execFile` (a caller can point discovery at a specific
  * PATH); the cache itself is process-wide and does not vary by env.
  */
@@ -359,21 +450,21 @@ export async function ensureHostExtensions(env: NodeJS.ProcessEnv = process.env)
 	if (!store.inFlight) {
 		store.inFlight = (async () => {
 			try {
-				const resolved = await resolveHostExtensions(env);
-				if (!resolved) {
-					store.failedAt = Date.now();
+				const probe = await resolveHostExtensions(env);
+				if (!probe.ok) {
+					noteDiscoveryFailure(probe.reason);
 					return [];
 				}
-				store.discovered = resolved;
+				store.discovered = probe.entries;
 				// A success supersedes any earlier failure, so the backoff stamp must not
 				// outlive it — otherwise a later re-probe (after a reset) would inherit an
 				// unrelated window.
 				delete store.failedAt;
-				return resolved;
-			} catch {
+				return probe.entries;
+			} catch (error) {
 				// Belt and braces: the contract is "never rejects", and a launch must
 				// never fail because the host could not be asked about packages.
-				store.failedAt = Date.now();
+				noteDiscoveryFailure(describeProbeFailure(error));
 				return [];
 			} finally {
 				// Success caches through `discovered`; failure leaves the `failedAt`
@@ -398,6 +489,41 @@ export const discoverHostExtensions = ensureHostExtensions;
 /** Synchronous read of whatever discovery has already produced. */
 export function discoveredHostExtensions(): string[] | undefined {
 	return store.discovered;
+}
+
+/**
+ * What this process knows about host extension discovery, read-only (#317).
+ *
+ * Exists because `discoveredHostExtensions() ?? []` collapses two different
+ * situations into one empty array: "the host really ships no package extensions"
+ * and "we could not ask" (and a third: "we never asked"). A caller that wants to
+ * tell them apart — `/legion doctor` does — reads this instead of guessing.
+ *
+ * Pure in-memory read: no probe, no subprocess. That is deliberate, so doctor
+ * can report `never` without silently kicking off a 0.3–0.9 s `pi list`.
+ */
+export interface HostExtensionDiscoveryState {
+	/** `ok` = a probe succeeded (count is the resolved set, possibly 0). */
+	status: "ok" | "failed" | "unknown";
+	/** Entries the last successful probe resolved; 0 unless `status` is `ok`. */
+	count: number;
+	/** `Date.now()` of the last FAILED probe (only set when `status` is `failed`). */
+	at?: number;
+}
+
+export type HostExtensionDiscoveryStatus = HostExtensionDiscoveryState["status"];
+
+/**
+ * Read the discovery state without changing it.
+ *
+ * A success wins over a stale stamp on purpose: `ensureHostExtensions` deletes
+ * `failedAt` on success, so both being set only means a reset raced a re-probe —
+ * the cache is the newer truth either way.
+ */
+export function hostExtensionDiscoveryState(): HostExtensionDiscoveryState {
+	if (store.discovered !== undefined) return { status: "ok", count: store.discovered.length };
+	if (store.failedAt !== undefined) return { status: "failed", count: 0, at: store.failedAt };
+	return { status: "unknown", count: 0 };
 }
 
 /**

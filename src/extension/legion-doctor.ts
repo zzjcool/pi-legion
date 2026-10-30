@@ -26,6 +26,10 @@ import {
 } from "../runs/role-tool-gates.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import {
+	hostExtensionDiscoveryState,
+	type HostExtensionDiscoveryState,
+} from "../runs/extension-inheritance.ts";
+import {
 	CHILD_MAX_OLD_SPACE_ENV,
 	CHILD_RESERVE_ENV,
 	CHILD_SEMI_SPACE_ENV,
@@ -427,6 +431,29 @@ function extensionsForRole(agent: AgentConfig, env: NodeJS.ProcessEnv, _extras: 
 	return collectChildExtensions(agent, env);
 }
 
+/**
+ * One-line answer to "is inheritance actually wired?" (#317).
+ *
+ * The role line above only says `(all host-discovered extensions)`, which reads
+ * identically whether discovery worked, failed, or never ran. This turns the
+ * three cases into text: `ok`, `failed <n>s ago` (with the age, because the
+ * backoff is 5 s and a stale stamp is a different diagnosis than a live one),
+ * and `never` (no probe in this process — the common shape for a doctor run
+ * before the first spawn).
+ */
+function formatDiscoveryProbe(state: HostExtensionDiscoveryState, now = Date.now()): string {
+	switch (state.status) {
+		case "ok":
+			return "ok";
+		case "failed": {
+			const ageS = Math.max(0, Math.floor((now - (state.at ?? now)) / 1000));
+			return `failed ${ageS}s ago`;
+		}
+		default:
+			return "never";
+	}
+}
+
 function scanOrphanTemps(storeRoot: string): { total: number; orphanDead: number; live: number; unknown: number; samples: string[] } {
 	const runsRoot = path.join(storeRoot, "runs");
 	let total = 0;
@@ -790,6 +817,12 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		push("## Extensions");
 		push(`- spawnMode (sample/default): ${spawnMode}`);
 		push(`- inheritExtensions (env/role default): ${inheritGlobal ? "yes (loads all host extensions)" : "no"}`);
+		// #317: `(all host-discovered extensions)` alone cannot say whether inheritance
+		// is wired — failed discovery, an empty host and "never probed" all looked the
+		// same. The count comes from the last probe in THIS process; doctor never
+		// probes on its own, so `never` is honest and cheap.
+		const discovery = hostExtensionDiscoveryState();
+		push(`- discovered host extensions: ${discovery.count} (last probe: ${formatDiscoveryProbe(discovery)})`);
 		if (isInprocess) {
 			push("- child argv --no-extensions: n/a (inprocess has no child argv)");
 		} else {
