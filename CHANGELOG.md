@@ -26,9 +26,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   stay off-limits because they belong to the parent or supervisor), and may pass
   `supersedes: [<failed child>]` to name which failures a settled sibling has taken over — an
   extra source unioned into the existing `reworkCount > 0` / `updatedAt < phaseSince` derivation,
-  never a replacement for it, with a `node_handled` audit event per handled id. The refusal text
-  for the deadlock now names both of those calls instead of two actions that were unreachable in
-  the current code. Contract: `docs/contracts/partial-failure-exit-v1.md` (#309).
+  never a replacement for it, with a `node_handled` audit event per handled id. A declared failure
+  still has to be a declared exit: the tool only hands the state machine that terminal reason when
+  the team's effective (normalized) machine offers a `failed` edge out of the current phase that
+  this node may take, so a card that reserves `failed` to another actor — or declares the phase but
+  omits the edge — keeps its veto, and the persisted reason is capped like `note`/`evidence`. The
+  refusal text for the deadlock now names both of those calls instead of two actions that were
+  unreachable in the current code. Contract: `docs/contracts/partial-failure-exit-v1.md` (#309).
 
 - **`status` now says what a live child is doing and for how long — `working · bash 00:07:31` —
   and marks a single tool that has run unchanged for five minutes.** "The process is alive but has

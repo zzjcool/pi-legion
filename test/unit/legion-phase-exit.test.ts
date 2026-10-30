@@ -181,6 +181,19 @@ test("#309 D2: the node_handled audit carries the trimmed note as its reason", a
 			"replacement took the work over",
 		);
 	});
+	// The audit reason is persisted like every other free text, so it is capped at
+	// 2_000 chars: deleting that `.slice` must turn this red.
+	await withFixture(async (db, cwd) => {
+		seedPartialFailure(db);
+		const result = await request(db, cwd, "reviewing", {
+			supersedes: ["worker"],
+			note: "n".repeat(2_500),
+		});
+		assert.equal(result.ok, true);
+		const reason = (eventsOfType(db, "node_handled")[0]!.data as Record<string, unknown>).reason;
+		assert.equal(typeof reason, "string");
+		assert.equal((reason as string).length, 2_000);
+	});
 });
 
 test("#309 D2: supersedes refuses a settled child and names the entry", async () => {
@@ -348,6 +361,11 @@ function seedTwoFailed(db: Db): void {
  * every variant, so `validatePhaseMachine` is clean either way.
  */
 function machineWithFailedEdge(failedEdge?: { actorRole?: string }): PhaseMachine {
+	return machineWithFailedEdges(failedEdge === undefined ? [] : [failedEdge]);
+}
+
+/** The same machine, with `implementing`'s `failed` edges spelled out in ORDER. */
+function machineWithFailedEdges(failedEdges: Array<{ actorRole?: string }>): PhaseMachine {
 	return {
 		start: "implementing",
 		maxRework: 2,
@@ -356,7 +374,7 @@ function machineWithFailedEdge(failedEdge?: { actorRole?: string }): PhaseMachin
 				id: "implementing",
 				next: [
 					{ to: "reviewing" },
-					...(failedEdge === undefined ? [] : [{ to: "failed", ...failedEdge }]),
+					...failedEdges.map((edge) => ({ to: "failed", ...edge })),
 					{ to: "aborted" },
 				],
 			},
@@ -513,6 +531,81 @@ test("#309 a failed edge reserved to another actor refuses to:'failed'", async (
 test("#309 a plain failed edge on a declared machine still permits a parent decision", async () => {
 	// The control for the two refusals above: same machine, no `actorRole`.
 	const machine = machineWithFailedEdge({});
+	assert.deepEqual(validatePhaseMachine(machine), []);
+	await withFixture(async (db, cwd) => {
+		seedPartialFailure(db);
+		const result = await request(db, cwd, "failed", { reason: "worker died", machine });
+		assert.equal(result.ok, true);
+		assert.equal(getNode(db, TEAM_ID)?.phase, "failed");
+		const data = eventsOfType(db, "phase_change")[0]!.data as Record<string, unknown>;
+		assert.equal(data.terminalReason, "parent_decision");
+		assert.equal(data.reason, "worker died");
+	});
+});
+
+test("#309 a failed edge reserved to THIS team's own role permits a parent decision", async () => {
+	// The POSITIVE half of `actorRole`: the reserved-`reviewer` test pins the refusal,
+	// this pins the acceptance. Comparing `actorRole` against anything other than
+	// `self.role` (or dropping the comparison) must turn exactly this test red.
+	const machine = machineWithFailedEdge({ actorRole: "centurion" });
+	assert.deepEqual(validatePhaseMachine(machine), []);
+	await withFixture(async (db, cwd) => {
+		seedPartialFailure(db);
+		const result = await request(db, cwd, "failed", { reason: "worker died", machine });
+		assert.equal(result.ok, true);
+		assert.equal(getNode(db, TEAM_ID)?.phase, "failed");
+		const data = eventsOfType(db, "phase_change")[0]!.data as Record<string, unknown>;
+		assert.equal(data.terminalReason, "parent_decision");
+	});
+});
+
+test("#309 the failed edge is selected by eligibility, not by list order", async () => {
+	// Two `failed` edges out of the current phase, one of them reserved to another
+	// actor. Picking the edge by `to` first and testing `actorRole` afterwards made
+	// the verdict depend on which entry came first; the role test belongs inside the
+	// lookup, so BOTH orders accept. The refused side of the same distinction (a
+	// reservation with no plain edge to fall back on) is the `actorRole:"reviewer"`
+	// test above.
+	const reservedFirst = machineWithFailedEdges([{ actorRole: "reviewer" }, {}]);
+	const plainFirst = machineWithFailedEdges([{}, { actorRole: "reviewer" }]);
+	const reservedOnly = machineWithFailedEdges([{ actorRole: "reviewer" }]);
+	assert.deepEqual(validatePhaseMachine(reservedFirst), []);
+	assert.deepEqual(validatePhaseMachine(plainFirst), []);
+	assert.deepEqual(validatePhaseMachine(reservedOnly), []);
+	// A reservation with nothing eligible to fall back on still binds...
+	await withFixture(async (db, cwd) => {
+		seedPartialFailure(db);
+		const result = await request(db, cwd, "failed", { reason: "worker died", machine: reservedOnly });
+		assert.equal(result.ok, false);
+		assert.equal(result.code, "INVALID_PARAMS");
+		assert.equal(getNode(db, TEAM_ID)?.phase, "implementing");
+	});
+	// ...while an eligible `failed` edge anywhere in the list wins, in either order.
+	for (const [label, machine] of [["reserved first", reservedFirst], ["plain first", plainFirst]] as const) {
+		await withFixture(async (db, cwd) => {
+			seedPartialFailure(db);
+			const result = await request(db, cwd, "failed", { reason: "worker died", machine });
+			assert.equal(result.ok, true, `${label}: the plain failed edge must be found — ${result.message}`);
+			assert.equal(getNode(db, TEAM_ID)?.phase, "failed");
+			const data = eventsOfType(db, "phase_change")[0]!.data as Record<string, unknown>;
+			assert.equal(data.terminalReason, "parent_decision");
+		});
+	}
+});
+
+test("#309 a machine that OMITS the failed phase may still declare failure (injected edge)", async () => {
+	// The injected-edge case, kept on purpose: this card never mentions `failed`,
+	// `done` or `aborted`, so `normalizePhaseMachine` supplies them. The guard reads
+	// that same normalized view — exactly what `evaluatePhaseTransition` does — so
+	// omitting the phase cannot leave the team stranded. Dropping the guard's
+	// `normalizePhaseMachine(...)` call turns this red.
+	const machine: PhaseMachine = {
+		start: "implementing",
+		phases: [
+			{ id: "implementing", next: [{ to: "reviewing" }] },
+			{ id: "reviewing", next: [{ to: "implementing" }] },
+		],
+	};
 	assert.deepEqual(validatePhaseMachine(machine), []);
 	await withFixture(async (db, cwd) => {
 		seedPartialFailure(db);

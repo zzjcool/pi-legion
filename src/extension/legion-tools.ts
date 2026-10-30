@@ -713,20 +713,29 @@ export async function requestLegionPhase(
 	// `evaluateDeclaredFailure` for `terminalReason: "parent_decision"` BEFORE the
 	// edge lookup ever runs (frozen semantics this change must not move). So the
 	// tool must only hand it that reason when the team's own machine actually
-	// declares a `failed` edge out of the CURRENT phase that THIS node may take;
-	// otherwise a card that reserves failure to another actor — or offers no
-	// failure exit at all — would gain one just by asking through `legion_phase`.
+	// declares a `failed` edge out of the CURRENT phase that THIS node may take.
+	//
+	// The guard reads the EFFECTIVE (normalized) machine — the very same machine the
+	// transition below is evaluated against — so the guard and the state machine can
+	// never disagree. Two consequences, both intended:
+	//   - a card that OMITS the `failed` phase still gets it injected, with an edge
+	//     out of every non-terminal phase, and therefore MAY declare failure;
+	//   - a card that DECLARES the `failed` phase but leaves the edge off the current
+	//     phase is refused.
+	// Injection adds no capability (`normalizePhaseMachine`: it only removes the
+	// possibility of a stranded team), because taking an injected terminal stays
+	// gated — here by the reason requirement and by `actorRole`.
 	//
 	// The edge's own `require` conditions are deliberately NOT consulted: a
 	// declared failure asserts that they are precisely what failed, so they are
 	// vacuous for it. `actorRole` answers a different question — WHO may decide a
-	// failure — and that still binds.
+	// failure — and that still binds. It binds INSIDE the lookup: a machine that
+	// reserves one `failed` edge to another actor and also offers a plain one is not
+	// order-dependent.
 	const effectiveMachine = normalizePhaseMachine(options.machine ?? DEFAULT_PHASE_MACHINE);
-	const failedEdge = self.phase === null
-		? undefined
-		: findPhase(effectiveMachine, self.phase)?.next.find((rule) => rule.to === "failed");
-	const mayDeclareFailure = failedEdge !== undefined
-		&& (failedEdge.actorRole === undefined || failedEdge.actorRole === self.role);
+	const mayDeclareFailure = self.phase !== null && (findPhase(effectiveMachine, self.phase)?.next.some(
+		(rule) => rule.to === "failed" && (rule.actorRole === undefined || rule.actorRole === self.role),
+	) ?? false);
 	const decision = evaluatePhaseTransition({
 		from: self.phase ?? null,
 		to,
@@ -782,7 +791,10 @@ export async function requestLegionPhase(
 		...decision.event.data,
 		// The persisted reason is capped like `note`/`evidence`/the audit reason; the
 		// RETURNED message keeps the full trimmed text because it is not stored.
-		...(declaredFailure && mayDeclareFailure ? { terminalReason: "parent_decision", reason: failureReason.slice(0, 2_000) } : {}),
+		// Reaching this point implies `mayDeclareFailure` — a `to:"failed"` the machine
+		// let through always had `terminalReason` handed to it — so the guard is not
+		// repeated here.
+		...(declaredFailure ? { terminalReason: "parent_decision", reason: failureReason.slice(0, 2_000) } : {}),
 		...(options.note ? { note: options.note.slice(0, 2_000) } : {}),
 		...(options.evidence ? { evidence: options.evidence.slice(0, 2_000) } : {}),
 	}, { now });

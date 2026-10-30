@@ -41,17 +41,33 @@ rework 边 → **自锁**。与此同时 `to: "failed"` 在 `requestLegionPhase`
 
 落库走**既有**接受路径（`updateNode` + `appendEvent`），没有新通道。`phase_change`
 事件的 `data` 带上 `terminalReason: "parent_decision"` 与 `reason`，于是「谁、为什么判负」
-是账本里的一条可查事实，而不是模型的一句话。成功回执逐字为
+是账本里的一条可查事实，而不是模型的一句话。`reason` 与 `note`/`evidence` 一样按 2 000 字符
+截断**落库**（返回给模型的消息保留全文，因为它不落库）。成功回执逐字为
 `Team failed by centurion decision: <reason>`。
 
 **判负不是聚变**：它只提交 `implementing → failed` 这一条机器本来就声明的边。非法边
 （例如从终态再判负）照旧由状态机拒绝——工具面不为它开特例。
 
-具体到实现：`terminalReason: "parent_decision"` **仅在**本团队机器的**当前相位确实声明了**
-`{ to: "failed" }` 边、且该边的 `actorRole` 为空或正对本节点时才传入。缺边、或边被保留给
-别的角色时，工具面传的是「没有 terminalReason」，状态机便按它自己的规则拒绝
-（`INVALID_PARAMS` + `failed requires parent decision, all children failed, or exhausted rework`）。
-于是「这张卡不许从这个相位失败」不会被 centurion 的一句话覆盖。
+具体到实现：`terminalReason: "parent_decision"` **仅在**本团队**有效（归一化后）机器的**当前
+相位中存在一条 `{ to: "failed" }` 边、且该边的 `actorRole` 为空或正对本节点时才传入。没有
+可用边、或边被保留给别的角色时，工具面传的是「没有 terminalReason」，状态机便按它自己的
+规则拒绝（`INVALID_PARAMS` + `failed requires parent decision, all children failed, or
+exhausted rework`）。于是「这张卡不许从这个相位失败」不会被 centurion 的一句话覆盖。
+
+**「归一化后」是有意的，两个方向都要看清**：`normalizePhaseMachine` 在卡**根本没声明**
+`failed`/`done`/`aborted` 这些相位时，会把它们补上，并给每个非终止相位追加一条
+`{ to: <该终态> }` 边。因此：
+
+| 卡的写法 | `failed` 边从本相位看 | 可否判负 |
+|---|---|---|
+| 没声明 `failed` 相位 | 注入的，存在 | **可以**（与 `evaluatePhaseTransition` 看到的是同一张机器） |
+| 声明了 `failed` 相位，但本相位的 `next` 里没有它 | 不存在 | 不可以 |
+| 声明了，但 `actorRole` 指向别的角色 | 存在但不可由本节点取 | 不可以 |
+
+第一行不是漏洞：`normalizePhaseMachine` 的注入从来只**增加可达性、不增加能力**
+（它的文档注释就是这么写的），真正把门的是 `terminalReason` 要求与 `actorRole` 校验。
+所以「卡声明了 `failed` 相位」本身就是一道 opt-out：声明了就按声明的边来，没声明就享受
+注入兜底。判负仍是显式决定，不是默认路径。
 
 拒绝文案本身**不**含「legal next phases」列表：`evaluateDeclaredFailure` 跑在边查找**之前**
 （`src/legion/state-machine.ts`，本契约不动它），所以 `to:"failed"` 这条路根本到不了那句
