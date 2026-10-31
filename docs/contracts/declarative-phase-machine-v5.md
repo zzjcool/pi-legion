@@ -100,6 +100,15 @@ Exactly three are terminal and are always available regardless of `next`:
 - `failed` — parent decision, all children failed, or rework exhausted
 - `aborted` — parent retire only
 
+`aborted` is the emergency stop, so a parent retire must land even when the
+transition itself cannot be resolved (#351). The abort asks the machine that the
+node's **role card** declares; if no machine can be resolved for the node's
+current phase name, the retire is forced anyway: the phase becomes `aborted`, one
+`phase_change` event carries `{ forced: true, reason:
+"parent_retire_unresolved_phase", denied: "<reason>" }` (no new event type — the
+set stays closed at 16), and one warning names the node, the phase and the
+refusal. Silently dropping the abort is what made a team unstoppable.
+
 ## Safety rails (unchanged)
 
 These are invariants, not configuration:

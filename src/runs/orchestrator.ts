@@ -21,6 +21,7 @@ import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "..
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { evaluatePhaseTransition, isTerminalPhase } from "../legion/state-machine.ts";
+import type { PhaseMachine } from "../legion/phase-machine.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import {
 	ALLOW_NESTED_ENV,
@@ -106,6 +107,15 @@ export interface OrchestratorLegionContext {
 	runStore?: RunStore;
 	settings?: LegionSettings;
 	eventBus?: Pick<LegionEventBus, "emit">;
+	/**
+	 * #351: the phase machine a node's role card declares, looked up by role.
+	 *
+	 * `abortLegionPhase` needs it for exactly one reason: a declared machine may
+	 * name phases the built-in union does not know (`build`), and without the
+	 * machine those names are `invalid_phase`, which used to drop the abort.
+	 * Absent = "no machine": the abort is still forced through (see the method).
+	 */
+	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }
 
 export interface OrchestratorDeps {
@@ -717,16 +727,41 @@ export class Orchestrator {
 		// is a safety hole. `isTerminalPhase` still covers the built-in names; a
 		// custom name resolves through the machine when one is attached.
 		if (!node || !node.phase || isTerminalPhase(node.phase)) return;
+		// #351: attach it. Without the machine a card-declared name (`build`) was
+		// `invalid_phase`, and the refusal below used to be dropped in silence.
+		const machine = this.legion.machineForRole?.(node.role);
 		const decision = evaluatePhaseTransition({
 			from: node.phase,
 			to: "aborted",
 			reworkCount: node.reworkCount,
 			terminalReason: "parent_retire",
 			actorRole: "supervisor",
+			...(machine ? { machine } : {}),
 		}, this.now);
-		if (!decision.allowed) return;
-		updateNode(this.legion.db, nodeId, { phase: decision.to, phaseSince: decision.phaseSince }, this.now);
-		this.emitStored(nodeId, "phase_change", decision.event.data);
+		if (decision.allowed) {
+			updateNode(this.legion.db, nodeId, { phase: decision.to, phaseSince: decision.phaseSince }, this.now);
+			this.emitStored(nodeId, "phase_change", decision.event.data);
+			return;
+		}
+		// #351: a parent retire must ALWAYS take effect — that is the safety bottom
+		// line `phase-machine.ts` normalizes every machine for. When the phase still
+		// cannot be resolved the transition is forced, not dropped: the node lands in
+		// `aborted` so no reader describes a team that no longer exists, the refusal
+		// becomes a `phase_change` fact (the event set is closed at 16 — no new type),
+		// and one warning makes it visible. Silence was the bug, not the refusal.
+		const phaseSince = this.now();
+		updateNode(this.legion.db, nodeId, { phase: "aborted", phaseSince }, this.now);
+		this.emitStored(nodeId, "phase_change", {
+			from: node.phase,
+			to: "aborted",
+			reworkCount: node.reworkCount,
+			forced: true,
+			reason: "parent_retire_unresolved_phase",
+			denied: decision.reason,
+		});
+		console.warn(
+			`[pi-legion] node ${nodeId} retired while in phase '${node.phase}': the abort was refused (${decision.reason}: ${decision.message}); phase forced to aborted so the parent retire still takes effect.`,
+		);
 	}
 
 	private emitProcess(type: LegionProcessEventType, nodeId: string, data: unknown): void {
