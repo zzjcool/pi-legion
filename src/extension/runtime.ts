@@ -64,6 +64,15 @@ export interface CollectSnapshot {
 	output: string;
 	/** Full output persisted to disk; named in the notice so a truncated preview has a one-step recovery. */
 	outputFile?: string;
+	/**
+	 * #349 (issue suggestion A: "an explicit already-persisted marker"): the
+	 * `output` above is NOT the child's whole text — the completion cache's
+	 * resident bound dropped the tail and the full text could not be re-read from
+	 * `outputFile` (the run dir was cleaned up, or the entry never had a file).
+	 * Absent on every non-degraded result, including the first collect of a child
+	 * whose output is larger than the whole cache budget.
+	 */
+	outputTruncated?: true;
 	acceptance: {
 		status: string;
 		level?: string;
@@ -651,27 +660,43 @@ export interface ClaimedCollect {
  *
  * `finished` is a one-round cache keyed by name (D7b) that used to hold every
  * child's full `CollectSnapshot.output` for the rest of the session: measured
- * 220KB resident per finished child, 10.8MB after 50 children, freed only by a
+ * 210KB resident per finished child, 10.0MB after 50 children, freed only by a
  * re-`track` or `dispose()`. What the cache actually owes its callers is the
  * RESULT — `runId`/`round` (D9/D10), `execution`, `acceptance`, `outputFile` —
  * plus a preview of the text; the full text is already on disk
- * (`CollectSnapshot.outputFile`, written by the orchestrator), so only the
- * newest few entries keep it in memory and an older one is re-read on the hit
- * that actually asks for it.
+ * (`CollectSnapshot.outputFile`, written by the orchestrator), so no entry keeps
+ * a long text in memory and a hit re-reads it from the file.
  *
- * These numbers are deliberately small: 16 children, 4MB, and a stripped entry
- * keeps ≤ 4k chars (8KB) as its preview. Nothing here changes WHICH results are
- * cached, the one-round invalidation, or the claim keys — a stripped entry keeps
- * its `runId`/`round`/snapshot metadata, so a later hit claims exactly what it
- * would have claimed before.
+ * #349's acceptance is **≤ 1.0MB resident**, so the budget is set to satisfy it
+ * rather than to be "roughly smaller":
+ *
+ *  - `FINISHED_CACHE_MAX_ENTRY_BYTES = 8KB` — one entry may retain at most one
+ *    terminal preview's worth of text. Anything longer is not resident at all;
+ *    the hit re-reads it from `outputFile` (this is also what makes the bound
+ *    independent of how large a single child's output was).
+ *  - `FINISHED_CACHE_MAX_OUTPUT_BYTES = 1MB` — the whole cache's resident text.
+ *  - `FINISHED_CACHE_MAX_ENTRIES = 128` — derived: 1MB / 8KB. The byte bound is
+ *    therefore the binding one; the count bound just keeps the per-entry
+ *    bookkeeping (and the head-per-entry of 4k chars) from growing without it.
+ *
+ * Nothing here changes WHICH results are cached, the one-round invalidation, or
+ * the claim keys — a stripped entry keeps its `runId`/`round`/snapshot metadata,
+ * so a later hit claims exactly what it would have claimed before.
  */
-export const FINISHED_CACHE_MAX_ENTRIES = 16;
-export const FINISHED_CACHE_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+export const FINISHED_CACHE_MAX_ENTRIES = 128;
+export const FINISHED_CACHE_MAX_OUTPUT_BYTES = 1024 * 1024;
+/**
+ * #349: resident text cap for ONE entry. A longer output is not kept in memory:
+ * the entry stores its head and the hit re-reads `outputFile`, so no single
+ * child can occupy the whole budget and the internal accounting stays
+ * independent of output size.
+ */
+export const FINISHED_CACHE_MAX_ENTRY_BYTES = 8 * 1024;
 /**
  * Text a stripped entry keeps. Matches `PREVIEW_CHARS` in notify.ts (duplicated
  * for the same reason as `DEFAULT_ORPHAN_STALE_MS`: the runtime must not import
  * the formatter's internals) so a notice rendered from a cached hit is still
- * whole.
+ * whole. 4000 chars is ≤ 8KB even at 2 bytes/char — the entry cap above.
  */
 export const FINISHED_OUTPUT_HEAD_CHARS = 4_000;
 
@@ -684,6 +709,12 @@ export const FINISHED_OUTPUT_HEAD_CHARS = 4_000;
  * cache hit for a name reused across runs claimed the wrong key — delivering a
  * notice that was already read (duplicate), or claiming the current run's entry
  * while handing out an older run's snapshot (swallowed failure).
+ *
+ * #349 (review major 1): `snapshot` is the cache's OWN shallow copy, never the
+ * object the caller was handed. Trimming mutates `snapshot.output` in place, so
+ * keeping a reference would strip the text out of a result that was already
+ * delivered to `collect`/`wait`/`join.onTerminal` (and out of the in-flight
+ * `job.collectPromise`) the moment the entry is inserted or evicted.
  */
 interface FinishedResult {
 	runId: string;
@@ -826,6 +857,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	/**
 	 * Shrink one entry to its preview head, keeping every other field.
 	 *
+	 * Only the ENTRY's own `snapshot` copy is touched (see `rememberFinished`), so a
+	 * result that was already handed to a caller keeps its text.
+	 *
 	 * The head is copied through UTF-8 on purpose: `String.prototype.slice` returns a
 	 * V8 *sliced* string that keeps the whole parent alive, so a 4KB head of a 200KB
 	 * output retained all 200KB and the bound did nothing (measured: 10.0MB resident
@@ -840,30 +874,39 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		entry.stripped = true;
 	};
 
-	/** Re-read the full text a stripped entry stands for; a no-op when it is whole. */
-	const rehydrateFinished = (entry: FinishedResult): void => {
-		if (!entry.stripped) return;
+	/**
+	 * Re-read the full text a stripped entry stands for, from `snapshot.outputFile`.
+	 * Returns whether the entry now holds the whole text (`false` = a degraded read:
+	 * no file recorded, or the run dir was cleaned up). A no-op that returns `true`
+	 * for an entry that was never stripped.
+	 */
+	const rehydrateFinished = (entry: FinishedResult): boolean => {
+		if (!entry.stripped) return true;
 		const file = entry.snapshot.outputFile;
-		if (!file) return;
+		if (!file) return false;
 		let text: string;
 		try {
 			text = fs.readFileSync(file, "utf8");
 		} catch {
 			// The file is gone (deleted run dir). Keep the head and the metadata: a
 			// degraded read, never a lost result.
-			return;
+			return false;
 		}
-		if (!text) return;
-		// `writeOutputFile` persists `output.trim() + "\n"`; drop that one newline so
-		// a rehydrated snapshot carries the same text the collect produced.
+		if (!text) return false;
+		// `writeOutputFile` persists `output.trim() + "\n"`; drop that one newline so a
+		// rehydrated snapshot carries the collected text (contract R3 -> §3.3: at most
+		// leading/trailing whitespace can differ from the original).
 		entry.snapshot.output = text.replace(/\n$/, "");
 		entry.bytes = outputBytes(entry.snapshot.output);
 		entry.stripped = false;
+		return true;
 	};
 
 	/**
-	 * Enforce the bound. Newest-first: everything inside the entry/byte budget keeps
-	 * its text, everything older is stripped (if it can be rebuilt at all).
+	 * Enforce the bound. Newest-first: everything inside the per-entry / byte / count
+	 * budget keeps its text, everything older is stripped (if it can be rebuilt at
+	 * all). `FINISHED_CACHE_MAX_ENTRY_BYTES` is what makes the bound independent of a
+	 * single child's output size: a 200KB text is never resident, however new it is.
 	 */
 	const trimFinished = (): void => {
 		const names = [...finished.keys()].reverse();
@@ -874,7 +917,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			if (!entry) continue;
 			// Pinned, already stripped, or empty: nothing this pass can reclaim.
 			if (entry.stripped || !entry.snapshot.outputFile || entry.bytes === 0) continue;
-			if (entries < FINISHED_CACHE_MAX_ENTRIES && bytes + entry.bytes <= FINISHED_CACHE_MAX_OUTPUT_BYTES) {
+			if (
+				entries < FINISHED_CACHE_MAX_ENTRIES &&
+				entry.bytes <= FINISHED_CACHE_MAX_ENTRY_BYTES &&
+				bytes + entry.bytes <= FINISHED_CACHE_MAX_OUTPUT_BYTES
+			) {
 				entries += 1;
 				bytes += entry.bytes;
 				continue;
@@ -883,9 +930,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		}
 	};
 
-	/** Insert / replace as the newest entry, then re-apply the bound. */
+	/**
+	 * Insert / replace as the newest entry, then re-apply the bound.
+	 *
+	 * #349 (review major 1): the entry keeps a SHALLOW COPY of the snapshot. Trimming
+	 * mutates `snapshot.output` in place, so storing the reference stripped the text
+	 * out of the very object this collect is about to return (`job.collectPromise`),
+	 * meaning a large output was delivered as a 4000-char head — and a later eviction
+	 * from a DIFFERENT child could still strip a result the parent already held.
+	 */
 	const rememberFinished = (name: string, runId: string, round: number, snapshot: CollectSnapshot): void => {
-		const entry: FinishedResult = { runId, round, snapshot, bytes: outputBytes(snapshot.output), stripped: false };
+		const copy: CollectSnapshot = { ...snapshot };
+		const entry: FinishedResult = { runId, round, snapshot: copy, bytes: outputBytes(copy.output), stripped: false };
 		// Delete first so a same-name re-insert also becomes the newest entry.
 		finished.delete(name);
 		finished.set(name, entry);
@@ -897,15 +953,33 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * caller sees it. Every path that hands a cached snapshot out goes through here —
 	 * `wait` and both `collect` seams — so "evicted" is never visible to a caller as
 	 * "lost".
+	 *
+	 * #349 (review major 1): the order is trim-then-rehydrate, and the caller gets a
+	 * COPY of the snapshot.
+	 *
+	 *  - trim FIRST: whatever this hit is about to take out of the budget is decided
+	 *    before the text is restored, so the pass the caller reads is the full text
+	 *    rather than a head that a later trim would produce anyway.
+	 *  - the copy is what makes "evicted" invisible for good: the entry is re-bounded
+	 *    right after (so `residentBytes` stays inside R1 at every instant, including
+	 *    right after a hit) and that re-bounding mutates the ENTRY's text, which no
+	 *    caller holds a reference to any more.
+	 *  - the `(runId, round)` origin is registered on the copy too, so
+	 *    `unclaimUndelivered` can still roll a claim back for a cached hit (#320).
 	 */
 	const cachedFinished = (name: string): FinishedResult | undefined => {
 		const entry = finished.get(name);
 		if (!entry) return undefined;
 		finished.delete(name);
 		finished.set(name, entry);
-		rehydrateFinished(entry);
 		trimFinished();
-		return entry;
+		const restored = rehydrateFinished(entry);
+		const snapshot: CollectSnapshot = { ...entry.snapshot };
+		if (!restored) snapshot.outputTruncated = true;
+		snapshotOrigins.set(snapshot, { runId: entry.runId, round: entry.round });
+		// Re-apply the bound: the hit needed the whole text, the cache does not keep it.
+		trimFinished();
+		return { runId: entry.runId, round: entry.round, snapshot, bytes: entry.bytes, stripped: entry.stripped };
 	};
 	/**
 	 * F1: the `(runId, round)` a snapshot was COLLECTED in.

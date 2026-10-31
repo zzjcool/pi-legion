@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
-import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
+import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds, visibleRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
@@ -2396,5 +2396,64 @@ test("#346: dropping a node from the frame does not repaint the chart", () => {
 	const a = renderLegionView({ ...without, rate: 0 }, initialViewState(), 120, 40).canvas.toPlain();
 	const b = renderLegionView({ ...withHistory, rate: 0 }, initialViewState(), 120, 40).canvas.toPlain();
 	assert.deepEqual(b, a);
+});
+
+test("#346: a frame walks the series that CHANGED inside its window, not every settled row", () => {
+	// The production shape: `data.nodes` comes from the subtree with no status
+	// filter, so 190 settled rows are in the frame — and the sampler keeps
+	// recording them every tick (the flat-run collapse moves their last SAMPLE
+	// forward to `now`). Skipping on the last sample timestamp therefore never
+	// fired: measured 200 series / 190 settled ⇒ walked 200, skipped 0. The skip
+	// has to key on when the VALUE last moved (`changedAt`).
+	const sampler = new RateSampler();
+	const settled = Array.from({ length: 190 }, (_, i) => ({ id: `settled-${i}`, rate: 10 + i }));
+	const active = Array.from({ length: 10 }, (_, i) => ({ id: `active-${i}`, rate: 50 + i }));
+	const nodesAt = (t: number): VizNode[] => [
+		ROOT,
+		...settled.map((s) => node(s.id, {
+			role: "worker",
+			status: t > 120 ? "settled" : "running",
+			startedAt: sec(0),
+			...(t > 120 ? { endedAt: sec(120) } : {}),
+			tokensOut: Math.min(t, 120) * s.rate,
+			generationMs: Math.min(t, 120) * 1000,
+			tokens: 120 * s.rate,
+		})),
+		...active.map((s) => node(s.id, {
+			role: "scout",
+			startedAt: sec(0),
+			tokensOut: t * s.rate,
+			generationMs: t * 1000,
+			tokens: 400 * s.rate,
+		})),
+	];
+	for (let t = 0; t <= 400; t += 2) sampler.record(sec(t), nodesAt(t));
+	const nodes = nodesAt(400);
+	const visible = visibleRateNodeIds(nodes);
+	assert.equal(visible.length, 200, "the subtree lists the 190 settled rows too");
+
+	// A window that starts after they stopped: their columns are provably 0.
+	const to = sec(400);
+	const from = to - RATE_WINDOW_MS;
+	const painted = sampler.buckets(from, to, 51, { onlyNodeIds: visible });
+	assert.equal(sampler.lastPass.walked, 10, `walked ${sampler.lastPass.walked} of 200 series`);
+	assert.equal(sampler.lastPass.skipped, 190, "the 190 settled rows are provably flat here");
+
+	// Skipping is exact, not approximate: the frame's columns equal the sum over
+	// EVERY series, computed by the per-series reference that never skips.
+	const reference = new Array<number>(51).fill(0);
+	for (const id of sampler.nodeIds()) {
+		const row = sampler.nodeBuckets(id, from, to, 51);
+		row.forEach((value, i) => { reference[i] = reference[i]! + value; });
+	}
+	assert.deepEqual(painted.total, reference, "skipping a provably-flat series changes no bucket");
+	assert.ok(reference.some((value) => value > 0), "positive control: the active ten really do paint");
+
+	// The honest residual (contract R2): a window that starts at the RUN's
+	// beginning keeps every series that ever produced in scope — its history is
+	// painted, so it must be walked. Skipping it would zero real columns.
+	sampler.buckets(sec(0), to, 51, { onlyNodeIds: visible });
+	assert.equal(sampler.lastPass.walked, 200, "a whole-run window still walks all 200 (in-window history)");
+	assert.equal(sampler.lastPass.skipped, 0);
 });
 

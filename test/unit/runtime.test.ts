@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
 	createSessionRuntime,
@@ -5762,20 +5762,23 @@ test("claim D2/#320-2: collectChild's JOB-branch bail still lands the notice (li
 
 // ───────────────── #349: the finished cache keeps results, not full texts ─────────────────
 
-/** Track + watch `count` children to completion, each with its own persisted output file. */
+/**
+ * Track + watch `count` children to completion, each with its own persisted
+ * output file (the real shape `writeOutputFile` produces: `output.trim() + "\n"`).
+ */
 async function finishChildren(
 	runtime: ReturnType<typeof createSessionRuntime>,
 	count: number,
 	dir: string,
-	opts: { outputSize: number; persist?: boolean; prefix?: string } = { outputSize: 1_000, persist: true },
+	opts: { outputSize: number; persist?: boolean; prefix?: string; startAt?: number } = { outputSize: 1_000, persist: true },
 ): Promise<string[]> {
 	const outputs: string[] = [];
-	for (let i = 0; i < count; i++) {
-		const name = `child-${i}`;
+	for (let i = opts.startAt ?? 0; i < (opts.startAt ?? 0) + count; i++) {
+		const name = `${opts.prefix ?? "child"}-${i}`;
 		const output = `${name}:${"x".repeat(opts.outputSize)}`;
 		outputs.push(output);
 		const outputFile = join(dir, `${name}.output.md`);
-		if (opts.persist !== false) writeFileSync(outputFile, `${output}\n`);
+		if (opts.persist !== false) writeFileSync(outputFile, `${output.trim()}\n`);
 		runtime.track({
 			name,
 			runId: "r-1",
@@ -5790,23 +5793,86 @@ async function finishChildren(
 	return outputs;
 }
 
-test("#349: the finished cache strips old output text and keeps every result's metadata", async () => {
+test("#349: the cache keeps every result's metadata and strips text past its entry budget", async () => {
 	await withTempDir(async (dir) => {
 		const runtime = createSessionRuntime({ sendMessage() {} });
-		await finishChildren(runtime, 20, dir, { outputSize: 8_000 });
+		// 130 entries of 1KB: under the 8KB entry cap and under the 1MB byte budget,
+		// but over the 128-entry count bound — so exactly the 2 oldest lose their text.
+		await finishChildren(runtime, 130, dir, { outputSize: 1_000 });
 
 		const stats = runtime.noticeQueueStats().finished;
-		assert.equal(stats.entries, 20, "eviction drops TEXT, never a result");
-		assert.equal(stats.stripped, 4, "the 4 oldest entries are the ones over the 16-entry bound");
-		// 16 whole entries + 4 heads. The exact bound is FINISHED_CACHE_MAX_ENTRIES heads.
-		assert.ok(stats.residentBytes <= 16 * 8_100 + 4 * 4_100, `resident ${stats.residentBytes}`);
+		assert.equal(stats.entries, 130, "eviction drops TEXT, never a result");
+		assert.equal(stats.stripped, 2, "the 2 oldest entries are the ones over the 128-entry bound");
+		assert.ok(stats.residentBytes <= 1024 * 1024, `resident ${stats.residentBytes} <= 1MB`);
 
-		// The oldest entry's result is still a result: metadata intact and readable.
+		// The oldest entry's result is still a result: metadata intact, text re-read.
 		const oldest = await runtime.consumeCollect("child-0");
 		assert.ok(oldest, "an evicted entry is still a cache hit");
 		assert.equal(oldest.snapshot.execution.status, "success");
 		assert.equal(oldest.snapshot.acceptance.status, "attested");
 		assert.equal(oldest.snapshot.outputFile, join(dir, "child-0.output.md"));
+		assert.equal(oldest.snapshot.output, `child-0:${"x".repeat(1_000)}`, "the text came back from disk");
+		assert.equal(oldest.snapshot.outputTruncated, undefined, "nothing was truncated");
+		runtime.dispose();
+	});
+});
+
+test("#349: a single output above the entry cap is never resident — and the first collect has all of it", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		// 200KB > FINISHED_CACHE_MAX_ENTRY_BYTES (8KB): the cache keeps the 4000-char
+		// head only. The result the caller is handed must still be whole — the entry
+		// is the cache's own copy (review major 1), so trimming it cannot shorten the
+		// text `collect`/`wait` (and `join.onTerminal`, which reads the same object)
+		// receives.
+		const output = `big:HEAD:${"y".repeat(200_000)}:TAIL`;
+		const outputFile = join(dir, "big.output.md");
+		writeFileSync(outputFile, `${output.trim()}\n`);
+		runtime.track({
+			name: "big",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/w.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => snapshot({ output, outputFile }),
+		});
+		const [first] = await runtime.wait(["big"], { timeoutMs: 1_000 });
+		assert.equal(first?.snapshot?.output, output, "the FIRST collect returns the whole output");
+		assert.equal(runtime.noticeQueueStats().finished.stripped, 1, "…while the cache keeps only the head");
+		assert.ok(runtime.noticeQueueStats().finished.residentBytes <= 8 * 1024, "one entry is capped at 8KB");
+
+		// A later hit (job released ⇒ cache branch) re-reads the full text from disk.
+		runtime.watch("big");
+		await waitFor(() => runtime.activeJobs().length === 0, "big released");
+		const hit = await runtime.consumeCollect("big");
+		assert.equal(hit?.snapshot.output, output, "the cache hit is whole again, from outputFile");
+		assert.equal(hit?.snapshot.outputTruncated, undefined);
+		runtime.dispose();
+	});
+});
+
+test("#349: a handed-out snapshot is never trimmed by a later insert", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		const output = `first:${"z".repeat(200_000)}:TAIL`;
+		const outputFile = join(dir, "first.output.md");
+		writeFileSync(outputFile, `${output}\n`);
+		runtime.track({
+			name: "first",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/w.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => snapshot({ output, outputFile }),
+		});
+		const [delivered] = await runtime.wait(["first"], { timeoutMs: 1_000 });
+		assert.equal(delivered?.snapshot?.output, output);
+		// 20 more finished children: every one of them re-runs the bound, which used
+		// to reach into the object the parent was already holding (the entry shared
+		// its `snapshot` reference with `job.collectPromise`).
+		await finishChildren(runtime, 20, dir, { outputSize: 200_000, prefix: "later" });
+		assert.equal(delivered?.snapshot?.output, output, "the delivered result is untouched by later eviction");
+		assert.equal(runtime.noticeQueueStats().finished.stripped > 0, true, "positive control: eviction did run");
 		runtime.dispose();
 	});
 });
@@ -5815,7 +5881,7 @@ test("#349: a stripped result is rehydrated from disc — wait returns the same 
 	await withTempDir(async (dir) => {
 		const runtime = createSessionRuntime({ sendMessage() {} });
 		const outputs = await finishChildren(runtime, 20, dir, { outputSize: 200_000 });
-		assert.equal(runtime.noticeQueueStats().finished.stripped, 4, "four 200KB texts were dropped");
+		assert.equal(runtime.noticeQueueStats().finished.stripped, 20, "every 200KB text left memory");
 
 		// End to end: the evicted result comes back whole, not as a head, and not as
 		// "missing". `wait` is the seam the parent model actually reads.
@@ -5829,15 +5895,82 @@ test("#349: a stripped result is rehydrated from disc — wait returns the same 
 	});
 });
 
+test("#349: rehydrate restores the persisted text — at most leading/trailing whitespace differs", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		// The orchestrator persists `output.trim() + "\n"` (writeOutputFile), so a
+		// rehydrated snapshot equals `output.trim()`, not the untrimmed original.
+		// Contract R3 points here (§3.3) instead of claiming a byte-identical text.
+		const output = `abc\n\n${"w".repeat(200_000)}\n\n`;
+		const outputFile = join(dir, "trim.output.md");
+		writeFileSync(outputFile, `${output.trim()}\n`);
+		runtime.track({
+			name: "trim",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/w.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => snapshot({ output, outputFile }),
+		});
+		runtime.watch("trim");
+		await waitFor(() => runtime.activeJobs().length === 0, "trim released");
+		const hit = await runtime.consumeCollect("trim");
+		assert.equal(hit?.snapshot.output, output.trim(), "rehydrated == output.trim()");
+		assert.notEqual(hit?.snapshot.output, output, "…which is NOT the untrimmed original (documented)");
+		runtime.dispose();
+	});
+});
+
+test("#349: a deleted outputFile degrades to the head and SAYS SO (outputTruncated)", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		const outputs = await finishChildren(runtime, 1, dir, { outputSize: 200_000 });
+		assert.equal(runtime.noticeQueueStats().finished.stripped, 1);
+		// Run dir cleaned up under us: the text is unrecoverable, so the hit must be
+		// visibly degraded — 4000-char head + the machine-readable marker — and never
+		// `missing`.
+		rmSync(join(dir, "child-0.output.md"));
+		const hit = await runtime.consumeCollect("child-0");
+		assert.ok(hit, "a deleted artifact is a degraded read, not a lost result");
+		assert.equal(hit.snapshot.output.length, 4_000, "the preview head");
+		assert.equal(outputs[0]!.startsWith(hit.snapshot.output), true, "…and it is the real head");
+		assert.equal(hit.snapshot.outputTruncated, true, "the caller can tell the text is incomplete");
+		assert.equal(hit.snapshot.execution.status, "success", "metadata survives the degradation");
+		assert.equal(hit.snapshot.outputFile, join(dir, "child-0.output.md"), "and it still names the file it wanted");
+		runtime.dispose();
+	});
+});
+
+test("#349: 50 children x 200KB stay inside the issue's 1.0MB acceptance", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		await finishChildren(runtime, 50, dir, { outputSize: 204_800 });
+		const stats = runtime.noticeQueueStats().finished;
+		assert.equal(stats.entries, 50, "all 50 results are still cached (metadata + claim keys)");
+		assert.equal(stats.stripped, 50, "none of the 200KB texts is resident");
+		assert.equal(stats.pinnedBytes, 0, "every entry can be rebuilt from its outputFile");
+		// The bound the issue asks for. `residentBytes` is the UTF-8 size of the text
+		// the cache actually holds (heads included), so it is the same quantity the
+		// `--expose-gc` heap measurement in docs/contracts/finished-cache-eviction-v1.md
+		// §4 reports as ≈0.2MB (10.0MB before this PR).
+		assert.ok(stats.residentBytes <= 1024 * 1024, `resident ${stats.residentBytes} <= 1MB`);
+		assert.ok(stats.residentBytes <= 50 * 4_000 + 1_000, "50 heads, nothing more");
+		runtime.dispose();
+	});
+});
+
 test("#349: a result with no outputFile is pinned — its text is never dropped", async () => {
 	const runtime = createSessionRuntime({ sendMessage() {} });
 	// No persisted output: stripping this text would lose it for good, so the
-	// contract forbids evicting it (only the count is observable).
+	// contract forbids evicting it (only the footprint is observable).
 	await finishChildren(runtime, 20, "/nonexistent", { outputSize: 8_000, persist: false });
 	const stats = runtime.noticeQueueStats().finished;
 	assert.equal(stats.entries, 20);
 	assert.equal(stats.stripped, 0, "nothing to rebuild from ⇒ nothing was dropped");
 	assert.equal(stats.pinnedBytes, stats.residentBytes, "the whole footprint is pinned, and says so");
+	const hit = await runtime.consumeCollect("child-0");
+	assert.equal(hit?.snapshot.output, `child-0:${"x".repeat(8_000)}`, "pinned text is served whole");
+	assert.equal(hit?.snapshot.outputTruncated, undefined, "nothing was truncated, so nothing is flagged");
 	runtime.dispose();
 });
 
@@ -5846,9 +5979,9 @@ test("#349: the byte bound strips text even when the entry count is small", asyn
 		const runtime = createSessionRuntime({ sendMessage() {} });
 		const outputs = await finishChildren(runtime, 3, dir, { outputSize: 2_000_000 });
 		const stats = runtime.noticeQueueStats().finished;
-		assert.equal(stats.entries, 3, "3 entries is well under the 16-entry bound");
-		assert.equal(stats.stripped, 1, "6MB of text does not fit the 4MB budget");
-		assert.ok(stats.residentBytes <= 4 * 1024 * 1024 + 4_100, `resident ${stats.residentBytes}`);
+		assert.equal(stats.entries, 3, "3 entries is well under the 128-entry bound");
+		assert.equal(stats.stripped, 3, "3 x 2MB does not fit — not one of them does (8KB entry cap)");
+		assert.ok(stats.residentBytes <= 3 * 4_000 + 1_000, `resident ${stats.residentBytes}`);
 		const [hit] = await runtime.wait(["child-0"], { timeoutMs: 100 });
 		assert.equal(hit?.snapshot?.output, outputs[0], "the 2MB text is re-read on demand");
 		runtime.dispose();

@@ -42,6 +42,17 @@ interface Series {
 	value: number[];
 	/** Cumulative generation wall ms (parallel to value). */
 	gen: number[];
+	/**
+	 * #346: last timestamp at which this series' sampled value actually CHANGED —
+	 * or its birth, when it was first seen.
+	 *
+	 * Every later sample is a flat continuation of that value: `record()`'s
+	 * flat-run collapse moves `ts[last]` forward WITHOUT touching the value, which
+	 * is exactly why the last SAMPLE timestamp cannot answer "is this series still
+	 * producing?". Invariant: all samples at `t > changedAt` carry the value at
+	 * `changedAt`, so `interpolate` is constant on `[changedAt, ∞)`.
+	 */
+	changedAt: number;
 }
 
 export interface RateSeries {
@@ -75,6 +86,13 @@ export class RateSampler {
 	private first: number | undefined;
 	/** Wall time of the latest tokensOut/gen change across all series (not flat-collapse moves). */
 	private lastChange: number | undefined;
+	/**
+	 * #346 diagnostics: series visited vs. provably skipped by the most recent
+	 * `buckets()` pass. Read-only observability — the test that pins "a frame pays
+	 * for the series that changed inside its window, not for every series ever
+	 * recorded" asserts on it, and nothing in the sampler reads it back.
+	 */
+	readonly lastPass: { walked: number; skipped: number } = { walked: 0, skipped: 0 };
 
 	constructor(options: { retentionMs?: number } = {}) {
 		this.retentionMs = options.retentionMs ?? DEFAULT_RETENTION_MS;
@@ -100,13 +118,14 @@ export class RateSampler {
 			if (node.id === "root") continue;
 			let s = this.series.get(node.id);
 			if (!s) {
-				s = { role: node.role, ts: [], value: [], gen: [] };
+				s = { role: node.role, ts: [], value: [], gen: [], changedAt: now };
 				this.series.set(node.id, s);
 				// A node born after sampling began starts from zero at its spawn time.
 				if (node.startedAt > this.first && node.startedAt < now) {
 					s.ts.push(node.startedAt);
 					s.value.push(0);
 					s.gen.push(0);
+					s.changedAt = node.startedAt;
 				}
 			}
 			s.role = node.role;
@@ -120,7 +139,12 @@ export class RateSampler {
 			if (lastTs !== undefined && now <= lastTs) {
 				s.value[s.value.length - 1] = value;
 				s.gen[s.gen.length - 1] = gen;
-				if (changed) this.noteChange(lastTs);
+				if (changed) {
+					// #346: a backward sample still rewrites the value at `lastTs`, so that
+					// is where the last real change now sits.
+					s.changedAt = Math.max(s.changedAt, lastTs);
+					this.noteChange(lastTs);
+				}
 				continue;
 			}
 			if (
@@ -132,14 +156,18 @@ export class RateSampler {
 				s.gen[s.gen.length - 2] === lastGen
 			) {
 				// Collapse flat runs: move the trailing sample forward.
-				// Does NOT advance lastChangeAt — chart x-axis stays frozen.
+				// Does NOT advance lastChangeAt — chart x-axis stays frozen — and does
+				// NOT advance `changedAt`: the value is the same one as before.
 				s.ts[s.ts.length - 1] = now;
 				continue;
 			}
 			s.ts.push(now);
 			s.value.push(value);
 			s.gen.push(gen);
-			if (changed) this.noteChange(now);
+			if (changed) {
+				s.changedAt = now;
+				this.noteChange(now);
+			}
 			this.prune(s, now);
 		}
 	}
@@ -221,10 +249,20 @@ export class RateSampler {
 	 * #346: ONE pass per frame (the chart body and its stats used to run this
 	 * twice with identical arguments), no per-series scratch array (the rows are
 	 * accumulated straight into the role totals), and only the series this frame
-	 * paints are visited. A series whose last sample sits at or before the first
-	 * bucket's trailing edge is skipped: `interpolate` clamps at both ends there,
-	 * so every Δ — and therefore every bucket — is provably 0. All three are
-	 * byte-identical to the exhaustive version.
+	 * paints are visited. A series whose last CHANGE sits at or before the first
+	 * bucket's trailing edge is skipped: `interpolate` clamps at both ends there and
+	 * every sample after `changedAt` is flat, so every Δ — and therefore every
+	 * bucket — is provably 0. All three are byte-identical to the exhaustive
+	 * version modulo a role whose whole column is zero (it then never enters
+	 * `byRole`; the chart derives its role list from the nodes, so nothing is
+	 * painted differently).
+	 *
+	 * #346 (review major 2): the skip used `ts[last]`, the last SAMPLE time — and
+	 * `record()`'s flat-run collapse pushes that forward every frame for every
+	 * settled row still in the subtree, so the skip never fired in production
+	 * (measured 200 series / 190 settled ⇒ walked 200, skipped 0). `changedAt` is
+	 * the timestamp the value last moved, so a settled child is skipped as soon as
+	 * its last contribution has scrolled out of the window.
 	 */
 	buckets(from: number, to: number, count: number, options: BucketOptions = {}): RateSeries {
 		const n = Math.max(1, Math.floor(count));
@@ -235,11 +273,18 @@ export class RateSampler {
 		const byRole = new Map<string, number[]>();
 		const total = new Array<number>(n).fill(0);
 		const visible = options.onlyNodeIds === undefined ? undefined : new Set(options.onlyNodeIds);
+		// The first bucket's trailing edge: at or after this, a series that has not
+		// changed since is flat on both ends of every window ⇒ every Δ is 0.
 		const quietBefore = times[0]! - w;
+		let walked = 0;
+		let skipped = 0;
 		for (const [id, s] of this.series) {
 			if (visible && !visible.has(id)) continue;
-			const last = s.ts[s.ts.length - 1];
-			if (last === undefined || last <= quietBefore) continue;
+			if (s.changedAt <= quietBefore) {
+				skipped += 1;
+				continue;
+			}
+			walked += 1;
 			const row = byRole.get(s.role) ?? new Array<number>(n).fill(0);
 			for (let i = 0; i < n; i++) {
 				const rate = this.rateOf(s, times[i]!, w);
@@ -248,6 +293,8 @@ export class RateSampler {
 			}
 			byRole.set(s.role, row);
 		}
+		this.lastPass.walked = walked;
+		this.lastPass.skipped = skipped;
 		return { times, byRole, total };
 	}
 
@@ -283,6 +330,8 @@ export class RateSampler {
 		this.series.clear();
 		this.first = undefined;
 		this.lastChange = undefined;
+		this.lastPass.walked = 0;
+		this.lastPass.skipped = 0;
 	}
 }
 
