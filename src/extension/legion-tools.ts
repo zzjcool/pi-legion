@@ -89,6 +89,15 @@ export interface LegionPostmanOptions {
 	 * session file. Defaults to `parseSessionFile(file).turns`, and the postman calls
 	 * it **once per seam per tick** (#338 minor 2), so a counter injected here can
 	 * prove the whole confirmation pass shares one projection.
+	 *
+	 * Deliberately NOT `parseSessionFileCached` (#348 review minor 6): this is a
+	 * decision path, not a display one — it moves a message to DELIVERED and can
+	 * discard a notice as obsolete — so it reads the file it is judging, the same
+	 * rule that keeps verdict derivation off the gate. The frozen DELIVERED
+	 * criterion (`docs/legion-v2-contract.md`) names `parseSessionFile` for the same
+	 * reason. The cost is bounded regardless:
+	 * {@link LegionPostman} only reaches this for a seam that actually has ACCEPTED
+	 * mail in its page, so a seam with nothing pending parses nothing.
 	 */
 	parseTurns?: (sessionFile: string) => readonly Pick<TurnRecord, "userText">[];
 }
@@ -240,7 +249,9 @@ export class LegionPostman {
 	 *   `ceil(inbox / ACCEPTED_MAIL_CONFIRM_LIMIT)` ticks later.
 	 * - **One parse per seam per tick (minor 2).** `parseSessionFile` projects the
 	 *   whole session; parsing it per message paid that cost up to 20 times a tick.
-	 *   The turns are read once and reused by every message judged for that seam.
+	 *   The turns are read once and reused by every message judged for that seam —
+	 *   and only for a seam whose page is non-empty, so the #348 stat gate is not
+	 *   needed here (see `parseTurns` for why this path stays on the real parse).
 	 */
 	private confirmAcceptedMail(children: readonly LegionNode[]): void {
 		let remaining = ACCEPTED_MAIL_CONFIRM_LIMIT;

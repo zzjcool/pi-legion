@@ -277,6 +277,7 @@ export {
 	extractVerdict,
 	isLastTurnComplete,
 	parseSessionFile,
+	parseSessionFileCached,
 	parseSessionText,
 } from "./shared/session.ts";
 export {

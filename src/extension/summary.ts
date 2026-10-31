@@ -11,7 +11,8 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { deriveOutcome, parseSessionFile } from "../shared/session.ts";
+import { deriveOutcome } from "../shared/session.ts";
+import { sessionMapFor } from "../shared/session-map.ts";
 import type { ParsedSession } from "../shared/types.ts";
 import {
 	RunStore,
@@ -388,8 +389,11 @@ function makeGroup(role: string, children: SummaryChild[]): SummaryGroup {
 
 /**
  * Aggregate run records without reading the filesystem. Pass parsed session
- * snapshots in `sessions`; the command layer is responsible for obtaining
- * those snapshots with parseSessionFile().
+ * snapshots in `sessions`; the command layer obtains them with
+ * {@link sessionMapFor}, i.e. through `parseSessionFileCached` — a display path,
+ * so an unchanged session file is served from the #348 `(size, mtimeMs)` gate.
+ * `parseSessionFileCached` is exported from `src/api.ts` for a host that wants to
+ * build the same map itself; a read-only `parseSessionFile` snapshot works too.
  */
 export function aggregateSubagentRuns(
 	runs: readonly RunRecord[],
@@ -674,18 +678,6 @@ function parseSummaryArgs(
 
 function filteredRuns(runs: readonly RunRecord[], _all: boolean): RunRecord[] {
 	return [...runs];
-}
-
-function sessionMapFor(runs: readonly RunRecord[]): Map<string, SummarySession> {
-	const sessions = new Map<string, SummarySession>();
-	for (const run of runs) {
-		for (const child of run.children) {
-			if (child.sessionFile) {
-				sessions.set(child.sessionFile, parseSessionFile(child.sessionFile));
-			}
-		}
-	}
-	return sessions;
 }
 
 function completionRuns(cwd: string, all: boolean): RunRecord[] {
