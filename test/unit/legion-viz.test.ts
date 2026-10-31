@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
-import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
+import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds, visibleRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
-import { buildLog, chartWindow, computeStats, drawLog, drawStatus, frame, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
+import { buildLog, chartBuckets, chartWindow, computeStats, drawLog, drawStatus, frame, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
 import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, LEGION_PAGE_BG, MIN_SELECTION_BADGE_W, paintPageFloor, renderLegionView } from "../../src/tui/viz/view.ts";
 import { Canvas, cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, formatActivityAgo, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
@@ -2276,3 +2276,184 @@ test("#251: the maxX guard is load-bearing — it clips the clock, not one cell 
 		);
 	}
 });
+
+// ─────────────────────── #346: one bucketing pass per frame ───────────────────────
+
+test("#346: a rendered frame buckets the sampler exactly once", () => {
+	const { nodes, sampler, now } = scenario();
+	const data = { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
+	let calls = 0;
+	const original = sampler.buckets.bind(sampler);
+	// The chart body and its stats used to compute the SAME buckets independently
+	// (panels.ts drawChart -> buckets + computeStats -> buckets). Any second pass
+	// here means one of them stopped reusing the frame's result.
+	(sampler as { buckets: RateSampler["buckets"] }).buckets = ((...args: Parameters<RateSampler["buckets"]>) => {
+		calls += 1;
+		return original(...args);
+	}) as RateSampler["buckets"];
+	renderLegionView(data, initialViewState(), 120, 40);
+	assert.equal(calls, 1, "one bucketing pass per frame");
+	// Several frames in a row stay at one pass each — no cache, no accumulation.
+	renderLegionView(data, initialViewState(), 160, 50);
+	assert.equal(calls, 2);
+});
+
+test("#346: computeStats reuses the frame's buckets instead of recomputing them", () => {
+	const { nodes, sampler, now } = scenario();
+	const data = { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
+	const window = chartWindow(data);
+	const shared = chartBuckets(data, 80, window);
+	let calls = 0;
+	const original = sampler.buckets.bind(sampler);
+	(sampler as { buckets: RateSampler["buckets"] }).buckets = ((...args: Parameters<RateSampler["buckets"]>) => {
+		calls += 1;
+		return original(...args);
+	}) as RateSampler["buckets"];
+	const reused = computeStats(data, 80, shared);
+	assert.equal(calls, 0, "a passed-in RateSeries must not trigger a second pass");
+	// Identical to the legacy two-argument call, which still works for callers
+	// that have no frame to share (tests, future one-picture consumers).
+	const fresh = computeStats(data, 80);
+	assert.deepEqual(reused, fresh);
+	assert.equal(calls, 1);
+});
+
+test("#346: bucketing only visits the series the frame paints; raw samples are kept", () => {
+	// 40 recorded series, 4 of them still in the tree. The chart must paint the
+	// visible ones and must not pay for the history it no longer shows.
+	const { nodes, sampler, now } = scenario(600, 40);
+	const visible = nodes.filter((n) => n.id === "root" || ["worker-0", "scout-1", "planner-2", "reviewer-3"].includes(n.id));
+	const data = { nodes: visible, sampler, now, rate: 0 };
+	const window = chartWindow(data);
+	const all = sampler.buckets(window.from, window.to, 51);
+	const painted = chartBuckets(data, 51, window);
+	assert.equal(painted.byRole.size > 0, true);
+	const sum = (rows: number[][]) => rows.reduce((total, row) => total + row.reduce((a, b) => a + b, 0), 0);
+	assert.ok(sum([...all.byRole.values()]) > sum([...painted.byRole.values()]), "the invisible series do contribute to the unfiltered pass");
+	assert.equal(
+		sum([...painted.byRole.values()]),
+		sum(["worker-0", "scout-1", "planner-2", "reviewer-3"].map((id) => sampler.nodeBuckets(id, window.from, window.to, 51))),
+		"the frame's pass is exactly the visible series, at the same resolution",
+	);
+	// Invisible series keep their samples: the unfiltered pass is unchanged, so
+	// nothing was pruned from the sampler to get here.
+	assert.deepEqual(all, sampler.buckets(window.from, window.to, 51));
+});
+
+test("#346: a series that stopped before the window edge is skipped without changing a bucket", () => {
+	// `interpolate` clamps at both ends, so a series whose last sample is at or
+	// before the first bucket's trailing edge yields a flat 0 for every bucket.
+	// Skipping it is byte-identical — this compares the fast path against the
+	// per-series reference (`nodeBuckets`, which still walks it).
+	const sampler = new RateSampler();
+	sampler.record(sec(0), [ROOT, node("old", { startedAt: T0, tokensOut: 0, generationMs: 0 })]);
+	sampler.record(sec(10), [ROOT, node("old", { startedAt: T0, tokensOut: 1200, generationMs: 4000 })]);
+	sampler.record(sec(60), [ROOT, node("fresh", { startedAt: sec(60), tokensOut: 0, generationMs: 0 })]);
+	sampler.record(sec(120), [ROOT, node("fresh", { startedAt: sec(60), tokensOut: 600, generationMs: 1000 })]);
+	// Window entirely after "old" stopped (last sample sec(10) ≪ first edge − 60s).
+	const from = sec(300);
+	const to = sec(360);
+	const fast = sampler.buckets(from, to, 12);
+	const reference = new Array<number>(12).fill(0);
+	for (const id of sampler.nodeIds()) {
+		const row = sampler.nodeBuckets(id, from, to, 12);
+		row.forEach((value, i) => { reference[i] = reference[i]! + value; });
+	}
+	assert.deepEqual(fast.total, reference);
+	assert.ok(reference.every((value) => value === 0), "both series are quiet in this window");
+});
+
+test("#346: dropping a node from the frame does not repaint the chart", () => {
+	// The visible-series filter must be invisible in the output: the same six
+	// agents render the same bytes whether or not the sampler still holds 40
+	// finished series that the frame no longer shows.
+	const build = (ghosts: boolean) => {
+		const sampler = new RateSampler();
+		const live = Array.from({ length: 6 }, (_, i) => ({ id: `worker-${i}`, start: i * 10 }));
+		const snap = (t: number): VizNode[] => [ROOT, ...live.filter((s) => s.start <= t).map((s) => node(s.id, {
+			role: "worker",
+			startedAt: sec(s.start),
+			tokensOut: Math.max(0, t - s.start) * 50,
+			generationMs: Math.max(0, t - s.start) * 1000,
+			tokens: 1_000,
+		}))];
+		const extra = (t: number): VizNode[] => (ghosts ? Array.from({ length: 40 }, (_, i) => node(`ghost-${i}`, {
+			role: "settled-worker",
+			startedAt: sec(0),
+			status: "settled",
+			endedAt: sec(60),
+			tokensOut: Math.min(t, 60) * (10 + i),
+			generationMs: Math.min(t, 60) * 1000,
+			tokens: 600,
+		})) : []);
+		for (let t = 0; t <= 240; t += 2) sampler.record(sec(t), [...snap(t), ...extra(t)]);
+		return { nodes: snap(240), sampler, now: sec(240) };
+	};
+	const without = build(false);
+	const withHistory = build(true);
+	assert.equal(without.sampler.nodeIds().length, 6);
+	assert.equal(withHistory.sampler.nodeIds().length, 46, "the ghost series really are recorded");
+	const a = renderLegionView({ ...without, rate: 0 }, initialViewState(), 120, 40).canvas.toPlain();
+	const b = renderLegionView({ ...withHistory, rate: 0 }, initialViewState(), 120, 40).canvas.toPlain();
+	assert.deepEqual(b, a);
+});
+
+test("#346: a frame walks the series that CHANGED inside its window, not every settled row", () => {
+	// The production shape: `data.nodes` comes from the subtree with no status
+	// filter, so 190 settled rows are in the frame — and the sampler keeps
+	// recording them every tick (the flat-run collapse moves their last SAMPLE
+	// forward to `now`). Skipping on the last sample timestamp therefore never
+	// fired: measured 200 series / 190 settled ⇒ walked 200, skipped 0. The skip
+	// has to key on when the VALUE last moved (`changedAt`).
+	const sampler = new RateSampler();
+	const settled = Array.from({ length: 190 }, (_, i) => ({ id: `settled-${i}`, rate: 10 + i }));
+	const active = Array.from({ length: 10 }, (_, i) => ({ id: `active-${i}`, rate: 50 + i }));
+	const nodesAt = (t: number): VizNode[] => [
+		ROOT,
+		...settled.map((s) => node(s.id, {
+			role: "worker",
+			status: t > 120 ? "settled" : "running",
+			startedAt: sec(0),
+			...(t > 120 ? { endedAt: sec(120) } : {}),
+			tokensOut: Math.min(t, 120) * s.rate,
+			generationMs: Math.min(t, 120) * 1000,
+			tokens: 120 * s.rate,
+		})),
+		...active.map((s) => node(s.id, {
+			role: "scout",
+			startedAt: sec(0),
+			tokensOut: t * s.rate,
+			generationMs: t * 1000,
+			tokens: 400 * s.rate,
+		})),
+	];
+	for (let t = 0; t <= 400; t += 2) sampler.record(sec(t), nodesAt(t));
+	const nodes = nodesAt(400);
+	const visible = visibleRateNodeIds(nodes);
+	assert.equal(visible.length, 200, "the subtree lists the 190 settled rows too");
+
+	// A window that starts after they stopped: their columns are provably 0.
+	const to = sec(400);
+	const from = to - RATE_WINDOW_MS;
+	const painted = sampler.buckets(from, to, 51, { onlyNodeIds: visible });
+	assert.equal(sampler.lastPass.walked, 10, `walked ${sampler.lastPass.walked} of 200 series`);
+	assert.equal(sampler.lastPass.skipped, 190, "the 190 settled rows are provably flat here");
+
+	// Skipping is exact, not approximate: the frame's columns equal the sum over
+	// EVERY series, computed by the per-series reference that never skips.
+	const reference = new Array<number>(51).fill(0);
+	for (const id of sampler.nodeIds()) {
+		const row = sampler.nodeBuckets(id, from, to, 51);
+		row.forEach((value, i) => { reference[i] = reference[i]! + value; });
+	}
+	assert.deepEqual(painted.total, reference, "skipping a provably-flat series changes no bucket");
+	assert.ok(reference.some((value) => value > 0), "positive control: the active ten really do paint");
+
+	// The honest residual (contract R2): a window that starts at the RUN's
+	// beginning keeps every series that ever produced in scope — its history is
+	// painted, so it must be walked. Skipping it would zero real columns.
+	sampler.buckets(sec(0), to, 51, { onlyNodeIds: visible });
+	assert.equal(sampler.lastPass.walked, 200, "a whole-run window still walks all 200 (in-window history)");
+	assert.equal(sampler.lastPass.skipped, 0);
+});
+

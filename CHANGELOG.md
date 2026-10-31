@@ -81,6 +81,43 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **`/legion` 的 tok/s 图表一帧只分桶一次，且只算本帧真的要画的 series (#346).** `drawChart` 先给图体
+  分桶、`computeStats` 又用**完全相同的参数**再分一遍，200 节点下一帧白烧 ≈1.2ms 与 ≈0.6MB 垃圾；
+  同时 `RateSampler.buckets()` 会遍历**每一个曾经记录过**的 series（`series` 永无删除点），
+  结束的 child 每帧照算。现在：`chartBuckets(data, count, window?)` 是唯一入口，结果以第三个参数
+  传给 `computeStats(data, buckets, series?)`（不传时退回老签名，语义逐字节一致）；
+  `buckets()` 接受 `BucketOptions.onlyNodeIds`，只遍历 `visibleRateNodeIds(data.nodes)`——settled 行
+  只要还在画就照旧贡献，不在帧里的 series 保留原始采样但不参与本帧计算；同时不再为每个 series
+  新建 `plotW` 长度的临时数组，并对「`changedAt` 早于首桶窗口左沿一个桶窗口」的 series 直接跳过
+  （`interpolate` 两端夹取 ⇒ 每桶 Δ 恒为 0，可证明为同一结果）。
+  `changedAt` 是 `record()` 里值真的变化时才更新的时间戳：上一版用的是**最后一个采样点**，而
+  flat-run collapse 每帧都会把 settled 行的最后一个采样点推到 `now`，所以那条跳过在生产形状下
+  一次都没触发（实测 200 series / 190 settled ⇒ walked 200, skipped 0）。图表的 `avg` 也跟同一份
+  可见集走：不可见 series 不再把它抬起来（实测 40 个已结束 ghost 把 300 tok/s 抬到 1.5k）。
+  实测（120×40 / 200 节点，真 `Theme(dark)`，50 帧 × 3 轮）：帧 median 6.5ms → 4.4ms（−32%）、
+  p95 9.1ms → 4.8ms（−40%）、`drawChart` 2.65ms → 0.6ms（−77%）、`buckets()` 1.24ms → 0.47ms；
+  帧分配 4214KB → 3306KB、`drawChart` 1432KB → 530KB。尾部 60s 窗口形状下 190 个 settled series
+  现在真的被跳过（walked 200 → 10，`buckets()` 0.89ms → 0.10ms）；**整轮窗口下它们仍在窗内、
+  必须照画**——「结束的 child 不再每帧收税」这句上一版契约的话是错的，已在契约 R2 如实改写。
+  图表外观与 `/legion` 其余输出不变。契约：`docs/contracts/legion-chart-frame-buckets-v1.md`。
+
+- **`finished` 完成结果缓存有了有界淘汰：每条 ≤8KB、合计 ≤1MB 驻留 output 文本，淘汰只丢文本、留结果 (#349).**
+  这个 one-round 缓存原本为每个完成过的 child 留一份**输出全文**且永不淘汰——实测 50 child ×
+  204,800B ⇒ GC 后驻留 10.07MB，长会话按 child 数单调增长。现在按 LRU：单条驻留 ≤8KB
+  （`FINISHED_CACHE_MAX_ENTRY_BYTES`）、合计 ≤1MB（`FINISHED_CACHE_MAX_OUTPUT_BYTES`）、
+  条目数 ≤128（=1MB/8KB，`FINISHED_CACHE_MAX_ENTRIES`），超出的条目剥成 4000 字符预览，
+  但**条目本身与 `runId`/`round`/`execution`/`acceptance`/`outputFile` 全部保留**——删条目会把
+  `collect`/`wait` 变成 `missing`（结果丢失）并抹掉本轮的 claim 键。命中时从
+  `snapshot.outputFile` 重新读回全文，因此 `wait`/`collect` 在淘汰前后返回**同样的结果**
+  （文本等价到 `output.trim()`）。缓存条目是**快照的浅拷贝**：淘汰只动缓存自己的那份，
+  已经交给调用方（以及 `join.onTerminal` 读的同一个对象）的结果永远不会被事后改写；
+  上一版存的是引用，插入时就把 >4MB 的输出原地剥成了 4000 字头（首次 `wait` 拿不到全文）。
+  没有 `outputFile` 的条目（宿主自备 collect、写盘失败）是 **pinned**，按契约不淘汰，字节数由
+  `noticeQueueStats().finished.pinnedBytes` 报出（新增 `finished` 计数块：`entries` /
+  `residentBytes` / `stripped` / `pinnedBytes`）；盘上文件被删时降级为「4000 字符头 + 元数据 +
+  `CollectSnapshot.outputTruncated: true`」，永远不是 `missing`。实测：50 child × 204,800B 驻留
+  10.07MB → **0.51MB**（满足 #349 的 ≤1.0MB），重新 track 全部后回落到基线。
+  契约：`docs/contracts/finished-cache-eviction-v1.md`。
 - **A 500ms status refresh no longer re-parses a session file that has not been written since the
   last tick (#348).** `refreshUi()` → `statusEntries()` parsed every child's session file — plus every
   historical ledger row that carries one — once per tick, changed or not: one idle child cost 119
