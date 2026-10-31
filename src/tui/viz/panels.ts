@@ -39,6 +39,9 @@ export function frame(cv: Canvas, r: Rect, title: string, focused: boolean, hint
 	return { x: r.x + 1, y: r.y + 1, w: r.w - 2, h: r.h - 2 };
 }
 
+/** Shared empty list: `map.get(id) ?? []` allocated one array per miss, per pass (~200/frame). */
+const NO_NODES: VizNode[] = [];
+
 export function childrenMap(nodes: readonly VizNode[]): Map<string | null, VizNode[]> {
 	const map = new Map<string | null, VizNode[]>();
 	for (const node of nodes) {
@@ -51,18 +54,23 @@ export function childrenMap(nodes: readonly VizNode[]): Map<string | null, VizNo
 	return map;
 }
 
-/** Depth-first order (roots first), used for keyboard navigation. */
-export function dfsOrder(nodes: readonly VizNode[]): VizNode[] {
-	const kids = childrenMap(nodes);
+/**
+ * Depth-first order (roots first), used for keyboard navigation.
+ *
+ * #364 A4: `kids` is optional so a caller that already built this frame's
+ * `childrenMap` (the galaxy legend) hands it over instead of paying for a second
+ * copy of the same map. The default keeps every existing caller unchanged.
+ */
+export function dfsOrder(nodes: readonly VizNode[], kids: Map<string | null, VizNode[]> = childrenMap(nodes)): VizNode[] {
 	const out: VizNode[] = [];
 	const visit = (node: VizNode, guard: Set<string>): void => {
 		if (guard.has(node.id)) return;
 		guard.add(node.id);
 		out.push(node);
-		for (const child of kids.get(node.id) ?? []) visit(child, guard);
+		for (const child of kids.get(node.id) ?? NO_NODES) visit(child, guard);
 	};
 	const guard = new Set<string>();
-	for (const root of kids.get(null) ?? []) visit(root, guard);
+	for (const root of kids.get(null) ?? NO_NODES) visit(root, guard);
 	for (const node of nodes) if (!guard.has(node.id)) visit(node, guard);
 	return out;
 }
@@ -71,6 +79,129 @@ export function dfsOrder(nodes: readonly VizNode[]): VizNode[] {
 
 const BRAILLE_BITS = [[0x1, 0x8], [0x2, 0x10], [0x4, 0x20], [0x40, 0x80]] as const;
 
+/**
+ * `String.fromCharCode(0x2800 + m)` for all 256 bit patterns, hoisted to module
+ * scope (#364 A2): the paint loop used to build one fresh glyph string per
+ * painted cell — 2,000+ strings a frame at 200×60.
+ */
+const BRAILLE_GLYPHS: string[] = Array.from({ length: 256 }, (_, m) => String.fromCharCode(0x2800 + m));
+
+/** Label search offsets and side order, hoisted out of the per-candidate loop (#364 A2). */
+const LABEL_DY = [0, -1, 1, -2, 2] as const;
+const SIDES_RIGHT = [1, -1] as const;
+const SIDES_LEFT = [-1, 1] as const;
+/** Two constant style objects: `text()` only reads them, so every label can share one. */
+const LABEL_STYLE = { bold: true, inverse: false };
+const LABEL_STYLE_SELECTED = { bold: true, inverse: true };
+/** Legend entries in fixed order (failed before retired); filtered per frame, never rebuilt. */
+const STATUS_ITEMS = [["failed", "✗ failed", "error"], ["retired", "⣿ retired", "dim"]] as const;
+
+/**
+ * Two-argument `Math.hypot`, inlined.
+ *
+ * `Math.hypot` is a variadic builtin: V8 materialises an arguments array on every
+ * call, and the disc fill alone makes ~10k of them per frame — measured at
+ * **170KB/frame**, a third of `drawGalaxy`'s allocation and the single largest
+ * item left after the buffers were reused (#364 S1).
+ *
+ * This is the same algorithm V8 runs for it (scale by the larger magnitude, then
+ * `max * sqrt(sum of scaled squares)`), which is why it is bit-for-bit equal to
+ * `Math.hypot(a, b)` — exported only so
+ * `test/unit/legion-viz.test.ts` can hold that equality over the whole drawing
+ * domain (all disc-fill coordinate pairs + 5k random pairs). The page digests are
+ * the second guard: a one-ulp difference would move a `<= rad` comparison and
+ * change the picture.
+ */
+export function hypot2(a: number, b: number): number {
+	const x = Math.abs(a);
+	const y = Math.abs(b);
+	if (x === Number.POSITIVE_INFINITY || y === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
+	const max = x > y ? x : y;
+	if (max === 0) return 0;
+	const xr = x / max;
+	const yr = y / max;
+	return max * Math.sqrt(xr * xr + yr * yr);
+}
+
+interface PxCell {
+	m: number;
+	col: string;
+	z: number;
+}
+
+/**
+ * #364 A1: the braille pixel buffer is rewritten in place instead of reallocated
+ * every frame (3,658 cells at 200×60, ~64B each).
+ *
+ * **Contract T1**: every cell's `m` and `z` MUST be cleared before a frame. `m`
+ * only ever accumulates (`|=`), and `z` is the write gate (`z >= cell.z`), so a
+ * stale `z` from the previous frame would reject this frame's lower-priority
+ * dots — and a cell with `m != 0` always has its `col` read for the glyph, i.e.
+ * last frame's colour would leak into this frame's picture. `col` itself is
+ * deliberately NOT cleared: with `z = -1` every dot that sets a bit also sets
+ * `col`, so "`m != 0` ⇒ `col` is this frame's" holds, and clearing it would just
+ * add 3,658 pointless stores.
+ */
+let pxWidth = -1;
+let pxHeight = -1;
+let pxGrid: PxCell[][] = [];
+
+function pixelGrid(width: number, height: number): PxCell[][] {
+	if (width !== pxWidth || height !== pxHeight) {
+		const rows: PxCell[][] = new Array(height);
+		for (let y = 0; y < height; y++) {
+			const row: PxCell[] = new Array(width);
+			for (let x = 0; x < width; x++) row[x] = { m: 0, col: "", z: -1 };
+			rows[y] = row;
+		}
+		pxGrid = rows;
+		pxWidth = width;
+		pxHeight = height;
+		return rows;
+	}
+	for (let y = 0; y < height; y++) {
+		const row = pxGrid[y]!;
+		for (let x = 0; x < width; x++) {
+			const cell = row[x]!;
+			cell.m = 0;
+			cell.z = -1;
+		}
+	}
+	return pxGrid;
+}
+
+/**
+ * Frame-local scratch for `drawGalaxy` (#364 A1). Every container is emptied at
+ * the top of the frame; nothing survives into the next one.
+ *
+ * **Contract T2/T3**: `data.nodes` and every `VizNode` is a NEW object each frame
+ * (`status.ts:925` → `model.ts:93`), and the drawing path compares nodes by
+ * IDENTITY (`node === center`, `node === virtualRoot`). A cross-frame cache of
+ * these maps would hand back last frame's objects and degrade the centre sphere
+ * to a plain node, so they may only ever hold *this* frame's data — which is why
+ * they are reset unconditionally rather than keyed on anything.
+ */
+const galaxyLeafMemo = new Map<string, number>();
+const galaxyLeafGuard = new Set<string>();
+const galaxyDepthGuard = new Set<string>();
+const galaxyLayGuard = new Set<string>();
+const galaxyRel = new Map<string, number>();
+const galaxyRadii = new Map<string, number>();
+/** id → index into `galaxyPosX/Y` (two number arrays beat N `[x, y]` tuples per frame). */
+const galaxyPos = new Map<string, number>();
+const galaxyPosX: number[] = [];
+const galaxyPosY: number[] = [];
+let galaxyPosCount = 0;
+const galaxyAll: VizNode[] = [];
+const galaxyRunning: number[] = [];
+const galaxyCandidates: VizNode[] = [];
+const galaxyRoles: string[] = [];
+const galaxyStatusItems: Array<(typeof STATUS_ITEMS)[number]> = [];
+const galaxyOccX: number[] = [];
+const galaxyOccY: number[] = [];
+const galaxyOccW: number[] = [];
+let galaxyOccCount = 0;
+
 export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: string | undefined): void {
 	if (r.w < 6 || r.h < 3) return;
 	const legendRows = 1;
@@ -78,7 +209,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	const CH = r.h - legendRows;
 	const PW = CW * 2;
 	const PH = CH * 4;
-	const px = Array.from({ length: CH }, () => Array.from({ length: CW }, () => ({ m: 0, col: "", z: -1 })));
+	const px = pixelGrid(CW, CH);
 	const dot = (x: number, y: number, col: string, z: number): void => {
 		const ix = Math.round(x);
 		const iy = Math.round(y);
@@ -90,6 +221,10 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 			cell.col = col;
 		}
 	};
+	// Contract T4: the seed resets to 99 every frame. Every `rnd()` call below must
+	// stay in the same order and count — the star dust and the twinkle pattern are
+	// this exact sequence, so "skip a dot to save an allocation" moves every later
+	// value and changes the picture.
 	let seed = 99;
 	const rnd = (): number => (seed = (seed * 16807) % 2147483647) / 2147483647;
 	for (let i = 0; i < (CW * CH) / 12; i++) dot(rnd() * PW, rnd() * PH, "borderMuted", 0);
@@ -100,44 +235,66 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 		cv.text(r.x + Math.max(0, Math.floor((r.w - msg.length) / 2)), r.y + Math.floor(r.h / 2) + 2, ellipsize(msg, r.w), "dim");
 	}
 	const kids = childrenMap(nodes);
-	const roots = kids.get(null) ?? [];
+	const roots = kids.get(null) ?? NO_NODES;
 	const virtualRoot: VizNode | undefined = roots.length === 1 ? undefined : {
 		id: "\u0000center", name: "legion", role: "centurion", parentId: null, depth: 0, status: "running", startedAt: data.now, tokens: 0, tokensOut: 0, generationMs: 0,
 	};
-	const childrenOf = (node: VizNode): VizNode[] => node === virtualRoot ? roots : kids.get(node.id) ?? [];
+	const childrenOf = (node: VizNode): VizNode[] => node === virtualRoot ? roots : kids.get(node.id) ?? NO_NODES;
 	const center = virtualRoot ?? roots[0]!;
 	if (!center) return;
-	const leafMemo = new Map<string, number>();
-	const leaves = (node: VizNode, guard = new Set<string>()): number => {
-		if (leafMemo.has(node.id)) return leafMemo.get(node.id)!;
-		if (guard.has(node.id)) return 1;
-		guard.add(node.id);
+	// Leaf counts (contract T3: id-keyed, so this memo is frame-scoped only).
+	// The old signature was `leaves(node, guard = new Set())`, i.e. one throw-away
+	// Set per call site — ~2N−1 per frame — while only the first call ever walks
+	// (every later one is a memo hit). A cleared shared set reproduces the exact
+	// "fresh guard per top-level call" semantics for free.
+	galaxyLeafMemo.clear();
+	const leavesWalk = (node: VizNode): number => {
+		const memo = galaxyLeafMemo.get(node.id);
+		if (memo !== undefined) return memo;
+		if (galaxyLeafGuard.has(node.id)) return 1;
+		galaxyLeafGuard.add(node.id);
 		const children = childrenOf(node);
-		const value = children.length ? children.reduce((sum, child) => sum + leaves(child, guard), 0) : 1;
-		leafMemo.set(node.id, value);
+		let value = 1;
+		if (children.length > 0) {
+			value = 0;
+			for (const child of children) value += leavesWalk(child);
+		}
+		galaxyLeafMemo.set(node.id, value);
 		return value;
 	};
+	const leaves = (node: VizNode): number => {
+		const memo = galaxyLeafMemo.get(node.id);
+		if (memo !== undefined) return memo;
+		galaxyLeafGuard.clear();
+		return leavesWalk(node);
+	};
 	let maxRel = 1;
-	const rel = new Map<string, number>();
+	galaxyRel.clear();
+	galaxyDepthGuard.clear();
 	(function depth(node: VizNode, d: number, guard: Set<string>): void {
 		if (guard.has(node.id)) return;
 		guard.add(node.id);
-		rel.set(node.id, d);
+		galaxyRel.set(node.id, d);
 		maxRel = Math.max(maxRel, d);
 		for (const child of childrenOf(node)) depth(child, d + 1, guard);
-	})(center, 0, new Set());
+	})(center, 0, galaxyDepthGuard);
 	const cx = PW / 2;
 	const cy = PH / 2;
 	const RY = Math.max(2, PH / 2 - 3);
 	const RX = Math.max(2, PW / 2 - 6);
-	const pos = new Map<string, [number, number]>();
+	galaxyPos.clear();
+	galaxyPosCount = 0;
+	galaxyLayGuard.clear();
 	(function lay(node: VizNode, a0: number, a1: number, guard: Set<string>): void {
 		if (guard.has(node.id)) return;
 		guard.add(node.id);
 		const a = (a0 + a1) / 2;
-		const d = rel.get(node.id) ?? 0;
+		const d = galaxyRel.get(node.id) ?? 0;
 		const k = Math.pow(d / maxRel, 0.85);
-		pos.set(node.id, [cx + Math.cos(a) * RX * k, cy + Math.sin(a) * RY * k]);
+		galaxyPos.set(node.id, galaxyPosCount);
+		galaxyPosX[galaxyPosCount] = cx + Math.cos(a) * RX * k;
+		galaxyPosY[galaxyPosCount] = cy + Math.sin(a) * RY * k;
+		galaxyPosCount += 1;
 		let start = a0;
 		const total = leaves(node);
 		for (const child of childrenOf(node)) {
@@ -145,33 +302,41 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 			lay(child, start, start + span, guard);
 			start += span;
 		}
-	})(center, -Math.PI / 2, Math.PI * 1.5, new Set());
+	})(center, -Math.PI / 2, Math.PI * 1.5, galaxyLayGuard);
 
 	for (let d = 1; d <= maxRel; d++) {
 		const k = Math.pow(d / maxRel, 0.85);
 		for (let a = 0; a < Math.PI * 2; a += 0.02) if (Math.floor(a * 60) % 4 === 0) dot(cx + Math.cos(a) * RX * k, cy + Math.sin(a) * RY * k, "borderMuted", 0);
 	}
-	const all = virtualRoot ? [virtualRoot, ...nodes] : [...nodes];
-	for (const node of all) {
+	galaxyAll.length = 0;
+	if (virtualRoot) galaxyAll.push(virtualRoot);
+	for (const node of nodes) galaxyAll.push(node);
+	for (const node of galaxyAll) {
 		const parentId = node === virtualRoot ? undefined : node.parentId ?? (virtualRoot ? virtualRoot.id : undefined);
 		if (!parentId) continue;
-		const a = pos.get(parentId);
-		const b = pos.get(node.id);
-		if (!a || !b) continue;
-		const dist = Math.hypot(b[0] - a[0], b[1] - a[1]);
+		const ai = galaxyPos.get(parentId);
+		const bi = galaxyPos.get(node.id);
+		if (ai === undefined || bi === undefined) continue;
+		const ax = galaxyPosX[ai]!;
+		const ay = galaxyPosY[ai]!;
+		const bx = galaxyPosX[bi]!;
+		const by = galaxyPosY[bi]!;
+		const dist = hypot2(bx - ax, by - ay);
 		const col = node.status === "running" ? roleColor(node.role) : node.status === "failed" ? "error" : "borderMuted";
-		for (let t = 0; t < dist; t += 1.7) dot(a[0] + ((b[0] - a[0]) * t) / dist, a[1] + ((b[1] - a[1]) * t) / dist, col, 1);
+		for (let t = 0; t < dist; t += 1.7) dot(ax + ((bx - ax) * t) / dist, ay + ((by - ay) * t) / dist, col, 1);
 	}
-	const maxTokens = Math.max(1, ...nodes.map((node) => node.tokens));
-	const radii = new Map<string, number>();
-	for (const node of all) {
-		const p = pos.get(node.id);
-		if (!p) continue;
-		const [x, y] = p;
+	let maxTokens = 1;
+	for (const node of nodes) if (node.tokens > maxTokens) maxTokens = node.tokens;
+	galaxyRadii.clear();
+	for (const node of galaxyAll) {
+		const index = galaxyPos.get(node.id);
+		if (index === undefined) continue;
+		const x = galaxyPosX[index]!;
+		const y = galaxyPosY[index]!;
 		const isCenter = node === center;
 		const col = isCenter ? roleColor(node.role) : nodeToken(node);
 		let rad = isCenter ? Math.max(2, Math.min(5, PH / 14)) : Math.max(node.status === "failed" ? 1.5 : 0.8, 0.8 + Math.sqrt(node.tokens / maxTokens) * Math.min(4, PH / 16));
-		radii.set(node.id, rad);
+		galaxyRadii.set(node.id, rad);
 		if (node.status === "running" && !isCenter) {
 			const act = Math.min(1, data.sampler.nodeRate(node.id, data.now) / 250);
 			for (let i = 0; i < 12 + rad * 6; i++) {
@@ -190,7 +355,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 		const xs = isCenter ? 1.6 : 1;
 		for (let yy = -Math.ceil(rad); yy <= Math.ceil(rad); yy++) {
 			for (let xx = -Math.ceil(rad * xs); xx <= Math.ceil(rad * xs); xx++) {
-				if (Math.hypot(xx / xs, yy) <= rad) dot(x + xx, y + yy, col, 3);
+				if (hypot2(xx / xs, yy) <= rad) dot(x + xx, y + yy, col, 3);
 			}
 		}
 		if (node.id === selectedId) {
@@ -201,71 +366,99 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	for (let j = 0; j < CH; j++) {
 		for (let i = 0; i < CW; i++) {
 			const cell = px[j]![i]!;
-			if (cell.m) cv.set(r.x + i, r.y + j, String.fromCharCode(0x2800 + cell.m), cell.col);
+			if (cell.m) cv.set(r.x + i, r.y + j, BRAILLE_GLYPHS[cell.m]!, cell.col);
 		}
 	}
 	// Labels: selected, center, depth-1 live, failed, and the heaviest running agents.
-	const running = nodes.filter((node) => node.status === "running" && isAgent(node)).map((node) => node.tokens).sort((a, b) => b - a);
-	const heavy = running[Math.min(running.length - 1, 4)] ?? Number.POSITIVE_INFINITY;
-	const candidates = all.filter((node) =>
-		node.id === selectedId || node === center || node.status === "failed" ||
-		((rel.get(node.id) ?? 9) <= 1 && node.status !== "retired") ||
-		(node.status === "running" && node.tokens >= heavy),
-	).sort((a, b) =>
+	galaxyRunning.length = 0;
+	for (const node of nodes) if (node.status === "running" && isAgent(node)) galaxyRunning.push(node.tokens);
+	galaxyRunning.sort((a, b) => b - a);
+	const heavy = galaxyRunning[Math.min(galaxyRunning.length - 1, 4)] ?? Number.POSITIVE_INFINITY;
+	galaxyCandidates.length = 0;
+	for (const node of galaxyAll) {
+		if (
+			node.id === selectedId || node === center || node.status === "failed" ||
+			((galaxyRel.get(node.id) ?? 9) <= 1 && node.status !== "retired") ||
+			(node.status === "running" && node.tokens >= heavy)
+		) galaxyCandidates.push(node);
+	}
+	galaxyCandidates.sort((a, b) =>
 		Number(b.id === selectedId) - Number(a.id === selectedId) ||
 		Number(b === center) - Number(a === center) ||
 		b.tokens - a.tokens,
 	);
-	const occupied: Array<{ x: number; y: number; w: number }> = [];
-	const free = (x: number, y: number, w: number): boolean =>
-		x >= r.x && x + w <= r.x + r.w && y >= r.y && y < r.y + CH &&
-		!occupied.some((o) => o.y === y && x < o.x + o.w + 1 && o.x < x + w + 1);
-	for (const node of candidates) {
-		const p = pos.get(node.id);
-		if (!p) continue;
-		const lx = r.x + Math.round(p[0] / 2);
-		const ly = r.y + Math.round(p[1] / 4);
+	galaxyOccCount = 0;
+	const free = (x: number, y: number, w: number): boolean => {
+		if (!(x >= r.x && x + w <= r.x + r.w && y >= r.y && y < r.y + CH)) return false;
+		for (let i = 0; i < galaxyOccCount; i++) {
+			const oy = galaxyOccY[i]!;
+			const ox = galaxyOccX[i]!;
+			const ow = galaxyOccW[i]!;
+			if (oy === y && x < ox + ow + 1 && ox < x + w + 1) return false;
+		}
+		return true;
+	};
+	for (const node of galaxyCandidates) {
+		const index = galaxyPos.get(node.id);
+		if (index === undefined) continue;
+		const px0 = galaxyPosX[index]!;
+		const py0 = galaxyPosY[index]!;
+		const lx = r.x + Math.round(px0 / 2);
+		const ly = r.y + Math.round(py0 / 4);
 		const label = ellipsize(node.name + (node.status === "failed" ? " ✗" : ""), Math.max(4, Math.floor(r.w / 3)));
-		const len = Array.from(label).length;
-		const rw = Math.ceil((radii.get(node.id) ?? 1) * (node === center ? 1.6 : 1) / 2) + (node.id === selectedId ? 3 : 1);
-		const right = p[0] >= cx - 4;
+		const len = cellWidth(label);
+		const rw = Math.ceil((galaxyRadii.get(node.id) ?? 1) * (node === center ? 1.6 : 1) / 2) + (node.id === selectedId ? 3 : 1);
+		const right = px0 >= cx - 4;
+		const sides = right ? SIDES_RIGHT : SIDES_LEFT;
 		let placed = false;
-		for (const dy of [0, -1, 1, -2, 2]) {
-			for (const side of right ? [1, -1] : [-1, 1]) {
-				if (placed) break;
+		for (let di = 0; di < LABEL_DY.length && !placed; di++) {
+			const dy = LABEL_DY[di]!;
+			for (let si = 0; si < sides.length; si++) {
+				const side = sides[si]!;
 				const sx = side > 0 ? lx + rw : lx - rw - len;
 				if (!free(sx, ly + dy, len)) continue;
 				const selected = node.id === selectedId;
-				cv.text(sx, ly + dy, label, node === center ? roleColor(node.role) : nodeToken(node), { bold: true, inverse: selected });
-				occupied.push({ x: sx, y: ly + dy, w: len });
+				cv.text(sx, ly + dy, label, node === center ? roleColor(node.role) : nodeToken(node), selected ? LABEL_STYLE_SELECTED : LABEL_STYLE);
+				galaxyOccX[galaxyOccCount] = sx;
+				galaxyOccY[galaxyOccCount] = ly + dy;
+				galaxyOccW[galaxyOccCount] = len;
+				galaxyOccCount += 1;
 				placed = true;
+				break;
 			}
 		}
 	}
 	// Legend: roles that actually appear (dynamic), then status hints.
 	// Reserve room for failed/retired glyphs first so a narrow panel still matches live scout (#102/#125).
-	const ly = r.y + r.h - 1;
-	let lx = r.x + 1;
-	const roles: string[] = [];
-	for (const node of dfsOrder(nodes)) if (isAgent(node) && !roles.includes(node.role)) roles.push(node.role);
-	const statuses = new Set(nodes.map((node) => node.status));
-	const statusItems = ([["failed", "✗ failed", "error"], ["retired", "⣿ retired", "dim"]] as const)
-		.filter(([status]) => statuses.has(status));
-	// Budget in grapheme cells (not String.length) so multi-byte / emoji labels do not squeeze roles (#128).
-	const statusBudget = statusItems.reduce((sum, [, label]) => sum + cellWidth(label) + 2, 0);
-	const roleLimit = r.x + r.w - 1 - statusBudget;
-	for (const role of roles) {
-		const w = cellWidth(role) + 4;
-		if (lx + w > roleLimit) break;
-		cv.set(lx, ly, "⣿", roleColor(role));
-		cv.text(lx + 2, ly, role, "dim");
-		lx += w;
+	const legendY = r.y + r.h - 1;
+	let legendX = r.x + 1;
+	galaxyRoles.length = 0;
+	for (const node of dfsOrder(nodes, kids)) if (isAgent(node) && !galaxyRoles.includes(node.role)) galaxyRoles.push(node.role);
+	let hasFailed = false;
+	let hasRetired = false;
+	for (const node of nodes) {
+		if (node.status === "failed") hasFailed = true;
+		else if (node.status === "retired") hasRetired = true;
 	}
-	for (const [, label, col] of statusItems) {
+	galaxyStatusItems.length = 0;
+	for (const item of STATUS_ITEMS) if (item[0] === "failed" ? hasFailed : hasRetired) galaxyStatusItems.push(item);
+	// Budget in grapheme cells (not String.length) so multi-byte / emoji labels do not squeeze roles (#128).
+	let statusBudget = 0;
+	for (const item of galaxyStatusItems) statusBudget += cellWidth(item[1]) + 2;
+	const roleLimit = r.x + r.w - 1 - statusBudget;
+	for (const role of galaxyRoles) {
+		const w = cellWidth(role) + 4;
+		if (legendX + w > roleLimit) break;
+		cv.set(legendX, legendY, "⣿", roleColor(role));
+		cv.text(legendX + 2, legendY, role, "dim");
+		legendX += w;
+	}
+	for (const item of galaxyStatusItems) {
+		const label = item[1];
 		const lw = cellWidth(label);
-		if (lx + lw + 1 > r.x + r.w - 1) break;
-		cv.text(lx, ly, label, col);
-		lx += lw + 2;
+		if (legendX + lw + 1 > r.x + r.w - 1) break;
+		cv.text(legendX, legendY, label, item[2]);
+		legendX += lw + 2;
 	}
 }
 

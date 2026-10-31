@@ -47,12 +47,28 @@ export function roleToken(role: string): string {
 /** Prefix marking a cell color as "the color of this agent type", resolved per theme at paint time. */
 export const ROLE_COLOR_PREFIX = "role:";
 
+/**
+ * `roleColor` used to build two strings per call (a `toLowerCase()` and the
+ * template) and the galaxy asks for one per edge, per node and per label —
+ * hundreds per frame, for the same handful of values.
+ *
+ * #364 A2: memoized on the role name, which is a stable scalar; the function is
+ * pure, so there is no invalidation to get wrong (contract I7 — the key *is* the
+ * input). The cap only stops a pathological caller from growing the table.
+ */
+const ROLE_COLOR_CACHE = new Map<string, string>();
+const ROLE_COLOR_CACHE_MAX = 512;
+
 /** Deferred per-type color; resolved by `resolveRolePalette` when a canvas is painted. */
 export function roleColor(role: string): string {
+	const cached = ROLE_COLOR_CACHE.get(role);
+	if (cached !== undefined) return cached;
 	// The ledger root is the user's own pi session, not an agent type: keep it
 	// neutral so it never takes a type's color (centurion owns accent).
-	if (role.toLowerCase() === "root") return "text";
-	return `${ROLE_COLOR_PREFIX}${role.toLowerCase()}`;
+	const out = role.toLowerCase() === "root" ? "text" : `${ROLE_COLOR_PREFIX}${role.toLowerCase()}`;
+	if (ROLE_COLOR_CACHE.size >= ROLE_COLOR_CACHE_MAX) ROLE_COLOR_CACHE.clear();
+	ROLE_COLOR_CACHE.set(role, out);
+	return out;
 }
 
 /**

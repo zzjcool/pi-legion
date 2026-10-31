@@ -56,7 +56,21 @@ export class Canvas {
 	text(x: number, y: number, value: string, color?: string, style: { bold?: boolean; inverse?: boolean; maxX?: number } = {}): number {
 		const limit = Math.min(this.width, style.maxX ?? this.width);
 		let col = x;
-		for (const ch of Array.from(value)) {
+		// #364: walk code points by index instead of `Array.from(value)` — the old
+		// loop allocated one throw-away array per written string, and the galaxy
+		// writes ~100 label strings and the legend per frame. Surrogate pairs are
+		// the only case that still builds a string, and `sanitizeChar` collapses
+		// them exactly as it did before.
+		for (let i = 0; i < value.length; i++) {
+			let ch = value[i] as string;
+			const code = value.charCodeAt(i);
+			if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+				const low = value.charCodeAt(i + 1);
+				if (low >= 0xdc00 && low <= 0xdfff) {
+					ch = value.slice(i, i + 2);
+					i++;
+				}
+			}
 			if (col >= limit) break;
 			if (col >= 0) this.set(col, y, ch, color, style);
 			col++;
@@ -130,17 +144,63 @@ function isWide(code: number): boolean {
 	);
 }
 
+/** Length of the code point at `i`, in UTF-16 units (2 only for a surrogate pair). */
+function codePointLength(value: string, i: number): number {
+	const code = value.charCodeAt(i);
+	if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
+		const low = value.charCodeAt(i + 1);
+		if (low >= 0xdc00 && low <= 0xdfff) return 2;
+	}
+	return 1;
+}
+
 /** Grapheme / cell count (UTF-16-safe). Prefer over `String.length` for layout budgets. */
 export function cellWidth(value: string): number {
-	return Array.from(value).length;
+	// #364: same answer as `Array.from(value).length` without materialising the array.
+	let count = 0;
+	for (let i = 0; i < value.length; i += codePointLength(value, i)) count++;
+	return count;
 }
 
 /** Truncate plain text to `width` single-width cells with an ellipsis. */
 export function ellipsize(value: string, width: number): string {
-	const chars = Array.from(value).map(sanitizeChar);
 	if (width <= 0) return "";
-	if (chars.length <= width) return chars.join("");
-	return `${chars.slice(0, Math.max(0, width - 1)).join("")}…`;
+	if (cellWidth(value) <= width) return sanitizeAll(value);
+	const keep = Math.max(0, width - 1);
+	let out = "";
+	let taken = 0;
+	for (let i = 0; i < value.length && taken < keep; i += codePointLength(value, i)) {
+		out += sanitizeChar(codePointAt(value, i));
+		taken++;
+	}
+	return `${out}…`;
+}
+
+/** The code point starting at `i` as a string (a lone surrogate comes back as itself). */
+function codePointAt(value: string, i: number): string {
+	return codePointLength(value, i) === 2 ? value.slice(i, i + 2) : (value[i] as string);
+}
+
+/**
+ * `Array.from(value).map(sanitizeChar).join("")`, but returns `value` untouched
+ * when nothing needs sanitising — which is the common case (agent names, role
+ * names, legend labels) and what keeps `ellipsize` allocation-free there.
+ * #364 A2/A3: the old version built a per-code-point array + string for every
+ * label on every frame.
+ */
+function sanitizeAll(value: string): string {
+	let changed = false;
+	for (let i = 0; i < value.length; i += codePointLength(value, i)) {
+		const raw = codePointAt(value, i);
+		if (sanitizeChar(raw) !== raw) {
+			changed = true;
+			break;
+		}
+	}
+	if (!changed) return value;
+	let out = "";
+	for (let i = 0; i < value.length; i += codePointLength(value, i)) out += sanitizeChar(codePointAt(value, i));
+	return out;
 }
 
 function renderRow(row: Cell[], theme: VizTheme): string {

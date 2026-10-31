@@ -8,7 +8,7 @@ import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds, v
 import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
-import { buildLog, chartBuckets, chartWindow, computeStats, drawLog, drawStatus, frame, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
+import { buildLog, chartBuckets, chartWindow, computeStats, drawLog, drawStatus, frame, hypot2, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
 import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, LEGION_PAGE_BG, MIN_SELECTION_BADGE_W, paintPageFloor, renderLegionView } from "../../src/tui/viz/view.ts";
 import { Canvas, cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, formatActivityAgo, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
@@ -2595,4 +2595,27 @@ test("#364: the /legion page renders the same bytes it did before the frame-allo
 		};
 	}
 	assert.deepEqual(actual, expected, "the page's bytes moved");
+});
+
+test("#364: the inlined hypot2 is bit-for-bit Math.hypot over the galaxy's domain", () => {
+	// `drawGalaxy` cannot afford `Math.hypot`: it is a variadic builtin, so V8
+	// materialises an arguments array on every call — measured 170KB/frame at the
+	// 200x60 galaxy rect, a third of what the panel allocated before #364 S1.
+	// `hypot2` runs the same algorithm V8 does (scale by the larger magnitude,
+	// then `max * sqrt(sum of scaled squares)`), so it must return the identical
+	// double: a one-ulp difference flips a `<= rad` test and moves the picture.
+	let seed = 12345;
+	const rnd = (): number => (seed = (seed * 16807) % 2147483647) / 2147483647;
+	let checked = 0;
+	const same = (a: number, b: number): void => {
+		assert.equal(hypot2(a, b), Math.hypot(a, b), `hypot2(${a}, ${b})`);
+		checked++;
+	};
+	// The disc fill: `hypot(xx / xs, yy) <= rad` for both radius samplings.
+	for (const xs of [1, 1.6]) for (let xx = -20; xx <= 20; xx++) for (let yy = -20; yy <= 20; yy++) same(xx / xs, yy);
+	// Edge distances: the difference between two galaxy pixel positions (|x| <= PW, |y| <= PH).
+	for (let i = 0; i < 5000; i++) same((rnd() - 0.5) * 840, (rnd() - 0.5) * 840);
+	// Degenerate and extreme inputs keep Math.hypot's answers too.
+	for (const pair of [[0, 0], [-0, 0], [0, -0], [1, 0], [0, 1], [-3, -4], [3e200, 4e200], [1e-200, 1e-200], [Number.NaN, 1]] as const) same(pair[0], pair[1]);
+	assert.ok(checked > 8000, `only ${checked} pairs checked`);
 });
