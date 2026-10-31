@@ -21,7 +21,7 @@ import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "..
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { evaluatePhaseTransition, isTerminalPhase } from "../legion/state-machine.ts";
-import { phaseStart } from "../legion/phase-machine.ts";
+import { phaseStart, type PhaseMachine } from "../legion/phase-machine.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import {
 	ALLOW_NESTED_ENV,
@@ -107,6 +107,16 @@ export interface OrchestratorLegionContext {
 	runStore?: RunStore;
 	settings?: LegionSettings;
 	eventBus?: Pick<LegionEventBus, "emit">;
+	/**
+	 * #350 review (minor 1): the phase machine a node's role card declares, looked up
+	 * by role. `abortLegionPhase` needs it for exactly one reason: a declared machine
+	 * may name phases the built-in union does not know (`recon`), and without the
+	 * machine those names are `invalid_phase` — which used to drop the abort in
+	 * silence, leaving a killed child's team stranded in its own phase.
+	 * Absent = "no machine": the abort keeps the built-in behaviour rather than
+	 * inventing a machine it was never given.
+	 */
+	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }
 
 export interface OrchestratorDeps {
@@ -726,16 +736,39 @@ export class Orchestrator {
 		// is a safety hole. `isTerminalPhase` still covers the built-in names; a
 		// custom name resolves through the machine when one is attached.
 		if (!node || !node.phase || isTerminalPhase(node.phase)) return;
+		// #350 review (minor 1): attach it. The sentence above promised exactly this and
+		// the call below did not do it, so `recon → aborted` was `invalid_phase` and the
+		// `!decision.allowed` guard dropped the abort in silence — a killed child under a
+		// custom-phase team left its node stranded in that phase. The seam is the caller's
+		// (`OrchestratorLegionContext.machineForRole`), so a machine this process could not
+		// resolve keeps today's behaviour instead of inventing one.
+		const machine = this.safeMachineForRole(node.role);
 		const decision = evaluatePhaseTransition({
 			from: node.phase,
 			to: "aborted",
 			reworkCount: node.reworkCount,
 			terminalReason: "parent_retire",
 			actorRole: "supervisor",
+			...(machine ? { machine } : {}),
 		}, this.now);
 		if (!decision.allowed) return;
 		updateNode(this.legion.db, nodeId, { phase: decision.to, phaseSince: decision.phaseSince }, this.now);
 		this.emitStored(nodeId, "phase_change", decision.event.data);
+	}
+
+	/**
+	 * `machineForRole` is a caller-supplied seam and `retire()` is already past
+	 * `supervisor.retire()` when it reaches {@link abortLegionPhase}, so a throw there
+	 * would escape the retire after the process is gone and skip every bookkeeping line
+	 * below it. The known supplier swallows its own discovery errors; this keeps the
+	 * abort path safe on its own terms — a broken lookup degrades to "no machine".
+	 */
+	private safeMachineForRole(role: string | null | undefined): PhaseMachine | undefined {
+		try {
+			return this.legion?.machineForRole?.(role);
+		} catch {
+			return undefined;
+		}
 	}
 
 	private emitProcess(type: LegionProcessEventType, nodeId: string, data: unknown): void {

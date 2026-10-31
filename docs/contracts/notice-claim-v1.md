@@ -51,6 +51,7 @@
 1. **claim 点不是 `waitOne`**：目标 child 已 settle 时它不在 `resolveWaitTargets` 的 live 集合里（`waitAction` 侧），于是 `waitAction` 的 finished-cache 探针（`runtime.consumeCollect`）先取走 claim，`claimedNow === true`。同一条调用链下游 `waitOne` 的 `claimReported` 在这条路径上是**幂等 no-op，返回 `false`** —— 把它的返回值当 `claimedNow` 透传，回滚一无所获。
 2. **丢弃点是工具层的外层 abort 网**：`await job.retire?.()` 期间父 turn 结束，`waitOne` 仍把渲染好的结果交回上层，而工具层在 `return ok("interrupted (parent turn ended; children still running)")` 之前把整条结果丢弃。这一行文案由 `esc-no-retire-v3` 冻结，**不改**：该丢的还是要丢，欠的是回滚。
 3. **顺出的形状**：探针的 `(snapshot, claimedNow)` 对随 `waitAction` 的返回值透出（`details.waitClaims`，只收 `claimedNow === true`），丢弃点在 `return ok("interrupted …")` 之前逐条 `runtime.unclaimUndelivered(name, snapshot, true)`。
+   - **探针是异步的（复审 major 1）**：claim 可能晚于 `details` 构建 —— `waitOne` 的 `signal?.aborted` / `WAIT_INTERRUPTED` / `WaitTimeoutError` 都能在探针的 `ensureCollect` 仍在飞行时先返回，随后探针 resolve 到终态才占下 `(runId,name,round)`。因此：`waitClaims` **无条件挂载**（一个探针至多一条，空数组就是「本次调用什么都没取」），并另有 `details.waitClaimsPending`（该探针自己的 promise 结果，非枚举字段）——bail 门必须**先 `await` 它**再逐条回滚，否则回滚发生在 claim 之前，等于什么都没回滚，通知照旧被 `deliverBatch` 过滤掉（Db 的残留窗口就是这里）。
 
 于是 bail 门枚举完整为：
 

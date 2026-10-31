@@ -302,7 +302,12 @@ export function validatePhaseMachine(machine: PhaseMachine): PhaseMachineError[]
 		}
 	}
 
-	const start = machine.start ?? machine.phases[0]?.id;
+	// #350 review (minor 3): ONE derivation of where a team starts. This validation used
+	// to keep a third copy of `start ?? phases[0]?.id`, which is how the birth site and
+	// the state machine drifted apart in the first place. The empty-machine case already
+	// returned above, so `phaseStart` is only asked when there is a phase to name — it
+	// can therefore never fall through to the built-in start here.
+	const start = machine.phases.length > 0 ? phaseStart(machine) : undefined;
 	if (start === undefined || !ids.has(start)) {
 		errors.push({
 			path: "start",

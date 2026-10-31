@@ -499,6 +499,13 @@ export class LegionPostman {
 			children: children.map(({ id, role, status }) => ({ id, role, status })),
 			terminalReason: "all_children_failed",
 			actorRole: "supervisor",
+			// #350 review (major 2): the team's OWN machine, or this safety net is inert.
+			// Without it `from: "recon"` is not a phase of `DEFAULT_PHASE_MACHINE`, the
+			// state machine answers `invalid_phase`, and the `!decision.allowed` guard
+			// below drops the verdict in silence — so a squad that lived on a declared
+			// phase never reached `failed` and its parent never heard. Silent only since
+			// #350 made a declared start reachable (teams used to be born `planning`).
+			...(this.machine ? { machine: this.machine } : {}),
 		}, () => timestamp);
 		if (!decision.allowed) return;
 		updateNode(this.db, node.id, { phase: "failed", phaseSince: decision.phaseSince }, () => timestamp);
@@ -511,6 +518,21 @@ export class LegionPostman {
 		} else this.sendRootMessage(failureNotice);
 	}
 
+	/**
+	 * NOT custom-phase aware yet — follow-up issue on purpose (#350 review minor 2).
+	 *
+	 * Two things here only speak the built-in vocabulary: the `phase !== "verifying"`
+	 * test above hard-codes a phase name a declared machine need never use, and the
+	 * `evaluatePhaseTransition` call below passes no `machine`, so a team whose card
+	 * declares its own verification phase can never reach the state machine's `done`
+	 * path. `checkOwnPhaseTimeout` (just below) has the sibling hole:
+	 * `DEFAULT_PHASE_TIMEOUTS[phase] ?? 0` makes a custom phase's advisory clock 0, so
+	 * it never warns.
+	 *
+	 * Deliberately NOT fixed here: #350's scope is where a team is BORN, and both
+	 * repairs move behaviour on phases this PR does not otherwise touch. Follow-up:
+	 * #358 `bug(legion): 自定义相位上的 verifying 收尾与相位超时告警恒不生效`.
+	 */
 	private finalizeVerifiedTeamIfReady(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
 		if (!node || node.phase !== "verifying" || verificationPassed(node) !== true) return;

@@ -350,6 +350,12 @@ interface LegionRuntimeIdentity {
 	eventBus: LegionEventBus;
 	dbEventSource: DbEventSource;
 	postman: LegionPostman;
+	/**
+	 * #350 review (minor 1): the phase machine a role's card declares, so the orchestrators
+	 * this process builds can forward it to `abortLegionPhase`. Absent only when discovery
+	 * cannot answer (`phaseMachineForRole` swallows its own errors).
+	 */
+	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 	childNodeId(name: string): string | undefined;
 }
 
@@ -549,6 +555,8 @@ function createLegionRuntime(input: {
 	registerTools: boolean;
 	/** #298: the team root's declared phase machine, when its card supplies one. */
 	machine?: PhaseMachine;
+	/** #350 review (minor 1): role → declared machine, for the orchestrator's abort path. */
+	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }): LegionRuntimeIdentity {
 	const self = getNode(input.db, input.nodeId);
 	const eventBus = input.eventBus;
@@ -566,6 +574,7 @@ function createLegionRuntime(input: {
 			pi: input.pi, supervisor: input.supervisor, db: input.db, dbPath: input.dbPath,
 			eventBus, settings: input.settings, cwd: input.cwd, storeRootDir: input.storeRootDir,
 			parentNodeId: input.nodeId, node, message: mail.text,
+			...(input.machineForRole ? { machineForRole: input.machineForRole } : {}),
 		}),
 	});
 	const identity: LegionRuntimeIdentity = {
@@ -584,6 +593,7 @@ function createLegionRuntime(input: {
 		eventBus,
 		dbEventSource,
 		postman,
+		...(input.machineForRole ? { machineForRole: input.machineForRole } : {}),
 		childNodeId: (name) => getChildByName(input.db, input.nodeId, name)?.id,
 	};
 	if (input.registerTools && input.nodeId !== "root") registerLegionTools(input.pi, { db: input.db, nodeId: input.nodeId, role: self?.role, settings: input.settings, cwd: input.cwd, runDir: input.runDir, eventBus, sendSelfMessage: (text: string) => notice(input.pi, text), ...(input.machine ? { machine: input.machine } : {}) });
@@ -645,7 +655,7 @@ function resolveLegionIdentity(input: {
 		}
 		if (node.runId !== nodeRun.runId) updateLegionRunId(db, nodeId, nodeRun.runId);
 		const machine = phaseMachineForRole(node.role, input.cwd, input.settings);
-		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true, ...(machine ? { machine } : {}) });
+		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true, ...(machine ? { machine } : {}), machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
 		// #273: `createLegionRuntime` runs during extension LOADING, where host
 		// actions (sendMessage, spawn, ui) are not available yet. Defer the team
 		// recovery to the next tick so a failure inside it cannot crash the load
@@ -718,10 +728,10 @@ function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSuperviso
 	// writes the same column from `reserveNode`; this is the root equivalent.
 	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: rootRun.runId, status: "running", taskSummary: input.task.slice(0, 2_000), ...(input.rootSessionFile ? { sessionFile: input.rootSessionFile } : {}), createdAt: now, updatedAt: now }, () => now);
 	appendEvent(db, "root", "node_launched", { runId: rootRun.runId, task: input.task }, { now: () => now });
-	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false });
+	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false, machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
 }
 
-async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; db: DatabaseSync; dbPath: string; eventBus: LegionEventBus; settings: LegionSettings; cwd: string; storeRootDir: string; parentNodeId: string; node: LegionNode; message: string }): Promise<void> {
+async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; db: DatabaseSync; dbPath: string; eventBus: LegionEventBus; settings: LegionSettings; cwd: string; storeRootDir: string; parentNodeId: string; node: LegionNode; message: string; machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined }): Promise<void> {
 	const parent = getNode(input.db, input.parentNodeId);
 	if (!parent || !input.node.runId || !input.node.sessionFile) throw new Error(`resume credentials missing for ${input.node.id}`);
 	const store = new RunStore({ rootDir: input.storeRootDir });
@@ -759,7 +769,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const childRun = store.readRun(input.node.runId);
 	if (!childRun) throw new Error(`child run.json not found: ${input.node.runId}`);
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
-	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
+	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus, ...(input.machineForRole ? { machineForRole: input.machineForRole } : {}) } });
 	orchestrator.restore(parentRun);
 	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
@@ -1584,7 +1594,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					// finished-cache probe. The result is thrown away here, so the claim has
 					// to go back (exactly what `collectChild` owes on its own bails): a claim
 					// nobody delivered suppresses that round's notice forever.
-					releaseWaitClaims(runtime, result.details);
+					await releaseWaitClaims(runtime, result.details);
 					return ok("interrupted (parent turn ended; children still running)");
 				}
 				return result;
@@ -2905,7 +2915,7 @@ async function launchFamily(input: {
 		// the bug's main path (a 12-step `tasks[]` fanout against `maxChildrenPerNode`).
 		launchQueue: launchQueueBounds(settings),
 		onLaunchQueueNotice: launchQueueNoticeSink(input.pi),
-		...(legion ? { legion: { db: legion.db, dbPath: legion.dbPath, nodeId: legion.nodeId, runId: run.runId, parentNodeId: legion.parentNodeId ?? undefined, parentRunId: legion.parentRunId ?? undefined, runStore: store, settings: legion.settings, eventBus: legion.eventBus } } : {}),
+		...(legion ? { legion: { db: legion.db, dbPath: legion.dbPath, nodeId: legion.nodeId, runId: run.runId, parentNodeId: legion.parentNodeId ?? undefined, parentRunId: legion.parentRunId ?? undefined, runStore: store, settings: legion.settings, eventBus: legion.eventBus, ...(legion.machineForRole ? { machineForRole: legion.machineForRole } : {}) } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
 	});
 	orchestrator.restore(run);
@@ -3609,6 +3619,7 @@ async function launchUtilityFamily(input: {
 					runStore: store,
 					settings: legion.settings,
 					eventBus: legion.eventBus,
+					...(legion.machineForRole ? { machineForRole: legion.machineForRole } : {}),
 				},
 			} : {}),
 		});
@@ -4754,10 +4765,34 @@ export interface WaitClaim {
  * queued notice is the ONLY remaining route — the rollback gives the claim back and
  * drops no copy (D2/D7). `claimedNow` is always `true` here: `WaitClaim`s only exist
  * for claims this call took.
+ *
+ * #352 review (major 1): the claim arrives ASYNCHRONOUSLY. `waitAction`'s
+ * finished-cache probe is a promise (`consumeCollect` → `ensureCollect`), and the wait
+ * can bail long before it answers — `signal?.aborted`, `WAIT_INTERRUPTED` and
+ * `WaitTimeoutError` all win their race inside `waitOne` while that collect is still in
+ * flight. The probe then resolves to a terminal snapshot and claims `(runId, name,
+ * round)` AFTER the details object was already built, so the bail has to wait for that
+ * answer before it rolls anything back: `details.waitClaims` is a live array (shared by
+ * reference with `waitAction`), and `details.waitClaimsPending` is the promise that
+ * resolves once the probe has folded its claim in. Awaited first, both windows are
+ * covered: the claim that was already there, and the one that landed late.
+ *
+ * The await is bounded by the probe's own collect, which is what makes the claim
+ * knowable at all; returning now and rolling back from a detached continuation would
+ * hand the claim back after the frozen `interrupted …` line already went out.
  */
-export function releaseWaitClaims(runtime: SessionRuntime, details: unknown): void {
+export async function releaseWaitClaims(runtime: SessionRuntime, details: unknown): Promise<void> {
 	if (details === null || typeof details !== "object") return;
-	const claims = (details as { waitClaims?: unknown }).waitClaims;
+	const record = details as { waitClaims?: unknown; waitClaimsPending?: unknown };
+	const pending = record.waitClaimsPending;
+	if (pending !== undefined) {
+		try {
+			await (pending as Promise<unknown>);
+		} catch {
+			// A throwing probe took no claim — nothing to give back.
+		}
+	}
+	const claims = record.waitClaims;
 	if (!Array.isArray(claims)) return;
 	for (const claim of claims as WaitClaim[]) {
 		runtime.unclaimUndelivered(claim.name, claim.snapshot, true);
@@ -4780,6 +4815,11 @@ export async function waitAction(input: {
 	// a claim that lands after the details object was built must still be visible to
 	// a caller that discards the rendered result.
 	const claims: WaitClaim[] = [];
+	// #352 review (major 1): the probe's answer, absent when this wait has no probe at
+	// all (live targets). It resolves to `claims` once the probe's own claim — if any —
+	// has been folded in, and travels out as `details.waitClaimsPending` so a bail that
+	// lands while it is still in flight can wait for it instead of rolling back nothing.
+	let claimsPending: Promise<WaitClaim[]> | undefined;
 	let targets = resolveWaitTargets(
 		{ name: params.name, all: params.all },
 		jobs,
@@ -4796,11 +4836,13 @@ export async function waitAction(input: {
 			const probe = runtime.consumeCollect(params.name);
 			if (probe) {
 				const name = params.name;
-				void probe.then((claimed: ClaimedCollect) => {
+				claimsPending = probe.then((claimed: ClaimedCollect) => {
 					// #320/1: only a claim THIS call took may come back later.
 					if (claimed.claimedNow) claims.push({ name, snapshot: claimed.snapshot });
+					return claims;
 				}, () => {
 					// A throwing collect is the `wait` below's problem, not the probe's.
+					return claims;
 				});
 				targets = { ok: true, names: [params.name] };
 			} else {
@@ -4831,8 +4873,24 @@ export async function waitAction(input: {
 	// layer's abort net replaces the rendered result with the frozen `interrupted …`
 	// line, and without this the claim it leaves behind suppresses that round's notice
 	// forever.
+	//
+	// #352 review (major 1): mount BOTH unconditionally. Deciding on `claims.length` was
+	// a no-op: one probe means at most one claim, and the probe has usually not answered
+	// yet at this point — so the length test mounted nothing in the window that matters,
+	// and when it did mount it shared a reference with a caller that could reach it anyway.
+	// The array stays live (late pushes land in the same object) and the promise says
+	// when the probe got its answer.
 	const details: Record<string, unknown> = timeoutDetails ? { ...timeoutDetails } : {};
-	if (claims.length > 0) details.waitClaims = claims;
+	details.waitClaims = claims;
+	if (claimsPending) {
+		// Non-enumerable: this is a live promise, and `details` is the tool result's
+		// record — a promise has no business in a serialized transcript.
+		Object.defineProperty(details, "waitClaimsPending", {
+			value: claimsPending,
+			enumerable: false,
+			configurable: true,
+		});
+	}
 	return { content: [{ type: "text", text }], details };
 }
 

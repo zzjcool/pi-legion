@@ -309,7 +309,7 @@ test("#352 seam: waitAction exposes the claims IT took (and only those) as detai
 		// EXACTLY what the abort net does with a result it throws away (`index.ts`):
 		// `claimedNow` is always true here — `details.waitClaims` only ever holds
 		// claims this call took.
-		releaseWaitClaims(fixture.runtime, result.details);
+		await releaseWaitClaims(fixture.runtime, result.details);
 		assert.equal(fixture.runtime.noticeQueueStats().pending, 1, "the rollback puts the notice back into `pending`");
 		await fixture.flush();
 		assert.equal(fixture.messages.length, 1, "and the flush then delivers it — exactly once");
@@ -333,13 +333,16 @@ test("#352 seam control: a round another path already claimed is NOT recorded, s
 			waitAction({ params: { action: "wait", name: CHILD }, runtime: fixture.runtime, agents: [agentConfig("worker")], store, cwd }),
 			"waitAction on an already-claimed result",
 		);
-		const details = result.details as { waitClaims?: unknown } | undefined;
+		const details = result.details as { waitClaims?: unknown; waitClaimsPending?: unknown } | undefined;
+		// #352 review (major 1): the array is mounted UNCONDITIONALLY — an empty array is
+		// the honest answer (this call took nothing), while `undefined` was the shape that
+		// also described a claim landing late. Either way the bail must roll nothing back.
 		assert.equal(
-			details?.waitClaims,
-			undefined,
+			Array.isArray(details?.waitClaims) ? details.waitClaims.length : -1,
+			0,
 			"a probe that took nothing must record nothing — otherwise the bail would erase an earlier delivery's claim",
 		);
-		releaseWaitClaims(fixture.runtime, result.details);
+		await releaseWaitClaims(fixture.runtime, result.details);
 		assert.equal(fixture.runtime.noticeQueueStats().pending, 0, "the earlier claim stands");
 		await fixture.flush();
 		assert.equal(
@@ -350,6 +353,131 @@ test("#352 seam control: a round another path already claimed is NOT recorded, s
 	} finally {
 		cleanup();
 		fixture.dispose();
+	}
+});
+
+// ─────────────────── the async window: the probe answers AFTER the bail ───────────────────
+
+/**
+ * The real window #352's rollback missed (review major 1).
+ *
+ * `waitAction`'s probe is a PROMISE: the child is tracked but not in the live wait set,
+ * so the probe starts a collect of its own, and the wait can bail (`signal?.aborted` /
+ * `WAIT_INTERRUPTED` / `WaitTimeoutError`) while that collect is still in flight. The
+ * probe then resolves to a TERMINAL snapshot — after the rendered result was already
+ * discarded — and claims `(runId, name, round)`. A rollback that ran synchronously at
+ * bail time rolled back nothing, so `deliverBatch` filtered that round's notice and the
+ * completion was lost exactly as #352 described.
+ *
+ * The fixture drives the real `waitAction`, the real runtime and the real
+ * `releaseWaitClaims`: the collect is a controllable gate, so the bail happens first and
+ * the terminal answer lands afterwards, on a schedule the test decides.
+ */
+test("#352 async window: a probe that answers after the bail still gives its claim back — the notice arrives exactly once", async () => {
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	// A live parent run holds the notice in the run-scoped outbox until settle (D-A), so
+	// the delivery attempt — and `deliverBatch`'s claim filter — lands after both the
+	// claim and its rollback.
+	runtime.notifyParentRunStart();
+	runtime.setJoinConfig({ mode: "each", flushMs: 0 });
+	let started = false;
+	let openGate = (): void => {};
+	const gate = new Promise<void>((resolve) => {
+		openGate = resolve;
+	});
+	runtime.track({
+		name: CHILD,
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: `/tmp/${CHILD}.jsonl`,
+		timeoutMs: DEFAULTS.turnTimeoutMs,
+		collect: async () => {
+			started = true;
+			await gate;
+			return terminalSnapshot("x-out");
+		},
+	});
+	// The production order: the WATCH is already waiting on this child's collect when the
+	// wait arrives, so the watch's continuation runs first (it was attached first) and
+	// queues its notice while the probe's claim is still pending — which is exactly why
+	// the rollback has to happen before the round is flushed, not at claim time.
+	runtime.watch(CHILD);
+	const job = runtime.get(CHILD);
+	assert.ok(job, "fixture: the child is tracked");
+	// …and the probe only fires for a child that is not in the LIVE wait set (`waitOne`
+	// would otherwise share this collect without probing). `awaiting` is that state: the
+	// watch has declared the child settled while its collect is still in flight.
+	job.state = "awaiting";
+	const { store, cwd, cleanup } = tempStore();
+	const controller = new AbortController();
+	try {
+		const waiting = waitAction({
+			params: { action: "wait", name: CHILD },
+			runtime,
+			agents: [agentConfig("worker")],
+			store,
+			cwd,
+			signal: controller.signal,
+		});
+		// The probe shares the watch's in-flight collect; the wait races it against the abort.
+		await until(() => started, "the watch (and the probe behind it) started the collect");
+		controller.abort();
+		const result = await within(waiting, "the wait answered on the abort");
+		const details = result.details as
+			| { waitClaims?: unknown[]; waitClaimsPending?: Promise<unknown> }
+			| undefined;
+		assert.equal(
+			details?.waitClaims?.length,
+			0,
+			"fixture: the probe has not answered yet, so this call has taken nothing to show yet",
+		);
+		assert.ok(
+			details?.waitClaimsPending,
+			"the pending probe answer must travel with the result — without it the bail cannot know it is owed a claim",
+		);
+
+		// The bail itself — exactly what the tool layer's abort net calls, and it runs HERE,
+		// while the probe is still in flight. That is the window: a synchronous rollback
+		// finds an empty array and gives back nothing.
+		const rollback = releaseWaitClaims(runtime, result.details);
+
+		// NOW the collect resolves to a terminal snapshot: the probe claims `(runId, name,
+		// round)` — strictly after the bail. Its claim lands in the array that already
+		// travelled out, which is the whole point of sharing it by reference.
+		openGate();
+		await rollback;
+		assert.equal(
+			details?.waitClaims?.length,
+			1,
+			"by the time the bail returned, the probe's late claim had to be known AND given back — " +
+				"an empty array here means the rollback ran before the claim existed and rolled back nothing",
+		);
+
+		// The claim that landed after the bail was handed back before the run settled, so
+		// the round's notice is deliverable again — and arrives exactly once.
+		await until(
+			() => runtime.noticeQueueStats().pending === 1,
+			"the rollback made this round's notice deliverable again",
+			2_000,
+		);
+		runtime.notifyParentSettled();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(
+			messages.length,
+			1,
+			"a claim that landed after the bail must still be handed back: the completion notice has to arrive exactly " +
+				`once, it was delivered ${messages.length} times`,
+		);
+		assert.match(messages[0]!.content, /x-out/);
+	} finally {
+		openGate();
+		cleanup();
+		runtime.dispose();
 	}
 });
 

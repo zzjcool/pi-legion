@@ -143,7 +143,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   site so the two cannot drift, and an empty machine falls back to the built-in start (it cannot be
   declared — the loader rejects it). A card that declares no machine keeps the literal `"planning"`, so
   the built-in four-phase pipeline is unchanged. Contract:
-  `docs/contracts/declarative-phase-machine-v5.md:107` (that file is `Status: draft`).
+  `docs/contracts/declarative-phase-machine-v5.md:107` (that file is `Status: draft`). **Review follow-up:**
+  a team that lived on a card-declared phase activated two safety nets that only spoke the built-in
+  vocabulary. `failTeamIfAllChildrenFailed` (`legion-tools.ts`) evaluated `from: "recon" -> "failed"` for
+  "every child failed" **without the team's own machine**, so the transition was `invalid_phase` and the
+  `!decision.allowed` guard dropped the verdict in silence — a squad whose children had all died never
+  reached `failed` and its parent never heard; it now forwards the machine. `abortLegionPhase`
+  (`src/runs/orchestrator.ts`) had the same hole against a comment claiming the opposite, so a retired
+  child's team stayed stranded in its custom phase with no `phase_change`; the abort now forwards the
+  machine its caller resolves (new optional `OrchestratorLegionContext.machineForRole` seam, wired from
+  `phaseMachineForRole`). `validatePhaseMachine` also stops keeping a third copy of
+  `start ?? phases[0]?.id` and reuses `phaseStart`. The two remaining custom-phase holes — a hard-coded
+  `phase !== "verifying"` completion gate and a phase clock that resolves to 0 for undeclared names — are
+  documented in place and tracked as #358 rather than fixed here.
 
 - **A `wait` whose result the abort net throws away now hands the completion claim back, so the child's
   finished notice is no longer lost (#352).** Waiting on an already-settled child goes through
@@ -156,7 +168,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   gives each one back through `unclaimUndelivered` — never `unclaimReported`, which would also drop the
   queued copy, the only remaining route — exactly as `collectChild` already does on its own bails. The
   frozen `interrupted …` text, the `(runId, name, round)` claim key and `deliverBatch`'s single exit are
-  untouched. Contract: `docs/contracts/notice-claim-v1.md` (bail-gate enumeration extended).
+  untouched. Contract: `docs/contracts/notice-claim-v1.md` (bail-gate enumeration extended). **Review
+  follow-up:** the probe answers ASYNCHRONOUSLY, and the first shape (`if (claims.length > 0)`) was a
+  no-op in exactly the window #352 was opened for — `waitOne` can bail while the probe's `ensureCollect`
+  is still in flight, and the claim then lands on an array nobody can reach. `details.waitClaims` is now
+  mounted unconditionally (one probe = at most one claim), the probe's own promise travels as
+  `details.waitClaimsPending`, and `releaseWaitClaims` awaits it before rolling back — so a claim that
+  landed after the bail is still handed back and the round's notice arrives exactly once.
 
 - **`/legion doctor` stopped recommending the dead extension switch (#329).** `inheritExtensions: true`
   and `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` outlived #328's clean-up in `legion-doctor.ts`: `true` has been
