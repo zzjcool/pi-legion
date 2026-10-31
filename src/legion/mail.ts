@@ -1,7 +1,7 @@
 import type { DatabaseSync, SqliteRow } from "./db.ts";
 import { withTransaction } from "./db.ts";
 import { appendEvent } from "./events.ts";
-import { getNode, getSubtree, isTerminalNode, sanitizeNodeSlug, type LegionNode } from "./nodes.ts";
+import { getNode, getSubtree, hasEnded, isTerminalNode, sanitizeNodeSlug, type LegionNode } from "./nodes.ts";
 import type { TurnRecord } from "../shared/types.ts";
 
 /**
@@ -488,16 +488,23 @@ export function mailReachedTurns(
  * The timed-out node is the message's *sender*: `checkOwnPhaseTimeout` mails the
  * parent about its own phase. The phase it timed out in is recovered from the
  * `phase_timeout` event that produced the notice (never by parsing the body), so
- * "left that phase" is a ledger fact: the node is terminal, or its current
- * `phase`/`phase_since` differ from the recorded ones. `phase_since` is compared
- * too, so re-entering the same phase later does not resurrect the old notice.
+ * "left that phase" is a ledger fact: the node has ended (terminal, or
+ * `settled`/`retired` — #354), or its current `phase`/`phase_since` differ from
+ * the recorded ones. `phase_since` is compared too, so re-entering the same phase
+ * later does not resurrect the old notice.
+ *
+ * #354: the "has ended" arm must ask {@link hasEnded}, not `isTerminalNode`. A
+ * team that only investigated never calls `legion_phase`, so it ends
+ * `settled`/`retired` while its phase and `phase_since` are untouched — the two
+ * older predicates both said "still current" and an `action-needed` about a team
+ * whose work had already merged was delivered 30 minutes later.
  */
 export function isStalePhaseTimeoutNotice(db: DatabaseSync, message: LegionMessage): boolean {
 	if (message.kind !== "notice") return false;
 	if (!message.subject.startsWith(PHASE_TIMEOUT_MAIL_SUBJECT_PREFIX)) return false;
 	const timedOut = getNode(db, message.fromNode);
 	if (!timedOut) return false;
-	if (isTerminalNode(timedOut)) return true;
+	if (hasEnded(timedOut)) return true;
 	const row = db
 		.prepare(
 			"SELECT data FROM events WHERE node_id = ? AND type = 'phase_timeout' AND ts <= ? ORDER BY ts DESC, id DESC LIMIT 1",

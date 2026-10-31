@@ -139,23 +139,22 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   *before* the target, the outgoing edge or the `failed` escape hatch is consulted — so advancing,
   declaring failure (#309) and aborting were all closed, leaving a team that was alive and spending
   budget while it could not move. The derivation now lives in one function, `phaseStart(machine)`
-  (`machine.start ?? machine.phases[0]?.id`), shared by the state machine's entry rule and the birth
-  site so the two cannot drift, and an empty machine falls back to the built-in start (it cannot be
-  declared — the loader rejects it). A card that declares no machine keeps the literal `"planning"`, so
-  the built-in four-phase pipeline is unchanged. Contract:
-  `docs/contracts/declarative-phase-machine-v5.md:107` (that file is `Status: draft`). **Review follow-up:**
-  a team that lived on a card-declared phase activated two safety nets that only spoke the built-in
-  vocabulary. `failTeamIfAllChildrenFailed` (`legion-tools.ts`) evaluated `from: "recon" -> "failed"` for
-  "every child failed" **without the team's own machine**, so the transition was `invalid_phase` and the
-  `!decision.allowed` guard dropped the verdict in silence — a squad whose children had all died never
-  reached `failed` and its parent never heard; it now forwards the machine. `abortLegionPhase`
-  (`src/runs/orchestrator.ts`) had the same hole against a comment claiming the opposite, so a retired
-  child's team stayed stranded in its custom phase with no `phase_change`; the abort now forwards the
-  machine its caller resolves (new optional `OrchestratorLegionContext.machineForRole` seam, wired from
-  `phaseMachineForRole`). `validatePhaseMachine` also stops keeping a third copy of
-  `start ?? phases[0]?.id` and reuses `phaseStart`. The two remaining custom-phase holes — a hard-coded
-  `phase !== "verifying"` completion gate and a phase clock that resolves to 0 for undeclared names — are
-  documented in place and tracked as #358 rather than fixed here.
+  (`machine.start ?? machine.phases[0]?.id`), shared by the state machine's entry rule, the birth site
+  and the load-time validation (`validatePhaseMachine` no longer keeps a third copy), so the three
+  cannot drift; an empty machine falls back to the built-in start (it cannot be declared — the loader
+  rejects it). A card that declares no machine keeps the literal `"planning"`, so the built-in
+  four-phase pipeline is unchanged. Contract:
+  `docs/contracts/declarative-phase-machine-v5.md:107` (that file is `Status: draft`). **Review
+  follow-up:** making a declared start reachable also made every supervisor-side net that only speaks
+  the built-in vocabulary reachable-and-inert. `failTeamIfAllChildrenFailed` (`legion-tools.ts`)
+  evaluated `from: "recon" -> "failed"` for "every child failed" **without the team's own machine**, so
+  the transition was `invalid_phase` and the `!decision.allowed` guard dropped the verdict in silence —
+  a squad whose children had all died never reached `failed` and its parent never heard; it now forwards
+  the machine, and a new case pins the verdict (`phase === "failed"`, one `phase_change`, one mail).
+  The abort half of the same hole is #351, which landed upstream in `abortLegionPhase` (already on
+  master), so this branch only had to stop duplicating it. The other two custom-phase holes — a hard-coded
+  `phase !== "verifying"` completion gate and a phase clock that resolves to 0 for undeclared names —
+  are documented in place and tracked as #358 rather than fixed here.
 
 - **A `wait` whose result the abort net throws away now hands the completion claim back, so the child's
   finished notice is no longer lost (#352).** Waiting on an already-settled child goes through
@@ -175,6 +174,28 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   mounted unconditionally (one probe = at most one claim), the probe's own promise travels as
   `details.waitClaimsPending`, and `releaseWaitClaims` awaits it before rolling back — so a claim that
   landed after the bail is still handed back and the round's notice arrives exactly once.
+- **A `Phase timeout:` notice no longer outlives a team that ended in the very phase it timed out in
+  (#354).** `isStalePhaseTimeoutNotice` asked `isTerminalNode`, which reads `status === "failed" ||
+  phase ∈ {done,failed,aborted}`. A team that only investigated never calls `legion_phase`, so it keeps
+  its birth `planning` phase and ends with `status: settled` / `retired` — neither predicate fired and
+  `phase_since` never moved either, so an `action-needed` asking root to extend-or-abort a team whose
+  work had already merged was delivered ~30 minutes late. The "has ended" arm now asks the new narrow
+  `hasEnded` predicate (terminal **or** settled/retired); `isTerminalNode` is deliberately unchanged
+  because mail bounce and the orphan scan share it. The `reason` stays `obsolete_after_phase_change`
+  (event set still 16) and the "no `phase_timeout` event → stay ACCEPTED, never guess" clause stands.
+  Contract: `docs/legion-v2-contract.md` §8.3.1, `docs/contracts/mailbox-delivery-v1.md` D4.
+
+- **`retire()` / `retireAll()` / `/legion stop` can no longer leave a team in its custom phase "forever"
+  (#351).** `Orchestrator.abortLegionPhase` evaluated the abort without the team's own phase machine, so a
+  card-declared name (`build`) fell through to `DEFAULT_PHASE_MACHINE`, was refused `invalid_phase`, and
+  that refusal was silently dropped (`if (!decision.allowed) return;`) — no `aborted`, no event, no log,
+  even though the child process had already been killed. The abort now forwards the machine resolved from
+  the node's role card, and when no machine can resolve the phase the retire is **forced** through:
+  `phase` becomes `aborted` (a parent retire must always take effect — the safety bottom line in
+  `phase-machine.ts`), one `phase_change` event carries `{ forced: true, reason:
+  "parent_retire_unresolved_phase", denied }` (no new event type; the set stays at 16), and one
+  `console.warn` names the node, the phase and the refusal.
+  Contract: `docs/contracts/declarative-phase-machine-v5.md`.
 
 - **`/legion doctor` stopped recommending the dead extension switch (#329).** `inheritExtensions: true`
   and `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` outlived #328's clean-up in `legion-doctor.ts`: `true` has been

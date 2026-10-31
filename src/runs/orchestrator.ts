@@ -108,13 +108,12 @@ export interface OrchestratorLegionContext {
 	settings?: LegionSettings;
 	eventBus?: Pick<LegionEventBus, "emit">;
 	/**
-	 * #350 review (minor 1): the phase machine a node's role card declares, looked up
-	 * by role. `abortLegionPhase` needs it for exactly one reason: a declared machine
-	 * may name phases the built-in union does not know (`recon`), and without the
-	 * machine those names are `invalid_phase` — which used to drop the abort in
-	 * silence, leaving a killed child's team stranded in its own phase.
-	 * Absent = "no machine": the abort keeps the built-in behaviour rather than
-	 * inventing a machine it was never given.
+	 * #351: the phase machine a node's role card declares, looked up by role.
+	 *
+	 * `abortLegionPhase` needs it for exactly one reason: a declared machine may
+	 * name phases the built-in union does not know (`build`), and without the
+	 * machine those names are `invalid_phase`, which used to drop the abort.
+	 * Absent = "no machine": the abort is still forced through (see the method).
 	 */
 	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }
@@ -736,12 +735,8 @@ export class Orchestrator {
 		// is a safety hole. `isTerminalPhase` still covers the built-in names; a
 		// custom name resolves through the machine when one is attached.
 		if (!node || !node.phase || isTerminalPhase(node.phase)) return;
-		// #350 review (minor 1): attach it. The sentence above promised exactly this and
-		// the call below did not do it, so `recon → aborted` was `invalid_phase` and the
-		// `!decision.allowed` guard dropped the abort in silence — a killed child under a
-		// custom-phase team left its node stranded in that phase. The seam is the caller's
-		// (`OrchestratorLegionContext.machineForRole`), so a machine this process could not
-		// resolve keeps today's behaviour instead of inventing one.
+		// #351: attach it. Without the machine a card-declared name (`build`) was
+		// `invalid_phase`, and the refusal below used to be dropped in silence.
 		const machine = this.safeMachineForRole(node.role);
 		const decision = evaluatePhaseTransition({
 			from: node.phase,
@@ -751,22 +746,49 @@ export class Orchestrator {
 			actorRole: "supervisor",
 			...(machine ? { machine } : {}),
 		}, this.now);
-		if (!decision.allowed) return;
-		updateNode(this.legion.db, nodeId, { phase: decision.to, phaseSince: decision.phaseSince }, this.now);
-		this.emitStored(nodeId, "phase_change", decision.event.data);
+		if (decision.allowed) {
+			updateNode(this.legion.db, nodeId, { phase: decision.to, phaseSince: decision.phaseSince }, this.now);
+			this.emitStored(nodeId, "phase_change", decision.event.data);
+			return;
+		}
+		// #351: a parent retire must ALWAYS take effect — that is the safety bottom
+		// line `phase-machine.ts` normalizes every machine for. When the phase still
+		// cannot be resolved the transition is forced, not dropped: the node lands in
+		// `aborted` so no reader describes a team that no longer exists, the refusal
+		// becomes a `phase_change` fact (the event set is closed at 16 — no new type),
+		// and one warning makes it visible. Silence was the bug, not the refusal.
+		const phaseSince = this.now();
+		updateNode(this.legion.db, nodeId, { phase: "aborted", phaseSince }, this.now);
+		this.emitStored(nodeId, "phase_change", {
+			from: node.phase,
+			to: "aborted",
+			reworkCount: node.reworkCount,
+			forced: true,
+			reason: "parent_retire_unresolved_phase",
+			denied: decision.reason,
+		});
+		console.warn(
+			`[pi-legion] node ${nodeId} retired while in phase '${node.phase}': the abort was refused (${decision.reason}: ${decision.message}); phase forced to aborted so the parent retire still takes effect.`,
+		);
 	}
 
 	/**
-	 * `machineForRole` is a caller-supplied seam and `retire()` is already past
-	 * `supervisor.retire()` when it reaches {@link abortLegionPhase}, so a throw there
-	 * would escape the retire after the process is gone and skip every bookkeeping line
-	 * below it. The known supplier swallows its own discovery errors; this keeps the
-	 * abort path safe on its own terms — a broken lookup degrades to "no machine".
+	 * #355 review: `machineForRole` is a caller-supplied seam, and `retire()` is
+	 * already past `supervisor.retire()` when it reaches `abortLegionPhase` — a
+	 * throw there would escape `retire()` after the process is gone and skip every
+	 * bookkeeping line below it (`child.state`, `node_retired`, slot release).
+	 * Safety today only comes from the caller: `phaseMachineForRole` swallows its
+	 * own discovery errors. This keeps the abort path safe on its own terms — a
+	 * broken lookup degrades to "no machine", which the forced-abort path covers.
 	 */
 	private safeMachineForRole(role: string | null | undefined): PhaseMachine | undefined {
 		try {
 			return this.legion?.machineForRole?.(role);
-		} catch {
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			console.warn(
+				`[pi-legion] phase machine lookup for role '${role ?? "<none>"}' threw (${detail}); retiring with the built-in machine so the abort still takes effect.`,
+			);
 			return undefined;
 		}
 	}

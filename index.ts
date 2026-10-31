@@ -350,13 +350,13 @@ interface LegionRuntimeIdentity {
 	eventBus: LegionEventBus;
 	dbEventSource: DbEventSource;
 	postman: LegionPostman;
+	childNodeId(name: string): string | undefined;
 	/**
-	 * #350 review (minor 1): the phase machine a role's card declares, so the orchestrators
-	 * this process builds can forward it to `abortLegionPhase`. Absent only when discovery
-	 * cannot answer (`phaseMachineForRole` swallows its own errors).
+	 * #351: the phase machine a node's role card declares, by role. Carried on the
+	 * identity (i.e. recorded when the tree is built) so every orchestrator this
+	 * process constructs can resolve a custom phase name for a parent retire.
 	 */
 	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
-	childNodeId(name: string): string | undefined;
 }
 
 function settingsForLegion(settings: ReturnType<typeof loadSubagentSettings>): LegionSettings {
@@ -555,7 +555,7 @@ function createLegionRuntime(input: {
 	registerTools: boolean;
 	/** #298: the team root's declared phase machine, when its card supplies one. */
 	machine?: PhaseMachine;
-	/** #350 review (minor 1): role → declared machine, for the orchestrator's abort path. */
+	/** #351: by-role resolver for the abort path (see LegionRuntimeIdentity). */
 	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }): LegionRuntimeIdentity {
 	const self = getNode(input.db, input.nodeId);
@@ -593,8 +593,8 @@ function createLegionRuntime(input: {
 		eventBus,
 		dbEventSource,
 		postman,
-		...(input.machineForRole ? { machineForRole: input.machineForRole } : {}),
 		childNodeId: (name) => getChildByName(input.db, input.nodeId, name)?.id,
+		...(input.machineForRole ? { machineForRole: input.machineForRole } : {}),
 	};
 	if (input.registerTools && input.nodeId !== "root") registerLegionTools(input.pi, { db: input.db, nodeId: input.nodeId, role: self?.role, settings: input.settings, cwd: input.cwd, runDir: input.runDir, eventBus, sendSelfMessage: (text: string) => notice(input.pi, text), ...(input.machine ? { machine: input.machine } : {}) });
 	postman.start();
@@ -711,7 +711,7 @@ async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input:
 			}
 		}
 		try {
-			await resumeLegionChild({ pi: input.input.pi, supervisor: input.input.supervisor, db: input.identity.db, dbPath: input.identity.dbPath, eventBus: input.identity.eventBus, settings: input.identity.settings, cwd: input.input.cwd, storeRootDir: input.identity.storeRootDir, parentNodeId: input.identity.nodeId, node, message: `Resume from saved session ${node.sessionFile} and continue interrupted work.` });
+			await resumeLegionChild({ pi: input.input.pi, supervisor: input.input.supervisor, db: input.identity.db, dbPath: input.identity.dbPath, eventBus: input.identity.eventBus, settings: input.identity.settings, cwd: input.input.cwd, storeRootDir: input.identity.storeRootDir, parentNodeId: input.identity.nodeId, node, message: `Resume from saved session ${node.sessionFile} and continue interrupted work.`, ...(input.identity.machineForRole ? { machineForRole: input.identity.machineForRole } : {}) });
 		} catch (error) { notice(input.input.pi, `Could not resume ${node.id}: ${error instanceof Error ? error.message : String(error)}`); }
 	}
 }
