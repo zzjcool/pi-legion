@@ -81,6 +81,27 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **A 500ms status refresh no longer re-parses a session file that has not been written since the
+  last tick (#348).** `refreshUi()` → `statusEntries()` parsed every child's session file — plus every
+  historical ledger row that carries one — once per tick, changed or not: one idle child cost 119
+  opens per 60s, 50 children 6000, and because that count grows with the *length* of a session rather
+  than with the number of live agents, crossing the 64-entry incremental-parse cap made every tick a
+  cold re-read of every file (`openSync` 200/s, CPU 16.2% at 100 session files). `parseSessionFileCached`
+  now sits in front of the parser: one `statSync` compares `(path, size, mtimeMs)` and an unchanged
+  file is answered from the previous parse instead of paying open + fstat + two 256B fingerprint reads
+  + close (36–66µs warm). A write from another process is still seen — an append grows `size`, a
+  rewrite moves `mtimeMs` even at identical length — so no fs watcher and no bus subscription is
+  involved. The display readers go through the gate (`progressFromSessionFile`, which every status row
+  calls; `/legion summary`; `/legion timing`); verdict derivation (`orchestrator`, `rebuild`,
+  `legion_*` tools) keeps calling `parseSessionFile` on the file it is judging, and none of the
+  parsing semantics moved. Both caches are bounded: the incremental cap rises 64 → 256 and the new
+  file-level cache is capped at 256 entries, LRU-ordered on every hit, so the files a tick actually
+  visits are the ones that stay. Hit/miss counters (`sessionFileCacheStats()`) exist for tests and are
+  never rendered. Measured with the issue's own script (`b3.ts` harness, real 60s/20s windows): 1 idle
+  child 119 → 0 parses and 0.34% → 0.10% CPU, 50 children 6000 → 0 parses and 3.64% → 0.31%, 100
+  session files 4000 → 0 parses and 16.20% → 0.63%; the only syscall left per unchanged file is the
+  `stat`.
+
 - **A control call no longer scans the run registry to find a child it is already scoped to, and the
   scan now keeps a snapshot when it does run (#344).** Every `collect` / `status` / `steer` / `abort` /
   `retire` / `continue` opened with `store.listRuns()` — `readdir` plus one `readFileSync` +

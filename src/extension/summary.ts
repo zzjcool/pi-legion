@@ -11,7 +11,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { deriveOutcome, parseSessionFile } from "../shared/session.ts";
+import { deriveOutcome, parseSessionFileCached } from "../shared/session.ts";
 import type { ParsedSession } from "../shared/types.ts";
 import {
 	RunStore,
@@ -389,7 +389,8 @@ function makeGroup(role: string, children: SummaryChild[]): SummaryGroup {
 /**
  * Aggregate run records without reading the filesystem. Pass parsed session
  * snapshots in `sessions`; the command layer is responsible for obtaining
- * those snapshots with parseSessionFile().
+ * those snapshots with parseSessionFileCached() — a display path, so an
+ * unchanged session file is served from the #348 `(size, mtimeMs)` gate.
  */
 export function aggregateSubagentRuns(
 	runs: readonly RunRecord[],
@@ -681,7 +682,9 @@ function sessionMapFor(runs: readonly RunRecord[]): Map<string, SummarySession> 
 	for (const run of runs) {
 		for (const child of run.children) {
 			if (child.sessionFile) {
-				sessions.set(child.sessionFile, parseSessionFile(child.sessionFile));
+				// Display only: reuse the parse when the file has not changed
+				// since the last refresh (#348). The snapshot is read-only here.
+				sessions.set(child.sessionFile, parseSessionFileCached(child.sessionFile));
 			}
 		}
 	}

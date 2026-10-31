@@ -11,7 +11,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { parseSessionFile } from "../shared/session.ts";
+import { parseSessionFileCached } from "../shared/session.ts";
 import type { ChildRecord, RunRecord, TaskState } from "../shared/types.ts";
 import {
 	RunStore,
@@ -285,7 +285,9 @@ function sessionMapFor(runs: readonly RunRecord[]): Map<string, SummarySession> 
 	for (const run of runs) {
 		for (const child of run.children) {
 			if (child.sessionFile) {
-				sessions.set(child.sessionFile, parseSessionFile(child.sessionFile));
+				// Same #348 gate as `/legion summary`: timing is display data, and an
+				// unchanged session file is reused rather than re-parsed.
+				sessions.set(child.sessionFile, parseSessionFileCached(child.sessionFile));
 			}
 		}
 	}
