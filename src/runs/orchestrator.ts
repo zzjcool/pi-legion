@@ -935,6 +935,14 @@ export class Orchestrator {
 		// #214 D4: only centurion may hold worktree. Legion path still forces
 		// centurion→true and centurion-parent→member false; non-centurion
 		// requests from any source are demoted below (D1: warn, never throw).
+		//
+		// #345: the nested-worktree probe is a REAL subprocess — one synchronous
+		// `git rev-parse` at 5–7ms, 60% of a worker launch — and it used to be an
+		// argument here, so it ran before `resolveLaunchWorktree` could short-circuit
+		// and its answer was then thrown away: the demotion below forces every
+		// non-centurion to `false` no matter what the probe said (18/18
+		// combinations of roleDefault × launch × parentInWorktree). It is asked only
+		// on the centurion branch, which is the only one it can change.
 		let worktree = isCenturion
 			? (this.legion
 				? true
@@ -948,7 +956,10 @@ export class Orchestrator {
 				: resolveLaunchWorktree({
 					roleDefault: input.agent.worktree,
 					launch: input.worktree,
-					parentInWorktree: isInsideChildWorktree(this.cwd),
+					// Not the probe: for a non-centurion this answer is
+					// overwritten below either way, and a role card that pins
+					// `worktree: true` only decides whether that demotion warns once.
+					parentInWorktree: false,
 				});
 		if (!isCenturion && worktree === true) {
 			this.warnWorktreeDenied(input.agent.name);

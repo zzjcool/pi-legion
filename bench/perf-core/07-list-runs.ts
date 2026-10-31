@@ -9,6 +9,12 @@
  * This measures the real corpus, a synthetic 1k/3k-run store, and the breakdown
  * of the scan.
  *
+ * #344 turned the scan into a FALLBACK and gave `listRuns()` a snapshot, so the
+ * same numbers now split in two: `coldMs` (a store that must scan) and `warmMs`
+ * (a repeat call served from the snapshot). The last section measures the thing
+ * the report is really about — one control call resolving a name it is scoped to
+ * — on both the pre-#344 path (`listRuns` + linear find) and the current one.
+ *
  * Run: node --experimental-strip-types bench/perf-core/07-list-runs.ts
  */
 
@@ -16,6 +22,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { resolveScopedChild } from "../../src/runs/child-scope.ts";
 import { RunStore } from "../../src/runs/store.ts";
 
 function median(xs: number[]): number {
@@ -25,7 +32,14 @@ function median(xs: number[]): number {
 }
 
 const REPS = 5;
-function timeListRuns(store: RunStore): { medianMs: number; samples: number[]; runs: number; children: number } {
+function timeListRuns(store: RunStore): {
+	medianMs: number;
+	coldMs: number;
+	warmMs: number;
+	samples: number[];
+	runs: number;
+	children: number;
+} {
 	let runs = 0;
 	let children = 0;
 	const samples: number[] = [];
@@ -36,7 +50,17 @@ function timeListRuns(store: RunStore): { medianMs: number; samples: number[]; r
 		runs = out.length;
 		children = out.reduce((n, r) => n + r.children.length, 0);
 	}
-	return { medianMs: Number(median(samples).toFixed(2)), samples: samples.map((s) => Number(s.toFixed(2))), runs, children };
+	const round = (x: number): number => Number(x.toFixed(3));
+	return {
+		medianMs: Number(median(samples).toFixed(2)),
+		// Sample 0 pays for the scan; the rest are served from the snapshot, as long
+		// as the registry does not change under the loop.
+		coldMs: round(samples[0] as number),
+		warmMs: round(median(samples.slice(1))),
+		samples: samples.map((s) => Number(s.toFixed(3))),
+		runs,
+		children,
+	};
 }
 
 const out: Record<string, unknown> = { bench: "07-list-runs", env: { node: process.version, cpus: os.cpus().length } };
@@ -147,5 +171,84 @@ try {
 } catch (error) {
 	out.crossStoreMissError = String(error);
 }
+
+// --- #344: one control call resolving a scoped name, old path vs new ---------
+// The pre-#344 control path was: `const runs = store.listRuns()` and then a
+// find of `(scopeRunId, name)` inside that scan. The current one asks the store
+// for ONE run. Both are measured on the same corpus with the same target, and
+// the counters prove which reads each path actually performed.
+function measureControlPath(label: string, store: RunStore, scopeRunId: string, name: string): Record<string, unknown> {
+	let listRunsCalls = 0;
+	let readRunCalls = 0;
+	const readRun = (runId: string) => {
+		readRunCalls += 1;
+		return store.readRun(runId);
+	};
+	const listRuns = () => {
+		listRunsCalls += 1;
+		return store.listRuns();
+	};
+
+	const oldSamples: number[] = [];
+	for (let i = 0; i < REPS; i += 1) {
+		// The pre-#344 path had no snapshot at all, so every call scanned. Dropping
+		// the snapshot first reproduces exactly that per-rep cost; without it this
+		// loop would be timing #344's cache and calling it "before".
+		store.invalidateRunsCache();
+		const t0 = process.hrtime.bigint();
+		const runs = store.listRuns();
+		const hit = runs.find((run) => run.runId === scopeRunId)?.children.find((child) => child.name === name) ?? null;
+		oldSamples.push(Number(process.hrtime.bigint() - t0) / 1e6);
+		if (!hit) throw new Error(`control-path bench: ${name} is not a child of ${scopeRunId}`);
+	}
+
+	listRunsCalls = 0;
+	readRunCalls = 0;
+	const newSamples: number[] = [];
+	for (let i = 0; i < REPS; i += 1) {
+		const t0 = process.hrtime.bigint();
+		const resolution = resolveScopedChild({ name, directRunId: scopeRunId, readRun, listRuns });
+		newSamples.push(Number(process.hrtime.bigint() - t0) / 1e6);
+		if (resolution.hit.kind !== "direct") throw new Error(`control-path bench: expected a direct hit for ${name}`);
+	}
+
+	const oldMs = median(oldSamples);
+	const newMs = median(newSamples);
+	return {
+		label,
+		target: { scopeRunId, name },
+		runsInStore: store.listRuns().length,
+		oldPathMs: Number(oldMs.toFixed(3)),
+		newPathMs: Number(newMs.toFixed(3)),
+		speedup: Number((oldMs / newMs).toFixed(1)),
+		newPathCalls: { listRuns: listRunsCalls, readRun: readRunCalls },
+		oldSamples: oldSamples.map((x) => Number(x.toFixed(3))),
+		newSamples: newSamples.map((x) => Number(x.toFixed(3))),
+	};
+}
+
+const controlPath: Array<Record<string, unknown>> = [];
+try {
+	// Real corpus: a run that actually holds a child, resolved exactly as a
+	// parent's `collect name: "..."` would resolve it.
+	const real = new RunStore({ rootDir: "/root/code/pi-legion/.pi-subagents" });
+	const populated = real.listRuns().find((run) => run.children.length > 0);
+	const target = populated?.children[0];
+	if (populated && target) controlPath.push(measureControlPath("real corpus", real, populated.runId, target.name));
+} catch (error) {
+	controlPath.push({ label: "real corpus", error: String(error) });
+}
+try {
+	// Synthetic 1000-run store: the size where the scan stopped being noise.
+	const { store, dir } = await buildStore(1000, 3);
+	try {
+		controlPath.push(measureControlPath("synthetic 1000 runs", store, store.listRuns()[0]!.runId, "w0"));
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+} catch (error) {
+	controlPath.push({ label: "synthetic 1000 runs", error: String(error) });
+}
+out.controlPath = controlPath;
 
 console.log(JSON.stringify(out, null, 2));

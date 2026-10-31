@@ -81,6 +81,45 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **A control call no longer scans the run registry to find a child it is already scoped to, and the
+  scan now keeps a snapshot when it does run (#344).** Every `collect` / `status` / `steer` / `abort` /
+  `retire` / `continue` opened with `store.listRuns()` — `readdir` plus one `readFileSync` +
+  `JSON.parse` per run — *before* it even asked which run it was scoped to, so a call that already
+  knew its `runId` (the explicit argument, the session's legion run, or the run the runtime tracks
+  the name under) paid for every run ever written: 26ms at the 352 runs on the reporting machine,
+  97% of a warm `status`, 110ms at 1000 synthetic runs, linear and unbounded apart from the 14-day
+  retention prune. The scan is now a FALLBACK: the scope run is read with one `readRun` (0.05ms) and
+  the registry is consulted only when the name might live in another run — which is exactly the
+  #312 case that must report or refuse instead of adopting. On this repo's 365-run corpus one name
+  resolution went 18.4ms → 0.04ms, and on 1000 synthetic runs 31.5ms → 0.04ms, with **zero**
+  `listRuns` calls for a scoped hit. The fallback scan itself is cached per runs directory: a
+  process-wide snapshot (shared by every `RunStore` instance on that root, since the tool surface
+  builds one per call) invalidated by the directory's `mtimeMs`, by any write this process performs
+  (`createRun` / `updateRun` / `updateChild` — all funnel through `writeRun` — plus `prune`'s explicit invalidation), and, for a
+  record another process rewrote in place with no directory mtime to show for it, by a 1s TTL that
+  tests drive through the store's injectable clock. Cold scans are unchanged (21.2ms at 365 real
+  runs, 34ms at 1000 synthetic on both sides of this change); a repeat scan is 0.018ms / 0.012ms.
+  `listRuns()` still answers exactly what it did — every readable run, oldest first, corrupt entries
+  skipped — and every #312 strict-scope case (`collect`/`continue`/`resume` refusing a same-named
+  node elsewhere, ambiguity never resolved by preference) is pinned by a parity test that compares
+  the shortcut against the full scan shape by shape.
+
+- **A launch that cannot use a worktree no longer runs the nested-worktree `git` probe whose answer is
+  then discarded (#345).** `isInsideChildWorktree(cwd)` — one synchronous `git rev-parse
+  --git-common-dir`, ~5–7ms — was an *argument* to `resolveLaunchWorktree`, so it was evaluated before
+  the resolver could short-circuit, and for every non-centurion its value was then thrown
+  away: the worktree guard forces `worktree: false` for those roles whatever the probe said (all 18
+  combinations of `roleDefault × launch × parentInWorktree`, now a table-driven test). The probe is
+  asked on the centurion branch only — the one branch it can change — so a worker launch
+  drops from 1 `git` subprocess to 0 and from 11.6ms to 2.9ms median on this repo, while a
+  centurion launch still spawns the same two git commands (probe not reached: legion
+  forces its worktree, `worktree add` still runs). `resolveLaunchWorktree`'s result semantics are
+  untouched; the one observable difference is that a role card pinning `worktree: true` while the
+  parent sits in a linked worktree now also gets the existing one-time `worktree denied for
+  non-centurion role` warning, because the suppression that used to silence it is the
+  answer being skipped.
+
+
 - **`messages.delivered` is a five-value domain now — `pending / accepted / bounced / delivered / obsolete`
   — and `LEGION_DB_USER_VERSION` moves 1 → 2 (#322).** The old `INJECTED(1)` claimed a delivery the ledger
   never observed: it was written the moment a send call returned, which covers `queued` (waiting for the
