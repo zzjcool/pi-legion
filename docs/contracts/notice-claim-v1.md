@@ -44,6 +44,24 @@
 
 该回滚**故意比 `unclaimReported`(D7) 更窄**：只删 claim，不清任何副本。理由相反于 D7 —— D7 处理的是「父已读过所以撤销」，此时还没有任何副本落到父手里，待发的通知是唯一剩下的送达路径。
 
+**修订（#352，2026-xx）：bail 门是「两类、三个丢弃点」，`wait` 的丢弃点此前漏列。**
+
+上面那段只数了 `collect` 一条路。`wait` 也会 claim，也会丢结果，而且丢得比 `collect` 更彻底：
+
+1. **claim 点不是 `waitOne`**：目标 child 已 settle 时它不在 `resolveWaitTargets` 的 live 集合里（`waitAction` 侧），于是 `waitAction` 的 finished-cache 探针（`runtime.consumeCollect`）先取走 claim，`claimedNow === true`。同一条调用链下游 `waitOne` 的 `claimReported` 在这条路径上是**幂等 no-op，返回 `false`** —— 把它的返回值当 `claimedNow` 透传，回滚一无所获。
+2. **丢弃点是工具层的外层 abort 网**：`await job.retire?.()` 期间父 turn 结束，`waitOne` 仍把渲染好的结果交回上层，而工具层在 `return ok("interrupted (parent turn ended; children still running)")` 之前把整条结果丢弃。这一行文案由 `esc-no-retire-v3` 冻结，**不改**：该丢的还是要丢，欠的是回滚。
+3. **顺出的形状**：探针的 `(snapshot, claimedNow)` 对随 `waitAction` 的返回值透出（`details.waitClaims`，只收 `claimedNow === true`），丢弃点在 `return ok("interrupted …")` 之前逐条 `runtime.unclaimUndelivered(name, snapshot, true)`。
+
+于是 bail 门枚举完整为：
+
+| # | 丢弃点 | 位置 | 取得的 claim 来自 |
+|---|---|---|---|
+| 1 | `collect` 父 turn 已 abort | `collectChild` 的 `signal?.aborted` 分支 | `consumeCollect` / `consumeCollectInterruptible` 的 `claimedNow` |
+| 2 | `collect` 持久化抛错 | `collectChild` 的 `persistChild` catch | 同上 |
+| 3 | `wait` 结果被外层 abort 网替换 | 工具层 `interrupted (parent turn ended; children still running)` 分支 | `waitAction` finished-cache 探针的 `claimedNow`（**不是** `waitOne` 的） |
+
+三条都用 `unclaimUndelivered`：用 `unclaimReported`(D7) 会把 outbox 里唯一剩下的副本一起丢掉（实测：通知从 1 变 0）。
+
 **修订（#320，2026-xx）：回滚收窄到「本次调用取的 claim」，并同时把通知路径交还。**
 
 上面那句「待发的通知是唯一剩下的送达路径」在实现上并不成立，回滚本身有两个缺陷：
@@ -179,5 +197,9 @@ unclaimReported(runId, name):
 11. **release 只丢当轮**（复审 major 1）：两轮各有一份未读副本 → 读掉后一轮（claim round 2）→ `release` → 前一轮的通知仍然送达。
 12. **D7 撤销的两条副本路径各有用例，且删行即红**（复审 major 2）：outbox 副本（删 `dropQueued` 变红）、join 窗口副本（删 revoke 侧 `join.dropBuffered` 变红）。
 13. **claim 回滚**（复审 minor 4）：`collectChild` 在交付前 bail（`persistChild` 抛错 / 父 turn 已 abort）→ claim 回滚 → 待发通知仍然送达。
+14. **`wait` 的 claim 回滚**（#352）：
+    - `wait` 命中 finished-cache 且父 turn 在被 wait 的 retire await 期间中断 → 回执仍是冻结的 `interrupted …`，**且**该轮通知随后恰好送达一次；探针的 `claimedNow` 已回滚。
+    - 对照：`wait` 正常返回（无中断）→ 通知仍然只有一条（不双发）。
+    - 对照：探针 `claimedNow === false`（别的路径已 claim）→ 中断时不得回滚别人的 claim。
 
 全部既有 unit 测试必须保持绿色（`npm test`），`npm run typecheck` 干净。

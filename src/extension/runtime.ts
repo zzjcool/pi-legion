@@ -694,9 +694,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	/**
 	 * D2: take the claim for `(runId, name, round)`, where `round` is the reporting
 	 * round handed out monotonically by `track()` (D10). Idempotent and side-effect
-	 * free for a key that is already claimed — there is deliberately no unclaim on the
-	 * DELIVERY side: a timeout / interrupt / still-running result was never claimed,
-	 * and a claim that did happen has already reached the parent.
+	 * free for a key that is already claimed — and there is deliberately no unclaim on
+	 * the DELIVERY side: a timeout / interrupt / still-running result was never
+	 * claimed, and a claim taken by a real delivery IS the record that the parent read
+	 * it, so nothing on the send path may revoke it.
+	 *
+	 * The caller side is a different question, and the answer is NOT "a claim that did
+	 * happen has already reached the parent": a tool call can claim a result and then
+	 * bail before rendering it — `collectChild`'s abort/persist bails, and `wait`'s
+	 * result discarded by the tool layer's abort net (#352). Those callers owe the
+	 * claim back through `unclaimUndelivered`, which is why that rollback takes
+	 * `claimedNow` (below) and why `waitAction` carries its probe's pair out in
+	 * `details.waitClaims`.
 	 *
 	 * Returns whether THIS call is the one that took the claim (#320/1): a `false`
 	 * means a real delivery got there first, and that claim is evidence, not something

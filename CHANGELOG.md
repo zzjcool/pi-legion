@@ -145,6 +145,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   the built-in four-phase pipeline is unchanged. Contract:
   `docs/contracts/declarative-phase-machine-v5.md:107` (that file is `Status: draft`).
 
+- **A `wait` whose result the abort net throws away now hands the completion claim back, so the child's
+  finished notice is no longer lost (#352).** Waiting on an already-settled child goes through
+  `waitAction`'s finished-cache probe, which claims the round (`claimedNow === true`) — and when the
+  parent turn ends inside the wait's `retire` teardown, the tool layer replaces the rendered result with
+  the frozen `interrupted (parent turn ended; children still running)` line and nothing was handed back:
+  `deliverBatch` filters a claimed round, so that completion notice never reached the parent, silently
+  and for the whole round. `waitAction` now carries the claims IT took out as `details.waitClaims` (only
+  `claimedNow === true`; `waitOne`'s own `claimReported` is a no-op `false` on this path), and the bail
+  gives each one back through `unclaimUndelivered` — never `unclaimReported`, which would also drop the
+  queued copy, the only remaining route — exactly as `collectChild` already does on its own bails. The
+  frozen `interrupted …` text, the `(runId, name, round)` claim key and `deliverBatch`'s single exit are
+  untouched. Contract: `docs/contracts/notice-claim-v1.md` (bail-gate enumeration extended).
+
 - **`/legion doctor` stopped recommending the dead extension switch (#329).** `inheritExtensions: true`
   and `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` outlived #328's clean-up in `legion-doctor.ts`: `true` has been
   the default since #280 and both yield 0 extensions when host discovery fails, so every doctor fix and

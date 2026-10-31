@@ -48,7 +48,7 @@ import {
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
 import { resolveTeamContext } from "./src/agents/context.ts";
-import { createSessionRuntime, renderLiveChildStatus, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
+import { createSessionRuntime, renderLiveChildStatus, type ClaimedCollect, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import type { PhaseMachine } from "./src/legion/phase-machine.ts";
@@ -1579,6 +1579,12 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					legion: activeLegion,
 				});
 				if (signal?.aborted && action !== "stop") {
+					// #352: the frozen head line replaces the rendered result, so the parent
+					// never sees it — and `wait` CLAIMS a settled child's completion on its
+					// finished-cache probe. The result is thrown away here, so the claim has
+					// to go back (exactly what `collectChild` owes on its own bails): a claim
+					// nobody delivered suppresses that round's notice forever.
+					releaseWaitClaims(runtime, result.details);
 					return ok("interrupted (parent turn ended; children still running)");
 				}
 				return result;
@@ -4726,6 +4732,38 @@ export async function stopAction(input: {
 		: ok(summary);
 }
 
+/**
+ * #352: one completion claim a `wait` took for a result the parent never saw.
+ *
+ * `waitAction` claims a settled child's result on its finished-cache probe
+ * (`runtime.consumeCollect`, `index.ts` — the probe is NOT side-effect free since
+ * notice-claim-v1), and the tool layer in this file can still throw the rendered
+ * result away when the parent turn ends. Only a claim THIS call took travels here
+ * (`claimedNow === true`): a key an earlier real delivery claimed is evidence, not
+ * something a bail may spend (#320/1).
+ */
+export interface WaitClaim {
+	name: string;
+	snapshot: CollectSnapshot;
+}
+
+/**
+ * #352: hand back every claim a discarded `wait` result owed.
+ *
+ * `unclaimUndelivered`, never `unclaimReported`: nothing reached the parent, so the
+ * queued notice is the ONLY remaining route — the rollback gives the claim back and
+ * drops no copy (D2/D7). `claimedNow` is always `true` here: `WaitClaim`s only exist
+ * for claims this call took.
+ */
+export function releaseWaitClaims(runtime: SessionRuntime, details: unknown): void {
+	if (details === null || typeof details !== "object") return;
+	const claims = (details as { waitClaims?: unknown }).waitClaims;
+	if (!Array.isArray(claims)) return;
+	for (const claim of claims as WaitClaim[]) {
+		runtime.unclaimUndelivered(claim.name, claim.snapshot, true);
+	}
+}
+
 export async function waitAction(input: {
 	params: SubagentParams;
 	signal?: AbortSignal;
@@ -4737,6 +4775,11 @@ export async function waitAction(input: {
 }): Promise<AgentToolResult<unknown>> {
 	const { params, signal, runtime, agents, allAgents = agents, store, cwd } = input;
 	const jobs = runtime.activeJobs();
+	// #352: every claim THIS call takes. The array is shared by REFERENCE with the
+	// returned `details.waitClaims`, because the probe below answers asynchronously:
+	// a claim that lands after the details object was built must still be visible to
+	// a caller that discards the rendered result.
+	const claims: WaitClaim[] = [];
 	let targets = resolveWaitTargets(
 		{ name: params.name, all: params.all },
 		jobs,
@@ -4747,9 +4790,18 @@ export async function waitAction(input: {
 		// notice-claim-v1 that probe is NOT side-effect free: a cache hit claims the
 		// result, which is correct here — the wait below returns the same result to the
 		// parent, so the pushed notice for it is suppressed instead of duplicating it.
+		// It is also why the claim travels back out (#352): if the caller never hands
+		// the result over, nobody else can, and the claim must be given back.
 		if (params.name && !params.all) {
-			const cached = runtime.consumeCollect(params.name);
-			if (cached) {
+			const probe = runtime.consumeCollect(params.name);
+			if (probe) {
+				const name = params.name;
+				void probe.then((claimed: ClaimedCollect) => {
+					// #320/1: only a claim THIS call took may come back later.
+					if (claimed.claimedNow) claims.push({ name, snapshot: claimed.snapshot });
+				}, () => {
+					// A throwing collect is the `wait` below's problem, not the probe's.
+				});
 				targets = { ok: true, names: [params.name] };
 			} else {
 				return unknownChild(params.name, store, cwd);
@@ -4774,10 +4826,14 @@ export async function waitAction(input: {
 		);
 	const results = await runtime.wait(targets.names, { timeoutMs, ...(signal ? { signal } : {}) });
 	const text = renderWait(results);
-	const details = buildWaitTimeoutDetails(results);
-	return details
-		? { content: [{ type: "text", text }], details }
-		: ok(text);
+	const timeoutDetails = buildWaitTimeoutDetails(results);
+	// #352: `details.waitClaims` is the only record of what this call took — the tool
+	// layer's abort net replaces the rendered result with the frozen `interrupted …`
+	// line, and without this the claim it leaves behind suppresses that round's notice
+	// forever.
+	const details: Record<string, unknown> = timeoutDetails ? { ...timeoutDetails } : {};
+	if (claims.length > 0) details.waitClaims = claims;
+	return { content: [{ type: "text", text }], details };
 }
 
 export function renderAgentList(
