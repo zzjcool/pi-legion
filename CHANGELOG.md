@@ -170,6 +170,45 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **`legion_mail` refuses text containing `U+0000` instead of storing a truncation (#353).** SQLite's
+  TEXT binding stops at the first NUL, so a `body`/`subject` carrying one was written as the part
+  before it while the send still answered `ok: true` — and `bodyBytes` counted the ORIGINAL text, so a
+  message that arrived cut in half looked complete to its sender. There is no lossless encoding that
+  keeps "the body" meaning the same thing to every reader, so the send is refused before any byte is
+  counted: `sendMail` throws `MailInvalidTextError` (code `MAIL_INVALID_TEXT`, a member of the existing
+  `code` vocabulary) naming the field, the character offset of the first NUL, and that NUL is not
+  supported. `subject`, `body` and every `to` token are checked; nothing is stored and no `mail_sent`
+  event is written. NUL-free text is untouched, and `bodyBytes` keeps describing exactly the row that
+  was stored (the invariant the truncation broke).
+
+- **A team woken by `continue` starts a new phase stint, so its next timeout is announced again
+  (#357).** The `Phase timeout:` notice was already judged `OBSOLETE` at settle time (#333/#354); what
+  made the team go permanently silent is that `Orchestrator.reserveNode`'s resume branch only rewrote
+  `status`, leaving `phase_since` at the value of the stint that had ALREADY timed out. Since
+  `checkOwnPhaseTimeout` dedupes on exactly that value (`hasPhaseTimeoutForSince`), one `phase_timeout`
+  per stint meant one for the life of the team: the second stint could run past its advisory clock
+  forever and nobody would hear. A revival now advances `phase_since` to the revival clock and records
+  a `phase_change` with `from === to` and `reason: "revived"` — the phase does not move (work resumes
+  where it was), the event set stays closed (no new type, no new subject prefix, no change to the
+  `kind: "notice"` accounting), and a revival that cannot move the clock still dedupes, because the key
+  is `phase_since` and not "a revival happened". Contract note:
+  `docs/contracts/mailbox-delivery-v1.md` (D4).
+
+- **A declared machine's own phase names now reach the verifying gate and the phase clock (#358).**
+  The follow-up left by #350: `finalizeVerifiedTeamIfReady` hard-coded `node.phase !== "verifying"` and
+  evaluated `verifying → done` with no `machine`, so a workflow the card called `spec → impl → ship`
+  could never take the supervisor's verified-completion path (`invalid_phase`, dropped by the
+  `!decision.allowed` guard). The completion gate is now the phase of THIS team's machine that judges
+  success — an exit to `done`, preferring one gated on `verification_passed`, otherwise the last
+  declared candidate, which is `verifying` in the built-in machine — and the machine is forwarded to
+  `evaluatePhaseTransition`. A team with no declared machine (or a machine with no exit to `done` at all)
+  keeps the historical literal, so the built-in four-phase pipeline is unchanged. The sibling hole is
+  the same mistake in the clock: `checkOwnPhaseTimeout` resolved `DEFAULT_PHASE_TIMEOUTS[phase] ?? 0`,
+  which for an undeclared phase name is 0, so `PhaseDefinition.timeoutMs` (`machineTimeout`) was dead
+  code and a custom phase's advisory clock never armed. The order is now operator setting
+  (`legion.phaseTimeouts`) → the machine's `timeoutMs` → the built-in default → 0, and 0 keeps its
+  pre-existing meaning of "never warn".
+
 - **A team is now born in the phase its own machine starts in, so a card declaring `phases:` no longer
   strands its team at spawn (#350).** `Orchestrator.reserveNode` wrote a hard-coded `phase: "planning"`
   into every team row, ignoring the machine the card already carried. With a machine whose first phase
@@ -193,7 +232,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   The abort half of the same hole is #351, which landed upstream in `abortLegionPhase` (already on
   master), so this branch only had to stop duplicating it. The other two custom-phase holes — a hard-coded
   `phase !== "verifying"` completion gate and a phase clock that resolves to 0 for undeclared names —
-  are documented in place and tracked as #358 rather than fixed here.
+  are documented in place and tracked as #358 rather than fixed here; this branch closes them (see the
+  #358 entry above).
 
 - **A `wait` whose result the abort net throws away now hands the completion claim back, so the child's
   finished notice is no longer lost (#352).** Waiting on an already-settled child goes through
