@@ -4,6 +4,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 chmod +x "$ROOT/test/docker/"*.sh
 bash "$ROOT/test/docker/prepare-home.sh"
 STAGING="${DOCKER_PI_HOME:-/tmp/pi-herdr-docker-home}"
+IMAGE="${PI_DOCKER_IMAGE:-pi-herdr-sandbox:latest}"
 docker run --rm -u 0 -e HOME=/root -e PI_OFFLINE=1 \
   -v "$ROOT:/plugin:ro" -v "$STAGING:/root" -v "$ROOT/test/docker:/opt/test:ro" \
-  -w /plugin pi-herdr-sandbox:latest bash /opt/test/inside-2-task-appendix.sh
+  -w /plugin "$IMAGE" bash /opt/test/inside-2-task-appendix.sh

@@ -188,7 +188,11 @@ Or all at once (RPC mainline **1–11** only):
 npm run test:docker
 ```
 
-Override paths with `HOST_PI_AGENT`, `DOCKER_PI_HOME`, `PI_DOCKER_IMAGE`.
+Override paths with `HOST_PI_AGENT`, `DOCKER_PI_HOME`, `PI_DOCKER_IMAGE`. Every
+`verify-*.sh` honors `PI_DOCKER_IMAGE` (all eleven, not just 1 and 7, since #367's
+follow-up), so a locally built `tui-sandbox:latest` works without retagging; the
+historical default is only a fallback. `make rpc` in `test/docker` runs the eleven
+against `$(IMAGE)`.
 
 Each `inside-N-*.sh` is what actually runs **in** the container. Keep those
 scripts self-contained: they should still make sense if you `docker exec`

@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -154,5 +154,12 @@ test("integration: pi --print against mock LLM returns MOCK_SAY text", {
 });
 
 test("integration: writeMockPiHome packages path is absolute plugin root shape", () => {
-	assert.ok(pluginRoot.endsWith("pi-legion-viz") || pluginRoot.includes("pi-legion"));
+	// The checkout's directory name is not part of the contract — the docker suite
+	// binds this repo at `/plugin` (CONTRIBUTING "Docker verification"), so keying on
+	// "pi-legion" made this pass on a dev box and fail inside the sandbox. Assert the
+	// shape the generated mock home actually depends on: an absolute path to a
+	// directory that holds this package.
+	assert.ok(path.isAbsolute(pluginRoot), `plugin root must be absolute: ${pluginRoot}`);
+	assert.ok(existsSync(path.join(pluginRoot, "package.json")), `plugin root must hold package.json: ${pluginRoot}`);
+	assert.ok(existsSync(path.join(pluginRoot, "index.ts")), `plugin root must hold the plugin entry: ${pluginRoot}`);
 });
