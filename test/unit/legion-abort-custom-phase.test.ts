@@ -206,6 +206,45 @@ test("#351: an unresolvable phase is still forced to aborted — with a phase_ch
 	}
 });
 
+test("#355: a throwing machineForRole degrades to \"no machine\" instead of escaping retire()", async () => {
+	const fx = fixture(CUSTOM_PHASE);
+	const run = fx.runStore.createRun({ task: "root task", cwd: fx.rootDir, nodeId: "root", maxDepth: 4 });
+	const originalWarn = console.warn;
+	const warnings: string[] = [];
+	console.warn = (message?: unknown) => { warnings.push(String(message)); };
+	try {
+		await seat(fx, run.runId);
+		// `retire()` is already past `supervisor.retire()` when it reaches the abort,
+		// so a throw from the caller-supplied lookup would escape `retire()` after the
+		// process is gone and skip the bookkeeping lines below it.
+		const rolesAsked: Array<string | null | undefined> = [];
+		const orchestrator = orchestratorFor(fx, run.runId, (role) => {
+			rolesAsked.push(role);
+			throw new Error("agent discovery exploded");
+		});
+		orchestrator.restore(fx.runStore.readRun(run.runId)!);
+
+		await bounded(orchestrator.retire("team-lead"), "orchestrator.retire (throwing machine)");
+
+		assert.equal(rolesAsked.length, 1, "the lookup was asked once");
+		assert.equal(getNode(fx.db, fx.nodeId)?.status, "retired", "the retire bookkeeping still runs");
+		assert.equal(getNode(fx.db, fx.nodeId)?.phase, "aborted", "a throwing lookup behaves like no machine: forced through");
+		const phaseEvents = readEventsAfter(fx.db, 0, { nodeId: fx.nodeId }).filter((event) => event.type === "phase_change");
+		assert.equal(phaseEvents.length, 1);
+		const data = phaseEvents[0]!.data as Record<string, unknown>;
+		assert.equal(data.to, "aborted");
+		assert.equal(data.forced, true);
+		assert.equal(data.denied, "invalid_phase", "without a machine the custom name is still unresolved");
+		assert.equal(warnings.length, 2, "one for the throw, one for the refused abort");
+		assert.match(warnings[0]!, /agent discovery exploded/u, "the throw is reported, not swallowed silently");
+		assert.ok(warnings[0]!.includes(String(rolesAsked[0])), "the warning names the role it could not resolve");
+		assert.match(warnings[1]!, /invalid_phase/u);
+	} finally {
+		console.warn = originalWarn;
+		fx.cleanup();
+	}
+});
+
 test("#351 control: a built-in phase aborts exactly as before (no forced flag, no warning)", async () => {
 	const fx = fixture("implementing");
 	const run = fx.runStore.createRun({ task: "root task", cwd: fx.rootDir, nodeId: "root", maxDepth: 4 });

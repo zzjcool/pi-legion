@@ -149,6 +149,8 @@ root 行的 `session_file` 仍是 NULL —— 这些账本里发给 root 的邮�
 `test/unit/legion-tools.test.ts`（三态落值、确认升级、子串不升级、#333 两处求值、幂等；
 #338 增：root 收件人升级到 DELIVERED、游标轮转、`report` 不作废、无 `phase_timeout` 事件不猜、
 同相位重进作废、每 seam 只 parse 一次、按 message id 重发事件）、
+`test/unit/legion-phase-timeout-ended.test.ts`（#354「已结束 = `hasEnded`」那句的**唯一**钉住者：
+停在出生相位、在超时相位里就地 `settled`/`retired` 的团队必须作废；`isTerminalNode` 不放宽）、
 `test/unit/legion-mail.test.ts`（五值迁移边、`mailboxStats`、精确匹配窗口、`inbox` 游标分页）、
 `test/unit/legion-root-session.test.ts`（#338 M1：`createRootLegion` 把本进程会话文件写进 root 行，
 并据此确认 root 收件人）、

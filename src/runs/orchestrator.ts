@@ -729,7 +729,7 @@ export class Orchestrator {
 		if (!node || !node.phase || isTerminalPhase(node.phase)) return;
 		// #351: attach it. Without the machine a card-declared name (`build`) was
 		// `invalid_phase`, and the refusal below used to be dropped in silence.
-		const machine = this.legion.machineForRole?.(node.role);
+		const machine = this.safeMachineForRole(node.role);
 		const decision = evaluatePhaseTransition({
 			from: node.phase,
 			to: "aborted",
@@ -762,6 +762,27 @@ export class Orchestrator {
 		console.warn(
 			`[pi-legion] node ${nodeId} retired while in phase '${node.phase}': the abort was refused (${decision.reason}: ${decision.message}); phase forced to aborted so the parent retire still takes effect.`,
 		);
+	}
+
+	/**
+	 * #355 review: `machineForRole` is a caller-supplied seam, and `retire()` is
+	 * already past `supervisor.retire()` when it reaches `abortLegionPhase` — a
+	 * throw there would escape `retire()` after the process is gone and skip every
+	 * bookkeeping line below it (`child.state`, `node_retired`, slot release).
+	 * Safety today only comes from the caller: `phaseMachineForRole` swallows its
+	 * own discovery errors. This keeps the abort path safe on its own terms — a
+	 * broken lookup degrades to "no machine", which the forced-abort path covers.
+	 */
+	private safeMachineForRole(role: string | null | undefined): PhaseMachine | undefined {
+		try {
+			return this.legion?.machineForRole?.(role);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			console.warn(
+				`[pi-legion] phase machine lookup for role '${role ?? "<none>"}' threw (${detail}); retiring with the built-in machine so the abort still takes effect.`,
+			);
+			return undefined;
+		}
 	}
 
 	private emitProcess(type: LegionProcessEventType, nodeId: string, data: unknown): void {

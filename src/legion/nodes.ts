@@ -236,6 +236,14 @@ export function isTerminalNode(node: Pick<LegionNode, "status" | "phase">): bool
  * a notice addressed to this node again?" — and a team that only investigated
  * ends `settled`/`retired` while keeping its birth phase, so the phase test above
  * can never see it.
+ *
+ * Also NOT the same question as {@link NON_TERMINAL_NODE_STATUSES} (top of this
+ * file), which literally lists `retired` on the NON-terminal side: that array is
+ * `listStaleNodes`' scan set ("hygiene should still look at this row"), not a
+ * "the run is over" predicate, so borrowing it here would classify a retired team
+ * as still alive. Four sets coexist on purpose and must not be collapsed into one:
+ * `LIVE_CHILD_STATUSES` (concurrency slots), `NON_TERMINAL_NODE_STATUSES` (stale
+ * scan), `isTerminalNode` (mail bounce + orphan convergence) and this one.
  */
 export function hasEnded(node: Pick<LegionNode, "status" | "phase">): boolean {
 	return isTerminalNode(node) || node.status === "settled" || node.status === "retired";
