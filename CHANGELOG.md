@@ -81,28 +81,20 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
-- **`/legion` 整帧分配降到 ≤2.0MB（120×40 2586.9 → 1036–1053 KB，200×60 3963.9 → 1309–1342 KB），
-  且可见输出逐字节不变 (#364).** #362 已经修掉「每写一格分配一个 `Cell`」，剩下的都是**每帧重建的脚手架**：
-  `drawGalaxy` 每帧新建 1,102/3,658 个 braille 像素格、每格一次 `String.fromCharCode`、每个 `leaves()`
-  调用点一个 `guard` Set（一帧约 2N−1 个）、`pos` 的每节点 `[x,y]` 元组、`Math.hypot` 的每次一个
-  arguments 数组；`toLines` 每帧全网格扫一遍 role、每个 role 色格复制成 `{...cell, color}`（1,123/1,865 个
-  ×70–72 B）、每个 run 一次 `text.trim()`；`drawChart` 每列每个非零 role 一个 `{top, role}` 对象；
-  还每帧 `new Canvas(W,H)`（预填 190/472 KB）。
-  现在：星系像素缓冲、星系帧内 Map/guard Set、行字符缓冲、图表 band 栈与 role 列表**原地复用**
-  （`m`/`z` 全格清零守住颜色串帧的写入门槛；叶数 memo/深度/位置/半径只帧内有效，绝不跨帧缓存——
-  `VizNode` 每帧是新对象且绘制路径按**身份**比较中心球）；role 色表由 `set()` 增量维护、调色板按
-  **(theme, 该帧 role 集合)** 缓存，`renderRow` 就地解析颜色并按**解析后**的颜色合并 run（与旧的
-  "先克隆再合并"同义），行尾裸空格仍然不套 SGR（#308 的 page floor 靠它）；`renderLegionView` 接受一个
-  可选 canvas 让 `createLegionViewFactory` 跨帧复用（`new Canvas` 语义与成本对所有其它调用方不变）。
+- **`/legion` 整帧分配降到 ≤2.0MB（−59% @120×40，−67% @200×60），且可见输出逐字节不变 (#364).** #362 已经修掉「每写一格分配一个 `Cell`」，这一轮清掉的是**每帧重建的
+  脚手架**：星系像素缓冲/帧内 Map、行字符缓冲、图表 band 栈、`new Canvas(W,H)`，以及 `Math.hypot`、
+  `{...cell, color}` 克隆、每帧 `text.trim()` 这类每格/每 run 的临时对象。现在这些都原地复用，
+  role 色表由 `set()` 增量维护、调色板按 **(theme, 该帧 role 集合)** 缓存，`renderLegionView` 接受一个
+  可选 canvas 让 `createLegionViewFactory` 跨帧复用（`new Canvas` 语义与成本对所有其它调用方不变；
+  `chartWindow` 的 earliest 推导也一并去掉了 `filter`/`map`/`spread`，语义等价）。
   实测（同一脚本、200 节点、真 `Theme(dark)`、`--expose-gc`、单帧 `heapUsed` 差值 20 次中位）：
   整帧分配 **2586.9 → 1036–1053 KB**（120×40/live，−59%）、**3963.9 → 1309–1342 KB**（200×60/live，−67%）；
-  median/p95 **3.34/5.44 → 2.77–2.99/3.85–4.36 ms**、**5.05/7.14 → 4.12–4.28/4.72–5.35 ms**。
-  **可见输出零变化**：4 形状（120×40 / 200×60 / 80×24 / 46×60）× `toPlain`/`toLines(真 dark)` 的 sha256
-  与技术前捕获逐字节相同；新增的**内联 golden** 补上了仓里原先没有的快照空档（旧用例都是"同代码渲染两次再比"，
-  两侧同时漂移抓不住）。基准：`bench/perf-core/10-legion-frame-alloc.ts`（+ `10-baseline.json` digest golden）；
-  契约：`docs/contracts/viz-frame-alloc-v1.md`；报告：`reports/364-viz-frame-alloc.md`（含残余分量实测归因：
-  `RateSampler.buckets()` 259 KB、`renderRow` 的 ESC 字符串 213 KB、星系 Map/Set 每帧重建 145 KB、
-  `buildLog` 每帧算两次 73 KB——都在契约步骤表之外，未越界改动）。
+  时间仍在契约门禁内（median/p95 ≤4.0/≤7.0ms @120×40，≤7.0/≤10.0ms @200×60）。
+  **可见输出零变化**：4 形状（120×40 / 200×60 / 80×24 / 46×60）× `toPlain`/`toLines(真 dark)` 的 sha256、
+  以及逐格 `(ch, color, bold, inverse)` 的 sha256，都与改动前捕获的 golden 逐字节相同；新增的**内联 golden**
+  补上了仓里原先没有的快照空档（旧用例都是"同代码渲染两次再比"，两侧同时漂移抓不住）。
+  基准：`bench/perf-core/10-legion-frame-alloc.ts`（+ `10-baseline.json` digest golden）；
+  契约：`docs/contracts/viz-frame-alloc-v1.md`。
 - **`/legion` 从全屏 overlay 改成主屏挂载，整帧合成开销消失（120×40 4.39ms → 1.69ms，200×60 9.59ms → 3.39ms）(#347).**
   页面一直以 `overlay: true` + `width:"100%"` 打开，于是 pi-tui 对**每一行**都跑 `compositeTuiLine`
   （`extractSegments` + `sliceWithWidth` + `visibleWidth` 三次 `Intl.Segmenter` 字素扫描，行宽缓存按整行

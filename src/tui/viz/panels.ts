@@ -1,6 +1,6 @@
 /** Panel renderers for the /legion full view. All drawing is clipped to its rect. */
 
-import { Canvas, cellWidth, ellipsize } from "./canvas.ts";
+import { Canvas, cellWidth, ellipsize, type TextStyle } from "./canvas.ts";
 import type { Rect } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode, type VizStatus } from "./model.ts";
 import { nodeToken, roleColor } from "./palette.ts";
@@ -40,7 +40,7 @@ export function frame(cv: Canvas, r: Rect, title: string, focused: boolean, hint
 }
 
 /** Shared empty list: `map.get(id) ?? []` allocated one array per miss, per pass (~200/frame). */
-const NO_NODES: VizNode[] = [];
+const NO_NODES: readonly VizNode[] = [];
 
 export function childrenMap(nodes: readonly VizNode[]): Map<string | null, VizNode[]> {
 	const map = new Map<string | null, VizNode[]>();
@@ -91,8 +91,8 @@ const LABEL_DY = [0, -1, 1, -2, 2] as const;
 const SIDES_RIGHT = [1, -1] as const;
 const SIDES_LEFT = [-1, 1] as const;
 /** Two constant style objects: `text()` only reads them, so every label can share one. */
-const LABEL_STYLE = { bold: true, inverse: false };
-const LABEL_STYLE_SELECTED = { bold: true, inverse: true };
+const LABEL_STYLE: Readonly<TextStyle> = { bold: true, inverse: false };
+const LABEL_STYLE_SELECTED: Readonly<TextStyle> = { bold: true, inverse: true };
 /** Legend entries in fixed order (failed before retired); filtered per frame, never rebuilt. */
 const STATUS_ITEMS = [["failed", "✗ failed", "error"], ["retired", "⣿ retired", "dim"]] as const;
 
@@ -111,12 +111,18 @@ const STATUS_ITEMS = [["failed", "✗ failed", "error"], ["retired", "⣿ retire
  * domain (all disc-fill coordinate pairs + 5k random pairs). The page digests are
  * the second guard: a one-ulp difference would move a `<= rad` comparison and
  * change the picture.
+ *
+ * `@internal` — exported for that differential test only; nothing outside
+ * `panels.ts` calls it.
  */
 export function hypot2(a: number, b: number): number {
 	const x = Math.abs(a);
 	const y = Math.abs(b);
 	if (x === Number.POSITIVE_INFINITY || y === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
-	const max = x > y ? x : y;
+	// `Math.max`, not `x > y ? x : y`: `Math.hypot` propagates NaN, and a plain
+	// comparison would silently answer `hypot2(NaN, 0) === 0`. `Math.max` is a
+	// two-argument builtin (no arguments object), so this stays allocation-free.
+	const max = Math.max(x, y);
 	if (max === 0) return 0;
 	const xr = x / max;
 	const yr = y / max;
@@ -134,13 +140,15 @@ interface PxCell {
  * every frame (3,658 cells at 200×60, ~64B each).
  *
  * **Contract T1**: every cell's `m` and `z` MUST be cleared before a frame. `m`
- * only ever accumulates (`|=`), and `z` is the write gate (`z >= cell.z`), so a
- * stale `z` from the previous frame would reject this frame's lower-priority
- * dots — and a cell with `m != 0` always has its `col` read for the glyph, i.e.
- * last frame's colour would leak into this frame's picture. `col` itself is
- * deliberately NOT cleared: with `z = -1` every dot that sets a bit also sets
- * `col`, so "`m != 0` ⇒ `col` is this frame's" holds, and clearing it would just
- * add 3,658 pointless stores.
+ * only ever accumulates (`|=`), so a stale bit paints last frame's glyph; and `z`
+ * is the write gate (`z >= cell.z`), so a stale `z` rejects this frame's
+ * lower-priority dots, which leaves `m` zero there and drops that part of the
+ * picture. `col` itself is deliberately NOT cleared: with `z = -1` on every cell
+ * and every dot's priority `z >= 0`, the FIRST dot to touch a cell always passes
+ * `z >= cell.z` and so writes `col` in the same step it sets its bit — hence
+ * "`m != 0` ⇒ `col` is this frame's" holds for free, and clearing it would only
+ * add 3,658 pointless stores. (Note the bit is set *outside* the `z` check, so
+ * that implication rests on the `z` reset, not on the assignment order.)
  */
 let pxWidth = -1;
 let pxHeight = -1;
@@ -171,8 +179,12 @@ function pixelGrid(width: number, height: number): PxCell[][] {
 }
 
 /**
- * Frame-local scratch for `drawGalaxy` (#364 A1). Every container is emptied at
- * the top of the frame; nothing survives into the next one.
+ * Frame-local scratch for `drawGalaxy` (#364 A1). None of it is a cache: each
+ * container is emptied at the start of the section that fills it, so a reader
+ * only ever sees this frame's entries. That is *not* "everything is cleared at
+ * the top of the function" — `if (!center) return` below leaves the containers
+ * it never reached holding the previous frame's values, which is harmless
+ * precisely because every one of them is re-cleared before its own reader.
  *
  * **Contract T2/T3**: `data.nodes` and every `VizNode` is a NEW object each frame
  * (`status.ts:925` → `model.ts:93`), and the drawing path compares nodes by
@@ -239,7 +251,7 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	const virtualRoot: VizNode | undefined = roots.length === 1 ? undefined : {
 		id: "\u0000center", name: "legion", role: "centurion", parentId: null, depth: 0, status: "running", startedAt: data.now, tokens: 0, tokensOut: 0, generationMs: 0,
 	};
-	const childrenOf = (node: VizNode): VizNode[] => node === virtualRoot ? roots : kids.get(node.id) ?? NO_NODES;
+	const childrenOf = (node: VizNode): readonly VizNode[] => node === virtualRoot ? roots : kids.get(node.id) ?? NO_NODES;
 	const center = virtualRoot ?? roots[0]!;
 	if (!center) return;
 	// Leaf counts (contract T3: id-keyed, so this memo is frame-scoped only).
@@ -481,12 +493,18 @@ export interface ChartStats {
  */
 export function chartWindow(data: ViewData): { from: number; to: number } {
 	// #364 S4: same answer as `Math.min(sampler.startedAt ?? now, ...agents.map(startedAt))`
-	// without the filtered+projected array pair and the spread (both per frame).
+	// without the filtered+projected array pair and the spread (both per frame),
+	// and pointwise equal to it: the no-agent case still folds `data.now` into the
+	// min (the old `starts.length ? starts : [data.now]`), and a NaN `startedAt`
+	// still poisons the result because `Math.min` propagates NaN.
 	let earliest = data.sampler.startedAt ?? data.now;
+	let anyAgent = false;
 	for (const node of data.nodes) {
 		if (!isAgent(node)) continue;
-		if (node.startedAt < earliest) earliest = node.startedAt;
+		anyAgent = true;
+		earliest = Math.min(earliest, node.startedAt);
 	}
+	if (!anyAgent) earliest = Math.min(earliest, data.now);
 	const to = data.sampler.lastChangeAt ?? data.sampler.startedAt ?? data.now;
 	return { from: Math.min(earliest, to - 60_000), to };
 }

@@ -299,8 +299,16 @@ function measureFrame(data: ViewData, cols: number, rows: number): FrameCell {
 
 /**
  * Component attribution for one frame. Every probe is measured on its own (same
- * 20-sample median), so the numbers overlap by design — `sumKB`/`residualKB`
- * record how well they add up instead of hiding the noise.
+ * 20-sample median), so the numbers overlap by design — `residualKB` records how
+ * well they add up instead of hiding the noise.
+ *
+ * `residualKB` = the measured whole frame MINUS (galaxy + chart + toLines +
+ * canvas). It is deliberately not `renderView + toLines - sumKB`: that was an
+ * algebraic identity and could only ever print 0. This one is only 0 if the four
+ * probes happen to account for the frame exactly. It comes out negative here,
+ * and that is the S3 result, not a bug: `canvasKB` is a `new Canvas(W,H)` per
+ * frame, which the production frame no longer allocates — so the sum correctly
+ * over-counts by it. Reported for attribution, never gated.
  */
 interface Components {
 	canvasKB: number;
@@ -309,11 +317,10 @@ interface Components {
 	chartKB: number;
 	toLinesKB: number;
 	otherKB: number;
-	sumKB: number;
 	residualKB: number;
 }
 
-function measureComponents(data: ViewData, cols: number, rows: number): Components {
+function measureComponents(data: ViewData, cols: number, rows: number, frameKB: number): Components {
 	const layout = computeLayout(cols, rows, { logEvents: buildLog(data.nodes).length });
 	const reuse = new Canvas(cols, rows);
 	const state = initialViewState();
@@ -337,7 +344,6 @@ function measureComponents(data: ViewData, cols: number, rows: number): Componen
 	const chartKB = round(frameAllocKB(chart));
 	const toLinesKB = round(frameAllocKB(toLines));
 	const otherKB = round(renderViewKB - galaxyKB - chartKB);
-	const sumKB = round(renderViewKB + toLinesKB);
 	return {
 		canvasKB,
 		renderViewKB: round(renderViewKB),
@@ -345,8 +351,7 @@ function measureComponents(data: ViewData, cols: number, rows: number): Componen
 		chartKB,
 		toLinesKB,
 		otherKB,
-		sumKB,
-		residualKB: round((renderViewKB + toLinesKB) - sumKB),
+		residualKB: round(frameKB - (galaxyKB + chartKB + toLinesKB + canvasKB)),
 	};
 }
 
@@ -388,7 +393,7 @@ for (const [cols, rows] of SIZES) {
 			perRoundMedian: rest.perRoundMedianMs,
 			perRoundP95: rest.perRoundP95Ms,
 		};
-		components[tag] = measureComponents(data[variant], cols, rows);
+		components[tag] = measureComponents(data[variant], cols, rows, frames[tag]!.frameAllocKB);
 	}
 }
 

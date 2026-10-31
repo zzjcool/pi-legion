@@ -99,25 +99,17 @@ export class Canvas {
 	}
 
 	/** Write text clipped to [x, maxX). Returns the column after the last written cell. */
-	text(x: number, y: number, value: string, color?: string, style: TextStyle = NO_TEXT_STYLE): number {
+	text(x: number, y: number, value: string, color?: string, style: Readonly<TextStyle> = NO_TEXT_STYLE): number {
 		const limit = Math.min(this.width, style.maxX ?? this.width);
 		let col = x;
 		// #364: walk code points by index instead of `Array.from(value)` — the old
 		// loop allocated one throw-away array per written string, and the galaxy
-		// writes ~100 label strings and the legend per frame. Surrogate pairs are
-		// the only case that still builds a string, and `sanitizeChar` collapses
-		// them exactly as it did before.
-		for (let i = 0; i < value.length; i++) {
-			let ch = value[i] as string;
-			const code = value.charCodeAt(i);
-			if (code >= 0xd800 && code <= 0xdbff && i + 1 < value.length) {
-				const low = value.charCodeAt(i + 1);
-				if (low >= 0xdc00 && low <= 0xdfff) {
-					ch = value.slice(i, i + 2);
-					i++;
-				}
-			}
+		// writes ~100 label strings and the legend per frame. The decode is
+		// `codePointAt`/`codePointLength`, the same pair `cellWidth`/`ellipsize` use
+		// (one implementation, and `sanitizeChar` collapses a wide glyph as before).
+		for (let i = 0; i < value.length; i += codePointLength(value, i)) {
 			if (col >= limit) break;
+			const ch = codePointAt(value, i);
 			if (col >= 0) this.set(col, y, ch, color, style);
 			col++;
 		}
@@ -154,7 +146,11 @@ export class Canvas {
 			PALETTES.set(theme, byTheme);
 		}
 		const roles = this.roleList().sort();
-		const key = roles.join(",");
+		// `length + \u0000` separator: role names are arbitrary strings, so a plain
+		// `join(",")` would let `["x,y"]` and `["x", "y"]` (different frames, different
+		// palettes) share one cache entry — the second frame would get the first's
+		// assignment and one of its roles would fall back to `text`.
+		const key = `${roles.length}\u0000${roles.join("\u0000")}`;
 		const cached = byTheme.get(key);
 		if (cached) return cached;
 		const resolved = resolveRolePalette(theme, roles);
@@ -186,7 +182,8 @@ export class Canvas {
 /** Shared empty style so a `set(x, y, ch)` call allocates no default object. */
 const NO_STYLE: { bold?: boolean; inverse?: boolean } = {};
 
-interface TextStyle {
+/** Style knobs `text()` reads; every shared style constant is a `Readonly<TextStyle>`. */
+export interface TextStyle {
 	bold?: boolean;
 	inverse?: boolean;
 	maxX?: number;
@@ -196,8 +193,9 @@ interface TextStyle {
  * #364: `text()`'s default argument was `{}` — a fresh object per call, i.e. one
  * per written string (~1,200 per 200x60 frame, measured 58KB). The painter never
  * mutates the style object, so one shared instance serves every style-less call.
+ * `Readonly` is what makes "never mutates" a type error instead of a comment.
  */
-const NO_TEXT_STYLE: TextStyle = {};
+const NO_TEXT_STYLE: Readonly<TextStyle> = {};
 
 /** Palette cache bound: one theme × one role set is a handful of entries. */
 const PALETTE_CACHE_MAX = 32;
