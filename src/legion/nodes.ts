@@ -227,6 +227,20 @@ export function isTerminalNode(node: Pick<LegionNode, "status" | "phase">): bool
 	return node.status === "failed" || (node.phase !== null && ["done", "failed", "aborted"].includes(node.phase));
 }
 
+/**
+ * #354: a node whose run is over, whatever phase it stopped in.
+ *
+ * Deliberately NOT folded into {@link isTerminalNode}: mail bounce and the orphan
+ * scan share that predicate, and widening it there would change delivery
+ * semantics. This one answers a different question — "will anything ever consume
+ * a notice addressed to this node again?" — and a team that only investigated
+ * ends `settled`/`retired` while keeping its birth phase, so the phase test above
+ * can never see it.
+ */
+export function hasEnded(node: Pick<LegionNode, "status" | "phase">): boolean {
+	return isTerminalNode(node) || node.status === "settled" || node.status === "retired";
+}
+
 export function getNode(db: DatabaseSync, id: string): LegionNode | null {
 	const row = db.prepare("SELECT * FROM nodes WHERE id = ?").get(id);
 	return row ? mapNode(row) : null;

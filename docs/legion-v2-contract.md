@@ -412,7 +412,8 @@ npm test -- --filter <scope>
 确认扫描每 tick 最多 N=20 封，且 **per-seam 游标轮转**（取 `id > cursor` 的下一批，扫到尾回绕）：某收件箱 M 封 `ACCEPTED` 时一封的确认最坏晚 `ceil(M / N)` 个 tick，而不是被前 20 封永久占住窗口（#338 M3）。
 
 **`OBSOLETE` 判据（冻结，#333）**：仅 `kind === "notice"` 且 `subject` 以 `Phase timeout:` 开头的邮件可被作废（kind 闭集是 `question|report|handoff|notice`，**没有** `instruction`；其它 kind **永不**自动作废——一个问题 / 一份交接过不过期由人判，#338 M4）。
-“该 phase” 取自产生该通知的 `phase_timeout` 事件（`data.phase`/`data.phaseSince`），**不解析正文**：发件节点当前 `phase`/`phase_since` 与之不同（含之后重新进入同一 phase）或已是终态 ⇒ 已过期。
+“该 phase” 取自产生该通知的 `phase_timeout` 事件（`data.phase`/`data.phaseSince`），**不解析正文**：发件节点当前 `phase`/`phase_since` 与之不同（含之后重新进入同一 phase）或**已结束** ⇒ 已过期。
+**「已结束」的判据是 `hasEnded`（#354）**：终态（`isTerminalNode`）**或** `status` 为 `settled`/`retired`。一个只做调查、从不调用 `legion_phase` 的团队，结局时 `phase`/`phase_since` 停在出生值，于是旧判据（只看相位）认为通知仍有效——这正是 #354 的形状。`reason` 文案不变（仍 `obsolete_after_phase_change`，事件闭集不动），只是覆盖面明确包含「在超时相位里就地结束」；`isTerminalNode` 本身**不**放宽（投递退信与孤儿扫描共用它）。
 求值两处：**投递前**（`PENDING→OBSOLETE`，不再注入，这是 #333 的根因路径）与 **tick 确认**（`ACCEPTED→OBSOLETE`，只改标签不回滚已注入的文本）。`DELIVERED` 优先于 `OBSOLETE`：确实消费过的事实不会被改写成“失效”。
 
 **后端能力上限（`prompt` 分支）**：in-process 后端的 `prompt` 返回 `void`，无 disposition 可读，**无法区分 `queued` 与 `accepted`**，因此这一分支落 `ACCEPTED` 是能力上限而非观测结论；同理 `resumeChild` 首条消息即此信，若被包装成任务卡文本，精确匹配会落空而停在 `ACCEPTED`。

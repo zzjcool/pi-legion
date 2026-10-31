@@ -8,11 +8,13 @@ import {
 	NodeNameConflictError,
 	childNameExists,
 	getChildByName,
+	hasEnded,
 	getChildren,
 	getNode,
 	getSubtree,
 	heartbeatNode,
 	insertNode,
+	isTerminalNode,
 	isValidNodeSlug,
 	listNodesByStatus,
 	listStaleNodes,
@@ -204,3 +206,29 @@ test("#266 A16: a seventh status is rejected loudly instead of truncating the SQ
 function listInvalidStatuses(db: Parameters<typeof listNodesByStatus>[0]) {
 	return listNodesByStatus(db, [...NODE_STATUSES, "queued" as never]);
 }
+
+/**
+ * #354: "the run is over" and "the node is terminal" are deliberately two
+ * predicates. A team that only investigated never calls `legion_phase`, so it
+ * keeps its birth phase and ends with `settled`/`retired` — `isTerminalNode`
+ * says false (mail bounce and the orphan scan rely on that reading), while the
+ * stale-notice rule must see that nothing will ever consume the mail again.
+ */
+test("#354: hasEnded covers settled/retired without widening isTerminalNode", () => {
+	// Ended: by status, or by a closing phase.
+	assert.equal(hasEnded({ status: "settled", phase: "planning" }), true);
+	assert.equal(hasEnded({ status: "retired", phase: "planning" }), true);
+	assert.equal(hasEnded({ status: "settled", phase: null }), true);
+	assert.equal(hasEnded({ status: "retired", phase: "reviewing" }), true);
+	assert.equal(hasEnded({ status: "running", phase: "done" }), true);
+	assert.equal(hasEnded({ status: "running", phase: "aborted" }), true);
+	assert.equal(hasEnded({ status: "failed", phase: "implementing" }), true);
+	// Still alive: the delivered notice must not be killed.
+	assert.equal(hasEnded({ status: "running", phase: "planning" }), false);
+	assert.equal(hasEnded({ status: "blocked", phase: "implementing" }), false);
+	assert.equal(hasEnded({ status: "starting", phase: null }), false);
+	// The frozen separation: isTerminalNode keeps its old (narrower) meaning.
+	assert.equal(isTerminalNode({ status: "settled", phase: "planning" }), false);
+	assert.equal(isTerminalNode({ status: "retired", phase: "planning" }), false);
+	assert.equal(isTerminalNode({ status: "running", phase: "done" }), true);
+});
