@@ -44,6 +44,7 @@ import { providerForModel, type ProviderLookup } from "./src/runs/provider-pin.t
 import { resolveStepModel } from "./src/agents/step-model.ts";
 import { checkModelScope } from "./src/agents/model-scope.ts";
 import {
+	legionSettingsForRun,
 	loadSubagentSettings,
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
@@ -58,7 +59,7 @@ import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.t
 import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
-import { DEFAULT_LEGION_SETTINGS, type LegionSettings } from "./src/shared/types.ts";
+import { type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
 import {
@@ -361,8 +362,14 @@ interface LegionRuntimeIdentity {
 	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }
 
+/**
+ * #358 review (major 1): the defaults are filled, but the explicitness of every
+ * value travels with them — see `legionSettingsForRun`. A plain spread here tagged
+ * the built-in `phaseTimeouts` as operator decisions, and a card's `timeoutMs` on
+ * `planning`/`implementing`/… was silently ignored.
+ */
 function settingsForLegion(settings: ReturnType<typeof loadSubagentSettings>): LegionSettings {
-	return { ...DEFAULT_LEGION_SETTINGS, ...(settings.legion ?? {}), phaseTimeouts: { ...DEFAULT_LEGION_SETTINGS.phaseTimeouts, ...(settings.legion?.phaseTimeouts ?? {}) } };
+	return legionSettingsForRun(settings);
 }
 
 function runStoreFor(cwd: string, dbPathOverride?: string): RunStore {
