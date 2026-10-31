@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
@@ -2551,4 +2552,47 @@ test("#346: one chartWindow per frame (drawChart hands its window to computeStat
 	assert.equal(withWindow.from, window.from);
 	assert.equal(withWindow.peak, derived.peak);
 	assert.equal(withWindow.avg, derived.avg);
+});
+
+// ───────────────────── #364: /legion visible-output golden (contract I1) ─────────────────────
+
+/**
+ * sha256 of a rendered surface. The golden below is the **pre-#364** value:
+ * captured from commit `f989d0a` (the contract commit, rendering code identical
+ * to master `6042686`) by running this test with an empty expected map, before
+ * one line of `src/` moved.
+ */
+const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+test("#364: the /legion page renders the same bytes it did before the frame-alloc work", () => {
+	// The two byte surfaces the page hands to the host: `view.ts` renders
+	// `canvas.toLines(theme)` and wraps it in `paintPageFloor` (frozen by #308, so
+	// not part of this digest). Hashing `toPlain()` too pins the glyphs/grid
+	// separately from the styling, which is what `drawGalaxy`'s pixel buffer
+	// rewrite must preserve (contract I4).
+	//
+	// Why a golden and not "render twice and compare" (the shape of every older
+	// test in this file): two renders of the same code drift together, so they can
+	// never notice a regression (contract §4.2 — the gap recon found).
+	//
+	// Four shapes: two the issue's numbers are stated for (120x40, 200x60), the
+	// smallest the page supports (80x24) and a portrait one (46x60).
+	const { nodes, sampler, now } = scenario(600, 40);
+	const data = { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
+	const shapes: ReadonlyArray<readonly [number, number]> = [[120, 40], [200, 60], [80, 24], [46, 60]];
+	const expected: Record<string, { plain: string; ansi: string }> = {
+		"120x40": { plain: "8d75b4fc85023179acd3efe8b2f84f58bb032b0c25a70011966137e3a45e8d3e", ansi: "c30f0d005cb24827e43351242de12ba7c0cabb7dbb28209e64f2bf025bd7063c" },
+		"200x60": { plain: "1c71e80d132197d3b7ceb797019889a2dd7db29ee7c536853c3511f31254bacd", ansi: "1f1145386e4893120d24a2cb23f3a16c7a39bdff5af43e25575fe9d2586c176b" },
+		"80x24": { plain: "5f71d89b9a98628f1fdf4f364941eac332cae92fe725af689b75cb2fb8c257e3", ansi: "37455f157fda3999916d12c356aa7cc80fe1abb4129d259b349bbf08b61ebabb" },
+		"46x60": { plain: "6f000ab58d8a36884240de3190d4c29557e6a5da9bdb958ff5fdcef013f850e4", ansi: "223f902d495535618c9f963bbb5950dd51bdc89cbca19d93aba57371c4fb8117" },
+	};
+	const actual: Record<string, { plain: string; ansi: string }> = {};
+	for (const [cols, rows] of shapes) {
+		const canvas = renderLegionView(data, initialViewState(), cols, rows).canvas;
+		actual[`${cols}x${rows}`] = {
+			plain: sha256(canvas.toPlain().join("\n")),
+			ansi: sha256(canvas.toLines(ansiTheme).join("\n")),
+		};
+	}
+	assert.deepEqual(actual, expected, "the page's bytes moved");
 });
