@@ -18,7 +18,9 @@
  * usage lands when each assistant message completes, not mid-stream.
  *
  * Settled/retired series keep contributing to chart buckets/avg so the
- * history window stays accurate.
+ * history window stays accurate. #346: they only do so while the frame still
+ * paints them — `buckets()` takes the frame's visible ids, and a series nobody
+ * shows costs nothing per frame even though its samples are kept.
  */
 
 import type { VizNode } from "./model.ts";
@@ -48,6 +50,23 @@ export interface RateSeries {
 	/** tok/s per bucket per role. */
 	byRole: Map<string, number[]>;
 	total: number[];
+}
+
+/**
+ * #346: knobs for one bucketing pass.
+ *
+ * `onlyNodeIds` is the frame-visibility filter: only series the frame actually
+ * paints are bucketed. Series that were recorded once and never removed (a
+ * finished child, a node that left the subtree) keep their raw samples — the
+ * chart just does not pay for them every frame — so a pass is O(visible
+ * series), not O(every series ever recorded). Omitting it keeps the unfiltered
+ * semantics for callers that really do want every series.
+ */
+export interface BucketOptions {
+	/** Trailing-window length per bucket; defaults to `RATE_WINDOW_MS`. */
+	windowMs?: number;
+	/** Restrict the pass to these series ids (including empty → nothing). */
+	onlyNodeIds?: Iterable<string>;
 }
 
 export class RateSampler {
@@ -164,11 +183,9 @@ export class RateSampler {
 	 */
 	nodeRate(nodeId: string, now: number, windowMs = RATE_WINDOW_MS): number {
 		if (windowMs <= 0) return 0;
-		const dOut = Math.max(0, this.valueAt(nodeId, now) - this.valueAt(nodeId, now - windowMs));
-		if (dOut <= 0) return 0;
-		const dGen = Math.max(0, this.genAt(nodeId, now) - this.genAt(nodeId, now - windowMs));
-		const seconds = dGen >= MIN_RATE_GENERATION_MS ? dGen / 1000 : windowMs / 1000;
-		return dOut / seconds;
+		const s = this.series.get(nodeId);
+		if (!s) return 0;
+		return this.rateOf(s, now, windowMs);
 	}
 
 	/**
@@ -200,19 +217,34 @@ export class RateSampler {
 	 * trailing-window average ending at the bucket edge (window = max(bucket
 	 * span, RATE_WINDOW_MS)), including settled series so history stays painted.
 	 * Header "now" may be lower (live-only); bursty flushes stay smoothed.
+	 *
+	 * #346: ONE pass per frame (the chart body and its stats used to run this
+	 * twice with identical arguments), no per-series scratch array (the rows are
+	 * accumulated straight into the role totals), and only the series this frame
+	 * paints are visited. A series whose last sample sits at or before the first
+	 * bucket's trailing edge is skipped: `interpolate` clamps at both ends there,
+	 * so every Δ — and therefore every bucket — is provably 0. All three are
+	 * byte-identical to the exhaustive version.
 	 */
-	buckets(from: number, to: number, count: number, windowMs = RATE_WINDOW_MS): RateSeries {
+	buckets(from: number, to: number, count: number, options: BucketOptions = {}): RateSeries {
 		const n = Math.max(1, Math.floor(count));
 		const span = Math.max(1, to - from);
 		const times = Array.from({ length: n }, (_, i) => from + (span * (i + 1)) / n);
+		const windowMs = options.windowMs ?? RATE_WINDOW_MS;
+		const w = Math.max(span / n, windowMs, 1);
 		const byRole = new Map<string, number[]>();
 		const total = new Array<number>(n).fill(0);
+		const visible = options.onlyNodeIds === undefined ? undefined : new Set(options.onlyNodeIds);
+		const quietBefore = times[0]! - w;
 		for (const [id, s] of this.series) {
+			if (visible && !visible.has(id)) continue;
+			const last = s.ts[s.ts.length - 1];
+			if (last === undefined || last <= quietBefore) continue;
 			const row = byRole.get(s.role) ?? new Array<number>(n).fill(0);
-			const rates = this.nodeBuckets(id, from, to, n, windowMs);
 			for (let i = 0; i < n; i++) {
-				row[i] = row[i]! + rates[i]!;
-				total[i] = total[i]! + rates[i]!;
+				const rate = this.rateOf(s, times[i]!, w);
+				row[i] = row[i]! + rate;
+				total[i] = total[i]! + rate;
 			}
 			byRole.set(s.role, row);
 		}
@@ -228,9 +260,23 @@ export class RateSampler {
 		const out: number[] = [];
 		for (let i = 0; i < n; i++) {
 			const t = from + (span * (i + 1)) / n;
-			out.push(this.nodeRate(nodeId, t, w));
+			out.push(this.rateOf(s, t, w));
 		}
 		return out;
+	}
+
+	/**
+	 * Trailing-window tok/s for one series at `t` — the body of `nodeRate` without
+	 * the per-call `Map` lookup. `buckets()` walks a few thousand of these per
+	 * frame (#346: 200 series × 51 buckets), so the lookup was ~20% of the pass.
+	 */
+	private rateOf(s: Series, t: number, windowMs: number): number {
+		if (windowMs <= 0) return 0;
+		const dOut = Math.max(0, interpolate(s.ts, s.value, t) - interpolate(s.ts, s.value, t - windowMs));
+		if (dOut <= 0) return 0;
+		const dGen = Math.max(0, interpolate(s.ts, s.gen, t) - interpolate(s.ts, s.gen, t - windowMs));
+		const seconds = dGen >= MIN_RATE_GENERATION_MS ? dGen / 1000 : windowMs / 1000;
+		return dOut / seconds;
 	}
 
 	clear(): void {
@@ -243,6 +289,16 @@ export class RateSampler {
 /** Node ids that contribute to the header tok/s (running agents; root excluded). */
 export function liveRateNodeIds(nodes: readonly VizNode[]): string[] {
 	return nodes.filter((n) => n.id !== "root" && n.status === "running").map((n) => n.id);
+}
+
+/**
+ * #346: node ids a frame paints, i.e. the series the chart is allowed to bucket.
+ * Unlike `liveRateNodeIds` this keeps settled/retired rows — the chart still
+ * paints their trailing-window history — and only drops the root and rows the
+ * frame does not show.
+ */
+export function visibleRateNodeIds(nodes: readonly VizNode[]): string[] {
+	return nodes.filter((n) => n.id !== "root").map((n) => n.id);
 }
 
 function interpolate(ts: number[], value: number[], t: number): number {
