@@ -23,7 +23,7 @@ COLS ?= 120
 ROWS ?= 40
 SCENARIO ?= echo
 
-.PHONY: help build rebuild run it print shell status clean down smoke tui-visual
+.PHONY: help build rebuild run it print shell status clean down smoke tui-visual rpc
 
 help: ## 显示帮助
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -55,6 +55,18 @@ shell: ## 只进容器 bash（不自动跑 pi）
 
 smoke: ## 三层冒烟：模型可达 → 插件加载 → legion 工具注册
 	@bash "$(DOCK)/smoke-real.sh" "$(MODEL)" "$(NAME)"
+
+rpc: ## 11 个 RPC 主线 verify（用 $(IMAGE)，不再要求历史镜像名 pi-herdr-sandbox）
+	@set -e; for n in 1 2 3 4 5 6 7 8 9 10 11; do \
+	  f=$$(ls "$(DOCK)"/verify-$$n-*.sh); \
+	  log=/tmp/pi-legion-rpc-$$n.log; \
+	  printf '==> %s ' "$$(basename "$$f")"; \
+	  if env PI_DOCKER_IMAGE="$(IMAGE)" bash "$$f" >"$$log" 2>&1; then \
+	    grep -hE 'RESULT:' "$$log" | tail -1; \
+	  else \
+	    echo "FAIL (log: $$log)"; tail -5 "$$log"; exit 1; \
+	  fi; \
+	done
 
 tui-visual: ## mock 模型确定性 TUI 回归（SCENARIO/COLS/ROWS 可调）
 	@docker image inspect "$(IMAGE)" >/dev/null 2>&1 || $(MAKE) build
