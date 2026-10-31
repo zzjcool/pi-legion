@@ -462,6 +462,27 @@ test("chartWindow: from stays min(earliest, to−60s) against frozen to", () => 
 	// earliest at sec(0) is older than to−60s=sec(540), so min keeps sec(0). Already asserted.
 });
 
+test("chartWindow: the array-free earliest derivation is the old Math.min, point by point", () => {
+	// #364 S4 replaced `Math.min(samplerStart ?? now, ...agents.map(startedAt))` with a
+	// loop (one filtered+projected array pair and a spread per frame). Two corners of
+	// the old form are easy to lose in that rewrite, and both change `from`:
+	//   - no agent nodes ⇒ the old form folded `data.now` in via `starts.length ? starts : [now]`;
+	//   - a NaN `startedAt` ⇒ `Math.min` propagates it into `from` (never reachable from
+	//     the live path, but the equivalence is what makes the rewrite reviewable).
+	const sampler = new RateSampler();
+	sampler.record(sec(0), [ROOT]);
+	sampler.record(sec(60), [ROOT]);
+	// No agent at all: from = min(sampler.startedAt, data.now, to−60s).
+	const empty = chartWindow({ nodes: [ROOT], sampler, now: sec(600), rate: 0 });
+	assert.equal(empty.to, sec(0), "the sampler never changed ⇒ to is its first sample");
+	assert.equal(empty.from, Math.min(sec(600), empty.to - 60_000), "data.now still takes part when there is no agent");
+	// `now` is the only thing keeping `from` from being 60s behind: it is not ignored.
+	assert.equal(chartWindow({ nodes: [ROOT], sampler, now: sec(0), rate: 0 }).from, Math.min(sec(0), empty.to - 60_000));
+	// NaN propagates, exactly like `Math.min(a, Number.NaN, ...)`.
+	const nan = chartWindow({ nodes: [ROOT, node("worker-1", { startedAt: Number.NaN })], sampler, now: sec(600), rate: 0 });
+	assert.ok(Number.isNaN(nan.from), `a NaN startedAt must poison from, got ${nan.from}`);
+});
+
 test("rate: header tok/s and chart rate share one definition", () => {
 	const { nodes, sampler, now } = scenario();
 	const rate = sampler.nowRate(now, nodes);
@@ -2597,6 +2618,47 @@ test("#364: the /legion page renders the same bytes it did before the frame-allo
 	assert.deepEqual(actual, expected, "the page's bytes moved");
 });
 
+/**
+ * `(ch, color, bold, inverse)` of every cell, in grid order, hashed (contract I4).
+ * `toPlain` pins the glyph grid and `toLines` pins the styled lines, but a line is
+ * a *run* of cells: two cells swapping colour inside one run — or a `bold` bit
+ * moving between two cells that render the same bytes — can hash the same on the
+ * merged line. This walks the grid itself.
+ */
+const cellDigest = (canvas: Canvas): string => {
+	const parts: string[] = [];
+	for (const row of canvas.cells) {
+		for (const cell of row) parts.push(`${cell.ch}\u0000${cell.color ?? ""}\u0000${!!cell.bold}\u0000${!!cell.inverse}`);
+	}
+	return sha256(parts.join(""));
+};
+
+test("#364: every painted cell is what it was before the frame-alloc work (contract I4)", () => {
+	// Same scenario and the same four shapes as the I1 golden above, but per cell:
+	// this is the guard I4 names ("同一 data/selectedId/几何下，画布逐格 (ch, color,
+	// bold, inverse) 相同") for `drawGalaxy`'s pixel-buffer rewrite.
+	//
+	// Captured from `f989d0a` (rendering identical to master `6042686`) with this
+	// very scenario. The same capture harness also printed the plain/ansi digests,
+	// and both matched the I1 goldens above — that is what makes this the same frame
+	// the line-level golden pins, not a second, drifting scenario.
+	const { nodes, sampler, now } = scenario(600, 40);
+	const data = { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
+	const shapes: ReadonlyArray<readonly [number, number]> = [[120, 40], [200, 60], [80, 24], [46, 60]];
+	const expected: Record<string, string> = {
+		"120x40": "5daf7add695cbd9885e70fecfaa9a8f0539b7db4cbd0e122f24d275684aff877",
+		"200x60": "717f4f7c9ec8158e5ac0dedbf9754dd99f12955fe12c6bc82d5493a0352baa22",
+		"80x24": "12c2f13dd8cf73e64bf801dee6a77f33537b7b2591a037f42a89a2c8201d0243",
+		"46x60": "34dc3f71c400e463b1a76339388ec53c747f5337514966bf4018e3138311f350",
+	};
+	const actual: Record<string, string> = {};
+	for (const [cols, rows] of shapes) {
+		const canvas = renderLegionView(data, initialViewState(), cols, rows).canvas;
+		actual[`${cols}x${rows}`] = cellDigest(canvas);
+	}
+	assert.deepEqual(actual, expected, "a cell's glyph/colour/style moved");
+});
+
 test("#364: the inlined hypot2 is bit-for-bit Math.hypot over the galaxy's domain", () => {
 	// `drawGalaxy` cannot afford `Math.hypot`: it is a variadic builtin, so V8
 	// materialises an arguments array on every call — measured 170KB/frame at the
@@ -2615,8 +2677,14 @@ test("#364: the inlined hypot2 is bit-for-bit Math.hypot over the galaxy's domai
 	for (const xs of [1, 1.6]) for (let xx = -20; xx <= 20; xx++) for (let yy = -20; yy <= 20; yy++) same(xx / xs, yy);
 	// Edge distances: the difference between two galaxy pixel positions (|x| <= PW, |y| <= PH).
 	for (let i = 0; i < 5000; i++) same((rnd() - 0.5) * 840, (rnd() - 0.5) * 840);
-	// Degenerate and extreme inputs keep Math.hypot's answers too.
-	for (const pair of [[0, 0], [-0, 0], [0, -0], [1, 0], [0, 1], [-3, -4], [3e200, 4e200], [1e-200, 1e-200], [Number.NaN, 1]] as const) same(pair[0], pair[1]);
+	// Degenerate and extreme inputs keep Math.hypot's answers too — including NaN
+	// (which `Math.hypot` propagates: `hypot2(NaN, 0)` must not answer 0) and the
+	// infinities.
+	for (const pair of [
+		[0, 0], [-0, 0], [0, -0], [1, 0], [0, 1], [-3, -4], [3e200, 4e200], [1e-200, 1e-200], [Number.NaN, 1],
+		[Number.NaN, 0], [0, Number.NaN], [Number.NaN, Number.NaN], [Number.NaN, -0],
+		[Number.POSITIVE_INFINITY, 1], [1, Number.NEGATIVE_INFINITY], [Number.NaN, Number.POSITIVE_INFINITY],
+	] as const) same(pair[0], pair[1]);
 	assert.ok(checked > 8000, `only ${checked} pairs checked`);
 });
 
@@ -2682,6 +2750,86 @@ test("#364: the palette cache is keyed on (theme, the frame's role set)", () => 
 	const solo = cv.toLines(theme)[0]!;
 	assert.ok(solo.includes("[syntaxNumber]s"), `scout alone keeps syntaxNumber: ${solo}`);
 	assert.equal(solo, cv.toLines(theme, resolveRolePalette(theme, cv.roles()))[0]);
+});
+
+test("#364: the palette cache key cannot be forged by a role name", () => {
+	// The key used to be `roles.join(",")`. Role names are arbitrary strings, so a
+	// single role named `x,y` and a pair named `x` + `y` produced the SAME key: the
+	// second frame was handed the first frame's palette, `y` was missing from it and
+	// silently fell back to `text`. The premise is asserted, not assumed.
+	assert.equal(["x,y"].join(","), ["x", "y"].join(","), "premise: the old key collided");
+	// Render the token NAME, so the assertion is about the palette, not ANSI bytes.
+	const theme = {
+		getFgAnsi: (token: string): string => `slot-${token}`,
+		fg: (token: string, text: string): string => `[${token}]${text}`,
+	};
+	const poison = new Canvas(1, 1);
+	poison.set(0, 0, "p", roleColor("x,y"));
+	poison.toLines(theme); // fills the cache under the comma key
+	const cv = new Canvas(2, 1);
+	cv.set(0, 0, "x", roleColor("x"));
+	cv.set(1, 0, "y", roleColor("y"));
+	const line = cv.toLines(theme)[0]!;
+	const expected = resolveRolePalette(theme, ["x", "y"]);
+	// With the old key this frame hits the `x,y` entry, whose palette has no `x`/`y`
+	// in it at all, so both roles render through the `palette.get(role) ?? "text"`
+	// fallback: `[text]x[text]y`.
+	assert.ok(line.includes(`[${expected.get("x")}]x`), `role x keeps its own token (${expected.get("x")}): ${line}`);
+	assert.ok(line.includes(`[${expected.get("y")}]y`), `role y keeps its own token (${expected.get("y")}): ${line}`);
+	assert.notEqual(expected.get("y"), "text", "a real role never falls back to `text`");
+});
+
+test("#364: the palette cache is keyed on the theme too (contract T5)", () => {
+	// T5 says the key is `(theme, the frame's role set)`. The role half has a test
+	// above; this is the theme half — the same canvas rendered with two themes must
+	// not reuse the first theme's resolution, and switching back must reproduce the
+	// first frame exactly.
+	const named = (name: string) => ({
+		getFgAnsi: (token: string): string => `${name}-slot-${token}`,
+		fg: (token: string, text: string): string => `[${name}:${token}]${text}`,
+	});
+	const themeA = named("A");
+	const themeB = named("B");
+	const cv = new Canvas(4, 1);
+	cv.set(0, 0, "w", roleColor("worker"));
+	cv.set(1, 0, "s", roleColor("scout"));
+	const firstA = cv.toLines(themeA);
+	const firstB = cv.toLines(themeB);
+	const againA = cv.toLines(themeA);
+	assert.notDeepEqual(firstA, firstB, "positive control: the two themes really render differently");
+	assert.deepEqual(againA, firstA, "switching themes must not hand back the other theme's palette");
+});
+
+test("#364: a reused px grid paints the frame a rebuilt one does (contract T1)", () => {
+	// T1 is the contract's #1 trap: the braille buffer `px` keeps what the previous
+	// frame left in it, so a missing `m`/`z` reset both paints the old bits and —
+	// because `z` is the write gate — rejects the new frame's lower-priority dots,
+	// i.e. last frame's colour leaks into this frame's picture.
+	//
+	// None of the existing tests can see that: the four golden shapes have four
+	// different galaxy rects, so every render in them takes the "size changed ⇒
+	// rebuild" branch, and the canvas-reuse test below builds its `fresh` reference
+	// through the same module-level `pixelGrid` (so an uncleared cell is dirty on
+	// both sides of that comparison).
+	//
+	// Here both frames use the SAME geometry, so frame B takes the reuse branch over
+	// frame A's leftovers. The reference is frame B on a pristine grid: paint a
+	// different geometry first (forcing a rebuild), then paint B into a fresh canvas.
+	const SHAPE: readonly [number, number] = [120, 40];
+	const OTHER_SHAPE: readonly [number, number] = [200, 60];
+	const big = { ...scenario(600, 200), rate: 0 };
+	const small = { ...scenario(600, 3), rate: 0 };
+	const paint = (data: typeof big, [cols, rows]: readonly [number, number]): Canvas =>
+		renderLegionView(data, initialViewState(), cols, rows).canvas;
+
+	paint(small, OTHER_SHAPE); // leave `px` on the other geometry…
+	const reference = paint(small, SHAPE); // …so this one rebuilds the grid, then paints B.
+
+	const frameA = paint(big, SHAPE); // 200 nodes, nothing selected
+	const frameB = paint(small, SHAPE); // frame B over A's leftovers (the reuse branch)
+	assert.notDeepEqual(frameA.toPlain(), reference.toPlain(), "positive control: A and B really differ");
+	assert.deepEqual(frameB.toPlain(), reference.toPlain(), "a stale `m`/`z` in px would change the glyphs");
+	assert.deepEqual(frameB.toLines(ansiTheme), reference.toLines(ansiTheme), "and its colours");
 });
 
 test("#364: the roleColor memo is keyed on the role name", () => {
