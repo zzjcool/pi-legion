@@ -81,6 +81,24 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **`/legion` 不再每写一个格子就分配一个 `Cell`：`Canvas` 预建 W×H 个可变 cell，`set()` 原地改字段 (#362).**
+  `set()` 原本是 `row[x] = { ch, color, ...style }`——一帧要写 4,583 次（120×40）/ 9,691 次（200×60），
+  实测 52.4 B/次 与 128.0 B/次。现在格子在构造时一次性建好，写入只做 `cell.ch / color / bold / inverse`
+  的显式字段赋值（无对象展开、默认 style 用共享常量），`sanitizeChar` 也按字符记忆化
+  （`String.fromCodePoint` 对 Latin-1 以外的字形每次都新建字符串，图表/星图画 `█ ⣿ ─` 上万次）。
+  同一脚本前后实测：每次 `set` 分配 **52.4 → 0.03 B**（120×40）/ **128.0 → 0.002 B**（200×60）；
+  整帧分配 **2839.9 → 2551.8 KB**（120×40/live，−10%）、**4556.8 → 4018.2 KB**（200×60/live，−12%）；
+  帧 median **4.53 → 3.87 ms**（120×40/live，−15%）、**6.95 → 5.73 ms**（200×60/live，−18%），
+  p95 −12% / −13%（5 轮 × 50 帧前后交叉，各 1250 样本）。预填本身也顺带变小
+  （269.3 → 190.0 KB / 616.1 → 472.4 KB，53–57 → 39–41 B/格）。
+  **`/legion` 可见输出逐字节不变**：4 个场景（120×40 / 200×60 × live / settled）的 plain 与 ANSI
+  摘要前后一致，`legion-viz` 快照用例原样绿。对外语义只有一条要说清：`get()` / `cells` 是**活视图**
+  （下一次 `set()` 会改同一个对象），不是快照——两个既有读点都只读 `ch` 即弃。
+  另：`drawChart` 的 `(from, to)` 直接交给 `computeStats`，一帧只调一次 `chartWindow`。
+  整帧分配离 #346 的 ≤2.0MB 仍差 0.5–2.0MB：残项已逐项隔离（`drawGalaxy` ≈0.93–1.23MB、
+  `toLines` ≈0.44–1.01MB、`drawChart` ≈0.38–0.62MB、`Canvas` 预填 0.19–0.47MB），
+  见契约 §3.4 / §4 与 follow-up #364。
+
 - **`/legion` 的 tok/s 图表一帧只分桶一次，且只算本帧真的要画的 series (#346).** `drawChart` 先给图体
   分桶、`computeStats` 又用**完全相同的参数**再分一遍，200 节点下一帧白烧 ≈1.2ms 与 ≈0.6MB 垃圾；
   同时 `RateSampler.buckets()` 会遍历**每一个曾经记录过**的 series（`series` 永无删除点），

@@ -293,8 +293,10 @@ export function chartWindow(data: ViewData): { from: number; to: number } {
 	return { from: Math.min(earliest, to - 60_000), to };
 }
 
-export function computeStats(data: ViewData, buckets: number, series?: RateSeries): ChartStats {
-	const { from, to } = chartWindow(data);
+export function computeStats(data: ViewData, buckets: number, series?: RateSeries, window?: { from: number; to: number }): ChartStats {
+	// #346: `drawChart` already resolved the frame's window (and bucketed it); take
+	// it instead of re-deriving the same `(from, to)` — one `chartWindow` per frame.
+	const { from, to } = window ?? chartWindow(data);
 	// #346: the chart body already bucketed this exact window, so reuse its result.
 	// Recomputing it here was the measured duplicate pass (≈1.2ms + 0.6MB per
 	// 200-node frame); the arguments are derived from the same `data`, so the two
@@ -362,7 +364,7 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	const axisY = plotTop + plotH;
 	const { from, to } = chartWindow(data);
 	const series = chartBuckets(data, plotW, { from, to });
-	const stats = computeStats(data, plotW, series);
+	const stats = computeStats(data, plotW, series, { from, to });
 	const max = Math.max(1, stats.peak * 1.15);
 	const rowsFor = (v: number): number => (v / max) * plotH;
 	const roles = stats.byRole.map((entry) => entry.role);

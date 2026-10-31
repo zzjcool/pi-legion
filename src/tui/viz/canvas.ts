@@ -9,6 +9,15 @@ export interface Cell {
 	inverse?: boolean;
 }
 
+/**
+ * #362: the grid owns `width × height` mutable cells, allocated once in the
+ * constructor. `set()` writes through to the existing cell instead of building
+ * a fresh object per write (measured 52–128 B/write, 4,583–9,691 writes/frame).
+ *
+ * Consequence for readers: `get()` and `cells` are a **live view**, not a
+ * snapshot. A cell object returned by `get()` is re-written in place by the next
+ * `set()` on that coordinate, so hold the value (`cell.ch`), never the object.
+ */
 export class Canvas {
 	readonly width: number;
 	readonly height: number;
@@ -17,19 +26,30 @@ export class Canvas {
 	constructor(width: number, height: number) {
 		this.width = Math.max(0, Math.floor(width));
 		this.height = Math.max(0, Math.floor(height));
-		this.cells = Array.from({ length: this.height }, () =>
-			Array.from({ length: this.width }, () => ({ ch: " " }) as Cell),
-		);
+		const cells: Cell[][] = new Array(this.height);
+		for (let y = 0; y < this.height; y++) {
+			const row: Cell[] = new Array(this.width);
+			for (let x = 0; x < this.width; x++) row[x] = { ch: " " } as Cell;
+			cells[y] = row;
+		}
+		this.cells = cells;
 	}
 
+	/** Live cell at `(x, y)` — re-written in place by the next `set()`. Do not retain it. */
 	get(x: number, y: number): Cell | undefined {
 		return this.cells[y]?.[x];
 	}
 
-	set(x: number, y: number, ch: string, color?: string, style: { bold?: boolean; inverse?: boolean } = {}): void {
+	set(x: number, y: number, ch: string, color?: string, style: { bold?: boolean; inverse?: boolean } = NO_STYLE): void {
 		const row = this.cells[y];
 		if (!row || x < 0 || x >= this.width) return;
-		row[x] = { ch: sanitizeChar(ch), color, ...style };
+		const cell = row[x] as Cell;
+		// Explicit field writes: an object spread here would allocate an intermediate
+		// object per write, which is the whole cost #362 is removing.
+		cell.ch = sanitizeChar(ch);
+		cell.color = color;
+		cell.bold = style.bold;
+		cell.inverse = style.inverse;
 	}
 
 	/** Write text clipped to [x, maxX). Returns the column after the last written cell. */
@@ -64,8 +84,31 @@ export class Canvas {
 	}
 }
 
-/** Keep cells single-width: wide/control characters become a placeholder. */
+/** Shared empty style so a `set(x, y, ch)` call allocates no default object. */
+const NO_STYLE: { bold?: boolean; inverse?: boolean } = {};
+
+/**
+ * Keep cells single-width: wide/control characters become a placeholder.
+ *
+ * #362: memoized per input char. `String.fromCodePoint` allocates a fresh string
+ * for every code point outside Latin-1, and the chart/galaxy paint `█ ⣿ ─` tens of
+ * thousands of times per frame — without this cache `set()` would still allocate
+ * one string per write. The table is bounded (terminal cell glyphs are a small set)
+ * and cleared if a pathological caller ever feeds it thousands of distinct chars.
+ */
+const SANITIZED = new Map<string, string>();
+const SANITIZED_MAX = 4096;
+
 export function sanitizeChar(ch: string): string {
+	const hit = SANITIZED.get(ch);
+	if (hit !== undefined) return hit;
+	const out = sanitizeUncached(ch);
+	if (SANITIZED.size >= SANITIZED_MAX) SANITIZED.clear();
+	SANITIZED.set(ch, out);
+	return out;
+}
+
+function sanitizeUncached(ch: string): string {
 	if (ch.length === 0) return " ";
 	const code = ch.codePointAt(0)!;
 	if (code < 0x20 || (code >= 0x7f && code < 0xa0)) return " ";

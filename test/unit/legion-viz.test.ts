@@ -2457,3 +2457,98 @@ test("#346: a frame walks the series that CHANGED inside its window, not every s
 	assert.equal(sampler.lastPass.skipped, 0);
 });
 
+
+// ------------------------------------------------- canvas cell reuse (#362)
+
+test("#362: set() writes through one preallocated cell per coordinate", () => {
+	// The pre-#362 `set` did `row[x] = { ch, color, ...style }`: one fresh Cell per
+	// write (measured 64–90 B), 4,583–9,691 writes per frame. The grid now owns
+	// W×H mutable cells and a write mutates one in place — so the identity and the
+	// COUNT of the cell objects must not move, however many times we write.
+	const cv = new Canvas(4, 3);
+	const before = new Set(cv.cells.flat());
+	assert.equal(before.size, 12, "the constructor preallocates exactly W×H cells");
+	for (let i = 0; i < 500; i++) cv.set(i % 4, i % 3, "█", "role:worker", { bold: true, inverse: i % 2 === 0 });
+	const after = new Set(cv.cells.flat());
+	assert.equal(after.size, 12, `500 writes must not add a Cell object (saw ${after.size})`);
+	for (const cell of before) assert.ok(after.has(cell), "every write landed in a preallocated cell");
+	// Same object per coordinate, and the held reference is the LIVE cell — the
+	// documented contract for `get()`/`cells` (a view, not a snapshot).
+	const held = cv.get(0, 0)!;
+	cv.set(0, 0, "x");
+	assert.equal(cv.get(0, 0), held, "get() returns the cell the next write mutates");
+	assert.equal(held.ch, "x", "get() is a live view; callers must copy the field, not the object");
+	assert.equal(cv.get(9, 0), undefined, "out-of-range get stays undefined");
+});
+
+test("#362: repeated writes into one cell allocate nothing measurable", () => {
+	// 5 windows of 1,000 same-cell writes; the MIN window is the signal, so one
+	// polluted window (a parent test's GC running concurrently) cannot fail it.
+	// A per-write Cell costs 48–128 B (measured), i.e. ~48–128 KB per window here;
+	// the in-place write measures 0–0.4 KB, so 16 KB is ~100x below the mutation.
+	const cv = new Canvas(8, 2);
+	const style = { bold: true }; // hoisted: the test must not count its own literal
+	const burst = (): void => {
+		for (let i = 0; i < 1000; i++) cv.set(3, 1, "█", "role:worker", style);
+	};
+	for (let i = 0; i < 20; i++) burst(); // warm the coordinate and the glyph cache
+	let best = Number.POSITIVE_INFINITY;
+	for (let w = 0; w < 5; w++) {
+		const heap0 = process.memoryUsage().heapUsed;
+		burst();
+		best = Math.min(best, process.memoryUsage().heapUsed - heap0);
+	}
+	assert.ok(best < 16 * 1024, `1,000 in-place writes grew the heap by ${best} B`);
+});
+
+test("#362: an in-place write clears the style it overwrote (no stale color/bold/inverse)", () => {
+	// The hazard of reusing a cell: fields the new write does not set must be
+	// cleared, exactly like the fresh `{ ch, color, ...style }` object did.
+	const cv = new Canvas(3, 1);
+	cv.set(0, 0, "a", "role:worker", { bold: true, inverse: true });
+	assert.deepEqual({ ...cv.get(0, 0)! }, { ch: "a", color: "role:worker", bold: true, inverse: true });
+	cv.set(0, 0, "b");
+	const plain = cv.get(0, 0)!;
+	assert.equal(plain.ch, "b");
+	assert.equal(plain.color, undefined, "colour must not survive the overwrite");
+	assert.equal(plain.bold, undefined, "bold must not survive the overwrite");
+	assert.equal(plain.inverse, undefined, "inverse must not survive the overwrite");
+	assert.equal(cv.toLines(plainTheme)[0], "b  ", "the rendered row really lost the styling");
+	// Wide chars still collapse to the placeholder on a reused cell.
+	cv.set(1, 0, "世");
+	assert.equal(cv.get(1, 0)!.ch, "?");
+	assert.equal(cv.toPlain()[0], "b? ");
+});
+
+test("#362: a big pre-filled canvas still costs one cell object per cell", () => {
+	// Prefill is the one place that legitimately allocates W×H objects; it must
+	// not grow (the old `Array.from({length}, () => Array.from(...))` pair cost
+	// 53–57 B/cell, the loop below 39–41 B/cell — so this is a cap, not a floor).
+	for (const [w, h] of [[120, 40], [200, 60]] as const) {
+		const cv = new Canvas(w, h);
+		assert.equal(cv.cells.length, h);
+		assert.ok(cv.cells.every((row) => row.length === w));
+		assert.equal(new Set(cv.cells.flat()).size, w * h, "one object per cell, no aliasing");
+		const heap0 = process.memoryUsage().heapUsed;
+		const big = new Canvas(w, h);
+		const perCell = (process.memoryUsage().heapUsed - heap0) / (w * h);
+		assert.equal(new Set(big.cells.flat()).size, w * h);
+		assert.ok(perCell <= 200, `${w}x${h}: ${perCell.toFixed(0)} B/cell > 200 B/cell`);
+	}
+});
+
+test("#346: one chartWindow per frame (drawChart hands its window to computeStats)", () => {
+	// `drawChart` resolves `(from, to)` once and `computeStats` reuses it: the
+	// second derivation was a pure O(nodes) re-scan per frame. Asserted through the
+	// observable surface — the stats the chart paints are the ones that window made.
+	const { nodes, sampler, now } = scenario(600, 40);
+	const data = { nodes, sampler, now, rate: 0 };
+	const window = chartWindow(data);
+	const series = chartBuckets(data, 51, window);
+	const withWindow = computeStats(data, 51, series, window);
+	const derived = computeStats(data, 51, series);
+	assert.deepEqual(withWindow, derived, "passing the frame's window must not change a field");
+	assert.equal(withWindow.from, window.from);
+	assert.equal(withWindow.peak, derived.peak);
+	assert.equal(withWindow.avg, derived.avg);
+});
