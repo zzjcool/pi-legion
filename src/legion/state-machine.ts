@@ -6,6 +6,7 @@ import {
 	normalizePhaseMachine,
 	isTerminalIn,
 	legacyReasonForCondition,
+	phaseStart,
 } from "./phase-machine.ts";
 import {
 	checkPhaseCondition,
@@ -136,7 +137,10 @@ function evaluateDeclarative(
 	const { from, to } = input;
 	const children = input.children ?? [];
 	const reworkCount = input.reworkCount ?? 0;
-	const start = machine.start ?? machine.phases[0]?.id;
+	// #350: ONE derivation of "where a new team starts", shared with the birth site
+	// (`Orchestrator.reserveNode`). Two copies of `start ?? phases[0]` is exactly how
+	// a team ends up born in a phase its own machine never declared.
+	const start = phaseStart(machine);
 	const maxRework = machine.maxRework ?? DEFAULT_MAX_REWORK_COUNT;
 
 	if (from !== null && !findPhase(machine, from)) {

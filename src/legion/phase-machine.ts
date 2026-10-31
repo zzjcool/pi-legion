@@ -132,6 +132,31 @@ export const DEFAULT_PHASE_MACHINE: PhaseMachine = {
 	],
 };
 
+/**
+ * The phase a brand-new team enters (#350).
+ *
+ * Derived the same way the state machine derives it, and exported so the BIRTH
+ * site (`Orchestrator.reserveNode`, which writes the team's first phase into the
+ * ledger) cannot drift from the decision function: a team born in a phase its own
+ * machine never declared is stranded, because `evaluatePhaseTransition` refuses
+ * every transition whose `from` is not a phase of the machine as `invalid_phase`
+ * — before the target, the outgoing edge and the `failed` escape hatch (#309) are
+ * consulted. One team, one start.
+ *
+ * `start` wins over the first declared phase: a machine may name an entry point
+ * that is not first (`validatePhaseMachine` rejects a start that is not a declared
+ * phase, so this never invents one).
+ *
+ * The last leg covers a machine with no phases at all. Such a machine cannot be
+ * declared — `validatePhaseMachine` rejects it ("a phase machine needs at least
+ * one phase") and the loader (`parseAgentDocument`) rejects the card — so it only
+ * keeps this function total, and lands on the built-in machine's start: the phase
+ * an UNDECLARED team is born in.
+ */
+export function phaseStart(machine: PhaseMachine): string {
+	return machine.start ?? machine.phases[0]?.id ?? DEFAULT_PHASE_MACHINE.start ?? "planning";
+}
+
 /** Look up a phase by id. */
 export function findPhase(
 	machine: PhaseMachine,

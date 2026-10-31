@@ -131,6 +131,20 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **A team is now born in the phase its own machine starts in, so a card declaring `phases:` no longer
+  strands its team at spawn (#350).** `Orchestrator.reserveNode` wrote a hard-coded `phase: "planning"`
+  into every team row, ignoring the machine the card already carried. With a machine whose first phase
+  is not `planning` (e.g. `recon -> build`) the team was born in a phase its own machine had never heard
+  of, and `evaluatePhaseTransition` refuses every transition out of an unknown `from` as `invalid_phase`
+  *before* the target, the outgoing edge or the `failed` escape hatch is consulted — so advancing,
+  declaring failure (#309) and aborting were all closed, leaving a team that was alive and spending
+  budget while it could not move. The derivation now lives in one function, `phaseStart(machine)`
+  (`machine.start ?? machine.phases[0]?.id`), shared by the state machine's entry rule and the birth
+  site so the two cannot drift, and an empty machine falls back to the built-in start (it cannot be
+  declared — the loader rejects it). A card that declares no machine keeps the literal `"planning"`, so
+  the built-in four-phase pipeline is unchanged. Contract:
+  `docs/contracts/declarative-phase-machine-v5.md:107` (that file is `Status: draft`).
+
 - **`/legion doctor` stopped recommending the dead extension switch (#329).** `inheritExtensions: true`
   and `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` outlived #328's clean-up in `legion-doctor.ts`: `true` has been
   the default since #280 and both yield 0 extensions when host discovery fails, so every doctor fix and
