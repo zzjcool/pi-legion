@@ -1,6 +1,16 @@
 /**
- * Session JSONL parse cost — the path `statusEntries()` walks once per job and
- * once per node on every 500ms refresh (`src/extension/runtime.ts`).
+ * Session JSONL parse cost — what a status refresh pays when a session file HAS
+ * changed.
+ *
+ * These are no longer the per-tick cost of the 500ms refresh
+ * (`statusEntries()` in `src/extension/runtime.ts`). Since #348 that path goes
+ * through `parseSessionFileCached` (`progressFromSessionFile`), which answers an
+ * unchanged file from one `statSync` on `(path, size, mtimeMs)` and never calls
+ * the parser at all — so the numbers below are the cost of a MISS (the first
+ * tick after a write, i.e. at most once per file per write) plus the parse cost
+ * that verdict readers still pay directly. The per-tick syscall profile is
+ * asserted in `bench/perf-core/06-watch-tick.ts` (`statCalls`, `misses`), not
+ * here: this file cannot see the gate from `parseSessionFile`.
  *
  * Findings these numbers back (reports/perf-2026-10-19/REPORT.md, P7):
  *   `parseSessionFile` keeps an incremental offset cache (#36), but the exit
@@ -84,8 +94,10 @@ test("a warm parse of a grown session stays well under a millisecond (the P7 gua
 		`warm parse of ${(biggest.bytes / 1e6).toFixed(1)}MB took ${warmMs.toFixed(3)}ms`,
 	);
 
-	// One refreshUi pass over 8 sessions at 2 Hz must fit the 500ms tick with
-	// room for the DB work that shares it.
+	// A status tick that has to parse (one miss, i.e. the first tick after a
+	// write) covers 8 sessions; the following ticks cost one `stat` each and are
+	// asserted in bench/perf-core/06-watch-tick.ts. This bound therefore still
+	// holds for the expensive tick at 2 Hz.
 	const files = realSessionFiles(8);
 	clearSessionParseCache();
 	for (const f of files) parseSessionFile(f.file);
@@ -141,15 +153,16 @@ test("an empty or missing session file parses for free", () => {
 	assert.ok(warmMs < 50, `missing-file parse took ${warmMs.toFixed(2)}ms`);
 });
 
-test("parseSessionFile is cheap enough to run per-node at 2Hz up to the LRU cap", () => {
+test("parseSessionFile is cheap enough to absorb the miss tick of every tracked node at 2Hz", () => {
 	if (!hasRealArtifacts()) return;
 	const files = realSessionFiles(8);
 	assert.ok(files.length > 0);
 	clearSessionParseCache();
 	for (const f of files) parseSessionFile(f.file); // prime, as the first refreshUi would
 
-	// One refreshUi pass over the tracked sessions must fit inside a 500ms tick
-	// with room for the DB work that shares the tick.
+	// The worst tick: every tracked session was written since the last poll, so
+	// every one of them is a miss. It must still fit inside a 500ms tick with
+	// room for the DB work that shares the tick.
 	const passMs = medianMs(() => {
 		for (const f of files) parseSessionFile(f.file);
 	}, 5);

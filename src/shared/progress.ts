@@ -3,7 +3,7 @@
  * RPC v2 has one child kind, so there are no pane/title probes.
  */
 
-import { isLastTurnComplete, parseSessionFile } from "./session.ts";
+import { isLastTurnComplete, parseSessionFileCached } from "./session.ts";
 import type { ParsedSession } from "./types.ts";
 
 export interface LiveProgress {
@@ -74,9 +74,18 @@ function turnClock(
 	};
 }
 
+/**
+ * Live progress for a session file — the status readers' entry point.
+ *
+ * Goes through `parseSessionFileCached` (#348): the 500ms `refreshUi()` sweep
+ * calls this once per ledger row per tick, and a session file that has not been
+ * written since the last tick is answered from the `(size, mtimeMs)` gate
+ * instead of paying open + fstat + fingerprint + close every time. Nothing here
+ * mutates the parsed snapshot, which is what makes the shared cache entry safe.
+ */
 export function progressFromSessionFile(file: string): LiveProgress {
 	if (!file) return {};
-	return progressFromSession(parseSessionFile(file));
+	return progressFromSession(parseSessionFileCached(file));
 }
 
 /** Later sources win when they actually have a value. */

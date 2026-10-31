@@ -118,6 +118,86 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `CollectSnapshot.outputTruncated: true`」，永远不是 `missing`。实测：50 child × 204,800B 驻留
   10.07MB → **0.51MB**（满足 #349 的 ≤1.0MB），重新 track 全部后回落到基线。
   契约：`docs/contracts/finished-cache-eviction-v1.md`。
+- **A 500ms status refresh no longer re-parses a session file that has not been written since the
+  last tick (#348).** `refreshUi()` → `statusEntries()` parsed every child's session file — plus every
+  historical ledger row that carries one — once per tick, changed or not: one idle child cost 119
+  opens per 60s, 50 children 6000. That count grows with the *length* of a session rather than with
+  the number of live agents — the reason the issue suspected the 64-entry incremental-parse cap of
+  thrashing every tick. `parseSessionFileCached` now sits in front of the parser: one `statSync`
+  compares `(path, size, mtimeMs)` and an unchanged file is answered from the previous parse instead
+  of opening it at all. A write from another process is still seen — an append grows `size`, a
+  rewrite moves `mtimeMs` even at identical length — so no fs watcher and no bus subscription is
+  involved, the one exception being a same-millisecond rewrite that keeps the byte length (see the
+  function's doc: the parser's own head/boundary fingerprint would catch it, but only by opening the
+  file, which is the fixed cost this gate exists to remove; it resolves on the next write). The
+  display readers go through the gate (`progressFromSessionFile`, which every status row calls;
+  `/legion summary`; `/legion timing`), while every path that has to *decide* something about a file
+  keeps calling `parseSessionFile` on the file it is judging: verdict derivation (`orchestrator`,
+  `rebuild`, `legion_*` tools) and the postman's DELIVERED evidence scan — that one moves a message
+  to DELIVERED and can discard a notice as obsolete, and the frozen criterion names the real parse,
+  so it is **deliberately kept** off the gate (it also only parses a seam whose mailbox page is
+  non-empty, so a seam with nothing pending parses nothing). None of the parsing semantics moved.
+  A file that cannot be *read* (`EACCES`/`EMFILE`/`EIO`) is never cached: `parseSessionFile` answers
+  that the same way it answers an empty file, and a settled session file never moves
+  `(size, mtimeMs)` again — `chmod` only bumps `ctime` — so caching that empty value would have
+  pinned `/legion summary` and the status rows at zero for the rest of the process. Both caches are
+  bounded: the file-level cache is capped at 256 entries, LRU-ordered on every hit, so the files a
+  tick actually visits are the ones that stay; the incremental cap rises 64 → 256 as headroom for a
+  child that appends on every tick, **not** as the source of this change's win (that cache's own
+  `misses` counter read 0 throughout the windows below, so it was never the cost being paid).
+  `sessionFileCacheStats()` (`hits`/`misses`/`size`/`statCalls`) exists for tests and is never
+  rendered.
+
+  Measured with the issue's own script (`b3.ts` harness, real 60s/20s windows): 1 idle child 119 → 0
+  opens, 50 children 6000 → 0, 100 session files 4000 → 0, and the only syscall left per unchanged
+  file is the `stat`. Two caveats on those zeros. First, they are window figures: the window starts
+  after the seed parse, so the steady-state number is **one parse per session file per process**
+  (plus one per write), not zero — a window that opens on the first tick does pay for it. Second, the
+  CPU side of that table (0.34% → 0.10%, 3.64% → 0.31%, 16.20% → 0.63%, `process.cpuUsage()` over the
+  same windows) was sampled on runs whose loadavg differed, so it shows direction, not an isolated
+  cost. The microsecond figure is the gate's own micro-benchmark — open + fstat + two 256B fingerprint
+  reads + close, 36–66µs warm, timed in isolation by the issue — and must not be subtracted from the
+  logged per-parse cost: that log shows a whole parse at ≈1.19ms per parse in one run and ≈0.78ms per
+  parse in the other, i.e. the per-parse figure itself moved between the two runs.
+
+- **A control call no longer scans the run registry to find a child it is already scoped to, and the
+  scan now keeps a snapshot when it does run (#344).** Every `collect` / `status` / `steer` / `abort` /
+  `retire` / `continue` opened with `store.listRuns()` — `readdir` plus one `readFileSync` +
+  `JSON.parse` per run — *before* it even asked which run it was scoped to, so a call that already
+  knew its `runId` (the explicit argument, the session's legion run, or the run the runtime tracks
+  the name under) paid for every run ever written: 26ms at the 352 runs on the reporting machine,
+  97% of a warm `status`, 110ms at 1000 synthetic runs, linear and unbounded apart from the 14-day
+  retention prune. The scan is now a FALLBACK: the scope run is read with one `readRun` (0.05ms) and
+  the registry is consulted only when the name might live in another run — which is exactly the
+  #312 case that must report or refuse instead of adopting. On this repo's 365-run corpus one name
+  resolution went 18.4ms → 0.04ms, and on 1000 synthetic runs 31.5ms → 0.04ms, with **zero**
+  `listRuns` calls for a scoped hit. The fallback scan itself is cached per runs directory: a
+  process-wide snapshot (shared by every `RunStore` instance on that root, since the tool surface
+  builds one per call) invalidated by the directory's `mtimeMs`, by any write this process performs
+  (`createRun` / `updateRun` / `updateChild` — all funnel through `writeRun` — plus `prune`'s explicit invalidation), and, for a
+  record another process rewrote in place with no directory mtime to show for it, by a 1s TTL that
+  tests drive through the store's injectable clock. Cold scans are unchanged (21.2ms at 365 real
+  runs, 34ms at 1000 synthetic on both sides of this change); a repeat scan is 0.018ms / 0.012ms.
+  `listRuns()` still answers exactly what it did — every readable run, oldest first, corrupt entries
+  skipped — and every #312 strict-scope case (`collect`/`continue`/`resume` refusing a same-named
+  node elsewhere, ambiguity never resolved by preference) is pinned by a parity test that compares
+  the shortcut against the full scan shape by shape.
+
+- **A launch that cannot use a worktree no longer runs the nested-worktree `git` probe whose answer is
+  then discarded (#345).** `isInsideChildWorktree(cwd)` — one synchronous `git rev-parse
+  --git-common-dir`, ~5–7ms — was an *argument* to `resolveLaunchWorktree`, so it was evaluated before
+  the resolver could short-circuit, and for every non-centurion its value was then thrown
+  away: the worktree guard forces `worktree: false` for those roles whatever the probe said (all 18
+  combinations of `roleDefault × launch × parentInWorktree`, now a table-driven test). The probe is
+  asked on the centurion branch only — the one branch it can change — so a worker launch
+  drops from 1 `git` subprocess to 0 and from 11.6ms to 2.9ms median on this repo, while a
+  centurion launch still spawns the same two git commands (probe not reached: legion
+  forces its worktree, `worktree add` still runs). `resolveLaunchWorktree`'s result semantics are
+  untouched; the one observable difference is that a role card pinning `worktree: true` while the
+  parent sits in a linked worktree now also gets the existing one-time `worktree denied for
+  non-centurion role` warning, because the suppression that used to silence it is the
+  answer being skipped.
+
 
 - **`messages.delivered` is a five-value domain now — `pending / accepted / bounced / delivered / obsolete`
   — and `LEGION_DB_USER_VERSION` moves 1 → 2 (#322).** The old `INJECTED(1)` claimed a delivery the ledger
