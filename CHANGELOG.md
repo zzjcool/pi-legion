@@ -81,6 +81,24 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **`/legion` 从全屏 overlay 改成主屏挂载，整帧合成开销消失（120×40 4.39ms → 1.69ms，200×60 9.59ms → 3.39ms）(#347).**
+  页面一直以 `overlay: true` + `width:"100%"` 打开，于是 pi-tui 对**每一行**都跑 `compositeTuiLine`
+  （`extractSegments` + `sliceWithWidth` + `visibleWidth` 三次 `Intl.Segmenter` 字素扫描，行宽缓存按整行
+  key 而实时帧永不重复）。`/legion` 是这条路径的最坏输入：非空格里 56%–68% 是 braille/box/块字形，
+  没有一行纯 ASCII，非 ASCII 行单价是 ASCII 的 3.67×，实测占整帧 57%–70%。
+  现在改成 `ctx.ui.custom(factory, { overlay: false })`（与经典 `--tree` 视图同一个挂载方式）：
+  页面**替换** base 组件而不是叠在它上面，宿主的 overlay 合成层完全不参与，页面只付自己那一次
+  `render()`。实测（真 `TuiMainScreen` + `FakeTerminal`，`written[]` 每帧清空，50 帧 × 3 轮）：
+  页面帧 median 2.49 → **0.96**（80×24）、4.41 → **1.77**（120×40）、8.63 → **3.35ms**（200×60），
+  p95 5.30/17.64/41.51 → **1.25/2.85/4.67ms**，每帧字节 −3.1% / −2.5% / −1.8%（视觉内容等价）。
+  **用户可见行为不变**：`Esc`/`q` 仍然回到原来的会话视图（宿主把打开时换掉的 editor 挂回来）；
+  页面继续按 `terminal.rows` 自己定高（非 overlay 的自定义组件是布局叶子，宿主不分配视口高度，
+  与 `createTreeViewFactory` 同源）；`/legion` 内打开的详情浮层仍是 75% 浮层
+  （`MODAL_MAX_WIDTH_RATIO` / 65% 高 / `resolveModalOverlayOptions()` 一个像素没动），resize 语义原样。
+  `paintPageFloor` **保留且仍然必需**：主屏挂载后详情浮层依旧是 overlay，合成器依旧按行取 base 行尾的
+  SGR 快照，实测去掉 floor 后两种挂载的 gutter 都退回终端默认背景（#308 黑带重现），
+  所以它不是「保险」。不改宿主 `compositeTuiLine`、不改 pi-tui 节流常量。
+  基准：`bench/perf-core/09-legion-mount.ts`；契约：`docs/contracts/legion-main-screen-mount-v1.md`。
 - **`/legion` 不再每写一个格子就分配一个 `Cell`：`Canvas` 预建 W×H 个可变 cell，`set()` 原地改字段 (#362).**
   `set()` 原本是 `row[x] = { ch, color, ...style }`——一帧要写 4,583 次（120×40）/ 9,691 次（200×60），
   实测 52.4 B/次 与 128.0 B/次。现在格子在构造时一次性建好，写入只做 `cell.ch / color / bold / inverse`

@@ -94,8 +94,21 @@ toolErrorBg     "\u001b[49mX\u001b[49m"
 保留 ANSI 的合成用例（新增于 `test/unit/legion-live-overlay.test.ts`，harness 在
 `test/helpers/modal-composite.ts` 的 `assertOverlayGutterInheritsBase`）：
 
-> `/legion` 视图作 base（全屏 overlay，生产几何）+ 75% 居中浮层，逐帧行断言
+> `/legion` 视图作 base + 75% 居中浮层，逐帧行断言
 > 「**浮层左右留白段的 strip 结果等于 base 同列文本，且第一个格子的背景 SGR 等于 base 同列背景 SGR**」。
+
+**REV-1（#347）—— 挂载方式变了，断言不变。** §3 落地时 `/legion` 的生产几何是**全屏
+overlay**；#347 之后生产几何改为**主屏挂载**（`ui.custom(..., { overlay: false })`，见
+`docs/contracts/legion-main-screen-mount-v1.md`）。本条断言的**内容与强度都不改**，两种挂载
+都必须绿：
+
+- `assertOverlayGutterInheritsBase({ ..., mount: "overlay" })` —— 历史几何，保留为记录（原 #308 用例）；
+- `assertOverlayGutterInheritsBase({ ..., mount: "main" })` —— **当前生产几何**（#347 新增用例）。
+
+理由：#308 的机制是「合成器对 rect 右侧段取 base 行尾的一次性 SGR 快照」，它只取决于
+**详情浮层是 overlay**，与页面自己怎么挂载无关。实测（主屏挂载、去掉 floor）
+`rowBg` / `baseRightBg` / `frameRightBg` 同样退化 `""` ⇒ 黑带重现，所以 `paintPageFloor`
+在主屏挂载后**仍然必需**，不是「保险」。
 
 该用例必须**在去掉修复后变红**：去掉 `paintPageFloor` 后所有段的 bg 快照都是 `""`
 （`rowBg` / `baseRightBg` / `frameRightBg` 全空），而文本仍逐字符相同 ——

@@ -18,6 +18,7 @@ node --experimental-strip-types bench/perf-core/05-ledger-writes.ts
 node --experimental-strip-types bench/perf-core/06-watch-tick.ts
 node --experimental-strip-types bench/perf-core/07-list-runs.ts
 node --experimental-strip-types bench/perf-core/08-steer-abort-sweep.ts
+node --experimental-strip-types bench/perf-core/09-legion-mount.ts
 ```
 
 `02` and `07` also read the real run corpus; pass a different `runsDir` (or edit the
@@ -35,6 +36,7 @@ node --experimental-strip-types bench/perf-core/08-steer-abort-sweep.ts
 | `06-watch-tick.ts` | One 500ms `statusEntries()` tick, wired the way `index.ts` wires it (`getSubtree` + `attachUsageTotals` + `getChildByName`) over a real ledger. |
 | `07-list-runs.ts` | `RunStore.listRuns()` on the real corpus and on 100/1000/3000-run stores, plus the breakdown and the single-`readRun` baseline. |
 | `08-steer-abort-sweep.ts` | `/proc` enumeration and `sweepProcessTree`, `raceWithTimeout` timer accounting, `steer`/`abort` on a 50-child orchestrator, run-registry age distribution. |
+| `09-legion-mount.ts` | `/legion` as a full-screen overlay vs a main-screen child (#347): page-frame `renderNow` median/p95 per terminal size, the detail modal's own delta next to a blank-rect control, bytes per frame, and the issue's gates. |
 
 ## Cautions
 
