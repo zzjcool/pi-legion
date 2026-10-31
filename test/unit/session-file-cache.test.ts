@@ -3,13 +3,12 @@
  *
  * The 500ms status refresh (`runtime.refreshUi()` → `statusEntries()` →
  * `progressFromSessionFile`) used to parse every child's session file twice a
- * second even when nothing was written: 119 opens for one idle child in 60s,
- * and a 64-entry incremental cache made that a cold re-read of every file once
- * a session carried more than 64 session files (CPU 3% → 13.15%).
+ * second even when nothing was written: 119 opens for one idle child in 60s.
  *
  * These cases pin the contract of `parseSessionFileCached`: an unchanged file
  * is answered from `stat` alone, an append or a same-length rewrite is visible,
- * 100 files do not thrash the bound, and a caller cannot poison the entry.
+ * a read failure is never cached as "empty", the bound is a hard LRU limit, and
+ * a caller cannot poison the entry.
  */
 
 import { test } from "node:test";
@@ -55,7 +54,7 @@ test("#348: an unchanged session file is parsed once, then served from the stat 
 		const second = parseSessionFileCached(file);
 		const third = parseSessionFileCached(file);
 
-		assert.deepEqual(sessionFileCacheStats(), { hits: 2, misses: 1, size: 1 });
+		assert.deepEqual(sessionFileCacheStats(), { hits: 2, misses: 1, size: 1, statCalls: 3 });
 		assert.equal(second.turns.length, first.turns.length);
 		assert.equal(third.lastTurnOutput, "two");
 		// two assistant messages, each `output: 2` — the fold totals them.
@@ -104,7 +103,7 @@ test("#348: a same-length rewrite with a new mtime is re-parsed", async () => {
 	});
 });
 
-test("#348: 100 session files are visited twice without thrashing the cache", async () => {
+test("#348: 100 session files are visited twice without a thrash, well under the bound", async () => {
 	await withTempDir((dir) => {
 		const files = Array.from({ length: 100 }, (_, i) => {
 			const file = path.join(dir, `s-${i}.jsonl`);
@@ -122,14 +121,141 @@ test("#348: 100 session files are visited twice without thrashing the cache", as
 		assert.equal(secondPass.misses, 100, "a second sweep must not re-parse a single file");
 		assert.equal(secondPass.hits, 100);
 		assert.equal(secondPass.size, 100);
-		assert.ok(
-			SESSION_FILE_CACHE_MAX_ENTRIES > secondPass.size,
-			`the bound (${SESSION_FILE_CACHE_MAX_ENTRIES}) must sit above a 100-file sweep`,
-		);
+		assert.equal(secondPass.statCalls, 200, "one stat per file per sweep, nothing else");
 	});
 });
 
-test("#348: a caller cannot poison the cached parse by mutating the result", async () => {
+/*
+ * The bound and its ORDER, which no other case covers: a suite that only ever
+ * fills 100 of 256 slots asserts nothing about eviction (a test whose last line
+ * is `MAX > size` stays green when the bound is deleted outright). This is the
+ * same fill-touch-insert shape as the inner cache's LRU case in
+ * session-stream.test.ts, and it is the only assertion that separates LRU from
+ * FIFO: after filling to the cap, the OLDEST path is touched, one new file is
+ * inserted, and the eviction must take the second-oldest instead.
+ */
+test("#348: the file cache is a hard bound and evicts the least-recently-used path, not the oldest", async () => {
+	await withTempDir((dir) => {
+		const files = Array.from({ length: SESSION_FILE_CACHE_MAX_ENTRIES }, (_, i) => {
+			const file = path.join(dir, `s-${i}.jsonl`);
+			fs.writeFileSync(file, twoTurns(`turn-${i}`));
+			return file;
+		});
+		clearSessionFileCache();
+		for (const file of files) parseSessionFileCached(file);
+		assert.equal(sessionFileCacheStats().size, SESSION_FILE_CACHE_MAX_ENTRIES);
+		assert.equal(sessionFileCacheStats().hits, 0);
+
+		// Insertion order is files[0] .. files[255]; touch the head so it moves to tail.
+		parseSessionFileCached(files[0] as string);
+
+		const overflow = path.join(dir, "overflow.jsonl");
+		fs.writeFileSync(overflow, twoTurns("overflow"));
+		parseSessionFileCached(overflow);
+
+		assert.equal(
+			sessionFileCacheStats().size,
+			SESSION_FILE_CACHE_MAX_ENTRIES,
+			"the bound is a hard limit, not advice — an unbounded map would report 257",
+		);
+		assert.equal(sessionFileCacheHas(files[0] as string), true, "a touched entry must survive (FIFO would drop it)");
+		assert.equal(sessionFileCacheHas(files[1] as string), false, "the least-recently-used entry is the one evicted");
+		assert.equal(sessionFileCacheHas(overflow), true);
+
+		// And the evicted path is a real miss next time, not a silent stale hit.
+		const misses = sessionFileCacheStats().misses;
+		assert.equal(parseSessionFileCached(files[1] as string).lastTurnOutput, "turn-1");
+		assert.equal(sessionFileCacheStats().misses, misses + 1, "an evicted path is re-parsed, not served stale");
+		assert.equal(sessionFileCacheStats().size, SESSION_FILE_CACHE_MAX_ENTRIES);
+	});
+});
+
+/*
+ * The reviewer's F1: `parseSessionFile` answers a failed OPEN/READ with the same
+ * empty value it answers an empty file, and the miss path used to cache that
+ * value against `(size, mtimeMs)`. Nothing moves those two after a session
+ * settles — `chmod` only bumps `ctime`, which is not part of the key — so a
+ * single EACCES/EMFILE/EIO pinned `/legion summary` and every status row at 0
+ * for the rest of the process (the "token rate reads 0 for the agent's entire
+ * lifetime" symptom in runtime.ts).
+ *
+ * This case is skipped as root: root can read a 000-mode file, so there is no
+ * failure to reproduce. CI (and any non-root run) exercises it for real.
+ */
+const unreadableIsUnreadable = (process.getuid?.() ?? 0) !== 0;
+
+test(
+	"#348: an unreadable session file is not pinned as empty — it is re-read when it becomes readable",
+	{ skip: unreadableIsUnreadable ? false : "running as root: chmod 000 does not stop reads" },
+	async () => {
+		await withTempDir((dir) => {
+			const file = path.join(dir, "s.jsonl");
+			fs.writeFileSync(file, twoTurns("two"));
+			clearSessionFileCache();
+
+			fs.chmodSync(file, 0o000);
+			let denied: ReturnType<typeof parseSessionFileCached>;
+			try {
+				denied = parseSessionFileCached(file);
+			} finally {
+				// Restore first: `chmod` moves ctime only, so `(size, mtimeMs)` is
+				// byte-for-byte what the failed read saw — exactly the state a pinned
+				// empty entry would answer from forever.
+				fs.chmodSync(file, 0o644);
+			}
+			assert.equal(denied.turns.length, 0, "an unreadable file parses as empty");
+			assert.equal(denied.tornLines, 0);
+			assert.equal(sessionFileCacheHas(file), false, "a read failure must not enter the cache");
+
+			const recovered = parseSessionFileCached(file);
+			assert.equal(recovered.turns.length, 2, "the same (size, mtimeMs) must not still answer empty");
+			assert.equal(recovered.lastTurnOutput, "two", "the restored file is re-read, not served from a pinned empty");
+			assert.equal(recovered.usage.output, 4);
+		});
+	},
+);
+
+/*
+ * Root-safe companion to the chmod case: a directory stats fine (`size` 4096 on
+ * ext4/overlayfs, non-zero on tmpfs) but cannot be read, which is the exact
+ * shape of the bug — stat succeeds, the parse does not. Removing the
+ * "unreadable is not cacheable" branch turns the second tick into a cache HIT.
+ */
+test("#348: a read failure is retried every tick instead of freezing an empty entry", async () => {
+	await withTempDir((dir) => {
+		const file = path.join(dir, "s.jsonl");
+		fs.mkdirSync(file);
+		clearSessionFileCache();
+
+		assert.equal(parseSessionFileCached(file).turns.length, 0);
+		assert.equal(parseSessionFileCached(file).turns.length, 0);
+
+		const stats = sessionFileCacheStats();
+		assert.equal(stats.hits, 0, "the second tick must re-attempt the read, not hit an empty entry");
+		assert.equal(stats.misses, 2);
+		assert.equal(stats.size, 0, "an unreadable path takes no cache slot");
+		assert.equal(sessionFileCacheHas(file), false);
+
+		// Same path, now a readable file: the next tick gets the real content.
+		fs.rmdirSync(file);
+		fs.writeFileSync(file, twoTurns("two"));
+		assert.equal(parseSessionFileCached(file).lastTurnOutput, "two");
+		assert.equal(sessionFileCacheStats().size, 1);
+	});
+});
+
+/*
+ * The name says what is guaranteed, because the guarantee is about DEPTH: the
+ * top level, `usage` and the `turns` ARRAY are copied, so a caller's write to
+ * those cannot land in the cache.
+ *
+ * Deeper sharing (a turn record, its assistants) is deliberate, not an
+ * oversight — see `cacheSafeCopy`: nothing in `src/` mutates a turn after the
+ * fold, and copying every turn per poll is precisely the cost #348 removed. The
+ * last assertion pins that intent so a future "fix" to deep-copy is a decision,
+ * not an accident.
+ */
+test("#348: a caller cannot poison the cached fields, usage or turn list (turn records stay shared by design)", async () => {
 	await withTempDir((dir) => {
 		const file = path.join(dir, "s.jsonl");
 		fs.writeFileSync(file, twoTurns("two"));
@@ -147,6 +273,11 @@ test("#348: a caller cannot poison the cached parse by mutating the result", asy
 		assert.equal(second.output, "two");
 		assert.equal(second.usage.input, 2, "the cached total survives a caller's write");
 		assert.equal(second.turns.length, 2);
+		assert.equal(
+			Object.is(second.turns[0], parseSessionFileCached(file).turns[0]),
+			true,
+			"turn records are shared on purpose (cacheSafeCopy documents the depth)",
+		);
 	});
 });
 

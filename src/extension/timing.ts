@@ -1,8 +1,9 @@
 /**
  * Subagent timing slash command (`/legion timing`).
  *
- * Reuses summary.ts duration resolution + session parse (via aggregateSubagentRuns
- * / parseSessionFile). Zero schema change — wall from spawnedAt/retiredAt|now,
+ * Reuses summary.ts duration resolution + session snapshots (via
+ * aggregateSubagentRuns / the shared `sessionMapFor`, which reads through
+ * `parseSessionFileCached`). Zero schema change — wall from spawnedAt/retiredAt|now,
  * generation from ParsedSession.generationMs, other = max(0, wall − gen).
  */
 
@@ -11,7 +12,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { parseSessionFileCached } from "../shared/session.ts";
+import { sessionMapFor } from "../shared/session-map.ts";
 import type { ChildRecord, RunRecord, TaskState } from "../shared/types.ts";
 import {
 	RunStore,
@@ -278,20 +279,6 @@ function parseTimingArgs(
 		name = token;
 	}
 	return { ok: true, json, ...(name ? { name } : {}) };
-}
-
-function sessionMapFor(runs: readonly RunRecord[]): Map<string, SummarySession> {
-	const sessions = new Map<string, SummarySession>();
-	for (const run of runs) {
-		for (const child of run.children) {
-			if (child.sessionFile) {
-				// Same #348 gate as `/legion summary`: timing is display data, and an
-				// unchanged session file is reused rather than re-parsed.
-				sessions.set(child.sessionFile, parseSessionFileCached(child.sessionFile));
-			}
-		}
-	}
-	return sessions;
 }
 
 function timingCompletions(

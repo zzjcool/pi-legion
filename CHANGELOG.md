@@ -84,23 +84,44 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - **A 500ms status refresh no longer re-parses a session file that has not been written since the
   last tick (#348).** `refreshUi()` → `statusEntries()` parsed every child's session file — plus every
   historical ledger row that carries one — once per tick, changed or not: one idle child cost 119
-  opens per 60s, 50 children 6000, and because that count grows with the *length* of a session rather
-  than with the number of live agents, crossing the 64-entry incremental-parse cap made every tick a
-  cold re-read of every file (`openSync` 200/s, CPU 16.2% at 100 session files). `parseSessionFileCached`
-  now sits in front of the parser: one `statSync` compares `(path, size, mtimeMs)` and an unchanged
-  file is answered from the previous parse instead of paying open + fstat + two 256B fingerprint reads
-  + close (36–66µs warm). A write from another process is still seen — an append grows `size`, a
+  opens per 60s, 50 children 6000. That count grows with the *length* of a session rather than with
+  the number of live agents — the reason the issue suspected the 64-entry incremental-parse cap of
+  thrashing every tick. `parseSessionFileCached` now sits in front of the parser: one `statSync`
+  compares `(path, size, mtimeMs)` and an unchanged file is answered from the previous parse instead
+  of opening it at all. A write from another process is still seen — an append grows `size`, a
   rewrite moves `mtimeMs` even at identical length — so no fs watcher and no bus subscription is
-  involved. The display readers go through the gate (`progressFromSessionFile`, which every status row
-  calls; `/legion summary`; `/legion timing`); verdict derivation (`orchestrator`, `rebuild`,
-  `legion_*` tools) keeps calling `parseSessionFile` on the file it is judging, and none of the
-  parsing semantics moved. Both caches are bounded: the incremental cap rises 64 → 256 and the new
-  file-level cache is capped at 256 entries, LRU-ordered on every hit, so the files a tick actually
-  visits are the ones that stay. Hit/miss counters (`sessionFileCacheStats()`) exist for tests and are
-  never rendered. Measured with the issue's own script (`b3.ts` harness, real 60s/20s windows): 1 idle
-  child 119 → 0 parses and 0.34% → 0.10% CPU, 50 children 6000 → 0 parses and 3.64% → 0.31%, 100
-  session files 4000 → 0 parses and 16.20% → 0.63%; the only syscall left per unchanged file is the
-  `stat`.
+  involved, the one exception being a same-millisecond rewrite that keeps the byte length (see the
+  function's doc: the parser's own head/boundary fingerprint would catch it, but only by opening the
+  file, which is the fixed cost this gate exists to remove; it resolves on the next write). The
+  display readers go through the gate (`progressFromSessionFile`, which every status row calls;
+  `/legion summary`; `/legion timing`), while every path that has to *decide* something about a file
+  keeps calling `parseSessionFile` on the file it is judging: verdict derivation (`orchestrator`,
+  `rebuild`, `legion_*` tools) and the postman's DELIVERED evidence scan — that one moves a message
+  to DELIVERED and can discard a notice as obsolete, and the frozen criterion names the real parse,
+  so it is **deliberately kept** off the gate (it also only parses a seam whose mailbox page is
+  non-empty, so a seam with nothing pending parses nothing). None of the parsing semantics moved.
+  A file that cannot be *read* (`EACCES`/`EMFILE`/`EIO`) is never cached: `parseSessionFile` answers
+  that the same way it answers an empty file, and a settled session file never moves
+  `(size, mtimeMs)` again — `chmod` only bumps `ctime` — so caching that empty value would have
+  pinned `/legion summary` and the status rows at zero for the rest of the process. Both caches are
+  bounded: the file-level cache is capped at 256 entries, LRU-ordered on every hit, so the files a
+  tick actually visits are the ones that stay; the incremental cap rises 64 → 256 as headroom for a
+  child that appends on every tick, **not** as the source of this change's win (that cache's own
+  `misses` counter read 0 throughout the windows below, so it was never the cost being paid).
+  `sessionFileCacheStats()` (`hits`/`misses`/`size`/`statCalls`) exists for tests and is never
+  rendered.
+
+  Measured with the issue's own script (`b3.ts` harness, real 60s/20s windows): 1 idle child 119 → 0
+  opens, 50 children 6000 → 0, 100 session files 4000 → 0, and the only syscall left per unchanged
+  file is the `stat`. Two caveats on those zeros. First, they are window figures: the window starts
+  after the seed parse, so the steady-state number is **one parse per session file per process**
+  (plus one per write), not zero — a window that opens on the first tick does pay for it. Second, the
+  CPU side of that table (0.34% → 0.10%, 3.64% → 0.31%, 16.20% → 0.63%, `process.cpuUsage()` over the
+  same windows) was sampled on runs whose loadavg differed, so it shows direction, not an isolated
+  cost. The microsecond figure is the gate's own micro-benchmark — open + fstat + two 256B fingerprint
+  reads + close, 36–66µs warm, timed in isolation by the issue — and must not be subtracted from the
+  logged per-parse cost: that log shows a whole parse at ≈1.19ms per parse in one run and ≈0.78ms per
+  parse in the other, i.e. the per-parse figure itself moved between the two runs.
 
 - **A control call no longer scans the run registry to find a child it is already scoped to, and the
   scan now keeps a snapshot when it does run (#344).** Every `collect` / `status` / `steer` / `abort` /

@@ -389,13 +389,15 @@ export const SESSION_MAX_LINE_BYTES_ENV = "PI_LEGION_SESSION_MAX_LINE_BYTES";
 /**
  * Hard bound on the incremental (offset) parse cache below.
  *
- * Raised 64 → 256 in #348. The 500ms status sweep parses every ledger row that
- * carries a session file — a count that grows with the LENGTH of a session, not
- * with the number of live agents — so a 64-entry cap was routinely exceeded,
- * and a self-evicting cache turns every tick into cold reads of every file
- * (measured: CPU 3% → 13.15% at 100 session files). The file-level gate added in
- * #348 (`parseSessionFileCached`) keeps most ticks away from this cache
- * entirely; 256 is the bound for the parses that still happen.
+ * Raised 64 → 256 in #348 as **headroom, not as the source of that issue's
+ * win**. The hypothesis that a 64-entry cap was routinely exceeded and turned
+ * every tick into a cold re-read does not survive the issue's own logs: the
+ * inner cache reported `misses=0` throughout the measured windows, i.e. this
+ * cache was never the cost. The win came from the file-level gate
+ * (`parseSessionFileCached`), which keeps an unchanging file out of the parser
+ * altogether. The raise stays because the gate deliberately lets every genuine
+ * append through to this cache, and a hot child process appending on every tick
+ * should not evict sibling files at the old bound; 256 is that margin.
  */
 export const SESSION_CACHE_MAX_ENTRIES = 256;
 
@@ -771,10 +773,26 @@ export interface SessionFileCacheStats {
 	hits: number;
 	misses: number;
 	size: number;
+	/**
+	 * `statSync` calls the gate has made. One per call by construction, so this
+	 * is how a caller counts the *cost* of the gate itself: an unchanged file
+	 * must cost exactly one stat and zero parses. `bench/perf-core/06-watch-tick.ts`
+	 * asserts that per tick. (Counted here rather than by patching `fs` in the
+	 * bench: `import * as fs from "node:fs"` bindings are read-only, so a
+	 * monkeypatch is invisible to this module.)
+	 */
+	statCalls: number;
 }
 
+let sessionFileCacheStatCalls = 0;
+
 export function sessionFileCacheStats(): SessionFileCacheStats {
-	return { hits: sessionFileCacheHits, misses: sessionFileCacheMisses, size: sessionFileCache.size };
+	return {
+		hits: sessionFileCacheHits,
+		misses: sessionFileCacheMisses,
+		size: sessionFileCache.size,
+		statCalls: sessionFileCacheStatCalls,
+	};
 }
 
 /** Test hook: drop the file-level cache and zero its counters. */
@@ -782,6 +800,7 @@ export function clearSessionFileCache(): void {
 	sessionFileCache.clear();
 	sessionFileCacheHits = 0;
 	sessionFileCacheMisses = 0;
+	sessionFileCacheStatCalls = 0;
 }
 
 /** Test hook: whether a path is cached, so eviction order is asserted, not inferred. */
@@ -809,8 +828,9 @@ function cacheSafeCopy(parsed: ParsedSession): ParsedSession {
  * changed since the last call (#348).
  *
  * This is the entry point for the *status* readers — `progressFromSessionFile`
- * (the 500ms `refreshUi()` sweep), `/legion summary`, `/legion timing` — never
- * for verdict derivation, which must read the file it is judging.
+ * (the 500ms `refreshUi()` sweep), `/legion summary`, `/legion timing` — and for
+ * the host-side postman's DELIVERED evidence scan; never for verdict derivation,
+ * which must read the file it is judging.
  *
  * Hit condition is exactly `(path, size, mtimeMs)` equal, as frozen in #348:
  * an append grows `size`, a rewrite moves `mtimeMs` even at equal length, and a
@@ -824,14 +844,24 @@ function cacheSafeCopy(parsed: ParsedSession): ParsedSession {
  *
  * The result is a shallow copy (`cacheSafeCopy`): mutating a field, `usage` or
  * the `turns` array of what this returns cannot poison the cache.
+ *
+ * A *read* failure (`EACCES`, `EMFILE`, `EIO`) is never cached, for the same
+ * reason a failed stat is not: `parseSessionFile` answers an unreadable file
+ * with the same empty value it answers an empty one, and `(size, mtimeMs)` says
+ * nothing about readability. A settled session file never moves again, so
+ * caching that empty value would pin `/legion summary` and the status rows at
+ * zero for the rest of the process — and `chmod` only moves `ctime`, which is
+ * not part of the key. The detection is exact: a file with `size > 0` that
+ * yields neither turns nor torn lines was not read.
  */
 export function parseSessionFileCached(path: string): ParsedSession {
+	sessionFileCacheStatCalls += 1;
 	let stat: fs.Stats;
 	try {
 		stat = fs.statSync(path);
 	} catch {
-		// Missing/unreadable is the same answer `parseSessionFile` gives, and
-		// there is nothing to cache: the next tick retries the stat.
+		// Missing is the same answer `parseSessionFile` gives, and there is
+		// nothing to cache: the next tick retries the stat.
 		sessionFileCache.delete(path);
 		return emptyParsedSession();
 	}
@@ -845,6 +875,14 @@ export function parseSessionFileCached(path: string): ParsedSession {
 	}
 	sessionFileCacheMisses += 1;
 	const parsed = parseSessionFile(path);
+	// Unreadable, not empty: bytes exist but the parser folded none of them
+	// (see the doc above). Cache nothing and retry on the next tick. A non-empty
+	// file that legitimately folds to zero turns (metadata rows only, no message
+	// yet) is re-parsed per tick as a result — tiny and rarer than the pinned-zero
+	// failure this prevents, and it stops being re-parsed as soon as it has a turn.
+	if (parsed.turns.length === 0 && parsed.tornLines === 0 && stat.size > 0) {
+		return cacheSafeCopy(parsed);
+	}
 	sessionFileCache.delete(path);
 	if (sessionFileCache.size >= SESSION_FILE_CACHE_MAX_ENTRIES) {
 		const oldest = sessionFileCache.keys().next().value;
