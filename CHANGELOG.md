@@ -170,6 +170,34 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **PR #363 review follow-up: an internal notice can no longer be refused into silence, and a refused
+  one is retried.** #353 made `sendMail` throw for a `U+0000`, which is right where the text is the
+  model's own (`legion_mail`) and wrong at the three call sites that compose a notice from ledger
+  facts, because all three run after the move they describe. `requestLegionPhase` writes
+  `updateNode` + `phase_change` and only then calls `notifyParent`, so a `reason`/`note` carrying a
+  NUL (model text, and the only place one can exist — a ledger column would have truncated it on
+  write) turned an accepted transition — including a declaring centurion's failure notice, the #309
+  promise — into a tool error while the team had already moved; `checkOwnPhaseTimeout` wrote its
+  `phase_timeout` row (also the de-dup key) BEFORE mailing, and `LegionPostman.start()` swallows
+  whatever escapes (`.catch(() => {})`), so a refused notice was lost for the whole stint. The
+  refusal now belongs to the tool boundary alone: `legion_mail` answers `toolError(…,
+  "MAIL_INVALID_TEXT")` so the code is visible in `details.error` instead of only in a message, while
+  internal notices degrade — the NUL characters are dropped and the send retried, and a refusal the
+  ledger understands (rate limit, permission) falls back to `sendRootMessage` + a warning — and never
+  throw. `checkOwnPhaseTimeout` places the notice before writing the de-dup key, so a notice it could
+  not place anywhere leaves the key unwritten and the next tick tries again; 0 keeps its meaning and
+  the built-in subjects/clocks are untouched.
+- **PR #363 review follow-up: a failed revival gives the phase clock back, and the completion gate's
+  assumption is pinned.** `Orchestrator.reserveNode` moves `phase_since` on a revive (#357) and
+  records the `revived` `phase_change` before the supervisor spawns; a spawn failure rolled the
+  reservation back but left the moved clock behind — a stint `checkOwnPhaseTimeout` de-dupes on, for a
+  launch that does not exist. `phase_since` now travels with the rest of the rollback. Also: the
+  derivation of the success phase follows the ORDER A CARD DECLARES, so "`phases:` order is pipeline
+  order" is a load-bearing assumption rather than a style note — a case now pins a shuffled
+  declaration moving the gate, and its control pins that a non-final phase cannot collect a team.
+  Contracts: `docs/legion-v2-contract.md` REV-26 and
+  `docs/contracts/declarative-phase-machine-v5.md`.
+
 - **`legion_mail` refuses text containing `U+0000` instead of storing a truncation (#353).** SQLite's
   TEXT binding stops at the first NUL, so a `body`/`subject` carrying one was written as the part
   before it while the send still answered `ok: true` — and `bodyBytes` counted the ORIGINAL text, so a
@@ -207,7 +235,15 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   which for an undeclared phase name is 0, so `PhaseDefinition.timeoutMs` (`machineTimeout`) was dead
   code and a custom phase's advisory clock never armed. The order is now operator setting
   (`legion.phaseTimeouts`) → the machine's `timeoutMs` → the built-in default → 0, and 0 keeps its
-  pre-existing meaning of "never warn".
+  pre-existing meaning of "never warn". **Correction (PR #363 review, major 1):** that order was only
+  real for phase names the built-in table had never heard of. `index.ts` handed the postman a
+  default-FILLED `legion` object, so `settings.phaseTimeouts[phase] ?? machineTimeout(...)` always had
+  a value on the left and a card's `timeoutMs` on `planning`/`implementing`/… was ignored in silence
+  (probe: `implementing` 3600000 in settings, 300000 on the card → 3600000 won). The explicitness the
+  settings parser already records (`legionExplicitFields`) is now carried through the run-time fill
+  (`legionSettingsForRun`), so "operator wins" means "the operator wrote it down". Declaring
+  `timeoutMs` on a built-in phase name now really takes effect; an explicit operator setting still
+  beats the card, and with neither the four built-in numbers are unchanged. Contract: REV-26.
 
 - **A team is now born in the phase its own machine starts in, so a card declaring `phases:` no longer
   strands its team at spawn (#350).** `Orchestrator.reserveNode` wrote a hard-coded `phase: "planning"`

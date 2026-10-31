@@ -199,7 +199,7 @@ CREATE TABLE nodes (
   team          TEXT,
   status        TEXT NOT NULL,        -- starting|running|blocked|settled|failed|retired
   phase         TEXT,                 -- centurion 专有：planning|implementing|reviewing|verifying|done|failed|aborted
-  phase_since   INTEGER,              -- 当前阶段起始时刻（超时判定）
+  phase_since   INTEGER,              -- 当前相位 stint 的起始时刻（超时判定 + 通知过期判据；复活时相位不动而它前移，REV-26）
   rework_count  INTEGER NOT NULL DEFAULT 0,
   contract_path TEXT,                 -- planning 产物（§7.2）
   task_summary  TEXT,
@@ -337,7 +337,7 @@ npm test -- --filter <scope>
 
 ### 7.3 verifying 执行：supervisor 在子树 worktree cwd 逐条执行 `legion-verify` 块内命令（`timeout` 包裹，默认 600s/条，可设），输出落 runDir + 事件记录。空块 = 直通 done（read-only 队常见）。
 
-### 7.4 超时（每阶段独立时钟，默认可设，role/task 可覆盖）：planning 15m / implementing 60m / reviewing 30m / verifying 15m。超时**不自动杀**：写 `phase_timeout` 事件 + mail 通知该 centurion 的上级，由上级裁决（steer 续期 / abort 打断当前轮且 child 仍在 / retire 收队并进 aborted）。确定性优先，避免意外屠杀。
+### 7.4 超时（每阶段独立时钟，默认可设，role/task 可覆盖）：planning 15m / implementing 60m / reviewing 30m / verifying 15m。时钟来源依次为：显式 operator 设置（`subagents.legion.phaseTimeouts`）→ 团队卡片 `phases[].timeoutMs` → 内置四阶段默认（上述四值）→ 0（永不告警），相位名也可以是卡片自定义的名字（REV-26；内置四值不变）。超时**不自动杀**：写 `phase_timeout` 事件 + mail 通知该 centurion 的上级，由上级裁决（steer 续期 / abort 打断当前轮且 child 仍在 / retire 收队并进 aborted）。确定性优先，避免意外屠杀。
 
 ### 7.5 DONE 收队流（全在 centurion 进程内自动编排）：
 1. verifying 全绿 → supervisor 迁移 phase=done（事件）
@@ -413,6 +413,7 @@ npm test -- --filter <scope>
 
 **`OBSOLETE` 判据（冻结，#333）**：仅 `kind === "notice"` 且 `subject` 以 `Phase timeout:` 开头的邮件可被作废（kind 闭集是 `question|report|handoff|notice`，**没有** `instruction`；其它 kind **永不**自动作废——一个问题 / 一份交接过不过期由人判，#338 M4）。
 “该 phase” 取自产生该通知的 `phase_timeout` 事件（`data.phase`/`data.phaseSince`），**不解析正文**：发件节点当前 `phase`/`phase_since` 与之不同（含之后重新进入同一 phase）或**已结束** ⇒ 已过期。
+**复活 = 新 stint（#357/REV-26）**：`continue` 唤醒已结束团队时 `phase_since` 前移到复活时刻（相位不变），产生旧通知的 `phase_timeout` 事件与当前 `phase_since` 因而不同 ⇒ 旧通知判 `OBSOLETE`，而复活后的 stint 拥有自己的去重键，可再次告警。
 **「已结束」的判据是 `hasEnded`（#354）**：终态（`isTerminalNode`）**或** `status` 为 `settled`/`retired`。一个只做调查、从不调用 `legion_phase` 的团队，结局时 `phase`/`phase_since` 停在出生值，于是旧判据（只看相位）认为通知仍有效——这正是 #354 的形状。`reason` 文案不变（仍 `obsolete_after_phase_change`，事件闭集不动），只是覆盖面明确包含「在超时相位里就地结束」；`isTerminalNode` 本身**不**放宽（投递退信与孤儿扫描共用它）。
 求值两处：**投递前**（`PENDING→OBSOLETE`，不再注入，这是 #333 的根因路径）与 **tick 确认**（`ACCEPTED→OBSOLETE`，只改标签不回滚已注入的文本）。`DELIVERED` 优先于 `OBSOLETE`：确实消费过的事实不会被改写成“失效”。
 
@@ -584,3 +585,4 @@ interface LegionEventBus {
 | 2026-11-01 | REV-23 | `messages.delivered` 由三值（0/1/2）收宽为**五值**（0 pending / 1 accepted / 2 bounced / 3 delivered / 4 obsolete），`LEGION_DB_USER_VERSION` 1→2，§4.2 的 `PRAGMA user_version` 随之改为 2（**schema 版本变更，按 §15-4 走修订**；但**无 DDL**——列仍是 `INTEGER NOT NULL DEFAULT 0`，五值域是写入方与读取方之间的语义约定，旧行的 `1` 直接按 `accepted` 解释、无需回填；旧账本也不会因此拿到 `idx_messages_rate`，同 REV-19）。同时补 §8.3.1（五值语义 + 迁移边 + `DELIVERED`/`OBSOLETE` 判据 + `prompt` 分支能力上限）并改写 §8.5（不再有「投递成功落 `delivered=1`」这句话）。语义变更要点：`intercepted` 从 `INJECTED + console.warn` 改为 `BOUNCED`（`reason: intercepted_by_input_handler`）；新增 `DELIVERED`（session 最后 20 个 turn 里与注入文本**完全相等**才算）；新增 `OBSOLETE`（仅对 `Phase timeout:` notice，且只在其 phase 已结束/节点已终态时）。**事件闭集不变（仍 16 种）**：`OBSOLETE` 复用 `mail_bounced` 并带 `reason: obsolete_after_phase_change`，`DELIVERED` 复用 `mail_delivered`，`ACCEPTED` 不写新事件（`sendMail` 的 `mail_sent` 已是该事实）。子契约：`docs/contracts/mailbox-delivery-v1.md`。触发：issue #322（信箱缺 accepted/delivered/bounced 三态）与 #333（相位超时 action-needed 到达即失效）。 |
 | 2026-11-02 | REV-24 | §8.3.1 按 #338 的对抗式 review 收紧（**语义修订，非 schema / 非事件类型变更**，按 §15-1 追加）：① `DELIVERED` 判据去掉「或与邮件 **body** 完全相等」这一分支，只认注入信封（`formatMail`）——body 不带 message id，任务卡/别封信/被引用原文都能与它整串相等，误判面过大；② 确认扫描由「每 tick 取最老 20 封」改为 **per-seam 游标轮转**（`id > cursor`，扫到尾回绕）——旧写法下 20 封无法判定的 `ACCEPTED` 会永久占住窗口，确认与作废两条通道一起停摆（死锁，不是延迟）；③ `OBSOLETE` 条款里的 `kind === "instruction"` 更正为「只有 `kind === "notice"` 可作废」，kind 闭集仍是 `question|report|handoff|notice`（`instruction` 从来不存在）；④ 补 root 收件人的证据来源与能力上限：`createRootLegion` 建 root 行时写入本进程会话文件，使发给 root 的邮件可确认到 `DELIVERED`；`run.json` 不记录该文件，故 `rebuildLegionDb` 重建的账本里仍停在 `ACCEPTED`；⑤ §8.5 的 `mailboxStats` 改为「导出 + 单测，目前无消费者」，不再声称已接 `/legion` 状态与 doctor。触发：PR #338 review（4 major + 6 minor）。 |
 | 2026-11-02 | REV-25 | §8.3.1 OBSOLETE 判据：「该团队已结束」由 `isTerminalNode`（failed / done / failed / aborted 相位）放宽为 `hasEnded`（上者 ∪ `status ∈ {settled, retired}`）。原因：在超时那个相位里就地收队的团队（调查型团队、或在 `reviewing` 内完成返工的团队）此前的通知会在收队后仍投递（#354，实测 3/3 命中）。事件闭集不变（16），`reason` 文案仍 `obsolete_after_phase_change`，`isTerminalNode` 不放宽。 |
+| 2026-11-02 | REV-26 | 三条**语义修订**（非 schema / 非事件类型 / 非权限变更，按 §15-1 追加）。① **§4.2 `phase_since` 的含义收窄为「当前相位 *stint* 的起始时刻」**：#357 之前它只能是「当前相位的起始时刻」，因为相位一迁才写；`continue` 复活一个已结束的团队时相位**不动**（工作从原地继续）而 `phase_since` 前移到复活时刻，好让「一个 stint 一次 `phase_timeout`」的去重键（`hasPhaseTimeoutForSince`）与 `Phase timeout:` 通知的过期判据都按新 stint 计算——否则一个超时过的团队复活后永远静默。② **§8.3.1 的 `OBSOLETE` 触发多一条来源：复活即令旧 stint 的通知作废**——判据仍是「`phase`/`phase_since` 与产生该通知的 `phase_timeout` 事件不同」（复活前移了 `phase_since`），`reason` 文案仍 `obsolete_after_phase_change`，事件闭集仍 **16**，未新增 event type / mail 主题前缀。③ **§7.4 的时钟来源扩为四级**：显式 operator 设置（`subagents.legion.phaseTimeouts`，只认**显式写下**的值）→ 卡片 `phases[].timeoutMs` → 内置四阶段默认 → 0（永不告警）；相位名不再要求是内置四名（声明式状态机 §7.1），内置四阶段的**数值逐字不变**（planning 15m / implementing 60m / reviewing 30m / verifying 15m），超时仍只报告、永不杀。**④ 行为变更（同一 PR 的 major 1 修复，随本修订一并记录）**：此前 `index.ts` 把 `DEFAULT_LEGION_SETTINGS` 的 `phaseTimeouts` 展开成普通对象，于是「设置项已存在」与「operator 显式设置过」不可区分，`settings.phaseTimeouts[phase] ?? machineTimeout(...)` 的左侧永远非空——卡片为**内置相位名**声明的 `timeoutMs` 被静默忽略（探针：`implementing` 设置项 3600000 / 卡片 300000 → 实际 3600000）。现在显式性由 `legionExplicitFields` 判定（`legionSettingsForRun` 把默认值填进来时不再冒充决定），因此**声明了内置名 `timeoutMs` 的卡片从此真的生效**：这是本修订里唯一可观察的行为变更，也是声明式状态机 v5 契约 `docs/contracts/declarative-phase-machine-v5.md` 早已写下的顺序第一次与行为一致。触发：PR #363 对抗式 review 的 major 1/2（契约漂移：改动已落库而修订日志未追加，同 #355 的形状）。 |
