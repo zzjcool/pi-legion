@@ -49,6 +49,7 @@ import {
 	DEFAULT_PHASE_MACHINE,
 	findPhase,
 	isTerminalIn,
+	machineTimeout,
 	normalizePhaseMachine,
 	type PhaseMachine,
 } from "../legion/phase-machine.ts";
@@ -519,32 +520,58 @@ export class LegionPostman {
 	}
 
 	/**
-	 * NOT custom-phase aware yet — follow-up issue on purpose (#350 review minor 2).
+	 * Which phase of THIS team's machine judges success (#358).
 	 *
-	 * Two things here only speak the built-in vocabulary: the `phase !== "verifying"`
-	 * test above hard-codes a phase name a declared machine need never use, and the
-	 * `evaluatePhaseTransition` call below passes no `machine`, so a team whose card
-	 * declares its own verification phase can never reach the state machine's `done`
-	 * path. `checkOwnPhaseTimeout` (just below) has the sibling hole:
-	 * `DEFAULT_PHASE_TIMEOUTS[phase] ?? 0` makes a custom phase's advisory clock 0, so
-	 * it never warns.
+	 * The old test was `node.phase !== "verifying"`, a name a declared machine need
+	 * never use, so a card whose workflow ends in `ship` could never take the
+	 * supervisor's verified-completion path. The machine declares the answer: a phase
+	 * with an exit to `done` judges success. Among those, an edge that requires
+	 * `verification_passed` is the most precise statement of "this is where the
+	 * verdict decides", and otherwise the LAST declared candidate wins — machines list
+	 * their phases in pipeline order, and the deepest phase that can complete a team is
+	 * the one that completes it (that rule alone picks `verifying` in the built-in
+	 * machine).
 	 *
-	 * Deliberately NOT fixed here: #350's scope is where a team is BORN, and both
-	 * repairs move behaviour on phases this PR does not otherwise touch. Follow-up:
-	 * #358 `bug(legion): 自定义相位上的 verifying 收尾与相位超时告警恒不生效`.
+	 * Fallback: a team with NO declared machine, or a machine with no exit to `done`
+	 * at all, keeps the historical literal `verifying` — the behaviour every team had
+	 * before this was derived, byte for byte.
+	 */
+	private successPhase(): string {
+		const machine = this.machine;
+		if (!machine) return "verifying";
+		const exits = machine.phases.filter((phase) => phase.next.some((rule) => rule.to === "done"));
+		if (exits.length === 0) return "verifying";
+		const gated = exits.filter((phase) =>
+			phase.next.some((rule) => rule.to === "done" && (rule.require ?? []).includes("verification_passed")),
+		);
+		const candidates = gated.length > 0 ? gated : exits;
+		return candidates[candidates.length - 1]!.id;
+	}
+
+	/**
+	 * Complete a team whose contract verification passed (#358).
+	 *
+	 * Both halves of this path used to speak only the built-in vocabulary: the phase
+	 * test hard-coded `verifying`, and `evaluatePhaseTransition` was called without a
+	 * `machine` — the same mistake #351 fixed on the abort path, and one that answers
+	 * `invalid_phase` for a phase the team's own declaration named. The phase now comes
+	 * from {@link successPhase} and the machine is forwarded, so a declared workflow
+	 * reaches `done` through exactly the edges its card asked for.
 	 */
 	private finalizeVerifiedTeamIfReady(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
-		if (!node || node.phase !== "verifying" || verificationPassed(node) !== true) return;
+		const successPhase = this.successPhase();
+		if (!node || node.phase !== successPhase || verificationPassed(node) !== true) return;
 		const children = getChildren(this.db, node.id);
 		if (children.some((child) => !isPhaseTerminalChild(child.status))) return;
 		const decision = evaluatePhaseTransition({
-			from: "verifying",
+			from: successPhase,
 			to: "done",
 			reworkCount: node.reworkCount,
 			children: children.map(({ id, role, status }) => ({ id, role, status })),
 			verificationPassed: true,
 			actorRole: "supervisor",
+			...(this.machine ? { machine: this.machine } : {}),
 		}, () => timestamp);
 		if (!decision.allowed) return;
 		updateNode(this.db, node.id, { phase: "done", phaseSince: decision.phaseSince }, () => timestamp);
@@ -552,14 +579,35 @@ export class LegionPostman {
 		this.sendSelfMessage("All contract verification passed. Collect every child result, squash the subtree work, open an MR/PR for your parent, and report the URL. Do not merge.");
 	}
 
+	/**
+	 * Warn the parent when this team has been in one phase too long.
+	 *
+	 * #358: the advisory clock used to be `settings.phaseTimeouts[phase] ??
+	 * DEFAULT_PHASE_TIMEOUTS[phase] ?? 0`, so a phase named by the team's own card had
+	 * no clock at all and `PhaseDefinition.timeoutMs` (`machineTimeout`) was dead code.
+	 * The machine's declared value now sits between the two, in this order:
+	 *
+	 *   1. `settings.phaseTimeouts[phase]` — an operator override still wins; a card
+	 *      must not be able to take the operator's clock away.
+	 *   2. `machineTimeout(machine, phase)` — the team's own declaration.
+	 *   3. `DEFAULT_PHASE_TIMEOUTS[phase]` — the built-in four, through
+	 *      `checkPhaseTimeout`'s own fallback.
+	 *   4. nothing → 0 → never warns (the pre-existing meaning of 0, unchanged).
+	 */
 	private checkOwnPhaseTimeout(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
 		if (!node?.phase || this.isTerminalPhaseOf(node.phase)) return;
+		const machineMs = this.machine ? machineTimeout(this.machine, node.phase) : undefined;
+		// A phase name the built-in table knows keeps its built-in clock unless either
+		// source above says otherwise; a name it does not know had no clock before.
+		const declaredMs = this.settings.phaseTimeouts?.[node.phase] ?? machineMs;
 		const timeout = checkPhaseTimeout({
 			phase: node.phase,
 			phaseSince: node.phaseSince,
 			now: timestamp,
-			timeouts: this.settings.phaseTimeouts,
+			timeouts: declaredMs === undefined
+				? this.settings.phaseTimeouts
+				: { ...this.settings.phaseTimeouts, [node.phase]: declaredMs },
 		});
 		if (!timeout.timedOut || hasPhaseTimeoutForSince(this.db, node.id, node.phaseSince)) return;
 		const event = appendEvent(this.db, node.id, "phase_timeout", {
