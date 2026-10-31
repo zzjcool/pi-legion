@@ -115,6 +115,11 @@ root 行的 `session_file` 仍是 NULL —— 这些账本里发给 root 的邮�
 
 - "该 phase" 取自产生这条通知的 `phase_timeout` 事件（`data.phase` / `data.phaseSince`），**不解析正文**：
   `phase` 不同、或 `phase_since` 不同（之后重新进入同一相位）都算离开。读不到那条事件 → 保持 `ACCEPTED`，绝不猜。
+- **复活 = 新 stint（#357）**：`continue` 唤醒一个已经结束的团队时，`Orchestrator.reserveNode` 的 resume 分支把
+  `phase_since` 前移到复活时刻，并写一条 `phase_change`（`from === to`、`data.reason: "revived"`，**不新增 event
+  type**、不动 `Phase timeout:` 前缀）。相位名不变（工作从原地继续），变的只有 clock：上一 stint 的通知继续判
+  `OBSOLETE`，而复活后的 stint 拥有自己的 `phase_since`，因此 `hasPhaseTimeoutForSince` 不会把它当成旧那一轮
+  ——同一团队第二次超时仍会产生 `phase_timeout` 并再次通知。未复活时仍然一个 stint 只告警一次。
 - **「已结束」= `hasEnded`（#354）**：终态（`isTerminalNode`）**或** `status ∈ {settled, retired}`。只做调查、
   从不迁移相位的团队，结局时 `phase`/`phase_since` 仍是出生值，旧判据因而永远判不出「过期」——通知在团队
   收队 30 分钟后才投递到 root。`reason` 文案不变（仍 `obsolete_after_phase_change`，事件闭集仍是 16），
