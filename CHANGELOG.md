@@ -81,6 +81,33 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **`/legion` 的 tok/s 图表一帧只分桶一次，且只算本帧画得到的 series (#346).** `drawChart` 先给图体
+  分桶、`computeStats` 又用**完全相同的参数**再分一遍，200 节点下一帧白烧 ≈1.2ms 与 ≈0.6MB 垃圾；
+  同时 `RateSampler.buckets()` 会遍历**每一个曾经记录过**的 series（`series` 永无删除点），
+  结束的 child 每帧照算。现在：`chartBuckets(data, count, window?)` 是唯一入口，结果以第三个参数
+  传给 `computeStats(data, buckets, series?)`（不传时退回老签名，语义逐字节一致）；
+  `buckets()` 接受 `BucketOptions.onlyNodeIds`，只遍历 `visibleRateNodeIds(data.nodes)`——settled 行
+  只要还在画就照旧贡献，不在帧里的 series 保留原始采样但不参与本帧计算；同时不再为每个 series
+  新建 `plotW` 长度的临时数组，并对「最后一个采样点早于首桶窗口左沿」的 series 直接跳过
+  （`interpolate` 两端夹取 ⇒ 每桶 Δ 恒为 0，可证明为同一结果）。图表的 `avg` 也跟同一份可见集走：
+  不可见 series 不再把它抬起来（实测 40 个已结束 ghost 把 300 tok/s 抬到 1.5k）。
+  实测（120×40 / 200 节点，真 `Theme(dark)`，50 帧 × 3 轮）：帧 median 6.5ms → 4.4ms（−32%）、
+  p95 9.1ms → 4.8ms（−40%）、`drawChart` 2.65ms → 0.6ms（−77%）、`buckets()` 1.24ms → 0.47ms；
+  帧分配 4214KB → 3306KB、`drawChart` 1432KB → 530KB。图表外观与 `/legion` 其余输出不变。
+  契约：`docs/contracts/legion-chart-frame-buckets-v1.md`。
+
+- **`finished` 完成结果缓存有了有界淘汰：最多 16 条 / 4MB 驻留 output 文本，淘汰只丢文本、留结果 (#349).**
+  这个 one-round 缓存原本为每个完成过的 child 留一份**输出全文**且永不淘汰——实测 50 child ×
+  204,800B ⇒ GC 后驻留 10.0MB，长会话按 child 数单调增长。现在按 LRU 只让最新的 16 条（且合计
+  ≤4MB）保留全文，更旧的条目剥成 4000 字符预览（≤8KB），但**条目本身与
+  `runId`/`round`/`execution`/`acceptance`/`outputFile` 全部保留**——删条目会把 `collect`/`wait`
+  变成 `missing`（结果丢失）并抹掉本轮的 claim 键。命中被淘汰的条目时从
+  `snapshot.outputFile` 重新读回全文，因此 `wait`/`collect` 在淘汰前后返回**同样的结果**。
+  没有 `outputFile` 的条目（宿主自备 collect、写盘失败）是 **pinned**，按契约不淘汰，字节数由
+  `noticeQueueStats().finished.pinnedBytes` 报出（新增 `finished` 计数块：`entries` /
+  `residentBytes` / `stripped` / `pinnedBytes`）。实测：50 child × 204,800B 驻留 10.02MB → **3.53MB**
+  （−65%），重新 track 全部后回落到基线。契约：`docs/contracts/finished-cache-eviction-v1.md`。
+
 - **`messages.delivered` is a five-value domain now — `pending / accepted / bounced / delivered / obsolete`
   — and `LEGION_DB_USER_VERSION` moves 1 → 2 (#322).** The old `INJECTED(1)` claimed a delivery the ledger
   never observed: it was written the moment a send call returned, which covers `queued` (waiting for the

@@ -5759,3 +5759,123 @@ test("claim D2/#320-2: collectChild's JOB-branch bail still lands the notice (li
 	assert.equal(messages.length, 1, "exactly one notice, never two");
 	runtime.dispose();
 });
+
+// ───────────────── #349: the finished cache keeps results, not full texts ─────────────────
+
+/** Track + watch `count` children to completion, each with its own persisted output file. */
+async function finishChildren(
+	runtime: ReturnType<typeof createSessionRuntime>,
+	count: number,
+	dir: string,
+	opts: { outputSize: number; persist?: boolean; prefix?: string } = { outputSize: 1_000, persist: true },
+): Promise<string[]> {
+	const outputs: string[] = [];
+	for (let i = 0; i < count; i++) {
+		const name = `child-${i}`;
+		const output = `${name}:${"x".repeat(opts.outputSize)}`;
+		outputs.push(output);
+		const outputFile = join(dir, `${name}.output.md`);
+		if (opts.persist !== false) writeFileSync(outputFile, `${output}\n`);
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/w.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => snapshot(opts.persist === false ? { output } : { output, outputFile }),
+		});
+		runtime.watch(name);
+		await waitFor(() => runtime.activeJobs().length === 0, `${name} settled`);
+	}
+	return outputs;
+}
+
+test("#349: the finished cache strips old output text and keeps every result's metadata", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		await finishChildren(runtime, 20, dir, { outputSize: 8_000 });
+
+		const stats = runtime.noticeQueueStats().finished;
+		assert.equal(stats.entries, 20, "eviction drops TEXT, never a result");
+		assert.equal(stats.stripped, 4, "the 4 oldest entries are the ones over the 16-entry bound");
+		// 16 whole entries + 4 heads. The exact bound is FINISHED_CACHE_MAX_ENTRIES heads.
+		assert.ok(stats.residentBytes <= 16 * 8_100 + 4 * 4_100, `resident ${stats.residentBytes}`);
+
+		// The oldest entry's result is still a result: metadata intact and readable.
+		const oldest = await runtime.consumeCollect("child-0");
+		assert.ok(oldest, "an evicted entry is still a cache hit");
+		assert.equal(oldest.snapshot.execution.status, "success");
+		assert.equal(oldest.snapshot.acceptance.status, "attested");
+		assert.equal(oldest.snapshot.outputFile, join(dir, "child-0.output.md"));
+		runtime.dispose();
+	});
+});
+
+test("#349: a stripped result is rehydrated from disc — wait returns the same text", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		const outputs = await finishChildren(runtime, 20, dir, { outputSize: 200_000 });
+		assert.equal(runtime.noticeQueueStats().finished.stripped, 4, "four 200KB texts were dropped");
+
+		// End to end: the evicted result comes back whole, not as a head, and not as
+		// "missing". `wait` is the seam the parent model actually reads.
+		const [hit] = await runtime.wait(["child-0"], { timeoutMs: 100 });
+		assert.equal(hit?.snapshot?.output, outputs[0], "the same full output, re-read from outputFile");
+		assert.equal(hit?.snapshot?.execution.status, "success");
+		assert.equal(hit?.snapshot?.outputFile, join(dir, "child-0.output.md"));
+		const collect = await runtime.consumeCollect("child-0");
+		assert.equal(collect?.snapshot.output, outputs[0], "and through the collect seam too");
+		runtime.dispose();
+	});
+});
+
+test("#349: a result with no outputFile is pinned — its text is never dropped", async () => {
+	const runtime = createSessionRuntime({ sendMessage() {} });
+	// No persisted output: stripping this text would lose it for good, so the
+	// contract forbids evicting it (only the count is observable).
+	await finishChildren(runtime, 20, "/nonexistent", { outputSize: 8_000, persist: false });
+	const stats = runtime.noticeQueueStats().finished;
+	assert.equal(stats.entries, 20);
+	assert.equal(stats.stripped, 0, "nothing to rebuild from ⇒ nothing was dropped");
+	assert.equal(stats.pinnedBytes, stats.residentBytes, "the whole footprint is pinned, and says so");
+	runtime.dispose();
+});
+
+test("#349: the byte bound strips text even when the entry count is small", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		const outputs = await finishChildren(runtime, 3, dir, { outputSize: 2_000_000 });
+		const stats = runtime.noticeQueueStats().finished;
+		assert.equal(stats.entries, 3, "3 entries is well under the 16-entry bound");
+		assert.equal(stats.stripped, 1, "6MB of text does not fit the 4MB budget");
+		assert.ok(stats.residentBytes <= 4 * 1024 * 1024 + 4_100, `resident ${stats.residentBytes}`);
+		const [hit] = await runtime.wait(["child-0"], { timeoutMs: 100 });
+		assert.equal(hit?.snapshot?.output, outputs[0], "the 2MB text is re-read on demand");
+		runtime.dispose();
+	});
+});
+
+test("#349: re-tracking every finished child returns the cache to baseline", async () => {
+	await withTempDir(async (dir) => {
+		const runtime = createSessionRuntime({ sendMessage() {} });
+		await finishChildren(runtime, 20, dir, { outputSize: 200_000 });
+		assert.ok(runtime.noticeQueueStats().finished.residentBytes > 0, "the cache holds text while it is the only copy");
+		// The P4 reverse proof, made deterministic: evicting every entry returns the
+		// footprint to where it started, i.e. the bytes above were the cache's.
+		for (let i = 0; i < 20; i++) {
+			runtime.track({
+				name: `child-${i}`,
+				runId: "r-1",
+				agent: "worker",
+				sessionFile: "/tmp/w.jsonl",
+				timeoutMs: 1_000,
+				collect: async () => new Promise<CollectSnapshot>(() => {}),
+			});
+		}
+		const after = runtime.noticeQueueStats().finished;
+		assert.equal(after.entries, 0);
+		assert.equal(after.residentBytes, 0);
+		assert.equal(after.stripped, 0);
+		runtime.dispose();
+	});
+});
