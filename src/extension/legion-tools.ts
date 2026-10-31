@@ -1463,7 +1463,7 @@ async function notifyParent(db: DatabaseSync, node: LegionNode, text: string, se
 	if (!node.parentId) return;
 	// Phase/timeout events are already durable facts. If mail is rate-limited,
 	// do not mislabel the failed notification as another phase timeout.
-	const { outcome, messages } = sendInternalNotice(db, {
+	const { messages } = sendInternalNotice(db, {
 		fromNode: node.id,
 		to: "parent",
 		subject: `Legion update: ${node.name}`,
