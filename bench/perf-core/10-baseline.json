@@ -60,5 +60,6 @@
       "medianMs": 4.522,
       "p95Ms": 5.257
     }
-  }
+  },
+  "metricsNote": "captured at the S0 commit, when a frame still allocated its own Canvas(W,H) per frame — i.e. the pre-#364-S3 render path. Reported for context only; the gates are the digests plus the §0 limits applied to the current frame."
 }

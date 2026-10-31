@@ -2696,3 +2696,62 @@ test("#364: the roleColor memo is keyed on the role name", () => {
 	assert.equal(roleColor("ROOT"), "text");
 	assert.equal(roleColor("designer-x"), "role:designer-x", "an unseen role is not aliased to a cached one");
 });
+
+test("#364: Canvas.reset() blanks every field in place (A5, contract I5)", () => {
+	const cv = new Canvas(3, 2);
+	cv.set(0, 0, "a", "role:worker", { bold: true, inverse: true });
+	cv.set(2, 1, "b", "accent");
+	const held = cv.get(0, 0)!;
+	cv.reset();
+	assert.equal(cv.get(0, 0), held, "reset keeps the cell objects: cells stay a live view (I5)");
+	assert.deepEqual({ ...held }, { ch: " ", color: undefined, bold: undefined, inverse: undefined }, "no ch/color/bold/inverse survives");
+	assert.deepEqual([...cv.roles()], [], "the painted-role table is emptied with the grid (T5)");
+	assert.deepEqual(cv.toPlain(), ["   ", "   "]);
+	assert.deepEqual(cv.toLines(ansiTheme), ["   ", "   "]);
+	// A reset canvas paints exactly like a fresh one.
+	const fresh = new Canvas(3, 2);
+	for (const [x, y, ch, color] of [[1, 0, "z", "role:scout"]] as const) {
+		cv.set(x, y, ch, color);
+		fresh.set(x, y, ch, color);
+	}
+	assert.deepEqual(cv.toLines(ansiTheme), fresh.toLines(ansiTheme));
+	assert.deepEqual([...cv.roles()], [...fresh.roles()]);
+});
+
+test("#364: the production view reuses one canvas and carries nothing over", () => {
+	// The A5 reuse is the only place a canvas outlives a frame. Its hazard is the
+	// one #362 already fixed inside `set()`: a field the new frame does not write
+	// must not survive. Proven the only way it can be: paint a full frame, then a
+	// different one, and compare against a view that started with a fresh grid.
+	const big = scenario(600, 12);
+	const small = scenario(600, 3);
+	const withBig = { ...big, rate: 0 };
+	const withSmall = { ...small, rate: 0 };
+	let current = withBig;
+	const tui = { requestRender(): void {}, terminal: { rows: 24 } };
+	const view = createLegionViewFactory({ getData: () => current })(tui, ansiTheme, {}, () => {});
+	const first = view.render(80);
+	current = withSmall;
+	const reused = view.render(80);
+	const fresh = createLegionViewFactory({ getData: () => withSmall })(tui, ansiTheme, {}, () => {}).render(80);
+	assert.notDeepEqual(first, fresh, "positive control: the two frames really differ");
+	assert.deepEqual(reused, fresh, "a reused canvas paints the byte-identical frame a fresh one does");
+	// And a resize is not reused at all (the size check is what makes that safe).
+	const resized = view.render(120);
+	const resizedFresh = createLegionViewFactory({ getData: () => withSmall })(tui, ansiTheme, {}, () => {}).render(120);
+	assert.deepEqual(resized, resizedFresh, "a different width paints into a correctly sized grid");
+	assert.equal(resized.length, 24);
+	view.dispose();
+});
+
+test("#364: renderLegionView only reuses a canvas of the same size", () => {
+	const { nodes, sampler, now } = scenario(600, 3);
+	const data = { nodes, sampler, now, rate: 0 };
+	const wrong = new Canvas(10, 5);
+	const out = renderLegionView(data, initialViewState(), 60, 20, wrong).canvas;
+	assert.notEqual(out, wrong, "a smaller canvas is not grown in place");
+	assert.equal(out.width, 60);
+	assert.equal(out.height, 20);
+	const right = new Canvas(60, 20);
+	assert.equal(renderLegionView(data, initialViewState(), 60, 20, right).canvas, right, "the same size is reused");
+});

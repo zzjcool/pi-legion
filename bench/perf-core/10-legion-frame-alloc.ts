@@ -170,11 +170,20 @@ function scenario(variant: Variant): ViewData {
 	return { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
 }
 
-/** `renderLegionView` + `toLines` — exactly what `createLegionViewFactory().render()` builds. */
+/**
+ * The production frame, exactly as `createLegionViewFactory().render()` builds it:
+ * ONE canvas held across frames (repainted through `reset()`, #364 A5) +
+ * `toLines(theme)`. Before #364 S3 that grid was a fresh `new Canvas(W, H)` every
+ * frame, which is what the pre-change numbers in `10-baseline.json` paid.
+ *
+ * `paintPageFloor` is deliberately outside the measurement: #308 freezes it and
+ * the visible-output golden anchors the same canvas-level surface, so wrapping it
+ * in would only add bytes no change here may touch.
+ */
 function makeFrame(data: ViewData, cols: number, rows: number, state = initialViewState()): () => Canvas {
+	const canvas = new Canvas(cols, rows);
 	return () => {
-		const canvas = renderLegionView(data, state, cols, rows).canvas;
-		canvas.toLines(theme);
+		renderLegionView(data, state, cols, rows, canvas).canvas.toLines(theme);
 		return canvas;
 	};
 }
@@ -307,6 +316,7 @@ interface Components {
 function measureComponents(data: ViewData, cols: number, rows: number): Components {
 	const layout = computeLayout(cols, rows, { logEvents: buildLog(data.nodes).length });
 	const reuse = new Canvas(cols, rows);
+	const state = initialViewState();
 	const galaxy = (): unknown => {
 		const rect = frame(reuse, layout.galaxy, "galaxy", false);
 		drawGalaxy(reuse, rect, data, undefined);
@@ -319,19 +329,21 @@ function measureComponents(data: ViewData, cols: number, rows: number): Componen
 	};
 	const painted = makeFrame(data, cols, rows)();
 	const toLines = (): unknown => painted.toLines(theme);
-	const canvasKB = frameAllocKB(() => new Canvas(cols, rows));
-	const renderViewKB = frameAllocKB(() => renderLegionView(data, initialViewState(), cols, rows));
-	const galaxyKB = frameAllocKB(galaxy);
-	const chartKB = frameAllocKB(chart);
-	const toLinesKB = frameAllocKB(toLines);
-	const otherKB = round(renderViewKB - canvasKB - galaxyKB - chartKB);
-	const sumKB = round(canvasKB + galaxyKB + chartKB + otherKB + toLinesKB);
+	// What one `new Canvas(W, H)` still costs — reported, not paid: the production
+	// frame keeps its grid (#364 S3 / contract A5).
+	const canvasKB = round(frameAllocKB(() => new Canvas(cols, rows)));
+	const renderViewKB = frameAllocKB(() => renderLegionView(data, state, cols, rows, reuse));
+	const galaxyKB = round(frameAllocKB(galaxy));
+	const chartKB = round(frameAllocKB(chart));
+	const toLinesKB = round(frameAllocKB(toLines));
+	const otherKB = round(renderViewKB - galaxyKB - chartKB);
+	const sumKB = round(renderViewKB + toLinesKB);
 	return {
-		canvasKB: round(canvasKB),
+		canvasKB,
 		renderViewKB: round(renderViewKB),
-		galaxyKB: round(galaxyKB),
-		chartKB: round(chartKB),
-		toLinesKB: round(toLinesKB),
+		galaxyKB,
+		chartKB,
+		toLinesKB,
 		otherKB,
 		sumKB,
 		residualKB: round((renderViewKB + toLinesKB) - sumKB),
@@ -410,7 +422,9 @@ interface Baseline {
 	agents: number;
 	method: string;
 	digests: Record<string, Digest>;
+	/** The numbers on the capture box at capture time — context, never a gate. */
 	metrics: Record<string, { frameAllocKB: number; medianMs: number; p95Ms: number }>;
+	metricsNote: string;
 }
 
 const baseline: Baseline = {
@@ -423,6 +437,8 @@ const baseline: Baseline = {
 		"frameAllocKB = median of 20 (gc; heapUsed; renderLegionView(...).canvas.toLines(theme); heapUsed) single-frame deltas; " +
 		"medianMs/p95Ms = 5 rounds x 50 frames, nearest-rank p95; digests = sha256 of toPlain().join(\"\\n\") / toLines(real dark).join(\"\\n\")",
 	digests,
+	metricsNote:
+		"captured at the S0 commit, when a frame still allocated its own Canvas(W,H) per frame — i.e. the pre-#364-S3 render path. Reported for context only; the gates are the digests plus the §0 limits applied to the current frame.",
 	metrics: Object.fromEntries(
 		Object.entries(frames).map(([tag, cell]) => [tag, { frameAllocKB: cell.frameAllocKB, medianMs: cell.medianMs, p95Ms: cell.p95Ms }]),
 	),
