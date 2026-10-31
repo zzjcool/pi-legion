@@ -78,14 +78,19 @@ const REGISTRY_CACHES = new Map<string, RegistryCache>();
 const MAX_CACHED_RUN_ROOTS = 64;
 
 function registryCacheFor(rootDir: string): RegistryCache {
-	let cache = REGISTRY_CACHES.get(rootDir);
+	// Canonicalize: the same runs directory is reachable as an absolute path and
+	// as a path built from `cwd` (or through a symlink), and two such spellings
+	// must share one cache — otherwise a write through one is invisible to the
+	// other until the 1s TTL expires (#344 review).
+	const key = path.resolve(rootDir);
+	let cache = REGISTRY_CACHES.get(key);
 	if (cache) return cache;
 	// Dropping every entry at once is safe — a dropped snapshot can only cause a
 	// rescan, never a stale read — and keeps a session that walks through dozens
 	// of worktree roots from growing this map without bound.
 	if (REGISTRY_CACHES.size >= MAX_CACHED_RUN_ROOTS) REGISTRY_CACHES.clear();
 	cache = {};
-	REGISTRY_CACHES.set(rootDir, cache);
+	REGISTRY_CACHES.set(key, cache);
 	return cache;
 }
 

@@ -90,12 +90,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   97% of a warm `status`, 110ms at 1000 synthetic runs, linear and unbounded apart from the 14-day
   retention prune. The scan is now a FALLBACK: the scope run is read with one `readRun` (0.05ms) and
   the registry is consulted only when the name might live in another run — which is exactly the
-  #312 case that must report or refuse instead of adopting. On this repo's 365-run corpus one
-  control action went 18.4ms → 0.04ms, and on 1000 synthetic runs 31.5ms → 0.04ms, with **zero**
+  #312 case that must report or refuse instead of adopting. On this repo's 365-run corpus one name
+  resolution went 18.4ms → 0.04ms, and on 1000 synthetic runs 31.5ms → 0.04ms, with **zero**
   `listRuns` calls for a scoped hit. The fallback scan itself is cached per runs directory: a
   process-wide snapshot (shared by every `RunStore` instance on that root, since the tool surface
   builds one per call) invalidated by the directory's `mtimeMs`, by any write this process performs
-  (`createRun` / `updateRun` / `updateChild` / `prune` — all funnel through `writeRun`), and, for a
+  (`createRun` / `updateRun` / `updateChild` — all funnel through `writeRun` — plus `prune`'s explicit invalidation), and, for a
   record another process rewrote in place with no directory mtime to show for it, by a 1s TTL that
   tests drive through the store's injectable clock. Cold scans are unchanged (21.2ms at 365 real
   runs, 34ms at 1000 synthetic on both sides of this change); a repeat scan is 0.018ms / 0.012ms.

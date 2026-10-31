@@ -2722,7 +2722,11 @@ async function reviveChild(
 		// and overstate how much the child achieved under the current budget.
 		const resumedChild =
 			orchestrator.childrenSnapshot().find((entry) => entry.name === handle.name) ??
-			found.child;
+			// #344 review: `found.child` may be an element of the process-wide
+			// `listRuns` snapshot, so mutating it in place would poison the cache
+			// until the next write. The fallback is latent (launch always registers
+			// the child), but a copy costs nothing and keeps the invariant local.
+			{ ...found.child };
 		// Read the verdict from `found.child`, NOT the orchestrator's record: `launch`
 		// clears `previous.execution` before returning (it is a relaunch), and
 		// `found` is a freshly parsed copy from `store.listRuns()`, so the pre-resume
