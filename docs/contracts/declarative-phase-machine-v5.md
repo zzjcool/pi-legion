@@ -109,6 +109,24 @@ current phase name, the retire is forced anyway: the phase becomes `aborted`, on
 set stays closed at 16), and one warning names the node, the phase and the
 refusal. Silently dropping the abort is what made a team unstoppable.
 
+## The advisory clock and the completion gate (#358)
+
+Two supervisor-side paths used to read the built-in phase vocabulary only:
+
+- **The clock.** `checkOwnPhaseTimeout` resolved `settings.phaseTimeouts[phase] ??
+  DEFAULT_PHASE_TIMEOUTS[phase] ?? 0`. `DEFAULT_PHASE_TIMEOUTS` is keyed by the four
+  built-in names, so a declared phase got `0` — "never warn" — and `PhaseDefinition.timeoutMs`
+  was dead config. Resolution order is now: explicit operator override
+  (`settings.legion.phaseTimeouts`) → card `timeoutMs` → built-in default → `0` (never warn).
+  The operator stays first because a machine must not be able to take away a limit the
+  operator set. Timeouts still only *report*.
+- **The completion gate.** `finalizeVerifiedTeamIfReady` hard-coded `phase === "verifying"`
+  and evaluated `verifying → done` against the built-in machine. It now asks the machine
+  which phase judges success: a phase with an exit to `done`, preferring an edge that
+  requires `verification_passed`, otherwise the **last** declared candidate (declaration
+  order is pipeline order, and the built-in machine's answer is `verifying`). A team with
+  no declared machine, or a machine with no exit to `done`, keeps the literal `verifying`.
+
 ## Safety rails (unchanged)
 
 These are invariants, not configuration:
