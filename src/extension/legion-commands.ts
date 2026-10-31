@@ -727,6 +727,20 @@ export function registerLegionCommand(
 			if (classicTree) query = "";
 			const vizSnapshot = deps.runtime.vizSnapshot?.bind(deps.runtime);
 			if (!query && !classicTree && vizSnapshot) {
+				// #347: mount the page on the main screen instead of as a full-screen
+				// overlay. pi-tui composites *every* row of a visible overlay through
+				// `compositeTuiLine` (three `Intl.Segmenter` grapheme walks, cached by
+				// whole line, which a live frame never repeats); for this page — 56–68%
+				// non-ASCII braille/box/block cells — that was 57–70% of the frame and
+				// ~183µs/row for the whole terminal height. A main-screen mount (the
+				// mount the classic `--tree` view below already uses) replaces
+				// the base instead of stacking on it, so the page costs one plain
+				// `render()` and nothing else: measured 2.5–2.7× on the same component
+				// and data, with the frame's bytes within 3% (`bench/perf-core/09`).
+				// Esc/q still return to the session view: the host restores the editor
+				// it swapped out. The detail modal opened from inside the page stays a
+				// 75% floating overlay (`openLiveOverlay` below).
+				// Contract: `docs/contracts/legion-main-screen-mount-v1.md`.
 				await ctx.ui.custom(createLegionViewFactory({
 					getData: () => vizSnapshot(),
 					onStopNode: deps.stop ? (nodeId) => void confirmStopNode(ctx, nodeId) : undefined,
@@ -735,10 +749,7 @@ export function registerLegionCommand(
 							openLiveOverlay(pi, ctx.ui, ctx.cwd, liveOverlay, nodeId, overlayStop(ctx.ui));
 						}
 					},
-				}), {
-					overlay: true,
-					overlayOptions: { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 },
-				});
+				}), { overlay: false });
 				return;
 			}
 			if (query) {

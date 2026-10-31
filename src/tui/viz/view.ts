@@ -386,7 +386,11 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 		};
 		return {
 			render(width: number): string[] {
-				// Rendered as a full-screen overlay: own the whole terminal height.
+				// #347: the page is mounted on the main screen (`ui.custom(..., { overlay:
+				// false })`, see `docs/contracts/legion-main-screen-mount-v1.md`). A custom
+				// component is a layout leaf and is handed no viewport height, so the page
+				// asks for the whole terminal — the same `terminal.rows` self-sizing the
+				// classic tree view does in `src/tui/tree-view.ts`.
 				const rows = Math.max(6, tui.terminal.rows ?? 24);
 				panes = availablePanes(computeLayout(width, rows));
 				return paintPageFloor(theme, renderLegionView(options.getData(), state, width, rows).canvas.toLines(theme));
