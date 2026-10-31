@@ -7,6 +7,14 @@
  * getSubtree + attachUsageTotals; getTreeIdentity = getChildByName) against a
  * real WAL ledger, tracks real jobs with real session files, and times one tick.
  *
+ * It also asserts the #348 gate's per-tick cost, which is the claim the timing
+ * alone cannot make: a warm tick over unchanged session files must do exactly
+ * one `statSync` per row that carries a session file and **zero** parses. That
+ * is counted through `sessionFileCacheStats()` (`statCalls`, `misses`) rather
+ * than by patching `fs`: `import * as fs from "node:fs"` bindings are read-only
+ * in ESM, so a monkeypatch in this file would be invisible to `session.ts`.
+ * A violation prints in the JSON and then fails the bench.
+ *
  * Run: node --experimental-strip-types bench/perf-core/06-watch-tick.ts
  */
 
@@ -19,6 +27,7 @@ import type { DatabaseSync } from "../../src/legion/db.ts";
 import { insertNode, getSubtree, getChildByName } from "../../src/legion/nodes.ts";
 import { attachUsageTotals, upsertUsage } from "../../src/legion/usage.ts";
 import { createSessionRuntime } from "../../src/extension/runtime.ts";
+import { sessionFileCacheStats } from "../../src/shared/session.ts";
 
 function median(xs: number[]): number {
 	const s = [...xs].sort((a, b) => a - b);
@@ -59,7 +68,22 @@ function seed(nodes: number): Setup {
 	return { dir, db, dbPath };
 }
 
-interface TickResult { nodes: number; jobs: number; jobsWithNodeId: boolean; ms: number; identityLookups: number }
+interface TickResult {
+	nodes: number;
+	jobs: number;
+	jobsWithNodeId: boolean;
+	ms: number;
+	identityLookups: number;
+	/** Rows of one tick that carry a session file — the gate's expected call count. */
+	rowsWithSession: number;
+	/** `statSync` calls the gate made in one warm tick (#348). */
+	statCalls: number;
+	/** Full `parseSessionFile` calls in one warm tick: must be 0, nothing changed. */
+	parses: number;
+}
+
+/** Every gate assertion that failed; printed with the rows, thrown at the end. */
+const violations: string[] = [];
 
 function measure(nodeCount: number, jobCount: number, withNodeId: boolean): TickResult {
 	const setup = seed(nodeCount);
@@ -90,17 +114,48 @@ function measure(nodeCount: number, jobCount: number, withNodeId: boolean): Tick
 			} as Parameters<typeof runtime.track>[0]);
 		}
 		identityLookups = 0;
-		runtime.statusEntries(); // warm
+		runtime.statusEntries(); // warm: the first tick after a write pays the parse
+		// Every non-root row in this seed carries the same session file, so the
+		// expected gate traffic is exactly one call per non-root row (the root row
+		// has no sessionFile: `insertNode` above never sets one).
+		const rowsWithSession = runtime.statusEntries().filter((entry) => entry.name !== "root").length;
 		const samples: number[] = [];
 		let lookups = 0;
+		let statCalls = 0;
+		let parses = 0;
 		for (let r = 0; r < 5; r += 1) {
 			identityLookups = 0;
+			const before = sessionFileCacheStats();
 			const t0 = process.hrtime.bigint();
 			runtime.statusEntries();
 			samples.push(Number(process.hrtime.bigint() - t0) / 1e6);
+			const after = sessionFileCacheStats();
 			lookups = Math.max(lookups, identityLookups);
+			const statDelta = after.statCalls - before.statCalls;
+			const parseDelta = after.misses - before.misses;
+			statCalls = Math.max(statCalls, statDelta);
+			parses = Math.max(parses, parseDelta);
+			const label = `nodes=${nodeCount} jobs=${jobCount} nodeId=${withNodeId ? "yes" : "no"} tick#${r}`;
+			if (parseDelta !== 0) {
+				violations.push(`${label}: parsed ${parseDelta} unchanged session file(s) — the #348 gate did not hit`);
+			}
+			if (statDelta !== rowsWithSession) {
+				violations.push(`${label}: ${statDelta} stat call(s) for ${rowsWithSession} session row(s) — the gate must stat once per row`);
+			}
+			if (after.hits - before.hits !== rowsWithSession) {
+				violations.push(`${label}: ${after.hits - before.hits} cache hit(s) for ${rowsWithSession} session row(s) — every unchanged row must be served from the cache`);
+			}
 		}
-		return { nodes: nodeCount, jobs: jobCount, jobsWithNodeId: withNodeId, ms: Number(median(samples).toFixed(2)), identityLookups: lookups };
+		return {
+			nodes: nodeCount,
+			jobs: jobCount,
+			jobsWithNodeId: withNodeId,
+			ms: Number(median(samples).toFixed(2)),
+			identityLookups: lookups,
+			rowsWithSession,
+			statCalls,
+			parses,
+		};
 	} finally {
 		runtime.dispose?.();
 		try { setup.db.close(); } catch { /* ignore */ }
@@ -125,8 +180,13 @@ console.log(
 			realSessionMb: realSession ? Number((fs.statSync(realSession).size / 1048576).toFixed(2)) : 0,
 			rows,
 			tickBudgetMs: 500,
+			gate: { violations, rule: "one statSync per session row per tick, zero parses" },
 		},
 		null,
 		2,
 	),
 );
+
+if (violations.length > 0) {
+	throw new Error(`#348 gate assertion failed in ${violations.length} tick(s):\n${violations.join("\n")}`);
+}

@@ -4,7 +4,8 @@ import { Canvas, cellWidth, ellipsize } from "./canvas.ts";
 import type { Rect } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode, type VizStatus } from "./model.ts";
 import { nodeToken, roleColor } from "./palette.ts";
-import type { RateSampler } from "./rate.ts";
+import type { RateSampler, RateSeries } from "./rate.ts";
+import { visibleRateNodeIds } from "./rate.ts";
 import { breakdown } from "../../shared/timing-breakdown.ts";
 
 export type Pane = "galaxy" | "chart" | "timing" | "log" | "status";
@@ -292,12 +293,16 @@ export function chartWindow(data: ViewData): { from: number; to: number } {
 	return { from: Math.min(earliest, to - 60_000), to };
 }
 
-export function computeStats(data: ViewData, buckets: number): ChartStats {
+export function computeStats(data: ViewData, buckets: number, series?: RateSeries): ChartStats {
 	const { from, to } = chartWindow(data);
-	const series = data.sampler.buckets(from, to, buckets);
+	// #346: the chart body already bucketed this exact window, so reuse its result.
+	// Recomputing it here was the measured duplicate pass (≈1.2ms + 0.6MB per
+	// 200-node frame); the arguments are derived from the same `data`, so the two
+	// passes could never disagree.
+	const rows = series ?? chartBuckets(data, buckets, { from, to });
 	let peak = 0;
 	let peakIndex = -1;
-	series.total.forEach((value, i) => {
+	rows.total.forEach((value, i) => {
 		if (value > peak) {
 			peak = value;
 			peakIndex = i;
@@ -305,7 +310,7 @@ export function computeStats(data: ViewData, buckets: number): ChartStats {
 	});
 	// The header tok/s is the shared definition, never the last bucket.
 	peak = Math.max(peak, data.rate);
-	const peakAt = peakIndex >= 0 && peak > data.rate ? series.times[peakIndex]! : to;
+	const peakAt = peakIndex >= 0 && peak > data.rate ? rows.times[peakIndex]! : to;
 	const roleTotals = new Map<string, number>();
 	let total = 0;
 	for (const node of data.nodes) {
@@ -315,8 +320,12 @@ export function computeStats(data: ViewData, buckets: number): ChartStats {
 	}
 	return {
 		now: data.rate,
-		// Full-series window average (includes settled); differs from the header tok/s on purpose.
-		avg: data.sampler.totalRate(to, Math.max(1, to - from)),
+		// Full-series window average over the series this frame paints (includes
+		// settled ones); differs from the header tok/s on purpose. #346: the
+		// visibility filter applies here too — a series the chart does not paint
+		// must not inflate the avg line (measured: 40 finished ghosts moved it
+		// from 300 to 1.5k tok/s) and must not cost a walk per frame.
+		avg: data.sampler.totalRate(to, Math.max(1, to - from), visibleRateNodeIds(data.nodes)),
 		peak,
 		peakAt,
 		total,
@@ -326,6 +335,19 @@ export function computeStats(data: ViewData, buckets: number): ChartStats {
 }
 
 const PARTIAL = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/**
+ * #346: the frame's bucketing pass — ONE per frame, shared by `drawChart`'s body
+ * and `computeStats`.
+ *
+ * The key is the sampling window `(from, to, count)` plus the frame's visible
+ * series (see `BucketOptions.onlyNodeIds`): a series the frame does not paint
+ * keeps its samples but contributes nothing to this pass, which is what stops a
+ * long session's finished children from taxing every frame.
+ */
+export function chartBuckets(data: ViewData, count: number, window: { from: number; to: number } = chartWindow(data)): RateSeries {
+	return data.sampler.buckets(window.from, window.to, count, { onlyNodeIds: visibleRateNodeIds(data.nodes) });
+}
 
 export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode | undefined, wideStats: boolean): void {
 	if (r.w < 12 || r.h < 4) return;
@@ -339,8 +361,8 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	const plotH = Math.max(1, r.h - 2 - statsBelow);
 	const axisY = plotTop + plotH;
 	const { from, to } = chartWindow(data);
-	const series = data.sampler.buckets(from, to, plotW);
-	const stats = computeStats(data, plotW);
+	const series = chartBuckets(data, plotW, { from, to });
+	const stats = computeStats(data, plotW, series);
 	const max = Math.max(1, stats.peak * 1.15);
 	const rowsFor = (v: number): number => (v / max) * plotH;
 	const roles = stats.byRole.map((entry) => entry.role);
