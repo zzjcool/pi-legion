@@ -135,7 +135,16 @@ const LEGION_SETTING_FIELDS = [
 	"orphanStaleMs",
 ] as const satisfies readonly (keyof LegionSettings)[];
 
-interface LegionExplicitFields {
+/**
+ * Which `legion` values the operator actually wrote down (#358 review, major 1).
+ *
+ * `parseLegionSettings` FILLS every default so a consumer never has to invent a
+ * number, and that fill is indistinguishable from a decision once it has been
+ * spread into a plain object. Anything that treats "the setting is present" as
+ * "the operator chose it" therefore sees a choice that was never made — which is
+ * exactly how a card's own `timeoutMs` on a built-in phase came to be ignored.
+ */
+export interface LegionExplicitFields {
 	fields: Set<keyof LegionSettings>;
 	phaseTimeouts: Set<(typeof LEGION_PHASES)[number]>;
 }
@@ -253,7 +262,16 @@ function parseLegionSettings(
 	return out;
 }
 
-function legionExplicitFields(
+/**
+ * Read the operator's own decisions out of a `legion` block.
+ *
+ * A settings object produced by {@link parseLegionSettings} / {@link mergeLegionSettings}
+ * carries them on a symbol; a hand-built object (a test, a caller) falls back to
+ * "an own key means explicit", which is the only thing that is observable there.
+ * Read this — never `phaseTimeouts?.[phase] !== undefined` — to answer "did a
+ * human set this clock?".
+ */
+export function legionExplicitFields(
 	settings: LegionSettings | undefined,
 ): LegionExplicitFields {
 	if (!settings) return { fields: new Set(), phaseTimeouts: new Set() };
@@ -270,6 +288,53 @@ function legionExplicitFields(
 			),
 		),
 	};
+}
+
+/**
+ * Did the operator set this phase's advisory clock by hand (#358 review, major 1)?
+ *
+ * The answer consumers need is about the DECISION, not about the value being
+ * present: a filled-in default is present too. `phase` is free-form because a
+ * declared machine names its own phases.
+ */
+export function isExplicitPhaseTimeout(
+	settings: LegionSettings | undefined,
+	phase: string,
+): boolean {
+	return (legionExplicitFields(settings).phaseTimeouts as ReadonlySet<string>).has(phase);
+}
+
+/**
+ * The `legion` settings a run actually uses, defaults filled (#358 review, major 1).
+ *
+ * The fill is what lets every consumer read a number, but it must not masquerade
+ * as an operator decision: `checkOwnPhaseTimeout` asks
+ * {@link legionExplicitFields} whether a phase clock was set by a human, and a
+ * built-in default that arrived by being spread in would answer yes. This is the
+ * seam that keeps the two apart — replacing it with a plain spread silently turns
+ * `settings > machine > default` into `settings(filled) > nothing`, i.e. a card's
+ * `timeoutMs` on a built-in phase name never wins.
+ */
+export function legionSettingsForRun(
+	settings: SubagentsSettings | undefined,
+): LegionSettings {
+	const legion = settings?.legion;
+	const resolved: TrackedLegionSettings = {
+		...DEFAULT_LEGION_SETTINGS,
+		...(legion ?? {}),
+		phaseTimeouts: {
+			...DEFAULT_LEGION_SETTINGS.phaseTimeouts,
+			...(legion?.phaseTimeouts ?? {}),
+		},
+	};
+	const explicit = legionExplicitFields(legion);
+	Object.defineProperty(resolved, LEGION_EXPLICIT_FIELDS, {
+		value: {
+			fields: new Set(explicit.fields),
+			phaseTimeouts: new Set(explicit.phaseTimeouts),
+		} satisfies LegionExplicitFields,
+	});
+	return resolved;
 }
 
 function mergeLegionSettings(

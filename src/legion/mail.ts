@@ -63,6 +63,42 @@ export const MAIL_DELIVERY_TURN_WINDOW = 20;
  */
 export const PHASE_TIMEOUT_MAIL_SUBJECT_PREFIX = "Phase timeout:";
 
+/**
+ * #353: the error code for mail text the ledger cannot represent (a NUL).
+ * A member of the same closed `code` vocabulary the `MailDenied` refusals use,
+ * so an operator reads one spelling for "this send did not happen".
+ */
+export const MAIL_INVALID_TEXT_CODE = "MAIL_INVALID_TEXT";
+
+/**
+ * #353: `sendMail` refuses text containing U+0000 instead of storing a truncation.
+ *
+ * `node:sqlite` binds a JS string as SQLite TEXT, and SQLite's text functions stop
+ * at the first NUL: the send returned `ok: true`, `bodyBytes` counted the ORIGINAL
+ * text, and the recipient read only the part before the NUL. There is no lossless
+ * encoding to fall back to (base64 would change what "the body" means for every
+ * reader), so the send is refused loudly — with the field and the offset, because a
+ * silent cut leaves the caller believing a message arrived intact.
+ *
+ * `index` is the 0-based UTF-16 offset of the first NUL (`String.prototype.indexOf`),
+ * which equals the character offset for the BMP text a NUL can appear in.
+ */
+export class MailInvalidTextError extends Error {
+	readonly code = MAIL_INVALID_TEXT_CODE;
+	readonly field: "subject" | "body" | "to";
+	readonly index: number;
+
+	constructor(field: "subject" | "body" | "to", index: number) {
+		super(
+			`mail ${field} contains U+0000 at character ${index}; NUL characters are not supported in mail text ` +
+				"(SQLite truncates text at the first NUL, which would silently deliver a fragment)",
+		);
+		this.name = "MailInvalidTextError";
+		this.field = field;
+		this.index = index;
+	}
+}
+
 export const MAIL_SUBJECT_HARD_LIMIT_BYTES = 256;
 export const MAIL_BODY_SOFT_LIMIT_BYTES = 4 * 1024;
 export const MAIL_BODY_HARD_LIMIT_BYTES = 32 * 1024;
@@ -188,6 +224,11 @@ export function sendMail(
 			fromNode: input.fromNode,
 		};
 	}
+	// #353: refuse unrepresentable text BEFORE any byte counting, so `bodyBytes` never
+	// describes a body the ledger will not hold.
+	assertMailText("subject", input.subject);
+	assertMailText("body", input.body);
+	for (const token of typeof input.to === "string" ? [input.to] : input.to) assertMailText("to", token);
 	if (typeof input.subject !== "string" || input.subject.trim().length === 0) {
 		return { ok: false, code: "forbidden", message: "mail subject must not be empty", fromNode: input.fromNode };
 	}
@@ -579,6 +620,13 @@ export class InvalidDeliveryTransitionError extends Error {
 		super(`mail delivery cannot transition from ${current} to ${next}`);
 		this.name = "InvalidDeliveryTransitionError";
 	}
+}
+
+/** #353: throw {@link MailInvalidTextError} for the first U+0000 in one field. */
+function assertMailText(field: "subject" | "body" | "to", value: unknown): void {
+	if (typeof value !== "string") return; // the type checks below own the non-string case
+	const index = value.indexOf("\u0000");
+	if (index !== -1) throw new MailInvalidTextError(field, index);
 }
 
 function isMailKind(value: unknown): value is MailKind {

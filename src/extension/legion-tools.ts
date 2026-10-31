@@ -20,6 +20,7 @@ import {
 	MAIL_BODY_SOFT_LIMIT_BYTES,
 	MAIL_BOUNCE_REASON,
 	MAIL_DELIVERY,
+	MailInvalidTextError,
 	formatMail,
 	inbox,
 	isStalePhaseTimeoutNotice,
@@ -28,6 +29,8 @@ import {
 	sendMail,
 	transitionDelivery,
 	type LegionMessage,
+	type SendMailInput,
+	type SendMailOptions,
 } from "../legion/mail.ts";
 import {
 	getChildren,
@@ -49,10 +52,12 @@ import {
 	DEFAULT_PHASE_MACHINE,
 	findPhase,
 	isTerminalIn,
+	machineTimeout,
 	normalizePhaseMachine,
 	type PhaseMachine,
 } from "../legion/phase-machine.ts";
 import { upsertUsage } from "../legion/usage.ts";
+import { isExplicitPhaseTimeout } from "../agents/settings.ts";
 
 const POSTMAN_INTERVAL_MS = 2_000;
 /** Upper bound on ACCEPTED mail one tick may confirm (#322 §3), so a big inbox cannot stall the loop. */
@@ -524,38 +529,67 @@ export class LegionPostman {
 		const failureNotice = `Legion team ${node.id} failed because all direct children failed.`;
 		this.sendSelfMessage(failureNotice);
 		if (node.parentId) {
-			const mail = sendMail(this.db, { fromNode: node.id, to: "parent", subject: `Team failed: ${node.name}`, body: failureNotice, kind: "notice", urgency: "action-needed" }, { now: () => timestamp, ratePer5Min: this.settings.mailRatePer5Min });
-			if (mail.ok) for (const message of mail.messages) this.emitMail(message.id, node.id, "mail_sent");
+			const { outcome, messages } = sendInternalNotice(this.db, { fromNode: node.id, to: "parent", subject: `Team failed: ${node.name}`, body: failureNotice, kind: "notice", urgency: "action-needed" }, { now: () => timestamp, ratePer5Min: this.settings.mailRatePer5Min }, `all-children-failed notice for ${node.id}`);
+			for (const message of messages) this.emitMail(message.id, node.id, "mail_sent");
+			// #353 review (major 3): a refused send must not silence the verdict — this
+			// call site sits inside `tick()`, where a throw is swallowed by `start()`.
+			if (outcome === "refused") this.sendRootMessage(failureNotice);
 		} else this.sendRootMessage(failureNotice);
 	}
 
 	/**
-	 * NOT custom-phase aware yet — follow-up issue on purpose (#350 review minor 2).
+	 * Which phase of THIS team's machine judges success (#358).
 	 *
-	 * Two things here only speak the built-in vocabulary: the `phase !== "verifying"`
-	 * test above hard-codes a phase name a declared machine need never use, and the
-	 * `evaluatePhaseTransition` call below passes no `machine`, so a team whose card
-	 * declares its own verification phase can never reach the state machine's `done`
-	 * path. `checkOwnPhaseTimeout` (just below) has the sibling hole:
-	 * `DEFAULT_PHASE_TIMEOUTS[phase] ?? 0` makes a custom phase's advisory clock 0, so
-	 * it never warns.
+	 * The old test was `node.phase !== "verifying"`, a name a declared machine need
+	 * never use, so a card whose workflow ends in `ship` could never take the
+	 * supervisor's verified-completion path. The machine declares the answer: a phase
+	 * with an exit to `done` judges success. Among those, an edge that requires
+	 * `verification_passed` is the most precise statement of "this is where the
+	 * verdict decides", and otherwise the LAST declared candidate wins — machines list
+	 * their phases in pipeline order, and the deepest phase that can complete a team is
+	 * the one that completes it (that rule alone picks `verifying` in the built-in
+	 * machine).
 	 *
-	 * Deliberately NOT fixed here: #350's scope is where a team is BORN, and both
-	 * repairs move behaviour on phases this PR does not otherwise touch. Follow-up:
-	 * #358 `bug(legion): 自定义相位上的 verifying 收尾与相位超时告警恒不生效`.
+	 * Fallback: a team with NO declared machine, or a machine with no exit to `done`
+	 * at all, keeps the historical literal `verifying` — the behaviour every team had
+	 * before this was derived, byte for byte.
+	 */
+	private successPhase(): string {
+		const machine = this.machine;
+		if (!machine) return "verifying";
+		const exits = machine.phases.filter((phase) => phase.next.some((rule) => rule.to === "done"));
+		if (exits.length === 0) return "verifying";
+		const gated = exits.filter((phase) =>
+			phase.next.some((rule) => rule.to === "done" && (rule.require ?? []).includes("verification_passed")),
+		);
+		const candidates = gated.length > 0 ? gated : exits;
+		return candidates[candidates.length - 1]!.id;
+	}
+
+	/**
+	 * Complete a team whose contract verification passed (#358).
+	 *
+	 * Both halves of this path used to speak only the built-in vocabulary: the phase
+	 * test hard-coded `verifying`, and `evaluatePhaseTransition` was called without a
+	 * `machine` — the same mistake #351 fixed on the abort path, and one that answers
+	 * `invalid_phase` for a phase the team's own declaration named. The phase now comes
+	 * from {@link successPhase} and the machine is forwarded, so a declared workflow
+	 * reaches `done` through exactly the edges its card asked for.
 	 */
 	private finalizeVerifiedTeamIfReady(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
-		if (!node || node.phase !== "verifying" || verificationPassed(node) !== true) return;
+		const successPhase = this.successPhase();
+		if (!node || node.phase !== successPhase || verificationPassed(node) !== true) return;
 		const children = getChildren(this.db, node.id);
 		if (children.some((child) => !isPhaseTerminalChild(child.status))) return;
 		const decision = evaluatePhaseTransition({
-			from: "verifying",
+			from: successPhase,
 			to: "done",
 			reworkCount: node.reworkCount,
 			children: children.map(({ id, role, status }) => ({ id, role, status })),
 			verificationPassed: true,
 			actorRole: "supervisor",
+			...(this.machine ? { machine: this.machine } : {}),
 		}, () => timestamp);
 		if (!decision.allowed) return;
 		updateNode(this.db, node.id, { phase: "done", phaseSince: decision.phaseSince }, () => timestamp);
@@ -563,16 +597,58 @@ export class LegionPostman {
 		this.sendSelfMessage("All contract verification passed. Collect every child result, squash the subtree work, open an MR/PR for your parent, and report the URL. Do not merge.");
 	}
 
+	/**
+	 * Warn the parent when this team has been in one phase too long.
+	 *
+	 * #358: the advisory clock used to be `settings.phaseTimeouts[phase] ??
+	 * DEFAULT_PHASE_TIMEOUTS[phase] ?? 0`, so a phase named by the team's own card had
+	 * no clock at all and `PhaseDefinition.timeoutMs` (`machineTimeout`) was dead code.
+	 * The clock is resolved in this order:
+	 *
+	 *   1. `settings.phaseTimeouts[phase]` — an operator override still wins; a card
+	 *      must not be able to take the operator's clock away. **Explicit means
+	 *      explicit** (#358 review, major 1): `legionSettingsForRun` fills the built-in
+	 *      defaults into every settings object, so `phaseTimeouts[phase] !== undefined`
+	 *      is true even when nobody set anything. `legionExplicitFields` is the only
+	 *      honest answer, and reading the filled value as a choice made the whole
+	 *      `setting > machine > default` order below a fiction for the four built-in
+	 *      names — the one case a card is most likely to declare.
+	 *   2. `machineTimeout(machine, phase)` — the team's own declaration.
+	 *   3. `DEFAULT_PHASE_TIMEOUTS[phase]` — the built-in four, through
+	 *      `checkPhaseTimeout`'s own fallback.
+	 *   4. nothing → 0 → never warns (the pre-existing meaning of 0, unchanged).
+	 */
 	private checkOwnPhaseTimeout(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
 		if (!node?.phase || this.isTerminalPhaseOf(node.phase)) return;
+		const operatorMs = isExplicitPhaseTimeout(this.settings, node.phase)
+			? this.settings.phaseTimeouts?.[node.phase]
+			: undefined;
+		const machineMs = this.machine ? machineTimeout(this.machine, node.phase) : undefined;
+		// A phase name the built-in table knows keeps its built-in clock unless either
+		// source above says otherwise; a name it does not know had no clock before.
+		const declaredMs = operatorMs ?? machineMs;
 		const timeout = checkPhaseTimeout({
 			phase: node.phase,
 			phaseSince: node.phaseSince,
 			now: timestamp,
-			timeouts: this.settings.phaseTimeouts,
+			...(declaredMs === undefined ? {} : { timeouts: { [node.phase]: declaredMs } }),
 		});
 		if (!timeout.timedOut || hasPhaseTimeoutForSince(this.db, node.id, node.phaseSince)) return;
+		const notice = `Legion phase timeout: ${node.id} has been in ${node.phase} for ${timeout.elapsedMs}ms (limit ${timeout.timeoutMs}ms). Work was not killed; decide whether to extend or abort.`;
+		// #353 review (major 3): the notice is placed BEFORE the `phase_timeout` row, which
+		// is also the de-dup key (`hasPhaseTimeoutForSince`). Written the other way round,
+		// a refused send still consumed the stint's single announcement: `start()` swallows
+		// the throw (`.catch(() => {})`), so no notice and no event ever appeared again for
+		// that `phase_since`. Announcing first makes a refusal retryable — and a duplicate
+		// notice (if this process dies between the send and the row) is the failure mode
+		// §8.5 already prefers over a lost one.
+		if (!node.parentId) this.sendRootMessage(notice);
+		else {
+			const notified = this.notifyTimeout(node, notice, timestamp);
+			// Nothing was placed anywhere: leave the key unwritten so the next tick tries again.
+			if (!notified) return;
+		}
 		const event = appendEvent(this.db, node.id, "phase_timeout", {
 			phase: node.phase,
 			phaseSince: node.phaseSince,
@@ -580,21 +656,30 @@ export class LegionPostman {
 			timeoutMs: timeout.timeoutMs,
 		}, { now: () => timestamp });
 		this.eventBus?.emit(event);
-		const notice = `Legion phase timeout: ${node.id} has been in ${node.phase} for ${timeout.elapsedMs}ms (limit ${timeout.timeoutMs}ms). Work was not killed; decide whether to extend or abort.`;
-		if (!node.parentId) {
-			this.sendRootMessage(notice);
-			return;
-		}
-		const result = sendMail(this.db, {
+	}
+
+	/**
+	 * Mail this team's timeout notice to its parent, degrading instead of throwing.
+	 *
+	 * Returns whether the notice reached the ledger's mail (`false` = it did not, and
+	 * the caller must not write the de-dup key). A refusal is answered with
+	 * `sendRootMessage` + a warning, so the fact is never silently dropped.
+	 */
+	private notifyTimeout(node: LegionNode, notice: string, timestamp: number): boolean {
+		const { outcome, messages } = sendInternalNotice(this.db, {
 			fromNode: node.id,
 			to: "parent",
 			subject: `Phase timeout: ${node.name}`,
 			body: notice,
 			kind: "notice",
 			urgency: "action-needed",
-		}, { now: () => timestamp, ratePer5Min: this.settings.mailRatePer5Min });
-		if (result.ok) for (const message of result.messages) this.emitMail(message.id, node.id, "mail_sent");
-		else this.sendRootMessage(notice);
+		}, { now: () => timestamp, ratePer5Min: this.settings.mailRatePer5Min }, "Phase timeout notice");
+		if (outcome === "refused") {
+			this.sendRootMessage(notice);
+			return false;
+		}
+		for (const message of messages) this.emitMail(message.id, node.id, "mail_sent");
+		return true;
 	}
 }
 
@@ -656,14 +741,25 @@ export function registerLegionTools(pi: ExtensionAPI, options: RegisterLegionToo
 			urgency: Type.Optional(Type.Union(MAIL_URGENCIES.map((value) => Type.Literal(value)))),
 		}),
 		async execute(_id, params) {
-			const result = sendMail(db, {
-				fromNode: nodeId,
-				to: params.to,
-				subject: params.subject,
-				body: params.body,
-				...(params.kind ? { kind: params.kind } : {}),
-				...(params.urgency ? { urgency: params.urgency } : {}),
-			}, { ratePer5Min: settings.mailRatePer5Min, now: options.now });
+			// #353 review (minor 1): `MailInvalidTextError` is a REFUSAL the model must be able to
+			// see and act on, at the one boundary where the text is the model's own. The
+			// framework only surfaces `content`, so the code (`MAIL_INVALID_TEXT`, a member of
+			// the same closed vocabulary as the `MailDenied` refusals) rides `details.error`
+			// like every other tool refusal here — and the throw never escapes the turn.
+			let result: ReturnType<typeof sendMail>;
+			try {
+				result = sendMail(db, {
+					fromNode: nodeId,
+					to: params.to,
+					subject: params.subject,
+					body: params.body,
+					...(params.kind ? { kind: params.kind } : {}),
+					...(params.urgency ? { urgency: params.urgency } : {}),
+				}, { ratePer5Min: settings.mailRatePer5Min, now: options.now });
+			} catch (error) {
+				if (error instanceof MailInvalidTextError) return toolError(error.message, error.code);
+				throw error; // a real defect must not be disguised as bad input
+			}
 			if (!result.ok) return toolError(`${result.message}${result.routingHint ? `; routing: ${result.routingHint}` : ""}`, result.code.toUpperCase());
 			for (const message of result.messages) emitStoredMailEvent(db, options.eventBus, nodeId, "mail_sent", message.id);
 			return toolOk(
@@ -1309,19 +1405,84 @@ function hasPhaseTimeoutForSince(db: DatabaseSync, nodeId: string, since: number
 		.some((row) => typeof row.data === "string" && safeJson(row.data)?.phaseSince === since);
 }
 
+/**
+ * #353 review (major 3): send an INTERNAL notice, degrading instead of throwing.
+ *
+ * `sendMail` throws `MailInvalidTextError` for a U+0000 because SQLite truncates text
+ * there, so a silent fragment would be stored under an `ok: true` (#353). That is the
+ * right answer at the `legion_mail` boundary — the model composed the text and can fix
+ * it. It is the wrong answer for every notice THIS file composes from ledger facts,
+ * because those call sites run after the durable move they describe and nobody is left
+ * to retry:
+ *
+ *   - `notifyParent` runs AFTER `updateNode` + `phase_change` (§8.4 `legion_phase`), so a
+ *     throw turned an accepted phase transition — including a failed team's mandatory
+ *     notice, the promise #309 made — into a tool error while the team had already moved;
+ *   - `checkOwnPhaseTimeout` runs inside `LegionPostman.tick`, and `start()` swallows
+ *     whatever escapes (`.catch(() => {})`), so a throw lost that stint's single notice.
+ *
+ * Degrade order, neither step dropping the notice:
+ *   1. the U+0000 characters are dropped from `subject` and `body` and the message is sent
+ *      again (the truncation `#353` refused is now explicit and total, and a warning names
+ *      the field and offset). Only text is rewritten: routing (`to`) is ledger-resolved and
+ *      is never re-decided here, because a notice that arrives at the wrong node is worse
+ *      than one that does not arrive;
+ *   2. a refusal the ledger understands (rate limit, permission, recipient gone) or a send
+ *      that still throws comes back as `refused`, and the caller places the fact another
+ *      way (`sendRootMessage` + this warning).
+ *
+ * Never throws: an internal notice may not be able to fail the ledger move it reports.
+ */
+function sendInternalNotice(
+	db: DatabaseSync,
+	input: SendMailInput,
+	options: SendMailOptions,
+	label: string,
+): { outcome: "sent" | "degraded" | "refused"; messages: LegionMessage[] } {
+	const warn = (detail: string) => console.warn(`[legion] ${label}: ${detail}`);
+	try {
+		const result = sendMail(db, input, options);
+		if (result.ok) return { outcome: "sent", messages: result.messages };
+		// A refusal the ledger understands (rate limit, permission, recipient gone) is not a
+		// text problem: report it and let the caller decide where the fact goes.
+		warn(`not mailed as composed (${result.code}: ${result.message}); degrading instead of dropping it.`);
+		return { outcome: "refused", messages: [] };
+	} catch (error) {
+		if (!(error instanceof MailInvalidTextError)) {
+			warn(`could not be mailed (${messageOf(error)}); the fact it reports is already committed, so this does not fail the turn.`);
+			return { outcome: "refused", messages: [] };
+		}
+		warn(`${error.message}; dropping the U+0000 characters from the text and sending again.`);
+		try {
+			const retry = sendMail(db, { ...input, subject: withoutNul(input.subject), body: withoutNul(input.body) }, options);
+			if (retry.ok) return { outcome: "degraded", messages: retry.messages };
+			warn(`degraded send was refused too (${retry.code}: ${retry.message}).`);
+			return { outcome: "refused", messages: [] };
+		} catch (retryError) {
+			warn(`degraded send was refused too (${messageOf(retryError)}).`);
+			return { outcome: "refused", messages: [] };
+		}
+	}
+}
+
+/** The only character `sendMail` cannot hold; dropping it is the degrade rule above. */
+function withoutNul(text: string): string {
+	return text.includes("\u0000") ? text.replaceAll("\u0000", "") : text;
+}
+
 async function notifyParent(db: DatabaseSync, node: LegionNode, text: string, settings: LegionSettings | undefined, now: () => number, eventBus?: Pick<LegionEventBus, "emit">): Promise<void> {
 	if (!node.parentId) return;
 	// Phase/timeout events are already durable facts. If mail is rate-limited,
 	// do not mislabel the failed notification as another phase timeout.
-	const result = sendMail(db, {
+	const { messages } = sendInternalNotice(db, {
 		fromNode: node.id,
 		to: "parent",
 		subject: `Legion update: ${node.name}`,
 		body: text,
 		kind: "notice",
 		urgency: "action-needed",
-	}, { now, ratePer5Min: settings?.mailRatePer5Min });
-	if (result.ok) for (const message of result.messages) emitStoredMailEvent(db, eventBus, node.id, "mail_sent", message.id);
+	}, { now, ratePer5Min: settings?.mailRatePer5Min }, `parent notification for ${node.id}`);
+	for (const message of messages) emitStoredMailEvent(db, eventBus, node.id, "mail_sent", message.id);
 }
 
 function toolOk(text: string): AgentToolResult<unknown> {

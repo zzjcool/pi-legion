@@ -99,6 +99,23 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   SGR 快照，实测去掉 floor 后两种挂载的 gutter 都退回终端默认背景（#308 黑带重现），
   所以它不是「保险」。不改宿主 `compositeTuiLine`、不改 pi-tui 节流常量。
   基准：`bench/perf-core/09-legion-mount.ts`；契约：`docs/contracts/legion-main-screen-mount-v1.md`。
+- **`/legion` 不再每写一个格子就分配一个 `Cell`：`Canvas` 预建 W×H 个可变 cell，`set()` 原地改字段 (#362).**
+  `set()` 原本是 `row[x] = { ch, color, ...style }`——一帧要写 4,583 次（120×40）/ 9,691 次（200×60），
+  实测 52.4 B/次 与 128.0 B/次。现在格子在构造时一次性建好，写入只做 `cell.ch / color / bold / inverse`
+  的显式字段赋值（无对象展开、默认 style 用共享常量），`sanitizeChar` 也按字符记忆化
+  （`String.fromCodePoint` 对 Latin-1 以外的字形每次都新建字符串，图表/星图画 `█ ⣿ ─` 上万次）。
+  同一脚本前后实测：每次 `set` 分配 **52.4 → 0.03 B**（120×40）/ **128.0 → 0.002 B**（200×60）；
+  整帧分配 **2839.9 → 2551.8 KB**（120×40/live，−10%）、**4556.8 → 4018.2 KB**（200×60/live，−12%）；
+  帧 median **4.53 → 3.87 ms**（120×40/live，−15%）、**6.95 → 5.73 ms**（200×60/live，−18%），
+  p95 −12% / −13%（5 轮 × 50 帧前后交叉，各 1250 样本）。预填本身也顺带变小
+  （269.3 → 190.0 KB / 616.1 → 472.4 KB，53–57 → 39–41 B/格）。
+  **`/legion` 可见输出逐字节不变**：4 个场景（120×40 / 200×60 × live / settled）的 plain 与 ANSI
+  摘要前后一致，`legion-viz` 快照用例原样绿。对外语义只有一条要说清：`get()` / `cells` 是**活视图**
+  （下一次 `set()` 会改同一个对象），不是快照——两个既有读点都只读 `ch` 即弃。
+  另：`drawChart` 的 `(from, to)` 直接交给 `computeStats`，一帧只调一次 `chartWindow`。
+  整帧分配离 #346 的 ≤2.0MB 仍差 0.5–2.0MB：残项已逐项隔离（`drawGalaxy` ≈0.93–1.23MB、
+  `toLines` ≈0.44–1.01MB、`drawChart` ≈0.38–0.62MB、`Canvas` 预填 0.19–0.47MB），
+  见契约 §3.4 / §4 与 follow-up #364。
 
 - **`/legion` 的 tok/s 图表一帧只分桶一次，且只算本帧真的要画的 series (#346).** `drawChart` 先给图体
   分桶、`computeStats` 又用**完全相同的参数**再分一遍，200 节点下一帧白烧 ≈1.2ms 与 ≈0.6MB 垃圾；
@@ -268,6 +285,81 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **PR #363 review follow-up: an internal notice can no longer be refused into silence, and a refused
+  one is retried.** #353 made `sendMail` throw for a `U+0000`, which is right where the text is the
+  model's own (`legion_mail`) and wrong at the three call sites that compose a notice from ledger
+  facts, because all three run after the move they describe. `requestLegionPhase` writes
+  `updateNode` + `phase_change` and only then calls `notifyParent`, so a `reason`/`note` carrying a
+  NUL (model text, and the only place one can exist — a ledger column would have truncated it on
+  write) turned an accepted transition — including a declaring centurion's failure notice, the #309
+  promise — into a tool error while the team had already moved; `checkOwnPhaseTimeout` wrote its
+  `phase_timeout` row (also the de-dup key) BEFORE mailing, and `LegionPostman.start()` swallows
+  whatever escapes (`.catch(() => {})`), so a refused notice was lost for the whole stint. The
+  refusal now belongs to the tool boundary alone: `legion_mail` answers `toolError(…,
+  "MAIL_INVALID_TEXT")` so the code is visible in `details.error` instead of only in a message, while
+  internal notices degrade — the NUL characters are dropped and the send retried, and a refusal the
+  ledger understands (rate limit, permission) falls back to `sendRootMessage` + a warning — and never
+  throw. `checkOwnPhaseTimeout` places the notice before writing the de-dup key, so a notice it could
+  not place anywhere leaves the key unwritten and the next tick tries again; 0 keeps its meaning and
+  the built-in subjects/clocks are untouched.
+- **PR #363 review follow-up: a failed revival gives the phase clock back, and the completion gate's
+  assumption is pinned.** `Orchestrator.reserveNode` moves `phase_since` on a revive (#357) and
+  records the `revived` `phase_change` before the supervisor spawns; a spawn failure rolled the
+  reservation back but left the moved clock behind — a stint `checkOwnPhaseTimeout` de-dupes on, for a
+  launch that does not exist. `phase_since` now travels with the rest of the rollback. Also: the
+  derivation of the success phase follows the ORDER A CARD DECLARES, so "`phases:` order is pipeline
+  order" is a load-bearing assumption rather than a style note — a case now pins a shuffled
+  declaration moving the gate, and its control pins that a non-final phase cannot collect a team.
+  Contracts: `docs/legion-v2-contract.md` REV-26 and
+  `docs/contracts/declarative-phase-machine-v5.md`.
+
+- **`legion_mail` refuses text containing `U+0000` instead of storing a truncation (#353).** SQLite's
+  TEXT binding stops at the first NUL, so a `body`/`subject` carrying one was written as the part
+  before it while the send still answered `ok: true` — and `bodyBytes` counted the ORIGINAL text, so a
+  message that arrived cut in half looked complete to its sender. There is no lossless encoding that
+  keeps "the body" meaning the same thing to every reader, so the send is refused before any byte is
+  counted: `sendMail` throws `MailInvalidTextError` (code `MAIL_INVALID_TEXT`, a member of the existing
+  `code` vocabulary) naming the field, the character offset of the first NUL, and that NUL is not
+  supported. `subject`, `body` and every `to` token are checked; nothing is stored and no `mail_sent`
+  event is written. NUL-free text is untouched, and `bodyBytes` keeps describing exactly the row that
+  was stored (the invariant the truncation broke).
+
+- **A team woken by `continue` starts a new phase stint, so its next timeout is announced again
+  (#357).** The `Phase timeout:` notice was already judged `OBSOLETE` at settle time (#333/#354); what
+  made the team go permanently silent is that `Orchestrator.reserveNode`'s resume branch only rewrote
+  `status`, leaving `phase_since` at the value of the stint that had ALREADY timed out. Since
+  `checkOwnPhaseTimeout` dedupes on exactly that value (`hasPhaseTimeoutForSince`), one `phase_timeout`
+  per stint meant one for the life of the team: the second stint could run past its advisory clock
+  forever and nobody would hear. A revival now advances `phase_since` to the revival clock and records
+  a `phase_change` with `from === to` and `reason: "revived"` — the phase does not move (work resumes
+  where it was), the event set stays closed (no new type, no new subject prefix, no change to the
+  `kind: "notice"` accounting), and a revival that cannot move the clock still dedupes, because the key
+  is `phase_since` and not "a revival happened". Contract note:
+  `docs/contracts/mailbox-delivery-v1.md` (D4).
+
+- **A declared machine's own phase names now reach the verifying gate and the phase clock (#358).**
+  The follow-up left by #350: `finalizeVerifiedTeamIfReady` hard-coded `node.phase !== "verifying"` and
+  evaluated `verifying → done` with no `machine`, so a workflow the card called `spec → impl → ship`
+  could never take the supervisor's verified-completion path (`invalid_phase`, dropped by the
+  `!decision.allowed` guard). The completion gate is now the phase of THIS team's machine that judges
+  success — an exit to `done`, preferring one gated on `verification_passed`, otherwise the last
+  declared candidate, which is `verifying` in the built-in machine — and the machine is forwarded to
+  `evaluatePhaseTransition`. A team with no declared machine (or a machine with no exit to `done` at all)
+  keeps the historical literal, so the built-in four-phase pipeline is unchanged. The sibling hole is
+  the same mistake in the clock: `checkOwnPhaseTimeout` resolved `DEFAULT_PHASE_TIMEOUTS[phase] ?? 0`,
+  which for an undeclared phase name is 0, so `PhaseDefinition.timeoutMs` (`machineTimeout`) was dead
+  code and a custom phase's advisory clock never armed. The order is now operator setting
+  (`legion.phaseTimeouts`) → the machine's `timeoutMs` → the built-in default → 0, and 0 keeps its
+  pre-existing meaning of "never warn". **Correction (PR #363 review, major 1):** that order was only
+  real for phase names the built-in table had never heard of. `index.ts` handed the postman a
+  default-FILLED `legion` object, so `settings.phaseTimeouts[phase] ?? machineTimeout(...)` always had
+  a value on the left and a card's `timeoutMs` on `planning`/`implementing`/… was ignored in silence
+  (probe: `implementing` 3600000 in settings, 300000 on the card → 3600000 won). The explicitness the
+  settings parser already records (`legionExplicitFields`) is now carried through the run-time fill
+  (`legionSettingsForRun`), so "operator wins" means "the operator wrote it down". Declaring
+  `timeoutMs` on a built-in phase name now really takes effect; an explicit operator setting still
+  beats the card, and with neither the four built-in numbers are unchanged. Contract: REV-26.
+
 - **A team is now born in the phase its own machine starts in, so a card declaring `phases:` no longer
   strands its team at spawn (#350).** `Orchestrator.reserveNode` wrote a hard-coded `phase: "planning"`
   into every team row, ignoring the machine the card already carried. With a machine whose first phase
@@ -291,7 +383,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   The abort half of the same hole is #351, which landed upstream in `abortLegionPhase` (already on
   master), so this branch only had to stop duplicating it. The other two custom-phase holes — a hard-coded
   `phase !== "verifying"` completion gate and a phase clock that resolves to 0 for undeclared names —
-  are documented in place and tracked as #358 rather than fixed here.
+  are documented in place and tracked as #358 rather than fixed here; this branch closes them (see the
+  #358 entry above).
 
 - **A `wait` whose result the abort net throws away now hands the completion claim back, so the child's
   finished notice is no longer lost (#352).** Waiting on an already-settled child goes through

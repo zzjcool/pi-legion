@@ -10,6 +10,7 @@ import {
 	mailMatchesUserText,
 	mailReachedTurns,
 	mailboxStats,
+	MailInvalidTextError,
 	pendingInbox,
 	resolveMailTargets,
 	sendMail,
@@ -318,6 +319,91 @@ test("inbox pages from an id cursor so a confirmation scan can rotate (#338 M3)"
 		// The cursor only moves the window; it never changes which messages are eligible.
 		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED, afterId: 0 }).length, 5);
 		assert.throws(() => inbox(db, "root.team-a.alice", { afterId: -1 }), /afterId/);
+	} finally {
+		db.close();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// #353 — U+0000 in mail text
+//
+// `sendMail` used to hand the raw string to SQLite's text binding, which
+// TRUNCATES at the first NUL: the send returned `ok: true`, `bodyBytes` counted
+// the ORIGINAL text, and the recipient read only the part before the NUL. The
+// ledger cannot represent that text, so the send is refused instead of being
+// silently cut — the refusal names the field and the character offset.
+// ---------------------------------------------------------------------------
+
+test("#353: a body containing U+0000 is refused and never lands in the ledger", () => {
+	const db = makeTree();
+	try {
+		assert.throws(
+			() => sendMail(db, {
+				fromNode: "root.team-a", to: "alice", subject: "report", body: "before\u0000after",
+			}, { now: () => 10 }),
+			(error: unknown) => {
+				assert.ok(error instanceof MailInvalidTextError, `expected MailInvalidTextError, got ${String(error)}`);
+				assert.equal(error.code, "MAIL_INVALID_TEXT");
+				assert.equal(error.field, "body");
+				assert.equal(error.index, 6, "the offset of the NUL is named, not the length of the text");
+				assert.match(error.message, /body/u);
+				assert.match(error.message, /character 6/u);
+				assert.match(error.message, /U\+0000/u);
+				assert.match(error.message, /not support/iu);
+				return true;
+			},
+		);
+		// Not stored, not announced: a refuse is not a partial send.
+		assert.deepEqual(inbox(db, "root.team-a.alice"), [], "the truncated remnant must not be stored");
+		assert.deepEqual(pendingInbox(db, "root.team-a.alice"), []);
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_sent").length, 0);
+	} finally {
+		db.close();
+	}
+});
+
+test("#353: a subject (or a recipient token) containing U+0000 is refused the same way", () => {
+	const db = makeTree();
+	try {
+		assert.throws(
+			() => sendMail(db, { fromNode: "root.team-a", to: "alice", subject: "sub\u0000ject", body: "fine" }, { now: () => 10 }),
+			(error: unknown) => error instanceof MailInvalidTextError
+				&& error.field === "subject"
+				&& error.index === 3
+				&& /subject/u.test(error.message),
+		);
+		assert.throws(
+			() => sendMail(db, { fromNode: "root.team-a", to: "ali\u0000ce", subject: "s", body: "b" }, { now: () => 11 }),
+			(error: unknown) => error instanceof MailInvalidTextError && error.field === "to",
+		);
+		assert.throws(
+			() => sendMail(db, { fromNode: "root.team-a", to: ["alice", "bo\u0000b"], subject: "s", body: "b" }, { now: () => 12 }),
+			(error: unknown) => error instanceof MailInvalidTextError && error.field === "to",
+			"every recipient token of an array target is checked, not only the first",
+		);
+		assert.deepEqual(inbox(db, "root.team-a.alice"), []);
+		assert.deepEqual(inbox(db, "root.team-a.bob"), []);
+	} finally {
+		db.close();
+	}
+});
+
+test("#353 control: ordinary text is unaffected and bodyBytes describes what was stored", () => {
+	const db = makeTree();
+	try {
+		// A NUL-free body with multi-byte characters: the byte counter and the stored
+		// text must agree, which is the invariant the truncation used to break.
+		const body = "line one\nline two ünïcode 你好";
+		const result = sendMail(db, { fromNode: "root.team-a", to: "alice", subject: "ok", body }, { now: () => 10 });
+		assert.equal(result.ok, true);
+		if (!result.ok) return;
+		assert.equal(result.bodyBytes, Buffer.byteLength(body, "utf8"));
+		const stored = inbox(db, "root.team-a.alice");
+		assert.equal(stored.length, 1);
+		assert.equal(stored[0]!.body, body, "the stored text is the sent text, byte for byte");
+		assert.equal(Buffer.byteLength(stored[0]!.body, "utf8"), result.bodyBytes, "bodyBytes must describe the stored row");
+		assert.equal(stored[0]!.subject, "ok");
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_sent").length, 1);
 	} finally {
 		db.close();
 	}

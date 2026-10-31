@@ -109,6 +109,40 @@ current phase name, the retire is forced anyway: the phase becomes `aborted`, on
 set stays closed at 16), and one warning names the node, the phase and the
 refusal. Silently dropping the abort is what made a team unstoppable.
 
+## The advisory clock and the completion gate (#358)
+
+Two supervisor-side paths used to read the built-in phase vocabulary only:
+
+- **The clock.** `checkOwnPhaseTimeout` resolved `settings.phaseTimeouts[phase] ??
+  DEFAULT_PHASE_TIMEOUTS[phase] ?? 0`. `DEFAULT_PHASE_TIMEOUTS` is keyed by the four
+  built-in names, so a declared phase got `0` — "never warn" — and `PhaseDefinition.timeoutMs`
+  was dead config. Resolution order is now: explicit operator override
+  (`settings.legion.phaseTimeouts`) → card `timeoutMs` → built-in default → `0` (never warn).
+  The operator stays first because a machine must not be able to take away a limit the
+  operator set — **"explicit" is the load-bearing word**: the run-time settings object has
+  every default filled in, so "the key is present" is not an operator decision, and a
+  resolver that reads the filled value puts a clock of 60m on `implementing` whether or not
+  anyone ever wrote one down. That is what made this order a fiction on the four built-in
+  names (the case a card is most likely to declare) until the explicitness the settings
+  parser already records was carried through the fill. Behaviour change worth naming: a
+  card that declares `timeoutMs` on `planning`/`implementing`/`reviewing`/`verifying` now
+  really wins over those defaults; with no card value and no explicit setting the four
+  built-in numbers are unchanged (15m / 60m / 30m / 15m). Timeouts still only *report*.
+- **The completion gate.** `finalizeVerifiedTeamIfReady` hard-coded `phase === "verifying"`
+  and evaluated `verifying → done` against the built-in machine. It now asks the machine
+  which phase judges success: a phase with an exit to `done`, preferring an edge that
+  requires `verification_passed`, otherwise the **last** declared candidate (declaration
+  order is pipeline order, and the built-in machine's answer is `verifying`). A team with
+  no declared machine, or a machine with no exit to `done`, keeps the literal `verifying`.
+  **`phases:` order is pipeline order, and the derivation depends on it.** When more than
+  one phase can reach `done`, "the last declared candidate" is the one that completes the
+  team — a card that lists its phases in some other order moves the completion gate with
+  the declaration, not with the workflow, so the phase that really ends the pipeline would
+  never be collected from. Declare phases in the order the work happens; the tests pin
+  both the assumption (`test/unit/legion-custom-phase-finalize.test.ts`, "declaration
+  order, not pipeline order…") and the control that a non-final phase cannot complete a
+  team.
+
 ## Safety rails (unchanged)
 
 These are invariants, not configuration:

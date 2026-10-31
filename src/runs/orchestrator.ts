@@ -623,7 +623,26 @@ export class Orchestrator {
 		};
 		const gate = withLaunchBudget(legion.db, { parentId: legion.nodeId, depth: parent.depth + 1, nodeId: input.nodeId }, () => {
 			if (previous) {
-				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team }, this.now);
+				// #357: a revival opens a NEW phase stint.
+				//
+				// `checkOwnPhaseTimeout` dedupes on `phase_since`
+				// (`hasPhaseTimeoutForSince`), so a resume that only flipped `status` left
+				// the revived team keyed to the stint that had ALREADY timed out: the
+				// second stint could run past its advisory clock forever and no
+				// `phase_timeout` — hence no `Phase timeout:` notice — was ever produced
+				// again. The first notice had meanwhile been judged OBSOLETE at settle
+				// time (#333/#354), so the team went silent for good.
+				//
+				// The phase itself does NOT move (the work resumes where it was); only the
+				// clock does, which is what makes the new stint a new dedup key. The
+				// `phase_change` carries `from === to` and `reason: "revived"` so the
+				// ledger says why a stint restarted without a transition — the event set
+				// stays closed (no new type, no new mail subject).
+				const revivedAt = this.now();
+				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team, ...(previous.phase === null ? {} : { phaseSince: revivedAt }) }, this.now);
+				if (previous.phase !== null) {
+					this.emitStored(input.nodeId, "phase_change", { from: previous.phase, to: previous.phase, reworkCount: previous.reworkCount, reason: "revived" });
+				}
 				return previous;
 			}
 			if (!input.runId) throw new SubagentError(`node run reservation is missing: ${input.nodeId}`, ErrorCodes.START_FAILED);
@@ -805,7 +824,16 @@ export class Orchestrator {
 	private rollbackReservation(nodeId: string, previous: LegionNode | null): void {
 		if (!this.legion) return;
 		if (!previous) { this.legion.db.prepare("DELETE FROM nodes WHERE id = ?").run(nodeId); return; }
-		updateNode(this.legion.db, nodeId, { status: previous.status, runId: previous.runId, sessionFile: previous.sessionFile, worktreePath: previous.worktreePath, model: previous.model, team: previous.team, taskSummary: previous.taskSummary }, this.now);
+		// #357 review (minor 2): a revival's reservation moves `phase_since` (that is the
+		// whole point of #357 — a new stint is a new de-dup key) and records a `revived`
+		// `phase_change`. Leaving the moved clock behind on a failed launch would claim a
+		// stint that never ran: `checkOwnPhaseTimeout` de-dupes on `phase_since`, so the
+		// node would carry a fresh, un-announced clock for a launch that does not exist.
+		// The clock therefore goes back with the rest of the reservation. `phase` did not
+		// move in the first place (a revival resumes in place), and the `revived` row is
+		// left as the durable record of the attempt — the event set is closed and an
+		// append-only ledger does not rewrite history.
+		updateNode(this.legion.db, nodeId, { status: previous.status, runId: previous.runId, sessionFile: previous.sessionFile, worktreePath: previous.worktreePath, model: previous.model, team: previous.team, taskSummary: previous.taskSummary, ...(previous.phaseSince === null ? {} : { phaseSince: previous.phaseSince }) }, this.now);
 	}
 
 	budget(): { used: number; limit: number | null; remaining: number | null } {
