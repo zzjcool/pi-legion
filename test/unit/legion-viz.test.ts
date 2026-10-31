@@ -476,8 +476,14 @@ test("chartWindow: the array-free earliest derivation is the old Math.min, point
 	const empty = chartWindow({ nodes: [ROOT], sampler, now: sec(600), rate: 0 });
 	assert.equal(empty.to, sec(0), "the sampler never changed ⇒ to is its first sample");
 	assert.equal(empty.from, Math.min(sec(600), empty.to - 60_000), "data.now still takes part when there is no agent");
-	// `now` is the only thing keeping `from` from being 60s behind: it is not ignored.
-	assert.equal(chartWindow({ nodes: [ROOT], sampler, now: sec(0), rate: 0 }).from, Math.min(sec(0), empty.to - 60_000));
+	// The fold is observable only when `now` is OLDER than `to - 60s`: then `from`
+// follows `data.now` instead of clamping at the 60s edge. Dropping the fold
+// yields `to - 60s` here, so this is the assertion that pins it.
+	const early = new RateSampler();
+	early.record(sec(2), [ROOT]);
+	const folded = chartWindow({ nodes: [ROOT], sampler: early, now: sec(-100), rate: 0 });
+	assert.equal(folded.to, sec(2), "to is the sampler's first sample");
+	assert.equal(folded.from, sec(-100), "no agent ⇒ data.now takes part in the min, not just to−60s");
 	// NaN propagates, exactly like `Math.min(a, Number.NaN, ...)`.
 	const nan = chartWindow({ nodes: [ROOT, node("worker-1", { startedAt: Number.NaN })], sampler, now: sec(600), rate: 0 });
 	assert.ok(Number.isNaN(nan.from), `a NaN startedAt must poison from, got ${nan.from}`);
@@ -2784,20 +2790,43 @@ test("#364: the palette cache is keyed on the theme too (contract T5)", () => {
 	// above; this is the theme half — the same canvas rendered with two themes must
 	// not reuse the first theme's resolution, and switching back must reproduce the
 	// first frame exactly.
-	const named = (name: string) => ({
-		getFgAnsi: (token: string): string => `${name}-slot-${token}`,
-		fg: (token: string, text: string): string => `[${name}:${token}]${text}`,
-	});
-	const themeA = named("A");
-	const themeB = named("B");
-	const cv = new Canvas(4, 1);
-	cv.set(0, 0, "w", roleColor("worker"));
-	cv.set(1, 0, "s", roleColor("scout"));
-	const firstA = cv.toLines(themeA);
-	const firstB = cv.toLines(themeB);
-	const againA = cv.toLines(themeA);
+	//
+	// The two themes must disagree on some role's TOKEN, otherwise a theme-blind
+	// cache is invisible: `dense` gives every token its own slot (nothing clashes ⇒
+	// everyone keeps their preferred token), while `collide` maps `syntaxVariable`
+	// and `syntaxNumber` onto one slot, which pushes `scout` and `planner` onto
+	// other tokens. Both echo the token in `fg`, so the rendered line says which
+	// token a cell actually got.
+	const dense = {
+		getFgAnsi: (token: string): string => `A-slot-${token}`,
+		fg: (token: string, text: string): string => `[${token}]${text}`,
+	};
+	const collide = {
+		getFgAnsi: (token: string): string =>
+			token === "syntaxVariable" || token === "syntaxNumber" ? "CLASH" : `S-${token}`,
+		fg: (token: string, text: string): string => `[${token}]${text}`,
+	};
+	// The canvas resolves the bare role names (`roles()` strips the `role:` prefix).
+	const names = ["worker", "scout", "planner", "reviewer"];
+	const paletteA = resolveRolePalette(dense, names);
+	const paletteB = resolveRolePalette(collide, names);
+	const bumped = names.find((n) => paletteA.get(n) !== paletteB.get(n));
+	assert.ok(bumped, "premise: the two themes must resolve this role set differently, or a theme-blind cache is invisible");
+	const cv = new Canvas(6, 1);
+	for (const [i, name] of names.entries()) cv.set(i, 0, "x", roleColor(name));
+	const firstA = cv.toLines(dense);
+	const firstB = cv.toLines(collide);
+	const againA = cv.toLines(dense);
 	assert.notDeepEqual(firstA, firstB, "positive control: the two themes really render differently");
 	assert.deepEqual(againA, firstA, "switching themes must not hand back the other theme's palette");
+	// The discriminating half: the second theme's frame must carry the token IT
+	// resolved, not the one cached under the first theme. A theme-blind cache keeps
+	// both assertions above green (the `fg` prefixes still differ) but fails here.
+	assert.notEqual(paletteB.get(bumped!), paletteA.get(bumped!), "the two themes must not agree on the bumped role");
+	assert.ok(
+		firstB[0]!.includes(`[${paletteB.get(bumped!)}]`),
+		`the second theme keeps its own resolution for ${bumped} (${paletteB.get(bumped!)}): ${firstB[0]}`,
+	);
 });
 
 test("#364: a reused px grid paints the frame a rebuilt one does (contract T1)", () => {

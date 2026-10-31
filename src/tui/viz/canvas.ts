@@ -78,7 +78,7 @@ export class Canvas {
 		for (const role of this.roleCounts.keys()) this.roleCounts.set(role, 0);
 	}
 
-	set(x: number, y: number, ch: string, color?: string, style: { bold?: boolean; inverse?: boolean } = NO_STYLE): void {
+	set(x: number, y: number, ch: string, color?: string, style: Readonly<{ bold?: boolean; inverse?: boolean }> = NO_STYLE): void {
 		const row = this.cells[y];
 		if (!row || x < 0 || x >= this.width) return;
 		const cell = row[x] as Cell;
@@ -180,7 +180,7 @@ export class Canvas {
 }
 
 /** Shared empty style so a `set(x, y, ch)` call allocates no default object. */
-const NO_STYLE: { bold?: boolean; inverse?: boolean } = {};
+const NO_STYLE: Readonly<{ bold?: boolean; inverse?: boolean }> = {};
 
 /** Style knobs `text()` reads; every shared style constant is a `Readonly<TextStyle>`. */
 export interface TextStyle {

@@ -305,10 +305,13 @@ function measureFrame(data: ViewData, cols: number, rows: number): FrameCell {
  * `residualKB` = the measured whole frame MINUS (galaxy + chart + toLines +
  * canvas). It is deliberately not `renderView + toLines - sumKB`: that was an
  * algebraic identity and could only ever print 0. This one is only 0 if the four
- * probes happen to account for the frame exactly. It comes out negative here,
- * and that is the S3 result, not a bug: `canvasKB` is a `new Canvas(W,H)` per
- * frame, which the production frame no longer allocates — so the sum correctly
- * over-counts by it. Reported for attribution, never gated.
+ * probes happen to account for the frame exactly, and measuring it exposed that
+ * they do not: the probes are independent 20-sample medians taken through
+ * different entry points (a rect-scoped `drawGalaxy` vs. the whole frame), and
+ * the production frame no longer pays `canvasKB` at all. The sign therefore
+ * varies by shape (+73/+271/−172/+15 KB across the four cells) — it is a
+ * measurement-scope difference, not a component that was missed. Reported for
+ * attribution only: never gated, never compared against a threshold.
  */
 interface Components {
 	canvasKB: number;
