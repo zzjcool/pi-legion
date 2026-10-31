@@ -480,8 +480,13 @@ export interface ChartStats {
  * `from` stays relative to that frozen `to` (earliest start, or to−60s).
  */
 export function chartWindow(data: ViewData): { from: number; to: number } {
-	const starts = data.nodes.filter(isAgent).map((node) => node.startedAt);
-	const earliest = Math.min(data.sampler.startedAt ?? data.now, ...(starts.length ? starts : [data.now]));
+	// #364 S4: same answer as `Math.min(sampler.startedAt ?? now, ...agents.map(startedAt))`
+	// without the filtered+projected array pair and the spread (both per frame).
+	let earliest = data.sampler.startedAt ?? data.now;
+	for (const node of data.nodes) {
+		if (!isAgent(node)) continue;
+		if (node.startedAt < earliest) earliest = node.startedAt;
+	}
 	const to = data.sampler.lastChangeAt ?? data.sampler.startedAt ?? data.now;
 	return { from: Math.min(earliest, to - 60_000), to };
 }
@@ -513,6 +518,11 @@ export function computeStats(data: ViewData, buckets: number, series?: RateSerie
 		total += node.tokens;
 		roleTotals.set(node.role, (roleTotals.get(node.role) ?? 0) + node.tokens);
 	}
+	// #364 S4: `[...roleTotals.entries()].map(...).sort(...)` built two throw-away
+	// arrays per frame; the projection is the same, built once.
+	const byRole: Array<{ role: string; tokens: number }> = [];
+	for (const [role, tokens] of roleTotals) byRole.push({ role, tokens });
+	byRole.sort((a, b) => b.tokens - a.tokens);
 	return {
 		now: data.rate,
 		// Full-series window average over the series this frame paints (includes
@@ -525,11 +535,40 @@ export function computeStats(data: ViewData, buckets: number, series?: RateSerie
 		peakAt,
 		total,
 		from,
-		byRole: [...roleTotals.entries()].map(([role, tokens]) => ({ role, tokens })).sort((a, b) => b.tokens - a.tokens),
+		byRole,
 	};
 }
 
 const PARTIAL = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/**
+ * #364 S4: the x-axis rule is `"└" + "─".repeat(plotW)` — a fresh 100–400B string
+ * per frame for a value that only depends on the plot width. Keyed on that width
+ * (contract I7: the key is the whole input), bounded because a page has a handful
+ * of widths.
+ */
+const AXIS_RULES = new Map<number, string>();
+const AXIS_RULES_MAX = 64;
+
+function axisRule(width: number): string {
+	const cached = AXIS_RULES.get(width);
+	if (cached !== undefined) return cached;
+	const rule = `└${"─".repeat(width)}`;
+	if (AXIS_RULES.size >= AXIS_RULES_MAX) AXIS_RULES.clear();
+	AXIS_RULES.set(width, rule);
+	return rule;
+}
+
+/**
+ * #364 S4: the chart's per-column band stack (one `{top, role}` object per
+ * non-zero role per column — up to plotW × #roles per frame) as two reused
+ * arrays with a count, re-emptied for every column.
+ */
+const CHART_BAND_TOP: number[] = [];
+const CHART_BAND_ROLE: string[] = [];
+let chartBandCount = 0;
+/** The chart's role list for this frame (stats order first, then series-only roles). */
+const CHART_ROLES: string[] = [];
 
 /**
  * #346: the frame's bucketing pass — ONE per frame, shared by `drawChart`'s body
@@ -560,28 +599,43 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	const stats = computeStats(data, plotW, series, { from, to });
 	const max = Math.max(1, stats.peak * 1.15);
 	const rowsFor = (v: number): number => (v / max) * plotH;
-	const roles = stats.byRole.map((entry) => entry.role);
-	for (const role of series.byRole.keys()) if (!roles.includes(role)) roles.push(role);
+	CHART_ROLES.length = 0;
+	for (const entry of stats.byRole) CHART_ROLES.push(entry.role);
+	for (const role of series.byRole.keys()) if (!CHART_ROLES.includes(role)) CHART_ROLES.push(role);
 
 	for (let i = 0; i < plotW; i++) {
 		let acc = 0;
-		const bands: Array<{ top: number; role: string }> = [];
-		for (const role of roles) {
+		chartBandCount = 0;
+		for (let ri = 0; ri < CHART_ROLES.length; ri++) {
+			const role = CHART_ROLES[ri]!;
 			const value = series.byRole.get(role)?.[i] ?? 0;
 			if (value <= 0) continue;
 			acc += value;
-			bands.push({ top: rowsFor(acc), role });
+			CHART_BAND_TOP[chartBandCount] = rowsFor(acc);
+			CHART_BAND_ROLE[chartBandCount] = role;
+			chartBandCount += 1;
 		}
 		const top = rowsFor(acc);
+		// The same two lookups the object array served: the first band whose top
+		// covers the row centre, else the last band; and the topmost role for the
+		// partial (▁▂▃…) cell.
+		const lastRole = chartBandCount > 0 ? CHART_BAND_ROLE[chartBandCount - 1]! : undefined;
 		for (let j = 0; j < plotH; j++) {
 			const center = j + 0.5;
 			const y = axisY - 1 - j;
 			if (top >= j + 1) {
-				const band = bands.find((b) => b.top >= center) ?? bands[bands.length - 1];
-				if (band) cv.set(plotX + i, y, "█", roleColor(band.role));
+				let bandRole: string | undefined;
+				for (let b = 0; b < chartBandCount; b++) {
+					if (CHART_BAND_TOP[b]! >= center) {
+						bandRole = CHART_BAND_ROLE[b]!;
+						break;
+					}
+				}
+				if (bandRole === undefined) bandRole = lastRole;
+				if (bandRole !== undefined) cv.set(plotX + i, y, "█", roleColor(bandRole));
 			} else if (top > j) {
 				const eighth = Math.round((top - j) * 8);
-				if (eighth > 0) cv.set(plotX + i, y, PARTIAL[eighth]!, roleColor(bands[bands.length - 1]?.role ?? "worker"));
+				if (eighth > 0) cv.set(plotX + i, y, PARTIAL[eighth]!, roleColor(lastRole ?? "worker"));
 				break;
 			}
 		}
@@ -612,7 +666,7 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	if (plotH >= 5 && max >= 20) yLabel(max / 2, axisY - 1 - Math.floor(plotH / 2));
 	yLabel(0, axisY - 1);
 	// X axis: elapsed time since the window start; the right edge is the present.
-	cv.text(plotX - 1, axisY, "└" + "─".repeat(plotW), "borderMuted", { maxX: plotX + plotW });
+	cv.text(plotX - 1, axisY, axisRule(plotW), "borderMuted", { maxX: plotX + plotW });
 	cv.text(plotX, axisY, "0m", "dim");
 	const mid = formatDuration((to - from) / 2);
 	if (plotW > 24) cv.text(plotX + Math.floor(plotW / 2) - Math.floor(mid.length / 2), axisY, mid, "dim");
@@ -648,7 +702,9 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 		y++;
 		const roomForRoles = r.h - (y - r.y) - (selected ? 4 : 0);
 		const top = stats.byRole[0]?.tokens ?? 1;
-		for (const entry of stats.byRole.slice(0, Math.max(0, roomForRoles))) {
+		const roleRows = Math.min(stats.byRole.length, Math.max(0, roomForRoles));
+		for (let ri = 0; ri < roleRows; ri++) {
+			const entry = stats.byRole[ri]!;
 			const name = ellipsize(entry.role, 10);
 			cv.text(sx, y, name, roleColor(entry.role));
 			const barW = Math.max(0, Math.round((entry.tokens / Math.max(1, top)) * 9));

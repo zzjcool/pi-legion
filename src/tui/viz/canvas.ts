@@ -99,7 +99,7 @@ export class Canvas {
 	}
 
 	/** Write text clipped to [x, maxX). Returns the column after the last written cell. */
-	text(x: number, y: number, value: string, color?: string, style: { bold?: boolean; inverse?: boolean; maxX?: number } = {}): number {
+	text(x: number, y: number, value: string, color?: string, style: TextStyle = NO_TEXT_STYLE): number {
 		const limit = Math.min(this.width, style.maxX ?? this.width);
 		let col = x;
 		// #364: walk code points by index instead of `Array.from(value)` — the old
@@ -185,6 +185,19 @@ export class Canvas {
 
 /** Shared empty style so a `set(x, y, ch)` call allocates no default object. */
 const NO_STYLE: { bold?: boolean; inverse?: boolean } = {};
+
+interface TextStyle {
+	bold?: boolean;
+	inverse?: boolean;
+	maxX?: number;
+}
+
+/**
+ * #364: `text()`'s default argument was `{}` — a fresh object per call, i.e. one
+ * per written string (~1,200 per 200x60 frame, measured 58KB). The painter never
+ * mutates the style object, so one shared instance serves every style-less call.
+ */
+const NO_TEXT_STYLE: TextStyle = {};
 
 /** Palette cache bound: one theme × one role set is a handful of entries. */
 const PALETTE_CACHE_MAX = 32;
