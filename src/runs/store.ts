@@ -46,6 +46,49 @@ const CORRUPT_SUFFIX = ".corrupt";
 const ARTIFACT_DIR = "out";
 const SESSION_EXT = ".jsonl";
 
+/**
+ * How long a `listRuns()` snapshot may be reused before it is re-taken (#344).
+ *
+ * In-process writes drop the snapshot immediately, and a create/delete changes
+ * the runs directory's mtime, so this bounds exactly one gap: a run.json
+ * rewritten IN PLACE by another process, which moves no directory mtime. Short
+ * enough that a foreign state change is seen within a control call or two, long
+ * enough that a burst of control calls (the N-children × rounds case the scan
+ * used to tax) re-parses nothing.
+ */
+const LIST_RUNS_CACHE_TTL_MS = 1_000;
+
+/**
+ * Per-root registry snapshot, shared by EVERY `RunStore` instance on that root
+ * in this process (#344).
+ *
+ * Per-process rather than per-instance because the tool surface builds a
+ * `RunStore` per call (`runStoreFor(cwd)`), so an instance-level cache would
+ * almost never hit. A write through any instance drops the snapshot, which also
+ * keeps two stores on one directory from serving each other stale records.
+ */
+interface RegistryCache {
+	/** The last completed scan, or undefined when the next call must rescan. */
+	snapshot?: { mtimeMs: number; at: number; runs: RunRecord[] } | undefined;
+}
+
+const REGISTRY_CACHES = new Map<string, RegistryCache>();
+
+/** Cap on distinct roots tracked at once (a long-lived parent visits many cwds). */
+const MAX_CACHED_RUN_ROOTS = 64;
+
+function registryCacheFor(rootDir: string): RegistryCache {
+	let cache = REGISTRY_CACHES.get(rootDir);
+	if (cache) return cache;
+	// Dropping every entry at once is safe — a dropped snapshot can only cause a
+	// rescan, never a stale read — and keeps a session that walks through dozens
+	// of worktree roots from growing this map without bound.
+	if (REGISTRY_CACHES.size >= MAX_CACHED_RUN_ROOTS) REGISTRY_CACHES.clear();
+	cache = {};
+	REGISTRY_CACHES.set(rootDir, cache);
+	return cache;
+}
+
 /** 16 hex chars of entropy give each persisted child a stable owner token. */
 function newOwnerToken(): string {
 	return randomBytes(8).toString("hex");
@@ -297,6 +340,10 @@ export class RunStore {
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
+		// #344: every write path funnels through here (createRun, updateRun and
+		// everything built on it), so this one line keeps the cached registry
+		// honest for this root — including for other RunStore instances on it.
+		this.invalidateRunsCache();
 		record.updatedAt = new Date(this.nowFn()).toISOString();
 		this.atomicWrite(
 			this.runFile(record.runId),
@@ -433,13 +480,62 @@ export class RunStore {
 
 	// ── listing ─────────────────────────────────────────────────────────
 
-	/** All readable runs, oldest first. Corrupt entries are skipped silently. */
+	/**
+	 * All readable runs, oldest first. Corrupt entries are skipped silently.
+	 *
+	 * ## Why this is cached (#344)
+	 *
+	 * Every control call (`collect` / `status` / `steer` / `abort` / `retire` /
+	 * `continue`) used to start here, so a store with 352 runs paid 352
+	 * `readFileSync` + `JSON.parse` (26ms) per call, synchronously, on the parent's
+	 * event loop — and the cost grew with every run ever written. The control
+	 * paths now resolve a scoped name with a single `readRun` and only fall back
+	 * here (see `resolveScopedChild`), and this scan keeps a snapshot so that a
+	 * fallback also stops re-parsing unchanged records.
+	 *
+	 * The snapshot is keyed by `<rootDir>/runs` and dropped when ANY of these
+	 * says the directory may have moved:
+	 *
+	 *   - the runs directory's `mtimeMs` changed (a run dir was created or
+	 *     removed, by this process or another one);
+	 *   - a `RunStore` in THIS process wrote a run.json — every write funnels
+	 *     through {@link writeRun} (createRun / updateRun / addChild / updateChild
+	 *     / removeChild) or {@link prune}, which invalidate the snapshot for the
+	 *     whole root, so two stores on one directory cannot serve each other a
+	 *     stale record;
+	 *   - the snapshot is older than {@link LIST_RUNS_CACHE_TTL_MS}. A record
+	 *     rewritten in place by ANOTHER process changes no directory mtime, so the
+	 *     TTL is the bound on that: a foreign edit is picked up within the TTL
+	 *     instead of when the directory happens to change.
+	 *
+	 * Returning a fresh array per call keeps the promise of the old
+	 * implementation: callers may sort or splice what they get without touching
+	 * the snapshot.
+	 */
 	listRuns(): RunRecord[] {
 		const runsRoot = path.join(this.rootDir, RUNS_DIR);
+		let mtimeMs: number;
+		try {
+			mtimeMs = fs.statSync(runsRoot).mtimeMs;
+		} catch {
+			// No runs directory: an empty registry, and nothing worth snapshotting.
+			this.invalidateRunsCache();
+			return [];
+		}
+		const cache = registryCacheFor(this.rootDir);
+		const snapshot = cache.snapshot;
+		if (
+			snapshot &&
+			snapshot.mtimeMs === mtimeMs &&
+			this.nowFn() - snapshot.at < LIST_RUNS_CACHE_TTL_MS
+		) {
+			return [...snapshot.runs];
+		}
 		let entries: string[];
 		try {
 			entries = fs.readdirSync(runsRoot);
 		} catch {
+			this.invalidateRunsCache();
 			return [];
 		}
 		const out: RunRecord[] = [];
@@ -448,7 +544,18 @@ export class RunStore {
 			if (record) out.push(record);
 		}
 		out.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-		return out;
+		cache.snapshot = { mtimeMs, at: this.nowFn(), runs: out };
+		return [...out];
+	}
+
+	/**
+	 * Drop the cached `listRuns()` snapshot for this store's root.
+	 *
+	 * Called by every write this store performs; public so a caller that mutates
+	 * the runs directory out of band (a migration, a test fixture) can say so.
+	 */
+	invalidateRunsCache(): void {
+		registryCacheFor(this.rootDir).snapshot = undefined;
 	}
 
 	// ── pruning ─────────────────────────────────────────────────────────
@@ -483,6 +590,10 @@ export class RunStore {
 			return { removedSessions, removedRuns };
 		}
 
+		// A pruned run dir disappears without going through writeRun, and a removed
+		// session file may be all a run had — either way the cached registry is no
+		// longer what a scan would answer.
+		this.invalidateRunsCache();
 		for (const entry of entries) {
 			const dir = path.join(runsRoot, entry);
 			const runFile = path.join(dir, RUN_FILE);

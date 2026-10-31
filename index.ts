@@ -109,10 +109,12 @@ import {
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
 import {
-	resolveChildScope,
 	describeChildScopeCandidates,
+	foundElsewhere,
+	foundInScope,
+	resolveScopedChild,
+	scopeHitFor,
 	type ChildScopeCandidate,
-	type ChildScopeHit,
 } from "./src/runs/child-scope.ts";
 import {
 	candidateStoreRoots,
@@ -1401,7 +1403,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				// uses: `alive` is this process's in-memory registry and never holds a
 				// child launched elsewhere, so a foreign record needs the owner marker.
 				// Undefined while alive — liveness already wins there.
-				const owner = ownerVerdictFor(store, runs, child.name, alive);
+				const owner = ownerVerdictFor(store, () => runs, child.name, alive);
 				// #315/#331: same display-only activity fact `subagent status` prints,
 				// so the slash command cannot drift from the tool surface.
 				const inFlightTools = inFlightToolStackOf(supervisor, child.name);
@@ -1928,7 +1930,7 @@ async function controlAction(input: {
 				const cached = factsByName.get(child.name);
 				if (cached) return cached;
 				const alive = input.supervisor.isAlive(child.name);
-				const owner = ownerVerdictFor(store, runs, child.name, alive);
+				const owner = ownerVerdictFor(store, () => runs, child.name, alive);
 				// A pid only exists for a child this process actually tracks; a
 				// record from another session has none, and none is invented.
 				const pid = input.runtime.get(child.name)?.pid;
@@ -1962,31 +1964,31 @@ async function controlAction(input: {
 				),
 			);
 		}
-		const runs = store.listRuns();
+		// #344: the registry scan is a FALLBACK, not an entry fee. A name this
+		// session is scoped to resolves from one `readRun`; the scan only happens
+		// when the answer depends on other runs.
 		const directRunId = scopeRunIdFor({
 			runId: params.runId,
 			sessionRunId: input.legion?.runId,
 			trackedRunId: input.runtime.get(params.name)?.runId,
 		});
-		const hit = scopeHitFor({
+		const scope = resolveScopedChild({
 			name: params.name,
-			directRunId,
 			explicitRunId: params.runId,
-			runs,
+			directRunId,
+			readRun: (runId) => store.readRun(runId),
+			listRuns: () => store.listRuns(),
 		});
+		const hit = scope.hit;
 		// #312: `status` is the one action that may SHOW a node it does not own, but
 		// two same-named nodes are an ambiguity it must not resolve by preference —
 		// that preference is how `status` and `collect` came to disagree.
 		if (hit.kind === "elsewhere" && hit.candidates.length > 1) {
 			return fail(ambiguousChildMessage("status", params.name, hit.candidates), ErrorCodes.NOT_FOUND);
 		}
-		const scoped =
-			hit.kind === "direct"
-				? foundInScope(runs, directRunId, params.name)
-				: foundElsewhere(runs, params.name, hit);
 		// #270: a miss in this store is not a miss overall — a worktree child's
 		// record lives under its own store, which this one cannot enumerate.
-		const found = scoped ?? findChildAcrossStores({
+		const found = scope.found ?? findChildAcrossStores({
 			name: params.name,
 			cwd,
 			callerCwd: input.callerCwd,
@@ -2007,7 +2009,7 @@ async function controlAction(input: {
 		const alive = input.supervisor.isAlive(params.name);
 		// #312: the owner verdict belongs to the run dir of the record just resolved
 		// (`found.runId`) — not to whatever `pickChildByName` prefers across runs.
-		const owner = ownerVerdictFor(store, runs, params.name, alive, found.runId);
+		const owner = ownerVerdictFor(store, scope.runs, params.name, alive, found.runId);
 		// #315: what it is doing and for how long, prepended to the block when this
 		// process is actually running a tool for it.
 		const snapshot = renderLiveChildStatus({
@@ -2034,18 +2036,22 @@ async function controlAction(input: {
 		);
 	}
 
-	const runs = store.listRuns();
+	// #344: as in `status`, the full registry is the FALLBACK. Resolving a name
+	// this call is already scoped to costs one `readRun` (0.05ms) instead of a
+	// scan of every run ever written (26ms at 352 runs).
 	const directRunId = scopeRunIdFor({
 		runId: params.runId,
 		sessionRunId: input.legion?.runId,
 		trackedRunId: input.runtime.get(params.name)?.runId,
 	});
-	const hit = scopeHitFor({
+	const scope = resolveScopedChild({
 		name: params.name,
-		directRunId,
 		explicitRunId: params.runId,
-		runs,
+		directRunId,
+		readRun: (runId) => store.readRun(runId),
+		listRuns: () => store.listRuns(),
 	});
+	const hit = scope.hit;
 	if (hit.kind === "elsewhere") {
 		// #312: never guess between two same-named nodes, whichever action asked.
 		if (hit.candidates.length > 1) {
@@ -2068,9 +2074,7 @@ async function controlAction(input: {
 	// outside this session's run stays addressable); the scope run is still tried
 	// first, so the common case never depends on the fallback.
 	const found =
-		(hit.kind === "direct"
-			? foundInScope(runs, directRunId, params.name)
-			: foundElsewhere(runs, params.name, hit)) ??
+		scope.found ??
 		findChildAcrossStores({
 			name: params.name,
 			cwd,
@@ -2190,80 +2194,6 @@ function scopeRunIdFor(input: {
 	trackedRunId?: string | undefined;
 }): string | undefined {
 	return input.runId ?? input.sessionRunId ?? input.trackedRunId;
-}
-
-/** A resolved child with the run it came from, as every control action needs it. */
-type ResolvedRunChild = NonNullable<ReturnType<typeof findChild>>;
-
-/**
- * The record `scopeRunId` actually owns for `name`, or `null`.
- *
- * This is the whole definition of "a direct child" in the resolver's terms: an
- * exact `(runId, name)` pair — never "the newest record with that name".
- */
-function foundInScope(
-	runs: ReturnType<RunStore["listRuns"]>,
-	scopeRunId: string | undefined,
-	name: string,
-): ResolvedRunChild | null {
-	if (!scopeRunId) return null;
-	const run = runs.find((candidate) => candidate.runId === scopeRunId);
-	const child = run?.children.find((candidate) => candidate.name === name);
-	if (!run || !child) return null;
-	return { runId: run.runId, run, child };
-}
-
-/** {@link resolveChildScope}, wired to one store's run records. */
-function scopeHitFor(input: {
-	name: string;
-	/**
-	 * The run whose children count as direct: the explicit `runId` when the caller
-	 * named one, else the run this session owns. Separate from `explicitRunId` on
-	 * purpose — see it below.
-	 */
-	directRunId: string | undefined;
-	/**
-	 * The `runId` the CALLER passed, which is the only thing allowed to narrow the
-	 * cross-run search. The inferred session run must not: with it in the filter a
-	 * name that lives in another run would come back `absent` instead of
-	 * `elsewhere`, and the refusal that tells the caller where it actually is
-	 * would never be reachable.
-	 */
-	explicitRunId?: string | undefined;
-	runs: ReturnType<RunStore["listRuns"]>;
-}): ChildScopeHit {
-	return resolveChildScope({
-		name: input.name,
-		runId: input.explicitRunId,
-		direct: (name) => foundInScope(input.runs, input.directRunId, name)?.child,
-		scan: () =>
-			input.runs.flatMap((run) =>
-				run.children.map((child) => ({
-					runId: run.runId,
-					nodeId: child.nodeId,
-					name: child.name,
-					state: child.state,
-					sessionFile: child.sessionFile,
-				})),
-			),
-	});
-}
-
-/**
- * The one node an `elsewhere` hit points at, when it is unambiguous.
- *
- * `null` for `absent` and for an ambiguity: a caller that cannot name the node
- * must not pick one, and the ambiguity is reported before this is consulted.
- */
-function foundElsewhere(
-	runs: ReturnType<RunStore["listRuns"]>,
-	name: string,
-	hit: ChildScopeHit,
-): ResolvedRunChild | null {
-	if (hit.kind !== "elsewhere" || hit.candidates.length !== 1) return null;
-	const only = hit.candidates[0];
-	if (!only) return null;
-	return foundInScope(runs, only.runId, name);
 }
 
 /** Actions that may only ever act on this session's own direct child (#312). */
@@ -4522,7 +4452,7 @@ export function renderWait(results: WaitResult[]): string {
  */
 function ownerVerdictFor(
 	store: RunStore,
-	runs: ReturnType<RunStore["listRuns"]>,
+	runs: () => ReturnType<RunStore["listRuns"]>,
 	name: string,
 	alive: boolean,
 	runId?: string | undefined,
@@ -4534,7 +4464,9 @@ function ownerVerdictFor(
 	// a child whose own run dir is owned by this live process could render
 	// `owner: dead (pid gone)` and even be rewritten to `state=failed`.
 	if (runId) return ownerState(path.join(store.runDir(runId), RUN_OWNER_FILE));
-	const picked = pickChildByName(runs, name);
+	// Only a caller with no resolved run reaches this: the registry scan happens
+	// here and nowhere earlier (#344).
+	const picked = pickChildByName(runs(), name);
 	if (!picked) return "unknown";
 	return ownerState(path.join(store.runDir(picked.run.runId), RUN_OWNER_FILE));
 }
