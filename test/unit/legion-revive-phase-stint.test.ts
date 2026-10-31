@@ -312,3 +312,34 @@ test("#357: a non-team node resume is untouched — no phase, no phase_change, n
 		fx.cleanup();
 	}
 });
+
+test("#357 review (minor 2): a revival whose launch fails gives the clock back", async () => {
+	// The reservation moves `phase_since` and writes the `revived` row, and only THEN does
+	// the supervisor spawn. A failed spawn therefore left the node holding a fresh stint it
+	// never ran — a clock that `checkOwnPhaseTimeout` de-dupes on, so the next successful
+	// launch (or the still-running work) would be measured from a launch that does not
+	// exist. The clock travels with the rest of the reservation.
+	const fx = fixture();
+	const failedAt = STINT_START + 60_000;
+	try {
+		const supervisor = new FakeSupervisor({ immediateTimeout: false, rejectSpawn: () => new Error("spawn refused") });
+		const orchestrator = new Orchestrator({
+			supervisor,
+			runDir: fx.runDir,
+			cwd: fx.rootDir,
+			maxDepth: 4,
+			legion: fx.context,
+			now: () => failedAt,
+		});
+		await assert.rejects(
+			orchestrator.launch({ agent: teamCard(), name: TEAM_NAME, task: "continue: finish the stint", worktree: false }),
+			/spawn refused/u,
+		);
+		const team = getNode(fx.db, TEAM_ID);
+		assert.equal(team?.phaseSince, STINT_START, "the moved stint start is rolled back with the reservation");
+		assert.equal(team?.status, "running", "…along with the status the reservation rewrote");
+		assert.equal(team?.phase, "implementing", "the phase never moved: a revival resumes in place");
+	} finally {
+		fx.cleanup();
+	}
+});

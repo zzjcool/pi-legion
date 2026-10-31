@@ -27,12 +27,31 @@ import assert from "node:assert/strict";
 
 import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { LegionPostman } from "../../src/extension/legion-tools.ts";
+import { legionSettingsForRun, parseSubagentSettings } from "../../src/agents/settings.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
 import { readEventsAfter } from "../../src/legion/events.ts";
 import { MAIL_DELIVERY, inbox } from "../../src/legion/mail.ts";
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import type { PhaseMachine } from "../../src/legion/phase-machine.ts";
+import type { LegionSettings } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
+
+/**
+ * The `legion` settings a run REALLY carries (#358 review, major 1).
+ *
+ * `index.ts` handed the postman a default-FILLED object, so `phaseTimeouts` held all
+ * four built-in numbers whether or not an operator ever wrote one down. Every fixture
+ * in this file used to inject a slim `{ phaseTimeouts: { ... } }` instead — an object
+ * production never produced — so `setting > machine > default` looked correct here
+ * while a real run always had a value on the left of the `??`. These helpers go through
+ * the same two seams `index.ts` does: `parseSubagentSettings` for a settings.json the
+ * operator wrote, `legionSettingsForRun` for the run-time fill.
+ */
+function runSettings(legion?: Record<string, unknown>): LegionSettings {
+	return legionSettingsForRun(
+		legion ? parseSubagentSettings({ subagents: { legion } }, "/fake/settings.json") : undefined,
+	);
+}
 
 type Db = ReturnType<typeof openLegionDb>;
 
@@ -95,7 +114,7 @@ function makeDb(options: { phase: string | null; phaseSince?: number; taskSummar
 	return db;
 }
 
-async function tick(db: Db, options: { machine?: PhaseMachine; now?: number; settings?: Record<string, unknown> } = {}) {
+async function tick(db: Db, options: { machine?: PhaseMachine; now?: number; settings?: LegionSettings } = {}) {
 	const selfMessages: string[] = [];
 	const postman = new LegionPostman({
 		db,
@@ -189,6 +208,66 @@ test("#358: a custom phase cannot finalize without a passing verdict", async () 
 	}
 });
 
+test("#358 review (minor 3): a non-final declared phase can never complete the team", async () => {
+	// The control for the derivation: `successPhase` answers `ship` for this machine, and a
+	// team parked in `impl` — verified as its work may be — must not be collected from
+	// there, or every intermediate phase would become a completion gate.
+	const db = makeDb({ phase: "impl", taskSummary: verifiedSummary() });
+	try {
+		await tick(db, { machine: SPEC_MACHINE });
+		assert.equal(getNode(db, "root.team")?.phase, "impl", "only the machine's success phase completes a team");
+		assert.deepEqual(phaseChanges(db), [], "no phase_change either — nothing to announce");
+	} finally {
+		db.close();
+	}
+});
+
+/**
+ * A card whose DECLARATION order is not its pipeline order: `ship` ends the workflow
+ * (`spec -> review -> ship -> done`) but is listed first.
+ *
+ * `successPhase` prefers an edge gated on `verification_passed` and otherwise takes the
+ * LAST declared candidate — which is only correct because a machine is expected to list
+ * its phases in pipeline order (README/contract: "`phases:` order is pipeline order").
+ * This machine breaks that expectation on purpose, so the test can pin what depends on it.
+ */
+const SHUFFLED_MACHINE: PhaseMachine = {
+	start: "spec",
+	phases: [
+		{ id: "ship", next: [{ to: "done", require: ["verification_passed"] }] },
+		{ id: "spec", next: [{ to: "review" }] },
+		{ id: "review", next: [{ to: "ship" }, { to: "done", require: ["verification_passed"] }] },
+	],
+};
+
+test("#358 review (minor 3): declaration order, not pipeline order, decides the completion gate", async () => {
+	// Two candidates can reach `done` here, so "last" is observable: the rule follows the
+	// ORDER THE CARD WROTE, which is why "`phases:` order is pipeline order" is a load-bearing
+	// assumption and not a style note. The last declared candidate is `review`, although the
+	// workflow's own last phase is `ship`.
+	const fromReview = makeDb({ phase: "review", taskSummary: verifiedSummary() });
+	const fromShip = makeDb({ phase: "ship", taskSummary: verifiedSummary() });
+	try {
+		await tick(fromReview, { machine: SHUFFLED_MACHINE });
+		assert.equal(
+			getNode(fromReview, "root.team")?.phase,
+			"done",
+			"a shuffled declaration moves the success phase with the declaration, not the workflow",
+		);
+
+		await tick(fromShip, { machine: SHUFFLED_MACHINE });
+		assert.equal(
+			getNode(fromShip, "root.team")?.phase,
+			"ship",
+			"…so the workflow's real last phase is NOT the gate here: declare phases in pipeline order",
+		);
+		assert.deepEqual(phaseChanges(fromShip), []);
+	} finally {
+		fromReview.close();
+		fromShip.close();
+	}
+});
+
 // ---------------------------------------------------------------------------
 // 2. The advisory phase clock
 // ---------------------------------------------------------------------------
@@ -230,22 +309,29 @@ test("#358: a custom phase with no timeout anywhere still says nothing (0 means 
 });
 
 test("#358 control: the built-in four phases keep their exact clocks", async () => {
-	for (const [phase, timeoutMs] of [
-		["planning", 15 * 60_000],
-		["implementing", 60 * 60_000],
-		["reviewing", 30 * 60_000],
-		["verifying", 15 * 60_000],
-	] as const) {
-		const db = makeDb({ phase, phaseSince: NOW });
-		try {
-			await tick(db, { now: NOW + timeoutMs - 1 });
-			assert.deepEqual(phaseTimeouts(db), [], `${phase}: one millisecond early is early`);
-			await tick(db, { now: NOW + timeoutMs });
-			const timeouts = phaseTimeouts(db);
-			assert.equal(timeouts.length, 1, `${phase}: the built-in clock still fires exactly on time`);
-			assert.equal((timeouts[0]!.data as { timeoutMs: number }).timeoutMs, timeoutMs);
-		} finally {
-			db.close();
+	// Both settings shapes matter: the slim object these fixtures used to inject, and the
+	// default-FILLED one a real run carries (#358 review, major 1). The two must agree
+	// byte for byte, or "no explicit setting, no machine" means something different in a
+	// test than in production.
+	const shapes: Array<[string, LegionSettings]> = [["slim", {}], ["default-filled", runSettings()]];
+	for (const [label, settings] of shapes) {
+		for (const [phase, timeoutMs] of [
+			["planning", 15 * 60_000],
+			["implementing", 60 * 60_000],
+			["reviewing", 30 * 60_000],
+			["verifying", 15 * 60_000],
+		] as const) {
+			const db = makeDb({ phase, phaseSince: NOW });
+			try {
+				await tick(db, { settings, now: NOW + timeoutMs - 1 });
+				assert.deepEqual(phaseTimeouts(db), [], `${label}/${phase}: one millisecond early is early`);
+				await tick(db, { settings, now: NOW + timeoutMs });
+				const timeouts = phaseTimeouts(db);
+				assert.equal(timeouts.length, 1, `${label}/${phase}: the built-in clock still fires exactly on time`);
+				assert.equal((timeouts[0]!.data as { timeoutMs: number }).timeoutMs, timeoutMs);
+			} finally {
+				db.close();
+			}
 		}
 	}
 });
@@ -260,6 +346,57 @@ test("#358: an explicit operator setting still outranks the machine's advisory c
 			phases: [{ id: "implementing", timeoutMs: 60 * 60_000, next: [{ to: "done" }] }],
 		};
 		await tick(db, { machine, settings: { phaseTimeouts: { implementing: 10_000 } }, now: NOW + 10_000 });
+		const timeouts = phaseTimeouts(db);
+		assert.equal(timeouts.length, 1);
+		assert.equal(
+			(timeouts[0]!.data as { timeoutMs: number }).timeoutMs,
+			10_000,
+			"the operator's 10s wins over the card's 60m",
+		);
+	} finally {
+		db.close();
+	}
+});
+
+test("#358 review (major 1): a card's timeoutMs on a BUILT-IN phase name really wins", async () => {
+	// The hole the earlier tests could not reach: `implementing` is one of the four names
+	// `DEFAULT_LEGION_SETTINGS` fills (60m). With the fill spread into a plain object, the
+	// left side of `settings.phaseTimeouts[phase] ?? machineTimeout(...)` was never null, so
+	// a card that declared 5m for `implementing` was ignored in silence — the very order
+	// this file documents. `legionExplicitFields` is what tells the two apart.
+	const cardMachine: PhaseMachine = {
+		start: "implementing",
+		phases: [{ id: "implementing", timeoutMs: 5 * 60_000, next: [{ to: "done" }] }],
+	};
+	const db = makeDb({ phase: "implementing", phaseSince: NOW });
+	try {
+		await tick(db, { machine: cardMachine, settings: runSettings(), now: NOW + 5 * 60_000 - 1 });
+		assert.deepEqual(phaseTimeouts(db), [], "one millisecond before the card's clock nothing is said");
+		await tick(db, { machine: cardMachine, settings: runSettings(), now: NOW + 5 * 60_000 });
+		const timeouts = phaseTimeouts(db);
+		assert.equal(timeouts.length, 1, "the card's 5m must arm a phase the built-in table also knows");
+		assert.deepEqual(timeouts[0]!.data, {
+			phase: "implementing",
+			phaseSince: NOW,
+			elapsedMs: 5 * 60_000,
+			timeoutMs: 5 * 60_000,
+		});
+	} finally {
+		db.close();
+	}
+});
+
+test("#358 review (major 1): an explicit operator clock still beats the card, through the production seam", async () => {
+	// Same default-filled object, but this time the operator DID write `implementing: 10s`
+	// down and the card asks for an hour. The fill and the decision must stay
+	// distinguishable — that is the whole point of the explicitness marker.
+	const cardMachine: PhaseMachine = {
+		start: "implementing",
+		phases: [{ id: "implementing", timeoutMs: 60 * 60_000, next: [{ to: "done" }] }],
+	};
+	const db = makeDb({ phase: "implementing", phaseSince: NOW });
+	try {
+		await tick(db, { machine: cardMachine, settings: runSettings({ phaseTimeouts: { implementing: 10_000 } }), now: NOW + 10_000 });
 		const timeouts = phaseTimeouts(db);
 		assert.equal(timeouts.length, 1);
 		assert.equal(

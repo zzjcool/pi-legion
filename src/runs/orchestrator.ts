@@ -824,7 +824,16 @@ export class Orchestrator {
 	private rollbackReservation(nodeId: string, previous: LegionNode | null): void {
 		if (!this.legion) return;
 		if (!previous) { this.legion.db.prepare("DELETE FROM nodes WHERE id = ?").run(nodeId); return; }
-		updateNode(this.legion.db, nodeId, { status: previous.status, runId: previous.runId, sessionFile: previous.sessionFile, worktreePath: previous.worktreePath, model: previous.model, team: previous.team, taskSummary: previous.taskSummary }, this.now);
+		// #357 review (minor 2): a revival's reservation moves `phase_since` (that is the
+		// whole point of #357 — a new stint is a new de-dup key) and records a `revived`
+		// `phase_change`. Leaving the moved clock behind on a failed launch would claim a
+		// stint that never ran: `checkOwnPhaseTimeout` de-dupes on `phase_since`, so the
+		// node would carry a fresh, un-announced clock for a launch that does not exist.
+		// The clock therefore goes back with the rest of the reservation. `phase` did not
+		// move in the first place (a revival resumes in place), and the `revived` row is
+		// left as the durable record of the attempt — the event set is closed and an
+		// append-only ledger does not rewrite history.
+		updateNode(this.legion.db, nodeId, { status: previous.status, runId: previous.runId, sessionFile: previous.sessionFile, worktreePath: previous.worktreePath, model: previous.model, team: previous.team, taskSummary: previous.taskSummary, ...(previous.phaseSince === null ? {} : { phaseSince: previous.phaseSince }) }, this.now);
 	}
 
 	budget(): { used: number; limit: number | null; remaining: number | null } {
