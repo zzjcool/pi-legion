@@ -21,7 +21,7 @@ import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "..
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { evaluatePhaseTransition, isTerminalPhase } from "../legion/state-machine.ts";
-import type { PhaseMachine } from "../legion/phase-machine.ts";
+import { phaseStart, type PhaseMachine } from "../legion/phase-machine.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import {
 	ALLOW_NESTED_ENV,
@@ -639,7 +639,15 @@ export class Orchestrator {
 				model: input.model ?? null,
 				team: team && team !== DEFAULT_TEAM ? team : null,
 				status: "starting",
-				...(input.agent.name === "centurion" ? { phase: "planning", phaseSince: this.now() } : {}),
+				// #350: a team is born in ITS machine's start phase. The literal
+				// `"planning"` used to be written for every team, so a card declaring
+				// `phases:` whose first phase is not `planning` (e.g. `recon -> build`)
+				// produced a team born in a phase its own machine never declared — and
+				// `evaluatePhaseTransition` refuses every transition out of an unknown
+				// `from` as `invalid_phase`, which closed advancing, declaring failure
+				// and aborting alike. An UNDECLARED team keeps the literal, so the
+				// built-in four-phase pipeline is bit-for-bit unchanged.
+				...(input.agent.name === "centurion" ? { phase: input.agent.phases ? phaseStart(input.agent.phases) : "planning", phaseSince: this.now() } : {}),
 				taskSummary: input.task.slice(0, 2_000),
 			}, this.now);
 			return null;

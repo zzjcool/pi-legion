@@ -15,6 +15,7 @@ import {
 	type LegionCommandRunner,
 } from "../../src/extension/legion-tools.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
+import type { PhaseMachine } from "../../src/legion/phase-machine.ts";
 import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import { MAIL_DELIVERY, formatMail, inbox, pendingInbox, sendMail, transitionDelivery } from "../../src/legion/mail.ts";
 import { getNode, insertNode, listStaleNodes, updateNode } from "../../src/legion/nodes.ts";
@@ -989,5 +990,62 @@ test("#338 minor 6: a mail_sent row beyond 100 later events is still emitted to 
 	} finally {
 		db.close();
 		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("#350 major 2: a declared machine's team whose children ALL failed is judged failed instead of dropping the verdict", async () => {
+	const db = openLegionDb(":memory:");
+	const selfMessages: string[] = [];
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		// A team born in ITS OWN machine's start phase (#350): `recon` is not a phase of
+		// the built-in machine, which is exactly what made the safety net unreachable —
+		// `evaluatePhaseTransition` answered `invalid_phase` and the guard swallowed it.
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running", phase: "recon" }, () => 2);
+		insertNode(db, { parentId: "root.team", name: "a", role: "worker", status: "failed" }, () => 3);
+		insertNode(db, { parentId: "root.team", name: "b", role: "worker", status: "failed" }, () => 4);
+		const machine: PhaseMachine = {
+			start: "recon",
+			phases: [
+				{ id: "recon", next: [{ to: "build" }] },
+				{ id: "build", next: [{ to: "check" }] },
+				{ id: "check", next: [] },
+			],
+		};
+		// `emitStored` short-circuits its argument without a bus, so the phase_change row
+		// only reaches the ledger when one is attached (as the extension always does).
+		const eventBus = createLegionEventBus();
+		const emitted: string[] = [];
+		eventBus.on("phase_change", (event) => emitted.push(String((event.data as { to?: string } | null)?.to)));
+		const postman = new LegionPostman({
+			db,
+			nodeId: "root.team",
+			supervisor: new FakeSupervisor(),
+			machine,
+			eventBus,
+			now: () => 100,
+			intervalMs: 10_000,
+			sendSelfMessage: (message) => selfMessages.push(message),
+		});
+		await postman.tick();
+		postman.stop();
+
+		// The verdict itself: `terminalReason: all_children_failed` is the only reason
+		// this path passes, so a `recon -> failed` phase_change is that fact in the ledger.
+		assert.equal(getNode(db, "root.team")?.phase, "failed", "all children failed must fail the team, not leave it in its own phase");
+		const phaseChanges = readEventsAfter(db, 0).filter((event) => event.type === "phase_change");
+		assert.deepEqual(
+			phaseChanges.map((event) => ({ ...(event.data as { from: string; to: string; reworkCount: number }) })),
+			[{ from: "recon", to: "failed", reworkCount: 0 }],
+			"one phase_change: the machine was attached (without it the transition is `invalid_phase` and nothing is written)",
+		);
+		assert.deepEqual(emitted, ["failed"], "the bus learns about the verdict in the same tick");
+		// …and it is no longer SILENT: the team says so locally and mails its parent.
+		assert.deepEqual(selfMessages, ["Legion team root.team failed because all direct children failed."]);
+		const parentMail = inbox(db, "root", { delivery: MAIL_DELIVERY.PENDING });
+		assert.equal(parentMail.length, 1, "the parent must hear about the verdict, not have to poll the ledger");
+		assert.match(parentMail[0]?.subject ?? "", /Team failed/);
+	} finally {
+		db.close();
 	}
 });

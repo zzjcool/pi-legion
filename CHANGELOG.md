@@ -131,6 +131,49 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **A team is now born in the phase its own machine starts in, so a card declaring `phases:` no longer
+  strands its team at spawn (#350).** `Orchestrator.reserveNode` wrote a hard-coded `phase: "planning"`
+  into every team row, ignoring the machine the card already carried. With a machine whose first phase
+  is not `planning` (e.g. `recon -> build`) the team was born in a phase its own machine had never heard
+  of, and `evaluatePhaseTransition` refuses every transition out of an unknown `from` as `invalid_phase`
+  *before* the target, the outgoing edge or the `failed` escape hatch is consulted — so advancing,
+  declaring failure (#309) and aborting were all closed, leaving a team that was alive and spending
+  budget while it could not move. The derivation now lives in one function, `phaseStart(machine)`
+  (`machine.start ?? machine.phases[0]?.id`), shared by the state machine's entry rule, the birth site
+  and the load-time validation (`validatePhaseMachine` no longer keeps a third copy), so the three
+  cannot drift; an empty machine falls back to the built-in start (it cannot be declared — the loader
+  rejects it). A card that declares no machine keeps the literal `"planning"`, so the built-in
+  four-phase pipeline is unchanged. Contract:
+  `docs/contracts/declarative-phase-machine-v5.md:107` (that file is `Status: draft`). **Review
+  follow-up:** making a declared start reachable also made every supervisor-side net that only speaks
+  the built-in vocabulary reachable-and-inert. `failTeamIfAllChildrenFailed` (`legion-tools.ts`)
+  evaluated `from: "recon" -> "failed"` for "every child failed" **without the team's own machine**, so
+  the transition was `invalid_phase` and the `!decision.allowed` guard dropped the verdict in silence —
+  a squad whose children had all died never reached `failed` and its parent never heard; it now forwards
+  the machine, and a new case pins the verdict (`phase === "failed"`, one `phase_change`, one mail).
+  The abort half of the same hole is #351, which landed upstream in `abortLegionPhase` (already on
+  master), so this branch only had to stop duplicating it. The other two custom-phase holes — a hard-coded
+  `phase !== "verifying"` completion gate and a phase clock that resolves to 0 for undeclared names —
+  are documented in place and tracked as #358 rather than fixed here.
+
+- **A `wait` whose result the abort net throws away now hands the completion claim back, so the child's
+  finished notice is no longer lost (#352).** Waiting on an already-settled child goes through
+  `waitAction`'s finished-cache probe, which claims the round (`claimedNow === true`) — and when the
+  parent turn ends inside the wait's `retire` teardown, the tool layer replaces the rendered result with
+  the frozen `interrupted (parent turn ended; children still running)` line and nothing was handed back:
+  `deliverBatch` filters a claimed round, so that completion notice never reached the parent, silently
+  and for the whole round. `waitAction` now carries the claims IT took out as `details.waitClaims` (only
+  `claimedNow === true`; `waitOne`'s own `claimReported` is a no-op `false` on this path), and the bail
+  gives each one back through `unclaimUndelivered` — never `unclaimReported`, which would also drop the
+  queued copy, the only remaining route — exactly as `collectChild` already does on its own bails. The
+  frozen `interrupted …` text, the `(runId, name, round)` claim key and `deliverBatch`'s single exit are
+  untouched. Contract: `docs/contracts/notice-claim-v1.md` (bail-gate enumeration extended). **Review
+  follow-up:** the probe answers ASYNCHRONOUSLY, and the first shape (`if (claims.length > 0)`) was a
+  no-op in exactly the window #352 was opened for — `waitOne` can bail while the probe's `ensureCollect`
+  is still in flight, and the claim then lands on an array nobody can reach. `details.waitClaims` is now
+  mounted unconditionally (one probe = at most one claim), the probe's own promise travels as
+  `details.waitClaimsPending`, and `releaseWaitClaims` awaits it before rolling back — so a claim that
+  landed after the bail is still handed back and the round's notice arrives exactly once.
 - **A `Phase timeout:` notice no longer outlives a team that ended in the very phase it timed out in
   (#354).** `isStalePhaseTimeoutNotice` asked `isTerminalNode`, which reads `status === "failed" ||
   phase ∈ {done,failed,aborted}`. A team that only investigated never calls `legion_phase`, so it keeps
