@@ -2619,3 +2619,80 @@ test("#364: the inlined hypot2 is bit-for-bit Math.hypot over the galaxy's domai
 	for (const pair of [[0, 0], [-0, 0], [0, -0], [1, 0], [0, 1], [-3, -4], [3e200, 4e200], [1e-200, 1e-200], [Number.NaN, 1]] as const) same(pair[0], pair[1]);
 	assert.ok(checked > 8000, `only ${checked} pairs checked`);
 });
+
+// ──────────────── #364: cross-frame caches, and the proof they invalidate (contract §4.3) ────────────────
+
+test("#364: the painted-role table follows overwrites (no stale role, no stale count)", () => {
+	// `Canvas.roles()` used to rescan every cell; it is now a table maintained by
+	// `set()`. The palette is a function of exactly the roles still on the grid, so
+	// an overwritten role MUST leave the table — otherwise the roles that remain
+	// would be assigned colours for a set that is no longer drawn (contract T5).
+	const cv = new Canvas(4, 2);
+	cv.set(0, 0, "a", "role:worker");
+	cv.set(1, 0, "b", "role:scout");
+	assert.deepEqual([...cv.roles()].sort(), ["scout", "worker"]);
+	cv.set(0, 0, "c", "role:planner"); // worker is gone from the grid
+	assert.deepEqual([...cv.roles()].sort(), ["planner", "scout"]);
+	cv.set(1, 0, "d"); // not a role colour at all
+	assert.deepEqual([...cv.roles()], ["planner"]);
+	// Rewriting the same coordinate with the same role must not double-count.
+	cv.set(0, 0, "e", "role:planner");
+	cv.set(0, 0, "f", "role:planner");
+	cv.set(0, 1, "g", "role:planner");
+	assert.deepEqual([...cv.roles()], ["planner"]);
+	// Overwriting one of two planner cells keeps the role alive.
+	cv.set(0, 0, "h");
+	assert.deepEqual([...cv.roles()], ["planner"]);
+	cv.set(0, 1, "i");
+	assert.deepEqual([...cv.roles()], [], "the last cell dropped the role");
+});
+
+test("#364: the palette cache is keyed on (theme, the frame's role set)", () => {
+	// A palette depends on the theme *and* on which roles are drawn: when the theme
+	// cannot tell two tokens apart, the second role is bumped to another token. A
+	// cache keyed on the role set alone (or on nothing) would hand a frame the
+	// previous frame's assignment. The fake theme renders the *token name*, so the
+	// assertion is about the palette, not about escape bytes.
+	const ansi: Record<string, string> = {
+		// accent and syntaxNumber share their ANSI — pi's `system` theme in palette
+		// mode — so `scout` (preferred: syntaxNumber) has to be bumped.
+		accent: "slot5",
+		syntaxNumber: "slot5",
+		error: "slot1",
+		dim: "slot8",
+	};
+	const theme = {
+		getFgAnsi: (token: string): string => ansi[token] ?? `slot-${token}`,
+		fg: (token: string, text: string): string => `[${token}]${text}`,
+	};
+	const cv = new Canvas(6, 1);
+	cv.set(0, 0, "c", "role:centurion");
+	const alone = cv.toLines(theme)[0]!;
+	assert.ok(alone.includes("[accent]"), `centurion keeps its preferred token: ${alone}`);
+	cv.set(1, 0, "s", "role:scout");
+	const both = cv.toLines(theme)[0]!;
+	const expected = resolveRolePalette(theme, cv.roles()).get("scout")!;
+	assert.ok(both.includes(`[${expected}]s`), `scout uses the bumped token ${expected}: ${both}`);
+	assert.notEqual(expected, "syntaxNumber", "the clash really forced a different token");
+	// Same input twice: the cache must return exactly what a fresh resolution does.
+	assert.equal(cv.toLines(theme)[0], cv.toLines(theme, resolveRolePalette(theme, cv.roles()))[0], "no stale palette");
+	// Drop centurion: scout is now the only role, so the clash is gone and it goes
+	// back to its preferred token — a cache keyed on the old set would not notice.
+	cv.set(0, 0, "x");
+	const solo = cv.toLines(theme)[0]!;
+	assert.ok(solo.includes("[syntaxNumber]s"), `scout alone keeps syntaxNumber: ${solo}`);
+	assert.equal(solo, cv.toLines(theme, resolveRolePalette(theme, cv.roles()))[0]);
+});
+
+test("#364: the roleColor memo is keyed on the role name", () => {
+	// Memoized because the galaxy asks for it per edge/node/label; the key is the
+	// input (a stable scalar), so a different role must still give a different
+	// colour, and the old case-insensitivity has to survive the cache.
+	assert.equal(roleColor("worker"), "role:worker");
+	assert.equal(roleColor("scout"), "role:scout");
+	assert.notEqual(roleColor("worker"), roleColor("scout"));
+	assert.equal(roleColor("Worker"), roleColor("worker"), "case-insensitive before and after the cache");
+	assert.equal(roleColor("root"), "text");
+	assert.equal(roleColor("ROOT"), "text");
+	assert.equal(roleColor("designer-x"), "role:designer-x", "an unseen role is not aliased to a cached one");
+});
