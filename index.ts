@@ -351,6 +351,12 @@ interface LegionRuntimeIdentity {
 	dbEventSource: DbEventSource;
 	postman: LegionPostman;
 	childNodeId(name: string): string | undefined;
+	/**
+	 * #351: the phase machine a node's role card declares, by role. Carried on the
+	 * identity (i.e. recorded when the tree is built) so every orchestrator this
+	 * process constructs can resolve a custom phase name for a parent retire.
+	 */
+	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }
 
 function settingsForLegion(settings: ReturnType<typeof loadSubagentSettings>): LegionSettings {
@@ -549,6 +555,8 @@ function createLegionRuntime(input: {
 	registerTools: boolean;
 	/** #298: the team root's declared phase machine, when its card supplies one. */
 	machine?: PhaseMachine;
+	/** #351: by-role resolver for the abort path (see LegionRuntimeIdentity). */
+	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }): LegionRuntimeIdentity {
 	const self = getNode(input.db, input.nodeId);
 	const eventBus = input.eventBus;
@@ -566,6 +574,7 @@ function createLegionRuntime(input: {
 			pi: input.pi, supervisor: input.supervisor, db: input.db, dbPath: input.dbPath,
 			eventBus, settings: input.settings, cwd: input.cwd, storeRootDir: input.storeRootDir,
 			parentNodeId: input.nodeId, node, message: mail.text,
+			...(input.machineForRole ? { machineForRole: input.machineForRole } : {}),
 		}),
 	});
 	const identity: LegionRuntimeIdentity = {
@@ -585,6 +594,7 @@ function createLegionRuntime(input: {
 		dbEventSource,
 		postman,
 		childNodeId: (name) => getChildByName(input.db, input.nodeId, name)?.id,
+		...(input.machineForRole ? { machineForRole: input.machineForRole } : {}),
 	};
 	if (input.registerTools && input.nodeId !== "root") registerLegionTools(input.pi, { db: input.db, nodeId: input.nodeId, role: self?.role, settings: input.settings, cwd: input.cwd, runDir: input.runDir, eventBus, sendSelfMessage: (text: string) => notice(input.pi, text), ...(input.machine ? { machine: input.machine } : {}) });
 	postman.start();
@@ -645,7 +655,7 @@ function resolveLegionIdentity(input: {
 		}
 		if (node.runId !== nodeRun.runId) updateLegionRunId(db, nodeId, nodeRun.runId);
 		const machine = phaseMachineForRole(node.role, input.cwd, input.settings);
-		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true, ...(machine ? { machine } : {}) });
+		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true, ...(machine ? { machine } : {}), machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
 		// #273: `createLegionRuntime` runs during extension LOADING, where host
 		// actions (sendMessage, spawn, ui) are not available yet. Defer the team
 		// recovery to the next tick so a failure inside it cannot crash the load
@@ -701,7 +711,7 @@ async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input:
 			}
 		}
 		try {
-			await resumeLegionChild({ pi: input.input.pi, supervisor: input.input.supervisor, db: input.identity.db, dbPath: input.identity.dbPath, eventBus: input.identity.eventBus, settings: input.identity.settings, cwd: input.input.cwd, storeRootDir: input.identity.storeRootDir, parentNodeId: input.identity.nodeId, node, message: `Resume from saved session ${node.sessionFile} and continue interrupted work.` });
+			await resumeLegionChild({ pi: input.input.pi, supervisor: input.input.supervisor, db: input.identity.db, dbPath: input.identity.dbPath, eventBus: input.identity.eventBus, settings: input.identity.settings, cwd: input.input.cwd, storeRootDir: input.identity.storeRootDir, parentNodeId: input.identity.nodeId, node, message: `Resume from saved session ${node.sessionFile} and continue interrupted work.`, ...(input.identity.machineForRole ? { machineForRole: input.identity.machineForRole } : {}) });
 		} catch (error) { notice(input.input.pi, `Could not resume ${node.id}: ${error instanceof Error ? error.message : String(error)}`); }
 	}
 }
@@ -718,10 +728,10 @@ function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSuperviso
 	// writes the same column from `reserveNode`; this is the root equivalent.
 	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: rootRun.runId, status: "running", taskSummary: input.task.slice(0, 2_000), ...(input.rootSessionFile ? { sessionFile: input.rootSessionFile } : {}), createdAt: now, updatedAt: now }, () => now);
 	appendEvent(db, "root", "node_launched", { runId: rootRun.runId, task: input.task }, { now: () => now });
-	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false });
+	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false, machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
 }
 
-async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; db: DatabaseSync; dbPath: string; eventBus: LegionEventBus; settings: LegionSettings; cwd: string; storeRootDir: string; parentNodeId: string; node: LegionNode; message: string }): Promise<void> {
+async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; db: DatabaseSync; dbPath: string; eventBus: LegionEventBus; settings: LegionSettings; cwd: string; storeRootDir: string; parentNodeId: string; node: LegionNode; message: string; machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined }): Promise<void> {
 	const parent = getNode(input.db, input.parentNodeId);
 	if (!parent || !input.node.runId || !input.node.sessionFile) throw new Error(`resume credentials missing for ${input.node.id}`);
 	const store = new RunStore({ rootDir: input.storeRootDir });
@@ -759,7 +769,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const childRun = store.readRun(input.node.runId);
 	if (!childRun) throw new Error(`child run.json not found: ${input.node.runId}`);
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
-	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus } });
+	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus, ...(input.machineForRole ? { machineForRole: input.machineForRole } : {}) } });
 	orchestrator.restore(parentRun);
 	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
@@ -2899,7 +2909,7 @@ async function launchFamily(input: {
 		// the bug's main path (a 12-step `tasks[]` fanout against `maxChildrenPerNode`).
 		launchQueue: launchQueueBounds(settings),
 		onLaunchQueueNotice: launchQueueNoticeSink(input.pi),
-		...(legion ? { legion: { db: legion.db, dbPath: legion.dbPath, nodeId: legion.nodeId, runId: run.runId, parentNodeId: legion.parentNodeId ?? undefined, parentRunId: legion.parentRunId ?? undefined, runStore: store, settings: legion.settings, eventBus: legion.eventBus } } : {}),
+		...(legion ? { legion: { db: legion.db, dbPath: legion.dbPath, nodeId: legion.nodeId, runId: run.runId, parentNodeId: legion.parentNodeId ?? undefined, parentRunId: legion.parentRunId ?? undefined, runStore: store, settings: legion.settings, eventBus: legion.eventBus, ...(legion.machineForRole ? { machineForRole: legion.machineForRole } : {}) } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
 	});
 	orchestrator.restore(run);
@@ -3603,6 +3613,7 @@ async function launchUtilityFamily(input: {
 					runStore: store,
 					settings: legion.settings,
 					eventBus: legion.eventBus,
+					...(legion.machineForRole ? { machineForRole: legion.machineForRole } : {}),
 				},
 			} : {}),
 		});

@@ -115,6 +115,10 @@ root 行的 `session_file` 仍是 NULL —— 这些账本里发给 root 的邮�
 
 - "该 phase" 取自产生这条通知的 `phase_timeout` 事件（`data.phase` / `data.phaseSince`），**不解析正文**：
   `phase` 不同、或 `phase_since` 不同（之后重新进入同一相位）都算离开。读不到那条事件 → 保持 `ACCEPTED`，绝不猜。
+- **「已结束」= `hasEnded`（#354）**：终态（`isTerminalNode`）**或** `status ∈ {settled, retired}`。只做调查、
+  从不迁移相位的团队，结局时 `phase`/`phase_since` 仍是出生值，旧判据因而永远判不出「过期」——通知在团队
+  收队 30 分钟后才投递到 root。`reason` 文案不变（仍 `obsolete_after_phase_change`，事件闭集仍是 16），
+  覆盖面明确包含「在超时相位里就地结束」；`isTerminalNode` 语义**不**改（投递退信与孤儿扫描共用它）。
 - 只有 `kind === "notice"` 可被自动作废：mail kind 闭集是 `question|report|handoff|notice`，
   **没有** `instruction`（#338 M4 订正了三处把它写成规则的文档/注释）。其它 kind **永不**自动作废——
   一个问题、一份交接过不过期由人判断。
@@ -145,6 +149,8 @@ root 行的 `session_file` 仍是 NULL —— 这些账本里发给 root 的邮�
 `test/unit/legion-tools.test.ts`（三态落值、确认升级、子串不升级、#333 两处求值、幂等；
 #338 增：root 收件人升级到 DELIVERED、游标轮转、`report` 不作废、无 `phase_timeout` 事件不猜、
 同相位重进作废、每 seam 只 parse 一次、按 message id 重发事件）、
+`test/unit/legion-phase-timeout-ended.test.ts`（#354「已结束 = `hasEnded`」那句的**唯一**钉住者：
+停在出生相位、在超时相位里就地 `settled`/`retired` 的团队必须作废；`isTerminalNode` 不放宽）、
 `test/unit/legion-mail.test.ts`（五值迁移边、`mailboxStats`、精确匹配窗口、`inbox` 游标分页）、
 `test/unit/legion-root-session.test.ts`（#338 M1：`createRootLegion` 把本进程会话文件写进 root 行，
 并据此确认 root 收件人）、

@@ -131,6 +131,29 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **A `Phase timeout:` notice no longer outlives a team that ended in the very phase it timed out in
+  (#354).** `isStalePhaseTimeoutNotice` asked `isTerminalNode`, which reads `status === "failed" ||
+  phase ∈ {done,failed,aborted}`. A team that only investigated never calls `legion_phase`, so it keeps
+  its birth `planning` phase and ends with `status: settled` / `retired` — neither predicate fired and
+  `phase_since` never moved either, so an `action-needed` asking root to extend-or-abort a team whose
+  work had already merged was delivered ~30 minutes late. The "has ended" arm now asks the new narrow
+  `hasEnded` predicate (terminal **or** settled/retired); `isTerminalNode` is deliberately unchanged
+  because mail bounce and the orphan scan share it. The `reason` stays `obsolete_after_phase_change`
+  (event set still 16) and the "no `phase_timeout` event → stay ACCEPTED, never guess" clause stands.
+  Contract: `docs/legion-v2-contract.md` §8.3.1, `docs/contracts/mailbox-delivery-v1.md` D4.
+
+- **`retire()` / `retireAll()` / `/legion stop` can no longer leave a team in its custom phase "forever"
+  (#351).** `Orchestrator.abortLegionPhase` evaluated the abort without the team's own phase machine, so a
+  card-declared name (`build`) fell through to `DEFAULT_PHASE_MACHINE`, was refused `invalid_phase`, and
+  that refusal was silently dropped (`if (!decision.allowed) return;`) — no `aborted`, no event, no log,
+  even though the child process had already been killed. The abort now forwards the machine resolved from
+  the node's role card, and when no machine can resolve the phase the retire is **forced** through:
+  `phase` becomes `aborted` (a parent retire must always take effect — the safety bottom line in
+  `phase-machine.ts`), one `phase_change` event carries `{ forced: true, reason:
+  "parent_retire_unresolved_phase", denied }` (no new event type; the set stays at 16), and one
+  `console.warn` names the node, the phase and the refusal.
+  Contract: `docs/contracts/declarative-phase-machine-v5.md`.
+
 - **`/legion doctor` stopped recommending the dead extension switch (#329).** `inheritExtensions: true`
   and `PI_LEGION_CHILD_INHERIT_EXTENSIONS=1` outlived #328's clean-up in `legion-doctor.ts`: `true` has been
   the default since #280 and both yield 0 extensions when host discovery fails, so every doctor fix and
