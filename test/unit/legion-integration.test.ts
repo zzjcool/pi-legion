@@ -17,7 +17,9 @@ import { inbox, MAIL_DELIVERY, sendMail } from "../../src/legion/mail.ts";
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import { appendEvent } from "../../src/legion/events.ts";
 import { getUsage } from "../../src/legion/usage.ts";
-import { liveRateNodeIds } from "../../src/tui/viz/rate.ts";
+import { RateSampler, liveRateNodeIds } from "../../src/tui/viz/rate.ts";
+import type { VizNode } from "../../src/tui/viz/model.ts";
+import type { StatusVizSnapshot } from "../../src/tui/status.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
@@ -784,6 +786,7 @@ function commandHarness(
 	jobs = nodes
 		.filter((node) => node.parentId !== null)
 		.map((node) => ({ name: node.name, nodeId: node.id, state: "working" })),
+	vizSnapshot?: () => StatusVizSnapshot,
 ) {
 	const bus = createLegionEventBus();
 	const rpc = new FakeRpcEvents();
@@ -791,6 +794,9 @@ function commandHarness(
 	const runtime = {
 		activeJobs: () => jobs,
 		treeNodes: () => nodes.map((node) => ({ ...node })),
+		// #347: the paged viz view only opens when the runtime can hand the command a
+		// snapshot; absence of this method is what selects the classic `--tree` path.
+		...(vizSnapshot ? { vizSnapshot } : {}),
 	};
 	type RegisteredLegionCommand = {
 		handler: (args: string, ctx: unknown) => Promise<void>;
@@ -867,6 +873,50 @@ test("/legion mounts the paged tree; j/o opens a node overlay and q/Esc close bo
 	await treeOpen;
 	assert.equal(tree.getState().visibleIds.length > 0, true);
 	assert.equal(harness.rpc.subscriptions.length, 0);
+});
+
+test("/legion mounts the full page on the main screen, not as a full-screen overlay (#347)", async () => {
+	// #347: a full-screen overlay made pi-tui composite every row of the page
+	// (`compositeTuiLine` per row, 57–70% of the frame). The page now replaces the
+	// base component — `{ overlay: false }` — which is what skips the composite
+	// layer entirely; the detail modal it opens is still the 75% floating overlay
+	// (#193/#308), and closing the page still returns to the session view because the
+	// host restores the editor it swapped out.
+	const sampler = new RateSampler();
+	const vizNodes: VizNode[] = [
+		{ id: "root", name: "legion-0", role: "legion", parentId: null, depth: 0, status: "running", startedAt: 1_000, tokens: 0, tokensOut: 0, generationMs: 0 },
+		{ id: "root.worker", name: "worker", role: "worker", parentId: "root", depth: 1, status: "running", startedAt: 2_000, tokens: 100, tokensOut: 60, generationMs: 1_000 },
+	];
+	const harness = commandHarness(treeNodes, undefined, () => ({ nodes: vizNodes, sampler, now: 5_000, rate: 0 }));
+	const pageOpen = harness.handler("", harness.ctx);
+	await Promise.resolve();
+	assert.equal(harness.ui.calls.length, 1);
+	assert.notEqual(
+		harness.ui.calls[0]?.options?.overlay,
+		true,
+		"the /legion page must be a main-screen mount: `overlay: true` re-introduces the per-row composite (#347)",
+	);
+	assert.equal(harness.ui.calls[0]?.options?.overlayOptions, undefined, "no overlay rect ⇒ nothing composites the page");
+	const page = harness.ui.calls[0]?.component as (Component & { handleInput?(data: string): void }) | undefined;
+	assert.ok(page);
+	assert.ok(page.render(80).length > 0, "the page still renders the height it is handed");
+
+	// `j` then `o`: the detail viewer opened from the main-screen page is unchanged.
+	page.handleInput?.("j");
+	page.handleInput?.("o");
+	await Promise.resolve();
+	assert.equal(harness.ui.calls.length, 2);
+	assert.equal(harness.ui.calls[1]?.options?.overlay, true);
+	assert.deepEqual(harness.ui.calls[1]?.options?.overlayOptions, resolveModalOverlayOptions());
+
+	// Esc closes the detail modal only; the page is still mounted, and `q` closes it.
+	const detail = harness.ui.calls[1]?.component as Component | undefined;
+	assert.ok(detail);
+	detail.handleInput?.("\u001b");
+	await harness.ui.calls[1]!.promise;
+	assert.notEqual(harness.ui.calls[0]?.options?.overlay, true, "the page survives closing the detail modal");
+	page.handleInput?.("q");
+	await pageOpen;
 });
 
 test("status widget opener shares the live overlay controller and safely ignores duplicate or unavailable opens", async () => {

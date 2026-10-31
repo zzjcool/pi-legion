@@ -314,10 +314,10 @@ export function assertUnderlayVisibleAfterResize(
 // edge (a one-shot snapshot in `extractSegments`), and the base row ended in
 // spaces carrying no SGR.
 //
-// So this probe keeps the escapes: it renders the real /legion view as a
-// full-screen overlay, captures the frame, adds the real context modal on top,
-// re-captures, and reports the background SGR in force at the first cell of each
-// gutter on both passes.
+// So this probe keeps the escapes: it renders the real /legion view (as the mount
+// under test — full-screen overlay before #347, main-screen child after), captures
+// the frame, adds the real context modal on top, re-captures, and reports the
+// background SGR in force at the first cell of each gutter on both passes.
 // ---------------------------------------------------------------------------
 
 /** Escape the faked theme paints as the page floor; distinctive by construction. */
@@ -424,18 +424,29 @@ export interface GutterRow {
 export interface GutterProbe {
 	rows: number;
 	cols: number;
+	/** How the /legion page was mounted for this probe. */
+	mount: LegionMount;
 	/** Rect pi-tui reserved for the modal (screen coordinates). */
 	bounds: { row: number; col: number; width: number; height: number };
 	gutters: GutterRow[];
 }
 
 /**
- * Stack the real /legion view (full-screen overlay) and the real context modal
- * (75% centered overlay), then report, per frame row, the text and background
- * SGR of both gutters on both passes.
+ * `overlay` = the pre-#347 production mount (a full-screen overlay); `main` = the
+ * current one (`ui.custom(..., { overlay: false })`, a layout child that replaces
+ * the base instead of being composited over it).
  */
-export function assertOverlayGutterInheritsBase(options: { rows: number; cols: number }): GutterProbe {
+export type LegionMount = "overlay" | "main";
+
+/**
+ * Stack the real /legion view (as a full-screen overlay by default, or mounted on
+ * the main screen with `mount: "main"`) and the real context modal (75% centered
+ * overlay), then report, per frame row, the text and background SGR of both
+ * gutters on both passes.
+ */
+export function assertOverlayGutterInheritsBase(options: { rows: number; cols: number; mount?: LegionMount }): GutterProbe {
 	const { rows, cols } = options;
+	const mount: LegionMount = options.mount ?? "overlay";
 	const terminal = new FakeTerminal(rows, cols);
 	const tui = new TuiMainScreen(terminal, false, undefined);
 	const data = pageData();
@@ -447,8 +458,15 @@ export function assertOverlayGutterInheritsBase(options: { rows: number; cols: n
 		{},
 		() => {},
 	);
-	// production geometry: /legion is a full-screen overlay (`legion-commands.ts`).
-	tui.showOverlay(legion, { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 });
+	// pre-#347 production geometry: /legion is a full-screen overlay
+	// (`legion-commands.ts` before #347). Kept as the recorded #308 case.
+	if (mount === "overlay") {
+		tui.showOverlay(legion, { width: "100%", maxHeight: "100%", anchor: "top-left", row: 0, col: 0 });
+	} else {
+		// #347 production geometry: the page replaces the base component as a
+		// main-screen child, so nothing composites it row by row.
+		tui.addChild(legion);
+	}
 	const capture = (): string[] => {
 		tui.renderNow(true);
 		terminal.written.length = 0;
@@ -505,5 +523,5 @@ export function assertOverlayGutterInheritsBase(options: { rows: number; cols: n
 	}
 	modal.dispose();
 	legion.dispose();
-	return { rows, cols, bounds, gutters };
+	return { rows, cols, mount, bounds, gutters };
 }
