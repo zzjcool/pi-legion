@@ -81,6 +81,20 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **`/legion` 整帧分配降到 ≤2.0MB（−59% @120×40，−67% @200×60），且可见输出逐字节不变 (#364).** #362 已经修掉「每写一格分配一个 `Cell`」，这一轮清掉的是**每帧重建的
+  脚手架**：星系像素缓冲/帧内 Map、行字符缓冲、图表 band 栈、`new Canvas(W,H)`，以及 `Math.hypot`、
+  `{...cell, color}` 克隆、每帧 `text.trim()` 这类每格/每 run 的临时对象。现在这些都原地复用，
+  role 色表由 `set()` 增量维护、调色板按 **(theme, 该帧 role 集合)** 缓存，`renderLegionView` 接受一个
+  可选 canvas 让 `createLegionViewFactory` 跨帧复用（`new Canvas` 语义与成本对所有其它调用方不变；
+  `chartWindow` 的 earliest 推导也一并去掉了 `filter`/`map`/`spread`，语义等价）。
+  实测（同一脚本、200 节点、真 `Theme(dark)`、`--expose-gc`、单帧 `heapUsed` 差值 20 次中位）：
+  整帧分配 **2586.9 → 1036–1053 KB**（120×40/live，−59%）、**3963.9 → 1309–1342 KB**（200×60/live，−67%）；
+  时间仍在契约门禁内（median/p95 ≤4.0/≤7.0ms @120×40，≤7.0/≤10.0ms @200×60）。
+  **可见输出零变化**：4 形状（120×40 / 200×60 / 80×24 / 46×60）× `toPlain`/`toLines(真 dark)` 的 sha256、
+  以及逐格 `(ch, color, bold, inverse)` 的 sha256，都与改动前捕获的 golden 逐字节相同；新增的**内联 golden**
+  补上了仓里原先没有的快照空档（旧用例都是"同代码渲染两次再比"，两侧同时漂移抓不住）。
+  基准：`bench/perf-core/10-legion-frame-alloc.ts`（+ `10-baseline.json` digest golden）；
+  契约：`docs/contracts/viz-frame-alloc-v1.md`。
 - **`/legion` 从全屏 overlay 改成主屏挂载，整帧合成开销消失（120×40 4.39ms → 1.69ms，200×60 9.59ms → 3.39ms）(#347).**
   页面一直以 `overlay: true` + `width:"100%"` 打开，于是 pi-tui 对**每一行**都跑 `compositeTuiLine`
   （`extractSegments` + `sliceWithWidth` + `visibleWidth` 三次 `Intl.Segmenter` 字素扫描，行宽缓存按整行

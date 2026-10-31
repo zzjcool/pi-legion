@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
@@ -7,7 +8,7 @@ import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds, v
 import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
-import { buildLog, chartBuckets, chartWindow, computeStats, drawLog, drawStatus, frame, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
+import { buildLog, chartBuckets, chartWindow, computeStats, drawLog, drawStatus, frame, hypot2, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
 import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, LEGION_PAGE_BG, MIN_SELECTION_BADGE_W, paintPageFloor, renderLegionView } from "../../src/tui/viz/view.ts";
 import { Canvas, cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, formatActivityAgo, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
@@ -459,6 +460,33 @@ test("chartWindow: from stays min(earliest, to−60s) against frozen to", () => 
 	assert.equal(w.from, sec(0), "earliest wins over to−60s when run is long");
 	// Short run near the end of a late start: from == to−60s when earliest is fresher... 
 	// earliest at sec(0) is older than to−60s=sec(540), so min keeps sec(0). Already asserted.
+});
+
+test("chartWindow: the array-free earliest derivation is the old Math.min, point by point", () => {
+	// #364 S4 replaced `Math.min(samplerStart ?? now, ...agents.map(startedAt))` with a
+	// loop (one filtered+projected array pair and a spread per frame). Two corners of
+	// the old form are easy to lose in that rewrite, and both change `from`:
+	//   - no agent nodes ⇒ the old form folded `data.now` in via `starts.length ? starts : [now]`;
+	//   - a NaN `startedAt` ⇒ `Math.min` propagates it into `from` (never reachable from
+	//     the live path, but the equivalence is what makes the rewrite reviewable).
+	const sampler = new RateSampler();
+	sampler.record(sec(0), [ROOT]);
+	sampler.record(sec(60), [ROOT]);
+	// No agent at all: from = min(sampler.startedAt, data.now, to−60s).
+	const empty = chartWindow({ nodes: [ROOT], sampler, now: sec(600), rate: 0 });
+	assert.equal(empty.to, sec(0), "the sampler never changed ⇒ to is its first sample");
+	assert.equal(empty.from, Math.min(sec(600), empty.to - 60_000), "data.now still takes part when there is no agent");
+	// The fold is observable only when `now` is OLDER than `to - 60s`: then `from`
+// follows `data.now` instead of clamping at the 60s edge. Dropping the fold
+// yields `to - 60s` here, so this is the assertion that pins it.
+	const early = new RateSampler();
+	early.record(sec(2), [ROOT]);
+	const folded = chartWindow({ nodes: [ROOT], sampler: early, now: sec(-100), rate: 0 });
+	assert.equal(folded.to, sec(2), "to is the sampler's first sample");
+	assert.equal(folded.from, sec(-100), "no agent ⇒ data.now takes part in the min, not just to−60s");
+	// NaN propagates, exactly like `Math.min(a, Number.NaN, ...)`.
+	const nan = chartWindow({ nodes: [ROOT, node("worker-1", { startedAt: Number.NaN })], sampler, now: sec(600), rate: 0 });
+	assert.ok(Number.isNaN(nan.from), `a NaN startedAt must poison from, got ${nan.from}`);
 });
 
 test("rate: header tok/s and chart rate share one definition", () => {
@@ -2551,4 +2579,356 @@ test("#346: one chartWindow per frame (drawChart hands its window to computeStat
 	assert.equal(withWindow.from, window.from);
 	assert.equal(withWindow.peak, derived.peak);
 	assert.equal(withWindow.avg, derived.avg);
+});
+
+// ───────────────────── #364: /legion visible-output golden (contract I1) ─────────────────────
+
+/**
+ * sha256 of a rendered surface. The golden below is the **pre-#364** value:
+ * captured from commit `f989d0a` (the contract commit, rendering code identical
+ * to master `6042686`) by running this test with an empty expected map, before
+ * one line of `src/` moved.
+ */
+const sha256 = (value: string): string => createHash("sha256").update(value).digest("hex");
+
+test("#364: the /legion page renders the same bytes it did before the frame-alloc work", () => {
+	// The two byte surfaces the page hands to the host: `view.ts` renders
+	// `canvas.toLines(theme)` and wraps it in `paintPageFloor` (frozen by #308, so
+	// not part of this digest). Hashing `toPlain()` too pins the glyphs/grid
+	// separately from the styling, which is what `drawGalaxy`'s pixel buffer
+	// rewrite must preserve (contract I4).
+	//
+	// Why a golden and not "render twice and compare" (the shape of every older
+	// test in this file): two renders of the same code drift together, so they can
+	// never notice a regression (contract §4.2 — the gap recon found).
+	//
+	// Four shapes: two the issue's numbers are stated for (120x40, 200x60), the
+	// smallest the page supports (80x24) and a portrait one (46x60).
+	const { nodes, sampler, now } = scenario(600, 40);
+	const data = { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
+	const shapes: ReadonlyArray<readonly [number, number]> = [[120, 40], [200, 60], [80, 24], [46, 60]];
+	const expected: Record<string, { plain: string; ansi: string }> = {
+		"120x40": { plain: "8d75b4fc85023179acd3efe8b2f84f58bb032b0c25a70011966137e3a45e8d3e", ansi: "c30f0d005cb24827e43351242de12ba7c0cabb7dbb28209e64f2bf025bd7063c" },
+		"200x60": { plain: "1c71e80d132197d3b7ceb797019889a2dd7db29ee7c536853c3511f31254bacd", ansi: "1f1145386e4893120d24a2cb23f3a16c7a39bdff5af43e25575fe9d2586c176b" },
+		"80x24": { plain: "5f71d89b9a98628f1fdf4f364941eac332cae92fe725af689b75cb2fb8c257e3", ansi: "37455f157fda3999916d12c356aa7cc80fe1abb4129d259b349bbf08b61ebabb" },
+		"46x60": { plain: "6f000ab58d8a36884240de3190d4c29557e6a5da9bdb958ff5fdcef013f850e4", ansi: "223f902d495535618c9f963bbb5950dd51bdc89cbca19d93aba57371c4fb8117" },
+	};
+	const actual: Record<string, { plain: string; ansi: string }> = {};
+	for (const [cols, rows] of shapes) {
+		const canvas = renderLegionView(data, initialViewState(), cols, rows).canvas;
+		actual[`${cols}x${rows}`] = {
+			plain: sha256(canvas.toPlain().join("\n")),
+			ansi: sha256(canvas.toLines(ansiTheme).join("\n")),
+		};
+	}
+	assert.deepEqual(actual, expected, "the page's bytes moved");
+});
+
+/**
+ * `(ch, color, bold, inverse)` of every cell, in grid order, hashed (contract I4).
+ * `toPlain` pins the glyph grid and `toLines` pins the styled lines, but a line is
+ * a *run* of cells: two cells swapping colour inside one run — or a `bold` bit
+ * moving between two cells that render the same bytes — can hash the same on the
+ * merged line. This walks the grid itself.
+ */
+const cellDigest = (canvas: Canvas): string => {
+	const parts: string[] = [];
+	for (const row of canvas.cells) {
+		for (const cell of row) parts.push(`${cell.ch}\u0000${cell.color ?? ""}\u0000${!!cell.bold}\u0000${!!cell.inverse}`);
+	}
+	return sha256(parts.join(""));
+};
+
+test("#364: every painted cell is what it was before the frame-alloc work (contract I4)", () => {
+	// Same scenario and the same four shapes as the I1 golden above, but per cell:
+	// this is the guard I4 names ("同一 data/selectedId/几何下，画布逐格 (ch, color,
+	// bold, inverse) 相同") for `drawGalaxy`'s pixel-buffer rewrite.
+	//
+	// Captured from `f989d0a` (rendering identical to master `6042686`) with this
+	// very scenario. The same capture harness also printed the plain/ansi digests,
+	// and both matched the I1 goldens above — that is what makes this the same frame
+	// the line-level golden pins, not a second, drifting scenario.
+	const { nodes, sampler, now } = scenario(600, 40);
+	const data = { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
+	const shapes: ReadonlyArray<readonly [number, number]> = [[120, 40], [200, 60], [80, 24], [46, 60]];
+	const expected: Record<string, string> = {
+		"120x40": "5daf7add695cbd9885e70fecfaa9a8f0539b7db4cbd0e122f24d275684aff877",
+		"200x60": "717f4f7c9ec8158e5ac0dedbf9754dd99f12955fe12c6bc82d5493a0352baa22",
+		"80x24": "12c2f13dd8cf73e64bf801dee6a77f33537b7b2591a037f42a89a2c8201d0243",
+		"46x60": "34dc3f71c400e463b1a76339388ec53c747f5337514966bf4018e3138311f350",
+	};
+	const actual: Record<string, string> = {};
+	for (const [cols, rows] of shapes) {
+		const canvas = renderLegionView(data, initialViewState(), cols, rows).canvas;
+		actual[`${cols}x${rows}`] = cellDigest(canvas);
+	}
+	assert.deepEqual(actual, expected, "a cell's glyph/colour/style moved");
+});
+
+test("#364: the inlined hypot2 is bit-for-bit Math.hypot over the galaxy's domain", () => {
+	// `drawGalaxy` cannot afford `Math.hypot`: it is a variadic builtin, so V8
+	// materialises an arguments array on every call — measured 170KB/frame at the
+	// 200x60 galaxy rect, a third of what the panel allocated before #364 S1.
+	// `hypot2` runs the same algorithm V8 does (scale by the larger magnitude,
+	// then `max * sqrt(sum of scaled squares)`), so it must return the identical
+	// double: a one-ulp difference flips a `<= rad` test and moves the picture.
+	let seed = 12345;
+	const rnd = (): number => (seed = (seed * 16807) % 2147483647) / 2147483647;
+	let checked = 0;
+	const same = (a: number, b: number): void => {
+		assert.equal(hypot2(a, b), Math.hypot(a, b), `hypot2(${a}, ${b})`);
+		checked++;
+	};
+	// The disc fill: `hypot(xx / xs, yy) <= rad` for both radius samplings.
+	for (const xs of [1, 1.6]) for (let xx = -20; xx <= 20; xx++) for (let yy = -20; yy <= 20; yy++) same(xx / xs, yy);
+	// Edge distances: the difference between two galaxy pixel positions (|x| <= PW, |y| <= PH).
+	for (let i = 0; i < 5000; i++) same((rnd() - 0.5) * 840, (rnd() - 0.5) * 840);
+	// Degenerate and extreme inputs keep Math.hypot's answers too — including NaN
+	// (which `Math.hypot` propagates: `hypot2(NaN, 0)` must not answer 0) and the
+	// infinities.
+	for (const pair of [
+		[0, 0], [-0, 0], [0, -0], [1, 0], [0, 1], [-3, -4], [3e200, 4e200], [1e-200, 1e-200], [Number.NaN, 1],
+		[Number.NaN, 0], [0, Number.NaN], [Number.NaN, Number.NaN], [Number.NaN, -0],
+		[Number.POSITIVE_INFINITY, 1], [1, Number.NEGATIVE_INFINITY], [Number.NaN, Number.POSITIVE_INFINITY],
+	] as const) same(pair[0], pair[1]);
+	assert.ok(checked > 8000, `only ${checked} pairs checked`);
+});
+
+// ──────────────── #364: cross-frame caches, and the proof they invalidate (contract §4.3) ────────────────
+
+test("#364: the painted-role table follows overwrites (no stale role, no stale count)", () => {
+	// `Canvas.roles()` used to rescan every cell; it is now a table maintained by
+	// `set()`. The palette is a function of exactly the roles still on the grid, so
+	// an overwritten role MUST leave the table — otherwise the roles that remain
+	// would be assigned colours for a set that is no longer drawn (contract T5).
+	const cv = new Canvas(4, 2);
+	cv.set(0, 0, "a", "role:worker");
+	cv.set(1, 0, "b", "role:scout");
+	assert.deepEqual([...cv.roles()].sort(), ["scout", "worker"]);
+	cv.set(0, 0, "c", "role:planner"); // worker is gone from the grid
+	assert.deepEqual([...cv.roles()].sort(), ["planner", "scout"]);
+	cv.set(1, 0, "d"); // not a role colour at all
+	assert.deepEqual([...cv.roles()], ["planner"]);
+	// Rewriting the same coordinate with the same role must not double-count.
+	cv.set(0, 0, "e", "role:planner");
+	cv.set(0, 0, "f", "role:planner");
+	cv.set(0, 1, "g", "role:planner");
+	assert.deepEqual([...cv.roles()], ["planner"]);
+	// Overwriting one of two planner cells keeps the role alive.
+	cv.set(0, 0, "h");
+	assert.deepEqual([...cv.roles()], ["planner"]);
+	cv.set(0, 1, "i");
+	assert.deepEqual([...cv.roles()], [], "the last cell dropped the role");
+});
+
+test("#364: the palette cache is keyed on (theme, the frame's role set)", () => {
+	// A palette depends on the theme *and* on which roles are drawn: when the theme
+	// cannot tell two tokens apart, the second role is bumped to another token. A
+	// cache keyed on the role set alone (or on nothing) would hand a frame the
+	// previous frame's assignment. The fake theme renders the *token name*, so the
+	// assertion is about the palette, not about escape bytes.
+	const ansi: Record<string, string> = {
+		// accent and syntaxNumber share their ANSI — pi's `system` theme in palette
+		// mode — so `scout` (preferred: syntaxNumber) has to be bumped.
+		accent: "slot5",
+		syntaxNumber: "slot5",
+		error: "slot1",
+		dim: "slot8",
+	};
+	const theme = {
+		getFgAnsi: (token: string): string => ansi[token] ?? `slot-${token}`,
+		fg: (token: string, text: string): string => `[${token}]${text}`,
+	};
+	const cv = new Canvas(6, 1);
+	cv.set(0, 0, "c", "role:centurion");
+	const alone = cv.toLines(theme)[0]!;
+	assert.ok(alone.includes("[accent]"), `centurion keeps its preferred token: ${alone}`);
+	cv.set(1, 0, "s", "role:scout");
+	const both = cv.toLines(theme)[0]!;
+	const expected = resolveRolePalette(theme, cv.roles()).get("scout")!;
+	assert.ok(both.includes(`[${expected}]s`), `scout uses the bumped token ${expected}: ${both}`);
+	assert.notEqual(expected, "syntaxNumber", "the clash really forced a different token");
+	// Same input twice: the cache must return exactly what a fresh resolution does.
+	assert.equal(cv.toLines(theme)[0], cv.toLines(theme, resolveRolePalette(theme, cv.roles()))[0], "no stale palette");
+	// Drop centurion: scout is now the only role, so the clash is gone and it goes
+	// back to its preferred token — a cache keyed on the old set would not notice.
+	cv.set(0, 0, "x");
+	const solo = cv.toLines(theme)[0]!;
+	assert.ok(solo.includes("[syntaxNumber]s"), `scout alone keeps syntaxNumber: ${solo}`);
+	assert.equal(solo, cv.toLines(theme, resolveRolePalette(theme, cv.roles()))[0]);
+});
+
+test("#364: the palette cache key cannot be forged by a role name", () => {
+	// The key used to be `roles.join(",")`. Role names are arbitrary strings, so a
+	// single role named `x,y` and a pair named `x` + `y` produced the SAME key: the
+	// second frame was handed the first frame's palette, `y` was missing from it and
+	// silently fell back to `text`. The premise is asserted, not assumed.
+	assert.equal(["x,y"].join(","), ["x", "y"].join(","), "premise: the old key collided");
+	// Render the token NAME, so the assertion is about the palette, not ANSI bytes.
+	const theme = {
+		getFgAnsi: (token: string): string => `slot-${token}`,
+		fg: (token: string, text: string): string => `[${token}]${text}`,
+	};
+	const poison = new Canvas(1, 1);
+	poison.set(0, 0, "p", roleColor("x,y"));
+	poison.toLines(theme); // fills the cache under the comma key
+	const cv = new Canvas(2, 1);
+	cv.set(0, 0, "x", roleColor("x"));
+	cv.set(1, 0, "y", roleColor("y"));
+	const line = cv.toLines(theme)[0]!;
+	const expected = resolveRolePalette(theme, ["x", "y"]);
+	// With the old key this frame hits the `x,y` entry, whose palette has no `x`/`y`
+	// in it at all, so both roles render through the `palette.get(role) ?? "text"`
+	// fallback: `[text]x[text]y`.
+	assert.ok(line.includes(`[${expected.get("x")}]x`), `role x keeps its own token (${expected.get("x")}): ${line}`);
+	assert.ok(line.includes(`[${expected.get("y")}]y`), `role y keeps its own token (${expected.get("y")}): ${line}`);
+	assert.notEqual(expected.get("y"), "text", "a real role never falls back to `text`");
+});
+
+test("#364: the palette cache is keyed on the theme too (contract T5)", () => {
+	// T5 says the key is `(theme, the frame's role set)`. The role half has a test
+	// above; this is the theme half — the same canvas rendered with two themes must
+	// not reuse the first theme's resolution, and switching back must reproduce the
+	// first frame exactly.
+	//
+	// The two themes must disagree on some role's TOKEN, otherwise a theme-blind
+	// cache is invisible: `dense` gives every token its own slot (nothing clashes ⇒
+	// everyone keeps their preferred token), while `collide` maps `syntaxVariable`
+	// and `syntaxNumber` onto one slot, which pushes `scout` and `planner` onto
+	// other tokens. Both echo the token in `fg`, so the rendered line says which
+	// token a cell actually got.
+	const dense = {
+		getFgAnsi: (token: string): string => `A-slot-${token}`,
+		fg: (token: string, text: string): string => `[${token}]${text}`,
+	};
+	const collide = {
+		getFgAnsi: (token: string): string =>
+			token === "syntaxVariable" || token === "syntaxNumber" ? "CLASH" : `S-${token}`,
+		fg: (token: string, text: string): string => `[${token}]${text}`,
+	};
+	// The canvas resolves the bare role names (`roles()` strips the `role:` prefix).
+	const names = ["worker", "scout", "planner", "reviewer"];
+	const paletteA = resolveRolePalette(dense, names);
+	const paletteB = resolveRolePalette(collide, names);
+	const bumped = names.find((n) => paletteA.get(n) !== paletteB.get(n));
+	assert.ok(bumped, "premise: the two themes must resolve this role set differently, or a theme-blind cache is invisible");
+	const cv = new Canvas(6, 1);
+	for (const [i, name] of names.entries()) cv.set(i, 0, "x", roleColor(name));
+	const firstA = cv.toLines(dense);
+	const firstB = cv.toLines(collide);
+	const againA = cv.toLines(dense);
+	assert.notDeepEqual(firstA, firstB, "positive control: the two themes really render differently");
+	assert.deepEqual(againA, firstA, "switching themes must not hand back the other theme's palette");
+	// The discriminating half: the second theme's frame must carry the token IT
+	// resolved, not the one cached under the first theme. A theme-blind cache keeps
+	// both assertions above green (the `fg` prefixes still differ) but fails here.
+	assert.notEqual(paletteB.get(bumped!), paletteA.get(bumped!), "the two themes must not agree on the bumped role");
+	assert.ok(
+		firstB[0]!.includes(`[${paletteB.get(bumped!)}]`),
+		`the second theme keeps its own resolution for ${bumped} (${paletteB.get(bumped!)}): ${firstB[0]}`,
+	);
+});
+
+test("#364: a reused px grid paints the frame a rebuilt one does (contract T1)", () => {
+	// T1 is the contract's #1 trap: the braille buffer `px` keeps what the previous
+	// frame left in it, so a missing `m`/`z` reset both paints the old bits and —
+	// because `z` is the write gate — rejects the new frame's lower-priority dots,
+	// i.e. last frame's colour leaks into this frame's picture.
+	//
+	// None of the existing tests can see that: the four golden shapes have four
+	// different galaxy rects, so every render in them takes the "size changed ⇒
+	// rebuild" branch, and the canvas-reuse test below builds its `fresh` reference
+	// through the same module-level `pixelGrid` (so an uncleared cell is dirty on
+	// both sides of that comparison).
+	//
+	// Here both frames use the SAME geometry, so frame B takes the reuse branch over
+	// frame A's leftovers. The reference is frame B on a pristine grid: paint a
+	// different geometry first (forcing a rebuild), then paint B into a fresh canvas.
+	const SHAPE: readonly [number, number] = [120, 40];
+	const OTHER_SHAPE: readonly [number, number] = [200, 60];
+	const big = { ...scenario(600, 200), rate: 0 };
+	const small = { ...scenario(600, 3), rate: 0 };
+	const paint = (data: typeof big, [cols, rows]: readonly [number, number]): Canvas =>
+		renderLegionView(data, initialViewState(), cols, rows).canvas;
+
+	paint(small, OTHER_SHAPE); // leave `px` on the other geometry…
+	const reference = paint(small, SHAPE); // …so this one rebuilds the grid, then paints B.
+
+	const frameA = paint(big, SHAPE); // 200 nodes, nothing selected
+	const frameB = paint(small, SHAPE); // frame B over A's leftovers (the reuse branch)
+	assert.notDeepEqual(frameA.toPlain(), reference.toPlain(), "positive control: A and B really differ");
+	assert.deepEqual(frameB.toPlain(), reference.toPlain(), "a stale `m`/`z` in px would change the glyphs");
+	assert.deepEqual(frameB.toLines(ansiTheme), reference.toLines(ansiTheme), "and its colours");
+});
+
+test("#364: the roleColor memo is keyed on the role name", () => {
+	// Memoized because the galaxy asks for it per edge/node/label; the key is the
+	// input (a stable scalar), so a different role must still give a different
+	// colour, and the old case-insensitivity has to survive the cache.
+	assert.equal(roleColor("worker"), "role:worker");
+	assert.equal(roleColor("scout"), "role:scout");
+	assert.notEqual(roleColor("worker"), roleColor("scout"));
+	assert.equal(roleColor("Worker"), roleColor("worker"), "case-insensitive before and after the cache");
+	assert.equal(roleColor("root"), "text");
+	assert.equal(roleColor("ROOT"), "text");
+	assert.equal(roleColor("designer-x"), "role:designer-x", "an unseen role is not aliased to a cached one");
+});
+
+test("#364: Canvas.reset() blanks every field in place (A5, contract I5)", () => {
+	const cv = new Canvas(3, 2);
+	cv.set(0, 0, "a", "role:worker", { bold: true, inverse: true });
+	cv.set(2, 1, "b", "accent");
+	const held = cv.get(0, 0)!;
+	cv.reset();
+	assert.equal(cv.get(0, 0), held, "reset keeps the cell objects: cells stay a live view (I5)");
+	assert.deepEqual({ ...held }, { ch: " ", color: undefined, bold: undefined, inverse: undefined }, "no ch/color/bold/inverse survives");
+	assert.deepEqual([...cv.roles()], [], "the painted-role table is emptied with the grid (T5)");
+	assert.deepEqual(cv.toPlain(), ["   ", "   "]);
+	assert.deepEqual(cv.toLines(ansiTheme), ["   ", "   "]);
+	// A reset canvas paints exactly like a fresh one.
+	const fresh = new Canvas(3, 2);
+	for (const [x, y, ch, color] of [[1, 0, "z", "role:scout"]] as const) {
+		cv.set(x, y, ch, color);
+		fresh.set(x, y, ch, color);
+	}
+	assert.deepEqual(cv.toLines(ansiTheme), fresh.toLines(ansiTheme));
+	assert.deepEqual([...cv.roles()], [...fresh.roles()]);
+});
+
+test("#364: the production view reuses one canvas and carries nothing over", () => {
+	// The A5 reuse is the only place a canvas outlives a frame. Its hazard is the
+	// one #362 already fixed inside `set()`: a field the new frame does not write
+	// must not survive. Proven the only way it can be: paint a full frame, then a
+	// different one, and compare against a view that started with a fresh grid.
+	const big = scenario(600, 12);
+	const small = scenario(600, 3);
+	const withBig = { ...big, rate: 0 };
+	const withSmall = { ...small, rate: 0 };
+	let current = withBig;
+	const tui = { requestRender(): void {}, terminal: { rows: 24 } };
+	const view = createLegionViewFactory({ getData: () => current })(tui, ansiTheme, {}, () => {});
+	const first = view.render(80);
+	current = withSmall;
+	const reused = view.render(80);
+	const fresh = createLegionViewFactory({ getData: () => withSmall })(tui, ansiTheme, {}, () => {}).render(80);
+	assert.notDeepEqual(first, fresh, "positive control: the two frames really differ");
+	assert.deepEqual(reused, fresh, "a reused canvas paints the byte-identical frame a fresh one does");
+	// And a resize is not reused at all (the size check is what makes that safe).
+	const resized = view.render(120);
+	const resizedFresh = createLegionViewFactory({ getData: () => withSmall })(tui, ansiTheme, {}, () => {}).render(120);
+	assert.deepEqual(resized, resizedFresh, "a different width paints into a correctly sized grid");
+	assert.equal(resized.length, 24);
+	view.dispose();
+});
+
+test("#364: renderLegionView only reuses a canvas of the same size", () => {
+	const { nodes, sampler, now } = scenario(600, 3);
+	const data = { nodes, sampler, now, rate: 0 };
+	const wrong = new Canvas(10, 5);
+	const out = renderLegionView(data, initialViewState(), 60, 20, wrong).canvas;
+	assert.notEqual(out, wrong, "a smaller canvas is not grown in place");
+	assert.equal(out.width, 60);
+	assert.equal(out.height, 20);
+	const right = new Canvas(60, 20);
+	assert.equal(renderLegionView(data, initialViewState(), 60, 20, right).canvas, right, "the same size is reused");
 });

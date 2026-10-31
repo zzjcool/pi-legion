@@ -1,0 +1,65 @@
+{
+  "issue": "#364 / docs/contracts/viz-frame-alloc-v1.md",
+  "capturedFrom": "f989d0a — the rendering code the contract froze (identical to master 6042686)",
+  "node": "v24.13.1",
+  "themeMode": "truecolor",
+  "agents": 200,
+  "method": "frameAllocKB = median of 20 (gc; heapUsed; renderLegionView(...).canvas.toLines(theme); heapUsed) single-frame deltas; medianMs/p95Ms = 5 rounds x 50 frames, nearest-rank p95; digests = sha256 of toPlain().join(\"\\n\") / toLines(real dark).join(\"\\n\")",
+  "digests": {
+    "120x40/live": {
+      "plainDigest": "54900c627710e5483cbc62dded3835652d9479685813c89f2b36c66d896de643",
+      "ansiDigest": "90161900862ecbea4bf90eb13e4c3e4c85a50068a8c44e44a43bfaa1f2f439dd"
+    },
+    "120x40/settled": {
+      "plainDigest": "64c4764ccf14a93ef3a197a68c4af55357e908fd40386ccedf4b251416601e80",
+      "ansiDigest": "65ac63644d4dc08ae80d4b7ddfe5dfc1c660319c38d4309d93e7149b1763059b"
+    },
+    "200x60/live": {
+      "plainDigest": "50b83e6c77d4cfd6565a335a9450143210ac1dd25f0ab362b9a906b378423ad5",
+      "ansiDigest": "155d954d185bff2c1c752c8d87d491fa4035d2b12d300f9111989741732fc56e"
+    },
+    "200x60/settled": {
+      "plainDigest": "a867a724e9891e0781d064f6883c134334f2f47f661b1ff0583f94294edfcd30",
+      "ansiDigest": "90754f9886e02126f596d779c4bbf12e9c0b601d9b6832edd30b62a22ab377da"
+    },
+    "80x24/live": {
+      "plainDigest": "44249757b33deb8800c92e6f1add6b33465d1d5729501372a319907aad59300a",
+      "ansiDigest": "28a40a6ec1c6f8468ff295bb93342888f972e0368e5b8b4001110f328d50cba6"
+    },
+    "80x24/settled": {
+      "plainDigest": "7464e77d3d5e6d18d29bd962a2ba75ed5ada4c78c488c75ff8a9d999e64fc963",
+      "ansiDigest": "bb0a73d93a66aadae259de55ee2a2b4b5603bddb374f7918fcbc5acc28e9a47f"
+    },
+    "46x60/live": {
+      "plainDigest": "acc2afe6274a1e55395330ef7a5b29d835c2cd1357d6a7cd2310cacece14d634",
+      "ansiDigest": "1862526fcbbb75833d9c29024653aee604e04200dc7b1c83634db014e40e3e44"
+    },
+    "46x60/settled": {
+      "plainDigest": "d62e5ddeefca5a2bfae36609fecd77b9a22610445b232356c3f85fe659541d50",
+      "ansiDigest": "96114aaec3aea352197a49493159e4e0aea5b50f40c316d52c84c2a88fef9230"
+    }
+  },
+  "metrics": {
+    "120x40/live": {
+      "frameAllocKB": 2586.934,
+      "medianMs": 3.335,
+      "p95Ms": 5.44
+    },
+    "120x40/settled": {
+      "frameAllocKB": 2736.563,
+      "medianMs": 3.036,
+      "p95Ms": 4.102
+    },
+    "200x60/live": {
+      "frameAllocKB": 3963.863,
+      "medianMs": 5.053,
+      "p95Ms": 7.14
+    },
+    "200x60/settled": {
+      "frameAllocKB": 4098.242,
+      "medianMs": 4.522,
+      "p95Ms": 5.257
+    }
+  },
+  "metricsNote": "captured at the S0 commit, when a frame still allocated its own Canvas(W,H) per frame — i.e. the pre-#364-S3 render path. Reported for context only; the gates are the digests plus the §0 limits applied to the current frame."
+}

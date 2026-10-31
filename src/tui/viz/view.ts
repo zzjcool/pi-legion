@@ -97,11 +97,30 @@ export function paintPageFloor(theme: VizTheme, lines: readonly string[]): strin
 	return lines.map((line) => theme.bg?.(LEGION_PAGE_BG, line) ?? line);
 }
 
-export function renderLegionView(data: ViewData, state: LegionViewState, cols: number, rows: number): { canvas: Canvas; layout: LayoutKind } {
+/**
+ * #364 A5: `reuse` lets the production render path paint into the canvas it
+ * painted last frame, which is the difference between W×H fresh cell objects and
+ * W×H in-place field writes (+190KB/472KB per frame). It is optional and
+ * size-checked, so `new Canvas(W, H)` keeps its exact old semantics and cost for
+ * every other caller — including the tests that hold the grid they got back.
+ */
+export function renderLegionView(
+	data: ViewData,
+	state: LegionViewState,
+	cols: number,
+	rows: number,
+	reuse?: Canvas,
+): { canvas: Canvas; layout: LayoutKind } {
 	const W = Math.max(1, Math.floor(cols));
 	const H = Math.max(6, Math.floor(rows));
 	const layout = computeLayout(W, H, { logEvents: buildLog(data.nodes).length });
-	const cv = new Canvas(W, H);
+	let cv: Canvas;
+	if (reuse !== undefined && reuse.width === W && reuse.height === H) {
+		reuse.reset();
+		cv = reuse;
+	} else {
+		cv = new Canvas(W, H);
+	}
 	const selected = data.nodes.find((node) => node.id === state.selectedId);
 	const portrait = layout.kind === "portrait";
 
@@ -377,6 +396,12 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 		 * paint this stays at the full ring, which is also `handleViewKey`'s default.
 		 */
 		let panes: Pane[] = [...PANES];
+		/**
+		 * #364 A5: the single canvas this view paints into, frame after frame. The
+		 * host calls `render()` once per frame, so one grid (plus its `reset()`) is
+		 * all the page ever needs — no per-frame W×H allocation.
+		 */
+		let frameCanvas: Canvas | undefined;
 		let closed = false;
 		const close = (): void => {
 			if (closed) return;
@@ -393,7 +418,9 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 				// classic tree view does in `src/tui/tree-view.ts`.
 				const rows = Math.max(6, tui.terminal.rows ?? 24);
 				panes = availablePanes(computeLayout(width, rows));
-				return paintPageFloor(theme, renderLegionView(options.getData(), state, width, rows).canvas.toLines(theme));
+				const rendered = renderLegionView(options.getData(), state, width, rows, frameCanvas);
+				frameCanvas = rendered.canvas;
+				return paintPageFloor(theme, rendered.canvas.toLines(theme));
 			},
 			handleInput(data: string): void {
 				const action = handleViewKey(
@@ -415,6 +442,7 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 			invalidate(): void {},
 			dispose(): void {
 				clearInterval(timer);
+				frameCanvas = undefined;
 			},
 		};
 	};
