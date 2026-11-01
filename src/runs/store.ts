@@ -18,6 +18,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomBytes } from "node:crypto";
+import type { PhaseMachine } from "../legion/phase-machine.ts";
 import { writeRunOwner } from "./owner.ts";
 import {
 	MAX_NESTED_PATH_ENTRIES,
@@ -28,10 +29,34 @@ import {
 	type RunRecord,
 } from "../shared/types.ts";
 
-/** M2 tree identity is an additive field on persisted v1 run/child records. */
+/**
+ * Additive fields on persisted v1 run/child records.
+ *
+ * - `nodeId`: M2 tree identity.
+ * - `RunRecord.sessionFile` (#374 §1): the ONE session-identity credential in this
+ *   repo — the absolute path of the process's own session transcript. A new root
+ *   run records it, so the next start of the SAME session can find this run
+ *   again (`findSessionRun`) and reopen its ledger instead of building a second,
+ *   shadow tree (contract `legion-session-continuity-v1.md` §2). A session with
+ *   no file (`SessionManager.inMemory()`) has no identity: nothing is recorded
+ *   and nothing is looked up.
+ * - `ChildRecord.phases` (#374 §4): the phase machine the root declared for this
+ *   team, snapshotted at launch so a resume in a LATER process can hand the child
+ *   the same `PI_LEGION_PHASES` declaration it was born with. Without it a revived
+ *   inline-machine team falls back to its role card and its custom phase names
+ *   become `invalid_phase`. Only ever written for the role the declaration is
+ *   forwarded to (`centurion`, see `Orchestrator.lineageEnv`), because replaying a
+ *   card machine as a live DECLARATION would be refused by the launch guards.
+ */
 declare module "../shared/types.ts" {
-	interface ChildRecord { nodeId?: string; }
-	interface RunRecord { nodeId?: string; }
+	interface ChildRecord {
+		nodeId?: string;
+		phases?: PhaseMachine;
+	}
+	interface RunRecord {
+		nodeId?: string;
+		sessionFile?: string;
+	}
 }
 
 export interface StoreOptions {
@@ -301,6 +326,8 @@ export class RunStore {
 		path?: NestedPathEntry[];
 		maxDepth?: number;
 		nodeId?: string;
+		/** #374 §1: the owning session's transcript path, when the host has one. */
+		sessionFile?: string;
 		herdr?: RunRecord["herdr"];
 	}): RunRecord {
 		if (typeof input.task !== "string" || input.task.length === 0) {
@@ -322,6 +349,7 @@ export class RunStore {
 			task: input.task,
 			cwd: input.cwd,
 			...(input.nodeId ? { nodeId: input.nodeId } : {}),
+			...(input.sessionFile ? { sessionFile: path.resolve(input.sessionFile) } : {}),
 			herdr: {
 				...(input.herdr ?? {}),
 				...(input.nodeId ? { node_id: input.nodeId } : {}),

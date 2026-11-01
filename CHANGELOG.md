@@ -81,6 +81,20 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **同一个 session 重开时会接回上次的树，并且只“提示”，不自动动任何子 agent (#374).** 以前每次启动都新建一份 run
+  和一本 `legion.db`，上次被打断的队伍既看不见也接不回来。现在 run 记录自己这个 session 的 transcript 路径
+  （`RunRecord.sessionFile`），同 session 再启动时复用它——同一个 runId、同一本账本、节点与相位原样还在
+  （`legion_tree` 看得到），root 行是更新而不是重建。**恢复必须显式**：启动时只在 system prompt 里列出
+  「上次退出时被打断的子 agent」并给用户一行提示，`spawn` 零次；用户同意后再 `subagent({action:"resume", name})`。
+  **换一个 session 启动则什么都不做**：不扫描、不提示、不写任何旧文件。
+- **退出 = 暂停，不再判负 (#374).** `session_shutdown` 收队时不再把相位推到 `aborted`（终态会被
+  `CHILD_TERMINAL` 永久拒绝恢复），只把节点标成 `retired` 并记一条带 `reason: "session-shutdown"` 的
+  `node_retired`（事件类型仍是 16 条）。相位、`phase_since`、`rework_count` 一律不动。其它收队原因
+  （`stop`/`abort`/超预算/显式 retire）行为逐字不变。
+- **`subagent resume` 能把声明过的相位机器一起带起来 (#374).** 声明式机器现在快照进 `ChildRecord.phases`，
+  跨进程恢复时重新下发给子进程的 `PI_LEGION_PHASES`——否则复活的内联队伍会退回角色卡机器，
+  自定义相位名全变 `invalid_phase`。
+
 - **空 `legion-verify` 块不再被报告成"验证通过" (#371).** 契约里没有 ```legion-verify 块时仍然直通
   （§7.3 的只读队形状，行为不变），但工具返回、收队提示与后台收尾现在都说
   `by contract (0 commands)`；若声明的机器把 `verification_passed` 当收尾门，还会明说
