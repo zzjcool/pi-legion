@@ -25,7 +25,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -50,6 +50,15 @@ const SOLO_MACHINE: PhaseMachine = {
 		{ id: "planning", next: [{ to: "implementing" }] },
 		{ id: "implementing", next: [{ to: "done" }] },
 		{ id: "done", terminal: true, next: [] },
+	],
+};
+
+/** A card-level machine with names that cannot be confused with the inline one. */
+const CARD_SHIP_MACHINE: PhaseMachine = {
+	start: "spec",
+	phases: [
+		{ id: "spec", next: [{ to: "ship" }] },
+		{ id: "ship", next: [{ to: "done" }] },
 	],
 };
 
@@ -94,7 +103,10 @@ interface Fixture {
 	cleanup: () => void;
 }
 
-function fixture(options: { verifyRunner?: (command: string, cwd: string, timeoutMs?: number) => Promise<{ code: number; stdout: string; stderr: string }> } = {}): Fixture {
+function fixture(options: {
+	verifyRunner?: (command: string, cwd: string, timeoutMs?: number) => Promise<{ code: number; stdout: string; stderr: string }>;
+	rejectSpawn?: (input: { env?: Record<string, string> }) => Error | undefined;
+} = {}): Fixture {
 	const sandbox = mkdtempSync(path.join(tmpdir(), "legion-declared-phases-e2e-"));
 	const repo = path.join(sandbox, "repo");
 	mkdirSync(repo, { recursive: true });
@@ -111,7 +123,10 @@ function fixture(options: { verifyRunner?: (command: string, cwd: string, timeou
 	const dbPath = legionDbPath(store.runDir(rootRun.runId));
 	const db = openLegionDb(dbPath);
 	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running", taskSummary: rootRun.task });
-	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const supervisor = new FakeSupervisor({
+		immediateTimeout: false,
+		...(options.rejectSpawn ? { rejectSpawn: options.rejectSpawn as never } : {}),
+	});
 	const root = new Orchestrator({
 		supervisor,
 		runDir: store.runDir(rootRun.runId),
@@ -134,6 +149,19 @@ function fixture(options: { verifyRunner?: (command: string, cwd: string, timeou
 		root,
 		cleanup: () => { db.close(); rmSync(sandbox, { recursive: true, force: true }); },
 	};
+}
+
+/**
+ * Every session file the run directory holds.
+ *
+ * `preCreateSessionFile` runs DEEP inside `launch()` (well past `reserveNode`), so
+ * a non-empty list here is proof that a refused dispatch got further than the
+ * guards — which the "no worktree directory" check cannot show for a child that
+ * would never get one anyway (review m2).
+ */
+function sessionFiles(runDir: string): string[] {
+	if (!existsSync(runDir)) return [];
+	return readdirSync(runDir).filter((entry) => entry.endsWith(".jsonl")).sort();
 }
 
 /** The tool set a live centurion child registers for itself. */
@@ -401,7 +429,12 @@ test("#371 I7: G2 — a non-root dispatcher may not declare phases, and leaves n
 			"a non-root dispatcher must be refused, not silently downgraded",
 		);
 		assert.equal(fx.supervisor.spawns.length, 0, "a refused dispatch must not spawn anything");
-		assert.equal(existsSync(path.join(fx.runDir, "worktrees")), false, "I7: no worktree directory may exist");
+		// I7 with teeth (review m2): the worker in this scenario would be demoted to
+		// `worktree: false` before the worktree branch ever runs, so asking "is there a
+		// worktree directory?" answers a question nothing can change. What a refusal
+		// must not leave behind is a RUN RECORD, a session file, or a ledger row.
+		assert.equal(fx.store.findChild(fx.rootRunId, "worker-0"), null, "I7: no child record may be committed");
+		assert.deepEqual(sessionFiles(fx.runDir), [], "I7: no session file may be pre-created");
 		assert.equal(getNode(fx.db, "root.worker-0.worker-0"), null, "I7: no ledger row may exist");
 	} finally { fx.cleanup(); }
 });
@@ -418,7 +451,8 @@ test("#371 I7: G3 — the root may not declare phases for a non-centurion", asyn
 			"a machine belongs to a team, not to a worker",
 		);
 		assert.equal(fx.supervisor.spawns.length, 0);
-		assert.equal(existsSync(path.join(fx.runDir, "worktrees")), false, "I7: no worktree directory may exist");
+		assert.equal(fx.store.findChild(fx.rootRunId, "worker-0"), null, "I7: no child record may be committed");
+		assert.deepEqual(sessionFiles(fx.runDir), [], "I7: no session file may be pre-created");
 		assert.equal(getNode(fx.db, "root.worker-0"), null, "I7: no ledger row may exist");
 	} finally { fx.cleanup(); }
 });
@@ -451,7 +485,61 @@ test("#371 I7: G4 — an inline machine must be valid AND able to reach a termin
 			/phase machine cannot reach a terminal phase from 'b'/,
 			"the sibling start must be the one the reachability check uses",
 		);
+		// (d) `start` next to a STRING declaration is ambiguous — the string carries its
+		// own `start` — and is refused rather than silently resolved (review m6b).
+		await assert.rejects(
+			() => fx.root.launch({ agent: centurion(), task: "ambiguous start", phases: JSON.stringify(SOLO_MACHINE), start: "implementing" }),
+			(error: unknown) =>
+				error instanceof SubagentError &&
+				error.code === ErrorCodes.INVALID_PARAMS &&
+				/start may not be combined with a phases string/.test(error.message),
+			"an ambiguous start must be refused, not guessed",
+		);
 		assert.equal(fx.supervisor.spawns.length, 0, "no refused declaration may reach the supervisor");
 		assert.equal(existsSync(path.join(fx.runDir, "worktrees")), false, "I7: no worktree directory may exist");
+	} finally { fx.cleanup(); }
+});
+
+test("#371 m8: a declaration never outlives its dispatch (failed launch and retire)", async () => {
+	const fx = fixture({ rejectSpawn: () => new Error("spawn refused by the fixture") });
+	try {
+		// `declaredPhases` is a private bookkeeping map with no behavioural surface —
+		// its only failure mode is leaking one machine per failed/retired dispatch in a
+		// long-lived parent. Peeking is the sole way to observe that.
+		const tracked = () => (fx.root as unknown as { declaredPhases: Map<string, unknown> }).declaredPhases;
+		await assert.rejects(
+			() => fx.root.launch({ agent: centurion(), task: "never gets out the door", phases: SOLO_MACHINE }),
+			/spawn refused by the fixture/,
+		);
+		assert.equal(tracked().size, 0, "a launch that failed after reserving must not leave a declaration behind");
+
+		// …and a successful dispatch's declaration is dropped on retire, which is the
+		// last moment anything could ask for an abort.
+		const clean = fixture();
+		try {
+			const { handle } = await launchTeam(clean, { phases: SOLO_MACHINE });
+			const trackedClean = () => (clean.root as unknown as { declaredPhases: Map<string, unknown> }).declaredPhases;
+			assert.equal(trackedClean().size, 1, "the dispatch is tracked while it lives");
+			await collect(clean, handle.name, '{"ok":true,"reason":"done"}');
+			assert.equal(trackedClean().size, 0, "retire must drop the declaration");
+		} finally { clean.cleanup(); }
+	} finally { fx.cleanup(); }
+});
+
+test("#371 §2: an inline declaration WINS over the card's own machine", async () => {
+	const fx = fixture();
+	try {
+		// The card says `spec → ship`; the dispatch says `planning → implementing →
+		// done`. Contract §2: the inline declaration is the more specific statement and
+		// wins — the team is born in ITS start phase and the child receives THAT machine,
+		// so `ship` must not survive anywhere (review m6c).
+		const cardAgent = centurion({ phases: CARD_SHIP_MACHINE });
+		const { node } = await launchTeam(fx, { phases: SOLO_MACHINE, agent: cardAgent });
+		assert.equal(node.phase, "planning", "born in the INLINE machine's start phase, not the card's");
+
+		const declared = parsePhaseMachine(fx.supervisor.spawns[0]!.input.env![LEGION_PHASES_ENV]!, LEGION_PHASES_ENV)!;
+		const ids = declared.phases.map((phase) => phase.id);
+		assert.ok(ids.includes("implementing"), `the inline machine must be what the child runs: ${ids}`);
+		assert.equal(ids.includes("ship"), false, `the card machine must not leak through: ${ids}`);
 	} finally { fx.cleanup(); }
 });

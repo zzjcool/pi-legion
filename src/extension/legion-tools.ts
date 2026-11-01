@@ -54,6 +54,7 @@ import {
 	isTerminalIn,
 	machineTimeout,
 	normalizePhaseMachine,
+	phaseStart,
 	successPhaseOf,
 	type PhaseMachine,
 } from "../legion/phase-machine.ts";
@@ -930,27 +931,38 @@ export type PhaseRequestResult =
 	| { ok: false; message: string; code?: string };
 
 /**
- * May this node walk an exit to `done` that its machine declares (#371 G5)?
+ * May this node walk an exit to `done` that its machine DECLARES (#371 G5)?
  *
- * Two things are deliberately NOT checked here:
+ * Two things are deliberately not re-checked here: the edge's `require`
+ * conditions (that is exactly what `evaluatePhaseTransition` applies once the
+ * request is handed over — duplicating them is how two answers to one question
+ * start drifting), and `actorRole` (same, and it is the state machine's own
+ * gate).
  *
- *   - the edge's `require` conditions. They are exactly what
- *     `evaluatePhaseTransition` applies once the request is handed over, and
- *     duplicating them here is how two answers to one question start drifting;
- *   - the injected terminal. A machine that omits `done` still has one, because
- *     `normalizePhaseMachine` appends an unconditional edge to it from every
- *     non-terminal phase — the same documented treatment `mayDeclareFailure`
- *     gives the injected `failed`. Injection only removes the possibility of a
- *     stranded team; the team still has to ask.
+ * The `injected !== true` filter is the whole point (#371 C1). A machine that
+ * omits `done` still HAS an edge to it, because `normalizePhaseMachine` appends
+ * an unconditional one from every non-terminal phase so no team can be stranded.
+ * That edge is the SUPERVISOR's way out (the verified-completion path), never a
+ * declared exit: counting it here made "the declaration offers no `→ done`" an
+ * unreachable answer — the gate would have been true for every machine — and let
+ * a team skip a verification phase its author HAD declared (requesting `done`
+ * from `impl` matched the injected edge before the authored `ship → done`).
  *
- * A team with NO machine answers `false` on purpose: an undeclared centurion has
- * no phase at all and no `legion_phase`, and a legacy row that kept the tool
- * through an upgrade must keep the pre-#371 rule (invariant I6).
+ * `failed` keeps its injected edge (see `mayDeclareFailure`): entering a
+ * terminal is gated there by `terminalReason` inside the state machine, which is
+ * a different door from "the supervisor completes the team", so the two are not
+ * symmetric.
+ *
+ * A team with NO declared machine answers `false` on purpose: an undeclared
+ * centurion has no phase at all and no `legion_phase`, and a legacy row that kept
+ * the tool through an upgrade must keep the pre-#371 rule (invariant I6).
  */
 function maySelfComplete(machine: PhaseMachine | undefined, phase: string | null, role: string): boolean {
 	if (!machine || phase === null) return false;
 	const from = findPhase(machine, phase);
-	return from?.next.some((rule) => rule.to === "done" && (rule.actorRole === undefined || rule.actorRole === role)) ?? false;
+	return from?.next.some((rule) =>
+		rule.injected !== true && rule.to === "done" && (rule.actorRole === undefined || rule.actorRole === role),
+	) ?? false;
 }
 
 export async function requestLegionPhase(
@@ -966,6 +978,14 @@ export async function requestLegionPhase(
 	// carries the declaration from the node's role card; absent means the built-in
 	// four-phase pipeline.
 	const machine = options.machine;
+	// #371 (m1): ONE normalized view of the machine for every gate below, so
+	// `maySelfComplete` and `mayDeclareFailure` cannot disagree about what the team
+	// declared. The two names are kept apart on purpose: `declaredMachine` answers
+	// "did this team declare anything at all?" (invariant I6 — `undefined` is NOT
+	// "use the built-in machine"), `effectiveMachine` is what the state machine
+	// will actually run.
+	const declaredMachine = machine ? normalizePhaseMachine(machine) : undefined;
+	const effectiveMachine = declaredMachine ?? DEFAULT_PHASE_MACHINE;
 	// #371 G5: `done` follows the DECLARATION.
 	//
 	// The blanket refusal below was written when every team ran the built-in
@@ -987,7 +1007,7 @@ export async function requestLegionPhase(
 	if (to === "aborted") {
 		return { ok: false, code: "INVALID_PARAMS", message: `${to} is controlled by the parent or supervisor` };
 	}
-	if (to === "done" && !maySelfComplete(machine, self.phase, self.role)) {
+	if (to === "done" && !maySelfComplete(declaredMachine, self.phase, self.role)) {
 		return { ok: false, code: "INVALID_PARAMS", message: `${to} is controlled by the parent or supervisor` };
 	}
 	// #309: `to: "failed"` is a centurion decision, but only a DECLARED one.
@@ -1078,7 +1098,14 @@ export async function requestLegionPhase(
 	// failure — and that still binds. It binds INSIDE the lookup: a machine that
 	// reserves one `failed` edge to another actor and also offers a plain one is not
 	// order-dependent.
-	const effectiveMachine = normalizePhaseMachine(options.machine ?? DEFAULT_PHASE_MACHINE);
+	//
+	// #371: an INJECTED `failed` edge still counts here, unlike an injected `done`
+	// edge in `maySelfComplete`. Not an inconsistency — the two terminals are
+	// gated by different doors: taking `failed` requires a `terminalReason`
+	// (checked inside the state machine, and the reason requirement above is the
+	// team-facing half of it), while taking `done` is gated by WHO is acting. This
+	// is also the pre-#309 behaviour a card that omits `failed` relies on, pinned
+	// by `test/unit/legion-phase-exit.test.ts`.
 	const mayDeclareFailure = self.phase !== null && (findPhase(effectiveMachine, self.phase)?.next.some(
 		(rule) => rule.to === "failed" && (rule.actorRole === undefined || rule.actorRole === self.role),
 	) ?? false);
@@ -1114,11 +1141,22 @@ export async function requestLegionPhase(
 		return { ok: false, code: "INVALID_PARAMS", message: `phase transition ${self.phase ?? "<unset>"} → ${to} refused: ${decision.message}` };
 	}
 
+	// #371 (m7): the contract is recorded when the team leaves its machine's ENTRY
+	// phase, whatever that phase is called. The old test was the literal pair
+	// `self.phase === "planning" && to === "implementing"`, which never matched a
+	// declared workflow (a machine starting in `spec`/`recon`/anything else left
+	// `contract_path` NULL forever), while a declared machine that happens to use
+	// those two names got the write for free.
+	//
+	// Terminal exits are excluded so the built-in pipeline behaves byte-for-byte:
+	// `planning → failed`/`aborted` never recorded a contract before either.
+	const entryPhase = phaseStart(effectiveMachine);
+	const leavesEntry = self.phase !== null && self.phase === entryPhase && decision.to !== "failed" && decision.to !== "aborted";
 	updateNode(db, nodeId, {
 		phase: decision.to,
 		phaseSince: decision.phaseSince,
 		reworkCount: decision.reworkCount,
-		...(self.phase === "planning" && to === "implementing" ? { contractPath: proposedContractPath } : {}),
+		...(leavesEntry ? { contractPath: proposedContractPath } : {}),
 	}, now);
 	// #309: the handled-audit trail is written ONLY on the accepted path, right
 	// before the transition it justified and with the same clock, so an auditor

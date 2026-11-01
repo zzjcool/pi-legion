@@ -910,6 +910,11 @@ export class Orchestrator {
 
 	private rollbackReservation(nodeId: string, previous: LegionNode | null): void {
 		if (!this.legion) return;
+		// #371 (m8): a launch that never got its child out the door must not leave a
+		// declaration behind for the abort path to read. The map is keyed by node id
+		// and only ever describes THIS process's dispatches, so the entry has to go
+		// wherever the reservation goes.
+		this.declaredPhases.delete(nodeId);
 		if (!previous) { this.legion.db.prepare("DELETE FROM nodes WHERE id = ?").run(nodeId); return; }
 		// #357 review (minor 2): a revival's reservation moves `phase_since` (that is the
 		// whole point of #357 — a new stint is a new de-dup key) and records a `revived`
@@ -2973,6 +2978,10 @@ export class Orchestrator {
 				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId });
 			}
 			this.abortLegionPhase(child.nodeId);
+			// #371 (m8): the abort just consumed the declaration; a retired node has
+			// nothing left to abort, so keeping it would only leak one machine per
+			// retired team in a long-lived parent process.
+			this.declaredPhases.delete(child.nodeId);
 		}
 		child.state = "retired";
 		child.retiredAt = new Date(this.now()).toISOString();

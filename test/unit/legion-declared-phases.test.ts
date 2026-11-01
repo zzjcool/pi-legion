@@ -24,7 +24,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-import { requestLegionPhase, type LegionCommandRunner } from "../../src/extension/legion-tools.ts";
+import { registerLegionTools, requestLegionPhase, type LegionCommandRunner } from "../../src/extension/legion-tools.ts";
+import { evaluatePhaseTransition } from "../../src/legion/state-machine.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import {
@@ -37,6 +38,38 @@ import {
 import { parsePhaseMachine } from "../../src/agents/agents.ts";
 
 const NOW = 100_000;
+
+/**
+ * The shape a REAL dispatch runs (#371 C1).
+ *
+ * Every gate in the tool reads the machine the way production hands it over:
+ * already normalized by `parsePhaseMachine`, which means the three universal
+ * terminals are present and every non-terminal phase carries an INJECTED `→ done`
+ * unless its author declared one. Feeding a raw literal instead is what let a
+ * green unit test certify a gate that was true for every possible machine.
+ */
+function productionShape(machine: PhaseMachine): PhaseMachine {
+	const parsed = parsePhaseMachine(machine, "subagent.phases", { requireTerminal: true });
+	assert.ok(parsed, "the fixture must survive the production parser");
+	return parsed;
+}
+
+/**
+ * `spec → impl` with NO declared `done`: the injected edge is the only way out.
+ *
+ * The declared `impl → failed` is what keeps this a legal INLINE declaration —
+ * G4 asks the DECLARED graph, and a machine whose only finish is the injected
+ * `→ done` cannot answer "yes, I can end". (Card machines are not asked; their
+ * rules are frozen, which is exactly why the supervisor's injected-edge path has
+ * to keep working.)
+ */
+const NO_DONE_MACHINE: PhaseMachine = {
+	start: "spec",
+	phases: [
+		{ id: "spec", next: [{ to: "impl" }] },
+		{ id: "impl", next: [{ to: "failed" }] },
+	],
+};
 
 /** `planning → implementing → done`, no conditions anywhere: the zero-child workflow. */
 const SOLO_MACHINE: PhaseMachine = {
@@ -129,13 +162,102 @@ test("#371 parsePhaseMachine: the reachability question is OPT-IN, so card loadi
 });
 
 // ---------------------------------------------------------------------------
+// I2 + the upgrade path — the tool follows the MACHINE, not the role name
+// ---------------------------------------------------------------------------
+
+test("#371 I2: an centurion with neither a machine nor a phase gets no legion_phase; a legacy row keeps it", () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-declared-tools-"));
+	const db = openLegionDb(":memory:");
+	const toolNames = (nodeId: string, options: { machine?: PhaseMachine } = {}): string[] => {
+		const names: string[] = [];
+		const pi = { registerTool(tool: { name: string }) { names.push(tool.name); } };
+		registerLegionTools(pi as never, {
+			db,
+			nodeId,
+			role: "centurion",
+			cwd: dir,
+			runDir: dir,
+			settings: { verifyCommandTimeoutMs: 1_000 },
+			...(options.machine ? { machine: options.machine } : {}),
+		});
+		return names.sort();
+	};
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => NOW - 10);
+		// The #371 shape: declared nothing, born with no phase.
+		insertNode(db, { parentId: "root", name: "fresh", role: "centurion", status: "running", phase: null }, () => NOW - 5);
+		// The pre-#371 shape: born `planning`, and this process may not have its card
+		// machine (a resumed team, a card the user has since edited). Dropping its tool
+		// would strand a team that is mid-flight for an upgrade it had no part in.
+		insertNode(db, { parentId: "root", name: "legacy", role: "centurion", status: "running", phase: "planning", phaseSince: NOW - 5 }, () => NOW - 5);
+
+		assert.deepEqual(toolNames("root.fresh"), ["legion_mail", "legion_tree"], "no machine, no phase ⇒ no legion_phase");
+		assert.deepEqual(toolNames("root.legacy"), ["legion_mail", "legion_phase", "legion_tree"], "a node that already lives in a phase keeps its tool");
+		assert.deepEqual(toolNames("root.legacy", { machine: SOLO_MACHINE }), ["legion_mail", "legion_phase", "legion_tree"]);
+	} finally { db.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------
+// m7 — the contract is recorded on the machine's own intake boundary
+// ---------------------------------------------------------------------------
+
+test("#371 m7: contract_path follows the machine's ENTRY phase, not the literals planning/implementing", async () => {
+	const { db, cwd, cleanup } = fixture("spec");
+	try {
+		// A declared machine whose intake phase is called `spec`. The old test was the
+		// literal pair `self.phase === "planning" && to === "implementing"`, which never
+		// matched a custom workflow — the contract the team froze was never recorded.
+		const machine = productionShape({
+			start: "spec",
+			phases: [
+				{ id: "spec", next: [{ to: "impl" }] },
+				{ id: "impl", next: [{ to: "done" }] },
+			],
+		});
+		const moved = await requestLegionPhase(db, TEAM_ID, "impl", { cwd, now: () => NOW, machine });
+		assert.equal(moved.ok, true, moved.message);
+		assert.equal(
+			getNode(db, TEAM_ID)?.contractPath,
+			path.resolve(cwd, ".pi-legion", "contract.md"),
+			"leaving the machine's entry phase must record the contract",
+		);
+	} finally { cleanup(); }
+});
+
+test("#371 m7 CONTROL: the built-in pipeline is unchanged, and the write is tied to the entry phase rather than to any move", async () => {
+	// (a) No machine: the pre-#371 shape. `phaseStart(DEFAULT_PHASE_MACHINE)` is
+	// `planning`, so the generalization has to be byte-for-byte the old rule here.
+	const first = fixture("planning");
+	try {
+		writeContract(first.cwd, ["npm test"]);
+		const moved = await requestLegionPhase(first.db, TEAM_ID, "implementing", { cwd: first.cwd, now: () => NOW });
+		assert.equal(moved.ok, true, moved.message);
+		assert.equal(getNode(first.db, TEAM_ID)?.contractPath, path.resolve(first.cwd, ".pi-legion", "contract.md"));
+	} finally { first.cleanup(); }
+
+	// (b) The same declared machine, but the team is already PAST its entry phase
+	// (`spec`): a later move must not claim a contract it never froze. Without this
+	// half, "write on every successful transition" would pass just as well.
+	const second = fixture("impl");
+	try {
+		const machine = productionShape(SHIP_MACHINE);
+		const moved = await requestLegionPhase(second.db, TEAM_ID, "ship", { cwd: second.cwd, now: () => NOW, machine });
+		assert.equal(moved.ok, true, moved.message);
+		assert.equal(getNode(second.db, TEAM_ID)?.phase, "done");
+		assert.equal(getNode(second.db, TEAM_ID)?.contractPath, null, "only the entry phase records the contract");
+	} finally { second.cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
 // G5 — `done` follows the declaration
 // ---------------------------------------------------------------------------
 
 test("#371 G5: a declared exit to done lets the team complete itself", async () => {
 	const { db, cwd, cleanup } = fixture("implementing");
 	try {
-		const result = await requestLegionPhase(db, TEAM_ID, "done", { cwd, now: () => NOW, machine: SOLO_MACHINE });
+		// PRODUCTION shape (#371 C1): the raw fixture would be a fake guarantee —
+		// `maySelfComplete` must find the AUTHOR's edge among the injected ones.
+		const result = await requestLegionPhase(db, TEAM_ID, "done", { cwd, now: () => NOW, machine: productionShape(SOLO_MACHINE) });
 		assert.equal(result.ok, true, `implementing → done must be allowed: ${result.message}`);
 		assert.equal(result.phase, "done");
 		assert.equal(getNode(db, TEAM_ID)?.phase, "done");
@@ -164,14 +286,18 @@ test("#371 G5: `aborted` is never the team's own call, machine or not", async ()
 	} finally { cleanup(); }
 });
 
-test("#371 G5: a declared machine with no exit to done from THIS phase still refuses", async () => {
+test("#371 G5/C1: a declared machine with no exit to done from THIS phase still refuses", async () => {
 	const { db, cwd, cleanup } = fixture("impl");
 	try {
 		// `impl` declares exactly one exit (`ship`). The blanket refusal is replaced by
-		// the DECLARATION, not by a blanket permission.
-		const refused = await requestLegionPhase(db, TEAM_ID, "done", { cwd, now: () => NOW, machine: SHIP_MACHINE });
+		// the DECLARATION, not by a blanket permission — and the machine handed over is
+		// the PRODUCTION shape, i.e. `impl` also carries the injected unconditional
+		// `→ done` that normalization adds. Counting that edge as a declared exit made
+		// this refusal unreachable for every machine (#371 C1: the exploit probe).
+		const refused = await requestLegionPhase(db, TEAM_ID, "done", { cwd, now: () => NOW, machine: productionShape(SHIP_MACHINE) });
 		assert.equal(refused.ok, false);
 		assert.equal(refused.message, "done is controlled by the parent or supervisor");
+		assert.equal(getNode(db, TEAM_ID)?.phase, "impl", "the refused request must not move the team");
 		// The declared edge is still usable when asked for by its own name — and it
 		// runs verification, so a failing command leaves the team parked in `ship`
 		// rather than silently completing it (G6).
@@ -186,6 +312,78 @@ test("#371 G5: a declared machine with no exit to done from THIS phase still ref
 		assert.equal(ship.ok, true, ship.message);
 		assert.match(ship.message, /Verification failed/);
 		assert.equal(getNode(db, TEAM_ID)?.phase, "ship");
+	} finally { cleanup(); }
+});
+
+// ---------------------------------------------------------------------------
+// C1 — an INJECTED `→ done` belongs to the supervisor, never to the team
+// ---------------------------------------------------------------------------
+
+test("#371 C1: the injected → done is refused for a team and allowed for the supervisor (raw AND production shape)", () => {
+	// The exploit, exactly as reported: `ship → done require:["verification_passed"]`
+	// is the author's gate, but `evalutePhaseTransition` takes the FIRST edge whose
+	// `to` matches, and `normalizePhaseMachine` appends an unconditional `→ done` to
+	// `impl`. A team asking for `done` from `impl` therefore completed WITHOUT ever
+	// entering `ship` or running `legion-verify`.
+	//
+	// Both shapes are asserted on purpose: production hands over a normalized machine
+	// (injected edges present and marked), while a raw caller — a test, a fixture, the
+	// panel — hands over the author's literal. The state machine normalizes internally,
+	// so both must answer the same thing.
+	for (const [label, machine] of [
+		["raw", SHIP_MACHINE],
+		["production", productionShape(SHIP_MACHINE)],
+	] as const) {
+		const team = evaluatePhaseTransition({ from: "impl", to: "done", actorRole: "centurion", machine }, () => NOW);
+		assert.equal(team.allowed, false, `[${label}] impl → done must be refused for the team`);
+		assert.equal(team.allowed ? "<allowed>" : team.reason, "injected_done_is_supervisor_only", `[${label}] reason`);
+		assert.match(
+			team.allowed ? "" : team.message,
+			/the declared machine has no transition to done from 'impl'/,
+			`[${label}] the message must name the missing declaration, not an unmet condition`,
+		);
+
+		// …and the SUPERVISOR still takes it: that edge is how a machine which never
+		// declares `done` gets closed out (`finalizeVerifiedTeamIfReady`).
+		const supervisor = evaluatePhaseTransition({ from: "impl", to: "done", actorRole: "supervisor", machine }, () => NOW);
+		assert.equal(supervisor.allowed, true, `[${label}] the supervisor must still complete through the injected edge: ${supervisor.allowed ? "" : supervisor.message}`);
+	}
+});
+
+test("#371 C1: the author's own → done edge is untouched — the filter is about injection, not about `done`", () => {
+	const declared = productionShape(SOLO_MACHINE);
+	const fromAuthor = declared.phases.find((phase) => phase.id === "implementing")?.next.find((rule) => rule.to === "done");
+	assert.ok(fromAuthor, "the solo machine's implementing phase must still reach done");
+	assert.equal(fromAuthor.injected, undefined, "an authored edge must never be marked injected");
+	// The injected siblings are marked, which is what makes them skippable. `done`
+	// is NOT among them here: the solo machine declares the phase, so nothing was
+	// injected for it (`planning → done` is simply not a transition this machine
+	// has, which is the point of declaring `done` at all).
+	const injected = declared.phases.find((phase) => phase.id === "planning")?.next.filter((rule) => rule.injected === true) ?? [];
+	assert.deepEqual(injected.map((rule) => rule.to).sort(), ["aborted", "failed"]);
+});
+
+test("#371 C1: a machine that declares no → done still completes through the injected edge when the SUPERVISOR runs verification", async () => {
+	const { db, cwd, cleanup } = fixture("spec");
+	const messages: string[] = [];
+	try {
+		// `NO_DONE_MACHINE` declares `spec → impl` and never mentions `done`. Entering
+		// `impl` is entering its success phase, so the tool runs `legion-verify` and
+		// then takes the injected `impl → done` edge AS THE SUPERVISOR. If the filter
+		// above were applied to that path too, such a machine could never finish.
+		const machine = productionShape(NO_DONE_MACHINE);
+		assert.equal(successPhaseOf(machine), "impl", "the injected exit is what makes `impl` the success phase");
+		const result = await requestLegionPhase(db, TEAM_ID, "impl", {
+			cwd,
+			now: () => NOW,
+			machine,
+			sendSelfMessage: (text) => messages.push(text),
+			settings: { verifyCommandTimeoutMs: 1_000 },
+		});
+		assert.equal(result.ok, true, result.message);
+		assert.equal(result.phase, "done", `the supervisor path must still close the team; receipt: ${result.message}`);
+		assert.equal(getNode(db, TEAM_ID)?.phase, "done");
+		assert.ok(messages.some((message) => /squash/.test(message)), "the collection prompt still fires");
 	} finally { cleanup(); }
 });
 

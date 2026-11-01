@@ -34,6 +34,17 @@ export interface PhaseTransitionRule {
 	rework?: boolean;
 	/** Notify the parent when taken. */
 	notifyParent?: boolean;
+	/**
+	 * This edge was ADDED BY THE NORMALIZER, not written by the author (#371).
+	 *
+	 * The distinction is load-bearing for `done`: an injected `→ done` exists so a
+	 * team can never be stranded, and it is the SUPERVISOR's way out (the verified
+	 * completion path). It must never become the team's own way to skip a
+	 * verification phase its author DID declare — `evaluatePhaseTransition` refuses
+	 * it for every other actor, and no author-facing gate (`maySelfComplete`) may
+	 * count it as a declared exit.
+	 */
+	injected?: boolean;
 }
 
 export interface PhaseDefinition {
@@ -46,6 +57,8 @@ export interface PhaseDefinition {
 	timeoutMs?: number;
 	/** Terminal phases may not transition out. */
 	terminal?: boolean;
+	/** Added by {@link normalizePhaseMachine} rather than declared (#371). */
+	injected?: boolean;
 }
 
 export interface PhaseMachine {
@@ -256,22 +269,30 @@ export function machineTimeout(
  *
  * Rather than reject a machine that omits them (which would punish a card for
  * something it had no reason to think about), they are injected as terminal
- * phases with an unconditional edge from every non-terminal phase. Taking those
- * edges is still gated: `failed` requires a terminal reason and `aborted`
- * requires a parent retire, checked before any edge lookup, and `done` is
- * refused outright for a centurion (only the supervisor may complete a
- * team). So injection adds no new capability — it only removes the possibility of
- * a stranded team.
+ * phases with an unconditional edge from every non-terminal phase.
+ *
+ * INVARIANT (#371): an injected edge is REACHABLE ONLY BY THE SUPERVISOR.
+ * Every one of them is marked {@link PhaseTransitionRule.injected}, and
+ * `evaluatePhaseTransition` refuses an injected `→ done` for any other actor,
+ * while `failed`/`aborted` stay gated exactly as before (a terminal reason, and
+ * a parent retire). So injection adds no capability — it only removes the
+ * possibility of a stranded team — and it can never be the team's way around a
+ * verification phase its author DID declare.
+ *
+ * That last point is not theoretical: before the marker existed, a machine
+ * declaring `ship → done require:["verification_passed"]` let a team complete
+ * from ANY non-terminal phase, because `evaluateDeclarative` takes the first
+ * matching edge and the injected one carried no conditions at all.
  */
 export function normalizePhaseMachine(machine: PhaseMachine): PhaseMachine {
 	const declared = new Set(machine.phases.map((phase) => phase.id));
 	const missing = (["done", "failed", "aborted"] as const).filter((id) => !declared.has(id));
 	if (missing.length === 0) return machine;
-	const injected: PhaseDefinition[] = missing.map((id) => ({ id, terminal: true, next: [] }));
+	const injected: PhaseDefinition[] = missing.map((id) => ({ id, terminal: true, next: [], injected: true }));
 	const phases = machine.phases.map((phase) => {
 		if (phase.terminal === true || phase.next.length === 0) return phase;
 		const existing = new Set(phase.next.map((rule) => rule.to));
-		const extra = missing.filter((id) => !existing.has(id)).map((to) => ({ to }));
+		const extra = missing.filter((id) => !existing.has(id)).map((to) => ({ to, injected: true as const }));
 		return extra.length > 0 ? { ...phase, next: [...phase.next, ...extra] } : phase;
 	});
 	return { ...machine, phases: [...phases, ...injected] };

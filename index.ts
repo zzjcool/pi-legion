@@ -52,7 +52,7 @@ import { resolveTeamContext } from "./src/agents/context.ts";
 import { createSessionRuntime, renderLiveChildStatus, type ClaimedCollect, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
-import type { PhaseMachine } from "./src/legion/phase-machine.ts";
+import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, LEGION_PHASES_ENV } from "./src/runs/args.ts";
 import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
@@ -186,6 +186,49 @@ const PhaseMachineParams = Type.Object({
 	start: Type.Optional(Type.String({ description: "Entry phase; defaults to the first declared phase." })),
 	maxRework: Type.Optional(Type.Integer({ minimum: 0 })),
 });
+
+/**
+ * #371 (m9): the schema above and the real machine types must not drift.
+ *
+ * `parsePhaseMachine` is the authority, but the model reads THIS schema: a field
+ * added to `PhaseDefinition` and forgotten here would be invisible to every
+ * caller, and a field offered here that the parser rejects would be advertised
+ * and then refused. Both are silent at runtime, so they are made loud at compile
+ * time.
+ *
+ * The comparison is against a LOOSENED copy of the real types, because the schema
+ * is deliberately wider in exactly two documented places: `require` arrives as
+ * raw strings (the validator resolves them into `PhaseCondition`s) and `next` may
+ * be omitted (a phase with no exits must be `terminal`, which the validator
+ * checks). `injected` is excluded for the same reason — it is the normalizer's
+ * marker, never the caller's.
+ */
+type PhaseRuleSchema = Static<typeof PhaseRuleParams>;
+type PhaseSchema = Static<typeof PhaseParams>;
+type PhaseMachineSchema = Static<typeof PhaseMachineParams>;
+type CallerRule = Omit<PhaseTransitionRule, "injected" | "require"> & { require?: string[] };
+type CallerPhase = Omit<PhaseDefinition, "next" | "require" | "injected"> & { next?: CallerRule[]; require?: string[] };
+type CallerMachine = Omit<PhaseMachine, "phases"> & { phases: CallerPhase[] };
+/**
+ * Mutual assignability plus an exact KEY SET. Assignability alone would miss a
+ * property added as optional on one side (extra optional properties are legal to
+ * assign), which is precisely how a schema silently stops describing a field the
+ * parser requires.
+ */
+type SameShape<A, B> = [A] extends [B]
+	? [B] extends [A]
+		? [keyof A] extends [keyof B]
+			? [keyof B] extends [keyof A] ? true : never
+			: never
+		: never
+	: never;
+const phaseRuleSchemaParity: SameShape<CallerRule, PhaseRuleSchema> = true;
+const phaseSchemaParity: SameShape<CallerPhase, PhaseSchema> = true;
+const phaseMachineSchemaParity: SameShape<CallerMachine, PhaseMachineSchema> = true;
+// Referenced so `noUnusedLocals` cannot quietly delete the assertions above.
+void phaseRuleSchemaParity;
+void phaseSchemaParity;
+void phaseMachineSchemaParity;
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
