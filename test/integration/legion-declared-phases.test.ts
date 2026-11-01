@@ -152,16 +152,20 @@ function fixture(options: {
 }
 
 /**
- * Every session file the run directory holds.
+ * Every session file anywhere under the run store.
  *
- * `preCreateSessionFile` runs DEEP inside `launch()` (well past `reserveNode`), so
- * a non-empty list here is proof that a refused dispatch got further than the
- * guards — which the "no worktree directory" check cannot show for a child that
- * would never get one anyway (review m2).
+ * Deliberately the WHOLE tree, not one run dir: a launch that gets past
+ * `reserveNode` pre-creates `<run>/<name>.jsonl`, and a fresh child may get its own
+ * run (`createdRunId`), so looking only at the parent's run dir answers a question
+ * that is empty even for an ACCEPTED dispatch — i.e. it proves nothing (review m2).
+ * A refused one must leave no session file anywhere.
  */
-function sessionFiles(runDir: string): string[] {
-	if (!existsSync(runDir)) return [];
-	return readdirSync(runDir).filter((entry) => entry.endsWith(".jsonl")).sort();
+function sessionFiles(rootDir: string): string[] {
+	if (!existsSync(rootDir)) return [];
+	return readdirSync(rootDir, { recursive: true })
+		.map((entry) => String(entry))
+		.filter((entry) => entry.endsWith(".jsonl"))
+		.sort();
 }
 
 /** The tool set a live centurion child registers for itself. */
@@ -434,7 +438,7 @@ test("#371 I7: G2 — a non-root dispatcher may not declare phases, and leaves n
 		// worktree directory?" answers a question nothing can change. What a refusal
 		// must not leave behind is a RUN RECORD, a session file, or a ledger row.
 		assert.equal(fx.store.findChild(fx.rootRunId, "worker-0"), null, "I7: no child record may be committed");
-		assert.deepEqual(sessionFiles(fx.runDir), [], "I7: no session file may be pre-created");
+		assert.deepEqual(sessionFiles(fx.store.rootDir), [], "I7: no session file may be pre-created anywhere");
 		assert.equal(getNode(fx.db, "root.worker-0.worker-0"), null, "I7: no ledger row may exist");
 	} finally { fx.cleanup(); }
 });
@@ -452,7 +456,7 @@ test("#371 I7: G3 — the root may not declare phases for a non-centurion", asyn
 		);
 		assert.equal(fx.supervisor.spawns.length, 0);
 		assert.equal(fx.store.findChild(fx.rootRunId, "worker-0"), null, "I7: no child record may be committed");
-		assert.deepEqual(sessionFiles(fx.runDir), [], "I7: no session file may be pre-created");
+		assert.deepEqual(sessionFiles(fx.store.rootDir), [], "I7: no session file may be pre-created anywhere");
 		assert.equal(getNode(fx.db, "root.worker-0"), null, "I7: no ledger row may exist");
 	} finally { fx.cleanup(); }
 });
