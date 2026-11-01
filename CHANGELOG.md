@@ -81,6 +81,15 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **`centurion` 的状态机改成 root 派发时声明 (#371).** 以前「角色叫 centurion」就等于强制走五阶段：
+  哪怕只改一行文件也要走契约 → 派 worker → 派 reviewer → 跑 verify → squash MR。现在只有
+  `subagent({ agent: "centurion", phases: [...] })` 显式声明了才走状态机（声明了 = 以前的行为一字不改，
+  含 `done` 后注入的收队提示）；**没声明就是一次普通派发**——`nodes.phase` 为空、工具里没有
+  `legion_phase`、也没有收队提示，干完自己的活交 verdict 即结束。小活请直接派 worker。`phases` 只能由
+  root 声明、只能给 centurion，且必须能从 start 走到某个终态，否则在创建 worktree 之前就被拒。
+  同时把「非 root 不得派 centurion」写进契约（`docs/legion-v2-contract.md` REV-27，子契约
+  `docs/contracts/centurion-declared-phases-v1.md`），`agents/centurion.md` 的验收条目从 `required` 改为
+  `optional`（它从来没有可跑的验证命令）。worktree/rpc 耦合、深度公式、组员不隔离均不变。
 - **`/legion` 整帧分配降到 ≤2.0MB（−59% @120×40，−67% @200×60），且可见输出逐字节不变 (#364).** #362 已经修掉「每写一格分配一个 `Cell`」，这一轮清掉的是**每帧重建的
   脚手架**：星系像素缓冲/帧内 Map、行字符缓冲、图表 band 栈、`new Canvas(W,H)`，以及 `Math.hypot`、
   `{...cell, color}` 克隆、每帧 `text.trim()` 这类每格/每 run 的临时对象。现在这些都原地复用，
