@@ -595,7 +595,12 @@ export class LegionPostman {
 		if (!decision.allowed) return;
 		updateNode(this.db, node.id, { phase: "done", phaseSince: decision.phaseSince }, () => timestamp);
 		this.eventBus?.emit(appendEvent(this.db, node.id, "phase_change", decision.event.data, { now: () => timestamp }));
-		this.sendSelfMessage("All contract verification passed. Collect every child result, squash the subtree work, open an MR/PR for your parent, and report the URL. Do not merge.");
+		const how = verificationHow(
+			taskMetadata(node.taskSummary).verification?.commandCount ?? 0,
+			successPhase,
+			this.machine,
+		);
+		this.sendSelfMessage(`Verification passed ${how}. Collect every child result, squash the subtree work, open an MR/PR for your parent, and report the URL. Do not merge.`);
 	}
 
 	/**
@@ -1226,11 +1231,17 @@ export async function requestLegionPhase(
 		actorRole: "supervisor",
 		...(machine ? { machine } : {}),
 	}, now);
-	if (!done.allowed) return { ok: true, phase: decision.to, message: `Verification passed; waiting for team to settle: ${done.message}` };
+	// #371 follow-up: an empty ```legion-verify block still completes a team (frozen
+	// contract §7.3: "empty block = pass by contract", the read-only shape), but it
+	// must never be reported as a real verification — least of all when the machine
+	// the author declared makes `verification_passed` its gate. The gate is then
+	// satisfied vacuously, and the report has to say so.
+	const how = verificationHow(verification.commandCount, decision.to, machine);
+	if (!done.allowed) return { ok: true, phase: decision.to, message: `Verification passed ${how}; waiting for team to settle: ${done.message}` };
 	updateNode(db, nodeId, { phase: "done", phaseSince: done.phaseSince }, now);
 	options.eventBus?.emit(appendEvent(db, nodeId, "phase_change", done.event.data, { now }));
-	options.sendSelfMessage?.("All verification passed. Collect every child result, squash the subtree work, open an MR/PR for the parent, and report its URL. Do not merge.");
-	return { ok: true, phase: "done", message: `Verification passed (${verification.commandCount} command(s)); phase automatically advanced to done.` };
+	options.sendSelfMessage?.(`Verification passed ${how}. Collect every child result, squash the subtree work, open an MR/PR for the parent, and report its URL. Do not merge.`);
+	return { ok: true, phase: "done", message: `Verification passed ${how}; phase automatically advanced to done.` };
 }
 
 interface VerificationResult {
@@ -1267,6 +1278,25 @@ function taskMetadata(raw: string | null): TaskSummaryMetadata {
 		} catch { /* a regular task summary is not metadata */ }
 	}
 	return { version: 1, taskSummary: raw };
+}
+
+/**
+ * How a passing verification should be described (#371 follow-up).
+ *
+ * `0 commands` is a legitimate pass ("by contract"), but it is NOT evidence: when
+ * the machine's own edge out of `phase` makes `verification_passed` the gate, the
+ * gate was satisfied without running anything, and every message that says so has
+ * to name it. Otherwise a parent reads "verification passed" and merges a branch
+ * nothing ever checked.
+ */
+function verificationHow(commandCount: number, phase: string, machine?: PhaseMachine): string {
+	if (commandCount > 0) return `(${commandCount} command(s))`;
+	const gated = (findPhase(machine ?? DEFAULT_PHASE_MACHINE, phase)?.next.find((rule) => rule.to === "done")?.require ?? []).includes(
+		"verification_passed",
+	);
+	return gated
+		? "by contract (0 commands — the machine gates on verification_passed, but the contract lists no legion-verify block)"
+		: "by contract (0 commands)";
 }
 
 function readVerificationResult(node: LegionNode): boolean | undefined {
@@ -1317,7 +1347,7 @@ export async function runVerification(
 			break;
 		}
 	}
-	if (!commands.length) output.push("No legion-verify block; verification passes by contract.");
+	if (!commands.length) output.push("No legion-verify block; verification passes by contract (0 commands).");
 	fs.writeFileSync(outputFile, `${output.join("\n\n")}\n`, { mode: 0o600 });
 	const now = options.now ?? Date.now;
 	const result = { passed, outputFile, commandCount: commands.length, checkedAt: now() };
