@@ -418,6 +418,28 @@ test("#371 G6: a machine that calls its verify phase `ship` still reaches done",
 	} finally { cleanup(); }
 });
 
+test("#371 G6: an out-of-order declaration is not completed before its own pipeline", () => {
+	// Legal and reachable, and `done` is never declared, so every exit to it is a
+	// normalizer injection: the AUTHOR said nothing about where success is judged.
+	// Array order (the old tie-break) picks `impl` — the last listed — and completes
+	// the team there, skipping `ship`. Distance from the start is order-independent.
+	// Listed out of pipeline order, with an explicit `start` so the validator's
+	// reachability rule is satisfied without reordering the array.
+	const machine = productionShape({
+		start: "spec",
+		phases: [
+			{ id: "ship", next: [{ to: "failed" }] },
+			{ id: "spec", next: [{ to: "impl" }] },
+			{ id: "impl", next: [{ to: "ship" }] },
+		],
+	});
+	assert.equal(
+		successPhaseOf(machine),
+		"ship",
+		"the deepest phase wins, not whichever phase the author listed last",
+	);
+});
+
 test("#371 G6: successPhaseOf names the declared phase and stays undefined when a machine never completes", () => {
 	assert.equal(successPhaseOf(DEFAULT_PHASE_MACHINE), "verifying", "the built-in answer is unchanged");
 	assert.equal(successPhaseOf(SHIP_MACHINE), "ship");

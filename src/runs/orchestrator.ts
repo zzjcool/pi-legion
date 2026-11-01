@@ -1083,7 +1083,10 @@ export class Orchestrator {
 		// the FALLBACK, never the override: a dispatch that names its machine wins
 		// over a role card that also names one (contract §2).
 		const machine = declaredPhases ? this.declaredPhaseMachine(input) : input.agent.phases;
-		if (machine && this.legion && nodeId) this.declaredPhases.set(nodeId, machine);
+		// #371 (m8, review r2): the declaration is recorded INSIDE the try below, not
+		// here. Admission/budget refusals and queued launches return or throw before a
+		// node exists, so recording it here would leave an entry that `abortLegionPhase`
+		// could later read for a node that never ran.
 		// #214 D4: only centurion may hold worktree. Legion path still forces
 		// centurion→true and centurion-parent→member false; non-centurion
 		// requests from any source are demoted below (D1: warn, never throw).
@@ -1231,6 +1234,8 @@ export class Orchestrator {
 		let createdRunId: string | undefined;
 		let parentReservationCreated = false;
 		try {
+			// #371 (m8): from here on a node may exist, so the declaration has an owner.
+			if (machine && this.legion && nodeId) this.declaredPhases.set(nodeId, machine);
 			if (worktree && !worktreePath) {
 				const tree = createChildWorktree({ repoCwd: this.cwd, runDir: this.runDir, name });
 				worktreePath = tree.path;
@@ -1393,6 +1398,10 @@ export class Orchestrator {
 		} catch (error) {
 			this.admitting.delete(name);
 			if (spawned) await this.supervisor.retire(name).catch(() => {});
+			// #371 (m8): unconditional — `rollbackReservation` only runs once the launch
+			// reached `reserveNode`, but worktree creation and provisioning fail before
+			// that and still need the entry gone.
+			if (nodeId) this.declaredPhases.delete(nodeId);
 			if (reserved && nodeId) this.rollbackReservation(nodeId, reservedNode);
 			if (parentReservationCreated && this.legion?.runStore) {
 				try { await this.legion.runStore.removeChild(this.legion.runId!, name, nodeId); } catch { /* rollback is best effort */ }

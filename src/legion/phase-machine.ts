@@ -57,8 +57,6 @@ export interface PhaseDefinition {
 	timeoutMs?: number;
 	/** Terminal phases may not transition out. */
 	terminal?: boolean;
-	/** Added by {@link normalizePhaseMachine} rather than declared (#371). */
-	injected?: boolean;
 }
 
 export interface PhaseMachine {
@@ -226,13 +224,51 @@ export function canReachTerminal(machine: PhaseMachine): boolean {
  * to keep its historical literal rather than invent a phase name.
  */
 export function successPhaseOf(machine: PhaseMachine): string | undefined {
-	const exits = machine.phases.filter((phase) => phase.next.some((rule) => rule.to === "done"));
+	const declared = machine.phases.filter((phase) =>
+		phase.next.some((rule) => rule.to === "done" && rule.injected !== true),
+	);
+	const exits =
+		declared.length > 0
+			? declared
+			: machine.phases.filter((phase) => phase.next.some((rule) => rule.to === "done"));
 	if (exits.length === 0) return undefined;
 	const gated = exits.filter((phase) =>
 		phase.next.some((rule) => rule.to === "done" && (rule.require ?? []).includes("verification_passed")),
 	);
 	const candidates = gated.length > 0 ? gated : exits;
-	return candidates[candidates.length - 1]!.id;
+	if (declared.length > 0) return candidates[candidates.length - 1]!.id;
+	// #371 (review r2): every exit is a normalizer injection, so the AUTHOR said
+	// nothing about where success is judged. Trusting array order here would let a
+	// legal but out-of-order declaration (phases listed ship, spec, impl) complete
+	// the team at `impl`, skipping an earlier pipeline stage; the farthest phase from
+	// the start is the only order-independent answer.
+	return farthestFrom(machine, candidates);
+}
+
+/** BFS distance from the start; ties keep the declaration's own order. */
+function farthestFrom(machine: PhaseMachine, candidates: PhaseDefinition[]): string {
+	const start = phaseStart(machine);
+	const distance = new Map<string, number>([[start, 0]]);
+	const queue = [start];
+	while (queue.length > 0) {
+		const id = queue.shift()!;
+		const phase = findPhase(machine, id);
+		for (const rule of phase?.next ?? []) {
+			if (distance.has(rule.to)) continue;
+			distance.set(rule.to, (distance.get(id) ?? 0) + 1);
+			queue.push(rule.to);
+		}
+	}
+	let best = candidates[0]!.id;
+	let bestDistance = distance.get(best) ?? -1;
+	for (const phase of candidates) {
+		const current = distance.get(phase.id) ?? -1;
+		if (current > bestDistance) {
+			best = phase.id;
+			bestDistance = current;
+		}
+	}
+	return best;
 }
 
 /** Look up a phase by id. */
@@ -288,7 +324,7 @@ export function normalizePhaseMachine(machine: PhaseMachine): PhaseMachine {
 	const declared = new Set(machine.phases.map((phase) => phase.id));
 	const missing = (["done", "failed", "aborted"] as const).filter((id) => !declared.has(id));
 	if (missing.length === 0) return machine;
-	const injected: PhaseDefinition[] = missing.map((id) => ({ id, terminal: true, next: [], injected: true }));
+	const injected: PhaseDefinition[] = missing.map((id) => ({ id, terminal: true, next: [] }));
 	const phases = machine.phases.map((phase) => {
 		if (phase.terminal === true || phase.next.length === 0) return phase;
 		const existing = new Set(phase.next.map((rule) => rule.to));
