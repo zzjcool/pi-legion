@@ -182,6 +182,11 @@ function harness(prefix: string) {
 		for (const handler of handlers.get("session_shutdown") ?? []) {
 			await handler({ type: "session_shutdown", reason: "quit" }, { mode: "tui", ...ctx() });
 		}
+		// Belt and braces: a scenario that leaves a child behind (a deliberately
+		// broken build under mutation testing) must not keep the test process alive.
+		for (const name of [...supervisor.children.keys()]) {
+			await supervisor.retire(name).catch(() => {});
+		}
 	};
 
 	/** The system prompt the agent would start this turn with. */
@@ -369,14 +374,23 @@ test("#374 §5/I6: the prompt lists what was interrupted, spawns nothing, and dr
 		assert.equal(h.supervisor.calls.filter((call) => call.method === "spawnChild").length, spawnsBefore);
 		assert.equal(h.notices.filter((line) => /were interrupted/u.test(line)).length, 1, "the user is told once");
 
-		// The agent asks, the user approves, and the tool is what restarts a team.
+		// The agent asks, the user approves, and the tool is what restarts a team —
+		// exactly ONE team. A reopen that also replayed the rest of the list would
+		// spend tokens nobody asked for, which is invariant I6.
 		await h.call({ action: "resume", name: "centurion-0", message: "keep going" });
+		assert.equal(h.supervisor.spawns.length, spawnsBefore + 1, "I6: resuming one team spawns one child, not the whole paused list");
+		assert.equal(
+			h.supervisor.calls.filter((call) => call.method === "spawnChild").length,
+			spawnsBefore + 1,
+			"I6: the supervisor was asked for exactly one child (the call log is the ground truth)",
+		);
 		const partial = h.systemPrompt();
 		assert.doesNotMatch(partial, /centurion-0 · spec/u, "a recovered team leaves the list");
 		assert.match(partial, /centurion-1 · spec/u, "…while the one still paused stays listed");
 		assert.equal(h.notices.filter((line) => /were interrupted/u.test(line)).length, 1, "one notice per startup, not per turn");
 
 		await h.call({ action: "resume", name: "centurion-1", message: "keep going too" });
+		assert.equal(h.supervisor.spawns.length, spawnsBefore + 2, "…and the second approval spawns the second child");
 		assert.ok(!h.systemPrompt().includes(INTERRUPTED_NODES_NOTE), "nothing left to resume ⇒ the section is gone");
 	} finally {
 		await h.shutdown().catch(() => {});
