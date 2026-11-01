@@ -1498,19 +1498,24 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	/** Same startup, one notice (§5). Keyed like {@link continuityProbe}. */
 	const continuityNotified = new Set<string>();
 	const sessionContinuity = (ctx: Pick<ExtensionContext, "cwd"> & { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined): { key: string; nodes: LegionNode[] } | undefined => {
+		// A node THIS process is running right now is not interrupted, whatever its
+		// row still says (`resume` flips it to `running`, which §5's status set
+		// contains). Liveness is the one fact the ledger cannot answer, and without
+		// it the section would keep nagging about a team that was just recovered.
+		const interrupted = (nodes: LegionNode[]): LegionNode[] => nodes.filter((node) => !supervisor.isAlive(node.name));
 		const own = ownLegionIdentity();
 		if (own) {
 			const key = path.resolve(own.dbPath);
 			// Only a session that REOPENED its own run reports anything; a tree adopted
 			// through env belongs to a session that is still live (or being resumed).
-			return reopenedSessionLedgers.has(key) ? { key, nodes: interruptedChildren(own.db) } : undefined;
+			return reopenedSessionLedgers.has(key) ? { key, nodes: interrupted(interruptedChildren(own.db)) } : undefined;
 		}
 		const sessionFile = ctx?.sessionManager?.getSessionFile?.();
 		if (!sessionFile) return undefined;
 		const key = path.resolve(sessionFile);
 		if (continuityProbe?.key === key) return continuityProbe;
 		const store = runStoreFor(ctx?.cwd ?? lastCwd);
-		continuityProbe = { key, nodes: probeInterruptedNodes(store, key) };
+		continuityProbe = { key, nodes: interrupted(probeInterruptedNodes(store, key)) };
 		return continuityProbe;
 	};
 	pi.on("before_agent_start", (event, ctx) => {
@@ -1539,16 +1544,24 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// itself once nothing is left to resume (idempotent, never accumulating).
 		const continuity = sessionContinuity(ctx);
 		const interrupted = continuity ? renderInterruptedSection(continuity.nodes) : "";
-		if (continuity && continuity.nodes.length > 0 && !continuityNotified.has(continuity.key)) {
-			continuityNotified.add(continuity.key);
-			const count = continuity.nodes.length;
-			try {
-				ctx?.ui?.notify?.(
-					`pi-legion: ${count} subagent${count === 1 ? "" : "s"} from this session were interrupted when it exited — nothing was restarted. Ask me to resume the ones you want.`,
-					"info",
-				);
-			} catch {
-				// no UI (print mode / headless): the prompt section still carries the fact
+		if (continuity && continuity.nodes.length > 0) {
+			// One notice per STARTUP, not per turn. Keyed by the session transcript when
+			// there is one, because the same session is described by two different
+			// handles over its life (the read-only probe before adoption, the live
+			// ledger after it) and both must count as "the same startup".
+			const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+			const noticeKey = sessionFile ? path.resolve(sessionFile) : continuity.key;
+			if (!continuityNotified.has(noticeKey)) {
+				continuityNotified.add(noticeKey);
+				const count = continuity.nodes.length;
+				try {
+					ctx?.ui?.notify?.(
+						`pi-legion: ${count} subagent${count === 1 ? "" : "s"} from this session were interrupted when it exited — nothing was restarted. Ask me to resume the ones you want.`,
+						"info",
+					);
+				} catch {
+					// no UI (print mode / headless): the prompt section still carries the fact
+				}
 			}
 		}
 		return {
