@@ -11,6 +11,7 @@
  *   is still working. Running children are painted next to the input box.
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type {
@@ -58,7 +59,7 @@ import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
 import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
-import { getChildByName, getChildren, getNode, getSubtree, insertNode, type LegionNode, updateNode } from "./src/legion/nodes.ts";
+import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, NON_TERMINAL_NODE_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
@@ -138,6 +139,7 @@ import {
 	type Execution,
 	type ModelOrigin,
 	type RetireOptions,
+	type RunRecord,
 	type SpawnMode,
 	SubagentError,
 	type SubagentsSettings,
@@ -873,7 +875,13 @@ async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input:
 }
 
 function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; store: RunStore; cwd: string; task: string; settings: ReturnType<typeof loadSubagentSettings>; maxDepth: number; eventBus: LegionEventBus; rootSessionFile?: string | undefined }): LegionRuntimeIdentity {
-	const rootRun = input.store.createRun({ task: input.task, cwd: input.cwd, maxDepth: input.maxDepth, nodeId: "root", herdr: { supervisor: currentProcessSpawnMode() } });
+	// #374 §2: this session may already own a tree. Reopening it (same run, same
+	// ledger, same rows) is the whole point of the contract — a fresh run would
+	// build a SHADOW tree whose `legion_tree`, phases and mail are all detached
+	// from the ones the interrupted session left behind.
+	const reopened = reopenSessionRun(input);
+	if (reopened) return reopened;
+	const rootRun = input.store.createRun({ task: input.task, cwd: input.cwd, maxDepth: input.maxDepth, nodeId: "root", ...(input.rootSessionFile ? { sessionFile: input.rootSessionFile } : {}), herdr: { supervisor: currentProcessSpawnMode() } });
 	const dbPath = path.resolve(legionDbPath(input.store.runDir(rootRun.runId)));
 	const db = openLegionDb(dbPath);
 	const now = Date.now();
@@ -885,6 +893,154 @@ function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSuperviso
 	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: rootRun.runId, status: "running", taskSummary: input.task.slice(0, 2_000), ...(input.rootSessionFile ? { sessionFile: input.rootSessionFile } : {}), createdAt: now, updatedAt: now }, () => now);
 	appendEvent(db, "root", "node_launched", { runId: rootRun.runId, task: input.task }, { now: () => now });
 	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false, machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
+}
+
+/**
+ * #374 §1: the ONE session-identity judgement in this repo.
+ *
+ * Two processes belong to the same session iff their session transcript paths
+ * are the same file (`path.resolve`). There is no session-id concept here and
+ * none is invented — `ChildRecord.sessionId` is a dead field.
+ *
+ * A session with no transcript (`SessionManager.inMemory()` hands out
+ * `undefined`) has NO identity: nothing is recorded, nothing is found, nothing
+ * is resumed.
+ */
+export function findSessionRun(store: RunStore, sessionFile: string | undefined): RunRecord | undefined {
+	if (!sessionFile) return undefined;
+	const target = path.resolve(sessionFile);
+	let newest: RunRecord | undefined;
+	for (const run of store.listRuns()) {
+		if (typeof run.sessionFile !== "string") continue;
+		if (path.resolve(run.sessionFile) !== target) continue;
+		// `listRuns()` is oldest-first, but the ordering is the store's business:
+		// compare explicitly so "the most recent run of this session" is true by
+		// construction rather than by luck.
+		if (!newest || run.createdAt >= newest.createdAt) newest = run;
+	}
+	return newest;
+}
+
+/**
+ * Reopen the ledger of THIS session's previous run (#374 §2).
+ *
+ * Returns `undefined` whenever the situation is not a clean reopen — no session
+ * credential, no matching run, an unreadable/corrupt ledger, or a run whose root
+ * row is gone. Every one of those degrades to "behave exactly like today" (a
+ * new run), never to a throw: losing continuity must not cost the user a launch.
+ *
+ * Deliberately NOT written here: a new run record, a `node_launched` event, a
+ * second root row (`insertNode` would throw `NodeNameConflictError`), or any
+ * touch of the phase columns (§3 leaves them exactly where the pause left
+ * them).
+ */
+function reopenSessionRun(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; store: RunStore; cwd: string; settings: ReturnType<typeof loadSubagentSettings>; eventBus: LegionEventBus; rootSessionFile?: string | undefined }): LegionRuntimeIdentity | undefined {
+	const sessionFile = input.rootSessionFile;
+	const previous = findSessionRun(input.store, sessionFile);
+	if (!previous) return undefined;
+	const dbPath = path.resolve(legionDbPath(input.store.runDir(previous.runId)));
+	let db: DatabaseSync | undefined;
+	try {
+		db = openLegionDb(dbPath);
+		if (!getNode(db, "root")) {
+			// A ledger without its root row is not a tree we can hand back.
+			db.close();
+			return undefined;
+		}
+	} catch (error) {
+		try { db?.close(); } catch { /* the open failed; nothing to release */ }
+		console.warn(
+			`[pi-legion] could not reopen the ledger of this session (${dbPath}): ${error instanceof Error ? error.message : String(error)}; starting a new run.`,
+		);
+		return undefined;
+	}
+	try {
+		const now = Date.now();
+		// The row exists: UPDATE it. `insertNode` would throw on the name conflict,
+		// and a second root row is not a thing this schema can hold.
+		updateNode(db, "root", { status: "running", ...(sessionFile ? { sessionFile: path.resolve(sessionFile) } : {}) }, () => now);
+		// §2: "不新写 run.json（只更新 updatedAt）" — every other field of the
+		// record is preserved verbatim, including the task the run was created for.
+		input.store.writeRun(previous);
+	} catch (error) {
+		try { db.close(); } catch { /* nothing to release */ }
+		console.warn(
+			`[pi-legion] could not adopt the previous run ${previous.runId}: ${error instanceof Error ? error.message : String(error)}; starting a new run.`,
+		);
+		return undefined;
+	}
+	reopenedSessionLedgers.add(dbPath);
+	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: previous.runId, runDir: input.store.runDir(previous.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false, machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
+}
+
+/**
+ * Read-only probe used by `before_agent_start` before this entry owns a ledger.
+ *
+ * Mirrors what `reopenSessionRun` will accept — same run lookup, same "the root
+ * row must exist" gate — so the hint can never advertise continuity that the
+ * adoption would then refuse. A corrupt or absent ledger degrades to "nothing to
+ * report", never to a throw, and run.json is never written (invariant I1).
+ */
+function probeInterruptedNodes(store: RunStore, sessionFile: string): LegionNode[] {
+	const run = findSessionRun(store, sessionFile);
+	if (!run) return [];
+	const dbPath = path.resolve(legionDbPath(store.runDir(run.runId)));
+	if (!fs.existsSync(dbPath)) return [];
+	let db: DatabaseSync | undefined;
+	try {
+		db = openLegionDb(dbPath);
+		return getNode(db, "root") ? interruptedChildren(db) : [];
+	} catch {
+		return [];
+	} finally {
+		try { db?.close(); } catch { /* probe is best-effort */ }
+	}
+}
+
+/**
+ * #374 §5: the children a previous exit left behind, i.e. the ones this session
+ * may resume.
+ *
+ * The predicate is the contract's, literally: `status` is one of the statuses
+ * that can still be resumed (the same list hygiene's stale scan uses, which is
+ * why `retired` is on it — §3 makes an interrupted node `retired`, not failed),
+ * it has a phase, and neither the status nor the phase is terminal.
+ *
+ * Only DIRECT children are listed. A name is resolvable from here only if this
+ * node is its parent (`subagent({action:"resume", name})` looks under the
+ * caller), so advertising a grandchild would name an action that cannot work;
+ * resuming the team brings its own squad back with it.
+ */
+export function interruptedChildren(db: DatabaseSync, parentNodeId = "root"): LegionNode[] {
+	return getChildren(db, parentNodeId).filter((node) =>
+		(NON_TERMINAL_NODE_STATUSES as readonly string[]).includes(node.status)
+		&& node.phase !== null
+		&& !isTerminalNode(node));
+}
+
+/** The frozen §5 wording. Quoted, not paraphrased: it is the rule the agent must read. */
+export const INTERRUPTED_NODES_NOTE =
+	"These subagents were interrupted when the previous session exited.\n" +
+	"Do NOT resume them on your own; ask the user first, then call\n" +
+	"subagent({action:\"resume\", name}) for each one they approve.";
+
+/** How many interrupted nodes the prompt lists before it starts counting. */
+export const INTERRUPTED_NODES_PROMPT_CAP = 10;
+
+/**
+ * The system-prompt section for {@link interruptedChildren}, or `""` when there
+ * is nothing to report.
+ *
+ * Rendered fresh on every `before_agent_start`, so it DISAPPEARS by itself once
+ * the last listed node has been resumed or dropped — the section is a view of
+ * the ledger, never an accumulating log.
+ */
+export function renderInterruptedSection(nodes: readonly Pick<LegionNode, "name" | "phase">[]): string {
+	if (nodes.length === 0) return "";
+	const shown = nodes.slice(0, INTERRUPTED_NODES_PROMPT_CAP).map((node) => `- ${node.name} · ${node.phase ?? "<none>"}`);
+	const hidden = nodes.length - INTERRUPTED_NODES_PROMPT_CAP;
+	if (hidden > 0) shown.push(`- …and ${hidden} more`);
+	return `## Interrupted subagents\n\n${INTERRUPTED_NODES_NOTE}\n\n${shown.join("\n")}`;
 }
 
 async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSupervisor; db: DatabaseSync; dbPath: string; eventBus: LegionEventBus; settings: LegionSettings; cwd: string; storeRootDir: string; parentNodeId: string; node: LegionNode; message: string; machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined }): Promise<void> {
@@ -927,7 +1083,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
 	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus, ...(input.machineForRole ? { machineForRole: input.machineForRole } : {}) } });
 	orchestrator.restore(parentRun);
-	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), worktree: Boolean(saved.worktreePath) });
+	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.phases ? { phases: saved.phases } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
@@ -975,6 +1131,16 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
  */
 const legionIdentityKey = (dbPath: string, nodeId: string): string => `${dbPath}\u0000${nodeId}`;
 const legionIdentities = new Map<string, LegionRuntimeIdentity>();
+
+/**
+ * Ledgers THIS process reopened because the session had been here before (#374).
+ *
+ * The §5 prompt hint is scoped to them on purpose: a fresh tree has nothing
+ * interrupted to report, and a tree adopted through `PI_LEGION_DB` env belongs to
+ * a live or being-resumed session, not to a restart. Keyed by resolved ledger
+ * path, like {@link legionIdentities}.
+ */
+const reopenedSessionLedgers = new Set<string>();
 
 export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps = {}) {
 	// #197 D8: a session is a child if either transport says so. RPC children
@@ -1314,6 +1480,39 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			},
 		});
 	}
+	/**
+	 * #374 §5: what THIS session's previous run left interrupted, for the prompt.
+	 *
+	 * Two sources, one predicate. Once this entry owns a ledger it is read live, so
+	 * a recovered or dropped node leaves the section on the very next turn. Before
+	 * that — which is the FIRST prompt of a reopened session, because the tree is
+	 * only adopted when a launch needs it — the same lookup `createRootLegion`
+	 * will use runs READ-ONLY: `findSessionRun` on this session's own transcript
+	 * path, then that run's ledger. Memoized, so one scan per session at most.
+	 *
+	 * A session with no transcript path has no identity (§1) and never looks at
+	 * anything; a different session's runs are never matched, so they are never
+	 * read, hinted at or touched (invariant I1).
+	 */
+	let continuityProbe: { key: string; nodes: LegionNode[] } | undefined;
+	/** Same startup, one notice (§5). Keyed like {@link continuityProbe}. */
+	const continuityNotified = new Set<string>();
+	const sessionContinuity = (ctx: Pick<ExtensionContext, "cwd"> & { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined): { key: string; nodes: LegionNode[] } | undefined => {
+		const own = ownLegionIdentity();
+		if (own) {
+			const key = path.resolve(own.dbPath);
+			// Only a session that REOPENED its own run reports anything; a tree adopted
+			// through env belongs to a session that is still live (or being resumed).
+			return reopenedSessionLedgers.has(key) ? { key, nodes: interruptedChildren(own.db) } : undefined;
+		}
+		const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+		if (!sessionFile) return undefined;
+		const key = path.resolve(sessionFile);
+		if (continuityProbe?.key === key) return continuityProbe;
+		const store = runStoreFor(ctx?.cwd ?? lastCwd);
+		continuityProbe = { key, nodes: probeInterruptedNodes(store, key) };
+		return continuityProbe;
+	};
 	pi.on("before_agent_start", (event, ctx) => {
 		if (process.env[UTILITY_CHILD_ENV] === "1") return;
 		if (!subagentsEnabled(ctx?.cwd ?? lastCwd)) return;
@@ -1335,12 +1534,29 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		const rosterAgents = selfRole
 			? catalog.agents.filter((agent) => agent.name !== selfRole)
 			: catalog.agents;
+		// #374 §5: the same session coming back finds its paused children named here.
+		// The section is derived from the ledger on every prompt, so it vanishes by
+		// itself once nothing is left to resume (idempotent, never accumulating).
+		const continuity = sessionContinuity(ctx);
+		const interrupted = continuity ? renderInterruptedSection(continuity.nodes) : "";
+		if (continuity && continuity.nodes.length > 0 && !continuityNotified.has(continuity.key)) {
+			continuityNotified.add(continuity.key);
+			const count = continuity.nodes.length;
+			try {
+				ctx?.ui?.notify?.(
+					`pi-legion: ${count} subagent${count === 1 ? "" : "s"} from this session were interrupted when it exited — nothing was restarted. Ask me to resume the ones you want.`,
+					"info",
+				);
+			} catch {
+				// no UI (print mode / headless): the prompt section still carries the fact
+			}
+		}
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${PARENT_PLAYBOOK}\n\n${renderParentRoster(
 				rosterAgents,
 				catalog.team,
 				catalog.teamWarnings,
-			)}${parentContext ? `\n\n${parentContext}` : ""}`,
+			)}${parentContext ? `\n\n${parentContext}` : ""}${interrupted ? `\n\n${interrupted}` : ""}`,
 		};
 	});
 	if (process.env[UTILITY_CHILD_ENV] === "1") {
@@ -1712,6 +1928,14 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				if (!activeLegion && action === "launch" && !isChild) {
 					const plan = buildPlan(params);
 					if (plan.ok) activeLegion = createRootLegion({ pi, supervisor, store, cwd, task: plan.task, settings, maxDepth: effectiveMaxDepth(settings.legion?.maxDepth), eventBus: legionBus, rootSessionFile: ctx.sessionManager?.getSessionFile() });
+				} else if (!activeLegion && !isChild && (action === "resume" || action === "continue")) {
+					// #374 §4/§7-2: a resume is the ONE control action that must act on the
+					// reopened tree. Without the adoption `input.legion.nodeId` is unknown to
+					// the launcher and the child would restart OUTSIDE the ledger — visibly
+					// running while its `nodes` row stayed `retired`. Reopen-ONLY: when this
+					// session owns no previous run the call falls through to today's behaviour
+					// (no tree is invented, nothing is written).
+					activeLegion = reopenSessionRun({ pi, supervisor, store, cwd, settings, eventBus: legionBus, rootSessionFile: ctx.sessionManager?.getSessionFile() });
 				}
 				if (activeLegion) adoptLegionIdentity(activeLegion);
 			} catch (error) {
@@ -2859,6 +3083,10 @@ async function reviveChild(
 			task: params.message,
 			name,
 			...(found.child.model ? { model: found.child.model } : {}),
+			// #374 §4: a team declared its machine at FIRST launch; a resume in a
+			// later process must replay that declaration or the child falls back to
+			// the role card and its custom phase names read as `invalid_phase`.
+			...(found.child.phases ? { phases: found.child.phases } : {}),
 		});
 		// D6/D8/D5-a: spend one renewal, but only if this child was actually cut
 		// off by its turn budget.

@@ -1374,6 +1374,13 @@ export class Orchestrator {
 				agent: input.agent,
 				sessionFile: result.sessionFile,
 				spawnMode: mode,
+				// #374 §4: snapshot the declaration this team actually RUNS under, so a
+				// resume in a later process can replay it. Gated exactly like
+				// `lineageEnv` — only `centurion` is ever sent `PI_LEGION_PHASES`, and a
+				// record that replayed a role-card machine as a DECLARATION would be
+				// refused by the launch guards (`phases` is a root-only, team-only
+				// argument), i.e. the resume would fail. What is stored is what was sent.
+				...(machine && input.agent.name === "centurion" ? { phases: machine } : {}),
 				...(startedModel ? { model: startedModel } : {}),
 				...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
 				...(worktreePath ? { worktreePath } : {}),
@@ -2267,6 +2274,8 @@ export class Orchestrator {
 		nodeId?: string;
 		agent: AgentConfig;
 		sessionFile: string;
+		/** #374 §4: the declaration this team runs under (`centurion` only), replayed on resume. */
+		phases?: PhaseMachine;
 		/** Arbitrated spawn backend (#209); persisted so later operators see the truth. */
 		spawnMode: SpawnMode;
 		model?: string;
@@ -2278,6 +2287,7 @@ export class Orchestrator {
 			name: input.name,
 			...(input.nodeId ? { nodeId: input.nodeId } : {}),
 			sessionFile: input.sessionFile,
+			...(input.phases ? { phases: input.phases } : {}),
 			ownerToken: ownerToken(),
 			state: "working",
 			spawnedAt: new Date(this.now()).toISOString(),
@@ -2979,14 +2989,32 @@ export class Orchestrator {
 			);
 		}
 		if (child.nodeId && this.legion) {
-			if (child.execution && child.execution.status !== "unknown" && child.execution.status !== "running") {
+			// #374 §3: the parent session leaving is a PAUSE, not a verdict.
+			//
+			// `abortLegionPhase` below pushes the phase to `aborted`, which is terminal,
+			// and `childFromNode`/`reserveNode` refuse a terminal node — so before this
+			// change an interrupted team could never be resumed: the one way to end a
+			// session also destroyed the only credential to continue it. On a session
+			// shutdown the phase, its stint clock and the rework count therefore stay
+			// exactly where the work stopped; the node only becomes `retired`, which is
+			// already on the resumable side of every predicate (`isTerminalNode` false,
+			// `hasEnded` true so it receives no mail). No `phase_change` is written:
+			// nothing moved. Every other cause (`stop`, `abort`, budget, explicit
+			// retire) keeps the abort behaviour byte for byte (invariant I4).
+			const pausedByShutdown = opts?.cause === "session-shutdown";
+			if (pausedByShutdown) {
+				updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
+				// The event type stays in the closed set of 16; `reason` is a field, not a
+				// new event (§3, invariant I2).
+				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, reason: "session-shutdown" });
+			} else if (child.execution && child.execution.status !== "unknown" && child.execution.status !== "running") {
 				this.recordSettled(child, child.execution);
 				if (child.execution.status !== "aborted") this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, execution: child.execution.status });
 			} else {
 				updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
 				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId });
 			}
-			this.abortLegionPhase(child.nodeId);
+			if (!pausedByShutdown) this.abortLegionPhase(child.nodeId);
 			// #371 (m8): the abort just consumed the declaration; a retired node has
 			// nothing left to abort, so keeping it would only leak one machine per
 			// retired team in a long-lived parent process.
