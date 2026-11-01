@@ -81,6 +81,11 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **空 `legion-verify` 块不再被报告成"验证通过" (#371).** 契约里没有 ```legion-verify 块时仍然直通
+  （§7.3 的只读队形状，行为不变），但工具返回、收队提示与后台收尾现在都说
+  `by contract (0 commands)`；若声明的机器把 `verification_passed` 当收尾门，还会明说
+  「门是被空契约满足的」。以前这三种输出都写着 `Verification passed`，父级无法分辨
+  "跑过了" 和 "什么都没跑"。
 - **`centurion` 的状态机改成 root 派发时声明 (#371).** 以前「角色叫 centurion」就等于强制走五阶段：
   哪怕只改一行文件也要走契约 → 派 worker → 派 reviewer → 跑 verify → squash MR。现在只有
   `subagent({ agent: "centurion", phases: [...] })` 显式声明了才走状态机（声明了 = 以前的行为一字不改，

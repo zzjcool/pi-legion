@@ -178,6 +178,50 @@ test("centurion phase tool enforces gates, rework, verification, and automatic D
 	}
 });
 
+test("#371: an empty legion-verify block does not masquerade as a real verification", async () => {
+	// Frozen contract §7.3 keeps "empty block = pass by contract" (the read-only
+	// shape), so the transition still lands in `done`. What must NOT happen is the
+	// report claiming a verification happened: the machine's own edge makes
+	// `verification_passed` the gate, and nothing ran.
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-empty-verify-"));
+	const cwd = path.join(rootDir, "repo");
+	mkdirSync(path.join(cwd, ".pi-legion"), { recursive: true });
+	writeFileSync(path.join(cwd, ".pi-legion", "contract.md"), "# Contract\nNo verification block here.\n");
+	const db = makePhaseFixture();
+	const reviewerSession = path.join(rootDir, "reviewer.jsonl");
+	const messages: string[] = [];
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	try {
+		writeFileSync(reviewerSession, session('{"ok":true,"reason":"looks fine"}'));
+		const options = { cwd, runDir: rootDir, now: () => 100, runCommand, sendSelfMessage: (text: string) => messages.push(text) };
+		insertNode(db, { parentId: "root.team-a", name: "worker", role: "worker", status: "settled" }, () => 101);
+		insertNode(db, { parentId: "root.team-a", name: "reviewer", role: "reviewer", status: "settled", sessionFile: reviewerSession }, () => 102);
+		assert.equal((await requestLegionPhase(db, "root.team-a", "implementing", options)).ok, true);
+		assert.equal((await requestLegionPhase(db, "root.team-a", "reviewing", options)).ok, true);
+		const verifying = await requestLegionPhase(db, "root.team-a", "verifying", options);
+		assert.equal(verifying.ok, true);
+		assert.equal(verifying.phase, "done", "an empty block still completes the team (§7.3)");
+		assert.deepEqual(commands, [], "nothing may be executed for an empty block");
+		assert.match(verifying.message, /by contract \(0 commands/, "the report must not claim a verification ran");
+		assert.match(
+			verifying.message,
+			/gates on verification_passed/,
+			"the gate was satisfied vacuously and the report has to name that",
+		);
+		assert.ok(
+			messages.some((message) => /by contract \(0 commands/.test(message) && /squash/.test(message)),
+			"the collection prompt carries the same caveat",
+		);
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
 test("phase rework beyond the frozen limit forces failed and notifies the parent", async () => {
 	const db = openLegionDb(":memory:");
 	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-rework-limit-"));
