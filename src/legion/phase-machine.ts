@@ -157,6 +157,71 @@ export function phaseStart(machine: PhaseMachine): string {
 	return machine.start ?? machine.phases[0]?.id ?? DEFAULT_PHASE_MACHINE.start ?? "planning";
 }
 
+/**
+ * Can the machine END at all (#371)?
+ *
+ * `validatePhaseMachine` answers "is this machine well formed", never "can this
+ * team finish". A declared graph may therefore be perfectly valid and still be a
+ * loop: every phase names a successor, no dead end exists, and nothing is
+ * terminal — `evaluatePhaseTransition` would accept the first hop and refuse
+ * every exit after it. The reachability check is the missing half, kept OUT of
+ * `validatePhaseMachine` on purpose: that function runs while a CARD loads, and
+ * its rules are frozen.
+ *
+ * Deliberately asked of the DECLARED graph, before {@link normalizePhaseMachine}
+ * injects the universal terminals. Normalization would answer `true` for any
+ * well-formed machine (it appends `done` to every non-terminal phase), which is
+ * exactly the answer that hides the loop.
+ */
+export function canReachTerminal(machine: PhaseMachine): boolean {
+	const start = phaseStart(machine);
+	const seen = new Set<string>([start]);
+	const queue = [start];
+	while (queue.length > 0) {
+		const current = queue.shift()!;
+		const phase = findPhase(machine, current);
+		if (phase && isTerminalIn(machine, current)) return true;
+		if (!phase) {
+			// An edge may name a phase the declaration does not define. For the three
+			// universal terminals that is legitimate and common — `ship -> done` is how
+			// a card says "end here", and normalization supplies the phase itself. Any
+			// OTHER undefined target is already a validation error ("unknown target
+			// phase"), so it must not be allowed to certify a machine by being a leaf.
+			if ((DEFAULT_TERMINAL_PHASES as readonly string[]).includes(current)) return true;
+			continue;
+		}
+		for (const rule of phase.next) {
+			if (seen.has(rule.to)) continue;
+			seen.add(rule.to);
+			queue.push(rule.to);
+		}
+	}
+	return false;
+}
+
+/**
+ * Which phase of this machine judges success (#358/#371)?
+ *
+ * A phase that can reach `done` is where the supervisor's verified-completion
+ * path fires. Among those, an edge requiring `verification_passed` is the most
+ * precise statement of "the verdict decides here"; otherwise the LAST declared
+ * candidate wins (machines list their phases in pipeline order, and the deepest
+ * phase that can complete a team is the one that completes it — that rule alone
+ * picks `verifying` in the built-in machine).
+ *
+ * `undefined` means the machine never reaches `done`, which is the caller's cue
+ * to keep its historical literal rather than invent a phase name.
+ */
+export function successPhaseOf(machine: PhaseMachine): string | undefined {
+	const exits = machine.phases.filter((phase) => phase.next.some((rule) => rule.to === "done"));
+	if (exits.length === 0) return undefined;
+	const gated = exits.filter((phase) =>
+		phase.next.some((rule) => rule.to === "done" && (rule.require ?? []).includes("verification_passed")),
+	);
+	const candidates = gated.length > 0 ? gated : exits;
+	return candidates[candidates.length - 1]!.id;
+}
+
 /** Look up a phase by id. */
 export function findPhase(
 	machine: PhaseMachine,

@@ -273,18 +273,26 @@ test("spawn: a team declaring its own machine is born in THAT machine's start ph
 	}
 });
 
-test("spawn control: a card with no `phases` is still born in `planning` (built-in pipeline unchanged)", async () => {
+test("spawn control: a card with no `phases` is born with NO phase (#371: no declaration, no state machine)", async () => {
 	const fx = spawnFixture();
 	let launched: Awaited<ReturnType<typeof launchTeam>> | undefined;
 	try {
 		launched = await launchTeam(fx);
+		// #371 replaced the old answer here. An UNDECLARED team used to be born in
+		// the literal `"planning"`, i.e. it acquired the built-in four-phase
+		// pipeline by virtue of its role name, and a one-file job was marched
+		// through contract → workers → review → verify → squash. Now the machine is
+		// something the root DECLARES (`subagent({agent:"centurion", phases:[…]})`),
+		// and a team that declares nothing is an ordinary agent: no phase, no
+		// `legion_phase`, no collection prompt (contract §0, invariant I2).
 		assert.equal(
 			launched.node.phase,
-			"planning",
-			"an undeclared team must keep the literal birth phase, verbatim",
+			null,
+			"an undeclared team must have NO phase at all",
 		);
-		// …and `planning` really is a phase of the machine that team uses, so the
-		// control is not passing on a name that happens to be spelled the same.
+		// The built-in machine itself is untouched — `planning` is still a phase of
+		// it, recognised by its own conditions rather than as `invalid_phase`. It is
+		// simply no longer where an undeclared team is born.
 		const out = evaluatePhaseTransition({ from: "planning", to: "implementing" }, () => NOW);
 		assert.equal(out.allowed, false);
 		assert.equal(

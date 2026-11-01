@@ -54,6 +54,7 @@ import {
 	isTerminalIn,
 	machineTimeout,
 	normalizePhaseMachine,
+	successPhaseOf,
 	type PhaseMachine,
 } from "../legion/phase-machine.ts";
 import { upsertUsage } from "../legion/usage.ts";
@@ -553,17 +554,16 @@ export class LegionPostman {
 	 * Fallback: a team with NO declared machine, or a machine with no exit to `done`
 	 * at all, keeps the historical literal `verifying` — the behaviour every team had
 	 * before this was derived, byte for byte.
+	 *
+	 * #371: the derivation itself lives in `successPhaseOf` (phase-machine.ts) so
+	 * the tool's own `legion_phase` path — which is a free function, not a member
+	 * of this class — asks the same question and gets the same answer. Two copies
+	 * is how the verify phase and the done path drift apart.
 	 */
 	private successPhase(): string {
 		const machine = this.machine;
 		if (!machine) return "verifying";
-		const exits = machine.phases.filter((phase) => phase.next.some((rule) => rule.to === "done"));
-		if (exits.length === 0) return "verifying";
-		const gated = exits.filter((phase) =>
-			phase.next.some((rule) => rule.to === "done" && (rule.require ?? []).includes("verification_passed")),
-		);
-		const candidates = gated.length > 0 ? gated : exits;
-		return candidates[candidates.length - 1]!.id;
+		return successPhaseOf(machine) ?? "verifying";
 	}
 
 	/**
@@ -785,17 +785,38 @@ export function registerLegionTools(pi: ExtensionAPI, options: RegisterLegionToo
 	});
 
 	const self = getNode(db, nodeId);
-	if (options.role === "centurion" || self?.role === "centurion") {
+	// #371 (I2): the tool follows the MACHINE, not the role name. A team whose root
+	// never declared `phases` is an ordinary agent that happens to be allowed to
+	// dispatch: it has no phase, so there is nothing to transition and no tool to
+	// call. Registration is the whole gate — an absent tool cannot be talked into
+	// existing by a model that read a card mentioning phases.
+	//
+	// Two signals, deliberately:
+	//
+	//   - `options.machine` — a declaration is in force for this node;
+	//   - `self.phase !== null` — a node that ALREADY lives in a phase. That is
+	//     every team dispatched before #371 landed (they were all born `planning`)
+	//     and every resumed one. Dropping their tool would strand a running team
+	//     mid-flight for an upgrade they had no part in, so the ledger's phase
+	//     column is honoured as proof that a machine governs this node.
+	const governed = options.machine !== undefined || (self?.phase ?? null) !== null;
+	if ((options.role === "centurion" || self?.role === "centurion") && governed) {
 		pi.registerTool({
 			name: "legion_phase",
 			label: "Legion phase",
 			// #309: a partially failed `implementing` had no legal exit, and this
 			// description advertised neither of the two that now exist. A model only
 			// learns about an argument if the tool tells it.
+			//
+			// #371 G5: `done` is no longer blanket-refused — a machine that declares
+			// an exit to `done` hands that exit to the team. The description says so,
+			// because a model that believes `done` is impossible will invent another
+			// way to finish.
 			description:
 				"Request a validated centurion phase transition. " +
 				'Pass supersedes:[<failed child>] (a direct failed child name or id; requires a settled sibling) ' +
-				'to account for a failure and keep moving, or declare to:"failed" with reason:"<why the team cannot succeed>" to fail the team.',
+				'to account for a failure and keep moving, or declare to:"failed" with reason:"<why the team cannot succeed>" to fail the team. ' +
+				'`done` is accepted exactly when this team\'s declared machine offers an exit to it; otherwise it stays the supervisor\'s decision.',
 			parameters: Type.Object({
 				// #298: the phase list is declared per team, so it cannot be a
 				// compile-time enum here. `requestLegionPhase` validates the value
@@ -804,7 +825,8 @@ export function registerLegionTools(pi: ExtensionAPI, options: RegisterLegionToo
 				to: Type.String({
 					description:
 						'Target phase. Default machine: planning, implementing, reviewing, verifying. ' +
-						'`done`/`aborted` are controlled by the parent or supervisor; ' +
+						'`aborted` is always the parent\'s call; `done` is accepted only when this team\'s ' +
+						'declared machine has an exit to it (no declaration means no exit); ' +
 						'`failed` is a centurion decision and requires a `reason`.',
 				}),
 				note: Type.Optional(Type.String()),
@@ -907,6 +929,30 @@ export type PhaseRequestResult =
 	| { ok: true; phase: string; message: string }
 	| { ok: false; message: string; code?: string };
 
+/**
+ * May this node walk an exit to `done` that its machine declares (#371 G5)?
+ *
+ * Two things are deliberately NOT checked here:
+ *
+ *   - the edge's `require` conditions. They are exactly what
+ *     `evaluatePhaseTransition` applies once the request is handed over, and
+ *     duplicating them here is how two answers to one question start drifting;
+ *   - the injected terminal. A machine that omits `done` still has one, because
+ *     `normalizePhaseMachine` appends an unconditional edge to it from every
+ *     non-terminal phase — the same documented treatment `mayDeclareFailure`
+ *     gives the injected `failed`. Injection only removes the possibility of a
+ *     stranded team; the team still has to ask.
+ *
+ * A team with NO machine answers `false` on purpose: an undeclared centurion has
+ * no phase at all and no `legion_phase`, and a legacy row that kept the tool
+ * through an upgrade must keep the pre-#371 rule (invariant I6).
+ */
+function maySelfComplete(machine: PhaseMachine | undefined, phase: string | null, role: string): boolean {
+	if (!machine || phase === null) return false;
+	const from = findPhase(machine, phase);
+	return from?.next.some((rule) => rule.to === "done" && (rule.actorRole === undefined || rule.actorRole === role)) ?? false;
+}
+
 export async function requestLegionPhase(
 	db: DatabaseSync,
 	nodeId: string,
@@ -920,7 +966,28 @@ export async function requestLegionPhase(
 	// carries the declaration from the node's role card; absent means the built-in
 	// four-phase pipeline.
 	const machine = options.machine;
-	if (to === "done" || to === "aborted") {
+	// #371 G5: `done` follows the DECLARATION.
+	//
+	// The blanket refusal below was written when every team ran the built-in
+	// pipeline, where the only exit to `done` is `verifying → done` gated on
+	// `verification_passed` — i.e. the supervisor's own verified-completion path.
+	// A declared machine may instead END a team on an edge its author chose (the
+	// solo workflow `implementing → done`), and refusing that left a zero-child
+	// team with no honest finish: `failed` meant admitting a failure that did not
+	// happen, and `aborted` is the parent's decision.
+	//
+	// So: if the machine offers `from → done` that THIS node may take, the request
+	// is handed to the state machine, which still applies the edge's own
+	// conditions. Otherwise the old message stands, unchanged — including for a
+	// team with NO declared machine (invariant I6: an undeclared team's `done` and
+	// `aborted` stay supervisor/parent-only).
+	//
+	// `aborted` is unchanged and unconditional: it is the emergency stop, and
+	// stopping is never a privilege of the process being stopped.
+	if (to === "aborted") {
+		return { ok: false, code: "INVALID_PARAMS", message: `${to} is controlled by the parent or supervisor` };
+	}
+	if (to === "done" && !maySelfComplete(machine, self.phase, self.role)) {
 		return { ok: false, code: "INVALID_PARAMS", message: `${to} is controlled by the parent or supervisor` };
 	}
 	// #309: `to: "failed"` is a centurion decision, but only a DECLARED one.
@@ -1088,24 +1155,40 @@ export async function requestLegionPhase(
 		await notifyParent(db, self, failureNotice, options.settings, now, options.eventBus);
 		return { ok: true, phase: decision.to, message: failureNotice };
 	}
-	if (to !== "verifying") return { ok: true, phase: decision.to, message: `Phase changed to ${decision.to}.` };
+	// #371 G6: the verification phase is the machine's, not the literal string
+	// `verifying`. A declaration that names its last phase `ship` must still be
+	// able to finish, so "did we just enter the phase that judges success?" is
+	// answered by the same derivation the supervisor's completion path uses
+	// (`successPhaseOf`, #358). For a machine the declaration never names one
+	// (`ship` absent, or no machine at all) this is byte-for-byte `to !==
+	// "verifying"` — the built-in machine's answer IS `verifying`.
+	const verifyPhase = successPhaseOf(machine ?? DEFAULT_PHASE_MACHINE);
+	if (to !== verifyPhase) return { ok: true, phase: decision.to, message: `Phase changed to ${decision.to}.` };
 
 	const current = getNode(db, nodeId) ?? self;
 	const contract = readContract(current, proposedContractPath);
 	const verification = await runVerification(db, current, contract, options);
 	if (!verification.passed) {
 		options.sendSelfMessage?.(`Verification failed. Read ${verification.outputFile} and fix the commands, then request implementing.`);
-		return { ok: true, phase: "verifying", message: `Verification failed: ${verification.outputFile}` };
+		return { ok: true, phase: decision.to, message: `Verification failed: ${verification.outputFile}` };
 	}
+	// #371: the completion edge is evaluated against the SAME machine and the SAME
+	// phase the verification just ran in. Two bugs were hiding in the old literal
+	// pair: `from: "verifying"` named a phase a declared machine need not have, and
+	// no `machine` was forwarded at all, so `evaluatePhaseTransition` judged the
+	// team by the BUILT-IN table (`invalid_phase` for any custom name). The
+	// supervisor's own path (`finalizeVerifiedTeamIfReady`) always did both right;
+	// this is the tool's path being made to agree with it.
 	const done = evaluatePhaseTransition({
-		from: "verifying",
+		from: decision.to,
 		to: "done",
 		reworkCount: getNode(db, nodeId)?.reworkCount ?? current.reworkCount,
 		children: getChildren(db, nodeId).map(({ id, role, status }) => ({ id, role, status })),
 		verificationPassed: true,
 		actorRole: "supervisor",
+		...(machine ? { machine } : {}),
 	}, now);
-	if (!done.allowed) return { ok: true, phase: "verifying", message: `Verification passed; waiting for team to settle: ${done.message}` };
+	if (!done.allowed) return { ok: true, phase: decision.to, message: `Verification passed; waiting for team to settle: ${done.message}` };
 	updateNode(db, nodeId, { phase: "done", phaseSince: done.phaseSince }, now);
 	options.eventBus?.emit(appendEvent(db, nodeId, "phase_change", done.event.data, { now }));
 	options.sendSelfMessage?.("All verification passed. Collect every child result, squash the subtree work, open an MR/PR for the parent, and report its URL. Do not merge.");
