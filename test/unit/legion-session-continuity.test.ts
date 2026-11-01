@@ -28,11 +28,11 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 
-import piLegion, { INTERRUPTED_NODES_NOTE } from "../../index.ts";
+import piLegion, { INTERRUPTED_NODES_NOTE, interruptedChildren, renderInterruptedSection } from "../../index.ts";
 import { parsePhaseMachine } from "../../src/agents/agents.ts";
 import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
-import { readEventsAfter } from "../../src/legion/events.ts";
+import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import { getChildren, getNode, insertNode } from "../../src/legion/nodes.ts";
 import { LEGION_PHASES_ENV } from "../../src/runs/args.ts";
 import { Orchestrator, type OrchestratorLegionContext } from "../../src/runs/orchestrator.ts";
@@ -395,6 +395,39 @@ test("#374 §5/I6: the prompt lists what was interrupted, spawns nothing, and dr
 	} finally {
 		await h.shutdown().catch(() => {});
 		h.cleanup();
+	}
+});
+
+test("#374 §5: an interrupted WORKER is listed, a deliberate stop is not", () => {
+	// The phase is not part of the predicate: only a team that declares `phases:`
+	// gets one (#371), so requiring a phase hid the most common case — a worker
+	// killed mid-task. What separates "interrupted" from "stopped on purpose" is
+	// the reason on the last `node_retired`, not the status alone.
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { id: "root", parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "paused-worker", role: "worker", status: "retired", sessionFile: "/s/paused.jsonl" }, () => 2);
+		insertNode(db, { parentId: "root", name: "stopped-worker", role: "worker", status: "retired", sessionFile: "/s/stopped.jsonl" }, () => 3);
+		insertNode(db, { parentId: "root", name: "no-session", role: "worker", status: "retired" }, () => 4);
+		insertNode(db, { parentId: "root", name: "finished", role: "worker", status: "settled", sessionFile: "/s/done.jsonl" }, () => 5);
+		appendEvent(db, "root.paused-worker", "node_retired", { reason: "session-shutdown" }, { now: () => 10 });
+		appendEvent(db, "root.stopped-worker", "node_retired", { reason: "user" }, { now: () => 10 });
+		appendEvent(db, "root.no-session", "node_retired", { reason: "session-shutdown" }, { now: () => 10 });
+
+		const listed = interruptedChildren(db).map((node) => node.name);
+		assert.deepEqual(listed, ["paused-worker"], "only the paused, resumable child counts");
+		const section = renderInterruptedSection(interruptedChildren(db));
+		assert.match(section, /paused-worker · <none>/u, "a phase-less child is still named in the prompt");
+		assert.ok(section.includes(INTERRUPTED_NODES_NOTE));
+
+		// A live node (its process died with the session) is interrupted too, even
+		// though no retire event was ever written for it.
+		insertNode(db, { parentId: "root", name: "live-worker", role: "worker", status: "running", sessionFile: "/s/live.jsonl" }, () => 6);
+		const names = interruptedChildren(db).map((node) => node.name);
+		assert.ok(names.includes("live-worker"), "a still-live ledger row is interrupted: nothing will ever move it");
+		assert.ok(!names.includes("stopped-worker"), "…and the deliberate stop stays out of the list");
+	} finally {
+		db.close();
 	}
 });
 

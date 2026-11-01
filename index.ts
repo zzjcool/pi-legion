@@ -59,7 +59,7 @@ import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
 import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
-import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, NON_TERMINAL_NODE_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
+import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
@@ -1001,10 +1001,19 @@ function probeInterruptedNodes(store: RunStore, sessionFile: string): LegionNode
  * #374 §5: the children a previous exit left behind, i.e. the ones this session
  * may resume.
  *
- * The predicate is the contract's, literally: `status` is one of the statuses
- * that can still be resumed (the same list hygiene's stale scan uses, which is
- * why `retired` is on it — §3 makes an interrupted node `retired`, not failed),
- * it has a phase, and neither the status nor the phase is terminal.
+ * Two ways a child counts as interrupted:
+ *  - it is still LIVE in the ledger (`starting`/`running`/`blocked`): its process
+ *    died with the session, so nothing will ever move it again;
+ *  - or it was paused by an exit: `retired` AND the last `node_retired` on it
+ *    carries `reason: "session-shutdown"` (§3 writes that). The reason matters —
+ *    a `retired` node without it was stopped deliberately (or finished), and
+ *    advertising it as "interrupted" would invite the agent to undo a user's
+ *    explicit stop.
+ *
+ * The phase is NOT part of the predicate: only teams that declare `phases:` get
+ * one (#371), so requiring a non-null phase would hide exactly the most common
+ * case — an interrupted worker. Resumability is checked separately by
+ * `childFromNode`, which refuses `failed`/terminal-phase nodes only.
  *
  * Only DIRECT children are listed. A name is resolvable from here only if this
  * node is its parent (`subagent({action:"resume", name})` looks under the
@@ -1012,10 +1021,27 @@ function probeInterruptedNodes(store: RunStore, sessionFile: string): LegionNode
  * resuming the team brings its own squad back with it.
  */
 export function interruptedChildren(db: DatabaseSync, parentNodeId = "root"): LegionNode[] {
-	return getChildren(db, parentNodeId).filter((node) =>
-		(NON_TERMINAL_NODE_STATUSES as readonly string[]).includes(node.status)
-		&& node.phase !== null
-		&& !isTerminalNode(node));
+	const paused = new Set<string>();
+	const rows = db
+		.prepare(
+			"SELECT node_id, data FROM events WHERE type = 'node_retired' AND id IN " +
+				"(SELECT MAX(id) FROM events WHERE type = 'node_retired' GROUP BY node_id)",
+		)
+		.all() as Array<{ node_id: string; data: string | null }>;
+	for (const row of rows) {
+		let reason: unknown;
+		try {
+			reason = row.data ? (JSON.parse(row.data) as { reason?: unknown }).reason : undefined;
+		} catch {
+			reason = undefined;
+		}
+		if (reason === "session-shutdown") paused.add(row.node_id);
+	}
+	return getChildren(db, parentNodeId).filter((node) => {
+		if (isTerminalNode(node) || !node.sessionFile) return false;
+		if ((LIVE_CHILD_STATUSES as readonly string[]).includes(node.status)) return true;
+		return node.status === "retired" && paused.has(node.id);
+	});
 }
 
 /** The frozen §5 wording. Quoted, not paraphrased: it is the rule the agent must read. */

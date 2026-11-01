@@ -58,8 +58,14 @@ root 退出时，子树**停手但保留可续的状态**；下次启动**同一
 
 ## §5 提示（agent 看得到、用户也看得到）
 
-- 触发条件：本次启动 **reopen 成功** 且账本里存在「`status ∈ {starting,running,blocked,retired}`
-  且 `phase` 非空且非终态」的节点 = 被打断的节点。
+- 触发条件：本次启动 **reopen 成功** 且账本里存在被打断的**直接子节点**。判据两条（实现期修订，
+  见下）：① 状态仍是 `starting/running/blocked`（进程随 session 死了，不会有人再推动它）；
+  ② 或状态是 `retired` **且**它最后一条 `node_retired` 带 `reason: "session-shutdown"`
+  （用户主动 `stop` 的节点不带这个 reason，不能报成"被打断"）。
+- `phase` **不参与**判据：自 #371 起只有声明 `phases:` 的队才有相位，把 `phase` 当必要条件会漏掉
+  最常见的场景——**被打断的 worker**。节点还必须带 `sessionFile`（没有恢复凭据就不该被宣传）。
+- 实现期修订记录（2026-11-02，本 PR）：初版 §5 要求 `phase` 非空且非终态，实际上线时会把所有 worker
+  排除在外；改为上述两条判据，测试同时钉住「主动 stop 不出现在清单里」。
 - agent 侧：注入**system prompt 一段**（复用 `before_agent_start` 的 playbook 注入位），内容包含
   节点名、相位、以及一句硬规则：
 
