@@ -15,7 +15,7 @@ import {
 	type LegionCommandRunner,
 } from "../../src/extension/legion-tools.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
-import type { PhaseMachine } from "../../src/legion/phase-machine.ts";
+import { DEFAULT_PHASE_MACHINE, type PhaseMachine } from "../../src/legion/phase-machine.ts";
 import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import { MAIL_DELIVERY, formatMail, inbox, pendingInbox, sendMail, transitionDelivery } from "../../src/legion/mail.ts";
 import { getNode, insertNode, listStaleNodes, updateNode } from "../../src/legion/nodes.ts";
@@ -86,9 +86,14 @@ test("Legion tools expose mail/tree to every node and phase only to centurions",
 		insertNode(db, { parentId: "root.team-a", name: "worker", role: "worker" });
 		insertNode(db, { parentId: "root.team-a", name: "reviewer", role: "reviewer" });
 		insertNode(db, { parentId: "root.team-b", name: "other", role: "worker" });
-		const centurionTools = makeTools(db, "root.team-a", "centurion");
+		// #371: `legion_phase` follows the MACHINE, not the role name. This team is
+		// declared (the built-in pipeline is what it asks for), so it keeps the
+		// tool; `team-b`, which declares nothing, must not get one at all.
+		const centurionTools = makeTools(db, "root.team-a", "centurion", { machine: DEFAULT_PHASE_MACHINE });
+		const undeclaredTools = makeTools(db, "root.team-b", "centurion");
 		const workerTools = makeTools(db, "root.team-a.worker", "worker");
 		assert.deepEqual([...centurionTools.keys()], ["legion_mail", "legion_tree", "legion_phase"]);
+		assert.deepEqual([...undeclaredTools.keys()], ["legion_mail", "legion_tree"], "an undeclared centurion gets no legion_phase (I2)");
 		assert.deepEqual([...workerTools.keys()], ["legion_mail", "legion_tree"]);
 
 		const mail = await centurionTools.get("legion_mail")!.execute("mail-1", {

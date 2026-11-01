@@ -10,6 +10,7 @@ import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { openLegionDb, legionDbPath } from "../../src/legion/db.ts";
 import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
+import { DEFAULT_PHASE_MACHINE } from "../../src/legion/phase-machine.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
@@ -193,6 +194,11 @@ test("M2 tree e2e: root → centurion worktree → parallel workers → review �
 			agent: agent("centurion", { allowNestedSubagents: true, maxSubagentDepth: 2, worktree: true }),
 			task: "Lead a small implementation squad.",
 			team: "be-value",
+			// #371: the state machine is now DECLARED by the root, so this test says
+			// out loud what it used to get for free from the role name. The machine is
+			// the built-in one, so every assertion below is unchanged (contract I1:
+			// declared ⇒ today's behaviour, byte for byte).
+			phases: DEFAULT_PHASE_MACHINE,
 		});
 		assert.ok(centurion.child.worktreePath, "centurion runs in an isolated subtree worktree");
 		assert.equal(centurion.child.nodeId, "root.centurion-0");
@@ -315,7 +321,7 @@ test("M2 tree e2e: root → centurion worktree → parallel workers → review �
 	}
 });
 
-test("#281: only the root session may dispatch a centurion", async () => {
+test("#281/#371 G1: only the root session may dispatch a centurion", async () => {
 	// A centurion owns an isolated worktree AND its own command chain. Every other
 	// guard in `launch()` keys on the CHILD's role, so without this rule any agent
 	// could dispatch one and silently acquire worktree + rpc isolation — measured
@@ -379,7 +385,10 @@ test("#281: only the root session may dispatch a centurion", async () => {
 			(error: unknown) =>
 				error instanceof SubagentError &&
 				error.code === ErrorCodes.BUDGET_EXCEEDED &&
-				/only the root session may dispatch a centurion/.test(error.message) &&
+				// #371 REV-1: the same refusal, now a contract clause rather than an
+				// undocumented implementation detail, so the wording names the ROOT
+				// SHELL instead of a session metaphor. The parent is still named.
+				/centurion is dispatchable only from the root shell/.test(error.message) &&
 				/'worker' at 'root\.worker-0' cannot/.test(error.message),
 			"a non-root dispatch must be refused with a message naming the parent",
 		);
@@ -395,7 +404,7 @@ test("#281: only the root session may dispatch a centurion", async () => {
 			(error: unknown) =>
 				error instanceof SubagentError &&
 				error.code === ErrorCodes.BUDGET_EXCEEDED &&
-				/only the root session may dispatch a centurion/.test(error.message),
+				/centurion is dispatchable only from the root shell/.test(error.message),
 			"centurion -> centurion is refused as well",
 		);
 		assert.equal(spawns.length, 1, "still no extra spawn");

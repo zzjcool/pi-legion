@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
 import type { LegionSettings } from "../shared/types.ts";
-import { LEGION_IDENTITY_ENV_KEYS, legionIdentityEnv } from "./args.ts";
+import { LEGION_IDENTITY_ENV_KEYS, LEGION_PHASES_ENV, legionIdentityEnv } from "./args.ts";
 import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
@@ -22,6 +22,7 @@ import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, 
 import { upsertUsage } from "../legion/usage.ts";
 import { evaluatePhaseTransition, isTerminalPhase } from "../legion/state-machine.ts";
 import { phaseStart, type PhaseMachine } from "../legion/phase-machine.ts";
+import { parsePhaseMachine } from "../agents/agents.ts";
 import { CHILD_ACCEPTANCE_ROLE_ENV, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import {
 	ALLOW_NESTED_ENV,
@@ -202,6 +203,23 @@ export interface LaunchInput {
 	utilityDispatch?: boolean;
 	/** Mask inherited Legion identity from the spawned child process. */
 	stripLegionIdentity?: boolean;
+	/**
+	 * #371: the phase machine the ROOT declares for this dispatch.
+	 *
+	 * Absent means "nothing was declared": the child is born with no phase, gets
+	 * no `legion_phase` and no collection prompt, and simply finishes its work
+	 * (contract §1/§2). Present means the team walks this machine — today's
+	 * behaviour, byte for byte.
+	 *
+	 * Deliberately `unknown`: a declaration is UNTRUSTED input that has not been
+	 * through the card loader, and the tool layer's TypeBox shape is wider than
+	 * `PhaseMachine` (`require` arrives as `string[]`, not `PhaseCondition[]`).
+	 * `parsePhaseMachine` is the only reader, and it is the same validator the
+	 * card layer uses — one definition of a legal machine.
+	 */
+	phases?: unknown;
+	/** #371: entry phase for a bare phase list; ignored when `phases` names one. */
+	start?: string;
 }
 
 	/**
@@ -428,6 +446,28 @@ function canFallbackStart(error: unknown): boolean {
 		error.code !== ErrorCodes.PROMPT_INTERCEPTED;
 }
 
+/**
+ * #371: fold a top-level `start:` into the declaration it belongs to.
+ *
+ * The documented dispatch shape (contract §2) shows `phases` and `start` as
+ * siblings, while the machine shape nests `start` inside. Both spellings are
+ * accepted; a `start` already inside the machine wins over the sibling one.
+ */
+function withStartPhase(phases: LaunchInput["phases"], start: string): unknown {
+	if (typeof phases === "string") {
+		throw new SubagentError(
+			'start may not be combined with a phases string; put "start" inside the JSON, or pass the phases as a list',
+			ErrorCodes.INVALID_PARAMS,
+		);
+	}
+	if (Array.isArray(phases)) return { phases, start };
+	if (phases && typeof phases === "object") {
+		const machine = phases as PhaseMachine;
+		return machine.start === undefined ? { ...machine, start } : machine;
+	}
+	throw new SubagentError("phases was supplied without a phase list", ErrorCodes.INVALID_PARAMS);
+}
+
 // pi-lens-ignore: large-class
 export class Orchestrator {
 	private readonly supervisor: LegionSupervisor;
@@ -457,6 +497,16 @@ export class Orchestrator {
 	private spawnModeDeniedWarningEmitted = false;
 	private spawned = 0;
 	private readonly children = new Map<string, ChildRecord>();
+	/**
+	 * #371: the machine the ROOT declared for a dispatch, by node id.
+	 *
+	 * The parent needs it for its own bookkeeping — the abort path asks a node's
+	 * own machine whether `→ aborted` exists (#351), and an INLINE declaration is
+	 * invisible to the by-role card lookup that seam performs. Kept per instance
+	 * and only for this process's dispatches: a parent that has restarted falls
+	 * back to the by-role lookup, which is the pre-#371 behaviour.
+	 */
+	private readonly declaredPhases = new Map<string, PhaseMachine>();
 	private readonly nameCounter = new Map<string, number>();
 	private readonly pendingWaits = new Map<string, Promise<SettleResult>>();
 	/** Children retired because the parent session is shutting down. */
@@ -577,7 +627,7 @@ export class Orchestrator {
 		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
 	}
 
-	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string; utility?: boolean; inProcess?: boolean }): LegionNode | null {
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string; utility?: boolean; inProcess?: boolean; phases?: PhaseMachine }): LegionNode | null {
 		const legion = this.legion;
 		if (!legion) return null;
 		const parent = getNode(legion.db, legion.nodeId);
@@ -658,15 +708,23 @@ export class Orchestrator {
 				model: input.model ?? null,
 				team: team && team !== DEFAULT_TEAM ? team : null,
 				status: "starting",
-				// #350: a team is born in ITS machine's start phase. The literal
-				// `"planning"` used to be written for every team, so a card declaring
-				// `phases:` whose first phase is not `planning` (e.g. `recon -> build`)
-				// produced a team born in a phase its own machine never declared — and
-				// `evaluatePhaseTransition` refuses every transition out of an unknown
-				// `from` as `invalid_phase`, which closed advancing, declaring failure
-				// and aborting alike. An UNDECLARED team keeps the literal, so the
-				// built-in four-phase pipeline is bit-for-bit unchanged.
-				...(input.agent.name === "centurion" ? { phase: input.agent.phases ? phaseStart(input.agent.phases) : "planning", phaseSince: this.now() } : {}),
+				// #350/#371: a team is born in ITS machine's start phase, and ONLY when a
+				// machine was declared for it. The literal `"planning"` used to be written
+				// for every team:
+				//
+				//   - #350 made it `phaseStart(machine)` when a CARD declared `phases:`, so
+				//     a card whose first phase is not `planning` (e.g. `recon -> build`) no
+				//     longer produced a team born in a phase its own machine never declared
+				//     (`evaluatePhaseTransition` refuses every transition out of an unknown
+				//     `from` as `invalid_phase`).
+				//   - #371 makes the write CONDITIONAL. No declaration means no state
+				//     machine at all: `nodes.phase` stays NULL, which is what every read
+				//     site already treats as "this node has no phase" (`!node?.phase`),
+				//     and what the child uses to decide whether it owns `legion_phase`.
+				//
+				// A revived team keeps its existing phase (the `previous` branch above), so
+				// this only ever describes a FIRST birth.
+				...(input.agent.name === "centurion" && input.phases ? { phase: phaseStart(input.phases), phaseSince: this.now() } : {}),
 				taskSummary: input.task.slice(0, 2_000),
 			}, this.now);
 			return null;
@@ -746,6 +804,32 @@ export class Orchestrator {
 		}).catch(() => {});
 	}
 
+	/**
+	 * #371 G4: parse one INLINE phase declaration.
+	 *
+	 * The inline layer has no file to name and no author to point at, so every
+	 * problem is reported the way `parsePhaseMachine` already reports card
+	 * problems: the validator's own `path: message` lines, verbatim. What it adds
+	 * is the terminal reachability question (contract §3 G4) — a declared graph
+	 * that loops forever passes `validatePhaseMachine` and would strand the team
+	 * on its first transition, which is precisely the failure this declaration
+	 * exists to make visible.
+	 *
+	 * Thrown BEFORE any worktree/run directory exists (see `launch`), like every
+	 * other refusal here: a rejected dispatch must leave nothing on the tree.
+	 */
+	private declaredPhaseMachine(input: LaunchInput): PhaseMachine {
+		const raw = input.start === undefined ? input.phases : withStartPhase(input.phases, input.start);
+		let machine: PhaseMachine | undefined;
+		try {
+			machine = parsePhaseMachine(raw, "subagent.phases", { requireTerminal: true });
+		} catch (error) {
+			throw new SubagentError(error instanceof Error ? error.message : String(error), ErrorCodes.INVALID_PARAMS);
+		}
+		if (!machine) throw new SubagentError("phases was supplied but declares no phase list", ErrorCodes.INVALID_PARAMS);
+		return machine;
+	}
+
 	private abortLegionPhase(nodeId: string): void {
 		if (!this.legion) return;
 		const node = getNode(this.legion.db, nodeId);
@@ -756,7 +840,10 @@ export class Orchestrator {
 		if (!node || !node.phase || isTerminalPhase(node.phase)) return;
 		// #351: attach it. Without the machine a card-declared name (`build`) was
 		// `invalid_phase`, and the refusal below used to be dropped in silence.
-		const machine = this.safeMachineForRole(node.role);
+		// #371: an INLINE declaration is not in the card catalog, so the launch that
+		// made it wins over the by-role lookup — the same precedence the child runs
+		// under (contract §2).
+		const machine = this.declaredPhases.get(nodeId) ?? this.safeMachineForRole(node.role);
 		const decision = evaluatePhaseTransition({
 			from: node.phase,
 			to: "aborted",
@@ -823,6 +910,11 @@ export class Orchestrator {
 
 	private rollbackReservation(nodeId: string, previous: LegionNode | null): void {
 		if (!this.legion) return;
+		// #371 (m8): a launch that never got its child out the door must not leave a
+		// declaration behind for the abort path to read. The map is keyed by node id
+		// and only ever describes THIS process's dispatches, so the entry has to go
+		// wherever the reservation goes.
+		this.declaredPhases.delete(nodeId);
 		if (!previous) { this.legion.db.prepare("DELETE FROM nodes WHERE id = ?").run(nodeId); return; }
 		// #357 review (minor 2): a revival's reservation moves `phase_since` (that is the
 		// whole point of #357 — a new stint is a new de-dup key) and records a `revived`
@@ -942,7 +1034,11 @@ export class Orchestrator {
 		const tempDir = this.runDir;
 		const parentRole = this.legion ? getNode(this.legion.db, this.legion.nodeId)?.role : undefined;
 		const isCenturion = input.agent.name === "centurion";
-		// #281: only the ROOT session may dispatch a centurion.
+		// #371: "root" is a property of the DISPATCHER, and a process without a
+		// ledger has no tree to be inside of — it is the top of its own chain.
+		const isRootShell = !this.legion || this.legion.nodeId === "root";
+		const declaredPhases = input.phases !== undefined || input.start !== undefined;
+		// #281 / #371 G1: only the ROOT session may dispatch a centurion.
 		//
 		// Every other guard here keys on the CHILD's role, so without this a worker
 		// could dispatch a centurion and silently acquire worktree + rpc isolation
@@ -952,14 +1048,45 @@ export class Orchestrator {
 		// command chain the root cannot collect, so it is refused rather than
 		// demoted — a demoted centurion can neither create a worktree nor do its job.
 		//
+		// #371 REV-1: the refusal is now a CONTRACT clause, not an undocumented
+		// implementation detail, and the wording says so ("only from the root
+		// shell") instead of leaning on a session metaphor.
+		//
 		// Refused BEFORE any worktree/dir is created, so a rejected dispatch leaves
 		// no artifacts behind.
-		if (isCenturion && this.legion && this.legion.nodeId !== "root") {
+		if (isCenturion && !isRootShell) {
 			throw new SubagentError(
-				`only the root session may dispatch a centurion; '${parentRole ?? this.legion.nodeId}' at '${this.legion.nodeId}' cannot`,
+				`centurion is dispatchable only from the root shell; '${parentRole ?? this.legion!.nodeId}' at '${this.legion!.nodeId}' cannot`,
 				ErrorCodes.BUDGET_EXCEEDED,
 			);
 		}
+		// #371 G2: a phase machine is the root's declaration about a team IT owns.
+		// Refused rather than ignored — silently dropping it would leave the caller
+		// believing a state machine was in force while the child runs free.
+		if (declaredPhases && !isRootShell) {
+			throw new SubagentError(
+				`phases are declared by the root shell only; '${this.legion!.nodeId}' cannot`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		// #371 G3: a machine governs a TEAM. Declaring one for a worker is not a
+		// smaller version of the same thing — it is a category error, and the fix is
+		// a different dispatch, so name it.
+		if (declaredPhases && !isCenturion) {
+			throw new SubagentError(
+				"phases belong to a centurion team; dispatch a worker for solo work",
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		// #371 G4: an inline declaration is validated HERE, before artifacts, with the
+		// same parser (and therefore the same rules) the card layer uses. The card is
+		// the FALLBACK, never the override: a dispatch that names its machine wins
+		// over a role card that also names one (contract §2).
+		const machine = declaredPhases ? this.declaredPhaseMachine(input) : input.agent.phases;
+		// #371 (m8, review r2): the declaration is recorded INSIDE the try below, not
+		// here. Admission/budget refusals and queued launches return or throw before a
+		// node exists, so recording it here would leave an entry that `abortLegionPhase`
+		// could later read for a node that never ran.
 		// #214 D4: only centurion may hold worktree. Legion path still forces
 		// centurion→true and centurion-parent→member false; non-centurion
 		// requests from any source are demoted below (D1: warn, never throw).
@@ -1107,6 +1234,8 @@ export class Orchestrator {
 		let createdRunId: string | undefined;
 		let parentReservationCreated = false;
 		try {
+			// #371 (m8): from here on a node may exist, so the declaration has an owner.
+			if (machine && this.legion && nodeId) this.declaredPhases.set(nodeId, machine);
 			if (worktree && !worktreePath) {
 				const tree = createChildWorktree({ repoCwd: this.cwd, runDir: this.runDir, name });
 				worktreePath = tree.path;
@@ -1145,11 +1274,11 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess });
+				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess, ...(machine ? { phases: machine } : {}) });
 				reserved = true;
 				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
 			}
-			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId);
+			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId, machine);
 			if (input.stripLegionIdentity) {
 				for (const key of LEGION_IDENTITY_ENV_KEYS) delete childEnv[key];
 			}
@@ -1269,6 +1398,10 @@ export class Orchestrator {
 		} catch (error) {
 			this.admitting.delete(name);
 			if (spawned) await this.supervisor.retire(name).catch(() => {});
+			// #371 (m8): unconditional — `rollbackReservation` only runs once the launch
+			// reached `reserveNode`, but worktree creation and provisioning fail before
+			// that and still need the entry gone.
+			if (nodeId) this.declaredPhases.delete(nodeId);
 			if (reserved && nodeId) this.rollbackReservation(nodeId, reservedNode);
 			if (parentReservationCreated && this.legion?.runStore) {
 				try { await this.legion.runStore.removeChild(this.legion.runId!, name, nodeId); } catch { /* rollback is best effort */ }
@@ -2097,7 +2230,7 @@ export class Orchestrator {
 		}
 	}
 
-	private lineageEnv(name: string, agent: AgentConfig, teamOverride?: string, nodeId?: string): Record<string, string> {
+	private lineageEnv(name: string, agent: AgentConfig, teamOverride?: string, nodeId?: string, phases?: PhaseMachine): Record<string, string> {
 		const roleDepth = agent.maxSubagentDepth === undefined
 			? Number.POSITIVE_INFINITY
 			: Number.isInteger(agent.maxSubagentDepth) && agent.maxSubagentDepth >= 1
@@ -2120,6 +2253,12 @@ export class Orchestrator {
 		// Utility identity takes precedence even when a role was misconfigured
 		// with allowNestedSubagents: utility children are always hard leaves.
 		if (agent.allowNestedSubagents && !agent.utility) env[ALLOW_NESTED_ENV] = "1";
+		// #371: the declaration is lineage, not a setting — the child cannot re-read
+		// the root's launch call from anywhere else, so it travels with the identity
+		// overlay. Gated on the role: a member inherits its lead's process env (the
+		// in-process backend literally shares it), and a worker must never resolve
+		// somebody else's team machine for itself.
+		if (phases && agent.name === "centurion") env[LEGION_PHASES_ENV] = JSON.stringify(phases);
 		return env;
 	}
 
@@ -2848,6 +2987,10 @@ export class Orchestrator {
 				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId });
 			}
 			this.abortLegionPhase(child.nodeId);
+			// #371 (m8): the abort just consumed the declaration; a retired node has
+			// nothing left to abort, so keeping it would only leak one machine per
+			// retired team in a long-lived parent process.
+			this.declaredPhases.delete(child.nodeId);
 		}
 		child.state = "retired";
 		child.retiredAt = new Date(this.now()).toISOString();

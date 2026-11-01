@@ -48,9 +48,25 @@ export const TASK_ARG_LIMIT = 8_000;
 /** Legion identity is inherited through every RPC child environment. */
 export const LEGION_DB_ENV = "PI_LEGION_DB";
 export const LEGION_NODE_ID_ENV = "PI_LEGION_NODE_ID";
+/**
+ * The phase machine the root DECLARED for this centurion dispatch (#371).
+ *
+ * A card-declared machine needs no transport: the child re-reads the same card
+ * from the same agent directories. An INLINE declaration exists only in the
+ * root's launch call, so it rides the one channel that survives into the child
+ * process — the environment — as JSON of the normalized machine. Absent means
+ * "nothing was declared", which is a different thing from "use the default"
+ * (contract §2): an undeclared centurion has no phase and no `legion_phase`.
+ *
+ * Listed under {@link LEGION_IDENTITY_ENV_KEYS} because it is lineage, not
+ * ambient settings: a `stripLegionIdentity` launch must not inherit the
+ * declaration of the tree it was detached from.
+ */
+export const LEGION_PHASES_ENV = "PI_LEGION_PHASES";
 export const LEGION_IDENTITY_ENV_KEYS = [
 	LEGION_DB_ENV,
 	LEGION_NODE_ID_ENV,
+	LEGION_PHASES_ENV,
 	"PI_SUBAGENT_PARENT_PATH",
 	"PI_SUBAGENT_MAX_DEPTH",
 ] as const;

@@ -61,7 +61,10 @@ export type PhaseTransitionReason =
 	// #298: a declared machine can refuse for reasons the built-in table had no
 	// name for — an unmet custom condition, or an edge reserved to another actor.
 	| "condition_not_met"
-	| "actor_not_permitted";
+	| "actor_not_permitted"
+	// #371: `done` was reachable through an edge the NORMALIZER injected, not one
+	// the author wrote. Only the supervisor may take that edge.
+	| "injected_done_is_supervisor_only";
 
 export interface PhaseChild {
 	id: string;
@@ -207,6 +210,31 @@ function evaluateDeclarative(
 			input,
 			"invalid_transition",
 			`transition ${from} → ${to} is not allowed by this team's machine (${hint})`,
+		);
+	}
+	// #371: an INJECTED `→ done` belongs to the supervisor.
+	//
+	// `normalizePhaseMachine` appends an unconditional `→ done` to every
+	// non-terminal phase whose author did not declare one, so that no team can be
+	// stranded. The edge exists for the verified-completion path
+	// (`finalizeVerifiedTeamIfReady`, `runVerification`), which is why it carries
+	// no conditions: the supervisor is the one who established them.
+	//
+	// Letting anybody else take it silently deleted the author's own gate: with
+	// `ship → done require:["verification_passed"]` declared, a request for `done`
+	// from `impl` found the injected edge FIRST (`find` takes the first match) and
+	// completed the team without ever entering `ship` or running `legion-verify`.
+	// Refused here, at the edge, so every caller is covered — the tool, the
+	// panel, and anything added later — rather than only the one path we
+	// remembered to patch.
+	//
+	// Checked BEFORE `actorRole`/`require`: the honest reason is "your machine
+	// declares no such exit", not "a condition you could satisfy is unmet".
+	if (rule.injected === true && to === "done" && input.actorRole !== "supervisor") {
+		return denied(
+			input,
+			"injected_done_is_supervisor_only",
+			`the declared machine has no transition to done from '${String(from)}'`,
 		);
 	}
 	if (rule.actorRole !== undefined && input.actorRole !== rule.actorRole) {

@@ -34,6 +34,17 @@ export interface PhaseTransitionRule {
 	rework?: boolean;
 	/** Notify the parent when taken. */
 	notifyParent?: boolean;
+	/**
+	 * This edge was ADDED BY THE NORMALIZER, not written by the author (#371).
+	 *
+	 * The distinction is load-bearing for `done`: an injected `→ done` exists so a
+	 * team can never be stranded, and it is the SUPERVISOR's way out (the verified
+	 * completion path). It must never become the team's own way to skip a
+	 * verification phase its author DID declare — `evaluatePhaseTransition` refuses
+	 * it for every other actor, and no author-facing gate (`maySelfComplete`) may
+	 * count it as a declared exit.
+	 */
+	injected?: boolean;
 }
 
 export interface PhaseDefinition {
@@ -157,6 +168,109 @@ export function phaseStart(machine: PhaseMachine): string {
 	return machine.start ?? machine.phases[0]?.id ?? DEFAULT_PHASE_MACHINE.start ?? "planning";
 }
 
+/**
+ * Can the machine END at all (#371)?
+ *
+ * `validatePhaseMachine` answers "is this machine well formed", never "can this
+ * team finish". A declared graph may therefore be perfectly valid and still be a
+ * loop: every phase names a successor, no dead end exists, and nothing is
+ * terminal — `evaluatePhaseTransition` would accept the first hop and refuse
+ * every exit after it. The reachability check is the missing half, kept OUT of
+ * `validatePhaseMachine` on purpose: that function runs while a CARD loads, and
+ * its rules are frozen.
+ *
+ * Deliberately asked of the DECLARED graph, before {@link normalizePhaseMachine}
+ * injects the universal terminals. Normalization would answer `true` for any
+ * well-formed machine (it appends `done` to every non-terminal phase), which is
+ * exactly the answer that hides the loop.
+ */
+export function canReachTerminal(machine: PhaseMachine): boolean {
+	const start = phaseStart(machine);
+	const seen = new Set<string>([start]);
+	const queue = [start];
+	while (queue.length > 0) {
+		const current = queue.shift()!;
+		const phase = findPhase(machine, current);
+		if (phase && isTerminalIn(machine, current)) return true;
+		if (!phase) {
+			// An edge may name a phase the declaration does not define. For the three
+			// universal terminals that is legitimate and common — `ship -> done` is how
+			// a card says "end here", and normalization supplies the phase itself. Any
+			// OTHER undefined target is already a validation error ("unknown target
+			// phase"), so it must not be allowed to certify a machine by being a leaf.
+			if ((DEFAULT_TERMINAL_PHASES as readonly string[]).includes(current)) return true;
+			continue;
+		}
+		for (const rule of phase.next) {
+			if (seen.has(rule.to)) continue;
+			seen.add(rule.to);
+			queue.push(rule.to);
+		}
+	}
+	return false;
+}
+
+/**
+ * Which phase of this machine judges success (#358/#371)?
+ *
+ * A phase that can reach `done` is where the supervisor's verified-completion
+ * path fires. Among those, an edge requiring `verification_passed` is the most
+ * precise statement of "the verdict decides here"; otherwise the LAST declared
+ * candidate wins (machines list their phases in pipeline order, and the deepest
+ * phase that can complete a team is the one that completes it — that rule alone
+ * picks `verifying` in the built-in machine).
+ *
+ * `undefined` means the machine never reaches `done`, which is the caller's cue
+ * to keep its historical literal rather than invent a phase name.
+ */
+export function successPhaseOf(machine: PhaseMachine): string | undefined {
+	const declared = machine.phases.filter((phase) =>
+		phase.next.some((rule) => rule.to === "done" && rule.injected !== true),
+	);
+	const exits =
+		declared.length > 0
+			? declared
+			: machine.phases.filter((phase) => phase.next.some((rule) => rule.to === "done"));
+	if (exits.length === 0) return undefined;
+	const gated = exits.filter((phase) =>
+		phase.next.some((rule) => rule.to === "done" && (rule.require ?? []).includes("verification_passed")),
+	);
+	const candidates = gated.length > 0 ? gated : exits;
+	if (declared.length > 0) return candidates[candidates.length - 1]!.id;
+	// #371 (review r2): every exit is a normalizer injection, so the AUTHOR said
+	// nothing about where success is judged. Trusting array order here would let a
+	// legal but out-of-order declaration (phases listed ship, spec, impl) complete
+	// the team at `impl`, skipping an earlier pipeline stage; the farthest phase from
+	// the start is the only order-independent answer.
+	return farthestFrom(machine, candidates);
+}
+
+/** BFS distance from the start; ties keep the declaration's own order. */
+function farthestFrom(machine: PhaseMachine, candidates: PhaseDefinition[]): string {
+	const start = phaseStart(machine);
+	const distance = new Map<string, number>([[start, 0]]);
+	const queue = [start];
+	while (queue.length > 0) {
+		const id = queue.shift()!;
+		const phase = findPhase(machine, id);
+		for (const rule of phase?.next ?? []) {
+			if (distance.has(rule.to)) continue;
+			distance.set(rule.to, (distance.get(id) ?? 0) + 1);
+			queue.push(rule.to);
+		}
+	}
+	let best = candidates[0]!.id;
+	let bestDistance = distance.get(best) ?? -1;
+	for (const phase of candidates) {
+		const current = distance.get(phase.id) ?? -1;
+		if (current > bestDistance) {
+			best = phase.id;
+			bestDistance = current;
+		}
+	}
+	return best;
+}
+
 /** Look up a phase by id. */
 export function findPhase(
 	machine: PhaseMachine,
@@ -191,12 +305,20 @@ export function machineTimeout(
  *
  * Rather than reject a machine that omits them (which would punish a card for
  * something it had no reason to think about), they are injected as terminal
- * phases with an unconditional edge from every non-terminal phase. Taking those
- * edges is still gated: `failed` requires a terminal reason and `aborted`
- * requires a parent retire, checked before any edge lookup, and `done` is
- * refused outright for a centurion (only the supervisor may complete a
- * team). So injection adds no new capability — it only removes the possibility of
- * a stranded team.
+ * phases with an unconditional edge from every non-terminal phase.
+ *
+ * INVARIANT (#371): an injected edge is REACHABLE ONLY BY THE SUPERVISOR.
+ * Every one of them is marked {@link PhaseTransitionRule.injected}, and
+ * `evaluatePhaseTransition` refuses an injected `→ done` for any other actor,
+ * while `failed`/`aborted` stay gated exactly as before (a terminal reason, and
+ * a parent retire). So injection adds no capability — it only removes the
+ * possibility of a stranded team — and it can never be the team's way around a
+ * verification phase its author DID declare.
+ *
+ * That last point is not theoretical: before the marker existed, a machine
+ * declaring `ship → done require:["verification_passed"]` let a team complete
+ * from ANY non-terminal phase, because `evaluateDeclarative` takes the first
+ * matching edge and the injected one carried no conditions at all.
  */
 export function normalizePhaseMachine(machine: PhaseMachine): PhaseMachine {
 	const declared = new Set(machine.phases.map((phase) => phase.id));
@@ -206,7 +328,7 @@ export function normalizePhaseMachine(machine: PhaseMachine): PhaseMachine {
 	const phases = machine.phases.map((phase) => {
 		if (phase.terminal === true || phase.next.length === 0) return phase;
 		const existing = new Set(phase.next.map((rule) => rule.to));
-		const extra = missing.filter((id) => !existing.has(id)).map((to) => ({ to }));
+		const extra = missing.filter((id) => !existing.has(id)).map((to) => ({ to, injected: true as const }));
 		return extra.length > 0 ? { ...phase, next: [...phase.next, ...extra] } : phase;
 	});
 	return { ...machine, phases: [...phases, ...injected] };

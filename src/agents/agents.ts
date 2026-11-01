@@ -31,10 +31,12 @@ import {
 import { getAgentDir } from "./paths.ts";
 import { ignoredKindMessage, reportIgnoredOnce } from "../shared/ignored-kind.ts";
 import {
+	canReachTerminal,
 	type PhaseDefinition,
 	type PhaseMachine,
 	type PhaseTransitionRule,
 	normalizePhaseMachine,
+	phaseStart,
 	validatePhaseMachine,
 } from "../legion/phase-machine.ts";
 import type { PhaseCondition } from "../legion/phase-conditions.ts";
@@ -528,8 +530,21 @@ function parsePhaseBlock(text: string): PhaseMachine | undefined {
  * Validation happens HERE, at load, and every problem is reported at once. A
  * machine that only fails mid-run would surface after a team had already spent
  * tokens on a workflow that could never complete.
+ *
+ * Exported since #371: the SAME parser reads a declaration handed to the
+ * `subagent` tool at dispatch time, so the card layer and the inline layer can
+ * never disagree about what a legal machine is.
+ *
+ * `requireTerminal` adds the one question this parser does not ask for a card:
+ * can the DECLARED graph actually reach a terminal phase (#371 G4)? A card has
+ * never been checked for it and its rules are frozen, so the check is opt-in
+ * rather than folded into `validatePhaseMachine`.
  */
-function parsePhaseMachine(value: unknown, filePath: string): PhaseMachine | undefined {
+export function parsePhaseMachine(
+	value: unknown,
+	filePath: string,
+	options: { requireTerminal?: boolean } = {},
+): PhaseMachine | undefined {
 	if (value === undefined || value === null) return undefined;
 	let raw: unknown = value;
 	if (typeof value === "string") {
@@ -570,6 +585,16 @@ function parsePhaseMachine(value: unknown, filePath: string): PhaseMachine | und
 	// on the machine as it will actually run.
 	const normalized = normalizePhaseMachine(machine);
 	const errors = validatePhaseMachine(normalized);
+	// #371 G4: a well-formed graph may still be a loop. Asked only when the graph
+	// is otherwise valid (a structural error already names the real problem), and
+	// asked of the DECLARED graph — `normalizePhaseMachine` appends `done` to every
+	// non-terminal phase, so the normalized machine answers "yes" by construction.
+	if (options.requireTerminal === true && errors.length === 0 && !canReachTerminal(machine)) {
+		errors.push({
+			path: "phases",
+			message: `phase machine cannot reach a terminal phase from '${phaseStart(machine)}'`,
+		});
+	}
 	if (errors.length > 0) {
 		const detail = errors.map((error) => `  - ${error.path}: ${error.message}`).join("\n");
 		throw new Error(`Agent '${filePath}' has an invalid phase machine:\n${detail}`);

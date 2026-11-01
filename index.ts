@@ -27,7 +27,7 @@ import type { AbortOutcome, InFlightToolStack, LegionSupervisor, SteerDispositio
 import { inFlightToolStackOf } from "./src/supervisor/types.ts";
 import { withInFlightToolLine } from "./src/extension/legion-status.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
-import { discoverAgents, findAgent, formatAgentRoster, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
+import { discoverAgents, findAgent, formatAgentRoster, parsePhaseMachine, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
 import {
 	applyAgentOverrides,
 	applyDefaultModel,
@@ -52,8 +52,8 @@ import { resolveTeamContext } from "./src/agents/context.ts";
 import { createSessionRuntime, renderLiveChildStatus, type ClaimedCollect, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
-import type { PhaseMachine } from "./src/legion/phase-machine.ts";
-import { LEGION_DB_ENV, LEGION_NODE_ID_ENV } from "./src/runs/args.ts";
+import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
+import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, LEGION_PHASES_ENV } from "./src/runs/args.ts";
 import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
 import { appendEvent, maxEventId } from "./src/legion/events.ts";
@@ -149,6 +149,87 @@ import {
 // Parameters
 // ---------------------------------------------------------------------------
 
+/**
+ * One transition of a declared phase machine (#371).
+ *
+ * Mirrors `PhaseTransitionRule` in `src/legion/phase-machine.ts`. The shape is
+ * declared here rather than accepting `Type.Any()` so the MODEL sees what a
+ * machine is made of; the authoritative validation still happens once, in
+ * `parsePhaseMachine`, at launch (`orchestrator.declaredPhaseMachine`).
+ */
+const PhaseRuleParams = Type.Object({
+	to: Type.String({ description: "Target phase id." }),
+	require: Type.Optional(
+		Type.Array(Type.String(), {
+			description: 'Conditions ANDed into this edge, e.g. ["contract_file","children_settled","verdict_ok","verification_passed"].',
+		}),
+	),
+	actorRole: Type.Optional(Type.String({ description: "When set, only this actor role may take the edge." })),
+	rework: Type.Optional(Type.Boolean({ description: "Counts as a rework step (increments rework_count, capped by maxRework)." })),
+	notifyParent: Type.Optional(Type.Boolean({ description: "Notify the parent when taken." })),
+});
+
+/** One phase of a declared machine (#371). */
+const PhaseParams = Type.Object({
+	id: Type.String({ description: "Phase id." }),
+	require: Type.Optional(
+		Type.Array(Type.String(), { description: "Conditions ANDed into every edge leaving this phase." }),
+	),
+	next: Type.Optional(Type.Array(PhaseRuleParams, { description: "Allowed exits. A phase with none must be `terminal`." })),
+	timeoutMs: Type.Optional(Type.Number({ description: "Advisory clock only; never kills work." })),
+	terminal: Type.Optional(Type.Boolean({ description: "Terminal phases may not transition out." })),
+});
+
+/** A whole machine, with its entry phase and rework cap (#371). */
+const PhaseMachineParams = Type.Object({
+	phases: Type.Array(PhaseParams),
+	start: Type.Optional(Type.String({ description: "Entry phase; defaults to the first declared phase." })),
+	maxRework: Type.Optional(Type.Integer({ minimum: 0 })),
+});
+
+/**
+ * #371 (m9): the schema above and the real machine types must not drift.
+ *
+ * `parsePhaseMachine` is the authority, but the model reads THIS schema: a field
+ * added to `PhaseDefinition` and forgotten here would be invisible to every
+ * caller, and a field offered here that the parser rejects would be advertised
+ * and then refused. Both are silent at runtime, so they are made loud at compile
+ * time.
+ *
+ * The comparison is against a LOOSENED copy of the real types, because the schema
+ * is deliberately wider in exactly two documented places: `require` arrives as
+ * raw strings (the validator resolves them into `PhaseCondition`s) and `next` may
+ * be omitted (a phase with no exits must be `terminal`, which the validator
+ * checks). `injected` is excluded for the same reason — it is the normalizer's
+ * marker, never the caller's.
+ */
+type PhaseRuleSchema = Static<typeof PhaseRuleParams>;
+type PhaseSchema = Static<typeof PhaseParams>;
+type PhaseMachineSchema = Static<typeof PhaseMachineParams>;
+type CallerRule = Omit<PhaseTransitionRule, "injected" | "require"> & { require?: string[] };
+type CallerPhase = Omit<PhaseDefinition, "next" | "require" | "injected"> & { next?: CallerRule[]; require?: string[] };
+type CallerMachine = Omit<PhaseMachine, "phases"> & { phases: CallerPhase[] };
+/**
+ * Mutual assignability plus an exact KEY SET. Assignability alone would miss a
+ * property added as optional on one side (extra optional properties are legal to
+ * assign), which is precisely how a schema silently stops describing a field the
+ * parser requires.
+ */
+type SameShape<A, B> = [A] extends [B]
+	? [B] extends [A]
+		? [keyof A] extends [keyof B]
+			? [keyof B] extends [keyof A] ? true : never
+			: never
+		: never
+	: never;
+const phaseRuleSchemaParity: SameShape<CallerRule, PhaseRuleSchema> = true;
+const phaseSchemaParity: SameShape<CallerPhase, PhaseSchema> = true;
+const phaseMachineSchemaParity: SameShape<CallerMachine, PhaseMachineSchema> = true;
+// Referenced so `noUnusedLocals` cannot quietly delete the assertions above.
+void phaseRuleSchemaParity;
+void phaseSchemaParity;
+void phaseMachineSchemaParity;
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate" }),
@@ -230,6 +311,35 @@ const SubagentParams = Type.Object({
 		Type.Array(Type.String(), {
 			description:
 			"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; the first non-zero exit rejects the child's verdict as `rejected (verified-path)`. The worker does not need to paste test output.",
+		}),
+	),
+	phases: Type.Optional(
+		Type.Union(
+			[
+				Type.Array(PhaseParams, {
+					description:
+						"A phase list, in pipeline order. The team is born in `start` (or the first entry).",
+				}),
+				PhaseMachineParams,
+				Type.String({
+					description:
+						'One-line JSON for the same machine, or an indented list of "  - id: <name>" entries.',
+				}),
+			],
+			{
+				description:
+					"ROOT-ONLY, centurion-only, launch-only (#371). The team's state machine, declared by the root at dispatch time. " +
+					"Where a machine is declared the team walks it exactly as it did before; where none is, the centurion gets no phase, no `legion_phase` and no collection prompt — it just does the work and returns a verdict. " +
+					"So declare this only for a real multi-agent delivery; a one-file change belongs to a worker. " +
+					"A machine must be able to REACH a terminal phase (`done`/`failed`/`aborted`) or it is refused before anything is created. " +
+					'Example — solo, no children required: `phases:[{id:"planning"},{id:"implementing",next:[{to:"done"}]},{id:"done",terminal:true}]`.',
+			},
+		),
+	),
+	start: Type.Optional(
+		Type.String({
+			description:
+				"Entry phase for a `phases` LIST (a machine object or JSON string carries its own `start`, which wins). Only meaningful with `phases`.",
 		}),
 	),
 	agentScope: Type.Optional(
@@ -549,6 +659,43 @@ function phaseMachineForRole(role: string | null | undefined, cwd: string, setti
 	}
 }
 
+/**
+ * The phase machine for THIS node, declaration first (#371 contract §2).
+ *
+ * Resolution order, exactly as the contract freezes it:
+ *
+ *   1. the machine the root declared in this dispatch (`PI_LEGION_PHASES`)
+ *   2. the role card's `phases:`
+ *   3. neither — and then the node has NO machine, which is a different answer
+ *      from "use the built-in one": no phase, no `legion_phase`, no collection
+ *      prompt (invariant I2).
+ *
+ * Gated on the role because the environment is inherited: an in-process member
+ * literally shares its lead's `process.env`, and a worker must never adopt its
+ * lead's team machine as its own. A nested centurion cannot exist (G1), so the
+ * gate loses nothing.
+ *
+ * A pre-existing ledger row with a phase but no obtainable declaration keeps the
+ * card path and, failing that, no machine — the same degrade-don't-throw rule the
+ * card lookup above follows. The row's phase is still enough for `legion_phase`
+ * to stay registered (see `registerLegionTools`), so an in-flight team is never
+ * stranded by an upgrade.
+ */
+function phaseMachineForNode(role: string | null | undefined, cwd: string, settings: SubagentsSettings): PhaseMachine | undefined {
+	if (role === "centurion") {
+		const declared = process.env[LEGION_PHASES_ENV];
+		if (declared) {
+			try {
+				const machine = parsePhaseMachine(declared, LEGION_PHASES_ENV);
+				if (machine) return machine;
+			} catch (error) {
+				console.warn(`[pi-legion] ignoring an unreadable ${LEGION_PHASES_ENV} declaration: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+	}
+	return phaseMachineForRole(role, cwd, settings);
+}
+
 function createLegionRuntime(input: {
 	pi: ExtensionAPI;
 	supervisor: LegionSupervisor;
@@ -663,7 +810,7 @@ function resolveLegionIdentity(input: {
 			nodeRun = input.store.createRun({ task: node.taskSummary ?? `Resume ${node.role} node ${node.id}`, cwd: input.cwd, path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH), maxDepth: effectiveMaxDepth(input.settings.legion?.maxDepth), nodeId, herdr: { supervisor: "rpc", node_id: nodeId } });
 		}
 		if (node.runId !== nodeRun.runId) updateLegionRunId(db, nodeId, nodeRun.runId);
-		const machine = phaseMachineForRole(node.role, input.cwd, input.settings);
+		const machine = phaseMachineForNode(node.role, input.cwd, input.settings);
 		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true, ...(machine ? { machine } : {}), machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
 		// #273: `createLegionRuntime` runs during extension LOADING, where host
 		// actions (sendMessage, spawn, ui) are not available yet. Defer the team
@@ -3107,6 +3254,12 @@ async function launchStep(
 				launch: session.params.worktree,
 				step: step.worktree,
 			}),
+			// #371: a phase machine is declared by the ROOT at dispatch time and is a
+			// property of the launch, not of a step — `tasks[]` fan-out carries the
+			// same declaration to every sibling (G3 then refuses any step that is not
+			// a centurion, rather than silently ignoring it).
+			...(session.params.phases !== undefined ? { phases: session.params.phases } : {}),
+			...(session.params.start !== undefined ? { start: session.params.start } : {}),
 		});
 		const recorded = session.store.findChild(session.runId, handle.name);
 		if (recorded?.nodeId && recorded.nodeId === handle.child.nodeId) {
