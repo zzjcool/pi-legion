@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	ENV_LIMITS,
+	parsePsi,
 	judgeEnvironment,
 	judgeSlack,
 	median,
@@ -27,7 +28,7 @@ const round = (ms: number[]): number[] => ms;
 const idleEnvironment = (): Environment => ({
 	loadavg: [0.4, 0.3, 0.3],
 	cpus: 8,
-	probe: { ratioP95Min: 1.02, foreignCpu: 0.01, windows: [0.01, 0, 0.02], batchMs: 2.2, probeMs: 330 },
+	probe: { ratioP95Min: 1.02, foreignCpu: 0.01, foreignCores: 0.08, psiSomeAvg10: 0, windows: [0.01, 0, 0.02], batchMs: 2.2, probeMs: 330 },
 });
 
 test("#368 statistics keep the nearest-rank median/percentile the bench had", () => {
@@ -97,38 +98,86 @@ test("#368 split signs over the epsilon are inconclusive, never red", () => {
 	assert.match(verdict.reason, /split/);
 });
 
-test("#368 environment: an idle box is satisfied, a busy one is not", () => {
+test("#368 environment: the box's own baseline is satisfied (#368 review)", () => {
+	// Exactly the machine the review measured: 8 logical cores, resident loadavg
+	// 1.7-1.8 (0.22/core, someone else's long-running agents), PSI 0.00 — nothing is
+	// ever stalled waiting for a CPU, so the benchmark is trustworthy.
+	const reviewBaseline: Environment = {
+		loadavg: [1.78, 1.74, 1.7],
+		cpus: 8,
+		probe: { ratioP95Min: 1.03, foreignCpu: 0.019, foreignCores: 0.15, psiSomeAvg10: 0, windows: [0.019], batchMs: 2.2, probeMs: 330 },
+	};
+	const verdict = judgeEnvironment(reviewBaseline);
+	assert.equal(verdict.satisfied, true, verdict.reason);
+
+	// ... and an idle box with nothing at all going on.
 	assert.equal(judgeEnvironment(idleEnvironment()).satisfied, true);
 
+	// A different machine without PSI: the foreign/loadavg thresholds are the whole
+	// judgement, and 1.9% of capacity (= 0.15 cores) is not a co-runner.
+	const noPsiIdle: Environment = {
+		...idleEnvironment(),
+		probe: { ...idleEnvironment().probe, psiSomeAvg10: null, foreignCpu: 0.019, foreignCores: 0.15 },
+	};
+	assert.equal(judgeEnvironment(noPsiIdle).satisfied, true);
+});
+
+test("#368 environment: two busy cores are not judged, on PSI or on foreign cores", () => {
+	// A box that is genuinely oversubscribed: PSI says tasks stall 20% of the time.
+	const psiBusy: Environment = {
+		...idleEnvironment(),
+		probe: { ...idleEnvironment().probe, psiSomeAvg10: 20 },
+	};
+	const psiVerdict = judgeEnvironment(psiBusy);
+	assert.equal(psiVerdict.satisfied, false);
+	assert.match(psiVerdict.reason, /psi some avg10 20\.0% > 5%/);
+
+	// This box with two `node -e 'for(;;){}'` loops: PSI still reads 0.00 (five cores
+	// are free, so nothing stalls), foreign CPU reads 2.0 cores. PSI alone would miss
+	// it, which is why the foreign-cores signal is OR-ed in.
+	const foreignBusy: Environment = {
+		loadavg: [3.1, 2.4, 1.9],
+		cpus: 8,
+		probe: { ratioP95Min: 1.04, foreignCpu: 0.25, foreignCores: 2, psiSomeAvg10: 0, windows: [0.25], batchMs: 2.2, probeMs: 330 },
+	};
+	const foreignVerdict = judgeEnvironment(foreignBusy);
+	assert.equal(foreignVerdict.satisfied, false);
+	assert.match(foreignVerdict.reason, /foreign 2\.00 cores > 0\.8/);
+});
+
+test("#368 environment: each signal fails on its own", () => {
 	const busyProbe: Environment = {
 		...idleEnvironment(),
-		probe: { ratioP95Min: 2.4, foreignCpu: 0.02, windows: [0.02], batchMs: 4.1, probeMs: 900 },
+		probe: { ...idleEnvironment().probe, ratioP95Min: 2.4 },
 	};
 	assert.equal(judgeEnvironment(busyProbe).satisfied, false);
 	assert.match(judgeEnvironment(busyProbe).reason, /probe p95\/min/);
 
-	const foreign: Environment = {
-		...idleEnvironment(),
-		probe: { ratioP95Min: 1.01, foreignCpu: 0.25, windows: [0.25], batchMs: 2.2, probeMs: 330 },
-	};
-	assert.equal(judgeEnvironment(foreign).satisfied, false);
-	assert.match(judgeEnvironment(foreign).reason, /foreign cpu/);
-
-	// `npm test` in another pane: load average only, which is the slow backstop.
-	const loaded: Environment = { ...idleEnvironment(), loadavg: [6.2, 5.0, 3.0] };
+	// loadavg backstop: ~6.5 runnable threads of foreign work on 8 CPUs.
+	const loaded: Environment = { ...idleEnvironment(), loadavg: [7.5, 6.0, 4.0] };
 	assert.equal(judgeEnvironment(loaded).satisfied, false);
-	assert.match(judgeEnvironment(loaded).reason, /loadavg 6\.2\/8/);
+	assert.match(judgeEnvironment(loaded).reason, /loadavg 7\.5\/8/);
 
-	// Load average counts this benchmark's own render thread, and five back-to-back
-	// runs decay into the next reading: 1.7 on an otherwise idle box is this script
-	// itself (idle measurements were 1.5–1.75), so it must not disqualify run N+1.
+	// Load average counts this benchmark's own render thread, and back-to-back runs
+	// decay into the next reading: 1.7 on an otherwise idle box is this script
+	// itself (idle measurements were 1.1–1.8), so it must not disqualify run N+1.
 	const selfOnly: Environment = { ...idleEnvironment(), loadavg: [1.74, 1.6, 1.5] };
 	assert.equal(judgeEnvironment(selfOnly).satisfied, true);
 
-	// A platform without /proc/stat: foreignCpu is null and simply not judged on.
+	// A resident co-runner is a co-runner even with PSI at 0: >= 0.8 cores of foreign
+	// work means the machine is not exclusively ours.
+	const resident: Environment = {
+		...idleEnvironment(),
+		loadavg: [1.7, 1.6, 1.5],
+		probe: { ...idleEnvironment().probe, foreignCpu: 0.15, foreignCores: 1.2 },
+	};
+	assert.equal(judgeEnvironment(resident).satisfied, false);
+
+	// A platform without /proc/stat and without PSI: those signals are simply not
+	// judged on, the ratio and load average still are.
 	const noProc: Environment = {
 		...idleEnvironment(),
-		probe: { ratioP95Min: 1.1, foreignCpu: null, windows: [], batchMs: 2.2, probeMs: 300 },
+		probe: { ratioP95Min: 1.1, foreignCpu: null, foreignCores: null, psiSomeAvg10: null, windows: [], batchMs: 2.2, probeMs: 300 },
 	};
 	assert.equal(judgeEnvironment(noProc).satisfied, true);
 });
@@ -157,11 +206,15 @@ test("#368 the probe measures tail inflation and foreign CPU, hand-driven", () =
 		statReads += 1;
 		return { busy, total: busy + 1000 };
 	};
-	const uniform = runCpuProbe({ cpus: 8, stat, now: uniformClock(), cpuUsage: () => ({ user: 0, system: 0 }) });
+	const uniform = runCpuProbe({ cpus: 8, stat, psi: () => 0, now: uniformClock(), cpuUsage: () => ({ user: 0, system: 0 }) });
 	assert.equal(uniform.ratioP95Min, 1, "uniform batches => no tail inflation");
 	assert.equal(uniform.batchMs, 1);
 	assert.equal(uniform.windows.length, 5);
 	assert.ok(Math.abs((uniform.foreignCpu ?? -1) - 0.24) < 0.02, `foreign CPU ~0.24, got ${String(uniform.foreignCpu)}`);
+	assert.ok(Math.abs((uniform.foreignCores ?? -1) - 1.92) < 0.2, `foreign cores ~1.92, got ${String(uniform.foreignCores)}`);
+	assert.equal(uniform.psiSomeAvg10, 0);
+	assert.equal(parsePsi("some avg10=26.83 avg60=12.37 avg300=3.44 total=8186958024\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"), 26.83);
+	assert.equal(parsePsi("full avg10=0.00 avg60=0.00 avg300=0.00 total=0"), null);
 
 	// Every 10th clock call jumps 40ms: the tail moves, the median does not.
 	let calls = 0;
@@ -172,12 +225,12 @@ test("#368 the probe measures tail inflation and foreign CPU, hand-driven", () =
 		return clock;
 	};
 	statReads = 0;
-	const spiky = runCpuProbe({ cpus: 8, stat, now: spikyClock, cpuUsage: () => ({ user: 0, system: 0 }) });
+	const spiky = runCpuProbe({ cpus: 8, stat, psi: () => 0, now: spikyClock, cpuUsage: () => ({ user: 0, system: 0 }) });
 	assert.ok(spiky.ratioP95Min > 1.5, `p95/min should show the spikes, got ${spiky.ratioP95Min}`);
 });
 
 test("#368 gates: busy box skips time gates but still fails a byte gate", () => {
-	const busy = judgeEnvironment({ ...idleEnvironment(), loadavg: [6.2, 5.0, 3.0] });
+	const busy = judgeEnvironment({ ...idleEnvironment(), loadavg: [7.5, 6.0, 4.0] });
 	const gates: Gate[] = [
 		{ gate: "page medianMs<=5.0", kind: "time", ok: null, judged: false, actual: 1.1, limit: 5 },
 		{ gate: "bytesGrowthPct<=2.0", kind: "bytes", ok: true, judged: true, actual: -2.4, limit: 2 },
@@ -208,6 +261,7 @@ test("#368 the exported thresholds match the documented derivation", () => {
 	// Guards the numbers `reports/368-mount-gate.md` derives from the idle run
 	// distribution: idle p95/min ≤ 1.09, idle foreign CPU ≤ 0.05, idle load/cpu ≤ 0.10.
 	assert.ok(ENV_LIMITS.probeRatio >= 1.09 && ENV_LIMITS.probeRatio <= 2, "probe ratio between idle max and saturation");
-	assert.ok(ENV_LIMITS.foreignCpu >= 0.05 && ENV_LIMITS.foreignCpu <= 0.25, "foreign CPU between idle max and two busy cores");
-	assert.ok(ENV_LIMITS.loadPerCpu >= 0.1 && ENV_LIMITS.loadPerCpu <= 1, "loadavg/cpu between idle max and saturation");
+	assert.ok(ENV_LIMITS.psiSomeAvg10 >= 1 && ENV_LIMITS.psiSomeAvg10 <= 15, "PSI between idle 0 and a saturated 20-30%");
+	assert.ok(ENV_LIMITS.foreignCores >= 0.4 && ENV_LIMITS.foreignCores <= 2, "foreign cores below the two-busy-core case");
+	assert.ok(ENV_LIMITS.loadPerCpu > 0.22 && ENV_LIMITS.loadPerCpu <= 1.5, "loadavg/cpu above the box baseline 0.22");
 });

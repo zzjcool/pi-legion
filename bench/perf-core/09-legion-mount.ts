@@ -43,12 +43,15 @@
  *    inside each round and gated on the median over 5 rounds (see `ROUNDS`).
  *    Comparing two batch medians taken a minute apart made the gate a coin flip.
  * 2. **A busy box is neither a pass nor a regression.** Before the first frame the
- *    script probes the machine (tight-loop p95/min, foreign CPU fraction from
- *    `/proc/stat`, `loadavg[0]/cpus`). When any of them says the box is not
- *    exclusively ours, every time-class gate is reported as `not judged`, the JSON
- *    `ok` is `"inconclusive"` and the process **exits 0** — with the observed
+ *    script probes the machine: PSI stall pressure (`/proc/pressure/cpu` `some
+ *    avg10`), persistent foreign CPU work in **cores** (from `/proc/stat`, this
+ *    process's own CPU subtracted), `loadavg[0]/cpus`, and the tight loop's
+ *    p95/min tail. When any of them says the box is not exclusively ours, every
+ *    time-class gate is reported as `not judged`, the JSON `ok` is
+ *    `"inconclusive"` and the process **exits 0** — with the observed
  *    `environment: { loadavg, cpus, probe }` and a one-line reason on stderr.
- *    Byte gates keep judging: bytes do not move with the clock.
+ *    Byte gates keep judging: bytes do not move with the clock. Thresholds and
+ *    their calibration are in `lib/mount-gate.ts` (`ENV_LIMITS`).
  *
  * Run: node --experimental-strip-types bench/perf-core/09-legion-mount.ts
  * (must be an otherwise-idle box; see `bench/perf-core/README.md`)

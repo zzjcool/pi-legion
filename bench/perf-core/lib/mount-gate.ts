@@ -139,27 +139,30 @@ export function judgeSlack(summary: SlackSummary, limitMs: number): { ok: Verdic
 // ------------------------------------------------------- environment probe
 
 /**
- * Thresholds, all derived from idle-machine measurements of this same probe
- * (distribution + derivation in `reports/368-mount-gate.md`):
+ * Thresholds. Each one is a *policy* about when frame timings stop meaning
+ * anything, calibrated against this box (8 logical cores, `reports/368-mount-gate.md`):
  *
- * - `probeRatio 1.5`: idle p95/min of the tight loop was 1.004–1.085 over 6 runs;
- *   1.5 is ~1.4× above the worst idle run and fires as soon as preemption starts
- *   showing up in the tail (a saturated box pushes it well past 2).
- * - `foreignCpu 0.10`: fraction of the whole machine busy with *foreign* work in
- *   the quietest window. Idle minimum-of-windows measured 0–0.05; one co-running
- *   core on this 8-CPU box is 0.125, two are 0.25. 0.10 sits between.
- * - `loadPerCpu 0.20`: foreign `loadavg[0]/cpus`. Load average counts **this
- *   process's own render thread** as runnable, and back-to-back bench runs decay
- *   into the next run's reading (measured: 1.5–1.75 on an idle box that was only
- *   running this script), so `SELF_RUNNABLE_THREADS` is subtracted before the
- *   ratio. Idle then measures 0.06–0.10; two busy cores on 8 CPUs settle at 0.25+
- *   and a saturating `npm test` at ~1.0. Load average reacts slowly, which is why
- *   the probe above is the fast signal; this one is the slow, global backstop.
+ * - `probeRatio 1.5`: p95/min of the tight loop. Idle measured 1.001–1.09 over a
+ *   dozen runs; a preempted thread pushes it past 2.
+ * - `psiSomeAvg10 5` (%): the kernel's own CPU stall pressure
+ *   (`/proc/pressure/cpu`, "some task was waiting for a CPU"). Idle is 0.00 and a
+ *   contended host reads 20–30%, but it is **host dependent**: on this SMT box it
+ *   only reaches 4.6% with all 8 cores busy, and it stays 0.00 while free cores
+ *   remain. Hence the OR below, never PSI alone.
+ * - `foreignCores 0.8`: persistent CPU work by other processes, in cores
+ *   (`foreignCpu × cpus`). One co-running core on this box reads ~1.0, two read
+ *   ~2.0; the idle baseline reads 0–0.15. 0.8 cores is the reviewer's
+ *   "0.10 of an 8-CPU box" (#368 review) and is the signal that catches a
+ *   co-runner while PSI is still 0.
+ * - `loadPerCpu 0.8`: `(loadavg[0] - this process) / cpus`, the slow global
+ *   backstop. Idle baseline is 0.13–0.22 (measured 1.1–1.8 raw); 0.8 means ~6.4
+ *   runnable threads on 8 CPUs.
  */
 export const ENV_LIMITS = {
 	probeRatio: 1.5,
-	foreignCpu: 0.1,
-	loadPerCpu: 0.2,
+	psiSomeAvg10: 5,
+	foreignCores: 0.8,
+	loadPerCpu: 0.8,
 } as const;
 
 /**
@@ -174,6 +177,10 @@ export interface ProbeObservation {
 	ratioP95Min: number;
 	/** Fraction of the whole machine busy with work that is not this process. */
 	foreignCpu: number | null;
+	/** `foreignCpu × cpus`, i.e. how many cores of foreign work were running. */
+	foreignCores: number | null;
+	/** `/proc/pressure/cpu` → `some avg10` (percent), `null` where unavailable. */
+	psiSomeAvg10: number | null;
 	/** Per-window `foreignCpu` samples, `null` where `/proc/stat` was unreadable. */
 	windows: Array<number | null>;
 	/** Wall time one batch of the tight loop took (median), for context. */
@@ -201,20 +208,23 @@ export function judgeEnvironment(env: Environment, limits: typeof ENV_LIMITS = E
 	const exceeded: string[] = [];
 	const foreignLoad = Math.max(0, (env.loadavg[0] ?? 0) - SELF_RUNNABLE_THREADS);
 	const loadPerCpu = env.cpus > 0 ? foreignLoad / env.cpus : 0;
+	const foreignCores = env.probe.foreignCpu === null ? null : env.probe.foreignCpu * env.cpus;
 	if (env.probe.ratioP95Min > limits.probeRatio) {
 		exceeded.push(`probe p95/min ${env.probe.ratioP95Min.toFixed(2)} > ${limits.probeRatio}`);
 	}
-	if (env.probe.foreignCpu !== null && env.probe.foreignCpu > limits.foreignCpu) {
-		exceeded.push(`foreign cpu ${(env.probe.foreignCpu * 100).toFixed(0)}% > ${(limits.foreignCpu * 100).toFixed(0)}%`);
+	if (env.probe.psiSomeAvg10 !== null && env.probe.psiSomeAvg10 > limits.psiSomeAvg10) {
+		exceeded.push(`psi some avg10 ${env.probe.psiSomeAvg10.toFixed(1)}% > ${limits.psiSomeAvg10}%`);
+	}
+	if (foreignCores !== null && foreignCores > limits.foreignCores) {
+		exceeded.push(`foreign ${foreignCores.toFixed(2)} cores > ${limits.foreignCores}`);
 	}
 	if (loadPerCpu > limits.loadPerCpu) {
-		exceeded.push(
-			`loadavg ${(env.loadavg[0] ?? 0).toFixed(1)}/${env.cpus} (foreign ${loadPerCpu.toFixed(2)} per cpu > ${limits.loadPerCpu})`,
-		);
+		exceeded.push(`loadavg ${(env.loadavg[0] ?? 0).toFixed(1)}/${env.cpus} (${loadPerCpu.toFixed(2)} per cpu > ${limits.loadPerCpu})`);
 	}
-	const stats = `loadavg ${(env.loadavg[0] ?? 0).toFixed(1)}/${env.cpus} (${loadPerCpu.toFixed(2)} per cpu minus this process), ` +
-		`probe p95/min ${env.probe.ratioP95Min.toFixed(2)}` +
-		(env.probe.foreignCpu === null ? "" : `, foreign cpu ${(env.probe.foreignCpu * 100).toFixed(0)}%`);
+	const stats = `psi some avg10 ${env.probe.psiSomeAvg10 === null ? "n/a" : `${env.probe.psiSomeAvg10.toFixed(1)}%`}, ` +
+		`loadavg ${(env.loadavg[0] ?? 0).toFixed(1)}/${env.cpus} (${loadPerCpu.toFixed(2)} per cpu minus this process), ` +
+		`foreign ${foreignCores === null ? "n/a" : `${foreignCores.toFixed(2)} cores`}, ` +
+		`probe p95/min ${env.probe.ratioP95Min.toFixed(2)}`;
 	if (exceeded.length === 0) {
 		return { satisfied: true, reason: `environment satisfied (${stats})`, exceeded };
 	}
@@ -254,9 +264,25 @@ export function parseProcStat(raw: string): ProcStat | null {
 	}
 }
 
+/**
+ * `/proc/pressure/cpu` → its `some avg10` percentage, i.e. the share of wall time
+ * during which at least one task was stalled waiting for a CPU. `null` when the
+ * kernel does not expose PSI (`CONFIG_PSI` off, `psi=0` on the command line, or a
+ * non-Linux host). The verdict is an OR of every available signal, so PSI being
+ * absent (or insensitive, see `ENV_LIMITS`) only removes one of them.
+ */
+export function parsePsi(raw: string): number | null {
+	const match = /^some\s+avg10=([\d.]+)/m.exec(raw);
+	if (!match) return null;
+	const value = Number(match[1]);
+	return Number.isFinite(value) ? value : null;
+}
+
 export interface CpuProbeOptions {
 	cpus: number;
 	stat: () => ProcStat | null;
+	/** `/proc/pressure/cpu` → `some avg10`; `null` when unavailable. */
+	psi: () => number | null;
 	now: () => number;
 	cpuUsage: () => { user: number; system: number };
 }
@@ -301,9 +327,13 @@ export function runCpuProbe(options: CpuProbeOptions): ProbeObservation {
 	const min = batches.length === 0 ? 0 : Math.min(...batches);
 	const foreigns = windows.map((w) => w.foreign);
 	const observed = foreigns.filter((v): v is number => v !== null);
+	const foreignCpu = observed.length === 0 ? null : Math.round(Math.min(...observed) * 1000) / 1000;
+	const psiSomeAvg10 = options.psi();
 	return {
 		ratioP95Min: min > 0 ? Math.round((percentile(batches, 0.95) / min) * 1000) / 1000 : 0,
-		foreignCpu: observed.length === 0 ? null : Math.round(Math.min(...observed) * 1000) / 1000,
+		foreignCpu,
+		foreignCores: foreignCpu === null ? null : Math.round(foreignCpu * options.cpus * 100) / 100,
+		psiSomeAvg10,
 		windows: foreigns.map((v) => (v === null ? null : Math.round(v * 1000) / 1000)),
 		batchMs: Math.round(median(batches) * 1000) / 1000,
 		probeMs: Math.round(options.now() - started),
@@ -369,9 +399,17 @@ export async function collectEnvironment(): Promise<Environment> {
 			return null;
 		}
 	};
+	const psi = (): number | null => {
+		try {
+			return parsePsi(readFileSync("/proc/pressure/cpu", "utf8"));
+		} catch {
+			return null;
+		}
+	};
 	const probe = runCpuProbe({
 		cpus: cpuCount,
 		stat,
+		psi,
 		now: () => performance.now(),
 		cpuUsage: () => {
 			const usage = process.cpuUsage();
