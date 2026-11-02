@@ -112,6 +112,13 @@ import {
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
 import {
+	pollInbox,
+	renderReleasedMail,
+	takePendingMail,
+	type MailReleaseSeam,
+} from "./src/legion/mail-release.ts";
+import type { LegionMessage } from "./src/legion/mail.ts";
+import {
 	describeChildScopeCandidates,
 	foundElsewhere,
 	foundInScope,
@@ -2382,6 +2389,14 @@ export function loadCatalog(
 }
 
 /**
+ * #384: the inbox the blocking tools watch, or `undefined` when this call is not a
+ * legion node (a plain session keeps `wait`/`collect` exactly as they were — I1).
+ */
+function mailSeamOf(legion: OrchestratorLegionContext | undefined): MailReleaseSeam | undefined {
+	return legion ? { db: legion.db, nodeId: legion.nodeId } : undefined;
+}
+
+/**
  * Act on an EXISTING child: status, steer, collect, retire, continue, resume.
  *
  * The extension stays loaded for the session, but a control call may arrive
@@ -2434,6 +2449,7 @@ async function controlAction(input: {
 			allAgents: input.allAgents,
 			store,
 			cwd,
+			mail: mailSeamOf(input.legion),
 		});
 	}
 
@@ -2689,7 +2705,7 @@ async function controlAction(input: {
 
 	if (action === "steer") return steerChild(ctx);
 	if (action === "abort") return abortChild(ctx);
-	if (action === "collect") return collectChild(ctx, input.signal);
+	if (action === "collect") return collectChild(ctx, input.signal, mailSeamOf(input.legion));
 	if (action === "retire") return retireChild(ctx);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
 
@@ -2966,9 +2982,23 @@ export async function abortChild(
 export async function collectChild(
 	ctx: ChildContext,
 	signal?: AbortSignal,
+	/**
+	 * #384: this node's inbox. When set, a collect that receives mail returns with
+	 * that mail instead of waiting for the child (`docs/contracts/wait-mail-preempt-v1.md`).
+	 * Absent = no query, no timer, no abort controller — today's behaviour byte for
+	 * byte (I1).
+	 */
+	mail?: MailReleaseSeam,
 ): Promise<AgentToolResult<unknown>> {
+	let stopPolling: (() => void) | undefined;
 	try {
 		if (signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
+		// #384: the inbox is checked BEFORE anything claims a result, so a preempted
+		// collect never holds a #352 claim for a result it will not deliver.
+		if (mail) {
+			const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+			if (released.length > 0) return mailPreemptedCollect(ctx.name, released);
+		}
 		// #312: the runtime's job table is keyed by NAME, while everything below
 		// acts on the node resolved in `ctx.found.runId`. A TRACKED job belonging to
 		// another run is a different node: consuming its snapshot here would answer
@@ -2981,10 +3011,18 @@ export async function collectChild(
 		// that window, so an absent job must not be read as "a different run".
 		const trackedJob = ctx.runtime.get(ctx.name);
 		const foreignJob = trackedJob !== undefined && trackedJob.runId !== ctx.found.runId;
+		// #384: the mail abort and the caller's abort race into one signal — whichever
+		// lands first ends the collect, and `combined.reason` says which it was (§4).
+		// With no mail seam the combined signal is the caller's, unchanged.
+		const mailAbort = new AbortController();
+		const combined = mail
+			? (signal ? AbortSignal.any([signal, mailAbort.signal]) : mailAbort.signal)
+			: signal;
+		if (mail) stopPolling = pollInbox(mail, () => mailAbort.abort(MAIL_PREEMPT_REASON));
 		const pending = foreignJob
 			? undefined
-			: signal
-				? ctx.runtime.consumeCollectInterruptible(ctx.name, signal)
+			: combined
+				? ctx.runtime.consumeCollectInterruptible(ctx.name, combined)
 				: ctx.runtime.consumeCollect(ctx.name);
 		if (pending) {
 			const collected = await pending;
@@ -2996,9 +3034,21 @@ export async function collectChild(
 			// THIS call took comes back (#320/1), so a result an earlier delivery already
 			// claimed keeps its evidence, and the job branch restores the notification
 			// route with it (#320/2).
-			if (!collected || signal?.aborted) {
+			//
+			// #384: a mail preempt is the reason the seam answered `undefined`, and it is
+			// resolved AFTER the rollback above so #352's invariant holds either way: no
+			// notice may be left claimed-but-undelivered by a preemption.
+			const callerGone = signal?.aborted === true;
+			const mailWon =
+				mail !== undefined && combined?.reason === MAIL_PREEMPT_REASON && !callerGone;
+			if (!collected || signal?.aborted || mailWon) {
 				if (collected) {
 					ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
+				}
+				if (mailWon) {
+					const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+					// Empty = the postman got there first; fall back to the frozen line.
+					if (released.length > 0) return mailPreemptedCollect(ctx.name, released);
 				}
 				return ok("interrupted (parent turn ended; children still running)");
 			}
@@ -3024,8 +3074,21 @@ export async function collectChild(
 		const timeoutMs = agentDef?.timeoutMs ?? DEFAULTS.turnTimeoutMs;
 		const collected = await ctx.orchestrator.collect(ctx.name, {
 			timeoutMs,
-			...(signal ? { signal } : {}),
+			...(combined ? { signal: combined } : {}),
 		});
+		// #384: this collect may have been cut short by mail (the orchestrator answers
+		// `aborted by parent` for ANY aborted signal). Only a genuinely interrupted
+		// answer is preempted — a real result is delivered, and the mail stays pending
+		// for the postman rather than replacing it.
+		const mailWon =
+			mail !== undefined &&
+			combined?.reason === MAIL_PREEMPT_REASON &&
+			signal?.aborted !== true &&
+			collected.execution.reason === "aborted by parent";
+		if (mailWon) {
+			const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+			if (released.length > 0) return mailPreemptedCollect(ctx.name, released);
+		}
 		if (signal?.aborted || collected.execution.reason === "aborted by parent") {
 			return ok("interrupted (parent turn ended; children still running)");
 		}
@@ -3041,6 +3104,9 @@ export async function collectChild(
 		return ok(renderCollect(ctx.name, collected));
 	} catch (error) {
 		return fail(`collect failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
+	} finally {
+		// #384: never leave a 250ms timer behind a finished collect.
+		stopPolling?.();
 	}
 }
 
@@ -5325,6 +5391,103 @@ export async function releaseWaitClaims(runtime: SessionRuntime, details: unknow
 	}
 }
 
+/**
+ * #384: the abort reason that says "this node's inbox got mail", as opposed to
+ * "the caller left". `AbortSignal.any` forwards the reason of whichever source
+ * aborted FIRST (contract §4), so the combined signal's `reason` is the verdict on
+ * who won the race — no bookkeeping flag to fall out of sync.
+ */
+const MAIL_PREEMPT_REASON = Symbol("legion mail preempted the blocking call");
+
+/**
+ * Mount the #352 claim record on a wait result's `details` (both fields, always).
+ *
+ * #352 review (major 1): mount BOTH unconditionally. Deciding on `claims.length` was
+ * a no-op: one probe means at most one claim, and the probe has usually not answered
+ * yet at this point — so the length test mounted nothing in the window that matters,
+ * and when it did mount it shared a reference with a caller that could reach it anyway.
+ * The array stays live (late pushes land in the same object) and the promise says
+ * when the probe got its answer.
+ */
+function withWaitClaims(
+	details: Record<string, unknown>,
+	claims: WaitClaim[],
+	pending?: Promise<WaitClaim[]>,
+): Record<string, unknown> {
+	details.waitClaims = claims;
+	if (pending) {
+		// Non-enumerable: this is a live promise, and `details` is the tool result's
+		// record — a promise has no business in a serialized transcript.
+		Object.defineProperty(details, "waitClaimsPending", {
+			value: pending,
+			enumerable: false,
+			configurable: true,
+		});
+	}
+	return details;
+}
+
+/**
+ * Contract §2: the mail that ended the blocking call, as a NORMAL tool result.
+ *
+ * Not an error and not `interrupted …` — the model reads the mail and carries on.
+ * The `details` shape is the one the contract froze: `state`, `mailIds`, `targets`,
+ * plus the wait's claim record when the caller has one (a `collect` takes no claim).
+ */
+function mailPreemptedResult(input: {
+	released: readonly LegionMessage[];
+	targets: readonly string[];
+	/** The frozen status line that follows the mail body (contract §2). */
+	summary: string;
+	claims?: WaitClaim[];
+}): AgentToolResult<unknown> {
+	const details: Record<string, unknown> = {
+		state: "mail",
+		mailIds: input.released.map((message) => message.id),
+		targets: [...input.targets],
+	};
+	if (input.claims) withWaitClaims(details, input.claims);
+	return {
+		content: [
+			{ type: "text", text: [renderReleasedMail(input.released), input.summary].join("\n\n") },
+		],
+		details,
+	};
+}
+
+/** `wait`: the mail plus what this node is still waiting on (contract §2). */
+function mailPreemptedWait(input: {
+	runtime: SessionRuntime;
+	released: readonly LegionMessage[];
+	names: readonly string[];
+	claims: WaitClaim[];
+}): AgentToolResult<unknown> {
+	const running =
+		input.names.length > 0
+			? input.names
+					.map((name) => `${name} (${input.runtime.get(name)?.state ?? "untracked"})`)
+					.join(", ")
+			: "none";
+	return mailPreemptedResult({
+		released: input.released,
+		targets: input.names,
+		summary: `Children are still running: ${running}`,
+		claims: input.claims,
+	});
+}
+
+/** `collect`: the mail plus the frozen "collect again" instruction (contract §2). */
+function mailPreemptedCollect(
+	name: string,
+	released: readonly LegionMessage[],
+): AgentToolResult<unknown> {
+	return mailPreemptedResult({
+		released,
+		targets: [name],
+		summary: "The collect was interrupted by this mail; call collect again after handling it.",
+	});
+}
+
 export async function waitAction(input: {
 	params: SubagentParams;
 	signal?: AbortSignal;
@@ -5333,6 +5496,13 @@ export async function waitAction(input: {
 	allAgents?: AgentConfig[];
 	store: RunStore;
 	cwd: string;
+	/**
+	 * #384: this node's inbox, when the caller is a legion node. A wait that receives
+	 * mail returns AT ONCE with that mail instead of waiting out its timeout
+	 * (`docs/contracts/wait-mail-preempt-v1.md`). Absent = no query, no timer, no
+	 * abort controller — today's behaviour byte for byte (I1).
+	 */
+	mail?: MailReleaseSeam;
 }): Promise<AgentToolResult<unknown>> {
 	const { params, signal, runtime, agents, allAgents = agents, store, cwd } = input;
 	const jobs = runtime.activeJobs();
@@ -5350,6 +5520,26 @@ export async function waitAction(input: {
 		{ name: params.name, all: params.all },
 		jobs,
 	);
+	// #384: look in the inbox ONCE here — before the finished-cache probe below can
+	// take a #352 claim. A preempted wait hands over MAIL, not the child's result, so
+	// it must not hold a claim for a result nobody received; checking here makes
+	// `claims` provably empty on that path. `signal?.aborted` at entry means the
+	// caller is already gone: I5 keeps that path exactly as it was, mail or no mail.
+	//
+	// A mail hit also wins over "unknown child" / "no running children": the node has
+	// unread mail in hand right now, and the wait it asked for can simply be repeated.
+	const mail = input.mail;
+	if (mail && signal?.aborted !== true) {
+		const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+		if (released.length > 0) {
+			return mailPreemptedWait({
+				runtime,
+				released,
+				names: targets.ok ? targets.names : params.name ? [params.name] : [],
+				claims,
+			});
+		}
+	}
 	if (!targets.ok) {
 		// A name that is merely finished (not live) is still waitable via the
 		// runtime's finished cache — probe it with consumeCollect. NOTE: since
@@ -5392,32 +5582,58 @@ export async function waitAction(input: {
 				);
 			}),
 		);
-	const results = await runtime.wait(targets.names, { timeoutMs, ...(signal ? { signal } : {}) });
+	// #384: the mail abort and the caller's abort race into one signal, so whichever
+	// lands FIRST ends the wait — and `reason` says which one it was (contract §4).
+	// With no mail seam the combined signal is the caller's, unchanged.
+	const mailAbort = new AbortController();
+	const combined = mail
+		? (signal ? AbortSignal.any([signal, mailAbort.signal]) : mailAbort.signal)
+		: signal;
+	let stopPolling: (() => void) | undefined;
+	if (mail) stopPolling = pollInbox(mail, () => mailAbort.abort(MAIL_PREEMPT_REASON));
+	let results: WaitResult[];
+	try {
+		results = await runtime.wait(targets.names, {
+			timeoutMs,
+			...(combined ? { signal: combined } : {}),
+		});
+	} finally {
+		// #384: never leave a 250ms timer behind a finished wait.
+		stopPolling?.();
+	}
+	// #384: mail preempted this wait. Only when nothing was delivered by it
+	// (`every(interrupted)`) — a wait that also returned a child's result keeps that
+	// result, because a claimed snapshot dropped in favour of mail is #352's
+	// suppressed-notice bug. `!claimsPending` says this wait never ran the
+	// finished-cache probe, which is what makes `claims` provably empty here: a
+	// preempted call must not hold a claim for a result it never delivered. Whoever
+	// aborted FIRST wins — a caller abort keeps the frozen `interrupted …` rendering
+	// even when mail landed a tick later (I5).
+	if (
+		mail &&
+		!claimsPending &&
+		combined?.reason === MAIL_PREEMPT_REASON &&
+		signal?.aborted !== true &&
+		results.every((result) => result.interrupted === true)
+	) {
+		const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+		// Empty = the postman took it during the abort. Nothing to hand over, so fall
+		// through to the ordinary (interrupted) render rather than inventing a result.
+		if (released.length > 0) {
+			return mailPreemptedWait({ runtime, released, names: targets.names, claims });
+		}
+	}
 	const text = renderWait(results);
 	const timeoutDetails = buildWaitTimeoutDetails(results);
 	// #352: `details.waitClaims` is the only record of what this call took — the tool
 	// layer's abort net replaces the rendered result with the frozen `interrupted …`
 	// line, and without this the claim it leaves behind suppresses that round's notice
-	// forever.
-	//
-	// #352 review (major 1): mount BOTH unconditionally. Deciding on `claims.length` was
-	// a no-op: one probe means at most one claim, and the probe has usually not answered
-	// yet at this point — so the length test mounted nothing in the window that matters,
-	// and when it did mount it shared a reference with a caller that could reach it anyway.
-	// The array stays live (late pushes land in the same object) and the promise says
-	// when the probe got its answer.
+	// forever (see `withWaitClaims`).
 	const details: Record<string, unknown> = timeoutDetails ? { ...timeoutDetails } : {};
-	details.waitClaims = claims;
-	if (claimsPending) {
-		// Non-enumerable: this is a live promise, and `details` is the tool result's
-		// record — a promise has no business in a serialized transcript.
-		Object.defineProperty(details, "waitClaimsPending", {
-			value: claimsPending,
-			enumerable: false,
-			configurable: true,
-		});
-	}
-	return { content: [{ type: "text", text }], details };
+	return {
+		content: [{ type: "text", text }],
+		details: withWaitClaims(details, claims, claimsPending),
+	};
 }
 
 export function renderAgentList(
