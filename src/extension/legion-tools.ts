@@ -13,6 +13,10 @@ import type { LegionSettings, TurnRecord } from "../shared/types.ts";
 import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
+import {
+	isMailHeld,
+	MAIL_DELIVERY_CLAIM_LEASE_MS,
+} from "../legion/mail-release.ts";
 import type { LegionEventBus } from "./event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
 import { ALL_CHILDREN_FAILED_REASON } from "../legion/interrupt.ts";
@@ -22,11 +26,14 @@ import {
 	MAIL_BOUNCE_REASON,
 	MAIL_DELIVERY,
 	MailInvalidTextError,
+	claimForDelivery,
 	formatMail,
+	renewDeliveryClaim,
 	inbox,
 	isStalePhaseTimeoutNotice,
 	mailReachedTurns,
 	pendingInbox,
+	releaseDeliveryClaim,
 	sendMail,
 	transitionDelivery,
 	type LegionMessage,
@@ -64,6 +71,14 @@ import { upsertUsage } from "../legion/usage.ts";
 import { isExplicitPhaseTimeout } from "../agents/settings.ts";
 
 const POSTMAN_INTERVAL_MS = 2_000;
+
+/**
+ * How often a claimed delivery renews its lease while the send runs (#384 review M3).
+ * A third of the lease: two renewals may be missed (a stalled event loop) before the
+ * claim expires, and no send can outlive a fixed budget — `resumeChild` waits on the
+ * admission queue, whose default is 900s.
+ */
+const RENEW_CLAIM_EVERY_MS = Math.floor(MAIL_DELIVERY_CLAIM_LEASE_MS / 3);
 /** Upper bound on ACCEPTED mail one tick may confirm (#322 §3), so a big inbox cannot stall the loop. */
 const ACCEPTED_MAIL_CONFIRM_LIMIT = 20;
 const ORPHAN_SCAN_INTERVAL_MS = 60_000;
@@ -201,6 +216,12 @@ export class LegionPostman {
 
 	private async deliverChildren(children: readonly LegionNode[]): Promise<void> {
 		for (const child of children) {
+			// #384 review m6: an IN-PROCESS child that is blocked in its own
+			// `wait`/`collect` holds its inbox, and this postman runs in the same process —
+			// so it must stand aside exactly like the root one does (§1.1). A child on RPC
+			// lives in another process, where this registry is invisible: there the §3.1
+			// lease is what keeps the message from being delivered twice.
+			if (isMailHeld(child.id)) continue;
 			for (const message of pendingInbox(this.db, child.id)) {
 				if (this.discardIfStaleNotice(message)) continue;
 				await this.deliverToChild(child, message);
@@ -209,9 +230,19 @@ export class LegionPostman {
 	}
 
 	private async deliverRootInbox(): Promise<void> {
+		// #384 review round 3: a blocked `wait`/`collect` from this node owns its inbox.
+		// Delivering now would push the text into the host's followUp queue (measured:
+		// ~200ms after the write) and leave the tool's poll staring at an empty PENDING
+		// set for the whole wait — the mail would still arrive only at the turn boundary,
+		// which is the defect #384 exists to remove. The hold is released on every exit
+		// path of the blocking call, so a timed-out wait never parks the inbox.
+		if (isMailHeld(this.nodeId)) return;
 		for (const message of pendingInbox(this.db, "root")) {
 			if (this.discardIfStaleNotice(message)) continue;
 			try {
+				// #384 review: the send and the record are SYNCHRONOUS and must stay that
+				// way — an `await` between these two lines reopens the P0-1 duplicate
+				// window for the root, exactly as it did for children before the lease.
 				this.sendRootMessage(formatMail(message));
 				transitionDelivery(this.db, message.id, MAIL_DELIVERY.ACCEPTED, this.now);
 				this.emitMail(message.id, message.fromNode, "mail_sent");
@@ -332,57 +363,126 @@ export class LegionPostman {
 		}
 	}
 
+	/**
+	 * Hand one message to a child, exactly once (#384 review P0-1).
+	 *
+	 * The ORDER is the point: a delivery CLAIM is taken BEFORE the send call, because
+	 * the send is awaited and the recipient may be blocked in its own `wait`/`collect` —
+	 * which races for the same row and would take it in that window. The claim is the
+	 * lease on `delivered_at` ({@link claimForDelivery}), so the database is the
+	 * arbiter: the loser's conditional update changes no rows, it skips its own send,
+	 * and the child gets one copy.
+	 *
+	 * #322 still holds, unchanged: the row is still `PENDING` while it is in flight, and
+	 * `ACCEPTED` still means exactly "a send call answered" (including `queued`), never
+	 * "the child read it"; `DELIVERED` remains a separate, later fact. A send that never
+	 * answered hands its claim back ({@link releaseDeliveryClaim}) so the next mailbox
+	 * tick retries, which is precisely the pre-#384 behaviour. `intercepted` still
+	 * bounces with its own reason, and nothing here reaches for a new edge.
+	 */
 	private async deliverToChild(node: LegionNode, message: LegionMessage): Promise<void> {
-		// #322: `ACCEPTED` is written below as soon as a send call returns an answer —
-		// including `queued`, where the text waits for the child's next turn boundary
-		// (after its current tool batch) and a child stuck in a long tool never
-		// consumes it. It means "the send call returned", never "the child read it",
-		// and it does not promise a retry either: only a thrown send stays pending.
-		// `DELIVERED` is a separate, later fact with its own evidence. `intercepted`
-		// is NOT accepted: an input handler ate the text, so it bounces.
 		const current = getNode(this.db, node.id) ?? node;
 		const text = formatMail(message);
 		const wasAlive = this.supervisor.isAlive(current.name);
+		if (isTerminalNode(current)) {
+			transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now);
+			this.emitMail(message.id, message.fromNode, "mail_bounced");
+			return;
+		}
+		// The send plan is resolved BEFORE the claim: a route that cannot be built (no
+		// resumer for a dead child) must leave the message PENDING for a later tick, not
+		// claim it and then discover it has nobody to hand it to.
+		const send = this.deliveryFor(current, message, text, wasAlive);
+		if (!send) return;
+		// #384 review P0-1: take the LEASE before the send. The row stays `PENDING`
+		// (nothing terminal is written for a claim), but its `delivered_at` now says
+		// "claimed at", so every other route — the recipient's blocked `wait`, or another
+		// postman — runs the same conditional update, loses, and skips its own copy.
+		if (!claimForDelivery(this.db, message.id, this.now, MAIL_DELIVERY_CLAIM_LEASE_MS)) {
+			return;
+		}
+		// #384 review M3: renew while the send runs. A `resumeChild` send waits on the
+		// admission queue (default 900s), which no fixed lease can be sized for — so the
+		// holder keeps its claim alive every `leaseMs / 3` and the lease only expires for
+		// a holder that stopped breathing.
+		const renewal = setInterval(() => {
+			try {
+				renewDeliveryClaim(this.db, message.id, this.now, MAIL_DELIVERY_CLAIM_LEASE_MS);
+			} catch {
+				// A closed ledger cannot be renewed; the send's own outcome decides the row.
+			}
+		}, RENEW_CLAIM_EVERY_MS);
+		renewal.unref?.();
 		try {
-			if (isTerminalNode(current)) {
-				transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now);
+			const outcome = await send();
+			if (outcome === "intercepted") {
+				// The child never saw the text and there is no retry, so the ledger says
+				// so: the mail bounced, with a reason the sender can act on (#322).
+				// #338 minor 1: this is NOT a steer, so it does not emit `node_steered`
+				// (the bus signal for an injected steer) — the observable event is the
+				// `mail_bounced` below, carrying `reason: intercepted_by_input_handler`.
+				transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now, {
+					reason: MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER,
+				});
 				this.emitMail(message.id, message.fromNode, "mail_bounced");
+				// …and this `return` is why a swallowed send never reaches the unblock below (#323 3).
 				return;
 			}
-			if (!wasAlive) {
-				if (!this.resumeChild) return;
-				await this.resumeChild(current, { name: current.name, text });
-			} else if (current.status === "running" || current.status === "starting" || current.status === "blocked") {
-				if (message.urgency === "action-needed") {
-					const disposition = await this.supervisor.steer(current.name, text);
-					if (disposition === "intercepted") {
-						// The child never saw the text and there is no retry, so the ledger says
-						// so: the mail bounced, with a reason the sender can act on (#322).
-						// #338 minor 1: this is NOT a steer, so it does not emit `node_steered`
-						// (the bus signal for an injected steer) — the observable event is the
-						// `mail_bounced` below, carrying `reason: intercepted_by_input_handler`.
-						transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now, {
-							reason: MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER,
-						});
-						this.emitMail(message.id, message.fromNode, "mail_bounced");
-						// …and this `return` is why a swallowed send never reaches the unblock below (#323 3).
-						return;
-					}
-					this.emitProcess("node_steered", current.id, { name: current.name, messageId: message.id });
-				} else {
-					await this.supervisor.followUp(current.name, text);
-				}
-			} else {
-				// In-process backends cannot tell `queued` from `accepted`: `prompt` returns
-				// void, so ACCEPTED here is a backend capability limit, not an observation.
-				await this.supervisor.prompt(current.name, text);
-			}
 			if (wasAlive && message.urgency === "action-needed" && current.status === "blocked") updateNode(this.db, current.id, { status: "running" }, this.now);
+			// The lease did its job; the transition is what ends the story (and overwrites
+			// `delivered_at` with the real acceptance time).
 			transitionDelivery(this.db, message.id, MAIL_DELIVERY.ACCEPTED, this.now);
 			this.emitMail(message.id, message.fromNode, "mail_sent");
 		} catch {
-			// RPC failures leave delivered=0 so the next mailbox tick can retry.
+			// A transport failure is not a delivery verdict: hand the claim back so the
+			// next mailbox tick retries, exactly as before #384 (no bounce, no receipt, no
+			// new edge — the row never left `PENDING`).
+			releaseDeliveryClaim(this.db, message.id);
+		} finally {
+			clearInterval(renewal);
 		}
+	}
+
+	/**
+	 * How this node receives one message, or `undefined` when no route exists.
+	 *
+	 * `"intercepted"` is a returned outcome, not a throw: an input handler eating the
+	 * text is a *delivery* verdict with its own bounce reason, not a transport failure.
+	 */
+	private deliveryFor(
+		current: LegionNode,
+		message: LegionMessage,
+		text: string,
+		wasAlive: boolean,
+	): (() => Promise<"sent" | "intercepted">) | undefined {
+		if (!wasAlive) {
+			const resume = this.resumeChild;
+			if (!resume) return undefined;
+			return async () => {
+				await resume(current, { name: current.name, text });
+				return "sent";
+			};
+		}
+		if (current.status === "running" || current.status === "starting" || current.status === "blocked") {
+			if (message.urgency === "action-needed") {
+				return async () => {
+					const disposition = await this.supervisor.steer(current.name, text);
+					if (disposition === "intercepted") return "intercepted";
+					this.emitProcess("node_steered", current.id, { name: current.name, messageId: message.id });
+					return "sent";
+				};
+			}
+			return async () => {
+				await this.supervisor.followUp(current.name, text);
+				return "sent";
+			};
+		}
+		// In-process backends cannot tell `queued` from `accepted`: `prompt` returns
+		// void, so ACCEPTED here is a backend capability limit, not an observation.
+		return async () => {
+			await this.supervisor.prompt(current.name, text);
+			return "sent";
+		};
 	}
 
 	private async pollUsage(children: readonly LegionNode[]): Promise<void> {

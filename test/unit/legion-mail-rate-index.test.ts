@@ -22,8 +22,13 @@ import { insertNode } from "../../src/legion/nodes.ts";
 /**
  * The exact statement text `sendMail` prepares, kept in sync by
  * `sendMail rate-limit COUNT query keeps its index` below.
+ *
+ * #384 review m5 added the `Redelivered: ` exclusion: a platform re-delivery (a
+ * preempted tool result that was thrown away and re-queued) is not a new send and
+ * must not spend the sender's quota.
  */
-const RATE_LIMIT_COUNT_SQL = "SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ?";
+const RATE_LIMIT_COUNT_SQL =
+	"SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ? AND subject NOT LIKE 'Redelivered: %'";
 const RATE_LIMIT_COUNT_PREFIX = "SELECT COUNT(*) AS count FROM messages";
 const WINDOW_START = (now: number) => now - MAIL_RATE_WINDOW_MS;
 
@@ -89,9 +94,18 @@ test("mail rate-limit COUNT is served by idx_messages_rate, never a messages sca
 			/SEARCH messages USING (?:COVERING )?INDEX idx_messages_rate/,
 			`expected a SEARCH on idx_messages_rate, got: ${rendered}`,
 		);
-		// from_node and created_at both live in the index, so the scan-free plan
-		// must not need a row fetch either.
-		assert.match(rendered, /COVERING INDEX/, `the index should answer the COUNT without fetching rows, got: ${rendered}`);
+		// The plan must stay an index SEARCH over one sender's window — that bound is the
+		// guard's point (no table scan, no dependence on how long the squad has lived).
+		//
+		// NOT COVERING any more, on purpose (#384 review m5): the quota exclusion reads
+		// `subject`, which is not in `(from_node, created_at)`, so SQLite walks the same
+		// index range and fetches those rows. The range is one sender's five-minute
+		// window — bounded by the sender's own rate, never the table — and measured at
+		// 50k rows it costs 3.2us/call against 2.7us for the covering form. Buying that
+		// back would mean widening `idx_messages_rate`, which is a migration; the 0.5us
+		// is not worth one.
+		assert.doesNotMatch(rendered, /SCAN messages/, "the query must stay a bounded index range search");
+		assert.match(rendered, /SEARCH messages USING (?:COVERING )?INDEX idx_messages_rate/);
 	} finally {
 		db.close();
 	}

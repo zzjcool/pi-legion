@@ -285,8 +285,13 @@ export function sendMail(
 		: undefined;
 
 	return withTransaction(db, () => {
+		// #384 review m5: a platform re-delivery (`Redelivered: …`, written when a
+		// preemption result was thrown away) is not a new send and must not spend the
+		// sender's quota — the sender never chose to write it.
 		const recent = db
-			.prepare("SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ?")
+			.prepare(
+				"SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ? AND subject NOT LIKE 'Redelivered: %'",
+			)
 			.get(input.fromNode, timestamp - MAIL_RATE_WINDOW_MS);
 		const count = Number(recent?.count ?? 0);
 		if (count + resolution.recipients.length > rate) {
@@ -465,6 +470,112 @@ export function transitionDelivery(
 		}
 		return updated;
 	});
+}
+
+/**
+ * Claim a message for ONE delivery route, before that route sends it (#384 review P0-1).
+ *
+ * The postman used to send first and record `ACCEPTED` afterwards, which left the row
+ * `PENDING` for the whole awaited send call. A recipient blocked in its own
+ * `wait`/`collect` polls the same row (#384) and would take it inside that window, so
+ * the text reached the child twice: once as the postman's followUp and once as the
+ * tool result. The claim is a CONDITIONAL update, so the loser gets `false` and skips
+ * its own send: the ledger decides who delivers, not the ordering of two async sites.
+ *
+ * The claim is a LEASE, not a state change (#384 review, ruling: do not touch #322's
+ * legal edges). `delivered_at` — already nullable, already written by
+ * `transitionDelivery` — carries "claimed at" while the row is still `PENDING`:
+ *
+ *   - the row keeps `delivered = PENDING`, so a crash between claim and send is not a
+ *     terminal verdict nobody can undo; `releaseDeliveryClaim` hands it back at once,
+ *     and the lease length (`leaseMs`, owned by the postman/preemption side) bounds the
+ *     damage of a holder that died without saying anything;
+ *   - the state machine still ends the story: a returned send call writes `ACCEPTED`
+ *     (overwriting the lease with the real acceptance time), a swallowed send writes
+ *     `BOUNCED`, and nothing new is reachable;
+ *   - the winning route is the only one that may send, because every other candidate
+ *     runs the same conditional update and sees `changes === 0`.
+ *
+ * `leaseMs` must be longer than the slowest `supervisor.*` call this host performs: the
+ * lease exists for crash recovery only — the normal path is closed by the transition.
+ */
+export function claimForDelivery(
+	db: DatabaseSync,
+	messageId: number,
+	now: () => number,
+	leaseMs: number,
+): boolean {
+	if (!Number.isSafeInteger(messageId) || messageId < 1) {
+		throw new TypeError("message id must be a positive safe integer");
+	}
+	if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+		throw new TypeError("leaseMs must be a positive integer");
+	}
+	const timestamp = now();
+	if (!Number.isFinite(timestamp)) throw new TypeError("delivery clock must return a finite timestamp");
+	return withTransaction(db, () => {
+		const claim = db
+			.prepare(
+				"UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered = ? AND (delivered_at IS NULL OR delivered_at < ?)",
+			)
+			.run(timestamp, messageId, MAIL_DELIVERY.PENDING, timestamp - leaseMs);
+		return Number(claim.changes) === 1;
+	});
+}
+
+/**
+ * Extend a claim that is still ours (#384 review M3).
+ *
+ * The lease has to outlive the SLOWEST send, and one of them is not seconds: a
+ * `resumeChild` send waits on the admission queue, whose default is 900s. Rather than
+ * picking a lease per route (and guessing wrong again the next time a route appears),
+ * the holder renews while it works — `deliverToChild` runs this every `leaseMs / 3`
+ * until the send settles, so the lease is only ever short for a holder that stopped
+ * breathing (which is exactly what expiry is for).
+ *
+ * Conditional on the row still being `PENDING`: if the hold lapsed and someone else
+ * took it over, renewing is no longer ours to do.
+ */
+export function renewDeliveryClaim(
+	db: DatabaseSync,
+	messageId: number,
+	now: () => number,
+	leaseMs: number,
+): boolean {
+	if (!Number.isSafeInteger(messageId) || messageId < 1) {
+		throw new TypeError("message id must be a positive safe integer");
+	}
+	if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+		throw new TypeError("leaseMs must be a positive integer");
+	}
+	const timestamp = now();
+	if (!Number.isFinite(timestamp)) throw new TypeError("delivery clock must return a finite timestamp");
+	return withTransaction(db, () => {
+		const renewed = db
+			.prepare("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered = ?")
+			.run(timestamp, messageId, MAIL_DELIVERY.PENDING);
+		return Number(renewed.changes) === 1;
+	});
+}
+
+/**
+ * Hand a claim back without delivering: the send threw, so the message is exactly
+ * where it started — `PENDING`, unclaimed, retryable on the next tick (#384 review
+ * P0-1). No bounce is written: a transport failure is not a delivery verdict, and
+ * inventing a terminal state for it would need an edge `#322` does not have.
+ *
+ * Conditional on the row still being `PENDING`: if a racing transition already moved
+ * it, the claim is no longer ours to release. The `delivered` guard is the same one
+ * `transitionDelivery` uses, so the two can never interleave into a half-written row.
+ */
+export function releaseDeliveryClaim(db: DatabaseSync, messageId: number): void {
+	if (!Number.isSafeInteger(messageId) || messageId < 1) {
+		throw new TypeError("message id must be a positive safe integer");
+	}
+	db.prepare("UPDATE messages SET delivered_at = NULL WHERE id = ? AND delivered = ?").run(
+		messageId,
+		MAIL_DELIVERY.PENDING,
+	);
 }
 
 /**
