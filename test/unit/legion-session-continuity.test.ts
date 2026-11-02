@@ -567,6 +567,25 @@ test("#374 §3: session-shutdown PAUSES the team — retired, phase untouched, n
 	}
 });
 
+test("#380: the orchestrator writes its ledger row with NO event bus attached", async () => {
+	// The fourth #380 site: `this.legion.eventBus?.emit(appendEvent(...))` inside
+	// `emitStored`. A headless host has no bus, so every event the orchestrator wrote
+	// (retire, settle, failure) vanished from the ledger while the node rows moved on.
+	const fx = retireFixture();
+	try {
+		// The bus is optional on the context; a headless embedder simply never sets it.
+		fx.legion.eventBus = undefined;
+		await fx.seedRunRecord();
+		const orchestrator = fx.orchestrator(() => STINT_START + 60_000);
+		await orchestrator.retire("team");
+
+		const events = readEventsAfter(fx.db, 0, { nodeId: "root.team" });
+		assert.ok(events.some((event) => event.type === "node_retired"), "no subscriber must not mean no ledger fact");
+	} finally {
+		fx.cleanup();
+	}
+});
+
 test("#374 I4: a retire WITHOUT the session-shutdown cause still aborts the phase", async () => {
 	const fx = retireFixture();
 	try {

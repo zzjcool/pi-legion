@@ -114,7 +114,7 @@ function makeDb(options: { phase: string | null; phaseSince?: number; taskSummar
 	return db;
 }
 
-async function tick(db: Db, options: { machine?: PhaseMachine; now?: number; settings?: LegionSettings } = {}) {
+async function tick(db: Db, options: { machine?: PhaseMachine; now?: number; settings?: LegionSettings; headless?: boolean } = {}) {
 	const selfMessages: string[] = [];
 	const postman = new LegionPostman({
 		db,
@@ -125,7 +125,9 @@ async function tick(db: Db, options: { machine?: PhaseMachine; now?: number; set
 		now: () => options.now ?? NOW,
 		intervalMs: 10_000,
 		sendSelfMessage: (message) => selfMessages.push(message),
-		eventBus: createLegionEventBus(),
+		// #380: `headless` is a host with no event bus — `eventBus?.emit(appendEvent(...))`
+		// used to skip the append there, so the ledger lost the phase change.
+		...(options.headless ? {} : { eventBus: createLegionEventBus() }),
 	});
 	await postman.tick();
 	postman.stop();
@@ -162,6 +164,26 @@ test("#358: a declared machine's success phase finalizes the team (spec → impl
 		);
 		assert.equal(selfMessages.length, 1, "…and the team is told to collect, squash and report");
 		assert.match(selfMessages[0]!, /verification passed/iu);
+	} finally {
+		db.close();
+	}
+});
+
+test("#380: the phase change reaches the LEDGER even with no event bus attached", async () => {
+	// Three write sites used `eventBus?.emit(appendEvent(...))`. With no bus the
+	// argument is never evaluated: the node's `phase` column moves, the ledger does
+	// not. A headless host is exactly where nobody re-derives the transition from a
+	// stream, so the row and the history drifted apart silently.
+	const db = makeDb({ phase: "ship", taskSummary: verifiedSummary() });
+	try {
+		await tick(db, { machine: SPEC_MACHINE, headless: true });
+		assert.equal(getNode(db, "root.team")?.phase, "done", "the transition still happens");
+		const changes = phaseChanges(db);
+		assert.equal(changes.length, 1, "no subscriber must not mean no ledger fact");
+		assert.deepEqual(
+			{ ...(changes[0]!.data as { from: string; to: string }) },
+			{ from: "ship", to: "done", reworkCount: 0 },
+		);
 	} finally {
 		db.close();
 	}
