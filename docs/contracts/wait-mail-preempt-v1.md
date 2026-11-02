@@ -40,6 +40,26 @@
 - postman 只读 PENDING（`pendingInbox`），因此**不会重复投递**；这是本契约唯一的防重复机制，
   测试必须钉住「抢占之后 postman tick 一次，不再产生 followUp」。
 
+### §3.1 在途认领（租约）
+
+同一条消息可能被两条路同时拿：postman 的 `followUp/steer/prompt`（`deliverToChild`）与收件人自己
+被阻塞的 `wait`/`collect`（本契约 §1）。谁先投递必须是**数据库层互斥**，而不是两个 async 调用点的先后。
+
+实现用**租约**，不新增状态、不新增合法边：
+
+- `messages.delivered_at`（本就存在且可空）在 `delivered = PENDING` 期间复用为**认领时间**；
+- 认领 = 条件更新
+  `UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered = 0 AND (delivered_at IS NULL OR delivered_at < ?)`
+  （`?` 为 `now - leaseMs`），`changes === 0` ⇒ 别人持有，**跳过发送**；
+- 租约 **60s**（`MAIL_DELIVERY_CLAIM_LEASE_MS`，`src/legion/mail-release.ts`）：只用于**崩溃兜底**，
+  正常路径由状态机收尾——发送返回 ⇒ `transitionDelivery(…, ACCEPTED)`（顺带把 `delivered_at` 写成真正的接受时间）；
+  发送抛错 ⇒ `UPDATE … SET delivered_at = NULL WHERE delivered = 0`（放回 PENDING，下一 tick 重试，**不判 BOUNCED**）；
+- 认领者异常退出（进程消失、没机会释放）：租约过期后（`now > delivered_at + leaseMs`）即可被重新认领；
+- `delivered = PENDING` 的含义因此**不变**（仍是"还没交付"），`ACCEPTED` 之后 `delivered_at` 回归"接受时间"，
+  §3 的"恰好一次"依旧由 `PENDING → ACCEPTED` 单独保证。
+
+由此 `ACCEPTED` 不承担"在途"语义，#322 的五值域与四类合法边一条不改。
+
 ## §4 取消
 
 - `wait`：内部 `AbortController` 与调用方 `signal` 合并（`AbortSignal.any`），abort 原因可区分
