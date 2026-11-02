@@ -17,6 +17,13 @@ export interface Cell {
  * Consequence for readers: `get()` and `cells` are a **live view**, not a
  * snapshot. A cell object returned by `get()` is re-written in place by the next
  * `set()` on that coordinate, so hold the value (`cell.ch`), never the object.
+ *
+ * Consequence for writers (#369, contract §4): a cell's `color` may only change
+ * through `set()`. `roleCounts` is the table `roles()`/`toLines()` resolve the
+ * palette from, and only `set()` knows to decrement the role it replaced — a
+ * direct `cell.color = …` write leaves the old role counted forever, i.e. a ghost
+ * role that changes which token the roles still painted are assigned. Nothing in
+ * the tree writes `color` outside `set()`/`reset()` today; that has to stay true.
  */
 export class Canvas {
 	readonly width: number;
@@ -50,7 +57,11 @@ export class Canvas {
 		this.cells = cells;
 	}
 
-	/** Live cell at `(x, y)` — re-written in place by the next `set()`. Do not retain it. */
+	/**
+	 * Live cell at `(x, y)` — re-written in place by the next `set()`. Do not retain
+	 * it, and never write `color` through it: only `set()` keeps `roleCounts` (and
+	 * with it the palette) in step with the grid (contract §4).
+	 */
 	get(x: number, y: number): Cell | undefined {
 		return this.cells[y]?.[x];
 	}
