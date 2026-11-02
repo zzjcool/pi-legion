@@ -541,17 +541,26 @@ export class LegionPostman {
 	 * already irreversible — a team whose entire workforce failed has no work in
 	 * flight to resume, and `reviveChild` refuses a terminal node either way.
 	 *
-	 * Told ONCE: the phase path is de-duplicated by the terminal-phase guard; the
-	 * undeclared path by `hasEnded`, which the `status = failed` write itself makes
-	 * true — no new table, no marker of its own.
+	 * NEVER re-judge a team whose run is over (round-2 review, major). `hasEnded`
+	 * sits BEFORE the phase fork on purpose: an ended team is ended regardless of
+	 * which shape its ledger row has. Guarding only the undeclared branch left the
+	 * declared one exposed — a `settled` or `retired` team whose phase is still
+	 * `recon` was moved to `failed` anyway, which (a) turned `isTerminalNode` true
+	 * and so made a PAUSED team unresumable (`legion-session-continuity-v1.md` §3),
+	 * (b) mailed the parent a "Team failed" for a run that had already ended, and
+	 * (c) left `node_settled` and `phase_change(failed)` describing the same node.
+	 *
+	 * Told ONCE: both paths are de-duplicated by the same guard — the phase path by
+	 * the terminal phase this function writes, the undeclared path by
+	 * `status = failed` — no new table, no marker of its own.
 	 */
 	private failTeamIfAllChildrenFailed(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
-		if (!node) return;
+		if (!node || hasEnded(node)) return;
 		const phase = node.phase;
 		if (phase !== null) {
 			if (this.isTerminalPhaseOf(phase)) return;
-		} else if (node.role !== "centurion" || hasEnded(node)) return;
+		} else if (node.role !== "centurion") return;
 		const children = getChildren(this.db, node.id);
 		if (!children.length || children.some((child) => child.status !== "failed")) return;
 		if (phase !== null) {

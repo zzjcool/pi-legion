@@ -752,6 +752,67 @@ export function inlinePhaseMachineForNode(
 	return owner?.children.find((child) => child.nodeId === nodeId)?.phases;
 }
 
+/**
+ * #372 B/M1/m4: the `/legion` tree's inline-declaration lookup.
+ *
+ * A factory rather than an inline closure so the plumbing is testable without
+ * booting the extension: the run lookup, the clock and the cwd are all injected.
+ * The review found the previous closure had NO test coverage at all — dropping the
+ * `parentRunId` argument or keying the cache by `node.id` alone kept every test
+ * green while the panel leaked another run's declaration.
+ *
+ * Three properties, each load-bearing:
+ *
+ *  - **run-scoped cache keys** `(parentRunId, node.id)`. `node.id` repeats in
+ *    every run of a checkout (`root.team`), so an id-only key serves one run's
+ *    answer for another run's node — and, once cached, for the rest of the
+ *    process (#372 M1).
+ *  - **misses are cached, briefly.** A miss is a real answer ("this team declared
+ *    nothing") and without caching it every repaint paid a runs-registry read per
+ *    undeclared team (#372 m4). `MISS_TTL_MS` bounds both that cost and the one
+ *    race the cache can lose: the node row exists a moment before `persistChild`
+ *    writes the record, and the TTL is the same 1s the store itself uses for a
+ *    foreign in-place `run.json` rewrite, so a miss observed in that window heals
+ *    by itself instead of freezing until restart.
+ *  - **the dispatching run is passed through** to `inlinePhaseMachineForNode`,
+ *    which is the only thing that can pick the right record (#372 M1).
+ */
+export function createInlineMachineLookup(input: {
+	/** This process's cwd, read at call time (it changes with the session). */
+	cwd: () => string | undefined;
+	/** The store for a checkout — injected so a test can count registry reads. */
+	runStoreFor: (cwd: string) => Pick<RunStore, "listRuns">;
+	now?: () => number;
+}): (node: { id: string; role: string | null; parentRunId: string | null }) => PhaseMachine | undefined {
+	const positives = new Map<string, PhaseMachine>();
+	const misses = new Map<string, number>();
+	const now = input.now ?? Date.now;
+	const MISS_TTL_MS = 1_000;
+	return (node) => {
+		const key = `${node.parentRunId ?? "-"}\u0000${node.id}`;
+		const hit = positives.get(key);
+		if (hit) return hit;
+		const nowMs = now();
+		const missUntil = misses.get(key);
+		if (missUntil !== undefined && nowMs < missUntil) return undefined;
+		const cwd = input.cwd();
+		if (!cwd) return undefined;
+		let machine: PhaseMachine | undefined;
+		try {
+			machine = inlinePhaseMachineForNode(node.id, input.runStoreFor(cwd).listRuns(), node.parentRunId);
+		} catch {
+			// The panel must never break on an unreadable runs directory; the role
+			// lookup still runs, so a card-declared team keeps rendering.
+			machine = undefined;
+		}
+		if (machine) {
+			positives.set(key, machine);
+			misses.delete(key);
+		} else misses.set(key, nowMs + MISS_TTL_MS);
+		return machine;
+	};
+}
+
 function createLegionRuntime(input: {
 	pi: ExtensionAPI;
 	supervisor: LegionSupervisor;
@@ -1717,47 +1778,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// DISPATCHED with (`subagent({ phases })`, #371 §2). That declaration has no
 		// card to look up, so it is answered per NODE from the dispatching run's
 		// run.json — the one source that survives a reload, a later process and a
-		// reopened session.
-		//
-		// #372 M1: the cache key carries the DISPATCH RUN, because `node.id` alone
-		// repeats across runs (`root.team` exists in every one of them). Keyed by id
-		// alone, one run's answer would be served for another run's node — and once
-		// cached, for the rest of the process.
-		//
-		// #372 m4: misses are cached too, but only for a moment. Without that, every
-		// repaint paid a runs-registry read for every UNDECLARED team. The TTL is the
-		// same 1s the store itself uses as the bound on an in-place `run.json` rewrite
-		// by another process (`LIST_RUNS_CACHE_TTL_MS`), and it is also the ceiling on
-		// the one race this cache can lose: the node row exists a moment before
-		// `persistChild` writes the record, so a miss observed in that window clears
-		// itself within the TTL instead of freezing until restart.
-		getPhaseMachineForNode: (() => {
-			const positives = new Map<string, PhaseMachine>();
-			const MISS_TTL_MS = 1_000;
-			const misses = new Map<string, number>();
-			return (node) => {
-				const key = `${node.parentRunId ?? "-"}\u0000${node.id}`;
-				const hit = positives.get(key);
-				if (hit) return hit;
-				const nowMs = Date.now();
-				const missUntil = misses.get(key);
-				if (missUntil !== undefined && nowMs < missUntil) return undefined;
-				if (!lastCwd) return undefined;
-				let machine: PhaseMachine | undefined;
-				try {
-					machine = inlinePhaseMachineForNode(node.id, runStoreFor(lastCwd).listRuns(), node.parentRunId);
-				} catch {
-					// The panel must never break on an unreadable runs directory; the role
-					// lookup above still runs, so a card-declared team keeps rendering.
-					machine = undefined;
-				}
-				if (machine) {
-					positives.set(key, machine);
-					misses.delete(key);
-				} else misses.set(key, nowMs + MISS_TTL_MS);
-				return machine;
-			};
-		})(),
+		// reopened session. The caching and the run plumbing live in the factory so
+		// they can be tested without booting the extension (#372 review, minor 1).
+		getPhaseMachineForNode: createInlineMachineLookup({ cwd: () => lastCwd, runStoreFor }),
 		getTreeIdentity: (name) => {
 			const own = ownLegionIdentity();
 			const node = own && getChildByName(own.db, own.nodeId, name);
