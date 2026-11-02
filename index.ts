@@ -2283,9 +2283,21 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	pi.on("turn_start", (event, ctx) => {
 		bindUi(event, ctx);
 	});
-	pi.on("turn_end", (event, ctx) => {
-		bindUi(event, ctx);
-	});
+	// Deliberately NOT `pi.on("turn_end", ...)`.
+	//
+	// The host's turn-end boundary (`_dispatchTurnEndBoundary`) only exists to feed
+	// `turn_end` handlers, and it is also where it emits "turn_end could not resolve
+	// the persisted assistant entry ID" — a message it can only produce when
+	// `hasHandlers("turn_end")` is true, because the gate is checked before the
+	// missing-entry case. A turn that ends after `dispose()` aborted it (session
+	// exit with a wake turn in flight, `notice()`'s `triggerTurn`) is exactly that
+	// case, and no amount of care on our side persists that message.
+	//
+	// Registering `turn_end` bought us one extra `bindUi`, and `bindUi` already runs
+	// on turn_start, agent_start, agent_end, agent_settled, input, tool_result and
+	// session_info_changed — the next event re-binds the current ctx anyway. Dropping
+	// it removes the host's only reason to run the boundary, so the line is never
+	// printed. If someone needs a turn-scoped refresh later, use `turn_start`.
 	pi.on("agent_start", (event, ctx) => {
 		runtime.notifyParentRunStart();
 		bindUi(event, ctx);

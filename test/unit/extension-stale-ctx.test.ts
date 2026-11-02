@@ -72,6 +72,8 @@ function harness() {
 	};
 	piLegion(pi as never, { supervisor });
 
+	const registered = (): string[] => [...handlers.keys()].sort();
+
 	const dispatch = async (name: string, ctx: unknown): Promise<void> => {
 		for (const handler of handlers.get(name) ?? []) await handler({ type: name }, ctx);
 	};
@@ -96,6 +98,7 @@ function harness() {
 				},
 			),
 		dispatch,
+		registered,
 		cleanup: () => {
 			for (const [name, value] of previousEnv) {
 				if (value === undefined) delete process.env[name];
@@ -111,12 +114,29 @@ test("#377: a stale ctx at turn_end/agent_settled is treated as 'no UI', not as 
 	try {
 		// Both events the host dispatches after invalidate. Neither may throw: the
 		// host would print an "Extension error (/plugin/index.ts)" line at every exit.
-		await h.dispatch("turn_end", h.staleCtx());
 		await h.dispatch("agent_settled", h.staleCtx());
 		await h.dispatch("turn_start", h.staleCtx());
 
 		// …and a live ctx still binds afterwards: the guard must not latch.
 		await h.dispatch("turn_start", h.baseCtx());
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#383: `turn_end` is NOT registered — that is the host's only reason to run the failing boundary", async () => {
+	// `_dispatchTurnEndBoundary` (host) gates its "could not resolve the persisted
+	// assistant entry ID" error on `hasHandlers("turn_end")`. The handler we used to
+	// register did nothing but call `bindUi`, which is already wired to turn_start /
+	// agent_start / agent_end / agent_settled / input / tool_result, so the
+	// registration cost us an error line at every exit that aborted a wake turn and
+	// bought nothing. This test is the guard against re-adding it "for symmetry".
+	const h = harness();
+	try {
+		const names = h.registered();
+		assert.ok(!names.includes("turn_end"), "registering it makes the host emit the boundary error again");
+		assert.ok(names.includes("turn_start"), "the UI binding still happens on the turn boundary we do handle");
+		assert.ok(names.includes("agent_settled"));
 	} finally {
 		h.cleanup();
 	}

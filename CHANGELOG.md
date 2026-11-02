@@ -13,6 +13,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **退出会话时不再出现 `Extension error (<boundary>): turn_end could not resolve the persisted
+  assistant entry ID` (#383)。** 这是 pi 宿主在 `turn_end` 边界上的既有缺陷（`dispose()` 之后仍会收尾一个
+  被 abort 的 turn，message 没落盘），扩展这边唯一能做的是**不去触发那个边界**：宿主只在
+  `hasHandlers("turn_end")` 为真时才走这条路径。我们注册的 `turn_end` 只做一次 `bindUi`，而 `bindUi` 已经挂在
+  `turn_start`/`agent_start`/`agent_end`/`agent_settled`/`input`/`tool_result` 上，于是直接不注册——宿主连报错
+  分支都进不去，UI 行为不变。
 - **没有事件总线时账本不再漏记事件 (#380)。** 四处写成 `eventBus?.emit(appendEvent(...))`：可选链在没有
   订阅者时会把 `appendEvent(...)` 的参数一起短路，于是 headless 宿主（不传 eventBus 的嵌入方）里相位迁移
   只改了 `nodes.phase`、账本里一条 `phase_change` 都没有，重开账本时历史与真实状态不一致。改成「先写账本、
