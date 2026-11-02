@@ -161,15 +161,32 @@ test("settled nodes can resume through mail; terminal recipients bounce with rec
 		assert.equal(injected.delivered, MAIL_DELIVERY.INJECTED);
 		assert.equal(injected.deliveredAt, 60);
 		assert.equal(transitionDelivery(db, injected.id, MAIL_DELIVERY.INJECTED).id, injected.id);
-		assert.throws(() => transitionDelivery(db, injected.id, MAIL_DELIVERY.BOUNCED), /cannot transition/);
+		// #384 review P0-1: `ACCEPTED → BOUNCED` is legal now, because a delivery route
+		// CLAIMS the message before its send — a send that never happened has to be
+		// expressible as a bounce. A post-acceptance bounce still writes no receipt
+		// (only the `PENDING` edge does; `bounceUndeliveredMail` owes its own).
+		assert.equal(
+			transitionDelivery(db, injected.id, MAIL_DELIVERY.BOUNCED, () => 61).delivered,
+			MAIL_DELIVERY.BOUNCED,
+		);
+		// …and BOUNCED itself is still terminal: the edge was added, not a free-for-all.
+		assert.throws(() => transitionDelivery(db, injected.id, MAIL_DELIVERY.ACCEPTED), /cannot transition/);
 		const second = sendMail(db, { fromNode: "root.team-a", to: "alice", subject: "again", body: "body" }, { now: () => 100 });
 		assert.equal(second.ok, true);
 		if (!second.ok) return;
 		updateNode(db, "root.team-a.alice", { status: "failed" });
 		const bounced = transitionDelivery(db, second.messages[0]!.id, MAIL_DELIVERY.INJECTED, () => 110);
 		assert.equal(bounced.delivered, MAIL_DELIVERY.BOUNCED);
-		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.BOUNCED }).length, 1);
-		assert.equal(inbox(db, "root.team-a", { delivery: MAIL_DELIVERY.PENDING }).length, 1);
+		assert.equal(
+			inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.BOUNCED }).length,
+			2,
+			"the claim bounce above plus this terminal-recipient bounce",
+		);
+		assert.equal(
+			inbox(db, "root.team-a", { delivery: MAIL_DELIVERY.PENDING }).length,
+			1,
+			"only the PENDING → BOUNCED edge owes a receipt; the claim bounce above wrote none",
+		);
 	} finally {
 		db.close();
 	}
@@ -192,8 +209,20 @@ test("delivery states form a five-value domain with the frozen legal edges (#322
 		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
 		// ACCEPTED writes no event of its own: `mail_sent` already recorded the send.
 		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_delivered" || event.type === "mail_bounced").length, 0);
-		// …and it is terminal for the send path: a bounce here would rewrite history.
-		assert.throws(() => transitionDelivery(db, acceptedId, MAIL_DELIVERY.BOUNCED), /cannot transition from 1 to 2/);
+		// #384 review P0-1 moves exactly ONE edge: the delivery claim now precedes its
+		// send (`claimForDelivery`), so the send-side failure ("the text never left")
+		// must be expressible from ACCEPTED. Everything else stays terminal — DELIVERED
+		// and OBSOLETE are still the only ways out of ACCEPTED below, and the receipt
+		// rule is unchanged (a post-acceptance bounce still writes none).
+		const third = sendMail(db, { fromNode: "root.team-a", to: "alice", subject: "u", body: "d" }, { now: () => 12 });
+		assert.equal(third.ok, true);
+		if (!third.ok) return;
+		const claimedId = third.messages[0]!.id;
+		transitionDelivery(db, claimedId, MAIL_DELIVERY.ACCEPTED, () => 21);
+		const claimedBounce = transitionDelivery(db, claimedId, MAIL_DELIVERY.BOUNCED, () => 22);
+		assert.equal(claimedBounce.delivered, MAIL_DELIVERY.BOUNCED);
+		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.BOUNCED }).length, 1);
+		assert.equal(inbox(db, "root.team-a", { delivery: MAIL_DELIVERY.PENDING }).length, 0, "a bounce from ACCEPTED owes no receipt");
 
 		transitionDelivery(db, acceptedId, MAIL_DELIVERY.DELIVERED, () => 30);
 		assert.equal(inbox(db, "root.team-a.alice", { delivery: MAIL_DELIVERY.DELIVERED }).length, 1);
@@ -206,12 +235,23 @@ test("delivery states form a five-value domain with the frozen legal edges (#322
 		// A queued message can lose its meaning before anyone hands it over (#333).
 		transitionDelivery(db, bouncedId, MAIL_DELIVERY.OBSOLETE, () => 40);
 		const bouncedEvents = readEventsAfter(db, 0).filter((event) => event.type === "mail_bounced");
-		assert.equal(bouncedEvents.length, 1);
-		assert.deepEqual(bouncedEvents[0]!.data, {
+		assert.equal(bouncedEvents.length, 2, "the #384 claim bounce above and this obsolete verdict");
+		const obsoleteEvent = bouncedEvents.find(
+			(event) => (event.data as { messageId?: number }).messageId === bouncedId,
+		);
+		assert.deepEqual(obsoleteEvent?.data, {
 			messageId: bouncedId,
 			toNode: "root.team-a.alice",
 			reason: "obsolete_after_phase_change",
 		}, "obsolete reuses mail_bounced with its own reason instead of adding an event type");
+		const claimEvent = bouncedEvents.find(
+			(event) => (event.data as { messageId?: number }).messageId === claimedId,
+		);
+		assert.deepEqual(
+			(claimEvent?.data as { reason?: string } | undefined)?.reason,
+			undefined,
+			"a bounce with no reason given invents none",
+		);
 	} finally {
 		db.close();
 	}

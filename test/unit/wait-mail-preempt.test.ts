@@ -7,7 +7,7 @@
  * taken at a turn boundary, so mail written while the root sat in a long `wait`
  * waited with it (measured 17.3 minutes, contract §0).
  *
- * What this file pins, one test per contract clause:
+ * What this file pins, one test per contract clause and per review finding:
  *
  *   - §2/I2 — `wait` with a live child returns the mail within a second, the mail
  *     envelope is the postman's own (`formatMail`), `details.state === "mail"`, the
@@ -18,16 +18,29 @@
  *     byte-identical to the same call made without the seam at all;
  *   - I5 — a caller abort (Esc / parent turn end) still answers the frozen
  *     `interrupted …` line and takes nothing out of the ledger, whether the signal
- *     was already aborted at entry or landed mid-wait.
+ *     was already aborted at entry or ended the call before the poll saw the mail.
+ *
+ * Review rework (2026-xx, all on this branch) adds the regressions that review
+ * found missing, each named after its finding:
+ *
+ *   - P0-1 — the postman claims the ledger row BEFORE it sends, so a child blocked
+ *     in its own `wait` cannot take the same row and receive two copies;
+ *   - P0-2 — `wait(all:true)` with a settled child keeps that child's result, states
+ *     `Still running: <name>` once, and never claims the PARENT turn ended;
+ *   - P0-3 — a mail result the tool layer's abort net throws away is re-delivered;
+ *   - P1.1/P1.2/P1.3 — the postman-won fallback keeps the collected result, an
+ *     unknown child is still an error even with mail waiting, and a message the
+ *     ledger bounces is not handed out as taken;
+ *   - P1 gap — the 250ms poll timer never outlives the call.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 
-import { collectChild, waitAction } from "../../index.ts";
+import { collectChild, interruptedControlResult, waitAction } from "../../index.ts";
 import {
 	createSessionRuntime,
 	type CollectSnapshot,
@@ -35,16 +48,19 @@ import {
 } from "../../src/extension/runtime.ts";
 import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { RunStore } from "../../src/runs/store.ts";
-import { openLegionDb } from "../../src/legion/db.ts";
+import { openLegionDb, type DatabaseSync } from "../../src/legion/db.ts";
 import { MAIL_DELIVERY, inbox, pendingInbox, sendMail } from "../../src/legion/mail.ts";
-import { insertNode } from "../../src/legion/nodes.ts";
+import { takePendingMail } from "../../src/legion/mail-release.ts";
+import { getNode, insertNode, updateNode, type LegionNode } from "../../src/legion/nodes.ts";
+import type { OrchestratorLegionContext } from "../../src/runs/orchestrator.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 /** Wall-clock bound for every fixture wait: nothing here may hang the suite. */
 const BOUND_MS = 5_000;
-/** The child this file controls; the run it belongs to is irrelevant to the seam. */
+/** The children this file controls; the run they belong to is irrelevant to the seam. */
 const CHILD = "live";
+const SETTLING = "fast";
 const RUN = "r-1";
 
 const INTERRUPTED_REPLY = "interrupted (parent turn ended; children still running)";
@@ -73,8 +89,30 @@ function within<T>(work: Promise<T>, label: string, boundMs = BOUND_MS): Promise
 	});
 }
 
+/** Bounded pump over a real observable — never a sleep used as synchronisation. */
+async function until(pred: () => boolean, label: string, boundMs = BOUND_MS): Promise<void> {
+	const deadline = Date.now() + boundMs;
+	while (!pred()) {
+		if (Date.now() > deadline) {
+			throw new Error(`bounded fixture pump expired (${boundMs}ms): ${label}`);
+		}
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	}
+}
+
+/** A full role card: `FakeSupervisor.spawnChild` refuses anything without `kind: "pi"`. */
 function agent(name: string): AgentConfig {
-	return { name, description: `${name} role`, source: "user" } as AgentConfig;
+	return {
+		name,
+		description: `${name} role`,
+		systemPromptMode: "append",
+		inheritProjectContext: true,
+		inheritSkills: false,
+		kind: "pi",
+		systemPrompt: `You are ${name}.`,
+		source: "user",
+		filePath: `/fake/${name}.md`,
+	} as AgentConfig;
 }
 
 function terminalSnapshot(output: string): CollectSnapshot {
@@ -86,13 +124,13 @@ function terminalSnapshot(output: string): CollectSnapshot {
 }
 
 /** A tracked child whose collect never resolves — the wait/collect is blocked. */
-function blockedRuntime(): SessionRuntime {
+function blockedRuntime(name = CHILD): SessionRuntime {
 	const runtime = createSessionRuntime({ sendMessage() {} });
 	runtime.track({
-		name: CHILD,
+		name,
 		runId: RUN,
 		agent: "worker",
-		sessionFile: `/tmp/${CHILD}.jsonl`,
+		sessionFile: `/tmp/${name}.jsonl`,
 		timeoutMs: 60_000,
 		collect: () => new Promise<CollectSnapshot>(() => {}),
 	});
@@ -126,25 +164,27 @@ function tempStore(): { store: RunStore; cwd: string; dispose: () => void } {
  * `root` with one child, so `root.team → parent` is a legal route and the ledger's
  * delivery transitions see a live (non-terminal) recipient.
  */
-function mailLedger(): ReturnType<typeof openLegionDb> {
+function mailLedger(): DatabaseSync {
 	const db = openLegionDb(":memory:");
 	insertNode(db, { parentId: null, name: "root", role: "root", status: "running" });
 	insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running" });
 	return db;
 }
 
-function mailFromChild(
-	db: ReturnType<typeof openLegionDb>,
-	subject: string,
-	body: string,
+function mailFromChild(db: DatabaseSync, subject: string, body: string, to = "parent"): number {
+	return fixtureMail(db, { from: "root.team", to, subject, body });
+}
+
+function fixtureMail(
+	db: DatabaseSync,
+	input: { from: string; to: string; subject: string; body: string },
 ): number {
 	const sent = sendMail(
 		db,
-		{ fromNode: "root.team", to: "parent", subject, body },
+		{ fromNode: input.from, to: input.to, subject: input.subject, body: input.body },
 		{ now: () => Date.now() },
 	);
-	assert.equal(sent.ok, true, "fixture mail must be accepted");
-	if (!sent.ok) throw new Error("fixture mail was refused");
+	if (!sent.ok) throw new Error(`fixture mail was refused: ${sent.message}`);
 	return sent.messages[0]!.id;
 }
 
@@ -152,10 +192,10 @@ function mailFromChild(
  * Run one postman tick on `root` and report what it would have injected.
  *
  * This is the I2 probe: the preemption's `PENDING → ACCEPTED` is the ONLY
- * anti-duplicate mechanism the contract allows, so the tick after a release has to
+ * anti-duplicate mechanism on the root side, so the tick after a release has to
  * come up empty.
  */
-async function postmanTick(db: ReturnType<typeof openLegionDb>): Promise<string[]> {
+async function postmanTick(db: DatabaseSync): Promise<string[]> {
 	const injected: string[] = [];
 	const postman = new LegionPostman({
 		db,
@@ -234,15 +274,20 @@ test("wait hands over mail written while it is blocked (§2, I2)", async () => {
 		assert.match(body, /\[legion mail #\d+\]/, "the mail envelope is the postman's own");
 		assert.match(body, /Subject: contract frozen/);
 		assert.match(body, /the frozen body of the mail/);
-		assert.match(body, /Children are still running: live \(working\)/);
+		// Review P0-2: the still-running fact is stated plainly and ONCE — no
+		// `interrupted (parent turn ended …)`, because the parent turn is alive.
+		assert.match(body, /Still running: live/);
+		assert.doesNotMatch(body, /parent turn ended/);
 		const details = result.details as {
 			state?: string;
 			mailIds?: number[];
 			targets?: string[];
+			waitClaims?: unknown[];
 		};
 		assert.equal(details.state, "mail");
 		assert.deepEqual(details.mailIds, [mailId]);
 		assert.deepEqual(details.targets, [CHILD]);
+		assert.deepEqual(details.waitClaims, [], "the claim record is still mounted (#352)");
 		// I2: taken exactly once, by the one write the contract allows.
 		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
 		assert.equal(pendingInbox(db, "root").length, 0);
@@ -413,16 +458,21 @@ test("a caller abort at entry still answers `interrupted …` and takes no mail 
 	}
 });
 
-test("a mid-wait caller abort wins over mail that lands after it (I5)", async () => {
+test("mail written before the abort still loses to the abort that ends the call (I5)", async () => {
 	const db = mailLedger();
 	const { store, cwd, dispose } = tempStore();
 	const runtime = blockedRuntime();
-	const controller = new AbortController();
-	const abortAt = setTimeout(() => controller.abort(), 50);
-	// Mail arrives well after the abort, and is always awaited before `db.close()`.
-	const arriving = new Promise<number>((resolve) => {
-		setTimeout(() => resolve(mailFromChild(db, "too late", "written after the abort")), 400);
+	// Review gap 4: the mail exists BEFORE the abort — the old fixture wrote it 350ms
+	// after the wait had already answered, so it pinned nothing. Now both are live
+	// when the call ends, and the winner is whoever ENDS the call: the abort (60ms)
+	// beats the first poll tick (250ms), so the frozen line stands and the mail stays
+	// queued for the postman instead of being consumed by a call that returned
+	// `interrupted …`.
+	const mailed = new Promise<number>((resolve) => {
+		setTimeout(() => resolve(mailFromChild(db, "too late", "written before the abort")), 50);
 	});
+	const controller = new AbortController();
+	const abortAt = setTimeout(() => controller.abort(), 60);
 	try {
 		const result = await within(
 			waitAction({
@@ -436,18 +486,429 @@ test("a mid-wait caller abort wins over mail that lands after it (I5)", async ()
 			}),
 			"mid-wait abort",
 		);
-		const mailId = await arriving;
+		const mailId = await mailed;
 		assert.match(textOf(result), /interrupted \(parent turn ended; children still running\)/);
 		assert.equal((result.details as { state?: string }).state, undefined);
-		// Mail that lands after the caller's abort stays for the postman.
+		// Written first, but never consumed: the postman still owns it.
 		assert.deepEqual(
 			pendingInbox(db, "root").map((message) => message.id),
 			[mailId],
 		);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
 	} finally {
 		clearTimeout(abortAt);
-		await arriving.catch(() => 0);
+		await mailed.catch(() => 0);
 		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+test("wait(all:true) keeps the settled result and never blames the parent turn (P0-2)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	const runtime = createSessionRuntime({ sendMessage() {} });
+	// `fast` settles 120ms in (so the wait HAS a result to carry), `slow` never does.
+	runtime.track({
+		name: SETTLING,
+		runId: RUN,
+		agent: "worker",
+		sessionFile: `/${SETTLING}.jsonl`,
+		timeoutMs: 60_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				setTimeout(() => resolve(terminalSnapshot("fast-own-output")), 120);
+			}),
+	});
+	runtime.track({
+		name: CHILD,
+		runId: RUN,
+		agent: "worker",
+		sessionFile: `/${CHILD}.jsonl`,
+		timeoutMs: 60_000,
+		collect: () => new Promise<CollectSnapshot>(() => {}),
+	});
+	const send = setTimeout(() => {
+		mailFromChild(db, "all-true preempt", "the body for the all:true wait");
+	}, 200);
+	try {
+		const result = await within(
+			waitAction({
+				params: { action: "wait", all: true, timeoutMs: 60_000 },
+				runtime,
+				agents: [agent("worker")],
+				store,
+				cwd,
+				mail: { db, nodeId: "root" },
+			}),
+			"all:true preempted by mail",
+			2_000,
+		);
+		const body = textOf(result);
+		assert.match(body, /Subject: all-true preempt/);
+		assert.match(body, /the body for the all:true wait/);
+		// The result this wait DID collect rides along, verbatim.
+		assert.match(body, /fast-own-output/);
+		assert.match(body, /Still running: live/);
+		// The review finding: no invented conclusion about the parent's turn.
+		assert.doesNotMatch(body, /parent turn ended/);
+		assert.doesNotMatch(body, /interrupted/);
+		const details = result.details as { state?: string; targets?: string[] };
+		assert.equal(details.state, "mail");
+		assert.deepEqual([...(details.targets ?? [])].sort(), [CHILD, SETTLING].sort());
+	} finally {
+		clearTimeout(send);
+		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+/**
+ * The postman, with the one seam review P0-1 needs: a `followUp` that parks until
+ * the test releases it. `deliverToChild` awaits that call, so parking inside it is
+ * exactly the window a blocked child's own `wait` could take the same row in.
+ */
+class GatedFollowUpSupervisor extends FakeSupervisor {
+	readonly handed: string[] = [];
+	private release?: () => void;
+	private announce?: () => void;
+	/** Resolves once the postman is parked INSIDE the send call. */
+	readonly parked: Promise<void> = new Promise<void>((resolve) => {
+		this.announce = resolve;
+	});
+
+	override async followUp(name: string, text: string): Promise<void> {
+		this.handed.push(text);
+		this.announce?.();
+		await new Promise<void>((resolve) => {
+			this.release = resolve;
+		});
+		return super.followUp(name, text);
+	}
+
+	free(): void {
+		const release = this.release;
+		this.release = undefined;
+		release?.();
+	}
+}
+
+test("the postman and a blocked child can never both deliver the same mail (P0-1)", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "mail-preempt-postman-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new GatedFollowUpSupervisor();
+	const sessionFile = path.join(rootDir, "team.jsonl");
+	mkdirSync(rootDir, { recursive: true });
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const child: LegionNode = insertNode(
+			db,
+			{ parentId: "root", name: "team", role: "centurion", status: "running", sessionFile },
+			() => 2,
+		);
+		await supervisor.spawnChild({
+			name: child.name,
+			task: "blocked in its own wait",
+			agent: agent("centurion"),
+			sessionFile,
+			tempDir: rootDir,
+			cwd: rootDir,
+		});
+		const messageId = fixtureMail(db, {
+			from: "root",
+			to: "team",
+			subject: "one copy only",
+			body: "the body that must not double",
+		});
+		const postman = new LegionPostman({
+			db,
+			nodeId: "root",
+			supervisor,
+			now: () => Date.now(),
+			intervalMs: 10_000,
+		});
+		const tick = postman.tick();
+		try {
+			await within(supervisor.parked, "the postman is parked inside its send call");
+			// The send is in flight. Review P0-1: the ledger must ALREADY say so, or the
+			// child's own preemption sees `PENDING` and hands over a second copy.
+			assert.equal(
+				getNode(db, child.id)?.status,
+				"running",
+				"fixture: the child is live during the delivery",
+			);
+			assert.equal(
+				inbox(db, child.id, { delivery: MAIL_DELIVERY.PENDING }).length,
+				0,
+				"the row is claimed BEFORE the send, so no second route may take it",
+			);
+			assert.deepEqual(
+				takePendingMail(db, child.id),
+				[],
+				"the child's own blocked wait finds nothing to take",
+			);
+		} finally {
+			supervisor.free();
+			await within(tick, "the postman tick finished");
+			postman.stop();
+		}
+		// Exactly one copy reached the child, and the ledger backs that up.
+		assert.equal(supervisor.handed.length, 1, "one send call, one copy");
+		assert.match(supervisor.handed[0]!, /Subject: one copy only/);
+		assert.equal(inbox(db, child.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+		assert.ok(messageId > 0);
+	} finally {
+		rmSync(rootDir, { recursive: true, force: true });
+		db.close();
+	}
+});
+
+test("a discarded mail result is re-delivered instead of lost (P0-3)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	const runtime = blockedRuntime();
+	const send = setTimeout(() => {
+		mailFromChild(db, "abort-net victim", "the body the model never read");
+	}, 100);
+	try {
+		const preempted = await within(
+			waitAction({
+				params: { action: "wait", name: CHILD, timeoutMs: 60_000 },
+				runtime,
+				agents: [agent("worker")],
+				store,
+				cwd,
+				mail: { db, nodeId: "root" },
+			}),
+			"wait preempted by mail",
+			1_000,
+		);
+		assert.equal((preempted.details as { state?: string }).state, "mail");
+		// The tool layer's abort net: the caller aborted after the call returned, so the
+		// rendered result (and the mail text in it) is replaced by the frozen line.
+		const replaced = await interruptedControlResult({
+			result: preempted,
+			runtime,
+			legion: { db, nodeId: "root" } as unknown as OrchestratorLegionContext,
+		});
+		assert.equal(
+			textOf(replaced),
+			INTERRUPTED_REPLY,
+			"the frozen line still replaces the rendered result",
+		);
+		// …and the mail that result had taken is back in the queue, as a fresh copy.
+		const requeued = pendingInbox(db, "root");
+		assert.equal(requeued.length, 1, "the discarded mail is PENDING again");
+		assert.match(requeued[0]!.subject, /^Redelivered: abort-net victim$/);
+		assert.match(requeued[0]!.body, /the body the model never read/, "body carried over verbatim");
+		assert.equal(requeued[0]!.fromNode, "root.team");
+		assert.equal(requeued[0]!.toNode, "root");
+		// …and the postman delivers it on the next tick, exactly once.
+		const injected = await postmanTick(db);
+		assert.equal(injected.length, 1, "the redelivered mail reaches the parent");
+		assert.match(injected[0]!, /Subject: Redelivered: abort-net victim/);
+		assert.deepEqual(await postmanTick(db), [], "and only once");
+	} finally {
+		clearTimeout(send);
+		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+/**
+ * A seam whose ledger reports mail to the POLL (`COUNT(*)`) but has none to take.
+ *
+ * That is the P1.1 interleaving in one object: the poll saw a `PENDING` row, the
+ * postman claimed it before `takePendingMail` ran, so the take comes back empty.
+ * Faking it at the `prepare` boundary keeps the real ledger, real transitions and
+ * real `collectChild`; only the "page of pending rows" query lies.
+ */
+function ledgerThatLosesTheMail(real: DatabaseSync): DatabaseSync {
+	return new Proxy(real, {
+		get(target, property, receiver) {
+			if (property === "prepare") {
+				return (sql: string) => {
+					if (/SELECT \* FROM messages WHERE to_node = \? AND delivered = \? AND id > \?/.test(sql)) {
+						return { all: () => [], get: () => undefined, run: () => ({ changes: 0 }) };
+					}
+					return target.prepare(sql);
+				};
+			}
+			const value = Reflect.get(target, property, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	}) as DatabaseSync;
+}
+
+test("collect answers with the result it got when the postman wins the ledger (P1.1)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	// An untracked child: `collectChild` falls through to the orchestrator seam, whose
+	// answer is the one `waitSettled` gave up on when OUR abort cut it (exactly what
+	// orchestrator.collect reports for any aborted signal).
+	const runtime = createSessionRuntime({ sendMessage() {} });
+	const fixture = collectFixture(runtime, store, cwd);
+	(fixture as unknown as { orchestrator: unknown }).orchestrator = {
+		childrenSnapshot: () => [] as unknown[],
+		cachedCollect: () => undefined,
+		retire: async () => ({}),
+		collect: (_name: string, opts?: { signal?: AbortSignal }) =>
+			new Promise((resolve) => {
+				opts?.signal?.addEventListener(
+					"abort",
+					() =>
+						resolve({
+							execution: { status: "running", reason: "aborted by parent" },
+							output: "partial output collected so far",
+							acceptance: { status: "unknown", level: "none" },
+						}),
+					{ once: true },
+				);
+			}),
+	};
+	const seam = { db: ledgerThatLosesTheMail(db), nodeId: "root" };
+	// The real row the poll sees; the proxy makes the take find nothing.
+	fixtureMail(db, { from: "root.team", to: "root", subject: "claimed elsewhere", body: "gone" });
+	try {
+		const result = await within(
+			collectChild(
+				fixture as unknown as Parameters<typeof collectChild>[0],
+				undefined,
+				seam,
+			),
+			"collect answered with the snapshot it got",
+			2_000,
+		);
+		const body = textOf(result);
+		assert.match(body, /partial output collected so far/, "the snapshot the collect got is delivered");
+		assert.doesNotMatch(body, /parent turn ended/, "no invented verdict about the parent turn");
+		assert.equal((result.details as { state?: string }).state, undefined);
+	} finally {
+		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+test("an unknown child is still an error when mail is waiting (P1.2)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	const runtime = blockedRuntime();
+	mailFromChild(db, "unrelated mail", "the body that must not answer a bad call");
+	try {
+		const result = await within(
+			waitAction({
+				params: { action: "wait", name: "ghost", timeoutMs: 1_000 },
+				runtime,
+				agents: [agent("worker")],
+				store,
+				cwd,
+				mail: { db, nodeId: "root" },
+			}),
+			"the unknown child answer",
+		);
+		assert.equal((result.details as { error?: string }).error, "NOT_FOUND");
+		assert.match(textOf(result), /unknown child: ghost/);
+		assert.doesNotMatch(textOf(result), /unrelated mail/);
+		assert.equal(pendingInbox(db, "root").length, 1, "the error path takes no mail");
+	} finally {
+		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+test("takePendingMail never returns a message the ledger bounced (P1.3)", () => {
+	const db = mailLedger();
+	try {
+		const id = fixtureMail(db, {
+			from: "root",
+			to: "team",
+			subject: "for a dead recipient",
+			body: "nobody will read this",
+		});
+		// The recipient goes terminal between the page read and the transition, so
+		// `ACCEPTED` becomes `BOUNCED` inside the ledger (`isTerminalNode`: a failed
+		// status, or a terminal phase).
+		updateNode(db, "root.team", { status: "failed" }, () => Date.now());
+		const taken = takePendingMail(db, "root.team");
+		assert.deepEqual(taken, [], "a bounce is not a delivery");
+		assert.equal(inbox(db, "root.team", { delivery: MAIL_DELIVERY.BOUNCED }).length, 1);
+		assert.equal(inbox(db, "root.team", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
+		assert.ok(id > 0);
+	} finally {
+		db.close();
+	}
+});
+
+test("the 250ms poll never outlives the call it was armed for (P1 gap)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	// No mail anywhere: the poll is armed, never fires a hit, and only the call ending
+	// can put it down. Deleting the `finally { stopPolling?.() }` leaves it running.
+	const runUnwatched = async (
+		run: () => Promise<unknown>,
+	): Promise<{ created: number; survivors: number }> => {
+		const realSetInterval = globalThis.setInterval;
+		const realClearInterval = globalThis.clearInterval;
+		const created: unknown[] = [];
+		const cleared = new Set<unknown>();
+		globalThis.setInterval = ((handler: () => void, ms?: number) => {
+			const handle = realSetInterval(handler, ms);
+			created.push(handle);
+			return handle;
+		}) as typeof setInterval;
+		globalThis.clearInterval = ((handle?: ReturnType<typeof setInterval>) => {
+			cleared.add(handle);
+			return realClearInterval(handle);
+		}) as typeof clearInterval;
+		try {
+			await run();
+		} finally {
+			globalThis.setInterval = realSetInterval;
+			globalThis.clearInterval = realClearInterval;
+		}
+		const survivors = created.filter((handle) => !cleared.has(handle));
+		// Clean up whatever the call leaked so this test never owns a live timer.
+		for (const handle of survivors) realClearInterval(handle as ReturnType<typeof setInterval>);
+		return { created: created.length, survivors: survivors.length };
+	};
+	try {
+		// The runtime is built OUTSIDE the spy: `createSessionRuntime` arms its own
+		// refresh interval, and counting that would make this test measure the wrong thing.
+		const waitRuntime = blockedRuntime();
+		const wait = await runUnwatched(async () => {
+			try {
+				return await waitAction({
+					params: { action: "wait", name: CHILD, timeoutMs: 60 },
+					runtime: waitRuntime,
+					agents: [agent("worker")],
+					store,
+					cwd,
+					mail: { db, nodeId: "root" },
+				});
+			} finally {
+				waitRuntime.dispose();
+			}
+		});
+		assert.equal(wait.created, 1, "fixture: the wait armed exactly one poll");
+		assert.equal(wait.survivors, 0, "the wait's poll must be cleared before it returns");
+		const collectRuntime = settledRuntime("done-output");
+		const collect = await runUnwatched(async () => {
+			try {
+				return await collectChild(collectFixture(collectRuntime, store, cwd), undefined, {
+					db,
+					nodeId: "root",
+				});
+			} finally {
+				collectRuntime.dispose();
+			}
+		});
+		assert.equal(collect.created, 1, "fixture: the collect armed exactly one poll");
+		assert.equal(collect.survivors, 0, "the collect's poll must be cleared before it returns");
+	} finally {
 		dispose();
 		db.close();
 	}
