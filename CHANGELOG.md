@@ -11,6 +11,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Fixed
+
+- **没有事件总线时账本不再漏记事件 (#380)。** 四处写成 `eventBus?.emit(appendEvent(...))`：可选链在没有
+  订阅者时会把 `appendEvent(...)` 的参数一起短路，于是 headless 宿主（不传 eventBus 的嵌入方）里相位迁移
+  只改了 `nodes.phase`、账本里一条 `phase_change` 都没有，重开账本时历史与真实状态不一致。改成「先写账本、
+  再通知订阅者」；交互模式行为不变。
+
 ### Added
 
 - **`legion_phase` gained the two arguments a centurion actually needed: `supersedes`
