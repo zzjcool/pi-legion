@@ -37,15 +37,16 @@
   `isMailHeld`，`src/legion/mail-release.ts`，进程级、按 nodeId 计数）。
 - hold 覆盖**所有**退出路径：超时、调用方 abort、抛错、正常返回，都在 `finally` 里释放 ——
   一次超时的 `wait` 不允许把 inbox 永久占住。
-- 只约束**同进程**的投递者：root 的 postman 与 root 的工具同进程。子节点的投递发生在父进程，
-  hold 跨不过进程边界 —— 那里由 §3.1 的租约保证「不重复投递」，本条的「抢占优先」不承诺给子节点。
+- hold 只覆盖**同一进程内的投递者**：root 的 postman、以及**同进程（in-process）子节点**的投递都受它约束
+  （`deliverChildren` 同样检查子节点的 hold）。RPC 子节点的投递发生在父进程，那里的 hold 在另一个进程里，
+  不受此约束 —— 那种情况下由 §3.1 的租约保证「不重复投递」，本条的「抢占优先」只对同进程投递者成立。
 
 ## §2 行为
 
 命中即**立即返回**（不再等 timeout、不再等 settle）：
 
 - 正文 = 被抢占的邮件（`formatMail` 原文，按 id 升序，最多 100 封）+ 一行状态说明：
-  - `wait`：`Children are still running: <name (state)>, …`
+  - `wait`：`Still running: <name>, …`（真机验证后的措辞；早先草案写的是 `Children are still running: <name (state)>, …`，已废弃）
   - `collect`：`The collect was interrupted by this mail; call collect again after handling it.`
 - `details.state = "mail"`、`details.mailIds = number[]`、`details.targets = string[]`。
 - 返回是**正常工具结果**（不是错误、不是 `interrupted`）——模型可以读完邮件继续工作。
@@ -54,8 +55,11 @@
 
 - 被抢占的邮件必须 `transitionDelivery(…, ACCEPTED)`（与 postman 的 `deliverRootInbox` 同一语义）。
 - 不新增事件：`mail_sent` 已在 `sendMail` 落账（`src/legion/mail.ts:311`），这里只动 delivery 列。
-- postman 只读 PENDING（`pendingInbox`），因此**不会重复投递**；这是本契约唯一的防重复机制，
-  测试必须钉住「抢占之后 postman tick 一次，不再产生 followUp」。
+- open 防重复有两条（都必要）：**发送前先在账本上认领**（§3.1 租约，postman 与抢占方用同一个
+  `claimForDelivery`，输的一方跳过自己的发送），以及**阻塞调用期间该节点的 postman 停手**（§1.1，邮件留在
+  PENDING 供抢占）。测试必须钉住「抢占之后 postman tick 一次，不再产生 followUp」。
+- **重投（`Redelivered: …`）不消耗发送方配额**：它是平台把被丢弃的工具结果救回来，不是发送方发的新邮件，
+  因此限流查询排除带该前缀的行；前缀只加一次。
 
 ### §3.1 在途认领（租约）
 
