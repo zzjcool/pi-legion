@@ -1732,12 +1732,12 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// `persistChild` writes the record, so a miss observed in that window clears
 		// itself within the TTL instead of freezing until restart.
 		getPhaseMachineForNode: (() => {
-			const POSITIVE = new Map<string, PhaseMachine>();
+			const positives = new Map<string, PhaseMachine>();
 			const MISS_TTL_MS = 1_000;
 			const misses = new Map<string, number>();
 			return (node) => {
 				const key = `${node.parentRunId ?? "-"}\u0000${node.id}`;
-				const hit = POSITIVE.get(key);
+				const hit = positives.get(key);
 				if (hit) return hit;
 				const nowMs = Date.now();
 				const missUntil = misses.get(key);
@@ -1752,7 +1752,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					machine = undefined;
 				}
 				if (machine) {
-					POSITIVE.set(key, machine);
+					positives.set(key, machine);
 					misses.delete(key);
 				} else misses.set(key, nowMs + MISS_TTL_MS);
 				return machine;
