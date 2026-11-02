@@ -32,6 +32,15 @@
  *     unknown child is still an error even with mail waiting, and a message the
  *     ledger bounces is not handed out as taken;
  *   - P1 gap — the 250ms poll timer never outlives the call.
+ *
+ * LAYERS. Most cases below drive `waitAction`/`collectChild` against the LEDGER only:
+ * no postman runs, so the mail is `PENDING` when the seam looks. That is the layer the
+ * preemption mechanics live in, but it is NOT the production race — measured on the
+ * issue's own ledger, root's postman flips the row to `ACCEPTED` ~200ms after the write,
+ * which is why the feature originally shipped "green but inert". The production path
+ * (a live `LegionPostman` ticking against the blocked call) is pinned by the two tests
+ * whose names start with "a held inbox" / "the hold is released" — the others are
+ * documented as ledger-layer on purpose.
  */
 
 import { test } from "node:test";
@@ -57,7 +66,11 @@ import {
 	pendingInbox,
 	sendMail,
 } from "../../src/legion/mail.ts";
-import { MAIL_DELIVERY_CLAIM_LEASE_MS, takePendingMail } from "../../src/legion/mail-release.ts";
+import {
+	MAIL_DELIVERY_CLAIM_LEASE_MS,
+	isMailHeld,
+	takePendingMail,
+} from "../../src/legion/mail-release.ts";
 import { getNode, insertNode, updateNode, type LegionNode } from "../../src/legion/nodes.ts";
 import type { OrchestratorLegionContext } from "../../src/runs/orchestrator.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
@@ -864,6 +877,114 @@ test("takePendingMail never returns a message the ledger bounced (P1.3)", () => 
 		assert.equal(inbox(db, "root.team", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
 		assert.ok(id > 0);
 	} finally {
+		db.close();
+	}
+});
+
+test("a held inbox survives the postman and reaches the blocked wait (production path)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	const runtime = blockedRuntime();
+	const injected: string[] = [];
+	// A REAL postman on the node the test calls from — the interleaving that made this
+	// feature inert in production: it delivers ~200ms after the write, long before a
+	// 250ms poll could ever see the row.
+	const postman = new LegionPostman({
+		db,
+		nodeId: "root",
+		supervisor: new FakeSupervisor(),
+		now: () => Date.now(),
+		sendRootMessage: (message) => injected.push(message),
+		intervalMs: 10_000,
+	});
+	let mailId = 0;
+	try {
+		const startedAt = Date.now();
+		let returnedAt = 0;
+		const waiting = waitAction({
+			params: { action: "wait", name: CHILD, timeoutMs: 60_000 },
+			runtime,
+			agents: [agent("worker")],
+			store,
+			cwd,
+			mail: { db, nodeId: "root" },
+		}).then((value) => {
+			returnedAt = Date.now();
+			return value;
+		});
+		// Let the call reach `runtime.wait` (it takes the hold synchronously on the way).
+		await new Promise<void>((resolve) => setTimeout(resolve, 60));
+		assert.equal(isMailHeld("root"), true, "fixture: the blocked wait holds the inbox");
+		// 1. mail lands while the wait is blocked…
+		mailId = mailFromChild(db, "the postman cannot race me", "the body that must reach the tool");
+		// 2. …and the postman ticks: it must leave the row PENDING (hold).
+		await postman.tick();
+		assert.deepEqual(injected, [], "the held postman delivers nothing");
+		assert.equal(
+			inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length,
+			0,
+			"the mail is still PENDING for the blocked call to take",
+		);
+		await postman.tick();
+		assert.deepEqual(injected, [], "a second held tick delivers nothing either");
+		// 3. the waiting call preempts on its next poll (250ms cadence).
+		const result = await within(waiting, "the blocked wait preempted while the postman ticked", 1_000);
+		const elapsed = returnedAt - startedAt;
+		const body = textOf(result);
+		assert.notEqual(mailId, 0);
+		assert.equal((result.details as { state?: string }).state, "mail");
+		assert.match(body, /Subject: the postman cannot race me/);
+		assert.match(body, /Still running: live/);
+		assert.ok(elapsed < 1_000, `preempted in ${elapsed}ms despite the live postman`);
+		// 4. delivered exactly once, and the postman is back on duty with nothing to send.
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+		await postman.tick();
+		assert.deepEqual(injected, [], "an ACCEPTED message is never injected twice");
+	} finally {
+		postman.stop();
+		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+test("the hold is released when the blocking call ends without mail", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	const runtime = blockedRuntime();
+	const injected: string[] = [];
+	const postman = new LegionPostman({
+		db,
+		nodeId: "root",
+		supervisor: new FakeSupervisor(),
+		now: () => Date.now(),
+		sendRootMessage: (message) => injected.push(message),
+		intervalMs: 10_000,
+	});
+	try {
+		const result = await within(
+			waitAction({
+				params: { action: "wait", name: CHILD, timeoutMs: 100 },
+				runtime,
+				agents: [agent("worker")],
+				store,
+				cwd,
+				mail: { db, nodeId: "root" },
+			}),
+			"the wait timed out",
+		);
+		assert.match(textOf(result), /status: wait_timeout/);
+		// The timeout path is the one that could park the inbox forever.
+		assert.equal(isMailHeld("root"), false, "a finished wait hands the inbox back");
+		mailFromChild(db, "after the wait", "delivered by the postman as usual");
+		await postman.tick();
+		assert.equal(injected.length, 1, "the postman delivers again once the hold is gone");
+		assert.match(injected[0]!, /Subject: after the wait/);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+	} finally {
+		postman.stop();
+		runtime.dispose();
+		dispose();
 		db.close();
 	}
 });
