@@ -94,6 +94,17 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **长等待中收到子 agent 的邮件会立刻返回，而不是等这一轮结束 (#384).** `legion_mail → root` 走宿主的
+  followUp，而宿主只在一轮「本来要停」时才取走它——于是根会话只要在 `subagent({action:"wait"})` 里，邮件就跟着
+  一起排队（实测一封冻结契约的邮件等了 17.3 分钟）。现在 `wait`/`collect` 在调用者是 legion 节点时每 250ms 看
+  一眼自己的收件箱：出现 `PENDING` 邮件就立即返回，正文就是那封邮件（`formatMail` 原文，多封按 id 升序、最多
+  100 封）加一行状态说明（`wait`：`Children are still running: <name (state)>, …`；`collect`：提示处理完再
+  collect 一次），`details.state = "mail"`。返回是**普通工具结果**而不是错误/中断，模型读完邮件继续干活。
+  邮件只被取走一次，用的是 postman 同一套记账（`PENDING → ACCEPTED`，不新增事件、不改 schema），postman 只读
+  `PENDING`，所以不会重复投递；子节点状态与进程完全不受影响（只返回，不 retire/abort）；Esc/父轮结束仍是原来的
+  `interrupted (parent turn ended; children still running)`，谁先到谁赢。没有邮件时 `wait`/`collect` 的结果与今天
+  逐字节一致。契约：`docs/contracts/wait-mail-preempt-v1.md`。
+
 - **`/legion` 两个画布面板的帧内容器收成了一个 `GalaxyScratch` 单例 (#369).** 对维护者：`panels.ts`
   的 26 个模块级可变容器（braille 网格及其尺寸键、19 个 `galaxy*`、4 个 chart 容器）不再散在文件里、
   也不再各自在函数中途清零——闸门之后的第一条语句就是唯一入口 `begin()`，它一次性清空全部带长度/
