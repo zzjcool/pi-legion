@@ -699,6 +699,120 @@ function phaseMachineForNode(role: string | null | undefined, cwd: string, setti
 	return phaseMachineForRole(role, cwd, settings);
 }
 
+/**
+ * #372 B: the machine a team declared INLINE at dispatch, as it was PERSISTED.
+ *
+ * `phaseMachineForRole` above answers "what does this role's card declare", and
+ * `phaseMachineForNode` answers it for a child process through the inherited
+ * `PI_LEGION_PHASES` environment. Neither can answer it for the `/legion` tree:
+ * the tree renders OTHER nodes, and since #371 the machine can be declared per
+ * DISPATCH (`subagent({ phases })`, contract §2) with no card involved — so the
+ * most explicitly configured teams were exactly the ones the panel could not
+ * describe.
+ *
+ * The durable record of that declaration is the child record the launch wrote
+ * (`ChildRecord.phases`, contract `legion-session-continuity-v1` §4), which is
+ * why this reads run.json rather than this process's `Orchestrator` snapshot:
+ * the snapshot dies with the launch call, while the panel must still answer after
+ * a reload, in a later process, and in a reopened session.
+ *
+ * The record lives in the run of the process that DISPATCHED the node, not in the
+ * node's own run, so this cannot read `store.readRun(node.runId)` — it is given
+ * the dispatch run when the caller knows it (`dispatchRunId`) and searches the
+ * registry only as a fallback.
+ *
+ * #372 M1: a bare node id is NOT an identity. Every run in a checkout contains a
+ * `root.team`, and `listRuns()` is oldest-first, so "the first run whose children
+ * mention this id" picked the OLDEST run — an old team's declaration would paint
+ * today's node, and a team that declared nothing today would inherit a machine
+ * from a run that ended long ago. Two rules follow, and both are load-bearing:
+ *
+ *   1. with `dispatchRunId`, ONLY that run answers (and "no record with `phases`"
+ *      there means "declared nothing", not "look elsewhere");
+ *   2. without it, the registry answer is used only when exactly ONE run owns the
+ *      id — ambiguity is a MISS, never a guess (the same convention
+ *      `storedNodeForJob` uses for identities it cannot disambiguate).
+ *
+ * Only the team that declared the machine has a record; a worker never does, and
+ * nothing is inferred for it here (it inherits from its lead while rendering,
+ * #298).
+ */
+export function inlinePhaseMachineForNode(
+	nodeId: string,
+	runs: readonly Pick<RunRecord, "runId" | "children">[],
+	dispatchRunId?: string | null,
+): PhaseMachine | undefined {
+	if (dispatchRunId) {
+		const dispatchRun = runs.find((run) => run.runId === dispatchRunId);
+		return dispatchRun?.children.find((child) => child.nodeId === nodeId)?.phases;
+	}
+	const owners = runs.filter((run) => run.children.some((child) => child.nodeId === nodeId));
+	if (owners.length !== 1) return undefined;
+	const [owner] = owners;
+	return owner?.children.find((child) => child.nodeId === nodeId)?.phases;
+}
+
+/**
+ * #372 B/M1/m4: the `/legion` tree's inline-declaration lookup.
+ *
+ * A factory rather than an inline closure so the plumbing is testable without
+ * booting the extension: the run lookup, the clock and the cwd are all injected.
+ * The review found the previous closure had NO test coverage at all — dropping the
+ * `parentRunId` argument or keying the cache by `node.id` alone kept every test
+ * green while the panel leaked another run's declaration.
+ *
+ * Three properties, each load-bearing:
+ *
+ *  - **run-scoped cache keys** `(parentRunId, node.id)`. `node.id` repeats in
+ *    every run of a checkout (`root.team`), so an id-only key serves one run's
+ *    answer for another run's node — and, once cached, for the rest of the
+ *    process (#372 M1).
+ *  - **misses are cached, briefly.** A miss is a real answer ("this team declared
+ *    nothing") and without caching it every repaint paid a runs-registry read per
+ *    undeclared team (#372 m4). `MISS_TTL_MS` bounds both that cost and the one
+ *    race the cache can lose: the node row exists a moment before `persistChild`
+ *    writes the record, and the TTL is the same 1s the store itself uses for a
+ *    foreign in-place `run.json` rewrite, so a miss observed in that window heals
+ *    by itself instead of freezing until restart.
+ *  - **the dispatching run is passed through** to `inlinePhaseMachineForNode`,
+ *    which is the only thing that can pick the right record (#372 M1).
+ */
+export function createInlineMachineLookup(input: {
+	/** This process's cwd, read at call time (it changes with the session). */
+	cwd: () => string | undefined;
+	/** The store for a checkout — injected so a test can count registry reads. */
+	runStoreFor: (cwd: string) => Pick<RunStore, "listRuns">;
+	now?: () => number;
+}): (node: { id: string; role: string | null; parentRunId: string | null }) => PhaseMachine | undefined {
+	const positives = new Map<string, PhaseMachine>();
+	const misses = new Map<string, number>();
+	const now = input.now ?? Date.now;
+	const MISS_TTL_MS = 1_000;
+	return (node) => {
+		const key = `${node.parentRunId ?? "-"}\u0000${node.id}`;
+		const hit = positives.get(key);
+		if (hit) return hit;
+		const nowMs = now();
+		const missUntil = misses.get(key);
+		if (missUntil !== undefined && nowMs < missUntil) return undefined;
+		const cwd = input.cwd();
+		if (!cwd) return undefined;
+		let machine: PhaseMachine | undefined;
+		try {
+			machine = inlinePhaseMachineForNode(node.id, input.runStoreFor(cwd).listRuns(), node.parentRunId);
+		} catch {
+			// The panel must never break on an unreadable runs directory; the role
+			// lookup still runs, so a card-declared team keeps rendering.
+			machine = undefined;
+		}
+		if (machine) {
+			positives.set(key, machine);
+			misses.delete(key);
+		} else misses.set(key, nowMs + MISS_TTL_MS);
+		return machine;
+	};
+}
+
 function createLegionRuntime(input: {
 	pi: ExtensionAPI;
 	supervisor: LegionSupervisor;
@@ -1660,6 +1774,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				return machine;
 			};
 		})(),
+		// #372 B: /legion must show the machine an inline-declared team was
+		// DISPATCHED with (`subagent({ phases })`, #371 §2). That declaration has no
+		// card to look up, so it is answered per NODE from the dispatching run's
+		// run.json — the one source that survives a reload, a later process and a
+		// reopened session. The caching and the run plumbing live in the factory so
+		// they can be tested without booting the extension (#372 review, minor 1).
+		getPhaseMachineForNode: createInlineMachineLookup({ cwd: () => lastCwd, runStoreFor }),
 		getTreeIdentity: (name) => {
 			const own = ownLegionIdentity();
 			const node = own && getChildByName(own.db, own.nodeId, name);
