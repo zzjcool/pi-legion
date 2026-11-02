@@ -22,6 +22,8 @@ import {
 	MAIL_BOUNCE_REASON,
 	MAIL_DELIVERY,
 	MailInvalidTextError,
+	bounceUndeliveredMail,
+	claimForDelivery,
 	formatMail,
 	inbox,
 	isStalePhaseTimeoutNotice,
@@ -332,57 +334,114 @@ export class LegionPostman {
 		}
 	}
 
+	/**
+	 * Hand one message to a child, exactly once (#384 review P0-1).
+	 *
+	 * The ORDER is the point: the ledger is claimed (`PENDING → ACCEPTED`) BEFORE the
+	 * send call, because the send is awaited and the recipient may be blocked in its
+	 * own `wait`/`collect` — which polls the same row and would take it in that
+	 * window. Claiming first makes the database the arbiter: the loser's conditional
+	 * update changes no rows, so it skips its own send and the child gets one copy.
+	 *
+	 * #322 still holds: `ACCEPTED` means "a send call answered" (including `queued`),
+	 * never "the child read it", and `DELIVERED` remains a separate, later fact. What
+	 * the claim adds is that a send which never answered owes an outcome instead of
+	 * silently holding the row forever — {@link bounceUndeliveredMail}, with the
+	 * receipt the send-side bounce used to write. `intercepted` still bounces with its
+	 * own reason.
+	 */
 	private async deliverToChild(node: LegionNode, message: LegionMessage): Promise<void> {
-		// #322: `ACCEPTED` is written below as soon as a send call returns an answer —
-		// including `queued`, where the text waits for the child's next turn boundary
-		// (after its current tool batch) and a child stuck in a long tool never
-		// consumes it. It means "the send call returned", never "the child read it",
-		// and it does not promise a retry either: only a thrown send stays pending.
-		// `DELIVERED` is a separate, later fact with its own evidence. `intercepted`
-		// is NOT accepted: an input handler ate the text, so it bounces.
 		const current = getNode(this.db, node.id) ?? node;
 		const text = formatMail(message);
 		const wasAlive = this.supervisor.isAlive(current.name);
+		if (isTerminalNode(current)) {
+			transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now);
+			this.emitMail(message.id, message.fromNode, "mail_bounced");
+			return;
+		}
+		// The send plan is resolved BEFORE the claim: a route that cannot be built (no
+		// resumer for a dead child) must leave the message PENDING for a later tick, not
+		// claim it and then discover it has nobody to hand it to.
+		const send = this.deliveryFor(current, message, text, wasAlive);
+		if (!send) return;
+		if (!claimForDelivery(this.db, message.id, this.now)) {
+			// The recipient's own blocked `wait`/`collect` delivered it first. A second
+			// copy is precisely the duplicate this claim exists to stop.
+			return;
+		}
 		try {
-			if (isTerminalNode(current)) {
-				transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now);
-				this.emitMail(message.id, message.fromNode, "mail_bounced");
+			const outcome = await send();
+			if (outcome === "intercepted") {
+				// The child never saw the text and there is no retry, so the ledger says
+				// so: the mail bounced, with a reason the sender can act on (#322).
+				// #338 minor 1: this is NOT a steer, so it does not emit `node_steered`
+				// (the bus signal for an injected steer) — the observable event is the
+				// `mail_bounced` below, carrying `reason: intercepted_by_input_handler`.
+				this.bounceClaimed(message, MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER);
+				// …and this `return` is why a swallowed send never reaches the unblock below (#323 3).
 				return;
 			}
-			if (!wasAlive) {
-				if (!this.resumeChild) return;
-				await this.resumeChild(current, { name: current.name, text });
-			} else if (current.status === "running" || current.status === "starting" || current.status === "blocked") {
-				if (message.urgency === "action-needed") {
-					const disposition = await this.supervisor.steer(current.name, text);
-					if (disposition === "intercepted") {
-						// The child never saw the text and there is no retry, so the ledger says
-						// so: the mail bounced, with a reason the sender can act on (#322).
-						// #338 minor 1: this is NOT a steer, so it does not emit `node_steered`
-						// (the bus signal for an injected steer) — the observable event is the
-						// `mail_bounced` below, carrying `reason: intercepted_by_input_handler`.
-						transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now, {
-							reason: MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER,
-						});
-						this.emitMail(message.id, message.fromNode, "mail_bounced");
-						// …and this `return` is why a swallowed send never reaches the unblock below (#323 3).
-						return;
-					}
-					this.emitProcess("node_steered", current.id, { name: current.name, messageId: message.id });
-				} else {
-					await this.supervisor.followUp(current.name, text);
-				}
-			} else {
-				// In-process backends cannot tell `queued` from `accepted`: `prompt` returns
-				// void, so ACCEPTED here is a backend capability limit, not an observation.
-				await this.supervisor.prompt(current.name, text);
-			}
 			if (wasAlive && message.urgency === "action-needed" && current.status === "blocked") updateNode(this.db, current.id, { status: "running" }, this.now);
-			transitionDelivery(this.db, message.id, MAIL_DELIVERY.ACCEPTED, this.now);
 			this.emitMail(message.id, message.fromNode, "mail_sent");
 		} catch {
-			// RPC failures leave delivered=0 so the next mailbox tick can retry.
+			// #384 review P0-1: the claim already LEFT `PENDING`, so "let the next tick
+			// retry" is no longer available — an RPC failure here would strand the row in
+			// ACCEPTED with the child never having seen it. The send-side outcome for a
+			// send that did not happen is a bounce, with the receipt the sender is owed.
+			this.bounceClaimed(message, MAIL_BOUNCE_REASON.SEND_FAILED);
 		}
+	}
+
+	/**
+	 * How this node receives one message, or `undefined` when no route exists.
+	 *
+	 * `"intercepted"` is a returned outcome, not a throw: an input handler eating the
+	 * text is a *delivery* verdict with its own bounce reason, not a transport failure.
+	 */
+	private deliveryFor(
+		current: LegionNode,
+		message: LegionMessage,
+		text: string,
+		wasAlive: boolean,
+	): (() => Promise<"sent" | "intercepted">) | undefined {
+		if (!wasAlive) {
+			const resume = this.resumeChild;
+			if (!resume) return undefined;
+			return async () => {
+				await resume(current, { name: current.name, text });
+				return "sent";
+			};
+		}
+		if (current.status === "running" || current.status === "starting" || current.status === "blocked") {
+			if (message.urgency === "action-needed") {
+				return async () => {
+					const disposition = await this.supervisor.steer(current.name, text);
+					if (disposition === "intercepted") return "intercepted";
+					this.emitProcess("node_steered", current.id, { name: current.name, messageId: message.id });
+					return "sent";
+				};
+			}
+			return async () => {
+				await this.supervisor.followUp(current.name, text);
+				return "sent";
+			};
+		}
+		// In-process backends cannot tell `queued` from `accepted`: `prompt` returns
+		// void, so ACCEPTED here is a backend capability limit, not an observation.
+		return async () => {
+			await this.supervisor.prompt(current.name, text);
+			return "sent";
+		};
+	}
+
+	/** Bounce a message THIS postman claimed, then publish the bus signal for it. */
+	private bounceClaimed(message: LegionMessage, reason: string): void {
+		try {
+			bounceUndeliveredMail(this.db, message.id, reason, this.now);
+		} catch {
+			// The row is already claimed; a second failure has nothing left to record.
+		}
+		this.emitMail(message.id, message.fromNode, "mail_bounced");
 	}
 
 	private async pollUsage(children: readonly LegionNode[]): Promise<void> {

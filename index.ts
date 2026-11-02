@@ -113,6 +113,7 @@ import {
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
 import {
 	pollInbox,
+	redeliverMail,
 	renderReleasedMail,
 	takePendingMail,
 	type MailReleaseSeam,
@@ -2150,13 +2151,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					legion: activeLegion,
 				});
 				if (signal?.aborted && action !== "stop") {
-					// #352: the frozen head line replaces the rendered result, so the parent
-					// never sees it — and `wait` CLAIMS a settled child's completion on its
-					// finished-cache probe. The result is thrown away here, so the claim has
-					// to go back (exactly what `collectChild` owes on its own bails): a claim
-					// nobody delivered suppresses that round's notice forever.
-					await releaseWaitClaims(runtime, result.details);
-					return ok("interrupted (parent turn ended; children still running)");
+					return interruptedControlResult({ result, runtime, legion: activeLegion });
 				}
 				return result;
 			}
@@ -2996,7 +2991,7 @@ export async function collectChild(
 		// #384: the inbox is checked BEFORE anything claims a result, so a preempted
 		// collect never holds a #352 claim for a result it will not deliver.
 		if (mail) {
-			const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+			const released = takePendingMail(mail.db, mail.nodeId);
 			if (released.length > 0) return mailPreemptedCollect(ctx.name, released);
 		}
 		// #312: the runtime's job table is keyed by NAME, while everything below
@@ -3041,14 +3036,26 @@ export async function collectChild(
 			const callerGone = signal?.aborted === true;
 			const mailWon =
 				mail !== undefined && combined?.reason === MAIL_PREEMPT_REASON && !callerGone;
-			if (!collected || signal?.aborted || mailWon) {
+			// #384 review P1.1: mail ended the collect, but the ledger is empty — the
+			// postman claimed the row first. Answer with what this collect DID get
+			// (`renderCollect`, the claim it took is the delivery) instead of the frozen
+			// `interrupted …`, which would blame the parent turn for something that
+			// never happened.
+			if (mailWon) {
+				const released = takePendingMail(mail.db, mail.nodeId);
+				if (released.length > 0) {
+					if (collected) {
+						// The mail wins and the child's text is dropped: hand the claim back
+						// so that round's notice can still deliver it (#352).
+						ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
+					}
+					return mailPreemptedCollect(ctx.name, released);
+				}
+				if (collected) return ok(renderCollect(ctx.name, collected.snapshot));
+			}
+			if (!collected || signal?.aborted) {
 				if (collected) {
 					ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
-				}
-				if (mailWon) {
-					const released = takePendingMail(mail.db, mail.nodeId, mail.now);
-					// Empty = the postman got there first; fall back to the frozen line.
-					if (released.length > 0) return mailPreemptedCollect(ctx.name, released);
 				}
 				return ok("interrupted (parent turn ended; children still running)");
 			}
@@ -3086,8 +3093,13 @@ export async function collectChild(
 			signal?.aborted !== true &&
 			collected.execution.reason === "aborted by parent";
 		if (mailWon) {
-			const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+			const released = takePendingMail(mail.db, mail.nodeId);
 			if (released.length > 0) return mailPreemptedCollect(ctx.name, released);
+			// #384 review P1.1: the mail is gone from the ledger (the postman claimed the
+			// row first), but this collect DID get a snapshot — including the child's
+			// output so far. Answering with `interrupted …` would blame the parent turn
+			// for something that never happened, so the snapshot is what goes out.
+			return ok(renderCollect(ctx.name, collected));
 		}
 		if (signal?.aborted || collected.execution.reason === "aborted by parent") {
 			return ok("interrupted (parent turn ended; children still running)");
@@ -5392,6 +5404,53 @@ export async function releaseWaitClaims(runtime: SessionRuntime, details: unknow
 }
 
 /**
+ * What a control call answers when the caller's abort lands after it returned
+ * (#352 + #384 review P0-3).
+ *
+ * #352: the frozen head line REPLACES the rendered result, so the parent never sees
+ * it — and `wait` CLAIMS a settled child's completion on its finished-cache probe.
+ * The result is thrown away here, so the claim has to go back (exactly what
+ * `collectChild` owes on its own bails): a claim nobody delivered suppresses that
+ * round's notice forever.
+ *
+ * #384 review P0-3: a MAIL result is thrown away the same way, but a claim is not
+ * the only thing it held — the mails inside it were already `PENDING → ACCEPTED`, and
+ * `takePendingMail` has no way back. Left alone, the text would be lost for good
+ * (before #384 the message was still `PENDING` and a restart would have delivered
+ * it). So the discarded result's mail is re-enqueued as fresh `PENDING` rows
+ * (`Redelivered: ` subject, same sender/recipient/body) and the postman's next tick
+ * delivers it like any other mail.
+ */
+export async function interruptedControlResult(input: {
+	result: AgentToolResult<unknown>;
+	runtime: SessionRuntime;
+	legion?: OrchestratorLegionContext;
+}): Promise<AgentToolResult<unknown>> {
+	await releaseWaitClaims(input.runtime, input.result.details);
+	redeliverPreemptedMail(input.legion, input.result.details);
+	return ok("interrupted (parent turn ended; children still running)");
+}
+
+/** Re-enqueue the mail a discarded (`state: "mail"`) result was carrying. */
+function redeliverPreemptedMail(
+	legion: OrchestratorLegionContext | undefined,
+	details: unknown,
+): void {
+	if (!legion || details === null || typeof details !== "object") return;
+	const record = details as { state?: unknown; mailIds?: unknown };
+	if (record.state !== "mail" || !Array.isArray(record.mailIds)) return;
+	const ids = record.mailIds.filter((id): id is number => Number.isSafeInteger(id));
+	if (ids.length === 0) return;
+	try {
+		redeliverMail(legion.db, ids);
+	} catch {
+		// The ledger refused the copy (closed DB, a racing shutdown). Nothing further to
+		// promise: the frozen line is still the answer, and swallowing beats failing a
+		// bail that has already been decided.
+	}
+}
+
+/**
  * #384: the abort reason that says "this node's inbox got mail", as opposed to
  * "the caller left". `AbortSignal.any` forwards the reason of whichever source
  * aborted FIRST (contract §4), so the combined signal's `reason` is the verdict on
@@ -5433,46 +5492,66 @@ function withWaitClaims(
  * Not an error and not `interrupted …` — the model reads the mail and carries on.
  * The `details` shape is the one the contract froze: `state`, `mailIds`, `targets`,
  * plus the wait's claim record when the caller has one (a `collect` takes no claim).
+ *
+ * `sections` are the parts of the blocking call that DID happen, in order: the mail
+ * itself first (that is what ended the call), then whatever the call had already
+ * delivered, then the frozen status line.
  */
 function mailPreemptedResult(input: {
 	released: readonly LegionMessage[];
 	targets: readonly string[];
-	/** The frozen status line that follows the mail body (contract §2). */
-	summary: string;
+	sections: readonly string[];
 	claims?: WaitClaim[];
+	pending?: Promise<WaitClaim[]>;
 }): AgentToolResult<unknown> {
-	const details: Record<string, unknown> = {
-		state: "mail",
-		mailIds: input.released.map((message) => message.id),
-		targets: [...input.targets],
-	};
-	if (input.claims) withWaitClaims(details, input.claims);
 	return {
 		content: [
-			{ type: "text", text: [renderReleasedMail(input.released), input.summary].join("\n\n") },
+			{
+				type: "text",
+				text: [renderReleasedMail(input.released), ...input.sections].join("\n\n"),
+			},
 		],
-		details,
+		details: withWaitClaims(
+			{
+				state: "mail",
+				mailIds: input.released.map((message) => message.id),
+				targets: [...input.targets],
+			},
+			input.claims ?? [],
+			input.pending,
+		),
 	};
 }
 
-/** `wait`: the mail plus what this node is still waiting on (contract §2). */
+/**
+ * `wait`: the mail, the results this wait already collected, and — once — who is
+ * still running (#384 review P0-2).
+ *
+ * Review finding: the earlier shape reused `renderWait`'s body, which labels an
+ * aborted result `interrupted (parent turn ended; children still running)` — a
+ * conclusion about the PARENT that is false here: the wait ended because mail
+ * arrived, and the parent turn is alive, reading that mail. So the interrupted
+ * lines are dropped, every result the wait DID get is kept verbatim, and the
+ * still-running fact is stated once, plainly.
+ */
 function mailPreemptedWait(input: {
-	runtime: SessionRuntime;
 	released: readonly LegionMessage[];
 	names: readonly string[];
+	/** Results that carried a snapshot — they were delivered, so they stay. */
+	delivered: readonly WaitResult[];
+	/** Names this wait had not finished when the mail landed. */
+	running: readonly string[];
 	claims: WaitClaim[];
+	pending?: Promise<WaitClaim[]>;
 }): AgentToolResult<unknown> {
-	const running =
-		input.names.length > 0
-			? input.names
-					.map((name) => `${name} (${input.runtime.get(name)?.state ?? "untracked"})`)
-					.join(", ")
-			: "none";
+	const sections = input.delivered.map((result) => renderCollect(result.name, result.snapshot!));
+	if (input.running.length > 0) sections.push(`Still running: ${input.running.join(", ")}`);
 	return mailPreemptedResult({
 		released: input.released,
 		targets: input.names,
-		summary: `Children are still running: ${running}`,
+		sections,
 		claims: input.claims,
+		...(input.pending ? { pending: input.pending } : {}),
 	});
 }
 
@@ -5484,7 +5563,9 @@ function mailPreemptedCollect(
 	return mailPreemptedResult({
 		released,
 		targets: [name],
-		summary: "The collect was interrupted by this mail; call collect again after handling it.",
+		sections: [
+			"The collect was interrupted by this mail; call collect again after handling it.",
+		],
 	});
 }
 
@@ -5520,22 +5601,24 @@ export async function waitAction(input: {
 		{ name: params.name, all: params.all },
 		jobs,
 	);
-	// #384: look in the inbox ONCE here — before the finished-cache probe below can
-	// take a #352 claim. A preempted wait hands over MAIL, not the child's result, so
-	// it must not hold a claim for a result nobody received; checking here makes
-	// `claims` provably empty on that path. `signal?.aborted` at entry means the
-	// caller is already gone: I5 keeps that path exactly as it was, mail or no mail.
-	//
-	// A mail hit also wins over "unknown child" / "no running children": the node has
-	// unread mail in hand right now, and the wait it asked for can simply be repeated.
 	const mail = input.mail;
-	if (mail && signal?.aborted !== true) {
-		const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+	// #384: look in the inbox ONCE here — before the finished-cache probe below can
+	// take a #352 claim, so the preempted path is provably claim-free. `signal?.aborted`
+	// at entry means the caller is already gone: I5 keeps that path exactly as it was,
+	// mail or no mail.
+	//
+	// Review P1.2: only a wait that HAS somewhere to wait is preempted. `unknown child`
+	// and the parameter/liveness errors keep precedence — mail is not an answer to a
+	// question this call did not ask, and hiding the error made the miss look like a
+	// successful call whose result was mail.
+	if (targets.ok && mail && signal?.aborted !== true) {
+		const released = takePendingMail(mail.db, mail.nodeId);
 		if (released.length > 0) {
 			return mailPreemptedWait({
-				runtime,
 				released,
-				names: targets.ok ? targets.names : params.name ? [params.name] : [],
+				names: targets.names,
+				delivered: [],
+				running: targets.names,
 				claims,
 			});
 		}
@@ -5601,26 +5684,36 @@ export async function waitAction(input: {
 		// #384: never leave a 250ms timer behind a finished wait.
 		stopPolling?.();
 	}
-	// #384: mail preempted this wait. Only when nothing was delivered by it
-	// (`every(interrupted)`) — a wait that also returned a child's result keeps that
-	// result, because a claimed snapshot dropped in favour of mail is #352's
-	// suppressed-notice bug. `!claimsPending` says this wait never ran the
-	// finished-cache probe, which is what makes `claims` provably empty here: a
-	// preempted call must not hold a claim for a result it never delivered. Whoever
-	// aborted FIRST wins — a caller abort keeps the frozen `interrupted …` rendering
-	// even when mail landed a tick later (I5).
+	// #384 review P0-2: mail preempts this wait UNCONDITIONALLY — no "did anything get
+	// delivered" test, no "did the probe run" test. Those two extra conditions were an
+	// invention: they made a wait that received mail answer as if the wait had simply
+	// timed out, with `interrupted (parent turn ended…)` naming a turn that never
+	// ended. What the wait DID collect rides along in the body instead (delivered
+	// results verbatim), and `details.waitClaims` is still mounted, so a claim this
+	// call took is never dropped on the floor.
+	//
+	// Whoever aborted FIRST still wins (contract §4): a caller abort keeps the frozen
+	// `interrupted …` rendering even when mail landed a tick later (I5).
 	if (
 		mail &&
-		!claimsPending &&
 		combined?.reason === MAIL_PREEMPT_REASON &&
-		signal?.aborted !== true &&
-		results.every((result) => result.interrupted === true)
+		signal?.aborted !== true
 	) {
-		const released = takePendingMail(mail.db, mail.nodeId, mail.now);
+		const released = takePendingMail(mail.db, mail.nodeId);
 		// Empty = the postman took it during the abort. Nothing to hand over, so fall
-		// through to the ordinary (interrupted) render rather than inventing a result.
+		// through to the ordinary render rather than inventing a result.
 		if (released.length > 0) {
-			return mailPreemptedWait({ runtime, released, names: targets.names, claims });
+			return mailPreemptedWait({
+				released,
+				names: targets.names,
+				delivered: results.filter((result) => result.snapshot !== undefined),
+				running: results
+					.filter((result) => result.snapshot === undefined)
+					.filter((result) => result.interrupted === true || result.stillRunning === true)
+					.map((result) => result.name),
+				claims,
+				...(claimsPending ? { pending: claimsPending } : {}),
+			});
 		}
 	}
 	const text = renderWait(results);
