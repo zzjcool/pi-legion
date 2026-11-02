@@ -81,6 +81,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **`/legion` 两个画布面板的帧内容器收成了一个 `GalaxyScratch` 单例 (#369).** 对维护者：`panels.ts`
+  的 26 个模块级可变容器（braille 网格及其尺寸键、19 个 `galaxy*`、4 个 chart 容器）不再散在文件里、
+  也不再各自在函数中途清零——闸门之后的第一条语句就是唯一入口 `begin()`，它一次性清空全部带长度/
+  计数器的容器（`clear()`/`length = 0`/计数归零，不分配、身份跨帧保持）；七个按计数器寻址的索引数组
+  只归零计数器，截断它们反而会分配（契约 §1.2），于是「这一帧此刻什么是干净的」只有一个答案。同时两个面板都加了不可重入闸门（嵌套渲染抛 `viz: <fn> is not reentrant`，以前这条
+  约束只写在注释里）。用户无感知：可见输出逐字节不变，整帧分配不回退（bench 10 全绿）。
+  契约：`docs/contracts/galaxy-scratch-v1.md`。
 - **退出/恢复会话时不再打印 `Extension error (/plugin/index.ts): … ctx is stale` (#377).** 宿主在会话销毁后
   仍会派发 `turn_end` / `agent_settled`，扩展入口这时读 ctx 会抛。现在把这种"ctx 已作废"当成「没有 UI」处理
   （与状态栏一直以来的做法一致）：缓存清空、安静返回；其它异常照旧抛出。用户感知：每次退出会话少一行红色噪音。

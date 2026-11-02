@@ -136,92 +136,215 @@ interface PxCell {
 }
 
 /**
- * #364 A1: the braille pixel buffer is rewritten in place instead of reallocated
- * every frame (3,658 cells at 200×60, ~64B each).
+ * #369: every mutable container the two painters read, in **one** object with
+ * **one** entry point (`begin`).
  *
- * **Contract T1**: every cell's `m` and `z` MUST be cleared before a frame. `m`
- * only ever accumulates (`|=`), so a stale bit paints last frame's glyph; and `z`
- * is the write gate (`z >= cell.z`), so a stale `z` rejects this frame's
- * lower-priority dots, which leaves `m` zero there and drops that part of the
- * picture. `col` itself is deliberately NOT cleared: with `z = -1` on every cell
- * and every dot's priority `z >= 0`, the FIRST dot to touch a cell always passes
- * `z >= cell.z` and so writes `col` in the same step it sets its bit — hence
- * "`m != 0` ⇒ `col` is this frame's" holds for free, and clearing it would only
- * add 3,658 pointless stores. (Note the bit is set *outside* the `z` check, so
- * that implication rests on the `z` reset, not on the assignment order.)
- */
-let pxWidth = -1;
-let pxHeight = -1;
-let pxGrid: PxCell[][] = [];
-
-function pixelGrid(width: number, height: number): PxCell[][] {
-	if (width !== pxWidth || height !== pxHeight) {
-		const rows: PxCell[][] = new Array(height);
-		for (let y = 0; y < height; y++) {
-			const row: PxCell[] = new Array(width);
-			for (let x = 0; x < width; x++) row[x] = { m: 0, col: "", z: -1 };
-			rows[y] = row;
-		}
-		pxGrid = rows;
-		pxWidth = width;
-		pxHeight = height;
-		return rows;
-	}
-	for (let y = 0; y < height; y++) {
-		const row = pxGrid[y]!;
-		for (let x = 0; x < width; x++) {
-			const cell = row[x]!;
-			cell.m = 0;
-			cell.z = -1;
-		}
-	}
-	return pxGrid;
-}
-
-/**
- * Frame-local scratch for `drawGalaxy` (#364 A1). None of it is a cache: each
- * container is emptied at the start of the section that fills it, so a reader
- * only ever sees this frame's entries. That is *not* "everything is cleared at
- * the top of the function" — `if (!center) return` below leaves the containers
- * it never reached holding the previous frame's values, which is harmless
- * precisely because every one of them is re-cleared before its own reader.
+ * None of it is a cache: `begin()` empties it before a frame paints, so a reader
+ * only ever sees this frame's entries — the answer to "how much of this is
+ * already clean at this point?" is "everything with a length or a counter",
+ * which is what used to require reading both painters end to end (the resets were
+ * spread over 14 lines, and `if (!center) return` in the middle of `drawGalaxy`
+ * made the rest look missed).
+ *
+ * Seven arrays are addressed through a counter instead of being truncated:
+ * `posX/posY` (by `pos`), `occX/occY/occW` (by `occCount`), `bandTop/bandRole`
+ * (by `bandCount`). `begin` zeroes those counters, which is the same state a fresh
+ * instance has — every reader indexes below the counter — and leaving the tails
+ * alone is deliberate: `length = 0` would drop V8's backing store and the next
+ * write would allocate, which is the one thing #364 forbids (contract §1.2).
+ *
+ * Nothing here may be re-allocated per frame either: `clear()` / `length = 0` / a
+ * counter back to `0` keeps every container's identity across frames, and that
+ * identity is what makes a frame allocation-free (#364 I3, contract §2 A1). The
+ * containers are therefore `readonly` — only their *contents* change — and the
+ * few scalars that are assigned (`pxGrid` as the braille grid's size key, the
+ * three counters, the reentrancy flag) are the ones that cannot be.
  *
  * **Contract T2/T3**: `data.nodes` and every `VizNode` is a NEW object each frame
  * (`status.ts:925` → `model.ts:93`), and the drawing path compares nodes by
  * IDENTITY (`node === center`, `node === virtualRoot`). A cross-frame cache of
  * these maps would hand back last frame's objects and degrade the centre sphere
  * to a plain node, so they may only ever hold *this* frame's data — which is why
- * they are reset unconditionally rather than keyed on anything.
+ * `begin` empties them unconditionally instead of keying them on anything.
  */
-const galaxyLeafMemo = new Map<string, number>();
-const galaxyLeafGuard = new Set<string>();
-const galaxyDepthGuard = new Set<string>();
-const galaxyLayGuard = new Set<string>();
-const galaxyRel = new Map<string, number>();
-const galaxyRadii = new Map<string, number>();
-/** id → index into `galaxyPosX/Y` (two number arrays beat N `[x, y]` tuples per frame). */
-const galaxyPos = new Map<string, number>();
-const galaxyPosX: number[] = [];
-const galaxyPosY: number[] = [];
-let galaxyPosCount = 0;
-const galaxyAll: VizNode[] = [];
-const galaxyRunning: number[] = [];
-const galaxyCandidates: VizNode[] = [];
-const galaxyRoles: string[] = [];
-const galaxyStatusItems: Array<(typeof STATUS_ITEMS)[number]> = [];
-const galaxyOccX: number[] = [];
-const galaxyOccY: number[] = [];
-const galaxyOccW: number[] = [];
-let galaxyOccCount = 0;
+class GalaxyScratch {
+	// ------------------------------------------------------- braille pixel buffer
+
+	/**
+	 * #364 A1: the braille pixel buffer is rewritten in place instead of reallocated
+	 * every frame (3,658 cells at 200×60, ~64B each). Its dimensions ARE its size
+	 * key: `pixelGrid()` builds a new grid only when the pane's pixel budget
+	 * changes, which is the one allocation this class ever makes and never a
+	 * per-frame one.
+	 *
+	 * **Contract T1**: `begin()` clears every cell's `m` and `z`. `m` only ever
+	 * accumulates (`|=`), so a stale bit paints last frame's glyph; and `z` is the
+	 * write gate (`z >= cell.z`), so a stale `z` rejects this frame's lower-priority
+	 * dots, which leaves `m` zero there and drops that part of the picture. `col`
+	 * itself is deliberately NOT cleared: with `z = -1` on every cell and every
+	 * dot's priority `z >= 0`, the FIRST dot to touch a cell always passes
+	 * `z >= cell.z` and so writes `col` in the same step it sets its bit — hence
+	 * "`m != 0` ⇒ `col` is this frame's" holds for free, and clearing it would only
+	 * add 3,658 pointless stores. (Note the bit is set *outside* the `z` check, so
+	 * that implication rests on the `z` reset, not on the assignment order.)
+	 */
+	private pxWidth = -1;
+	private pxHeight = -1;
+	private pxGrid: PxCell[][] = [];
+
+	// ------------------------------------------------------------------- galaxy
+
+	readonly leafMemo = new Map<string, number>();
+	readonly leafGuard = new Set<string>();
+	readonly depthGuard = new Set<string>();
+	readonly layGuard = new Set<string>();
+	readonly rel = new Map<string, number>();
+	readonly radii = new Map<string, number>();
+	/** id → index into `posX/Y` (two number arrays beat N `[x, y]` tuples per frame). */
+	readonly pos = new Map<string, number>();
+	readonly posX: number[] = [];
+	readonly posY: number[] = [];
+	posCount = 0;
+	readonly all: VizNode[] = [];
+	readonly running: number[] = [];
+	readonly candidates: VizNode[] = [];
+	readonly roles: string[] = [];
+	readonly statusItems: Array<(typeof STATUS_ITEMS)[number]> = [];
+	readonly occX: number[] = [];
+	readonly occY: number[] = [];
+	readonly occW: number[] = [];
+	occCount = 0;
+
+	// -------------------------------------------------------------- tok/s chart
+
+	/**
+	 * #364 S4: the chart's per-column band stack (one `{top, role}` object per
+	 * non-zero role per column — up to plotW × #roles per frame) as two reused
+	 * arrays with a count, re-emptied for every column.
+	 */
+	readonly bandTop: number[] = [];
+	readonly bandRole: string[] = [];
+	/** Bands used by the column being painted; reset per column, so `begin` only has to match. */
+	bandCount = 0;
+	/** The chart's role list for this frame (stats order first, then series-only roles). */
+	readonly chartRoles: string[] = [];
+
+	/**
+	 * #369 (contract §3): these containers are a process-wide singleton, so a
+	 * nested render would clear what the outer call is still reading and paint into
+	 * a half-built frame. Always on: one boolean read on entry, no allocation.
+	 */
+	painting = false;
+
+	/**
+	 * The single reset point (contract §1/§2): one call at the top of each painter,
+	 * before its first early return.
+	 *
+	 * Every step is an in-place empty — `Map.clear()` / `Set.clear()` /
+	 * `array.length = 0` / a counter back to 0 / the grid's `m`+`z` fields — so no
+	 * container changes identity and a frame allocates nothing for its scaffolding.
+	 * It is idempotent (contract §1.3): all four kinds of reset are, so calling it
+	 * twice for one frame is the same state as calling it once.
+	 *
+	 * `rect` is contract §2's frozen signature and is deliberately not used to size
+	 * the braille grid: `drawChart` hands `begin` the chart's rect, and the galaxy
+	 * and chart panes never share a pixel budget, so keying the grid on the rect
+	 * here would rebuild it twice per frame — exactly the per-frame allocation
+	 * #364 removed. The grid's size key is the mounted grid's own dimensions and
+	 * `pixelGrid()` is the one place that sizes it; `begin` only empties it, which
+	 * is what keeps this reset unconditional (contract §1.1) for both painters.
+	 */
+	begin(rect: Rect): void {
+		for (let y = 0; y < this.pxHeight; y++) {
+			const row = this.pxGrid[y]!;
+			for (let x = 0; x < this.pxWidth; x++) {
+				const cell = row[x]!;
+				cell.m = 0;
+				cell.z = -1;
+			}
+		}
+		this.leafMemo.clear();
+		this.leafGuard.clear();
+		this.depthGuard.clear();
+		this.layGuard.clear();
+		this.rel.clear();
+		this.radii.clear();
+		this.pos.clear();
+		this.posCount = 0;
+		this.all.length = 0;
+		this.running.length = 0;
+		this.candidates.length = 0;
+		this.roles.length = 0;
+		this.statusItems.length = 0;
+		// The counters are also the LENGTH of posX/posY and occX/occY/occW: dropping a
+		// reset here would not change a byte (readers stay below the counter) but the
+		// arrays would grow across frames forever, so they are memory hygiene, not
+		// removable redundancy (contract §6.3).
+		this.occCount = 0;
+		this.bandCount = 0;
+		this.chartRoles.length = 0;
+	}
+
+	/**
+	 * The braille buffer for a `width × height` pixel budget: the mounted grid when
+	 * the budget did not change (it is already empty — `begin` emptied it), a fresh
+	 * zeroed one when it did. Resizing is the only allocation in this class and it
+	 * happens on a pane resize, never per frame.
+	 */
+	pixelGrid(width: number, height: number): PxCell[][] {
+		if (width === this.pxWidth && height === this.pxHeight) return this.pxGrid;
+		const rows: PxCell[][] = new Array(height);
+		for (let y = 0; y < height; y++) {
+			const row: PxCell[] = new Array(width);
+			for (let x = 0; x < width; x++) row[x] = { m: 0, col: "", z: -1 };
+			rows[y] = row;
+		}
+		this.pxGrid = rows;
+		this.pxWidth = width;
+		this.pxHeight = height;
+		return rows;
+	}
+}
+
+/** The one instance (contract §1). */
+const g = new GalaxyScratch();
+
+/**
+ * #369 (contract §3): enter a painter, or refuse a nested one. The gate reads one
+ * boolean and allocates nothing on the happy path (the message is built only on
+ * the throw) — and the caller's `finally` is what clears it again, including on
+ * the early returns.
+ */
+function enterPanel(fn: "drawGalaxy" | "drawChart"): void {
+	if (g.painting) throw new Error(`viz: ${fn} is not reentrant`);
+	g.painting = true;
+}
 
 export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: string | undefined): void {
+	// The gate comes before `begin`: a nested call must not wipe the containers the
+	// outer frame is still painting from before it throws.
+	enterPanel("drawGalaxy");
+	try {
+		g.begin(r);
+		paintGalaxy(cv, r, data, selectedId);
+	} finally {
+		g.painting = false;
+	}
+}
+
+/**
+ * `drawGalaxy`'s body (contract §2): the frame's containers are empty on entry —
+ * `begin` ran before the size check, so no early return below can leave a
+ * container dirty for the next frame.
+ */
+function paintGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: string | undefined): void {
 	if (r.w < 6 || r.h < 3) return;
 	const legendRows = 1;
 	const CW = r.w;
 	const CH = r.h - legendRows;
 	const PW = CW * 2;
 	const PH = CH * 4;
-	const px = pixelGrid(CW, CH);
+	const px = g.pixelGrid(CW, CH);
 	const dot = (x: number, y: number, col: string, z: number): void => {
 		const ix = Math.round(x);
 		const iy = Math.round(y);
@@ -254,59 +377,54 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	const childrenOf = (node: VizNode): readonly VizNode[] => node === virtualRoot ? roots : kids.get(node.id) ?? NO_NODES;
 	const center = virtualRoot ?? roots[0]!;
 	if (!center) return;
-	// Leaf counts (contract T3: id-keyed, so this memo is frame-scoped only).
-	// The old signature was `leaves(node, guard = new Set())`, i.e. one throw-away
-	// Set per call site — ~2N−1 per frame — while only the first call ever walks
-	// (every later one is a memo hit). A cleared shared set reproduces the exact
-	// "fresh guard per top-level call" semantics for free.
-	galaxyLeafMemo.clear();
+	// Leaf counts (contract T3: id-keyed, so this memo is frame-scoped only — `begin`
+	// emptied it). The old signature was `leaves(node, guard = new Set())`, i.e. one
+	// throw-away Set per call site — ~2N−1 per frame — while only the first call ever
+	// walks (every later one is a memo hit). A cleared shared set reproduces the exact
+	// "fresh guard per top-level call" semantics for free — which is why `leafGuard`
+	// is cleared per top-level call below and not only per frame.
 	const leavesWalk = (node: VizNode): number => {
-		const memo = galaxyLeafMemo.get(node.id);
+		const memo = g.leafMemo.get(node.id);
 		if (memo !== undefined) return memo;
-		if (galaxyLeafGuard.has(node.id)) return 1;
-		galaxyLeafGuard.add(node.id);
+		if (g.leafGuard.has(node.id)) return 1;
+		g.leafGuard.add(node.id);
 		const children = childrenOf(node);
 		let value = 1;
 		if (children.length > 0) {
 			value = 0;
 			for (const child of children) value += leavesWalk(child);
 		}
-		galaxyLeafMemo.set(node.id, value);
+		g.leafMemo.set(node.id, value);
 		return value;
 	};
 	const leaves = (node: VizNode): number => {
-		const memo = galaxyLeafMemo.get(node.id);
+		const memo = g.leafMemo.get(node.id);
 		if (memo !== undefined) return memo;
-		galaxyLeafGuard.clear();
+		g.leafGuard.clear();
 		return leavesWalk(node);
 	};
 	let maxRel = 1;
-	galaxyRel.clear();
-	galaxyDepthGuard.clear();
 	(function depth(node: VizNode, d: number, guard: Set<string>): void {
 		if (guard.has(node.id)) return;
 		guard.add(node.id);
-		galaxyRel.set(node.id, d);
+		g.rel.set(node.id, d);
 		maxRel = Math.max(maxRel, d);
 		for (const child of childrenOf(node)) depth(child, d + 1, guard);
-	})(center, 0, galaxyDepthGuard);
+	})(center, 0, g.depthGuard);
 	const cx = PW / 2;
 	const cy = PH / 2;
 	const RY = Math.max(2, PH / 2 - 3);
 	const RX = Math.max(2, PW / 2 - 6);
-	galaxyPos.clear();
-	galaxyPosCount = 0;
-	galaxyLayGuard.clear();
 	(function lay(node: VizNode, a0: number, a1: number, guard: Set<string>): void {
 		if (guard.has(node.id)) return;
 		guard.add(node.id);
 		const a = (a0 + a1) / 2;
-		const d = galaxyRel.get(node.id) ?? 0;
+		const d = g.rel.get(node.id) ?? 0;
 		const k = Math.pow(d / maxRel, 0.85);
-		galaxyPos.set(node.id, galaxyPosCount);
-		galaxyPosX[galaxyPosCount] = cx + Math.cos(a) * RX * k;
-		galaxyPosY[galaxyPosCount] = cy + Math.sin(a) * RY * k;
-		galaxyPosCount += 1;
+		g.pos.set(node.id, g.posCount);
+		g.posX[g.posCount] = cx + Math.cos(a) * RX * k;
+		g.posY[g.posCount] = cy + Math.sin(a) * RY * k;
+		g.posCount += 1;
 		let start = a0;
 		const total = leaves(node);
 		for (const child of childrenOf(node)) {
@@ -314,41 +432,39 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 			lay(child, start, start + span, guard);
 			start += span;
 		}
-	})(center, -Math.PI / 2, Math.PI * 1.5, galaxyLayGuard);
+	})(center, -Math.PI / 2, Math.PI * 1.5, g.layGuard);
 
 	for (let d = 1; d <= maxRel; d++) {
 		const k = Math.pow(d / maxRel, 0.85);
 		for (let a = 0; a < Math.PI * 2; a += 0.02) if (Math.floor(a * 60) % 4 === 0) dot(cx + Math.cos(a) * RX * k, cy + Math.sin(a) * RY * k, "borderMuted", 0);
 	}
-	galaxyAll.length = 0;
-	if (virtualRoot) galaxyAll.push(virtualRoot);
-	for (const node of nodes) galaxyAll.push(node);
-	for (const node of galaxyAll) {
+	if (virtualRoot) g.all.push(virtualRoot);
+	for (const node of nodes) g.all.push(node);
+	for (const node of g.all) {
 		const parentId = node === virtualRoot ? undefined : node.parentId ?? (virtualRoot ? virtualRoot.id : undefined);
 		if (!parentId) continue;
-		const ai = galaxyPos.get(parentId);
-		const bi = galaxyPos.get(node.id);
+		const ai = g.pos.get(parentId);
+		const bi = g.pos.get(node.id);
 		if (ai === undefined || bi === undefined) continue;
-		const ax = galaxyPosX[ai]!;
-		const ay = galaxyPosY[ai]!;
-		const bx = galaxyPosX[bi]!;
-		const by = galaxyPosY[bi]!;
+		const ax = g.posX[ai]!;
+		const ay = g.posY[ai]!;
+		const bx = g.posX[bi]!;
+		const by = g.posY[bi]!;
 		const dist = hypot2(bx - ax, by - ay);
 		const col = node.status === "running" ? roleColor(node.role) : node.status === "failed" ? "error" : "borderMuted";
 		for (let t = 0; t < dist; t += 1.7) dot(ax + ((bx - ax) * t) / dist, ay + ((by - ay) * t) / dist, col, 1);
 	}
 	let maxTokens = 1;
 	for (const node of nodes) if (node.tokens > maxTokens) maxTokens = node.tokens;
-	galaxyRadii.clear();
-	for (const node of galaxyAll) {
-		const index = galaxyPos.get(node.id);
+	for (const node of g.all) {
+		const index = g.pos.get(node.id);
 		if (index === undefined) continue;
-		const x = galaxyPosX[index]!;
-		const y = galaxyPosY[index]!;
+		const x = g.posX[index]!;
+		const y = g.posY[index]!;
 		const isCenter = node === center;
 		const col = isCenter ? roleColor(node.role) : nodeToken(node);
 		let rad = isCenter ? Math.max(2, Math.min(5, PH / 14)) : Math.max(node.status === "failed" ? 1.5 : 0.8, 0.8 + Math.sqrt(node.tokens / maxTokens) * Math.min(4, PH / 16));
-		galaxyRadii.set(node.id, rad);
+		g.radii.set(node.id, rad);
 		if (node.status === "running" && !isCenter) {
 			const act = Math.min(1, data.sampler.nodeRate(node.id, data.now) / 250);
 			for (let i = 0; i < 12 + rad * 6; i++) {
@@ -382,44 +498,41 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 		}
 	}
 	// Labels: selected, center, depth-1 live, failed, and the heaviest running agents.
-	galaxyRunning.length = 0;
-	for (const node of nodes) if (node.status === "running" && isAgent(node)) galaxyRunning.push(node.tokens);
-	galaxyRunning.sort((a, b) => b - a);
-	const heavy = galaxyRunning[Math.min(galaxyRunning.length - 1, 4)] ?? Number.POSITIVE_INFINITY;
-	galaxyCandidates.length = 0;
-	for (const node of galaxyAll) {
+	for (const node of nodes) if (node.status === "running" && isAgent(node)) g.running.push(node.tokens);
+	g.running.sort((a, b) => b - a);
+	const heavy = g.running[Math.min(g.running.length - 1, 4)] ?? Number.POSITIVE_INFINITY;
+	for (const node of g.all) {
 		if (
 			node.id === selectedId || node === center || node.status === "failed" ||
-			((galaxyRel.get(node.id) ?? 9) <= 1 && node.status !== "retired") ||
+			((g.rel.get(node.id) ?? 9) <= 1 && node.status !== "retired") ||
 			(node.status === "running" && node.tokens >= heavy)
-		) galaxyCandidates.push(node);
+		) g.candidates.push(node);
 	}
-	galaxyCandidates.sort((a, b) =>
+	g.candidates.sort((a, b) =>
 		Number(b.id === selectedId) - Number(a.id === selectedId) ||
 		Number(b === center) - Number(a === center) ||
 		b.tokens - a.tokens,
 	);
-	galaxyOccCount = 0;
 	const free = (x: number, y: number, w: number): boolean => {
 		if (!(x >= r.x && x + w <= r.x + r.w && y >= r.y && y < r.y + CH)) return false;
-		for (let i = 0; i < galaxyOccCount; i++) {
-			const oy = galaxyOccY[i]!;
-			const ox = galaxyOccX[i]!;
-			const ow = galaxyOccW[i]!;
+		for (let i = 0; i < g.occCount; i++) {
+			const oy = g.occY[i]!;
+			const ox = g.occX[i]!;
+			const ow = g.occW[i]!;
 			if (oy === y && x < ox + ow + 1 && ox < x + w + 1) return false;
 		}
 		return true;
 	};
-	for (const node of galaxyCandidates) {
-		const index = galaxyPos.get(node.id);
+	for (const node of g.candidates) {
+		const index = g.pos.get(node.id);
 		if (index === undefined) continue;
-		const px0 = galaxyPosX[index]!;
-		const py0 = galaxyPosY[index]!;
+		const px0 = g.posX[index]!;
+		const py0 = g.posY[index]!;
 		const lx = r.x + Math.round(px0 / 2);
 		const ly = r.y + Math.round(py0 / 4);
 		const label = ellipsize(node.name + (node.status === "failed" ? " ✗" : ""), Math.max(4, Math.floor(r.w / 3)));
 		const len = cellWidth(label);
-		const rw = Math.ceil((galaxyRadii.get(node.id) ?? 1) * (node === center ? 1.6 : 1) / 2) + (node.id === selectedId ? 3 : 1);
+		const rw = Math.ceil((g.radii.get(node.id) ?? 1) * (node === center ? 1.6 : 1) / 2) + (node.id === selectedId ? 3 : 1);
 		const right = px0 >= cx - 4;
 		const sides = right ? SIDES_RIGHT : SIDES_LEFT;
 		let placed = false;
@@ -431,10 +544,10 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 				if (!free(sx, ly + dy, len)) continue;
 				const selected = node.id === selectedId;
 				cv.text(sx, ly + dy, label, node === center ? roleColor(node.role) : nodeToken(node), selected ? LABEL_STYLE_SELECTED : LABEL_STYLE);
-				galaxyOccX[galaxyOccCount] = sx;
-				galaxyOccY[galaxyOccCount] = ly + dy;
-				galaxyOccW[galaxyOccCount] = len;
-				galaxyOccCount += 1;
+				g.occX[g.occCount] = sx;
+				g.occY[g.occCount] = ly + dy;
+				g.occW[g.occCount] = len;
+				g.occCount += 1;
 				placed = true;
 				break;
 			}
@@ -444,28 +557,26 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
 	// Reserve room for failed/retired glyphs first so a narrow panel still matches live scout (#102/#125).
 	const legendY = r.y + r.h - 1;
 	let legendX = r.x + 1;
-	galaxyRoles.length = 0;
-	for (const node of dfsOrder(nodes, kids)) if (isAgent(node) && !galaxyRoles.includes(node.role)) galaxyRoles.push(node.role);
+	for (const node of dfsOrder(nodes, kids)) if (isAgent(node) && !g.roles.includes(node.role)) g.roles.push(node.role);
 	let hasFailed = false;
 	let hasRetired = false;
 	for (const node of nodes) {
 		if (node.status === "failed") hasFailed = true;
 		else if (node.status === "retired") hasRetired = true;
 	}
-	galaxyStatusItems.length = 0;
-	for (const item of STATUS_ITEMS) if (item[0] === "failed" ? hasFailed : hasRetired) galaxyStatusItems.push(item);
+	for (const item of STATUS_ITEMS) if (item[0] === "failed" ? hasFailed : hasRetired) g.statusItems.push(item);
 	// Budget in grapheme cells (not String.length) so multi-byte / emoji labels do not squeeze roles (#128).
 	let statusBudget = 0;
-	for (const item of galaxyStatusItems) statusBudget += cellWidth(item[1]) + 2;
+	for (const item of g.statusItems) statusBudget += cellWidth(item[1]) + 2;
 	const roleLimit = r.x + r.w - 1 - statusBudget;
-	for (const role of galaxyRoles) {
+	for (const role of g.roles) {
 		const w = cellWidth(role) + 4;
 		if (legendX + w > roleLimit) break;
 		cv.set(legendX, legendY, "⣿", roleColor(role));
 		cv.text(legendX + 2, legendY, role, "dim");
 		legendX += w;
 	}
-	for (const item of galaxyStatusItems) {
+	for (const item of g.statusItems) {
 		const label = item[1];
 		const lw = cellWidth(label);
 		if (legendX + lw + 1 > r.x + r.w - 1) break;
@@ -578,17 +689,6 @@ function axisRule(width: number): string {
 }
 
 /**
- * #364 S4: the chart's per-column band stack (one `{top, role}` object per
- * non-zero role per column — up to plotW × #roles per frame) as two reused
- * arrays with a count, re-emptied for every column.
- */
-const CHART_BAND_TOP: number[] = [];
-const CHART_BAND_ROLE: string[] = [];
-let chartBandCount = 0;
-/** The chart's role list for this frame (stats order first, then series-only roles). */
-const CHART_ROLES: string[] = [];
-
-/**
  * #346: the frame's bucketing pass — ONE per frame, shared by `drawChart`'s body
  * and `computeStats`.
  *
@@ -602,6 +702,19 @@ export function chartBuckets(data: ViewData, count: number, window: { from: numb
 }
 
 export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode | undefined, wideStats: boolean): void {
+	// Same gate as `drawGalaxy` (contract §3): they share `g`, so a chart painted
+	// from inside a galaxy frame would read half-built containers.
+	enterPanel("drawChart");
+	try {
+		g.begin(r);
+		paintChart(cv, r, data, selected, wideStats);
+	} finally {
+		g.painting = false;
+	}
+}
+
+/** `drawChart`'s body: the chart's containers are empty on entry (contract §2). */
+function paintChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode | undefined, wideStats: boolean): void {
 	if (r.w < 12 || r.h < 4) return;
 	const statsW = wideStats && r.w >= 64 ? 28 : 0;
 	const statsBelow = statsW === 0 ? Math.min(selected ? 4 : 3, Math.max(0, r.h - 6)) : 0;
@@ -617,35 +730,34 @@ export function drawChart(cv: Canvas, r: Rect, data: ViewData, selected: VizNode
 	const stats = computeStats(data, plotW, series, { from, to });
 	const max = Math.max(1, stats.peak * 1.15);
 	const rowsFor = (v: number): number => (v / max) * plotH;
-	CHART_ROLES.length = 0;
-	for (const entry of stats.byRole) CHART_ROLES.push(entry.role);
-	for (const role of series.byRole.keys()) if (!CHART_ROLES.includes(role)) CHART_ROLES.push(role);
+	for (const entry of stats.byRole) g.chartRoles.push(entry.role);
+	for (const role of series.byRole.keys()) if (!g.chartRoles.includes(role)) g.chartRoles.push(role);
 
 	for (let i = 0; i < plotW; i++) {
 		let acc = 0;
-		chartBandCount = 0;
-		for (let ri = 0; ri < CHART_ROLES.length; ri++) {
-			const role = CHART_ROLES[ri]!;
+		g.bandCount = 0;
+		for (let ri = 0; ri < g.chartRoles.length; ri++) {
+			const role = g.chartRoles[ri]!;
 			const value = series.byRole.get(role)?.[i] ?? 0;
 			if (value <= 0) continue;
 			acc += value;
-			CHART_BAND_TOP[chartBandCount] = rowsFor(acc);
-			CHART_BAND_ROLE[chartBandCount] = role;
-			chartBandCount += 1;
+			g.bandTop[g.bandCount] = rowsFor(acc);
+			g.bandRole[g.bandCount] = role;
+			g.bandCount += 1;
 		}
 		const top = rowsFor(acc);
 		// The same two lookups the object array served: the first band whose top
 		// covers the row centre, else the last band; and the topmost role for the
 		// partial (▁▂▃…) cell.
-		const lastRole = chartBandCount > 0 ? CHART_BAND_ROLE[chartBandCount - 1]! : undefined;
+		const lastRole = g.bandCount > 0 ? g.bandRole[g.bandCount - 1]! : undefined;
 		for (let j = 0; j < plotH; j++) {
 			const center = j + 0.5;
 			const y = axisY - 1 - j;
 			if (top >= j + 1) {
 				let bandRole: string | undefined;
-				for (let b = 0; b < chartBandCount; b++) {
-					if (CHART_BAND_TOP[b]! >= center) {
-						bandRole = CHART_BAND_ROLE[b]!;
+				for (let b = 0; b < g.bandCount; b++) {
+					if (g.bandTop[b]! >= center) {
+						bandRole = g.bandRole[b]!;
 						break;
 					}
 				}
