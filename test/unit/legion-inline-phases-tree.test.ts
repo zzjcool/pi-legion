@@ -23,7 +23,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { inlinePhaseMachineForNode } from "../../index.ts";
+import { createInlineMachineLookup, inlinePhaseMachineForNode } from "../../index.ts";
 import { createSessionRuntime } from "../../src/extension/runtime.ts";
 import type { PhaseMachine } from "../../src/legion/phase-machine.ts";
 import { RunStore } from "../../src/runs/store.ts";
@@ -275,7 +275,24 @@ test("#372 M1: every run has a `root.team` — only the DISPATCHING run answers,
 	});
 });
 
-test("#372 m3: a render asks ONCE per team root, not once per descendant", async () => {
+/** Count `listRuns` at the STORE boundary, so a seam that reads twice goes red. */
+function countingStore(store: RunStore): { store: Pick<RunStore, "listRuns">; reads: () => number } {
+	let reads = 0;
+	const proxy = new Proxy(store, {
+		get(target, property, receiver) {
+			if (property === "listRuns") {
+				return () => {
+					reads += 1;
+					return target.listRuns();
+				};
+			}
+			return Reflect.get(target, property, receiver);
+		},
+	});
+	return { store: proxy, reads: () => reads };
+}
+
+test("#372 m3: a render asks ONCE per team root, and reads the registry ONCE", async () => {
 	await withTempDir(async (dir) => {
 		const store = new RunStore({ rootDir: dir });
 		const run = store.createRun({ task: "team task", cwd: dir, maxDepth: 2, nodeId: "root" });
@@ -291,36 +308,91 @@ test("#372 m3: a render asks ONCE per team root, not once per descendant", async
 				node(`root.team.w${index}`, "root.team", `w${index}`, 2, "worker", null, `r-team-w${index}`)),
 		];
 
+		// Counting happens at the STORE, not in this test's own callback: a seam that
+		// called `listRuns()` twice inside one lookup would be counted twice here,
+		// which is what makes the assertion non-tautological (round-2 review, minor 2).
+		const counted = countingStore(store);
 		let seamCalls = 0;
-		let registryReads = 0;
+		// Assigned AFTER construction: the runtime paints once while being built, and
+		// that paint must not pre-warm the wiring cache this case is measuring. A cold
+		// cache is the state a freshly launched panel is in.
+		let lookup: ReturnType<typeof createInlineMachineLookup> | undefined;
 		const runtime = createSessionRuntime({
 			sendMessage() {},
 			getTreeNodes: () => nodes,
 			getPhaseMachineForNode: (target) => {
+				if (!lookup) return undefined;
 				seamCalls += 1;
-				registryReads += 1;
-				return inlinePhaseMachineForNode(target.id, store.listRuns(), target.parentRunId);
+				return lookup(target);
 			},
 		});
+		lookup = createInlineMachineLookup({ cwd: () => dir, runStoreFor: () => counted.store });
 
-		// Construction paints once, so the first render is measured as a DELTA rather
-		// than as an absolute count.
+		// Measured as a DELTA so the construction-time paint cannot leak in.
 		const askedBefore = seamCalls;
-		const readBefore = registryReads;
+		const readsBefore = counted.reads();
 		const rendered = runtime.treeNodes();
 		assert.deepEqual(rendered.find((entry) => entry.id === "root.team")?.phaseMachine, INLINE_MACHINE, "the real store answered");
 		// The walk reaches this team root from the team itself AND from every worker.
-		// Without a per-snapshot memo this is one ask per descendant (N + 1) and as many
-		// registry reads — which is what made an undeclared team pay on every repaint.
+		// Without a per-snapshot memo this is N + 1 asks.
 		assert.equal(seamCalls - askedBefore, 1, `one ask for the team root, not one per descendant (${workers} workers)`);
-		assert.equal(registryReads - readBefore, 1, "…and one runs-registry read behind it");
+		assert.equal(counted.reads() - readsBefore, 1, "…and exactly one runs-registry read at the store boundary");
 		for (const worker of rendered.filter((entry) => entry.id.startsWith("root.team.w"))) {
 			assert.deepEqual(worker.phaseMachine, INLINE_MACHINE, "every worker inherited the ONE answer");
 		}
 
-		// The memo is scoped to a snapshot: a repaint asks again, still exactly once.
+		// The runtime memo is scoped to a snapshot, so a repaint asks again — and the
+		// wiring's positive cache answers it without touching the registry.
 		runtime.treeNodes();
-		assert.equal(seamCalls - askedBefore, 2, "per render, not per node and not forever");
-		assert.equal(registryReads - readBefore, 2);
+		assert.equal(seamCalls - askedBefore, 2, "the runtime asks per render, not per node and not forever");
+		assert.equal(counted.reads() - readsBefore, 1, "the wiring cache absorbs the repaint (no second registry read)");
+	});
+});
+
+test("#372 minor 1: the wiring is run-scoped, forwards the dispatching run, and heals its own misses", async () => {
+	await withTempDir(async (dir) => {
+		let clock = 1_000;
+		const store = new RunStore({ rootDir: dir, now: () => (clock += 1) });
+		// THREE runs, all owning `root.team` — the collision that #372 M1 is about.
+		// `listRuns()` is oldest-first, so an id-keyed scan or an id-keyed cache would
+		// hand the FIRST one's answer to all three.
+		const first = store.createRun({ task: "first", cwd: dir, maxDepth: 2, nodeId: "root" });
+		await store.addChild(first.runId, record("team", dir, "root.team", CARD_MACHINE));
+		const second = store.createRun({ task: "second", cwd: dir, maxDepth: 2, nodeId: "root" });
+		await store.addChild(second.runId, record("team", dir, "root.team"));
+		const third = store.createRun({ task: "third", cwd: dir, maxDepth: 2, nodeId: "root" });
+		await store.addChild(third.runId, record("team", dir, "root.team", INLINE_MACHINE));
+
+		let now = 10_000;
+		const counted = countingStore(store);
+		const lookup = createInlineMachineLookup({
+			cwd: () => dir,
+			runStoreFor: () => counted.store,
+			now: () => now,
+		});
+		const ask = (parentRunId: string) => lookup({ id: "root.team", role: "centurion", parentRunId });
+
+		// (c) the THIRD argument is really passed through: three runs, three answers —
+		// an id-only answer (or a dropped `parentRunId`) collapses them into one.
+		assert.deepEqual(ask(first.runId), CARD_MACHINE, "the first run's own declaration");
+		assert.equal(ask(second.runId), undefined, "the second run declared nothing — never borrow from another run");
+		assert.deepEqual(ask(third.runId), INLINE_MACHINE, "the third run's own declaration");
+		assert.equal(counted.reads(), 3, "one registry read per distinct (run, node)");
+
+		// (a) cache entries are per (run, node): a shared entry would now answer
+		// the wrong machine for two of the three keys.
+		assert.deepEqual(ask(first.runId), CARD_MACHINE);
+		assert.equal(ask(second.runId), undefined);
+		assert.deepEqual(ask(third.runId), INLINE_MACHINE);
+		assert.equal(counted.reads(), 3, "…and each is served from its own entry, no extra reads");
+
+		// (b) a cached MISS heals itself after the TTL: this is the `persistChild`
+		// race — the row exists a moment before the record does.
+		await store.updateChild(second.runId, "team", (child) => { child.phases = INLINE_MACHINE; });
+		assert.equal(ask(second.runId), undefined, "still inside the TTL: the miss stands");
+		assert.equal(counted.reads(), 3);
+		now += 1_000;
+		assert.deepEqual(ask(second.runId), INLINE_MACHINE, "after the TTL the new declaration is picked up");
+		assert.equal(counted.reads(), 4);
 	});
 });

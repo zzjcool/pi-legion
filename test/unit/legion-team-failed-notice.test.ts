@@ -22,14 +22,20 @@ import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
 import { readEventsAfter } from "../../src/legion/events.ts";
 import { MAIL_DELIVERY, inbox } from "../../src/legion/mail.ts";
+import type { PhaseMachine } from "../../src/legion/phase-machine.ts";
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
-/** root → team (centurion, NO phase) → one child per status given. */
-function undeclaredTeam(childStatuses: readonly string[], teamStatus = "running") {
+/**
+ * root → team (centurion) → one child per status given.
+ *
+ * `phase` defaults to NULL (the undeclared shape #371 introduced); a value makes
+ * it a DECLARED team, which is the shape the round-2 review found unguarded.
+ */
+function teamFixture(childStatuses: readonly string[], teamStatus = "running", phase: string | null = null) {
 	const db = openLegionDb(":memory:");
 	insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
-	insertNode(db, { parentId: "root", name: "team", role: "centurion", status: teamStatus as "running", phase: null }, () => 2);
+	insertNode(db, { parentId: "root", name: "team", role: "centurion", status: teamStatus as "running", phase }, () => 2);
 	childStatuses.forEach((status, index) => {
 		insertNode(db, {
 			parentId: "root.team",
@@ -47,6 +53,7 @@ function postmanFor(
 	nodeId: string,
 	collected: { self: string[]; root: string[] },
 	now: number,
+	machine?: PhaseMachine,
 ) {
 	const eventBus = createLegionEventBus();
 	const busEvents: string[] = [];
@@ -55,6 +62,7 @@ function postmanFor(
 		db,
 		nodeId,
 		supervisor: new FakeSupervisor(),
+		...(machine ? { machine } : {}),
 		eventBus,
 		now: () => now,
 		intervalMs: 10_000,
@@ -64,8 +72,17 @@ function postmanFor(
 	return { postman, busEvents };
 }
 
+/** `recon → build`, with `recon` NON-terminal — the declared shape of a live team. */
+const DECLARED_MACHINE: PhaseMachine = {
+	start: "recon",
+	phases: [
+		{ id: "recon", next: [{ to: "build" }] },
+		{ id: "build", terminal: true, next: [] },
+	],
+};
+
 test("#372 A: a team with NO phase whose children ALL failed is failed, recorded and reported to its parent", async () => {
-	const db = undeclaredTeam(["failed", "failed"]);
+	const db = teamFixture(["failed", "failed"]);
 	const collected = { self: [] as string[], root: [] as string[] };
 	try {
 		const { postman, busEvents } = postmanFor(db, "root.team", collected, 100);
@@ -104,7 +121,7 @@ test("#372 A: a team with NO phase whose children ALL failed is failed, recorded
 });
 
 test("#372 A control: one child still working means the team keeps running", async () => {
-	const db = undeclaredTeam(["failed", "running"]);
+	const db = teamFixture(["failed", "running"]);
 	const collected = { self: [] as string[], root: [] as string[] };
 	try {
 		const { postman, busEvents } = postmanFor(db, "root.team", collected, 100);
@@ -126,7 +143,7 @@ test("#372 A: the verdict reaches the LEDGER with no event bus attached (headles
 	// subscriber, so an event written that way exists only when someone is
 	// listening. The failure has to be in the ledger regardless: a headless run is
 	// exactly where nobody re-derives it from a stream.
-	const db = undeclaredTeam(["failed"]);
+	const db = teamFixture(["failed"]);
 	const collected = { self: [] as string[], root: [] as string[] };
 	try {
 		const postman = new LegionPostman({
@@ -151,31 +168,42 @@ test("#372 A: the verdict reaches the LEDGER with no event bus attached (headles
 	}
 });
 
-test("#372 m1: a PAUSED (retired) or already-settled team is never judged failed — it stays resumable", async () => {
+test("#372 m1: a PAUSED (retired) or already-settled team is never judged failed — declared or not", async () => {
 	// `docs/contracts/legion-session-continuity-v1.md` §3: an exit PAUSES a subtree
 	// (`status: retired`, phase and stint untouched) and that is exactly what keeps
 	// it resumable. Judging such a team failed would make `isTerminalNode` true and
 	// `reviveChild` refuse it with CHILD_TERMINAL — the pause would become a verdict
 	// nobody pronounced. The same holds for a team whose row already ended
 	// (`settled`): there is nothing left in flight to fail.
+	//
+	// Round-2 review (major): the guard must sit BEFORE the phase fork. With it
+	// only on the undeclared branch, a team that had DECLARED a machine
+	// (`phase: "recon"`, non-terminal) was moved to `failed` anyway — the paused
+	// team became unresumable, the parent got a "Team failed" mail for a run that
+	// had already ended, and the ledger carried `node_settled` next to
+	// `phase_change(failed)`. Both shapes are covered here.
 	for (const status of ["retired", "settled"] as const) {
-		const db = undeclaredTeam(["failed", "failed"], status);
-		const collected = { self: [] as string[], root: [] as string[] };
-		try {
-			const { postman } = postmanFor(db, "root.team", collected, 100);
-			await postman.tick();
-			postman.stop();
+		for (const declared of [false, true]) {
+			const phase = declared ? "recon" : null;
+			const label = `${status}/${declared ? "declared" : "undeclared"}`;
+			const db = teamFixture(["failed", "failed"], status, phase);
+			const collected = { self: [] as string[], root: [] as string[] };
+			try {
+				const { postman } = postmanFor(db, "root.team", collected, 100, declared ? DECLARED_MACHINE : undefined);
+				await postman.tick();
+				postman.stop();
 
-			assert.equal(getNode(db, "root.team")?.status, status, `${status}: the row keeps the status it had`);
-			assert.equal(
-				readEventsAfter(db, 0).filter((event) => event.type === "node_failed").length,
-				0,
-				`${status}: no verdict is written for a team that is not running`,
-			);
-			assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.PENDING }).length, 0, `${status}: and no notice is sent`);
-			assert.deepEqual(collected.self, []);
-		} finally {
-			db.close();
+				const row = getNode(db, "root.team");
+				assert.equal(row?.status, status, `${label}: the row keeps the status it had`);
+				assert.equal(row?.phase, phase, `${label}: and the phase it had`);
+				const events = readEventsAfter(db, 0);
+				assert.equal(events.filter((event) => event.type === "node_failed").length, 0, `${label}: no verdict is written`);
+				assert.equal(events.filter((event) => event.type === "phase_change").length, 0, `${label}: no phase is moved`);
+				assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.PENDING }).length, 0, `${label}: and no notice is sent`);
+				assert.deepEqual(collected.self, [], `${label}: nothing is announced locally either`);
+			} finally {
+				db.close();
+			}
 		}
 	}
 });
