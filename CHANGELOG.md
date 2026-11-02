@@ -90,7 +90,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   恢复——pre-#371 的 `phase → failed` 本来也是不可恢复的，两种写法现在给出同一个结论。**判决是硬的**：lead 那一轮
   仍会正常结束，收队 drain 不再把 `failed` 改写成 `settled`（以前会：账本里留下「`node_failed` 事件 + `settled` 行」
   的自相矛盾，队伍还会重新变成可恢复）。只有「全队失败」这类 supervisor 判决受保护，普通子节点的 drain 行为逐字不变。
-  **暂停中的队伍不受影响**：`retired`（会话退出时的暂停）或已经结束的队伍不会被本路径判失败，仍可恢复
+  **已经结束的队伍一律不再判定**：`retired`（会话退出时的暂停）或已经结束（`settled`）的队伍，**不管有没有声明
+  相位机器**，都不会被本路径判失败——相位原样保留、不发通知、父级也不会多收一条「Team failed」，因此仍可恢复
   （`legion-session-continuity-v1.md` §3）。root 行同样不受影响（它不是队伍；把 root 判失败会让寻址到 root
   的邮件全部退回）。
 - **内联声明的相位机器现在也显示在 `/legion` 树里 (#372).** 面板取机器只有「按角色查角色卡」一条路，而 #371
