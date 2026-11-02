@@ -112,6 +112,8 @@ import {
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
 import {
+	beginMailHold,
+	endMailHold,
 	pollInbox,
 	redeliverMail,
 	renderReleasedMail,
@@ -2986,6 +2988,10 @@ export async function collectChild(
 	mail?: MailReleaseSeam,
 ): Promise<AgentToolResult<unknown>> {
 	let stopPolling: (() => void) | undefined;
+	// #384 review round 3: same hold as `wait` — this node's postman stays off its inbox
+	// for the whole collect (entry check, interruptible seam and orchestrator fallback
+	// alike), and the `finally` below hands it back on every exit path.
+	if (mail) beginMailHold(mail.nodeId);
 	try {
 		if (signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
 		// #384: the inbox is checked BEFORE anything claims a result, so a preempted
@@ -3119,6 +3125,7 @@ export async function collectChild(
 	} finally {
 		// #384: never leave a 250ms timer behind a finished collect.
 		stopPolling?.();
+		if (mail) endMailHold(mail.nodeId);
 	}
 }
 
@@ -5674,6 +5681,14 @@ export async function waitAction(input: {
 		: signal;
 	let stopPolling: (() => void) | undefined;
 	if (mail) stopPolling = pollInbox(mail, () => mailAbort.abort(MAIL_PREEMPT_REASON));
+	// #384 review round 3: while this call is blocked, this node's own postman must NOT
+	// deliver — otherwise the mail is `ACCEPTED` and queued behind the host's followUp
+	// long before the first poll tick, and the wait sees an empty inbox for its whole
+	// timeout (the production hole the review found). Held across the ONE blocking
+	// region and released in `finally`, so a timeout, an abort and a throw all give the
+	// inbox back. Taking the mail below happens after that release, with no `await` in
+	// between, so nothing can slip into the gap.
+	if (mail) beginMailHold(mail.nodeId);
 	let results: WaitResult[];
 	try {
 		results = await runtime.wait(targets.names, {
@@ -5683,6 +5698,7 @@ export async function waitAction(input: {
 	} finally {
 		// #384: never leave a 250ms timer behind a finished wait.
 		stopPolling?.();
+		if (mail) endMailHold(mail.nodeId);
 	}
 	// #384 review P0-2: mail preempts this wait UNCONDITIONALLY — no "did anything get
 	// delivered" test, no "did the probe run" test. Those two extra conditions were an

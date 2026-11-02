@@ -13,7 +13,7 @@ import type { LegionSettings, TurnRecord } from "../shared/types.ts";
 import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
-import { MAIL_DELIVERY_CLAIM_LEASE_MS } from "../legion/mail-release.ts";
+import { isMailHeld, MAIL_DELIVERY_CLAIM_LEASE_MS } from "../legion/mail-release.ts";
 import type { LegionEventBus } from "./event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
 import { ALL_CHILDREN_FAILED_REASON } from "../legion/interrupt.ts";
@@ -212,6 +212,13 @@ export class LegionPostman {
 	}
 
 	private async deliverRootInbox(): Promise<void> {
+		// #384 review round 3: a blocked `wait`/`collect` from this node owns its inbox.
+		// Delivering now would push the text into the host's followUp queue (measured:
+		// ~200ms after the write) and leave the tool's poll staring at an empty PENDING
+		// set for the whole wait — the mail would still arrive only at the turn boundary,
+		// which is the defect #384 exists to remove. The hold is released on every exit
+		// path of the blocking call, so a timed-out wait never parks the inbox.
+		if (isMailHeld(this.nodeId)) return;
 		for (const message of pendingInbox(this.db, "root")) {
 			if (this.discardIfStaleNotice(message)) continue;
 			try {

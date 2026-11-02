@@ -66,6 +66,46 @@ export interface MailReleaseSeam {
 	nodeId: string;
 }
 
+/**
+ * Nodes whose postman must hold its inbox because a blocking call is running
+ * (#384 review round 3 — the reason the feature worked in tests but not in life).
+ *
+ * Measured on the issue's own ledger: root's postman moves a message
+ * `PENDING → ACCEPTED` ~200ms after it is written, pushing it into the host's
+ * followUp queue. A `wait` that starts afterwards sees an EMPTY pending inbox for its
+ * whole 15 minutes and preempts nothing — the mail still waits for the turn boundary,
+ * which is the bug #384 set out to fix. So while a blocking call from a node runs,
+ * that node's own postman must not deliver: the message stays `PENDING`, the poll
+ * sees it, and the tool hands it over immediately. Releasing the hold restores the
+ * postman (a `wait` that timed out must not park the inbox forever).
+ *
+ * A counter, not a flag, so nested/overlapping holds cannot release each other early.
+ * Process-wide on purpose: the postman that delivers to a node runs in the SAME
+ * process as that node's tools (this is the root node's case). A child's delivery
+ * happens in the parent process, where this registry is invisible — there the claim
+ * lease keeps the message from being delivered twice, which is all it owes.
+ */
+const mailHolds = new Map<string, number>();
+
+/** Hold this node's postman until the matching {@link endMailHold}. */
+export function beginMailHold(nodeId: string): void {
+	if (!nodeId) throw new TypeError("nodeId must be a non-empty node id");
+	mailHolds.set(nodeId, (mailHolds.get(nodeId) ?? 0) + 1);
+}
+
+/** Release one hold; the postman resumes when the last holder lets go. */
+export function endMailHold(nodeId: string): void {
+	if (!nodeId) throw new TypeError("nodeId must be a non-empty node id");
+	const remaining = (mailHolds.get(nodeId) ?? 0) - 1;
+	if (remaining > 0) mailHolds.set(nodeId, remaining);
+	else mailHolds.delete(nodeId);
+}
+
+/** Is a blocking call from this node currently holding its inbox? */
+export function isMailHeld(nodeId: string): boolean {
+	return (mailHolds.get(nodeId) ?? 0) > 0;
+}
+
 /** Contract §1: is there anything to release right now, that nobody else holds? */
 function pendingMailCount(db: DatabaseSync, nodeId: string): number {
 	if (!nodeId) throw new TypeError("nodeId must be a non-empty node id");
