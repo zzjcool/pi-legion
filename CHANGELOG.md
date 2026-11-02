@@ -11,25 +11,9 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
-### Changed
+## [5.1.0] — 2026-11-02
 
-- **交付物是分支，MR 只是有 remote 时的便利。** 以前角色卡、注入给子节点的任务附录、验证后的提示语都写「开 MR/PR 并把 URL 写进 verdict」，
-  在**零 remote** 的仓库里等于要求一个不可能的东西（实测一次真实会话：centurion 只能交一条待推分支，如实报 `no remote`）。
-  现在统一的措辞是：**分支名 + HEAD sha 就是交付**；仓库有 remote 且 `gh`/`glab` 可用时再附 MR/PR 链接，缺失不算失败，**任何情况下不许编造 URL**。
-  逐级合并权不变（仍由父节点合并，认分支/提交而非平台对象）。见 `docs/legion-v2-contract.md` REV-29。
-
-### Fixed
-
-- **退出会话时不再出现 `Extension error (<boundary>): turn_end could not resolve the persisted
-  assistant entry ID` (#383)。** 这是 pi 宿主在 `turn_end` 边界上的既有缺陷（`dispose()` 之后仍会收尾一个
-  被 abort 的 turn，message 没落盘），扩展这边唯一能做的是**不去触发那个边界**：宿主只在
-  `hasHandlers("turn_end")` 为真时才走这条路径。我们注册的 `turn_end` 只做一次 `bindUi`，而 `bindUi` 已经挂在
-  `turn_start`/`agent_start`/`agent_end`/`agent_settled`/`input`/`tool_result` 上，于是直接不注册——宿主连报错
-  分支都进不去，UI 行为不变。
-- **没有事件总线时账本不再漏记事件 (#380)。** 四处写成 `eventBus?.emit(appendEvent(...))`：可选链在没有
-  订阅者时会把 `appendEvent(...)` 的参数一起短路，于是 headless 宿主（不传 eventBus 的嵌入方）里相位迁移
-  只改了 `nodes.phase`、账本里一条 `phase_change` 都没有，重开账本时历史与真实状态不一致。改成「先写账本、
-  再通知订阅者」；交互模式行为不变。
+一次以**可恢复、可声明的子树**为中心的发布。三个新能力：`centurion` 的状态机改为由 root 派发时用 `phases:` 声明（不声明就是普通 agent）；同一个 session 重开能接回上次的树，退出等于暂停、恢复必须显式；长等待中的 `wait`/`collect` 会在收到子节点邮件时立刻返回。`/legion` 一侧：整帧分配降到 2.0MB 以内（120×40 −59%、200×60 −67%），overlay 改为主屏挂载，状态行能说清子节点正在做什么，且不再每写一格分配一个 `Cell`。另有三十余项稳定性修复：失败队不再静默消失、内联相位机器进树、headless 账本不再漏记、`ctx is stale` 与宿主 `turn_end` 的报错消失。
 
 ### Added
 
@@ -101,6 +85,11 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **交付物是分支，MR 只是有 remote 时的便利。** 以前角色卡、注入给子节点的任务附录、验证后的提示语都写「开 MR/PR 并把 URL 写进 verdict」，
+  在**零 remote** 的仓库里等于要求一个不可能的东西（实测一次真实会话：centurion 只能交一条待推分支，如实报 `no remote`）。
+  现在统一的措辞是：**分支名 + HEAD sha 就是交付**；仓库有 remote 且 `gh`/`glab` 可用时再附 MR/PR 链接，缺失不算失败，**任何情况下不许编造 URL**。
+  逐级合并权不变（仍由父节点合并，认分支/提交而非平台对象）。见 `docs/legion-v2-contract.md` REV-29。
+
 - **长等待中收到子 agent 的邮件会立刻返回，而不是等这一轮结束 (#384).** `legion_mail → root` 走宿主的
   followUp，而宿主只在一轮「本来要停」时才取走它——于是根会话只要在 `subagent({action:"wait"})` 里，邮件就跟着
   一起排队（实测一封冻结契约的邮件等了 17.3 分钟）。现在 `wait`/`collect` 在调用者是 legion 节点时每 250ms 看
@@ -120,9 +109,11 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   只归零计数器，截断它们反而会分配（契约 §1.2），于是「这一帧此刻什么是干净的」只有一个答案。同时两个面板都加了不可重入闸门（嵌套渲染抛 `viz: <fn> is not reentrant`，以前这条
   约束只写在注释里）。用户无感知：可见输出逐字节不变，整帧分配不回退（bench 10 全绿）。
   契约：`docs/contracts/galaxy-scratch-v1.md`。
+
 - **退出/恢复会话时不再打印 `Extension error (/plugin/index.ts): … ctx is stale` (#377).** 宿主在会话销毁后
   仍会派发 `turn_end` / `agent_settled`，扩展入口这时读 ctx 会抛。现在把这种"ctx 已作废"当成「没有 UI」处理
   （与状态栏一直以来的做法一致）：缓存清空、安静返回；其它异常照旧抛出。用户感知：每次退出会话少一行红色噪音。
+
 - **没声明状态机的队伍「全员失败」时不再静默消失 (#372).** #371 之后，没声明 `phases` 的 centurion 出生时
   `nodes.phase` 为空，而「全队都失败」的兜底逻辑开头就写着「没有相位就没什么可判的」——于是这种队伍把 N 个
   worker 全派失败后，账本里没有失败、没有事件、父级什么也收不到，只能等 lead 自己写 verdict。判据改成
@@ -136,6 +127,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   相位机器**，都不会被本路径判失败——相位原样保留、不发通知、父级也不会多收一条「Team failed」，因此仍可恢复
   （`legion-session-continuity-v1.md` §3）。root 行同样不受影响（它不是队伍；把 root 判失败会让寻址到 root
   的邮件全部退回）。
+
 - **内联声明的相位机器现在也显示在 `/legion` 树里 (#372).** 面板取机器只有「按角色查角色卡」一条路，而 #371
   允许 root 在派发时内联声明 `phases`——这种队伍根本没有卡，配置得最明确的队伍反而看不见自己的相位。
   现在面板先按**节点**问一次（来源是 launch 写下的 `ChildRecord.phases`，跨进程、重开会话后都还在），查不到
@@ -144,16 +136,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   消歧时按本仓惯例当作「没有」而不是猜。只有队伍根节点会被问（其它角色不可能带声明），且每轮渲染每个队伍只问
   一次，所以渲染一整队 worker 不会变成每节点一次注册表读取。渲染形式与卡片声明完全相同：不新增列、不改布局；
   没声明的队伍依旧什么都不显示。
+
 - **同一个 session 重开时会接回上次的树，并且只“提示”，不自动动任何子 agent (#374).** 以前每次启动都新建一份 run
   和一本 `legion.db`，上次被打断的队伍既看不见也接不回来。现在 run 记录自己这个 session 的 transcript 路径
   （`RunRecord.sessionFile`），同 session 再启动时复用它——同一个 runId、同一本账本、节点与相位原样还在
   （`legion_tree` 看得到），root 行是更新而不是重建。**恢复必须显式**：启动时只在 system prompt 里列出
   「上次退出时被打断的子 agent」并给用户一行提示，`spawn` 零次；用户同意后再 `subagent({action:"resume", name})`。
   **换一个 session 启动则什么都不做**：不扫描、不提示、不写任何旧文件。
+
 - **退出 = 暂停，不再判负 (#374).** `session_shutdown` 收队时不再把相位推到 `aborted`（终态会被
   `CHILD_TERMINAL` 永久拒绝恢复），只把节点标成 `retired` 并记一条带 `reason: "session-shutdown"` 的
   `node_retired`（事件类型仍是 16 条）。相位、`phase_since`、`rework_count` 一律不动。其它收队原因
   （`stop`/`abort`/超预算/显式 retire）行为逐字不变。
+
 - **`subagent resume` 能把声明过的相位机器一起带起来 (#374).** 声明式机器现在快照进 `ChildRecord.phases`，
   跨进程恢复时重新下发给子进程的 `PI_LEGION_PHASES`——否则复活的内联队伍会退回角色卡机器，
   自定义相位名全变 `invalid_phase`。
@@ -163,6 +158,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `by contract (0 commands)`；若声明的机器把 `verification_passed` 当收尾门，还会明说
   「门是被空契约满足的」。以前这三种输出都写着 `Verification passed`，父级无法分辨
   "跑过了" 和 "什么都没跑"。
+
 - **`centurion` 的状态机改成 root 派发时声明 (#371).** 以前「角色叫 centurion」就等于强制走五阶段：
   哪怕只改一行文件也要走契约 → 派 worker → 派 reviewer → 跑 verify → squash MR。现在只有
   `subagent({ agent: "centurion", phases: [...] })` 显式声明了才走状态机（声明了 = 以前的行为一字不改，
@@ -172,6 +168,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   同时把「非 root 不得派 centurion」写进契约（`docs/legion-v2-contract.md` REV-27，子契约
   `docs/contracts/centurion-declared-phases-v1.md`），`agents/centurion.md` 的验收条目从 `required` 改为
   `optional`（它从来没有可跑的验证命令）。worktree/rpc 耦合、深度公式、组员不隔离均不变。
+
 - **`/legion` 整帧分配降到 ≤2.0MB（−59% @120×40，−67% @200×60），且可见输出逐字节不变 (#364).** #362 已经修掉「每写一格分配一个 `Cell`」，这一轮清掉的是**每帧重建的
   脚手架**：星系像素缓冲/帧内 Map、行字符缓冲、图表 band 栈、`new Canvas(W,H)`，以及 `Math.hypot`、
   `{...cell, color}` 克隆、每帧 `text.trim()` 这类每格/每 run 的临时对象。现在这些都原地复用，
@@ -186,6 +183,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   补上了仓里原先没有的快照空档（旧用例都是"同代码渲染两次再比"，两侧同时漂移抓不住）。
   基准：`bench/perf-core/10-legion-frame-alloc.ts`（+ `10-baseline.json` digest golden）；
   契约：`docs/contracts/viz-frame-alloc-v1.md`。
+
 - **`/legion` 从全屏 overlay 改成主屏挂载，整帧合成开销消失（120×40 4.39ms → 1.69ms，200×60 9.59ms → 3.39ms）(#347).**
   页面一直以 `overlay: true` + `width:"100%"` 打开，于是 pi-tui 对**每一行**都跑 `compositeTuiLine`
   （`extractSegments` + `sliceWithWidth` + `visibleWidth` 三次 `Intl.Segmenter` 字素扫描，行宽缓存按整行
@@ -204,6 +202,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   SGR 快照，实测去掉 floor 后两种挂载的 gutter 都退回终端默认背景（#308 黑带重现），
   所以它不是「保险」。不改宿主 `compositeTuiLine`、不改 pi-tui 节流常量。
   基准：`bench/perf-core/09-legion-mount.ts`；契约：`docs/contracts/legion-main-screen-mount-v1.md`。
+
 - **`/legion` 不再每写一个格子就分配一个 `Cell`：`Canvas` 预建 W×H 个可变 cell，`set()` 原地改字段 (#362).**
   `set()` 原本是 `row[x] = { ch, color, ...style }`——一帧要写 4,583 次（120×40）/ 9,691 次（200×60），
   实测 52.4 B/次 与 128.0 B/次。现在格子在构造时一次性建好，写入只做 `cell.ch / color / bold / inverse`
@@ -259,6 +258,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `CollectSnapshot.outputTruncated: true`」，永远不是 `missing`。实测：50 child × 204,800B 驻留
   10.07MB → **0.51MB**（满足 #349 的 ≤1.0MB），重新 track 全部后回落到基线。
   契约：`docs/contracts/finished-cache-eviction-v1.md`。
+
 - **A 500ms status refresh no longer re-parses a session file that has not been written since the
   last tick (#348).** `refreshUi()` → `statusEntries()` parsed every child's session file — plus every
   historical ledger row that carries one — once per tick, changed or not: one idle child cost 119
@@ -339,7 +339,6 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   non-centurion role` warning, because the suppression that used to silence it is the
   answer being skipped.
 
-
 - **`messages.delivered` is a five-value domain now — `pending / accepted / bounced / delivered / obsolete`
   — and `LEGION_DB_USER_VERSION` moves 1 → 2 (#322).** The old `INJECTED(1)` claimed a delivery the ledger
   never observed: it was written the moment a send call returned, which covers `queued` (waiting for the
@@ -390,6 +389,18 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **退出会话时不再出现 `Extension error (<boundary>): turn_end could not resolve the persisted
+  assistant entry ID` (#383)。** 这是 pi 宿主在 `turn_end` 边界上的既有缺陷（`dispose()` 之后仍会收尾一个
+  被 abort 的 turn，message 没落盘），扩展这边唯一能做的是**不去触发那个边界**：宿主只在
+  `hasHandlers("turn_end")` 为真时才走这条路径。我们注册的 `turn_end` 只做一次 `bindUi`，而 `bindUi` 已经挂在
+  `turn_start`/`agent_start`/`agent_end`/`agent_settled`/`input`/`tool_result` 上，于是直接不注册——宿主连报错
+  分支都进不去，UI 行为不变。
+
+- **没有事件总线时账本不再漏记事件 (#380)。** 四处写成 `eventBus?.emit(appendEvent(...))`：可选链在没有
+  订阅者时会把 `appendEvent(...)` 的参数一起短路，于是 headless 宿主（不传 eventBus 的嵌入方）里相位迁移
+  只改了 `nodes.phase`、账本里一条 `phase_change` 都没有，重开账本时历史与真实状态不一致。改成「先写账本、
+  再通知订阅者」；交互模式行为不变。
+
 - **PR #363 review follow-up: an internal notice can no longer be refused into silence, and a refused
   one is retried.** #353 made `sendMail` throw for a `U+0000`, which is right where the text is the
   model's own (`legion_mail`) and wrong at the three call sites that compose a notice from ledger
@@ -407,6 +418,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   throw. `checkOwnPhaseTimeout` places the notice before writing the de-dup key, so a notice it could
   not place anywhere leaves the key unwritten and the next tick tries again; 0 keeps its meaning and
   the built-in subjects/clocks are untouched.
+
 - **PR #363 review follow-up: a failed revival gives the phase clock back, and the completion gate's
   assumption is pinned.** `Orchestrator.reserveNode` moves `phase_since` on a revive (#357) and
   records the `revived` `phase_change` before the supervisor spawns; a spawn failure rolled the
@@ -509,6 +521,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   mounted unconditionally (one probe = at most one claim), the probe's own promise travels as
   `details.waitClaimsPending`, and `releaseWaitClaims` awaits it before rolling back — so a claim that
   landed after the bail is still handed back and the round's notice arrives exactly once.
+
 - **A `Phase timeout:` notice no longer outlives a team that ended in the very phase it timed out in
   (#354).** `isStalePhaseTimeoutNotice` asked `isTerminalNode`, which reads `status === "failed" ||
   phase ∈ {done,failed,aborted}`. A team that only investigated never calls `legion_phase`, so it keeps
@@ -539,6 +552,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   The `?fresh=1` half of the #317 case re-evaluated the wrong module (ESM drops the query when resolving a
   relative import), so it now re-evaluates `extension-inheritance.ts` and asserts that a second instance
   reads the shared discovery holder.
+
 - **The `/legion` track view now paints its own page background, so the detail modal no longer sits
   on a black vertical stripe (#308).** Opening a node's context viewer put a pure-black band between
   the frame's right edge and the terminal's right edge (the left side looked fine). The frame was not
@@ -611,6 +625,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   refuses — a swallowed prompt used to re-spawn one process per fallback model and roll each one back
   right away. The mailbox `prompt` branch keeps no disposition by construction; its comment and the
   contract now say why. Contract: `docs/legion-v2-contract.md` §3.1.
+
 - **The in-flight tool fact behind `status` is a stack, so nested and parallel calls stop disappearing
   (#331).** `working · bash 00:07:31` used to read a single slot: `tool_execution_start` overwrote it
   and the matching `tool_execution_end` cleared it. Two shapes therefore made the line vanish while a
@@ -627,6 +642,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   are untouched. The seam gained an optional `inFlightToolStack` next to `inFlightTool`, so a doubled
   supervisor that only answers the single frame keeps working. Contract revision:
   `docs/contracts/stall-visibility-v1.md` (D1/D2/D4/D7).
+
 - **One name, one node: `status` / `collect` / `stop` / `continue` now resolve a child name the same way.**
   In a single root session, `status(name)` and `collect(name)` called ten seconds apart answered with two
   different nodes for the same `worker-0`: `status` went through `pickChildByName`, which walks **every**
@@ -722,6 +738,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   the rpc `--no-extensions` hint lost its own `inheritExtensions` clause too (it would have
   contradicted the note right below it). Contract revision:
   `docs/contracts/extension-inheritance-wiring-v1.md` §9 (#317).
+
 - **A `collect` that bails after claiming no longer swallows that round's completion notice.**
   The claim-once seam claims a terminal result as it hands the snapshot to the tool call, and
   `collectChild` can still bail afterwards — the parent turn aborts, or persisting the child
@@ -745,6 +762,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   the result stays readable through a later `collect` and a copy already held in the run outbox
   still arrives, but a copy sitting in the join window goes with the release. Contract revision:
   `docs/contracts/notice-claim-v1.md` (D2, #320).
+
 - **A `steer` receipt now reports what the child's session actually answered.** `steer` is a
   queue, not an interrupt: the text is enqueued and only consumed at the child's next turn
   boundary — after the current batch of tool calls finishes, before the next LLM call — so a
@@ -765,6 +783,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   back a child that was born busy. Legion mail sent to a busy child with `action-needed` now logs
   a warning when its steer was intercepted — `delivered=1` still records the send (D3), so the
   warning is the only signal that the child never saw the message.
+
 - **A child's completion notice is delivered once, whichever route won.** A terminal
   result reaches the parent two ways — the tool result (`wait` / `collect`) and the
   pushed notice (`watch` → `join` → outbox) — and each kept its own memory
