@@ -49,8 +49,15 @@ import {
 import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { openLegionDb, type DatabaseSync } from "../../src/legion/db.ts";
-import { MAIL_DELIVERY, inbox, pendingInbox, sendMail } from "../../src/legion/mail.ts";
-import { takePendingMail } from "../../src/legion/mail-release.ts";
+import {
+	MAIL_DELIVERY,
+	claimForDelivery,
+	getMessage,
+	inbox,
+	pendingInbox,
+	sendMail,
+} from "../../src/legion/mail.ts";
+import { MAIL_DELIVERY_CLAIM_LEASE_MS, takePendingMail } from "../../src/legion/mail-release.ts";
 import { getNode, insertNode, updateNode, type LegionNode } from "../../src/legion/nodes.ts";
 import type { OrchestratorLegionContext } from "../../src/runs/orchestrator.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
@@ -569,6 +576,21 @@ test("wait(all:true) keeps the settled result and never blames the parent turn (
  * the test releases it. `deliverToChild` awaits that call, so parking inside it is
  * exactly the window a blocked child's own `wait` could take the same row in.
  */
+/** Throws on the FIRST followUp, then behaves: the transport blip P0-1 has to survive. */
+class FlakyFollowUpSupervisor extends FakeSupervisor {
+	readonly handed: string[] = [];
+	private failNext = true;
+
+	override async followUp(name: string, text: string): Promise<void> {
+		if (this.failNext) {
+			this.failNext = false;
+			throw new Error("rpc blip");
+		}
+		this.handed.push(text);
+		return super.followUp(name, text);
+	}
+}
+
 class GatedFollowUpSupervisor extends FakeSupervisor {
 	readonly handed: string[] = [];
 	private release?: () => void;
@@ -631,32 +653,35 @@ test("the postman and a blocked child can never both deliver the same mail (P0-1
 		const tick = postman.tick();
 		try {
 			await within(supervisor.parked, "the postman is parked inside its send call");
-			// The send is in flight. Review P0-1: the ledger must ALREADY say so, or the
-			// child's own preemption sees `PENDING` and hands over a second copy.
 			assert.equal(
 				getNode(db, child.id)?.status,
 				"running",
 				"fixture: the child is live during the delivery",
 			);
-			assert.equal(
-				inbox(db, child.id, { delivery: MAIL_DELIVERY.PENDING }).length,
-				0,
-				"the row is claimed BEFORE the send, so no second route may take it",
-			);
+			// Review ruling (lease, not a new edge): the send is in flight, so the row is
+			// leased — still `PENDING`, with `delivered_at` carrying "claimed at". Nothing
+			// terminal is written for a claim, and #322's edges are untouched.
+			const claimed = getMessage(db, messageId);
+			assert.equal(claimed?.delivered, MAIL_DELIVERY.PENDING, "a claim is not a delivery state");
+			assert.equal(claimed?.deliveredAt !== null, true, "delivered_at is the lease while PENDING");
 			assert.deepEqual(
 				takePendingMail(db, child.id),
 				[],
-				"the child's own blocked wait finds nothing to take",
+				"the child's own blocked wait cannot take a leased row",
 			);
 		} finally {
 			supervisor.free();
 			await within(tick, "the postman tick finished");
-			postman.stop();
 		}
-		// Exactly one copy reached the child, and the ledger backs that up.
+		// Exactly one copy reached the child, and the ledger backs that up: the lease
+		// handed the story to the transition, which is what wrote ACCEPTED.
 		assert.equal(supervisor.handed.length, 1, "one send call, one copy");
 		assert.match(supervisor.handed[0]!, /Subject: one copy only/);
 		assert.equal(inbox(db, child.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+		// …and a second tick has nothing to send: the row left PENDING.
+		await within(postman.tick(), "the follow-up tick finished");
+		postman.stop();
+		assert.equal(supervisor.handed.length, 1, "the next tick does not repeat the send");
 		assert.ok(messageId > 0);
 	} finally {
 		rmSync(rootDir, { recursive: true, force: true });
@@ -839,6 +864,126 @@ test("takePendingMail never returns a message the ledger bounced (P1.3)", () => 
 		assert.equal(inbox(db, "root.team", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
 		assert.ok(id > 0);
 	} finally {
+		db.close();
+	}
+});
+
+test("a lease is exclusive while it runs and reclaimable after 60s (P0-1 lease)", async () => {
+	const db = openLegionDb(":memory:");
+	const rootDir = mkdtempSync(path.join(tmpdir(), "mail-preempt-lease-"));
+	const supervisor = new FakeSupervisor();
+	const sessionFile = path.join(rootDir, "team.jsonl");
+	mkdirSync(rootDir, { recursive: true });
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const child = insertNode(
+			db,
+			{ parentId: "root", name: "team", role: "centurion", status: "running", sessionFile },
+			() => 2,
+		);
+		await supervisor.spawnChild({
+			name: child.name,
+			task: "lease fixture",
+			agent: agent("centurion"),
+			sessionFile,
+			tempDir: rootDir,
+			cwd: rootDir,
+		});
+		const messageId = fixtureMail(db, {
+			from: "root",
+			to: "team",
+			subject: "leased message",
+			body: "one holder at a time",
+		});
+		const t = 1_000_000;
+		// Whoever claims first holds it: the predicate is `delivered_at < now - leaseMs`.
+		assert.equal(claimForDelivery(db, messageId, () => t, MAIL_DELIVERY_CLAIM_LEASE_MS), true);
+		assert.equal(
+			claimForDelivery(db, messageId, () => t + MAIL_DELIVERY_CLAIM_LEASE_MS, MAIL_DELIVERY_CLAIM_LEASE_MS),
+			false,
+			"the last millisecond of the lease still belongs to the holder",
+		);
+		assert.equal(
+			claimForDelivery(db, messageId, () => t + MAIL_DELIVERY_CLAIM_LEASE_MS + 1, MAIL_DELIVERY_CLAIM_LEASE_MS),
+			true,
+			"the ruling's now + 60_001: an expired lease is reclaimable",
+		);
+		// The lease is what a crash leaves behind, so the postman must be able to take an
+		// expired one over on its next tick.
+		db.prepare("UPDATE messages SET delivered_at = ?, delivered = ? WHERE id = ?").run(
+			Date.now() - MAIL_DELIVERY_CLAIM_LEASE_MS - 1,
+			MAIL_DELIVERY.PENDING,
+			messageId,
+		);
+		const postman = new LegionPostman({
+			db,
+			nodeId: "root",
+			supervisor,
+			now: () => Date.now(),
+			intervalMs: 10_000,
+		});
+		try {
+			await within(postman.tick(), "the postman took the expired lease over");
+		} finally {
+			postman.stop();
+		}
+		assert.equal(inbox(db, child.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+		assert.equal(supervisor.calls.filter((call) => call.method === "followUp").length, 1);
+	} finally {
+		rmSync(rootDir, { recursive: true, force: true });
+		db.close();
+	}
+});
+
+test("a thrown send releases the lease so the next tick retries (P0-1 lease)", async () => {
+	const db = openLegionDb(":memory:");
+	const rootDir = mkdtempSync(path.join(tmpdir(), "mail-preempt-release-"));
+	const supervisor = new FlakyFollowUpSupervisor();
+	const sessionFile = path.join(rootDir, "team.jsonl");
+	mkdirSync(rootDir, { recursive: true });
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const child = insertNode(
+			db,
+			{ parentId: "root", name: "team", role: "centurion", status: "running", sessionFile },
+			() => 2,
+		);
+		await supervisor.spawnChild({
+			name: child.name,
+			task: "flaky send fixture",
+			agent: agent("centurion"),
+			sessionFile,
+			tempDir: rootDir,
+			cwd: rootDir,
+		});
+		const messageId = fixtureMail(db, {
+			from: "root",
+			to: "team",
+			subject: "retry me",
+			body: "the first send throws",
+		});
+		const postman = new LegionPostman({
+			db,
+			nodeId: "root",
+			supervisor,
+			now: () => Date.now(),
+			intervalMs: 10_000,
+		});
+		try {
+			await within(postman.tick(), "the failing tick finished");
+			const afterFailure = getMessage(db, messageId);
+			assert.equal(afterFailure?.delivered, MAIL_DELIVERY.PENDING, "a send failure is not a verdict");
+			assert.equal(afterFailure?.deliveredAt, null, "the lease is handed back, not left to expire");
+			assert.equal(inbox(db, child.id, { delivery: MAIL_DELIVERY.BOUNCED }).length, 0, "nothing bounced");
+			// The retry the pre-#384 comment promised still happens.
+			await within(postman.tick(), "the retry tick finished");
+		} finally {
+			postman.stop();
+		}
+		assert.equal(supervisor.handed.length, 1, "the retry is the one that got through");
+		assert.equal(inbox(db, child.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+	} finally {
+		rmSync(rootDir, { recursive: true, force: true });
 		db.close();
 	}
 });
