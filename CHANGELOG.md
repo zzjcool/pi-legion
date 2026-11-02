@@ -81,6 +81,9 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Changed
 
+- **退出/恢复会话时不再打印 `Extension error (/plugin/index.ts): … ctx is stale` (#377).** 宿主在会话销毁后
+  仍会派发 `turn_end` / `agent_settled`，扩展入口这时读 ctx 会抛。现在把这种"ctx 已作废"当成「没有 UI」处理
+  （与状态栏一直以来的做法一致）：缓存清空、安静返回；其它异常照旧抛出。用户感知：每次退出会话少一行红色噪音。
 - **没声明状态机的队伍「全员失败」时不再静默消失 (#372).** #371 之后，没声明 `phases` 的 centurion 出生时
   `nodes.phase` 为空，而「全队都失败」的兜底逻辑开头就写着「没有相位就没什么可判的」——于是这种队伍把 N 个
   worker 全派失败后，账本里没有失败、没有事件、父级什么也收不到，只能等 lead 自己写 verdict。判据改成
