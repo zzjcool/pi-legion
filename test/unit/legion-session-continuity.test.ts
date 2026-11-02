@@ -34,6 +34,7 @@ import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
 import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import { getChildren, getNode, insertNode } from "../../src/legion/nodes.ts";
+import { markSessionInterrupted } from "../../src/legion/interrupt.ts";
 import { LEGION_PHASES_ENV } from "../../src/runs/args.ts";
 import { Orchestrator, type OrchestratorLegionContext } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
@@ -395,6 +396,39 @@ test("#374 §5/I6: the prompt lists what was interrupted, spawns nothing, and dr
 	} finally {
 		await h.shutdown().catch(() => {});
 		h.cleanup();
+	}
+});
+
+test("#374 §3: the exit marker lands BEFORE anything drains or kills", () => {
+	// `--print` drains before the retire path runs, and a child whose turn ends during
+	// that drain is recorded `settled/success`. The marker therefore has to be written
+	// first — and it must only touch the ledger: a child that really finishes during
+	// the drain is improved to `settled` right afterwards (`recordSettled` writes the
+	// status regardless), while a killed one stays interrupt-marked.
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { id: "root", parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "live", role: "worker", status: "running", sessionFile: "/s/live.jsonl" }, () => 2);
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "blocked", phase: "implementing", sessionFile: "/s/team.jsonl" }, () => 3);
+		insertNode(db, { parentId: "root", name: "done", role: "worker", status: "settled", sessionFile: "/s/done.jsonl" }, () => 4);
+
+		const marked = markSessionInterrupted(db, "root", () => 100);
+		assert.deepEqual(marked.sort(), ["root.live", "root.team"]);
+		assert.equal(getNode(db, "root.live")?.status, "retired");
+		assert.equal(getNode(db, "root.team")?.status, "retired");
+		assert.equal(getNode(db, "root.team")?.phase, "implementing", "a pause never touches the phase");
+		assert.equal(getNode(db, "root.done")?.status, "settled", "an already-finished child is left alone");
+
+		const retired = readEventsAfter(db, 0).filter((event) => event.type === "node_retired");
+		assert.deepEqual(retired.map((event) => event.nodeId).sort(), ["root.live", "root.team"]);
+		assert.ok(retired.every((event) => (event.data as { reason?: string }).reason === "session-shutdown"));
+
+		// The marker is idempotent: the explicit retire that follows must not write a
+		// second "the session ended" event for the same node.
+		assert.deepEqual(markSessionInterrupted(db, "root", () => 200), []);
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "node_retired").length, 2);
+	} finally {
+		db.close();
 	}
 });
 

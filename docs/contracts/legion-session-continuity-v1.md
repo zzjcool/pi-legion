@@ -44,6 +44,12 @@ root 退出时，子树**停手但保留可续的状态**；下次启动**同一
 - 相位、`phase_since`、`rework_count` **一律不动**（暂停是暂停，不是新 stint，不写 `phase_change{reason:"revived"}`）。
 - 结果：`isTerminalNode` 仍为 false（`retired` 且相位非终态）⇒ 可被 resume；`hasEnded` 为 true ⇒ 暂停期间
   邮件不会被投给它（保持 §8.3 现状，不新增投递语义）。
+- **实现顺序（实测修正，2026-11-02）**：标记必须在退出流程**最前面**完成（`markSessionInterrupted`），
+  早于 `--print`/`--json` 的 `drainBeforeShutdown`。原因：drain 期间被杀的子节点，其截断 session 仍会被
+  解析成 `success`，retire 路径会把它记成 `settled` —— 容器实测：worker 在 SIGTERM 时仍 `running`，
+  退出后却变成 `settled/success`，暂停标记被吞掉。因此：① 先只写账本（不杀进程、不动相位）；
+  ② 「是否被打断」以**账本最后一条 `node_retired` 的 reason** 为准，而不是调用点的 `cause`；
+  ③ 标记过的节点只有在最后一轮**真的完整结束**时才允许升级成 `settled`（`isLastTurnComplete`）。
 
 ## §4 恢复必须显式
 
