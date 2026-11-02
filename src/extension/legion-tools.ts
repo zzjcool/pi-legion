@@ -36,6 +36,7 @@ import {
 	getChildren,
 	getNode,
 	getSubtree,
+	hasEnded,
 	heartbeatNode,
 	isTerminalNode,
 	listStaleNodes,
@@ -505,29 +506,81 @@ export class LegionPostman {
 		return isTerminalPhase(phase);
 	}
 
+	/**
+	 * Fail a team whose direct children ALL failed (#344 safety net).
+	 *
+	 * #372 A: the old gate opened with `!node?.phase` — "no phase, nothing to
+	 * fail" — which was true while every centurion was born on a phase. Since #371
+	 * the machine is DECLARED, not inferred from the role name, so an undeclared
+	 * team has `nodes.phase IS NULL` (contract `centurion-declared-phases-v1` §5
+	 * I2): a lead that dispatched N workers and lost all N stayed `running`, the
+	 * ledger recorded no failure, and the parent heard nothing until the lead
+	 * decided to write a verdict itself. The gate is now "this node leads a team
+	 * and the team has children", in the two shapes the ledger can produce:
+	 *
+	 *   - WITH a phase: byte for byte the old path — the team's own machine judges
+	 *     the `failed` transition and a `phase_change` records it.
+	 *   - WITHOUT one: there is no machine to ask, so the verdict is written
+	 *     directly (`status → failed` + `node_failed`, an existing event type) and
+	 *     the parent gets the same notice.
+	 *
+	 * Why `role === "centurion"` rather than "any node with children": the root row
+	 * has children too, and root is the ledger's stand-in for the parent SESSION.
+	 * `status = failed` makes `isTerminalNode()` true, and `mail.ts` bounces every
+	 * message addressed to a terminal node — so failing root would silence the very
+	 * channel this notice travels on. A worker can own children as well, but it was
+	 * never eligible before #372 (no phase, and its lead is already the one that
+	 * hears about failures); widening to it is a different change. The role names
+	 * exactly "a team lead": only the root may dispatch an centurion (G1), so there
+	 * is no nested lead this criterion could miss.
+	 *
+	 * IRREVERSIBLE on purpose (#372 A, an accepted trade-off): `status = failed`
+	 * makes `isTerminalNode()` true, so an all-failed team can no longer be
+	 * resumed. That matches the pre-#371 verdict (`phase → failed`), which was
+	 * already irreversible — a team whose entire workforce failed has no work in
+	 * flight to resume, and `reviveChild` refuses a terminal node either way.
+	 *
+	 * Told ONCE: the phase path is de-duplicated by the terminal-phase guard; the
+	 * undeclared path by `hasEnded`, which the `status = failed` write itself makes
+	 * true — no new table, no marker of its own.
+	 */
 	private failTeamIfAllChildrenFailed(timestamp: number): void {
 		const node = getNode(this.db, this.nodeId);
-		if (!node?.phase || this.isTerminalPhaseOf(node.phase)) return;
+		if (!node) return;
+		const phase = node.phase;
+		if (phase !== null) {
+			if (this.isTerminalPhaseOf(phase)) return;
+		} else if (node.role !== "centurion" || hasEnded(node)) return;
 		const children = getChildren(this.db, node.id);
 		if (!children.length || children.some((child) => child.status !== "failed")) return;
-		const decision = evaluatePhaseTransition({
-			from: node.phase,
-			to: "failed",
-			reworkCount: node.reworkCount,
-			children: children.map(({ id, role, status }) => ({ id, role, status })),
-			terminalReason: "all_children_failed",
-			actorRole: "supervisor",
-			// #350 review (major 2): the team's OWN machine, or this safety net is inert.
-			// Without it `from: "recon"` is not a phase of `DEFAULT_PHASE_MACHINE`, the
-			// state machine answers `invalid_phase`, and the `!decision.allowed` guard
-			// below drops the verdict in silence — so a squad that lived on a declared
-			// phase never reached `failed` and its parent never heard. Silent only since
-			// #350 made a declared start reachable (teams used to be born `planning`).
-			...(this.machine ? { machine: this.machine } : {}),
-		}, () => timestamp);
-		if (!decision.allowed) return;
-		updateNode(this.db, node.id, { phase: "failed", phaseSince: decision.phaseSince }, () => timestamp);
-		this.eventBus?.emit(appendEvent(this.db, node.id, "phase_change", decision.event.data, { now: () => timestamp }));
+		if (phase !== null) {
+			const decision = evaluatePhaseTransition({
+				from: phase,
+				to: "failed",
+				reworkCount: node.reworkCount,
+				children: children.map(({ id, role, status }) => ({ id, role, status })),
+				terminalReason: "all_children_failed",
+				actorRole: "supervisor",
+				// #350 review (major 2): the team's OWN machine, or this safety net is inert.
+				// Without it `from: "recon"` is not a phase of `DEFAULT_PHASE_MACHINE`, the
+				// state machine answers `invalid_phase`, and the `!decision.allowed` guard
+				// below drops the verdict in silence — so a squad that lived on a declared
+				// phase never reached `failed` and its parent never heard. Silent only since
+				// #350 made a declared start reachable (teams used to be born `planning`).
+				...(this.machine ? { machine: this.machine } : {}),
+			}, () => timestamp);
+			if (!decision.allowed) return;
+			updateNode(this.db, node.id, { phase: "failed", phaseSince: decision.phaseSince }, () => timestamp);
+			this.eventBus?.emit(appendEvent(this.db, node.id, "phase_change", decision.event.data, { now: () => timestamp }));
+		} else {
+			// No machine to judge the move, so the verdict is the state itself. The
+			// event is appended FIRST and unconditionally (`emit` short-circuits its
+			// argument when no subscriber exists, which would drop the ledger fact on a
+			// headless run); only the bus delivery depends on a subscriber.
+			updateNode(this.db, node.id, { status: "failed" }, () => timestamp);
+			const failedEvent = appendEvent(this.db, node.id, "node_failed", { execution: "failed", reason: "all_children_failed" }, { now: () => timestamp });
+			this.eventBus?.emit(failedEvent);
+		}
 		const failureNotice = `Legion team ${node.id} failed because all direct children failed.`;
 		this.sendSelfMessage(failureNotice);
 		if (node.parentId) {

@@ -179,6 +179,19 @@ export interface SessionRuntimeDeps {
 	 */
 	getPhaseMachine?: (role: string | null | undefined) => PhaseMachine | undefined;
 	/**
+	 * #372 B: the phase machine for a NODE, inline declaration first.
+	 *
+	 * `getPhaseMachine` above answers "what does this ROLE declare", which is only
+	 * the role card. Since #371 a team may declare its machine INLINE at dispatch
+	 * (`subagent({ phases })`, contract §2), and such a team has no card to find:
+	 * its machine is recorded per NODE (`ChildRecord.phases` in the launching run's
+	 * run.json). Asked before the role lookup, so the inline layer keeps the
+	 * priority the contract freezes (inline > card > none); the ancestor walk in
+	 * `mergePhaseMachines` is unchanged, so a worker still inherits the machine of
+	 * the team that declared it.
+	 */
+	getPhaseMachineForNode?: (node: { id: string; role: string | null }) => PhaseMachine | undefined;
+	/**
 	 * Renewal proposal for a finishing child (subagent-renewal-v1 D3).
 	 *
 	 * Injected rather than imported: the only builder lives in `index.ts`, which
@@ -1440,6 +1453,19 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * Only a team root declares `phases:`, so children inherit it downward: showing
 	 * an empty machine on a worker would suggest it has none, when in fact it is
 	 * governed by its lead's. The nearest ancestor that resolves a machine wins.
+	 *
+	 * #372 B: "resolves" now asks the NODE first and the ROLE second. A team that
+	 * declared its machine inline at dispatch (#371 §2) has no card, so the role
+	 * lookup could never find it; the node lookup reads the declaration recorded at
+	 * launch. Order matters and matches the contract (inline > card > none).
+	 *
+	 * Only a team root is asked, because only a team root can carry that record: the
+	 * launch guards refuse `phases` for every other role (G2/G3), and the child
+	 * record is written on exactly that branch. Asking for a worker could only ever
+	 * answer `undefined`, and the answer costs a runs-registry read — so the gate
+	 * keeps a render of N workers from paying for N lookups. Descendants still
+	 * inherit: the walk reaches the team root above them (see the header comment),
+	 * which is the node the lookup is made for.
 	 */
 	const mergePhaseMachines = (nodes: TreeNodeSnapshot[]): TreeNodeSnapshot[] => {
 		const byId = new Map(nodes.map((node) => [node.id, node]));
@@ -1447,7 +1473,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			let cursor: TreeNodeSnapshot | undefined = node;
 			let hops = 0;
 			while (cursor && hops < 64) {
-				const machine = deps.getPhaseMachine?.(cursor.role);
+				const declared =
+					cursor.role === "centurion"
+						? deps.getPhaseMachineForNode?.({ id: cursor.id, role: cursor.role })
+						: undefined;
+				const machine = declared ?? deps.getPhaseMachine?.(cursor.role);
 				if (machine) {
 					node.phaseMachine = machine;
 					break;

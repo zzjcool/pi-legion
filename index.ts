@@ -699,6 +699,39 @@ function phaseMachineForNode(role: string | null | undefined, cwd: string, setti
 	return phaseMachineForRole(role, cwd, settings);
 }
 
+/**
+ * #372 B: the machine a team declared INLINE at dispatch, as it was PERSISTED.
+ *
+ * `phaseMachineForRole` above answers "what does this role's card declare", and
+ * `phaseMachineForNode` answers it for a child process through the inherited
+ * `PI_LEGION_PHASES` environment. Neither can answer it for the `/legion` tree:
+ * the tree renders OTHER nodes, and since #371 the machine can be declared per
+ * DISPATCH (`subagent({ phases })`, contract §2) with no card involved — so the
+ * most explicitly configured teams were exactly the ones the panel could not
+ * describe.
+ *
+ * The durable record of that declaration is the child record the launch wrote
+ * (`ChildRecord.phases`, contract `legion-session-continuity-v1` §4), which is
+ * why this reads run.json rather than this process's `Orchestrator` snapshot:
+ * the snapshot dies with the launch call, while the panel must still answer after
+ * a reload, in a later process, and in a reopened session.
+ *
+ * Deliberately scans ALL runs instead of the node's own: the record lives in the
+ * run of the process that DISPATCHED the node, not in the node's run. Only the
+ * team that declared the machine has a record; a worker never does, and nothing
+ * is inferred for it here (it inherits from its lead while rendering, #298).
+ */
+export function inlinePhaseMachineForNode(
+	nodeId: string,
+	runs: readonly Pick<RunRecord, "children">[],
+): PhaseMachine | undefined {
+	for (const run of runs) {
+		const record = run.children.find((child) => child.nodeId === nodeId);
+		if (record?.phases) return record.phases;
+	}
+	return undefined;
+}
+
 function createLegionRuntime(input: {
 	pi: ExtensionAPI;
 	supervisor: LegionSupervisor;
@@ -1657,6 +1690,32 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					machine = undefined;
 				}
 				cache.set(role, machine);
+				return machine;
+			};
+		})(),
+		// #372 B: /legion must show the machine an inline-declared team was
+		// DISPATCHED with (`subagent({ phases })`, #371 §2). That declaration has no
+		// card to look up, so it is answered per NODE from the launching run's
+		// run.json — the one source that survives a reload, a later process and a
+		// reopened session. Only positive answers are cached: a node row exists a
+		// moment before `persistChild` writes its record, and caching that miss would
+		// freeze the race into the panel until restart. `listRuns()` is itself cached
+		// and mtime-checked, so a miss costs a snapshot reuse, not a directory walk.
+		getPhaseMachineForNode: (() => {
+			const cache = new Map<string, PhaseMachine>();
+			return (node) => {
+				const cached = cache.get(node.id);
+				if (cached) return cached;
+				if (!lastCwd) return undefined;
+				let machine: PhaseMachine | undefined;
+				try {
+					machine = inlinePhaseMachineForNode(node.id, runStoreFor(lastCwd).listRuns());
+				} catch {
+					// The panel must never break on an unreadable runs directory; the role
+					// lookup below still runs, so a card-declared team keeps rendering.
+					machine = undefined;
+				}
+				if (machine) cache.set(node.id, machine);
 				return machine;
 			};
 		})(),
