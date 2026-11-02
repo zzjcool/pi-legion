@@ -26,10 +26,10 @@ import { getNode, insertNode } from "../../src/legion/nodes.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 /** root → team (centurion, NO phase) → one child per status given. */
-function undeclaredTeam(childStatuses: readonly string[]) {
+function undeclaredTeam(childStatuses: readonly string[], teamStatus = "running") {
 	const db = openLegionDb(":memory:");
 	insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
-	insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running", phase: null }, () => 2);
+	insertNode(db, { parentId: "root", name: "team", role: "centurion", status: teamStatus as "running", phase: null }, () => 2);
 	childStatuses.forEach((status, index) => {
 		insertNode(db, {
 			parentId: "root.team",
@@ -148,6 +148,35 @@ test("#372 A: the verdict reaches the LEDGER with no event bus attached (headles
 		);
 	} finally {
 		db.close();
+	}
+});
+
+test("#372 m1: a PAUSED (retired) or already-settled team is never judged failed — it stays resumable", async () => {
+	// `docs/contracts/legion-session-continuity-v1.md` §3: an exit PAUSES a subtree
+	// (`status: retired`, phase and stint untouched) and that is exactly what keeps
+	// it resumable. Judging such a team failed would make `isTerminalNode` true and
+	// `reviveChild` refuse it with CHILD_TERMINAL — the pause would become a verdict
+	// nobody pronounced. The same holds for a team whose row already ended
+	// (`settled`): there is nothing left in flight to fail.
+	for (const status of ["retired", "settled"] as const) {
+		const db = undeclaredTeam(["failed", "failed"], status);
+		const collected = { self: [] as string[], root: [] as string[] };
+		try {
+			const { postman } = postmanFor(db, "root.team", collected, 100);
+			await postman.tick();
+			postman.stop();
+
+			assert.equal(getNode(db, "root.team")?.status, status, `${status}: the row keeps the status it had`);
+			assert.equal(
+				readEventsAfter(db, 0).filter((event) => event.type === "node_failed").length,
+				0,
+				`${status}: no verdict is written for a team that is not running`,
+			);
+			assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.PENDING }).length, 0, `${status}: and no notice is sent`);
+			assert.deepEqual(collected.self, []);
+		} finally {
+			db.close();
+		}
 	}
 });
 

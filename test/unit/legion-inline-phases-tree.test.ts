@@ -9,10 +9,13 @@
  * kept across processes by #374 §4). So the panel showed nothing at all for the
  * very teams whose machine was configured most explicitly.
  *
- * Three layers are pinned here:
- *   1. the runtime seam resolves per NODE (inline first) instead of per role;
- *   2. the run record is the source, so a reopened session still sees it;
- *   3. rendering is unchanged — an inline team and a card team produce the same
+ * What is pinned here, layer by layer:
+ *   1. the runtime seam resolves per NODE (inline first, and inline BEATS card);
+ *   2. the run record is the source, so a reopened session still sees it — and
+ *      only the run that DISPATCHED the node may answer (a bare node id repeats
+ *      in every run of a checkout: `root.team` is not an identity);
+ *   3. a render asks ONCE per team root, however many descendants it has;
+ *   4. rendering is unchanged — an inline team and a card team produce the same
  *      phase lines (no new column, no new layout).
  */
 
@@ -37,6 +40,18 @@ const INLINE_MACHINE: PhaseMachine = {
 	],
 };
 
+/** A DIFFERENT machine, as a role card would declare one (#298). */
+const CARD_MACHINE: PhaseMachine = {
+	start: "plan",
+	phases: [
+		{ id: "plan", next: [{ to: "ship" }] },
+		{ id: "ship", terminal: true, next: [] },
+	],
+};
+
+/** The run id the root row carries — the run that dispatches the teams below. */
+const ROOT_RUN = "r-root";
+
 function node(
 	id: string,
 	parentId: string | null,
@@ -44,6 +59,7 @@ function node(
 	depth: number,
 	role: string,
 	phase: string | null,
+	runId: string | null = null,
 ): TreeNodeSnapshot {
 	return {
 		id,
@@ -52,7 +68,7 @@ function node(
 		role,
 		kind: "pi",
 		depth,
-		runId: null,
+		runId,
 		sessionFile: null,
 		worktreePath: null,
 		model: null,
@@ -74,20 +90,20 @@ function node(
 /** Two teams side by side: `a` declared a machine, `b` declared none. */
 function twoTeams(): TreeNodeSnapshot[] {
 	return [
-		node("root", null, "root", 0, "root", null),
-		node("root.a", "root", "a", 1, "centurion", "recon"),
-		node("root.a.w", "root.a", "w", 2, "worker", null),
-		node("root.b", "root", "b", 1, "centurion", null),
-		node("root.b.w", "root.b", "w", 2, "worker", null),
+		node("root", null, "root", 0, "root", null, ROOT_RUN),
+		node("root.a", "root", "a", 1, "centurion", "recon", "r-a"),
+		node("root.a.w", "root.a", "w", 2, "worker", null, "r-a-w"),
+		node("root.b", "root", "b", 1, "centurion", null, "r-b"),
+		node("root.b.w", "root.b", "w", 2, "worker", null, "r-b-w"),
 	];
 }
 
 /** One declared team with one worker, at the phase a fresh team is born in. */
 function oneTeam(phase: string | null): TreeNodeSnapshot[] {
 	return [
-		node("root", null, "root", 0, "root", null),
-		node("root.team", "root", "team", 1, "centurion", phase),
-		node("root.team.w", "root.team", "w", 2, "worker", null),
+		node("root", null, "root", 0, "root", null, ROOT_RUN),
+		node("root.team", "root", "team", 1, "centurion", phase, "r-team"),
+		node("root.team.w", "root.team", "w", 2, "worker", null, "r-team-w"),
 	];
 }
 
@@ -106,14 +122,27 @@ function phaseLines(nodes: readonly TreeNodeSnapshot[]): string[] {
 	}
 }
 
+/** A child record skeleton the run store accepts. */
+function record(name: string, dir: string, nodeId: string, phases?: PhaseMachine) {
+	return {
+		name,
+		sessionFile: path.join(dir, `${name}.jsonl`),
+		ownerToken: "owner",
+		state: "working" as const,
+		spawnedAt: "2026-01-01T00:00:00.000Z",
+		nodeId,
+		...(phases ? { phases } : {}),
+	};
+}
+
 test("#372 B: the runtime seam resolves a machine per NODE — inline declaration first, no invention for others", () => {
-	const asked: string[] = [];
+	const asked: Array<{ id: string; parentRunId: string | null }> = [];
 	const runtime = createSessionRuntime({
 		sendMessage() {},
 		getTreeNodes: () => twoTeams(),
 		// The inline declaration is recorded per node; nothing else declares one.
 		getPhaseMachineForNode: (target) => {
-			asked.push(target.id);
+			asked.push({ id: target.id, parentRunId: target.parentRunId });
 			return target.id === "root.a" ? INLINE_MACHINE : undefined;
 		},
 	});
@@ -137,7 +166,34 @@ test("#372 B: the runtime seam resolves a machine per NODE — inline declaratio
 	// Only a team root can carry an inline declaration (the launch guards refuse
 	// `phases` for every other role), so only team roots are asked — a render of a
 	// whole squad must not pay one runs-registry read per worker.
-	assert.deepEqual([...new Set(asked)].sort(), ["root.a", "root.b"], "asked exactly the team roots, never a worker or the root shell");
+	assert.deepEqual([...new Set(asked.map((entry) => entry.id))].sort(), ["root.a", "root.b"], "asked exactly the team roots, never a worker or the root shell");
+	// #372 M1: the ask carries the run that DISPATCHED the node (the parent's), so
+	// the host can read the one run record that is allowed to answer.
+	assert.ok(
+		asked.every((entry) => entry.parentRunId === ROOT_RUN),
+		`every ask carries the dispatching run, got: ${JSON.stringify(asked)}`,
+	);
+});
+
+test("#372 M2: the INLINE declaration beats the role card (contract §2 priority is real, not incidental)", () => {
+	// Both layers answer, with DIFFERENT machines. Only an assertion that names the
+	// winner can tell the priority apart: swapping the two lookups in
+	// `mergePhaseMachines` must break this test.
+	const runtime = createSessionRuntime({
+		sendMessage() {},
+		getTreeNodes: () => oneTeam("recon"),
+		getPhaseMachine: () => CARD_MACHINE,
+		getPhaseMachineForNode: () => INLINE_MACHINE,
+	});
+	const nodes = runtime.treeNodes();
+	const team = nodes.find((entry) => entry.id === "root.team");
+
+	assert.deepEqual(team?.phaseMachine, INLINE_MACHINE, "the dispatch declaration wins over a card that also declares one");
+	const lines = phaseLines(nodes).join("\n");
+	assert.match(lines, /phases · current: recon/, "the panel names the inline phase");
+	assert.match(lines, /→ build/, "and the inline transitions");
+	assert.doesNotMatch(lines, /\bplan\b/, "the card's phases are not mixed in");
+	assert.doesNotMatch(lines, /\bship\b/);
 });
 
 test("#372 B: an inline-declared team renders its phases exactly like a card-declared team", () => {
@@ -172,17 +228,99 @@ test("#372 B: the source of truth is run.json, so a later process still sees the
 	await withTempDir(async (dir) => {
 		const store = new RunStore({ rootDir: dir });
 		const run = store.createRun({ task: "team task", cwd: dir, maxDepth: 2, nodeId: "root" });
-		const base = { sessionFile: path.join(dir, "s.jsonl"), ownerToken: "owner", state: "working" as const, spawnedAt: "2026-01-01T00:00:00.000Z" };
 		// The launch recorded the declaration on the team's child record (#374 §4)…
-		await store.addChild(run.runId, { ...base, name: "team", nodeId: "root.team", phases: INLINE_MACHINE });
+		await store.addChild(run.runId, record("team", dir, "root.team", INLINE_MACHINE));
 		// …and a worker never has one, whatever its lead declared.
-		await store.addChild(run.runId, { ...base, name: "w", sessionFile: path.join(dir, "w.jsonl"), nodeId: "root.team.w" });
+		await store.addChild(run.runId, record("w", dir, "root.team.w"));
 
 		// A FRESH store stands in for the next process / a reopened session: the
 		// panel can only answer from what was persisted.
 		const runs = new RunStore({ rootDir: dir }).listRuns();
-		assert.deepEqual(inlinePhaseMachineForNode("root.team", runs), INLINE_MACHINE);
-		assert.equal(inlinePhaseMachineForNode("root.team.w", runs), undefined, "a worker is never given a declared machine");
-		assert.equal(inlinePhaseMachineForNode("root.unknown", runs), undefined);
+		assert.deepEqual(inlinePhaseMachineForNode("root.team", runs, run.runId), INLINE_MACHINE);
+		assert.equal(inlinePhaseMachineForNode("root.team.w", runs, run.runId), undefined, "a worker is never given a declared machine");
+		assert.equal(inlinePhaseMachineForNode("root.unknown", runs, run.runId), undefined);
+	});
+});
+
+test("#372 M1: every run has a `root.team` — only the DISPATCHING run answers, and ambiguity is a miss", async () => {
+	await withTempDir(async (dir) => {
+		let clock = 1_000;
+		const store = new RunStore({ rootDir: dir, now: () => (clock += 1) });
+		// An OLD run that declared a machine for `root.team`…
+		const oldRun = store.createRun({ task: "old task", cwd: dir, maxDepth: 2, nodeId: "root" });
+		await store.addChild(oldRun.runId, record("team", dir, "root.team", CARD_MACHINE));
+		// …and TODAY's run, which recorded the same node id and declared NOTHING.
+		const currentRun = store.createRun({ task: "today's task", cwd: dir, maxDepth: 2, nodeId: "root" });
+		await store.addChild(currentRun.runId, record("team", dir, "root.team"));
+
+		const runs = new RunStore({ rootDir: dir }).listRuns();
+		assert.deepEqual(
+			runs.map((run) => run.runId),
+			[oldRun.runId, currentRun.runId],
+			"oldest first — a 'first run that mentions this id' scan is exactly the bug",
+		);
+
+		// 1) The dispatching run answers, and "declared nothing" means nothing.
+		assert.equal(
+			inlinePhaseMachineForNode("root.team", runs, currentRun.runId),
+			undefined,
+			"today's team declared nothing; an older run's machine must not paint it",
+		);
+		// 2) The same id still resolves in the run that DID declare it.
+		assert.deepEqual(inlinePhaseMachineForNode("root.team", runs, oldRun.runId), CARD_MACHINE);
+		// 3) Without a dispatching run, two owners are ambiguous ⇒ miss, never guess.
+		assert.equal(inlinePhaseMachineForNode("root.team", runs), undefined, "ambiguity is a miss");
+		// 4) A single owner needs no dispatch run to be unambiguous.
+		assert.deepEqual(inlinePhaseMachineForNode("root.team", [runs[0]!]), CARD_MACHINE);
+	});
+});
+
+test("#372 m3: a render asks ONCE per team root, not once per descendant", async () => {
+	await withTempDir(async (dir) => {
+		const store = new RunStore({ rootDir: dir });
+		const run = store.createRun({ task: "team task", cwd: dir, maxDepth: 2, nodeId: "root" });
+		const workers = 6;
+		await store.addChild(run.runId, record("team", dir, "root.team", INLINE_MACHINE));
+		for (let index = 0; index < workers; index += 1) {
+			await store.addChild(run.runId, record(`w${index}`, dir, `root.team.w${index}`));
+		}
+		const nodes: TreeNodeSnapshot[] = [
+			node("root", null, "root", 0, "root", null, run.runId),
+			node("root.team", "root", "team", 1, "centurion", "recon", "r-team"),
+			...Array.from({ length: workers }, (_, index) =>
+				node(`root.team.w${index}`, "root.team", `w${index}`, 2, "worker", null, `r-team-w${index}`)),
+		];
+
+		let seamCalls = 0;
+		let registryReads = 0;
+		const runtime = createSessionRuntime({
+			sendMessage() {},
+			getTreeNodes: () => nodes,
+			getPhaseMachineForNode: (target) => {
+				seamCalls += 1;
+				registryReads += 1;
+				return inlinePhaseMachineForNode(target.id, store.listRuns(), target.parentRunId);
+			},
+		});
+
+		// Construction paints once, so the first render is measured as a DELTA rather
+		// than as an absolute count.
+		const askedBefore = seamCalls;
+		const readBefore = registryReads;
+		const rendered = runtime.treeNodes();
+		assert.deepEqual(rendered.find((entry) => entry.id === "root.team")?.phaseMachine, INLINE_MACHINE, "the real store answered");
+		// The walk reaches this team root from the team itself AND from every worker.
+		// Without a per-snapshot memo this is one ask per descendant (N + 1) and as many
+		// registry reads — which is what made an undeclared team pay on every repaint.
+		assert.equal(seamCalls - askedBefore, 1, `one ask for the team root, not one per descendant (${workers} workers)`);
+		assert.equal(registryReads - readBefore, 1, "…and one runs-registry read behind it");
+		for (const worker of rendered.filter((entry) => entry.id.startsWith("root.team.w"))) {
+			assert.deepEqual(worker.phaseMachine, INLINE_MACHINE, "every worker inherited the ONE answer");
+		}
+
+		// The memo is scoped to a snapshot: a repaint asks again, still exactly once.
+		runtime.treeNodes();
+		assert.equal(seamCalls - askedBefore, 2, "per render, not per node and not forever");
+		assert.equal(registryReads - readBefore, 2);
 	});
 });
