@@ -338,18 +338,19 @@ export class LegionPostman {
 	/**
 	 * Hand one message to a child, exactly once (#384 review P0-1).
 	 *
-	 * The ORDER is the point: the ledger is claimed (`PENDING → ACCEPTED`) BEFORE the
-	 * send call, because the send is awaited and the recipient may be blocked in its
-	 * own `wait`/`collect` — which polls the same row and would take it in that
-	 * window. Claiming first makes the database the arbiter: the loser's conditional
-	 * update changes no rows, so it skips its own send and the child gets one copy.
+	 * The ORDER is the point: a delivery CLAIM is taken BEFORE the send call, because
+	 * the send is awaited and the recipient may be blocked in its own `wait`/`collect` —
+	 * which races for the same row and would take it in that window. The claim is the
+	 * lease on `delivered_at` ({@link claimForDelivery}), so the database is the
+	 * arbiter: the loser's conditional update changes no rows, it skips its own send,
+	 * and the child gets one copy.
 	 *
-	 * #322 still holds: `ACCEPTED` means "a send call answered" (including `queued`),
-	 * never "the child read it", and `DELIVERED` remains a separate, later fact. What
-	 * the claim adds is that a send which never answered owes an outcome instead of
-	 * silently holding the row forever — {@link bounceUndeliveredMail}, with the
-	 * receipt the send-side bounce used to write. `intercepted` still bounces with its
-	 * own reason.
+	 * #322 still holds, unchanged: the row is still `PENDING` while it is in flight, and
+	 * `ACCEPTED` still means exactly "a send call answered" (including `queued`), never
+	 * "the child read it"; `DELIVERED` remains a separate, later fact. A send that never
+	 * answered hands its claim back ({@link releaseDeliveryClaim}) so the next mailbox
+	 * tick retries, which is precisely the pre-#384 behaviour. `intercepted` still
+	 * bounces with its own reason, and nothing here reaches for a new edge.
 	 */
 	private async deliverToChild(node: LegionNode, message: LegionMessage): Promise<void> {
 		const current = getNode(this.db, node.id) ?? node;
