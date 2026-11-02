@@ -678,7 +678,8 @@ export interface StatusUi {
 	};
 }
 
-function isStaleUiError(error: unknown): boolean {
+/** Exported (#377): the same test the board uses, reused by the extension entry points. */
+export function isStaleUiError(error: unknown): boolean {
 	return (
 		error instanceof Error &&
 		(error.message.includes("This extension ctx is stale") ||
