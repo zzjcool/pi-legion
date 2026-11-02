@@ -23,6 +23,23 @@
 - 进入 `wait` / `collect` 时**先查一次**；之后每 **250ms** 查一次，直到这次调用结束。
 - 与 `signal`（调用方中断）互不覆盖：谁先到谁赢。
 
+### §1.1 阻塞期间该节点的 postman 必须停手
+
+`PENDING` 是触发条件的全部前提，而**生产里这一前提曾经不成立**：实测问题会话的账本
+（`r-f4ef2868/legion.db`）显示，root 的 postman 在写入后 **~200ms** 就把邮件
+`PENDING → ACCEPTED` 并推进 host 的 followUp 队列 —— 比任何一次 250ms 轮询都早。
+于是 `pendingMailCount(root)` 在整个 15 分钟的 `wait` 里恒为 0，功能形同虚设。
+
+因此：
+
+- **阻塞调用持有节点期间，该节点自己的 postman 不得投递**：`deliverRootInbox` 在看到 hold
+  时直接返回，邮件留在 `PENDING` 供抢占取走（`beginMailHold` / `endMailHold` /
+  `isMailHeld`，`src/legion/mail-release.ts`，进程级、按 nodeId 计数）。
+- hold 覆盖**所有**退出路径：超时、调用方 abort、抛错、正常返回，都在 `finally` 里释放 ——
+  一次超时的 `wait` 不允许把 inbox 永久占住。
+- 只约束**同进程**的投递者：root 的 postman 与 root 的工具同进程。子节点的投递发生在父进程，
+  hold 跨不过进程边界 —— 那里由 §3.1 的租约保证「不重复投递」，本条的「抢占优先」不承诺给子节点。
+
 ## §2 行为
 
 命中即**立即返回**（不再等 timeout、不再等 settle）：
