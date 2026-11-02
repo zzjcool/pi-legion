@@ -114,3 +114,7 @@ node --expose-gc --experimental-strip-types bench/perf-core/10-legion-frame-allo
    `byRole` 投影（`:335`）、`"─".repeat(plotW)`（`:422`）。
 
 每步后跑同一 bench：任一步让 §4.2 的 digest 变化 → 回退该步，不得为了数字改输出。
+
+> **#369 之后**：本节各步用到的帧内容器（`px` 网格及其尺寸键、`drawGalaxy` 的 19 个、`drawChart` 的
+> 4 个，共 26）已收进 `panels.ts` 的 `GalaxyScratch` 单例，统一由 `begin()` 清零、跨帧身份不变；
+> 本节的步骤划分、T1–T7 的含义与 §1 的不变量都**不变**，只是上述 `panels.ts:NNN` 行号随重构移动。
