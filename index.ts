@@ -126,6 +126,7 @@ import {
 	type CandidateStore,
 } from "./src/runs/store-lookup.ts";
 import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
+import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
 import {
@@ -2200,12 +2201,28 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	});
 
 	const bindUi = (_event: unknown, ctx: ExtensionContext): void => {
-		lastUi = ctx.hasUI ? ctx.ui : undefined;
-		if (ctx.cwd) lastCwd = ctx.cwd;
+		// #377: `session.dispose()` invalidates the extension ctx, but the run's
+		// `finally` still dispatches `turn_end` / `agent_settled`. Reading `hasUI` on
+		// that ctx throws, and the host prints "Extension error (/plugin/index.ts)" at
+		// every exit. The board already treats staleness as "no UI"; the handler entry
+		// has to answer the same way instead of throwing.
+		let ui: ExtensionContext["ui"] | undefined;
+		let hasUi = false;
+		try {
+			hasUi = ctx.hasUI;
+			ui = hasUi ? ctx.ui : undefined;
+			if (ctx.cwd) lastCwd = ctx.cwd;
+		} catch (error) {
+			if (!isStaleUiError(error)) throw error;
+			lastUi = undefined;
+			lastConfirm = undefined;
+			return;
+		}
+		lastUi = ui;
 		runtime.bind(ctx);
 		lastConfirm =
-			ctx.hasUI && typeof ctx.ui?.confirm === "function"
-				? (message) => ctx.ui.confirm("", message)
+			hasUi && typeof ui?.confirm === "function"
+				? (message) => ui!.confirm("", message)
 				: undefined;
 	};
 
