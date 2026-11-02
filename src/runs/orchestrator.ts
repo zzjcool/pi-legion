@@ -16,7 +16,7 @@ import { LEGION_IDENTITY_ENV_KEYS, LEGION_PHASES_ENV, legionIdentityEnv } from "
 import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
-import { wasSessionInterrupted } from "../legion/interrupt.ts";
+import { wasFailedBySupervisor, wasSessionInterrupted } from "../legion/interrupt.ts";
 import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
@@ -796,6 +796,20 @@ export class Orchestrator {
 		const status = execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
 		const current = getNode(this.legion.db, child.nodeId);
 		if (!current || current.status === status) return;
+		// #372 m2: a VERDICT is not a pause. The safety net can fail a team while its
+		// lead is still thinking (`failTeamIfAllChildrenFailed`), and the lead then
+		// finishes its turn normally — so the drain sees `success` and would rewrite
+		// the row `failed` → `settled`. That leaves the ledger contradicting itself (a
+		// `node_failed` event on a `settled` row) and flips `isTerminalNode` back to
+		// false, i.e. a team the supervisor already buried becomes resumable again.
+		// Same shape as the #374 §3 interrupt guard above: the marker was written
+		// first, and only a later, genuinely different fact may overturn it — here,
+		// none does. Usage is still recorded: it is an orthogonal fact about the turn
+		// that did run, not a claim about the team's lifecycle.
+		if (status !== "failed" && current.status === "failed" && wasFailedBySupervisor(this.legion.db, child.nodeId)) {
+			this.recordUsage(child, execution);
+			return;
+		}
 		updateNode(this.legion.db, child.nodeId, { status }, this.now);
 		const eventType = status === "settled" ? "node_settled" : status === "failed" ? "node_failed" : "node_retired";
 		// #316 D3: `errorKind` rides along so an empty-generation failure is
@@ -806,6 +820,12 @@ export class Orchestrator {
 			reason: execution.reason,
 			...(execution.errorKind ? { errorKind: execution.errorKind } : {}),
 		});
+		this.recordUsage(child, execution);
+	}
+
+	/** Token accounting for one child turn — status-independent on purpose (#372 m2). */
+	private recordUsage(child: ChildRecord, execution: Execution): void {
+		if (!this.legion || !child.nodeId) return;
 		if (execution.usage) {
 			upsertUsage(this.legion.db, { nodeId: child.nodeId, tokensIn: execution.usage.input + execution.usage.cacheRead + execution.usage.cacheWrite, tokensOut: execution.usage.output, costUsd: execution.usage.cost }, this.now);
 		}

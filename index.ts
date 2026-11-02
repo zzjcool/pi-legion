@@ -716,20 +716,40 @@ function phaseMachineForNode(role: string | null | undefined, cwd: string, setti
  * the snapshot dies with the launch call, while the panel must still answer after
  * a reload, in a later process, and in a reopened session.
  *
- * Deliberately scans ALL runs instead of the node's own: the record lives in the
- * run of the process that DISPATCHED the node, not in the node's run. Only the
- * team that declared the machine has a record; a worker never does, and nothing
- * is inferred for it here (it inherits from its lead while rendering, #298).
+ * The record lives in the run of the process that DISPATCHED the node, not in the
+ * node's own run, so this cannot read `store.readRun(node.runId)` — it is given
+ * the dispatch run when the caller knows it (`dispatchRunId`) and searches the
+ * registry only as a fallback.
+ *
+ * #372 M1: a bare node id is NOT an identity. Every run in a checkout contains a
+ * `root.team`, and `listRuns()` is oldest-first, so "the first run whose children
+ * mention this id" picked the OLDEST run — an old team's declaration would paint
+ * today's node, and a team that declared nothing today would inherit a machine
+ * from a run that ended long ago. Two rules follow, and both are load-bearing:
+ *
+ *   1. with `dispatchRunId`, ONLY that run answers (and "no record with `phases`"
+ *      there means "declared nothing", not "look elsewhere");
+ *   2. without it, the registry answer is used only when exactly ONE run owns the
+ *      id — ambiguity is a MISS, never a guess (the same convention
+ *      `storedNodeForJob` uses for identities it cannot disambiguate).
+ *
+ * Only the team that declared the machine has a record; a worker never does, and
+ * nothing is inferred for it here (it inherits from its lead while rendering,
+ * #298).
  */
 export function inlinePhaseMachineForNode(
 	nodeId: string,
-	runs: readonly Pick<RunRecord, "children">[],
+	runs: readonly Pick<RunRecord, "runId" | "children">[],
+	dispatchRunId?: string | null,
 ): PhaseMachine | undefined {
-	for (const run of runs) {
-		const record = run.children.find((child) => child.nodeId === nodeId);
-		if (record?.phases) return record.phases;
+	if (dispatchRunId) {
+		const dispatchRun = runs.find((run) => run.runId === dispatchRunId);
+		return dispatchRun?.children.find((child) => child.nodeId === nodeId)?.phases;
 	}
-	return undefined;
+	const owners = runs.filter((run) => run.children.some((child) => child.nodeId === nodeId));
+	if (owners.length !== 1) return undefined;
+	const [owner] = owners;
+	return owner?.children.find((child) => child.nodeId === nodeId)?.phases;
 }
 
 function createLegionRuntime(input: {
@@ -1695,27 +1715,46 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		})(),
 		// #372 B: /legion must show the machine an inline-declared team was
 		// DISPATCHED with (`subagent({ phases })`, #371 §2). That declaration has no
-		// card to look up, so it is answered per NODE from the launching run's
+		// card to look up, so it is answered per NODE from the dispatching run's
 		// run.json — the one source that survives a reload, a later process and a
-		// reopened session. Only positive answers are cached: a node row exists a
-		// moment before `persistChild` writes its record, and caching that miss would
-		// freeze the race into the panel until restart. `listRuns()` is itself cached
-		// and mtime-checked, so a miss costs a snapshot reuse, not a directory walk.
+		// reopened session.
+		//
+		// #372 M1: the cache key carries the DISPATCH RUN, because `node.id` alone
+		// repeats across runs (`root.team` exists in every one of them). Keyed by id
+		// alone, one run's answer would be served for another run's node — and once
+		// cached, for the rest of the process.
+		//
+		// #372 m4: misses are cached too, but only for a moment. Without that, every
+		// repaint paid a runs-registry read for every UNDECLARED team. The TTL is the
+		// same 1s the store itself uses as the bound on an in-place `run.json` rewrite
+		// by another process (`LIST_RUNS_CACHE_TTL_MS`), and it is also the ceiling on
+		// the one race this cache can lose: the node row exists a moment before
+		// `persistChild` writes the record, so a miss observed in that window clears
+		// itself within the TTL instead of freezing until restart.
 		getPhaseMachineForNode: (() => {
-			const cache = new Map<string, PhaseMachine>();
+			const POSITIVE = new Map<string, PhaseMachine>();
+			const MISS_TTL_MS = 1_000;
+			const misses = new Map<string, number>();
 			return (node) => {
-				const cached = cache.get(node.id);
-				if (cached) return cached;
+				const key = `${node.parentRunId ?? "-"}\u0000${node.id}`;
+				const hit = POSITIVE.get(key);
+				if (hit) return hit;
+				const nowMs = Date.now();
+				const missUntil = misses.get(key);
+				if (missUntil !== undefined && nowMs < missUntil) return undefined;
 				if (!lastCwd) return undefined;
 				let machine: PhaseMachine | undefined;
 				try {
-					machine = inlinePhaseMachineForNode(node.id, runStoreFor(lastCwd).listRuns());
+					machine = inlinePhaseMachineForNode(node.id, runStoreFor(lastCwd).listRuns(), node.parentRunId);
 				} catch {
 					// The panel must never break on an unreadable runs directory; the role
-					// lookup below still runs, so a card-declared team keeps rendering.
+					// lookup above still runs, so a card-declared team keeps rendering.
 					machine = undefined;
 				}
-				if (machine) cache.set(node.id, machine);
+				if (machine) {
+					POSITIVE.set(key, machine);
+					misses.delete(key);
+				} else misses.set(key, nowMs + MISS_TTL_MS);
 				return machine;
 			};
 		})(),

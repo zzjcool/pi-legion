@@ -58,3 +58,41 @@ export function wasSessionInterrupted(db: DatabaseSync, nodeId: string): boolean
 		return false;
 	}
 }
+
+/**
+ * #372: the ledger reason the all-children-failed safety net writes.
+ *
+ * Shared so the writer (`LegionPostman.failTeamIfAllChildrenFailed`) and the
+ * reader below cannot drift: the reason is the ONLY thing that distinguishes a
+ * supervisor verdict from an ordinary drain-recorded failure (`recordSettled`
+ * writes the child's own `execution.reason` there).
+ */
+export const ALL_CHILDREN_FAILED_REASON = "all_children_failed";
+
+/**
+ * Did a SUPERVISOR already judge this node failed — before its own turn drained?
+ *
+ * `recordSettled` is the drain's writer: it derives a status from the child's
+ * session and writes it, deliberately without asking the row what it already
+ * says (a child that really finished during a shutdown drain is improved to
+ * `settled`, #374 §3). That rule is right for a PAUSE and wrong for a VERDICT:
+ * after the safety net failed a team, its lead still finishes its turn normally,
+ * and the drain would rewrite `failed` → `settled`. The ledger would then
+ * contradict itself — a `node_failed` event on a row that reads `settled` — and
+ * `isTerminalNode` would flip back to false, so a team the supervisor had already
+ * buried would look resumable again.
+ *
+ * The marker is the last `node_failed` carrying {@link ALL_CHILDREN_FAILED_REASON},
+ * which only the safety net writes.
+ */
+export function wasFailedBySupervisor(db: DatabaseSync, nodeId: string): boolean {
+	const row = db
+		.prepare("SELECT data FROM events WHERE node_id = ? AND type = 'node_failed' ORDER BY id DESC LIMIT 1")
+		.get(nodeId) as { data: string | null } | undefined;
+	if (!row?.data) return false;
+	try {
+		return (JSON.parse(row.data) as { reason?: unknown }).reason === ALL_CHILDREN_FAILED_REASON;
+	} catch {
+		return false;
+	}
+}

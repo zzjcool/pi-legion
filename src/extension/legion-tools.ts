@@ -15,6 +15,7 @@ import type { LegionSupervisor } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
 import type { LegionEventBus } from "./event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
+import { ALL_CHILDREN_FAILED_REASON } from "../legion/interrupt.ts";
 import {
 	MAIL_BODY_HARD_LIMIT_BYTES,
 	MAIL_BODY_SOFT_LIMIT_BYTES,
@@ -578,7 +579,7 @@ export class LegionPostman {
 			// argument when no subscriber exists, which would drop the ledger fact on a
 			// headless run); only the bus delivery depends on a subscriber.
 			updateNode(this.db, node.id, { status: "failed" }, () => timestamp);
-			const failedEvent = appendEvent(this.db, node.id, "node_failed", { execution: "failed", reason: "all_children_failed" }, { now: () => timestamp });
+			const failedEvent = appendEvent(this.db, node.id, "node_failed", { execution: "failed", reason: ALL_CHILDREN_FAILED_REASON }, { now: () => timestamp });
 			this.eventBus?.emit(failedEvent);
 		}
 		const failureNotice = `Legion team ${node.id} failed because all direct children failed.`;

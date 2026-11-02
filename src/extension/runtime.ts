@@ -189,8 +189,19 @@ export interface SessionRuntimeDeps {
 	 * priority the contract freezes (inline > card > none); the ancestor walk in
 	 * `mergePhaseMachines` is unchanged, so a worker still inherits the machine of
 	 * the team that declared it.
+	 *
+	 * #372 M1: `parentRunId` is the run of the node that DISPATCHED this one — the
+	 * run whose `children[]` holds the record. A bare node id is not an identity:
+	 * every run in a checkout has a `root.team`, so a lookup across the registry
+	 * would let an OLD run's declaration paint today's node. Hosts that cannot
+	 * resolve it may answer `undefined` (a miss): a guess here is worse than a
+	 * blank panel, because it shows a workflow the team never had.
 	 */
-	getPhaseMachineForNode?: (node: { id: string; role: string | null }) => PhaseMachine | undefined;
+	getPhaseMachineForNode?: (node: {
+		id: string;
+		role: string | null;
+		parentRunId: string | null;
+	}) => PhaseMachine | undefined;
 	/**
 	 * Renewal proposal for a finishing child (subagent-renewal-v1 D3).
 	 *
@@ -1466,18 +1477,33 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * keeps a render of N workers from paying for N lookups. Descendants still
 	 * inherit: the walk reaches the team root above them (see the header comment),
 	 * which is the node the lookup is made for.
+	 *
+	 * #372 m3/m4: answers are memoized for the DURATION OF THIS SNAPSHOT. The walk
+	 * visits the same team root from every descendant, so without the memo a team of
+	 * N asks N+1 times — and an UNDECLARED team would pay a registry read once per
+	 * visitor on every repaint. A miss is memoized too (it is a real answer: "this
+	 * team declared nothing"), and the memo dies with this call, so the host's own
+	 * caches keep owning cross-render invalidation.
 	 */
 	const mergePhaseMachines = (nodes: TreeNodeSnapshot[]): TreeNodeSnapshot[] => {
 		const byId = new Map(nodes.map((node) => [node.id, node]));
+		/** One lookup per node per snapshot (see the memo note above). */
+		const declaredCache = new Map<string, PhaseMachine | undefined>();
+		const declaredFor = (cursor: TreeNodeSnapshot): PhaseMachine | undefined => {
+			if (cursor.role !== "centurion") return undefined;
+			if (declaredCache.has(cursor.id)) return declaredCache.get(cursor.id);
+			// The record lives in the run whose orchestrator DISPATCHED this node: the
+			// PARENT's run (#372 M1), never "any run that happens to know this id".
+			const parentRunId = cursor.parentId ? byId.get(cursor.parentId)?.runId ?? null : null;
+			const machine = deps.getPhaseMachineForNode?.({ id: cursor.id, role: cursor.role, parentRunId });
+			declaredCache.set(cursor.id, machine);
+			return machine;
+		};
 		for (const node of nodes) {
 			let cursor: TreeNodeSnapshot | undefined = node;
 			let hops = 0;
 			while (cursor && hops < 64) {
-				const declared =
-					cursor.role === "centurion"
-						? deps.getPhaseMachineForNode?.({ id: cursor.id, role: cursor.role })
-						: undefined;
-				const machine = declared ?? deps.getPhaseMachine?.(cursor.role);
+				const machine = declaredFor(cursor) ?? deps.getPhaseMachine?.(cursor.role);
 				if (machine) {
 					node.phaseMachine = machine;
 					break;
