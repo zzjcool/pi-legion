@@ -70,7 +70,8 @@ commands under the supervisor, without an LLM deciding whether they passed.
 
 A centurion owns a Git worktree for its subtree; squad members share that
 worktree, and a nested centurion gets a nested Git worktree. Each squad
-squashes its subtree into an MR for its parent. MRs move upward until the root
+squashes its subtree onto a branch for its parent — the branch is the deliverable, and an
+MR is added only when the repository has a remote. Deliveries move upward until the root
 reviews and merges into the default branch. Do not merge a child squad's work
 at the wrong level.
 

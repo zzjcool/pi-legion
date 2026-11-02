@@ -11,6 +11,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Changed
+
+- **交付物是分支，MR 只是有 remote 时的便利。** 以前角色卡、注入给子节点的任务附录、验证后的提示语都写「开 MR/PR 并把 URL 写进 verdict」，
+  在**零 remote** 的仓库里等于要求一个不可能的东西（实测一次真实会话：centurion 只能交一条待推分支，如实报 `no remote`）。
+  现在统一的措辞是：**分支名 + HEAD sha 就是交付**；仓库有 remote 且 `gh`/`glab` 可用时再附 MR/PR 链接，缺失不算失败，**任何情况下不许编造 URL**。
+  逐级合并权不变（仍由父节点合并，认分支/提交而非平台对象）。见 `docs/legion-v2-contract.md` REV-29。
+
 ### Fixed
 
 - **退出会话时不再出现 `Extension error (<boundary>): turn_end could not resolve the persisted

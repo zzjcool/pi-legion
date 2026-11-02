@@ -70,7 +70,9 @@ test("formatChildTask worktreeBranch tells the child to ship via MR", () => {
 	});
 	assert.match(text, /pi-subagent\/worker-0-deadbeef/);
 	assert.match(text, /isolated git worktree/);
-	assert.match(text, /merge request \/ pull request/);
+	assert.match(text, /The branch is the deliverable/);
+	assert.match(text, /never invent a URL/);
+	assert.match(text, /a missing MR is not a failure/);
 	assert.doesNotMatch(formatChildTask("implement it"), /isolated git worktree/);
 });
 

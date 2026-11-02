@@ -30,10 +30,11 @@
   不要主会话自己逐文件读。
 
 ## 交付流水线：review 是合并门禁，merge 权在主 agent
-- worker 交活（自报 verdict + MR）→ 主 agent 派 reviewer 门槛审查（`ok: true` 才算过）。
+- worker 交活（自报 verdict + 分支；有 remote 时才附 MR）→ 主 agent 派 reviewer 门槛审查（`ok: true` 才算过）。
 - **reviewer 任务里必须附上冻结契约的关键决策**（planner 的 D 编号决策、刻意删除/不改的项），否则 reviewer 会把「刻意为之」误判为「缺失功能」，引发不必要的返工循环（契约矛盾型 major）。
 - reviewer 有 critical/major findings → steer 原 worker 修复 → 复审；minor 可接受后合入。修复范围应由主 agent 按契约裁决后裁剪，全盘照单转给 worker 是浪费。
-- **MR 由主 agent 统一合回默认分支，worker 永不自己 merge**。并行多个 MR 时按 planner 标注的集成顺序合（共享文件的改动必须序列化），冲突时主 agent 裁决。
+- **交付物是分支**：`git log` 能看到、`git diff` 能审就够；MR 只是有 remote 时的便利，不是门槛。
+- **合并由主 agent 统一做，worker 永不自己 merge**。并行多个分支时按 planner 标注的集成顺序合（共享文件的改动必须序列化），冲突时主 agent 裁决。
 
 ## 不要派发（保持单 agent，避免无谓开销）
 - 改单个文件的单个函数、跑测试、看日志、回答简单问题。

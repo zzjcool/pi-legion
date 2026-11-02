@@ -34,7 +34,8 @@ export function childTaskAppendix(opts?: {
 	const worktree = opts?.worktreeBranch
 		? [
 				`- You are in an isolated git worktree on branch \`${opts.worktreeBranch}\`. Do not write the parent checkout.`,
-				"- Commit on this branch and open a merge request / pull request into the repository default branch. Do not merge locally. Do not push to main or master. Put the MR/PR URL in your verdict reason.",
+				"- Commit on this branch. The branch is the deliverable: put its name and HEAD sha in your verdict reason. Do not merge locally; do not push to main or master.",
+				"- A merge request / pull request is a convenience, not a requirement: open one only when the repository has a remote and `gh`/`glab` is available, and then add its URL to the verdict. With no remote, write `no remote: branch <name> at <sha>`; never invent a URL, and a missing MR is not a failure.",
 			]
 		: [];
 	return [

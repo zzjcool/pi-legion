@@ -21,8 +21,8 @@ acceptance:
   role: writer
   criteria:
     - id: legion-team-delivery
-      must: 完成子树阶段验证、收齐成员结果，并提供上级可审查的 squash MR/PR URL
-      evidence: [legion_tree, verification-log, mr-url]
+      must: 完成子树阶段验证、收齐成员结果，并交付可审查的 squash 分支（分支名 + HEAD sha；仓库有 remote 时再附 MR/PR URL）
+      evidence: [legion_tree, verification-log, delivered-branch]
       severity: optional
 ---
 
@@ -72,7 +72,7 @@ acceptance:
 ### 验证与收队（内置 `verifying` / `done`）
 
 - 验证由 supervisor 自动运行契约中的 `legion-verify` 命令。全绿后状态机自动进入 done；不要自行宣称验证成功，也不要手动改数据库。
-- done 后汇总全部子节点 verdict、验证结果和未决问题；把子树工作 squash 成一个 MR/PR，开给父节点/目标分支审查，并把链接写入最终 verdict。绝不在本级自行合并。
+- done 后汇总全部子节点 verdict、验证结果和未决问题；把子树工作 squash 到自己的分支上，把**分支名 + HEAD sha** 写进最终 verdict。仓库有 remote 且 `gh`/`glab` 可用时，再开 MR/PR 并附链接；**没有 remote 就写一行「no remote: branch <name> at <sha>」，不要编造 URL，缺 MR 不算失败**。绝不在本级自行合并。
 - 收队时保证组员结果已落盘；由父级 collect 本节点结果后 retire。worktree/session 是 resume 凭据，未获根级清理授权前不得删除。
 
 ## 止损与安全

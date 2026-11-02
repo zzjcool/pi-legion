@@ -1,7 +1,7 @@
 ---
 name: pi-legion
 npm: "pi-legion"
-description: "Pi Legion v2: recursive centurion teams on Pi. Children run in-process by default (rpc only for a worktree-owning centurion); shared SQLite WAL legion.db. Declarative per-team phase machine (built-in default: planning/implementing/reviewing/verifying), parent/child/sibling legion_mail, three-layer /legion UI, upward MR trees, squad resume."
+description: "Pi Legion v2: recursive centurion teams on Pi. Children run in-process by default (rpc only for a worktree-owning centurion); shared SQLite WAL legion.db. Declarative per-team phase machine (built-in default: planning/implementing/reviewing/verifying), parent/child/sibling legion_mail, three-layer /legion UI, upward branch deliveries (MRs when a remote exists), squad resume."
 ---
 
 # pi-legion
@@ -160,7 +160,7 @@ acceptance checklist in its task:
 ```text
 subagent({
   agent: "centurion",
-  task: "Goal: implement the account export flow. Acceptance: contract is recorded; implementation is reviewed; the verification commands pass; return a squash MR and verdict."
+  task: "Goal: implement the account export flow. Acceptance: contract is recorded; implementation is reviewed; the verification commands pass; return the squashed branch (name + sha) and verdict."
 })
 ```
 
@@ -557,8 +557,9 @@ A centurion owns a Git worktree for its subtree; its worker/scout
 children work in that subtree (`worktree: false`, typically in-process), and a
 nested centurion gets a nested worktree. **Parallel isolated writers:** dispatch
 N centurions from the root (each owns one worktree); do not give every worker
-its own worktree. Each subtree is delivered as a squash MR to its parent level.
-MRs move upward through the tree until the root reviews and merges into the
+its own worktree. Each subtree is delivered as a squashed branch to its parent level
+(an MR/PR is added when the repository has a remote); deliveries move upward through
+the tree until the root reviews and merges into the
 default branch.
 
 Resuming follows the tree's saved sessions and node records. If a supervisor

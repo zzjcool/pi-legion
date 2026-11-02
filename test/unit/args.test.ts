@@ -190,7 +190,8 @@ test("buildPiArgs worktreeBranch lands in the task file", () => {
 		assert.ok(taskArg);
 		const text = readFileSync(taskArg!.slice(1), "utf8");
 		assert.match(text, /pi-subagent\/worker-0-deadbeef/);
-		assert.match(text, /merge request \/ pull request/);
+		assert.match(text, /The branch is the deliverable/);
+		assert.match(text, /never invent a URL/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
