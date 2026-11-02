@@ -935,7 +935,11 @@ export class Orchestrator {
 
 	private emitStored(nodeId: string, type: Parameters<typeof appendEvent>[2], data: unknown): void {
 		if (!this.legion) return;
-		this.legion.eventBus?.emit(appendEvent(this.legion.db, nodeId, type, data, { now: this.now }));
+		// #380: `eventBus?.emit(appendEvent(...))` never evaluated `appendEvent` when
+		// there was no bus, so a headless host silently lost the ledger row. Append
+		// first, then notify whoever is listening.
+		const event = appendEvent(this.legion.db, nodeId, type, data, { now: this.now });
+		this.legion.eventBus?.emit(event);
 	}
 
 	private rollbackReservation(nodeId: string, previous: LegionNode | null): void {

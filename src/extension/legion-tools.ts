@@ -581,7 +581,10 @@ export class LegionPostman {
 			}, () => timestamp);
 			if (!decision.allowed) return;
 			updateNode(this.db, node.id, { phase: "failed", phaseSince: decision.phaseSince }, () => timestamp);
-			this.eventBus?.emit(appendEvent(this.db, node.id, "phase_change", decision.event.data, { now: () => timestamp }));
+			// #380: append FIRST. `eventBus?.emit(appendEvent(...))` short-circuits the
+			// argument, so a host without an event bus lost the phase change entirely.
+			const changed = appendEvent(this.db, node.id, "phase_change", decision.event.data, { now: () => timestamp });
+			this.eventBus?.emit(changed);
 		} else {
 			// No machine to judge the move, so the verdict is the state itself. The
 			// event is appended FIRST and unconditionally (`emit` short-circuits its
@@ -657,7 +660,9 @@ export class LegionPostman {
 		}, () => timestamp);
 		if (!decision.allowed) return;
 		updateNode(this.db, node.id, { phase: "done", phaseSince: decision.phaseSince }, () => timestamp);
-		this.eventBus?.emit(appendEvent(this.db, node.id, "phase_change", decision.event.data, { now: () => timestamp }));
+		// #380: append first — see the comment on the all-children-failed path above.
+		const changed = appendEvent(this.db, node.id, "phase_change", decision.event.data, { now: () => timestamp });
+		this.eventBus?.emit(changed);
 		const how = verificationHow(
 			taskMetadata(node.taskSummary).verification?.commandCount ?? 0,
 			successPhase,
@@ -1302,7 +1307,9 @@ export async function requestLegionPhase(
 	const how = verificationHow(verification.commandCount, decision.to, machine);
 	if (!done.allowed) return { ok: true, phase: decision.to, message: `Verification passed ${how}; waiting for team to settle: ${done.message}` };
 	updateNode(db, nodeId, { phase: "done", phaseSince: done.phaseSince }, now);
-	options.eventBus?.emit(appendEvent(db, nodeId, "phase_change", done.event.data, { now }));
+	// #380: the ledger write must not depend on a subscriber existing.
+	const changed = appendEvent(db, nodeId, "phase_change", done.event.data, { now });
+	options.eventBus?.emit(changed);
 	options.sendSelfMessage?.(`Verification passed ${how}. Collect every child result, squash the subtree work, open an MR/PR for the parent, and report its URL. Do not merge.`);
 	return { ok: true, phase: "done", message: `Verification passed ${how}; phase automatically advanced to done.` };
 }
