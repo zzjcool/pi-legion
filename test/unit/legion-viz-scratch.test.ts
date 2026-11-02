@@ -185,3 +185,25 @@ test("#369: the same frame twice through one scratch paints the same bytes (begi
 	assert.deepEqual(chartSecond.toLines(theme), chartFirst.toLines(theme));
 	assert.equal(second.width, GALAXY.w);
 });
+
+test("#369: a painter that throws still releases the gate (try/finally, not try/catch)", () => {
+	// The gate protects process-wide containers, so a `finally` that only runs on the
+	// happy path would latch it shut after the first renderer error: every later frame
+	// would throw `is not reentrant` instead of painting, and the panel would freeze.
+	const data = scenario();
+	const reference = referenceGalaxy(data);
+	class Exploding extends Canvas {
+		private calls = 0;
+		override set(x: number, y: number, ch: string, color?: string, style?: Readonly<{ bold?: boolean; inverse?: boolean }>): void {
+			this.calls += 1;
+			if (this.calls === 5) throw new Error("canvas boom");
+			super.set(x, y, ch, color, style);
+		}
+	}
+
+	assert.throws(() => paintGalaxy(new Exploding(GALAXY.w, GALAXY.h), data), /canvas boom/u);
+	// If the gate were still held, this very call would throw `viz: drawGalaxy is not
+	// reentrant` — the assertion is the painting itself, not a private field.
+	const after = referenceGalaxy(data);
+	assert.deepEqual(after.toPlain(), reference.toPlain(), "the next frame paints clean");
+});

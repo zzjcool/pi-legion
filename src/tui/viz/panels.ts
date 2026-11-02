@@ -139,11 +139,19 @@ interface PxCell {
  * #369: every mutable container the two painters read, in **one** object with
  * **one** entry point (`begin`).
  *
- * None of it is a cache: `begin()` empties all of it before a frame paints, so a
- * reader only ever sees this frame's entries — the answer to "how much of this is
- * already clean at this point?" is "all of it", which is what used to require
- * reading both painters end to end (the resets were spread over 14 lines, and
- * `if (!center) return` in the middle of `drawGalaxy` made the rest look missed).
+ * None of it is a cache: `begin()` empties it before a frame paints, so a reader
+ * only ever sees this frame's entries — the answer to "how much of this is
+ * already clean at this point?" is "everything with a length or a counter",
+ * which is what used to require reading both painters end to end (the resets were
+ * spread over 14 lines, and `if (!center) return` in the middle of `drawGalaxy`
+ * made the rest look missed).
+ *
+ * Seven arrays are addressed through a counter instead of being truncated:
+ * `posX/posY` (by `pos`), `occX/occY/occW` (by `occCount`), `bandTop/bandRole`
+ * (by `bandCount`). `begin` zeroes those counters, which is the same state a fresh
+ * instance has — every reader indexes below the counter — and leaving the tails
+ * alone is deliberate: `length = 0` would drop V8's backing store and the next
+ * write would allocate, which is the one thing #364 forbids (contract §1.2).
  *
  * Nothing here may be re-allocated per frame either: `clear()` / `length = 0` / a
  * counter back to `0` keeps every container's identity across frames, and that
@@ -268,6 +276,10 @@ class GalaxyScratch {
 		this.candidates.length = 0;
 		this.roles.length = 0;
 		this.statusItems.length = 0;
+		// The counters are also the LENGTH of posX/posY and occX/occY/occW: dropping a
+		// reset here would not change a byte (readers stay below the counter) but the
+		// arrays would grow across frames forever, so they are memory hygiene, not
+		// removable redundancy (contract §6.3).
 		this.occCount = 0;
 		this.bandCount = 0;
 		this.chartRoles.length = 0;
