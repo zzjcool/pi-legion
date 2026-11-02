@@ -59,19 +59,24 @@ import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { openLegionDb, type DatabaseSync } from "../../src/legion/db.ts";
 import {
+	DEFAULT_MAIL_RATE_PER_5_MIN,
 	MAIL_DELIVERY,
 	claimForDelivery,
 	getMessage,
+	renewDeliveryClaim,
 	inbox,
 	pendingInbox,
 	sendMail,
 } from "../../src/legion/mail.ts";
 import {
 	MAIL_DELIVERY_CLAIM_LEASE_MS,
+	beginMailHold,
+	endMailHold,
 	isMailHeld,
+	redeliverMail,
 	takePendingMail,
 } from "../../src/legion/mail-release.ts";
-import { getNode, insertNode, updateNode, type LegionNode } from "../../src/legion/nodes.ts";
+import { getNode, hasEnded, insertNode, updateNode, type LegionNode } from "../../src/legion/nodes.ts";
 import type { OrchestratorLegionContext } from "../../src/runs/orchestrator.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -195,13 +200,24 @@ function mailFromChild(db: DatabaseSync, subject: string, body: string, to = "pa
 	return fixtureMail(db, { from: "root.team", to, subject, body });
 }
 
+/** A send whose refusal is the answer the test wants, not a fixture failure. */
+function mailFromChildOk(db: DatabaseSync, subject: string): boolean {
+	return sendMail(db, { fromNode: "root.team", to: "parent", subject, body: "rate probe" }, { now: () => Date.now() }).ok;
+}
+
 function fixtureMail(
 	db: DatabaseSync,
-	input: { from: string; to: string; subject: string; body: string },
+	input: { from: string; to: string; subject: string; body: string; kind?: string },
 ): number {
 	const sent = sendMail(
 		db,
-		{ fromNode: input.from, to: input.to, subject: input.subject, body: input.body },
+		{
+			fromNode: input.from,
+			to: input.to,
+			subject: input.subject,
+			body: input.body,
+			...(input.kind ? { kind: input.kind as never } : {}),
+		},
 		{ now: () => Date.now() },
 	);
 	if (!sent.ok) throw new Error(`fixture mail was refused: ${sent.message}`);
@@ -314,7 +330,8 @@ test("wait hands over mail written while it is blocked (§2, I2)", async () => {
 		assert.deepEqual(await postmanTick(db), [], "an ACCEPTED message is never injected twice");
 		// I4: the child was not touched.
 		assert.equal(runtime.get(CHILD)?.state, "working");
-		assert.ok(returnedAt - sentAt < 1_000, `preempted in ${returnedAt - sentAt}ms`);
+		// Contract I6: preemption lands inside one poll of the write, well under 500ms.
+		assert.ok(returnedAt - sentAt < 500, `preempted in ${returnedAt - sentAt}ms`);
 	} finally {
 		clearTimeout(send);
 		runtime.dispose();
@@ -935,13 +952,112 @@ test("a held inbox survives the postman and reaches the blocked wait (production
 		assert.equal((result.details as { state?: string }).state, "mail");
 		assert.match(body, /Subject: the postman cannot race me/);
 		assert.match(body, /Still running: live/);
-		assert.ok(elapsed < 1_000, `preempted in ${elapsed}ms despite the live postman`);
+		assert.ok(elapsed < 500, `preempted in ${elapsed}ms despite the live postman`);
 		// 4. delivered exactly once, and the postman is back on duty with nothing to send.
 		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
 		await postman.tick();
 		assert.deepEqual(injected, [], "an ACCEPTED message is never injected twice");
 	} finally {
 		postman.stop();
+		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+test("collect holds the inbox too: a live postman cannot deliver past it (M4-1)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	const runtime = blockedRuntime();
+	const injected: string[] = [];
+	const postman = new LegionPostman({
+		db,
+		nodeId: "root",
+		supervisor: new FakeSupervisor(),
+		now: () => Date.now(),
+		sendRootMessage: (message) => injected.push(message),
+		intervalMs: 10_000,
+	});
+	try {
+		const startedAt = Date.now();
+		let returnedAt = 0;
+		// The child's collect never settles, so this `collect` blocks exactly like a real
+		// long one. The hold is taken synchronously, before the first await.
+		const collecting = collectChild(collectFixture(runtime, store, cwd), undefined, {
+			db,
+			nodeId: "root",
+		}).then((value) => {
+			returnedAt = Date.now();
+			return value;
+		});
+		assert.equal(isMailHeld("root"), true, "the blocked collect holds its inbox from entry");
+		mailFromChild(db, "the postman waits its turn", "the body the collect must hand over");
+		await postman.tick();
+		await postman.tick();
+		assert.deepEqual(injected, [], "two ticks inside the block deliver nothing");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
+		const result = await within(collecting, "the blocked collect preempted", 1_000);
+		const elapsed = returnedAt - startedAt;
+		assert.equal((result.details as { state?: string }).state, "mail");
+		assert.ok(elapsed < 500, `the collect settled in ${elapsed}ms`);
+		// The hold is gone with the call: the postman is back on duty.
+		assert.equal(isMailHeld("root"), false, "the finished collect hands the inbox back");
+		mailFromChild(db, "second mail", "the postman's again, not the tool's");
+		await postman.tick();
+		assert.equal(injected.length, 1, "the next tick injects exactly the new mail");
+		assert.match(injected[0]!, /Subject: second mail/);
+	} finally {
+		postman.stop();
+		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+test("collect releases the hold when the caller is already gone (M4-2)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	const runtime = blockedRuntime();
+	mailFromChild(db, "waiting for a gone caller", "must stay queued");
+	try {
+		const aborted = new AbortController();
+		aborted.abort();
+		const result = await within(
+			collectChild(collectFixture(runtime, store, cwd), aborted.signal, {
+				db,
+				nodeId: "root",
+			}),
+			"the already-aborted collect",
+		);
+		assert.match(textOf(result), /interrupted \(parent turn ended; children still running\)/);
+		assert.equal((result.details as { state?: string }).state, undefined);
+		assert.equal(isMailHeld("root"), false, "the entry return path must release the hold");
+		assert.equal(pendingInbox(db, "root").length, 1, "and it takes no mail");
+	} finally {
+		runtime.dispose();
+		dispose();
+		db.close();
+	}
+});
+
+test("collect releases the hold when it preempts at entry (M4-3)", async () => {
+	const db = mailLedger();
+	const { store, cwd, dispose } = tempStore();
+	const runtime = blockedRuntime();
+	mailFromChild(db, "already here", "the collect takes it on entry");
+	try {
+		const result = await within(
+			collectChild(collectFixture(runtime, store, cwd), undefined, {
+				db,
+				nodeId: "root",
+			}),
+			"the collect that preempts on entry",
+		);
+		assert.equal((result.details as { state?: string }).state, "mail");
+		assert.match(textOf(result), /Subject: already here/);
+		assert.equal(isMailHeld("root"), false, "the entry-preempt path must release the hold too");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+	} finally {
 		runtime.dispose();
 		dispose();
 		db.close();
@@ -985,6 +1101,209 @@ test("the hold is released when the blocking call ends without mail", async () =
 		postman.stop();
 		runtime.dispose();
 		dispose();
+		db.close();
+	}
+});
+
+test("an in-process child that holds its inbox is skipped by the parent postman (m6)", async () => {
+	const db = openLegionDb(":memory:");
+	const rootDir = mkdtempSync(path.join(tmpdir(), "mail-preempt-child-hold-"));
+	const supervisor = new FakeSupervisor();
+	const sessionFile = path.join(rootDir, "team.jsonl");
+	mkdirSync(rootDir, { recursive: true });
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const child = insertNode(
+			db,
+			{ parentId: "root", name: "team", role: "centurion", status: "running", sessionFile },
+			() => 2,
+		);
+		await supervisor.spawnChild({
+			name: child.name,
+			task: "held child fixture",
+			agent: agent("centurion"),
+			sessionFile,
+			tempDir: rootDir,
+			cwd: rootDir,
+		});
+		fixtureMail(db, { from: "root", to: "team", subject: "for a blocked child", body: "hold me" });
+		const postman = new LegionPostman({
+			db,
+			nodeId: "root",
+			supervisor,
+			now: () => Date.now(),
+			intervalMs: 10_000,
+		});
+		try {
+			// A child's `wait`/`collect` takes the same hold under its own node id; the
+			// parent's postman runs in this process, so it must stand aside too.
+			beginMailHold(child.id);
+			await postman.tick();
+			assert.equal(
+				supervisor.calls.filter((call) => call.method === "followUp").length,
+				0,
+				"the held child receives nothing",
+			);
+			assert.equal(inbox(db, child.id, { delivery: MAIL_DELIVERY.PENDING }).length, 1);
+			endMailHold(child.id);
+			await postman.tick();
+			assert.equal(
+				supervisor.calls.filter((call) => call.method === "followUp").length,
+				1,
+				"once the hold is gone the parent postman delivers normally",
+			);
+			assert.equal(inbox(db, child.id, { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+		} finally {
+			postman.stop();
+		}
+	} finally {
+		rmSync(rootDir, { recursive: true, force: true });
+		db.close();
+	}
+});
+
+test("a re-delivered mail spends no quota and is never double-prefixed (m5)", () => {
+	const db = mailLedger();
+	try {
+		// Fill most of the sender's window with genuine sends (the limiter counts them).
+		const ids: number[] = [];
+		for (let index = 0; index < DEFAULT_MAIL_RATE_PER_5_MIN - 2; index += 1) {
+			ids.push(mailFromChild(db, `genuine ${index}`, "counted once"));
+		}
+		// Five platform re-deliveries of those same mails: five extra rows, none of them
+		// a send the sender chose to make.
+		const copies = redeliverMail(db, [ids[0]!, ids[1]!, ids[2]!, ids[3]!, ids[4]!]);
+		assert.equal(copies.length, 5);
+		assert.match(copies[0]!.subject, /^Redelivered: genuine 0$/);
+		// Re-delivering a copy keeps ONE prefix.
+		const again = redeliverMail(db, [copies[0]!.id]);
+		assert.equal(again[0]!.subject, "Redelivered: genuine 0", "no `Redelivered: Redelivered:`");
+		// The quota still has the two slots the genuine sends left, and only those.
+		assert.equal(mailFromChildOk(db, "after copies 1"), true);
+		assert.equal(mailFromChildOk(db, "after copies 2"), true);
+		assert.equal(
+			mailFromChildOk(db, "the 11th counted mail"),
+			false,
+			"the copies did not spend the quota, so this is the sender's own 11th message",
+		);
+	} finally {
+		db.close();
+	}
+});
+
+test("a stale phase-timeout notice is discarded, never handed over (M1)", () => {
+	const db = mailLedger();
+	try {
+		// The sender of a `Phase timeout:` notice is what makes it stale: once that child
+		// has ended, the phase it is nagging about is over. The postman already refuses to
+		// deliver these (#333); the preemption must agree, or the model gets a to-do that
+		// the ledger itself considers pointless.
+		const timedOut = insertNode(
+			db,
+			{ parentId: "root", name: "late", role: "centurion", status: "failed" },
+			() => 100,
+		);
+		assert.equal(hasEnded(timedOut), true, "fixture: the sender has ended");
+		const stale = fixtureMail(db, {
+			from: timedOut.id,
+			to: "root",
+			subject: "Phase timeout: implementing",
+			body: "the phase this asked about is over",
+			kind: "notice",
+		});
+		// A live second mail proves the loop keeps going after the discard.
+		const live = fixtureMail(db, {
+			from: "root.team",
+			to: "root",
+			subject: "still relevant",
+			body: "this one must be handed over",
+		});
+		assert.deepEqual(
+			takePendingMail(db, "root").map((message) => message.id),
+			[live],
+			"the stale notice is skipped, the live mail still comes through",
+		);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 1);
+		assert.equal(getMessage(db, stale)?.delivered, MAIL_DELIVERY.OBSOLETE);
+		assert.equal(getMessage(db, live)?.delivered, MAIL_DELIVERY.ACCEPTED);
+	} finally {
+		db.close();
+	}
+});
+
+test("a long send keeps renewing its claim, so the lease never lapses (M3)", async (t) => {
+	const db = openLegionDb(":memory:");
+	const rootDir = mkdtempSync(path.join(tmpdir(), "mail-preempt-renew-"));
+	const supervisor = new GatedFollowUpSupervisor();
+	const sessionFile = path.join(rootDir, "team.jsonl");
+	mkdirSync(rootDir, { recursive: true });
+	t.mock.timers.enable({ apis: ["setInterval", "Date"], now: Date.now() });
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const child = insertNode(
+			db,
+			{ parentId: "root", name: "team", role: "centurion", status: "running", sessionFile },
+			() => 2,
+		);
+		await supervisor.spawnChild({
+			name: child.name,
+			task: "slow send fixture",
+			agent: agent("centurion"),
+			sessionFile,
+			tempDir: rootDir,
+			cwd: rootDir,
+		});
+		const messageId = fixtureMail(db, {
+			from: "root",
+			to: "team",
+			subject: "a send that outlives the lease",
+			body: "resumeChild waits on the admission queue",
+		});
+		const postman = new LegionPostman({
+			db,
+			nodeId: "root",
+			supervisor,
+			now: () => Date.now(),
+			intervalMs: 10_000,
+		});
+		const tick = postman.tick();
+		try {
+			await within(supervisor.parked, "the postman is parked inside its send call");
+			const claimedAt = getMessage(db, messageId)!.deliveredAt;
+			assert.equal(getMessage(db, messageId)?.delivered, MAIL_DELIVERY.PENDING);
+			// Three whole lease periods pass inside ONE send (the ruling's slow-send case:
+			// `resumeChild` waits on an admission queue whose default is 900s).
+			t.mock.timers.tick(MAIL_DELIVERY_CLAIM_LEASE_MS * 3);
+			const renewedAt = getMessage(db, messageId)!.deliveredAt;
+			assert.ok(
+				renewedAt !== null && claimedAt !== null && renewedAt > claimedAt,
+				`the claim was renewed while the send ran (${claimedAt} -> ${renewedAt})`,
+			);
+			// Still exclusive: nobody else can take a lease the holder keeps alive.
+			assert.equal(
+				claimForDelivery(db, messageId, () => Date.now(), MAIL_DELIVERY_CLAIM_LEASE_MS),
+				false,
+				"a renewed lease is as exclusive as a fresh one",
+			);
+			assert.equal(getMessage(db, messageId)?.delivered, MAIL_DELIVERY.PENDING);
+		} finally {
+			supervisor.free();
+			await within(tick, "the postman tick finished");
+			postman.stop();
+		}
+		// The send returned: the transition owns the row, and the renewal stopped.
+		const acceptedAt = getMessage(db, messageId)!.deliveredAt;
+		assert.equal(getMessage(db, messageId)?.delivered, MAIL_DELIVERY.ACCEPTED);
+		t.mock.timers.tick(MAIL_DELIVERY_CLAIM_LEASE_MS * 3);
+		assert.equal(
+			getMessage(db, messageId)!.deliveredAt,
+			acceptedAt,
+			"no renewal runs after the send settled",
+		);
+		// …and renewal itself refuses a row that already left PENDING.
+		assert.equal(renewDeliveryClaim(db, messageId, () => Date.now(), MAIL_DELIVERY_CLAIM_LEASE_MS), false);
+	} finally {
+		rmSync(rootDir, { recursive: true, force: true });
 		db.close();
 	}
 });
