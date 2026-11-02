@@ -768,7 +768,7 @@ export class LegionPostman {
 			successPhase,
 			this.machine,
 		);
-		this.sendSelfMessage(`Verification passed ${how}. Collect every child result, squash the subtree work, open an MR/PR for your parent, and report the URL. Do not merge.`);
+		this.sendSelfMessage(`Verification passed ${how}. Collect every child result, squash the subtree work onto your branch, and report the branch name + HEAD sha (add an MR/PR URL only when the repository has a remote). Do not merge.`);
 	}
 
 	/**
@@ -1410,7 +1410,7 @@ export async function requestLegionPhase(
 	// #380: the ledger write must not depend on a subscriber existing.
 	const changed = appendEvent(db, nodeId, "phase_change", done.event.data, { now });
 	options.eventBus?.emit(changed);
-	options.sendSelfMessage?.(`Verification passed ${how}. Collect every child result, squash the subtree work, open an MR/PR for the parent, and report its URL. Do not merge.`);
+	options.sendSelfMessage?.(`Verification passed ${how}. Collect every child result, squash the subtree work onto your branch, and report the branch name + HEAD sha (add an MR/PR URL only when the repository has a remote). Do not merge.`);
 	return { ok: true, phase: "done", message: `Verification passed ${how}; phase automatically advanced to done.` };
 }
 

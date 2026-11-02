@@ -37,7 +37,7 @@
 | D3 | centurion 权力 = 汇总权 + 对**自己组员**的标准 steer/retire | 不越界管别人的队 |
 | D4 | 越级通道（叶子直达 CEO）**不做** | v2 明确出清，见 §16 |
 | D5 | 规模目标：数十 ～ 300 节点 | 决定 RPC headless 架构 |
-| D6 | MR 树状合并：子树 squash MR → 逐级上交，根统一合入默认分支 | 现有纪律的递归推广 |
+| D6 | 树状交付：子树 squash 分支（有 remote 时附 MR/PR）→ 逐级上交，根统一合入默认分支 | 现有纪律的递归推广（REV-29） |
 | D7 | 传输层换 **pi RPC 模式**（`RpcClient` 子进程），去 herdr 展示依赖 | 实测：`--mode rpc --session <file>` 可用、resume 无损 |
 | D8 | worktree **仅支持 git**（裸 `git worktree add`，现有实现） | 不做 herdr worktree 分支 |
 | D9 | resume 必须支持；父死 = 子死（stdin close），恢复走 resume 链 | F13 语义变化，已知并接受 |
@@ -280,7 +280,7 @@ CREATE INDEX idx_messages_rate ON messages(from_node, created_at);   -- from_nod
 ---
 name: centurion
 description: 百夫长/组长：携带一支团队递归派生的指挥角色。负责冻结契约、
-  调度组员、推进四阶段状态机、整队交付（squash MR）。
+  调度组员、推进四阶段状态机、整队交付（squash 分支；有 remote 时开 MR）。
 kind: pi
 allowNestedSubagents: true
 maxSubagentDepth: 2          # R=本角色子树代数上限（含自身；与所在深度无关；只收紧不放宽）：1=叶子禁派生；2=可派一层组员、组员不可再派；3=组员（如孙代 centurion）可再派一层
@@ -289,7 +289,7 @@ team:                        # 可选：默认队（须是 settings.teams 里真
 ---
 ```
 
-角色正文要点（写给 LLM 的职责说明）：只管自己队；planning 先出契约再开工；implementing 按文件所有权并行派工；reviewing 多角度对抗审查；`legion_phase` 请求迁移被拒时按拒绝理由修正后重试（不算 rework）；收队时 squash MR + 汇总 verdict；组员卡死按现有止损纪律（重试≤2 → 咨询 advisor 或上报）。
+角色正文要点（写给 LLM 的职责说明）：只管自己队；planning 先出契约再开工；implementing 按文件所有权并行派工；reviewing 多角度对抗审查；`legion_phase` 请求迁移被拒时按拒绝理由修正后重试（不算 rework）；收队时 squash 到分支 + 汇总 verdict（有 remote 时附 MR/PR URL）；组员卡死按现有止损纪律（重试≤2 → 咨询 advisor 或上报）。
 
 ### 6.2 团队绑定：角色 frontmatter `team` 为默认，launch 参数覆盖，经现有 `PI_SUBAGENTS_TEAM` env 通道下发——centurion 的 roster 即所选队的成员（现成机制，README:498）。
 
@@ -341,7 +341,7 @@ npm test -- --filter <scope>
 
 ### 7.5 DONE 收队流（全在 centurion 进程内自动编排）：
 1. verifying 全绿 → supervisor 迁移 phase=done（事件）
-2. 注入收队 prompt：汇总 verdict、squash 分支、开 MR
+2. 注入收队 prompt：汇总 verdict、squash 到分支（有 remote 时开 MR）
 3. centurion settle → 其父 collect → retire centurion
 4. worktree 保留至根节点合 MR 后由 `legion-gc` 清理（文件不删库记录）
 
@@ -438,7 +438,7 @@ legion_phase({ to, note?, evidence?, reason?, supersedes? })  // 仅 centurion�
 - **worktree 仅 centurion 可用**（REV-17，#214）：`worktree: true` 是 centurion 角色的专属权限，不存在其他持有者。判定以角色名 `centurion` 为准：centurion 卡一律拿到子树 worktree（嵌套 centurion 拿 nested worktree，不受「父是 centurion ⇒ 组员不隔离」压制）；centurion 的组员一律不拿；其余角色（`worker` / `prototype` / `scout` / `reviewer` / `planner` / `advisor` / `designer`，含用户自建 writer 角色）既不自动获得、也不会因 `acceptance.role: writer` 而获得 worktree
 - **违规处理为降级，不是报错**（REV-17）：非 centurion 角色卡声明 `worktree: true`、或 `subagent({ worktree: true })` 显式传参，一律**降级为 `worktree: false`**，并 `console.warn` 一次（每 Orchestrator 实例一次，同 `depthWarningEmitted` 语义）。**不抛错**——抛错会阻断 launch，而降级的语义是「回到契约本来的边界」；被降级的组员与父共享 checkout，其改动留在父的工作区里
 - 孙代 centurion 在子树 worktree 内再开 nested worktree（git 原生支持），递归成立
-- **MR 树**（D6）：每棵子树一个 squash MR → 父节点（或其队）合并 → 逐级上交 → 根合入默认分支。合并权在各级父节点，叶子永不 merge（现有纪律的递归推广）
+- **交付树**（D6，REV-29）：每棵子树一个 squash 分支（有 remote 时附 MR/PR）→ 父节点（或其队）合并 → 逐级上交 → 根合入默认分支。合并权在各级父节点，叶子永不 merge；合并认的是分支/提交，不是平台对象（现有纪律的递归推广）
 - 文件所有权清单随契约（§7.2）逐层传递；契约矛盾 = 正确拒绝，上报修订后重派
 
 ## 10. 可视化与事件总线
@@ -532,7 +532,7 @@ interface LegionEventBus {
 ### M2 军团树（组织层：db + centurion + 状态机 + 邮件）
 
 - **归属**：新增 `src/legion/{db,nodes,events,usage,mail,state-machine,budget,rebuild}.ts`、`agents/centurion.md`、`src/extension/legion-tools.ts`；修改 `orchestrator.ts`（launch 落库/树命名/预算查库/子树 worktree——经 REV-17 收为 centurion 专属，非 centurion 请求 warns 一次后降级）、`src/runs/worktree.ts`（subtree 模式）、`src/runs/args.ts`（env 增 `PI_LEGION_DB`/`PI_LEGION_NODE_ID`）、`src/agents/agents.ts`、`index.ts`（队级 resume、collect 落库）
-- **验收**：(a) 三层树 e2e：CEO→centurion→workers×2 全阶段走通（契约落盘→并行实施→review verdict→verify 实跑→done 收队 + squash MR）；(b) rework 循环：review major→回 implementing→复审通过；(c) rework≥2 → failed 上抛；(d) kill centurion 进程 → 孤儿报警 → resume 恢复整队、settled 组员不复活、运行中组员上下文延续；(e) `maxActiveNodes` 超限拒派 + 事件；(f) 邮件：同级/父子/父←子通、跨子树拒发并提示路由、retired 收件人唤醒投递、终态收件人退信；(g) WAL 压测：60 模拟 supervisor 并发写 5 分钟，busy 超时率 <0.1%（**实测 2026-10-22 通过**：60 个 `fork` 子进程、各持一连接、共享一库，postman 节奏每 ~2s 一短事务，300s 内 9004 次尝试 / 9004 提交 / 0 次 busy = 0.000%；成功事务 p50 1.03ms / p95 1.99ms / p99 4.92ms。复跑：`npm run test:wal-stress`；CI 快速守卫 `test/unit/wal-concurrency.test.ts` 只钉住 busy_timeout 生效、WAL/超时前置条件与零 busy，**不证明** 5 分钟跨进程结论）；(h) `legion-rebuild` 从 run.json+jsonl 重建 nodes/events；(i) 非 pi kind 明确拒绝
+- **验收**：(a) 三层树 e2e：CEO→centurion→workers×2 全阶段走通（契约落盘→并行实施→review verdict→verify 实跑→done 收队 + squash 分支）；(b) rework 循环：review major→回 implementing→复审通过；(c) rework≥2 → failed 上抛；(d) kill centurion 进程 → 孤儿报警 → resume 恢复整队、settled 组员不复活、运行中组员上下文延续；(e) `maxActiveNodes` 超限拒派 + 事件；(f) 邮件：同级/父子/父←子通、跨子树拒发并提示路由、retired 收件人唤醒投递、终态收件人退信；(g) WAL 压测：60 模拟 supervisor 并发写 5 分钟，busy 超时率 <0.1%（**实测 2026-10-22 通过**：60 个 `fork` 子进程、各持一连接、共享一库，postman 节奏每 ~2s 一短事务，300s 内 9004 次尝试 / 9004 提交 / 0 次 busy = 0.000%；成功事务 p50 1.03ms / p95 1.99ms / p99 4.92ms。复跑：`npm run test:wal-stress`；CI 快速守卫 `test/unit/wal-concurrency.test.ts` 只钉住 busy_timeout 生效、WAL/超时前置条件与零 busy，**不证明** 5 分钟跨进程结论）；(h) `legion-rebuild` 从 run.json+jsonl 重建 nodes/events；(i) 非 pi kind 明确拒绝
 
 ### M3 可视化
 
@@ -588,3 +588,4 @@ interface LegionEventBus {
 | 2026-11-02 | REV-26 | 三条**语义修订**（非 schema / 非事件类型 / 非权限变更，按 §15-1 追加）。① **§4.2 `phase_since` 的含义收窄为「当前相位 *stint* 的起始时刻」**：#357 之前它只能是「当前相位的起始时刻」，因为相位一迁才写；`continue` 复活一个已结束的团队时相位**不动**（工作从原地继续）而 `phase_since` 前移到复活时刻，好让「一个 stint 一次 `phase_timeout`」的去重键（`hasPhaseTimeoutForSince`）与 `Phase timeout:` 通知的过期判据都按新 stint 计算——否则一个超时过的团队复活后永远静默。② **§8.3.1 的 `OBSOLETE` 触发多一条来源：复活即令旧 stint 的通知作废**——判据仍是「`phase`/`phase_since` 与产生该通知的 `phase_timeout` 事件不同」（复活前移了 `phase_since`），`reason` 文案仍 `obsolete_after_phase_change`，事件闭集仍 **16**，未新增 event type / mail 主题前缀。③ **§7.4 的时钟来源扩为四级**：显式 operator 设置（`subagents.legion.phaseTimeouts`，只认**显式写下**的值）→ 卡片 `phases[].timeoutMs` → 内置四阶段默认 → 0（永不告警）；相位名不再要求是内置四名（声明式状态机 §7.1），内置四阶段的**数值逐字不变**（planning 15m / implementing 60m / reviewing 30m / verifying 15m），超时仍只报告、永不杀。**④ 行为变更（同一 PR 的 major 1 修复，随本修订一并记录）**：此前 `index.ts` 把 `DEFAULT_LEGION_SETTINGS` 的 `phaseTimeouts` 展开成普通对象，于是「设置项已存在」与「operator 显式设置过」不可区分，`settings.phaseTimeouts[phase] ?? machineTimeout(...)` 的左侧永远非空——卡片为**内置相位名**声明的 `timeoutMs` 被静默忽略（探针：`implementing` 设置项 3600000 / 卡片 300000 → 实际 3600000）。现在显式性由 `legionExplicitFields` 判定（`legionSettingsForRun` 把默认值填进来时不再冒充决定），因此**声明了内置名 `timeoutMs` 的卡片从此真的生效**：这是本修订里唯一可观察的行为变更，也是声明式状态机 v5 契约 `docs/contracts/declarative-phase-machine-v5.md` 早已写下的顺序第一次与行为一致。触发：PR #363 对抗式 review 的 major 1/2（契约漂移：改动已落库而修订日志未追加，同 #355 的形状）。 |
 | 2026-11-02 | REV-27 | **REV-1（子契约 `docs/contracts/centurion-declared-phases-v1.md` §4，子契约内编号；本文件编号顺延为 REV-27，避免与 2026-10-11 的 REV-1 撞号）**：把「非 root 不得派 centurion」从**未记录的实现约束**提升为契约条款（权限变更，按 §15-4 走修订）。该约束与 §9「孙代 centurion 在子树 worktree 内再开 nested worktree，递归成立」及 §6.1 `maxSubagentDepth` 注释「3=组员（如孙代 centurion）可再派一层」**直接冲突**，而此前没有任何 REV 记录。裁决：**保持禁止**。理由（老板决定，2026-10-31）：centurion 的语义是「root 派出去的一支子树」，嵌套 lead 不带来新的交付语义，只带来深度与工件的递归；需要更多并行时由 root 直派多个 centurion。落地：`Orchestrator.launch` 在创建 worktree/run 目录**之前**抛 `centurion is dispatchable only from the root shell; '<parent>' at '<node>' cannot`（code 仍 `BUDGET_EXCEEDED`，与 #281 一致）；`agents/centurion.md` 的 description 同步为「仅根会话可派发」。同一修订确立**声明式启用**：状态机不再是「角色叫 centurion」的自动后果，而是 root 在那次派发里显式声明的东西（`subagent({ agent: "centurion", phases: [...] })`）——**声明了 = §7.1 原行为一字不改**；**没声明 = 该节点 `nodes.phase` 为 NULL、不注册 `legion_phase`、不注入收队提示**，干完活交 verdict 即结束（§7.1 的「团队生来在 `planning`」由此变为「声明了才生来在机器声明的 start 相位」）。同一次修订还补两条守卫：`phases` 只能由 root 声明、且只能给 centurion（非 root 传 / 给非 centurion 传一律在 launch 期拒绝，不产生任何工件）。**worktree 归属不变**（§9 REV-17 保持：centurion 专属、强制 `true`、仍绑 rpc）；不新增角色、不动 `teams` 裁剪、不放宽 MR 合并权（仍在各级父节点）。**另订正一处子契约与实现的冲突**：`centurion-declared-phases-v1.md` §5 的 I1 守卫列写「`test/unit/legion-tools.test.ts:114` / `test/integration/legion-tree.test.ts:164` 两个文件不改」，子契约 §6-2 又要求 G2/G3 断言「worktree 目录不存在」，但 M2 那条 e2e 必须改成**显式声明内置机器**（原来自动获得的状态机现在要写明）——这两处对应的都只是**测试**，不改任何被冻结的行为语义，M2 的断言除新增 `phases:` 外一行未动，I1 的「声明后与今天逐字节一致」正是由这条改动后的用例来证明。同理 `legion-phase-machine-start.test.ts` 里「未声明团队生来在 `planning`」的旧断言必须反转成 NULL（那条旧断言正是本契约要推翻的规则本身）。**并订正 §6-2 的一处漂移**：G2/G3 的「无工件」判据从「worktree 目录不存在」改为「run store 无新 child / 账本无新行」——非 centurion 在守卫之前就被强制 `worktree:false`，那条断言恒真（PR #371 review r1 minor 2）；G4 仍保留 worktree 断言（它派的是真 centurion）。 |
 | 2026-11-03 | REV-28 | 会话中断与恢复语义（**语义修订，非 schema / 非事件类型 / 非权限变更**，按 §15-1 追加；子契约 `docs/contracts/legion-session-continuity-v1.md`）。① **§3.1 的 retire 语义分叉**：`retire(cause: "session-shutdown")` **不再**迁移相位——父会话退出是**暂停**，不是判负。此前它走 `abortLegionPhase`，把 `nodes.phase` 推到终态 `aborted`，而 `childFromNode`/`reserveNode` 对终态相位直接抛 `CHILD_TERMINAL`，于是「结束一个会话」这个动作本身摧毁了「继续这份工作」的唯一凭证。现在该原因下只杀进程、`status → retired`、写一条带 `reason: "session-shutdown"` 的 `node_retired`（事件闭集仍 **16**，`reason` 是字段）；`phase` / `phase_since` / `rework_count` 一律不动、不写 `phase_change`（暂停不是新 stint，区别于 #357 的 `revived`）。`isTerminalNode` 仍为 false ⇒ 可被 resume；`hasEnded` 仍为 true ⇒ 暂停期间不投邮件（§8.3.1 现状不变）。**其它 cause（`stop`/`abort`/超预算/显式 retire）逐字不变**。② **`RunRecord.sessionFile`（run.json 附加字段，非 SQLite 列）**：记录创建该 run 的会话 transcript 绝对路径，是仓内**唯一**的会话身份判据（`path.resolve` 相等；仓内没有 session id 概念，`ChildRecord.sessionId` 是死字段）。同一 session 再启动时按它找回**最近一条** run 并**复用**（同一 `runId`/run 目录/`legion.db`；root 行 update 而非 insert，`insertNode` 会按名字冲突抛 `NodeNameConflictError`；只更新 run.json 的 `updatedAt`）。找不到 / 账本损坏 / root 行缺失 ⇒ 退回「今天的行为」（新建 run），**不抛**。③ **`ChildRecord.phases`（run.json 附加字段，非 SQLite 列）**：launch 时把 root 声明的相位机器快照进 child 记录，`subagent({action:"resume"/"continue"})` 与 centurion 自愈恢复把它传回 `Orchestrator.launch`，经既有 `LEGION_PHASES_ENV` 通道下发；否则复活的内联声明队会退回角色卡机器，自定义相位名变成 `invalid_phase`。只对真正下发的角色（`centurion`）快照——把角色卡机器当**声明**回放会被 launch 期守卫（只 root 声明 / 只给 centurion）拒绝。④ **提示与边界**：root 启动时**只**在 system prompt 里列出「`status ∈ {starting,running,blocked,retired}` 且 `phase` 非空且非终态、且本进程没有在跑它」的直接子节点（附一句硬规则：不要自己 resume，先问用户），用户侧一行 `notify`，**零 spawn**（不自动恢复，不烧 token）；**跨 session 不扫描旧 run、不提示、不写任何文件**。该段从账本现算，节点全部恢复后自动消失。**不改**：`NodeStatus` 仍 6 个值（不加 `interrupted`）、事件闭集仍 16、`hasEnded`/`isTerminalNode` 语义、worktree/MR/acceptance、SQLite schema（`nodes` 表不加列）。触发：issue #374。 |
+| 2026-11-03 | REV-29 | **交付物是分支，MR 只是有 remote 时的便利**（措辞修订，非语义/非 schema/非权限变更，按 §15-1 追加）：§6.2/§7.1/§9 里「squash MR」「MR 树」的表述，在**零 remote** 的仓库里无法执行（实测一次真实会话：centurion 只能交一条待推分支，报 `no remote`），而契约读起来像「没有 MR 就是没交付」。明确：**D6 的「子树 squash MR」= 一个可审查的 squash 分支（分支名 + HEAD sha）**；MR/PR 是**有 remote 且 `gh`/`glab` 可用**时的可选产物，附 URL 更好，缺失不构成验收失败，**任何情况下都不许编造 URL**。逐级合并权与「叶子永不 merge」一字不变（合并仍发生在父节点，认的是分支/提交，不是平台对象）。落地文案：`agents/centurion.md`、`src/extension/child-guard.ts` 的注入附录、验证后的 `sendSelfMessage`、`subagent` 的 worktree 参数说明、`skills/pi-legion/SKILL.md`、`README.md`、`examples/subagents-parent-context.md`。 |
