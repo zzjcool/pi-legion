@@ -60,6 +60,7 @@ import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.t
 import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
+import { markSessionInterrupted } from "./src/legion/interrupt.ts";
 import { type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
@@ -1439,6 +1440,18 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	const pendingUtilityRetires: Array<(opts?: RetireOptions) => Promise<void>> = [];
 	let sessionRuntime: SessionRuntime | undefined;
 	const shutdownRetireAll = async (_event?: unknown, ctx?: { mode?: string }): Promise<void> => {
+		// #374 §3: record what this exit interrupts BEFORE anything drains or kills.
+		// `--print`/`--json` drain first, and a child whose turn ends during that drain
+		// (including one the exit just killed) parses as a finished turn and would be
+		// recorded `settled/success` — the interrupt would be lost. The marker only
+		// writes the ledger, so a child that genuinely finishes during the drain still
+		// ends up `settled` (measured in the container before this line existed).
+		const own = ownLegionIdentity();
+		if (own) {
+			try {
+				markSessionInterrupted(own.db, own.nodeId, () => Date.now());
+			} catch { /* the ledger may already be closing; never block shutdown */ }
+		}
 		// #181: short --print exits before the deferred timer; flush now so
 		// orphan rpc-child-* dirs still get swept on a clean exit.
 		if (!isChild) flushHygieneIfPending();

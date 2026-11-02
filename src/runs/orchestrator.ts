@@ -16,6 +16,7 @@ import { LEGION_IDENTITY_ENV_KEYS, LEGION_PHASES_ENV, legionIdentityEnv } from "
 import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
+import { wasSessionInterrupted } from "../legion/interrupt.ts";
 import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
@@ -781,8 +782,17 @@ export class Orchestrator {
 		this.emitStored(child.nodeId, resumed ? "node_resumed" : "node_launched", { parentId: this.legion.nodeId, runId: childRun, sessionFile: child.sessionFile, role: agent.name, kind: agent.kind });
 	}
 
-	private recordSettled(child: ChildRecord, execution: Execution): void {
+	private recordSettled(child: ChildRecord, execution: Execution, lastTurnComplete = true): void {
 		if (!this.legion || !child.nodeId || execution.status === "running" || child.state === "retired") return;
+		// #374 §3: an exit already marked this node as INTERRUPTED. A killed child's
+		// truncated session still derives `success` (its last turn never wrote a stop
+		// reason), so the drain would overwrite the pause with a fake completion —
+		// measured in the container: a worker killed by SIGTERM came back `settled`.
+		// Only a genuinely finished turn may improve the marker to `settled`.
+		if (!lastTurnComplete && wasSessionInterrupted(this.legion.db, child.nodeId)) {
+			const current = getNode(this.legion.db, child.nodeId);
+			if (current?.status === "retired") return;
+		}
 		const status = execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
 		const current = getNode(this.legion.db, child.nodeId);
 		if (!current || current.status === status) return;
@@ -2853,7 +2863,7 @@ export class Orchestrator {
 		if (execution.status !== "running" && !isRetired()) child.state = "awaiting";
 		child.execution = execution;
 		child.acceptance = acceptance;
-		if (execution.status !== "running") this.recordSettled(child, execution);
+		if (execution.status !== "running") this.recordSettled(child, execution, isLastTurnComplete(parsed));
 		if (!isRetired()) this.onChildUpdate(child);
 		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
 		if (isRetired()) {
@@ -3001,12 +3011,22 @@ export class Orchestrator {
 			// `hasEnded` true so it receives no mail). No `phase_change` is written:
 			// nothing moved. Every other cause (`stop`, `abort`, budget, explicit
 			// retire) keeps the abort behaviour byte for byte (invariant I4).
-			const pausedByShutdown = opts?.cause === "session-shutdown";
+			// #374: "was this node paused by the exit" is a LEDGER fact, not a call-site
+			// fact. The shutdown hook marks the children before it drains, and the drain
+			// retires them through a path that carries no `cause` — so trusting
+			// `opts.cause` alone let the no-cause branch overwrite the pause with
+			// `node_retired{execution:"success"}` (measured in the container).
+			const pausedByShutdown =
+				opts?.cause === "session-shutdown" || wasSessionInterrupted(this.legion.db, child.nodeId);
 			if (pausedByShutdown) {
-				updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
+				// #374: the shutdown hook marks live children before it drains, so this
+				// branch usually finds the node already retired. Writing again would make
+				// the history say the session ended twice.
+				const marked = getNode(this.legion.db, child.nodeId)?.status === "retired";
+				if (!marked) updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
 				// The event type stays in the closed set of 16; `reason` is a field, not a
 				// new event (§3, invariant I2).
-				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, reason: "session-shutdown" });
+				if (!marked) this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, reason: "session-shutdown" });
 			} else if (child.execution && child.execution.status !== "unknown" && child.execution.status !== "running") {
 				this.recordSettled(child, child.execution);
 				if (child.execution.status !== "aborted") this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, execution: child.execution.status });
