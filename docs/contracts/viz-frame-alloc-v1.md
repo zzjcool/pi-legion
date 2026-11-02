@@ -99,7 +99,10 @@ node --expose-gc --experimental-strip-types bench/perf-core/10-legion-frame-allo
 ### 4.4 不回归
 
 `npm run typecheck` / `npm test` / `npm run test:integration` 全绿；
-`node --experimental-strip-types bench/perf-core/09-legion-mount.ts` 仍 `ok: true`。
+`node --experimental-strip-types bench/perf-core/09-legion-mount.ts` 在**空闲独占**机器上仍 `ok: true`。
+机器不空闲时（有并发任务、`loadavg`/foreign CPU/探针超阈值）该基准输出 `ok: "inconclusive"`、
+时间类门标 `not judged`、退出码 0 —— **不算回归**，也不是通过；须换空闲机器复跑
+（见 `bench/perf-core/README.md` 的「`09` 必须空闲独占运行」与 #368）。
 
 ## §5 交付顺序（按契约写死的优先级，实测可微调但必须写进报告）
 
