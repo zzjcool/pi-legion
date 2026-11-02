@@ -23,10 +23,12 @@
 import { appendEvent } from "./events.ts";
 import type { DatabaseSync } from "./db.ts";
 import {
+	claimForDelivery,
 	formatMail,
 	getMessage,
 	MAIL_DELIVERY,
 	pendingInbox,
+	releaseDeliveryClaim,
 	transitionDelivery,
 	type LegionMessage,
 } from "./mail.ts";
@@ -36,6 +38,22 @@ const MAIL_RELEASE_LIMIT = 100;
 
 /** Contract §1: how often a blocked `wait`/`collect` looks at the inbox. */
 const MAIL_PREEMPT_POLL_MS = 250;
+
+/**
+ * How long a delivery claim lives (#384 review, ruling: lease, not a new edge).
+ *
+ * `claimForDelivery` stamps `delivered_at` on a `PENDING` row; that stamp is the
+ * lease. It exists for CRASH RECOVERY only — the normal path is closed by
+ * `transitionDelivery` (a returned send writes `ACCEPTED`, a thrown one releases the
+ * claim immediately), so this number only has to outlive the slowest real
+ * `supervisor.*` call a host performs (RPC steer/followUp/prompt round trips, which
+ * are seconds at worst). A holder that dies without releasing therefore blocks its own
+ * claim for 60s and no longer: after that another route may take the message over.
+ *
+ * Not a timeout: nothing is written when it expires, and an expired-but-alive holder
+ * can only lose a race it was about to lose anyway.
+ */
+export const MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000;
 
 /**
  * The inbox a blocking tool has to watch, when the caller is a legion node.
@@ -48,12 +66,15 @@ export interface MailReleaseSeam {
 	nodeId: string;
 }
 
-/** Contract §1: is there anything to release right now? */
+/** Contract §1: is there anything to release right now, that nobody else holds? */
 function pendingMailCount(db: DatabaseSync, nodeId: string): number {
 	if (!nodeId) throw new TypeError("nodeId must be a non-empty node id");
+	const cutoff = Date.now() - MAIL_DELIVERY_CLAIM_LEASE_MS;
 	const row = db
-		.prepare("SELECT COUNT(*) AS count FROM messages WHERE to_node = ? AND delivered = ?")
-		.get(nodeId, MAIL_DELIVERY.PENDING);
+		.prepare(
+			"SELECT COUNT(*) AS count FROM messages WHERE to_node = ? AND delivered = ? AND (delivered_at IS NULL OR delivered_at < ?)",
+		)
+		.get(nodeId, MAIL_DELIVERY.PENDING, cutoff);
 	return Number(row?.count ?? 0);
 }
 
@@ -72,13 +93,19 @@ function pendingMailCount(db: DatabaseSync, nodeId: string): number {
  * lie the ledger just refused to tell.
  */
 export function takePendingMail(db: DatabaseSync, nodeId: string): LegionMessage[] {
+	const now = () => Date.now();
 	const taken: LegionMessage[] = [];
 	for (const message of pendingInbox(db, nodeId, MAIL_RELEASE_LIMIT)) {
+		// The SAME lease the postman uses (#384 review): whoever claims first delivers,
+		// and an in-flight postman send is not stolen out from under its followUp.
+		if (!claimForDelivery(db, message.id, now, MAIL_DELIVERY_CLAIM_LEASE_MS)) continue;
 		try {
 			const claimed = transitionDelivery(db, message.id, MAIL_DELIVERY.ACCEPTED);
 			if (claimed.delivered === MAIL_DELIVERY.ACCEPTED) taken.push(claimed);
 		} catch {
-			// Raced: the postman (or a previous release) already moved it.
+			// Raced: another writer moved it between claim and transition. Hand the lease
+			// back so the row is claimable again rather than parked for a minute.
+			releaseDeliveryClaim(db, message.id);
 		}
 	}
 	return taken.sort((left, right) => left.id - right.id);

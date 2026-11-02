@@ -13,6 +13,7 @@ import type { LegionSettings, TurnRecord } from "../shared/types.ts";
 import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
+import { MAIL_DELIVERY_CLAIM_LEASE_MS } from "../legion/mail-release.ts";
 import type { LegionEventBus } from "./event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
 import { ALL_CHILDREN_FAILED_REASON } from "../legion/interrupt.ts";
@@ -22,13 +23,13 @@ import {
 	MAIL_BOUNCE_REASON,
 	MAIL_DELIVERY,
 	MailInvalidTextError,
-	bounceUndeliveredMail,
 	claimForDelivery,
 	formatMail,
 	inbox,
 	isStalePhaseTimeoutNotice,
 	mailReachedTurns,
 	pendingInbox,
+	releaseDeliveryClaim,
 	sendMail,
 	transitionDelivery,
 	type LegionMessage,
@@ -364,9 +365,11 @@ export class LegionPostman {
 		// claim it and then discover it has nobody to hand it to.
 		const send = this.deliveryFor(current, message, text, wasAlive);
 		if (!send) return;
-		if (!claimForDelivery(this.db, message.id, this.now)) {
-			// The recipient's own blocked `wait`/`collect` delivered it first. A second
-			// copy is precisely the duplicate this claim exists to stop.
+		// #384 review P0-1: take the LEASE before the send. The row stays `PENDING`
+		// (nothing terminal is written for a claim), but its `delivered_at` now says
+		// "claimed at", so every other route — the recipient's blocked `wait`, or another
+		// postman — runs the same conditional update, loses, and skips its own copy.
+		if (!claimForDelivery(this.db, message.id, this.now, MAIL_DELIVERY_CLAIM_LEASE_MS)) {
 			return;
 		}
 		try {
@@ -377,18 +380,23 @@ export class LegionPostman {
 				// #338 minor 1: this is NOT a steer, so it does not emit `node_steered`
 				// (the bus signal for an injected steer) — the observable event is the
 				// `mail_bounced` below, carrying `reason: intercepted_by_input_handler`.
-				this.bounceClaimed(message, MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER);
+				transitionDelivery(this.db, message.id, MAIL_DELIVERY.BOUNCED, this.now, {
+					reason: MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER,
+				});
+				this.emitMail(message.id, message.fromNode, "mail_bounced");
 				// …and this `return` is why a swallowed send never reaches the unblock below (#323 3).
 				return;
 			}
 			if (wasAlive && message.urgency === "action-needed" && current.status === "blocked") updateNode(this.db, current.id, { status: "running" }, this.now);
+			// The lease did its job; the transition is what ends the story (and overwrites
+			// `delivered_at` with the real acceptance time).
+			transitionDelivery(this.db, message.id, MAIL_DELIVERY.ACCEPTED, this.now);
 			this.emitMail(message.id, message.fromNode, "mail_sent");
 		} catch {
-			// #384 review P0-1: the claim already LEFT `PENDING`, so "let the next tick
-			// retry" is no longer available — an RPC failure here would strand the row in
-			// ACCEPTED with the child never having seen it. The send-side outcome for a
-			// send that did not happen is a bounce, with the receipt the sender is owed.
-			this.bounceClaimed(message, MAIL_BOUNCE_REASON.SEND_FAILED);
+			// A transport failure is not a delivery verdict: hand the claim back so the
+			// next mailbox tick retries, exactly as before #384 (no bounce, no receipt, no
+			// new edge — the row never left `PENDING`).
+			releaseDeliveryClaim(this.db, message.id);
 		}
 	}
 
@@ -432,16 +440,6 @@ export class LegionPostman {
 			await this.supervisor.prompt(current.name, text);
 			return "sent";
 		};
-	}
-
-	/** Bounce a message THIS postman claimed, then publish the bus signal for it. */
-	private bounceClaimed(message: LegionMessage, reason: string): void {
-		try {
-			bounceUndeliveredMail(this.db, message.id, reason, this.now);
-		} catch {
-			// The row is already claimed; a second failure has nothing left to record.
-		}
-		this.emitMail(message.id, message.fromNode, "mail_bounced");
 	}
 
 	private async pollUsage(children: readonly LegionNode[]): Promise<void> {

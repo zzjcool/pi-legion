@@ -48,12 +48,6 @@ export const MAIL_BOUNCE_REASON = {
 	INTERCEPTED_BY_INPUT_HANDLER: "intercepted_by_input_handler",
 	/** #333: a `Phase timeout:` notice whose phase was already over when it landed. */
 	OBSOLETE_AFTER_PHASE_CHANGE: "obsolete_after_phase_change",
-	/**
-	 * #384 review P0-1: the send call itself threw AFTER the message was claimed for
-	 * that route, so the text never reached the recipient. The claim must not swallow
-	 * it silently — the sender gets the same receipt a send-side bounce writes.
-	 */
-	SEND_FAILED: "send_failed",
 } as const;
 export type MailBounceReason = (typeof MAIL_BOUNCE_REASON)[keyof typeof MAIL_BOUNCE_REASON];
 
@@ -366,18 +360,10 @@ export function pendingInbox(db: DatabaseSync, toNode: string, limit = 100): Leg
  * Which state may follow which (schema v2, #322). Everything downstream of
  * ACCEPTED is terminal on purpose: once the ledger knows the outcome, a later
  * tick must not rewrite history.
- *
- * #384 review P0-1 is the one exception, and it is a CLAIM rather than a rewrite:
- * a delivery route now takes `ACCEPTED` BEFORE its send (`claimForDelivery`), so
- * `ACCEPTED` means "one route owns this message and is handing it over" for the
- * duration of that call. A send that never happened is therefore exactly the
- * send-side bounce #322 already modelled — hence `ACCEPTED → BOUNCED`, with the
- * same event and the receipt `bounceUndeliveredMail` writes. No column, value or
- * event type changes; the edge is reachable only through that helper.
  */
 const MAIL_DELIVERY_TRANSITIONS: Record<number, readonly MailDeliveryStatus[]> = {
 	[MAIL_DELIVERY.PENDING]: [MAIL_DELIVERY.ACCEPTED, MAIL_DELIVERY.BOUNCED, MAIL_DELIVERY.OBSOLETE],
-	[MAIL_DELIVERY.ACCEPTED]: [MAIL_DELIVERY.DELIVERED, MAIL_DELIVERY.OBSOLETE, MAIL_DELIVERY.BOUNCED],
+	[MAIL_DELIVERY.ACCEPTED]: [MAIL_DELIVERY.DELIVERED, MAIL_DELIVERY.OBSOLETE],
 	[MAIL_DELIVERY.BOUNCED]: [],
 	[MAIL_DELIVERY.DELIVERED]: [],
 	[MAIL_DELIVERY.OBSOLETE]: [],
@@ -491,69 +477,65 @@ export function transitionDelivery(
  * tool result. The claim is a CONDITIONAL update, so the loser gets `false` and skips
  * its own send: the ledger decides who delivers, not the ordering of two async sites.
  *
- * Returns true only when THIS call moved the row `PENDING → ACCEPTED`. The winner owes
- * an outcome: `ACCEPTED` is what a returned send call means, so a send that throws
- * must hand the row to {@link bounceUndeliveredMail} instead of leaving it claimed.
+ * The claim is a LEASE, not a state change (#384 review, ruling: do not touch #322's
+ * legal edges). `delivered_at` — already nullable, already written by
+ * `transitionDelivery` — carries "claimed at" while the row is still `PENDING`:
+ *
+ *   - the row keeps `delivered = PENDING`, so a crash between claim and send is not a
+ *     terminal verdict nobody can undo; `releaseDeliveryClaim` hands it back at once,
+ *     and the lease length (`leaseMs`, owned by the postman/preemption side) bounds the
+ *     damage of a holder that died without saying anything;
+ *   - the state machine still ends the story: a returned send call writes `ACCEPTED`
+ *     (overwriting the lease with the real acceptance time), a swallowed send writes
+ *     `BOUNCED`, and nothing new is reachable;
+ *   - the winning route is the only one that may send, because every other candidate
+ *     runs the same conditional update and sees `changes === 0`.
+ *
+ * `leaseMs` must be longer than the slowest `supervisor.*` call this host performs: the
+ * lease exists for crash recovery only — the normal path is closed by the transition.
  */
 export function claimForDelivery(
 	db: DatabaseSync,
 	messageId: number,
-	now: () => number = () => Date.now(),
+	now: () => number,
+	leaseMs: number,
 ): boolean {
 	if (!Number.isSafeInteger(messageId) || messageId < 1) {
 		throw new TypeError("message id must be a positive safe integer");
+	}
+	if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+		throw new TypeError("leaseMs must be a positive integer");
 	}
 	const timestamp = now();
 	if (!Number.isFinite(timestamp)) throw new TypeError("delivery clock must return a finite timestamp");
 	return withTransaction(db, () => {
 		const claim = db
-			.prepare("UPDATE messages SET delivered = ?, delivered_at = ? WHERE id = ? AND delivered = ?")
-			.run(MAIL_DELIVERY.ACCEPTED, timestamp, messageId, MAIL_DELIVERY.PENDING);
+			.prepare(
+				"UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered = ? AND (delivered_at IS NULL OR delivered_at < ?)",
+			)
+			.run(timestamp, messageId, MAIL_DELIVERY.PENDING, timestamp - leaseMs);
 		return Number(claim.changes) === 1;
 	});
 }
 
 /**
- * Record that a CLAIMED message never reached its recipient, and owe the sender the
- * receipt a send-side bounce has always written (#384 review P0-1).
+ * Hand a claim back without delivering: the send threw, so the message is exactly
+ * where it started — `PENDING`, unclaimed, retryable on the next tick (#384 review
+ * P0-1). No bounce is written: a transport failure is not a delivery verdict, and
+ * inventing a terminal state for it would need an edge `#322` does not have.
  *
- * `transitionDelivery`'s own receipt only fires on the `PENDING → BOUNCED` edge, which
- * is the send-side bounce of the pre-claim world; once the row is claimed (`ACCEPTED`)
- * that edge is gone, and the sender would otherwise learn nothing. The receipt is the
- * same row shape (a `notice`/`info` message back to the sender, no event — exactly what
- * `transitionDelivery` writes) and is idempotent: a second call finds `BOUNCED` and
- * writes nothing.
+ * Conditional on the row still being `PENDING`: if a racing transition already moved
+ * it, the claim is no longer ours to release. The `delivered` guard is the same one
+ * `transitionDelivery` uses, so the two can never interleave into a half-written row.
  */
-export function bounceUndeliveredMail(
-	db: DatabaseSync,
-	messageId: number,
-	reason: MailBounceReason | string,
-	now: () => number = () => Date.now(),
-): LegionMessage {
-	const timestamp = now();
-	if (!Number.isFinite(timestamp)) throw new TypeError("delivery clock must return a finite timestamp");
-	return withTransaction(db, () => {
-		const before = getMessage(db, messageId);
-		if (!before) throw new Error(`message not found: ${messageId}`);
-		const updated = transitionDelivery(db, messageId, MAIL_DELIVERY.BOUNCED, () => timestamp, { reason });
-		if (before.delivered !== MAIL_DELIVERY.ACCEPTED || updated.delivered !== MAIL_DELIVERY.BOUNCED) {
-			return updated;
-		}
-		db.prepare(
-			`INSERT INTO messages (
-				from_node, to_node, subject, body, kind, urgency, delivered, created_at
-			) VALUES (?, ?, ?, ?, 'notice', 'info', 0, ?)`,
-		).run(
-			updated.toNode,
-			updated.fromNode,
-			`Delivery bounced: ${updated.subject}`,
-			reason === MAIL_BOUNCE_REASON.INTERCEPTED_BY_INPUT_HANDLER
-				? `Message ${updated.id} was intercepted by the recipient's input handler and never reached it; re-send it if it still matters.`
-				: `Message ${updated.id} was claimed for delivery but could not be handed over (${reason}); re-send it if it still matters.`,
-			timestamp,
-		);
-		return updated;
-	});
+export function releaseDeliveryClaim(db: DatabaseSync, messageId: number): void {
+	if (!Number.isSafeInteger(messageId) || messageId < 1) {
+		throw new TypeError("message id must be a positive safe integer");
+	}
+	db.prepare("UPDATE messages SET delivered_at = NULL WHERE id = ? AND delivered = ?").run(
+		messageId,
+		MAIL_DELIVERY.PENDING,
+	);
 }
 
 /**
