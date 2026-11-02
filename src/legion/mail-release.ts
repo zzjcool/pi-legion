@@ -235,8 +235,14 @@ export function redeliverMail(db: DatabaseSync, messageIds: readonly number[]): 
 /**
  * Watch `seam`'s inbox every {@link MAIL_PREEMPT_POLL_MS} until mail lands, then
  * call `onMail` ONCE and stop. Returns the cancel handle for the caller's
- * `finally` — the timer is `unref`'d so a blocked wait can never hold the
- * process open, and a ledger that closed under us is not the caller's problem.
+ * `finally`; a ledger that closed under us is not the caller's problem.
+ *
+ * The timer is deliberately NOT `unref`'d (#384 CI): the poll is the only thing
+ * that can end a blocked `wait`/`collect` early, so a process whose event loop
+ * holds nothing else would otherwise drain and leave the tool's promise pending
+ * forever — node reports that as `Promise resolution is still pending but the
+ * event loop has already resolved`. It lives exactly as long as the blocking
+ * call and is cleared in the same `finally`, so it cannot outlive its owner.
  */
 export function pollInbox(seam: MailReleaseSeam, onMail: () => void): () => void {
 	let timer: ReturnType<typeof setInterval> | undefined;
@@ -256,6 +262,5 @@ export function pollInbox(seam: MailReleaseSeam, onMail: () => void): () => void
 		cancel();
 		onMail();
 	}, MAIL_PREEMPT_POLL_MS);
-	timer.unref?.();
 	return cancel;
 }
