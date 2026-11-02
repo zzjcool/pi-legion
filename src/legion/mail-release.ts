@@ -27,6 +27,7 @@ import {
 	formatMail,
 	getMessage,
 	MAIL_DELIVERY,
+	isStalePhaseTimeoutNotice,
 	pendingInbox,
 	releaseDeliveryClaim,
 	transitionDelivery,
@@ -45,15 +46,26 @@ const MAIL_PREEMPT_POLL_MS = 250;
  * `claimForDelivery` stamps `delivered_at` on a `PENDING` row; that stamp is the
  * lease. It exists for CRASH RECOVERY only — the normal path is closed by
  * `transitionDelivery` (a returned send writes `ACCEPTED`, a thrown one releases the
- * claim immediately), so this number only has to outlive the slowest real
- * `supervisor.*` call a host performs (RPC steer/followUp/prompt round trips, which
- * are seconds at worst). A holder that dies without releasing therefore blocks its own
- * claim for 60s and no longer: after that another route may take the message over.
+ * claim immediately), and a send that runs long RENEWS it (`renewDeliveryClaim` every
+ * `leaseMs / 3`, wired in `deliverToChild`) so the length is not a bet on the slowest
+ * call: entry into the resume/admission queue defaults to 900s, which is why the
+ * holder renews instead of the constant trying to cover it. A holder that dies
+ * without releasing therefore blocks its own claim for 60s and no longer: after that
+ * another route may take the message over.
  *
  * Not a timeout: nothing is written when it expires, and an expired-but-alive holder
  * can only lose a race it was about to lose anyway.
  */
 export const MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000;
+
+/** Contract §3: the marker that tells the rate limiter this row is a re-delivery. */
+export const REDELIVERED_SUBJECT_PREFIX = "Redelivered: ";
+
+function redeliveredSubject(subject: string): string {
+	return subject.startsWith(REDELIVERED_SUBJECT_PREFIX)
+		? subject
+		: `${REDELIVERED_SUBJECT_PREFIX}${subject}`;
+}
 
 /**
  * The inbox a blocking tool has to watch, when the caller is a legion node.
@@ -136,6 +148,15 @@ export function takePendingMail(db: DatabaseSync, nodeId: string): LegionMessage
 	const now = () => Date.now();
 	const taken: LegionMessage[] = [];
 	for (const message of pendingInbox(db, nodeId, MAIL_RELEASE_LIMIT)) {
+		// #333 + #384 review M1: the postman discards a `Phase timeout:` notice whose
+		// phase is already over, and this path must agree with it — otherwise the
+		// preemption hands the model a to-do that is already pointless, one the postman
+		// would have thrown away. Same predicate, same verdict, BEFORE the claim so the
+		// row is never leased for a message nobody will read.
+		if (isStalePhaseTimeoutNotice(db, message)) {
+			transitionDelivery(db, message.id, MAIL_DELIVERY.OBSOLETE);
+			continue;
+		}
 		// The SAME lease the postman uses (#384 review): whoever claims first delivers,
 		// and an in-flight postman send is not stolen out from under its followUp.
 		if (!claimForDelivery(db, message.id, now, MAIL_DELIVERY_CLAIM_LEASE_MS)) continue;
@@ -170,6 +191,11 @@ export function renderReleasedMail(messages: readonly LegionMessage[]): string {
  *
  * Not idempotent on purpose: it is called once per discarded result, and the ids it
  * is handed are exactly the ones that result carried.
+ *
+ * Two ledger rules follow from "this is a platform re-delivery, not a new send"
+ * (#384 review m5): the subject is prefixed ONCE (a copy of a copy must not read
+ * `Redelivered: Redelivered: …`), and the rate limiter ignores these rows, so a
+ * discarded tool result can never spend the sender's five-minute quota — contract §3.
  */
 export function redeliverMail(db: DatabaseSync, messageIds: readonly number[]): LegionMessage[] {
 	const now = Date.now();
@@ -186,7 +212,7 @@ export function redeliverMail(db: DatabaseSync, messageIds: readonly number[]): 
 			.run(
 				original.fromNode,
 				original.toNode,
-				`Redelivered: ${original.subject}`,
+				redeliveredSubject(original.subject),
 				original.body,
 				original.kind,
 				original.urgency,

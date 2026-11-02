@@ -13,7 +13,10 @@ import type { LegionSettings, TurnRecord } from "../shared/types.ts";
 import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
-import { isMailHeld, MAIL_DELIVERY_CLAIM_LEASE_MS } from "../legion/mail-release.ts";
+import {
+	isMailHeld,
+	MAIL_DELIVERY_CLAIM_LEASE_MS,
+} from "../legion/mail-release.ts";
 import type { LegionEventBus } from "./event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
 import { ALL_CHILDREN_FAILED_REASON } from "../legion/interrupt.ts";
@@ -25,6 +28,7 @@ import {
 	MailInvalidTextError,
 	claimForDelivery,
 	formatMail,
+	renewDeliveryClaim,
 	inbox,
 	isStalePhaseTimeoutNotice,
 	mailReachedTurns,
@@ -67,6 +71,14 @@ import { upsertUsage } from "../legion/usage.ts";
 import { isExplicitPhaseTimeout } from "../agents/settings.ts";
 
 const POSTMAN_INTERVAL_MS = 2_000;
+
+/**
+ * How often a claimed delivery renews its lease while the send runs (#384 review M3).
+ * A third of the lease: two renewals may be missed (a stalled event loop) before the
+ * claim expires, and no send can outlive a fixed budget — `resumeChild` waits on the
+ * admission queue, whose default is 900s.
+ */
+const RENEW_CLAIM_EVERY_MS = Math.floor(MAIL_DELIVERY_CLAIM_LEASE_MS / 3);
 /** Upper bound on ACCEPTED mail one tick may confirm (#322 §3), so a big inbox cannot stall the loop. */
 const ACCEPTED_MAIL_CONFIRM_LIMIT = 20;
 const ORPHAN_SCAN_INTERVAL_MS = 60_000;
@@ -204,6 +216,12 @@ export class LegionPostman {
 
 	private async deliverChildren(children: readonly LegionNode[]): Promise<void> {
 		for (const child of children) {
+			// #384 review m6: an IN-PROCESS child that is blocked in its own
+			// `wait`/`collect` holds its inbox, and this postman runs in the same process —
+			// so it must stand aside exactly like the root one does (§1.1). A child on RPC
+			// lives in another process, where this registry is invisible: there the §3.1
+			// lease is what keeps the message from being delivered twice.
+			if (isMailHeld(child.id)) continue;
 			for (const message of pendingInbox(this.db, child.id)) {
 				if (this.discardIfStaleNotice(message)) continue;
 				await this.deliverToChild(child, message);
@@ -222,6 +240,9 @@ export class LegionPostman {
 		for (const message of pendingInbox(this.db, "root")) {
 			if (this.discardIfStaleNotice(message)) continue;
 			try {
+				// #384 review: the send and the record are SYNCHRONOUS and must stay that
+				// way — an `await` between these two lines reopens the P0-1 duplicate
+				// window for the root, exactly as it did for children before the lease.
 				this.sendRootMessage(formatMail(message));
 				transitionDelivery(this.db, message.id, MAIL_DELIVERY.ACCEPTED, this.now);
 				this.emitMail(message.id, message.fromNode, "mail_sent");
@@ -380,6 +401,18 @@ export class LegionPostman {
 		if (!claimForDelivery(this.db, message.id, this.now, MAIL_DELIVERY_CLAIM_LEASE_MS)) {
 			return;
 		}
+		// #384 review M3: renew while the send runs. A `resumeChild` send waits on the
+		// admission queue (default 900s), which no fixed lease can be sized for — so the
+		// holder keeps its claim alive every `leaseMs / 3` and the lease only expires for
+		// a holder that stopped breathing.
+		const renewal = setInterval(() => {
+			try {
+				renewDeliveryClaim(this.db, message.id, this.now, MAIL_DELIVERY_CLAIM_LEASE_MS);
+			} catch {
+				// A closed ledger cannot be renewed; the send's own outcome decides the row.
+			}
+		}, RENEW_CLAIM_EVERY_MS);
+		renewal.unref?.();
 		try {
 			const outcome = await send();
 			if (outcome === "intercepted") {
@@ -405,6 +438,8 @@ export class LegionPostman {
 			// next mailbox tick retries, exactly as before #384 (no bounce, no receipt, no
 			// new edge — the row never left `PENDING`).
 			releaseDeliveryClaim(this.db, message.id);
+		} finally {
+			clearInterval(renewal);
 		}
 	}
 

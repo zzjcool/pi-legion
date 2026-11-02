@@ -285,8 +285,13 @@ export function sendMail(
 		: undefined;
 
 	return withTransaction(db, () => {
+		// #384 review m5: a platform re-delivery (`Redelivered: …`, written when a
+		// preemption result was thrown away) is not a new send and must not spend the
+		// sender's quota — the sender never chose to write it.
 		const recent = db
-			.prepare("SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ?")
+			.prepare(
+				"SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ? AND subject NOT LIKE 'Redelivered: %'",
+			)
 			.get(input.fromNode, timestamp - MAIL_RATE_WINDOW_MS);
 		const count = Number(recent?.count ?? 0);
 		if (count + resolution.recipients.length > rate) {
@@ -515,6 +520,41 @@ export function claimForDelivery(
 			)
 			.run(timestamp, messageId, MAIL_DELIVERY.PENDING, timestamp - leaseMs);
 		return Number(claim.changes) === 1;
+	});
+}
+
+/**
+ * Extend a claim that is still ours (#384 review M3).
+ *
+ * The lease has to outlive the SLOWEST send, and one of them is not seconds: a
+ * `resumeChild` send waits on the admission queue, whose default is 900s. Rather than
+ * picking a lease per route (and guessing wrong again the next time a route appears),
+ * the holder renews while it works — `deliverToChild` runs this every `leaseMs / 3`
+ * until the send settles, so the lease is only ever short for a holder that stopped
+ * breathing (which is exactly what expiry is for).
+ *
+ * Conditional on the row still being `PENDING`: if the hold lapsed and someone else
+ * took it over, renewing is no longer ours to do.
+ */
+export function renewDeliveryClaim(
+	db: DatabaseSync,
+	messageId: number,
+	now: () => number,
+	leaseMs: number,
+): boolean {
+	if (!Number.isSafeInteger(messageId) || messageId < 1) {
+		throw new TypeError("message id must be a positive safe integer");
+	}
+	if (!Number.isSafeInteger(leaseMs) || leaseMs < 1) {
+		throw new TypeError("leaseMs must be a positive integer");
+	}
+	const timestamp = now();
+	if (!Number.isFinite(timestamp)) throw new TypeError("delivery clock must return a finite timestamp");
+	return withTransaction(db, () => {
+		const renewed = db
+			.prepare("UPDATE messages SET delivered_at = ? WHERE id = ? AND delivered = ?")
+			.run(timestamp, messageId, MAIL_DELIVERY.PENDING);
+		return Number(renewed.changes) === 1;
 	});
 }
 
