@@ -338,7 +338,7 @@ test("waitAction: timeout details land in tool details (no auto-stop)", async ()
 	assert.equal(details.hint, WAIT_TIMEOUT_HINT);
 	assert.match(text(res), /status: wait_timeout/);
 	assert.match(text(res), /decisions: extend, steer_again, stop, force_stop/);
-	assert.match(text(res), /hint: wait does not stop children/);
+	assert.match(text(res), /hint: wait only stopped waiting: the children are still running/);
 	// Children stay tracked — wait must not retire.
 	assert.ok(runtime.get("live"));
 	base.dispose();

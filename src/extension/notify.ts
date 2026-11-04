@@ -72,7 +72,14 @@ export interface RenewalProposal {
 export interface CompletionInput {
 	name: string;
 	agent?: string;
-	execution: { status: string; reason?: string };
+	execution: {
+		status: string;
+		reason?: string;
+		/** Provider transcript detail; shown only when `reason` cannot carry it. */
+		stopReason?: string | null;
+		errorMessage?: string | null;
+		errorKind?: string;
+	};
 	output: string;
 	/** Full output on disk; the truncated preview names this path. */
 	outputFile?: string;
@@ -106,11 +113,29 @@ export interface CompletionDetails {
 	status: CompletionStatus;
 	name: string;
 	agent?: string;
-	execution: { status: string; reason?: string };
+	execution: {
+		status: string;
+		reason?: string;
+		stopReason?: string | null;
+		errorMessage?: string | null;
+		errorKind?: string;
+	};
 	acceptance?: { status: string; level?: string };
 	sessionFile?: string;
 	outputBytes: number;
 	recycled?: boolean;
+}
+
+/**
+ * Provider text the synthetic `reason` cannot carry (`unknown stopReason: …`).
+ *
+ * Display-only and bounded: an HTTP error body can be a whole HTML page, and a
+ * notice is a summary. Absent when the message is already the reason.
+ */
+function errorDetailFor(execution: { reason?: string; errorMessage?: string | null }): string | undefined {
+	const message = execution.errorMessage?.trim();
+	if (!message || message === execution.reason?.trim()) return undefined;
+	return `error: ${message.length > 400 ? `${message.slice(0, 400)}…` : message}`;
 }
 
 /** `1234` -> `1.2 KB`, so the collapsed line says how much landed. */
@@ -318,6 +343,7 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 		`Background task ${status}: **${label}**`,
 		"",
 		`execution: ${input.execution.status}${reason}`,
+		errorDetailFor(input.execution),
 		acceptance,
 		"",
 		preview,
@@ -344,6 +370,9 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 			execution: {
 				status: input.execution.status,
 				reason: input.execution.reason,
+				...(input.execution.stopReason !== undefined ? { stopReason: input.execution.stopReason } : {}),
+				...(input.execution.errorMessage !== undefined ? { errorMessage: input.execution.errorMessage } : {}),
+				...(input.execution.errorKind !== undefined ? { errorKind: input.execution.errorKind } : {}),
 			},
 			acceptance: input.acceptance
 				? {

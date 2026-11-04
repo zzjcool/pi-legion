@@ -435,6 +435,51 @@ test("a live child timeout stays working and does not write a terminal output ar
 	}
 });
 
+test("a collect timeout only stops waiting: the child survives, finishes, and still reports its result", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "long but healthy", worktree: false });
+		const timedOut = await h.orchestrator.collect(handle.name, { timeoutMs: 2 });
+		assert.equal(timedOut.execution.status, "running");
+		assert.equal(timedOut.execution.reason, COLLECT_DEADLINE_REASON);
+		// The deadline is a parent-side budget: nothing was killed or retired, and the
+		// child is still the same live job (this is what makes `wait-not-stop` true).
+		assert.equal(h.supervisor.isAlive(handle.name), true);
+		assert.equal(h.supervisor.calls.filter((call) => call.method === "retire").length, 0);
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
+
+		// It then finishes on its own, after its role timeout had already elapsed.
+		h.supervisor.settle(handle.name, { text: '{"ok":true,"reason":"finished after the deadline"}' });
+		const collected = await h.orchestrator.collect(handle.name);
+		assert.equal(collected.execution.status, "success");
+		assert.ok(collected.outputFile);
+		assert.equal(readFileSync(collected.outputFile, "utf8").trim(), '{"ok":true,"reason":"finished after the deadline"}');
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("a collect that lands after the child was retired still writes the output artifact", async () => {
+	const h = harness();
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "answer then get stopped", worktree: false });
+		h.supervisor.settle(handle.name, { text: '{"ok":true,"reason":"answered before the stop"}' });
+		await h.orchestrator.retire(handle.name);
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "retired");
+
+		// `stop` won the race in production; the terminal text must still land.
+		const collected = await h.orchestrator.collect(handle.name);
+		assert.equal(collected.execution.status, "success");
+		assert.ok(collected.outputFile, "the terminal text must still be written after a retire");
+		assert.equal(readFileSync(collected.outputFile, "utf8").trim(), '{"ok":true,"reason":"answered before the stop"}');
+		assert.equal(collected.acceptance.status, "accepted");
+		// Writing the artifact must not revive the lifecycle state.
+		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "retired");
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("retireAll snapshots settled outcomes and retires every registered child", async () => {
 	const h = harness();
 	try {

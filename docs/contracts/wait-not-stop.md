@@ -14,7 +14,7 @@ result includes structured fields for the **parent** to decide:
 - `status`: `wait_timeout` | `still_running` | `budget_exceeded` (budget optional)
 - `done` / `stillRunning[{ name, elapsedMs, budgetMs? }]`
 - `decisions`: `extend` | `steer_again` | `stop` | `force_stop` (model hint enum, not a new RPC)
-- `hint`: wait does not stop children; choose stop/force_stop or extend/steer
+- `hint`: wait only stopped waiting — the children are still running and keep their context; prefer `status`/`extend`/`steer_again`, and use `stop`/`force_stop` only to abandon the work
 
 The parent then calls existing tools (`wait` again, `steer`, or `stop` with
 optional `force: true`). Tooling must not auto-SIGKILL on timeout.

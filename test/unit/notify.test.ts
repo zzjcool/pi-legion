@@ -268,7 +268,7 @@ test("U3: formatCompletionNotice fails loud on a running snapshot (B)", () => {
 				name: "worker-1",
 				execution: {
 					status: "running",
-					reason: "collect deadline (cumulative since launch) exceeded; child still alive",
+					reason: "collect deadline (per collect attempt) exceeded; child still alive",
 				},
 				output: "",
 			}),
@@ -471,7 +471,7 @@ test("A3/D7: a notice without a renewal proposal carries zero renewal lines", ()
 		agent: "worker",
 		execution: {
 			status: "failed",
-			reason: "collect deadline (cumulative since launch) exceeded; child still alive",
+			reason: "collect deadline (per collect attempt) exceeded; child still alive",
 		},
 		output: "still working",
 		sessionFile: "/runs/r-1/worker-1.jsonl",
@@ -699,4 +699,38 @@ test("formatGroupedNotice: per-entry previews are capped so the batch stays boun
 	// 8 entries → cap is max(500, 4000/8) = 500 chars per preview.
 	assert.match(notice.content, /…/);
 	assert.ok(notice.content.length < 8 * 600 + 500, "batch preview must be bounded");
+});
+
+test("formatCompletionNotice: a synthetic reason keeps the provider error visible", () => {
+	const notice = formatCompletionNotice({
+		name: "w1",
+		agent: "worker",
+		execution: {
+			status: "failed",
+			// `unknown stopReason` replaces the message in `reason`, so without the
+			// dedicated line the 502 body would only exist in run.json.
+			reason: "unknown stopReason: weird",
+			stopReason: null,
+			errorMessage: "502: bad gateway (cloudflare)",
+		},
+		output: "",
+		acceptance: { status: "rejected", level: "none" },
+		recycled: false,
+	});
+	assert.match(
+		notice.content,
+		/execution: failed \(unknown stopReason: weird\)\nerror: 502: bad gateway \(cloudflare\)/,
+	);
+	assert.equal(notice.details.execution.errorMessage, "502: bad gateway (cloudflare)");
+	assert.equal(notice.details.execution.stopReason, null);
+
+	// In the ordinary error shape the provider text IS the reason: no duplicate.
+	const same = formatCompletionNotice({
+		name: "w2",
+		execution: { status: "failed", reason: "502: bad gateway", errorMessage: "502: bad gateway" },
+		output: "",
+		recycled: false,
+	});
+	assert.doesNotMatch(same.content, /\nerror: /);
+	assert.equal(same.details.execution.errorMessage, "502: bad gateway");
 });

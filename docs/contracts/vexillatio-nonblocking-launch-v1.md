@@ -159,3 +159,4 @@ npm run test:integration
 | 2026-10-19 | v1 | 首次冻结 | #227 三缺陷拆分：D1/D2/D3(A)、D4/D3b/D5(B)；D6/D7 显式排除 |
 | 2026-10-19 | v1.1 | 勘误 §1 D1 轮询常量位置：`src/shared/types.ts` → 实为 `src/runs/orchestrator.ts:143` 私有常量，改由 `src/supervisor/spawn-mode.ts` 导出同值常量；§2 Worker A 文件表同步 | Worker A 指出契约原文事实错误；`grep` 确认 `POLL_INTERVAL_MS` 从未在 `src/shared/types.ts` 出现过。属笔误型而非设计型矛盾，advisor 裁决按勘误继续（不回退重派），父会话在此落库 |
 | 2026-10-19 | v1.2 | 新增 **D1a**：首次 prompt 在「受理之前」reject 时 `spawnChild` 仍须抛出（保 `fallbackModels`）；§3 验收清单同步为 8 条 | 父会话审查 PR #228 实测发现回归：非阻塞改造把受理前 reject 吞成「已 spawn」，`canFallbackStart` 失效。HEAD 抛错 / 首版实现返回 handle，属 #227 之外的回归，必须以先红后绿用例守住 |
+| 2026-11-04 | v1.3 | **D6 复议**：`COLLECT_DEADLINE_REASON` 的 `cumulative since launch` 措辞改为 `per collect attempt`，同步更新 5 个测试文件的字面断言 | 该字面量本来就是错的（deadline 从 collect 调用起算），当初只因「测试钉住了」而冻结；容器实测（role `timeoutMs`=10s 的 child 存活 56s 并 success）证明它不是 kill 预算，留错字面会继续误导排障 |

@@ -309,13 +309,15 @@ export const COLLECT_GRACE_EXTENSIONS = 2;
 /**
  * Shown when this collect() call's budget elapses and the child is still in-turn.
  *
- * The "cumulative since launch" wording below is legacy: `collect()` starts its
- * deadline from the moment it is called (`orchestrator.ts` `let deadline = ...`),
- * not from launch. The literal is user-visible and asserted in integration tests,
- * so D6 of `docs/contracts/vexillatio-nonblocking-launch-v1.md` deliberately left
- * it untouched; do not read it as the actual budget origin.
+ * The budget is per collect call, never cumulative since launch: the deadline is
+ * `now + timeoutMs` at the top of `collect()`. The old literal claimed otherwise
+ * and was frozen only because integration tests pinned the string; the wording is
+ * honest now.
+ *
+ * Elapsing here NEVER terminates the child: `classifyOutcome` reports `running`,
+ * `shouldRecycleAfterCollect` refuses to recycle it, and the watch re-arms.
  */
-export const COLLECT_DEADLINE_REASON = "collect deadline (cumulative since launch) exceeded; child still alive";
+export const COLLECT_DEADLINE_REASON = "collect deadline (per collect attempt) exceeded; child still alive";
 /** Shown when a live child's session ends on an OpenAI/GPT connection blip. */
 export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC child still alive";
 /**
@@ -2890,9 +2892,10 @@ export class Orchestrator {
 		if (execution.status !== "running") this.recordSettled(child, execution, isLastTurnComplete(parsed));
 		if (!isRetired()) this.onChildUpdate(child);
 		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
-		if (isRetired()) {
-			return { execution, output, usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance };
-		}
+		// A stop can land between the snapshot and here. The lifecycle state must not
+		// be revived (above), but the terminal text still belongs on disk: this collect
+		// is the only writer of the artifact, so returning early here dropped the
+		// child's last answer whenever an explicit stop won the race.
 		let outputFile: string | undefined;
 		if (execution.status === "running") child.outputFile = undefined;
 		else {

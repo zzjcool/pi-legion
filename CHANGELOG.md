@@ -25,6 +25,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   settle→retire 那一小段窗口时，回复 `Retired 1 already-settled child: x (execution: success)` 而不是
   `Stopped 1 child`——后者等于宣称一次从未发生的打断。retire 行为本身不变，只有措辞。
 
+- **超时不再被说成会终止子节点，`stop` 竞态也不再丢最后一轮产物。** 角色 `timeoutMs` 实际只是父侧等待预算：
+  容器实测 `worker.timeoutMs=10s` 的 child 存活 56s 并正常 `success`，且 pi 1.4 的 CLI / settings 都没有 turn 级超时；
+  文档与 renewal 契约据此改正，`collect deadline (cumulative since launch)` 改为 `(per collect attempt)`（原文案
+  本来就是错的）。`finishCollect` 在「child 已被 retire」时仍写 `<name>.output.md`，不再因 `stop` 撞上 collect
+  而丢掉那一轮文本。失败通知携带 `stopReason` / `errorMessage` / `errorKind`，当合成 reason 表达不了 provider
+  错误时多打一行 `error:`；`wait` 超时回执的 `hint` 改为「只是停止等待，child 还在跑」，不再把 `stop` 摆在建议位。
+
 ## [5.1.0] — 2026-11-02
 
 一次以**可恢复、可声明的子树**为中心的发布。三个新能力：`centurion` 的状态机改为由 root 派发时用 `phases:` 声明（不声明就是普通 agent）；同一个 session 重开能接回上次的树，退出等于暂停、恢复必须显式；长等待中的 `wait`/`collect` 会在收到子节点邮件时立刻返回。`/legion` 一侧：整帧分配降到 2.0MB 以内（120×40 −59%、200×60 −67%），overlay 改为主屏挂载，状态行能说清子节点正在做什么，且不再每写一格分配一个 `Cell`。另有三十余项稳定性修复：失败队不再静默消失、内联相位机器进树、headless 账本不再漏记、`ctx is stale` 与宿主 `turn_end` 的报错消失。

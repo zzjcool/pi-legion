@@ -5130,7 +5130,7 @@ export const WAIT_PARENT_DECISIONS = [
 export type WaitParentDecision = (typeof WAIT_PARENT_DECISIONS)[number];
 
 export const WAIT_TIMEOUT_HINT =
-	"wait does not stop children; choose stop/force_stop or extend/steer";
+	"wait only stopped waiting: the children are still running and keep their context. Prefer status/extend/steer_again; stop/force_stop retire them and discard that context, so use them only to abandon the work.";
 
 export interface WaitStillRunningChild {
 	name: string;

@@ -60,7 +60,18 @@ import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 import type { PhaseMachine } from "../legion/phase-machine.ts";
 
 export interface CollectSnapshot {
-	execution: { status: string; reason?: string };
+	execution: {
+		status: string;
+		reason?: string;
+		/**
+		 * Failure detail carried to the parent notice. `reason` is often a synthetic
+		 * sentence (`unknown stopReason: …`), so the provider text is kept beside it
+		 * instead of being lost between the transcript and the notice.
+		 */
+		stopReason?: string | null;
+		errorMessage?: string | null;
+		errorKind?: string;
+	};
 	output: string;
 	/** Full output persisted to disk; named in the notice so a truncated preview has a one-step recovery. */
 	outputFile?: string;

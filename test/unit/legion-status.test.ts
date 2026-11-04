@@ -309,7 +309,7 @@ test("legion status highlights alive · quiet before execution snapshot", async 
 			sessionFile,
 			execution: {
 				status: "running",
-				reason: "collect deadline (cumulative since launch) exceeded; child still alive",
+				reason: "collect deadline (per collect attempt) exceeded; child still alive",
 			},
 			acceptance: { status: "unknown", level: "none" },
 			alive: true,

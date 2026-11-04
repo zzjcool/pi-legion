@@ -80,9 +80,15 @@ Never fall back across columns: in-process limits are read from
 
 ### Renewing a budget casualty (#270)
 
-An agent's `timeoutMs` is enforced by the host, so pi-legion cannot prevent the
-cut — but it can make the loss recoverable. When a child is terminated **and**
-it measurably progressed, the completion notice ends with a ready-made command:
+An agent's `timeoutMs` is the parent's **wait** budget, not a kill switch: when
+it elapses, `collect`/`wait` stop waiting and report `running`, and the child
+keeps running (the watch re-arms). Nothing in pi or pi-legion terminates a child
+at that deadline — verified against pi 1.4: no CLI flag, no settings key, and no
+timeout is passed in a child's argv.
+
+A child is terminated by an explicit `stop`, by session shutdown, or by a
+tool-call budget cut. When that happens **and** it measurably progressed, the
+completion notice ends with a ready-made command:
 
 ```
 ✗ W2 (worker) failed (terminated during tool call)

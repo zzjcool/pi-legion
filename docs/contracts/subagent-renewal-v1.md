@@ -41,10 +41,12 @@
    - `wait { timeoutMs }` / `collect { timeoutMs }`（`index.ts:1768`, `:2616`）
      → **父侧放弃等待，不杀 child**。`inprocess-supervisor.ts:1084` 只 `resolve({settled:false, reason:"timeout"})`。
    - 角色 `timeoutMs`（`agents/worker.md:9` 等）
-     → 由 **pi 宿主**执行，child 被终止。pi-legion 源码里**没有** `terminated` 这个字面量
-     （全仓 grep 只命中 `src/shared/session.ts:912` 的 "terminated during tool call" 文案）。
+     → **父侧等待预算，不终止 child**（`orchestrator.ts` 的 collect deadline；到点返回 `running`，watch 重新武装）。
+     宿主没有 turn 级超时：pi 1.4 的 CLI / settings 都没有该开关，子进程 argv 也不带 timeout（2026-11 容器实测：
+     `worker.timeoutMs=10s` 的 child 存活 56s 并正常 `success`）。真正终止 child 的只有 `stop`、session shutdown、
+     工具预算切断。
 
-**结论：pi-legion 无法阻止宿主终止 child，但能在终止后识别、评估、续约。** 契约按此边界设计。
+**结论：宿主不会因 `timeoutMs` 终止 child。真正的终止来自 stop / shutdown / 工具预算，pi-legion 无法阻止，但能在终止后识别、评估、续约。** 契约按此边界设计。
 
 ---
 

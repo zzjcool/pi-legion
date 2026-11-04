@@ -1424,7 +1424,7 @@ test("renderLiveChildStatus keeps a live running snapshot and adds recency", asy
 			agent: "worker",
 			kind: "pi",
 			sessionFile,
-			execution: { status: "running", reason: "collect deadline (cumulative since launch) exceeded; child still alive" },
+			execution: { status: "running", reason: "collect deadline (per collect attempt) exceeded; child still alive" },
 			acceptance: { status: "unknown", level: "none" },
 			alive: true,
 			now,
@@ -1698,7 +1698,7 @@ test("renderLiveChildStatus long-quiet alive worker: (living) leads; collect-dea
 			sessionFile,
 			execution: {
 				status: "running",
-				reason: "collect deadline (cumulative since launch) exceeded; child still alive",
+				reason: "collect deadline (per collect attempt) exceeded; child still alive",
 			},
 			acceptance: { status: "unknown", level: "none" },
 			alive: true,
