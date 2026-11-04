@@ -247,6 +247,12 @@ void phaseMachineSchemaParity;
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate" }),
+	name: Type.Optional(
+		Type.String({
+			description:
+				"Explicit handle for THIS child (same grammar as the top-level `name`: [a-z][a-z0-9_-]{0,31}). Omit to auto-allocate `<role>-N`. Every handle in one tasks[] batch must be distinct. A one-entry batch may name its child here or at the call level, but not two different values. `vexillatio` allocates names itself and refuses this field.",
+		}),
+	),
 	cwd: Type.Optional(
 		Type.String({
 			description:
@@ -3677,7 +3683,7 @@ interface LaunchSession {
  */
 async function launchStep(
 	session: LaunchSession,
-	step: { agent: string; task: string; model?: string; preset?: string; worktree?: boolean; verify?: string[] },
+	step: { agent: string; task: string; name?: string; model?: string; preset?: string; worktree?: boolean; verify?: string[] },
 ): Promise<void> {
 	if (session.signal?.aborted) return;
 	const agent = findAgent(session.agents, step.agent);
@@ -3747,13 +3753,16 @@ async function launchStep(
 			return;
 		}
 
-		// Honor `name=` when the caller asked for one; otherwise let `launch()`
-		// allocate from the supervisor-local registry (scout-N). The index must
-		// not race separate subagent tool calls for auto names.
+		// Honor `name=` in this order: a per-item `tasks[]` handle wins over the
+		// call-level `name=` (which applies to a single-step launch), and when
+		// neither is given `launch()` allocates from the supervisor-local registry
+		// (scout-N). The index must not race separate subagent tool calls for auto
+		// names.
+		const name = step.name ?? session.launchName;
 		const handle = await session.orchestrator.launch({
 			agent: launchedAgent,
 			task: step.task,
-			...(session.launchName ? { name: session.launchName } : {}),
+			...(name ? { name } : {}),
 			...(session.teamOverride ? { team: session.teamOverride } : {}),
 			...(resolved.model ? { model: resolved.model } : {}),
 			// Pin the provider (#123): a bare id like `workbuddy/...` may also
@@ -4010,6 +4019,7 @@ type Plan =
 			steps: Array<{
 				agent: string;
 				task: string;
+				name?: string;
 				model?: string;
 				preset?: string;
 				worktree?: boolean;
@@ -4040,6 +4050,16 @@ function buildUtilityPlan(params: VexillatioParams): UtilityPlan {
 		return {
 			ok: false,
 			message: `tasks[] step ${unsupportedVerify + 1} cannot include \`verify\`; vexillatio does not run verification commands.`,
+		};
+	}
+	// `name` is a `subagent` concept: vexillatio allocates one handle per step
+	// itself (`<role>-N`, continuing the parent's existing children), so a
+	// per-item handle cannot be honored — refuse it instead of silently dropping.
+	const unsupportedName = steps.findIndex((item) => item.name !== undefined);
+	if (unsupportedName >= 0) {
+		return {
+			ok: false,
+			message: `tasks[] step ${unsupportedName + 1} cannot include \`name\`; vexillatio allocates one handle per step itself.`,
 		};
 	}
 	const invalid = steps.findIndex((item) => !item.agent.trim() || !item.task.trim());
@@ -4485,10 +4505,12 @@ export function resolveExplicitLaunchName(
 export function buildPlan(params: {
 	agent?: string;
 	task?: string;
+	name?: string;
 	preset?: string;
 	tasks?: Array<{
 		agent: string;
 		task: string;
+		name?: string;
 		model?: string;
 		preset?: string;
 		worktree?: boolean;
@@ -4534,17 +4556,83 @@ export function buildPlan(params: {
 	const tasks = params.tasks as PlanStep[];
 	const problem = firstInvalidStep(tasks, "tasks[]");
 	if (problem) return { ok: false, message: problem };
-	return { ok: true, task: `${tasks.length} parallel tasks`, steps: tasks };
+	// A per-item `name` is a handle the caller will later steer/collect by, so a
+	// name that cannot be honored is refused for the WHOLE batch (see
+	// `resolveStepNames`) before any child is allocated.
+	const named = resolveStepNames(tasks, "tasks[]", params.name);
+	if (!named.ok) return { ok: false, message: named.message };
+	return { ok: true, task: `${tasks.length} parallel tasks`, steps: named.steps };
 }
 
 /** One entry of `tasks[]`. */
 interface PlanStep {
 	agent: string;
 	task: string;
+	name?: string;
 	model?: string;
 	preset?: string;
 	worktree?: boolean;
 	verify?: string[];
+}
+
+/**
+ * Resolve the per-item `name` handles of one `tasks[]` batch.
+ *
+ * Whole-batch rejection on purpose: a half-named batch would launch some
+ * children under the caller's handles and the rest under auto `role-N`, so the
+ * caller could neither predict nor control which child it later steers by name.
+ * Nothing is allocated yet (this runs before every launch), so refusing the
+ * batch costs nothing — unlike a partial start, which cannot be un-spawned.
+ *
+ * Returns a NEW array carrying the normalized handles; the caller's array is
+ * never rewritten, and an entry without a name keeps no `name` key at all.
+ */
+function resolveStepNames(
+	steps: PlanStep[],
+	label: string,
+	topLevelName: string | undefined,
+): { ok: true; steps: PlanStep[] } | { ok: false; message: string } {
+	const firstByName = new Map<string, number>();
+	const resolved: PlanStep[] = [];
+	for (let i = 0; i < steps.length; i += 1) {
+		const step = steps[i] ?? ({} as PlanStep);
+		if (step.name === undefined) {
+			resolved.push(step);
+			continue;
+		}
+		// Reuse the single-launch gate so trim/lowercase normalization and the
+		// grammar refusal can never drift between `name=` and `tasks[].name`.
+		const gate = resolveExplicitLaunchName(step.name, 1);
+		if (!gate.ok) {
+			return { ok: false, message: `${label}: step ${i + 1}: ${gate.message}` };
+		}
+		const name = gate.name as string;
+		const first = firstByName.get(name);
+		if (first !== undefined) {
+			return {
+				ok: false,
+				message: `${label}: steps ${first + 1} and ${i + 1} both ask for the name "${name}"; each child needs its own handle.`,
+			};
+		}
+		firstByName.set(name, i);
+		resolved.push({ ...step, name });
+	}
+	// A one-entry batch can name the child in both places. Agreement passes; a
+	// disagreement is refused rather than letting one silently win, because the
+	// child would then answer to a handle the caller did not mean to use.
+	const only = resolved[0];
+	if (resolved.length === 1 && only?.name !== undefined && topLevelName !== undefined) {
+		const top = resolveExplicitLaunchName(topLevelName, 1);
+		// An invalid top-level name keeps its own existing refusal (`name=` is
+		// validated by the launch handler); only a valid, differing name conflicts.
+		if (top.ok && top.name !== undefined && top.name !== only.name) {
+			return {
+				ok: false,
+				message: `${label}: step 1 asks for the name "${only.name}", but the call also passes name="${topLevelName.trim()}"; pass one.`,
+			};
+		}
+	}
+	return { ok: true, steps: resolved };
 }
 
 /**

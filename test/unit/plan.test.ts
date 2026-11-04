@@ -107,3 +107,96 @@ test("plan: the unknown-agent refusal is a single, complete line", () => {
 test('plan: the unknown-agent refusal says "none" when no agent is known', () => {
 	assert.match(unknownAgentLine([], "nope"), /Available: none$/);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// `tasks[]` entries could always carry a `name` (models wrote one: the top-level
+// `name` is documented right next to `tasks[]`), but the field was not in the
+// schema nor read by `launchStep`, so every child was silently numbered
+// `role-N`. The handle now has to be honored — and a handle that cannot be
+// honored refuses the WHOLE batch, before anything is spawned.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("plan: a tasks[] step name is normalized like name= (trim + lowercase)", () => {
+	const plan = buildPlan({
+		tasks: [
+			{ agent: "worker", task: "a", name: " Worker-A " },
+			{ agent: "worker", task: "b", name: "SCOUT_B" },
+		],
+	});
+	assert.equal(plan.ok, true);
+	assert.equal((plan.steps[0] as { name?: string }).name, "worker-a");
+	assert.equal((plan.steps[1] as { name?: string }).name, "scout_b");
+});
+
+test("plan: an illegal tasks[] step name is refused with its step number", () => {
+	const plan = buildPlan({
+		tasks: [
+			{ agent: "worker", task: "fine", name: "worker-a" },
+			{ agent: "worker", task: "bad", name: "Worker A!" },
+		],
+	});
+	assert.equal(plan.ok, false, "an unhonorable handle must not be launched under a different name");
+	if (plan.ok) return;
+	assert.match(plan.message, /^tasks\[\]: step 2/);
+	// The grammar refusal itself is reused verbatim, so the fix has one wording.
+	assert.match(plan.message, /invalid child name "Worker A!": must match \[a-z\]/);
+});
+
+test("plan: duplicate tasks[] step names refuse and name both steps", () => {
+	for (const [second, label] of [
+		["worker-a", "identical"],
+		[" WORKER-A ", "case/space difference"],
+	] as const) {
+		const plan = buildPlan({
+			tasks: [
+				{ agent: "worker", task: "a", name: "worker-a" },
+				{ agent: "worker", task: "b", name: second },
+			],
+		});
+		assert.equal(plan.ok, false, `duplicate names must be refused (${label})`);
+		if (plan.ok) continue;
+		assert.match(plan.message, /steps 1 and 2 both ask for the name "worker-a"/);
+	}
+	// Three entries: report the pair that collides, not the first entry.
+	const third = buildPlan({
+		tasks: [
+			{ agent: "worker", task: "a", name: "worker-a" },
+			{ agent: "worker", task: "b", name: "worker-b" },
+			{ agent: "worker", task: "c", name: "worker-b" },
+		],
+	});
+	assert.equal(third.ok, false);
+	if (!third.ok) assert.match(third.message, /steps 2 and 3/);
+});
+
+test("plan: a one-entry tasks[] may name the child in both places only if they agree", () => {
+	const conflict = buildPlan({
+		name: "worker-b",
+		tasks: [{ agent: "worker", task: "a", name: "worker-a" }],
+	});
+	assert.equal(conflict.ok, false, "two different handles for one child is ambiguous");
+	if (!conflict.ok) {
+		assert.match(conflict.message, /step 1 asks for the name "worker-a"/);
+		assert.match(conflict.message, /also passes name="worker-b"/);
+	}
+
+	const agree = buildPlan({
+		name: " Worker-A ",
+		tasks: [{ agent: "worker", task: "a", name: "worker-a" }],
+	});
+	assert.equal(agree.ok, true, "the same handle in both places is not a conflict");
+	assert.equal((agree.steps[0] as { name?: string }).name, "worker-a");
+});
+
+test("plan: a tasks[] entry without a name keeps no name key", () => {
+	const plan = buildPlan({
+		tasks: [
+			{ agent: "worker", task: "a" },
+			{ agent: "scout", task: "b", name: "scout-b" },
+		],
+	});
+	assert.equal(plan.ok, true);
+	assert.equal(Object.hasOwn(plan.steps[0] ?? {}, "name"), false, "no synthesized name key");
+	assert.deepEqual(plan.steps[0], { agent: "worker", task: "a" });
+	assert.deepEqual(plan.steps[1], { agent: "scout", task: "b", name: "scout-b" });
+});

@@ -51,7 +51,11 @@ const VexillatioParams = Type.Object({
 });
 ```
 
-**只有 launch 语义**（无 status/collect/wait/steer/retire——用 `subagent` 工具的既有控制动作管理同名子节点；见 2.6）。执行流程（同步）：
+**只有 launch 语义**（无 status/collect/wait/steer/retire——用 `subagent` 工具的既有控制动作管理同名子节点；见 2.6）。
+
+**先于下列步骤的前置校验**：`tasks[]` 条目带 `name` → 硬拒（`INVALID_PARAMS`），消息为 ``tasks[] step <i> cannot include `name`; vexillatio allocates one handle per step itself.``。命名权归 vexillatio（§2.6 `<role>-N` 接续父节点既有 children），接受该字段等于把「调用方指定的 handle 静默失效」搬进工具人通道。
+
+执行流程（同步）：
 
 1. 解析 agent：默认 `scout`；目标必须在 catalog 里且 `utility === true`，否则报错 `not a utility agent: <name> (mark it with 'utility: true')`。
 2. 走**既有 `orchestrator.launch`**（复用 budget/session 管线），但 `SpawnInput.env` 显式剔除 legion 身份四变量：`PI_LEGION_DB`、`PI_LEGION_NODE_ID`、`PI_SUBAGENT_PARENT_PATH`、`PI_SUBAGENT_MAX_DEPTH`（防幽灵节点 + 防工具人继承指挥链身份）。**不剔除** `PI_SUBAGENT_CHILD`、`PI_SUBAGENT_CHILD_ROLE`、`PI_SUBAGENT_MAX_TOOL_CALLS` 等预算变量（child-guard 仍要工作）。utility 目标（两通道）**剥除 `PI_SUBAGENT_ALLOW_NESTED`**（§2.5.1，utility 语义优先）；`lineageEnv` 统一设置 `PI_SUBAGENT_UTILITY_CHILD`（§2.2）。

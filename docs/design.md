@@ -928,7 +928,10 @@ subagent({
 
   // launch
   agent?: string, task?: string,
-  tasks?: Array<{ agent: string; task: string }>,   // 并行
+  tasks?: Array<{ agent: string; task: string; name?: string }>,   // 并行
+                            // name 是该条目自己的 handle（批量内必须互不相同，
+                            // 省略则由 launch 自动编号 role-N）；单条目时也可
+                            // 用顶层 name=，两处给不同值会被拒
   async?: boolean,          // 默认 true
   model?: string, cwd?: string, placement?: string,
   worktree?: boolean,       // 隔离 git worktree（默认随角色）

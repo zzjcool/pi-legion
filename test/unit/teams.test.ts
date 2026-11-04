@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import type { AgentConfig, SubagentsSettings } from "../../src/shared/types.ts";
+import { ErrorCodes, type AgentConfig, type SubagentsSettings } from "../../src/shared/types.ts";
 import {
 	applyTeam,
 	DEFAULT_TEAM,
@@ -2236,6 +2236,36 @@ test("#266 A20: async:false reports the real queue wait per child instead of jus
 		}
 		assert.doesNotMatch(text, /BUDGET_EXCEEDED/);
 		assert.doesNotMatch(text, /maxChildrenPerNode reached/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("vexillatio refuses a per-item `name` instead of silently dropping it", async () => {
+	// `name` belongs to `subagent`: vexillatio allocates one handle per step
+	// itself (`<role>-N`). Accepting the field would recreate the very bug the
+	// `subagent` side just fixed — a caller-chosen handle that never takes effect.
+	const harness = indexHarness({ disableBuiltins: true }, { "scout.md": UTILITY_FILE });
+	try {
+		const result = await harness.utilityTool.execute(
+			"vexillatio-task-name",
+			{
+				task: "recon with a named entry",
+				tasks: [
+					{ agent: "scout", task: "inspect area A", name: "scout-a" },
+					{ agent: "scout", task: "inspect area B" },
+				],
+				cwd: harness.cwd,
+			},
+			undefined,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		const text = (result.content ?? []).map((item) => item.text ?? "").join("\n");
+		assert.match(text, /tasks\[\] step 1 cannot include `name`/);
+		assert.match(text, /vexillatio allocates one handle per step itself/);
+		assert.equal((result.details as { error?: string } | undefined)?.error, ErrorCodes.INVALID_PARAMS);
+		assert.equal(harness.supervisor.spawns.length, 0, "a refused field must not launch anything");
 	} finally {
 		await harness.cleanup();
 	}

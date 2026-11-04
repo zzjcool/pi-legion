@@ -255,3 +255,120 @@ test("#101 collision and invalid name refuse clearly", async () => {
 		await harness.cleanup();
 	}
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// A `name` on a `tasks[]` ENTRY was silently dropped: only the call-level
+// `name=` reached `launch`, so every child of a named fan-out came back as
+// `scout-N`/`worker-N` with nothing telling the caller its handle had been
+// ignored. Per-item handles are honored now, and a batch whose handles cannot
+// all be honored spawns nothing at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("tasks[] per-item names reach the supervisor and the run store", async () => {
+	const harness = indexHarness();
+	try {
+		const launched = await harness.invoke({
+			tasks: [
+				{ agent: "scout", task: "recon TOKEN_A", name: "scout-a" },
+				{ agent: "worker", task: "build TOKEN_B", name: "worker-b" },
+			],
+			async: true,
+			worktree: false,
+		});
+		assert.match(launched.text, /▶ scout-a \(scout\)/);
+		assert.match(launched.text, /▶ worker-b \(worker\)/);
+		assert.doesNotMatch(launched.text, /▶ scout-0/);
+		assert.doesNotMatch(launched.text, /▶ worker-0/);
+		assert.deepEqual(
+			harness.supervisor.spawns.map((spawn) => spawn.input.name).sort(),
+			["scout-a", "worker-b"],
+		);
+
+		const { store, db } = openHarnessLegionDb(harness.cwd);
+		try {
+			const children = store.listRuns().flatMap((run) => run.children);
+			for (const [name, agent] of [
+				["scout-a", "scout"],
+				["worker-b", "worker"],
+			] as const) {
+				const child = children.find((entry) => entry.name === name);
+				assert.ok(child, `run store must record ${name}`);
+				assert.equal(child.agent, agent);
+				assert.equal(child.nodeId, `root.${name}`);
+				assert.ok(getChildByName(db, "root", name), `legion ledger must register ${name}`);
+			}
+		} finally {
+			db.close();
+		}
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("an unhonorable tasks[] name spawns nothing (no partial start)", async () => {
+	const harness = indexHarness();
+	try {
+		const refused = await harness.invoke({
+			tasks: [
+				{ agent: "scout", task: "healthy sibling", name: "scout-a" },
+				{ agent: "worker", task: "bad handle", name: "Worker B!" },
+			],
+			async: true,
+			worktree: false,
+		});
+		assert.equal(refused.details?.error, ErrorCodes.INVALID_PARAMS);
+		assert.match(refused.text, /tasks\[\]: step 2/);
+		assert.equal(
+			harness.supervisor.spawns.length,
+			0,
+			"the healthy first entry must not be launched around the refusal",
+		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("a one-entry tasks[] handle comes from either place, never from two", async () => {
+	const agreed = indexHarness();
+	try {
+		const launched = await agreed.invoke({
+			name: " Worker-A ",
+			tasks: [{ agent: "worker", task: "same handle in both places", name: "worker-a" }],
+			async: true,
+			worktree: false,
+		});
+		assert.match(launched.text, /▶ worker-a \(worker\)/);
+		assert.deepEqual(
+			agreed.supervisor.spawns.map((spawn) => spawn.input.name),
+			["worker-a"],
+		);
+	} finally {
+		await agreed.cleanup();
+	}
+
+	const refusals: Array<[string, Record<string, unknown>]> = [
+		[
+			"two different handles for one child",
+			{ name: "worker-b", tasks: [{ agent: "worker", task: "x", name: "worker-a" }] },
+		],
+		[
+			"the same handle twice in one batch",
+			{
+				tasks: [
+					{ agent: "worker", task: "x", name: "worker-a" },
+					{ agent: "scout", task: "y", name: "WORKER-A" },
+				],
+			},
+		],
+	];
+	for (const [label, params] of refusals) {
+		const harness = indexHarness();
+		try {
+			const refused = await harness.invoke({ ...params, async: true, worktree: false });
+			assert.equal(refused.details?.error, ErrorCodes.INVALID_PARAMS, label);
+			assert.equal(harness.supervisor.spawns.length, 0, `${label}: nothing may be launched`);
+		} finally {
+			await harness.cleanup();
+		}
+	}
+});
