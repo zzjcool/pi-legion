@@ -16,7 +16,7 @@ DOCK  := $(ROOT)/test/docker
 # 真模型容器
 NAME  ?= pi-legion-real
 IMAGE ?= ghcr.io/zzjcool/pi-legion/tui-sandbox:latest
-MODEL ?= workbuddy/hy4-preview-ioa
+MODEL ?= workbuddy/hy4std
 
 # mock TUI 回归
 COLS ?= 120
@@ -42,7 +42,7 @@ up: ## 只起真模型容器，不进 pi
 	@bash "$(DOCK)/run-tui-real.sh" --print "Reply with the single word OK" >/dev/null
 	@echo "容器 $(NAME) 已起"
 
-run: ## 起容器并直接进入 pi（默认 hy4-preview-ioa）—— 日常用这个
+run: ## 起容器并直接进入 pi（默认 hy4std）—— 日常用这个
 	@bash "$(DOCK)/run-tui-real.sh"
 
 it: run ## run 的别名

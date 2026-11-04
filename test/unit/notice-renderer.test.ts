@@ -33,6 +33,8 @@ test("renderer: collapsed success is one compact row", () => {
 	const component = renderSubagentNotice(success, {
 		expanded: false,
 		outputPad: 1,
+		keyText: () => "",
+		keyHint: () => "",
 	}, identityTheme);
 	assert.ok(component);
 	const lines = component.render(120);
@@ -46,6 +48,8 @@ test("renderer: collapsed success stays one row at hostile widths", () => {
 	const component = renderSubagentNotice(success, {
 		expanded: false,
 		outputPad: 1,
+		keyText: () => "",
+		keyHint: () => "",
 	}, identityTheme);
 	assert.ok(component);
 	for (const width of [80, 40, 10, 1, 0]) {
@@ -63,6 +67,8 @@ test("renderer: hostile names render as one row without escapes", () => {
 	const component = renderSubagentNotice(hostile, {
 		expanded: false,
 		outputPad: 1,
+		keyText: () => "",
+		keyHint: () => "",
 	}, identityTheme);
 	assert.ok(component);
 	const lines = component.render(80);
@@ -74,7 +80,7 @@ test("renderer: hostile names render as one row without escapes", () => {
 
 test("renderer: expanded success falls back to the default Markdown block", () => {
 	assert.equal(
-		renderSubagentNotice(success, { expanded: true, outputPad: 1 }, identityTheme),
+		renderSubagentNotice(success, { expanded: true, outputPad: 1, keyText: () => "", keyHint: () => "" }, identityTheme),
 		undefined,
 	);
 });
@@ -90,7 +96,7 @@ test("renderer: failures and stops always use the full default block", () => {
 			output: "boom",
 		});
 		assert.equal(
-			renderSubagentNotice(notice, { expanded: false, outputPad: 1 }, identityTheme),
+			renderSubagentNotice(notice, { expanded: false, outputPad: 1, keyText: () => "", keyHint: () => "" }, identityTheme),
 			undefined,
 		);
 	}
@@ -103,7 +109,7 @@ test("renderer: notices without details (old sessions) fall back", () => {
 		display: true,
 	} as NoticeMessage;
 	assert.equal(
-		renderSubagentNotice(legacy, { expanded: false, outputPad: 1 }, identityTheme),
+		renderSubagentNotice(legacy, { expanded: false, outputPad: 1, keyText: () => "", keyHint: () => "" }, identityTheme),
 		undefined,
 	);
 });
@@ -126,7 +132,7 @@ test("renderer: details round-trips through JSON and still collapses", () => {
 			display: true,
 			details: reloaded,
 		} as NoticeMessage,
-		{ expanded: false, outputPad: 1 },
+		{ expanded: false, outputPad: 1, keyText: () => "", keyHint: () => "" },
 		identityTheme,
 	);
 	assert.ok(component);

@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 全局安装 pi coding agent（TUI 被测对象）。版本可用 build-arg 固定。
-ARG PI_VERSION=latest
+ARG PI_VERSION=1.5.0
 RUN npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}"
 
 # 注册 any-endpoint provider：真模型沙箱（test/docker/run-tui-real.sh）靠它读宿主

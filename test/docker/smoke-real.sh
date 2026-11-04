@@ -9,7 +9,7 @@
 set -uo pipefail
 
 NAME="${2:-pi-legion-real}"
-MODEL="${1:-workbuddy/hy4-preview-ioa}"
+MODEL="${1:-workbuddy/hy4std}"
 
 run() { timeout 200 docker exec "$NAME" pi --model "$MODEL" --print "$1" 2>&1; }
 

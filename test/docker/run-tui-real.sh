@@ -14,13 +14,13 @@
 # 可调环境变量：
 #   TUI_REAL_IMAGE  镜像（默认 ghcr.io/zzjcool/pi-legion/tui-sandbox:latest）
 #   TUI_REAL_NAME   容器名（默认 pi-legion-real）
-#   PI_MODEL        模型 id（默认 workbuddy/hy4-preview-ioa）
+#   PI_MODEL        模型 id（默认 workbuddy/hy4std）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 IMAGE="${TUI_REAL_IMAGE:-ghcr.io/zzjcool/pi-legion/tui-sandbox:latest}"
 NAME="${TUI_REAL_NAME:-pi-legion-real}"
-MODEL="${PI_MODEL:-workbuddy/hy4-preview-ioa}"
+MODEL="${PI_MODEL:-workbuddy/hy4std}"
 HOST_AGENT="${HOST_PI_AGENT:-$HOME/.pi/agent}"
 
 for f in auth.json models-store.json; do
