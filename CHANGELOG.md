@@ -11,7 +11,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
-### Fixed
+## [5.2.0] — 2026-11-04
+
+一次以「回复说真话」为中心的发布。批量派发的每个子节点可以带自己的 handle；`stop` 与超时的回复不再把
+「已经跑完」「还在跑」说成相反的东西；`collect` 与 `stop` 撞车时不再丢最后一轮产物；文档里「`timeoutMs`
+会终止子节点」的说法被容器实测推翻并改正。
+
+### Added
 
 - **`tasks[]` 的每个条目现在可以带自己的 `name`，而且这个 handle 一定生效。** 以前条目里的 `name` 被
   静默丢弃——schema 里没有这个字段、`launchStep` 也从不读它，于是调用方明明写了名字，批量出来的子节点仍被
@@ -19,6 +25,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   语法、同一批内重名（含大小写/空格差异）、或单条目同时给了两个不同的名字，都在**任何子节点启动之前**整批拒绝，
   不会留下「一半按调用方的名字、一半按自动名」的半启动状态。`vexillatio` 自己为每一步分配唯一 handle，因此对
   条目里的 `name` 直接报错拒绝，而不是静默忽略。
+
+### Fixed
 
 - **`stop` 的回复现在带状态，不再把「已经跑完」说成「被停掉」。** 名字在子节点 retire 之后才到达时，回复是
   `No non-retired children to stop. worker-2 is already retired (execution: success, retired at …)`；命中
