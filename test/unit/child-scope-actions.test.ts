@@ -399,7 +399,9 @@ test("#312 stop: retires the node it named, not another run's live child with th
 
 		const stopped = await harness.invoke({ action: "stop", name: "worker-0" });
 		assert.notEqual(stopped.details?.error, ErrorCodes.NOT_FOUND);
-		assert.match(stopped.text, /Stopped 1 child/);
+		// The child had already finished (`exited`), so `stop` reaped it — claiming
+		// "Stopped" here would report an interruption that never happened.
+		assert.match(stopped.text, /Retired 1 already-settled child: worker-0/);
 		// The report and the retire agree: the session's own record is retired…
 		assert.equal(harness.childRecord(own.runId, "worker-0")?.state, "retired");
 		// …and the decoy is untouched. Reporting this session's node while retiring
@@ -429,7 +431,11 @@ test("#312 stop: a scope that names another run does not retire this session's l
 		// without a scope, so the refusal did not orphan it.
 		assert.equal(harness.childRecord(decoyRunId, "worker-0")?.state, "exited");
 		const live = await harness.invoke({ action: "stop", name: "worker-0" });
-		assert.match(live.text, /Stopped 1 child/);
+		// The refusal must not orphan the node: reaching it without a scope still
+		// works. The fake supervisor settles instantly, so by now it has finished —
+		// the reply says reaped rather than stopped, but the retire still happens.
+		assert.equal(live.details?.error, undefined, live.text);
+		assert.match(live.text, /Retired 1 already-settled child: worker-0/);
 	} finally {
 		await harness.cleanup();
 	}

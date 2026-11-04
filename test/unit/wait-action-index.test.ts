@@ -225,6 +225,35 @@ test("stopAction: all retires active children sequentially and releases each tar
 	runtime.dispose();
 });
 
+test("stopAction: a child that had already settled is reaped, not reported as stopped", async () => {
+	const runtime = runtimeWith([
+		{ name: "live-child", agent: "worker" },
+		{ name: "settled-child", agent: "worker" },
+	]);
+	// Settled but still tracked: the runtime sets `awaiting` before its watch
+	// retires and releases the job, which is the window a stop can land in.
+	const settled = runtime.get("settled-child")!;
+	settled.state = "awaiting";
+	settled.settledAt = Date.parse("2026-01-02T03:04:05.000Z");
+	const retired: string[] = [];
+	const result = await stopAction({
+		params: { all: true },
+		runtime,
+		retire: async (name) => {
+			retired.push(name);
+		},
+	});
+	assert.deepEqual(retired, ["live-child", "settled-child"], "both targets are still retired");
+	const rendered = text(result);
+	assert.match(rendered, /Stopped 1 child: live-child\./);
+	assert.match(
+		rendered,
+		/Retired 1 already-settled child: settled-child \(settled at 2026-01-02T03:04:05\.000Z\)/,
+	);
+	assert.doesNotMatch(rendered, /Stopped 2 children|Stopped 1 child: settled-child/);
+	runtime.dispose();
+});
+
 test("renderWait: summary line counts done and still-running", () => {
 	const rendered = renderWait([
 		{ name: "a", snapshot: snapshot("A-out") },

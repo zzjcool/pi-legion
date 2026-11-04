@@ -640,6 +640,31 @@ test("#209-3 stop on an already-retired foreign record reports nothing to stop",
 		const result = await harness.invoke({ action: "stop", name: "worker-2" });
 		assert.doesNotMatch(result.text, /not tracked by this session/);
 		assert.match(result.text, /No non-retired children to stop/);
+		// The reply says WHICH state the child is in, so a stop that lost the race
+		// against its own retire does not read like a failed stop.
+		assert.match(result.text, /worker-2 is already retired \(execution: success\)\./);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("#209-3 stop reaps a child that already finished instead of claiming it was stopped", async () => {
+	const harness = indexHarness();
+	try {
+		// `awaiting` with a terminal outcome: settled, but not yet retired — the
+		// window a `stop` used to report as "Stopped 1 child".
+		foreignDeadRun(harness.cwd, "r-settled2", "worker-3", {
+			state: "awaiting",
+			execution: { status: "success" },
+		});
+		const result = await harness.invoke({ action: "stop", name: "worker-3" });
+		assert.equal(result.details?.error, undefined, result.text);
+		assert.match(result.text, /Retired 1 already-settled child: worker-3 \(execution: success\)/);
+		assert.doesNotMatch(result.text, /Stopped 1 child/);
+
+		const runFile = path.join(harness.cwd, ".pi-subagents", "runs", "r-settled2", "run.json");
+		const persisted = JSON.parse(readFileSync(runFile, "utf8")) as RunRecord;
+		assert.equal(persisted.children[0]?.state, "retired");
 	} finally {
 		await harness.cleanup();
 	}

@@ -20,6 +20,11 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   不会留下「一半按调用方的名字、一半按自动名」的半启动状态。`vexillatio` 自己为每一步分配唯一 handle，因此对
   条目里的 `name` 直接报错拒绝，而不是静默忽略。
 
+- **`stop` 的回复现在带状态，不再把「已经跑完」说成「被停掉」。** 名字在子节点 retire 之后才到达时，回复是
+  `No non-retired children to stop. worker-2 is already retired (execution: success, retired at …)`；命中
+  settle→retire 那一小段窗口时，回复 `Retired 1 already-settled child: x (execution: success)` 而不是
+  `Stopped 1 child`——后者等于宣称一次从未发生的打断。retire 行为本身不变，只有措辞。
+
 ## [5.1.0] — 2026-11-02
 
 一次以**可恢复、可声明的子树**为中心的发布。三个新能力：`centurion` 的状态机改为由 root 派发时用 `phases:` 声明（不声明就是普通 agent）；同一个 session 重开能接回上次的树，退出等于暂停、恢复必须显式；长等待中的 `wait`/`collect` 会在收到子节点邮件时立刻返回。`/legion` 一侧：整帧分配降到 2.0MB 以内（120×40 −59%、200×60 −67%），overlay 改为主屏挂载，状态行能说清子节点正在做什么，且不再每写一格分配一个 `Cell`。另有三十余项稳定性修复：失败队不再静默消失、内联相位机器进树、headless 账本不再漏记、`ctx is stale` 与宿主 `turn_end` 的报错消失。

@@ -61,7 +61,7 @@ import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
-import { type LegionSettings } from "./src/shared/types.ts";
+import { type ExecutionStatus, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
 import {
@@ -294,7 +294,7 @@ const SubagentParams = Type.Object({
 				Type.Literal("stop"),
 				Type.Literal("diagnose"),
 			],
-			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor." },
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor." },
 		),
 	),
 	agent: Type.Optional(
@@ -5248,10 +5248,93 @@ export interface StopRetireScope {
 	runId?: string | undefined;
 }
 
+/** What a child had already done by the time `stop` reached it. */
+interface StopSettled {
+	status?: ExecutionStatus;
+	/** ISO settle time, when the runtime observed one. */
+	at?: string;
+}
+
 /** One node `stop` will retire, with the run that owns it (#312). */
 interface StopTarget {
 	name: string;
 	runId: string;
+	/**
+	 * Set when the child had already finished: retiring it only reaps it, and the
+	 * reply has to say so instead of claiming an interruption.
+	 */
+	settled?: StopSettled;
+}
+
+/** The targets a named `stop` resolved, plus why it resolved none. */
+interface StopResolution {
+	targets: StopTarget[];
+	/** Present when the name matched a record that is already retired. */
+	note?: string;
+}
+
+/**
+ * A child that already finished is reaped, not stopped.
+ *
+ * `awaiting` means the runtime already collected a terminal snapshot; `exited`
+ * means its process is gone. A record whose execution is still `running` is NOT
+ * settled, even when a lifecycle state raced ahead of the process.
+ */
+function settledFromRecord(child: ChildRecord): StopSettled | undefined {
+	if (child.state !== "awaiting" && child.state !== "exited") return undefined;
+	const status = child.execution?.status;
+	if (status === "running") return undefined;
+	return status ? { status } : {};
+}
+
+/** The runtime job knows WHEN it settled; the outcome lives on the record, not on it. */
+function settledFromJob(job: { state: string; settledAt?: number }): StopSettled | undefined {
+	if (job.state !== "awaiting") return undefined;
+	return job.settledAt ? { at: new Date(job.settledAt).toISOString() } : {};
+}
+
+/**
+ * Resolve ONE named target from a persisted record.
+ *
+ * A `retired` record yields no target plus a note carrying its outcome and retire
+ * time — otherwise the caller learns only "nothing to stop", which is exactly how
+ * a child that finished a second earlier reads as a failed stop.
+ */
+function stopResolutionFromRecord(child: ChildRecord, runId: string): StopResolution {
+	if (child.state === "retired") {
+		return { targets: [], note: retiredRecordNote(child) };
+	}
+	const settled = settledFromRecord(child);
+	return { targets: [{ name: child.name, runId, ...(settled ? { settled } : {}) }] };
+}
+
+/** Same, for a live job the session tracks (the job table never holds `retired` in production). */
+function stopResolutionFromJob(job: {
+	name: string;
+	runId: string;
+	state: string;
+	settledAt?: number;
+}): StopResolution {
+	if (job.state === "retired") return { targets: [], note: `${job.name} is already retired.` };
+	const settled = settledFromJob(job);
+	return { targets: [{ name: job.name, runId: job.runId, ...(settled ? { settled } : {}) }] };
+}
+
+/** `worker-2 is already retired (execution: success, retired at 2026-…).` */
+function retiredRecordNote(child: ChildRecord): string {
+	const bits: string[] = [];
+	const status = child.execution?.status;
+	if (status) bits.push(`execution: ${status}`);
+	if (child.retiredAt) bits.push(`retired at ${child.retiredAt}`);
+	return `${child.name} is already retired${bits.length > 0 ? ` (${bits.join(", ")})` : ""}.`;
+}
+
+/** ` (execution: success, settled at 2026-…)`, or "" when nothing is known. */
+function stopSettledNote(settled: StopSettled | undefined): string {
+	const bits: string[] = [];
+	if (settled?.status) bits.push(`execution: ${settled.status}`);
+	if (settled?.at) bits.push(`settled at ${settled.at}`);
+	return bits.length > 0 ? ` (${bits.join(", ")})` : "";
 }
 
 /**
@@ -5346,8 +5429,13 @@ export async function stopAction(input: {
 	const jobs = runtime.activeJobs();
 	const active = jobs.filter((job) => job.state !== "retired");
 	let targets: StopTarget[];
+	/** Describes the already-retired record a NAMED stop resolved to no target. */
+	let alreadyRetired: string | undefined;
 	if (params.all) {
-		targets = active.map((job) => ({ name: job.name, runId: job.runId }));
+		targets = active.map((job) => {
+			const settled = settledFromJob(job);
+			return { name: job.name, runId: job.runId, ...(settled ? { settled } : {}) };
+		});
 	} else {
 		// Local const so the earlier `name`/`all` guard narrows through the lookup.
 		const name = params.name;
@@ -5399,33 +5487,48 @@ export async function stopAction(input: {
 					if (!permissive) {
 						return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
 					}
-					targets = permissive.child.state === "retired" ? [] : [{ name: permissive.child.name, runId: permissive.runId }];
+					const resolved = stopResolutionFromRecord(permissive.child, permissive.runId);
+					targets = resolved.targets;
+					alreadyRetired = resolved.note;
 				} else {
 					return fail(`unknown child: ${params.name} (not tracked by this session).`, ErrorCodes.NOT_FOUND);
 				}
 			} else {
-				targets = found.child.state === "retired" ? [] : [{ name: found.child.name, runId: found.runId }];
+				const resolved = stopResolutionFromRecord(found.child, found.runId);
+				targets = resolved.targets;
+				alreadyRetired = resolved.note;
 			}
 		} else {
-			targets = target.state === "retired" ? [] : [{ name: target.name, runId: target.runId }];
+			const resolved = stopResolutionFromJob(target);
+			targets = resolved.targets;
+			alreadyRetired = resolved.note;
 		}
 	}
-	if (targets.length === 0) return ok("No non-retired children to stop.");
+	if (targets.length === 0) {
+		return ok(
+			alreadyRetired ? `No non-retired children to stop. ${alreadyRetired}` : "No non-retired children to stop.",
+		);
+	}
 
 	// Stop every watcher before any retire starts: a later target must not finish
 	// its own watch (and notify/release) while an earlier target is being retired.
 	for (const { name } of targets) runtime.cancelWatch(name);
 
 	const stopped: string[] = [];
+	const reaped: string[] = [];
 	const failures: string[] = [];
-	for (const { name, runId } of targets) {
+	for (const target of targets) {
+		const { name, runId } = target;
 		try {
 			// The runtime job may have been released after the target snapshot was
 			// taken. `scope` hands the resolve-time run to the executor, which reads
 			// THAT record rather than picking one across runs (#312).
 			await retire(name, retireOpts, { runId });
 			runtime.release(name);
-			stopped.push(name);
+			// A child that had already finished is reaped, not stopped: "Stopped 1
+			// child" for a success claims an interruption that never happened.
+			if (target.settled) reaped.push(`${name}${stopSettledNote(target.settled)}`);
+			else stopped.push(name);
 		} catch (error) {
 			// If the retire chain fails, restore the completion watcher so a
 			// still-live child is not orphaned by the explicit stop attempt.
@@ -5434,9 +5537,16 @@ export async function stopAction(input: {
 		}
 	}
 	const mode = force ? "force-stopped" : "Stopped";
-	const summary = stopped.length
-		? `${mode} ${stopped.length} child${stopped.length === 1 ? "" : "ren"}: ${stopped.join(", ")}.`
-		: "No children were stopped.";
+	const lines: string[] = [];
+	if (stopped.length > 0) {
+		lines.push(`${mode} ${stopped.length} child${stopped.length === 1 ? "" : "ren"}: ${stopped.join(", ")}.`);
+	}
+	if (reaped.length > 0) {
+		lines.push(
+			`Retired ${reaped.length} already-settled child${reaped.length === 1 ? "" : "ren"}: ${reaped.join(", ")}.`,
+		);
+	}
+	const summary = lines.length > 0 ? lines.join("\n") : "No children were stopped.";
 	return failures.length
 		? fail(`${summary}\nFailed to stop: ${failures.join("; ")}`, ErrorCodes.RETIRE_FAILED)
 		: ok(summary);
