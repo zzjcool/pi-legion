@@ -28,6 +28,7 @@ import {
 	DEFAULT_LEGION_SETTINGS,
 } from "../shared/types.ts";
 import { childBuiltinExtensionEntries, type ChildBuiltinFactories } from "./child-builtins.ts";
+import { bindChildSessionExtensions } from "./child-session.ts";
 import {
 	POLL_INTERVAL_MS,
 	DEFAULT_INPROCESS_MAX_ACTIVE,
@@ -598,10 +599,12 @@ async function defaultSessionFactory(
 	// Registering a factory is not a load switch — the `builtin:` path chosen by
 	// `collectChildExtensions` is — but it is not inert either: the name enters
 	// `DefaultPackageManager`'s builtin table and discovery synthesizes a
-	// default-enabled `builtin:<name>` for it (`package-manager.js:766-772`). So
-	// "mcp has no path yet" is NOT what keeps MCP out of MR1; the gates are
-	// `noExtensions: true` (D3) plus never triggering `session_start` (D5). Even if
-	// `builtin:mcp` were loaded, nothing here opens an MCP connection.
+	// default-enabled `builtin:<name>` for it (`package-manager.js:766-772`).
+	//
+	// MR2 (`child-mcp-v1` D1/D3): `collectChildExtensions` now also names
+	// `builtin:mcp` + `builtin:tool-search` (mask: `PI_LEGION_CHILD_MCP=0`), and the
+	// session is bound below so `session_start` actually fires. Those two facts are
+	// what make MCP connect; neither alone does.
 	//
 	// D7: `childBuiltinExtensionEntries` is the only construction point, so the
 	// name→factory wiring is unit-testable without building a session.
@@ -702,6 +705,13 @@ async function defaultSessionFactory(
 	}
 
 	const { session } = await createAgentSession(createOptions);
+	// `child-mcp-v1` D3, the only bind: `createAgentSession` does NOT emit
+	// `session_start` (`bindExtensions` is its sole emitter), so every
+	// `session_start` consumer — most visibly the MCP extension's
+	// `loadConfig` + `startConnection` — is dead in an in-process child without
+	// this call. Exactly once: no idempotence guard exists and a second bind
+	// leaves the MCP extension's previous connections dangling.
+	await bindChildSessionExtensions(session, input.name);
 	return session;
 }
 
