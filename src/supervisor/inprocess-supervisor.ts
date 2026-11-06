@@ -15,6 +15,7 @@ import { parseSessionFile } from "../shared/session.ts";
 import {
 	appendLegionChildTools,
 	applyThinkingSuffix,
+	childEnablesMcp,
 	childInheritsExtensions,
 	collectChildExtensions,
 } from "../runs/args.ts";
@@ -705,13 +706,21 @@ async function defaultSessionFactory(
 	}
 
 	const { session } = await createAgentSession(createOptions);
-	// `child-mcp-v1` D3, the only bind: `createAgentSession` does NOT emit
+	// `child-mcp-v1` D3 + r2, the only bind: `createAgentSession` does NOT emit
 	// `session_start` (`bindExtensions` is its sole emitter), so every
 	// `session_start` consumer — most visibly the MCP extension's
 	// `loadConfig` + `startConnection` — is dead in an in-process child without
 	// this call. Exactly once: no idempotence guard exists and a second bind
 	// leaves the MCP extension's previous connections dangling.
-	await bindChildSessionExtensions(session, input.name);
+	//
+	// r2: gated on the MCP switch, because `bindExtensions` hands `session_start`
+	// to EVERY loaded extension — including third-party host extensions inherited
+	// through `inheritExtensions: true` — and an in-process child has no
+	// `session_shutdown` to reclaim whatever they start (`InProcessSupervisor`
+	// only calls `session.dispose()`). So `PI_LEGION_CHILD_MCP=0` means "exactly as
+	// before MR2": no MCP path, and no `session_start` either. Same lever as
+	// `collectChildExtensions`, on purpose — one judgment, not two.
+	if (childEnablesMcp(process.env)) await bindChildSessionExtensions(session, input.name);
 	return session;
 }
 

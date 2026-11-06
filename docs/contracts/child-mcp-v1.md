@@ -220,14 +220,42 @@ npm run test:integration
 
 ## 7. 修订记录
 
-### r1（D1 实施后）— 文件所有权扩容一处
+### r1 — 实施中的两处偏离（worker 记录，root 追认）
 
-**原因**：D1 让 `collectChildExtensions` 的返回值里第一次出现非路径条目（`builtin:mcp` /
-`builtin:tool-search`），而 `test/unit/extension-inheritance.test.ts` 的 A13 断言「这个列表里的
-每一条都必须是磁盘上的真实文件」（`statSync(entry).isFile()`）。它在 MR1 时代是对的：那时列表里
-只有继承路径、卡片路径、额外路径与 child-guard。D1 之后它与「`npm test` 全绿」互斥。
+1. `test/unit/extension-inheritance.test.ts` 不在 §3 清单内。D1 让 `collectChildExtensions`
+   第一次产出非磁盘路径条目，该测试现有的「每条都必须是真实文件」探针必红，与
+   「`npm test` 全绿」互斥。改动是**语义不变**的：探针跳过 `builtin:` ref（它原本防的是
+   目录被当 `--extension`）。授权。
+2. `bindChildSessionExtensions(session, name?)` 多了一个可选 `name` 参数（warn 文案要带子节点名）。
+   冻结的一参数调用形状与 bindings 形状不变，取超集。授权。
 
-**修订**：授权该文件**仅**在 A13 的探针里跳过 `builtin:` ref（`isBuiltinExtensionRef`），
-其余断言逐字不动。这**不改语义**：A13 的缺陷是「目录被当成 `--extension` 传下去」，而
-`builtin:<name>` 是 loader 解析的名字、不是路径，本就不该走 `statSync`。判据与
-`child-builtin-extensions-v1.md` §6 r1 相同——只改字面量/探针形状，不放宽被守的性质。
+### r2 — bind 必须挂在 MCP 开关上（root 追加）
+
+**问题**：`bindExtensions` 会让 **所有** 已加载扩展收到 `session_start` —— 不只是 MCP，还包括
+`inheritExtensions: true` 继承来的宿主扩展。核对了本机继承的四个宿主包：
+
+| 包 | `session_start` 行为 | 子会话里安全？ |
+|---|---|---|
+| `pi-sysmon` | `if (!ctx.hasUI) return;` 在启用逻辑之前（`src/index.ts:1229`） | 是（无 UI 直接退出，不起 1Hz 采样） |
+| `pi-async` | `bindTuiHost` 要求 `ctx.mode === "tui"`（`src/tui/host.ts:17`） | 是（子会话 mode 是 `"print"`） |
+| `pi-any-endpoint` / `pi-diff-review` | 无 `session_start` handler | 是 |
+
+它们都做了降级保护，但这是**别人的实现**，不是我们的不变量。任何第三方扩展都可能在
+`session_start` 里起定时器/子进程，而 in-process 子会话**没有 `session_shutdown` 可回收**
+（`AgentSessionRuntime` 才发它，`InProcessSupervisor` 只 `session.dispose()`）。
+
+**决定**：`defaultSessionFactory` 里那次 bind 改为条件执行：
+
+```ts
+if (childEnablesMcp(process.env)) await bindChildSessionExtensions(session, input.name);
+```
+
+于是 `PI_LEGION_CHILD_MCP=0` 的语义收紧为「**完全回到 MR2 之前**」——没有 `builtin:mcp` 路径，
+也没有 `session_start`，宿主扩展在子会话里的可见行为一字不变。这一条同时是回滚手段。
+
+**代价**：`childEnablesMcp` 因此在 `inprocess-supervisor.ts` 里被再读一次（与 `args.ts` 的路径注入
+各读一次）。接受：两次读取的是同一个 `process.env`，且 in-process 子会话共享父 env
+（`docs/inprocess-supervisor.md:162-166`），不存在两侧不一致的窗口。
+
+**测试**：D7.3 仍覆盖被调函数本身；新增一条单测断言 `childEnablesMcp` 与
+「是否应 bind」是同一个判据（表驱动复用 D7.1 的用例集即可），避免两处判据分叉。

@@ -13,10 +13,24 @@
  * deleting the `builtin:mcp` injection in `collectChildExtensions`) was executed
  * against these assertions and the D7.2 gate; the recorded output is in the MR
  * report.
+ *
+ * r2 adds the other half: whether the factory binds at all must be the SAME
+ * judgment as whether the MCP path is injected. `bindExtensions` shows
+ * `session_start` to every loaded extension (inherited third-party ones
+ * included) and an in-process child has no `session_shutdown` to reclaim them,
+ * so a second judgment for the bind would silently reopen that door.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import {
+	BUILTIN_MCP,
+	BUILTIN_TOOL_SEARCH,
+	childEnablesMcp,
+	collectChildExtensions,
+} from "../../src/runs/args.ts";
+import { childEnablesMcp as policyChildEnablesMcp } from "../../src/runs/extension-inheritance.ts";
 import {
 	bindChildSessionExtensions,
 	type ChildSessionBinding,
@@ -111,4 +125,56 @@ test("D7.3 a bind failure propagates instead of leaving a half-started session",
 		},
 	};
 	await assert.rejects(() => bindChildSessionExtensions(session, "root.worker"), /resources_discover exploded/);
+});
+
+// ────────────── child-mcp-v1 r2 ──────────────
+
+test("r2: 'should bind' and the builtin:mcp path are one judgment (childEnablesMcp)", () => {
+	// Same table as D7.1 (`args.test.ts`): only an explicit mask turns MCP off.
+	const ON: Array<string | undefined> = [undefined, "", "all", "1", "true", "on", "yes", "   ", "whatever", "MCP"];
+	const OFF = ["0", "false", "off", "no", "none"];
+
+	// The two sides of the switch, compared case by case: the path injection
+	// (`collectChildExtensions`, which both transports read) and the bind gate
+	// (`childEnablesMcp`, which `defaultSessionFactory` reads) must agree, or
+	// `PI_LEGION_CHILD_MCP=0` would disable one half only.
+	for (const value of [...ON, ...OFF]) {
+		const env = value === undefined ? {} : { PI_LEGION_CHILD_MCP: value };
+		const shouldBind = childEnablesMcp(env);
+		const exts = collectChildExtensions({ tools: ["read"] }, env);
+		assert.equal(
+			shouldBind,
+			value === undefined || ON.includes(value),
+			`the table itself disagrees with childEnablesMcp for ${JSON.stringify(value)}`,
+		);
+		assert.equal(
+			exts.includes(BUILTIN_MCP),
+			shouldBind,
+			`path side vs bind side disagree for PI_LEGION_CHILD_MCP=${JSON.stringify(value)}`,
+		);
+		assert.equal(
+			exts.includes(BUILTIN_TOOL_SEARCH),
+			shouldBind,
+			`tool-search must follow the same switch: ${JSON.stringify(value)}`,
+		);
+	}
+
+	// One implementation, not two copies: `args.ts` re-exports the policy function.
+	assert.equal(childEnablesMcp, policyChildEnablesMcp, "args.ts must re-export childEnablesMcp, never re-implement it");
+
+	// And the factory's bind DECISION is that very function, read from the env the
+	// in-process child shares with its parent. A second judgment (or an
+	// unconditional bind) would bring `session_start` back for inherited
+	// third-party extensions while MCP is meant to be off.
+	const source = readFileSync(new URL("../../src/supervisor/inprocess-supervisor.ts", import.meta.url), "utf8");
+	assert.match(
+		source,
+		/if \(childEnablesMcp\(process\.env\)\) await bindChildSessionExtensions\(session, input\.name\);\n/,
+		"the one bind must stay gated on childEnablesMcp(process.env)",
+	);
+	assert.equal(
+		source.split("bindChildSessionExtensions(session, input.name)").length - 1,
+		1,
+		"exactly one bind call in the factory — a second one dangles MCP connections",
+	);
 });
