@@ -215,6 +215,11 @@ npm run test:integration
 2. 真实 server 的连接延迟与进程成本只在父会话手动实测，不进 CI（会拉起真实 `npx`）。
 3. 未验证：in-process 子会话里 MCP 的 `ctx.isProjectTrusted()` 返回值与 cwd 的关系
    （项目级 `.pi/mcp.json` 是否加载）；用户级配置不受影响。
+4. **没跑到 `before_agent_start` 就退役的 in-process 子会话**：它从未 adopt 任何 identity，
+   `ownLegionKey` 恒为 `undefined`，所以「只关自己的」这条对它无事可做 —— 它没有 handle 要关，
+   也不会去碰别人的（r4 F1 / r5 G1）。未覆盖的是反方向：同一进程里若由别的 entry 以祖先
+   `PI_LEGION_*` 开出过 handle，本 MR 既无法识别它属于谁、也不会替它回收，该 handle 会活到 root 退出。
+   §4 的行为验收不覆盖这一条。
 
 ---
 
@@ -459,3 +464,61 @@ emit 永不 resolve 时 `dispose` 仍然在超时后跑到。
 ## 8. 复核要求（第二轮）
 
 修完再跑一次 fresh-context review。**F1 未修不得合并。**
+
+### r5 — 第三轮 review（1 major + 5 minor）
+
+#### G1（major）— 截断窗口里 legion 自己的 shutdown handler 会 stale 抛错，跳过自身清理
+
+**事实**：`dispose()` 的包装在 `Promise.race` 的 1000ms 上限到点后立即 `rawDispose()`，
+而 `AgentSession.dispose()` 会 `extensionRunner.invalidate()`（`agent-session.js:1035`）。
+仍在迭代的 `emit` 里，**排在扩展列表最后**的 legion 自己（`args.ts:293` 把 child-guard 放末尾）
+会在 `index.ts:1731` 读 `ctx?.mode` 时抛 stale（`runner.js:617-628`），于是
+`sessionRuntime.dispose()`、退自己的子节点、`stopLegionRuntime(ownLegionKey)` 全部跳过。
+
+**决定（不改上限，改 handler 自身）**：`shutdownRetireAll` 必须保证「无论 ctx 是否还活着，
+自己的账要先结干净」：
+
+1. `ctx?.mode` 的读取单独 try/catch（stale 时按 `undefined` 处理，等价于非 print/json 路径）。
+2. `stopLegionRuntime(ownLegionKey)` 放进 `finally`，保证异常路径也执行。
+3. 其余步骤（mark / drain / 退子节点）各自 try/catch，互不连坐；顺序不变。
+
+理由：这是**正确性**问题，不是本 MR 特有 —— rpc 子会话同样可能被 stale ctx 打断（只是概率低）。
+上限保留用于 liveness（避免 wedged handler 让 retire 永久挂住，`retireChild` 现在是 `await`）。
+
+**测试**：新增一条单测/集成测试（放进 `test/unit/backend-parity.test.ts` 或既有 shutdown 测试文件），
+构造 stale ctx（用 `{ get mode() { throw ... } }` 形状的假 ctx）调用 handler，断言
+`stopLegionRuntime` 路径仍被执行 —— 若直接可测性不足，退化为「对 handler 源码的顺序断言」并在报告里说明。
+
+#### G2（minor）— `stopLegionRuntime` 的注释与真实调用点相反，「关全部」分支零调用者
+
+`index.ts:1528-1531` 说 undefined 分支是 adopt 替换路径，实际 adopt 传的是已定义 key
+（`:1562`/`:1568`）。改为 `key: string`（编译期杜绝 undefined 调用），删掉零调用者的分支，
+并把 doc 改成「每条会话/entry 只关自己；全表清扫不存在」。
+
+#### G3（minor）— F2 里 `void session.dispose()` 丢掉了 F3 的 async 化
+
+`inprocess-supervisor.ts:739` 改为 `await session.dispose()`（wrapper 永不再抛，零成本；
+这样失败路径也不会在 emit 仍在飞时释放 slot）。
+
+#### G4（minor）— 退役语义与延迟要披露
+
+补 CHANGELOG/README 两句：
+
+1. in-process 子会话退役现在是 `await dispose()`：包含一次 `session_shutdown` emit，
+   最坏多 1000ms（典型 <100ms）后才 `emitSlotReleased`。
+2. 该 emit 会让子会话跑完整的 `shutdownRetireAll`：写 `node_retired{reason: session_interrupt}`、
+   `print` 模式先 drain、并退役**它自己的**子节点（嵌套 centurion 时才存在）。与 rpc 子会话同形，
+   不是新语义，但此前 in-process 不会发生。
+
+#### G5（minor）— F4 的陈述还有两处没改
+
+`index.ts:1610`（「with no reclaim point」）与 `index.ts:1682-1683`（「covers the extension bind,
+not this runtime init」）按 G1 之后的真实行为重写；对「没跑到 `before_agent_start` 就退役」的
+子会话要写清祖先 handle 仍会失主（属已知缺口，加进 §6）。
+
+---
+
+## 9. 复核要求（第三轮）
+
+G1 必须有一条能红的测试；其余按条改。改完做一次**限定范围的** fresh-context review
+（只看 r5 diff 与 G1 的可测性结论），通过即合并。

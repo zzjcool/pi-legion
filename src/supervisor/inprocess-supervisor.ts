@@ -736,7 +736,10 @@ async function defaultSessionFactory(
 		try {
 			await bindChildSessionExtensions(session, input.name);
 		} catch (error) {
-			void session.dispose();
+			// r5 G3: awaited — the wrapper never rejects, so this is free, and it keeps
+			// the failure path from unwinding while the `session_shutdown` emit is still
+			// in flight.
+			await session.dispose();
 			throw error;
 		}
 	}

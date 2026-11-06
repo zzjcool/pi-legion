@@ -1521,28 +1521,25 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		}
 	};
 	/**
-	 * Close one ledger handle (by resolved path) or every handle this process
-	 * opened. Shutdown handlers pass their own path so a child session teardown
-	 * cannot close the parent's database (#283).
+	 * Close the ONE ledger handle this entry owns, by its `legionIdentityKey`.
 	 *
-	 * The `key === undefined` branch is the adopt-replacement path, NOT a session
-	 * lifecycle one (`child-mcp-v1` r4 F1): `legionIdentities` is process-shared, so
-	 * calling it with `undefined` from a shutdown handler would close the root's
-	 * handle (and every sibling's) — see `ownLegionKey`'s three call sites.
+	 * There is no "close everything" sweep, and the parameter is required on purpose
+	 * (`child-mcp-v1` r5 G2): `legionIdentities` is process-shared — a root and every
+	 * in-process child live in it — so an optional key let a session lifecycle
+	 * caller pass `undefined` and close the ROOT's handle along with all the
+	 * siblings' (#283/#285). Each entry closes only its own key, and
+	 * `adoptLegionIdentity` closes only a key it already owned.
 	 */
-	const stopLegionRuntime = (key?: string): void => {
-		const targets = key === undefined
-			? [...legionIdentities.entries()]
-			: (legionIdentities.has(key) ? [[key, legionIdentities.get(key)!] as const] : []);
-		for (const [key, identity] of targets) {
-			legionIdentities.delete(key);
-			identity.postman.stop();
-			identity.dbEventSource.stop();
-			// #40: bound the ledger and fold the WAL back before closing.
-			if (hygieneEnabled() && !isChild) applyEventRetention(identity.db);
-			else checkpoint(identity.db);
-			identity.db.close();
-		}
+	const stopLegionRuntime = (key: string): void => {
+		const identity = legionIdentities.get(key);
+		if (identity === undefined) return;
+		legionIdentities.delete(key);
+		identity.postman.stop();
+		identity.dbEventSource.stop();
+		// #40: bound the ledger and fold the WAL back before closing.
+		if (hygieneEnabled() && !isChild) applyEventRetention(identity.db);
+		else checkpoint(identity.db);
+		identity.db.close();
 	};
 	/** The handle this extension entry owns, if any (see `legionIdentities`). */
 	let ownLegionKey: string | undefined;
@@ -1607,7 +1604,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// parent's, so an rpc grandparent leaves `PI_LEGION_*` pointing at an
 		// ancestor, and this call passes no `sessionFile` ⇒ the credential check in
 		// `resolveLegionIdentity` is skipped entirely ⇒ ancestor db opened and a
-		// second postman started, with no reclaim point.
+		// second postman started under an ANCESTOR's node row. Closing that later is
+		// not this entry's call (r4 F1) — an ancestor's handle is not ours to sweep —
+		// so skipping the init here is the whole fix.
 		if (!hasInjectedChildContext && process.env[LEGION_DB_ENV] && process.env[LEGION_NODE_ID_ENV]) {
 			// Boot-time attach: no ExtensionContext yet, so no session credential —
 			// the session_start handler re-runs this with the real credential (it is
@@ -1679,8 +1678,12 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	// must not call `initializeLegionRuntime`, whose `resolveLegionIdentity` reads
 	// `PI_LEGION_*` from `process.env` — the parent's env, shared by every
 	// in-process child. With an rpc ancestor that means opening an ancestor's db and
-	// starting a second postman, with nothing to reclaim it (r3 C1's shutdown emit
-	// covers the extension bind, not this runtime init).
+	// starting a second postman under the ANCESTOR's node row — the wrong owner.
+	// Reclaim is real (r3 C1's `session_shutdown` emit reaches this entry's own
+	// handler; r4/r5 made that handler close its own key from a `finally`, stale ctx
+	// included), which is exactly why the guard has to stop the wrong handle from
+	// being adopted here at all. One case stays uncovered — a child retired before
+	// its first `before_agent_start`: it owns no key, so it closes none (contract §6).
 	// The predicate is the whole context, not `nodeId && dbPath` (r3 M3): a
 	// `stripLegionIdentity` child has the dbPath but no nodeId, and the hazard is
 	// the env read, not the identity shape.
@@ -1709,45 +1712,72 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	});
 	const pendingUtilityRetires: Array<(opts?: RetireOptions) => Promise<void>> = [];
 	let sessionRuntime: SessionRuntime | undefined;
+	/**
+	 * `session_shutdown` for this entry (#283, `child-mcp-v1` r4 F1 / r5 G1).
+	 *
+	 * Runs on both transports — including an in-process child, whose release emit
+	 * (r3 C1) fires this handler. The steps are isolated on purpose: the ctx can be
+	 * STALE here. The release's 1000ms bound may expire and `dispose()` the session
+	 * while the runner is still iterating extensions (legion's own extension sits
+	 * last), and then even reading `ctx.mode` throws. A stale ctx must not stop the
+	 * LAST step — closing the ledger THIS entry owns — from running.
+	 *
+	 * Order is unchanged: the #374 §3 interrupt marker must land before anything
+	 * drains or kills a child.
+	 */
 	const shutdownRetireAll = async (_event?: unknown, ctx?: { mode?: string }): Promise<void> => {
-		// #374 §3: record what this exit interrupts BEFORE anything drains or kills.
-		// `--print`/`--json` drain first, and a child whose turn ends during that drain
-		// (including one the exit just killed) parses as a finished turn and would be
-		// recorded `settled/success` — the interrupt would be lost. The marker only
-		// writes the ledger, so a child that genuinely finishes during the drain still
-		// ends up `settled` (measured in the container before this line existed).
-		const own = ownLegionIdentity();
-		if (own) {
+		try {
 			try {
-				markSessionInterrupted(own.db, own.nodeId, () => Date.now());
+				// #374 §3: record what this exit interrupts BEFORE anything drains or kills.
+				// `--print`/`--json` drain first, and a child whose turn ends during that drain
+				// (including one the exit just killed) parses as a finished turn and would be
+				// recorded `settled/success` — the interrupt would be lost. The marker only
+				// writes the ledger, so a child that genuinely finishes during the drain still
+				// ends up `settled` (measured in the container before this line existed).
+				const own = ownLegionIdentity();
+				if (own) markSessionInterrupted(own.db, own.nodeId, () => Date.now());
 			} catch { /* the ledger may already be closing; never block shutdown */ }
+
+			try {
+				// #181: short --print exits before the deferred timer; flush now so
+				// orphan rpc-child-* dirs still get swept on a clean exit.
+				if (!isChild) flushHygieneIfPending();
+			} catch { /* the sweep is best-effort on the way out */ }
+
+			// A stale ctx means the session is already gone — treat it exactly like the
+			// non-print transports (no drain) instead of aborting the whole handler.
+			let mode: string | undefined;
+			try {
+				mode = ctx?.mode;
+			} catch { mode = undefined; }
+
+			try {
+				// pi --print / JSON exits when the parent turn ends. Async children
+				// have only just been spawned; retiring them here aborts the run
+				// before the first model call. Interactive quit still retires immediately.
+				if (mode === "print" || mode === "json") {
+					await sessionRuntime?.drainBeforeShutdown();
+				}
+			} catch { /* drain is best-effort: the children below still get retired */ }
+
+			try {
+				const children = sessionRuntime?.activeJobs() ?? [];
+				sessionRuntime?.dispose();
+				const shutdownRetire: RetireOptions = { cause: "session-shutdown" };
+				await Promise.all([
+					...children.map((job) => job.retire?.(shutdownRetire).catch(() => {})),
+					...pendingUtilityRetires.map((retire) => retire(shutdownRetire).catch(() => {})),
+				]);
+			} catch { /* each job already swallows its own failure; never block the close */ }
+		} finally {
+			// r5 G1: the ledger close lives in `finally` so no earlier throw can skip it.
+			// Scope to the ledger THIS entry opened (#283): `ownLegionKey === undefined`
+			// means this entry never adopted one (an identity-less child, or a child
+			// retired before its first turn) — nothing to close, and nothing else's
+			// handle may be touched (r4 F1). `stopLegionRuntime` runs only when this
+			// entry actually owns a key.
+			if (ownLegionKey !== undefined) stopLegionRuntime(ownLegionKey);
 		}
-		// #181: short --print exits before the deferred timer; flush now so
-		// orphan rpc-child-* dirs still get swept on a clean exit.
-		if (!isChild) flushHygieneIfPending();
-		// pi --print / JSON exits when the parent turn ends. Async children
-		// have only just been spawned; retiring them here aborts the run
-		// before the first model call. Interactive quit still retires immediately.
-		const mode = ctx?.mode;
-		if (mode === "print" || mode === "json") {
-			await sessionRuntime?.drainBeforeShutdown();
-		}
-		const children = sessionRuntime?.activeJobs() ?? [];
-		sessionRuntime?.dispose();
-		const shutdownRetire: RetireOptions = { cause: "session-shutdown" };
-		await Promise.all([
-			...children.map((job) => job.retire?.(shutdownRetire).catch(() => {})),
-			...pendingUtilityRetires.map((retire) => retire(shutdownRetire).catch(() => {})),
-		]);
-		// Scope to the ledger THIS entry opened: a parent and its in-process child
-		// both register a shutdown handler, and each must close only its own (#283).
-		//
-		// r4 F1: `ownLegionKey === undefined` means this entry never adopted a ledger
-		// (an identity-less `stripLegionIdentity` child, or a child retired before its
-		// first turn). `stopLegionRuntime(undefined)` closes EVERY handle in the
-		// process-shared map — including the root's — which is exactly the #283/#285
-		// accident. No handle, nothing to close.
-		if (ownLegionKey !== undefined) stopLegionRuntime(ownLegionKey);
 	};
 	if (process.env[UTILITY_CHILD_ENV] !== "1") {
 		pi.registerTool({

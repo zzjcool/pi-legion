@@ -511,7 +511,17 @@ is what makes `session_start` fire and the configured MCP servers actually
 connect. Each child therefore spawns its own server processes: measured, **5
 concurrent children × 1 server = 18 processes / 1121 MB**. They are released when
 the child retires (its `dispose()` emits `session_shutdown` first, which is MCP's
-only disconnect path). There is no connection
+only disconnect path).
+
+Two consequences of that release path, stated plainly. Retiring an in-process
+child is now `await dispose()`: one `session_shutdown` emit happens first, so the
+slot is freed up to 1000 ms later (typically well under 100 ms). And that emit
+runs the child's **own** full `session_shutdown` handler — it writes the
+`session_interrupt` marker, drains first in `--print`, and retires its own
+children (only if it was a nested centurion). That is exactly what an rpc child
+already did; it just never happened for in-process children before.
+
+There is no connection
 budget and no concurrency cap yet — the only knob is the mask
 `PI_LEGION_CHILD_MCP=0`, which removes both builtins for every child and also
 skips the session bind (no `session_start` at all, so inherited host extensions

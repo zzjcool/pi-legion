@@ -396,3 +396,97 @@ test("#285: a child session sharing the parent's ledger must not close the paren
 		rmSync(sandbox, { recursive: true, force: true });
 	}
 });
+
+test("r5 G1: a stale shutdown ctx must not skip this entry's own ledger close", async () => {
+	// `child-mcp-v1` r3 C1 emits `session_shutdown` from `dispose()` before tearing
+	// the session down, but if the 1000ms bound trips, `dispose()` invalidates the
+	// extension runner while it is still iterating handlers — and legion's own
+	// extension sits LAST in the list (`args.ts` appends the child-guard at the end).
+	// From that point on every `ctx` read throws (`ctx.mode` included).
+	//
+	// r5 G1: that stale ctx must not abort the handler, and above all it must not
+	// skip the last step — closing the ledger THIS entry adopted at boot. Asserted on
+	// the observable handle count (`/proc/self/fd`), because the map is private.
+	const sandbox = mkdtempSync(path.join(tmpdir(), "legion-stale-shutdown-"));
+	const cwd = path.join(sandbox, "project");
+	const agentDir = path.join(sandbox, "agent");
+	mkdirSync(cwd, { recursive: true });
+	mkdirSync(agentDir, { recursive: true });
+
+	const store = new RunStore({ rootDir: path.join(cwd, ".pi-subagents") });
+	const run = store.createRun({ task: "stale ctx", cwd, maxDepth: 4, nodeId: "root" });
+	const dbPath = legionDbPath(store.runDir(run.runId));
+	const seed = openLegionDb(dbPath);
+	insertNode(seed, { id: "root", parentId: null, name: "root", role: "root", runId: run.runId, status: "running" });
+	seed.close();
+
+	const previous = new Map(ENV_KEYS.map((name) => [name, process.env[name]]));
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const handlers = new Map<string, (...args: unknown[]) => unknown>();
+	const pi = {
+		registerTool() {},
+		registerCommand() {},
+		registerMessageRenderer() {},
+		sendMessage() {},
+		events: { emit() {} },
+		on(name: string, handler: (...args: unknown[]) => unknown) {
+			handlers.set(name, handler);
+		},
+	};
+	const dbHandles = (): number => {
+		try {
+			return readdirSync("/proc/self/fd").filter((fd) => {
+				try {
+					return readlinkSync(`/proc/self/fd/${fd}`).endsWith("legion.db");
+				} catch {
+					return false;
+				}
+			}).length;
+		} catch {
+			return -1; // not Linux
+		}
+	};
+	// The shape the SDK hands a handler whose ctx went stale mid-emit.
+	const staleCtx = {
+		get mode(): string {
+			throw new Error("stale extension ctx: the session was already disposed");
+		},
+		cwd,
+		hasUI: false,
+		ui: { notify() {}, setStatus() {} },
+	};
+
+	try {
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		for (const name of ENV_KEYS.slice(1)) delete process.env[name];
+		// A child session with an env identity: boot attach adopts this entry's own key.
+		process.env.PI_SUBAGENT_CHILD = "1";
+		process.env.PI_SUBAGENT_ALLOW_NESTED = "1";
+		process.env.PI_LEGION_DB = dbPath;
+		process.env.PI_LEGION_NODE_ID = "root";
+
+		piLegion(pi as never, { supervisor });
+		const before = dbHandles();
+		assert.ok(handlers.has("session_shutdown"), "the child registers a shutdown handler");
+
+		// Must not reject: every stale read is isolated (r5 G1 step 1).
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, staleCtx);
+
+		const after = dbHandles();
+		if (before >= 0) {
+			assert.ok(before >= 1, `boot attach adopted a ledger handle (saw ${before})`);
+			assert.equal(
+				after,
+				before - 1,
+				"the own ledger must be closed from the handler's finally even though ctx.mode threw",
+			);
+		}
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, undefined);
+		for (const [name, value] of previous) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+		rmSync(sandbox, { recursive: true, force: true });
+	}
+});
