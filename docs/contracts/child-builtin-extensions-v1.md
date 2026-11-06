@@ -62,8 +62,15 @@ replaceable builtin，顺序固定：
 1. 工厂必须**动态 import**，与现有 `createAgentSession` 等一起在
    `defaultSessionFactory` 内部解构；禁止模块顶层静态 import（保持现有的惰性加载）。
 2. 传 factory **不激活任何东西**：`builtin:` 路径（由 `collectChildExtensions` 决定）
-   才是开关。已实测：只给 factories、不给路径 → `extensions: []`。
+   才是加载开关。已实测：只给 factories、不给路径 → `extensions: []`。
    因此 D1 对当前行为零影响，唯一变化是 `builtin:codemode` 得以解析。
+
+   > r2 修正：**不要**把「mcp 没有路径所以不连」当成安全依据。
+   > 工厂一旦注册，名字就进入 `DefaultPackageManager` 的 builtin 表，
+   > discovery 打开时会为它合成一条**默认启用**的 `builtin:<name>`
+   > （`dist/core/package-manager.js:764-772` + `isEnabledByOverrides` 默认 true）。
+   > 真正的闸门是 `noExtensions: true`（D3）与「不触发 `session_start`」（D5）：
+   > 即使某天 `builtin:mcp` 被加载，MR1 也不会建立任何 MCP 连接。
 3. `mcp` 这一项也放进列表，但它**没有对应路径**，因此 MR1 不会连接任何 MCP server
    （MR2 只补一条路径即可）。若宿主装了注册 `/mcp` 的第三方扩展，`replaceable`
    语义与宿主一致，无需额外处理。
@@ -119,6 +126,35 @@ MR2 才做。
    `builtin:<name>`，`<name>` 必须 ∈ `CHILD_BUILTIN_EXTENSIONS`。
    只要有人再往路径里加 builtin 名而忘了 factory，这条就红。
 
+### D7 — 把「常量→factory」的接线做成可测的纯函数（r2）
+
+`src/supervisor/child-builtins.ts` 新增：
+
+```ts
+export type ChildBuiltinFactories = Record<(typeof CHILD_BUILTIN_EXTENSIONS)[number], unknown>;
+export function childBuiltinExtensionEntries(factories: ChildBuiltinFactories): Array<{
+  name: string; factory: unknown; builtin: true; replaceable: true;
+}>;
+```
+
+`defaultSessionFactory` **必须**用它生成 `extensionFactories`（唯一构造点）。
+
+新增 `test/integration/child-loader-builtins.test.ts`（仓库已有测试静态 import 宿主包的先例，
+`test/unit/supervisor.test.ts:7`）：
+
+1. `childBuiltinExtensionEntries` 返回 3 项，`name` 顺序 == `CHILD_BUILTIN_EXTENSIONS`，
+   每项 `builtin === true` / `replaceable === true`，且 `factory` 与传入的**同名**对象相等
+   （按名接线，不是按位置）。
+2. 用**真实** loader 验证注入生效：
+   `new DefaultResourceLoader({ cwd: tmp, agentDir: tmp, noExtensions: true,
+   additionalExtensionPaths: plan.additionalExtensionPaths,
+   extensionFactories: childBuiltinExtensionEntries(realThree) })` → `reload()` 后
+   `errors` 为空且已加载 `builtin:codemode`。
+3. 同一 loader 里**没有** `builtin:mcp` / `builtin:tool-search`（MR1 D4 不变量）。
+
+已知缺口（写进 §6，不掩盖）：`defaultSessionFactory` 里那一行调用本身仍不被机械覆盖；
+缓解是错误很响（删掉后会重新出现 `Unknown built-in extension: builtin:codemode`）。
+
 ---
 
 ## 3. 文件所有权
@@ -130,6 +166,7 @@ MR2 才做。
 | `src/runs/args.ts` | `pushToolArgs` 补同样三个名字 |
 | `test/unit/inprocess-supervisor.test.ts` | 更新既有断言 + D6 的 1、2 |
 | `test/unit/args.test.ts` | 更新既有断言 + D6 的 2、3 |
+| `test/integration/child-loader-builtins.test.ts` | 新建，D7 的三条断言 |
 | `test/unit/supervisor.test.ts` | 仅 `:301` 的 `--tools` 字面量断言 |
 | `test/integration/orchestrator.test.ts` | 仅 `:101` 的 `--tools` 字面量断言 |
 | `test/integration/vexillatio.test.ts` | 仅 `:397`、`:413` 的 `--tools` 字面量断言 |
@@ -192,3 +229,26 @@ npm run test:integration
    （utility 角色仍不得继承 `vexillatio`），只追加 legion 三名字。
 3. 若实施中发现**还有**写死旧白名单的断言，追加授权即可，不必再停 ——
    判据是「只改字面量、不改语义」。
+
+### r2（review 后）— 修正不变量措辞 + 给 D1 补门禁
+
+**来源**：fresh-context review 报 2 个 major（均为契约/注释层，非行为 bug）。
+
+**M1（注释里的不变量写错了）**：`inprocess-supervisor.ts` 与 `child-builtins.ts` 都写着
+「mcp 没有路径 ⇒ MR1 不连 MCP」。真实闸门是 `noExtensions: true` + 不触发 `session_start`；
+工厂注册会让名字进入 `DefaultPackageManager` 的 builtin 表，discovery 一开就会合成默认启用的
+`builtin:mcp`（`dist/core/package-manager.js:764-772`）。→ 已在该两处注释与 §D1.3 改正。
+
+**M2（codemode 那半没有机械门禁）**：D6.3 只断言「路径 ⊆ 常量」，从不观察注入点；
+删掉 `defaultSessionFactory` 里的 `extensionFactories` 后三条门禁全绿。
+→ 新增 §D7：抽出 `childBuiltinExtensionEntries()` 纯函数 + 真实 loader 集成测试。
+
+**minor 一并处理**：
+
+- `src/runs/args.ts` 注释「唯一保持同步的办法是只有一份实现」收窄为只描述 legion 三工具；
+  `vexillatio` 规则仍是两处拷贝（由 D6.2 parity 守住）。
+- CHANGELOG 允许使用 `### Fixed` 小节（不限于单条 bullet）。
+
+**已知缺口（不掩盖）**：`defaultSessionFactory` 里那一行 `childBuiltinExtensionEntries(...)` 调用
+本身不被任何测试覆盖。接受理由：错误在运行期非常响（重新出现
+`Unknown built-in extension: builtin:codemode`），且该函数现在是唯一的构造点。
