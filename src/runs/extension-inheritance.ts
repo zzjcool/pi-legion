@@ -59,6 +59,32 @@ export function childInheritsExtensions(
 	return true;
 }
 
+/** MCP kill-switch for children (`child-mcp-v1` D2). Mask only, never a whitelist. */
+export const CHILD_MCP_ENV = "PI_LEGION_CHILD_MCP";
+
+/** Spellings that turn MCP off. Everything else — including unset — leaves it on. */
+const MCP_OFF_VALUES = new Set(["0", "false", "off", "no", "none"]);
+
+/**
+ * Whether a child session loads the host's MCP servers (`child-mcp-v1` D2).
+ *
+ * Default TRUE, same polarity as {@link childInheritsExtensions}: a child starts
+ * from everything the parent has. The switch exists for COST, not for policy —
+ * every child that loads `builtin:mcp` opens its own connection per configured
+ * server (measured: 5 concurrent children × 1 server = 18 processes / 1121 MB) —
+ * so it is a single boolean mask rather than a per-role/per-server list. A list
+ * would be a half-built filter: a typo in a name silently drops a server instead
+ * of failing, and per-role lists are MR2b.
+ *
+ * `0`/`false`/`off`/`no`/`none` (case- and whitespace-insensitive) disable it;
+ * anything else — unset, `""`, `all`, `1` — enables it.
+ */
+export function childEnablesMcp(env: NodeJS.ProcessEnv = process.env): boolean {
+	const raw = env[CHILD_MCP_ENV]?.trim().toLowerCase();
+	if (raw === undefined || raw === "") return true;
+	return !MCP_OFF_VALUES.has(raw);
+}
+
 const execFileAsync = promisify(execFile);
 
 /**

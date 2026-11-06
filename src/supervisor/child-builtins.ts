@@ -9,10 +9,14 @@
  * `collectChildExtensions` is. It is not inert either: once a factory is
  * registered the name enters `DefaultPackageManager`'s builtin table, and
  * discovery synthesizes a **default-enabled** `builtin:<name>` for it
- * (`resource-loader.js:265-270` → `package-manager.js:766-772`). So "mcp has no
- * path yet" is NOT what keeps MCP out of MR1; the gates are `noExtensions: true`
- * (D3) and never triggering `session_start` (D5). Even if `builtin:mcp` were
- * loaded someday, nothing in MR1 opens an MCP connection.
+ * (`resource-loader.js:265-270` → `package-manager.js:766-772`).
+ *
+ * MR2 (`child-mcp-v1`) flipped the MCP half: `collectChildExtensions` now names
+ * `builtin:mcp` + `builtin:tool-search` for every child unless
+ * `PI_LEGION_CHILD_MCP=0`, and `defaultSessionFactory` binds the child session's
+ * extensions once so `session_start` actually fires — that handler is where MCP
+ * loads its config and starts connecting. Loading a path is therefore a real
+ * connection now, and the cost is per child (see README's child-MCP note).
  */
 export const CHILD_BUILTIN_EXTENSIONS = ["codemode", "tool-search", "mcp"] as const;
 

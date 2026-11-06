@@ -6,8 +6,11 @@ import * as path from "node:path";
 import type { AgentConfig } from "../../src/shared/types.ts";
 import {
 	BUILTIN_CODEMODE,
+	BUILTIN_MCP,
+	BUILTIN_TOOL_SEARCH,
 	SELF_EXTENSION_NAME,
 	buildPiArgs,
+	childEnablesMcp,
 	childGuardExtensionPath,
 	collectChildExtensions,
 	isBuiltinExtensionRef,
@@ -330,6 +333,76 @@ test("#89 no codemode tool → no auto builtin:codemode", () => {
 		const exts = argvFor(agent()).flatMap((a, i, args) => (a === "--extension" ? [args[i + 1]] : []));
 		assert.equal(exts.includes(BUILTIN_CODEMODE), false);
 	});
+});
+
+// ────────────── child-mcp-v1 D7.1 / D7.2 ──────────────
+
+test("D7.1 childEnablesMcp: default all, five spellings off, everything else on", () => {
+	// The table is the contract's (§D2): only an explicit mask turns MCP off.
+	const ON: Array<string | undefined> = [
+		undefined, // unset → the default
+		"", // empty string is not an opt-out
+		"all",
+		"1",
+		"true",
+		"on",
+		"yes",
+		"   ", // whitespace only
+		"whatever", // no name whitelist in v1
+		"MCP",
+	];
+	const OFF = ["0", "false", "off", "no", "none"];
+
+	for (const value of ON) {
+		const env = value === undefined ? {} : { PI_LEGION_CHILD_MCP: value };
+		assert.equal(childEnablesMcp(env), true, `PI_LEGION_CHILD_MCP=${JSON.stringify(value)} must enable MCP`);
+	}
+	for (const value of OFF) {
+		assert.equal(childEnablesMcp({ PI_LEGION_CHILD_MCP: value }), false, `"${value}" must disable MCP`);
+		// Case and surrounding whitespace are noise, not a different value: an
+		// operator who writes `OFF` in a shell profile means the same thing.
+		assert.equal(
+			childEnablesMcp({ PI_LEGION_CHILD_MCP: `  ${value.toUpperCase()}  ` }),
+			false,
+			`"  ${value.toUpperCase()}  " must disable MCP`,
+		);
+	}
+});
+
+test("D7.2 collectChildExtensions names builtin:mcp then builtin:tool-search, maskable", async () => {
+	// Empty fake host: the shape under test is ours, not "whatever this machine has".
+	const host = fakeHost([]);
+	const clean = { PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined };
+	try {
+		await withPrimedHost(host, { ...clean, PI_LEGION_CHILD_MCP: undefined }, async () => {
+			const exts = collectChildExtensions({ tools: ["read", "codemode"] });
+			assert.equal(exts.filter((e) => e === BUILTIN_MCP).length, 1, `one builtin:mcp in ${exts.join(",")}`);
+			assert.equal(
+				exts.filter((e) => e === BUILTIN_TOOL_SEARCH).length,
+				1,
+				`one ${BUILTIN_TOOL_SEARCH} in ${exts.join(",")}`,
+			);
+			// Fixed order, not merely presence: `tool-search` must load with (not
+			// before) `mcp`, and both after `codemode`.
+			const order = [BUILTIN_CODEMODE, BUILTIN_MCP, BUILTIN_TOOL_SEARCH].map((e) => exts.indexOf(e));
+			assert.ok(
+				order.every((idx) => idx >= 0) && order[0]! < order[1]! && order[1]! < order[2]!,
+				`fixed order codemode → mcp → tool-search, got ${exts.join(",")}`,
+			);
+			assert.equal(exts.at(-1), childGuardExtensionPath(), "the child-guard still closes the list");
+		});
+
+		await withPrimedHost(host, { ...clean, PI_LEGION_CHILD_MCP: "0" }, async () => {
+			const exts = collectChildExtensions({ tools: ["read", "codemode"] });
+			assert.equal(exts.includes(BUILTIN_MCP), false, `masked: ${exts.join(",")}`);
+			assert.equal(exts.includes(BUILTIN_TOOL_SEARCH), false, `masked: ${exts.join(",")}`);
+			// The mask is MCP-only: codemode and the guard are untouched.
+			assert.equal(exts.includes(BUILTIN_CODEMODE), true, "the codemode path is unaffected");
+			assert.equal(exts.at(-1), childGuardExtensionPath(), "the child-guard is unaffected");
+		});
+	} finally {
+		host.cleanup();
+	}
 });
 
 test("#123 modelProvider pins --provider next to --model", () => {

@@ -5,7 +5,14 @@
  * observes the injection point, so deleting `extensionFactories` from
  * `defaultSessionFactory` would leave every other gate green. This file watches a
  * real `DefaultResourceLoader` resolve the plan's paths against the real
- * factories, and pins the D4 invariant (no MCP path) at the same time.
+ * factories.
+ *
+ * The MCP invariant flipped in MR2 (`child-mcp-v1` D1): MR1 asserted "no MCP path
+ * reaches the loader"; the contract now injects `builtin:mcp` +
+ * `builtin:tool-search` for every child, with `PI_LEGION_CHILD_MCP=0` as the only
+ * mask. Loading a path is not yet a connection — that needs `session_start`,
+ * which the child session factory emits via `bindChildSessionExtensions`; this
+ * loader-only test deliberately stops short of it.
  *
  * Static import of the host SDK follows `test/unit/supervisor.test.ts:7`;
  * `src/supervisor/child-builtins.ts` itself stays SDK-free on purpose.
@@ -74,13 +81,15 @@ test("D7.1 entries follow the constant's order and wire factories by name", () =
 	}
 });
 
-test("D7.2 a real loader resolves builtin:codemode from the plan and loads nothing else", async () => {
+test("D7.2 a real loader resolves the plan's builtin paths; PI_LEGION_CHILD_MCP=0 masks MCP", async () => {
 	const root = mkdtempSync(path.join(tmpdir(), "legion-child-loader-"));
 	const previousInherit = process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
-	try {
-		// The plan's extension list must be this machine's-independent: with host
-		// inheritance on it is "whatever the host has", which is not what D7 measures.
-		process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = "0";
+	const previousMcp = process.env.PI_LEGION_CHILD_MCP;
+
+	/** Build the plan under one MCP setting and let a real loader resolve it. */
+	const load = async (mcp: string | undefined) => {
+		if (mcp === undefined) delete process.env.PI_LEGION_CHILD_MCP;
+		else process.env.PI_LEGION_CHILD_MCP = mcp;
 		resetExtensionDiscoveryCache();
 
 		const plan = buildInProcessSessionPlan({
@@ -100,7 +109,7 @@ test("D7.2 a real loader resolves builtin:codemode from the plan and loads nothi
 				// exactly as a real role card does.
 				tools: ["read", "codemode"],
 			},
-			sessionFile: path.join(root, "scout.jsonl"),
+			sessionFile: path.join(root, `scout${mcp === undefined ? "-on" : "-off"}.jsonl`),
 		});
 
 		const loader = new DefaultResourceLoader({
@@ -113,30 +122,54 @@ test("D7.2 a real loader resolves builtin:codemode from the plan and loads nothi
 		await loader.reload();
 
 		const { extensions = [], errors = [] } = loader.getExtensions();
-		const loaded = extensions.map((extension) => extension.path);
-
 		assert.deepEqual(
 			errors.map((error) => `${error.path}: ${error.error}`),
 			[],
 			"the loader must resolve every path the plan hands it",
 		);
-		assert.ok(
-			loaded.includes("builtin:codemode"),
-			`expected builtin:codemode to load, got ${loaded.join(", ")}`,
-		);
+		return { plan, loaded: extensions.map((extension) => extension.path) };
+	};
 
-		// D4: mcp / tool-search factories are registered, but no path names them, so
-		// the child loads neither — MR1 opens no MCP connection.
+	try {
+		// The plan's extension list must be this machine's-independent: with host
+		// inheritance on it is "whatever the host has", which is not what D7 measures.
+		process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = "0";
+
+		// D1 (child-mcp-v1): both builtins are named by default and load for real.
+		const on = await load(undefined);
+		assert.ok(
+			on.plan.additionalExtensionPaths.includes("builtin:mcp"),
+			`plan must name builtin:mcp, got ${on.plan.additionalExtensionPaths.join(", ")}`,
+		);
+		assert.ok(
+			on.plan.additionalExtensionPaths.includes("builtin:tool-search"),
+			`plan must name builtin:tool-search, got ${on.plan.additionalExtensionPaths.join(", ")}`,
+		);
+		for (const name of ["codemode", "mcp", "tool-search"]) {
+			assert.ok(
+				on.loaded.includes(`builtin:${name}`),
+				`expected builtin:${name} to load, got ${on.loaded.join(", ")}`,
+			);
+		}
+
+		// D2: the mask removes exactly the MCP half.
+		const off = await load("0");
+		assert.ok(
+			off.loaded.includes("builtin:codemode"),
+			`the codemode path is not MCP-gated, got ${off.loaded.join(", ")}`,
+		);
 		for (const name of ["mcp", "tool-search"]) {
 			assert.equal(
-				loaded.includes(`builtin:${name}`),
+				off.loaded.includes(`builtin:${name}`),
 				false,
-				`builtin:${name} must not load, got ${loaded.join(", ")}`,
+				`PI_LEGION_CHILD_MCP=0 must keep builtin:${name} out, got ${off.loaded.join(", ")}`,
 			);
 		}
 	} finally {
 		if (previousInherit === undefined) delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
 		else process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = previousInherit;
+		if (previousMcp === undefined) delete process.env.PI_LEGION_CHILD_MCP;
+		else process.env.PI_LEGION_CHILD_MCP = previousMcp;
 		resetExtensionDiscoveryCache();
 		rmSync(root, { recursive: true, force: true });
 	}

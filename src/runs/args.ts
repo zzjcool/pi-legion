@@ -14,7 +14,7 @@ import {
 	isThinkingLevel,
 } from "../shared/types.ts";
 import { formatChildTask } from "../extension/child-guard.ts";
-import { discoveredHostExtensions, inheritedExtensions, matchesExcludedExtension } from "./extension-inheritance.ts";
+import { childEnablesMcp, discoveredHostExtensions, inheritedExtensions, matchesExcludedExtension } from "./extension-inheritance.ts";
 
 /** Re-exported for callers that only need the level list. */
 export { THINKING_LEVELS };
@@ -185,8 +185,27 @@ export function childExtraExtensions(env: NodeJS.ProcessEnv = process.env): stri
  */
 export { childInheritsExtensions } from "./extension-inheritance.ts";
 
+/**
+ * Re-exported from `extension-inheritance.ts` for the same reason as
+ * `childInheritsExtensions`: that module owns "what a child loads", `args.ts` is
+ * the historical import site for the rpc argument builder and `legion-doctor`.
+ */
+export { childEnablesMcp };
+
 /** Light pi builtin that registers the `codemode` tool (`-e builtin:codemode`). */
 export const BUILTIN_CODEMODE = "builtin:codemode";
+
+/** Host builtin that starts the configured MCP servers (`-e builtin:mcp`). */
+export const BUILTIN_MCP = "builtin:mcp";
+
+/**
+ * Host builtin that registers `tool_search` (`-e builtin:tool-search`).
+ *
+ * Not optional next to {@link BUILTIN_MCP}: a non-`direct` exposure MCP tool is
+ * only declarable once `tool_search` is registered (`agent-session.js:1164-1171`),
+ * so loading MCP alone would leave the tools invisible to the model.
+ */
+export const BUILTIN_TOOL_SEARCH = "builtin:tool-search";
 
 /** True for `builtin:<name>` refs — must not be `path.resolve`d. */
 export function isBuiltinExtensionRef(ext: string): boolean {
@@ -215,10 +234,12 @@ export const SELF_EXTENSION_NAME = "pi-legion";
  *
  * Order is deliberate: inherited host extensions FIRST (they are ambient
  * capabilities the child would otherwise lose), then the role's own explicit
- * list, then `PI_LEGION_CHILD_EXTENSIONS`, then `builtin:codemode` (#89), and
- * finally the child-guard — which is unconditional and never subject to
- * `inheritExtensions` / `excludeExtensions`, because a child without it breaks
- * the prompt/format contract regardless of what the card asked for.
+ * list, then `PI_LEGION_CHILD_EXTENSIONS`, then `builtin:codemode` (#89), then
+ * `builtin:mcp` → `builtin:tool-search` (`child-mcp-v1` D1, masked by
+ * `PI_LEGION_CHILD_MCP`), and finally the child-guard — which is unconditional
+ * and never subject to `inheritExtensions` / `excludeExtensions`, because a child
+ * without it breaks the prompt/format contract regardless of what the card asked
+ * for.
  *
  * #280: the inherited set is computed by `inheritedExtensions` and is empty when
  * the card sets `inheritExtensions: false`; `excludeExtensions` subtracts from
@@ -256,6 +277,18 @@ export function collectChildExtensions(
 	// honest when discovery is disabled via `--no-extensions`.
 	if (roleListsCodemode(agent) && !list.some(isCodemodeExtension)) {
 		list.push(BUILTIN_CODEMODE);
+	}
+	// `child-mcp-v1` D1: both transports read their extension list from here, so
+	// this is the ONE place the MCP path is injected. Order is fixed — codemode →
+	// mcp → tool-search — and dedupe below leaves a card that names them itself at
+	// its own position (first-wins).
+	//
+	// A path alone is not enough for an in-process child: MCP connects inside the
+	// `session_start` handler, which only `bindExtensions` emits, so the child
+	// session factory binds once too (`supervisor/child-session.ts`). rpc / print /
+	// interactive children already bind, and now get the same path.
+	if (childEnablesMcp(env)) {
+		list.push(BUILTIN_MCP, BUILTIN_TOOL_SEARCH);
 	}
 	list.push(childGuardExtensionPath());
 	const seen = new Set<string>();

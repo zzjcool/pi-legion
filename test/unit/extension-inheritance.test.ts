@@ -26,7 +26,7 @@ import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { InMemoryUIProxy } from "../../src/supervisor/ui-proxy.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
-import { collectChildExtensions } from "../../src/runs/args.ts";
+import { collectChildExtensions, isBuiltinExtensionRef } from "../../src/runs/args.ts";
 import { spawnFailureHint } from "../../src/extension/spawn-hints.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 
@@ -637,6 +637,12 @@ test("A13: no non-file path ever reaches collectChildExtensions", async () => {
 			const list = collectChildExtensions(inheritingAgent());
 			assert.ok(list.length >= 2, "the inherited entry plus the child-guard at minimum");
 			const offenders = list.filter((entry) => {
+				// `child-mcp-v1` D1 injects `builtin:mcp` / `builtin:tool-search` into the
+				// same list. Those are loader-resolved NAMES, not paths on disk, so the
+				// "everything here must be an existing file" probe skips them — the
+				// assertion is about paths (A13's defect was a directory being passed as
+				// `--extension`), and narrowing it to file-shaped entries keeps that.
+				if (isBuiltinExtensionRef(entry)) return false;
 				try {
 					return !statSync(entry).isFile();
 				} catch {
