@@ -18,6 +18,7 @@ import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.t
 import {
 	isMailHeld,
 	MAIL_DELIVERY_CLAIM_LEASE_MS,
+	staleNoticeReason,
 } from "../legion/mail-release.ts";
 import type { LegionEventBus } from "./event-bus.ts";
 import { appendEvent } from "../legion/events.ts";
@@ -32,7 +33,6 @@ import {
 	formatMail,
 	renewDeliveryClaim,
 	inbox,
-	isStalePhaseTimeoutNotice,
 	mailReachedTurns,
 	pendingInbox,
 	releaseDeliveryClaim,
@@ -338,16 +338,24 @@ export class LegionPostman {
 	}
 
 	/**
-	 * #333: never hand a `Phase timeout:` notice to a recipient whose subject phase
-	 * is already over — that is a to-do item that expired before it could be read.
+	 * #333 + stall-notice-staleness D2/D3: never hand a notice whose subject is already
+	 * over to a recipient — that is a to-do item that expired before it could be read.
 	 * Applies to both inboxes this postman owns (children, and the root inbox when
 	 * this node is `root`), because a queued notice would otherwise be injected long
 	 * after the team converged.
+	 *
+	 * Two classes now, one predicate (`staleNoticeReason`, shared with the #384
+	 * preemption and its poll counter): a `Phase timeout:` whose phase moved on, and a
+	 * `Stall notice:` whose children have all ended. Each carries its own reason in the
+	 * `mail_bounced` event, so an operator can tell the two apart; the phase-timeout
+	 * reason is passed explicitly here and is byte-identical to the one the ledger used
+	 * to default to (#333's assertions must not move).
 	 */
 	private discardIfStaleNotice(message: LegionMessage): boolean {
-		if (!isStalePhaseTimeoutNotice(this.db, message)) return false;
+		const reason = staleNoticeReason(this.db, message);
+		if (reason === undefined) return false;
 		try {
-			transitionDelivery(this.db, message.id, MAIL_DELIVERY.OBSOLETE, this.now);
+			transitionDelivery(this.db, message.id, MAIL_DELIVERY.OBSOLETE, this.now, { reason });
 			this.emitMail(message.id, message.fromNode, "mail_bounced");
 		} catch {
 			// Leave it for the next tick rather than losing the mail silently.
@@ -1019,7 +1027,7 @@ export class LegionPostman {
 		}
 		this.markAbsentStallClocks(children, live);
 		if (announcements.length === 0) return;
-		const notice = formatStallNotice(announcements);
+		const notice = formatStallNotice(announcements, timestamp);
 		this.writeStallNotice(notice, timestamp);
 		// Counters move only after the row exists: a refused/failed write must leave the
 		// window unspent so the next tick can try again (same rule as `phase_timeout`).

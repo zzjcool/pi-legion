@@ -4,6 +4,12 @@
 > **本文件是 mailbox-delivery 的 D 编号命名空间**：实现代码与测试注释里的
 > `#322 Dn` 只解析到这里的 D1–D5。`docs/legion-v2-contract.md` 的 D 编号（D11 可视化、
 > D12 账本…#322 无关）不在本契约内。
+>
+> **修订（2026-11-06）**：可被自动作废的通知类别从 1 类（`Phase timeout:`）扩为 2 类
+> （+ `Stall notice: `，见 `docs/contracts/stall-notice-staleness-v1.md` D2/D3/D4）。
+> 谓词仍以 `kind === "notice"` 为前提；新增 reason `obsolete_after_child_end`，且该谓词同时被
+> postman、#384 `takePendingMail` 与轮询计数共享（计数只数「可释放」的行）。五态本身、
+> `formatMail` 信封与事件集合均不变（作废仍只发既有的 `mail_bounced`）。
 
 ## 背景
 
@@ -107,11 +113,20 @@ Urgency` 信封的那段）**完全相等**的字符串 → `DELIVERED`，写 `m
 root 行的 `session_file` 仍是 NULL —— 这些账本里发给 root 的邮件确认不了，会停在 `ACCEPTED`
 （状态不撒谎：没有证据就不升级）。
 
-### D4 — `OBSOLETE`：只对 `Phase timeout:` notice 生效（#333）
+### D4 — `OBSOLETE`：两类 `notice`（#333 + stall 时效性）
 
-**判据（冻结）**：`kind === "notice"` 且 `subject` 以 `Phase timeout:` 开头，而发件节点（= 团队根，
-`checkOwnPhaseTimeout` 报的是自己的相位）已经**离开**该 phase（`phase` 变了）或已是终态 → `OBSOLETE`，
-写 `mail_bounced` 事件 + `reason: "obsolete_after_phase_change"`（**不新增 event type**）。
+**判据（冻结）**：`kind === "notice"`，且命中以下两类之一 ——
+
+1. **`Phase timeout:`**（#333，本节下文全部细节都指这一类）：`subject` 以 `Phase timeout:` 开头，而
+   发件节点（= 团队根，`checkOwnPhaseTimeout` 报的是自己的相位）已经**离开**该 phase（`phase` 变了）
+   或已是终态 → `OBSOLETE`，`reason: "obsolete_after_phase_change"`。
+2. **`Stall notice: `**（`docs/contracts/stall-notice-staleness-v1.md` D2）：`subject` 以
+   `Stall notice: ` 开头，正文 `- <child>: ` 行点名的 child **全部**已结束（`hasEnded`）或不在这棵树里
+   → `OBSOLETE`，`reason: "obsolete_after_child_end"`。这一类**必须解析正文**（名字没有结构化字段可读）；
+   任一名字不可解析 / 非 canonical slug / 探测器节点缺失 ⇒ **不作废**（never guess）。
+
+两类都只写 `mail_bounced` 事件（**不新增 event type**）。第三类通知进入本判据必须走
+`legion-v2-contract.md` §15-4 的修订。
 
 - "该 phase" 取自产生这条通知的 `phase_timeout` 事件（`data.phase` / `data.phaseSince`），**不解析正文**：
   `phase` 不同、或 `phase_since` 不同（之后重新进入同一相位）都算离开。读不到那条事件 → 保持 `ACCEPTED`，绝不猜。

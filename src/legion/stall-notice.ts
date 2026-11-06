@@ -27,6 +27,15 @@
 
 import { DEFAULTS } from "../shared/types.ts";
 
+/**
+ * The one subject prefix a stall notice has, exported because the delivery side
+ * (`isStaleStallNotice`) has to recognise the row by the SAME literal the writer
+ * emits — two readers, one spelling, no drift.
+ *
+ * stall-notice-staleness D1.
+ */
+export const STALL_NOTICE_SUBJECT_PREFIX = "Stall notice: ";
+
 /** L1 announces at `1×` and `2×` the threshold, then stops (D6). */
 export const SILENCE_NOTICE_LIMIT = 2;
 /** L2 repeats once per radius, and at most three times per window (D6). */
@@ -249,8 +258,21 @@ export function formatStallDuration(ms: number): string {
  * the lines themselves carry the qualifier: an L1 line must say `steer cannot land
  * here; abort can` (the child is not inside a turn, so a steer only queues), and an
  * L2 line must NOT say that — a child that is running does reach a turn boundary.
+ *
+ * `detectedAt` is the DETECTION time (stall-notice-staleness D1), stamped on its own
+ * line right below the heading. The text below it is frozen at the tick that saw the
+ * fact, while delivery may happen minutes later (postman tick, or a `wait` preemption
+ * at the top of a turn), so a recipient needs to know how old the snapshot is before
+ * acting on `10m 1s, no tool in flight`. It arrives as an ARGUMENT and never from a
+ * clock here: this module stays pure (see the purity test).
+ *
+ * A non-finite value omits the line rather than printing `Invalid Date` — a caller
+ * without a usable clock still owes the parent the facts, just not a bogus time.
  */
-export function formatStallNotice(announcements: readonly StallAnnouncement[]): {
+export function formatStallNotice(
+	announcements: readonly StallAnnouncement[],
+	detectedAt: number,
+): {
 	readonly subject: string;
 	readonly body: string;
 } {
@@ -260,6 +282,16 @@ export function formatStallNotice(announcements: readonly StallAnnouncement[]): 
 	const sections: string[] = [
 		"Legion stall notice — nothing was stopped, steered or retired; these are facts for you to check.",
 	];
+	// The line starts with `Detected at `, never `- `, so the `- <child>: ` grammar the
+	// delivery side parses (D2) cannot mistake it for a child line.
+	//
+	// The range guard is not pedantry: `Number.isFinite` alone lets `Number.MAX_SAFE_INTEGER`
+	// through, and `toISOString()` throws `RangeError` past ±8.64e15 ms. A throw here would
+	// take the whole tick's notice with it (the caller catches and degrades), so a clock
+	// that is merely absurd must lose only the stamp line, never the facts.
+	if (Number.isFinite(detectedAt) && Math.abs(detectedAt) <= 8.64e15) {
+		sections.push(`Detected at ${new Date(detectedAt).toISOString()}.`);
+	}
 	if (silence.length > 0) {
 		sections.push(
 			["", "L1 silence (no tool in flight, no child event):", ...silence.map(silenceLine)].join("\n"),
@@ -272,10 +304,37 @@ export function formatStallNotice(announcements: readonly StallAnnouncement[]): 
 	}
 	return {
 		subject: announcements.length === 1
-			? `Stall notice: ${announcements[0]!.childName}`
-			: `Stall notice: ${announcements.length} children`,
+			? `${STALL_NOTICE_SUBJECT_PREFIX}${announcements[0]!.childName}`
+			: `${STALL_NOTICE_SUBJECT_PREFIX}${announcements.length} children`,
 		body: sections.join("\n"),
 	};
+}
+
+/**
+ * `- <name>: ` — the frozen line grammar {@link formatStallNotice} writes, and the
+ * ONLY parser of it (`stall-notice-staleness` D2).
+ *
+ * The name group is `\S+` (a slug never contains a space) and the trailing `: ` is
+ * what stops a body prose line like `- see the report` from ever being read as a
+ * child. Dedupe keeps a child named twice from checking the ledger twice.
+ */
+const STALL_NOTICE_CHILD_LINE = /^- (\S+): /gm;
+
+/**
+ * The child names a stall notice's body points at, in first-appearance order.
+ *
+ * Sharing this parser with the writer is the whole point: a second, looser reading
+ * of the same text would let the delivery side obsolete a notice the writer never
+ * meant (`never guess` — an unparseable body yields an empty list, which the
+ * predicate treats as "not stale").
+ */
+export function stallNoticeChildNames(body: string): string[] {
+	const names = new Set<string>();
+	for (const match of body.matchAll(STALL_NOTICE_CHILD_LINE)) {
+		const name = match[1];
+		if (name !== undefined) names.add(name);
+	}
+	return [...names];
 }
 
 /**

@@ -18,6 +18,7 @@ import { openLegionDb } from "../../src/legion/db.ts";
 import { DEFAULT_PHASE_MACHINE, type PhaseMachine } from "../../src/legion/phase-machine.ts";
 import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import { MAIL_DELIVERY, formatMail, inbox, pendingInbox, sendMail, transitionDelivery } from "../../src/legion/mail.ts";
+import { formatStallNotice } from "../../src/legion/stall-notice.ts";
 import { getNode, insertNode, listStaleNodes, updateNode } from "../../src/legion/nodes.ts";
 import { getUsage } from "../../src/legion/usage.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -666,6 +667,172 @@ test("an already-ACCEPTED phase-timeout notice is obsoleted once its phase moves
 		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
 	} finally {
 		db.close();
+	}
+});
+
+/**
+ * The row `writeStallNotice` writes (`legion-tools.ts` D4): self-addressed, `notice`,
+ * `action-needed`, `PENDING`, body in the frozen `- <child>: ` grammar.
+ *
+ * Reproduced here instead of calling the private writer because these tests are about
+ * the DELIVERY side: the notice must already exist, verbatim, before a tick starts.
+ * The body comes from the real `formatStallNotice`, so the predicate is fed the text
+ * production produces (including the D1 stamp).
+ */
+function queueStallNotice(
+	db: ReturnType<typeof openLegionDb>,
+	nodeId: string,
+	names: readonly string[],
+	createdAt: number,
+): number {
+	const { subject, body } = formatStallNotice(
+		names.map((childName) => ({
+			kind: "long-running" as const,
+			childName,
+			sinceBucket: createdAt,
+			sequence: 1,
+			elapsedMs: 600_000,
+			thresholdMs: 600_000,
+		})),
+		createdAt,
+	);
+	const inserted = db
+		.prepare(
+			`INSERT INTO messages (
+				from_node, to_node, subject, body, kind, urgency, delivered, created_at
+			) VALUES (?, ?, ?, ?, 'notice', 'action-needed', ?, ?)`,
+		)
+		.run(nodeId, nodeId, subject, body, MAIL_DELIVERY.PENDING, createdAt);
+	return Number(inserted.lastInsertRowid);
+}
+
+// ───── stall-notice-staleness D2: delivery must judge the notice alive first ─────
+
+test("§6.2 a stall notice whose child already ended is obsoleted, never injected", async () => {
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const rootMessages: string[] = [];
+	const now = 5_001;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const child = insertNode(db, { parentId: "root", name: "worker", role: "worker", status: "running" }, () => 1);
+		const messageId = queueStallNotice(db, "root", ["worker"], 1_000);
+		assert.equal(pendingInbox(db, "root").length, 1, "precondition: the notice is queued for root");
+		// The 2026-11-06 observation: the detector saw `worker` running past its radius,
+		// the mail sat in the inbox, and by delivery time the child had returned.
+		updateNode(db, child.id, { status: "retired" }, () => 2);
+		const postman = new LegionPostman({ db, nodeId: "root", supervisor, now: () => now, sendRootMessage: (message) => rootMessages.push(message), intervalMs: 10_000 });
+		await postman.tick();
+		// Idempotency: a second pass must neither re-inject nor duplicate the verdict.
+		await postman.tick();
+		postman.stop();
+
+		assert.deepEqual(rootMessages, [], "a notice about a child that is gone must not reach the parent at all");
+		assert.equal(pendingInbox(db, "root").length, 0);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 1);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
+		const bounced = readEventsAfter(db, 0).filter((event) => event.type === "mail_bounced");
+		assert.equal(bounced.length, 1, "the verdict is written once, not once per tick");
+		assert.deepEqual(bounced[0]!.data, { messageId, toNode: "root", reason: "obsolete_after_child_end" });
+	} finally {
+		db.close();
+	}
+});
+
+test("§6.3 positive control: a stall notice about a RUNNING child is delivered unchanged", async () => {
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const rootMessages: string[] = [];
+	const now = 5_001;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		insertNode(db, { parentId: "root", name: "worker", role: "worker", status: "running" }, () => 1);
+		queueStallNotice(db, "root", ["worker"], 1_000);
+		const postman = new LegionPostman({ db, nodeId: "root", supervisor, now: () => now, sendRootMessage: (message) => rootMessages.push(message), intervalMs: 10_000 });
+		await postman.tick();
+		postman.stop();
+
+		assert.equal(rootMessages.length, 1, "the same fixture with a live child still reaches the parent");
+		assert.match(rootMessages[0]!, /Stall notice: worker/);
+		assert.match(rootMessages[0]!, /- worker: running for 10m 0s/);
+		assert.match(rootMessages[0]!, /Detected at 1970-01-01T00:00:01\.000Z\./, "D1: the delivered text carries its own age");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 0);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_bounced").length, 0);
+	} finally {
+		db.close();
+	}
+});
+
+test("§6.6 ACCEPTED side: confirmAcceptedMail obsoletes an already-accepted stall notice", async () => {
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	const rootMessages: string[] = [];
+	const now = 5_001;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+		const child = insertNode(db, { parentId: "root", name: "worker", role: "worker", status: "running" }, () => 1);
+		const messageId = queueStallNotice(db, "root", ["worker"], 1_000);
+		// The notice was handed over while `worker` was still running…
+		transitionDelivery(db, messageId, MAIL_DELIVERY.ACCEPTED, () => 1_000);
+		// …and only afterwards did the child return.
+		updateNode(db, child.id, { status: "retired" }, () => 2);
+		const postman = new LegionPostman({ db, nodeId: "root", supervisor, now: () => now, sendRootMessage: (message) => rootMessages.push(message), intervalMs: 10_000 });
+		await postman.tick();
+		postman.stop();
+
+		assert.deepEqual(rootMessages, [], "confirmation never re-injects, it only relabels");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 1);
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
+		const bounced = readEventsAfter(db, 0).filter((event) => event.type === "mail_bounced");
+		assert.equal(bounced.length, 1);
+		assert.deepEqual(bounced[0]!.data, { messageId, toNode: "root", reason: "obsolete_after_child_end" });
+	} finally {
+		db.close();
+	}
+});
+
+test("§6.6 delivered-wins arm: a stale-but-CONSUMED stall notice is DELIVERED, never obsoleted", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-stall-delivered-"));
+	const db = openLegionDb(":memory:");
+	const supervisor = new FakeSupervisor();
+	mkdirSync(rootDir, { recursive: true });
+	const rootSession = path.join(rootDir, "root.jsonl");
+	const now = 5_001;
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running", sessionFile: rootSession }, () => 1);
+		const child = insertNode(db, { parentId: "root", name: "worker", role: "worker", status: "running" }, () => 1);
+		const messageId = queueStallNotice(db, "root", ["worker"], 1_000);
+		const notice = pendingInbox(db, "root")[0]!;
+		// The notice was handed over while `worker` was still running, and the recipient's
+		// session proves it read the text: the user turn is byte-for-byte the envelope
+		// `formatMail` injects (the frozen #322 criterion, not a substring).
+		transitionDelivery(db, messageId, MAIL_DELIVERY.ACCEPTED, () => 1_000);
+		writeFileSync(rootSession, userSession([formatMail(notice)]));
+		// Only afterwards did the child return: the row IS stale by D2, yet the ledger can
+		// prove it was consumed. A confirmation pass that asks "is it stale?" before "was it
+		// read?" would relabel a mail the parent already acted on as OBSOLETE and bounce it
+		// — the "delivered wins over obsolete" rule (mailbox-delivery-v1) must hold for the
+		// ACCEPTED path too, not just for the DELIVERED one.
+		updateNode(db, child.id, { status: "retired" }, () => 2);
+		const rootMessages: string[] = [];
+		const postman = new LegionPostman({ db, nodeId: "root", supervisor, now: () => now, sendRootMessage: (message) => rootMessages.push(message), intervalMs: 10_000 });
+		await postman.tick();
+		// Idempotency: a second pass must not rewrite the verdict either.
+		await postman.tick();
+		postman.stop();
+
+		assert.deepEqual(rootMessages, [], "a consumed notice is never re-injected");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.DELIVERED }).length, 1, "evidence of a read beats an obsolete verdict");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 0, "the notice is not discarded as stale");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0);
+		assert.equal(readEventsAfter(db, 0).filter((event) => event.type === "mail_bounced").length, 0, "no obsolete verdict, so no bounce");
+		const delivered = readEventsAfter(db, 0).filter((event) => event.type === "mail_delivered");
+		assert.equal(delivered.length, 1, "two ticks write exactly one mail_delivered event");
+		assert.equal((delivered[0]!.data as { messageId?: number }).messageId, messageId);
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
 	}
 });
 

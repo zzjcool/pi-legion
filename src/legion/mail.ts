@@ -1,7 +1,17 @@
 import type { DatabaseSync, SqliteRow } from "./db.ts";
 import { withTransaction } from "./db.ts";
 import { appendEvent } from "./events.ts";
-import { getNode, getSubtree, hasEnded, isTerminalNode, sanitizeNodeSlug, type LegionNode } from "./nodes.ts";
+import {
+	getChildByName,
+	getNode,
+	getSubtree,
+	hasEnded,
+	isTerminalNode,
+	isValidNodeSlug,
+	sanitizeNodeSlug,
+	type LegionNode,
+} from "./nodes.ts";
+import { STALL_NOTICE_SUBJECT_PREFIX, stallNoticeChildNames } from "./stall-notice.ts";
 import type { TurnRecord } from "../shared/types.ts";
 
 /**
@@ -48,6 +58,12 @@ export const MAIL_BOUNCE_REASON = {
 	INTERCEPTED_BY_INPUT_HANDLER: "intercepted_by_input_handler",
 	/** #333: a `Phase timeout:` notice whose phase was already over when it landed. */
 	OBSOLETE_AFTER_PHASE_CHANGE: "obsolete_after_phase_change",
+	/**
+	 * stall-notice-staleness D4: a `Stall notice:` whose children had ALL ended by the
+	 * time it was about to be delivered. Kept distinct from the phase-change reason
+	 * because the two say different things about why nobody needs the text anymore.
+	 */
+	OBSOLETE_AFTER_CHILD_END: "obsolete_after_child_end",
 } as const;
 export type MailBounceReason = (typeof MAIL_BOUNCE_REASON)[keyof typeof MAIL_BOUNCE_REASON];
 
@@ -683,6 +699,56 @@ export function isStalePhaseTimeoutNotice(db: DatabaseSync, message: LegionMessa
 	if (timedOut.phase !== phase) return true;
 	const phaseSince = typeof data.phaseSince === "number" ? data.phaseSince : null;
 	return phaseSince !== null && timedOut.phaseSince !== phaseSince;
+}
+
+/**
+ * stall-notice-staleness D2: is this a `Stall notice:` about children that have ALL
+ * ended since the detector saw them?
+ *
+ * The stall notice is a snapshot taken at a detection tick (`elapsedMs`, "no tool in
+ * flight") and delivered whenever its route gets to it — the postman's 2s tick, or a
+ * blocked `wait` taking it out of the inbox. By then every child it names may have
+ * long returned, and a to-do about work that is already finished is worse than no
+ * mail at all: it spends the parent's attention on a fact that no longer exists.
+ *
+ * Every `false` arm below is a deliberate refusal to guess:
+ *
+ * - not a notice / not a stall subject ⇒ not ours (`kind` is the same gate the
+ *   phase-timeout rule uses; every other kind is a human judgement call);
+ * - zero parseable names ⇒ nothing to judge (the body is not the frozen shape);
+ * - a name that is not a legal slug ⇒ the body carries something this parser does
+ *   not own (`stallNoticeChildNames` is the single reader of the line grammar);
+ * - the detector node is gone ⇒ there is no parent to ask "who is `<name>`?" of, so
+ *   every `getChildByName` answer would be a null that means "unknown", not "ended".
+ *   A missing node is the one case where a null child must NOT read as ended.
+ *
+ * `hasEnded`, not `isTerminalNode` (#354): a team that only investigated ends
+ * `settled`/`retired` while its phase is untouched, and that team is just as unable
+ * to act on a stall reminder as a failed one.
+ *
+ * A child that is MISSING from the tree counts as ended: the notice names a node that
+ * no longer exists, so there is nothing for the recipient to steer or abort either.
+ */
+export function isStaleStallNotice(db: DatabaseSync, message: LegionMessage): boolean {
+	if (message.kind !== "notice") return false;
+	if (!message.subject.startsWith(STALL_NOTICE_SUBJECT_PREFIX)) return false;
+	const names = stallNoticeChildNames(message.body);
+	if (names.length === 0) return false;
+	// "Every `- ` line is a name the parser owns": a body with a `- ` line the frozen
+	// grammar cannot read is not the writer's body, so the names we did parse say
+	// nothing about the ones we did not (a dropped line could be the only live child).
+	const dashLines = message.body.split("\n").filter((line) => line.startsWith("- ")).length;
+	if (dashLines !== names.length) return false;
+	// A canonical slug only. `sanitizeNodeSlug` maps `agent-` to `agent`, so a name that
+	// is not its own sanitized form would look up a DIFFERENT child than the one written
+	// (`isValidNodeSlug` alone accepts the trailing separator). The writer always emits
+	// canonical names, so this arm refuses only bodies that did not come from it.
+	if (!names.every((name) => isValidNodeSlug(name) && sanitizeNodeSlug(name) === name)) return false;
+	if (!getNode(db, message.fromNode)) return false;
+	return names.every((name) => {
+		const child = getChildByName(db, message.fromNode, name);
+		return child === null || hasEnded(child);
+	});
 }
 
 export interface MailboxStats {

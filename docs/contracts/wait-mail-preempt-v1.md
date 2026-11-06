@@ -19,7 +19,12 @@
 ## §1 触发条件
 
 - 调用者是 legion 节点（工具入口的 `input.legion` 存在），且该节点的 inbox 里存在
-  `delivery = PENDING` 的邮件。
+  **可释放**的 `delivery = PENDING` 邮件。
+  修订（2026-11-06，`stall-notice-staleness-v1.md` D3）：轮询与 `takePendingMail` 共享同一个
+  `staleNoticeReason` 谓词——postman 在投递前就会作废的 stale notice（过期的 `Phase timeout:` /
+  `Stall notice:`）**不算**触发条件。否则轮询会把阻塞中的 `wait`/`collect` 唤醒，而 take 随即把
+  那封作废并返回空列表，调用方会落到普通渲染分支、把这次空返误报成
+  `interrupted (parent turn ended; children still running)`。
 - 进入 `wait` / `collect` 时**先查一次**；之后每 **250ms** 查一次，直到这次调用结束。
 - 与 `signal`（调用方中断）互不覆盖：谁先到谁赢。
 

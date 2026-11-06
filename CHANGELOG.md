@@ -33,6 +33,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   （按条计一次、只算仍可交付的，只计数不发送）。`pi-legion/api` 的 `SessionRuntime`
   消费者需要跟着改；仓内零生产消费者，只有单测读它。
 
+- **stall 通知自带检测时刻，并在投递前判活**（`docs/contracts/stall-notice-staleness-v1.md`）。
+  以前 `Stall notice:` 的正文只有 `elapsedMs` 快照、没有时刻，而它对投递路径没有任何
+  「已失效」规则（只有 `Phase timeout:` 有）——于是 10m 阈值刚过时检测到的通知，可能在 child
+  早已返回报告很久以后才经 postman 或 #384 抢占送达，读信的人无法判断这份事实有多旧。现在：
+  (1) 正文首行之下固定一行 `Detected at <ISO>.`（`detectedAt` 由 tick 传入，模块仍不读时钟，
+  非有限数则省略该行）；(2) 新增纯谓词 `isStaleStallNotice`：`Stall notice:` 通知点名的 child
+  **全部**已结束（`hasEnded`，含 `settled`/`retired`）⇒ 在发送/确认前转 `OBSOLETE`，
+  `mail_bounced` 的 `reason` 为新的 `obsolete_after_child_end`；(3) 该谓词由 postman 三条投递/
+  确认路径、#384 `takePendingMail` 与 250ms 轮询计数**共享**（计数改「可释放」口径：take 不会
+  交出东西就不唤醒阻塞的 `wait`/`collect`，否则会出现空返 + 误报 `interrupted`）；正文无可解析
+  名字 / 名字非法 slug / 探测器节点不存在时一律**照常送达**（never guess）。不改投递节奏、不改
+  `formatMail` 信封、不改 schema，作废只发既有的 `mail_bounced`。
+
 ## [5.4.0] — 2026-11-06
 
 一次「把子 agent 的工具面还回去」的发布。默认后端（in-process）的子会话以前**悄悄**少了三样东西：

@@ -33,17 +33,19 @@ import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { readEventsAfter } from "../../src/legion/events.ts";
-import { MAIL_DELIVERY, inbox, sendMail } from "../../src/legion/mail.ts";
+import { MAIL_DELIVERY, inbox, isStaleStallNotice, sendMail, type LegionMessage } from "../../src/legion/mail.ts";
 import { getChildren, getNode, insertNode, updateNode } from "../../src/legion/nodes.ts";
 import {
 	DEFAULT_LOOP_NOTICE_MS,
 	LONG_RUNNING_NOTICE_LIMIT,
 	SILENCE_NOTICE_LIMIT,
+	STALL_NOTICE_SUBJECT_PREFIX,
 	decideStallNotice,
 	formatStallDuration,
 	formatStallNotice,
 	isActiveStallThreshold,
 	resolveLoopRadiusMs,
+	stallNoticeChildNames,
 	type StallAnnouncement,
 	type StallChildFacts,
 	type StallLineState,
@@ -269,6 +271,27 @@ test("L1 wins over L2 for the same child in the same tick (one line per child)",
 
 // ───────────────────────────── 2. pure text ─────────────────────────────
 
+/**
+ * A frozen tick reading for the D1 stamp: `2025-10-09T08:53:20.123Z`.
+ *
+ * Fixed on purpose — `formatStallNotice` takes the detection clock as an argument, so
+ * the text is reproducible and the purity test below stays honest.
+ */
+const DETECTED_AT = 1_760_000_000_123;
+
+/** An announcement shape the predicate tests can reuse without spelling every field. */
+function silenceAnnouncement(childName: string, overrides: Partial<StallAnnouncement> = {}): StallAnnouncement {
+	return {
+		kind: "silence",
+		childName,
+		sinceBucket: 0,
+		sequence: 1,
+		elapsedMs: 125_000,
+		thresholdMs: 120_000,
+		...overrides,
+	};
+}
+
 test("L1 text carries the frozen qualifier: steer cannot land, abort can (D3)", () => {
 	const announcement: StallAnnouncement = {
 		kind: "silence",
@@ -278,11 +301,37 @@ test("L1 text carries the frozen qualifier: steer cannot land, abort can (D3)", 
 		elapsedMs: 125_000,
 		thresholdMs: 120_000,
 	};
-	const { subject, body } = formatStallNotice([announcement]);
+	const { subject, body } = formatStallNotice([announcement], DETECTED_AT);
 	assert.equal(subject, "Stall notice: root.worker");
 	assert.match(body, /steer cannot land here; abort can/);
 	assert.match(body, /no event for 2m 5s/);
 	assert.match(body, /threshold 2m 0s/);
+});
+
+test("D1: the body stamps the tick that detected it, so a late delivery is self-evident", () => {
+	const { subject, body } = formatStallNotice([silenceAnnouncement("worker")], DETECTED_AT);
+	const stamp = `Detected at ${new Date(DETECTED_AT).toISOString()}.`;
+	assert.equal(subject, `${STALL_NOTICE_SUBJECT_PREFIX}worker`);
+	// Exactly where the contract puts it: the line right after the heading, before any
+	// section — a reader hits the age of the snapshot before the snapshot itself.
+	assert.deepEqual(body.split("\n").slice(0, 2), [
+		"Legion stall notice — nothing was stopped, steered or retired; these are facts for you to check.",
+		stamp,
+	]);
+	assert.equal(body.match(/Detected at /g)?.length, 1, "one stamp per mail, not one per line");
+	// It is not a child line, so the D2 parser cannot mistake it for one.
+	assert.equal(stamp.startsWith("- "), false);
+	assert.deepEqual(stallNoticeChildNames(body), ["worker"]);
+});
+
+test("D1: an unusable detection clock omits the line instead of printing `Invalid Date`", () => {
+	for (const detectedAt of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+		const { body } = formatStallNotice([silenceAnnouncement("worker")], detectedAt);
+		assert.doesNotMatch(body, /Detected at/, `detectedAt=${detectedAt} must not be stamped`);
+		assert.doesNotMatch(body, /Invalid Date/);
+		// The facts are still owed to the parent: only the stamp is dropped.
+		assert.match(body, /- worker: no event for 2m 5s/);
+	}
 });
 
 test("L2 text does NOT tell the parent that steer is useless (D3)", () => {
@@ -297,7 +346,7 @@ test("L2 text does NOT tell the parent that steer is useless (D3)", () => {
 			inFlightTool: "bash",
 			inFlightMs: 38 * MINUTE,
 		},
-	]);
+	], DETECTED_AT);
 	assert.doesNotMatch(body, /steer cannot land/);
 	assert.match(body, /inside `bash` for 38m 0s/, "the stack is evidence, spelled out as one");
 	assert.match(body, /running for 46m 0s/);
@@ -314,7 +363,7 @@ test("many children in one tick merge into ONE mail with one line each (D7)", ()
 		{ kind: "silence", childName: "root.a", sinceBucket: 0, sequence: 1, elapsedMs: 130_000, thresholdMs: 120_000 },
 		{ kind: "silence", childName: "root.b", sinceBucket: 0, sequence: 1, elapsedMs: 140_000, thresholdMs: 120_000 },
 		{ kind: "long-running", childName: "root.c", sinceBucket: 0, sequence: 1, elapsedMs: 46 * MINUTE, thresholdMs: 45 * MINUTE },
-	]);
+	], DETECTED_AT);
 	assert.equal(merged.subject, "Stall notice: 3 children");
 	const lines = merged.body.split("\n").filter((line) => line.startsWith("- "));
 	assert.deepEqual(
@@ -324,6 +373,9 @@ test("many children in one tick merge into ONE mail with one line each (D7)", ()
 	);
 	assert.equal(merged.body.match(/L1 silence/g)?.length, 1, "the section heading is not repeated per child");
 	assert.equal(merged.body.match(/L2 long-running/g)?.length, 1);
+	// D2: the delivery-side parser reads the same three names out of the same text,
+	// and the `Detected at` stamp above them does not become a fourth.
+	assert.deepEqual(stallNoticeChildNames(merged.body), ["root.a", "root.b", "root.c"]);
 });
 
 test("formatStallDuration never renders an unusable clock as a stall", () => {
@@ -572,6 +624,17 @@ test("postman L1: one self-addressed notice row, kind=notice, urgency=action-nee
 		assert.equal(notice.kind, "notice");
 		assert.equal(notice.urgency, "action-needed");
 		assert.match(notice.body, /steer cannot land here; abort can/);
+		// D1 WIRING, not just D1 text: the row's stamp must be THIS tick's clock reading
+		// (`checkStallNotices(timestamp)` → `formatStallNotice(announcements, timestamp)`),
+		// spelled out to the millisecond. The pure-text tests above cannot see a caller
+		// that passes `0` (or any other number) instead of the timestamp, and that
+		// mutation is the one that matters: a notice stamped with a wrong time is the
+		// "delivered late, looks fresh" defect this contract removes. The expected ISO
+		// string is `new Date(TICK_AT)`, never `new Date(0)` and never a fresh reading.
+		assert.ok(
+			notice.body.includes(`Detected at ${new Date(TICK_AT).toISOString()}.`),
+			`the mailbox row is stamped with the tick that detected it, not with \`0\`: ${notice.body}`,
+		);
 		assert.equal(readEventsAfter(fx.db, 0).length, before, "D9: the notice writes NO events row");
 		// D4 path 2: the root postman reads its OWN inbox, so the fact reaches the
 		// session in the same tick it was written.
@@ -1235,4 +1298,173 @@ test("extend through `subagent({action:'extend'})`: receipt, unknown name, ended
 		db?.close();
 		await harness.cleanup();
 	}
+});
+
+// ────── 13. stall-notice-staleness D2: the delivery-side liveness predicate ──────
+
+/**
+ * The predicate's home is `mail.ts`, but its facts are all stall-notice facts — the
+ * body it parses is the one `formatStallNotice` just wrote — so the §6.4/§6.5 cases
+ * live next to that grammar.
+ *
+ * `isStaleStallNotice` reads exactly five fields off a message (kind, subject, body,
+ * fromNode, plus the tree), so the fixture is a plain object: no `messages` row, no
+ * clock, no postman. The integration of the verdict into the four delivery paths is
+ * `legion-tools.test.ts` / `wait-mail-preempt.test.ts`.
+ */
+function staleProbe(overrides: Partial<LegionMessage> = {}): LegionMessage {
+	return {
+		id: 1,
+		fromNode: "root",
+		toNode: "root",
+		subject: `${STALL_NOTICE_SUBJECT_PREFIX}alpha`,
+		body: `Legion stall notice — nothing was stopped, steered or retired; these are facts for you to check.\nDetected at ${new Date(DETECTED_AT).toISOString()}.\n\nL1 silence (no tool in flight, no child event):\n- alpha: no event for 2m 5s with nothing in flight (threshold 2m 0s).`,
+		kind: "notice",
+		urgency: "action-needed",
+		delivered: MAIL_DELIVERY.PENDING,
+		deliveredAt: null,
+		createdAt: DETECTED_AT,
+		...overrides,
+	};
+}
+
+/** `root` plus the named children at their birth phase, all still running. */
+function stallTree(names: readonly string[], status: "running" | "retired" = "running") {
+	const db = openLegionDb(":memory:");
+	insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 1);
+	for (const name of names) {
+		insertNode(db, { parentId: "root", name, role: "worker", status }, () => 1);
+	}
+	return db;
+}
+
+test("§6.4 merged notice: every named child has ended ⇒ stale; one still running ⇒ delivered", () => {
+	const db = stallTree(["alpha", "beta", "gamma"]);
+	try {
+		const merged = formatStallNotice(
+			[silenceAnnouncement("alpha"), silenceAnnouncement("beta"), silenceAnnouncement("gamma", { kind: "long-running" })],
+			DETECTED_AT,
+		);
+		const message = staleProbe({ subject: merged.subject, body: merged.body });
+		assert.equal(isStaleStallNotice(db, message), false, "three running children: nothing is stale");
+
+		for (const name of ["alpha", "beta"]) {
+			const child = getChildren(db, "root").find((node) => node.name === name);
+			assert.ok(child);
+			updateNode(db, child.id, { status: "retired" }, () => 2);
+		}
+		assert.equal(isStaleStallNotice(db, message), false, "two of three ended is NOT stale");
+
+		const last = getChildren(db, "root").find((node) => node.name === "gamma");
+		assert.ok(last);
+		updateNode(db, last.id, { status: "retired" }, () => 3);
+		assert.equal(isStaleStallNotice(db, message), true, "all three ended ⇒ the notice describes nothing left to act on");
+		assert.match(message.body, /- gamma: /, "the fixture really names that child in its own text");
+	} finally {
+		db.close();
+	}
+});
+
+test("§6.4/§6.5 mixed: one live child in a merged notice keeps the whole mail deliverable", () => {
+	const db = stallTree(["alpha", "beta", "gamma"]);
+	try {
+		const merged = formatStallNotice([silenceAnnouncement("alpha"), silenceAnnouncement("beta"), silenceAnnouncement("gamma")], DETECTED_AT);
+		const message = staleProbe({ subject: merged.subject, body: merged.body });
+		for (const name of ["alpha", "beta"]) {
+			const child = getChildren(db, "root").find((node) => node.name === name);
+			assert.ok(child);
+			updateNode(db, child.id, { status: "retired" }, () => 2);
+		}
+		assert.equal(isStaleStallNotice(db, message), false, "`beta` is still running ⇒ still actionable");
+		assert.match(message.body, /- beta: /, "the delivered text still names the live child (never edited at delivery)");
+	} finally {
+		db.close();
+	}
+});
+
+test("§6.5 never guess: an unparseable body, an illegal slug, or a missing detector ⇒ deliver it", () => {
+	const db = stallTree(["alpha"]);
+	try {
+		const child = getChildren(db, "root").find((node) => node.name === "alpha");
+		assert.ok(child);
+		updateNode(db, child.id, { status: "retired" }, () => 2);
+
+		assert.equal(
+			isStaleStallNotice(db, staleProbe({ body: "the notice body was rewritten by a human" })),
+			false,
+			"zero parseable names: there is nothing to judge, so nothing is obsoleted",
+		);
+		assert.equal(
+			isStaleStallNotice(db, staleProbe({
+				body: "L1 silence:\n- Not_A_Slug!: no event for 2m 5s",
+			})),
+			false,
+			"a name outside the slug grammar is not a node id this code may look up",
+		);
+		assert.equal(
+			isStaleStallNotice(db, staleProbe({ fromNode: "root.gone-team" })),
+			false,
+			"an unknown detector turns every `getChildByName` null into `unknown`, never into `ended`",
+		);
+		assert.equal(
+			isStaleStallNotice(db, staleProbe({ kind: "report" })),
+			false,
+			"only a `notice` is a machine fact; a report about an ended child is still history",
+		);
+		assert.equal(
+			isStaleStallNotice(db, staleProbe({ subject: "Something else: alpha" })),
+			false,
+			"the subject prefix is the whole gate",
+		);
+		// Positive control for the same fixture: the one shape that IS stale.
+		assert.equal(isStaleStallNotice(db, staleProbe()), true);
+	} finally {
+		db.close();
+	}
+});
+
+test("D2: a named child that is GONE from the tree counts as ended (nothing left to steer)", () => {
+	const db = stallTree(["alpha"]);
+	try {
+		assert.equal(
+			isStaleStallNotice(db, staleProbe({
+				subject: `${STALL_NOTICE_SUBJECT_PREFIX}deleted`,
+				body: "L1 silence:\n- deleted: no event for 2m 5s",
+			})),
+			true,
+			"the detector node exists and the named child does not: there is nobody to act on",
+		);
+	} finally {
+		db.close();
+	}
+});
+
+test("D2: `settled` and `retired` count as ended, an ended phase is not required (#354)", () => {
+	const db = stallTree(["alpha"]);
+	try {
+		const child = getChildren(db, "root").find((node) => node.name === "alpha");
+		assert.ok(child);
+		// A team that only investigated: it never called `legion_phase`, so its phase is
+		// still its birth phase — exactly the case `isTerminalNode` cannot see.
+		updateNode(db, child.id, { status: "settled" }, () => 2);
+		assert.equal(getNode(db, child.id)?.phase, null);
+		assert.equal(isStaleStallNotice(db, staleProbe()), true);
+	} finally {
+		db.close();
+	}
+});
+
+test("D2: the child-name parser reads only the frozen `- <child>: ` line grammar", () => {
+	assert.deepEqual(stallNoticeChildNames(""), []);
+	assert.deepEqual(stallNoticeChildNames("no lines at all"), []);
+	assert.deepEqual(
+		stallNoticeChildNames("Heading:\n- alpha: one\n- beta: two\n- alpha: again"),
+		["alpha", "beta"],
+		"deduped, first-appearance order",
+	);
+	assert.deepEqual(
+		stallNoticeChildNames(`Detected at 2025-10-09T08:53:20.123Z.\n- see the report\n- alpha: real line`),
+		["alpha"],
+		"the stamp and a prose bullet are not children",
+	);
 });

@@ -3,6 +3,12 @@
 > 实现期发现矛盾 → 停下报告，不得重新解释本契约。
 > **本文件是该特性的唯一 D 编号命名空间**：实现代码与测试注释里的 `stall-notice Dn`
 > 只解析到这里的 D1–D9。
+>
+> **修订（2026-11-06）**：`docs/contracts/stall-notice-staleness-v1.md`（FROZEN）在 D4 的
+> 「三条投递路径零改动」上追加一步**投递前作废**：正文首行下新增一行 `Detected at <ISO>.`
+> （检测时刻自证），且 `Stall notice:` 通知在其点名的 child **全部结束**后于发送/确认前转
+> `OBSOLETE`（`reason: obsolete_after_child_end`）。三条路径的**文本时序与投递节奏**仍按本
+> D4（postman 仍 2s tick、`isMailHeld` 与 `formatMail` 不动），D9 写入侧仍零事件。
 
 ## 1. 背景与目标
 

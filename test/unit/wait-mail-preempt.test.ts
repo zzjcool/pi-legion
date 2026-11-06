@@ -58,6 +58,7 @@ import {
 import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { openLegionDb, type DatabaseSync } from "../../src/legion/db.ts";
+import { appendEvent } from "../../src/legion/events.ts";
 import {
 	DEFAULT_MAIL_RATE_PER_5_MIN,
 	MAIL_DELIVERY,
@@ -77,6 +78,7 @@ import {
 	takePendingMail,
 } from "../../src/legion/mail-release.ts";
 import { getNode, hasEnded, insertNode, updateNode, type LegionNode } from "../../src/legion/nodes.ts";
+import { formatStallNotice } from "../../src/legion/stall-notice.ts";
 import type { OrchestratorLegionContext } from "../../src/runs/orchestrator.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -200,9 +202,56 @@ function mailFromChild(db: DatabaseSync, subject: string, body: string, to = "pa
 	return fixtureMail(db, { from: "root.team", to, subject, body });
 }
 
+/**
+ * The row `writeStallNotice` writes: SELF-addressed (`from_node = to_node = nodeId`),
+ * `notice`, `action-needed`, `PENDING`, body in the frozen `- <child>: ` grammar.
+ *
+ * `sendMail` cannot produce it (it drops the sender from its own recipient list), and
+ * the writer itself is private — so the shape is reproduced here, with the body built
+ * by the real `formatStallNotice` so the D1 stamp and the D2 line grammar are the ones
+ * production emits.
+ */
+function queueStallNotice(db: DatabaseSync, nodeId: string, names: readonly string[], detectedAt: number): number {
+	const { subject, body } = formatStallNotice(
+		names.map((childName) => ({
+			kind: "long-running" as const,
+			childName,
+			sinceBucket: detectedAt,
+			sequence: 1,
+			elapsedMs: 600_000,
+			thresholdMs: 600_000,
+		})),
+		detectedAt,
+	);
+	const inserted = db
+		.prepare(
+			`INSERT INTO messages (
+				from_node, to_node, subject, body, kind, urgency, delivered, created_at
+			) VALUES (?, ?, ?, ?, 'notice', 'action-needed', ?, ?)`,
+		)
+		.run(nodeId, nodeId, subject, body, MAIL_DELIVERY.PENDING, detectedAt);
+	return Number(inserted.lastInsertRowid);
+}
+
 /** A send whose refusal is the answer the test wants, not a fixture failure. */
 function mailFromChildOk(db: DatabaseSync, subject: string): boolean {
 	return sendMail(db, { fromNode: "root.team", to: "parent", subject, body: "rate probe" }, { now: () => Date.now() }).ok;
+}
+
+/**
+ * Every `mail_bounced` verdict this fixture wrote, oldest first, `data` parsed.
+ *
+ * The obsolete verdict's ONLY trace is this event (`mailbox-delivery-v1`: no new event
+ * type, no new column), and the two notice classes are told apart by `data.reason`
+ * alone (`stall-notice-staleness` D4) — so the assertions below read the event, not
+ * the row. Read straight from `events` because nothing else in this file needs the
+ * `readEventsAfter` projection.
+ */
+function bouncedEvents(db: DatabaseSync): Array<{ messageId?: number; toNode?: string; reason?: string }> {
+	const rows = db.prepare("SELECT data FROM events WHERE type = 'mail_bounced' ORDER BY id").all() as Array<{
+		data: string;
+	}>;
+	return rows.map((row) => JSON.parse(row.data) as { messageId?: number; toNode?: string; reason?: string });
 }
 
 function fixtureMail(
@@ -773,19 +822,36 @@ test("a discarded mail result is re-delivered instead of lost (P0-3)", async () 
 });
 
 /**
- * A seam whose ledger reports mail to the POLL (`COUNT(*)`) but has none to take.
+ * A seam whose ledger reports mail to the POLL but has none to take.
  *
  * That is the P1.1 interleaving in one object: the poll saw a `PENDING` row, the
  * postman claimed it before `takePendingMail` ran, so the take comes back empty.
  * Faking it at the `prepare` boundary keeps the real ledger, real transitions and
  * real `collectChild`; only the "page of pending rows" query lies.
+ *
+ * The page is ONE query for both readers (stall-notice-staleness D3: the poll counts
+ * what a take would hand over, so it reads the same page `takePendingMail` does), and
+ * in this test it is read exactly three times in a fixed order:
+ *
+ *   [0] `collectChild`'s ENTRY take — finds nothing, so the call proceeds to block;
+ *   [1] the 250ms poll's releasable count — MUST see the row, or the abort that this
+ *       test is built around never happens and the fixture waits out its 2s bound;
+ *   [2…] the take AFTER that abort — finds nothing, which is the race itself (the
+ *       postman won) and what makes the collect fall back to the snapshot it got.
+ *
+ * So "the ledger loses the mail" is applied from the take onwards, not to the poll: a
+ * plain "always empty" sabotage now tests nothing, because the poll would correctly
+ * count zero and never fire.
  */
 function ledgerThatLosesTheMail(real: DatabaseSync): DatabaseSync {
+	let pagesRead = 0;
 	return new Proxy(real, {
 		get(target, property, receiver) {
 			if (property === "prepare") {
 				return (sql: string) => {
 					if (/SELECT \* FROM messages WHERE to_node = \? AND delivered = \? AND id > \?/.test(sql)) {
+						const read = pagesRead++;
+						if (read === 1) return target.prepare(sql);
 						return { all: () => [], get: () => undefined, run: () => ({ changes: 0 }) };
 					}
 					return target.prepare(sql);
@@ -1226,7 +1292,296 @@ test("a stale phase-timeout notice is discarded, never handed over (M1)", () => 
 		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 1);
 		assert.equal(getMessage(db, stale)?.delivered, MAIL_DELIVERY.OBSOLETE);
 		assert.equal(getMessage(db, live)?.delivered, MAIL_DELIVERY.ACCEPTED);
+		// D4: the preemption names WHY it discarded the row, through the same `mail_bounced`
+		// event the postman writes — the two notice classes are only distinguishable here.
+		// A missing/renamed reason (the `takePendingMail` call passing no `{ reason }` and
+		// some later refactor moving the default) leaves the operator unable to tell a
+		// "phase moved on" verdict from a "children are gone" one.
+		assert.deepEqual(
+			bouncedEvents(db).map((event) => ({ messageId: event.messageId, reason: event.reason })),
+			[{ messageId: stale, reason: "obsolete_after_phase_change" }],
+			"the phase-timeout discard carries its own reason, not the stall one",
+		);
 	} finally {
+		db.close();
+	}
+});
+
+/**
+ * stall-notice-staleness §6.7 / D3 (R3): the 250ms poll counts "releasable", not
+ * "pending", and it uses the SAME predicate as `takePendingMail`.
+ *
+ * The production shape of this: root sits in a 15-minute `wait`, the postman's stall
+ * detector writes a notice into root's inbox, and by the time the poll looks the child
+ * is already back. If the count includes that row the wait aborts, `takePendingMail`
+ * hands back nothing and the caller reports an abort that never happened — a stall
+ * notice about finished work would end a live wait. So the notice is written MID-wait
+ * (an empty inbox at entry proves nothing about the poll) and the wait must run to its
+ * own timeout.
+ */
+test("a stale stall notice does not preempt a blocked wait — a fresh one still does (§6.7)", async () => {
+	const db = mailLedger();
+	// One child that has ended and one that has not: the notice's verdict is decided by
+	// the tree, not by how recently it was written.
+	const gone = insertNode(db, { parentId: "root", name: "gone", role: "worker", status: "retired" }, () => 100);
+	const alive = insertNode(db, { parentId: "root", name: CHILD, role: "worker", status: "running" }, () => 100);
+	assert.equal(hasEnded(gone), true, "fixture: `gone` has ended");
+	assert.equal(hasEnded(alive), false, "fixture: `live` is still running");
+	const { store, cwd, dispose } = tempStore();
+	try {
+		// 1. Only a STALE notice arrives while the wait is blocked.
+		const queuedId = queueStallNotice(db, "root", ["gone"], 1_000);
+		const runtime = blockedRuntime();
+		// Written MID-wait on purpose: an inbox that is empty at entry proves nothing about
+		// the 250ms poll, and the poll is the half of D3/R3 under test here.
+		let midWaitId = 0;
+		const staleTimer = setTimeout(() => {
+			midWaitId = queueStallNotice(db, "root", ["gone"], 1_001);
+		}, 100);
+		const startedAt = Date.now();
+		let timedOut: Result;
+		try {
+			timedOut = await within(
+				waitAction({
+					params: { action: "wait", name: CHILD, timeoutMs: 900 },
+					runtime,
+					agents: [agent("worker")],
+					store,
+					cwd,
+					mail: { db, nodeId: "root" },
+				}),
+				"wait runs to its own timeout instead of preempting on stale mail",
+				3_000,
+			);
+		} finally {
+			clearTimeout(staleTimer);
+			runtime.dispose();
+		}
+		const waited = Date.now() - startedAt;
+		const body = textOf(timedOut);
+		assert.match(body, /status: wait_timeout/, "the wait ends the ordinary way");
+		assert.ok(body.includes("── live ──"), "the frozen timeout rendering, for this child");
+		assert.match(body, /still running \(elapsed \d+ms\)/);
+		assert.doesNotMatch(body, /\[legion mail #/, "no envelope: nothing was handed over");
+		assert.doesNotMatch(body, /parent turn ended/, "and no invented abort either");
+		assert.ok(waited >= 700, `the poll ran at least twice and declined (${waited}ms of a 900ms wait)`);
+		assert.equal((timedOut.details as { state?: string }).state, undefined);
+		assert.notEqual(midWaitId, 0, "fixture: the stale notice really landed while the wait was blocked");
+		// The two stale rows end in different places, and both are correct:
+		// - the one queued BEFORE the call was obsoleted by the entry `takePendingMail`;
+		// - the one that landed DURING the call was only *filtered* by the poll's
+		//   releasable count — the poll must not claim or mutate it, so it stays PENDING
+		//   for the postman. A count that did not filter it would have aborted the wait.
+		assert.equal(getMessage(db, queuedId)?.delivered, MAIL_DELIVERY.OBSOLETE, "the entry take obsoletes the queued one");
+		assert.equal(getMessage(db, midWaitId)?.delivered, MAIL_DELIVERY.PENDING, "the poll filters the mid-wait row without claiming it");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0, "nothing was handed over");
+
+		// 2. Positive control: the SAME fixture and the SAME write timing, but the notice
+		// names the child that is still running. It must preempt through the POLL, which is
+		// what makes this a control for step 1 rather than for the entry take.
+		const live = blockedRuntime();
+		let freshId = 0;
+		const freshTimer = setTimeout(() => {
+			freshId = queueStallNotice(db, "root", [CHILD], 1_002);
+		}, 100);
+		const preemptStartedAt = Date.now();
+		let preempted: Result;
+		try {
+			preempted = await within(
+				waitAction({
+					// A generous ceiling on the tool's own wait, but not a CI hazard: when the
+					// preemption is broken this call must fail the `within` bound in 3s, not sit
+					// here for a minute (the poll timer is deliberately not unref'd, so a stuck
+					// wait keeps the whole file alive).
+					params: { action: "wait", name: CHILD, timeoutMs: 4_000 },
+					runtime: live,
+					agents: [agent("worker")],
+					store,
+					cwd,
+					mail: { db, nodeId: "root" },
+				}),
+				"wait preempted by the fresh stall notice",
+				3_000,
+			);
+		} finally {
+			clearTimeout(freshTimer);
+			live.dispose();
+		}
+		const preemptedIn = Date.now() - preemptStartedAt;
+		const preemptBody = textOf(preempted);
+		assert.notEqual(freshId, 0, "fixture: the fresh notice landed while the wait was blocked");
+		// One poll is 250ms; 2s tolerates a loaded CI runner while still being far below the
+		// tool's 4s budget, so "returned because it was preempted" and "returned because the
+		// wait timed out" remain distinguishable. Which path fired is proved independently
+		// below (`details.state === "mail"` + the envelope), not by this bound.
+		assert.ok(preemptedIn < 2_000, `a live notice still preempts inside the poll window (${preemptedIn}ms)`);
+		assert.match(preemptBody, /\[legion mail #\d+\]/, "the mail envelope, exactly as the postman renders it");
+		assert.match(preemptBody, /Subject: Stall notice: live/);
+		assert.match(preemptBody, /Detected at /, "D1: even a preempted notice says when it was detected");
+		const details = preempted.details as { state?: string; mailIds?: number[] };
+		assert.equal(details.state, "mail");
+		// The stale rows in the same inbox must not hide the live one: `takePendingMail`
+		// skips them (obsoleting, never returning) and hands over exactly the fresh id.
+		assert.deepEqual(details.mailIds, [freshId]);
+		assert.equal(getMessage(db, midWaitId)?.delivered, MAIL_DELIVERY.OBSOLETE, "the take obsoletes the stale row it skips");
+		// D4: `takePendingMail` passes the STALL reason explicitly. Without it the ledger's
+		// default would relabel this row as a phase-timeout verdict — the two classes are
+		// only told apart by `data.reason`, so nothing else in this fixture notices.
+		assert.deepEqual(
+			bouncedEvents(db)
+				.filter((event) => event.messageId === queuedId || event.messageId === midWaitId)
+				.map((event) => ({ messageId: event.messageId, reason: event.reason })),
+			[
+				{ messageId: queuedId, reason: "obsolete_after_child_end" },
+				{ messageId: midWaitId, reason: "obsolete_after_child_end" },
+			],
+			"both stall discards (entry take + mid-wait take) carry obsolete_after_child_end",
+		);
+		assert.equal(
+			inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length,
+			1,
+			"only the live notice is accepted — the stale ones are discarded, not delivered",
+		);
+	} finally {
+		dispose();
+		db.close();
+	}
+});
+
+/**
+ * §6.7, the PHASE-TIMEOUT half of the same rule (D3/R3).
+ *
+ * `pendingMailCount` is the single place where "count only what the take can release"
+ * has to be spelled out per notice class, so each class gets its own blocked wait: the
+ * stall case above pins the stall arm, this one pins the phase-timeout arm. A poll that
+ * filtered only the stall half — the obvious way to half-fix R3, since the stall notice
+ * is the class this contract added — leaves the RAW COUNT above zero on this fixture,
+ * aborts the wait on the next poll, and `takePendingMail` then filters the row away and
+ * hands back nothing: the caller reports `interrupted (parent turn ended; children
+ * still running)` for a wait whose parent turn is alive.
+ *
+ * The row is written MID-wait for the same reason as the stall case: an inbox that is
+ * empty at entry says nothing about the 250ms poll, and the poll is the half under test.
+ */
+test("a stale phase-timeout notice does not preempt a blocked wait — a fresh one still does (§6.7)", async () => {
+	const db = mailLedger();
+	// The M1 shape: a `Phase timeout:` notice is stale once its SENDER has ended. The
+	// raw `COUNT(*)` of pending rows is 1 either way; only the predicate differs.
+	const late = insertNode(db, { parentId: "root", name: "late", role: "centurion", status: "failed" }, () => 100);
+	insertNode(db, { parentId: "root", name: CHILD, role: "worker", status: "running" }, () => 100);
+	assert.equal(hasEnded(late), true, "fixture: the phase-timeout sender has ended");
+	const { store, cwd, dispose } = tempStore();
+	try {
+		// 1. Only a STALE phase-timeout notice arrives while the wait is blocked.
+		const runtime = blockedRuntime();
+		let staleId = 0;
+		const staleTimer = setTimeout(() => {
+			staleId = fixtureMail(db, {
+				from: late.id,
+				to: "root",
+				subject: "Phase timeout: implementing",
+				body: "the phase this asked about is over",
+				kind: "notice",
+			});
+		}, 100);
+		const startedAt = Date.now();
+		let timedOut: Result;
+		try {
+			timedOut = await within(
+				waitAction({
+					params: { action: "wait", name: CHILD, timeoutMs: 900 },
+					runtime,
+					agents: [agent("worker")],
+					store,
+					cwd,
+					mail: { db, nodeId: "root" },
+				}),
+				"wait runs to its own timeout instead of preempting on a stale phase-timeout notice",
+				3_000,
+			);
+		} finally {
+			clearTimeout(staleTimer);
+			runtime.dispose();
+		}
+		const waited = Date.now() - startedAt;
+		const body = textOf(timedOut);
+		assert.match(body, /status: wait_timeout/, "the wait ends the ordinary way");
+		assert.ok(body.includes("── live ──"), "the frozen timeout rendering, for this child");
+		assert.match(body, /still running \(elapsed \d+ms\)/);
+		assert.doesNotMatch(body, /\[legion mail #/, "no envelope: nothing was handed over");
+		assert.doesNotMatch(body, /parent turn ended/, "and no invented abort either");
+		assert.ok(waited >= 700, `the poll ran at least twice and declined (${waited}ms of a 900ms wait)`);
+		assert.equal((timedOut.details as { state?: string }).state, undefined);
+		assert.notEqual(staleId, 0, "fixture: the stale notice really landed while the wait was blocked");
+		// The raw count is 1 and the releasable count is 0: exactly the split the poll must
+		// make (contract D3/R3). A `COUNT(*)` poll would have aborted on it.
+		assert.equal(pendingInbox(db, "root").length, 1, "precondition: an unfiltered count of this inbox is 1");
+		// The poll FILTERS, it never claims: the row is still the postman's to obsolete.
+		assert.equal(getMessage(db, staleId)?.delivered, MAIL_DELIVERY.PENDING, "the poll filters the mid-wait row without claiming it");
+		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 0, "nothing was handed over");
+
+		// 2. Positive control: the SAME fixture and the SAME write timing, but the sender is
+		// alive and still in the phase the notice names. It must preempt through the POLL —
+		// that is what makes this a control for step 1 rather than for the entry take.
+		const team = getNode(db, "root.team")!;
+		updateNode(db, team.id, { phase: "implementing", phaseSince: 100 }, () => 100);
+		appendEvent(
+			db,
+			team.id,
+			"phase_timeout",
+			{ phase: "implementing", phaseSince: 100, elapsedMs: 1_800_573, timeoutMs: 1_800_000 },
+			{ now: () => Date.now() - 1_000 },
+		);
+		assert.equal(getNode(db, team.id)?.phase, "implementing", "fixture: the live sender is in the phase it names");
+		const live = blockedRuntime();
+		let freshId = 0;
+		const freshTimer = setTimeout(() => {
+			freshId = fixtureMail(db, {
+				from: team.id,
+				to: "root",
+				subject: "Phase timeout: team",
+				body: "the phase this asked about is still current",
+				kind: "notice",
+			});
+		}, 100);
+		const preemptStartedAt = Date.now();
+		let preempted: Result;
+		try {
+			preempted = await within(
+				waitAction({
+					// Bounded so a broken preemption fails the `within` bound in 3s instead of
+					// parking the whole file behind the un-unref'd poll timer.
+					params: { action: "wait", name: CHILD, timeoutMs: 4_000 },
+					runtime: live,
+					agents: [agent("worker")],
+					store,
+					cwd,
+					mail: { db, nodeId: "root" },
+				}),
+				"wait preempted by the fresh phase-timeout notice",
+				3_000,
+			);
+		} finally {
+			clearTimeout(freshTimer);
+			live.dispose();
+		}
+		const preemptedIn = Date.now() - preemptStartedAt;
+		const preemptBody = textOf(preempted);
+		assert.notEqual(freshId, 0, "fixture: the fresh notice landed while the wait was blocked");
+		assert.ok(preemptedIn < 2_000, `a live phase-timeout notice still preempts inside the poll window (${preemptedIn}ms)`);
+		assert.match(preemptBody, /\[legion mail #\d+\]/, "the mail envelope, exactly as the postman renders it");
+		assert.match(preemptBody, /Subject: Phase timeout: team/);
+		const details = preempted.details as { state?: string; mailIds?: number[] };
+		assert.equal(details.state, "mail");
+		assert.deepEqual(details.mailIds, [freshId], "exactly the fresh notice, never the stale one");
+		assert.equal(getMessage(db, staleId)?.delivered, MAIL_DELIVERY.OBSOLETE, "the take obsoletes the stale row it skips");
+		// D4: the phase-timeout class keeps its OWN reason through the preemption path.
+		assert.deepEqual(
+			bouncedEvents(db).map((event) => ({ messageId: event.messageId, reason: event.reason })),
+			[{ messageId: staleId, reason: "obsolete_after_phase_change" }],
+		);
+	} finally {
+		dispose();
 		db.close();
 	}
 });

@@ -26,12 +26,15 @@ import {
 	claimForDelivery,
 	formatMail,
 	getMessage,
+	MAIL_BOUNCE_REASON,
 	MAIL_DELIVERY,
 	isStalePhaseTimeoutNotice,
+	isStaleStallNotice,
 	pendingInbox,
 	releaseDeliveryClaim,
 	transitionDelivery,
 	type LegionMessage,
+	type MailBounceReason,
 } from "./mail.ts";
 
 /** Contract §2: at most this many mails ride out on one preemption. */
@@ -127,7 +130,42 @@ function pendingMailCount(db: DatabaseSync, nodeId: string): number {
 			"SELECT COUNT(*) AS count FROM messages WHERE to_node = ? AND delivered = ? AND (delivered_at IS NULL OR delivered_at < ?)",
 		)
 		.get(nodeId, MAIL_DELIVERY.PENDING, cutoff);
-	return Number(row?.count ?? 0);
+	const pending = Number(row?.count ?? 0);
+	if (pending === 0) return 0;
+	// The count must mean "releasable", not "pending" (contract D3, R3). A row the
+	// preemption is about to obsolete is not something to wake a blocked `wait` for:
+	// counting it would abort the tool, `takePendingMail` would hand back an empty
+	// list, and the caller would report `interrupted (parent turn ended; children
+	// still running)` — an empty return reported as a parent-turn abort. A stale
+	// stall notice is exactly that row (its children all ended while it waited), so
+	// the count runs the SAME window and the SAME predicate as `takePendingMail`
+	// below; the cheap COUNT first only spares the 250ms poll a row fetch when the
+	// inbox is empty.
+	const releasable = pendingInbox(db, nodeId, MAIL_RELEASE_LIMIT).filter(
+		(message) => (message.deliveredAt === null || message.deliveredAt < cutoff) && staleNoticeReason(db, message) === undefined,
+	);
+	return releasable.length;
+}
+
+/**
+ * The single "this notice is already pointless, and why" predicate (contract D3).
+ *
+ * The phase-timeout rule keeps its own reason (`obsolete_after_phase_change`, #333)
+ * and the stall rule has its own (`obsolete_after_child_end`); folding them into one
+ * function is what makes the preemption, the poll counter and the postman's discard
+ * literally the same judgement instead of three copies that drift (R3 in the
+ * contract: two predicate sets = an empty return + a false `interrupted`).
+ *
+ * `undefined` is the whole answer for "deliver it": no caller is allowed to invent
+ * a third outcome here.
+ */
+export function staleNoticeReason(
+	db: DatabaseSync,
+	message: LegionMessage,
+): MailBounceReason | undefined {
+	if (isStalePhaseTimeoutNotice(db, message)) return MAIL_BOUNCE_REASON.OBSOLETE_AFTER_PHASE_CHANGE;
+	if (isStaleStallNotice(db, message)) return MAIL_BOUNCE_REASON.OBSOLETE_AFTER_CHILD_END;
+	return undefined;
 }
 
 /**
@@ -148,13 +186,15 @@ export function takePendingMail(db: DatabaseSync, nodeId: string): LegionMessage
 	const now = () => Date.now();
 	const taken: LegionMessage[] = [];
 	for (const message of pendingInbox(db, nodeId, MAIL_RELEASE_LIMIT)) {
-		// #333 + #384 review M1: the postman discards a `Phase timeout:` notice whose
-		// phase is already over, and this path must agree with it — otherwise the
-		// preemption hands the model a to-do that is already pointless, one the postman
-		// would have thrown away. Same predicate, same verdict, BEFORE the claim so the
-		// row is never leased for a message nobody will read.
-		if (isStalePhaseTimeoutNotice(db, message)) {
-			transitionDelivery(db, message.id, MAIL_DELIVERY.OBSOLETE);
+		// #333 + stall-notice-staleness D3: the postman discards notices whose subject is
+		// already over, and this path must agree with it — otherwise the preemption hands
+		// the model a to-do that is already pointless, one the postman would have thrown
+		// away. `staleNoticeReason` is the SHARED predicate (`pendingMailCount` runs it
+		// too), and it is applied BEFORE the claim so the row is never leased for a
+		// message nobody will read. The reason is the same one the postman writes.
+		const staleReason = staleNoticeReason(db, message);
+		if (staleReason !== undefined) {
+			transitionDelivery(db, message.id, MAIL_DELIVERY.OBSOLETE, now, { reason: staleReason });
 			continue;
 		}
 		// The SAME lease the postman uses (#384 review): whoever claims first delivers,
