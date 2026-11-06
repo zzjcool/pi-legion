@@ -296,7 +296,7 @@ const SubagentParams = Type.Object({
 				Type.Literal("diagnose"),
 				Type.Literal("extend"),
 			],
-			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor. extend = defer the `may be looping` REMINDER for one child only: it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`/`steer`/`renewal`." },
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor. extend = defer the `may be looping` REMINDER for one child only; it addresses this node's own direct children (an unknown or already-ended child is refused, and `runId` does not apply), it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`/`steer`/`renewal`." },
 		),
 	),
 	agent: Type.Optional(
@@ -386,7 +386,7 @@ const SubagentParams = Type.Object({
 	runId: Type.Optional(
 		Type.String({
 			description:
-				'control actions (status/collect/stop/continue/resume/steer/abort/retire/extend): name the run that holds the child, instead of the run this session owns. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
+				'control actions (status/collect/stop/continue/resume/steer/abort/retire): name the run that holds the child, instead of the run this session owns. Not used by `extend`, which always addresses this node\'s own direct children. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
 		}),
 	),
 	timeoutMs: Type.Optional(
@@ -688,6 +688,18 @@ function phaseMachineForRole(role: string | null | undefined, cwd: string, setti
 }
 
 /**
+ * How long one role's L2 radius is reused before the cards are read again (#review
+ * m4). The postman asks per live child per 2s tick; discovery + overrides measured at
+ * ~1ms per call, which is 8ms of synchronous event-loop time per tick for a full
+ * squad. Five seconds keeps a settings/card edit visible almost immediately while
+ * turning that into one lookup per (cwd, role) per window.
+ */
+export const LOOP_NOTICE_ROLE_TTL_MS = 5_000;
+
+/** `(cwd, role)` → the radius this process resolved for it, with its expiry. */
+const loopNoticeRoleCache = new Map<string, { radius: number | undefined; expiresAt: number }>();
+
+/**
  * stall-notice D8 (L2): the role card's LONG-RUNNING reminder radius.
  *
  * Same shape and same best-effort rule as {@link phaseMachineForRole} above: the
@@ -697,14 +709,44 @@ function phaseMachineForRole(role: string | null | undefined, cwd: string, setti
  * The chain itself (card `loopNoticeMs` → card `timeoutMs` → the SDK turn budget) is
  * `resolveLoopRadiusMs`, a pure function in `src/legion/stall-notice.ts`, so the "no
  * card at all" answers are the same ones a missing card would give.
+ *
+ * Cached per `(cwd, role)` for {@link LOOP_NOTICE_ROLE_TTL_MS}: the caller is a 2s
+ * tick over every live child, and re-running discovery there is pure event-loop cost.
+ * A `0`/negative answer is cached too — "the card turned L2 off" is an answer, not a
+ * miss — so a disabled role does not pay for discovery every tick. The `now` seam
+ * exists for the tests that pin the TTL itself.
  */
-function loopNoticeMsForRole(
+export function loopNoticeMsForRole(
+	role: string | null | undefined,
+	cwd: string,
+	settings: SubagentsSettings,
+	now: () => number = Date.now,
+): number | undefined {
+	const key = `${cwd}\u0000${role ?? ""}`;
+	const nowMs = now();
+	const cached = loopNoticeRoleCache.get(key);
+	if (cached && nowMs < cached.expiresAt) return cached.radius;
+	const radius = resolveLoopNoticeMsUncached(role, cwd, settings);
+	// Prune while writing: the map is keyed by cwd+role, so it only grows when a
+	// session walks through many roles/directories, but nothing else would ever
+	// remove an entry.
+	for (const [staleKey, entry] of loopNoticeRoleCache) {
+		if (nowMs >= entry.expiresAt) loopNoticeRoleCache.delete(staleKey);
+	}
+	loopNoticeRoleCache.set(key, { radius, expiresAt: nowMs + LOOP_NOTICE_ROLE_TTL_MS });
+	return radius;
+}
+
+function resolveLoopNoticeMsUncached(
 	role: string | null | undefined,
 	cwd: string,
 	settings: SubagentsSettings,
 ): number | undefined {
 	if (!role) return resolveLoopRadiusMs(undefined);
 	try {
+		// `agentScope: "user"` matches the launch default; a project-level card's
+		// `loopNoticeMs` therefore does NOT take part in this resolution. Documented
+		// as a v1 limit in `docs/design.md` §6.1.
 		const discovery = discoverAgents(cwd, "user", { includeBuiltin: settings.disableBuiltins !== true });
 		const overridden = applyAgentOverrides(discovery.agents, settings.agentOverrides);
 		return resolveLoopRadiusMs(findAgent(overridden, role));
@@ -2848,8 +2890,16 @@ function scopeRunIdFor(input: {
 	return input.runId ?? input.sessionRunId ?? input.trackedRunId;
 }
 
-/** Actions that may only ever act on this session's own direct child (#312). */
-const STRICT_SCOPE_ACTIONS = new Set(["collect", "continue", "resume"]);
+/**
+ * Actions that may only ever act on this session's own direct child (#312).
+ *
+ * `extend` belongs here for a different reason than the other three: its state lives
+ * in THIS session's postman, which only knows `getChildren(db, this.node)`. A record
+ * resolved from another run would be answered "not a child of this node" a moment
+ * later, so the strict refusal — which names the candidates — is the honest answer
+ * the description promises.
+ */
+const STRICT_SCOPE_ACTIONS = new Set(["collect", "continue", "resume", "extend"]);
 
 /**
  * stall-notice D5 — `subagent({action:"extend", name, ms?})`.
@@ -2879,18 +2929,27 @@ export function extendStallNotice(
 			ErrorCodes.INVALID_PARAMS,
 		);
 	}
-	const receipt = input.postman?.extendStallWindow(name, ms);
-	if (!receipt) {
+	const postman = input.postman;
+	if (!postman) {
 		return fail(
-			`\`extend\` applies to this session's own children, and ${name} is not one of them; no stall-notice clock was moved.`,
+			`\`extend\` needs this session's legion stall detector, and ${name} has none; no stall-notice clock was moved.`,
 			ErrorCodes.NOT_FOUND,
 		);
 	}
-	const radius = receipt.loopRadiusMs === undefined
+	const result = postman.extendStallWindow(name, ms);
+	if ("reason" in result) {
+		// D5: a finished child is refused, not acknowledged — a receipt would promise a
+		// reminder no tick can ever send.
+		const why = result.reason === "child-ended"
+			? `${name} has already ended (settled/retired/terminal phase), and an ended child is never reminded about`
+			: `${name} is not a child of this node`;
+		return fail(`\`extend\` applies only to this node's live direct children, and ${why}; no stall-notice clock was moved.`, ErrorCodes.NOT_FOUND);
+	}
+	const radius = result.loopRadiusMs === undefined
 		? "the role card's own radius"
-		: `${receipt.loopRadiusMs}ms`;
+		: `${result.loopRadiusMs}ms`;
 	return ok(
-		`Extended the stall-notice clock for ${receipt.childName}: the next long-running reminder is due ${radius} from now. ` +
+		`Extended the stall-notice clock for ${result.childName}: the next long-running reminder is due ${radius} from now. ` +
 			"This defers the REMINDER only — it does not extend a collect/wait budget (that is the role's timeoutMs), " +
 			"does not restart or revive the child, and is not `continue` or `steer`.",
 	);

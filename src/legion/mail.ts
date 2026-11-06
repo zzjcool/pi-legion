@@ -288,9 +288,16 @@ export function sendMail(
 		// #384 review m5: a platform re-delivery (`Redelivered: …`, written when a
 		// preemption result was thrown away) is not a new send and must not spend the
 		// sender's quota — the sender never chose to write it.
+		//
+		// stall-notice D4: a SELF-addressed row (`from_node = to_node`, the stall notice's
+		// only exit) is the system describing a node to itself, not interpersonal mail, so
+		// it must not count either — otherwise a node's own reminders spend its
+		// `legion_mail` allowance. That is the whole reason the stall notice writes its
+		// row directly (`resolveMailTargets` drops the sender from its own recipients) and
+		// still has to be visible to this COUNT without being charged for it.
 		const recent = db
 			.prepare(
-				"SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ? AND subject NOT LIKE 'Redelivered: %'",
+				"SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ? AND subject NOT LIKE 'Redelivered: %' AND from_node <> to_node",
 			)
 			.get(input.fromNode, timestamp - MAIL_RATE_WINDOW_MS);
 		const count = Number(recent?.count ?? 0);

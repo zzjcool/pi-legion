@@ -603,6 +603,16 @@ onBlocked: auto-approve    # auto-approve (default) | forward | notify
 = 900000）。`loopNoticeMs: 0` 或负数关闭该 L2 提醒；`subagents()` 的 launch 参数
 不接受 `loopNoticeMs`（v1 只支持角色卡与 `agentOverrides`）。
 
+解析口径与已知限制（stall-notice D8，review m4）：
+
+- 解析用 `discoverAgents(cwd, "user", …)`，**与 launch 的默认作用域一致**——因此
+  **project 层（`.pi/agents/*.md`）角色卡的 `loopNoticeMs` 本次不参与解析**，只有
+  user 层卡片（含内置角色）与 `subagents.agentOverrides.<name>.loopNoticeMs` 生效。
+  这是 v1 的显式限制，不是遗漏；需要 per-project 阈值时用 `agentOverrides`。
+- 结果按 `(cwd, role)` 缓存 5s（`LOOP_NOTICE_ROLE_TTL_MS`）：postman 每 2s 对每个
+  活着的子节点问一次，不缓存会把 1ms/次的 discovery 变成每秒几毫秒的同步阻塞。
+  改卡/改 override 到生效最多有 5s 延迟；`0`（关闭）也是一个答案，同样被缓存。
+
 ### 6.2 模型优先级（原样抄 pi-subagents）
 
 ```text
@@ -1016,6 +1026,11 @@ subagent({
 （那是 `continue`/`resume`）、**不延后 L1 静默提醒**（L1 的基准是子自己的事件，客观
 事实不该被续期抹掉）。`wait` 回执里的 "extend" 是「再调一次 wait」，与本动作无关。
 状态存内存：进程重启后按「首次见到」重建，基准回到 `nodes.created_at`。
+
+作用范围只有**本节点（调用者）的直接子**：`runId` 参数对它不适用，未知名字与**已终态 /
+已 retire 的子**一律 `NOT_FOUND` 拒绝——回执承诺一封永远不会到来的提醒比拒绝更糟。
+子终态后在探测器里留一条 `absent` 墓碑（清空计数、不删条目），`continue` 复活时按
+「重新出现」把基准重置为复活时刻，因此不会拿旧的 `created_at` 立刻误报一次 L2。
 
 ### `retire` 的隐含语义（重要）
 

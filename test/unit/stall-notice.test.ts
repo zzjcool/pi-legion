@@ -22,15 +22,19 @@
  */
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { LegionPostman } from "../../src/extension/legion-tools.ts";
-import { openLegionDb } from "../../src/legion/db.ts";
+import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
+import { RunStore } from "../../src/runs/store.ts";
 import { readEventsAfter } from "../../src/legion/events.ts";
-import { inbox } from "../../src/legion/mail.ts";
-import { getNode, insertNode, updateNode } from "../../src/legion/nodes.ts";
+import { MAIL_DELIVERY, inbox, sendMail } from "../../src/legion/mail.ts";
+import { getChildren, getNode, insertNode, updateNode } from "../../src/legion/nodes.ts";
 import {
 	DEFAULT_LOOP_NOTICE_MS,
 	LONG_RUNNING_NOTICE_LIMIT,
@@ -42,13 +46,14 @@ import {
 	resolveLoopRadiusMs,
 	type StallAnnouncement,
 	type StallChildFacts,
+	type StallLineState,
 	type StallThresholds,
 } from "../../src/legion/stall-notice.ts";
 import type { InFlightToolStack } from "../../src/supervisor/types.ts";
 import { DEFAULT_LEGION_SETTINGS, DEFAULTS, ErrorCodes, type AgentConfig } from "../../src/shared/types.ts";
 import { parseSubagentSettings } from "../../src/agents/settings.ts";
 import { parseAgentDocument } from "../../src/agents/agents.ts";
-import { extendStallNotice } from "../../index.ts";
+import piLegion, { LOOP_NOTICE_ROLE_TTL_MS, extendStallNotice, loopNoticeMsForRole } from "../../index.ts";
 import { applyOverride } from "../../src/agents/overrides.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
@@ -57,8 +62,21 @@ const MINUTE = 60_000;
 // ───────────────────────────── 1. pure decision ─────────────────────────────
 
 /** The window as the postman builds it: `announced` = lines already sent. */
-function window(loopBaseAt: number, silenceAnnounced = 0, longRunningAnnounced = 0) {
-	return { loopBaseAt, silenceAnnounced, longRunningAnnounced };
+/** The window as the postman builds it: per-kind `{ count, lastAt }` (D6). */
+function window(
+	loopBaseAt: number,
+	announced: { silence?: StallLineState; longRunning?: StallLineState } = {},
+) {
+	return {
+		loopBaseAt,
+		silence: announced.silence ?? { count: 0 },
+		longRunning: announced.longRunning ?? { count: 0 },
+	};
+}
+
+/** A line already sent at `lastAt` (the repeat clock's whole input). */
+function sentAt(count: number, lastAt: number): StallLineState {
+	return { count, lastAt };
 }
 
 function child(facts: Partial<StallChildFacts> = {}): StallChildFacts {
@@ -140,29 +158,29 @@ test("L1: stack NON-empty + ten minutes without an event → NOT reported (D1)",
 test("L1: announced at 1× and 2×, then never again in the same silence window (D6)", () => {
 	const silenceNoticeMs = 120_000;
 	const since = 0;
-	const announce = (now: number, silenceAnnounced: number) =>
+	const announce = (now: number, already: StallLineState) =>
 		decideStallNotice({
 			now,
 			child: child({ lastEventAt: since }),
 			thresholds: silence(silenceNoticeMs),
-			window: window(0, silenceAnnounced),
+			window: window(0, { silence: already }),
 		});
 
-	assert.equal(announce(silenceNoticeMs, 0)?.sequence, 1);
-	// Past 1× but before 2× there is nothing new to say.
-	assert.equal(announce(silenceNoticeMs + 1_000, 1), undefined, "no second mail one tick later");
-	assert.equal(announce(2 * silenceNoticeMs - 1, 1), undefined, "the second line waits for 2×");
-	assert.equal(announce(2 * silenceNoticeMs, 1)?.sequence, 2);
+	assert.equal(announce(silenceNoticeMs, { count: 0 })?.sequence, 1);
+	// D6: the second line waits one threshold after the FIRST line, not after `2×base`.
+	assert.equal(announce(silenceNoticeMs + 1_000, sentAt(1, silenceNoticeMs)), undefined, "no second mail one tick later");
+	assert.equal(announce(2 * silenceNoticeMs - 1, sentAt(1, silenceNoticeMs)), undefined, "one threshold after the first line");
+	assert.equal(announce(2 * silenceNoticeMs, sentAt(1, silenceNoticeMs))?.sequence, 2);
 	assert.equal(SILENCE_NOTICE_LIMIT, 2);
-	assert.equal(announce(3 * silenceNoticeMs, 2), undefined, "a dead child must not mail every 2 minutes");
-	assert.equal(announce(100 * silenceNoticeMs, 2), undefined);
+	assert.equal(announce(3 * silenceNoticeMs, sentAt(2, 2 * silenceNoticeMs)), undefined, "a dead child must not mail every 2 minutes");
+	assert.equal(announce(100 * silenceNoticeMs, sentAt(2, 3 * silenceNoticeMs)), undefined);
 	// A NEW event opens a new window, and the count restarts with it.
 	assert.equal(
 		decideStallNotice({
 			now: 3 * silenceNoticeMs,
 			child: child({ lastEventAt: 2 * silenceNoticeMs }),
 			thresholds: silence(silenceNoticeMs),
-			window: window(0, 0),
+			window: window(0),
 		})?.sequence,
 		1,
 	);
@@ -190,21 +208,23 @@ test("L2: the radius boundary, and it works without lastEventAt (D2)", () => {
 test("L2: it repeats once per radius and stops after three unhandled lines (D6)", () => {
 	const radius = 10 * MINUTE;
 	const base = 0;
-	const at = (now: number, announced: number) =>
+	const at = (now: number, longRunning: StallLineState) =>
 		decideStallNotice({
 			now,
 			child: child(),
 			thresholds: long(radius),
-			window: window(base, 0, announced),
+			window: window(base, { longRunning }),
 		});
 
-	assert.equal(at(radius, 0)?.sequence, 1);
-	assert.equal(at(radius + 1, 1), undefined, "‘每再过一个 loopRadiusMs’ — not one tick later");
-	assert.equal(at(2 * radius, 1)?.sequence, 2);
-	assert.equal(at(3 * radius, 2)?.sequence, 3);
+	assert.equal(at(radius, { count: 0 })?.sequence, 1);
+	// ‘每再过一个 loopRadiusMs’ measured from the PREVIOUS line (D6), not one tick later.
+	assert.equal(at(radius + 1, sentAt(1, radius)), undefined);
+	assert.equal(at(2 * radius - 1, sentAt(1, radius)), undefined);
+	assert.equal(at(2 * radius, sentAt(1, radius))?.sequence, 2);
+	assert.equal(at(3 * radius, sentAt(2, 2 * radius))?.sequence, 3);
 	assert.equal(LONG_RUNNING_NOTICE_LIMIT, 3);
-	assert.equal(at(4 * radius, 3), undefined, "the cap holds until an `extend` or the child ends");
-	assert.equal(at(100 * radius, 3), undefined);
+	assert.equal(at(4 * radius, sentAt(3, 3 * radius)), undefined, "the cap holds until an `extend` or the child ends");
+	assert.equal(at(100 * radius, sentAt(3, 4 * radius)), undefined);
 });
 
 test("L2: a non-empty stack becomes EVIDENCE inside the line, never a verdict of its own (D1)", () => {
@@ -242,7 +262,7 @@ test("L1 wins over L2 for the same child in the same tick (one line per child)",
 		now: 60 * MINUTE,
 		child: child({ lastEventAt: 0 }),
 		thresholds: { silenceNoticeMs: 120_000, loopRadiusMs: 45 * MINUTE },
-		window: window(0, SILENCE_NOTICE_LIMIT, 0),
+		window: window(0, { silence: sentAt(SILENCE_NOTICE_LIMIT, 2 * 120_000) }),
 	});
 	assert.equal(later?.kind, "long-running");
 });
@@ -454,6 +474,13 @@ class StallSupervisor extends FakeSupervisor {
 	readonly live = new Set<string>();
 	readonly eventAges = new Map<string, number>();
 	readonly stacks = new Map<string, InFlightToolStack>();
+	/** What reached a child's session through `deliverToChild` (D4 path 3). */
+	readonly steered: Array<{ name: string; text: string }> = [];
+
+	override async steer(name: string, text: string) {
+		this.steered.push({ name, text });
+		return "queued" as const;
+	}
 
 	isAlive(name: string): boolean {
 		return this.live.has(name);
@@ -483,6 +510,7 @@ function fixture(options: {
 	children?: Array<{ name: string; role: string; createdAt?: number; phase?: string | null; status?: "running" | "settled" }>;
 	loopRadiusMs?: number;
 	silenceNoticeMs?: number;
+	mailRatePer5Min?: number;
 	noticeMsForRole?: (role: string | null | undefined) => number | undefined;
 	now?: () => number;
 } = {}): Fixture {
@@ -516,7 +544,7 @@ function fixture(options: {
 		settings: {
 			orphanStaleMs: Number.MAX_SAFE_INTEGER,
 			...(options.silenceNoticeMs === undefined ? {} : { silenceNoticeMs: options.silenceNoticeMs }),
-			mailRatePer5Min: 10,
+			mailRatePer5Min: options.mailRatePer5Min ?? 10,
 		},
 		now: options.now ?? (() => TICK_AT),
 		intervalMs: 10_000,
@@ -656,7 +684,7 @@ test("postman L2: 3 lines per window, then silence until `extend` (D5/D6)", asyn
 
 		// `extend` moves the baseline, which restarts the count — and nothing else.
 		const receipt = fx.postman.extendStallWindow("worker");
-		assert.ok(receipt);
+		assert.ok("childName" in receipt, "a live child gets a receipt");
 		assert.equal(receipt.loopBaseAt, TICK_AT + 10 * radius);
 		assert.equal(receipt.loopRadiusMs, radius);
 		await tickAt(TICK_AT + 10 * radius + radius - 1);
@@ -668,14 +696,19 @@ test("postman L2: 3 lines per window, then silence until `extend` (D5/D6)", asyn
 	}
 });
 
-test("postman: `extend` refuses a name that is not a child of this node", () => {
+test("postman: `extend` refuses an unknown name and an ended child (D5)", async () => {
 	const fx = fixture();
 	try {
-		assert.equal(fx.postman.extendStallWindow("ghost"), undefined, "an unknown name gets no receipt");
+		assert.deepEqual(fx.postman.extendStallWindow("ghost"), { reason: "unknown-child" });
 		const receipt = fx.postman.extendStallWindow("worker");
-		assert.ok(receipt, "a real child does");
+		assert.ok("childName" in receipt, "a live child does get one");
 		assert.equal(receipt.childName, "worker");
 		assert.equal(receipt.loopBaseAt, TICK_AT);
+
+		// D5: "an ended child does not accept `extend`" — a receipt would promise a
+		// reminder that no tick can ever send.
+		updateNode(fx.db, "root.worker", { status: "settled" }, () => TICK_AT);
+		assert.deepEqual(fx.postman.extendStallWindow("worker"), { reason: "child-ended" });
 	} finally {
 		fx.db.close();
 	}
@@ -787,7 +820,14 @@ test("extend: an unknown name is the existing NOT_FOUND path, never a silent no-
 		const unknown = extendStallNotice({ postman: fx.postman }, { name: "ghost" });
 		assert.equal(errorOf(unknown), ErrorCodes.NOT_FOUND);
 		const text = textOf(unknown);
-		assert.match(text, /ghost is not one of them/);
+		assert.match(text, /ghost is not a child of this node/);
+
+		// D5: an ENDED child is refused too — the receipt must not promise a reminder
+		// that no tick can send.
+		updateNode(fx.db, "root.worker", { status: "retired" }, () => TICK_AT);
+		const ended = extendStallNotice({ postman: fx.postman }, { name: "worker" });
+		assert.equal(errorOf(ended), ErrorCodes.NOT_FOUND);
+		assert.match(textOf(ended), /has already ended/);
 	} finally {
 		fx.db.close();
 	}
@@ -807,5 +847,334 @@ test("extend: `ms` must be a positive integer, and a session without a detector 
 		assert.deepEqual(inbox(fx.db, "root"), [], "a refused extend never writes mail");
 	} finally {
 		fx.db.close();
+	}
+});
+
+// ─────────── 8. review round: D5 tombstone + D6 repeat clock (M1 / M2) ───────────
+
+test("M2: a child first observed already past its radius gets ONE line, not three", async () => {
+	let now = TICK_AT;
+	const radius = 10 * MINUTE;
+	const fx = fixture({
+		now: () => now,
+		// Handed over long after it started: 3h of run time at the first observation.
+		children: [{ name: "worker", role: "worker", createdAt: TICK_AT - 3 * 60 * MINUTE }],
+		noticeMsForRole: () => radius,
+	});
+	try {
+		await fx.postman.tick();
+		assert.equal(inbox(fx.db, "root").length, 1, "the late first line is due immediately");
+		// The next ticks are 2s apart, like the real postman. The second line is due
+		// one RADIUS after the first, not one `base + n×radius` step.
+		now = TICK_AT + 2_000;
+		await fx.postman.tick();
+		now = TICK_AT + 4_000;
+		await fx.postman.tick();
+		assert.equal(inbox(fx.db, "root").length, 1, "three consecutive ticks must not burn the whole quota");
+	} finally {
+		fx.db.close();
+	}
+});
+
+test("M1: a terminal child that is revived must not fire L2 immediately (D5 tombstone)", async () => {
+	let now = TICK_AT;
+	const radius = 10 * MINUTE;
+	const fx = fixture({
+		now: () => now,
+		children: [{ name: "worker", role: "worker", createdAt: TICK_AT - radius }],
+		noticeMsForRole: () => radius,
+	});
+	try {
+		await fx.postman.tick();
+		assert.equal(inbox(fx.db, "root").length, 1, "the first window is due");
+
+		// The child ends (its `nodes.created_at` never moves) …
+		updateNode(fx.db, "root.worker", { status: "settled" }, () => now);
+		now = TICK_AT + 60 * MINUTE;
+		await fx.postman.tick();
+		assert.equal(inbox(fx.db, "root").length, 1, "an ended child is never reminded about");
+
+		// … and `continue`/resume brings it back. The reviving tick must NOT read the
+		// old `created_at` as the baseline and announce "running for 70m".
+		updateNode(fx.db, "root.worker", { status: "running" }, () => now);
+		await fx.postman.tick();
+		assert.equal(inbox(fx.db, "root").length, 1, "the clock restarts at the revival, not at createdAt");
+
+		// One radius after the revival it is a real window again.
+		now += radius;
+		await fx.postman.tick();
+		assert.equal(inbox(fx.db, "root").length, 2);
+	} finally {
+		fx.db.close();
+	}
+});
+
+// ─────────── 9. review round: D6 late first line (pure) + D8 cache (m4) ───────────
+
+test("D6 late first line: one line now, the next only after a whole radius", () => {
+	const radius = 45 * MINUTE;
+	// Observed for the first time 3h into its run (a restarted postman taking over).
+	const base = 0;
+	const at = (now: number, longRunning: StallLineState) =>
+		decideStallNotice({ now, child: child(), thresholds: long(radius), window: window(base, { longRunning }) });
+
+	const first = at(180 * MINUTE, { count: 0 });
+	assert.equal(first?.sequence, 1, "the late first line is due at once");
+	// Three ticks 2s apart must not walk through 2× and 3× of the base.
+	for (const tick of [180 * MINUTE + 2_000, 180 * MINUTE + 4_000, 180 * MINUTE + 6_000]) {
+		assert.equal(at(tick, sentAt(1, 180 * MINUTE)), undefined, "the repeat clock starts at the SENT line");
+	}
+	assert.equal(at(180 * MINUTE + radius, sentAt(1, 180 * MINUTE))?.sequence, 2);
+	assert.equal(at(180 * MINUTE + 2 * radius, sentAt(2, 180 * MINUTE + radius))?.sequence, 3);
+	assert.equal(at(180 * MINUTE + 3 * radius, sentAt(3, 180 * MINUTE + 2 * radius)), undefined, "cap holds");
+});
+
+test("m4: the role radius is cached per (cwd, role) for the TTL, then re-resolved", () => {
+	// The real resolver reads the USER layer (`agentScope: "user"`, the launch default),
+	// so the card has to live in `$PI_CODING_AGENT_DIR/agents` — that is exactly the
+	// documented v1 limit: a PROJECT-level card's `loopNoticeMs` is not consulted.
+	const cwd = mkdtempSync(path.join(tmpdir(), "legion-loop-notice-cache-"));
+	const agentDir = path.join(cwd, "agents");
+	mkdirSync(agentDir, { recursive: true });
+	writeFileSync(
+		path.join(agentDir, "probe.md"),
+		"---\nname: probe\ndescription: probe role\ntimeoutMs: 600000\n---\nbody\n",
+	);
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = cwd;
+	try {
+		const settings = { disableBuiltins: true, agentOverrides: { probe: {} } } as unknown as Parameters<typeof loopNoticeMsForRole>[2];
+		let now = 1_000;
+		assert.equal(loopNoticeMsForRole("probe", agentDir, settings, () => now), 600_000);
+
+		// An override written while the entry is warm is NOT seen: that is the cache.
+		const overridden = { disableBuiltins: true, agentOverrides: { probe: { loopNoticeMs: 90_000 } } } as unknown as typeof settings;
+		now += LOOP_NOTICE_ROLE_TTL_MS - 1;
+		assert.equal(loopNoticeMsForRole("probe", agentDir, overridden, () => now), 600_000, "warm entry wins");
+		// One millisecond past the TTL it re-resolves — with the new override.
+		now += 1;
+		assert.equal(loopNoticeMsForRole("probe", agentDir, overridden, () => now), 90_000, "the TTL expires");
+		// A different role is a different key, never a stale hit from this one.
+		writeFileSync(
+			path.join(agentDir, "other.md"),
+			"---\nname: other\ndescription: other role\n---\nbody\n",
+		);
+		assert.equal(
+			loopNoticeMsForRole("other", agentDir, { disableBuiltins: true } as unknown as typeof settings, () => now),
+			DEFAULTS.turnTimeoutMs,
+			"a card with neither field falls back to the SDK turn budget",
+		);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+// ─────── 10. review round: the exit does not charge the sender (D4 / m1) ───────
+
+test("m1: a self-addressed notice does not spend the sender's mailRatePer5Min", async () => {
+	// rate 1: ONE counted row already exceeds the allowance, so this fails if the
+	// notice is counted (the exact defect: a node's own reminder rate-limits its
+	// `legion_mail`).
+	const fx = fixture({ silenceNoticeMs: 120_000, mailRatePer5Min: 1 });
+	try {
+		fx.supervisor.eventAges.set("worker", TICK_AT - 125_000);
+		await fx.postman.tick();
+		fx.stop();
+		assert.equal(inbox(fx.db, "root").length, 1, "fixture: the self-addressed row exists");
+
+		const sent = sendMail(
+			fx.db,
+			{ fromNode: "root", to: "worker", subject: "still allowed", body: "the parent can still write" },
+			{ ratePer5Min: 1, now: () => TICK_AT },
+		);
+		assert.equal(sent.ok, true, "the notice must not be charged to the sender");
+
+		// The window still counts real mail: one more send now exceeds rate 1.
+		const second = sendMail(
+			fx.db,
+			{ fromNode: "root", to: "worker", subject: "one too many", body: "rate window still works" },
+			{ ratePer5Min: 1, now: () => TICK_AT },
+		);
+		assert.equal(second.ok, false);
+		assert.equal(second.ok ? "" : second.code, "rate_limited");
+	} finally {
+		fx.db.close();
+	}
+});
+
+// ───── 11. review round: a centurion's notice is delivered by ITS parent (D4 path 3) ─────
+
+test("non-root: a centurion's own notice is delivered by its parent's postman (D4 path 3)", async () => {
+	const db = openLegionDb(":memory:");
+	const supervisor = new StallSupervisor();
+	insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => TICK_AT);
+	insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running" }, () => TICK_AT);
+	insertNode(db, { parentId: "root.team", name: "worker", role: "worker", status: "running" }, () => TICK_AT - 45 * MINUTE);
+	supervisor.live.add("team");
+	supervisor.live.add("worker");
+	const rootMessages: string[] = [];
+	const teamPostman = new LegionPostman({
+		db,
+		nodeId: "root.team",
+		supervisor,
+		settings: { orphanStaleMs: Number.MAX_SAFE_INTEGER },
+		noticeMsForRole: () => 45 * MINUTE,
+		now: () => TICK_AT,
+		intervalMs: 10_000,
+	});
+	const rootPostman = new LegionPostman({
+		db,
+		nodeId: "root",
+		supervisor,
+		settings: { orphanStaleMs: Number.MAX_SAFE_INTEGER },
+		noticeMsForRole: () => 45 * MINUTE,
+		now: () => TICK_AT,
+		sendRootMessage: (text) => rootMessages.push(text),
+		intervalMs: 10_000,
+	});
+	try {
+		await teamPostman.tick();
+		const written = inbox(db, "root.team");
+		assert.equal(written.length, 1, "the detector writes into its OWN inbox");
+		assert.equal(written[0]?.fromNode, "root.team");
+		assert.equal(written[0]?.toNode, "root.team");
+		assert.equal(
+			inbox(db, "root.team", { delivery: MAIL_DELIVERY.PENDING }).length,
+			1,
+			"a non-root postman does not deliver its own inbox — path 3 does",
+		);
+
+		await rootPostman.tick();
+		assert.equal(
+			inbox(db, "root.team", { delivery: MAIL_DELIVERY.ACCEPTED }).length,
+			1,
+			"the grandparent's deliverChildren handed it over",
+		);
+		const steered = supervisor.steered.filter((call) => call.name === "team");
+		assert.equal(steered.length, 1);
+		assert.match(steered[0]?.text ?? "", /Stall notice: worker/);
+		assert.match(steered[0]?.text ?? "", /running for 45m 0s/);
+		assert.deepEqual(rootMessages, [], "the root's own inbox was never used for this");
+	} finally {
+		teamPostman.stop();
+		rootPostman.stop();
+		db.close();
+	}
+});
+
+// ───── 12. review round: `extend` through the REAL tool entry (controlAction) ─────
+
+const ENTRY_ENV_KEYS = [
+	"PI_CODING_AGENT_DIR",
+	"PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS",
+	"PI_SUBAGENT_CHILD",
+	"PI_SUBAGENT_ALLOW_NESTED",
+	"PI_LEGION_DB",
+	"PI_LEGION_NODE_ID",
+	"PI_SUBAGENTS_TEAM",
+];
+
+/**
+ * The `abort-action.test.ts` harness: a real `piLegion` registration driven through
+ * `tools.get("subagent").execute(...)`, so `extend` is exercised through
+ * `controlAction` (name resolution, scope rules, the postman it reaches) and not
+ * only through the exported helper.
+ */
+function extendEntryHarness() {
+	const cwd = mkdtempSync(path.join(tmpdir(), "legion-extend-entry-"));
+	const agentDir = path.join(cwd, "agent-config");
+	const extraAgentsDir = path.join(cwd, "extra-agents");
+	mkdirSync(agentDir, { recursive: true });
+	mkdirSync(extraAgentsDir, { recursive: true });
+	writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ subagents: { disableBuiltins: true } }));
+	writeFileSync(path.join(extraAgentsDir, "worker.md"), "---\nname: worker\ndescription: worker role\nkind: pi\n---\nworker prompt\n");
+	const previous = new Map(ENTRY_ENV_KEYS.map((name) => [name, process.env[name]]));
+	const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }> }>();
+	const handlers = new Map<string, (...args: unknown[]) => unknown>();
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	const pi = {
+		registerTool(value: unknown) {
+			const typed = value as { name: string; execute: (...args: unknown[]) => Promise<{ content?: Array<{ text?: string }>; details?: unknown }> };
+			tools.set(typed.name, typed);
+		},
+		registerCommand() {},
+		registerMessageRenderer() {},
+		sendMessage() {},
+		events: { emit() {} },
+		on(name: string, handler: (...args: unknown[]) => unknown) {
+			handlers.set(name, handler);
+		},
+	};
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraAgentsDir;
+	for (const name of ENTRY_ENV_KEYS.slice(2)) delete process.env[name];
+	piLegion(pi as never, { supervisor });
+	const tool = tools.get("subagent");
+	assert.ok(tool);
+	return {
+		cwd,
+		supervisor,
+		async invoke(params: Record<string, unknown>) {
+			const result = await tool.execute("stall-notice-extend", params, undefined, undefined, {
+				cwd,
+				hasUI: false,
+				ui: { notify() {}, setStatus() {} },
+			});
+			return {
+				text: (result.content ?? []).map((item) => item.text ?? "").join("\n"),
+				error: (result.details as { error?: string } | undefined)?.error,
+			};
+		},
+		/** The ledger this session's root runtime created (one db per run dir). */
+		openLedger() {
+			const store = new RunStore({ rootDir: path.join(cwd, ".pi-subagents") });
+			const rootRun = store.listRuns().find((run) => run.nodeId === "root");
+			assert.ok(rootRun, "the launch created a root run");
+			return openLegionDb(legionDbPath(store.runDir(rootRun.runId)));
+		},
+		async cleanup() {
+			await handlers.get("session_shutdown")?.();
+			for (const [name, value] of previous) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+			rmSync(cwd, { recursive: true, force: true });
+		},
+	};
+}
+
+test("extend through `subagent({action:'extend'})`: receipt, unknown name, ended child", async () => {
+	initTheme("dark");
+	const harness = extendEntryHarness();
+	let db: ReturnType<typeof openLegionDb> | undefined;
+	try {
+		const launched = await harness.invoke({ agent: "worker", task: "long job", name: "worker-0", async: true, worktree: false });
+		assert.equal(launched.error, undefined, launched.text);
+
+		// 1. A real child of this session's root node: the postman moves its clock.
+		const extended = await harness.invoke({ action: "extend", name: "worker-0", ms: 120_000 });
+		assert.equal(extended.error, undefined, extended.text);
+		assert.match(extended.text, /Extended the stall-notice clock for worker-0/);
+		assert.match(extended.text, /due 120000ms from now/);
+		assert.match(extended.text, /does not extend a collect\/wait budget/);
+
+		// 2. A name nobody has: the same NOT_FOUND path as every other control action.
+		const unknown = await harness.invoke({ action: "extend", name: "ghost" });
+		assert.equal(unknown.error, ErrorCodes.NOT_FOUND);
+		assert.match(unknown.text, /ghost/);
+
+		// 3. D5: an ended child is refused — no receipt for a reminder nobody will send.
+		db = harness.openLedger();
+		const child = getChildren(db, "root").find((node) => node.name === "worker-0");
+		assert.ok(child, "the launch wrote the child row");
+		updateNode(db, child.id, { status: "settled" }, () => Date.now());
+		const ended = await harness.invoke({ action: "extend", name: "worker-0" });
+		assert.equal(ended.error, ErrorCodes.NOT_FOUND);
+		assert.match(ended.text, /has already ended/);
+	} finally {
+		db?.close();
+		await harness.cleanup();
 	}
 });

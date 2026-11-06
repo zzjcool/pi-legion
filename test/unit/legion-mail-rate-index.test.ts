@@ -26,9 +26,16 @@ import { insertNode } from "../../src/legion/nodes.ts";
  * #384 review m5 added the `Redelivered: ` exclusion: a platform re-delivery (a
  * preempted tool result that was thrown away and re-queued) is not a new send and
  * must not spend the sender's quota.
+ *
+ * stall-notice D4 added the self-addressed exclusion (`from_node <> to_node`): the
+ * stall notice writes `from_node = to_node` rows into its own inbox, and those are
+ * the system describing a node to itself — charging them would let a node's own
+ * reminders rate-limit its `legion_mail`. Same shape as the `subject` exclusion
+ * above: one more non-indexed predicate on the same bounded index range, so the
+ * plan stays a SEARCH on `idx_messages_rate` (never a scan).
  */
 const RATE_LIMIT_COUNT_SQL =
-	"SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ? AND subject NOT LIKE 'Redelivered: %'";
+	"SELECT COUNT(*) AS count FROM messages WHERE from_node = ? AND created_at > ? AND subject NOT LIKE 'Redelivered: %' AND from_node <> to_node";
 const RATE_LIMIT_COUNT_PREFIX = "SELECT COUNT(*) AS count FROM messages";
 const WINDOW_START = (now: number) => now - MAIL_RATE_WINDOW_MS;
 

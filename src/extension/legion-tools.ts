@@ -75,6 +75,7 @@ import {
 	formatStallNotice,
 	type StallAnnouncement,
 	type StallChildFacts,
+	type StallLineState,
 	type StallNoticeKind,
 } from "../legion/stall-notice.ts";
 import { isExplicitPhaseTimeout } from "../agents/settings.ts";
@@ -171,6 +172,17 @@ export interface StallExtendReceipt {
 	readonly loopRadiusMs: number | undefined;
 }
 
+/**
+ * Why an `extend` was refused (D5: "已终态 / 已 retire 的子不接受 extend").
+ *
+ * A receipt that promises a reminder nobody will ever send is worse than a refusal,
+ * so the two refusals are distinguishable: `unknown-child` is a name that is not a
+ * child of this node at all, `child-ended` is a real child whose run is over.
+ */
+export interface StallExtendRefusal {
+	readonly reason: "unknown-child" | "child-ended";
+}
+
 /** D6's key, without the bucket: the bucket lives inside the entry (see the field). */
 function stallAnnouncementKey(name: string, kind: StallNoticeKind): string {
 	return `${name}\u0000${kind}`;
@@ -204,9 +216,10 @@ export class LegionPostman {
 	 * bucket is exactly "a zeroed counter", and one row per `(child, kind)` keeps the
 	 * map bounded by the number of children instead of by the number of windows that
 	 * ever elapsed. `count` is the last sequence announced, so `count + 1` is the next
-	 * line the pure decision will accept.
+	 * line the pure decision will accept, and `lastAt` is WHEN that line was written —
+	 * D6's repeat clock measures from it, not from the window base.
 	 */
-	private readonly stallAnnouncements = new Map<string, { bucket: number; count: number }>();
+	private readonly stallAnnouncements = new Map<string, { bucket: number; count: number; lastAt: number }>();
 	private readonly now: () => number;
 	private readonly intervalMs: number;
 	private timer: ReturnType<typeof setInterval> | undefined;
@@ -970,8 +983,12 @@ export class LegionPostman {
 		const announcements: StallAnnouncement[] = [];
 		for (const child of children) {
 			if (hasEnded(child)) {
-				// D5: a terminal/retired child takes its clock (and its counters) with it.
-				this.forgetStallState(child.name);
+				// D5: an ENDED child leaves a tombstone, not a hole. `continue`/resume can
+				// bring it back with the same `nodes.created_at`, so deleting the entry
+				// would make the next tick take that old creation time as a fresh baseline
+				// and announce "running for 70m" one tick after the revival. The tombstone
+				// (`absent`) is what turns the revival into a restart.
+				this.tombstoneStallClock(child.name);
 				continue;
 			}
 			// D9: no new liveness verdict. This only reads the one the supervisor
@@ -993,8 +1010,8 @@ export class LegionPostman {
 				},
 				window: {
 					loopBaseAt: clock.loopBaseAt,
-					silenceAnnounced: this.stallAnnouncedCount(child.name, "silence", facts.lastEventAt),
-					longRunningAnnounced: this.stallAnnouncedCount(child.name, "long-running", clock.loopBaseAt),
+					silence: this.stallAnnouncedState(child.name, "silence", facts.lastEventAt),
+					longRunning: this.stallAnnouncedState(child.name, "long-running", clock.loopBaseAt),
 				},
 			});
 			if (announcement) announcements.push(announcement);
@@ -1009,6 +1026,7 @@ export class LegionPostman {
 			this.stallAnnouncements.set(stallAnnouncementKey(announcement.childName, announcement.kind), {
 				bucket: announcement.sinceBucket,
 				count: announcement.sequence,
+				lastAt: timestamp,
 			});
 		}
 	}
@@ -1041,12 +1059,13 @@ export class LegionPostman {
 		return known;
 	}
 
-	/** D5: entries whose child is gone for now are flagged, not dropped. */
+	/** D5: entries whose child is gone for NOW are flagged, not dropped. */
 	private markAbsentStallClocks(children: readonly LegionNode[], live: ReadonlySet<string>): void {
 		const known = new Set(children.map((child) => child.name));
 		for (const [name, clock] of this.stallClocks) {
 			if (!known.has(name)) {
-				// The node itself is gone from the ledger: nothing can make it reappear.
+				// D5: the name is gone from the ledger itself — nothing can make it
+				// reappear, so this is the ONE case that deletes the entry.
 				this.forgetStallState(name);
 				continue;
 			}
@@ -1055,9 +1074,31 @@ export class LegionPostman {
 		}
 	}
 
+	/**
+	 * D5: an ended child keeps a tombstone and loses its counters.
+	 *
+	 * The clock itself is not a measurement any more — nobody is running — but "it
+	 * WAS here and is not any more" is the fact the revival branch needs.
+	 */
+	private tombstoneStallClock(name: string): void {
+		const known = this.stallClocks.get(name);
+		this.stallClocks.set(name, {
+			loopBaseAt: known?.loopBaseAt ?? this.now(),
+			...(known?.loopRadiusMs === undefined ? {} : { loopRadiusMs: known.loopRadiusMs }),
+			absent: true,
+		});
+		this.forgetStallAnnouncements(name);
+	}
+
+	/** Only the counters: the clock is the caller's choice (tombstone vs delete). */
+	private forgetStallAnnouncements(name: string): void {
+		for (const kind of STALL_KINDS) this.stallAnnouncements.delete(stallAnnouncementKey(name, kind));
+	}
+
+	/** D5: the name left the ledger, so both halves of the state go with it. */
 	private forgetStallState(name: string): void {
 		this.stallClocks.delete(name);
-		for (const kind of STALL_KINDS) this.stallAnnouncements.delete(stallAnnouncementKey(name, kind));
+		this.forgetStallAnnouncements(name);
 	}
 
 	/**
@@ -1103,24 +1144,40 @@ export class LegionPostman {
 		}
 	}
 
-	private stallAnnouncedCount(name: string, kind: StallNoticeKind, bucket: number | undefined): number {
-		if (bucket === undefined) return 0;
+	/**
+	 * What this window has already said, or the empty state.
+	 *
+	 * A different `sinceBucket` IS a different window (a new event for L1, an
+	 * `extend` or a revival for L2), so a stale entry contributes nothing — that is
+	 * the whole de-duplication rule of D6, with the entry keyed `(child, kind)` and
+	 * the bucket carried in the value.
+	 */
+	private stallAnnouncedState(
+		name: string,
+		kind: StallNoticeKind,
+		bucket: number | undefined,
+	): StallLineState {
+		if (bucket === undefined) return { count: 0 };
 		const known = this.stallAnnouncements.get(stallAnnouncementKey(name, kind));
-		// `count` is the last sequence announced, so the next line is `count + 1`.
-		return known && known.bucket === bucket ? known.count : 0;
+		if (!known || known.bucket !== bucket) return { count: 0 };
+		return { count: known.count, lastAt: known.lastAt };
 	}
 
 	/**
 	 * D5's `extend`: move this child's L2 baseline to now, optionally changing its
-	 * radius. Returns `undefined` when the name is not one of this node's children
-	 * (the caller answers `NOT_FOUND`).
+	 * radius.
+	 *
+	 * Refuses (rather than acknowledging) a name that is not one of this node's
+	 * children, and equally an ENDED one: no tick will ever judge that child again,
+	 * so a receipt would promise a reminder that cannot arrive (D5).
 	 *
 	 * It does NOT touch `lastEventAt`, so L1 keeps measuring the real silence (D5:
 	 * "不延后 L1" — an objective gap must not be renewable away).
 	 */
-	extendStallWindow(name: string, ms?: number): StallExtendReceipt | undefined {
+	extendStallWindow(name: string, ms?: number): StallExtendReceipt | StallExtendRefusal {
 		const child = getChildren(this.db, this.nodeId).find((candidate) => candidate.name === name);
-		if (!child) return undefined;
+		if (!child) return { reason: "unknown-child" };
+		if (hasEnded(child)) return { reason: "child-ended" };
 		const now = this.now();
 		const known = this.stallClocks.get(name);
 		const radius = ms ?? known?.loopRadiusMs;

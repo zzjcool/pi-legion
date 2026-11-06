@@ -61,14 +61,29 @@ export interface StallThresholds {
 	readonly loopRadiusMs?: number;
 }
 
+/**
+ * What has already been said in ONE window (D6).
+ *
+ * `count` and `lastAt` travel together on purpose: the repeat clock is "one
+ * interval after the PREVIOUS line", so a count without the time it was sent at is
+ * not enough to decide anything. The caller records `lastAt = now` of the tick that
+ * emitted.
+ */
+export interface StallLineState {
+	/** Lines already announced in this window. */
+	readonly count: number;
+	/** Host-clock reading of the last of them; `undefined` when `count === 0`. */
+	readonly lastAt?: number;
+}
+
 /** The per-tick half of the state the CALLER owns (D5/D6: memory only). */
 export interface StallWindow {
 	/** L2 baseline: `nodes.created_at` on first sight, or `now` after `extend`. */
 	readonly loopBaseAt: number;
-	/** L1 announcements already made in the current silence window. */
-	readonly silenceAnnounced: number;
-	/** L2 announcements already made in the current long-running window. */
-	readonly longRunningAnnounced: number;
+	/** L1 lines already sent in the current silence window. */
+	readonly silence: StallLineState;
+	/** L2 lines already sent in the current long-running window. */
+	readonly longRunning: StallLineState;
 }
 
 /** One line of the notice; the caller merges the lines of one tick into one mail (D7). */
@@ -133,12 +148,11 @@ function silenceAnnouncement(input: {
 	if (sinceBucket === undefined || !Number.isFinite(sinceBucket)) return undefined;
 	const elapsedMs = now - sinceBucket;
 	if (!(elapsedMs >= thresholdMs)) return undefined;
-	const sequence = window.silenceAnnounced + 1;
+	const sequence = window.silence.count + 1;
 	if (sequence > SILENCE_NOTICE_LIMIT) return undefined;
-	// The rhythm, not merely "past the threshold": line N waits for N× the
-	// threshold, so the second announcement is a re-check interval after the first
-	// and never two mails in two consecutive 2s ticks.
-	if (elapsedMs < thresholdMs * sequence) return undefined;
+	// The rhythm, not merely "past the threshold" (D6): the FIRST line is measured
+	// from the window's start, every LATER line from the line before it.
+	if (!afterPreviousLine(window.silence, now, thresholdMs)) return undefined;
 	return { kind: "silence", childName: child.name, sinceBucket, sequence, elapsedMs, thresholdMs };
 }
 
@@ -155,9 +169,9 @@ function longRunningAnnouncement(input: {
 	if (!Number.isFinite(sinceBucket)) return undefined;
 	const elapsedMs = now - sinceBucket;
 	if (!(elapsedMs >= thresholdMs)) return undefined;
-	const sequence = window.longRunningAnnounced + 1;
+	const sequence = window.longRunning.count + 1;
 	if (sequence > LONG_RUNNING_NOTICE_LIMIT) return undefined;
-	if (elapsedMs < thresholdMs * sequence) return undefined;
+	if (!afterPreviousLine(window.longRunning, now, thresholdMs)) return undefined;
 	const inFlightMs = child.inFlightTool === undefined ? undefined : now - (child.inFlightToolStartedAt ?? Number.NaN);
 	return {
 		kind: "long-running",
@@ -169,6 +183,29 @@ function longRunningAnnouncement(input: {
 		...(child.inFlightTool === undefined ? {} : { inFlightTool: child.inFlightTool }),
 		...(inFlightMs !== undefined && Number.isFinite(inFlightMs) && inFlightMs >= 0 ? { inFlightMs } : {}),
 	};
+}
+
+/**
+ * D6's repeat clock: nothing has been said yet, or one whole interval has passed
+ * since the last line.
+ *
+ * Measuring repeats from the WINDOW BASE (`base + n × radius`) is the bug this
+ * function exists to prevent: a child first observed long past its threshold would
+ * satisfy every `n` at once and spend the entire quota in three consecutive 2s
+ * ticks. A line once sent is a fact with a timestamp — the next one waits for it.
+ *
+ * A `count > 0` with no `lastAt` is a caller defect (the two fields travel
+ * together), and the safe reading is "not due": guessing would re-spam.
+ */
+function afterPreviousLine(
+	state: StallLineState,
+	now: number,
+	intervalMs: number,
+): boolean {
+	if (state.count === 0) return true;
+	const lastAt = state.lastAt;
+	if (lastAt === undefined || !Number.isFinite(lastAt)) return false;
+	return now - lastAt >= intervalMs;
 }
 
 /**
