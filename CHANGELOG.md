@@ -11,7 +11,39 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [5.3.0] — 2026-11-06
+
+一次「下游很久没动静时说一声」的发布。新增两个**只通知、不处置**的探测器：L1 抓「进程活着但僵住」，
+L2 抓「跑满一整个角色预算还没结束，可能陷入循环」；父节点可以把提醒往后推（`extend`），但系统永不
+自己 `abort` / `stop` / `retire` 任何子节点。另一条线是收尾：#301 删掉那批角色卡之后，仍然把用户
+（和子节点）引向它们的几处模板、示例团队与 mock 脚本被清掉，并加了机械门禁。
+
+### Added
+
+- **子节点「很久没有动静」会主动通知父节点（`stall-notice v1`，`docs/contracts/stall-notice-v1.md`）。**
+  L1 静默 = 不在任何工具里且 `120s` 没有任何事件（`subagents.legion.silenceNoticeMs`）；**栈非空时
+  绝不报**——一个 10 分钟的 `npm run build` 与一个卡死的 `bash` 在父侧事件流里完全同形，所以「正在跑
+  某个工具」只能作为证据出现在 L2 的文案里（「正在跑 `bash`，已 38 分钟」），不能判成卡死。
+  L2 长跑 = 已运行超过角色预算（角色卡 `loopNoticeMs` → `timeoutMs` → `900s`；因此内置角色是
+  scout 10 分钟 / centurion 30 分钟 / worker 45 分钟）。提醒写进父节点**自己的** inbox：父正卡在
+  `wait` / `collect` 里时 250ms 内被打断，否则由它自己的父的邮差在 2s tick 里投递。
+- **`subagent({ action: "extend", name, ms? })`**：把该子节点的 L2 基准前移到现在，下一次到期继续提醒。
+  它**不延长 `collect` / `wait` 的预算、不重启子节点、也不延后 L1**——L1 量的是客观的静默，不该被续期
+  抹掉。已终态的子节点会被拒绝（回执不会承诺一封永远不会到来的提醒）。
+- **L2 阈值可以按角色卡单独声明**：新 frontmatter 字段 `loopNoticeMs`（`0` 关闭该提醒），也可用
+  `subagents.agentOverrides.<name>.loopNoticeMs`。层解析先走 launch 的默认作用域（user），找不到再
+  回落全部层，所以 `agentScope: "project" | "both"` 派发的项目层卡片也会被解析到——否则一个 45 分钟
+  预算的项目角色会在 15 分钟处被提醒三次。
+- 两个探测器都只产出字符串与一条 mail：不 `abort`、不 `stop`、不 `retire`，不新增事件类型、不改
+  `nodes` schema、不改心跳与孤儿扫描判据。多子在同一 tick 到期会合并成一封，单个子节点最多 2 封（L1）/
+  3 封（L2）。自投递的提醒不计入发送方的 `mailRatePer5Min` 配额。
+
+### Changed
+
+- 测试沙箱（`test/docker`）的 real-model 默认切到 `hy4std`，并把 `pi` 钉到 `1.5.0`。
+
 ### Fixed
+
 - **#301 删了角色卡，却没删“会把用户带到那张卡”的几处**：
   `examples/subagents-child-context.md` / `subagents-parent-context.md` 仍在教子 agent
   用 `subagent({ agent: "advisor" })` 做失败止损（这两份模板会被复制成
