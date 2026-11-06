@@ -948,9 +948,15 @@ test("stall-notice D2 rpc: the event age rides the RPC stream already consumed",
 		assert.equal(h.supervisor.inFlightToolStack("root.worker"), undefined);
 		assert.ok((h.supervisor.lastEventAt("root.worker") ?? 0) >= afterTurn);
 
-		// The UI/activity envelopes are NOT coarse events: they must not refresh it.
+		// Child-side `setActivity` / `setProgramRecord` envelopes are NOT child events: the
+		// RPC stream routes them to the UI proxy and returns **before** the fold
+		// (`handleRpcEvent`), so they must not refresh the age. The payload has to be a
+		// well-formed one (`isExtensionActivity` requires `record{id,state}` or
+		// `source: string`) — a malformed one falls through the fold like any other
+		// event and *does* refresh the clock, which is why this assertion used to pass
+		// by landing in the same millisecond and fail on CI when it did not.
 		const parked = h.supervisor.lastEventAt("root.worker");
-		client.emit({ type: "extension_activity", activity: { label: "thinking" } });
+		client.emit({ type: "extension_activity", id: "a1", source: "host", activity: null });
 		assert.equal(h.supervisor.lastEventAt("root.worker"), parked, "an activity ping is not child progress");
 
 		// A dead child answers nothing, whatever the record still holds.
