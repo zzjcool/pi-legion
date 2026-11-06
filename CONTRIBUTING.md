@@ -194,6 +194,24 @@ follow-up), so a locally built `tui-sandbox:latest` works without retagging; the
 historical default is only a fallback. `make rpc` in `test/docker` runs the eleven
 against `$(IMAGE)`.
 
+### Verifying a plugin code change in the sandbox
+
+`/plugin` is a read-only mount of this checkout, so a code change does **not**
+need a rebuild — `make rebuild` is only for `Dockerfile` / pi-version changes
+(and it deletes the container, so follow it with `make up`). The agent-executable
+path is:
+
+```bash
+cd test/docker && make rebuild && make up && make smoke && make rpc
+```
+
+`make run` is the interactive TUI (`docker exec -it`) and needs a real terminal.
+Two non-interactive probes that answer "what does a child agent actually get"
+live in [`test/docker/README.md`](test/docker/README.md#改完插件代码后怎么测agent-可执行) —
+the important gotcha is that MCP tools have `deferred` exposure, so a child's
+tool list never shows `mcp__*`; count `ALL_TOOLS` from inside a codemode script
+instead.
+
 Each `inside-N-*.sh` is what actually runs **in** the container. Keep those
 scripts self-contained: they should still make sense if you `docker exec`
 them by hand.

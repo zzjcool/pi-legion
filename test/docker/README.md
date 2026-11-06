@@ -33,6 +33,63 @@ make tui-visual   # mock 模型确定性 TUI 回归
 
 路径全部从 Makefile 位置反推仓库根，不硬编码 `/root/...`。
 
+## 改完插件代码后怎么测（agent 可执行）
+
+`/plugin` 是**宿主源码的只读挂载**，所以改代码**不需要重建镜像**——重建只在改了
+`Dockerfile`、或镜像里烧的 pi 版本要换时才有意义。
+
+```sh
+cd test/docker
+make rebuild     # 只在改 Dockerfile / 换 pi 版本时；>300s，日志 /tmp/pi-legion-build.log
+make up          # 起容器（不进 pi）。rebuild 会删掉容器，这两步别漏
+make smoke       # L1 模型 → L2 插件真加载 → L3 subagent 工具注册 → L4 worktree 角色可跑
+make rpc         # 11 个 RPC 主线 verify；改了 args.ts / 子进程 argv 时必须跑
+```
+
+`make run` 是**交互 TUI**（`docker exec -it`），要真终端；agent / CI 用 `make print`，
+或下面这些 `docker exec … --print`。
+
+### 探针一：子 agent 真实的工具表
+
+```sh
+docker exec pi-legion-real pi --model workbuddy/hy4std --print \
+  '调用 subagent 派一个 scout，task 原样传：“列出你当前可用的工具名（逗号分隔，不要猜），\
+并回答：有没有 codemode / legion_mail / 任何 mcp__ 开头的工具。”把它的输出原样贴出来。'
+```
+
+### 探针二：MCP 工具（**必须走 codemode**）
+
+MCP 工具的默认 `exposure` 是 `codemode`→`deferred`，**不进程工具列表**，所以「探针一」
+里自报工具表永远看不到 `mcp__*`——用 codemode 脚本数 `ALL_TOOLS` 才是真信号：
+
+```sh
+docker exec pi-legion-real pi --model workbuddy/hy4std --print \
+  '派一个 scout，task：“用 codemode 跑：const hits = ALL_TOOLS.filter(t => t.name.startsWith("mcp__")).map(t => t.name); return hits.length ? hits.length + ":" + hits.join(",") : "NONE"; 把输出原样贴出。”'
+```
+
+容器里**默认没有 MCP 配置**（`run-tui-real.sh` 只挂 `auth.json` / `models-store.json`），
+要测得先把宿主配置塞进去：
+
+```sh
+docker cp ~/.pi/agent/mcp.json pi-legion-real:/root/.pi/agent/mcp.json
+```
+
+关掉兜底开关再测一遍，应当一个都没有：
+
+```sh
+docker exec -e PI_LEGION_CHILD_MCP=0 pi-legion-real pi --model workbuddy/hy4std --print '<同一条探针>'
+```
+
+### 基线（2026-11-06，master `0d8dd03`，真模型）
+
+| 探针 | 结果 |
+| --- | --- |
+| `make smoke` | L1–L4 全过 |
+| `make rpc` | 11/11 PASS |
+| 探针一 | `read, grep, find, ls, bash, codemode, legion_mail, legion_tree`（`legion_phase` 只属于有 phase machine 的 centurion） |
+| 探针二（默认） | `4:mcp__search_hub__web_search,mcp__search_hub__web_fetch,mcp__search_hub__search_status,mcp__search_hub__search_login` |
+| 探针二（`PI_LEGION_CHILD_MCP=0`） | `NONE` |
+
 ## 两条路
 
 | 路 | 用途 | 网络 | 模型 |
