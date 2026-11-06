@@ -726,8 +726,20 @@ async function defaultSessionFactory(
 	// does not emit it, so a retired child's servers would run until the root
 	// exits. The release is armed unconditionally; it only emits for a session
 	// that was actually bound (see `releaseChildSessionExtensions`).
+	//
+	// r4 F2: a bind failure must not orphan the session. `session_start` may already
+	// have reached the extensions (MCP included) and `spawnChild` only records the
+	// session AFTER this factory resolves — so its `rollbackSpawn` would have
+	// nothing to dispose. Dispose here (the armed release still emits) and rethrow.
 	attachChildSessionRelease(session);
-	if (childEnablesMcp(process.env)) await bindChildSessionExtensions(session, input.name);
+	if (childEnablesMcp(process.env)) {
+		try {
+			await bindChildSessionExtensions(session, input.name);
+		} catch (error) {
+			void session.dispose();
+			throw error;
+		}
+	}
 	return session;
 }
 
@@ -1559,7 +1571,9 @@ export class InProcessSupervisor implements LegionSupervisor {
 			reason: "child spawn failed",
 		});
 		try {
-			child.session?.dispose();
+			// r4 F3: the armed `dispose()` resolves after the real teardown (it emits
+			// `session_shutdown` first), so the slot must not be freed until it settles.
+			await child.session?.dispose();
 		} catch {
 			/* preserve launch error */
 		} finally {
@@ -1753,7 +1767,9 @@ export class InProcessSupervisor implements LegionSupervisor {
 		child.lastTurnResult = result;
 		this.resolveWaiters(child, result);
 		try {
-			child.session?.dispose();
+			// r4 F3: awaited — the retired slot is only free once the shutdown emit and
+			// the real `dispose()` have run.
+			await child.session?.dispose();
 		} catch {
 			/* dispose best-effort */
 		} finally {
@@ -1767,7 +1783,10 @@ export class InProcessSupervisor implements LegionSupervisor {
 	private disposeRecord(child: ChildRecord): void {
 		child.unsubscribeSession?.();
 		try {
-			child.session?.dispose();
+			// r4 F3: this record is already retired/exited and its slot was released
+			// there, so there is no concurrency to respect — the promise is discarded
+			// on purpose, keeping this path synchronous.
+			void child.session?.dispose();
 		} catch {
 			/* ignore */
 		}

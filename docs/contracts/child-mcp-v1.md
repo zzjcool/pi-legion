@@ -358,3 +358,104 @@ dbPath，`Boolean(childContext?.nodeId && dbPath)` 因此失效，`session_start
 
 修完重新跑一次 fresh-context review（同一份契约，范围 `master...feat/child-mcp-v1`），
 **C1 未修则不得合并**。
+
+### r4 — 第二轮 review（N1 critical + N2/N3 major）。阻塞合并项
+
+#### F1（critical）— 补发 `session_shutdown` 会关掉**别人的** ledger handle
+
+**事实链**（已逐跳核实）：
+
+1. r3 的 emit 收件人是该子会话加载的**全部**扩展，包括 legion 自己 ——
+   `childGuardExtensionPath()` 就是仓库根 `index.ts`（`args.ts:82-87`），in-process 子会话的
+   `additionalExtensionPaths` 必含它（`inprocess-supervisor.ts:184`）。
+2. 子会话里 `piLegion()` 又跑一遍，注册三个 `session_shutdown` handler，全部以
+   `stopLegionRuntime(ownLegionKey)` 收尾：`index.ts:1880`（utility 子会话）、
+   `index.ts:2038`、`index.ts:2462`（经 `shutdownRetireAll:1739`）。
+3. `ownLegionKey` 只在 `adoptLegionIdentity`（`index.ts:1556-1566`）里赋值，而它只由
+   `initializeLegionRuntime` 调用。对以下子会话它**永远是 undefined**：
+   - `stripLegionIdentity: true` 的 vexillatio 子会话（`orchestrator.ts:1354-1355` 把 nodeId 与 dbPath 都省掉）；
+   - 在首次 `before_agent_start` 之前就被退役/回滚的任意子会话（懒挂还没跑）。
+4. `stopLegionRuntime(key === undefined)` 的分支是**关掉全部**：`index.ts:1528-1531`
+   `[...legionIdentities.entries()]`，而 `legionIdentities` 是**模块级、进程共享**
+   （`index.ts:1388`）。⇒ root 的 db handle + postman + dbEventSource 被关并从表里删掉，
+   root 之后 `ownLegionIdentity()` 恒 undefined →「database is not open」。
+   这正是 `index.ts:1370-1385` 记录过的 #283/#285 事故形态。
+
+**决定**：三个 `session_shutdown` handler **只关自己**：
+
+```ts
+// A child session's shutdown must never sweep handles it does not own: `ownLegionKey`
+// is undefined for identity-less children (stripLegionIdentity) and for a child
+// retired before its first turn, and `stopLegionRuntime(undefined)` closes EVERY
+// handle in the process-shared map — including the root's (#283/#285).
+if (ownLegionKey !== undefined) stopLegionRuntime(ownLegionKey);
+```
+
+`stopLegionRuntime(undefined)` 的「关全部」分支保留（`index.ts:1563` 的 adopt 替换路径依赖函数形状），
+但**不得**再从 session 生命周期路径以 undefined 调用。
+
+**净收益（要写进 CHANGELOG）**：守卫之后，跑过至少一轮的子会话在退役时终于会关掉**自己的**
+postman + db handle —— 这是 MR2 之前 in-process 子会话的历史泄漏，r3 顺手修掉了它。
+
+**测试**：`index.ts` 的 map 是模块私有的，行为测试成本过高；本项以**代码审查 + 变异**为准，
+契约要求 worker 在报告里贴出三个 handler 改动后的行号。
+
+#### F2（major）— bind 失败时整个 session 无人 dispose
+
+`inprocess-supervisor.ts:729-730` 先 arm release 再 `await bind…`；bind 抛出时 factory 直接 reject，
+而 `registration.session = session` 在 `await sessionFactory(...)` **之后**才赋值
+（`:873→889`），于是 `rollbackSpawn` 的 `child.session?.dispose()`（`:1560`）是 no-op：
+`session_start` 已 emit、MCP 可能已 startConnection，这批连接永不关闭。
+
+**决定**：把「已尝试 bind」记进 `boundSessions` 的时机提前到 **bind 调用之前**，并在 factory 内
+try/catch：
+
+```ts
+attachChildSessionRelease(session);
+if (childEnablesMcp(process.env)) {
+  try { await bindChildSessionExtensions(session, input.name); }
+  catch (error) { session.dispose(); throw error; }   // release 会把 shutdown 发出去
+}
+```
+
+（`boundSessions.add` 移到 `bindChildSessionExtensions` 的第一行；`session_shutdown` 在 start 从未
+发出的极端情况下是无害空转 —— MCP handler 关闭空集合。）
+
+#### F3（major）— `dispose()` 变成异步后，slot 释放早于真实回收
+
+r3 的包装让 `dispose()` 立刻返回、真正回收推迟 ≤1s；三个退役点都在它返回后同步释放 slot
+（`inprocess-supervisor.ts:1556-1566`、`:1756-1763`、`:1770-1774`），于是 8 slot 轮转下
+真实并发可能短暂超过 8，fallback 重试复用同一 `sessionFile` 时旧 attempt 可能尚未 invalidate。
+
+**决定**：
+
+1. `attachChildSessionRelease` 包装后的 `dispose()` **返回 `Promise<void>`**
+   （`ChildSessionBinding.dispose?: () => void | Promise<void>`）。
+2. `rollbackSpawn` / `retireChild` 改为 `await child.session?.dispose()`（两者已是 `async`），
+   之后才 `emitSlotReleased`。
+3. `disposeRecord` 保持同步：`void child.session?.dispose()`（它只丢弃已 retired/exited 的记录，
+   slot 早已释放，无并发风险）。
+4. 代码注释注明：1000ms 上限到点即 dispose，此时关闭动作已**发起**但未必完成（不是泄漏，
+   只延后进程退出）。
+
+#### F4（minor，但陈述必须改）— 两处「没有回收点」的表述现在是错的
+
+`index.ts:1625-1627` 与 `CHANGELOG.md:38` 说「legion 的 runtime 没有对应的回收点」。r3 之后
+**有**了（就是这次 emit），且 F1 让它是安全的。改成准确表述并写进 CHANGELOG 的净收益。
+
+#### F5（minor）— 1000ms 上限没有测试
+
+`releaseChildSessionExtensions` 增加可选 `timeoutMs`（默认 1000），D7.5 补一条：
+emit 永不 resolve 时 `dispose` 仍然在超时后跑到。
+
+#### F6（minor）— 接受并记录
+
+`test/unit/child-session.test.ts` 的两条源码计数钉子定性为「接线 tripwire，防的是整行被删」，
+注释已写明；不再加码。review 认为它给假安全感 —— 接受，理由：这是唯一能钉住「武装发生在 bind
+之前 / 只武装一次」的机械手段，成本低于导出 `defaultSessionFactory`。
+
+---
+
+## 8. 复核要求（第二轮）
+
+修完再跑一次 fresh-context review。**F1 未修不得合并。**

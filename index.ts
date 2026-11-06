@@ -1524,6 +1524,11 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	 * Close one ledger handle (by resolved path) or every handle this process
 	 * opened. Shutdown handlers pass their own path so a child session teardown
 	 * cannot close the parent's database (#283).
+	 *
+	 * The `key === undefined` branch is the adopt-replacement path, NOT a session
+	 * lifecycle one (`child-mcp-v1` r4 F1): `legionIdentities` is process-shared, so
+	 * calling it with `undefined` from a shutdown handler would close the root's
+	 * handle (and every sibling's) — see `ownLegionKey`'s three call sites.
 	 */
 	const stopLegionRuntime = (key?: string): void => {
 		const targets = key === undefined
@@ -1622,9 +1627,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// now runs here too — and must NOT initialize the legion runtime, because an
 		// in-process child shares the parent's `process.env`: under an rpc parent it
 		// would init on the ANCESTOR's `PI_LEGION_*` identity, get flipped to its own
-		// on this very event, and have no reclaim point. (`r3 C1` added one
-		// `session_shutdown` emit for the extension bind, but legion's runtime init is
-		// not part of it — `InProcessSupervisor` still only calls `dispose()`.)
+		// on this very event, and only ever close the handle it adopted. (`r3 C1`'s
+		// `session_shutdown` emit does reach legion's own handlers, which is why they
+		// are guarded to close only their own key — r4 F1.)
 		if (childContext?.nodeId && childContext.dbPath) {
 			const legionNode = { dbPath: childContext.dbPath, nodeId: childContext.nodeId };
 			let attached = false;
@@ -1736,7 +1741,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		]);
 		// Scope to the ledger THIS entry opened: a parent and its in-process child
 		// both register a shutdown handler, and each must close only its own (#283).
-		stopLegionRuntime(ownLegionKey);
+		//
+		// r4 F1: `ownLegionKey === undefined` means this entry never adopted a ledger
+		// (an identity-less `stripLegionIdentity` child, or a child retired before its
+		// first turn). `stopLegionRuntime(undefined)` closes EVERY handle in the
+		// process-shared map — including the root's — which is exactly the #283/#285
+		// accident. No handle, nothing to close.
+		if (ownLegionKey !== undefined) stopLegionRuntime(ownLegionKey);
 	};
 	if (process.env[UTILITY_CHILD_ENV] !== "1") {
 		pi.registerTool({
@@ -1877,7 +1888,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		};
 	});
 	if (process.env[UTILITY_CHILD_ENV] === "1") {
-		pi.on("session_shutdown", () => stopLegionRuntime(ownLegionKey));
+		// r4 F1: a session's shutdown must never sweep handles it does not own. An
+		// identity-less utility child never adopts a key, and `stopLegionRuntime(
+		// undefined)` would close the root's handle (and every sibling's), because
+		// `legionIdentities` is process-shared (#283/#285).
+		pi.on("session_shutdown", () => {
+			if (ownLegionKey !== undefined) stopLegionRuntime(ownLegionKey);
+		});
 		return;
 	}
 	let lastUi: ExtensionUIContext | undefined;

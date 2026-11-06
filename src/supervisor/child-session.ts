@@ -51,7 +51,11 @@ export interface ChildSessionBinding {
 	}): Promise<void>;
 	/** Public getter on `AgentSession` (`agent-session.d.ts:937`). */
 	extensionRunner?: ChildExtensionRunner;
-	dispose(): void;
+	/**
+	 * Sync on `AgentSession`; the armed wrapper returns a promise (F3) so the retire
+	 * paths can await the real teardown before freeing the slot.
+	 */
+	dispose?: () => void | Promise<void>;
 }
 
 /**
@@ -88,15 +92,18 @@ export async function bindChildSessionExtensions(
 	name?: string,
 ): Promise<void> {
 	const label = name ? ` ${name}` : "";
+	// Recorded BEFORE the call (r4 F2): if `bindExtensions` throws, the factory
+	// disposes the session — and that dispose must still be allowed to emit
+	// `session_shutdown`, because `session_start` may already have gone out to
+	// extensions (MCP included). The reverse (record only on success) left a
+	// half-started session with live MCP connections and no owner.
+	boundSessions.add(session);
 	await session.bindExtensions({
 		mode: "print",
 		onError: (error) => {
 			console.warn(`[pi-legion] in-process child${label} extension error: ${describeExtensionError(error)}`);
 		},
 	});
-	// Recorded only after a successful bind: `releaseChildSessionExtensions` owes a
-	// shutdown exactly to the sessions whose extensions were told `session_start`.
-	boundSessions.add(session);
 }
 
 /**
@@ -129,8 +136,13 @@ const SHUTDOWN_EMIT_TIMEOUT_MS = 1000;
  * caller's `dispose()` still runs. No-ops for a session that was never bound
  * (`PI_LEGION_CHILD_MCP=0` means no bind, so inherited host extensions must not
  * receive a shutdown they never got a start for).
+ *
+ * `timeoutMs` is an injectable seam for the D7.5 case that pins the bound (r4 F5).
  */
-export async function releaseChildSessionExtensions(session: ChildSessionBinding): Promise<void> {
+export async function releaseChildSessionExtensions(
+	session: ChildSessionBinding,
+	timeoutMs: number = SHUTDOWN_EMIT_TIMEOUT_MS,
+): Promise<void> {
 	// `delete` is the once-guard: the first caller takes the entry, later ones see
 	// false and stay silent (two `dispose()` calls, two retire paths, …).
 	if (!boundSessions.delete(session)) return;
@@ -141,7 +153,7 @@ export async function releaseChildSessionExtensions(session: ChildSessionBinding
 		await Promise.race([
 			runner.emit({ type: "session_shutdown", reason: "quit" }),
 			new Promise<void>((resolve) => {
-				timer = setTimeout(resolve, SHUTDOWN_EMIT_TIMEOUT_MS);
+				timer = setTimeout(resolve, timeoutMs);
 				timer.unref?.();
 			}),
 		]);
@@ -162,27 +174,37 @@ export async function releaseChildSessionExtensions(session: ChildSessionBinding
  * closing every connection) must run while the extension ctx is still valid,
  * and `dispose()` invalidates it — and disposes even when the emit fails.
  *
+ * Returns a promise (r4 F3): the wrapped call finishes when the real teardown has
+ * run, so `rollbackSpawn` / `retireChild` can await it before freeing the slot.
+ * When the 1000ms bound trips, the shutdown has been INITIATED but may not have
+ * completed — that is a delayed exit, not a leak, and it must not hold the slot.
+ *
  * Installed unconditionally by `defaultSessionFactory`; whether an event is owed
  * is decided by {@link releaseChildSessionExtensions}, not by the caller.
+ *
+ * `timeoutMs` is forwarded to the release so D7.5 can pin the bound without a
+ * one-second test (r4 F5); production never passes it.
  *
  * Exported because `defaultSessionFactory` is not (contract §6 gap 1): without
  * this seam the five D7.5 assertions would have nothing to call.
  */
-export function attachChildSessionRelease(session: ChildSessionBinding): void {
-	const rawDispose = session.dispose.bind(session);
+export function attachChildSessionRelease(
+	session: ChildSessionBinding,
+	timeoutMs: number = SHUTDOWN_EMIT_TIMEOUT_MS,
+): void {
+	const rawDispose = session.dispose?.bind(session);
 	let disposing = false;
-	session.dispose = () => {
+	session.dispose = async () => {
 		if (disposing) return;
 		disposing = true;
-		void releaseChildSessionExtensions(session).then(() => {
-			try {
-				rawDispose();
-			} catch (error) {
-				// `dispose()` is called fire-and-forget on the retire path, so a throw
-				// here would surface as an unhandled rejection rather than a failed
-				// retire. Report it and let the retire finish.
-				console.warn(`[pi-legion] in-process child dispose failed: ${describeExtensionError(error)}`);
-			}
-		});
+		await releaseChildSessionExtensions(session, timeoutMs);
+		try {
+			await rawDispose?.();
+		} catch (error) {
+			// `dispose()` is called fire-and-forget on some paths, so a throw here
+			// would surface as an unhandled rejection rather than a failed retire.
+			// Report it and let the retire finish.
+			console.warn(`[pi-legion] in-process child dispose failed: ${describeExtensionError(error)}`);
+		}
 	};
 }

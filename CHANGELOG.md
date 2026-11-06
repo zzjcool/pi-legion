@@ -35,7 +35,11 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   另一半是身份守卫：in-process 子会话现在会收到 `session_start`，所以 legion 自己的 handler 加了守卫——
   只要持有注入的 `childContext`（含 `stripLegionIdentity` 那种有 dbPath 无 nodeId 的 utility 子会话）就跳过
   `initializeLegionRuntime`，boot 期那条 env attach 也一并跳过。否则父本身是 rpc child 时，这个 handler 会先用
-  祖先的 `PI_LEGION_*` 身份 init（开祖先 db、起第二个 postman），而 legion 的 runtime 没有对应的回收点。
+  祖先的 `PI_LEGION_*` 身份 init（开祖先 db、起第二个 postman）。回收的是另一半：补发的 `session_shutdown`
+  现在真的会到 legion 自己的 handler，所以三个 handler 都收紧成「只关自己的 handle」——`ownLegionKey` 为
+  undefined 时（无身份的 utility 子会话、或首轮之前就退役的子会话）什么都不关，绝不碰进程共享 map 里别人
+  的句柄。**净收益**：跑过至少一轮的 in-process 子会话在退役时终于会关掉**自己的** postman 与 db handle，
+  这是 MR2 之前就存在的历史泄漏（以前 `dispose()` 既不 emit `session_shutdown`，也就没有任何回收点）。
 
 ### Fixed
 

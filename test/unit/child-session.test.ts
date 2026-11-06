@@ -201,10 +201,11 @@ test("r2: bind gate and builtin:mcp path read the same switch (childEnablesMcp)"
 	// One implementation, not two copies: `args.ts` re-exports the policy function.
 	assert.equal(childEnablesMcp, policyChildEnablesMcp, "args.ts must re-export childEnablesMcp, never re-implement it");
 
-	// FORMAT TRIPWIRE, not a behavioral assertion: the factory is not exported, so
-	// the only mechanical check left is the call count in its source — one bind call
-	// (a second one dangles MCP connections). Counted per call; the surrounding line
-	// shape and `input.name` are deliberately not pinned.
+	// FORMAT TRIPWIRE, not a behavioral assertion (r4 F6 — accepted as-is): the
+	// factory is not exported, so the only mechanical check left is the call count in
+	// its source. What it guards is the WHOLE LINE being deleted — one bind call (a
+	// second one dangles MCP connections) — not its formatting: the surrounding shape
+	// and `input.name` are deliberately not pinned.
 	const source = readFileSync(new URL("../../src/supervisor/inprocess-supervisor.ts", import.meta.url), "utf8");
 	assert.equal(
 		source.split("bindChildSessionExtensions(").length - 1,
@@ -220,7 +221,7 @@ test("D7.5 dispose emits session_shutdown once, reason=quit, before the real dis
 	await bindChildSessionExtensions(session, "root.scout");
 	attachChildSessionRelease(session);
 
-	session.dispose();
+	session.dispose?.();
 	await settle();
 
 	assert.deepEqual(
@@ -241,7 +242,7 @@ test("D7.5 a throwing shutdown handler still gets disposed", async () => {
 	attachChildSessionRelease(session);
 
 	await captureWarnings(async (warnings) => {
-		session.dispose();
+		session.dispose?.();
 		await settle();
 		assert.deepEqual(order, ["bind", "emit", "dispose"], "dispose must run on the rejection path too");
 		assert.equal(warnings.length, 1, "the failure is reported, not silent");
@@ -254,10 +255,10 @@ test("D7.5 repeated dispose() emits once (idempotent)", async () => {
 	await bindChildSessionExtensions(session);
 	attachChildSessionRelease(session);
 
-	session.dispose();
-	session.dispose();
+	session.dispose?.();
+	session.dispose?.();
 	await settle();
-	session.dispose();
+	session.dispose?.();
 	await settle();
 
 	assert.equal(events.length, 1, "one shutdown, no matter how often the retire path disposes");
@@ -270,7 +271,7 @@ test("D7.5 a session that was never bound emits nothing", async () => {
 	const { session, order, events } = fakeSession();
 	attachChildSessionRelease(session);
 
-	session.dispose();
+	session.dispose?.();
 	await settle();
 
 	assert.deepEqual(events, [], "no bind, no session_shutdown");
@@ -284,17 +285,78 @@ test("D7.5 no session_shutdown handler ⇒ no emit", async () => {
 	await bindChildSessionExtensions(session);
 	attachChildSessionRelease(session);
 
-	session.dispose();
+	session.dispose?.();
 	await settle();
 
 	assert.deepEqual(events, [], "hasHandlers() === false ⇒ nothing emitted");
 	assert.deepEqual(order, ["bind", "dispose"], "and dispose still runs");
 });
 
-// FORMAT TRIPWIRE, not a behavioral assertion: the factory is not exported, so the
-// only mechanical check that the release is ARMED at all is its call count in the
-// source. Without it, deleting `attachChildSessionRelease(session)` leaves every
-// behavioral case green while MCP connections leak again — the C1 bug itself.
+test("r4 F3: the armed dispose is awaitable and only resolves after the real dispose", async () => {
+	// The retire paths (`rollbackSpawn` / `retireChild`) await this before freeing the
+	// slot; a fire-and-forget wrapper would free the slot while the child's MCP
+	// connections were still closing, letting real concurrency exceed the cap under
+	// the 8-slot rotation.
+	const order: string[] = [];
+	const session: ChildSessionBinding = {
+		async bindExtensions() {
+			order.push("bind");
+		},
+		extensionRunner: {
+			hasHandlers: (event: string) => event === "session_shutdown",
+			async emit() {
+				order.push("emit");
+				return undefined;
+			},
+		},
+		dispose() {
+			order.push("dispose");
+		},
+	};
+	attachChildSessionRelease(session);
+	await bindChildSessionExtensions(session);
+
+	const pending = session.dispose?.();
+	assert.ok(pending instanceof Promise, "the armed dispose must return a promise, not void");
+	assert.equal(order.includes("dispose"), false, "the real dispose has NOT run when it returns");
+
+	await pending;
+	assert.deepEqual(order, ["bind", "emit", "dispose"], "it resolves only after emit + real dispose");
+});
+
+test("D7.5 a wedged handler cannot hold the session: dispose still runs (r4 F5)", async () => {
+	// `attachChildSessionRelease` forwards `timeoutMs` so this case takes 10ms instead
+	// of a real second; production always uses the 1000ms default.
+	const order: string[] = [];
+	const session: ChildSessionBinding = {
+		async bindExtensions() {
+			order.push("bind");
+		},
+		extensionRunner: {
+			hasHandlers: (event: string) => event === "session_shutdown",
+			// A handler that never settles (a stuck `connection.close()` would look
+			// like this): the emit can never be awaited forever.
+			emit: () => new Promise<never>(() => {}),
+		},
+		dispose() {
+			order.push("dispose");
+		},
+	};
+	attachChildSessionRelease(session, 10);
+	await bindChildSessionExtensions(session);
+
+	const startedAt = Date.now();
+	await session.dispose?.();
+
+	assert.deepEqual(order, ["bind", "dispose"], "the real dispose ran despite the wedged emit");
+	assert.ok(Date.now() - startedAt >= 9, "and it waited for the bound rather than hanging");
+});
+
+// FORMAT TRIPWIRE, not a behavioral assertion (r4 F6 — accepted as-is): what it
+// defends is the arm LINE being deleted — not how it is written. Without it,
+// removing `attachChildSessionRelease(session)` leaves every behavioral case green
+// while MCP connections leak again — the C1 bug itself. The cost of making this a
+// true behavior test is exporting `defaultSessionFactory`, which is not worth it.
 test("r3 C1 wiring: the factory arms the release exactly once (format tripwire)", () => {
 	const source = readFileSync(new URL("../../src/supervisor/inprocess-supervisor.ts", import.meta.url), "utf8");
 	assert.equal(
