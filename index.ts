@@ -743,17 +743,34 @@ function resolveLoopNoticeMsUncached(
 	settings: SubagentsSettings,
 ): number | undefined {
 	if (!role) return resolveLoopRadiusMs(undefined);
-	try {
-		// `agentScope: "user"` matches the launch default; a project-level card's
-		// `loopNoticeMs` therefore does NOT take part in this resolution. Documented
-		// as a v1 limit in `docs/design.md` §6.1.
-		const discovery = discoverAgents(cwd, "user", { includeBuiltin: settings.disableBuiltins !== true });
-		const overridden = applyAgentOverrides(discovery.agents, settings.agentOverrides);
-		return resolveLoopRadiusMs(findAgent(overridden, role));
-	} catch {
-		// A broken project directory must not cost the team its reminders.
-		return resolveLoopRadiusMs(undefined);
-	}
+	const opts = { includeBuiltin: settings.disableBuiltins !== true };
+	/**
+	 * One discovery pass. `found` is deliberately separate from `radius`: a card that
+	 * declares `loopNoticeMs: 0` answers `{ found: true, radius: undefined }`
+	 * ("the card switched L2 off"), and that answer must NOT fall through to the next
+	 * pass — otherwise a same-named card in a lower layer would silently resurrect the
+	 * detector the higher-precedence card had just turned off.
+	 */
+	const resolveIn = (scope: "user" | "both"): { found: boolean; radius?: number } => {
+		try {
+			const agents = applyAgentOverrides(discoverAgents(cwd, scope, opts).agents, settings.agentOverrides);
+			const card = findAgent(agents, role);
+			return card ? { found: true, radius: resolveLoopRadiusMs(card) } : { found: false };
+		} catch {
+			// A broken directory in one layer must not cost the other layer's answer.
+			return { found: false };
+		}
+	};
+	// Pass 1 is the launch default (`agentScope: "user"`), so the common case resolves
+	// exactly the card the caller launched and the default-scope answer never changes.
+	const own = resolveIn("user");
+	if (own.found) return own.radius;
+	// Pass 2 exists for `agentScope: "project" | "both"`: such a role lives in
+	// `<cwd>/.pi/agents`, and without this pass it fell through to
+	// `DEFAULTS.turnTimeoutMs` (15 min) — so a project role with a 45-minute budget was
+	// reminded three times before it ever reached that budget.
+	const everyLayer = resolveIn("both");
+	return everyLayer.found ? everyLayer.radius : resolveLoopRadiusMs(undefined);
 }
 
 /**

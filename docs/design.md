@@ -603,12 +603,16 @@ onBlocked: auto-approve    # auto-approve (default) | forward | notify
 = 900000）。`loopNoticeMs: 0` 或负数关闭该 L2 提醒；`subagents()` 的 launch 参数
 不接受 `loopNoticeMs`（v1 只支持角色卡与 `agentOverrides`）。
 
-解析口径与已知限制（stall-notice D8，review m4）：
+解析口径（stall-notice D8，review m4）：
 
-- 解析用 `discoverAgents(cwd, "user", …)`，**与 launch 的默认作用域一致**——因此
-  **project 层（`.pi/agents/*.md`）角色卡的 `loopNoticeMs` 本次不参与解析**，只有
-  user 层卡片（含内置角色）与 `subagents.agentOverrides.<name>.loopNoticeMs` 生效。
-  这是 v1 的显式限制，不是遗漏；需要 per-project 阈值时用 `agentOverrides`。
+- 两遍解析：先 `discoverAgents(cwd, "user", …)`（launch 的默认作用域），找到该名字
+  就用它；找不到再跑一次 `discoverAgents(cwd, "both", …)`。第二遍覆盖
+  `agentScope: "project" | "both"` 启动、卡片只存在于 `<cwd>/.pi/agents` 的角色
+  （没有这一遍时它们会静默落到 900000，即 45 分钟预算的项目角色每 15 分钟被提醒一次）。
+  user 层总是优先，所以**默认作用域下的结果与单遍时完全一致**。
+- 卡片显式写 `loopNoticeMs: 0`（关闭）在第一遍就算「找到了」，不会因
+  `radius === undefined` 而回落到下一遍——否则同名的低优先级卡片会把上层刚关掉的
+  探测器重新打开。
 - 结果按 `(cwd, role)` 缓存 5s（`LOOP_NOTICE_ROLE_TTL_MS`）：postman 每 2s 对每个
   活着的子节点问一次，不缓存会把 1ms/次的 discovery 变成每秒几毫秒的同步阻塞。
   改卡/改 override 到生效最多有 5s 延迟；`0`（关闭）也是一个答案，同样被缓存。

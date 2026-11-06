@@ -204,6 +204,11 @@ loopRadiusMs = ms ?? loopRadiusMs     // 不给就沿用当前半径
 角色卡 loopNoticeMs  →  角色卡 timeoutMs  →  DEFAULTS.turnTimeoutMs (900_000)
 ```
 
+**角色卡的层解析**：先按 launch 的默认作用域（`agentScope: "user"`）找这张卡；找不到再
+按全部层（`"both"`）找一次，覆盖用 `agentScope: "project" | "both"` 启动、卡片只在
+`<cwd>/.pi/agents` 的角色。user 层总是优先，所以默认作用域下的答案与单遍时相同。
+「卡片写了 `loopNoticeMs: 0`」算已找到（关闭），不得回落下一层。
+
 - 新增角色卡 frontmatter 字段 `loopNoticeMs`，**必须**加进 `AGENT_FRONTMATTER_FIELDS`
   （卡里未知键是硬错）；
 - 允许 `subagents.agentOverrides.<name>.loopNoticeMs`（进 `OVERRIDE_FIELDS`）；

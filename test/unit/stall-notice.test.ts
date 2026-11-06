@@ -930,9 +930,9 @@ test("D6 late first line: one line now, the next only after a whole radius", () 
 });
 
 test("m4: the role radius is cached per (cwd, role) for the TTL, then re-resolved", () => {
-	// The real resolver reads the USER layer (`agentScope: "user"`, the launch default),
-	// so the card has to live in `$PI_CODING_AGENT_DIR/agents` — that is exactly the
-	// documented v1 limit: a PROJECT-level card's `loopNoticeMs` is not consulted.
+	// The first discovery pass reads the USER layer (`agentScope: "user"`, the launch
+	// default), so this card has to live in `$PI_CODING_AGENT_DIR/agents`. The
+	// project-layer fallback is covered by its own tests below.
 	const cwd = mkdtempSync(path.join(tmpdir(), "legion-loop-notice-cache-"));
 	const agentDir = path.join(cwd, "agents");
 	mkdirSync(agentDir, { recursive: true });
@@ -969,6 +969,64 @@ test("m4: the role radius is cached per (cwd, role) for the TTL, then re-resolve
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		rmSync(cwd, { recursive: true, force: true });
 	}
+});
+
+/**
+ * D8's layer resolution: the user layer first (the launch default), then every layer
+ * for roles that were launched with `agentScope: "project" | "both"`. Without the
+ * second pass such a card fell through to `DEFAULTS.turnTimeoutMs`, which reminded a
+ * 45-minute project role three times before it ever reached its budget.
+ */
+function withAgentLayers<T>(input: {
+	project?: Record<string, string>;
+	user?: Record<string, string>;
+	run: (cwd: string, settings: Parameters<typeof loopNoticeMsForRole>[2]) => T;
+}): T {
+	const cwd = mkdtempSync(path.join(tmpdir(), "legion-loop-notice-layers-"));
+	const userRoot = mkdtempSync(path.join(tmpdir(), "legion-loop-notice-agentdir-"));
+	const projectDir = path.join(cwd, ".pi", "agents");
+	const userDir = path.join(userRoot, "agents");
+	for (const [dir, cards] of [[projectDir, input.project ?? {}], [userDir, input.user ?? {}]] as const) {
+		if (Object.keys(cards).length === 0) continue;
+		mkdirSync(dir, { recursive: true });
+		for (const [name, body] of Object.entries(cards)) writeFileSync(path.join(dir, `${name}.md`), body);
+	}
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = userRoot;
+	try {
+		return input.run(cwd, { disableBuiltins: true } as unknown as Parameters<typeof loopNoticeMsForRole>[2]);
+	} finally {
+		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previous;
+		rmSync(cwd, { recursive: true, force: true });
+		rmSync(userRoot, { recursive: true, force: true });
+	}
+}
+
+test("D8: a role that lives only in the PROJECT layer keeps its own radius", () => {
+	const radius = withAgentLayers({
+		project: { qa: "---\nname: qa\ndescription: d\ntimeoutMs: 2700000\n---\nbody\n" },
+		run: (cwd, settings) => loopNoticeMsForRole("qa", cwd, settings),
+	});
+	assert.equal(radius, 45 * MINUTE, "not the 15-minute SDK budget a single-pass resolver gave it");
+});
+
+test("D8: the user layer wins over the project layer for the same role name", () => {
+	const radius = withAgentLayers({
+		user: { dual: "---\nname: dual\ndescription: d\ntimeoutMs: 600000\n---\nbody\n" },
+		project: { dual: "---\nname: dual\ndescription: d\ntimeoutMs: 2700000\n---\nbody\n" },
+		run: (cwd, settings) => loopNoticeMsForRole("dual", cwd, settings),
+	});
+	assert.equal(radius, 10 * MINUTE, "the default (user) scope is what the launch resolved");
+});
+
+test("D8: a user-layer `loopNoticeMs: 0` is an answer, not a miss — it does not fall through", () => {
+	const radius = withAgentLayers({
+		user: { off: "---\nname: off\ndescription: d\nloopNoticeMs: 0\ntimeoutMs: 600000\n---\nbody\n" },
+		project: { off: "---\nname: off\ndescription: d\ntimeoutMs: 2700000\n---\nbody\n" },
+		run: (cwd, settings) => loopNoticeMsForRole("off", cwd, settings),
+	});
+	assert.equal(radius, undefined, "a lower-precedence card must not re-enable what the launched card switched off");
 });
 
 // ─────── 10. review round: the exit does not charge the sender (D4 / m1) ───────
