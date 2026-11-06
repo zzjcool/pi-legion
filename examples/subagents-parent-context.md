@@ -45,7 +45,7 @@
 - review/侦察类用全新会话（不 --session 继承），避免主会话历史污染判断。
 - 写操作类 worker 同一 worktree 只留一个 writer，避免冲突。
 - worker 只接收具体任务，不要让 worker 再自己开 worker/写操作子 agent；
-  失败升级咨询 advisor 的机制见「失败止损」。
+  卡住时回 verdict 上报、由父会话裁决的机制见「失败止损」。
 - 长任务在 worker pane 后台跑，主 pane 收割状态，别空等。
 - **等待要事件驱动，不要轮询/干等**：派工后优先用 `subagent({ action: "wait", all: true })`（或带具体 `name`）等完成事件，或在下一个自然时机主动收割；不要静置 20+ 分钟后等用户来问「为什么还在跑」。用户发问「还在跑吗」本身说明等待期没有可观察的进度信号。`wait` **必须**带 `name` 或 `all: true`，二者互斥。
 

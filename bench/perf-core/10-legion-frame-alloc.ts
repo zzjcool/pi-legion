@@ -87,6 +87,19 @@ const WRITE_BASELINE = process.argv.includes("--write-baseline");
 
 const T0 = 1_700_000_000_000;
 const sec = (s: number): number => T0 + s * 1_000;
+/**
+ * Synthetic role LABELS for the frame fixture — deliberately NOT limited to the
+ * bundled cast. #301 deleted advisor/planner/reviewer/designer/prototype as cards;
+ * these strings survive here because they are rendering input only (the `role`
+ * column of a made-up 200-agent tree), never a name anything loads or dispatches.
+ *
+ * Renaming them would repaint the fixture and void every digest in
+ * `10-baseline.json`, which is the gate that pins this frame to `f989d0a`
+ * (`docs/contracts/viz-frame-alloc-v1.md` §4.2/§7: a digest change means roll the
+ * step back, not re-capture the baseline). So the `#301 guard` in
+ * `test/unit/agents.test.ts` scans this file for a **dispatch** of a removed role,
+ * not for its label.
+ */
 const ROLES = ["worker", "scout", "planner", "reviewer", "designer", "advisor"] as const;
 /** 200 agents + the ledger root, the size the issue's targets are stated for. */
 const AGENTS = 200;

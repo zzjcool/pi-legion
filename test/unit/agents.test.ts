@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
@@ -1275,4 +1275,49 @@ test("#293: a malformed budget is an error, not a silent 'no limit'", () => {
 	// Omitting the field still means "no limit".
 	const none = parseAgentDocument(card("{}"), "/x/p.md", "user");
 	assert.equal(none?.toolBudget, undefined);
+});
+
+test("#301 guard: the repo never ships a card or a dispatch for a removed role", () => {
+	// #301 deleted five cards, but `examples/` and `docs/subagents-teams.md` kept
+	// teaching users to dispatch them. That failure lands far from the edit —
+	// `UNKNOWN_AGENT` on a card that is gone, or `START_FAILED` on a stale model
+	// binding — so the line is drawn mechanically here instead of by review.
+	const bundled = new Set(loadAgentsFromDir(BUILTIN_AGENTS_DIR, "builtin").map((a) => a.name));
+
+	assert.deepEqual(
+		[...bundled].sort(),
+		["centurion", "scout", "worker"],
+		"the bundled cast is what a shipped surface may name",
+	);
+
+	// (a) No removed role may come back as a bundled card.
+	const cards = readdirSync(new URL("../../agents/", import.meta.url)).filter((f) => f.endsWith(".md"));
+	for (const card of cards) {
+		assert.ok(bundled.has(card.replace(/\.md$/, "")), `unexpected bundled card: ${card}`);
+	}
+
+	// (b) No shipped example/doc may instruct dispatching one of them.
+	const dispatch = /agent\s*:\s*"(advisor|planner|reviewer|designer|prototype)"/g;
+	for (const surface of [
+		"../../examples/subagents-child-context.md",
+		"../../examples/subagents-parent-context.md",
+		"../../docs/subagents-teams.md",
+	]) {
+		const text = readFileSync(new URL(surface, import.meta.url), "utf8");
+		const hits = [...text.matchAll(dispatch)].map((m) => m[1]);
+		assert.deepEqual(hits, [], `${surface} dispatches a role that has no card`);
+	}
+
+	// (c) `bench/` may keep a removed name as a rendering LABEL but must never dispatch
+	// one. `10-legion-frame-alloc.ts`'s `ROLES` is the case in point: it is frame
+	// fixture data, and renaming it would repaint the frame and void the baseline
+	// digests (viz-frame-alloc-v1 §4.2). The failure this guard exists for is a
+	// *dispatch* to a card that is gone, so that is what it scans for here.
+	const benchRoot = new URL("../../bench/", import.meta.url);
+	for (const entry of readdirSync(benchRoot, { recursive: true, encoding: "utf8" })) {
+		if (!entry.endsWith(".ts")) continue;
+		const text = readFileSync(new URL(entry, benchRoot), "utf8");
+		const hits = [...text.matchAll(dispatch)].map((m) => m[1]);
+		assert.deepEqual(hits, [], `bench/${entry} dispatches a role that has no card`);
+	}
 });

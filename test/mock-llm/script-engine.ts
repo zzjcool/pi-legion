@@ -39,11 +39,8 @@ const ROLE_PATTERNS: Array<{ role: string; re: RegExp }> = [
 	{ role: "centurion", re: /你是\s*centurion|you are (a |an )?centurion\b/i },
 	{ role: "worker", re: /你是\s*worker|you are (a |an )?worker\b/i },
 	{ role: "scout", re: /你是\s*scout|you are (a |an )?scout\b/i },
-	{ role: "reviewer", re: /你是\s*reviewer|you are (a |an )?reviewer\b/i },
-	{ role: "planner", re: /你是\s*planner|you are (a |an )?planner\b/i },
-	{ role: "advisor", re: /你是\s*advisor|you are (a |an )?advisor\b/i },
-	{ role: "designer", re: /你是\s*designer|you are (a |an )?designer\b/i },
-	{ role: "prototype", re: /你是\s*prototype|you are (a |an )?prototype\b/i },
+	// #301 removed planner/reviewer/designer/prototype/advisor from the bundled
+	// cast; the mock only infers roles that a card can still supply.
 ];
 
 export function inferRole(textBlob: string): string | undefined {

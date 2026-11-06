@@ -143,8 +143,8 @@ round2 根因：hunter 调了 `acquireVerifySlot()`（轮询等槽位的阻塞 A
 
 ## 7. 角色卡与团队配置
 
-- 角色定义：`agents/qa-hunter.md`、`agents/qa-repro.md`（若有）、`agents/scout.md`、
-  `agents/advisor.md`
+- 角色定义：`agents/qa-hunter.md`、`agents/qa-repro.md`（若有）、`agents/scout.md`
+  （内置 cast 只有 centurion/worker/scout，`qa-*` 属自定义卡）
 - 团队编排示例：`docs/subagents-teams.md`；本仓库实配：`.pi/settings.json`
   → `subagents.teams["qa-hunting"]`
-- 子 agent 卡死重试 2 次仍失败 → 升级咨询 `advisor`（见各角色卡的失败止损节）
+- 子 agent 卡死重试 2 次仍失败 → 回 verdict + 阻塞点，由父会话裁决（见各角色卡的失败止损节）

@@ -7,9 +7,14 @@ object with an `agent` name and per-member overrides. Each team may also set
 markdown, `@path`, or a string array; `false` disables that side). Team
 context **replaces** the global value for that side — it never merges.
 
-The examples below show two squads with **different operating workflows**, not
-just different models. Replace every model placeholder with an ID available
-from your provider.
+The four teams below show **different operating workflows**, not just different
+models. Replace every model placeholder with an ID available from your provider.
+
+Every roster entry must name a role that has a card: the bundled
+`centurion` / `worker` / `scout` (`agents/` in this repo, plus your own
+`<agentDir>/agents/<name>.md`). A member naming a role with no card is refused
+at launch (`UNKNOWN_AGENT`), so a team file that still lists a role you removed
+is a startup failure, not a silent fallback.
 
 ```json
 {
@@ -18,29 +23,31 @@ from your provider.
     "teams": {
       "fe-premium": {
         "description": "Frontend · complex projects",
-        "parentContext": "FE premium parent workflow:\n1. Scout UX surface and design tokens first.\n2. Prototype before planner locks the slice.\n3. Designer gate before worker lands UI.\n4. Reviewer checks a11y + visual regress; escalate to advisor on product ambiguity.\n5. Stop when designer+reviewer both approve; do not expand scope mid-flight.",
-        "childContext": "FE premium child guardrails: stay in the assigned component tree; no API shape changes without planner; hand off diffs with screenshot notes.",
+        "parentContext": "FE premium parent workflow:
+1. Scout UX surface and design tokens first.
+2. Lock the slice in a short contract before any worker starts.
+3. Design gate before the worker lands UI (screenshot + token check).
+4. Adversarial review covers a11y + visual regress; product ambiguity goes back to the parent, never to a new layer.
+5. Stop when the review passes; do not expand scope mid-flight.",
+        "childContext": "FE premium child guardrails: stay in the assigned component tree; no API shape change without a contract revision; hand off diffs with screenshot notes.",
         "members": [
           { "agent": "scout", "model": "your-provider/strong-model", "thinking": "high" },
-          { "agent": "prototype", "model": "your-provider/strong-model", "thinking": "high" },
-          { "agent": "planner", "model": "your-provider/strong-model", "thinking": "max" },
           { "agent": "worker", "model": "your-provider/strong-model", "thinking": "max" },
-          { "agent": "reviewer", "model": "your-provider/strong-model", "thinking": "xhigh" },
-          { "agent": "designer", "model": "your-provider/strong-model", "thinking": "xhigh" },
-          { "agent": "advisor", "model": "your-provider/strong-model", "thinking": "xhigh" },
           "centurion"
         ]
       },
       "be-value": {
         "description": "Backend · standard projects",
-        "parentContext": "BE value parent workflow:\n1. Scout existing handlers and data model only — no greenfield redesign.\n2. Planner writes a thin acceptance list (tests + curl).\n3. Worker implements behind feature flags; one PR-sized slice.\n4. Reviewer focuses on contracts/errors; advisor only on cross-service risk.\n5. Stop when acceptance tests pass; escalate early if schema migration is required.",
+        "parentContext": "BE value parent workflow:
+1. Scout existing handlers and data model only — no greenfield redesign.
+2. Write a thin acceptance list (tests + curl) before dispatch.
+3. Worker implements behind feature flags; one PR-sized slice.
+4. Review focuses on contracts/errors and cross-service risk.
+5. Stop when acceptance tests pass; escalate early if schema migration is required.",
         "childContext": "BE value child guardrails: do not touch frontend; prefer existing patterns; document migration needs instead of applying them.",
         "members": [
           { "agent": "scout", "model": "your-provider/value-model", "thinking": "high" },
-          { "agent": "planner", "model": "your-provider/strong-model", "thinking": "xhigh" },
           { "agent": "worker", "model": "your-provider/value-model", "thinking": "xhigh" },
-          { "agent": "reviewer", "model": "your-provider/value-model", "thinking": "max" },
-          { "agent": "advisor", "model": "your-provider/strong-model", "thinking": "xhigh" },
           "centurion"
         ]
       },
@@ -48,12 +55,7 @@ from your provider.
         "description": "Frontend · standard projects (roster only — context falls back to global)",
         "members": [
           { "agent": "scout", "model": "your-provider/value-model", "thinking": "high" },
-          { "agent": "prototype", "model": "your-provider/value-model", "thinking": "high" },
-          { "agent": "planner", "model": "your-provider/strong-model", "thinking": "max" },
           { "agent": "worker", "model": "your-provider/value-model", "thinking": "xhigh" },
-          { "agent": "reviewer", "model": "your-provider/value-model", "thinking": "max" },
-          { "agent": "designer", "model": "your-provider/strong-model", "thinking": "xhigh" },
-          { "agent": "advisor", "model": "your-provider/strong-model", "thinking": "xhigh" },
           "centurion"
         ]
       },
@@ -63,10 +65,7 @@ from your provider.
         "childContext": "@be-premium-child.md",
         "members": [
           { "agent": "scout", "model": "your-provider/strong-model", "thinking": "high" },
-          { "agent": "planner", "model": "your-provider/strong-model", "thinking": "max" },
           { "agent": "worker", "model": "your-provider/strong-model", "thinking": "max" },
-          { "agent": "reviewer", "model": "your-provider/strong-model", "thinking": "xhigh" },
-          { "agent": "advisor", "model": "your-provider/strong-model", "thinking": "xhigh" },
           "centurion"
         ]
       }

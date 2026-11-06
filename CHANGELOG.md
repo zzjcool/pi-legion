@@ -11,6 +11,23 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Fixed
+- **#301 删了角色卡，却没删“会把用户带到那张卡”的几处**：
+  `examples/subagents-child-context.md` / `subagents-parent-context.md` 仍在教子 agent
+  用 `subagent({ agent: "advisor" })` 做失败止损（这两份模板会被复制成
+  `<agentDir>/subagents-*-context.md`，再作为约定文件注入每个子节点的 prompt，所以
+  删卡不等于断链）；`docs/subagents-teams.md` 的四个示例团队全部仍列着
+  `advisor/planner/reviewer/designer/prototype`；`test/mock-llm/script-engine.ts` 的
+  角色推断表也还留着这五个名字。三处一并清掉，坏掉的是“被推荐的止损通道本身”。
+- 加机械门禁（`test/unit/agents.test.ts`「#301 guard」）：`agents/` 下多出一张卡、或
+  `examples/`、`docs/subagents-teams.md`、`bench/` 里再出现指向已删角色的
+  `agent: "<role>"`，测试直接红。此前同类回潮无人拦：`bench/perf-core/10-legion-frame-alloc.ts`
+  在 `b02fb4a`（#364，晚于 #301）把五个已删角色又写回了 `ROLES`。
+- `bench/` 只拦「派发」不拦「标签」：`ROLES` 是渲染夹具，改名会重画帧、作废
+  `10-baseline.json` 的 digest（`docs/contracts/viz-frame-alloc-v1.md` §4.2 要求 digest
+  变化即回退该步，不得为了改名重采基线），所以那五个名字作为标签留了下来，
+  并在原处写明了理由。
+
 ## [5.2.0] — 2026-11-04
 
 一次以「回复说真话」为中心的发布。批量派发的每个子节点可以带自己的 handle；`stop` 与超时的回复不再把
