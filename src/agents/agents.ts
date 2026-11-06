@@ -685,7 +685,7 @@ const AGENT_FRONTMATTER_FIELDS: ReadonlySet<string> = new Set([
 	// tools
 	"tools", "extensions", "subagentOnlyExtensions",
 	// budgets / guards / lifecycle
-	"defaultProgress", "async", "timeoutMs", "toolTimeoutMs", "completionGuard",
+	"defaultProgress", "async", "timeoutMs", "toolTimeoutMs", "loopNoticeMs", "completionGuard",
 	"maxSubagentDepth", "allowNestedSubagents", "renewable", "maxRenewals",
 	"utility", "disabled", "worktree", "steer", "onBlocked",
 	"acceptance", "toolBudget", "turnBudget",
@@ -828,6 +828,11 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "async", bool(fm.async));
 	setIf(config, "timeoutMs", int(fm.timeoutMs));
 	setIf(config, "toolTimeoutMs", int(fm.toolTimeoutMs));
+	// stall-notice D8 (L2): parsed verbatim and left absent when undeclared — the
+	// fallback chain (card `timeoutMs`, then `DEFAULTS.turnTimeoutMs`) lives with the
+	// consumer (`resolveLoopRadiusMs`), so this layer never guesses whether the role
+	// was explicit. `int()` keeps an explicit `0` (the detector's off switch).
+	setIf(config, "loopNoticeMs", int(fm.loopNoticeMs));
 	setIf(config, "completionGuard", bool(fm.completionGuard));
 	setIf(config, "maxSubagentDepth", int(fm.maxSubagentDepth));
 	setIf(config, "allowNestedSubagents", bool(fm.allowNestedSubagents));

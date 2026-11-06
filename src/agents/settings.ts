@@ -133,6 +133,7 @@ const LEGION_SETTING_FIELDS = [
 	"mailRatePer5Min",
 	"usagePollMs",
 	"orphanStaleMs",
+	"silenceNoticeMs",
 ] as const satisfies readonly (keyof LegionSettings)[];
 
 /**
@@ -250,6 +251,17 @@ function parseLegionSettings(
 		filePath,
 	);
 	if (orphanStaleMs !== undefined) out.orphanStaleMs = orphanStaleMs;
+	// stall-notice D8: same `positiveInt` rule as its neighbours. `0`/negative is a
+	// hard error here even though the DETECTOR reads `<= 0` as "off" (D6) — the two
+	// answers are not in conflict: settings.json only accepts a positive integer, so
+	// the off switch is reachable from a hand-built object (tests, callers), never
+	// from a typo in a settings file.
+	const silenceNoticeMs = positiveInt(
+		input.silenceNoticeMs,
+		"legion.silenceNoticeMs",
+		filePath,
+	);
+	if (silenceNoticeMs !== undefined) out.silenceNoticeMs = silenceNoticeMs;
 
 	Object.defineProperty(out, LEGION_EXPLICIT_FIELDS, {
 		value: {

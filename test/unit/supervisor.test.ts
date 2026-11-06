@@ -924,6 +924,44 @@ test("#315 rpc: the in-flight tool rides the RPC event stream already consumed",
 	}
 });
 
+test("stall-notice D2 rpc: the event age rides the RPC stream already consumed", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const client = h.clients[0]!;
+		const before = h.supervisor.lastEventAt("root.worker");
+		// No event has arrived yet: no fact, and (D2) no notice can be produced from it.
+		assert.equal(before, undefined);
+
+		client.emit({ type: "agent_start" });
+		const started = h.supervisor.lastEventAt("root.worker");
+		assert.equal(typeof started, "number");
+
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		client.emit({ type: "turn_start" });
+		const afterTurn = h.supervisor.lastEventAt("root.worker");
+		assert.ok(afterTurn !== undefined && started !== undefined && afterTurn > started);
+
+		// A settle empties the stack but does not erase the age: a settle is an event.
+		client.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash" });
+		emitSettled(client);
+		assert.equal(h.supervisor.inFlightToolStack("root.worker"), undefined);
+		assert.ok((h.supervisor.lastEventAt("root.worker") ?? 0) >= afterTurn);
+
+		// The UI/activity envelopes are NOT coarse events: they must not refresh it.
+		const parked = h.supervisor.lastEventAt("root.worker");
+		client.emit({ type: "extension_activity", activity: { label: "thinking" } });
+		assert.equal(h.supervisor.lastEventAt("root.worker"), parked, "an activity ping is not child progress");
+
+		// A dead child answers nothing, whatever the record still holds.
+		client.process.exit(9, null);
+		assert.equal(h.supervisor.lastEventAt("root.worker"), undefined);
+	} finally {
+		await h.supervisor.retire("root.worker").catch(() => {});
+		h.close();
+	}
+});
+
 test("unexpected process exit immediately resolves waitSettled as abnormal", async () => {
 	const h = harness();
 	try {

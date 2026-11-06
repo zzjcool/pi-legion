@@ -44,6 +44,8 @@ export const OVERRIDE_FIELDS = [
 	// numbers
 	"timeoutMs",
 	"toolTimeoutMs",
+	// stall-notice D8: the L2 reminder radius, overridable per agent (§6.3).
+	"loopNoticeMs",
 	"maxSubagentDepth",
 	"maxRenewals",
 	// arrays (a `false` value is meaningful for skills/extensions)

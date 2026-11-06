@@ -492,6 +492,19 @@ export interface LegionSupervisor {
 	 */
 	inFlightToolStack?(name: string): InFlightToolStack | undefined;
 	/**
+	 * Host-clock reading of the last coarse event this backend folded for `name`
+	 * (stall-notice D2), or `undefined`.
+	 *
+	 * Optional for the same reason as `inFlightTool`: a supervisor that cannot answer
+	 * — a test double, a backend predating stall notice v1 — has NO FACT, and no fact
+	 * must never become a "this child is stuck" notice. The stall detector is its one
+	 * consumer; nothing else reads it, and no liveness verdict may.
+	 *
+	 * Only the age `now - lastEventAt` is meaningful: both numbers are host clock
+	 * readings, so the value carries no claim about what the child achieved.
+	 */
+	lastEventAt?(name: string): number | undefined;
+	/**
 	 * What this backend can actually observe (#323).
 	 *
 	 * `promptDisposition: false` means `prompt()` cannot tell "the session

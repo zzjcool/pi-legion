@@ -148,6 +148,17 @@ export interface AgentConfig {
 	async?: boolean;
 	timeoutMs?: number;
 	toolTimeoutMs?: number;
+	/**
+	 * stall-notice D8 (L2): how long THIS role may run before its parent is reminded
+	 * that it may be looping. Falls back to the role's `timeoutMs`, then to
+	 * `DEFAULTS.turnTimeoutMs`.
+	 *
+	 * `timeoutMs` is three clocks at once (the parent's collect budget, `wait`'s
+	 * default, and this reminder's basis), so raising it to make `wait` patient also
+	 * pushes the reminder back. Declaring `loopNoticeMs` is how a role decouples the
+	 * two. `0` or a negative value turns the reminder off.
+	 */
+	loopNoticeMs?: number;
 	acceptance?: AcceptanceConfig;
 	completionGuard?: boolean;
 	maxSubagentDepth?: number;
@@ -640,6 +651,12 @@ export interface LegionSettings {
 	mailRatePer5Min?: number;
 	usagePollMs?: number;
 	orphanStaleMs?: number;
+	/**
+	 * stall-notice D8 (L1): how long a child may be silent — empty in-flight stack,
+	 * no event — before its parent is told. `0`/negative disables the detector; every
+	 * positive value is legal (the settings parser takes only positive integers).
+	 */
+	silenceNoticeMs?: number;
 }
 
 /** Defaults from the frozen v2 contract §11.4. */
@@ -660,6 +677,9 @@ export const DEFAULT_LEGION_SETTINGS = {
 	mailRatePer5Min: 10,
 	usagePollMs: 30_000,
 	orphanStaleMs: 90_000,
+	// stall-notice D8: two minutes of silence with an empty stack is the point where
+	// "alive but stuck" becomes worth a mail.
+	silenceNoticeMs: 120_000,
 } as const satisfies Required<LegionSettings>;
 
 export type AgentOverride = Partial<AgentConfig> & { disabled?: boolean };

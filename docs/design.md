@@ -566,6 +566,7 @@ defaultProgress: true
 async: true
 timeoutMs: 900000
 toolTimeoutMs: 600000
+loopNoticeMs: 1800000         # 可选："可能陷入循环"提醒的基准（默认跟随 timeoutMs）
 acceptance:                  # 第 3.5 节：L2 语义判定
   level: attested            # none | attested | verified
   role: read-only
@@ -594,6 +595,13 @@ onBlocked: auto-approve    # auto-approve (default) | forward | notify
 
 （system prompt body）
 ```
+
+`timeoutMs` 现在同时充当三个时钟：父的 `collect` 预算、`wait` 的默认超时、
+以及「很久没有动静」主动上报的 L2 基准（`docs/contracts/stall-notice-v1.md` D8）。
+为了 `wait` 等更久而调大 `timeoutMs` 时，L2 提醒会一并被推后；要解耦就显式写
+`loopNoticeMs`（回落链：`loopNoticeMs` → `timeoutMs` → `DEFAULTS.turnTimeoutMs`
+= 900000）。`loopNoticeMs: 0` 或负数关闭该 L2 提醒；`subagents()` 的 launch 参数
+不接受 `loopNoticeMs`（v1 只支持角色卡与 `agentOverrides`）。
 
 ### 6.2 模型优先级（原样抄 pi-subagents）
 
@@ -653,6 +661,12 @@ preset 规则：
     "disableBuiltins": false,
     "disableThinking": false,
     "maxSubagentSpawnsPerSession": 8,
+    "legion": {
+      "silenceNoticeMs": 120000,
+      "phaseTimeouts": { "implementing": 3600000 },
+      "orphanStaleMs": 90000,
+      "mailRatePer5Min": 10
+    },
     "herdr": {
       "defaultPlacement": "split-down",
       "maxConcurrentAgents": 6,
@@ -664,6 +678,13 @@ preset 规则：
   }
 }
 ```
+
+`legion.silenceNoticeMs` 是「很久没有动静」的 L1 阈值（毫秒，`positiveInt`：缺省合法，
+写了就必须是正整数），默认 120000：子节点**不在任何工具里**（in-flight 栈为空）且 `lastEventAt` 已过去这么久时，
+父节点自己的 inbox 会收到一封 `kind=notice, urgency=action-needed` 的自投递提醒，同一
+静默窗口最多两封（1× 与 2×），永不自动 abort/stop/retire。栈非空时一律不报——慢编译
+与真 hang 在事件流上完全同形（`docs/contracts/stall-notice-v1.md` D1）。探测器的进度
+基准来自角色卡（见 §6.1 的 `loopNoticeMs`），与 `phaseTimeouts`／`orphanStaleMs` 无关。
 
 Team selection is resolved as `PI_SUBAGENTS_TEAM` > `subagents.team` >
 `default`. `default` keeps every discovered role; named teams select ordered
@@ -968,6 +989,7 @@ subagent({
 | `status` / `collect` / `list` | 查询 | child record / session JSONL |
 | `wait` | 等待指定或全部活动 child 完成；由 RPC settle 事件唤醒；ESC 中断只结束等待（children 继续跑并 re-arm watch） | session runtime + RPC supervisor |
 | `stop` | 优雅停止指定或全部 tracked、非 retired children | `retire` 全链 + runtime release |
+| `extend` | **只延后「可能陷入循环」提醒**（`docs/contracts/stall-notice-v1.md` D5） | postman 内存里的 L2 基准前移到 now；不改任何预算 |
 
 ### ESC abort 语义 + stop
 
@@ -977,7 +999,7 @@ subagent({
 
 `stop` 是显式停止操作：`subagent({ action: "stop", name: "worker-0" })` 停一个 child，`subagent({ action: "stop", all: true })` 逐个停止当前跟踪的全部非 retired children。它复用 `retire` 生命周期（优雅关闭、超时后升级信号、后代清理）并释放 runtime 跟踪；`stop` 本身不接父 turn abort signal。`name` 与 `all` 互斥且必须指定其一。
 
-### `continue` vs `steer` vs `resume`
+### `continue` vs `steer` vs `resume` vs `renewal` vs `extend`
 
 | 场景 | 用哪个 |
 | --- | --- |
@@ -985,6 +1007,15 @@ subagent({
 | 跑完了（awaiting），要它接着做 | `continue` |
 | 已退出 / pane 没了，要接着做 | `resume` |
 | 彻底不要了 | `retire` |
+| 轮次预算耗尽，续一段预算 | `renewal`（角色 `renewable` / `maxRenewals`） |
+| 子看着像在死循环，但你想先让它继续跑 | `extend` |
+
+`extend` 的语义只有一条：把该子节点的 L2 提醒基准前移到 `now`
+（`subagent({ action: "extend", name, ms? })`，`ms` 省略则沿用当前半径）。它
+**不延长**父的 `collect`/`wait` 预算（那是角色 `timeoutMs`）、**不重启不复活**子进程
+（那是 `continue`/`resume`）、**不延后 L1 静默提醒**（L1 的基准是子自己的事件，客观
+事实不该被续期抹掉）。`wait` 回执里的 "extend" 是「再调一次 wait」，与本动作无关。
+状态存内存：进程重启后按「首次见到」重建，基准回到 `nodes.created_at`。
 
 ### `retire` 的隐含语义（重要）
 

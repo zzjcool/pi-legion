@@ -54,6 +54,7 @@ import { createSessionRuntime, renderLiveChildStatus, type ClaimedCollect, type 
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
+import { resolveLoopRadiusMs } from "./src/legion/stall-notice.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, LEGION_PHASES_ENV } from "./src/runs/args.ts";
 import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
@@ -293,8 +294,9 @@ const SubagentParams = Type.Object({
 				Type.Literal("wait"),
 				Type.Literal("stop"),
 				Type.Literal("diagnose"),
+				Type.Literal("extend"),
 			],
-			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor." },
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor. extend = defer the `may be looping` REMINDER for one child only: it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`/`steer`/`renewal`." },
 		),
 	),
 	agent: Type.Optional(
@@ -384,12 +386,18 @@ const SubagentParams = Type.Object({
 	runId: Type.Optional(
 		Type.String({
 			description:
-				'control actions (status/collect/stop/continue/resume/steer/abort/retire): name the run that holds the child, instead of the run this session owns. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
+				'control actions (status/collect/stop/continue/resume/steer/abort/retire/extend): name the run that holds the child, instead of the run this session owns. A name is resolved against this session\'s direct children first; a same-named node in another run is reported (as `not a direct child` or as an ambiguity), never silently adopted. Example: subagent({ action: "collect", name: "worker-0", runId: "r-4fd626ee" }).',
 		}),
 	),
 	timeoutMs: Type.Optional(
 		Type.Number({
 			description: "wait: per-child timeout in ms; event-driven completion returns early (default: role turnTimeoutMs)",
+		}),
+	),
+	ms: Type.Optional(
+		Type.Number({
+			description:
+				'extend only: the new long-running reminder radius in ms (positive integer). Omit to keep the radius already in force. It is a REMINDER setting — it never changes a collect/wait budget or the child\'s own timeoutMs. Example: subagent({ action: "extend", name: "worker-0", ms: 1800000 }).',
 		}),
 	),
 	force: Type.Optional(
@@ -680,6 +688,33 @@ function phaseMachineForRole(role: string | null | undefined, cwd: string, setti
 }
 
 /**
+ * stall-notice D8 (L2): the role card's LONG-RUNNING reminder radius.
+ *
+ * Same shape and same best-effort rule as {@link phaseMachineForRole} above: the
+ * postman owns no catalog, so this process resolves the answer from the discovery it
+ * already does for launcher decisions.
+ *
+ * The chain itself (card `loopNoticeMs` → card `timeoutMs` → the SDK turn budget) is
+ * `resolveLoopRadiusMs`, a pure function in `src/legion/stall-notice.ts`, so the "no
+ * card at all" answers are the same ones a missing card would give.
+ */
+function loopNoticeMsForRole(
+	role: string | null | undefined,
+	cwd: string,
+	settings: SubagentsSettings,
+): number | undefined {
+	if (!role) return resolveLoopRadiusMs(undefined);
+	try {
+		const discovery = discoverAgents(cwd, "user", { includeBuiltin: settings.disableBuiltins !== true });
+		const overridden = applyAgentOverrides(discovery.agents, settings.agentOverrides);
+		return resolveLoopRadiusMs(findAgent(overridden, role));
+	} catch {
+		// A broken project directory must not cost the team its reminders.
+		return resolveLoopRadiusMs(undefined);
+	}
+}
+
+/**
  * The phase machine for THIS node, declaration first (#371 contract §2).
  *
  * Resolution order, exactly as the contract freezes it:
@@ -847,6 +882,8 @@ function createLegionRuntime(input: {
 	machine?: PhaseMachine;
 	/** #351: by-role resolver for the abort path (see LegionRuntimeIdentity). */
 	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
+	/** stall-notice D8 (L2): by-role resolver for the postman's reminder radius. */
+	noticeMsForRole?: (role: string | null | undefined) => number | undefined;
 }): LegionRuntimeIdentity {
 	const self = getNode(input.db, input.nodeId);
 	const eventBus = input.eventBus;
@@ -860,6 +897,7 @@ function createLegionRuntime(input: {
 		sendRootMessage: (text: string) => notice(input.pi, text),
 		sendSelfMessage: (text: string) => notice(input.pi, text),
 		...(input.machine ? { machine: input.machine } : {}),
+		...(input.noticeMsForRole ? { noticeMsForRole: input.noticeMsForRole } : {}),
 		resumeChild: (node: LegionNode, mail: LegionMailCommand) => resumeLegionChild({
 			pi: input.pi, supervisor: input.supervisor, db: input.db, dbPath: input.dbPath,
 			eventBus, settings: input.settings, cwd: input.cwd, storeRootDir: input.storeRootDir,
@@ -945,7 +983,7 @@ function resolveLegionIdentity(input: {
 		}
 		if (node.runId !== nodeRun.runId) updateLegionRunId(db, nodeId, nodeRun.runId);
 		const machine = phaseMachineForNode(node.role, input.cwd, input.settings);
-		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true, ...(machine ? { machine } : {}), machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
+		const identity = createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath: absoluteDbPath, nodeId, rootRunId: getNode(db, "root")?.runId ?? path.basename(path.dirname(absoluteDbPath)), runDir: input.store.runDir(nodeRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: true, ...(machine ? { machine } : {}), machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings), noticeMsForRole: (role) => loopNoticeMsForRole(role, input.cwd, input.settings) });
 		// #273: `createLegionRuntime` runs during extension LOADING, where host
 		// actions (sendMessage, spawn, ui) are not available yet. Defer the team
 		// recovery to the next tick so a failure inside it cannot crash the load
@@ -1024,7 +1062,7 @@ function createRootLegion(input: { pi: ExtensionAPI; supervisor: LegionSuperviso
 	// writes the same column from `reserveNode`; this is the root equivalent.
 	insertNode(db, { id: "root", parentId: null, name: "root", role: "root", kind: "pi", depth: 0, runId: rootRun.runId, status: "running", taskSummary: input.task.slice(0, 2_000), ...(input.rootSessionFile ? { sessionFile: input.rootSessionFile } : {}), createdAt: now, updatedAt: now }, () => now);
 	appendEvent(db, "root", "node_launched", { runId: rootRun.runId, task: input.task }, { now: () => now });
-	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false, machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
+	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: rootRun.runId, runDir: input.store.runDir(rootRun.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false, machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings), noticeMsForRole: (role) => loopNoticeMsForRole(role, input.cwd, input.settings) });
 }
 
 /**
@@ -1102,7 +1140,7 @@ function reopenSessionRun(input: { pi: ExtensionAPI; supervisor: LegionSuperviso
 		return undefined;
 	}
 	reopenedSessionLedgers.add(dbPath);
-	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: previous.runId, runDir: input.store.runDir(previous.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false, machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings) });
+	return createLegionRuntime({ pi: input.pi, supervisor: input.supervisor, db, dbPath, nodeId: "root", rootRunId: previous.runId, runDir: input.store.runDir(previous.runId), cwd: input.cwd, storeRootDir: input.store.rootDir, settings: settingsForLegion(input.settings), eventBus: input.eventBus, registerTools: false, machineForRole: (role) => phaseMachineForRole(role, input.cwd, input.settings), noticeMsForRole: (role) => loopNoticeMsForRole(role, input.cwd, input.settings) });
 }
 
 /**
@@ -2157,6 +2195,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					runtime,
 					settings,
 					legion: activeLegion,
+					...(activeLegion ? { postman: activeLegion.postman } : {}),
 				});
 				if (signal?.aborted && action !== "stop") {
 					return interruptedControlResult({ result, runtime, legion: activeLegion });
@@ -2412,6 +2451,13 @@ async function controlAction(input: {
 	params: SubagentParams;
 	signal?: AbortSignal;
 	legion?: OrchestratorLegionContext;
+	/**
+	 * stall-notice D5: this session's OWN postman — the instance whose `children`
+	 * include the named child, and therefore the only place the L2 clock lives.
+	 * Absent = no legion runtime (a plain parent), which also means no detector is
+	 * running and `extend` has nothing to move.
+	 */
+	postman?: LegionPostman;
 	supervisor: LegionSupervisor;
 	uiProxy: UIProxy;
 	onBudgetRefused: NonNullable<ConstructorParameters<typeof Orchestrator>[0]["onBudgetRefused"]>;
@@ -2682,6 +2728,13 @@ async function controlAction(input: {
 		});
 	if (!found) return unknownChild(params.name, store, cwd, input.callerCwd);
 
+	// stall-notice D5: `extend` touches nothing but the detector's memory, so it runs
+	// BEFORE an orchestrator is rebuilt for the name — there is no child to restore,
+	// no session to read, and nothing to persist. The name is still resolved through
+	// the same scope path as every other control action, so an unknown name answers
+	// the same NOT_FOUND (above) and never silently "extends" a name nobody has.
+	if (action === "extend") return extendStallNotice(input, params);
+
 	const orchestrator = new Orchestrator({
 		supervisor: input.supervisor,
 		uiProxy: input.uiProxy,
@@ -2797,6 +2850,51 @@ function scopeRunIdFor(input: {
 
 /** Actions that may only ever act on this session's own direct child (#312). */
 const STRICT_SCOPE_ACTIONS = new Set(["collect", "continue", "resume"]);
+
+/**
+ * stall-notice D5 — `subagent({action:"extend", name, ms?})`.
+ *
+ * One semantics, one line of work: move this child's L2 baseline to `now`, so the
+ * next long-running reminder is `ms` (or the radius already in force) away. It is
+ * NOT any of the four things it is easy to mistake it for:
+ *
+ * - not `renewal` (which continues an exhausted turn budget),
+ * - not `continue` (which sends a FINISHED child a new message),
+ * - not `wait`'s own `extend` (which means "call wait again"),
+ * - and not a budget change at all: `collect`/`wait` deadlines are the role's
+ *   `timeoutMs` and this action never touches them.
+ *
+ * Nothing is persisted, so a restarted process rebuilds the clock from
+ * `nodes.created_at` (D5) — the reminder is renewable, the fact behind it is not.
+ */
+export function extendStallNotice(
+	input: { postman?: LegionPostman },
+	params: Pick<SubagentParams, "name" | "ms">,
+): AgentToolResult<unknown> {
+	const name = params.name ?? "";
+	const ms = params.ms;
+	if (ms !== undefined && (!Number.isSafeInteger(ms) || ms <= 0)) {
+		return fail(
+			"`ms` must be a positive integer (milliseconds); omit it to keep the radius already in force.",
+			ErrorCodes.INVALID_PARAMS,
+		);
+	}
+	const receipt = input.postman?.extendStallWindow(name, ms);
+	if (!receipt) {
+		return fail(
+			`\`extend\` applies to this session's own children, and ${name} is not one of them; no stall-notice clock was moved.`,
+			ErrorCodes.NOT_FOUND,
+		);
+	}
+	const radius = receipt.loopRadiusMs === undefined
+		? "the role card's own radius"
+		: `${receipt.loopRadiusMs}ms`;
+	return ok(
+		`Extended the stall-notice clock for ${receipt.childName}: the next long-running reminder is due ${radius} from now. ` +
+			"This defers the REMINDER only — it does not extend a collect/wait budget (that is the role's timeoutMs), " +
+			"does not restart or revive the child, and is not `continue` or `steer`.",
+	);
+}
 
 /**
  * Two or more same-named nodes and not one of them is this session's child.

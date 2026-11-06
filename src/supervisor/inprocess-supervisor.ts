@@ -350,6 +350,14 @@ interface ChildRecord {
 	 */
 	inFlightTools?: InFlightToolStack;
 	/**
+	 * stall-notice D2: host-clock reading of the last coarse event folded for this
+	 * child. Written where the event stream is folded (the same function that keeps
+	 * {@link inFlightTools} current) — no new subscription, no new IPC, and no child-
+	 * side change. Never cleared by `agent_settled`: a settle IS an event, and the
+	 * age it leaves behind is the honest one.
+	 */
+	lastEventAt?: number;
+	/**
 	 * A19: an admission slot is freed exactly once per departure from the live
 	 * set. All three release points (`retireChild`, `rollbackSpawn`,
 	 * `disposeRecord`) can observe the same record, so the flag — not the call
@@ -1260,6 +1268,18 @@ export class InProcessSupervisor implements LegionSupervisor {
 		return stack !== undefined && stack.length > 0 ? stack : undefined;
 	}
 
+	/**
+	 * stall-notice D2: when this child's last coarse event arrived (host clock).
+	 *
+	 * Same `isAlive` gate as the display reads above: a child this backend is not
+	 * running has delivered no events, so whatever the record still holds describes a
+	 * process that no longer exists.
+	 */
+	lastEventAt(name: string): number | undefined {
+		if (!this.isAlive(name)) return undefined;
+		return this.children.get(name)?.lastEventAt;
+	}
+
 	async stats(name: string): Promise<UsageSnapshot | null> {
 		const child = this.children.get(name);
 		if (!child || !child.session || !this.isAlive(name)) return null;
@@ -1521,7 +1541,12 @@ export class InProcessSupervisor implements LegionSupervisor {
 		// #315/#331: the in-flight stack rides the event stream this backend already
 		// consumes. Nothing new is asked of the child, and the fold is total, so an
 		// event about anything else leaves the stack untouched.
-		child.inFlightTools = nextInFlightTool(child.inFlightTools ?? [], record, Date.now());
+		const at = Date.now();
+		child.inFlightTools = nextInFlightTool(child.inFlightTools ?? [], record, at);
+		// stall-notice D2: the same fold, one clock reading. This is the ONLY writer of
+		// `lastEventAt`, which is why the age it produces cannot disagree with the stack
+		// it sits next to.
+		child.lastEventAt = at;
 		this.updateTurnState(child, record);
 		this.publishEvent(child, record);
 	}

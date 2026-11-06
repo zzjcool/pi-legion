@@ -256,6 +256,17 @@ export class RoutingSupervisor implements LegionSupervisor {
 		return this.inprocess.inFlightToolStack(name) ?? this.rpc.inFlightToolStack(name);
 	}
 
+	/**
+	 * Forward the stall notice's event age (D2) the same way, so the detector runs
+	 * against whichever backend actually hosts the child.
+	 */
+	lastEventAt(name: string): number | undefined {
+		const owner = this.owners.get(name);
+		if (owner === "inprocess") return this.inprocess.lastEventAt?.(name);
+		if (owner === "rpc") return this.rpc.lastEventAt?.(name);
+		return this.inprocess.lastEventAt?.(name) ?? this.rpc.lastEventAt?.(name);
+	}
+
 	async stats(name: string): Promise<UsageSnapshot | null> {
 		return this.backendFor(name).stats(name);
 	}

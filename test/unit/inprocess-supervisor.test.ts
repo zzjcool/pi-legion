@@ -414,6 +414,70 @@ test("#315 routing: inFlightTool is forwarded to the owning backend", async () =
 	}
 });
 
+test("stall-notice D2: the event age rides the same fold as the in-flight stack", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const session = h.sessions[0]!;
+		const before = h.supervisor.lastEventAt("root.worker");
+		assert.equal(typeof before, "number", "`agent_start` during spawn is already an event");
+
+		await new Promise((resolve) => setTimeout(resolve, 5));
+		session.emit({ type: "turn_start" });
+		const afterTurn = h.supervisor.lastEventAt("root.worker");
+		assert.ok(afterTurn !== undefined && before !== undefined && afterTurn > before, "a later event moves the age forward");
+
+		// D2: a settle IS an event. It empties the stack but must NOT clear the age —
+		// "when did this child last do anything" keeps its answer.
+		session.emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: {} });
+		session.settle();
+		assert.equal(h.supervisor.inFlightToolStack("root.worker"), undefined, "the turn is over");
+		assert.ok((h.supervisor.lastEventAt("root.worker") ?? 0) >= afterTurn, "the settle refreshed the age instead of erasing it");
+
+		// A child this backend no longer runs answers nothing: whatever the record
+		// still holds describes a process that is gone.
+		await h.supervisor.retire("root.worker");
+		assert.equal(h.supervisor.lastEventAt("root.worker"), undefined);
+		assert.equal(h.supervisor.isAlive("root.worker"), false);
+	} finally {
+		h.close();
+	}
+});
+
+test("stall-notice D2 routing: lastEventAt is forwarded to the owning backend", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-routing-event-age-"));
+	const sessions: FakeSession[] = [];
+	const inprocess = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			const session = new FakeSession();
+			sessions.push(session);
+			return session;
+		},
+	});
+	const rpc = new RpcSupervisor({
+		clientFactory: () => {
+			throw new Error("rpc factory should not run in this test");
+		},
+		enumerateDescendants: () => [],
+	});
+	const routing = new RoutingSupervisor({ rpc, inprocess });
+	try {
+		await routing.spawnChild(
+			testInput(root, "root.ip", testAgent({ spawnMode: "inprocess" })),
+		);
+		const age = routing.lastEventAt("root.ip");
+		assert.equal(typeof age, "number", "the facade does not swallow the backend's answer");
+		assert.equal(routing.lastEventAt("root.ghost"), undefined, "no fact for a child nobody hosts");
+
+		sessions[0]!.settle();
+		await routing.retire("root.ip");
+		assert.equal(routing.lastEventAt("root.ip"), undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("inprocess plan: tools + model + systemPrompt replace/append", () => {
 	const baseAgent = testAgent({
 		tools: ["read", "bash"],

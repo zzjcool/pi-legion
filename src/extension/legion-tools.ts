@@ -10,8 +10,10 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { LegionSettings, TurnRecord } from "../shared/types.ts";
+import { DEFAULT_LEGION_SETTINGS } from "../shared/types.ts";
 import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
+import { inFlightToolStackOf } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
 import {
 	isMailHeld,
@@ -68,6 +70,13 @@ import {
 	type PhaseMachine,
 } from "../legion/phase-machine.ts";
 import { upsertUsage } from "../legion/usage.ts";
+import {
+	decideStallNotice,
+	formatStallNotice,
+	type StallAnnouncement,
+	type StallChildFacts,
+	type StallNoticeKind,
+} from "../legion/stall-notice.ts";
 import { isExplicitPhaseTimeout } from "../agents/settings.ts";
 
 const POSTMAN_INTERVAL_MS = 2_000;
@@ -109,6 +118,20 @@ export interface LegionPostmanOptions {
 	/** #298: the team root's declared phase machine (absent = built-in). */
 	machine?: PhaseMachine;
 	/**
+	 * stall-notice D8: the L2 reminder radius a node's ROLE declares, or `undefined`.
+	 *
+	 * The postman has no agent catalog, so the caller resolves it — the same seam
+	 * shape `machineForRole` (#351) uses. The chain (card `loopNoticeMs` → card
+	 * `timeoutMs` → `DEFAULTS.turnTimeoutMs`) is resolved by the caller through
+	 * `resolveLoopRadiusMs`, so this seam answers only "what does the card say".
+	 *
+	 * **Absent = the detector is off.** A postman built without a catalog (a test
+	 * double, an older caller) cannot answer what the role declares, and the same
+	 * "no fact, no claim" rule that makes `lastEventAt?` optional applies here: it
+	 * must not invent a 900s budget and mail its parent about it.
+	 */
+	noticeMsForRole?: (role: string | null | undefined) => number | undefined;
+	/**
 	 * Test seam for the DELIVERED evidence scan: read the recipient's turns from a
 	 * session file. Defaults to `parseSessionFile(file).turns`, and the postman calls
 	 * it **once per seam per tick** (#338 minor 2), so a counter injected here can
@@ -126,6 +149,33 @@ export interface LegionPostmanOptions {
 	parseTurns?: (sessionFile: string) => readonly Pick<TurnRecord, "userText">[];
 }
 
+/** Both detectors, in the order a merged notice renders them (D7). */
+const STALL_KINDS: readonly StallNoticeKind[] = ["silence", "long-running"];
+
+/**
+ * The in-memory half of D5's table for ONE child. `absent` flags "was in the live
+ * set, currently is not" — the state a resume/re-spawn has to notice.
+ */
+interface StallClock {
+	/** L2 baseline. */
+	loopBaseAt: number;
+	/** Set only by `extend`; absent means "ask the role card each tick". */
+	loopRadiusMs?: number;
+	absent?: boolean;
+}
+
+/** What one `extend` did, for the tool receipt (D5: it changes nothing else). */
+export interface StallExtendReceipt {
+	readonly childName: string;
+	readonly loopBaseAt: number;
+	readonly loopRadiusMs: number | undefined;
+}
+
+/** D6's key, without the bucket: the bucket lives inside the entry (see the field). */
+function stallAnnouncementKey(name: string, kind: StallNoticeKind): string {
+	return `${name}\u0000${kind}`;
+}
+
 /** Poll and deliver mail only for children hosted by this process. */
 export class LegionPostman {
 	private readonly db: DatabaseSync;
@@ -137,9 +187,26 @@ export class LegionPostman {
 	private readonly sendSelfMessage: (text: string) => void;
 	private readonly resumeChild?: LegionPostmanOptions["resumeChild"];
 	private readonly machine?: PhaseMachine;
+	private readonly noticeMsForRole?: LegionPostmanOptions["noticeMsForRole"];
 	private readonly parseTurns: (sessionFile: string) => readonly Pick<TurnRecord, "userText">[];
 	/** Per-seam confirmation cursor (#338 M3): the last message id this seam scanned. */
 	private readonly confirmCursor = new Map<string, number>();
+	/**
+	 * stall-notice D5: the L2 clock of every child this postman has seen. Memory only
+	 * — a restart rebuilds it from `nodes.created_at` ("the process is old" is a fine
+	 * starting point), and `extend` edits it in place.
+	 */
+	private readonly stallClocks = new Map<string, StallClock>();
+	/**
+	 * stall-notice D6 de-duplication, in memory only (D4: never an events row).
+	 *
+	 * Keyed `(childName, kind)` with the `sinceBucket` stored INSIDE the value: a new
+	 * bucket is exactly "a zeroed counter", and one row per `(child, kind)` keeps the
+	 * map bounded by the number of children instead of by the number of windows that
+	 * ever elapsed. `count` is the last sequence announced, so `count + 1` is the next
+	 * line the pure decision will accept.
+	 */
+	private readonly stallAnnouncements = new Map<string, { bucket: number; count: number }>();
 	private readonly now: () => number;
 	private readonly intervalMs: number;
 	private timer: ReturnType<typeof setInterval> | undefined;
@@ -157,6 +224,7 @@ export class LegionPostman {
 		this.sendSelfMessage = options.sendSelfMessage ?? (() => {});
 		this.resumeChild = options.resumeChild;
 		this.machine = options.machine;
+		this.noticeMsForRole = options.noticeMsForRole;
 		this.parseTurns = options.parseTurns ?? ((sessionFile) => parseSessionFile(sessionFile).turns);
 		this.now = options.now ?? Date.now;
 		this.intervalMs = options.intervalMs ?? POSTMAN_INTERVAL_MS;
@@ -182,6 +250,10 @@ export class LegionPostman {
 			const timestamp = this.now();
 			const children = getChildren(this.db, this.nodeId);
 			this.refreshHeartbeats(children);
+			// stall-notice: the detectors run off the SAME per-tick facts the heartbeat
+			// just refreshed, and before any delivery pass — so a notice written here is
+			// picked up by this tick's own delivery instead of waiting another 2s.
+			this.checkStallNotices(timestamp, children);
 			// Confirm before delivering, so a message sent in this very tick stays
 			// ACCEPTED for at least one tick instead of flipping to DELIVERED in the
 			// same pass that queued it.
@@ -854,6 +926,246 @@ export class LegionPostman {
 		}
 		for (const message of messages) this.emitMail(message.id, node.id, "mail_sent");
 		return true;
+	}
+
+	/**
+	 * stall-notice v1: tell THIS node's own inbox that a child has not moved.
+	 *
+	 * The detectors run in the postman (D4: it owns the tick, the supervisor and the
+	 * db), so "the recipient of a notice is the detector's own node". Two independent
+	 * facts, one exit:
+	 *
+	 * - **L1 silence** — empty in-flight stack, no event for `silenceNoticeMs`. The
+	 *   child is alive but produced nothing; the parent gets two announcements (1× and
+	 *   2×) and then quiet, because a dead child must not mail every 2 minutes.
+	 * - **L2 long-running** — `now - loopBaseAt >= loopRadiusMs`. It may be looping and
+	 *   it may just be a huge task; either way the parent should look at the actual
+	 *   execution context. Repeated once per radius, at most three times per window.
+	 *
+	 * Nothing here decides liveness, kills, steers or retires anything (D3): a false
+	 * positive must cost a human a glance, never a child its process.
+	 *
+	 * @param timestamp this tick's clock reading (`this.now()`), never a fresh one, so
+	 * two facts written in the same tick cannot disagree about "now".
+	 */
+	private checkStallNotices(timestamp: number, children: readonly LegionNode[]): void {
+		try {
+			this.runStallNoticeCheck(timestamp, children);
+		} catch (error) {
+			// Degrade, don't throw: this step runs in the MIDDLE of the tick, so an
+			// escaped throw would cost the rest of the pass its mail delivery (unlike
+			// `checkOwnPhaseTimeout`, which is the last step). The counters were not
+			// recorded, so the next tick retries — nothing is silently burnt.
+			console.warn(
+				`[pi-legion] stall notice pass for ${this.nodeId} failed (${messageOf(error)}); mail delivery is unaffected.`,
+			);
+		}
+	}
+
+	private runStallNoticeCheck(timestamp: number, children: readonly LegionNode[]): void {
+		const self = getNode(this.db, this.nodeId);
+		// A team that already ended has nothing left to act on a notice with.
+		if (!self || hasEnded(self)) return;
+		const live = new Set<string>();
+		const announcements: StallAnnouncement[] = [];
+		for (const child of children) {
+			if (hasEnded(child)) {
+				// D5: a terminal/retired child takes its clock (and its counters) with it.
+				this.forgetStallState(child.name);
+				continue;
+			}
+			// D9: no new liveness verdict. This only reads the one the supervisor
+			// already owns — a child this process is not running cannot be judged
+			// "stuck" by it, and a *dead* child is the orphan scan's business.
+			if (!this.supervisor.isAlive(child.name)) continue;
+			live.add(child.name);
+			const clock = this.stallClockFor(child, timestamp);
+			const facts = this.stallFactsFor(child);
+			const announcement = decideStallNotice({
+				now: timestamp,
+				child: facts,
+				thresholds: {
+					// The settings object is normally the resolved one (defaults filled), so the
+					// `??` only matters for a hand-built postman (tests, callers): it must behave
+					// like production rather than silently turning L1 off.
+					silenceNoticeMs: this.settings.silenceNoticeMs ?? DEFAULT_LEGION_SETTINGS.silenceNoticeMs,
+					loopRadiusMs: this.stallLoopRadiusMs(child, clock),
+				},
+				window: {
+					loopBaseAt: clock.loopBaseAt,
+					silenceAnnounced: this.stallAnnouncedCount(child.name, "silence", facts.lastEventAt),
+					longRunningAnnounced: this.stallAnnouncedCount(child.name, "long-running", clock.loopBaseAt),
+				},
+			});
+			if (announcement) announcements.push(announcement);
+		}
+		this.markAbsentStallClocks(children, live);
+		if (announcements.length === 0) return;
+		const notice = formatStallNotice(announcements);
+		this.writeStallNotice(notice, timestamp);
+		// Counters move only after the row exists: a refused/failed write must leave the
+		// window unspent so the next tick can try again (same rule as `phase_timeout`).
+		for (const announcement of announcements) {
+			this.stallAnnouncements.set(stallAnnouncementKey(announcement.childName, announcement.kind), {
+				bucket: announcement.sinceBucket,
+				count: announcement.sequence,
+			});
+		}
+	}
+
+	/**
+	 * The L2 clock for one child, creating or restarting it per D5's table.
+	 *
+	 * First sight uses `nodes.created_at`: the tick that happened to notice a child is
+	 * not "when it started", and using it would make every restart of this process
+	 * look like a brand-new child.
+	 */
+	private stallClockFor(child: LegionNode, timestamp: number): StallClock {
+		const known = this.stallClocks.get(child.name);
+		if (!known) {
+			const created = { loopBaseAt: Number.isFinite(child.createdAt) ? child.createdAt : timestamp };
+			this.stallClocks.set(child.name, created);
+			return created;
+		}
+		if (known.absent) {
+			// D5: back from "not in the live set" (resume / re-spawn). The new process
+			// has done none of the old one's work, so the clock restarts now. A radius an
+			// operator set with `extend` survives: it is a preference, not a measurement.
+			const resumed: StallClock = {
+				loopBaseAt: timestamp,
+				...(known.loopRadiusMs === undefined ? {} : { loopRadiusMs: known.loopRadiusMs }),
+			};
+			this.stallClocks.set(child.name, resumed);
+			return resumed;
+		}
+		return known;
+	}
+
+	/** D5: entries whose child is gone for now are flagged, not dropped. */
+	private markAbsentStallClocks(children: readonly LegionNode[], live: ReadonlySet<string>): void {
+		const known = new Set(children.map((child) => child.name));
+		for (const [name, clock] of this.stallClocks) {
+			if (!known.has(name)) {
+				// The node itself is gone from the ledger: nothing can make it reappear.
+				this.forgetStallState(name);
+				continue;
+			}
+			if (live.has(name) || clock.absent) continue;
+			this.stallClocks.set(name, { ...clock, absent: true });
+		}
+	}
+
+	private forgetStallState(name: string): void {
+		this.stallClocks.delete(name);
+		for (const kind of STALL_KINDS) this.stallAnnouncements.delete(stallAnnouncementKey(name, kind));
+	}
+
+	/**
+	 * The two facts the pure decision reads, and nothing else.
+	 *
+	 * `inFlightToolStackOf` answers `undefined` both for "empty stack" and for "this
+	 * supervisor cannot answer" — the same conflation the status line has always made
+	 * ("no fact, no line"). For L1 that is the honest reading: absence of a frame is
+	 * the absence of a running tool, and D2 makes `lastEventAt` the optional member
+	 * that decides whether a notice can be produced at all.
+	 */
+	private stallFactsFor(child: LegionNode): StallChildFacts {
+		const stack = inFlightToolStackOf(this.supervisor, child.name);
+		const top = stack?.[stack.length - 1];
+		const lastEventAt = this.supervisor.lastEventAt?.(child.name);
+		return {
+			name: child.name,
+			...(lastEventAt === undefined ? {} : { lastEventAt }),
+			...(top === undefined ? {} : { inFlightTool: top.tool, inFlightToolStartedAt: top.startedAt }),
+		};
+	}
+
+	/**
+	 * The L2 radius: an `extend` override first, then the role card's own answer.
+	 *
+	 * `undefined` from the resolver is a decision (the card declared `loopNoticeMs: 0`),
+	 * and no resolver at all is also a decision: this postman was built without a
+	 * catalog, so it has no fact about the role and reports nothing (see
+	 * {@link LegionPostmanOptions.noticeMsForRole}).
+	 */
+	private stallLoopRadiusMs(child: LegionNode, clock: StallClock): number | undefined {
+		if (clock.loopRadiusMs !== undefined) return clock.loopRadiusMs;
+		if (!this.noticeMsForRole) return undefined;
+		try {
+			return this.noticeMsForRole(child.role);
+		} catch (error) {
+			// A caller-supplied lookup must not be able to stop the postman tick (the
+			// same degrade-don't-throw rule as `machineForRole` in the orchestrator).
+			console.warn(
+				`[pi-legion] stall notice radius lookup for role '${child.role}' threw (${messageOf(error)}); no L2 reminder for ${child.name} this tick.`,
+			);
+			return undefined;
+		}
+	}
+
+	private stallAnnouncedCount(name: string, kind: StallNoticeKind, bucket: number | undefined): number {
+		if (bucket === undefined) return 0;
+		const known = this.stallAnnouncements.get(stallAnnouncementKey(name, kind));
+		// `count` is the last sequence announced, so the next line is `count + 1`.
+		return known && known.bucket === bucket ? known.count : 0;
+	}
+
+	/**
+	 * D5's `extend`: move this child's L2 baseline to now, optionally changing its
+	 * radius. Returns `undefined` when the name is not one of this node's children
+	 * (the caller answers `NOT_FOUND`).
+	 *
+	 * It does NOT touch `lastEventAt`, so L1 keeps measuring the real silence (D5:
+	 * "不延后 L1" — an objective gap must not be renewable away).
+	 */
+	extendStallWindow(name: string, ms?: number): StallExtendReceipt | undefined {
+		const child = getChildren(this.db, this.nodeId).find((candidate) => candidate.name === name);
+		if (!child) return undefined;
+		const now = this.now();
+		const known = this.stallClocks.get(name);
+		const radius = ms ?? known?.loopRadiusMs;
+		const clock: StallClock = { loopBaseAt: now, ...(radius === undefined ? {} : { loopRadiusMs: radius }) };
+		this.stallClocks.set(name, clock);
+		// The new baseline is a new `sinceBucket`, so the L2 count restarts on its own
+		// (D6: "after the cap, silent until extend or the child ends").
+		return { childName: name, loopBaseAt: now, loopRadiusMs: this.stallLoopRadiusMs(child, clock) };
+	}
+
+	/**
+	 * D4's single exit: one row in `messages`, addressed to this postman's own node.
+	 *
+	 * Deliberately not `sendMail`: that helper drops the sender from its own recipient
+	 * list (`resolveMailTargets` filters `id !== fromNode`), so a self-addressed row is
+	 * unreachable through it — and it would also write a `mail_sent` event, while D9
+	 * keeps this notice out of the events table entirely (the de-duplication is memory
+	 * only, and the fact is one-shot and regenerable). The three DELIVERY paths that
+	 * consume the row are untouched: a blocked `wait`/`collect` preempts on it, the
+	 * root postman delivers its own inbox, and a non-root parent receives it through
+	 * its own parent's `deliverChildren`.
+	 *
+	 * A throw is contained: `tick()` is called from `start()` with `.catch(() => {})`,
+	 * so leaving the counters unspent (the caller only records after this returns) is
+	 * what makes the next tick retry instead of silently losing the fact.
+	 *
+	 * `withoutNul` is the same last-resort guard `sendInternalNotice` applies: SQLite
+	 * truncates text at a U+0000, and this row is composed from ledger fields (a child
+	 * handle rides the body), so a stray one must not cost the notice.
+	 */
+	private writeStallNotice(notice: { subject: string; body: string }, timestamp: number): void {
+		this.db
+			.prepare(
+				`INSERT INTO messages (
+					from_node, to_node, subject, body, kind, urgency, delivered, created_at
+				) VALUES (?, ?, ?, ?, 'notice', 'action-needed', ?, ?)`,
+			)
+			.run(
+				this.nodeId,
+				this.nodeId,
+				withoutNul(notice.subject),
+				withoutNul(notice.body),
+				MAIL_DELIVERY.PENDING,
+				timestamp,
+			);
 	}
 }
 
