@@ -488,6 +488,7 @@ another process's worth of memory.
 | role frontmatter `inheritExtensions: false` | Load ONLY the card's own `extensions` / `subagentOnlyExtensions`. Nothing is inherited, so `excludeExtensions` has nothing to subtract. |
 | `PI_LEGION_CHILD_INHERIT_EXTENSIONS=0` | Same as `inheritExtensions: false`, for every child. `1` forces inheritance back on. |
 | `PI_LEGION_CHILD_EXTENSIONS=/a.ts,/b.ts` | Extra paths every child loads explicitly. |
+| `PI_LEGION_CHILD_MCP=0` | **No MCP in children.** Neither `builtin:mcp` nor `builtin:tool-search` is loaded, so no child opens an MCP connection. `0`/`false`/`off`/`no`/`none` disable it; anything else (including unset) leaves MCP on. |
 
 The child-guard is appended unconditionally and is not subject to either knob —
 a child without it breaks the prompt/format contract no matter what the card
@@ -503,6 +504,24 @@ explicitly if a child needs them.
 LSP stack (~1 GB per child, #43). If a fleet of children does not need it, add
 `excludeExtensions: [pi-lens]` to those cards. The bundled `worker` does not list
 `lens_*` tools; give a role those tools by adding the names to its `tools:` list.
+
+**MCP is on for every child, and it costs per child.** A child loads
+`builtin:mcp` + `builtin:tool-search` and then binds its extensions once, which
+is what makes `session_start` fire and the configured MCP servers actually
+connect. Each child therefore spawns its own server processes: measured, **5
+concurrent children × 1 server = 18 processes / 1121 MB**. There is no connection
+budget and no concurrency cap yet — the only knob is the mask
+`PI_LEGION_CHILD_MCP=0`, which removes both builtins for every child. Per-role and
+per-server selection is not implemented.
+
+There is also **no annotation-level firewall**, deliberately. A real server's
+`tools[].annotations` came back `null` for every tool measured (`web_search`,
+`web_fetch`, `search_status`, `search_login`), so a `readOnlyHint` allow-list
+would have blocked even `web_search` while a `destructiveHint` deny-list would be
+a no-op for any server that declares nothing. The honest consequence: **a role
+whose `acceptance.role` is `read-only` (the bundled `scout`) can call whatever
+write capability an MCP server exposes.** The bash-only read-only classification
+is unchanged — it never covered anything but bash.
 
 ### Extra agent directories
 

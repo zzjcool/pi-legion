@@ -252,3 +252,14 @@ npm run test:integration
 **已知缺口（不掩盖）**：`defaultSessionFactory` 里那一行 `childBuiltinExtensionEntries(...)` 调用
 本身不被任何测试覆盖。接受理由：错误在运行期非常响（重新出现
 `Unknown built-in extension: builtin:codemode`），且该函数现在是唯一的构造点。
+
+### r3（MR2，`child-mcp-v1` 取代）— D4 / D5 反转
+
+本契约的 **D4（不启用 MCP）** 与 **D5（不调用 `bindExtensions`）** 已被
+`docs/contracts/child-mcp-v1.md` 取代：D1 现在为所有子会话注入 `builtin:mcp` +
+`builtin:tool-search`（掩码 `PI_LEGION_CHILD_MCP=0`），in-process 子会话在 `createAgentSession`
+之后绑定一次扩展，因此 `session_start` **会**触发；legion 自己的 `session_start` handler 相应加了
+注入身份守卫（持有 `childContext` 身份的会话跳过 `initializeLegionRuntime`）。其余条款不变 ——
+D1 的 factories 注册、D2 的 legion 三工具白名单、D3 的 `noExtensions: true`、D6/D7 的门禁都仍然有效；
+D3 的「rpc 与 in-process 扩展集合逐字节一致」尤其仍是硬约束（两条路共用
+`collectChildExtensions`，MCP 的两条路径也只在那里注入）。

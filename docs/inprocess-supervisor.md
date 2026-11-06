@@ -180,11 +180,20 @@ Two consequences worth knowing:
   tree identity. That is the isolation the env channel lacked — it is what
   produced the "healthy ghost nodes" incident, where a test-loading extension
   adopted an ancestor's ledger identity.
-- **The SDK never emits `session_start` for these sessions.** `createAgentSession`
-  does not call `bindExtensions`, which is the only emitter, so the usual
-  session-start identity init is dead here. The orchestrator injects the
-  context explicitly and the extension attaches the identity on its first
-  ctx-bearing event, using the pre-created transcript file as the credential.
+- **`session_start` DOES fire for these sessions — the identity still comes from
+  ALS.** `createAgentSession` does not call `bindExtensions` (the only emitter),
+  so the in-process session factory binds once right after creating the session
+  (`bindChildSessionExtensions`: `mode: "print"` plus an `onError` that warns
+  instead of swallowing). That is what makes `session_start` consumers real here
+  — the MCP extension loads its config and starts connecting inside that
+  handler — and it is also why legion's own `session_start` handler carries an
+  identity guard: a session holding the injected child identity skips
+  `initializeLegionRuntime`, because its identity comes from the ALS context, not
+  from `process.env` (an in-process child shares the parent's env, so with an rpc
+  ancestor the handler would otherwise init on the ancestor's ledger). The
+  orchestrator injects the context explicitly and the extension attaches the
+  identity on its first ctx-bearing event, using the pre-created transcript file
+  as the credential.
 
 Do not replace this with env injection for in-process children.
 
@@ -210,7 +219,8 @@ Production `defaultSessionFactory` calls `createAgentSession` with:
 | `tools` | `agent.tools` (omit when unset → SDK default). Non-utility roles also get `vexillatio`, same as RPC `pushToolArgs`. |
 | `model` / `thinkingLevel` | Resolved spawn `model` (+ `thinking` / `modelProvider`), via `ModelRuntime` + `resolveCliModel` — same string Orchestrator already picked for RPC. |
 | system prompt | `DefaultResourceLoader` `systemPromptOverride` (replace) or `appendSystemPromptOverride` (append) from `agent.systemPrompt` + `systemPromptMode`. `childContext` is joined once here (RPC-aligned); do not double-inject. |
-| extensions | Default `noExtensions: true` + explicit `additionalExtensionPaths` from role / `PI_LEGION_CHILD_EXTENSIONS` / auto `builtin:codemode` + child-guard. Does **not** reload parent MCP wholesale. `inheritExtensions: true` restores host discovery. |
+| extensions | Default `noExtensions: true` + explicit `additionalExtensionPaths` from role / `PI_LEGION_CHILD_EXTENSIONS` / auto `builtin:codemode` / `builtin:mcp` + `builtin:tool-search` (absent when `PI_LEGION_CHILD_MCP=0`) + child-guard. The host MCP config is loaded by the child itself through `builtin:mcp`; the parent's live connections are never copied. `inheritExtensions: true` restores host discovery. |
+| `session_start` | `bindChildSessionExtensions(session, name)` right after `createAgentSession`, exactly once, with `{ mode: "print", onError }` — without it the SDK emits no `session_start` and every handler for it (MCP connections included) is dead. |
 
 See `buildInProcessSessionPlan` / `test/unit/inprocess-supervisor.test.ts`.
 

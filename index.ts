@@ -1597,15 +1597,22 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			try { initializeLegionRuntime({ cwd: process.cwd() }); }
 			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 		}
-		// #197 D8: an in-process child never sees `session_start` — the SDK emits it
-		// from `bindExtensions`, which only rpc / print / interactive modes call;
-		// `createAgentSession` does not. So the handler further down is dead for
-		// this transport and the injected identity is attached here instead.
+		// #197 D8: the injected identity is attached here, on the first ctx-bearing
+		// event, rather than at extension load — the identity credential (this
+		// session's transcript file) only exists on `ctx.sessionManager`, and
+		// skipping it would defeat the ghost-node guard inside
+		// `resolveLegionIdentity`.
 		//
-		// It is attached on the first ctx-bearing event rather than at extension
-		// load: the identity credential (this session's transcript file) only
-		// exists on `ctx.sessionManager`, and skipping it would defeat the
-		// ghost-node guard inside `resolveLegionIdentity`.
+		// The `session_start` handler further down USED to be dead for this
+		// transport (`createAgentSession` does not emit it; only `bindExtensions`
+		// does). `child-mcp-v1` D3 makes `defaultSessionFactory` bind once, so it
+		// now runs here too — and must NOT initialize the legion runtime, because an
+		// in-process child shares the parent's `process.env`: under an rpc parent it
+		// would init on the ANCESTOR's `PI_LEGION_*` identity, get flipped to its own
+		// on this very event, and have no reclaim point (`session_shutdown` never
+		// fires for this transport — `InProcessSupervisor` only calls
+		// `session.dispose()`). The identity channel for this transport is
+		// `childContext` (ALS), never env; see the guard below.
 		if (childContext?.nodeId && childContext.dbPath) {
 			const legionNode = { dbPath: childContext.dbPath, nodeId: childContext.nodeId };
 			let attached = false;
@@ -1648,9 +1655,23 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			console.error(`[pi-legion] storage sweep failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	};
+	// `child-mcp-v1` D4: an in-process child now DOES receive `session_start`
+	// (`defaultSessionFactory` binds the session's extensions once, `child-session.ts`),
+	// so this handler is no longer dead for that transport. The guard is about
+	// IDENTITY, not about the event: a session holding the injected child identity
+	// must not call `initializeLegionRuntime`, whose `resolveLegionIdentity` reads
+	// `PI_LEGION_*` from `process.env` — the parent's env, shared by every
+	// in-process child. With an rpc ancestor that means opening an ancestor's db and
+	// starting a second postman, with `session_shutdown` never firing to reclaim it.
+	// A root session is unaffected: no injected identity ⇒ the original path runs
+	// verbatim, and for a true root `initializeLegionRuntime` would resolve no
+	// identity anyway. The hygiene branch below is `!isChild` and stays as it was.
+	const hasInjectedChildIdentity = Boolean(childContext?.nodeId && childContext.dbPath);
 	pi.on("session_start", (_event, ctx) => {
-		try { initializeLegionRuntime({ cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile() }); }
-		catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
+		if (!hasInjectedChildIdentity) {
+			try { initializeLegionRuntime({ cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile() }); }
+			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
+		}
 		if (!isChild && !hygieneScheduled && hygieneEnabled()) {
 			hygieneScheduled = true;
 			const storeRoot = runStoreFor(ctx.cwd).rootDir;
