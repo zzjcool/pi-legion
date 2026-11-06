@@ -397,7 +397,7 @@ test("#285: a child session sharing the parent's ledger must not close the paren
 	}
 });
 
-test("r5 G1: a stale shutdown ctx must not skip this entry's own ledger close", async () => {
+test("r5 G1: a stale shutdown ctx must not skip this entry's own ledger close", async (t) => {
 	// `child-mcp-v1` r3 C1 emits `session_shutdown` from `dispose()` before tearing
 	// the session down, but if the 1000ms bound trips, `dispose()` invalidates the
 	// extension runner while it is still iterating handlers — and legion's own
@@ -473,14 +473,15 @@ test("r5 G1: a stale shutdown ctx must not skip this entry's own ledger close", 
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, staleCtx);
 
 		const after = dbHandles();
-		if (before >= 0) {
-			assert.ok(before >= 1, `boot attach adopted a ledger handle (saw ${before})`);
-			assert.equal(
-				after,
-				before - 1,
-				"the own ledger must be closed from the handler's finally even though ctx.mode threw",
-			);
-		}
+		// `countDbFds` answers -1 off Linux (no procfs). Say "skipped" out loud: a
+		// silent green would claim coverage this host cannot give.
+		if (before < 0) return t.skip("procfs-only assertion (/proc/self/fd)");
+		assert.ok(before >= 1, `boot attach adopted a ledger handle (saw ${before})`);
+		assert.equal(
+			after,
+			before - 1,
+			"the own ledger must be closed from the handler's finally even though ctx.mode threw",
+		);
 	} finally {
 		await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, undefined);
 		for (const [name, value] of previous) {

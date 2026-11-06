@@ -90,6 +90,26 @@ docker exec -e PI_LEGION_CHILD_MCP=0 pi-legion-real pi --model workbuddy/hy4std 
 | 探针二（默认） | `4:mcp__search_hub__web_search,mcp__search_hub__web_fetch,mcp__search_hub__search_status,mcp__search_hub__search_login` |
 | 探针二（`PI_LEGION_CHILD_MCP=0`） | `NONE` |
 
+## macOS（结构性限制，未在 Mac 上实测）
+
+**真模型沙箱（`make run` / `make smoke` / `make print`）目前是 Linux-only**，三处假设：
+
+1. `run-tui-real.sh:38` 用 `--network=host`。Docker Desktop for Mac 默认不共享宿主
+   loopback，容器里的 `localhost:3425` 到不了宿主网关。
+2. 挂载用**宿主绝对路径挂到容器内同名路径**（`-v "$HOST_AGENT/auth.json:...:ro"`）。
+   Linux 上宿主 `$HOME=/root` 恰好等于容器里的 `HOME=/root`，所以能读到；macOS 上
+   宿主是 `/Users/<you>/.pi/agent`，而容器里的 pi 仍然只找 `/root/.pi/agent`
+   ⇒ auth 读不到，模型起不来。
+3. `CHILD_EXT=/root/.pi/agent/npm/...` 也是容器内路径，这条本身没问题；
+   真正的问题来自第 2 条。
+
+**可以跨平台的**：`make rpc`（`verify-*.sh` 把 host config 复制到 `/tmp` 暂存目录再挂到
+容器 `/root`，且用 mock LLM / 不需要宿主网关）与 `make tui-visual`（mock 模型）。
+这两项按设计不依赖宿主网络与宿主 HOME 布局，但**尚未在 macOS 上实跑验证**。
+
+要真在 Mac 上跑真模型沙箱，至少得改两处：容器内 `-e HOME=<宿主 agent 目录的父目录>`
+加把挂载路径对齐，或改用 `host.docker.internal` 并重写 `auth.json` 的 `baseUrl`。
+
 ## 两条路
 
 | 路 | 用途 | 网络 | 模型 |
