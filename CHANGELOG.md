@@ -11,6 +11,16 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [5.4.0] — 2026-11-06
+
+一次「把子 agent 的工具面还回去」的发布。默认后端（in-process）的子会话以前**悄悄**少了三样东西：
+角色卡里声明的 `codemode` 根本解析不出来、`legion_mail` / `legion_tree` / `legion_phase` 被 `tools:`
+白名单裁掉、以及任何 MCP server 都连不上。三者成因各不相同（loader 缺 `extensionFactories`、白名单对
+所有已注册工具生效、`session_start` 只由 `bindExtensions` emit），本版一并补齐：MCP 默认给所有子会话，
+`PI_LEGION_CHILD_MCP=0` 一键回到旧行为。三轮对抗式 review 各抓出一个会真出事儿的生命周期缺陷
+（退役不回收 MCP 连接、补发的 `session_shutdown` 关掉**别人的** ledger、截断窗口里 stale ctx 跳过自身清理），
+全部修掉并留下门禁。
+
 ### Added
 
 - **子会话默认加载 MCP（`docs/contracts/child-mcp-v1.md`）。** 以前子会话连不上任何 MCP server，卡在两层：
@@ -52,11 +62,20 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `tools:` 白名单裁掉**（`docs/contracts/child-builtin-extensions-v1.md`）。子会话的 `DefaultResourceLoader`
   以前不传 `extensionFactories`，于是角色卡声明 `tools: [codemode]` 只换来一条 `Unknown built-in extension:
   builtin:codemode`——真机派一个 scout 自报，`codemode` 就这么消失了；现在 `codemode` / `tool-search` /
-  `mcp` 三个宿主 replaceable builtin 只做**注册**，开关仍然是 `builtin:` 路径，因此本次不引入任何 MCP 连接。
+  `mcp` 三个宿主 replaceable builtin 只做**注册**，开关仍然是 `builtin:` 路径（MCP 路径由下一条 Added 引入）。
   另一半是同一批工具被白名单裁掉：`tools:` 对所有已注册工具生效，`legion_mail` / `legion_tree` /
   `legion_phase` 注册后被过滤，子 agent 中途只剩「收尾 verdict」一条上行通道；现在它们被无条件补进
   in-process 与 rpc 两条路的白名单（固定顺序、缺席才追加，两处逐字节一致并新增 parity 门禁）。
   未注册的名字在白名单里是惰性的，没有机器的子节点不会凭空多出 `legion_phase`。
+
+### Docs
+
+- **容器化验证配方落地（`test/docker/README.md`，`CONTRIBUTING.md`）**：改完插件代码不必重建镜像
+  （`/plugin` 是只读挂载），顺序是 `make up && make smoke && make rpc`；`make run` 是交互 TUI。附两条
+  非交互探针（子 agent 工具表 / 用 codemode 数 `ALL_TOOLS` 验证 MCP），以及今天真机基线
+  （`make rpc` 11/11、scout 工具表 8 个、MCP 4 个工具、`PI_LEGION_CHILD_MCP=0` → 0 个）。
+  真模型沙箱的 macOS 限制写清了（`--network=host` 与同路径挂载的两处假设）。
+- 依赖 `/proc/self/fd` 的那条断言在非 Linux 上改为**显式 `t.skip`**，不再静默绿。
 
 ## [5.3.0] — 2026-11-06
 
