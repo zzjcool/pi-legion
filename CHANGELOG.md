@@ -11,6 +11,18 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Fixed
+
+- **in-process 子会话又能解析 `builtin:codemode`，`legion_mail` / `legion_tree` / `legion_phase` 也不再被
+  `tools:` 白名单裁掉**（`docs/contracts/child-builtin-extensions-v1.md`）。子会话的 `DefaultResourceLoader`
+  以前不传 `extensionFactories`，于是角色卡声明 `tools: [codemode]` 只换来一条 `Unknown built-in extension:
+  builtin:codemode`——真机派一个 scout 自报，`codemode` 就这么消失了；现在 `codemode` / `tool-search` /
+  `mcp` 三个宿主 replaceable builtin 只做**注册**，开关仍然是 `builtin:` 路径，因此本次不引入任何 MCP 连接。
+  另一半是同一批工具被白名单裁掉：`tools:` 对所有已注册工具生效，`legion_mail` / `legion_tree` /
+  `legion_phase` 注册后被过滤，子 agent 中途只剩「收尾 verdict」一条上行通道；现在它们被无条件补进
+  in-process 与 rpc 两条路的白名单（固定顺序、缺席才追加，两处逐字节一致并新增 parity 门禁）。
+  未注册的名字在白名单里是惰性的，没有机器的子节点不会凭空多出 `legion_phase`。
+
 ## [5.3.0] — 2026-11-06
 
 一次「下游很久没动静时说一声」的发布。新增两个**只通知、不处置**的探测器：L1 抓「进程活着但僵住」，

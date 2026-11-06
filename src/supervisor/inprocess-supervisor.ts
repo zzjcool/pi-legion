@@ -13,6 +13,7 @@ import { formatChildTask } from "../extension/child-guard.ts";
 import { childBudgetFromEnv } from "../extension/budget.ts";
 import { parseSessionFile } from "../shared/session.ts";
 import {
+	appendLegionChildTools,
 	applyThinkingSuffix,
 	childInheritsExtensions,
 	collectChildExtensions,
@@ -26,6 +27,7 @@ import {
 	SubagentError,
 	DEFAULT_LEGION_SETTINGS,
 } from "../shared/types.ts";
+import { CHILD_BUILTIN_EXTENSIONS } from "./child-builtins.ts";
 import {
 	POLL_INTERVAL_MS,
 	DEFAULT_INPROCESS_MAX_ACTIVE,
@@ -202,6 +204,7 @@ function resolveInProcessTools(
 	if (!agent.utility && !tools.includes("vexillatio")) {
 		tools.push("vexillatio");
 	}
+	appendLegionChildTools(tools);
 	return tools;
 }
 
@@ -578,15 +581,39 @@ async function defaultSessionFactory(
 		getAgentDir,
 		ModelRuntime,
 		resolveCliModel,
+		createCodemodeExtension,
+		createToolSearchExtension,
+		createMcpExtension,
 	} = await import("@earendil-works/pi-coding-agent");
 
 	const plan = buildInProcessSessionPlan(input);
 	const agentDir = getAgentDir();
 
+	// D1 (child-builtin-extensions-v1): a `builtin:<name>` path resolves only out
+	// of a factory registered with the loader. Without these the loader answers
+	// "Unknown built-in extension: builtin:codemode" and the card's `codemode`
+	// tool silently vanishes — codemode is a light builtin, so a role card may
+	// list it without naming an extension path.
+	//
+	// Registering a factory activates nothing: the `builtin:` path chosen by
+	// `collectChildExtensions` is still the switch. `mcp` is registered for parity
+	// with the host but has no path, so MR1 connects no MCP server.
+	const builtinFactories = {
+		codemode: createCodemodeExtension(),
+		"tool-search": createToolSearchExtension(),
+		mcp: createMcpExtension(),
+	} satisfies Record<(typeof CHILD_BUILTIN_EXTENSIONS)[number], unknown>;
+
 	const loaderOptions: ConstructorParameters<typeof DefaultResourceLoader>[0] = {
 		cwd: plan.cwd,
 		agentDir,
 		noExtensions: plan.noExtensions,
+		extensionFactories: CHILD_BUILTIN_EXTENSIONS.map((name) => ({
+			name,
+			factory: builtinFactories[name],
+			builtin: true,
+			replaceable: true,
+		})),
 		...(plan.additionalExtensionPaths.length > 0
 			? { additionalExtensionPaths: plan.additionalExtensionPaths }
 			: {}),

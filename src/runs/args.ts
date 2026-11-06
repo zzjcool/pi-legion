@@ -269,11 +269,44 @@ export function collectChildExtensions(
 	return out;
 }
 
+/**
+ * Legion's own child tools, which must stay on the whitelist (D2).
+ *
+ * `tools:` filters every registered tool (`agent-session` `_isAllowedTool`), so a
+ * tool the child registers but the card does not list never reaches the model —
+ * that is how `legion_mail` / `legion_tree` / `legion_phase` went missing, taking
+ * away every mid-run channel a child had to its parent and siblings.
+ *
+ * A name that was never registered is inert in the list (`getToolListError` only
+ * rejects `+`/`-` mixing, `_isAllowedTool` only matches), so `legion_phase` can be
+ * listed for a child that has no machine and thus no such tool.
+ */
+export const LEGION_CHILD_TOOLS = [
+	"legion_mail",
+	"legion_tree",
+	"legion_phase",
+] as const;
+
+/**
+ * Append {@link LEGION_CHILD_TOOLS} in fixed order; a name the card already lists
+ * is left where the card put it.
+ *
+ * Shared by the rpc (`pushToolArgs`) and in-process (`resolveInProcessTools`)
+ * paths on purpose: the two launch shapes must produce a byte-identical
+ * whitelist, and the only way to keep them in step is to have one implementation.
+ */
+export function appendLegionChildTools(tools: string[]): void {
+	for (const name of LEGION_CHILD_TOOLS) {
+		if (!tools.includes(name)) tools.push(name);
+	}
+}
+
 /** `--tools a,b`, `--no-extensions` (unless inherited), plus one `--extension` per explicit extension. */
 function pushToolArgs(args: string[], agent: AgentConfig): void {
 	const tools = agent.tools?.filter(Boolean) ?? [];
 	if (tools.length > 0) {
 		if (!agent.utility && !tools.includes("vexillatio")) tools.push("vexillatio");
+		appendLegionChildTools(tools);
 		args.push("--tools", tools.join(","));
 	}
 

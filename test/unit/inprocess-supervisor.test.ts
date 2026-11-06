@@ -21,6 +21,7 @@ import {
 	discoveredHostExtensions,
 	resetExtensionDiscoveryCache,
 } from "../../src/runs/extension-inheritance.ts";
+import { buildPiArgs } from "../../src/runs/args.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
 import type { NestedPathEntry } from "../../src/shared/types.ts";
@@ -495,7 +496,14 @@ test("inprocess plan: tools + model + systemPrompt replace/append", () => {
 		thinking: "high",
 		childContext: "machine notes",
 	});
-	assert.deepEqual(plan.tools, ["read", "bash", "vexillatio"]);
+	assert.deepEqual(plan.tools, [
+		"read",
+		"bash",
+		"vexillatio",
+		"legion_mail",
+		"legion_tree",
+		"legion_phase",
+	]);
 	assert.equal(plan.modelRef, "anthropic/claude-sonnet-4-5:high");
 	assert.equal(plan.systemPromptMode, "replace");
 	assert.equal(plan.systemPromptText, "You are scout.\n\nmachine notes");
@@ -537,7 +545,80 @@ test("inprocess plan: omit tools leaves SDK default; utility skips vexillatio", 
 		agent: testAgent({ tools: ["read"], utility: true }),
 		sessionFile: "/tmp/u2.jsonl",
 	});
-	assert.deepEqual(util.tools, ["read"]);
+	// D2: utility children skip `vexillatio` but still get legion's own child tools.
+	assert.deepEqual(util.tools, ["read", "legion_mail", "legion_tree", "legion_phase"]);
+});
+
+test("inprocess plan D6.1: legion_mail/tree/phase survive the card's tools whitelist", () => {
+	// The whitelist filters every registered tool, so a legion tool that registers
+	// but is not listed never reaches the child — the mid-run channel to the parent
+	// and siblings silently disappears (child-builtin-extensions-v1 D2).
+	const plan = buildInProcessSessionPlan({
+		name: "root.scout",
+		cwd: "/tmp/ws",
+		agent: testAgent({ tools: ["read", "grep"], utility: true }),
+		sessionFile: "/tmp/ws/scout.jsonl",
+	});
+	for (const tool of ["legion_mail", "legion_tree", "legion_phase"]) {
+		assert.ok(
+			plan.tools?.includes(tool),
+			`${tool} must be whitelisted, got ${plan.tools?.join(",")}`,
+		);
+	}
+
+	// Fixed order, and a name the card already declared keeps its own position
+	// instead of being appended twice.
+	const declared = buildInProcessSessionPlan({
+		name: "root.worker",
+		cwd: "/tmp/ws",
+		agent: testAgent({ tools: ["read", "legion_mail"] }),
+		sessionFile: "/tmp/ws/worker.jsonl",
+	});
+	assert.deepEqual(declared.tools, [
+		"read",
+		"legion_mail",
+		"vexillatio",
+		"legion_tree",
+		"legion_phase",
+	]);
+});
+
+test("inprocess plan D6.2: in-process whitelist equals rpc --tools", () => {
+	// The only mechanical gate against the two launch shapes drifting apart again:
+	// rpc and in-process must hand the child a byte-identical `tools` whitelist.
+	const root = mkdtempSync(path.join(tmpdir(), "legion-tools-parity-"));
+	try {
+		const cards = [
+			{ tools: ["read", "bash"] },
+			{ tools: ["read", "bash", "codemode"] },
+			{ tools: ["read"], utility: true },
+			{ tools: ["read", "legion_phase"] },
+		];
+		for (const overrides of cards) {
+			const agent = testAgent(overrides);
+			const plan = buildInProcessSessionPlan({
+				name: "root.worker",
+				cwd: root,
+				agent,
+				sessionFile: path.join(root, "worker.jsonl"),
+			});
+			const built = buildPiArgs({
+				agent,
+				task: "parity",
+				sessionFile: path.join(root, "worker.jsonl"),
+				tempDir: root,
+			});
+			const toolsAt = built.args.indexOf("--tools");
+			assert.ok(toolsAt >= 0, "rpc argv must carry --tools for a card with tools");
+			assert.deepEqual(
+				plan.tools,
+				(built.args[toolsAt + 1] ?? "").split(","),
+				`whitelist drift for ${JSON.stringify(overrides)}`,
+			);
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("inprocess: spawnChild forwards model/thinking/childContext to factory", async () => {

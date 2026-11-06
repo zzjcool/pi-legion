@@ -10,7 +10,9 @@ import {
 	buildPiArgs,
 	childGuardExtensionPath,
 	collectChildExtensions,
+	isBuiltinExtensionRef,
 } from "../../src/runs/args.ts";
+import { CHILD_BUILTIN_EXTENSIONS } from "../../src/supervisor/child-builtins.ts";
 import { ensureHostExtensions, resetExtensionDiscoveryCache } from "../../src/runs/extension-inheritance.ts";
 import { CHILD_TASK_APPENDIX } from "../../src/extension/child-guard.ts";
 
@@ -278,6 +280,32 @@ test("#89 tools:codemode auto-loads builtin:codemode under --no-extensions", () 
 		// builtin refs must not be path.resolved into cwd/builtin:codemode
 		assert.equal(exts.some((e) => !!e && e.includes("/") && e.endsWith("builtin:codemode")), false);
 	});
+});
+
+test("D6.3 every builtin: path a child gets is a wired-in child builtin", () => {
+	// The other half of D1: a `builtin:<name>` path only resolves against a factory
+	// `defaultSessionFactory` registers. Add a path without the factory and the
+	// loader answers "Unknown built-in extension" and drops the tool, so the set of
+	// paths must stay closed over CHILD_BUILTIN_EXTENSIONS.
+	withEnv(
+		{ PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined, PI_LEGION_CHILD_EXTENSIONS: undefined },
+		() => {
+			const exts = collectChildExtensions({ tools: ["read", "codemode"] });
+			const builtinNames = exts
+				.filter(isBuiltinExtensionRef)
+				.map((ext) => ext.trim().slice("builtin:".length));
+			assert.ok(
+				builtinNames.includes("codemode"),
+				`expected builtin:codemode in ${exts.join(",")}`,
+			);
+			for (const name of builtinNames) {
+				assert.ok(
+					(CHILD_BUILTIN_EXTENSIONS as readonly string[]).includes(name),
+					`builtin:${name} has no factory in defaultSessionFactory`,
+				);
+			}
+		},
+	);
 });
 
 test("#89 collectChildExtensions dedupes explicit builtin:codemode", async () => {
