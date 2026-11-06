@@ -224,33 +224,52 @@ launch (async) ──→ 子 pane 跑
               └─ runtime 完成通道（唯一的延迟源，按 **run** 级判定）
 ```
 
-完成通知的投递分两段，**只有一处 run 级延迟**：join 窗口是纯批处理延迟，二者串行叠加
-（最坏串联约 10s + 80s）——除此之外不存在第二个"等父会话忙完"的延迟源。
+完成通知的投递分两段，**只有一处 run 级延迟**：join 窗口是纯批处理延迟（默认 10s），
+之后一直等到本次 run 的边界（确切时刻由宿主 `agent_settled` 决定）；80s 只做健康计数，
+不再投递——除此之外不存在第二个"等父会话忙完"的延迟源。
 
 1. **join 批处理窗口**（`src/extension/join.ts`，默认 10s）：同一 runId 的多个 child
    一起启动、先后结束，窗口把 straggler 合成一条消息（`Background tasks completed
    (N of M)`）。窗口**只做批处理**，到期无条件 flush 到下一个环节，**不**因为父会话忙
    而延长——turn 级的 busy 是错误预测器（工具循环里父会话按定义就是忙的），而且会在
    outbox 之外叠加第二层延迟。
-2. **run 级 outbox**（`src/extension/runtime.ts`，`MAX_PENDING_AGE_MS = 80_000`）：
-   父 **run** 活跃时不 `pi.sendMessage`，通知入 FIFO 队列；`agent_settled` 到达后
-   一次性 burst 发出（一条通知一条消息），并重绘 UI。硬上限 80s（= 2× 旧的
-   `(1+3)×10s`）到点强制发送并计入 `noticeQueueStats().forcedFlushes`，宁可回到旧
-   行为也不无限隐藏。父 run 不活跃时**立即**发送（含 `mode: "each"`、单成员批次、
-   `triggerTurn:false` 项）。
+2. **run 级 outbox**（`src/extension/runtime.ts`）：父 **run** 活跃时不
+   `pi.sendMessage`，通知**只存结构**（`QueuedNotice` 持有 `entries` / `triggerTurn` /
+   `partial` / `enqueuedAt`，文本与 footer 都在交付那一刻现场算）；父 run 不活跃时
+   **立即**发送（含 `mode: "each"`、单成员批次、`triggerTurn:false` 项）。
 
-   上限是 **per-notice** 而不是 per-run：到点判定用 notice 自己的 `enqueuedAt` 算
-   （`runtime.ts` 的 `armOutboxTimer` 从 `outbox[0]` 起算，
-   `noticeQueueStats().oldestAgeMs` 也报最老一条）。所以父 run 持续 10 分钟时，不是
-   给整个 run 记一个 80s 预算、也不是因为 run 还在跑就无限顺延：队列里最老一条到点就
-   触发（`flushOutbox` 一次 `splice(0)`，连同队列里更年轻的 notice 一起按 FIFO burst
-   发出）。T3d 把「arm 与 oldestAgeMs 都跟最老一条」钉成测试。
+   **交付时刻 = 可见时刻**（`docs/contracts/notice-delivery-v2.md` D1）。`agent_settled`
+   是唯一允许投递的时刻：宿主 `sendMessage` 没有撤回能力，而通知真正进入模型上下文是在
+   宿主的 settle 边界 drain（`agent-session.js` 的 `hasQueuedMessages → continue`）。任何
+   "提前发、事后靠 claim 撤掉"都做不到——提前发出去的通知在 T0 就脱离了 claim 过滤，这就是
+   同一份结果经 `collect` 与通知各到一次（以及随后被误读成用户输入）的根因。
 
-为什么不能只发 `followUp`：宿主只在 **live run 内部** drain `agent.followUpQueue`，
-所以父 run 活跃时发出去的 followUp 会一直躺在队列里，直到用户再发一条消息才出现。
-这正是「完成通知看起来没来」的根因。发送时形状不变——
+   **一次边界只交付一条会唤起 run 的通知**（D2）：`flushOutbox()` 按 FIFO 逐条交付，交付
+   成功一条 `triggerTurn:true` 的条目后立即停手，剩余条目留在 outbox 等下一次边界；
+   `triggerTurn:false` 的条目只记录不唤 turn，所以可以在同一次边界内连续交付；被 claim
+   过滤掉的条目（返回 0）不计入停止条件，继续下一条。停止条件**不能**读 `parentRunActive`：
+   宿主 emit `agent_settled` 期间 `sendMessage` 是延后执行的（`_isEmittingAgentSettled`），
+   标志位无法反映"这一条已经唤起 run"。
+
+   **80s 上限降级为健康信号**（D6）：`MAX_PENDING_AGE_MS = 80_000`（= 2× 旧的
+   `(1+3)×10s`）不再触发任何发送。它只用来判断"这条通知被压得太久了"（`parentRunActive`
+   卡住、或宿主没 emit settle），到点计入 `noticeQueueStats().heldOverCap` 并按一个完整
+   窗口重新武装；`pending` / `oldestAgeMs` 语义不变，`heldOverCap` 与它们一起供诊断读取
+   （当前无生产消费者）。真实保底只有 `dispose()`（丢弃未投递的 pending）。上限仍然是
+   **per-notice**：`armOutboxTimer` 与 `oldestAgeMs` 都跟最老一条**仍可交付**的通知算
+   （已全被 claim 的死重条目不参与：不计时、不计数），T3d 把这一点钉成测试。
+
+   为什么不能"到点强发"：该上限的前提是"父 run 活跃时发出去的 followUp 会躺在队列里，
+   直到用户再发一条消息"——这个前提在当前宿主（pi 1.5.0）不成立，settle 边界就会 drain。
+   强制发送既不让模型早一秒看到，也不解决任何事情，只让通知提前离开 claim 过滤。
+
+发送时形状不变——
 `pi.sendMessage({ customType: "subagent-notify" }, { triggerTurn: true, deliverAs: "followUp" })`
-——只是**时机**改到 run 结束时。
+——只是**时机**改到 run 结束时。通知首行固定为
+`▣ legion · automatic completion notice — not a user message`（D5，通知以 `role:user`
+进入上下文，模型需要能把它和用户输入区分开），footer 只陈述事实
+`Still running: a, b`，且只列**确定会另发通知**的节点（D4：同 runId、未终态、
+`watching:true`、未被 claim/工具消费、未被判死）。
 
 所有状态都 display:true（transcript 留下完成/失败记录）；
 成功由 notice-renderer 压成单行并按 pane 宽度硬截断

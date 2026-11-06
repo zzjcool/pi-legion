@@ -17,6 +17,7 @@ import {
 	type RenewalProposal,
 	sanitizeNoticeField,
 	SUBAGENT_NOTIFY_TYPE,
+	NOTICE_SOURCE_MARKER,
 } from "../../src/extension/notify.ts";
 
 test("completionStatusOf: success is completed, abort is stopped, else failed", () => {
@@ -444,10 +445,11 @@ test("formatGroupedNotice: no runId omits the run header; stillRunning line appe
 	});
 	assert.doesNotMatch(notice.content, /^Run:/m);
 	assert.match(notice.content, /Background tasks completed \(1 of 2\):/);
-	assert.match(
-		notice.content,
-		/Still running: slow-2 \(notifies separately when it finishes\)/,
-	);
+	// D4: the footer states the fact only. The old "(notifies separately when it
+	// finishes)" promised a second message for children whose watch could already
+	// be gone, so it is deleted rather than reworded.
+	assert.match(notice.content, /^Still running: slow-2$/m);
+	assert.doesNotMatch(notice.content, /notifies separately/);
 });
 
 test("formatGroupedNotice: a single entry still uses the grouped shape", () => {
@@ -642,9 +644,10 @@ test("D3: an aborted (terminated) child still gets the proposal", () => {
 	assert.match(notice.content, /^renew: /m);
 });
 
-test("regression: a notice without a renewal proposal is byte-identical to the pre-W3 output", () => {
+test("regression: a notice without a renewal proposal keeps its body byte-identical (D5 adds one line)", () => {
 	// Captured from notify.ts before the renewal block existed; the contract's
-	// §6 "only add, never change" rule lives or dies on this assertion.
+	// §6 "only add, never change" rule lives or dies on this assertion. D5 adds
+	// exactly one line in front — everything after it is untouched.
 	const failure = formatCompletionNotice({
 		name: "worker-0",
 		agent: "worker",
@@ -654,7 +657,8 @@ test("regression: a notice without a renewal proposal is byte-identical to the p
 	});
 	assert.equal(
 		failure.content,
-		"Background task failed: **worker-0 (worker)**\n\nexecution: failed (terminated during tool call)\n\nboom\n\nSession file: /runs/r-1/worker-0.jsonl\nChild retired. Resume from the session file if you need this child again.",
+		`${NOTICE_SOURCE_MARKER}\n` +
+			"Background task failed: **worker-0 (worker)**\n\nexecution: failed (terminated during tool call)\n\nboom\n\nSession file: /runs/r-1/worker-0.jsonl\nChild retired. Resume from the session file if you need this child again.",
 	);
 
 	const success = formatCompletionNotice({
@@ -666,7 +670,8 @@ test("regression: a notice without a renewal proposal is byte-identical to the p
 	});
 	assert.equal(
 		success.content,
-		"Background task completed: **reviewer-1**\n\nexecution: success\nacceptance: accepted (attested)\n\nall good\nFull output: /runs/r-1/reviewer-1.output.md\nChild retired. Resume from the session file if you need this child again.",
+		`${NOTICE_SOURCE_MARKER}\n` +
+			"Background task completed: **reviewer-1**\n\nexecution: success\nacceptance: accepted (attested)\n\nall good\nFull output: /runs/r-1/reviewer-1.output.md\nChild retired. Resume from the session file if you need this child again.",
 	);
 
 	const stopped = formatCompletionNotice({
@@ -678,7 +683,7 @@ test("regression: a notice without a renewal proposal is byte-identical to the p
 	});
 	assert.equal(
 		stopped.content,
-		"Background task stopped: **w1 (worker)**\n\nexecution: aborted (killed)\n\n(no output)",
+		`${NOTICE_SOURCE_MARKER}\n` + "Background task stopped: **w1 (worker)**\n\nexecution: aborted (killed)\n\n(no output)",
 	);
 });
 
@@ -733,4 +738,79 @@ test("formatCompletionNotice: a synthetic reason keeps the provider error visibl
 	});
 	assert.doesNotMatch(same.content, /\nerror: /);
 	assert.equal(same.details.execution.errorMessage, "502: bad gateway");
+});
+
+// ─────────── delivery v2 §6.8/§6.9: the source marker, and details untouched ───────────
+
+test("v2 §6.8: both notice paths start with the fixed source marker; the footer makes no promise", () => {
+	// D5: the notice lands as a `role:user` message and starts a turn, so the model
+	// needs a first-line marker to tell it from what the user typed (N3). Both
+	// shapes carry the SAME line — a grouped notice is just as machine-generated.
+	const single = formatCompletionNotice({
+		name: "worker-0",
+		agent: "worker",
+		execution: { status: "success" },
+		output: "done",
+	});
+	assert.equal(single.content.split("\n")[0], NOTICE_SOURCE_MARKER);
+	assert.equal(NOTICE_SOURCE_MARKER, "▣ legion · automatic completion notice — not a user message");
+	assert.match(single.content, /\nBackground task completed: \*\*worker-0 \(worker\)\*\*$/m);
+
+	const grouped = formatGroupedNotice({
+		runId: "r-1",
+		entries: [groupedEntry({ name: "a" }), groupedEntry({ name: "b" })],
+		stillRunning: ["slow-2"],
+	});
+	assert.equal(grouped.content.split("\n")[0], NOTICE_SOURCE_MARKER);
+	// Exactly one marker line: the body is not decorated twice.
+	assert.equal(grouped.content.split(NOTICE_SOURCE_MARKER).length, 2);
+	// D4: the fact only — never the promise that a second notice will follow.
+	assert.match(grouped.content, /^Still running: slow-2$/m);
+	assert.doesNotMatch(grouped.content, /notifies separately/);
+	assert.doesNotMatch(single.content, /notifies separately/);
+});
+
+test("v2 §6.9: the marker changes `content` only; `details` keeps its exact shape", () => {
+	// The TUI collapses a completed notice to one row built from `details`, so the
+	// marker must not leak into them — and `outputBytes` still measures the body,
+	// not the marker line (a marker-sized drift would change every collapsed row).
+	const single = formatCompletionNotice({
+		name: "worker-0",
+		agent: "worker",
+		execution: { status: "success" },
+		output: "done the thing",
+		sessionFile: "/tmp/worker-0.jsonl",
+		acceptance: { status: "attested", level: "attested" },
+	});
+	assert.deepEqual(single.details, {
+		status: "completed",
+		name: "worker-0",
+		agent: "worker",
+		execution: { status: "success", reason: undefined },
+		acceptance: { status: "attested", level: "attested" },
+		sessionFile: "/tmp/worker-0.jsonl",
+		outputBytes: Buffer.byteLength("done the thing"),
+		recycled: undefined,
+	});
+	assert.equal(single.display, true);
+	assert.equal(
+		JSON.stringify(single.details).includes(NOTICE_SOURCE_MARKER),
+		false,
+		"the marker belongs to content, not to the renderer's data",
+	);
+
+	const grouped = formatGroupedNotice({
+		runId: "r-1",
+		entries: [groupedEntry({ name: "a" }), groupedEntry({ name: "b" })],
+	});
+	assert.equal(grouped.details.status, "completed");
+	assert.equal(grouped.details.name, "a, b");
+	assert.deepEqual(grouped.details.execution, { status: "batch 2" });
+	assert.equal(grouped.details.sessionFile, "r-1");
+	assert.equal(
+		grouped.details.outputBytes,
+		Buffer.byteLength(grouped.content.slice(NOTICE_SOURCE_MARKER.length + 1)),
+		"outputBytes counts the body after the marker, as before",
+	);
+	assert.equal(grouped.display, true);
 });

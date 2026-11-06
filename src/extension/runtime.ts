@@ -243,7 +243,7 @@ export interface SessionRuntimeDeps {
 	) => () => void;
 	/** Batching config; applied via setJoinConfig right after construction. */
 	joinConfig?: JoinConfig;
-	/** Injectable timer for the MAX_PENDING_AGE_MS overflow (tests fire it manually); default = unref'd setTimeout. */
+	/** Injectable timer for the MAX_PENDING_AGE_MS horizon (tests fire it manually); default = unref'd setTimeout. */
 	scheduleNoticeOverflow?: (ms: number, fn: () => void) => JoinSchedulerHandle;
 }
 
@@ -259,17 +259,22 @@ const DEFAULT_REFRESH_MS = 500;
  */
 const DEFAULT_ORPHAN_STALE_MS = 90_000;
 /**
- * Hard cap on how long a completion notice may stay hidden behind a live
- * parent agent run (D-B). 80s = 2× the (1+3)×10s that the old join window
- * could reach while a busy parent kept extending it. Past this the notice is
- * force-sent even though the run is still going: reverting to the old
- * "queued as a followUp" behaviour after 80s is better than hiding it forever.
+ * Health horizon of a completion notice held behind a live parent agent run (D6).
+ *
+ * Since delivery v2 a notice may only enter the transcript at a RUN BOUNDARY
+ * (`parentRunActive === false`). The host cannot retract a message, so anything
+ * sent earlier becomes visible at a moment this code no longer controls —
+ * exactly the T0 ≠ T2 gap that produced the duplicate. So this horizon no longer
+ * sends anything: crossing it proves a notice has been held far longer than a
+ * healthy settle boundary should take (a stuck `parentRunActive`, or a host that
+ * never emits `agent_settled`), which is what `noticeQueueStats().heldOverCap`
+ * reports to doctor. 80s = 2× the (1+3)×10s the old join window could reach.
  */
 export const MAX_PENDING_AGE_MS = 80_000;
 /** Fallback per-child timeout for wait(); index.ts passes the role value. */
 const DEFAULT_WAIT_TIMEOUT_MS = DEFAULTS.turnTimeoutMs;
 
-/** Default timer for the MAX_PENDING_AGE_MS overflow (unref'd, like join's). */
+/** Default timer for the MAX_PENDING_AGE_MS horizon (unref'd, like join's). */
 function defaultNoticeOverflow(
 	ms: number,
 	fn: () => void,
@@ -307,6 +312,16 @@ interface QueuedNotice {
 	 */
 	partial: boolean;
 	enqueuedAt: number;
+	/**
+	 * D6: when this notice's hold was counted against `MAX_PENDING_AGE_MS`.
+	 *
+	 * One stamp per NOTICE, not per window: `heldOverCap` says "this held notice has
+	 * been waiting longer than a healthy boundary" — a single fact about a single
+	 * notice — so its second and third 80s must not add anything. The stamp is also
+	 * where the next window is anchored: an age-derived delay for an already-counted
+	 * notice would be 0 forever, which is a busy loop rather than a measurement.
+	 */
+	overCapAt?: number;
 }
 
 export interface NoticeQueueStats {
@@ -318,8 +333,17 @@ export interface NoticeQueueStats {
 	pending: number;
 	/** now() - enqueuedAt of the oldest such batch; 0 when none. */
 	oldestAgeMs: number;
-	/** Lifetime count of MAX_PENDING_AGE_MS overflows that forced a send (D-B observability). */
-	forcedFlushes: number;
+	/**
+	 * Lifetime count of held notices whose age crossed `MAX_PENDING_AGE_MS` (D6).
+	 *
+	 * Counted PER NOTICE, once, and only for a notice that can still be delivered —
+	 * the same population `pending` describes. It counts the HOLD, never a send: the
+	 * horizon cannot put a message into the transcript any more, so a non-zero value
+	 * means notices are waiting far longer than a run boundary should take. That is
+	 * a diagnostic number (exported for doctor/tests; no production consumer today),
+	 * not a failure of delivery.
+	 */
+	heldOverCap: number;
 	/**
 	 * #349: what the completion cache (`finished`) is holding right now.
 	 *
@@ -655,9 +679,9 @@ export interface SessionRuntime {
 	setJoinConfig(config: JoinConfig): void;
 	/** Parent agent run started (pi `agent_start`): hold completion notices until settle (D-A/D-C). */
 	notifyParentRunStart(): void;
-	/** Parent agent run settled (pi `agent_settled`): send every held notice now, then repaint (D-A/D-D). */
+	/** Parent agent run settled (pi `agent_settled`): deliver the oldest held notice (and any `triggerTurn:false` one behind it), then repaint (D-A/D-D/D2). */
 	notifyParentSettled(): void;
-	/** Introspection seam for tests/doctor: deferred-notice queue state (D-B observability). */
+	/** Introspection seam for tests/doctor: deferred-notice queue state (D-B/D6 health). */
 	noticeQueueStats(): NoticeQueueStats;
 	/**
 	 * Explicit wait: suppress auto-notify on the targets via consumedByTool
@@ -1129,32 +1153,67 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		flushMs: DEFAULT_FLUSH_MS,
 	};
 
-	// Run-scoped completion outbox (D-A). The host only drains
-	// `agent.followUpQueue` inside a live run, so a `followUp` sent while the
-	// parent run is active sits invisible until the user types again. When a
-	// run is active we therefore hold the formatted notice here and burst it
-	// out on `agent_settled` (D-D). This is the ONLY deferral point: the join
+	// Run-scoped completion outbox (D-A). While a parent RUN is live a completion
+	// is held here and delivered at the run boundary (`agent_settled`) — one
+	// waking message per boundary (D2). This is the ONLY deferral point: the join
 	// window above batches stragglers and never waits on a busy parent (D-I).
+	//
+	// D1: there is no second delivery moment. The host cannot retract a message,
+	// so a notice sent during a live run is visible at a time that is NOT the
+	// moment the claim filter judged it — which is where the duplicate came from.
 	//
 	// D-H: the default is `false`, so a host (or a test) that never signals a
 	// run start keeps today's immediate-send behaviour byte for byte.
 	let parentRunActive = false;
 	const outbox: QueuedNotice[] = [];
 	let outboxTimer: JoinSchedulerHandle | undefined;
-	let forcedFlushes = 0;
+	let heldOverCap = 0;
 
-	const armOutboxTimer = (): void => {
-		if (outboxTimer || outbox.length === 0 || disposed) return;
-		// Armed off the HEAD entry, as before. A head that is already claimed can
-		// only make the queue flush EARLIER than the live members' own caps (never
-		// later), and the flush re-filters — so this stays a scheduling detail, not a
-		// second source of truth about what is pending.
-		const oldest = outbox[0]!;
-		const delay = Math.max(0, oldest.enqueuedAt + MAX_PENDING_AGE_MS - now());
+	/**
+	 * D6: the oldest held batch that can still produce a message.
+	 *
+	 * Identical predicate to `noticeQueueStats().pending`, and deliberately shared
+	 * with it in spirit: a batch whose every member is already claimed is dead
+	 * weight (the flush drops it, no message can come of it), so pricing a timer or
+	 * a count off `outbox[0]` would describe a notice nobody is waiting for. The
+	 * arm, `oldestAgeMs` and `heldOverCap` must all name the SAME entry.
+	 */
+	const oldestDeliverable = (): QueuedNotice | undefined =>
+		outbox.find((item) =>
+			item.entries.some((entry) => !isReported(entry.runId, entry.name, entry.round)),
+		);
+
+	/**
+	 * Arm the horizon timer off the oldest STILL-DELIVERABLE entry.
+	 *
+	 * D6: this timer only COUNTS. Reaching the horizon increments `heldOverCap`
+	 * once per notice and re-arms for another full window; it never sends, because
+	 * the only delivery moment is a run boundary (D1) and a timer firing while the
+	 * run is still live is by definition not one.
+	 *
+	 * `fullWindow` re-arms from NOW rather than from the head's `enqueuedAt`: once
+	 * the head is past the horizon (or has already been counted) an age-derived
+	 * delay is 0, which would turn the counter into a tight loop instead of one
+	 * tick per window.
+	 */
+	const armOutboxTimer = (fullWindow = false): void => {
+		if (outboxTimer || disposed) return;
+		// Nothing deliverable ⇒ no timer at all. Arming anyway is what let the count
+		// keep growing while `pending === 0`.
+		const oldest = oldestDeliverable();
+		if (!oldest) return;
+		// A head that is already claimed can never be the head here, and one that has
+		// already been counted is priced off the count (a full window), not off its
+		// age.
+		const delay =
+			fullWindow || oldest.overCapAt !== undefined
+				? MAX_PENDING_AGE_MS
+				: Math.max(0, oldest.enqueuedAt + MAX_PENDING_AGE_MS - now());
 		// `live` proves this callback is the CURRENT arm. A cancelled-but-still-
 		// invoked timer (a zombie queued before the cancel landed) must be a strict
-		// no-op: otherwise it would clear the live timer's handle and force-send a
-		// notice that is nowhere near its cap.
+		// no-op: otherwise it would clear the live timer's handle and count a hold
+		// that belongs to a notice nowhere near its horizon (and, before v2, send
+		// one).
 		//
 		// A boolean — not a closure over the handle — because an injected scheduler
 		// is free to invoke the callback synchronously, before the `const` binding
@@ -1165,19 +1224,25 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			if (!live) return;
 			live = false;
 			outboxTimer = undefined;
-			if (outbox.length === 0) return;
-			const next = outbox[0]!;
+			// Same head the arm was priced off: a dead-weight queue head (every member
+			// already claimed) is neither counted nor re-armed.
+			const next = oldestDeliverable();
+			if (!next) return;
 			if (now() < next.enqueuedAt + MAX_PENDING_AGE_MS) {
-				// Fired while the oldest notice is still younger than the cap (a
-				// coarse timer or a backwards clock step). Never force-send early:
-				// re-arm for the remaining age instead.
+				// Fired while the oldest notice is still younger than the horizon (a
+				// coarse timer or a backwards clock step): re-arm for the remaining age.
 				armOutboxTimer();
 				return;
 			}
-			// `forcedFlushes` counts forced SENDS, not forced flush attempts: a batch
-			// whose members were all claimed by wait/collect delivers nothing, and
-			// reporting it as a forced send would describe a message that never existed.
-			if (flushOutbox() > 0) forcedFlushes += 1;
+			if (next.overCapAt === undefined) {
+				// D6: the horizon is a HEALTH SIGNAL, not a trigger. Nothing is sent — a
+				// notice that outlives its parent run stays in the outbox until the next
+				// run boundary or `dispose()` — and the count is what a diagnostic reads.
+				// One count per NOTICE: the next 80s of the same hold add nothing.
+				next.overCapAt = now();
+				heldOverCap += 1;
+			}
+			armOutboxTimer(true);
 		});
 		outboxTimer = {
 			cancel: () => {
@@ -1193,9 +1258,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * The outbox is the one buffer with no per-name undo, so an unclaim that only
 	 * deletes the key leaves the old entry alive and the next flush ships it again
 	 * (the "revived notice", measured). Removing members can invalidate the armed
-	 * overflow timer — it was priced off the entry that used to be at the head — so
+	 * horizon timer — it was priced off the entry that used to be at the head — so
 	 * the timer is retired and re-armed off the NEW head (the oldest survivor, i.e.
-	 * the earliest remaining cap). Nothing left to send ⇒ no timer at all.
+	 * the earliest remaining horizon). Nothing left to send ⇒ no timer at all.
 	 */
 	const dropQueued = (runId: string, name: string): void => {
 		if (outbox.length === 0) return;
@@ -1235,7 +1300,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		entries: readonly DeliverableEntry[],
 		triggerTurn: boolean,
 		partial: boolean,
-		force = false,
 	): number => {
 		// D10 #4: each entry is judged, and later claimed, on ITS OWN round — so two
 		// unread rounds of one child both survive, while a repeated delivery inside one
@@ -1260,10 +1324,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						// `awaiting` is a TERMINAL marker: the watch has already buffered
 						// this child's completion and is merely parked in `retire`. Listing
 						// it as "still running" contradicts the completed entry that the
-						// very same burst delivered (and D4 makes the footer recompute up to
-						// 80s later, so that window is wide). Not done = not retire yet.
+						// very same burst delivered (and D4 recomputes the footer at the run
+						// boundary, so that window can be arbitrarily wide). Not done = not
+						// retire yet.
 						job.state !== "awaiting" &&
 						job.state !== "retired" &&
+						// D4: only an ARMED watch can deliver a second notice. A utility job
+						// (`watching: false`) has no such path, so listing it promises a
+						// message that can never come — a false fact, not a hedge.
+						job.watching === true &&
+						// D4: a job its own liveness hook has declared dead is not "still
+						// running". No hook (`undefined`) is not permission to call it dead.
+						!(job.isAlive && !job.isAlive()) &&
 						!isReported(job.runId, job.name, job.round) &&
 						!job.consumedByTool &&
 						!delivering.has(job.name),
@@ -1275,7 +1347,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				...(stillRunning.length > 0 ? { stillRunning } : {}),
 			});
 		}
-		if (!force && parentRunActive) {
+		// D1: a run boundary is the ONLY delivery moment. While the parent run is
+		// live the batch is held STRUCTURALLY (D4) — not sent, not even as a
+		// followUp: the host cannot retract a message, so anything sent now would
+		// become visible at a moment the claim filter no longer controls (T0 ≠ T2).
+		if (parentRunActive) {
 			outbox.push({ entries: surviving, triggerTurn, partial, enqueuedAt: now() });
 			armOutboxTimer();
 			return 0;
@@ -1290,28 +1366,95 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			for (const entry of surviving) claimReported(entry.runId, entry.name, entry.round);
 			return 1;
 		}
+		// Host rejected the send: no claim is taken (D5 step 4), so the notice is still
+		// deliverable. `flushOutbox` reacts by putting the item back at the head; the
+		// direct (idle-run) path has no queue to put it back into — there the child's
+		// session file is the documented recovery path.
 		return 0;
 	};
 
-	// FIFO, one message per notice: the grouped shape belongs to the join layer.
-	// N held notices = N host `_runAgentPrompt` calls; the common case is 1 per
-	// run, so the batch is not merged into a synthetic grouped notice.
+	// FIFO, one WAKING message per boundary (D2): the grouped shape belongs to the
+	// join layer. N held notices are NOT merged into a synthetic grouped notice —
+	// each one is its own completion, and the parent gets the oldest now, the next
+	// at the next boundary.
+	/**
+	 * A2: re-entrancy guard.
+	 *
+	 * `sendMessage` is a host ACTION, so a host may call straight back into the
+	 * runtime from inside it (`agent_start`, a `sendMessage` handler that settles a
+	 * nested turn, …). A nested flush would hand out a SECOND waking notice at the
+	 * same boundary — the thing D2 forbids and the one thing this loop cannot see
+	 * from `parentRunActive` (a send emitted while the host is settling is
+	 * deferred). So the inner call is a strict no-op: it delivers nothing and
+	 * leaves the queue, the timer and the counter exactly as the outer call has
+	 * them.
+	 */
+	let flushing = false;
 	/** Returns how many messages were actually delivered (0 when all was claimed). */
 	const flushOutbox = (): number => {
-		outboxTimer?.cancel();
-		outboxTimer = undefined;
-		if (outbox.length === 0) return 0;
-		// One splice: anything enqueued by a re-entrant send belongs to the next
-		// batch, so a settle can never double-deliver what it already flushed.
-		const batch = outbox.splice(0);
-		let sent = 0;
-		for (const item of batch) {
-			// Re-filter + re-format (D4/D5): a claim taken while this notice was
-			// held drops its member, and the header is recomputed from survivors.
-			// `force`: the outbox wait is already over — never re-enqueue.
-			sent += deliverBatch(item.entries, item.triggerTurn, item.partial, true);
+		if (flushing) return 0;
+		flushing = true;
+		try {
+			outboxTimer?.cancel();
+			outboxTimer = undefined;
+			let sent = 0;
+			// One item at a time, not `splice(0)`: a stop must leave the REST of the queue
+			// exactly where it was, oldest first (FIFO).
+			// `!parentRunActive` is the D1 gate read again per item, so a re-entrant
+			// `agent_start` (a send that synchronously starts a new run) stops the loop
+			// instead of pushing the next notice into a live turn.
+			while (outbox.length > 0 && !parentRunActive) {
+				const item = outbox.shift()!;
+				// Snapshot AFTER the shift, so a re-queue performed by `deliverBatch`
+				// itself is visible as "the queue grew".
+				const queuedAfterShift = outbox.length;
+				let delivered: number;
+				try {
+					delivered = deliverBatch(item.entries, item.triggerTurn, item.partial);
+				} catch {
+					// A2: `shift` + a throw must never lose the notice. Put it back at the
+					// HEAD (it is still the oldest) and stop this round; the timer is re-armed
+					// below so the hold keeps being observed.
+					outbox.unshift(item);
+					break;
+				}
+				if (delivered === 0) {
+					if (outbox.length > queuedAfterShift) {
+						// `deliverBatch` already re-queued the structure on its own
+						// `parentRunActive` branch — one copy is correct, a second would duplicate it.
+						break;
+					}
+					const stillDeliverable = item.entries.some(
+						(entry) => !isReported(entry.runId, entry.name, entry.round),
+					);
+					if (stillDeliverable) {
+						// Nothing was sent although a member is still unclaimed ⇒ the host REJECTED
+						// the send (`deliverCompletion` reports the throw as `false`). The claim is
+						// untouched, so the notice is still deliverable: put it back at the head
+						// and stop, instead of dropping it silently.
+						outbox.unshift(item);
+						break;
+					}
+					// Every member was claimed while it waited: dropping it IS the claim, so it
+					// does not count toward the stop condition — the loop moves on.
+					continue;
+				}
+				sent += delivered;
+				// D2: one WAKING message per boundary. The stop condition is "a
+				// `triggerTurn:true` notice was delivered", never a read of
+				// `parentRunActive`: while the host emits `agent_settled`,
+				// `pi.sendMessage` is DEFERRED (`_isEmittingAgentSettled`), so the flag
+				// cannot tell us that THIS message already started a new run. The rest
+				// waits for the next boundary — pushing it into the host queue now
+				// would make it visible in a turn that has not started yet, recreating
+				// exactly the gap delivery v2 closes.
+				if (item.triggerTurn) break;
+			}
+			if (outbox.length > 0) armOutboxTimer();
+			return sent;
+		} finally {
+			flushing = false;
 		}
-		return sent;
 	};
 
 	const join = new JoinCoordinator({
@@ -2541,11 +2684,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			// Only batches that still have an unclaimed member count: everything else
 			// is already delivered through the other route and will be filtered out at
 			// flush. The FLUSH end is deliberately unchanged — it re-filters, which is
-			// what makes the claim authoritative.
+			// what makes the claim authoritative. The horizon timer and `heldOverCap`
+			// use the same predicate (`oldestDeliverable`), so `pending`, `oldestAgeMs`
+			// and the count all describe the same notice.
 			const deliverable = outbox.filter((item) =>
 				item.entries.some((entry) => !isReported(entry.runId, entry.name, entry.round)),
 			);
-			const oldest = deliverable[0];
+			const oldest = oldestDeliverable();
 			// #349: the completion cache's footprint, so a long session can see it grow
 			// (and see what it CANNOT reclaim — a pinned entry has no `outputFile`).
 			let residentBytes = 0;
@@ -2559,7 +2704,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			return {
 				pending: deliverable.length,
 				oldestAgeMs: oldest ? Math.max(0, now() - oldest.enqueuedAt) : 0,
-				forcedFlushes,
+				heldOverCap,
 				finished: {
 					entries: finished.size,
 					residentBytes,

@@ -1993,7 +1993,7 @@ test("T1: runtime — a completion during the parent run is held until agent_set
 	// The whole point: nothing reaches the host while the run is live, because
 	// the host only drains followUp inside a live run.
 	assert.equal(messages.length, 0, "a live parent run holds the notice");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0);
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0);
 
 	runtime.notifyParentSettled();
 	assert.equal(messages.length, 1, "settle flushes the held notice");
@@ -2010,7 +2010,7 @@ test("T1: runtime — a completion during the parent run is held until agent_set
 	runtime.dispose();
 });
 
-test("T2: runtime — two runIds finishing in one parent run flush as a FIFO burst at settle", async () => {
+test("T2: runtime — two runIds finishing in one parent run deliver one notice per run boundary (FIFO)", async () => {
 	const messages: Array<{ content: string }> = [];
 	const resolvers = new Map<string, (value: CollectSnapshot) => void>();
 	const runtime = createSessionRuntime({
@@ -2035,15 +2035,22 @@ test("T2: runtime — two runIds finishing in one parent run flush as a FIFO bur
 		runtime.watch(name);
 	}
 	resolvers.get("first")!(joinSnapshot({ output: "first-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "first notice held");
 	resolvers.get("second")!(joinSnapshot({ output: "second-out" }));
 
 	await waitFor(() => runtime.noticeQueueStats().pending === 2, "both notices held");
 	assert.equal(messages.length, 0, "no notice escapes a live run");
 
+	// D2: ONE waking message per boundary, oldest first. The second notice is not
+	// pushed into the host queue — it stays held for the next boundary.
 	runtime.notifyParentSettled();
-	assert.equal(messages.length, 2, "both survive the burst");
+	assert.equal(messages.length, 1, "one notice per run boundary");
 	assert.match(messages[0]!.content, /first/);
 	assert.match(messages[0]!.content, /first-out/);
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the second notice is still held");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 2, "the next boundary delivers the rest");
 	assert.match(messages[1]!.content, /second/);
 	assert.match(messages[1]!.content, /second-out/);
 	assert.equal(runtime.noticeQueueStats().pending, 0);
@@ -2052,7 +2059,7 @@ test("T2: runtime — two runIds finishing in one parent run flush as a FIFO bur
 	runtime.dispose();
 });
 
-test("T3: runtime — a notice held past MAX_PENDING_AGE_MS is force-sent while the run is still active", async () => {
+test("T3 / v2 §6.1: runtime — a notice held past MAX_PENDING_AGE_MS is COUNTED, never sent; the boundary delivers it (D1/D6)", async () => {
 	const messages: unknown[] = [];
 	const overflow = manualOverflow();
 	// B4: an ADVANCEABLE fake clock, not a frozen `() => 1_000`. A frozen clock
@@ -2079,20 +2086,29 @@ test("T3: runtime — a notice held past MAX_PENDING_AGE_MS is force-sent while 
 	runtime.watch("stuck");
 
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
-	assert.equal(overflow.timers.length, 1, "exactly one overflow timer armed");
-	assert.equal(overflow.timers[0]!.ms, MAX_PENDING_AGE_MS, "delay is the hard cap from enqueue");
+	assert.equal(overflow.timers.length, 1, "exactly one horizon timer armed");
+	assert.equal(overflow.timers[0]!.ms, MAX_PENDING_AGE_MS, "delay is the horizon from enqueue");
 	assert.equal(messages.length, 0);
 
-	// The arm fires when the notice actually reaches the cap.
+	// The arm fires when the notice reaches the horizon (D6): the hold is counted,
+	// nothing is sent, and the notice is STILL held for the next run boundary.
 	t += MAX_PENDING_AGE_MS;
 	overflow.timers[0]!.fn();
-	assert.equal(messages.length, 1, "the cap force-sends even during a live run");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1, "the overflow is counted");
+	assert.equal(messages.length, 0, "the horizon never sends");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 1, "the hold is counted");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the notice is still held");
+	assert.equal(overflow.timers.length, 2, "a full window is re-armed");
+	assert.equal(overflow.timers[1]!.ms, MAX_PENDING_AGE_MS, "re-armed with the full horizon");
+
+	// The run boundary is the only delivery moment (D1) — and it does deliver.
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the run boundary delivers the held notice");
+	assert.match((messages[0] as { content: string }).content, /stuck-out/);
 	assert.equal(runtime.noticeQueueStats().pending, 0);
 	runtime.dispose();
 });
 
-test("T3b: runtime — an early-firing arm re-arms for the remaining age instead of force-sending", async () => {
+test("T3b: runtime — an early-firing arm re-arms for the remaining age; the horizon only counts", async () => {
 	const messages: unknown[] = [];
 	const overflow = manualOverflow();
 	let t = 1_000;
@@ -2119,26 +2135,33 @@ test("T3b: runtime — an early-firing arm re-arms for the remaining age instead
 
 	// 30s elapsed, then the arm fires even though it was scheduled for 80s. The
 	// fancier case a real timer exhibits after a coarse wake-up / clock step: it
-	// must NOT force-send early, and it must re-arm for the age REMAINING.
+	// must NOT count a hold yet, and it must re-arm for the age REMAINING.
 	t += 30_000;
 	overflow.timers[0]!.fn();
-	assert.equal(messages.length, 0, "an early fire must not force-send");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "nothing was force-flushed");
+	assert.equal(messages.length, 0, "an early fire must not send");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0, "nothing crossed the horizon yet");
 	assert.equal(overflow.timers.length, 2, "the arm re-armed");
 	assert.equal(
 		overflow.timers[1]!.ms,
 		MAX_PENDING_AGE_MS - 30_000,
-		"the re-arm carries the REMAINING age, not the full cap",
+		"the re-arm carries the REMAINING age, not the full horizon",
 	);
 
 	const oldestAge = runtime.noticeQueueStats().oldestAgeMs;
 	assert.equal(oldestAge, 30_000, "the held notice is 30s old");
 
-	// At the cap the live arm force-sends exactly once.
+	// At the horizon the live arm counts the hold, sends nothing, and re-arms a
+	// FULL window (D6: an age-derived delay here would be 0 and spin).
 	t += MAX_PENDING_AGE_MS - 30_000;
 	overflow.timers[1]!.fn();
-	assert.equal(messages.length, 1, "at the cap the notice is force-sent");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1);
+	assert.equal(messages.length, 0, "the horizon is not a send trigger");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 1);
+	assert.equal(runtime.noticeQueueStats().pending, 1, "still held for the next boundary");
+	assert.equal(overflow.timers.length, 3, "the horizon re-arms");
+	assert.equal(overflow.timers[2]!.ms, MAX_PENDING_AGE_MS, "re-armed a full window, not 0");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the run boundary delivers it");
 	assert.equal(runtime.noticeQueueStats().pending, 0);
 	runtime.dispose();
 });
@@ -2202,13 +2225,21 @@ test("T3d: runtime — the arm and oldestAgeMs are driven by the OLDEST notice i
 		"oldestAgeMs reports the FIRST notice (30s), not the second (0s)",
 	);
 
-	// At the first notice's cap the whole queue is force-flushed in FIFO order.
+	// At the first notice's horizon the hold is counted once (D6), nothing is sent,
+	// and both notices remain held for the run boundaries.
 	t += MAX_PENDING_AGE_MS - 30_000;
 	overflow.timers[0]!.fn();
-	assert.equal(messages.length, 2, "the cap flushes both notices");
+	assert.equal(messages.length, 0, "the horizon sends nothing");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 1, "one horizon tick for the queue head");
+	assert.equal(runtime.noticeQueueStats().pending, 2);
+
+	// FIFO, one waking notice per boundary.
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the oldest notice goes first");
 	assert.match((messages[0] as { content: string }).content, /older/);
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 2, "the next boundary delivers the newer one");
 	assert.match((messages[1] as { content: string }).content, /newer/);
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1, "one flush for the queue");
 	assert.equal(runtime.noticeQueueStats().pending, 0);
 	runtime.dispose();
 });
@@ -2250,11 +2281,11 @@ test("T3c: runtime — a stale arm that fires after its cancel is a no-op (B2 zo
 	assert.equal(messages.length, 1);
 	assert.equal(runtime.noticeQueueStats().pending, 0);
 
-	// The cancelled callback fires anyway (a real timer can be queued before the
-	// cancel lands). It must not re-send, and it must not increment the counter.
+	// A cancelled callback firing anyway (a real timer can be queued before the
+	// cancel lands) must not re-send, and it must not tick the counter.
 	overflow.timers[0]!.fn();
 	assert.equal(messages.length, 1, "a zombie arm never double-delivers");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "a zombie arm is not counted");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0, "a zombie arm is not counted");
 
 	// A second notice must arm a FRESH timer; if the zombie had clobbered the
 	// handle, this arm would be skipped and the notice would hang forever.
@@ -2272,19 +2303,19 @@ test("T3c: runtime — a stale arm that fires after its cancel is a no-op (B2 zo
 	assert.equal(overflow.timers.length, 2, "a fresh arm is scheduled after the zombie fired");
 
 	// The discriminating part: fire the ZOMBIE arm again now that the outbox is
-	// NON-empty AND the fresh notice is past its cap. An unguarded callback would
-	// force-send a notice that belongs to a later wave and count a bogus flush —
-	// neither the empty-outbox guard (the outbox is non-empty) nor the age branch
-	// (the age is now past the cap) can absorb it. The live-handle check must.
+	// NON-empty AND the fresh notice is past its horizon. An unguarded callback
+	// would count a hold that belongs to a later wave — neither the empty-outbox
+	// guard (the outbox is non-empty) nor the age branch (the age is now past the
+	// horizon) can absorb it. The live-handle check must.
 	t += MAX_PENDING_AGE_MS;
 	overflow.timers[0]!.fn();
-	assert.equal(messages.length, 1, "the zombie must not flush the fresh notice");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "a zombie is never counted");
+	assert.equal(messages.length, 1, "the zombie must not touch the fresh notice");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0, "a zombie is never counted");
 	assert.equal(runtime.noticeQueueStats().pending, 1, "the fresh notice is still held");
 	runtime.dispose();
 });
 
-test("T4: runtime — agent_settled cancels the overflow timer and does not double-send", async () => {
+test("T4: runtime — agent_settled cancels the horizon timer and does not double-send", async () => {
 	const messages: unknown[] = [];
 	const overflow = manualOverflow();
 	// B2: the send is counted by CALLS, and the settle→late-fire window is a real
@@ -2294,7 +2325,7 @@ test("T4: runtime — agent_settled cancels the overflow timer and does not doub
 	// delivery would be visible even if the outbox were re-populated.
 	let sends = 0;
 	let resolveCollect!: (value: CollectSnapshot) => void;
-	// An advanceable clock: the B2 tail below pushes it past the cap so the age
+	// An advanceable clock: the B2 tail below pushes it past the horizon so the age
 	// re-arm branch cannot mask a broken cancel.
 	let t = 1_000;
 	const runtime = createSessionRuntime({
@@ -2323,7 +2354,7 @@ test("T4: runtime — agent_settled cancels the overflow timer and does not doub
 	await waitFor(() => overflow.timers.length === 1, "overflow armed");
 
 	runtime.notifyParentSettled();
-	assert.equal(overflow.timers[0]!.canceled, true, "settle cancels the pending cap");
+	assert.equal(overflow.timers[0]!.canceled, true, "settle cancels the pending horizon arm");
 	assert.equal(sends, 1, "settle delivered it once");
 
 	// Let a real macrotask pass so any deferred duplicate would have landed,
@@ -2332,15 +2363,15 @@ test("T4: runtime — agent_settled cancels the overflow timer and does not doub
 	assert.equal(sends, 1, "no deferred duplicate after the settle macrotask");
 	overflow.timers[0]!.fn();
 	assert.equal(sends, 1, "no duplicate delivery after the settle");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "the cap never counted");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0, "the horizon never counted");
 
 	// B2 (reviewer-4): refill the outbox AFTER the settle, then fire the OLD
 	// zombie arm again. With a NO-OP `cancel()` the zombie clears the handle of
-	// the fresh arm and force-sends a notice that should still be waiting — the
-	// empty-outbox guard cannot save us here, because the outbox is non-empty.
-	// The clock is advanced past the cap first: with a frozen clock the age
-	// re-arm branch would absorb the zombie and this tail would stay green even
-	// with `cancel()` disabled (verified — that is exactly T3c's old hole, and
+	// the fresh arm and ticks the counter for a notice that should still be
+	// waiting — the empty-outbox guard cannot save us here, because the outbox is
+	// non-empty. The clock is advanced past the horizon first: with a frozen clock
+	// the age re-arm branch would absorb the zombie and this tail would stay green
+	// even with `cancel()` disabled (verified — that is exactly T3c's old hole, and
 	// adding it here without the clock would just repeat the bug).
 	let sendSecond!: (value: CollectSnapshot) => void;
 	runtime.notifyParentRunStart();
@@ -2361,20 +2392,20 @@ test("T4: runtime — agent_settled cancels the overflow timer and does not doub
 	assert.equal(overflow.timers.length, 2, "the fresh notice armed a new timer");
 
 	// Fire the stale arm from the settled wave, now that the fresh notice is PAST
-	// its cap. It must be inert: no send, no forced flush, and the fresh notice
-	// must still be pending.
+	// its horizon. It must be inert: no send, no tick, and the fresh notice must
+	// still be pending.
 	t += MAX_PENDING_AGE_MS;
 	overflow.timers[0]!.fn();
 	assert.equal(sends, 1, "the zombie arm must not deliver the fresh notice");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 0, "the zombie is never counted as a flush");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0, "the zombie is never counted");
 	assert.equal(runtime.noticeQueueStats().pending, 1, "the fresh notice is still held");
 	runtime.dispose();
 });
 
-test("T4b: runtime — cap fires FIRST, then agent_settled arrives: exactly one send, one forced flush (B3)", async () => {
-	// The D-B × D-D crossing that nothing covered: the hard cap wins the race
-	// against `agent_settled`. Both paths run; the notice must be delivered once
-	// (by the cap) and the later settle must find an empty outbox.
+test("T4b: runtime — the horizon fires FIRST, then agent_settled arrives: nothing is sent early, the boundary delivers once", async () => {
+	// The D6 × D-D crossing: the horizon reaches the hold BEFORE the run settles.
+	// It must count and stay inert, then the boundary — the only delivery moment —
+	// delivers exactly once.
 	const messages: unknown[] = [];
 	const overflow = manualOverflow();
 	let t = 1_000;
@@ -2399,18 +2430,19 @@ test("T4b: runtime — cap fires FIRST, then agent_settled arrives: exactly one 
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
 	assert.equal(messages.length, 0, "held while the run is live");
 
-	// 1) cap fires (at the cap) while the run is STILL active → force-send.
+	// 1) the horizon fires while the run is STILL active → count only.
 	t += MAX_PENDING_AGE_MS;
 	overflow.timers[0]!.fn();
-	assert.equal(messages.length, 1, "the cap delivers during the live run");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1, "counted as a forced flush");
-	assert.equal(runtime.noticeQueueStats().pending, 0);
+	assert.equal(messages.length, 0, "the horizon does not deliver during a live run");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 1, "the hold is counted");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "still held");
 
-	// 2) settle arrives afterwards → nothing left to flush, no second send.
+	// 2) settle arrives afterwards → the boundary delivers it, exactly once.
 	runtime.notifyParentSettled();
-	assert.equal(messages.length, 1, "the later settle must not re-deliver");
-	assert.equal(runtime.noticeQueueStats().forcedFlushes, 1, "still exactly one forced flush");
+	assert.equal(messages.length, 1, "the settle delivers the held notice once");
+	assert.match((messages[0] as { content: string }).content, /capped-out/);
 	assert.equal(runtime.noticeQueueStats().pending, 0);
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 1, "still exactly one horizon tick");
 	runtime.dispose();
 });
 
@@ -2561,6 +2593,457 @@ test("C4: runtime — dispose() drops the held outbox without sending", async ()
 	// The cancelled arm is a real timer in production; dispose must cancel it
 	// rather than leave it to fire after the session is gone.
 	assert.equal(overflow.timers[0]!.canceled, true, "dispose cancels the pending overflow arm");
+});
+
+// ═════════ delivery v2 §6: the frozen acceptance list, one test per clause ═════════
+//
+// D1/D2/D6 are the load-bearing behaviour: a notice may only enter the transcript
+// at a run boundary, one waking notice per boundary, and the MAX_PENDING_AGE_MS
+// horizon counts the hold instead of sending. §6.1 lives in T3 above; the rest are
+// here. Every test that asserts ZERO messages carries a positive control (an
+// unclaimed sibling on the same path), otherwise a dead delivery path would pass.
+
+test("v2 §6.2: the incident — a child the parent collected in this turn is never announced; its unread sibling rides the SAME boundary", async () => {
+	// The 2026-11-06 sequence: parent run active, the children complete, the parent
+	// `collect`s one inside the SAME turn, then the outbox flushes at settle. Before
+	// v2 the identical body arrived twice (session lines 16 and 22-23).
+	const messages: SentMessage[] = [];
+	let releaseWorker!: (s: CollectSnapshot) => void;
+	let releaseScout!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 30 });
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "demo-worker",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/demo-worker.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				releaseWorker = resolve;
+			}),
+	});
+	// Positive control: an unread sibling in the same batch.
+	runtime.track({
+		name: "scout-a",
+		runId: "r-1",
+		agent: "scout",
+		sessionFile: "/tmp/scout-a.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				releaseScout = resolve;
+			}),
+	});
+	runtime.watch("demo-worker");
+	runtime.watch("scout-a");
+
+	releaseWorker(joinSnapshot({ output: "demo-worker-out" }));
+	// B1: the sibling finishes BEFORE the boundary and inside the same window, so
+	// both children ride ONE held batch into the outbox. That is the incident's real
+	// shape (the outbox is the buffering layer) — finishing the sibling after the
+	// settle would sidestep `flushOutbox` altogether and prove nothing.
+	releaseScout(joinSnapshot({ output: "scout-a-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both children held as one batch");
+
+	// The parent reads one of them in the SAME turn (T0): the claim lands here.
+	const collected = await runtime.consumeCollect("demo-worker");
+	assert.equal(collected?.snapshot.output, "demo-worker-out");
+
+	// The boundary is where the incident's duplicate became visible: the read result
+	// must not appear, and the unread sibling of the SAME batch must arrive here.
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the unread sibling rides this very boundary");
+	assert.match(messages[0]!.content, /scout-a-out/);
+	assert.doesNotMatch(messages[0]!.content, /demo-worker-out/);
+	await drainContinuations();
+	assert.equal(messages.length, 1, "no duplicate of the read result, and no second boundary message");
+	runtime.dispose();
+});
+
+test("v2 §6.3: a `watching:false` utility sibling is never promised as `Still running`", async () => {
+	// N2: `scout-0` is a utility job (`watching:false`, index.ts:4603) — no watch is
+	// armed, so there is no path that could ever deliver a second notice for it.
+	// The old footer said "(notifies separately when it finishes)" anyway.
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 30 });
+	runtime.notifyParentRunStart();
+	// a: tracked but NEVER watched — its collect never settles, and it is not a
+	// candidate for a later notice because no watch exists.
+	runtime.track({
+		name: "scout-0",
+		runId: "r-1",
+		agent: "scout",
+		sessionFile: "/tmp/scout-0.jsonl",
+		timeoutMs: 1_000,
+		collect: () => new Promise<CollectSnapshot>(() => {}),
+	});
+	// b: watched, finished — the notice being delivered.
+	runtime.track({
+		name: "worker-0",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/worker-0.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "worker-0-out" }),
+	});
+	runtime.watch("worker-0");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "worker-0's notice is held");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the finished child is delivered");
+	const content = messages[0]!.content;
+	assert.match(content, /^Background tasks completed \(1\):$/m);
+	assert.match(content, /worker-0-out/);
+	// The whole point of D4: no footer, because scout-0 can never notify again.
+	assert.doesNotMatch(content, /Still running/, "an unwatched job cannot notify — do not promise it");
+	assert.doesNotMatch(content, /scout-0/);
+	runtime.dispose();
+});
+
+test("v2 §6.4: a re-armed (still watching) sibling IS reported, and its own notice follows", async () => {
+	// The other half of D4: "prefer under-reporting to a false report" must not turn
+	// into "never report". A re-armed watch (blocked / timeout / running snapshot) is
+	// a live promise, so the footer names it — and the promise is kept.
+	const messages: SentMessage[] = [];
+	let liveCalls = 0;
+	let releaseSlow!: (s: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 30 });
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "slow",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/slow.jsonl",
+		timeoutMs: 1_000,
+		collect: () => {
+			liveCalls += 1;
+			// First collect: a progress signal, so the watch re-arms (still watching).
+			return liveCalls === 1
+				? Promise.resolve(joinSnapshot({ execution: { status: "running" } }))
+				: new Promise<CollectSnapshot>((resolve) => {
+						releaseSlow = resolve;
+					});
+		},
+	});
+	runtime.track({
+		name: "fast",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/fast.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "fast-out" }),
+	});
+	runtime.watch("slow");
+	runtime.watch("fast");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "fast's notice is held");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1);
+	assert.match(messages[0]!.content, /^Still running: slow$/m, "a re-armed watch WILL notify: say so");
+	assert.doesNotMatch(messages[0]!.content, /notifies separately/);
+	assert.match(messages[0]!.content, /^Background tasks completed \(1 of 2\):$/m);
+
+	// The promise is kept — in the shape that actually happens (B3): the delivered
+	// notice WOKES a new run (`agent_start`), `slow` finishes inside that live run,
+	// and only the run boundary delivers the second notice. No "parent is idle so
+	// send straight away" shortcut: that path never exercised the outbox.
+	runtime.notifyParentRunStart();
+	releaseSlow(joinSnapshot({ output: "slow-out" }));
+	await waitFor(
+		() => runtime.noticeQueueStats().pending === 1,
+		"the promised notice is held for the live run",
+	);
+	assert.equal(messages.length, 1, "a live run holds the promised notice");
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 2, "the promised second notice arrives at the next boundary");
+	assert.match(messages[1]!.content, /slow-out/);
+	runtime.dispose();
+});
+
+test("v2 §6.5: a sibling the liveness hook reports dead is not `Still running`", async () => {
+	// D4 condition 5: `isAlive()` is the process fact. Reporting a dead child as
+	// still running tells the parent to wait for something that will never happen.
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 30 });
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "crashed",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/crashed.jsonl",
+		timeoutMs: 1_000,
+		// Still watched (so it passes the `watching` gate) but provably dead.
+		isAlive: () => false,
+		collect: () => new Promise<CollectSnapshot>(() => {}),
+	});
+	runtime.track({
+		name: "alive",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/alive.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "alive-out" }),
+	});
+	runtime.watch("crashed");
+	runtime.watch("alive");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "alive's notice is held");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1);
+	const content = messages[0]!.content;
+	assert.match(content, /alive-out/);
+	assert.doesNotMatch(content, /Still running/, "a dead process is not still running");
+	assert.doesNotMatch(content, /crashed/);
+	runtime.dispose();
+});
+
+test("v2 §6.6: a burst of three held notices delivers one per boundary (pending 2 → 1 → 0)", async () => {
+	// D2's contract case: three `triggerTurn:true` notices in the outbox. Each settle
+	// hands out exactly ONE; the rest stay held rather than being pushed into the
+	// host queue (which is what put them in a turn that had not started yet).
+	const messages: SentMessage[] = [];
+	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
+	let sends = 0;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			sends += 1;
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	for (const [name, runId] of [["first", "r-1"], ["second", "r-2"], ["third", "r-3"]] as const) {
+		runtime.track({
+			name,
+			runId,
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolvers.set(name, resolve);
+				}),
+		});
+		runtime.watch(name);
+	}
+	resolvers.get("first")!(joinSnapshot({ output: "first-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "first held");
+	resolvers.get("second")!(joinSnapshot({ output: "second-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 2, "second held");
+	resolvers.get("third")!(joinSnapshot({ output: "third-out" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 3, "third held");
+	assert.equal(sends, 0, "a live run holds all three");
+
+	runtime.notifyParentSettled();
+	assert.equal(sends, 1, "one message per boundary");
+	assert.equal(runtime.noticeQueueStats().pending, 2);
+	assert.match(messages[0]!.content, /first-out/, "FIFO: the oldest goes first");
+
+	runtime.notifyParentSettled();
+	assert.equal(sends, 2, "the next boundary delivers the next one");
+	assert.equal(runtime.noticeQueueStats().pending, 1);
+	assert.match(messages[1]!.content, /second-out/);
+
+	runtime.notifyParentSettled();
+	assert.equal(sends, 3);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	assert.match(messages[2]!.content, /third-out/);
+	// Held, never dropped: nothing crossed the horizon, every result arrived.
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0);
+	runtime.dispose();
+});
+
+test("v2 §6.7: `triggerTurn:false` notices all ride one boundary; the first waking one stops it", async () => {
+	// D2's second clause. A `triggerTurn:false` notice only records, so it cannot
+	// start a turn and must not consume the boundary's single waking slot.
+	const sent: Array<{ content: string; triggerTurn: boolean }> = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message, options) {
+			sent.push({
+				content: (message as SentMessage).content,
+				triggerTurn: options?.triggerTurn === true,
+			});
+		},
+	});
+	runtime.notifyParentRunStart();
+	const plan = [
+		["quiet-1", "r-1", false],
+		["quiet-2", "r-2", false],
+		["loud-1", "r-3", true],
+		["loud-2", "r-4", true],
+	] as const;
+	// One at a time, waiting for each to be held: the outbox order is then pinned.
+	for (const [index, [name, runId, triggerTurn]] of plan.entries()) {
+		runtime.track({
+			name,
+			runId,
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: async () => joinSnapshot({ output: `${name}-out` }),
+		});
+		runtime.watch(name, { triggerTurn });
+		await waitFor(() => runtime.noticeQueueStats().pending === index + 1, `${name} is held`);
+	}
+	assert.equal(sent.length, 0, "a live run holds all four");
+
+	runtime.notifyParentSettled();
+	assert.equal(sent.length, 3, "two silent notices plus the first waking one");
+	assert.deepEqual(
+		sent.map((entry) => entry.triggerTurn),
+		[false, false, true],
+		"the silent ones do not consume the waking slot",
+	);
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the second waking notice waits");
+	runtime.notifyParentSettled();
+	assert.equal(sent.length, 4);
+	assert.equal(sent[3]!.triggerTurn, true);
+	assert.match(sent[3]!.content, /loud-2-out/);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
+});
+
+test("v2 A2(a): a re-entrant `agent_start` inside `sendMessage` stops the boundary after ONE notice", async () => {
+	// `sendMessage` is a host ACTION, so the host can call back into the runtime from
+	// inside it. Here the delivered waking notice immediately starts a new run
+	// (`agent_start`): the SECOND held notice must not follow it into a turn that is
+	// already live. Without the per-item `!parentRunActive` read (and the
+	// `triggerTurn` stop) one boundary would hand out two waking notices.
+	const sent: SentMessage[] = [];
+	let runtime!: ReturnType<typeof createSessionRuntime>;
+	runtime = createSessionRuntime({
+		sendMessage(message) {
+			sent.push(message as SentMessage);
+			// The host woke a new turn off this very message.
+			runtime.notifyParentRunStart();
+		},
+	});
+	runtime.notifyParentRunStart();
+	for (const [index, [name, runId]] of ([["first", "r-1"], ["second", "r-2"]] as const).entries()) {
+		runtime.track({
+			name,
+			runId,
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: async () => joinSnapshot({ output: `${name}-out` }),
+		});
+		runtime.watch(name);
+		await waitFor(() => runtime.noticeQueueStats().pending === index + 1, `${name} is held`);
+	}
+	assert.equal(runtime.noticeQueueStats().pending, 2, "two notices are held");
+	assert.equal(sent.length, 0, "a live run holds both");
+
+	runtime.notifyParentSettled();
+	assert.equal(sent.length, 1, "one waking notice per boundary, even when the send re-enters");
+	assert.match(sent[0]!.content, /first-out/, "FIFO: the oldest goes first");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the second notice stays held for the next boundary");
+	runtime.dispose();
+});
+
+test("v2 A2(b): a re-entrant `agent_settled` inside `sendMessage` cannot deliver a second notice", async () => {
+	// The other re-entry shape: the host calls `notifyParentSettled()` from inside the
+	// `sendMessage` callback. A nested `flushOutbox()` would hand out the next notice
+	// in the SAME boundary (two waking messages, one turn) — the guard makes the
+	// inner call a strict no-op.
+	const sent: SentMessage[] = [];
+	let runtime!: ReturnType<typeof createSessionRuntime>;
+	let reentered = 0;
+	runtime = createSessionRuntime({
+		sendMessage(message) {
+			sent.push(message as SentMessage);
+			if (reentered === 0) {
+				reentered += 1;
+				runtime.notifyParentSettled();
+			}
+		},
+	});
+	runtime.notifyParentRunStart();
+	for (const [index, [name, runId]] of ([["first", "r-1"], ["second", "r-2"]] as const).entries()) {
+		runtime.track({
+			name,
+			runId,
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: async () => joinSnapshot({ output: `${name}-out` }),
+		});
+		runtime.watch(name);
+		await waitFor(() => runtime.noticeQueueStats().pending === index + 1, `${name} is held`);
+	}
+	assert.equal(runtime.noticeQueueStats().pending, 2, "two notices are held");
+
+	runtime.notifyParentSettled();
+	assert.equal(reentered, 1, "the send did re-enter the runtime");
+	assert.equal(sent.length, 1, "the nested settle delivered nothing");
+	assert.match(sent[0]!.content, /first-out/, "FIFO: the oldest goes first");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the second notice waits for the real next boundary");
+
+	// Positive control: the next (non-re-entrant) boundary still delivers it.
+	runtime.notifyParentSettled();
+	assert.equal(sent.length, 2);
+	assert.match(sent[1]!.content, /second-out/);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
+});
+
+test("v2 A2: a send the host REJECTS keeps the notice in the outbox — the next boundary delivers it", async () => {
+	// Per-item exception safety: `deliverBatch` throws / the host throws inside
+	// `sendMessage`. The item has already been `shift`ed off the queue at that point,
+	// so a bare `try` would SILENTLY DROP the notice (shift + nothing sent). It must
+	// go back to the head, unclaimed, and ride the next boundary.
+	const sent: SentMessage[] = [];
+	let attempts = 0;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			attempts += 1;
+			if (attempts === 1) throw new Error("host is not ready");
+			sent.push(message as SentMessage);
+		},
+	});
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "flaky",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/flaky.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "flaky-out" }),
+	});
+	runtime.watch("flaky");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the notice is held");
+	assert.equal(attempts, 0, "a live run holds the notice");
+
+	runtime.notifyParentSettled();
+	assert.equal(attempts, 1, "the boundary tried to deliver");
+	assert.equal(sent.length, 0, "and the host threw");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the rejected notice is still pending (and unclaimed)");
+
+	runtime.notifyParentSettled();
+	assert.equal(sent.length, 1, "the next boundary delivers it");
+	assert.match(sent[0]!.content, /flaky-out/);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
 });
 
 // ═════ D-D①②③ repaint guards: the pinned defence against a stuck "working" row ═════
@@ -4528,10 +5011,68 @@ test("claim D7b: a revive (existing branch) also drops the one-round cache", asy
 	runtime.dispose();
 });
 
-test("claim D-B: a cap flush that delivers nothing is not counted as a forced send", async () => {
-	// `forcedFlushes` documents forced SENDS. A cap that fires on a batch whose only
-	// member was already read claims nothing and sends nothing, so counting it would
-	// report a message that never existed.
+test("v2 A2: a throw while FORMATTING the notice puts it back at the head (no silent drop)", async () => {
+	// The other half of per-item exception safety: `deliverBatch` itself can throw (a
+	// supervisor liveness hook, a formatter) at a point where the item is already off
+	// the queue. Same rule as a host rejection — back to the head, stop the round,
+	// re-arm the horizon — never "shifted and never sent".
+	const messages: SentMessage[] = [];
+	let explode = false;
+	const overflow = manualOverflow();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
+	});
+	runtime.setJoinConfig({ mode: "smart", flushMs: 30 });
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "live",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/live.jsonl",
+		timeoutMs: 1_000,
+		isAlive: () => {
+			if (explode) throw new Error("liveness hook exploded");
+			return true;
+		},
+		collect: () => new Promise<CollectSnapshot>(() => {}),
+	});
+	runtime.track({
+		name: "done",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/done.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "done-out" }),
+	});
+	runtime.watch("live");
+	runtime.watch("done");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the partial batch is held");
+	assert.equal(overflow.timers.length, 1, "the horizon is armed");
+
+	explode = true;
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 0, "the throw stopped this round");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the notice is back in the outbox");
+	assert.equal(overflow.timers.length, 2, "the horizon was re-armed for the retry");
+
+	explode = false;
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the retry delivers it");
+	assert.match(messages[0]!.content, /done-out/);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
+});
+
+test("claim D-B/v2: a fully claimed batch is dead weight — the horizon neither counts it nor stays armed", async () => {
+	// D6 (A1): the counter and the timer both describe a notice that can STILL be
+	// delivered. A batch whose every member is already claimed can never produce a
+	// message, so counting it would report `pending === 0` next to a `heldOverCap`
+	// that keeps growing — two numbers about the same queue that contradict each
+	// other (and the older arm would keep ticking forever, which is what the old
+	// `outbox[0]` fix priced).
 	const messages: SentMessage[] = [];
 	const overflow = manualOverflow();
 	let t = 1_000;
@@ -4553,27 +5094,29 @@ test("claim D-B: a cap flush that delivers nothing is not counted as a forced se
 	});
 	runtime.watch("stuck");
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+	assert.equal(overflow.timers.length, 1, "the only deliverable notice armed the horizon");
 
-	// The parent reads it before the cap fires; the queued copy is now dead weight.
+	// The parent reads it before the horizon fires; the queued copy is now dead weight.
 	const waited = await runtime.wait(["stuck"], { timeoutMs: 500 });
 	assert.equal(waited[0]?.snapshot?.output, "stuck-out");
-	assert.equal(overflow.timers.length, 1, "the cap arm is still live");
+	assert.equal(runtime.noticeQueueStats().pending, 0, "a claimed copy is not `pending`");
 
+	// The arm was priced when the notice WAS deliverable, so it still fires. It must
+	// find nothing deliverable, count nothing, and not re-arm either.
 	t += MAX_PENDING_AGE_MS;
 	overflow.timers[0]!.fn();
 	assert.equal(messages.length, 0, "a fully claimed batch sends nothing");
-	assert.equal(
-		runtime.noticeQueueStats().forcedFlushes,
-		0,
-		"a forced flush that sent nothing is not a forced send",
-	);
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0, "dead weight is never counted");
+	assert.equal(runtime.noticeQueueStats().oldestAgeMs, 0, "…and it stops describing an age");
+	assert.equal(overflow.timers.length, 1, "no new window: there is nothing left to observe");
 
 	// Positive control (hard requirement 7). "Zero messages" is also what a dead
-	// `flushOutbox` produces, so the very same arm → flush → deliver path must now
-	// send an UNCLAIMED notice: one real forced send, one message.
+	// `flushOutbox` produces, so the very same horizon → boundary → deliverBatch
+	// path must now deliver an UNCLAIMED notice.
+	runtime.notifyParentRunStart();
 	runtime.track({
 		name: "late",
-		runId: "r-1",
+		runId: "r-2",
 		agent: "worker",
 		sessionFile: "/tmp/late.jsonl",
 		timeoutMs: 1_000,
@@ -4581,16 +5124,132 @@ test("claim D-B: a cap flush that delivers nothing is not counted as a forced se
 	});
 	runtime.watch("late");
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the control notice is held");
-	assert.equal(overflow.timers.length, 2, "a fresh cap arm for the surviving batch");
+	assert.equal(overflow.timers.length, 2, "a live notice arms a fresh window");
+	assert.equal(
+		overflow.timers[1]!.ms,
+		MAX_PENDING_AGE_MS,
+		"priced off the DELIVERABLE head, not the dead one behind it",
+	);
 	t += MAX_PENDING_AGE_MS;
 	overflow.timers[1]!.fn();
-	await waitFor(() => messages.length === 1, "the control notice is force-sent");
-	assert.match(messages[0]!.content, /late-out/, "the cap machinery really delivers");
-	assert.equal(
-		runtime.noticeQueueStats().forcedFlushes,
-		1,
-		"a forced flush that DID send is counted",
+	assert.equal(messages.length, 0, "the horizon still does not send, even for a live notice");
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 1, "the live hold is counted, once");
+	assert.equal(overflow.timers.length, 3, "…and re-arms a full window again");
+
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the boundary delivers the control notice");
+	assert.match(
+		messages[0]!.content,
+		/late-out/,
+		"the claimed head delivers nothing, so the flush moves on to the next item",
 	);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
+});
+
+test("v2 D6: `heldOverCap` counts PER NOTICE — the deliverable head, once, never dead weight", async () => {
+	// A1's second half. Three properties, each of which the old `outbox[0]`-priced
+	// window violated: (a) the tick describes the SAME notice `pending`/`oldestAgeMs`
+	// describe, so a dead head behind a live notice neither counts nor sets the
+	// deadline; (b) one notice crosses the horizon once, however many windows it
+	// outlives; (c) `pending === 0` means no timer and no count.
+	const messages: SentMessage[] = [];
+	const overflow = manualOverflow();
+	let t = 1_000;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+		now: () => t,
+		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
+	});
+	runtime.notifyParentRunStart();
+
+	// Dead weight first: the parent reads this child, so its queued copy can never land.
+	runtime.track({
+		name: "read",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/read.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "read-out" }),
+	});
+	runtime.watch("read");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "read's notice is held");
+	assert.equal(overflow.timers.length, 1);
+	assert.equal(overflow.timers[0]!.ms, MAX_PENDING_AGE_MS, "armed off the only notice");
+	await runtime.wait(["read"], { timeoutMs: 500 });
+	assert.equal(runtime.noticeQueueStats().pending, 0, "the queue head is dead weight now");
+
+	// A LIVE notice joins the queue 10s later, while the original arm is still armed.
+	t += 10_000;
+	runtime.track({
+		name: "live",
+		runId: "r-2",
+		agent: "worker",
+		sessionFile: "/tmp/live.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "live-out" }),
+	});
+	runtime.watch("live");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the live notice is held");
+	assert.equal(overflow.timers.length, 1, "the live arm still covers the queue");
+	assert.equal(runtime.noticeQueueStats().oldestAgeMs, 0, "`oldestAgeMs` names the live notice");
+
+	// Wake that arm: it must price the LIVE head (a full window from now), not the dead
+	// head's 10s-older deadline (`MAX_PENDING_AGE_MS - 10_000`) and not its own age.
+	overflow.timers[0]!.fn();
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 0, "the live notice is 0s old");
+	assert.equal(overflow.timers.length, 2, "it re-armed");
+	assert.equal(
+		overflow.timers[1]!.ms,
+		MAX_PENDING_AGE_MS,
+		"priced off the deliverable head, not the dead one 10s older",
+	);
+
+	// At the LIVE notice's own horizon the hold is counted — once, and only for it.
+	t += MAX_PENDING_AGE_MS;
+	overflow.timers[1]!.fn();
+	assert.equal(runtime.noticeQueueStats().heldOverCap, 1, "one count, for the deliverable notice");
+	assert.equal(overflow.timers.length, 3);
+	assert.equal(overflow.timers[2]!.ms, MAX_PENDING_AGE_MS, "re-armed a full window after the count");
+	assert.equal(messages.length, 0, "the horizon never sends");
+
+	// Three more windows: the SAME hold is not counted again.
+	for (let window = 0; window < 3; window += 1) {
+		t += MAX_PENDING_AGE_MS;
+		overflow.timers.at(-1)!.fn();
+		assert.equal(runtime.noticeQueueStats().heldOverCap, 1, `window ${window + 2} adds nothing`);
+		assert.equal(overflow.timers.length, 4 + window, "…and the hold is still being observed");
+	}
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the live notice is still deliverable");
+
+	// Claim it: the queue holds no deliverable notice, so the last arm finds nothing
+	// to observe — no count, no re-arm — and `pending`/`heldOverCap` stop together.
+	await runtime.wait(["live"], { timeoutMs: 500 });
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	const armedBefore = overflow.timers.length;
+	const countedBefore = runtime.noticeQueueStats().heldOverCap;
+	overflow.timers.at(-1)!.fn();
+	assert.equal(runtime.noticeQueueStats().heldOverCap, countedBefore, "no count without a deliverable notice");
+	assert.equal(overflow.timers.length, armedBefore, "…and no new arm either");
+	assert.equal(messages.length, 0, "and still nothing sent");
+
+	// Positive control (contract §6): "nothing was sent" is also what a dead horizon
+	// path produces, so the same runtime must still deliver at a run boundary.
+	runtime.track({
+		name: "control",
+		runId: "r-3",
+		agent: "worker",
+		sessionFile: "/tmp/control.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "control-out" }),
+	});
+	runtime.watch("control");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the control notice is held");
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the boundary delivers the control notice");
+	assert.match(messages[0]!.content, /control-out/);
 	runtime.dispose();
 });
 
@@ -4694,7 +5353,7 @@ test("claim D4: a terminal sibling parked in retire is not listed as `Still runn
 	await waitFor(() => messages.length === 1, "window 2 flushed beta");
 	const second = messages[0]!.content;
 	assert.match(second, /^- beta \(worker\): completed/m);
-	assert.match(second, /^Still running: gamma \(notifies separately/m, "gamma is genuinely still running");
+	assert.match(second, /^Still running: gamma$/m, "gamma is genuinely still running");
 	assert.doesNotMatch(
 		second,
 		/Still running:[^\n]*alpha/,
@@ -4743,8 +5402,13 @@ test("claim D10: two unread rounds of one child are both delivered, FIFO", async
 	resolvers[1]!(joinSnapshot({ output: "round-2-out" }));
 	await waitFor(() => runtime.noticeQueueStats().pending === 2, "both rounds held");
 
+	// D2: one waking notice per boundary, so the two rounds arrive at two
+	// boundaries — still both, oldest first (the round in the claim key is what
+	// keeps the second one from being swallowed).
 	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 2, "both rounds are delivered");
+	await waitFor(() => messages.length === 1, "the first boundary delivers round 1");
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 2, "the second boundary delivers round 2");
 	assert.match(messages[0]!.content, /round-1-out/, "FIFO: round 1 first");
 	assert.match(messages[1]!.content, /round-2-out/, "round 2 is not swallowed by round 1's claim");
 	assert.equal(messages.length, 2, "one notice per round, no duplicates");

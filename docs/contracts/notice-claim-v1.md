@@ -1,5 +1,14 @@
 # 完成通知去重：claim-once（v1，冻结）
 
+> 修订（详见 `notice-delivery-v2.md`）：outbox 的**投递时机**与 **D-B** 被 v2 取代。
+>
+> - **D-B** 指旧 outbox 的「80s 到点强制发送」（`MAX_PENDING_AGE_MS`，见 `docs/design.md`
+>   §3.3.0 旧段）。本文件从未定义过 D-A…D-I，这些记号来自实现侧；v2 起该上限**只做健康
+>   计数**（`noticeQueueStats().heldOverCap`），不再触达任何发送。
+> - **D5 的「逐字节一致」条款被 v2 D5 的首行标记取代**：完成通知首行固定为
+>   `▣ legion · automatic completion notice — not a user message`，其余正文与旧形状一致。
+> - 其余条款（D1-D4、D6-D10 的 claim 语义）不变。
+
 ## 背景
 
 同一个 child 的终态结果有两条路到达父 agent：
@@ -10,7 +19,7 @@
 现有去重只有两个内存位 `TrackedJob.consumedByTool` / `TrackedJob.notified`，并且**只在 watch 跑到终态的那一刻判断一次**（`runtime.ts` 的 `!job.consumedByTool && !job.notified` 闸门）。判完之后，通知还要穿过两层缓冲才真正落地：
 
 - `JoinCoordinator.group.buffered`（10s 窗口 / 同组 pending 清空才 flush）
-- `runtime.outbox`（父 run 活跃时入队，`agent_settled` 或 80s 上限才 flush，且**没有按 name 撤销的 API**）
+- `runtime.outbox`（父 run 活跃时入队，**只在 `agent_settled` 边界 flush**；80s 上限只做健康计数，不再 flush。且**没有按 name 撤销的 API**）
 
 于是产生四个重复窗口：
 
@@ -96,7 +105,7 @@
 3. 单条 → `formatCompletionNotice`；多条 → `formatGroupedNotice`（`stillRunning` 在投递时实时重算）
 4. 立即发送或入 outbox；`deliverCompletion` 返回 `false`（宿主拒绝）→ **不 claim**，允许后续补救
 
-`join` 的 `deliver` sink 与 `flushOutbox` 都只调它。单 child、未被 claim 的通知文本必须与现状**逐字节一致**（保留 `Background task …` 旧形状；`partial` 由入队时刻的 `join.allSettled()` 决定并随条目保存，避免 flush 时语义漂移）。
+`join` 的 `deliver` sink 与 `flushOutbox` 都只调它。单 child、未被 claim 的通知文本必须与现状**逐字节一致**（首行标记的例外见顶部修订注记与 `notice-delivery-v2.md` D5；保留 `Background task …` 旧形状；`partial` 由入队时刻的 `join.allSettled()` 决定并随条目保存，避免 flush 时语义漂移）。
 
 ### D6 — 工具结果永不被抑制
 
@@ -191,7 +200,7 @@ unclaimReported(runId, name):
 补充硬要求（复审追加）：
 
 7. 每条「断言零消息」的用例必须有**正向控制**（同批一个未 claim 的兄弟必须送达，用 `waitFor` 等它），否则成了空转通过。
-   - 落点：W2、D10 的同名 re-track、D-B 的 cap flush、F1 的 interruptible collect。四条都补了兄弟控制；D-B 的 flush 一条的「零」是 `forcedFlushes` 的属性本身，所以控制放在同一用例的第二段（同一条 arm → flush → deliverBatch 路径必须送出一条未 claim 的通知）。
+   - 落点：W2、D10 的同名 re-track、D-B 的 held 计数、F1 的 interruptible collect。四条都补了兄弟控制；D-B 一条的「零」本身就是属性（v2 起 80s 上限只计数、不投递，且只对仍可交付的通知计一次，见 `notice-delivery-v2.md` D6），所以控制放在同一用例的第二段（同一条 arm → 边界 → `deliverBatch` 路径必须送出一条未 claim 的通知）。
 8. 生产 collect 缝是 `consumeCollectInterruptible`（tool execute 必带 signal），它的 claim 点必须有对应用例。
 9. 一轮内出现第二轮（同名同 runId）时：第二轮失败通知不得被上一轮的缓存命中吞掉。
 10. 同名同 runId 的两轮各有未读通知 → 两条都送达（FIFO，不丢新轮）；第一轮已读 → 只发第二轮一条。

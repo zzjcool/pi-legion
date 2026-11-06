@@ -654,8 +654,9 @@ export class LegionPostman {
 			reported.add(node.id);
 			this.sendRootMessage(
 				// The notice can be delivered long after detection: it is queued through
-				// `subagent-notify` and the outbox flushes at `MAX_PENDING_AGE_MS` or at
-				// `agent_settled`. A stale `staleMs` alone therefore reads as "detected
+				// `subagent-notify` and the outbox only flushes at `agent_settled` (the
+				// `MAX_PENDING_AGE_MS` horizon merely counts the hold — it sends nothing). A
+				// stale `staleMs` alone therefore reads as "detected
 				// just now" when the value can be tens of minutes old, which makes a
 				// replayed notice look like a fresh detection. Stamp the detection time
 				// so a late delivery is self-evident.

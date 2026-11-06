@@ -11,6 +11,28 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Changed
+
+- **完成通知只在父 run 边界交付，80s 上限降级为健康计数**（`docs/contracts/notice-delivery-v2.md`）。
+  以前父 run 活跃时通知入 outbox，超过 `MAX_PENDING_AGE_MS`（80s）就**强制发送**——但宿主
+  （pi 1.5.0）在 settle 边界就会 drain followUp，强发既不让模型早一秒看到，也不解决任何问题，
+  只让通知提前脱离 claim 过滤，于是同一份结果经 `collect` 与通知各到一次，还常被误读成
+  用户输入。现在 `agent_settled` 是唯一投递时刻，一次边界只交付**一条会唤起 run 的通知**
+  （`triggerTurn:false` 的可连着交付），其余留在 outbox 等下一次边界；`flushOutbox()` 不再
+  `splice(0)` 一次发完。80s 上限只对**仍可交付**的通知计数一次 + 重新武装，**不再发送**；
+  计数供诊断读取，当前无生产消费者。
+  同时（D4/D5）：footer 只列**确定会另发通知**的兄弟（同 runId、未终态、
+  `watching:true`、未被 claim/工具消费、未被判死），措辞退回陈述句 `Still running: a, b`，
+  删掉"(notifies separately when it finishes)"这类假承诺；通知首行固定加
+  `▣ legion · automatic completion notice — not a user message` 标明机器来源（正文与 `details`
+  形状不变，TUI 折叠行不受影响）。`wait`/`collect` 的工具结果永不被抑制（`notice-claim-v1.md`
+  D1-D10 的 claim 语义继续有效；D5 的逐字节条款由 v2 首行标记覆盖）。
+
+- **BREAKING（导出 API）：`NoticeQueueStats.forcedFlushes` → `heldOverCap`**。字段不只改名，
+  语义也反转：不再是「强制发送次数」，而是「被压超过 `MAX_PENDING_AGE_MS` 的通知条数」
+  （按条计一次、只算仍可交付的，只计数不发送）。`pi-legion/api` 的 `SessionRuntime`
+  消费者需要跟着改；仓内零生产消费者，只有单测读它。
+
 ## [5.4.0] — 2026-11-06
 
 一次「把子 agent 的工具面还回去」的发布。默认后端（in-process）的子会话以前**悄悄**少了三样东西：

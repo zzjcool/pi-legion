@@ -26,6 +26,17 @@ import { isTransientConnectionFailure } from "../shared/session.ts";
 
 export const SUBAGENT_NOTIFY_TYPE = "subagent-notify";
 
+/**
+ * D5: the fixed first line of every completion notice.
+ *
+ * A notice enters the parent session as a `role:user` message and starts a turn,
+ * so without a marker the model has no way to tell it apart from something the
+ * user typed (N3: the root re-ran a status check because it read the notice as
+ * user input). The host offers no other source field, so the line itself is the
+ * marker; body and `details` are unchanged.
+ */
+export const NOTICE_SOURCE_MARKER = "▣ legion · automatic completion notice — not a user message";
+
 export type CompletionStatus = "completed" | "failed" | "stopped" | "running";
 
 /**
@@ -358,7 +369,10 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 	// in, so an unrenewable notice is byte-identical to what it was before.
 	const renewalLines = renewalLinesFor(status, input.renewal);
 	if (renewalLines) lines.push("", ...renewalLines);
-	const content = lines.filter((line) => line !== undefined).join("\n");
+	const body = lines.filter((line) => line !== undefined).join("\n");
+	// D5: the marker is the FIRST line; the body after it is byte-for-byte what it
+	// was before (the renderer reads `details`, never `content`).
+	const content = `${NOTICE_SOURCE_MARKER}\n${body}`;
 	return {
 		content,
 		display: true,
@@ -433,7 +447,7 @@ export interface GroupedCompletionInput {
  *   - worker-0 (worker): completed — acceptance: accepted (attested)
  *     <previewOutput, per-entry cap max(500, PREVIEW_CHARS/entries.length)>
  *   - reviewer-1: failed (model error)
- *   Still running: slow-2 (notifies separately when it finishes)
+ *   Still running: slow-2
  *
  * Retirement is per-entry (a wait()-released sibling can race the flush, so a
  * blanket footer could be inaccurate): entries whose child is retired
@@ -488,9 +502,11 @@ export function formatGroupedNotice(
 			lines.push(`  Full output: ${entry.outputFile}`);
 	}
 	if (stillRunning.length > 0) {
-		lines.push(
-			`Still running: ${stillRunning.join(", ")} (notifies separately when it finishes)`,
-		);
+		// D4: state the fact only. "(notifies separately when it finishes)" promised a
+		// second message on behalf of children whose watch could already be gone —
+		// the footer now lists only jobs that really can notify again, so it must not
+		// add a promise the call site cannot keep.
+		lines.push(`Still running: ${stillRunning.join(", ")}`);
 	}
 	const status: CompletionStatus = anyFailed
 		? "failed"
@@ -499,7 +515,7 @@ export function formatGroupedNotice(
 			: "completed";
 	const preview = lines.join("\n");
 	return {
-		content: preview,
+		content: `${NOTICE_SOURCE_MARKER}\n${preview}`,
 		// display:true matches the single-child path (master f966088): the
 		// renderer collapses a completed batch to one row instead of hiding it.
 		display: true,
