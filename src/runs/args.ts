@@ -292,8 +292,9 @@ export const LEGION_CHILD_TOOLS = [
  * is left where the card put it.
  *
  * Shared by the rpc (`pushToolArgs`) and in-process (`resolveInProcessTools`)
- * paths on purpose: the two launch shapes must produce a byte-identical
- * whitelist, and the only way to keep them in step is to have one implementation.
+ * paths so the three legion names cannot be appended twice with two different
+ * orders. The `vexillatio` rule just above them is still one copy per path —
+ * equal output there is guarded by the D6.2 parity test instead.
  */
 export function appendLegionChildTools(tools: string[]): void {
 	for (const name of LEGION_CHILD_TOOLS) {

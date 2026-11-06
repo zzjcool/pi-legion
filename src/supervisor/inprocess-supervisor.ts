@@ -27,7 +27,7 @@ import {
 	SubagentError,
 	DEFAULT_LEGION_SETTINGS,
 } from "../shared/types.ts";
-import { CHILD_BUILTIN_EXTENSIONS } from "./child-builtins.ts";
+import { childBuiltinExtensionEntries, type ChildBuiltinFactories } from "./child-builtins.ts";
 import {
 	POLL_INTERVAL_MS,
 	DEFAULT_INPROCESS_MAX_ACTIVE,
@@ -590,30 +590,32 @@ async function defaultSessionFactory(
 	const agentDir = getAgentDir();
 
 	// D1 (child-builtin-extensions-v1): a `builtin:<name>` path resolves only out
-	// of a factory registered with the loader. Without these the loader answers
+	// of a factory registered with the loader. Without them the loader answers
 	// "Unknown built-in extension: builtin:codemode" and the card's `codemode`
 	// tool silently vanishes — codemode is a light builtin, so a role card may
 	// list it without naming an extension path.
 	//
-	// Registering a factory activates nothing: the `builtin:` path chosen by
-	// `collectChildExtensions` is still the switch. `mcp` is registered for parity
-	// with the host but has no path, so MR1 connects no MCP server.
+	// Registering a factory is not a load switch — the `builtin:` path chosen by
+	// `collectChildExtensions` is — but it is not inert either: the name enters
+	// `DefaultPackageManager`'s builtin table and discovery synthesizes a
+	// default-enabled `builtin:<name>` for it (`package-manager.js:766-772`). So
+	// "mcp has no path yet" is NOT what keeps MCP out of MR1; the gates are
+	// `noExtensions: true` (D3) plus never triggering `session_start` (D5). Even if
+	// `builtin:mcp` were loaded, nothing here opens an MCP connection.
+	//
+	// D7: `childBuiltinExtensionEntries` is the only construction point, so the
+	// name→factory wiring is unit-testable without building a session.
 	const builtinFactories = {
 		codemode: createCodemodeExtension(),
 		"tool-search": createToolSearchExtension(),
 		mcp: createMcpExtension(),
-	} satisfies Record<(typeof CHILD_BUILTIN_EXTENSIONS)[number], unknown>;
+	} satisfies ChildBuiltinFactories;
 
 	const loaderOptions: ConstructorParameters<typeof DefaultResourceLoader>[0] = {
 		cwd: plan.cwd,
 		agentDir,
 		noExtensions: plan.noExtensions,
-		extensionFactories: CHILD_BUILTIN_EXTENSIONS.map((name) => ({
-			name,
-			factory: builtinFactories[name],
-			builtin: true,
-			replaceable: true,
-		})),
+		extensionFactories: childBuiltinExtensionEntries(builtinFactories),
 		...(plan.additionalExtensionPaths.length > 0
 			? { additionalExtensionPaths: plan.additionalExtensionPaths }
 			: {}),
