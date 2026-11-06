@@ -509,10 +509,14 @@ LSP stack (~1 GB per child, #43). If a fleet of children does not need it, add
 `builtin:mcp` + `builtin:tool-search` and then binds its extensions once, which
 is what makes `session_start` fire and the configured MCP servers actually
 connect. Each child therefore spawns its own server processes: measured, **5
-concurrent children × 1 server = 18 processes / 1121 MB**. There is no connection
+concurrent children × 1 server = 18 processes / 1121 MB**. They are released when
+the child retires (its `dispose()` emits `session_shutdown` first, which is MCP's
+only disconnect path). There is no connection
 budget and no concurrency cap yet — the only knob is the mask
-`PI_LEGION_CHILD_MCP=0`, which removes both builtins for every child. Per-role and
-per-server selection is not implemented.
+`PI_LEGION_CHILD_MCP=0`, which removes both builtins for every child and also
+skips the session bind (no `session_start` at all, so inherited host extensions
+behave exactly as they did before child MCP existed). Per-role and per-server
+selection is not implemented.
 
 There is also **no annotation-level firewall**, deliberately. A real server's
 `tools[].annotations` came back `null` for every tool measured (`web_search`,

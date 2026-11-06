@@ -16,11 +16,16 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - **子会话默认加载 MCP（`docs/contracts/child-mcp-v1.md`）。** 以前子会话连不上任何 MCP server，卡在两层：
   `collectChildExtensions` 从不给 `builtin:mcp` 路径，而 MCP 的 `loadConfig` + `startConnection` 全部在
   `session_start` handler 里，`session_start` 又只由 `bindExtensions` emit——`createAgentSession` 不调它。
-  现在两条路都补齐：所有子会话（rpc 与 in-process）的扩展列表固定注入
-  `builtin:codemode → builtin:mcp → builtin:tool-search`；in-process 子会话在 `createAgentSession` 之后
+  现在两条路都补齐：所有子会话（rpc 与 in-process）的扩展列表注入
+  `builtin:mcp → builtin:tool-search`（无条件，仅受掩码控制）；`builtin:codemode` 仍只在角色 `tools:`
+  含 `codemode` 时才注入（#89 的既有规则，本次不变）。in-process 子会话在 `createAgentSession` 之后
   **绑定一次**扩展（`{ mode: "print", onError }`，扩展异常走 `console.warn` 而不是被静默吞掉），于是
   `session_start` 真的会触发。`tool-search` 不是可选项：非 `direct` 曝光的 MCP 工具只有在 `tool_search`
   已注册时才可声明。
+  **退役回收**：`session_shutdown` 是 MCP 唯一的断开路径，而 `dispose()` 不 emit 它——in-process 子会话
+  只走 `dispose()`，于是退役后 MCP server 会活到 root 退出。现在 `dispose()` 被包了一层：先补发一次
+  `session_shutdown`（`reason: "quit"`，幂等、1000ms 上限），再执行真正的 dispose；`PI_LEGION_CHILD_MCP=0`
+  时压根不 bind，也就不补发。
   **代价（实测）**：MCP 连接是每个子会话各开一份——5 个并发子会话 × 1 个 server = 18 个进程 / 1121 MB。
   本次不做连接预算 / 并发上限，只提供掩码开关 `PI_LEGION_CHILD_MCP=0`（`0`/`false`/`off`/`no`/`none`
   关闭；未设置即开启；不做 role card 名单，留 MR2b）。
@@ -28,9 +33,9 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `acceptance.role: read-only` 的 scout **从此可以调用 MCP server 暴露的写能力**（bash 的只读分类不变，
   它只拦 bash）。不要把「只读」理解成对 MCP 也成立。
   另一半是身份守卫：in-process 子会话现在会收到 `session_start`，所以 legion 自己的 handler 加了守卫——
-  持有注入身份（`childContext.nodeId && childContext.dbPath`）的子会话跳过 `initializeLegionRuntime`。
-  否则父本身是 rpc child 时，这个 handler 会先用祖先的 `PI_LEGION_*` 身份 init（开祖先 db、起第二个
-  postman），而 `session_shutdown` 在 in-process 子会话里不会触发，没有任何回收点。
+  只要持有注入的 `childContext`（含 `stripLegionIdentity` 那种有 dbPath 无 nodeId 的 utility 子会话）就跳过
+  `initializeLegionRuntime`，boot 期那条 env attach 也一并跳过。否则父本身是 rpc child 时，这个 handler 会先用
+  祖先的 `PI_LEGION_*` 身份 init（开祖先 db、起第二个 postman），而 legion 的 runtime 没有对应的回收点。
 
 ### Fixed
 

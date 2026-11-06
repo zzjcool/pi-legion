@@ -259,3 +259,102 @@ if (childEnablesMcp(process.env)) await bindChildSessionExtensions(session, inpu
 
 **测试**：D7.3 仍覆盖被调函数本身；新增一条单测断言 `childEnablesMcp` 与
 「是否应 bind」是同一个判据（表驱动复用 D7.1 的用例集即可），避免两处判据分叉。
+
+### r3 — review 后的必修项（root 追加，阻塞合并）
+
+fresh-context review 给出 `ok: false`，1 critical + 2 major。以下全部纳入本 MR。
+
+#### C1（critical）— MCP 连接永不回收
+
+**事实**：MCP 唯一的断开路径是 `pi.on("session_shutdown", …)`（`dist/extensions/mcp/index.js:1114-1119`
+：`session.abort()` + `connection.close()`）。`AgentSession.dispose()` **不 emit** 它
+（`agent-session.js:1024-1043` 只 `invalidate` + `_disconnectFromAgent`）；能 emit 它的只有
+`AgentSessionRuntime.dispose()`（`agent-session-runtime.js:298`）。而 in-process 子会话退休只走
+`session.dispose()`（`inprocess-supervisor.ts` 的 1555 / 1749 / 1763）。
+⇒ 每个退役子会话的 MCP server 进程与连接活到 root 进程退出，8 slot 轮转下单调增长。
+
+**决定**：显式补一次 `session_shutdown`，且必须在 `dispose()` 之前。
+
+SDK 提供公开出口（不需要私有字段）：
+
+- `AgentSession.extensionRunner` 是 public getter（`agent-session.d.ts:937`）；
+- `ExtensionRunner.hasHandlers(event)` 与 `emit(event)` 是 public（`runner.d.ts:181`）；
+- 官方实现就是这两句（`runner.js:80-86` 的 `emitSessionShutdownEvent`），我们照抄同一逻辑，
+  **不要**深引 `dist/core/extensions/runner.js`（exports map 只暴露 `.` 与 `./rpc-entry`）。
+
+`src/supervisor/child-session.ts` 新增：
+
+```ts
+/** Emit `session_shutdown` once for a bound in-process child session (r3 C1). */
+export async function releaseChildSessionExtensions(session: ChildSessionBinding): Promise<void>;
+```
+
+`ChildSessionBinding` 相应扩展为带 `extensionRunner?: { hasHandlers(event: string): boolean;
+emit(event: { type: "session_shutdown"; reason: "quit" }): Promise<unknown> }`（结构化类型，
+测试仍然不需要 SDK）。
+
+`defaultSessionFactory` 里把 `dispose` 包一层（**幂等**）：
+
+```ts
+const rawDispose = session.dispose.bind(session);
+let disposing = false;
+session.dispose = () => {
+  if (disposing) return;
+  disposing = true;
+  // Emitting first runs the shutdown handlers' synchronous prefix (MCP aborts its
+  // controller and starts closing every connection) before `dispose()` invalidates
+  // the extension ctx. Bounded so a wedged handler cannot keep the session alive.
+  void releaseChildSessionExtensions(session).finally(() => rawDispose());
+};
+```
+
+约定：
+
+1. 只在**成功 bind 过**的会话上补发（`child-mcp-v1` 里 bind 已被 `childEnablesMcp` 门控；
+   MCP 关闭时不应无故给宿主扩展发 `session_shutdown`）。用一个模块级 `WeakSet` 记录已 bind 的
+   session，`release…` 对它做 once。
+2. `release…` 内部对 `emit` 做 try/catch + 1000ms 上限，**无论成功失败都必须让 `rawDispose` 跑到**。
+3. 不传 `reason: "quit"` 以外任何值（in-process 子会话不存在 reload/new/resume/fork）。
+
+**测试（D7.5）**：fake session 断言 —— ①`dispose()` 触发 `session_shutdown` 恰一次且
+`reason === "quit"`；②`session_shutdown` 在 `dispose` 之前（用调用顺序数组）；
+③emit 抛错时 `dispose` 仍然被调用；④连续两次 `dispose()` 只发一次事件；
+⑤未 bind 的 session 不发事件。
+
+#### M2（major）— boot-time attach 的同一个洞
+
+`index.ts:1594-1598` 在 env 带祖先 `PI_LEGION_DB/NODE_ID` 时仍会
+`initializeLegionRuntime({cwd})`，且**不传 sessionFile ⇒ credential 校验被跳过**
+（`resolveLegionIdentity:1027-1032` 要求 `mySession` 非空）⇒ 开祖先 db + 起 postman，同样无回收点。
+
+**决定**：与 D4 用同一个谓词，boot attach 也跳过：
+
+```ts
+if (!hasInjectedChildContext && process.env[LEGION_DB_ENV] && process.env[LEGION_NODE_ID_ENV]) { … }
+```
+
+#### M3（major）— 守卫谓词比危害窄
+
+`stripLegionIdentity: true` 的子会话（vexillatio）由 `orchestrator.ts:1354-1356` 省略 nodeId 但保留
+dbPath，`Boolean(childContext?.nodeId && dbPath)` 因此失效，`session_start` 仍会走 env init。
+
+**决定**：谓词改为 **`childContext !== undefined`**（任何 in-process 子会话都不在 `session_start`
+里从 env 推导身份；它的身份通道是 ALS，没有就是没有）。这也覆盖 boot attach（M2）。
+命名：`hasInjectedChildContext`。
+
+#### Minor（一并修）
+
+- `test/unit/child-session.test.ts` 的源码钉子：改为按 `bindChildSessionExtensions(` 出现次数计数
+  （不再钉整行格式与 `input.name`），并在注释里声明「格式 tripwire，不是行为断言」；测试名去掉
+  「exactly one bind」里的行为承诺。
+- 同名测试里「不留下半启动 session」改成准确表述（`bindExtensions` 极少 reject；此测试钉的是
+  「向上抛，不吞」）。
+- `index.ts:1595-1596` 的「the session_start handler re-runs this with the real credential」在新守卫下
+  对持注入身份的子会话不再成立 → 改掉。
+- CHANGELOG 的「扩展列表固定注入 codemode → mcp → tool-search」→ 说明 `codemode` 仍只在角色
+  `tools` 含 `codemode` 时注入，后两条才是无条件。
+
+#### 复核要求
+
+修完重新跑一次 fresh-context review（同一份契约，范围 `master...feat/child-mcp-v1`），
+**C1 未修则不得合并**。

@@ -29,7 +29,7 @@ import {
 	DEFAULT_LEGION_SETTINGS,
 } from "../shared/types.ts";
 import { childBuiltinExtensionEntries, type ChildBuiltinFactories } from "./child-builtins.ts";
-import { bindChildSessionExtensions } from "./child-session.ts";
+import { bindChildSessionExtensions, attachChildSessionRelease } from "./child-session.ts";
 import {
 	POLL_INTERVAL_MS,
 	DEFAULT_INPROCESS_MAX_ACTIVE,
@@ -706,7 +706,7 @@ async function defaultSessionFactory(
 	}
 
 	const { session } = await createAgentSession(createOptions);
-	// `child-mcp-v1` D3 + r2, the only bind: `createAgentSession` does NOT emit
+	// `child-mcp-v1` D3 + r2 + r3, the only bind: `createAgentSession` does NOT emit
 	// `session_start` (`bindExtensions` is its sole emitter), so every
 	// `session_start` consumer — most visibly the MCP extension's
 	// `loadConfig` + `startConnection` — is dead in an in-process child without
@@ -720,6 +720,13 @@ async function defaultSessionFactory(
 	// only calls `session.dispose()`). So `PI_LEGION_CHILD_MCP=0` means "exactly as
 	// before MR2": no MCP path, and no `session_start` either. Same lever as
 	// `collectChildExtensions`, on purpose — one judgment, not two.
+	//
+	// r3 C1: that same missing `session_shutdown` is what leaves MCP connected —
+	// it is the only disconnect path (`mcp/index.js:1114-1119`) and `dispose()`
+	// does not emit it, so a retired child's servers would run until the root
+	// exits. The release is armed unconditionally; it only emits for a session
+	// that was actually bound (see `releaseChildSessionExtensions`).
+	attachChildSessionRelease(session);
 	if (childEnablesMcp(process.env)) await bindChildSessionExtensions(session, input.name);
 	return session;
 }

@@ -1410,6 +1410,12 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	// check in `resolveLegionIdentity`. Do not replace this with env injection.
 	const childContext = currentChildContext();
 	const isChild = process.env.PI_SUBAGENT_CHILD === "1" || childContext !== undefined;
+	// `child-mcp-v1` D4 + r3 M3: an in-process child is a session the orchestrator
+	// gave an ALS context. Whatever shape that context has — a `stripLegionIdentity`
+	// utility child keeps `dbPath` and drops `nodeId` (`orchestrator.ts:1354-1356`) —
+	// its identity channel is the context, never `process.env`, which it shares with
+	// its parent. Both env-derived init points below are skipped for it.
+	const hasInjectedChildContext = childContext !== undefined;
 	const allowNested = process.env[ALLOW_NESTED_ENV] === "1" || childContext?.allowNested === true;
 	if (isChild) restoreHostNodeOptions();
 	else {
@@ -1591,9 +1597,16 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	};
 	if (isChild) {
 		registerChildGuard(pi);
-		if (process.env[LEGION_DB_ENV] && process.env[LEGION_NODE_ID_ENV]) {
+		// `child-mcp-v1` r3 M2: only an ENV-identified child (rpc: own process, own
+		// env) takes this boot path. An in-process child never does — its env is the
+		// parent's, so an rpc grandparent leaves `PI_LEGION_*` pointing at an
+		// ancestor, and this call passes no `sessionFile` ⇒ the credential check in
+		// `resolveLegionIdentity` is skipped entirely ⇒ ancestor db opened and a
+		// second postman started, with no reclaim point.
+		if (!hasInjectedChildContext && process.env[LEGION_DB_ENV] && process.env[LEGION_NODE_ID_ENV]) {
 			// Boot-time attach: no ExtensionContext yet, so no session credential —
-			// the session_start handler re-runs this with the real credential.
+			// the session_start handler re-runs this with the real credential (it is
+			// not skipped below, because `hasInjectedChildContext` is false here).
 			try { initializeLegionRuntime({ cwd: process.cwd() }); }
 			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 		}
@@ -1609,10 +1622,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// now runs here too — and must NOT initialize the legion runtime, because an
 		// in-process child shares the parent's `process.env`: under an rpc parent it
 		// would init on the ANCESTOR's `PI_LEGION_*` identity, get flipped to its own
-		// on this very event, and have no reclaim point (`session_shutdown` never
-		// fires for this transport — `InProcessSupervisor` only calls
-		// `session.dispose()`). The identity channel for this transport is
-		// `childContext` (ALS), never env; see the guard below.
+		// on this very event, and have no reclaim point. (`r3 C1` added one
+		// `session_shutdown` emit for the extension bind, but legion's runtime init is
+		// not part of it — `InProcessSupervisor` still only calls `dispose()`.)
 		if (childContext?.nodeId && childContext.dbPath) {
 			const legionNode = { dbPath: childContext.dbPath, nodeId: childContext.nodeId };
 			let attached = false;
@@ -1658,17 +1670,21 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	// `child-mcp-v1` D4: an in-process child now DOES receive `session_start`
 	// (`defaultSessionFactory` binds the session's extensions once, `child-session.ts`),
 	// so this handler is no longer dead for that transport. The guard is about
-	// IDENTITY, not about the event: a session holding the injected child identity
+	// IDENTITY, not about the event: a session holding an injected child context
 	// must not call `initializeLegionRuntime`, whose `resolveLegionIdentity` reads
 	// `PI_LEGION_*` from `process.env` — the parent's env, shared by every
 	// in-process child. With an rpc ancestor that means opening an ancestor's db and
-	// starting a second postman, with `session_shutdown` never firing to reclaim it.
-	// A root session is unaffected: no injected identity ⇒ the original path runs
+	// starting a second postman, with nothing to reclaim it (r3 C1's shutdown emit
+	// covers the extension bind, not this runtime init).
+	// The predicate is the whole context, not `nodeId && dbPath` (r3 M3): a
+	// `stripLegionIdentity` child has the dbPath but no nodeId, and the hazard is
+	// the env read, not the identity shape.
+	//
+	// A root session is unaffected: no injected context ⇒ the original path runs
 	// verbatim, and for a true root `initializeLegionRuntime` would resolve no
 	// identity anyway. The hygiene branch below is `!isChild` and stays as it was.
-	const hasInjectedChildIdentity = Boolean(childContext?.nodeId && childContext.dbPath);
 	pi.on("session_start", (_event, ctx) => {
-		if (!hasInjectedChildIdentity) {
+		if (!hasInjectedChildContext) {
 			try { initializeLegionRuntime({ cwd: ctx.cwd, sessionFile: ctx.sessionManager?.getSessionFile() }); }
 			catch (error) { console.error(`[pi-legion] legion initialization failed: ${error instanceof Error ? error.message : String(error)}`); }
 		}

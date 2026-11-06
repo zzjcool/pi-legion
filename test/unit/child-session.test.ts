@@ -19,6 +19,12 @@
  * `session_start` to every loaded extension (inherited third-party ones
  * included) and an in-process child has no `session_shutdown` to reclaim them,
  * so a second judgment for the bind would silently reopen that door.
+ *
+ * r3 C1 adds D7.5: the `session_shutdown` side. MCP's ONLY disconnect path is
+ * that event, `dispose()` does not emit it, and an in-process child is retired by
+ * `dispose()` alone — so a retired child would keep its MCP servers until the
+ * root exits. These five cases pin the emit (once, `reason: "quit"`, before the
+ * real dispose, even when the handler throws, and never for an unbound session).
  */
 
 import { test } from "node:test";
@@ -32,19 +38,48 @@ import {
 } from "../../src/runs/args.ts";
 import { childEnablesMcp as policyChildEnablesMcp } from "../../src/runs/extension-inheritance.ts";
 import {
+	attachChildSessionRelease,
 	bindChildSessionExtensions,
 	type ChildSessionBinding,
 } from "../../src/supervisor/child-session.ts";
 
-/** Records every bindings object it is handed; never touches the SDK. */
-function fakeSession() {
+/** What a fake session records: the bindings handed over, the call order, the events. */
+interface FakeOptions {
+	/** Whether the fake extension runner reports a `session_shutdown` handler. */
+	shutdownHandlers?: boolean;
+	/** Make `emit` reject, the way a throwing handler does. */
+	emitThrows?: boolean;
+}
+
+/** Records every bindings object it is handed and every call, in order. */
+function fakeSession(options: FakeOptions = {}) {
 	const calls: Array<{ mode?: "print"; onError?: (error: unknown) => void }> = [];
+	const order: string[] = [];
+	const events: Array<{ type: string; reason?: string }> = [];
 	const session: ChildSessionBinding = {
 		async bindExtensions(bindings) {
 			calls.push(bindings);
+			order.push("bind");
+		},
+		extensionRunner: {
+			hasHandlers: (event: string) => (options.shutdownHandlers ?? true) && event === "session_shutdown",
+			async emit(event) {
+				order.push("emit");
+				events.push(event);
+				if (options.emitThrows) throw new Error("shutdown handler exploded");
+				return undefined;
+			},
+		},
+		dispose() {
+			order.push("dispose");
 		},
 	};
-	return { session, calls };
+	return { session, calls, order, events };
+}
+
+/** Let the fire-and-forget `dispose()` chain (release → raw dispose) finish. */
+function settle(): Promise<void> {
+	return new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 /** Run `fn` with `console.warn` captured (restored even when it throws). */
@@ -115,13 +150,17 @@ test("D7.3 an unnamed child still binds (label is optional, bindings are not)", 
 	});
 });
 
-test("D7.3 a bind failure propagates instead of leaving a half-started session", async () => {
-	// `extendResourcesFromExtensions` runs inside bindExtensions and can throw. A
-	// child whose extensions were never told the session exists must not be handed
-	// back as healthy, so this is deliberately not caught.
+test("D7.3 a bind failure propagates (it is not swallowed)", async () => {
+	// `extendResourcesFromExtensions` runs inside bindExtensions and can throw.
+	// Rare, but a spawn whose extensions never learned the session exists must fail
+	// loudly rather than be handed back looking healthy — this pins “throws up” and
+	// claims nothing more than that.
 	const session: ChildSessionBinding = {
 		async bindExtensions() {
 			throw new Error("resources_discover exploded");
+		},
+		dispose() {
+			/* not exercised */
 		},
 	};
 	await assert.rejects(() => bindChildSessionExtensions(session, "root.worker"), /resources_discover exploded/);
@@ -129,7 +168,7 @@ test("D7.3 a bind failure propagates instead of leaving a half-started session",
 
 // ────────────── child-mcp-v1 r2 ──────────────
 
-test("r2: 'should bind' and the builtin:mcp path are one judgment (childEnablesMcp)", () => {
+test("r2: bind gate and builtin:mcp path read the same switch (childEnablesMcp)", () => {
 	// Same table as D7.1 (`args.test.ts`): only an explicit mask turns MCP off.
 	const ON: Array<string | undefined> = [undefined, "", "all", "1", "true", "on", "yes", "   ", "whatever", "MCP"];
 	const OFF = ["0", "false", "off", "no", "none"];
@@ -162,19 +201,105 @@ test("r2: 'should bind' and the builtin:mcp path are one judgment (childEnablesM
 	// One implementation, not two copies: `args.ts` re-exports the policy function.
 	assert.equal(childEnablesMcp, policyChildEnablesMcp, "args.ts must re-export childEnablesMcp, never re-implement it");
 
-	// And the factory's bind DECISION is that very function, read from the env the
-	// in-process child shares with its parent. A second judgment (or an
-	// unconditional bind) would bring `session_start` back for inherited
-	// third-party extensions while MCP is meant to be off.
+	// FORMAT TRIPWIRE, not a behavioral assertion: the factory is not exported, so
+	// the only mechanical check left is the call count in its source — one bind call
+	// (a second one dangles MCP connections). Counted per call; the surrounding line
+	// shape and `input.name` are deliberately not pinned.
 	const source = readFileSync(new URL("../../src/supervisor/inprocess-supervisor.ts", import.meta.url), "utf8");
-	assert.match(
-		source,
-		/if \(childEnablesMcp\(process\.env\)\) await bindChildSessionExtensions\(session, input\.name\);\n/,
-		"the one bind must stay gated on childEnablesMcp(process.env)",
-	);
 	assert.equal(
-		source.split("bindChildSessionExtensions(session, input.name)").length - 1,
+		source.split("bindChildSessionExtensions(").length - 1,
 		1,
-		"exactly one bind call in the factory — a second one dangles MCP connections",
+		"format tripwire: the factory file calls bindChildSessionExtensions( once",
+	);
+});
+
+// ────────────── child-mcp-v1 r3 C1 (D7.5) ──────────────
+
+test("D7.5 dispose emits session_shutdown once, reason=quit, before the real dispose", async () => {
+	const { session, order, events } = fakeSession();
+	await bindChildSessionExtensions(session, "root.scout");
+	attachChildSessionRelease(session);
+
+	session.dispose();
+	await settle();
+
+	assert.deepEqual(
+		events,
+		[{ type: "session_shutdown", reason: "quit" }],
+		"exactly one event, and only ever reason=quit (in-process has no reload/new/fork)",
+	);
+	assert.deepEqual(
+		order,
+		["bind", "emit", "dispose"],
+		"emit precedes dispose: the extension ctx must still be valid for the handlers' sync prefix",
+	);
+});
+
+test("D7.5 a throwing shutdown handler still gets disposed", async () => {
+	const { session, order } = fakeSession({ emitThrows: true });
+	await bindChildSessionExtensions(session);
+	attachChildSessionRelease(session);
+
+	await captureWarnings(async (warnings) => {
+		session.dispose();
+		await settle();
+		assert.deepEqual(order, ["bind", "emit", "dispose"], "dispose must run on the rejection path too");
+		assert.equal(warnings.length, 1, "the failure is reported, not silent");
+		assert.match(warnings[0]!, /in-process child session_shutdown failed/);
+	});
+});
+
+test("D7.5 repeated dispose() emits once (idempotent)", async () => {
+	const { session, order, events } = fakeSession();
+	await bindChildSessionExtensions(session);
+	attachChildSessionRelease(session);
+
+	session.dispose();
+	session.dispose();
+	await settle();
+	session.dispose();
+	await settle();
+
+	assert.equal(events.length, 1, "one shutdown, no matter how often the retire path disposes");
+	assert.deepEqual(order, ["bind", "emit", "dispose"], "and the real dispose runs exactly once");
+});
+
+test("D7.5 a session that was never bound emits nothing", async () => {
+	// `PI_LEGION_CHILD_MCP=0` ⇒ no bind ⇒ inherited host extensions must not see a
+	// shutdown they never got a start for. The dispose itself still happens.
+	const { session, order, events } = fakeSession();
+	attachChildSessionRelease(session);
+
+	session.dispose();
+	await settle();
+
+	assert.deepEqual(events, [], "no bind, no session_shutdown");
+	assert.deepEqual(order, ["dispose"], "the dispose still happens");
+});
+
+test("D7.5 no session_shutdown handler ⇒ no emit", async () => {
+	// The SDK's own rule (`emitSessionShutdownEvent`): `hasHandlers` first, then
+	// `emit`. A session with no handler must not be handed the event anyway.
+	const { session, order, events } = fakeSession({ shutdownHandlers: false });
+	await bindChildSessionExtensions(session);
+	attachChildSessionRelease(session);
+
+	session.dispose();
+	await settle();
+
+	assert.deepEqual(events, [], "hasHandlers() === false ⇒ nothing emitted");
+	assert.deepEqual(order, ["bind", "dispose"], "and dispose still runs");
+});
+
+// FORMAT TRIPWIRE, not a behavioral assertion: the factory is not exported, so the
+// only mechanical check that the release is ARMED at all is its call count in the
+// source. Without it, deleting `attachChildSessionRelease(session)` leaves every
+// behavioral case green while MCP connections leak again — the C1 bug itself.
+test("r3 C1 wiring: the factory arms the release exactly once (format tripwire)", () => {
+	const source = readFileSync(new URL("../../src/supervisor/inprocess-supervisor.ts", import.meta.url), "utf8");
+	assert.equal(
+		source.split("attachChildSessionRelease(").length - 1,
+		1,
+		"format tripwire: the factory file calls attachChildSessionRelease( once",
 	);
 });

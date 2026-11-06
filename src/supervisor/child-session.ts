@@ -29,7 +29,19 @@
  * Call it EXACTLY ONCE. There is no idempotence guard, and the MCP extension
  * overwrites its `AbortController` on every `session_start` without aborting the
  * previous one (`mcp/index.js:980`) — a second bind leaves dangling connections.
+ *
+ * `session_shutdown` is the matching OTHER half (`child-mcp-v1` r3 C1): it is
+ * MCP's only disconnect path, `dispose()` does not emit it, and an in-process
+ * child is retired by `dispose()` alone — so {@link attachChildSessionRelease}
+ * emits it on the way out. A session that was never bound must not see it (the
+ * event is only owed to extensions that were told the session started).
  */
+
+/** What `AgentSession.extensionRunner` exposes that this module needs. */
+export interface ChildExtensionRunner {
+	hasHandlers(event: string): boolean;
+	emit(event: { type: "session_shutdown"; reason: "quit" }): Promise<unknown>;
+}
 
 /** The slice of `AgentSession` this module needs. Structural, so tests need no SDK. */
 export interface ChildSessionBinding {
@@ -37,6 +49,9 @@ export interface ChildSessionBinding {
 		mode?: "print";
 		onError?: (error: unknown) => void;
 	}): Promise<void>;
+	/** Public getter on `AgentSession` (`agent-session.d.ts:937`). */
+	extensionRunner?: ChildExtensionRunner;
+	dispose(): void;
 }
 
 /**
@@ -79,4 +94,95 @@ export async function bindChildSessionExtensions(
 			console.warn(`[pi-legion] in-process child${label} extension error: ${describeExtensionError(error)}`);
 		},
 	});
+	// Recorded only after a successful bind: `releaseChildSessionExtensions` owes a
+	// shutdown exactly to the sessions whose extensions were told `session_start`.
+	boundSessions.add(session);
+}
+
+/**
+ * Sessions whose extensions were bound, i.e. that are owed a `session_shutdown`.
+ *
+ * Module-level because the cleanup happens where the session dies, not where it
+ * was bound. Weak, so a retired session is not kept alive by this bookkeeping.
+ */
+const boundSessions = new WeakSet<object>();
+
+/** Bound the shutdown emit so a wedged handler cannot keep a dead session alive. */
+const SHUTDOWN_EMIT_TIMEOUT_MS = 1000;
+
+/**
+ * Emit `session_shutdown` once for a bound in-process child session (r3 C1).
+ *
+ * Why this is mandatory rather than nice-to-have: `pi.on("session_shutdown", …)`
+ * is the ONLY path that discards MCP connections (`mcp/index.js:1114-1119` —
+ * `session.abort()` + `connection.close()`), `AgentSession.dispose()` does not
+ * emit it, and an in-process child is retired by `dispose()` alone. Without this,
+ * every retired child's MCP server processes outlive it until the root exits.
+ *
+ * The body is the SDK's own `emitSessionShutdownEvent` (`runner.js:80-86`):
+ * `hasHandlers` first, then `emit`. Both are PUBLIC members of
+ * `session.extensionRunner` — deliberately no `dist/...` deep import, which the
+ * package's `exports` map does not allow. `reason` is only ever `"quit"`: an
+ * in-process child has no reload / new / resume / fork.
+ *
+ * Never rejects and never hangs: a failed or wedged handler is reported and the
+ * caller's `dispose()` still runs. No-ops for a session that was never bound
+ * (`PI_LEGION_CHILD_MCP=0` means no bind, so inherited host extensions must not
+ * receive a shutdown they never got a start for).
+ */
+export async function releaseChildSessionExtensions(session: ChildSessionBinding): Promise<void> {
+	// `delete` is the once-guard: the first caller takes the entry, later ones see
+	// false and stay silent (two `dispose()` calls, two retire paths, …).
+	if (!boundSessions.delete(session)) return;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const runner = session.extensionRunner;
+		if (!runner?.hasHandlers("session_shutdown")) return;
+		await Promise.race([
+			runner.emit({ type: "session_shutdown", reason: "quit" }),
+			new Promise<void>((resolve) => {
+				timer = setTimeout(resolve, SHUTDOWN_EMIT_TIMEOUT_MS);
+				timer.unref?.();
+			}),
+		]);
+	} catch (error) {
+		// Reported, not rethrown: the session and its MCP connections must still be
+		// released, so the caller's `dispose()` runs on the rejection path too.
+		console.warn(`[pi-legion] in-process child session_shutdown failed: ${describeExtensionError(error)}`);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+/**
+ * Route `session.dispose()` through {@link releaseChildSessionExtensions} (r3 C1).
+ *
+ * Idempotent (a second `dispose()` is a no-op), emits BEFORE disposing — the
+ * shutdown handlers' synchronous prefix (MCP aborts its controller and starts
+ * closing every connection) must run while the extension ctx is still valid,
+ * and `dispose()` invalidates it — and disposes even when the emit fails.
+ *
+ * Installed unconditionally by `defaultSessionFactory`; whether an event is owed
+ * is decided by {@link releaseChildSessionExtensions}, not by the caller.
+ *
+ * Exported because `defaultSessionFactory` is not (contract §6 gap 1): without
+ * this seam the five D7.5 assertions would have nothing to call.
+ */
+export function attachChildSessionRelease(session: ChildSessionBinding): void {
+	const rawDispose = session.dispose.bind(session);
+	let disposing = false;
+	session.dispose = () => {
+		if (disposing) return;
+		disposing = true;
+		void releaseChildSessionExtensions(session).then(() => {
+			try {
+				rawDispose();
+			} catch (error) {
+				// `dispose()` is called fire-and-forget on the retire path, so a throw
+				// here would surface as an unhandled rejection rather than a failed
+				// retire. Report it and let the retire finish.
+				console.warn(`[pi-legion] in-process child dispose failed: ${describeExtensionError(error)}`);
+			}
+		});
+	};
 }
