@@ -394,7 +394,7 @@ test("subagent remains compatible with misconfigured utility roles and enforces 
 		assert.equal(supervisor.spawns[0]?.input.env?.PI_SUBAGENT_ALLOW_NESTED, undefined);
 		assert.equal(supervisor.spawns[0]?.input.allowNestedSubagents, undefined);
 		const toolsIndex = supervisor.spawns[0]?.args.indexOf("--tools") ?? -1;
-		assert.equal(supervisor.spawns[0]?.args[toolsIndex + 1], "read,grep,find,ls", "utility roles must not inherit vexillatio");
+		assert.equal(supervisor.spawns[0]?.args[toolsIndex + 1], "read,grep,find,ls,legion_mail,legion_tree,legion_phase", "utility roles must not inherit vexillatio");
 	});
 });
 
@@ -410,7 +410,7 @@ test("non-utility child allowlists include vexillatio without widening subagent 
 		const spawn = supervisor.spawns[0];
 		assert.ok(spawn);
 		const toolsIndex = spawn.args.indexOf("--tools");
-		assert.equal(spawn.args[toolsIndex + 1], "read,grep,find,ls,vexillatio");
+		assert.equal(spawn.args[toolsIndex + 1], "read,grep,find,ls,vexillatio,legion_mail,legion_tree,legion_phase");
 		assert.equal(spawn.args[toolsIndex + 1]?.includes("subagent"), false);
 		assert.equal(spawn.input.env?.PI_SUBAGENT_UTILITY_CHILD, undefined);
 	});

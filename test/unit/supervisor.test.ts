@@ -298,7 +298,7 @@ test("spawn passes the complete buildPiArgs CLI context and starts the first pro
 		const toolsIndex = args.indexOf("--tools");
 		assert.ok(toolsIndex >= 0);
 		// REV-17.7 §2.7: non-utility allowlists include the separate recon tool.
-		assert.equal(args[toolsIndex + 1], "read,bash,vexillatio");
+		assert.equal(args[toolsIndex + 1], "read,bash,vexillatio,legion_mail,legion_tree,legion_phase");
 		assert.ok(args.includes("--extension"));
 		assert.ok(args.includes("/tmp/example-extension.ts"));
 		assert.ok(args.includes("--append-system-prompt"));
