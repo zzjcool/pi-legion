@@ -153,8 +153,13 @@ export async function releaseChildSessionExtensions(
 		await Promise.race([
 			runner.emit({ type: "session_shutdown", reason: "quit" }),
 			new Promise<void>((resolve) => {
+				// NOT `unref()`ed on purpose. This timer is the only thing that can settle
+				// a wedged emit, so it must keep the loop alive: unref'd, a process whose
+				// remaining work is just this promise exits without ever running
+				// `dispose()` (measured in CI as "Promise resolution is still pending but
+				// the event loop has already resolved"). Clearing it in `finally` bounds
+				// the cost to one second of loop keep-alive after a hung handler.
 				timer = setTimeout(resolve, timeoutMs);
-				timer.unref?.();
 			}),
 		]);
 	} catch (error) {
