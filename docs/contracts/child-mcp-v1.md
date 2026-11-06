@@ -506,7 +506,7 @@ emit 永不 resolve 时 `dispose` 仍然在超时后跑到。
 
 1. in-process 子会话退役现在是 `await dispose()`：包含一次 `session_shutdown` emit，
    最坏多 1000ms（典型 <100ms）后才 `emitSlotReleased`。
-2. 该 emit 会让子会话跑完整的 `shutdownRetireAll`：写 `node_retired{reason: session_interrupt}`、
+2. 该 emit 会让子会话跑完整的 `shutdownRetireAll`：写 `node_retired{reason: "session-shutdown"}`、
    `print` 模式先 drain、并退役**它自己的**子节点（嵌套 centurion 时才存在）。与 rpc 子会话同形，
    不是新语义，但此前 in-process 不会发生。
 

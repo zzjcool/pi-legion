@@ -1762,7 +1762,12 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 
 			try {
 				const children = sessionRuntime?.activeJobs() ?? [];
-				sessionRuntime?.dispose();
+				// Isolated on purpose: `dispose()` runs host callbacks
+				// (`deps.emitBusy` / `job.unsubscribeRpcEvents`) that may throw, and a throw
+				// here must not skip the children's retirement below — the ledger is closed
+				// in `finally` regardless, so leaving live children behind would point them
+				// at a closed database.
+				try { sessionRuntime?.dispose(); } catch { /* retirement below still runs */ }
 				const shutdownRetire: RetireOptions = { cause: "session-shutdown" };
 				await Promise.all([
 					...children.map((job) => job.retire?.(shutdownRetire).catch(() => {})),
@@ -1919,8 +1924,8 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	});
 	if (process.env[UTILITY_CHILD_ENV] === "1") {
 		// r4 F1: a session's shutdown must never sweep handles it does not own. An
-		// identity-less utility child never adopts a key, and `stopLegionRuntime(
-		// undefined)` would close the root's handle (and every sibling's), because
+		// identity-less utility child never adopts a key, and an unrestricted sweep
+		// would close the root's handle (and every sibling's), because
 		// `legionIdentities` is process-shared (#283/#285).
 		pi.on("session_shutdown", () => {
 			if (ownLegionKey !== undefined) stopLegionRuntime(ownLegionKey);

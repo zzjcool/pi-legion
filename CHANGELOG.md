@@ -28,7 +28,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   时压根不 bind，也就不补发。
   **延迟与语义**：in-process 子会话退役现在是 `await dispose()`——含一次 `session_shutdown` emit，
   最坏多 1000ms（典型 <100ms）才 `emitSlotReleased`；而这次 emit 会让子会话跑完整的
-  `shutdownRetireAll`（写 `node_retired{reason: session_interrupt}`、`print` 模式先 drain、并退役
+  `shutdownRetireAll`（写 `node_retired{reason: "session-shutdown"}`、`print` 模式先 drain、并退役
   **它自己的**子节点，嵌套 centurion 时才存在）。与 rpc 子会话同形，不是新语义，但此前 in-process
   不会发生。
   **代价（实测）**：MCP 连接是每个子会话各开一份——5 个并发子会话 × 1 个 server = 18 个进程 / 1121 MB。

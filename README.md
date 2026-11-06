@@ -517,7 +517,7 @@ Two consequences of that release path, stated plainly. Retiring an in-process
 child is now `await dispose()`: one `session_shutdown` emit happens first, so the
 slot is freed up to 1000 ms later (typically well under 100 ms). And that emit
 runs the child's **own** full `session_shutdown` handler — it writes the
-`session_interrupt` marker, drains first in `--print`, and retires its own
+`session-shutdown` marker, drains first in `--print`, and retires its own
 children (only if it was a nested centurion). That is exactly what an rpc child
 already did; it just never happened for in-process children before.
 
