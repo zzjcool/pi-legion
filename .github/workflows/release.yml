@@ -9,6 +9,9 @@ on:
 
 permissions:
   contents: write
+  # npm trusted publishing (OIDC): the job exchanges this token for a
+  # short-lived publish credential instead of a stored NPM_TOKEN.
+  id-token: write
 
 jobs:
   release:
@@ -117,47 +120,26 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, '-') }}
 
-      - name: Setup npm auth
+      - name: Setup npm publish
         uses: actions/setup-node@v7
         with:
           node-version: 22
           check-latest: true
           registry-url: https://registry.npmjs.org
 
-      # Deps are installed with npm above. Staging still uses the npm CLI.
-      # CI only stages the package on npm. It does not formally publish.
-      # A maintainer must complete npm 2FA (`npm stage approve`) afterwards.
-      # NPM_TOKEN is a granular token with Read and write (stage only), which
-      # can stage and cannot publish directly.
-      # Requires npm CLI >= 11.15 and Node >= 22.14. node-version 22 with
-      # check-latest already satisfies the Node requirement. Node 22 still
-      # bundles npm 10, so install the npm 11 CLI before staging.
-      - name: Pack tarball
+      # Trusted publishing (npm OIDC). No NPM_TOKEN and no manual stage
+      # approval: the registry trusts this repository + workflow filename
+      # (`release.yml`), and `id-token: write` lets the npm CLI exchange the
+      # job's OIDC token for a short-lived publish credential. Provenance is
+      # attached from the same token, so the tarball is verifiably built from
+      # this commit.
+      #
+      # Requires npm CLI >= 11.5.1 for the exchange (Node 22 still bundles npm
+      # 10, hence the upgrade) and Node >= 22.14, which `node-version: 22` with
+      # `check-latest` already satisfies.
+      - name: Publish to npm (trusted publishing)
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/pack"
-          npm pack --pack-destination "${RUNNER_TEMP}/pack"
-          ls -l "${RUNNER_TEMP}/pack"
-
-      - name: Stage on npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "::error::Repository secret NPM_TOKEN is not set."
-            echo "::error::The GitHub Release exists but nothing was staged."
-            echo "::error::Add the stage-only token as NPM_TOKEN, then re-run."
-            exit 1
-          fi
           npm install -g npm@^11.15.0
-          tarball=$(ls "${RUNNER_TEMP}"/pack/pi-legion-*.tgz)
-          mkdir -p "${RUNNER_TEMP}/stage"
-          cd "${RUNNER_TEMP}/stage"
-          if ! npm stage publish "${tarball}"; then
-            echo "::error::npm stage publish failed; nothing is live."
-            echo "::error::A maintainer must approve the stage with 2FA."
-            exit 1
-          fi
-          echo "Staged only. pi-legion is not live."
-          echo "A maintainer must run: npm stage approve <stage-id>"
+          npm publish --provenance --access public
+          echo "Published $(node -p "require('./package.json').name + '@' + require('./package.json').version") with provenance."
