@@ -3,6 +3,102 @@
 状态：**FROZEN** — 实施中禁止偏离。发现矛盾立刻停下报告，不要自圆其说。
 范围：planning only。本文件冻结接口、闸门分类、状态机、文件归属与验收；不含实现。
 
+## REV — 落地校正（2026-11-07）
+
+本节是**实测对账**，不是新决策：正文与 §13 一字未删，此处记录「当初写的」与「代码实际落的」。
+行号均为 2026-11-07 在 `master`（`95a4c9a`）上重新实测。凡标 **MISMATCH** 的条目，正文原句**已失效**；
+reviewer 判「缺失」前先读本节。
+
+### REV-1 — D7（abort flush）→ **MISMATCH：session 退出不清队列（待收口的代码缺口）**
+
+- **实测调用点只有两个**：`index.ts:3843`（父 turn 结束，`interruptedResult()` 路径）与
+  `index.ts:4667`（`vexillatio` 的同类路径）。`shutdownRetireAll`（`index.ts:1736-1794`）内**没有**
+  `flushLaunchQueue`：它只做 `drainBeforeShutdown()`（`:1767`）→ `sessionRuntime.dispose()`（`:1778`）→
+  `job.retire({cause:"session-shutdown"})` + `pendingUtilityRetires`（`:1779-1783`）。
+- **当前实际清理由是间接的**：`job.retire → Orchestrator.retire`（`src/runs/orchestrator.ts:3000`）的
+  `state === "queued"` 分支（`:3004-3024`）= `existingAdmissionQueue()?.remove(name)` + `abandonQueued(...)`
+  + 标 `retired`，零 spawn、零账本行 —— 与 D7 第 2 条（stop 一个排队项）语义一致。
+- 但这**不是** D7 第 3 条要求的「shutdown 清空队列」。`flushLaunchQueue` 自己的注释
+  （`orchestrator.ts:2093-2098`）仍写 "Called from the parent turn's abort path and from session shutdown"
+  —— 这句注释本身也是过期断言（实测无 shutdown 调用点）。
+- **必须按「待收口的代码缺口」对待，不是「已复核的等价实现」。** 两个风险（只记录，本节不含代码改动）：
+  1. **未被 runtime 跟踪的排队项可能残留**：`flushLaunchQueue` 故意只清「本实例持有 guard」的项
+     （`orchestrator.ts:2104-2118`，含 `const mine = queue.entries().filter(... launchGuards.has ...)` `:2111`；
+     注释理由是清兄弟实例的项会留下永久 `queued` 僵尸），而 shutdown 只 retire
+     `sessionRuntime.activeJobs()` + `pendingUtilityRetires`（`index.ts:1772-1783`）。owner Orchestrator 不在
+     activeJobs 里的队列项**既不会被 flush 也不会被 retire**。队列是进程级注册表（`runDir` + `pid`，§13.6），
+     进程退出即消失，故这是**内存残留**而不是磁盘泄漏；但同一进程内若 shutdown 之后仍有存活的 Orchestrator
+     （嵌套 in-process 会话、非退出型 shutdown），它仍会继续 pump 这些项。
+  2. **`armQueueWatchdog` 的 `unref` 不构成 shutdown 关闭态**：`orchestrator.ts:1804-1833` 的
+     `timer.unref?.()`（`:1831`）只保证「不让 host 进程为了盯空队列而活着」，**不**保证 shutdown 后不再准入；
+     `src/supervisor/admission-queue.ts` 没有 closed/dispose 概念（只有测试用的 `resetAdmissionQueuesForTests`
+     `:501-503`），到点的定时器照样会唤醒 `pumpAdmissions`。
+- 收口建议（应另开**代码**工单，不在本文件范围）：`shutdownRetireAll` 对每个 active job 的 orchestrator
+  调一次 `flushLaunchQueue("session shutdown")`，或给 `AdmissionQueue` 加 shutdown 关闭态让 `pump` 直接返回。
+
+### REV-2 — D8（顺序与 `async:false`）→ **MISMATCH（有意的既有偏离：死锁论证优先于「顺序不变」）**
+
+正文写「`async: false`：逐个『准入→再收集』（现有 `collectInline` 顺序不变）」。实测 `index.ts`：
+
+- `collectInline`（`:4227`）先算 `queuedHere`（`:4236-4241`，取 `childrenSnapshot()` 里 `state === "queued"` 的名字），
+  再用 `ordered`（`:4242-4245`）把 queued handle **排到最后**。代码注释给了死锁论证（`:4228-4235`）：queued
+  handle 是 `launch()` 同步返回的，落在真 spawn 的兄弟**之前**，按原顺序 collect 会先阻塞在 queued 项上，
+  而释放槽位只能靠先 collect 那些兄弟 —— 是死锁不是等待。每个分组内保持 launch 顺序，故**无队列时顺序逐字不变**。
+- 新增行为（`:4265-4275`）：collect 之后若 `launchQueueEntries().length > 0` 且
+  `shouldRecycleAfterCollect(collected.execution.status)`，立即 `await retire(name)` —— 否则顺序 collect 会
+  等一个只有下一项才能释放的槽位（`maxChildrenPerNode: 1` 时死锁）。
+- 另有 `collectThroughAdmission`（`:4197-4215`）：仅 `async:false` 顺序路径使用，跨 `pumpAdmissions`
+  「删 `queued` 占位 → 重放真 launch」的微任务窗口，对 `ErrorCodes.NOT_FOUND` 做有界重试
+  （`ADMISSION_SETTLE_TIMEOUT_MS = 5_000` `:4223` / `ADMISSION_SETTLE_POLL_MS = 25` `:4224`）；`async:true`
+  不走它（其 watcher 自行 re-arm，重试循环会与 watcher 抢）。
+- **现行行为**：非 queued 优先 + 分组内保序 + 队列非空时 collect 后立即 retire。正文的「`collectInline` 顺序不变」已失效。
+
+### REV-3 — D12（两个进程级事件）→ **MISMATCH：只登记类型，全仓无发射器**
+
+- `launch_queued` / `launch_admitted` 只出现在 `src/extension/event-bus.ts:29-30`
+  （`LEGION_PROCESS_EVENT_TYPES`，数组本体 `:19-31`；正文写的 `:10-21` 同样已过期）。
+  `rg -n 'launch_queued|launch_admitted' src index.ts` 全仓**只命中这两行** —— 零发射点，D12 冻结的
+  data 形状（`{name,parentKey,position,queueSize,maxPending,gate,dimension,message}` /
+  `{name,parentKey,waitedMs,position}`）**没有任何实现**。§13.3/D3-a 允许的「`launch_queued` 进程事件」目前不存在。
+- 观测实际走 D9 的两条通道：`setLaunchQueueListener`（`src/supervisor/admission-queue.ts:307-311`）与
+  `OrchestratorDeps.onLaunchQueueNotice`（`orchestrator.ts:154`，`index.ts` 接线 `:1340`/`:3797`/`:4509`）。
+- 结论：**类型已登记、暂无发射器**。新增发射器属于代码工单，不是本契约的验收缺口。
+
+### REV-4 — D9（观测）→ 四处里两处需按实测改写
+
+1. **UI pill 的 `· 8/8 slots busy` 是死代码路径**：`LaunchQueueEvent.slotsInUse` / `.slots`
+   （`admission-queue.ts:507-516`）**没有任何 emitter 赋值** —— 模块内 6 个 `emit(...)` 调用点
+   （`:343` overflow / `:359` queued / `:378` stopped / `:387` flushed / `:401` expired / `:407` admitted）
+   只带 `name/position/waitedMs/queued/message`。因此 `index.ts:1439-1440` 的
+   `· ${slotsInUse}/${slots} slots busy` 后缀永不成立，pill 恒为 `legion-queue: N queued`
+   （`index.ts:1432-1436` 的注释声称「契约显式允许省略该维度」，但字段留在 interface 里、分支也还在，
+   读者会以为它可达）。
+2. **§13.4 的「`async:false` 时同一行也进 tool result」不准**：实测进 tool result 的是
+   `↳ <name> waited <N>s in the launch queue`（`index.ts:619-622` `queuedWaitLine`，读
+   `ChildRecord.queueWaitedMs`），**不是** `▶ <name> started after queued <N>s`。后者只经
+   `orchestrator.ts:1976` 的 `this.notice(...)` → `onLaunchQueueNotice` → `pi.sendMessage`（notice 通道），
+   不入 tool result。
+3. 其余两处抽检一致：启动行后缀 ` queued(<pos>)`（`index.ts:607-610`）、`status` 的 `state=queued`
+   字面渲染（child 记录字段直出，`src/extension/runtime.ts:563`；`queued` 未被映射成 working/launching）。
+
+### REV-5 — D2 的**理由**过期（结论仍成立，且更成立）
+
+- **实测已变的前提**：`#279` 之后 in-process **也**扣账本门。`probeAdmission` 的 `ctx.inProcess` 分支
+  （`src/runs/orchestrator.ts:1611-1620`）先调 `probeLedgerAdmission`（`:1549-1610`），in-process 因此同样受
+  `max_children_per_node` / `max_active_nodes` 约束，两条闸门取更严者；`launch()` 里的
+  `assertWithinBudgets` 也已去掉 `!inProcess` 守卫（注释 `:1201-1210`："this check now covers EVERY backend"）。
+  故 D2 理由里的「in-process 子在账本门被放宽到无限（F3）」**已不成立**；§1 表 F3 的行号
+  （`orchestrator.ts:385-396`）也已完全漂移（现为 `deriveAcceptance`/`preCreateSessionFile` 等无关代码）。
+- **结论不变**：排队只放 `Orchestrator`、supervisor 只给只读探测 + 一个回调，这个 single choke point 仍然正确，
+  而且比原来更必要（两个后端共享账本门，两套调度器必然漂移）。**需要更新的是 D2 的理由与 §1 F3，不是 D2 的判定。**
+
+### 其余抽检结论
+
+其余 17 条（D1/D1-a/D1-b/D2/D2-a..d/D3/D3-a/D4/D5/D6/D6-a/D8-a/D10/D11）抽检与代码一致（含
+`admission-queue.ts` 纯模块零 `fs`/`path`/timer/`process.env` import（`:11-18` 声明，源码对照）、四条闸门文案
+单源 `evaluateInProcessAdmission`（定义 `:154`，消费者 `inprocess-supervisor.ts:1422/1469` 与
+`orchestrator.ts:1628`）、快路径在同一个同步块里 `admitting.set`（`orchestrator.ts:1265-1274`）），正文不重写。
+
 ## 0. 目标与不做的事
 
 **目标**：把「超过并发/扇出上限 → 抛 `BUDGET_EXCEEDED` 让调用方自己重试」改成

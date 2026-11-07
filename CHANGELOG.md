@@ -23,6 +23,10 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - `src/shared/types.ts` 中 `phases` 的注释改为 #371 语义（原文仍写「省略 = 内置四阶段」）。
 - contracts 归档纪律：`esc-cascade-v2` / `esc-abort-v1` / `drop-non-pi-kinds-v4` 移入 `docs/contracts/archive/`（抬头标 HISTORICAL / LANDED）；`retire-hardening-contract.md` 改名 `docs/contracts/retire-hardening-v1.md`（仍生效）；`spawn-mode-visibility-v1` 标 `implemented` 并修正已失效的验收命令；`declarative-phase-machine-v5` 的 `draft` 改 `implemented`；stall 两类阈值的术语消歧。
 - 孤儿文档归档到 `docs/archive/`：`qa-hunting-round`（依赖的角色卡不在本仓库）、`performance-2026-10-19`（v3.1.0 测量快照）、`legion-v2-delivery`（v2 交付账本）。
+- `launch-admission-queue-v1` 新增 `REV — 落地校正` 小节：实测 D7（shutdown 不清队列）、D8（`collectInline` 有意重排）、D9（pill 的 slots 维度无可达发射点）、D12（两个进程事件只登记不发射）与正文不符，正文保留、实测写在 REV；D2 的论证依据（F3）已被 #279 取代。
+- `legion-v2-contract`：重名错误码明确为 `NAME_TAKEN`；删除不存在的 `legion-gc` 入口（worktree 仅由 launch 失败回滚删除，hygiene 保留）；`tree_finalized` 标注“闭集已登记、无发射点”。
+- viz 契约标注证据链：门槛只在本机 `bench/perf-core/10-legion-frame-alloc.ts:431-436` 与测试断言中，完整报告未入库（`reports/` 被忽略）、CI 不采集。
+- `osc-busy-plugin`：把“不得 printf OSC 7501”明确为**调用方纪律、非运行时守卫**（Non-goals 就不解析子进程 stdout）。
 
 ## [5.5.0] — 2026-11-07
 

@@ -100,6 +100,14 @@ avg 归属外逐字节不变（既有快照用例守）。
 
 ## §3 实测（120×40 / 200 节点，真 `Theme(dark)`）
 
+**证据（截至本行，仓库内的现状）**：R1/R2 的数字**落成在用例里**，不在存档里——
+`test/unit/legion-viz.test.ts:2467-2485` 断言 `walked` 10 / `skipped` 190、整轮窗口回到 200，
+并用逐桶 `deepEqual` 对比不过滤的参考实现；那是断言，不是一次存档的门禁输出。§3 下面的表格
+是当轮在本机跑出来的测量记录，唯一**入库**的是 `CHANGELOG.md:485-489` 的摘要；完整报告未入库
+（`reports/` 见 `.gitignore:30`，`git ls-files reports` = 0），CI 也不采集
+（`.github/workflows/ci.yml`、`release.yml` 均无 bench 步骤）。所以本契约没有入库的存档结果，
+复现路径只有本地重跑测量脚本。
+
 ### 3.1 上一轮（r1）记录：master vs 分支
 
 基准机与 issue 不同，**比值**是可迁移的（同机、同脚本、同 flag 前后各跑两遍）。

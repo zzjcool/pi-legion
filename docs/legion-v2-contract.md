@@ -245,7 +245,7 @@ CREATE INDEX idx_messages_rate ON messages(from_node, created_at);   -- from_nod
 
 ### 4.3 事件类型枚举（闭集，新增需修订契约）
 
-`node_launched` `node_settled` `node_failed` `node_retired` `node_resumed` `node_blocked` `node_abandoned` `node_handled` `phase_change` `phase_timeout` `mail_sent` `mail_delivered` `mail_bounced` `budget_refused` `orphan_detected` `tree_finalized`
+`node_launched` `node_settled` `node_failed` `node_retired` `node_resumed` `node_blocked` `node_abandoned` `node_handled` `phase_change` `phase_timeout` `mail_sent` `mail_delivered` `mail_bounced` `budget_refused` `orphan_detected` `tree_finalized`（注：该事件名只在闭集登记，src/ 与 index.ts 无发射点，详见 §15 REV-32③）
 
 共 16 种，与 `src/legion/events.ts` 的 `LEGION_EVENT_TYPES` 逐项对齐：`node_abandoned` 由 hygiene 的
 `markAbandoned` 写（#233），`node_handled` 是 #309 的失败处理审计（见 `docs/contracts/partial-failure-exit-v1.md`），
@@ -268,7 +268,7 @@ CREATE INDEX idx_messages_rate ON messages(from_node, created_at);   -- from_nod
 ## 5. 节点标识与命名
 
 - **node id** = `<父id>.<name-slug>`，根节点 id 为 `root`；例：`root.centurion-fe`、`root.centurion-fe.worker-a2`
-- name-slug 语法 = `[a-z][a-z0-9_-]{0,31}`（与 src/shared/name.ts 的 herdr 名字语法一致，**禁止点号**——点是 id 分隔符；`sanitizeNameForFs` 不适用于 slug，因其允许点号会制造 `a.b` vs `a`+`b` 的 id 歧义）。**父内唯一**，重名拒绝（BUDGET_EXCEEDED 同级错误通道）；launch 时的 `name` 参数先按 makeName 风格净化到该语法再拼 id
+- name-slug 语法 = `[a-z][a-z0-9_-]{0,31}`（与 src/shared/name.ts 的 herdr 名字语法一致，**禁止点号**——点是 id 分隔符；`sanitizeNameForFs` 不适用于 slug，因其允许点号会制造 `a.b` vs `a`+`b` 的 id 歧义）。**父内唯一**，重名拒绝返回 **`NAME_TAKEN`**（`ErrorCodes.NAME_TAKEN`，`src/runs/orchestrator.ts:641` 的 `legion child already exists`；「名字已绑定到别的 nodeId」同码 `:751`）。**REV-32① 实测订正**：原句写作「BUDGET_EXCEEDED **同级**错误通道」——同级但不**同码**，实现从不返回 `BUDGET_EXCEEDED`，勿把重名当成预算拒绝去重试。launch 时的 `name` 参数先按 makeName 风格净化到该语法再拼 id
 - RPC 子进程不在 herdr 命名空间，全局撞名问题（F16）随之消失；树内寻址一律用 node id
 - 工具寻址简写：对**自己的直接子节点**可用短名；`legion_mail` 的 `parent`/`squad`/`children` 广播糖在发送方 supervisor 内展开
 
@@ -343,7 +343,7 @@ npm test -- --filter <scope>
 1. verifying 全绿 → supervisor 迁移 phase=done（事件）
 2. 注入收队 prompt：汇总 verdict、squash 到分支（有 remote 时开 MR）
 3. centurion settle → 其父 collect → retire centurion
-4. worktree 保留至根节点合 MR 后由 `legion-gc` 清理（文件不删库记录）
+4. worktree **无自动清理入口**：合 MR 后**不删**，保留为 resume 凭据；唯一删除路径是 launch 失败回滚（`src/runs/orchestrator.ts:1466` → `src/runs/worktree.ts:310` `removeChildWorktree` 的 `git worktree remove --force` `:317`），且 `src/runs/hygiene.ts` 把带 `worktrees/` 的 run 目录排除在 prune 之外（说明 `:16`、`hasWorktrees` `:145`、判据 `:217`）。**REV-32② 实测订正**：原句所称的 GC 清理命令在仓库里不存在（全仓检索只命中本文原有两行）；不要期待合 MR 后有人来删 worktree——需要清理时由人手动 `git worktree remove`
 
 ## 8. 通信协议
 
@@ -486,7 +486,7 @@ interface LegionEventBus {
 
 ### 11.2 心跳与孤儿：postman 循环每次刷新直接子节点 `updated_at`。根 supervisor 每 60s 扫描：非终态 + `updated_at` 超 90s = `orphan_detected` 事件 + mail 通知 CEO。恢复 = resume 链（CEO 裁决，auto-resume 默认关）。孤儿判定可判定化：**非终态 ∧ 无活跃进程 ∧ 心跳超时**。
 
-### 11.3 泄漏四闸门：进程（终态自动 retire + phase 超时兜底）／预算（§11.1 + usage 表入账）／状态（终态闭集 + 孤儿扫描）／文件（**故意不防**：worktree/jsonl 是 resume 凭据，MR 合并后 `legion-gc` 清理，只删文件不删库记录）。
+### 11.3 泄漏四闸门：进程（终态自动 retire + phase 超时兜底）／预算（§11.1 + usage 表入账）／状态（终态闭集 + 孤儿扫描）／文件（**故意不防**：worktree/jsonl 是 resume 凭据；**当前无自动清理入口**——worktree 一律保留，唯一删除路径是 launch 失败回滚（`orchestrator.ts:1466` → `worktree.ts:310`），hygiene 也把带 `worktrees/` 的 run 目录排除在 prune 之外（`hygiene.ts:16/145/217`）；REV-32②）。
 
 ### 11.4 v2 settings 增量
 
@@ -596,3 +596,4 @@ interface LegionEventBus {
 | 2026-11-03 | REV-29 | **交付物是分支，MR 只是有 remote 时的便利**（措辞修订，非语义/非 schema/非权限变更，按 §15-1 追加）：§6.2/§7.1/§9 里「squash MR」「MR 树」的表述，在**零 remote** 的仓库里无法执行（实测一次真实会话：centurion 只能交一条待推分支，报 `no remote`），而契约读起来像「没有 MR 就是没交付」。明确：**D6 的「子树 squash MR」= 一个可审查的 squash 分支（分支名 + HEAD sha）**；MR/PR 是**有 remote 且 `gh`/`glab` 可用**时的可选产物，附 URL 更好，缺失不构成验收失败，**任何情况下都不许编造 URL**。逐级合并权与「叶子永不 merge」一字不变（合并仍发生在父节点，认的是分支/提交，不是平台对象）。落地文案：`agents/centurion.md`、`src/extension/child-guard.ts` 的注入附录、验证后的 `sendSelfMessage`、`subagent` 的 worktree 参数说明、`skills/pi-legion/SKILL.md`、`README.md`、`examples/subagents-parent-context.md`。 |
 | 2026-11-06 | REV-30 | §8.3.1 的 `OBSOLETE` 判据由「仅 `Phase timeout:`」扩为**两个类别**（语义修订，非 schema / 非事件类型 / 非权限变更，按 §15-1 追加）：新增 `Stall notice: ` 通知在其点名的 child 全部结束（`hasEnded`）或已不在树中时，于发送/确认前转 `OBSOLETE`，`reason` 为新值 `obsolete_after_child_end`（旧值 `obsolete_after_phase_change` 与事件闭集**不动**，`mail_bounced` 复用）。与相位超时不同，stall 一类**必须解析正文**的 `- <child>: ` 行（该行文法是 `stall-notice.ts` 写入方的冻结文法，没有结构化字段可读）；解析不全、名字非 canonical slug、探测器节点缺失时一律不作废（never guess）。同一谓词由 postman 三条投递/确认路径、#384 `takePendingMail` 与 250ms 轮询计数共享（轮询只数「可释放」的行，否则 stale 通知会让阻塞的 `wait`/`collect` 空返并误报 `interrupted`）。子契约：`docs/contracts/stall-notice-staleness-v1.md`。触发：2026-11-06 实测一条 stall 通知在 child 已返回报告后 10 分钟才送达（`rev-correct`），同 `notice-delivery-v2` 的 T0≠T2 家族。 |
 | 2026-11-07 | REV-31 | **worktree 仍是 centurion 专属；改变的是它用哪个 transport**（后端选择修订，非 schema / 非事件类型 / 非权限变更，按 §15-1 追加；子契约 `docs/contracts/centurion-terminal-backend-v1.md`）：`SPAWN_MODES` 增 `terminal`，仲裁唯一改点为 `worktree === true ? (isCenturion && hc 宿主 ? "terminal" : "rpc") : "inprocess"`。`terminal` 是**同一棵 worktree、同一个 centurion**，只是跑成 `hc`（herdr-core）终端里的真 `pi` TUI：可在 herdr-app 的 agents 侧栏看见、可 attach、可 Esc 打断而不丢上下文。宿主判据是**两个环境变量**（`HC_TERMINAL_SOCKET` + `HC_TERMINAL_ID`），零子进程、零 socket probe、零 git 探测；两标记缺失时表达式逐字节等于 REV-27 的旧式。**§9 的归属与降级语义一字未改**（centurion 独占、强制 `true`、非 centurion 请求 warn-once 后降级、组员恒 `false`），冻结的四个测试文件（`worktree-centurion-only` / `launch-worktree-probe` / `spawn-mode-arbitration` / `teams`）**一行未动**；`src/runs/worktree.ts` 未编辑（worktree 创建/清理/分支命名全部沿用）。transport 走 `hc connect` 的 JSON-RPC 而非 CLI，因为 `hc run` 没有 `--env` 而 `terminal.run` 有；argv 复用 `buildPiArgs` 与 `formatChildTask`，与 rpc 后端逐字节同构（含 `--session` 绝对路径与完整继承 `-e` 集——漏掉 provider 扩展会让子进程无模型、永不开始 turn，已实测）。v1 的能力上限（不接事件流、不声明 in-flight/stall 事实、`promptDisposition: false`、不按 prompt 重切 transcript）写在子契约 Non-goals；人在终端里插话最坏使 acceptance 降为 `unknown`，不会伪造 accept。同一提交把 `HC_TERMINAL_SOCKET`/`HC_TERMINAL_ID` 加入 `package.json` 各测试脚本的 `env -u` 净化列表（与既有 `PI_SUBAGENT_*` 同模式）：测试宿主必须是 hermetic 的，否则在 hc 终端里跑 `npm test` 会让那 7 条「centurion+worktree ⇒ rpc」断言因真实宿主而翻红。触发：herdr-app 只能列出自行上报状态的终端，headless rpc child 永远不会出现在窗口里。 |
+| 2026-11-07 | REV-32 | **三处事实订正 + 一次抽检**（非语义 / 非 schema / 非事件类型 / 非权限变更，按 §15-1 追加；纯「让文档说代码的实话」）。① §5 重名拒绝的错误码由隐形的「`BUDGET_EXCEEDED` 同级错误通道」改写为显式的 **`NAME_TAKEN`**（`ErrorCodes.NAME_TAKEN`，`src/runs/orchestrator.ts:641`，另 `:751` 同一码；实测实现从不返回 `BUDGET_EXCEEDED`）。② §7.5 `DONE` 收队流第四步与 §11.3 文件闸门里声称的 GC 清理入口**不存在**（全仓检索仅命中本文那两行）：worktree **当前无自动清理入口**，一律保留为 resume 凭据；唯一删除路径是 launch 失败回滚（`src/runs/orchestrator.ts:1466` → `src/runs/worktree.ts:310` `removeChildWorktree`，`git worktree remove --force` `:317`），而 `src/runs/hygiene.ts` 明确把带 `worktrees/` 的 run 目录排除在 prune 之外（`:16` 说明、`hasWorktrees` `:145`、判据 `:217`）。③ §4.3 的 `tree_finalized` 在 `LEGION_EVENT_TYPES`（`src/legion/events.ts:30`）已登记，但 `rg -n 'tree_finalized' src index.ts` **只有闭集定义一处**——**闭集已登记，暂无发射点**；不复用 rebuild 合成事件（§4.4 的 `tree_finalized` 零幸存者）。④ **抽检无漂移**（同一日实测，不改正文）：§8.4 工具参数（`src/extension/legion-tools.ts:1285/1323/1357`）、§7.1-7.4 相位（`src/legion/phase-machine.ts:82-144` 内置四阶段 + 声明式覆盖）、§8.3/§8.3.1 delivery 五值（`src/legion/db.ts:125` 注释与 `mail.ts` 写入方一致）、§4.2 DDL 与 `src/legion/db.ts:75-134`、`LEGION_DB_USER_VERSION = 2`（`db.ts:14`）均与正文一致。触发：2026-11-07 文档审计（`docs/contracts/launch-admission-queue-v1.md` 的 REV 小节同一批对账）。 |

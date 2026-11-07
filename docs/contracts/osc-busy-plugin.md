@@ -4,6 +4,15 @@ Legion keeps the **root** program-status record `working` while any live child
 or registered extension activity remains. OSC truth is owned by Pi's
 `ProgramStatusReporter` — **plugins and legion must not `printf` OSC 7501**.
 
+That prohibition is **caller discipline, not an enforced guard**. This repo has no
+runtime interceptor for it: `rg -n '7501' src index.ts` turns up one comment
+(`src/supervisor/terminal-supervisor.ts:137-138`), and the Non-goals below
+explicitly exclude parsing child stdout for OSC 7501. Compliance therefore rests
+on each plugin checking itself; the only stripping this repo does happens at
+render time in the viz canvas (`sanitizeChar`, `src/tui/viz/canvas.ts:245-259`,
+control chars → space), which keeps a stray OSC byte from painting but does not
+prevent it from being emitted.
+
 ## Handshake
 
 - Terminals may answer `OSC 7501;?` / `PI_PROGRAM_STATUS=1`.

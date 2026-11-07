@@ -43,10 +43,17 @@ Tab switches panes; arrows move or scroll; Enter selects an agent; `o` opens
 its live overlay; `q` or Esc closes. `/legion --tree` opens the classic paged
 tree (`j`/`k`, Enter/Space fold, `/` search, PageUp/PageDown). `/legion <name>`
 opens a node overlay directly; if short names are ambiguous, use the full node
-ID from completion. `/legion status` prints the whole tree in chat (same lines
-as `legion_tree`); `/legion status <name>` prints one node like
-`subagent({ action: "status", name })`. Esc closes an overlay and unsubscribes
-its live feed. OSC 8 links are visual anchors only.
+ID from completion. `/legion status` prints the caller's whole subtree in chat:
+every node's line format is `legion_tree`'s (`formatTree`), but the command wraps
+it with a `Legion status · N nodes` header, an optional `Live jobs not in the
+tree:` section, and a `One node: /legion status <name>` footer — and its range is
+the full subtree, while the tool's default is `scope="children", depth=1` (direct
+children only). `/legion status <name>` prints one node like
+`subagent({ action: "status", name })`: same renderer, same fields, when a
+run-store record exists (the tool prepends `resolved: …` when that record lives
+in another run); with no record the command falls back to the node's own fields.
+Esc closes an overlay and unsubscribes its live feed. OSC 8 links are visual
+anchors only.
 
 To stop live children yourself: `/legion stop` (or `/legion stop <name>`), idle
 Esc with an empty editor (confirm "Stop N running subagents?"), or `x` then `y`
