@@ -12,7 +12,7 @@
 
 | 约束 | 锚点 |
 | --- | --- |
-| **禁止给 `legion.db` 加列、禁止升 `LEGION_DB_USER_VERSION`** | `docs/spawn-mode-visibility-v1.md:143`、`test/unit/legion-schema-sentinel.test.ts` |
+| **禁止给 `legion.db` 加列、禁止升 `LEGION_DB_USER_VERSION`** | `docs/contracts/spawn-mode-visibility-v1.md:154`、`test/unit/legion-schema-sentinel.test.ts` |
 | 运行时零外部依赖（Node stdlib only） | `CONTRIBUTING.md:215` |
 | 每行 `visibleWidth === w`（严格相等，非 ≤） | `test/unit/legion-viz.test.ts:417-434,628,911,1464,1630` |
 | 平台降级不得抛错：非 Linux 返回空值 | 先例 `src/supervisor/proc-tree.ts:44` |

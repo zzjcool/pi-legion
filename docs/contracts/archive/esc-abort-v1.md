@@ -1,6 +1,11 @@
 # ESC 打断 + 优雅停止契约（v1，2026-10-13 冻结）
 
-> **v2 修订（2026-10-13）**：ESC / 父 turn abort 的语义已改为级联优雅关闭由该 turn 拥有的 children，推翻 v1 下文的「ESC ≠ 杀 children」决定。下文保留 v1 冻结原文，仅供历史考古；当前语义以 `docs/contracts/esc-cascade-v2.md` 为准。
+> `STATUS: HISTORICAL` — superseded by `docs/contracts/esc-no-retire-v3.md`；正文冻结不改。
+>
+> 归档依据（2026-11-07 实测，代码为事实源）：`rg -n "cascadeRetireAll|cascadingJobs" src index.ts` → **无命中**，
+> v2 的级联语义确定不是现行行为；v1 的「ESC ≠ 杀 children」原则被 v3 恢复，但 v1 文本本身（缺 drain/归因与显式 stop）已被 v3 取代。
+> 原 `:3` 的「当前语义以 `docs/contracts/archive/esc-cascade-v2.md` 为准」一句已删除（它指向一份同样被推翻的文件）。
+> 下文中仍出现的 `docs/contracts/...` 路径是冻结时的位置（正文不改）。
 
 > **v3 说明（2026-10-15）**：v3（`esc-no-retire-v3.md`）再次回到 v1 的「ESC ≠ 杀 children」原则；与 v1 不同的是保留 session_shutdown drain/归因与显式 `/legion stop`。v2 级联语义已推翻。
 

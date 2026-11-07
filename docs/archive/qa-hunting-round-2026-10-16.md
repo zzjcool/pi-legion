@@ -1,5 +1,13 @@
 # QA 狩猎 round 编排手册（multi-agent orchestration）
 
+> `STATUS: HISTORICAL` — 非契约·一次性复盘快照（round2 · 2026-10-16 · v2.0.4 @ b00d4c7）。
+>
+> **本文是外部环境的一次性编排复盘记录，不是本仓库的可用操作面**：它依赖的 `agents/qa-hunter.md`
+> 等角色卡、以及 `.pi/settings.json` 的 `subagents.teams["qa-hunting"]` 在本仓库均**不存在**
+> （`ls agents/` 只有 `centurion.md scout.md worker.md`；`ls .pi/settings.json` → `No such file or directory`）。
+> 照本手册开跑第一步就会卡在「角色卡不存在」；把它当方法论读即可，别当 runbook。
+> 仍在维护的部分是 `docs/tui-qa-playbook.md`（单人取证手册）。
+
 > **给谁看**：任何要在这个仓库组织「一轮」多子 agent 缺陷狩猎的主 agent（或人）。读完即可开跑。
 >
 > **和 `tui-qa-playbook.md` 的分工**：那份是**单人狩猎手册**——三层证据链、容器/tmux 基建、

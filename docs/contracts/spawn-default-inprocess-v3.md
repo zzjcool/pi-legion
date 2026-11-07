@@ -2,6 +2,13 @@
 
 状态：**FROZEN** — 实施中禁止偏离。发现矛盾立刻停下报告，不要自圆其说。
 
+> **REV 3（2026-11-07，落地后校正）**：本契约已落地（3.0.0 起 `DEFAULT_SPAWN_MODE = "inprocess"`），
+> 但 **D2 的仲裁形状已被 `terminal` 后端扩写**：现行实现是 `src/runs/orchestrator.ts` 里的
+> `worktree === true ? (isCenturion && terminalHostAvailable(process.env) ? "terminal" : "rpc") : "inprocess"`，
+> 不再有 `explicitMode` / `resolveSpawnMode` 仲裁分支（`rg -n "explicitMode" src index.ts` → 无命中），
+> 因为角色卡已经不能声明 `spawnMode`。D2 的原始代码块已删，本文件的其余决定（D1/D3–D9、I1–I6、
+> REV2-1…REV2-8）保持原样。注：下文「REV 2」是 2026-10-18 的 review 轮次，不是本次校正。
+
 ## 目标
 
 `spawnMode` 缺省值从 `rpc` 改为 `inprocess`，且**不引入任何已知回归**。翻转默认是 breaking
@@ -38,42 +45,43 @@ change，因此本次发 `3.0.0`。
 `DEFAULT_SPAWN_MODE: SpawnMode = "inprocess"`（`src/supervisor/spawn-mode.ts:9`）。
 `resolveSpawnMode` 保持纯配置解析语义：**只返回意图**，不感知 worktree。
 
-### D2 — 仲裁位置与形状（唯一实现点：`Orchestrator.launch`）
-把 `const inProcess = isInProcessSpawn(input.agent)` 从 `:549` **移到 `:583` 之后**（`worktree`
-const 结束处）。`:549` 与 `:583` 之间无 `inProcess` 使用点（仅 `:550`、`:564`、`:584`），移动是局部的。
+### D2 — 仲裁位置与形状（**REV 3：已被 `terminal` 后端扩写，本节按代码改写**）
 
-仲裁逻辑（紧接移动后的位置）：
+> **REV 3（2026-11-07，代码为准）** — 本节原始施工代码块（`explicitMode` + `resolveSpawnMode` 仲裁）
+> **已删除**：那是 3.0.0 落地时的一次性形状，**不是现行实现**。
+>
+> - `rg -n "explicitMode" src index.ts` → **无命中**；`resolveSpawnMode` 在 launch 路径上只剩注释。
+> - 现行仲裁只有一处，在 `src/runs/orchestrator.ts` 的 `Orchestrator.launch`：
+>
+>   ```ts
+>   const mode: SpawnMode = worktree === true
+>       ? isCenturion && terminalHostAvailable(process.env) ? "terminal" : "rpc"
+>       : "inprocess";
+>   const inProcess = mode === "inprocess";
+>   ```
+>
+>   即 **worktree 隔离 → `rpc`（在 `hc` 终端里且是 centurion → `terminal`），其余一律 `inprocess`**。
+>   角色卡不再有 `spawnMode` 字段（#290 起声明该键会在加载期被拒绝），backend 是 launch 的属性，
+>   不是角色的属性 —— 所以「缺省 vs 显式」这个二分已经不存在了。
+> - `terminal` 这一支来自 `docs/contracts/centurion-terminal-backend-v1.md` D1/D2，本契约（v3）冻结时
+>   还不存在。
 
-```ts
-const explicitMode = input.agent.spawnMode !== undefined;
-// 缺省 + 解析后需要 worktree / 非 pi → 回落 rpc。显式给值绝不降级。
-const mode: SpawnMode =
-    !explicitMode && worktree === true
-        ? "rpc"
-        : resolveSpawnMode(input.agent);
-const inProcess = mode === "inprocess";
-// 下游必须看到仲裁结果，否则 RoutingSupervisor 会独立重算并抛错。
-// `worktree` 也必须归一化：角色卡上的 worktree:true 在本次发射「不需要隔离」时
-// 会让 RoutingSupervisor(:79) / InProcessSupervisor(:342) 直接拒绝，即使 mode 已是
-// inprocess 且解析结果 worktree===false。只改 spawnMode 不改 worktree 是错的。
-const agent: AgentConfig = mode === input.agent.spawnMode && worktree
-    ? input.agent
-    : { ...input.agent, spawnMode: mode, ...(worktree ? {} : { worktree: false }) };
-```
+仍然成立的两条硬约束（与 REV 3 无关，别一起删）：
 
-**硬约束（两条，缺一不可）**：
-1. 仲裁结果必须**写回一个 agent 克隆**并同时传给 `reserveNode({agent})`（`:636`）和
-   `spawnInput.agent`（`:652`）。否则 `routing-supervisor.ts:71` 会独立重算
-   `resolveSpawnMode` 得到 `inprocess` 并在 `:79-84` 抛错，仲裁白做。
+1. 仲裁结果必须**写回一个 agent 克隆**，并同时传给 `reserveNode({ agent })` 与 `spawnInput.agent`。
+   否则 `RoutingSupervisor.spawnChild` 会独立调 `resolveSpawnMode(input.agent)` 重算得到 `inprocess`，
+   并以 `spawnMode "inprocess" cannot combine with worktree: true` 拒掉，仲裁白做。
 2. 克隆必须**同时归一化 `worktree`** 为本次发射的真实值（不需要隔离时写 `false`）。
-   只写 `spawnMode` 会让 `{spawnMode:"inprocess", worktree:true}` 这个自相矛盾的组合
-   流到 `routing-supervisor.ts:79` 与 `inprocess-supervisor.ts:342`，直接 `INVALID_PARAMS`。
-   这正是 `centurion 派 worker` 主链路的形态（centurion 父 → `parentRole==="centurion"` →
-   解析 worktree=false，而 `agents/worker.md` 写死 `worktree: true`），必须由该归一化兜住。
+   只写 `spawnMode` 会让 `{spawnMode:"inprocess", worktree:true}` 这个自相矛盾的组合流到
+   `routing-supervisor.ts` / `inprocess-supervisor.ts` 的 guard，直接 `INVALID_PARAMS`。
+   这正是「centurion 派 worker」主链路的形态（centurion 父 → `parentRole === "centurion"` →
+   解析 `worktree: false`，而 `agents/worker.md` 写死 `worktree: true`），必须由该归一化兜住。
+   现行代码里这归一化写作 `const agent: AgentConfig = { ...input.agent, spawnMode: mode, ...(worktree ? {} : { worktree: false }) };`。
 
-**注（`kind !== "pi"` 子句）**：`Orchestrator.launch` 在 `:545-548` 已对 `kind !== "pi"` 早抛，
-因此仲裁里不再重复该条件（原契约写的 `|| input.agent.kind !== "pi"` 在本文件内不可达，属死代码）。
-`kind !== "pi"` 的保护由 `:545-548` 早 guard 承担，不在本契约范围内变更其归属。
+**注（`kind !== "pi"` 子句）**：`Orchestrator.launch` 在进入仲裁前已对 `kind !== "pi"` 早抛，
+因此仲裁里不再重复该条件（原契约写的 `|| input.agent.kind !== "pi"` 在 launch 路径内不可达，属死代码）。
+现行 `RoutingSupervisor` / `InProcessSupervisor` 各自的 non-pi guard 仍在（v4 起 `AGENT_KINDS = ["pi"]`，
+非 pi 值在解析期就被丢弃，见 `docs/contracts/archive/drop-non-pi-kinds-v4.md`）。
 
 ### D3 — 删除 `:550` 的原始字段门，统一到 `:584`
 `orchestrator.ts:550-555`（`if (inProcess && (input.worktree === true || input.agent.worktree === true)) throw`）

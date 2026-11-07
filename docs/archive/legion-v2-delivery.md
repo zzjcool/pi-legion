@@ -1,6 +1,10 @@
 # Legion v2 delivery summary
 
-本摘要以冻结契约 [`legion-v2-contract.md`](./legion-v2-contract.md) 与
+> `STATUS: HISTORICAL` — 历史交付快照（v2 里程碑，PR #6–#14）。交付物 `src/backends/legacy/` 已在 v4 删除
+> （`ls src/backends` → `No such file or directory`，见 `docs/contracts/archive/drop-non-pi-kinds-v4.md` D3）。
+> 本文的里程碑账目是历史事实，不是现行架构说明；现行架构看 `docs/design.md`。
+
+本摘要以冻结契约 [`legion-v2-contract.md`](../legion-v2-contract.md) 与
 `master` 上的 PR merge commit 为事实来源。v2 的最后一个里程碑 M3 已由
 PR #14 合入；以下账目覆盖 M0、M1/M2/M3 core 与 integration，以及 schema
 sentinel。
@@ -15,7 +19,7 @@ sentinel。
 | M1-core patch | [#9](https://github.com/zzjcool/pi-legion/pull/9) · `afaad13` | 补齐 supervisor abort/settle 可观测性、fallback retire 时 waiter 收敛、`isAlive` 无副作用及相应回归与 live 测试。 |
 | M0：深度预算地基 | [#10](https://github.com/zzjcool/pi-legion/pull/10) · `aad3195` | 接通 `maxSubagentDepth` 与累计深度预算，落实硬顶 4、只收紧不放宽的 INCL 继承语义、`subagents.legion` 设置解析及测试入口 env 隔离。 |
 | M3-core：可视化核心 | [#11](https://github.com/zzjcool/pi-legion/pull/11) · `05d3076` | 新增 Legion event bus、全屏树视图和 live overlay 的可视化组件与单测。 |
-| M1-integration：RPC 主线 | [#12](https://github.com/zzjcool/pi-legion/pull/12) · `3feb43e` | 将主执行路径切到 Pi RPC，旧 Herdr 后端归档至 `src/backends/legacy/`；把主线测试切到 fake supervisor，并将遗留测试归档。 |
+| M1-integration：RPC 主线 | [#12](https://github.com/zzjcool/pi-legion/pull/12) · `3feb43e` | 将主执行路径切到 Pi RPC，旧 Herdr 后端归档至 `src/backends/legacy/`（**该目录 v4 已删除**）；把主线测试切到 fake supervisor，并将遗留测试归档。 |
 | M2-integration：组织层接线 | [#13](https://github.com/zzjcool/pi-legion/pull/13) · `efa0754` | 接通 centurion、递归子树、树级预算/账本、邮件与阶段工具、子树恢复和组织层集成测试；修复整队 retire、终态邮件及精确孤儿判定等问题。 |
 | M3-integration：可视化接线 | [#14](https://github.com/zzjcool/pi-legion/pull/14) · `9490a1c` | 接通常驻树面板、`/legion` 命令、节点 overlay 和事件流；更新 SKILL 与可视化集成测试，完成 M3。 |
 

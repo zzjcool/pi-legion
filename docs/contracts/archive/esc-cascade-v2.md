@@ -1,5 +1,12 @@
 # ESC 级联关闭契约（v2，2026-10-13 冻结）
 
+> `STATUS: HISTORICAL` — superseded by `esc-no-retire-v3.md`；正文冻结不改。
+>
+> 归档依据（2026-11-07 实测，代码为事实源）：`rg -n "cascadeRetireAll|cascadingJobs" src index.ts` → **无命中**；
+> 现行语义是不级联（`index.ts` 的 `signal?.aborted` 分支只返回 `interrupted (parent turn ended; children still running)`）。
+> 本文件仅作考古，任何「ESC 级联 retire」的实现都会重建已被删除的行为。
+> 正文里的仓库内路径（如 `docs/contracts/esc-abort-v1.md`）是它冻结时的位置，归档后同一批文件都在本目录，正文按约定不改。
+
 > **v3 推翻（2026-10-15）**：ESC / 父 turn abort **不再**级联 retire children。当前语义以 `docs/contracts/esc-no-retire-v3.md` 为准。下文保留 v2 冻结原文，仅供历史考古。
 
 

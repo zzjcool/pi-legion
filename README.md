@@ -246,7 +246,7 @@ shutdown); process exit / session shutdown also retires:
   `/legion stop --force <name>` for hard retire).
 - **Tool**: `subagent({ action: "stop", name })` is graceful; pass
   `force: true` for hard retire (SIGTERM → SIGKILL + descendant sweep per
-  `docs/retire-hardening-contract.md`). Example:
+  `docs/contracts/retire-hardening-v1.md`). Example:
   `subagent({ action: "stop", name: "worker-0", force: true })`.
 
 **`wait` ≠ stop.** A `wait` timeout (or still-running result) does **not**
@@ -451,10 +451,11 @@ today's warn + full roster behaviour and still use global context.
 See [docs/subagents-teams.md](docs/subagents-teams.md) for editable
 frontend/backend team templates with **distinct workflow text** (not only
 different models). The model IDs in that template are placeholders for your
-provider, not required defaults. For running a multi-agent QA hunting round in
-this repo, see [docs/qa-hunting-round.md](docs/qa-hunting-round.md) (round
-orchestration) and [docs/tui-qa-playbook.md](docs/tui-qa-playbook.md)
-(evidence rules).
+provider, not required defaults. For running a multi-agent QA hunting round,
+see [docs/archive/qa-hunting-round-2026-10-16.md](docs/archive/qa-hunting-round-2026-10-16.md)
+(round orchestration — **外部团队配置示例，非本仓库内置**：它依赖的 `qa-hunter` 等角色卡与
+`.pi/settings.json` 的 `qa-hunting` team 都不在本仓库里，这里只作方法论参考) and
+[docs/tui-qa-playbook.md](docs/tui-qa-playbook.md) (evidence rules).
 
 ### Parent/child context conventions
 

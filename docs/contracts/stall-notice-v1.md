@@ -10,6 +10,13 @@
 > `OBSOLETE`（`reason: obsolete_after_child_end`）。三条路径的**文本时序与投递节奏**仍按本
 > D4（postman 仍 2s tick、`isMailHeld` 与 `formatMail` 不动），D9 写入侧仍零事件。
 
+> **术语表（#315 vs #315 之外，别混用）**：本文件说的 **stall notice** 是**推给父会话的通知**，L1 阈值走
+> 配置项 `silenceNoticeMs`（`src/shared/types.ts` 的 `DEFAULTS.subagents.legion.silenceNoticeMs`，默认
+> 120s；判定在 `src/legion/stall-notice.ts` 的 L1 行）。
+> `STALL_NOTICE_MS`（`src/supervisor/types.ts`，300s）**不是**这个阈值 —— 它是**展示层**在途标记
+> （`formatInFlightToolLine` 给单条工具行追加 `long-running tool — no progress for Nm`），见
+> `docs/contracts/stall-visibility-v1.md` D3。两者名字像、语义与阈值都不同，不是同一物。
+
 ## 1. 背景与目标
 
 `docs/contracts/stall-visibility-v1.md` 解决了「看不看得见」，但**只有人去拉才看得见**：

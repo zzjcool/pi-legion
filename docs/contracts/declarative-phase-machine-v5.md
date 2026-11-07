@@ -1,6 +1,17 @@
 # Declarative phase machine (v5)
 
-Status: draft, layer 3 (#298).
+Status: **implemented** — 生效中（#298 已落地；原 `draft` 标注已过期，2026-11-07 按代码改正）。
+
+> 落地证据（符号级，代码为准）：`parsePhaseMachine` 定义在 `src/agents/agents.ts`，两条入路都走它 ——
+> 卡片加载路径 `parsePhaseMachine(fm.phases, config.filePath)`，launch 路径
+> `parsePhaseMachine(raw, "subagent.phases", { requireTerminal: true })`（`src/runs/orchestrator.ts`），
+> 即「合法机器只有一个定义」；
+> `Orchestrator` 侧 `phases?: unknown`（launch 输入）+ `reserveNode({ …, phases })` + 条件写入
+> `input.agent.name === "centurion" && input.phases ? { phase: phaseStart(input.phases), … }`；
+> `legion_phase` 工具由 `src/extension/legion-tools.ts` 按「有机器才注册」的判据提供，
+> 下游 `docs/contracts/centurion-declared-phases-v1.md` 已把本文件当**现行相位机行为依据**。
+>
+> 本文的“Problem：硬编码在三处”段落是**落地前的动机**，不是现状；现状见上面的符号。
 
 ## Problem
 

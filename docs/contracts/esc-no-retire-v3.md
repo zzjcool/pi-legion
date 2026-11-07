@@ -2,7 +2,7 @@
 
 ## 背景
 
-v2（`esc-cascade-v2.md`）把「父 turn abort → 级联 retire children」冻结为产品语义。2026-10-15 实测事故：主会话异步派了多个 child 后用 `wait` 阻塞，用户按 Esc 打断父 turn，级联 retire 把整棵仍在生长的 legion 树抹掉（含尚未派生子 agent 的 centurion）。Esc 是高频误触键，后果不可恢复。
+v2（`archive/esc-cascade-v2.md`，已归档）把「父 turn abort → 级联 retire children」冻结为产品语义。2026-10-15 实测事故：主会话异步派了多个 child 后用 `wait` 阻塞，用户按 Esc 打断父 turn，级联 retire 把整棵仍在生长的 legion 树抹掉（含尚未派生子 agent 的 centurion）。Esc 是高频误触键，后果不可恢复。
 
 用户裁决推翻 v2：**Esc 只打断父 turn 的等待，不杀 children；停止 subagent 只有两条路——显式 `/legion stop`，或主进程退出。**
 
@@ -46,8 +46,8 @@ interrupted (parent turn ended; children still running)
 
 ## 与 v1 / v2 的关系
 
-- **v1**（`esc-abort-v1.md`）主张「ESC ≠ 杀 children」——v3 回到这一原则，但保留 v1 没有的 drain / shutdown 归因与显式 stop。
-- **v2**（`esc-cascade-v2.md`）级联 retire —— **v3 推翻**；原文保留供考古。
+- **v1**（`archive/esc-abort-v1.md`，已归档）主张「ESC ≠ 杀 children」——v3 回到这一原则，但保留 v1 没有的 drain / shutdown 归因与显式 stop。
+- **v2**（`archive/esc-cascade-v2.md`，已归档）级联 retire —— **v3 推翻**；原文保留供考古。
 
 ## 验收锚点
 

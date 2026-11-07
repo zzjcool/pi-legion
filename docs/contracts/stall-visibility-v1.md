@@ -150,7 +150,7 @@ working · bash 00:12:00 (long-running tool — no progress for 12m; `steer` can
 
 ### D5 — 为什么不做 fleet watchdog
 
-`docs/contracts/esc-abort-v1.md` 的非目标写明「不做主机级 watchdog」。`#315` 不推翻它，理由是
+`docs/contracts/archive/esc-abort-v1.md` 的非目标写明「不做主机级 watchdog」。`#315` 不推翻它，理由是
 这一条现在**更**成立而不是更松：
 
 1. **watchdog 要判「该杀」，而这里没有可信的「该杀」判据。** 5 分钟一个工具可以是 `npm test`

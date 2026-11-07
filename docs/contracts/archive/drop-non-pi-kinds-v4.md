@@ -1,5 +1,22 @@
 # 冻结契约：删除 cursor / 第三方后端支持，只保留 `kind: pi`（v4.0.0）
 
+> `STATUS: LANDED (v4.0.0)` — 本契约 100% 已落地，已归档。**下文整体是历史施工单**：
+> 所有 `:x-y` 行号都是基线 `35edac5` 时的位置，现在没有意义，不要按行号操作。
+>
+> 符号级完成记录（2026-11-07 实测，代码为事实源）：
+>
+> | 契约项 | 完成态（实测证据） |
+> |---|---|
+> | `AGENT_KINDS` 收敛为仅 `pi` | `src/shared/types.ts` 的 `AGENT_KINDS = ["pi"]` |
+> | `src/backends/**`（含 `legacy/`）删除 | `ls src/backends` → `No such file or directory` |
+> | `test/legacy/**` 删除 | 同上，`test/legacy` 不存在 |
+> | `herdr.*` DEFAULTS 7 键清零 | `rg -n "startRetries|startRetryBackoffMs|binaryProbeTimeoutMs|sessionRetentionDays|commandTimeoutMs|maxConcurrentAgents|startTimeoutMs" src/ index.ts` → **无命中** |
+> | `run.herdr` 字段保留 | 仍存在（本契约就不要求删） |
+> | `nativeModelFor` / `assertKindModelCoherent` / `planKindStart` 删除 | 全库无这些导出 |
+>
+> 下游影响：`docs/tui-viewer-contract.md`、`docs/archive/legion-v2-delivery.md` 等提过 `src/backends/legacy/` 的
+> 文档已在本次一并改为“v4 已删除”，见本目录 `README.md`。
+
 状态：**FROZEN** — 实施中禁止偏离。发现矛盾立刻停下，报给父会话，**不要自行解释矛盾**。
 
 ## 目标
@@ -146,12 +163,12 @@
   5. `CONTRIBUTING.md:110-113`（deprecated herdr 导出段）与 `:164-175`（Legacy Herdr / kind checks 段）：
      前者的 helper 已删，整段重写；后者指向已删的 `test/legacy/docker/verify-13-kinds.sh`，整段删除。
 - **不改（历史设计文档）**：`docs/design.md`、`docs/legion-v2-contract.md`（除 §15 追加一条 REV）、
-  `docs/legion-v2-delivery.md`、`docs/tui-viewer-contract.md`、`docs/contracts/spawn-default-inprocess-v3.md`、
-  `docs/contracts/osc-busy-plugin.md`、`docs/performance-2026-10-19.md`。
+  `docs/archive/legion-v2-delivery.md`、`docs/tui-viewer-contract.md`、`docs/contracts/spawn-default-inprocess-v3.md`、
+  `docs/contracts/osc-busy-plugin.md`、`docs/archive/performance-2026-10-19.md`。
   在 `docs/legion-v2-contract.md` 的 REV 表（`:448-460`）**追加一行** REV-13：`v4 收紧为仅 kind: pi；
   AGENT_KINDS 收敛为 ["pi"]；非 pi 值忽略并按 pi 启动`。
 - **假阳性白名单（禁止改动）**：`docs/tui-viewer-contract.md` 的 `cursor`/`kind:` 全是文件游标与
-  ChatItem 判别式；`docs/performance-2026-10-19.md` 的 `cursor` 全是事件游标；
+  ChatItem 判别式；`docs/archive/performance-2026-10-19.md` 的 `cursor` 全是事件游标；
   `docs/legion-v2-contract.md:173,313,355` 是邮件 kind；`docs/design.md:416` 是 artifact kind。
 
 **D10 — 版本与 CHANGELOG。**

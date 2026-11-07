@@ -278,6 +278,9 @@ them by hand.
 | `examples/` | parent/child context cards — **repo-only**: absent from `package.json` `files`, so they do not ship with the package |
 | `docs/design.md` | design of the 5.5.0 architecture (five layers, phase machine, `legion.db`, mail/notice) — code is the source of truth |
 | `docs/archive/design-herdr-era.md` | historical herdr-era design notes (F1–F46); superseded by v4/v5, kept for context only |
+| `docs/archive/` | historical, non-contract snapshots (delivery / perf / QA round retrospectives) — read as evidence, never as the current behaviour |
+| `docs/contracts/archive/` | superseded or fully landed contracts, frozen and kept verbatim; index + successor in [`docs/contracts/archive/README.md`](docs/contracts/archive/README.md) |
+| `docs/audits/` | audits: the drift evidence chain between docs and code (snapshot, body not edited) |
 | `README.md` | what is actually wired today |
 
 Do not import from `src/` in downstream packages — use

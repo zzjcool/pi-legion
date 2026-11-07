@@ -1,7 +1,7 @@
 # 冻结契约：vexillatio 工具人派发（REV-17）
 
 日期：2026-10-12 ｜ 状态：frozen（唯一接口；worker 不得自行解释矛盾，发现矛盾上报修订）
-依据：`docs/retire-hardening-contract.md` 的流程规范；HEAD `ec65b69`；pi 内核 1.1.0
+依据：`docs/contracts/retire-hardening-v1.md` 的流程规范；HEAD `ec65b69`；pi 内核 1.1.0
 
 ## 0. 侦察已定事实（worker 直接引用，勿重查）
 

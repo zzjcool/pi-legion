@@ -98,6 +98,12 @@
 
 ### D5 — 单一投递出口 `deliverBatch`
 
+> **SUPERSEDED by notice-delivery-v2 D5** — 下面最后一段的「单 child 通知文本必须与现状**逐字节一致**」
+> 不再是现行条款：v2 D5 在正文首行前插入一条固定标记行，因此文本形状**故意**变了。
+> 现行形状（代码为准）：`NOTICE_SOURCE_MARKER = "▣ legion · automatic completion notice — not a user message"`
+> 作为首行，其余正文与旧形状一致（`src/extension/notify.ts`）。
+> 本节其余部分（`deliverBatch` 作为唯一出口、claim 过滤、`false` → 不 claim）仍然生效。
+
 `deliverBatch(entries, triggerTurn, partial)` 是唯一实现：
 
 1. `entries.filter(e => !isClaimed(e.runId, e.name))`
@@ -105,7 +111,7 @@
 3. 单条 → `formatCompletionNotice`；多条 → `formatGroupedNotice`（`stillRunning` 在投递时实时重算）
 4. 立即发送或入 outbox；`deliverCompletion` 返回 `false`（宿主拒绝）→ **不 claim**，允许后续补救
 
-`join` 的 `deliver` sink 与 `flushOutbox` 都只调它。单 child、未被 claim 的通知文本必须与现状**逐字节一致**（首行标记的例外见顶部修订注记与 `notice-delivery-v2.md` D5；保留 `Background task …` 旧形状；`partial` 由入队时刻的 `join.allSettled()` 决定并随条目保存，避免 flush 时语义漂移）。
+`join` 的 `deliver` sink 与 `flushOutbox` 都只调它。单 child、未被 claim 的通知文本~~必须与现状逐字节一致~~（**此条已被 notice-delivery-v2 D5 取代**，见本节开头的 SUPERSEDED 注记；保留 `Background task …` 旧形状；`partial` 由入队时刻的 `join.allSettled()` 决定并随条目保存，避免 flush 时语义漂移）。
 
 ### D6 — 工具结果永不被抑制
 

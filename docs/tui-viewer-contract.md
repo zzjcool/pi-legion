@@ -22,7 +22,7 @@
 - 不改 RPC supervisor / orchestrator / child 启动链的**运行时行为**（RPC 数据通道维持现状；仅允许 §7 定义的机械 type-compat 修复）。
 - 不改 `src/shared/session.ts` 的 TurnRecord 判定链（Orchestrator/acceptance/usage 依赖）。
 - 不做「历史全局搜索 / 会话导出 / 复制消息」等浮窗不需要的能力。
-- 不动 legacy herdr 归档代码（`src/backends/legacy/`）。
+- 不动 legacy herdr 归档代码 —— **该目录 v4 已删除**（`ls src/backends` → `No such file or directory`），见 `docs/contracts/archive/drop-non-pi-kinds-v4.md` D3。
 - 不新增 DB schema 字段（nodes 表结构不变）。
 
 ---

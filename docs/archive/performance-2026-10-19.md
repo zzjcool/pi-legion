@@ -1,5 +1,8 @@
 # Performance measurements (2026-10-19)
 
+> `STATUS: HISTORICAL` — 非契约·历史测量快照（v3.1.0 / `3071dee`），**不代表当前性能**。
+> 绝对值随机器漂移；本文的结论是当时的调用链与比值。现行性能基线请看 `bench/` 与 CI 里的 perf 门禁。
+
 Measured on `v3.1.0` (`3071dee`), Node v24.13.1, one container. **Absolute
 milliseconds drift with the machine; the ratios and the call chains are the
 findings.** Reproduce with `npm run test:perf`.

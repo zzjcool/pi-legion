@@ -2,7 +2,7 @@
 
 > **给谁看**：任何要在本仓库做「视觉/交互验证」的 agent 或人。读完即可执行。
 >
-> **为什么有这份文档**：`CONTRIBUTING.md` 只覆盖 `typecheck` / `test` / `test:docker`，而本仓库有冻结的 TUI 契约（`docs/tui-viewer-contract.md`），其验收项（T1 渲染对齐主上下文、T5 follow-end、T12 流式去重）本质是**渲染与交互**断言，无法用普通单测覆盖。本手册补上这一段：如何在容器里跑真实 TUI、如何截图取证、如何造确定性复现、如何把发现变成 issue。多 agent 整轮狩猎的编排见 `docs/qa-hunting-round.md`。
+> **为什么有这份文档**：`CONTRIBUTING.md` 只覆盖 `typecheck` / `test` / `test:docker`，而本仓库有冻结的 TUI 契约（`docs/tui-viewer-contract.md`），其验收项（T1 渲染对齐主上下文、T5 follow-end、T12 流式去重）本质是**渲染与交互**断言，无法用普通单测覆盖。本手册补上这一段：如何在容器里跑真实 TUI、如何截图取证、如何造确定性复现、如何把发现变成 issue。多 agent 整轮狩猎的编排见 `docs/archive/qa-hunting-round-2026-10-16.md`（历史复盘；它依赖的外部角色卡不在本仓库）。
 
 ---
 
@@ -56,9 +56,9 @@ for _ in $(seq 1 40); do curl -sf -m2 "http://127.0.0.1:$PORT/v1/models" >/dev/n
 ps -eo pid,cmd | grep "[m]ock-llm" | awk '{print $1}' | xargs -r kill -9
 ```
 
-### 1.4 tmux 捕获（本仓库尚缺的一环）
+### 1.4 tmux 捕获（已落库：`test/docker/verify-tui-visual.sh`）
 
-`test/docker/` 已有容器基建；需要补一个 tmux 捕获步骤拿到真像素。建议新增 `test/docker/verify-tui-visual.sh`（**当前尚未落库，见 §11 状态表**）：
+`test/docker/` 已有容器基建；tmux 捕获步骤**已落库**为 `test/docker/verify-tui-visual.sh`，一键入口是 `npm run test:tui-visual`（本地 build `test/docker/Dockerfile.tui-sandbox` 后在容器内跑，与 §11 状态表一致）。大致步骤（细节以脚本为准）：
 
 ```bash
 # 在容器内
@@ -238,8 +238,8 @@ sleep 12; tmux capture-pane -p -t qa -e > /tmp/boot.ansi
 tmux send-keys -t qa "MOCK_SAY: hello" C-m
 sleep 2
 tmux capture-pane -p -t qa -e > /tmp/frame.ansi
-# 渲染 PNG（ansi2png.py 尚未落库，见 §11 状态表）
-# python3 test/tui/ansi2png.py /tmp/frame.ansi /tmp/frame.png --cols 120
+# 渲染 PNG（ansi2png.py 已落库：test/tui/ansi2png.py，镜像内置 /opt/tui/ansi2png.py）
+python3 test/tui/ansi2png.py /tmp/frame.ansi /tmp/frame.png --cols 120
 
 # ── 4. 清理 ─────────────────────────────────────────
 tmux kill-session -t qa

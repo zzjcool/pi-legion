@@ -3,7 +3,7 @@
 # pi-legion 设计文档
 
 > **⚠️ 历史实验笔记（非现行契约）**  
-> 本文记录 herdr / pane 时代的实测与设计推演。**运行时契约以 [README](../../README.md) 与 [CONTRIBUTING](../../CONTRIBUTING.md) 为准**（Pi Legion 2.x = headless Pi RPC + `legion.db`；herdr pane 执行已归档到 `src/backends/legacy/`）。  
+> 本文记录 herdr / pane 时代的实测与设计推演。**运行时契约以 [README](../../README.md) 与 [CONTRIBUTING](../../CONTRIBUTING.md) 为准**（Pi Legion 2.x = headless Pi RPC + `legion.db`；herdr pane 执行已归档到 `src/backends/legacy/` —— **该目录 v4 已删除**，见 [`docs/contracts/archive/drop-non-pi-kinds-v4.md`](../contracts/archive/drop-non-pi-kinds-v4.md) D3）。  
 > 下文 F 条中标 **✅ landed** 的是已在当前 master 落地的修复；未标注的早期结论仍有参考价值，但不要当作「今日仍坏」的缺口清单。
 
 > 基于 10 组实测实验（exp1–exp10）得出的设计。所有结论都标注了实验依据，

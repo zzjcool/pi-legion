@@ -11,6 +11,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Added
+
+- `test/unit/agents.test.ts` 新增散文守卫：`agents/**`、`examples/**`、`skills/**/SKILL.md` 里提到已删除角色（`reviewer`/`planner`/`search` 等）即失败，除非该分句显式声明“已删除”；#301 之后同一类陈旧文字不再能静默发布。
+- `docs/audits/2026-11-07-docs-vs-code.md`：本次文档/代码漂移审计报告（代码为事实源，每条双侧行号证据）。
+
+### Changed
+
+- 文档全面对齐 5.5.0 代码（以代码为唯一事实源）：`phases` 省略即**无状态机**（#371）、三个 terminal 的前置条件、`terminal` 第三种 spawn 后端、`diagnose` 的 `section` 参数、13 个控制动作全表、`/legion` 子命令全表；`CONTRIBUTING` 的发布流程改为 npm trusted publishing（OIDC + `--provenance`，无 token 无人工审批）并补发布 checklist；`agents/*` 的 `acceptance.level` 口径（合法但非机器门禁），worker 卡改 `attested`。
+- `docs/design.md` 按现行架构重写：五层结构、`RoutingSupervisor` 三后端仲裁、声明式相位机独立成节、`legion.db` 四表六索引、`stdin EOF → SIGTERM → SIGKILL → 后代 pgid sweep`、mail/notice 的 claim 与五值域。herdr 时代正文与 F1–F46 实验记录移入 `docs/archive/design-herdr-era.md`。
+- `src/shared/types.ts` 中 `phases` 的注释改为 #371 语义（原文仍写「省略 = 内置四阶段」）。
+- contracts 归档纪律：`esc-cascade-v2` / `esc-abort-v1` / `drop-non-pi-kinds-v4` 移入 `docs/contracts/archive/`（抬头标 HISTORICAL / LANDED）；`retire-hardening-contract.md` 改名 `docs/contracts/retire-hardening-v1.md`（仍生效）；`spawn-mode-visibility-v1` 标 `implemented` 并修正已失效的验收命令；`declarative-phase-machine-v5` 的 `draft` 改 `implemented`；stall 两类阈值的术语消歧。
+- 孤儿文档归档到 `docs/archive/`：`qa-hunting-round`（依赖的角色卡不在本仓库）、`performance-2026-10-19`（v3.1.0 测量快照）、`legion-v2-delivery`（v2 交付账本）。
+
 ## [5.5.0] — 2026-11-07
 
 一次「让 centurion 从黑盒变成可看的终端」的发布。herdr-app 的 agents 侧栏只列**自己上报状态**的终端
@@ -1494,7 +1507,7 @@ context-token data, and ten measured performance fixes.
 
 ### Performance
 
-Ten fixes measured against the baseline in `docs/performance-2026-10-19.md`,
+Ten fixes measured against the baseline in `docs/archive/performance-2026-10-19.md`,
 plus the harness that measured them (#239). Numbers below are the before/after
 from each fix's own commit.
 

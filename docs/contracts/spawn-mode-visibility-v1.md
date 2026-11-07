@@ -1,6 +1,15 @@
 # Spawn-mode visibility + RPC copy cleanup — frozen contract v1
 
-Status: frozen for implementation. Owner decisions are D1–D7; do not re-litigate.
+Status: **implemented** — 一次性实现契约，已完成。本文件仍留在 `docs/contracts/`，作为「当时到底建了什么」的规范记录，
+但**不再是待施工的工单**（D1–D7 均已落）。
+
+> **Implemented in:** `src/extension/spawn-render.ts` (`spawnModeSummary` / `renderSpawnResult`),
+> footer `src/tui/live-overlay.ts` (`spawn <mode>` segment), `details.spawns` on the launch family.
+> Owner decisions are D1–D7; do not re-litigate.
+>
+> **Acceptance note (2026-11-07):** the original D7 grep (`rg -n 'RPC child|headless RPC|via RPC'
+> src index.ts`) was **retired** — it asserted an empty-set over comments as well as strings, so it could
+> never pass again once unrelated comments mentioned the RPC backend. The reproducible form is D7 below.
 
 ## Why
 
@@ -204,6 +213,20 @@ Sub-agents must not `git commit`, `git push`, or merge. Round 1 violated this
 - `npm run typecheck`
 - `npm test`
 - `npm run test:integration`
-- No new `RPC child` occurrences in parent-visible strings: the D1 table is empty
-  afterwards, and `rg -n 'RPC child|headless RPC|via RPC' src index.ts` returns
-  only the files listed in D2.
+- **Copy cleanup (reproducible form, replaces the retired whole-tree grep).** Parent-facing copy
+  carries no "RPC child" wording; the remaining occurrences are the D2-exempt internal/rpc-backend
+  strings in `src/runs/orchestrator.ts` (`TRANSIENT_CONNECTION_REASON`, "RPC child start failed",
+  session-JSONL abort reason). Run both:
+
+  ```bash
+  # 1) parent-facing entry point: must print nothing (exit 1)
+  rg -n '"[^"]*RPC child|"[^"]*headless RPC|"[^"]*via RPC' index.ts
+
+  # 2) rest of the tree: only the D2-exempt file may match
+  rg -l '"[^"]*RPC child|"[^"]*headless RPC|"[^"]*via RPC' src
+  # expected: src/runs/orchestrator.ts
+  ```
+
+  The quotes restrict the match to string **literals**, so comments (which legitimately describe the
+  rpc backend) no longer make the check un-passable. Verified at archival time: command 1 → no
+  output/exit 1; command 2 → `src/runs/orchestrator.ts` only.
