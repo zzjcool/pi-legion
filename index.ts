@@ -4610,7 +4610,16 @@ async function launchUtilityFamily(input: {
 	};
 	for (const handle of handles) followUtility(handle, false);
 
-	const collected = await Promise.all(handles.map(async (handle) => {
+	// The batch below is a BLOCKING call from this node, exactly like a `wait`/`collect`,
+	// so this node's own postman stands off its inbox for its duration (the same hold
+	// #384 gave the blocking tools). Without it the root postman ticks 2s into a
+	// 10-minute scout, flips a `Stall notice:` row to ACCEPTED and pushes it into the
+	// host's followUp queue; the batch then returns with the child already gone, and the
+	// parent turns again for a to-do that expired before it was ever read. The hold
+	// covers the collect batch ONLY — launches before it and the abort flush after it
+	// keep today's behaviour — and `finally` hands the inbox back on every exit path (a
+	// leak would park this node's mail for the rest of the process).
+	const collectHandles = (): Promise<string[]> => Promise.all(handles.map(async (handle) => {
 		try {
 			const result = await handle.orchestrator.collect(handle.name, {
 				timeoutMs,
@@ -4654,6 +4663,14 @@ async function launchUtilityFamily(input: {
 			return `✗ ${handle.name}: collect failed: ${error instanceof Error ? error.message : String(error)}\nsessionFile: ${handle.sessionFile}`;
 		}
 	}));
+	const holdNodeId = legion?.nodeId;
+	if (holdNodeId) beginMailHold(holdNodeId);
+	let collected: string[];
+	try {
+		collected = await collectHandles();
+	} finally {
+		if (holdNodeId) endMailHold(holdNodeId);
+	}
 	if (input.signal?.aborted) {
 		// #266 D7/A5: same rule as the command chain — a parent turn end empties
 		// every dispatch family's queue and spawns nothing. Each utility item owns

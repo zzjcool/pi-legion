@@ -169,6 +169,60 @@ export function staleNoticeReason(
 }
 
 /**
+ * Obsolete this node's pending stall notices whose named children have all ended.
+ *
+ * The delivery paths already refuse to hand over a notice whose subject is gone
+ * (`discardIfStaleNotice`), but they only run on a postman tick — so the row sat
+ * `PENDING` for up to 2s after the child returned, and a parent that had just finished
+ * a synchronous `vexillatio` batch was handed that expired to-do as a followUp the
+ * moment its turn ended. The fact "the child ended" therefore writes its own
+ * consequence, where that fact is recorded (`Orchestrator.recordSettled` and the two
+ * direct `retired` writes in `retire`).
+ *
+ * Only the STALL predicate is consulted on purpose: `staleNoticeReason` would also
+ * sweep `Phase timeout:` notices, which have their own owner (#333) and their own
+ * hook-free path — this sweep must not become a second, differently-timed writer for
+ * a class it does not own.
+ *
+ * Idempotent, and BOUNDED: it visits the first `pendingInbox` window (100 rows), so a
+ * backlog past it is not swept in one pass — those rows keep today's behaviour and are
+ * discarded by the postman's next tick. A second call returns 0 (an `OBSOLETE` row is
+ * terminal and only `PENDING` rows are visited), and a row another writer already moved
+ * is skipped rather than raised at a settle path that must never fail on bookkeeping.
+ */
+export function obsoleteStaleStallNotices(
+	db: DatabaseSync,
+	parentNodeId: string,
+	now: () => number = () => Date.now(),
+): number {
+	if (!parentNodeId) throw new TypeError("parentNodeId must be a non-empty node id");
+	let obsoleted = 0;
+	// A row another delivery already holds is mid-send, not "pending" in any sense this
+	// sweep may rewrite: a claim is `delivered_at` on a still-`PENDING` row (#384), and
+	// obsoleting it would only make that sender's own transition throw afterwards. Same
+	// lease window `pendingMailCount` uses.
+	const cutoff = now() - MAIL_DELIVERY_CLAIM_LEASE_MS;
+	for (const message of pendingInbox(db, parentNodeId)) {
+		if (message.deliveredAt !== null && message.deliveredAt >= cutoff) continue;
+		try {
+			// The PREDICATE is inside the guard too: it reads the tree (`getNode`,
+			// `getChildByName`), so one malformed row could throw there and — with the
+			// check outside — take the whole pass with it, costing every row behind it.
+			if (!isStaleStallNotice(db, message)) continue;
+			transitionDelivery(db, message.id, MAIL_DELIVERY.OBSOLETE, now, {
+				reason: MAIL_BOUNCE_REASON.OBSOLETE_AFTER_CHILD_END,
+			});
+			obsoleted += 1;
+		} catch {
+			// Raced, unreadable, or an edge the ledger refuses: leave this row to the
+			// postman's own discard rather than failing the settle/retire that called us.
+			continue;
+		}
+	}
+	return obsoleted;
+}
+
+/**
  * Take every `PENDING` message addressed to `nodeId`, oldest id first.
  *
  * "Take" is exactly the postman's own bookkeeping — `PENDING` → `ACCEPTED`, no

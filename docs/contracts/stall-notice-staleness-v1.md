@@ -178,3 +178,16 @@ stall 作废用它，phase-timeout 仍用 `obsolete_after_phase_change`。
 | `test/unit/wait-mail-preempt.test.ts` | §6.7（不抢占 + 正向控制） |
 | `docs/contracts/stall-notice-v1.md`、`docs/contracts/mailbox-delivery-v1.md` | 顶部修订注记 |
 | `CHANGELOG.md` | `[Unreleased]` 一条 |
+
+---
+
+## REV — 2026-11-07：结算侧作废 + 阻塞批量持信（落地校正）
+
+D3 的判据共享面事后多了一条作废写手；D5 的「不改投递节奏」新增了一处**持信**（按住投递，不改节奏）。
+
+| 事实 | 落点 |
+|---|---|
+| 第 5 条作废写手：child 写终态时**立刻**判过期，不等 postman tick | `src/runs/orchestrator.ts`（`recordSettled` 与 `retire` 两条直接写 `retired` 的分支）→ `obsoleteStaleStallNotices`（`src/legion/mail-release.ts`）：只问 stall 谓词（phase-timeout 仍归 #333），只扫 `PENDING` 前 100 行，跳过带投递租约的行 |
+| 第 2 处持信：`vexillatio` 同步批量 collect 期间按住父节点 inbox（与 #384 的 `wait`/`collect` 同机制） | `index.ts` 的 `launchUtilityFamily`：`beginMailHold`，`finally` 释放 |
+| 未变 | 2s tick、信封、schema、事件闭集（作废仍发 `mail_bounced{obsolete_after_child_end}`） |
+| 已知残留 | `ACCEPTED` 行的宿主 followUp 队列不可撤回；绕过 `recordSettled`/`retire` 的写手（orphan 扫描、`markSessionInterrupted`、team 失败判定、启动期 abandonment、`resumeLegionTeam`）仍靠 postman 下一 tick |

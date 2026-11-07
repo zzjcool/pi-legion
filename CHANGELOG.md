@@ -28,6 +28,17 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - viz 契约标注证据链：门槛只在本机 `bench/perf-core/10-legion-frame-alloc.ts:431-436` 与测试断言中，完整报告未入库（`reports/` 被忽略）、CI 不采集。
 - `osc-busy-plugin`：把“不得 printf OSC 7501”明确为**调用方纪律、非运行时守卫**（Non-goals 就不解析子进程 stdout）。
 
+### Fixed
+
+- **A synchronous `vexillatio` batch no longer leaves an expired stall notice behind for the parent.**
+  When the call runs under a legion node, the batch holds that node's mail while it collects
+  (released in a `finally`), and a child that ends obsoletes the pending stall notice naming it; a
+  still-actionable notice (live child, timed-out collect) is delivered unchanged, and the hold
+  suppresses delivery, not detection. Known limitations: an already-**accepted** row cannot be
+  recalled from the host's followUp queue, a sweep covers the first 100 pending rows only (and skips
+  rows another delivery has already claimed), and bypass status writers (orphan scan, session
+  interrupt, team-failure and abandonment sweeps, resume) rely on the postman's next tick.
+
 ## [5.5.0] — 2026-11-07
 
 一次「让 centurion 从黑盒变成可看的终端」的发布。herdr-app 的 agents 侧栏只列**自己上报状态**的终端

@@ -17,6 +17,7 @@ import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
 import { wasFailedBySupervisor, wasSessionInterrupted } from "../legion/interrupt.ts";
+import { obsoleteStaleStallNotices } from "../legion/mail-release.ts";
 import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
@@ -814,6 +815,11 @@ export class Orchestrator {
 			return;
 		}
 		updateNode(this.legion.db, child.nodeId, { status }, this.now);
+		// A child that just ended is exactly the fact that makes a `Stall notice:` about it
+		// pointless, so the verdict is written here instead of waiting for the next postman
+		// tick (`obsoleteStaleStallNotices`): a parent that ends its turn between two ticks
+		// used to be handed that expired to-do as a followUp.
+		this.obsoleteSettledStallNotices();
 		const eventType = status === "settled" ? "node_settled" : status === "failed" ? "node_failed" : "node_retired";
 		// #316 D3: `errorKind` rides along so an empty-generation failure is
 		// distinguishable in the ledger from any other `failed`. The existing pair
@@ -824,6 +830,26 @@ export class Orchestrator {
 			...(execution.errorKind ? { errorKind: execution.errorKind } : {}),
 		});
 		this.recordUsage(child, execution);
+	}
+
+	/**
+	 * Judge the parent's pending stall notices against the ledger right now.
+	 *
+	 * Best effort by construction: the sweep runs on the settle/retire path, which must
+	 * never fail because a mailbox write did. A throw is logged once and swallowed; the
+	 * row then keeps today's behaviour and is discarded by the postman on its next tick
+	 * (`discardIfStaleNotice`), so nothing is lost by losing this pass.
+	 */
+	private obsoleteSettledStallNotices(): void {
+		if (!this.legion) return;
+		const nodeId = this.legion.nodeId;
+		try {
+			obsoleteStaleStallNotices(this.legion.db, nodeId, this.now);
+		} catch (error) {
+			console.warn(
+				`[pi-legion] could not obsolete stale stall notices for ${nodeId} (${error instanceof Error ? error.message : String(error)}); mail delivery is unaffected — the postman discards them on its next tick.`,
+			);
+		}
 	}
 
 	/** Token accounting for one child turn — status-independent on purpose (#372 m2). */
@@ -3062,6 +3088,10 @@ export class Orchestrator {
 				// the history say the session ended twice.
 				const marked = getNode(this.legion.db, child.nodeId)?.status === "retired";
 				if (!marked) updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
+				// This branch writes `retired` directly, so it carries the same sweep as
+				// `recordSettled` (idempotent: a node the shutdown hook already retired simply
+				// has nothing left to obsolete).
+				this.obsoleteSettledStallNotices();
 				// The event type stays in the closed set of 16; `reason` is a field, not a
 				// new event (§3, invariant I2).
 				if (!marked) this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, reason: "session-shutdown" });
@@ -3070,6 +3100,7 @@ export class Orchestrator {
 				if (child.execution.status !== "aborted") this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId, execution: child.execution.status });
 			} else {
 				updateNode(this.legion.db, child.nodeId, { status: "retired" }, this.now);
+				this.obsoleteSettledStallNotices();
 				this.emitStored(child.nodeId, "node_retired", { parentId: this.legion.nodeId });
 			}
 			if (!pausedByShutdown) this.abortLegionPhase(child.nodeId);

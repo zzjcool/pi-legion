@@ -1,14 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import piLegion from "../../index.ts";
+import { LegionPostman } from "../../src/extension/legion-tools.ts";
 import { ErrorCodes, type AgentConfig } from "../../src/shared/types.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import type { RpcClientOptions, SettleResult } from "../../src/supervisor/types.ts";
-import { openLegionDb, legionDbPath } from "../../src/legion/db.ts";
-import { getNode } from "../../src/legion/nodes.ts";
+import { openLegionDb, legionDbPath, type DatabaseSync } from "../../src/legion/db.ts";
+import { readEventsAfter } from "../../src/legion/events.ts";
+import { MAIL_BOUNCE_REASON, MAIL_DELIVERY, inbox, pendingInbox } from "../../src/legion/mail.ts";
+import { isMailHeld } from "../../src/legion/mail-release.ts";
+import { getNode, insertNode } from "../../src/legion/nodes.ts";
+import { STALL_NOTICE_SUBJECT_PREFIX, formatStallNotice } from "../../src/legion/stall-notice.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
 interface ToolResult {
@@ -177,10 +182,11 @@ async function invoke(
 	name: string,
 	params: unknown,
 	ctx: ReturnType<typeof context>,
+	signal?: AbortSignal,
 ): Promise<ToolResult> {
 	const tool = pi.tools.get(name);
 	assert.ok(tool, `${name} tool must be registered`);
-	return tool.execute("test-call", params, undefined, undefined, ctx);
+	return tool.execute("test-call", params, signal, undefined, ctx);
 }
 
 function writeProjectSubagentSettings(cwd: string, subagents: Record<string, unknown>): void {
@@ -820,4 +826,235 @@ test("utility child identity suppresses both dispatch tools even if ALLOW_NESTED
 			assert.equal(pi.tools.has("subagent"), false);
 		},
 	);
+});
+
+// ─────── a synchronous batch owns the parent inbox (#384 hold, extended) ───────
+
+/**
+ * The ledger of the root run this sandbox just created.
+ *
+ * The tool publishes its `runId` only in its RESULT, and the case below needs the
+ * ledger while the call is still blocked — so the run directory is scanned instead
+ * of predicted (`createRun` mints the id).
+ */
+function findRunDb(cwd: string): string | undefined {
+	const runsDir = path.join(cwd, ".pi-subagents", "runs");
+	let entries: string[];
+	try {
+		entries = readdirSync(runsDir);
+	} catch {
+		return undefined;
+	}
+	for (const entry of entries) {
+		const candidate = path.join(runsDir, entry, "legion.db");
+		if (existsSync(candidate)) return candidate;
+	}
+	return undefined;
+}
+
+/** The row `LegionPostman.writeStallNotice` writes: self-addressed, PENDING, frozen grammar. */
+function queueStallNotice(db: DatabaseSync, nodeId: string, names: readonly string[], createdAt: number): number {
+	const { subject, body } = formatStallNotice(
+		names.map((childName) => ({
+			kind: "long-running" as const,
+			childName,
+			sinceBucket: createdAt,
+			sequence: 1,
+			elapsedMs: 600_000,
+			thresholdMs: 600_000,
+		})),
+		createdAt,
+	);
+	const inserted = db
+		.prepare(
+			`INSERT INTO messages (
+				from_node, to_node, subject, body, kind, urgency, delivered, created_at
+			) VALUES (?, ?, ?, ?, 'notice', 'action-needed', ?, ?)`,
+		)
+		.run(nodeId, nodeId, subject, body, MAIL_DELIVERY.PENDING, createdAt);
+	return Number(inserted.lastInsertRowid);
+}
+
+/**
+ * `Promise.race` with a sentinel: a fixture that would otherwise wait forever (a collect
+ * that never settles, an abort that lands nowhere) fails with a named error instead of
+ * hanging the suite.
+ */
+async function settleWithin<T>(work: Promise<T>, label: string, boundMs = 5_000): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const bound = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => reject(new Error(`bounded fixture wait expired (${boundMs}ms): ${label}`)), boundMs);
+		timer.unref?.();
+	});
+	return Promise.race([work, bound]).finally(() => {
+		if (timer) clearTimeout(timer);
+	});
+}
+
+/**
+ * How many stall notices about `childName` the PARENT SESSION received.
+ *
+ * Two postmen can deliver a root's inbox: the harness one this file builds, and the real
+ * one the extension started for the run (2s tick, delivery lands in `pi.messages`). A
+ * release-restored delivery may belong to either, so the assertion counts both — what
+ * matters is that exactly one copy reaches the session.
+ */
+function stallAlertsFor(pi: FakePi, own: readonly string[], childName: string): number {
+	const needle = `${STALL_NOTICE_SUBJECT_PREFIX}${childName}`;
+	return [...own, ...pi.messages.map((message) => JSON.stringify(message))].filter((text) => text.includes(needle)).length;
+}
+
+/** A REAL root postman that only ticks when the test says so (2s cadence is a timer, not a fact). */
+function rootPostman(db: DatabaseSync, supervisor: FakeSupervisor, collected: string[]): LegionPostman {
+	return new LegionPostman({
+		db,
+		nodeId: "root",
+		supervisor,
+		now: () => Date.now(),
+		sendRootMessage: (message) => collected.push(message),
+		intervalMs: 10_000,
+	});
+}
+
+test("vexillatio holds the parent inbox while it collects, and a child that ends obsoletes its stall notice", async () => {
+	// `immediateTimeout: false` makes the utility's `waitSettled` hang, which is what a
+	// 10-minute scout does to `Promise.all(handles.map(collect))`.
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	await withSandbox({}, async ({ pi, cwd }) => {
+		const parentMail: string[] = [];
+		const call = invoke(pi, "vexillatio", {
+			task: "Inspect the repository and report facts.",
+			agent: "scout",
+			timeoutMs: 10_000,
+		}, context(cwd));
+		// The batch reaches the blocked collect only after the hold is taken, and the
+		// ledger row exists before it: both are preconditions of what follows.
+		assert.equal(await waitFor(() => supervisor.calls.some((entry) => entry.method === "waitSettled")), true);
+		const dbPath = findRunDb(cwd);
+		assert.ok(dbPath, "fixture: the root run's ledger exists");
+		const db = openLegionDb(dbPath);
+		const postman = rootPostman(db, supervisor, parentMail);
+		try {
+			assert.ok(getNode(db, "root.scout-0"), "fixture: the utility node is in the ledger");
+			const messageId = queueStallNotice(db, "root", ["scout-0"], Date.now());
+			// Two ticks while the collect is stuck. Without the hold this is exactly the
+			// measured defect: the row went PENDING → ACCEPTED ~200ms after the write and
+			// the parent turned again for a notice whose children had already returned.
+			await postman.tick();
+			await postman.tick();
+			assert.deepEqual(parentMail, [], "the held batch delivers nothing to the parent");
+			assert.equal(pendingInbox(db, "root").length, 1, "the notice waits for the batch instead of reaching the host queue");
+
+			// The scout returns and the batch ends.
+			supervisor.settle("scout-0", { text: "facts collected", stopReason: "stop" });
+			const result = await call;
+			assert.match(result.content.map((part) => part.text ?? "").join("\n"), /── scout-0 ──/);
+			assert.equal(isMailHeld("root"), false, "the hold is released with the batch");
+
+			// The ended child takes its notice with it — before any postman pass.
+			assert.equal(pendingInbox(db, "root").length, 0, "an expired to-do is not left in the inbox");
+			assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 1);
+			const verdicts = readEventsAfter(db, 0)
+				.filter((event) => event.type === "mail_bounced" && (event.data as { messageId?: number }).messageId === messageId)
+				.map((event) => (event.data as { reason?: string }).reason);
+			assert.deepEqual(verdicts, [MAIL_BOUNCE_REASON.OBSOLETE_AFTER_CHILD_END]);
+			// …and the released postman cannot resurrect it: the parent receives 0 mails.
+			await postman.tick();
+			assert.deepEqual(parentMail, []);
+		} finally {
+			postman.stop();
+			db.close();
+		}
+	}, supervisor);
+});
+
+test("vexillatio's hold does not eat a live child's alert: a still-running notice is delivered after the batch", async () => {
+	// The reverse control of the case above: the pending row and the hold must COEXIST,
+	// and the notice names a child that is still RUNNING at release time — an alert the
+	// hold must never absorb (a release that discards the inbox would eat real mail).
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	await withSandbox({}, async ({ pi, cwd }) => {
+		const parentMail: string[] = [];
+		const call = invoke(pi, "vexillatio", {
+			task: "Inspect the repository and report facts.",
+			agent: "scout",
+			timeoutMs: 10_000,
+		}, context(cwd));
+		assert.equal(await waitFor(() => supervisor.calls.some((entry) => entry.method === "waitSettled")), true);
+		const dbPath = findRunDb(cwd);
+		assert.ok(dbPath, "fixture: the root run's ledger exists");
+		const db = openLegionDb(dbPath);
+		const postman = rootPostman(db, supervisor, parentMail);
+		try {
+			// A child of root that stays `running` for the whole case: the notice points at
+			// live work, so the STALL predicate (the only thing delivery consults) says
+			// "deliver it" — now and after the release alike.
+			insertNode(db, { parentId: "root", name: "watcher", role: "worker", status: "running" }, () => Date.now());
+			queueStallNotice(db, "root", ["watcher"], Date.now());
+			await postman.tick();
+			await postman.tick();
+			// The two facts must be true AT THE SAME TIME, which is what makes a release
+			// that clears the inbox visible: held AND still queued.
+			assert.equal(isMailHeld("root"), true, "fixture: the batch still holds the inbox");
+			assert.deepEqual(parentMail, [], "held: the harness postman delivers nothing");
+			assert.equal(stallAlertsFor(pi, parentMail, "watcher"), 0, "…and the real postman delivers nothing either");
+			assert.equal(pendingInbox(db, "root").length, 1, "the row survives the hold instead of being consumed or dropped");
+
+			// The scout returns; the batch (and its hold) ends.
+			supervisor.settle("scout-0", { text: "facts collected", stopReason: "stop" });
+			await settleWithin(call, "the vexillatio batch returned");
+			assert.equal(isMailHeld("root"), false, "the hold is released with the batch");
+
+			// One harness tick revives the ordinary route; the bounded wait below then
+			// tolerates the run's OWN 2s postman having won the race (it is live in this
+			// sandbox), so the assertion is "delivered once", not "delivered by me".
+			await postman.tick();
+			assert.equal(await waitFor(() => pendingInbox(db, "root").length === 0, 2_000), true, "the released notice left the pending inbox");
+			assert.equal(stallAlertsFor(pi, parentMail, "watcher"), 1, "exactly one copy reaches the parent session");
+			const queued = inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length
+				+ inbox(db, "root", { delivery: MAIL_DELIVERY.DELIVERED }).length;
+			assert.equal(queued, 1, "the ledger records it as accepted/delivered");
+			assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.OBSOLETE }).length, 0, "a live child's alert is never obsoleted");
+		} finally {
+			postman.stop();
+			db.close();
+		}
+	}, supervisor);
+});
+
+test("vexillatio releases the hold when the parent aborts mid-batch (a leak would silence the node forever)", async () => {
+	// `index.ts` releases in a `finally`, and the abort path is the one that also has to
+	// work: a leaked hold parks the inbox of THIS node for the rest of the process, so
+	// every future mail to it would sit PENDING with no route.
+	const supervisor = new FakeSupervisor({ immediateTimeout: false });
+	await withSandbox({}, async ({ pi, cwd }) => {
+		const controller = new AbortController();
+		const call = invoke(pi, "vexillatio", {
+			task: "Inspect the repository and report facts.",
+			agent: "scout",
+			timeoutMs: 10_000,
+		}, context(cwd), controller.signal);
+		assert.equal(await waitFor(() => supervisor.calls.some((entry) => entry.method === "waitSettled")), true);
+		assert.equal(isMailHeld("root"), true, "fixture: the blocked batch holds the inbox");
+		controller.abort();
+		const result = await settleWithin(call, "the aborted batch returned");
+		assert.match(result.content.map((part) => part.text ?? "").join("\n"), /interrupted \(parent turn ended; children still running\)/);
+		assert.equal(isMailHeld("root"), false, "an aborted batch must hand the inbox back");
+
+		// …and the node's mail flows again, which is the fact the flag sums up.
+		const dbPath = findRunDb(cwd);
+		assert.ok(dbPath, "fixture: the root run's ledger exists");
+		const db = openLegionDb(dbPath);
+		const parentMail: string[] = [];
+		const postman = rootPostman(db, supervisor, parentMail);
+		try {
+			queueStallNotice(db, "root", ["scout-0"], Date.now());
+			await postman.tick();
+			assert.equal(await waitFor(() => pendingInbox(db, "root").length === 0, 2_000), true, "a released node delivers again");
+			assert.equal(stallAlertsFor(pi, parentMail, "scout-0"), 1);
+		} finally {
+			postman.stop();
+			db.close();
+		}
+	}, supervisor);
 });
