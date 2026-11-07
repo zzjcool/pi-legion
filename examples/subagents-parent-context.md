@@ -30,7 +30,7 @@
   不要主会话自己逐文件读。
 
 ## 交付流水线：review 是合并门禁，merge 权在主 agent
-- worker 交活（自报 verdict + 分支；有 remote 时才附 MR）→ 主 agent 派一个 fresh-context `worker` 做合并门槛审查（任务卡写明「只审不改」、结论以 `ok: true/false` 开头；本包没有 `reviewer` 角色）。
+- worker 交活（自报 verdict + 分支；有 remote 时才附 MR）→ 主 agent 派一个 fresh-context `worker` 做合并门槛审查（任务卡写明「只审不改」、结论以 `ok: true/false` 开头；本包没有 `reviewer` 角色）。分支与 MR 只在主 agent 显式授权时才存在，见「派发纪律」的越权条目。
 - **审查任务卡里必须附上冻结契约的关键决策**（出方案那一方的 D 编号决策、刻意删除/不改的项），否则审查方会把「刻意为之」误判为「缺失功能」，引发不必要的返工循环（契约矛盾型 major）。
 - 审查方报 critical/major findings → steer 原 worker 修复 → 复审；minor 可接受后合入。修复范围应由主 agent 按契约裁决后裁剪，全盘照单转给 worker 是浪费。
 - **交付物是分支**：`git log` 能看到、`git diff` 能审就够；MR 只是有 remote 时的便利，不是门槛。
@@ -42,6 +42,7 @@
 - 任务本身只值一次工具调用的微小操作。
 
 ## 派发纪律
+- **worker 不得自作主张 `git commit` / `git push` / 建分支 / 开 PR**：交活只交 verdict + 工作区改动（或任务卡里显式写明的那个分支）。`commit`、`push`、建分支、开 PR 各算一次越权——verify 门禁只跑命令，不替父会话落盘历史，更不替它对外发声。需要分支/MR 时由主 agent 在任务卡里**显式授权并写明分支名**（例：`分支：feat/x`），worker 自己开 PR 属于越权。若 worker 已经建了分支/PR：由主 agent 决定保留还是关闭，worker 不得自行 `push` 到受保护分支（`main`/`master`），也不得自己 merge。
 - review/侦察类用全新会话（不 --session 继承），避免主会话历史污染判断。
 - 写操作类 worker 同一 worktree 只留一个 writer，避免冲突。
 - worker 只接收具体任务，不要让 worker 再自己开 worker/写操作子 agent；

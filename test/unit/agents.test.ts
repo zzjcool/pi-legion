@@ -1321,3 +1321,121 @@ test("#301 guard: the repo never ships a card or a dispatch for a removed role",
 		assert.deepEqual(hits, [], `bench/${entry} dispatches a role that has no card`);
 	}
 });
+
+test("#301 prose guard: no shipped surface names a removed role outside an explicit 'it is gone' clause", () => {
+	// The dispatch-shaped guard above only matches `agent: "reviewer"`. That left
+	// the prose version of the same rot uncovered: after #301 deleted five cards,
+	// `examples/subagents-parent-context.md` and `skills/pi-legion/SKILL.md` kept
+	// telling a parent which role to dispatch in plain sentences ("派一个 planner
+	// 出方案"), and nothing failed — the reader hits UNKNOWN_AGENT on a card that
+	// is gone, far from the edit that rotted it. So this scan reads whole lines
+	// (and whole-clause exemptions, below), not dispatch expressions.
+	//
+	// EXEMPTION RULE (deterministic — no judgement, no model, no "looks fine"):
+	//   A CLAUSE that carries an explicit this-role-is-gone marker may name the role,
+	//   because "本包没有 `reviewer` 角色；派 fresh-context `worker` 审查" is the FIX,
+	//   not the bug. The marker set is EXEMPT_MARKERS below; any clause naming a
+	//   removed role WITHOUT one of those markers is a hit.
+	//   Scoped to the clause (split on ；;。) rather than the whole line on purpose:
+	//   "本包没有 `reviewer` 角色；出方案派 planner" must still fail on `planner`,
+	//   and a line-wide exemption would have cleared it too.
+	//   Why not "only match `派 X` / `用 X`"? Because the rot we are guarding
+	//   against is exactly a sentence that recommends the role in some phrasing
+	//   nobody anticipated ("先开一个 pi 做第二意见"), and a dispatch-verb allowlist
+	//   is what was too narrow in the first place.
+	//
+	// `search` needs a second rule: it is one of the removed role names AND
+	// ordinary English in these very files ("an over-scoped search" in
+	// agents/scout.md, "`/` search" in the TUI help), so a bare word match would
+	// fire on prose that never refers to a role. It only counts in a ROLE SLOT:
+	// backtick/quote-wrapped, after `agent:`, or after 派/用/调. Every other name
+	// below has no other meaning in these surfaces, so it is matched as a word.
+	const EXEMPT_MARKERS =
+		/没有|不存在|已删除|已移除|不提供|no longer|not shipped|never shipped|\bremoved\b|\bmissing\b|#301/i;
+	const UNAMBIGUOUS = ["advisor", "designer", "planner", "prototype", "researcher", "reviewer"];
+	const AMBIGUOUS = ["search"];
+	// Characters that wrap a role name when a doc refers to it as a role.
+	const Q = "[\"'\u0060\u300c]";
+	const Q_END = "[\"'\u0060\u300d]";
+	const patterns = new Map<string, RegExp>();
+	for (const name of UNAMBIGUOUS) patterns.set(name, new RegExp(`\\b${name}\\b`, "i"));
+	for (const name of AMBIGUOUS) {
+		patterns.set(
+			name,
+			new RegExp(
+				`${Q}\\s*${name}\\s*${Q_END}` + // quoted/backticked role name
+					`|agent\\s*:\\s*["']?${name}\\b` + // `agent: "search"`
+					`|(?:派|用|调)\\s*(?:一?个)?\\s*["'\u0060]?${name}\\b`, // 派 search / 派一个 search
+				"i",
+			),
+		);
+	}
+
+	const mdUnder = (dir: string): string[] =>
+		readdirSync(new URL(`../../${dir}/`, import.meta.url), { recursive: true, encoding: "utf8" })
+			.map((entry) => entry.split(path.sep).join("/"))
+			.filter((entry) => entry.endsWith(".md"))
+			.map((entry) => `${dir}/${entry}`)
+			.sort();
+	// `examples/` is covered recursively (so `examples/*.md` is included) and
+	// `skills/` only at SKILL.md, matching task surfaces: a skill's reference files
+	// are not parent-facing dispatch prose.
+	const surfaces = [
+		...mdUnder("agents"),
+		...mdUnder("examples"),
+		...mdUnder("skills").filter((entry) => entry.endsWith("SKILL.md")),
+	];
+	// A scan that reaches nothing passes for the wrong reason. These three anchors
+	// are the surfaces #301 actually rotted, so their presence is part of the test.
+	for (const anchor of [
+		"agents/scout.md",
+		"examples/subagents-parent-context.md",
+		"skills/pi-legion/SKILL.md",
+	]) {
+		assert.ok(surfaces.includes(anchor), `the scan must reach ${anchor}; saw ${surfaces.join(", ")}`);
+	}
+
+	// `docs/` is deliberately NOT scanned for bare prose. The design/contract docs
+	// under `docs/contracts/` are historical records that legitimately name
+	// reviewer/planner as *conceptual actors* of past runs (e.g.
+	// `docs/contracts/vexillatio-contract.md`), and rewriting history to satisfy a
+	// word grep would be the wrong fix. Dispatch-shaped mentions in
+	// `docs/subagents-teams.md` stay covered by the guard above.
+	const CLAUSE_SEPARATOR = /[\uFF1B;\u3002]/;
+	const clauseAround = (line: string, at: number): string => {
+		let start = 0;
+		for (let i = 0; i < at; i += 1) if (CLAUSE_SEPARATOR.test(line.charAt(i))) start = i + 1;
+		let end = line.length;
+		for (let i = at; i < line.length; i += 1) {
+			if (CLAUSE_SEPARATOR.test(line.charAt(i))) {
+				end = i;
+				break;
+			}
+		}
+		return line.slice(start, end);
+	};
+
+	const hits: string[] = [];
+	for (const surface of surfaces) {
+		const text = readFileSync(new URL(`../../${surface}`, import.meta.url), "utf8");
+		text.split("\n").forEach((line, index) => {
+			for (const [name, pattern] of patterns) {
+				const match = pattern.exec(line);
+				if (!match || match.index === undefined) continue;
+				if (EXEMPT_MARKERS.test(clauseAround(line, match.index))) continue;
+				hits.push(`${surface}:${index + 1} names \`${name}\` — ${line.trim().slice(0, 140)}`);
+			}
+		});
+	}
+
+	assert.deepEqual(
+		hits,
+		[],
+		"a shipped surface must not name a removed role without saying it is gone.\n" +
+			"本包内置只有 scout/worker/centurion（agents.ts:44-48）；#301 已删除 " +
+			"reviewer/planner/designer/prototype/advisor/search。\n" +
+			"Fix the prose (dispatch a `worker`/`scout` with the role spelled out in the task card), " +
+			`or mark the clause explicitly as gone (allowed markers: ${EXEMPT_MARKERS}).\n` +
+			`${hits.join("\n")}`,
+	);
+});
