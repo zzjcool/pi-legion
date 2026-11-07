@@ -28,6 +28,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - viz 契约标注证据链：门槛只在本机 `bench/perf-core/10-legion-frame-alloc.ts:431-436` 与测试断言中，完整报告未入库（`reports/` 被忽略）、CI 不采集。
 - `osc-busy-plugin`：把“不得 printf OSC 7501”明确为**调用方纪律、非运行时守卫**（Non-goals 就不解析子进程 stdout）。
 
+## [5.5.1] — 2026-11-07
+
 ### Fixed
 
 - **A synchronous `vexillatio` batch no longer leaves an expired stall notice behind for the parent.**
