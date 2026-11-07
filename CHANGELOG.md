@@ -11,6 +11,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [5.4.1] — 2026-11-07
+
+一个只改口径的补丁版。5.4.0 把 MCP 默认给了所有子会话，于是 `acceptance.role: read-only` 的 scout
+也能调用 server 暴露的写能力——这一条已经在 5.4.0 里披露，但「只读」这个词仍然带着它兑现不了的暗示。
+本版把名实对齐：角色只保证「不通过 bash 改工作区」，`edit`/`write` 由卡片的 `tools:` 决定，
+MCP 与 `codemode` 脚本的副作用不在契约内。**没有任何行为变化**，`npm` 上的 5.4.0 与 5.4.1 代码等价。
+
 ### Docs
 
 - **「只读角色」的口径写清楚了（选项 C：只改名实，不改行为）。** 5.4.0 把 MCP 默认给了所有子会话，
