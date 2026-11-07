@@ -185,8 +185,11 @@ export interface AgentConfig {
 	/**
 	 * #298: this role's team defines its own phase machine.
 	 *
-	 * Only meaningful on a team root (a centurion). Omitted means the built-in
-	 * four-phase pipeline, so an undeclared team behaves exactly as before.
+	 * Only meaningful on a team root (a centurion). Omitted means NO phase machine
+	 * at all (#371): `nodes.phase` stays NULL, `legion_phase` is not registered,
+	 * and the collection / verifying gates never run. A team gets the built-in
+	 * four-phase pipeline only by declaring it — on the card or via the launch
+	 * `phases` argument.
 	 * Validated at load: an invalid machine is rejected rather than surfacing
 	 * mid-run after the team has already spent tokens.
 	 */

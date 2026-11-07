@@ -7,12 +7,18 @@ maxSubagentDepth: 3
 timeoutMs: 1800000
 worktree: true
 # team: 可选默认队（须真实存在于 settings.teams）；省略 = 全 roster（REV-15）
-# #371: `level: verified` is gone. Nothing in the repo reads `acceptance.level` —
-# the level a caller sees is derived at collect time from `verify:` commands — so
-# the old line only promised a machine check this card could never receive. It
-# cannot simply be DELETED, though: `parseAcceptance` uses `level` as the gate
-# that decides the block exists at all, and dropping it would take `role` and
-# `criteria` with it. `attested` is what this card's criteria can actually earn.
+# #371: this card earns `attested`, not `verified`. `acceptance.level` is still a
+# legal frontmatter key (`VALID_ACCEPTANCE_LEVELS` = none | attested | verified) and
+# the level reported to a caller IS read and displayed (run.json, the completion
+# notice, the status widget, `summary`), but a card's declared level is never a
+# machine gate: the level a caller sees is derived at collect time from the child's
+# verdict + criteria (`src/runs/acceptance.ts` is the only place that promotes it to
+# `verified`, and only for a required `verification-output` criterion carrying an
+# explicit `command`). So the old line only promised a check this card could never
+# receive. It cannot simply be DELETED, though:
+# `parseAcceptance` uses `level` as the gate that decides the block exists at all,
+# and dropping it would take `role` and `criteria` with it. `attested` is what this
+# card's criteria can actually earn.
 # `legion-team-delivery` is `optional` for the same reason: its evidence set has
 # no `verification-output` and no `command`, so a `required` marker promised a
 # check that could never run.

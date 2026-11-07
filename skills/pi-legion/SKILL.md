@@ -1,6 +1,6 @@
 ---
 name: pi-legion
-description: "Use the subagent tool to delegate to a loaded role; use centurion for recursive squads and /legion to inspect the tree. Pi Legion v2 runs headless Pi RPC children and records their shared tree state in legion.db."
+description: "Use the subagent tool to delegate to a loaded role; use centurion for recursive squads and /legion to inspect the tree. Pi Legion v2 runs children in-process by default (rpc only for a worktree-owning centurion) and records their shared tree state in legion.db."
 ---
 
 # Pi Legion
@@ -13,17 +13,22 @@ launch child processes manually.
 ## Dispatch
 
 ```text
-subagent({ agent: "search", task: "<query>" })
+subagent({ agent: "scout", task: "<question list>" })
 subagent({ agent: "worker", task: "<task card>" })
 subagent({ agent: "centurion", task: "<目标 + 验收清单>" })
 subagent({ tasks: [
-  { agent: "reviewer", task: "<lane A>" },
-  { agent: "reviewer", task: "<lane B>" },
+  { agent: "worker", task: "<lane A>" },
+  { agent: "worker", task: "<lane B>" },
 ] })
 ```
 
-That is the dispatch path: Pi Legion starts headless `pi --mode rpc` child
-processes under a tree-aware supervisor. A `centurion` leads its own squad and
+The loaded roles are whatever `subagent({ action: "list" })` reports; this
+package bundles only three of them — `centurion`, `worker`, and `scout`.
+
+That is the dispatch path: Pi Legion starts children as `AgentSession`s inside
+the parent process under a tree-aware supervisor; only a worktree-owning
+`centurion` becomes a separate `pi --mode rpc` process (a real `pi` TUI in an
+`hc` terminal). A `centurion` leads its own squad and
 may recursively dispatch when its role and inherited depth budget allow it;
 ordinary roles should not be assumed to have that permission. Give every child
 a concrete task and acceptance criteria. Children communicate through the
@@ -60,8 +65,10 @@ Child nodes have access to:
   validates and records the transition; do not claim a phase change from chat
   text alone.
 
-A squad's four work phases are **planning → implementing → reviewing →
-verifying**. Planning writes `.pi-legion/contract.md` with interfaces, file
+When a squad declares the built-in machine, its four work phases are
+**planning → implementing → reviewing → verifying**; a squad that declares no
+`phases` has no phase machine at all (no `nodes.phase`, no `legion_phase` tool).
+Planning writes `.pi-legion/contract.md` with interfaces, file
 ownership, and acceptance commands before implementation starts. Reviewing
 uses independent review; verifying runs the contract's `legion-verify`
 commands under the supervisor, without an LLM deciding whether they passed.

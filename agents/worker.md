@@ -8,7 +8,7 @@ inheritSkills: false
 async: true
 timeoutMs: 2700000
 acceptance:
-  level: verified
+  level: attested
   role: writer
   criteria:
     - id: typecheck-test-pass

@@ -18,23 +18,23 @@
 
 ## 必须并行派发（在 subagents tab 下拆多个 pane，每 pane 一个 pi）
 - **跨多目录/多模块的改动**：每个互不依赖的模块一个 pi worker，并行推进，主 pane 只做汇总。例：同时改后端+前端时，开两个 worker pi。
-- **实现完成后的对抗式 review**：并行开多个 fresh-context pi reviewer，角度至少包含「正确性/回归」「测试覆盖」「简洁性」，再由主 pane 综合修复。
+- **实现完成后的对抗式 review**：并行开多个 fresh-context `worker`，任务卡里写清各自的 review 视角（正确性/回归、测试覆盖、简洁性，并要求「只审不改」），再由主 pane 综合修复。**本包没有 `reviewer` 角色**——`BUILTIN_AGENT_NAMES` 只有 `scout` / `worker` / `centurion`（reviewer/planner/designer/prototype/advisor 在 #301 被删除）。
 - **多个互不依赖的独立任务（测试/回归/调研）**：直接并行，不要串行排队。
 
 ## 必须派发（单个也派）
 - **不确定方案时**：先开一个 pi 做第二意见，拿到建议再动手。
-- **planner 的产出是计划，不是基线实测**：给 planner 的任务里显式禁止跑集成/全量测试（至多 typecheck 或读 CI 结果），需要基线验证的是 worker 的 verify 门禁职责。违反此条是 planner 过度侦察，直接浪费 20 分钟级别的时间。
+- **做方案的那个任务的产出是计划，不是基线实测**：任务卡里显式禁止跑集成/全量测试（至多 typecheck 或读 CI 结果），需要基线验证的是 worker 的 verify 门禁职责。违反此条是过度侦察，直接浪费 20 分钟级别的时间。**本包没有 `planner` 角色**：方案任务派给 `scout`（只读侦察、在回答里给方案）或 `worker`（需要落盘成文时）。
 - **大改动前**：先侦察摸清代码（多路 scout 并行，见上）→ 出计划 → 再开 worker pi 实现。
-- **需要查外部资料/文档时**：开 researcher pi，不要自己瞎猜。
+- **需要查外部资料/文档时**：先派 `scout` 做侦察/第二意见（只读、不带历史），拿不准再自己查，不要自己瞎猜。**本包没有 `researcher` 角色**——可派发角色只有 `scout` / `worker` / `centurion`。
 - **用户报告 bug / 体验问题要定位原因时**：这是典型的侦察场景，直接派 scout 并行摸事实，
   不要主会话自己逐文件读。
 
 ## 交付流水线：review 是合并门禁，merge 权在主 agent
-- worker 交活（自报 verdict + 分支；有 remote 时才附 MR）→ 主 agent 派 reviewer 门槛审查（`ok: true` 才算过）。
-- **reviewer 任务里必须附上冻结契约的关键决策**（planner 的 D 编号决策、刻意删除/不改的项），否则 reviewer 会把「刻意为之」误判为「缺失功能」，引发不必要的返工循环（契约矛盾型 major）。
-- reviewer 有 critical/major findings → steer 原 worker 修复 → 复审；minor 可接受后合入。修复范围应由主 agent 按契约裁决后裁剪，全盘照单转给 worker 是浪费。
+- worker 交活（自报 verdict + 分支；有 remote 时才附 MR）→ 主 agent 派一个 fresh-context `worker` 做合并门槛审查（任务卡写明「只审不改」、结论以 `ok: true/false` 开头；本包没有 `reviewer` 角色）。
+- **审查任务卡里必须附上冻结契约的关键决策**（出方案那一方的 D 编号决策、刻意删除/不改的项），否则审查方会把「刻意为之」误判为「缺失功能」，引发不必要的返工循环（契约矛盾型 major）。
+- 审查方报 critical/major findings → steer 原 worker 修复 → 复审；minor 可接受后合入。修复范围应由主 agent 按契约裁决后裁剪，全盘照单转给 worker 是浪费。
 - **交付物是分支**：`git log` 能看到、`git diff` 能审就够；MR 只是有 remote 时的便利，不是门槛。
-- **合并由主 agent 统一做，worker 永不自己 merge**。并行多个分支时按 planner 标注的集成顺序合（共享文件的改动必须序列化），冲突时主 agent 裁决。
+- **合并由主 agent 统一做，worker 永不自己 merge**。并行多个分支时按出方案一方标注的集成顺序合（共享文件的改动必须序列化），冲突时主 agent 裁决。
 
 ## 不要派发（保持单 agent，避免无谓开销）
 - 改单个文件的单个函数、跑测试、看日志、回答简单问题。

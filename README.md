@@ -1,14 +1,16 @@
 ---
 name: pi-legion
 npm: "pi-legion"
-description: "Pi Legion v2: recursive centurion teams on Pi. Children run in-process by default (rpc only for a worktree-owning centurion); shared SQLite WAL legion.db. Declarative per-team phase machine (built-in default: planning/implementing/reviewing/verifying), parent/child/sibling legion_mail, three-layer /legion UI, upward branch deliveries (MRs when a remote exists), squad resume."
+description: "Pi Legion v2: recursive centurion teams on Pi. Children run in-process by default (rpc only for a worktree-owning centurion); shared SQLite WAL legion.db. Declarative per-team phase machine (no `phases` = no state machine; the built-in planning/implementing/reviewing/verifying machine must be declared), parent/child/sibling legion_mail, three-layer /legion UI, upward branch deliveries (MRs when a remote exists), squad resume."
 ---
 
 # pi-legion
 
 A Pi extension for building recursive, resumable agent teams. A `centurion`
-leads each squad; Pi RPC runs its children as headless processes, while a
-shared SQLite ledger records the whole tree.
+leads each squad; children run as `AgentSession`s inside the parent process by
+default, and only a worktree-owning centurion is spawned as a separate process
+(see [Spawn mode](#spawn-mode)), while a shared SQLite ledger records the whole
+tree.
 
 > **Name note.** This package was formerly published as
 > `@zzjcool/pi-herdr-subagents` (through 0.14.3; renamed after an npm name
@@ -40,12 +42,12 @@ shared SQLite ledger records the whole tree.
 User (CEO) — root Pi session (TUI)
 ├─ pi-legion extension
 │  ├─ LegionSupervisor (root)
-│  │  ├─ RpcClient × N → headless `pi --mode rpc` child processes
-│  │  ├─ mail postman (inbox delivery) + four-phase state machine
+│  │  ├─ children in-process (AgentSession); worktree centurions on rpc/terminal
+│  │  ├─ mail postman (inbox delivery) + declarative phase machine (opt-in)
 │  │  └─ orphan scan + child lifecycle / usage accounting
 │  ├─ `legion.db` (one shared SQLite/WAL tree ledger)
 │  └─ LegionEventBus → resident tree | `/legion` full view | live overlay
-└─ centurion child (RpcClient; cwd = its subtree worktree)
+└─ centurion child (own process; cwd = its subtree worktree)
    └─ pi-legion in child mode
       ├─ LegionSupervisor for this squad
       ├─ `legion_mail` / `legion_tree` / `legion_phase` tools
@@ -56,9 +58,9 @@ User (CEO) — root Pi session (TUI)
 Transport, state, decision-making, and display are separate layers:
 
 - **Transport:** a child is an `AgentSession` inside the parent process by
-  default; only a worktree-owning centurion runs as a separate `pi --mode rpc`
-  process. A `LegionSupervisor` owns both backends, and a centurion can lead
-  another squad recursively.
+  default; only a worktree-owning centurion runs as a separate process (`rpc`,
+  or `terminal` inside an `hc` terminal). A `LegionSupervisor` owns all three
+  backends, and a centurion can lead another squad recursively.
 - **State:** all nodes in the tree share the `legion.db` SQLite ledger in WAL
   mode. Per-run `run.json` records and session files remain the resume source
   for each child.
@@ -98,13 +100,26 @@ phases:
         require: [children_settled]
 ```
 
-Omitted means the built-in four-phase pipeline
-(`planning → implementing → reviewing → verifying → done`). Conditions are a
-closed vocabulary — `contract_file`, `children_present`, `children_settled`,
-`children_none_failed`, `verdict_ok`, `verdict_not_ok`, `verification_passed`,
-`verification_failed`, `rework_available`, `children_all_failed`, `always` — and
-`done` / `failed` / `aborted` are always available terminals so a team can
-never lose the ability to complete or abort.
+A machine may also set `start` (the entry phase, defaulting to the first one)
+and `maxRework` (default `2`): every transition marked `rework: true` increments
+the counter, and taking it past `maxRework` forces the team to `failed`.
+
+Omitting `phases` means the team has **no state machine at all**: `nodes.phase`
+stays NULL, the `legion_phase` tool is not registered for that node, and the
+verifying gate never runs. The built-in four-phase pipeline
+(`planning → implementing → reviewing → verifying → done`) is
+`DEFAULT_PHASE_MACHINE`, and a team runs it only by declaring it — on the lead's
+card or through the launch-level `phases` argument (root-only, centurion-only).
+Conditions are a closed vocabulary — `contract_file`, `children_present`,
+`children_settled`, `children_none_failed`, `verdict_ok`, `verdict_not_ok`,
+`verification_passed`, `verification_failed`, `rework_available`,
+`children_all_failed`, `always`. A declared machine always has the three
+terminals `done` / `failed` / `aborted` (declared by the author, or injected by
+the normalizer), but none of them is unconditional: `done` on an injected edge
+is the supervisor's exit, so a team may request it only where its own machine
+declares an edge to `done` that the team may take; `failed` needs a declared
+reason (parent decision, every child failed, or exhausted rework); `aborted`
+needs the parent's retire decision — `legion_phase` refuses it outright.
 
 ## Spawn mode
 
@@ -114,14 +129,16 @@ and the rule is simply:
 
 | Launch needs a worktree? | Backend |
 | --- | --- |
+| yes, and this process runs inside an `hc` terminal | `terminal` — the same worktree centurion hosted as a real `pi` TUI in an `hc` terminal, so a person can see it and attach to it ([contract](docs/contracts/centurion-terminal-backend-v1.md)) |
 | yes | `rpc` — a separate `pi --mode rpc` process |
 | no | in-process `AgentSession` inside the parent Node process |
 
-**Why rpc still exists:** it is the only backend that can host a worktree
-child. Only the `centurion` role may hold a worktree (see
-[Delivery and resume](#delivery-and-resume)), so a centurion is the only role
-that can ever run on rpc — every other role runs in-process, where spawn latency
-is lower and no second process is involved.
+**What the process backends are for:** only a worktree child needs one, and
+only the `centurion` role may hold a worktree (see
+[Delivery and resume](#delivery-and-resume)). Outside an `hc` terminal that
+child is an `rpc` process; inside one it is a `terminal` process, which is the
+same role in the same worktree but visible and attachable. Every other role runs
+in-process, where spawn latency is lower and no second process is involved.
 
 **A non-centurion asking for a worktree** is demoted to `worktree: false` with a
 once-per-run warning rather than throwing, so a stale card does not break every
@@ -194,6 +211,24 @@ turn ends, or launch with `async: false`. To stop children explicitly, use
 `subagent({ action: "stop", all: true })`; this runs the normal graceful-retire
 sequence for each selected child. Pass `force: true` to escalate to hard retire
 when a child ignores soft steer / graceful close.
+
+The `action` union is closed; every literal is listed here.
+
+| `action` | What it does |
+| --- | --- |
+| `launch` *(default)* | Start a child from a role card (`agent` + `task`, or `tasks[]`). |
+| `continue` | Act on the child with `message`: a live child is steered in place, an exited one is relaunched from its persisted session so its context survives. |
+| `steer` | Send `message` to a running child without waiting for its reply. Not an interrupt: the text queues at the child's next turn boundary. |
+| `abort` | Interrupt the child's current turn and keep its session, so it stays continuable. The child is not torn down — that is `stop`. |
+| `resume` | The same revive path as `continue`, used to pick a saved child back up (receipt says `Resumed`). |
+| `retire` | Retire the child while preserving its outcome and session for a later resume. |
+| `status` | One child's snapshot with `name`; without `name`, the live-children overview. |
+| `collect` | Wait for the child's current turn and derive its outcome from its session. |
+| `list` | List the loaded roles, with the active team and any team warnings on top when they are not the default. |
+| `wait` | Event-driven wait for `name` or `all: true`; a timeout retires nothing. |
+| `stop` | Graceful stop of one child or of every live child; `force: true` hard-retires. |
+| `diagnose` | The `/legion doctor` self-check returned as tool output, with an optional `section`. |
+| `extend` | Defer the "may be looping" reminder for one direct child by `ms`. It never restarts or revives the child. |
 
 ### Stopping async subagents yourself
 
@@ -270,8 +305,9 @@ legion_phase({ to, note?, evidence?, reason?, supersedes? })
   direct children that a settled sibling has taken over, which is what unlocks
   the exit from `implementing` after a partial failure.
 
-A squad moves through whatever phases its lead declares. With no declaration
-that is the built-in **planning → implementing → reviewing → verifying**:
+A squad moves through whatever phases its lead declares — and a squad whose lead
+declares nothing has no phase at all. The built-in machine is
+**planning → implementing → reviewing → verifying**, ending in `done`:
 planning produces a non-empty `.pi-legion/contract.md` with file ownership and
 acceptance commands; reviewing needs a settled child that returns `ok:true`; in
 verifying the supervisor runs the contract's `legion-verify` commands without an
@@ -333,11 +369,18 @@ Add the v2 `legion` block to `~/.pi/agent/settings.json` or the project
       "verifyCommandTimeoutMs": 600000,
       "mailRatePer5Min": 10,
       "usagePollMs": 30000,
-      "orphanStaleMs": 90000
+      "orphanStaleMs": 90000,
+      "silenceNoticeMs": 120000
     }
   }
 }
 ```
+
+`silenceNoticeMs` (default `120000`) is the stall-notice L1 threshold: a child
+silent this long with an empty in-flight stack is reported to its parent. A
+settings file accepts only a positive integer here — `0`/negative turns the
+detector off only for a hand-built settings object (tests, callers), not from a
+settings file.
 
 The three launch budget gates are enforced against the tree ledger:
 
@@ -425,7 +468,7 @@ side via `subagents.teams.<name>.parentContext` /
 `childContext` (replace, never merge; see [Team 配置](#team-配置)). The
 convention filenames are `PARENT_CONTEXT_CONVENTION` and
 `CHILD_CONTEXT_CONVENTION` in
-[`src/agents/settings.ts`](src/agents/settings.ts#L30-L31); missing convention
+[`src/agents/settings.ts`](src/agents/settings.ts); missing convention
 files simply contribute no context. The repository examples are
 [`examples/subagents-parent-context.md`](examples/subagents-parent-context.md)
 and [`examples/subagents-child-context.md`](examples/subagents-child-context.md).
@@ -440,8 +483,10 @@ same idea as `pi list` / `pi auth check`.
 - `/legion doctor [section]` — one of: `summary`, `extensions`, `models`,
   `spawn`, `memory`, `tools`, `storage`, `runtime`, `errors`, `next`.
 - `subagent({ action: "diagnose" })` — same full report as tool output so the
-  main agent can call it without waiting for you. The tool has no section
-  field; filter with `/legion doctor [section]`.
+  main agent can call it without waiting for you. It takes the same optional
+  `section` filter: `subagent({ action: "diagnose", section: "models spawn" })`
+  means the same as `/legion doctor models spawn`. Space- or comma-separated;
+  an unknown name is rejected with the list of valid sections.
 
 The report is structured for the model: each section ends in **Issues** /
 **Next steps** with copy-pasteable fixes (env exports, role frontmatter,
@@ -467,7 +512,7 @@ Coverage:
 | models | Host vs child model lists, which package restores providers, team/roster gaps |
 | spawn | Sample child argv, recent spawn failures + stderr, nested-spawn flags |
 | memory | Free RAM, memory gate, child V8 flags, verify concurrency slots in use |
-| tools | `/legion` slash list (status, team, agents, summary, on/off, scout-guard, doctor, stop), idle-Esc / strip hints, tool names |
+| tools | the `/legion` slash list (exactly what `/legion help` prints: `status`, `team`, `agents`, `on` / `off`, `summary`, `timing`, `doctor`, `stop`, `--tree` / `<node>`, `help`), the separate top-level `/scout-guard` and `/no-scout-guard` commands, idle-Esc / strip hints, tool names |
 | storage | `legion.db` sizes, orphan `rpc-child-*` temps, effective hygiene limits (default vs env), last sweep marker plus a hint when it is missing or stale |
 | runtime | Live children, tree statuses, acceptance-ish / active nodes |
 | errors | Recent session/tool errors (validation failures, etc.) as a short summary; full journal at `.pi-subagents/session-errors.jsonl` (rotated ~500 lines). Large logs: summary + path only — doctor never dumps the whole file |
@@ -637,7 +682,8 @@ kind: pi
 ```
 
 Child execution is Pi either way: in-process by default, with an automatic
-`rpc` fallback when the resolved spawn needs an OS worktree (see
+`rpc` fallback when the resolved spawn needs an OS worktree — `terminal`
+instead when that process runs inside an `hc` terminal (see
 [Spawn mode](#spawn-mode)).
 
 Version **0.16.x was the final Herdr-era line** — it launched children in Herdr
