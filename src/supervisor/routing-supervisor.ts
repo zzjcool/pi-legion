@@ -3,6 +3,8 @@
  *
  * rpc → RpcSupervisor (unchanged internals)
  * inprocess → InProcessSupervisor
+ * terminal → TerminalSupervisor (centurion worktree inside an `hc` terminal,
+ *            `docs/contracts/centurion-terminal-backend-v1.md`)
  *
  * Same name must not be registered on both backends.
  */
@@ -15,6 +17,7 @@ import {
 } from "../shared/types.ts";
 import { InProcessSupervisor, type InProcessSlotEvent } from "./inprocess-supervisor.ts";
 import { RpcSupervisor } from "./rpc-supervisor.ts";
+import type { TerminalSupervisor } from "./terminal-supervisor.ts";
 import { resolveSpawnMode } from "./spawn-mode.ts";
 import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import type { UIProxy } from "./ui-proxy.ts";
@@ -32,11 +35,20 @@ import type {
 	UsageSnapshot,
 } from "./types.ts";
 
-export type SupervisorBackend = "rpc" | "inprocess";
+export type SupervisorBackend = "rpc" | "inprocess" | "terminal";
 
 export interface RoutingSupervisorOptions {
 	rpc?: RpcSupervisor;
 	inprocess?: InProcessSupervisor;
+	/**
+	 * Third backend: a centurion worktree hosted in an `hc` terminal.
+	 *
+	 * NOT default-constructed, unlike rpc/inprocess. Constructing one only makes
+	 * sense when the host is `hc`, and a default here would let a test double that
+	 * never asked for a terminal spawn a real one. `index.ts` wires it; without it
+	 * a `terminal` launch is refused loudly instead of silently downgraded.
+	 */
+	terminal?: TerminalSupervisor;
 	/** Shared UI proxy preferred; otherwise each backend keeps its own. */
 	uiProxy?: UIProxy;
 	getInprocessLimits?: () => InProcessLimits | undefined;
@@ -112,6 +124,7 @@ export class RoutingSupervisor implements LegionSupervisor {
 	readonly capabilities = { promptDisposition: false } as const;
 	readonly rpc: RpcSupervisor;
 	readonly inprocess: InProcessSupervisor;
+	readonly terminal: TerminalSupervisor | undefined;
 	private readonly owners = new Map<string, SupervisorBackend>();
 	readonly uiProxy: UIProxy;
 
@@ -134,6 +147,7 @@ export class RoutingSupervisor implements LegionSupervisor {
 				// D2-d-2: an in-process slot release wakes every launch-queue pump.
 				onSlotReleased: chainSlotRelease(options.onSlotReleased),
 			});
+		this.terminal = options.terminal;
 		this.uiProxy = options.uiProxy ?? this.rpc.uiProxy;
 	}
 
@@ -166,12 +180,17 @@ export class RoutingSupervisor implements LegionSupervisor {
 				);
 			}
 		}
+		// D1 of the terminal contract: `terminal` is a worktree backend, exactly
+		// like rpc. The inprocess guard above stays the only illegal combination.
+		if (mode === "terminal" && this.terminal === undefined) {
+			throw new SubagentError(
+				`spawnMode "terminal" requires a terminal backend for '${input.name}'; construct RoutingSupervisor with { terminal }`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
 		const existing = this.owners.get(input.name);
 		if (existing && existing !== mode) {
-			const alive =
-				existing === "rpc"
-					? this.rpc.isAlive(input.name)
-					: this.inprocess.isAlive(input.name);
+			const alive = this.ownsAlive(existing, input.name);
 			if (alive) {
 				throw new SubagentError(
 					`child '${input.name}' is already registered on ${existing}; cannot spawn as ${mode}`,
@@ -179,7 +198,7 @@ export class RoutingSupervisor implements LegionSupervisor {
 				);
 			}
 		}
-		const backend = mode === "inprocess" ? this.inprocess : this.rpc;
+		const backend = this.backendOf(mode);
 		const handle = await backend.spawnChild(input);
 		this.owners.set(input.name, mode);
 		return handle;
@@ -227,6 +246,7 @@ export class RoutingSupervisor implements LegionSupervisor {
 		const owner = this.owners.get(name);
 		if (owner === "inprocess") return this.inprocess.isAlive(name);
 		if (owner === "rpc") return this.rpc.isAlive(name);
+		if (owner === "terminal") return this.terminal?.isAlive(name) ?? false;
 		return this.rpc.isAlive(name) || this.inprocess.isAlive(name);
 	}
 
@@ -242,6 +262,9 @@ export class RoutingSupervisor implements LegionSupervisor {
 		const owner = this.owners.get(name);
 		if (owner === "inprocess") return this.inprocess.inFlightTool(name);
 		if (owner === "rpc") return this.rpc.inFlightTool(name);
+		// The terminal backend observes no tool events (contract D12), so the
+		// honest answer is `undefined` — never an inherited record's leftover.
+		if (owner === "terminal") return this.terminalSeam?.inFlightTool?.(name);
 		return this.inprocess.inFlightTool(name) ?? this.rpc.inFlightTool(name);
 	}
 
@@ -253,6 +276,7 @@ export class RoutingSupervisor implements LegionSupervisor {
 		const owner = this.owners.get(name);
 		if (owner === "inprocess") return this.inprocess.inFlightToolStack(name);
 		if (owner === "rpc") return this.rpc.inFlightToolStack(name);
+		if (owner === "terminal") return this.terminalSeam?.inFlightToolStack?.(name);
 		return this.inprocess.inFlightToolStack(name) ?? this.rpc.inFlightToolStack(name);
 	}
 
@@ -264,6 +288,7 @@ export class RoutingSupervisor implements LegionSupervisor {
 		const owner = this.owners.get(name);
 		if (owner === "inprocess") return this.inprocess.lastEventAt?.(name);
 		if (owner === "rpc") return this.rpc.lastEventAt?.(name);
+		if (owner === "terminal") return this.terminalSeam?.lastEventAt?.(name);
 		return this.inprocess.lastEventAt?.(name) ?? this.rpc.lastEventAt?.(name);
 	}
 
@@ -287,6 +312,11 @@ export class RoutingSupervisor implements LegionSupervisor {
 		if (owner === "rpc") {
 			return this.rpc.onEvent(name, listener, options);
 		}
+		if (owner === "terminal") {
+			// Contract D12: v1 feeds no event stream. A no-op unsubscribe is the
+			// whole subscription, which is what "no events" looks like from here.
+			return () => {};
+		}
 		// Pre-spawn: subscribe on both so whichever backend wins still delivers.
 		const offRpc = this.rpc.onEvent(name, listener, options);
 		const offIn = this.inprocess.onEvent(name, listener, options);
@@ -296,10 +326,43 @@ export class RoutingSupervisor implements LegionSupervisor {
 		};
 	}
 
+	/**
+	 * The terminal backend through the frozen seam type.
+	 *
+	 * `TerminalSupervisor` deliberately declares none of the optional display
+	 * members (`inFlightTool`, `inFlightToolStack`, `lastEventAt`) because v1
+	 * observes no events (contract D12); reading them through `LegionSupervisor`
+	 * keeps that absence visible instead of inventing empty methods.
+	 */
+	private get terminalSeam(): LegionSupervisor | undefined {
+		return this.terminal;
+	}
+
+	/** The instance behind one arbitrated backend name. */
+	private backendOf(backend: SupervisorBackend): LegionSupervisor {
+		if (backend === "inprocess") return this.inprocess;
+		if (backend === "terminal") {
+			if (this.terminal === undefined) {
+				throw new SubagentError(
+					"spawnMode \"terminal\" requires a terminal backend; construct RoutingSupervisor with { terminal }",
+					ErrorCodes.INVALID_PARAMS,
+				);
+			}
+			return this.terminal;
+		}
+		return this.rpc;
+	}
+
+	/** Liveness as the named backend sees it (absent terminal backend = never alive). */
+	private ownsAlive(backend: SupervisorBackend, name: string): boolean {
+		if (backend === "inprocess") return this.inprocess.isAlive(name);
+		if (backend === "terminal") return this.terminal?.isAlive(name) ?? false;
+		return this.rpc.isAlive(name);
+	}
+
 	private backendFor(name: string): LegionSupervisor {
 		const owner = this.owners.get(name);
-		if (owner === "inprocess") return this.inprocess;
-		if (owner === "rpc") return this.rpc;
+		if (owner !== undefined) return this.backendOf(owner);
 		if (this.inprocess.isAlive(name)) {
 			this.owners.set(name, "inprocess");
 			return this.inprocess;
@@ -307,6 +370,10 @@ export class RoutingSupervisor implements LegionSupervisor {
 		if (this.rpc.isAlive(name)) {
 			this.owners.set(name, "rpc");
 			return this.rpc;
+		}
+		if (this.terminal?.isAlive(name)) {
+			this.owners.set(name, "terminal");
+			return this.terminal;
 		}
 		throw unknownChildError(name);
 	}

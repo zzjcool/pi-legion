@@ -24,6 +24,7 @@ import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
+import { TerminalSupervisor } from "./src/supervisor/terminal-supervisor.ts";
 import type { AbortOutcome, InFlightToolStack, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
 import { inFlightToolStackOf } from "./src/supervisor/types.ts";
 import { withInFlightToolLine } from "./src/extension/legion-status.ts";
@@ -1479,6 +1480,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				}
 			},
 		}),
+		// Centurion terminal backend v1 (`docs/contracts/centurion-terminal-backend-v1.md`):
+		// a worktree-holding centurion inside an `hc` terminal runs as a real `pi`
+		// TUI. Constructing this backend spawns nothing and reads nothing — the
+		// `hc connect` child, the parent space label and the terminal itself all
+		// appear only when the arbitration actually picks `terminal`, which requires
+		// both `HC_TERMINAL_SOCKET` and `HC_TERMINAL_ID`. Outside `hc` this is inert.
+		terminal: new TerminalSupervisor(),
 		onSpawnRefused,
 	});
 	const verifyRunner = deps.verifyRunner;

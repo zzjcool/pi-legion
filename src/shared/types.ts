@@ -29,8 +29,16 @@ export const AGENT_KINDS = ["pi"] as const;
 
 export type AgentKind = (typeof AGENT_KINDS)[number];
 
-/** How Legion launches a child session: omit → `inprocess` (with automatic rpc fallback when the agent needs a worktree). */
-export const SPAWN_MODES = ["rpc", "inprocess"] as const;
+/**
+ * How Legion launches a child session: omit → `inprocess` (with automatic rpc
+ * fallback when the agent needs a worktree).
+ *
+ * `terminal` is reachable ONLY through the centurion arbitration
+ * (`docs/contracts/centurion-terminal-backend-v1.md` D1/D13): a worktree-holding
+ * centurion inside an `hc` terminal runs as a real `pi` TUI instead of a headless
+ * rpc child. No role card may name it — `spawnMode` is not a card field (#290).
+ */
+export const SPAWN_MODES = ["rpc", "inprocess", "terminal"] as const;
 export type SpawnMode = (typeof SPAWN_MODES)[number];
 
 

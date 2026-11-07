@@ -62,6 +62,7 @@ import {
 	type Usage,
 } from "../shared/types.ts";
 import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
+import { terminalHostAvailable } from "../supervisor/terminal-supervisor.ts";
 import {
 	type AdmissionDimension,
 	type AdmissionQueue,
@@ -1161,14 +1162,24 @@ export class Orchestrator {
 		// itself to a process model. rpc exists for exactly one reason — it is the
 		// only backend that can host a worktree child — so the rule collapses to:
 		//
-		//   worktree isolation ⇒ rpc;  everything else ⇒ in-process.
+		//   worktree isolation ⇒ rpc (or `terminal` inside hc);  everything else
+		//   ⇒ in-process.
 		//
 		// A centurion is the only role allowed to hold a worktree (#214), so it is
 		// also the only role that reaches rpc (#279). Nothing to deny here anymore:
 		// a non-centurion cannot request worktree in the first place (the guard
 		// above forces it false), and there is no card field left to smuggle a
 		// backend request through.
-		const mode: SpawnMode = worktree === true ? "rpc" : "inprocess";
+		//
+		// `terminal` is `docs/contracts/centurion-terminal-backend-v1.md` D1/D2: the
+		// SAME worktree-holding centurion, hosted as a real `pi` TUI inside an `hc`
+		// terminal so a person can see and attach to it. Host detection is two env
+		// markers and costs nothing (no subprocess, no socket probe, no git call —
+		// I3); outside `hc` the expression reduces byte-for-byte to the old one. The
+		// role test is the `isCenturion` already computed above.
+		const mode: SpawnMode = worktree === true
+			? isCenturion && terminalHostAvailable(process.env) ? "terminal" : "rpc"
+			: "inprocess";
 		const inProcess = mode === "inprocess";
 		// Downstream must see the arbitrated result, otherwise RoutingSupervisor
 		// re-resolves the omitted field to `inprocess` on its own and throws
