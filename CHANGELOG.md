@@ -11,6 +11,45 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [5.5.0] — 2026-11-07
+
+一次「让 centurion 从黑盒变成可看的终端」的发布。herdr-app 的 agents 侧栏只列**自己上报状态**的终端
+（OSC 7501），而带 worktree 的 centurion 一直是 headless `pi --mode rpc` 子进程：它永远不会出现在窗口里，
+也没人能 attach 进去。本版在 hc（herdr-core）宿主上给它换了一个 transport —— 同一个 worktree、同一个
+centurion，跑成终端里的真 `pi` TUI：窗口里能看实时过程、点进去能接管、Esc 打断还保留上下文。
+**worktree 归属（§9 REV-17）与创建逻辑一行未动**，变的是运输层，不是权限。
+
+### Added
+
+- **第三个 spawn 后端 `terminal`（`docs/contracts/centurion-terminal-backend-v1.md`）。** 仲裁只在
+  「`agent.name === "centurion"` 且 `worktree === true` 且宿主带 `HC_TERMINAL_SOCKET` + `HC_TERMINAL_ID`」
+  时选它；其余情况逐字节等于旧表达式。探测是两个环境变量读取，零子进程、零 git probe。
+- **`hc` 终端里的 centurion 会出现在父会话所在 space。** 子终端复用父终端的 `herdr.space` 标签
+  （每个 supervisor 只读一次并缓存），名字映射为 `lgl-<handle>`（≤32 字符、`[a-z0-9_-]`），
+  因此 herdr-app 侧栏按 hc 的 parent 关系把它挂在派发它的会话下面。
+- **能力上限如实声明，不编造事实。** 不接事件流（父 TUI 的实时/卡死视图对它保持沉默，而不是误报）、
+  不实现 `inFlightTool` / `lastEventAt`、`capabilities.promptDisposition = false`。
+- **`abort` 与 `retire` 的语义分开。** `abort` = `terminal.interrupt`（Esc：进程、上下文、turn 计数都在，
+  之后仍可继续）；`retire` = `terminal.kill` + `terminal.rm`。
+
+### Changed
+
+- **`hc` 可执行文件解析链：`HC_BIN` → `PATH` → `~/.local/bin/hc` → 裸名。** 实测 hc 终端自己的 PATH
+  只有 `/usr/local/bin:/usr/bin`，而安装器把 `hc` 放在 `~/.local/bin` —— 少了这一段，第一次真实运行就是
+  `spawn hc ENOENT`。
+- **测试脚本同时净化 `HC_TERMINAL_SOCKET` / `HC_TERMINAL_ID`**（与既有 `PI_SUBAGENT_*` 同模式）：
+  测试宿主必须 hermetic，否则在 hc 终端里跑 `npm test` 会让四条冻结测试里的 7 条
+  「centurion + worktree ⇒ rpc」断言因真实宿主而翻红。
+- **`.github/workflows/release.yml` 改用 npm trusted publishing（OIDC）。** 不再依赖 `NPM_TOKEN`
+  与手工 `npm stage approve`：`id-token: write` 让 npm CLI 用 job 的 OIDC token 换一次性发布凭证，
+  `npm publish --provenance` 同时附上 provenance。
+
+### Docs
+
+- 新增 `docs/contracts/centurion-terminal-backend-v1.md`（D1–D13、四条不变式、Non-goals）。
+- `docs/legion-v2-contract.md` 追加 **REV-31**：worktree 归属不变，改的是 transport 选择。
+
+
 ## [5.4.1] — 2026-11-07
 
 一个只改口径的补丁版。5.4.0 把 MCP 默认给了所有子会话，于是 `acceptance.role: read-only` 的 scout
