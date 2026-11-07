@@ -494,6 +494,26 @@ The child-guard is appended unconditionally and is not subject to either knob �
 a child without it breaks the prompt/format contract no matter what the card
 asked for.
 
+### What `read-only` actually covers
+
+`acceptance.role: read-only` is a **bash** rule. The write heuristic in the
+child-guard (`src/extension/child-guard.ts`) refuses output redirection,
+`rm`/`mv`-style heads, `git commit|push|…`, package-manager writes and `sed -i`,
+and its `tool_call` handler starts with `if (event.toolName !== "bash") return;`.
+So the promise is narrower than the name suggests:
+
+| | enforced by |
+| --- | --- |
+| no write command **through bash** | the role (`read-only`) |
+| no `edit` / `write` at all | the card's `tools:` list — **not** the role |
+| no MCP server side effects | nothing; see the MCP section above |
+| no side effect inside a `codemode` script | nothing — a script may call any tool the session can call |
+
+In other words: a `read-only` child cannot dirty the working tree *through bash*.
+Everything else follows from the card and from what the session loaded. If a role
+must not reach the outside world, keep MCP out of it (`PI_LEGION_CHILD_MCP=0`, or
+per-server selection once that exists) instead of trusting the role name.
+
 **Discovery limit.** Host extensions are found by reading `pi list` (which
 reports package *directories*) and resolving each one the way pi's own loader
 does: `package.json`'s `pi.extensions`, else `index.ts`/`index.js`. Single-file
@@ -535,7 +555,8 @@ would have blocked even `web_search` while a `destructiveHint` deny-list would b
 a no-op for any server that declares nothing. The honest consequence: **a role
 whose `acceptance.role` is `read-only` (the bundled `scout`) can call whatever
 write capability an MCP server exposes.** The bash-only read-only classification
-is unchanged — it never covered anything but bash.
+is unchanged — it never covered anything but bash; see
+[What `read-only` actually covers](#what-read-only-actually-covers).
 
 ### Extra agent directories
 

@@ -522,3 +522,23 @@ not this runtime init」）按 G1 之后的真实行为重写；对「没跑到 
 
 G1 必须有一条能红的测试；其余按条改。改完做一次**限定范围的** fresh-context review
 （只看 r5 diff 与 G1 的可测性结论），通过即合并。
+
+### r6 — 只读与 MCP 的边界：改名实，不改行为（root 决议 C）
+
+review 之后仍然悬着的那条「只读 scout 可以调用 MCP 写能力」，三个选项里选了 **C**：
+**不改行为，只把名实对齐**。理由：annotation 级防火墙做不到（真实 server 的
+`annotations` 全是 `null`，实测），而按角色一刀切掉 MCP 会正面冲突本 MR 的目的
+（scout 的检索正是 MCP 的主要用途）。
+
+落地（全部文档面，零行为变更）：
+
+1. `README.md` 新增 **What `read-only` actually covers** 表：只保证「不通过 bash 改工作区」；
+   `edit`/`write` 由卡片的 `tools:` 决定而非角色；MCP 与 `codemode` 脚本的副作用不在契约内。
+   MCP 段的「bash-only classification」一句改为指向该表。
+2. `agents/scout.md`：description 写明「不改文件、不跑写命令」，正文加一条「只读的边界」，
+   让 scout 自己也不会声称「因为是只读角色所以没有副作用」。
+3. `docs/design.md` 的总览条目加同一口径。
+4. `CHANGELOG.md` `[Unreleased] → Docs` 记一条。
+
+**没有做的事**（明确留在「不做」清单里）：per-role / per-server 的 MCP 选择、
+MCP 工具级拦截。要做就等于回到选项 B，需要单独立项。

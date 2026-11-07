@@ -11,6 +11,16 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Docs
+
+- **「只读角色」的口径写清楚了（选项 C：只改名实，不改行为）。** 5.4.0 把 MCP 默认给了所有子会话，
+  于是 `acceptance.role: read-only` 的 scout 可以调用 MCP server 暴露的写能力。三条路（角色默认不给 MCP /
+  按 server 白名单 / 只改名实）里选了第三条：annotation 级防火墙做不到（真实 server 的 `annotations`
+  实测全为 `null`），而按角色切掉 MCP 会废掉 scout 的检索。现在 `README.md` 有一张
+  **What `read-only` actually covers** 表——它只保证「不通过 bash 改工作区」，`edit`/`write` 由卡片的
+  `tools:` 决定而非角色，MCP 与 `codemode` 脚本的副作用不在契约内；`agents/scout.md` 的正文里也写了同一条，
+  免得 scout 自己复述一个它兑现不了的承诺。**行为没有任何变化。**
+
 ### Changed
 
 - **完成通知只在父 run 边界交付，80s 上限降级为健康计数**（`docs/contracts/notice-delivery-v2.md`）。
