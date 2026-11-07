@@ -1,1407 +1,581 @@
-# pi-legion 设计文档
+# pi-legion 设计文档（5.5.0）
 
-> **⚠️ 历史实验笔记（非现行契约）**  
-> 本文记录 herdr / pane 时代的实测与设计推演。**运行时契约以 [README](../README.md) 与 [CONTRIBUTING](../CONTRIBUTING.md) 为准**（Pi Legion 2.x = headless Pi RPC + `legion.db`；herdr pane 执行已归档到 `src/backends/legacy/`）。  
-> 下文 F 条中标 **✅ landed** 的是已在当前 master 落地的修复；未标注的早期结论仍有参考价值，但不要当作「今日仍坏」的缺口清单。
+> 基线：`pi-legion 5.5.0`（`package.json`）。**代码是唯一事实源**：本文每条结论都落在一个具体源文件/符号上，写不出锚点的内容不写。
+> 历史文档：herdr / pane 时代的设计推演与 F1–F46 实验记录已整体移入 [`docs/archive/design-herdr-era.md`](archive/design-herdr-era.md)，本文不复述。旧文档中的 `src/backends/legacy/` 在 v4 已删除。
 
-> 基于 10 组实测实验（exp1–exp10）得出的设计。所有结论都标注了实验依据，
-> 未经验证的假设明确标记为「待验证」。
+---
 
 ## 0. 核心命题
 
-**herdr 的 subagent 不是「函数调用」，而是「受监督的活进程」。**
+5.x 的三条承重假设与 herdr 时代完全相反。理解这三条，其余章节都是推论。
 
-这个差异决定了整个设计：
-
-| 维度 | spawn 模型（pi-subagents） | herdr 模型（本设计） |
+| 维度 | 5.5.0 的答案 | 代码锚点 |
 | --- | --- | --- |
-| 生命周期 | 调用开始→返回即结束 | pane 常驻，可多轮、可续跑 |
-| 完成语义 | 退出 = 结束 | `done` = 本轮说完，**不等于结束** |
-| 父进程死 | 子进程全死 | **子进程继续跑**（exp8 实测） |
-| 结果通道 | stdout / `--mode json` | session jsonl（结构化）+ pane read |
-| 隔离 | 进程级天然隔离 | **无隔离，需靠纪律**（exp10 实测） |
-| 回收 | 自动 | 需显式，但 tab close 可原子化 |
+| 子 agent 跑在哪 | **默认同进程 `AgentSession`**；只有需要 git worktree 的 centurion 才升级为子进程 | `Orchestrator.launch` 的仲裁三元式（`src/runs/orchestrator.ts`）；`DEFAULT_SPAWN_MODE`（`src/supervisor/spawn-mode.ts`） |
+| 状态存在哪 | **SQLite（WAL）`legion.db` 四表是权威树**；run 目录降级为会话寻址副本 | `SCHEMA_V1` / `legionDbPath` / `openLegionDb`（`src/legion/db.ts`） |
+| 阶段从哪来 | **root 在派发时声明的相位机**；未声明 = 根本没有状态机 | `DEFAULT_PHASE_MACHINE`（`src/legion/phase-machine.ts`）；`Orchestrator.reserveNode` 的条件写入（`src/runs/orchestrator.ts`） |
 
-### 实现状态（相对本文档）
+### 0.1 被推翻的旧假设
 
-下面 F 条目里不少写的是「当时的缺口」（文首 banner 已说明：契约以 README + CONTRIBUTING 为准）。当前运行时已经钉死：
+| 旧假设（herdr 时代） | 现行事实 |
+| --- | --- |
+| 执行层 = `tab create` → `pane split` → `agent start` | 执行层 = `RpcSupervisor` / `InProcessSupervisor` / `TerminalSupervisor` 三后端 + `RoutingSupervisor` 仲裁（`src/supervisor/routing-supervisor.ts`） |
+| 进程归 herdr server，「父死子活」 | 默认子 agent 就是父进程里的一个 `AgentSession`（`src/supervisor/inprocess-supervisor.ts`），父进程死则会话随之结束；不存在「父死子活」的设计前提 |
+| 状态机 = pane 生命周期；阶段固定四步 | 阶段是**可声明机器**（`PhaseMachine`），`nodes.phase` 可为 `NULL`（`#371`） |
+| 隔离边界 = tab；原子回收 = `tab close` | 隔离 = git worktree（centurion-only）+ 进程组；回收 = stdin EOF → SIGTERM → SIGKILL → 后代 pgid sweep（`RpcSupervisor.retireChild`） |
+| 持久化 = `run.json` + `*.jsonl` | 权威状态 = `legion.db`（nodes/events/usage/messages）；`run.json` 是恢复源与会话寻址副本 |
+| `kind` 多后端（cursor/claude/codex/gemini） | `AGENT_KINDS = ["pi"]`（`src/shared/types.ts`），非 `pi` 值解析期被忽略并告警一次 |
+| 通知 = 展示层事件 | mail / notice 有独立投递状态机（`messages.delivered` 五值域、`claimForDelivery`、`mail-release`） |
 
-- 子进程强制加载 child-guard：拦 `herdr agent prompt|wait|send-keys|start`、外 pane read、只读角色写操作（**仅 bash**：`edit`/`write` 由卡片 `tools:` 决定，MCP 副作用不在内 —— 口径见 README「What `read-only` actually covers」）
-- 任务卡自动附录（禁止 wakeup、必须 `{"ok":…}`）
-- worker 的 `verification-output` 在 collect 后由插件跑 `criterion.command`（有 command 才跑，从 `attested` 升到 `verified` 或拒绝；没 command 则保持 attested 并把标准标为 pending 交给父 agent 确认，不猜测默认命令）
-- `onBlocked: forward` 弹父会话 confirm（无 TUI 则 notify）
-- 自动 recycle；已 watch 的 `collect` 返回缓存；已回收的 `retire` 是 no-op
-- 完成通知 `deliverAs: followUp`；状态栏在输入框上方
-- `toolBudget` / `turnBudget` / `toolTimeoutMs`：子进程计数并拦截 / 给 bash 套 `timeout`
-- `worktree: true`：在 run 目录下 `git worktree add --detach`，pane cwd 指向该树；retire 保留目录
-- `fallbackModels`：`agent start` 失败后换下一个模型，不新开 pane
-- `alias`、`completionGuard`、`allowNestedSubagents`（仍受 `maxSubagentDepth` 限制）
-- 验收 `criteria[].command` 可配置；验证有超时
+### 0.2 五条不变式
 
-`action=list` 不再标 `⚠ not enforced yet`（`UNENFORCED_FIELDS` 为空）。
-F23 的结论仍然成立：pane 不是沙箱，child-guard 只覆盖 bash/herdr 这一层。
+1. **未声明 `phases` ⇒ 无状态机**：`nodes.phase` 保持 `NULL`，`legion_phase` 工具不注册（`Orchestrator.reserveNode`；`legion-tools.ts` 中 `governed` 判定）。
+2. **执行结果只从 session jsonl 推导**：`deriveOutcome`（`src/shared/session.ts`）读最后一个 turn 的 `stopReason` 与 `lastTurnOutput`；backend 只提供 settle 信号。
+3. **backend 由 launch 推导，不是卡片字段**：`spawnMode` 不在 `AGENT_FRONTMATTER_FIELDS`（`src/agents/agents.ts`），卡片写了会在加载期抛错（`#290`）。
+4. **回收是显式、分级、可审计的**：`retire` = 优雅；`stop` = 优雅 retire；`stop --force` = 直接硬化回收（`RetireOptions.graceful = false`）。
+5. **ESC 不回收子 agent**：中断父 turn 只返回 `interrupted (parent turn ended; children still running)`（`index.ts`，`esc-no-retire-v3`），回收只走 `/legion stop`、`subagent({action:"stop"|"retire"})` 或进程退出。
 
 ---
 
-## 1. 实测结论汇总（33 条）
+## 1. 概念
 
-### 1.1 结果通道
-
-| # | 结论 | 证据 |
+| 概念 | 定义 | 出现位置 |
 | --- | --- | --- |
-| F1 | `agent start` 返回子 agent 的 **session 路径** | `result.agent.agent_session.value`，不传 `--session` 时返回 pi 默认路径 |
-| F2 | session jsonl 是**准实时流**，1–3s 粒度 | exp1：t=43.1s 写完 `assistant:stop`，逐秒可读 |
-| F3 | session 文件**惰性创建**：无 turn 则文件不存在 | exp6：start 后 size=401（session+model_change 头）；exp3：未跑 turn 的 w1/w2 MISSING |
-| F4 | **预创建空文件可关闭数据丢失窗口**，且不影响正常写入 | exp6：预创建后 size=401，5 行，resume 正常 |
-| F5 | session jsonl 提供 `usage`（input/output/cacheRead/cacheWrite/cost）+ `model` + `stopReason` | 直接读 `message.usage` |
-| F6 | **`agent read` 返回纯文本，不是 JSON** | exp10：`_stdout` 是渲染后的终端文本 |
-| F7 | 非 pi kind（cursor）**没有 session ref**，只能靠 pane read 收集 | exp9/exp10：`agent_session: null` |
-
-### 1.2 状态与等待
-
-| # | 结论 | 证据 |
-| --- | --- | --- |
-| F8 | **`agent wait` 等待到 turn 结束**（不是提前返回） | exp5-C：长 turn 中调用 wait，23.5s 后返回，正好等到 turn 完成 |
-| F9 | 状态取值：`idle` / `working` / `done` / `blocked` / `unknown` / `GONE`（退出后） | 全程观测 |
-| F10 | **steering 可用**：working 时提交 prompt，0.3s 接受，排队后 agent 切换任务 | exp5-B：agent 放弃原任务，回复 `STEERED` |
-
-### 1.3 生命周期与回收
-
-| # | 结论 | 证据 |
-| --- | --- | --- |
-| F11 | **退出用 `ctrl+d`，不是 `ctrl+c`** | exp2：`ctrl+c` 后 agent 仍存活；`ctrl+d`×2 后 `GONE` |
-| F12 | **pane close 会杀死 agent，但 session 文件存活且可 resume** | exp2/exp4：mid-turn kill 后 0 torn，resume 拿到 `KIWI9`/`PINE99` |
-| F13 | **父 pane 死，子 agent 继续跑并完成任务** | exp8-B：杀掉 orchestrator tab，child 仍 `working` → `done`，输出 `CHILD_FINISHED` |
-| F14 | **迟到接管可行**：`agent list` 可重新发现孤儿 child + session 路径 | exp8-C |
-| F15 | **`tab close` 原子化回收**：0.12s 清空该 tab 所有 agent + pane | exp3-Q3 |
-| F16 | **名字在退出后释放，可复用**；存活期间 `agent_name_taken` | exp10-A |
-| F17 | 名字规则：`[a-z][a-z0-9_-]{0,31}`（小写、无空格、≤32 字符） | exp6-C 全部按预期拒绝 |
-| F18 | 热 pane 复用（ctrl+d 后重启）约 3.0s，冷 pane 约 3.9s | exp2-Q1/Q2：收益约 0.9s，**不值得做池化** |
-
-### 1.4 并发与失败
-
-| # | 结论 | 证据 |
-| --- | --- | --- |
-| F19 | **并行 start 有 `agent_pane_busy` 竞态**：无延迟时 2/6 失败 | exp7-H1 |
-| F20 | **重试可完全消除竞态**（backoff 0.15s+0.05s×i） | exp8-A：6/6 成功，墙钟 4.8s |
-| F21 | **错误 JSON 走 stderr，不是 stdout** | exp7：`stdout=''`, `stderr='{"error":...}'` |
-| F22 | **缺失的二进制不报明确错误，而是 15s 超时**；pane 里才有 `command not found` | exp10-C：claude/gemini 均 timeout |
-
-### 1.5 隔离（重要限制）
-
-| # | 结论 | 证据 |
-| --- | --- | --- |
-| F23 | **herdr 无隔离**：子 agent 能 `pane read` 任意 pane，读到别人内容 | exp10 越权测试：成功读到 `TOP_SECRET_TOKEN` |
-| F24 | **`HERDR_SOCKET_PATH` 是保留变量，`--env` 覆盖不了** | 传 `/tmp/FAKE.sock`，实际仍是默认 socket |
-| F25 | 唯一真隔离是命名 session（独立 socket + server），但会脱离主 session | `herdr --session X status` 显示独立 socket |
-
-**结论：隔离必须靠「纪律 + 审计」，不能靠 herdr 强制。**
-
-### 1.6 成败判定（关键）
-
-| # | 结论 | 证据 |
-| --- | --- | --- |
-| F26 | **`agent_status` 无法区分成功与失败**：正常成功、模型报错、被强杀，三者都是 `done` | exp12：三种场景 `agent_status` 全为 `done` |
-| F27 | **`agent get` 没有任何 error 字段**；agent 退出后直接 `agent_not_found` | exp12-D2：字段仅 status/labels/tokens 等 |
-| F28 | 权威枚举：`stopReason: "stop" \| "length" \| "toolUse" \| "error" \| "aborted"` | pi 官方文档 `session-format.md:88` |
-| F29 | **`stopReason: "aborted"` 实际上从不写入 session**：优雅中断（esc）写 `error` + `"This operation was aborted"`；强杀则**完全没有 assistant 消息** | exp12-3 / exp13-G6 |
-| F30 | **工具错误是 per-turn 的，不代表任务失败**：turn1 里 bash `exit 7`（`toolResult.isError: true`）该 turn 仍以 `stop` 结束 | exp13-G2：turn1 有 toolErrors 但 stop=`stop` |
-| F31 | **只有最后一轮的 assistant 决定成败** | exp13-G4：turn2 干净则整体成功 |
-| F32 | **agent 自述失败无法从执行层看出**：回复 `"FAILED: ..."` 的 agent，`stopReason` 是 `stop`、状态是 `done` | exp12-5 |
-| F33 | **子 agent 能稳定输出机器可读 verdict**：`{"ok": false, "reason": "..."}` 可被 `json.loads` 解析 | exp12-E |
-
-**结论：成败必须从 session jsonl 推导，不能依赖 herdr 的 agent 状态。**
-
-### 1.7 诊断能力对比
-
-| 诊断信号 | pane 提供 | session jsonl 提供 |
-| --- | --- | --- |
-| 模型错误信息 | ✗ | ✓ `assistant.errorMessage` |
-| 失败原因（stopReason） | ✗ | ✓ |
-| 中途被杀的判定 | ✗ | ✓（缺 assistant 消息） |
-| 工具错误计数 | ✗ | ✓ `toolResult.isError` |
-| 进程 working/idle 状态 | ✗（`pane process-info` 实测 diff 为空） | ✓（jsonl 静默 + 消息计数） |
-| 人的现场阅读 | ✓ | ✗（需解析） |
-
-**结论：程序化诊断全部走 session jsonl；`pane read` 只适合给人看。**
+| **root** | 拥有账本的会话。账本里固定一行 `id = "root"` 的节点 | `index.ts` 建 root run 时 `insertNode({ id: "root", parentId: null, … })` |
+| **run** | 一次 root 会话的运行单元，对应 `<cwd>/.pi-subagents/runs/<runId>/` | `RunStore`（`src/runs/store.ts`） |
+| **node** | 账本里的树节点（root 或任意后代），有 `parent_id` / `depth` / `team` | `nodes` 表；`LegionNode`（`src/legion/nodes.ts`） |
+| **child** | `subagent` / `vexillatio` 派发出来的子会话；在 run 里是一条 `ChildRecord`，在账本里是一个 node | `ChildRecord`（`src/shared/types.ts`） |
+| **team** | 一次派发携带的 roster（角色 → 成员）；`DEFAULT_TEAM` 不写进 `nodes.team` | `Orchestrator.reserveNode` 的 `team && team !== DEFAULT_TEAM` |
+| **centurion** | 唯一可以持有 worktree、唯一可以领一支有相位机的团队的根级角色 | `worktree.ts`；`Orchestrator.launch` 的 G1/G3 守卫 |
+| **phase** | 声明式相位机里的一个阶段 id；`nodes.phase` 可以为 `NULL` | `src/legion/phase-machine.ts`、`src/legion/state-machine.ts` |
+| **backend** | 子会话的执行后端：`rpc` / `inprocess` / `terminal` | `SPAWN_MODES`（`src/shared/types.ts`） |
+| **mail** | 节点之间的异步消息（`legion_mail`），落在 `messages` 表 | `src/legion/mail.ts`、`src/legion/mail-release.ts` |
+| **notice** | 平台自动生成的提示：完成通知、stall notice、phase timeout | `src/extension/notify.ts`、`src/legion/stall-notice.ts` |
 
 ---
 
-## 2. 架构
+## 2. 架构五层
 
 ```text
-┌─ 定义层 ───────────────────────────────────────────────┐
-│ agents/*.md frontmatter（对齐 pi-subagents 规范）        │
-│   + herdr 专有字段（kind/placement/worktree/steer/...） │
-│ settings.json → subagents 段（模型优先级、scope、预算）  │
-└────────────────────────────────────────────────────────┘
-┌─ 调度层 (pi extension, registerTool "subagent") ────────┐
-│ 生命周期：launching→working→awaiting→retired/exited     │
-│ 执行结果：deriveOutcome(session) → success/failed/...   │
-│ 动作：launch/continue/steer/resume/retire/status/collect│
-│ 树：lineage + ownership + resource（run.json）           │
-└────────────────────────────────────────────────────────┘
-┌─ 执行层 (herdr 原语) ──────────────────────────────────┐
-│ tab create → pane split → agent start（带重试）          │
-│ agent prompt（多轮/steer） / agent wait                  │
-│ session jsonl（结果+usage+进度） / pane read（诊断）      │
-│ tab close（原子回收）                                    │
-└────────────────────────────────────────────────────────┘
+┌─ 定义层 ─────────────────────────────────────────────────────────────┐
+│ agents/*.md frontmatter（严格字段表）+ .pi/settings.json 的 subagents 段 │
+│ 解析/校验/模型解析/team 合成：src/agents/*.ts                          │
+└──────────────────────────────────────────────────────────────────────┘
+                 ↓ AgentConfig
+┌─ 编排层 ─────────────────────────────────────────────────────────────┐
+│ Orchestrator：launch / collect / retire / 预算 / 血缘 / acceptance      │
+│ RunStore：run.json + session 文件；worktree：git 分支交付               │
+└──────────────────────────────────────────────────────────────────────┘
+                 ↓ SpawnInput
+┌─ 执行层 ─────────────────────────────────────────────────────────────┐
+│ RoutingSupervisor ─┬─ RpcSupervisor      （pi --mode rpc 子进程）      │
+│                    ├─ InProcessSupervisor（同进程 AgentSession，默认）  │
+│                    └─ TerminalSupervisor （hc 终端里的真 pi TUI）       │
+└──────────────────────────────────────────────────────────────────────┘
+                 ↓ 事件 / 状态变更
+┌─ 共享状态层 ─────────────────────────────────────────────────────────┐
+│ legion.db（nodes/events/usage/messages）+ 相位机 + stall notice        │
+│ src/legion/*：db / nodes / events / usage / mail / mail-release / …    │
+│ src/shared/*：types / session 解析 / proc-sweep                        │
+└──────────────────────────────────────────────────────────────────────┘
+                 ↓ 读模型
+┌─ 呈现层 ─────────────────────────────────────────────────────────────┐
+│ 工具（subagent / vexillatio / legion_mail / legion_tree / legion_phase）│
+│ /legion 命令族 + TUI viewer + aboveEditor 状态面板                      │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**核心原则：调度层不持有进程，只持有句柄。** 进程归 herdr server，这是父死子活的前提（F13）。
+### 2.1 每层的职责与落点
 
-**数据流：**
+| 层 | 目录 | 职责 | 关键符号 |
+| --- | --- | --- | --- |
+| 定义层 | `src/agents/` + `agents/*.md` | 读角色卡、校验 frontmatter、合并 settings/override/team、解析模型候选 | `parseAgentDocument` / `assertKnownFrontmatter` / `parsePhaseMachine`（`agents.ts`）、`loadSubagentSettings`（`settings.ts`）、`modelCandidates`（`model-resolution.ts`） |
+| 编排层 | `src/runs/` | 派发、预算、血缘、worktree、collect、验收、run 记录 | `Orchestrator`（`orchestrator.ts`）、`RunStore`（`store.ts`）、`buildPiArgs`/`lineageEnv`（`args.ts`）、`resolveLaunchWorktree`/`createChildWorktree`（`worktree.ts`）、`applyVerification`（`acceptance.ts`）、`acquireVerifySlot`（`verify-queue.ts`） |
+| 执行层 | `src/supervisor/` + `src/hc/` | 启动/驱动/等待/中断/回收子会话；三个后端 | `RoutingSupervisor`、`RpcSupervisor`、`InProcessSupervisor`、`TerminalSupervisor`、`HcClient` |
+| 共享状态层 | `src/legion/` + `src/shared/` | 账本 schema、树查询、事件、用量、相位机、邮件、卡死检测、session 解析 | `openLegionDb`、`insertNode`/`getSubtree`、`appendEvent`、`sendMail`、`evaluatePhaseTransition`、`parseSessionFile`/`deriveOutcome`、`sweepProcessTree` |
+| 呈现层 | `src/extension/` + `src/tui/` | 工具注册、slash 命令、doctor、通知、状态面板、树/overlay 视图 | `registerLegionTools`（`legion-tools.ts`）、`registerLegionCommand`（`legion-commands.ts`）、`runLegionDoctor`（`legion-doctor.ts`）、`deliverCompletion`（`notify.ts`）、`createStatusBoard`（`tui/status.ts`）、`createTreeView`（`tui/tree-view.ts`） |
 
-```text
-launch ──→ herdr pane ──→ session jsonl ──→ deriveOutcome ──→ run.json
-   │                          │                    │
-   └── 重试/预创建             └── 唯一结果来源       └── 成败落盘
-                                                         │
-                              retire ──→ pane close ─────┘
-                              （信息不丢：已在 run.json）
-```
+### 2.2 RoutingSupervisor 的仲裁规则
 
----
-
-## 3. 状态机
-
-**生命周期与执行结果是两个正交的维度**，必须分开建模（否则回收后会丢失失败信息）。
-
-### 3.1 生命周期（state）
+**第一层（谁决定 backend）在编排层，不在 supervisor。** `Orchestrator.launch` 用一条三元式把 launch 的形状翻译成后端：
 
 ```ts
-type TaskState =
-  | "launching"   // pane 已建，agent 启动中（含重试）
-  | "working"     // 本轮进行中
-  | "awaiting"    // 本轮完成，等调度者决策  ← 核心状态
-  | "blocked"     // 请求审批（有误判率，需超时兜底）
-  | "retired"     // 已回收，session 按 retention 保留
-  | "exited"      // 进程已退出，可 resume
+// src/runs/orchestrator.ts，Orchestrator.launch
+const mode: SpawnMode = worktree === true
+    ? isCenturion && terminalHostAvailable(process.env) ? "terminal" : "rpc"
+    : "inprocess";
 ```
 
-### 3.2 执行结果（execution.status）—— 从 session 推导
+- 不要 worktree → `inprocess`（默认路径，绝大多数派发）。
+- 要 worktree → 只有 centurion 能要（`#214`，非 centurion 的 `worktree: true` 会被降级为 `false` 并告警一次）；在 hc 终端里（两个 env 标记都在）用 `terminal`，否则 `rpc`。
+- 角色卡没有 `spawnMode` 字段可写（`#290`），所以「显式指定后端」这条路在 launch 路径上不存在。
+- 裁决结果会被**写回** `input.agent.spawnMode` 再交给 supervisor，否则 RoutingSupervisor 会按省略值重新解析成 `inprocess` 并撞上 `worktree` 守卫。
 
-```ts
-type ExecutionStatus =
-  | "success"     // 末轮 stopReason === "stop"
-  | "failed"      // stopReason === "error"（非 abort）
-  | "aborted"     // 末轮无 assistant 消息，或 errorMessage 含 "aborted"
-  | "truncated"   // stopReason === "length"
-  | "running"     // 尚未结束
-```
+**第二层（路由到一个已存在的 child）在 `RoutingSupervisor`：**
 
-**两者正交**：一个 agent 可以是 `state: retired` + `execution.status: failed`。
-
-### 3.3 关键：`done ≠ 结束`
-
-这是与 pi-subagents 最大的模型差异。
-
-```text
-launch → working → awaiting ─┬─ continue ─→ working → awaiting ...
-                             ├─ steer（working 时直接注入，F10）
-                             ├─ retire ──→ retired
-                             └─ 超时未决 ─→ exited（session 保留，可 resume）
-```
-
-**`awaiting` 不保留 pane**（按用户决策）：pane 关掉，session 文件保留。续跑时用 resume
-重建 pane —— 实测上下文完整保留（F12）。
-
-### 3.3.0 完成通道（对齐 pi-subagents，禁止子 agent 回头 prompt 父会话）
-
-子 agent **不得**在任务卡里写 `herdr agent prompt orchestrator ...`。那会把子进程的
-herdr 写权限对准父 pane，打断父会话，也依赖父 agent 名叫 `orchestrator`。
-
-完成通道归 **extension**，与 pi-subagents 的 `notify.ts` 同一模型：
-
-```text
-launch (async) ──→ 子 pane 跑
-       │
-       ├─ TUI：输入框上方 aboveEditor widget（live agent 面板）
-       │        （pi-subagents fleet-status；footer 不再重复计数，见 #192）
-       └─ collect 在后台等 run 结束
-              │
-              └─ runtime 完成通道（唯一的延迟源，按 **run** 级判定）
-```
-
-完成通知的投递分两段，**只有一处 run 级延迟**：join 窗口是纯批处理延迟（默认 10s），
-之后一直等到本次 run 的边界（确切时刻由宿主 `agent_settled` 决定）；80s 只做健康计数，
-不再投递——除此之外不存在第二个"等父会话忙完"的延迟源。
-
-1. **join 批处理窗口**（`src/extension/join.ts`，默认 10s）：同一 runId 的多个 child
-   一起启动、先后结束，窗口把 straggler 合成一条消息（`Background tasks completed
-   (N of M)`）。窗口**只做批处理**，到期无条件 flush 到下一个环节，**不**因为父会话忙
-   而延长——turn 级的 busy 是错误预测器（工具循环里父会话按定义就是忙的），而且会在
-   outbox 之外叠加第二层延迟。
-2. **run 级 outbox**（`src/extension/runtime.ts`）：父 **run** 活跃时不
-   `pi.sendMessage`，通知**只存结构**（`QueuedNotice` 持有 `entries` / `triggerTurn` /
-   `partial` / `enqueuedAt`，文本与 footer 都在交付那一刻现场算）；父 run 不活跃时
-   **立即**发送（含 `mode: "each"`、单成员批次、`triggerTurn:false` 项）。
-
-   **交付时刻 = 可见时刻**（`docs/contracts/notice-delivery-v2.md` D1）。`agent_settled`
-   是唯一允许投递的时刻：宿主 `sendMessage` 没有撤回能力，而通知真正进入模型上下文是在
-   宿主的 settle 边界 drain（`agent-session.js` 的 `hasQueuedMessages → continue`）。任何
-   "提前发、事后靠 claim 撤掉"都做不到——提前发出去的通知在 T0 就脱离了 claim 过滤，这就是
-   同一份结果经 `collect` 与通知各到一次（以及随后被误读成用户输入）的根因。
-
-   **一次边界只交付一条会唤起 run 的通知**（D2）：`flushOutbox()` 按 FIFO 逐条交付，交付
-   成功一条 `triggerTurn:true` 的条目后立即停手，剩余条目留在 outbox 等下一次边界；
-   `triggerTurn:false` 的条目只记录不唤 turn，所以可以在同一次边界内连续交付；被 claim
-   过滤掉的条目（返回 0）不计入停止条件，继续下一条。停止条件**不能**读 `parentRunActive`：
-   宿主 emit `agent_settled` 期间 `sendMessage` 是延后执行的（`_isEmittingAgentSettled`），
-   标志位无法反映"这一条已经唤起 run"。
-
-   **80s 上限降级为健康信号**（D6）：`MAX_PENDING_AGE_MS = 80_000`（= 2× 旧的
-   `(1+3)×10s`）不再触发任何发送。它只用来判断"这条通知被压得太久了"（`parentRunActive`
-   卡住、或宿主没 emit settle），到点计入 `noticeQueueStats().heldOverCap` 并按一个完整
-   窗口重新武装；`pending` / `oldestAgeMs` 语义不变，`heldOverCap` 与它们一起供诊断读取
-   （当前无生产消费者）。真实保底只有 `dispose()`（丢弃未投递的 pending）。上限仍然是
-   **per-notice**：`armOutboxTimer` 与 `oldestAgeMs` 都跟最老一条**仍可交付**的通知算
-   （已全被 claim 的死重条目不参与：不计时、不计数），T3d 把这一点钉成测试。
-
-   为什么不能"到点强发"：该上限的前提是"父 run 活跃时发出去的 followUp 会躺在队列里，
-   直到用户再发一条消息"——这个前提在当前宿主（pi 1.5.0）不成立，settle 边界就会 drain。
-   强制发送既不让模型早一秒看到，也不解决任何事情，只让通知提前离开 claim 过滤。
-
-发送时形状不变——
-`pi.sendMessage({ customType: "subagent-notify" }, { triggerTurn: true, deliverAs: "followUp" })`
-——只是**时机**改到 run 结束时。通知首行固定为
-`▣ legion · automatic completion notice — not a user message`（D5，通知以 `role:user`
-进入上下文，模型需要能把它和用户输入区分开），footer 只陈述事实
-`Still running: a, b`，且只列**确定会另发通知**的节点（D4：同 runId、未终态、
-`watching:true`、未被 claim/工具消费、未被判死）。
-
-所有状态都 display:true（transcript 留下完成/失败记录）；
-成功由 notice-renderer 压成单行并按 pane 宽度硬截断
-（控制字符已消毒，ctrl+o 展开），
-失败/中止保留完整块，details 只供 TUI 不进 LLM 上下文。
-
-> print/json 模式：`session_shutdown` → `dispose()` 丢弃未投递的 pending。child 的
-> session 文件仍在，可用 `collect` 从磁盘恢复；但 `finished` 缓存**不**保留
-> （`dispose()` 开头就 `jobs.clear()` / `finished.clear()`，此后才丢弃 outbox）。
-
-父 agent 的正确用法：`subagent` 工具 launch 之后把控制权交回用户，等 completion
-message，而不是轮询，也不是让孩子来拍自己。
-
-**Launch 路径冻结**（禁止每次现查 CLI）：父会话第一件事就是 `subagent({ agent, task })`。
-extension 拦截 `herdr --help` / 裸 `herdr agent|pane` / `agent start|prompt|wait` /
-`pane split` / `test HERDR_ENV` 这些探路命令，并在 system prompt 里注入同一份 playbook。
-tab → pane → start → watch 只发生在工具内部，不出现在父 agent 的 bash 里。
-
-### 3.3.1 判定 turn 结束的算法
-
-```ts
-async function waitTurnEnd(name, sessionFile, opts) {
-  // 主信号：agent wait（F8 实测等到 turn 结束）
-  // 兜底：轮询 agent_status + jsonl 行数稳定性
-  const before = countAssistantMessages(sessionFile);
-  await herdr.agentWait(name, { timeoutMs: opts.timeoutMs });
-  // 二次确认：jsonl 静默 N 秒且 assistant 消息数增加
-  await waitStable(sessionFile, { quietMs: 2500, minNew: 1 });
-  return collectFromSession(sessionFile);
-}
-```
-
-⚠️ 不要只靠 `agent_status === "idle"`：exp1 显示 idle 可能在 jsonl 落盘前出现。
-⚠️ `agent wait` 返回后仍须读 session 才能判定**成败**（F26）。
-
-### 3.4 成败判定算法（从 session jsonl）
-
-```ts
-function deriveOutcome(sessionFile: string): Execution {
-  const turns = groupByTurn(readMessages(sessionFile));   // 按 user 消息切分
-  const last = turns.at(-1);
-
-  // 强杀：末轮 user 之后没有 assistant 消息（F29）
-  if (!last || last.assistants.length === 0)
-    return { status: "aborted", reason: "no assistant message for last prompt" };
-
-  const final = last.assistants.at(-1);
-  switch (final.stopReason) {
-    case "stop":    return { status: "success" };
-    case "length":  return { status: "truncated" };
-    case "error":
-      // 优雅中断（esc）也走 error，靠 errorMessage 区分（F29）
-      return /abort/i.test(final.errorMessage ?? "")
-        ? { status: "aborted", reason: final.errorMessage }
-        : { status: "failed", reason: final.errorMessage };
-    case "toolUse":
-      // 末轮停在 toolUse 意味着进程在工具执行中被终止
-      return { status: "aborted", reason: "terminated during tool call" };
-    default:
-      return { status: "failed", reason: `unknown stopReason: ${final.stopReason}` };
-  }
-}
-```
-
-**注意（F30/F31）**：
-
-- 工具错误（`toolResult.isError`）**只作诊断统计，不影响 status** —— turn1 里 bash `exit 7` 的 turn 仍以 `stop` 结束
-- **只有最后一轮决定成败**；前面的 turn 失败不算失败
-
-### 3.5 自述 verdict（L2 判定，抄 pi-subagents acceptance）
-
-`execution.status` 只能回答「它跑完了吗」，回答不了「它跑对了吗」。
-
-实测反例（F32）：让 agent 回复 `"FAILED: could not complete the task"`，它的 `stopReason` 是 `stop`、
-`agent_status` 是 `done` —— **执行层看是完美成功**。
-
-所以需要第二层：agent 在末尾输出机器可读 verdict（F33 实测可行）：
-
-```json
-{"ok": false, "reason": "missing input file"}
-```
-
-对应 pi-subagents 的 `acceptance` 语义：
-
-```yaml
-acceptance:
-  level: attested          # none | attested | verified
-  role: read-only          # read-only 类 agent 自动降级为 attested
-  criteria:
-    - id: review-findings
-      must: 返回带文件路径和严重级别的具体发现
-      evidence: [review-findings, residual-risks]
-      severity: required
-```
-
-| level | 含义 | 判定方式 |
+| 规则 | 行为 | 锚点 |
 | --- | --- | --- |
-| `none` | 不校验 | 只看 execution.status |
-| `attested` | agent 自述 | 解析末尾 verdict JSON |
-| `verified` | 外部校验 | 调度者检查产物（文件存在？测试通过？） |
+| 按 `agent.spawnMode` 选后端，并记进 `owners` map | `spawnChild` → `backendOf(mode)` | `routing-supervisor.ts` |
+| 同名 child 不允许跨后端注册 | 旧后端仍存活 → `NAME_TAKEN`；已死 → 允许换后端 | `spawnChild` 的 `owners` 检查 |
+| `inprocess` 只接受 `kind === "pi"` | 否则 `INVALID_PARAMS` | `spawnChild` |
+| `inprocess` 不能带 `worktree: true` | 否则 `INVALID_PARAMS`（唯一非法的组合） | `spawnChild` |
+| `terminal` 必须有装配好的后端 | 否则 `INVALID_PARAMS`（不静默降级） | `spawnChild`；`index.ts` 构造时传 `new TerminalSupervisor()` |
+| 其余调用按 owner 路由 | `steer` / `abort` / `waitSettled` / `isAlive` / `stats` / `inFlightTool` | 各方法体 |
+| 无 owner 时回退 `rpc || inprocess` | 只用于「首次 spawn 之前」的查询 | `isAlive` / `inFlightTool` |
+| facade 的能力位只声明所有后端都能答的 | `capabilities.promptDisposition = false`（inprocess 答不了，`#323` D1） | `RoutingSupervisor.capabilities` |
+
+**in-process slot 释放是进程内广播**：`RoutingSupervisor` 把 `onSlotReleased` 挂到 `notifyInProcessSlotReleased()`，每个活跃 `Orchestrator` 用 `subscribeInProcessSlotReleases()` 订阅，用来唤醒 launch-admission 队列（`#266` D2-d-2）。监听者抛错不得打断 retire。
 
 ---
 
-## 4. 树结构（防泄露）
+## 3. 状态机三维
 
-### 4.1 三层树，职责分离
+一个节点同时有三条正交的状态轴。把它们混成一条是 herdr 时代最贵的建模错误。
+
+| 轴 | 存储 | 取值 | 谁写 |
+| --- | --- | --- | --- |
+| 生命周期 | `nodes.status` | `starting` / `running` / `blocked` / `settled` / `failed` / `retired` | `Orchestrator`（`reserveNode`、`recordSettled`、`retire`） |
+| 阶段 | `nodes.phase` + `phase_since` + `rework_count` | 任意声明过的 phase id，或 `NULL` | `Orchestrator.reserveNode`（出生）、`requestLegionPhase`（迁移） |
+| 执行后端 | `run.json` 的 `herdr.supervisor` | `rpc` / `inprocess` / `terminal` | `index.ts` 的 `currentProcessSpawnMode()` |
+
+### 3.1 `nodes.status`（六值）
+
+权威枚举是 `NODE_STATUSES`（`src/legion/nodes.ts`）。写入路径：
+
+- 出生：`reserveNode` 写 `starting`；首次真正启动时写 `running`（并落 `sessionFile` / `worktreePath` / `model` / `team`）。
+- 收尾：`Orchestrator.recordSettled` 把**执行结果**映射成节点状态——`success → settled`，`failed | truncated → failed`，`aborted | unknown → retired`，同时写 `node_settled` / `node_failed` / `node_retired` 事件并累计 usage。
+- 回收：`retire` 把仍非终态的节点写 `retired`（`node_retired` 事件）。
+- 安全网：某个子树的所有子节点都失败时，`failTeamIfAllChildrenFailed` 直接把团队标 `failed`；`#372` m2 规定这个 marker 不能被后续正常 turn 覆写回 `settled`。
+
+**注意**：`TaskState`（`queued | launching | working | awaiting | blocked | retired | exited`，`src/shared/types.ts`）是 run store 里的**显示态**，不是账本状态。两者刻意不同：`queued`（admission 队列里还没起来）只存在于内存，`awaiting` 只描述 display。
+
+### 3.2 `nodes.phase`
+
+- 只有**声明了机器**的团队才会写：`reserveNode` 的条件写入是 `...(input.agent.name === "centurion" && input.phases ? { phase: phaseStart(input.phases), phaseSince: … } : {})`。未声明 → `phase = NULL`。
+- 复活（resume）的团队保留原来的 phase，不会重新出生。
+- 读侧一律把 `NULL` 当「这个节点没有阶段」：`legion_phase` 工具只在 `options.machine !== undefined || self.phase !== null` 时注册（`src/extension/legion-tools.ts`），所以「没有阶段」的节点连工具都没有。
+- `rework_count` 由相位机迁移累加（见 §3.4.6）；`contract_path` 在团队**离开机器入口相位**时记录（`requestLegionPhase` 的 `leavesEntry`；终态出边不记，保持内置流水线的历史行为）。
+
+### 3.3 `run.herdr.supervisor`（传输标记）
+
+`RunRecord.herdr` 是历史键名，现在只表示**这个 run 自己的进程跑在哪个后端**（`#209`）：
 
 ```jsonc
-{
-  "runId": "r-7f3a",
-  "task": "auth-refactor",
-  "herdr": {
-    "workspaceId": "w7",
-    "tabId": "w7:t2",            // ★ 隔离边界 + 批量回收单元
-    "tabLabel": "task:auth-refactor [2/3 done]"
-  },
-
-  // ① 血缘树：防越权、防环、防无限嵌套
-  "path": [                       // 抄 pi-subagents NestedPathEntry
-    { "runId": "r-root", "agent": "orchestrator" },
-    { "runId": "r-7f3a", "stepIndex": 0, "agent": "reviewer" }
-  ],
-  "depth": 2,
-  "maxDepth": 4,
-
-  // ② 所有权树：防误杀
-  "children": [
-    {
-      "name": "reviewer-1",       // herdr agent name（全局唯一）
-      "paneId": null,             // 已回收后置 null（F12：pane 不是持久载体）
-      "sessionFile": ".pi-subagents/runs/r-7f3a/reviewer-1.jsonl",  // ★ resume 凭据
-      "sessionId": "01a08e...",
-      "ownerToken": "tok-9c2f",   // 证明是我创建的
-
-      // 生命周期（第 3.1 节）
-      "state": "retired",
-      "spawnedAt": "2026-09-11T04:18:08Z",
-      "retiredAt": "2026-09-11T04:25:31Z",
-
-      // ① 执行结果：机械判定，从 session 推导（第 3.4 节）
-      "execution": {
-        "status": "success",      // success|failed|aborted|truncated|running
-        "stopReason": "stop",
-        "errorMessage": null,
-        "turns": 3,
-        "toolErrors": 1,          // 累计，仅诊断用（F30：不影响 status）
-        "lastTurn": { "stopReason": "stop", "toolErrors": 0 },  // ★ 只有末轮定成败（F31）
-        "model": "glm-5.3-flash",
-        "usage": { "input": 7528, "output": 12, "cost": 0.0011 },
-        "completedAt": "2026-09-11T04:25:30Z"
-      },
-
-      // ② 任务结果：语义判定，需验收（第 3.5 节）
-      "acceptance": {
-        "status": "accepted",     // accepted|rejected|unknown
-        "level": "attested",      // none|attested|verified
-        "evidence": ["review-findings", "residual-risks"],
-        "reason": "read-only/reviewer-style agent"
-      },
-
-      // ③ 产物
-      "artifacts": [
-        { "kind": "output", "path": ".pi-subagents/runs/r-7f3a/out/reviewer-1.md" }
-      ]
-    }
-  ],
-
-  // ③ 资源树：防泄漏
-  "budget": { "spawned": 3, "limit": 8, "granted": 0 },  // 抄 spawn-budget
-  "leases": { "reviewer-1.jsonl": { "token": "...", "writerPid": 1234 } }
-}
+// run.json（节选）
+"herdr": { "supervisor": "inprocess", "node_id": "<node id>" }
 ```
 
-### 4.2 为什么扁平数组而不是嵌套对象（抄 pi-subagents）
+写入值来自 `currentProcessSpawnMode()`（`index.ts`）：子进程/宿主读作 `rpc`，in-process child 从 AsyncLocalStorage 的 child context 读出真实后端。**它不是配置项**，也不影响任何派发决策——决策永远由 §2.2 的三元式给出。
 
-1. **序列化友好**：可塞进环境变量传递
-2. **天然防环**：长度上限（`MAX_NESTED_PATH_ENTRIES = 4`）
-3. **注入安全**：`isSafeNestedPathId` 拒绝绝对路径 / `/` / `\` / `..`
-4. **逐项可裁剪**：坏的丢掉不污染整条链
+### 3.4 Phase machine（声明式相位机）
 
-### 4.2.1 成败为何必须落盘到树里
+`#298` 把硬编码的四阶段 switch 换成了数据：一份 `PhaseMachine` = 阶段列表 + 每条出边上的条件。默认机复刻旧表，所以「不写 `phases` 的角色卡」行为不变；`#371` 之后更进一步：**未声明就是没有状态机**。
 
-实测（F27）：agent 退出后 `agent get` 直接 `agent_not_found`，**pane 也关掉了**。
-所以 **retire 时必须把 `execution` 快照写进 run.json**，否则事后无法判断子任务成没成。
+#### 3.4.1 默认机形状（`DEFAULT_PHASE_MACHINE`）
 
-> **任何失败诊断都必须读 session jsonl，不能依赖 herdr 的 agent 状态。**
-
-这意味着 `collect()` 是成败判定的**唯一入口**，不能省。
-
-```ts
-function isSafeNestedPathId(v: unknown): v is string {
-  return typeof v === "string" && v.length > 0 && v.length <= 128
-    && !path.isAbsolute(v) && !v.includes("/")
-    && !v.includes("\\") && !v.includes("..");
-}
-```
-
-### 4.3 泄露防护：承认 herdr 不隔离（F23–F25）
-
-**树不能阻止越权，只能检测越权。** 三层防御：
-
-| 层 | 机制 | 作用 |
+| 阶段 | 超时 | 出边（条件） |
 | --- | --- | --- |
-| 1 | **tab 边界** | 一任务一 tab。回收时只动自己的 tab，不误杀别人（F15） |
-| 2 | **孤儿审计** | 对比「tab 里实际存在的 pane」vs「树里登记的 pane」，发现未登记的即告警（exp3-Q2 验证可行） |
-| 3 | **prompt 纪律 + tools 白名单** | system prompt 明确禁止操作他人 pane；不需要 bash 的 agent 直接不给 |
+| `planning` | 15 min | `implementing`（`contract_file`）、`failed`、`aborted` |
+| `implementing` | 60 min | 阶段级 `require: [children_settled]`；`reviewing`（`children_present` + `children_none_failed`）、`failed`（`children_all_failed`）、`aborted` |
+| `reviewing` | 30 min | `verifying`（`children_present` + `children_settled` + `verdict_ok`）、`implementing`（`verdict_not_ok`，rework）、`planning`（仅 `actorRole: centurion`，通知父级）、`failed`、`aborted` |
+| `verifying` | 15 min | `done`（`verification_passed` + `children_settled`）、`implementing`（`verification_failed`，rework）、`failed`、`aborted` |
+| `done` / `failed` / `aborted` | — | terminal，无出边 |
 
-```ts
-// 审计：每次回收前执行
-const registered = new Set(tree.children.map(c => c.paneId));
-const actual = herdr.paneList().filter(p => p.tabId === tree.herdr.tabId);
-const orphans = actual.filter(p => !registered.has(p.paneId));
-if (orphans.length) warn("发现孤儿 pane，可能有越权创建", orphans);
-```
+「阶段级 `require`」会 AND 进该阶段的**每一条**出边（包括失败出边），这是刻意的：`implementing` 的 `children_settled` 保证带着跑着的子节点没人能离开实现阶段；而 `aborted` 被显式豁免（急救按钮优先于整洁）。
 
-**明确不做**：命名 session 硬隔离。代价是失去「可见可介入」这一核心价值，与本设计目标冲突。
-本设计定位为**可信内部工具**，不是不可信代码沙箱。
+#### 3.4.2 `phases` 的声明口径
+
+| 途径 | 形状 | 约束 |
+| --- | --- | --- |
+| launch 参数 | `subagent({ phases, start? })` | **ROOT-ONLY**（G2）、**centurion-only**（G3）、**launch-only**；`start` 只对“裸阶段列表”生效，机器对象/JSON 自带 `start` 且优先 |
+| 角色卡 | frontmatter `phases:` | 卡片是**回退**，不是覆盖：一次派发自己声明了机器就以派发为准（G4） |
+| 三种可接受写法 | 阶段数组 / 机器对象 / 一行 JSON 字符串 / 缩进块 | `parsePhaseMachine` 全部走同一个校验器 |
+| 传给子进程 | `PI_LEGION_PHASES` env（仅 centurion） | `Orchestrator.lineageEnv`；`LEGION_PHASES_ENV`（`src/runs/args.ts`） |
+| 重启后复原 | `ChildRecord.phases` 快照 | run.json 记录声明，复活时不丢自定义阶段名（`#374` §4） |
+
+#### 3.4.3 条件词汇表（`PHASE_CONDITIONS`）
+
+`always` / `contract_file` / `children_settled` / `children_present` / `children_none_failed` / `verdict_ok` / `verdict_not_ok` / `verification_passed` / `verification_failed` / `rework_available` / `children_all_failed`。
+
+条件全部在 `src/legion/phase-conditions.ts` 里求值，输入是「子节点快照 + 契约路径 + 最新 settled 子节点的 verdict + 验证结果 + rework 计数」。求值器遇到未知条件名直接抛错（而不是静默放行）——放行会让一个没达标的团队推进。
+
+#### 3.4.4 拒绝点
+
+**加载期（写坏一张卡就该在加载时报错，而不是跑完一支队伍才报）：**
+
+- `parsePhaseMachine` / `validatePhaseMachine`：空机器、非法/重复阶段 id、未知条件、`next` 不是数组、未知目标、自环、terminal 阶段声明出边、非 terminal 阶段零出边、`start` 未声明或本身是 terminal、从 start 不可达的阶段、`maxRework` 不是非负整数；launch 路径额外要求**声明图**能到达终态（`requireTerminal: true`，判的是作者写的图，不是补过 `done` 的归一化图）。
+- `assertKnownFrontmatter`：卡片写了不在字段表里的键 → 硬错（含拼写近似）。
+
+**运行期（`evaluatePhaseTransition` 的拒绝理由）：**
+
+`invalid_phase` / `same_phase` / `terminal_phase` / `invalid_transition`（消息里会列出当前合法出边）/ `contract_path_required` / `children_not_terminal` / `all_workers_failed` / `reviewer_not_settled` / `review_verdict_not_accepted` / `review_verdict_not_rejected` / `verification_not_passed` / `verification_not_failed` / `rework_limit_exceeded` / `centurion_required` / `actor_not_permitted` / `condition_not_met` / `terminal_reason_required` / `all_children_not_failed` / `injected_done_is_supervisor_only`。
+
+#### 3.4.5 归一化与 supervisor-only 的 `done`
+
+`normalizePhaseMachine` 给缺失的 `done` / `failed` / `aborted` 补成 terminal 阶段，并给每个非 terminal 阶段补一条**无条件的注入边**，保证团队永远不会被卡死。代价是安全漏洞，所以注入边带 `injected: true` 标记：
+
+- 注入的 `→ done` **只有 supervisor 能走**（`evaluatePhaseTransition` 在 `require` / `actorRole` 之前就拒绝其他 actor，理由是「你的机器没有这条出边」）。
+- `aborted` 永远由父级/supervisor 决定（`terminalReason === "parent_retire"`），任何角色自己请求都会被 `requestLegionPhase` 拒绝。
+- `failed` 需要给理由：`parent_decision` / `all_children_failed` / `rework_exhausted` 三者之一。
+- 一个**自己声明了** `… → done` 出边的机器，把这条出边交给团队；`maySelfComplete` 只看作者声明的边，不看注入边。
+
+#### 3.4.6 `maxRework` 语义
+
+- 机器级 `maxRework`，缺省 `DEFAULT_MAX_REWORK_COUNT = 2`。
+- 只有带 `rework: true` 的出边会累加 `rework_count`（默认机的 `reviewing → implementing` 与 `verifying → implementing`）。
+- 第 `maxRework + 1` 次会得到 `rework_limit_exceeded`，并附带 `forcedTransition: { to: "failed", reason: "rework_exhausted" }`——不是「继续等」，而是判死。
+- 一个**不带 `rework` 标记**的回退边不消耗预算（自定义机器可以做无限次“重看”，但要自己承担成本）。
+
+#### 3.4.7 未声明 = 无状态机（`#371`）
+
+- `nodes.phase = NULL`，`phase_since = NULL`。
+- 没有 `legion_phase` 工具（注册即门禁，模型无法“说服”一个不存在的工具出现）。
+- 没有 collection prompt / 收队提示（`index.ts` 的 `phases` 参数说明：“no phase, no `legion_phase` and no collection prompt”）；centurion 变成一个「恰好可以派活的普通 agent」：干完活交 verdict 就结束。
+- 想让一支队伍走四阶段流水线，必须显式声明：`subagent({ agent: "centurion", phases: [...] })`，或在 centurion 卡片里写 `phases:`。
+
+#### 3.4.8 phase 超时只是通知
+
+`checkOwnPhaseTimeout`（`src/extension/legion-tools.ts`）在 postman tick 里比对 `phase_since` 与阶段超时：显式配置 `subagent.legion.phaseTimeouts` 优先，其次机器声明的 `timeoutMs`，再其次内置表；超时就发一封 `Phase timeout:` 邮件。**它不杀任何人**，也不改 phase——「超时」是给父级的一个决策输入，不是执行动作。
 
 ---
 
-## 5. 回收策略（无条件回收）
+## 4. 树结构
 
-### 5.1 为什么没有 cleanup 策略选项
+### 4.1 `nodes` 表就是血缘树
 
-早期设计曾考虑 `cleanup: keep | on-success | always`，其唯一理由是「**pane 里有失败现场**，值得留着看一眼」。
-但既然续跑走 resume，这个理由不成立：
-
-| 需求 | pane | session jsonl |
-| --- | --- | --- |
-| 失败诊断（错误信息、stopReason） | ✗ | ✓（F28，更全） |
-| 中途被杀判定 | ✗ | ✓（F29） |
-| 续跑（上下文） | ✗（resume 不需要 pane） | ✓（F12） |
-| 工具错误统计 | ✗ | ✓（F30） |
-
-**结论：pane 关了之后没有任何信息丢失。** 诊断信息全在 session jsonl 里，且比 pane 更结构化、更完整。
-
-所以回收是**无条件的**，不需要策略配置。
-
-### 5.2 执行顺序（严格遵守）
-
-```text
-1. 任务进入终态（awaiting / retired / failed / aborted）
-   ⚠️ blocked 除外 —— 那不是终态，agent 还活着等回复，pane 必须保留
-2. 孤儿审计（对比 tab 内实际 pane vs 树登记）
-3. 逐个 children 回收：
-     - 有 ownerToken 且 pane 存在 → 可回收
-     - 无 ownerToken 或不在树里 → 跳过 + 告警
-4. 先 collect() 推导 execution（必须！否则回收后无法判定成败，F27）
-5. 优雅退出尝试：ctrl+d ×2（不是 ctrl+c！F11），等 2s
-6. 若仍存活 → pane close（F12 实测安全，session 已落盘）
-7. tab close 批量兜底（F15：0.12s 清空）
-8. run.json 标记 retired + 写入 execution 快照；session 按 retention 保留
+```sql
+-- src/legion/db.ts，SCHEMA_V1
+CREATE TABLE nodes (
+  id TEXT PRIMARY KEY,
+  parent_id TEXT REFERENCES nodes(id),
+  name TEXT NOT NULL,
+  role TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'pi',
+  depth INTEGER NOT NULL,
+  run_id TEXT, session_file TEXT, worktree_path TEXT, model TEXT, team TEXT,
+  status TEXT NOT NULL, phase TEXT, phase_since INTEGER,
+  rework_count INTEGER NOT NULL DEFAULT 0,
+  contract_path TEXT, task_summary TEXT,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
 ```
 
-**步骤 4 是硬性要求**：`agent get` 退出后直接 `agent_not_found`（F27），
-不先 collect 就回收 = 永久丢失成败信息。
+- **root 行**：`id = "root"`、`parent_id = NULL`、`depth = 0`，在 root run 建立时插入（`index.ts`）。
+- **血缘**：`parent_id` 外键 + `depth`；子树用递归 CTE `getSubtree` 查（`src/legion/nodes.ts`），带 `maxDepth` 上限（`DEFAULT_SUBTREE_MAX_DEPTH = 64`）。
+- **team**：只有非 `DEFAULT_TEAM` 才落库（`Orchestrator.reserveNode` / 启动时 `team: team && team !== DEFAULT_TEAM ? team : null`），因此 `NULL` 读作「默认 roster」。
+- **名字**：`[a-z][a-z0-9_-]{0,31}`（`NODE_SLUG_PATTERN`）；node id 由 child 名派生（`nodeIdForChild`），同名不同 run 是两个 node。
+- **身份**：`session_file` 是会话寻址凭据，也是 resume 的唯一凭据；`PI_LEGION_NODE_ID` 加 `PI_LEGION_DB` 是子进程认领自己那一行的方式（`index.ts` 会校验 session 路径，拒绝继承来的错身份）。
 
-### 5.3 blocked 是唯一例外
+### 4.2 run 目录
 
-`blocked` 不是终态：agent 还活着等审批回复，pane 必须保留。
+`<cwd>/.pi-subagents/runs/<runId>/`：
 
-但这**是状态机的事，不是 cleanup 策略的事**，不应混在一个配置项里。
-
-```yaml
-onBlocked: auto-approve    # auto-approve (default) | forward | notify
-```
-
-| 值 | 行为 |
+| 项 | 用途 |
 | --- | --- |
-| `auto-approve`（默认） | 自动放行（cursor 子 agent 启动即带 `--force`）；子 pane 没有人，审批框即死锁 |
-| `forward` | 转发给父 agent 决策（父 TUI 弹 confirm） |
-| `notify` | 只通知用户（`herdr notification show --sound request`），等人来 |
+| `run.json` | run 记录（children、预算、lineage、`herdr.supervisor`）；原子写（`.tmp` + rename），损坏时隔离为 `run.json.corrupt` 并返回 `null` |
+| `<name>.jsonl` | 子会话 session 文件（预创建为空文件，避免 pi 惰性建文件造成的数据丢失窗口；也是 resume 凭据） |
+| `out/` | 产物目录（`artifactDirFor`，按需创建） |
+| `worktrees/<name>/` | centurion 的 git worktree（retire 后**保留**） |
+| `rpc-child-*` | RPC 子进程临时目录，由 hygiene 按 owner pid 清扫 |
 
-⚠️ `blocked` 依赖屏幕检测，有误判率，**必须配超时兜底**，不能作为唯一真相。
-
-### 5.4 关键约束
-
-- **session 文件必须落盘到 run 目录，绝不放 `/tmp`** —— 它是 resume 唯一凭据
-- **预创建空 session 文件**（F4），关闭「start 后无 turn 则文件不存在」的数据丢失窗口
-- **pane 永远可以关**，因为 session 是更持久的载体（这是用户方案的核心洞察）
-- **回收前必须 collect**（步骤 4），否则成败信息丢失
+**没有 workspace / tab / pane 三层。** 隔离只有一种：git worktree（且只有 centurion 能要）。进程级隔离只是 rpc/terminal 后端的附带效果，不是设计承诺（in-process 子会话与父共享进程、cwd 与内存）。
 
 ---
 
-## 6. 配置规范（抄 pi-subagents）
+## 5. 回收策略
 
-### 6.1 Agent 定义 `agents/*.md`
+### 5.1 三个入口
 
-```yaml
----
-name: reviewer
-description: 代码审查，只读，返回可执行发现
+| 入口 | 语义 | 代码 |
+| --- | --- | --- |
+| `subagent({ action: "retire" })` | 优雅回收；已回收的是 no-op | `retireChild`（`index.ts`）→ `Orchestrator.retire` |
+| `subagent({ action: "stop" })` / `/legion stop [name|all]` | 同优雅回收；`stopAction` 按 run 作用域解析名字（`#312`） | `legion-stop.ts` / `index.ts` |
+| `subagent({ action: "stop", force: true })` / `/legion stop --force` | 硬回收：跳过优雅阶段，直接硬化链 | `RetireOptions.graceful = false`（`src/shared/types.ts`） |
 
-# ── 模型（抄 pi-subagents 优先级）──
-model: cb/glm-5.3-flash
-fallbackModels: cb/claude-sonnet-5
-thinking: high
-
-# ── 能力边界 ──
-tools: read, grep, find, ls, bash
-skills: safe-bash, review-checklist
-skillPath: ./skills
-systemPromptMode: replace          # replace | append
-inheritProjectContext: true
-inheritSkills: false
-extensions: []
-subagentOnlyExtensions: []
-
-# ── 行为 ──
-output: .pi-subagents/out/reviewer.md
-defaultReads: context.md, plan.md
-defaultProgress: true
-async: true
-timeoutMs: 900000
-toolTimeoutMs: 600000
-loopNoticeMs: 1800000         # 可选："可能陷入循环"提醒的基准（默认跟随 timeoutMs）
-acceptance:                  # 第 3.5 节：L2 语义判定
-  level: attested            # none | attested | verified
-  role: read-only
-  criteria:
-    - id: review-findings
-      must: 返回带文件路径和严重级别的具体发现
-      evidence: [review-findings, residual-risks]
-      severity: required
-completionGuard: true
-maxSubagentDepth: 1
-allowNestedSubagents: false
-toolBudget: {...}
-turnBudget: {...}
-permissions: {...}
-memory: {...}
-disabled: false
-
-# ── herdr 专有 ──
-kind: pi                    # pi | cursor | claude | codex | gemini | ...
-placement: split-down       # split-down | split-right | new-tab
-worktree: false             # true = git worktree add --detach（herdr 尚无 worktree 客户端）
-steer: true                 # 允许父 agent 中途插话
-onBlocked: auto-approve    # auto-approve (default) | forward | notify
-# 注：无 cleanup 字段 —— 回收是无条件的（第 5.1 节）
----
-
-（system prompt body）
-```
-
-`timeoutMs` 现在同时充当三个时钟：父的 `collect` 预算、`wait` 的默认超时、
-以及「很久没有动静」主动上报的 L2 基准（`docs/contracts/stall-notice-v1.md` D8）。
-为了 `wait` 等更久而调大 `timeoutMs` 时，L2 提醒会一并被推后；要解耦就显式写
-`loopNoticeMs`（回落链：`loopNoticeMs` → `timeoutMs` → `DEFAULTS.turnTimeoutMs`
-= 900000）。`loopNoticeMs: 0` 或负数关闭该 L2 提醒；`subagents()` 的 launch 参数
-不接受 `loopNoticeMs`（v1 只支持角色卡与 `agentOverrides`）。
-
-解析口径（stall-notice D8，review m4）：
-
-- 两遍解析：先 `discoverAgents(cwd, "user", …)`（launch 的默认作用域），找到该名字
-  就用它；找不到再跑一次 `discoverAgents(cwd, "both", …)`。第二遍覆盖
-  `agentScope: "project" | "both"` 启动、卡片只存在于 `<cwd>/.pi/agents` 的角色
-  （没有这一遍时它们会静默落到 900000，即 45 分钟预算的项目角色每 15 分钟被提醒一次）。
-  user 层总是优先，所以**默认作用域下的结果与单遍时完全一致**。
-- 卡片显式写 `loopNoticeMs: 0`（关闭）在第一遍就算「找到了」，不会因
-  `radius === undefined` 而回落到下一遍——否则同名的低优先级卡片会把上层刚关掉的
-  探测器重新打开。
-- 结果按 `(cwd, role)` 缓存 5s（`LOOP_NOTICE_ROLE_TTL_MS`）：postman 每 2s 对每个
-  活着的子节点问一次，不缓存会把 1ms/次的 discovery 变成每秒几毫秒的同步阻塞。
-  改卡/改 override 到生效最多有 5s 延迟；`0`（关闭）也是一个答案，同样被缓存。
-
-### 6.2 模型优先级（原样抄 pi-subagents）
+### 5.2 RPC 后端的回收顺序（`RpcSupervisor.retireChild`）
 
 ```text
-per-run override
-  → preset 的 kind/model/thinking（subagents.presets.<name>，经 preset: 引用）
-  → provider 作用域 override（agentOverridesByProvider.<provider>.<name>）
-  → agentOverrides.<name>.model
-  → agent frontmatter model
-  → subagents.defaultModel
-  → 父会话模型（读 $PI_PROVIDER / $PI_MODEL）
+1. 快照后代进程（enumerateDescendants）        ← 必须在杀父之前
+2. graceful ? stdin.end()（EOF）→ 等 retireTimeoutMs（默认 5s）
+3. 仍存活 → SIGTERM → 等 signalTimeoutMs（默认 1s）
+4. 仍存活 → SIGKILL → 等 killTimeoutMs（默认 1s）
+5. sweepDescendants：对每个后代 pgid 发 TERM（负号发组），再对每个 pid 发 TERM
+   → 等 signalTimeoutMs → 对 pgid/pid 各发 SIGKILL
+6. 仍存活 → 抛 RETIRE_FAILED（不谎报成功）
 ```
 
-preset 规则：
+要点：
 
-- 引用方式：agent frontmatter `preset: <name>`、`agentOverrides.<name>.preset`、
-  或工具的 `preset` 参数（single/tasks 均支持）
-- **原子性**：校验的是 preset 的 `kind` 与**最终解析出的** model 这一对，而不是
-  preset 自身的 model。因为 model 可能来自更高或更低的层级（per-run tool `model`、
-  `defaultModel`、父会话模型、override），只校验 preset 自身会让不兼容的 pair 溜过去，
-  最终在启动时被 `nativeModelFor` 静默丢弃。校验点位于 `resolveModel` 之后
-  （`src/agents/step-model.ts`），只在该步骤确实引用了 preset 时生效
-- **响亮失败**：引用了未定义的 preset 是错误（列出已定义的 preset），绝不静默
-  回退到父会话模型。报错会指明 model 的真实来源，不把责任误归于 preset
-- preset 刻意高于 agentOverrides：通过 `agentOverrides` 钉死的角色模型（`loadCatalog`
-  会先把它们折进 `agent.model`），若 preset 放在 frontmatter 同级则对它不可达。
-  未引用 preset 的 agent 行为不变
-- 解析逻辑抽到 `src/agents/step-model.ts`（纯函数，便于单测）
+- **先枚举后代再杀父**：父一死，`/proc` 里的父子关系就断了，后代再也找不到。
+- **stdin EOF 是优雅信号**，不是 `ctrl+d` 按键、不是 pane close；代码里没有 pane/tab 概念。
+- 后代清扫同时按 **pgid** 和 **pid** 发信号，并跳过自己的 pgid，避免自杀。
+- `sweepDescendants` 的等待定时器**不能 unref**：它可能是驱动 caller await 的唯一句柄。
 
-特殊值：
+### 5.3 另两个后端
 
-- `model: "inherit"` = 显式继承父会话模型
-- `modelScope.enforce` + `allow` 白名单：显式指定违规 = error，继承来的 = warn
-
-### 6.3 全局配置 `settings.json`
-
-```json
-{
-  "subagents": {
-    "defaultModel": "cb/glm-5.3-flash",
-    "defaultProvider": "cb",
-    "team": "frontend",
-    "teams": {
-      "frontend": {
-        "description": "UI work",
-        "members": ["designer", "prototype", { "agent": "worker", "model": "cb/kimi-k3" }]
-      }
-    },
-    "agentOverrides": { "reviewer": { "model": "cb/claude-opus-5" } },
-    "agentOverridesByProvider": { "cb": { "worker": { "model": "cb/glm-5.3-flash" } } },
-    "presets": {
-      "cheap": { "kind": "pi", "model": "cb/deepseek-v4.1-flash", "thinking": "low" },
-      "strong": { "kind": "pi", "model": "cb/kimi-k3", "thinking": "high" }
-    },
-    "modelScope": { "enforce": true, "allow": ["cb/*"] },
-    "enabled": true,
-    "disableBuiltins": false,
-    "disableThinking": false,
-    "maxSubagentSpawnsPerSession": 8,
-    "legion": {
-      "silenceNoticeMs": 120000,
-      "phaseTimeouts": { "implementing": 3600000 },
-      "orphanStaleMs": 90000,
-      "mailRatePer5Min": 10
-    },
-    "herdr": {
-      "defaultPlacement": "split-down",
-      "maxConcurrentAgents": 6,
-      "startRetries": 40,
-      "startRetryBackoffMs": 150,
-      "sessionRetentionDays": 7,
-      "sessionRetentionMaxBytesPerRun": 52428800
-    }
-  }
-}
-```
-
-`legion.silenceNoticeMs` 是「很久没有动静」的 L1 阈值（毫秒，`positiveInt`：缺省合法，
-写了就必须是正整数），默认 120000：子节点**不在任何工具里**（in-flight 栈为空）且 `lastEventAt` 已过去这么久时，
-父节点自己的 inbox 会收到一封 `kind=notice, urgency=action-needed` 的自投递提醒，同一
-静默窗口最多两封（1× 与 2×），永不自动 abort/stop/retire。栈非空时一律不报——慢编译
-与真 hang 在事件流上完全同形（`docs/contracts/stall-notice-v1.md` D1）。探测器的进度
-基准来自角色卡（见 §6.1 的 `loopNoticeMs`），与 `phaseTimeouts`／`orphanStaleMs` 无关。
-
-Team selection is resolved as `PI_SUBAGENTS_TEAM` > `subagents.team` >
-`default`. `default` keeps every discovered role; named teams select ordered
-string/object members, with `*` expanding all roles once and later object
-members applying the normal agent-override fields. Project team entries replace
-same-named user entries. Non-default team names are passed to child pane/tab
-processes as `PI_SUBAGENTS_TEAM`; `/legion team` manages project or user
-settings.
-
-### 6.4 总开关 `subagents.enabled`
-
-解析顺序：会话内覆盖（`/legion on|off`，仅内存，`/reload` 后回落） >
-项目 `.pi/settings.json` > 用户 `~/.pi/agent/settings.json` > 默认 `true`。
-旧 toggle 的 `flip` 与无参数 `show` 用法已由显式 `/legion on` 或
-`/legion off` 取代；每次执行后都会显示最终状态。
-
-关闭后：launch 拒绝（`DISABLED` 错误码，指向 `/legion on`）；
-system prompt 不再注入 playbook/roster；bash 派发 guard 放行手动 herdr
-命令。已有 children 不受影响——正常完成并通知，`status`/`collect`/
-`wait`/`resume`/`steer` 继续可用。
-
-### 6.4.1 Scout guard `subagents.scoutGuard`
-
-只在主会话生效（子进程带 `PI_SUBAGENT_ROLE`，不计数、不注入）。连续 N 次
-读类工具调用（first-class `read`/`grep`/`find`/`ls`，以及可判定为只读的 bash：
-`cat`/`head`/`tail`/`less`/`rg`/`grep`/`find`/`ls`/`stat`/`wc`/`file`/`jq`、
-`git show|log|diff|status|blame`、不带 `-i` 的 `sed`）且中间没有成功的
-`subagent` / `vexillatio` 派发时，异步注入一条 follow-up 提醒，不挡住当前
-`tool_call`。
-
-```json
-{ "subagents": { "scoutGuard": { "enabled": true, "threshold": 8, "cooldownMs": 120000 } } }
-```
-
-默认开启，`threshold` 8，`cooldownMs` 120000。提醒发出后计数清零并进入冷却；
-冷却期内不计数、不重复提醒。成功派发立即清零并退出冷却。`edit`/`write` 和
-写类 bash（含 `sed -i`、写重定向）清零但不进入冷却。无法判定的 bash 不计数
-也不清零。`/scout-guard` 开启、`/no-scout-guard` 关闭，只覆盖本会话。
-
-## 7. 借鉴 pi-subagents：三类处理
-
-**不要整体抄。** pi-subagents 的 `src/` 有 14 个子目录、4000+ 行，其中大量基础设施在 herdr 下是重复造轮子。
-
-| 类别 | 内容 | 处理 |
+| 后端 | 回收方式 | 说明 |
 | --- | --- | --- |
-| **A. 直接抄**（规范层） | frontmatter 字段名、模型优先级、settings 结构、`NestedPathEntry`、`isSafeNestedPathId`、spawn-budget 思路 | ✅ 抄 |
-| **B. 借鉴重写** | 状态机（改成 herdr 多轮模型）、artifact 布局、acceptance 校验、`session-lease`（防写冲突） | ⚠️ 按 herdr 模型重写 |
-| **C. 不要抄**（herdr 已覆盖） | detached runner 进程池、steer 文件信箱+ack、`contact_supervisor`、worktree 管理、inspector pane、后台任务追踪 | ❌ 会重复造轮子 |
+| `inprocess` | `session.dispose()`，然后释放 slot | 没有子进程、没有进程树可扫；`retireChild` 忽略 `graceful`（没有 stdin 可关） |
+| `terminal` | `terminal.kill` → `terminal.rm`（rm 失败是 best effort） | 终端已被 core 遗忘（`not found`）视为已回收；其他错误照常上抛 |
 
-### C 类对照表
+### 5.4 保留与级联
 
-| pi-subagents 自建（~700 行） | herdr 原生 |
+- **session 文件保留**：retire 只停会话，不删 transcript —— 它是 resume 的唯一凭据。
+- **worktree 保留**：retire 后目录留在 `runs/<runId>/worktrees/<name>`，hygiene 也明确不删带 `worktrees/` 的 run 目录。
+- **父退出**：root 会话正常关闭时 `shutdownRetire` 会回收**自己这一支**的 children（`index.ts` 的 shutdown 路径）；异常死亡留下的行由 orphan 扫描收敛为 `failed` + `node_abandoned`（`LegionPostman.scanOrphans`），并由启动卫生再扫一遍。子会话的交付语义绑定在父的 collect 上，不存在「父死子继续交付」。
+- **ESC 不级联**：父 turn 被中断只返回 `interrupted`，子 agent 继续跑（`esc-no-retire-v3`）；「杀掉父 tab 子进程继续完成任务」的 herdr 结论已作废。
+- **名字释放**：回收后名字可复用（注册表按 owner 判活）。
+
+---
+
+## 6. 配置规范
+
+### 6.1 角色卡（`agents/*.md`）
+
+frontmatter 走**严格字段表**：`AGENT_FRONTMATTER_FIELDS`（`src/agents/agents.ts`）之外的键在加载期直接抛错，错误信息会列出全部合法键。字段分组：
+
+| 组 | 字段 |
 | --- | --- |
-| detached runner 进程池 | pane 就是常驻进程（F13） |
-| steer 文件信箱 + ack 目录 | `agent prompt` 直接注入（F10） |
-| `contact_supervisor` 协调工具 | `agent wait --until blocked` |
-| worktree 管理 | `herdr worktree create` |
-| inspector pane | `pane read` / `pane report-metadata` |
-| 后台任务追踪 | `agent list` / `agent_status` |
+| 身份 | `name`、`description`、`kind`、`model`、`thinking`、`alias`、`aliases`、`preset`、`team`、`output`、`fallbackModels` |
+| 上下文 | `systemPromptMode`、`inheritProjectContext`、`inheritSkills`、`inheritExtensions`、`excludeExtensions`、`skillPath`、`skills`、`defaultReads` |
+| 工具 | `tools`、`extensions`、`subagentOnlyExtensions` |
+| 预算/守卫 | `defaultProgress`、`async`、`timeoutMs`、`toolTimeoutMs`、`loopNoticeMs`、`completionGuard`、`maxSubagentDepth`、`allowNestedSubagents`、`renewable`、`maxRenewals`、`utility`、`disabled`、`worktree`、`steer`、`onBlocked`、`toolBudget`、`turnBudget` |
+| 阶段 | `phases` |
+| 验收 | `acceptance`（`level` / `role` / `criteria`） |
 
-### B 类值得借鉴的两个具体设计
+口径澄清（这三条最容易被旧文档带错）：
 
-**1. `session-lease.ts`（防写冲突）**
+- **`kind` 只有 `pi`**：`AGENT_KINDS = ["pi"]`。写了别的值不会报错，但解析层会忽略并告警一次，角色仍按 `pi` 启动（`parseKind`，`src/agents/agents.ts`）。旧的多 kind 降级表不存在。
+- **`placement` 不是字段**：它曾是 pane 时代的布局提示，解析期被主动丢弃（`src/agents/settings.ts` 的注释与归一化逻辑）；字段表里没有它，所以现在写它等于写一个未知键。
+- **`spawnMode` 不是卡片字段**（`#290`）：写了会在加载期抛错；后端由 launch 需要不需要 worktree 推导（§2.2）。
+- **`worktree` 仅 centurion**：`centurion` 卡片写 `worktree: true`；非 centurion 请求 `true` 会被降级为 `false` 并告警一次（`Orchestrator.launch`）。
+- **`phases`**：卡片可声明，但它是**回退**；root 在派发时显式声明的机器优先。
 
-记录 `token + pid + hostname + writerState(none|spawning|running)`，防止两个 agent 同时写同一 session 文件。
-在本设计中用于：resume 时确保没有其他 agent 正在写同一个 session。
+### 6.2 settings（`.pi/settings.json` 的 `subagents` 段）
 
-**2. `spawn-budget.ts`（防失控）**
+| 键 | 默认 | 含义 |
+| --- | --- | --- |
+| `subagents.enabled` | `true` | 总开关；关闭后拒绝新 launch，但控制类动作（status/collect/wait/…）仍可用 |
+| `subagents.legion.maxDepth` | `4` | 血缘深度上限 |
+| `subagents.legion.maxChildrenPerNode` | `8` | 单节点直接子节点上限 |
+| `subagents.legion.maxActiveNodes` | `30` | 全树活跃节点上限 |
+| `subagents.legion.phaseTimeouts` | planning 900s / implementing 3600s / reviewing 1800s / verifying 900s | 阶段超时（仅发 notice） |
+| `subagents.legion.verifyCommandTimeoutMs` | `600000` | 验收命令超时 |
+| `subagents.legion.worktreeBootstrap` | `""`（关闭） | worktree 创建后的 provisioning（`npm-install` 或 shell 命令） |
+| `subagents.legion.worktreeBootstrapTimeoutMs` | `600000` | 上述超时 |
+| `subagents.legion.mailRatePer5Min` | `10` | 每个 sender 的 mail 限流 |
+| `subagents.legion.usagePollMs` | `30000` | usage 轮询间隔 |
+| `subagents.legion.orphanStaleMs` | `90000` | orphan 扫描阈值 |
+| `subagents.legion.silenceNoticeMs` | `120000` | L1 stall 检测阈值（`0`/负值关闭） |
+| `subagents.inprocess.*` | `maxActive` 8（显式块省略时）/ 30（无显式块）；`maxQueuedLaunches` 32、`launchQueueTimeoutMs` 900000、spawn 启动超时 15s | in-process 并发池、排队上限与启动超时（与 legion 预算取严，`InProcessLimits`） |
+| `subagents.rpc.approve` | `false` | RPC 子进程是否带 `--approve`（只影响 rpc 后端） |
+
+默认值集中在 `DEFAULT_LEGION_SETTINGS`（`src/shared/types.ts`）与 `DEFAULT_INPROCESS_*`（`src/supervisor/spawn-mode.ts`）。
+
+---
+
+## 7. 持久化：`legion.db`
+
+### 7.1 位置与打开方式
+
+- 路径：`<rootRunDir>/legion.db`（`legionDbPath`），即 `<cwd>/.pi-subagents/runs/<rootRunId>/legion.db`；子进程用 `PI_LEGION_DB` 继承同一个文件。
+- 打开即断言前置条件：`PRAGMA journal_mode = WAL` 的**返回值**必须是 `wal`（不是就抛错，`assertLegionJournalMode`）、`busy_timeout = 5000`、`foreign_keys = ON`。
+- 编译语句走每连接 LRU（上限 64，`LEGION_STMT_CACHE_LIMIT`）；`exec()` 的文本里出现 `ALTER|CREATE|DROP|REINDEX|VACUUM` 就整体失效，避免旧 schema 的编译结果被继续使用。
+
+### 7.2 四张表
+
+| 表 | 主键 | 关键列 | 写入方 |
+| --- | --- | --- | --- |
+| `nodes` | `id` | `parent_id`、`name`、`role`、`kind`、`depth`、`run_id`、`session_file`、`worktree_path`、`model`、`team`、`status`、`phase`、`phase_since`、`rework_count`、`contract_path`、`task_summary`、时间戳 | `insertNode` / `updateNode` / `heartbeatNode` |
+| `events` | 自增 `id` | `node_id`、`type`、`data`(JSON)、`ts` | `appendEvent` |
+| `usage` | `node_id` | `tokens_in`、`tokens_out`、`cost_usd`、`updated_at` | `upsertUsage` |
+| `messages` | 自增 `id` | `from_node`、`to_node`、`subject`、`body`、`kind`、`urgency`、`delivered`、`delivered_at`、`created_at` | `sendMail` / `transitionDelivery` |
+
+6 个索引：`idx_nodes_parent`、`idx_nodes_status`、`idx_events_node`、`idx_events_type_ts`、`idx_messages_inbox`、`idx_messages_rate`。最后一个专为 `sendMail` 的限流 COUNT 而建，否则每次发信都要全表扫。
+
+### 7.3 事件
+
+`LEGION_EVENT_TYPES`（`src/legion/events.ts`）是**封闭枚举**：`node_launched`、`node_settled`、`node_failed`、`node_retired`、`node_resumed`、`node_blocked`、`node_abandoned`、`node_handled`、`phase_change`、`phase_timeout`、`mail_sent`、`mail_delivered`、`mail_bounced`、`budget_refused`、`orphan_detected`、`tree_finalized`。
+
+写读必须同时认这个集合，否则读侧 `mapEvent` 抛错、DB 事件游标冻结（历史事故 `#233`）。**进程内活动事件**（`text_delta`、`tool_call`、`launch_queued`、`launch_admitted` …）走另一份 `LEGION_PROCESS_EVENT_TYPES`（`src/extension/event-bus.ts`），永不写库。
+
+### 7.4 迁移与卫生
+
+- `LEGION_DB_USER_VERSION = 2`：v0 → v1 建表；v1 → v2 只 bump 版本（`messages.delivered` 从三值域扩成五值域，列类型本就是 `INTEGER`，旧值 `1` 语义上等同新 `accepted`）。比支持版本更新的库直接拒绝打开。
+- 启动卫生（`src/runs/hygiene.ts`，每个 root 会话一次、best-effort、绝不抛）：清扫死 owner 的 `rpc-child-*`；把 owner 已死且长时间没更新的 `starting/running/blocked` 节点标 `failed`（`node_abandoned`）；按 `retentionDays`（默认 14 天）删空闲 run 目录（**带 `worktrees/` 的除外**）；events 按 `eventRetentionDays` / `eventMaxRows` 裁剪。每一步都同时看**年龄**与**进程所有权**，绝不碰别的活跃会话。
+
+### 7.5 run 目录的降级定位
+
+`run.json` 不再是权威状态，它承担两件事：
+
+1. **会话寻址**：`sessionFile`、`worktrees/`、`out/` 都在这里，resume 靠它。
+2. **恢复源**：`rebuildLegionDb`（`src/legion/rebuild.ts`）能从 run 记录 + session 文件 best-effort 重建 `nodes`/`events`/`usage`。它是模块级能力（有单测），**没有挂 slash 或工具入口**——不要把它当日常命令。
+
+---
+
+## 8. mail / notice 投递与 claim
+
+### 8.1 mail 是什么
+
+`legion_mail`（`src/extension/legion-tools.ts` 注册）→ `sendMail`（`src/legion/mail.ts`）：
+
+- 目标：`parent` / `children` / `squad`（`resolveMailTargets`）。
+- 类型：`question` / `report` / `handoff` / `notice`；紧急度 `info` / `action-needed`。
+- 限制：subject 硬上限 256B、body 软 4KB / 硬 32KB、每个 sender 每 5 分钟 10 封（`DEFAULT_MAIL_RATE_PER_5_MIN`）、含 U+0000 的正文直接拒绝（`MAIL_INVALID_TEXT`）。
+- 写入即 `mail_sent` 事件；投递状态在 `messages.delivered` 上演进。
+
+### 8.2 `delivered` 五值域（schema v2，`#322`）
+
+| 值 | 名称 | 含义 |
+| --- | --- | --- |
+| 0 | `PENDING` | 有效、尚未投递 |
+| 1 | `ACCEPTED` | **一次 send 调用返回了**（queued 或 accepted），不证明模型读过；`intercepted` 不落这里，直接 bounce |
+| 2 | `BOUNCED` | 永不可投：收件人已终态，或文本被输入处理器吞掉 |
+| 3 | `DELIVERED` | 收件人确实消费了（在它最近 20 个 turn 里精确匹配到文本，`MAIL_DELIVERY_TURN_WINDOW` / `mailMatchesUserText`） |
+| 4 | `OBSOLETE` | 发送时有效，消费前已失去意义（phase 已过、子节点全结束，`#333`） |
+
+状态迁移只走 `transitionDelivery`（单一写入口）；`INJECTED` 是 `ACCEPTED` 的 deprecated 别名（同值 `1`），保留只为外部 import 能编译。
+
+### 8.3 claim（租约）与两条投递路径
 
 ```text
-used / configuredLimit / granted / remaining / grantHistory
+claimForDelivery(db, id, now, leaseMs)   → 把 PENDING 行盖上 delivered_at 作为租约
+renewDeliveryClaim(...)                  → 长调用每 leaseMs/3 续租
+releaseDeliveryClaim(db, id)             → 立刻归还（send 抛错 / 竞争失败）
+MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过期不写任何东西
 ```
 
-每 session 的 spawn 配额，可运行时 grant 追加。本设计直接采用，默认 `maxSubagentSpawnsPerSession: 8`。
+**路径 A：postman tick。** `LegionPostman`（`src/extension/legion-tools.ts`）每 2s（`POSTMAN_INTERVAL_MS`）跑一轮：刷新心跳 → stall 检测 → 确认已 ACCEPTED 的投递 → 给子节点投递 → 给 root 投递 → 轮询 usage → 收队/失败安全网 → orphan 扫描 → 自身 phase 超时。投递前先跑 `discardIfStaleNotice`，把过时通知转 `OBSOLETE` 并写 `mail_bounced`。
+
+**路径 B：阻塞工具抢占（`#384`）。** 父会话卡在 `wait`/`collect` 里时，followUp 只会在 turn 边界进；所以阻塞期间由工具自己把邮箱取走：`beginMailHold(nodeId)` 冻结 postman（同进程可见），`takePendingMail` 逐条 claim + 转 `ACCEPTED`，把文本并入工具结果（`renderReleasedMail`，单次上限 100 条，250ms 轮询）。工具结果被丢弃时 `redeliverMail` 以 `Redelivered: ` 前缀重新入队（不消耗发件人配额）。hold 在阻塞调用的每条退出路径上 `endMailHold` 释放。
+
+**两条路径靠同一个租约互斥**：先 claim 到的那条投，另一条拿不到；RPC 子进程看不到内存里的 hold 注册表，因此跨进程只能靠租约。
+
+### 8.4 完成通知（notice）
+
+- 子 agent 不能回头 prompt 父会话。父会话侧 `deliverCompletion`（`src/extension/notify.ts`）把完成结果作为 `subagent-notify` 消息注入，`deliverAs: "followUp"`，并在首行写 `NOTICE_SOURCE_MARKER`（`▣ legion · automatic completion notice …`）以便模型区分「这不是用户说的话」。
+- **outbox**（`src/extension/runtime.ts`）：父 run 仍活跃时通知先入队，只在 run 边界（`agent_settled`）投递一次，避免同一批完成产生多次唤醒。
+- `MAX_PENDING_AGE_MS = 80_000` 是**健康信号**而不是发送触发器：held 通知超过 80s 只把 `heldOverCap` 加一（每条一次）并续一个窗口，**不发消息**；唯一投递时机仍是 run 边界。
+
+### 8.5 stall notice
+
+`src/legion/stall-notice.ts` 是纯判定（不读时钟、不碰 SQLite、不调 supervisor），有两条检测线：
+
+- **L1 静默**：in-flight 工具栈为空且 `now - lastEventAt >= silenceNoticeMs`（默认 120s）。栈非空**永不**报 L1（一次 10 分钟的 build 与一次卡死的 bash 事件流完全一样）。每个窗口最多 2 条（`SILENCE_NOTICE_LIMIT`）。
+- **L2 长跑**：`now - loopBaseAt >= loopRadiusMs`，每半径一条、每窗口最多 3 条（`LONG_RUNNING_NOTICE_LIMIT`）；只有此时才可以把「正在 `bash` 里 38 分钟」作为**证据**写进正文。
+
+同一 tick 每个子节点最多一条线（L1 优先）。模块只产出判定与文案，**从不决定 abort/stop/retire**——决策权在父级。
 
 ---
 
-## 8. Tab 组织策略
+## 9. 呈现层三形态
 
-### 8.1 层级映射
-
-```text
-workspace  = 项目/仓库边界（跟 cwd 走）
-  tab      = 一个「任务」
-    pane   = 一个 subagent
-```
-
-### 8.2 为什么 tab 是关键
-
-1. **原子回收**：`tab close` 一次清空该任务所有资源（F15，0.12s）
-2. **隔离边界**：herdr 无进程隔离，tab 是唯一可用的资源边界（F23）
-3. **孤儿检测**：对比 tab 内 pane vs 树登记，可发现越权创建（exp3-Q2）
-4. **人的心智模型**：按 tab 切换任务，一眼看到该任务有几个 agent
-5. **状态板**：tab rename 仅 19ms（F12），可高频更新标签
-
-### 8.3 布局决策表
-
-| 任务规模 | 布局 | 理由 |
+| 形态 | 入口 | 源文件 |
 | --- | --- | --- |
-| 单个 subagent、短任务 | 当前 tab split | 零开销 |
-| 2–4 个并行、相关 | 当前 tab 多 split | 同屏对比 |
-| 多阶段任务（父 agent 协调） | 按阶段启动 | 收到完成通知后决定下一步 |
-| 多个不相关任务并行 | **每任务一个 tab** | 隔离 + 批量回收 |
+| 命令族 | `/legion …` | `src/extension/legion-commands.ts`（`LEGION_COMMAND`） |
+| TUI viewer | `/legion`（打开）、`/legion --tree`、`x` 停止选中节点 | `src/tui/live-overlay.ts`、`src/tui/tree-view.ts` |
+| 状态面板 | 输入框上方（`aboveEditor`）的常驻 widget | `src/tui/status.ts`（`STATUS_WIDGET_PLACEMENT`） |
 
-```yaml
-placement: split-down     # split-down | split-right | new-tab
-```
+### 9.1 `/legion` 命令族（权威清单 `LEGION_SLASH_HELP_LINES`）
 
-### 8.4 编排面板（herdr 独有，spawn 做不到）
-
-```bash
-# 子 agent 启动后上报元数据
-herdr pane report-metadata <pane> --source subagent \
-  --display-agent "reviewer" --token model=glm-5.3 --token phase=review
-```
-
-```toml
-# ~/.config/herdr/config.toml
-[ui.sidebar.agents]
-rows = [["state_icon", "workspace", "tab"], ["agent", "$model", "state_text"]]
-```
-
-配合 `herdr agent view set --source subagent` 定义「只看 subagent」的过滤视图。
-
----
-
-## 9. 启动流程（含重试，关键）
-
-```ts
-async function launch(def: AgentDef, task: string): Promise<Handle> {
-  // 1. 预创建 session 文件（F4：关闭数据丢失窗口）
-  const sessionFile = path.join(runDir, `${name}.jsonl`);
-  fs.writeFileSync(sessionFile, "", { mode: 0o600 });
-
-  // 2. 建 tab（若 placement = new-tab）或 split 当前 pane
-  const paneId = def.placement === "new-tab"
-    ? (await herdr.tabCreate({ cwd, label: `task:${taskId}` })).rootPaneId
-    : (await herdr.paneSplit({ direction, cwd })).paneId;
-
-  // 3. 启动 agent，带 agent_pane_busy 重试（F19/F20）
-  const args = buildPiArgs(def, { sessionFile, task });
-  let started = false;
-  for (let i = 0; i < maxTries; i++) {
-    const r = await herdr.agentStart(name, def.kind, paneId, args);
-    if (r.ok) { started = true; break; }
-    if (r.error.code !== "agent_pane_busy") {
-      // 真错误：区分「二进制缺失」（表现为 timeout，F22）
-      throw new LaunchError(r.error, await diagnose(paneId));
-    }
-    await sleep(150 + i * 50);
-  }
-  if (!started) throw new LaunchError("retries_exhausted");
-
-  // 4. 登记到树
-  tree.children.push({ name, paneId, sessionFile, ownerToken, state: "launched" });
-  await persist(tree);
-
-  return { name, paneId, sessionFile };
-}
-```
-
-### 错误处理要点
-
-- **错误 JSON 在 stderr**（F21）—— 必须同时解析 stdout 和 stderr
-- **缺失二进制 = 15s timeout**（F22）—— 启动前用 `which <bin>` 预检，或超时后读 pane 内容诊断
-- **`agent_not_ready`**：名字不会被占用，pane 仍可用 `agent read` 查看
-
-### 名字生成
-
-```ts
-// F17：必须匹配 [a-z][a-z0-9_-]{0,31}
-function makeName(agent: string, index: number): string {
-  const base = agent.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/^[^a-z]+/, "");
-  return `${base || "agent"}-${index}`.slice(0, 32);
-}
-```
-
----
-
-## 10. 收集流程（成败判定的唯一入口）
-
-> ⚠️ `collect()` 是**成败判定的唯一入口**（F26/F27）。不能省、不能延迟到回收之后。
-
-```ts
-async function collect(handle: Handle, opts): Promise<Result> {
-  // 主通道：session jsonl（pi kind，F1/F2/F5）
-  if (def.kind === "pi") {
-    await waitTurnEnd(handle.name, handle.sessionFile, opts);   // F8
-    const execution = deriveOutcome(handle.sessionFile);        // 第 3.4 节
-    const acceptance = await verifyAcceptance(execution, handle); // 第 3.5 节
-    return { ...parseSession(handle.sessionFile), execution, acceptance };
-  }
-  // 兜底通道：pane read（非 pi kind，F7）
-  // ⚠️ 无 session → 无 stopReason → 只能报 unknown
-  const text = await herdr.paneRead(handle.paneId, { source: "recent-unwrapped", lines: 200 });
-  return {
-    output: text, usage: null, model: null,
-    execution: { status: "unknown", reason: "non-pi kind: no session file" },
-    acceptance: { status: "unknown", level: "none" },
-  };
-}
-```
-
-### 非 pi kind 的能力降级
-
-| 能力 | pi kind | cursor / claude / ... |
-| --- | --- | --- |
-| session jsonl | ✓ | ✗（F7） |
-| usage / cost | ✓ | ✗ |
-| 成败判定 | ✓ stopReason | ✗ 只能 `unknown` |
-| 续跑（resume） | ✓ `--session` | ⚠️ 依赖各自 CLI 能力 |
-
-**建议**：需要可靠成败判定和续跑能力的 agent 用 pi kind；
-非 pi kind 只用于「跑完就行、不需精确判定」的场景。
-
-### session 解析
-
-```ts
-function parseSession(file: string) {
-  let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-  let model = null, stopReason = null, finalOutput = "";
-  for (const line of readLines(file)) {
-    const e = safeJsonParse(line);           // F12：容忍 torn line
-    if (e?.type !== "message") continue;
-    const m = e.message;
-    if (m.role !== "assistant") continue;
-    const u = m.usage ?? {};
-    usage.input += u.input ?? 0; usage.output += u.output ?? 0;
-    usage.cacheRead += u.cacheRead ?? 0; usage.cacheWrite += u.cacheWrite ?? 0;
-    usage.cost += u.cost?.total ?? 0;
-    model = m.model ?? model;
-    stopReason = m.stopReason ?? stopReason;
-    for (const p of m.content ?? []) if (p.type === "text") finalOutput = p.text;
-  }
-  return { output: finalOutput, usage, model, stopReason };
-}
-```
-
-### 工具错误统计（仅诊断，不影响成败）
-
-```ts
-// F30：toolResult.isError 是 per-turn 的，不计入 execution.status
-// 实测形状（exp12-4）：
-// {"role":"toolResult","toolName":"bash","isError":true,
-//  "content":[{"type":"text","text":"(no output)\n\nCommand exited with code 1"}]}
-function countToolErrors(turn: Turn): number {
-  return turn.toolResults.filter(r => r.isError === true).length;
-}
-```
-
-**为什么只统计不判定**：exp13 实测 turn1 里 bash `exit 7` 产生 `isError: true`，
-但该 turn 仍以 `stop` 正常结束、agent 正确汇报了错误 —— 这是**预期行为**，不是任务失败。
-
----
-
-## 11. Tool 接口
-
-```ts
-subagent({
-  action?: "launch" | "continue" | "steer" | "resume" | "retire"
-         | "status" | "collect" | "wait" | "list" | "stop", // 默认 launch
-
-  // launch
-  agent?: string, task?: string,
-  tasks?: Array<{ agent: string; task: string; name?: string }>,   // 并行
-                            // name 是该条目自己的 handle（批量内必须互不相同，
-                            // 省略则由 launch 自动编号 role-N）；单条目时也可
-                            // 用顶层 name=，两处给不同值会被拒
-  async?: boolean,          // 默认 true
-  model?: string, cwd?: string, placement?: string,
-  worktree?: boolean,       // 隔离 git worktree（默认随角色）
-  verify?: string[],        // 收集时由扩展在子 worktree 里机械执行的验证命令；
-                            // 首个非零退出即 reject。子 agent 无需粘贴测试输出。
-
-  // 续跑 / 控制
-  name?: string,            // handle 名，如 "reviewer-1"
-  message?: string,         // steer / continue 的内容
-})
-```
-
-#### `verify` 的信任链
-
-- launch 时 `verify` 合成一条带 `command` 的 acceptance criterion（`task-verify`），快照进子记录的 `pendingCriteria`；
-- collect 时 `applyVerification` 在子 worktree cwd 亲自执行（bash -lc，超时 SIGKILL）；
-- 全零退出 → `accepted (verified)`；首个非零 → `rejected`，reason 指名失败的命令；
-- 未提供 `verify` 时扩展**绝不猜命令**，保持 attested 语义不变（F44 边界）。
-
-配套设置（`~/.pi/agent/settings.json` → `subagents.legion`）：
-
-- `worktreeBootstrap`: 新建子 worktree 后自动准备依赖环境。`"npm-install"`（按 lockfile 选 pnpm/bun/yarn/npm）或任意 shell 命令（如 `"ln -sfn /path/to/node_modules ./node_modules"`）。幂等：`.pi-provisioned` 标记文件记录已应用的 mode，同 mode 重入直接跳过（resume 不重装）；mode 变更视为声明变更，重新执行。
-- `worktreeBootstrapTimeoutMs`: bootstrap 命令预算，默认 600s。失败即失败整个 launch，worktree 走既有回滚被整体移除。
-
-### 动作语义
-
-| action | 用途 | 底层 |
-| --- | --- | --- |
-| `launch` | 启动新 agent | tab/pane + agent start |
-| `continue` | **本轮完成后继续**（上下文保留） | `agent prompt`（若还活着）或 resume |
-| `steer` | **运行中插话改方向**（F10） | `agent prompt`（不等） |
-| `resume` | **已退出后恢复**（F12） | 新 pane + `--session <file>` |
-| `retire` | 回收 | ctrl+d / pane close / tab close |
-| `status` / `collect` / `list` | 查询 | child record / session JSONL |
-| `wait` | 等待指定或全部活动 child 完成；由 RPC settle 事件唤醒；ESC 中断只结束等待（children 继续跑并 re-arm watch） | session runtime + RPC supervisor |
-| `stop` | 优雅停止指定或全部 tracked、非 retired children | `retire` 全链 + runtime release |
-| `extend` | **只延后「可能陷入循环」提醒**（`docs/contracts/stall-notice-v1.md` D5） | postman 内存里的 L2 基准前移到 now；不改任何预算 |
-
-### ESC abort 语义 + stop
-
-> **v3（2026-10-15）**：见 `docs/contracts/esc-no-retire-v3.md`。ESC / 父 turn abort **不再**级联 retire。
-
-父 turn 的 ESC / RPC abort signal 会立即打断当前工具等待，但 **children 继续运行**；`wait` 返回 `interrupted (parent turn ended; children still running)` 并 re-arm watch，settle 仍通知父会话。显式 `/legion stop` / `stop` action，或主进程退出（`session_shutdown`，print/json 先 drain）才会 retire。正常完成的 `wait` 仍由 RPC settle 事件立即解除，不需要等满 timeout。
-
-`stop` 是显式停止操作：`subagent({ action: "stop", name: "worker-0" })` 停一个 child，`subagent({ action: "stop", all: true })` 逐个停止当前跟踪的全部非 retired children。它复用 `retire` 生命周期（优雅关闭、超时后升级信号、后代清理）并释放 runtime 跟踪；`stop` 本身不接父 turn abort signal。`name` 与 `all` 互斥且必须指定其一。
-
-### `continue` vs `steer` vs `resume` vs `renewal` vs `extend`
-
-| 场景 | 用哪个 |
+| 命令 | 作用 |
 | --- | --- |
-| 还在跑，想改方向 | `steer` |
-| 跑完了（awaiting），要它接着做 | `continue` |
-| 已退出 / pane 没了，要接着做 | `resume` |
-| 彻底不要了 | `retire` |
-| 轮次预算耗尽，续一段预算 | `renewal`（角色 `renewable` / `maxRenewals`） |
-| 子看着像在死循环，但你想先让它继续跑 | `extend` |
+| `/legion` | 打开 Legion 视图（TUI） |
+| `/legion status [name]` | 全树摘要，或单节点（与 `subagent({action:"status"})` 同文本） |
+| `/legion team [list\|use <name> [--global]\|create <name> a,b,c [--global]]` | 查看/切换/创建 team |
+| `/legion agents [user\|project\|both]` | 列出角色卡 |
+| `/legion on` / `/legion off` | 本会话开关 subagents |
+| `/scout-guard` / `/no-scout-guard` | 本会话覆盖主会话 scout guard |
+| `/legion summary [--all] [<name>]` | 会话级汇总（`src/extension/summary.ts`） |
+| `/legion timing [--json] [<name>]` | 子节点 wall / generation / other 计时（`src/extension/timing.ts`） |
+| `/legion doctor [section]` | 全量自检；section ∈ `summary/extensions/models/spawn/memory/tools/storage/runtime/errors/next`（`DOCTOR_SECTIONS`） |
+| `/legion stop [--force\|-f] [name\|all]` | 回收（`src/extension/legion-stop.ts`） |
+| `/legion --tree` / `/legion <node>` | 直接打开树视图 / 定位节点 |
+| `/legion help` | 打印上述清单 |
 
-`extend` 的语义只有一条：把该子节点的 L2 提醒基准前移到 `now`
-（`subagent({ action: "extend", name, ms? })`，`ms` 省略则沿用当前半径）。它
-**不延长**父的 `collect`/`wait` 预算（那是角色 `timeoutMs`）、**不重启不复活**子进程
-（那是 `continue`/`resume`）、**不延后 L1 静默提醒**（L1 的基准是子自己的事件，客观
-事实不该被续期抹掉）。`wait` 回执里的 "extend" 是「再调一次 wait」，与本动作无关。
-状态存内存：进程重启后按「首次见到」重建，基准回到 `nodes.created_at`。
+`/legion help` 与 doctor 的 Tools 段共用同一份 `LEGION_SLASH_HELP_LINES`（`src/extension/legion-doctor.ts`），所以两处不会漂移。
 
-作用范围只有**本节点（调用者）的直接子**：`runId` 参数对它不适用，未知名字与**已终态 /
-已 retire 的子**一律 `NOT_FOUND` 拒绝——回执承诺一封永远不会到来的提醒比拒绝更糟。
-子终态后在探测器里留一条 `absent` 墓碑（清空计数、不删条目），`continue` 复活时按
-「重新出现」把基准重置为复活时刻，因此不会拿旧的 `created_at` 立刻误报一次 L2。
+### 9.2 TUI 与状态面板
 
-### `retire` 的隐含语义（重要）
+- **树视图**（`tree-view.ts`）：活动/终态分区来自 `isTerminalState`（`src/extension/liveness.ts`），不是本地手写集合；键位：`j/k` 移动、`enter` 折叠、`/` 搜索、`pgup/pgdn` 滚动、`esc/q` 关闭。
+- **live overlay**（`live-overlay.ts`）：单节点详情，含 backend（`spawnMode`）、turn 进度、worktree 路径；历史 transcript 从 session 文件回填（`backfill` 游标，250ms 轮询），事件增量来自事件总线（`createDbEventSource` 把账本事件喂进总线）。
+- **状态面板**（`status.ts`）：`aboveEditor` 常驻组件 + `requestRender`，elapsed 自己走时钟（execute ctx 过期后仍能刷新）；数据来自 `viz/model.ts` 的节点快照与 `viz/rate.ts` 的速率采样，渲染走 `viz/railway.ts`。
 
-```ts
-// retire 必须先 collect，再回收 —— 顺序不可颠倒（F27）
-async function retire(name) {
-  const child = tree.children.find(c => c.name === name);
+### 9.3 工具面（root 与 child 不同）
 
-  // 1. 先抓 execution（agent 退出后就拿不到了）
-  if (child.state !== "retired" && child.sessionFile) {
-    child.execution = deriveOutcome(child.sessionFile);
-  }
-
-  // 2. 再回收 pane
-  await gracefulExit(name);        // ctrl+d ×2
-  if (await stillAlive(name)) await herdr.paneClose(child.paneId);
-
-  // 3. 落盘
-  child.state = "retired";
-  child.paneId = null;
-  child.retiredAt = now();
-  await persist(tree);
-}
-```
-
----
-
-## 12. 持久化布局
-
-```text
-<project>/.pi-subagents/
-  runs/<run-id>/
-    run.json                    # 树 + 生命周期 + execution + acceptance
-    <agent>-<n>.jsonl           # ★ session（resume 凭据，必须持久）
-    out/<agent>-<n>.md          # 交付物
-    logs/<agent>-<n>.log        # pane read 快照（人的现场，可轮转）
-```
-
-**双写状态**：herdr 侧（tab label + pane metadata，给人看）与磁盘侧（run.json + session，给机器读）互为备份。
-
-- herdr server 重启 → 从 `run.json` 恢复
-- 文件系统丢失 → 从 `agent list` 恢复
-- **成败信息只在 run.json**（F27：agent 退出后无法重查），所以 run.json 是权威
-
----
-
-## 13. 实施计划
-
-| 阶段 | 内容 | 验收标准 |
+| 工具 | 可用者 | 作用 |
 | --- | --- | --- |
-| **P1 MVP** | single + parallel；pi kind；split pane；start 重试；`deriveOutcome` 成败判定；无条件回收 | 3 个 reviewer 并行跑完，拿到结构化结果 + usage + **准确的 success/failed 判定**；无 pane 泄漏 |
-| **P2 编排** | `continue`/`steer`/`resume`；tab 布局；孤儿审计；blocked 转发；acceptance 校验 | 中途纠正跑偏 worker；awaiting 后 continue 上下文保留；agent 自述失败能被识别 |
-| **P3 成熟** | 多 kind（cursor/claude/codex）；async 后台；worktree 隔离；modelScope；tool/turn budget；agent view 面板 | 侧边栏一眼看到全部 subagent 状态 |
-| **P4 产品化** | 打成 pi package；文档；单测 | `pi install npm:...` 一键可用 |
+| `subagent` | 宿主会话（受 `subagents.enabled` 与预算约束） | 13 个动作：`launch` / `continue` / `steer` / `abort` / `resume` / `retire` / `status` / `collect` / `list` / `wait` / `stop` / `diagnose` / `extend` |
+| `vexillatio` | 宿主会话（utility child 自身不注册） | 只派 read-only utility agent（`scout`），永远 leaf |
+| `legion_mail` / `legion_tree` / `legion_phase` | **子进程**（`registerTools: true`，root 为 `false`） | 发信 / 看子树 / 请求阶段迁移 |
 
-### P1 必须处理的坑（全部实测确认）
+`subagent` 的参数里两个值得记住的点：`section` 是真实存在的 diagnose 过滤参数（等价 `/legion doctor [section]`）；`phases` / `start` 只对 root 派发 centurion 有意义（§3.4.2）。
 
-1. ✅ 启动重试（F19/F20）
-2. ✅ stderr 解析（F21）
-3. ✅ 预创建 session（F4）
-4. ✅ 二进制预检（F22）
-5. ✅ 名字规范化（F17）
-6. ✅ torn line 容忍（F12）
-7. ✅ `ctrl+d` 而非 `ctrl+c`（F11）
-8. ✅ tab close 兜底（F15）
-9. ✅ **`deriveOutcome` 从 session 推导成败**（F26–F31）—— 不能用 `agent_status`
-10. ✅ **回收前先 collect**（F27）—— 否则成败信息永久丢失
+---
 
-### P1 验收测试用例（直接来自实验）
+## 10. 与 pi 宿主边界
 
-| 用例 | 预期 execution.status |
+### 10.1 三种后端各自由谁承担
+
+| 后端 | 子会话是什么 | 何时启用 | 契约 |
+| --- | --- | --- | --- |
+| `inprocess` | 父 Node 进程里的 `AgentSession`（`createAgentSession` + `SessionManager.open(sessionFile)`） | 默认；只要 launch 不需要 worktree | `docs/inprocess-supervisor.md` |
+| `rpc` | 独立 `pi --mode rpc` 子进程（`RpcClient`） | 需要 worktree 且不在 hc 终端内 | `docs/headless-child-contract.md` |
+| `terminal` | hc 终端里的真 `pi` TUI（JSON-RPC over `hc connect`） | 需要 worktree + `HC_TERMINAL_SOCKET` & `HC_TERMINAL_ID` 都在 | `docs/contracts/centurion-terminal-backend-v1.md` |
+
+`terminalHostAvailable` 只看两个非空 env 标记：不 fork、不探 socket、不跑 git。hc 客户端的方法白名单是 `HC_METHODS`（`hello` / `terminal.run|get|send|wait|interrupt|kill|rm`），后端只被允许使用终端事实，不碰 `server.stop` 之类的控制面。
+
+### 10.2 子会话里装了什么
+
+- **身份**：`PI_LEGION_DB` + `PI_LEGION_NODE_ID`（账本身份与 node 行），`PI_SUBAGENT_ROLE` / `PI_SUBAGENT_ACCEPTANCE_ROLE`（只读角色判定），`PI_LEGION_PHASES`（相位机声明，仅 centurion）。
+- **预算**：`PI_SUBAGENT_MAX_DEPTH`、`PI_SUBAGENT_ALLOW_NESTED`、`PI_SUBAGENT_MAX_TOOL_CALLS`、`PI_SUBAGENT_MAX_TURNS`、`PI_SUBAGENT_TOOL_TIMEOUT_MS`（`child-guard.ts` / `budget.ts`）。
+- **child-guard**（`registerChildGuard`）：子会话加载的扩展，做三件事：计数并拦 `toolBudget`/`turnBudget`、拦 bash 对 `legion.db` 的直接读写、给 bash 套 `toolTimeoutMs`；它**不注册父工具**，所以「能不能再派活」由是否装父工具决定。它是**纪律层**，不是沙箱：`acceptance.role: read-only` 是**只针对 bash** 的规则（`tool_call` handler 首行就是 `if (event.toolName !== "bash") return;`），`edit`/`write` 由卡片 `tools:` 决定，MCP 与 `codemode` 脚本不在覆盖范围内——精确边界见 README 的「What `read-only` actually covers」。
+- **扩展继承**：`ensureHostExtensions` 在第一次 spawn 前预热宿主扩展发现（幂等、永不 reject），子会话默认继承宿主扩展，卡片可用 `inheritExtensions` / `excludeExtensions` / `subagentOnlyExtensions` 调整。
+
+### 10.3 失败与中断的归属
+
+- 执行结果由 `parseSessionFile` + `deriveOutcome`（`src/shared/session.ts`）从 session jsonl 推导；backend 只负责给 settle 信号（`SettleResult`）。
+- 中断（ESC / `abort`）保留子会话：`abort` 只打断当前 turn，`stop`/`retire` 才拆会话（`#313`/`#314`）。
+- `wait`/`collect` 超时不是失败：返回结构化 `decisions`（`extend` / `steer_again` / `stop` / `force_stop`），由父级选。
+- 验收（acceptance）：`deriveOutcome` 之外再看 `acceptance.level`。`attested` 是 agent 自评；只有 `verification-output` 证据且带显式 `command` 的 required 条件，才会由 `src/runs/acceptance.ts` 真跑并升级为 `verified` 或判 `rejected`。没有 `command` 的条件保持 `attested` 并列为 pending，交给父 agent 确认——平台不猜命令。
+
+---
+
+## 附录 A：符号锚点索引
+
+| 主题 | 文件 |
 | --- | --- |
-| 正常完成 | `success` |
-| 模型报错（bad model） | `failed` + errorMessage |
-| esc 优雅中断 | `aborted` |
-| pane close 强杀 | `aborted`（缺 assistant 消息） |
-| turn1 工具报错、turn2 成功 | `success`（只算末轮） |
-| agent 自述 "FAILED: ..." | `success` + acceptance 应报 rejected |
-
----
-
-## 14. 已知限制（明确接受）
-
-| 限制 | 影响 | 缓解 |
-| --- | --- | --- |
-| **无进程隔离**（F23–F25） | 子 agent 可读任意 pane | tab 边界 + 孤儿审计 + prompt 纪律 + tools 白名单 |
-| **`agent_status` 无成败语义**（F26） | 不能靠 herdr 判断成败 | 必须读 session jsonl（第 3.4 节） |
-| **`agent get` 无 error 字段**（F27） | 退出后信息全失 | 回收前 collect，快照进 run.json |
-| **非 pi kind 无 usage / 无成败判定**（F7） | cursor/claude 只能报 `unknown` | 只用于「跑完就行」的场景；关键任务用 pi kind |
-| **agent 自述失败不可信**（F32） | 说“我失败了”但 stopReason 是 `stop` | 靠 acceptance L2 自述 verdict / L3 外部校验 |
-| **`agent wait` 语义依赖屏幕检测** | blocked 有误判率 | 超时兜底，不作为唯一真相 |
-| **`pane process-info` 无法判状态** | 测不出 working/idle（diff 为空） | 用 jsonl 静默 + 消息计数代替 |
-| **pane 是稀缺资源** | 大量并行受屏幕限制 | `maxConcurrentAgents` 限流 |
-| **herdr 版本耦合** | API 变更风险 | 启动时检查版本，缺失方法明确报错 |
-| **`split` 需要 `HERDR_PANE_ID`**（F34） | headless/脚本环境里 split 直接失败 | 无当前 pane 时自动降级为 `new-tab`（见下） |
-
----
-
-## 15. 交付验证（F34–F36：只有真机/容器才能暴露）
-
-以下三条不是设计推导出来的，是**把插件放进隔离容器跑真实 pi 才暴露**的。它们全部属于
-"单元测试与集成测试都绿，但用户装上就是不能用"的类型。
-
-### F34 — `pane split --current` 依赖 `HERDR_PANE_ID`
-
-```text
-$ herdr pane split --current --direction down --no-focus
---current requires HERDR_PANE_ID
-```
-
-`--current` 由 herdr 从 `HERDR_PANE_ID` 解析，而该变量只在 **pi 自己跑在 herdr pane 里**时存在。
-于是 headless 场景（脚本、CI、`pi -p`、容器）里**默认的 `split-down` 必然失败**：
-
-```text
-✗ scout: HERDR_ERROR: pane split failed: --current requires HERDR_PANE_ID
-```
-
-**修法**：placement 感知环境。有 `HERDR_PANE_ID` 才 split，否则降级为 `new-tab`。
-tab 本来就是更好的隔离单元（F15），降级不损失能力。
-
-### F35 — `tab create` 也必须传 `--env`，否则血缘丢失
-
-herdr 的 `tab create` 支持 `--env`（和 `pane split` 一样），但**我最初没传**。
-后果：一旦 F34 的降级生效，子 agent 拿不到 `PI_SUBAGENT_PARENT_PATH` / `PI_SUBAGENT_MAX_DEPTH`，
-**嵌套深度上限直接失效**——一个纯安全边界被静默绕过。
-
-这个 bug 是被一条**早已存在的测试**抓到的：该测试断言 split 命令里有血缘 env，
-它在开发机（`HERDR_PANE_ID` 恰好存在）一直是绿的，直到在干净环境里跑才失败。
-**教训：测试若依赖环境变量才能通过，就不是回归测试。**
-
-### F36 — 包自带的 `agents/` 不在 pi 的包资源约定里
-
-pi 的包资源约定只有 `extensions/` `skills/` `prompts/` `themes/`。
-`agents/` **不在其中**，写进 `package.json` 的 `pi` manifest 会被静默忽略。
-所以插件自带的 5 个角色定义，在真实安装后一个都加载不到：
-
-```text
-$ subagent action=list
-No agents found. Add definitions to ~/.pi/agent/agents/*.md
-$ subagent action=launch agent=scout
-✗ unknown agent "scout". Available: none
-```
-
-**修法**：用 `import.meta.url` 把包自身的 `agents/` 锚定出来（不能靠 `~/.pi/agent`），
-作为**最低优先级**的 builtin 层并入 discovery；再提供
-`PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS` 供 Nix/只读安装注入角色目录。
-优先级：`builtin` < `extra dirs` < `user` < `project`。
-
-### 验证矩阵（隔离容器：独立 herdr server + 独立 pi home + 真实 LLM）
-
-| 项 | 结果 |
-| --- | --- |
-| typecheck | clean (exit 0) |
-| unit | 170 pass / 0 fail |
-| integration | 41 pass / 0 fail（含 14 个 bug 回归） |
-| live（真 herdr + 真 pi 子进程） | 3 pass / 0 fail |
-| 端到端（真实 pi 调 `subagent` 工具） | launch→collect `execution=success`, output `FINAL_OK` |
-| 自带角色加载 | 5/5 以 `[builtin]` 出现 |
-| headless launch | 自动降级 `new-tab`，`execution=success` |
-
-复现脚本：`/tmp/herdr-sandbox/`（Dockerfile + verify.sh + final2.sh）。
-
-### F37 — 开发机的 `node_modules` 是手工 symlink，克隆后 typecheck 必崩
-
-我在开发机上把 peer 依赖做成了指向全局 pi 安装的 **symlink**（从未进 git）。
-于是 `npm run typecheck` 在开发机一直绿，但**全新 `git clone` 后必然失败**：
-
-```text
-index.ts(131,4): error TS7006: Parameter 'onUpdate' implicitly has an 'any' type.
-index.ts(132,4): error TS7006: Parameter 'signal' implicitly has an 'any' type.
-```
-
-根因有两层：
-
-1. `peerDependenciesMeta` 把**全部** peer 标成 `optional`，npm 因此不安装它们。
-2. 类型定义实际来自开发机的手工 symlink，而非任何可复现的安装步骤。
-
-**修法**：`peerDependencies` 保留（pi 官方要求用 `"*"` 声明并由 pi 提供），
-但把真正参与编译的包同时列为 **devDependencies**（`pi-agent-core`、
-`pi-coding-agent`、`typebox`），使 `npm install` 后即可 typecheck。
-
-**教训（与 F35 同源）**：**“在我机器上能跑”的等价物是“在我的 node_modules 上能编译”。**
-验证可交付性必须从一个干净克隆开始，而不是在开发工作区里跑测试。
-这条同样是“测试全绿但用户装不上”的类别。
-
----
-
-## 16. 交付前安全/健壮性审计（F38–F46）— Historical findings（✅ landed）
-
-对全部模块做了对抗式输入扫描（畸形会话文件、路径穿越、恶意配置、并发写）。
-以下条目**当时**是真缺陷；对照当前 master 均已落地（见各条 ✅），勿再当 open gap。
-
-| # | 当时缺口 | master 落点（摘要） |
-| --- | --- | --- |
-| F38 | glob→RegExp ReDoS | `matchesScopePattern` 双指针 glob，**不用 RegExp** |
-| F39 | `openSync`/`closeSync` fd 泄漏 | session 预创建改 `writeFileSync(..., { flag: "wx" })` |
-| F40 | `JSON.parse` 标量拖垮会话解析 | `decodeEvent` 非对象计入 `tornLines` |
-| F41 | `tasks[]` 条目未校验 | `firstInvalidStep` / 启动前校验 agent+task |
-| F42 | 空白 `task` 被 `Boolean` 放行 | 存在性按 `trim()` |
-| F43 | 角色 `timeoutMs` 被忽略 | launch 记入 `timeoutByName`，follow/wait 使用 |
-| F44 | `acceptance.criteria` 静默丢弃 | `pendingCriteria` + command 才升 `verified` |
-| F45 | 未生效配置看起来生效 | `UNENFORCED_FIELDS` 现为空；list 不再假警告 |
-| F46 | 嵌套 YAML acceptance 未解析 | `parseAcceptance` + `parseIndentedBlock` |
-
-### F38 — ✅ landed — ReDoS：glob → RegExp 的嵌套量词（安全）
-
-`modelScope.allow` 的 glob 被翻译成 `.*`，于是 `*a*a*a…b` 变成 `.*a.*a.*a…b`——
-嵌套量词在**不匹配**的输入上指数回溯。
-
-```text
-实测：n=50 → 327ms, n=100 → 14565ms（每个 * 翻倍）
-```
-
-**威胁模型成立**：pattern 来自 `.pi/settings.json`，而该文件**随克隆的仓库一起来**。
-受害者 clone 一个恶意仓库，在其中调用一次 subagent 工具，主进程即被挂起。
-
-**修法**：不用正则，改用双指针贪心 glob 匹配（只回溯最近一个 `*`）。
-修复后 n=6400 仅 2ms。
-
-### F39 — ✅ landed — fd 泄漏：`openSync`/`closeSync` 无保护
-
-```ts
-const fd = fs.openSync(file, "w", 0o600);
-fs.closeSync(fd);   // ← 抛错（EIO/ENOSPC）则 fd 永久泄漏
-```
-
-launcher 为**每个 child** 创建一个 session 文件，所以泄漏会随 fan-out 累积。
-实测：模拟 200 次中 67 次抛错 → fd 从 21 涨到 88。
-
-**修法**：`fs.writeFileSync(file, "", { flag: "wx", mode: 0o600 })`——
-由 Node 自己管理描述符，并且 `wx` 顺带消除了 `existsSync` 检查留下的 TOCTOU 窗口。
-
-### F40 — ✅ landed — `JSON.parse("null")` 拖垮整个会话解析
-
-`JSON.parse` 对标量是成功的：`null` / `42` / `true` / `"x"`。
-随后 `event.type` 在 `null` 上抛异常，**整个 `parseSessionText` 崩溃**，
-于是 `collect` 也崩溃。会话文件是外部输入（pane 可能在写入中途被关闭）。
-
-**修法**：非对象、非数组的标量按损坏行计入 `tornLines`，继续解析其余行。
-
-### F41 — ✅ landed — `tasks[]` 的条目未校验
-
-单任务路径用 `Boolean(params.agent && params.task)` 把关，但数组路径直接放行：
-
-```text
-tasks:[{agent:"worker", task:""}] → 放行，启动一个没任务的 child
-tasks:[{task:"do it"}]            → 放行，agent 名为 undefined
-```
-
-**修法**：每个 step 在分配任何资源之前校验 `agent` 与 `task`。
-
-### F42 — ✅ landed — `Boolean("   ")` 为真：纯空白 task 被放行
-
-即使单任务路径，`task: "   "` 也会通过，生成一个毫无意义的 `Task:` prompt。
-**修法**：存在性按 `trim()` 后的内容判定，而非 `Boolean()`。
-
-### F43 — ✅ landed — `timeoutMs` 被解析却从不生效
-
-5 个自带角色都声明了预算，运行时却全部忽略，永远用全局默认 15 分钟：
-
-```text
-worker.md: timeoutMs: 1800000 (30min)  ← 被忽略
-oracle.md: timeoutMs: 1200000 (20min)  ← 被忽略
-DEFAULTS.turnTimeoutMs: 900000 (15min) ← 实际生效
-```
-
-**修法**：`collect` 采用 `agent.timeoutMs`（按 child 记录，逐个子 agent 生效）。
-
-### F44 — ✅ landed — `acceptance.criteria` 被静默丢弃
-
-角色可以声明 `must: "测试通过"` 这类**语义**验收条件，代码解析后就不管了。
-调用方无法知道「没有任何东西验证过它」。
-
-这里**不能**假装自动校验：`must` 是自然语言，而 agent 自述成功恰恰是 F32 证明
-不可信的那个信号。
-
-**修法**：criteria 作为**待验证清单**回传调用方（`pendingCriteria`），
-且 `level` 保持 `attested`——**`verified` 只留给真正被人核对过的证据**。
-
-### F45 — ✅ landed — 配置字段「看起来生效、实际无效」
-
-自带角色携带 `onBlocked` / `allowNestedSubagents` / `fallbackModels` / `toolTimeoutMs`，
-全部被解析、全部不生效。其中 `allowNestedSubagents: false` 最危险——
-它**看起来像个安全护栏**，实际真正的护栏是 `maxSubagentDepth: 1`。
-
-**修法**：
-
-1. 从自带角色移除这些字段（不发布误导性配置）；
-2. 新增 `AgentConfig.unenforcedFields`，在 `action=list` 与 `launch` 输出中
-   显式警告 `⚠ not enforced yet: ...`。
-
-**原则**：**一个被接受却不做事的键，比一个未知的键更危险**——
-用户会相信它已经在保护自己。
-
-### F46 — ✅ landed — 嵌套 YAML 块从未被解析：自带角色的 acceptance 全部丢失
-
-frontmatter 解析器是**扁平的**（只处理 `key: value`）；一个嵌套块会以
-**剥掉公共缩进后的原始文本**返回：
-
-```text
-acceptance: "level: attested\nrole: read-only\ncriteria:\n  - id: ..."
-```
-
-而 `parseAcceptance` 只做了 `JSON.parse(raw)`——对这段文本永远失败，
-直接 `return undefined`。于是：
-
-```text
-实测：oracle/planner/reviewer/scout/worker 的 acceptance 全部 undefined
-      → level 丢失、role 丢失、criteria 丢失
-```
-
-这是最隐蔽的一类 bug：**配置写得很对、解析器也“成功返回”了，但结果是空**。
-它同时解释了为什么 F44 的 criteria 从来没出现在输出里——那些 criteria
-**根本没被解析出来**。
-
-**修法**：`parseAcceptance` 接受两种写法——单行 JSON 字符串（保留）
-与嵌套 YAML 块（自带角色实际使用的写法）。新增一个极简的
-`parseIndentedBlock()`，只支持 agent 定义用到的形状（标量 + 一层对象列表），
-不做完整 YAML。
-
-修复后：5 个角色的 `level` / `role` / `criteria` 全部正确解析，
-且 criteria 经 F44 的通道真实出现在 `collect` 输出中（容器实测）。
-
-### 已验证健壮的区域（对抗输入，0 崩溃）
-
-| 区域 | 输入 | 结果 |
-| --- | --- | --- |
-| 路径穿越 | `../../etc/passwd`、`..`、`/etc/passwd`、NUL、超长… 12 例 | 全部安全 |
-| herdr 响应解析 | 空/非 JSON/`null`/截断/BOM/stderr-only… 16 例 | 0 崩溃 |
-| argv 构造 | 空 task、NUL、`--flag` 注入、超长… 13 例 | 0 崩溃；`shell: false` |
-| 模型解析 / scope | 非法 thinking、空串、大小写… 15 例 | 正确处理 |
-| 并发写 | 50 并发 `addChild` / `updateChild` | 无丢失 |
-| retire | pane 已死 / agent 已退 | 安全降级 |
-
----
-
-## 附录：实验脚本
-
-- `/tmp/exp1.py` — turn 完成判定信号
-- `/tmp/exp2.py` — pane 回收经济学
-- `/tmp/exp3.py` — tab 隔离 + 孤儿检测 + 批量回收
-- `/tmp/exp4.py` — pane-close-mid-turn 安全性
-- `/tmp/exp5.py` — session 预创建 / steering / wait 语义
-- `/tmp/exp6.py` — 预创建验证 / 并发 / 名字冲突
-- `/tmp/exp7.py` — 并行启动竞态根因
-- `/tmp/exp8.py` — 重试修复 + 父死子活 + 迟到接管
-- `/tmp/exp9.py` — 多 kind + 资源上限
-- `/tmp/exp10.py` — 名字生命周期 + 非 pi 收集 + 失败模式
-- `/tmp/exp11.py` — pane 诊断能力 + 失败信号
-- `/tmp/exp12.py` — 成败判定信号全场景枚举
-- `/tmp/exp13.py` — 多轮成败 / 工具错误 / abort 语义
+| 账本 schema / WAL / 迁移 | `src/legion/db.ts` |
+| 树查询与状态 | `src/legion/nodes.ts` |
+| 事件枚举 | `src/legion/events.ts`、`src/extension/event-bus.ts` |
+| 用量累计 | `src/legion/usage.ts` |
+| 相位机定义 / 校验 / 归一化 | `src/legion/phase-machine.ts` |
+| 相位迁移判定 | `src/legion/state-machine.ts` |
+| 相位条件 | `src/legion/phase-conditions.ts` |
+| mail 状态机 | `src/legion/mail.ts` |
+| mail 抢占投递 | `src/legion/mail-release.ts` |
+| stall 判定 | `src/legion/stall-notice.ts` |
+| 从 run 目录重建账本 | `src/legion/rebuild.ts` |
+| 派发/收集/回收/验收 | `src/runs/orchestrator.ts`、`src/runs/acceptance.ts` |
+| run 记录与目录 | `src/runs/store.ts` |
+| 子进程 argv/env | `src/runs/args.ts`、`src/extension/child-guard.ts` |
+| worktree | `src/runs/worktree.ts` |
+| 三后端 | `src/supervisor/{routing,rpc,inprocess,terminal}-supervisor.ts` |
+| spawn 模式常量 | `src/supervisor/spawn-mode.ts` |
+| hc 客户端 | `src/hc/client.ts` |
+| 工具注册 | `index.ts`（`subagent` / `vexillatio`）、`src/extension/legion-tools.ts`（`legion_*`） |
+| 命令族 / doctor / 通知 / 运行时 | `src/extension/legion-commands.ts`、`legion-doctor.ts`、`notify.ts`、`runtime.ts` |
+| TUI | `src/tui/{tree-view,live-overlay,status}.ts`、`src/tui/viz/*` |
+
+## 附录 B：相关契约（本文不复述，按需查阅）
+
+`docs/inprocess-supervisor.md`、`docs/headless-child-contract.md`、`docs/contracts/centurion-terminal-backend-v1.md`、`docs/contracts/declarative-phase-machine-v5.md`、`docs/contracts/centurion-declared-phases-v1.md`、`docs/contracts/legion-session-continuity-v1.md`、`docs/contracts/mailbox-delivery-v1.md`、`docs/contracts/notice-delivery-v2.md`、`docs/contracts/stall-notice-v1.md`、`docs/contracts/stall-notice-staleness-v1.md`、`docs/contracts/launch-admission-queue-v1.md`、`docs/contracts/esc-no-retire-v3.md`、`docs/contracts/retire-hardening-v1.md`、`docs/contracts/wait-mail-preempt-v1.md`、`docs/tui-viewer-contract.md`。
+
+## 附录 C：刻意留白
+
+以下内容本文不写，因为代码里没有可落锚点的实现，或只存在于契约/历史记录：
+
+- 旧 §1 的 F1–F46 实验结论（herdr 原语、ctrl+d、pane read、tab close、多 kind 降级）——见 [`docs/archive/design-herdr-era.md`](archive/design-herdr-era.md)。
+- `rebuildLegionDb` 的运维入口：只有模块与单测，没有命令/工具。
+- bench / 性能门槛数字：由 `bench/**` 与 reports 承载，本文不引用。
+- 未来计划（`P1/P2/P3` 里程碑表）——代码未落地的东西不写成设计。
