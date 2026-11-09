@@ -63,6 +63,7 @@ import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
+import { isLegionRunActive } from "./src/legion/run-active.ts";
 import { type ExecutionStatus, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
 import { allocateSiblingNames, isValidAgentName } from "./src/shared/name.ts";
@@ -956,6 +957,10 @@ function createLegionRuntime(input: {
 		eventBus,
 		sendRootMessage: (text: string) => notice(input.pi, text),
 		sendSelfMessage: (text: string) => notice(input.pi, text),
+		// root-mail-run-boundary D2: the read side. Asked on every root-inbox pass; the
+		// truth stays in the session runtime's `parentRunActive` closure, reached through
+		// the process-wide registry, and a node with no registrant answers `false` (D3).
+		isRunActive: () => isLegionRunActive(input.nodeId),
 		...(input.machine ? { machine: input.machine } : {}),
 		...(input.noticeMsForRole ? { noticeMsForRole: input.noticeMsForRole } : {}),
 		resumeChild: (node: LegionNode, mail: LegionMailCommand) => resumeLegionChild({
@@ -1554,6 +1559,17 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	const ownLegionIdentity = (): LegionRuntimeIdentity | undefined =>
 		ownLegionKey === undefined ? undefined : legionIdentities.get(ownLegionKey);
 	/**
+	 * `root-mail-run-boundary-v1` D2: publish THIS session's run-activity reader, keyed
+	 * by the adopted identity's `nodeId`.
+	 *
+	 * Indirect on purpose: `sessionRuntime` is declared much further down (extension
+	 * load builds it), while adoption also happens from the boot-time env attach ABOVE
+	 * that point. Reaching for that `let` from here would be a TDZ throw, so the hook is
+	 * wired once the runtime exists and stays `undefined` (a silent no-op) before that —
+	 * which is also the bootstrap path D7-3 registers as fail-open.
+	 */
+	let publishRunActivityFor: ((nodeId: string) => void) | undefined;
+	/**
 	 * Register a resolved identity and make it this entry's own (#283/#285).
 	 *
 	 * One rule for every call site: the map holds at most one live handle per
@@ -1574,6 +1590,18 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		}
 		if (existing !== identity) legionIdentities.set(key, identity);
 		ownLegionKey = key;
+		// `root-mail-run-boundary-v1` D2: the ONE write point for the run-activity
+		// reader — and it has to be here. Adoption is where every identity of this
+		// session converges (`resolveLegionIdentity` on `session_start`, the lazy
+		// `createRootLegion` on a session's first launch, a reopened run, and a
+		// `vexillatio` batch). Publishing anywhere narrower leaves the gate open for a
+		// whole session: for a true ROOT, `initializeLegionRuntime` resolves nothing
+		// before the first launch, so its only identity is the one `createRootLegion`
+		// hands to this function — and that session never fires `session_start` twice.
+		// Idempotent: a later adoption of the same node republishes the same reader.
+		// (A child publishes under its own nodeId too; harmless — the gate is only read
+		// by `deliverRootInbox`, which only `nodeId === "root"` ever runs.)
+		publishRunActivityFor?.(identity.nodeId);
 	};
 	const initializeLegionRuntime = (ctx: Pick<ExtensionContext, "cwd"> & { sessionFile?: string; legionNode?: { dbPath: string; nodeId: string } }): void => {
 		// The injected node's dbPath is authoritative: an in-process child shares the
@@ -2098,6 +2126,15 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		pi.on("session_shutdown", shutdownRetireAll);
 		return;
 	}
+	// `root-mail-run-boundary-v1` D2: from here on every identity this session adopts
+	// publishes its run-activity reader (`adoptLegionIdentity` is the single write
+	// point). Deliberately AFTER the early return above: a nested-disallowed child
+	// registers no `agent_start`/`agent_settled`, so it has no run lifecycle to report
+	// and stays out of the registry (D7-3 fail-open) — `publishRunActivityFor` remains
+	// `undefined` for it, which is what makes `adoptLegionIdentity` silent there.
+	publishRunActivityFor = (nodeId) => {
+		try { runtime.publishRunActivity?.(nodeId); } catch { /* optional member: stay fail-open (D3) */ }
+	};
 	// #17: main session only. Children (PI_SUBAGENT_ROLE / PI_SUBAGENT_CHILD)
 	// must not count their own reads or inject this reminder. Nested children
 	// also have isChild set, so they skip this even though they continue below.

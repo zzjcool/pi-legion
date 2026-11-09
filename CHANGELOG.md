@@ -28,6 +28,30 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - viz 契约标注证据链：门槛只在本机 `bench/perf-core/10-legion-frame-alloc.ts:431-436` 与测试断言中，完整报告未入库（`reports/` 被忽略）、CI 不采集。
 - `osc-busy-plugin`：把“不得 printf OSC 7501”明确为**调用方纪律、非运行时守卫**（Non-goals 就不解析子进程 stdout）。
 
+### Fixed
+
+- **Root mail is no longer pushed into the host's followUp queue while root's own run is live.**
+  `LegionPostman.deliverRootInbox` now skips the WHOLE inbox — every mail kind, not just stall
+  notices — while the recipient's agent run still holds the turn, leaving the rows `PENDING` so the
+  existing staleness predicate judges them again on the tick before a real injection
+  (`docs/contracts/root-mail-run-boundary-v1.md`): the incident behind it is a notice held through a
+  2s hold, injected 2s after the release, and only relabelled `ACCEPTED → OBSOLETE` when the parent
+  retired the child 14s later — text already queued, not recallable. The fact is read through one
+  seam (`isRunActive` → `isLegionRunActive(nodeId)`) backed by the session runtime's single
+  `parentRunActive` closure, never a copy; the reader is published where identities are adopted
+  (`adoptLegionIdentity`, so the lazily created root ledger is covered) and withdrawn first in
+  `dispose()` through an ownership-checked disposer. It fails open: an absent or throwing probe
+  delivers immediately, exactly as before the gate. Known limitations: the child→parent `steer`
+  channel is still a mid-turn injection; a stuck `parentRunActive` (a host that never emits
+  `agent_settled`) holds root mail while the flag is up — `dispose()` clears only the in-memory
+  notice outbox, so those rows stay `PENDING` in the ledger and a reopened session's postman would
+  deliver them, and only `kind: "notice"` has an age predicate at all (`question`/`report`/`handoff`
+  have none); a session that never registered `agent_start`/`agent_settled` has no reader at all, so
+  it keeps the pre-gate behaviour; and a continuously busy session defers root mail by arbitrarily
+  many turns — the gate only promises "not this turn", since delivery still needs a tick to land in
+  the idle window after `agent_settled`, and only stall notices carry a `Detected at` line that makes
+  a late arrival self-evident.
+
 ## [5.5.1] — 2026-11-07
 
 ### Fixed

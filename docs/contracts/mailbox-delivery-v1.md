@@ -10,6 +10,10 @@
 > 谓词仍以 `kind === "notice"` 为前提；新增 reason `obsolete_after_child_end`，且该谓词同时被
 > postman、#384 `takePendingMail` 与轮询计数共享（计数只数「可释放」的行）。五态本身、
 > `formatMail` 信封与事件集合均不变（作废仍只发既有的 `mail_bounced`）。
+>
+> **追加（2026-11-09）**：`deliverRootInbox` 另加一道 root run 边界门
+> （`docs/contracts/root-mail-run-boundary-v1.md`）：本节点 run 活跃期间整轮 root 收件箱不投递，行留在
+> `PENDING`，五态与两个 `mail_bounced` reason 仍不变。
 
 ## 背景
 

@@ -9,6 +9,11 @@
 > （检测时刻自证），且 `Stall notice:` 通知在其点名的 child **全部结束**后于发送/确认前转
 > `OBSOLETE`（`reason: obsolete_after_child_end`）。三条路径的**文本时序与投递节奏**仍按本
 > D4（postman 仍 2s tick、`isMailHeld` 与 `formatMail` 不动），D9 写入侧仍零事件。
+>
+> **追加（2026-11-09）**：同一天又落了一道 `docs/contracts/root-mail-run-boundary-v1.md`——本节点 run 活跃期间
+> `deliverRootInbox` 整轮不投递（行留 `PENDING`）。**它与 D4「三条投递路径零改动」的冲突，裁定为**：
+> **路径 2（root 自己的 `deliverRootInbox`）的投递时机由该契约 D1 接管**，路径 2 的其余语义（`formatMail`
+> 信封、五态、2s tick、`isMailHeld`）与路径 1/3 全部零改动。
 
 > **术语表（#315 vs #315 之外，别混用）**：本文件说的 **stall notice** 是**推给父会话的通知**，L1 阈值走
 > 配置项 `silenceNoticeMs`（`src/shared/types.ts` 的 `DEFAULTS.subagents.legion.silenceNoticeMs`，默认

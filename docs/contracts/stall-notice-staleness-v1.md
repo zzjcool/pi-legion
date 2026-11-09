@@ -126,10 +126,13 @@ stall 作废用它，phase-timeout 仍用 `obsolete_after_phase_change`。
 
 ## §5 不在本版范围（有证据的登记）
 
-1. **`notice()` 的 run 边界门**（"父 run 活跃时把 stall 通知压到 settle"）不在本版：它需要把
-   run 活性传进 postman（当前 `SessionRuntime` 无 getter），且与 `stall-notice-v1` D4 的
-   "三条路径零改动"和 `wait-mail-preempt-v1` §7 的"不改投递节奏"直接冲突；本版用
-   D1+D2 消掉**有害的那一半**（失效通知不再送达），仍然有效的通知晚到时有 D1 自证。
+1. **`notice()` 的 run 边界门**（"父 run 活跃时把 stall 通知压到 settle"）**已由
+   `docs/contracts/root-mail-run-boundary-v1.md` 接管**（落地见文末 REV — 2026-11-09）：
+   门没有加在 `notice()` 上，而是加在 root 收件箱的投递口（`deliverRootInbox`），作用面是整轮 root
+   收件箱的全部 kind，run 活性经 `src/legion/run-active.ts` 的读取器注册表读入（fail-open）。
+   本版当时的登记保留如下（原文）：它需要把 run 活性传进 postman（当前 `SessionRuntime` 无 getter），
+   且与 `stall-notice-v1` D4 的"三条路径零改动"和 `wait-mail-preempt-v1` §7 的"不改投递节奏"
+   直接冲突；本版用 D1+D2 消掉**有害的那一半**（失效通知不再送达），仍然有效的通知晚到时有 D1 自证。
 2. **"Delivered N after detection"**：不能在投递时拼接——`formatMail` 是 `DELIVERED` 的
    精确匹配判据，改文本会让账本永远停在 `ACCEPTED`。
 3. **stall 通知写入侧限流/长度**：沿用 `stall-notice-v1` D4（自投递绕过 `sendMail`），本版不改。
@@ -191,3 +194,19 @@ D3 的判据共享面事后多了一条作废写手；D5 的「不改投递节�
 | 第 2 处持信：`vexillatio` 同步批量 collect 期间按住父节点 inbox（与 #384 的 `wait`/`collect` 同机制） | `index.ts` 的 `launchUtilityFamily`：`beginMailHold`，`finally` 释放 |
 | 未变 | 2s tick、信封、schema、事件闭集（作废仍发 `mail_bounced{obsolete_after_child_end}`） |
 | 已知残留 | `ACCEPTED` 行的宿主 followUp 队列不可撤回；绕过 `recordSettled`/`retire` 的写手（orphan 扫描、`markSessionInterrupted`、team 失败判定、启动期 abandonment、`resumeLegionTeam`）仍靠 postman 下一 tick |
+
+---
+
+## REV — 2026-11-09：root 收件箱的 run 边界门（落地校正）
+
+§5 第 1 条登记的那道 run 边界门已由 `docs/contracts/root-mail-run-boundary-v1.md`（FROZEN）落地并接管，
+落点与本节的判断不同：门加在 root 收件箱的投递口而不是 `notice()`，作用面从「只挡 stall notice」扩到
+「整轮 root 收件箱的全部 kind」，判据经进程内读取器注册表传入、无事实即放行（fail-open）。本节的
+D1/D2/D3/D5 一字未改：注入前的判活仍是同一个谓词，它只是终于能在**正确的时刻**跑。
+
+| 事实 | 落点 |
+|---|---|
+| 第 2 处门（D1）：本节点 run 活跃期间 `deliverRootInbox` 整轮 `return`（不是 `continue`），行留在 `PENDING` 等下一次判活 | `src/extension/legion-tools.ts` 的 `deliverRootInbox`（`isMailHeld` 之后、`pendingInbox` 之前）与 `rootRunActive()` |
+| 判据来源（D2/D3）：按 `nodeId` 持有**读取器**的注册表，无注册者/抛错/非 `true` 一律「不活跃」= 立即投递；写入侧在该会话**采纳 identity** 时 publish 一次、`dispose()` **最先**释放归属校验的 disposer | `src/legion/run-active.ts`；`SessionRuntime.publishRunActivity`（`src/extension/runtime.ts`，真值仍是 `parentRunActive` 闭包）；`index.ts` 的**读侧**是 postman 构造处的 `isRunActive`，**写侧唯一落点是 `adoptLegionIdentity`**（不是 `initializeLegionRuntime`——true root 的 identity 由 `createRootLegion` 懒创建，那条路径不经过它），钩子安装在 `isChild && !allowNested` 早退之后 |
+| 未变 | 2s tick、`isMailHeld` 与 hold 计数、`wait`/`collect` 的 250ms 抢占、`formatMail` 信封、schema、五态与事件闭集；注入前判活仍是 `discardIfStaleNotice` → `staleNoticeReason` → `isStaleStallNotice` |
+| 已知残留 | ① child→parent 的 `steer` 通道仍是 mid-turn 注入（D7-1）。② `parentRunActive` 卡死（宿主漏 `agent_settled`）时 root 邮件在标志落下前一直 `PENDING`——**没有 `dispose()` 丢弃这回事**：`dispose()` 只清内存 outbox，`messages` 里的 `PENDING` 行仍在账本里，重开会话后同一 postman 会补投，且既有年龄判据只覆盖 `kind === "notice"`（`question`/`report`/`handoff` 无年龄门槛）（D7-2）。③ 没有 `agent_start`/`agent_settled` 的会话没有注册者 ⇒ fail-open（D7-3）。④ 持续忙碌的会话把 root 邮件推迟任意多个 turn：门只保证「本轮不推」，投递要求某个 2s tick 恰好落在 `agent_settled` 后的空闲窗口；stall notice 晚到有 `Detected at` 自证，其他 kind 没有（D7-4）。⑤ `ACCEPTED` 行仍不可从宿主 followUp 队列撤回 |

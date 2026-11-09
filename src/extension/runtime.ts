@@ -56,6 +56,7 @@ import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
 import { getSubtree } from "../legion/nodes.ts";
 import { attachUsageTotals } from "../legion/usage.ts";
 import { maxEventId } from "../legion/events.ts";
+import { publishLegionRunActivity } from "../legion/run-active.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 import type { PhaseMachine } from "../legion/phase-machine.ts";
 
@@ -269,6 +270,13 @@ const DEFAULT_ORPHAN_STALE_MS = 90_000;
  * healthy settle boundary should take (a stuck `parentRunActive`, or a host that
  * never emits `agent_settled`), which is what `noticeQueueStats().heldOverCap`
  * reports to doctor. 80s = 2× the (1+3)×10s the old join window could reach.
+ *
+ * Since `root-mail-run-boundary-v1` D2 the mail postman's root-inbox gate also reads
+ * the SAME `parentRunActive` variable — through the registry in
+ * `src/legion/run-active.ts`, via {@link SessionRuntime.publishRunActivity} — so a
+ * stuck flag parks root mail too (that contract's D7-2 names the residual). This
+ * horizon plays no part in that gate: `MAX_PENDING_AGE_MS` only counts how long a
+ * completion notice has been held, and it sends nothing.
  */
 export const MAX_PENDING_AGE_MS = 80_000;
 /** Fallback per-child timeout for wait(); index.ts passes the role value. */
@@ -683,6 +691,18 @@ export interface SessionRuntime {
 	notifyParentSettled(): void;
 	/** Introspection seam for tests/doctor: deferred-notice queue state (D-B/D6 health). */
 	noticeQueueStats(): NoticeQueueStats;
+	/**
+	 * `root-mail-run-boundary-v1` D2: hand this session's run-activity reader to the
+	 * process-wide registry (`src/legion/run-active.ts`) under `nodeId`, so the mail
+	 * postman can ask "is this node's run still live?" without a second copy of the
+	 * flag. The reader is `() => parentRunActive` — the ONE variable — and `dispose()`
+	 * withdraws it.
+	 *
+	 * Optional on purpose (that contract's D6): `SessionRuntime` is also built as a
+	 * literal double in tests (`wait-action-index.test.ts` and friends), and a required
+	 * member would break every one of them for no behaviour.
+	 */
+	publishRunActivity?(nodeId: string): void;
 	/**
 	 * Explicit wait: suppress auto-notify on the targets via consumedByTool
 	 * and aggregate their results. A timeout restores auto-notify.
@@ -1165,6 +1185,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	// D-H: the default is `false`, so a host (or a test) that never signals a
 	// run start keeps today's immediate-send behaviour byte for byte.
 	let parentRunActive = false;
+	/**
+	 * `root-mail-run-boundary-v1` D2 (review F3): the disposers this runtime owns, per
+	 * nodeId. Each one only removes the reader IT published, so two runtimes can never
+	 * withdraw each other's registration; the reader itself is still the closure above
+	 * (`() => parentRunActive`), never a stored boolean (display-liveness R1).
+	 */
+	const runActivityReleases = new Map<string, () => void>();
 	const outbox: QueuedNotice[] = [];
 	let outboxTimer: JoinSchedulerHandle | undefined;
 	let heldOverCap = 0;
@@ -2674,6 +2701,19 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			parentRunActive = true;
 		},
 
+		publishRunActivity(nodeId: string) {
+			// Review F2: a LATE publish (an `onLegion` callback or a microtask that lands
+			// after the session went away) must not install a reader on a disposed runtime —
+			// it would freeze at whatever `parentRunActive` happened to be, and no teardown
+			// would ever run to withdraw it. No-op, which is the fail-open direction (D3).
+			if (disposed) return;
+			// D2: idempotent — re-publishing for the same node drops this runtime's previous
+			// reader (ownership-checked, so it cannot touch another runtime's) and takes a
+			// fresh one. Bounded by the number of distinct nodeIds, not by adoption count.
+			runActivityReleases.get(nodeId)?.();
+			runActivityReleases.set(nodeId, publishLegionRunActivity(nodeId, () => parentRunActive));
+		},
+
 		notifyParentSettled() {
 			parentRunActive = false;
 			flushOutbox();
@@ -2747,6 +2787,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		dispose() {
 			if (disposed) return;
 			disposed = true;
+			// `root-mail-run-boundary-v1` D2 (review F2): withdraw FIRST. Everything below is
+			// host-facing teardown (`unsubscribeRpcEvents`, `join.dispose`, `ledgerDb.close`)
+			// and may throw; a reader left registered by a throw here would answer from a
+			// closure nobody drives any more — a fail-CLOSED gate, the one direction D3
+			// forbids. F3: each disposer only drops the reader this runtime published.
+			for (const release of runActivityReleases.values()) release();
+			runActivityReleases.clear();
 			for (const job of jobs.values()) job.unsubscribeRpcEvents?.();
 			jobs.clear();
 			finished.clear();

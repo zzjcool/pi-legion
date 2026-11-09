@@ -133,6 +133,18 @@ export interface LegionPostmanOptions {
 	 */
 	noticeMsForRole?: (role: string | null | undefined) => number | undefined;
 	/**
+	 * `root-mail-run-boundary-v1` D2: is THIS node's agent run still holding the turn?
+	 * Absent ⇒ "no fact, no claim" — the gate opens and root mail is delivered now,
+	 * which is the pre-contract behaviour byte for byte (D3's fail-open).
+	 *
+	 * Same seam shape and same rule as {@link noticeMsForRole} above: the postman has
+	 * no handle on the host's run lifecycle, so the caller (which owns it) resolves the
+	 * fact. The production answer is `() => isLegionRunActive(nodeId)`, and the truth
+	 * behind it stays in the session runtime's single `parentRunActive` closure — never
+	 * a boolean copied in here (display-liveness-v1 R1).
+	 */
+	isRunActive?: () => boolean;
+	/**
 	 * Test seam for the DELIVERED evidence scan: read the recipient's turns from a
 	 * session file. Defaults to `parseSessionFile(file).turns`, and the postman calls
 	 * it **once per seam per tick** (#338 minor 2), so a counter injected here can
@@ -200,6 +212,9 @@ export class LegionPostman {
 	private readonly resumeChild?: LegionPostmanOptions["resumeChild"];
 	private readonly machine?: PhaseMachine;
 	private readonly noticeMsForRole?: LegionPostmanOptions["noticeMsForRole"];
+	private readonly isRunActive?: LegionPostmanOptions["isRunActive"];
+	/** D3: the fail-open degrade is worth ONE line in the log, not one per 2s tick. */
+	private runActivityWarned = false;
 	private readonly parseTurns: (sessionFile: string) => readonly Pick<TurnRecord, "userText">[];
 	/** Per-seam confirmation cursor (#338 M3): the last message id this seam scanned. */
 	private readonly confirmCursor = new Map<string, number>();
@@ -238,6 +253,7 @@ export class LegionPostman {
 		this.resumeChild = options.resumeChild;
 		this.machine = options.machine;
 		this.noticeMsForRole = options.noticeMsForRole;
+		this.isRunActive = options.isRunActive;
 		this.parseTurns = options.parseTurns ?? ((sessionFile) => parseSessionFile(sessionFile).turns);
 		this.now = options.now ?? Date.now;
 		this.intervalMs = options.intervalMs ?? POSTMAN_INTERVAL_MS;
@@ -322,6 +338,15 @@ export class LegionPostman {
 		// which is the defect #384 exists to remove. The hold is released on every exit
 		// path of the blocking call, so a timed-out wait never parks the inbox.
 		if (isMailHeld(this.nodeId)) return;
+		// root-mail-run-boundary D1: root's own run boundary. `followUp` mail is only
+		// consumed at a turn boundary anyway (R2), so pushing it now buys no latency and
+		// only deepens a queue the host cannot retract (R4). Skipping the WHOLE pass —
+		// `return`, like the hold above, not `deliverChildren`'s `continue` — leaves every
+		// row PENDING so the existing predicate (`discardIfStaleNotice`) judges it again on
+		// the tick before a real injection, including whatever changed in between.
+		// Scope is every kind, not just stall notices (D1): "which kind is still a fact"
+		// would be a classification table to maintain, and no kind gains from queueing.
+		if (this.rootRunActive()) return;
 		for (const message of pendingInbox(this.db, "root")) {
 			if (this.discardIfStaleNotice(message)) continue;
 			try {
@@ -334,6 +359,35 @@ export class LegionPostman {
 			} catch {
 				// Leave pending for a later tick instead of silently losing mail.
 			}
+		}
+	}
+
+	/**
+	 * `root-mail-run-boundary-v1` D2/D3: is the recipient's agent run still holding the
+	 * turn? The answer comes from {@link LegionPostmanOptions.isRunActive} and nowhere
+	 * else — this method stores nothing between ticks, so the gate always reads the
+	 * current truth (display-liveness R1: one authority, no copy).
+	 *
+	 * Fail direction is OPEN (D3): a missing seam and a throwing probe both mean "not
+	 * active", i.e. deliver now — an unknown host must not be able to park root's mail
+	 * indefinitely. Same degrade-don't-throw rule as `stallLoopRadiusMs`, with one
+	 * difference: the warning is latched, because this runs on every 2s tick and the
+	 * fact it reports does not change between them.
+	 */
+	private rootRunActive(): boolean {
+		if (!this.isRunActive) return false;
+		try {
+			// Strictly `true`: the registry already collapses non-booleans, but this seam is
+			// caller-supplied, so a truthy typo must not close the gate (D3).
+			return this.isRunActive() === true;
+		} catch (error) {
+			if (!this.runActivityWarned) {
+				this.runActivityWarned = true;
+				console.warn(
+					`[pi-legion] run-activity probe for node '${this.nodeId}' threw (${messageOf(error)}); root mail is delivered without the run boundary gate.`,
+				);
+			}
+			return false;
 		}
 	}
 
