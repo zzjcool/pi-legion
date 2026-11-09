@@ -11,6 +11,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [5.6.0] — 2026-11-09
+
 ### Added
 
 - `test/unit/agents.test.ts` 新增散文守卫：`agents/**`、`examples/**`、`skills/**/SKILL.md` 里提到已删除角色（`reviewer`/`planner`/`search` 等）即失败，除非该分句显式声明“已删除”；#301 之后同一类陈旧文字不再能静默发布。
