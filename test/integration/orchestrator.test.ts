@@ -429,7 +429,7 @@ test("a live child timeout stays working and does not write a terminal output ar
 		assert.equal(collected.execution.reason, COLLECT_DEADLINE_REASON);
 		assert.equal(collected.outputFile, undefined);
 		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
-		assert.equal(existsSync(path.join(h.runDir, `${handle.name}.output.md`)), false);
+		assert.equal(existsSync(path.join(h.runDir, "artifacts", handle.name, "r1.md")), false);
 	} finally {
 		h.cleanup();
 	}
@@ -605,7 +605,7 @@ test("a live child's Connection error stays running and is not retired", async (
 		assert.equal(h.orchestrator.childrenSnapshot()[0]?.state, "working");
 		assert.equal(h.supervisor.isAlive(handle.name), true);
 		assert.equal(h.supervisor.calls.filter((call) => call.method === "retire").length, 0);
-		assert.equal(existsSync(path.join(h.runDir, `${handle.name}.output.md`)), false);
+		assert.equal(existsSync(path.join(h.runDir, "artifacts", handle.name, "r1.md")), false);
 	} finally {
 		h.cleanup();
 	}
@@ -802,9 +802,9 @@ test("#316 D2: a retried empty generation returns the retry's success and costs 
 		assert.equal(CONTINUE_PROMPT, "Your previous turn ended with no output. Continue from where you left off; do not restart the task.");
 		assert.equal(h.orchestrator.childrenSnapshot()[0]?.providerRetriesUsed, 1);
 		// One artifact, holding the retried turn — not two files, nor the empty turn.
-		const outputs = readdirSync(h.runDir).filter((file) => file.endsWith(".output.md"));
-		assert.deepEqual(outputs, [`${handle.name}.output.md`]);
-		assert.match(readFileSync(path.join(h.runDir, outputs[0]!), "utf8"), /ok/);
+		const outputs = readdirSync(path.join(h.runDir, "artifacts", handle.name));
+		assert.deepEqual(outputs, ["r1.md"], "the empty turn allocated no round of its own");
+		assert.match(readFileSync(path.join(h.runDir, "artifacts", handle.name, "r1.md"), "utf8"), /ok/);
 	} finally {
 		h.cleanup();
 	}

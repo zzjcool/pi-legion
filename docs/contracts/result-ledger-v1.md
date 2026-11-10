@@ -70,8 +70,57 @@ W6/W7 证明：缺的不是「一个读工具」，是**结果本身没有身份
 
 - `id = "<runId>/<name>/r<round>"`；路径 `<runDir>/artifacts/<name>/r<round>.md`。
 - 修掉 `outputFileFor`（`orchestrator.ts:2946`）只按 name 的覆盖行为（W6）。
-- 空输出不产生 artifact（沿用今天 `fs.rmSync` 的语义），ledger 不落行；`collect` 的文案保持不变。
 - 保留今天「无大小上限」的事实，但把 `bytes` 记进 ledger —— 读工具与通知都能诚实说「4.0 KB of 24.5 KB」。
+
+### D1a — artifact round 的来源：ledger 的 `MAX(round)+1`，**不是** runtime 的 report round
+
+P2 侦察结论（2026-11-10）：orchestrator **看不到** `TrackedJob.round`（`collect()` 只收 `timeoutMs/signal`；
+`ChildRecord` / `Handle` / `CollectResult` / `CollectSnapshot` 全都无 round 字段）。而 runtime 的
+`roundOfName` 是**进程内 Map**，`dispose()` 会 `clear()`、**不落盘** —— 用它做路径会让 `r1.md` 在重启/reload 后被复用，
+直接违反 A1。
+
+冻结：
+
+- `nextArtifactRound` = **`max(ledger 的最大 round, 磁盘的最大 round) + 1`**；1-based。
+  **不能只看 ledger**（P2 交付后纠正）：`legion.db` 被删/被替换且未跑 rebuild 时，磁盘上已有 `r1.md` 而 ledger 为空，
+  只看 ledger 会算出 round 1 而**覆盖已有 artifact** —— A1「路径永不复用」优先于「单一来源」。两个来源都是自描述的：
+  ledger 只要查行，磁盘只需 `readdir` + `r<digits>.md` 匹配。
+- 无 DB 上下文时（`this.legion` 可选，且**所有 orchestrator 集成测试都不传**）自然退化为「只看磁盘」。
+- **两种 round 语义不合并**：runtime 的 round 是「reporting round」，artifact 的 round 是「输出轮次」。
+  一次 resume 没有任何新输出 → runtime round +1、artifact round 不动。这是有意的不等价。
+
+### D1b — 内容幂等：相同字节不新增 round
+
+写之前先比对 **本 `(runId,name)` 最新 artifact 的磁盘内容**与本次要写的字节：完全相同 → 直接复用那份
+artifact（不建新文件、不写新行）。目的：
+
+- 同 child 的并发 collect（仓库自己承认会并发，`orchestrator.ts:2677-2680`）不会产出 r1+r2 两份；
+- 「读了但内容没变」的 resume 不会把一个纯冗余的 artifact 推成新通知。
+
+### D1c — 空输出：不产生 artifact，也**不删**历史 artifact（取代 D1 里那句「沿用 fs.rmSync 语义」）
+
+今天 `writeOutputFile` 在空输出时 `fs.rmSync(<name>.output.md)`，而那个路径**指向上一轮的文件**；
+一旦 round 进路径，这句话就失去了对应物（本轮 `rN.md` 从不存在）。冻结：
+
+- 本轮空输出 ⇒ 不写文件、不落 ledger 行，`CollectResult.outputFile` 为 `undefined`。
+- **不得**删除任何历史 artifact（它们是不可变的审计与通知素材）。
+- `test/integration/regressions.test.ts:97-115`「later turn has no output」用例改写为断言「本轮 `outputFile === undefined` 且上一轮 artifact 文件仍在」，
+  不再是「文件被删」。
+
+### D1d — name 是路径段，必须 sanitize
+
+今天 `${name}.output.md` 里 name 只是个文件名的一部分；改成目录后它是一个路径段（`..`/`/` 的逃逸面不同）。
+写路径时必须用既有 `sanitizeNameForFs`（`src/runs/worktree.ts:16-19` 的惯例）。
+
+**`id` 与路径段一律用 sanitize 后的段，`artifacts.name` 列存原始 name**（P2 交付后纠正）：`rebuild` 只能从**目录名**
+反推 name（`rebuild.ts:562-570`），若写侧的 id 用原始 name，两侧对同一份 body 会产出不同 id，导致重建后 `consumptions`
+成孤儿、`maxRoundFor` 前缀也查不到重建行。raw name 仍完整保留在列里，展示与按名查找不受影响。
+
+### D1e — ledger 写入是 best-effort，永不改变 `collect` 的返回契约
+
+`this.legion` 可选（`:107`，集成测试全不传）、`child.nodeId` 可选、写盘失败今天也已是「吞成 `undefined`」
+（`orchestrator.ts:2958`）。冻结：写 ledger 行包在守卫里（照 `recordSettled` 的 `if (!this.legion || !child.nodeId) return` 先例），
+失败只吞、不抛、不影响 `CollectResult`。
 
 ### D2 — Ledger 落 `legion.db`，不落内存（用户裁决：**允许**升版本，2026-11-10）
 
@@ -177,6 +226,9 @@ legion_output({ name, round?, offset?, limit? })
 
 - artifact 在磁盘上自描述（`<runId>/<name>/r<round>.md` + 文件 mtime/bytes），`rebuild.ts` 可重建 `artifacts` 行；`consumptions` 不可重建（消费是父进程的事实），重建后一律视为未读 —— 与今天 `phase`/`phase_since` 回落 null 同一取向，且**只会多推、不会少推**。
 - `rebuild.ts` 现有的有损说明（`docs/legion-v2-contract.md:258-262`）追加本条款。
+- **已裁决的不对称**：rebuild 只能从**目录名**（sanitize 段）反推 name，所以重建后 `artifacts.name` 列会是 `"A-B"` 而不是原始的 `"A B"`；写侧存原始 name。
+  这不影响任何判定（抑制谓词与 round 查询全走 `id`），但 **P5 的 `legion_output({name})` 必须用 `artifactNameSegment(name)` 拼 id，不得按 `name` 列过滤**。
+  真实 agent 名是 `[a-z][a-z0-9_-]{0,31}` slug，sanitize 为恒等，这个不对称只在病态名字上可见。
 
 ### D11 — shadow 期双写，分歧即 log
 
@@ -244,7 +296,7 @@ legion_output({ name, round?, offset?, limit? })
 
 1. **W5 消除**：child 完成 → 父 `read` artifact 全文 → 边界 flush → **0 条**；同批未读兄弟 1 条（正向控制）。
 2. **W5 边界**：父 `read` 带 `offset` → `partial` → 边界 flush **仍送达**（D6）。
-3. **W6 消除**：同名两轮 → 两个 artifact，路径不同；读 round 1 后 round 2 的通知仍送达。
+3. **W6 消除**：同名两轮且**内容不同** → 两个 artifact，路径不同；读 round 1 后 round 2 的通知仍送达；对照：内容完全相同的两轮 → **一个** artifact（D1b）。
 4. **W7 消除**：artifact 24.5 KB → `legion_output` 无参返回全文且 header 带 `24.5 KB`；`collect` 的预览不被误标为全文。
 5. **D3 顺序**：`collect` 在 `return ok(...)` 前落账 —— 用会抛错的 `persistChild` 模拟 bail → **不落账** → 通知仍送达（等价于旧 #352 用例 14 的正向面）。
 6. **D4 幂等**：通知发送成功 → 立刻再 `notifyParentSettled` → 0 条；`deliverCompletion` 返回 `false` → 下次边界重试 1 条。
@@ -300,7 +352,11 @@ legion_output({ name, round?, offset?, limit? })
 | --- | --- | --- |
 | 2026-11-10 | v1 DRAFT | 初版。由 root 会话基于 4 份只读侦察（phases / ledger 数据面 / 扩展接缝 / notice-claim 链路）起草。 |
 | 2026-11-10 | v1.1 DRAFT | 用户裁决三项：D6 = 必须读完才抑制；D2 = 允许 `LEGION_DB_USER_VERSION` 升 3；D12 = 旧模型直接删、不做兼容。shadow 瘦身为 stderr-only，事件闭集风险消解。 |
-| 2026-11-10 | v1.3 FROZEN | P1 复审通过（3 条 minor 已裁定/修复）：① `LEGION_STMT_CACHE_LIMIT` 64→128（v3 把 distinct SQL 文本推到 69，旧上限已无 headroom）；② sentinel 不校验索引 UNIQUE/FK 登记为已知盲区（§8-8）；③ `parent_id` 谓词的权威位置是 §15 REV-34，§4.2 只留列注释。 |
+| 2026-11-10 | v1.2 FROZEN | P1 审查后修正：① `undelivered` 必须带 `a.parent_id` 作用域（critical，跨 consumer 串台）；② artifact 不可变 ⇒ `recordArtifact` 必须 `ON CONFLICT(id) DO NOTHING`；③ §7-10 由「<1ms 计时」改为 `EXPLAIN QUERY PLAN` 命中索引；④ D11 的 API 名对齐 `hasRead`。 |
+| 2026-11-10 | v1.3 FROZEN | P1 复审通过（3 条 minor 已裁定/修复）：① `LEGION_STMT_CACHE_LIMIT` 64→128（v3 把 distinct SQL 文本推到 69）；② sentinel 不校验索引 UNIQUE/FK 登记为已知盲区（§8-8）；③ `parent_id` 谓词的权威位置是 §15 REV-34。 |
+| 2026-11-10 | v1.4 FROZEN | P2 侦察后补：D1a artifact round 来源 = ledger `MAX(round)+1`（不用 runtime 的 report round）；D1b 相同字节不新增 round；D1c 空输出不删历史 artifact（废除「沿用 fs.rmSync 语义」）；D1d name 作路径段必须 sanitize；D1e ledger 写入 best-effort。 |
+| 2026-11-10 | v1.5 FROZEN | P2 交付后纠正两处：① D1a 改为 `max(ledger, 磁盘)+1`（只看 ledger 会在库被重置时覆盖已有 artifact，违反 A1）；② D1d 的 `id` 与路径段一律用 sanitize 后的段、`name` 列存原始值（否则与 rebuild 按目录名反推的 id 不收敛）。 |
+| 2026-11-10 | v1.6 FROZEN | P2 复审前补 D10 的不对称裁决：rebuild 后 `artifacts.name` 为 sanitize 段；P5 拼 id 必须用 `artifactNameSegment`，禁止按 `name` 列过滤。 |
 
 ## 12. 裁决记录
 

@@ -275,6 +275,7 @@ CREATE TABLE nodes (
 | `run.json` | run 记录（children、预算、lineage、`herdr.supervisor`）；原子写（`.tmp` + rename），损坏时隔离为 `run.json.corrupt` 并返回 `null` |
 | `<name>.jsonl` | 子会话 session 文件（预创建为空文件，避免 pi 惰性建文件造成的数据丢失窗口；也是 resume 凭据） |
 | `out/` | 产物目录（`artifactDirFor`，按需创建） |
+| `artifacts/<name>/r<round>.md` | 子结果 artifact（不可变，round 在路径里；`writeOutputFile` + `src/runs/artifacts.ts`，见 `result-ledger-v1.md` D1） |
 | `worktrees/<name>/` | centurion 的 git worktree（retire 后**保留**） |
 | `rpc-child-*` | RPC 子进程临时目录，由 hygiene 按 owner pid 清扫 |
 

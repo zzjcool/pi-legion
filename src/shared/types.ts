@@ -417,11 +417,12 @@ export interface ChildRecord {
 	execution?: Execution;
 	acceptance?: AcceptanceResult;
 	/**
-	 * Full terminal output persisted by the last collect (run-dir
-	 * `<name>.output.md`), or absent when that collect wrote none (running
-	 * snapshot / empty output). Recorded on the child — not re-derived via
-	 * existsSync — so a cached collect cannot hand out an EARLIER turn's
-	 * artifact as this turn's result.
+	 * Full terminal output persisted by the last collect as an immutable artifact
+	 * (run-dir `artifacts/<name>/r<round>.md`), or absent when that collect wrote
+	 * none (running snapshot / empty output — an empty output never becomes an
+	 * artifact and never deletes an earlier one). Recorded on the child — not
+	 * re-derived via existsSync — so a cached collect cannot hand out an EARLIER
+	 * turn's artifact as this turn's result.
 	 */
 	outputFile?: string;
 	/**

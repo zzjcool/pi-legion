@@ -21,7 +21,7 @@
 
 关键事实：**调用方真正需要的是「结果」而不是「全文」**——
 `runId`/`round`（claim 键，D9/D10）、`execution`、`acceptance`、`outputFile`；
-而全文早已由 orchestrator 落盘（`writeOutputFile` → `<runDir>/<name>.output.md`，
+而全文早已由 orchestrator 落盘（`writeOutputFile` → `<runDir>/artifacts/<name>/r<round>.md`，
 `CollectSnapshot.outputFile` 就是它的路径）。
 
 ---
@@ -82,7 +82,8 @@
 | orchestrator 之外的 `TrackedJobInput.collect` 来源 | 同上，契约不假设它们有磁盘副本 |
 
 生产路径不受影响：`index.ts` 只把 `orchestrator.collect(...)` 交给 `runtime.track()`，而它对
-每个**终态、非空**输出都写 `<runDir>/<name>.output.md`（inprocess 与 rpc 共用同一 orchestrator）。
+每个**终态、非空**输出都写 `<runDir>/artifacts/<name>/r<round>.md`（inprocess 与 rpc 共用同一 orchestrator；
+round 在路径里，同名多轮不再互相覆盖，见 `result-ledger-v1.md` D1/D1a）。
 pinned 的字节数**不是隐形的**：`noticeQueueStats().finished.pinnedBytes` 会如实报出来（R5）。
 
 ### R5 — 可观测性（含「已降级读取」的显式标记）

@@ -43,6 +43,18 @@ export interface Consumption {
 	notifiedAt: number | null;
 }
 
+/** Which `(runId, name)` slice of the artifact table a round belongs to. */
+export interface ArtifactRoundScope {
+	runId: string;
+	/**
+	 * The artifact id's `<name>` **segment**, i.e. the sanitized directory name
+	 * (`artifactNameSegment` in `src/runs/artifacts.ts`), not the raw child name.
+	 * The `artifacts.name` column keeps the raw value; the id must match the path
+	 * so a `rebuild` that only has the directory arrives at the same id (§3 D1d).
+	 */
+	name: string;
+}
+
 export interface MarkReadInput {
 	artifactId: string;
 	consumerId: string;
@@ -103,6 +115,36 @@ export function artifactById(db: DatabaseSync, id: string): Artifact | null {
 	assertNonEmptyString(id, "id");
 	const row = db.prepare(`SELECT ${ARTIFACT_COLUMNS} FROM artifacts WHERE id = ?`).get(id);
 	return row ? mapArtifact(row) : null;
+}
+
+/**
+ * The highest artifact round recorded for one `(runId, name)`, or `0` when there
+ * is none.
+ *
+ * The artifact id is `"<runId>/<name>/r<round>"` (§3 D1), so the scope is a plain
+ * prefix of the primary key — no extra table, column or index. `name` is matched
+ * together with its surrounding separators (`"<runId>/<name>/r"`), which is what
+ * keeps `a` from swallowing `ab` and one run id from swallowing another.
+ *
+ * `name` is the id segment (already sanitized by the caller — see
+ * {@link ArtifactRoundScope}), because `rebuild` re-derives the id from the
+ * on-disk directory name and both sides must agree (§3 D1d v1.5).
+ *
+ * Read-only on purpose: the round generator lives in `src/runs/artifacts.ts`
+ * (§3 D1a) and this function is its only ledger dependency.
+ */
+export function maxRoundFor(db: DatabaseSync, input: ArtifactRoundScope): number {
+	assertNonEmptyString(input.runId, "runId");
+	assertNonEmptyString(input.name, "name");
+	const prefix = `${input.runId}/${input.name}/r`;
+	const row = db
+		.prepare(
+			`SELECT COALESCE(MAX(round), 0) AS max_round
+			 FROM artifacts
+			 WHERE substr(id, 1, length(?)) = ?`,
+		)
+		.get(prefix, prefix);
+	return Number(row?.max_round ?? 0);
 }
 
 /** Artifacts whose consumer is `parentId`, oldest first (stable tie-break on id). */

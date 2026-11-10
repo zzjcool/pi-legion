@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { parseSessionText, deriveOutcome, isLastTurnComplete } from "../../src/shared/session.ts";
@@ -94,7 +94,7 @@ test("regression: the final turn owns the verdict; stale earlier verdicts cannot
 	} finally { rmSync(runDir, { recursive: true, force: true }); }
 });
 
-test("regression: terminal output artifact is cleared when a later turn has no output", async () => {
+test("regression: a later turn with no output writes no artifact and keeps the earlier one", async () => {
 	const runDir = tempDir();
 	try {
 		const supervisor = new FakeSupervisor();
@@ -104,11 +104,19 @@ test("regression: terminal output artifact is cleared when a later turn has no o
 		supervisor.settle(first.name, { text: "first output" });
 		const result1 = await orchestrator.collect(first.name);
 		assert.ok(result1.outputFile);
+		assert.equal(readFileSync(result1.outputFile, "utf8"), "first output\n", "the first round's body is on disk");
 		await orchestrator.retire(first.name);
 		const resumed = await orchestrator.launch({ agent: agent(), task: "second", name: "worker-0", worktree: false });
 		supervisor.settle(resumed.name, { text: "" });
 		const result2 = await orchestrator.collect(resumed.name);
+		// result-ledger-v1 §3 D1c: an empty turn produces no artifact and, unlike the old
+		// `<name>.output.md` cleanup, does NOT delete the immutable earlier one — the
+		// path used to point at the previous turn's file, which is why the old removal
+		// silently destroyed unread result material.
 		assert.equal(result2.outputFile, undefined);
+		assert.equal(existsSync(result1.outputFile), true, "the previous round's artifact survives an empty turn");
+		assert.equal(readFileSync(result1.outputFile, "utf8"), "first output\n", "and it is unchanged");
+		assert.equal(existsSync(path.join(runDir, "artifacts", resumed.name, "r2.md")), false, "the empty turn allocated no round");
 		assert.equal(orchestrator.cachedCollect(resumed.name)?.outputFile, undefined);
 		assert.equal(orchestrator.cachedCollect(resumed.name)?.output, "", "cached result must not resurrect a previous turn's text");
 	} finally { rmSync(runDir, { recursive: true, force: true }); }
