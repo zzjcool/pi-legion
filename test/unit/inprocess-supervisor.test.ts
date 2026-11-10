@@ -14,7 +14,8 @@ import {
 } from "../../src/supervisor/inprocess-supervisor.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
-import { currentChildContext } from "../../src/supervisor/child-context.ts";
+import { currentChildContext, type ChildLaunchContext } from "../../src/supervisor/child-context.ts";
+import { CHILD_ROLE_ENV, effectiveChildBudget } from "../../src/extension/child-guard.ts";
 import { TEAM_ENV, resolveActiveTeamName } from "../../src/agents/teams.ts";
 import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
@@ -1128,6 +1129,170 @@ test("B9: the derived context carries the team too, and never invents one", asyn
 		// The neighbouring env-derived field still works: budget and team are read
 		// off the same object, independently.
 		assert.deepEqual(contexts[2]?.budget, { maxToolCalls: 3 });
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── R6: the role a spawn runs as is a per-spawn fact, never an env read ─────
+//
+// An in-process child shares the HOST's `process.env`, so `PI_SUBAGENT_ROLE`
+// there is either absent (root: nothing dropped from the roster) or the
+// PARENT's role (a grandchild drops the wrong role). The value therefore rides
+// the same ALS channel `team` and `budget` use, lifted off `SpawnInput.env`.
+
+test("R6: the spawning role rides the spawn env into the child context (both branches)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-role-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	try {
+		// 1) the PROVIDED branch (legion spawns hand a full context over);
+		await supervisor.spawnChild({
+			...testInput(root, "root.a"),
+			env: { [CHILD_ROLE_ENV]: "centurion" },
+			childLaunchContext: {
+				nodeId: "node-21",
+				allowNested: true,
+				utility: false,
+				spawnMode: "inprocess",
+			},
+		});
+		// 2) the fallback branch (no childLaunchContext) merges it as well — the
+		//    `provided` branch returns early, so a merge placed only there would
+		//    leave a root-level in-process child role-blind all over again;
+		await supervisor.spawnChild({
+			...testInput(root, "root.b"),
+			env: { [CHILD_ROLE_ENV]: "worker" },
+		});
+		// 3) no key → no role. Key presence decides, so an absent key must not
+		//    invent one (the child keeps every env-derived answer it had).
+		await supervisor.spawnChild({ ...testInput(root, "root.c") });
+		assert.deepEqual(
+			contexts.map((context) => context?.role),
+			["centurion", "worker", undefined],
+		);
+		// The rest of the provided identity is untouched by the role merge.
+		assert.equal(contexts[0]?.nodeId, "node-21");
+		assert.equal(contexts[0]?.allowNested, true);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("R6: a provided template's role is never inherited, only the per-spawn env authors it", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-role-template-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	// One template object reused across two spawns (REV2-3): reusing a context is
+	// supported, so a role left on it would be handed to a child that never ran
+	// as that role — A's role leaking into B.
+	const template: ChildLaunchContext = {
+		nodeId: "node-31",
+		allowNested: false,
+		utility: false,
+		spawnMode: "inprocess",
+		role: "centurion",
+	};
+	try {
+		await supervisor.spawnChild({
+			...testInput(root, "root.d"),
+			childLaunchContext: template,
+		});
+		await supervisor.spawnChild({
+			...testInput(root, "root.e"),
+			env: { [CHILD_ROLE_ENV]: "worker" },
+			childLaunchContext: template,
+		});
+		assert.deepEqual(
+			contexts.map((context) => context?.role),
+			[undefined, "worker"],
+			"the template's role is dropped; the env's role is the only source",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("R6/F2: an empty PI_SUBAGENT_ROLE is no role — the key is absent, not \"\"", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-role-empty-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	try {
+		// `Orchestrator.lineageEnv` is the only writer of this key and only ever writes
+		// a real role name, so `""` cannot mean "a role named empty" — it means nobody
+		// authored a role. It must NOT arrive as `role: ""`: `index.ts` reads the
+		// context with `??`, which only falls through on NULLISH, so `""` would shadow
+		// a real `PI_SUBAGENT_ROLE` inherited from the host env — and then
+		// `selfRole ? … : …` would treat it as absent and drop nobody, i.e. the value
+		// that means "nothing" would win over the one that means something.
+		await supervisor.spawnChild({
+			...testInput(root, "root.g"),
+			env: { [CHILD_ROLE_ENV]: "" },
+		});
+		assert.equal(contexts.length, 1, "the spawn ran");
+		assert.equal(
+			Object.hasOwn(contexts[0] ?? {}, "role"),
+			false,
+			"no `role` key at all — `role: \"\"` is what shadows the env fallback",
+		);
+		assert.equal(contexts[0]?.role, undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("R6: a provided context's budget beats the env it was spawned with (D-R6.5 b)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-budget-"));
+	let seen: ReturnType<typeof currentChildContext>;
+	let enforced: ReturnType<typeof effectiveChildBudget> | undefined;
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			seen = currentChildContext();
+			// The consumer, not a shape check: `effectiveChildBudget` replaces the
+			// whole object with the context's, so this is what the child's guard
+			// would enforce (`child-guard.ts`).
+			enforced = effectiveChildBudget();
+			return new FakeSession();
+		},
+	});
+	try {
+		await supervisor.spawnChild({
+			...testInput(root, "root.f"),
+			// Deliberately DIFFERENT numbers on the env channel: the context must win.
+			env: { PI_SUBAGENT_MAX_TOOL_CALLS: "9", PI_SUBAGENT_MAX_TURNS: "8" },
+			childLaunchContext: {
+				nodeId: "node-41",
+				allowNested: false,
+				utility: false,
+				spawnMode: "inprocess",
+				budget: { maxToolCalls: 1, toolTimeoutMs: 500 },
+			},
+		});
+		assert.deepEqual(seen?.budget, { maxToolCalls: 1, toolTimeoutMs: 500 });
+		assert.deepEqual(
+			enforced,
+			{ maxToolCalls: 1, toolTimeoutMs: 500 },
+			"the context budget is the whole object the child enforces — env does not fill gaps",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

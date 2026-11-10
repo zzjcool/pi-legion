@@ -49,6 +49,37 @@ export interface ChildBudget {
 	toolTimeoutMs?: number;
 }
 
+/** The three budget fields a role card can declare, structurally typed. */
+export interface AgentBudgetSource {
+	toolBudget?: { maxToolCalls?: number };
+	turnBudget?: { maxTurns?: number };
+	toolTimeoutMs?: number;
+}
+
+/**
+ * The budget a role card declares for its children (R6 / #295).
+ *
+ * ONE producer, TWO channels: `Orchestrator.lineageEnv` turns this object into
+ * the `PI_SUBAGENT_MAX_*` env keys an rpc child receives as its real environment,
+ * and the in-process `ChildLaunchContext.budget` carries the same object over ALS
+ * (the child shares the HOST's `process.env`). Computing it twice let the two
+ * channels drift silently — a fix to one would leave the other on the old
+ * numbers, with nothing failing. Same values as before, still only for DEFINED
+ * fields: an omitted limit stays "no limit" on both channels, and `0` is a real
+ * limit ("none allowed"), never "unset".
+ */
+export function childBudgetFromAgent(agent: AgentBudgetSource): ChildBudget {
+	return {
+		...(agent.toolBudget?.maxToolCalls !== undefined
+			? { maxToolCalls: agent.toolBudget.maxToolCalls }
+			: {}),
+		...(agent.turnBudget?.maxTurns !== undefined
+			? { maxTurns: agent.turnBudget.maxTurns }
+			: {}),
+		...(agent.toolTimeoutMs !== undefined ? { toolTimeoutMs: agent.toolTimeoutMs } : {}),
+	};
+}
+
 export function childBudgetFromEnv(
 	env: NodeJS.ProcessEnv = process.env,
 ): ChildBudget {

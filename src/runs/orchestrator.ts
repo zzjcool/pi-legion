@@ -33,6 +33,7 @@ import {
 	MAX_TOOL_CALLS_ENV,
 	MAX_TURNS_ENV,
 	TOOL_TIMEOUT_MS_ENV,
+	childBudgetFromAgent,
 } from "../extension/budget.ts";
 import { canUseCachedCollect } from "../extension/recycle.ts";
 import {
@@ -1416,12 +1417,11 @@ export class Orchestrator {
 									// #295: the in-process child shares the HOST's process.env, so
 									// `env` below never reaches its guard. Carry the budget here,
 									// where the child context is the only channel that survives.
+									// R6: the object comes from `childBudgetFromAgent`, the same
+									// producer `lineageEnv` uses for the env keys — one source, so the
+									// two channels cannot drift apart silently.
 									...(() => {
-										const budget = {
-											...(agent.toolBudget?.maxToolCalls !== undefined ? { maxToolCalls: agent.toolBudget.maxToolCalls } : {}),
-											...(agent.turnBudget?.maxTurns !== undefined ? { maxTurns: agent.turnBudget.maxTurns } : {}),
-											...(agent.toolTimeoutMs !== undefined ? { toolTimeoutMs: agent.toolTimeoutMs } : {}),
-										};
+										const budget = childBudgetFromAgent(agent);
 										return Object.keys(budget).length > 0 ? { budget } : {};
 									})(),
 								},
@@ -2377,9 +2377,13 @@ export class Orchestrator {
 		if (team !== undefined && (team !== DEFAULT_TEAM || teamOverride === DEFAULT_TEAM || this.team?.source === "env")) env[TEAM_ENV] = team;
 		if (this.legion && nodeId) Object.assign(env, legionIdentityEnv(this.legion.dbPath, nodeId));
 		if (agent.acceptance?.role) env[CHILD_ACCEPTANCE_ROLE_ENV] = agent.acceptance.role;
-		if (agent.toolBudget?.maxToolCalls !== undefined) env[MAX_TOOL_CALLS_ENV] = String(agent.toolBudget.maxToolCalls);
-		if (agent.turnBudget?.maxTurns !== undefined) env[MAX_TURNS_ENV] = String(agent.turnBudget.maxTurns);
-		if (agent.toolTimeoutMs !== undefined) env[TOOL_TIMEOUT_MS_ENV] = String(agent.toolTimeoutMs);
+		// R6: ONE producer for the budget (`childBudgetFromAgent`), consumed here as
+		// the rpc child's env keys and by the in-process context literal above as an
+		// object. Key names and values are exactly what they were.
+		const budget = childBudgetFromAgent(agent);
+		if (budget.maxToolCalls !== undefined) env[MAX_TOOL_CALLS_ENV] = String(budget.maxToolCalls);
+		if (budget.maxTurns !== undefined) env[MAX_TURNS_ENV] = String(budget.maxTurns);
+		if (budget.toolTimeoutMs !== undefined) env[TOOL_TIMEOUT_MS_ENV] = String(budget.toolTimeoutMs);
 		if (agent.utility) env[UTILITY_CHILD_ENV] = "1";
 		// Utility identity takes precedence even when a role was misconfigured
 		// with allowNestedSubagents: utility children are always hard leaves.

@@ -45,7 +45,8 @@ import {
 import { createSessionRuntime, type WaitResult } from "../../src/extension/runtime.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
-import { runInChildContext } from "../../src/supervisor/child-context.ts";
+import { currentChildContext, runInChildContext } from "../../src/supervisor/child-context.ts";
+import { CHILD_ROLE_ENV } from "../../src/extension/child-guard.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import {
 	INPROCESS_FIX_ADVICE,
@@ -1024,6 +1025,8 @@ function indexHarness(
 	startTurn(): void;
 	startRun(): void;
 	emitSettled(aborted: boolean): void;
+	/** Invoke the `before_agent_start` handler; "" means it declined to take part. */
+	beforeAgentStart(event?: Record<string, unknown>): string;
 	shutdown(): Promise<void>;
 	cleanup(): Promise<void>;
 } {
@@ -1093,6 +1096,17 @@ function indexHarness(
 		},
 		emitSettled(aborted: boolean): void {
 			handlers.get("agent_settled")?.({ type: "agent_settled", aborted }, { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } });
+		},
+		beforeAgentStart(event: Record<string, unknown> = {}) {
+			const handler = handlers.get("before_agent_start");
+			assert.ok(handler, "before_agent_start handler registered through the index entry point");
+			const result = handler(
+				{ systemPrompt: "base prompt", systemPromptOptions: {}, ...event },
+				{ cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+			) as { systemPrompt?: string } | undefined;
+			// `undefined` is "this session takes no part" (a utility child) — reported as
+			// "" so a caller can assert it without a cast.
+			return result?.systemPrompt ?? "";
 		},
 		async shutdown() {
 			await handlers.get("session_shutdown")?.();
@@ -1701,6 +1715,309 @@ test("B9: a child context without a team keeps following the settings team", asy
 		assert.deepEqual(child.agents.map((entry) => entry.name), ["designer"]);
 	} finally {
 		await harness.cleanup();
+	}
+});
+
+const BUDGETED_WORKER_FILE =
+	"---\nname: worker\ndescription: budgeted worker\ntoolBudget: '{\"maxToolCalls\": 3}'\nturnBudget: '{\"maxTurns\": 2}'\ntoolTimeoutMs: 60000\n---\nbudgeted worker prompt\n";
+// F4's counterpart: a role card that declares NO budget at all.
+const PLAIN_WORKER_FILE =
+	"---\nname: plainworker\ndescription: no budgets at all\n---\nplain worker prompt\n";
+
+/**
+ * Register the extension entry point and keep what it registered (R6).
+ *
+ * `register` is a callback because some decisions are made AT REGISTRATION TIME
+ * from the child identity — the utility gate returns before registering a single
+ * tool — so the identity has to be active while `piLegion` runs, not only when a
+ * handler is invoked afterwards.
+ */
+function registerIndex(
+	agents: Record<string, string>,
+	register: (pi: unknown) => void,
+	env: Record<string, string | undefined> = {},
+): {
+	toolNames: string[];
+	handlers: Map<string, (...args: any[]) => unknown>;
+	cwd: string;
+	cleanup(): Promise<void>;
+} {
+	const cwd = mkdtempSync(path.join(tmpdir(), "teams-index-register-"));
+	const names = [
+		"PI_SUBAGENT_CHILD",
+		"PI_SUBAGENT_UTILITY_CHILD",
+		"PI_SUBAGENT_ROLE",
+		"PI_CODING_AGENT_DIR",
+		"PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS",
+		"PI_LEGION_DB",
+		"PI_LEGION_NODE_ID",
+		TEAM_ENV,
+	];
+	const previous = new Map(names.map((name) => [name, process.env[name]]));
+	const agentDir = path.join(cwd, "agentdir");
+	const extraDir = path.join(cwd, "extra-agents");
+	mkdirSync(agentDir, { recursive: true });
+	mkdirSync(extraDir, { recursive: true });
+	writeFileSync(
+		path.join(agentDir, "settings.json"),
+		JSON.stringify({ subagents: { disableBuiltins: true } }),
+	);
+	for (const [file, content] of Object.entries(agents)) writeFileSync(path.join(extraDir, file), content);
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_HERDR_SUBAGENTS_EXTRA_AGENT_DIRS = extraDir;
+	for (const name of [
+		"PI_SUBAGENT_CHILD",
+		"PI_SUBAGENT_UTILITY_CHILD",
+		"PI_SUBAGENT_ROLE",
+		"PI_LEGION_DB",
+		"PI_LEGION_NODE_ID",
+		TEAM_ENV,
+	]) delete process.env[name];
+	// Applied AFTER the ambient cleanup above, so a case can simulate the env an
+	// rpc child really owns (and cleanup still restores what it found).
+	for (const [name, value] of Object.entries(env)) {
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
+	const toolNames: string[] = [];
+	const handlers = new Map<string, (...args: any[]) => unknown>();
+	const pi = {
+		registerTool(tool: unknown) { toolNames.push((tool as { name: string }).name); },
+		registerCommand() {}, registerMessageRenderer() {}, sendMessage() {},
+		events: { emit() {} },
+		on(name: string, handler: (...args: any[]) => unknown) { handlers.set(name, handler); },
+	};
+	register(pi);
+	return {
+		toolNames, handlers, cwd,
+		async cleanup() {
+			await handlers.get("session_shutdown")?.({
+				mode: "interactive",
+			}, { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } });
+			for (const [name, value] of previous) restoreEnv(name, value);
+			rmSync(cwd, { recursive: true, force: true });
+		},
+	};
+}
+
+/**
+ * R6: a utility child registers no dispatch tool and gets no parent playbook.
+ *
+ * The utility verdict used to be an env-only read, but an in-process utility
+ * child shares the HOST's `process.env` — so it answered with the PARENT's
+ * verdict and registered `vexillatio` + the parent playbook for a hard leaf.
+ * `ChildLaunchContext.utility` exists precisely to carry it; these cases pin the
+ * ALS answer AND the rpc env fallback that must keep working unchanged.
+ */
+test("R6: an ALS utility child registers no dispatch tools and gets no parent playbook", async () => {
+	// The whole session lives in the scope, like the real one: an in-process child's
+	// registration happens inside `spawnChild`'s `runInChildContext`, and every
+	// later turn is dispatched inside it again (`dispatch`), so the handlers below
+	// see the child identity exactly as production does.
+	let cleanup: (() => Promise<void>) | undefined;
+	try {
+		const { toolNames, prompt } = await runInChildContext(
+			{ utility: true, allowNested: false, spawnMode: "inprocess" },
+			async () => {
+				const registration = registerIndex(
+					{ "worker.md": WORKER_FILE },
+					(pi) => piLegion(pi as never, { supervisor: new FakeSupervisor() }),
+				);
+				cleanup = registration.cleanup;
+				const handler = registration.handlers.get("before_agent_start");
+				assert.ok(handler, "before_agent_start is registered for the utility shutdown branch");
+				return {
+					toolNames: registration.toolNames,
+					prompt: handler(
+						{ systemPrompt: "base prompt", systemPromptOptions: {} },
+						{ cwd: registration.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+					),
+				};
+			},
+		);
+		assert.equal(toolNames.includes("vexillatio"), false, "a utility child is a hard leaf");
+		assert.equal(toolNames.includes("subagent"), false);
+		assert.equal(prompt, undefined, "no parent playbook for a utility child");
+	} finally {
+		await cleanup?.();
+	}
+});
+
+test("R6: the env utility marker still suppresses the dispatch tools (rpc path)", async () => {
+	// The rpc channel: a real subprocess owns these values, so the env answer is
+	// the authoritative one and must keep working unchanged.
+	const registration = registerIndex(
+		{ "worker.md": WORKER_FILE },
+		(pi) => piLegion(pi as never, { supervisor: new FakeSupervisor() }),
+		{ PI_SUBAGENT_UTILITY_CHILD: "1" },
+	);
+	try {
+		assert.equal(registration.toolNames.includes("vexillatio"), false);
+		assert.equal(registration.toolNames.includes("subagent"), false);
+	} finally {
+		await registration.cleanup();
+	}
+});
+
+/**
+ * R6 / D-R6.5: the in-process child's context budget is fed by the role card.
+ *
+ * `d13ad87` moved the budget onto the context the orchestrator builds, because
+ * the child cannot read the `SpawnInput.env` object it was spawned with. That
+ * fix shipped with no regression test — this is it: the whole object has to
+ * arrive, from the SAME producer that writes the env keys.
+ */
+test("R6: an in-process child's context budget comes from the role card", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": BUDGETED_WORKER_FILE, "plain.md": PLAIN_WORKER_FILE },
+	);
+	try {
+		await invokeIndex(harness, { agent: "worker", task: "budgeted", async: true, worktree: false });
+		const input = harness.supervisor.spawns[0]?.input;
+		assert.ok(input, "the launch reached the supervisor");
+		assert.deepEqual(input.childLaunchContext?.budget, {
+			maxToolCalls: 3,
+			maxTurns: 2,
+			toolTimeoutMs: 60000,
+		});
+		// The rpc channel carries the same numbers (one producer, two channels).
+		assert.equal(input.env?.PI_SUBAGENT_MAX_TOOL_CALLS, "3");
+		assert.equal(input.env?.PI_SUBAGENT_MAX_TURNS, "2");
+		assert.equal(input.env?.PI_SUBAGENT_TOOL_TIMEOUT_MS, "60000");
+
+		// F4: the dedupe's OTHER branch — a card with no budget must leave the key
+		// ABSENT, not `{}`. The orchestrator guards on
+		// `Object.keys(budget).length > 0`; if that guard ever degrades to
+		// "always emit", the context would claim a budget object nobody authored,
+		// and `effectiveChildBudget` (whole-object replacement) would report
+		// "limits: none" as if the parent had said so.
+		await invokeIndex(harness, { agent: "plainworker", task: "unbudgeted", async: true, worktree: false });
+		const plain = harness.supervisor.spawns[1]?.input;
+		assert.ok(plain, "the second launch reached the supervisor");
+		assert.ok(plain.childLaunchContext, "an in-process child always gets an identity context");
+		assert.equal(
+			Object.hasOwn(plain.childLaunchContext, "budget"),
+			false,
+			"no `budget` key for a card that declares none — absence, not `budget: {}`",
+		);
+		assert.equal(plain.env?.PI_SUBAGENT_MAX_TOOL_CALLS, undefined);
+		assert.equal(plain.env?.PI_SUBAGENT_MAX_TURNS, undefined);
+		assert.equal(plain.env?.PI_SUBAGENT_TOOL_TIMEOUT_MS, undefined);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R6: the role THIS session runs as comes from the ALS child context.
+//
+// An in-process child shares the HOST's `process.env`, so `PI_SUBAGENT_ROLE`
+// there is the PARENT's role — or, under a root, nothing at all. Reading env
+// therefore dropped the wrong role from a grandchild's roster and, at the root,
+// offered the session its own role. These cases assert the PROMPT: "the env has
+// the key" is the false green that hid B9.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("R6: an in-process child's roster drops the role it actually runs as", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE, "centurion.md": RPC_WORKER_FILE },
+	);
+	try {
+		// Root: no context, no env role → every role offered, unchanged behaviour.
+		const root = harness.beforeAgentStart();
+		assert.match(root, /- centurion \[/);
+		assert.match(root, /- worker \[/);
+
+		// An in-process centurion gets the same list minus itself.
+		const child = await runInChildContext(
+			{ allowNested: true, utility: false, spawnMode: "inprocess", role: "centurion" },
+			async () => harness.beforeAgentStart(),
+		);
+		assert.equal(child.includes("- centurion ["), false);
+		assert.match(child, /- worker \[/);
+		assert.match(child, /call the matching name immediately/, "the playbook is still there");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("R6: the ALS role beats a PI_SUBAGENT_ROLE inherited from the host env", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE, "centurion.md": RPC_WORKER_FILE },
+	);
+	const previous = process.env.PI_SUBAGENT_ROLE;
+	try {
+		// What an in-process child of an rpc `worker` sees: the PARENT's role.
+		process.env.PI_SUBAGENT_ROLE = "worker";
+		const child = await runInChildContext(
+			{ allowNested: true, utility: false, spawnMode: "inprocess", role: "centurion" },
+			async () => harness.beforeAgentStart(),
+		);
+		assert.equal(child.includes("- centurion ["), false, "the context's role is the one dropped");
+		assert.match(child, /- worker \[/, "the env's role must not be the one dropped");
+	} finally {
+		restoreEnv("PI_SUBAGENT_ROLE", previous);
+		await harness.cleanup();
+	}
+});
+
+test("R6/F2: an empty role in the spawn env leaves the roster whole", async () => {
+	// The producer half (`roleFromSpawnEnv` answers `{}` for `""`) is pinned in
+	// `inprocess-supervisor.test.ts`. This is the consumer half at the REAL spawn
+	// boundary: the session factory runs inside the child's identity scope (that
+	// is also where extension loading happens), so this handler sees the roster a
+	// real child's first turn would see.
+	let registration: ReturnType<typeof registerIndex> | undefined;
+	let seen: ReturnType<typeof currentChildContext>;
+	let roster = "";
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 4 },
+		sessionFactory: async (input) => {
+			seen = currentChildContext();
+			const handler = registration?.handlers.get("before_agent_start");
+			assert.ok(handler, "before_agent_start handler registered through the index entry point");
+			const result = handler(
+				{ systemPrompt: "base prompt", systemPromptOptions: {} },
+				{ cwd: input.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+			) as { systemPrompt?: string } | undefined;
+			roster = result?.systemPrompt ?? "";
+			return {
+				subscribe: () => () => {},
+				async prompt(text: string) {
+					// `spawnChild` returns once the transcript shows an accepted turn.
+					writeFileSync(
+						input.sessionFile,
+						`${JSON.stringify({ type: "message", message: { role: "user", content: text } })}\n`,
+					);
+				},
+				dispose() {},
+			};
+		},
+	});
+	registration = registerIndex(
+		{ "worker.md": WORKER_FILE, "centurion.md": RPC_WORKER_FILE },
+		(pi) => piLegion(pi as never, { supervisor }),
+	);
+	try {
+		await supervisor.spawnChild({
+			name: "root.emptyrole",
+			task: "empty role",
+			agent: agent("worker"),
+			sessionFile: path.join(registration.cwd, "root.emptyrole.jsonl"),
+			tempDir: registration.cwd,
+			cwd: registration.cwd,
+			// A spawn whose role field was blanked out. `""` is not a role, so the
+			// read must fall through to the env — which has none either.
+			env: { [CHILD_ROLE_ENV]: "" },
+		});
+		assert.equal(seen?.role, undefined, "no role on the child's context");
+		assert.match(roster, /- centurion \[/, "nobody is dropped");
+		assert.match(roster, /- worker \[/);
+	} finally {
+		await registration.cleanup();
 	}
 });
 

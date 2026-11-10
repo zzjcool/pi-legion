@@ -86,6 +86,24 @@ export interface ChildLaunchContext {
 	 * explicit `team: "default"` has to beat a settings team.
 	 */
 	team?: string;
+	/**
+	 * The role THIS spawn runs as (R6) — carried here for exactly the reason
+	 * `team` is (#295 / #197, above).
+	 *
+	 * The spawning parent writes `PI_SUBAGENT_ROLE` into `SpawnInput.env`
+	 * (`Orchestrator.lineageEnv`), which is the rpc child's real environment. An
+	 * in-process child shares the HOST's `process.env` instead, so reading env
+	 * there answers with the parent's role (a grandchild then drops the PARENT's
+	 * role from its roster) or with nothing at all (root: every role listed,
+	 * including the one this session already is).
+	 *
+	 * Key presence, like `team`: only a spawn env that actually carried
+	 * `PI_SUBAGENT_ROLE` produces a value, so an absent key keeps every env-based
+	 * reader on exactly its previous answer. Deliberately NOT inherited from a
+	 * `provided` template (REV2-3): a template reused across spawns would leak A's
+	 * role into B, and the role is a per-spawn fact by definition.
+	 */
+	role?: string;
 }
 
 const STORE_KEY = Symbol.for("pi-legion.child-context.als");

@@ -536,6 +536,23 @@ function currentProcessSpawnMode(): SpawnMode {
 }
 
 /**
+ * Is THIS session a utility (hard-leaf) child? (R6)
+ *
+ * Two channels, one answer, for exactly the reason `isChild` has two: an rpc
+ * child is a separate process and reads the env its parent spawned it with,
+ * while an in-process child shares the HOST's `process.env` and can only be told
+ * apart by the ALS child context. Reading env alone therefore answered with the
+ * PARENT's verdict — `ChildLaunchContext.utility` existed with no reader — so an
+ * in-process utility child registered `vexillatio` and got the parent playbook.
+ */
+function isUtilityChild(): boolean {
+	return (
+		currentChildContext()?.utility === true ||
+		process.env[UTILITY_CHILD_ENV] === "1"
+	);
+}
+
+/**
  * The frozen interruption head line (`test/unit/teams.test.ts` matches it, and
  * `esc-no-retire-v3` records why it leads every interrupted result).
  */
@@ -1826,7 +1843,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			if (ownLegionKey !== undefined) stopLegionRuntime(ownLegionKey);
 		}
 	};
-	if (process.env[UTILITY_CHILD_ENV] !== "1") {
+	if (!isUtilityChild()) {
 		pi.registerTool({
 			name: "vexillatio",
 			label: "Vexillatio",
@@ -1911,7 +1928,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		return continuityProbe;
 	};
 	pi.on("before_agent_start", (event, ctx) => {
-		if (process.env[UTILITY_CHILD_ENV] === "1") return;
+		if (isUtilityChild()) return;
 		if (!subagentsEnabled(ctx?.cwd ?? lastCwd)) return;
 		const tools = event.systemPromptOptions?.selectedTools;
 		if (Array.isArray(tools) && !tools.includes("subagent") && !tools.includes("vexillatio")) return;
@@ -1927,7 +1944,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// the runtime refuses a non-root centurion dispatch (a nested centurion is
 		// a second command chain the root cannot collect), so listing it invites a
 		// call that can only fail. Leaving it out keeps the roster truthful.
-		const selfRole = process.env[CHILD_ROLE_ENV];
+		//
+		// R6: "self" comes from the ALS child context FIRST. An in-process child
+		// shares the host's `process.env`, so env there holds the PARENT's role
+		// (dropping the wrong role from a grandchild's roster — and it holds nothing
+		// at all under a root, which then lists the role this session already is).
+		// `??` keeps rpc children on the env they really own: no ALS context there.
+		const selfRole = currentChildContext()?.role ?? process.env[CHILD_ROLE_ENV];
 		const rosterAgents = selfRole
 			? catalog.agents.filter((agent) => agent.name !== selfRole)
 			: catalog.agents;
@@ -1964,7 +1987,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			)}${parentContext ? `\n\n${parentContext}` : ""}${interrupted ? `\n\n${interrupted}` : ""}`,
 		};
 	});
-	if (process.env[UTILITY_CHILD_ENV] === "1") {
+	if (isUtilityChild()) {
 		// r4 F1: a session's shutdown must never sweep handles it does not own. An
 		// identity-less utility child never adopts a key, and an unrestricted sweep
 		// would close the root's handle (and every sibling's), because

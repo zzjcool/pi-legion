@@ -9,7 +9,7 @@
  */
 
 import { statSync } from "node:fs";
-import { formatChildTask } from "../extension/child-guard.ts";
+import { formatChildTask, CHILD_ROLE_ENV } from "../extension/child-guard.ts";
 import { childBudgetFromEnv } from "../extension/budget.ts";
 import { TEAM_ENV } from "../agents/teams.ts";
 import { parseSessionFile } from "../shared/session.ts";
@@ -421,17 +421,26 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 	// returns early, so a merge placed only in the fallback would leave exactly the
 	// legion (node-backed) spawns team-blind, i.e. the grandchildren this fixes.
 	const team = teamFromSpawnEnv(input.env);
+	// R6: the role this spawn runs as. Same channel and same rule as `team` —
+	// merged in BOTH branches below, because the `provided` branch returns early.
+	const role = roleFromSpawnEnv(input.env);
 	const provided = input.childLaunchContext;
 	if (provided) {
 		// REV2-3: store a deep-enough snapshot, never the caller's live object.
 		// A caller that reuses one template object (or one `parentPath` array)
 		// across spawns would otherwise mutate the identity of an already-spawned
 		// child for its later dispatches — the A-becomes-B leak D5 exists to kill.
+		//
+		// R6: `role` is dropped from the template for that same reason. It is a
+		// per-spawn fact, so a reused template must not leak A's role into B; only
+		// the per-spawn env may author it (merged back below).
+		const { role: _templateRole, ...template } = provided;
 		return {
-			...provided,
+			...template,
 			// …and for the same REV2-3 reason the spawn env wins over a reused
 			// template's `team`: env is per-spawn, the template is not.
 			...team,
+			...role,
 			// Element-level copy too: after the path became `NestedPathEntry[]`
 			// (objects), `[...path]` would still alias every entry, so a caller
 			// mutating `template.parentPath[0].runId` would rewrite an
@@ -453,6 +462,8 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		...budgetFromSpawnEnv(input.env),
 		// B9: same channel, same reason (see the `team` binding above).
 		...team,
+		// R6: and the role, for the reason in `roleFromSpawnEnv` below.
+		...role,
 	};
 }
 
@@ -469,6 +480,28 @@ function teamFromSpawnEnv(env: NodeJS.ProcessEnv | undefined): {
 	if (!env || !(TEAM_ENV in env)) return {};
 	const team = env[TEAM_ENV];
 	return team === undefined ? {} : { team };
+}
+
+/**
+ * Extract the role this spawn runs as from its env (R6).
+ *
+ * The same shape as `teamFromSpawnEnv`: key presence, not truthiness, so "no
+ * role" is exactly an env without `PI_SUBAGENT_ROLE` and a value is carried
+ * verbatim.
+ *
+ * R6/F2: an EMPTY value is "no role", not a role named "". `Orchestrator.lineageEnv`
+ * is the only writer of this key and it only ever writes a real role name, so
+ * `""` cannot mean anything else. Carrying it through would be actively wrong:
+ * `index.ts` reads the context with `??`, which only falls through on NULLISH, so
+ * `role: ""` would shadow a real `PI_SUBAGENT_ROLE` inherited from the host env —
+ * and then `selfRole ? … : …` would treat the empty string as "no role" and drop
+ * nobody, i.e. the one value that means "nothing" would suppress the value that
+ * means something. Answer `{}` so the reader keeps its old env answer.
+ */
+function roleFromSpawnEnv(env: NodeJS.ProcessEnv | undefined): { role?: string } {
+	if (!env || !(CHILD_ROLE_ENV in env)) return {};
+	const role = env[CHILD_ROLE_ENV];
+	return role ? { role } : {};
 }
 
 /** Extract the child budget keys from a spawn env, for the in-process channel. */
@@ -950,6 +983,16 @@ export class InProcessSupervisor implements LegionSupervisor {
 				// Identity scope: the session factory and the first prompt both run
 				// inside it, so every tool the child executes during that turn
 				// inherits the child's context instead of seeing the root's.
+				//
+				// This wrapper is load-bearing for REGISTRATION as well, not only for
+				// tools: `sessionFactory` is awaited inside this scope and it awaits
+				// `resourceLoader.reload()`, which loads and EXECUTES the child's
+				// extension files — so `piLegion()` registers while the child's own
+				// identity is the active one. `index.ts` decides `isUtilityChild()` and
+				// reads `currentChildContext()?.role` AT REGISTRATION TIME; without this
+				// scope both silently answer with the PARENT's identity (under a root:
+				// "not utility", "no role"), and no test goes red for it — which is
+				// exactly why the reason is written down here.
 				runInChildContext(registration.context, async () => {
 					// #227 D1: the acceptance baseline is the transcript size at the
 					// moment *this spawn* starts (a missing file counts as 0), so a
