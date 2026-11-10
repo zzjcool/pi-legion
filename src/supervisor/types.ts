@@ -41,6 +41,19 @@ export interface ChildHandle {
 	name: string;
 	sessionFile: string;
 	pid?: number;
+	/**
+	 * In-process-only, NON-FATAL model-resolution notice (B5).
+	 *
+	 * `resolveCliModel` answers a `warning` for two legitimate situations — an
+	 * unregistered model id ("Using custom model id", a supported usage) and an
+	 * invalid `:thinking` suffix. Neither may fail a spawn, but both used to be
+	 * dropped on the floor, so a child could run on a model nobody registered
+	 * with nothing said about it. The in-process backend forwards them here; the
+	 * rpc backend never sets the field (its child reports the same thing itself).
+	 *
+	 * Absent — not empty — when the spawn said nothing.
+	 */
+	warning?: string;
 }
 
 /** Process id and process group id for one descendant of a supervised child. */

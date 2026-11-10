@@ -1344,7 +1344,12 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
 	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus, ...(input.machineForRole ? { machineForRole: input.machineForRole } : {}) } });
 	orchestrator.restore(parentRun);
-	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.phases ? { phases: saved.phases } : {}), worktree: Boolean(saved.worktreePath) });
+	// #123 residual: replay the provider pin with the model it belongs to. The
+	// value comes from the child's `run.json` record (above); `legion.db`'s
+	// `nodes` table has no provider column and is deliberately not migrated, so
+	// this must never be looked up there. Records written before the field
+	// existed simply have none — then no pin is replayed rather than a guessed one.
+	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
@@ -2387,6 +2392,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					team,
 					runtime,
 					settings,
+					// #123 residual: a revive that runs on a model chosen by THIS call must
+					// compute its provider pin from the same registry the launch path uses.
+					modelRegistry: ctx.modelRegistry,
 					legion: activeLegion,
 					...(activeLegion ? { postman: activeLegion.postman } : {}),
 				});
@@ -2667,6 +2675,14 @@ async function controlAction(input: {
 	team: ActiveTeam;
 	runtime: SessionRuntime;
 	settings: ReturnType<typeof loadSubagentSettings>;
+	/**
+	 * Parent model registry (`ExtensionContext.modelRegistry`), forwarded only so
+	 * `continue`/`resume` can price a `--provider` pin — computed for a model this
+	 * call chose, or validated for one replayed from the record (#123). Absent =
+	 * the record is replayed unvalidated and no pin is computed; never a new
+	 * pipeline.
+	 */
+	modelRegistry?: ProviderLookup;
 }): Promise<AgentToolResult<unknown>> {
 	const { action, params, store, cwd } = input;
 
@@ -2977,6 +2993,13 @@ interface ChildContext {
 	found: NonNullable<ReturnType<typeof findChild>>;
 	orchestrator: Orchestrator;
 	runtime: SessionRuntime;
+	/**
+	 * Parent registry, used to price the `--provider` pin of a revive: computed for
+	 * a model THIS call chose, validated for one replayed from the record (#123).
+	 * Optional: a scope without a registry replays the record verbatim and computes
+	 * no new pin — it never guesses one.
+	 */
+	modelRegistry?: ProviderLookup;
 }
 
 /**
@@ -3682,15 +3705,35 @@ async function reviveChild(
 		// A `model` passed to THIS call is the caller's own choice and wins over the
 		// model recorded at the first launch; without it the recorded model is kept,
 		// so a resume cannot silently move a child to whatever the settings say now.
-		// `modelProvider` is deliberately not passed: only `LaunchSession` carries a
-		// `modelRegistry`, and this scope has none — threading one down would be a
-		// new pipeline, not part of this fix.
-		const revivedModel = params.model?.trim() || found.child.model;
+		const explicitModel = params.model?.trim();
+		const recordedModel = found.child.model;
+		const revivedModel = explicitModel || recordedModel;
+		// #123 residual: `--provider` has to be replayed TOGETHER with the model it
+		// was computed for, or a bare id can resolve into a colliding static
+		// provider with no auth — the failure the first launch already pins against.
+		//
+		// REV-1.4: a model equal to the recorded one means the child did not move, so
+		// the pin recorded WITH that model is the better answer than a fresh lookup —
+		// a custom id is absent from the registry by definition, and unpinning it
+		// would re-open #123 for exactly those deployments. A model THIS call chose
+		// was never priced against the recorded pin, so it is computed fresh.
+		const sameAsRecorded = recordedModel !== undefined && revivedModel === recordedModel;
+		const pinned = sameAsRecorded ? found.child.modelProvider : providerForModel(ctx.modelRegistry, revivedModel);
+		// REV-1.4 (the #123 scene itself): the pin was computed while an EXTENSION
+		// provider was loaded, and this process has not loaded it. `--provider
+		// <unknown>` is a fatal child error — worse than an unpinned bare id — so a
+		// pin the current registry does not know is dropped instead of forced. No
+		// registry at all means nothing to check against: keep what the record says.
+		const revivedProvider =
+			pinned && ctx.modelRegistry && !ctx.modelRegistry.getAll().some((entry) => entry.provider === pinned)
+				? undefined
+				: pinned;
 		const handle = await orchestrator.launch({
 			agent: agentDef,
 			task: params.message,
 			name,
 			...(revivedModel ? { model: revivedModel } : {}),
+			...(revivedProvider ? { modelProvider: revivedProvider } : {}),
 			// `preset` is NOT expanded on a revive, on purpose: the child resumes the
 			// model it was persisted with, so a later settings edit cannot move a
 			// session that is already in flight.
@@ -3730,8 +3773,12 @@ async function reviveChild(
 		if (budgetCut) chargeRenewal(resumedChild);
 		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, handle.name);
 		followChild(ctx, { watch: true });
+		// REV-1.5/B5: the same non-fatal model-resolution notice a launch renders
+		// (`  ⚠ name: …`), same shape and column — a revived child must not be the
+		// one silent path onto a model nobody registered.
+		const warning = handle.warning ? `\n  ⚠ ${handle.name}: ${handle.warning}` : "";
 		return ok(
-			`Resumed ${handle.name} from its session. Context preserved from ${handle.sessionFile}`,
+			`Resumed ${handle.name} from its session. Context preserved from ${handle.sessionFile}${warning}`,
 		);
 	} catch (error) {
 		// #309 D4: preserve the code the launcher already decided on (e.g.
@@ -4138,6 +4185,12 @@ async function launchStep(
 		session.results.push(
 			`▶ ${handle.name} (${effective.name}) supervisor=${handle.spawnMode}${launchLineQueueSuffix(handle)}`,
 		);
+		// B5: an in-process spawn's model resolution may only have produced a
+		// WARNING (custom model id / invalid `:thinking` suffix). It is never fatal
+		// — but it must not be invisible either, or a child quietly runs on a model
+		// nobody registered. Queued launches render this after admission instead
+		// (`Handle.queued` carries no warning; the queue notice does).
+		if (handle.warning) session.results.push(`  ⚠ ${handle.name}: ${handle.warning}`);
 		session.onUpdate?.({
 			content: [
 				{

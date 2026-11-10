@@ -1357,6 +1357,11 @@ export class Orchestrator {
 			}
 			let result: Awaited<ReturnType<LegionSupervisor["spawnChild"]>> | undefined;
 			let startedModel: string | undefined;
+			// #123 residual: the provider pin was computed for CANDIDATE 0, so it may
+			// only be recorded alongside the model that was asked for. A fallback
+			// candidate leaves it undefined — not pinning at all beats pinning the
+			// wrong provider (`provider-pin.ts` states the same rule).
+			let startedModelProvider: string | undefined;
 			let lastError: unknown;
 			for (let index = 0; index < effectiveModel.length; index += 1) {
 				const model = effectiveModel[index];
@@ -1369,7 +1374,13 @@ export class Orchestrator {
 					cwd: worktreePath ?? this.cwd,
 					env: childEnv,
 					...(model ? { model } : {}),
-					...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
+					// REV-1.2: the pin was computed for CANDIDATE 0's model, so only that
+					// candidate may carry it. Handing it to a fallback routes the retry to a
+					// provider that owns a DIFFERENT model (wrong endpoint when it has auth,
+					// `No API key` when it does not) — the fallback would never fall back.
+					...(input.modelProvider && index === 0 && model !== undefined
+						? { modelProvider: input.modelProvider }
+						: {}),
 					...(input.stripLegionIdentity ? { stripLegionIdentity: true } : {}),
 					...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
 					...(input.agent.allowNestedSubagents !== undefined && !input.agent.utility ? { allowNestedSubagents: input.agent.allowNestedSubagents } : {}),
@@ -1418,6 +1429,10 @@ export class Orchestrator {
 				try {
 					result = await this.supervisor.spawnChild(spawnInput);
 					startedModel = model;
+					// REV-1.3: `undefined === undefined` would read as "this IS candidate 0"
+					// and record a provider with no model next to it — half a pair, which
+					// `recordChild` (and every reader) must not have to interpret.
+					startedModelProvider = model !== undefined && model === models[0] ? input.modelProvider : undefined;
 					spawned = true;
 					break;
 				} catch (error) {
@@ -1436,7 +1451,16 @@ export class Orchestrator {
 				previous.execution = undefined;
 				previous.acceptance = undefined;
 				previous.outputFile = undefined;
+				// REV-1.1: a pin belongs to the MODEL it was computed for. A relaunch on a
+				// different model must drop it — otherwise the record becomes
+				// `{model: cb/model-b, modelProvider: prov-a}` and the next `continue`
+				// replays exactly the wrong pair (#123 again). A relaunch on the SAME model
+				// may keep the pin when this launch computed none: "nothing new this time"
+				// is not a disproof of the provider stored at the first launch.
+				const sameModel = startedModel !== undefined && startedModel === previous.model;
 				previous.model = startedModel;
+				if (startedModelProvider) previous.modelProvider = startedModelProvider;
+				else if (!sameModel) delete previous.modelProvider;
 				// A resume re-arbitrates the backend; keep the record truthful (#209).
 				previous.spawnMode = mode;
 				this.children.set(name, previous);
@@ -1455,6 +1479,7 @@ export class Orchestrator {
 				// argument), i.e. the resume would fail. What is stored is what was sent.
 				...(machine && input.agent.name === "centurion" ? { phases: machine } : {}),
 				...(startedModel ? { model: startedModel } : {}),
+				...(startedModelProvider ? { modelProvider: startedModelProvider } : {}),
 				...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
 				...(worktreePath ? { worktreePath } : {}),
 				...(worktreeBranch ? { worktreeBranch } : {}),
@@ -1474,6 +1499,9 @@ export class Orchestrator {
 				// Only an `rpc` child owns a process; `inprocess` reports no pid, so no
 				// value is invented. Never persisted — a pid is host-scoped.
 				...(result.pid ? { pid: result.pid } : {}),
+				// B5: an in-process spawn's non-fatal model-resolution notice, one hop
+				// closer to the caller so `launchStep` can render it. Never persisted.
+				...(result.warning ? { warning: result.warning } : {}),
 			};
 		} catch (error) {
 			this.admitting.delete(name);
@@ -1999,7 +2027,12 @@ export class Orchestrator {
 			handle.child.queueWaitedMs = waitedMs;
 			handle.child.queuePosition = undefined;
 			this.onChildUpdate(handle.child);
-			this.notice(`▶ ${payload.name} started after queued ${Math.round(waitedMs / 1000)}s`);
+			// R2/B5: the `▶` line for a queued launch was already rendered at enqueue
+			// time, so this notice is the only place its spawn-time parse warning can
+			// become visible. Same two-space `⚠` shape `launchStep` uses; the caller
+			// pushes nothing extra there (`Handle.queued` carries no warning).
+			const startedLine = `▶ ${payload.name} started after queued ${Math.round(waitedMs / 1000)}s`;
+			this.notice(handle.warning ? `${startedLine}\n  ⚠ ${payload.name}: ${handle.warning}` : startedLine);
 			guard?.settle({ kind: "admitted", waitedMs });
 		} catch (error) {
 			const again = guard?.probe() ?? ({ admitted: true } as AdmissionVerdict);
@@ -2352,6 +2385,13 @@ export class Orchestrator {
 		/** Arbitrated spawn backend (#209); persisted so later operators see the truth. */
 		spawnMode: SpawnMode;
 		model?: string;
+		/**
+		 * #123: the provider pin that was computed for candidate 0's `model`.
+		 * Written only when one was actually pinned — a fallback candidate and a launch
+		 * with no model both leave the field absent, so a reader sees "unknown"
+		 * rather than a guess.
+		 */
+		modelProvider?: string;
 		thinking?: string | false;
 		worktreePath?: string;
 		worktreeBranch?: string;
@@ -2370,6 +2410,7 @@ export class Orchestrator {
 			...(input.agent.onBlocked ? { onBlocked: input.agent.onBlocked } : {}),
 			...(input.agent.completionGuard ? { completionGuard: true } : {}),
 			...(input.model ? { model: input.model } : {}),
+			...(input.modelProvider ? { modelProvider: input.modelProvider } : {}),
 			...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
 			spawnMode: input.spawnMode,
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),

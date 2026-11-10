@@ -134,6 +134,12 @@ export interface InProcessSessionFactoryInput {
 	 * inject it through another path for the same spawn.
 	 */
 	childContext?: string;
+	/**
+	 * Non-fatal model-resolution notice (B5). Called at most once, right after
+	 * `resolveCliModel` answers a `warning`; never used to fail the spawn. An
+	 * unknown/ignoring factory stays valid — this input is optional.
+	 */
+	onNotice?: (line: string) => void;
 }
 
 export type InProcessSessionFactory = (
@@ -695,6 +701,11 @@ async function defaultSessionFactory(
 			);
 		}
 		createOptions.model = resolved.model;
+		// B5: `warning` is a NON-FATAL resolution notice (custom model id, invalid
+		// `:thinking` suffix). Failing the spawn would break the supported custom-id
+		// usage, and dropping it is what made a child run silently on a model
+		// nobody registered — so it leaves through the notice channel instead.
+		if (resolved.warning) input.onNotice?.(resolved.warning);
 		if (resolved.thinkingLevel && isThinkingLevel(resolved.thinkingLevel)) {
 			createOptions.thinkingLevel = resolved.thinkingLevel;
 		} else if (
@@ -873,6 +884,9 @@ export class InProcessSupervisor implements LegionSupervisor {
 		};
 		this.subscriptionsBeforeSpawn.delete(input.name);
 		this.children.set(input.name, registration);
+		// B5: notices the session factory emits during THIS spawn. Collected here
+		// (not on the record) because they are a spawn result, not child state.
+		const notices: string[] = [];
 
 		try {
 			return await runAtInProcessChildDepthAsync(() =>
@@ -890,6 +904,10 @@ export class InProcessSupervisor implements LegionSupervisor {
 						cwd: input.cwd,
 						agent: input.agent,
 						sessionFile: input.sessionFile,
+						// B5: non-fatal resolution notices (see `ChildHandle.warning`).
+						onNotice: (line) => {
+							notices.push(line);
+						},
 						...(input.model !== undefined ? { model: input.model } : {}),
 						...(input.modelProvider !== undefined
 							? { modelProvider: input.modelProvider }
@@ -938,6 +956,8 @@ export class InProcessSupervisor implements LegionSupervisor {
 					return {
 						name: registration.name,
 						sessionFile: registration.sessionFile,
+						// B5: absent (never empty) when the spawn had nothing to say.
+						...(notices.length > 0 ? { warning: notices.join("; ") } : {}),
 					};
 				}),
 			);

@@ -31,6 +31,7 @@ import {
 	type SessionStats as SdkSessionStats,
 } from "@earendil-works/pi-coding-agent";
 import { statSync, writeFileSync } from "node:fs";
+import { MODEL_WARNING } from "../helpers/model-warning.ts";
 
 /** Raw answer from the SDK's `AgentSession.steer()` (#313): `"handled"` | `"queued"`. */
 type RawSteerDisposition = "queued" | "handled";
@@ -648,6 +649,69 @@ test("inprocess: spawnChild forwards model/thinking/childContext to factory", as
 		assert.deepEqual(captured[0]!.agent.tools, ["read"]);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── B5: a non-fatal model-resolution notice leaves through the handle ─────
+
+/**
+ * `resolveCliModel`'s `warning` (custom model id / invalid `:thinking` suffix)
+ * used to be dropped here, so a child ran silently on a model nobody had
+ * registered. It is NOT fatal — a custom id is a supported usage — so it must
+ * leave as data on the handle, never as a thrown error.
+ *
+ * The fake factory below does the emitting, so the `model` on the spawn input is
+ * NOT what produces the notice; it is there because a real spawn would carry it.
+ */
+test("inprocess: a factory's `onNotice` becomes `handle.warning` without failing the spawn", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-notice-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async (input) => {
+			input.onNotice?.(MODEL_WARNING);
+			return new FakeSession();
+		},
+	});
+	try {
+		const handle = await supervisor.spawnChild({
+			...testInput(root),
+			model: "cb/custom-thing",
+		});
+		assert.equal(handle.warning, MODEL_WARNING);
+		assert.equal(supervisor.isAlive("root.worker"), true, "a warning must not fail the spawn");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: every notice is kept, joined in order", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-notice2-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async (input) => {
+			input.onNotice?.("first");
+			input.onNotice?.("second");
+			return new FakeSession();
+		},
+	});
+	try {
+		const handle = await supervisor.spawnChild(testInput(root));
+		assert.equal(handle.warning, "first; second");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+/** Anti-regression: a silent spawn must not grow an empty `warning` field. */
+test("inprocess: a silent spawn carries no `warning` key at all", async () => {
+	const h = harness();
+	try {
+		const input = testInput(h.root);
+		const handle = await h.supervisor.spawnChild(input);
+		assert.deepEqual(handle, { name: "root.worker", sessionFile: input.sessionFile });
+		assert.equal(Object.hasOwn(handle, "warning"), false);
+	} finally {
+		h.close();
 	}
 });
 

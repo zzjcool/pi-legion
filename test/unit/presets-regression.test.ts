@@ -6,8 +6,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import piLegion from "../../index.ts";
+import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import type { ProviderLookup } from "../../src/runs/provider-pin.ts";
 import { RunStore } from "../../src/runs/store.ts";
+import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
+import { MODEL_WARNING } from "../helpers/model-warning.ts";
 
 const BROKEN = "---\nname: broken\ndescription: b\npreset: nonexistent\n---\np\n";
 const HEALTHY = "---\nname: healthy\ndescription: h\n---\np\n";
@@ -120,11 +124,17 @@ function textOf(result: ToolResult): string {
 }
 
 /** The minimal tool context: a cwd, no UI and (optionally) a dispatching model. */
-function contextOf(harness: Harness, dispatchModel?: string): Record<string, unknown> {
+function contextOf(
+	harness: Harness,
+	dispatchModel?: string,
+	modelRegistry?: ProviderLookup,
+): Record<string, unknown> {
 	return {
 		cwd: harness.dir,
 		hasUI: false,
 		ui: { notify() {}, confirm: async () => true, setStatus() {} },
+		// #123: the parent registry `continue`/`resume` re-pin from.
+		...(modelRegistry ? { modelRegistry } : {}),
 		...(dispatchModel
 			? { model: { provider: dispatchModel.split("/")[0], id: dispatchModel.split("/").slice(1).join("/") } }
 			: {}),
@@ -138,8 +148,12 @@ async function runBatch(params: {
 	tasks: Array<Record<string, unknown>>;
 	toolParams?: Record<string, unknown>;
 	dispatchModel?: string;
+	/** Fake RPC supervisor knobs (spawn failure, handle warning, …). */
+	supervisor?: ConstructorParameters<typeof FakeSupervisor>[0];
+	/** Default false (wait + collect); `true` returns the bare launch text. */
+	async?: boolean;
 }): Promise<BatchOutcome> {
-	const harness = startHarness({ settings: params.settings, agents: params.agents });
+	const harness = startHarness({ settings: params.settings, agents: params.agents, ...(params.supervisor ? { supervisor: params.supervisor } : {}) });
 	let text = "";
 	let threw: Error | undefined;
 	let parameters: Tool["parameters"] = {};
@@ -149,7 +163,7 @@ async function runBatch(params: {
 		try {
 			text = textOf(await tool.execute(
 				"rpc-presets-test",
-				{ ...(params.toolParams ?? { tasks: params.tasks }), async: false, worktree: false },
+				{ ...(params.toolParams ?? { tasks: params.tasks }), async: params.async ?? false, worktree: false },
 				undefined,
 				undefined,
 				contextOf(harness, params.dispatchModel),
@@ -373,12 +387,19 @@ test("F3 utility: an early failure still carries the warnings collected before i
  */
 async function runContinue(params: {
 	childModel?: string;
+	/** `ChildRecord.modelProvider` recorded at first launch (#123). */
+	childModelProvider?: string;
 	model?: string;
+	/** Parent registry the revive re-pins from when THIS call chose the model. */
+	modelRegistry?: ProviderLookup;
+	/** Fake RPC supervisor knobs (a spawn-time `warning`, …). */
+	supervisor?: ConstructorParameters<typeof FakeSupervisor>[0];
 }): Promise<{ text: string; supervisor: FakeSupervisor }> {
 	const harness = startHarness({
 		settings: { disableBuiltins: true },
 		agents: { "worker.md": "---\nname: worker\ndescription: w\n---\np\n" },
 		plainRunStore: true,
+		...(params.supervisor ? { supervisor: params.supervisor } : {}),
 	});
 	let text = "";
 	try {
@@ -399,6 +420,7 @@ async function runContinue(params: {
 			agent: "worker",
 			kind: "pi",
 			...(params.childModel ? { model: params.childModel } : {}),
+			...(params.childModelProvider ? { modelProvider: params.childModelProvider } : {}),
 		});
 
 		text = textOf(await tool.execute(
@@ -411,7 +433,7 @@ async function runContinue(params: {
 			},
 			undefined,
 			undefined,
-			contextOf(harness),
+			contextOf(harness, undefined, params.modelRegistry),
 		));
 	} finally {
 		harness.cleanup();
@@ -479,4 +501,387 @@ test("D1d: settings.json's agentOverridesByProvider reaches the spawned child", 
 	});
 	assert.equal(result.supervisor.spawns.length, 1, `the role must launch:\n${result.text}`);
 	assert.equal(result.supervisor.spawns[0]?.input.model, "cb/kimi-k3");
+});
+
+// ──────────────── B5: an in-process parse warning is visible, not fatal ────────────────
+
+/**
+ * The two `resolveCliModel` warnings a legitimate configuration produces (a
+ * custom model id, an invalid `:thinking` suffix) used to be dropped by the
+ * in-process backend, so the child ran on a model nobody registered with
+ * nothing said about it (B5). The channel is `handle.warning` → one `⚠` line
+ * after the `▶` line. It must NEVER become a refusal — a custom id is a
+ * supported usage.
+ *
+ * The exact bytes live in `test/helpers/model-warning.ts`, shared with the
+ * backend-level test that makes pi produce them.
+ */
+test("B5: a spawn warning is rendered as a `⚠ name:` line right after `▶`", async () => {
+	const result = await runBatch({
+		settings: {},
+		agents: { "healthy.md": "---\nname: healthy\ndescription: h\nmodel: cb/custom-thing\n---\np\n" },
+		tasks: [{ agent: "healthy", task: "t1" }],
+		async: true,
+		supervisor: { handleWarning: MODEL_WARNING },
+	});
+	const name = result.supervisor.spawns[0]?.input.name;
+	assert.ok(name, `the child must still spawn:\n${result.text}`);
+	const lines = result.text.split("\n");
+	assert.equal(
+		lines[0],
+		`▶ ${name} (healthy) supervisor=inprocess`,
+		"the ▶ line is unchanged",
+	);
+	assert.equal(lines[1], `  ⚠ ${name}: ${MODEL_WARNING}`, "the warning is rendered right below it");
+});
+
+test("B5: a warning never turns the launch into a failure", async () => {
+	const result = await runBatch({
+		settings: {},
+		agents: { "healthy.md": HEALTHY },
+		tasks: [{ agent: "healthy", task: "t1" }],
+		async: true,
+		supervisor: { handleWarning: MODEL_WARNING },
+	});
+	assert.equal(result.threw, undefined, "a warning must not throw");
+	assert.equal(result.supervisor.spawns.length, 1, "a warning must not block the launch");
+	assert.doesNotMatch(result.text, /✗/, "a warning is not a refusal");
+});
+
+/** Anti-regression: a clean spawn's text is byte for byte what it always was. */
+test("B5 regression: a spawn with no warning renders exactly the previous text", async () => {
+	const result = await runBatch({
+		settings: {},
+		agents: { "healthy.md": HEALTHY },
+		tasks: [{ agent: "healthy", task: "t1" }],
+		async: true,
+	});
+	const name = result.supervisor.spawns[0]?.input.name;
+	assert.equal(
+		result.text.split("\n")[0],
+		`▶ ${name} (healthy) supervisor=inprocess`,
+	);
+	assert.doesNotMatch(result.text, /⚠/, "no warning line may be invented");
+});
+
+// ──────────── #123 residual: the provider pin is persisted and replayed ────────────
+
+function testAgent(overrides: Partial<AgentConfig> = {}): AgentConfig {
+	return {
+		name: "worker",
+		description: "worker",
+		systemPrompt: "role prompt",
+		systemPromptMode: "append",
+		inheritProjectContext: true,
+		inheritSkills: false,
+		kind: "pi",
+		source: "user",
+		filePath: "/worker.md",
+		...overrides,
+	};
+}
+
+const registryOf = (...models: Array<{ provider: string; id: string }>) => ({
+	getAll: () => models,
+});
+
+/**
+ * D-R3.2: `recordChild` persists the provider that was paired with the model
+ * that actually started, and the pair survives the run.json round-trip — which
+ * is the only place `continue`/`resume` can read it back from (`legion.db`'s
+ * `nodes` table has no provider column and is deliberately not migrated).
+ */
+test("R3: launch records the provider paired with the started model", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "rpc-provider-persist-"));
+	try {
+		const supervisor = new FakeSupervisor();
+		const orchestrator = new Orchestrator({ supervisor, runDir: dir, cwd: "/tmp/project" });
+		const handle = await orchestrator.launch({
+			agent: testAgent({ model: "cb/kimi-k3" }),
+			task: "go",
+			modelProvider: "live",
+			worktree: false,
+		});
+		assert.equal(handle.child.model, "cb/kimi-k3");
+		assert.equal(handle.child.modelProvider, "live");
+
+		const store = new RunStore({ rootDir: path.join(dir, "store") });
+		const run = store.createRun({ task: "go", cwd: dir });
+		await store.addChild(run.runId, handle.child);
+		const persisted = store.findChild(run.runId, handle.name);
+		assert.equal(persisted?.model, "cb/kimi-k3");
+		assert.equal(persisted?.modelProvider, "live", "the pin must survive run.json");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/**
+ * The pairing rule (D-R3.2): the provider was computed for CANDIDATE 0. When a
+ * fallback candidate is what actually started, the pin describes a different
+ * model, so it must be dropped — not pinning at all beats pinning wrong.
+ */
+test("R3: a fallback candidate does NOT persist the candidate-0 provider", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "rpc-provider-fallback-"));
+	try {
+		const supervisor = new FakeSupervisor({
+			rejectSpawn: (input) =>
+				input.model === "cb/primary"
+					? new SubagentError("model unavailable", ErrorCodes.START_FAILED)
+					: undefined,
+		});
+		const orchestrator = new Orchestrator({ supervisor, runDir: dir, cwd: "/tmp/project" });
+		const handle = await orchestrator.launch({
+			agent: testAgent({ model: "cb/primary", fallbackModels: ["cb/fallback"] }),
+			task: "go",
+			modelProvider: "live-primary",
+			worktree: false,
+		});
+		assert.equal(handle.child.model, "cb/fallback", "the fallback candidate is what started");
+		assert.equal(
+			Object.hasOwn(handle.child, "modelProvider"),
+			false,
+			"a fallback candidate must not inherit candidate 0's pin",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/** D-R3.3: the recorded `model` AND `modelProvider` are replayed as a pair. */
+test("R3: `continue` replays the recorded provider with the recorded model", async () => {
+	const result = await runContinue({
+		childModel: "cb/recorded",
+		childModelProvider: "any-endpoint",
+	});
+	assert.equal(result.supervisor.spawns.length, 1, `the child must be relaunched through the tool:\n${result.text}`);
+	assert.equal(result.supervisor.spawns[0]?.input.model, "cb/recorded");
+	assert.equal(result.supervisor.spawns[0]?.input.modelProvider, "any-endpoint");
+});
+
+/**
+ * D-R3.3 the other half: a model THIS call chose was never priced against the
+ * recorded provider, so replaying it would pin the wrong one. It is computed
+ * fresh from the parent registry instead.
+ */
+test("R3: `continue` on a model THIS call chose re-pins from the parent registry", async () => {
+	const result = await runContinue({
+		childModel: "cb/recorded",
+		childModelProvider: "stale-provider",
+		model: "cb/kimi-k3",
+		modelRegistry: registryOf({ provider: "live", id: "cb/kimi-k3" }),
+	});
+	assert.equal(result.supervisor.spawns.length, 1, `the child must be relaunched through the tool:\n${result.text}`);
+	assert.equal(result.supervisor.spawns[0]?.input.model, "cb/kimi-k3");
+	assert.equal(
+		result.supervisor.spawns[0]?.input.modelProvider,
+		"live",
+		"the recorded pin belongs to a different model and must not be replayed",
+	);
+});
+
+/**
+ * Anti-regression: no recorded pin ⇒ the field is never invented. The empty
+ * string is not the danger here (two falsy spreads eat it); a GUESS is — which
+ * is why the mutation this guards against is `?? "guessed-provider"`.
+ */
+test("R3: `continue` with no recorded provider writes no `modelProvider` field", async () => {
+	const result = await runContinue({ childModel: "cb/recorded" });
+	assert.equal(result.supervisor.spawns.length, 1);
+	assert.equal(Object.hasOwn(result.supervisor.spawns[0]!.input, "modelProvider"), false);
+});
+
+// ─────────── REV-1.1–1.3: the pin is paired with the model it priced ───────────
+
+/**
+ * REV-1.1 (review F1, measured): a relaunch used to keep the OLD pin when the
+ * new launch carried none, so `launch(cb/model-a, prov-a)` → retire → `launch(cb/model-b)`
+ * landed as `{model: "cb/model-b", modelProvider: "prov-a"}` and the next
+ * `continue` replayed exactly the wrong pair — #123 all over again. The pin only
+ * survives a relaunch that keeps the model it was computed for.
+ */
+test("R3/REV-1.1: a relaunch on a NEW model drops the pin that belonged to the old one", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "rpc-provider-relaunch-"));
+	try {
+		const supervisor = new FakeSupervisor();
+		const orchestrator = new Orchestrator({ supervisor, runDir: dir, cwd: "/tmp/project" });
+		const first = await orchestrator.launch({
+			agent: testAgent({ model: "cb/model-a" }),
+			task: "go",
+			modelProvider: "prov-a",
+			worktree: false,
+		});
+		assert.equal(first.child.modelProvider, "prov-a");
+		await orchestrator.retire(first.name);
+
+		const second = await orchestrator.launch({
+			agent: testAgent({ model: "cb/model-b" }),
+			task: "go again",
+			name: first.name,
+			worktree: false,
+		});
+		assert.equal(second.child.model, "cb/model-b");
+		assert.equal(
+			Object.hasOwn(second.child, "modelProvider"),
+			false,
+			"prov-a priced cb/model-a; keeping it next to cb/model-b is the #123 replay bug",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/** REV-1.1, the other half: the same model ⇒ the pin was never disproved. */
+test("R3/REV-1.1: a relaunch on the SAME model keeps its pin, and a fresh pin still wins", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "rpc-provider-relaunch-same-"));
+	try {
+		const supervisor = new FakeSupervisor();
+		const orchestrator = new Orchestrator({ supervisor, runDir: dir, cwd: "/tmp/project" });
+		const first = await orchestrator.launch({
+			agent: testAgent({ model: "cb/model-a" }),
+			task: "go",
+			modelProvider: "prov-a",
+			worktree: false,
+		});
+		await orchestrator.retire(first.name);
+		// No provider computed this time: "nothing new" is not a disproof.
+		const second = await orchestrator.launch({
+			agent: testAgent({ model: "cb/model-a" }),
+			task: "again",
+			name: first.name,
+			worktree: false,
+		});
+		assert.equal(second.child.modelProvider, "prov-a", "the same model keeps the pin it came with");
+
+		await orchestrator.retire(first.name);
+		const third = await orchestrator.launch({
+			agent: testAgent({ model: "cb/model-a" }),
+			task: "third",
+			name: first.name,
+			modelProvider: "prov-b",
+			worktree: false,
+		});
+		assert.equal(third.child.modelProvider, "prov-b", "a newly computed pin replaces the old one");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/**
+ * REV-1.2 (review F2, measured): `spawnInput` used to hand candidate 0's
+ * provider to EVERY candidate. A fallback then routed to the wrong endpoint (or
+ * died on "No API key"), i.e. the fallback never fell back — and it emitted a B5
+ * warning on top. Only candidate 0, and only with a model, may carry the pin.
+ */
+test("R3/REV-1.2: a fallback candidate is spawned WITHOUT candidate 0's provider", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "rpc-provider-fallback-spawn-"));
+	try {
+		const supervisor = new FakeSupervisor({
+			rejectSpawn: (input) =>
+				input.model === "cb/primary"
+					? new SubagentError("model unavailable", ErrorCodes.START_FAILED)
+					: undefined,
+		});
+		const orchestrator = new Orchestrator({ supervisor, runDir: dir, cwd: "/tmp/project" });
+		const handle = await orchestrator.launch({
+			agent: testAgent({ model: "cb/primary", fallbackModels: ["cb/fallback"] }),
+			task: "go",
+			modelProvider: "live-primary",
+			worktree: false,
+		});
+		assert.equal(handle.child.model, "cb/fallback", "the fallback candidate is what started");
+		// A rejected spawn never reaches `spawns`, so the attempts are read from
+		// `calls` — candidate 0's own pin is asserted on the input it was given.
+		const attempts = supervisor.calls.filter((call) => call.method === "spawnChild");
+		assert.equal(attempts.length, 2, "candidate 0, then the fallback");
+		assert.equal(attempts[0]?.input?.model, "cb/primary");
+		assert.equal(attempts[0]?.input?.modelProvider, "live-primary", "candidate 0 keeps its own pin");
+		assert.equal(attempts[1]?.input?.model, "cb/fallback");
+		assert.equal(
+			Object.hasOwn(attempts[1]!.input!, "modelProvider"),
+			false,
+			"a fallback pointed at candidate 0's provider is not a fallback",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/** REV-1.3 (review F7): a provider without a model is half a pair — never written. */
+test("R3/REV-1.3: no model means no pin (a provider is never recorded alone)", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "rpc-provider-nomodel-"));
+	try {
+		const supervisor = new FakeSupervisor();
+		const orchestrator = new Orchestrator({ supervisor, runDir: dir, cwd: "/tmp/project" });
+		const handle = await orchestrator.launch({
+			agent: testAgent(),
+			task: "go",
+			modelProvider: "live",
+			worktree: false,
+		});
+		assert.equal(handle.child.model, undefined, "no candidate model was planned");
+		assert.equal(
+			Object.hasOwn(handle.child, "modelProvider"),
+			false,
+			"`undefined === models[0]` must not read as `this is candidate 0`",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ─────────── REV-1.4/1.5: revive picks and validates the pin, and shows ⚠ ───────────
+
+/**
+ * REV-1.4 (review F3): a model equal to the recorded one means the child did not
+ * move, so the recorded pin is still the best answer — re-deriving it from the
+ * registry would throw away exactly the custom ids a registry cannot know. The
+ * registry here DOES own `any-endpoint` (so the pin is still valid) but does not
+ * list `cb/custom-thing`, which is what "custom id" means.
+ */
+test("R3/REV-1.4: an explicit model equal to the recorded one reuses the recorded pin", async () => {
+	const result = await runContinue({
+		childModel: "cb/custom-thing",
+		childModelProvider: "any-endpoint",
+		model: "cb/custom-thing",
+		modelRegistry: registryOf({ provider: "any-endpoint", id: "cb/another-model" }),
+	});
+	assert.equal(result.supervisor.spawns.length, 1, `the child must be relaunched:\n${result.text}`);
+	assert.equal(result.supervisor.spawns[0]?.input.model, "cb/custom-thing");
+	assert.equal(
+		result.supervisor.spawns[0]?.input.modelProvider,
+		"any-endpoint",
+		"the registry cannot see a custom id, which is no reason to unpin it",
+	);
+});
+
+/**
+ * REV-1.4 (review F4): #123's original scene is a pin computed while an EXTENSION
+ * provider was loaded. If this process has not loaded it, replaying the pin is
+ * fatal (`Unknown provider`), which is worse than not pinning at all.
+ */
+test("R3/REV-1.4: a recorded pin the current registry does not know is skipped, not forced", async () => {
+	const result = await runContinue({
+		childModel: "cb/recorded",
+		childModelProvider: "gone-extension",
+		modelRegistry: registryOf({ provider: "live", id: "cb/kimi-k3" }),
+	});
+	assert.equal(result.supervisor.spawns.length, 1, `the child must be relaunched:\n${result.text}`);
+	assert.equal(
+		Object.hasOwn(result.supervisor.spawns[0]!.input, "modelProvider"),
+		false,
+		"`--provider <unknown>` kills the child; no pin leaves it to resolve the id itself",
+	);
+});
+
+/** REV-1.5 (review F5): a revived child must not be the silent path to a warning. */
+test("B5: a revive renders its spawn warning as a `⚠ name:` line after the resume line", async () => {
+	const result = await runContinue({
+		childModel: "cb/recorded",
+		supervisor: { handleWarning: MODEL_WARNING },
+	});
+	assert.equal(result.supervisor.spawns.length, 1, `the child must be relaunched:\n${result.text}`);
+	const lines = result.text.split("\n");
+	assert.match(lines[0] ?? "", /^Resumed worker-0 from its session\./u, "the resume line is unchanged");
+	assert.equal(lines[1], `  ⚠ worker-0: ${MODEL_WARNING}`, "the warning is rendered right below it");
 });
