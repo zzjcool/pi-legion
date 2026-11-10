@@ -180,10 +180,11 @@ interface LegionSupervisor {
 - 连接约定：每 supervisor 进程一连接；`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`；写入均为短事务 prepared statement
   - **WAL 是前置条件，不是请求**：`PRAGMA journal_mode=WAL` 是**查询**，返回值才是实际生效的 journal mode，它可能在**不报错**的情况下降级（网络/FUSE 挂载无 shared-memory 支持、只读介质、争用锁）。`openLegionDb()` 因此**读取返回值并在其为文件库时校验**：非 `wal` 直接抛错，在启动期炸掉，而不是带着「已开 WAL」的假设继续跑、把问题拖成后发性数据事故。`:memory:` 是唯一的刻意豁免——SQLite 对内存库不实现 WAL、永远报 `memory`，而该库本来就不跨进程存活（由 `PRAGMA database_list` 的空 `file` 判定，不是靠路径字符串匹配）。测试见 `test/unit/legion-db.test.ts`。
 
-### 4.2 Schema（`PRAGMA user_version = 2`）
+### 4.2 Schema（`PRAGMA user_version = 3`）
 
 ```sql
-PRAGMA user_version = 2;   -- v1→v2 无 DDL：只把 messages.delivered 收宽为五值语义（§8.3.1，REV-23）
+PRAGMA user_version = 3;   -- v1→v2 无 DDL：只把 messages.delivered 收宽为五值语义（§8.3.1，REV-23）
+                           -- v2→v3 无列变更：只新增结果账本两张表（§4.2 末，result-ledger-v1 D2）
 
 CREATE TABLE nodes (
   id            TEXT PRIMARY KEY,     -- 树形 id（§5）
@@ -241,6 +242,35 @@ CREATE TABLE messages (              -- 邮件（§8）
 );
 CREATE INDEX idx_messages_inbox ON messages(to_node, delivered, id);
 CREATE INDEX idx_messages_rate ON messages(from_node, created_at);   -- from_node 维度的限速 COUNT（§8，REV-19）
+
+-- schema v3（`src/legion/db.ts` 的 `SCHEMA_V3`，迁移用 `IF NOT EXISTS` 保证幂等）：
+-- 结果账本（`docs/contracts/result-ledger-v1.md` D2）。下面四张表一个列都不动，
+-- 旧 v2 库打开即补建这两张表与 `idx_artifacts_parent` 并升到 3。
+-- 代码里的实际 DDL 是 `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
+-- （幂等迁移所需）；下面为可读性省略 `IF NOT EXISTS`，列/类型/顺序与代码逐字一致，
+-- `test/unit/legion-schema-sentinel.test.ts` 把本段声明（含类型与 PRIMARY KEY）
+-- 与 `openLegionDb()` 实际建出的 schema 逐列比对。
+
+CREATE TABLE artifacts (                 -- 不可变的 child 输出，身份 = (runId, name, round)
+  id          TEXT PRIMARY KEY,          -- "<runId>/<name>/r<round>"
+  parent_id   TEXT NOT NULL,             -- consumer 节点 id（root 或 centurion）
+  node_id     TEXT NOT NULL,             -- 产出该输出的 child 节点 id
+  name        TEXT NOT NULL,
+  round       INTEGER NOT NULL,
+  path        TEXT NOT NULL,             -- 绝对路径 <runDir>/artifacts/<name>/r<round>.md
+  bytes       INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_artifacts_parent ON artifacts(parent_id, created_at);
+
+CREATE TABLE consumptions (              -- 每个 (artifact, consumer) 两个正交事实（A2）
+  artifact_id  TEXT NOT NULL,
+  consumer_id  TEXT NOT NULL,
+  read_bytes   INTEGER NOT NULL DEFAULT 0,   -- 已读字节的高水位，只增不减
+  read_at      INTEGER,                      -- 最后一次读的时刻
+  notified_at  INTEGER,                      -- 通知首次成功交付的时刻（只写一次）
+  PRIMARY KEY (artifact_id, consumer_id)
+);
 ```
 
 ### 4.3 事件类型枚举（闭集，新增需修订契约）
@@ -255,11 +285,12 @@ CREATE INDEX idx_messages_rate ON messages(from_node, created_at);   -- from_nod
 
 ### 4.4 与 run.json 的关系（D20）：run.json 保留为 per-run 权威记录（resume 凭据、原子写、写锁、坏文件隔离原样不动）。legion.db 是树级索引+账本，**可重建**：`legion-rebuild` 命令遍历 nodes 各 run_id 的 run.json + session jsonl 重建 nodes/events（best effort，验收项 M2-h）。
 
-**「可重建」的确切边界（实测，勿过度引用）**：重建**不是**无损复原，以下三类事实在当前 `rebuildLegionDb()` 实现中**无来源、不可恢复**（「无来源」= 该函数不读取/不映射这些字段，不等于磁盘上没有；见每条的括注）——
+**「可重建」的确切边界（实测，勿过度引用）**：重建**不是**无损复原，以下四类事实在当前 `rebuildLegionDb()` 实现中**无来源、不可恢复**（「无来源」= 该函数不读取/不映射这些字段，不等于磁盘上没有；见每条的括注）——
 
 1. **节点字段**：`phase` / `phase_since` / `rework_count` / `contract_path` / `task_summary` 一律回落为 `null` / `0`。根因是 `NodeSource`（`src/legion/rebuild.ts:37`）根本没有这几个字段，`run.json` 也不携带 phase（`RunRecord` 无该字段），而 `insertNode` 对缺省值填 `?? null` / `?? 0`。
 2. **events 塌缩为合成事件**：重建每个节点只产出一条 `node_launched`（或按终态 `node_settled` / `node_failed` / `node_retired`），payload 为 `{ recovered: true, fromSession }`。`phase_change` / `budget_refused` / `mail_sent` / `tree_finalized` / `orphan_detected` / `phase_timeout` / `node_blocked` / `node_resumed` 等**全部无幸存者**——`ChildRecord` 只留终态，而**当前**的 rebuild 不解析 session jsonl 里的工具调用流水（§4.3 把树级语义事件与工具级明细分在两处）。这是对**当前实现**的陈述，不是「jsonl 里没有」：`legion_mail` 的 subject/body（`legion-tools.ts:412-413`）与 `legion_phase` 的 `to`（:458）确实以工具调用记录的形式存在于**发送方**会话 jsonl 中，未来说的 rebuild 完全可以（且应该）把它们解析回来。
 3. **messages 永不重建**：`INSERT INTO messages` 只存在于 `mail.ts`（`sendMail` :209 与 bounce 通知 :294）；`rebuild.ts:79` 只有条件 `DELETE`（`preserveMessages === false` 时）而**无对应 INSERT**。`ChildRecord` 不含 subject/body，`mail_sent` 的 payload 只有 `{messageId, toNode}`。故 **`messages` 表一旦丢失即不可再生**（同样限于当前实现：正文可从发送方 jsonl 的工具调用参数中恢复；但**未投递**的消息若发送方会话文件也已轮转/删除，正文即永久消失）。
+4. **`artifacts` 可从磁盘恢复，`consumptions` 一律重置为空**（`result-ledger-v1.md` D10）：artifact 在磁盘上自描述——`<runDir>/artifacts/<name>/r<round>.md` 的路径给出 `name`/`round`，`stat` 给出 `bytes`，文件 mtime 当 `created_at`，`node_id`/`parent_id` 由重建出的 `nodes` 按 name 反查（查不到或同名歧义的指针**跳过并记 warning**，不猜测）。但 `consumptions` 是父进程的消费事实、磁盘上无对应物，`rebuildLegionDb()` 先清空该表再重建 artifact 行，因此**重建后一律视为未读**：`notified_at`/`read_bytes` 全部丢失，只会多推一条通知，不会少推。审计层面的含义是：重建后不能用账本回答「父当时读没读过」，也不能据此判断某条通知漏发。
 
 因此 §4.4 的「可重建」只能支撑**索引/聚合层可重算**这一层结论，**不能**用来论证「丢写无代价」——phase 状态机断点、预算拒绝、邮件正文都不在重建范围内。任何以「反正能重建」为由放松持久性的论证都必须先与本节对账。实测方法：构造含 5 类真实事件的账本 + 一封带 subject/body 的邮件 + 一个填满 phase 字段的 centurion 节点，跑真实 `rebuildLegionDb()`（`test/unit/legion-rebuild.test.ts` 之外的一次性探针），行数自 6→2、上述字段全清空、邮件行因默认 `preserveMessages` 而**幸存但不可再生**。
 
@@ -602,3 +633,4 @@ interface LegionEventBus {
 | 2026-11-07 | REV-31 | **worktree 仍是 centurion 专属；改变的是它用哪个 transport**（后端选择修订，非 schema / 非事件类型 / 非权限变更，按 §15-1 追加；子契约 `docs/contracts/centurion-terminal-backend-v1.md`）：`SPAWN_MODES` 增 `terminal`，仲裁唯一改点为 `worktree === true ? (isCenturion && hc 宿主 ? "terminal" : "rpc") : "inprocess"`。`terminal` 是**同一棵 worktree、同一个 centurion**，只是跑成 `hc`（herdr-core）终端里的真 `pi` TUI：可在 herdr-app 的 agents 侧栏看见、可 attach、可 Esc 打断而不丢上下文。宿主判据是**两个环境变量**（`HC_TERMINAL_SOCKET` + `HC_TERMINAL_ID`），零子进程、零 socket probe、零 git 探测；两标记缺失时表达式逐字节等于 REV-27 的旧式。**§9 的归属与降级语义一字未改**（centurion 独占、强制 `true`、非 centurion 请求 warn-once 后降级、组员恒 `false`），冻结的四个测试文件（`worktree-centurion-only` / `launch-worktree-probe` / `spawn-mode-arbitration` / `teams`）**一行未动**；`src/runs/worktree.ts` 未编辑（worktree 创建/清理/分支命名全部沿用）。transport 走 `hc connect` 的 JSON-RPC 而非 CLI，因为 `hc run` 没有 `--env` 而 `terminal.run` 有；argv 复用 `buildPiArgs` 与 `formatChildTask`，与 rpc 后端逐字节同构（含 `--session` 绝对路径与完整继承 `-e` 集——漏掉 provider 扩展会让子进程无模型、永不开始 turn，已实测）。v1 的能力上限（不接事件流、不声明 in-flight/stall 事实、`promptDisposition: false`、不按 prompt 重切 transcript）写在子契约 Non-goals；人在终端里插话最坏使 acceptance 降为 `unknown`，不会伪造 accept。同一提交把 `HC_TERMINAL_SOCKET`/`HC_TERMINAL_ID` 加入 `package.json` 各测试脚本的 `env -u` 净化列表（与既有 `PI_SUBAGENT_*` 同模式）：测试宿主必须是 hermetic 的，否则在 hc 终端里跑 `npm test` 会让那 7 条「centurion+worktree ⇒ rpc」断言因真实宿主而翻红。触发：herdr-app 只能列出自行上报状态的终端，headless rpc child 永远不会出现在窗口里。 |
 | 2026-11-07 | REV-32 | **三处事实订正 + 一次抽检**（非语义 / 非 schema / 非事件类型 / 非权限变更，按 §15-1 追加；纯「让文档说代码的实话」）。① §5 重名拒绝的错误码由隐形的「`BUDGET_EXCEEDED` 同级错误通道」改写为显式的 **`NAME_TAKEN`**（`ErrorCodes.NAME_TAKEN`，`src/runs/orchestrator.ts:641`，另 `:751` 同一码；实测实现从不返回 `BUDGET_EXCEEDED`）。② §7.5 `DONE` 收队流第四步与 §11.3 文件闸门里声称的 GC 清理入口**不存在**（全仓检索仅命中本文那两行）：worktree **当前无自动清理入口**，一律保留为 resume 凭据；唯一删除路径是 launch 失败回滚（`src/runs/orchestrator.ts:1466` → `src/runs/worktree.ts:310` `removeChildWorktree`，`git worktree remove --force` `:317`），而 `src/runs/hygiene.ts` 明确把带 `worktrees/` 的 run 目录排除在 prune 之外（`:16` 说明、`hasWorktrees` `:145`、判据 `:217`）。③ §4.3 的 `tree_finalized` 在 `LEGION_EVENT_TYPES`（`src/legion/events.ts:30`）已登记，但 `rg -n 'tree_finalized' src index.ts` **只有闭集定义一处**——**闭集已登记，暂无发射点**；不复用 rebuild 合成事件（§4.4 的 `tree_finalized` 零幸存者）。④ **抽检无漂移**（同一日实测，不改正文）：§8.4 工具参数（`src/extension/legion-tools.ts:1285/1323/1357`）、§7.1-7.4 相位（`src/legion/phase-machine.ts:82-144` 内置四阶段 + 声明式覆盖）、§8.3/§8.3.1 delivery 五值（`src/legion/db.ts:125` 注释与 `mail.ts` 写入方一致）、§4.2 DDL 与 `src/legion/db.ts:75-134`、`LEGION_DB_USER_VERSION = 2`（`db.ts:14`）均与正文一致。触发：2026-11-07 文档审计（`docs/contracts/launch-admission-queue-v1.md` 的 REV 小节同一批对账）。 |
 | 2026-11-09 | REV-33 | §8.3 根收件箱注入语义（**语义修订，非 schema / 非事件类型 / 非权限变更**，按 §15-1 追加；子契约 `docs/contracts/root-mail-run-boundary-v1.md`）：原文「根节点收件箱 → `pi.sendMessage` 注入（复用现有 notify 机制）」读起来是无条件注入，而 `followUp` 只在一个 turn 边界被消费——turn 期间 push 不买任何延迟收益，只把文本放进宿主一个**不可撤回**的队列（实测事故：hold 释放后 2s tick 立即注入 `ACCEPTED`，父 14s 后 `stop` 该子节点，`ACCEPTED→OBSOLETE` 只改标签，通知仍送达）。现在 `LegionPostman.deliverRootInbox` 在 `isMailHeld` 之后、遍历 `pendingInbox` 之前加一道**整轮 `return`**：root 自身 run 活跃 ⇒ 本轮不投递、行留 `PENDING`，由既有作废谓词在真正注入前的那一 tick 重新判活。作用面是**整个 root 收件箱的全部 kind**（不做 kind 白名单：`question`/`report`/`handoff` 同样只在 turn 边界被消费）。判据走单一权威：`src/legion/run-active.ts` 的进程内注册表只存**读取器** `() => parentRunActive`（不存布尔副本，`display-liveness-v1` R1），生产写侧唯一落点是 `adoptLegionIdentity`（真 root 的 identity 由首次 launch 的 `createRootLegion` 懒创建），`dispose()` 最先释放归属校验的 disposer；未接线/抛错一律 fail-open（立即投递）。五态、`MAIL_BOUNCE_REASON` 闭集、事件闭集（16）、schema 与 2s tick 全部不变，`deliverChildren` 不受影响（子通道不在本门作用面）。范围外四条（`steer` 通道仍 mid-turn 注入、`parentRunActive` 卡死、未注册 run 事件的会话 fail-open、持续忙碌会话把 root 邮件推迟任意多 turn）登记在子契约 D7。触发：2026-11-09 实测一条 L2 通知在 child 已被 stop 之后仍然送达（同 `notice-delivery-v2` 的 T0≠T2 家族）。 |
+| 2026-11-10 | REV-34 | §4.2 新增结果账本两张表 `artifacts` / `consumptions`，`LEGION_DB_USER_VERSION` 2→3（**schema 版本变更，按 §15-4 走修订**；子契约 `docs/contracts/result-ledger-v1.md` D2）。四张既有表**一个列都不改**：v3 是纯增量，`nodes`/`events`/`usage`/`messages` 的行与列全部原样保留，`migrate()` 的 v2→v3 只有 `CREATE TABLE/INDEX IF NOT EXISTS`（幂等，`user_version=2` 的旧库打开即补建并升到 3，不降级、不删表）。`consumptions` 的每行对 `(artifact_id, consumer_id)` 只存**两个正交事实**：`read_bytes`（已读字节高水位，只增不减）与 `notified_at`（通知首次成功交付时刻，只写一次，`COALESCE` 保旧值）——**禁止**把它们压成一个 `kind` 等级：那会把「通知后再分页读几行」误判成没通知过而重发、把「先分页读一半」误判成读完而漏发（A2）。抑制谓词只有一处（`ledger.undelivered`），三个合取项缺一不可：`a.parent_id = :consumerId AND c.notified_at IS NULL AND COALESCE(c.read_bytes,0) < a.bytes`（`parent_id` 是 consumer 作用域，去掉它会把兄弟子树/别的 run 的 artifact 交给错的 consumer）。§4.4 的重建边界同时补第 4 条：`artifacts` 可从 `<runDir>/artifacts/<name>/r<round>.md` 恢复（`name`/`round` 取自路径、`bytes` 取自 `stat`、`created_at` 取文件 mtime、`node_id`/`parent_id` **只在本次 run 作用域内**按 name 反查重建后的 `nodes`，查不到或同名歧义**跳过不猜**，不做全树同名回落），`consumptions` 一律重置为空 ⇒ 重建后一律视为未读（只会多推、不会少推）。事件闭集**不变**（仍 16 种，本次不新增事件类型）；同批更新 `test/unit/legion-schema-sentinel.test.ts` 与 `test/unit/legion-db.test.ts` 的 schema 快照。触发：结果账本重构 P1 |

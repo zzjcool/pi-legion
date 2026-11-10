@@ -401,7 +401,7 @@ frontmatter 走**严格字段表**：`AGENT_FRONTMATTER_FIELDS`（`src/agents/ag
 
 ### 7.4 迁移与卫生
 
-- `LEGION_DB_USER_VERSION = 2`：v0 → v1 建表；v1 → v2 只 bump 版本（`messages.delivered` 从三值域扩成五值域，列类型本就是 `INTEGER`，旧值 `1` 语义上等同新 `accepted`）。比支持版本更新的库直接拒绝打开。
+- `LEGION_DB_USER_VERSION = 3`：v0 → v1 建表；v1 → v2 只 bump 版本（`messages.delivered` 从三值域扩成五值域，列类型本就是 `INTEGER`，旧值 `1` 语义上等同新 `accepted`）；v2 → v3 只加结果账本两张表（`artifacts` / `consumptions`，`CREATE TABLE/INDEX IF NOT EXISTS`，四张既有表零列变更、零迁数据）。每一步都先写 DDL 再写 `PRAGMA user_version`，故同一个 `migrate()` 从任意旧版本都能落到当前版本，且重跑幂等。比支持版本更新的库直接拒绝打开。
 - 启动卫生（`src/runs/hygiene.ts`，每个 root 会话一次、best-effort、绝不抛）：清扫死 owner 的 `rpc-child-*`；把 owner 已死且长时间没更新的 `starting/running/blocked` 节点标 `failed`（`node_abandoned`）；按 `retentionDays`（默认 14 天）删空闲 run 目录（**带 `worktrees/` 的除外**）；events 按 `eventRetentionDays` / `eventMaxRows` 裁剪。每一步都同时看**年龄**与**进程所有权**，绝不碰别的活跃会话。
 
 ### 7.5 run 目录的降级定位
@@ -409,7 +409,7 @@ frontmatter 走**严格字段表**：`AGENT_FRONTMATTER_FIELDS`（`src/agents/ag
 `run.json` 不再是权威状态，它承担两件事：
 
 1. **会话寻址**：`sessionFile`、`worktrees/`、`out/` 都在这里，resume 靠它。
-2. **恢复源**：`rebuildLegionDb`（`src/legion/rebuild.ts`）能从 run 记录 + session 文件 best-effort 重建 `nodes`/`events`/`usage`。它是模块级能力（有单测），**没有挂 slash 或工具入口**——不要把它当日常命令。
+2. **恢复源**：`rebuildLegionDb`（`src/legion/rebuild.ts`）能从 run 记录 + session 文件 best-effort 重建 `nodes`/`events`/`usage`，以及从 `<runDir>/artifacts/<name>/r<round>.md` 重建 `artifacts`（`name`/`round` 来自路径、`bytes` 来自 `stat`、`created_at` 来自 mtime，`node_id`/`parent_id` **只在本次 run 作用域内**按 name 反查，查不到或同名歧义就跳过并记 warning）。`consumptions` **不重建**（父进程的消费事实，磁盘上无对应物），重建后一律视为未读——只会多推一条通知，不会少推。它是模块级能力（有单测），**没有挂 slash 或工具入口**——不要把它当日常命令。
 
 ---
 

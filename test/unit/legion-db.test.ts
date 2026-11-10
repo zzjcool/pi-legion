@@ -18,6 +18,9 @@ const TABLE_COLUMNS = {
 	events: ["id", "node_id", "type", "data", "ts"],
 	usage: ["node_id", "tokens_in", "tokens_out", "cost_usd", "updated_at"],
 	messages: ["id", "from_node", "to_node", "subject", "body", "kind", "urgency", "delivered", "delivered_at", "created_at"],
+	// schema v3 (`result-ledger-v1.md` D2).
+	artifacts: ["id", "parent_id", "node_id", "name", "round", "path", "bytes", "created_at"],
+	consumptions: ["artifact_id", "consumer_id", "read_bytes", "read_at", "notified_at"],
 } as const;
 
 const INDEX_COLUMNS = {
@@ -27,9 +30,10 @@ const INDEX_COLUMNS = {
 	idx_events_type_ts: ["type", "ts"],
 	idx_messages_inbox: ["to_node", "delivered", "id"],
 	idx_messages_rate: ["from_node", "created_at"],
+	idx_artifacts_parent: ["parent_id", "created_at"],
 } as const;
 
-test("legion db schema snapshot matches contract columns and indexes (v2)", () => {
+test("legion db schema snapshot matches contract columns and indexes (v3)", () => {
 	const db = openLegionDb(":memory:");
 	try {
 		assert.equal(Number(db.prepare("PRAGMA user_version").get()?.user_version), LEGION_DB_USER_VERSION);
@@ -243,7 +247,7 @@ test("sqliteHasRow treats Bun null and Node undefined as miss", () => {
 	assert.equal(sqliteHasRow({ found: 1 }), true);
 });
 
-test("a v1 ledger opens as schema v2 without rewriting a single row (#322)", () => {
+test("a v1 ledger opens as the current schema version without rewriting a single row (#322)", () => {
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "legion-db-v1-v2-"));
 	const file = path.join(directory, "ledger.db");
 	try {
@@ -267,8 +271,17 @@ test("a v1 ledger opens as schema v2 without rewriting a single row (#322)", () 
 
 		const upgraded = openLegionDb(file);
 		try {
-			assert.equal(LEGION_DB_USER_VERSION, 2);
-			assert.equal(Number(upgraded.prepare("PRAGMA user_version").get()?.user_version), 2, "opening upgrades v1 to v2");
+			assert.equal(LEGION_DB_USER_VERSION, 3);
+			assert.equal(
+				Number(upgraded.prepare("PRAGMA user_version").get()?.user_version),
+				LEGION_DB_USER_VERSION,
+				"opening upgrades v1 all the way to the current schema version",
+			);
+			assert.deepEqual(
+				upgraded.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('artifacts', 'consumptions') ORDER BY name").all().map((info) => String(info.name)),
+				["artifacts", "consumptions"],
+				"v2 → v3 adds the result-ledger tables to a ledger that predates them",
+			);
 			const row = upgraded.prepare("SELECT * FROM messages").get();
 			assert.equal(Number(row?.delivered), 1, "the old 1 keeps its value and now reads as ACCEPTED");
 			assert.equal(String(row?.subject), "queued before v2");
@@ -278,7 +291,7 @@ test("a v1 ledger opens as schema v2 without rewriting a single row (#322)", () 
 			assert.deepEqual(
 				upgraded.prepare("PRAGMA table_info(messages)").all().map((info) => String(info.name)),
 				[...TABLE_COLUMNS.messages],
-				"v1 → v2 changes no columns",
+				"v1 → v3 changes no columns of the four original tables",
 			);
 		} finally {
 			upgraded.close();
