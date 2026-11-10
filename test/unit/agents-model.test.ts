@@ -22,7 +22,11 @@ import {
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import type { AgentConfig } from "../../src/shared/types.ts";
+import {
+	ErrorCodes,
+	SubagentError,
+	type AgentConfig,
+} from "../../src/shared/types.ts";
 
 function agent(over: Partial<AgentConfig> = {}): AgentConfig {
 	return {
@@ -218,6 +222,43 @@ test("resolve: 'inherit' selects the dispatch model explicitly", () => {
 	assert.equal(r.source?.type, "inherit");
 });
 
+// ─────────── B8a: `inherit` with nothing to inherit is a refusal ───────────
+//
+// The parent session's model is the ONLY thing `inherit` can resolve to. With
+// none, the old code returned a model-less shape whose `source.model` still
+// read `inherit`; the orchestrator re-read `agent.model`, spawned
+// `--model inherit`, and pi answered the fatal `Model "inherit" not found`.
+
+test("B8a.1: `inherit` with no dispatch model is a loud INVALID_PARAMS refusal", () => {
+	assert.throws(
+		() => resolveModel({ agent: agent({ model: "inherit" }) }),
+		(error: unknown) => {
+			assert.ok(
+				error instanceof SubagentError,
+				`must be a SubagentError with a code: ${String(error)}`,
+			);
+			assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
+			assert.match(error.message, /inherit/, "the message must name the sentinel");
+			assert.match(
+				error.message,
+				/defaultModel/,
+				"the message must name the fix the operator has",
+			);
+			return true;
+		},
+	);
+});
+
+test("B8a.1: `inherit` as the per-run override refuses too (tool params)", () => {
+	// Every level that can hold a model reaches the same branch, so the refusal
+	// cannot be dodged by writing the sentinel into the launch call itself.
+	assert.throws(
+		() => resolveModel({ agent: agent(), override: "inherit" }),
+		(error: unknown) =>
+			error instanceof SubagentError && error.code === ErrorCodes.INVALID_PARAMS,
+	);
+});
+
 test("resolve: no candidates yields no model", () => {
 	const r = resolveModel({ agent: agent() });
 	assert.equal(r.model, undefined);
@@ -316,6 +357,20 @@ test("settings: rejects a non-object subagents value", () => {
 test("settings: rejects an empty defaultModel", () => {
 	assert.throws(() =>
 		parseSubagentSettings({ subagents: { defaultModel: "  " } }, "/s.json"),
+	);
+});
+
+test("B8a.2: subagents.defaultModel: \"inherit\" is rejected at parse time", () => {
+	// `inherit` means "use THIS session's model" — as a settings-wide default it
+	// can only make every launch from a model-less session fail (B8a.1).
+	assert.throws(
+		() => parseSubagentSettings({ subagents: { defaultModel: "inherit" } }, "/s.json"),
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /subagents\.defaultModel/);
+			assert.match(error.message, /inherit/);
+			return true;
+		},
 	);
 });
 
@@ -602,6 +657,13 @@ test("modelCandidates is unique and keeps an empty primary as one attempt", () =
 	assert.deepEqual(modelCandidates(undefined, ["c/d"]), [undefined, "c/d"]);
 	assert.deepEqual(modelCandidates(undefined, undefined), [undefined]);
 	assert.deepEqual(modelCandidates("  ", [" x "]), [undefined, "x"]);
+});
+
+test("B8a.3: modelCandidates filters the `inherit` sentinel out of every position", () => {
+	// Defence in depth for callers that bypass `resolveModel`: the sentinel is a
+	// launch instruction, never a model id, so it must not reach `--model`.
+	assert.deepEqual(modelCandidates("inherit", ["cb/fb", "inherit"]), ["cb/fb"]);
+	assert.deepEqual(modelCandidates("inherit"), [undefined]);
 });
 
 // ─────────────────────────── join settings (smart join) ───────────────────────────

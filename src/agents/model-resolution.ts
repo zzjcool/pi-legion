@@ -13,6 +13,10 @@
  *   8. the dispatching (parent) session model
  *
  * `model: "inherit"` at any of levels 1-5 explicitly selects the parent model.
+ * When there is no parent model to inherit it is a loud refusal (D-B8a.1), never
+ * a silent "no model": an empty resolution makes the orchestrator re-read
+ * `agent.model` (the literal `inherit`) and spawn `--model inherit`, which pi
+ * answers with the fatal `Model "inherit" not found`.
  * Level 2 is new: the preset's model is passed in by the caller (which owns
  * preset expansion), so this module stays a pure candidate chain. Level 3 is
  * new: a team member's `model` and its `preset` belong on the same footing, so
@@ -20,12 +24,36 @@
  * settings-wide override.
  */
 
-import type {
-	AgentConfig,
-	ModelSourceInfo,
-	SubagentsSettings,
+import {
+	ErrorCodes,
+	SubagentError,
+	type AgentConfig,
+	type ModelSourceInfo,
+	type SubagentsSettings,
 } from "../shared/types.ts";
 import { splitThinkingSuffix } from "./model-scope.ts";
+
+/**
+ * The `model: "inherit"` sentinel: "use THIS (parent) session's model".
+ *
+ * Not a model id — it must never reach `--model` (pi answers
+ * `Model "inherit" not found`). Three layers have to agree on the literal, so
+ * it lives here: `resolveModel` refuses it when there is no parent model to
+ * inherit, `modelCandidates` keeps it out of the candidate list, and
+ * `legion-doctor` does not report it as a registry entry.
+ */
+export const INHERIT_MODEL_SENTINEL = "inherit";
+
+/**
+ * `details.reason` of the refusal an `inherit` with nothing to inherit raises
+ * (D-B8a.1).
+ *
+ * A caller that RENDERS resolution failures (`/legion agents`) has to tell this
+ * refusal apart from the other one (an undefined preset) to say something true
+ * about it, and matching on prose would be a trap. `SubagentError.details` is
+ * the structured channel it already has.
+ */
+export const INHERIT_WITHOUT_PARENT_MODEL = "inherit-without-parent-model";
 
 export interface ResolveModelInput {
 	agent: AgentConfig;
@@ -139,9 +167,20 @@ export function resolveModel(input: ResolveModelInput): ResolvedModel {
 		if (!raw) continue;
 
 		// Explicit inheritance request.
-		if (raw === "inherit") {
+		if (raw === INHERIT_MODEL_SENTINEL) {
+			// D-B8a.1: with no parent model there is nothing to inherit, and the
+			// old model-less return was NOT inert — `index.ts` then passes no
+			// model, `Orchestrator.launch` re-reads `agent.model` (`inherit`) and
+			// spawns `--model inherit`. Refusing here is what turns a fatal child
+			// start into one actionable line for the operator.
 			if (!input.dispatchModel) {
-				return { source: { type: "inherit", model: "inherit" } };
+				throw new SubagentError(
+					`Model 'inherit' was requested for '${name}' but the parent session has no model. ` +
+						"Set `subagents.defaultModel` or pass an explicit `model` — 'inherit' means " +
+						"\"use the parent session's model\", and there is none.",
+					ErrorCodes.INVALID_PARAMS,
+					{ reason: INHERIT_WITHOUT_PARENT_MODEL, agent: name },
+				);
 			}
 			return {
 				model: input.dispatchModel,
@@ -180,6 +219,11 @@ export function providerOf(model: string | undefined): string | undefined {
 /**
  * Unique model ids to try at start, primary first.
  *
+ * The `inherit` sentinel is dropped from every position (D-B8a.3): it is a
+ * launch instruction, not a model id, so it must not reach `--model` / the
+ * in-process model ref. Defence in depth — the normal path is already refused
+ * by `resolveModel`, so this only covers callers that skip it.
+ *
  * Empty primary with no fallbacks yields `[undefined]` so the caller still
  * makes one start attempt without `--model`.
  */
@@ -191,6 +235,7 @@ export function modelCandidates(
 	const seen = new Set<string>();
 	for (const raw of [primary, ...(fallbacks ?? [])]) {
 		const value = raw?.trim() ? raw.trim() : undefined;
+		if (value === INHERIT_MODEL_SENTINEL) continue;
 		const key = value ?? "";
 		if (seen.has(key)) continue;
 		seen.add(key);

@@ -25,6 +25,7 @@ import {
 	roleToolGateNextSteps,
 } from "../runs/role-tool-gates.ts";
 import { getAgentDir } from "../agents/paths.ts";
+import { INHERIT_MODEL_SENTINEL } from "../agents/model-resolution.ts";
 import {
 	hostExtensionDiscoveryState,
 	type HostExtensionDiscoveryState,
@@ -1155,5 +1156,9 @@ export function expectedModelsFromSettings(settings: unknown): string[] {
 			}
 		}
 	}
-	return [...out];
+	// D-B8a.4: the `inherit` sentinel is not a model id — it means "use the
+	// parent session's model" (and is refused when there is none, D-B8a.1).
+	// Reporting it as an expected model made doctor warn that the child could not
+	// see a registry entry that no registry can ever provide.
+	return [...out].filter((model) => model !== INHERIT_MODEL_SENTINEL);
 }

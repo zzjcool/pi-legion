@@ -376,6 +376,87 @@ test("F3 utility: an early failure still carries the warnings collected before i
 	assert.equal(clean.text, "not a utility agent: worker (mark it with 'utility: true')");
 });
 
+// ─────────── B8a: `inherit` with no parent model refuses, never spawns ───────────
+
+const INHERIT_CARD = "---\nname: heir\ndescription: i\nmodel: inherit\n---\np\n";
+
+/**
+ * The sentinel used to resolve to a MODEL-LESS shape, so `index.ts` passed no
+ * model, `Orchestrator.launch` re-read `agent.model` (the literal `inherit`) and
+ * spawned `--model inherit` — pi's fatal `Model "inherit" not found`.
+ *
+ * The whole point of B8a is the shape of the failure: a `✗` line naming the
+ * sentinel, and NO child. Asserted together because either half alone passes on
+ * the buggy code (it spat a message AND the spawn).
+ */
+test("B8a.1 end-to-end: a card `model: inherit` with no parent model refuses and spawns nothing", async () => {
+	const result = await runBatch({
+		settings: {},
+		agents: { "heir.md": INHERIT_CARD },
+		tasks: [{ agent: "heir", task: "t1" }],
+	});
+	assert.equal(
+		result.threw,
+		undefined,
+		`a bad model must degrade to a refusal line, not reject the batch: ${result.threw?.message}`,
+	);
+	assert.match(result.text, /✗ heir: /);
+	assert.match(result.text, /Model 'inherit' was requested for 'heir'/);
+	assert.equal(
+		result.supervisor.spawns.length,
+		0,
+		`the sentinel must never reach --model:\n${result.text}`,
+	);
+});
+
+test("B8a.1 end-to-end: a tool-param `model: \"inherit\"` with no parent model refuses too", async () => {
+	const result = await runBatch({
+		settings: {},
+		agents: { "healthy.md": HEALTHY },
+		tasks: [],
+		toolParams: { agent: "healthy", task: "t1", model: "inherit" },
+	});
+	assert.match(result.text, /✗ healthy: /);
+	assert.match(result.text, /but the parent session has no model/);
+	assert.equal(result.supervisor.spawns.length, 0);
+});
+
+test("B8a.1 end-to-end: `inherit` WITH a parent model still launches on it", async () => {
+	// The working half of the sentinel must not regress while the missing-parent
+	// half starts refusing.
+	const result = await runBatch({
+		settings: {},
+		agents: { "heir.md": INHERIT_CARD },
+		tasks: [{ agent: "heir", task: "t1" }],
+		dispatchModel: "parent/opus",
+	});
+	assert.equal(result.supervisor.spawns.length, 1);
+	assert.equal(result.supervisor.spawns[0]?.input.model, "parent/opus");
+});
+
+// ─────────── B8b: a configured `thinking` wins over a level in the model ───────────
+
+/**
+ * The end of the chain the decision is judged on: the CHILD's argv.
+ *
+ * `applyThinkingSuffix` only appends a level when the model has none, so on the
+ * pre-fix code the child started on `cb/x:high` and the preset's `thinking: max`
+ * vanished without a word. Asserting `input.model` alone would miss half of it:
+ * the model ref the child actually receives is the suffixed one.
+ */
+test("B8b end-to-end: a preset's `thinking` replaces the level inside its own model", async () => {
+	const result = await runBatch({
+		settings: { presets: { strong: { kind: "pi", model: "cb/x:high", thinking: "max" } } },
+		agents: { "healthy.md": "---\nname: healthy\ndescription: h\npreset: strong\n---\np\n" },
+		tasks: [{ agent: "healthy", task: "t1" }],
+	});
+	const spawn = result.supervisor.spawns[0];
+	assert.ok(spawn, `the preset must still launch:\n${result.text}`);
+	assert.equal(spawn.input.model, "cb/x");
+	assert.ok(spawn.args.includes("cb/x:max"), `argv must carry the configured level: ${spawn.args.join(" ")}`);
+	assert.equal(spawn.args.includes("cb/x:high"), false, "the model string's own level must be gone");
+});
+
 // ─────────────────── continue / resume: the per-call model ───────────────────
 
 /**

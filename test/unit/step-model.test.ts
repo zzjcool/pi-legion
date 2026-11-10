@@ -337,7 +337,7 @@ type StepSettings = Parameters<typeof resolveStepModel>[0]["settings"];
  */
 function teamFolded(
 	base: AgentConfig,
-	member: { model?: string; preset?: string },
+	member: { model?: string; preset?: string; thinking?: string | false },
 	overrides?: Record<string, Partial<AgentConfig>>,
 ): AgentConfig {
 	const folded = overrides ? fold(base, overrides) : base;
@@ -483,6 +483,102 @@ test("R1: a team member `model` still beats subagents.defaultModel", () => {
 	});
 	assert.equal(out.resolved.model, "cb/team-model");
 	assert.equal(out.resolved.source?.type, "team");
+});
+
+// ─────────── B8b: configured `thinking` vs a `:level` in the model string ───────────
+//
+// `applyThinkingSuffix` (argv AND in-process model ref) keeps an existing level
+// by default and nothing calls it with `replaceExisting`, so a configured
+// `thinking` was silently dropped whenever the winning model string carried a
+// level. The strip happens HERE — the single resolution entry point both
+// backends read — so rpc and in-process stay byte-identical.
+
+test("B8b.1: a card model level yields to the card's own `thinking`", () => {
+	const out = resolveStepModel({
+		agent: agent({ model: "cb/x:high", thinking: "max" }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	assert.equal(out.resolved.model, "cb/x");
+});
+
+test("B8b.1: a team member's model level yields to the member's `thinking`", () => {
+	const folded = teamFolded(agent({}), { model: "cb/x:high", thinking: "max" });
+	assert.equal(folded.thinking, "max", "precondition: applyTeam folds the member's thinking");
+
+	const out = resolveStepModel({ agent: folded, step: {}, params: {}, settings: {} });
+	assert.equal(out.resolved.model, "cb/x");
+});
+
+test("B8b.1: a preset's model level yields to the preset's `thinking`", () => {
+	const out = resolveStepModel({
+		agent: agent({ preset: "strong" }),
+		step: {},
+		params: {},
+		settings: {
+			presets: { strong: { kind: "pi" as const, model: "cb/x:high", thinking: "max" } },
+		},
+	});
+	assert.equal(out.resolved.model, "cb/x");
+});
+
+test("B8b.1: a per-run model's OWN level survives a configured `thinking`", () => {
+	// The exception: a level typed into THIS call's `model` is the most specific
+	// signal there is, so the lower-precedence `thinking` must not undo it.
+	const out = resolveStepModel({
+		agent: agent({ model: "cb/other", thinking: "low" }),
+		step: { model: "cb/x:high" },
+		params: {},
+		settings: {},
+	});
+	assert.equal(out.resolved.model, "cb/x:high");
+
+	// `tasks[].model` and the call-level `model` are the SAME level, so the
+	// exception must hold for both — not just the one this test started with.
+	const viaParams = resolveStepModel({
+		agent: agent({ model: "cb/other", thinking: "low" }),
+		step: {},
+		params: { model: "cb/x:high" },
+		settings: {},
+	});
+	assert.equal(viaParams.resolved.model, "cb/x:high");
+});
+
+test("B8b.1: no configured `thinking` leaves the model string alone", () => {
+	// The level may be the only thinking choice the operator made; stripping it
+	// here would lose it for good (existing behaviour, must not change).
+	const out = resolveStepModel({
+		agent: agent({ model: "cb/x:high" }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	assert.equal(out.resolved.model, "cb/x:high");
+});
+
+test("B8b.1: `thinking: false` strips the level (reasoning must stay off)", () => {
+	const out = resolveStepModel({
+		agent: agent({ model: "cb/x:high", thinking: false }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	assert.equal(out.resolved.model, "cb/x");
+	assert.equal(out.agent.thinking, false, "the flag itself is untouched");
+});
+
+test("B8b.1: provenance keeps `model` and `source.model` in step after the strip", () => {
+	// `resolveModel` always returns them as the same string; a strip that only
+	// rewrote one of them would look like a STALE provenance tag downstream.
+	const out = resolveStepModel({
+		agent: agent({ model: "cb/x:high", thinking: "max" }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	assert.equal(out.resolved.source?.type, "frontmatter");
+	assert.equal(out.resolved.source?.model, "cb/x");
 });
 
 // ─────────── blank step fields must not shadow the call-level values (D4) ───────────

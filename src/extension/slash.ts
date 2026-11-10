@@ -7,12 +7,15 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import type {
-	AgentConfig,
-	AgentScope,
-	SubagentsSettings,
+import {
+	ErrorCodes,
+	SubagentError,
+	type AgentConfig,
+	type AgentScope,
+	type SubagentsSettings,
 } from "../shared/types.ts";
 import { classifyModelOrigin, resolveStepModel } from "../agents/step-model.ts";
+import { INHERIT_WITHOUT_PARENT_MODEL } from "../agents/model-resolution.ts";
 import { checkModelScope } from "../agents/model-scope.ts";
 import {
 	DEFAULT_TEAM,
@@ -187,6 +190,27 @@ export function renderAgentsListing(input: {
 	return lines.join("\n");
 }
 
+/**
+ * D-B8a.4: what an `inherit` role's line says when the parent has no model.
+ *
+ * `inherit` is not a model and not a fallback: the ONLY thing it can mean is
+ * "whatever this session is running", so with none the launch is refused
+ * (D-B8a.1). Reporting `(agent CLI default)` there named a working
+ * configuration the operator would never get.
+ */
+const INHERIT_NEEDS_PARENT_MODEL =
+	"needs a parent session model — a launch would refuse this";
+
+/** True for the D-B8a.1 refusal (`inherit` with nothing to inherit). */
+function isInheritWithoutParentModel(error: unknown): boolean {
+	return (
+		error instanceof SubagentError &&
+		error.code === ErrorCodes.INVALID_PARAMS &&
+		(error.details as { reason?: string } | undefined)?.reason ===
+			INHERIT_WITHOUT_PARENT_MODEL
+	);
+}
+
 function renderOneAgent(
 	agent: AgentConfig,
 	input: {
@@ -213,14 +237,23 @@ function renderOneAgent(
 		});
 		if (resolved.resolved.model) {
 			details.push(modelLine(agent, resolved, input.settings));
+		} else if (resolved.resolved.source?.type === "inherit") {
+			// D-B8a.4: a model-less `inherit` is NOT the CLI default. Nothing of the
+			// role's own would run, and a launch from a session without a model is
+			// refused (D-B8a.1) — so say that instead of naming a fallback nobody
+			// would get. Kept as a guard even though D-B8a.1 now throws on the way
+			// in: this line must never claim `(agent CLI default)` for an `inherit`.
+			details.push(`model: ${INHERIT_NEEDS_PARENT_MODEL}`);
 		} else {
 			details.push("model: (agent CLI default)");
 		}
-	} catch {
-		// An undefined preset or an incoherent kind/model pair throws here —
+	} catch (error) {
+		// An undefined preset or an `inherit` with no parent model throws here —
 		// the launch would refuse too. Report it instead of guessing.
 		details.push(
-			`model: ${agent.model ?? "(agent CLI default)"} (unresolvable — a launch with this configuration would be refused)`,
+			isInheritWithoutParentModel(error)
+				? `model: ${INHERIT_NEEDS_PARENT_MODEL}`
+				: `model: ${agent.model ?? "(agent CLI default)"} (unresolvable — a launch with this configuration would be refused)`,
 		);
 	}
 	lines.push(`    ${details.join(" · ")}`);

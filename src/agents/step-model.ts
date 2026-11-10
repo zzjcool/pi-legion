@@ -16,6 +16,7 @@
 
 import type { AgentConfig, ModelOrigin, PresetConfig } from "../shared/types.ts";
 import { providerOf, resolveModel, type ResolvedModel } from "./model-resolution.ts";
+import { splitThinkingSuffix, stripThinkingSuffix } from "./model-scope.ts";
 import { expandPreset } from "./presets.ts";
 
 export interface StepModelInput {
@@ -68,10 +69,59 @@ function explicitValue(value: string | undefined): string | undefined {
 }
 
 /**
+ * Drop a `:level` that a configured `thinking` is about to replace (D-B8b.1).
+ *
+ * `applyThinkingSuffix` — the builder of both the rpc argv's `--model` and the
+ * in-process model ref — keeps an existing level unless it is told to replace
+ * it, and it is NOT told to: flipping `replaceExisting` on would also undo the
+ * per-run exception below (and would do so deep in `src/runs/**`, where the
+ * configuration being overridden is no longer visible). Stripping one step
+ * earlier keeps `thinking` meaningful and keeps the two backends identical,
+ * because both read THIS result.
+ *
+ * Three conditions must hold together:
+ *   - a model resolved, and it did not come from the per-run override (a level
+ *     typed into THIS call's `model` is the most specific signal there is —
+ *     the caller chose it for this very run, so a lower-precedence setting must
+ *     not undo it);
+ *   - the effective agent configures `thinking` (preset / team member / card /
+ *     `agentOverrides` all land there via `expandPreset` + the folds);
+ *   - the model string actually carries a KNOWN level (`splitThinkingSuffix`
+ *     only matches those, so `provider/model:variant` is left alone).
+ *
+ * `thinking: false` counts as a configuration too: leaving the suffix would
+ * switch reasoning back on for a role that asked for it off. It needs no level
+ * of its own — the strip is the whole effect.
+ */
+function stripConfiguredThinkingLevel(
+	resolved: ResolvedModel,
+	override: string | undefined,
+	thinking: string | false | undefined,
+): ResolvedModel {
+	if (!resolved.model || thinking === undefined) return resolved;
+	// The same judgement `classifyModelOrigin` uses to recognise the per-run
+	// winner: the override is candidate 1, so a winner that IS the override came
+	// from this call.
+	if (override !== undefined && resolved.model === override) return resolved;
+	if (splitThinkingSuffix(resolved.model).thinking === undefined) return resolved;
+
+	const model = stripThinkingSuffix(resolved.model);
+	// `resolveModel` always reports `model` and `source.model` as the same
+	// string; a strip that rewrote only one of them would look exactly like a
+	// STALE provenance tag to the next reader that compares them.
+	return {
+		...resolved,
+		model,
+		...(resolved.source ? { source: { ...resolved.source, model } } : {}),
+	};
+}
+
+/**
  * Resolve the model (and the effective agent) a step will launch with.
  *
- * Throws when a referenced preset is undefined. Callers are expected to turn
- * that into a refusal line rather than letting it escape.
+ * Throws when a referenced preset is undefined, or when `inherit` has no parent
+ * model to inherit (D-B8a.1). Callers are expected to turn that into a refusal
+ * line rather than letting it escape.
  */
 export function resolveStepModel(input: StepModelInput): StepModelResult {
 	const override = explicitValue(input.step.model) ?? explicitValue(input.params.model);
@@ -84,7 +134,7 @@ export function resolveStepModel(input: StepModelInput): StepModelResult {
 
 	const effective = expanded?.agent ?? input.agent;
 
-	const resolved = resolveModel({
+	const resolvedChosen = resolveModel({
 		agent: effective,
 		...(override ? { override } : {}),
 		...(expanded?.presetModel ? { presetModel: expanded.presetModel } : {}),
@@ -97,6 +147,14 @@ export function resolveStepModel(input: StepModelInput): StepModelResult {
 			: {}),
 		settings: input.settings as Parameters<typeof resolveModel>[0]["settings"],
 	});
+	// B8b: the configured `thinking` (a dedicated field) outranks a `:level`
+	// embedded in the model string — except for a level that came in with THIS
+	// call's `model`. See `stripConfiguredThinkingLevel`.
+	const resolved = stripConfiguredThinkingLevel(
+		resolvedChosen,
+		override,
+		effective.thinking,
+	);
 
 	// Only a preset can change the kind, and v4 accepts `pi` alone, so nothing
 	// here can leave the kind and the launched model incoherent.

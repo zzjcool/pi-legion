@@ -373,6 +373,21 @@ test("renderAgentsListing: unresolvable configuration is reported, not guessed",
 	assert.match(text, /unresolvable/);
 });
 
+test("renderAgentsListing: an `inherit` role with no parent model says a launch would refuse it", () => {
+	// `inherit` used to be reported as `(agent CLI default)` — a working
+	// configuration. A launch from a session with no model is REFUSED (B8a.1),
+	// so the line must say that instead of naming a fallback nobody would get.
+	const text = renderAgentsListing({
+		agents: [stubAgent({ name: "heir", model: "inherit" })],
+		scope: "user",
+		projectAgentsDir: null,
+		builtinAgentsDir: "/pkg/agents",
+		settings: {},
+	});
+	assert.match(text, /needs a parent session model — a launch would refuse this/);
+	assert.doesNotMatch(text, /\(agent CLI default\)/);
+});
+
 test("renderAgentsListing: alias and unenforced fields are surfaced", () => {
 	const text = renderAgentsListing({
 		agents: [

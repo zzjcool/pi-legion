@@ -27,6 +27,7 @@ import {
 } from "./context.ts";
 import { OVERRIDE_FIELDS } from "./overrides.ts";
 import { ignoredKindMessage, reportIgnoredOnce } from "../shared/ignored-kind.ts";
+import { INHERIT_MODEL_SENTINEL } from "./model-resolution.ts";
 import { parseModelScopeConfig } from "./model-scope.ts";
 import { parsePresets } from "./presets.ts";
 
@@ -461,7 +462,7 @@ export function parseSubagentSettings(
 
 	// Each reader validates one field and returns `undefined` when absent, so a
 	// missing key and a rejected key stay distinguishable (only the latter throws).
-	setIf(out, "defaultModel", requiredString(input.defaultModel, "defaultModel", filePath));
+	setIf(out, "defaultModel", parseDefaultModel(input.defaultModel, filePath));
 	setIf(out, "defaultProvider", requiredString(input.defaultProvider, "defaultProvider", filePath));
 	setIf(
 		out,
@@ -527,6 +528,26 @@ function requiredString(
 		);
 	}
 	return value.trim();
+}
+
+/**
+ * `subagents.defaultModel`: a concrete model id, never the `inherit` sentinel.
+ *
+ * `inherit` means "use THIS session's model", which a settings-wide default
+ * cannot express — and `resolveModel` refuses an `inherit` with no parent model
+ * (D-B8a.1), so accepting it here would turn every launch from a model-less
+ * session into a failure. Rejected while parsing the file, where the operator
+ * can see it, instead of at the first spawn.
+ */
+function parseDefaultModel(value: unknown, filePath: string): string | undefined {
+	const model = requiredString(value, "defaultModel", filePath);
+	if (model === INHERIT_MODEL_SENTINEL) {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid 'subagents.defaultModel'; ` +
+				`'inherit' means "use the parent session's model", which a global default cannot express — set a concrete model id.`,
+		);
+	}
+	return model;
 }
 
 /** A boolean, or `undefined` when the key is absent. */
