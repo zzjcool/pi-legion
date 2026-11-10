@@ -18,6 +18,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { classifyModelOrigin, resolveStepModel } from "../../src/agents/step-model.ts";
 import { applyAgentOverrides, applyDefaultModel } from "../../src/agents/overrides.ts";
+import { applyTeam } from "../../src/agents/teams.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 
 function agent(over: Partial<AgentConfig> = {}): AgentConfig {
@@ -316,6 +317,172 @@ test("D2b: a plain frontmatter model is still explicit (no regression)", () => {
 	assert.equal(out.resolved.source?.type, "frontmatter");
 	assert.equal(out.modelOrigin, "explicit");
 	assert.equal(classifyModelOrigin(out.resolved, undefined).label, "the agent's frontmatter");
+});
+
+// ─────────── R1: a team member's `model` is its own precedence level ───────────
+//
+// `loadCatalog` folds in this order: frontmatter → `agentOverrides` → the team
+// member override → `defaultModel`. But `resolveModel` re-reads the SETTINGS
+// overrides at candidates 3/4, so before this level existed the folded team
+// `model` sat at candidate 5 and silently lost to a settings-wide override.
+// The docs (README, docs/subagents-teams.md) promise the member override wins,
+// and a member's `preset` already lives at level 2 — so the member's `model`
+// belongs directly below it, above every settings-wide override.
+
+type StepSettings = Parameters<typeof resolveStepModel>[0]["settings"];
+
+/**
+ * Reproduce `loadCatalog`'s real fold for a team member: the frontmatter agent,
+ * then `agentOverrides`, then `applyTeam`.
+ */
+function teamFolded(
+	base: AgentConfig,
+	member: { model?: string; preset?: string },
+	overrides?: Record<string, Partial<AgentConfig>>,
+): AgentConfig {
+	const folded = overrides ? fold(base, overrides) : base;
+	const result = applyTeam(
+		[folded],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: base.name, ...member }] } },
+		},
+		{},
+	);
+	const [first] = result.agents;
+	assert.ok(first, "applyTeam must return the agent");
+	return first;
+}
+
+test("R1: a team member `model` beats subagents.agentOverrides", () => {
+	const folded = teamFolded(
+		agent({}),
+		{ model: "cb/team-model" },
+		{ scout: { model: "cb/override" } },
+	);
+	assert.equal(folded.model, "cb/team-model", "precondition: the fold wins on the agent");
+
+	const settings: StepSettings = {
+		agentOverrides: { scout: { model: "cb/override" } },
+	};
+	const out = resolveStepModel({ agent: folded, step: {}, params: {}, settings });
+	assert.equal(out.resolved.model, "cb/team-model");
+	assert.equal(out.resolved.source?.type, "team");
+});
+
+test("R1: a team member `model` beats agentOverridesByProvider for the parent provider", () => {
+	const settings: StepSettings = {
+		agentOverridesByProvider: { cb: { scout: { model: "cb/scoped" } } },
+	};
+	const folded = teamFolded(agent({}), { model: "cb/team-model" });
+
+	const out = resolveStepModel({
+		agent: folded,
+		step: {},
+		params: {},
+		dispatchModel: "cb/parent-session",
+		settings,
+	});
+	assert.equal(out.resolved.model, "cb/team-model");
+	assert.equal(out.resolved.source?.type, "team");
+});
+
+test("R1: a tool preset still beats a team member `model`", () => {
+	// The new level sits BELOW the preset: a member's `preset` is already level
+	// 2, so its `model` must not outrank a preset chosen for this call.
+	const settings: StepSettings = {
+		presets: { strong: { kind: "pi" as const, model: "cb/preset-model" } },
+	};
+	const folded = teamFolded(agent({}), { model: "cb/team-model" });
+
+	const out = resolveStepModel({
+		agent: folded,
+		step: { preset: "strong" },
+		params: {},
+		settings,
+	});
+	assert.equal(out.resolved.model, "cb/preset-model");
+	assert.equal(out.resolved.source?.type, "preset");
+});
+
+test("R1: a member's `preset` still beats that same member's `model`", () => {
+	// Both fields on ONE member: the preset expands into the agent and reports
+	// level 2, so the member's `model` cannot override it. Pinned so the fold
+	// order can never quietly start letting `model` beat `preset`.
+	const settings: StepSettings = {
+		presets: { cheap: { kind: "pi" as const, model: "cb/preset-model" } },
+	};
+	const folded = teamFolded(agent({}), { model: "cb/team-model", preset: "cheap" });
+
+	const out = resolveStepModel({ agent: folded, step: {}, params: {}, settings });
+	assert.equal(out.resolved.model, "cb/preset-model");
+	assert.equal(out.resolved.source?.type, "preset");
+});
+
+test("R1: a per-run `model` still beats a team member `model`", () => {
+	const settings: StepSettings = {};
+	const folded = teamFolded(agent({}), { model: "cb/team-model" });
+
+	const out = resolveStepModel({
+		agent: folded,
+		step: { model: "cb/per-run" },
+		params: {},
+		settings,
+	});
+	assert.equal(out.resolved.model, "cb/per-run");
+});
+
+test("R1: a team-sourced model is classified as an explicit team member override", () => {
+	const settings: StepSettings = {};
+	const folded = teamFolded(agent({}), { model: "cb/team-model" });
+	const out = resolveStepModel({ agent: folded, step: {}, params: {}, settings });
+
+	const classified = classifyModelOrigin(out.resolved, undefined);
+	assert.equal(classified.origin, "explicit");
+	assert.equal(classified.label, "the team member override");
+	assert.equal(out.modelOrigin, "explicit");
+});
+
+test("R1: a stale team tag is ignored instead of promoting the model", () => {
+	// `modelSource` is provenance for the CURRENT model only. If the two
+	// disagree the tag is stale, and the model counts as frontmatter again —
+	// otherwise a dirty tag would lift an ordinary frontmatter model above
+	// `agentOverrides`.
+	const stale = agent({
+		model: "cb/frontmatter",
+		modelSource: { type: "team", model: "cb/stale-team" },
+	});
+
+	const plain = resolveStepModel({ agent: stale, step: {}, params: {}, settings: {} });
+	assert.equal(plain.resolved.model, "cb/frontmatter");
+	assert.equal(plain.resolved.source?.type, "frontmatter");
+
+	const withOverride = resolveStepModel({
+		agent: stale,
+		step: {},
+		params: {},
+		settings: { agentOverrides: { scout: { model: "cb/override" } } },
+	});
+	assert.equal(withOverride.resolved.model, "cb/override");
+	assert.equal(withOverride.resolved.source?.type, "agentOverrides");
+});
+
+test("R1: a team member `model` still beats subagents.defaultModel", () => {
+	const settings: StepSettings = { defaultModel: "cb/default-model" };
+	const folded = teamFolded(agent({}), { model: "cb/team-model" });
+	const [withDefaults] = applyDefaultModel([folded], settings.defaultModel);
+	assert.ok(withDefaults, "applyDefaultModel must return the agent");
+	assert.equal(withDefaults.model, "cb/team-model");
+	assert.equal(withDefaults.modelSource?.type, "team");
+
+	const out = resolveStepModel({
+		agent: withDefaults,
+		step: {},
+		params: {},
+		settings,
+	});
+	assert.equal(out.resolved.model, "cb/team-model");
+	assert.equal(out.resolved.source?.type, "team");
 });
 
 // ─────────── blank step fields must not shadow the call-level values (D4) ───────────

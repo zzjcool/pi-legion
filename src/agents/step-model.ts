@@ -130,6 +130,11 @@ export function classifyModelOrigin(
 	switch (type) {
 		case "preset":
 			return { origin: "explicit", label: "the preset" };
+		case "team":
+			// A team member's `model` is the operator's explicit pick for this
+			// team, so `modelScope.enforce` may refuse it (unlike an inherited
+			// default, which only warns).
+			return { origin: "explicit", label: "the team member override" };
 		case "agentOverrides":
 			return { origin: "explicit", label: "agentOverrides" };
 		case "frontmatter":

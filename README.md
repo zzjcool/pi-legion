@@ -437,9 +437,11 @@ The `PI_SUBAGENTS_TEAM` environment variable takes precedence over
 is used. Team definitions have a description and an ordered `members` list;
 each member can be a role-name string or an object with an `agent` name and
 per-member overrides. Object member overrides (for example `model` or
-`thinking`) take precedence over those fields in the role card's frontmatter;
-omitted override fields continue to use their normal role/configuration
-values.
+`thinking`) take precedence over those fields in the role card's frontmatter
+and over `subagents.agentOverrides` (including the provider-scoped
+`agentOverridesByProvider`), but lose to a referenced preset and to a `model`
+passed for this call; omitted override fields continue to use their normal
+role/configuration values.
 
 Teams may also set optional `parentContext` / `childContext` (same value forms
 as the global keys, including `@path` and `false`). When the active team

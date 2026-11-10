@@ -1,19 +1,23 @@
 /**
- * Model resolution (design §6.2).
+ * Model resolution (design §6.3).
  *
  * Precedence, strongest first:
  *   1. per-run override
  *   2. preset model (a referenced `subagents.presets.<name>.model`)
- *   3. agentOverridesByProvider.<parentProvider>.<name>.model
- *   4. agentOverrides.<name>.model
- *   5. agent frontmatter `model` (a folded `subagents.defaultModel` also lands
- *      here; `agentModelSource` keeps its inherited label)
- *   6. subagents.defaultModel
- *   7. the dispatching (parent) session model
+ *   3. team member `model` (folded in by `applyTeam`, `modelSource.type = team`)
+ *   4. agentOverridesByProvider.<parentProvider>.<name>.model
+ *   5. agentOverrides.<name>.model
+ *   6. agent frontmatter `model` (a folded `subagents.defaultModel` also lands
+ *      here; `foldedModelSource` keeps its inherited label)
+ *   7. subagents.defaultModel
+ *   8. the dispatching (parent) session model
  *
- * `model: "inherit"` at any of levels 1-4 explicitly selects the parent model.
+ * `model: "inherit"` at any of levels 1-5 explicitly selects the parent model.
  * Level 2 is new: the preset's model is passed in by the caller (which owns
- * preset expansion), so this module stays a pure candidate chain.
+ * preset expansion), so this module stays a pure candidate chain. Level 3 is
+ * new: a team member's `model` and its `preset` belong on the same footing, so
+ * the member's `model` sits directly below the preset level and above every
+ * settings-wide override.
  */
 
 import type {
@@ -67,22 +71,41 @@ function overrideModel(
 }
 
 /**
- * The provenance candidate 5 (the agent's own `model`) reports.
+ * The folded provenance of the agent's own `model`.
  *
- * `applyDefaultModel` folds `subagents.defaultModel` into `agent.model` and
- * records where it came from, so by the time this chain runs the folded default
- * looks like frontmatter. Reporting it as `frontmatter` would let
- * `modelScope.enforce` treat the operator's OWN configured default as a
- * deliberate (`explicit`) choice and refuse it, so a fold that matches the
- * current model keeps its `subagents.defaultModel` identity (which
- * `classifyModelOrigin` maps to `inherited`). A `modelSource` that does not
- * match `agent.model` is stale and is ignored.
+ * Two folds write `agent.model` before this chain runs, and both record where
+ * the value came from — so neither may be reported as plain frontmatter:
+ *
+ *   - `applyTeam` folds a team member's `model` (`"team"`): the member's explicit
+ *     choice, which owns level 3;
+ *   - `applyDefaultModel` folds `subagents.defaultModel`: the operator's OWN
+ *     configured default. Reporting it as `frontmatter` would let
+ *     `modelScope.enforce` treat it as a deliberate (`explicit`) choice and
+ *     refuse it, so it keeps its `inherited` identity.
+ *
+ * A tag whose `model` does not match the current `agent.model` is STALE and is
+ * ignored: a dirty tag must never promote (or demote) a model it no longer
+ * describes.
  */
-function agentModelSource(agent: AgentConfig): ModelSourceInfo["type"] {
+function foldedModelSource(
+	agent: AgentConfig,
+): "team" | "subagents.defaultModel" | "frontmatter" {
 	const source = agent.modelSource;
-	return source?.type === "subagents.defaultModel" && source.model === agent.model
-		? "subagents.defaultModel"
-		: "frontmatter";
+	if (agent.model === undefined || source?.model !== agent.model) {
+		return "frontmatter";
+	}
+	if (source.type === "team") return "team";
+	if (source.type === "subagents.defaultModel") return "subagents.defaultModel";
+	return "frontmatter";
+}
+
+/**
+ * Level 3 value: the team member's folded `model`, only when the tag still
+ * describes it. Returns `undefined` otherwise so an ordinary frontmatter model
+ * is never counted twice (once here and once at its own level).
+ */
+function teamFoldedModel(agent: AgentConfig): string | undefined {
+	return foldedModelSource(agent) === "team" ? agent.model : undefined;
 }
 
 /**
@@ -100,12 +123,14 @@ export function resolveModel(input: ResolveModelInput): ResolvedModel {
 	}> = [
 		{ value: input.override, source: "dispatch" },
 		{ value: input.presetModel, source: "preset" },
+		// Level 3: a team member's own `model`, folded in by `applyTeam`.
+		{ value: teamFoldedModel(input.agent), source: "team" },
 		{
 			value: providerScopedModel(input.settings, input.parentProvider, name),
 			source: "agentOverrides",
 		},
 		{ value: overrideModel(input.settings, name), source: "agentOverrides" },
-		{ value: input.agent.model, source: agentModelSource(input.agent) },
+		{ value: input.agent.model, source: foldedModelSource(input.agent) },
 		{ value: input.defaultModel, source: "subagents.defaultModel" },
 	];
 

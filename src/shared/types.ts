@@ -237,6 +237,10 @@ export interface ModelSourceInfo {
 		| "subagents.defaultModel"
 		| "agentOverrides"
 		| "preset"
+		// A team member's `model`, folded into `agent.model` by `applyTeam`. It owns
+		// its own precedence level: above the settings-wide `agentOverrides` and
+		// below a preset (design §6.3 level 3).
+		| "team"
 		| "frontmatter"
 		| "dispatch"
 		| "inherit";

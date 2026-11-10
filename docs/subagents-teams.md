@@ -88,9 +88,11 @@ Notes on the examples:
 Each team's `description` and `members` shape follows
 `subagents.teams.<name>`. Member objects apply their own `model` and
 `thinking` values to that role in this team; those values override the same
-fields in the role card's frontmatter. Omitted member override fields continue
-to use the role card/configuration defaults. The string `"centurion"` is a
-plain roster entry with no member-level override.
+fields in the role card's frontmatter **and** `subagents.agentOverrides`
+(including the provider-scoped `agentOverridesByProvider`), but lose to a
+referenced preset and to a `model` passed for this call. Omitted member
+override fields continue to use the role card/configuration defaults. The
+string `"centurion"` is a plain roster entry with no member-level override.
 
 To make one team the settings default, add a sibling `"team": "be-value"`
 under `"subagents"`. `PI_SUBAGENTS_TEAM` takes precedence over that configured

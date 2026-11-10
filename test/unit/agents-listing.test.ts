@@ -598,6 +598,32 @@ test("command: settings flow through — override model + disableBuiltins", asyn
 	);
 });
 
+test("command: a team member `model` shows the team override label", async () => {
+	// The listing drives the real loadCatalog → applyTeam → resolveStepModel →
+	// classifyModelOrigin path, so the label is the launch path's own verdict:
+	// a team member's model must read as the member override, not frontmatter.
+	await withSandbox(
+		{
+			settings: {
+				disableBuiltins: true,
+				team: "value",
+				teams: {
+					value: { members: [{ agent: "search", model: "cb/glm-5.3" }] },
+				},
+			},
+			extraAgents: {
+				"search.md": "---\nname: search\ndescription: s\n---\np",
+			},
+		},
+		async ({ pi, projectRoot }) => {
+			const text = await invoke(pi, "", projectRoot);
+			assert.ok(text);
+			assert.match(text, /Active team: value/);
+			assert.match(text, /model: cb\/glm-5\.3 \(the team member override\)/);
+		},
+	);
+});
+
 test("command: no roles at all → helpful empty state", async () => {
 	await withSandbox(
 		{ settings: { disableBuiltins: true } },

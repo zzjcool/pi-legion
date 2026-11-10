@@ -165,6 +165,104 @@ test("teams: star expands each role once and later object overrides win", () => 
 	assert.deepEqual(result.warnings, []);
 });
 
+// ─────────── D1: a member `model` carries team provenance ───────────
+// Reason: the folded `model` alone is indistinguishable from frontmatter, and
+// the precedence chain re-reads `agentOverrides` BELOW the preset level. The
+// tag is what lets candidate 3 promote a team member's own choice above those
+// settings-wide overrides (design §6.3 level 3).
+
+test("teams: a member `model` is tagged with team provenance", () => {
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: "worker", model: "cb/team-model" }] } },
+		},
+		{},
+	);
+	const folded = result.agents[0];
+	assert.ok(folded);
+	assert.equal(folded.model, "cb/team-model");
+	assert.deepEqual(folded.modelSource, { type: "team", model: "cb/team-model" });
+});
+
+test("teams: the `inherit` sentinel is tagged verbatim", () => {
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: "worker", model: "inherit" }] } },
+		},
+		{},
+	);
+	assert.deepEqual(result.agents[0]?.modelSource, {
+		type: "team",
+		model: "inherit",
+	});
+});
+
+test("teams: a plain string member is not tagged as a team model", () => {
+	const result = applyTeam(
+		[agent("worker", { model: "cb/frontmatter" })],
+		{ team: "cheap", teams: { cheap: { members: ["worker"] } } },
+		{},
+	);
+	assert.equal(result.agents[0]?.model, "cb/frontmatter");
+	assert.equal(result.agents[0]?.modelSource, undefined);
+});
+
+test("teams: a member that only sets `preset` is not tagged as a team model", () => {
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: "worker", preset: "cheap" }] } },
+		},
+		{},
+	);
+	assert.equal(result.agents[0]?.preset, "cheap");
+	assert.equal(result.agents[0]?.modelSource, undefined);
+});
+
+test("teams: a blank member `model` is not tagged", () => {
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: "worker", model: "   " }] } },
+		},
+		{},
+	);
+	assert.equal(result.agents[0]?.modelSource, undefined);
+});
+
+test("teams: a later member without `model` keeps the earlier team tag", () => {
+	// The tag is provenance for the CURRENT `model`. A following member that
+	// touches another field must not erase it, or the fold loses its identity
+	// and the model silently drops back below `agentOverrides`.
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: {
+				cheap: {
+					members: [
+						{ agent: "worker", model: "cb/team-model" },
+						{ agent: "worker", thinking: "high" },
+					],
+				},
+			},
+		},
+		{},
+	);
+	assert.equal(result.agents[0]?.model, "cb/team-model");
+	assert.equal(result.agents[0]?.thinking, "high");
+	assert.deepEqual(result.agents[0]?.modelSource, {
+		type: "team",
+		model: "cb/team-model",
+	});
+});
+
 test("teams: a later member or star restores a role removed by disabled", () => {
 	const agents = [agent("worker"), agent("reviewer")];
 	const afterExplicitMention = applyTeam(

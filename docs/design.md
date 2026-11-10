@@ -380,22 +380,24 @@ frontmatter 走**严格字段表**：`AGENT_FRONTMATTER_FIELDS`（`src/agents/ag
 | --- | --- | --- | --- |
 | 1 | 本次调用传入的 `model`（`model:` / `tasks[].model`） | `dispatch` | `explicit` |
 | 2 | 被引用 preset 的 model（`subagents.presets.<name>.model`） | `preset` | `explicit` |
-| 3 | `subagents.agentOverridesByProvider.<父 provider>.<role>.model`（**此级只作用于 `model`**；`thinking` / `preset` / `disabled` 等其余字段在本级不生效，请用第 4 级 `agentOverrides` 配） | `agentOverrides` | `explicit` |
-| 4 | `subagents.agentOverrides.<role>.model` | `agentOverrides` | `explicit` |
-| 5 | 角色卡 frontmatter `model`（含被折叠进来的 `subagents.defaultModel`） | `frontmatter` / `subagents.defaultModel` | 前者 `explicit`，后者 `inherited` |
-| 6 | `subagents.defaultModel` | `subagents.defaultModel` | `inherited` |
-| 7 | 派发方（父会话）当前的 model | `dispatch` | `inherited` |
+| 3 | 当前 team 的 member override `model`（`subagents.teams.<name>.members[].model`；`applyTeam` 折进 `agent.model` 并写 `modelSource.type = "team"`） | `team` | `explicit` |
+| 4 | `subagents.agentOverridesByProvider.<父 provider>.<role>.model`（**此级只作用于 `model`**；`thinking` / `preset` / `disabled` 等其余字段在本级不生效，请用第 5 级 `agentOverrides` 配） | `agentOverrides` | `explicit` |
+| 5 | `subagents.agentOverrides.<role>.model` | `agentOverrides` | `explicit` |
+| 6 | 角色卡 frontmatter `model`（含被折叠进来的 `subagents.defaultModel`） | `frontmatter` / `subagents.defaultModel` | 前者 `explicit`，后者 `inherited` |
+| 7 | `subagents.defaultModel` | `subagents.defaultModel` | `inherited` |
+| 8 | 派发方（父会话）当前的 model | `dispatch` | `inherited` |
 
 口径（与代码一一对应）：
 
 - **per-run model 是最高级**：调用方传的 `model:` 就是本次运行的选择，任何配置都不能覆盖它。
 - **preset 是原子的**：`kind` / `model` / `thinking` 出自同一个 preset 对象，不会出现"A 的 model 配 B 的 thinking"；引用不存在的 preset 是错误，不回退到派发 model（`expandPreset` / `requirePreset`）。
+- **team member 的 `model` 与它的 `preset` 同级**：team member 的 `preset` 已经走第 2 级，同一个 member 的 `model` 若屈居第 6 级就变成"两个字段不同级、不自洽"；而且"本次选了哪支队伍"比"全局按角色钉死"更具体。因此 `applyTeam` 在折叠 member `model` 时给它打 `modelSource: { type: "team", model }`，候选链据此在第 3 级单独认它，**压过 `subagents.agentOverrides` 与 provider 作用域 override，输给 preset 与本次调用的 `model`**。tag 只在成员 `model` 为非空白字符串时打（纯字符串成员、只给 `preset` 的成员都不打），且 `modelSource.model !== agent.model` 的陈旧 tag 一律忽略（按 frontmatter 处理），否则脏 tag 会把普通 model 非法抬到第 3 级。
 - **空白字段不算选择**：`tasks[].model` / `tasks[].preset` 为空白串时让位给顶层 `model` / `preset`，传给候选链的是 trim 后的值（`resolveStepModel`，`src/agents/step-model.ts`）。
 - **`inherit` 哨兵**：任一候选值等于 `inherit` 时解析为父会话的 model，判源 `inherited`。
 - **判源决定 `modelScope.enforce` 的力度**（`checkModelScope`，`src/agents/model-scope.ts`）：`explicit` → `error`，拒绝启动并打一行 `✗`；`inherited` → `warn`，打一行 `⚠` 后**照常启动**。判源由 `classifyModelOrigin`（`src/agents/step-model.ts`）唯一给出，launch 与 utility（vexillatio）两条路径都传真实 origin，不再硬编码。
-- **折叠后的默认模型保持 inherited 身份**：`applyDefaultModel` 把 `subagents.defaultModel` 折进 `agent.model` 并写 `agent.modelSource`；候选 5 只在 `modelSource.model === agent.model` 时把它报成 `subagents.defaultModel`，否则按 frontmatter 处理。否则"配置的默认 model"会被当成显式违规拒掉。
+- **折叠后的默认模型保持 inherited 身份**：`applyDefaultModel` 把 `subagents.defaultModel` 折进 `agent.model` 并写 `agent.modelSource`；第 6 级只在 `modelSource.model === agent.model` 时把它报成 `subagents.defaultModel`，否则按 frontmatter 处理。否则"配置的默认 model"会被当成显式违规拒掉。
 - **`continue` / `resume`**：本次调用显式传 `model` 用它，否则沿用 `ChildRecord.model`；`preset` 不在 revive 上展开，子会话沿用它被持久化的 model。
-- **provider 作用域**：第 3 级的 key 是"父会话的 provider"（`providerOf(dispatchModel)`），因此同一份角色配置可以按 provider 各写一套；user/project 两层设置按 provider 深合并（`resolveSubagentSettings`），不是整张表替换。该级**只认 `model`**：其余字段在本级不生效（用 `agentOverrides` 配），`model` 不是非空字符串时在解析期就报错（`parseAgentOverridesByProvider`，报错文案带 `agentOverridesByProvider.<provider>.<role>.model` 完整点路径），不留"看着配了、实际静默失效"的配置。
+- **provider 作用域**：第 4 级的 key 是"父会话的 provider"（`providerOf(dispatchModel)`），因此同一份角色配置可以按 provider 各写一套；user/project 两层设置按 provider 深合并（`resolveSubagentSettings`），不是整张表替换。该级**只认 `model`**：其余字段在本级不生效（用 `agentOverrides` 配），`model` 不是非空字符串时在解析期就报错（`parseAgentOverridesByProvider`，报错文案带 `agentOverridesByProvider.<provider>.<role>.model` 完整点路径），不留"看着配了、实际静默失效"的配置。
 
 ---
 
