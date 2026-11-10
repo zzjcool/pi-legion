@@ -62,6 +62,7 @@ import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.t
 import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
+import { artifactById, markRead } from "./src/legion/ledger.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
 import { type ExecutionStatus, type LegionSettings } from "./src/shared/types.ts";
@@ -2403,10 +2404,15 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					legion: activeLegion,
 					...(activeLegion ? { postman: activeLegion.postman } : {}),
 				});
-				if (signal?.aborted && action !== "stop") {
-					return interruptedControlResult({ result, runtime, legion: activeLegion });
-				}
-				return result;
+				// P4a/D3b: one gate for both the abort net and the read-side ledger write —
+				// `stop` keeps its pre-existing exemption (it is not a turn-ending bail), so a
+				// stop's result is delivered and settled like any other.
+				return settleControlResult({
+					result,
+					runtime,
+					...(activeLegion ? { legion: activeLegion } : {}),
+					aborted: signal?.aborted === true && action !== "stop",
+				});
 			}
 
 			const result = await launchFamily({
@@ -2642,6 +2648,114 @@ export function loadCatalog(
  */
 function mailSeamOf(legion: OrchestratorLegionContext | undefined): MailReleaseSeam | undefined {
 	return legion ? { db: legion.db, nodeId: legion.nodeId } : undefined;
+}
+
+/**
+ * The READ-side ledger target (`result-ledger-v1.md` §3 D3, P4a): the connection a
+ * delivery is recorded in, and the CONSUMER whose row it advances.
+ */
+interface LedgerReadSeam {
+	db: DatabaseSync;
+	consumerId: string;
+}
+
+/**
+ * `consumerId` is this session's own node id — `ownLegionIdentity()?.nodeId`, and a
+ * root's id is literally `"root"`.
+ *
+ * Taken off the identity THIS call resolved and adopted (`activeLegion`), which is the
+ * SAME object the orchestrator receives as its legion context, so `consumerId` cannot
+ * disagree with the `artifacts.parent_id` the writer recorded
+ * (`recordArtifactRow` → `parentId: legion.nodeId`) — the two halves the projection
+ * joins on.
+ *
+ * `undefined` = this call has no legion identity. That case needs no special handling
+ * downstream: without a context the orchestrator writes no artifact row either, so the
+ * snapshot carries no `artifactId` and there is nothing to record (D3).
+ */
+function ledgerReadSeamOf(
+	legion: OrchestratorLegionContext | undefined,
+): LedgerReadSeam | undefined {
+	return legion ? { db: legion.db, consumerId: legion.nodeId } : undefined;
+}
+
+/**
+ * The `details` key a control handler uses to DEFER its read-side writes
+ * (`result-ledger-v1.md` §3 D3b).
+ *
+ * A handler does not write the ledger: it can only say "if this text reaches the
+ * parent, these artifacts were read in full". The write happens in
+ * `settleControlResult`, which is the first place that knows the answer (`§6` P4a).
+ */
+const LEDGER_READS_DETAIL = "ledgerReads";
+
+/**
+ * Mount the deferred ids on a tool result's `details`, or nothing at all when there is
+ * no artifact identity to name (empty turn, failed artifact write, an older result, a
+ * running snapshot: §3 D3).
+ *
+ * `details` never affects the rendered text, so this cannot change what the model reads
+ * — the same reason `#352`'s `waitClaims` lives there.
+ */
+function ledgerReadsDetails(
+	artifactIds: ReadonlyArray<string | undefined>,
+): Record<string, unknown> {
+	const ids = artifactIds.filter((id): id is string => id !== undefined);
+	return ids.length === 0 ? {} : { [LEDGER_READS_DETAIL]: ids };
+}
+
+/**
+ * Record that the artifact with this id has reached its consumer (§3 D3, P4a).
+ *
+ * Every condition below answers with silence, which is the direction D3 chose on
+ * purpose (a missing fact can cost one redundant notice; a wrong one costs the result
+ * itself):
+ *
+ * - no seam: not a legion node, so there is no ledger;
+ * - no `artifacts` row for that id: the id names nothing, and a snapshot's
+ *   `output.length` is CHARACTERS, not the bytes the projection compares `read_bytes`
+ *   against (inventing a number there would flip "read half" into "read all");
+ * - never throws (D1e): a closed or refusing database is a diagnostic failure, and the
+ *   tool's answer must come out identical with or without it.
+ *
+ * `bytesRead` is the artifact's WHOLE body, not what the renderer showed: `collect` and
+ * `wait` hand the text over verbatim (D6's "read to EOF" is satisfied by construction).
+ * `read_bytes` is a high-water mark (`markRead`'s `max()`), so a second delivery of the
+ * same artifact — a re-`wait` on the finished cache — moves nothing. `notified_at` is
+ * left untouched: P4a is the read side only.
+ */
+function markDelivered(seam: LedgerReadSeam | undefined, artifactId: string): void {
+	if (!seam) return;
+	try {
+		const artifact = artifactById(seam.db, artifactId);
+		if (!artifact) return;
+		markRead(seam.db, {
+			artifactId,
+			consumerId: seam.consumerId,
+			bytesRead: artifact.bytes,
+			at: Date.now(),
+		});
+	} catch {
+		// D1e: a ledger write is a fact ABOUT the delivery, never a condition OF it.
+	}
+}
+
+/**
+ * Settle a control result's DEFERRED read-side writes (`§3 D3b`) — the only caller of
+ * {@link markDelivered}.
+ *
+ * Called after the handler returned and after every bail the handler could see, from
+ * `settleControlResult` (the tool layer). A result with no `ledgerReads` — every bail,
+ * every `interrupted …`, every mail preempt, every result without an artifact id —
+ * records nothing.
+ */
+function markLedgerReads(seam: LedgerReadSeam | undefined, details: unknown): void {
+	if (!seam || details === null || typeof details !== "object") return;
+	const ids = (details as Record<string, unknown>)[LEDGER_READS_DETAIL];
+	if (!Array.isArray(ids)) return;
+	for (const id of ids) {
+		if (typeof id === "string") markDelivered(seam, id);
+	}
 }
 
 /**
@@ -3314,6 +3428,22 @@ export async function collectChild(
 	 */
 	mail?: MailReleaseSeam,
 ): Promise<AgentToolResult<unknown>> {
+	/**
+	 * P4a (`result-ledger-v1.md` §3 D3/D3b): the ONE way a snapshot becomes this tool's
+	 * answer, so "delivered ⇒ declared read" cannot drift from "rendered".
+	 *
+	 * Every `return` that hands the parent a terminal snapshot goes through here, and
+	 * every bail returns BEFORE it (`signal?.aborted` / the mail preempt that drops the
+	 * snapshot / the `persistChild` throw) — the bail needs no rollback API because it
+	 * never declared anything.
+	 *
+	 * The declaration is NOT the write: the id travels out in `details.ledgerReads` and is
+	 * settled by `settleControlResult`, because only THAT layer knows whether the text
+	 * actually reached the parent (the abort net can still replace this whole result).
+	 */
+	const deliver = (snapshot: CollectSnapshot): AgentToolResult<unknown> => {
+		return ok(renderCollect(ctx.name, snapshot), ledgerReadsDetails([snapshot.artifactId]));
+	};
 	let stopPolling: (() => void) | undefined;
 	// #384 review round 3: same hold as `wait` — this node's postman stays off its inbox
 	// for the whole collect (entry check, interruptible seam and orchestrator fallback
@@ -3384,7 +3514,7 @@ export async function collectChild(
 					}
 					return mailPreemptedCollect(ctx.name, released);
 				}
-				if (collected) return ok(renderCollect(ctx.name, collected.snapshot));
+				if (collected) return deliver(collected.snapshot);
 			}
 			if (!collected || signal?.aborted) {
 				if (collected) {
@@ -3400,11 +3530,11 @@ export async function collectChild(
 				ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
 				throw error;
 			}
-			return ok(renderCollect(ctx.name, collected.snapshot));
+			return deliver(collected.snapshot);
 		}
 
 		const cached = ctx.orchestrator.cachedCollect(ctx.name);
-		if (cached) return ok(renderCollect(ctx.name, cached));
+		if (cached) return deliver(cached);
 
 		const agentDef = findControlAgent(
 			ctx.agents,
@@ -3432,7 +3562,7 @@ export async function collectChild(
 			// row first), but this collect DID get a snapshot — including the child's
 			// output so far. Answering with `interrupted …` would blame the parent turn
 			// for something that never happened, so the snapshot is what goes out.
-			return ok(renderCollect(ctx.name, collected));
+			return deliver(collected);
 		}
 		if (signal?.aborted || collected.execution.reason === "aborted by parent") {
 			return ok("interrupted (parent turn ended; children still running)");
@@ -3446,7 +3576,7 @@ export async function collectChild(
 		// Only release a job that IS the node just collected. Releasing by name alone
 		// would drop the tracking of a still-live same-named child in another run.
 		if (!foreignJob) ctx.runtime.release(ctx.name);
-		return ok(renderCollect(ctx.name, collected));
+		return deliver(collected);
 	} catch (error) {
 		return fail(`collect failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
 	} finally {
@@ -5974,6 +6104,42 @@ export async function interruptedControlResult(input: {
 	return ok("interrupted (parent turn ended; children still running)");
 }
 
+/**
+ * The LAST decision point before a control tool's result reaches the parent
+ * (`result-ledger-v1.md` §3 D3b) — and therefore the only place the read-side ledger
+ * write may happen.
+ *
+ * P4a first put `markRead` inside the handlers, which was wrong by one layer: the abort
+ * net below is not a handler bail. `interruptedControlResult` replaces the ENTIRE result
+ * with the frozen `interrupted …` line when the caller's turn ended, so a read already
+ * recorded there would make `undelivered` (D4) drop the notice for text the parent never
+ * saw — the silent loss this whole refactor exists to remove, in its most dangerous
+ * direction. D3b's ruling: the handlers only DECLARE (`details.ledgerReads`), this
+ * function decides.
+ *
+ * `aborted` is the caller's verdict (`signal?.aborted`, with the pre-existing `stop`
+ * exemption applied by the caller). Replaced results keep nothing:
+ * `interruptedControlResult` releases the wait claims and re-queues the mail it carried,
+ * and the artifact ids go with the text — no row was ever written, so there is nothing
+ * to roll back and nothing that can suppress a notice.
+ */
+export async function settleControlResult(input: {
+	result: AgentToolResult<unknown>;
+	runtime: SessionRuntime;
+	legion?: OrchestratorLegionContext;
+	aborted: boolean;
+}): Promise<AgentToolResult<unknown>> {
+	if (input.aborted) {
+		return interruptedControlResult({
+			result: input.result,
+			runtime: input.runtime,
+			...(input.legion ? { legion: input.legion } : {}),
+		});
+	}
+	markLedgerReads(ledgerReadSeamOf(input.legion), input.result.details);
+	return input.result;
+}
+
 /** Re-enqueue the mail a discarded (`state: "mail"`) result was carrying. */
 function redeliverPreemptedMail(
 	legion: OrchestratorLegionContext | undefined,
@@ -6268,13 +6434,24 @@ export async function waitAction(input: {
 			});
 		}
 	}
+	// P4a (§3 D3/D3b): every terminal snapshot this wait is about to hand over —
+	// `renderWait` renders each of them verbatim — DECLARES its artifact read here; the
+	// write itself happens in `settleControlResult`, after the tool layer has decided the
+	// text really goes out.
+	//
+	// This includes the finished-cache probe path: the probe only CLAIMS the cached
+	// result; the snapshot the parent actually reads is the one in `results`. It excludes
+	// the two answers that carry no delivery — the `interrupted …` entries (they have no
+	// snapshot at all) and the mail preempt above, which is a cut-short call whose answer
+	// the tool layer's abort net may still discard in full.
+	const ledgerReads = ledgerReadsDetails(results.map((result) => result.snapshot?.artifactId));
 	const text = renderWait(results);
 	const timeoutDetails = buildWaitTimeoutDetails(results);
 	// #352: `details.waitClaims` is the only record of what this call took — the tool
 	// layer's abort net replaces the rendered result with the frozen `interrupted …`
 	// line, and without this the claim it leaves behind suppresses that round's notice
 	// forever (see `withWaitClaims`).
-	const details: Record<string, unknown> = timeoutDetails ? { ...timeoutDetails } : {};
+	const details: Record<string, unknown> = { ...(timeoutDetails ?? {}), ...ledgerReads };
 	return {
 		content: [{ type: "text", text }],
 		details: withWaitClaims(details, claims, claimsPending),

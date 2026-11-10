@@ -164,8 +164,27 @@ CREATE TABLE consumptions (
 ### D3 — 消费只由「真实交付」推进，且由**工具层**推进
 
 - runtime 返回 `{ snapshot, artifactId }`，**不**置位；`collectChild` / `waitAction` 在 `return ok(...)` 的**前一行**调 `ledger.markRead({artifactId, consumerId, bytesRead: bytes, at})`（全文读完 ⇒ 高水位持平 `bytes`）。
+- `consumerId` = `ownLegionIdentity()?.nodeId`（root 就是 `"root"`）；`bytes` 取自 `artifactById(db, artifactId).bytes`（不重读文件）。
+- **落账必须在所有 bail 判定之后**：`signal?.aborted` / `persistChild` 抛错 / `interrupted …` 分支都不落账 —— 这就是「不要回滚 API」的实现方式。
+- `artifactId` 缺失（无 legion 上下文 / 空输出 / 写盘失败 / 老产物）→ **不落账**，宁可多推一条通知，不可静默丢。
+- 落账的**位置**由 D3b 修订：handler 只声明 `details.ledgerReads`，真正写账在 abort net 之后。
 - 依据：父 turn 不可能在工具 handler 中途结束，所以「交付完成 ⇒ 已经落账」在本进程内是同步成立的；顺带**整类删除** bail 回滚（`unclaimUndelivered` + `claimedNow`「证据不是借条」，`notice-claim-v1.md` #320/#352）。
 - 被否决：在 runtime 缝里 claim（今天形状）—— 那是 #320/#352 两个 patch 的成因。
+
+### D3b — 落账点在 abort net **之后**（修正 D3 的「handler 的 return 前一行」）
+
+P4a 交付时发现 D3 的假设在一个地方是错的：`interruptedControlResult`（工具层 abort net）在 handler 返回**之后**
+才决定把整条结果替换成 `interrupted (parent turn ended; children still running)`。若在 handler 里已 `markRead`，
+ledger 会认为父已读全 → 通知被抑制，而父从未看到那份结果 —— **正好是这次重构要消灭的静默丢结果**。
+
+冻结：
+
+- handler **只声明**：返回 `ok(text, details)` 时在 `details.ledgerReads` 里列出本次真正交付的 artifactId；
+  无 id 时**键整个不出现**（绝不给空数组）。
+- **唯一写点**：`settleControlResult`（工具层收口，位于 abort 决策之后）。被替换成 `interrupted …` 时 ids 直接丢弃 → 不落账 →
+  artifact 仍在 `undelivered` → 通知路仍然开（宁多推，不静默丢）。
+- handler 侧**不持有 ledger seam**：结构上让「在 handler 里写账本」这个旧形状写不出来。
+- `stop` 豁免 abort net 的既有语义不变。
 
 ### D4 — 通知是投影，没有 filter / claim / bail
 
@@ -295,9 +314,11 @@ legion_output({ name, round?, offset?, limit? })
 | P0 | 本契约冻结 + 裁决记录（§12） | `docs/contracts/result-ledger-v1.md` | 人工 ✓ |
 | P1 | schema v3 + ledger store（纯函数 + 读写 API，无消费者） | `src/legion/db.ts`、`src/legion/ledger.ts`（新）、`src/legion/rebuild.ts`、sentinel 测试、`docs/legion-v2-contract.md` | typecheck + test |
 | P2 | artifact store + 写入路径（含原子写、路径含 round） | `src/runs/artifacts.ts`（新）、`src/runs/orchestrator.ts` | typecheck + test + integration |
-| P3 | 瘦身 shadow：老 claim 与新 ledger 双算，分歧只写 stderr（`PI_LEGION_LEDGER_SHADOW=1`），P4 连同老机制一起删 | `src/extension/runtime.ts`、`src/runs/orchestrator.ts` | 同上 + 真跑 5 会话 |
-| P4 | 通知投影化 + **一次性删除** claim 三件套 / `join` 缓冲 / finished strip | `src/extension/runtime.ts`、`src/extension/join.ts`、`src/extension/notify.ts`、`src/api.ts` | 同上 + mock-llm |
-| P5 | `legion_output` + path 索引 hook + collect 走 artifact | `index.ts`、`src/extension/ledger-hook.ts`（新）、`src/extension/notify.ts` | 同上 + 全量 |
+| P3 | 瘦身 shadow：老 claim 与新 ledger 双算，分歧只写 stderr（`PI_LEGION_LEDGER_SHADOW=1`），P4 连同老机制一起删 | `src/extension/runtime.ts`、`src/runs/orchestrator.ts` | 同上 + mock-llm e2e |
+| **P4a** | **读侧落账**（D3）：`collectChild` / `waitAction` 在 bail 判定之后 `markRead`；无 artifactId 不落账 | `index.ts` | typecheck + test + integration |
+| **P4b** | **投递改投影**（D4）：`deliverBatch` 的判据从 `isReported` 换成 `undelivered`；发送成功后 `markNotified`；无 artifactId 的条目走一个最小 `deliveredOnce` 集（无回滚语义） | `src/extension/runtime.ts`、`src/extension/notify.ts` | 同上 + mock-llm |
+| **P4c** | **一次性删除** claim 三件套 / `snapshotOrigins` / `consumedByTool`/`notified` 闸门 / `join` 缓冲 + `dropBuffered*` / shadow 模块 / `src/api.ts` 的 `ClaimedCollect` | `src/extension/runtime.ts`、`src/extension/join.ts`、`src/api.ts`、`test/unit/runtime.test.ts`、`test/unit/join.test.ts` | 同上 + mock-llm |
+| P5 | `legion_output` + path 索引 hook + collect 走 artifact + **finished strip/rehydrate 删除**（从 P4 搬来：它与投影无耦合，单独一步更好审） | `index.ts`、`src/extension/ledger-hook.ts`（新）、`src/extension/runtime.ts`、`src/extension/notify.ts` | 同上 + 全量 |
 
 ---
 
@@ -371,6 +392,8 @@ legion_output({ name, round?, offset?, limit? })
 | 2026-11-10 | v1.5 FROZEN | P2 交付后纠正两处：① D1a 改为 `max(ledger, 磁盘)+1`（只看 ledger 会在库被重置时覆盖已有 artifact，违反 A1）；② D1d 的 `id` 与路径段一律用 sanitize 后的段、`name` 列存原始值（否则与 rebuild 按目录名反推的 id 不收敛）。 |
 | 2026-11-10 | v1.6 FROZEN | P2 复审前补 D10 的不对称裁决：rebuild 后 `artifacts.name` 为 sanitize 段；P5 拼 id 必须用 `artifactNameSegment`，禁止按 `name` 列过滤。 |
 | 2026-11-10 | v1.7 FROZEN | P3 交付后改 D11：新侧用 `undelivered`（等价于 `reported`）而非 `hasRead`；退出条件拆方向（`old=deliver ledger=suppress` 必须为 0，反向在 P3 必现且预期）；真机需 `index.ts` 接 `getLedgerShadowFacts`。 |
+| 2026-11-10 | v1.8 FROZEN | P4 拆成 a/b/c 三步（读侧落账 → 投递改投影 → 一次性删除），finished strip 移到 P5；D3 补 bail 顺序、consumerId 取法、artifactId 缺失时不落账。 |
+| 2026-11-10 | v1.9 FROZEN | P4a 交付时新增 **D3b**：落账从 handler 挪到 abort net 之后（handler 只声明 `details.ledgerReads`，唯一写点是 `settleControlResult`）。原因：abort net 会把已落账的结果整条替换成 `interrupted …`，造成静默丢结果。 |
 
 ## 12. 裁决记录
 
