@@ -327,13 +327,94 @@ test("formatWidgetLines t/s uses generationMs not wall clock / finishedAt", () =
 	assert.match(lines[1] ?? "", /· 200 avg t\/s$/);
 });
 
-test("formatWidgetLines omits throughput without generationMs but keeps token headline", () => {
+test("formatWidgetLines t/s prefers the measured decodeMs over generationMs (tps-decode D7)", () => {
+	const lines = formatWidgetLines(
+		[{
+			name: "worker-0",
+			agent: "worker",
+			state: "running",
+			startedAt: 0,
+			tokensTotal: 1_000,
+			tokensOut: 400,
+			// The contract's measured shape: one 400-token message really decoded
+			// for 1s while the request took 5s (≈4.3s fixed cost + decode).
+			generationMs: 5_000,
+			decodeMs: 1_000,
+		}],
+		6_000,
+	);
+	// 400 / 1s = 400 avg t/s. On generationMs it would read 80 — a 5x understatement.
+	assert.match(lines[1] ?? "", /· 400 avg t\/s$/);
+	assert.doesNotMatch(lines[1] ?? "", /80 avg t\/s/);
+});
+
+test("formatWidgetLines t/s falls back to generationMs when decodeMs is absent or 0", () => {
+	// Absent = nobody measured this row (a legacy/restored row, a backend that
+	// cannot answer). Zero = a measured "no decoding yet". Both keep the old
+	// denominator instead of rendering 0 t/s or dividing by zero.
+	for (const decodeMs of [undefined, 0]) {
+		const lines = formatWidgetLines(
+			[{
+				name: "worker-0",
+				agent: "worker",
+				state: "working",
+				startedAt: 0,
+				tokensTotal: 1_200,
+				tokensOut: 600,
+				generationMs: 2_000,
+				...(decodeMs === undefined ? {} : { decodeMs }),
+			}],
+			5_000,
+		);
+		assert.match(lines[1] ?? "", /· 300 avg t\/s$/, `decodeMs=${String(decodeMs)} must fall back to generationMs`);
+	}
+});
+
+test("formatWidgetLines omits throughput only when NEITHER denominator exists", () => {
+	// No generationMs and no decodeMs → nothing to divide by.
 	const lines = formatWidgetLines(
 		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 800, tokensOut: 400 }],
 		5_000,
 	);
 	assert.match(lines[0] ?? "", /· 800 tok$/);
 	assert.doesNotMatch(lines[1] ?? "", /t\/s/);
+
+	// decodeMs alone is enough (D7): the measured denominator no longer depends on
+	// the session's generationMs being available.
+	const measuredOnly = formatWidgetLines(
+		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 800, tokensOut: 400, decodeMs: 2_000 }],
+		5_000,
+	);
+	assert.match(measuredOnly[1] ?? "", /· 200 avg t\/s$/);
+
+	// Each axis has its OWN trust floor (D7-b): the generation axis keeps 1s (its
+	// values are seconds), the decode axis floors at 200ms because a measured decode
+	// is smaller by the ≈4.3s per-request cost — a flat 1s gate would delete the
+	// label for every short message.
+	for (const entry of [
+		{ generationMs: 999 },
+		{ decodeMs: 199 },
+	] as const) {
+		const small = formatWidgetLines(
+			[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 800, tokensOut: 400, ...entry }],
+			5_000,
+		);
+		assert.doesNotMatch(small[1] ?? "", /t\/s/, `${JSON.stringify(entry)} must stay unlabelled`);
+	}
+	// The regression D7-b exists for: one 60-token message, 438ms of real decoding.
+	// Rejected by a 1s gate (the row would show NOTHING), labelled at the decode floor
+	// — and 137 tok/s, not the 13 the request-inclusive 4730ms would have shown.
+	const shortMessage = formatWidgetLines(
+		[{ name: "worker-0", agent: "worker", state: "settled", startedAt: 0, tokensTotal: 1_000, tokensOut: 60, generationMs: 4_730, decodeMs: 438 }],
+		5_000,
+	);
+	assert.match(shortMessage[1] ?? "", /· 137 avg t\/s$/, "a single short message must keep its label");
+	// Same row without a measurement keeps the old denominator and its 13 tok/s.
+	const shortMessageGenOnly = formatWidgetLines(
+		[{ name: "worker-0", agent: "worker", state: "settled", startedAt: 0, tokensTotal: 1_000, tokensOut: 60, generationMs: 4_730 }],
+		5_000,
+	);
+	assert.match(shortMessageGenOnly[1] ?? "", /· 13 avg t\/s$/, "the generation axis keeps its own floor and number");
 });
 
 test("formatWidgetLines appends a session-wide tree overview when totals are supplied", () => {

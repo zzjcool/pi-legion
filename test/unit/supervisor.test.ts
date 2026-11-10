@@ -37,6 +37,7 @@ import type {
 import { currentPgid } from "../../src/supervisor/proc-tree.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
+import { InProcessSupervisor, type InProcessSession } from "../../src/supervisor/inprocess-supervisor.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import {
 	discoveredHostExtensions,
@@ -965,6 +966,406 @@ test("stall-notice D2 rpc: the event age rides the RPC stream already consumed",
 	} finally {
 		await h.supervisor.retire("root.worker").catch(() => {});
 		h.close();
+	}
+});
+
+/**
+ * tps-decode-denominator-v1 (contract `docs/contracts/tps-decode-denominator-v1.md`).
+ *
+ * The denominator these tests guard is `decodeMs` — the measured first-delta →
+ * last-delta wall clock — and the reason it cannot be `durationMs` is in the
+ * fixture: the fake message reports 12s of request while its deltas span ~160ms.
+ * A regression back to `durationMs` therefore fails on the magnitude, not on a
+ * missing field.
+ */
+const decodeMessageUpdate = (type: string, delta?: string) => ({
+	type: "message_update",
+	assistantMessageEvent: { type, contentIndex: 0, ...(delta === undefined ? {} : { delta }) },
+});
+const decodeMessageEnd = (durationMs: number) => ({ type: "message_end", message: { role: "assistant", durationMs } });
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("tps-decode D1/D2 rpc: decodeMs measures the delta span, not the request's durationMs", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const client = h.clients[0]!;
+		// A registered child has a seed from its transcript (0 for a fresh spawn):
+		// that is a measured zero, not the absence of a fact. An unregistered name
+		// is the absence of a fact.
+		assert.equal(h.supervisor.decodeMs("root.worker"), 0);
+		assert.equal(h.supervisor.decodeMs("ghost-0"), undefined);
+
+		// One streamed message. The THINKING delta comes FIRST on purpose: a delta in
+		// the middle of a span cannot change first→last, so only a leading
+		// thinking_delta proves the fold is not behind `publishEvent`'s filter (which
+		// drops everything but text_delta/tool-name) — a filter-side hook would open
+		// the span 80ms late and under-report by exactly that gap.
+		client.emit({ type: "message_start", message: { role: "assistant" } });
+		client.emit(decodeMessageUpdate("start"));
+		client.emit(decodeMessageUpdate("thinking_delta", "hmm"));
+		await sleep(80);
+		client.emit(decodeMessageUpdate("text_delta", "he"));
+		await sleep(80);
+		client.emit(decodeMessageUpdate("text_delta", "llo"));
+		// Nothing is banked until the message closes (usage lands at the same
+		// moment, which is what keeps the two counters comparable).
+		assert.equal(h.supervisor.decodeMs("root.worker"), 0);
+		client.emit(decodeMessageEnd(12_000));
+		const first = h.supervisor.decodeMs("root.worker")!;
+		assert.ok(first >= 150, `expected at least the two 80ms gaps, got ${first}`);
+		assert.ok(first < 6_000, `expected the measured span, got durationMs-shaped ${first}`);
+
+		// Cumulative, and a non-streaming message falls back to its durationMs.
+		client.emit({ type: "message_start", message: { role: "assistant" } });
+		client.emit(decodeMessageUpdate("text_delta", "a"));
+		await sleep(60);
+		client.emit(decodeMessageUpdate("text_delta", "b"));
+		client.emit(decodeMessageEnd(99_000));
+		const two = h.supervisor.decodeMs("root.worker")!;
+		assert.ok(two > first, `decodeMs must accumulate: ${two} !> ${first}`);
+		assert.ok(two < first + 6_000, `second message must be its span, not 99s: got ${two - first}`);
+
+		// D4-b: a DEAD child still answers its lifetime total — the denominator is a
+		// lifetime fact, not a liveness query. Only a name never observed is absent.
+		client.process.exit(9, null);
+		assert.equal(h.supervisor.decodeMs("root.worker"), two, "retire/exit must not erase the measured denominator");
+		assert.equal(h.supervisor.decodeMs("ghost-0"), undefined);
+	} finally {
+		await h.supervisor.retire("root.worker").catch(() => {});
+		h.close();
+	}
+});
+
+/** The in-process counterpart: the same fold, driven by `session.subscribe`. */
+class FakeDecodeSession {
+	readonly listeners = new Set<(event: unknown) => void>();
+	subscribe(listener: (event: unknown) => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+	/** Stream one short message during the first prompt (rollback/seed fixtures). */
+	streamOnPrompt = false;
+	/** Reject the first prompt after the stream, to drive `rollbackSpawn`. */
+	promptError?: Error;
+	async prompt(): Promise<void> {
+		this.emit({ type: "agent_start" });
+		this.emit({ type: "turn_start" });
+		if (this.streamOnPrompt) {
+			this.emit({ type: "message_start", message: { role: "assistant" } });
+			this.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "a" } });
+			await new Promise((resolve) => setTimeout(resolve, 70));
+			this.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "b" } });
+			this.emit({ type: "message_end", message: { role: "assistant", durationMs: 20_000 } });
+		}
+		if (this.promptError) throw this.promptError;
+	}
+	async steer(): Promise<"queued"> {
+		return "queued";
+	}
+	async followUp(): Promise<void> {}
+	async abort(): Promise<void> {}
+	dispose(): void {}
+	getSessionStats(): { tokensIn: number; tokensOut: number; costUsd: number } {
+		return { tokensIn: 1, tokensOut: 2, costUsd: 0 };
+	}
+	emit(event: unknown): void {
+		for (const listener of [...this.listeners]) listener(event);
+	}
+	settle(): void {
+		this.emit({ type: "turn_end" });
+		this.emit({ type: "agent_end" });
+		this.emit({ type: "agent_settled" });
+	}
+}
+
+function inProcessDecodeHarness() {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-decode-inprocess-"));
+	const sessions: FakeDecodeSession[] = [];
+	const supervisor = new InProcessSupervisor({
+		sessionFactory: async () => {
+			const session = new FakeDecodeSession();
+			sessions.push(session);
+			return session as unknown as InProcessSession;
+		},
+	});
+	return {
+		root,
+		sessions,
+		supervisor,
+		close(): void {
+			rmSync(root, { recursive: true, force: true });
+		},
+	};
+}
+
+test("tps-decode D1/D2 inprocess: the same fold runs on the session event stream", async () => {
+	const h = inProcessDecodeHarness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const session = h.sessions[0]!;
+		assert.equal(h.supervisor.decodeMs("root.worker"), 0);
+		assert.equal(h.supervisor.decodeMs("ghost-0"), undefined);
+
+		session.emit({ type: "message_start", message: { role: "assistant" } });
+		session.emit(decodeMessageUpdate("thinking_delta", "think"));
+		await sleep(80);
+		session.emit(decodeMessageUpdate("text_delta", "talk"));
+		await sleep(80);
+		session.emit(decodeMessageUpdate("text_delta", "more"));
+		session.emit(decodeMessageEnd(12_000));
+		const measured = h.supervisor.decodeMs("root.worker")!;
+		assert.ok(measured >= 150, `expected at least the two 80ms gaps, got ${measured}`);
+		assert.ok(measured < 6_000, `expected the measured span, got durationMs-shaped ${measured}`);
+
+		// No stream at all → that message's durationMs (today's behaviour, D2 rule 2).
+		const before = measured;
+		session.emit({ type: "message_start", message: { role: "assistant" } });
+		session.emit(decodeMessageEnd(4_300));
+		assert.equal(h.supervisor.decodeMs("root.worker"), before + 4_300);
+
+		// Aborted turn: no message_end, and the open span must not leak into the next.
+		session.emit(decodeMessageUpdate("text_delta", "x"));
+		await sleep(70);
+		session.emit(decodeMessageUpdate("text_delta", "y"));
+		session.emit({ type: "turn_end", message: { role: "assistant", stopReason: "aborted" } });
+		const afterAbort = h.supervisor.decodeMs("root.worker")!;
+		assert.ok(afterAbort >= before + 4_300 + 60, `aborted span must be banked: ${afterAbort}`);
+		await sleep(80);
+		session.emit({ type: "message_start", message: { role: "assistant" } });
+		session.emit(decodeMessageUpdate("text_delta", "z"));
+		await sleep(70);
+		session.emit(decodeMessageUpdate("text_delta", "w"));
+		session.emit(decodeMessageEnd(9_000));
+		const total = h.supervisor.decodeMs("root.worker")!;
+		assert.ok(total - afterAbort < 6_000, `the idle gap must not be counted: got ${total - afterAbort}`);
+
+		// D4-b: retiring drops the record but KEEPS the measurement — otherwise the
+		// same status row would swing from the measured average back to generationMs
+		// at retire time (measured 136 → 69 avg t/s), contradicting the chart series
+		// that already recorded the decode samples.
+		assert.equal(h.supervisor.decodeMs("root.worker"), total);
+		await h.supervisor.retire("root.worker");
+		assert.equal(h.supervisor.decodeMs("root.worker"), total, "the archive must outlive the record");
+		assert.equal(h.supervisor.decodeMs("ghost-0"), undefined);
+	} finally {
+		await h.supervisor.retire("root.worker").catch(() => {});
+		h.close();
+	}
+});
+
+test("tps-decode D4: the routing facade delegates decodeMs to the owning backend", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-decode-routing-"));
+	const inprocess = new InProcessSupervisor({
+		sessionFactory: async () => new FakeDecodeSession() as unknown as InProcessSession,
+	});
+	try {
+		const rpc = new RpcSupervisor({
+			clientFactory: (options) => new FakeRpcClient(options, 31_000),
+			retireTimeoutMs: 100,
+			signalTimeoutMs: 100,
+			killTimeoutMs: 100,
+			enumerateDescendants: () => [],
+		});
+		const routing = new RoutingSupervisor({ inprocess, rpc });
+		await routing.spawnChild(testInput(root, "root.local"));
+		// Owned by the in-process backend; the facade answers with its number, and
+		// still answers `undefined` for a name neither backend hosts.
+		assert.equal(routing.decodeMs("root.local"), 0);
+		assert.equal(routing.decodeMs("root.ghost"), undefined);
+	} finally {
+		await inprocess.retire("root.local").catch(() => {});
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+/** D3 fixture: an OLD transcript a resume/continue reuses (`orchestrator.ts:1096`). */
+function writeResumeTranscript(file: string, generationMs: number): void {
+	writeFileSync(file, [
+		JSON.stringify({ type: "session", id: "s-resume", cwd: path.dirname(file), timestamp: "2026-01-01T00:00:00.000Z" }),
+		JSON.stringify({ type: "message", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: [{ type: "text", text: "go" }], timestamp: 1_000 } }),
+		JSON.stringify({
+			type: "message",
+			timestamp: "2026-01-01T00:00:10.000Z",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "done" }],
+				stopReason: "stop",
+				durationMs: generationMs,
+				usage: { input: 10, output: 50, cacheRead: 0, cacheWrite: 0 },
+				timestamp: 2_000,
+			},
+		}),
+	].join("\n") + "\n", "utf8");
+}
+
+test("tps-decode D3 rpc: a resume seeds decodeMs from the transcript's generationMs", async () => {
+	const h = harness();
+	try {
+		// The child reuses an old sessionFile: its history already holds 9s of
+		// generation. The accumulator must START there, not at 0 — otherwise the
+		// sampler would difference a decode series against a generation series
+		// seeded at 9s and paint a spike (or a hole).
+		writeResumeTranscript(testInput(h.root).sessionFile, 9_000);
+		await h.supervisor.spawnChild(testInput(h.root));
+		assert.equal(h.supervisor.decodeMs("root.worker"), 9_000, "seed = historical generationMs");
+
+		// New messages add on top of the seed, on the same axis.
+		const client = h.clients[0]!;
+		client.emit({ type: "message_start", message: { role: "assistant" } });
+		client.emit(decodeMessageUpdate("text_delta", "a"));
+		await sleep(70);
+		client.emit(decodeMessageUpdate("text_delta", "b"));
+		client.emit(decodeMessageEnd(20_000));
+		const measured = h.supervisor.decodeMs("root.worker")!;
+		assert.ok(measured >= 9_000 + 60, `expected seed + span, got ${measured}`);
+		assert.ok(measured < 9_000 + 6_000, `expected the span, not durationMs: got ${measured}`);
+	} finally {
+		await h.supervisor.retire("root.worker").catch(() => {});
+		h.close();
+	}
+});
+
+test("tps-decode D3 inprocess: the same seed rule on the in-process path", async () => {
+	const h = inProcessDecodeHarness();
+	try {
+		writeResumeTranscript(testInput(h.root).sessionFile, 12_500);
+		await h.supervisor.spawnChild(testInput(h.root));
+		assert.equal(h.supervisor.decodeMs("root.worker"), 12_500, "seed = historical generationMs");
+
+		const session = h.sessions[0]!;
+		session.emit({ type: "message_start", message: { role: "assistant" } });
+		session.emit(decodeMessageUpdate("text_delta", "a"));
+		await sleep(70);
+		session.emit(decodeMessageUpdate("text_delta", "b"));
+		session.emit(decodeMessageEnd(30_000));
+		const measured = h.supervisor.decodeMs("root.worker")!;
+		assert.ok(measured >= 12_500 + 60, `expected seed + span, got ${measured}`);
+		assert.ok(measured < 12_500 + 6_000, `expected the span, not durationMs: got ${measured}`);
+	} finally {
+		await h.supervisor.retire("root.worker").catch(() => {});
+		h.close();
+	}
+});
+
+test("tps-decode D4-b: a retired child keeps answering its lifetime decodeMs (both backends)", async () => {
+	// The production entry point is `RoutingSupervisor`, and a retire/exit leaves a
+	// record that is no longer alive. Answering `undefined` there flipped the row's
+	// label back to the request-inclusive generationMs (measured 136 → 69 avg t/s)
+	// while the chart still held the decode samples it had recorded.
+	const root = mkdtempSync(path.join(tmpdir(), "legion-decode-alive-"));
+	const sessions: FakeDecodeSession[] = [];
+	const inprocess = new InProcessSupervisor({
+		sessionFactory: async () => {
+			const session = new FakeDecodeSession();
+			sessions.push(session);
+			return session as unknown as InProcessSession;
+		},
+	});
+	const clients: FakeRpcClient[] = [];
+	const rpc = new RpcSupervisor({
+		clientFactory: (options) => {
+			const client = new FakeRpcClient(options, 41_000 + clients.length);
+			clients.push(client);
+			return client;
+		},
+		retireTimeoutMs: 100,
+		signalTimeoutMs: 100,
+		killTimeoutMs: 100,
+		enumerateDescendants: () => [],
+	});
+	const routing = new RoutingSupervisor({ inprocess, rpc });
+	try {
+		// in-process: measure one message, retire, read again.
+		await routing.spawnChild(testInput(root, "root.local"));
+		const local = sessions[0]!;
+		local.emit({ type: "message_start", message: { role: "assistant" } });
+		local.emit(decodeMessageUpdate("text_delta", "a"));
+		await sleep(70);
+		local.emit(decodeMessageUpdate("text_delta", "b"));
+		local.emit(decodeMessageEnd(20_000));
+		const localMeasured = routing.decodeMs("root.local")!;
+		assert.ok(localMeasured >= 60 && localMeasured < 6_000, `expected a measured span, got ${localMeasured}`);
+		await routing.retire("root.local");
+		assert.equal(routing.decodeMs("root.local"), localMeasured, "retire must not erase the in-process total");
+
+		// rpc: measure, then kill the process — the record stays but is not alive.
+		await routing.spawnChild({ ...testInput(root, "root.remote"), agent: { ...testAgent(), spawnMode: "rpc" as const } });
+		const client = clients[0]!;
+		client.emit({ type: "message_start", message: { role: "assistant" } });
+		client.emit(decodeMessageUpdate("text_delta", "a"));
+		await sleep(70);
+		client.emit(decodeMessageUpdate("text_delta", "b"));
+		client.emit(decodeMessageEnd(20_000));
+		const remoteMeasured = routing.decodeMs("root.remote")!;
+		assert.ok(remoteMeasured >= 60 && remoteMeasured < 6_000, `expected a measured span, got ${remoteMeasured}`);
+		client.process.exit(9, null);
+		assert.equal(routing.decodeMs("root.remote"), remoteMeasured, "a dead child keeps its lifetime total");
+
+		// Only a name this backend NEVER observed answers `undefined`.
+		assert.equal(routing.decodeMs("never-seen"), undefined);
+	} finally {
+		await inprocess.retire("root.local").catch(() => {});
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("tps-decode D4-b: the archive outlives children.delete() (failed-spawn rollback)", async () => {
+	// `rollbackSpawn` (in-process `:1645`, rpc `:842`) and `disposeRecord` are the
+	// paths that actually DELETE the record. The measured value must survive those
+	// too, so it is archived on every change rather than read off the record.
+	const root = mkdtempSync(path.join(tmpdir(), "legion-decode-rollback-"));
+	const supervisor = new InProcessSupervisor({
+		sessionFactory: async () => {
+			const session = new FakeDecodeSession();
+			session.streamOnPrompt = true;
+			session.promptError = new Error("prompt rejected");
+			return session as unknown as InProcessSession;
+		},
+	});
+	try {
+		await assert.rejects(supervisor.spawnChild(testInput(root)), /prompt rejected/);
+		// The record is gone (rollback deleted it); the measurement is not.
+		const measured = supervisor.decodeMs("root.worker");
+		assert.ok(measured !== undefined, "the archive must survive rollbackSpawn's children.delete()");
+		assert.ok(measured >= 60 && measured < 6_000, `expected the streamed span, got ${measured}`);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("tps-decode D4: the routing facade delegates decodeMs for an RPC-owned child", async () => {
+	// The facade is the production path (`index.ts:1461`), and an rpc child is the
+	// common case in a worktree-centurion team.
+	const root = mkdtempSync(path.join(tmpdir(), "legion-decode-routing-rpc-"));
+	const clients: FakeRpcClient[] = [];
+	try {
+		const rpc = new RpcSupervisor({
+			clientFactory: (options) => {
+				const client = new FakeRpcClient(options, 51_000 + clients.length);
+				clients.push(client);
+				return client;
+			},
+			retireTimeoutMs: 100,
+			signalTimeoutMs: 100,
+			killTimeoutMs: 100,
+			enumerateDescendants: () => [],
+		});
+		const routing = new RoutingSupervisor({ inprocess: new InProcessSupervisor({ sessionFactory: async () => new FakeDecodeSession() as unknown as InProcessSession }), rpc });
+		await routing.spawnChild({ ...testInput(root, "root.remote"), agent: { ...testAgent(), spawnMode: "rpc" as const } });
+		const client = clients[0]!;
+		assert.equal(routing.decodeMs("root.remote"), 0, "registered on the rpc backend, seeded from an empty transcript");
+
+		client.emit({ type: "message_start", message: { role: "assistant" } });
+		client.emit(decodeMessageUpdate("text_delta", "a"));
+		await sleep(70);
+		client.emit(decodeMessageUpdate("text_delta", "b"));
+		client.emit(decodeMessageEnd(30_000));
+		const measured = routing.decodeMs("root.remote");
+		assert.ok(measured !== undefined && measured >= 60 && measured < 6_000, `the facade must forward the rpc total, got ${measured}`);
+		assert.equal(routing.decodeMs("root.ghost"), undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
 	}
 });
 

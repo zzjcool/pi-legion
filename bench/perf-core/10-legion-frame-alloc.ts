@@ -156,6 +156,7 @@ function scenario(variant: Variant): ViewData {
 			tokens: 0,
 			tokensOut: 0,
 			generationMs: 0,
+			decodeMs: 0,
 		},
 		...specs
 			.filter((spec) => spec.start <= t)
@@ -174,6 +175,7 @@ function scenario(variant: Variant): ViewData {
 					tokens: Math.round(spec.rate * (until - spec.start)),
 					tokensOut: Math.round(spec.rate * (until - spec.start)),
 					generationMs: Math.round((until - spec.start) * 1_000),
+					decodeMs: 0,
 				};
 			}),
 	];

@@ -242,6 +242,16 @@ export interface SessionRuntimeDeps {
 		listener: (event: SupervisorEvent) => void,
 		options?: EventSubscriptionOptions,
 	) => () => void;
+	/**
+	 * Measured decode ms for a child (contract `tps-decode-denominator-v1` D5) —
+	 * the live `tok/s` denominator the supervisor folded from the child's own event
+	 * stream. `undefined` means NO OBSERVATION and the row falls back to
+	 * `generationMs`; a measured 0 is a real answer (a child spawned seconds ago).
+	 *
+	 * Injected rather than imported because this module must not reach into the
+	 * supervisor instance (the host owns it, and unit tests run without one).
+	 */
+	getLiveDecode?: (name: string) => number | undefined;
 	/** Batching config; applied via setJoinConfig right after construction. */
 	joinConfig?: JoinConfig;
 	/** Injectable timer for the MAX_PENDING_AGE_MS horizon (tests fire it manually); default = unref'd setTimeout. */
@@ -1747,6 +1757,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					identity,
 					storedNode,
 					finished.get(job.name)?.snapshot.execution.status,
+					deps.getLiveDecode?.(job.name),
 				);
 			});
 		const seen = new Set(jobEntries.flatMap((entry) => entry.nodeId ? [entry.nodeId] : []));
@@ -1754,7 +1765,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		for (const node of nodes) {
 			if (seen.has(node.id)) continue;
 			const details = activity.get(node.id);
-			persistedEntries.push(statusEntryFromNode(node, details));
+			persistedEntries.push(statusEntryFromNode(node, details, deps.getLiveDecode?.(node.name)));
 		}
 		return [...persistedEntries, ...jobEntries].sort((left, right) =>
 			(left.depth ?? 0) - (right.depth ?? 0) ||
@@ -2862,6 +2873,7 @@ function statusEntryFromJob(
 	identity?: LegionTreeIdentity,
 	node?: TreeNodeSnapshot,
 	executionStatus?: string,
+	liveDecode?: number,
 ): StatusEntry {
 	const live = progressFromSessionFile(job.sessionFile);
 	const model = live.model ?? job.model ?? node?.model ?? undefined;
@@ -2907,6 +2919,9 @@ function statusEntryFromJob(
 			? { tokensOut: live.tokensOut }
 			: node?.tokensOut ? { tokensOut: node.tokensOut } : {}),
 		...(live.generationMs ? { generationMs: live.generationMs } : {}),
+		// D5: the measured denominator only appears when the supervisor actually
+		// observed a stream; absence keeps the row on `generationMs` upstream.
+		...(liveDecode !== undefined ? { decodeMs: liveDecode } : {}),
 		...(live.contextTokens ? { contextTokens: live.contextTokens } : {}),
 		...(job.pid ? { pid: job.pid } : {}),
 		...(job.spawnMode ? { spawnMode: job.spawnMode } : {}),
@@ -2923,6 +2938,7 @@ function statusEntryFromJob(
 function statusEntryFromNode(
 	node: TreeNodeSnapshot,
 	activity?: NodeActivity,
+	liveDecode?: number,
 ): StatusEntry {
 	const lastActivityAt = latestActivityAt(
 		node.updatedAt,
@@ -2951,6 +2967,7 @@ function statusEntryFromNode(
 		...(live.usageTotal ? { tokensTotal: live.usageTotal } : node.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),
 		...(tokensOut ? { tokensOut } : {}),
 		...(live.generationMs ? { generationMs: live.generationMs } : {}),
+		...(liveDecode !== undefined ? { decodeMs: liveDecode } : {}),
 		...(live.contextTokens ? { contextTokens: live.contextTokens } : {}),
 		...(activity?.turn !== undefined ? { turns: activity.turn } : {}),
 		...(activity?.turnStartedAt !== undefined ? { currentTurnStartedAt: activity.turnStartedAt } : {}),

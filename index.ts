@@ -2066,6 +2066,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			},
 			options,
 		) ?? (() => {}),
+		/**
+		 * tps-decode-denominator D5: the measured `tok/s` denominator, read live off
+		 * whichever backend hosts the child (the routing facade delegates).
+		 * `undefined` stays `undefined` — the row then keeps `generationMs`, which is
+		 * a different statement from "measured 0".
+		 */
+		getLiveDecode: (name) => supervisor.decodeMs?.(name),
 		emitBusy: (active, label, children = []) => {
 			try { pi.events.emit("pi-legion:busy", active ? { active: true, label } : { active: false }); }
 			catch { /* optional display integration */ }

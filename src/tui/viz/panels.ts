@@ -372,7 +372,7 @@ function paintGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: string | u
 	const kids = childrenMap(nodes);
 	const roots = kids.get(null) ?? NO_NODES;
 	const virtualRoot: VizNode | undefined = roots.length === 1 ? undefined : {
-		id: "\u0000center", name: "legion", role: "centurion", parentId: null, depth: 0, status: "running", startedAt: data.now, tokens: 0, tokensOut: 0, generationMs: 0,
+		id: "\u0000center", name: "legion", role: "centurion", parentId: null, depth: 0, status: "running", startedAt: data.now, tokens: 0, tokensOut: 0, generationMs: 0, decodeMs: 0,
 	};
 	const childrenOf = (node: VizNode): readonly VizNode[] => node === virtualRoot ? roots : kids.get(node.id) ?? NO_NODES;
 	const center = virtualRoot ?? roots[0]!;
@@ -599,7 +599,9 @@ export interface ChartStats {
 
 /**
  * Chart x-domain. `to` advances only on substantive RateSampler changes
- * (tokensOut / generationMs); wall-clock `now` alone does not scroll the axis.
+ * (tokensOut / generationMs / measured decodeMs — D8 adds the third so a
+ * decode-only sample, e.g. a message closing with frozen token counters, still
+ * moves the axis); wall-clock `now` alone does not scroll it.
  * `from` stays relative to that frozen `to` (earliest start, or to−60s).
  */
 export function chartWindow(data: ViewData): { from: number; to: number } {

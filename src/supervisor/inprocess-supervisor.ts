@@ -12,6 +12,7 @@ import { statSync } from "node:fs";
 import { formatChildTask } from "../extension/child-guard.ts";
 import { childBudgetFromEnv } from "../extension/budget.ts";
 import { parseSessionFile } from "../shared/session.ts";
+import { progressFromSessionFile } from "../shared/progress.ts";
 import {
 	appendLegionChildTools,
 	applyThinkingSuffix,
@@ -30,6 +31,7 @@ import {
 } from "../shared/types.ts";
 import { childBuiltinExtensionEntries, type ChildBuiltinFactories } from "./child-builtins.ts";
 import { bindChildSessionExtensions, attachChildSessionRelease } from "./child-session.ts";
+import { DECODE_ARCHIVE_MAX, foldDecode, seedDecode, type DecodeClock } from "./decode-clock.ts";
 import {
 	POLL_INTERVAL_MS,
 	DEFAULT_INPROCESS_MAX_ACTIVE,
@@ -362,6 +364,15 @@ interface ChildRecord {
 	 * age it leaves behind is the honest one.
 	 */
 	lastEventAt?: number;
+	/**
+	 * Contract `tps-decode-denominator-v1` D1/D2: the measured first-delta→last-
+	 * delta wall clock folded from this child's own event stream — the same stream
+	 * {@link inFlightTools} and {@link lastEventAt} already ride, so no new
+	 * subscription and no child-side change. Seeded at registration from the
+	 * session file's `generationMs` (D3) so a resume keeps a continuous axis;
+	 * display-only, never persisted.
+	 */
+	decode: DecodeClock;
 	/**
 	 * A19: an admission slot is freed exactly once per departure from the live
 	 * set. All three release points (`retireChild`, `rollbackSpawn`,
@@ -758,6 +769,21 @@ export class InProcessSupervisor implements LegionSupervisor {
 	 */
 	readonly capabilities = { promptDisposition: false } as const;
 	private readonly children = new Map<string, ChildRecord>();
+	/**
+	 * D4-b: the last measured decode ms per child NAME, kept after the record is
+	 * gone.
+	 *
+	 * `decodeMs` answers "how much did this child decode in its life", not "is it
+	 * alive right now", so retiring a child must not erase the denominator: the
+	 * status row would flip from the measured average back to the request-inclusive
+	 * `generationMs` (measured: 136 → 69 avg t/s on one unchanged row) while the
+	 * chart's series keeps the decode samples it already recorded.
+	 *
+	 * Bounded on purpose (a long session can retire thousands of children) and
+	 * memory-only: no DB column, no child JSONL entry, no wire field (D4's
+	 * prohibitions still stand).
+	 */
+	private readonly decodeArchive = new Map<string, number>();
 	private readonly subscriptionsBeforeSpawn = new Map<string, Set<EventSubscription>>();
 	private readonly sessionFactory: InProcessSessionFactory;
 	private readonly getLimits: () => InProcessLimits | undefined;
@@ -870,6 +896,10 @@ export class InProcessSupervisor implements LegionSupervisor {
 			spawnDepth: inProcessDepth() + 1,
 			parentKey: parentKeyOf(input.name),
 			context: resolveChildLaunchContext(input),
+			// D3: seed from the session file's own `generationMs` — 0 for a fresh
+			// spawn (empty file), the historical total for a resume/continue that
+			// reuses an old transcript, so measured decode continues the same axis.
+			decode: seedDecode(progressFromSessionFile(input.sessionFile).generationMs ?? 0),
 		};
 		this.subscriptionsBeforeSpawn.delete(input.name);
 		this.children.set(input.name, registration);
@@ -1350,6 +1380,35 @@ export class InProcessSupervisor implements LegionSupervisor {
 		return this.children.get(name)?.lastEventAt;
 	}
 
+	/**
+	 * tps-decode-denominator D4/D4-b: measured decode ms (first delta→last delta).
+	 *
+	 * Deliberately NOT gated on `isAlive` (D4-b). This answers a lifetime question,
+	 * so a retired/exited child — whose record has left `children` — keeps answering
+	 * through {@link decodeArchive}. Gating it on liveness made one unchanged row
+	 * swing from the measured average to `generationMs` at retire time, and made a
+	 * single short message look WORSE once the child ended (no label before, a tiny
+	 * one after).
+	 *
+	 * `undefined` now means exactly one thing: this backend has never observed that
+	 * name. A measured 0 is still a real answer (a child whose first message has not
+	 * closed yet).
+	 */
+	decodeMs(name: string): number | undefined {
+		return this.children.get(name)?.decode.measuredMs ?? this.decodeArchive.get(name);
+	}
+
+	/** Remember a child's last measured decode ms by name (D4-b), bounded FIFO. */
+	private rememberDecode(name: string, measuredMs: number): void {
+		if (this.decodeArchive.get(name) === measuredMs) return;
+		this.decodeArchive.set(name, measuredMs);
+		while (this.decodeArchive.size > DECODE_ARCHIVE_MAX) {
+			const oldest = this.decodeArchive.keys().next();
+			if (oldest.done) return;
+			this.decodeArchive.delete(oldest.value);
+		}
+	}
+
 	async stats(name: string): Promise<UsageSnapshot | null> {
 		const child = this.children.get(name);
 		if (!child || !child.session || !this.isAlive(name)) return null;
@@ -1619,6 +1678,16 @@ export class InProcessSupervisor implements LegionSupervisor {
 		// `lastEventAt`, which is why the age it produces cannot disagree with the stack
 		// it sits next to.
 		child.lastEventAt = at;
+		// tps-decode-denominator D1/D2: the third reader of the same clock reading.
+		// It MUST stay above `publishEvent` — that path drops every delta except
+		// text_delta/tool-name (`publishEventAtRoot`), so a thinking-only turn would
+		// measure nothing if the fold lived behind the filter.
+		const decode = foldDecode(child.decode, record, at);
+		if (decode !== child.decode) {
+			child.decode = decode;
+			// D4-b: archive on every change, so the value survives `children.delete()`.
+			this.rememberDecode(child.name, decode.measuredMs);
+		}
 		this.updateTurnState(child, record);
 		this.publishEvent(child, record);
 	}

@@ -16,6 +16,7 @@ import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import { checkMemoryGate, childMemoryEnv } from "./child-memory.ts";
 import { enrichFailureWithAutoDoctor } from "../extension/auto-doctor.ts";
 import { ErrorCodes, SubagentError, unknownChildError } from "../shared/types.ts";
+import { progressFromSessionFile } from "../shared/progress.ts";
 import {
 	InMemoryUIProxy,
 	extensionActivityToUIRequest,
@@ -53,6 +54,7 @@ import {
 } from "./types.ts";
 import { currentPgid, enumerateDescendants } from "./proc-tree.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
+import { DECODE_ARCHIVE_MAX, foldDecode, seedDecode, type DecodeClock } from "./decode-clock.ts";
 
 interface EventSubscription {
 	listener: SupervisorEventListener;
@@ -104,6 +106,16 @@ interface ChildRecord {
 	 * age it leaves behind is the honest one.
 	 */
 	lastEventAt?: number;
+	/**
+	 * Contract `tps-decode-denominator-v1` D1/D2: the measured first-delta→last-
+	 * delta wall clock folded from the child's own RPC event stream — the same
+	 * stream {@link inFlightTools} and {@link lastEventAt} already ride, so no new
+	 * IPC and no wire change. The stamp is the PARENT-side arrival time (pipes and
+	 * backpressure included), still far better than `durationMs`, which folds the
+	 * whole request (prefill/TTFT) into the denominator. Seeded at registration from
+	 * the session file's `generationMs` (D3); display-only, never persisted.
+	 */
+	decode: DecodeClock;
 }
 
 export type { RpcSupervisorOptions } from "./types.ts";
@@ -236,6 +248,12 @@ export class RpcSupervisor implements LegionSupervisor {
 	 */
 	readonly capabilities = { promptDisposition: true } as const;
 	private readonly children = new Map<string, ChildRecord>();
+	/**
+	 * D4-b: the last measured decode ms per child NAME, kept after the record is
+	 * gone — the RPC twin of the in-process archive (see that field for why a retire
+	 * must not erase the denominator). Bounded and memory-only.
+	 */
+	private readonly decodeArchive = new Map<string, number>();
 	private readonly subscriptionsBeforeSpawn = new Map<
 		string,
 		Set<EventSubscription>
@@ -319,6 +337,10 @@ export class RpcSupervisor implements LegionSupervisor {
 			waiters: new Set(),
 			subscriptions:
 				this.subscriptionsBeforeSpawn.get(input.name) ?? new Set(),
+			// D3: a fresh spawn reads an empty transcript (seed 0); a resume reuses
+			// the old file, so the historical `generationMs` seeds the accumulator
+			// and the measured values continue on the same axis.
+			decode: seedDecode(progressFromSessionFile(input.sessionFile).generationMs ?? 0),
 		};
 		this.subscriptionsBeforeSpawn.delete(input.name);
 		this.children.set(input.name, registration);
@@ -639,6 +661,30 @@ export class RpcSupervisor implements LegionSupervisor {
 		return this.children.get(name)?.lastEventAt;
 	}
 
+	/**
+	 * tps-decode-denominator D4/D4-b: measured decode ms (first delta→last delta) as
+	 * stamped by the parent when each RPC line arrived.
+	 *
+	 * Deliberately NOT gated on process liveness (D4-b): a retired/exited child keeps
+	 * answering its lifetime total through {@link decodeArchive}, so the status row
+	 * cannot swing back to `generationMs` the moment the child ends. `undefined`
+	 * means only "this backend never observed that name".
+	 */
+	decodeMs(name: string): number | undefined {
+		return this.children.get(name)?.decode.measuredMs ?? this.decodeArchive.get(name);
+	}
+
+	/** Remember a child's last measured decode ms by name (D4-b), bounded FIFO. */
+	private rememberDecode(name: string, measuredMs: number): void {
+		if (this.decodeArchive.get(name) === measuredMs) return;
+		this.decodeArchive.set(name, measuredMs);
+		while (this.decodeArchive.size > DECODE_ARCHIVE_MAX) {
+			const oldest = this.decodeArchive.keys().next();
+			if (oldest.done) return;
+			this.decodeArchive.delete(oldest.value);
+		}
+	}
+
 	async stats(name: string): Promise<UsageSnapshot | null> {
 		const child = this.children.get(name);
 		if (!child || !child.client || !this.isAlive(name)) return null;
@@ -861,6 +907,18 @@ export class RpcSupervisor implements LegionSupervisor {
 		// stall-notice D2: the same fold, one clock reading (see the in-process
 		// backend for why this is the only writer of the field).
 		child.lastEventAt = at;
+		// tps-decode-denominator D1/D2: the third reader of the same clock reading,
+		// and it MUST stay above `publishEvent` — that path drops every delta except
+		// text_delta/tool-name, so a thinking-only turn would measure nothing.
+		// Non-`message_update` events pass `toJsonEvent` through verbatim
+		// (`modes/json-event.js`), so `message_end` still carries the full message,
+		// `durationMs` included — that is the no-stream fallback (D2 rule 2).
+		const decode = foldDecode(child.decode, record, at);
+		if (decode !== child.decode) {
+			child.decode = decode;
+			// D4-b: archive on every change, so the value survives `children.delete()`.
+			this.rememberDecode(child.name, decode.measuredMs);
+		}
 
 		this.updateTurnState(child, record);
 

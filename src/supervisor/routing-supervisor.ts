@@ -292,6 +292,20 @@ export class RoutingSupervisor implements LegionSupervisor {
 		return this.inprocess.lastEventAt?.(name) ?? this.rpc.lastEventAt?.(name);
 	}
 
+	/**
+	 * Forward the measured decode denominator (tps-decode-denominator D4) the same
+	 * way, so `tok/s` divides by the stream the backend that hosts the child
+	 * actually observed. `undefined` stays `undefined` — an unobserved child falls
+	 * back to `generationMs`, which is a different answer from a measured 0.
+	 */
+	decodeMs(name: string): number | undefined {
+		const owner = this.owners.get(name);
+		if (owner === "inprocess") return this.inprocess.decodeMs?.(name);
+		if (owner === "rpc") return this.rpc.decodeMs?.(name);
+		if (owner === "terminal") return this.terminalSeam?.decodeMs?.(name);
+		return this.inprocess.decodeMs?.(name) ?? this.rpc.decodeMs?.(name);
+	}
+
 	async stats(name: string): Promise<UsageSnapshot | null> {
 		return this.backendFor(name).stats(name);
 	}

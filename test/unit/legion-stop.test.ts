@@ -115,7 +115,7 @@ test("legion stop: runLegionStop — one, all, not found, nested, nothing runnin
 });
 
 const T0 = 1_700_000_000_000;
-const vnode = (id: string, opts: Partial<VizNode> = {}): VizNode => ({ id, name: id, role: "scout", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, ...opts });
+const vnode = (id: string, opts: Partial<VizNode> = {}): VizNode => ({ id, name: id, role: "scout", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, decodeMs: 0, ...opts });
 const ROOT = vnode("root", { name: "centurion-0", role: "centurion", parentId: null, depth: 0 });
 
 test("legion stop: parseStopArg strips --force/-f anywhere in the arg", () => {

@@ -281,8 +281,21 @@ in-process lifetime while `rpc` looked correct.
 (`message.durationMs`, or entry-to-entry write times). It must never be derived
 from the nested `message.timestamp`, which marks when generation *started* and
 yields only prompt-to-first-token latency — that mistake pinned the denominator
-near zero, so `tok/s` silently fell back to a wall-clock window and stopped being
-a decode rate.
+near zero and made `tok/s` meaningless.
+
+**`tok/s` no longer divides by `generationMs`.** `durationMs` is the whole
+request (prefill/TTFT included: `durationMs ≈ 4.3s + output/137` over 22306 real
+assistant calls), so short agentic turns read 2–12x low. Both backends now fold
+the measured **first delta → last delta** wall clock per child
+(`src/supervisor/decode-clock.ts`, contract
+`docs/contracts/tps-decode-denominator-v1.md`) and expose it as
+`LegionSupervisor.decodeMs(name)`; `generationMs` remains the fallback for rows
+nobody measured. There is no wall-clock fallback any more: a window with no
+timing measurement reports `0` rather than a 60x-low number, and a measured but
+sub-200ms window is clamped (`MIN_RATE_DECODE_MS`), not replaced. The value is a
+lifetime fact, so a retired child keeps answering it from a bounded in-memory
+archive (D4-b) — it is never written to `legion.db`, the child transcript, or the
+RPC wire.
 
 ## Refusals
 

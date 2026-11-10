@@ -4,18 +4,25 @@
  * Two UI surfaces show throughput with different definitions:
  *
  * - Header / snap tok/s (`nowRate`): 60s trailing window + live (running)
- *   agents only. Numerator = Δ cumulative output tokens; denominator =
- *   Δ cumulative generationMs over the same window (falls back to wall-clock
- *   window when generationMs is unavailable / zero, or when in-window
- *   ΔgenerationMs is below MIN_RATE_GENERATION_MS — same 1s floor as the
- *   tree-row gate). Once nothing is live, the header rate is 0 even if the
- *   window still holds Δtokens.
- * - Tree-row label (`avg t/s` in status.ts): lifetime cumulative average
- *   `tokensOut / (generationMs/1000)` — no window, no live filter.
+ *   agents only. Numerator = Δ cumulative output tokens; denominator = the same
+ *   window's Δ decode ms when the supervisor measured any (contract
+ *   `tps-decode-denominator-v1` D6), else Δ generationMs. Once nothing is live,
+ *   the header rate is 0 even if the window still holds Δtokens.
+ * - Tree-row label (`avg t/s` in status.ts): lifetime cumulative average over
+ *   decodeMs, falling back to `generationMs` — no window, no live filter.
  *
- * generationMs comes from session JSONL: sum of (assistant_ts − prior
- * user/toolResult_ts). Idle and tool gaps are excluded. Approximate —
- * usage lands when each assistant message completes, not mid-stream.
+ * Why decode and not generation: `generationMs` comes from session JSONL
+ * (`assistant_ts − prior user/toolResult_ts`) and its values come from
+ * `message.durationMs` = the WHOLE request, prefill/TTFT included. Measured over
+ * 215 real sessions that is `≈ 4.3s + output / 137 tok/s`: a ~4.3s fixed cost per
+ * call, so the 31–800-token calls that are 75% of an agentic run displayed 11–60
+ * tok/s instead of ~137. `decodeMs` is the first delta→last delta wall clock the
+ * supervisor actually observed, so it measures decoding instead of the request.
+ *
+ * Still true (deliberately out of scope, D9): usage only lands when each assistant
+ * message COMPLETES (Anthropic writes output at `message_delta`), so a turn in
+ * flight shows the previous message's numbers rather than a live partial — this
+ * change fixes the MAGNITUDE, not the lag.
  *
  * Settled/retired series keep contributing to chart buckets/avg so the
  * history window stays accurate. #346: they only do so while the frame still
@@ -27,11 +34,18 @@ import type { VizNode } from "./model.ts";
 
 export const RATE_WINDOW_MS = 60_000;
 /**
- * Min in-window ΔgenerationMs before trusting gen as the tok/s denominator.
- * Matches tree-row t/s gate (`generationMs >= 1000` in status.ts). Below this,
- * fall back to wall-clock window length so a 1ms gen flush cannot spike to M.
+ * Floor for the in-window denominator, in ms.
+ *
+ * This is a CLAMP (`Math.max`), not a fallback: a short but real decode window
+ * (one 300ms message) would otherwise divide a modest Δtokens by a fraction of a
+ * second and paint a spike. 200ms sits below one 500ms sample interval, so it can
+ * only ever bound a spike — it never stretches a legitimate window.
+ *
+ * It is NOT the old `MIN_RATE_GENERATION_MS` rule, which swapped the denominator
+ * for the 60s wall clock and therefore reported 1/60 of the truth on exactly the
+ * short windows that are most common on a fast model.
  */
-export const MIN_RATE_GENERATION_MS = 1_000;
+export const MIN_RATE_DECODE_MS = 200;
 const DEFAULT_RETENTION_MS = 6 * 60 * 60 * 1000;
 const MAX_SAMPLES_PER_NODE = 4096;
 
@@ -40,8 +54,10 @@ interface Series {
 	ts: number[];
 	/** Cumulative output tokens. */
 	value: number[];
-	/** Cumulative generation wall ms (parallel to value). */
+	/** Cumulative generation wall ms (parallel to value) — fallback denominator. */
 	gen: number[];
+	/** Cumulative measured decode ms (parallel to value) — preferred denominator. */
+	decode: number[];
 	/**
 	 * #346: last timestamp at which this series' sampled value actually CHANGED —
 	 * or its birth, when it was first seen.
@@ -84,7 +100,7 @@ export class RateSampler {
 	private readonly series = new Map<string, Series>();
 	private readonly retentionMs: number;
 	private first: number | undefined;
-	/** Wall time of the latest tokensOut/gen change across all series (not flat-collapse moves). */
+	/** Wall time of the latest tokensOut/gen/decode change across all series (not flat-collapse moves). */
 	private lastChange: number | undefined;
 	/**
 	 * #346 diagnostics: series visited vs. provably skipped by the most recent
@@ -103,9 +119,10 @@ export class RateSampler {
 	}
 
 	/**
-	 * Latest timestamp where any series recorded a substantive tokensOut or
-	 * generationMs change. Flat-collapse (advancing a flat trailing sample to
-	 * `now`) does not move this — chart x-axis freezes until real data arrives.
+	 * Latest timestamp where any series recorded a substantive tokensOut,
+	 * generationMs or decodeMs change. Flat-collapse (advancing a flat trailing
+	 * sample to `now`) does not move this — chart x-axis freezes until real data
+	 * arrives.
 	 */
 	get lastChangeAt(): number | undefined {
 		return this.lastChange;
@@ -118,27 +135,34 @@ export class RateSampler {
 			if (node.id === "root") continue;
 			let s = this.series.get(node.id);
 			if (!s) {
-				s = { role: node.role, ts: [], value: [], gen: [], changedAt: now };
+				s = { role: node.role, ts: [], value: [], gen: [], decode: [], changedAt: now };
 				this.series.set(node.id, s);
 				// A node born after sampling began starts from zero at its spawn time.
 				if (node.startedAt > this.first && node.startedAt < now) {
 					s.ts.push(node.startedAt);
 					s.value.push(0);
 					s.gen.push(0);
+					s.decode.push(0);
 					s.changedAt = node.startedAt;
 				}
 			}
 			s.role = node.role;
 			const last = s.value[s.value.length - 1];
 			const lastGen = s.gen[s.gen.length - 1];
+			const lastDecode = s.decode[s.decode.length - 1];
 			const lastTs = s.ts[s.ts.length - 1];
 			// Cumulative counters never decrease; ignore regressions from stale sources.
 			const value = last === undefined ? node.tokensOut : Math.max(last, node.tokensOut);
 			const gen = lastGen === undefined ? node.generationMs : Math.max(lastGen, node.generationMs);
-			const changed = last === undefined || value !== last || gen !== lastGen;
+			// D8: the decode counter joins the monotone clamp AND the change test —
+			// a measured message that lands while tokensOut/gen stand still still IS
+			// progress, and #346's chart x-axis freeze must see it.
+			const decode = lastDecode === undefined ? node.decodeMs : Math.max(lastDecode, node.decodeMs);
+			const changed = last === undefined || value !== last || gen !== lastGen || decode !== lastDecode;
 			if (lastTs !== undefined && now <= lastTs) {
 				s.value[s.value.length - 1] = value;
 				s.gen[s.gen.length - 1] = gen;
+				s.decode[s.decode.length - 1] = decode;
 				if (changed) {
 					// #346: a backward sample still rewrites the value at `lastTs`, so that
 					// is where the last real change now sits.
@@ -151,9 +175,11 @@ export class RateSampler {
 				last !== undefined &&
 				value === last &&
 				gen === lastGen &&
+				decode === lastDecode &&
 				s.value.length >= 2 &&
 				s.value[s.value.length - 2] === last &&
-				s.gen[s.gen.length - 2] === lastGen
+				s.gen[s.gen.length - 2] === lastGen &&
+				s.decode[s.decode.length - 2] === lastDecode
 			) {
 				// Collapse flat runs: move the trailing sample forward.
 				// Does NOT advance lastChangeAt — chart x-axis stays frozen — and does
@@ -164,6 +190,7 @@ export class RateSampler {
 			s.ts.push(now);
 			s.value.push(value);
 			s.gen.push(gen);
+			s.decode.push(decode);
 			if (changed) {
 				s.changedAt = now;
 				this.noteChange(now);
@@ -186,6 +213,7 @@ export class RateSampler {
 			s.ts.splice(0, drop);
 			s.value.splice(0, drop);
 			s.gen.splice(0, drop);
+			s.decode.splice(0, drop);
 		}
 	}
 
@@ -203,11 +231,16 @@ export class RateSampler {
 		return interpolate(s.ts, s.gen, t);
 	}
 
+	/** Cumulative measured decodeMs at time t (0 when the row has no measurement). */
+	decodeAt(nodeId: string, t: number): number {
+		const s = this.series.get(nodeId);
+		if (!s || s.ts.length === 0) return 0;
+		return interpolate(s.ts, s.decode, t);
+	}
+
 	/**
-	 * Output tok/s over the trailing window: ΔtokensOut / (ΔgenerationMs/1000).
-	 * When in-window ΔgenerationMs is 0 or below MIN_RATE_GENERATION_MS, falls
-	 * back to wall-clock window length so a ledger-only path still yields a
-	 * number and a sub-second gen flush cannot report M-level TPS.
+	 * Output tok/s over the trailing window: ΔtokensOut / (ΔdecodeMs/1000), falling
+	 * back to ΔgenerationMs for a series nobody measured.
 	 */
 	nodeRate(nodeId: string, now: number, windowMs = RATE_WINDOW_MS): number {
 		if (windowMs <= 0) return 0;
@@ -321,8 +354,18 @@ export class RateSampler {
 		if (windowMs <= 0) return 0;
 		const dOut = Math.max(0, interpolate(s.ts, s.value, t) - interpolate(s.ts, s.value, t - windowMs));
 		if (dOut <= 0) return 0;
+		// D6: one denominator per window. Once the series has a measured decode
+		// counter, that counter is the denominator; mixing the two axes inside one
+		// window would combine a request-inclusive span with a decode span.
+		const dDecode = Math.max(0, interpolate(s.ts, s.decode, t) - interpolate(s.ts, s.decode, t - windowMs));
 		const dGen = Math.max(0, interpolate(s.ts, s.gen, t) - interpolate(s.ts, s.gen, t - windowMs));
-		const seconds = dGen >= MIN_RATE_GENERATION_MS ? dGen / 1000 : windowMs / 1000;
+		// D6-b: NEITHER denominator moved → this window has no timing measurement at
+		// all (typical: `tokensOut` came from the ledger while the transcript is
+		// unreadable — a "ledger-only" row). Dividing the clamp into it invents a
+		// rate: 5000 tokens over 200ms = 25000 tok/s. No timing, no rate.
+		if (dDecode <= 0 && dGen <= 0) return 0;
+		const denomMs = dDecode > 0 ? dDecode : dGen;
+		const seconds = Math.max(denomMs, MIN_RATE_DECODE_MS) / 1000;
 		return dOut / seconds;
 	}
 

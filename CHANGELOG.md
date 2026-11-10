@@ -11,6 +11,30 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tok/s` 的分母换成实测 decode 时长（首 delta → 末 delta），不再用含 prefill 的
+  `generationMs`。** 旧口径的分母来自 `message.durationMs` = **请求发出 → 响应结束**
+  的整段墙钟；对 215 个真实 session / 22306 条 assistant 调用回归得到
+  `durationMs ≈ 4.3s + output/137`，即每次调用约 4.3s 固定开销。agentic 场景里 75% 的
+  调用只有 31–800 个 output token，于是长期显示 11–60 tok/s，而模型真实解码约 137 tok/s
+  （低估 2.3–12x）。`InProcessSupervisor.handleSessionEvent` 与
+  `RpcSupervisor.handleRpcEvent` 现在对称地把**实测**的首 delta→末 delta 墙钟折进
+  `src/supervisor/decode-clock.ts`（纯函数、总函数，挂在 `publishEvent` 过滤之前，否则
+  thinking-only 轮次测不到），经 `LegionSupervisor.decodeMs(name)` 供
+  `StatusEntry`/`VizNode`/`RateSampler` 使用；`generationMs` 仅在「没人测过」的行上兜底。
+  契约：`docs/contracts/tps-decode-denominator-v1.md`。
+- **删掉 tok/s 的 60s 墙钟回退悬崖。** 旧 `MIN_RATE_GENERATION_MS=1000` 在窗口内
+  ΔgenerationMs 低于 1s 时把分母换成整个 60s 墙钟窗（短窗口上等于 60x 低估）。现改为
+  下限钳制 `MIN_RATE_DECODE_MS=200`（`Math.max`）；两个分母都为 0（账本-only 行，无任何
+  时长测量）时直接返回 `0`，不再靠钳制编出一个速率。
+- **`decodeMs` 是「这一生」的事实，不是存活查询。** retire / 进程退出后
+  `children.delete()` 不再抹掉累加值：按 name 保留在有界内存归档里，因此同一行不会在
+  retire 瞬间从实测均值跳回 `generationMs`（实测 136 → 69 avg t/s）。树行 `avg t/s` 的
+  信任下限按轴分开（decode 200ms / generation 1s），单条短消息不再被旧门禁整条吞掉。
+- 图表 x 轴冻结判定（#346）与 flat-run 折叠把 decode 采样一并纳入，避免「只有 decode
+  前进」的真实进展被当成静态而被跳过。
+
 ## [5.6.0] — 2026-11-09
 
 ### Added
