@@ -372,6 +372,37 @@ frontmatter 走**严格字段表**：`AGENT_FRONTMATTER_FIELDS`（`src/agents/ag
 
 默认值集中在 `DEFAULT_LEGION_SETTINGS`（`src/shared/types.ts`）与 `DEFAULT_INPROCESS_*`（`src/supervisor/spawn-mode.ts`）。
 
+### 6.3 model 优先级（Model precedence）
+
+一个子 agent 最终用哪个 model，由一条固定顺序的候选链决定（`resolveModel`，`src/agents/model-resolution.ts`），**从强到弱**：
+
+| 级 | 来源 | `ModelSourceInfo.type` | 判源（`modelOrigin`） |
+| --- | --- | --- | --- |
+| 1 | 本次调用传入的 `model`（`model:` / `tasks[].model`） | `dispatch` | `explicit` |
+| 2 | 被引用 preset 的 model（`subagents.presets.<name>.model`） | `preset` | `explicit` |
+| 3 | 当前 team 的 member override `model`（`subagents.teams.<name>.members[].model`；`applyTeam` 折进 `agent.model` 并写 `modelSource.type = "team"`） | `team` | `explicit` |
+| 4 | `subagents.agentOverridesByProvider.<父 provider>.<role>.model`（**此级只作用于 `model`**；`thinking` / `preset` / `disabled` 等其余字段在本级不生效，请用第 5 级 `agentOverrides` 配） | `agentOverrides` | `explicit` |
+| 5 | `subagents.agentOverrides.<role>.model` | `agentOverrides` | `explicit` |
+| 6 | 角色卡 frontmatter `model`（含被折叠进来的 `subagents.defaultModel`） | `frontmatter` / `subagents.defaultModel` | 前者 `explicit`，后者 `inherited` |
+| 7 | `subagents.defaultModel` | `subagents.defaultModel` | `inherited` |
+| 8 | 派发方（父会话）当前的 model | `dispatch` | `inherited` |
+
+口径（与代码一一对应）：
+
+- **per-run model 是最高级**：调用方传的 `model:` 就是本次运行的选择，任何配置都不能覆盖它。
+- **preset 是原子的**：`kind` / `model` / `thinking` 出自同一个 preset 对象，不会出现"A 的 model 配 B 的 thinking"；引用不存在的 preset 是错误，不回退到派发 model（`expandPreset` / `requirePreset`）。
+- **team member 的 `model` 与它的 `preset` 同级**：team member 的 `preset` 已经走第 2 级，同一个 member 的 `model` 若屈居第 6 级就变成"两个字段不同级、不自洽"；而且"本次选了哪支队伍"比"全局按角色钉死"更具体。因此 `applyTeam` 在折叠 member `model` 时给它打 `modelSource: { type: "team", model }`，候选链据此在第 3 级单独认它，**压过 `subagents.agentOverrides` 与 provider 作用域 override，输给 preset 与本次调用的 `model`**。tag 只在成员 `model` 为非空白字符串时打（纯字符串成员、只给 `preset` 的成员都不打），且 `modelSource.model !== agent.model` 的陈旧 tag 一律忽略（按 frontmatter 处理），否则脏 tag 会把普通 model 非法抬到第 3 级。
+- **team 选择在 in-process 子树里同样生效**（B9）：team 的选定只有三档——`PI_SUBAGENTS_TEAM` > `subagents.team` > `default`（`resolveActiveTeamName`，`src/agents/teams.ts`）。rpc 子进程把这次选择当真实环境变量收下；**in-process 子会话与父共用一个 `process.env`**，所以父为「这一次 spawn」选的 team 到不了它手里，工具 `team:` / 卡片 `team:` / resume 的 `node.team` 在孙会话里全部静默失效——连带第 3 级（team member 的 `model`）根本不发生。通道因此改成 ALS：`ChildLaunchContext.team` 由 `InProcessSupervisor` 从 `SpawnInput.env`（`TEAM_ENV`，**按键存在判定**，所以显式 `team: "default"` 可表达且压过 settings 里的 team）抬进上下文，`loadCatalog`（唯一消费漏斗）把该值当 env 覆盖交给 `applyTeam`；root（上下文无 team）逐字走原链路。`provided` 与 `fallback` 两条 context 分支都要合，前者提前 return，漏掉就让 legion 路径失效。禁止写 `process.env`（见 `child-context.ts` 顶部：env 通道没有 ALS 的那层隔离）。
+- **空白字段不算选择**：`tasks[].model` / `tasks[].preset` 为空白串时让位给顶层 `model` / `preset`，传给候选链的是 trim 后的值（`resolveStepModel`，`src/agents/step-model.ts`）。
+- **`inherit` 哨兵**：任一候选值等于 `inherit` 时解析为父会话的 model，判源 `inherited`。**父会话没有 model 时是拒绝，不回退**（`resolveModel` 抛 `SubagentError` + `INVALID_PARAMS`，文案里带上角色名与 `subagents.defaultModel` / 显式 `model` 两条出路）：`inherit` 的全部语义就是"用父会话的 model"，没有可继承的对象时退回"不带 `--model`"并不安全——`Orchestrator.launch` 会回读 `agent.model`（字面量 `inherit`）并拼出 `--model inherit`，子进程直接以 `Model "inherit" not found` 死。配套口径：`subagents.defaultModel: "inherit"` 在设置解析期就被拒（全局默认表达不了"继承本次会话"，而且会把上面这条变成每次 launch 都失败）；`modelCandidates` 把哨兵从候选里滤掉（只对绕过 `resolveModel` 的直接调用生效）；`/legion doctor` 不把它当成 registry 里缺的 model；`/legion agents` 对这一形态显示 `needs a parent session model — a launch would refuse this`，不再谎报 `(agent CLI default)`。
+- **`thinking` 压过 model 串里的 `:level`，per-run 例外**：`thinking`（preset / team member / 卡片 / `agentOverrides`）是显式配置的专用字段，model 串自带的 level 是它的粗略版本，两者冲突时以 `thinking` 为准——`resolveStepModel`（`src/agents/step-model.ts`，两条后端共用的唯一入口）在解析出口把已知 level strip 掉，下游 `applyThinkingSuffix` 再按 `thinking` 重新拼，所以 rpc argv 与 in-process model ref 不会分叉。**例外是本次调用传的 `model`**：调用方在这一跑里写 `provider/model:high` 是更强、更具体的信号，下层的 `thinking` 不能推翻它。`thinking` 未配置（`undefined`）时不剥离——写在 model 串里的 level 是操作者唯一的 thinking 选择。`thinking: false` 同样剥离：留着 `:level` 会把 reasoning 重新打开，`false` 的效果就是"不追加 level 且去掉串里的 level"。只剥离已知 level，`provider/model:variant` 一律保留（`splitThinkingSuffix`）。
+- **判源决定 `modelScope.enforce` 的力度**（`checkModelScope`，`src/agents/model-scope.ts`）：`explicit` → `error`，拒绝启动并打一行 `✗`；`inherited` → `warn`，打一行 `⚠` 后**照常启动**。判源由 `classifyModelOrigin`（`src/agents/step-model.ts`）唯一给出，launch 与 utility（vexillatio）两条路径都传真实 origin，不再硬编码。
+- **折叠后的默认模型保持 inherited 身份**：`applyDefaultModel` 把 `subagents.defaultModel` 折进 `agent.model` 并写 `agent.modelSource`；第 6 级只在 `modelSource.model === agent.model` 时把它报成 `subagents.defaultModel`，否则按 frontmatter 处理。否则"配置的默认 model"会被当成显式违规拒掉。
+- **`continue` / `resume`**：本次调用显式传 `model` 用它，否则沿用 `ChildRecord.model`；`preset` 不在 revive 上展开，子会话沿用它被持久化的 model。
+- **provider pin 跟着 model 一起回放**（#123）：首启为候选 0 算出的 provider 落在 `ChildRecord.modelProvider`（只进 `run.json`；`legion.db` 的 `nodes` 没有 provider 列，本版不升级 schema，所以只能从 run 记录读）。`continue` / `resume` 沿用记录 model 时成对回放它；本次调用显式传的 `model` 与记录**相同**时仍沿用记录的 pin（custom id 在 registry 里查不到，重算只会把它丢掉），不同才改用父 registry 现算。回放前用当前 registry 校验 pin：上次由扩展注册、这次没加载的 provider（#123 原场景）会被跳过而不是硬钉——`Unknown provider` 是致命错误，比不 pin 更糟；registry 拿不到时不校验。命中 fallback 候选（非候选 0）时 spawn 不带 pin，也不落 provider（候选 0 的 pin 发给 fallback = 路由到错端或 `No API key`，fallback 形同作废）——宁可下次不 pin，也不钉错；同名 relaunch 换了 model 就丢掉旧 pin（只有新 model 与旧记录相同才允许沿用）。`providerForModel` 匹配前先 strip 已知的 `:thinking` 后缀（registry 的 id 不带它），否则带后缀的 model 永远匹配不上。
+- **model 解析 warning 可见但不致命**（B5）：`resolveCliModel` 对「未注册的 model id」（`Using custom model id.`，合法用法）与「非法 thinking 后缀」给出 `warning`。in-process 后端经 `onNotice` → `handle.warning` 把它透出来，launch 结果在 `▶` 行后、`continue`/`resume` 结果在 `Resumed …` 行后都追加一行 `  ⚠ <name>: <warning>`（与 `modelScope` 的 inherited 警告同样式）；排队 child 的 `▶` 行在入队时就打过了，所以它的 warning 由准入通知 `▶ … started after queued Ns` 带上。rpc 路径没有这个字段（子进程自己会报）。任何 `warning` 都**不得**升级成启动失败。
+- **provider 作用域**：第 4 级的 key 是"父会话的 provider"（`providerOf(dispatchModel)`），因此同一份角色配置可以按 provider 各写一套；user/project 两层设置按 provider 深合并（`resolveSubagentSettings`），不是整张表替换。该级**只认 `model`**：其余字段在本级不生效（用 `agentOverrides` 配），`model` 不是非空字符串时在解析期就报错（`parseAgentOverridesByProvider`，报错文案带 `agentOverridesByProvider.<provider>.<role>.model` 完整点路径），不留"看着配了、实际静默失效"的配置。
+
 ---
 
 ## 7. 持久化：`legion.db`
@@ -538,6 +569,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 - 中断（ESC / `abort`）保留子会话：`abort` 只打断当前 turn，`stop`/`retire` 才拆会话（`#313`/`#314`）。
 - `wait`/`collect` 超时不是失败：返回结构化 `decisions`（`extend` / `steer_again` / `stop` / `force_stop`），由父级选。
 - 验收（acceptance）：`deriveOutcome` 之外再看 `acceptance.level`。`attested` 是 agent 自评；只有 `verification-output` 证据且带显式 `command` 的 required 条件，才会由 `src/runs/acceptance.ts` 真跑并升级为 `verified` 或判 `rejected`。没有 `command` 的条件保持 `attested` 并列为 pending，交给父 agent 确认——平台不猜命令。
+- 失败要能被定位：rpc 启动失败由 `enrichFailureWithAutoDoctor` 附 doctor 片段；in-process 的 `inprocess model resolve failed …` 由 `appendInprocessModelHint`（`src/extension/spawn-hints.ts`，纯函数）追加 `models.json` / `PI_LEGION_CHILD_EXTENSIONS` 的 Fix 段，且只在命中该标记时追加——rpc 文案不含它，所以天然不会双份（已有 `Hint:` / `--- Legion auto-doctor` 段的 rpc 消息逐字不变）。普通 `Error` 的文案也逐字不变。
 
 ---
 
@@ -559,6 +591,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 | 派发/收集/回收/验收 | `src/runs/orchestrator.ts`、`src/runs/acceptance.ts` |
 | run 记录与目录 | `src/runs/store.ts` |
 | 子进程 argv/env | `src/runs/args.ts`、`src/extension/child-guard.ts` |
+| model 优先级 / 判源 / modelScope | `src/agents/{model-resolution,step-model,model-scope}.ts` |
 | worktree | `src/runs/worktree.ts` |
 | 三后端 | `src/supervisor/{routing,rpc,inprocess,terminal}-supervisor.ts` |
 | spawn 模式常量 | `src/supervisor/spawn-mode.ts` |

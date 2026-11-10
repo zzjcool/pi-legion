@@ -63,6 +63,34 @@ test("expectedModelsFromSettings reads team members", () => {
 	assert.ok(models.includes("cursor-plugin/glm-5p3"));
 });
 
+test("B8a.4: the `inherit` sentinel is not collected as an expected model", () => {
+	// `inherit` means "use the parent session's model" — never a registry
+	// entry. Collecting it made doctor warn that the child could not see a
+	// model called `inherit`, which no registry could ever provide.
+	const models = expectedModelsFromSettings({
+		subagents: {
+			defaultModel: "cb/real",
+			agentOverrides: { scout: { model: "inherit" } },
+			team: "t",
+			teams: {
+				t: {
+					members: [
+						{ agent: "worker", model: "inherit" },
+						{ agent: "planner", model: "cb/team" },
+					],
+				},
+			},
+		},
+	});
+	assert.ok(models.includes("cb/real"));
+	assert.ok(models.includes("cb/team"));
+	assert.equal(
+		models.includes("inherit"),
+		false,
+		`doctor must not look for a model called 'inherit': ${models.join(", ")}`,
+	);
+});
+
 test("parseDoctorSections validates names", () => {
 	assert.deepEqual(parseDoctorSections("models memory"), ["models", "memory"]);
 	assert.throws(() => parseDoctorSections("nope"), /Unknown doctor section/);

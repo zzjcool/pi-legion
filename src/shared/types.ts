@@ -237,6 +237,10 @@ export interface ModelSourceInfo {
 		| "subagents.defaultModel"
 		| "agentOverrides"
 		| "preset"
+		// A team member's `model`, folded into `agent.model` by `applyTeam`. It owns
+		// its own precedence level: above the settings-wide `agentOverrides` and
+		// below a preset (design §6.3 level 3).
+		| "team"
 		| "frontmatter"
 		| "dispatch"
 		| "inherit";
@@ -447,6 +451,20 @@ export interface ChildRecord {
 	kind?: AgentKind;
 	/** Model actually started with (resolved + fallback). */
 	model?: string;
+	/**
+	 * Provider that owned `model` at first launch, when it could be pinned (#123).
+	 *
+	 * Persisted so `continue`/`resume` can replay `--model` AND `--provider` as a
+	 * pair: the pin is what keeps a bare id from resolving into a colliding
+	 * static provider with no auth. Optional for the same reason `spawnMode` is —
+	 * run.json records written before the field existed have no value, and a
+	 * reader must treat those as unknown rather than guess a provider. Absent
+	 * also when the child started on a FALLBACK candidate: the provider was
+	 * computed for the model the caller asked for, so pairing it with a different
+	 * model would pin the wrong thing. Deliberately run.json only — the
+	 * `legion.db` `nodes` table has no such column (schema is not upgraded).
+	 */
+	modelProvider?: string;
 	thinking?: string | false;
 	/**
 	 * Backend this child was actually spawned on, as arbitrated by
@@ -617,6 +635,13 @@ export interface Handle {
 	queued?: boolean;
 	/** D4: 1-based queue position at enqueue time (always set when `queued === true`). */
 	queuePosition?: number;
+	/**
+	 * NON-FATAL model-resolution notice from the backend that spawned the child
+	 * (B5, in-process only — see `ChildHandle.warning`). Same meaning, one hop
+	 * closer to the caller, so `launchStep` can render it. Absent when the spawn
+	 * reported none; never persisted, since it describes THIS spawn.
+	 */
+	warning?: string;
 }
 
 // =============================================================================

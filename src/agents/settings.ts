@@ -27,6 +27,7 @@ import {
 } from "./context.ts";
 import { OVERRIDE_FIELDS } from "./overrides.ts";
 import { ignoredKindMessage, reportIgnoredOnce } from "../shared/ignored-kind.ts";
+import { INHERIT_MODEL_SENTINEL } from "./model-resolution.ts";
 import { parseModelScopeConfig } from "./model-scope.ts";
 import { parsePresets } from "./presets.ts";
 
@@ -461,7 +462,7 @@ export function parseSubagentSettings(
 
 	// Each reader validates one field and returns `undefined` when absent, so a
 	// missing key and a rejected key stay distinguishable (only the latter throws).
-	setIf(out, "defaultModel", requiredString(input.defaultModel, "defaultModel", filePath));
+	setIf(out, "defaultModel", parseDefaultModel(input.defaultModel, filePath));
 	setIf(out, "defaultProvider", requiredString(input.defaultProvider, "defaultProvider", filePath));
 	setIf(
 		out,
@@ -469,6 +470,11 @@ export function parseSubagentSettings(
 		parseOnBlocked(input.defaultOnBlocked, filePath),
 	);
 	setIf(out, "agentOverrides", parseAgentOverrides(input.agentOverrides, filePath));
+	setIf(
+		out,
+		"agentOverridesByProvider",
+		parseAgentOverridesByProvider(input.agentOverridesByProvider, filePath),
+	);
 	setIf(out, "teams", parseTeams(input.teams, filePath));
 	setIf(out, "team", requiredString(input.team, "team", filePath));
 	setIf(out, "disableBuiltins", requiredBoolean(input.disableBuiltins, "disableBuiltins", filePath));
@@ -493,7 +499,8 @@ export function parseSubagentSettings(
 	setIf(out, "rpc", parseRpcSettings(input.rpc, filePath));
 
 	// THE WHITELIST: every key read above must be assigned, or it is silently
-	// discarded. `presets` is the newest key and the easiest to drop here.
+	// discarded. `presets` and `agentOverridesByProvider` are the newest keys and
+	// the easiest to drop here.
 	setIf(out, "presets", parsePresets(input.presets, { filePath }));
 
 	return out;
@@ -521,6 +528,26 @@ function requiredString(
 		);
 	}
 	return value.trim();
+}
+
+/**
+ * `subagents.defaultModel`: a concrete model id, never the `inherit` sentinel.
+ *
+ * `inherit` means "use THIS session's model", which a settings-wide default
+ * cannot express — and `resolveModel` refuses an `inherit` with no parent model
+ * (D-B8a.1), so accepting it here would turn every launch from a model-less
+ * session into a failure. Rejected while parsing the file, where the operator
+ * can see it, instead of at the first spawn.
+ */
+function parseDefaultModel(value: unknown, filePath: string): string | undefined {
+	const model = requiredString(value, "defaultModel", filePath);
+	if (model === INHERIT_MODEL_SENTINEL) {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid 'subagents.defaultModel'; ` +
+				`'inherit' means "use the parent session's model", which a global default cannot express — set a concrete model id.`,
+		);
+	}
+	return model;
 }
 
 /** A boolean, or `undefined` when the key is absent. */
@@ -682,36 +709,96 @@ function parseAgentOverride(
 }
 
 /**
- * Validate `agentOverrides`; scalar entries or invalid supported fields must not
- * pass validation and then disappear during the field-by-field merge.
+ * Validate an override map keyed by ROLE (`agentOverrides`, and one provider's
+ * slice of `agentOverridesByProvider`).
+ *
+ * Scalar entries or invalid supported fields must not pass validation and then
+ * disappear during the field-by-field merge. `field` is the dotted path used in
+ * every message, so a nested map reports `agentOverridesByProvider.<provider>`
+ * instead of claiming the flat key is malformed.
  */
 function parseAgentOverrides(
 	value: unknown,
 	filePath: string,
+	field = "agentOverrides",
 ): SubagentsSettings["agentOverrides"] {
 	if (value === undefined) return undefined;
 	if (!isRecord(value)) {
 		throw new Error(
-			`Subagent settings in '${filePath}' have invalid 'agentOverrides'; expected an object.`,
+			`Subagent settings in '${filePath}' have invalid '${field}'; expected an object.`,
 		);
 	}
 	const parsed: NonNullable<SubagentsSettings["agentOverrides"]> = {};
 	for (const [name, override] of Object.entries(value)) {
 		if (!isRecord(override)) {
 			throw new Error(
-				`Subagent settings in '${filePath}' have invalid 'agentOverrides.${name}'; expected an object of agent fields.`,
+				`Subagent settings in '${filePath}' have invalid '${field}.${name}'; expected an object of agent fields.`,
 			);
 		}
 		const normalized: Record<string, unknown> = { ...override };
 		delete normalized.placement;
 		if (normalized.utility !== undefined && typeof normalized.utility !== "boolean") {
 			throw new Error(
-				`Subagent settings in '${filePath}' have invalid 'agentOverrides.${name}.utility'; expected a boolean.`,
+				`Subagent settings in '${filePath}' have invalid '${field}.${name}.utility'; expected a boolean.`,
 			);
 		}
 		parsed[name] = normalized as AgentOverride;
 	}
 	return parsed;
+}
+
+/**
+ * Validate `agentOverridesByProvider` (design §6.3, model level 3).
+ *
+ * A provider-scoped map is only meaningful if the parser admits it: the settings
+ * reader assigns each key it reads explicitly, so a key read nowhere would be
+ * accepted and silently inert (§6.2's "accepted but inert" trap). Each provider's
+ * role map therefore goes through the SAME validator as `agentOverrides`, with
+ * the dotted path preserved in every message.
+ *
+ * This level acts on `model` ONLY: `resolveModel`'s candidate 3 reads
+ * `agentOverridesByProvider.<provider>.<role>.model` and nothing else. Other
+ * fields (`thinking`, `preset`, `disabled`, …) belong in the flat
+ * `agentOverrides` map; a `model` that is not a non-blank string is refused here
+ * rather than accepted and silently ignored by the consumer.
+ *
+ * An empty provider map carries no information, so it is dropped rather than
+ * recorded as `{}` (which would look like an explicit, empty override block).
+ */
+function parseAgentOverridesByProvider(
+	value: unknown,
+	filePath: string,
+): SubagentsSettings["agentOverridesByProvider"] {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid 'agentOverridesByProvider'; expected an object.`,
+		);
+	}
+	const parsed: NonNullable<SubagentsSettings["agentOverridesByProvider"]> = {};
+	for (const [provider, roles] of Object.entries(value)) {
+		const field = `agentOverridesByProvider.${provider}`;
+		if (!isRecord(roles)) {
+			throw new Error(
+				`Subagent settings in '${filePath}' have invalid '${field}'; expected an object of agent fields.`,
+			);
+		}
+		const entries = parseAgentOverrides(roles, filePath, field);
+		if (entries) {
+			// The consumer reads `model` and nothing else, so anything that is not a
+			// usable model string must not look configured.
+			for (const [role, entry] of Object.entries(entries)) {
+				const model: unknown = entry.model;
+				if (model !== undefined && (typeof model !== "string" || !model.trim())) {
+					throw new Error(
+						`Subagent settings in '${filePath}' have invalid '${field}.${role}.model'; expected a non-empty string.`,
+					);
+				}
+			}
+			if (Object.keys(entries).length > 0) parsed[provider] = entries;
+		}
+	}
+	return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
 
 type InvalidTeamSetting = (field: string, expected: string) => never;
@@ -833,7 +920,10 @@ export function loadSubagentSettings(
 /**
  * Merge project settings over user settings.
  * `legion`, `agentOverrides`, `teams` and `presets` shallow-merge;
- * `legion.phaseTimeouts` also merges per phase. `modelScope` is replaced
+ * `legion.phaseTimeouts` also merges per phase. `agentOverridesByProvider`
+ * merges ONE LEVEL DEEPER: per provider, then shallow per role, so a project
+ * that configures `pi` does not drop the user's `cb` block (or the user's other
+ * roles under the same provider). `modelScope` is replaced
  * wholesale. A project team with the same name replaces the user's complete
  * team definition.
  */
@@ -871,6 +961,23 @@ export function resolveSubagentSettings(
 			...(user.agentOverrides ?? {}),
 			...project.agentOverrides,
 		};
+	}
+
+	if (project.agentOverridesByProvider) {
+		// Provider-scoped overrides are keyed two levels deep, so a plain spread
+		// would be the `agentOverrides` shape applied to the wrong level: the
+		// project's provider set would REPLACE the user's and silently drop every
+		// role the project did not mention. Merge per provider, then per role.
+		const merged: NonNullable<SubagentsSettings["agentOverridesByProvider"]> = {
+			...(user.agentOverridesByProvider ?? {}),
+		};
+		for (const [provider, roles] of Object.entries(project.agentOverridesByProvider)) {
+			merged[provider] = {
+				...(user.agentOverridesByProvider?.[provider] ?? {}),
+				...roles,
+			};
+		}
+		out.agentOverridesByProvider = merged;
 	}
 
 	if (project.teams) {

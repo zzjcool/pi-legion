@@ -31,6 +31,7 @@ import { inProcessDepth, runAtAbsoluteDepth } from "../../src/supervisor/inproce
 import { runInChildContext, type ChildLaunchContext } from "../../src/supervisor/child-context.ts";
 import { getNode } from "../../src/legion/nodes.ts";
 import { ErrorCodes, SubagentError, type AgentConfig, type ChildRecord } from "../../src/shared/types.ts";
+import { MODEL_WARNING } from "../helpers/model-warning.ts";
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -96,6 +97,12 @@ function harness(
 	options: {
 		limits?: { maxActive?: number; maxChildrenPerNode?: number; maxDepth?: number };
 		launchQueue?: { maxPending?: number; timeoutMs?: number };
+		/**
+		 * B5: what the session factory reports through `input.onNotice` on every
+		 * spawn — the in-process backend's only channel for a non-fatal
+		 * model-resolution warning.
+		 */
+		notice?: string;
 	} = {},
 ): Harness {
 	// The queue registry is keyed by `${pid}:${runDir}`, and every harness uses a
@@ -112,6 +119,7 @@ function harness(
 		limits: { maxActive: 30, maxChildrenPerNode: 8, ...(options.limits ?? {}) },
 		sessionFactory: async (input) => {
 			spawnedNames.push(input.name);
+			if (options.notice !== undefined) input.onNotice?.(options.notice);
 			return new SyncSession(input.sessionFile);
 		},
 	});
@@ -173,6 +181,21 @@ async function settleWithin(
 	}
 }
 
+/**
+ * Poll until `predicate()` holds, or fail with a legible verdict.
+ *
+ * A queued item is spawned by the PUMP, never by the `launch` call that
+ * enqueued it, so there is no promise to await — the effect is the only signal.
+ */
+async function waitUntil(predicate: () => boolean, what: string, timeoutMs = 2_000): Promise<void> {
+	const startedAt = Date.now();
+	while (Date.now() - startedAt < timeoutMs) {
+		if (predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.fail(`timed out after ${timeoutMs}ms waiting for ${what}`);
+}
+
 // ── A21 (D2-b): the in-flight reservation is what makes same-tick fanout work ──
 
 test("A21: eight same-tick launches all spawn, the ninth is queued (D2-b in-flight reservation)", async () => {
@@ -208,6 +231,48 @@ test("A21: the fast path enqueues nothing and gains no queue entry (D2-b)", asyn
 		assert.ok(handle.queued !== true, "a launch with a free slot must not queue");
 		assert.equal(h.orchestrator.launchQueueEntries().length, 0, "the queue stays untouched");
 		assert.equal(h.spawned().join(","), "worker-0");
+	} finally {
+		h.cleanup();
+	}
+});
+
+// ── B5/R2: the admission notice is a queued child's only ⚠ channel ─────────
+//
+// A queued launch renders its `▶` line at ENQUEUE time, so the spawn happens
+// later, inside `admitQueued` — where `handle.warning` is the only thing that
+// knows what the model resolution said. Dropping the join there loses B5 on the
+// path fan-out actually takes (the queue is what `maxActive` hits first).
+
+test("B5/R2: an admitted queued launch reports its spawn-time warning in the queue notice", async () => {
+	const h = harness({ limits: { maxChildrenPerNode: 1 }, notice: MODEL_WARNING });
+	try {
+		await h.orchestrator.launch({ agent: agent(), task: "holder", name: "worker-0", worktree: false });
+		const queued = await h.orchestrator.launch({ agent: agent(), task: "waits", name: "worker-1", worktree: false });
+		assert.equal(queued.queued, true, "the only slot is taken, so this one waits");
+		// Freeing the slot is what lets the pump admit it.
+		await h.orchestrator.retire("worker-0");
+		await waitUntil(() => h.spawned().includes("worker-1"), `worker-1 to be admitted; spawned=${JSON.stringify(h.spawned())}`);
+		const notice = h.notices.find((line) => line.includes("started after queued"));
+		assert.ok(notice, `expected the admission notice, saw ${JSON.stringify(h.notices)}`);
+		const lines = notice.split("\n");
+		assert.match(lines[0] ?? "", /^▶ worker-1 started after queued \d+s$/u, "the baseline line is unchanged");
+		assert.equal(lines[1], `  ⚠ worker-1: ${MODEL_WARNING}`, "the warning rides along, or nobody ever sees it");
+	} finally {
+		h.cleanup();
+	}
+});
+
+/** Anti-regression: a clean admission invents no `⚠` line (nor any other). */
+test("B5/R2: an admitted queued launch with no warning reports only the baseline line", async () => {
+	const h = harness({ limits: { maxChildrenPerNode: 1 } });
+	try {
+		await h.orchestrator.launch({ agent: agent(), task: "holder", name: "worker-0", worktree: false });
+		const queued = await h.orchestrator.launch({ agent: agent(), task: "waits", name: "worker-1", worktree: false });
+		assert.equal(queued.queued, true);
+		await h.orchestrator.retire("worker-0");
+		await waitUntil(() => h.spawned().includes("worker-1"), `worker-1 to be admitted; spawned=${JSON.stringify(h.spawned())}`);
+		const notice = h.notices.find((line) => line.includes("started after queued"));
+		assert.match(notice ?? "", /^▶ worker-1 started after queued \d+s$/u, "exactly the baseline line, nothing appended");
 	} finally {
 		h.cleanup();
 	}

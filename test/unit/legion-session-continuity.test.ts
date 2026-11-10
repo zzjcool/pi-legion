@@ -35,6 +35,8 @@ import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
 import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import { getChildren, getNode, insertNode } from "../../src/legion/nodes.ts";
 import { markSessionInterrupted } from "../../src/legion/interrupt.ts";
+import { sendMail } from "../../src/legion/mail.ts";
+import type { ProviderLookup } from "../../src/runs/provider-pin.ts";
 import { LEGION_PHASES_ENV } from "../../src/runs/args.ts";
 import { Orchestrator, type OrchestratorLegionContext } from "../../src/runs/orchestrator.ts";
 import { RunStore } from "../../src/runs/store.ts";
@@ -148,6 +150,8 @@ function harness(prefix: string) {
 	const supervisor = new FakeSupervisor({ immediateTimeout: false });
 	const notices: string[] = [];
 	let sessionFile = path.join(root, "session.jsonl");
+	/** The parent model registry, when a test needs a provider pin (#123). */
+	let modelRegistry: ProviderLookup | undefined;
 	let tools = new Map<string, RegisteredTool>();
 	let handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
 
@@ -156,6 +160,7 @@ function harness(prefix: string) {
 		hasUI: false,
 		ui: { notify: (text: string) => notices.push(text), setStatus() {} },
 		sessionManager: { getSessionFile: () => sessionFile },
+		...(modelRegistry ? { modelRegistry } : {}),
 	});
 
 	const boot = (): void => {
@@ -250,6 +255,14 @@ function harness(prefix: string) {
 		},
 		useSession(file: string): void {
 			sessionFile = file;
+		},
+		/** Register the parent providers `providerForModel` may pin (#123). */
+		useModelRegistry(registry: ProviderLookup): void {
+			modelRegistry = registry;
+		},
+		/** This checkout's ledger path for the root run (`PI_LEGION_DB`). */
+		legionDb(): string {
+			return legionDbPath(path.join(repo, ".pi-subagents", "runs", rootRun().runId));
 		},
 		cleanup(): void {
 			for (const [name, value] of previousEnv) {
@@ -662,6 +675,154 @@ test("#374 §4: `subagent resume` restarts a paused team with the SAME declared 
 		} finally {
 			ledger.close();
 		}
+	} finally {
+		await h.shutdown().catch(() => {});
+		h.cleanup();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// #123 residual — the LEDGER's own resume route replays the pin with its model
+// ---------------------------------------------------------------------------
+//
+// A paused legion child comes back through `resumeLegionChild` whenever MAIL
+// reaches it (`LegionPostman.resumeChild`), not through `reviveChild`, which is
+// what a `subagent({action:"continue"|"resume"})` tool call takes. Both replay
+// the model; only this route had zero tests, so deleting its provider replay
+// changed nothing anywhere in the suite — while legion revival is #123's
+// original scene (`legion.db`'s `nodes` table has no provider column, so the pin
+// can only come from the child's `run.json` record, or from nowhere).
+
+const TEAM_MODEL = "cb/team-model";
+
+/** Queue a mail to a paused child; the postman delivers it on its next tick. */
+function mailPausedChild(h: Harness, nodeId: string): void {
+	const ledger = h.ledger();
+	try {
+		const sent = sendMail(ledger.db, {
+			fromNode: "root",
+			to: nodeId,
+			subject: "carry on",
+			body: "keep going",
+		});
+		assert.equal(sent.ok, true, `the mail must be queued: ${JSON.stringify(sent)}`);
+	} finally {
+		ledger.close();
+	}
+}
+
+/**
+ * Start the NEXT process and reattach this session's ledger.
+ *
+ * `PI_LEGION_DB`/`PI_LEGION_NODE_ID` is how a resumed process adopts an existing
+ * tree; the first postman tick then delivers whatever is pending.
+ */
+async function reattachNextProcess(h: Harness): Promise<void> {
+	h.boot();
+	process.env.PI_LEGION_DB = h.legionDb();
+	process.env.PI_LEGION_NODE_ID = "root";
+	await h.call({ action: "status", all: true });
+}
+
+/** Wait for a spawn no tool call hands back: a postman delivery makes it. */
+async function waitForSpawn(
+	h: Harness,
+	name: string,
+	count: number,
+): Promise<(typeof h.supervisor.spawns)[number]> {
+	const startedAt = Date.now();
+	while (Date.now() - startedAt < 3_000) {
+		const matches = h.supervisor.spawns.filter((spawn) => spawn.input.name === name);
+		if (matches.length >= count) return matches[matches.length - 1]!;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	assert.fail(
+		`no spawn #${count} for ${name}; saw ${JSON.stringify(h.supervisor.spawns.map((spawn) => spawn.input.name))}`,
+	);
+}
+
+/**
+ * The first launch pins `{model, modelProvider}` into run.json; the revive that
+ * a mail triggers must send BOTH again. Sending only the model is the defect:
+ * the bare id can resolve into a colliding static provider with no auth (#123).
+ */
+test("#123: a mail-resumed legion child replays the provider pin stored with its model", async () => {
+	const h = harness("legion-123-resume-pin-");
+	try {
+		h.boot();
+		h.useModelRegistry({ getAll: () => [{ provider: "live", id: TEAM_MODEL }] });
+		await h.call({
+			agent: "centurion",
+			task: "own the slice",
+			phases: TEAM_MACHINE,
+			model: TEAM_MODEL,
+			async: true,
+			worktree: true,
+		});
+		const first = h.supervisor.spawns[0];
+		assert.ok(first, "the team was spawned");
+		assert.equal(first.input.model, TEAM_MODEL);
+		assert.equal(first.input.modelProvider, "live", "the first launch pins the provider that owns the model");
+		await h.shutdown();
+
+		const record = h.store().findChild(h.rootRun().runId, "centurion-0");
+		assert.equal(record?.model, TEAM_MODEL);
+		assert.equal(record?.modelProvider, "live", "run.json is the only place a later process can read the pin");
+
+		mailPausedChild(h, "root.centurion-0");
+
+		// ── the next process reattaches THIS session's tree; its postman tick
+		// delivers the pending mail, and a delivery to a paused child is the route
+		// that reaches `resumeLegionChild`.
+		await reattachNextProcess(h);
+
+		const revived = await waitForSpawn(h, "centurion-0", 2);
+		assert.equal(revived.input.model, TEAM_MODEL);
+		assert.equal(revived.input.modelProvider, "live", "the pin must be replayed WITH its model");
+	} finally {
+		await h.shutdown().catch(() => {});
+		h.cleanup();
+	}
+});
+
+/**
+ * The same route, one record short: the ledger knows the child but `run.json`
+ * does not. The synthesized record has no provider (the `nodes` table has no
+ * such column and is deliberately not migrated), so the revive must send NO pin
+ * rather than guess one — a pinned-but-wrong provider is the #123 failure.
+ */
+test("#123: a resume from a SYNTHESIZED record sends no pin — it never guesses one", async () => {
+	const h = harness("legion-123-resume-synth-");
+	try {
+		h.boot();
+		h.useModelRegistry({ getAll: () => [{ provider: "live", id: TEAM_MODEL }] });
+		await h.call({
+			agent: "centurion",
+			task: "own the slice",
+			phases: TEAM_MACHINE,
+			model: TEAM_MODEL,
+			async: true,
+			worktree: true,
+		});
+		await h.shutdown();
+		const store = h.store();
+		await store.removeChild(h.rootRun().runId, "centurion-0");
+		assert.equal(
+			store.findChild(h.rootRun().runId, "centurion-0"),
+			null,
+			"run.json no longer knows this child",
+		);
+
+		mailPausedChild(h, "root.centurion-0");
+		await reattachNextProcess(h);
+
+		const revived = await waitForSpawn(h, "centurion-0", 2);
+		assert.equal(revived.input.model, TEAM_MODEL, "the ledger still knows the model");
+		assert.equal(
+			Object.hasOwn(revived.input, "modelProvider"),
+			false,
+			"a record without a pin must revive without one",
+		);
 	} finally {
 		await h.shutdown().catch(() => {});
 		h.cleanup();

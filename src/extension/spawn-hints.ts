@@ -39,6 +39,17 @@ export function clearSpawnFailures(): void {
 const MODEL_NOT_FOUND =
 	/Model\s+"[^"]+"\s+not found|No models available|Use --list-models|Unknown provider|inprocess model resolve failed/i;
 
+/**
+ * The in-process backend's own wording for a model it could not resolve
+ * (`defaultSessionFactory` → `SubagentError(START_FAILED)`).
+ *
+ * Also the idempotence gate below: an rpc failure never contains it (its text
+ * comes from a child process that never ran this code), so appending on this
+ * marker alone cannot double up on a message that already carries a `Hint:` /
+ * `--- Legion auto-doctor ---` section.
+ */
+const INPROCESS_RESOLVE_FAILED = /inprocess model resolve failed/i;
+
 export function looksLikeMissingModel(stderr: string | undefined): boolean {
 	return Boolean(stderr && MODEL_NOT_FOUND.test(stderr));
 }
@@ -116,6 +127,33 @@ export function spawnFailureHint(input: {
 		"or add them under the role's `extensions:` frontmatter. " +
 		"Run `/legion doctor` or `subagent action=diagnose` for paths.",
 	);
+}
+
+/**
+ * The in-process counterpart of `enrichFailureWithAutoDoctor` (R5 D-H1).
+ *
+ * A failed in-process spawn reports
+ * `inprocess model resolve failed for '<id>': Model "<id>" not found …` — which
+ * `MODEL_NOT_FOUND` already matches and `spawnFailureHint` already knows how to
+ * fix — but nothing called it on this path, so the caller got the raw `✗` line
+ * and no escape hatch (the rpc path is enriched in `rpc-supervisor`).
+ *
+ * Deliberately NOT routed through `enrichFailureWithAutoDoctor`: that one writes
+ * the process-wide `recentFailures` ring (8 entries, shared across runs), and an
+ * in-process record in it (no argv, `hadNoExtensions: false`) is then offered as
+ * the doctor snippet for a LATER, unrelated rpc failure.
+ *
+ * Pure apart from the in-memory discovery holder `spawnFailureHint` reads: no
+ * ring write, no IO. A message that is not an in-process model miss — including
+ * every already-hinted rpc failure and every plain `Error` — is returned byte for
+ * byte, which is what the frozen result wording depends on.
+ */
+export function appendInprocessModelHint(message: string): string {
+	if (!INPROCESS_RESOLVE_FAILED.test(message)) return message;
+	// `session.results` / the utility segments are joined with `\n`, so the shape
+	// is `${message}\n\n${hint}` exactly as `enrichFailureWithAutoDoctor` does it.
+	const hint = spawnFailureHint({ stderr: message, spawnMode: "inprocess" });
+	return hint ? `${message}\n\n${hint}` : message;
 }
 
 /** Short hint only. Spawn paths use `enrichFailureWithAutoDoctor` for auto snippets. */

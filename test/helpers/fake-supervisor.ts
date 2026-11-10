@@ -78,6 +78,12 @@ export interface FakeSupervisorOptions {
 	autoSettle?: FakeTurn | ((input: SpawnInput) => FakeTurn);
 	/** Reject selected spawns to exercise model fallback. */
 	rejectSpawn?: (input: SpawnInput) => Error | undefined;
+	/**
+	 * B5: the non-fatal `warning` every spawn's handle carries (a string, or a
+	 * per-spawn function). Absent — the default — means the handle has no such
+	 * field at all, exactly like a clean spawn.
+	 */
+	handleWarning?: string | ((input: SpawnInput) => string | undefined);
 	/** Optional initial cumulative stats snapshot. */
 	usage?: UsageSnapshot | null;
 }
@@ -125,6 +131,7 @@ export class FakeSupervisor implements LegionSupervisor {
 	private readonly immediateTimeout: boolean;
 	private readonly autoSettle?: FakeSupervisorOptions["autoSettle"];
 	private readonly rejectSpawn?: FakeSupervisorOptions["rejectSpawn"];
+	private readonly handleWarning?: FakeSupervisorOptions["handleWarning"];
 	private readonly initialUsage: UsageSnapshot | null;
 	/**
 	 * Disposition every `steer` call reports (#313). Defaults to the honest
@@ -137,6 +144,7 @@ export class FakeSupervisor implements LegionSupervisor {
 		this.immediateTimeout = options.immediateTimeout ?? true;
 		this.autoSettle = options.autoSettle;
 		this.rejectSpawn = options.rejectSpawn;
+		this.handleWarning = options.handleWarning;
 		this.initialUsage = options.usage ?? null;
 	}
 
@@ -191,7 +199,16 @@ export class FakeSupervisor implements LegionSupervisor {
 				if (this.isAlive(input.name)) this.settle(input.name, turn);
 			});
 		}
-		return { name: input.name, sessionFile: input.sessionFile, pid: 1000 + this.spawns.length };
+		// B5: a handle-level warning is what the in-process factory's `onNotice`
+		// path produces; the assertion target is the rendered line, not this hop.
+		const warning =
+			typeof this.handleWarning === "function" ? this.handleWarning(input) : this.handleWarning;
+		return {
+			name: input.name,
+			sessionFile: input.sessionFile,
+			pid: 1000 + this.spawns.length,
+			...(warning ? { warning } : {}),
+		};
 	}
 
 	async prompt(name: string, text: string): Promise<void> {

@@ -22,7 +22,11 @@ import {
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import type { AgentConfig } from "../../src/shared/types.ts";
+import {
+	ErrorCodes,
+	SubagentError,
+	type AgentConfig,
+} from "../../src/shared/types.ts";
 
 function agent(over: Partial<AgentConfig> = {}): AgentConfig {
 	return {
@@ -218,6 +222,43 @@ test("resolve: 'inherit' selects the dispatch model explicitly", () => {
 	assert.equal(r.source?.type, "inherit");
 });
 
+// ─────────── B8a: `inherit` with nothing to inherit is a refusal ───────────
+//
+// The parent session's model is the ONLY thing `inherit` can resolve to. With
+// none, the old code returned a model-less shape whose `source.model` still
+// read `inherit`; the orchestrator re-read `agent.model`, spawned
+// `--model inherit`, and pi answered the fatal `Model "inherit" not found`.
+
+test("B8a.1: `inherit` with no dispatch model is a loud INVALID_PARAMS refusal", () => {
+	assert.throws(
+		() => resolveModel({ agent: agent({ model: "inherit" }) }),
+		(error: unknown) => {
+			assert.ok(
+				error instanceof SubagentError,
+				`must be a SubagentError with a code: ${String(error)}`,
+			);
+			assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
+			assert.match(error.message, /inherit/, "the message must name the sentinel");
+			assert.match(
+				error.message,
+				/defaultModel/,
+				"the message must name the fix the operator has",
+			);
+			return true;
+		},
+	);
+});
+
+test("B8a.1: `inherit` as the per-run override refuses too (tool params)", () => {
+	// Every level that can hold a model reaches the same branch, so the refusal
+	// cannot be dodged by writing the sentinel into the launch call itself.
+	assert.throws(
+		() => resolveModel({ agent: agent(), override: "inherit" }),
+		(error: unknown) =>
+			error instanceof SubagentError && error.code === ErrorCodes.INVALID_PARAMS,
+	);
+});
+
 test("resolve: no candidates yields no model", () => {
 	const r = resolveModel({ agent: agent() });
 	assert.equal(r.model, undefined);
@@ -316,6 +357,20 @@ test("settings: rejects a non-object subagents value", () => {
 test("settings: rejects an empty defaultModel", () => {
 	assert.throws(() =>
 		parseSubagentSettings({ subagents: { defaultModel: "  " } }, "/s.json"),
+	);
+});
+
+test("B8a.2: subagents.defaultModel: \"inherit\" is rejected at parse time", () => {
+	// `inherit` means "use THIS session's model" — as a settings-wide default it
+	// can only make every launch from a model-less session fail (B8a.1).
+	assert.throws(
+		() => parseSubagentSettings({ subagents: { defaultModel: "inherit" } }, "/s.json"),
+		(error: unknown) => {
+			assert.ok(error instanceof Error);
+			assert.match(error.message, /subagents\.defaultModel/);
+			assert.match(error.message, /inherit/);
+			return true;
+		},
 	);
 });
 
@@ -604,6 +659,13 @@ test("modelCandidates is unique and keeps an empty primary as one attempt", () =
 	assert.deepEqual(modelCandidates("  ", [" x "]), [undefined, "x"]);
 });
 
+test("B8a.3: modelCandidates filters the `inherit` sentinel out of every position", () => {
+	// Defence in depth for callers that bypass `resolveModel`: the sentinel is a
+	// launch instruction, never a model id, so it must not reach `--model`.
+	assert.deepEqual(modelCandidates("inherit", ["cb/fb", "inherit"]), ["cb/fb"]);
+	assert.deepEqual(modelCandidates("inherit"), [undefined]);
+});
+
 // ─────────────────────────── join settings (smart join) ───────────────────────────
 
 test("settings: joinMode accepts each/smart, rejects anything else", () => {
@@ -656,4 +718,122 @@ test("settings: join keys default to absent and project overrides user", () => {
 	);
 	assert.equal(kept.joinMode, "each");
 	assert.equal(kept.joinFlushMs, 1000);
+});
+
+// ─────────── agentOverridesByProvider: the settings whitelist (D1) ───────────
+
+test("D1a settings: agentOverridesByProvider survives parseSubagentSettings", () => {
+	// Same trap as `presets`: a key read nowhere is dropped without a word, so a
+	// provider-scoped override map would be accepted-and-inert.
+	const parsed = parseSubagentSettings(
+		{
+			subagents: {
+				agentOverridesByProvider: {
+					cb: { worker: { model: "cb/glm-5.3" } },
+				},
+			},
+		},
+		"/s.json",
+	);
+	assert.deepEqual(parsed.agentOverridesByProvider, {
+		cb: { worker: { model: "cb/glm-5.3" } },
+	});
+});
+
+test("D1a settings: an empty agentOverridesByProvider map is dropped, not kept", () => {
+	const parsed = parseSubagentSettings(
+		{ subagents: { agentOverridesByProvider: {} } },
+		"/s.json",
+	);
+	assert.equal("agentOverridesByProvider" in parsed, false);
+});
+
+test("D1b settings: a non-object agentOverridesByProvider is rejected", () => {
+	assert.throws(
+		() => parseSubagentSettings({ subagents: { agentOverridesByProvider: "cb" } }, "/s.json"),
+		/invalid 'agentOverridesByProvider'; expected an object\./,
+	);
+});
+
+test("D1b settings: a malformed provider entry names its full dot path", () => {
+	assert.throws(
+		() =>
+			parseSubagentSettings(
+				{ subagents: { agentOverridesByProvider: { cb: "worker" } } },
+				"/s.json",
+			),
+		/invalid 'agentOverridesByProvider\.cb'/,
+	);
+	assert.throws(
+		() =>
+			parseSubagentSettings(
+				{ subagents: { agentOverridesByProvider: { cb: { worker: "cb/glm" } } } },
+				"/s.json",
+			),
+		/invalid 'agentOverridesByProvider\.cb\.worker'/,
+	);
+});
+
+test("D1b settings: role entries are validated like agentOverrides", () => {
+	// `utility` is a boolean field in both maps; a string must be refused with the
+	// provider-scoped path, not silently normalized.
+	assert.throws(
+		() =>
+			parseSubagentSettings(
+				{ subagents: { agentOverridesByProvider: { cb: { worker: { utility: "yes" } } } } },
+				"/s.json",
+			),
+		/invalid 'agentOverridesByProvider\.cb\.worker\.utility'/,
+	);
+});
+
+test("F2 settings: a provider-scoped `model` must be a non-empty string", () => {
+	// The level-3 consumer reads `model` and nothing else, so a number used to be
+	// accepted and then silently ignored — "configured but inert" is exactly what
+	// the parser promises not to do. The message must name the full dot path.
+	assert.throws(
+		() =>
+			parseSubagentSettings(
+				{ subagents: { agentOverridesByProvider: { cb: { worker: { model: 123 } } } } },
+				"/s.json",
+			),
+		/invalid 'agentOverridesByProvider\.cb\.worker\.model'; expected a non-empty string\./,
+	);
+	assert.throws(
+		() =>
+			parseSubagentSettings(
+				{ subagents: { agentOverridesByProvider: { cb: { worker: { model: "   " } } } } },
+				"/s.json",
+			),
+		/invalid 'agentOverridesByProvider\.cb\.worker\.model'; expected a non-empty string\./,
+	);
+	// A usable string still parses unchanged.
+	const parsed = parseSubagentSettings(
+		{ subagents: { agentOverridesByProvider: { cb: { worker: { model: " cb/glm-5.3 " } } } } },
+		"/s.json",
+	);
+	assert.deepEqual(parsed.agentOverridesByProvider, { cb: { worker: { model: " cb/glm-5.3 " } } });
+});
+
+test("D1c settings: agentOverridesByProvider merges ONE LEVEL DEEPER than the rest", () => {
+	// The shallow-spread trap: merging the provider maps wholesale would drop the
+	// user's `cb` block the moment the project configures `pi`.
+	const merged = resolveSubagentSettings(
+		{
+			agentOverridesByProvider: {
+				cb: { worker: { model: "cb/user-worker" }, scout: { model: "cb/user-scout" } },
+			},
+		},
+		{ agentOverridesByProvider: { cb: { worker: { model: "cb/project-worker" } }, pi: { worker: { model: "pi/x" } } } },
+	);
+	assert.deepEqual(merged.agentOverridesByProvider, {
+		cb: { worker: { model: "cb/project-worker" }, scout: { model: "cb/user-scout" } },
+		pi: { worker: { model: "pi/x" } },
+	});
+});
+
+test("D1c settings: a project with no provider map keeps the user's", () => {
+	const userOnly = { agentOverridesByProvider: { cb: { worker: { model: "cb/u" } } } };
+	const merged = resolveSubagentSettings(userOnly, { defaultModel: "cb/mid" });
+	assert.deepEqual(merged.agentOverridesByProvider, userOnly.agentOverridesByProvider);
 });
