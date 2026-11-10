@@ -3679,11 +3679,21 @@ async function reviveChild(
 			return ok(`${prefix} (live child steered).`);
 		}
 
+		// A `model` passed to THIS call is the caller's own choice and wins over the
+		// model recorded at the first launch; without it the recorded model is kept,
+		// so a resume cannot silently move a child to whatever the settings say now.
+		// `modelProvider` is deliberately not passed: only `LaunchSession` carries a
+		// `modelRegistry`, and this scope has none — threading one down would be a
+		// new pipeline, not part of this fix.
+		const revivedModel = params.model?.trim() || found.child.model;
 		const handle = await orchestrator.launch({
 			agent: agentDef,
 			task: params.message,
 			name,
-			...(found.child.model ? { model: found.child.model } : {}),
+			...(revivedModel ? { model: revivedModel } : {}),
+			// `preset` is NOT expanded on a revive, on purpose: the child resumes the
+			// model it was persisted with, so a later settings edit cannot move a
+			// session that is already in flight.
 			// #374 §4: a team declared its machine at FIRST launch; a resume in a
 			// later process must replay that declaration or the child falls back to
 			// the role card and its custom phase names read as `invalid_phase`.
@@ -4054,11 +4064,21 @@ async function launchStep(
 		const violation = checkModelScope(
 			resolved.model,
 			session.settings.modelScope,
-			"explicit",
+			// The REAL origin of the winning model: a per-run override or a preset is
+			// a deliberate choice (refusable), while `subagents.defaultModel`, an
+			// `inherit` or the parent model falling through is not (warn only).
+			// Hardcoding `"explicit"` here refused every inherited out-of-scope model,
+			// i.e. the operator's own configured default.
+			model.modelOrigin,
 		);
-		if (violation && violation.severity === "error") {
-			session.results.push(`✗ ${violation.message}`);
-			return;
+		if (violation) {
+			if (violation.severity === "error") {
+				session.results.push(`✗ ${violation.message}`);
+				return;
+			}
+			// Inherited model: report it and START ANYWAY. Refusing would break an
+			// existing configuration whose default model predates the allow-list.
+			session.results.push(`⚠ ${violation.message}`);
 		}
 
 		// Honor `name=` in this order: a per-item `tasks[]` handle wins over the
@@ -4398,6 +4418,25 @@ async function launchUtilityFamily(input: {
 	if (!plan.ok) return fail(plan.message, ErrorCodes.INVALID_PARAMS);
 
 	const catalog = loadCatalog(input.sessionCwd, input.cwd, undefined);
+	/**
+	 * `modelScope` warnings for this batch, in step order.
+	 *
+	 * Collected here because the result channel (`results`) is created further
+	 * down, after the launch plan is resolved; a warning that is dropped is
+	 * exactly the silent refusal this path used to give inherited models.
+	 */
+	const scopeWarnings: string[] = [];
+	/**
+	 * Early exit that still reports the warnings collected so far.
+	 *
+	 * `results` only exists once the whole launch plan is resolved, so a refusal
+	 * raised inside the prep loop would drop the inherited-model warnings already
+	 * collected for its sibling steps — the caller is owed those lines even when
+	 * this batch ends in `fail()`. With nothing collected the message is passed
+	 * through byte for byte.
+	 */
+	const failUtility = (text: string, code: string): AgentToolResult<unknown> =>
+		scopeWarnings.length > 0 ? fail(`${scopeWarnings.join("\n")}\n${text}`, code) : fail(text, code);
 	const prepared: Array<{
 		step: UtilityTaskItem;
 		agent: AgentConfig;
@@ -4419,7 +4458,7 @@ async function launchUtilityFamily(input: {
 			}),
 		);
 		if (explicitlyMentionedByTeam) {
-			return fail(
+			return failUtility(
 				unknownAgentLineForCatalog(
 					catalog.agents,
 					catalog.allAgents,
@@ -4432,13 +4471,13 @@ async function launchUtilityFamily(input: {
 		}
 		const agent = selectedAgent ?? fallbackAgent;
 		if (!agent?.utility) {
-			return fail(
+			return failUtility(
 				`not a utility agent: ${step.agent} (mark it with 'utility: true')`,
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
 		if (agent.disabled) {
-			return fail(`utility agent is disabled: ${agent.name}`, ErrorCodes.DISABLED);
+			return failUtility(`utility agent is disabled: ${agent.name}`, ErrorCodes.DISABLED);
 		}
 		try {
 			const resolvedStep = resolveStepModel({
@@ -4457,7 +4496,12 @@ async function launchUtilityFamily(input: {
 				resolvedStep.modelOrigin,
 			);
 			if (violation?.severity === "error") {
-				return fail(violation.message, ErrorCodes.INVALID_PARAMS);
+				return failUtility(violation.message, ErrorCodes.INVALID_PARAMS);
+			}
+			// Inherited (not chosen) model: warn and launch anyway — same rule as
+			// `launchStep`, surfaced through this path's own result channel below.
+			if (violation) {
+				scopeWarnings.push(`⚠ ${step.agent}: ${violation.message}`);
 			}
 			prepared.push({
 				step,
@@ -4466,7 +4510,7 @@ async function launchUtilityFamily(input: {
 				modelOrigin: resolvedStep.modelOrigin,
 			});
 		} catch (error) {
-			return fail(`✗ ${step.agent}: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
+			return failUtility(`✗ ${step.agent}: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
 		}
 	}
 
@@ -4510,7 +4554,7 @@ async function launchUtilityFamily(input: {
 			path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH),
 			herdr: { supervisor: currentProcessSpawnMode() },
 		});
-	if (!run) return fail("vexillatio parent run is not available", ErrorCodes.NOT_FOUND);
+	if (!run) return failUtility("vexillatio parent run is not available", ErrorCodes.NOT_FOUND);
 	const runId = run.runId;
 	const timeoutMs = input.params.timeoutMs ?? 600_000;
 	// §2.6: continue numbering from this parent's existing children only —
@@ -4526,7 +4570,7 @@ async function launchUtilityFamily(input: {
 	const names = new Map<UtilityTaskItem, string>();
 	for (let i = 0; i < prepared.length; i++) names.set(prepared[i]!.step, allocated[i]!);
 
-	const results: string[] = [];
+	const results: string[] = [...scopeWarnings];
 	const stillRunning = new Set<string>();
 	const launches = await Promise.all(prepared.map(async (item) => {
 		const cwd = item.step.cwd ? path.resolve(input.cwd, item.step.cwd) : input.cwd;

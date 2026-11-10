@@ -53,17 +53,32 @@ export interface StepModelResult {
 }
 
 /**
+ * The non-blank form of a caller-supplied string.
+ *
+ * A blank `""` / `"   "` is not a choice, so it must not shadow the other
+ * source: `??` alone treats an empty string as present and silently drops the
+ * call-level `model`/`preset`. Trimming here also keeps `classifyModelOrigin`'s
+ * `resolved.model === override` comparison honest — passing `"  x/y  "` down
+ * means the winner (`x/y`) never equals the override and the caller's own
+ * choice is reported as inherited.
+ */
+function explicitValue(value: string | undefined): string | undefined {
+	const trimmed = value?.trim();
+	return trimmed ? trimmed : undefined;
+}
+
+/**
  * Resolve the model (and the effective agent) a step will launch with.
  *
  * Throws when a referenced preset is undefined. Callers are expected to turn
  * that into a refusal line rather than letting it escape.
  */
 export function resolveStepModel(input: StepModelInput): StepModelResult {
-	const override = input.step.model ?? input.params.model;
+	const override = explicitValue(input.step.model) ?? explicitValue(input.params.model);
 
 	const expanded = expandPreset({
 		agent: input.agent,
-		toolPreset: input.step.preset ?? input.params.preset,
+		toolPreset: explicitValue(input.step.preset) ?? explicitValue(input.params.preset),
 		...(input.settings.presets ? { presets: input.settings.presets } : {}),
 	});
 

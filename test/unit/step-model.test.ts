@@ -16,8 +16,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveStepModel } from "../../src/agents/step-model.ts";
-import { applyAgentOverrides } from "../../src/agents/overrides.ts";
+import { classifyModelOrigin, resolveStepModel } from "../../src/agents/step-model.ts";
+import { applyAgentOverrides, applyDefaultModel } from "../../src/agents/overrides.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
 
 function agent(over: Partial<AgentConfig> = {}): AgentConfig {
@@ -238,4 +238,121 @@ test("origin: no model anywhere is inherited (nothing was chosen)", () => {
 	});
 	assert.equal(none.resolved.model, undefined);
 	assert.equal(none.modelOrigin, "inherited");
+});
+
+// ─────────── provider-scoped overrides (D1d) & folded provenance (D2) ───────────
+
+test("D1d: agentOverridesByProvider.<parentProvider>.<role>.model is a real level", () => {
+	const out = resolveStepModel({
+		agent: agent({}),
+		step: {},
+		params: {},
+		// The parent provider selects the provider-scoped block.
+		dispatchModel: "cb/parent-model",
+		settings: {
+			agentOverridesByProvider: { cb: { scout: { model: "cb/glm-5.3" } } },
+		},
+	});
+	assert.equal(out.resolved.model, "cb/glm-5.3");
+	assert.equal(out.resolved.source?.type, "agentOverrides");
+	assert.equal(out.modelOrigin, "explicit");
+});
+
+test("D1d: a provider-scoped override for ANOTHER provider does not apply", () => {
+	const out = resolveStepModel({
+		agent: agent({ model: "cb/frontmatter" }),
+		step: {},
+		params: {},
+		dispatchModel: "cb/parent-model",
+		settings: {
+			agentOverridesByProvider: { pi: { scout: { model: "pi/other" } } },
+		},
+	});
+	assert.equal(out.resolved.model, "cb/frontmatter");
+	assert.equal(out.resolved.source?.type, "frontmatter");
+});
+
+test("D2a: a folded subagents.defaultModel stays INHERITED (origin + label)", () => {
+	// The real shape: `loadCatalog` runs `applyDefaultModel`, which writes the
+	// configured default into `agent.model` and records where it came from.
+	// Candidate 5 then sees a plain string — it must not report it as a
+	// deliberate frontmatter choice, or `modelScope.enforce` refuses the
+	// operator's own default.
+	const [folded] = applyDefaultModel([agent({})], "cb/scoped-default");
+	assert.ok(folded, "applyDefaultModel must return the agent");
+	assert.equal(folded.model, "cb/scoped-default", "precondition: folded into agent.model");
+	assert.equal(folded.modelSource?.type, "subagents.defaultModel");
+
+	const out = resolveStepModel({ agent: folded, step: {}, params: {}, settings: {} });
+	assert.equal(out.resolved.model, "cb/scoped-default");
+	assert.equal(out.resolved.source?.type, "subagents.defaultModel");
+	assert.equal(out.modelOrigin, "inherited");
+	assert.equal(classifyModelOrigin(out.resolved, undefined).label, "subagents.defaultModel");
+});
+
+test("D2a: a leftover modelSource that does not match agent.model is NOT trusted", () => {
+	// `modelSource` is provenance for the CURRENT model. If the two disagree the
+	// record is stale, and the model in hand counts as frontmatter again.
+	const out = resolveStepModel({
+		agent: agent({
+			model: "cb/frontmatter",
+			modelSource: { type: "subagents.defaultModel", model: "cb/stale-default" },
+		}),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	assert.equal(out.resolved.source?.type, "frontmatter");
+	assert.equal(out.modelOrigin, "explicit");
+});
+
+test("D2b: a plain frontmatter model is still explicit (no regression)", () => {
+	const out = resolveStepModel({
+		agent: agent({ model: "cb/frontmatter" }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	assert.equal(out.resolved.source?.type, "frontmatter");
+	assert.equal(out.modelOrigin, "explicit");
+	assert.equal(classifyModelOrigin(out.resolved, undefined).label, "the agent's frontmatter");
+});
+
+// ─────────── blank step fields must not shadow the call-level values (D4) ───────────
+
+test("D4a(model): `step.model: \"\"` cannot shadow `params.model`", () => {
+	const out = resolveStepModel({
+		agent: agent({ model: "cb/frontmatter" }),
+		step: { model: "" },
+		params: { model: "cb/per-run" },
+		settings: {},
+	});
+	assert.equal(out.resolved.model, "cb/per-run");
+	assert.equal(out.modelOrigin, "explicit");
+});
+
+test("D4b(model): a padded `params.model` is trimmed AND still classified explicit", () => {
+	// The override handed to `resolveModel` must be the trimmed value, otherwise
+	// `classifyModelOrigin`'s `resolved.model === override` comparison misses and
+	// the caller's own choice is reported as inherited.
+	const out = resolveStepModel({
+		agent: agent({}),
+		step: {},
+		params: { model: "  cb/per-run  " },
+		settings: {},
+	});
+	assert.equal(out.resolved.model, "cb/per-run");
+	assert.equal(out.modelOrigin, "explicit");
+});
+
+test("D4a(preset): a blank `step.preset` cannot shadow `params.preset`", () => {
+	const out = resolveStepModel({
+		agent: agent({ preset: "cheap" }),
+		step: { preset: "" },
+		params: { preset: "strong" },
+		settings: SETTINGS,
+	});
+	assert.equal(out.usedPreset, true);
+	assert.equal(out.resolved.model, "cb/kimi-k3");
+	assert.equal(out.agent.preset, "strong");
 });

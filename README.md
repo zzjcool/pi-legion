@@ -672,8 +672,10 @@ Keep the run records and session files while the tree may need to resume.
 Pi Legion runs `kind: pi` roles only. `kind` is still a legal frontmatter key,
 but `pi` is the only accepted value: a non-`pi` value is ignored (one note on
 stderr) and the role launches as `kind: pi`. The same holds for
-`subagents.presets.<role>.kind` and `subagents.agentOverrides.<role>.kind` —
-those three spots are the only places a role's `kind` can come from.
+`subagents.presets.<name>.kind` and `subagents.agentOverrides.<role>.kind` —
+those three spots are the only places a role's `kind` can come from. A preset is
+named, not role-scoped: `presets.<name>` is looked up by the `preset:` reference
+itself (role card, override or tool call).
 
 ```yaml
 ---

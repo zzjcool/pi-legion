@@ -6,7 +6,8 @@
  *   2. preset model (a referenced `subagents.presets.<name>.model`)
  *   3. agentOverridesByProvider.<parentProvider>.<name>.model
  *   4. agentOverrides.<name>.model
- *   5. agent frontmatter `model`
+ *   5. agent frontmatter `model` (a folded `subagents.defaultModel` also lands
+ *      here; `agentModelSource` keeps its inherited label)
  *   6. subagents.defaultModel
  *   7. the dispatching (parent) session model
  *
@@ -52,13 +53,7 @@ function providerScopedModel(
 	agentName: string,
 ): string | undefined {
 	if (!settings || !provider) return undefined;
-	const map = (settings as Record<string, unknown>).agentOverridesByProvider;
-	if (!map || typeof map !== "object") return undefined;
-	const forProvider = (map as Record<string, unknown>)[provider];
-	if (!forProvider || typeof forProvider !== "object") return undefined;
-	const entry = (forProvider as Record<string, unknown>)[agentName];
-	if (!entry || typeof entry !== "object") return undefined;
-	const model = (entry as Record<string, unknown>).model;
+	const model = settings.agentOverridesByProvider?.[provider]?.[agentName]?.model;
 	return typeof model === "string" && model.trim() ? model.trim() : undefined;
 }
 
@@ -69,6 +64,25 @@ function overrideModel(
 	const entry = settings?.agentOverrides?.[agentName];
 	const model = entry?.model;
 	return typeof model === "string" && model.trim() ? model.trim() : undefined;
+}
+
+/**
+ * The provenance candidate 5 (the agent's own `model`) reports.
+ *
+ * `applyDefaultModel` folds `subagents.defaultModel` into `agent.model` and
+ * records where it came from, so by the time this chain runs the folded default
+ * looks like frontmatter. Reporting it as `frontmatter` would let
+ * `modelScope.enforce` treat the operator's OWN configured default as a
+ * deliberate (`explicit`) choice and refuse it, so a fold that matches the
+ * current model keeps its `subagents.defaultModel` identity (which
+ * `classifyModelOrigin` maps to `inherited`). A `modelSource` that does not
+ * match `agent.model` is stale and is ignored.
+ */
+function agentModelSource(agent: AgentConfig): ModelSourceInfo["type"] {
+	const source = agent.modelSource;
+	return source?.type === "subagents.defaultModel" && source.model === agent.model
+		? "subagents.defaultModel"
+		: "frontmatter";
 }
 
 /**
@@ -91,7 +105,7 @@ export function resolveModel(input: ResolveModelInput): ResolvedModel {
 			source: "agentOverrides",
 		},
 		{ value: overrideModel(input.settings, name), source: "agentOverrides" },
-		{ value: input.agent.model, source: "frontmatter" },
+		{ value: input.agent.model, source: agentModelSource(input.agent) },
 		{ value: input.defaultModel, source: "subagents.defaultModel" },
 	];
 
