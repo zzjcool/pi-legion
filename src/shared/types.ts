@@ -426,6 +426,15 @@ export interface ChildRecord {
 	 */
 	outputFile?: string;
 	/**
+	 * Result-ledger identity of {@link outputFile} — `"<runId>/<name segment>/r<round>"`
+	 * (`docs/contracts/result-ledger-v1.md` §3 D1). Travels with `outputFile` and is
+	 * absent under exactly the same conditions (running snapshot / empty output /
+	 * failed write / no ledger row). Kept beside the path because the artifact id is
+	 * what the ledger is keyed on: a later process's `collect` reads it back from here
+	 * (`Orchestrator.cachedCollect`) instead of re-deriving a round it cannot know.
+	 */
+	artifactId?: string;
+	/**
 	 * Acceptance criteria declared by the agent, copied here at launch so a
 	 * `collect` in a later process (each tool call is a fresh process) can still
 	 * surface them without re-reading the agent definition.

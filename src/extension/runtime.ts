@@ -56,6 +56,8 @@ import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
 import { getSubtree } from "../legion/nodes.ts";
 import { attachUsageTotals } from "../legion/usage.ts";
 import { maxEventId } from "../legion/events.ts";
+import { undelivered } from "../legion/ledger.ts";
+import { compareDelivery, shadowEnabled } from "./ledger-shadow.ts";
 import { publishLegionRunActivity } from "../legion/run-active.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 import type { PhaseMachine } from "../legion/phase-machine.ts";
@@ -76,6 +78,20 @@ export interface CollectSnapshot {
 	output: string;
 	/** Full output persisted to disk; named in the notice so a truncated preview has a one-step recovery. */
 	outputFile?: string;
+	/**
+	 * Result-ledger identity of `outputFile` (`"<runId>/<name segment>/r<round>"`),
+	 * when the collect recorded a ledger row.
+	 *
+	 * Straight pass-through of `CollectResult.artifactId` (`src/runs/orchestrator.ts`):
+	 * an optional field on a shape the orchestrator already satisfies structurally, so
+	 * nothing has to be re-mapped on the way in. Absent for a running snapshot, an
+	 * empty output and any host with no legion context — the same conditions that leave
+	 * `outputFile` absent.
+	 *
+	 * Consumed by the P3 ledger shadow (§3 D11) today; P5's `legion_output` / path
+	 * index is the reason it belongs on the snapshot at all.
+	 */
+	artifactId?: string;
 	/**
 	 * #349 (issue suggestion A: "an explicit already-persisted marker"): the
 	 * `output` above is NOT the child's whole text — the completion cache's
@@ -246,6 +262,21 @@ export interface SessionRuntimeDeps {
 	joinConfig?: JoinConfig;
 	/** Injectable timer for the MAX_PENDING_AGE_MS horizon (tests fire it manually); default = unref'd setTimeout. */
 	scheduleNoticeOverflow?: (ms: number, fn: () => void) => JoinSchedulerHandle;
+	/**
+	 * P3 ledger shadow (`result-ledger-v1` §3 D11) — the ledger handle plus the
+	 * consumer id (`parent_id`) the old claim set is compared against, or `undefined`
+	 * when this host has neither.
+	 *
+	 * Consulted ONLY when `PI_LEGION_LEDGER_SHADOW=1` (`shadowEnabled`), so the flag's
+	 * off path never calls it: 默认零开销. The runtime does not open its own connection
+	 * for the shadow — the host already owns one, and a second writer of the same file
+	 * would be a fact this diagnostic cannot justify.
+	 *
+	 * Optional for the same reason `publishRunActivity` is: `SessionRuntime` is also
+	 * built as a literal double in tests, and a required member would break every one of
+	 * them for no behaviour.
+	 */
+	getLedgerShadowFacts?: () => { db: DatabaseSync; consumerId: string } | undefined;
 }
 
 const DEFAULT_REFRESH_MS = 500;
@@ -799,6 +830,12 @@ interface FinishedResult {
 	runId: string;
 	/** Round the snapshot belongs to (D10) — a cached hit claims THAT round. */
 	round: number;
+	/**
+	 * The collect's own snapshot (a shallow copy made by `rememberFinished`), so it
+	 * carries `output`/`outputFile`/`artifactId` without a second copy of them here: a
+	 * duplicated artifact id could drift from the snapshot it describes, and the
+	 * trimming below mutates only the TEXT.
+	 */
 	snapshot: CollectSnapshot;
 	/** Resident bytes of `snapshot.output` (the head alone once `stripped`). */
 	bytes: number;
@@ -1309,6 +1346,52 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	};
 
 	/**
+	 * P3 (`docs/contracts/result-ledger-v1.md` §3 D11): the compressed shadow.
+	 *
+	 * For every entry that is ABOUT to be claim-filtered, computes BOTH verdicts —
+	 * `!isReported(...)` from the claim set and `ledger.undelivered(consumerId) ∋
+	 * artifactId` from the projection — and writes one stderr line per disagreement.
+	 * It changes nothing: `surviving`, its order, the batching, the outbox and the
+	 * send are all decided below, from the same inputs as before. The only consumer
+	 * of this output is a human reading stderr, which is why it must never throw.
+	 *
+	 * `shadowEnabled()` is the FIRST condition on purpose (D11: 默认零开销): with the
+	 * flag unset this function allocates nothing, builds no entry id and does not
+	 * touch the database — it is one environment-variable read on the delivery seam.
+	 */
+	const shadowBatch = (entries: readonly DeliverableEntry[]): void => {
+		if (!shadowEnabled()) return;
+		try {
+			const facts = deps.getLedgerShadowFacts?.();
+			// No ledger context ⇒ no projection to compare against. Reporting every
+			// artifact as "absent from undelivered" would invent a disagreement.
+			if (!facts) return;
+			const undeliveredIds = new Set(
+				undelivered(facts.db, facts.consumerId).map((artifact) => artifact.id),
+			);
+			const at = now();
+			for (const entry of entries) {
+				const artifactId = entry.input.artifactId;
+				const line = compareDelivery({
+					entry: {
+						// The claim key `(runId, name, round)` in a human-readable spelling —
+						// the shipped key joins the three with NUL, which no log line can carry.
+						entryId: `${entry.runId}/${entry.name}/r${entry.round}`,
+						...(artifactId === undefined ? {} : { artifactId }),
+					},
+					oldSaysDeliver: !isReported(entry.runId, entry.name, entry.round),
+					ledgerSaysDeliver: artifactId !== undefined && undeliveredIds.has(artifactId),
+					now: at,
+				});
+				if (line !== undefined) process.stderr.write(`${line}\n`);
+			}
+		} catch {
+			// D11: diagnostic only. A missing table, a closed handle, a throwing host
+			// hook or a closed stderr pipe must never become a failed delivery.
+		}
+	};
+
+	/**
 	 * D5: THE single completion exit. Both the join `deliver` sink and the outbox
 	 * flush go through here and nowhere else, so the claim (D3) is consulted at
 	 * the last possible moment — after the join window and after the outbox wait,
@@ -1328,6 +1411,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		triggerTurn: boolean,
 		partial: boolean,
 	): number => {
+		// P3 shadow (D11): observe the batch BEFORE the claim filter below, and change
+		// nothing about it. A no-op unless `PI_LEGION_LEDGER_SHADOW=1`.
+		shadowBatch(entries);
 		// D10 #4: each entry is judged, and later claimed, on ITS OWN round — so two
 		// unread rounds of one child both survive, while a repeated delivery inside one
 		// round is still filtered.
@@ -2401,6 +2487,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 								execution: snapshot.execution,
 								output: snapshot.output,
 								...(snapshot.outputFile ? { outputFile: snapshot.outputFile } : {}),
+								// §3 D1/P3: the artifact this notice is about, straight off the collect
+								// (absent for a running snapshot / empty output / no ledger row). The
+								// rendered text does not read it; the ledger shadow does.
+								...(snapshot.artifactId ? { artifactId: snapshot.artifactId } : {}),
 								sessionFile: job.sessionFile,
 								acceptance: snapshot.acceptance,
 								recycled: shouldRecycleAfterCollect(

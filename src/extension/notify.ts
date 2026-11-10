@@ -94,6 +94,17 @@ export interface CompletionInput {
 	output: string;
 	/** Full output on disk; the truncated preview names this path. */
 	outputFile?: string;
+	/**
+	 * Result-ledger identity of `outputFile` (`"<runId>/<name>/r<round>"`), when this
+	 * result has one.
+	 *
+	 * Additive and NOT part of the rendered notice: the body, the subject and every
+	 * line of the text are unchanged (§3 D9 keeps the preview, P4 adds the pointer
+	 * later). It rides here because the notice entry is the only per-entry carrier
+	 * the delivery seam sees, and the P3 shadow needs to know WHICH artifact the old
+	 * claim set is being compared against.
+	 */
+	artifactId?: string;
 	sessionFile?: string;
 	acceptance?: { status: string; level?: string };
 	recycled?: boolean;

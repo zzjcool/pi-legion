@@ -1990,6 +1990,19 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				? attachUsageTotals(identity.db, getSubtree(identity.db, identity.nodeId))
 				: [];
 		},
+		// P3 ledger shadow (`result-ledger-v1` §3 D11): the ledger handle and the
+		// consumer id (`parent_id`) the old claim set is compared against.
+		//
+		// Asked ONLY when `PI_LEGION_LEDGER_SHADOW=1` (the runtime's first condition), so
+		// this line is dead weight on every other run. Answered from the connection THIS
+		// entry already owns — `openLegionDb` is deliberately not called here: a second
+		// connection to the same file for a diagnostic would be a fact the shadow cannot
+		// justify. No identity yet (a root has no ledger before its first launch) answers
+		// `undefined`, which the shadow reads as "nothing to compare" and stays silent.
+		getLedgerShadowFacts: () => {
+			const identity = ownLegionIdentity();
+			return identity ? { db: identity.db, consumerId: identity.nodeId } : undefined;
+		},
 		// #298: let the tree render a team's declared workflow. Cached per role
 		// because agent discovery touches the filesystem and the tree re-renders on
 		// every event.

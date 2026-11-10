@@ -19,6 +19,8 @@ import { assistantMsg, modelChange, sessionHeader, userMsg } from "../helpers/fi
 import type { TreeNodeSnapshot } from "../../src/tui/tree-view.ts";
 import type { StatusUi } from "../../src/tui/status.ts";
 import { createLegionEventBus, type LegionEventBus } from "../../src/extension/event-bus.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { markNotified, recordArtifact } from "../../src/legion/ledger.ts";
 
 function snapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
 	return {
@@ -6456,6 +6458,193 @@ async function finishChildren(
 	}
 	return outputs;
 }
+
+// ──────────────── P3: the ledger shadow (`result-ledger-v1` D11) ────────────────
+//
+// The shadow answers ONE question — do the old claim set and the new ledger
+// projection agree about whether a result still owes a notice? — and its only
+// observable output is a line on stderr. These cases pin the two properties the
+// delivery seam depends on: a disagreement is logged, and NOTHING about the
+// delivery changes (the notice still arrives); with the flag off, stderr is
+// byte-for-byte what it was before this feature existed.
+
+const SHADOW_ARTIFACT = "r-1/w/r1";
+
+/**
+ * Only OUR lines. node's SQLite support prints an ExperimentalWarning on stderr the
+ * first time a db is opened, so a raw `deepEqual(stderr, [])` would assert on
+ * node's output and turn order-dependent the moment one of these cases runs first.
+ */
+function shadowLines(stderr: readonly string[]): string[] {
+	return stderr.join("").split("\n").filter((line) => line.includes("ledger-shadow"));
+}
+
+/**
+ * One child, one terminal result carrying `SHADOW_ARTIFACT`, delivered through the
+ * real watch → join → deliverBatch seam with `process.stderr.write` captured.
+ *
+ * `alreadyNotified` is the manufactured divergence: the ledger records that this
+ * consumer was already told (so the projection is empty) while the claim set —
+ * which the shadow reads and never mutates — has no entry for it.
+ */
+async function deliverOneUnderShadow(options: {
+	shadow: "on" | "off";
+	alreadyNotified: boolean;
+	/** `false` = a host with no ledger handle, i.e. no projection to compare against. */
+	ledgerHandle?: boolean;
+}): Promise<{ messages: SentMessage[]; stderr: string[] }> {
+	const db = openLegionDb(":memory:");
+	const messages: SentMessage[] = [];
+	const stderr: string[] = [];
+	const previousFlag = process.env.PI_LEGION_LEDGER_SHADOW;
+	if (options.shadow === "on") process.env.PI_LEGION_LEDGER_SHADOW = "1";
+	else delete process.env.PI_LEGION_LEDGER_SHADOW;
+	const originalWrite = process.stderr.write;
+	process.stderr.write = ((chunk: unknown) => {
+		stderr.push(String(chunk));
+		return true;
+	}) as typeof process.stderr.write;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+		...(options.ledgerHandle === false
+			? {}
+			: { getLedgerShadowFacts: () => ({ db, consumerId: "root" }) }),
+	});
+	try {
+		recordArtifact(db, {
+			id: SHADOW_ARTIFACT,
+			parentId: "root",
+			nodeId: "root.w",
+			name: "w",
+			round: 1,
+			path: "/tmp/r-1/artifacts/w/r1.md",
+			bytes: 10,
+			createdAt: 1_000,
+		});
+		if (options.alreadyNotified) {
+			markNotified(db, { artifactId: SHADOW_ARTIFACT, consumerId: "root", at: 2_000 });
+		}
+		runtime.setJoinConfig({ mode: "each", flushMs: 10_000 });
+		let resolveCollect: ((snapshot: CollectSnapshot) => void) | undefined;
+		runtime.track({
+			name: "w",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/w.jsonl",
+			timeoutMs: 1_000,
+			collect: () =>
+				new Promise<CollectSnapshot>((resolve) => {
+					resolveCollect = resolve;
+				}),
+		});
+		runtime.watch("w");
+		await waitFor(() => resolveCollect !== undefined, "w is collecting");
+		resolveCollect!(joinSnapshot({ output: "shadowed-out", artifactId: SHADOW_ARTIFACT }));
+		await waitFor(() => messages.length === 1, "the notice is delivered");
+	} finally {
+		runtime.dispose();
+		db.close();
+		process.stderr.write = originalWrite;
+		if (previousFlag === undefined) delete process.env.PI_LEGION_LEDGER_SHADOW;
+		else process.env.PI_LEGION_LEDGER_SHADOW = previousFlag;
+	}
+	return { messages, stderr };
+}
+
+test("P3 shadow: a disagreement is logged on stderr and the notice still arrives", async () => {
+	const { messages, stderr } = await deliverOneUnderShadow({ shadow: "on", alreadyNotified: true });
+	// The delivery is untouched: the old model still hands the parent its notice.
+	assert.equal(messages.length, 1, "the shadow never suppresses a delivery");
+	assert.match(messages[0]!.content, /shadowed-out/);
+	// …and the disagreement is one line, naming the entry and both verdicts.
+	const lines = shadowLines(stderr);
+	assert.equal(lines.length, 1, `exactly one line, got ${JSON.stringify(stderr)}`);
+	assert.match(lines[0]!, /^ledger-shadow mismatch /);
+	assert.match(lines[0]!, /entry=r-1\/w\/r1\b/);
+	assert.match(lines[0]!, /artifact=r-1\/w\/r1\b/);
+	assert.match(lines[0]!, /old=deliver\b/);
+	assert.match(lines[0]!, /ledger=suppress\b/);
+});
+
+test("P3 shadow: the flag off writes nothing at all", async () => {
+	const { messages, stderr } = await deliverOneUnderShadow({ shadow: "off", alreadyNotified: true });
+	assert.equal(messages.length, 1, "positive control: the same delivery happened");
+	assert.deepEqual(shadowLines(stderr), [], "默认零开销: no line, no formatting, no comparison");
+});
+
+test("P3 shadow: agreeing verdicts write nothing", async () => {
+	// Same flag, but the ledger has no delivery for this artifact either: both sides
+	// say "deliver", which is the only shape healthy traffic has.
+	const { messages, stderr } = await deliverOneUnderShadow({ shadow: "on", alreadyNotified: false });
+	assert.equal(messages.length, 1);
+	assert.deepEqual(shadowLines(stderr), []);
+});
+
+test("P3 shadow: a host with no ledger handle writes nothing (no projection, no verdict)", async () => {
+	const { messages, stderr } = await deliverOneUnderShadow({
+		shadow: "on",
+		alreadyNotified: true,
+		ledgerHandle: false,
+	});
+	assert.equal(messages.length, 1);
+	assert.deepEqual(shadowLines(stderr), []);
+});
+
+test("P3 shadow: an entry with no artifactId is not compared (backward compatible)", async () => {
+	const db = openLegionDb(":memory:");
+	recordArtifact(db, {
+		id: SHADOW_ARTIFACT,
+		parentId: "root",
+		nodeId: "root.w",
+		name: "w",
+		round: 1,
+		path: "/tmp/r-1/artifacts/w/r1.md",
+		bytes: 10,
+		createdAt: 1_000,
+	});
+	// The ledger is empty for this consumer, so "ledger says deliver" — but the result
+	// predates the artifact id (no ledger context at collect time). Reporting that as
+	// a disagreement would accuse every older child of a defect that does not exist.
+	markNotified(db, { artifactId: SHADOW_ARTIFACT, consumerId: "root", at: 2_000 });
+	const messages: SentMessage[] = [];
+	const stderr: string[] = [];
+	const previousFlag = process.env.PI_LEGION_LEDGER_SHADOW;
+	process.env.PI_LEGION_LEDGER_SHADOW = "1";
+	const originalWrite = process.stderr.write;
+	process.stderr.write = ((chunk: unknown) => {
+		stderr.push(String(chunk));
+		return true;
+	}) as typeof process.stderr.write;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+		getLedgerShadowFacts: () => ({ db, consumerId: "root" }),
+	});
+	try {
+		runtime.setJoinConfig({ mode: "each", flushMs: 10_000 });
+		runtime.track({
+			name: "w",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/w.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => joinSnapshot({ output: "legacy-out" }),
+		});
+		runtime.watch("w");
+		await waitFor(() => messages.length === 1, "the notice is delivered");
+	} finally {
+		runtime.dispose();
+		db.close();
+		process.stderr.write = originalWrite;
+		if (previousFlag === undefined) delete process.env.PI_LEGION_LEDGER_SHADOW;
+		else process.env.PI_LEGION_LEDGER_SHADOW = previousFlag;
+	}
+	assert.equal(messages.length, 1);
+	assert.deepEqual(shadowLines(stderr), []);
+});
 
 test("#349: the cache keeps every result's metadata and strips text past its entry budget", async () => {
 	await withTempDir(async (dir) => {

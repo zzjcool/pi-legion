@@ -233,9 +233,22 @@ legion_output({ name, round?, offset?, limit? })
 ### D11 — shadow 期双写，分歧即 log
 
 - `PI_LEGION_LEDGER_SHADOW=1`：老 claim 与新 ledger 并行计算，**只**在分歧时写 **stderr**（不新增 `events` 类型，避开 `events.ts` 的 16 类型闭集与 sentinel）。
-- 分歧判定：`isReported(runId,name,round)` ≠ `ledger.hasRead(db, artifactId, consumerId)`（P1 落地的 API 名）。
+- 新侧判定用 **`ledger.undelivered(consumerId)` 是否包含该 artifactId**，不用 `hasRead`：`reported`
+  = 「两条路由任一已交付」（工具读 OR 通知已发），只有 `undelivered`（读完 + 已通知都排除）与它等价；
+  `hasRead` 只覆盖读取侧，会在「已通知」侧假报分歧。
+- **分歧方向必须分开看**（P3 交付后修正，否则退出条件不可达）：
+  - `old=deliver ledger=suppress`（line 里 `reason=claim-open-but-ledger-counts-this-artifact-as-delivered`）
+    = **静默漏发**，这是唯一真正的危险方向。
+  - `old=suppress ledger=deliver`（`reason=claim-closed-but-ledger-still-owes-this-artifact`）
+    = 在 P3 阶段**必然出现且预期**：`notified_at` / `read_bytes` 的写侧要到 P4/P5 才接，
+    ledger 结构上少两类事实。「已交付但 ledger 不知道」只会多推一条，不会丢。
+- **退出条件**（修正后）：P3 验收 = 「`old=deliver ledger=suppress` 为 **0**」+ mock-llm 全绿；
+  **零分歧的全局目标属于 P4 之后**（那时两侧写侧都齐了）。
+- 真机启用前提：`index.ts` 必须把 `getLedgerShadowFacts`（→ `{db, consumerId}`）传进 runtime deps；
+  不接线时 shadow 是 inert 的（静默无输出，不报错、不影响投递）。
+- 真跑规模：P3 的可重复验收载体是 `test/integration/mock-llm-ledger-shadow.test.ts`（同一 runId 两个 child、一个走 collect、一个纯通知）
+  + 变异测试（删掉 read 侧写入必须变红）；真机会话作为补充而非门禁。
 - 寿命：**只在 P3 存在**，P4 与老机制同一个 commit 删除。
-- 退出条件：真跑 ≥5 个多 child 会话，分歧日志为 0，且 `test/mock-llm` 全绿。若用户决定跳过 P3，必须在真机上人工跑完 §7-11 的清单后再进 P4（这是唯一能挡住「通知静默少一条」的手段，测试挡不住）。
 
 ### D12 — 旧模型直接删除，不做兼容层（用户裁决，2026-11-10）
 
@@ -357,6 +370,7 @@ legion_output({ name, round?, offset?, limit? })
 | 2026-11-10 | v1.4 FROZEN | P2 侦察后补：D1a artifact round 来源 = ledger `MAX(round)+1`（不用 runtime 的 report round）；D1b 相同字节不新增 round；D1c 空输出不删历史 artifact（废除「沿用 fs.rmSync 语义」）；D1d name 作路径段必须 sanitize；D1e ledger 写入 best-effort。 |
 | 2026-11-10 | v1.5 FROZEN | P2 交付后纠正两处：① D1a 改为 `max(ledger, 磁盘)+1`（只看 ledger 会在库被重置时覆盖已有 artifact，违反 A1）；② D1d 的 `id` 与路径段一律用 sanitize 后的段、`name` 列存原始值（否则与 rebuild 按目录名反推的 id 不收敛）。 |
 | 2026-11-10 | v1.6 FROZEN | P2 复审前补 D10 的不对称裁决：rebuild 后 `artifacts.name` 为 sanitize 段；P5 拼 id 必须用 `artifactNameSegment`，禁止按 `name` 列过滤。 |
+| 2026-11-10 | v1.7 FROZEN | P3 交付后改 D11：新侧用 `undelivered`（等价于 `reported`）而非 `hasRead`；退出条件拆方向（`old=deliver ledger=suppress` 必须为 0，反向在 P3 必现且预期）；真机需 `index.ts` 接 `getLedgerShadowFacts`。 |
 
 ## 12. 裁决记录
 
