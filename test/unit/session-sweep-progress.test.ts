@@ -11,8 +11,10 @@
  * `LiveProgress` is a pure function of the file (`progressFromSession` never
  * reads a clock), so a terminal row only has to be folded once. These cases pin
  * that: terminal rows leave the per-tick parse path, live rows keep it, a
- * re-settled row re-reads its file instead of replaying the old answer, and two
- * rows that share a transcript are parsed once per sweep.
+ * resumed (and re-settled) row re-reads its file instead of replaying the old
+ * answer, two rows that share a transcript are parsed once per sweep, the
+ * revalidation window actually revalidates, and an empty answer is never memoized
+ * (a missing transcript must not be pinned as "zero tokens").
  */
 
 import { test } from "node:test";
@@ -24,6 +26,13 @@ import { sessionFileCacheStats } from "../../src/shared/session.ts";
 import { createSessionRuntime } from "../../src/extension/runtime.ts";
 import type { TreeNodeSnapshot } from "../../src/tui/tree-view.ts";
 import { withTempDir } from "../helpers/tmp.ts";
+
+/** When the seeded terminal rows settled. Well inside the orphan horizon at `now`. */
+const SETTLED_AT = 1_000;
+/** A frozen clock: nothing here may depend on wall time. */
+const NOW = 10_000;
+/** Mirrors `TERMINAL_PROGRESS_TTL_MS` in runtime.ts — the revalidation window. */
+const TTL_MS = 30_000;
 
 const user = (t: string): string =>
 	JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: t }] } });
@@ -49,6 +58,7 @@ function treeNode(
 	depth: number,
 	sessionFile: string | null,
 	status: TreeNodeSnapshot["status"] = "running",
+	updatedAt = 0,
 ): TreeNodeSnapshot {
 	return {
 		id,
@@ -69,17 +79,20 @@ function treeNode(
 		contractPath: null,
 		taskSummary: null,
 		createdAt: 0,
-		updatedAt: 0,
+		updatedAt,
 	};
 }
 
 test("#391: 300 terminal rows and 2 running rows parse only the running ones", async () => {
 	await withTempDir((dir) => {
 		const nodes: TreeNodeSnapshot[] = [treeNode("root", null, "root", 0, null, "running")];
+		// The reported distribution: everything but a couple of rows has settled.
+		// All three final statuses are seeded, because the memo must cover all three.
+		const finalStatuses = ["settled", "failed", "retired"] as const;
 		for (let i = 0; i < 300; i += 1) {
-			const file = path.join(dir, `settled-${i}.jsonl`);
-			fs.writeFileSync(file, twoTurns(`settled-${i}`));
-			nodes.push(treeNode(`root.s${i}`, "root", `s${i}`, 1, file, "settled"));
+			const file = path.join(dir, `final-${i}.jsonl`);
+			fs.writeFileSync(file, twoTurns(`final-${i}`));
+			nodes.push(treeNode(`root.s${i}`, "root", `s${i}`, 1, file, finalStatuses[i % 3], SETTLED_AT));
 		}
 		for (let i = 0; i < 2; i += 1) {
 			const file = path.join(dir, `live-${i}.jsonl`);
@@ -89,12 +102,13 @@ test("#391: 300 terminal rows and 2 running rows parse only the running ones", a
 		const runtime = createSessionRuntime({
 			sendMessage() {},
 			getTreeNodes: () => nodes,
-			now: () => 10_000,
+			now: () => NOW,
 		});
 		try {
-			// Warm: the terminal memo is filled on the first sight of each terminal
-			// row, and the file cache is filled for the running ones. Setup is not part
-			// of the measurement — the point of the case is what a *later* tick costs.
+			// Warm twice: the terminal memo is filled on the first sight of each
+			// terminal row, and the second pass drops any warm-up cache pressure, so
+			// the measurement cannot depend on the row order `getTreeNodes()` uses.
+			runtime.refreshUi();
 			runtime.refreshUi();
 			const before = sessionFileCacheStats();
 
@@ -115,12 +129,23 @@ test("#391: 300 terminal rows and 2 running rows parse only the running ones", a
 				"the reported cliff was a hit rate of exactly 0 at 279 files > 256",
 			);
 
-			// The terminal rows still carry the facts the panel renders (tokens,
-			// finished stamp) — leaving the parse path must not blank a row.
-			const settled = runtime.statusEntries().find((entry) => entry.nodeId === "root.s299");
-			assert.equal(settled?.tokensOut, 4, "a memoized terminal row still reports its output tokens");
-			assert.equal(settled?.state, "settled");
-			assert.equal(settled?.finishedAt, 0, "a terminal row is stamped with its own updatedAt");
+			// Every final status is memoized, and the row still carries the facts the
+			// panel renders (output tokens, finished stamp) — leaving the parse path
+			// must not blank a row.
+			for (const name of ["s0", "s1", "s2"]) {
+				const entry = runtime.statusEntries().find((e) => e.name === name);
+				assert.equal(entry?.tokensOut, 4, `a memoized ${name} row still reports its output tokens`);
+				assert.equal(entry?.finishedAt, SETTLED_AT, "a terminal row is stamped with its own updatedAt");
+			}
+			assert.equal(
+				runtime.statusEntries().filter((e) => e.name === "s1")[0]?.state,
+				"failed",
+				"the projection keeps the status the ledger recorded",
+			);
+			assert.equal(
+				runtime.statusEntries().filter((e) => e.name === "s2")[0]?.state,
+				"retired",
+			);
 		} finally {
 			runtime.dispose();
 		}
@@ -135,7 +160,7 @@ test("#391: a live row keeps being re-read when its transcript grows", async () 
 		const runtime = createSessionRuntime({
 			sendMessage() {},
 			getTreeNodes: () => nodes,
-			now: () => 10_000,
+			now: () => NOW,
 		});
 		try {
 			runtime.refreshUi();
@@ -154,32 +179,41 @@ test("#391: a live row keeps being re-read when its transcript grows", async () 
 	});
 });
 
-test("#391: a re-settled row re-reads its file instead of replaying the memo", async () => {
+test("#391: resume bypasses the memo, and settling again re-reads the file", async () => {
 	await withTempDir((dir) => {
 		const file = path.join(dir, "child.jsonl");
 		fs.writeFileSync(file, twoTurns("one"));
-		const node = treeNode("root.w", "root", "w", 1, file, "settled");
+		const node = treeNode("root.w", "root", "w", 1, file, "settled", SETTLED_AT);
 		const nodes = [treeNode("root", null, "root", 0, null, "running"), node];
 		const runtime = createSessionRuntime({
 			sendMessage() {},
 			getTreeNodes: () => nodes,
-			now: () => 10_000,
+			now: () => NOW,
 		});
 		try {
 			runtime.refreshUi();
 			assert.equal(runtime.statusEntries().find((e) => e.nodeId === "root.w")?.tokensOut, 4);
 
-			// `resume` pulls the row back to `running`, the child appends a turn, and
-			// it settles again: the memo guard is `(sessionFile, updatedAt)`, so the
-			// new stamp must re-read the file.
+			// `resume` pulls the row back to `running` (orchestrator writes `starting`
+			// first); the live path must parse again even though the memo has an entry.
+			node.status = "running";
+			node.updatedAt = NOW;
 			fs.appendFileSync(file, `${user("c")}\n${asst("three")}\n`);
-			node.status = "settled";
-			node.updatedAt = 60_000;
 			runtime.refreshUi();
+			assert.equal(
+				runtime.statusEntries().find((e) => e.nodeId === "root.w")?.tokensOut,
+				6,
+				"a resumed row is live again, so its new turn is visible",
+			);
 
+			// It settles again with a new stamp: the memo guard is per row, so this
+			// re-reads instead of replaying the pre-resume answer.
+			node.status = "settled";
+			node.updatedAt = NOW + 5_000;
+			runtime.refreshUi();
 			const entry = runtime.statusEntries().find((e) => e.nodeId === "root.w");
-			assert.equal(entry?.tokensOut, 6, "a row that settled again reflects the appended turn");
-			assert.equal(entry?.finishedAt, 60_000);
+			assert.equal(entry?.tokensOut, 6);
+			assert.equal(entry?.finishedAt, NOW + 5_000);
 		} finally {
 			runtime.dispose();
 		}
@@ -198,7 +232,7 @@ test("#391: two rows sharing one session file are parsed once per sweep", async 
 		const runtime = createSessionRuntime({
 			sendMessage() {},
 			getTreeNodes: () => nodes,
-			now: () => 10_000,
+			now: () => NOW,
 		});
 		try {
 			runtime.refreshUi();
@@ -211,6 +245,99 @@ test("#391: two rows sharing one session file are parsed once per sweep", async 
 			assert.equal(after.misses - before.misses, 0);
 			const entries = runtime.statusEntries().filter((entry) => entry.name === "a" || entry.name === "b");
 			assert.deepEqual(entries.map((entry) => entry.tokensOut), [4, 4], "both rows still carry the fold");
+		} finally {
+			runtime.dispose();
+		}
+	});
+});
+
+/*
+ * The revalidation window exists for the one class of terminal rows whose
+ * transcript is NOT final at the stamp: the shutdown hook retires still-running
+ * children and only then drains them, and `liveness()` can render a dead row as
+ * `failed` while its writer is still flushing. Without the window those values
+ * freeze for the lifetime of the process; with it they converge within 30s.
+ *
+ * Deleting the TTL check (or making it `Infinity`) leaves every other case in
+ * this file green — this is the case that pins it.
+ */
+test("#391: a terminal row is revalidated once the window expires, and the drained turn converges", async () => {
+	await withTempDir((dir) => {
+		const file = path.join(dir, "drained.jsonl");
+		fs.writeFileSync(file, twoTurns("one"));
+		const node = treeNode("root.w", "root", "w", 1, file, "retired", SETTLED_AT);
+		const nodes = [treeNode("root", null, "root", 0, null, "running"), node];
+		let clock = NOW;
+		const runtime = createSessionRuntime({
+			sendMessage() {},
+			getTreeNodes: () => nodes,
+			now: () => clock,
+		});
+		try {
+			runtime.refreshUi();
+			const before = sessionFileCacheStats();
+			runtime.refreshUi();
+			const inside = sessionFileCacheStats();
+			assert.equal(inside.statCalls - before.statCalls, 0, "inside the window a terminal row costs no stat at all");
+
+			// The child was retired first and drained afterwards: the file grew once
+			// nothing was polling it.
+			fs.appendFileSync(file, `${user("c")}\n${asst("three")}\n`);
+			clock += TTL_MS + 1;
+			runtime.refreshUi();
+			assert.equal(
+				runtime.statusEntries().find((e) => e.nodeId === "root.w")?.tokensOut,
+				6,
+				"the expired window must re-read the file, not serve the stamp-time answer",
+			);
+
+			// And the fresh answer is memoized again: one stat per window, no more.
+			const afterRevalidate = sessionFileCacheStats();
+			runtime.refreshUi();
+			assert.equal(
+				sessionFileCacheStats().statCalls - afterRevalidate.statCalls,
+				0,
+				"the revalidated answer is memoized for the next window",
+			);
+		} finally {
+			runtime.dispose();
+		}
+	});
+});
+
+/*
+ * An empty answer must never be memoized. `progressFromSessionFile` folds a
+ * missing or unreadable file to `{}`, and `session.ts` deliberately refuses to
+ * cache that ("a settled session file never moves again, so caching that empty
+ * value would pin the status rows at zero for the rest of the process"). The
+ * memo honours the same rule: the file appears, the next tick sees it.
+ */
+test("#391: a missing terminal transcript is retried, not pinned as zero for the window", async () => {
+	await withTempDir((dir) => {
+		const file = path.join(dir, "later.jsonl");
+		const node = treeNode("root.w", "root", "w", 1, file, "settled", SETTLED_AT);
+		node.tokensOut = 7;
+		const nodes = [treeNode("root", null, "root", 0, null, "running"), node];
+		const runtime = createSessionRuntime({
+			sendMessage() {},
+			getTreeNodes: () => nodes,
+			now: () => NOW,
+		});
+		try {
+			runtime.refreshUi();
+			assert.equal(
+				runtime.statusEntries().find((e) => e.nodeId === "root.w")?.tokensOut,
+				7,
+				"a missing transcript falls back to the ledger's own total",
+			);
+
+			fs.writeFileSync(file, twoTurns("now-here"));
+			runtime.refreshUi();
+			assert.equal(
+				runtime.statusEntries().find((e) => e.nodeId === "root.w")?.tokensOut,
+				4,
+				"the file appeared, so the very next tick reads it instead of waiting out the window",
+			);
 		} finally {
 			runtime.dispose();
 		}

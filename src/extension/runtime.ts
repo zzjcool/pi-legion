@@ -265,12 +265,13 @@ const DEFAULT_REFRESH_MS = 500;
  *
  * `LiveProgress` is a pure function of the session file — `progressFromSession`
  * never reads a clock, every field is folded content — so a row whose transcript
- * has stopped growing needs to be folded once, not twice a second. The one path
- * that stamps a row terminal *before* its transcript is final is the shutdown
- * hook (it retires still-running children and only then drains them), so a
- * window is kept: those values converge within half a minute instead of freezing
- * at the stamp. 279 files per 30s is ~9 stats/s, against the 279 parses per
- * 500ms this replaces (134.5MB/tick in the reported session).
+ * has stopped growing needs to be folded once, not twice a second. The window is
+ * not cosmetic: several paths stamp a terminal status before the transcript is
+ * final (the shutdown hook retires still-running children and only then drains
+ * them, `liveness()` can render a dead row as `failed`, a terminal event
+ * override can outrun the ledger), so those values must converge rather than
+ * freeze. 279 files per 30s is ~9 stats/s against the 279 folds per 500ms this
+ * replaces (134.5MB/tick in the reported session).
  */
 const TERMINAL_PROGRESS_TTL_MS = 30_000;
 
@@ -1657,7 +1658,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			for (const nodeId of activity.keys()) if (!tree.has(nodeId)) activity.delete(nodeId);
 			for (const nodeId of eventOverrides.keys()) if (!tree.has(nodeId)) eventOverrides.delete(nodeId);
 			// #391: a memoized terminal progress belongs to the rows the tree still owns.
-			// Without this the map would outlive a collapsed subtree forever.
+			// Without this the map would outlive a collapsed subtree forever. A transient
+			// empty snapshot (no ledger identity this tick) drops the memo and costs one
+			// re-fold per row afterwards — bounded, and only on that path.
 			for (const nodeId of terminalProgress.keys()) if (!tree.has(nodeId)) terminalProgress.delete(nodeId);
 		}
 		const nodes = [...tree.values()].map((node) => ({ ...node }));
@@ -1798,6 +1801,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			return cached.progress;
 		}
 		const progress = progressFromSessionFile(node.sessionFile);
+		// Never memoize an EMPTY answer. `progressFromSessionFile` folds a missing or
+		// unreadable file to `{}`, and `session.ts` deliberately refuses to cache
+		// that (a pinned zero would outlive the failure — the "token rate reads 0
+		// for the agent's entire lifetime" regression). Keeping the same rule here
+		// costs one retry per tick for a metadata-only transcript, and nothing for
+		// the ordinary case: a settled file with content always yields fields.
+		if (Object.keys(progress).length === 0) return progress;
 		terminalProgress.set(node.id, {
 			sessionFile: node.sessionFile,
 			updatedAt: node.updatedAt,
@@ -1838,10 +1848,10 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					: undefined) ?? liveFor(job.sessionFile);
 				return statusEntryFromJob(
 					job,
+					live,
 					identity,
 					storedNode,
 					finished.get(job.name)?.snapshot.execution.status,
-					live,
 					deps.getLiveDecode?.(job.name),
 				);
 			});
@@ -1851,7 +1861,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			if (seen.has(node.id)) continue;
 			const details = activity.get(node.id);
 			const live = node.sessionFile ? terminalProgressFor(node) ?? liveFor(node.sessionFile) : undefined;
-			persistedEntries.push(statusEntryFromNode(node, details, live, deps.getLiveDecode?.(node.name)));
+			persistedEntries.push(statusEntryFromNode(node, live ?? {}, details, deps.getLiveDecode?.(node.name)));
 		}
 		return [...persistedEntries, ...jobEntries].sort((left, right) =>
 			(left.depth ?? 0) - (right.depth ?? 0) ||
@@ -2956,10 +2966,10 @@ function rssFor(job: TrackedJob): number | undefined {
 
 function statusEntryFromJob(
 	job: TrackedJob,
+	live: LiveProgress,
 	identity?: LegionTreeIdentity,
 	node?: TreeNodeSnapshot,
 	executionStatus?: string,
-	live: LiveProgress = {},
 	liveDecode?: number,
 ): StatusEntry {
 	const model = live.model ?? job.model ?? node?.model ?? undefined;
@@ -3023,8 +3033,8 @@ function statusEntryFromJob(
 
 function statusEntryFromNode(
 	node: TreeNodeSnapshot,
+	live: LiveProgress,
 	activity?: NodeActivity,
-	live: LiveProgress = {},
 	liveDecode?: number,
 ): StatusEntry {
 	const lastActivityAt = latestActivityAt(

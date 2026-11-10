@@ -764,16 +764,20 @@ export function parseSessionFile(path: string): ParsedSession {
  * `/legion timing` — sweep through `session-map.ts` with no notion of a "tick"
  * at all, so a caller-reported size would have to be wrong for one of the two
  * readers in the same process. The cache instead grows on *observed thrash*: a
- * miss for a path this cache itself evicted means the cap sat below the working
- * set, so the cap doubles, once per process, up to the ceiling, and the
- * eviction memory is dropped.
+ * miss for a path this cache itself evicted (and has not re-admitted since)
+ * means the cap sat below the working set, so the cap doubles, up to the ceiling,
+ * and the eviction memory is dropped.
  *
  * The ceiling keeps the #349 rule that a resident cache is a hard bound rather
  * than a knob that follows history: an entry holds one projected
- * `ParsedSession` (turns/assistants/usage — never the raw JSONL), and twice this
- * floor is the most the cache may hold. D1's active/terminal split is what keeps
- * the steady state at the number of *live* files, so growing past 256 only pays
- * out for a workload genuinely sweeping more live files than the floor.
+ * `ParsedSession` (turns/assistants/usage — never the raw JSONL). Measured on
+ * this checkout, a projected parse is ~0.226 of the transcript's bytes, i.e.
+ * ~110 KB for the reported 482 KB mean — so the worst case moves from 256 ×
+ * ~110 KB (~28 MB) to 512 × ~110 KB (~57 MB), and no further. The issue's
+ * suggested 1024-entry guard was rejected for that reason. Steady state is what
+ * matters more: D1's active/terminal split keeps the cache at the number of
+ * *live* files, so the extra headroom is only paid by a workload genuinely
+ * sweeping more live files than the floor.
  */
 export const SESSION_FILE_CACHE_MAX_ENTRIES = 256;
 
@@ -798,10 +802,13 @@ const sessionFileCache = new Map<string, SessionFileCacheEntry>();
 /**
  * Thrash evidence (#391 D3): the paths this cache itself evicted, oldest first.
  *
- * A miss for one of these means the file is needed again *before the sweep that
- * dropped it has finished* — the only signal available without being told how
- * big a sweep is. Bounded at the ceiling like the cache: forgetting the oldest
- * evidence can only delay a doubling, never cause a wrong answer.
+ * A miss for one of these means the file is needed again after this cache
+ * dropped it and before anything re-admitted it — the only signal available
+ * without being told how big a sweep is. Wider than "within one sweep" on
+ * purpose: `parseSessionFileCached` cannot tell a tick from a one-shot
+ * `/legion summary`, and a stale piece of evidence can only double the bound
+ * once, never answer a lookup wrongly. Bounded at the ceiling like the cache:
+ * forgetting the oldest evidence can only delay a doubling.
  */
 const sessionFileCacheEvicted = new Set<string>();
 
@@ -854,7 +861,7 @@ export function sessionFileCacheStats(): SessionFileCacheStats {
 	};
 }
 
-/** Test hook: drop the file-level cache and zero its counters. */
+/** Test hook: drop the file-level cache, reset the adaptive cap and its thrash evidence, and zero the counters. */
 export function clearSessionFileCache(): void {
 	sessionFileCache.clear();
 	sessionFileCacheEvicted.clear();
