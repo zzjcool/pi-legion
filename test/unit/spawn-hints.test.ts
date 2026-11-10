@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	INPROCESS_MODEL_HINT,
+	appendInprocessModelHint,
 	clearSpawnFailures,
 	looksLikeMissingModel,
 	recentSpawnFailures,
@@ -147,4 +148,25 @@ test("#317: no spawn hint recommends the dead inheritExtensions switch (rpc bran
 	assert.doesNotMatch(rpc!, /PI_LEGION_CHILD_INHERIT_EXTENSIONS=1/);
 	assert.match(rpc!, /PI_LEGION_CHILD_EXTENSIONS/, "the lever that still works stays in the first sentence");
 	assert.match(rpc!, /\/legion doctor|action=diagnose/);
+});
+
+test("appendInprocessModelHint: pure gate, appended once, byte-identical otherwise", () => {
+	const message = "inprocess model resolve failed for 'ghost/model': Model \"ghost/model\" not found";
+	const hinted = appendInprocessModelHint(message);
+	assert.ok(hinted.startsWith(`${message}\n\nHint: `), "the original message survives verbatim as the prefix");
+	assert.match(hinted, /models\.json/);
+	// One hint per call — the gate is the marker, so "no double hint" is the call
+	// sites' job (each appends once per failure), not an accumulating series.
+	assert.equal((hinted.match(/Hint:/g) ?? []).length, 1);
+
+	// An rpc-shaped message never carries the in-process marker, so no second
+	// hint can be glued under one that already has a section of its own.
+	const rpc = 'Pi RPC process exited during startup: Error: Model "x" not found\n\nHint: argv advice';
+	assert.equal(appendInprocessModelHint(rpc), rpc);
+	// A plain failure is returned untouched (the frozen `teams.test.ts` wording).
+	const plain = "spawn refused for the interrupt test";
+	assert.equal(appendInprocessModelHint(plain), plain);
+
+	// The gate is case-insensitive, like `MODEL_NOT_FOUND`.
+	assert.match(appendInprocessModelHint("INPROCESS MODEL RESOLVE FAILED for 'x'"), /Hint: /);
 });

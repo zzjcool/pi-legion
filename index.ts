@@ -102,6 +102,7 @@ import {
 } from "./src/extension/notify.ts";
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
 import { renderSpawnResult } from "./src/extension/spawn-render.ts";
+import { appendInprocessModelHint } from "./src/extension/spawn-hints.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
 import { CHILD_ROLE_ENV } from "./src/extension/child-guard.ts";
 import { configureSessionErrors, recordSessionError } from "./src/extension/session-errors.ts";
@@ -2568,6 +2569,28 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 }
 
 /**
+ * The env `applyTeam` resolves the team from (B9, D-B9.3).
+ *
+ * A root session keeps `process.env` verbatim — its behaviour must not move, and
+ * an explicit `PI_SUBAGENTS_TEAM` there still wins the same way it always did.
+ *
+ * An in-process child shares that very env with its parent, so the team the
+ * parent chose for THIS spawn cannot be read from it. It rides on the ALS child
+ * context instead (`ChildLaunchContext.team`, lifted off `SpawnInput.env` by
+ * `InProcessSupervisor`). Overlaying it on the env — rather than branching
+ * around `applyTeam` — keeps ONE resolution funnel for every session shape:
+ * env (`active team`) > `subagents.team` > `default`. Key presence decides, so
+ * a child spawned with an explicit `team: "default"` really means "no team" and
+ * beats a settings team; an absent context team leaves the chain untouched.
+ */
+function teamEnvForCatalog(): NodeJS.ProcessEnv {
+	const contextTeam = currentChildContext()?.team;
+	return contextTeam === undefined
+		? process.env
+		: { ...process.env, [TEAM_ENV]: contextTeam };
+}
+
+/**
  * Load the effective agent catalog for a request.
  *
  * User settings (`~/.pi/agent/settings.json`) merge
@@ -2600,7 +2623,7 @@ export function loadCatalog(
 		includeBuiltin: settings.disableBuiltins !== true,
 	});
 	const overridden = applyAgentOverrides(discovery.agents, settings.agentOverrides);
-	const teamResult = applyTeam(overridden, settings);
+	const teamResult = applyTeam(overridden, settings, teamEnvForCatalog());
 	const utilityWarnings = [...new Map(
 		[...overridden, ...teamResult.agents]
 			.filter((agent) => agent.utility && agent.allowNestedSubagents)
@@ -4213,7 +4236,11 @@ async function launchStep(
 			error instanceof SubagentError
 				? `${error.code}: ${error.message}`
 				: String(error);
-		session.results.push(`✗ ${step.agent}: ${message}`);
+		// R5 hint (D-H1/D-H2): an in-process model miss only ever reached the `✗`
+		// line. `spawnFailureHint` already knew the in-process Fix段 — append it
+		// here, through the pure helper, so the process-wide failure ring (which a
+		// later rpc doctor snippet reads) is never written from this path.
+		session.results.push(`✗ ${step.agent}: ${appendInprocessModelHint(message)}`);
 	}
 }
 
@@ -4722,8 +4749,16 @@ async function launchUtilityFamily(input: {
 		retire: (opts?: RetireOptions) => Promise<void>;
 	}> = [];
 	for (const launch of launches) {
-		if ("error" in launch) results.push(`✗ ${launch.item.agent.name}: ${launch.error}`);
-		else handles.push(launch.value);
+		// Same hint as `launchStep`: the utility family is the other place a failed
+		// spawn becomes a line, and it must not lose the fix path either. The
+		// collected `scopeWarnings` already sit at the head of `results`, so
+		// appending here cannot bypass them.
+		if ("error" in launch) {
+			// `String(...)` keeps the pre-hint rendering for the (impossible) undefined
+			// case byte-identical.
+			const failure = String(launch.error);
+			results.push(`✗ ${launch.item.agent.name}: ${appendInprocessModelHint(failure)}`);
+		} else handles.push(launch.value);
 	}
 
 	const followUtility = (handle: (typeof handles)[number], watch: boolean): void => {

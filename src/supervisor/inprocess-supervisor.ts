@@ -11,6 +11,7 @@
 import { statSync } from "node:fs";
 import { formatChildTask } from "../extension/child-guard.ts";
 import { childBudgetFromEnv } from "../extension/budget.ts";
+import { TEAM_ENV } from "../agents/teams.ts";
 import { parseSessionFile } from "../shared/session.ts";
 import {
 	appendLegionChildTools,
@@ -403,6 +404,12 @@ function parentKeyOf(name: string): string {
  * why partial identity must not be mistaken for a complete one downstream.
  */
 function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
+	// B9 (D-B9.2): the team the parent chose for THIS spawn travels on
+	// `SpawnInput.env` — that is how an rpc child receives it. Lifted here for the
+	// in-process channel, and merged in BOTH branches below: the `provided` branch
+	// returns early, so a merge placed only in the fallback would leave exactly the
+	// legion (node-backed) spawns team-blind, i.e. the grandchildren this fixes.
+	const team = teamFromSpawnEnv(input.env);
 	const provided = input.childLaunchContext;
 	if (provided) {
 		// REV2-3: store a deep-enough snapshot, never the caller's live object.
@@ -411,6 +418,9 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		// child for its later dispatches — the A-becomes-B leak D5 exists to kill.
 		return {
 			...provided,
+			// …and for the same REV2-3 reason the spawn env wins over a reused
+			// template's `team`: env is per-spawn, the template is not.
+			...team,
 			// Element-level copy too: after the path became `NestedPathEntry[]`
 			// (objects), `[...path]` would still alias every entry, so a caller
 			// mutating `template.parentPath[0].runId` would rewrite an
@@ -430,7 +440,24 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		// gets as its real environment — and carry them in the context, because the
 		// in-process child shares the host's process.env and cannot see them there.
 		...budgetFromSpawnEnv(input.env),
+		// B9: same channel, same reason (see the `team` binding above).
+		...team,
 	};
+}
+
+/**
+ * Extract the parent's selected team from a spawn env (B9).
+ *
+ * Key presence, not truthiness: `team: "default"` is a real, expressible choice
+ * that must beat a `subagents.team` setting, so the only "no team" answer is an
+ * env without `PI_SUBAGENTS_TEAM` at all.
+ */
+function teamFromSpawnEnv(env: NodeJS.ProcessEnv | undefined): {
+	team?: string;
+} {
+	if (!env || !(TEAM_ENV in env)) return {};
+	const team = env[TEAM_ENV];
+	return team === undefined ? {} : { team };
 }
 
 /** Extract the child budget keys from a spawn env, for the in-process channel. */

@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { ErrorCodes, type AgentConfig, type SubagentsSettings } from "../../src/shared/types.ts";
+import { ErrorCodes, SubagentError, type AgentConfig, type SubagentsSettings } from "../../src/shared/types.ts";
 import {
 	applyTeam,
 	DEFAULT_TEAM,
@@ -45,6 +45,7 @@ import {
 import { createSessionRuntime, type WaitResult } from "../../src/extension/runtime.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
+import { runInChildContext } from "../../src/supervisor/child-context.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import piLegion from "../../index.ts";
 
@@ -1616,6 +1617,84 @@ test("index mainline: environment default team reaches the child", async () => {
 	}
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// B9: the team the parent chose for a spawn must be VISIBLE to the child
+// session, not merely present in `SpawnInput.env`.
+//
+// An in-process child shares the host's `process.env`, so the env entry below is
+// not something it can read — the choice travels on the ALS child context
+// (`ChildLaunchContext.team`) and `loadCatalog` overlays it on the env it hands
+// to `applyTeam`. These cases therefore read the CATALOG, not the spawn env: a
+// "the env has the key" assertion is exactly the false green that hid B9.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("B9: an in-process child's catalog sees the team its parent chose", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true, teams: { frontend: { members: [{ agent: "worker", model: "cb/team-model" }] } } },
+		{ "worker.md": WORKER_FILE, "designer.md": DESIGNER_FILE },
+	);
+	try {
+		// Root (no ALS team): settings alone decide, unchanged behaviour.
+		const root = loadCatalog(harness.cwd, harness.cwd, undefined);
+		assert.equal(root.team.name, DEFAULT_TEAM);
+		assert.equal(root.agents.find((entry) => entry.name === "worker")?.model, undefined);
+
+		const child = await runInChildContext(
+			{ allowNested: true, utility: false, spawnMode: "inprocess", team: "frontend" },
+			async () => loadCatalog(harness.cwd, harness.cwd, undefined),
+		);
+		assert.equal(child.team.name, "frontend", "the child resolves the parent's team, not the default");
+		// Team filtering happened…
+		assert.deepEqual(child.agents.map((entry) => entry.name), ["worker"]);
+		// …and level 3 (the member's `model`) folded — the observable consequence
+		// B9 hid for grandchildren.
+		const worker = child.agents.find((entry) => entry.name === "worker");
+		assert.equal(worker?.model, "cb/team-model");
+		assert.deepEqual(worker?.modelSource, { type: "team", model: "cb/team-model" });
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("B9: an explicit `default` on the child context beats the settings team", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true, team: "frontend", teams: { frontend: { members: ["designer"] } } },
+		{ "worker.md": WORKER_FILE, "designer.md": DESIGNER_FILE },
+	);
+	try {
+		const child = await runInChildContext(
+			{ allowNested: false, utility: false, spawnMode: "inprocess", team: "default" },
+			async () => loadCatalog(harness.cwd, harness.cwd, undefined),
+		);
+		assert.equal(child.team.name, "default");
+		// The settings team would have filtered `worker` out, so an explicit
+		// `team: "default"` must be expressible: the decision is key presence, not
+		// truthiness (`"default"` is perfectly truthy, but `""`/absent is not — a
+		// truthiness check is what would have swallowed the distinction).
+		assert.deepEqual(child.agents.map((entry) => entry.name).sort(), ["designer", "worker"]);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("B9: a child context without a team keeps following the settings team", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true, team: "frontend", teams: { frontend: { members: ["designer"] } } },
+		{ "worker.md": WORKER_FILE, "designer.md": DESIGNER_FILE },
+	);
+	try {
+		const child = await runInChildContext(
+			{ allowNested: true, utility: false, spawnMode: "inprocess" },
+			async () => loadCatalog(harness.cwd, harness.cwd, undefined),
+		);
+		assert.equal(child.team.name, "frontend");
+		assert.equal(child.team.source, "settings", "no context team means the env/settings chain decides");
+		assert.deepEqual(child.agents.map((entry) => entry.name), ["designer"]);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
 test("index verify: launch-supplied commands run at collect and gate the verdict", async () => {
 	const calls: Array<{ command: string; cwd: string }> = [];
 	const verifyRunner = async (command: string, cwd: string) => {
@@ -2364,6 +2443,131 @@ test("vexillatio refuses a per-item `name` instead of silently dropping it", asy
 		assert.match(text, /vexillatio allocates one handle per step itself/);
 		assert.equal((result.details as { error?: string } | undefined)?.error, ErrorCodes.INVALID_PARAMS);
 		assert.equal(harness.supervisor.spawns.length, 0, "a refused field must not launch anything");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R5 hint: an in-process model-resolution failure used to reach the caller as
+// the bare `✗` line, while the rpc path got `enrichFailureWithAutoDoctor`.
+// `spawnFailureHint` already knew the wording; nothing called it here.
+//
+// Deliberately NOT routed through the auto-doctor ring: that buffer is
+// process-wide (8 entries, across runs), so an in-process record in it would be
+// offered as advice for a later, unrelated rpc failure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const INPROCESS_MODEL_FAILURE =
+	"inprocess model resolve failed for 'ghost/model': Model \"ghost/model\" not found. Use --list-models";
+
+test("hint: an in-process model miss appends the Fix段 exactly once", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.supervisor.spawnChild = async () => {
+			throw new SubagentError(INPROCESS_MODEL_FAILURE, ErrorCodes.START_FAILED);
+		};
+		const text = await invokeIndex(harness, {
+			agent: "worker",
+			task: "spawn with an unregistered model",
+			async: true,
+			worktree: false,
+		});
+		// The failure line is still the `✗ <agent>:` shape and keeps the message.
+		assert.match(text, /✗ worker: START_FAILED: inprocess model resolve failed for 'ghost\/model'/);
+		// …and now carries the in-process fix path, not just argv-era prose.
+		assert.match(text, /Fix: declare the provider statically in `models\.json`/);
+		assert.match(text, /PI_LEGION_CHILD_EXTENSIONS/);
+		assert.equal(
+			(text.match(/Hint:/g) ?? []).length,
+			1,
+			`the hint is appended once, not per call site:\n${text}`,
+		);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("hint: an rpc-style failure that already carries a Hint is not hinted twice", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		// Shaped exactly like an enriched rpc failure: no `inprocess` marker, but
+		// it already ends with its own hint + auto-doctor section.
+		const failure =
+			'Pi RPC process exited during startup: Error: Model "ghost/model" not found. Use --list-models\n\n' +
+			"Hint: children start with `--no-extensions`, so host packages that register providers are not loaded.\n\n" +
+			"--- Legion auto-doctor ---\nmodels: ghost/model";
+		harness.supervisor.spawnChild = async () => {
+			throw new SubagentError(failure, ErrorCodes.START_FAILED);
+		};
+		const text = await invokeIndex(harness, {
+			agent: "worker",
+			task: "rpc-style failure",
+			async: true,
+			worktree: false,
+		});
+		assert.match(text, /✗ worker: START_FAILED: Pi RPC process exited during startup/);
+		assert.equal((text.match(/Hint:/g) ?? []).length, 1, `no second hint:\n${text}`);
+		assert.doesNotMatch(text, /declare the provider statically/, "the in-process Fix段 must not ride along");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("hint: a plain spawn failure stays byte-identical (no hint invented)", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.supervisor.spawnChild = async () => {
+			throw new Error("spawn refused for the interrupt test");
+		};
+		const text = await invokeIndex(harness, {
+			agent: "worker",
+			task: "plain failure",
+			async: true,
+			worktree: false,
+		});
+		// Verbatim: `String(error)` is what launchStep has always rendered, and this
+		// shape must not grow a hint (the utility-interrupt test pins the same
+		// rule on its own path).
+		assert.equal(text, "✗ worker: Error: spawn refused for the interrupt test");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("hint: the vexillatio failure path carries the same hint once", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		{ "scout.md": UTILITY_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.supervisor.spawnChild = async () => {
+			throw new SubagentError(INPROCESS_MODEL_FAILURE, ErrorCodes.START_FAILED);
+		};
+		const result = await harness.utilityTool.execute(
+			"vex-hint",
+			{ agent: "scout", task: "recon", cwd: harness.cwd, timeoutMs: 600_000 },
+			undefined,
+			undefined,
+			{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+		);
+		const text = (result.content ?? []).map((item) => item.text ?? "").join("\n");
+		assert.match(text, /✗ scout: inprocess model resolve failed for 'ghost\/model'/);
+		assert.match(text, /declare the provider statically in `models\.json`/);
+		assert.equal((text.match(/Hint:/g) ?? []).length, 1, `one hint per failure:\n${text}`);
 	} finally {
 		await harness.cleanup();
 	}

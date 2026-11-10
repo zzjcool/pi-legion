@@ -15,6 +15,7 @@ import {
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import { currentChildContext } from "../../src/supervisor/child-context.ts";
+import { TEAM_ENV } from "../../src/agents/teams.ts";
 import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import {
@@ -1003,6 +1004,82 @@ test("inprocess: missing childLaunchContext falls back to a derived context", as
 		assert.equal(seen.utility, false);
 		assert.equal(seen.acceptanceRole, "writer");
 		assert.equal(seen.nodeId, undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("B9: the team the parent chose travels from SpawnInput.env into the child context", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-team-"));
+	let seenDuringFactory: ReturnType<typeof currentChildContext>;
+	let seenDuringPrompt: ReturnType<typeof currentChildContext>;
+	class ProbeSession extends FakeSession {
+		override async prompt(text: string): Promise<void> {
+			seenDuringPrompt = currentChildContext();
+			await super.prompt(text);
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			seenDuringFactory = currentChildContext();
+			return new ProbeSession();
+		},
+	});
+	try {
+		// The PROVIDED branch: legion spawns hand a full context over and the
+		// resolver returns early, so a merge placed only in the fallback branch
+		// would leave exactly the node-backed (grand)children team-blind.
+		await supervisor.spawnChild({
+			...testInput(root),
+			env: { [TEAM_ENV]: "frontend" },
+			childLaunchContext: {
+				nodeId: "node-11",
+				allowNested: true,
+				utility: false,
+				spawnMode: "inprocess",
+			},
+		});
+		assert.equal(seenDuringFactory?.team, "frontend");
+		assert.equal(seenDuringPrompt?.team, "frontend");
+		// The rest of the provided identity is untouched by the team merge.
+		assert.equal(seenDuringPrompt?.nodeId, "node-11");
+		assert.deepEqual(seenDuringPrompt?.budget, undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("B9: the derived context carries the team too, and never invents one", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-team-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	try {
+		// 1) the fallback branch (no childLaunchContext) must merge it as well;
+		// 2) `"default"` is carried verbatim — it is a real choice, and whether it
+		//    beats a settings team is decided downstream (teams.test.ts asserts
+		//    that against the catalog; this layer must not swallow the value);
+		// 3) no key at all must stay `undefined` (no invented team).
+		await supervisor.spawnChild({ ...testInput(root, "root.a"), env: { [TEAM_ENV]: "frontend" } });
+		await supervisor.spawnChild({ ...testInput(root, "root.b"), env: { [TEAM_ENV]: "default" } });
+		await supervisor.spawnChild({
+			...testInput(root, "root.c"),
+			env: { PI_SUBAGENT_MAX_TOOL_CALLS: "3" },
+		});
+		await supervisor.spawnChild(testInput(root, "root.d"));
+		assert.deepEqual(
+			contexts.map((context) => context?.team),
+			["frontend", "default", undefined, undefined],
+		);
+		// The neighbouring env-derived field still works: budget and team are read
+		// off the same object, independently.
+		assert.deepEqual(contexts[2]?.budget, { maxToolCalls: 3 });
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
