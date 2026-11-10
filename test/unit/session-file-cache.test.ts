@@ -198,11 +198,19 @@ test("#348: the file cache is a hard bound and evicts the least-recently-used pa
  * The measured cliff is 279 ledger rows over 279 distinct session files against
  * a 256-entry cap: `SESSION_FILE_CACHE_MAX_ENTRIES` sat *just* below the working
  * set, so every sweep evicted files it was about to need again, and the hit rate
- * was exactly 0 while the 500ms refresh re-read 134.5 MB per tick. This is the
- * same shape at 300 files: the first sweep cannot hit (nothing is cached yet, and
- * the cap is below the sweep), the evicted paths come back immediately on the
- * next sweep, and that is the evidence the cap doubles on. Once warm, the sweep
- * is served from `stat` alone — no parse, no re-read.
+ * was exactly 0 while the 500ms refresh re-read 134.5 MB per tick. This is that
+ * shape at 300 files, and it pins the recovery to the exact sweep: the first
+ * sweep fills the cap and drops `300 - MAX` paths, the second re-needs those
+ * paths (the first of them is the thrash signal, so the cap doubles and the rest
+ * re-enter instead of evicting each other), and by the third sweep every file is
+ * served from `stat` alone.
+ *
+ * Why growth cannot happen *inside* sweep 1, and why the all-hit sweep is the
+ * third and not the second: growth requires a miss for a path this cache itself
+ * evicted, and a sweep visits each path once. So with 300 files and a 256 cap,
+ * sweep 1 necessarily ends with 256 cached and 44 evicted, and sweep 2 must
+ * re-parse exactly those 44. `misses === 0` on a sweep of 300 is therefore only
+ * reachable once the cap already covers the sweep — i.e. from sweep 3 on.
  */
 test("#391: a sweep larger than the cap doubles the cap once instead of thrashing forever", async () => {
 	await withTempDir((dir) => {
@@ -211,21 +219,42 @@ test("#391: a sweep larger than the cap doubles the cap once instead of thrashin
 			fs.writeFileSync(file, twoTurns(`turn-${i}`));
 			return file;
 		});
+		const sweep = (): void => {
+			for (const file of files) parseSessionFileCached(file);
+		};
+		const dropped = 300 - SESSION_FILE_CACHE_MAX_ENTRIES;
 		clearSessionFileCache();
 
-		for (const file of files) parseSessionFileCached(file);
+		// Sweep 1: cold, so 300 misses and no hit, and the cap keeps only the last
+		// MAX files. No path is revisited, so there is no thrash evidence yet.
+		sweep();
 		const first = sessionFileCacheStats();
 		assert.equal(first.misses, 300);
 		assert.equal(first.hits, 0);
-		assert.equal(first.cap, SESSION_FILE_CACHE_MAX_ENTRIES);
+		assert.equal(first.cap, SESSION_FILE_CACHE_MAX_ENTRIES, "a sweep cannot grow the cap it is thrashing against");
+		assert.equal(first.size, SESSION_FILE_CACHE_MAX_ENTRIES);
 
-		for (const file of files) parseSessionFileCached(file);
+		// Sweep 2: the head of the file list is the first path sweep 1 evicted, so
+		// it is a miss with evidence — the cap doubles, and the remaining dropped
+		// paths re-enter under the grown cap. Everything sweep 1 kept is a hit.
+		sweep();
 		const second = sessionFileCacheStats();
-		assert.equal(second.misses, first.misses, "the second sweep must not re-parse a single file");
-		assert.equal(second.hits, 300);
+		assert.equal(second.misses - first.misses, dropped, "only the paths sweep 1 evicted are re-parsed");
+		assert.equal(second.hits - first.hits, SESSION_FILE_CACHE_MAX_ENTRIES, "every path sweep 1 kept is a hit");
+		assert.equal(second.cap, SESSION_FILE_CACHE_MAX_ENTRIES * 2, "the thrash miss doubles the cap, once");
 		assert.equal(second.size, 300, "the grown cap holds the whole sweep");
-		assert.equal(second.cap, SESSION_FILE_CACHE_MAX_ENTRIES * 2);
-		assert.equal(sessionFileCacheHas(files[0] as string), true, "the head of the sweep is still cached");
+		assert.equal(sessionFileCacheHas(files[0] as string), true, "the path that doubled the cap is cached again");
+
+		// Sweep 3 (warm): 100% hit rate — the guarantee the issue's acceptance is
+		// about, and the proof that the cache stopped thrashing for good.
+		sweep();
+		const third = sessionFileCacheStats();
+		const warmHits = third.hits - second.hits;
+		const warmMisses = third.misses - second.misses;
+		assert.equal(warmMisses, 0, "a warm sweep re-parses nothing");
+		assert.equal(warmHits, 300);
+		assert.equal(warmHits / (warmHits + warmMisses), 1, "hits/(hits+misses) after warm-up is 1.0");
+		assert.equal(third.cap, SESSION_FILE_CACHE_MAX_ENTRIES * 2, "the cap stays at the ceiling, not growing per sweep");
 	});
 });
 
