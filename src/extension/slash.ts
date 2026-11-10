@@ -17,6 +17,7 @@ import {
 import { classifyModelOrigin, resolveStepModel } from "../agents/step-model.ts";
 import { INHERIT_WITHOUT_PARENT_MODEL } from "../agents/model-resolution.ts";
 import { checkModelScope } from "../agents/model-scope.ts";
+import { applyThinkingSuffix } from "../runs/args.ts";
 import {
 	DEFAULT_TEAM,
 	TEAM_ENV,
@@ -196,7 +197,9 @@ export function renderAgentsListing(input: {
  * `inherit` is not a model and not a fallback: the ONLY thing it can mean is
  * "whatever this session is running", so with none the launch is refused
  * (D-B8a.1). Reporting `(agent CLI default)` there named a working
- * configuration the operator would never get.
+ * configuration the operator would never get. Rendered by the catch below,
+ * because the refusal is what arrives: there is no model-less `inherit` to
+ * describe on the success path.
  */
 const INHERIT_NEEDS_PARENT_MODEL =
 	"needs a parent session model — a launch would refuse this";
@@ -237,13 +240,6 @@ function renderOneAgent(
 		});
 		if (resolved.resolved.model) {
 			details.push(modelLine(agent, resolved, input.settings));
-		} else if (resolved.resolved.source?.type === "inherit") {
-			// D-B8a.4: a model-less `inherit` is NOT the CLI default. Nothing of the
-			// role's own would run, and a launch from a session without a model is
-			// refused (D-B8a.1) — so say that instead of naming a fallback nobody
-			// would get. Kept as a guard even though D-B8a.1 now throws on the way
-			// in: this line must never claim `(agent CLI default)` for an `inherit`.
-			details.push(`model: ${INHERIT_NEEDS_PARENT_MODEL}`);
 		} else {
 			details.push("model: (agent CLI default)");
 		}
@@ -287,7 +283,15 @@ function modelLine(
 	const model = resolved.resolved.model as string;
 	const { origin, label } = classifyModelOrigin(resolved.resolved, undefined);
 
-	const parts = [`model: ${model} (${label ?? "resolved"})`];
+	// The running form, not the resolved one: `thinking` (on the effective agent
+	// after preset expansion) is appended as `:level` by the SAME builder that
+	// writes the rpc argv and the in-process model ref, so a listing that showed
+	// the bare id would disagree with the child it describes (`cb/x` here vs
+	// `cb/x:max` there).
+	const effectiveModel =
+		applyThinkingSuffix(model, resolved.agent.thinking) ?? model;
+
+	const parts = [`model: ${effectiveModel} (${label ?? "resolved"})`];
 
 	// Same settings, same severity semantics as `launchStep`.
 	const violation = checkModelScope(

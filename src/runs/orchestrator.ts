@@ -10,6 +10,8 @@ import * as fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
+import { stripThinkingSuffix } from "../agents/model-scope.ts";
+import { isThinkingConfigured } from "../agents/step-model.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
 import type { LegionSettings } from "../shared/types.ts";
 import { LEGION_IDENTITY_ENV_KEYS, LEGION_PHASES_ENV, legionIdentityEnv } from "./args.ts";
@@ -1527,12 +1529,28 @@ export class Orchestrator {
 		model?: string;
 		origin: ModelOrigin;
 		thinking?: string | false;
-	}): Array<string | undefined> {		const requested = modelCandidates(input.model ?? input.agent.model, input.agent.fallbackModels);
+	}): Array<string | undefined> {
+		const requested = modelCandidates(
+			input.model ?? input.agent.model,
+			input.agent.fallbackModels,
+		);
 		// Every candidate now belongs to the one supported kind, so the model the
 		// caller asked for is the model the child starts with; an unset model is
 		// the only case that leaves the choice to the child's own configuration.
 		const candidates = requested.filter((model): model is string => Boolean(model));
-		return candidates.length ? candidates : [undefined];
+		if (candidates.length === 0) return [undefined];
+		// D-B8b.1: a configured `thinking` REPLACES a `:level` inside the model
+		// string. `step-model` already stripped the winning candidate — it owns the
+		// per-run exception (a level typed into THIS call is the caller's choice and
+		// must survive). A fallback is not covered by that exception and no later
+		// layer strips it either, so `applyThinkingSuffix` would meet the fallback's
+		// stale level first, keep it, and drop the configured one on the retry: a
+		// silent switch back to reasoning after a start failure.
+		const thinking = input.thinking !== undefined ? input.thinking : input.agent.thinking;
+		if (!isThinkingConfigured(thinking)) return candidates;
+		return candidates.map((model, index) =>
+			index === 0 ? model : stripThinkingSuffix(model),
+		);
 	}
 
 	// ── Launch admission queue (issue #266) ─────────────────────────────────

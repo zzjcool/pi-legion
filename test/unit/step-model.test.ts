@@ -568,6 +568,29 @@ test("B8b.1: `thinking: false` strips the level (reasoning must stay off)", () =
 	assert.equal(out.agent.thinking, false, "the flag itself is untouched");
 });
 
+test("B8b.1: a blank `thinking` is not a configuration, so the model's level stays", () => {
+	// `agentOverrides.<role>.thinking: ""` used to count as configured and strip
+	// the level — with nothing put back, because `applyThinkingSuffix` appends
+	// nothing for a blank level. The operator's only thinking choice vanished.
+	const blank = resolveStepModel({
+		agent: agent({ model: "cb/x:high", thinking: "" }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	assert.equal(blank.resolved.model, "cb/x:high", "a blank `thinking` is not a choice");
+	assert.equal(blank.agent.thinking, "");
+
+	// Whitespace is the same non-choice (the override is a string from settings).
+	const spaces = resolveStepModel({
+		agent: agent({ model: "cb/x:high", thinking: "   " }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	assert.equal(spaces.resolved.model, "cb/x:high");
+});
+
 test("B8b.1: provenance keeps `model` and `source.model` in step after the strip", () => {
 	// `resolveModel` always returns them as the same string; a strip that only
 	// rewrote one of them would look like a STALE provenance tag downstream.

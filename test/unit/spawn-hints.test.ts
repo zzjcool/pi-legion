@@ -9,6 +9,7 @@ import {
 	spawnFailureHint,
 	withSpawnFailureHint,
 } from "../../src/extension/spawn-hints.ts";
+import { INPROCESS_MODEL_FAILURE } from "../helpers/inprocess-failure.ts";
 
 test("looksLikeMissingModel detects pi's model errors", () => {
 	assert.equal(looksLikeMissingModel('Error: Model "workbuddy/x:high" not found. Use --list-models'), true);
@@ -151,7 +152,7 @@ test("#317: no spawn hint recommends the dead inheritExtensions switch (rpc bran
 });
 
 test("appendInprocessModelHint: pure gate, appended once, byte-identical otherwise", () => {
-	const message = "inprocess model resolve failed for 'ghost/model': Model \"ghost/model\" not found";
+	const message = INPROCESS_MODEL_FAILURE;
 	const hinted = appendInprocessModelHint(message);
 	assert.ok(hinted.startsWith(`${message}\n\nHint: `), "the original message survives verbatim as the prefix");
 	assert.match(hinted, /models\.json/);

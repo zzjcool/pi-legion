@@ -373,6 +373,28 @@ test("renderAgentsListing: unresolvable configuration is reported, not guessed",
 	assert.match(text, /unresolvable/);
 });
 
+test("renderAgentsListing: the model line shows the RUNNING form, with `thinking` appended", () => {
+	// The line described the resolved id while the child actually starts with
+	// `applyThinkingSuffix(model, thinking)` — so a role whose reasoning level
+	// came from `thinking` was displayed as if it had none (`cb/x` vs `cb/x:max`).
+	const text = renderAgentsListing({
+		agents: [stubAgent({ name: "strong", model: "cb/x", thinking: "max" })],
+		scope: "user",
+		projectAgentsDir: null,
+		builtinAgentsDir: "/pkg/agents",
+		settings: {},
+	});
+	assert.match(text, /model: cb\/x:max \(the agent's frontmatter\)/);
+	assert.doesNotMatch(text, /model: cb\/x \(the agent's frontmatter\)/);
+});
+
+/**
+ * D-B8a.4: `inherit` with no parent model is a REFUSAL, and the listing says so.
+ *
+ * The refusal is thrown by `resolveStepModel` (D-B8a.1), so it is the catch below
+ * that renders this line — the former success-path branch for a model-less
+ * `inherit` was unreachable and has been removed.
+ */
 test("renderAgentsListing: an `inherit` role with no parent model says a launch would refuse it", () => {
 	// `inherit` used to be reported as `(agent CLI default)` — a working
 	// configuration. A launch from a session with no model is REFUSED (B8a.1),

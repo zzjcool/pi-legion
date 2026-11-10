@@ -15,9 +15,10 @@ import {
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import { currentChildContext } from "../../src/supervisor/child-context.ts";
-import { TEAM_ENV } from "../../src/agents/teams.ts";
+import { TEAM_ENV, resolveActiveTeamName } from "../../src/agents/teams.ts";
 import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import { resolveStepModel } from "../../src/agents/step-model.ts";
 import {
 	discoveredHostExtensions,
 	resetExtensionDiscoveryCache,
@@ -529,6 +530,37 @@ test("inprocess plan: tools + model + systemPrompt replace/append", () => {
 	assert.equal(appendPlan.systemPromptMode, "append");
 	assert.equal(appendPlan.systemPromptText, "Extra.");
 	assert.equal(appendPlan.modelRef, undefined);
+});
+
+/**
+ * B8b end-to-end on the in-process side: the launch layer strips the level that
+ * a configured `thinking` replaces, and THIS layer re-attaches the configured
+ * one as the model ref.
+ *
+ * Asserting `plan.modelRef` (not the spawn input) is the point: the ref is built
+ * by the same `applyThinkingSuffix` that builds the rpc argv, and it KEEPS any
+ * level it finds — so an unstripped model would silently keep `:high` while the
+ * operator configured `max`, and the two backends would agree on the wrong
+ * answer.
+ */
+test("inprocess plan e2e: a configured `thinking` beats the level inside the model", () => {
+	const resolved = resolveStepModel({
+		agent: testAgent({ model: "cb/x:high", thinking: "max" }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	const plan = buildInProcessSessionPlan({
+		name: "root.worker",
+		cwd: "/tmp/ws",
+		agent: resolved.agent,
+		sessionFile: "/tmp/ws/worker.jsonl",
+		...(resolved.resolved.model ? { model: resolved.resolved.model } : {}),
+		...(resolved.agent.thinking !== undefined
+			? { thinking: resolved.agent.thinking }
+			: {}),
+	});
+	assert.equal(plan.modelRef, "cb/x:max");
 });
 
 test("inprocess plan: omit tools leaves SDK default; utility skips vexillatio", () => {
@@ -1065,7 +1097,14 @@ test("B9: the derived context carries the team too, and never invents one", asyn
 		// 2) `"default"` is carried verbatim — it is a real choice, and whether it
 		//    beats a settings team is decided downstream (teams.test.ts asserts
 		//    that against the catalog; this layer must not swallow the value);
-		// 3) no key at all must stay `undefined` (no invented team).
+		// 3) no key at all must stay `undefined` (no invented team);
+		// 4) a BLANK value is the one case where key presence and truthiness stop
+		//    agreeing. `teamFromSpawnEnv` carries key presence (a `"default"` that
+		//    must beat settings cannot be confused with "absent"), so `""` reaches
+		//    the context verbatim; `resolveActiveTeamName` trims it to "nothing
+		//    selected" and falls through to settings. The two agree on everything
+		//    OBSERVABLE — a blank selection selects no team — which is the property
+		//    asserted below, not a new truth about `""`.
 		await supervisor.spawnChild({ ...testInput(root, "root.a"), env: { [TEAM_ENV]: "frontend" } });
 		await supervisor.spawnChild({ ...testInput(root, "root.b"), env: { [TEAM_ENV]: "default" } });
 		await supervisor.spawnChild({
@@ -1073,10 +1112,19 @@ test("B9: the derived context carries the team too, and never invents one", asyn
 			env: { PI_SUBAGENT_MAX_TOOL_CALLS: "3" },
 		});
 		await supervisor.spawnChild(testInput(root, "root.d"));
+		await supervisor.spawnChild({ ...testInput(root, "root.e"), env: { [TEAM_ENV]: "" } });
 		assert.deepEqual(
 			contexts.map((context) => context?.team),
-			["frontend", "default", undefined, undefined],
+			["frontend", "default", undefined, undefined, ""],
 		);
+		// The downstream reader turns that blank into the same answer it gives an
+		// absent key: "no team chosen, use settings".
+		assert.equal(
+			resolveActiveTeamName({ team: "settings-team" }, { [TEAM_ENV]: "" }).name,
+			resolveActiveTeamName({ team: "settings-team" }, {}).name,
+			"a blank env value and an absent one are observably equal downstream",
+		);
+		assert.equal(resolveActiveTeamName({ team: "settings-team" }, { [TEAM_ENV]: "" }).source, "settings");
 		// The neighbouring env-derived field still works: budget and team are read
 		// off the same object, independently.
 		assert.deepEqual(contexts[2]?.budget, { maxToolCalls: 3 });

@@ -473,6 +473,11 @@ async function runContinue(params: {
 	model?: string;
 	/** Parent registry the revive re-pins from when THIS call chose the model. */
 	modelRegistry?: ProviderLookup;
+	/**
+	 * The parent session model (`provider/id`), i.e. what `model: "inherit"`
+	 * resolves to. Absent = a session with no model, which must refuse `inherit`.
+	 */
+	dispatchModel?: string;
 	/** Fake RPC supervisor knobs (a spawn-time `warning`, …). */
 	supervisor?: ConstructorParameters<typeof FakeSupervisor>[0];
 }): Promise<{ text: string; supervisor: FakeSupervisor }> {
@@ -514,7 +519,7 @@ async function runContinue(params: {
 			},
 			undefined,
 			undefined,
-			contextOf(harness, undefined, params.modelRegistry),
+			contextOf(harness, params.dispatchModel, params.modelRegistry),
 		));
 	} finally {
 		harness.cleanup();
@@ -557,6 +562,45 @@ test("D5a: `continue` with a per-call `model` relaunches on THAT model", async (
 		`the child must be relaunched through the tool:\n${result.text}`,
 	);
 	assert.equal(result.supervisor.spawns[0]?.input.model, "cb/call-time");
+});
+
+/**
+ * D-B8a.1 on the revive path: `inherit` is a launch instruction, not a model id.
+ *
+ * `planModelCandidates` drops the sentinel, so a revive that passed the literal
+ * down did not fail — it spawned a child with NO model at all: not the parent's
+ * (there is none), not the recorded one, and with the provider pin already
+ * dropped. That is a silent demotion of an explicit choice, so the only
+ * acceptable answer is the same loud refusal a launch gives.
+ */
+test("B8a.3: `continue` with `model: \"inherit\"` and no parent model is refused, never spawned", async () => {
+	const result = await runContinue({ childModel: "cb/recorded", model: "inherit" });
+	assert.equal(
+		result.supervisor.spawns.length,
+		0,
+		`nothing may start when the inherited model cannot be resolved:\n${result.text}`,
+	);
+	assert.match(result.text, /^✗ continue worker-0:/m, `the refusal is a refusal:\n${result.text}`);
+	assert.match(result.text, /no parent session model to inherit/);
+	assert.ok(
+		result.text.includes("Drop the `model` param to keep this child's recorded model (cb/recorded)."),
+		`the message must name the way out (keep the recorded model):\n${result.text}`,
+	);
+});
+
+/** The other half of the same rule: a parent model IS what `inherit` means. */
+test("B8a.3: `continue` with `model: \"inherit\"` relaunches on the parent session model", async () => {
+	const result = await runContinue({
+		childModel: "cb/recorded",
+		dispatchModel: "cb/parent",
+		model: "inherit",
+	});
+	assert.equal(result.supervisor.spawns.length, 1, `the child must be relaunched:\n${result.text}`);
+	assert.equal(
+		result.supervisor.spawns[0]?.input.model,
+		"cb/parent",
+		"`inherit` resolves to THIS session's model, not the recorded one",
+	);
 });
 
 test("D5b: `continue` without `model` keeps the model recorded at first launch", async () => {
@@ -723,6 +767,56 @@ test("R3: a fallback candidate does NOT persist the candidate-0 provider", async
 			Object.hasOwn(handle.child, "modelProvider"),
 			false,
 			"a fallback candidate must not inherit candidate 0's pin",
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+/**
+ * D-B8b.1 on the RETRY path: a fallback's own `:level` is not exempt.
+ *
+ * `step-model` strips the level of the model the run STARTS with (candidate 1)
+ * because a configured `thinking` replaces it. A fallback was left as written,
+ * so `applyThinkingSuffix` met its stale level first, kept it, and dropped the
+ * configured `thinking` — the retry silently ran with different reasoning than
+ * the primary attempt.
+ */
+test("B8b.1: a fallback model's own `:level` is stripped too, so `thinking` survives the retry", async () => {
+	const dir = mkdtempSync(path.join(tmpdir(), "rpc-thinking-fallback-"));
+	try {
+		const supervisor = new FakeSupervisor({
+			rejectSpawn: (input) =>
+				input.model === "cb/a"
+					? new SubagentError("model unavailable", ErrorCodes.START_FAILED)
+					: undefined,
+		});
+		const orchestrator = new Orchestrator({ supervisor, runDir: dir, cwd: "/tmp/project" });
+		await orchestrator.launch({
+			agent: testAgent({
+				model: "cb/a",
+				thinking: "max",
+				fallbackModels: ["cb/b:high"],
+			}),
+			task: "go",
+			worktree: false,
+		});
+		// `spawns` records what STARTED: the refused primary is in `calls` only.
+		assert.equal(
+			supervisor.calls.filter((call) => call.method === "spawnChild").length,
+			2,
+			"the primary is attempted, refused, and the fallback starts",
+		);
+		assert.equal(supervisor.spawns.length, 1);
+		const retry = supervisor.spawns[0]!;
+		assert.equal(
+			retry.input.model,
+			"cb/b",
+			"the fallback's stale level must be gone before the spawn",
+		);
+		assert.ok(
+			retry.args.includes("cb/b:max"),
+			`the configured level must be re-attached on the retry: ${retry.args.join(" ")}`,
 		);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

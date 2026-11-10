@@ -69,6 +69,31 @@ function explicitValue(value: string | undefined): string | undefined {
 }
 
 /**
+ * Is a `thinking` field actually CONFIGURED?
+ *
+ * `undefined` and a blank string are "not configured": `agentOverrides.<role>.
+ * thinking: ""` is not a choice, and `applyThinkingSuffix` treats it as nothing
+ * at all (it returns the model unchanged), so acting on it would strip a level
+ * and put no replacement behind it — silently deleting the operator's only
+ * thinking decision.
+ *
+ * `false` IS a configuration even though it has no level of its own: it means
+ * "reasoning off", which still has to replace a `:level` already in the model
+ * string, or the suffix switches reasoning back on.
+ *
+ * One predicate rather than two, because two layers act on the same judgement:
+ * `stripConfiguredThinkingLevel` below (the winning candidate) and
+ * `Orchestrator.planModelCandidates` (the fallback candidates). If they
+ * disagreed, a blank override would strip a fallback's level while leaving the
+ * primary's.
+ */
+export function isThinkingConfigured(
+	thinking: string | false | undefined,
+): thinking is string | false {
+	return thinking === false || (typeof thinking === "string" && thinking.trim() !== "");
+}
+
+/**
  * Drop a `:level` that a configured `thinking` is about to replace (D-B8b.1).
  *
  * `applyThinkingSuffix` — the builder of both the rpc argv's `--model` and the
@@ -98,7 +123,7 @@ function stripConfiguredThinkingLevel(
 	override: string | undefined,
 	thinking: string | false | undefined,
 ): ResolvedModel {
-	if (!resolved.model || thinking === undefined) return resolved;
+	if (!resolved.model || !isThinkingConfigured(thinking)) return resolved;
 	// The same judgement `classifyModelOrigin` uses to recognise the per-run
 	// winner: the override is candidate 1, so a winner that IS the override came
 	// from this call.

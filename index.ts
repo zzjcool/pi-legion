@@ -41,7 +41,7 @@ import {
 	TEAM_ENV,
 	type ActiveTeam,
 } from "./src/agents/teams.ts";
-import { resolveModel } from "./src/agents/model-resolution.ts";
+import { INHERIT_MODEL_SENTINEL, resolveModel } from "./src/agents/model-resolution.ts";
 import { providerForModel, type ProviderLookup } from "./src/runs/provider-pin.ts";
 import { resolveStepModel } from "./src/agents/step-model.ts";
 import { checkModelScope } from "./src/agents/model-scope.ts";
@@ -2396,6 +2396,10 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					// #123 residual: a revive that runs on a model chosen by THIS call must
 					// compute its provider pin from the same registry the launch path uses.
 					modelRegistry: ctx.modelRegistry,
+					// D-B8a.1: `continue`/`resume` may pass the `inherit` sentinel, which can
+					// only be resolved against THIS session's model. Same channel as the
+					// registry above — the control path has no other view of the session.
+					...(ctx.model ? { parentModel: `${ctx.model.provider}/${ctx.model.id}` } : {}),
 					legion: activeLegion,
 					...(activeLegion ? { postman: activeLegion.postman } : {}),
 				});
@@ -2706,6 +2710,14 @@ async function controlAction(input: {
 	 * pipeline.
 	 */
 	modelRegistry?: ProviderLookup;
+	/**
+	 * The parent session's model as `provider/id` (`ExtensionContext.model`),
+	 * forwarded for the same reason and through the same channel as
+	 * `modelRegistry`: a revive that asks for `model: "inherit"` (D-B8a.1) has no
+	 * other view of what it is supposed to inherit. Absent = this session has no
+	 * model, and `inherit` is refused exactly like it is at launch.
+	 */
+	parentModel?: string;
 }): Promise<AgentToolResult<unknown>> {
 	const { action, params, store, cwd } = input;
 
@@ -3023,6 +3035,12 @@ interface ChildContext {
 	 * no new pin — it never guesses one.
 	 */
 	modelRegistry?: ProviderLookup;
+	/**
+	 * The parent session's model as `provider/id`, when this call runs inside a
+	 * session that has one. Only `reviveChild` reads it: `model: "inherit"` means
+	 * "THIS session's model", and the control path has no other view of it.
+	 */
+	parentModel?: string;
 }
 
 /**
@@ -3730,7 +3748,27 @@ async function reviveChild(
 		// so a resume cannot silently move a child to whatever the settings say now.
 		const explicitModel = params.model?.trim();
 		const recordedModel = found.child.model;
-		const revivedModel = explicitModel || recordedModel;
+		let revivedModel = explicitModel || recordedModel;
+		// D-B8a.1 / D-B8a.3: `inherit` is a launch INSTRUCTION ("this session's
+		// model"), not a model id. Handing the literal down would be a silent
+		// demotion: `modelCandidates` drops the sentinel, so the child would start
+		// with NO model at all — not the parent's, not the recorded one, and with the
+		// provider pin gone. Resolved here, where the parent session's model is
+		// visible; with nothing to inherit it is refused in the same shape a launch
+		// refuses it, and the way to keep the child's own model is named.
+		if (explicitModel === INHERIT_MODEL_SENTINEL) {
+			if (!ctx.parentModel) {
+				return fail(
+					`✗ ${action} ${name}: model 'inherit' has no parent session model to inherit. ` +
+						"Drop the `model` param to keep " +
+						(recordedModel
+							? `this child's recorded model (${recordedModel}).`
+							: "this child's recorded model."),
+					ErrorCodes.INVALID_PARAMS,
+				);
+			}
+			revivedModel = ctx.parentModel;
+		}
 		// #123 residual: `--provider` has to be replayed TOGETHER with the model it
 		// was computed for, or a bare id can resolve into a colliding static
 		// provider with no auth — the failure the first launch already pins against.
