@@ -23,6 +23,9 @@ const criteria = [
 	},
 ];
 
+/** Same required criterion, but carrying the explicit command (#393). */
+const runnableCriteria = [{ ...criteria[0]!, command: "npm test" }];
+
 test("needsVerification is true only for required verification-output criteria", () => {
 	assert.equal(needsVerification(undefined), false);
 	assert.equal(needsVerification([]), false);
@@ -89,21 +92,62 @@ test("applyVerification rejects when the command fails", async () => {
 	assert.match(out.reason ?? "", /boom|fail/);
 });
 
-test("applyVerification does not run on an already-rejected turn", async () => {
+test("applyVerification runs a command-bearing criterion even when the child said rejected (#393)", async () => {
 	const runs: string[] = [];
 	const out = await applyVerification(
-		{ status: "rejected", level: "none", reason: "aborted" },
+		{ status: "rejected", level: "attested", reason: "child says no" },
 		{
 			cwd: "/work",
-			criteria,
+			criteria: runnableCriteria,
 			run: async (command) => {
 				runs.push(command);
-				return { code: 0, stdout: "", stderr: "" };
+				return { code: 0, stdout: "ok\n", stderr: "" };
 			},
 		},
 	);
-	assert.equal(runs.length, 0);
+	// The command must actually run: a child's own `ok: false` is not a licence
+	// to skip verification (docs/design.md §10.3 — the precondition is the
+	// explicit `command`, not the child's self-report).
+	assert.deepEqual(runs, ["npm test"], "the verify command must run");
+	// …and it must not silently overturn the child's verdict either.
+	assert.equal(out.status, "rejected", "the child's own verdict still stands");
+	assert.equal(out.level, "verified", "the commands did pass, so the level is verified");
+	assert.match(out.reason ?? "", /verified by `npm test`/);
+	assert.match(out.reason ?? "", /child says no/);
+});
+
+test("applyVerification keeps an unknown verdict when the commands pass (#393)", async () => {
+	const out = await applyVerification(
+		{ status: "unknown", level: "none", reason: "no verdict parsed" },
+		{
+			cwd: "/work",
+			criteria: runnableCriteria,
+			run: async () => ({ code: 0, stdout: "ok\n", stderr: "" }),
+		},
+	);
+	assert.equal(out.status, "unknown");
+	assert.equal(out.level, "verified");
+	assert.match(out.reason ?? "", /verified by `npm test`/);
+	assert.match(out.reason ?? "", /no verdict parsed/);
+});
+
+test("applyVerification rejects on a red command even when the child said rejected (#393)", async () => {
+	const out = await applyVerification(
+		{ status: "rejected", level: "attested", reason: "child says no" },
+		{
+			cwd: "/work",
+			criteria: runnableCriteria,
+			run: async () => ({ code: 1, stdout: "", stderr: "1 failing" }),
+		},
+	);
 	assert.equal(out.status, "rejected");
+	assert.equal(out.level, "attested");
+	// The `verification failed (` prefix is what index.ts inlines on — keep it.
+	assert.ok(
+		(out.reason ?? "").startsWith("verification failed (`npm test`)"),
+		`unexpected reason: ${out.reason}`,
+	);
+	assert.match(out.reason ?? "", /1 failing/);
 });
 
 test("verifyCommandOf returns the criterion command, else undefined", () => {
