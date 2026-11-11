@@ -61,6 +61,7 @@ import {
 	type LegionEventBus,
 	LEGION_EVENT_TYPES,
 	LEGION_PROCESS_EVENT_TYPES,
+	isDetailDeltaEvent,
 } from "./event-bus.ts";
 import type {
 	EventSubscriptionOptions,
@@ -120,28 +121,82 @@ function stringField(value: unknown, key: string): string | undefined {
 /**
  * Forward coarse supervisor facts onto the shared bus. Text is omitted unless a
  * caller explicitly opened a live overlay; even then it is display-only.
+ *
+ * Contract `viewer-transcript-parity-v1`:
+ * - D7: the opt-in now opens the WHOLE detail stream (`includeTextDelta`, or its
+ *   alias `includeDetail`) — interim text, interim reasoning and tool arguments.
+ *   `textDeltaOnly` still keeps coarse facts out of a display-only subscription.
+ * - D6: `toolcall_start/delta/end` become `tool_delta` (needs a `toolCallId` to
+ *   name the tool block the arguments belong to).
+ * - D8: every `tool_call` fact carries `toolCallId` when the host supplied one.
  */
 export function publishSupervisorEvent(
 	bus: LegionEventBus,
 	nodeId: string,
 	event: SupervisorEvent,
-	options: { includeTextDelta?: boolean; textDeltaOnly?: boolean } = {},
+	options: {
+		includeTextDelta?: boolean;
+		/** Alias of `includeTextDelta` (D7): either one opens the detail stream. */
+		includeDetail?: boolean;
+		textDeltaOnly?: boolean;
+	} = {},
 ): void {
 	const timestamp = Date.now();
+	const detailOptIn =
+		options.includeTextDelta === true || options.includeDetail === true;
 	const rawType = event.type;
 	const updateType = stringField(event, "updateType");
 	if (rawType === "message_update") {
 		if (updateType === "text_delta") {
-			if (!options.includeTextDelta) return;
+			if (!detailOptIn) return;
 			const delta = stringField(event, "delta");
 			if (delta === undefined) return;
 			bus.emit({ nodeId, type: "text_delta", data: { delta }, ts: timestamp });
 			return;
 		}
+		if (updateType === "thinking_delta") {
+			// D4: reasoning streams under the same opt-in as text, never by default.
+			if (!detailOptIn) return;
+			const delta = stringField(event, "delta");
+			if (delta === undefined) return;
+			bus.emit({ nodeId, type: "thinking_delta", data: { delta }, ts: timestamp });
+			return;
+		}
+		const toolCallId = stringField(event, "toolCallId");
+		const isToolCallUpdate =
+			updateType === "toolcall_start" ||
+			updateType === "toolcall_delta" ||
+			updateType === "toolcall_end";
+		// D6: arguments are detail-only, and useless to a renderer without the id that
+		// names the tool block they belong to.
+		if (isToolCallUpdate && detailOptIn && toolCallId !== undefined) {
+			const toolName = stringField(event, "toolName");
+			const args = event.args;
+			bus.emit({
+				nodeId,
+				type: "tool_delta",
+				data: {
+					toolCallId,
+					...(toolName ? { toolName } : {}),
+					...(args === undefined ? {} : { args }),
+				},
+				ts: timestamp,
+			});
+			return;
+		}
+		// D19: an update that cannot name its tool block (legacy dialect, no
+		// `toolCallId`) FALLS THROUGH to the flat `tool_call` emission below instead of
+		// being dropped — narrowing an exported function's semantics must not swallow a
+		// fact it published before the detail stream existed.
 		if (options.textDeltaOnly) return;
 		const toolName = stringField(event, "toolName");
 		if (toolName) {
-			bus.emit({ nodeId, type: "tool_call", data: { toolName }, ts: timestamp });
+			bus.emit({
+				nodeId,
+				type: "tool_call",
+				data: { toolName, ...(toolCallId ? { toolCallId } : {}) },
+				ts: timestamp,
+			});
 		}
 		return;
 	}
@@ -156,11 +211,15 @@ export function publishSupervisorEvent(
 	}
 	if (rawType === "tool_call" || rawType === "tool_execution_start" || rawType === "tool_execution_end") {
 		const toolName = stringField(event, "toolName");
+		// D8: the in-flight tool's identity, so the overlay can open the tool block it
+		// belongs to instead of guessing by name.
+		const toolCallId = stringField(event, "toolCallId");
 		bus.emit({
 			nodeId,
 			type: "tool_call",
 			data: {
 				...(toolName ? { toolName } : {}),
+				...(toolCallId ? { toolCallId } : {}),
 				...(rawType === "tool_call" ? {} : { phase: rawType }),
 			},
 			ts: timestamp,
@@ -359,18 +418,19 @@ function treeForLiveSource(
 				deps.bus.on(type, (event) => {
 					if (event.nodeId !== nodeId) return;
 					if (event.id === undefined && !processEventTypes.has(event.type)) return;
-					// #261: `text_delta` is one streamed token. The token carries no tree state, so
-					// the snapshot below would only re-read what it already has — and
+					// #261 + D18 (`viewer-transcript-parity-v1` §9): a detail-delta event is ONE
+					// streamed chunk (`text_delta` / `thinking_delta` / `tool_delta`). A chunk carries no
+					// tree state, so the snapshot below would only re-read what it already has — and
 					// `deps.runtime.treeNodes()` is a synchronous SQLite subtree scan (~0.95–1.09 ms
-					// p50 at 120 nodes), once per token for the whole life of the modal. Usage rows
+					// p50 at 120 nodes), once per chunk for the whole life of the modal. Usage rows
 					// land via other paths, so a skipped snapshot defers their pickup to the next
-					// non-delta event (the backfill poll keeps the transcript current). Same
-					// exclusion the /legion tree view's subscription in this file and the status
-					// board in runtime.ts already apply.
+					// non-delta event (the backfill poll keeps the transcript current). The test is
+					// `isDetailDeltaEvent`, the ONE predicate the `/legion` tree subscription below and
+					// the status board in runtime.ts also call: three subscriptions, one decision.
 					//
-					// The listener below still fires: this event's only job here is the transcript,
-					// so do not re-add a refresh on the `text_delta` branch.
-					if (event.type !== "text_delta") refresh();
+					// The listener below still fires: these events' only job here is the transcript,
+					// so do not re-add a refresh on any detail-delta branch.
+					if (!isDetailDeltaEvent(event.type)) refresh();
 					listener({
 						...(event.id === undefined ? {} : { id: event.id }),
 						domain: event.id === undefined ? "process" : "stored",
@@ -773,7 +833,8 @@ export function registerLegionCommand(
 
 			let component: TreeViewComponent | undefined;
 			const unsubscribe = LEGION_EVENT_TYPES
-				.filter((type) => type !== "text_delta")
+				// D18: detail deltas are streamed chunks, not tree facts — see `isDetailDeltaEvent`.
+				.filter((type) => !isDetailDeltaEvent(type))
 				.map((type) => deps.bus.on(type, (event: LegionEvent) => {
 					if (!component) return;
 					const nextNodes = deps.runtime.treeNodes();

@@ -28,6 +28,12 @@ export const LEGION_PROCESS_EVENT_TYPES = [
 	"turn_start",
 	"launch_queued",
 	"launch_admitted",
+	// Contract `viewer-transcript-parity-v1` §3 (D4/D6): the streamed detail the
+	// live overlay receives from an opted-in supervisor subscription. Detail-only:
+	// `thinking_delta` carries `{ delta }`, `tool_delta` carries
+	// `{ toolCallId, toolName?, args }`.
+	"thinking_delta",
+	"tool_delta",
 ] as const;
 export type LegionProcessEventType = (typeof LEGION_PROCESS_EVENT_TYPES)[number];
 
@@ -39,6 +45,30 @@ export const LEGION_EVENT_TYPES: readonly LegionEventType[] = [
 		...LEGION_PROCESS_EVENT_TYPES,
 	]),
 ];
+
+/**
+ * The streamed-detail events (D18, `viewer-transcript-parity-v1` §9): one arrives
+ * per token, per reasoning chunk and per tool-argument chunk, and NONE of them
+ * carries tree state.
+ *
+ * Every subscriber that would re-read the tree or repaint a widget per event MUST
+ * skip them — that is #261: a synchronous SQLite subtree scan plus a widget repaint
+ * once per token for the whole life of a view. The live overlay, the classic tree
+ * view and the session runtime's status board are three separate subscriptions, so
+ * the decision lives here once (`isDetailDeltaEvent`) instead of three copies of
+ * `type !== "text_delta"` that silently disagree after the next detail type lands.
+ */
+export const DETAIL_DELTA_EVENT_TYPES: readonly LegionEventType[] = [
+	"text_delta",
+	"thinking_delta",
+	"tool_delta",
+];
+const DETAIL_DELTA_EVENT_TYPE_SET = new Set<string>(DETAIL_DELTA_EVENT_TYPES);
+
+/** Is this bus event one streamed-detail chunk (see `DETAIL_DELTA_EVENT_TYPES`)? */
+export function isDetailDeltaEvent(type: string): boolean {
+	return DETAIL_DELTA_EVENT_TYPE_SET.has(type);
+}
 
 /**
  * A normalized event-bus event. Persisted events retain the DB row id; process-only

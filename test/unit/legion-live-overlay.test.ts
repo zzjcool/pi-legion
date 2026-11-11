@@ -115,16 +115,23 @@ function userMessage(text: string): AgentMessage {
 
 function assistantMessage(
 	text: string,
-	options: { stopReason?: AssistantMessage["stopReason"]; toolCallId?: string; toolName?: string } = {},
+	options: {
+		stopReason?: AssistantMessage["stopReason"];
+		toolCallId?: string;
+		toolName?: string;
+		thinking?: string;
+		args?: Record<string, string>;
+	} = {},
 ): AgentMessage {
 	const content: AssistantMessage["content"] = [];
+	if (options.thinking) content.push({ type: "thinking", thinking: options.thinking });
 	if (text) content.push({ type: "text", text });
 	if (options.toolCallId) {
 		content.push({
 			type: "toolCall",
 			id: options.toolCallId,
 			name: options.toolName ?? "read",
-			arguments: { path: "file.ts" },
+			arguments: options.args ?? { path: "file.ts" },
 		});
 	}
 	return {
@@ -146,13 +153,19 @@ function assistantMessage(
 	} satisfies AssistantMessage;
 }
 
-function mouseEvent(y: number, type: TuiMouseEvent["type"] = "click"): TuiMouseEvent {
+/**
+ * A frame-relative click. `x` defaults to 2, not 1: the modal spends column 0 on its
+ * `┃` border and a tool block spends column 1 on its `Box` padding, and `Box.handleMouse`
+ * rejects a hit on its padding column. Column 2 is the first cell that belongs to the
+ * tool row itself — the same geometry the main TUI dispatches.
+ */
+function mouseEvent(y: number, type: TuiMouseEvent["type"] = "click", x = 2): TuiMouseEvent {
 	return {
 		type,
 		button: "left",
-		x: 1,
+		x,
 		y,
-		screenX: 1,
+		screenX: x,
 		screenY: y,
 		width: 80,
 		height: 40,
@@ -162,13 +175,18 @@ function mouseEvent(y: number, type: TuiMouseEvent["type"] = "click"): TuiMouseE
 	};
 }
 
-function toolResult(toolCallId: string, text: string): AgentMessage {
+function toolResult(
+	toolCallId: string,
+	text: string,
+	options: { toolName?: string; durationMs?: number } = {},
+): AgentMessage {
 	return {
 		role: "toolResult",
 		toolCallId,
-		toolName: "read",
+		toolName: options.toolName ?? "read",
 		content: [{ type: "text", text }],
 		isError: false,
+		...(options.durationMs === undefined ? {} : { durationMs: options.durationMs }),
 		timestamp: 3,
 	} satisfies ToolResultMessage;
 }
@@ -501,12 +519,21 @@ test("malformed null content parts in user, assistant, and tool results do not c
 		const messages = parseSessionMessages(sessionText);
 		return { messages, cursor: cursor(1, 1, messages.length, 512) };
 	};
-	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	const component = createLiveOverlay(source).open("root.worker", {
+		terminalRows: 40,
+		keybindings: keybindings as never,
+	});
 	try {
-		const rendered = component.render(100).join("\n");
-		assert.match(stripTerminalSequences(rendered), /Safe user text/);
-		assert.match(stripTerminalSequences(rendered), /Safe assistant text/);
-		assert.match(stripTerminalSequences(rendered), /Safe tool result/);
+		const collapsed = stripTerminalSequences(component.render(100).join("\n"));
+		assert.match(collapsed, /Safe user text/);
+		assert.match(collapsed, /Safe assistant text/);
+		// D1/parity: the host `read` renderer returns "" from `renderResult` while
+		// collapsed (`!expanded && !isError`), so a collapsed block is its call line —
+		// exactly what the main TUI draws. The result is revealed by ctrl+o below.
+		assert.match(collapsed, /read/);
+		assert.doesNotMatch(collapsed, /Safe tool result/);
+		component.handleInput?.("\u000f");
+		assert.match(stripTerminalSequences(component.getState().text), /Safe tool result/);
 		assert.equal(component.getState().itemCount, 3);
 	} finally {
 		component.close();
@@ -523,10 +550,20 @@ test("orphan tool results are held pending and backfilled into their later tool 
 		];
 		return { messages, cursor: cursor(1, 1, messages.length, 512) };
 	};
-	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	const component = createLiveOverlay(source).open("root.worker", {
+		terminalRows: 40,
+		keybindings: keybindings as never,
+	});
 	try {
-		const rendered = stripTerminalSequences(component.render(100).join("\n"));
-		assert.match(rendered, /orphan output arrives first/);
+		const collapsed = stripTerminalSequences(component.render(100).join("\n"));
+		assert.match(collapsed, /read file\.ts/);
+		assert.doesNotMatch(collapsed, /orphan output arrives first/, "collapsed: the call line only");
+		component.handleInput?.("\u000f");
+		assert.match(
+			stripTerminalSequences(component.getState().text),
+			/orphan output arrives first/,
+			"the pending result was backfilled into the later tool call",
+		);
 		assert.equal(component.getState().itemCount, 3, "tool result does not add a standalone component");
 		assert.equal(component.getState().items.filter((item) => item.kind === "tool").length, 1);
 	} finally {
@@ -618,6 +655,8 @@ test("tool mouse events are mapped through the viewer header and scroll offset i
 	try {
 		const before = component.render(80);
 		const layout = resolveModalLayout(40, 80);
+		// The hit test runs against the tool row itself, not the modal's `┃` border column
+		// (x=0) nor the block's `Box` padding column (x=1) — `Box.handleMouse` rejects both.
 		const visibleToolLine = before.findIndex((line) => stripTerminalSequences(line).includes("read"));
 		assert.ok(visibleToolLine >= layout.bodyStartRow, "tool component appears in the modal body");
 		const result = component.handleMouse?.(mouseEvent(visibleToolLine));
@@ -636,14 +675,23 @@ test("session messages render with Pi user background, markdown highlighting, an
 	const component = createLiveOverlay(source).open("root.worker", {
 		terminalRows: 40,
 		settings: { hideThinkingBlock: true },
+		keybindings: keybindings as never,
 	});
 	try {
 		const rendered = component.render(100).join("\n");
 		assert.match(stripTerminalSequences(rendered), /Review the implementation/);
-		assert.match(stripTerminalSequences(rendered), /read/);
+		assert.match(stripTerminalSequences(rendered), /read src\/example\.ts/);
 		assert.match(stripTerminalSequences(rendered), /Thinking\.\.\./);
 		assert.doesNotMatch(stripTerminalSequences(rendered), /private reasoning/);
-		assert.match(stripTerminalSequences(rendered), /result line 1/);
+		// D1/parity: collapsed shows the call line only (host `read` renderResult returns ""
+		// unless expanded or an error), so the result text appears after ctrl+o.
+		assert.doesNotMatch(stripTerminalSequences(rendered), /result line 1/);
+		component.handleInput?.("\u000f");
+		assert.match(
+			stripTerminalSequences(component.getState().text),
+			/result line 1/,
+			"ctrl+o reveals the tool result under the host renderer",
+		);
 		const userLineIndex = stripTerminalSequences(rendered).split("\n").findIndex((line) => line.includes("Review the implementation"));
 		assert.ok(userLineIndex >= 0, "user message line is present");
 		assert.match(rendered.split("\n")[userLineIndex] ?? "", /\u001b\[[0-9;]*48;/, "user message line carries the Pi user-block background ANSI");
@@ -667,11 +715,16 @@ test("ctrl+o expands tools, pgdn scrolls, and Esc closes the viewer", () => {
 	});
 	try {
 		const collapsed = component.getState().text;
-		assert.match(collapsed, /more lines/);
+		// R4 + host parity: a collapsed read block is its call line only, so the 10-line
+		// truncation notice no longer fires for it (the old undefined-toolDefinition
+		// fallback dumped the whole output, which is what this assertion used to see).
+		assert.match(collapsed, /read src\/example\.ts/);
+		assert.doesNotMatch(collapsed, /more lines/);
 		assert.doesNotMatch(collapsed, /result line 12/);
 		component.handleInput?.("\u000f");
 		const expanded = component.getState().text;
 		assert.notEqual(expanded, collapsed);
+		assert.match(expanded, /result line 1/);
 		assert.match(expanded, /result line 12/);
 
 		component.handleInput?.("g");
@@ -695,6 +748,51 @@ test("ctrl+o expands tools, pgdn scrolls, and Esc closes the viewer", () => {
 		component.handleInput?.("\u001b");
 		assert.equal(component.getState().open, false);
 		assert.equal(source.unsubscribeCount, 1);
+	} finally {
+		component.close();
+	}
+});
+
+/**
+ * R4/D20: the 10-line collapsed cap needs a POSITIVE assertion. The `read` fixtures can no longer
+ * reach it — the host renderer's collapsed `renderResult` is empty, so such a block is one call
+ * row — which is why deleting `TOOL_COLLAPSED_PREVIEW_LINES` used to keep every overlay test green.
+ * An unknown tool name (`legion_output`) keeps the host's generic block, whose text is long enough
+ * to be capped here, so this test goes red the moment the cap is dropped.
+ */
+test("a collapsed generic tool block is capped at 10 lines until ctrl+o expands it", () => {
+	const source = new FakeOverlaySource();
+	const output = Array.from({ length: 12 }, (_, index) => `legacy output ${index + 1}`);
+	source.backfill = () => {
+		const messages: AgentMessage[] = [
+			userMessage("read the artifact"),
+			assistantMessage("", {
+				toolCallId: "legion-output-1",
+				toolName: "legion_output",
+				args: { id: "artifact-1" },
+			}),
+			toolResult("legion-output-1", output.join("\n"), { toolName: "legion_output" }),
+		];
+		return { messages, cursor: cursor(1, 1, messages.length, 512) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", {
+		terminalRows: 40,
+		keybindings: keybindings as never,
+	});
+	try {
+		const collapsed = component.getState().text;
+		assert.match(collapsed, /legacy output 1\b/, "the head of the output is visible while collapsed");
+		assert.match(collapsed, /\d+ more lines/, "R4: the capped block says how much is hidden");
+		assert.doesNotMatch(collapsed, /legacy output 12/, "the tail is behind the cap");
+
+		component.handleInput?.("\u000f");
+		const expanded = component.getState().text;
+		assert.match(expanded, /legacy output 12/, "ctrl+o reveals the whole output");
+		assert.equal(
+			expanded.split("legacy output").length - 1,
+			output.length,
+			"every line of the 12-line output is rendered once expanded",
+		);
 	} finally {
 		component.close();
 	}
@@ -975,6 +1073,307 @@ test("disk backfill containing clamped streaming text does not repeat its last l
 		const rendered = stripTerminalSequences(state.text);
 		assert.equal(rendered.split("Fifth line").length - 1, 1);
 		assert.equal(state.streamingText, "");
+	} finally {
+		component.close();
+	}
+});
+
+/**
+ * D4/R1: reasoning streams into the SAME assistant item as text, and the settled message that lands
+ * afterwards must not paint the same reasoning a second time. The settled copy arrives AFTER
+ * `agent_settled` here on purpose: that is the REV-4 shape, where the streaming item was already
+ * finalized (and stays mounted) and only the disk copy can still be deduped.
+ */
+test("streamed thinking is not painted twice once the settled message lands", async () => {
+	const source = new FakeOverlaySource();
+	const diskMessages = [assistantMessage("final answer", { thinking: "weigh options" })];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		source.emit("root.worker", { type: "thinking_delta", data: { delta: "weigh " } });
+		source.emit("root.worker", { type: "thinking_delta", data: { delta: "options" } });
+		assert.match(
+			stripTerminalSequences(component.getState().text),
+			/weigh options/,
+			"D4: reasoning renders while it streams, not only at message_end",
+		);
+		assert.deepEqual(
+			component.getState().activity,
+			[],
+			"a thinking delta is a detail, not a `· thinking_delta` activity row",
+		);
+
+		source.emit("root.worker", { type: "text_delta", delta: "final answer" });
+		source.emit("root.worker", { type: "agent_settled" });
+
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		const rendered = stripTerminalSequences(state.text);
+		assert.equal(rendered.split("weigh options").length - 1, 1, "the same reasoning must not be painted twice");
+		assert.equal(rendered.split("final answer").length - 1, 1, "the text half is deduped as before");
+		assert.equal(state.items.filter((item) => item.kind === "assistant").length, 1);
+	} finally {
+		component.close();
+	}
+});
+
+/**
+ * D5 under the display clamp (review finding 6): `finishStreaming()` has to publish the
+ * UNCLAMPED reasoning as the committed record. Reading the clamped `streamingThinking` mirror
+ * first reduces `finalizedAssistantThinking` to a suffix of the disk copy, so
+ * `finalizedThinking.includes(diskThinking)` can never match, the landed message is not stripped
+ * and the whole settled run is painted a second time. 130 lines is one line past the 120-line
+ * default window, which is exactly where the mirror starts losing its head.
+ */
+test("settled thinking longer than the display clamp is not painted twice", async () => {
+	const source = new FakeOverlaySource();
+	const lines = Array.from({ length: 130 }, (_, index) => `thought line ${index + 1}`);
+	// Blank-line-separated paragraphs: each line then renders on its own row, so the sentinel can
+	// never be split by markdown wrapping and its occurrence count is meaningful.
+	const diskMessages = [assistantMessage("long answer", { thinking: lines.join("\n\n") })];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		for (const line of lines) {
+			source.emit("root.worker", { type: "thinking_delta", data: { delta: `${line}\n\n` } });
+		}
+		source.emit("root.worker", { type: "text_delta", delta: "long answer" });
+		source.emit("root.worker", { type: "agent_settled" });
+
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		const rendered = stripTerminalSequences(state.text);
+		assert.equal(
+			rendered.split("thought line 130").length - 1,
+			1,
+			"reasoning past the clamp window must not survive in the landed message as a second copy",
+		);
+		assert.equal(rendered.split("long answer").length - 1, 1, "the text half is deduped as before");
+		assert.equal(state.items.filter((item) => item.kind === "assistant").length, 1);
+	} finally {
+		component.close();
+	}
+});
+
+/**
+ * D5 follow-up (same defect class as the thinking half): the committed text must be the UNCLAMPED
+ * accumulation. With the clamped mirror as the dedup key, a settled answer longer than the viewer
+ * window never matched by containment and the landed message painted the last lines a second time.
+ */
+test("settled text longer than the display clamp is not painted twice", async () => {
+	const source = new FakeOverlaySource();
+	const lines = Array.from({ length: 130 }, (_, index) => `answer line ${index + 1}`);
+	const diskMessages = [assistantMessage(lines.join("\n\n"))];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		for (const line of lines) {
+			source.emit("root.worker", { type: "text_delta", delta: `${line}\n\n` });
+		}
+		source.emit("root.worker", { type: "agent_settled" });
+
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		const rendered = stripTerminalSequences(state.text);
+		assert.equal(
+			rendered.split("answer line 130").length - 1,
+			1,
+			"text past the clamp window must not survive in the landed message as a second copy",
+		);
+		assert.equal(state.items.filter((item) => item.kind === "assistant").length, 1);
+	} finally {
+		component.close();
+	}
+});
+
+/**
+ * D5, other half: thinking and text are judged separately. Reasoning that ran ahead of the disk
+ * snapshot keeps its uncovered tail in the streaming item instead of being thrown away with the
+ * retract, and the covered part is still painted once (by the landed message).
+ */
+test("streaming reasoning ahead of the disk snapshot keeps its uncovered tail", async () => {
+	const source = new FakeOverlaySource();
+	const diskMessages = [assistantMessage("answer", { thinking: "the first thought" })];
+	let polls = 0;
+	source.backfill = () => ({ messages: [], cursor: cursor(0, 0, 0, 128) });
+	const originalSubscribe = source.subscribe.bind(source);
+	source.subscribe = (nodeId, listener) => {
+		const subscription = originalSubscribe(nodeId, listener);
+		subscription.pollBackfill = () => {
+			polls++;
+			return polls === 1
+				? { messages: diskMessages, cursor: cursor(1, 1, 1, 192) }
+				: undefined;
+		};
+		return subscription;
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		source.emit("root.worker", { type: "thinking_delta", data: { delta: "the first thought" } });
+		source.emit("root.worker", { type: "thinking_delta", data: { delta: " and the second" } });
+
+		const pollDeadline = Date.now() + 1_500;
+		while (polls === 0 && Date.now() < pollDeadline) await new Promise((resolve) => setTimeout(resolve, 25));
+		assert.equal(polls, 1, "the incremental session-file batch is polled");
+
+		const state = component.getState();
+		const rendered = stripTerminalSequences(state.text);
+		assert.equal(rendered.split("the first thought").length - 1, 1, "the covered prefix is painted once");
+		assert.equal(
+			rendered.split("and the second").length - 1,
+			1,
+			"the reasoning the snapshot did not cover survives in the streaming item",
+		);
+		assert.equal(state.items.filter((item) => item.kind === "assistant").length, 2);
+	} finally {
+		component.close();
+	}
+});
+
+/**
+ * D2: once a tool block has its recorded `durationMs`, the host renderer prints its timing line —
+ * the whole point of handing `ToolExecutionComponent` the real tool definition (D1). R2: the wording
+ * belongs to the host, so the assertion only pins `Took` + a number.
+ */
+test("a finished tool block renders its recorded duration under the host renderer", () => {
+	const source = new FakeOverlaySource();
+	source.backfill = () => {
+		const messages: AgentMessage[] = [
+			userMessage("run the check"),
+			assistantMessage("running the check", {
+				toolCallId: "bash-call-1",
+				toolName: "bash",
+				args: { command: "echo hi" },
+			}),
+			toolResult("bash-call-1", "hi", { toolName: "bash", durationMs: 27_000 }),
+		];
+		return { messages, cursor: cursor(1, 1, messages.length, 512) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		const text = stripTerminalSequences(component.getState().text);
+		assert.match(text, /\$ echo hi/, "the shell renderer drew the call row");
+		assert.match(text, /Took[^\n]*\d/, "the final result row shows its recorded duration, like the main TUI");
+	} finally {
+		component.close();
+	}
+});
+
+/**
+ * D6: `tool_delta` carries the in-flight arguments for the block named by `toolCallId`. The
+ * explicit branch must (a) repaint the block, and (b) not fall through to the `· <eventType>`
+ * activity fallback — one argument delta per token would spam that log.
+ */
+test("tool_delta repaints a live tool block without adding an activity row", () => {
+	const source = new FakeOverlaySource();
+	source.backfill = () => ({
+		messages: [
+			userMessage("run it"),
+			assistantMessage("", {
+				toolCallId: "live-call",
+				toolName: "bash",
+				args: { command: "sleep 1" },
+			}),
+		],
+		cursor: cursor(1, 1, 2, 256),
+	});
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		assert.match(stripTerminalSequences(component.getState().text), /\$ sleep 1/);
+		const activityBefore = component.getState().activity;
+
+		source.emit("root.worker", {
+			type: "tool_delta",
+			data: { toolCallId: "live-call", toolName: "bash", args: { command: "sleep 2" } },
+		});
+		assert.match(
+			stripTerminalSequences(component.getState().text),
+			/\$ sleep 2/,
+			"the tool block re-rendered with the streamed arguments",
+		);
+		assert.deepEqual(component.getState().activity, activityBefore, "an argument delta is not an activity row");
+	} finally {
+		component.close();
+	}
+});
+
+/**
+ * D8/parity: a tool row must still toggle open on click. Under the real host renderers the hit
+ * travels modal frame → transcript → our collapsed-line wrapper → `ToolExecutionComponent` → `Box`
+ * → the `MouseRegion` the renderer wrapped its call row in, so it also proves the wrapper forwards
+ * the event (a wrapper that swallowed `handleMouse` would leave the row dead).
+ */
+test("clicking a tool row expands and collapses it through the host mouse region", () => {
+	const source = new FakeOverlaySource();
+	source.backfill = () => {
+		const messages = parseSessionMessages(sessionWithToolResult());
+		return { messages, cursor: cursor(1, 2, messages.length, 1_024) };
+	};
+	const component = createLiveOverlay(source).open("root.worker", { terminalRows: 40 });
+	try {
+		const toolRow = (): number =>
+			component.render(80).findIndex((line) => stripTerminalSequences(line).includes("read src/example.ts"));
+		assert.ok(toolRow() >= 0, "the read call row is on screen");
+		assert.doesNotMatch(stripTerminalSequences(component.getState().text), /result line 1/);
+
+		assert.equal(component.handleMouse?.(mouseEvent(toolRow()))?.handled, true, "the click lands on the tool row");
+		assert.match(
+			stripTerminalSequences(component.getState().text),
+			/result line 1/,
+			"a click on the row expands the block, exactly like the main TUI",
+		);
+
+		assert.equal(component.handleMouse?.(mouseEvent(toolRow()))?.handled, true);
+		assert.doesNotMatch(
+			stripTerminalSequences(component.getState().text),
+			/result line 1/,
+			"a second click collapses it again (the same MouseRegion toggles)",
+		);
 	} finally {
 		component.close();
 	}

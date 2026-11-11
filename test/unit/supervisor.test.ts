@@ -43,6 +43,15 @@ import {
 	discoveredHostExtensions,
 	resetExtensionDiscoveryCache,
 } from "../../src/runs/extension-inheritance.ts";
+import {
+	DETAIL_DELTA_EVENT_TYPES,
+	LEGION_EVENT_TYPES,
+	createLegionEventBus,
+	isDetailDeltaEvent,
+	type LegionEvent,
+} from "../../src/extension/event-bus.ts";
+import { publishSupervisorEvent } from "../../src/extension/legion-commands.ts";
+import { LEGION_EVENT_TYPES as STORED_EVENT_TYPES } from "../../src/legion/events.ts";
 
 class FakeRpcProcess implements RpcProcessHandle {
 	readonly pid: number;
@@ -1723,39 +1732,301 @@ test("A21: the router retries a failing `pi list` once the backoff window passes
 	}
 });
 
-test("text deltas are opt-in while default events stay coarse", async () => {
+/**
+ * Contract `viewer-transcript-parity-v1` D6/D7 (§3 wire shape).
+ *
+ * D7 deliberately EXTENDS the opt-in: `includeTextDelta` (and its explicit alias
+ * `includeDetail`) now opens the WHOLE detail stream — text, thinking and tool
+ * arguments — where it used to mean text alone. This is an intentional contract
+ * change, not a regression: a `thinking_delta` MUST reach a detailed
+ * subscription and MUST NOT reach a coarse one (the old pin asserted the
+ * opposite and is gone on purpose).
+ */
+test("viewer-parity D6/D7 rpc: streamed detail is opt-in while default events stay coarse", async () => {
 	const h = harness();
 	try {
 		await h.supervisor.spawnChild(testInput(h.root));
 		const client = h.clients[0]!;
 		const coarse: Array<Record<string, unknown>> = [];
 		const detailed: Array<Record<string, unknown>> = [];
+		const aliased: Array<Record<string, unknown>> = [];
 		h.supervisor.onEvent("root.worker", (event) => coarse.push(event));
 		h.supervisor.onEvent("root.worker", (event) => detailed.push(event), {
 			includeTextDelta: true,
 		});
+		// D7: the alias means exactly the same thing as the legacy name.
+		h.supervisor.onEvent("root.worker", (event) => aliased.push(event), {
+			includeDetail: true,
+		});
 
 		client.emit({
 			type: "message_update",
-			assistantMessageEvent: { type: "text_delta", delta: "secret text" },
+			assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "secret text" },
 		});
 		client.emit({
 			type: "message_update",
-			assistantMessageEvent: { type: "thinking_delta", delta: "private reasoning" },
+			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "private reasoning" },
 		});
+		// D6: a host-shaped toolcall update — the block is named by `contentIndex` and
+		// the live arguments ride on the partial's tool call, not on the event.
+		client.emit({
+			type: "message_update",
+			assistantMessageEvent: {
+				type: "toolcall_delta",
+				contentIndex: 0,
+				delta: '{"path":"a"}',
+				partial: {
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call_7", name: "read", arguments: { path: "a" } }],
+				},
+			},
+		});
+		// Legacy flat-`toolName` dialect: its coarse payload must stay byte-identical.
 		client.emit({
 			type: "message_update",
 			assistantMessageEvent: { type: "toolcall_start", toolName: "read" },
 		});
-		assert.equal(coarse.some((event) => event.delta === "secret text"), false);
-		assert.equal(detailed.some((event) => event.delta === "private reasoning"), false);
-		assert.equal(coarse.some((event) => event.updateType === "text_delta"), false);
+		// D15 (`viewer-transcript-parity-v1` §9): a `thinking_delta` with NO `delta`
+		// publishes nothing at all. The host always ships `delta`; the old fallback
+		// ("last thinking block of the partial") would hand the overlay the WHOLE
+		// reasoning block on every update, which it would append again and again —
+		// double render. A dialect that omits `delta` simply does not stream; its
+		// thinking still lands with `message_end`.
+		client.emit({
+			type: "message_update",
+			assistantMessageEvent: {
+				type: "thinking_delta",
+				contentIndex: 1,
+				partial: {
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "earlier" },
+						{ type: "thinking", thinking: "deeper" },
+					],
+				},
+			},
+		});
+
+		// D7/D15: the detailed subscriber sees exactly the streamed delta; a
+		// delta-less update contributes nothing (no fallback text, no event at all).
+		assert.deepEqual(
+			detailed.filter((event) => event.updateType === "thinking_delta").map((event) => event.delta),
+			["private reasoning"],
+		);
+		assert.equal(
+			detailed.some((event) => event.delta === "deeper" || event.delta === "earlier"),
+			false,
+			"D15: no thinking fallback — a delta-less update must not re-publish the block",
+		);
+		assert.equal(coarse.some((event) => event.updateType === "thinking_delta"), false);
+		// Text is unchanged: opt-in only, on either name.
 		assert.equal(detailed.some((event) => event.delta === "secret text"), true);
-		assert.equal(coarse.some((event) => event.toolName === "read"), true);
+		assert.equal(aliased.some((event) => event.delta === "secret text"), true);
+		assert.equal(coarse.some((event) => event.updateType === "text_delta"), false);
+		// D6: `toolCallId` + `args` on the argument stream, name read from the partial.
+		assert.deepEqual(
+			detailed.find(
+				(event) => event.updateType === "toolcall_delta" && event.delta === undefined,
+			),
+			{
+				name: "root.worker",
+				type: "message_update",
+				updateType: "toolcall_delta",
+				toolCallId: "call_7",
+				toolName: "read",
+				args: { path: "a" },
+			},
+		);
+		assert.equal(
+			aliased.some((event) => event.toolCallId === "call_7"),
+			true,
+			"the alias carries the same detail",
+		);
+		// Coarse: the legacy name-only payload, and nothing at all for an update that
+		// has no name to report (no partial, no text, no arguments).
+		assert.deepEqual(
+			coarse.filter((event) => event.updateType === "toolcall_start"),
+			[{ name: "root.worker", type: "message_update", updateType: "toolcall_start", toolName: "read" }],
+		);
+		assert.equal(coarse.some((event) => event.updateType === "toolcall_delta"), false);
+		assert.equal(
+			coarse.some((event) => event.args !== undefined || event.toolCallId !== undefined || event.delta !== undefined),
+			false,
+			"no interim content ever reaches a default subscriber",
+		);
 	} finally {
 		await h.supervisor.retire("root.worker");
 		h.close();
 	}
+});
+
+test("viewer-parity D6/D7/D8 inprocess: the session stream publishes the same detail fields", async () => {
+	const h = inProcessDecodeHarness();
+	try {
+		await h.supervisor.spawnChild(testInput(h.root));
+		const session = h.sessions[0]!;
+		const coarse: Array<Record<string, unknown>> = [];
+		const detailed: Array<Record<string, unknown>> = [];
+		h.supervisor.onEvent("root.worker", (event) => coarse.push(event));
+		h.supervisor.onEvent("root.worker", (event) => detailed.push(event), { includeDetail: true });
+
+		session.emit({
+			type: "message_update",
+			assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "why" },
+		});
+		session.emit({
+			type: "message_update",
+			assistantMessageEvent: {
+				type: "toolcall_end",
+				contentIndex: 1,
+				partial: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: "running it" },
+						{ type: "toolCall", id: "call_9", name: "bash", arguments: { command: "ls" } },
+					],
+				},
+			},
+		});
+		// D8: the host puts `toolCallId` on the coarse boundary event itself.
+		session.emit({ type: "tool_execution_start", toolCallId: "call_9", toolName: "bash", args: { command: "ls" } });
+
+		assert.deepEqual(
+			detailed.find((event) => event.updateType === "thinking_delta"),
+			{ name: "root.worker", type: "message_update", updateType: "thinking_delta", delta: "why" },
+		);
+		assert.deepEqual(
+			detailed.find((event) => event.updateType === "toolcall_end"),
+			{
+				name: "root.worker",
+				type: "message_update",
+				updateType: "toolcall_end",
+				toolCallId: "call_9",
+				toolName: "bash",
+				args: { command: "ls" },
+			},
+		);
+		assert.deepEqual(
+			coarse.filter((event) => event.type === "tool_execution_start"),
+			[{ name: "root.worker", type: "tool_execution_start", toolName: "bash", toolCallId: "call_9" }],
+		);
+		assert.equal(coarse.some((event) => event.updateType === "thinking_delta"), false);
+		assert.equal(
+			coarse.some((event) => event.updateType === "toolcall_end"),
+			false,
+			"the coarse feed gains no interim update it did not already carry",
+		);
+	} finally {
+		await h.supervisor.retire("root.worker");
+		h.close();
+	}
+});
+
+test("viewer-parity D4/D6/D7/D8 wire: the bridge maps supervisor facts onto the process bus", () => {
+	const bus = createLegionEventBus();
+	const seen: LegionEvent[] = [];
+	for (const type of ["text_delta", "thinking_delta", "tool_delta", "tool_call", "agent_settled"] as const) {
+		bus.on(type, (event) => seen.push(event));
+	}
+	const shape = (): Array<{ type: string; data: unknown }> =>
+		seen.map(({ type, data }) => ({ type, data }));
+
+	// D7: the detail stream is opt-in — no opt-in, no content at all.
+	const thinking = { name: "worker", type: "message_update", updateType: "thinking_delta", delta: "reasoning" };
+	publishSupervisorEvent(bus, "root.worker", thinking);
+	// (`length`, not `deepEqual(seen, [])`: the latter narrows `seen` to `never[]`.)
+	assert.equal(seen.length, 0);
+	// ... and the alias opens exactly the same door.
+	publishSupervisorEvent(bus, "root.worker", thinking, { includeDetail: true });
+	assert.deepEqual(shape(), [{ type: "thinking_delta", data: { delta: "reasoning" } }]);
+
+	// D6 + D19: arguments need the id that names their tool block. An id-less
+	// (legacy dialect) `toolcall_*` update does NOT vanish: it falls back to the flat
+	// `tool_call` fact this bridge published before the detail stream existed.
+	publishSupervisorEvent(bus, "root.worker", {
+		name: "worker",
+		type: "message_update",
+		updateType: "toolcall_delta",
+		toolName: "read",
+		args: { path: "a" },
+	}, { includeTextDelta: true, textDeltaOnly: true });
+	assert.equal(
+		seen.length,
+		1,
+		"D19+textDeltaOnly: a display-only feed takes no coarse fact, so nothing lands",
+	);
+	publishSupervisorEvent(bus, "root.worker", {
+		name: "worker",
+		type: "message_update",
+		updateType: "toolcall_delta",
+		toolName: "read",
+		args: { path: "a" },
+	}, { includeTextDelta: true });
+	assert.deepEqual(
+		shape().at(-1),
+		{ type: "tool_call", data: { toolName: "read" } },
+		"D19: the legacy flat `tool_call` still reaches a coarse-capable subscriber",
+	);
+	publishSupervisorEvent(bus, "root.worker", {
+		name: "worker",
+		type: "message_update",
+		updateType: "toolcall_delta",
+		toolCallId: "call_1",
+		toolName: "read",
+		args: { path: "a" },
+	}, { includeTextDelta: true, textDeltaOnly: true });
+	assert.deepEqual(shape().at(-1), {
+		type: "tool_delta",
+		data: { toolCallId: "call_1", toolName: "read", args: { path: "a" } },
+	});
+
+	// D8: coarse tool boundaries carry the id the host supplied.
+	publishSupervisorEvent(bus, "root.worker", {
+		name: "worker",
+		type: "tool_execution_start",
+		toolName: "bash",
+		toolCallId: "call_2",
+	});
+	assert.deepEqual(shape().at(-1), {
+		type: "tool_call",
+		data: { toolName: "bash", toolCallId: "call_2", phase: "tool_execution_start" },
+	});
+
+	// D7: `textDeltaOnly` still excludes coarse facts from a display-only feed.
+	publishSupervisorEvent(bus, "root.worker", { name: "worker", type: "agent_settled" }, {
+		includeTextDelta: true,
+		textDeltaOnly: true,
+	});
+	assert.equal(seen.some((event) => event.type === "agent_settled"), false);
+
+	// §3: both detail types are process-only bus events; the DB closed set is untouched.
+	assert.ok(LEGION_EVENT_TYPES.includes("thinking_delta"));
+	assert.ok(LEGION_EVENT_TYPES.includes("tool_delta"));
+	assert.equal((STORED_EVENT_TYPES as readonly string[]).includes("thinking_delta"), false);
+	assert.equal((STORED_EVENT_TYPES as readonly string[]).includes("tool_delta"), false);
+
+	// D18: ONE predicate for the streamed-detail chunks — the live overlay, the
+	// classic tree view and the session runtime's status board all call it, so a
+	// detail type missing here would put a synchronous SQLite subtree scan back on
+	// the per-token path (#261) in whichever view was forgotten.
+	assert.deepEqual(
+		[...DETAIL_DELTA_EVENT_TYPES],
+		["text_delta", "thinking_delta", "tool_delta"],
+	);
+	for (const type of DETAIL_DELTA_EVENT_TYPES) {
+		assert.ok(LEGION_EVENT_TYPES.includes(type), `${type} is a known bus event`);
+		assert.equal(isDetailDeltaEvent(type), true, `${type} is a detail chunk`);
+		assert.equal(
+			(STORED_EVENT_TYPES as readonly string[]).includes(type),
+			false,
+			`${type} must stay process-only`,
+		);
+	}
+	for (const type of LEGION_EVENT_TYPES) {
+		if (DETAIL_DELTA_EVENT_TYPES.includes(type)) continue;
+		assert.equal(isDetailDeltaEvent(type), false, `${type} is not a detail chunk`);
+	}
+	assert.equal(isDetailDeltaEvent("tool_execution_start"), false);
 });
 
 test("extension UI requests queue with source identity and deliver correlated replies", async () => {

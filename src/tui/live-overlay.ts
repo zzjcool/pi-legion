@@ -157,6 +157,11 @@ const DEFAULT_VIEWER_LINE_WIDTH = 2_000;
 const DEFAULT_BACKFILL_TURNS = 3;
 const DEFAULT_TERMINAL_ROWS = 24;
 const TOOL_COLLAPSED_PREVIEW_LINES = 10;
+/**
+ * Upper bound for the unclamped dedup mirror (see `capFullStream`). Roughly a megabyte of text:
+ * far beyond any real turn, small enough that a runaway stream stays finite.
+ */
+const MAX_FULL_STREAM_CHARS = 1_000_000;
 const BACKFILL_POLL_INTERVAL_MS = 250;
 /**
  * #157: Cap the floating context modal by terminal ratio so large transcripts do
@@ -301,7 +306,22 @@ function createSession(
 	let turn = initialNode?.turn ?? initialNode?.turns ?? 0;
 	let turnStartedAt: number | undefined;
 	let streamingText = "";
+	/**
+	 * D5 follow-up: the UNCLAMPED text accumulation. `streamingText` is the display mirror, and a
+	 * settled message longer than `maxLines` would no longer contain that mirror, so the disk copy
+	 * would be painted a second time. Bounded so one runaway turn cannot grow without limit.
+	 */
+	let streamedTextFull = "";
+	/**
+	 * D4: display mirror of the streamed reasoning. The factory owns the authoritative
+	 * accumulation (`streamingParts()`); this copy is clamped like `streamingText` and lets
+	 * `finishStreaming` / the dedup path work even when the streaming item was retracted.
+	 */
+	let streamingThinking = "";
+	/** Text of the streaming item that `finishStreaming` already committed (REV-4 dedup). */
 	let finalizedAssistantText = "";
+	/** D5: reasoning half of the same committed item, so the disk copy is not painted twice. */
+	let finalizedAssistantThinking = "";
 	const activity: string[] = [];
 	let lastActivityTextLine = -1;
 	let toolsExpanded = false;
@@ -485,6 +505,34 @@ function createSession(
 		return textParts.join("");
 	};
 
+	/**
+	 * D5: the reasoning half of {@link messageText}. Joined with `""` on purpose — the streamed
+	 * accumulation is the raw concatenation of every thinking delta, so this is the exact shape
+	 * it must be compared against (a `\n\n` join would never be contained in it).
+	 */
+	const messageThinking = (content: unknown): string => {
+		if (!Array.isArray(content)) return "";
+		const thinkingParts: string[] = [];
+		for (const part of content) {
+			if (part === null || typeof part !== "object" || Array.isArray(part)) continue;
+			if (!("type" in part) || part.type !== "thinking") continue;
+			if (!("thinking" in part) || typeof part.thinking !== "string") continue;
+			thinkingParts.push(part.thinking);
+		}
+		return thinkingParts.join("");
+	};
+
+	/**
+	 * D5: what a streamed run keeps of itself once a message with `landed` has been painted.
+	 * Empty when the landed copy already contains it; the tail when the stream ran ahead of the
+	 * snapshot; the whole run when the two disagree (a different or redacted run).
+	 */
+	const uncoveredTail = (streamed: string, landed: string): string => {
+		if (!streamed) return "";
+		if (landed.includes(streamed)) return "";
+		return streamed.startsWith(landed) ? streamed.slice(landed.length) : streamed;
+	};
+
 	const appendMessages = (messages: readonly AgentMessage[], redraw: boolean): boolean => {
 		projectMessagesToActivity(messages);
 		const result = chat.appendMessages(messages);
@@ -520,47 +568,76 @@ function createSession(
 		hasSession = true;
 		turn = Math.max(turn, update.cursor.turnCount);
 
-		if (!initial && finalizedAssistantText) {
+		if (!initial && (finalizedAssistantText || finalizedAssistantThinking)) {
 			const finalizedText = finalizedAssistantText;
-			let consumedFinalizedText = false;
+			const finalizedThinking = finalizedAssistantThinking;
+			let consumedFinalizedRun = false;
 			messages = messages.map((message) => {
 				if (
-					consumedFinalizedText ||
+					consumedFinalizedRun ||
 					message.role !== "assistant" ||
-					!Array.isArray(message.content) ||
-					!finalizedText.includes(messageText(message.content))
+					!Array.isArray(message.content)
 				) {
 					return message;
 				}
-				consumedFinalizedText = true;
-				return { ...message, content: message.content.filter((part) => part?.type !== "text") };
+				// D5/REV-4: the committed streaming item already paints what it accumulated, so the
+				// disk copy must lose exactly the parts it covers — per part, not per message: a
+				// covered reasoning run must not survive as a second copy (R1).
+				const textCovered = finalizedText !== "" && finalizedText.includes(messageText(message.content));
+				const thinkingCovered = finalizedThinking !== "" &&
+					finalizedThinking.includes(messageThinking(message.content));
+				if (!textCovered && !thinkingCovered) return message;
+				consumedFinalizedRun = true;
+				return {
+					...message,
+					content: message.content.filter((part) => {
+						if (part?.type === "text") return !textCovered;
+						if (part?.type === "thinking") return !thinkingCovered;
+						return true;
+					}),
+				};
 			});
-			if (consumedFinalizedText) finalizedAssistantText = "";
+			if (consumedFinalizedRun) {
+				finalizedAssistantText = "";
+				finalizedAssistantThinking = "";
+			}
 		}
 
 		let diskAssistantText: string | undefined;
+		let diskAssistantThinking: string | undefined;
 		if (!initial) {
 			for (const message of messages) {
-				if (message.role === "assistant") diskAssistantText = messageText(message.content);
+				if (message.role !== "assistant") continue;
+				diskAssistantText = messageText(message.content);
+				diskAssistantThinking = messageThinking(message.content);
 			}
 		}
-		if (diskAssistantText !== undefined) {
+		if (diskAssistantText !== undefined || diskAssistantThinking !== undefined) {
+			// D5: snapshot BEFORE the retract — `retractStreamingItem()` clears the factory
+			// accumulation and only hands back its text half.
+			const streamingParts = chat.streamingParts();
 			const retractedText = chat.retractStreamingItem();
-			const currentStreamingText = retractedText || streamingText;
-			let remainingStreamingText = "";
-			if (currentStreamingText && !diskAssistantText.includes(currentStreamingText)) {
-				remainingStreamingText = currentStreamingText.startsWith(diskAssistantText)
-					? currentStreamingText.slice(diskAssistantText.length)
-					: currentStreamingText;
-			}
+			const currentStreamingText = streamedTextFull || retractedText || streamingText;
+			const currentStreamingThinking = streamingParts.thinking || streamingThinking;
+			// Thinking and text are judged separately: whichever the landed message does not
+			// cover keeps its own tail in the streaming item.
+			const remainingStreamingText = uncoveredTail(currentStreamingText, diskAssistantText ?? "");
+			const remainingStreamingThinking = uncoveredTail(
+				currentStreamingThinking,
+				diskAssistantThinking ?? "",
+			);
 			streamingText = "";
+			streamedTextFull = "";
+			streamingThinking = "";
 			const changed = appendMessages(messages, false);
-			if (remainingStreamingText) {
-				streamingText = remainingStreamingText;
-				chat.updateStreamingText(
-					streamingText,
-					sourceNode()?.model ?? initialNode?.model ?? undefined,
-				);
+			if (remainingStreamingText || remainingStreamingThinking) {
+				// Keep the display mirror clamped, the authoritative tail whole.
+				streamedTextFull = remainingStreamingText;
+				streamingText = clampStreamingText(remainingStreamingText);
+				streamingThinking = remainingStreamingThinking;
+				const model = sourceNode()?.model ?? initialNode?.model ?? undefined;
+				if (remainingStreamingThinking) chat.appendStreamingThinking(remainingStreamingThinking, model);
+				if (remainingStreamingText) chat.updateStreamingText(remainingStreamingText, model);
 				mountNewItems();
 			}
 			if (changed) {
@@ -596,28 +673,81 @@ function createSession(
 		return undefined;
 	};
 
+	/** Same lookup as {@link readString}, for fields the wire carries untyped (D6 `args`). */
+	const readValue = (event: LiveOverlayEvent, key: string): unknown => {
+		if (event[key] !== undefined) return event[key];
+		if (event.data && typeof event.data === "object" && !Array.isArray(event.data)) {
+			return (event.data as Record<string, unknown>)[key];
+		}
+		return undefined;
+	};
+
 	const clampStreamingText = (text: string): string => text
 		.split("\n")
 		.slice(-maxLines)
 		.map((line) => line.slice(-maxLineWidth))
 		.join("\n");
 
-	const updateStreamingText = (delta: string): void => {
-		if (!delta) return;
-		streamingText = clampStreamingText(`${streamingText}${delta}`);
-		appendActivityText(delta);
-		chat.updateStreamingText(streamingText, sourceNode()?.model ?? initialNode?.model ?? undefined);
+	/**
+	 * The dedup mirror is kept far larger than the display window: it only has to recognise the
+	 * landed message, so the bound exists to keep a pathological turn finite, not to fit a frame.
+	 * Past it, containment degrades to the old (clamped) behaviour instead of failing outright.
+	 */
+	const capFullStream = (text: string): string =>
+		text.length <= MAX_FULL_STREAM_CHARS ? text : text.slice(-MAX_FULL_STREAM_CHARS);
+
+	/** The node's model, used by every streaming paint so both runs stay attributed. */
+	const streamingModel = (): string | undefined => sourceNode()?.model ?? initialNode?.model ?? undefined;
+
+	/** Shared tail of both delta paths: mount, re-layout the body, stay anchored, ask for a frame. */
+	const paintStreamingUpdate = (): void => {
 		mountNewItems();
 		lastBodyLines = renderBody(contentWidth);
 		syncScroll(lastBodyLines);
 		requestRender();
 	};
 
+	const updateStreamingText = (delta: string): void => {
+		if (!delta) return;
+		// D5 follow-up: `streamingText` is the display mirror (clamped to the viewer window); the
+		// authoritative accumulation is kept whole so a settled message longer than the window still
+		// matches by containment instead of being painted twice (the same defect D5 fixed for thinking).
+		streamedTextFull = capFullStream(` ${streamedTextFull}${delta}`.trimStart());
+		streamingText = clampStreamingText(`${streamingText}${delta}`);
+		appendActivityText(delta);
+		chat.updateStreamingText(streamingText, streamingModel());
+		paintStreamingUpdate();
+	};
+
+	/**
+	 * D4: a reasoning delta paints into the SAME streaming assistant item (the factory keeps
+	 * `[thinking…, text…]` content order). Deliberately not fed to `appendActivityText`: that
+	 * log is the text projection the state/test views assert on (D10), not a second transcript.
+	 */
+	const updateStreamingThinking = (delta: string): void => {
+		if (!delta) return;
+		streamingThinking = clampStreamingText(`${streamingThinking}${delta}`);
+		chat.appendStreamingThinking(delta, streamingModel());
+		paintStreamingUpdate();
+	};
+
 	const finishStreaming = (): void => {
-		if (!streamingText) return;
+		// D5: a thinking-only turn has no text, but its reasoning must still be finalized —
+		// otherwise the next delta keeps mutating a message the model already finished.
+		const parts = chat.streamingParts();
+		// D5: the committed record must be the UNCLAMPED accumulation. `streamingText` /
+		// `streamingThinking` are display mirrors only, and past the `clampStreamingText` window they
+		// are suffixes of the landed message, so `includes()` can never match and the settled run gets
+		// painted twice (D5, R1). The factory's unclamped thinking and our full text mirror come first.
+		const text = streamedTextFull || parts.text || streamingText;
+		const thinking = parts.thinking || streamingThinking;
+		if (!text && !thinking) return;
 		chat.finishStreaming();
-		finalizedAssistantText = streamingText;
+		finalizedAssistantText = text;
+		finalizedAssistantThinking = thinking;
 		streamingText = "";
+		streamedTextFull = "";
+		streamingThinking = "";
 		requestRender();
 	};
 
@@ -668,6 +798,12 @@ function createSession(
 			updateStreamingText(readString(event, "delta") ?? readString(event, "text") ?? "");
 			return;
 		}
+		if (eventType === "thinking_delta") {
+			// D4: an explicit branch, not the `· <eventType>` activity fallback below — a delta is
+			// one token, so falling through would paint one junk activity row per chunk.
+			updateStreamingThinking(readString(event, "delta") ?? "");
+			return;
+		}
 		if (eventType === "turn_start") {
 			finishStreaming();
 			const data = event.data && typeof event.data === "object" && !Array.isArray(event.data)
@@ -695,10 +831,25 @@ function createSession(
 				(eventType === "tool_call" && toolPhase === "tool_execution_start");
 			const toolEnded = eventType === "toolcall_end" || eventType === "tool_execution_end" ||
 				(eventType === "tool_call" && toolPhase === "tool_execution_end");
-			if (toolStarted) finishStreaming();
+			if (toolStarted) {
+				finishStreaming();
+				// D8: open the block's shell/clock. An in-flight call has no component yet (the
+				// `toolCall` part is only persisted at `message_end`), so this is often a no-op.
+				const startedId = readString(event, "toolCallId");
+				if (startedId) chat.markToolStarted(startedId);
+			}
 			const name = safeText(readString(event, "toolName") ?? readString(event, "name") ?? "tool");
 			const phase = toolEnded ? "✓" : "⚙";
 			appendActivityLine(`${phase} ${name}`);
+		} else if (eventType === "tool_delta" || eventType === "toolcall_delta") {
+			// D6: streamed arguments for the tool block named by `toolCallId`; the factory is a
+			// silent no-op when that block does not exist yet. Explicit branch for the same reason
+			// as `thinking_delta` — an arg delta is not an activity row.
+			const toolCallId = readString(event, "toolCallId");
+			const args = readValue(event, "args");
+			if (toolCallId && args !== undefined) chat.updateToolArgs(toolCallId, args);
+			requestRender();
+			return;
 		} else if (eventType !== "message_update") {
 			appendActivityLine(`· ${safeText(eventType)}`);
 		}
@@ -813,6 +964,14 @@ function createSession(
 		const activeSubscription = subscription;
 		subscription = undefined;
 		if (activeSubscription) source.unsubscribe(activeSubscription);
+		// D3/R3: every in-flight tool block owns a host 1s interval. Nothing paints this
+		// component after close, so settle them now instead of leaking one timer per close.
+		try {
+			chat.releaseToolTimers();
+		} catch {
+			// A host renderer must never keep `done()` pending: an unresolved overlay promise
+			// queues every later prompt behind it (H1). The components are discarded anyway.
+		}
 		const handle = overlayHandle;
 		overlayHandle = undefined;
 		// pi's custom() `done` already hides this overlay (ui.hideOverlay() pops the

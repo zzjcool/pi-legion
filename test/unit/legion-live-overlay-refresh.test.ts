@@ -305,3 +305,40 @@ test("#261 B control: opening a different node still mounts a second overlay", a
 	await harness.mounts[1]!.promise;
 	assert.equal(harness.controller.getCurrent(), undefined);
 });
+
+/**
+ * `viewer-transcript-parity-v1` §3 wire: the two new detail events have to survive the *bus*, not
+ * just the overlay. `bus.emit()` asserts the type against `LEGION_EVENT_TYPES`, and
+ * `treeForLiveSource` subscribes to that same list, so a type missing from the process whitelist is
+ * dropped silently between the supervisor and the modal — invisible to a test that emits straight
+ * into the overlay's listener. This drives the real bus through the real `/legion <node>` mount.
+ *
+ * Only arrival + render are asserted here; whether a detail event may take a tree snapshot is
+ * #261's question, and pinning it here would make the wire test depend on the refresh policy.
+ */
+test("viewer-parity D4/D6: the bus carries thinking_delta and tool_delta into the open modal", async () => {
+	const harness = liveHarness();
+	const overlay = await harness.open("worker");
+
+	harness.bus.emit({
+		nodeId: "root.worker",
+		type: "thinking_delta",
+		data: { delta: "consider this" },
+		ts: NOW + 1,
+	});
+	assert.match(plain(overlay), /consider this/, "streamed reasoning reaches the modal body");
+
+	const activityBefore = overlay.getState().activity;
+	harness.bus.emit({
+		nodeId: "root.worker",
+		type: "tool_delta",
+		data: { toolCallId: "call-1", toolName: "read", args: { path: "src/a.ts" } },
+		ts: NOW + 2,
+	});
+	assert.deepEqual(
+		overlay.getState().activity,
+		activityBefore,
+		"an argument delta is detail, not an activity row",
+	);
+	assert.equal(overlay.getState().open, true, "a detail event never closes the modal");
+});

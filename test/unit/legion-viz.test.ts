@@ -1,15 +1,15 @@
 import { test } from "node:test";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
-import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
-import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
+import { stripTerminalSequences, visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { displayStatus, isAgent, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
 import { RateSampler, RATE_WINDOW_MS, MIN_RATE_DECODE_MS, liveRateNodeIds, visibleRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
-import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
+import { computeLayout, selectLayout, STATUS_LOG_RESERVE, type Rect } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
-import { buildLog, chartBuckets, chartWindow, computeStats, drawLog, drawStatus, frame, hypot2, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type LogEvent } from "../../src/tui/viz/panels.ts";
-import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, LEGION_PAGE_BG, MIN_SELECTION_BADGE_W, paintPageFloor, renderLegionView } from "../../src/tui/viz/view.ts";
+import { buildLog, chartBuckets, chartWindow, computeStats, dfsOrder, drawLog, drawStatus, emptyGalaxyDiscs, frame, galaxyHitAt, hypot2, paneInner, statusRowsFromNodes, statusVisibleRows, timingRowsFromNodes, type GalaxyDiscs, type LogEvent } from "../../src/tui/viz/panels.ts";
+import { availablePanes, createLegionViewFactory, handleViewKey, initialViewState, LEGION_PAGE_BG, MIN_SELECTION_BADGE_W, paintPageFloor, renderLegionView, viewHitAt } from "../../src/tui/viz/view.ts";
 import { Canvas, cellWidth, ellipsize } from "../../src/tui/viz/canvas.ts";
 import { createStatusBoard, formatActivityAgo, type StatusEntry, type StatusUi, type WidgetFactory } from "../../src/tui/status.ts";
 
@@ -3034,4 +3034,340 @@ test("#364: renderLegionView only reuses a canvas of the same size", () => {
 	assert.equal(out.height, 20);
 	const right = new Canvas(60, 20);
 	assert.equal(renderLegionView(data, initialViewState(), 60, 20, right).canvas, right, "the same size is reused");
+});
+
+// ------------------------------------------------------- D11/D13: viz mouse
+// `docs/contracts/viewer-transcript-parity-v1.md` D11 + D13 (§9) — the /legion page
+// gets a mouse: `createLegionViewFactory`'s component answers `handleMouse`, and a
+// left click on an agent **row** (status/timing/log) or on a galaxy **disc** opens
+// that agent exactly as `o`/Enter does. Every click is resolved against the last
+// painted frame (`PaintedView`), so these tests drive the geometry the page drew:
+// list row `i` sits on `outer.y + 2 + i`, and a galaxy disc is the ellipse the
+// painter recorded in pane-local pixels (2 pixels per cell column, 4 per cell row).
+
+/** A left click at a page-local cell. */
+const pageClick = (x: number, y: number, extra: Partial<TuiMouseEvent> = {}): TuiMouseEvent => ({
+	type: "click",
+	button: "left",
+	x,
+	y,
+	screenX: x,
+	screenY: y,
+	width: 160,
+	height: 50,
+	shift: false,
+	alt: false,
+	ctrl: false,
+	...extra,
+});
+
+/**
+ * Whole tokens of one pane's cells in a rendered row.
+ *
+ * `line.includes(name)` is not good enough as a positive control: the fixture has
+ * both `scout-1` and `scout-11`, so a row could "contain the agent" while painting
+ * a different one. Tokens split on anything that is neither a word character nor
+ * `-` (names keep their dash), and the row is cut to the **pane's own** columns so
+ * a name in the neighbouring pane cannot stand in for it either. Slicing by code
+ * point is exact here: the page is box/braille/ASCII, every glyph one column wide.
+ */
+function paneTokens(line: string, r: Rect): string[] {
+	return Array.from(stripTerminalSequences(line)).slice(r.x, r.x + r.w).join("").split(/[^\w-]+/).filter(Boolean);
+}
+
+/** The `/legion` page at 160×50 (wide: galaxy|chart left, timing|log|status right). */
+function vizPage(): {
+	data: { nodes: VizNode[]; sampler: RateSampler; now: number; rate: number };
+	frame: ReturnType<typeof renderLegionView>;
+	galaxy: GalaxyDiscs;
+} {
+	const { nodes, sampler, now } = scenario();
+	const data = { nodes, sampler, now, rate: sampler.totalRate(now) };
+	const galaxy = emptyGalaxyDiscs();
+	const frame = renderLegionView(data, initialViewState(), 160, 50, undefined, galaxy);
+	return { data, frame, galaxy };
+}
+
+test("viz D11: the hit test maps a cell to the row painted there, and honours the scroll offset", () => {
+	const { frame } = vizPage();
+	const { rects, rows } = frame;
+	const painted = (offsets: { log: number; timing: number; status: number } = { log: 0, timing: 0, status: 0 }) => ({
+		rects,
+		rows,
+		offsets,
+		galaxy: emptyGalaxyDiscs(),
+	});
+	const rowX = (pane: "timing" | "log" | "status"): number => rects[pane].x + 2;
+	const rowY = (pane: "timing" | "log" | "status", index: number): number => rects[pane].y + 2 + index;
+
+	// One row per entry, on the first inner row under each pane's header.
+	assert.deepEqual(viewHitAt(painted(), rowX("status"), rowY("status", 0)), { pane: "status", index: 0, nodeId: rows.status[0]!.id });
+	assert.deepEqual(viewHitAt(painted(), rowX("timing"), rowY("timing", 1)), { pane: "timing", index: 1, nodeId: rows.timing[1]!.node.id });
+	assert.deepEqual(viewHitAt(painted(), rowX("log"), rowY("log", 2)), { pane: "log", index: 2, nodeId: rows.log[2]!.node.id });
+
+	// A later row is a different agent, not the same one shifted.
+	assert.notEqual(rows.status[0]!.id, rows.status[1]!.id);
+	assert.equal(viewHitAt(painted(), rowX("status"), rowY("status", 1))?.nodeId, rows.status[1]!.id);
+
+	// Scrolled: the cell paints list entry `offset + row`, so that is what opens.
+	const scrolled = painted({ log: 1, timing: 2, status: 3 });
+	assert.deepEqual(viewHitAt(scrolled, rowX("status"), rowY("status", 0)), { pane: "status", index: 3, nodeId: rows.status[3]!.id });
+	assert.equal(viewHitAt(scrolled, rowX("timing"), rowY("timing", 0))?.nodeId, rows.timing[2]!.node.id);
+	assert.equal(viewHitAt(scrolled, rowX("log"), rowY("log", 0))?.nodeId, rows.log[1]!.node.id);
+
+	// Chrome is not a row: title rules, borders, and the footer line of a pane.
+	assert.equal(viewHitAt(painted(), rowX("status"), rects.status.y), undefined, "top border");
+	assert.equal(viewHitAt(painted(), rowX("status"), rects.status.y + 1), undefined, "status header");
+	assert.equal(viewHitAt(painted(), rects.status.x, rowY("status", 0)), undefined, "left border column");
+	assert.equal(viewHitAt(painted(), rects.status.x + rects.status.w - 1, rowY("status", 0)), undefined, "right border column");
+	assert.equal(viewHitAt(painted(), rowX("log"), rects.log.y + 1), undefined, "log summary line");
+	assert.equal(viewHitAt(painted(), rowX("timing"), rects.timing.y + 1), undefined, "timing header");
+	assert.equal(viewHitAt(painted(), rowX("timing"), rects.timing.y + rects.timing.h - 2), undefined, "timing footer (span/sum)");
+
+	// Blank tail: the status band shows 3 of 12 agents, so its 4th row paints nothing.
+	assert.ok(rows.status.length > statusVisibleRows(rects.status.h, rows.status.length), "the fixture really overflows the band");
+	assert.equal(viewHitAt(painted(), rowX("status"), rowY("status", statusVisibleRows(rects.status.h, rows.status.length))), undefined, "blank tail");
+	// Same rule for a short log: geometry has rows the list does not fill.
+	assert.ok(rows.log.length < rects.log.h - 3, "the fixture leaves blank log rows");
+	assert.equal(viewHitAt(painted(), rowX("log"), rowY("log", rows.log.length)), undefined, "blank log tail");
+
+	// The galaxy is not a list: with no discs recorded (an empty sink) nothing in it
+	// is clickable, and the chart never is.
+	assert.equal(viewHitAt(painted(), rects.galaxy.x + 3, rects.galaxy.y + 3), undefined, "galaxy without discs");
+	assert.equal(viewHitAt(painted(), 2, rects.chart.y + 3), undefined, "chart");
+	assert.equal(viewHitAt(painted(), 2, rowY("status", 0)), undefined, "left column is not the status pane");
+});
+
+test("viz D11: a left click on a status/timing/log row opens that agent and leaves the keyboard selection on it", () => {
+	const { data, frame } = vizPage();
+	const { rects, rows } = frame;
+	const mount = (): {
+		component: ReturnType<ReturnType<typeof createLegionViewFactory>>;
+		opened: string[];
+		ui: { renders: number; requestRender(): void };
+	} => {
+		const opened: string[] = [];
+		const ui = { renders: 0, requestRender(): void { this.renders++; } };
+		const component = createLegionViewFactory({ getData: () => data, onOpenNode: (id) => opened.push(id) })(
+			{ requestRender: () => ui.requestRender(), terminal: { rows: 50 } },
+			plainTheme,
+			undefined,
+			() => {},
+		);
+		return { component, opened, ui };
+	};
+	// The fixture really does contain the review's false-pass pair, and the control
+	// helper rejects it: a row painting `scout-11` never satisfies `scout-1`.
+	assert.ok(data.nodes.some((node) => node.name === "scout-11"), "the fixture has scout-11");
+	assert.ok(data.nodes.some((node) => node.name === "scout-1"), "the fixture has scout-1");
+	assert.deepEqual(paneTokens("│ scout-11 ✗ 2m00s │", { x: 0, y: 0, w: 20, h: 1 }), ["scout-11", "2m00s"]);
+	assert.ok(!paneTokens("│ scout-11 ✗ 2m00s │", { x: 0, y: 0, w: 20, h: 1 }).includes("scout-1"), "whole tokens, not substrings");
+	const cases = [
+		{ pane: "status" as const, index: 1, name: rows.status[1]!.name, id: rows.status[1]!.id },
+		{ pane: "timing" as const, index: 0, name: rows.timing[0]!.node.name, id: rows.timing[0]!.node.id },
+		{ pane: "log" as const, index: 2, name: rows.log[2]!.node.name, id: rows.log[2]!.node.id },
+	];
+	for (const { pane, index, name, id } of cases) {
+		const { component, opened, ui } = mount();
+		const lines = component.render(160);
+		const y = rects[pane].y + 2 + index;
+		// Positive control on the geometry: the row the click lands on really paints
+		// this agent's name — as a whole token, in this pane's own columns, so the
+		// fixture's `scout-11` cannot satisfy a check for `scout-1`.
+		const painted = paneTokens(lines[y]!, rects[pane]);
+		assert.ok(painted.includes(name), `${pane} row ${index} paints ${name}, got ${JSON.stringify(painted)}`);
+		const before = ui.renders;
+		const result = component.handleMouse!(pageClick(rects[pane].x + 2, y));
+		assert.deepEqual(result, { handled: true, focus: true }, `${pane} click is handled`);
+		assert.deepEqual(opened, [id], `${pane} click opens the agent of that row`);
+		assert.equal(ui.renders, before + 1, `${pane} click requests one render`);
+		// `o` right after the click reopens the clicked agent: the click left
+		// `selectedId` behind the same way Enter in a focused pane does.
+		component.handleInput("o");
+		assert.deepEqual(opened, [id, id], `${pane} click leaves the agent selected`);
+		component.dispose();
+	}
+
+	// The cursor, not just the selection: after clicking status row 1, ↓ + Enter
+	// selects row **2**, which `o` then opens. A cursor left at 0 would put ↓ on
+	// row 1 — the already-selected row — so Enter would deselect it and `o` would
+	// open nothing.
+	const { component, opened } = mount();
+	component.render(160);
+	component.handleMouse!(pageClick(rects.status.x + 2, rects.status.y + 3));
+	assert.deepEqual(opened, [rows.status[1]!.id]);
+	component.handleInput("\x1b[B");
+	component.handleInput("\r");
+	component.handleInput("o");
+	assert.deepEqual(opened, [rows.status[1]!.id, rows.status[2]!.id], "the click parked the status cursor on the clicked row");
+	component.dispose();
+});
+
+test("viz D11: clicks that carry no agent row stay unhandled and request no render", () => {
+	const { data, frame } = vizPage();
+	const { rects } = frame;
+	const opened: string[] = [];
+	const ui = { renders: 0, requestRender(): void { this.renders++; } };
+	const component = createLegionViewFactory({ getData: () => data, onOpenNode: (id) => opened.push(id) })(
+		{ requestRender: () => ui.requestRender(), terminal: { rows: 50 } },
+		plainTheme,
+		undefined,
+		() => {},
+	);
+	const lines = component.render(160);
+	const statusRowY = rects.status.y + 2;
+	const click = (x: number, y: number, extra: Partial<TuiMouseEvent> = {}) => component.handleMouse!(pageClick(x, y, extra));
+
+	// Sanity: the same cell, as a plain left click, does open (so the misses below
+	// are about the cell, not about a broken fixture).
+	assert.deepEqual(click(rects.status.x + 2, statusRowY), { handled: true, focus: true });
+	assert.deepEqual(opened, [frame.rows.status[0]!.id]);
+	ui.renders = 0;
+	opened.length = 0;
+
+	const misses: Array<[string, number, number, Partial<TuiMouseEvent>?]> = [
+		["status top border", rects.status.x + 2, rects.status.y],
+		["status title rule", rects.status.x + 2, rects.status.y + 1],
+		["status left border", rects.status.x, statusRowY],
+		["status blank tail", rects.status.x + 2, rects.status.y + 2 + statusVisibleRows(rects.status.h, frame.rows.status.length)],
+		["log summary line", rects.log.x + 2, rects.log.y + 1],
+		["timing header", rects.timing.x + 2, rects.timing.y + 1],
+		["chart cell", 2, rects.chart.y + 3],
+		["galaxy legend row", rects.galaxy.x + 2, rects.galaxy.y + rects.galaxy.h - 2],
+		["page header", 2, 0],
+		["footer", 2, rects.footer.y],
+		["right button on an agent row", rects.status.x + 2, statusRowY, { button: "right" }],
+		["press on an agent row", rects.status.x + 2, statusRowY, { type: "press" }],
+		["wheel on an agent row", rects.status.x + 2, statusRowY, { type: "wheel", button: "none", wheelDelta: 1 }],
+		["move on an agent row", rects.status.x + 2, statusRowY, { type: "move", button: "left" }],
+	];
+	for (const [what, x, y, extra] of misses) {
+		assert.equal(click(x, y, extra), undefined, `${what} is left to the host`);
+	}
+	assert.deepEqual(opened, [], "a miss never opens an agent");
+	assert.equal(ui.renders, 0, "a miss never requests a render");
+	// And the page still renders (a miss must not have disturbed the frame).
+	assert.ok(paneTokens(lines[statusRowY]!, rects.status).includes(frame.rows.status[0]!.name));
+	component.dispose();
+});
+
+test("viz D13: a click on a galaxy disc opens that node — the cell really paints its disc", () => {
+	const { data, frame, galaxy } = vizPage();
+	const { rects } = frame;
+	const inner = paneInner(rects.galaxy)!;
+	const lines = renderLegionView(data, initialViewState(), 160, 50).canvas.toPlain();
+	const nameOf = new Map(data.nodes.map((node) => [node.id, node]));
+
+	// Positive control, in two independent pixel facts about the same cell:
+	//  1. the disc's centre cell carries the node's own colour token (the disc fill
+	//     writes `nodeToken(node)`, so the paint there is *that* node's disc), and
+	//  2. the node's name label is painted on one of the five label rows around it
+	//     (`LABEL_DY`) — text is the only glyph in the frame that spells the agent.
+	let target: { id: string; cx: number; cy: number } | undefined;
+	for (let i = 0; i < galaxy.count && !target; i++) {
+		const id = galaxy.ids[i]!;
+		const node = nameOf.get(id);
+		if (!node || id === "root") continue;
+		const cx = inner.x + Math.floor(galaxy.xs[i]! / 2);
+		const cy = inner.y + Math.floor(galaxy.ys[i]! / 4);
+		const cell = frame.canvas.cells[cy]![cx]!;
+		if (!/[\u2800-\u28ff]/.test(cell.ch)) continue;
+		if (cell.color !== nodeToken(node)) continue;
+		const labelRow = [0, -1, 1, -2, 2].map((dy) => cy + dy).find((y) => paneTokens(lines[y]!, rects.galaxy).includes(node.name));
+		if (labelRow === undefined) continue;
+		target = { id, cx, cy };
+	}
+	assert.ok(target, "one disc centre is painted in its node's colour, next to that node's label");
+	const name = nameOf.get(target!.id)!.name;
+
+	const opened: string[] = [];
+	const ui = { renders: 0, requestRender(): void { this.renders++; } };
+	const component = createLegionViewFactory({ getData: () => data, onOpenNode: (id) => opened.push(id) })(
+		{ requestRender: () => ui.requestRender(), terminal: { rows: 50 } },
+		plainTheme,
+		undefined,
+		() => {},
+	);
+	component.render(160);
+	const result = component.handleMouse!(pageClick(target!.cx, target!.cy));
+	assert.deepEqual(result, { handled: true, focus: true }, "the disc click is handled");
+	assert.deepEqual(opened, [target!.id], `the disc under the cell opens ${target!.id}`);
+	assert.equal(ui.renders, 1, "the click requests one render");
+
+	// `focus` / `selectedId` synced, like a list pane. Take the focus away with the
+	// *keyboard* (Tab twice: galaxy → chart → timing), so this does not lean on the
+	// click-focus behaviour it is meant to verify. Then click the disc and press ↓:
+	// with focus back on the galaxy that walks its DFS order from the clicked node;
+	// with focus stuck on `timing` it moves the timing cursor instead, `selectedId`
+	// stays put and `o` reopens the same agent.
+	component.handleInput("\t");
+	component.handleInput("\t");
+	const order = dfsOrder(data.nodes).filter(isAgent).map((node) => node.id);
+	const next = order[(order.indexOf(target!.id) + 1) % order.length]!;
+	assert.notEqual(next, target!.id);
+	component.handleMouse!(pageClick(target!.cx, target!.cy));
+	assert.deepEqual(opened, [target!.id, target!.id]);
+	component.handleInput("\x1b[B");
+	component.handleInput("o");
+	assert.equal(opened.at(-1), next, `↓ after a disc click walks the galaxy from ${name}, not the timing cursor`);
+	component.dispose();
+});
+
+test("viz D13: an empty patch of star field (and the legend row) stays unhandled", () => {
+	const { data, frame, galaxy } = vizPage();
+	const { rects } = frame;
+	const inner = paneInner(rects.galaxy)!;
+	const lines = renderLegionView(data, initialViewState(), 160, 50).canvas.toPlain();
+	// A cell that is genuinely blank in the paint AND inside no disc's tolerance:
+	// the pixel fact and the record agree, which is the point of the test.
+	let blank: { x: number; y: number } | undefined;
+	for (let y = inner.y + 1; y < inner.y + inner.h - 1 && !blank; y++) {
+		for (let x = inner.x + 1; x < inner.x + inner.w - 1; x++) {
+			if (frame.canvas.cells[y]![x]!.ch !== " ") continue;
+			if (galaxyHitAt(inner, galaxy, x, y) !== undefined) continue;
+			blank = { x, y };
+			break;
+		}
+	}
+	assert.ok(blank, "the fixture has blank star field");
+	assert.equal(Array.from(lines[blank.y]!)[blank.x], " ", "the positive control: the cell really is empty");
+
+	const opened: string[] = [];
+	const ui = { renders: 0, requestRender(): void { this.renders++; } };
+	const component = createLegionViewFactory({ getData: () => data, onOpenNode: (id) => opened.push(id) })(
+		{ requestRender: () => ui.requestRender(), terminal: { rows: 50 } },
+		plainTheme,
+		undefined,
+		() => {},
+	);
+	component.render(160);
+	assert.equal(component.handleMouse!(pageClick(blank.x, blank.y)), undefined, "blank star field");
+	assert.equal(component.handleMouse!(pageClick(inner.x + 2, inner.y + inner.h - 1)), undefined, "galaxy legend row");
+	assert.equal(component.handleMouse!(pageClick(rects.galaxy.x, inner.y + 2)), undefined, "galaxy border column");
+	assert.deepEqual(opened, [], "nothing opened");
+	assert.equal(ui.renders, 0, "no render requested");
+	component.dispose();
+});
+
+test("viz D13: overlapping discs resolve to the nearest centre, and a cell inside none misses", () => {
+	// Pure: two overlapping discs (radius 6, tolerance 8) on one row of a 40×10 pane.
+	// Cell (i, j) covers pixels [2i, 2i+1] × [4j, 4j+3], so its centre is (2i+1, 4j+1.5).
+	const r = { x: 10, y: 5, w: 40, h: 10 };
+	const discs: GalaxyDiscs = { ids: ["left", "right"], xs: [20, 26], ys: [10, 10], rxs: [6, 6], rys: [6, 6], count: 2 };
+	// px 21 / py 9.5: inside both (dist 1.1 vs 5.0), nearest centre = left.
+	assert.equal(galaxyHitAt(r, discs, 20, 7), "left");
+	// px 25 / py 9.5: inside both (dist 5.0 vs 1.1), nearest centre = right.
+	assert.equal(galaxyHitAt(r, discs, 22, 7), "right");
+	// px 21 at the far row: py = 4j + 1.5 = 21.5 → dy 11.5 > tolerance ⇒ neither.
+	assert.equal(galaxyHitAt(r, discs, 20, 10), undefined);
+	// Off-pane is never a disc.
+	assert.equal(galaxyHitAt(r, discs, r.x - 1, 7), undefined);
+	// The legend row is not star field. The control is a disc drawn *on* it: cell
+	// row 14 (the last inner row, `paintGalaxy`'s legend line) has its centre at
+	// py = 37.5, so without the row bound this click would open "legend".
+	const onLegend: GalaxyDiscs = { ids: ["legend"], xs: [20], ys: [37.5], rxs: [6], rys: [6], count: 1 };
+	assert.equal(galaxyHitAt(r, onLegend, 20, 14), undefined, "the legend row is not star field");
+	assert.equal(galaxyHitAt(r, onLegend, 20, 13), "legend", "one row above the legend, the same disc is a hit");
+	// An empty sink (too-small pane, or a frame painted without a sink) is a miss.
+	assert.equal(galaxyHitAt(r, emptyGalaxyDiscs(), 20, 7), undefined);
 });

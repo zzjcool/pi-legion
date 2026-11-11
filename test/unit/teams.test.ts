@@ -2661,10 +2661,13 @@ test("#266 A13: the launch-queue events live in the process-only set and never i
 			"node_launched", "node_steered", "node_retired", "node_aborted", "ui_request",
 			"text_delta", "tool_call", "agent_settled", "turn_start",
 			"launch_queued", "launch_admitted",
+			// D4/D6 of `viewer-transcript-parity-v1`: thinking deltas and streamed tool
+			// arguments reach the live overlay through the process-only bus, never the DB.
+			"thinking_delta", "tool_delta",
 		],
-		"the process-only set is exactly the previous nine plus the two queue events (D12)",
+		"the process-only set is exactly the previous nine plus the two queue events (D12) and the two viewer detail events",
 	);
-	assert.equal(LEGION_PROCESS_EVENT_TYPES.length, 11);
+	assert.equal(LEGION_PROCESS_EVENT_TYPES.length, 13);
 	assert.ok(!(STORED_EVENT_TYPES as readonly string[]).includes("launch_queued"));
 	assert.ok(!(STORED_EVENT_TYPES as readonly string[]).includes("launch_admitted"));
 	// #309: `node_handled` is persisted, so it must never leak into the process-only

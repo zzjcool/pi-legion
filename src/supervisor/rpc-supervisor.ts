@@ -55,10 +55,15 @@ import {
 import { currentPgid, enumerateDescendants } from "./proc-tree.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
 import { DECODE_ARCHIVE_MAX, foldDecode, seedDecode, type DecodeClock } from "./decode-clock.ts";
+import { DETAIL_UPDATE_TYPES, detailFieldsOf } from "./detail-fields.ts";
 
 interface EventSubscription {
 	listener: SupervisorEventListener;
-	includeTextDelta: boolean;
+	/**
+	 * D7: one gate for the whole detail stream. `includeTextDelta` (legacy name)
+	 * and its explicit alias `includeDetail` both mean "send streamed detail too".
+	 */
+	includeDetail: boolean;
 }
 
 interface SettleWaiter {
@@ -706,7 +711,7 @@ export class RpcSupervisor implements LegionSupervisor {
 		return pending;
 	}
 
-	/** Subscribe to coarse events; set includeTextDelta only for a live overlay. */
+	/** Subscribe to coarse events; set includeTextDelta (or includeDetail) for a live overlay. */
 	onEvent(
 		name: string,
 		listener: SupervisorEventListener,
@@ -715,7 +720,8 @@ export class RpcSupervisor implements LegionSupervisor {
 		const child = this.children.get(name);
 		const subscription: EventSubscription = {
 			listener,
-			includeTextDelta: options.includeTextDelta === true,
+			includeDetail:
+				options.includeTextDelta === true || options.includeDetail === true,
 		};
 		const subscriptions = child?.subscriptions ?? this.pendingSubscriptions(name);
 		subscriptions.add(subscription);
@@ -908,8 +914,9 @@ export class RpcSupervisor implements LegionSupervisor {
 		// backend for why this is the only writer of the field).
 		child.lastEventAt = at;
 		// tps-decode-denominator D1/D2: the third reader of the same clock reading,
-		// and it MUST stay above `publishEvent` — that path drops every delta except
-		// text_delta/tool-name, so a thinking-only turn would measure nothing.
+		// and it MUST stay above `publishEvent` — that path only forwards streamed
+		// detail to opted-in subscribers, so a thinking-only turn would measure
+		// nothing if the fold lived behind the subscriber filter.
 		// Non-`message_update` events pass `toJsonEvent` through verbatim
 		// (`modes/json-event.js`), so `message_end` still carries the full message,
 		// `durationMs` included — that is the no-stream fallback (D2 rule 2).
@@ -983,33 +990,40 @@ export class RpcSupervisor implements LegionSupervisor {
 			const assistantEvent = recordOf(record.assistantMessageEvent);
 			if (!assistantEvent || typeof assistantEvent.type !== "string") return;
 			const updateType = assistantEvent.type;
-			const isTextDelta = updateType === "text_delta";
+			const isDetail = DETAIL_UPDATE_TYPES.has(updateType);
 			const toolName =
 				typeof assistantEvent.toolName === "string"
 					? assistantEvent.toolName
 					: undefined;
-			if (!isTextDelta && !toolName) return;
+			if (!isDetail && !toolName) return;
+			// D6/D7: an opted-in subscriber gets the same event plus the streamed fields —
+			// `delta` for text/thinking, `toolCallId`/`toolName`/`args` for the argument
+			// stream. `undefined` means "nothing publishable here", which D15 produces for
+			// a `thinking_delta` with no `delta`: it is dropped rather than falling back to
+			// the whole reasoning block (the overlay would append that block again and
+			// again — double render).
+			const fields = isDetail
+				? detailFieldsOf(assistantEvent, updateType)
+				: undefined;
+			if (isDetail && fields === undefined) return;
+			// The coarse payload stays exactly what it always was: no text and no
+			// arguments ever reach the default status stream.
 			const coarse: SupervisorEvent = {
 				name: child.name,
 				type,
 				updateType,
 				...(toolName ? { toolName } : {}),
 			};
-			const detailed: SupervisorEvent = {
-				name: child.name,
-				type,
-				updateType,
-				...(isTextDelta && typeof assistantEvent.delta === "string"
-					? { delta: assistantEvent.delta }
-					: {}),
-				...(toolName ? { toolName } : {}),
-			};
+			const detailed: SupervisorEvent = isDetail
+				? { ...coarse, ...fields }
+				: coarse;
 			for (const subscription of [...child.subscriptions]) {
-				if (isTextDelta && !subscription.includeTextDelta) continue;
-				this.notify(
-					subscription,
-					isTextDelta ? detailed : coarse,
-				);
+				if (!subscription.includeDetail) {
+					// Legacy coarse traffic: only an update that already had a tool name.
+					if (toolName !== undefined) this.notify(subscription, coarse);
+					continue;
+				}
+				this.notify(subscription, detailed);
 			}
 			return;
 		}
@@ -1017,6 +1031,8 @@ export class RpcSupervisor implements LegionSupervisor {
 
 		// Keep payloads intentionally small: argument/text content is never
 		// copied into the default status stream, but tool names remain visible.
+		// D8: the host puts `toolCallId` on `tool_execution_start`/`_end` itself, so
+		// this whitelist already forwards it — nothing is synthesized here.
 		const event: SupervisorEvent = { name: child.name, type };
 		for (const key of ["toolName", "toolCallId", "aborted", "willRetry", "reason"]) {
 			if (record[key] !== undefined) event[key] = record[key];

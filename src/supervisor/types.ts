@@ -648,9 +648,15 @@ export interface SupervisorEvent {
 	[key: string]: unknown;
 }
 
-/** text_delta payloads are opt-in to keep default event traffic coarse. */
+/** Streaming detail payloads are opt-in to keep default event traffic coarse. */
 export interface EventSubscriptionOptions {
+	/**
+	 * D7 (`viewer-transcript-parity-v1`): one gate for the WHOLE detail stream —
+	 * `text_delta`, `thinking_delta` and the `toolcall_*` arg deltas.
+	 */
 	includeTextDelta?: boolean;
+	/** Explicit alias of `includeTextDelta` (D7): either one opens the detail stream. */
+	includeDetail?: boolean;
 }
 
 export type SupervisorEventListener = (event: SupervisorEvent) => void;

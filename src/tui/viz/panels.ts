@@ -18,8 +18,22 @@ export interface ViewData {
 	rate: number;
 }
 
+/**
+ * The inner (content) rect `frame()` hands back, or `undefined` when the pane is
+ * too small to be painted at all.
+ *
+ * Pure half of `frame()`'s geometry, exported so the mouse hit-test (view.ts, D11)
+ * derives a pane's content cells from the *draw layer's* border offset instead of
+ * keeping a second copy of `+1 / -2` that could drift from it.
+ */
+export function paneInner(r: Rect): Rect | undefined {
+	if (r.w < 4 || r.h < 3) return undefined;
+	return { x: r.x + 1, y: r.y + 1, w: r.w - 2, h: r.h - 2 };
+}
+
 export function frame(cv: Canvas, r: Rect, title: string, focused: boolean, hint?: string): Rect {
-	if (r.w < 4 || r.h < 3) return { x: r.x, y: r.y, w: Math.max(0, r.w), h: Math.max(0, r.h) };
+	const inner = paneInner(r);
+	if (!inner) return { x: r.x, y: r.y, w: Math.max(0, r.w), h: Math.max(0, r.h) };
 	const col = focused ? "borderAccent" : "borderMuted";
 	const [tl, tr, bl, br, hz, vt] = focused ? ["┏", "┓", "┗", "┛", "━", "┃"] : ["╭", "╮", "╰", "╯", "─", "│"];
 	const maxX = r.x + r.w;
@@ -36,7 +50,53 @@ export function frame(cv: Canvas, r: Rect, title: string, focused: boolean, hint
 		const hx = r.x + r.w - h.length - 2;
 		if (hx > after + 1) cv.text(hx, r.y, h, "dim", { maxX: maxX - 1 });
 	}
-	return { x: r.x + 1, y: r.y + 1, w: r.w - 2, h: r.h - 2 };
+	return inner;
+}
+
+/**
+ * Row count of a header + optional-footer list pane (status, timing) inside an
+ * `innerH`-tall inner rect: one header row, plus one footer row once the pane has
+ * the four rows that shape needs and the list is non-empty.
+ */
+function innerListRows(innerH: number, total: number): number {
+	const footerH = total > 0 && innerH >= 4 ? 1 : 0;
+	return Math.max(0, innerH - 1 - footerH);
+}
+
+/** Rows `drawTiming` paints inside an `innerH`-tall inner rect. */
+function timingVisibleRows(innerH: number, total: number): number {
+	return innerListRows(innerH, total);
+}
+
+/** Rows `drawLog` paints: one summary/scroll row above the first event, then one inner row per event. */
+function logVisibleRows(innerH: number): number {
+	return Math.max(0, innerH - 1);
+}
+
+/** The panes made of one row per entry (D11). The galaxy is clickable too, but it is not a list (D13). */
+export type ListPane = "timing" | "log" | "status";
+
+/**
+ * Rows this pane actually painted, given its `frame()` inner rect and row list
+ * length — `0` when the draw layer paints nothing at all at this size.
+ *
+ * This is the mouse hit-test's single source of truth (view.ts, D11): row `i` of a
+ * pane sits on cell `inner.y + 1 + i` and every row is painted across the pane's
+ * inner columns, so "the cell carries an agent" is exactly
+ * `0 <= y - (inner.y + 1) < visibleListRows(...)`. The width floors below are the
+ * draw functions' own early returns, kept here rather than duplicated at the
+ * click site.
+ */
+export function visibleListRows(pane: ListPane, inner: Rect, total: number): number {
+	switch (pane) {
+		case "log":
+			return inner.w < 8 || inner.h < 2 ? 0 : logVisibleRows(inner.h);
+		case "timing":
+			return inner.w < 8 || inner.h < 2 ? 0 : timingVisibleRows(inner.h, total);
+		case "status":
+			// `drawStatus` needs `statusColumns()` (20 columns) before it paints a row.
+			return inner.w < 20 || inner.h < 2 ? 0 : innerListRows(inner.h, total);
+	}
 }
 
 /** Shared empty list: `map.get(id) ?? []` allocated one array per miss, per pass (~200/frame). */
@@ -320,16 +380,97 @@ function enterPanel(fn: "drawGalaxy" | "drawChart"): void {
 	g.painting = true;
 }
 
-export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: string | undefined): void {
+export function drawGalaxy(
+	cv: Canvas,
+	r: Rect,
+	data: ViewData,
+	selectedId: string | undefined,
+	discs?: GalaxyDiscs,
+): void {
 	// The gate comes before `begin`: a nested call must not wipe the containers the
 	// outer frame is still painting from before it throws.
 	enterPanel("drawGalaxy");
 	try {
 		g.begin(r);
-		paintGalaxy(cv, r, data, selectedId);
+		paintGalaxy(cv, r, data, selectedId, discs);
 	} finally {
 		g.painting = false;
 	}
+}
+
+/**
+ * D13: where one painted galaxy frame's node discs are, in **pane-local pixel**
+ * coordinates — the braille grid's own space (2 pixels per cell column, 4 per
+ * cell row), which is also the space `paintGalaxy` lays the nodes out in.
+ *
+ * The painter writes it as it already computes `posX/posY` and `radii`, so a
+ * click needs no braille-cell reverse lookup and no second copy of the layout
+ * math: hit = "the nearest disc whose ellipse (plus one cell of slack) covers the
+ * clicked cell's centre".
+ *
+ * Parallel arrays behind `count` (not one object per node), filled **in place**
+ * frame after frame: the caller owns the sink, so a frame allocates nothing for
+ * it (#364), and a per-component sink cannot alias another painter's frame the way
+ * the process-wide scratch would. `count` is the only field a reader trusts; the
+ * tails above it hold last frame's values on purpose.
+ */
+export interface GalaxyDiscs {
+	ids: string[];
+	xs: number[];
+	ys: number[];
+	/** Half-axes: the centre sphere is drawn `1.6×` wide (`xs` in `paintGalaxy`), every other disc is round. */
+	rxs: number[];
+	rys: number[];
+	count: number;
+}
+
+/** An empty sink for `drawGalaxy` / `renderLegionView` to fill in place. */
+export function emptyGalaxyDiscs(): GalaxyDiscs {
+	return { ids: [], xs: [], ys: [], rxs: [], rys: [], count: 0 };
+}
+
+/**
+ * Slack added to every disc when a click is resolved, in the painter's pixels.
+ *
+ * A click carries a *cell*, and the cell's centre sits up to 1 pixel (2 columns)
+ * and 2 pixels (4 rows) away from any point of it — so a disc that is painted in
+ * the cell must still be hit when the cell's centre is just outside its radius.
+ */
+const GALAXY_HIT_SLACK = 2;
+
+/**
+ * D13: the node whose disc covers cell `(x, y)` — the click side of `drawGalaxy`.
+ *
+ * `r` is the pane's `frame()` inner rect (exactly what `drawGalaxy` painted into)
+ * and `discs` the record that same paint left behind. Overlapping discs resolve to
+ * the **nearest centre**; the legend row, the pane's border cell and every pixel
+ * outside a disc are `undefined`, so the host keeps dispatching them.
+ */
+export function galaxyHitAt(r: Rect, discs: GalaxyDiscs, x: number, y: number): string | undefined {
+	// -1: the legend line (`paintGalaxy` lays the star field out on `r.h - 1` rows).
+	if (x < r.x || x >= r.x + r.w || y < r.y || y >= r.y + r.h - 1) return undefined;
+	if (discs.count === 0) return undefined;
+	// Cell (i, j) covers pixels [2i, 2i+1] × [4j, 4j+3]; its centre in the painter's
+	// space is therefore (2i + 1, 4j + 1.5).
+	const px = 2 * (x - r.x) + 1;
+	const py = 4 * (y - r.y) + 1.5;
+	let bestId: string | undefined;
+	let bestDist = Number.POSITIVE_INFINITY;
+	for (let i = 0; i < discs.count; i++) {
+		const dx = px - discs.xs[i]!;
+		const dy = py - discs.ys[i]!;
+		// Ellipse membership (the inflated half-axes), so a hit is the shape that was
+		// drawn — then the *nearest centre* wins when two discs overlap.
+		const nx = dx / (discs.rxs[i]! + GALAXY_HIT_SLACK);
+		const ny = dy / (discs.rys[i]! + GALAXY_HIT_SLACK);
+		if (nx * nx + ny * ny > 1) continue;
+		const dist = Math.hypot(dx, dy);
+		if (dist < bestDist) {
+			bestDist = dist;
+			bestId = discs.ids[i]!;
+		}
+	}
+	return bestId;
 }
 
 /**
@@ -337,7 +478,10 @@ export function drawGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: stri
  * `begin` ran before the size check, so no early return below can leave a
  * container dirty for the next frame.
  */
-function paintGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: string | undefined): void {
+function paintGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: string | undefined, discs?: GalaxyDiscs): void {
+	// D13: the sink describes THIS frame, so it is emptied before any early return —
+	// a pane too small to paint must not leave last frame's discs clickable.
+	if (discs) discs.count = 0;
 	if (r.w < 6 || r.h < 3) return;
 	const legendRows = 1;
 	const CW = r.w;
@@ -481,6 +625,18 @@ function paintGalaxy(cv: Canvas, r: Rect, data: ViewData, selectedId: string | u
 			}
 		}
 		const xs = isCenter ? 1.6 : 1;
+		// D13: record what was just painted, before the selection ring inflates `rad`
+		// (+3 is a halo, not the disc). The virtual root is the run, not a node: it has
+		// no id the host could open, so it is deliberately not clickable.
+		if (discs && node !== virtualRoot) {
+			const n = discs.count;
+			discs.ids[n] = node.id;
+			discs.xs[n] = x;
+			discs.ys[n] = y;
+			discs.rxs[n] = rad * xs;
+			discs.rys[n] = rad;
+			discs.count = n + 1;
+		}
 		for (let yy = -Math.ceil(rad); yy <= Math.ceil(rad); yy++) {
 			for (let xx = -Math.ceil(rad * xs); xx <= Math.ceil(rad * xs); xx++) {
 				if (hypot2(xx / xs, yy) <= rad) dot(x + xx, y + yy, col, 3);
@@ -923,7 +1079,7 @@ export function drawLog(
 	const maxX = r.x + r.w;
 	const filter = state.selectedId ? events.find((e) => e.node.id === state.selectedId)?.node.name : undefined;
 	cv.text(r.x, r.y, ellipsize(`${events.length} events${filter ? ` · highlight: ${filter}` : ""}`, r.w), "dim", { maxX });
-	const rows = r.h - 1;
+	const rows = visibleListRows("log", r, events.length);
 	const maxDepth = Math.max(1, ...events.map((e) => e.node.depth));
 	const graphW = Math.min(8, maxDepth * 2);
 	const timeW = 7;
@@ -1042,7 +1198,7 @@ export function drawTiming(
 	cv.text(r.x, r.y, ellipsize(header, r.w), "dim");
 
 	const footerH = rows.length > 0 && r.h >= 4 ? 1 : 0;
-	const rowsAvail = Math.max(0, r.h - 1 - footerH);
+	const rowsAvail = visibleListRows("timing", r, rows.length);
 	for (let i = 0; i < rowsAvail; i++) {
 		const index = state.offset + i;
 		const row = rows[index];
@@ -1191,9 +1347,7 @@ export function statusColumns(width: number): StatusColumn[] | undefined {
  * own arithmetic instead of the off-by-one `layout.h - 3` it uses for timing.
  */
 export function statusVisibleRows(outerH: number, total: number): number {
-	const innerH = Math.max(0, outerH - 2);
-	const footerH = total > 0 && innerH >= 4 ? 1 : 0;
-	return Math.max(0, innerH - 1 - footerH);
+	return innerListRows(Math.max(0, outerH - 2), total);
 }
 
 /** `unknown` for a missing mode (D6): a legacy row is not evidence of `rpc`. */
@@ -1271,7 +1425,7 @@ export function drawStatus(
 	const maxX = r.x + r.w;
 	const rows = statusRowsFromNodes(nodes);
 	const footerH = rows.length > 0 && r.h >= 4 ? 1 : 0;
-	const rowsAvail = Math.max(0, r.h - 1 - footerH);
+	const rowsAvail = visibleListRows("status", r, rows.length);
 
 	// Header: labels only. Panel content never lands on the title rule.
 	let x = r.x;

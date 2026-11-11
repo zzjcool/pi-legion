@@ -52,7 +52,7 @@ import type {
 	SupervisorEvent,
 } from "../supervisor/types.ts";
 import type { LegionEvent, LegionEventBus } from "./event-bus.ts";
-import { LEGION_EVENT_TYPES } from "./event-bus.ts";
+import { LEGION_EVENT_TYPES, isDetailDeltaEvent } from "./event-bus.ts";
 import { createDbEventSource, type DbEventSource } from "./event-bus.ts";
 import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
 import { getSubtree } from "../legion/nodes.ts";
@@ -2172,7 +2172,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	};
 	const busUnsubscribers = deps.eventBus
 		? LEGION_EVENT_TYPES
-			.filter((type) => type !== "text_delta")
+			// D18 (`viewer-transcript-parity-v1` §9): streamed-detail chunks never change
+			// tree state, so subscribing the widget painter to them would pay a
+			// synchronous SQLite subtree scan + a widget repaint per token (#261). One
+			// predicate, three call sites — the live overlay and the classic tree view
+			// call the same `isDetailDeltaEvent`.
+			.filter((type) => !isDetailDeltaEvent(type))
 			.map((type) => deps.eventBus!.on(type, onWidgetEvent))
 		: [];
 

@@ -1,6 +1,6 @@
 /** /legion full view: galaxy + tok/s chart + timing + git-log history with linked selection. */
 
-import { Key, matchesKey } from "@earendil-works/pi-tui";
+import { Key, matchesKey, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Canvas, cellWidth, ellipsize } from "./canvas.ts";
 import { computeLayout, type LayoutKind, type LegionLayout } from "./layout.ts";
 import { formatCount, formatDuration, isAgent, type VizNode } from "./model.ts";
@@ -13,11 +13,19 @@ import {
 	drawLog,
 	drawStatus,
 	drawTiming,
+	emptyGalaxyDiscs,
 	frame,
+	galaxyHitAt,
+	paneInner,
 	statusRowsFromNodes,
 	statusVisibleRows,
 	timingRowsFromNodes,
+	visibleListRows,
+	type GalaxyDiscs,
+	type ListPane,
+	type LogEvent,
 	type Pane,
+	type TimingRow,
 	type ViewData,
 } from "./panels.ts";
 
@@ -97,12 +105,117 @@ export function paintPageFloor(theme: VizTheme, lines: readonly string[]): strin
 	return lines.map((line) => theme.bg?.(LEGION_PAGE_BG, line) ?? line);
 }
 
+/** Row lists a frame painted, by pane: the very arrays `renderLegionView` drew (D11). */
+export interface PaintedViewRows {
+	log: readonly LogEvent[];
+	timing: readonly TimingRow[];
+	status: readonly VizNode[];
+}
+
+/**
+ * The last painted frame as the mouse sees it (D11).
+ *
+ * The hit-test runs off a *snapshot of what was painted*, not off a fresh
+ * `getData()`: the page only repaints on `refreshMs` (1s), so rebuilding the row
+ * lists at click time could open the agent that moved into that row after the
+ * frame the user is looking at. The galaxy discs work the same way: the component
+ * owns the sink, the paint fills it, and the click reads it.
+ */
+export interface PaintedView {
+	rects: LegionLayout;
+	rows: PaintedViewRows;
+	/** Row 0 of a list pane is its entry `offsets[pane]` — the scroll offset of that painted frame. */
+	offsets: Record<ListPane, number>;
+	/** D13: the discs this frame's `drawGalaxy` laid out (in pane-local pixels). */
+	galaxy: GalaxyDiscs;
+}
+
+/** Panes a click can open an agent from: the three lists (D11) and the star map (D13). */
+export type ClickablePane = ListPane | "galaxy";
+
+export interface ViewHit {
+	pane: ClickablePane;
+	/** Index into that pane's row list — list panes only; the galaxy has no cursor. */
+	index?: number;
+	nodeId: string;
+}
+
+const CLICKABLE_PANES: readonly ListPane[] = ["timing", "log", "status"];
+
+function clickRowCount(rows: PaintedViewRows, pane: ListPane): number {
+	switch (pane) {
+		case "log":
+			return rows.log.length;
+		case "timing":
+			return rows.timing.length;
+		case "status":
+			return rows.status.length;
+	}
+}
+
+function clickNodeId(rows: PaintedViewRows, pane: ListPane, index: number): string | undefined {
+	switch (pane) {
+		case "log":
+			return rows.log[index]?.node.id;
+		case "timing":
+			return rows.timing[index]?.node.id;
+		case "status":
+			return rows.status[index]?.id;
+	}
+}
+
+/**
+ * D11/D13: the agent painted on cell `(x, y)`, or `undefined` when that cell
+ * carries no agent.
+ *
+ * `timing` / `log` / `status` each paint one row per entry at a known offset
+ * (`row i` on `inner.y + 1 + i`) and stop at their last entry, so the cell → entry
+ * mapping is exact: borders, titles, the log's summary line, the footer and the
+ * blank space under a short list are all misses.
+ *
+ * `galaxy` is resolved by `galaxyHitAt` from the discs the painter recorded: the
+ * nearest node whose disc covers the cell (overlaps → nearest centre; empty star
+ * field, legend row and the virtual centre sphere → miss).
+ *
+ * `chart` is a rate histogram, not nodes: it is never clickable.
+ */
+export function viewHitAt(painted: PaintedView, x: number, y: number): ViewHit | undefined {
+	for (const pane of CLICKABLE_PANES) {
+		const inner = paneInner(painted.rects[pane]);
+		if (!inner) continue;
+		if (x < inner.x || x >= inner.x + inner.w) continue;
+		const row = y - (inner.y + 1);
+		if (row < 0 || row >= visibleListRows(pane, inner, clickRowCount(painted.rows, pane))) continue;
+		// Geometry says "a row is painted here"; the list says which entry. A list
+		// shorter than the pane leaves the tail blank (the draws `break` on the
+		// first missing entry), so an index past the end is a miss too.
+		const index = painted.offsets[pane] + row;
+		const nodeId = clickNodeId(painted.rows, pane, index);
+		if (nodeId === undefined) continue;
+		return { pane, index, nodeId };
+	}
+	const galaxy = paneInner(painted.rects.galaxy);
+	if (galaxy) {
+		const nodeId = galaxyHitAt(galaxy, painted.galaxy, x, y);
+		if (nodeId !== undefined) return { pane: "galaxy", nodeId };
+	}
+	return undefined;
+}
+
 /**
  * #364 A5: `reuse` lets the production render path paint into the canvas it
  * painted last frame, which is the difference between W×H fresh cell objects and
  * W×H in-place field writes (+190KB/472KB per frame). It is optional and
  * size-checked, so `new Canvas(W, H)` keeps its exact old semantics and cost for
  * every other caller — including the tests that hold the grid they got back.
+ *
+ * D11: the return value also carries the frame's own rectangles and row lists, so
+ * the mouse hit-test resolves a cell against exactly what was painted (see
+ * `PaintedView`).
+ *
+ * D13: `discs` is an optional caller-owned sink that `drawGalaxy` fills in place
+ * with this frame's node discs (see `GalaxyDiscs`) — the click side of the star
+ * map. Omit it and the frame is byte-for-byte what it was.
  */
 export function renderLegionView(
 	data: ViewData,
@@ -110,7 +223,8 @@ export function renderLegionView(
 	cols: number,
 	rows: number,
 	reuse?: Canvas,
-): { canvas: Canvas; layout: LayoutKind } {
+	discs?: GalaxyDiscs,
+): { canvas: Canvas; layout: LayoutKind; rects: LegionLayout; rows: PaintedViewRows } {
 	const W = Math.max(1, Math.floor(cols));
 	const H = Math.max(6, Math.floor(rows));
 	const layout = computeLayout(W, H, { logEvents: buildLog(data.nodes).length });
@@ -160,7 +274,7 @@ export function renderLegionView(
 	}
 
 	const galaxyInner = frame(cv, layout.galaxy, portrait ? "galaxy" : "galaxy · structure", state.focus === "galaxy");
-	drawGalaxy(cv, galaxyInner, data, state.selectedId);
+	drawGalaxy(cv, galaxyInner, data, state.selectedId, discs);
 	const chartInner = frame(cv, layout.chart, portrait ? "tok/s · by role" : "tok/s · stacked by role", state.focus === "chart");
 	drawChart(cv, chartInner, data, selected, !portrait);
 
@@ -222,7 +336,7 @@ export function renderLegionView(
 		cv.text(0, fy, `Stop ${pending.name}? Its own subagents are retired with it.`, "warning", { bold: true, maxX: W - 1 });
 		const yn = "  y stop · any other key cancel";
 		cv.text(Math.min(W - 1, Array.from(`Stop ${pending.name}? Its own subagents are retired with it.`).length), fy, yn, "dim", { maxX: W - 1 });
-		return { canvas: cv, layout: layout.kind };
+		return { canvas: cv, layout: layout.kind, rects: layout, rows: { log: events, timing: timingRows, status: statusRows } };
 	}
 	let fx = 0;
 	for (const [key, label] of keys) {
@@ -233,7 +347,12 @@ export function renderLegionView(
 		fx += w;
 	}
 	if (W - right.length > fx) cv.text(W - right.length, fy, right, "accent", { bold: true });
-	return { canvas: cv, layout: layout.kind };
+	// D11: `rects` and `rows` are what the mouse hit-test needs to map a cell back
+	// to the agent painted on it. They are handed back rather than rebuilt by the
+	// caller: the row lists are this frame's own arrays (no second pass over the
+	// nodes, no divergence from what was actually painted), and `layout` alone is
+	// the kind, not the rectangles.
+	return { canvas: cv, layout: layout.kind, rects: layout, rows: { log: events, timing: timingRows, status: statusRows } };
 }
 
 function statusLabel(node: VizNode): string {
@@ -402,6 +521,17 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 		 * all the page ever needs — no per-frame W×H allocation.
 		 */
 		let frameCanvas: Canvas | undefined;
+		/**
+		 * D11: the last painted frame as the mouse sees it (`undefined` before the first
+		 * paint), so a click resolves against the rows and rects the user is looking at.
+		 */
+		let painted: PaintedView | undefined;
+		/**
+		 * D13: this component's own disc sink. The painter fills it in place every
+		 * frame (#364: no per-frame allocation) and `painted` points at it, so a click
+		 * reads exactly this page's last frame — never another painter's.
+		 */
+		const galaxy = emptyGalaxyDiscs();
 		let closed = false;
 		const close = (): void => {
 			if (closed) return;
@@ -417,9 +547,15 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 				// asks for the whole terminal — the same `terminal.rows` self-sizing the
 				// classic tree view does in `src/tui/tree-view.ts`.
 				const rows = Math.max(6, tui.terminal.rows ?? 24);
-				panes = availablePanes(computeLayout(width, rows));
-				const rendered = renderLegionView(options.getData(), state, width, rows, frameCanvas);
+				const rendered = renderLegionView(options.getData(), state, width, rows, frameCanvas, galaxy);
 				frameCanvas = rendered.canvas;
+				panes = availablePanes(rendered.rects);
+				painted = {
+					rects: rendered.rects,
+					rows: rendered.rows,
+					offsets: { log: state.logOffset, timing: state.timingOffset, status: state.statusOffset },
+					galaxy,
+				};
 				return paintPageFloor(theme, rendered.canvas.toLines(theme));
 			},
 			handleInput(data: string): void {
@@ -439,10 +575,49 @@ export function createLegionViewFactory(options: LegionViewOptions) {
 				}
 				tui.requestRender();
 			},
+			/**
+			 * D11/D13: a left click on an agent row (`status` / `timing` / `log`) or on a
+			 * galaxy disc opens that agent, exactly as `o`/Enter does on the keyboard —
+			 * same `onOpenNode`, same selection left behind (focus on the pane, its cursor
+			 * on the row where the pane has one, `selectedId` on the agent), so `o` / `x` /
+			 * the arrows keep working on what was clicked.
+			 *
+			 * Only `click` is an open gesture, never `press`: the host delivers
+			 * press → release → click for one physical click, so handling both would open
+			 * the overlay twice. Everything off an agent returns `undefined` — borders,
+			 * titles, the log summary line, the blank tail under a short list, empty star
+			 * field, the galaxy legend row, the chart — and the host keeps dispatching it.
+			 */
+			handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+				if (event.type !== "click" || event.button !== "left") return undefined;
+				if (!painted) return undefined;
+				const hit = viewHitAt(painted, event.x, event.y);
+				if (!hit) return undefined;
+				state.focus = hit.pane;
+				// The galaxy has no cursor: its selection state IS `selectedId`.
+				if (hit.index !== undefined) {
+					switch (hit.pane) {
+						case "log":
+							state.logCursor = hit.index;
+							break;
+						case "timing":
+							state.timingCursor = hit.index;
+							break;
+						case "status":
+							state.statusCursor = hit.index;
+							break;
+					}
+				}
+				state.selectedId = hit.nodeId;
+				options.onOpenNode?.(hit.nodeId);
+				tui.requestRender();
+				return { handled: true, focus: true };
+			},
 			invalidate(): void {},
 			dispose(): void {
 				clearInterval(timer);
 				frameCanvas = undefined;
+				painted = undefined;
 			},
 		};
 	};
