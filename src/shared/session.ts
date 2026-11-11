@@ -745,16 +745,49 @@ export function parseSessionFile(path: string): ParsedSession {
 }
 
 /**
- * Upper bound on the file-level (`size`, `mtimeMs`) parse cache below.
+ * Floor of the file-level (`size`, `mtimeMs`) parse cache below; the cap doubles
+ * to `SESSION_FILE_CACHE_CEILING` on observed thrash (#391 D3).
  *
  * Same reasoning as {@link SESSION_CACHE_MAX_ENTRIES}: the number of distinct
  * session files one status sweep touches is bounded by the session history, so
  * the cap must sit above the sweep size for the cache to have any hit rate at
  * all. 256 covers a long session's ledger rows (issue #348 measured 151 files
- * across three scenarios) while staying a hard memory bound — an entry holds
- * one projected `ParsedSession`, i.e. turns/assistants/usage, not the raw JSONL.
+ * across three scenarios) — but "above the sweep" is a property no constant can
+ * keep. #391 measured 279 rows over 279 distinct files: the 256-entry cap
+ * evicted a file before the same sweep came back to it, so the hit rate was
+ * *exactly* 0 (not degraded — zero), and every 500 ms tick re-read 134.5 MB
+ * (142-148 MB/s `rchar`, 126-133 % CPU).
+ *
+ * The cap is therefore adaptive, and *caller-free* (D3 rejects the issue's
+ * `sweepSize × 1.2`: that would need a second parameter on a one-argument gate
+ * with four call sites). Two of those callers — `/legion summary` and
+ * `/legion timing` — sweep through `session-map.ts` with no notion of a "tick"
+ * at all, so a caller-reported size would have to be wrong for one of the two
+ * readers in the same process. The cache instead grows on *observed thrash*: a
+ * miss for a path this cache itself evicted (and has not re-admitted since)
+ * means the cap sat below the working set, so the cap doubles, up to the ceiling,
+ * and the eviction memory is dropped.
+ *
+ * The ceiling keeps the #349 rule that a resident cache is a hard bound rather
+ * than a knob that follows history: an entry holds one projected
+ * `ParsedSession` (turns/assistants/usage — never the raw JSONL). Measured on
+ * this checkout, a projected parse is ~0.226 of the transcript's bytes, i.e.
+ * ~110 KB for the reported 482 KB mean — so the worst case moves from 256 ×
+ * ~110 KB (~28 MB) to 512 × ~110 KB (~57 MB), and no further. The issue's
+ * suggested 1024-entry guard was rejected for that reason. Steady state is what
+ * matters more: D1's active/terminal split keeps the cache at the number of
+ * *live* files, so the extra headroom is only paid by a workload genuinely
+ * sweeping more live files than the floor.
  */
 export const SESSION_FILE_CACHE_MAX_ENTRIES = 256;
+
+/**
+ * Hard upper bound on the adaptive cap (#391 D3). One doubling clears the
+ * measured 279-file cliff with headroom; anything larger is a working set that
+ * grows with history, which is what D1 removes rather than what this cap grows
+ * for.
+ */
+const SESSION_FILE_CACHE_CEILING = SESSION_FILE_CACHE_MAX_ENTRIES * 2;
 
 interface SessionFileCacheEntry {
 	/** Byte length at the time of the parse; a grow means bytes were appended. */
@@ -765,6 +798,32 @@ interface SessionFileCacheEntry {
 }
 
 const sessionFileCache = new Map<string, SessionFileCacheEntry>();
+
+/**
+ * Thrash evidence (#391 D3): the paths this cache itself evicted, oldest first.
+ *
+ * A miss for one of these means the file is needed again after this cache
+ * dropped it and before anything re-admitted it — the only signal available
+ * without being told how big a sweep is. Wider than "within one sweep" on
+ * purpose: `parseSessionFileCached` cannot tell a tick from a one-shot
+ * `/legion summary`, and a stale piece of evidence can only double the bound
+ * once, never answer a lookup wrongly. Bounded at the ceiling like the cache:
+ * forgetting the oldest evidence can only delay a doubling.
+ */
+const sessionFileCacheEvicted = new Set<string>();
+
+/** Record one eviction as thrash evidence, keeping the evidence bounded (#391 D3). */
+function rememberSessionFileEviction(path: string): void {
+	sessionFileCacheEvicted.add(path);
+	if (sessionFileCacheEvicted.size > SESSION_FILE_CACHE_CEILING) {
+		const stale = sessionFileCacheEvicted.keys().next().value;
+		if (stale !== undefined) sessionFileCacheEvicted.delete(stale);
+	}
+}
+
+/** Cap in force right now: the #348 floor until thrash doubles it (#391 D3). */
+let sessionFileCacheCap = SESSION_FILE_CACHE_MAX_ENTRIES;
+
 let sessionFileCacheHits = 0;
 let sessionFileCacheMisses = 0;
 
@@ -773,6 +832,12 @@ export interface SessionFileCacheStats {
 	hits: number;
 	misses: number;
 	size: number;
+	/**
+	 * The bound currently enforced, so a test or the bench can see the grown cap
+	 * instead of inferring it from `size`: `SESSION_FILE_CACHE_MAX_ENTRIES` until
+	 * observed thrash doubles it, at most to twice that (#391 D3).
+	 */
+	cap: number;
 	/**
 	 * `statSync` calls the gate has made. One per call by construction, so this
 	 * is how a caller counts the *cost* of the gate itself: an unchanged file
@@ -791,13 +856,16 @@ export function sessionFileCacheStats(): SessionFileCacheStats {
 		hits: sessionFileCacheHits,
 		misses: sessionFileCacheMisses,
 		size: sessionFileCache.size,
+		cap: sessionFileCacheCap,
 		statCalls: sessionFileCacheStatCalls,
 	};
 }
 
-/** Test hook: drop the file-level cache and zero its counters. */
+/** Test hook: drop the file-level cache, reset the adaptive cap and its thrash evidence, and zero the counters. */
 export function clearSessionFileCache(): void {
 	sessionFileCache.clear();
+	sessionFileCacheEvicted.clear();
+	sessionFileCacheCap = SESSION_FILE_CACHE_MAX_ENTRIES;
 	sessionFileCacheHits = 0;
 	sessionFileCacheMisses = 0;
 	sessionFileCacheStatCalls = 0;
@@ -883,10 +951,24 @@ export function parseSessionFileCached(path: string): ParsedSession {
 	if (parsed.turns.length === 0 && parsed.tornLines === 0 && stat.size > 0) {
 		return cacheSafeCopy(parsed);
 	}
+	// #391 D3 — thrash detection, and it must run before the eviction below: this
+	// call is a MISS for a path this cache itself evicted, i.e. the file is needed
+	// again within the same round that dropped it. That is the signature of a cap
+	// below one sweep's working set (279 files against 256 gave a hit rate of
+	// exactly 0), so double the cap once and drop the evidence — the new cap
+	// already covers that batch, so replaying it would only re-grow the set. The
+	// failed-stat and failed-read paths above return before this and never grow
+	// anything: neither says a word about how many files a sweep touches.
+	if (sessionFileCacheEvicted.delete(path)) {
+		sessionFileCacheCap = Math.min(SESSION_FILE_CACHE_CEILING, sessionFileCacheCap * 2);
+		sessionFileCacheEvicted.clear();
+	}
 	sessionFileCache.delete(path);
-	if (sessionFileCache.size >= SESSION_FILE_CACHE_MAX_ENTRIES) {
+	while (sessionFileCache.size >= sessionFileCacheCap) {
 		const oldest = sessionFileCache.keys().next().value;
-		if (oldest !== undefined) sessionFileCache.delete(oldest);
+		if (oldest === undefined) break;
+		sessionFileCache.delete(oldest);
+		rememberSessionFileEviction(oldest);
 	}
 	sessionFileCache.set(path, { size: stat.size, mtimeMs: stat.mtimeMs, parsed });
 	// Hand out a copy: the freshly parsed value is the cached one now.

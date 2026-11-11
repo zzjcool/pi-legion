@@ -7,8 +7,9 @@
  *
  * These cases pin the contract of `parseSessionFileCached`: an unchanged file
  * is answered from `stat` alone, an append or a same-length rewrite is visible,
- * a read failure is never cached as "empty", the bound is a hard LRU limit, and
- * a caller cannot poison the entry.
+ * a read failure is never cached as "empty", the bound is a hard LRU limit that
+ * doubles once when the sweep it serves provably outgrew it (#391 D3), and a
+ * caller cannot poison the entry.
  */
 
 import { test } from "node:test";
@@ -54,7 +55,13 @@ test("#348: an unchanged session file is parsed once, then served from the stat 
 		const second = parseSessionFileCached(file);
 		const third = parseSessionFileCached(file);
 
-		assert.deepEqual(sessionFileCacheStats(), { hits: 2, misses: 1, size: 1, statCalls: 3 });
+		assert.deepEqual(sessionFileCacheStats(), {
+			hits: 2,
+			misses: 1,
+			size: 1,
+			cap: SESSION_FILE_CACHE_MAX_ENTRIES,
+			statCalls: 3,
+		});
 		assert.equal(second.turns.length, first.turns.length);
 		assert.equal(third.lastTurnOutput, "two");
 		// two assistant messages, each `output: 2` — the fold totals them.
@@ -162,11 +169,92 @@ test("#348: the file cache is a hard bound and evicts the least-recently-used pa
 		assert.equal(sessionFileCacheHas(files[1] as string), false, "the least-recently-used entry is the one evicted");
 		assert.equal(sessionFileCacheHas(overflow), true);
 
-		// And the evicted path is a real miss next time, not a silent stale hit.
+		// And the evicted path is a real miss next time, not a silent stale hit —
+		// and that miss is also the thrash signal of #391 D3: this cache itself
+		// dropped files[1], and the very next thing that needs it is the same round.
+		// A path re-needed right after eviction proves the cap sat below the working
+		// set, so the cap doubles once, and because the new cap has room the re-parsed
+		// path re-enters instead of evicting its neighbour.
 		const misses = sessionFileCacheStats().misses;
 		assert.equal(parseSessionFileCached(files[1] as string).lastTurnOutput, "turn-1");
 		assert.equal(sessionFileCacheStats().misses, misses + 1, "an evicted path is re-parsed, not served stale");
-		assert.equal(sessionFileCacheStats().size, SESSION_FILE_CACHE_MAX_ENTRIES);
+		assert.equal(
+			sessionFileCacheStats().cap,
+			SESSION_FILE_CACHE_MAX_ENTRIES * 2,
+			"re-needing an evicted path doubles the cap, once (#391 D3)",
+		);
+		assert.equal(
+			sessionFileCacheStats().size,
+			SESSION_FILE_CACHE_MAX_ENTRIES + 1,
+			"under the grown cap the re-parsed path re-enters instead of evicting another",
+		);
+		assert.equal(sessionFileCacheHas(files[1] as string), true, "the thrash miss is cached again, not dropped");
+	});
+});
+
+/*
+ * #391 D3 — the bound must follow the sweep instead of sitting just under it.
+ *
+ * The measured cliff is 279 ledger rows over 279 distinct session files against
+ * a 256-entry cap: `SESSION_FILE_CACHE_MAX_ENTRIES` sat *just* below the working
+ * set, so every sweep evicted files it was about to need again, and the hit rate
+ * was exactly 0 while the 500ms refresh re-read 134.5 MB per tick. This is that
+ * shape at 300 files, and it pins the recovery to the exact sweep: the first
+ * sweep fills the cap and drops `300 - MAX` paths, the second re-needs those
+ * paths (the first of them is the thrash signal, so the cap doubles and the rest
+ * re-enter instead of evicting each other), and by the third sweep every file is
+ * served from `stat` alone.
+ *
+ * Why growth cannot happen *inside* sweep 1, and why the all-hit sweep is the
+ * third and not the second: growth requires a miss for a path this cache itself
+ * evicted, and a sweep visits each path once. So with 300 files and a 256 cap,
+ * sweep 1 necessarily ends with 256 cached and 44 evicted, and sweep 2 must
+ * re-parse exactly those 44. `misses === 0` on a sweep of 300 is therefore only
+ * reachable once the cap already covers the sweep — i.e. from sweep 3 on.
+ */
+test("#391: a sweep larger than the cap doubles the cap once instead of thrashing forever", async () => {
+	await withTempDir((dir) => {
+		const files = Array.from({ length: 300 }, (_, i) => {
+			const file = path.join(dir, `s-${i}.jsonl`);
+			fs.writeFileSync(file, twoTurns(`turn-${i}`));
+			return file;
+		});
+		const sweep = (): void => {
+			for (const file of files) parseSessionFileCached(file);
+		};
+		const dropped = 300 - SESSION_FILE_CACHE_MAX_ENTRIES;
+		clearSessionFileCache();
+
+		// Sweep 1: cold, so 300 misses and no hit, and the cap keeps only the last
+		// MAX files. No path is revisited, so there is no thrash evidence yet.
+		sweep();
+		const first = sessionFileCacheStats();
+		assert.equal(first.misses, 300);
+		assert.equal(first.hits, 0);
+		assert.equal(first.cap, SESSION_FILE_CACHE_MAX_ENTRIES, "a sweep cannot grow the cap it is thrashing against");
+		assert.equal(first.size, SESSION_FILE_CACHE_MAX_ENTRIES);
+
+		// Sweep 2: the head of the file list is the first path sweep 1 evicted, so
+		// it is a miss with evidence — the cap doubles, and the remaining dropped
+		// paths re-enter under the grown cap. Everything sweep 1 kept is a hit.
+		sweep();
+		const second = sessionFileCacheStats();
+		assert.equal(second.misses - first.misses, dropped, "only the paths sweep 1 evicted are re-parsed");
+		assert.equal(second.hits - first.hits, SESSION_FILE_CACHE_MAX_ENTRIES, "every path sweep 1 kept is a hit");
+		assert.equal(second.cap, SESSION_FILE_CACHE_MAX_ENTRIES * 2, "the thrash miss doubles the cap, once");
+		assert.equal(second.size, 300, "the grown cap holds the whole sweep");
+		assert.equal(sessionFileCacheHas(files[0] as string), true, "the path that doubled the cap is cached again");
+
+		// Sweep 3 (warm): 100% hit rate — the guarantee the issue's acceptance is
+		// about, and the proof that the cache stopped thrashing for good.
+		sweep();
+		const third = sessionFileCacheStats();
+		const warmHits = third.hits - second.hits;
+		const warmMisses = third.misses - second.misses;
+		assert.equal(warmMisses, 0, "a warm sweep re-parses nothing");
+		assert.equal(warmHits, 300);
+		assert.equal(warmHits / (warmHits + warmMisses), 1, "hits/(hits+misses) after warm-up is 1.0");
+		assert.equal(third.cap, SESSION_FILE_CACHE_MAX_ENTRIES * 2, "the cap stays at the ceiling, not growing per sweep");
 	});
 });
 

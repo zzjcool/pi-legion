@@ -35,6 +35,7 @@ import {
 	type WidgetTui,
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
+import type { LiveProgress } from "../shared/progress.ts";
 import { readProcRss } from "../supervisor/proc-memory.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
 import { isTerminalState, liveness } from "./liveness.ts";
@@ -259,6 +260,26 @@ export interface SessionRuntimeDeps {
 }
 
 const DEFAULT_REFRESH_MS = 500;
+/**
+ * #391: how often a terminal row's progress may be re-read.
+ *
+ * `LiveProgress` is a pure function of the session file — `progressFromSession`
+ * never reads a clock, every field is folded content — so a row whose transcript
+ * has stopped growing needs to be folded once, not twice a second. The window is
+ * not cosmetic: several paths stamp a terminal status before the transcript is
+ * final (the shutdown hook retires still-running children and only then drains
+ * them, `liveness()` can render a dead row as `failed`, a terminal event
+ * override can outrun the ledger), so those values must converge rather than
+ * freeze. 279 files per 30s is ~9 stats/s against the 279 folds per 500ms this
+ * replaces (134.5MB/tick in the reported session).
+ */
+const TERMINAL_PROGRESS_TTL_MS = 30_000;
+
+/** The row statuses whose transcript is final — the ones `statusEntryFromNode` stamps `finishedAt` on. */
+function isFinalRowStatus(status: TreeNodeSnapshot["status"]): boolean {
+	return status === "settled" || status === "failed" || status === "retired";
+}
+
 /**
  * How long a ledger heartbeat stays trustworthy (D3/D7).
  *
@@ -831,6 +852,20 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	});
 	const tree = new Map<string, TreeNodeSnapshot>();
 	const activity = new Map<string, NodeActivity>();
+	/**
+	 * #391 A: terminal-row progress, keyed by node id.
+	 *
+	 * Keyed by row (not by session file) because `updatedAt` is the "this row
+	 * settled again" guard and two rows over one transcript carry different
+	 * stamps — keyed by file, the second row would look like a re-settle and
+	 * re-fold the file on every tick. `sessionFile` is part of the guard so a row
+	 * that is pointed at a different transcript re-reads it. Pruned by the same
+	 * rule as `activity`: the tree no longer has the node.
+	 */
+	const terminalProgress = new Map<
+		string,
+		{ sessionFile: string; updatedAt: number; progress: LiveProgress; checkedAt: number }
+	>();
 	const eventOverrides = new Map<string, { ts: number; status?: TreeNodeSnapshot["status"]; phase?: string }>();
 	let ledgerDb: DatabaseSync | undefined;
 	let dbEventSource: DbEventSource | undefined;
@@ -1622,6 +1657,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			}
 			for (const nodeId of activity.keys()) if (!tree.has(nodeId)) activity.delete(nodeId);
 			for (const nodeId of eventOverrides.keys()) if (!tree.has(nodeId)) eventOverrides.delete(nodeId);
+			// #391: a memoized terminal progress belongs to the rows the tree still owns.
+			// Without this the map would outlive a collapsed subtree forever. A transient
+			// empty snapshot (no ledger identity this tick) drops the memo and costs one
+			// re-fold per row afterwards — bounded, and only on that path.
+			for (const nodeId of terminalProgress.keys()) if (!tree.has(nodeId)) terminalProgress.delete(nodeId);
 		}
 		const nodes = [...tree.values()].map((node) => ({ ...node }));
 		return mergePhaseMachines(mergeSpawnModes(nodes));
@@ -1741,8 +1781,57 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		};
 	};
 
+	/**
+	 * #391 A: the sweep's progress for a terminal row.
+	 *
+	 * `undefined` means "this row is live" — the caller then parses the file itself,
+	 * because a live transcript is still growing. A terminal row is answered from
+	 * the memo until its `updatedAt` moves (re-settled) or the TTL expires.
+	 */
+	const terminalProgressFor = (node: TreeNodeSnapshot): LiveProgress | undefined => {
+		if (!node.sessionFile || !isFinalRowStatus(node.status)) return undefined;
+		const at = now();
+		const cached = terminalProgress.get(node.id);
+		if (
+			cached &&
+			cached.sessionFile === node.sessionFile &&
+			cached.updatedAt === node.updatedAt &&
+			at - cached.checkedAt < TERMINAL_PROGRESS_TTL_MS
+		) {
+			return cached.progress;
+		}
+		const progress = progressFromSessionFile(node.sessionFile);
+		// Never memoize an EMPTY answer. `progressFromSessionFile` folds a missing or
+		// unreadable file to `{}`, and `session.ts` deliberately refuses to cache
+		// that (a pinned zero would outlive the failure — the "token rate reads 0
+		// for the agent's entire lifetime" regression). Keeping the same rule here
+		// costs one retry per tick for a metadata-only transcript, and nothing for
+		// the ordinary case: a settled file with content always yields fields.
+		if (Object.keys(progress).length === 0) return progress;
+		terminalProgress.set(node.id, {
+			sessionFile: node.sessionFile,
+			updatedAt: node.updatedAt,
+			progress,
+			checkedAt: at,
+		});
+		return progress;
+	};
+
 	const statusEntries = (): StatusEntry[] => {
 		const nodes = snapshotNodes();
+		/**
+		 * #391 C: one parse per distinct session file per sweep. Rows can share one
+		 * transcript (a re-followed job next to its ledger row, a resume that reuses
+		 * the path), and paying for it twice in one tick is pure waste.
+		 */
+		const liveByFile = new Map<string, LiveProgress>();
+		const liveFor = (file: string): LiveProgress => {
+			const cached = liveByFile.get(file);
+			if (cached) return cached;
+			const progress = progressFromSessionFile(file);
+			liveByFile.set(file, progress);
+			return progress;
+		};
 		const jobEntries = [...jobs.values()]
 			.filter((job) => job.state !== "retired")
 			.sort((a, b) => a.spawnedAt - b.spawnedAt)
@@ -1752,8 +1841,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				const identity = job.nodeId || mappedIdentity?.nodeId || storedNode
 					? identityForJob(job, storedNode)
 					: undefined;
+				// The memo is keyed by node; the job is only allowed to use it when both
+				// point at the same transcript (a re-followed record can disagree).
+				const live = (storedNode && storedNode.sessionFile === job.sessionFile
+					? terminalProgressFor(storedNode)
+					: undefined) ?? liveFor(job.sessionFile);
 				return statusEntryFromJob(
 					job,
+					live,
 					identity,
 					storedNode,
 					finished.get(job.name)?.snapshot.execution.status,
@@ -1765,7 +1860,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		for (const node of nodes) {
 			if (seen.has(node.id)) continue;
 			const details = activity.get(node.id);
-			persistedEntries.push(statusEntryFromNode(node, details, deps.getLiveDecode?.(node.name)));
+			const live = node.sessionFile ? terminalProgressFor(node) ?? liveFor(node.sessionFile) : undefined;
+			persistedEntries.push(statusEntryFromNode(node, live ?? {}, details, deps.getLiveDecode?.(node.name)));
 		}
 		return [...persistedEntries, ...jobEntries].sort((left, right) =>
 			(left.depth ?? 0) - (right.depth ?? 0) ||
@@ -2870,15 +2966,15 @@ function rssFor(job: TrackedJob): number | undefined {
 
 function statusEntryFromJob(
 	job: TrackedJob,
+	live: LiveProgress,
 	identity?: LegionTreeIdentity,
 	node?: TreeNodeSnapshot,
 	executionStatus?: string,
 	liveDecode?: number,
 ): StatusEntry {
-	const live = progressFromSessionFile(job.sessionFile);
 	const model = live.model ?? job.model ?? node?.model ?? undefined;
 	const thinking = job.thinking;
-	const terminalNode = node && (node.status === "settled" || node.status === "failed" || node.status === "retired");
+	const terminalNode = node && isFinalRowStatus(node.status);
 	const state = job.state !== "awaiting"
 		? job.state
 		: terminalNode ? node.status
@@ -2937,6 +3033,7 @@ function statusEntryFromJob(
 
 function statusEntryFromNode(
 	node: TreeNodeSnapshot,
+	live: LiveProgress,
 	activity?: NodeActivity,
 	liveDecode?: number,
 ): StatusEntry {
@@ -2948,18 +3045,19 @@ function statusEntryFromNode(
 	// An in-process child has no tracked job for its whole first run: spawnChild()
 	// awaits the whole agent run, so the job (and its sessionFile plumbing in
 	// statusEntryFromJob) does not exist yet. The node row does carry the session
-	// file, so parse it directly — otherwise the ledger only has a tokens_out row
-	// after settle and the token rate reads 0 for the agent's entire lifetime.
-	const live = node.sessionFile ? progressFromSessionFile(node.sessionFile) : {};
+	// file, so `statusEntries()` resolves its progress directly — otherwise the
+	// ledger only has a tokens_out row after settle and the token rate reads 0 for
+	// the agent's entire lifetime.
+	// #391: that resolution is the caller's job now, so a terminal row can be
+	// answered from the memo instead of a per-tick fold (`live` is `{}` when the
+	// row has no session file).
 	const tokensOut = live.tokensOut ?? node.tokensOut;
 	return {
 		name: node.name,
 		agent: node.role,
 		state: node.status,
 		startedAt: node.createdAt,
-		...(node.status === "settled" || node.status === "failed" || node.status === "retired"
-			? { finishedAt: node.updatedAt }
-			: {}),
+		...(isFinalRowStatus(node.status) ? { finishedAt: node.updatedAt } : {}),
 		...(node.phase ? { phase: node.phase } : {}),
 		...(node.kind ? { kind: node.kind } : {}),
 		...(node.model ? { model: node.model } : {}),
