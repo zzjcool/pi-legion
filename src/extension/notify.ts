@@ -145,6 +145,20 @@ export interface CompletionDetails {
 	acceptance?: { status: string; level?: string };
 	sessionFile?: string;
 	outputBytes: number;
+	/**
+	 * P5c (D9): present ONLY when the body is a preview of a longer text. `bytes` is the
+	 * head that was shown, `ofBytes` the text it stands for — the collapsed row prints
+	 * them as `preview 4.0 KB of 24.5 KB` instead of letting the preview's size read as
+	 * the child's output size (the mislabel D9 exists for).
+	 */
+	preview?: { bytes: number; ofBytes: number };
+	/**
+	 * P5c (D9): the result-ledger artifacts this notice speaks about (§3 D1 ids),
+	 * passed through from the entries. Rendering ignores it; it is the machine field a
+	 * later reader (or a diagnostic) locates the notice's text with. Absent — never an
+	 * empty array — when no entry had an artifact.
+	 */
+	artifactIds?: string[];
 	recycled?: boolean;
 }
 
@@ -205,11 +219,50 @@ export function formatNoticeHeadline(details: CompletionDetails): string {
 			`acceptance ${sanitizeNoticeField(details.acceptance.status)}${level}`,
 		);
 	}
-	bits.push(formatSize(details.outputBytes));
+	// D9/P5c: a preview's size is NOT the result's size. When the notice carries both
+	// numbers the row says so (`preview 4.0 KB of 24.5 KB`); otherwise the old number
+	// stands unchanged, so a complete result's row is byte-for-byte what it was.
+	bits.push(
+		details.preview
+			? `preview ${formatSize(details.preview.bytes)} of ${formatSize(details.preview.ofBytes)}`
+			: formatSize(details.outputBytes),
+	);
 	return `${glyph} ${label} · ${bits.join(" · ")}`;
 }
 
 const PREVIEW_CHARS = 4_000;
+
+/**
+ * P5c (`result-ledger-v1` §3 D9): the tool the notice names as the one-step recovery
+ * when the result has a ledger artifact.
+ *
+ * Restated instead of imported from `legion-output.ts` because that module imports
+ * THIS one (`formatSize`/`sanitizeNoticeField`); a test in `notify.test.ts` pins this
+ * string to `LEGION_OUTPUT_TOOL_NAME` so the copy cannot drift silently.
+ */
+const OUTPUT_TOOL = "legion_output";
+
+/** The two keys {@link buildPreview} needs: where the full text lives, and how to say so. */
+interface PreviewHints {
+	/** Durable full-text path (artifact or session file) — the generic bypass. */
+	sessionFile?: string;
+	name?: string;
+	/**
+	 * P5c: the entry has a ledger artifact (D1), so `legion_output({ name })` — not the
+	 * path — is the ONE-STEP recovery, and the truncation hint says that instead.
+	 */
+	artifact?: boolean;
+}
+
+/**
+ * D9/P5c: the durable full-text path, plus the tool pointer when the entry has a ledger
+ * artifact — `legion_output({ name })` is the one-step read (D7), the path is the
+ * generic bypass the D5 hook also accounts for. One shape for both notice forms.
+ */
+function fullOutputLine(path: string, name: string, artifact: boolean, indent = ""): string {
+	const pointer = artifact ? ` · ${OUTPUT_TOOL}({ name: ${JSON.stringify(name)} })` : "";
+	return `${indent}Full output: ${path}${pointer}`;
+}
 
 /**
  * Map an execution status onto the coarse notification label.
@@ -245,18 +298,45 @@ export function completionStatusOf(
 export function previewOutput(
 	text: string,
 	max = PREVIEW_CHARS,
-	hints?: { sessionFile?: string; name?: string },
+	hints?: PreviewHints,
 ): string {
+	return buildPreview(text, max, hints).text;
+}
+
+/**
+ * The preview AND the honest numbers behind it (P5c, `result-ledger-v1` §3 D9).
+ *
+ * `headBytes` is the text the reader actually gets (without the truncation sentence),
+ * `totalBytes` the text it stands for; they are equal unless the preview was cut. Both
+ * count UTF-8 bytes so they can be printed with {@link formatSize} and compared with an
+ * artifact's `bytes`.
+ */
+function buildPreview(
+	text: string,
+	max: number,
+	hints?: PreviewHints,
+): { text: string; headBytes: number; totalBytes: number } {
 	const trimmed = text.trim() || "(no output)";
-	if (trimmed.length <= max) return trimmed;
+	const totalBytes = Buffer.byteLength(trimmed, "utf8");
+	if (trimmed.length <= max) {
+		return { text: trimmed, headBytes: totalBytes, totalBytes };
+	}
+	const head = trimmed.slice(0, max);
 	// The preview is a hook, not the payload: name the recovery move so the
 	// parent model does not re-derive it (or, worse, re-launch a search that
 	// already finished — a duplicate child for a result already on disk).
 	const who = hints?.name ? ` ${hints.name}` : "";
-	const where = hints?.sessionFile
-		? ` — full text: ${hints.sessionFile}`
-		: ` — collect${who} for the full text`;
-	return `${trimmed.slice(0, max)}\n…(preview truncated${where})`;
+	const where =
+		hints?.artifact && hints.name
+			? ` — full text: ${OUTPUT_TOOL}({ name: ${JSON.stringify(hints.name)} })`
+			: hints?.sessionFile
+				? ` — full text: ${hints.sessionFile}`
+				: ` — collect${who} for the full text`;
+	return {
+		text: `${head}\n…(preview truncated${where})`,
+		headBytes: Buffer.byteLength(head, "utf8"),
+		totalBytes,
+	};
 }
 
 /**
@@ -354,13 +434,25 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 	const acceptance = input.acceptance
 		? `acceptance: ${input.acceptance.status}${input.acceptance.level ? ` (${input.acceptance.level})` : ""}`
 		: undefined;
-	const previewHints: { name?: string; sessionFile?: string } = {};
+	const previewHints: PreviewHints = {};
 	if (input.name) previewHints.name = input.name;
+	// P5c (D9): an artifact makes `legion_output` the one-step recovery, so the hint
+	// names the TOOL instead of telling the parent to read a path.
+	if (input.artifactId) previewHints.artifact = true;
 	// Prefer the durable full-text artifact over the session file as the
 	// recovery pointer: one `read` beats re-deriving from jsonl/chat store.
 	if (input.outputFile) previewHints.sessionFile = input.outputFile;
 	else if (input.sessionFile) previewHints.sessionFile = input.sessionFile;
-	const preview = previewOutput(input.output, PREVIEW_CHARS, previewHints);
+	const previewParts = buildPreview(input.output, PREVIEW_CHARS, previewHints);
+	const preview = previewParts.text;
+	// D9/P5c: state the preview's size beside the preview, in the body itself — the
+	// place that is visible whether the TUI folds the notice to one row or shows the
+	// whole block (a failed notice falls through to Pi's default rendering).
+	const previewBytesLine =
+		previewParts.headBytes < previewParts.totalBytes
+			? `preview ${formatSize(previewParts.headBytes)} of ${formatSize(previewParts.totalBytes)}` +
+				(input.artifactId ? ` · read via ${OUTPUT_TOOL}({ name: ${JSON.stringify(input.name)} })` : "")
+			: undefined;
 	const lines: Array<string | undefined> = [
 		`Background task ${status}: **${label}**`,
 		"",
@@ -369,7 +461,10 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 		acceptance,
 		"",
 		preview,
-		input.outputFile ? `Full output: ${input.outputFile}` : undefined,
+		previewBytesLine,
+		input.outputFile
+			? fullOutputLine(input.outputFile, input.name, input.artifactId !== undefined)
+			: undefined,
 		input.sessionFile ? "" : undefined,
 		input.sessionFile ? `Session file: ${input.sessionFile}` : undefined,
 		input.recycled === false
@@ -407,6 +502,14 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 				: undefined,
 			sessionFile: input.sessionFile,
 			outputBytes: Buffer.byteLength(preview),
+			// D9/P5c: the honest pair, only when the body really is a preview — a
+			// complete result carries no `preview` key at all.
+			...(previewBytesLine
+				? { preview: { bytes: previewParts.headBytes, ofBytes: previewParts.totalBytes } }
+				: {}),
+			// D9: machine locator for the artifact(s) this notice speaks about; the key is
+			// absent (never `[]`) when the result had no ledger row.
+			...(input.artifactId ? { artifactIds: [input.artifactId] } : {}),
 			recycled: input.recycled,
 		},
 	};
@@ -503,15 +606,27 @@ export function formatGroupedNotice(
 		// Prefer the durable full-text artifact over the session file as the
 		// recovery pointer: one `read` beats re-deriving from jsonl/chat store.
 		const fullText = entry.outputFile ?? entry.sessionFile;
-		const previewHints: { name?: string; sessionFile?: string } = {};
+		const previewHints: PreviewHints = {};
 		if (entry.name) previewHints.name = entry.name;
+		// P5c (D9): an artifact ⇒ `legion_output` is the one-step recovery.
+		if (entry.artifactId) previewHints.artifact = true;
 		if (fullText) previewHints.sessionFile = fullText;
-		lines.push(
-			`  ${previewOutput(entry.output, perEntryMax, previewHints)}`,
-		);
+		const entryPreview = buildPreview(entry.output, perEntryMax, previewHints);
+		lines.push(`  ${entryPreview.text}`);
+		// D9/P5c: no extra size line per entry. The batch body is bounded by the
+		// per-entry cap, and the "preview truncated" sentence already says a preview was
+		// cut and (with an artifact) names `legion_output`; a second line per member would
+		// spend the batch budget on bookkeeping. The single-child notice — where the
+		// collapsed row really did read the preview's size as the child's size — carries
+		// the `preview X of Y` pair.
 		if (entry.outputFile)
-			lines.push(`  Full output: ${entry.outputFile}`);
+			lines.push(fullOutputLine(entry.outputFile, entry.name, entry.artifactId !== undefined, "  "));
 	}
+	// D9/P5c: every member that has a ledger artifact — the machine locator a diagnostic
+	// (or a later renderer) uses to find the texts this batch stands for.
+	const artifactIds = entries
+		.map((entry) => entry.artifactId)
+		.filter((id): id is string => id !== undefined);
 	if (stillRunning.length > 0) {
 		// D4: state the fact only. "(notifies separately when it finishes)" promised a
 		// second message on behalf of children whose watch could already be gone —
@@ -539,6 +654,9 @@ export function formatGroupedNotice(
 			execution: { status: `batch ${entries.length}` },
 			sessionFile: input.runId,
 			outputBytes: Buffer.byteLength(preview),
+			// D9: the batch's members' artifact ids, machine-only. Absent — never an
+			// empty array — when no entry had one.
+			...(artifactIds.length > 0 ? { artifactIds } : {}),
 		},
 	};
 }

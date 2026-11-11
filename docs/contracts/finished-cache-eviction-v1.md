@@ -105,7 +105,13 @@ finished: {
 - 只有当这一份 `output` **不是** child 的全文、并且**重建失败**时才出现
   （`outputFile` 被删 / 从未记录 / 读盘抛错）；
 - 第一次 `collect`/`wait`、pinned 条目、落盘正常时的任何命中，**都不会**带这个字段；
-- 它是纯快照字段，不进 wire、不进 ledger（R6）。
+- 它是纯快照字段，不进 wire、不进 ledger（R6）；
+- **P5c（`result-ledger-v1` §3 D8，v1.12）起这个标记被渲染成「这是摘要」的提示，不再是死字段**：
+  `collect`/`wait`/内联 collect 在它之后追加一句
+  `this is the cached head (4.0 KB of 24.5 KB); full text: legion_output({ name: "…" })`
+  （`<bytes>` 取 artifact 的 ledger 行；没有行时写 `at least`），未截断的结果只剩 `full output: <path>`；
+  通知则用 `preview 4.0 KB of 24.5 KB` 标注预览。strip/rehydrate 本身**保留**——W7 的诚实性缺口由标注补上，
+  不用内存驻留去换。
 
 ### R6 — 不动的边界
 

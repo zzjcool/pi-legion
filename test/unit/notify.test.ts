@@ -19,6 +19,10 @@ import {
 	SUBAGENT_NOTIFY_TYPE,
 	NOTICE_SOURCE_MARKER,
 } from "../../src/extension/notify.ts";
+// The tool the notice names as the one-step recovery (D7). Imported rather than spelled
+// out in the assertions so a rename in `legion-output.ts` cannot leave `notify.ts`
+// pointing at a tool that no longer exists.
+import { LEGION_OUTPUT_TOOL_NAME } from "../../src/extension/legion-output.ts";
 
 test("completionStatusOf: success is completed, abort is stopped, else failed", () => {
 	assert.equal(completionStatusOf("success"), "completed");
@@ -813,4 +817,108 @@ test("v2 §6.9: the marker changes `content` only; `details` keeps its exact sha
 		"outputBytes counts the body after the marker, as before",
 	);
 	assert.equal(grouped.display, true);
+});
+
+// ───────── P5c (result-ledger-v1 §3 D9): the preview says what it is ─────────
+
+test("P5c/D9: a truncated artifact-backed preview is labelled `preview X of Y` and names legion_output", () => {
+	// The mislabel D9 exists for: the collapsed row printed `4.0 KB` for a 24.5 KB result,
+	// because `outputBytes` measures the PREVIEW. With an artifact, the notice now prints
+	// the pair and names the tool that can page the rest (D7).
+	const readVia = `${LEGION_OUTPUT_TOOL_NAME}({ name: "search-0" })`;
+	const notice = formatCompletionNotice({
+		name: "search-0",
+		agent: "search",
+		execution: { status: "success" },
+		output: "z".repeat(5_000),
+		outputFile: "/runs/r-1/artifacts/search-0/r1.md",
+		artifactId: "r-1/search-0/r1",
+		sessionFile: "/runs/r-1/search-0.jsonl",
+		acceptance: { status: "accepted", level: "attested" },
+	});
+	// (a) the truncation sentence no longer advises reading a file.
+	assert.ok(
+		notice.content.includes(`…(preview truncated — full text: ${readVia})`),
+		"the preview hint names legion_output",
+	);
+	// (b) the honest pair, in the body — visible folded AND expanded, and for a failed
+	// notice too (which the TUI renders as the plain block, not the collapsed row).
+	assert.ok(notice.content.includes(`preview 3.9 KB of 4.9 KB · read via ${readVia}`));
+	// (c) the path stays as the bypass — and names the tool beside it, so even a notice
+	// whose preview was NOT cut (`Full output:` is unconditional) points at the reader.
+	assert.ok(
+		notice.content.includes(`Full output: /runs/r-1/artifacts/search-0/r1.md · ${readVia}`),
+	);
+	// (d) the folded TUI row prints the same pair instead of the preview's size alone.
+	const headline = formatNoticeHeadline(notice.details);
+	assert.match(headline, /· preview 3\.9 KB of 4\.9 KB$/);
+	// (e) the machine facts: the honest pair and the artifact locator.
+	assert.deepEqual(notice.details.preview, { bytes: 4_000, ofBytes: 5_000 });
+	assert.deepEqual(notice.details.artifactIds, ["r-1/search-0/r1"]);
+	// `outputBytes` keeps its old meaning (the preview as delivered, truncation sentence
+	// included) — the new field ADDS the split, it does not redefine the old number, so
+	// every existing reader stays correct.
+	assert.ok(notice.details.outputBytes > notice.details.preview!.bytes);
+});
+
+test("P5c/D9: a complete result carries no preview pair and no artifactIds key", () => {
+	const notice = formatCompletionNotice({
+		name: "worker-0",
+		execution: { status: "success" },
+		output: "done",
+	});
+	// Absent, not `{bytes: n, ofBytes: n}` and not `[]` — a complete result has nothing
+	// to confess, and an empty array would read as "this notice has artifacts".
+	assert.equal("preview" in notice.details, false);
+	assert.equal("artifactIds" in notice.details, false);
+	assert.doesNotMatch(notice.content, /legion_output/);
+	assert.doesNotMatch(notice.content, /preview truncated/);
+	// The folded row keeps its pre-P5c shape.
+	assert.match(formatNoticeHeadline(notice.details), /· 4 B$/);
+});
+
+test("P5c/D9: a grouped notice reports its members' artifact ids, and each member's hint", () => {
+	const withIds = formatGroupedNotice({
+		runId: "r-1",
+		entries: [
+			groupedEntry({
+				name: "a",
+				output: "a".repeat(5_000),
+				outputFile: "/runs/r-1/artifacts/a/r1.md",
+				artifactId: "r-1/a/r1",
+			}),
+			groupedEntry({ name: "b", artifactId: "r-1/b/r1" }),
+		],
+	});
+	assert.deepEqual(withIds.details.artifactIds, ["r-1/a/r1", "r-1/b/r1"]);
+	// The batch entry's truncation hint names the tool too (same rule as the single
+	// notice): the member has an artifact, so `legion_output` is the one-step read.
+	assert.ok(
+		withIds.content.includes(
+			`…(preview truncated — full text: ${LEGION_OUTPUT_TOOL_NAME}({ name: "a" }))`,
+		),
+	);
+	// …and the per-entry path line carries the pointer too.
+	assert.ok(
+		withIds.content.includes(
+			`  Full output: /runs/r-1/artifacts/a/r1.md · ${LEGION_OUTPUT_TOOL_NAME}({ name: "a" })`,
+		),
+	);
+
+	const withoutIds = formatGroupedNotice({ entries: [groupedEntry({ name: "c" })] });
+	assert.equal("artifactIds" in withoutIds.details, false, "never an empty array");
+
+	// No artifact ⇒ the durable path stays the recovery pointer (nothing to page).
+	const pathHint = formatGroupedNotice({
+		entries: [
+			groupedEntry({
+				name: "d",
+				output: "d".repeat(5_000),
+				outputFile: "/runs/r-1/d.output.md",
+			}),
+		],
+	});
+	assert.ok(pathHint.content.includes("…(preview truncated — full text: /runs/r-1/d.output.md)"));
+	assert.ok(pathHint.content.includes("  Full output: /runs/r-1/d.output.md"));
+	assert.doesNotMatch(pathHint.content, /legion_output/);
 });

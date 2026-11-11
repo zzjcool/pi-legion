@@ -99,6 +99,7 @@ import {
 import { formatAlreadyRecycled } from "./src/extension/recycle.ts";
 import {
 	completionStatusOf,
+	formatSize,
 	type RenewalProposal,
 	SUBAGENT_NOTIFY_TYPE,
 } from "./src/extension/notify.ts";
@@ -2697,6 +2698,40 @@ function mailSeamOf(legion: OrchestratorLegionContext | undefined): MailReleaseS
 }
 
 /**
+ * P5c (`result-ledger-v1` §3 D8, v1.12): the artifact's FULL byte count, by artifact id.
+ *
+ * The one consumer is the render of a truncated snapshot, which has to say how big the
+ * text it is showing really was (`4.0 KB of 24.5 KB`). A function rather than a number
+ * because only the renderer knows WHICH snapshot it is about to print
+ * (`snapshot.artifactId`) and only the caller holds the connection. `undefined` means
+ * "no row" — a host without a legion context, a best-effort insert that failed, a db
+ * reset without rebuild — and the render then says `at least`, because what the model
+ * can see is a floor and nothing more. Never invent the difference.
+ */
+export type ArtifactBytesLookup = (artifactId: string) => number | undefined;
+
+/**
+ * Build that lookup over this session's ledger connection; `undefined` when the call has
+ * no legion identity (and then no artifact row was written either — §3 D1e).
+ *
+ * Never throws: a closed/refusing database must not be able to fail a tool result, and a
+ * missing number only costs the renderer its precision (D1e's direction, same as
+ * {@link markDelivered}).
+ */
+export function artifactBytesLookup(
+	legion: { db: DatabaseSync } | undefined,
+): ArtifactBytesLookup | undefined {
+	if (!legion) return undefined;
+	return (artifactId) => {
+		try {
+			return artifactById(legion.db, artifactId)?.bytes;
+		} catch {
+			return undefined;
+		}
+	};
+}
+
+/**
  * The READ-side ledger target (`result-ledger-v1.md` §3 D3, P4a): the connection a
  * delivery is recorded in, and the CONSUMER whose row it advances.
  */
@@ -2963,6 +2998,10 @@ async function controlAction(input: {
 			store,
 			cwd,
 			mail: mailSeamOf(input.legion),
+			// P5c (§3 D8): the SAME identity whose artifacts this wait delivers — one
+			// helper (`artifactBytesLookup`) so `collect` and `wait` cannot disagree about
+			// how big a text was.
+			...(input.legion ? { fullBytesOf: artifactBytesLookup(input.legion) } : {}),
 		});
 	}
 
@@ -3225,7 +3264,13 @@ async function controlAction(input: {
 
 	if (action === "steer") return steerChild(ctx);
 	if (action === "abort") return abortChild(ctx);
-	if (action === "collect") return collectChild(ctx, input.signal, mailSeamOf(input.legion));
+	if (action === "collect")
+		return collectChild(
+			ctx,
+			input.signal,
+			mailSeamOf(input.legion),
+			artifactBytesLookup(input.legion),
+		);
 	if (action === "retire") return retireChild(ctx);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
 
@@ -3569,6 +3614,12 @@ export async function collectChild(
 	 * byte (I1).
 	 */
 	mail?: MailReleaseSeam,
+	/**
+	 * P5c (`result-ledger-v1` §3 D8): this session's artifact-size lookup, so a truncated
+	 * (stripped) snapshot can say `4.0 KB of 24.5 KB` instead of only what it can see.
+	 * Absent = no legion identity → the render says `at least`.
+	 */
+	fullBytesOf?: ArtifactBytesLookup,
 ): Promise<AgentToolResult<unknown>> {
 	/**
 	 * P4a (`result-ledger-v1.md` §3 D3/D3b): the ONE way a snapshot becomes this tool's
@@ -3584,7 +3635,7 @@ export async function collectChild(
 	 * actually reached the parent (the abort net can still replace this whole result).
 	 */
 	const deliver = (snapshot: CollectSnapshot): AgentToolResult<unknown> => {
-		return ok(renderCollect(ctx.name, snapshot), ledgerReadsDetails([snapshot.artifactId]));
+		return ok(renderCollect(ctx.name, snapshot, fullBytesOf), ledgerReadsDetails([snapshot.artifactId]));
 	};
 	let stopPolling: (() => void) | undefined;
 	// #384 review round 3: same hold as `wait` — this node's postman stays off its inbox
@@ -4129,6 +4180,10 @@ async function launchFamily(input: {
 		// here — same precedent as `timeoutByName`.
 		spawnByName: new Map(),
 		pidByName: new Map(),
+		// P5c (§3 D8): the same ledger the orchestrator writes artifacts into — one
+		// source for "how big was this text", so the inline (`async:false`) collect
+		// renders a stripped snapshot exactly like `collect`/`wait` do.
+		...(legion ? { fullBytesOf: artifactBytesLookup(legion) } : {}),
 		...(nameGate.name ? { launchName: nameGate.name } : {}),
 	};
 
@@ -4250,6 +4305,12 @@ interface LaunchSession {
 	pidByName: Map<string, number>;
 	/** Explicit child name for this single-step launch; omit to auto-allocate. */
 	launchName?: string;
+	/**
+	 * P5c (`result-ledger-v1` §3 D8): the artifact-size lookup the inline (`async:false`)
+	 * collect renders its truncated snapshots with. Absent = no legion identity → the
+	 * render says `at least`.
+	 */
+	fullBytesOf?: ArtifactBytesLookup;
 }
 
 /**
@@ -4558,7 +4619,7 @@ async function collectInline(session: LaunchSession, signal?: AbortSignal): Prom
 				session.results.push("interrupted (parent turn ended; children still running)");
 				return;
 			}
-			session.results.push(renderCollect(name, collected));
+			session.results.push(renderCollect(name, collected, session.fullBytesOf));
 			// #266 D8/A20: `async:false` must report the real wait, not just look slow.
 			// Read AFTER collect: `queueWaitedMs` is written at admission, so an item
 			// that is still waiting when the collect deadline fires has no line yet.
@@ -5769,7 +5830,7 @@ export function buildWaitTimeoutDetails(
 }
 
 /** Render one wait result, reusing the collect shape for finished children. */
-export function renderWait(results: WaitResult[]): string {
+export function renderWait(results: WaitResult[], fullBytesOf?: ArtifactBytesLookup): string {
 	let done = 0;
 	let running = 0;
 	let interrupted = 0;
@@ -5777,7 +5838,7 @@ export function renderWait(results: WaitResult[]): string {
 	for (const result of results) {
 		if (result.snapshot) {
 			done += 1;
-			parts.push(renderCollect(result.name, result.snapshot));
+			parts.push(renderCollect(result.name, result.snapshot, fullBytesOf));
 		} else if (result.stillRunning) {
 			running += 1;
 			const elapsed =
@@ -6278,8 +6339,12 @@ function mailPreemptedWait(input: {
 	delivered: readonly WaitResult[];
 	/** Names this wait had not finished when the mail landed. */
 	running: readonly string[];
+	/** P5c: the artifact-size lookup the delivered snapshots render with (§3 D8). */
+	fullBytesOf?: ArtifactBytesLookup;
 }): AgentToolResult<unknown> {
-	const sections = input.delivered.map((result) => renderCollect(result.name, result.snapshot!));
+	const sections = input.delivered.map((result) =>
+		renderCollect(result.name, result.snapshot!, input.fullBytesOf),
+	);
 	if (input.running.length > 0) sections.push(`Still running: ${input.running.join(", ")}`);
 	return mailPreemptedResult({
 		released: input.released,
@@ -6317,8 +6382,14 @@ export async function waitAction(input: {
 	 * abort controller — today's behaviour byte for byte (I1).
 	 */
 	mail?: MailReleaseSeam;
+	/**
+	 * P5c (`result-ledger-v1` §3 D8): this session's artifact-size lookup, so that a
+	 * truncated (stripped) snapshot renders as `4.0 KB of 24.5 KB` instead of only what
+	 * the model can see. Absent = no legion identity → the render says `at least`.
+	 */
+	fullBytesOf?: ArtifactBytesLookup;
 }): Promise<AgentToolResult<unknown>> {
-	const { params, signal, runtime, agents, allAgents = agents, store, cwd } = input;
+	const { params, signal, runtime, agents, allAgents = agents, store, cwd, fullBytesOf } = input;
 	const jobs = runtime.activeJobs();
 	let targets = resolveWaitTargets(
 		{ name: params.name, all: params.all },
@@ -6341,6 +6412,7 @@ export async function waitAction(input: {
 				names: targets.names,
 				delivered: [],
 				running: targets.names,
+				...(fullBytesOf ? { fullBytesOf } : {}),
 			});
 		}
 	}
@@ -6432,6 +6504,7 @@ export async function waitAction(input: {
 					.filter((result) => result.snapshot === undefined)
 					.filter((result) => result.interrupted === true || result.stillRunning === true)
 					.map((result) => result.name),
+				...(fullBytesOf ? { fullBytesOf } : {}),
 			});
 		}
 	}
@@ -6446,7 +6519,7 @@ export async function waitAction(input: {
 	// which is a cut-short call whose answer the tool layer's abort net may still discard
 	// in full.
 	const ledgerReads = ledgerReadsDetails(results.map((result) => result.snapshot?.artifactId));
-	const text = renderWait(results);
+	const text = renderWait(results, fullBytesOf);
 	const timeoutDetails = buildWaitTimeoutDetails(results);
 	const details: Record<string, unknown> = { ...(timeoutDetails ?? {}), ...ledgerReads };
 	return {
@@ -6581,6 +6654,16 @@ function renderCollect(
 		execution: { status: string; reason?: string };
 		output: string;
 		outputFile?: string;
+		/**
+		 * P5c (`result-ledger-v1` §3 D8, v1.12): the text above is a cached HEAD of a longer
+		 * result — the finished cache's strip (`finished-cache-eviction-v1` R5), whose
+		 * rehydrate failed. This field is the only thing that makes this render say so
+		 * instead of letting the model believe it read the whole thing (W7). Absent on every
+		 * complete result, including a cache hit that re-read the file.
+		 */
+		outputTruncated?: true;
+		/** §3 D1: the artifact this text came from, when a ledger row names one. */
+		artifactId?: string;
 		acceptance: {
 			status: string;
 			level?: string;
@@ -6593,6 +6676,12 @@ function renderCollect(
 		};
 		blocked?: boolean;
 	},
+	/**
+	 * P5c: full byte count of the artifact above, when the caller has a ledger (see
+	 * {@link ArtifactBytesLookup}). Missing = the render knows only what it can see and
+	 * says `at least`.
+	 */
+	fullBytesOf?: ArtifactBytesLookup,
 ): string {
 	const lines = [
 		`── ${name} ──`,
@@ -6625,11 +6714,45 @@ function renderCollect(
 	}
 
 	lines.push(collected.output || "(no output)");
-	if (collected.outputFile)
-		lines.push(
-			`full output: ${collected.outputFile} (read this file when the output above is truncated)`,
-		);
+	// P5c (§3 D8): a stripped snapshot is a HEAD, and saying so is the whole point of
+	// keeping the strip. Only the truncated case gets the sentence — an unconditional
+	// "this may be a summary" made every complete result look suspect.
+	if (collected.outputTruncated)
+		lines.push(cachedHeadLine(name, collected, fullBytesOf));
+	// The path stays as the bypass: `legion_output` is the one-step read, the file is
+	// still readable with the host's own `read` (which the D5 hook also accounts for).
+	if (collected.outputFile) lines.push(`full output: ${collected.outputFile}`);
 	return lines.join("\n");
+}
+
+/**
+ * P5c (`result-ledger-v1` §3 D8, v1.12, W7): the one honest sentence a stripped snapshot
+ * gets.
+ *
+ *   this is the cached head (4.0 KB of 24.5 KB); full text: legion_output({ name: "x" })
+ *   this is the cached head (at least 4.0 KB); full text: legion_output({ name: "x" })
+ *
+ * The first shape needs the artifact's ledger row (§3 D8: `<bytes>` comes from there).
+ * Without one the second shape is the honest answer — the head the model holds is a
+ * floor, so the text says `at least` rather than pretending to know the total. A row
+ * that is somehow SMALLER than the head (a tampered file, a reused id) is treated the
+ * same way: never print `4.0 KB of 3.1 KB`.
+ *
+ * `legion_output` is the recovery D7 exists for (`{ name }` resolves the latest round);
+ * the caller still gets `full output: <path>` on the next line as the generic bypass.
+ */
+function cachedHeadLine(
+	name: string,
+	collected: { output: string; artifactId?: string },
+	fullBytesOf: ArtifactBytesLookup | undefined,
+): string {
+	const headBytes = Buffer.byteLength(collected.output, "utf8");
+	const total = collected.artifactId ? fullBytesOf?.(collected.artifactId) : undefined;
+	const size =
+		total !== undefined && total > headBytes
+			? `${formatSize(headBytes)} of ${formatSize(total)}`
+			: `at least ${formatSize(headBytes)}`;
+	return `this is the cached head (${size}); full text: legion_output({ name: ${JSON.stringify(name)} })`;
 }
 
 /**

@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { buildWaitTimeoutDetails, renderWait, stopAction, waitAction, WAIT_PARENT_DECISIONS, WAIT_TIMEOUT_HINT } from "../../index.ts";
+import { buildWaitTimeoutDetails, artifactBytesLookup, renderWait, stopAction, waitAction, WAIT_PARENT_DECISIONS, WAIT_TIMEOUT_HINT } from "../../index.ts";
 import {
 	createSessionRuntime,
 	type CollectSnapshot,
@@ -21,6 +21,8 @@ import {
 	type WaitResult,
 } from "../../src/extension/runtime.ts";
 import { RunStore } from "../../src/runs/store.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { recordArtifact } from "../../src/legion/ledger.ts";
 import { DEFAULTS, type AgentConfig } from "../../src/shared/types.ts";
 
 function snapshot(output: string): CollectSnapshot {
@@ -372,4 +374,122 @@ test("stopAction: omit force keeps graceful default (no graceful:false)", async 
 	});
 	assert.deepEqual(calls, [{ name: "soft", opts: undefined }]);
 	runtime.dispose();
+});
+
+// ────────────────── P5c (result-ledger-v1 §3 D8 v1.12): "this is a summary" ──────────────────
+//
+// The strip is KEPT (D8 改判): the completion cache still hands a 4000-char head back when
+// its `outputFile` is gone. What was missing is the LABEL — the model could not tell a head
+// from a whole result (W7). These three cases pin the only two shapes a stripped snapshot
+// may render as, plus the silence a complete result keeps.
+
+/** A stripped snapshot: head text + the metadata the cache never drops (`outputTruncated`). */
+function truncatedSnapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
+	return {
+		execution: { status: "success" },
+		output: "h".repeat(4_000),
+		outputFile: "/runs/r-1/artifacts/a/r1.md",
+		artifactId: "r-1/a/r1",
+		outputTruncated: true,
+		acceptance: { status: "accepted", level: "attested" },
+		...over,
+	};
+}
+
+/** A real ledger with a real `artifacts` row — the `<bytes>` source D8 names. */
+function ledgerWith(bytes: number): { db: ReturnType<typeof openLegionDb>; dispose: () => void } {
+	const db = openLegionDb(":memory:");
+	recordArtifact(db, {
+		id: "r-1/a/r1",
+		parentId: "root",
+		nodeId: "root.a",
+		name: "a",
+		round: 1,
+		path: "/runs/r-1/artifacts/a/r1.md",
+		bytes,
+		createdAt: 1,
+	});
+	return { db, dispose: () => db.close() };
+}
+
+test("P5c: a stripped snapshot says it is the cached head, with the ledger's full size", () => {
+	const ledger = ledgerWith(24_576);
+	try {
+		const rendered = renderWait(
+			[{ name: "a", snapshot: truncatedSnapshot() }],
+			artifactBytesLookup({ db: ledger.db }),
+		);
+		// The honest sentence: how much is shown, how much there was, and the one-step read.
+		assert.match(
+			rendered,
+			/this is the cached head \(3\.9 KB of 24\.0 KB\); full text: legion_output\(\{ name: "a" \}\)/,
+		);
+		// The path stays as the bypass (a plain `read` still works, and the D5 hook
+		// accounts for it) — and the OLD unconditional advice is gone.
+		assert.match(rendered, /^full output: \/runs\/r-1\/artifacts\/a\/r1\.md$/m);
+		assert.doesNotMatch(rendered, /read this file when the output above is truncated/);
+	} finally {
+		ledger.dispose();
+	}
+});
+
+test("P5c: without a ledger row the sentence says `at least`, never an invented total", () => {
+	// No lookup at all (a host with no legion identity) and a lookup that knows no row
+	// (db reset without rebuild, best-effort insert failed) must read the same: the head
+	// the model holds is a floor. `4.0 KB of 3.1 KB` is exactly what must not appear.
+	const noSeam = renderWait([{ name: "a", snapshot: truncatedSnapshot() }]);
+	assert.match(noSeam, /this is the cached head \(at least 3\.9 KB\); full text: legion_output\(\{ name: "a" \}\)/);
+	const noRow = renderWait([{ name: "a", snapshot: truncatedSnapshot() }], () => undefined);
+	assert.match(noRow, /this is the cached head \(at least 3\.9 KB\)/);
+	const smallerThanHead = renderWait([{ name: "a", snapshot: truncatedSnapshot() }], () => 10);
+	assert.match(smallerThanHead, /\(at least 3\.9 KB\)/, "a row below the head is not a total");
+});
+
+test("P5c: waitAction threads the artifact-size lookup into the render (not a dead parameter)", async () => {
+	// The renderer tests above prove the two shapes; this one proves the TOOL passes the
+	// seam through — a lookup that is accepted but never forwarded would still leave W7
+	// open on the `wait` path.
+	const ledger = ledgerWith(24_576);
+	const base = runtimeWith([{ name: "a", agent: "worker" }]);
+	const runtime: SessionRuntime = {
+		...base,
+		wait: (names) =>
+			Promise.resolve(names.map((name) => ({ name, snapshot: truncatedSnapshot() }) as WaitResult)),
+	};
+	const { store, cwd } = tempStore();
+	try {
+		const res = await waitAction({
+			params: { action: "wait", name: "a", timeoutMs: 50 },
+			runtime,
+			agents: [agent("worker")],
+			store,
+			cwd,
+			fullBytesOf: artifactBytesLookup({ db: ledger.db }),
+		});
+		assert.match(text(res), /this is the cached head \(3\.9 KB of 24\.0 KB\); full text: legion_output\(\{ name: "a" \}\)/);
+	} finally {
+		base.dispose();
+		ledger.dispose();
+	}
+});
+
+test("P5c: a complete result keeps the plain path line and prints no summary warning", () => {
+	const ledger = ledgerWith(24_576);
+	try {
+		const rendered = renderWait(
+			[
+				{
+					name: "a",
+					snapshot: truncatedSnapshot({ output: "the whole answer", outputTruncated: undefined }),
+				},
+			],
+			artifactBytesLookup({ db: ledger.db }),
+		);
+		assert.match(rendered, /^full output: \/runs\/r-1\/artifacts\/a\/r1\.md$/m);
+		assert.doesNotMatch(rendered, /cached head/);
+		assert.doesNotMatch(rendered, /legion_output/);
+		assert.doesNotMatch(rendered, /preview truncated/);
+	} finally {
+		ledger.dispose();
+	}
 });
