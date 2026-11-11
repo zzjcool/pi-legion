@@ -72,6 +72,34 @@ Major 只因为两件对程序化使用者的破坏：`consumeCollect*` 回到�
 
 ### Fixed
 
+- **`legion-verify` 的四种写法各有归处，空的绿灯不再来自「没解析出来」**（#394）。`parseLegionVerifyCommands`
+  只认 ` ```legion-verify ` 围栏，于是契约把验收写成 `## legion-verify` 标题、` ```legion-verify bash `（info string
+  多一个词）、`~~~legion-verify` 或裸行 `legion-verify: npm test` 时都解析成 0 条命令，而 `runVerification` 的
+  `let passed = true` 让这个「没解析出来」直接变成 `verification passed`。现在 `parseLegionVerifyContract` 带回
+  `shape`：`fence`（反引号与波浪号都算）与 `bare-line`（`legion-verify: <cmd>`，允许 `>` / `#` / 列表符前缀）
+  解析并执行；**空块 / 空裸行 / 完全没提**仍按 §7.3 直通 done（`none` / `fence`），只有「行首出现了
+  `legion-verify` 但形状读不出来」才判**失败**并点名两种合法写法。行中段的散文提及不算声明，不会把 read-only
+  队判红。collect 头多出第三态 `verification: FAILED — 0 commands; nothing the supervisor parses is declared`
+  （`VerificationSummary` 带 `passed`，失败行不再借用「by contract, nothing ran」）。*已知保留*：裸行扫描不做
+  围栏感知——在 ` ```text ` 引用块里写一行 `- legion-verify: cmd` 会被执行，因为那两行字与一条真声明在语法上无法区分。
+- **child 说「不行」不等于不验证，但验证只对结果跑**（#393）。`applyVerification` 开头那道
+  `status !== "accepted"` 门让诚实交 `{ok:false}` 的 child 一条命令都跑不到（`task-verify` 永久 pending、
+  父级拿不到机器证据）；门已删除。取而代之的是三条边界：①机械绿灯**不翻案** child 的自述——`status` 原样保留、
+  `level` 升 `verified`、reason 写成 `verified by … — the child's own verdict still stands (…)`（child 自己的
+  reason 与红路径的输出同享 1 500 字符预算）；②命令报错才判 `rejected (attested)`（`verify` 的 schema 描述不再
+  宣称一个全仓不存在的 `rejected (verified-path)` 标签）；③**只有终态 collect 才验证**——`collect` 超时返回的
+  `running` 是快照不是结果，`finishCollect` 对它不调 `applyVerification`。③是删门之后第一次修复翻的车：快照会在
+  child 仍在写的 worktree 里跑命令，deadline 已过、`Math.max(5_000, …)` 几乎必超，实测产出伪 `rejected`。另外
+  `carried` 改为只丢弃真正会被执行的 criteria——带 `command` 但没有 `verification-output` 证据的 pending 不再
+  静默从父级清单里消失。
+- **settle 之后的 steer 不再把 child 判成 aborted、也不再烧掉 resume**（#392）。`TerminalSupervisor.sendText`
+  会 `observe()` 却不读结果：terminal 已经 `finished` 时照样 `terminal.send`，还把记录无条件改回 `"live"`。
+  下一次 collect 于是把「末轮只有 user 消息」判成 `aborted`，retire 把 phase 推向 `aborted`，`childFromNode`
+  从此以 `CHILD_TERMINAL` 拒绝 resume——一句迟到的 steer 让一场已结束的队永久不可恢复。现在 `sendText` 在
+  `observe()` 之后、`terminal.send` 之前拦下 `finished` / `retired`，以及 core 已经不再认识这个 terminal 的
+  `not_found`（复用同一个 `isNotFound` 判据）：抛 `CHILD_TERMINAL`、**一次也不发**，`state` 只在发送真的落地后
+  才记 `live`；`steerChild` 不再把这个码压成 `NOT_FOUND`。`SteerDisposition` 三态与 `abortLegionPhase`
+  一行未动（§I4 的「非 session-shutdown 的 retire 行为逐字不变」继续成立）。
 - **`done` 先判边、后付费**（D10）。`PhaseTransitionDecision` 的拒绝形状新增 `failed`（失败的那条 `require`
   名），`legion_phase { to: "done" }` 先按 `verification_passed = true` 试判一次（问的是「就算契约绿了，这条边会过吗」，与
   `require` 的书写顺序无关）：只有这个假设下边仍会拒绝时才不付钱。于是注定被 `children_settled` 拒的请求不再先付一次全套验证；`children 全失败 ⇒

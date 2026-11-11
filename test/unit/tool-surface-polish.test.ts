@@ -379,6 +379,23 @@ test("#5: the collect head names an empty pass, and says nothing when there is n
 		/^verification: 0 commands — by contract, nothing ran$/m,
 		"0 commands is named as a pass by contract, not as a green",
 	);
+	// #394: the same prefix, opposite meaning. A contract whose declaration nothing
+	// parses runs nothing AND fails, so it must not borrow "by contract, nothing ran".
+	assert.match(
+		render({ commandCount: 0, passed: false, outputFile: "/tmp/v.log", checkedAt: 1, stale: false }),
+		/^verification: FAILED — 0 commands; nothing the supervisor parses is declared · log \/tmp\/v\.log$/m,
+		"a failed 0-command row is a failure, not the §7.3 pass",
+	);
+	assert.match(
+		render({ commandCount: 2, passed: false, checkedAt: 1, stale: false }),
+		/^verification: FAILED — 2 command\(s\)$/m,
+		"a failed run names the count it tried",
+	);
+	assert.match(
+		render({ commandCount: 2, passed: true, checkedAt: 1, stale: false }),
+		/^verification: 2 command\(s\) · log \(not recorded\)$/m,
+		"an explicit pass keeps the pre-#394 line",
+	);
 	assert.match(
 		render({ commandCount: 3, outputFile: "/tmp/v.log", checkedAt: 1, stale: true }),
 		/^verification: STALE — the checkout changed after the pass \(3 command\(s\), \/tmp\/v\.log\)$/m,

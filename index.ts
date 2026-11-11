@@ -340,7 +340,7 @@ const SubagentParams = Type.Object({
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-			"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; the first non-zero exit rejects the child's verdict as `rejected (verified-path)`. The worker does not need to paste test output. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
+				"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; a non-zero exit rejects the child's verdict as `rejected (attested)`, while an all-green run only raises the level to `verified` and leaves the status the child reported. The worker does not need to paste test output. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
 		}),
 	),
 	phases: Type.Optional(
@@ -7230,17 +7230,32 @@ export function renderCollect(
 	// #5: the CONTRACT verification is a different fact from `acceptance` (that one is
 	// the launch-level attestation). A `0 commands` pass and a stale pass are the two
 	// ways "verified" can be empty, and the parent decides on a merge right here — so
-	// they are named, not left to the child's own prose.
+	// they are named, not left to the child's own prose. #394 added a third shape that
+	// must never borrow those words: a contract whose declaration nothing parses fails
+	// WITH 0 commands, so `passed` is read before the count is.
+	// #394: `passed === false` is the shape that used to be invisible — a contract
+	// whose declaration nothing parses runs 0 commands and still rendered as the
+	// §7.3 "by contract, nothing ran" pass. Only an explicit `false` is a failure:
+	// an absent field is a row written before it existed, and keeps `commandCount`.
 	if (verification === null) {
 		lines.push("verification: never ran (no contract)");
 	} else if (verification) {
-		lines.push(
-			verification.commandCount === 0
-				? "verification: 0 commands — by contract, nothing ran"
-				: verification.stale
-					? `verification: STALE — the checkout changed after the pass (${verification.commandCount} command(s)${verification.outputFile ? `, ${verification.outputFile}` : ""})`
-					: `verification: ${verification.commandCount} command(s) · log ${verification.outputFile ?? "(not recorded)"}`,
-		);
+		const log = verification.outputFile ? ` · log ${verification.outputFile}` : "";
+		if (verification.passed === false) {
+			lines.push(
+				verification.commandCount === 0
+					? `verification: FAILED — 0 commands; nothing the supervisor parses is declared${log}`
+					: `verification: FAILED — ${verification.commandCount} command(s)${log}`,
+			);
+		} else if (verification.commandCount === 0) {
+			lines.push("verification: 0 commands — by contract, nothing ran");
+		} else if (verification.stale) {
+			lines.push(
+				`verification: STALE — the checkout changed after the pass (${verification.commandCount} command(s)${verification.outputFile ? `, ${verification.outputFile}` : ""})`,
+			);
+		} else {
+			lines.push(`verification: ${verification.commandCount} command(s) · log ${verification.outputFile ?? "(not recorded)"}`);
+		}
 	}
 	// The mechanical verify outcome (which command failed / which commands had
 	// to pass) is the parent's primary trust anchor — surface it inline.

@@ -439,7 +439,10 @@ test("D8: a boot-time idle at promptTurn NEVER settles; a later done turn does",
 	});
 	try {
 		await h.supervisor.spawnChild(spawnInput(h.root));
-		const settle = await h.supervisor.waitSettled("root.centurion-0", 40);
+		// 40ms was too tight under a loaded runner: three 5ms polls have to land before the
+		// budget expires, and a full-suite run fans out across every test file at once. The
+		// assertion is "the idle reading is polled through, not accepted", not "under 40ms".
+		const settle = await h.supervisor.waitSettled("root.centurion-0", 500);
 		assert.deepEqual(settle, { settled: true, abnormal: false });
 		assert.ok(reads >= 3, "the idle reading must be polled through, not accepted");
 	} finally {
