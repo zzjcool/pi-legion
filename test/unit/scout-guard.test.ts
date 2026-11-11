@@ -461,7 +461,12 @@ test("parent tool_call observes reads and does not block or rewrite bash", async
 		process.env.PI_CODING_AGENT_DIR = dir;
 		delete process.env.PI_SUBAGENT_CHILD;
 		delete process.env[CHILD_ROLE_ENV];
-		const events = new Map<string, (event: { toolName: string; input: { command: string } }, ctx?: { cwd?: string }) => unknown>();
+		// The host allows SEVERAL handlers per event, and this extension registers more
+		// than one `tool_call` observer (scout-guard, the child guard and the P5d
+		// artifact-path guard), so the fake keeps a LIST. A single-slot Map would silently
+		// drop all but the last and make this test pass without observing anything.
+		type ToolCallObserver = (event: { toolName: string; input: { command: string } }, ctx?: { cwd?: string }) => unknown;
+		const events = new Map<string, ToolCallObserver[]>();
 		const pi = {
 			registerMessageRenderer() {},
 			registerTool() {},
@@ -469,14 +474,14 @@ test("parent tool_call observes reads and does not block or rewrite bash", async
 			sendMessage() {},
 			events: { emit() {} },
 			on(name: string, handler: unknown) {
-				events.set(name, handler as (event: { toolName: string; input: { command: string } }, ctx?: { cwd?: string }) => unknown);
+				events.set(name, [...(events.get(name) ?? []), handler as ToolCallObserver]);
 			},
 		};
 		piLegion(pi as never, { supervisor: new FakeSupervisor() });
-		const handler = events.get("tool_call");
-		assert.equal(typeof handler, "function");
+		const observers = events.get("tool_call") ?? [];
+		assert.ok(observers.length > 0, "the extension registers at least one `tool_call` observer");
 		const event = { toolName: "bash", input: { command: "echo hi" } };
-		assert.equal(handler?.(event, { cwd: dir }), undefined);
+		for (const observer of observers) assert.equal(observer(event, { cwd: dir }), undefined);
 		assert.equal(event.input.command, "echo hi");
 	} finally {
 		if (previous.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -513,7 +518,12 @@ test("harness: N read-like calls notify once, dispatch clears the streak, cooldo
 		delete process.env.PI_SUBAGENT_UTILITY_CHILD;
 
 		const sent: Array<{ message: SentMessage; options?: SentOptions }> = [];
-		const events = new Map<string, (event: { toolName: string; input?: unknown }, ctx?: { cwd?: string }) => unknown>();
+		// Several `tool_call` handlers coexist in the real host (scout-guard, the child
+		// guard, the P5d artifact-path guard), so this fake keeps them all: a single-slot
+		// Map drops the scout guard's observer and the streak assertions below become
+		// vacuous.
+		type ToolCallObserver = (event: { toolName: string; input?: unknown }, ctx?: { cwd?: string }) => unknown;
+		const events = new Map<string, ToolCallObserver[]>();
 		let hookReturned = true;
 		const pi = {
 			registerMessageRenderer() {},
@@ -525,17 +535,19 @@ test("harness: N read-like calls notify once, dispatch clears the streak, cooldo
 			},
 			events: { emit() {} },
 			on(name: string, handler: unknown) {
-				events.set(name, handler as (event: { toolName: string; input?: unknown }, ctx?: { cwd?: string }) => unknown);
+				events.set(name, [...(events.get(name) ?? []), handler as ToolCallObserver]);
 			},
 		};
 		piLegion(pi as never, { supervisor: new FakeSupervisor() });
-		const handler = events.get("tool_call");
-		assert.equal(typeof handler, "function");
+		const observers = events.get("tool_call") ?? [];
+		assert.ok(observers.length > 0);
 		const call = (toolName: string, input: unknown) => {
 			hookReturned = false;
-			const result = handler?.({ toolName, input }, { cwd: dir });
+			for (const observer of observers) {
+				const result = observer({ toolName, input }, { cwd: dir });
+				assert.equal(result, undefined);
+			}
 			hookReturned = true;
-			assert.equal(result, undefined);
 		};
 		const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 		const reminders = () => sent.filter((entry) => entry.message.customType === SCOUT_GUARD_NOTIFY_TYPE);

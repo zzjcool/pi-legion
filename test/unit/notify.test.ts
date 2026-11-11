@@ -335,9 +335,10 @@ function groupedEntry(over: Partial<GroupedEntry> = {}): GroupedEntry {
 	};
 }
 
-test("formatCompletionNotice: a truncated preview names the full-output file", () => {
-	// The whole point of the artifact: the notice must point the parent at a
-	// one-step recovery (read the file), not a jsonl/chat-store re-derivation.
+test("formatCompletionNotice: a truncated preview names the reader, never the artifact path (P5d)", () => {
+	// The whole point of the artifact: the notice must point the parent at a one-step
+	// recovery (the tool), not a jsonl/chat-store re-derivation — and, since P5d, not at
+	// a path either: the path is never an address the model is handed.
 	const long = `${"z".repeat(5_000)}\n{"ok": true, "reason": "found"}`;
 	const notice = formatCompletionNotice({
 		name: "search-0",
@@ -350,9 +351,12 @@ test("formatCompletionNotice: a truncated preview names the full-output file", (
 	});
 	assert.match(
 		notice.content,
-		/…\(preview truncated — full text: \/runs\/r-1\/search-0\.output\.md\)/,
+		/…\(preview truncated — full text: legion_output\(\{ name: "search-0" \}\)\)/,
 	);
-	assert.match(notice.content, /Full output: \/runs\/r-1\/search-0\.output\.md/);
+	assert.match(notice.content, /Full text: legion_output\(\{ name: "search-0" \}\)/);
+	// The session file is the diagnostic pointer and stays; the artifact body is not.
+	assert.ok(notice.content.includes("Session file: /runs/r-1/search-0.jsonl"));
+	assert.doesNotMatch(notice.content, /runs\/r-1\/search-0\.output\.md/);
 });
 
 test("formatCompletionNotice: no outputFile, no hint suffix beyond the collect pointer", () => {
@@ -368,7 +372,7 @@ test("formatCompletionNotice: no outputFile, no hint suffix beyond the collect p
 	);
 });
 
-test("formatGroupedNotice: per-entry Full output lines", () => {
+test("formatGroupedNotice: per-entry full-text lines name the reader (P5d)", () => {
 	const notice = formatGroupedNotice({
 		runId: "r-1",
 		entries: [
@@ -382,11 +386,13 @@ test("formatGroupedNotice: per-entry Full output lines", () => {
 	});
 	assert.match(
 		notice.content,
-		/…\(preview truncated — full text: \/runs\/r-1\/search-0\.output\.md\)/,
+		/…\(preview truncated — full text: legion_output\(\{ name: "search-0" \}\)\)/,
 	);
-	assert.match(notice.content, /Full output: \/runs\/r-1\/search-0\.output\.md/);
+	assert.match(notice.content, /Full text: legion_output\(\{ name: "search-0" \}\)/);
+	assert.doesNotMatch(notice.content, /runs\/r-1\/search-0\.output\.md/, "P5d: no artifact path is printed");
 	// Entries without an artifact must not grow a dangling pointer line.
-	assert.doesNotMatch(notice.content, /Full output: undefined/);
+	assert.doesNotMatch(notice.content, /Full text: undefined/);
+	assert.doesNotMatch(notice.content, /Full text: legion_output\(\{ name: "worker-1" \}\)/);
 });
 
 test("formatGroupedNotice: multiple entries merge into one notice with a header", () => {
@@ -675,7 +681,7 @@ test("regression: a notice without a renewal proposal keeps its body byte-identi
 	assert.equal(
 		success.content,
 		`${NOTICE_SOURCE_MARKER}\n` +
-			"Background task completed: **reviewer-1**\n\nexecution: success\nacceptance: accepted (attested)\n\nall good\nFull output: /runs/r-1/reviewer-1.output.md\nChild retired. Resume from the session file if you need this child again.",
+			"Background task completed: **reviewer-1**\n\nexecution: success\nacceptance: accepted (attested)\n\nall good\nFull text: legion_output({ name: \"reviewer-1\" })\nChild retired. Resume from the session file if you need this child again.",
 	);
 
 	const stopped = formatCompletionNotice({
@@ -844,10 +850,14 @@ test("P5c/D9: a truncated artifact-backed preview is labelled `preview X of Y` a
 	// (b) the honest pair, in the body — visible folded AND expanded, and for a failed
 	// notice too (which the TUI renders as the plain block, not the collapsed row).
 	assert.ok(notice.content.includes(`preview 3.9 KB of 4.9 KB · read via ${readVia}`));
-	// (c) the path stays as the bypass — and names the tool beside it, so even a notice
-	// whose preview was NOT cut (`Full output:` is unconditional) points at the reader.
+	// (c) the reader is named — with the round the artifact id carries (D1) — and the
+	// path is gone: P5d makes `legion_output` the only address a notice prints.
 	assert.ok(
-		notice.content.includes(`Full output: /runs/r-1/artifacts/search-0/r1.md · ${readVia}`),
+		notice.content.includes(`Full text: ${LEGION_OUTPUT_TOOL_NAME}({ name: "search-0", round: 1 })`),
+	);
+	assert.ok(
+		!notice.content.includes("/runs/r-1/artifacts/search-0/r1.md"),
+		"P5d: the artifact path never reaches the model",
 	);
 	// (d) the folded TUI row prints the same pair instead of the preview's size alone.
 	const headline = formatNoticeHeadline(notice.details);
@@ -898,17 +908,18 @@ test("P5c/D9: a grouped notice reports its members' artifact ids, and each membe
 			`…(preview truncated — full text: ${LEGION_OUTPUT_TOOL_NAME}({ name: "a" }))`,
 		),
 	);
-	// …and the per-entry path line carries the pointer too.
+	// …and the per-entry line names the reader with its round, never the path.
 	assert.ok(
-		withIds.content.includes(
-			`  Full output: /runs/r-1/artifacts/a/r1.md · ${LEGION_OUTPUT_TOOL_NAME}({ name: "a" })`,
-		),
+		withIds.content.includes(`  Full text: ${LEGION_OUTPUT_TOOL_NAME}({ name: "a", round: 1 })`),
 	);
+	assert.ok(!withIds.content.includes("/runs/r-1/artifacts/a/r1.md"), "P5d: no artifact path in a batch");
 
 	const withoutIds = formatGroupedNotice({ entries: [groupedEntry({ name: "c" })] });
 	assert.equal("artifactIds" in withoutIds.details, false, "never an empty array");
 
-	// No artifact ⇒ the durable path stays the recovery pointer (nothing to page).
+	// P5d: an `outputFile` with no ledger row is STILL an artifact body — the hint and
+	// the line name the reader (only the round is missing, and `legion_output` resolves
+	// the newest round itself). The path is not printed either way.
 	const pathHint = formatGroupedNotice({
 		entries: [
 			groupedEntry({
@@ -918,7 +929,9 @@ test("P5c/D9: a grouped notice reports its members' artifact ids, and each membe
 			}),
 		],
 	});
-	assert.ok(pathHint.content.includes("…(preview truncated — full text: /runs/r-1/d.output.md)"));
-	assert.ok(pathHint.content.includes("  Full output: /runs/r-1/d.output.md"));
-	assert.doesNotMatch(pathHint.content, /legion_output/);
+	assert.ok(
+		pathHint.content.includes(`…(preview truncated — full text: ${LEGION_OUTPUT_TOOL_NAME}({ name: "d" }))`),
+	);
+	assert.ok(pathHint.content.includes(`  Full text: ${LEGION_OUTPUT_TOOL_NAME}({ name: "d" })`));
+	assert.doesNotMatch(pathHint.content, /\/runs\/r-1\/d\.output\.md/);
 });

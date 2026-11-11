@@ -424,9 +424,10 @@ test("P5c: a stripped snapshot says it is the cached head, with the ledger's ful
 			rendered,
 			/this is the cached head \(3\.9 KB of 24\.0 KB\); full text: legion_output\(\{ name: "a" \}\)/,
 		);
-		// The path stays as the bypass (a plain `read` still works, and the D5 hook
-		// accounts for it) — and the OLD unconditional advice is gone.
-		assert.match(rendered, /^full output: \/runs\/r-1\/artifacts\/a\/r1\.md$/m);
+		// P5d: the line names the READER with the round the artifact id carries — the
+		// artifact path is never handed to the model — and the OLD unconditional advice is gone.
+		assert.match(rendered, /^full text: legion_output\(\{ name: "a", round: 1 \}\)$/m);
+		assert.doesNotMatch(rendered, /\/runs\/r-1\/artifacts\/a\/r1\.md/);
 		assert.doesNotMatch(rendered, /read this file when the output above is truncated/);
 	} finally {
 		ledger.dispose();
@@ -473,7 +474,7 @@ test("P5c: waitAction threads the artifact-size lookup into the render (not a de
 	}
 });
 
-test("P5c: a complete result keeps the plain path line and prints no summary warning", () => {
+test("P5c/P5d: a complete result keeps the plain reader line and prints no summary warning", () => {
 	const ledger = ledgerWith(24_576);
 	try {
 		const rendered = renderWait(
@@ -485,9 +486,9 @@ test("P5c: a complete result keeps the plain path line and prints no summary war
 			],
 			artifactBytesLookup({ db: ledger.db }),
 		);
-		assert.match(rendered, /^full output: \/runs\/r-1\/artifacts\/a\/r1\.md$/m);
+		assert.match(rendered, /^full text: legion_output\(\{ name: "a", round: 1 \}\)$/m);
+		assert.doesNotMatch(rendered, /\/runs\/r-1\/artifacts/);
 		assert.doesNotMatch(rendered, /cached head/);
-		assert.doesNotMatch(rendered, /legion_output/);
 		assert.doesNotMatch(rendered, /preview truncated/);
 	} finally {
 		ledger.dispose();

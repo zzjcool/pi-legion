@@ -98,6 +98,7 @@ import {
 } from "./src/extension/blocked.ts";
 import { formatAlreadyRecycled } from "./src/extension/recycle.ts";
 import {
+	artifactReadCall,
 	completionStatusOf,
 	formatSize,
 	type RenewalProposal,
@@ -2622,6 +2623,21 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			/* D1e: a ledger failure is a diagnostic, never the tool's answer. */
 		}
 	});
+	// P5d (user ruling, 2026-11-11: "文件路径永远不让 agent 知道，也不告诉他，只指引他通过
+	// 工具来读；软的就可以了"). An artifact is still an ordinary immutable file — nothing is
+	// encrypted, no directory moved, no DB blob — its path is simply never handed out, so a
+	// `read` of one is turned back to the ONE tool that reports the exact size and records
+	// the consumption (D7), and a `write`/`edit` is refused because A1b makes the body
+	// immutable. `block` WITHOUT `terminate`: this is a sentence the model can act on, not
+	// a dead turn. Fail OPEN on every shape we cannot judge (no identity, no runDir, a
+	// missing/non-string path, a throw) — the guard may not break an ordinary read/write.
+	pi.on("tool_call", (event) => {
+		try {
+			return artifactPathToolCallBlock({ event, identity: ownLegionIdentity() });
+		} catch {
+			return undefined;
+		}
+	});
 	pi.on("session_shutdown", shutdownRetireAll);
 }
 
@@ -2850,6 +2866,85 @@ export interface ArtifactReadHookIdentity {
 	runDir: string;
 }
 
+/** The identity facts the P5d artifact-path guard needs; `ownLegionIdentity()` answers it. */
+export interface ArtifactPathGuardIdentity {
+	/** `<runDir>` whose `artifacts/` subtree is not a path a model may touch directly. */
+	runDir: string;
+}
+
+/**
+ * P5d: the `read` refusal. Names the ONE tool that can answer — the header it returns is
+ * where the exact size is (§3 D7), and that read is what the ledger records.
+ */
+const ARTIFACT_READ_BLOCK_REASON =
+	"This is a legion artifact (immutable). Read it with legion_output({ name, round }) — it returns the header with the exact size and records your read.";
+
+/** P5d: `write`/`edit` — A1b makes an artifact row and its body immutable. */
+const ARTIFACT_WRITE_BLOCK_REASON =
+	"Legion artifacts are immutable; legion_output is the read path.";
+
+/**
+ * P5d (user ruling, 2026-11-11): an artifact's PATH is never handed to a model — "还是
+ * 文件，但文件路径永远不让 agent 知道，也不告诉他，只指引他通过工具来读；软的就可以了".
+ *
+ * This is the soft half of that ruling: `read`/`write`/`edit` of a path under
+ * `<runDir>/artifacts/` is blocked with a reason, so the model is steered to
+ * `legion_output` instead of a path it was never given. Deliberately NOT `terminate`
+ * (the turn goes on; the reason is the instruction) and deliberately fail-OPEN:
+ *
+ * - no identity / no `runDir` (a plain session, a root before its first launch) ⇒ allow;
+ * - no `toolName`, a tool that is not `read`/`write`/`edit`, no `input`, a non-string or
+ *   empty `path` ⇒ allow;
+ * - any throw (an unresolvable path, a closed handle) ⇒ allow.
+ *
+ * A guard that cannot decide must never break an ordinary file read/write, which is why
+ * every branch above answers `undefined` rather than inventing a block. Returns the
+ * verdict the `tool_call` handler hands back, or `undefined` to let the call run.
+ */
+export function artifactPathToolCallBlock(input: {
+	event: unknown;
+	identity: ArtifactPathGuardIdentity | undefined;
+}): { block: true; reason: string } | undefined {
+	try {
+		const identity = input.identity;
+		if (!identity || typeof identity.runDir !== "string" || identity.runDir.length === 0) return undefined;
+		const event = asRecord(input.event);
+		if (!event) return undefined;
+		const toolName = event.toolName;
+		if (toolName !== "read" && toolName !== "write" && toolName !== "edit") return undefined;
+		const params = asRecord(event.input);
+		// `path` is the one argument all three tools share; `read` also pages it, which the
+		// D5 hook judges — here only WHERE it points matters.
+		const filePath = params?.path;
+		if (typeof filePath !== "string" || filePath.length === 0) return undefined;
+		if (!isUnderArtifactsDirectory(filePath, identity.runDir)) return undefined;
+		return {
+			block: true,
+			reason: toolName === "read" ? ARTIFACT_READ_BLOCK_REASON : ARTIFACT_WRITE_BLOCK_REASON,
+		};
+	} catch {
+		// P5d: fail open. A path we cannot resolve is not evidence of an artifact.
+		return undefined;
+	}
+}
+
+/**
+ * Does `filePath` resolve INTO `<runDir>/artifacts/`? (P5d)
+ *
+ * `path.resolve` + `path.relative`, never a string prefix: `artifacts-evil/` shares every
+ * character of `artifacts` but is a different directory, and a `..` segment is normalised
+ * BEFORE the comparison instead of being taken literally. The directory itself is not a
+ * file, and a relative result that is absolute (another drive/root) is not under it
+ * either — both answer `false`.
+ */
+function isUnderArtifactsDirectory(filePath: string, runDir: string): boolean {
+	const artifactsDir = path.resolve(runDir, "artifacts");
+	const relative = path.relative(artifactsDir, path.resolve(filePath));
+	if (relative.length === 0) return false;
+	if (path.isAbsolute(relative)) return false;
+	return relative !== ".." && !relative.startsWith(`..${path.sep}`);
+}
+
 /**
  * D5 (`result-ledger-v1.md` §3 D5, §6 P5a): a generic `read` that reaches EOF consumes
  * the artifact, exactly like a `collect`/`wait` delivery does (P4a).
@@ -2890,6 +2985,14 @@ export interface ArtifactReadHookIdentity {
  *
  * D1e: never throws. This runs inside `tool_result`, and a ledger failure must not be
  * able to fail the tool the model just called.
+ *
+ * P5d (2026-11-11): after the soft block in the `tool_call` handler above, a generic
+ * `read` OF AN ARTIFACT never reaches `tool_result` — the call is blocked — so this hook
+ * now only serves the non-`read` tool paths: a `read` the block could not see (a host
+ * that ignores `block`, a nested/tool-mediated call, an identity resolved too late) and
+ * any future tool that hands a file body through `tool_result`. It stays because the
+ * ledger must be right for those too — "blocked at the tool layer" is a policy, not a
+ * proof.
  */
 export function recordArtifactReadFromToolResult(input: {
 	event: unknown;
@@ -5003,7 +5106,7 @@ async function launchUtilityFamily(input: {
 				`execution: ${result.execution.status}${result.execution.reason ? ` (${result.execution.reason})` : ""}`,
 				result.output || "(no output)",
 			];
-			if (result.outputFile) lines.push(`outputFile: ${result.outputFile}`);
+			if (result.outputFile) lines.push(`full text: ${artifactReadCall(handle.name, result.artifactId)}`);
 			lines.push(`sessionFile: ${handle.sessionFile}`);
 			return lines.join("\n");
 		} catch (error) {
@@ -6719,9 +6822,11 @@ function renderCollect(
 	// "this may be a summary" made every complete result look suspect.
 	if (collected.outputTruncated)
 		lines.push(cachedHeadLine(name, collected, fullBytesOf));
-	// The path stays as the bypass: `legion_output` is the one-step read, the file is
-	// still readable with the host's own `read` (which the D5 hook also accounts for).
-	if (collected.outputFile) lines.push(`full output: ${collected.outputFile}`);
+	// P5d (user ruling 2026-11-11): the artifact is still a file, but its path is never
+	// an address the model is handed — the line names the READER instead. `name` is the
+	// caller's own name for the child and `round` comes out of the snapshot's artifact id
+	// (§3 D1); with no parseable id the roundless call resolves the newest round.
+	if (collected.outputFile) lines.push(`full text: ${artifactReadCall(name, collected.artifactId)}`);
 	return lines.join("\n");
 }
 
@@ -6739,7 +6844,8 @@ function renderCollect(
  * same way: never print `4.0 KB of 3.1 KB`.
  *
  * `legion_output` is the recovery D7 exists for (`{ name }` resolves the latest round);
- * the caller still gets `full output: <path>` on the next line as the generic bypass.
+ * the caller's own `full text: legion_output({ name: <name>, round: <round> })` line
+ * follows, so this sentence and that line name the same reader (P5d: never a path).
  */
 function cachedHeadLine(
 	name: string,

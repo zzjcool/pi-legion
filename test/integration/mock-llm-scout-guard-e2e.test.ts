@@ -170,13 +170,14 @@ test("e2e: extension harness — notify once, dispatch clears, cooldown blocks s
 		delete process.env.PI_SUBAGENT_UTILITY_CHILD;
 
 		const sent: Array<{ message: SentMessage; options?: SentOptions }> = [];
-		const events = new Map<
-			string,
-			(
-				event: { toolName: string; input?: unknown },
-				ctx?: { cwd?: string },
-			) => unknown
-		>();
+		// The real host runs EVERY `tool_call` handler for a call (scout-guard, the child
+		// guard and the P5d artifact-path guard all register one), so the fake keeps a
+		// list — a single-slot Map would silently drop all but the last.
+		type ToolCallObserver = (
+			event: { toolName: string; input?: unknown },
+			ctx?: { cwd?: string },
+		) => unknown;
+		const events = new Map<string, ToolCallObserver[]>();
 		let hookReturned = true;
 		const pi = {
 			registerMessageRenderer() {},
@@ -192,24 +193,20 @@ test("e2e: extension harness — notify once, dispatch clears, cooldown blocks s
 			},
 			events: { emit() {} },
 			on(name: string, handler: unknown) {
-				events.set(
-					name,
-					handler as (
-						event: { toolName: string; input?: unknown },
-						ctx?: { cwd?: string },
-					) => unknown,
-				);
+				events.set(name, [...(events.get(name) ?? []), handler as ToolCallObserver]);
 			},
 		};
 		piLegion(pi as never, { supervisor: new FakeSupervisor() });
-		const handler = events.get("tool_call");
-		assert.equal(typeof handler, "function");
+		const observers = events.get("tool_call") ?? [];
+		assert.ok(observers.length > 0, "the extension registers a `tool_call` observer");
 
 		const call = (toolName: string, input: unknown) => {
 			hookReturned = false;
-			const result = handler?.({ toolName, input }, { cwd: dir });
+			for (const observer of observers) {
+				const result = observer({ toolName, input }, { cwd: dir });
+				assert.equal(result, undefined, "tool_call must not block");
+			}
 			hookReturned = true;
-			assert.equal(result, undefined, "tool_call must not block");
 		};
 		const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 		const reminders = () =>
@@ -326,13 +323,14 @@ test("e2e: mock-llm + harness — feed scripted read names into scout-guard", as
 		delete process.env[CHILD_ROLE_ENV];
 
 		const sent: Array<{ message: SentMessage; options?: SentOptions }> = [];
-		const events = new Map<
-			string,
-			(
-				event: { toolName: string; input?: unknown },
-				ctx?: { cwd?: string },
-			) => unknown
-		>();
+		// The real host runs EVERY `tool_call` handler for a call (scout-guard, the child
+		// guard and the P5d artifact-path guard all register one), so the fake keeps a
+		// list — a single-slot Map would silently drop all but the last.
+		type ToolCallObserver = (
+			event: { toolName: string; input?: unknown },
+			ctx?: { cwd?: string },
+		) => unknown;
+		const events = new Map<string, ToolCallObserver[]>();
 		const pi = {
 			registerMessageRenderer() {},
 			registerTool() {},
@@ -342,18 +340,12 @@ test("e2e: mock-llm + harness — feed scripted read names into scout-guard", as
 			},
 			events: { emit() {} },
 			on(name: string, handler: unknown) {
-				events.set(
-					name,
-					handler as (
-						event: { toolName: string; input?: unknown },
-						ctx?: { cwd?: string },
-					) => unknown,
-				);
+				events.set(name, [...(events.get(name) ?? []), handler as ToolCallObserver]);
 			},
 		};
 		piLegion(pi as never, { supervisor: new FakeSupervisor() });
-		const handler = events.get("tool_call");
-		assert.equal(typeof handler, "function");
+		const observers = events.get("tool_call") ?? [];
+		assert.ok(observers.length > 0, "the extension registers a `tool_call` observer");
 
 		const messages: unknown[] = [{ role: "user", content: "scout the tree" }];
 		for (let i = 0; i < THRESHOLD; i += 1) {
@@ -361,7 +353,7 @@ test("e2e: mock-llm + harness — feed scripted read names into scout-guard", as
 			const call = turn.choices[0]?.message.tool_calls?.[0];
 			assert.ok(call);
 			const args = JSON.parse(call.function.arguments) as unknown;
-			handler?.({ toolName: call.function.name, input: args }, { cwd: dir });
+			for (const observer of observers) observer({ toolName: call.function.name, input: args }, { cwd: dir });
 			messages.push({
 				role: "assistant",
 				content: null,

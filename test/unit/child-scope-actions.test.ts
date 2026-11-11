@@ -455,8 +455,12 @@ test("#312 collect: an explicit runId collects that run's node, not a live same-
 		// The other node's snapshot must neither answer this call nor be persisted
 		// into the scoped run: `runtime.get(name)` is not `found.runId`.
 		assert.doesNotMatch(collected.text, /own-worker-0-ok/);
-		assert.match(collected.text, new RegExp(`runs/${scopedRunId}/`));
-		assert.doesNotMatch(collected.text, /runs\/[^/]+\/worker-0\.output\.md[\s\S]*own-worker-0-ok/);
+		// P5d took the artifact PATH out of the render (the model is handed the reader, not
+		// a locator), so the same "the scoped run answered" fact is read from the machine
+		// facts instead: the artifact id the delivery names carries `<runId>/<name>/r<round>`
+		// (§3 D1). An id naming the live job's run — or two ids — would fail here.
+		const ledgerReads = (collected.details as unknown as { ledgerReads?: string[] } | undefined)?.ledgerReads;
+		assert.deepEqual(ledgerReads, [`${scopedRunId}/worker-0/r1`]);
 	} finally {
 		await harness.cleanup();
 	}

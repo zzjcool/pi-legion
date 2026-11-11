@@ -92,17 +92,20 @@ export interface CompletionInput {
 		errorKind?: string;
 	};
 	output: string;
-	/** Full output on disk; the truncated preview names this path. */
+	/**
+	 * Full output on disk — an ARTIFACT body (P5d), so the truncated preview and the
+	 * `Full text:` line name `legion_output`, never this path.
+	 */
 	outputFile?: string;
 	/**
 	 * Result-ledger identity of `outputFile` (`"<runId>/<name>/r<round>"`), when this
 	 * result has one.
 	 *
-	 * Additive and NOT part of the rendered notice: the body, the subject and every
-	 * line of the text are unchanged (§3 D9 keeps the preview, P4 adds the pointer
-	 * later). It rides here because the notice entry is the only per-entry carrier
-	 * the delivery seam sees, and the P3 shadow needs to know WHICH artifact the old
-	 * claim set is being compared against.
+	 * Rides here because the notice entry is the only per-entry carrier the delivery
+	 * seam sees, the P3 shadow needs to know WHICH artifact the old claim set is being
+	 * compared against, and since P5d its `round` is also what the rendered
+	 * `Full text: legion_output({ name, round })` line prints. The body and the subject
+	 * are unchanged (§3 D9 keeps the preview; the pointer is added, §6 P4).
 	 */
 	artifactId?: string;
 	sessionFile?: string;
@@ -242,26 +245,70 @@ const PREVIEW_CHARS = 4_000;
  */
 const OUTPUT_TOOL = "legion_output";
 
+/**
+ * P5d (user ruling, 2026-11-11): "还是文件，但文件路径永远不让 agent 知道，也不告诉他，
+ * 只指引他通过工具来读；软的就可以了".
+ *
+ * So a render names the READER, never the file. The body is still an ordinary
+ * (immutable) file on disk — nothing is encrypted or moved — it is simply not an
+ * address the model is ever handed. `round` is read out of the artifact id
+ * (`"<runId>/<name segment>/r<round>"`, §3 D1); without a parseable id the roundless
+ * call stands, and `legion_output` resolves the newest round itself.
+ */
+export function artifactReadCall(name: string, artifactId?: string | undefined): string {
+	const round = artifactRoundFromId(artifactId);
+	const roundArg = round === undefined ? "" : `, round: ${round}`;
+	return `${OUTPUT_TOOL}({ name: ${JSON.stringify(name)}${roundArg} })`;
+}
+
+/**
+ * The round in `"<runId>/<name segment>/r<round>"`, or `undefined` for anything else.
+ *
+ * Read off the TAIL: a name is one sanitized path segment (§3 D1d) and the file is
+ * `r<round>` — canonical spelling only, the same rule `artifactIdFromPath` applies in
+ * the other direction. Never throws: a render must not fail because an id written by
+ * another build has another shape.
+ */
+function artifactRoundFromId(artifactId: string | undefined): number | undefined {
+	if (typeof artifactId !== "string" || artifactId.length === 0) return undefined;
+	try {
+		const parts = artifactId.split("/");
+		if (parts.length < 3) return undefined;
+		const file = parts[parts.length - 1] ?? "";
+		const segment = parts[parts.length - 2] ?? "";
+		if (segment.length === 0 || segment === "." || segment === "..") return undefined;
+		const match = /^r(\d+)$/.exec(file);
+		if (!match) return undefined;
+		const round = Number(match[1]);
+		if (!Number.isSafeInteger(round) || round < 1) return undefined;
+		if (file !== `r${round}`) return undefined;
+		return round;
+	} catch {
+		return undefined;
+	}
+}
+
 /** The two keys {@link buildPreview} needs: where the full text lives, and how to say so. */
 interface PreviewHints {
-	/** Durable full-text path (artifact or session file) — the generic bypass. */
+	/**
+	 * A session file (`.jsonl`) — the diagnostic pointer, not an artifact, so it is the
+	 * one durable path a notice may still print (P5d).
+	 */
 	sessionFile?: string;
 	name?: string;
 	/**
-	 * P5c: the entry has a ledger artifact (D1), so `legion_output({ name })` — not the
-	 * path — is the ONE-STEP recovery, and the truncation hint says that instead.
+	 * P5d: the durable full text IS an artifact body, so the truncation hint names
+	 * `legion_output` — the ONE-STEP read (D7) — instead of printing its path.
 	 */
 	artifact?: boolean;
 }
 
 /**
- * D9/P5c: the durable full-text path, plus the tool pointer when the entry has a ledger
- * artifact — `legion_output({ name })` is the one-step read (D7), the path is the
- * generic bypass the D5 hook also accounts for. One shape for both notice forms.
+ * P5d: the durable full text as the model can reach it — `legion_output`, never a path.
+ * One shape for both notice forms (a single child and a batch entry).
  */
-function fullOutputLine(path: string, name: string, artifact: boolean, indent = ""): string {
-	const pointer = artifact ? ` · ${OUTPUT_TOOL}({ name: ${JSON.stringify(name)} })` : "";
-	return `${indent}Full output: ${path}${pointer}`;
+function fullTextLine(name: string, artifactId: string | undefined, indent = ""): string {
+	return `${indent}Full text: ${artifactReadCall(name, artifactId)}`;
 }
 
 /**
@@ -437,11 +484,10 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 	const previewHints: PreviewHints = {};
 	if (input.name) previewHints.name = input.name;
 	// P5c (D9): an artifact makes `legion_output` the one-step recovery, so the hint
-	// names the TOOL instead of telling the parent to read a path.
-	if (input.artifactId) previewHints.artifact = true;
-	// Prefer the durable full-text artifact over the session file as the
-	// recovery pointer: one `read` beats re-deriving from jsonl/chat store.
-	if (input.outputFile) previewHints.sessionFile = input.outputFile;
+	// names the TOOL instead of telling the parent to read a path — and since P5d an
+	// `outputFile` IS such an artifact body too, so the path never appears. A session file
+	// stays a path: it is a diagnostic pointer, not an artifact.
+	if (input.artifactId || input.outputFile) previewHints.artifact = true;
 	else if (input.sessionFile) previewHints.sessionFile = input.sessionFile;
 	const previewParts = buildPreview(input.output, PREVIEW_CHARS, previewHints);
 	const preview = previewParts.text;
@@ -462,9 +508,7 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 		"",
 		preview,
 		previewBytesLine,
-		input.outputFile
-			? fullOutputLine(input.outputFile, input.name, input.artifactId !== undefined)
-			: undefined,
+		input.outputFile ? fullTextLine(input.name, input.artifactId) : undefined,
 		input.sessionFile ? "" : undefined,
 		input.sessionFile ? `Session file: ${input.sessionFile}` : undefined,
 		input.recycled === false
@@ -603,14 +647,12 @@ export function formatGroupedNotice(
 		// be released while another child is still alive, so no blanket footer.
 		const recycled = entry.recycled === false ? "" : " (child retired)";
 		lines.push(`- ${label}: ${entry.status}${reason}${acceptance}${recycled}`);
-		// Prefer the durable full-text artifact over the session file as the
-		// recovery pointer: one `read` beats re-deriving from jsonl/chat store.
-		const fullText = entry.outputFile ?? entry.sessionFile;
 		const previewHints: PreviewHints = {};
 		if (entry.name) previewHints.name = entry.name;
-		// P5c (D9): an artifact ⇒ `legion_output` is the one-step recovery.
-		if (entry.artifactId) previewHints.artifact = true;
-		if (fullText) previewHints.sessionFile = fullText;
+		// P5d: `outputFile` is an artifact body, so the hint names the reader; a session
+		// file stays a path (a diagnostic pointer, not an artifact).
+		if (entry.outputFile) previewHints.artifact = true;
+		else if (entry.sessionFile) previewHints.sessionFile = entry.sessionFile;
 		const entryPreview = buildPreview(entry.output, perEntryMax, previewHints);
 		lines.push(`  ${entryPreview.text}`);
 		// D9/P5c: no extra size line per entry. The batch body is bounded by the
@@ -619,8 +661,7 @@ export function formatGroupedNotice(
 		// spend the batch budget on bookkeeping. The single-child notice — where the
 		// collapsed row really did read the preview's size as the child's size — carries
 		// the `preview X of Y` pair.
-		if (entry.outputFile)
-			lines.push(fullOutputLine(entry.outputFile, entry.name, entry.artifactId !== undefined, "  "));
+		if (entry.outputFile) lines.push(fullTextLine(entry.name, entry.artifactId, "  "));
 	}
 	// D9/P5c: every member that has a ledger artifact — the machine locator a diagnostic
 	// (or a later renderer) uses to find the texts this batch stands for.
