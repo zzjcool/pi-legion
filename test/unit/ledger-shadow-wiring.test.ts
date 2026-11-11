@@ -13,12 +13,14 @@
  *    `ownLegionIdentity()` — the connection the entry already owns. No
  *    `openLegionDb`, no second connection to the same file, no env check of its
  *    own (the switch is the runtime's), and `undefined` when there is no identity.
- * 2. **the runtime only asks when the flag says so**: with
- *    `PI_LEGION_LEDGER_SHADOW` unset the hook is never CALLED, so the wiring above
- *    cannot open, query or allocate anything on the default path (默认零开销).
+ * 2. **the flag governs the COMPARISON, not the projection**: since P4b
+ *    (`result-ledger-v1` §3 D4) `getLedgerShadowFacts` is the delivery predicate's
+ *    input, so the runtime asks for it on EVERY delivery decision — flag or no flag.
+ *    What the flag buys is `compareDelivery`: with `PI_LEGION_LEDGER_SHADOW` unset
+ *    no comparison, no formatting and no stderr line happen on top of the read.
  *
- * Together: delete the wiring and (1) goes red; make the hook unconditional and
- * (2) goes red.
+ * Together: delete the wiring and (1) goes red; make the SHADOW unconditional (i.e.
+ * compare without the flag) and the shadow tests go red.
  */
 
 import assert from "node:assert/strict";
@@ -79,9 +81,9 @@ test("D11 wiring: index.ts hands the runtime the ledger handle and the consumer 
 	assert.doesNotMatch(hookWindow, new RegExp(SHADOW_ENV));
 });
 
-// ───────────── 2. …and asks for it only when the shadow is switched on ─────────────
+// ───────────── 2. …and the flag governs the comparison, not the projection ─────────────
 
-test("默认零开销: with the flag off the runtime never asks the host for ledger facts", async () => {
+test("P4b: the hook is asked either way — the projection is the predicate, the flag only adds the comparison", async () => {
 	const previous = process.env[SHADOW_ENV];
 	const messages: unknown[] = [];
 	let asked = 0;
@@ -91,7 +93,8 @@ test("默认零开销: with the flag off the runtime never asks the host for led
 			messages.push(message);
 		},
 		// Deliberately answers `undefined`: this case is about WHETHER the hook is
-		// called, not about what a ledger would say.
+		// called, not about what a ledger would say (an undefined answer means "no
+		// projection", which keeps the notice deliverable — the positive control).
 		getLedgerShadowFacts: () => {
 			asked += 1;
 			return undefined;
@@ -114,13 +117,19 @@ test("默认零开销: with the flag off the runtime never asks the host for led
 		};
 
 		await deliver("shadow-off");
-		assert.equal(asked, 0, "the flag is off: the hook is not even called (no db lookup, not even undefined)");
+		const askedWithFlagOff = asked;
+		assert.ok(
+			askedWithFlagOff >= 1,
+			"P4b: the delivery predicate IS the projection now, so the hook is asked with the flag off too",
+		);
+		assert.equal(messages.length, 1, "positive control: no projection ⇒ the notice is delivered");
 
-		// Positive control: the hook IS reachable — so the zero above is the flag, not a
-		// wiring that never fires.
+		// …and the flag adds the comparison on top of the SAME read (its own cost is the
+		// bundle of work `compareDelivery` needs, not a second connection).
 		process.env[SHADOW_ENV] = "1";
 		await deliver("shadow-on");
-		assert.equal(asked, 1, "the flag is on: the seam asks, and an undefined answer keeps it silent");
+		assert.ok(asked > askedWithFlagOff, "the flag on: the shadow compares on top of the projection read");
+		assert.equal(messages.length, 2, "positive control: both children were delivered");
 	} finally {
 		runtime.dispose();
 		if (previous === undefined) delete process.env[SHADOW_ENV];

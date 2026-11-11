@@ -1991,15 +1991,21 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				? attachUsageTotals(identity.db, getSubtree(identity.db, identity.nodeId))
 				: [];
 		},
-		// P3 ledger shadow (`result-ledger-v1` §3 D11): the ledger handle and the
-		// consumer id (`parent_id`) the old claim set is compared against.
+		// The ledger handle + consumer id (`parent_id`) the runtime asks about, or
+		// `undefined` before this entry has an identity.
 		//
-		// Asked ONLY when `PI_LEGION_LEDGER_SHADOW=1` (the runtime's first condition), so
-		// this line is dead weight on every other run. Answered from the connection THIS
-		// entry already owns — `openLegionDb` is deliberately not called here: a second
-		// connection to the same file for a diagnostic would be a fact the shadow cannot
-		// justify. No identity yet (a root has no ledger before its first launch) answers
-		// `undefined`, which the shadow reads as "nothing to compare" and stays silent.
+		// Since P4b (`result-ledger-v1` §3 D4) this is the DELIVERY PROJECTION's input, not
+		// a diagnostic switch: every notice decision asks it — `ledger.undelivered(...)` for
+		// "still owed" and `ledger.listArtifacts(...)` for "does this id even exist", plus
+		// `markNotified` on a successful send. `PI_LEGION_LEDGER_SHADOW=1` only adds the
+		// P3 comparison line on top (D11); it is NOT what makes the hook live.
+		//
+		// Answered from the connection THIS entry already owns — `openLegionDb` is
+		// deliberately not called here: a second connection to the same file for a
+		// diagnostic would be a fact neither the projection nor the shadow can justify. No
+		// identity yet (a root has no ledger before its first launch) answers `undefined`,
+		// which the runtime reads as "no projection" and handles by degrading to its
+		// in-memory `deliveredOnce` (宁多推一条，不静默丢).
 		getLedgerShadowFacts: () => {
 			const identity = ownLegionIdentity();
 			return identity ? { db: identity.db, consumerId: identity.nodeId } : undefined;

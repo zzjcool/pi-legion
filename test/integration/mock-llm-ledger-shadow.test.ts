@@ -27,11 +27,12 @@
  * at flush time the old model must suppress that entry, and the ledger must agree
  * it is settled. That agreement is what this test measures.
  *
- * P3 boundary, stated on purpose: nothing in the shipped code writes `read_bytes`
- * or `notified_at` yet — the tool-layer `markRead` is P5's (D3) and the flush-side
- * `markNotified` is P4's (D4). So the test performs the read-side write the P5
- * tool layer will perform, and asserts the *notification*-side artifact is still
- * `undelivered` afterwards (P4's job), instead of pretending P3 already records it.
+ * P3 boundary, stated on purpose: nothing in the shipped code wrote `read_bytes` or
+ * `notified_at` when this test was written — the tool-layer `markRead` is P4a's (D3)
+ * and the flush-side `markNotified` is P4b's (D4). So the test performs the read-side
+ * write the tool layer performs. Since P4b the NOTIFICATION-side write is real: the
+ * delivered artifact leaves `undelivered` by `notified_at` instead of lingering there,
+ * which is exactly what the last assertion now pins (it used to pin the gap).
  */
 
 import assert from "node:assert/strict";
@@ -224,10 +225,14 @@ test("P3 e2e: a two-child run produces no ledger-shadow mismatch — one route c
 			false,
 			"the collected artifact was read to EOF: the projection no longer owes it",
 		);
+		// P4b boundary: the flush-side write landed (`markNotified`), so the delivered
+		// artifact is settled by the very projection that suppressed the collected one.
+		// P3 documented this as its own gap ("that is P4"); the expectation is now the
+		// post-P4b fact, not the gap.
 		assert.equal(
 			projected.includes(notified.id),
-			true,
-			"P3 records no `notified_at` yet (that is P4) — the delivered artifact is still projected",
+			false,
+			"the delivered notice wrote `notified_at`: the projection no longer owes it",
 		);
 		assert.ok(mock.requestCount() >= 2, "both children's text came from the mock backend");
 	} finally {

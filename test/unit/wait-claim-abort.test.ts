@@ -42,6 +42,8 @@ import {
 	type CollectSnapshot,
 	type SessionRuntime,
 } from "../../src/extension/runtime.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { markRead, recordArtifact } from "../../src/legion/ledger.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { DEFAULTS, type AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -62,6 +64,19 @@ function terminalSnapshot(output: string): CollectSnapshot {
 		acceptance: { status: "accepted", level: "attested" },
 	};
 }
+
+/**
+ * P4b: the artifact the fixture's child result is filed under.
+ *
+ * Since P4b the delivery predicate is `ledger.undelivered(consumerId)`, so a fixture
+ * that wants to describe "the parent has this result" has to say it the way the
+ * shipping code says it: an artifact row, and a `read_bytes` high-water mark written
+ * by the tool layer AFTER it handed the result over (P4a/`settleControlResult`).
+ * `deliver()` below is exactly that write; a case that does NOT call it describes the
+ * abort branch, where no read fact exists and the notice is still owed.
+ */
+const CHILD_ARTIFACT = "r-1/x/r1";
+const CHILD_BYTES = 10;
 
 function agentConfig(name: string): AgentConfig {
 	return { name, description: `${name} role`, source: "user" } as AgentConfig;
@@ -166,6 +181,8 @@ interface ClaimedNoticeFixture {
 	claim: ClaimedCollect | undefined;
 	pendingBeforeClaim: number;
 	pending(): number;
+	/** P4a's tool-layer write: the result was handed over, so the projection settles it. */
+	deliver(): void;
 	unclaim(claimedNow: boolean): void;
 	flush(): Promise<void>;
 	dispose(): void;
@@ -183,10 +200,23 @@ interface ClaimedNoticeFixture {
  */
 async function claimedNoticeFixture(input: { probe?: boolean } = {}): Promise<ClaimedNoticeFixture> {
 	const messages: SentMessage[] = [];
+	// P4b: the ledger the notice projection reads (a real one, in memory).
+	const db = openLegionDb(":memory:");
+	recordArtifact(db, {
+		id: CHILD_ARTIFACT,
+		parentId: "root",
+		nodeId: `root.${CHILD}`,
+		name: CHILD,
+		round: 1,
+		path: `/tmp/r-1/artifacts/${CHILD}/r1.md`,
+		bytes: CHILD_BYTES,
+		createdAt: 1_000,
+	});
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
 			messages.push(message as SentMessage);
 		},
+		getLedgerShadowFacts: () => ({ db, consumerId: "root" }),
 	});
 	// A live parent run makes the notice WAIT in the run-scoped outbox, so the
 	// delivery attempt happens at settle — after the claim exists.
@@ -198,7 +228,7 @@ async function claimedNoticeFixture(input: { probe?: boolean } = {}): Promise<Cl
 		agent: "worker",
 		sessionFile: `/tmp/${CHILD}.jsonl`,
 		timeoutMs: DEFAULTS.turnTimeoutMs,
-		collect: async () => terminalSnapshot("x-out"),
+		collect: async () => ({ ...terminalSnapshot("x-out"), artifactId: CHILD_ARTIFACT }),
 	});
 	runtime.watch(CHILD);
 	await until(
@@ -217,6 +247,13 @@ async function claimedNoticeFixture(input: { probe?: boolean } = {}): Promise<Cl
 		claim,
 		pendingBeforeClaim,
 		pending: () => runtime.noticeQueueStats().pending,
+		deliver: () =>
+			markRead(db, {
+				artifactId: CHILD_ARTIFACT,
+				consumerId: "root",
+				bytesRead: CHILD_BYTES,
+				at: 2_000,
+			}),
 		unclaim: (claimedNow: boolean) => {
 			assert.ok(claim, "fixture: there is no claim to hand back");
 			runtime.unclaimUndelivered(CHILD, claim.snapshot, claimedNow);
@@ -227,21 +264,33 @@ async function claimedNoticeFixture(input: { probe?: boolean } = {}): Promise<Cl
 			runtime.notifyParentSettled();
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		},
-		dispose: () => runtime.dispose(),
+		dispose: () => {
+			runtime.dispose();
+			db.close();
+		},
 	};
 }
 
-test("#352 mechanism: the probe's claim takes the queued notice out of `pending`, so the flush delivers nothing", async () => {
+test("#352 mechanism: the tool layer's read write takes the queued notice out of `pending`, so the flush delivers nothing", async () => {
 	const fixture = await claimedNoticeFixture();
 	try {
-		assert.equal(fixture.pendingBeforeClaim, 1, "fixture: the notice was deliverable before the claim");
+		assert.equal(fixture.pendingBeforeClaim, 1, "fixture: the notice was deliverable before the delivery");
 		const claim = fixture.claim;
 		assert.ok(claim, "fixture: the probe took a claim");
 		assert.equal(claim.claimedNow, true, "the probe's call took the claim for the round — THIS is the site");
 		assert.equal(claim.snapshot.output, "x-out", "…for this child's result");
-		assert.equal(fixture.pending(), 0, "the claimed round leaves `pending` at once — `deliverBatch` will filter it");
+		assert.equal(
+			claim.snapshot.artifactId,
+			CHILD_ARTIFACT,
+			"…and it names the artifact the ledger files it under (P4b's projection input)",
+		);
+		// P4b: `deliverBatch` filters on `ledger.undelivered(consumerId)`, so the fact that
+		// settles this round is the read row the tool layer writes after handing the result
+		// over (P4a). Without it nothing is settled — which is exactly the abort branch.
+		fixture.deliver();
+		assert.equal(fixture.pending(), 0, "the delivered round leaves `pending` at once — `deliverBatch` will filter it");
 		await fixture.flush();
-		assert.equal(fixture.messages.length, 0, "a claimed round delivers nothing: the notice is filtered, not missing");
+		assert.equal(fixture.messages.length, 0, "a delivered round announces nothing: the notice is filtered, not missing");
 	} finally {
 		fixture.dispose();
 	}
@@ -256,8 +305,9 @@ test("#352 wrong claim: unclaimUndelivered(…, false) rolls nothing back", asyn
 		// `waitOne`'s `claimReported` answers `false` on this path (the probe was
 		// first); rolling that value back is a no-op by contract — a claim an earlier
 		// delivery took is evidence, not a loan.
+		fixture.deliver();
 		fixture.unclaim(false);
-		assert.equal(fixture.pending(), 0, "a `claimedNow === false` rollback leaves the claim standing");
+		assert.equal(fixture.pending(), 0, "a `claimedNow === false` rollback leaves the delivery standing");
 		await fixture.flush();
 		assert.equal(
 			fixture.messages.length,
@@ -289,9 +339,16 @@ test("#352 control: unclaimUndelivered(…, true) with the probe's pair delivers
 
 // ─────────────────────── the seam: what `waitAction` carries out ───────────────────────
 
-test("#352 seam: waitAction exposes the claims IT took (and only those) as details.waitClaims; handing them back delivers exactly once", async () => {
+test("#352 seam: waitAction exposes the claims IT took (and only those) as details.waitClaims — an ABORTED wait writes no read row, so the notice arrives exactly once", async () => {
 	// `probe: false`: the round is still unclaimed when the wait arrives, so the wait
 	// itself is the one that takes the claim — the only kind it may travel out.
+	//
+	// P4b/v1.10: this case walks the PRODUCTION order of an aborted wait, not the
+	// forbidden one. D3b puts the read write after the abort net, so a result the net
+	// throws away was never recorded as read (no `read_bytes`), which means the round is
+	// STILL OWED — that is the guarantee #352 needs, and it holds without any rollback.
+	// (The reverse order — write the read row, then discard the result — is what D3b
+	// exists to prevent, so nothing here may pin it as expected behaviour.)
 	const fixture = await claimedNoticeFixture({ probe: false });
 	const { store, cwd, cleanup } = tempStore();
 	try {
@@ -304,15 +361,23 @@ test("#352 seam: waitAction exposes the claims IT took (and only those) as detai
 		assert.equal(details?.waitClaims?.length, 1, "the probe's claim must travel with the result, or the bail cannot give it back");
 		assert.equal(details?.waitClaims?.[0]?.name, CHILD);
 		assert.equal(details?.waitClaims?.[0]?.snapshot.output, "x-out", "…and it must be the claim for THIS result");
-		assert.equal(fixture.runtime.noticeQueueStats().pending, 0, "fixture: the claim filters the queued notice");
+		assert.equal(
+			details?.waitClaims?.[0]?.snapshot.artifactId,
+			CHILD_ARTIFACT,
+			"…naming the artifact, which is what the tool layer's read write would be keyed on",
+		);
+		// No read row was written (the net is about to discard the result), so the notice
+		// is still owed — for real, not as a pending flag.
+		assert.equal(fixture.runtime.noticeQueueStats().pending, 1, "nothing settled this round yet");
 
 		// EXACTLY what the abort net does with a result it throws away (`index.ts`):
 		// `claimedNow` is always true here — `details.waitClaims` only ever holds
 		// claims this call took.
 		await releaseWaitClaims(fixture.runtime, result.details);
-		assert.equal(fixture.runtime.noticeQueueStats().pending, 1, "the rollback puts the notice back into `pending`");
+		assert.equal(fixture.runtime.noticeQueueStats().pending, 1, "the round is still owed after the bail");
 		await fixture.flush();
-		assert.equal(fixture.messages.length, 1, "and the flush then delivers it — exactly once");
+		assert.equal(fixture.messages.length, 1, "the aborted wait announced the result exactly once");
+		assert.match(fixture.messages[0]!.content, /x-out/);
 	} finally {
 		cleanup();
 		fixture.dispose();
@@ -324,9 +389,10 @@ test("#352 seam control: a round another path already claimed is NOT recorded, s
 	const { store, cwd, cleanup } = tempStore();
 	try {
 		// Someone else delivered first (a watch flush, an earlier wait, a collect):
-		// its claim is evidence, not a loan.
+		// its read fact is evidence, not a loan.
 		const earlier = await fixture.runtime.consumeCollect(CHILD);
 		assert.equal(earlier?.claimedNow, true, "fixture: the first consumer took the claim");
+		fixture.deliver();
 		assert.equal(fixture.runtime.noticeQueueStats().pending, 0);
 
 		const result = await within(

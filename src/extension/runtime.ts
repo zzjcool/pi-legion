@@ -56,8 +56,8 @@ import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
 import { getSubtree } from "../legion/nodes.ts";
 import { attachUsageTotals } from "../legion/usage.ts";
 import { maxEventId } from "../legion/events.ts";
-import { undelivered } from "../legion/ledger.ts";
-import { compareDelivery, shadowEnabled } from "./ledger-shadow.ts";
+import { listArtifacts, markNotified, undelivered } from "../legion/ledger.ts";
+import { compareDelivery, shadowEnabled, SHADOW_MISMATCH_PREFIX } from "./ledger-shadow.ts";
 import { publishLegionRunActivity } from "../legion/run-active.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 import type { PhaseMachine } from "../legion/phase-machine.ts";
@@ -263,18 +263,24 @@ export interface SessionRuntimeDeps {
 	/** Injectable timer for the MAX_PENDING_AGE_MS horizon (tests fire it manually); default = unref'd setTimeout. */
 	scheduleNoticeOverflow?: (ms: number, fn: () => void) => JoinSchedulerHandle;
 	/**
-	 * P3 ledger shadow (`result-ledger-v1` §3 D11) — the ledger handle plus the
-	 * consumer id (`parent_id`) the old claim set is compared against, or `undefined`
-	 * when this host has neither.
+	 * The ledger handle plus the consumer id (`parent_id`) the runtime asks about — or
+	 * `undefined` when this host has neither.
 	 *
-	 * Consulted ONLY when `PI_LEGION_LEDGER_SHADOW=1` (`shadowEnabled`), so the flag's
-	 * off path never calls it: 默认零开销. The runtime does not open its own connection
-	 * for the shadow — the host already owns one, and a second writer of the same file
-	 * would be a fact this diagnostic cannot justify.
+	 * Since P4b (`result-ledger-v1` §3 D4) this is the DELIVERY PROJECTION: whether a
+	 * result still owes the parent a notice is answered by
+	 * `ledger.undelivered(consumerId)` (see `ledgerProjection` / `owesDelivery` below),
+	 * and a successful send is recorded with `ledger.markNotified`. P3 read it for the
+	 * shadow comparison (D11), which is where the name comes from, and `index.ts`
+	 * already wires it (from `ownLegionIdentity()`), so the projection is live in a
+	 * real session rather than waiting for a hookup.
+	 *
+	 * The runtime does not open its own connection — the host already owns one, and a
+	 * second writer of the same file would be a fact this code cannot justify.
 	 *
 	 * Optional for the same reason `publishRunActivity` is: `SessionRuntime` is also
 	 * built as a literal double in tests, and a required member would break every one of
-	 * them for no behaviour.
+	 * them for no behaviour. Absent (or throwing) ⇒ no projection ⇒ the `deliveredOnce`
+	 * fallback, never a failed delivery (D1e).
 	 */
 	getLedgerShadowFacts?: () => { db: DatabaseSync; consumerId: string } | undefined;
 }
@@ -328,6 +334,28 @@ function defaultNoticeOverflow(
  * round) plus its coarse verdict.
  */
 type DeliverableEntry = JoinEntry & { status: CompletionStatus };
+
+/**
+ * P4b (`result-ledger-v1` §3 D4): one read of the notice projection, plus the two
+ * facts a `markNotified` write needs.
+ *
+ * Two sets, because "not in the projection" has two very different reasons (v1.10):
+ * - `undeliveredIds` — artifacts this consumer neither was told about nor read to EOF
+ *   ⇒ the suppression answer;
+ * - `knownIds` — every artifact id this consumer actually has a row for. An id outside
+ *   it was never filed (`recordArtifact` is best-effort, D1b's reuse branch does not
+ *   verify the row, a reset `legion.db` without a rebuild): the ledger cannot prove the
+ *   parent ever saw it, so it must not answer "settled".
+ *
+ * `db`/`consumerId` travel with them so the write uses the SAME handle and scope the
+ * verdict was computed from (`undefined` projection ⇒ no write, see `deliverBatch`).
+ */
+interface LedgerProjection {
+	db: DatabaseSync;
+	consumerId: string;
+	undeliveredIds: ReadonlySet<string>;
+	knownIds: ReadonlySet<string>;
+}
 
 /**
  * A completion batch held because the parent agent run is still active (D-A).
@@ -953,6 +981,116 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const claimCachedResult = (name: string, cached: FinishedResult): boolean =>
 		claimReported(cached.runId, name, cached.round);
 
+	// ─────────────────── P4b: the delivery verdict is a PROJECTION ───────────────────
+	//
+	// `result-ledger-v1` D4: whether a result still owes the parent a notice is no
+	// longer a memory bit set at four call sites — it is a query. `undelivered` names
+	// every artifact this consumer has neither been told about nor read to EOF, and that
+	// projection IS the answer (D2's three conjuncts live in `src/legion/ledger.ts` and
+	// nowhere else, A3). A result the parent read through `collect`/`wait` leaves the
+	// projection by `read_bytes` (P4a), a notice that went out leaves it by
+	// `notified_at` (below) — one predicate, two facts, no rank.
+	//
+	// A projection can also be UNAVAILABLE: no `legion.db` wired into this host yet, no
+	// `consumerId`, a result collected with no ledger context (no artifact id), or a host
+	// hook that throws. Those entries fall back to `deliveredOnce` — the smallest memory
+	// this seam can get away with: one set of already-sent keys, no rollback API, and
+	// (unlike the claim set it replaces) no part in dropping join/outbox copies. It can
+	// only ever ADD suppression, so the failure direction is "a notice is repeated",
+	// never "a notice is lost"; it is also the record of a delivery whose ledger write
+	// (v1.10: `markNotified`) failed, which is why `owesDelivery` reads it first.
+	//
+	// Both the fallback and the ledger write are keyed the same way the claim set was
+	// (`runId\0name\0round`): the round is what makes a child's SECOND round a
+	// different result rather than a repeat of the first (D1).
+	const deliveredOnce = new Set<string>();
+
+	/**
+	 * One read of the projection. `undefined` = no projection available (D1e: a
+	 * missing/closed handle or a throwing host hook is "no ledger", not a failed
+	 * send — the caller degrades, it never throws).
+	 */
+	const ledgerProjection = (): LedgerProjection | undefined => {
+		try {
+			const facts = deps.getLedgerShadowFacts?.();
+			if (!facts) return undefined;
+			return {
+				db: facts.db,
+				consumerId: facts.consumerId,
+				undeliveredIds: new Set(undelivered(facts.db, facts.consumerId).map((artifact) => artifact.id)),
+				// v1.10: the scope of the projection's authority. Same query family, same
+				// `parent_id` scope, served by `idx_artifacts_parent`.
+				knownIds: new Set(listArtifacts(facts.db, facts.consumerId).map((artifact) => artifact.id)),
+			};
+		} catch {
+			return undefined;
+		}
+	};
+
+	/**
+	 * v1.10 diagnostic (review critical): an artifact id this consumer has no row for.
+	 *
+	 * A diagnostic, never a decision: by the time this runs the verdict has already
+	 * failed OPEN. Gated on the shadow flag so the default path stays silent (D11), one
+	 * line per id (this runs on every `noticeQueueStats()` poll too, and a diagnostic must
+	 * not become a stderr firehose), and wrapped because a closed stderr pipe may not
+	 * become a failed delivery.
+	 */
+	const unknownArtifactReported = new Set<string>();
+	const reportUnknownArtifact = (artifactId: string, consumerId: string): void => {
+		if (!shadowEnabled()) return;
+		const key = `${consumerId}\u0000${artifactId}`;
+		if (unknownArtifactReported.has(key)) return;
+		unknownArtifactReported.add(key);
+		try {
+			process.stderr.write(
+				`${SHADOW_MISMATCH_PREFIX} reason=artifact-id-without-ledger-row ` +
+					`artifact=${artifactId} consumer=${consumerId}\n`,
+			);
+		} catch {
+			// D11: diagnostics only.
+		}
+	};
+
+	/**
+	 * D4: does THIS result still owe the parent a notice?
+	 *
+	 * - the fallback memory is read FIRST (v1.10, review major): a `markNotified` that
+	 *   threw already recorded the delivery in `deliveredOnce`, and reading it after the
+	 *   projection branch below would make that fallback dead code — the same result
+	 *   would be re-sent at every boundary;
+	 * - no artifact id, or no projection ⇒ nothing is known ⇒ deliver (contract D3's
+	 *   deliberate direction: 宁多推一条，不静默丢);
+	 * - an artifact id with NO ledger row ⇒ the ledger cannot have judged it, so deliver
+	 *   and say so on stderr (v1.10, review critical) — the alternative is silent loss
+	 *   for a whole class of real cases (best-effort insert failed, db reset without
+	 *   rebuild, D1b reuse of a row that is gone);
+	 * - otherwise the projection IS the answer, and nothing else (D6: a partial read
+	 *   suppresses nothing, because `read_bytes < bytes` keeps it in the set).
+	 *
+	 * `artifactId` is optional on purpose: a LIVE tracked sibling has no artifact yet (the
+	 * store writes one only at settle), so the `Still running` footer asks without an id
+	 * and the answer is always the `deliveredOnce` fallback.
+	 *
+	 * Deliberately does NOT consult the old claim set: mixing the two models here is what
+	 * would make a "delivered" verdict unexplainable. P4c deletes that set.
+	 */
+	const owesDelivery = (
+		runId: string,
+		name: string,
+		round: number,
+		projection: LedgerProjection | undefined,
+		artifactId?: string,
+	): boolean => {
+		if (deliveredOnce.has(reportKey(runId, name, round))) return false;
+		if (artifactId === undefined || !projection) return !deliveredOnce.has(reportKey(runId, name, round));
+		if (!projection.knownIds.has(artifactId)) {
+			reportUnknownArtifact(artifactId, projection.consumerId);
+			return true;
+		}
+		return projection.undeliveredIds.has(artifactId);
+	};
+
 	// ────────────────── #349: bounded completion-cache text ──────────────────
 	//
 	// The cache is an LRU by insertion order (Map preserves it; a hit re-inserts
@@ -1242,10 +1380,16 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * a count off `outbox[0]` would describe a notice nobody is waiting for. The
 	 * arm, `oldestAgeMs` and `heldOverCap` must all name the SAME entry.
 	 */
-	const oldestDeliverable = (): QueuedNotice | undefined =>
-		outbox.find((item) =>
-			item.entries.some((entry) => !isReported(entry.runId, entry.name, entry.round)),
+	const oldestDeliverable = (): QueuedNotice | undefined => {
+		// P4b/D4: the same projection `deliverBatch` will use, so the arm, `oldestAgeMs`
+		// and `heldOverCap` name the notice the flush is actually going to send.
+		const projection = ledgerProjection();
+		return outbox.find((item) =>
+			item.entries.some((entry) =>
+				owesDelivery(entry.runId, entry.name, entry.round, projection, entry.input.artifactId),
+			),
 		);
+	};
 
 	/**
 	 * Arm the horizon timer off the oldest STILL-DELIVERABLE entry.
@@ -1393,32 +1537,39 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 
 	/**
 	 * D5: THE single completion exit. Both the join `deliver` sink and the outbox
-	 * flush go through here and nowhere else, so the claim (D3) is consulted at
-	 * the last possible moment — after the join window and after the outbox wait,
-	 * never at `onTerminal` time where a `wait` could still take the result away.
+	 * flush go through here and nowhere else, so the verdict (P4b/D4: the ledger
+	 * projection) is consulted at the last possible moment — after the join window and
+	 * after the outbox wait, never at `onTerminal` time where a `wait` could still hand
+	 * the result to the parent.
 	 *
 	 * Order is load-bearing:
-	 *  1. filter claimed entries → empty ⇒ return (this IS "read once, never
+	 *  1. filter settled entries → empty ⇒ return (this IS "read once, never
 	 *     repeated");
 	 *  2. format what survives — single & whole ⇒ legacy `Background task …`
 	 *     shape, otherwise the grouped one with `stillRunning` recomputed NOW;
 	 *  3. send immediately, or hold the STRUCTURE (D4) until the run settles;
-	 *  4. claim only after a real delivery: a host rejection (`false`) must stay
-	 *     claimable so a later route can still deliver it.
+	 *  4. record the delivery (`markNotified` / `deliveredOnce`) only after a real
+	 *     one: a host rejection (`false`) must mark nothing so the next boundary can
+	 *     still deliver it.
 	 */
 	const deliverBatch = (
 		entries: readonly DeliverableEntry[],
 		triggerTurn: boolean,
 		partial: boolean,
 	): number => {
-		// P3 shadow (D11): observe the batch BEFORE the claim filter below, and change
-		// nothing about it. A no-op unless `PI_LEGION_LEDGER_SHADOW=1`.
+		// P3 shadow (D11): observe the batch BEFORE the filter below, and change nothing
+		// about it. A no-op unless `PI_LEGION_LEDGER_SHADOW=1`.
 		shadowBatch(entries);
-		// D10 #4: each entry is judged, and later claimed, on ITS OWN round — so two
-		// unread rounds of one child both survive, while a repeated delivery inside one
+		// D10 #4: each entry is judged, and later marked notified, on ITS OWN round — so
+		// two unread rounds of one child both survive, while a repeated delivery inside one
 		// round is still filtered.
-		const surviving = entries.filter(
-			(entry) => !isReported(entry.runId, entry.name, entry.round),
+		//
+		// P4b/D4: ONE projection read for the whole batch (not one per entry), and the
+		// verdict for an entry with an artifact id is that projection alone. A host with no
+		// ledger handle degrades to `deliveredOnce` for every member of the batch.
+		const projection = ledgerProjection();
+		const surviving = entries.filter((entry) =>
+			owesDelivery(entry.runId, entry.name, entry.round, projection, entry.input.artifactId),
 		);
 		if (surviving.length === 0) return 0;
 		let notice: CompletionNotice;
@@ -1449,7 +1600,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						// D4: a job its own liveness hook has declared dead is not "still
 						// running". No hook (`undefined`) is not permission to call it dead.
 						!(job.isAlive && !job.isAlive()) &&
-						!isReported(job.runId, job.name, job.round) &&
+						// D4 (notice-delivery-v2): a sibling belongs in the footer only if it
+						// really will produce another notice. P4b: a LIVE tracked job has no
+						// artifact yet (the store writes one only at settle), so this ask never
+						// has an id and `owesDelivery` always answers from `deliveredOnce` —
+						// 宁少报不假报: a sibling this runtime has not already announced is
+						// listed.
+						owesDelivery(job.runId, job.name, job.round, projection) &&
 						!job.consumedByTool &&
 						!delivering.has(job.name),
 				)
@@ -1463,23 +1620,39 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		// D1: a run boundary is the ONLY delivery moment. While the parent run is
 		// live the batch is held STRUCTURALLY (D4) — not sent, not even as a
 		// followUp: the host cannot retract a message, so anything sent now would
-		// become visible at a moment the claim filter no longer controls (T0 ≠ T2).
+		// become visible at a moment the projection no longer controls (T0 ≠ T2).
 		if (parentRunActive) {
 			outbox.push({ entries: surviving, triggerTurn, partial, enqueuedAt: now() });
 			armOutboxTimer();
 			return 0;
 		}
 		if (deliverCompletion({ sendMessage: deps.sendMessage }, notice, triggerTurn)) {
-			// Redundant by design, NOT the observable main path: for a batch that came
-			// through this exit the tool route could only have claimed first if it ran
-			// between the filter above and this line. Keeping it means a later entry
-			// for the same key can never be re-delivered; the claim that actually
-			// suppresses notices is the one taken by wait/collect, and the filter at
-			// the top of this function is what reads it.
-			for (const entry of surviving) claimReported(entry.runId, entry.name, entry.round);
+			// P4b/D4 step 4: record the delivery. This is the ONLY write on the notice side,
+			// and it is per entry, never per batch:
+			//   - an artifact id with a projection ⇒ `ledger.markNotified` (write-once:
+			//     `COALESCE` keeps the first timestamp, so a replay cannot move it);
+			//   - no artifact id / no projection ⇒ `deliveredOnce` for this exact round.
+			// A host rejection returns above and reaches NEITHER write, so the notice stays
+			// deliverable and the next boundary retries it (D4: “false → do not mark”).
+			const at = now();
+			for (const entry of surviving) {
+				const artifactId = entry.input.artifactId;
+				if (artifactId !== undefined && projection) {
+					try {
+						markNotified(projection.db, { artifactId, consumerId: projection.consumerId, at });
+					} catch {
+						// D1e: a ledger failure is a diagnostic, never a delivery outcome. Falling
+						// back to the memory set keeps the “one notice per result” promise on a
+						// broken handle instead of turning the next boundary into a re-send loop.
+						deliveredOnce.add(reportKey(entry.runId, entry.name, entry.round));
+					}
+				} else {
+					deliveredOnce.add(reportKey(entry.runId, entry.name, entry.round));
+				}
+			}
 			return 1;
 		}
-		// Host rejected the send: no claim is taken (D5 step 4), so the notice is still
+		// Host rejected the send: nothing was marked (D5 step 4), so the notice is still
 		// deliverable. `flushOutbox` reacts by putting the item back at the head; the
 		// direct (idle-run) path has no queue to put it back into — there the child's
 		// session file is the documented recovery path.
@@ -1537,9 +1710,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						// `parentRunActive` branch — one copy is correct, a second would duplicate it.
 						break;
 					}
-					const stillDeliverable = item.entries.some(
-						(entry) => !isReported(entry.runId, entry.name, entry.round),
-					);
+					const stillDeliverable = (() => {
+						// Same verdict `deliverBatch` just applied (P4b/D4): re-queueing is only
+						// correct when the host REJECTED a batch that still owes a notice.
+						const projection = ledgerProjection();
+						return item.entries.some((entry) =>
+							owesDelivery(entry.runId, entry.name, entry.round, projection, entry.input.artifactId),
+						);
+					})();
 					if (stillDeliverable) {
 						// Nothing was sent although a member is still unclaimed ⇒ the host REJECTED
 						// the send (`deliverCompletion` reports the throw as `false`). The claim is
@@ -2811,14 +2989,17 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		},
 
 		noticeQueueStats(): NoticeQueueStats {
-			// Only batches that still have an unclaimed member count: everything else
-			// is already delivered through the other route and will be filtered out at
-			// flush. The FLUSH end is deliberately unchanged — it re-filters, which is
-			// what makes the claim authoritative. The horizon timer and `heldOverCap`
-			// use the same predicate (`oldestDeliverable`), so `pending`, `oldestAgeMs`
-			// and the count all describe the same notice.
+			// Only batches that still owe a notice count: everything else is already
+			// settled — read to EOF (D6) or already announced (D4) — and will be filtered
+			// out at flush. The FLUSH end is deliberately unchanged — it re-reads the
+			// projection, which is what makes the ledger authoritative. The horizon timer
+			// and `heldOverCap` use the same predicate (`oldestDeliverable`), so `pending`,
+			// `oldestAgeMs` and the count all describe the same notice.
+			const projection = ledgerProjection();
 			const deliverable = outbox.filter((item) =>
-				item.entries.some((entry) => !isReported(entry.runId, entry.name, entry.round)),
+				item.entries.some((entry) =>
+					owesDelivery(entry.runId, entry.name, entry.round, projection, entry.input.artifactId),
+				),
 			);
 			const oldest = oldestDeliverable();
 			// #349: the completion cache's footprint, so a long session can see it grow
@@ -2889,6 +3070,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			finished.clear();
 			// D7: the claim table is session state, like the caches above it.
 			reported.clear();
+			// P4b/D4: the degraded-path memory is session state too — `dispose()` is the end
+			// of this runtime's delivery authority, not a boundary that may leak into a
+			// successor.
+			deliveredOnce.clear();
+			unknownArtifactReported.clear();
 			roundOfName.clear();
 			join.dispose();
 			// Shutdown drops held notices unsent: the child's session file survives,

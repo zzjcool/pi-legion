@@ -195,6 +195,13 @@ flushOutbox() → ledger.undelivered(consumerId)
 
 - `undelivered` = `a.parent_id = consumerId AND c.notified_at IS NULL AND COALESCE(c.read_bytes,0) < a.bytes`（D2 的单一谓词，三个合取项）。
 - 已读全文（`read_bytes >= bytes`）→ 投影变空，不补发；已发过通知（`notified_at`）→ 不重发。
+- **投影的权威范围只限账本里存在的 artifact**（P4b 复审判定 critical）：`artifactId` 不在投影里不等于「已交付」，可能是——
+  1) 已读完全 / 已通知 → 抑制；
+  2) **账本里根本没有这一行**（`legion.db` 被删/替换未 rebuild、或 `recordArtifact` 那次 best-effort 插入失败）→ 不能证明交付过。
+  两种情形必须区分：`owesDelivery` 需同时取「undelivered 集」与「已知 id 集」。
+  **账本不认识的 artifactId 一律投递（fail-open）**，并在 shadow 开启时打一行诊断。方向永远选「宁多推，不静默丢」。
+- 账本写失败的兜底：`deliveredOnce` 必须在 `owesDelivery` 的**最前面**被读（先于投影短路），否则该兜底是死代码——
+  同一个已交付结果会在下一个边界重发（P4b 复审 major）。
 - 发送失败 → 不写 `notified_at` → 下次边界重试（沿用 `notice-claim-v1` D5 的 `false → 不 claim`）；**没有回滚 API**。
 - `join.dropBuffered*` 整类删除：成员由投影决定，缓冲里没有「需要撤销的副本」。
 
@@ -394,6 +401,7 @@ legion_output({ name, round?, offset?, limit? })
 | 2026-11-10 | v1.7 FROZEN | P3 交付后改 D11：新侧用 `undelivered`（等价于 `reported`）而非 `hasRead`；退出条件拆方向（`old=deliver ledger=suppress` 必须为 0，反向在 P3 必现且预期）；真机需 `index.ts` 接 `getLedgerShadowFacts`。 |
 | 2026-11-10 | v1.8 FROZEN | P4 拆成 a/b/c 三步（读侧落账 → 投递改投影 → 一次性删除），finished strip 移到 P5；D3 补 bail 顺序、consumerId 取法、artifactId 缺失时不落账。 |
 | 2026-11-10 | v1.9 FROZEN | P4a 交付时新增 **D3b**：落账从 handler 挪到 abort net 之后（handler 只声明 `details.ledgerReads`，唯一写点是 `settleControlResult`）。原因：abort net 会把已落账的结果整条替换成 `interrupted …`，造成静默丢结果。 |
+| 2026-11-10 | v1.10 FROZEN | P4b 复审后补 D4 两条：① 投影权威只限「账本里存在的 artifact」，未知 id 必须 fail-open 投递（否则库重置/插入失败 ⇒ 永久静默）；② `deliveredOnce` 必须在 `owesDelivery` 最前面读，否则 markNotified 抛错时的兜底是死代码。 |
 
 ## 12. 裁决记录
 
