@@ -59,14 +59,22 @@ acceptance:
 ### 规划阶段（内置 `planning`）
 
 - 先完整理解目标与验收条件，再把接口、wire 字段、文件所有权、验收清单写入 `.pi-legion/contract.md`。
-- 可执行的验收命令必须写成 `legion-verify` 围栏块（info string 恰为 `legion-verify`），这是 supervisor 唯一会解析的形式：
+- 可执行的验收命令有两种等价写法，supervisor 都认：
+  - `legion-verify` 围栏块（info string 恰为 `legion-verify`）：
 
-  ```legion-verify
-  npm run typecheck
-  npm test
-  ```
+    ```legion-verify
+    npm run typecheck
+    npm test
+    ```
 
-  写成 `## legion-verify` 标题加普通围栏不会被识别，等价于 0 条命令：阶段按契约直通 done，但没有任何命令被执行。
+  - 裸行写法：一行一条 `legion-verify: <命令>`，行首可带一个 markdown 列表符（`- ` / `* ` / `+ `）：
+
+    ```text
+    - legion-verify: npm run typecheck
+    - legion-verify: npm test
+    ```
+
+  写成 `## legion-verify` 标题、info string 多带参数的围栏（如 ```` ```legion-verify bash ````）、或只在正文里提一句，都**不是**声明——这种「想声明却写错形状」的契约会被判为**验收失败**（团队停在 verifying），不再直通 done。真正「0 commands 直通 done」只剩两种：契约里完全没有 `legion-verify` 字样，以及空的 `legion-verify` 块（§7.3，read-only 队常见）。那是直通，不是绿灯：**`0 commands` 不等于「检查过了」**，汇报时不得把它写成验过。
 - 契约未落盘且非空，不得请求进入实现阶段；发现契约矛盾时停止派工并上报，不得自行解释或扩大文件归属。
 - 契约中的每个写入文件只能有一个 owner；共享文件必须串行分配。
 
@@ -85,8 +93,8 @@ acceptance:
 
 ### 验证与收队（内置 `verifying` / `done`）
 
-- 验证由 supervisor 自动运行契约中 `legion-verify` 围栏块内的命令。全绿后状态机自动进入 done；不要自行宣称验证成功，也不要手动改数据库。
-- 回执里出现 `0 commands` 说明围栏格式没被识别——那一步什么都没跑，不是绿灯；先改契约再重试。
+- 验证由 supervisor 自动运行契约中 `legion-verify` 声明的命令（围栏块或 `legion-verify: <命令>` 裸行）。全绿后状态机自动进入 done；不要自行宣称验证成功，也不要手动改数据库。
+- 回执里出现 `0 commands` 说明契约没有可执行的声明（完全没写 `legion-verify`，或块是空的）——那一步什么都没跑，不是绿灯；如果你本来想声明验收，说明形状写错了（写成标题/多参数围栏会被直接判失败），改成围栏块或 `legion-verify: <命令>` 裸行后重试。
 - done 后汇总全部子节点 verdict、验证结果和未决问题；把子树工作 squash 到自己的分支上，把**分支名 + HEAD sha + 已提交文件清单**写进最终 verdict。仓库有 remote 且 `gh`/`glab` 可用时，再开 MR/PR 并附链接；**没有 remote 就写一行「no remote: branch <name> at <sha>」，不要编造 URL，缺 MR 不算失败**。绝不在本级自行合并。
 - squash 时**显式 add 交付文件**（契约里的文件所有权清单 + 一份契约），不要 `git add -A`：`.pi-subagents/`、运行日志、多份 hedge 副本都不该进交付分支。
 - 收队时保证组员结果已落盘；由父级 collect 本节点结果后 retire。worktree/session 是 resume 凭据，未获根级清理授权前不得删除。

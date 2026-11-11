@@ -77,17 +77,31 @@ When a squad declares the built-in machine, its four work phases are
 `phases` has no phase machine at all (no `nodes.phase`, no `legion_phase` tool).
 Planning writes `.pi-legion/contract.md` with interfaces, file
 ownership, and acceptance commands before implementation starts. The
-executable acceptance commands must sit in a fenced block whose info string is
-exactly `legion-verify` — that fence is the only form the supervisor parses:
+executable acceptance commands are declared in one of two equivalent forms:
 
-```legion-verify
-npm run typecheck
-npm test
-```
+- a fenced block whose info string is exactly `legion-verify`:
 
-A `## legion-verify` heading is not a command, and a contract with no such block
-advances the phase with 0 commands executed — a pass by contract (§7.3), never
-evidence that the code was checked. Reviewing
+  ```legion-verify
+  npm run typecheck
+  npm test
+  ```
+
+- one command per bare line, `legion-verify: <command>`, optionally behind a
+  markdown list marker (`- ` / `* ` / `+ `):
+
+  ```text
+  - legion-verify: npm run typecheck
+  - legion-verify: npm test
+  ```
+
+A `## legion-verify` heading, a fence whose info string carries extra words
+(`legion-verify bash`), or a passing mention in prose is NOT a declaration: a
+contract that says `legion-verify` but states no command in either form above
+FAILS verification and parks the team in `verifying` instead of passing
+vacuously. Only a contract with no `legion-verify` wording at all — and an empty
+`legion-verify` block — advances the phase with 0 commands executed: a pass by
+contract (§7.3), never evidence that the code was checked (`0 commands` is not a
+green). Reviewing
 uses independent review; verifying runs the contract's `legion-verify`
 commands under the supervisor, without an LLM deciding whether they passed.
 

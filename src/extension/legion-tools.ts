@@ -1889,8 +1889,9 @@ export async function requestLegionPhase(
 			if (!verification.passed) {
 				// Same words and the same log path as the `verifyPhase` branch below:
 				// one failure report, whichever door the team tried to leave by.
-				options.sendSelfMessage?.(`Verification failed. Read ${verification.outputFile} and fix the commands, then request implementing.`);
-				return { ok: true, phase: fromPhase, message: `Verification failed: ${verification.outputFile}` };
+				const failure = verificationFailure(verification);
+				options.sendSelfMessage?.(failure.notice);
+				return { ok: true, phase: fromPhase, message: failure.message };
 			}
 			doneGate = { commandCount: verification.commandCount, phase: fromPhase };
 			// A green run is the pass this decision is about, so the second evaluation
@@ -1998,8 +1999,9 @@ export async function requestLegionPhase(
 	const contractFile = proposedContractPath;
 	const verification = await runVerification(db, current, readTextOrEmpty(contractFile), { ...options, contractFile });
 	if (!verification.passed) {
-		options.sendSelfMessage?.(`Verification failed. Read ${verification.outputFile} and fix the commands, then request implementing.`);
-		return { ok: true, phase: decision.to, message: `Verification failed: ${verification.outputFile}` };
+		const failure = verificationFailure(verification);
+		options.sendSelfMessage?.(failure.notice);
+		return { ok: true, phase: decision.to, message: failure.message };
 	}
 	// #371: the completion edge is evaluated against the SAME machine and the SAME
 	// phase the verification just ran in. Two bugs were hiding in the old literal
@@ -2091,7 +2093,7 @@ function taskMetadata(raw: string | null): TaskSummaryMetadata {
 }
 
 /**
- * How a passing verification should be described (#371 follow-up).
+ * How a passing verification should be described (#371 follow-up, #394).
  *
  * `0 commands` is a legitimate pass ("by contract"), but it is NOT evidence: when
  * the machine's own edge out of `phase` makes `verification_passed` the gate, the
@@ -2099,21 +2101,26 @@ function taskMetadata(raw: string | null): TaskSummaryMetadata {
  * to name it. Otherwise a parent reads "verification passed" and merges a branch
  * nothing ever checked.
  *
- * #P0 D2: "0 commands" also has a cause the agent can FIX, and it is the one that
- * was never told: `parseLegionVerifyCommands` reads ```legion-verify fenced blocks
- * only. A contract that states the instruction as the `## legion-verify` HEADING
- * verifies nothing, and the team then reports a pass. Both variants name the
- * fenced shape for that reason.
+ * #P0 D2 / #394 D2: "0 commands" also has a cause the agent can FIX, and it is the
+ * one that was never told. Since #394 a contract may declare verification as a
+ * bare `legion-verify: <command>` line as well as in a ```legion-verify fenced
+ * block (#394 D1), so both spellings are named here. A contract that DOES state
+ * the instruction but in no parsable shape (`## legion-verify` heading, a fence
+ * whose info string carries extra words) is no longer a vacuous pass at all —
+ * `parseLegionVerifyContract` reports `unrecognised`, `runVerification` fails,
+ * and this helper gives that case its own sentence (D394-3) instead of the two
+ * "by contract" variants below.
  */
-function verificationHow(commandCount: number, phase: string, machine?: PhaseMachine): string {
+function verificationHow(commandCount: number, phase: string, machine?: PhaseMachine, shape: LegionVerifyShape = "none"): string {
 	if (commandCount > 0) return `(${commandCount} command(s))`;
-	const fence = "only a ```legion-verify fenced block is parsed, and a `## legion-verify` heading is not parsed";
+	if (shape === "unrecognised") return `(0 commands — ${UNRECOGNISED_VERIFY_DECLARATION})`;
+	const shapes = "a ```legion-verify fenced block is parsed and a bare `legion-verify: <command>` line is parsed; a `## legion-verify` heading is not parsed";
 	const gated = (findPhase(machine ?? DEFAULT_PHASE_MACHINE, phase)?.next.find((rule) => rule.to === "done")?.require ?? []).includes(
 		"verification_passed",
 	);
 	return gated
-		? `by contract (0 commands — the machine gates on verification_passed, but the contract lists no block: ${fence})`
-		: `by contract (0 commands — the contract lists no block: ${fence})`;
+		? `by contract (0 commands — the machine gates on verification_passed, but the contract lists no command: ${shapes})`
+		: `by contract (0 commands — the contract lists no command: ${shapes})`;
 }
 
 function readVerificationResult(node: LegionNode): boolean | undefined {
@@ -2126,15 +2133,116 @@ function writeVerificationResult(db: DatabaseSync, node: LegionNode, result: Ver
 	updateNode(db, node.id, { taskSummary: JSON.stringify({ [TASK_SUMMARY_METADATA_KEY]: metadata }) }, now);
 }
 
-export function parseLegionVerifyCommands(text: string): string[] {
+/**
+ * #394 D2: the shape a contract declared verification in.
+ *
+ *  - `none` — no `legion-verify` wording at all: passes by contract (frozen §7.3).
+ *  - `fence` — at least one ```legion-verify block: passes by contract when empty (§7.3).
+ *  - `bare-line` — at least one `legion-verify: <command>` line: same rules as a fence.
+ *  - `unrecognised` — `legion-verify` in a DECLARATION position (line start, optionally
+ *    behind `#+`/a list marker) or as a fence info string that is not exactly
+ *    `legion-verify`, yet not one parsable command: the author tried to declare
+ *    verification and wrote a shape nothing reads. That is a FAILURE, not a pass.
+ */
+export type LegionVerifyShape = "none" | "fence" | "bare-line" | "unrecognised";
+
+/**
+ * The sentence an `unrecognised` contract owes the agent (#394 D2/D3): it names
+ * both legal spellings and one minimal example of each, because the only thing to
+ * fix is the shape the author wrote. Used by the log, the failure receipt and
+ * `verificationHow`, so all three say the same thing.
+ */
+const UNRECOGNISED_VERIFY_DECLARATION =
+	"the contract mentions legion-verify but declares no command the supervisor parses (a `## legion-verify` heading, a fence whose info string is not exactly `legion-verify` such as ```legion-verify bash, and a mid-sentence mention are all not declarations). Write a fenced block whose info string is exactly `legion-verify` with one command per line, or a bare line `legion-verify: npm test`.";
+
+/**
+ * #394 D1/D2: the DECLARATION parser, carrying the shape it recognised.
+ *
+ * The supervisor accepts two spellings of the same instruction, because a contract
+ * is markdown and an agent writes whichever it last saw:
+ *
+ *  - fenced — a ```legion-verify block whose info string is exactly
+ *    `legion-verify` (unchanged from #371: same regex, same trim, same `#` skip);
+ *  - bare line — `legion-verify: <command>`, optionally behind ONE markdown list
+ *    marker (`- ` / `* ` / `+ `), e.g. `- legion-verify: npm test`. Whatever sits
+ *    after the colon IS the command (trimmed; empty ⇒ no command). A
+ *    `legion-verify:` anywhere else in a line is prose and is never executed —
+ *    a read-only squad's prose must not run anything.
+ *
+ * `shape` is what tells a declaration from a typo: `none` and an empty
+ * block/bare line still pass by contract (§7.3), but `unrecognised` fails. A
+ * mid-line mention is never `unrecognised`, so prose alone cannot turn a
+ * read-only squad red.
+ */
+export function parseLegionVerifyContract(text: string): { commands: string[]; shape: LegionVerifyShape } {
 	const commands: string[] = [];
+	let fence = false;
+	let bareLine = false;
+	let declaration = false;
 	for (const block of text.matchAll(/```legion-verify\s*\n([\s\S]*?)```/g)) {
+		fence = true;
 		for (const raw of (block[1] ?? "").split("\n")) {
 			const command = raw.trim();
 			if (command && !command.startsWith("#")) commands.push(command);
 		}
 	}
-	return commands;
+	for (const raw of text.split("\n")) {
+		const line = raw.trim();
+		if (!line) continue;
+		const bare = /^(?:[-*+]\s+)?legion-verify:\s*(.*)$/.exec(line);
+		if (bare) {
+			bareLine = true;
+			const command = (bare[1] ?? "").trim();
+			if (command && !command.startsWith("#")) commands.push(command);
+			continue;
+		}
+		// A `legion-verify` that OPENS a line (optionally behind `#+` or a list marker)
+		// or a fence info string is a declaration attempt — valid or not is decided
+		// above; anything left over is an author who wrote the wrong shape.
+		if (
+			/^#{1,6}\s*(?:[-*+]\s+)?legion-verify\b/.test(line)
+			|| /^(?:[-*+]\s+)?legion-verify\b/.test(line)
+			|| /^`{3,}\s*legion-verify\b/.test(line)
+		) {
+			declaration = true;
+		}
+	}
+	// A parsable block (even an empty one) or a parsable bare line outranks a stray
+	// declaration attempt: §7.3's empty-block pass must not be taken away by a
+	// heading that happens to sit above it.
+	const shape: LegionVerifyShape = fence ? "fence" : bareLine ? "bare-line" : declaration ? "unrecognised" : "none";
+	return { commands, shape };
+}
+
+/**
+ * The commands a contract declares: fenced blocks first, then bare lines (#394:
+ * both shapes — see `parseLegionVerifyContract`). The fenced-block behaviour is
+ * byte-for-byte #371's; reach for `parseLegionVerifyContract` when the SHAPE
+ * matters, because a typo is not a pass.
+ */
+export function parseLegionVerifyCommands(text: string): string[] {
+	return parseLegionVerifyContract(text).commands;
+}
+
+/**
+ * #394 D2/D3: the one failure report, whichever door the team tried to leave by.
+ *
+ * A red COMMAND keeps the pre-existing words (and the log path, which is where the
+ * fix is). An `unrecognised` declaration is a different failure: nothing ran, and
+ * the only thing to fix is the contract's shape, so the receipt carries the reason
+ * instead of pointing at a log of nothing.
+ */
+function verificationFailure(verification: { outputFile: string; reason?: string }): { notice: string; message: string } {
+	if (verification.reason) {
+		return {
+			notice: `Verification failed: ${verification.reason} (log ${verification.outputFile}). Fix the contract, then request implementing.`,
+			message: `Verification failed: ${verification.reason}`,
+		};
+	}
+	return {
+		notice: `Verification failed. Read ${verification.outputFile} and fix the commands, then request implementing.`,
+		message: `Verification failed: ${verification.outputFile}`,
+	};
 }
 
 export async function runVerification(
@@ -2142,8 +2250,13 @@ export async function runVerification(
 	node: LegionNode,
 	contractText: string,
 	options: Pick<PhaseRequestOptions, "cwd" | "runDir" | "settings" | "now" | "runCommand"> & { contractFile?: string },
-): Promise<{ passed: boolean; commandCount: number; outputFile: string; message: string }> {
-	const commands = parseLegionVerifyCommands(contractText);
+): Promise<{ passed: boolean; commandCount: number; outputFile: string; message: string; shape: LegionVerifyShape; reason?: string }> {
+	// #394 D2: the shape decides whether "0 commands" is the frozen §7.3 pass
+	// (`none`, empty block, empty bare line) or an author who wrote the declaration
+	// in a shape nothing parses (`unrecognised` ⇒ fail).
+	const contract = parseLegionVerifyContract(contractText);
+	const commands = contract.commands;
+	const unrecognised = contract.shape === "unrecognised";
 	const timeoutMs = options.settings?.verifyCommandTimeoutMs ?? 600_000;
 	const cwd = node.worktreePath ?? options.cwd;
 	const contractFile = options.contractFile ?? path.resolve(cwd, ".pi-legion", "contract.md");
@@ -2151,7 +2264,7 @@ export async function runVerification(
 	fs.mkdirSync(runDir, { recursive: true });
 	const outputFile = path.join(runDir, `${node.name}.legion-verify.log`);
 	const output: string[] = [];
-	let passed = true;
+	let passed = !unrecognised;
 	for (const command of commands) {
 		const result = await (options.runCommand ?? runLegionCommand)(command, cwd, timeoutMs);
 		output.push([
@@ -2165,7 +2278,13 @@ export async function runVerification(
 			break;
 		}
 	}
-	if (!commands.length) output.push("No legion-verify block; verification passes by contract (0 commands).");
+	if (!commands.length) {
+		output.push(
+			unrecognised
+				? `No legion-verify declaration the supervisor can parse; verification FAILS (0 commands). ${UNRECOGNISED_VERIFY_DECLARATION}`
+				: "No legion-verify block; verification passes by contract (0 commands).",
+		);
+	}
 	fs.writeFileSync(outputFile, `${output.join("\n\n")}\n`, { mode: 0o600 });
 	const now = options.now ?? Date.now;
 	// #P0 S4: record WHAT was judged, so a later `done` can tell whether this pass
@@ -2181,7 +2300,16 @@ export async function runVerification(
 		...(tree === undefined ? {} : { tree }),
 	};
 	writeVerificationResult(db, node, result, now);
-	return { passed, commandCount: commands.length, outputFile, message: passed ? "verification passed" : "verification failed" };
+	// `shape`/`reason` are the in-memory receipt only: the persisted statement keeps
+	// its #P0 S4 fields exactly (#394 D4).
+	return {
+		passed,
+		commandCount: commands.length,
+		outputFile,
+		shape: contract.shape,
+		...(unrecognised ? { reason: UNRECOGNISED_VERIFY_DECLARATION } : {}),
+		message: passed ? "verification passed" : "verification failed",
+	};
 }
 
 /** legion-verify command behind the tree-wide verify queue (wait not charged to timeout). */

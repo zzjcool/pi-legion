@@ -9,6 +9,7 @@ import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import {
 	LegionPostman,
 	parseLegionVerifyCommands,
+	parseLegionVerifyContract,
 	readTree,
 	registerLegionTools,
 	requestLegionPhase,
@@ -235,6 +236,148 @@ test("#371: an empty legion-verify block does not masquerade as a real verificat
 			messages.some((message) => /```legion-verify fenced block is parsed/.test(message)),
 			"the collection prompt carries the fence wording too",
 		);
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// #394 — a contract may declare verification as a bare line, and a declaration
+// written in the WRONG shape is a failure, not a vacuous pass. Frozen §7.3
+// ("empty block = pass by contract") is untouched: `none` and an empty block
+// still pass; only "the author tried to declare and wrote an unparsable shape"
+// turns red.
+// ---------------------------------------------------------------------------
+
+test("#394 D1: a bare-line `legion-verify:` declaration is parsed AND executed", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-bare-verify-"));
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root" });
+		const team = insertNode(db, { parentId: "root", name: "team", role: "centurion", taskSummary: "original task" });
+		// The bare spelling, per line. The markdown list markers are the forms an
+		// agent writing a contract reaches for first, so all three are accepted.
+		assert.deepEqual(parseLegionVerifyContract("# Contract\n\nlegion-verify: npm test\n"), { commands: ["npm test"], shape: "bare-line" });
+		assert.deepEqual(
+			parseLegionVerifyContract("# Contract\n\n- legion-verify: npm test\n* legion-verify: printf a\n+ legion-verify: printf b\n"),
+			{ commands: ["npm test", "printf a", "printf b"], shape: "bare-line" },
+		);
+		// The fenced shape is #371's parser, byte for byte.
+		assert.deepEqual(parseLegionVerifyContract("```legion-verify\n# ignored\nnpm test\nprintf ok\n```"), {
+			commands: ["npm test", "printf ok"],
+			shape: "fence",
+		});
+
+		const calls: string[] = [];
+		const result = await runVerification(db, team, "# Contract\n\n- legion-verify: npm test\nlegion-verify: printf ok\n", {
+			cwd: rootDir,
+			runDir: path.join(rootDir, "run"),
+			now: () => 900,
+			runCommand: async (command) => {
+				calls.push(command);
+				return { code: 0, stdout: "green", stderr: "" };
+			},
+		});
+		assert.equal(result.passed, true);
+		assert.equal(result.commandCount, 2, "a bare declaration is a real verification, not a 0-command pass");
+		assert.deepEqual(calls, ["npm test", "printf ok"], "the declared commands actually run, in order");
+		assert.match(readFileSync(result.outputFile, "utf8"), /\$ npm test\nexit: 0/, "the log is the evidence the command ran");
+		const metadata = JSON.parse(getNode(db, team.id)?.taskSummary ?? "{}") as {
+			__piLegion?: { taskSummary?: string; verification?: { commandCount?: number; passed?: boolean } };
+		};
+		assert.equal(metadata.__piLegion?.verification?.commandCount, 2);
+		assert.equal(metadata.__piLegion?.verification?.passed, true);
+		assert.equal(metadata.__piLegion?.taskSummary, "original task", "the stored shape is unchanged (#394 D4)");
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("#394 D2: `## legion-verify` + a plain fence fails instead of passing vacuously", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-wrong-shape-"));
+	const cwd = path.join(rootDir, "repo");
+	mkdirSync(path.join(cwd, ".pi-legion"), { recursive: true });
+	// The exact shape #394 is about: the author DID try to declare verification,
+	// but as a heading over an unnamed fence — nothing the supervisor reads.
+	const contractText = "# Contract\n\n## legion-verify\n\n```\nnpm test\n```\n";
+	writeFileSync(path.join(cwd, ".pi-legion", "contract.md"), contractText);
+	const db = makePhaseFixture();
+	const reviewerSession = path.join(rootDir, "reviewer.jsonl");
+	const messages: string[] = [];
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	try {
+		assert.deepEqual(parseLegionVerifyContract(contractText), { commands: [], shape: "unrecognised" });
+		assert.deepEqual(
+			parseLegionVerifyContract("```legion-verify bash\nnpm test\n```"),
+			{ commands: [], shape: "unrecognised" },
+			"an info string carrying extra words is a typo, not a block",
+		);
+		assert.deepEqual(
+			parseLegionVerifyContract("Write `legion-verify: npm test` in the contract.\n"),
+			{ commands: [], shape: "none" },
+			"a mid-line mention is prose: it neither runs nor turns a read-only squad red",
+		);
+
+		writeFileSync(reviewerSession, session('{"ok":true,"reason":"clean"}'));
+		const options = { cwd, runDir: rootDir, now: () => 100, runCommand, sendSelfMessage: (text: string) => messages.push(text) };
+		insertNode(db, { parentId: "root.team-a", name: "worker", role: "worker", status: "settled" }, () => 101);
+		insertNode(db, { parentId: "root.team-a", name: "reviewer", role: "reviewer", status: "settled", sessionFile: reviewerSession }, () => 102);
+		assert.equal((await requestLegionPhase(db, "root.team-a", "implementing", options)).ok, true);
+		assert.equal((await requestLegionPhase(db, "root.team-a", "reviewing", options)).ok, true);
+		const verifying = await requestLegionPhase(db, "root.team-a", "verifying", options);
+		assert.equal(verifying.ok, true);
+		assert.notEqual(
+			getNode(db, "root.team-a")?.phase,
+			"done",
+			"a contract whose declaration was written in the wrong shape must not complete the team",
+		);
+		assert.deepEqual(commands, [], "nothing is executed: the plain fence is not a command list");
+		assert.match(verifying.message, /Verification failed/, "the receipt is a red, not a pass");
+		assert.match(verifying.message, /exactly `legion-verify`/, "the reason names the fenced shape to write");
+		assert.match(verifying.message, /bare line `legion-verify: npm test`/, "…and the bare-line shape to write");
+		assert.ok(
+			messages.some((message) => /Verification failed/.test(message) && /exactly `legion-verify`/.test(message)),
+			"the agent gets the same reason it has to fix",
+		);
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("#394 §7.3: an empty block, an empty bare line, and no declaration at all still pass by contract", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-empty-verify-394-"));
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root" });
+		const team = insertNode(db, { parentId: "root", name: "team", role: "centurion" });
+		assert.deepEqual(parseLegionVerifyContract("```legion-verify\n```"), { commands: [], shape: "fence" });
+		assert.deepEqual(parseLegionVerifyContract("# Contract\nNo verification block here.\n"), { commands: [], shape: "none" });
+		assert.deepEqual(
+			parseLegionVerifyContract("- legion-verify:\n"),
+			{ commands: [], shape: "bare-line" },
+			"an empty bare line is a declaration with no command, not a typo",
+		);
+		const texts = ["```legion-verify\n```", "# Contract\nNo verification block here.\n", "- legion-verify:\n"];
+		for (const text of texts) {
+			const result = await runVerification(db, team, text, {
+				cwd: rootDir,
+				runDir: path.join(rootDir, "run"),
+				now: () => 900,
+				runCommand: async () => {
+					throw new Error(`nothing may be executed for ${JSON.stringify(text)}`);
+				},
+			});
+			assert.equal(result.passed, true, `§7.3: ${JSON.stringify(text)} passes by contract`);
+			assert.equal(result.commandCount, 0);
+			assert.match(result.message, /verification passed/);
+		}
 	} finally {
 		db.close();
 		rmSync(rootDir, { recursive: true, force: true });
