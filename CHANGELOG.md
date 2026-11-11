@@ -25,6 +25,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - **“你看到的是摘要”说出口**（D8 v1.12 改判 / D9，P5c）：finished 缓存的 strip 保留（内存护栏），改为**如实标注**——`collect`/`wait`/内联 collect 对被 strip 的快照追加 `this is the cached head (4.0 KB of 24.5 KB); full text: legion_output({ name: "…" })`（无 ledger 行时写 `at least`，绝不编造总数），不再带那句无条件的「输出被截断时读这个文件」；通知正文与 TUI 折叠行以 `preview 4.0 KB of 24.5 KB` 标注预览（不再让预览字节数冒充结果大小），`details` 增 `artifactIds`。
 - **artifact 的路径不再交给 agent**（P6）：`collect`/`wait`/vexillatio 批量/两种通知形状一律改印 `full text: legion_output({ name, round })`；`tool_call` 对 `read`/`write`/`edit` 落在 `<runDir>/artifacts/` 下的调用直接 `block` 并指路（`path.resolve` + `path.relative` 判包含，非字符串前缀；任何无法判定的形状 fail-open，普通文件不受影响）。写 artifact 被拒的理由与不可变性同源（A1）。文件和 `rebuild` 都不受影响；P5a 的通用 `read` hook 退居兜底（`bash cat` 这类路子仍然记账）。
 
+- **`wait` 交回的是预览，不再把全文再塞一遍**（D4）：当 ledger 能给出该 artifact 的完整字节数时，正文按 4 KB（UTF-8 安全切分，不劈码点）预览，并复用
+  collect 的 `cached head (4.0 KB of X)` + `legion_output({ name, round })`
+  指针；拿不到总数时保持全文——截断却编不出总数才是不可接受的。`still running` 行从 `(elapsed 190108ms)` 改成 `(spawned 190.1s
+  ago)`：那个数字一直是「启动至今」，不是本次等待时长（D3），`elapsedMs` 本身未改。
+- **collect/wait 的头写明契约验证的事实**（#5）：正常是 `verification: N command(s) · log …`，两种「空绿灯」单独成句——
+  `0 commands — by contract, nothing ran` 与 `STALE — the checkout changed after the pass`；legion 子节点没有记录时写
+  有相位的子节点没有记录时写 `never ran (no contract)`；worker 这类没有相位的子节点、以及非 legion 调用，都不出现这一行。事实来自子节点的 verification 行，用与门禁同一套判据
+  （checkout + 树指纹，不看相位 stint），所以父级在决定合并时不需要相信子节点的措辞。
+- **`status all` 不再是空开关**（D7）：不带 `name` 的总览仍是 live-only；`all:true` 在其后追加 retired/finished 记录（同名 live 优先，不重复列一行）。
+- **launch 级 `verify` 与契约的 ```legion-verify 围栏互相点名**：`index.ts` 两处 schema 描述与 `agents/worker.md`
+  各加一句「前者是 extension 在 collect 时自己跑的 attestation，后者由 supervisor 在 verifying 执行」，`wait` 的 `timeoutMs`
+  文案同时改成真实默认（目标里最小的角色 `timeoutMs`，否则 900000）——vexillatio 的同名字段保持 flat 600000，注释写明两者不同（D2/D8）。
+
 ### Removed
 
 - `reported` set、`claimReported` / `claimCachedResult` / `claimIfTerminal` / `unclaimReported` / `unclaimUndelivered`、`snapshotOrigins` 的 claim 用途、`TrackedJob.consumedByTool` / `notified` 与 watch 闸门、`join.dropBuffered*`、`P3` 的 shadow 模块（共 -2.9k 行）。`consumeCollect*` 回退成返回裸 `CollectSnapshot`（**对外 API 破坏**，无兼容层）。
@@ -32,6 +45,20 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ### Fixed
 
+- **`done` 先判边、后付费**（D10）。`PhaseTransitionDecision` 的拒绝形状新增 `failed`（失败的那条 `require`
+  名），`legion_phase { to: "done" }` 先按 `verification_passed = true` 试判一次（问的是「就算契约绿了，这条边会过吗」，与
+  `require` 的书写顺序无关）：只有这个假设下边仍会拒绝时才不付钱。于是注定被 `children_settled` 拒的请求不再先付一次全套验证；`children 全失败 ⇒
+  forced failed` 立即生效，不必等 supervisor 的下一个 tick；被拒请求也不再写 `task_summary`（`updated_at` 不再被一次没发生的事抬起来）。无
+  `verification_passed` 要求的边**仍然**必须先有一张本轮新 pass 才放行——原 P0-1 洞的回归用例已补（删掉「先跑再放行」即红）。
+- **契约可以放在 runDir**（D1）：规范路径 `<worktree|cwd>/.pi-legion/contract.md` 缺席时回退
+  `<runDir>/contract.md`（存在性判断：记录的路径只在文件仍存在时优先，否则规范路径，再否则 runDir 副本），`contract_file` 门、记录的
+  `contractPath`、`done` 门与 submitting 阶段的验证走同一个答案。`docs/legion-v2-contract.md:358`
+  此前是「文档允许、代码不认」，read-only 队照文档写会卡在 planning。
+- **换过检出也判 stale**（D11）：pass 记了 `cwd`；节点现在的检出（`worktreePath ?? cwd`）与它不同时，即使树指纹相同也不再复用——同 commit、同
+  untracked 状态的两个目录指纹本来就相等，只有路径能区分「同一个树、不同的交付目录」。
+- **scout 默认带 tool budget**（D12）：`agents/scout.md` 增加 `toolBudget: {"maxToolCalls": 60}`（frontmatter
+  只接受 JSON 拼写，flow map 会让整张卡解析失败，注释已写明），这是有界失败，不是结果预算。
+- 删除 `index.ts` 里的死字段 `budgetMs`（只声明、无任何使用）（D9）。
 - **`tok/s` 的分母换成实测 decode 时长（首 delta → 末 delta），不再用含 prefill 的
   `generationMs`。** 旧口径的分母来自 `message.durationMs` = **请求发出 → 响应结束**
   的整段墙钟；对 215 个真实 session / 22306 条 assistant 调用回归得到
@@ -53,6 +80,41 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   信任下限按轴分开（decode 200ms / generation 1s），单条短消息不再被旧门禁整条吞掉。
 - 图表 x 轴冻结判定（#346）与 flat-run 折叠把 decode 采样一并纳入，避免「只有 decode
   前进」的真实进展被当成静态而被跳过。
+- **声明式机器的 `→ done` 不再绕过验证。** `maySelfComplete`（#371 G5）把 `done` 交给了
+  作者声明的边，但该请求随后直接进 `evaluatePhaseTransition` 落盘相位，而 `runVerification`
+  只挂在「离开成功相位」那条路上——于是 `{ id: "verifying", next: [{ to: "done" }] }`
+  （无 `require`）的机器可以在一份红契约上收队，一条命令都没跑：docker 演示会话
+  `01a1c964` 实测到了这个形状。`requestLegionPhase` 现在在执行 `done` 边**之前**补一道门：
+  存量 pass **必须是当前相位里产生的**（`checkedAt >= phaseSince`）才复用；否则立即重测
+  （存量失败、陈旧 pass 都算没有证据），失败则相位不动并回报 `Verification failed: <log>`。
+  这只补在作者写的边上——`state-machine.ts` 已为注入边写过同一个不变量。`to: "verifying"`
+  路径不变，`done` 的重试也不付二次执行成本（新增用例见 `test/unit/legion-tools.test.ts`）。
+- **只读守卫不再把 `2>/dev/null;` 判成写文件。** `child-guard` 的 `/dev/null` 放行靠
+  `/^\/dev\/null(\s|$)/`——目标后面必须跟空白，于是 `git config --list 2>/dev/null; …`
+  这种最普通的只读探针被拒（演示里 scout 为此废掉一回合）。改为取重定向目标 word
+  （终止于 `;` `&` `|` `(` `)` 与空白/换行）后全等比较，但只接受**不会隐藏未检命令**的终止符：
+  `;`（`shellChunks` 会切开）与 `)`、空白、行尾；`|` `&` `(` 保持历史拒绝，
+  `2>/dev/null|tee f` 不会成为过写检查的新旁路。`=>`/`>=`/`->`/引号内 `>`/`&>file`
+  的既有判定不变。
+- **`0 commands` 的回执点名「围栏」这个可修的原因。** `verificationHow` 的两个变体都写明
+  只有 ` ```legion-verify ` 围栏块会被解析、`## legion-verify` 标题不算；`agents/centurion.md`
+  与 `skills/**/SKILL.md` 补最小示例与「`0 commands` 不是绿灯」。格式要求此前只存在于 frozen 的
+  `docs/legion-v2-contract.md` §7.2，真正写契约的 agent 读的是角色卡/技能卡，于是「标题 +
+  普通围栏」静默解析为 0 条并直通 done。
+- **验证通过后树变了就不再算数。** `VerificationResult` 多记三样事实：`cwd`、`contractFile`、
+  `tree`（HEAD + `git status --porcelain --untracked-files=normal` + 契约文本的 sha256）。契约文本
+  必须进摘要，因为 `.pi-legion/` 通常是 **untracked 目录**：`git status` 只输出一行
+  `?? .pi-legion/`，改里面的内容不会改变那一行。`to:"done"` 只在 pass 属于本相位**且树未变**时
+  复用，否则当场重测。三种「记不了」的情形分开处理：没有 `.git` 的检出（只读队、无 worktree）记为
+  `no-git-checkout` 并照旧复用；git 探测失败/超时（二进制缺失、权限）记为未知，强制重测；升级前
+  落库、没有 `cwd` 的 pass 同样重测一次。supervisor 的自动收尾路径不会自己跑验证，遇到过期 pass
+  改为推迟 + 每个「已记录树 / 当前树」组合一次提示（换到新 pass 后自动解除），由 agent 的
+  `legion_phase { to: "done" }` 触发重测后完成。演示里
+  centurion 在 verifying 之后改契约再 amend 进 squash 的那个洞就是这个。
+- **收队提示改为显式 staging。** 注入的 squash 提示改成「显式 add 交付文件、只保留一份契约、排除
+  `.pi-subagents/` 与运行日志、报分支名 + HEAD sha + 文件清单」；`agents/centurion.md` 与
+  `skills/pi-legion/SKILL.md` 同步，卡片 verdict 要求也补上文件清单。squash 本身仍然由 LLM 执行
+  （插件不跑 git），所以这是提示层能做的全部。
 
 
 ## [5.6.0] — 2026-11-09

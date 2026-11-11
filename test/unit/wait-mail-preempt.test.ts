@@ -1361,7 +1361,7 @@ test("a stale stall notice does not preempt a blocked wait — a fresh one still
 		const body = textOf(timedOut);
 		assert.match(body, /status: wait_timeout/, "the wait ends the ordinary way");
 		assert.ok(body.includes("── live ──"), "the frozen timeout rendering, for this child");
-		assert.match(body, /still running \(elapsed \d+ms\)/);
+		assert.match(body, /still running \(spawned \d+\.\d+s ago\)/);
 		assert.doesNotMatch(body, /\[legion mail #/, "no envelope: nothing was handed over");
 		assert.doesNotMatch(body, /parent turn ended/, "and no invented abort either");
 		assert.ok(waited >= 700, `the poll ran at least twice and declined (${waited}ms of a 900ms wait)`);
@@ -1507,7 +1507,7 @@ test("a stale phase-timeout notice does not preempt a blocked wait — a fresh o
 		const body = textOf(timedOut);
 		assert.match(body, /status: wait_timeout/, "the wait ends the ordinary way");
 		assert.ok(body.includes("── live ──"), "the frozen timeout rendering, for this child");
-		assert.match(body, /still running \(elapsed \d+ms\)/);
+		assert.match(body, /still running \(spawned \d+\.\d+s ago\)/);
 		assert.doesNotMatch(body, /\[legion mail #/, "no envelope: nothing was handed over");
 		assert.doesNotMatch(body, /parent turn ended/, "and no invented abort either");
 		assert.ok(waited >= 700, `the poll ran at least twice and declined (${waited}ms of a 900ms wait)`);

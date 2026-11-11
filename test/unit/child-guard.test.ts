@@ -257,6 +257,43 @@ test("read-only role: comparison/arrow operators are not redirects", () => {
 	assert.equal(forbiddenChildReason("echo hi > /dev/null", env), undefined);
 });
 
+// D3: `/dev/null` is decided by the redirection target WORD, not by trailing
+// whitespace. The docker demo (`01a1c964`) lost a whole read-only scout turn
+// because `... 2>/dev/null; ...` was classified as a file write: the old
+// `/^\/dev\/null(\s|$)/` probe failed on the `;` that follows the device.
+// Only terminators that cannot hide an unchecked command are accepted: `;` is
+// split by `shellChunks` and `)` just closes a group, but `|`, `&` and `(` start
+// a command the splitter does not isolate — those keep the historical block.
+test("read-only role: /dev/null is allowed by the exact redirect target (D3)", () => {
+	const env = { acceptanceRole: "read-only" as const };
+	for (const command of [
+		"echo hi 2>/dev/null; echo bye",
+		"git config --global --list 2>/dev/null; git branch --show-current",
+		"(echo hi 2>/dev/null)",
+		"cat f 2>&1",
+		"echo hi > /dev/null",
+		"echo hi &> /dev/null",
+	]) assert.equal(forbiddenChildReason(command, env), undefined, `must allow ${command}`);
+	// A no-space separator that the chunk splitter cannot see must not become the
+	// new way past the write-head check (`2>/dev/null|tee f` used to be blocked by
+	// the trailing-whitespace probe, and it still is).
+	for (const command of [
+		"echo hi 2>/dev/null|tee /tmp/x",
+		"echo hi 2>/dev/null& rm /tmp/x",
+		"echo hi 2>/dev/null(touch /tmp/x)",
+	]) assert.ok(forbiddenChildReason(command, env), `must block ${command}`);
+	// `;` IS a chunk boundary, so the write that follows is still refused by name.
+	assert.ok(forbiddenChildReason("echo hi 2>/dev/null; touch /tmp/x", env));
+	// Everything whose target word is not exactly `/dev/null` still writes.
+	for (const command of [
+		"echo hi > /tmp/out",
+		"echo hi >> /tmp/out",
+		"echo hi 2>/tmp/err",
+		"echo hi >/dev/nullx",
+		"echo hi &>/tmp/out",
+	]) assert.ok(forbiddenChildReason(command, env), `must block ${command}`);
+});
+
 test("read-only role: real redirects are still blocked, including &>file", () => {
 	const env = { acceptanceRole: "read-only" as const };
 	assert.ok(forbiddenChildReason("echo hi > /tmp/out", env));

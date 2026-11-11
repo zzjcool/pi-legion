@@ -110,6 +110,21 @@ export type PhaseTransitionDecision =
 		to: string;
 		reason: PhaseTransitionReason;
 		message: string;
+		/**
+		 * #P0 D10: WHICH phase condition refused the edge (`requirement.failed`), when
+		 * the refusal came from the edge's `require` list.
+		 *
+		 * `reason` is the legacy vocabulary, widened to a handful of names; a caller
+		 * that has to act on the ANSWER ("is a verification pass the only thing
+		 * missing, or is this request doomed anyway?") cannot read it. The tool's
+		 * `done` gate asks exactly that before it pays for a contract run, so the
+		 * condition itself travels here instead of being re-derived by a second copy
+		 * of the machine's rules.
+		 *
+		 * Absent means the refusal had another cause (invalid edge, actor gate, an
+		 * earlier phase-level requirement, a forced transition's own reason).
+		 */
+		failed?: string;
 		forcedTransition?: {
 			to: "failed";
 			reworkCount: number;
@@ -269,15 +284,21 @@ function evaluateDeclarative(
 					"all_workers_failed",
 					`all children failed; the team cannot reach ${to} and must fail`,
 				),
+				// #P0 D10: the forced branch carries the condition too — it is the same
+				// refusal, with the terminal transition attached.
+				failed: requirement.failed,
 				forcedTransition: { to: "failed", reworkCount, reason: "all_children_failed" },
 			};
 		}
 		const legacy = legacyReasonForCondition(requirement.failed, rule);
-		return denied(
-			input,
-			legacy,
-			describeFailedCondition(requirement.failed),
-		);
+		return {
+			...denied(
+				input,
+				legacy,
+				describeFailedCondition(requirement.failed),
+			),
+			failed: requirement.failed,
+		};
 	}
 
 	if (rule.rework === true) {

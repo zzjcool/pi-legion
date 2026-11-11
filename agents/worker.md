@@ -44,6 +44,7 @@ maxSubagentDepth: 1
 1. 实现计划中的步骤，在当前分支上小步提交。
 2. **用项目自己的方式验证，分两档，别每轮都跑全量**：
    - 先发现项目怎么验证：看 `.pi/verify.sh`、Makefile/justfile target、CI 配置（.github/workflows 等）、package.json scripts、项目 README/CONTRIBUTING。项目明确的验证入口就是唯一权威，不要自己发明替代命令。
+   - **两个 `verify` 不是一回事**：派发时任务卡上的 launch 级 `verify` 是 extension 在 collect 时自己跑的 attestation（跑什么由派发方写死，轮不到你改写，也不用你去跑一遍），**不是**契约里 `` ```legion-verify `` 围栏——那套围栏只在 verifying 相位由 supervisor 执行。
    - 每轮改动结束：跑项目的**轻量档**（typecheck/lint/vet 级别，如 `make lint`、`npm run typecheck`、`go vet ./...`）；秒级反馈，失败直接修，不计入重试升级。
    - 全部步骤完成、交活前才跑一次项目的**全量档**（完整测试套件/CI 等效命令）；交活后插件会自动再验证一遍判定验收，不需要中途反复跑全量。全量失败按「失败止损」处理：重试不超过 2 次，仍失败则 `ok: false` 上报。
    - 项目找不到任何验证入口时，在报告里写明依据（查过哪些地方），不要自己编命令冒充。

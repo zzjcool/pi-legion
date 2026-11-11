@@ -82,6 +82,25 @@ function firstToken(chunk: string): string {
 	return chunk.trim().match(/^(\S+)/)?.[1] ?? "";
 }
 
+/**
+ * Classify a redirection target that starts `rest`.
+ *
+ * A shell word ends at whitespace (including newlines) and at `;` `&` `|` `(`
+ * `)`. Trailing-whitespace matching (`/^\/dev\/null(\s|$)/`) rejected
+ * `2>/dev/null;` — a real read-only probe — because the `;` that follows the
+ * device is not whitespace.
+ *
+ * Not every terminator may be accepted, though: `;` and `)` are safe because
+ * `;` is split into a separate chunk by `shellChunks` (so the write-head check
+ * still sees what follows), while `|`, `&` and `(` start a command that splitter
+ * does NOT isolate — `2>/dev/null|tee f` would then slip past the write check.
+ * Those keep the historical "not a device redirect" answer.
+ */
+function redirectTarget(rest: string): { token: string; ends: string } {
+	const token = rest.match(/^[^\s;&|()]+/)?.[0] ?? "";
+	return { token, ends: rest[token.length] ?? "" };
+}
+
 /** Does this command write to the filesystem via an output redirection? */
 function hasFilesystemRedirect(command: string): boolean {
 	let inSingle = false;
@@ -102,7 +121,10 @@ function hasFilesystemRedirect(command: string): boolean {
 		if (previous === "=" || previous === "-" || previous === "<" || previous === "!" || next === "=") continue;
 		if (next === "&" || previous === ">") continue;
 		const rest = command.slice(index + (next === ">" ? 2 : 1)).trimStart();
-		if (/^\/dev\/null(\s|$)/.test(rest)) continue;
+		// D3: the device is judged by the whole target word, and only the terminators
+		// that cannot introduce an unchecked command are accepted.
+		const target = redirectTarget(rest);
+		if (target.token === "/dev/null" && (target.ends === "" || /\s/.test(target.ends) || target.ends === ";" || target.ends === ")")) continue;
 		return true;
 	}
 	return false;

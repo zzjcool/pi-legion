@@ -24,9 +24,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as path from "node:path";
 
 import { createLegionEventBus } from "../../src/extension/event-bus.ts";
-import { LegionPostman } from "../../src/extension/legion-tools.ts";
+import { LegionPostman, verificationTree } from "../../src/extension/legion-tools.ts";
 import { legionSettingsForRun, parseSubagentSettings } from "../../src/agents/settings.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
 import { readEventsAfter } from "../../src/legion/events.ts";
@@ -88,13 +89,33 @@ const TIMED_MACHINE: PhaseMachine = {
 
 const NOW = 100_000;
 
-/** A satisfied verification verdict, in the shape `writeVerificationResult` stores. */
+/**
+ * A satisfied verification verdict, in the shape `writeVerificationResult` stores.
+ *
+ * #P0 S4 added `cwd`/`tree`: a stored pass now says WHICH checkout it judged, so a
+ * later `done` can tell whether it still applies. These fixtures are about phase
+ * naming and the ledger, not freshness, so they model the "nothing to compare" case —
+ * a non-git checkout (`verificationTree` is `undefined` on both sides, which is the
+ * read-only-team shape).
+ */
+const NON_GIT_CWD = "/tmp/pi-legion-test-non-git-checkout";
 function verifiedSummary(): string {
+	// The shape `writeVerificationResult` really writes: where it ran, which contract it
+	// read, and the tree it judged (`verificationTree` answers "no-git-checkout" here).
+	const contractFile = path.join(NON_GIT_CWD, ".pi-legion", "contract.md");
 	return JSON.stringify({
 		__piLegion: {
 			version: 1,
 			taskSummary: null,
-			verification: { passed: true, outputFile: "/tmp/verify.log", commandCount: 1, checkedAt: NOW - 1 },
+			verification: {
+				passed: true,
+				outputFile: "/tmp/verify.log",
+				commandCount: 1,
+				checkedAt: NOW - 1,
+				cwd: NON_GIT_CWD,
+				contractFile,
+				tree: verificationTree(NON_GIT_CWD, ""),
+			},
 		},
 	});
 }

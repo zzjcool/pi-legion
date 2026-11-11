@@ -19,6 +19,18 @@ timeoutMs: 600000
 # `worker` and `centurion` must run full builds, test suites and
 # integration gates, where a false kill costs more than the hang it prevents.
 toolTimeoutMs: 600000
+# A recon is a few dozen reads: grep / find / ls, plus one batched `codemode`
+# pass over the files that matter. 60 tool calls is what a WELL-SCOPED recon
+# costs, so a scout that reaches it was handed too broad a question — the parent
+# narrows the question, it does not renew the scout to dig wider.
+# This is BOUNDED failure, not a result budget: nothing here claims a good recon
+# must stop at 60, and hitting the cap is not "the recon finished" — it is "the
+# recon ran out", with the child still reporting the facts it had already read.
+# Same deliberate asymmetry the `toolTimeoutMs` block above spells out: scout-only,
+# because a `worker` / `centurion` mid-build must never be cut off by a counting
+# bound. Written as a JSON object because the frontmatter parser is flat and
+# `parseBudgets` reads this field as JSON (an unquoted flow map is refused).
+toolBudget: {"maxToolCalls": 60}
 # A timed-out scout means the question was too broad, not that work needs
 # finishing — renewing it would just re-run an over-scoped search (#270 D5).
 renewable: false

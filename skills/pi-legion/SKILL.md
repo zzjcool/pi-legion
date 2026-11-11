@@ -76,7 +76,18 @@ When a squad declares the built-in machine, its four work phases are
 **planning → implementing → reviewing → verifying**; a squad that declares no
 `phases` has no phase machine at all (no `nodes.phase`, no `legion_phase` tool).
 Planning writes `.pi-legion/contract.md` with interfaces, file
-ownership, and acceptance commands before implementation starts. Reviewing
+ownership, and acceptance commands before implementation starts. The
+executable acceptance commands must sit in a fenced block whose info string is
+exactly `legion-verify` — that fence is the only form the supervisor parses:
+
+```legion-verify
+npm run typecheck
+npm test
+```
+
+A `## legion-verify` heading is not a command, and a contract with no such block
+advances the phase with 0 commands executed — a pass by contract (§7.3), never
+evidence that the code was checked. Reviewing
 uses independent review; verifying runs the contract's `legion-verify`
 commands under the supervisor, without an LLM deciding whether they passed.
 
@@ -87,7 +98,8 @@ worktree, and a nested centurion gets a nested Git worktree. Each squad
 squashes its subtree onto a branch for its parent — the branch is the deliverable, and an
 MR is added only when the repository has a remote. Deliveries move upward until the root
 reviews and merges into the default branch. Do not merge a child squad's work
-at the wrong level.
+at the wrong level. Stage the delivered paths explicitly — `git add -A` sweeps
+run artifacts and duplicate contract copies into the branch.
 
 Resume uses saved run records and Pi session files. Parent shutdown does not
 leave detached child processes; recovery follows the tree's resume chain.

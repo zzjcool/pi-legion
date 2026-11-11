@@ -463,6 +463,58 @@ test("#145 status with no children returns empty overview", async () => {
 	}
 });
 
+// ── D7 (polish round): `status all` must have a name AND a meaning ───────
+
+/**
+ * A run dir holding the given records, written the way a previous session left it.
+ *
+ * No `owner.json`: ownership is irrelevant for terminal records (they are skipped by
+ * the live classification on state alone), and inventing a marker would only test
+ * the marker.
+ */
+function runDirWith(cwd: string, runId: string, children: ChildRecord[]): void {
+	const runDir = path.join(cwd, ".pi-subagents", "runs", runId);
+	mkdirSync(runDir, { recursive: true });
+	writeFileSync(
+		path.join(runDir, "run.json"),
+		`${JSON.stringify(runStub(runId, children), null, "\t")}\n`,
+	);
+}
+
+test("D7: `status all` lists retired/finished children; plain status stays the live overview", async () => {
+	const harness = indexHarness();
+	try {
+		runDirWith(harness.cwd, "r-finished1", [
+			childStub({
+				name: "scout-done",
+				state: "retired",
+				agent: "scout",
+				execution: { status: "success" },
+				retiredAt: "2026-01-02T03:04:05.000Z",
+			}),
+			childStub({ name: "worker-gone", state: "exited", agent: "worker", execution: { status: "failed" } }),
+		]);
+
+		// Before D7 the two branches were byte-identical, which is what made `all` a
+		// silent no-op. Omitting it keeps exactly that: the live-only overview.
+		const plain = await harness.invoke({ action: "status" });
+		assert.equal(plain.text.trim(), "No live children.");
+		assert.doesNotMatch(plain.text, /scout-done|worker-gone|retired\/finished/);
+
+		const all = await harness.invoke({ action: "status", all: true });
+		assert.match(all.text, /^No live children\.\n\nretired\/finished \(2\):$/m);
+		assert.match(
+			all.text,
+			/^ {2}scout-done — state=retired agent=scout \(execution: success, retired at 2026-01-02T03:04:05\.000Z\)$/m,
+		);
+		assert.match(all.text, /^ {2}worker-gone — state=exited agent=worker \(execution: failed\)$/m);
+		// Listing a record is not a liveness claim: the header still counts live only.
+		assert.doesNotMatch(all.text, /Status · 2/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
 // ── #209-3: foreign dead child must not report state=working ─────────────
 
 /**
