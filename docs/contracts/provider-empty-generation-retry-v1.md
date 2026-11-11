@@ -100,7 +100,7 @@ export function isEmptyGeneration(parsed: Pick<ParsedSession, "turns">): boolean
 - **只重试一次**：计数器在 `ChildRecord` 上，**跨 collect（同进程内）**保持；
   `ChildRecord` 不落盘（无 store 形状可写），进程重启后从 0 开始——重启即新进程、新预算，
   本契约不声称、也不实现跨进程持久化（review round 1 minor 6）；
-- 不得 `recordSettled` 两次、不得写两份 `.output.md`：重试发生在 `finishCollect` 之前，
+- 不得 `recordSettled` 两次、不得写两份结果 artifact（`<runDir>/artifacts/<name>/r<round>.md`，见 `result-ledger-v1.md` D1）：重试发生在 `finishCollect` 之前，
   终局只经过那一个出口；
 - 重试轮的 settle 若是 `timeout` 且 child 仍活着，则沿用既有的
   `running` + `COLLECT_DEADLINE_REASON` 快照（不把"还在生成"说成 abort 或 failed）。

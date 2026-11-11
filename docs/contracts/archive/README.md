@@ -14,6 +14,7 @@
 | `esc-cascade-v2.md` | HISTORICAL | `../esc-no-retire-v3.md` | 被 v3 推翻；`rg -n "cascadeRetireAll\|cascadingJobs" src index.ts` → 无命中 |
 | `esc-abort-v1.md` | HISTORICAL | `../esc-no-retire-v3.md` | 被 v3 取代：v1 的核心原则「ESC ≠ 杀 children」已被 v3 恢复，但 v1 自身不是现行文本（缺少 drain/shutdown 归因与显式 stop）；被它推翻过的 v2 不是现行行为 |
 | `drop-non-pi-kinds-v4.md` | LANDED (v4.0.0) | 无（已全额落地，无后续版本） | `AGENT_KINDS = ["pi"]`、`src/backends/` 已删、7 个 `herdr` DEFAULTS 键清零 |
+| `notice-claim-v1.md` | HISTORICAL | `../result-ledger-v1.md`（D4/D12） | 内存 claim 集合被账本投影取代，P4c 一次性删除（无兼容层）；`rg -n -e claimReported -e unclaimUndelivered -e consumedByTool src/ index.ts` → 无命中。`snapshotOrigins` 仍存在，但只剩 D4a 的 origin 戳职责（条目 round 标签 + `deliveredOnce` 键），不再参与任何 claim/回滚判定 |
 
 相关但不在本目录：
 

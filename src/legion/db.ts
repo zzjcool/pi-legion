@@ -10,21 +10,28 @@ import { createRequire } from "node:module";
  *      1 accepted, 2 bounced, 3 delivered, 4 obsolete — #322). The column was
  *      already `INTEGER`, so the migration is a version bump plus the semantic
  *      agreement that the old value `1` now reads as `accepted`.
+ * v3 — result-ledger tables `artifacts` + `consumptions`
+ *      (`docs/contracts/result-ledger-v1.md` D2). Purely additive: the four
+ *      v1 tables gain no column, so a v2 ledger opens and is upgraded in place.
  */
-export const LEGION_DB_USER_VERSION = 2;
+export const LEGION_DB_USER_VERSION = 3;
 export const LEGION_DB_BUSY_TIMEOUT_MS = 5_000;
 
 /**
  * Bound on one connection's compiled-statement cache.
  *
- * The ledger has ~29 distinct static SQL texts behind the 46 `prepare()` call
- * sites (many sites share a text), plus a handful of dynamically-shaped
- * families — `usage.ts`'s chunked `IN (?,?,…)` (stable chunk length at runtime)
- * and `hygiene.ts`'s retention `NOT IN (…)` lists. 64 holds everything a
- * connection reuses with 2x headroom, while an unbounded map keyed on SQL text
- * would grow with every distinct chunk size ever requested.
+ * The cache is keyed on the exact SQL text, so the bound has to cover the
+ * number of *distinct* texts one connection reuses. Measured at schema v3
+ * (2026-11-10, P1 review): **71** literal `.prepare(...)` call sites across
+ * `src/` + `index.ts`, of which **69** are distinct texts (`ledger.ts`
+ * contributes 8 sites / 8 texts) — plus dynamically-shaped families
+ * (`usage.ts`'s chunked `IN (?,?,…)`, `hygiene.ts`'s retention `NOT IN (…)`).
+ * v2's 64 cap was left with no headroom by v3's additions, so it is 128: an
+ * unbounded map keyed on SQL text would grow with every distinct chunk size
+ * ever requested, but 128 keeps every reused text resident with room for the
+ * next schema addition.
  */
-export const LEGION_STMT_CACHE_LIMIT = 64;
+export const LEGION_STMT_CACHE_LIMIT = 128;
 
 /**
  * `exec()` texts that can change the schema and therefore invalidate compiled
@@ -132,6 +139,45 @@ CREATE INDEX idx_messages_inbox ON messages(to_node, delivered, id);
 -- transaction (mail.ts): without it that COUNT is a full SCAN of messages, which
 -- degrades monotonically because messages has no retention policy.
 CREATE INDEX idx_messages_rate ON messages(from_node, created_at);
+`;
+
+/**
+ * Schema v3 (result-ledger D2): the artifact ledger and its per-consumer
+ * consumption facts.
+ *
+ * `IF NOT EXISTS` is what makes the v2 → v3 step idempotent: a database that
+ * already carries one of the tables (or a fresh v0 database that just ran
+ * {@link SCHEMA_V1}) is completed rather than refused, and re-running the
+ * migration on a v3 file is a no-op. Nothing here drops or rewrites a v1/v2
+ * table or column.
+ *
+ * `consumptions` deliberately keeps two orthogonal facts per
+ * `(artifact_id, consumer_id)` — `read_bytes` (a high-water mark of how much
+ * the consumer read) and `notified_at` (whether a completion notice was
+ * delivered) — because collapsing them into one rank makes "paged past the end
+ * after being notified" look like "never notified" (D2/A2).
+ */
+const SCHEMA_V3 = `
+CREATE TABLE IF NOT EXISTS artifacts (
+  id          TEXT PRIMARY KEY,
+  parent_id   TEXT NOT NULL,
+  node_id     TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  round       INTEGER NOT NULL,
+  path        TEXT NOT NULL,
+  bytes       INTEGER NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_parent ON artifacts(parent_id, created_at);
+
+CREATE TABLE IF NOT EXISTS consumptions (
+  artifact_id  TEXT NOT NULL,
+  consumer_id  TEXT NOT NULL,
+  read_bytes   INTEGER NOT NULL DEFAULT 0,
+  read_at      INTEGER,
+  notified_at  INTEGER,
+  PRIMARY KEY (artifact_id, consumer_id)
+);
 `;
 
 /**
@@ -362,8 +408,15 @@ function migrate(db: DatabaseSync): void {
 			// v1 `1` was written as "the send call returned", which is exactly what v2
 			// calls `accepted`. A v1 ledger without the `idx_messages_rate` index is not
 			// repaired here either (see contract REV-19).
-			db.exec(`PRAGMA user_version = ${LEGION_DB_USER_VERSION};`);
+			version = 2;
 		}
+		if (version === 2) {
+			// v2 → v3: the result ledger (contract `result-ledger-v1.md` D2).
+			// Two new tables only — `nodes`/`events`/`usage`/`messages` are untouched,
+			// so an existing ledger keeps every row and simply gains the new tables.
+			db.exec(SCHEMA_V3);
+		}
+		db.exec(`PRAGMA user_version = ${LEGION_DB_USER_VERSION};`);
 		db.exec("COMMIT;");
 	} catch (error) {
 		try {

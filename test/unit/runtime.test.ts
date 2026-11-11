@@ -13,12 +13,15 @@ import {
 } from "../../src/extension/runtime.ts";
 import { collectChild } from "../../index.ts";
 import { SUBAGENT_NOTIFY_TYPE } from "../../src/extension/notify.ts";
-import type { CollectSnapshot } from "../../src/extension/runtime.ts";
+import type { CollectSnapshot, SessionRuntime, SessionRuntimeDeps } from "../../src/extension/runtime.ts";
 import { withTempDir } from "../helpers/tmp.ts";
 import { assistantMsg, modelChange, sessionHeader, userMsg } from "../helpers/fixtures.ts";
 import type { TreeNodeSnapshot } from "../../src/tui/tree-view.ts";
 import type { StatusUi } from "../../src/tui/status.ts";
 import { createLegionEventBus, type LegionEventBus } from "../../src/extension/event-bus.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import type { DatabaseSync } from "../../src/legion/db.ts";
+import { consumptionFor, markNotified, markRead, recordArtifact, undelivered } from "../../src/legion/ledger.ts";
 
 function snapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
 	return {
@@ -173,12 +176,18 @@ test("runtime: a blocked child is not recycled", async () => {
 });
 
 test("runtime: an explicit collect suppresses the completion message", async () => {
-	const messages: unknown[] = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message);
-		},
-	});
+	// P4c: the suppression is the LEDGER's now. `seam.read()` is the tool layer's
+	// `markRead` (P4a/D3b), performed at the point `settleControlResult` performs it —
+	// after the text really reached the parent. Without a projection the same collect
+	// would announce anyway (the deliberate over-notification pinned further down);
+	// with one, a result the parent read settles and this case keeps its meaning.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
+	// A live parent run holds the notice until the boundary (D1) — that is the window the
+	// production order relies on: the tool result (and its read row) exists BEFORE the
+	// flush. With no run signal the notice would be sent inside the collect, which is the
+	// documented over-notification of the degraded path, not what this case is about.
+	runtime.notifyParentRunStart();
 	let collects = 0;
 	runtime.track({
 		name: "w1",
@@ -188,17 +197,20 @@ test("runtime: an explicit collect suppresses the completion message", async () 
 		timeoutMs: 1_000,
 		collect: async () => {
 			collects += 1;
-			return snapshot();
+			return seam.snap("w1");
 		},
 	});
 	runtime.watch("w1");
 	const pending = runtime.consumeCollect("w1");
 	assert.ok(pending);
-	const collected = (await pending).snapshot;
+	const collected = await pending;
 	assert.equal(collected.execution.status, "success");
+	seam.read("w1");
 	await waitFor(() => runtime.activeJobs().length === 0, "watcher release");
 	assert.equal(collects, 1, "tool collect and watcher must share one wait");
+	runtime.notifyParentSettled();
 	assert.equal(messages.length, 0, "parent must not also get a notify");
+	seam.close();
 });
 
 test("runtime: collect failure still wakes the parent", async () => {
@@ -262,7 +274,7 @@ test("runtime: collect after watch finished returns the cached snapshot", async 
 	await waitFor(() => runtime.activeJobs().length === 0, "watch finished");
 	const pending = runtime.consumeCollect("w1");
 	assert.ok(pending, "finished collect must stay cached after the widget drops");
-	const collected = (await pending).snapshot;
+	const collected = await pending;
 	assert.equal(collected.output, "cached-output");
 });
 
@@ -406,6 +418,99 @@ function joinSnapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
 		output: "ok",
 		acceptance: { status: "accepted", level: "attested" },
 		...over,
+	};
+}
+
+// ───────── P4b: the notice PROJECTION (`result-ledger-v1` §3 D4) ─────────
+//
+// Since P4b a completion notice is suppressed by the LEDGER, not by a memory bit.
+// A result stops owing the parent a notice once the consumer read it to EOF
+// (`read_bytes` — written by the tool layer after a real delivery, P4a/D3b) or was
+// already announced (`notified_at` — written by `deliverBatch` itself). The cases
+// below all say "the parent read this through `wait`/`collect`, so it is not
+// announced"; `read()` is the tool-layer write that makes that true, performed at
+// exactly the point `index.ts`'s `settleControlResult` performs it (after the result
+// was really handed over, never inside a handler).
+//
+// `snap()` is the collect snapshot the watch sees: the output plus the artifact id
+// the ledger knows, so the notice filter has something to project.
+
+/** Small on purpose: the SIZE is never the point, but "read to EOF" must be true. */
+const PROJECTION_ARTIFACT_BYTES = 10;
+
+interface ProjectionSeam {
+	runtime: SessionRuntime;
+	messages: SentMessage[];
+	/** The ledger the projection reads (for asserting the facts, not the verdict). */
+	db: ReturnType<typeof openLegionDb>;
+	/** `<runId>/<name>/r<round>` for a child result; registered on first use. */
+	artifactId: (name: string, round?: number) => string;
+	/** The `CollectSnapshot` a collect returns for `name` — output + its artifact id. */
+	snap: (name: string, output?: string, round?: number) => CollectSnapshot;
+	/** P4a/D6 "full": the parent read that artifact to EOF, so the notice is settled. */
+	read: (name: string, round?: number) => void;
+	/** D6's other half: a PAGED read (`read_bytes < bytes`) settles nothing. */
+	readPartial: (name: string, round?: number) => void;
+	/** Teardown: the runtime first, then the ledger it was reading. */
+	close: () => void;
+}
+
+/** A runtime whose only side effect is `messages`, filtered against a real ledger. */
+function projectionSeam(deps: Partial<SessionRuntimeDeps> = {}): ProjectionSeam {
+	const db = openLegionDb(":memory:");
+	const messages: SentMessage[] = [];
+	const registered = new Map<string, string>();
+	const artifactId = (name: string, round = 1): string => {
+		const key = `${name}/${round}`;
+		const known = registered.get(key);
+		if (known !== undefined) return known;
+		const id = `r-1/${name}/r${round}`;
+		recordArtifact(db, {
+			id,
+			parentId: "root",
+			nodeId: `root.${name}`,
+			name,
+			round,
+			path: `/tmp/r-1/artifacts/${name}/r${round}.md`,
+			bytes: PROJECTION_ARTIFACT_BYTES,
+			createdAt: 1_000 + registered.size,
+		});
+		registered.set(key, id);
+		return id;
+	};
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+		// D4: the projection this runtime filters and marks against.
+		getLedgerProjection: () => ({ db, consumerId: "root" }),
+		...deps,
+	});
+	return {
+		runtime,
+		messages,
+		db,
+		artifactId,
+		snap: (name, output = `${name}-out`, round = 1) =>
+			joinSnapshot({ output, artifactId: artifactId(name, round) }),
+		read: (name, round = 1) =>
+			markRead(db, {
+				artifactId: artifactId(name, round),
+				consumerId: "root",
+				bytesRead: PROJECTION_ARTIFACT_BYTES,
+				at: 2_000,
+			}),
+		readPartial: (name, round = 1) =>
+			markRead(db, {
+				artifactId: artifactId(name, round),
+				consumerId: "root",
+				bytesRead: PROJECTION_ARTIFACT_BYTES - 1,
+				at: 2_000,
+			}),
+		close: () => {
+			runtime.dispose();
+			db.close();
+		},
 	};
 }
 
@@ -603,14 +708,14 @@ test("runtime: retire runs during the batch window, not after the flush", async 
 // ─────────────────────────── runtime.wait (T5) ───────────────────────────
 
 test("runtime.wait: aggregates both children, retires RPC children, suppresses notify", async () => {
-	const messages: SentMessage[] = [];
+	// P4c: the suppression comes from the LEDGER (the read rows the tool layer declares
+	// after the parent really got the text, P4a/D3b), and the notice is held until the run
+	// boundary — the window in which the production order writes that read.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	let retired = 0;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
+	runtime.notifyParentRunStart();
 	for (const name of ["a", "b"]) {
 		runtime.track({
 			name,
@@ -630,8 +735,8 @@ test("runtime.wait: aggregates both children, retires RPC children, suppresses n
 	runtime.watch("a");
 	runtime.watch("b");
 	const pending = runtime.wait(["a", "b"], { timeoutMs: 5_000 });
-	resolvers.get("a")!(joinSnapshot({ output: "A-done" }));
-	resolvers.get("b")!(joinSnapshot({ output: "B-done" }));
+	resolvers.get("a")!(seam.snap("a", "A-done"));
+	resolvers.get("b")!(seam.snap("b", "B-done"));
 	const results = await pending;
 	assert.deepEqual(
 		results.map((r) => ({ name: r.name, output: r.snapshot?.output })),
@@ -640,8 +745,12 @@ test("runtime.wait: aggregates both children, retires RPC children, suppresses n
 			{ name: "b", output: "B-done" },
 		],
 	);
+	// The tool layer settles the read for what it rendered (`settleControlResult`).
+	seam.read("a");
+	seam.read("b");
 	await waitFor(() => retired === 2, "both RPC children retired");
 	assert.equal(runtime.activeJobs().length, 0, "both released");
+	runtime.notifyParentSettled();
 	await new Promise((r) => setTimeout(r, 20));
 	assert.equal(messages.length, 0, "wait consumes the results; no notify");
 
@@ -659,6 +768,7 @@ test("runtime.wait: aggregates both children, retires RPC children, suppresses n
 	await waitFor(() => messages.length === 1, "clean group after wait");
 	assert.match(messages[0]!.content, /Background task completed: \*\*c \(worker\)\*\*/);
 	assert.doesNotMatch(messages[0]!.content, /Still running:/);
+	seam.close();
 });
 
 test("runtime.wait: the hit path itself releases the job (no watch finally to hide it)", async () => {
@@ -684,7 +794,7 @@ test("runtime.wait: the hit path itself releases the job (no watch finally to hi
 	runtime.dispose();
 });
 
-test("runtime.wait: timeout yields stillRunning, resets consumedByTool, auto-notify lands", async () => {
+test("runtime.wait: timeout yields stillRunning and the auto-notify still lands", async () => {
 	const messages: SentMessage[] = [];
 	let resolveCollect!: (s: CollectSnapshot) => void;
 	const runtime = createSessionRuntime({
@@ -710,7 +820,8 @@ test("runtime.wait: timeout yields stillRunning, resets consumedByTool, auto-not
 	assert.equal(results[0]?.stillRunning, true);
 	assert.equal(results[0]?.timedOut, true, "timeout path sets timedOut for #179");
 	assert.ok(typeof results[0]?.elapsedMs === "number");
-	assert.equal(runtime.get("slow")?.consumedByTool, false, "timeout resets the flag");
+	// P4c: nothing is taken on this path any more (no flag to reset) — the assertion
+	// that matters is the one below: the in-flight watch still delivers the notice.
 	// The in-flight watch completes later and the notice is delivered as usual.
 	resolveCollect(joinSnapshot({ output: "finally" }));
 	await waitFor(() => messages.length === 1, "auto-notify after timeout");
@@ -761,7 +872,8 @@ test("runtime.wait: parent abort interrupts promptly, clears its timer, and rest
 		assert.deepEqual(await pending, [{ name: "slow", interrupted: true }]);
 		assert.equal(scheduledTimers.size, 1, "wait must install its timeout guard");
 		assert.equal(clearedWaitTimers, 1, "abort must clear the losing timeout");
-		assert.equal(runtime.get("slow")?.consumedByTool, false, "abort restores notification ownership");
+		// P4c: `consumedByTool` is gone; the surviving fact is that the watch still owns
+		// the notice route, which the delivery at the end of this test proves.
 		assert.equal(runtime.get("slow")?.watching, true, "the existing watch continues after abort");
 	} finally {
 		globalThis.setTimeout = originalSetTimeout;
@@ -792,7 +904,6 @@ test("runtime.wait: an interrupted unwatched job is re-armed so settle still not
 	const pending = runtime.wait(["unwatched"], { timeoutMs: 5_000, signal: controller.signal });
 	controller.abort();
 	assert.deepEqual(await pending, [{ name: "unwatched", interrupted: true }]);
-	assert.equal(runtime.get("unwatched")?.consumedByTool, false, "abort restores notification ownership");
 	assert.equal(runtime.get("unwatched")?.watching, true, "waitOne re-arms watch after interrupt (esc-no-retire-v3)");
 	resolveCollect(joinSnapshot({ output: "still running after abort" }));
 	await waitFor(() => messages.length === 1, "completion notify after re-armed watch");
@@ -862,7 +973,6 @@ test("runtime.wait: a blocked snapshot yields stillRunning, keeps the job, and r
 	assert.ok(typeof results[0]?.elapsedMs === "number");
 	const job = runtime.get("b");
 	assert.ok(job, "job still tracked");
-	assert.equal(job.consumedByTool, false, "consumedByTool reset");
 	assert.equal(retired, 0, "blocked pane is not retired");
 	await waitFor(() => collectCalls === 2, "orphaned watch restarted");
 
@@ -903,7 +1013,6 @@ test("runtime.wait: a non-terminal (running) snapshot keeps the job active and u
 	assert.ok(typeof results[0]?.elapsedMs === "number");
 	const job = runtime.get("r");
 	assert.ok(job, "job still tracked");
-	assert.equal(job.consumedByTool, false, "consumedByTool reset");
 	assert.equal(retired, 0, "non-terminal pane is not retired");
 	assert.equal(messages.length, 0, "a running snapshot never notifies");
 	runtime.dispose();
@@ -952,7 +1061,8 @@ test("U1: watch re-arms instead of notifying when collect times out on a live ch
 	assert.ok(job);
 	assert.equal(job.state, "working", "still working, not awaiting");
 	assert.equal(job.watching, true, "the re-armed watch is in flight");
-	assert.equal(job.notified, false, "the notify flag was cleared for the new round");
+	// P4c: no `notified` flag survives; the proof that the new round may notify is the
+	// delivery asserted right below.
 
 	// The child truly finishes: the re-armed watch collects and notifies.
 	resolves[1]!(joinSnapshot({ output: "finally done" }));
@@ -1054,7 +1164,7 @@ test("U5: a running snapshot is not cached as a finished result", async () => {
 				output: "half-done",
 			}),
 	});
-	const collected = (await runtime.consumeCollect("stale"))?.snapshot;
+	const collected = await runtime.consumeCollect("stale");
 	assert.ok(collected);
 	assert.equal(collected.execution.status, "running");
 
@@ -1085,10 +1195,10 @@ test("U5: a terminal snapshot is still cached (the exclusion is running-only)", 
 		timeoutMs: 1_000,
 		collect: async () => joinSnapshot({ output: "all good" }),
 	});
-	const first = (await runtime.consumeCollect("done"))?.snapshot;
+	const first = await runtime.consumeCollect("done");
 	assert.equal(first?.output, "all good");
 	runtime.release("done");
-	const cached = (await runtime.consumeCollect("done"))?.snapshot;
+	const cached = await runtime.consumeCollect("done");
 	assert.equal(cached?.output, "all good", "a terminal snapshot stays cached");
 	const results = await runtime.wait(["done"], { timeoutMs: 50 });
 	assert.equal(results[0]?.snapshot?.output, "all good", "wait hits the cache too");
@@ -2607,14 +2717,10 @@ test("v2 §6.2: the incident — a child the parent collected in this turn is ne
 	// The 2026-11-06 sequence: parent run active, the children complete, the parent
 	// `collect`s one inside the SAME turn, then the outbox flushes at settle. Before
 	// v2 the identical body arrived twice (session lines 16 and 22-23).
-	const messages: SentMessage[] = [];
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	let releaseWorker!: (s: CollectSnapshot) => void;
 	let releaseScout!: (s: CollectSnapshot) => void;
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.setJoinConfig({ mode: "smart", flushMs: 30 });
 	runtime.notifyParentRunStart();
 	runtime.track({
@@ -2643,17 +2749,20 @@ test("v2 §6.2: the incident — a child the parent collected in this turn is ne
 	runtime.watch("demo-worker");
 	runtime.watch("scout-a");
 
-	releaseWorker(joinSnapshot({ output: "demo-worker-out" }));
+	releaseWorker(seam.snap("demo-worker"));
 	// B1: the sibling finishes BEFORE the boundary and inside the same window, so
 	// both children ride ONE held batch into the outbox. That is the incident's real
 	// shape (the outbox is the buffering layer) — finishing the sibling after the
 	// settle would sidestep `flushOutbox` altogether and prove nothing.
-	releaseScout(joinSnapshot({ output: "scout-a-out" }));
+	releaseScout(seam.snap("scout-a"));
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both children held as one batch");
 
-	// The parent reads one of them in the SAME turn (T0): the claim lands here.
+	// The parent reads one of them in the SAME turn (T0). P4b: the notice filter now
+	// reads the ledger projection, so the tool-layer write (P4a) is what makes "read"
+	// mean "settled" — performed here at the same point `settleControlResult` does.
 	const collected = await runtime.consumeCollect("demo-worker");
-	assert.equal(collected?.snapshot.output, "demo-worker-out");
+	assert.equal(collected?.output, "demo-worker-out");
+	seam.read("demo-worker");
 
 	// The boundary is where the incident's duplicate became visible: the read result
 	// must not appear, and the unread sibling of the SAME batch must arrive here.
@@ -2663,7 +2772,7 @@ test("v2 §6.2: the incident — a child the parent collected in this turn is ne
 	assert.doesNotMatch(messages[0]!.content, /demo-worker-out/);
 	await drainContinuations();
 	assert.equal(messages.length, 1, "no duplicate of the read result, and no second boundary message");
-	runtime.dispose();
+	seam.close();
 });
 
 test("v2 §6.3: a `watching:false` utility sibling is never promised as `Still running`", async () => {
@@ -4174,14 +4283,10 @@ test("display-liveness A2: a finished child is not pulled back to running by a f
 // the other route goes quiet. These cases pin each window in which the notice
 // used to arrive twice.
 
-test("claim W1: a buffered entry claimed by wait() never reaches the window flush", async () => {
-	const messages: SentMessage[] = [];
+test("W1: a buffered entry read through wait() never reaches the window flush", async () => {
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.setJoinConfig({ mode: "smart", flushMs: 150 });
 	for (const name of ["a", "b"]) {
 		runtime.track({
@@ -4200,12 +4305,14 @@ test("claim W1: a buffered entry claimed by wait() never reaches the window flus
 
 	// W1 window: a finishes first, so its entry waits in the join buffer while b
 	// is still pending. Its watch releases the child right after.
-	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	resolvers.get("a")!(seam.snap("a"));
 	await waitFor(() => runtime.get("a") === undefined, "a's watch released it");
 
-	// The parent reads a's result explicitly: from here on a has been reported.
+	// The parent reads a's result explicitly. P4b: what suppresses the notice is the
+	// ledger row the tool layer writes on delivery (P4a), not a memory claim.
 	const waited = await runtime.wait(["a"], { timeoutMs: 500 });
 	assert.equal(waited[0]?.snapshot?.output, "a-out");
+	seam.read("a");
 	assert.equal(messages.length, 0, "a was read, not announced");
 
 	// The window expires with b still pending. The claimed entry must not fire.
@@ -4215,7 +4322,7 @@ test("claim W1: a buffered entry claimed by wait() never reaches the window flus
 	assert.equal(messages.length, 0, "the window must not deliver the claimed entry");
 
 	// b is now the only child the parent has not read.
-	resolvers.get("b")!(joinSnapshot({ output: "b-out" }));
+	resolvers.get("b")!(seam.snap("b"));
 	await waitFor(() => messages.length === 1, "only b notifies");
 	// Shape-agnostic on purpose: whether b flushes alone (legacy single) or the
 	// expired window already happened to be mid-flight (grouped entry) is timing,
@@ -4225,17 +4332,13 @@ test("claim W1: a buffered entry claimed by wait() never reaches the window flus
 	assert.doesNotMatch(messages[0]!.content, /a-out/, "a's output is never repeated");
 	// Strict: a second message would land in messages[1] and go unnoticed otherwise.
 	assert.equal(messages.length, 1, "exactly one message for the whole scenario");
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim W2: a held outbox entry claimed by wait() is dropped; its sibling still arrives", async () => {
-	const messages: SentMessage[] = [];
+test("W2: a held outbox entry read through wait() is dropped; its sibling still arrives", async () => {
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 
 	// The parent run is live, so the notice is held (D-A) instead of sent.
 	runtime.notifyParentRunStart();
@@ -4259,21 +4362,21 @@ test("claim W2: a held outbox entry claimed by wait() is dropped; its sibling st
 
 	// W2 window: the children finish first, so the batch is enqueued for the live
 	// run — this is the deferral the outbox exists for.
-	resolvers.get("held")!(joinSnapshot({ output: "held-out" }));
-	resolvers.get("free")!(joinSnapshot({ output: "free-out" }));
+	resolvers.get("held")!(seam.snap("held"));
+	resolvers.get("free")!(seam.snap("free"));
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "batch held in the outbox");
 	assert.equal(messages.length, 0, "a live run holds the notice");
 
-	// The same turn then reads one member explicitly. The batch is held as ENTRIES
-	// (D4) and only formatted at flush, which is exactly why a claim taken after
-	// enqueue still wins.
+	// The same turn then reads one member explicitly. P4b: the projection sees the
+	// read row (P4a's write) and drops that member at the flush, not at enqueue time.
 	const waited = await runtime.wait(["held"], { timeoutMs: 500 });
 	assert.equal(waited[0]?.snapshot?.output, "held-out");
+	seam.read("held");
 
-	// The item is still pending, but now only for `free`: the claim removed the
-	// `held` member at the filter, it did not throw the batch away.
+	// The item is still pending, but now only for `free`: the read member left the
+	// projection, it did not throw the batch away.
 	assert.equal(runtime.noticeQueueStats().pending, 1, "the batch still owes the unread sibling");
-	assert.equal(messages.length, 0, "claiming never sends anything");
+	assert.equal(messages.length, 0, "reading a result never sends anything");
 
 	runtime.notifyParentSettled();
 	await waitFor(() => messages.length === 1, "the sibling's notice is delivered at settle");
@@ -4281,10 +4384,10 @@ test("claim W2: a held outbox entry claimed by wait() is dropped; its sibling st
 	assert.doesNotMatch(messages[0]!.content, /held-out/, "the read member is dropped from the body");
 	assert.equal(messages.length, 1, "exactly one message: the read result is never re-announced");
 	assert.equal(runtime.noticeQueueStats().pending, 0, "the outbox is drained");
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D6: a notice sent first does not shorten the collect the parent asks for next", async () => {
+test("D6: a notice sent first does not shorten the collect the parent asks for next", async () => {
 	const messages: SentMessage[] = [];
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
@@ -4306,15 +4409,15 @@ test("claim D6: a notice sent first does not shorten the collect the parent asks
 	assert.match(messages[0]!.content, /Background task completed: \*\*fast \(worker\)\*\*/);
 
 	// ...and the tool route that follows still returns the FULL result (D6).
-	const collected = (await runtime.consumeCollect("fast"))?.snapshot;
+	const collected = await runtime.consumeCollect("fast");
 	assert.equal(collected?.output, "fast-out", "the collect text is never suppressed");
 	const waited = await runtime.wait(["fast"], { timeoutMs: 50 });
 	assert.equal(waited[0]?.snapshot?.output, "fast-out", "the wait text is never suppressed");
-	assert.equal(messages.length, 1, "still exactly one message: the claim stayed taken");
+	assert.equal(messages.length, 1, "still exactly one message: the notice was already sent");
 	runtime.dispose();
 });
 
-test("claim a wait timeout claims nothing, so the real completion still notifies", async () => {
+test("D4: a wait timeout settles nothing, so the real completion still notifies", async () => {
 	const messages: SentMessage[] = [];
 	let resolveCollect!: (s: CollectSnapshot) => void;
 	const runtime = createSessionRuntime({
@@ -4347,7 +4450,7 @@ test("claim a wait timeout claims nothing, so the real completion still notifies
 	runtime.dispose();
 });
 
-test("claim D7: a fresh track after release reports again — the claim never leaks into round 2", async () => {
+test("D7: a fresh track after release reports again — the earlier round never leaks into round 2", async () => {
 	const messages: SentMessage[] = [];
 	let collects = 0;
 	let resolveRound!: (s: CollectSnapshot) => void;
@@ -4395,11 +4498,12 @@ test("claim D7: a fresh track after release reports again — the claim never le
 	runtime.dispose();
 });
 
-test("claim D7: rewatch un-claims a result the tool route already took", async () => {
-	// The other re-arm site: the claim came from `consumeCollect` (the tool route)
-	// while the job is still tracked, and the parent then explicitly asks to be
-	// told again. Without the unclaim in `rewatch` the second round is filtered out
-	// and the parent hears nothing at all.
+test("D4: rewatch asks to be told again — the next round is announced exactly once", async () => {
+	// The other re-arm site: the tool route read round 1 (`consumeCollect`) while the
+	// job is still tracked, and the parent then explicitly asks to be told again.
+	// P4c: `rewatch` no longer revokes anything — it re-arms the watch, the next collect
+	// is a NEW round with its own artifact, and the projection owes THAT one a notice, so
+	// the parent hears exactly one report and never zero.
 	const messages: SentMessage[] = [];
 	let collects = 0;
 	const runtime = createSessionRuntime({
@@ -4419,7 +4523,7 @@ test("claim D7: rewatch un-claims a result the tool route already took", async (
 		},
 	});
 
-	const first = (await runtime.consumeCollect("re"))?.snapshot;
+	const first = await runtime.consumeCollect("re");
 	assert.equal(first?.output, "round-1", "the tool route read round 1");
 	assert.equal(runtime.get("re") !== undefined, true, "collect does not release the job");
 	assert.equal(messages.length, 0, "reading a result is not a notice");
@@ -4430,14 +4534,10 @@ test("claim D7: rewatch un-claims a result the tool route already took", async (
 	runtime.dispose();
 });
 
-test("claim D4: a grouped outbox entry drops the claimed member and recomputes its header", async () => {
-	const messages: SentMessage[] = [];
+test("D4: a grouped outbox entry drops the read member and recomputes its header", async () => {
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.setJoinConfig({ mode: "smart", flushMs: 60 });
 
 	runtime.notifyParentRunStart();
@@ -4458,14 +4558,15 @@ test("claim D4: a grouped outbox entry drops the claimed member and recomputes i
 
 	// a and b settle, c is still running: the window flushes a + b as ONE grouped
 	// entry, which is then held for the live parent run.
-	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
-	resolvers.get("b")!(joinSnapshot({ output: "b-out" }));
+	resolvers.get("a")!(seam.snap("a"));
+	resolvers.get("b")!(seam.snap("b"));
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "grouped entry held");
 	assert.equal(messages.length, 0, "held for the live run");
 
-	// The parent reads a before the run settles.
+	// The parent reads a before the run settles; P4a's read row settles it.
 	const waited = await runtime.wait(["a"], { timeoutMs: 500 });
 	assert.equal(waited[0]?.snapshot?.output, "a-out");
+	seam.read("a");
 
 	runtime.notifyParentSettled();
 	await waitFor(() => messages.length === 1, "one message at settle");
@@ -4478,25 +4579,23 @@ test("claim D4: a grouped outbox entry drops the claimed member and recomputes i
 	// of the two that were pending, and c — still unread, still alive — remains.
 	assert.match(content, /^Background tasks completed \(1 of 2\):$/m);
 	assert.match(content, /^Still running: c( |$)/m);
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D2(a)/D9: a CACHED collect-claim is filtered out of the join window", async () => {
+test("D2(a)/D9: a CACHED result the tool route read is filtered out of the join window", async () => {
 	// `consumeCollect` is the seam index.ts's collectChild awaits, so a terminal
-	// snapshot returned there is a delivery like any other.
+	// snapshot returned there is a delivery like any other. Since P4b the delivery is
+	// recorded where it happens — the tool layer's read row (P4a) — so the filter
+	// below reads the projection, not a claim the seam took.
 	//
 	// Branch honesty: the watch's `finally` already released the child by the time
-	// `consumeCollect` runs, so this exercises the FINISHED-CACHE claim
-	// (`claimCachedResult`, keyed with D9's snapshot run id) — not the job branch.
+	// `consumeCollect` runs, so this exercises the FINISHED-CACHE snapshot (keyed with
+	// D9's snapshot run id) — not the job branch.
 	// Sibling c is the POSITIVE CONTROL: it proves the window really flushed, so a
 	// green result here cannot be a window that simply never fired.
-	const messages: SentMessage[] = [];
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.setJoinConfig({ mode: "smart", flushMs: 120 });
 	for (const name of ["a", "c", "b"]) {
 		runtime.track({
@@ -4512,25 +4611,26 @@ test("claim D2(a)/D9: a CACHED collect-claim is filtered out of the join window"
 		});
 		runtime.watch(name);
 	}
-	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	resolvers.get("a")!(seam.snap("a"));
 	await waitFor(() => runtime.get("a") === undefined, "job released ⇒ cache branch");
-	resolvers.get("c")!(joinSnapshot({ output: "c-out" }));
+	resolvers.get("c")!(seam.snap("c"));
 	await waitFor(() => runtime.get("c") === undefined, "c released");
 
 	// b keeps the group pending, so both entries wait for the window.
-	const collected = (await runtime.consumeCollect("a"))?.snapshot;
+	const collected = await runtime.consumeCollect("a");
 	assert.equal(collected?.output, "a-out");
+	seam.read("a");
 
 	await waitFor(() => messages.length === 1, "the window flushed the batch");
 	const content = messages[0]!.content;
 	assert.match(content, /^- c \(worker\): completed/m, "positive control: the flush really ran");
 	assert.match(content, /c-out/);
-	assert.doesNotMatch(content, /- a \(worker\)/, "a was claimed through the cache branch");
+	assert.doesNotMatch(content, /- a \(worker\)/, "a was read through the cache branch");
 	assert.doesNotMatch(content, /a-out/);
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D7b: re-tracking the same name drops the one-round cache (no stale read)", async () => {
+test("D7b: re-tracking the same name drops the one-round cache (no stale read)", async () => {
 	// `runId` is the PARENT run id, so every round of the same child shares it — a
 	// surviving cache entry would hand the new round the previous round's snapshot.
 	// ANY (re)track starts a new round and must drop the cache (D7b).
@@ -4591,15 +4691,15 @@ test("claim D7b: re-tracking the same name drops the one-round cache (no stale r
 	runtime.dispose();
 });
 
-test("claim D7b: the same child's next-round failure is not swallowed by the old cache", async () => {
+test("D7b: the same child's next-round failure is not swallowed by the old cache", async () => {
 	// The critical direction: round 1 succeeded and its snapshot was cached; round 2
 	// throws. Serving (and claiming) that stale snapshot told the parent "success"
 	// AND claimed exactly the key of round 2's failure notice, so the failure was
 	// lost. `runId` is the same in both rounds — a parent run id, not a round id.
 	//
 	// Notices are delivered immediately here (no live parent run), so each round
-	// speaks for itself: round 1's claim is revoked by round 2's track (D7), and
-	// round 2's failure must reach the parent.
+	// speaks for itself: round 2's artifact is its own, and the failure must reach the
+	// parent even though round 1 was served (and, in production, read).
 	const messages: SentMessage[] = [];
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
@@ -4651,24 +4751,27 @@ test("claim D7b: the same child's next-round failure is not swallowed by the old
 	runtime.dispose();
 });
 
-test("claim D2(a): waitOne claims BEFORE the retire await, so the window cannot fire in between", async () => {
+test("D2(a): a result parked in a tool call is not announced at the boundary that follows it", async () => {
 	// A pending `retire` is the only way to reach waitOne's terminal branch while the
-	// job (and its buffered entry) is still alive: the claim must already be taken by
-	// then, or a join flush landing inside the retire await delivers the same result
-	// a second time.
+	// job (and its buffered entry) is still alive.
 	//
-	// Sibling z is the POSITIVE CONTROL: its unclaimed entry rides in the same batch,
-	// so "z arrived, a did not" proves the window really expired DURING the park —
-	// no bare sleep is load-bearing here.
-	const messages: SentMessage[] = [];
+	// P4b re-anchors this case: the old model claimed inside `waitOne`, BEFORE the
+	// retire await, because an idle-run join flush could land in that window. That
+	// promise is deleted by P4b on purpose (A3: no second memory marker, and D3b puts
+	// the read write after the abort net), and it is not needed: with the parent run
+	// live (the production shape — D1) the window only HOLDS the batch, so the
+	// duplicate could only become visible at the run boundary — which happens after
+	// the tool result was handed over and its read row written (P4a). This case pins
+	// exactly that: the flush during the park holds, the boundary delivers z only.
+	//
+	// Sibling z is the POSITIVE CONTROL: "z arrived, a did not" proves the boundary
+	// really flushed — no bare sleep is load-bearing here.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
 	const retires: Array<{ name: string; release: () => void }> = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.setJoinConfig({ mode: "smart", flushMs: 150 });
+	runtime.notifyParentRunStart();
 	for (const name of ["a", "z", "b"]) {
 		runtime.track({
 			name,
@@ -4690,48 +4793,55 @@ test("claim D2(a): waitOne claims BEFORE the retire await, so the window cannot 
 
 	// a and z finish: the window opens (b is still pending) and both watches park in
 	// the retire await, so both jobs keep their buffered entries.
-	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	resolvers.get("a")!(seam.snap("a"));
 	await waitFor(() => retires.length === 1, "a's watch is awaiting retire");
 	assert.ok(runtime.get("a"), "the job survives a pending retire");
-	resolvers.get("z")!(joinSnapshot({ output: "z-out" }));
+	resolvers.get("z")!(seam.snap("z"));
 	await waitFor(() => retires.length === 2, "z's watch is awaiting retire");
 
 	// The explicit wait reaches the terminal branch and parks in its own retire
-	// await — the exact window the claim has to cover.
+	// await — the exact window a second delivery could come out of.
 	const pendingWait = runtime.wait(["a"], { timeoutMs: 5_000 });
 	await waitFor(() => retires.length === 3, "the wait is parked in the retire await");
 
-	// The window expires while the wait is parked. Positive control: z is delivered.
-	await waitFor(() => messages.length === 1, "the window expired during the retire await");
-	const content = messages[0]!.content;
-	assert.match(content, /^- z \(worker\): completed/m, "positive control: the flush really ran");
-	assert.match(content, /z-out/);
-	assert.doesNotMatch(content, /- a \(worker\)/, "a's claim was taken before the retire await");
-	assert.doesNotMatch(content, /a-out/);
+	// The window expires while the wait is parked: the batch is HELD for the live run,
+	// so nothing became visible at a moment the projection no longer controls.
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the window expired during the retire await");
+	assert.equal(messages.length, 0, "a live run holds the batch: the duplicate has no moment to land");
 
-	// Release the wait's park: it returns the snapshot, and still nothing for a.
+	// Release the wait's park: it returns the snapshot and the read row is written
+	// (P4a's settleControlResult).
 	retires[2]!.release();
 	const waited = await pendingWait;
 	assert.equal(waited[0]?.snapshot?.output, "a-out");
-	assert.equal(messages.length, 1, "still exactly one message: z only");
+	seam.read("a");
+
+	// The boundary is where the batch becomes visible: z rides it, a does not.
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the unread sibling rides the boundary");
+	const content = messages[0]!.content;
+	assert.match(content, /^- z \(worker\): completed/m, "positive control: the flush really ran");
+	assert.match(content, /z-out/);
+	assert.doesNotMatch(content, /- a \(worker\)/, "the read result is not announced");
+	assert.doesNotMatch(content, /a-out/);
+	assert.equal(messages.length, 1, "exactly one message: z only");
 	for (const gate of retires) gate.release();
 	await drainContinuations();
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D2(b): a collect-claimed member is dropped from the batch that flushes right now", async () => {
+test("D2(b): a member the tool route read is dropped from the batch that flushes right now", async () => {
 	// `consumeCollect` really takes the JOB branch here (a pending retire keeps the
-	// job tracked), so the claim comes from `claimIfTerminal`, not from the finished
-	// cache. The sibling entry d in the same batch is the positive control: it proves
-	// the window actually flushed while a demonstrably stayed out.
-	const messages: SentMessage[] = [];
+	// job tracked), so the snapshot is handed out while the notice is still queued.
+	// P4b: what suppresses it is the read row the tool layer writes on delivery
+	// (P4a) — taken right after the result reaches the parent, exactly where
+	// `settleControlResult` takes it. The sibling entry d in the same batch is the
+	// positive control: it proves the window actually flushed while a demonstrably
+	// stayed out.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
 	const retires: Array<() => void> = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.setJoinConfig({ mode: "smart", flushMs: 300 });
 	for (const name of ["a", "d", "b"]) {
 		runtime.track({
@@ -4751,34 +4861,31 @@ test("claim D2(b): a collect-claimed member is dropped from the batch that flush
 		});
 		runtime.watch(name);
 	}
-	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
-	resolvers.get("d")!(joinSnapshot({ output: "d-out" }));
+	resolvers.get("a")!(seam.snap("a"));
+	resolvers.get("d")!(seam.snap("d"));
 	await waitFor(() => retires.length === 2, "a and d are parked in retire");
 	assert.ok(runtime.get("a"), "a is still TRACKED — this is the job branch");
 
-	const collected = (await runtime.consumeCollect("a"))?.snapshot;
+	const collected = await runtime.consumeCollect("a");
 	assert.equal(collected?.output, "a-out");
+	seam.read("a");
 
 	await waitFor(() => messages.length === 1, "the window flushed the batch");
 	const content = messages[0]!.content;
 	assert.match(content, /^- d \(worker\): completed/m, "positive control: the flush really ran");
 	assert.match(content, /d-out/);
-	assert.doesNotMatch(content, /- a \(worker\)/, "a was claimed through the job branch");
+	assert.doesNotMatch(content, /- a \(worker\)/, "a was read through the job branch");
 	assert.doesNotMatch(content, /a-out/);
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D4: the grouped header collapses to (1) when the only other member was read", async () => {
+test("D4: the grouped header collapses to (1) when the only other member was read", async () => {
 	// The `N of 1` shape: the batch is still the grouped notice (it was built from
-	// two members), but after the claim only one survives and nothing is still
+	// two members), but after the read only one survives and nothing is still
 	// running — so the header must say exactly `(1)`.
-	const messages: SentMessage[] = [];
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.notifyParentRunStart();
 	for (const name of ["a", "b"]) {
 		runtime.track({
@@ -4795,12 +4902,13 @@ test("claim D4: the grouped header collapses to (1) when the only other member w
 		runtime.watch(name);
 	}
 	// Both settle → ONE grouped entry (2 members) held for the live run.
-	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
-	resolvers.get("b")!(joinSnapshot({ output: "b-out" }));
+	resolvers.get("a")!(seam.snap("a"));
+	resolvers.get("b")!(seam.snap("b"));
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "grouped entry held");
 
 	const waited = await runtime.wait(["a"], { timeoutMs: 500 });
 	assert.equal(waited[0]?.snapshot?.output, "a-out");
+	seam.read("a");
 
 	runtime.notifyParentSettled();
 	await waitFor(() => messages.length === 1, "one message at settle");
@@ -4809,32 +4917,27 @@ test("claim D4: the grouped header collapses to (1) when the only other member w
 	assert.doesNotMatch(content, /\d+ of \d+/, "no stale `N of M` header");
 	assert.match(content, /^- b \(worker\): completed/m);
 	assert.doesNotMatch(content, /- a \(worker\)/);
-	runtime.dispose();
+	seam.close();
 });
 
 // ═════ D7 atomicity (revoked copies) · consumeCollectInterruptible (the real seam) ═════
 
-test("claim D10: a same-name re-track after a read does not revive the OLD round's notice", async () => {
-	// Scope, stated plainly: this case is about the ROUND-KEYED FILTER in
-	// `deliverBatch`, not about the D7 revoke. The parent read round 1 (claim on
-	// `(runId, held, 1)`), then `continue`d the child before the run settled, which
-	// takes `track()`'s NEW-job branch and starts round 2. That branch's revoke
-	// targets round 2 — a key with no claim yet — so nothing is unclaimed here on
-	// purpose (D7/D10: an unread copy must not be dropped), and the queued round-1
-	// entry is killed by its own claim at flush time.
+test("D10: a same-name re-track after a read does not revive the OLD round's notice", async () => {
+	// Scope, stated plainly: this case is about the ROUND-SCOPED filter in
+	// `deliverBatch`. The parent read round 1 (the ledger records it against the
+	// round-1 artifact), then `continue`d the child before the run settled, which takes
+	// `track()`'s NEW-job branch and starts round 2. Nothing is revoked on that path
+	// (D10: an unread copy must not be dropped), so the queued round-1 entry is killed
+	// by its own read row at flush time — and only that.
 	//
 	// The genuine revoke paths (rewatch / rearm with a live job) are pinned
-	// separately, where the claim and the copy actually coexist.
+	// separately, where the read fact and the copy actually coexist.
 	//
 	// `free` is the positive control (hard requirement 7): the flush must deliver
 	// its notice, so a dead `flushOutbox` cannot make this case green.
-	const messages: SentMessage[] = [];
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.notifyParentRunStart();
 	for (const name of ["held", "free"]) {
 		runtime.track({
@@ -4850,16 +4953,17 @@ test("claim D10: a same-name re-track after a read does not revive the OLD round
 		});
 		runtime.watch(name);
 	}
-	resolvers.get("held")!(joinSnapshot({ output: "held-out" }));
-	resolvers.get("free")!(joinSnapshot({ output: "free-out" }));
+	resolvers.get("held")!(seam.snap("held"));
+	resolvers.get("free")!(seam.snap("free"));
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "batch held in the outbox");
 
 	const waited = await runtime.wait(["held"], { timeoutMs: 500 });
 	assert.equal(waited[0]?.snapshot?.output, "held-out");
+	seam.read("held");
 	assert.equal(
 		runtime.noticeQueueStats().pending,
 		1,
-		"the round-1 member is claimed; the batch survives for the unread one",
+		"the round-1 member is read; the batch survives for the unread one",
 	);
 
 	// The parent continues the same child before the run settles: a new round.
@@ -4882,21 +4986,56 @@ test("claim D10: a same-name re-track after a read does not revive the OLD round
 		"a read result is never re-announced, not even for the round that succeeded it",
 	);
 	assert.equal(messages.length, 1, "exactly one message");
+	seam.close();
+});
+
+test("D12: consumeCollect answers with the bare snapshot again (public API shape)", async () => {
+	// #320 wrapped the seam in `ClaimedCollect` — `{ snapshot, claimedNow }` — because the
+	// seam used to arbitrate delivery. P4c deleted that model (D12), and this is the
+	// public-API guard for the shape `src/api.ts` documents: the resolved value IS the
+	// snapshot, on BOTH branches, with no envelope to unwrap and no flag to hand back.
+	const runtime = createSessionRuntime({ sendMessage() {} });
+	runtime.track({
+		name: "bare",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/bare.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "bare-out" }),
+	});
+	// Job branch: the tracked child.
+	const fromJob = await runtime.consumeCollect("bare")!;
+	assert.equal(fromJob.output, "bare-out");
+	assert.equal("snapshot" in fromJob, false, "no `{ snapshot }` envelope");
+	assert.equal("claimedNow" in fromJob, false, "nothing for the caller to hand back");
+
+	// Cache branch: the watch released the child, the snapshot comes from the cache.
+	runtime.watch("bare");
+	await waitFor(() => runtime.get("bare") === undefined, "the watch released the child");
+	const fromCache = await runtime.consumeCollect("bare")!;
+	assert.equal(fromCache.output, "bare-out");
+	assert.equal("snapshot" in fromCache, false);
+	assert.equal("claimedNow" in fromCache, false);
+
+	// …and the abortable variant the production `collect` tool uses answers the same way.
+	const fromInterruptible = await runtime.consumeCollectInterruptible(
+		"bare",
+		new AbortController().signal,
+	)!;
+	assert.equal(fromInterruptible?.output, "bare-out");
+	assert.equal("snapshot" in fromInterruptible!, false);
 	runtime.dispose();
 });
 
-test("claim D2(b): consumeCollectInterruptible claims on the JOB branch", async () => {
+test("D2(b): consumeCollectInterruptible serves the JOB branch", async () => {
 	// Production always passes a signal, so THIS seam — not plain consumeCollect — is
 	// what collectChild actually awaits. A pending retire keeps the job tracked so the
-	// claim is the job-branch one; sibling d is the positive control for the flush.
-	const messages: SentMessage[] = [];
+	// snapshot is handed out by the job branch; the read row P4a writes on delivery is
+	// what drops it from the batch. Sibling d is the positive control for the flush.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
 	const retires: Array<() => void> = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.setJoinConfig({ mode: "smart", flushMs: 150 });
 	for (const name of ["a", "d", "b"]) {
 		runtime.track({
@@ -4916,33 +5055,31 @@ test("claim D2(b): consumeCollectInterruptible claims on the JOB branch", async 
 		});
 		runtime.watch(name);
 	}
-	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
-	resolvers.get("d")!(joinSnapshot({ output: "d-out" }));
+	resolvers.get("a")!(seam.snap("a"));
+	resolvers.get("d")!(seam.snap("d"));
 	await waitFor(() => retires.length === 2, "a and d are parked in retire");
 	assert.ok(runtime.get("a"), "a is still TRACKED — this is the job branch");
 
-	const collected = (await runtime.consumeCollectInterruptible("a", new AbortController().signal))?.snapshot;
+	const collected = await runtime.consumeCollectInterruptible("a", new AbortController().signal);
 	assert.equal(collected?.output, "a-out");
+	seam.read("a");
 
 	await waitFor(() => messages.length === 1, "the window flushed the batch");
 	const content = messages[0]!.content;
 	assert.match(content, /^- d \(worker\): completed/m, "positive control: the flush really ran");
 	assert.match(content, /d-out/);
-	assert.doesNotMatch(content, /- a \(worker\)/, "a was claimed through the job branch");
+	assert.doesNotMatch(content, /- a \(worker\)/, "a was read through the job branch");
 	assert.doesNotMatch(content, /a-out/);
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D2(a)/D9: consumeCollectInterruptible claims on the CACHE branch", async () => {
+test("D2(a)/D9: consumeCollectInterruptible serves the CACHE branch", async () => {
 	// The other half of the same seam: the watch already released the child, so the
-	// snapshot comes from the finished cache and the claim is `claimCachedResult`.
-	const messages: SentMessage[] = [];
+	// snapshot comes from the finished cache. The read row P4a writes on delivery is
+	// what settles it for the projection.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.setJoinConfig({ mode: "smart", flushMs: 150 });
 	for (const name of ["a", "c", "b"]) {
 		runtime.track({
@@ -4958,28 +5095,30 @@ test("claim D2(a)/D9: consumeCollectInterruptible claims on the CACHE branch", a
 		});
 		runtime.watch(name);
 	}
-	resolvers.get("a")!(joinSnapshot({ output: "a-out" }));
+	resolvers.get("a")!(seam.snap("a"));
 	await waitFor(() => runtime.get("a") === undefined, "job released ⇒ cache branch");
-	resolvers.get("c")!(joinSnapshot({ output: "c-out" }));
+	resolvers.get("c")!(seam.snap("c"));
 	await waitFor(() => runtime.get("c") === undefined, "c released");
 
-	const collected = (await runtime.consumeCollectInterruptible("a", new AbortController().signal))?.snapshot;
+	const collected = await runtime.consumeCollectInterruptible("a", new AbortController().signal);
 	assert.equal(collected?.output, "a-out");
+	seam.read("a");
 
 	await waitFor(() => messages.length === 1, "the window flushed the batch");
 	const content = messages[0]!.content;
 	assert.match(content, /^- c \(worker\): completed/m, "positive control: the flush really ran");
 	assert.match(content, /c-out/);
-	assert.doesNotMatch(content, /- a \(worker\)/, "a was claimed through the cache branch");
+	assert.doesNotMatch(content, /- a \(worker\)/, "a was read through the cache branch");
 	assert.doesNotMatch(content, /a-out/);
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D7b: a revive (existing branch) also drops the one-round cache", async () => {
+test("D7b: a revive (existing branch) also drops the one-round cache", async () => {
 	// Both `track()` branches must drop the cache. Here the job is still live
 	// (`consumeCollect` does not release), so the second track takes the EXISTING
-	// branch — the one a `notified`-based reading of D7 leaves alone. If the cached
-	// round-1 snapshot survived, a later read would be served it.
+	// branch. If the cached round-1 snapshot survived, a later read would be served it —
+	// and with P4c nothing else would filter the stale result: the verdict belongs to the
+	// artifact id the round carries.
 	const runtime = createSessionRuntime({ sendMessage() {} });
 	let collects = 0;
 	const track = () =>
@@ -4996,7 +5135,7 @@ test("claim D7b: a revive (existing branch) also drops the one-round cache", asy
 		});
 
 	track();
-	const first = (await runtime.consumeCollect("a"))?.snapshot;
+	const first = await runtime.consumeCollect("a");
 	assert.equal(first?.output, "round-1");
 	assert.ok(runtime.get("a"), "collect does not release ⇒ the revive branch is reachable");
 
@@ -5066,23 +5205,20 @@ test("v2 A2: a throw while FORMATTING the notice puts it back at the head (no si
 	runtime.dispose();
 });
 
-test("claim D-B/v2: a fully claimed batch is dead weight — the horizon neither counts it nor stays armed", async () => {
+test("D-B/v2: a fully settled batch is dead weight — the horizon neither counts it nor stays armed", async () => {
 	// D6 (A1): the counter and the timer both describe a notice that can STILL be
-	// delivered. A batch whose every member is already claimed can never produce a
-	// message, so counting it would report `pending === 0` next to a `heldOverCap`
-	// that keeps growing — two numbers about the same queue that contradict each
-	// other (and the older arm would keep ticking forever, which is what the old
-	// `outbox[0]` fix priced).
-	const messages: SentMessage[] = [];
+	// delivered. A batch whose every member is already settled (P4b: read to EOF, or
+	// already announced) can never produce a message, so counting it would report
+	// `pending === 0` next to a `heldOverCap` that keeps growing — two numbers about the
+	// same queue that contradict each other (and the older arm would keep ticking
+	// forever, which is what the old `outbox[0]` fix priced).
 	const overflow = manualOverflow();
 	let t = 1_000;
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
+	const seam = projectionSeam({
 		now: () => t,
 		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
 	});
+	const { runtime, messages } = seam;
 	runtime.notifyParentRunStart();
 	runtime.track({
 		name: "stuck",
@@ -5090,7 +5226,7 @@ test("claim D-B/v2: a fully claimed batch is dead weight — the horizon neither
 		agent: "worker",
 		sessionFile: "/tmp/stuck.jsonl",
 		timeoutMs: 1_000,
-		collect: async () => joinSnapshot({ output: "stuck-out" }),
+		collect: async () => seam.snap("stuck"),
 	});
 	runtime.watch("stuck");
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
@@ -5099,20 +5235,21 @@ test("claim D-B/v2: a fully claimed batch is dead weight — the horizon neither
 	// The parent reads it before the horizon fires; the queued copy is now dead weight.
 	const waited = await runtime.wait(["stuck"], { timeoutMs: 500 });
 	assert.equal(waited[0]?.snapshot?.output, "stuck-out");
-	assert.equal(runtime.noticeQueueStats().pending, 0, "a claimed copy is not `pending`");
+	seam.read("stuck");
+	assert.equal(runtime.noticeQueueStats().pending, 0, "a read copy is not `pending`");
 
 	// The arm was priced when the notice WAS deliverable, so it still fires. It must
 	// find nothing deliverable, count nothing, and not re-arm either.
 	t += MAX_PENDING_AGE_MS;
 	overflow.timers[0]!.fn();
-	assert.equal(messages.length, 0, "a fully claimed batch sends nothing");
+	assert.equal(messages.length, 0, "a fully read batch sends nothing");
 	assert.equal(runtime.noticeQueueStats().heldOverCap, 0, "dead weight is never counted");
 	assert.equal(runtime.noticeQueueStats().oldestAgeMs, 0, "…and it stops describing an age");
 	assert.equal(overflow.timers.length, 1, "no new window: there is nothing left to observe");
 
 	// Positive control (hard requirement 7). "Zero messages" is also what a dead
 	// `flushOutbox` produces, so the very same horizon → boundary → deliverBatch
-	// path must now deliver an UNCLAIMED notice.
+	// path must now deliver an UNREAD notice.
 	runtime.notifyParentRunStart();
 	runtime.track({
 		name: "late",
@@ -5120,7 +5257,7 @@ test("claim D-B/v2: a fully claimed batch is dead weight — the horizon neither
 		agent: "worker",
 		sessionFile: "/tmp/late.jsonl",
 		timeoutMs: 1_000,
-		collect: async () => joinSnapshot({ output: "late-out" }),
+		collect: async () => seam.snap("late"),
 	});
 	runtime.watch("late");
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the control notice is held");
@@ -5141,10 +5278,10 @@ test("claim D-B/v2: a fully claimed batch is dead weight — the horizon neither
 	assert.match(
 		messages[0]!.content,
 		/late-out/,
-		"the claimed head delivers nothing, so the flush moves on to the next item",
+		"the read head delivers nothing, so the flush moves on to the next item",
 	);
 	assert.equal(runtime.noticeQueueStats().pending, 0);
-	runtime.dispose();
+	seam.close();
 });
 
 test("v2 D6: `heldOverCap` counts PER NOTICE — the deliverable head, once, never dead weight", async () => {
@@ -5153,16 +5290,13 @@ test("v2 D6: `heldOverCap` counts PER NOTICE — the deliverable head, once, nev
 	// describe, so a dead head behind a live notice neither counts nor sets the
 	// deadline; (b) one notice crosses the horizon once, however many windows it
 	// outlives; (c) `pending === 0` means no timer and no count.
-	const messages: SentMessage[] = [];
 	const overflow = manualOverflow();
 	let t = 1_000;
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
+	const seam = projectionSeam({
 		now: () => t,
 		scheduleNoticeOverflow: overflow.scheduleNoticeOverflow,
 	});
+	const { runtime, messages } = seam;
 	runtime.notifyParentRunStart();
 
 	// Dead weight first: the parent reads this child, so its queued copy can never land.
@@ -5172,13 +5306,14 @@ test("v2 D6: `heldOverCap` counts PER NOTICE — the deliverable head, once, nev
 		agent: "worker",
 		sessionFile: "/tmp/read.jsonl",
 		timeoutMs: 1_000,
-		collect: async () => joinSnapshot({ output: "read-out" }),
+		collect: async () => seam.snap("read"),
 	});
 	runtime.watch("read");
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "read's notice is held");
 	assert.equal(overflow.timers.length, 1);
 	assert.equal(overflow.timers[0]!.ms, MAX_PENDING_AGE_MS, "armed off the only notice");
 	await runtime.wait(["read"], { timeoutMs: 500 });
+	seam.read("read");
 	assert.equal(runtime.noticeQueueStats().pending, 0, "the queue head is dead weight now");
 
 	// A LIVE notice joins the queue 10s later, while the original arm is still armed.
@@ -5189,7 +5324,7 @@ test("v2 D6: `heldOverCap` counts PER NOTICE — the deliverable head, once, nev
 		agent: "worker",
 		sessionFile: "/tmp/live.jsonl",
 		timeoutMs: 1_000,
-		collect: async () => joinSnapshot({ output: "live-out" }),
+		collect: async () => seam.snap("live"),
 	});
 	runtime.watch("live");
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the live notice is held");
@@ -5224,9 +5359,10 @@ test("v2 D6: `heldOverCap` counts PER NOTICE — the deliverable head, once, nev
 	}
 	assert.equal(runtime.noticeQueueStats().pending, 1, "the live notice is still deliverable");
 
-	// Claim it: the queue holds no deliverable notice, so the last arm finds nothing
+	// Settle it: the queue holds no deliverable notice, so the last arm finds nothing
 	// to observe — no count, no re-arm — and `pending`/`heldOverCap` stop together.
 	await runtime.wait(["live"], { timeoutMs: 500 });
+	seam.read("live");
 	assert.equal(runtime.noticeQueueStats().pending, 0);
 	const armedBefore = overflow.timers.length;
 	const countedBefore = runtime.noticeQueueStats().heldOverCap;
@@ -5243,22 +5379,22 @@ test("v2 D6: `heldOverCap` counts PER NOTICE — the deliverable head, once, nev
 		agent: "worker",
 		sessionFile: "/tmp/control.jsonl",
 		timeoutMs: 1_000,
-		collect: async () => joinSnapshot({ output: "control-out" }),
+		collect: async () => seam.snap("control"),
 	});
 	runtime.watch("control");
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the control notice is held");
 	runtime.notifyParentSettled();
 	assert.equal(messages.length, 1, "the boundary delivers the control notice");
 	assert.match(messages[0]!.content, /control-out/);
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D7: an UNREAD queued notice survives a same-name re-track", async () => {
-	// D7 revokes the copies of a result the parent ALREADY READ. A notice nobody read
-	// has no claim to revoke, so `stop` + `continue` of the same child must not
-	// silently drop it: `release()` does not unclaim, and the next `track()` takes the
-	// NEW-job branch, whose revoke targets the NEW round and is therefore a no-op —
-	// D10's "one round = one deliverable result".
+test("D7: an UNREAD queued notice survives a same-name re-track", async () => {
+	// A notice nobody read is still owed. `stop` + `continue` of the same child must not
+	// silently drop it: `release()` only removes the job from the join group (P4c: no
+	// buffered drop, no revoke), the next `track()` takes the NEW-job branch and starts a
+	// new round, and the queued entry keeps its own artifact — D10's "one round = one
+	// deliverable result".
 	const messages: SentMessage[] = [];
 	let resolveCollect!: (s: CollectSnapshot) => void;
 	const runtime = createSessionRuntime({
@@ -5300,7 +5436,7 @@ test("claim D7: an UNREAD queued notice survives a same-name re-track", async ()
 	runtime.dispose();
 });
 
-test("claim D4: a terminal sibling parked in retire is not listed as `Still running`", async () => {
+test("D4: a terminal sibling parked in retire is not listed as `Still running`", async () => {
 	// `awaiting` is a TERMINAL marker: the completion is already buffered/announced and
 	// the watch is only parked in `retire`. Listing that sibling under `Still running:`
 	// contradicts the completed entry the same burst delivered — and D4 recomputes the
@@ -5364,10 +5500,12 @@ test("claim D4: a terminal sibling parked in retire is not listed as `Still runn
 
 // ═══════════════ D10: one round = one deliverable result (claim key has a round) ═══════════════
 
-test("claim D10: two unread rounds of one child are both delivered, FIFO", async () => {
-	// `runId` is the PARENT run id, so two rounds of the same child share it. Without
-	// the round in the claim key the first delivery claimed the key and the second
-	// round's notice was filtered — the parent saw the OLD result and never the new one.
+test("D10: two unread rounds of one child are both delivered, FIFO", async () => {
+	// `runId` is the PARENT run id, so two rounds of the same child share it. Under the
+	// old claim key both rounds of a name collapsed into it: the first delivery claimed
+	// it and the second round's notice was filtered — the parent saw the OLD result and
+	// never the new one. The projection is scoped by ARTIFACT id, which is why the round
+	// still has to survive all the way into the notice entry.
 	const messages: SentMessage[] = [];
 	const resolvers: Array<(s: CollectSnapshot) => void> = [];
 	const runtime = createSessionRuntime({
@@ -5415,17 +5553,13 @@ test("claim D10: two unread rounds of one child are both delivered, FIFO", async
 	runtime.dispose();
 });
 
-test("claim D10: a read round does not suppress the next round's notice", async () => {
-	// The reverse direction of the same key problem: round 1 was READ (so its claim is
-	// legitimate), and round 2 must still be announced — the claim belongs to round 1,
-	// not to the child forever.
-	const messages: SentMessage[] = [];
+test("D10: a read round does not suppress the next round's notice", async () => {
+	// The reverse direction of the same key problem: round 1 was READ (so its read row
+	// is legitimate), and round 2 must still be announced — the fact belongs to round
+	// 1's artifact, not to the child forever.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers: Array<(s: CollectSnapshot) => void> = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.notifyParentRunStart();
 	const track = () =>
 		runtime.track({
@@ -5443,16 +5577,17 @@ test("claim D10: a read round does not suppress the next round's notice", async 
 	// Round 1: completes, and the parent reads it before the run settles.
 	track();
 	runtime.watch("A");
-	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	resolvers[0]!(seam.snap("A", "round-1-out", 1));
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "round 1 held");
 	const first = await runtime.wait(["A"], { timeoutMs: 500 });
 	assert.equal(first[0]?.snapshot?.output, "round-1-out");
+	seam.read("A", 1);
 	assert.equal(runtime.noticeQueueStats().pending, 0, "round 1's copy is dead weight now");
 
 	// Round 2: completes unread.
 	track();
 	runtime.watch("A");
-	resolvers[1]!(joinSnapshot({ output: "round-2-out" }));
+	resolvers[1]!(seam.snap("A", "round-2-out", 2));
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "round 2 held");
 
 	runtime.notifyParentSettled();
@@ -5460,12 +5595,12 @@ test("claim D10: a read round does not suppress the next round's notice", async 
 	assert.match(messages[0]!.content, /round-2-out/);
 	assert.doesNotMatch(messages[0]!.content, /round-1-out/, "round 1 stays suppressed");
 	assert.equal(messages.length, 1, "exactly one message");
-	runtime.dispose();
+	seam.close();
 });
 
 // ═══════════ F1/F2: the round travels with the snapshot, and survives `persist` ═══════════
 
-test("claim F2: a re-track during `persist` keeps the one-round cache invalid", async () => {
+test("F2: a re-track during `persist` keeps the one-round cache invalid", async () => {
 	// `current` is computed BEFORE `await job.persist()`, and `track()` does not bump
 	// `generation` — so without a re-check the stale round-1 collect writes its snapshot
 	// back over the invalidation `track()` just performed (D7b), and the next `wait`
@@ -5524,21 +5659,25 @@ test("claim F2: a re-track during `persist` keeps the one-round cache invalid", 
 	runtime.dispose();
 });
 
-test("claim F1: a notice carries the round its snapshot was COLLECTED in", async () => {
-	// `track()` on a live job bumps the round mid-collect. The snapshot that lands
-	// afterwards belongs to the OLD round: if its notice is labelled with the live
-	// round instead, that entry's claim steals the NEW round's key and the new round's
-	// real result is filtered out (the parent never sees it).
+test("D4a/F1: on the degraded path a notice carries the round its snapshot was COLLECTED in (two rounds both arrive)", async () => {
+	// `track()` on a live job (steer / continue) bumps the round mid-collect, so the
+	// snapshot that lands afterwards belongs to the OLD round. This case is deliberately
+	// the DEGRADED path — no ledger handle, so `owesDelivery` answers from `deliveredOnce`
+	// and the round label IS the key. Label it with the live job's round and round 1's
+	// notice lands on ROUND 2's key; round 2's own completion is then filtered as
+	// "already sent" and the parent never hears about it (reviewer's probe: two pending
+	// notices, one delivered). D4a: the origin stamp captured when the collect STARTED is
+	// what keeps the two rounds apart.
 	const messages: SentMessage[] = [];
 	const resolvers: Array<(s: CollectSnapshot) => void> = [];
 	const retires: Array<() => void> = [];
+	let collects = 0;
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
 			messages.push(message as SentMessage);
 		},
 	});
 	runtime.notifyParentRunStart();
-	let started = 0;
 	const track = () =>
 		runtime.track({
 			name: "A",
@@ -5547,8 +5686,8 @@ test("claim F1: a notice carries the round its snapshot was COLLECTED in", async
 			sessionFile: "/tmp/A.jsonl",
 			timeoutMs: 1_000,
 			collect: () => {
-				const index = started;
-				started += 1;
+				const index = collects;
+				collects += 1;
 				return new Promise<CollectSnapshot>((resolve) => {
 					resolvers[index] = resolve;
 				});
@@ -5565,51 +5704,43 @@ test("claim F1: a notice carries the round its snapshot was COLLECTED in", async
 	runtime.watch("A");
 	await waitFor(() => resolvers.length === 1, "round 1 is collecting");
 	track();
+	assert.equal(runtime.get("A")?.round, 2, "the live job is already on round 2");
 
 	// Round 1's snapshot lands now, AFTER the round bump.
 	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
 	await waitFor(() => retires.length === 1, "round 1's watch is parked in retire");
 	assert.equal(runtime.noticeQueueStats().pending, 1, "round 1's notice is queued unread");
 
-	// Round 2's own collect lands too (via rewatch: same round label, fresh snapshot).
+	// Round 2's own collect lands too (via rewatch: fresh promise, same name).
 	runtime.rewatch("A");
 	await waitFor(() => resolvers.length === 2, "round 2 is collecting");
 	resolvers[1]!(joinSnapshot({ output: "round-2-out" }));
 	await waitFor(() => retires.length === 2, "round 2's watch is parked in retire");
-	await waitFor(() => runtime.noticeQueueStats().pending === 2, "both notices queued");
+	await waitFor(() => runtime.noticeQueueStats().pending === 2, "both rounds are owed a notice");
 
-	// The parent reads A: the live collect is round 2's, so it claims round 2.
-	const pendingWait = runtime.wait(["A"], { timeoutMs: 5_000 });
-	await waitFor(() => retires.length === 3, "the wait is parked in retire");
-	retires[2]!();
-	const waited = await pendingWait;
-	assert.equal(waited[0]?.snapshot?.output, "round-2-out");
-	assert.equal(runtime.noticeQueueStats().pending, 1, "only round 1's notice is still live");
-
-	// Round 2 was read through the tool route, so only ROUND 1's notice may arrive.
+	// One waking notice per boundary, so the two rounds take two of them.
 	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 1, "round 1's unread notice is delivered");
-	assert.match(messages[0]!.content, /round-1-out/);
-	assert.doesNotMatch(messages[0]!.content, /round-2-out/, "round 2 was read, not announced");
-	assert.equal(messages.length, 1, "the old round's entry did not steal the new round's key");
+	await waitFor(() => messages.length === 1, "the first boundary delivers one notice");
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 2, "the second boundary delivers the other");
+	const bodies = messages.map((message) => message.content).join("\n---\n");
+	assert.match(bodies, /round-1-out/, "round 1 is announced");
+	assert.match(bodies, /round-2-out/, "…and round 2 is NOT swallowed by round 1's key");
+	assert.equal(messages.length, 2, "exactly one notice per round");
 	for (const release of retires) release();
 	await drainContinuations();
 	runtime.dispose();
 });
 
-test("claim F1: the wait claims the round its snapshot was collected in (no duplicate)", async () => {
+test("F1: the wait settles the round its snapshot was collected in (no duplicate)", async () => {
 	// The duplicate direction of F1: a `track()` bumps the live round while round 1's
 	// collect is still pending, and the parent then reads that very snapshot through the
-	// tool route. The claim must land on the round the NOTICE carries — i.e. the
+	// tool route. The read must land on the artifact the NOTICE carries — i.e. the
 	// snapshot's origin — or the same output is announced on top of the tool result.
-	const messages: SentMessage[] = [];
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers: Array<(s: CollectSnapshot) => void> = [];
 	const retires: Array<() => void> = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.notifyParentRunStart();
 	let started = 0;
 	const track = () =>
@@ -5640,36 +5771,33 @@ test("claim F1: the wait claims the round its snapshot was collected in (no dupl
 	track();
 
 	// Round 1's snapshot lands after the bump: its notice is queued (unread).
-	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	resolvers[0]!(seam.snap("A", "round-1-out", 1));
 	await waitFor(() => retires.length === 1, "round 1's watch is parked in retire");
 	assert.equal(runtime.noticeQueueStats().pending, 1, "round 1's notice is queued unread");
 
 	// The live collect promise is still round 1's, so this tool result IS round 1's
-	// output — and it must claim exactly the round that notice carries.
+	// output — and it must settle exactly the artifact that notice carries.
 	const pendingWait = runtime.wait(["A"], { timeoutMs: 5_000 });
 	await waitFor(() => retires.length === 2, "the wait is parked in retire");
 	retires[1]!();
 	const waited = await pendingWait;
 	assert.equal(waited[0]?.snapshot?.output, "round-1-out");
+	seam.read("A", 1);
 
 	runtime.notifyParentSettled();
 	assert.equal(messages.length, 0, "the result was read: its notice must not arrive too");
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim F1: an interruptible collect claims the round its snapshot was collected in", async () => {
+test("F1: an interruptible collect settles the round its snapshot was collected in", async () => {
 	// Same seam the production `collect` tool uses (`consumeCollectInterruptible`), with
-	// the round bumped mid-collect: the job-branch claim goes through `claimIfTerminal`,
-	// which must read the SNAPSHOT's origin — otherwise the unread notice it should
-	// suppress is delivered next to the tool result.
-	const messages: SentMessage[] = [];
+	// the round bumped mid-collect: the read write must settle the SNAPSHOT's artifact —
+	// otherwise the unread notice it should suppress is delivered next to the tool
+	// result.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers: Array<(s: CollectSnapshot) => void> = [];
 	const retires: Array<() => void> = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.notifyParentRunStart();
 	let started = 0;
 	const track = () =>
@@ -5697,7 +5825,7 @@ test("claim F1: an interruptible collect claims the round its snapshot was colle
 	await waitFor(() => resolvers.length === 1, "round 1 is collecting");
 	track(); // round 2 while round 1's collect is pending
 
-	resolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	resolvers[0]!(seam.snap("A", "round-1-out", 1));
 	await waitFor(() => retires.length === 1, "round 1's watch is parked in retire");
 	assert.equal(runtime.noticeQueueStats().pending, 1, "round 1's notice is queued unread");
 
@@ -5716,39 +5844,38 @@ test("claim F1: an interruptible collect claims the round its snapshot was colle
 			}),
 	});
 	runtime.watch("B");
-	resolveB(joinSnapshot({ output: "B-out" }));
+	resolveB(seam.snap("B"));
 	await waitFor(() => runtime.noticeQueueStats().pending === 2, "the sibling's notice is queued too");
 
-	const collected = (await runtime.consumeCollectInterruptible("A", new AbortController().signal))?.snapshot;
+	const collected = await runtime.consumeCollectInterruptible("A", new AbortController().signal);
 	assert.equal(collected?.output, "round-1-out", "the cache-free job branch served round 1");
+	seam.read("A", 1);
 
 	runtime.notifyParentSettled();
 	await waitFor(() => messages.length === 1, "the unread sibling still arrives");
 	assert.match(messages[0]!.content, /B-out/, "positive control: settle really flushed");
 	assert.doesNotMatch(messages[0]!.content, /round-1-out/, "the read result's notice must not arrive too");
 	assert.equal(messages.length, 1, "exactly one message");
-	runtime.dispose();
+	seam.close();
 });
 
 // ═════ D10 round scoping on the release path · the genuine D7 revoke paths ═════
 
-test("claim D10: release() drops only the round the parent read; an older unread round still arrives", async () => {
-	// D10: one round = one deliverable result. `release()` acts on ONE tracked job,
-	// and a job owns one round — but it dropped buffered copies by NAME, so the
-	// release that follows a `wait()` hit also deleted an EARLIER round's unread
-	// notice. Reachable sequence, reproduced here:
+test("D10: release() never takes an older round's unread notice with it", async () => {
+	// D10: one round = one deliverable result. `release()` acts on ONE tracked job, and a
+	// job owns one round — the old shape dropped buffered copies by NAME right here, so
+	// the release that followed a `wait()` hit also deleted an EARLIER round's unread
+	// notice. P4c removed that call entirely (`release()` is `join.remove` and nothing
+	// else): the projection scopes the verdict per artifact, so the filter can never
+	// reach across rounds in the first place. Reachable sequence, reproduced here:
 	//   round 1 finishes while `s` is pending → buffered, unread
 	//   re-track (round 2) → round 2 finishes → buffered too
-	//   `wait(["x"])` claims round 2 → its release wipes the buffer by name
-	const messages: SentMessage[] = [];
+	//   the parent reads round 2 through `wait` → its release must leave round 1 alone
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const collectResolvers: Array<(s: CollectSnapshot) => void> = [];
 	const retires: Array<() => void> = [];
 	let resolveS!: (s: CollectSnapshot) => void;
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	// Long window on purpose: the batch must be flushed by the last member coming
 	// home, never by a timer that could fire halfway through the sequence.
 	runtime.setJoinConfig({ mode: "smart", flushMs: 60_000 });
@@ -5787,7 +5914,7 @@ test("claim D10: release() drops only the round the parent read; an older unread
 	runtime.watch("x");
 	runtime.watch("s");
 	await waitFor(() => collectResolvers.length === 1, "round 1 is collecting");
-	collectResolvers[0]!(joinSnapshot({ output: "round-1-out" }));
+	collectResolvers[0]!(seam.snap("x", "round-1-out", 1));
 	await waitFor(() => retires.length === 1, "round 1's watch is parked in retire");
 	assert.equal(messages.length, 0, "round 1 waits in the window");
 	retires[0]!();
@@ -5797,46 +5924,42 @@ test("claim D10: release() drops only the round the parent read; an older unread
 	trackX();
 	runtime.watch("x");
 	await waitFor(() => collectResolvers.length === 2, "round 2 is collecting");
-	collectResolvers[1]!(joinSnapshot({ output: "round-2-out" }));
+	collectResolvers[1]!(seam.snap("x", "round-2-out", 2));
 	await waitFor(() => retires.length === 2, "round 2's watch is parked in retire");
 
-	// ── the parent reads round 2 through the tool route, which claims it
+	// ── the parent reads round 2 through the tool route (`wait` + the declared read)
 	const pendingWait = runtime.wait(["x"], { timeoutMs: 5_000 });
 	await waitFor(() => retires.length === 3, "the wait is parked in its retire await");
 	retires[2]!();
 	const waited = await pendingWait;
 	assert.equal(waited[0]?.snapshot?.output, "round-2-out");
+	seam.read("x", 2);
 	assert.equal(runtime.get("x"), undefined, "the wait released x");
 
 	// ── everyone home: the batch flushes
-	resolveS(joinSnapshot({ output: "s-out" }));
+	resolveS(seam.snap("s", "s-out"));
 	await waitFor(() => messages.length === 1, "one notice for the whole group");
 	const content = messages[0]!.content;
 	assert.match(content, /round-1-out/, "round 1 was never read: its notice must still arrive");
 	assert.match(content, /s-out/, "positive control: the flush really ran");
-	assert.doesNotMatch(content, /round-2-out/, "round 2 was the tool result, never a notice");
+	assert.doesNotMatch(content, /round-2-out/, "round 2 was read, so it is never announced");
 	assert.equal(messages.length, 1, "exactly one message");
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D7: rewatch revokes the HELD OUTBOX copy of a read result (the sibling still arrives)", async () => {
-	// The genuine revoke path, i.e. the one where the claim and an undelivered copy
-	// (here: an outbox entry) actually coexist. `rewatch` is the parent explicitly
-	// asking to be told again while the result has ALREADY been read: D7 says the
-	// claim and every pending copy of it go together. Delete the `dropQueued` call
-	// in `unclaimReported` and the already-read notice is resurrected into the next
-	// settle — this case goes red.
+test("D4: a read result held in the OUTBOX is still filtered at the boundary (rewatch cannot resurrect it)", async () => {
+	// D7's revoke is deleted (D4: no rollback API). What remains is the projection, and
+	// this case pins that it is enough: the already-read member leaves the flush by
+	// `read_bytes`, the unread sibling of the same held batch still arrives, and
+	// `rewatch` — which used to drop the queued copy — neither resurrects nor duplicates
+	// anything.
 	//
-	// `free` is the positive control (hard requirement 7): an unclaimed entry in the
-	// same held batch must arrive, so a dead flush cannot make this green.
-	const messages: SentMessage[] = [];
+	// `free` is the positive control (hard requirement 7): an unread entry in the same
+	// held batch must arrive, so a dead flush cannot make this green.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
 	const retires: Array<() => void> = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	runtime.notifyParentRunStart();
 	runtime.track({
 		name: "held",
@@ -5848,8 +5971,7 @@ test("claim D7: rewatch revokes the HELD OUTBOX copy of a read result (the sibli
 			new Promise<CollectSnapshot>((resolve) => {
 				resolvers.set("held", resolve);
 			}),
-		// Keeps the job tracked so `rewatch` has something to act on: a released
-		// child has no claim to revoke and no round to re-arm.
+		// Keeps the job tracked so `rewatch` has something to act on.
 		retire: () =>
 			new Promise<void>((resolve) => {
 				retires.push(resolve);
@@ -5868,20 +5990,21 @@ test("claim D7: rewatch revokes the HELD OUTBOX copy of a read result (the sibli
 	});
 	runtime.watch("held");
 	runtime.watch("free");
-	resolvers.get("held")!(joinSnapshot({ output: "held-out" }));
-	resolvers.get("free")!(joinSnapshot({ output: "free-out" }));
+	resolvers.get("held")!(seam.snap("held", "held-out"));
+	resolvers.get("free")!(seam.snap("free", "free-out"));
 	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the batch is held for the live run");
 	assert.equal(messages.length, 0, "a live run holds the notice");
 
 	const pendingWait = runtime.wait(["held"], { timeoutMs: 5_000 });
 	await waitFor(() => retires.length === 2, "the wait is parked in its retire await");
+	seam.read("held");
 	assert.equal(runtime.noticeQueueStats().pending, 1, "still one item — now only for `free`");
 
 	runtime.rewatch("held");
 	assert.equal(
 		runtime.noticeQueueStats().pending,
 		1,
-		"the revoked copy left the outbox without taking the sibling with it",
+		"the read member is still accounted for once, and the sibling was not taken with it",
 	);
 
 	retires[1]!();
@@ -5889,27 +6012,23 @@ test("claim D7: rewatch revokes the HELD OUTBOX copy of a read result (the sibli
 	assert.equal(waited[0]?.snapshot?.output, "held-out");
 
 	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 1, "the unclaimed sibling is delivered");
+	await waitFor(() => messages.length === 1, "the unread sibling is delivered");
 	assert.match(messages[0]!.content, /free-out/, "positive control: the flush really ran");
-	assert.doesNotMatch(messages[0]!.content, /held-out/, "the revoked copy was not resurrected");
+	assert.doesNotMatch(messages[0]!.content, /held-out/, "the read copy is never announced");
 	assert.equal(messages.length, 1, "exactly one message");
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D7: rewatch also drops the copy still sitting in the join window", async () => {
-	// The second copy the revoke has to reach: the join window. Here the entry never
-	// enters the outbox (a sibling is still pending), so `dropQueued` cannot help —
-	// only `join.dropBuffered` can. Delete that call and the read result's buffered
-	// notice fires when the group finally flushes.
-	const messages: SentMessage[] = [];
+test("D4: a read result buffered in the JOIN WINDOW is filtered at the flush (no per-name drop needed)", async () => {
+	// The second copy the old revoke had to reach: the join window. Here the entry never
+	// enters the outbox (a sibling is still pending), so only a per-name drop could have
+	// removed it. With the projection it needs no removal: the member is judged when the
+	// group finally flushes, which is the one place every copy passes through.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
 	const collectResolvers: Array<(s: CollectSnapshot) => void> = [];
 	const retires: Array<() => void> = [];
 	let resolveS!: (s: CollectSnapshot) => void;
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
 	// Nothing flushes mid-scenario: `s` is the only thing that can close the group.
 	runtime.setJoinConfig({ mode: "smart", flushMs: 60_000 });
 	runtime.track({
@@ -5941,32 +6060,33 @@ test("claim D7: rewatch also drops the copy still sitting in the join window", a
 	runtime.watch("x");
 	runtime.watch("s");
 	await waitFor(() => collectResolvers.length === 1, "x is collecting");
-	collectResolvers[0]!(joinSnapshot({ output: "x-out" }));
+	collectResolvers[0]!(seam.snap("x", "x-out"));
 	await waitFor(() => retires.length === 1, "x's watch is parked in retire");
 	assert.equal(runtime.noticeQueueStats().pending, 0, "buffered, not queued: the outbox is untouched");
 
 	const pendingWait = runtime.wait(["x"], { timeoutMs: 5_000 });
 	await waitFor(() => retires.length === 2, "the wait is parked in its retire await");
+	seam.read("x");
 	runtime.rewatch("x");
 	retires[1]!();
 	const waited = await pendingWait;
 	assert.equal(waited[0]?.snapshot?.output, "x-out", "the tool route still delivers the full result");
 
-	resolveS(joinSnapshot({ output: "s-out" }));
+	resolveS(seam.snap("s", "s-out"));
 	await waitFor(() => messages.length === 1, "the sibling flushes alone");
 	assert.match(messages[0]!.content, /s-out/, "positive control: the flush really ran");
-	assert.doesNotMatch(messages[0]!.content, /x-out/, "the revoked buffered copy is gone");
+	assert.doesNotMatch(messages[0]!.content, /x-out/, "the read buffered copy is filtered out");
 	assert.equal(messages.length, 1, "exactly one message");
-	runtime.dispose();
+	seam.close();
 });
 
-test("claim D2: a collect that bails before delivering hands its claim back (minor 4)", async () => {
-	// The seam claims a terminal snapshot on the way out, because a join/outbox flush
-	// in that same tick would otherwise repeat it. But `collectChild` may still bail
-	// AFTER that point — persisting the child can fail, which the tool turns into
-	// `fail("collect failed: …")` — and then the text never reaches the parent.
-	// Keeping the claim would suppress the one route that is left (the pushed notice)
-	// forever, which is worse than the duplicate it was defending against.
+test("D3b: a collect that bails before delivering leaves the notice owed (persist failure)", async () => {
+	// `collectChild` can bail AFTER the seam answered — persisting the child can fail,
+	// which the tool turns into `fail("collect failed: …")` — and then the text never
+	// reaches the parent. P4c: no rollback is needed for this any more, because nothing
+	// was ever taken: the read is declared by `deliver` (the one return that renders the
+	// snapshot) and this path returns before it, so the artifact stays `undelivered` and
+	// the pushed notice — the only route left — still arrives.
 	const messages: SentMessage[] = [];
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
@@ -6013,19 +6133,17 @@ test("claim D2: a collect that bails before delivering hands its claim back (min
 	runtime.dispose();
 });
 
-test("claim D2/#320-2: a bail AFTER the job-branch claim still lands the notice (watch in flight)", async () => {
-	// #320 finding 2, in the PRODUCTION shape: every child is watched (`followChild` with
+test("D2(b): a collect through the interruptible seam still lands the notice exactly once (job branch)", async () => {
+	// The PRODUCTION shape, after P4c: every child is watched (`followChild` with
 	// `watch: true`), `collect` never cancels that watch, and both await the same
-	// `job.collectPromise`. So the watch's continuation runs FIRST — its gate
-	// (`!consumedByTool && !notified`) sees the flag the seam just set and skips
-	// `onTerminal` — and by the time `collectChild` bails the watch is already parked in
-	// `retire` with `job.watching === true`. That is why the repair may not be gated on
-	// "nobody is watching": there is always somebody watching, so the re-arm is
-	// unconditional and the generation bump makes the old watch skip its `release`.
+	// `job.collectPromise`. The watch's continuation therefore runs first — and since the
+	// `!consumedByTool && !notified` gate is gone (D4), it announces the result on its own
+	// route while the seam hands the same snapshot to the tool call.
 	//
-	// Delete any of the three repairs in `unclaimUndelivered` and this goes red: the
-	// `consumedByTool` reset (the re-armed gate would skip), the re-arm (nothing is left
-	// to deliver), or the claim rollback (`deliverBatch` filters the notice out).
+	// What this pins is the outcome that gate used to protect: ONE result, ONE notice,
+	// and the text still readable afterwards. There is nothing to claim or hand back any
+	// more; a second announcement could only come from a second delivery decision, and
+	// the ledger (`deliveredOnce` here, no projection) records the first one.
 	const messages: SentMessage[] = [];
 	const retires: Array<() => void> = [];
 	let resolveCollect!: (s: CollectSnapshot) => void;
@@ -6045,7 +6163,7 @@ test("claim D2/#320-2: a bail AFTER the job-branch claim still lands the notice 
 				resolveCollect = resolve;
 			}),
 		// An async retire is what production has (an RPC round trip): the watch's
-		// `finally` parks here, which is the window the rollback runs in.
+		// `finally` parks here, which keeps the job tracked while the seam resolves.
 		retire: () =>
 			new Promise<void>((resolve) => {
 				retires.push(resolve);
@@ -6056,242 +6174,34 @@ test("claim D2/#320-2: a bail AFTER the job-branch claim still lands the notice 
 	const controller = new AbortController();
 	const pending = runtime.consumeCollectInterruptible("x", controller.signal);
 	assert.ok(pending, "the tracked job answers on the JOB branch");
-	assert.equal(runtime.get("x")?.consumedByTool, true, "the tool call owns the notice route");
 
 	resolveCollect(joinSnapshot({ output: "x-out" }));
-	// The watch got there first and is parked in retire: its gate already skipped.
-	await waitFor(() => retires.length === 1, "the watch is parked in retire");
-	assert.ok(runtime.get("x"), "still tracked ⇒ job branch, not the finished cache");
-	assert.equal(messages.length, 0, "the gate skipped onTerminal, as expected");
-
 	const collected = await pending;
-	assert.equal(collected?.snapshot.output, "x-out", "the seam handed the claimed snapshot out");
-	assert.equal(collected?.claimedNow, true, "this call is the one that took the claim");
+	assert.equal(collected?.output, "x-out", "the seam hands the same snapshot to the tool call");
+	await waitFor(() => retires.length === 1, "the watch is parked in its retire");
+	assert.ok(runtime.get("x"), "still tracked ⇒ job branch, not the finished cache");
 
-	// …and NOW the parent turn aborts: after the claim, before the snapshot is rendered.
-	controller.abort();
-	runtime.unclaimUndelivered("x", collected!.snapshot, collected!.claimedNow);
-	assert.equal(runtime.get("x")?.consumedByTool, false, "the bail hands the notice route back");
-	assert.ok(
-		runtime.get("x"),
-		"the old watch's release is skipped (generation bumped), so the re-arm has a job to run",
-	);
-
-	await waitFor(() => messages.length === 1, "the re-armed watch delivers the notice");
+	await waitFor(() => messages.length === 1, "the watch's own route announced the result once");
 	assert.match(messages[0]!.content, /x-out/);
 	assert.equal(messages.length, 1, "exactly one notice, never two");
-	// The result was never delivered, so it must also still be readable.
-	const again = (await runtime.consumeCollect("x"))?.snapshot;
-	assert.equal(again?.output, "x-out", "the result survives the bail");
+	// The result is still readable after the notice (D6: the notice never shortens a
+	// collect the parent asks for next).
+	const again = await runtime.consumeCollect("x");
+	assert.equal(again?.output, "x-out", "the result is still readable");
 	runtime.dispose();
 });
 
-test("claim D2/#320-1: a bail never erases a claim a real delivery already took", async () => {
-	// #320 finding 1. `unclaimUndelivered` used to delete the key unconditionally, so a
-	// bail on a `(runId, name, round)` that a REAL delivery had already claimed erased the
-	// evidence and resurrected a result the parent had read. `claimedNow` travels with the
-	// seam's return value (per CALL, not per snapshot), and only a `true` comes back.
+test("D3b: collectChild's OWN abort bail leaves the notice owed (index wiring)", async () => {
+	// One of `collectChild`'s two bail doors: `!collected || signal?.aborted` (the other is
+	// a throwing `persistChild`, above). Here the abort lands after the seam's promise is
+	// already resolved — the cache branch answers synchronously, so aborting in the same
+	// tick still passes the function's first `signal.aborted` gate — which is the only way
+	// into the `collected && signal.aborted` combination.
 	//
-	// Phase A (job branch): the round's notice is still held in the outbox when the first
-	// collect delivers it, so master's "delete the claim anyway" resurrects it into the
-	// next flush — an observable consequence, not just a flag assertion.
-	// Phase B (cache branch): same question one layer down, where the delivery claim comes
-	// from the finished cache (D9). An unread sibling is the positive control in both.
-	const messages: SentMessage[] = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
-
-	// ── Phase A: job branch with the notice still held.
-	runtime.notifyParentRunStart();
-	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const retires: Array<() => void> = [];
-	for (const name of ["held", "mate"]) {
-		runtime.track({
-			name,
-			runId: "r-1",
-			agent: "worker",
-			sessionFile: `/tmp/${name}.jsonl`,
-			timeoutMs: 1_000,
-			collect: () =>
-				new Promise<CollectSnapshot>((resolve) => {
-					resolvers.set(name, resolve);
-				}),
-			// Keeps both jobs TRACKED after their terminal snapshot, so `held` is read on
-			// the job branch while its unread notice is still queued.
-			retire: () =>
-				new Promise<void>((resolve) => {
-					retires.push(resolve);
-				}),
-		});
-		runtime.watch(name);
-	}
-	resolvers.get("held")!(joinSnapshot({ output: "held-out" }));
-	resolvers.get("mate")!(joinSnapshot({ output: "mate-out" }));
-	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both notices held as one batch");
-	await waitFor(() => retires.length === 2, "both jobs parked in retire ⇒ still tracked");
-
-	const delivered = await runtime.consumeCollect("held");
-	assert.equal(delivered?.snapshot.output, "held-out", "the tool route delivered this round");
-	assert.equal(delivered?.claimedNow, true, "the delivery took the claim");
-	const second = await runtime.consumeCollect("held");
-	assert.equal(second?.snapshot.output, "held-out", "the seam still hands the same snapshot out");
-	assert.equal(second?.claimedNow, false, "a second call does NOT own that claim");
-	// The bail of the second call: the claim belongs to the first one, so this is a no-op —
-	// not even `consumedByTool` may be reset.
-	runtime.unclaimUndelivered("held", second!.snapshot, second!.claimedNow);
-	assert.equal(
-		runtime.get("held")?.consumedByTool,
-		true,
-		"a claim this call did not take is left alone — the whole rollback is a no-op",
-	);
-
-	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 1, "the unread sibling still arrives");
-	assert.match(messages[0]!.content, /mate-out/, "positive control: the flush really ran");
-	assert.doesNotMatch(
-		messages[0]!.content,
-		/held-out/,
-		"the read result keeps its claim: no second announcement",
-	);
-	assert.equal(messages.length, 1, "exactly one message");
-
-	// ── Phase B: the same question on the cache branch.
-	runtime.notifyParentRunStart();
-	const cache = new Map<string, (s: CollectSnapshot) => void>();
-	for (const name of ["x", "y"]) {
-		runtime.track({
-			name,
-			runId: "r-2",
-			agent: "worker",
-			sessionFile: `/tmp/${name}.jsonl`,
-			timeoutMs: 1_000,
-			collect: () =>
-				new Promise<CollectSnapshot>((resolve) => {
-					cache.set(name, resolve);
-				}),
-		});
-		runtime.watch(name);
-	}
-	cache.get("x")!(joinSnapshot({ output: "x-out" }));
-	cache.get("y")!(joinSnapshot({ output: "y-out" }));
-	await waitFor(
-		() => runtime.get("x") === undefined && runtime.get("y") === undefined,
-		"both released ⇒ the cache branch",
-	);
-	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the second batch is held too");
-
-	// The parent reads x: a real delivery, claimed from the cache (D9).
-	const read = await runtime.consumeCollect("x");
-	assert.equal(read?.snapshot.output, "x-out");
-	assert.equal(read?.claimedNow, true);
-	// A LATER collect on the same name bails (abort / persist failure). The key is already
-	// claimed, so the rollback must leave it alone…
-	const bailed = await runtime.consumeCollect("x");
-	assert.equal(bailed?.snapshot.output, "x-out");
-	assert.equal(bailed?.claimedNow, false, "nobody else may spend that claim");
-	runtime.unclaimUndelivered("x", bailed!.snapshot, bailed!.claimedNow);
-
-	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 2, "the sibling still arrives");
-	assert.match(messages[1]!.content, /y-out/, "positive control: the flush really ran");
-	assert.doesNotMatch(
-		messages[1]!.content,
-		/x-out/,
-		"the read result keeps its claim: no second announcement",
-	);
-	assert.equal(messages.length, 2, "exactly one message per batch");
-	runtime.dispose();
-});
-
-test("claim D2/#320-1: the rollback follows the CALL that took the claim, never the snapshot", async () => {
-	// The distinguishing case between "per call" and "per snapshot" bookkeeping (#327).
-	// A and B collect the SAME `job.collectPromise`, so they get the same snapshot
-	// OBJECT: A takes the claim (`claimedNow === true`) and B does not (`false`). A
-	// table keyed by the snapshot therefore has exactly one slot for the two calls —
-	// B's `false` overwrites A's `true` — and A's bail, the only one that may spend
-	// that claim, reads back `false` and returns early. The claim then outlives a
-	// delivery that never happened and the queued notice is filtered out for good:
-	// one result, delivered zero times. Carrying the flag home in the return value
-	// keeps the two calls apart, so the notice still lands — exactly once.
-	const messages: SentMessage[] = [];
-	const runtime = createSessionRuntime({
-		sendMessage(message) {
-			messages.push(message as SentMessage);
-		},
-	});
-	runtime.notifyParentRunStart();
-	const resolvers = new Map<string, (s: CollectSnapshot) => void>();
-	const retires: Array<() => void> = [];
-	for (const name of ["held", "mate"]) {
-		runtime.track({
-			name,
-			runId: "r-1",
-			agent: "worker",
-			sessionFile: `/tmp/${name}.jsonl`,
-			timeoutMs: 1_000,
-			collect: () =>
-				new Promise<CollectSnapshot>((resolve) => {
-					resolvers.set(name, resolve);
-				}),
-			// Keeps both jobs TRACKED after their terminal snapshot (the job branch) while
-			// the batch sits unread in the outbox.
-			retire: () =>
-				new Promise<void>((resolve) => {
-					retires.push(resolve);
-				}),
-		});
-		runtime.watch(name);
-	}
-	resolvers.get("held")!(joinSnapshot({ output: "held-out" }));
-	resolvers.get("mate")!(joinSnapshot({ output: "mate-out" }));
-	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both notices held as one batch");
-	await waitFor(() => retires.length === 2, "both jobs parked in retire ⇒ still tracked");
-
-	// Two collects, one shared promise: A owns the claim, B does not.
-	const a = await runtime.consumeCollect("held");
-	assert.equal(a?.claimedNow, true, "the first call takes this round's claim");
-	const b = await runtime.consumeCollect("held");
-	assert.equal(b?.claimedNow, false, "the second call gets the result without a claim");
-	assert.equal(
-		a?.snapshot,
-		b?.snapshot,
-		"one job ⇒ one collect promise ⇒ the two calls share the snapshot object",
-	);
-
-	// The bail comes from A — the call that took the claim. It reached nobody, so the
-	// claim goes back and the held notice becomes deliverable.
-	runtime.unclaimUndelivered("held", a!.snapshot, a!.claimedNow);
-	assert.equal(
-		runtime.get("held")?.consumedByTool,
-		false,
-		"the owning call's bail hands the notice route back",
-	);
-
-	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 1, "the held batch is flushed");
-	assert.match(messages[0]!.content, /mate-out/, "positive control: the flush really ran");
-	assert.equal(
-		(messages[0]!.content.match(/held-out/g) ?? []).length,
-		1,
-		"the bailed call's result is delivered exactly once — never zero, never twice",
-	);
-	assert.equal(messages.length, 1, "one batch, one message");
-	runtime.dispose();
-});
-
-test("claim D2/#320: collectChild's OWN abort bail hands the claim back (index wiring)", async () => {
-	// `collectChild` has two bail doors and the claim is only restored if the closed one is
-	// wired: `!collected || signal?.aborted` (this case) and a throwing `persistChild`
-	// (minor 4, above). Here the abort lands after the seam's promise is already resolved —
-	// the cache branch answers synchronously, so aborting in the same tick still passes the
-	// function's first `signal.aborted` gate — which is the only way into the
-	// `collected && signal.aborted` combination.
-	//
-	// Delete the `ctx.runtime.unclaimUndelivered(...)` call in that branch and the held
-	// notice stays filtered out forever: red.
+	// P4c: the tool returns BEFORE `deliver`, so no `ledgerReads` were declared and the
+	// held notice is the only route left — and it arrives, exactly once. Delete the
+	// `signal?.aborted` check (i.e. render the result anyway) and this case loses its
+	// subject; nothing else may swallow the notice.
 	const messages: SentMessage[] = [];
 	const runtime = createSessionRuntime({
 		sendMessage(message) {
@@ -6330,26 +6240,28 @@ test("claim D2/#320: collectChild's OWN abort bail hands the claim back (index w
 	assert.match(text, /interrupted/, "the tool call delivered nothing");
 
 	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 1, "the rollback put the notice back on the wire");
+	await waitFor(() => messages.length === 1, "the undeclared read left the notice owed");
 	assert.match(messages[0]!.content, /x-out/);
 	assert.equal(messages.length, 1, "exactly once");
 	runtime.dispose();
 });
 
-test("claim D2/#320-2: collectChild's JOB-branch bail still lands the notice (live job, retire pending)", async () => {
-	// The end-to-end shape of #320/2 through the real caller (#327), on the branch that
-	// production actually takes: the job is STILL TRACKED and its watch is parked in an
-	// unresolved `retire`, so the watch's gate has already skipped `onTerminal` and the
-	// re-arm is the only thing that can deliver. The cache-branch case above starts from
-	// a released child and never exercises that window.
+test("D3b: collectChild's JOB-branch bail still lands the notice (live job, retire pending)", async () => {
+	// The same bail through the real caller on the branch production actually takes: the
+	// job is STILL TRACKED and its watch is parked in an unresolved `retire`. The
+	// cache-branch case above starts from a released child and never exercises that
+	// window.
 	//
-	// The abort has to land in one specific window — after the seam answered with the
-	// claim, before `collectChild` reads `signal?.aborted` — which is exactly one
-	// microtask hop wide. Registering the abort on the seam's promise here (ahead of
-	// `collectChild`'s own `await`) puts it there deterministically instead of relying on
-	// a sleep: the handler is queued first, flips `aborted`, and only then does
-	// `collectChild` resume and bail. Delete the rollback in that branch and this goes
-	// red with zero messages: the claim keeps filtering the notice out forever.
+	// The abort has to land in one specific window — after the seam answered, before
+	// `collectChild` reads `signal?.aborted` — which is exactly one microtask hop wide.
+	// Registering the abort on the seam's promise here (ahead of `collectChild`'s own
+	// `await`) puts it there deterministically instead of relying on a sleep: the handler
+	// is queued first, flips `aborted`, and only then does `collectChild` resume and bail.
+	//
+	// P4c: the notice no longer depends on a rollback or a watch re-arm — the watch's gate
+	// is gone (D4), so the result was announced on the watch's own route while the tool
+	// call was still awaiting, and the bail only means "this tool result carried no
+	// read". Exactly one notice, which is what the parent sees.
 	const messages: SentMessage[] = [];
 	const retires: Array<() => void> = [];
 	let resolveCollect!: (s: CollectSnapshot) => void;
@@ -6400,7 +6312,6 @@ test("claim D2/#320-2: collectChild's JOB-branch bail still lands the notice (li
 	} as unknown as Parameters<typeof collectChild>[0];
 
 	const pending = collectChild(ctx, controller.signal);
-	assert.equal(runtime.get("x")?.consumedByTool, true, "the tool call owns the notice route");
 	resolveCollect(joinSnapshot({ output: "x-out" }));
 	const result = await pending;
 	const text = (result.content as Array<{ text?: string }>)
@@ -6408,17 +6319,13 @@ test("claim D2/#320-2: collectChild's JOB-branch bail still lands the notice (li
 		.join("\n");
 	assert.match(text, /interrupted/, "the tool call delivered nothing");
 
-	// The bail happened on the JOB branch: the job is still live, its watch is still
-	// parked in retire, and the rollback handed the notice route back.
+	// The bail happened on the JOB branch: the job is still live and its watch is parked
+	// in retire — exactly one watch, because nothing re-arms any more.
 	assert.ok(runtime.get("x"), "the job is still tracked (job branch, not the finished cache)");
-	assert.equal(runtime.get("x")?.consumedByTool, false, "the bail restored the notice route");
-	// Two watches have reached retire: the one whose gate skipped (generation bump kept
-	// it from releasing) and the re-armed one. Neither resolving is the point — the job
-	// is still the same live job the notice has to come from.
-	assert.equal(retires.length, 2, "the original watch parked in retire, then the re-armed one");
-	assert.equal(runtime.get("x")?.watching, true, "the re-armed watch is live on the same job");
+	assert.equal(retires.length, 1, "one watch, parked in retire (no re-arm: P4c)");
+	assert.equal(runtime.get("x")?.watching, true, "the watch still owns the job");
 
-	await waitFor(() => messages.length === 1, "the re-armed watch delivers the notice");
+	await waitFor(() => messages.length === 1, "the watch's own route delivers the notice");
 	assert.match(messages[0]!.content, /x-out/);
 	assert.equal(messages.length, 1, "exactly one notice, never two");
 	runtime.dispose();
@@ -6472,11 +6379,11 @@ test("#349: the cache keeps every result's metadata and strips text past its ent
 		// The oldest entry's result is still a result: metadata intact, text re-read.
 		const oldest = await runtime.consumeCollect("child-0");
 		assert.ok(oldest, "an evicted entry is still a cache hit");
-		assert.equal(oldest.snapshot.execution.status, "success");
-		assert.equal(oldest.snapshot.acceptance.status, "attested");
-		assert.equal(oldest.snapshot.outputFile, join(dir, "child-0.output.md"));
-		assert.equal(oldest.snapshot.output, `child-0:${"x".repeat(1_000)}`, "the text came back from disk");
-		assert.equal(oldest.snapshot.outputTruncated, undefined, "nothing was truncated");
+		assert.equal(oldest.execution.status, "success");
+		assert.equal(oldest.acceptance.status, "attested");
+		assert.equal(oldest.outputFile, join(dir, "child-0.output.md"));
+		assert.equal(oldest.output, `child-0:${"x".repeat(1_000)}`, "the text came back from disk");
+		assert.equal(oldest.outputTruncated, undefined, "nothing was truncated");
 		runtime.dispose();
 	});
 });
@@ -6509,8 +6416,8 @@ test("#349: a single output above the entry cap is never resident — and the fi
 		runtime.watch("big");
 		await waitFor(() => runtime.activeJobs().length === 0, "big released");
 		const hit = await runtime.consumeCollect("big");
-		assert.equal(hit?.snapshot.output, output, "the cache hit is whole again, from outputFile");
-		assert.equal(hit?.snapshot.outputTruncated, undefined);
+		assert.equal(hit?.output, output, "the cache hit is whole again, from outputFile");
+		assert.equal(hit?.outputTruncated, undefined);
 		runtime.dispose();
 	});
 });
@@ -6554,7 +6461,7 @@ test("#349: a stripped result is rehydrated from disc — wait returns the same 
 		assert.equal(hit?.snapshot?.execution.status, "success");
 		assert.equal(hit?.snapshot?.outputFile, join(dir, "child-0.output.md"));
 		const collect = await runtime.consumeCollect("child-0");
-		assert.equal(collect?.snapshot.output, outputs[0], "and through the collect seam too");
+		assert.equal(collect?.output, outputs[0], "and through the collect seam too");
 		runtime.dispose();
 	});
 });
@@ -6579,8 +6486,8 @@ test("#349: rehydrate restores the persisted text — at most leading/trailing w
 		runtime.watch("trim");
 		await waitFor(() => runtime.activeJobs().length === 0, "trim released");
 		const hit = await runtime.consumeCollect("trim");
-		assert.equal(hit?.snapshot.output, output.trim(), "rehydrated == output.trim()");
-		assert.notEqual(hit?.snapshot.output, output, "…which is NOT the untrimmed original (documented)");
+		assert.equal(hit?.output, output.trim(), "rehydrated == output.trim()");
+		assert.notEqual(hit?.output, output, "…which is NOT the untrimmed original (documented)");
 		runtime.dispose();
 	});
 });
@@ -6596,11 +6503,11 @@ test("#349: a deleted outputFile degrades to the head and SAYS SO (outputTruncat
 		rmSync(join(dir, "child-0.output.md"));
 		const hit = await runtime.consumeCollect("child-0");
 		assert.ok(hit, "a deleted artifact is a degraded read, not a lost result");
-		assert.equal(hit.snapshot.output.length, 4_000, "the preview head");
-		assert.equal(outputs[0]!.startsWith(hit.snapshot.output), true, "…and it is the real head");
-		assert.equal(hit.snapshot.outputTruncated, true, "the caller can tell the text is incomplete");
-		assert.equal(hit.snapshot.execution.status, "success", "metadata survives the degradation");
-		assert.equal(hit.snapshot.outputFile, join(dir, "child-0.output.md"), "and it still names the file it wanted");
+		assert.equal(hit.output.length, 4_000, "the preview head");
+		assert.equal(outputs[0]!.startsWith(hit.output), true, "…and it is the real head");
+		assert.equal(hit.outputTruncated, true, "the caller can tell the text is incomplete");
+		assert.equal(hit.execution.status, "success", "metadata survives the degradation");
+		assert.equal(hit.outputFile, join(dir, "child-0.output.md"), "and it still names the file it wanted");
 		runtime.dispose();
 	});
 });
@@ -6633,8 +6540,8 @@ test("#349: a result with no outputFile is pinned — its text is never dropped"
 	assert.equal(stats.stripped, 0, "nothing to rebuild from ⇒ nothing was dropped");
 	assert.equal(stats.pinnedBytes, stats.residentBytes, "the whole footprint is pinned, and says so");
 	const hit = await runtime.consumeCollect("child-0");
-	assert.equal(hit?.snapshot.output, `child-0:${"x".repeat(8_000)}`, "pinned text is served whole");
-	assert.equal(hit?.snapshot.outputTruncated, undefined, "nothing was truncated, so nothing is flagged");
+	assert.equal(hit?.output, `child-0:${"x".repeat(8_000)}`, "pinned text is served whole");
+	assert.equal(hit?.outputTruncated, undefined, "nothing was truncated, so nothing is flagged");
 	runtime.dispose();
 });
 
@@ -6675,4 +6582,458 @@ test("#349: re-tracking every finished child returns the cache to baseline", asy
 		assert.equal(after.stripped, 0);
 		runtime.dispose();
 	});
+});
+
+// ════════════ P4b: the delivery verdict is the LEDGER PROJECTION (`result-ledger-v1` D4) ════════════
+//
+// One result, one notice — but the fact that says so lives in the ledger now:
+// `undelivered(consumerId)` is the whole predicate (notified? read to EOF?), and a
+// successful send writes `notified_at`. These are the P4b acceptance cases: the
+// projection suppresses, the projection survives a second boundary, a REJECTED send
+// writes nothing, a partial read suppresses nothing, and a result with no artifact
+// id falls back to the minimal `deliveredOnce` memory — with no database at all the
+// seam must still deliver rather than throw.
+
+test("P4b/D4: a child read through collect is never announced — its unread sibling rides the same boundary", async () => {
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
+	runtime.notifyParentRunStart();
+	for (const name of ["read-me", "unread"]) {
+		runtime.track({
+			name,
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: `/tmp/${name}.jsonl`,
+			timeoutMs: 1_000,
+			collect: async () => seam.snap(name),
+		});
+		runtime.watch(name);
+	}
+	// One batch (same run, same window), held because the parent run is live (D1).
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "both notices held as one batch");
+	assert.equal(messages.length, 0, "a live run sends nothing");
+
+	// The tool route delivers one of them; P4a's write is what makes it settled.
+	const collected = await runtime.wait(["read-me"], { timeoutMs: 500 });
+	assert.equal(collected[0]?.snapshot?.output, "read-me-out");
+	assert.equal(
+		collected[0]?.snapshot?.artifactId,
+		seam.artifactId("read-me"),
+		"the artifact id reaches the tool result (a projection needs it)",
+	);
+	seam.read("read-me");
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the unread sibling rides this very boundary");
+	const content = messages[0]!.content;
+	assert.match(content, /unread-out/, "positive control: the boundary really delivered");
+	assert.doesNotMatch(content, /read-me-out/, "the read result is not re-announced");
+	assert.equal(messages.length, 1, "exactly one message");
+	// The ledger's own view, so the assertion above is not vacuous.
+	assert.equal(consumptionFor(seam.db, seam.artifactId("read-me"), "root")?.readBytes, PROJECTION_ARTIFACT_BYTES);
+	assert.equal(
+		typeof consumptionFor(seam.db, seam.artifactId("unread"), "root")?.notifiedAt,
+		"number",
+		"the delivered notice recorded `notified_at`",
+	);
+	seam.close();
+});
+
+test("P4b/D4: a delivered notice writes `notified_at` once — the same artifact is never sent again", async () => {
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
+	const id = seam.artifactId("w");
+	// Both rounds hand back the SAME artifact: identical bytes are one artifact (D1b),
+	// so the projection is the only thing that can keep the second round quiet.
+	const trackRound = () =>
+		runtime.track({
+			name: "w",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/w.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => seam.snap("w"),
+		});
+
+	runtime.notifyParentRunStart();
+	trackRound();
+	runtime.watch("w");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the notice is held");
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the boundary delivers it");
+	const first = consumptionFor(seam.db, id, "root");
+	assert.equal(typeof first?.notifiedAt, "number", "the send wrote `notified_at`");
+
+	// A second reporting round over the same artifact must stay silent.
+	runtime.notifyParentRunStart();
+	trackRound();
+	runtime.watch("w");
+	await waitFor(() => runtime.get("w") === undefined, "the second round settled and released");
+	await drainContinuations();
+	assert.equal(runtime.noticeQueueStats().pending, 0, "a notified artifact is never `pending`");
+	runtime.notifyParentSettled();
+	await drainContinuations();
+	assert.equal(messages.length, 1, "no second notice for the same artifact");
+	assert.equal(
+		consumptionFor(seam.db, id, "root")?.notifiedAt,
+		first?.notifiedAt,
+		"write-once: a replayed delivery cannot move the timestamp",
+	);
+	seam.close();
+});
+
+test("P4b/D4: a REJECTED send writes no `notified_at`, and the next boundary retries it", async () => {
+	const delivered: SentMessage[] = [];
+	let hostDown = true;
+	const seam = projectionSeam({
+		sendMessage(message) {
+			if (hostDown) throw new Error("host is down");
+			delivered.push(message as SentMessage);
+		},
+	});
+	const { runtime } = seam;
+	const id = seam.artifactId("w");
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "w",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/w.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => seam.snap("w"),
+	});
+	runtime.watch("w");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the notice is held");
+
+	runtime.notifyParentSettled();
+	assert.equal(delivered.length, 0, "the host rejected the send");
+	assert.equal(consumptionFor(seam.db, id, "root"), null, "a rejected send records nothing");
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the notice is still owed ⇒ it was re-queued");
+
+	hostDown = false;
+	runtime.notifyParentSettled();
+	await waitFor(() => delivered.length === 1, "the retry at the next boundary delivers it");
+	assert.equal(runtime.noticeQueueStats().pending, 0, "the outbox is drained");
+	assert.equal(
+		typeof consumptionFor(seam.db, id, "root")?.notifiedAt,
+		"number",
+		"only the successful send wrote `notified_at`",
+	);
+	seam.close();
+});
+
+test("P4b/D6: a PARTIAL read suppresses nothing — the notice still arrives (and a full read settles it)", async () => {
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "half",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/half.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => seam.snap("half"),
+	});
+	runtime.watch("half");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the notice is held");
+
+	// D6: read half is not read. `read_bytes < bytes` keeps the artifact projected.
+	seam.readPartial("half");
+	assert.equal(
+		consumptionFor(seam.db, seam.artifactId("half"), "root")?.readBytes,
+		PROJECTION_ARTIFACT_BYTES - 1,
+		"the ledger recorded a partial read",
+	);
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "a partial read does not suppress the notice");
+	assert.match(messages[0]!.content, /half-out/);
+
+	// Now read to EOF: the same artifact is settled, so a later round stays silent.
+	seam.read("half");
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "half",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/half.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => seam.snap("half"),
+	});
+	runtime.watch("half");
+	await waitFor(() => runtime.get("half") === undefined, "the second round settled and released");
+	runtime.notifyParentSettled();
+	await drainContinuations();
+	assert.equal(messages.length, 1, "read to EOF ⇒ nothing left to announce");
+	seam.close();
+});
+
+/** A runtime whose collect never hands out an artifact id, i.e. the degraded path. */
+async function legacyEntryDeliversOnce(seam: ProjectionSeam | undefined): Promise<number> {
+	const messages: SentMessage[] = [];
+	const runtime = seam
+		? seam.runtime
+		: createSessionRuntime({
+				sendMessage(message) {
+					messages.push(message as SentMessage);
+				},
+			});
+	const sent = seam ? seam.messages : messages;
+	runtime.setJoinConfig({ mode: "each", flushMs: 10_000 });
+	let collects = 0;
+	runtime.track({
+		name: "legacy",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/legacy.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => {
+			collects += 1;
+			// No artifactId: this is a result the ledger cannot name.
+			return joinSnapshot({ output: "legacy-out" });
+		},
+		// Never resolves: the job stays tracked, so `rewatch` can re-arm the SAME round.
+		retire: () => new Promise<void>(() => {}),
+	});
+	runtime.watch("legacy");
+	await waitFor(() => sent.length === 1, "round 1 is announced once");
+	// `rewatch` does not `track()`, so the reporting round — and with it the fallback
+	// key — is unchanged: only `deliveredOnce` can keep the copy quiet.
+	runtime.rewatch("legacy");
+	await waitFor(() => collects === 2, "the same round settled a second time");
+	await drainContinuations();
+	// The caller owns a `projectionSeam`'s teardown (`close()`); a bare runtime is ours.
+	if (!seam) runtime.dispose();
+	return sent.length;
+}
+
+test("P4b/D4 fallback: an entry with no artifact id is sent once (`deliveredOnce`), never twice", async () => {
+	const seam = projectionSeam();
+	const sent = await legacyEntryDeliversOnce(seam);
+	assert.equal(sent, 1, "the same (runId, name, round) is delivered once even without an artifact");
+	seam.close();
+});
+
+test("P4b/D4 fallback: with NO projection at all the seam still delivers (never throws, never repeats)", async () => {
+	// No `getLedgerProjection` ⇒ no projection ⇒ the degraded path. The point of the
+	// case is the direction of the failure: one notice, no exception.
+	const sent = await legacyEntryDeliversOnce(undefined);
+	assert.equal(sent, 1, "no ledger ⇒ the notice is still delivered, exactly once");
+});
+
+// ═══ P4b 复审（契约 v1.10）：投影的权威范围与兜底的读取顺序 ═══
+//
+// Two failures the first P4b cut had, both in `owesDelivery`:
+//
+//   1. an artifact id the ledger has NO row for was read as "settled" (it cannot be in
+//      `undelivered` if it does not exist) — a best-effort `recordArtifact` that failed,
+//      a reset `legion.db` without a rebuild, or D1b's reuse of a row that is gone all
+//      turned into PERMANENT SILENCE. v1.10: fail open, and say so on stderr;
+//   2. `deliveredOnce` was consulted after the projection answer, so the fallback
+//      written when `markNotified` throws could never be read — the same result was
+//      re-announced at every boundary. v1.10: read it FIRST.
+
+/**
+ * A ledger whose READS work and whose `consumptions` INSERT throws — exactly what a
+ * failed best-effort `markNotified` looks like from inside the delivery seam.
+ */
+function writeRefusingDb(real: ReturnType<typeof openLegionDb>): DatabaseSync {
+	return {
+		prepare(sql: string) {
+			if (/INSERT INTO consumptions/.test(sql)) throw new Error("ledger write refused (test)");
+			return real.prepare(sql);
+		},
+	} as unknown as DatabaseSync;
+}
+
+test("P4b/v1.10 critical: an artifact id with NO ledger row fails OPEN — the notice is delivered, never silenced", async () => {
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
+	const stderr: string[] = [];
+	const previousFlag = process.env.PI_LEGION_LEDGER_SHADOW;
+	const originalWrite = process.stderr.write;
+	process.env.PI_LEGION_LEDGER_SHADOW = "1";
+	process.stderr.write = ((chunk: unknown) => {
+		stderr.push(String(chunk));
+		return true;
+	}) as typeof process.stderr.write;
+	try {
+		runtime.setJoinConfig({ mode: "each", flushMs: 10_000 });
+		runtime.notifyParentRunStart();
+		// The suppression half: a normal artifact, read to EOF, so the ledger HAS a row and
+		// the projection settles it.
+		seam.read("known");
+		runtime.track({
+			name: "known",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/known.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => seam.snap("known"),
+		});
+		// The fail-open half: an id NO `artifacts` row exists for (a best-effort insert that
+		// failed / a db reset without rebuild / D1b reuse of a vanished row).
+		runtime.track({
+			name: "ghost",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/ghost.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => joinSnapshot({ output: "ghost-out", artifactId: "r-1/ghost/r1" }),
+		});
+		runtime.watch("known");
+		runtime.watch("ghost");
+		await waitFor(
+			() => runtime.get("known") === undefined && runtime.get("ghost") === undefined,
+			"both entries are decided",
+		);
+		assert.equal(runtime.noticeQueueStats().pending, 1, "only the unknown-id entry is still owed");
+
+		runtime.notifyParentSettled();
+		await waitFor(() => messages.length === 1, "the unknown-id result is delivered");
+		assert.match(messages[0]!.content, /ghost-out/);
+		assert.doesNotMatch(messages[0]!.content, /known-out/, "positive control: the READ artifact stays suppressed");
+		await drainContinuations();
+		assert.equal(messages.length, 1, "exactly one notice");
+
+		// …and the fail-open decision is visible instead of silent.
+		const diagnostics = stderr
+			.join("")
+			.split("\n")
+			.filter((line) => line.includes("artifact-id-without-ledger-row"));
+		assert.ok(diagnostics.length >= 1, `shadow on: an unknown artifact id must be reported, got ${JSON.stringify(stderr)}`);
+		assert.match(diagnostics[0]!, /artifact=r-1\/ghost\/r1\b/);
+		// It really was delivered: the notice side wrote its own fact for that id.
+		assert.equal(typeof consumptionFor(seam.db, "r-1/ghost/r1", "root")?.notifiedAt, "number");
+	} finally {
+		seam.close();
+		process.stderr.write = originalWrite;
+		if (previousFlag === undefined) delete process.env.PI_LEGION_LEDGER_SHADOW;
+		else process.env.PI_LEGION_LEDGER_SHADOW = previousFlag;
+	}
+});
+
+test("P4b/v1.10 major: a REFUSED markNotified still means \"sent once\" — `deliveredOnce` is read before the projection", async () => {
+	const db = openLegionDb(":memory:");
+	const refusing = writeRefusingDb(db);
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+		getLedgerProjection: () => ({ db: refusing, consumerId: "root" }),
+	});
+	try {
+		recordArtifact(db, {
+			id: "r-1/w/r1",
+			parentId: "root",
+			nodeId: "root.w",
+			name: "w",
+			round: 1,
+			path: "/tmp/r-1/artifacts/w/r1.md",
+			bytes: PROJECTION_ARTIFACT_BYTES,
+			createdAt: 1_000,
+		});
+		runtime.setJoinConfig({ mode: "each", flushMs: 10_000 });
+		let collects = 0;
+		runtime.track({
+			name: "w",
+			runId: "r-1",
+			agent: "worker",
+			sessionFile: "/tmp/w.jsonl",
+			timeoutMs: 1_000,
+			collect: async () => {
+				collects += 1;
+				return joinSnapshot({ output: "w-out", artifactId: "r-1/w/r1" });
+			},
+			// Never resolves: the job stays tracked, so `rewatch` can re-arm the SAME round.
+			retire: () => new Promise<void>(() => {}),
+		});
+		runtime.watch("w");
+		await waitFor(() => messages.length === 1, "the first delivery goes out");
+		assert.equal(consumptionFor(db, "r-1/w/r1", "root"), null, "the ledger write was refused");
+		assert.deepEqual(
+			undelivered(db, "root").map((artifact) => artifact.id),
+			["r-1/w/r1"],
+			"…so the projection still owes the artifact",
+		);
+
+		// The SAME reporting round again (no `track()`, so the fallback key is unchanged).
+		runtime.rewatch("w");
+		await waitFor(() => collects === 2, "the same round settled a second time");
+		await drainContinuations();
+		assert.equal(
+			messages.length,
+			1,
+			"no second notice: the `deliveredOnce` fallback caught the failed ledger write",
+		);
+	} finally {
+		runtime.dispose();
+		db.close();
+	}
+});
+
+test("P4b/D4 fallback: a legacy result read through `wait` is still announced — deliberate over-notification (D3: 宁多推)", async () => {
+	// The accepted asymmetry (contract D3): a result with no artifact id has nowhere to
+	// record `read_bytes`, so reading it through the tool route cannot settle it and the
+	// boundary announces it anyway. That is the chosen direction, not a regression — a
+	// notice that was never sent is invisible, a repeated one is not.
+	const seam = projectionSeam();
+	const { runtime, messages } = seam;
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "legacy",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/legacy.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "legacy-out" }),
+	});
+	runtime.watch("legacy");
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "the entry is held");
+	const waited = await runtime.wait(["legacy"], { timeoutMs: 500 });
+	assert.equal(waited[0]?.snapshot?.output, "legacy-out");
+	assert.equal(waited[0]?.snapshot?.artifactId, undefined, "no artifact id ⇒ nothing to record a read against");
+
+	runtime.notifyParentSettled();
+	await waitFor(() => messages.length === 1, "the boundary announces it anyway");
+	assert.match(messages[0]!.content, /legacy-out/);
+	seam.close();
+});
+
+test("D4b: a collect-failure notice carries no renewal line and asks for no proposal", async () => {
+	// P4c moved the renewal proposal from `watch` to the delivery seam. The move must
+	// not widen it: HEAD's collect-failure notice never carried a `renew:` line, and
+	// asking the host per failure pays a `listRuns()` + `loadCatalog()` scan.
+	const messages: SentMessage[] = [];
+	let asked = 0;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+		getRenewalProposal: () => {
+			asked += 1;
+			return {
+				progress: { toolResults: 3, assistantMessages: 2, filesChanged: 1 },
+				used: 0,
+				max: 1,
+				command: 'subagent({ action: "continue", name: "f" })',
+			};
+		},
+	});
+	runtime.setJoinConfig({ mode: "each", flushMs: 10_000 });
+	runtime.track({
+		name: "f",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/f.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => {
+			throw new Error("boom");
+		},
+	});
+	runtime.watch("f");
+	await waitFor(() => messages.length === 1, "the collect-failure notice");
+	assert.equal(asked, 0, "a failed entry must not ask the host for a proposal (D4b)");
+	assert.doesNotMatch(messages[0]!.content, /renew:/);
+	runtime.dispose();
 });

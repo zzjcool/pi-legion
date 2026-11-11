@@ -1,10 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { parseSessionText, deriveOutcome, isLastTurnComplete } from "../../src/shared/session.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import { RunStore } from "../../src/runs/store.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { artifactById } from "../../src/legion/ledger.ts";
+import { insertNode } from "../../src/legion/nodes.ts";
+import { createLegionEventBus } from "../../src/extension/event-bus.ts";
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { assistantMsg, sessionHeader, userMsg } from "../helpers/fixtures.ts";
@@ -94,7 +99,7 @@ test("regression: the final turn owns the verdict; stale earlier verdicts cannot
 	} finally { rmSync(runDir, { recursive: true, force: true }); }
 });
 
-test("regression: terminal output artifact is cleared when a later turn has no output", async () => {
+test("regression: a later turn with no output writes no artifact and keeps the earlier one", async () => {
 	const runDir = tempDir();
 	try {
 		const supervisor = new FakeSupervisor();
@@ -104,14 +109,75 @@ test("regression: terminal output artifact is cleared when a later turn has no o
 		supervisor.settle(first.name, { text: "first output" });
 		const result1 = await orchestrator.collect(first.name);
 		assert.ok(result1.outputFile);
+		assert.equal(readFileSync(result1.outputFile, "utf8"), "first output\n", "the first round's body is on disk");
 		await orchestrator.retire(first.name);
 		const resumed = await orchestrator.launch({ agent: agent(), task: "second", name: "worker-0", worktree: false });
 		supervisor.settle(resumed.name, { text: "" });
 		const result2 = await orchestrator.collect(resumed.name);
+		// result-ledger-v1 §3 D1c: an empty turn produces no artifact and, unlike the old
+		// `<name>.output.md` cleanup, does NOT delete the immutable earlier one — the
+		// path used to point at the previous turn's file, which is why the old removal
+		// silently destroyed unread result material.
 		assert.equal(result2.outputFile, undefined);
+		assert.equal(existsSync(result1.outputFile), true, "the previous round's artifact survives an empty turn");
+		assert.equal(readFileSync(result1.outputFile, "utf8"), "first output\n", "and it is unchanged");
+		assert.equal(existsSync(path.join(runDir, "artifacts", resumed.name, "r2.md")), false, "the empty turn allocated no round");
 		assert.equal(orchestrator.cachedCollect(resumed.name)?.outputFile, undefined);
 		assert.equal(orchestrator.cachedCollect(resumed.name)?.output, "", "cached result must not resurrect a previous turn's text");
 	} finally { rmSync(runDir, { recursive: true, force: true }); }
+});
+
+test("result-ledger P3: a collect hands out the artifact id of the ledger row it wrote, and a cache hit keeps it", async () => {
+	// The chain task 1 of P3 is about: the orchestrator is the only writer, so the id
+	// has to leave that write path already attached to the result — the notice entry
+	// and the P3 shadow both read it downstream, and nothing may re-derive it.
+	const runDir = tempDir();
+	const db = openLegionDb(":memory:");
+	try {
+		const runStore = new RunStore({ rootDir: path.join(runDir, ".pi-subagents") });
+		const rootRun = runStore.createRun({
+			task: "root task",
+			cwd: runDir,
+			nodeId: "root",
+			maxDepth: 4,
+			herdr: { supervisor: "rpc" },
+		});
+		insertNode(db, { id: "root", parentId: null, name: "root", role: "root", runId: rootRun.runId, status: "running" });
+		const supervisor = new FakeSupervisor();
+		const orchestrator = new Orchestrator({
+			supervisor,
+			runDir: runStore.runDir(rootRun.runId),
+			cwd: runDir,
+			legion: {
+				db,
+				dbPath: path.join(runStore.runDir(rootRun.runId), "legion.db"),
+				nodeId: "root",
+				parentNodeId: null,
+				parentRunId: null,
+				runId: rootRun.runId,
+				runStore,
+				settings: { maxDepth: 4, maxChildrenPerNode: 8, maxActiveNodes: 30 },
+				eventBus: createLegionEventBus(),
+			},
+		});
+		const handle = await orchestrator.launch({ agent: agent(), task: "go", name: "worker-0", worktree: false });
+		supervisor.settle(handle.name, { text: "first output" });
+		const result = await orchestrator.collect(handle.name);
+		assert.ok(result.outputFile, "positive control: the body was written");
+		const expected = `${rootRun.runId}/worker-0/r1`;
+		assert.equal(result.artifactId, expected, "the id is <runId>/<name segment>/r<round> (D1)");
+		const row = artifactById(db, expected);
+		assert.equal(row?.parentId, "root", "parent_id is the CONSUMER (D2)");
+		assert.equal(row?.nodeId, "root.worker-0");
+		assert.equal(row?.path, path.resolve(result.outputFile), "the row points at the body the result names");
+		assert.equal(row?.bytes, Buffer.byteLength("first output\n", "utf8"), "bytes == the written body (A1)");
+		// P5 reads the artifact id off a collect in a LATER process: it comes from the
+		// persisted child record, never from a re-derived round.
+		assert.equal(orchestrator.cachedCollect("worker-0")?.artifactId, expected);
+	} finally {
+		db.close();
+		rmSync(runDir, { recursive: true, force: true });
+	}
 });
 
 test("regression: RPC start fallback tries configured models in order", async () => {

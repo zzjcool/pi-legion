@@ -51,9 +51,10 @@ import {
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
 import { resolveTeamContext } from "./src/agents/context.ts";
-import { createSessionRuntime, renderLiveChildStatus, type ClaimedCollect, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
+import { createSessionRuntime, renderLiveChildStatus, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
+import { registerLegionOutputTool } from "./src/extension/legion-output.ts";
 import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
 import { resolveLoopRadiusMs } from "./src/legion/stall-notice.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, LEGION_PHASES_ENV } from "./src/runs/args.ts";
@@ -62,6 +63,7 @@ import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.t
 import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
+import { artifactById, markRead } from "./src/legion/ledger.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
 import { type ExecutionStatus, type LegionSettings } from "./src/shared/types.ts";
@@ -96,7 +98,9 @@ import {
 } from "./src/extension/blocked.ts";
 import { formatAlreadyRecycled } from "./src/extension/recycle.ts";
 import {
+	artifactReadCall,
 	completionStatusOf,
+	formatSize,
 	type RenewalProposal,
 	SUBAGENT_NOTIFY_TYPE,
 } from "./src/extension/notify.ts";
@@ -115,6 +119,7 @@ import {
 	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
+import { artifactIdFromPath } from "./src/runs/artifacts.ts";
 import {
 	beginMailHold,
 	endMailHold,
@@ -2041,6 +2046,25 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				? attachUsageTotals(identity.db, getSubtree(identity.db, identity.nodeId))
 				: [];
 		},
+		// The ledger handle + consumer id (`parent_id`) the runtime asks about, or
+		// `undefined` before this entry has an identity.
+		//
+		// This is the DELIVERY PROJECTION (`result-ledger-v1` §3 D4) — the ONE source of
+		// every notice decision since P4c deleted the claim model: `ledger.undelivered(...)`
+		// for "still owed", `ledger.listArtifacts(...)` for "does this id even exist", plus
+		// `markNotified` on a successful send. The P3 shadow that used to read it too is
+		// gone; nothing else answers this question.
+		//
+		// Answered from the connection THIS entry already owns — `openLegionDb` is
+		// deliberately not called here: a second connection to the same file for a
+		// diagnostic would be a fact the projection cannot justify. No identity yet (a root
+		// has no ledger before its first launch) answers `undefined`, which the runtime
+		// reads as "no projection" and handles by degrading to its in-memory
+		// `deliveredOnce` (宁多推一条，不静默丢).
+		getLedgerProjection: () => {
+			const identity = ownLegionIdentity();
+			return identity ? { db: identity.db, consumerId: identity.nodeId } : undefined;
+		},
 		// #298: let the tree render a team's declared workflow. Cached per role
 		// because agent discovery touches the filesystem and the tree re-renders on
 		// every event.
@@ -2179,6 +2203,36 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			}
 		},
 	});
+
+	// P5b/D7: the result-ledger reader, registered at the PLUGIN layer — beside
+	// `subagent`/`vexillatio`, never inside `registerLegionTools` (`registerTools &&
+	// nodeId !== "root"`, child-only). A root owns artifacts too
+	// (`artifacts.parent_id = "root"`), so "read my children's result" must not be a
+	// child-only tool.
+	//
+	// It sits ABOVE the `isChild && !allowNested` early return on purpose: that gate
+	// exists because a child which may not dispatch has no dispatch tools to register,
+	// and `legion_output` is not one — a plain worker still has children of its own to
+	// read (D7: "root 与 child 都注册"). It keeps `vexillatio`'s utility guard for the
+	// same reason that tool has one: a read-only utility child never owns a child of
+	// its own, so the reader would only ever answer "nothing recorded". The identity
+	// is resolved per call — this runs at extension load, before any session or
+	// launch has one.
+	if (process.env[UTILITY_CHILD_ENV] !== "1") {
+		registerLegionOutputTool(pi, {
+			resolveIdentity: () => {
+				const identity = ownLegionIdentity();
+				return identity
+					? {
+							db: identity.db,
+							consumerId: identity.nodeId,
+							runId: identity.runId,
+							runDir: identity.runDir,
+						}
+					: undefined;
+			},
+		});
+	}
 
 	if (isChild && !allowNested) {
 		pi.on("session_shutdown", shutdownRetireAll);
@@ -2455,10 +2509,14 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					legion: activeLegion,
 					...(activeLegion ? { postman: activeLegion.postman } : {}),
 				});
-				if (signal?.aborted && action !== "stop") {
-					return interruptedControlResult({ result, runtime, legion: activeLegion });
-				}
-				return result;
+				// P4a/D3b: one gate for both the abort net and the read-side ledger write —
+				// `stop` keeps its pre-existing exemption (it is not a turn-ending bail), so a
+				// stop's result is delivered and settled like any other.
+				return settleControlResult({
+					result,
+					...(activeLegion ? { legion: activeLegion } : {}),
+					aborted: signal?.aborted === true && action !== "stop",
+				});
 			}
 
 			const result = await launchFamily({
@@ -2620,6 +2678,30 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	pi.on("tool_result", (_event, ctx) => {
 		bindUi(_event, ctx);
 		runtime.refreshUi();
+		// D5 (`result-ledger-v1.md` §3 D5, §6 P5a): a generic `read` that reaches EOF IS a
+		// consumption of that artifact. Wrapped here AND inside the hook: a ledger write is
+		// a fact ABOUT the tool result, never a condition of it (D1e), so not even the
+		// argument evaluation may escape into the host's tool result.
+		try {
+			recordArtifactReadFromToolResult({ event: _event, identity: ownLegionIdentity() });
+		} catch {
+			/* D1e: a ledger failure is a diagnostic, never the tool's answer. */
+		}
+	});
+	// P5d (user ruling, 2026-11-11: "文件路径永远不让 agent 知道，也不告诉他，只指引他通过
+	// 工具来读；软的就可以了"). An artifact is still an ordinary immutable file — nothing is
+	// encrypted, no directory moved, no DB blob — its path is simply never handed out, so a
+	// `read` of one is turned back to the ONE tool that reports the exact size and records
+	// the consumption (D7), and a `write`/`edit` is refused because A1b makes the body
+	// immutable. `block` WITHOUT `terminate`: this is a sentence the model can act on, not
+	// a dead turn. Fail OPEN on every shape we cannot judge (no identity, no runDir, a
+	// missing/non-string path, a throw) — the guard may not break an ordinary read/write.
+	pi.on("tool_call", (event) => {
+		try {
+			return artifactPathToolCallBlock({ event, identity: ownLegionIdentity() });
+		} catch {
+			return undefined;
+		}
 	});
 	pi.on("session_shutdown", shutdownRetireAll);
 }
@@ -2719,6 +2801,333 @@ function mailSeamOf(legion: OrchestratorLegionContext | undefined): MailReleaseS
 }
 
 /**
+ * P5c (`result-ledger-v1` §3 D8, v1.12): the artifact's FULL byte count, by artifact id.
+ *
+ * The one consumer is the render of a truncated snapshot, which has to say how big the
+ * text it is showing really was (`4.0 KB of 24.5 KB`). A function rather than a number
+ * because only the renderer knows WHICH snapshot it is about to print
+ * (`snapshot.artifactId`) and only the caller holds the connection. `undefined` means
+ * "no row" — a host without a legion context, a best-effort insert that failed, a db
+ * reset without rebuild — and the render then says `at least`, because what the model
+ * can see is a floor and nothing more. Never invent the difference.
+ */
+export type ArtifactBytesLookup = (artifactId: string) => number | undefined;
+
+/**
+ * Build that lookup over this session's ledger connection; `undefined` when the call has
+ * no legion identity (and then no artifact row was written either — §3 D1e).
+ *
+ * Never throws: a closed/refusing database must not be able to fail a tool result, and a
+ * missing number only costs the renderer its precision (D1e's direction, same as
+ * {@link markDelivered}).
+ */
+export function artifactBytesLookup(
+	legion: { db: DatabaseSync } | undefined,
+): ArtifactBytesLookup | undefined {
+	if (!legion) return undefined;
+	return (artifactId) => {
+		try {
+			return artifactById(legion.db, artifactId)?.bytes;
+		} catch {
+			return undefined;
+		}
+	};
+}
+
+/**
+ * The READ-side ledger target (`result-ledger-v1.md` §3 D3, P4a): the connection a
+ * delivery is recorded in, and the CONSUMER whose row it advances.
+ */
+interface LedgerReadSeam {
+	db: DatabaseSync;
+	consumerId: string;
+}
+
+/**
+ * `consumerId` is this session's own node id — `ownLegionIdentity()?.nodeId`, and a
+ * root's id is literally `"root"`.
+ *
+ * Taken off the identity THIS call resolved and adopted (`activeLegion`), which is the
+ * SAME object the orchestrator receives as its legion context, so `consumerId` cannot
+ * disagree with the `artifacts.parent_id` the writer recorded
+ * (`recordArtifactRow` → `parentId: legion.nodeId`) — the two halves the projection
+ * joins on.
+ *
+ * `undefined` = this call has no legion identity. That case needs no special handling
+ * downstream: without a context the orchestrator writes no artifact row either, so the
+ * snapshot carries no `artifactId` and there is nothing to record (D3).
+ */
+function ledgerReadSeamOf(
+	legion: OrchestratorLegionContext | undefined,
+): LedgerReadSeam | undefined {
+	return legion ? { db: legion.db, consumerId: legion.nodeId } : undefined;
+}
+
+/**
+ * The `details` key a control handler uses to DEFER its read-side writes
+ * (`result-ledger-v1.md` §3 D3b).
+ *
+ * A handler does not write the ledger: it can only say "if this text reaches the
+ * parent, these artifacts were read in full". The write happens in
+ * `settleControlResult`, which is the first place that knows the answer (`§6` P4a).
+ */
+const LEDGER_READS_DETAIL = "ledgerReads";
+
+/**
+ * Mount the deferred ids on a tool result's `details`, or nothing at all when there is
+ * no artifact identity to name (empty turn, failed artifact write, an older result, a
+ * running snapshot: §3 D3).
+ *
+ * `details` never affects the rendered text, so this cannot change what the model reads.
+ */
+function ledgerReadsDetails(
+	artifactIds: ReadonlyArray<string | undefined>,
+): Record<string, unknown> {
+	const ids = artifactIds.filter((id): id is string => id !== undefined);
+	return ids.length === 0 ? {} : { [LEDGER_READS_DETAIL]: ids };
+}
+
+/**
+ * Record that the artifact with this id has reached its consumer (§3 D3, P4a).
+ *
+ * Every condition below answers with silence, which is the direction D3 chose on
+ * purpose (a missing fact can cost one redundant notice; a wrong one costs the result
+ * itself):
+ *
+ * - no seam: not a legion node, so there is no ledger;
+ * - no `artifacts` row for that id: the id names nothing, and a snapshot's
+ *   `output.length` is CHARACTERS, not the bytes the projection compares `read_bytes`
+ *   against (inventing a number there would flip "read half" into "read all");
+ * - never throws (D1e): a closed or refusing database is a diagnostic failure, and the
+ *   tool's answer must come out identical with or without it.
+ *
+ * `bytesRead` is the artifact's WHOLE body, not what the renderer showed: `collect` and
+ * `wait` hand the text over verbatim (D6's "read to EOF" is satisfied by construction).
+ * `read_bytes` is a high-water mark (`markRead`'s `max()`), so a second delivery of the
+ * same artifact — a re-`wait` on the finished cache — moves nothing. `notified_at` is
+ * left untouched: P4a is the read side only.
+ */
+function markDelivered(seam: LedgerReadSeam | undefined, artifactId: string): void {
+	if (!seam) return;
+	try {
+		const artifact = artifactById(seam.db, artifactId);
+		if (!artifact) return;
+		markRead(seam.db, {
+			artifactId,
+			consumerId: seam.consumerId,
+			bytesRead: artifact.bytes,
+			at: Date.now(),
+		});
+	} catch {
+		// D1e: a ledger write is a fact ABOUT the delivery, never a condition OF it.
+	}
+}
+
+/**
+ * Settle a control result's DEFERRED read-side writes (`§3 D3b`) — the tool-layer
+ * caller of {@link markDelivered} (the D5 generic-`read` hook is the other one).
+ *
+ * Called after the handler returned and after every bail the handler could see, from
+ * `settleControlResult` (the tool layer). A result with no `ledgerReads` — every bail,
+ * every `interrupted …`, every mail preempt, every result without an artifact id —
+ * records nothing.
+ */
+function markLedgerReads(seam: LedgerReadSeam | undefined, details: unknown): void {
+	if (!seam || details === null || typeof details !== "object") return;
+	const ids = (details as Record<string, unknown>)[LEDGER_READS_DETAIL];
+	if (!Array.isArray(ids)) return;
+	for (const id of ids) {
+		if (typeof id === "string") markDelivered(seam, id);
+	}
+}
+
+/** The identity facts the D5 read hook needs; `ownLegionIdentity()` answers all four. */
+export interface ArtifactReadHookIdentity {
+	/** This session's ledger connection (the host's one handle — no second open). */
+	db: DatabaseSync;
+	/** The CONSUMER whose row the read advances; a root's id is literally `"root"` (D3). */
+	nodeId: string;
+	/** `<runId>` component of the artifact id (D1). */
+	runId: string;
+	/** `<runDir>` that owns `artifacts/…` — the `runDir` half of {@link artifactIdFromPath}. */
+	runDir: string;
+}
+
+/** The identity facts the P5d artifact-path guard needs; `ownLegionIdentity()` answers it. */
+export interface ArtifactPathGuardIdentity {
+	/** `<runDir>` whose `artifacts/` subtree is not a path a model may touch directly. */
+	runDir: string;
+}
+
+/**
+ * P5d: the `read` refusal. Names the ONE tool that can answer — the header it returns is
+ * where the exact size is (§3 D7), and that read is what the ledger records.
+ */
+const ARTIFACT_READ_BLOCK_REASON =
+	"This is a legion artifact (immutable). Read it with legion_output({ name, round }) — it returns the header with the exact size and records your read.";
+
+/** P5d: `write`/`edit` — A1b makes an artifact row and its body immutable. */
+const ARTIFACT_WRITE_BLOCK_REASON =
+	"Legion artifacts are immutable; legion_output is the read path.";
+
+/**
+ * P5d (user ruling, 2026-11-11): an artifact's PATH is never handed to a model — "还是
+ * 文件，但文件路径永远不让 agent 知道，也不告诉他，只指引他通过工具来读；软的就可以了".
+ *
+ * This is the soft half of that ruling: `read`/`write`/`edit` of a path under
+ * `<runDir>/artifacts/` is blocked with a reason, so the model is steered to
+ * `legion_output` instead of a path it was never given. Deliberately NOT `terminate`
+ * (the turn goes on; the reason is the instruction) and deliberately fail-OPEN:
+ *
+ * - no identity / no `runDir` (a plain session, a root before its first launch) ⇒ allow;
+ * - no `toolName`, a tool that is not `read`/`write`/`edit`, no `input`, a non-string or
+ *   empty `path` ⇒ allow;
+ * - any throw (an unresolvable path, a closed handle) ⇒ allow.
+ *
+ * A guard that cannot decide must never break an ordinary file read/write, which is why
+ * every branch above answers `undefined` rather than inventing a block. Returns the
+ * verdict the `tool_call` handler hands back, or `undefined` to let the call run.
+ */
+export function artifactPathToolCallBlock(input: {
+	event: unknown;
+	identity: ArtifactPathGuardIdentity | undefined;
+}): { block: true; reason: string } | undefined {
+	try {
+		const identity = input.identity;
+		if (!identity || typeof identity.runDir !== "string" || identity.runDir.length === 0) return undefined;
+		const event = asRecord(input.event);
+		if (!event) return undefined;
+		const toolName = event.toolName;
+		if (toolName !== "read" && toolName !== "write" && toolName !== "edit") return undefined;
+		const params = asRecord(event.input);
+		// `path` is the one argument all three tools share; `read` also pages it, which the
+		// D5 hook judges — here only WHERE it points matters.
+		const filePath = params?.path;
+		if (typeof filePath !== "string" || filePath.length === 0) return undefined;
+		if (!isUnderArtifactsDirectory(filePath, identity.runDir)) return undefined;
+		return {
+			block: true,
+			reason: toolName === "read" ? ARTIFACT_READ_BLOCK_REASON : ARTIFACT_WRITE_BLOCK_REASON,
+		};
+	} catch {
+		// P5d: fail open. A path we cannot resolve is not evidence of an artifact.
+		return undefined;
+	}
+}
+
+/**
+ * Does `filePath` resolve INTO `<runDir>/artifacts/`? (P5d)
+ *
+ * `path.resolve` + `path.relative`, never a string prefix: `artifacts-evil/` shares every
+ * character of `artifacts` but is a different directory, and a `..` segment is normalised
+ * BEFORE the comparison instead of being taken literally. The directory itself is not a
+ * file, and a relative result that is absolute (another drive/root) is not under it
+ * either — both answer `false`.
+ */
+function isUnderArtifactsDirectory(filePath: string, runDir: string): boolean {
+	const artifactsDir = path.resolve(runDir, "artifacts");
+	const relative = path.relative(artifactsDir, path.resolve(filePath));
+	if (relative.length === 0) return false;
+	if (path.isAbsolute(relative)) return false;
+	return relative !== ".." && !relative.startsWith(`..${path.sep}`);
+}
+
+/**
+ * D5 (`result-ledger-v1.md` §3 D5, §6 P5a): a generic `read` that reaches EOF consumes
+ * the artifact, exactly like a `collect`/`wait` delivery does (P4a).
+ *
+ * Why this hook exists at all: W5 — the completion notice recommends reading the output
+ * file, and a model that takes that advice uses the ordinary `read` tool, which no
+ * ledger-aware path sees. Without this, the artifact stays `undelivered` (D4) and the
+ * parent gets a second copy of a result it already read. With it, the root needs NO
+ * exemption from `registerLegionTools`' `nodeId !== "root"` gate (D5), which is why the
+ * gate and `registerTools:false` stay untouched.
+ *
+ * What counts as "read" is D6 (user ruling, 2026-11-10: "read half is not read"):
+ *
+ * - **no `offset`/`limit`** ⇒ the tool returned the whole body ⇒ record `full`;
+ * - **`offset` or `limit` present** ⇒ a page, not the body ⇒ record NOTHING (the
+ *   projection must keep owing the notice);
+ * - **the shape cannot be read at all** (no event, no `input`, no `path`, a non-string
+ *   path, a thrown `stat`) ⇒ also NOTHING. The direction is deliberate: a missing
+ *   record can cost one redundant notice, a wrong one silently drops the result — and
+ *   D4/A3 make the ledger the only place "the parent has seen this" may live, so a
+ *   guessed `full` is unrecoverable.
+ *
+ * Two further vetoes on top of D5's literal criterion, both in the same conservative
+ * direction:
+ *
+ * - a failed read (`isError`) or one the tool itself truncated
+ *   (`details.truncation.truncated` — the read tool caps at 2000 lines / 50 KB) did not
+ *   deliver EOF, whatever the arguments said;
+ * - the body on disk must still be exactly `artifacts.bytes`. `bytes` is taken from the
+ *   LEDGER ROW, not from `stat`/`content.length`: it is the number the projection
+ *   compares `read_bytes` against, and a file that changed size is D7's
+ *   `changed-on-disk` — it must not advance `full`.
+ *
+ * The write goes through {@link markDelivered}, the same sequence (and the same
+ * `consumerId`, `identity.nodeId`) the `collect`/`wait` seam uses. A path that names no
+ * artifact, or an id with no `artifacts` row, records nothing (same guard as
+ * `markDelivered`). Returns the id it recorded, or `undefined`.
+ *
+ * D1e: never throws. This runs inside `tool_result`, and a ledger failure must not be
+ * able to fail the tool the model just called.
+ *
+ * P5d (2026-11-11): after the soft block in the `tool_call` handler above, a generic
+ * `read` OF AN ARTIFACT never reaches `tool_result` — the call is blocked — so this hook
+ * now only serves the non-`read` tool paths: a `read` the block could not see (a host
+ * that ignores `block`, a nested/tool-mediated call, an identity resolved too late) and
+ * any future tool that hands a file body through `tool_result`. It stays because the
+ * ledger must be right for those too — "blocked at the tool layer" is a policy, not a
+ * proof.
+ */
+export function recordArtifactReadFromToolResult(input: {
+	event: unknown;
+	identity: ArtifactReadHookIdentity | undefined;
+}): string | undefined {
+	try {
+		const identity = input.identity;
+		if (!identity) return undefined;
+		const event = asRecord(input.event);
+		if (!event || event.toolName !== "read") return undefined;
+		// D6: a paged read is a page. Checked before the path so a partial read of an
+		// artifact cannot depend on any later parse succeeding.
+		const params = asRecord(event.input);
+		if (!params) return undefined;
+		if (params.offset !== undefined || params.limit !== undefined) return undefined;
+		const filePath = params.path;
+		if (typeof filePath !== "string" || filePath.length === 0) return undefined;
+		// A read that failed, or one the tool truncated, did not reach EOF.
+		if (event.isError === true) return undefined;
+		const details = asRecord(event.details);
+		const truncation = details ? asRecord(details.truncation) : undefined;
+		if (truncation?.truncated === true) return undefined;
+
+		const artifactId = artifactIdFromPath(filePath, identity.runDir, identity.runId);
+		if (artifactId === undefined) return undefined;
+		const artifact = artifactById(identity.db, artifactId);
+		if (!artifact) return undefined;
+		// `bytes` is the row's number (D5) and A1 says the body is immutable: a size that
+		// disagrees means the file on disk is not (or is no longer) this artifact.
+		const stats = fs.statSync(path.resolve(filePath));
+		if (!stats.isFile() || stats.size !== artifact.bytes) return undefined;
+
+		markDelivered({ db: identity.db, consumerId: identity.nodeId }, artifactId);
+		return artifactId;
+	} catch {
+		// D1e: a closed/refusing database or an unreadable file is a diagnostic failure,
+		// never a condition of the tool result this hook is riding on.
+		return undefined;
+	}
+}
+
+/** `Record<string, unknown>` view of an untyped event field, or `undefined`. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	return value as Record<string, unknown>;
+}
+
+/**
  * Act on an EXISTING child: status, steer, collect, retire, continue, resume.
  *
  * The extension stays loaded for the session, but a control call may arrive
@@ -2795,6 +3204,10 @@ async function controlAction(input: {
 			store,
 			cwd,
 			mail: mailSeamOf(input.legion),
+			// P5c (§3 D8): the SAME identity whose artifacts this wait delivers — one
+			// helper (`artifactBytesLookup`) so `collect` and `wait` cannot disagree about
+			// how big a text was.
+			...(input.legion ? { fullBytesOf: artifactBytesLookup(input.legion) } : {}),
 		});
 	}
 
@@ -3057,7 +3470,13 @@ async function controlAction(input: {
 
 	if (action === "steer") return steerChild(ctx);
 	if (action === "abort") return abortChild(ctx);
-	if (action === "collect") return collectChild(ctx, input.signal, mailSeamOf(input.legion));
+	if (action === "collect")
+		return collectChild(
+			ctx,
+			input.signal,
+			mailSeamOf(input.legion),
+			artifactBytesLookup(input.legion),
+		);
 	if (action === "retire") return retireChild(ctx);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
 
@@ -3402,9 +3821,7 @@ export async function abortChild(
 /**
  * Wait for the child's current turn and derive its outcome from the session.
  *
- * Exported alongside `waitAction` for the index-layer unit tests: the claim the
- * runtime seam takes has to be handed back when this call bails (D2), and that
- * wiring is only observable from here.
+ * Exported alongside `waitAction` for the index-layer unit tests.
  */
 export async function collectChild(
 	ctx: ChildContext,
@@ -3416,7 +3833,29 @@ export async function collectChild(
 	 * byte (I1).
 	 */
 	mail?: MailReleaseSeam,
+	/**
+	 * P5c (`result-ledger-v1` §3 D8): this session's artifact-size lookup, so a truncated
+	 * (stripped) snapshot can say `4.0 KB of 24.5 KB` instead of only what it can see.
+	 * Absent = no legion identity → the render says `at least`.
+	 */
+	fullBytesOf?: ArtifactBytesLookup,
 ): Promise<AgentToolResult<unknown>> {
+	/**
+	 * P4a (`result-ledger-v1.md` §3 D3/D3b): the ONE way a snapshot becomes this tool's
+	 * answer, so "delivered ⇒ declared read" cannot drift from "rendered".
+	 *
+	 * Every `return` that hands the parent a terminal snapshot goes through here, and
+	 * every bail returns BEFORE it (`signal?.aborted` / the mail preempt that drops the
+	 * snapshot / the `persistChild` throw) — the bail needs no rollback API because it
+	 * never declared anything.
+	 *
+	 * The declaration is NOT the write: the id travels out in `details.ledgerReads` and is
+	 * settled by `settleControlResult`, because only THAT layer knows whether the text
+	 * actually reached the parent (the abort net can still replace this whole result).
+	 */
+	const deliver = (snapshot: CollectSnapshot): AgentToolResult<unknown> => {
+		return ok(renderCollect(ctx.name, snapshot, fullBytesOf), ledgerReadsDetails([snapshot.artifactId]));
+	};
 	let stopPolling: (() => void) | undefined;
 	// #384 review round 3: same hold as `wait` — this node's postman stays off its inbox
 	// for the whole collect (entry check, interruptible seam and orchestrator fallback
@@ -3456,58 +3895,40 @@ export async function collectChild(
 				? ctx.runtime.consumeCollectInterruptible(ctx.name, combined)
 				: ctx.runtime.consumeCollect(ctx.name);
 		if (pending) {
+			// P4c/D12: the seam returns the bare snapshot again — nothing was claimed, so
+			// nothing has to be handed back on a bail. Delivery is recorded where it
+			// happens (`deliver` above declares the read; the abort net decides whether that
+			// declaration survives), which is why an abort/persist bail simply returns
+			// before `deliver` and leaves the notice owed (D3: 宁多推一条，不静默丢).
 			const collected = await pending;
-			// D2: the seam claims a terminal snapshot on the way out, because a flush in
-			// that tick would otherwise repeat it. Every bail from here hands the result
-			// to NOBODY, so the claim is handed back — a permanently suppressed notice
-			// for a result the parent never saw is the worse failure of the two. The
-			// rollback is told `claimedNow`, the flag this very call got back: only a claim
-			// THIS call took comes back (#320/1), so a result an earlier delivery already
-			// claimed keeps its evidence, and the job branch restores the notification
-			// route with it (#320/2).
-			//
-			// #384: a mail preempt is the reason the seam answered `undefined`, and it is
-			// resolved AFTER the rollback above so #352's invariant holds either way: no
-			// notice may be left claimed-but-undelivered by a preemption.
+			// #384: a mail preempt is the reason the seam answered `undefined`.
 			const callerGone = signal?.aborted === true;
 			const mailWon =
 				mail !== undefined && combined?.reason === MAIL_PREEMPT_REASON && !callerGone;
 			// #384 review P1.1: mail ended the collect, but the ledger is empty — the
 			// postman claimed the row first. Answer with what this collect DID get
-			// (`renderCollect`, the claim it took is the delivery) instead of the frozen
-			// `interrupted …`, which would blame the parent turn for something that
-			// never happened.
+			// (`renderCollect`) instead of the frozen `interrupted …`, which would blame
+			// the parent turn for something that never happened.
 			if (mailWon) {
 				const released = takePendingMail(mail.db, mail.nodeId);
 				if (released.length > 0) {
-					if (collected) {
-						// The mail wins and the child's text is dropped: hand the claim back
-						// so that round's notice can still deliver it (#352).
-						ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
-					}
+					// The mail wins and the child's text is dropped: `deliver` is never
+					// reached, so no read is declared and the notice stays owed.
 					return mailPreemptedCollect(ctx.name, released);
 				}
-				if (collected) return ok(renderCollect(ctx.name, collected.snapshot));
+				if (collected) return deliver(collected);
 			}
 			if (!collected || signal?.aborted) {
-				if (collected) {
-					ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
-				}
 				return ok("interrupted (parent turn ended; children still running)");
 			}
-			try {
-				await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
-			} catch (error) {
-				// Same rule for the other bail: `renderCollect` is never reached, so the
-				// tool result will not carry this snapshot either.
-				ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
-				throw error;
-			}
-			return ok(renderCollect(ctx.name, collected.snapshot));
+			// The other bail: `renderCollect` is never reached, so the tool result will not
+			// carry this snapshot — the throw propagates and nothing was declared.
+			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
+			return deliver(collected);
 		}
 
 		const cached = ctx.orchestrator.cachedCollect(ctx.name);
-		if (cached) return ok(renderCollect(ctx.name, cached));
+		if (cached) return deliver(cached);
 
 		const agentDef = findControlAgent(
 			ctx.agents,
@@ -3535,7 +3956,7 @@ export async function collectChild(
 			// row first), but this collect DID get a snapshot — including the child's
 			// output so far. Answering with `interrupted …` would blame the parent turn
 			// for something that never happened, so the snapshot is what goes out.
-			return ok(renderCollect(ctx.name, collected));
+			return deliver(collected);
 		}
 		if (signal?.aborted || collected.execution.reason === "aborted by parent") {
 			return ok("interrupted (parent turn ended; children still running)");
@@ -3549,7 +3970,7 @@ export async function collectChild(
 		// Only release a job that IS the node just collected. Releasing by name alone
 		// would drop the tracking of a still-live same-named child in another run.
 		if (!foreignJob) ctx.runtime.release(ctx.name);
-		return ok(renderCollect(ctx.name, collected));
+		return deliver(collected);
 	} catch (error) {
 		return fail(`collect failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
 	} finally {
@@ -4032,6 +4453,10 @@ async function launchFamily(input: {
 		// here — same precedent as `timeoutByName`.
 		spawnByName: new Map(),
 		pidByName: new Map(),
+		// P5c (§3 D8): the same ledger the orchestrator writes artifacts into — one
+		// source for "how big was this text", so the inline (`async:false`) collect
+		// renders a stripped snapshot exactly like `collect`/`wait` do.
+		...(legion ? { fullBytesOf: artifactBytesLookup(legion) } : {}),
 		...(nameGate.name ? { launchName: nameGate.name } : {}),
 	};
 
@@ -4153,6 +4578,12 @@ interface LaunchSession {
 	pidByName: Map<string, number>;
 	/** Explicit child name for this single-step launch; omit to auto-allocate. */
 	launchName?: string;
+	/**
+	 * P5c (`result-ledger-v1` §3 D8): the artifact-size lookup the inline (`async:false`)
+	 * collect renders its truncated snapshots with. Absent = no legion identity → the
+	 * render says `at least`.
+	 */
+	fullBytesOf?: ArtifactBytesLookup;
 }
 
 /**
@@ -4481,7 +4912,7 @@ async function collectInline(session: LaunchSession, signal?: AbortSignal): Prom
 				session.results.push("interrupted (parent turn ended; children still running)");
 				return;
 			}
-			session.results.push(renderCollect(name, collected));
+			session.results.push(renderCollect(name, collected, session.fullBytesOf));
 			// #266 D8/A20: `async:false` must report the real wait, not just look slow.
 			// Read AFTER collect: `queueWaitedMs` is written at admission, so an item
 			// that is still waiting when the collect deadline fires has no line yet.
@@ -4897,7 +5328,7 @@ async function launchUtilityFamily(input: {
 				`execution: ${result.execution.status}${result.execution.reason ? ` (${result.execution.reason})` : ""}`,
 				result.output || "(no output)",
 			];
-			if (result.outputFile) lines.push(`outputFile: ${result.outputFile}`);
+			if (result.outputFile) lines.push(`full text: ${artifactReadCall(handle.name, result.artifactId)}`);
 			lines.push(`sessionFile: ${handle.sessionFile}`);
 			return lines.join("\n");
 		} catch (error) {
@@ -5724,7 +6155,7 @@ export function buildWaitTimeoutDetails(
 }
 
 /** Render one wait result, reusing the collect shape for finished children. */
-export function renderWait(results: WaitResult[]): string {
+export function renderWait(results: WaitResult[], fullBytesOf?: ArtifactBytesLookup): string {
 	let done = 0;
 	let running = 0;
 	let interrupted = 0;
@@ -5732,7 +6163,7 @@ export function renderWait(results: WaitResult[]): string {
 	for (const result of results) {
 		if (result.snapshot) {
 			done += 1;
-			parts.push(renderCollect(result.name, result.snapshot));
+			parts.push(renderCollect(result.name, result.snapshot, fullBytesOf));
 		} else if (result.stillRunning) {
 			running += 1;
 			const elapsed =
@@ -6100,87 +6531,60 @@ export async function stopAction(input: {
 }
 
 /**
- * #352: one completion claim a `wait` took for a result the parent never saw.
- *
- * `waitAction` claims a settled child's result on its finished-cache probe
- * (`runtime.consumeCollect`, `index.ts` — the probe is NOT side-effect free since
- * notice-claim-v1), and the tool layer in this file can still throw the rendered
- * result away when the parent turn ends. Only a claim THIS call took travels here
- * (`claimedNow === true`): a key an earlier real delivery claimed is evidence, not
- * something a bail may spend (#320/1).
- */
-export interface WaitClaim {
-	name: string;
-	snapshot: CollectSnapshot;
-}
-
-/**
- * #352: hand back every claim a discarded `wait` result owed.
- *
- * `unclaimUndelivered`, never `unclaimReported`: nothing reached the parent, so the
- * queued notice is the ONLY remaining route — the rollback gives the claim back and
- * drops no copy (D2/D7). `claimedNow` is always `true` here: `WaitClaim`s only exist
- * for claims this call took.
- *
- * #352 review (major 1): the claim arrives ASYNCHRONOUSLY. `waitAction`'s
- * finished-cache probe is a promise (`consumeCollect` → `ensureCollect`), and the wait
- * can bail long before it answers — `signal?.aborted`, `WAIT_INTERRUPTED` and
- * `WaitTimeoutError` all win their race inside `waitOne` while that collect is still in
- * flight. The probe then resolves to a terminal snapshot and claims `(runId, name,
- * round)` AFTER the details object was already built, so the bail has to wait for that
- * answer before it rolls anything back: `details.waitClaims` is a live array (shared by
- * reference with `waitAction`), and `details.waitClaimsPending` is the promise that
- * resolves once the probe has folded its claim in. Awaited first, both windows are
- * covered: the claim that was already there, and the one that landed late.
- *
- * The await is bounded by the probe's own collect, which is what makes the claim
- * knowable at all; returning now and rolling back from a detached continuation would
- * hand the claim back after the frozen `interrupted …` line already went out.
- */
-export async function releaseWaitClaims(runtime: SessionRuntime, details: unknown): Promise<void> {
-	if (details === null || typeof details !== "object") return;
-	const record = details as { waitClaims?: unknown; waitClaimsPending?: unknown };
-	const pending = record.waitClaimsPending;
-	if (pending !== undefined) {
-		try {
-			await (pending as Promise<unknown>);
-		} catch {
-			// A throwing probe took no claim — nothing to give back.
-		}
-	}
-	const claims = record.waitClaims;
-	if (!Array.isArray(claims)) return;
-	for (const claim of claims as WaitClaim[]) {
-		runtime.unclaimUndelivered(claim.name, claim.snapshot, true);
-	}
-}
-
-/**
  * What a control call answers when the caller's abort lands after it returned
- * (#352 + #384 review P0-3).
+ * (#384 review P0-3).
  *
- * #352: the frozen head line REPLACES the rendered result, so the parent never sees
- * it — and `wait` CLAIMS a settled child's completion on its finished-cache probe.
- * The result is thrown away here, so the claim has to go back (exactly what
- * `collectChild` owes on its own bails): a claim nobody delivered suppresses that
- * round's notice forever.
+ * P4c deleted #352's claim rollback with the claim model: the handlers no longer take
+ * anything the abort net could owe back. A replaced result simply never declared its
+ * `ledgerReads` (D3b), so nothing was marked read and the notice stays owed — the same
+ * guarantee the rollback bought, without an API to undo.
  *
- * #384 review P0-3: a MAIL result is thrown away the same way, but a claim is not
- * the only thing it held — the mails inside it were already `PENDING → ACCEPTED`, and
- * `takePendingMail` has no way back. Left alone, the text would be lost for good
- * (before #384 the message was still `PENDING` and a restart would have delivered
- * it). So the discarded result's mail is re-enqueued as fresh `PENDING` rows
- * (`Redelivered: ` subject, same sender/recipient/body) and the postman's next tick
+ * #384 review P0-3: a MAIL result is thrown away here, and the mails inside it were
+ * already `PENDING → ACCEPTED` — `takePendingMail` has no way back. Left alone, the text
+ * would be lost for good (before #384 the message was still `PENDING` and a restart would
+ * have delivered it). So the discarded result's mail is re-enqueued as fresh `PENDING`
+ * rows (`Redelivered: ` subject, same sender/recipient/body) and the postman's next tick
  * delivers it like any other mail.
  */
 export async function interruptedControlResult(input: {
 	result: AgentToolResult<unknown>;
-	runtime: SessionRuntime;
 	legion?: OrchestratorLegionContext;
 }): Promise<AgentToolResult<unknown>> {
-	await releaseWaitClaims(input.runtime, input.result.details);
 	redeliverPreemptedMail(input.legion, input.result.details);
 	return ok("interrupted (parent turn ended; children still running)");
+}
+
+/**
+ * The LAST decision point before a control tool's result reaches the parent
+ * (`result-ledger-v1.md` §3 D3b) — and therefore the only place the read-side ledger
+ * write may happen.
+ *
+ * P4a first put `markRead` inside the handlers, which was wrong by one layer: the abort
+ * net below is not a handler bail. `interruptedControlResult` replaces the ENTIRE result
+ * with the frozen `interrupted …` line when the caller's turn ended, so a read already
+ * recorded there would make `undelivered` (D4) drop the notice for text the parent never
+ * saw — the silent loss this whole refactor exists to remove, in its most dangerous
+ * direction. D3b's ruling: the handlers only DECLARE (`details.ledgerReads`), this
+ * function decides.
+ *
+ * `aborted` is the caller's verdict (`signal?.aborted`, with the pre-existing `stop`
+ * exemption applied by the caller). A replaced result keeps nothing:
+ * `interruptedControlResult` re-queues the mail it carried, and the artifact ids go with
+ * the text — no row was ever written, so nothing can suppress a notice.
+ */
+export async function settleControlResult(input: {
+	result: AgentToolResult<unknown>;
+	legion?: OrchestratorLegionContext;
+	aborted: boolean;
+}): Promise<AgentToolResult<unknown>> {
+	if (input.aborted) {
+		return interruptedControlResult({
+			result: input.result,
+			...(input.legion ? { legion: input.legion } : {}),
+		});
+	}
+	markLedgerReads(ledgerReadSeamOf(input.legion), input.result.details);
+	return input.result;
 }
 
 /** Re-enqueue the mail a discarded (`state: "mail"`) result was carrying. */
@@ -6211,39 +6615,12 @@ function redeliverPreemptedMail(
 const MAIL_PREEMPT_REASON = Symbol("legion mail preempted the blocking call");
 
 /**
- * Mount the #352 claim record on a wait result's `details` (both fields, always).
- *
- * #352 review (major 1): mount BOTH unconditionally. Deciding on `claims.length` was
- * a no-op: one probe means at most one claim, and the probe has usually not answered
- * yet at this point — so the length test mounted nothing in the window that matters,
- * and when it did mount it shared a reference with a caller that could reach it anyway.
- * The array stays live (late pushes land in the same object) and the promise says
- * when the probe got its answer.
- */
-function withWaitClaims(
-	details: Record<string, unknown>,
-	claims: WaitClaim[],
-	pending?: Promise<WaitClaim[]>,
-): Record<string, unknown> {
-	details.waitClaims = claims;
-	if (pending) {
-		// Non-enumerable: this is a live promise, and `details` is the tool result's
-		// record — a promise has no business in a serialized transcript.
-		Object.defineProperty(details, "waitClaimsPending", {
-			value: pending,
-			enumerable: false,
-			configurable: true,
-		});
-	}
-	return details;
-}
-
-/**
  * Contract §2: the mail that ended the blocking call, as a NORMAL tool result.
  *
  * Not an error and not `interrupted …` — the model reads the mail and carries on.
- * The `details` shape is the one the contract froze: `state`, `mailIds`, `targets`,
- * plus the wait's claim record when the caller has one (a `collect` takes no claim).
+ * The `details` shape is the one the contract froze: `state`, `mailIds`, `targets`.
+ * (P4c removed the #352 claim record that used to ride along: the seam takes nothing
+ * to hand back any more, and the read side is declared by the handlers themselves.)
  *
  * `sections` are the parts of the blocking call that DID happen, in order: the mail
  * itself first (that is what ended the call), then whatever the call had already
@@ -6253,8 +6630,6 @@ function mailPreemptedResult(input: {
 	released: readonly LegionMessage[];
 	targets: readonly string[];
 	sections: readonly string[];
-	claims?: WaitClaim[];
-	pending?: Promise<WaitClaim[]>;
 }): AgentToolResult<unknown> {
 	return {
 		content: [
@@ -6263,15 +6638,11 @@ function mailPreemptedResult(input: {
 				text: [renderReleasedMail(input.released), ...input.sections].join("\n\n"),
 			},
 		],
-		details: withWaitClaims(
-			{
-				state: "mail",
-				mailIds: input.released.map((message) => message.id),
-				targets: [...input.targets],
-			},
-			input.claims ?? [],
-			input.pending,
-		),
+		details: {
+			state: "mail",
+			mailIds: input.released.map((message) => message.id),
+			targets: [...input.targets],
+		},
 	};
 }
 
@@ -6293,17 +6664,17 @@ function mailPreemptedWait(input: {
 	delivered: readonly WaitResult[];
 	/** Names this wait had not finished when the mail landed. */
 	running: readonly string[];
-	claims: WaitClaim[];
-	pending?: Promise<WaitClaim[]>;
+	/** P5c: the artifact-size lookup the delivered snapshots render with (§3 D8). */
+	fullBytesOf?: ArtifactBytesLookup;
 }): AgentToolResult<unknown> {
-	const sections = input.delivered.map((result) => renderCollect(result.name, result.snapshot!));
+	const sections = input.delivered.map((result) =>
+		renderCollect(result.name, result.snapshot!, input.fullBytesOf),
+	);
 	if (input.running.length > 0) sections.push(`Still running: ${input.running.join(", ")}`);
 	return mailPreemptedResult({
 		released: input.released,
 		targets: input.names,
 		sections,
-		claims: input.claims,
-		...(input.pending ? { pending: input.pending } : {}),
 	});
 }
 
@@ -6336,28 +6707,23 @@ export async function waitAction(input: {
 	 * abort controller — today's behaviour byte for byte (I1).
 	 */
 	mail?: MailReleaseSeam;
+	/**
+	 * P5c (`result-ledger-v1` §3 D8): this session's artifact-size lookup, so that a
+	 * truncated (stripped) snapshot renders as `4.0 KB of 24.5 KB` instead of only what
+	 * the model can see. Absent = no legion identity → the render says `at least`.
+	 */
+	fullBytesOf?: ArtifactBytesLookup;
 }): Promise<AgentToolResult<unknown>> {
-	const { params, signal, runtime, agents, allAgents = agents, store, cwd } = input;
+	const { params, signal, runtime, agents, allAgents = agents, store, cwd, fullBytesOf } = input;
 	const jobs = runtime.activeJobs();
-	// #352: every claim THIS call takes. The array is shared by REFERENCE with the
-	// returned `details.waitClaims`, because the probe below answers asynchronously:
-	// a claim that lands after the details object was built must still be visible to
-	// a caller that discards the rendered result.
-	const claims: WaitClaim[] = [];
-	// #352 review (major 1): the probe's answer, absent when this wait has no probe at
-	// all (live targets). It resolves to `claims` once the probe's own claim — if any —
-	// has been folded in, and travels out as `details.waitClaimsPending` so a bail that
-	// lands while it is still in flight can wait for it instead of rolling back nothing.
-	let claimsPending: Promise<WaitClaim[]> | undefined;
 	let targets = resolveWaitTargets(
 		{ name: params.name, all: params.all },
 		jobs,
 	);
 	const mail = input.mail;
-	// #384: look in the inbox ONCE here — before the finished-cache probe below can
-	// take a #352 claim, so the preempted path is provably claim-free. `signal?.aborted`
-	// at entry means the caller is already gone: I5 keeps that path exactly as it was,
-	// mail or no mail.
+	// #384: look in the inbox ONCE here, before the finished-cache probe below can start
+	// a collect nobody reads. `signal?.aborted` at entry means the caller is already
+	// gone: I5 keeps that path exactly as it was, mail or no mail.
 	//
 	// Review P1.2: only a wait that HAS somewhere to wait is preempted. `unknown child`
 	// and the parameter/liveness errors keep precedence — mail is not an answer to a
@@ -6371,30 +6737,22 @@ export async function waitAction(input: {
 				names: targets.names,
 				delivered: [],
 				running: targets.names,
-				claims,
+				...(fullBytesOf ? { fullBytesOf } : {}),
 			});
 		}
 	}
 	if (!targets.ok) {
 		// A name that is merely finished (not live) is still waitable via the
-		// runtime's finished cache — probe it with consumeCollect. NOTE: since
-		// notice-claim-v1 that probe is NOT side-effect free: a cache hit claims the
-		// result, which is correct here — the wait below returns the same result to the
-		// parent, so the pushed notice for it is suppressed instead of duplicating it.
-		// It is also why the claim travels back out (#352): if the caller never hands
-		// the result over, nobody else can, and the claim must be given back.
+		// runtime's finished cache: `consumeCollect` answers with the cached snapshot.
+		// P4c: the probe is a plain read again — it takes nothing, so nothing has to be
+		// handed back if this call is discarded; the wait below returns the same result
+		// to the parent and THAT is what declares the read.
 		if (params.name && !params.all) {
 			const probe = runtime.consumeCollect(params.name);
 			if (probe) {
-				const name = params.name;
-				claimsPending = probe.then((claimed: ClaimedCollect) => {
-					// #320/1: only a claim THIS call took may come back later.
-					if (claimed.claimedNow) claims.push({ name, snapshot: claimed.snapshot });
-					return claims;
-				}, () => {
-					// A throwing collect is the `wait` below's problem, not the probe's.
-					return claims;
-				});
+				// A throwing collect is the `wait` below's problem, not the probe's: park a
+				// no-op handler so the failure surfaces exactly once, through the wait.
+				void probe.catch(() => undefined);
 				targets = { ok: true, names: [params.name] };
 			} else {
 				return unknownChild(params.name, store, cwd);
@@ -6450,8 +6808,7 @@ export async function waitAction(input: {
 	// invention: they made a wait that received mail answer as if the wait had simply
 	// timed out, with `interrupted (parent turn ended…)` naming a turn that never
 	// ended. What the wait DID collect rides along in the body instead (delivered
-	// results verbatim), and `details.waitClaims` is still mounted, so a claim this
-	// call took is never dropped on the floor.
+	// results verbatim).
 	//
 	// Whoever aborted FIRST still wins (contract §4): a caller abort keeps the frozen
 	// `interrupted …` rendering even when mail landed a tick later (I5).
@@ -6472,21 +6829,27 @@ export async function waitAction(input: {
 					.filter((result) => result.snapshot === undefined)
 					.filter((result) => result.interrupted === true || result.stillRunning === true)
 					.map((result) => result.name),
-				claims,
-				...(claimsPending ? { pending: claimsPending } : {}),
+				...(fullBytesOf ? { fullBytesOf } : {}),
 			});
 		}
 	}
-	const text = renderWait(results);
+	// P4a (§3 D3/D3b): every terminal snapshot this wait is about to hand over —
+	// `renderWait` renders each of them verbatim — DECLARES its artifact read here; the
+	// write itself happens in `settleControlResult`, after the tool layer has decided the
+	// text really goes out.
+	//
+	// This includes the finished-cache probe path: the snapshot the parent actually reads
+	// is the one in `results`. It excludes the two answers that carry no delivery — the
+	// `interrupted …` entries (they have no snapshot at all) and the mail preempt above,
+	// which is a cut-short call whose answer the tool layer's abort net may still discard
+	// in full.
+	const ledgerReads = ledgerReadsDetails(results.map((result) => result.snapshot?.artifactId));
+	const text = renderWait(results, fullBytesOf);
 	const timeoutDetails = buildWaitTimeoutDetails(results);
-	// #352: `details.waitClaims` is the only record of what this call took — the tool
-	// layer's abort net replaces the rendered result with the frozen `interrupted …`
-	// line, and without this the claim it leaves behind suppresses that round's notice
-	// forever (see `withWaitClaims`).
-	const details: Record<string, unknown> = timeoutDetails ? { ...timeoutDetails } : {};
+	const details: Record<string, unknown> = { ...(timeoutDetails ?? {}), ...ledgerReads };
 	return {
 		content: [{ type: "text", text }],
-		details: withWaitClaims(details, claims, claimsPending),
+		details,
 	};
 }
 
@@ -6616,6 +6979,16 @@ function renderCollect(
 		execution: { status: string; reason?: string };
 		output: string;
 		outputFile?: string;
+		/**
+		 * P5c (`result-ledger-v1` §3 D8, v1.12): the text above is a cached HEAD of a longer
+		 * result — the finished cache's strip (`finished-cache-eviction-v1` R5), whose
+		 * rehydrate failed. This field is the only thing that makes this render say so
+		 * instead of letting the model believe it read the whole thing (W7). Absent on every
+		 * complete result, including a cache hit that re-read the file.
+		 */
+		outputTruncated?: true;
+		/** §3 D1: the artifact this text came from, when a ledger row names one. */
+		artifactId?: string;
 		acceptance: {
 			status: string;
 			level?: string;
@@ -6628,6 +7001,12 @@ function renderCollect(
 		};
 		blocked?: boolean;
 	},
+	/**
+	 * P5c: full byte count of the artifact above, when the caller has a ledger (see
+	 * {@link ArtifactBytesLookup}). Missing = the render knows only what it can see and
+	 * says `at least`.
+	 */
+	fullBytesOf?: ArtifactBytesLookup,
 ): string {
 	const lines = [
 		`── ${name} ──`,
@@ -6660,11 +7039,48 @@ function renderCollect(
 	}
 
 	lines.push(collected.output || "(no output)");
-	if (collected.outputFile)
-		lines.push(
-			`full output: ${collected.outputFile} (read this file when the output above is truncated)`,
-		);
+	// P5c (§3 D8): a stripped snapshot is a HEAD, and saying so is the whole point of
+	// keeping the strip. Only the truncated case gets the sentence — an unconditional
+	// "this may be a summary" made every complete result look suspect.
+	if (collected.outputTruncated)
+		lines.push(cachedHeadLine(name, collected, fullBytesOf));
+	// P5d (user ruling 2026-11-11): the artifact is still a file, but its path is never
+	// an address the model is handed — the line names the READER instead. `name` is the
+	// caller's own name for the child and `round` comes out of the snapshot's artifact id
+	// (§3 D1); with no parseable id the roundless call resolves the newest round.
+	if (collected.outputFile) lines.push(`full text: ${artifactReadCall(name, collected.artifactId)}`);
 	return lines.join("\n");
+}
+
+/**
+ * P5c (`result-ledger-v1` §3 D8, v1.12, W7): the one honest sentence a stripped snapshot
+ * gets.
+ *
+ *   this is the cached head (4.0 KB of 24.5 KB); full text: legion_output({ name: "x" })
+ *   this is the cached head (at least 4.0 KB); full text: legion_output({ name: "x" })
+ *
+ * The first shape needs the artifact's ledger row (§3 D8: `<bytes>` comes from there).
+ * Without one the second shape is the honest answer — the head the model holds is a
+ * floor, so the text says `at least` rather than pretending to know the total. A row
+ * that is somehow SMALLER than the head (a tampered file, a reused id) is treated the
+ * same way: never print `4.0 KB of 3.1 KB`.
+ *
+ * `legion_output` is the recovery D7 exists for (`{ name }` resolves the latest round);
+ * the caller's own `full text: legion_output({ name: <name>, round: <round> })` line
+ * follows, so this sentence and that line name the same reader (P5d: never a path).
+ */
+function cachedHeadLine(
+	name: string,
+	collected: { output: string; artifactId?: string },
+	fullBytesOf: ArtifactBytesLookup | undefined,
+): string {
+	const headBytes = Buffer.byteLength(collected.output, "utf8");
+	const total = collected.artifactId ? fullBytesOf?.(collected.artifactId) : undefined;
+	const size =
+		total !== undefined && total > headBytes
+			? `${formatSize(headBytes)} of ${formatSize(total)}`
+			: `at least ${formatSize(headBytes)}`;
+	return `this is the cached head (${size}); full text: legion_output({ name: ${JSON.stringify(name)} })`;
 }
 
 /**

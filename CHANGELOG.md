@@ -11,6 +11,25 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Added
+
+- `legion.db` schema **v3**（`LEGION_DB_USER_VERSION` 2 → 3，迁移幂等、旧四表零列变更）：`artifacts`（不可变结果的台账）+ `consumptions`（每个 consumer 的两维事实：`read_bytes` 高水位 / `notified_at` 只写一次）。`rebuild` 可从磁盘恢复 `artifacts`，`consumptions` 一律重置（只会多推、不会少推）。
+- 子 agent 输出改存 `<runDir>/artifacts/<name>/r<round>.md`（原子写、按轮次寻址，同名多轮不再互相覆盖），由 `src/runs/artifacts.ts` 统一负责路径/轮次/内容幂等。
+- `legion_db` 的 statement cache 上限 64 → 128（v3 把 distinct SQL 文本推到 69，旧上限已无 headroom）。
+- **`legion_output({ name, round?, offset?, limit? })` 工具**（`result-ledger-v1` D7 / P5b）：在插件层注册（root 与 child 都有，utility child 除外），按 `(name, round)` 解析 artifact id，header 带 `round · bytes · settled · phase`；分页读显式写 `partial i/N lines · notifications not suppressed — read to EOF to settle`（D6：读到 EOF 才抑制通知），文件与 ledger 的 `bytes` 不符时打 `changed-on-disk` 且不推进 full。
+- **通用 `read` 命中 artifact 全文也计消费**（D5 / P5a）：`tool_result` 把 `<runDir>/artifacts/**/r*.md` 的路径反查成 artifact——无 `offset`/`limit`、未被工具截断、磁盘大小等于 ledger 的 `bytes` 时记 `read_bytes = bytes`；分页读不落账。root 因此不需要任何工具注册例外。
+
+### Changed
+
+- **“读过就不再提”从进程内 claim 集合改成账本投影**（`docs/contracts/result-ledger-v1.md`）：投递判据统一为 `owesDelivery`（投影 + 最小兜底集），账本不认识的 artifact id **fail-open** 投递（宁多推，不静默丢）。`collect`/`wait` 在 abort net **之后**才落 read 账（结果被 `interrupted …` 替换时一笔不记）。
+- **“你看到的是摘要”说出口**（D8 v1.12 改判 / D9，P5c）：finished 缓存的 strip 保留（内存护栏），改为**如实标注**——`collect`/`wait`/内联 collect 对被 strip 的快照追加 `this is the cached head (4.0 KB of 24.5 KB); full text: legion_output({ name: "…" })`（无 ledger 行时写 `at least`，绝不编造总数），不再带那句无条件的「输出被截断时读这个文件」；通知正文与 TUI 折叠行以 `preview 4.0 KB of 24.5 KB` 标注预览（不再让预览字节数冒充结果大小），`details` 增 `artifactIds`。
+- **artifact 的路径不再交给 agent**（P6）：`collect`/`wait`/vexillatio 批量/两种通知形状一律改印 `full text: legion_output({ name, round })`；`tool_call` 对 `read`/`write`/`edit` 落在 `<runDir>/artifacts/` 下的调用直接 `block` 并指路（`path.resolve` + `path.relative` 判包含，非字符串前缀；任何无法判定的形状 fail-open，普通文件不受影响）。写 artifact 被拒的理由与不可变性同源（A1）。文件和 `rebuild` 都不受影响；P5a 的通用 `read` hook 退居兜底（`bash cat` 这类路子仍然记账）。
+
+### Removed
+
+- `reported` set、`claimReported` / `claimCachedResult` / `claimIfTerminal` / `unclaimReported` / `unclaimUndelivered`、`snapshotOrigins` 的 claim 用途、`TrackedJob.consumedByTool` / `notified` 与 watch 闸门、`join.dropBuffered*`、`P3` 的 shadow 模块（共 -2.9k 行）。`consumeCollect*` 回退成返回裸 `CollectSnapshot`（**对外 API 破坏**，无兼容层）。
+- 契约 `notice-claim-v1.md` 归档到 `docs/contracts/archive/`（HISTORICAL），语义由 `result-ledger-v1.md` 取代；`notice-delivery-v2.md` 的 D1-D6 仍有效。
+
 ### Fixed
 
 - **`tok/s` 的分母换成实测 decode 时长（首 delta → 末 delta），不再用含 prefill 的
@@ -34,6 +53,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   信任下限按轴分开（decode 200ms / generation 1s），单条短消息不再被旧门禁整条吞掉。
 - 图表 x 轴冻结判定（#346）与 flat-run 折叠把 decode 采样一并纳入，避免「只有 decode
   前进」的真实进展被当成静态而被跳过。
+
 
 ## [5.6.0] — 2026-11-09
 

@@ -98,6 +98,14 @@ function indexHarness() {
 	const tool = tools.get("subagent");
 	assert.ok(tool);
 	const store = new RunStore({ rootDir: path.join(cwd, ".pi-subagents") });
+	// A tool call always runs INSIDE a parent run (`agent_start` … `agent_settled`), and
+	// the notice runtime holds a completion until that boundary (`notice-delivery-v2` D1).
+	// Model that shape: without the signal a completion is sent immediately — including
+	// one that lands inside a `collect` — and a control call would then be charged for a
+	// *notice's* work (a delivered notice asks the renewal hook, which reads run.json).
+	// That is not what the #344 cases below measure; the collect path itself is.
+	const hostCtx = { cwd, hasUI: false, ui: { notify() {}, setStatus() {} } };
+	handlers.get("agent_start")?.({}, hostCtx);
 	return {
 		cwd,
 		store,
@@ -132,6 +140,7 @@ function indexHarness() {
 			return { runId, record };
 		},
 		async cleanup() {
+			handlers.get("agent_settled")?.({}, hostCtx);
 			await handlers.get("session_shutdown")?.();
 			for (const [name, value] of previous) {
 				if (value === undefined) delete process.env[name];

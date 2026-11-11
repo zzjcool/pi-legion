@@ -23,6 +23,8 @@ import { obsoleteStaleStallNotices } from "../legion/mail-release.ts";
 import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
+import { recordArtifact } from "../legion/ledger.ts";
+import { artifactContentMatches, artifactNameSegment, artifactPathFor, nextArtifactRound, readLatestArtifact, writeArtifactAtomic } from "./artifacts.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { evaluatePhaseTransition, isTerminalPhase } from "../legion/state-machine.ts";
 import { phaseStart, type PhaseMachine } from "../legion/phase-machine.ts";
@@ -295,6 +297,22 @@ export interface CollectResult {
 	execution: Execution;
 	output: string;
 	outputFile?: string;
+	/**
+	 * Result-ledger identity of the body this collect wrote —
+	 * `"<runId>/<name segment>/r<round>"`, the id `recordArtifact` persisted
+	 * (`docs/contracts/result-ledger-v1.md` §3 D1).
+	 *
+	 * Present exactly when a ledger ROW exists: a running snapshot wrote nothing,
+	 * an empty output is not an artifact (D1c), a failed write degrades to
+	 * `undefined` (D1e), and a host with no legion context records no row — in all
+	 * of those cases there is no artifact to point at, and an id without a row
+	 * would make the P3 shadow compare against a projection that can never
+	 * contain it.
+	 *
+	 * Not persisted in `run.json` on its own: {@link ChildRecord.artifactId} is
+	 * the persisted copy a later process's `cachedCollect` reads back.
+	 */
+	artifactId?: string;
 	usage: Usage | null;
 	model: string | null;
 	acceptance: AcceptanceResult;
@@ -2627,8 +2645,8 @@ export class Orchestrator {
 		// child. Placed after every outcome rewrite in `classifyOutcome` (so an abort
 		// cascade or a deadline snapshot is never retried) and before
 		// `finishCollect` (which is the single place that settles the ledger, writes
-		// `.output.md` and records the child), so a retried turn is reported exactly
-		// once. The retry's own turn goes back through the SAME ladder.
+		// the result artifact and records the child), so a retried turn is reported
+		// exactly once. The retry's own turn goes back through the SAME ladder.
 		const retry = await this.retryEmptyGeneration(child, classified.execution, deadline, opts.signal);
 		if (retry.kind === "aborted") return abortedSnapshot();
 		if (retry.kind === "blocked") return this.blockedResult(child);
@@ -3004,31 +3022,144 @@ export class Orchestrator {
 		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
 		// A stop can land between the snapshot and here. The lifecycle state must not
 		// be revived (above), but the terminal text still belongs on disk: this collect
-		// is the only writer of the artifact, so returning early here dropped the
-		// child's last answer whenever an explicit stop won the race.
+		// is the only writer of the child's artifact, so returning early here dropped
+		// the child's last answer whenever an explicit stop won the race.
 		let outputFile: string | undefined;
-		if (execution.status === "running") child.outputFile = undefined;
-		else {
-			outputFile = this.writeOutputFile(child, output);
+		let artifactId: string | undefined;
+		if (execution.status === "running") {
+			// Neither half of the pointer may survive a running snapshot: the file and
+			// the ledger row it names belong to the PREVIOUS terminal round, and a
+			// reader that picked up the stale id would mark THIS round's result read.
+			child.outputFile = undefined;
+			child.artifactId = undefined;
+		} else {
+			const written = this.writeOutputFile(child, output);
+			outputFile = written?.file;
+			artifactId = written?.artifactId;
 			child.outputFile = outputFile;
+			child.artifactId = artifactId;
 		}
 		if (!isRetired()) this.onChildUpdate(child);
-		return { execution, output, ...(outputFile ? { outputFile } : {}), usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance };
+		return {
+			execution,
+			output,
+			...(outputFile ? { outputFile } : {}),
+			...(artifactId ? { artifactId } : {}),
+			usage: parsed.usage,
+			model: parsed.model ?? child.model ?? null,
+			acceptance,
+		};
 	}
 
-	private outputFileFor(name: string): string { return path.join(this.runDir, `${name}.output.md`); }
+	/**
+	 * `<runId>` for the artifact id.
+	 *
+	 * The same expression `recordLegionLaunch` persists as the child's `runId`, so
+	 * the id written here and the id `rebuild` derives from `run.json` + the
+	 * `artifacts/<name>/r<round>.md` path agree (convergence is pinned by
+	 * `test/unit/artifacts.test.ts`).
+	 */
+	private artifactRunId(): string { return this.legion?.runId ?? path.basename(this.runDir); }
 
-	private writeOutputFile(child: ChildRecord, output: string): string | undefined {
-		const file = this.outputFileFor(child.name);
+	/**
+	 * Persist this collect's terminal output as one immutable artifact.
+	 *
+	 * Contract `result-ledger-v1.md` §3 — this method is the only writer, so every
+	 * write rule lives here:
+	 *
+	 * - **D1** identity carries the round: `artifacts/<name>/r<round>.md` replaces
+	 *   the old one-file-per-name `<name>.output.md`, whose second write used to
+	 *   erase an unread first result (W6).
+	 * - **D1c** an empty output writes nothing and **deletes** nothing: the old
+	 *   `fs.rmSync(<name>.output.md)` pointed at the PREVIOUS turn's file, so with
+	 *   the round in the path there is no such file to clean up, and a historical
+	 *   artifact is immutable notice material.
+	 * - **D1b** identical bytes add no round: concurrent collects of one child and
+	 *   resumes that produced no new text reuse the artifact that already holds
+	 *   exactly these bytes.
+	 * - **D1e** nothing here may change `collect`'s return contract: a missing
+	 *   legion context / node id, an unusable name or a disk error degrade to
+	 *   `undefined`, never to a thrown collect.
+	 *
+	 * Returns BOTH halves of the pointer the result carries: `file` (the body) and,
+	 * when a ledger row was actually recorded, `artifactId`. The two are not
+	 * independent — a collect that wrote no row has no artifact identity to hand
+	 * out, and an id pointing at a row that does not exist would be a projection
+	 * key nothing can ever match (see {@link recordArtifactRow}).
+	 */
+	private writeOutputFile(
+		child: ChildRecord,
+		output: string,
+	): { file: string; artifactId?: string } | undefined {
 		const trimmed = output.trim();
-		if (!trimmed) {
-			try { fs.rmSync(file, { force: true }); } catch { /* stale output is best-effort cleanup */ }
-			return undefined;
-		}
+		// D1c: no file, no ledger row, no deletion of history.
+		if (!trimmed) return undefined;
+		// The body keeps its trailing newline (trim, then one `\n`), so every reader
+		// — including `runtime.ts`'s rehydrate — reads back what `output` says.
+		const body = `${trimmed}\n`;
 		try {
-			fs.writeFileSync(file, `${trimmed}\n`, { mode: 0o600 });
-			return file;
+			const scope = { runDir: this.runDir, name: child.name, runId: this.artifactRunId(), ...(this.legion ? { db: this.legion.db } : {}) };
+			const latest = readLatestArtifact(scope);
+			if (latest && artifactContentMatches(latest, body)) {
+				// D1b: the bytes are the SAME fact, so the newest artifact already IS this
+				// result. Its id is the one the FIRST write recorded — not re-recorded here
+				// (A1b: the row is immutable, and rewriting it would only risk shrinking
+				// `bytes`), nor a fresh round, which would name a file no write produces.
+				return { file: latest.path, artifactId: this.artifactIdFor(child, latest.round) };
+			}
+			const round = nextArtifactRound(scope);
+			const file = artifactPathFor(this.runDir, child.name, round);
+			const bytes = writeArtifactAtomic(file, body);
+			const artifactId = this.recordArtifactRow(child, file, round, bytes);
+			return { file, ...(artifactId === undefined ? {} : { artifactId }) };
 		} catch { return undefined; }
+	}
+
+	/**
+	 * Best-effort ledger row for an artifact that is already on disk (D1e, A1b).
+	 *
+	 * `parent_id` is the CONSUMER — the node this orchestrator runs for, i.e. the
+	 * same id `reserveNode` persists as the child's `parent_id` — and `node_id` is
+	 * the producing child. `bytes` is the written byte count, which equals
+	 * `stat.size`, the number `rebuild` will derive (§3 D10).
+	 *
+	 * The id uses the SANITIZED name segment, exactly like the path and like the
+	 * `rebuild` that can only read the directory name (D1d v1.5); the `name` column
+	 * keeps the raw name, so display and lookup by name stay exact.
+	 *
+	 * Returns the id it recorded, or `undefined` when no row was written (no legion
+	 * context / no node id / a failed insert). The caller only hands out an
+	 * `artifactId` for a row that exists — a shadow or a `markRead` keyed on an
+	 * unrecorded id would be a fact about nothing.
+	 */
+	private recordArtifactRow(child: ChildRecord, file: string, round: number, bytes: number): string | undefined {
+		const legion = this.legion;
+		const nodeId = child.nodeId;
+		if (!legion || !nodeId) return undefined;
+		const id = this.artifactIdFor(child, round);
+		try {
+			recordArtifact(legion.db, {
+				id,
+				parentId: legion.nodeId,
+				nodeId,
+				name: child.name,
+				round,
+				path: path.resolve(file),
+				bytes,
+				createdAt: this.now(),
+			});
+			return id;
+		} catch { return undefined; /* the body is the artifact; a missing row can cost a notice, never the output */ }
+	}
+
+	/**
+	 * `"<runId>/<name segment>/r<round>"` — the id the artifact store writes.
+	 *
+	 * One spelling for the writer and the reused (D1b) branch, so the identity a
+	 * result carries cannot disagree with the row's primary key.
+	 */
+	private artifactIdFor(child: ChildRecord, round: number): string {
+		return `${this.artifactRunId()}/${artifactNameSegment(child.name)}/r${round}`;
 	}
 
 	/**
@@ -3093,6 +3224,11 @@ export class Orchestrator {
 			...(child.state === "blocked" ? { blocked: true } : {}),
 		};
 		if (child.outputFile) cached.outputFile = child.outputFile;
+		// The second pointer the result carries (P5 will `markRead` on it from a
+		// later process's `collect`): restored from the child record, never
+		// re-derived, so a cached collect cannot hand out an EARLIER round's
+		// artifact id as this turn's.
+		if (child.artifactId) cached.artifactId = child.artifactId;
 		return cached;
 	}
 

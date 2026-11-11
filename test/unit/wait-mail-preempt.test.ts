@@ -12,8 +12,8 @@
  *   - §2/I2 — `wait` with a live child returns the mail within a second, the mail
  *     envelope is the postman's own (`formatMail`), `details.state === "mail"`, the
  *     ledger says ACCEPTED, and a postman tick afterwards injects NOTHING;
- *   - §2/I4 — the same for `collect`, plus the child is untouched: still tracked,
- *     still `working`, and its notice route (`consumedByTool`) still open (#352);
+ *   - §2/I4 — the same for `collect`, plus the child is untouched: still tracked and
+ *     still `working`;
  *   - I1 — with no mail, `wait`'s timeout result and `collect`'s collected result are
  *     byte-identical to the same call made without the seam at all;
  *   - I5 — a caller abort (Esc / parent turn end) still answers the frozen
@@ -367,12 +367,13 @@ test("wait hands over mail written while it is blocked (§2, I2)", async () => {
 			state?: string;
 			mailIds?: number[];
 			targets?: string[];
-			waitClaims?: unknown[];
 		};
 		assert.equal(details.state, "mail");
 		assert.deepEqual(details.mailIds, [mailId]);
 		assert.deepEqual(details.targets, [CHILD]);
-		assert.deepEqual(details.waitClaims, [], "the claim record is still mounted (#352)");
+		// P4c: no claim record rides along any more — the seam takes nothing to hand
+		// back, so a discarded result cannot leave a suppressed notice behind.
+		assert.equal("waitClaims" in details, false);
 		// I2: taken exactly once, by the one write the contract allows.
 		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
 		assert.equal(pendingInbox(db, "root").length, 0);
@@ -423,11 +424,11 @@ test("collect hands over mail instead of waiting for the child (§2, I4)", async
 		assert.equal(inbox(db, "root", { delivery: MAIL_DELIVERY.ACCEPTED }).length, 1);
 		assert.equal(pendingInbox(db, "root").length, 0);
 		assert.deepEqual(await postmanTick(db), [], "an ACCEPTED message is never injected twice");
-		// I4: only the CALL returns — the child is still there.
+		// I4: only the CALL returns — the child is still there, and its notice route is
+		// open. P4c deleted the `consumedByTool` flag this used to inspect: a preempted
+		// collect declares no `ledgerReads`, so nothing was marked read and the notice is
+		// still owed (D3b). "Still tracked and working" is the observable fact.
 		assert.equal(runtime.get(CHILD)?.state, "working");
-		// #352: the preempted collect delivered no result, so it must hold no claim and
-		// must have left the notification route open.
-		assert.equal(runtime.get(CHILD)?.consumedByTool, false);
 	} finally {
 		clearTimeout(send);
 		runtime.dispose();
@@ -793,7 +794,6 @@ test("a discarded mail result is re-delivered instead of lost (P0-3)", async () 
 		// rendered result (and the mail text in it) is replaced by the frozen line.
 		const replaced = await interruptedControlResult({
 			result: preempted,
-			runtime,
 			legion: { db, nodeId: "root" } as unknown as OrchestratorLegionContext,
 		});
 		assert.equal(

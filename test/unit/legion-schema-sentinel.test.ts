@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { LEGION_DB_USER_VERSION } from "../../src/legion/db.ts";
+import { LEGION_DB_USER_VERSION, openLegionDb } from "../../src/legion/db.ts";
+import type { DatabaseSync } from "../../src/legion/db.ts";
 
 const contract = readFileSync(
 	fileURLToPath(new URL("../../docs/legion-v2-contract.md", import.meta.url)),
@@ -45,6 +46,18 @@ const EXPECTED_COLUMNS: Record<string, readonly string[]> = {
 		"delivered_at",
 		"created_at",
 	],
+	// schema v3 (`result-ledger-v1.md` D2).
+	artifacts: [
+		"id",
+		"parent_id",
+		"node_id",
+		"name",
+		"round",
+		"path",
+		"bytes",
+		"created_at",
+	],
+	consumptions: ["artifact_id", "consumer_id", "read_bytes", "read_at", "notified_at"],
 };
 
 const EXPECTED_INDEXES = [
@@ -54,6 +67,7 @@ const EXPECTED_INDEXES = [
 	{ table: "events", name: "idx_events_type_ts", columns: ["type", "ts"] },
 	{ table: "messages", name: "idx_messages_inbox", columns: ["to_node", "delivered", "id"] },
 	{ table: "messages", name: "idx_messages_rate", columns: ["from_node", "created_at"] },
+	{ table: "artifacts", name: "idx_artifacts_parent", columns: ["parent_id", "created_at"] },
 ] as const;
 
 const EXPECTED_EVENTS = [
@@ -94,14 +108,88 @@ function tableBody(sql: string, table: string): string {
 	return match[1] ?? "";
 }
 
-function declaredColumns(body: string): string[] {
-	return body
-		.split(/\r?\n/)
-		.map((line) => line.match(/^\s*([a-z_][a-z0-9_]*)\s+[a-z_][a-z0-9_]*/i)?.[1])
-		.filter((column): column is string => column !== undefined);
+/**
+ * One column's declared shape, in the same shape `PRAGMA table_info` reports it.
+ *
+ * Types and primary keys are part of the sentinel on purpose: an earlier version
+ * of this file dropped every line that started with a constraint keyword, so
+ * `consumptions`' composite `PRIMARY KEY (artifact_id, consumer_id)` and *all*
+ * column types were invisible — deleting the PK or changing `read_bytes INTEGER`
+ * to `TEXT` stayed green (P1 review major #4).
+ */
+interface ColumnShape {
+	name: string;
+	type: string;
+	notNull: boolean;
+	defaultValue: string | null;
+	/** 1-based position in the primary key; 0 when the column is not part of it. */
+	pk: number;
 }
 
-test("legion v2 contract §4.2 keeps the frozen four-table schema", () => {
+/**
+ * Declaration lines of a `CREATE TABLE` body: comments stripped, whitespace
+ * collapsed, trailing separators removed. Constraint lines are **kept** — they
+ * are declarations too, and dropping them is what hid the composite PK.
+ */
+function declarationLines(body: string): string[] {
+	return body
+		.split(/\r?\n/)
+		.map((line) => line.replace(/--.*$/, "").trim().replace(/,$/, "").replace(/\s+/g, " ").trim())
+		.filter((line) => line.length > 0);
+}
+
+/** Parse a `CREATE TABLE` body into the column shapes it declares. */
+function declaredShape(body: string): ColumnShape[] {
+	const columns: ColumnShape[] = [];
+	for (const line of declarationLines(body)) {
+		const constraint = line.match(/^PRIMARY\s+KEY\s*\(([^)]*)\)$/i);
+		if (constraint) {
+			const names = (constraint[1] ?? "").split(",").map((name) => name.trim()).filter((name) => name.length > 0);
+			assert.ok(names.length > 0, `Schema sentinel: §4.2 has an empty PRIMARY KEY constraint: ${line}`);
+			names.forEach((name, index) => {
+				const column = columns.find((candidate) => candidate.name === name);
+				assert.ok(column, `Schema sentinel: §4.2 PRIMARY KEY names undeclared column ${name} (${line})`);
+				assert.equal(column.pk, 0, `Schema sentinel: §4.2 declares ${name} as a primary key twice`);
+				column.pk = index + 1;
+			});
+			continue;
+		}
+		const column = line.match(/^([a-z_][a-z0-9_]*)\s+([A-Za-z][A-Za-z0-9_]*)\b(.*)$/);
+		assert.ok(
+			column,
+			`Schema sentinel: §4.2 has a declaration line this sentinel cannot read (${line}). Column names, types, NOT NULL, DEFAULT and PRIMARY KEY are frozen here on purpose; if the schema is intentionally revised, update this parser and the expectation together.`,
+		);
+		const rest = column[3] ?? "";
+		columns.push({
+			name: column[1] ?? "",
+			type: (column[2] ?? "").toUpperCase(),
+			notNull: /\bNOT\s+NULL\b/i.test(rest),
+			defaultValue: rest.match(/\bDEFAULT\s+('(?:[^']*)'|\S+)/i)?.[1] ?? null,
+			pk: /\bPRIMARY\s+KEY\b/i.test(rest) ? 1 : 0,
+		});
+	}
+	return columns;
+}
+
+function declaredColumns(body: string): string[] {
+	return declaredShape(body).map((column) => column.name);
+}
+
+/** The shape the running code actually creates, read through `PRAGMA table_info`. */
+function liveShape(db: DatabaseSync, table: string): ColumnShape[] {
+	return db
+		.prepare(`PRAGMA table_info(${table})`)
+		.all()
+		.map((row) => ({
+			name: String(row.name),
+			type: String(row.type).toUpperCase(),
+			notNull: Number(row.notnull) === 1,
+			defaultValue: row.dflt_value === null || row.dflt_value === undefined ? null : String(row.dflt_value),
+			pk: Number(row.pk),
+		}));
+}
+
+test("legion v2 contract §4.2 keeps the frozen six-table schema (columns, types, PRIMARY KEYs)", () => {
 	const schemaSection = contract.match(/^### 4\.2\b[\s\S]*?(?=^### 4\.3\b)/m)?.[0];
 	assert.ok(schemaSection, "Schema sentinel: contract §4.2 is missing; update this test explicitly when revising the contract.");
 
@@ -123,11 +211,11 @@ test("legion v2 contract §4.2 keeps the frozen four-table schema", () => {
 		Number(userVersions[0]),
 		"Schema sentinel: §4.2's PRAGMA user_version must equal the code's LEGION_DB_USER_VERSION.",
 	);
-	const unexpectedUserVersions = userVersions.filter((version) => version !== "2");
+	const unexpectedUserVersions = userVersions.filter((version) => version !== "3");
 	assert.deepEqual(
 		unexpectedUserVersions,
 		[],
-		`Schema sentinel: every §4.2 PRAGMA user_version declaration must remain 2 (found: ${userVersions.join(", ")}). If the contract schema is intentionally revised, update this test explicitly.`,
+		`Schema sentinel: every §4.2 PRAGMA user_version declaration must remain 3 (found: ${userVersions.join(", ")}). If the contract schema is intentionally revised, update this test explicitly.`,
 	);
 
 	const expectedTables = Object.keys(EXPECTED_COLUMNS);
@@ -140,7 +228,7 @@ test("legion v2 contract §4.2 keeps the frozen four-table schema", () => {
 	assert.deepEqual(
 		[...actualTables].sort(),
 		[...expectedTables].sort(),
-		`Schema sentinel: §4.2 must define exactly nodes/events/usage/messages (missing: ${missingTables.join(", ") || "none"}; unexpected: ${unexpectedTables.join(", ") || "none"}); update this test explicitly when revising the contract.`,
+		`Schema sentinel: §4.2 must define exactly nodes/events/usage/messages/artifacts/consumptions (missing: ${missingTables.join(", ") || "none"}; unexpected: ${unexpectedTables.join(", ") || "none"}); update this test explicitly when revising the contract.`,
 	);
 
 	for (const [table, expected] of Object.entries(EXPECTED_COLUMNS)) {
@@ -153,6 +241,23 @@ test("legion v2 contract §4.2 keeps the frozen four-table schema", () => {
 			[...expected].sort(),
 			`Schema sentinel: §4.2 ${table} columns changed (missing: ${missing.map((column) => `${table}.${column}`).join(", ") || "none"}; unexpected: ${unexpected.map((column) => `${table}.${column}`).join(", ") || "none"}; duplicates: ${duplicates.map((column) => `${table}.${column}`).join(", ") || "none"}). If the contract schema is intentionally revised, update this test explicitly.`,
 		);
+	}
+
+	// Types and primary keys are checked against the schema the code actually
+	// creates, not just against a name list: `PRAGMA table_info` reports
+	// name/type/NOT NULL/DEFAULT/PRIMARY KEY for every column, so a changed column
+	// type or a dropped PK (inline or composite) fails in **either** direction.
+	const liveDb = openLegionDb(":memory:");
+	try {
+		for (const table of expectedTables) {
+			assert.deepEqual(
+				declaredShape(tableBody(sql, table)),
+				liveShape(liveDb, table),
+				`Schema sentinel: §4.2 ${table} declarations (column name/type/NOT NULL/DEFAULT/PRIMARY KEY) drifted from the schema \`openLegionDb()\` creates. Changing a column type or dropping the PRIMARY KEY must fail here; if the schema is intentionally revised, update §4.2 and this test together.`,
+			);
+		}
+	} finally {
+		liveDb.close();
 	}
 
 	// Capture the column list too, not just the name: the index SET below compares

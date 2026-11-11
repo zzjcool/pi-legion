@@ -15,13 +15,14 @@
 
 `src/extension/runtime.ts` 的 `finished` 是 **one-round 缓存**（D7b，按 name 键），存
 `{ runId, round, snapshot: CollectSnapshot }`，其中 `snapshot.output` 是 child 的**输出全文**。
-它只在 5 处被删（重新 `track` / `rewatch` / `unclaim` / `unclaimUndelivered` / `dispose`），
+它只在 3 处被删（重新 `track` / `rewatch` / `dispose`；claim 模型已由 `result-ledger-v1` 的账本投影取代，
+P4c 删除了 `unclaim` / `unclaimUndelivered` 这两个失效点），
 **没有任何上限**：实测 50 个 child × 204,800 B 输出 ⇒ 堆上驻留 **10.07 MB**（≈206 KB/child），
 把 50 个名字重新 `track` 后立刻回落（反向证明持有者就是它）。
 
 关键事实：**调用方真正需要的是「结果」而不是「全文」**——
 `runId`/`round`（claim 键，D9/D10）、`execution`、`acceptance`、`outputFile`；
-而全文早已由 orchestrator 落盘（`writeOutputFile` → `<runDir>/<name>.output.md`，
+而全文早已由 orchestrator 落盘（`writeOutputFile` → `<runDir>/artifacts/<name>/r<round>.md`，
 `CollectSnapshot.outputFile` 就是它的路径）。
 
 ---
@@ -82,7 +83,8 @@
 | orchestrator 之外的 `TrackedJobInput.collect` 来源 | 同上，契约不假设它们有磁盘副本 |
 
 生产路径不受影响：`index.ts` 只把 `orchestrator.collect(...)` 交给 `runtime.track()`，而它对
-每个**终态、非空**输出都写 `<runDir>/<name>.output.md`（inprocess 与 rpc 共用同一 orchestrator）。
+每个**终态、非空**输出都写 `<runDir>/artifacts/<name>/r<round>.md`（inprocess 与 rpc 共用同一 orchestrator；
+round 在路径里，同名多轮不再互相覆盖，见 `result-ledger-v1.md` D1/D1a）。
 pinned 的字节数**不是隐形的**：`noticeQueueStats().finished.pinnedBytes` 会如实报出来（R5）。
 
 ### R5 — 可观测性（含「已降级读取」的显式标记）
@@ -103,15 +105,20 @@ finished: {
 - 只有当这一份 `output` **不是** child 的全文、并且**重建失败**时才出现
   （`outputFile` 被删 / 从未记录 / 读盘抛错）；
 - 第一次 `collect`/`wait`、pinned 条目、落盘正常时的任何命中，**都不会**带这个字段；
-- 它是纯快照字段，不进 wire、不进 ledger（R6）。
+- 它是纯快照字段，不进 wire、不进 ledger（R6）；
+- **P5c（`result-ledger-v1` §3 D8，v1.12）起这个标记被渲染成「这是摘要」的提示，不再是死字段**：
+  `collect`/`wait`/内联 collect 在它之后追加一句
+  `this is the cached head (4.0 KB of 24.5 KB); full text: legion_output({ name: "…" })`
+  （`<bytes>` 取 artifact 的 ledger 行；没有行时写 `at least`），未截断的结果只剩 `full output: <path>`；
+  通知则用 `preview 4.0 KB of 24.5 KB` 标注预览。strip/rehydrate 本身**保留**——W7 的诚实性缺口由标注补上，
+  不用内存驻留去换。
 
 ### R6 — 不动的边界
 
-- **不改 claim（`reported`）的淘汰语义**（#320 那一族的正确性依赖它），只加计数；
-- 不改 one-round 失效点（`track` / `rewatch` / `unclaim` / `unclaimUndelivered` / `dispose`）；
-- **不改 claim 键**：淘汰后的条目仍然带 `runId`/`round`，缓存命中的 claim 与淘汰前完全相同；
-  命中时交出的副本会重新登记 `(runId, round)` origin，`unclaimUndelivered`（#320 的回滚）
-  因此对缓存命中也照旧生效；
+- **不改淘汰语义**（`finished` 仍是一轮缓存，被 `track`/`rewatch`/`dispose` 失效），只加计数；
+- 不改 one-round 失效点（`track` / `rewatch` / `dispose` —— P4c 之后只剩这三处）；
+- **不改 `(runId, round)` 的登记**：淘汰后的条目仍然带 `runId`/`round`，命中时交出的副本会重新登记
+  origin 戳（`result-ledger-v1` D4a）—— 降级路径的 `deliveredOnce` 键靠它，与淘汰前完全相同；
 - 不改 `CollectSnapshot` 之外的形状（不进 wire、不改 ledger schema）；`outputTruncated` 是本轮
   唯一新增字段（R5），且是可选字段；
 - 不改 `RateSampler` 的样本保留（那是 #346 的地盘，见 `legion-chart-frame-buckets-v1.md`）。

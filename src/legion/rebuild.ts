@@ -4,9 +4,15 @@ import type { DatabaseSync } from "./db.ts";
 import { withTransaction } from "./db.ts";
 import { appendEvent } from "./events.ts";
 import { getNode, insertNode, nodeIdForChild, sanitizeNodeSlug } from "./nodes.ts";
+import { recordArtifact } from "./ledger.ts";
 import { upsertUsage } from "./usage.ts";
 import { deriveOutcome, parseSessionFile } from "../shared/session.ts";
 import type { ChildRecord, RunRecord, Usage } from "../shared/types.ts";
+
+/** Directory under a run dir that holds one sub-directory per child name. */
+const ARTIFACTS_DIRECTORY = "artifacts";
+/** `<runDir>/artifacts/<name>/r<round>.md` — the round is part of the filename. */
+const ARTIFACT_FILE_PATTERN = /^r(\d+)\.md$/;
 
 export interface RebuildOptions {
 	/** A run directory, its parent `runs/` directory, or the run's project root. */
@@ -26,6 +32,8 @@ export interface RebuildResult {
 	nodesRebuilt: number;
 	eventsRebuilt: number;
 	usageRebuilt: number;
+	/** Artifact rows re-derived from `<runDir>/artifacts/<name>/r<round>.md` (D10). */
+	artifactsRebuilt: number;
 	warnings: RebuildWarning[];
 }
 
@@ -62,7 +70,7 @@ export function rebuildLegionDb(options: RebuildOptions): RebuildResult {
 	const discoveredRuns = loadRuns(options.rootRunDir, warnings);
 	const scope = selectTreeRuns(options.rootRunDir, discoveredRuns, options.db, warnings);
 	if (scope.rootRunId === null) {
-		return { runFiles: [], nodesRebuilt: 0, eventsRebuilt: 0, usageRebuilt: 0, warnings };
+		return { runFiles: [], nodesRebuilt: 0, eventsRebuilt: 0, usageRebuilt: 0, artifactsRebuilt: 0, warnings };
 	}
 	const runs = scope.runs;
 	const sources = collectSources(runs, scope.rootRunId, warnings, clock);
@@ -72,10 +80,18 @@ export function rebuildLegionDb(options: RebuildOptions): RebuildResult {
 	let nodesRebuilt = 0;
 	let eventsRebuilt = 0;
 	let usageRebuilt = 0;
+	let artifactsRebuilt = 0;
 	withTransaction(options.db, () => {
 		options.db.exec("DELETE FROM usage;");
 		options.db.exec("DELETE FROM events;");
 		options.db.exec("DELETE FROM nodes;");
+		// The result ledger is rebuilt from disk, not preserved: artifact rows are
+		// re-derived below, and consumption facts are parent-process history with no
+		// on-disk source (contract `result-ledger-v1.md` D10). Clearing both is what
+		// makes "after a rebuild everything is unread" true — it can only cause an
+		// extra notice, never a missing one.
+		options.db.exec("DELETE FROM consumptions;");
+		options.db.exec("DELETE FROM artifacts;");
 		if (options.preserveMessages === false) options.db.exec("DELETE FROM messages;");
 		for (const source of orderByParent(sources)) {
 			try {
@@ -116,8 +132,11 @@ export function rebuildLegionDb(options: RebuildOptions): RebuildResult {
 				}
 			}
 		}
+		// Artifacts are looked up against the nodes this rebuild just inserted:
+		// a pointer whose node cannot be resolved is skipped, never guessed (D10).
+		artifactsRebuilt = rebuildArtifacts(options.db, runs, warnings);
 	});
-	return { runFiles: runs.map((entry) => entry.file), nodesRebuilt, eventsRebuilt, usageRebuilt, warnings };
+	return { runFiles: runs.map((entry) => entry.file), nodesRebuilt, eventsRebuilt, usageRebuilt, artifactsRebuilt, warnings };
 }
 
 function loadRuns(input: string, warnings: RebuildWarning[]): LoadedRun[] {
@@ -509,6 +528,144 @@ function nodeDepth(id: string): number {
 function toMillis(value: string, clock: () => number): number {
 	const parsed = Date.parse(value);
 	return Number.isFinite(parsed) ? parsed : clock();
+}
+
+/**
+ * Artifact reconstruction (contract `result-ledger-v1.md` D10).
+ *
+ * An artifact is self-describing on disk: `<runDir>/artifacts/<name>/r<round>.md`
+ * carries its own name and round in the path, its size in `stat`, and its
+ * settlement moment in the file mtime. The consuming parent and the producing
+ * node are resolved **in this run's scope only** ({@link resolveArtifactOwner}) —
+ * a pointer that does not resolve uniquely there is skipped with a warning,
+ * because the only alternative is guessing, and a wrong `parent_id` addresses a
+ * notice to the wrong node.
+ *
+ * A 0-byte file is not an artifact (A1/D1: empty output never produces one), so
+ * it is skipped rather than recorded — recording it would create a row whose
+ * `bytes` is below the `>= 1` invariant `recordArtifact` enforces.
+ *
+ * `consumptions` is deliberately NOT rebuilt: consumption is a fact of the
+ * parent process with no on-disk source, so after a rebuild every recovered
+ * artifact counts as unread (D10 — over-delivery, never silent loss).
+ */
+function rebuildArtifacts(
+	db: DatabaseSync,
+	runs: readonly LoadedRun[],
+	warnings: RebuildWarning[],
+): number {
+	const seen = new Set<string>();
+	let rebuilt = 0;
+	for (const { file, run } of runs) {
+		const artifactsRoot = path.join(path.dirname(file), ARTIFACTS_DIRECTORY);
+		if (!fs.existsSync(artifactsRoot)) continue;
+		for (const name of listDirectories(artifactsRoot)) {
+			const nameDirectory = path.join(artifactsRoot, name);
+			// One lookup per (run, name): every round under this directory belongs to
+			// the same producing node.
+			const owner = resolveArtifactOwner(db, run.runId, name);
+			for (const entry of readDirectoryEntries(nameDirectory, warnings)) {
+				const match = ARTIFACT_FILE_PATTERN.exec(entry);
+				if (!match) continue;
+				const round = Number(match[1]);
+				const artifactPath = path.join(nameDirectory, entry);
+				const id = `${run.runId}/${name}/r${round}`;
+				if (seen.has(id)) continue;
+				if (owner.kind !== "ok") {
+					warnings.push({
+						path: artifactPath,
+						message:
+							owner.kind === "ambiguous"
+								? `skipped artifact ${id}: ${owner.matches} nodes named ${name} in run ${run.runId} — ambiguous, not guessed`
+								: `skipped artifact ${id}: no node named ${name} under run ${run.runId} — never resolved outside its own run`,
+					});
+					continue;
+				}
+				let stats: fs.Stats;
+				try {
+					stats = fs.statSync(artifactPath);
+				} catch (error) {
+					warnings.push({ path: artifactPath, message: `skipped artifact ${id}: ${messageOf(error)}` });
+					continue;
+				}
+				if (!stats.isFile()) continue;
+				if (stats.size === 0) {
+					warnings.push({ path: artifactPath, message: `skipped artifact ${id}: empty file is not an artifact (A1)` });
+					continue;
+				}
+				try {
+					recordArtifact(db, {
+						id,
+						parentId: owner.parentId,
+						nodeId: owner.id,
+						name,
+						round,
+						path: path.resolve(artifactPath),
+						bytes: stats.size,
+						createdAt: Math.round(stats.mtimeMs),
+					});
+				} catch (error) {
+					warnings.push({ path: artifactPath, message: `could not rebuild artifact ${id}: ${messageOf(error)}` });
+					continue;
+				}
+				seen.add(id);
+				rebuilt += 1;
+			}
+		}
+	}
+	return rebuilt;
+}
+
+/** Result of {@link resolveArtifactOwner}: resolved, absent, or not unique. */
+export type ArtifactOwnerResolution =
+	| { kind: "ok"; id: string; parentId: string }
+	| { kind: "missing" }
+	| { kind: "ambiguous"; matches: number };
+
+/**
+ * The node that produced `<runDir>/artifacts/<name>/…`, resolved **inside the
+ * run's own scope only**.
+ *
+ * A run directory belongs to one node (`nodes.run_id`), so the artifact's parent
+ * is that node and its producer is the child named `<name>` underneath it. There
+ * is deliberately **no tree-wide fallback**: a name that does not resolve inside
+ * this run is skipped, because the only thing a global name lookup can produce is
+ * a pointer into a *different* run's subtree — i.e. a notice addressed to the
+ * wrong parent. Zero matches and multiple matches both answer
+ * `missing`/`ambiguous` so the caller can warn instead of guessing.
+ *
+ * Exported for the rebuild tests: the ambiguity branch cannot be reached from a
+ * well-formed on-disk tree (a run has exactly one owning node, and node names are
+ * unique under a parent), so it is exercised against a hand-seeded `nodes` table.
+ */
+export function resolveArtifactOwner(
+	db: DatabaseSync,
+	runId: string,
+	name: string,
+): ArtifactOwnerResolution {
+	const matches = db
+		.prepare(
+			`SELECT id, parent_id FROM nodes
+			 WHERE name = ? AND parent_id IN (SELECT id FROM nodes WHERE run_id = ?)
+			 ORDER BY id LIMIT 2`,
+		)
+		.all(sanitizeNodeSlug(name), runId);
+	if (matches.length === 0) return { kind: "missing" };
+	if (matches.length > 1) return { kind: "ambiguous", matches: matches.length };
+	const row = matches[0];
+	if (row === undefined || row.parent_id === null || row.parent_id === undefined) {
+		return { kind: "missing" };
+	}
+	return { kind: "ok", id: String(row.id), parentId: String(row.parent_id) };
+}
+
+function readDirectoryEntries(directory: string, warnings: RebuildWarning[]): string[] {
+	try {
+		return fs.readdirSync(directory).sort();
+	} catch (error) {
+		warnings.push({ path: directory, message: `skipped unreadable directory: ${messageOf(error)}` });
+		return [];
+	}
 }
 
 function listDirectories(directory: string): string[] {

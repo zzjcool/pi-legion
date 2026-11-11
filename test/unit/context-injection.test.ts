@@ -554,18 +554,22 @@ test("parent extension no longer registers a pane-era bash dispatch interceptor"
 	try {
 		process.env.PI_CODING_AGENT_DIR = dir;
 		delete process.env.PI_SUBAGENT_ROLE;
-		const events = new Map<string, ExtensionEvent>();
+		// The real host runs EVERY `tool_call` handler for a call (scout-guard, the child
+		// guard and the P5d artifact-path guard all register one), so this fake keeps a
+		// list rather than a single slot.
+		type ToolCallObserver = (event: { toolName: string; input: { command: string } }, ctx?: { cwd?: string }) => unknown;
+		const events = new Map<string, ToolCallObserver[]>();
 		const pi = {
 			registerMessageRenderer() {}, registerTool() {}, registerCommand() {}, sendMessage() {},
 			events: { emit() {} },
-			on(name: string, handler: unknown) { events.set(name, handler as ExtensionEvent); },
+			on(name: string, handler: unknown) { events.set(name, [...(events.get(name) ?? []), handler as ToolCallObserver]); },
 		};
 		piLegion(pi as never, { supervisor: new FakeSupervisor() });
 		// Scout guard observes tool_call. The old interceptor blocked or rewrote bash.
-		const handler = events.get("tool_call");
-		assert.equal(typeof handler, "function");
+		const observers = events.get("tool_call") ?? [];
+		assert.ok(observers.length > 0);
 		const event = { toolName: "bash", input: { command: "echo hi" } };
-		assert.equal(handler?.(event, { cwd: dir }), undefined);
+		for (const observer of observers) assert.equal(observer(event, { cwd: dir }), undefined);
 		assert.equal(event.input.command, "echo hi");
 	} finally {
 		if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;

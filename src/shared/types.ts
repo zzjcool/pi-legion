@@ -421,13 +421,23 @@ export interface ChildRecord {
 	execution?: Execution;
 	acceptance?: AcceptanceResult;
 	/**
-	 * Full terminal output persisted by the last collect (run-dir
-	 * `<name>.output.md`), or absent when that collect wrote none (running
-	 * snapshot / empty output). Recorded on the child — not re-derived via
-	 * existsSync — so a cached collect cannot hand out an EARLIER turn's
-	 * artifact as this turn's result.
+	 * Full terminal output persisted by the last collect as an immutable artifact
+	 * (run-dir `artifacts/<name>/r<round>.md`), or absent when that collect wrote
+	 * none (running snapshot / empty output — an empty output never becomes an
+	 * artifact and never deletes an earlier one). Recorded on the child — not
+	 * re-derived via existsSync — so a cached collect cannot hand out an EARLIER
+	 * turn's artifact as this turn's result.
 	 */
 	outputFile?: string;
+	/**
+	 * Result-ledger identity of {@link outputFile} — `"<runId>/<name segment>/r<round>"`
+	 * (`docs/contracts/result-ledger-v1.md` §3 D1). Travels with `outputFile` and is
+	 * absent under exactly the same conditions (running snapshot / empty output /
+	 * failed write / no ledger row). Kept beside the path because the artifact id is
+	 * what the ledger is keyed on: a later process's `collect` reads it back from here
+	 * (`Orchestrator.cachedCollect`) instead of re-deriving a round it cannot know.
+	 */
+	artifactId?: string;
 	/**
 	 * Acceptance criteria declared by the agent, copied here at launch so a
 	 * `collect` in a later process (each tool call is a fresh process) can still
