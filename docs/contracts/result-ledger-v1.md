@@ -245,20 +245,28 @@ HEAD 的 collect-failure 分支从不带 `renewal`，套上去会让失败通知
 
 ```
 legion_output({ name, round?, offset?, limit? })
-→ "scout-data · round 1 · settled 2m ago · 24.5 KB · phase=implementing\n"
+→ "scout-data · round 1 · 24.5 KB · settled 2m ago · phase=implementing\n"
   + 内容
-→ 读到 EOF 且覆盖全文件 ⇒ markRead(bytesRead = bytes)；否则 markRead(bytesRead = 本次实际返回的末字节偏移)
+→ 无 offset/limit 且读到 EOF ⇒ markRead(bytesRead = bytes)；分页读 ⇒ **不落账**
 ```
 
-- 注册位置：插件入口（与 `subagent` 同层，`index.ts:2251` 旁），**不**走 `registerLegionTools`（那是 child-only）。
-- header 必含：`round`（否则同名多轮的歧义仍在）、`bytes`、`settled-at`、`phase`。
+- 注册位置：插件入口，且在「child 早退门」**之前**注册 —— 否则普通 worker/scout 进程拿不到它（D7 要求 root 与 child 都可用）；utility child 同 `vexillatio` 不注册。
+- header 顺序以实现为准：`round · bytes · settled · phase`。
+- 分页读**不写** `read_bytes`（P5b 落地裁决）：可观测后果与「写到末偏移」相同（都不抑制），但 `read_bytes` 保持“曾完整交付了多少”这个单一含义，不用它记“扫到第几行”。
+- header 必含：`round`（否则同名多轮的歧义仍在）、`bytes`、`settled-at`、`phase`；分页时再加一行 `partial i/N lines · notifications not suppressed — read to EOF to settle`。
 - 文件被人工截短/篡改：`bytes` 与 ledger 不符时 header 打 `changed-on-disk`，**不**推进 `full`。
+- 角色卡里显式声明 `tools:` 的（`LEGION_CHILD_TOOLS` 未含本工具）拿不到 `legion_output` —— 这是卡的刻意限制，不是缺陷。
 - 被否决：复用 `collect` 加 `offset/limit` —— `collect` 的语义是「交付结果」，分页会让它同时承担两种职责。
 
-### D8 — 删除 finished 缓存的 strip/rehydrate
+### D8 — finished 缓存的 strip/rehydrate：**保留**（v1.12 改判，原计划删除作废）
 
-- 今天：>8KB 只留 4000 字符头（`runtime.ts:948-953`），读缓存时回读文件（`:957-980`），失败打 `outputTruncated`（`:1057`），而该标记**从不渲染**（W7）。
-- 新：缓存只存 `artifactId` + 元数据，正文一律从 artifact 读（按 `offset/limit` 流式），不再有「摘要被当成全文」这一状态。
+原计划把 >8KB 的「只留 4000 字符头 + 回读文件」删掉。**P5 完成后改判：保留。**
+
+- 删它的动机是 W7（模型拿到摘要却以为是全文）。这个诚实性问题已由 **D7 的 header 解决**（`legion_output` 说得出“24.5 KB，你看到的是 partial/摘要”）。
+- 而 strip 是一个**内存护栏**（50 个 child × 200KB 约 10 MB 堆驻留，见 `finished-cache-eviction-v1`）。把正文永久驻留以换一个已经被 header 解决的诚实性，是拿错误的代价交换。
+- 剩余缺口：`snapshot.outputTruncated` 仍然不渲染给模型。**P5c 只做标注**（在 collect/通知的文本里说一句“这是摘要，全文用 `legion_output`”），**不**删 strip。
+
+### D9 — 通知正文保留预览，但如实标注
 
 ### D9 — 通知正文保留预览，但如实标注
 
@@ -422,6 +430,7 @@ legion_output({ name, round?, offset?, limit? })
 | 2026-11-10 | v1.9 FROZEN | P4a 交付时新增 **D3b**：落账从 handler 挪到 abort net 之后（handler 只声明 `details.ledgerReads`，唯一写点是 `settleControlResult`）。原因：abort net 会把已落账的结果整条替换成 `interrupted …`，造成静默丢结果。 |
 | 2026-11-10 | v1.10 FROZEN | P4b 复审后补 D4 两条：① 投影权威只限「账本里存在的 artifact」，未知 id 必须 fail-open 投递（否则库重置/插入失败 ⇒ 永久静默）；② `deliveredOnce` 必须在 `owesDelivery` 最前面读，否则 markNotified 抛错时的兜底是死代码。 |
 | 2026-11-11 | v1.11 FROZEN | P4c 复审后补 **D4a**（降级路径保留最小 origin 戳，否则 re-track 后 round 键锉位 ⇒ 静默丢通知）、**D4b**（renewal 只挂 completed 条目）；§5 修正两处自相矛盾（`reportKey` 保留、`join.buffered` 保留）。 |
+| 2026-11-11 | v1.12 FROZEN | P5b 落地后对齐：D7 的分页读改为**不落账**、header 段序以实现为准、注册点提前到 child 早退门之前；**D8 改判为保留 strip**（W7 的诚实性已由 D7 header 解决，拆内存护栏换不来东西），P5c 只做“这是摘要”的标注。 |
 
 ## 12. 裁决记录
 

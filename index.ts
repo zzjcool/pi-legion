@@ -54,6 +54,7 @@ import { resolveTeamContext } from "./src/agents/context.ts";
 import { createSessionRuntime, renderLiveChildStatus, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
+import { registerLegionOutputTool } from "./src/extension/legion-output.ts";
 import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
 import { resolveLoopRadiusMs } from "./src/legion/stall-notice.ts";
 import { LEGION_DB_ENV, LEGION_NODE_ID_ENV, LEGION_PHASES_ENV } from "./src/runs/args.ts";
@@ -2142,6 +2143,36 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			}
 		},
 	});
+
+	// P5b/D7: the result-ledger reader, registered at the PLUGIN layer — beside
+	// `subagent`/`vexillatio`, never inside `registerLegionTools` (`registerTools &&
+	// nodeId !== "root"`, child-only). A root owns artifacts too
+	// (`artifacts.parent_id = "root"`), so "read my children's result" must not be a
+	// child-only tool.
+	//
+	// It sits ABOVE the `isChild && !allowNested` early return on purpose: that gate
+	// exists because a child which may not dispatch has no dispatch tools to register,
+	// and `legion_output` is not one — a plain worker still has children of its own to
+	// read (D7: "root 与 child 都注册"). It keeps `vexillatio`'s utility guard for the
+	// same reason that tool has one: a read-only utility child never owns a child of
+	// its own, so the reader would only ever answer "nothing recorded". The identity
+	// is resolved per call — this runs at extension load, before any session or
+	// launch has one.
+	if (process.env[UTILITY_CHILD_ENV] !== "1") {
+		registerLegionOutputTool(pi, {
+			resolveIdentity: () => {
+				const identity = ownLegionIdentity();
+				return identity
+					? {
+							db: identity.db,
+							consumerId: identity.nodeId,
+							runId: identity.runId,
+							runDir: identity.runDir,
+						}
+					: undefined;
+			},
+		});
+	}
 
 	if (isChild && !allowNested) {
 		pi.on("session_shutdown", shutdownRetireAll);

@@ -305,6 +305,19 @@ legion_phase({ to, note?, evidence?, reason?, supersedes? })
   direct children that a settled sibling has taken over, which is what unlocks
   the exit from `implementing` after a partial failure.
 
+The root session and child nodes both also get the result reader:
+
+```text
+legion_output({ name, round?, offset?, limit? })
+```
+
+- **`legion_output`** reads a child's result artifact — the immutable body behind
+  a completion notice; `round` defaults to the newest round of that name, and
+  `offset` (1-based) / `limit` page by lines. Reading the whole body (no
+  `offset`/`limit`) settles it, so its completion notice is not sent (and is not
+  re-sent); a paged read prints `partial … lines · notifications not suppressed —
+  read to EOF to settle` and settles nothing.
+
 A squad moves through whatever phases its lead declares — and a squad whose lead
 declares nothing has no phase at all. The built-in machine is
 **planning → implementing → reviewing → verifying**, ending in `done`:
