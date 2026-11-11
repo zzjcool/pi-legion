@@ -25,6 +25,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { NestedPathEntry, SpawnMode } from "../shared/types.ts";
+import type { PhaseMachine } from "../legion/phase-machine.ts";
 
 /** Lineage identity of one in-process child session. Never routed via process.env. */
 export interface ChildLaunchContext {
@@ -104,6 +105,28 @@ export interface ChildLaunchContext {
 	 * role into B, and the role is a per-spawn fact by definition.
 	 */
 	role?: string;
+	/**
+	 * The phase machine the parent declared for THIS spawn (#371 / R7) — carried
+	 * here for exactly the reason `team` and `role` are (#295 / #197, above).
+	 *
+	 * The declaration travels on `SpawnInput.env` as `PI_LEGION_PHASES`, which is
+	 * the rpc child's real environment (and the only channel that exists for the
+	 * rpc backend). An in-process child shares the HOST's `process.env` instead, so
+	 * `phaseMachineForNode` there read nothing, the declared machine degraded to
+	 * the role card's answer, and every custom phase name failed `invalid_phase` at
+	 * run time — an undeclared card means NO machine at all.
+	 *
+	 * `InProcessSupervisor.phasesFromSpawnEnv` lifts it off the spawn env and
+	 * `index.ts`'s `phaseMachineForNode` is the single consumer (ALS > env > card).
+	 *
+	 * Present only when the spawn env actually carried the key, and parsed into a
+	 * fresh object tree — a bad declaration degrades to "no machine" with a warn
+	 * rather than blocking the spawn (same rule `index.ts` already applies to the
+	 * env channel). Deliberately NOT inherited from a `provided` template
+	 * (REV2-3): a template reused across spawns would leak A's machine into B's
+	 * team, and a declaration is a per-spawn fact by definition.
+	 */
+	phases?: PhaseMachine;
 }
 
 const STORE_KEY = Symbol.for("pi-legion.child-context.als");

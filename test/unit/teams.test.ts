@@ -49,9 +49,12 @@ import { currentChildContext, runInChildContext } from "../../src/supervisor/chi
 import { CHILD_ROLE_ENV } from "../../src/extension/child-guard.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import {
+	CREDENTIAL_FIX_ADVICE,
+	INPROCESS_CREDENTIAL_FAILURE,
 	INPROCESS_FIX_ADVICE,
 	INPROCESS_MODEL_FAILURE,
 	INPROCESS_MODEL_FAILURE_LINE,
+	MODEL_MISS_ADVICE,
 } from "../helpers/inprocess-failure.ts";
 import piLegion from "../../index.ts";
 
@@ -2883,4 +2886,19 @@ test("hint: the vexillatio failure path carries the same hint once", async () =>
 	assert.match(text, INPROCESS_MODEL_FAILURE_LINE);
 	assert.match(text, INPROCESS_FIX_ADVICE);
 	assert.equal((text.match(/Hint:/g) ?? []).length, 1, `one hint per failure:\n${text}`);
+});
+
+test("hint: a missing API key reaches the caller as an authentication problem", async () => {
+	// The `START_FAILED` an in-process child really produces when its provider has
+	// no credential (`defaultSessionFactory` surfaces the SDK's rejection). It used
+	// to arrive with no hint at all, while the fix (`/login`) is public knowledge.
+	const text = await runSpawnFailure(
+		new SubagentError(INPROCESS_CREDENTIAL_FAILURE, ErrorCodes.START_FAILED),
+	);
+	assert.match(text, /✗ worker: START_FAILED: /);
+	assert.ok(text.includes(INPROCESS_CREDENTIAL_FAILURE), `the failure text is kept:\n${text}`);
+	assert.match(text, CREDENTIAL_FIX_ADVICE, "the credential fix, not the declaration advice");
+	assert.doesNotMatch(text, MODEL_MISS_ADVICE, `no models.json detour:\n${text}`);
+	assert.doesNotMatch(text, INPROCESS_FIX_ADVICE);
+	assert.equal((text.match(/Hint:/g) ?? []).length, 1, `the hint is appended once:\n${text}`);
 });

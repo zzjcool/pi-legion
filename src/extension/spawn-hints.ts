@@ -43,12 +43,61 @@ const MODEL_NOT_FOUND =
  * The in-process backend's own wording for a model it could not resolve
  * (`defaultSessionFactory` → `SubagentError(START_FAILED)`).
  *
- * Also the idempotence gate below: an rpc failure never contains it (its text
- * comes from a child process that never ran this code), so appending on this
- * marker alone cannot double up on a message that already carries a `Hint:` /
- * `--- Legion auto-doctor ---` section.
+ * Not an idempotence gate any more (R7): a message can carry this marker AND a
+ * credential root cause, and the root cause must win. `hasHintSection` below is
+ * the once-only gate; this constant only selects the model-hint branch.
  */
 const INPROCESS_RESOLVE_FAILED = /inprocess model resolve failed/i;
+
+/**
+ * Root-cause wording for "the provider has no usable credential" (R7).
+ *
+ * Case-insensitive, matching the SDK's real strings:
+ *  - `No API key found for "<provider>"` (`model-registry.ts`)
+ *  - `Authentication failed for "<provider>". …` (`agent-session.ts`)
+ *  - `No matching provider is authenticated.` (`model-resolver.ts`, ambiguous
+ *    provider set — the one that used to arrive as
+ *    `inprocess model resolve failed …` and collect model advice)
+ *
+ * Deliberately NOT folded into `MODEL_NOT_FOUND`: a credential problem is not a
+ * missing model, and widening that regex would also change `looksLikeMissingModel`
+ * and the rpc enrich path (R7 D-R7.8).
+ */
+const CREDENTIAL_FAILURE =
+	/No API key found for|Authentication failed for|No matching provider is authenticated/i;
+
+/**
+ * A hint section already exists: do not stack a second one (R7 D-R7.7).
+ *
+ * Both shapes are what this codebase appends — the `Hint: ` block every hint
+ * follows, and the `--- Legion auto-doctor ---` section the rpc path writes. A
+ * failure that already carries either went through this gate once.
+ *
+ * `(^|\n\n)` rather than plain `\n\n`: a hint that IS the whole message (the SDK
+ * rejection is often wrapped as the message alone, so the first line is already
+ * `Hint: `) has no leading blank line, and the old check missed it — appending a
+ * second `Fix:` block to the only sentence the operator gets.
+ */
+function hasHintSection(message: string): boolean {
+	return /(^|\n\n)Hint: /.test(message) || message.includes("--- Legion auto-doctor");
+}
+
+/**
+ * The credential hint (R7 D-R7.5) — points ONLY at repairs that create a
+ * credential.
+ *
+ * The model hint below teaches `models.json` / `PI_LEGION_CHILD_EXTENSIONS`,
+ * which is exactly wrong here: no declaration can make an unauthenticated
+ * provider serve a request. The wording also says out loud that this is not a
+ * model-name problem, because that is the misdiagnosis it replaces.
+ */
+export const INPROCESS_CREDENTIAL_HINT =
+	"Hint: this is an authentication failure, not a model-name or declaration problem — no API " +
+	"key is available for the provider this child must call (children use the host's credentials, " +
+	"and that provider is not logged in).\n" +
+	"Fix: run `/login <provider>` for that provider (or add its API key to the provider's own " +
+	"configuration), then retry. `/legion doctor` or `subagent action=diagnose` shows the child's " +
+	"provider state.";
 
 export function looksLikeMissingModel(stderr: string | undefined): boolean {
 	return Boolean(stderr && MODEL_NOT_FOUND.test(stderr));
@@ -130,13 +179,24 @@ export function spawnFailureHint(input: {
 }
 
 /**
- * The in-process counterpart of `enrichFailureWithAutoDoctor` (R5 D-H1).
+ * The in-process counterpart of `enrichFailureWithAutoDoctor` (R5 D-H1), now
+ * routed by ROOT CAUSE (R7 D-R7.6).
  *
- * A failed in-process spawn reports
- * `inprocess model resolve failed for '<id>': Model "<id>" not found …` — which
- * `MODEL_NOT_FOUND` already matches and `spawnFailureHint` already knows how to
- * fix — but nothing called it on this path, so the caller got the raw `✗` line
- * and no escape hatch (the rpc path is enriched in `rpc-supervisor`).
+ * Three shapes reach this function:
+ *
+ *  1. `No API key found for "x"` — the in-process first-turn rejection
+ *     (`inprocess-supervisor.ts` `START_FAILED`). It used to leave with NO hint
+ *     at all: `spawnFailureHint` only knows the model-miss wording.
+ *  2. `inprocess model resolve failed for '<id>': No matching provider is
+ *     authenticated.` — an AUTHENTICATION failure that also carries the model
+ *     marker. It used to collect `INPROCESS_MODEL_HINT`, i.e. advice to edit
+ *     `models.json` when the repair is `/login`. The credential vocabulary is
+ *     therefore checked FIRST and wins even when the marker is present.
+ *  3. a genuine model miss (`Model "x" not found`, `Unknown provider`, …) —
+ *     unchanged: the existing in-process model hint, byte for byte.
+ *
+ * Anything else is returned byte for byte, and a message that already carries a
+ * hint section is never appended to twice.
  *
  * Deliberately NOT routed through `enrichFailureWithAutoDoctor`: that one writes
  * the process-wide `recentFailures` ring (8 entries, shared across runs), and an
@@ -144,11 +204,17 @@ export function spawnFailureHint(input: {
  * the doctor snippet for a LATER, unrelated rpc failure.
  *
  * Pure apart from the in-memory discovery holder `spawnFailureHint` reads: no
- * ring write, no IO. A message that is not an in-process model miss — including
- * every already-hinted rpc failure and every plain `Error` — is returned byte for
- * byte, which is what the frozen result wording depends on.
+ * ring write, no IO.
  */
 export function appendInprocessModelHint(message: string): string {
+	// D-R7.7: one hint section per failure, whichever call site asked. Appending
+	// twice is what made an already-diagnosed message carry two `Fix:` blocks.
+	if (hasHintSection(message)) return message;
+	// D-R7.6: the root cause wins over the marker. A credential problem that
+	// happens to travel inside `inprocess model resolve failed …` is still a
+	// credential problem, and the model hint would send the operator to edit a
+	// file that cannot supply a key.
+	if (CREDENTIAL_FAILURE.test(message)) return `${message}\n\n${INPROCESS_CREDENTIAL_HINT}`;
 	if (!INPROCESS_RESOLVE_FAILED.test(message)) return message;
 	// `session.results` / the utility segments are joined with `\n`, so the shape
 	// is `${message}\n\n${hint}` exactly as `enrichFailureWithAutoDoctor` does it.

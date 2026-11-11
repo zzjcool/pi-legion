@@ -190,7 +190,7 @@ const mode: SpawnMode = worktree === true
 | launch 参数 | `subagent({ phases, start? })` | **ROOT-ONLY**（G2）、**centurion-only**（G3）、**launch-only**；`start` 只对“裸阶段列表”生效，机器对象/JSON 自带 `start` 且优先 |
 | 角色卡 | frontmatter `phases:` | 卡片是**回退**，不是覆盖：一次派发自己声明了机器就以派发为准（G4） |
 | 三种可接受写法 | 阶段数组 / 机器对象 / 一行 JSON 字符串 / 缩进块 | `parsePhaseMachine` 全部走同一个校验器 |
-| 传给子进程 | `PI_LEGION_PHASES` env（仅 centurion） | `Orchestrator.lineageEnv`；`LEGION_PHASES_ENV`（`src/runs/args.ts`） |
+| 传给子进程 | rpc：`PI_LEGION_PHASES` env；in-process：`ChildLaunchContext.phases`（ALS） | 同一份声明（仅 centurion），两条通道：`Orchestrator.lineageEnv` 写 env（`LEGION_PHASES_ENV`，`src/runs/args.ts`）给真子进程；in-process 子会话与宿主共用一个 `process.env`，于是由 `InProcessSupervisor.phasesFromSpawnEnv` 从 per-spawn env 解析进 `ChildLaunchContext.phases`，消费点 `phaseMachineForNode`（`index.ts`）ALS 优先、env 兜底、再回退角色卡；坏声明降级为“无机器”+warn，不从 provided 模板继承 |
 | 重启后复原 | `ChildRecord.phases` 快照 | run.json 记录声明，复活时不丢自定义阶段名（`#374` §4） |
 
 #### 3.4.3 条件词汇表（`PHASE_CONDITIONS`）
@@ -559,7 +559,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 
 ### 10.2 子会话里装了什么
 
-- **身份**：`PI_LEGION_DB` + `PI_LEGION_NODE_ID`（账本身份与 node 行），`PI_SUBAGENT_ROLE` / `PI_SUBAGENT_ACCEPTANCE_ROLE`（只读角色判定），`PI_LEGION_PHASES`（相位机声明，仅 centurion）。
+- **身份**：`PI_LEGION_DB` + `PI_LEGION_NODE_ID`（账本身份与 node 行），`PI_SUBAGENT_ROLE` / `PI_SUBAGENT_ACCEPTANCE_ROLE`（只读角色判定），`PI_LEGION_PHASES`（相位机声明，仅 centurion；**rpc** 子进程走这条 env，in-process 子会话与宿主共用一个 `process.env`，改走 `ChildLaunchContext.phases`，见 §3.4.2）。
 - **预算**：`PI_SUBAGENT_MAX_DEPTH`、`PI_SUBAGENT_ALLOW_NESTED`、`PI_SUBAGENT_MAX_TOOL_CALLS`、`PI_SUBAGENT_MAX_TURNS`、`PI_SUBAGENT_TOOL_TIMEOUT_MS`（`child-guard.ts` / `budget.ts`）。
 - **child-guard**（`registerChildGuard`）：子会话加载的扩展，做三件事：计数并拦 `toolBudget`/`turnBudget`、拦 bash 对 `legion.db` 的直接读写、给 bash 套 `toolTimeoutMs`；它**不注册父工具**，所以「能不能再派活」由是否装父工具决定。它是**纪律层**，不是沙箱：`acceptance.role: read-only` 是**只针对 bash** 的规则（`tool_call` handler 首行就是 `if (event.toolName !== "bash") return;`），`edit`/`write` 由卡片 `tools:` 决定，MCP 与 `codemode` 脚本不在覆盖范围内——精确边界见 README 的「What `read-only` actually covers」。
 - **扩展继承**：`ensureHostExtensions` 在第一次 spawn 前预热宿主扩展发现（幂等、永不 reject），子会话默认继承宿主扩展，卡片可用 `inheritExtensions` / `excludeExtensions` / `subagentOnlyExtensions` 调整。
@@ -570,7 +570,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 - 中断（ESC / `abort`）保留子会话：`abort` 只打断当前 turn，`stop`/`retire` 才拆会话（`#313`/`#314`）。
 - `wait`/`collect` 超时不是失败：返回结构化 `decisions`（`extend` / `steer_again` / `stop` / `force_stop`），由父级选。
 - 验收（acceptance）：`deriveOutcome` 之外再看 `acceptance.level`。`attested` 是 agent 自评；只有 `verification-output` 证据且带显式 `command` 的 required 条件，才会由 `src/runs/acceptance.ts` 真跑并升级为 `verified` 或判 `rejected`。没有 `command` 的条件保持 `attested` 并列为 pending，交给父 agent 确认——平台不猜命令。
-- 失败要能被定位：rpc 启动失败由 `enrichFailureWithAutoDoctor` 附 doctor 片段；in-process 的 `inprocess model resolve failed …` 由 `appendInprocessModelHint`（`src/extension/spawn-hints.ts`，纯函数）追加 `models.json` / `PI_LEGION_CHILD_EXTENSIONS` 的 Fix 段，且只在命中该标记时追加——rpc 文案不含它，所以天然不会双份（已有 `Hint:` / `--- Legion auto-doctor` 段的 rpc 消息逐字不变）。普通 `Error` 的文案也逐字不变。
+- 失败要能被定位：rpc 启动失败由 `enrichFailureWithAutoDoctor` 附 doctor 片段；in-process 的失败由 `appendInprocessModelHint`（`src/extension/spawn-hints.ts`，纯函数）按**根因**追加 Fix 段，顺序是：先 `hasHintSection`（已有 `Hint:` / `--- Legion auto-doctor` 的消息一律不再追加）→ 凭证词表（`No API key found for` / `Authentication failed for` / `No matching provider is authenticated`）给 `/login <provider>` 的建议 → 否则命中 `inprocess model resolve failed` 才给 `models.json` / `PI_LEGION_CHILD_EXTENSIONS`。凭证优先于标记：一个「解析失败但真因是没登录」的错误必须拿到登录建议，而不是去改声明文件。普通 `Error` 的文案逐字不变。
 
 ---
 

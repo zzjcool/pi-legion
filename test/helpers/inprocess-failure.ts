@@ -23,3 +23,29 @@ export const INPROCESS_MODEL_FAILURE_LINE =
  */
 export const INPROCESS_FIX_ADVICE =
 	/Fix: declare the provider statically in `models\.json`/;
+
+/**
+ * The SDK's wording when a provider simply has no credential (#R7).
+ *
+ * `model-registry.ts` answers `No API key found for "<provider>"` and the
+ * agent-session prompt rejection answers `Authentication failed for "<provider>"`;
+ * both reach the caller as `START_FAILED`. This is NOT a model miss: no
+ * `models.json` entry and no child extension can create a credential.
+ *
+ * The wording is the SDK's own, quoted, not a paraphrase: the old fixture said
+ * `No API key found for provider "workbuddy"`, a string no SDK file produces, so
+ * tightening the vocabulary later (a quoted-provider match) would have flipped
+ * this test red for the wrong reason — or, worse, kept it green while the real
+ * message stopped matching.
+ */
+export const INPROCESS_CREDENTIAL_FAILURE = 'No API key found for "workbuddy"';
+
+/** The fix a credential failure must name — `/login <provider>`. */
+export const CREDENTIAL_FIX_ADVICE = /\/login/;
+
+/**
+ * The fix a MODEL miss must name, and a credential failure must not: pointing an
+ * unauthenticated provider at `models.json` sends the operator to edit a file
+ * that cannot supply the missing key.
+ */
+export const MODEL_MISS_ADVICE = /models\.json/;
