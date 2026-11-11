@@ -61,15 +61,28 @@ function mergePending(
 	return [...byId.values()];
 }
 
+/**
+ * The command this criterion is actually run with, else `undefined`.
+ *
+ * The ONE "is this criterion runnable" predicate (#393 review / D393-7):
+ * required, `verification-output` evidence, non-empty `command`. The three
+ * readers below — `verifyCommandsOf`, `verifyCommandOf` and the `carried`
+ * filter inside `applyVerification` — all go through it, so a criterion that
+ * one of them treats as pending can never be silently executed by another.
+ */
+function runnableCommandOf(criterion: AcceptanceCriterion): string | undefined {
+	if (criterion.severity === "optional") return undefined;
+	if (!(criterion.evidence ?? []).includes("verification-output")) return undefined;
+	return criterion.command?.trim() || undefined;
+}
+
 /** All runnable verification commands, in declaration order. */
 export function verifyCommandsOf(
 	criteria: AcceptanceCriterion[] | undefined,
 ): string[] {
 	const commands: string[] = [];
 	for (const criterion of criteria ?? []) {
-		if (criterion.severity === "optional") continue;
-		if (!(criterion.evidence ?? []).includes("verification-output")) continue;
-		const command = criterion.command?.trim();
+		const command = runnableCommandOf(criterion);
 		if (command) commands.push(command);
 	}
 	return commands;
@@ -80,12 +93,25 @@ export function verifyCommandOf(
 	criteria: AcceptanceCriterion[] | undefined,
 ): string | undefined {
 	for (const criterion of criteria ?? []) {
-		if (criterion.severity === "optional") continue;
-		if (!(criterion.evidence ?? []).includes("verification-output")) continue;
-		const command = criterion.command?.trim();
+		const command = runnableCommandOf(criterion);
 		if (command) return command;
 	}
 	return undefined;
+}
+
+/**
+ * Budget for any child-supplied tail spliced into an `acceptance.reason`
+ * (#393 review / D393-6). Verification output is capped on the red path; a
+ * child's own `reason` is equally unbounded, and pasting it whole makes the
+ * collect result unreadable and bloats every artifact that carries the reason.
+ * Shared by both paths so the two caps cannot drift apart.
+ */
+const REASON_TAIL_LIMIT = 1_500;
+
+/** `text` cut to `REASON_TAIL_LIMIT` chars, with the ellipsis counted inside it. */
+function truncateReason(text: string): string {
+	if (text.length <= REASON_TAIL_LIMIT) return text;
+	return `${text.slice(0, REASON_TAIL_LIMIT - 1)}…`;
 }
 
 /**
@@ -275,10 +301,25 @@ export async function applyVerification(
 	// criterion carrying an explicit `command` — not the child's own verdict
 	// (`docs/design.md` §10.3). A child that self-reports `ok: false` must still
 	// have its commands run; the reported status is kept either way, so nothing
-	// is silently overturned (see the success path below). Aborted/blocked
-	// collects never reach this function (they go through `interruptedCollect` /
-	// `blockedResult` in orchestrator.ts), so they are deliberately not covered
-	// by that removal.
+	// is silently overturned (see the success path below).
+	//
+	// Whether to run at all is a separate question from what the child said: only
+	// a TERMINAL collect is a result. The three non-terminal paths therefore never
+	// reach this function, and the exclusion must stay outside it (#393 review /
+	// D393-8):
+	//   - aborted collect (`abortedSnapshot` / `interruptedCollect` in
+	//     orchestrator.ts) — the turn was interrupted, so there is no verdict to
+	//     verify and the worktree holds a half-written turn;
+	//   - blocked collect (`blockedResult`) — the child is parked on a child-UI
+	//     approval it is still waiting for; a command run there races that
+	//     approval and cannot describe a finished state;
+	//   - running snapshot — the collect deadline fired while the child is still
+	//     alive. `finishCollect` skips this call for `status === "running"`: a
+	//     snapshot of a live, still-writing worktree is not a result, the deadline
+	//     has already elapsed (`Math.max(5_000, deadline - now)` is therefore
+	//     almost always ~5s, so a real command times out and manufactures a fake
+	//     `rejected`/`verified`), and the tree-wide verify-slot wait is not charged
+	//     against that timeout at all.
 	if (!needsVerification(opts.criteria)) return acceptance;
 
 	const commands = verifyCommandsOf(opts.criteria);
@@ -296,12 +337,16 @@ export async function applyVerification(
 		};
 	}
 	const run = opts.run ?? defaultVerifyRunner;
-	// Command-bearing criteria are resolved mechanically below — verified or
-	// failed, they never stay "pending for the parent to confirm". Only
-	// no-command criteria remain in pending (mergePending above), which is
-	// what the unverified-criteria banner is for.
+	// Criteria the loop below actually executes (verified or failed) are resolved
+	// here — they never stay "pending for the parent to confirm". Everything else
+	// is carried VERBATIM (#393 review / D393-7): a pending criterion can carry a
+	// `command` this module still never runs (optional severity, or no
+	// `verification-output` evidence), and dropping it by `command` alone silently
+	// deleted the parent's only reminder. The filter is `runnableCommandOf`, the
+	// same predicate `verifyCommandsOf` uses above, so "kept pending" and "run"
+	// cannot disagree.
 	const carried = (acceptance.pendingCriteria ?? []).filter(
-		(criterion) => !criterion.command?.trim(),
+		(criterion) => runnableCommandOf(criterion) === undefined,
 	);
 	// Run every command in order; stop at the first failure so the rejection
 	// names the command that actually broke, not a later one that never ran.
@@ -313,7 +358,7 @@ export async function applyVerification(
 			...acceptance,
 			status: "rejected",
 			level: "attested",
-			reason: `verification failed (\`${command}\`): ${output.slice(0, 1_500)}`,
+			reason: `verification failed (\`${command}\`): ${output.slice(0, REASON_TAIL_LIMIT)}`,
 			pendingCriteria: carried,
 		};
 	}
@@ -321,13 +366,15 @@ export async function applyVerification(
 	if (acceptance.status !== "accepted") {
 		// The commands did pass, so the level is `verified` — but the status the
 		// child reported stands verbatim, and its reason is kept alongside ours
-		// instead of being overwritten (#393 / D393-2).
+		// instead of being overwritten (#393 / D393-2). The child's own reason is
+		// capped like the red path's output is, ellipsis included (#393 review /
+		// D393-6).
 		const ownReason = acceptance.reason?.trim();
 		return {
 			...acceptance,
 			level: "verified",
 			reason: ownReason
-				? `${verifiedReason} — the child's own verdict still stands (${ownReason})`
+				? `${verifiedReason} — the child's own verdict still stands (${truncateReason(ownReason)})`
 				: verifiedReason,
 			pendingCriteria: carried,
 		};

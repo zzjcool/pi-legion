@@ -264,3 +264,54 @@ test("applyVerification success names every command that had to pass", async () 
 	assert.equal(out.level, "verified");
 	assert.match(out.reason ?? "", /`npm run typecheck` && `npm test`/);
 });
+
+test("D393-6: a long child reason is truncated inside the verified reason", async () => {
+	const long = `start ${"x".repeat(4_000)} TAIL-MARKER`;
+	const out = await applyVerification(
+		{ status: "rejected", level: "attested", reason: long },
+		{
+			cwd: "/work",
+			criteria: runnableCriteria,
+			run: async () => ({ code: 0, stdout: "ok\n", stderr: "" }),
+		},
+	);
+	const reason = out.reason ?? "";
+	const prefix = "verified by `npm test` — the child's own verdict still stands (";
+	const suffix = ")";
+	assert.ok(reason.startsWith(prefix), `unexpected reason: ${reason.slice(0, 120)}`);
+	assert.ok(reason.endsWith(suffix));
+	const carriedReason = reason.slice(prefix.length, reason.length - suffix.length);
+	// Same 1500-char budget as the red path, with the marker included in it.
+	assert.ok(carriedReason.length <= 1_500, `child reason not capped: ${carriedReason.length} chars`);
+	assert.match(carriedReason, /…$/, "truncation is marked with an ellipsis");
+	assert.doesNotMatch(reason, /TAIL-MARKER/, "the dropped tail must not survive");
+});
+
+test("D393-7: a pending criterion carrying a command that never runs is not swallowed", async () => {
+	const runs: string[] = [];
+	// A pending criterion WITH a command, but without `verification-output`: it is
+	// never executed this round, so dropping it silently loses the only record
+	// that the parent still has to confirm it.
+	const manualCheck = {
+		id: "manual-diff-review",
+		must: "parent reviews the diff",
+		evidence: ["facts"],
+		severity: "required" as const,
+		command: "git diff --stat",
+	};
+	const runnable = { ...runnableCriteria[0]! };
+	const out = await applyVerification(
+		{ ...attested, pendingCriteria: [manualCheck, runnable] },
+		{
+			cwd: "/work",
+			criteria: runnableCriteria,
+			run: async (command) => {
+				runs.push(command);
+				return { code: 0, stdout: "ok\n", stderr: "" };
+			},
+		},
+	);
+	assert.deepEqual(runs, ["npm test"], "only the runnable criterion's command ran");
+	const ids = (out.pendingCriteria ?? []).map((criterion) => criterion.id);
+	assert.deepEqual(ids, ["manual-diff-review"], "the unexecuted criterion stays pending; the run one is resolved");
+});

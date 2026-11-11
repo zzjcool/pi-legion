@@ -420,6 +420,40 @@ test("required verification command promotes an attested RPC verdict to verified
 	}
 });
 
+test("#393 review D393-5: a live timeout snapshot is not a result, so no verify command runs", async () => {
+	const h = harness();
+	const calls: Array<{ command: string; cwd: string }> = [];
+	const orchestrator = new Orchestrator({
+		supervisor: h.supervisor,
+		runDir: h.runDir,
+		cwd: "/tmp/project",
+		verifyRunner: async (command, cwd) => {
+			calls.push({ command, cwd });
+			return { code: 0, stdout: "green", stderr: "" };
+		},
+	});
+	try {
+		const handle = await orchestrator.launch({
+			agent: agent({ acceptance: { level: "attested", criteria: [{ id: "tests", must: "tests pass", evidence: ["verification-output"], severity: "required", command: "npm test" }] } }),
+			task: "still writing its worktree",
+			worktree: false,
+		});
+		const collected = await orchestrator.collect(handle.name, { timeoutMs: 2 });
+		assert.equal(collected.execution.status, "running");
+		assert.equal(collected.execution.reason, COLLECT_DEADLINE_REASON);
+		assert.equal(h.supervisor.isAlive(handle.name), true, "the child is still alive: this is a snapshot, not a result");
+		// The snapshot must not spawn a command inside a worktree that is still being
+		// written. The collect deadline has already passed, which is exactly how a
+		// spurious `rejected` / `verified` gets manufactured.
+		assert.deepEqual(calls, [], "a snapshot must not run the verify command");
+		assert.equal(collected.acceptance.status, "unknown");
+		assert.equal(collected.acceptance.level, "none");
+		assert.match(collected.acceptance.reason ?? "", /collect deadline/);
+	} finally {
+		h.cleanup();
+	}
+});
+
 test("a live child timeout stays working and does not write a terminal output artifact", async () => {
 	const h = harness();
 	try {

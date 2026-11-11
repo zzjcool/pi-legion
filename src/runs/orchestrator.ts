@@ -3006,10 +3006,30 @@ export class Orchestrator {
 		// note can be applied without either writing it twice or losing it when the
 		// retry's own wait did not see the terminal turn (#316 review, minor 4).
 		const execution = this.withEmptyGenerationRetryNote(child, input);
-		const acceptance = await applyVerification(
-			deriveAcceptance(parsed, execution, child.pendingCriteria, { ...(child.completionGuard ? { completionGuard: true } : {}) }),
-			{ cwd: child.worktreePath ?? this.cwd, criteria: child.pendingCriteria, run: this.verifyRunner, timeoutMs: Math.max(5_000, deadline - this.now()) },
-		);
+		const derived = deriveAcceptance(parsed, execution, child.pendingCriteria, { ...(child.completionGuard ? { completionGuard: true } : {}) });
+		// #393 review / D393-5: verification runs on a TERMINAL collect only.
+		//
+		// A `running` execution is a SNAPSHOT, not a result: `classifyOutcome`
+		// produces it when the collect deadline fires while the child is still alive
+		// (and for a transient connection blip on a live child), and
+		// `deriveAcceptance` turns it into `status: "unknown"`. Running the verify
+		// commands for it spawns them inside a worktree that child is still writing,
+		// and the deadline has already elapsed, so `Math.max(5_000, deadline - now)`
+		// is almost always the 5s floor — a real command times out and manufactures a
+		// fake `rejected` / `verified`. The tree-wide verify-slot wait is not charged
+		// against that timeout either, so the wait can also push this collect past
+		// its own deadline. The commands belong to the terminal turn that follows.
+		//
+		// Only `running` is skipped: every other status keeps the exact behaviour it
+		// had before (#393 / D393-1, D393-2 are unchanged inside applyVerification).
+		const acceptance = execution.status === "running"
+			? derived
+			: await applyVerification(derived, {
+				cwd: child.worktreePath ?? this.cwd,
+				criteria: child.pendingCriteria,
+				run: this.verifyRunner,
+				timeoutMs: Math.max(5_000, deadline - this.now()),
+			});
 		const isRetired = () => child.state === "retired";
 		// A running child can finish its in-flight collect while an explicit stop
 		// is retiring it. Record the result, but never demote a retired lifecycle
