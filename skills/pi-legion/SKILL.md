@@ -77,31 +77,40 @@ When a squad declares the built-in machine, its four work phases are
 `phases` has no phase machine at all (no `nodes.phase`, no `legion_phase` tool).
 Planning writes `.pi-legion/contract.md` with interfaces, file
 ownership, and acceptance commands before implementation starts. The
-executable acceptance commands are declared in one of two equivalent forms:
+executable acceptance commands are declared in one of two equivalent forms, and
+markdown's own line prefixes (a `> ` quote, a `#{1,6}` heading marker, one list
+marker — `- ` / `* ` / `+ ` / `N.` / `N)`) are stripped before the line is read,
+so `> legion-verify: npm test` and `1. legion-verify: npm test` are the same
+declaration as the bare one:
 
-- a fenced block whose info string is exactly `legion-verify`:
+- a fenced block whose info string is exactly `legion-verify` — with backticks or
+  with tildes, both are read the same:
 
   ```legion-verify
   npm run typecheck
   npm test
   ```
 
-- one command per bare line, `legion-verify: <command>`, optionally behind a
-  markdown list marker (`- ` / `* ` / `+ `):
+- one command per bare line, `legion-verify: <command>`:
 
   ```text
   - legion-verify: npm run typecheck
-  - legion-verify: npm test
+  > legion-verify: npm test
   ```
 
-A `## legion-verify` heading, a fence whose info string carries extra words
-(`legion-verify bash`), or a passing mention in prose is NOT a declaration: a
-contract that says `legion-verify` but states no command in either form above
-FAILS verification and parks the team in `verifying` instead of passing
-vacuously. Only a contract with no `legion-verify` wording at all — and an empty
-`legion-verify` block — advances the phase with 0 commands executed: a pass by
-contract (§7.3), never evidence that the code was checked (`0 commands` is not a
-green). Reviewing
+What the supervisor then does with a contract is exactly one of four things:
+
+| the contract… | result |
+|---|---|
+| declares either legal form above — a fenced block with info string exactly `legion-verify` on a backtick or a tilde fence, or a `legion-verify: <command>` line behind any of those prefixes | the declared commands RUN under the supervisor |
+| OPENS a line with `legion-verify` in a shape nothing reads — a `## legion-verify` heading (quoted or not), or a fence whose info string carries extra words, e.g. info string `legion-verify bash` on a backtick or a tilde fence | verification FAILS; the team stays in `verifying` |
+| mentions `legion-verify` mid-sentence only ("use the legion-verify block") | IGNORED: no command runs, and by contract (§7.3) that is a pass |
+| never mentions it, or declares an empty fence block / an empty `legion-verify:` line | 0 commands, and by contract (§7.3) a pass |
+
+`0 commands` is not a green: it means there is no evidence, not that something
+failed. It is a pass by contract (§7.3 — the usual read-only case), the report
+has to say so instead of claiming a check happened, and it is never by itself a
+reason to hold a team back — only row 2 fails. Reviewing
 uses independent review; verifying runs the contract's `legion-verify`
 commands under the supervisor, without an LLM deciding whether they passed.
 

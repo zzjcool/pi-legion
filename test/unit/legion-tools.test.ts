@@ -14,6 +14,7 @@ import {
 	registerLegionTools,
 	requestLegionPhase,
 	runVerification,
+	verificationSummary,
 	verificationTree,
 	type LegionCommandRunner,
 } from "../../src/extension/legion-tools.ts";
@@ -378,6 +379,112 @@ test("#394 §7.3: an empty block, an empty bare line, and no declaration at all 
 			assert.equal(result.commandCount, 0);
 			assert.match(result.message, /verification passed/);
 		}
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// #394 D394-5 — ONE normalisation for the declaration prefix, so a declaration
+// is read wherever markdown puts it (`>` quote, `#{1,6}` heading, list marker)
+// and a fence may use ``` or ~~~. A line that OPENS with `legion-verify` in a
+// shape nothing reads is a FAILURE wherever it sits; a mid-sentence mention
+// stays prose (it neither runs nor turns a read-only squad red).
+// ---------------------------------------------------------------------------
+
+test("#394 D394-5: every declaration prefix normalises to one of the two legal shapes", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-verify-prefix-"));
+	const db = openLegionDb(":memory:");
+	try {
+		assert.deepEqual(
+			parseLegionVerifyContract("~~~legion-verify\n# ignored\nnpm test\n~~~\n"),
+			{ commands: ["npm test"], shape: "fence" },
+			"a tilde fence is a fence, exactly like the backtick one",
+		);
+		assert.deepEqual(
+			parseLegionVerifyContract("# Contract\n\n> legion-verify: npm test\n"),
+			{ commands: ["npm test"], shape: "bare-line" },
+			"a block quote in front of a bare line is still a bare line",
+		);
+		assert.deepEqual(
+			parseLegionVerifyContract("# Contract\n\n1. legion-verify: npm test\n2) legion-verify: printf ok\n"),
+			{ commands: ["npm test", "printf ok"], shape: "bare-line" },
+			"an ordered-list marker is a list marker too",
+		);
+
+		insertNode(db, { parentId: null, name: "root", role: "root" });
+		const team = insertNode(db, { parentId: "root", name: "team", role: "centurion" });
+		const calls: string[] = [];
+		const result = await runVerification(db, team, "# Contract\n\n> legion-verify: npm test\n\n~~~legion-verify\nprintf ok\n~~~\n", {
+			cwd: rootDir,
+			runDir: path.join(rootDir, "run"),
+			now: () => 900,
+			runCommand: async (command) => {
+				calls.push(command);
+				return { code: 0, stdout: "green", stderr: "" };
+			},
+		});
+		assert.equal(result.passed, true);
+		// Order is the documented one (`parseLegionVerifyCommands`): fenced blocks first,
+		// then bare lines — a prefixed line is collected by the same scan, not a new one.
+		assert.deepEqual(calls, ["printf ok", "npm test"], "a prefixed declaration is a real verification, not a 0-command pass");
+		assert.equal(result.commandCount, 2);
+	} finally {
+		db.close();
+		rmSync(rootDir, { recursive: true, force: true });
+	}
+});
+
+test("#394 D394-5: a declaration-shaped line nothing can read still fails, wherever markdown puts it", () => {
+	assert.deepEqual(
+		parseLegionVerifyContract("~~~legion-verify bash\nnpm test\n~~~\n"),
+		{ commands: [], shape: "unrecognised" },
+		"a tilde fence whose info string carries extra words is the same typo as ```legion-verify bash",
+	);
+	assert.deepEqual(
+		parseLegionVerifyContract("# Contract\n\n> ## legion-verify\n\n```\nnpm test\n```\n"),
+		{ commands: [], shape: "unrecognised" },
+		"a quoted heading is still a heading: it declares nothing the supervisor runs",
+	);
+	assert.deepEqual(
+		parseLegionVerifyContract("Write `legion-verify: npm test` in the contract.\n"),
+		{ commands: [], shape: "none" },
+		"…while a mid-sentence mention is prose: no command runs, and it does not turn the squad red",
+	);
+	assert.deepEqual(
+		parseLegionVerifyContract("~~~legion-verify bash\nnpm test\n~~~\n\n~~~legion-verify\nnpm test\n~~~\n"),
+		{ commands: ["npm test"], shape: "fence" },
+		"a parsable block still outranks a stray wrong-shaped declaration (priority unchanged)",
+	);
+});
+
+test("#394 F5: verificationSummary carries `passed`, so a red row is not rendered as a 0-command pass", async () => {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-verify-summary-"));
+	const db = openLegionDb(":memory:");
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root" });
+		const team = insertNode(db, { parentId: "root", name: "team", role: "centurion" });
+		const options = {
+			cwd: rootDir,
+			runDir: path.join(rootDir, "run"),
+			now: () => 900,
+			runCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
+		};
+		// The case the collect head used to mis-report: an author who DID try to declare
+		// verification, in a shape nothing reads. Nothing ran, so `commandCount` is 0 —
+		// and only `passed` can tell this row apart from the §7.3 pass by contract.
+		const red = await runVerification(db, team, "# Contract\n\n## legion-verify\n\n```\nnpm test\n```\n", options);
+		assert.equal(red.passed, false);
+		const redSummary = verificationSummary(getNode(db, team.id)!);
+		assert.equal(redSummary?.commandCount, 0);
+		assert.equal(redSummary?.passed, false, "a red 0-command row must not read as a contract pass");
+
+		const green = await runVerification(db, team, "```legion-verify\nnpm test\n```\n", options);
+		assert.equal(green.passed, true);
+		const greenSummary = verificationSummary(getNode(db, team.id)!);
+		assert.equal(greenSummary?.passed, true);
+		assert.equal(greenSummary?.commandCount, 1);
 	} finally {
 		db.close();
 		rmSync(rootDir, { recursive: true, force: true });
