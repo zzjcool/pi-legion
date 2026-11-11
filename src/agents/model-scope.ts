@@ -35,6 +35,68 @@ export function stripThinkingSuffix(model: string): string {
 }
 
 /**
+ * The RUNNING form of a model, for display (D-R8.1).
+ *
+ * One producer for every place that shows `model` next to `thinking`: the status
+ * widget, the summary detail and `/legion agents`. Each used to assemble the
+ * string its own way, so the same child read `cb/x` in one view and `cb/x:max`
+ * in another, and the status widget swallowed an explicit `:off`.
+ *
+ * Rules, in order:
+ *  - `thinking: false` is an explicit "no reasoning": no level is shown, not even
+ *    one baked into the model id. The normal launch path already strips the
+ *    level in that case (`step-model`), so this only keeps the label honest for
+ *    a record written by an older process.
+ *  - a trailing KNOWN level in the model id wins: it is what the child actually
+ *    runs (`applyThinkingSuffix` keeps the suffix), so `cb/x:high` + `max` is
+ *    `cb/x:high`.
+ *  - a trailing UNKNOWN segment is part of the model id (`provider/model:variant`),
+ *    so the configured level is appended after it — exactly what the launcher
+ *    does with the same input, which is the whole point of sharing the rule.
+ *  - otherwise a known level in `thinking` is appended.
+ *
+ * `off` is a real, effective level and therefore rendered when it is the level
+ * that runs.
+ */
+export function modelLabel(
+	model: string | undefined,
+	thinking: string | false | undefined,
+): string | undefined {
+	if (!model) return undefined;
+	// `false` means reasoning is OFF: strip a level an older record may still
+	// carry, rather than render one that no longer applies.
+	if (thinking === false) return stripThinkingSuffix(model);
+	// Everything else is literally the launcher's own rule — see
+	// `withThinkingLevel` below, which `applyThinkingSuffix` also delegates to.
+	// One implementation, so a label can never disagree with the argv.
+	return withThinkingLevel(model, thinking) ?? model;
+}
+
+/**
+ * Append `:<thinking>` to a model id, unless it already carries a known suffix.
+ *
+ * The single implementation behind BOTH the launcher's argv/model-ref
+ * (`applyThinkingSuffix` in `src/runs/args.ts`) and the display label above.
+ * They were two hand-written copies of the same rule, so a change to one could
+ * leave the other describing a child differently from how it actually runs —
+ * exactly the class of bug the label exists to prevent.
+ *
+ * `replaceExisting` is only used by the argv builder's callers.
+ */
+export function withThinkingLevel(
+	model: string | undefined,
+	thinking: string | false | undefined,
+	replaceExisting = false,
+): string | undefined {
+	if (!model || !thinking) return model;
+	const colon = model.lastIndexOf(":");
+	if (colon !== -1 && isThinkingLevel(model.slice(colon + 1))) {
+		return replaceExisting ? `${model.slice(0, colon)}:${thinking}` : model;
+	}
+	return `${model}:${thinking}`;
+}
+
+/**
  * Match a `*`-glob against `text`, case-insensitively, as a FULL match.
  *
  * Deliberately NOT a RegExp. Translating a glob into `.*` produces nested

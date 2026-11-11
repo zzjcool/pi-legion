@@ -9,6 +9,7 @@ import {
 	HYGIENE_SWEEP_STALE_DAYS,
 	LEGION_SLASH_HELP_LINES,
 	expectedModelsFromSettings,
+	modelMatches,
 	parseDoctorSections,
 	parseListModels,
 	runLegionDoctor,
@@ -40,6 +41,22 @@ any-endpoint  cursor-plugin/glm-5p3               1M       262.1K   yes       ye
 		"any-endpoint/cursor-plugin/glm-5p3",
 	]);
 	assert.deepEqual(parseListModels("No models available. Use /login"), []);
+});
+
+// D-R8.3: only a KNOWN thinking level is a suffix. "Drop the last `:` segment"
+// was a third definition of the same thing and truncated real model ids.
+test("modelMatches strips a known thinking level and nothing else", () => {
+	const host = ["cb/x", "any-endpoint/workbuddy/hy4-preview-ioa", "provider/model:variant"];
+	// known level: the registry id is the base
+	assert.equal(modelMatches("cb/x:high", host), true);
+	// an UNKNOWN suffix is part of the model id — the old rule cut it to
+	// `provider/model` and reported a model the host really serves as missing
+	assert.equal(modelMatches("provider/model:variant", host), true);
+	// the normal forms still match
+	assert.equal(modelMatches("any-endpoint/workbuddy/hy4-preview-ioa", host), true);
+	assert.equal(modelMatches("workbuddy/hy4-preview-ioa", host), true);
+	// …and a genuinely absent model still reads as missing
+	assert.equal(modelMatches("cb/missing", host), false);
 });
 
 test("expectedModelsFromSettings reads team members", () => {

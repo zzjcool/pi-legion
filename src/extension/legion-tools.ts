@@ -1497,6 +1497,8 @@ export function formatTree(nodes: readonly LegionNode[]): string {
 		`role=${node.role}`,
 		`status=${node.status}`,
 		...(node.phase ? [`phase=${node.phase}`] : []),
+		// Ledger-only model (D-R8.2): the `nodes` table carries no `thinking`
+		// column, so the tree listing prints the id it has and invents no level.
 		...(node.model ? [`model=${node.model}`] : []),
 		`depth=${node.depth}`,
 	].join(" ")).join("\n");

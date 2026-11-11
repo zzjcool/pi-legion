@@ -16,8 +16,7 @@ import {
 } from "../shared/types.ts";
 import { classifyModelOrigin, resolveStepModel } from "../agents/step-model.ts";
 import { INHERIT_WITHOUT_PARENT_MODEL } from "../agents/model-resolution.ts";
-import { checkModelScope } from "../agents/model-scope.ts";
-import { applyThinkingSuffix } from "../runs/args.ts";
+import { checkModelScope, modelLabel } from "../agents/model-scope.ts";
 import {
 	DEFAULT_TEAM,
 	TEAM_ENV,
@@ -287,9 +286,9 @@ function modelLine(
 	// after preset expansion) is appended as `:level` by the SAME builder that
 	// writes the rpc argv and the in-process model ref, so a listing that showed
 	// the bare id would disagree with the child it describes (`cb/x` here vs
-	// `cb/x:max` there).
-	const effectiveModel =
-		applyThinkingSuffix(model, resolved.agent.thinking) ?? model;
+	// `cb/x:max` there). `modelLabel` is that builder's display twin (D-R8.2); the
+	// `?? model` keeps the "no model resolved" case rendering as before.
+	const effectiveModel = modelLabel(model, resolved.agent.thinking) ?? model;
 
 	const parts = [`model: ${effectiveModel} (${label ?? "resolved"})`];
 

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
 	matchesScopePattern,
 	checkModelScope,
+	modelLabel,
 	stripThinkingSuffix,
 	splitThinkingSuffix,
 	parseModelScopeConfig,
@@ -52,6 +53,36 @@ test("scope: thinking suffix is stripped only for known levels", () => {
 		baseModel: "a/b",
 		thinking: "low",
 	});
+});
+
+// D-R8.1: ONE display producer for `model` + `thinking`. The table is the
+// contract: every row is a shape the launch paths really produce.
+test("scope: modelLabel renders the RUNNING form", () => {
+	const cases: Array<[
+		string | undefined,
+		string | false | undefined,
+		string | undefined,
+		string,
+	]> = [
+		// A level inside the model id is what runs (`applyThinkingSuffix` keeps it),
+		// so the suffix outranks the field — the resume shape.
+		["cb/x:high", "max", "cb/x:high", "suffix wins over a configured level"],
+		["cb/x", "max", "cb/x:max", "the configured level is appended"],
+		["cb/x:high", false, "cb/x", "thinking:false shows no level at all"],
+		["cb/x:high", undefined, "cb/x:high", "no field to fold in: the suffix stands"],
+		["cb/x:off", undefined, "cb/x:off", "`off` is a real level, not noise"],
+		[
+			"provider/model:variant",
+			"max",
+			"provider/model:variant:max",
+			"an unknown suffix is part of the id, so the level is appended like the launcher does",
+		],
+		["cb/x", undefined, "cb/x", "nothing to show but the id"],
+		[undefined, "max", undefined, "no model, no label"],
+	];
+	for (const [model, thinking, expected, why] of cases) {
+		assert.equal(modelLabel(model, thinking), expected, `${why}: ${String(model)} + ${String(thinking)}`);
+	}
 });
 
 test("scope: glob matching is case-insensitive and anchored", () => {

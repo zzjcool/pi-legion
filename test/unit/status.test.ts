@@ -309,6 +309,28 @@ test("formatWidgetLines adds model, thinking, kind, tools, and worktree", () => 
 	);
 });
 
+test("formatWidgetLines shows an explicit `:off` model suffix (D-R8.2)", () => {
+	// `off` is a real, effective thinking level — the child genuinely runs with
+	// reasoning disabled. The widget used to special-case it away, which made
+	// "reasoning is off" look exactly like "no level known". Same producer as the
+	// summary and the roster now (`modelLabel`).
+	assert.deepEqual(
+		formatWidgetLines(
+			[{ name: "worker-0", agent: "worker", state: "working", startedAt: 1_000, model: "cb/x:off" }],
+			5_000,
+		),
+		["● worker-0 (worker) · cb/x:off · 4s", "  ⎿  working"],
+	);
+	// …and a level carried by the FIELD is rendered as the running suffix too.
+	assert.deepEqual(
+		formatWidgetLines(
+			[{ name: "worker-1", agent: "worker", state: "working", startedAt: 1_000, model: "cb/x", thinking: "off" }],
+			5_000,
+		),
+		["● worker-1 (worker) · cb/x:off · 4s", "  ⎿  working"],
+	);
+});
+
 test("formatWidgetLines shows cumulative tokens and output/generation throughput", () => {
 	const lines = formatWidgetLines(
 		[{ name: "worker-0", agent: "worker", state: "working", startedAt: 0, tokensTotal: 1_200, tokensOut: 600, generationMs: 2_000 }],

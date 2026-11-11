@@ -26,6 +26,7 @@ import {
 } from "../runs/role-tool-gates.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import { INHERIT_MODEL_SENTINEL } from "../agents/model-resolution.ts";
+import { splitThinkingSuffix } from "../agents/model-scope.ts";
 import {
 	hostExtensionDiscoveryState,
 	type HostExtensionDiscoveryState,
@@ -336,8 +337,17 @@ export function parseListModels(output: string): string[] {
 	return models;
 }
 
-function modelMatches(expected: string, available: readonly string[]): boolean {
-	const e = expected.includes(":") ? expected.slice(0, expected.lastIndexOf(":")) : expected;
+/**
+ * Is `expected` present in the registry listing?
+ *
+ * The model id may carry a `:thinking` suffix, and only a KNOWN level is one
+ * (`splitThinkingSuffix`, D-R8.3). The previous "drop the last `:` segment" rule
+ * was a third, disagreeing definition of the same thing: it truncated
+ * `provider/model:variant` — a real id whose `variant` segment is part of the
+ * model — and then reported a model as missing that the host actually serves.
+ */
+export function modelMatches(expected: string, available: readonly string[]): boolean {
+	const e = splitThinkingSuffix(expected).baseModel;
 	if (available.includes(e)) return true;
 	return available.some((a) => a === e || a.endsWith(`/${e}`) || a.split("/").slice(1).join("/") === e);
 }

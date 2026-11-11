@@ -283,6 +283,9 @@ export function createTreeView(
 		const selection = isSelected ? "❯" : " ";
 		const indent = "  ".repeat(Math.max(0, node.depth));
 		const model = safeText(node.model);
+		// `node.model` is the LEDGER's model (D-R8.2): the `nodes` table has no
+		// `thinking` column, so the tree can only show the id — a level shown here
+		// would be invented.
 		return formatNodeLine(node, `${indent}${selection}${marker} `, model);
 	}
 

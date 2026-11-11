@@ -14,6 +14,7 @@ import {
 	isThinkingLevel,
 } from "../shared/types.ts";
 import { formatChildTask } from "../extension/child-guard.ts";
+import { withThinkingLevel } from "../agents/model-scope.ts";
 import { childEnablesMcp, discoveredHostExtensions, inheritedExtensions, matchesExcludedExtension } from "./extension-inheritance.ts";
 
 /** Re-exported for callers that only need the level list. */
@@ -30,12 +31,10 @@ export function applyThinkingSuffix(
 	thinking: string | false | undefined,
 	replaceExisting = false,
 ): string | undefined {
-	if (!model || !thinking) return model;
-	const colonIdx = model.lastIndexOf(":");
-	if (colonIdx !== -1 && isThinkingLevel(model.slice(colonIdx + 1))) {
-		return replaceExisting ? `${model.slice(0, colonIdx)}:${thinking}` : model;
-	}
-	return `${model}:${thinking}`;
+	// One implementation with the display label (`modelLabel` in
+	// `src/agents/model-scope.ts`): the string an operator reads and the string
+	// the child is launched with must be produced by the same rule.
+	return withThinkingLevel(model, thinking, replaceExisting);
 }
 
 /**
