@@ -88,6 +88,51 @@ export function artifactPathFor(runDir: string, name: string, round: number): st
 }
 
 /**
+ * The artifact id a path names, or `undefined` when it names none (§3 D5, P5a).
+ *
+ * The READ-side twin of {@link artifactPathFor}: one definition of "what an artifact
+ * path looks like", so a parser here and a writer there can never disagree about the
+ * same file. Accepts exactly `<runDir>/artifacts/<segment>/r<round>.md`:
+ *
+ * - the **canonical** spelling only. `rebuild`/`maxRoundOnDisk` tolerate `r01.md` for
+ *   the round cursor, but the writer (`artifactIdFor`/`artifactPathFor`) only ever
+ *   produces `r<round>.md`, and the id `"<runId>/<segment>/r<round>"` is compared
+ *   against ledger rows keyed by that canonical spelling — answering an id for `r01.md`
+ *   would point at a DIFFERENT path than the one that was read;
+ * - `round` must be a positive safe integer (`r0.md` is not an artifact, A1);
+ * - a segment that would escape (`..`) or is empty is not a name, so not an artifact.
+ *
+ * `runId` defaults to `path.basename(runDir)` — the same fallback `artifactRunId()` in
+ * the orchestrator uses when the run has no legion context, which keeps the id this
+ * parser derives equal to the id the writer recorded (`pinned by`
+ * `test/unit/artifacts.test.ts`).
+ *
+ * Paths are resolved before comparing, so a relative `read` argument and an absolute
+ * `runDir` can still meet. A path outside `runDir` is `undefined`, never a throw: this
+ * is called from a `tool_result` hook (§3 D5).
+ */
+export function artifactIdFromPath(filePath: string, runDir: string, runId?: string): string | undefined {
+	if (typeof filePath !== "string" || filePath.length === 0) return undefined;
+	if (typeof runDir !== "string" || runDir.length === 0) return undefined;
+	const relative = path.relative(path.resolve(runDir), path.resolve(filePath));
+	const parts = relative.split(path.sep);
+	if (parts.length !== 3) return undefined;
+	const [directory, segment, file] = parts;
+	if (directory !== ARTIFACTS_DIRECTORY) return undefined;
+	if (segment === undefined || segment.length === 0 || segment === "." || segment === "..") return undefined;
+	if (file === undefined) return undefined;
+	const match = ARTIFACT_FILE_PATTERN.exec(file);
+	if (!match) return undefined;
+	const round = Number(match[1]);
+	if (!Number.isSafeInteger(round) || round < 1) return undefined;
+	// Canonical only: the id names `r<round>.md`, so a differently spelled file (r01.md)
+	// must not borrow that identity.
+	if (file !== `r${round}.md`) return undefined;
+	const idRunId = typeof runId === "string" && runId.length > 0 ? runId : path.basename(path.resolve(runDir));
+	return `${idRunId}/${segment}/r${round}`;
+}
+
+/**
  * The highest round already used by this `(run, name)`, `0` when none (D1a).
  *
  * **Both** sources, and their maximum (v1.5):

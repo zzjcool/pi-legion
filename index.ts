@@ -115,6 +115,7 @@ import {
 	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
+import { artifactIdFromPath } from "./src/runs/artifacts.ts";
 import {
 	beginMailHold,
 	endMailHold,
@@ -2579,6 +2580,15 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	pi.on("tool_result", (_event, ctx) => {
 		bindUi(_event, ctx);
 		runtime.refreshUi();
+		// D5 (`result-ledger-v1.md` §3 D5, §6 P5a): a generic `read` that reaches EOF IS a
+		// consumption of that artifact. Wrapped here AND inside the hook: a ledger write is
+		// a fact ABOUT the tool result, never a condition of it (D1e), so not even the
+		// argument evaluation may escape into the host's tool result.
+		try {
+			recordArtifactReadFromToolResult({ event: _event, identity: ownLegionIdentity() });
+		} catch {
+			/* D1e: a ledger failure is a diagnostic, never the tool's answer. */
+		}
 	});
 	pi.on("session_shutdown", shutdownRetireAll);
 }
@@ -2745,8 +2755,8 @@ function markDelivered(seam: LedgerReadSeam | undefined, artifactId: string): vo
 }
 
 /**
- * Settle a control result's DEFERRED read-side writes (`§3 D3b`) — the only caller of
- * {@link markDelivered}.
+ * Settle a control result's DEFERRED read-side writes (`§3 D3b`) — the tool-layer
+ * caller of {@link markDelivered} (the D5 generic-`read` hook is the other one).
  *
  * Called after the handler returned and after every bail the handler could see, from
  * `settleControlResult` (the tool layer). A result with no `ledgerReads` — every bail,
@@ -2760,6 +2770,105 @@ function markLedgerReads(seam: LedgerReadSeam | undefined, details: unknown): vo
 	for (const id of ids) {
 		if (typeof id === "string") markDelivered(seam, id);
 	}
+}
+
+/** The identity facts the D5 read hook needs; `ownLegionIdentity()` answers all four. */
+export interface ArtifactReadHookIdentity {
+	/** This session's ledger connection (the host's one handle — no second open). */
+	db: DatabaseSync;
+	/** The CONSUMER whose row the read advances; a root's id is literally `"root"` (D3). */
+	nodeId: string;
+	/** `<runId>` component of the artifact id (D1). */
+	runId: string;
+	/** `<runDir>` that owns `artifacts/…` — the `runDir` half of {@link artifactIdFromPath}. */
+	runDir: string;
+}
+
+/**
+ * D5 (`result-ledger-v1.md` §3 D5, §6 P5a): a generic `read` that reaches EOF consumes
+ * the artifact, exactly like a `collect`/`wait` delivery does (P4a).
+ *
+ * Why this hook exists at all: W5 — the completion notice recommends reading the output
+ * file, and a model that takes that advice uses the ordinary `read` tool, which no
+ * ledger-aware path sees. Without this, the artifact stays `undelivered` (D4) and the
+ * parent gets a second copy of a result it already read. With it, the root needs NO
+ * exemption from `registerLegionTools`' `nodeId !== "root"` gate (D5), which is why the
+ * gate and `registerTools:false` stay untouched.
+ *
+ * What counts as "read" is D6 (user ruling, 2026-11-10: "read half is not read"):
+ *
+ * - **no `offset`/`limit`** ⇒ the tool returned the whole body ⇒ record `full`;
+ * - **`offset` or `limit` present** ⇒ a page, not the body ⇒ record NOTHING (the
+ *   projection must keep owing the notice);
+ * - **the shape cannot be read at all** (no event, no `input`, no `path`, a non-string
+ *   path, a thrown `stat`) ⇒ also NOTHING. The direction is deliberate: a missing
+ *   record can cost one redundant notice, a wrong one silently drops the result — and
+ *   D4/A3 make the ledger the only place "the parent has seen this" may live, so a
+ *   guessed `full` is unrecoverable.
+ *
+ * Two further vetoes on top of D5's literal criterion, both in the same conservative
+ * direction:
+ *
+ * - a failed read (`isError`) or one the tool itself truncated
+ *   (`details.truncation.truncated` — the read tool caps at 2000 lines / 50 KB) did not
+ *   deliver EOF, whatever the arguments said;
+ * - the body on disk must still be exactly `artifacts.bytes`. `bytes` is taken from the
+ *   LEDGER ROW, not from `stat`/`content.length`: it is the number the projection
+ *   compares `read_bytes` against, and a file that changed size is D7's
+ *   `changed-on-disk` — it must not advance `full`.
+ *
+ * The write goes through {@link markDelivered}, the same sequence (and the same
+ * `consumerId`, `identity.nodeId`) the `collect`/`wait` seam uses. A path that names no
+ * artifact, or an id with no `artifacts` row, records nothing (same guard as
+ * `markDelivered`). Returns the id it recorded, or `undefined`.
+ *
+ * D1e: never throws. This runs inside `tool_result`, and a ledger failure must not be
+ * able to fail the tool the model just called.
+ */
+export function recordArtifactReadFromToolResult(input: {
+	event: unknown;
+	identity: ArtifactReadHookIdentity | undefined;
+}): string | undefined {
+	try {
+		const identity = input.identity;
+		if (!identity) return undefined;
+		const event = asRecord(input.event);
+		if (!event || event.toolName !== "read") return undefined;
+		// D6: a paged read is a page. Checked before the path so a partial read of an
+		// artifact cannot depend on any later parse succeeding.
+		const params = asRecord(event.input);
+		if (!params) return undefined;
+		if (params.offset !== undefined || params.limit !== undefined) return undefined;
+		const filePath = params.path;
+		if (typeof filePath !== "string" || filePath.length === 0) return undefined;
+		// A read that failed, or one the tool truncated, did not reach EOF.
+		if (event.isError === true) return undefined;
+		const details = asRecord(event.details);
+		const truncation = details ? asRecord(details.truncation) : undefined;
+		if (truncation?.truncated === true) return undefined;
+
+		const artifactId = artifactIdFromPath(filePath, identity.runDir, identity.runId);
+		if (artifactId === undefined) return undefined;
+		const artifact = artifactById(identity.db, artifactId);
+		if (!artifact) return undefined;
+		// `bytes` is the row's number (D5) and A1 says the body is immutable: a size that
+		// disagrees means the file on disk is not (or is no longer) this artifact.
+		const stats = fs.statSync(path.resolve(filePath));
+		if (!stats.isFile() || stats.size !== artifact.bytes) return undefined;
+
+		markDelivered({ db: identity.db, consumerId: identity.nodeId }, artifactId);
+		return artifactId;
+	} catch {
+		// D1e: a closed/refusing database or an unreadable file is a diagnostic failure,
+		// never a condition of the tool result this hook is riding on.
+		return undefined;
+	}
+}
+
+/** `Record<string, unknown>` view of an untyped event field, or `undefined`. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	return value as Record<string, unknown>;
 }
 
 /**
