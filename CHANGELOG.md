@@ -74,6 +74,20 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   与 `skills/**/SKILL.md` 补最小示例与「`0 commands` 不是绿灯」。格式要求此前只存在于 frozen 的
   `docs/legion-v2-contract.md` §7.2，真正写契约的 agent 读的是角色卡/技能卡，于是「标题 +
   普通围栏」静默解析为 0 条并直通 done。
+- **验证通过后树变了就不再算数。** `VerificationResult` 多记三样事实：`cwd`、`contractFile`、
+  `tree`（HEAD + `git status --porcelain --untracked-files=normal` + 契约文本的 sha256）。契约文本
+  必须进摘要，因为 `.pi-legion/` 通常是 **untracked 目录**：`git status` 只输出一行
+  `?? .pi-legion/`，改里面的内容不会改变那一行。`to:"done"` 只在 pass 属于本相位**且树未变**时
+  复用，否则当场重测。三种「记不了」的情形分开处理：没有 `.git` 的检出（只读队、无 worktree）记为
+  `no-git-checkout` 并照旧复用；git 探测失败/超时（二进制缺失、权限）记为未知，强制重测；升级前
+  落库、没有 `cwd` 的 pass 同样重测一次。supervisor 的自动收尾路径不会自己跑验证，遇到过期 pass
+  改为推迟 + 每个「已记录树 / 当前树」组合一次提示（换到新 pass 后自动解除），由 agent 的
+  `legion_phase { to: "done" }` 触发重测后完成。演示里
+  centurion 在 verifying 之后改契约再 amend 进 squash 的那个洞就是这个。
+- **收队提示改为显式 staging。** 注入的 squash 提示改成「显式 add 交付文件、只保留一份契约、排除
+  `.pi-subagents/` 与运行日志、报分支名 + HEAD sha + 文件清单」；`agents/centurion.md` 与
+  `skills/pi-legion/SKILL.md` 同步，卡片 verdict 要求也补上文件清单。squash 本身仍然由 LLM 执行
+  （插件不跑 git），所以这是提示层能做的全部。
 
 
 ## [5.6.0] — 2026-11-09

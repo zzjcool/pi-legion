@@ -98,7 +98,8 @@ worktree, and a nested centurion gets a nested Git worktree. Each squad
 squashes its subtree onto a branch for its parent — the branch is the deliverable, and an
 MR is added only when the repository has a remote. Deliveries move upward until the root
 reviews and merges into the default branch. Do not merge a child squad's work
-at the wrong level.
+at the wrong level. Stage the delivered paths explicitly — `git add -A` sweeps
+run artifacts and duplicate contract copies into the branch.
 
 Resume uses saved run records and Pi session files. Parent shutdown does not
 leave detached child processes; recovery follows the tree's resume chain.

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -12,6 +13,7 @@ import {
 	registerLegionTools,
 	requestLegionPhase,
 	runVerification,
+	verificationTree,
 	type LegionCommandRunner,
 } from "../../src/extension/legion-tools.ts";
 import { openLegionDb } from "../../src/legion/db.ts";
@@ -267,7 +269,14 @@ function seedStoredVerification(
 	db: ReturnType<typeof openLegionDb>,
 	nodeId: string,
 	stored: { passed: boolean; checkedAt: number },
+	cwd: string,
 ): void {
+	// #P0 S4: a pass now carries WHERE and WHAT it judged (`cwd`/`contractFile`/`tree`).
+	// A seeded row without them is a legacy row, which the gate deliberately re-measures.
+	const contractFile = path.join(cwd, ".pi-legion", "contract.md");
+	let contractText = "";
+	try { contractText = readFileSync(contractFile, "utf8"); } catch { contractText = ""; }
+	const tree = verificationTree(cwd, contractText);
 	updateNode(db, nodeId, {
 		taskSummary: JSON.stringify({
 			__piLegion: {
@@ -278,6 +287,9 @@ function seedStoredVerification(
 					outputFile: "/tmp/legacy.legion-verify.log",
 					commandCount: 1,
 					checkedAt: stored.checkedAt,
+					cwd,
+					contractFile,
+					...(tree === undefined ? {} : { tree }),
 				},
 			},
 		}),
@@ -311,7 +323,7 @@ test("#P0 D1: a declared verifying→done with a red contract is refused and the
 	try {
 		// Stored as failed and measured in the CURRENT stint: the request must still
 		// re-measure (a failure is not a pass) and must not walk the edge.
-		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 60 });
+		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 60 }, fx.cwd);
 		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
 			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
 			sendSelfMessage: (text: string) => messages.push(text),
@@ -334,7 +346,7 @@ test("#P0 D1: the same edge passes once the contract is green, and the contract 
 		return { code: 0, stdout: "green", stderr: "" };
 	};
 	try {
-		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 60 });
+		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 60 }, fx.cwd);
 		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
 			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
 			sendSelfMessage() {},
@@ -361,7 +373,7 @@ test("#P0 D1: a fresh pass is reused — `done` costs no second execution", asyn
 	try {
 		// checkedAt (60) >= phaseSince (50): this stint's own pass. Idempotence is the
 		// whole reason a retried `done` may not cost another run.
-		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 60 });
+		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 60 }, fx.cwd);
 		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
 			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
 			sendSelfMessage() {},
@@ -384,7 +396,7 @@ test("#P0 D1: a stored failure from an earlier stint does not lock the team out"
 	try {
 		// Recorded BEFORE this stint began (20 < 50) and red. The fix landed since; the
 		// old failure is not a life sentence.
-		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 20 });
+		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 20 }, fx.cwd);
 		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
 			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
 			sendSelfMessage() {},
@@ -406,7 +418,7 @@ test("#P0 D1: a stored PASS from an earlier stint is not evidence — it is re-m
 		// checkedAt (20) predates phaseSince (50): the pass belongs to another phase
 		// stint, so it may not stand as the evidence for this finish. The OTHER
 		// direction of the freshness rule — dropping this makes `phaseSince` decorative.
-		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 20 });
+		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 20 }, fx.cwd);
 		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
 			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
 			sendSelfMessage() {},
@@ -432,7 +444,7 @@ test("#P0 D1: a phase with no clock cannot inherit a pass from another stint", a
 		// an implicit reopening path. A missing clock means "unknown stint", so the
 		// contract is measured again instead.
 		updateNode(fx.db, "root.team-a", { phase: "verifying", phaseSince: null }, () => 50);
-		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 60 });
+		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 60 }, fx.cwd);
 		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
 			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
 			sendSelfMessage() {},
@@ -442,6 +454,184 @@ test("#P0 D1: a phase with no clock cannot inherit a pass from another stint", a
 		assert.match(result.message, /Verification failed/);
 		assert.deepEqual(commands, ["npm test"], "re-measured instead of trusting the stored pass");
 	} finally { fx.cleanup(); }
+});
+
+/**
+ * A REAL git checkout, so a recorded pass carries a tree fingerprint.
+ *
+ * The identity flags are per command (`-c`) so the developer's global git config is
+ * never touched, and signing is disabled explicitly: a machine with
+ * `commit.gpgsign=true` would otherwise fail the fixture with a swallowed error.
+ * `commitContract: false` leaves the contract UNTRACKED — the common shape, where
+ * `git status` shows one `?? .pi-legion/` line no matter what the file says.
+ */
+function gitDoneGateFixture(options: { commitContract?: boolean } = {}) {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-done-git-"));
+	const cwd = path.join(rootDir, "repo");
+	mkdirSync(path.join(cwd, ".pi-legion"), { recursive: true });
+	writeFileSync(path.join(cwd, "calc.mjs"), "export const add = (a, b) => a + b;\n");
+	const contract = "```legion-verify\nnpm test\n```\n";
+	if (options.commitContract !== false) writeFileSync(path.join(cwd, ".pi-legion", "contract.md"), contract);
+	const git = (...args: string[]) => execFileSync(
+		"git",
+		["-C", cwd, "-c", "user.name=gate", "-c", "user.email=gate@example.invalid", "-c", "commit.gpgsign=false", ...args],
+		{ stdio: "ignore" },
+	);
+	git("init");
+	git("add", ".");
+	git("commit", "-m", "baseline");
+	// Written AFTER the commit, so it stays untracked.
+	if (options.commitContract === false) writeFileSync(path.join(cwd, ".pi-legion", "contract.md"), contract);
+	const db = makePhaseFixture();
+	updateNode(db, "root.team-a", { phase: "verifying", phaseSince: 50 }, () => 50);
+	return { db, cwd, rootDir, cleanup: () => { db.close(); rmSync(rootDir, { recursive: true, force: true }); } };
+}
+
+test("#P0 S4: a pass stops counting once the checkout changes", async () => {
+	const fx = gitDoneGateFixture();
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	try {
+		const contractFile = path.join(fx.cwd, ".pi-legion", "contract.md");
+		// A REAL pass recorded inside this stint: `runVerification` stores where it ran
+		// and what the checkout looked like, which is the evidence a later `done` needs.
+		await runVerification(fx.db, getNode(fx.db, "root.team-a")!, readFileSync(contractFile, "utf8"), {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 60, runCommand, contractFile,
+		});
+		assert.deepEqual(commands, ["npm test"], "the pass is measured once");
+		// The tree moves AFTER the pass. An untracked file is enough: the pass judged a
+		// checkout that no longer exists, and `checkedAt >= phaseSince` alone would have
+		// reused it.
+		writeFileSync(path.join(fx.cwd, "late.txt"), "changed\n");
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage() {},
+		});
+		assert.equal(result.ok, true, result.message);
+		assert.equal(result.phase, "done");
+		assert.deepEqual(commands, ["npm test", "npm test"], "the stale pass is re-measured, once");
+		assert.match(result.message, /Verification passed \(1 command\(s\)\)/);
+	} finally { fx.cleanup(); }
+});
+
+test("#P0 S4: an untracked contract that changed still invalidates the pass", async () => {
+	const fx = gitDoneGateFixture({ commitContract: false });
+	const commands: string[] = [];
+	// The contract edit below makes the command red; the stub follows it so the test can
+	// assert BOTH halves: the pass was re-measured AND the red result refused the finish.
+	let red = false;
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: red ? 7 : 0, stdout: "", stderr: "" };
+	};
+	try {
+		const contractFile = path.join(fx.cwd, ".pi-legion", "contract.md");
+		await runVerification(fx.db, getNode(fx.db, "root.team-a")!, readFileSync(contractFile, "utf8"), {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 60, runCommand, contractFile,
+		});
+		assert.deepEqual(commands, ["npm test"]);
+		// Only the contract changes. `git status` still reports the same single
+		// `?? .pi-legion/` line (an untracked DIRECTORY hides its files' contents), so the
+		// contract text in the digest is the only thing that can notice — this test is
+		// what pins that term.
+		writeFileSync(contractFile, "```legion-verify\nnpm test && exit 7\n```\n");
+		red = true;
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage() {},
+		});
+		assert.equal(result.ok, true, result.message);
+		assert.deepEqual(commands, ["npm test", "npm test && exit 7"], "a contract edit is a new tree to judge — and the edited command is what ran");
+		assert.equal(result.phase, "verifying");
+	} finally { fx.cleanup(); }
+});
+
+test("#P0 S4: a pass stored before the fingerprint existed is re-measured, not trusted", async () => {
+	const fx = doneGateFixture();
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 0, stdout: "", stderr: "" };
+	};
+	try {
+		// Exactly what an upgrade finds: `passed` and a clock, but no record of WHERE it
+		// ran or WHAT it judged. It cannot answer "does this still describe this tree",
+		// so the gate re-measures once instead of trusting it forever.
+		updateNode(fx.db, "root.team-a", {
+			taskSummary: JSON.stringify({
+				__piLegion: {
+					version: 1,
+					taskSummary: null,
+					verification: { passed: true, outputFile: "/tmp/pre-fingerprint.log", commandCount: 1, checkedAt: 60 },
+				},
+			}),
+		}, () => 60);
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage() {},
+		});
+		assert.equal(result.ok, true, result.message);
+		assert.equal(result.phase, "done");
+		assert.deepEqual(commands, ["npm test"], "a legacy pass buys one re-measurement, not a free finish");
+	} finally { fx.cleanup(); }
+});
+
+test("#P0 S4: the supervisor will not complete a team whose pass no longer matches the checkout", async () => {
+	const runCommand: LegionCommandRunner = async () => ({ code: 0, stdout: "", stderr: "" });
+	// --- stale: the tree moved after the pass, so the tick must defer and nudge once.
+	{
+		const fx = gitDoneGateFixture();
+		const messages: string[] = [];
+		try {
+			const contractFile = path.join(fx.cwd, ".pi-legion", "contract.md");
+			await runVerification(fx.db, getNode(fx.db, "root.team-a")!, readFileSync(contractFile, "utf8"), {
+				cwd: fx.cwd, runDir: fx.rootDir, now: () => 60, runCommand, contractFile,
+			});
+			writeFileSync(path.join(fx.cwd, "late.txt"), "changed\n");
+			let nowMs = 100;
+			const postman = new LegionPostman({
+				db: fx.db, nodeId: "root.team-a", supervisor: new FakeSupervisor(), machine: DECLARED_VERIFY_DONE,
+				now: () => nowMs, intervalMs: 10_000, sendSelfMessage: (text) => messages.push(text),
+			});
+			await postman.tick();
+			assert.equal(getNode(fx.db, "root.team-a")?.phase, "verifying", "a stale pass must not complete the team");
+			const nudges = messages.filter((message) => /checkout changed after legion-verify passed/.test(message));
+			assert.equal(nudges.length, 1, "the agent is told why, once");
+			assert.match(nudges[0]!, /legion_phase \{ to: "done" \}/, "and what to do about it");
+			await postman.tick();
+			assert.equal(messages.filter((message) => /checkout changed after legion-verify passed/.test(message)).length, 1, "no reminder storm");
+			// The agent re-measures (a NEW pass for the new tree). One nudge must not
+			// disable this stint's supervisor for good: the pair changed, so the check
+			// re-arms and the team completes.
+			nowMs = 20_000;
+			await runVerification(fx.db, getNode(fx.db, "root.team-a")!, readFileSync(contractFile, "utf8"), {
+				cwd: fx.cwd, runDir: fx.rootDir, now: () => nowMs - 1_000, runCommand, contractFile,
+			});
+			await postman.tick();
+			assert.equal(getNode(fx.db, "root.team-a")?.phase, "done", "a new pass re-arms the supervisor");
+			postman.stop();
+		} finally { fx.cleanup(); }
+	}
+	// --- current: an unchanged checkout still completes on the supervisor's own clock.
+	{
+		const fx = gitDoneGateFixture();
+		try {
+			const contractFile = path.join(fx.cwd, ".pi-legion", "contract.md");
+			await runVerification(fx.db, getNode(fx.db, "root.team-a")!, readFileSync(contractFile, "utf8"), {
+				cwd: fx.cwd, runDir: fx.rootDir, now: () => 60, runCommand, contractFile,
+			});
+			const postman = new LegionPostman({
+				db: fx.db, nodeId: "root.team-a", supervisor: new FakeSupervisor(), machine: DECLARED_VERIFY_DONE,
+				now: () => 100, intervalMs: 10_000, sendSelfMessage() {},
+			});
+			await postman.tick();
+			assert.equal(getNode(fx.db, "root.team-a")?.phase, "done", "an unchanged checkout completes as before");
+			postman.stop();
+		} finally { fx.cleanup(); }
+	}
 });
 
 test("phase rework beyond the frozen limit forces failed and notifies the parent", async () => {

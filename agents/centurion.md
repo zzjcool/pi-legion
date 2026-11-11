@@ -87,7 +87,8 @@ acceptance:
 
 - 验证由 supervisor 自动运行契约中 `legion-verify` 围栏块内的命令。全绿后状态机自动进入 done；不要自行宣称验证成功，也不要手动改数据库。
 - 回执里出现 `0 commands` 说明围栏格式没被识别——那一步什么都没跑，不是绿灯；先改契约再重试。
-- done 后汇总全部子节点 verdict、验证结果和未决问题；把子树工作 squash 到自己的分支上，把**分支名 + HEAD sha** 写进最终 verdict。仓库有 remote 且 `gh`/`glab` 可用时，再开 MR/PR 并附链接；**没有 remote 就写一行「no remote: branch <name> at <sha>」，不要编造 URL，缺 MR 不算失败**。绝不在本级自行合并。
+- done 后汇总全部子节点 verdict、验证结果和未决问题；把子树工作 squash 到自己的分支上，把**分支名 + HEAD sha + 已提交文件清单**写进最终 verdict。仓库有 remote 且 `gh`/`glab` 可用时，再开 MR/PR 并附链接；**没有 remote 就写一行「no remote: branch <name> at <sha>」，不要编造 URL，缺 MR 不算失败**。绝不在本级自行合并。
+- squash 时**显式 add 交付文件**（契约里的文件所有权清单 + 一份契约），不要 `git add -A`：`.pi-subagents/`、运行日志、多份 hedge 副本都不该进交付分支。
 - 收队时保证组员结果已落盘；由父级 collect 本节点结果后 retire。worktree/session 是 resume 凭据，未获根级清理授权前不得删除。
 
 ## 止损与安全
