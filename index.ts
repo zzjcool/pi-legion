@@ -281,7 +281,7 @@ const TaskItem = Type.Object({
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Commands the extension runs itself in the child worktree at collect time; first non-zero exit rejects the verdict.",
+				"Commands the extension runs itself in the child worktree at collect time; first non-zero exit rejects the verdict. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
 		}),
 	),
 });
@@ -340,7 +340,7 @@ const SubagentParams = Type.Object({
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-			"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; the first non-zero exit rejects the child's verdict as `rejected (verified-path)`. The worker does not need to paste test output.",
+			"Verification commands the extension runs itself in the child worktree at collect time (launch only). Each must exit 0; the first non-zero exit rejects the child's verdict as `rejected (verified-path)`. The worker does not need to paste test output. This is NOT the contract's ```legion-verify fence — that one is executed by the supervisor while the team is in the `verifying` phase.",
 		}),
 	),
 	phases: Type.Optional(
@@ -388,7 +388,7 @@ const SubagentParams = Type.Object({
 	),
 	all: Type.Optional(
 		Type.Boolean({
-			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of all live (non-retired) children under cwd",
+			description: "wait: REQUIRED unless name is set — wait for every live (working/blocked) child; mutually exclusive with name. stop: stop every non-retired child; status: overview of the live children under cwd — with `all:true` the retired/finished children are listed below it too (omit `name` for the overview, no `all` needed).",
 		}),
 	),
 	runId: Type.Optional(
@@ -399,7 +399,7 @@ const SubagentParams = Type.Object({
 	),
 	timeoutMs: Type.Optional(
 		Type.Number({
-			description: "wait: per-child timeout in ms; event-driven completion returns early (default: role turnTimeoutMs)",
+			description: "wait: per-child timeout in ms; event-driven completion returns early (default: the smallest role `timeoutMs` among the targets, else 900000 (15m))",
 		}),
 	),
 	ms: Type.Optional(
@@ -458,6 +458,8 @@ const VexillatioParams = Type.Object({
 		}),
 	),
 	model: Type.Optional(Type.String()),
+	// NOT the same default as the wait action's `timeoutMs`: this one settles a utility
+	// launch, and the handler uses a flat 600000 (`input.params.timeoutMs ?? 600_000`).
 	timeoutMs: Type.Optional(Type.Number({ description: "Per-child wait in ms, default 600000" })),
 });
 
@@ -3302,21 +3304,32 @@ async function controlAction(input: {
 			};
 			const classified = classifyChildrenForStatus(runs, factsFor);
 			const now = Date.now();
-			return ok(
-				renderStatusOverview(
-					classified.map(({ child, live }) => {
-						const { pid, inFlightTools, ...facts } = factsFor(child);
-						return {
-							child,
-							...facts,
-							...(pid ? { pid } : {}),
-							...(inFlightTools ? { inFlightTools } : {}),
-							live,
-						};
-					}),
-					now,
+			const overview = renderStatusOverview(
+				classified.map(({ child, live }) => {
+					const { pid, inFlightTools, ...facts } = factsFor(child);
+					return {
+						child,
+						...facts,
+						...(pid ? { pid } : {}),
+						...(inFlightTools ? { inFlightTools } : {}),
+						live,
+					};
+				}),
+				now,
+			);
+			// D7 (polish round): `all` has to MEAN something. The overview above is
+			// live-only by construction (`TERMINAL_STATUS_CHILD_STATES` is skipped), so
+			// `all` used to be a switch that changed nothing — the second of the two
+			// shapes the contract allows. It now adds the retired/finished records below
+			// the live overview; omitting `all` gives exactly what it gave before.
+			if (params.all !== true) return ok(overview);
+			const finished = renderFinishedStatusSection(
+				listFinishedChildrenForStatus(
+					runs,
+					classified.map(({ child }) => child.name),
 				),
 			);
+			return ok(finished ? `${overview}\n\n${finished}` : overview);
 		}
 		// #344: the registry scan is a FALLBACK, not an entry fee. A name this
 		// session is scoped to resolves from one `readRun`; the scan only happens
@@ -6003,6 +6016,57 @@ export function listLiveChildrenForStatus(
 	);
 }
 
+/**
+ * The retired/finished records a `status all` lists below the live overview (D7).
+ *
+ * `classifyChildrenForStatus` drops every terminal state on purpose (a retired
+ * child is not live), which left `all` a switch that changed nothing. `all` now
+ * means "the whole run dir": the same newest-first, newest-record-per-name rule,
+ * keeping the terminal records instead of discarding them.
+ *
+ * `liveNames` is subtracted because a reused name can own both a live record and
+ * an older terminal one — listing one name twice, in two states, is how a status
+ * starts lying.
+ */
+export function listFinishedChildrenForStatus(
+	runs: ReturnType<RunStore["listRuns"]>,
+	liveNames: Iterable<string> = [],
+): StatusChildRecord[] {
+	const excluded = new Set(liveNames);
+	const ranked = [...runs].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+	const picked = new Map<string, StatusChildRecord>();
+	for (const run of ranked) {
+		for (const child of run.children) {
+			if (!TERMINAL_STATUS_CHILD_STATES.has(child.state)) continue;
+			if (excluded.has(child.name) || picked.has(child.name)) continue;
+			picked.set(child.name, child);
+		}
+	}
+	return [...picked.values()];
+}
+
+/**
+ * The trailing section `status all` appends: `retired/finished (2):` plus one line
+ * per terminal child, or `undefined` when there is nothing to append (D7).
+ *
+ * One line each, so the section stays a list of what EXISTS rather than a second
+ * rendering of the live blocks above; the outcome detail reuses the wording the
+ * retired-record notes already use (`execution: success, retired at …`).
+ */
+export function renderFinishedStatusSection(children: StatusChildRecord[]): string | undefined {
+	if (children.length === 0) return undefined;
+	const lines = [`retired/finished (${children.length}):`];
+	for (const child of children) {
+		const bits: string[] = [];
+		const status = child.execution?.status;
+		if (status) bits.push(`execution: ${status}`);
+		if (child.retiredAt) bits.push(`retired at ${child.retiredAt}`);
+		const detail = bits.length > 0 ? ` (${bits.join(", ")})` : "";
+		lines.push(`  ${child.name} — state=${child.state} agent=${child.agent ?? "?"}${detail}`);
+	}
+	return lines.join("\n");
+}
+
 /** One child block for {@link renderStatusOverview}. */
 export interface StatusChildEntry {
 	child: StatusChildRecord;
@@ -6113,7 +6177,6 @@ export const WAIT_TIMEOUT_HINT =
 export interface WaitStillRunningChild {
 	name: string;
 	elapsedMs: number;
-	budgetMs?: number;
 }
 
 /** Structured wait result when children are still live after wait (#179). */
@@ -6154,6 +6217,60 @@ export function buildWaitTimeoutDetails(
 	};
 }
 
+/**
+ * D4 (polish round): the byte cap a `wait` body is previewed at.
+ *
+ * The completion notice previews at `PREVIEW_CHARS` (4 000 **chars**, `notify.ts`) and the
+ * finished cache keeps a `FINISHED_OUTPUT_HEAD_CHARS` (4 000 chars) head — neither is a
+ * byte cap, and neither is exported to this module. The sentence this preview has to make
+ * honest (`cachedHeadLine`) reports UTF-8 BYTES, so the cap that has to hold is bytes:
+ * 4 KB. No existing constant says that, hence the number here (contract D4: "复用现有常量，
+ * 没有就取 4096").
+ */
+const WAIT_BODY_MAX_BYTES = 4 * 1024;
+
+/**
+ * `text` cut to at most `maxBytes` UTF-8 bytes, never splitting a code point.
+ *
+ * `stream: true` holds an incomplete trailing sequence back instead of emitting U+FFFD,
+ * so a head can never end on a mangled character (and can never measure MORE than the cap
+ * it was cut at).
+ */
+function utf8Head(text: string, maxBytes: number): string {
+	return new TextDecoder().decode(
+		Buffer.from(text, "utf8").subarray(0, maxBytes),
+		{ stream: true },
+	);
+}
+
+/**
+ * D4 (polish round): a finished child's text as the `wait` body hands it over.
+ *
+ * The body is a PREVIEW, and `fullBytesOf` is the only thing that can make a cut preview
+ * honest: it supplies the artifact's whole byte count, which `cachedHeadLine` then states
+ * (`this is the cached head (4.0 KB of 24.5 KB); full text: legion_output({ name })`).
+ * Without that number the text is handed over WHOLE — truncating while being unable to
+ * say how much was cut is the one thing this path must not do.
+ *
+ * The returned snapshot is a COPY when it was cut: the caller's `WaitResult` (and the
+ * runtime's finished-cache entry behind it) keeps the whole text (#349's lesson, one
+ * layer up — trimming must never mutate a result someone else already holds).
+ */
+function waitBodySnapshot(
+	snapshot: CollectSnapshot,
+	fullBytesOf: ArtifactBytesLookup | undefined,
+): CollectSnapshot {
+	const total = snapshot.artifactId ? fullBytesOf?.(snapshot.artifactId) : undefined;
+	const bytes = Buffer.byteLength(snapshot.output, "utf8");
+	// No artifact id, no ledger row, no number → no complete byte count → no truncation:
+	// cutting text while being unable to say how much was cut is the one thing this path
+	// must not do (`cachedHeadLine` would have to guess the total).
+	if (total === undefined || bytes <= WAIT_BODY_MAX_BYTES) return snapshot;
+	const head = utf8Head(snapshot.output, WAIT_BODY_MAX_BYTES);
+	if (head.length >= snapshot.output.length) return snapshot;
+	return { ...snapshot, output: head, outputTruncated: true };
+}
+
 /** Render one wait result, reusing the collect shape for finished children. */
 export function renderWait(results: WaitResult[], fullBytesOf?: ArtifactBytesLookup): string {
 	let done = 0;
@@ -6163,12 +6280,21 @@ export function renderWait(results: WaitResult[], fullBytesOf?: ArtifactBytesLoo
 	for (const result of results) {
 		if (result.snapshot) {
 			done += 1;
-			parts.push(renderCollect(result.name, result.snapshot, fullBytesOf));
+			// D4: preview-sized when the ledger can state the whole size, and only then.
+			parts.push(
+				renderCollect(result.name, waitBodySnapshot(result.snapshot, fullBytesOf), fullBytesOf),
+			);
 		} else if (result.stillRunning) {
 			running += 1;
-			const elapsed =
-				result.elapsedMs !== undefined ? ` (elapsed ${result.elapsedMs}ms)` : "";
-			parts.push(`── ${result.name} ──\nstill running${elapsed}`);
+			// D3 (polish round): the number is when the child was SPAWNED, not how long this
+			// wait blocked (`elapsedMs` is "ms since the tracked job was spawned"). Calling that
+			// "elapsed" read as the waiting time. `elapsedMs` itself is unchanged — this is a
+			// render-only change, seconds with one decimal.
+			const spawned =
+				result.elapsedMs !== undefined
+					? ` (spawned ${(result.elapsedMs / 1_000).toFixed(1)}s ago)`
+					: "";
+			parts.push(`── ${result.name} ──\nstill running${spawned}`);
 		} else if (result.interrupted) {
 			interrupted += 1;
 			parts.push(`── ${result.name} ──\ninterrupted (parent turn ended; children still running)`);
@@ -6667,8 +6793,10 @@ function mailPreemptedWait(input: {
 	/** P5c: the artifact-size lookup the delivered snapshots render with (§3 D8). */
 	fullBytesOf?: ArtifactBytesLookup;
 }): AgentToolResult<unknown> {
+	// D4 applies here too: a wait preempted by mail is still a wait, so a body the
+	// ledger can measure is previewed exactly like the ordinary path's.
 	const sections = input.delivered.map((result) =>
-		renderCollect(result.name, result.snapshot!, input.fullBytesOf),
+		renderCollect(result.name, waitBodySnapshot(result.snapshot!, input.fullBytesOf), input.fullBytesOf),
 	);
 	if (input.running.length > 0) sections.push(`Still running: ${input.running.join(", ")}`);
 	return mailPreemptedResult({
@@ -7029,8 +7157,16 @@ function renderCollect(
 	// the caller as an explicit checklist rather than assumed to hold.
 	const pending = collected.acceptance.pendingCriteria ?? [];
 	if (pending.length > 0) {
+		// D6 (polish round): the banner states what these criteria DO. A required one
+		// gates the verdict (`acceptance.ts` skips `severity === "optional"` when it
+		// decides what must pass); an optional one never did, so asking the caller to
+		// confirm it "before trusting the result" demanded work the verdict never
+		// needed. Two banners, one per shape, and the per-line `(optional)` tag stays.
+		const gating = pending.some((c) => c.severity !== "optional");
 		lines.push(
-			`unverified criteria — you must confirm these before trusting the result:`,
+			gating
+				? "unverified criteria — these gate the verdict:"
+				: "optional criteria — fix them if cheap, but they do not gate the verdict:",
 		);
 		for (const c of pending) {
 			const tag = c.severity === "optional" ? " (optional)" : "";

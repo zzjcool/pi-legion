@@ -22,7 +22,7 @@ When `wait` times out (or otherwise returns while children are live), the tool
 result includes structured fields for the **parent** to decide:
 
 - `status`: `wait_timeout` | `still_running` | `budget_exceeded` (budget optional)
-- `done` / `stillRunning[{ name, elapsedMs, budgetMs? }]`
+- `done` / `stillRunning[{ name, elapsedMs }]`
 - `decisions`: `extend` | `steer_again` | `stop` | `force_stop` (model hint enum, not a new RPC)
 - `hint`: wait only stopped waiting — the children are still running and keep their context; prefer `status`/`extend`/`steer_again`, and use `stop`/`force_stop` only to abandon the work
 

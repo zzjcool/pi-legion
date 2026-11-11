@@ -59,6 +59,7 @@ import {
 	evaluatePhaseTransition,
 	isTerminalPhase,
 	type LegionPhase,
+	type PhaseTransitionDecision,
 } from "../legion/state-machine.ts";
 import {
 	DEFAULT_PHASE_MACHINE,
@@ -943,16 +944,28 @@ export class LegionPostman {
 		// whose edge is refused for an unrelated reason; here it runs only when everything
 		// else already says "complete".
 		//
-		// A stale pass is remembered per (stored tree, current tree) pair, not per stint:
-		// one nudge per distinct mismatch, and a NEW pass (the agent re-measured) or a tree
-		// that came back to what was judged re-arms this check instead of being blocked by
-		// the first nudge forever. The probe itself is cached briefly, so a stint that
-		// stays wrong does not shell out to git every tick.
-		const stored = taskMetadata(node.taskSummary).verification;
-		if (stored?.passed !== true || node.phaseSince === null || stored.checkedAt < node.phaseSince || stored.cwd === undefined) return;
-		const currentTree = this.probeTree(stored.cwd, stored.contractFile, timestamp);
-		if (currentTree !== stored.tree) {
-			const nudgeKey = `${node.id}:${stored.tree ?? "?"}:${currentTree ?? "?"}`;
+		// A stale pass is remembered per DISTINCT mismatch, not per stint: one nudge per
+		// mismatch, and a NEW pass (the agent re-measured) or a tree that came back to what
+		// was judged re-arms this check instead of being blocked by the first nudge forever.
+		// The probe itself is cached briefly, so a stint that stays wrong does not shell out
+		// to git every tick.
+		// The freshness rule is `verificationIsCurrent`'s, shared: a tick only supplies a
+		// CACHED tree probe (this runs every second) and, for the checkout half, the one
+		// path it can honestly name. A tick has no request `cwd`, so the comparison uses
+		// the node's own `worktreePath` and is SKIPPED when there is none
+		// (`checkoutMatchesPass`): guessing a fallback here would compare a pass against
+		// the supervisor's own working directory, which is never this team's checkout.
+		const stored = storedPassThisStint(node);
+		if (!stored) return;
+		const checkoutMoved = !checkoutMatchesPass(stored.cwd, node.worktreePath);
+		const currentTree = checkoutMoved ? undefined : this.probeTree(stored.cwd, stored.contractFile, timestamp);
+		if (checkoutMoved || currentTree !== stored.tree) {
+			// One nudge per distinct mismatch. A replaced checkout is its own key: it can
+			// happen with an UNCHANGED tree (a fresh checkout of the same commit), which
+			// would otherwise collide with the pair that was already suppressed.
+			const nudgeKey = checkoutMoved
+				? `${node.id}:${stored.tree ?? "?"}:checkout:${node.worktreePath ?? "?"}`
+				: `${node.id}:${stored.tree ?? "?"}:${currentTree ?? "?"}`;
 			if (this.staleVerificationNudges.has(nudgeKey)) return;
 			this.sendSelfMessage(
 				"The checkout changed after legion-verify passed, so that pass no longer covers what would be delivered. "
@@ -1711,7 +1724,11 @@ export async function requestLegionPhase(
 			return { ok: false, code: "INVALID_PARAMS", message: "supersedes requires a settled sibling that took the work over: no direct child of this team has status=settled" };
 		}
 	}
-	const proposedContractPath = path.resolve(self.worktreePath ?? options.cwd, ".pi-legion", "contract.md");
+	// #P0 D1: the canonical location FIRST, the run dir's copy as the fallback. A
+	// read-only team has no worktree to write into, and the frozen contract lets it
+	// keep the contract in the run dir (docs/legion-v2-contract.md:358) — reading
+	// only the canonical path left such a team unable to ever leave its entry phase.
+	const proposedContractPath = contractPathForRun(self, options);
 	let contractText: string | undefined;
 	try { contractText = fs.readFileSync(proposedContractPath, "utf8"); } catch { contractText = undefined; }
 	// #298: NO role names here any more. The old code scanned for a settled
@@ -1791,22 +1808,80 @@ export async function requestLegionPhase(
 	// pass inherited from an earlier stint, or a stored failure. A stale pass is
 	// not evidence for a finish that happened in another phase, and a stored
 	// failure must never lock a team out of a finish it has since earned.
+	//
+	// #P0 D10 — and it must not PAY before it judges.
+	//
+	// Running the contract first made a request that was doomed anyway expensive: a
+	// team with a child still in flight, or with every child failed, paid for a full
+	// verification, wrote a `task_summary` for a phase change that never happened,
+	// and only then heard "a child is still running". The edge is therefore judged
+	// FIRST with no verification (#P0 D10's `judge(false)`), and the contract runs
+	// only when a green result is the one thing standing between the team and its
+	// finish — that is, when the edge would stand, or when `verification_passed` is
+	// the condition that refused it.
+	//
+	// The other direction is the P0-1 hole and must not come back: an edge that does
+	// NOT require `verification_passed` is not allowed to walk on a stale pass just
+	// because the pre-judgement said yes. `pre.allowed === true` means "nothing else
+	// objects", never "go": the run still happens below and only a green result
+	// advances the phase.
 	const fromPhase = self.phase;
 	// Set only when the gate EXECUTED the contract during this request (see the
 	// `verifyPhase` early return below, which has to carry the receipt).
 	let doneGate: { commandCount: number; phase: string } | undefined;
+	// #P0 D10 — ONE input construction for both evaluations. The pre-judgement asks
+	// "would this edge stand if the contract were green?" and the final one asks
+	// "does it stand now?"; the only value that may differ between them is the
+	// verification result. Two hand-built inputs would be two copies of the same
+	// question, drifting apart one condition at a time.
+	const judge = (verificationPassed: boolean | undefined): PhaseTransitionDecision => evaluatePhaseTransition({
+		from: self.phase ?? null,
+		to,
+		reworkCount: self.reworkCount,
+		contractPath: contractPresent ? proposedContractPath : self.contractPath,
+		contractPresent,
+		children: children.map(({ id, role, status }) => ({ id, role, status })),
+		failedWorkerHandledIds: handledIds,
+		reviewerVerdictOk: verdictOk,
+		verificationPassed,
+		actorRole: self.role,
+		...(machine ? { machine } : {}),
+		...(declaredFailure && mayDeclareFailure ? { terminalReason: "parent_decision" as const } : {}),
+	}, now);
+	let decision: PhaseTransitionDecision;
 	// `maySelfComplete` already refused a node with no phase (a team without a
 	// declared machine has no `→ done` edge to take), so `fromPhase` is set here.
-	if (to === "done" && fromPhase !== null) {
-		// #P0 S4: the pass has to belong to this stint AND still describe this tree
-		// (`verificationIsCurrent`). Editing the contract after a pass used to be free:
-		// `checkedAt >= phaseSince` alone reused it forever.
-		if (!verificationIsCurrent(self)) {
+	if (
+		to === "done"
+		&& fromPhase !== null
+		// #P0 S4 / #P0 D11: the pass has to belong to this stint, to THIS checkout, and
+		// still describe its tree (`verificationIsCurrent`). Editing the contract after a
+		// pass used to be free: `checkedAt >= phaseSince` alone reused it forever. The
+		// current checkout is the worktree when the node has one, else the cwd this
+		// request was made from.
+		&& !verificationIsCurrent(self, self.worktreePath ?? options.cwd)
+	) {
+		// "Would this request succeed if the contract came back green?" — judged with a
+		// PASS, not without one, so the answer does not depend on the order the author
+		// listed `require` (the first failing condition wins, and `verification_passed`
+		// may well be listed before a child that is still running). Only when a green
+		// contract cannot change the answer is the run not worth paying for.
+		const pre = judge(true);
+		if (!pre.allowed) {
+			// Doomed for a reason a green contract cannot fix (a child is still running,
+			// the machine does not offer the edge, every child failed…): the refusal —
+			// including the forced transition to `failed` — is produced by the same
+			// sentence below, without buying a verification nobody can use.
+			decision = pre;
+		} else {
 			const current = getNode(db, nodeId) ?? self;
-			// Record the file that is actually read (`node.contractPath ?? canonical`), not
+			// Record the file that is actually read (`node.contractPath ?? resolved`), not
 			// just the canonical one: a mismatch here would make every later freshness
 			// check compare a different file and re-run the whole contract forever.
-			const contractFile = contractPathFor(current, proposedContractPath);
+			// `proposedContractPath` is already the single resolved answer (recorded-if-alive
+			// → canonical → run-dir copy); resolving AGAIN through `contractPathFor` would
+			// re-prefer a recorded path this function just rejected as missing.
+			const contractFile = proposedContractPath;
 			const verification = await runVerification(db, current, readTextOrEmpty(contractFile), {
 				...options,
 				contractFile,
@@ -1818,28 +1893,19 @@ export async function requestLegionPhase(
 				return { ok: true, phase: fromPhase, message: `Verification failed: ${verification.outputFile}` };
 			}
 			doneGate = { commandCount: verification.commandCount, phase: fromPhase };
+			// A green run is the pass this decision is about, so the second evaluation
+			// reuses `judge` with the one value the gate just established.
+			decision = judge(true);
 		}
+	} else {
+		// No gate: judge the row as it stands (a fresh pass in this stint, or a
+		// request that is not a `done`). `runVerification` never ran here, so nothing
+		// needs re-reading.
+		decision = judge(readVerificationResult(self));
 	}
-	// `runVerification` PERSISTED what the gate just measured, so the transition has
-	// to judge the row as it is NOW — `self` is the snapshot taken before the gate.
-	const decisionNode = doneGate ? (getNode(db, nodeId) ?? self) : self;
 	// #P0 D1: a refusal AFTER the gate ran still owes the agent the verification
 	// receipt — it paid for a full contract run either way.
 	const doneReceipt = doneGate ? `Verification passed ${verificationHow(doneGate.commandCount, doneGate.phase, machine)}; ` : "";
-	const decision = evaluatePhaseTransition({
-		from: self.phase ?? null,
-		to,
-		reworkCount: self.reworkCount,
-		contractPath: contractPresent ? proposedContractPath : self.contractPath,
-		contractPresent,
-		children: children.map(({ id, role, status }) => ({ id, role, status })),
-		failedWorkerHandledIds: handledIds,
-		reviewerVerdictOk: verdictOk,
-		verificationPassed: readVerificationResult(decisionNode),
-		actorRole: self.role,
-		...(machine ? { machine } : {}),
-		...(declaredFailure && mayDeclareFailure ? { terminalReason: "parent_decision" as const } : {}),
-	}, now);
 
 	if (!decision.allowed) {
 		if (decision.forcedTransition) {
@@ -1929,7 +1995,7 @@ export async function requestLegionPhase(
 	}
 
 	const current = getNode(db, nodeId) ?? self;
-	const contractFile = contractPathFor(current, proposedContractPath);
+	const contractFile = proposedContractPath;
 	const verification = await runVerification(db, current, readTextOrEmpty(contractFile), { ...options, contractFile });
 	if (!verification.passed) {
 		options.sendSelfMessage?.(`Verification failed. Read ${verification.outputFile} and fix the commands, then request implementing.`);
@@ -2290,13 +2356,41 @@ export function runLegionCommandNow(command: string, cwd: string, timeoutMs: num
 	});
 }
 
-/** The contract file this node actually uses: its recorded path, else the canonical one. */
-function contractPathFor(node: LegionNode, fallbackPath: string): string {
-	return node.contractPath?.trim() ? node.contractPath : fallbackPath;
-}
-
-function readContract(node: LegionNode, fallbackPath: string): string {
-	return readTextOrEmpty(contractPathFor(node, fallbackPath));
+/** The contract file this node actually uses: its recorded path, else the given one. */
+/**
+ * #P0 D1 — the contract file this REQUEST will actually use, before any recorded path.
+ *
+ * The canonical location is `<worktreePath ?? cwd>/.pi-legion/contract.md`. A read-only
+ * team has no worktree to write an artifact into, and the frozen contract allows it to
+ * keep the contract in the RUN dir instead (`docs/legion-v2-contract.md:358`), so an
+ * ABSENT canonical file falls back to `<runDir>/contract.md`.
+ *
+ * The fallback is existence-based, not mode-based: the canonical path wins whenever the
+ * file is there, so no team that already has one changes meaning, and a run dir holding
+ * a stale copy can never shadow it. ONE answer for every caller in `requestLegionPhase`
+ * — the `contract_file` gate, the recorded `contract_path`, the `done` gate and the
+ * success phase's verification — because two answers to "which file is the contract"
+ * is how a pass gets recorded against a file nobody reads (`contractPathFor` restores
+ * the RECORDED path on top of this one; the value here is the fresh resolution).
+ */
+function contractPathForRun(
+	node: Pick<LegionNode, "worktreePath" | "contractPath">,
+	options: Pick<PhaseRequestOptions, "cwd" | "runDir">,
+): string {
+	const canonical = path.resolve(node.worktreePath ?? options.cwd, ".pi-legion", "contract.md");
+	// The RECORDED path is the team's own answer, but only while the file is still
+	// there: a node whose contractPath was recorded before its contract moved (or
+	// before a run-dir contract appeared) must not keep the gate and the verifier
+	// pointing at different files — that is how a `contract_file` check passes and
+	// then reads nothing, finishing with a 0-command "pass".
+	const recorded = node.contractPath?.trim();
+	if (recorded && fs.existsSync(recorded)) return recorded;
+	if (fs.existsSync(canonical)) return canonical;
+	if (options.runDir) {
+		const inRunDir = path.resolve(options.runDir, "contract.md");
+		if (fs.existsSync(inRunDir)) return inRunDir;
+	}
+	return recorded || canonical;
 }
 
 function verificationPassed(node: LegionNode): boolean | undefined {
@@ -2356,21 +2450,57 @@ export function verificationTree(cwd: string, contractText: string): string | un
 }
 
 /**
+ * #P0 D11 — does a stored pass belong to the checkout this call is about?
+ *
+ * A pass records WHERE it ran (`stored.cwd`), and a team's checkout can be
+ * REPLACED under it: a worktree that was recreated, a node resumed with a new
+ * `worktreePath`, a request now made from a different `cwd`. The tree digest cannot
+ * notice that — a fresh checkout of the same commit with the same untracked state
+ * hashes identically while being a different directory the delivery would come
+ * from. Cheap string comparison, run before the `git` probes.
+ *
+ * `currentCwd == null` means "this caller cannot name the current checkout" (the
+ * supervisor tick only knows `node.worktreePath`): the rule is SKIPPED, never
+ * assumed to hold.
+ */
+function checkoutMatchesPass(storedCwd: string, currentCwd: string | null | undefined): boolean {
+	if (currentCwd == null) return true;
+	return path.resolve(currentCwd) === path.resolve(storedCwd);
+}
+
+/**
+ * The part of "is this stored pass still evidence" that needs no `git`: it passed, it
+ * belongs to THIS phase stint, and it was recorded for a checkout.
+ *
+ * Split out (#P0 D11) so the two callers cannot drift: the tool path finishes the
+ * question with a tree probe, the supervisor tick prefixes a CACHED probe (it runs every
+ * second and must not shell out to git twice a tick), and both have to agree on what
+ * "this stint's pass" means. Returning the row rather than a boolean also lets the
+ * supervisor see WHICH part stopped it (`cwd`), which is what its nudge key needs.
+ */
+function storedPassThisStint(node: LegionNode): (VerificationResult & { cwd: string }) | undefined {
+	const stored = taskMetadata(node.taskSummary).verification;
+	if (stored?.passed !== true) return undefined;
+	if (node.phaseSince === null || stored.checkedAt < node.phaseSince) return undefined;
+	// A row with no `cwd` predates the fingerprint: it cannot answer WHERE it ran or WHAT
+	// it judged, so it is re-measured once rather than trusted.
+	if (typeof stored.cwd !== "string") return undefined;
+	return { ...stored, cwd: stored.cwd };
+}
+
+/**
  * Is a stored pass still evidence for finishing THIS phase stint, on THIS tree?
  *
  * Three questions, all of which have to be answered yes:
- *   1. it passed;
- *   2. it was recorded inside the current stint (`checkedAt >= phaseSince`) — a
- *      pass from an earlier stint judged a different phase's work;
+ *   1. it passed and belongs to this stint (`storedPassThisStint`);
+ *   2. it describes the checkout the caller is about to deliver (`currentCwd`, when
+ *      the caller can name it — #P0 D11);
  *   3. the checkout still matches what it judged.
- * A row with no `cwd` predates the fingerprint and cannot answer (3), so it is
- * re-measured once rather than trusted.
  */
-function verificationIsCurrent(node: LegionNode): boolean {
-	const stored = taskMetadata(node.taskSummary).verification;
-	if (stored?.passed !== true) return false;
-	if (node.phaseSince === null || stored.checkedAt < node.phaseSince) return false;
-	if (stored.cwd === undefined) return false;
+function verificationIsCurrent(node: LegionNode, currentCwd?: string | null): boolean {
+	const stored = storedPassThisStint(node);
+	if (!stored) return false;
+	if (!checkoutMatchesPass(stored.cwd, currentCwd)) return false;
 	return verificationTree(stored.cwd, readTextOrEmpty(stored.contractFile)) === stored.tree;
 }
 
