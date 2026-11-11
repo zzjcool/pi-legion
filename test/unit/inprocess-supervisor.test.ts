@@ -18,6 +18,8 @@ import { currentChildContext, type ChildLaunchContext } from "../../src/supervis
 import { CHILD_ROLE_ENV, effectiveChildBudget } from "../../src/extension/child-guard.ts";
 import { TEAM_ENV, resolveActiveTeamName } from "../../src/agents/teams.ts";
 import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
+import { loadCatalog } from "../../index.ts";
+import { withTempDir } from "../helpers/tmp.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { resolveStepModel } from "../../src/agents/step-model.ts";
 import {
@@ -1133,6 +1135,79 @@ test("B9: the derived context carries the team too, and never invents one", asyn
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+// ── B9/R8: the SEAM between the two halves of B9 ──────────────────────────
+//
+// B9 was tested at both ends and not in between: the producer side asserted
+// `currentChildContext()?.team` (the two cases above), and the consumer side
+// hand-injected `runInChildContext(...)` before calling `loadCatalog`
+// (`teams.test.ts`). Nothing tied them together, so reverting `index.ts`'s
+// `teamEnvForCatalog()` to a plain `process.env` left the whole suite green
+// while every in-process child silently lost its parent's team.
+//
+// The seam IS the session factory: it is awaited inside
+// `runInChildContext(registration.context, …)`, which is exactly where a forked
+// child session later loads its own catalog. So this case spawns through the
+// real supervisor and loads the real catalog from inside that factory.
+
+test("B9/R8: the team reaches a REAL loadCatalog call made inside the session factory", async () => {
+	await withTempDir(async (dir) => {
+		const agentDir = path.join(dir, "agent");
+		mkdirSync(path.join(agentDir, "agents"), { recursive: true });
+		writeFileSync(
+			path.join(agentDir, "settings.json"),
+			JSON.stringify({
+				subagents: {
+					disableBuiltins: true,
+					teams: { frontend: { members: [{ agent: "worker", model: "cb/team-model" }] } },
+				},
+			}),
+		);
+		writeFileSync(
+			path.join(agentDir, "agents", "worker.md"),
+			"---\nname: worker\ndescription: seam worker\n---\nseam worker prompt\n",
+		);
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousTeam = process.env[TEAM_ENV];
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+		// An in-process child SHARES the host's `process.env`, so nothing but the
+		// ALS child context can carry the selection. Deleting it is what makes the
+		// mutation survive-proof: `teamEnvForCatalog()` reading `process.env`
+		// directly then sees NO team and the assertions below go red.
+		delete process.env[TEAM_ENV];
+		let catalog: ReturnType<typeof loadCatalog> | undefined;
+		const supervisor = new InProcessSupervisor({
+			limits: { maxActive: 8 },
+			sessionFactory: async () => {
+				catalog = loadCatalog(dir, dir, undefined);
+				return new FakeSession();
+			},
+		});
+		try {
+			await supervisor.spawnChild({
+				...testInput(dir),
+				env: { [TEAM_ENV]: "frontend" },
+			});
+		} finally {
+			// `withEnvironment` cannot be used here: it is synchronous, and the
+			// factory (where the env is read) is awaited inside `spawnChild`.
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousTeam === undefined) delete process.env[TEAM_ENV];
+			else process.env[TEAM_ENV] = previousTeam;
+		}
+		assert.ok(catalog, "the session factory ran and loaded a catalog");
+		assert.equal(
+			catalog.team.name,
+			"frontend",
+			"the child catalog resolves the team its parent chose, not the default",
+		);
+		const worker = catalog.agents.find((entry) => entry.name === "worker");
+		assert.ok(worker, "the role card in the temp agent dir was discovered");
+		assert.equal(worker.model, "cb/team-model", "the team member's `model` folded");
+		assert.deepEqual(worker.modelSource, { type: "team", model: "cb/team-model" });
+	});
 });
 
 // ── R6: the role a spawn runs as is a per-spawn fact, never an env read ─────

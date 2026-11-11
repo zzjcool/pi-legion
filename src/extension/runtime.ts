@@ -2962,6 +2962,10 @@ function statusEntryFromNode(
 			: {}),
 		...(node.phase ? { phase: node.phase } : {}),
 		...(node.kind ? { kind: node.kind } : {}),
+		// Ledger-only path (D-R8.2): the `nodes` table has no `thinking` column and
+		// is deliberately not migrated, so this entry carries the model alone. Do
+		// not synthesize a level here — `modelLabel` folds one in only when it is
+		// actually known.
 		...(node.model ? { model: node.model } : {}),
 		...(node.spawnMode ? { spawnMode: node.spawnMode } : {}),
 		...(live.usageTotal ? { tokensTotal: live.usageTotal } : node.tokensTotal ? { tokensTotal: node.tokensTotal } : {}),

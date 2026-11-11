@@ -317,7 +317,8 @@ test("formatSubagentDetail includes RPC fields and omits legacy pane/tab data", 
 	});
 	const output = formatSubagentDetail({ run, child: childRecord, cwd: "/tmp/project" });
 	assert.match(output, /^reviewer-0 — reviewer \(pi\)/);
-	assert.match(output, /state: retired · execution: success · model: cb\/kimi-k3 · thinking: max/);
+	// D-R8.2: model + level are ONE bit — the running form, `:level` appended.
+	assert.match(output, /state: retired · execution: success · model: cb\/kimi-k3:max/);
 	assert.match(output, /run: r-detail · supervisor: rpc/);
 	assert.doesNotMatch(output, /pane:/);
 	assert.match(output, /time: \d\d:21:53 → \d\d:27:37 \(5m44s\)/);
@@ -326,6 +327,45 @@ test("formatSubagentDetail includes RPC fields and omits legacy pane/tab data", 
 	assert.match(output, /session: \.pi-subagents\/runs\/r-detail\/reviewer-0\.jsonl/);
 	assert.doesNotMatch(output, /tab:/);
 	assert.doesNotMatch(output, /worktree:/);
+});
+
+test("formatSubagentDetail folds the thinking level into the model bit (D-R8.2)", () => {
+	const run: RunRecord = {
+		schemaVersion: 1,
+		runId: "r-detail-thinking",
+		task: "detail",
+		cwd: "/tmp/project",
+		herdr: { supervisor: "inprocess" },
+		path: [],
+		depth: 0,
+		maxDepth: 1,
+		children: [],
+		budget: { spawned: 1, limit: null, granted: 0 },
+		createdAt: "2026-01-01T04:00:00.000Z",
+		updatedAt: "2026-01-01T04:30:00.000Z",
+	};
+	const render = (overrides: Partial<ChildRecord>): string =>
+		formatSubagentDetail({
+			run,
+			child: child("/tmp/project", "reviewer-0", "2026-01-01T04:21:53.000Z", {
+				agent: "reviewer",
+				model: "cb/kimi-k3",
+				...overrides,
+			}),
+			cwd: "/tmp/project",
+		});
+
+	assert.match(render({ thinking: "max" }), /state: retired · model: cb\/kimi-k3:max/);
+	// A level inside the model id is what the child actually runs, so it wins over
+	// the field — the resume replay (`saved.model` + the card's current thinking).
+	assert.match(
+		render({ model: "cb/kimi-k3:high", thinking: "max" }),
+		/state: retired · model: cb\/kimi-k3:high/,
+	);
+	// `thinking: false` has no level to fold in, so it keeps its own bit: a reader
+	// must still see that reasoning is OFF (the old code printed `thinking: false`).
+	const off = render({ thinking: false });
+	assert.match(off, /state: retired · model: cb\/kimi-k3 · thinking: off/);
 });
 
 test("summary subcommand offers completion and emits slash text", async () => {

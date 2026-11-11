@@ -15,7 +15,7 @@ import {
 	type TuiMouseEventResult,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { isThinkingLevel } from "../shared/types.ts";
+import { modelLabel } from "../agents/model-scope.ts";
 import {
 	NON_TERMINAL,
 	TERMINAL_STATES as LIVENESS_TERMINAL_STATES,
@@ -303,22 +303,11 @@ function entryStatus(entry: StatusEntry): string {
 }
 
 function formatModel(entry: StatusEntry): string | undefined {
-	const raw = entry.model?.trim();
-	if (!raw) return undefined;
-	const idx = raw.lastIndexOf(":");
-	const suffix = idx === -1 ? undefined : raw.slice(idx + 1);
-	const suffixIsThinking = Boolean(suffix && isThinkingLevel(suffix));
-	const base = suffixIsThinking ? raw.slice(0, idx) : raw;
-	const fromModel =
-		suffixIsThinking && suffix !== "off" ? suffix : undefined;
-	const thinking =
-		fromModel ??
-		(typeof entry.thinking === "string" &&
-		entry.thinking !== "off" &&
-		isThinkingLevel(entry.thinking)
-			? entry.thinking
-			: undefined);
-	return thinking ? `${base}:${thinking}` : base;
+	// One display producer (D-R8.2): the running form, suffix included. The widget
+	// used to keep its own copy of this rule and swallow an explicit `:off`, so a
+	// child genuinely running without reasoning looked identical to one whose
+	// level was simply unknown.
+	return modelLabel(entry.model?.trim(), entry.thinking);
 }
 
 function formatWorktreeBranch(branch: string): string {

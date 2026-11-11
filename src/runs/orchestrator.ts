@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import { randomBytes } from "node:crypto";
 import * as path from "node:path";
 import { modelCandidates } from "../agents/model-resolution.ts";
-import { stripThinkingSuffix } from "../agents/model-scope.ts";
+import { splitThinkingSuffix, stripThinkingSuffix } from "../agents/model-scope.ts";
 import { isThinkingConfigured } from "../agents/step-model.ts";
 import { DEFAULT_TEAM, TEAM_ENV, type ActiveTeam } from "../agents/teams.ts";
 import type { LegionSettings } from "../shared/types.ts";
@@ -1482,7 +1482,17 @@ export class Orchestrator {
 				...(machine && input.agent.name === "centurion" ? { phases: machine } : {}),
 				...(startedModel ? { model: startedModel } : {}),
 				...(startedModelProvider ? { modelProvider: startedModelProvider } : {}),
-				...(input.thinking !== undefined ? { thinking: input.thinking } : input.agent.thinking !== undefined ? { thinking: input.agent.thinking } : {}),
+				// D-R8.4: record the level the child RUNS, not the one the card asked for.
+				// A `:level` inside `model` wins over the `thinking` field
+				// (`applyThinkingSuffix` keeps the suffix), which is exactly the resume
+				// shape: a saved `cb/x:high` replayed next to a card's `thinking: max`
+				// ran `:high` while run.json claimed `max` — and every later view
+				// (summary, status, the next resume's card) repeated the claim. Only
+				// the RECORDED value changes here; the spawn still gets `input.thinking`
+				// and the untouched model string above.
+				thinking: startedModel
+					? splitThinkingSuffix(startedModel).thinking ?? input.thinking ?? input.agent.thinking
+					: input.thinking ?? input.agent.thinking,
 				...(worktreePath ? { worktreePath } : {}),
 				...(worktreeBranch ? { worktreeBranch } : {}),
 			});

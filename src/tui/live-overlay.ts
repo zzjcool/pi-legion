@@ -762,6 +762,8 @@ function createSession(
 			// model id (e.g. `workbuddy/deepseek-v4.1-flash`) used to push the
 			// trailing segment into `spawn inpr...`. role + spawn survive now.
 			...(node.spawnMode ? [`spawn ${node.spawnMode}`] : []),
+			// Ledger-only model (D-R8.2): `nodes` has no `thinking` column, so this
+			// segment is the id alone. Never append a level the row cannot verify.
 			...(node.model ? [safeText(node.model)] : []),
 			turnLabel,
 			elapsed,

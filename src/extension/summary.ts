@@ -12,6 +12,7 @@ import type {
 	ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { deriveOutcome } from "../shared/session.ts";
+import { modelLabel } from "../agents/model-scope.ts";
 import { sessionMapFor } from "../shared/session-map.ts";
 import type { ParsedSession } from "../shared/types.ts";
 import {
@@ -618,8 +619,14 @@ export function formatSubagentDetail(input: SummaryDetailInput): string {
 	const title = `${child.name} — ${summaryRole(child)}${child.kind ? ` (${child.kind})` : ""}`;
 	const stateBits = [`state: ${child.state}`];
 	if (derivedExecution) stateBits.push(`execution: ${derivedExecution}`);
-	if (model) stateBits.push(`model: ${model}`);
-	if (child.thinking !== undefined) stateBits.push(`thinking: ${child.thinking}`);
+	// ONE bit, not two (D-R8.2): `model` and `thinking` are a single running form —
+	// printing them apart let the pair disagree with what the child actually runs
+	// (a `:level` inside the model id wins over the `thinking` field).
+	const modelBit = modelLabel(model, child.thinking);
+	if (modelBit) stateBits.push(`model: ${modelBit}`);
+	// `thinking: false` has no level to fold into the model string, so the fact
+	// that reasoning is OFF keeps its own bit — otherwise it would vanish.
+	if (child.thinking === false) stateBits.push("thinking: off");
 	const lines = [title, `  ${stateBits.join(" · ")}`];
 
 	const runBits = [`run: ${run.runId}`, `supervisor: ${run.herdr.supervisor ?? "unknown"}`];
