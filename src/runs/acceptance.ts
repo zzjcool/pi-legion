@@ -270,7 +270,15 @@ export async function applyVerification(
 		timeoutMs?: number;
 	},
 ): Promise<AcceptanceResult> {
-	if (acceptance.status !== "accepted") return acceptance;
+	// No `acceptance.status === "accepted"` gate here on purpose (#393). The
+	// precondition for running verification is a required `verification-output`
+	// criterion carrying an explicit `command` — not the child's own verdict
+	// (`docs/design.md` §10.3). A child that self-reports `ok: false` must still
+	// have its commands run; the reported status is kept either way, so nothing
+	// is silently overturned (see the success path below). Aborted/blocked
+	// collects never reach this function (they go through `interruptedCollect` /
+	// `blockedResult` in orchestrator.ts), so they are deliberately not covered
+	// by that removal.
 	if (!needsVerification(opts.criteria)) return acceptance;
 
 	const commands = verifyCommandsOf(opts.criteria);
@@ -309,12 +317,27 @@ export async function applyVerification(
 			pendingCriteria: carried,
 		};
 	}
+	const verifiedReason = `verified by ${commands.map((c) => `\`${c}\``).join(" && ")}`;
+	if (acceptance.status !== "accepted") {
+		// The commands did pass, so the level is `verified` — but the status the
+		// child reported stands verbatim, and its reason is kept alongside ours
+		// instead of being overwritten (#393 / D393-2).
+		const ownReason = acceptance.reason?.trim();
+		return {
+			...acceptance,
+			level: "verified",
+			reason: ownReason
+				? `${verifiedReason} — the child's own verdict still stands (${ownReason})`
+				: verifiedReason,
+			pendingCriteria: carried,
+		};
+	}
 	return {
 		...acceptance,
 		status: "accepted",
 		level: "verified",
 		// Name every command that had to pass, not just the first.
-		reason: `verified by ${commands.map((c) => `\`${c}\``).join(" && ")}`,
+		reason: verifiedReason,
 		pendingCriteria: carried,
 	};
 }
