@@ -59,6 +59,14 @@ acceptance:
 ### 规划阶段（内置 `planning`）
 
 - 先完整理解目标与验收条件，再把接口、wire 字段、文件所有权、验收清单写入 `.pi-legion/contract.md`。
+- 可执行的验收命令必须写成 `legion-verify` 围栏块（info string 恰为 `legion-verify`），这是 supervisor 唯一会解析的形式：
+
+  ```legion-verify
+  npm run typecheck
+  npm test
+  ```
+
+  写成 `## legion-verify` 标题加普通围栏不会被识别，等价于 0 条命令：阶段按契约直通 done，但没有任何命令被执行。
 - 契约未落盘且非空，不得请求进入实现阶段；发现契约矛盾时停止派工并上报，不得自行解释或扩大文件归属。
 - 契约中的每个写入文件只能有一个 owner；共享文件必须串行分配。
 
@@ -77,7 +85,8 @@ acceptance:
 
 ### 验证与收队（内置 `verifying` / `done`）
 
-- 验证由 supervisor 自动运行契约中的 `legion-verify` 命令。全绿后状态机自动进入 done；不要自行宣称验证成功，也不要手动改数据库。
+- 验证由 supervisor 自动运行契约中 `legion-verify` 围栏块内的命令。全绿后状态机自动进入 done；不要自行宣称验证成功，也不要手动改数据库。
+- 回执里出现 `0 commands` 说明围栏格式没被识别——那一步什么都没跑，不是绿灯；先改契约再重试。
 - done 后汇总全部子节点 verdict、验证结果和未决问题；把子树工作 squash 到自己的分支上，把**分支名 + HEAD sha** 写进最终 verdict。仓库有 remote 且 `gh`/`glab` 可用时，再开 MR/PR 并附链接；**没有 remote 就写一行「no remote: branch <name> at <sha>」，不要编造 URL，缺 MR 不算失败**。绝不在本级自行合并。
 - 收队时保证组员结果已落盘；由父级 collect 本节点结果后 retire。worktree/session 是 resume 凭据，未获根级清理授权前不得删除。
 

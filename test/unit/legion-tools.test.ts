@@ -213,14 +213,235 @@ test("#371: an empty legion-verify block does not masquerade as a real verificat
 			/gates on verification_passed/,
 			"the gate was satisfied vacuously and the report has to name that",
 		);
+		// #P0 D2: a `0 commands` pass must point at the shape it failed to parse —
+		// the fenced block — because that is the only thing an agent can fix.
+		assert.match(
+			verifying.message,
+			/```legion-verify fenced block is parsed/,
+			"the caveat names the fenced block that was expected",
+		);
+		assert.match(
+			verifying.message,
+			/`## legion-verify` heading is not parsed/,
+			"…and the heading that is NOT parsed, which is what a contract usually gets wrong",
+		);
 		assert.ok(
 			messages.some((message) => /by contract \(0 commands/.test(message) && /squash/.test(message)),
 			"the collection prompt carries the same caveat",
+		);
+		assert.ok(
+			messages.some((message) => /```legion-verify fenced block is parsed/.test(message)),
+			"the collection prompt carries the fence wording too",
 		);
 	} finally {
 		db.close();
 		rmSync(rootDir, { recursive: true, force: true });
 	}
+});
+
+// ---------------------------------------------------------------------------
+// #P0 D1 — a DECLARED `verifying → done` must not skip verification
+// ---------------------------------------------------------------------------
+
+/**
+ * The exact shape the gate is about: `→ done` DECLARED by the author, with NO
+ * `require`. `normalizePhaseMachine` only pads `failed`/`aborted` here, so the
+ * authored edge is the whole condition — before the fix that edge alone let a
+ * team finish on a red contract, because the tool's verification branch only
+ * ran on the way out of the success phase.
+ */
+const DECLARED_VERIFY_DONE: PhaseMachine = {
+	start: "verifying",
+	phases: [
+		{ id: "verifying", next: [{ to: "done" }] },
+		{ id: "done", terminal: true, next: [] },
+	],
+};
+
+/**
+ * Persist a verification result the way `runVerification` does, WITHOUT running
+ * anything. The stored metadata is the only input to the gate's freshness check,
+ * so this is how a test puts a team in a given history.
+ */
+function seedStoredVerification(
+	db: ReturnType<typeof openLegionDb>,
+	nodeId: string,
+	stored: { passed: boolean; checkedAt: number },
+): void {
+	updateNode(db, nodeId, {
+		taskSummary: JSON.stringify({
+			__piLegion: {
+				version: 1,
+				taskSummary: null,
+				verification: {
+					passed: stored.passed,
+					outputFile: "/tmp/legacy.legion-verify.log",
+					commandCount: 1,
+					checkedAt: stored.checkedAt,
+				},
+			},
+		}),
+	}, () => stored.checkedAt);
+}
+
+/** A team sitting in `verifying` (phaseSince 50) whose contract runs one command. */
+function doneGateFixture() {
+	const rootDir = mkdtempSync(path.join(tmpdir(), "legion-done-gate-"));
+	const cwd = path.join(rootDir, "repo");
+	mkdirSync(path.join(cwd, ".pi-legion"), { recursive: true });
+	writeFileSync(path.join(cwd, ".pi-legion", "contract.md"), "```legion-verify\nnpm test\n```\n");
+	const db = makePhaseFixture();
+	updateNode(db, "root.team-a", { phase: "verifying", phaseSince: 50 }, () => 50);
+	return {
+		db,
+		cwd,
+		rootDir,
+		cleanup: () => { db.close(); rmSync(rootDir, { recursive: true, force: true }); },
+	};
+}
+
+test("#P0 D1: a declared verifying→done with a red contract is refused and the phase stays put", async () => {
+	const fx = doneGateFixture();
+	const commands: string[] = [];
+	const messages: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 1, stdout: "", stderr: "1 failing test" };
+	};
+	try {
+		// Stored as failed and measured in the CURRENT stint: the request must still
+		// re-measure (a failure is not a pass) and must not walk the edge.
+		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 60 });
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage: (text: string) => messages.push(text),
+		});
+		assert.equal(result.ok, true, `a failed verification is a report, not a refusal: ${result.message}`);
+		assert.equal(result.phase, "verifying", "the phase must not move on a red contract");
+		assert.match(result.message, /Verification failed/, "the receipt names the failure");
+		assert.equal(getNode(fx.db, "root.team-a")?.phase, "verifying", "the row must not move either");
+		assert.deepEqual(readEventsAfter(fx.db, 0).filter((event) => event.type === "phase_change"), [], "no phase_change may be written");
+		assert.deepEqual(commands, ["npm test"], "the contract is measured exactly once");
+		assert.ok(messages.some((message) => /Verification failed/.test(message)), "the log path reaches the agent");
+	} finally { fx.cleanup(); }
+});
+
+test("#P0 D1: the same edge passes once the contract is green, and the contract runs exactly once", async () => {
+	const fx = doneGateFixture();
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 0, stdout: "green", stderr: "" };
+	};
+	try {
+		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 60 });
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage() {},
+		});
+		assert.equal(result.ok, true, result.message);
+		assert.equal(result.phase, "done");
+		assert.equal(getNode(fx.db, "root.team-a")?.phase, "done");
+		assert.deepEqual(commands, ["npm test"], "ONE execution, not one per gate");
+		assert.match(
+			result.message,
+			/Verification passed \(1 command\(s\)\)/,
+			"the receipt must reach the agent: this is the verification it paid for",
+		);
+	} finally { fx.cleanup(); }
+});
+
+test("#P0 D1: a fresh pass is reused — `done` costs no second execution", async () => {
+	const fx = doneGateFixture();
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 0, stdout: "green", stderr: "" };
+	};
+	try {
+		// checkedAt (60) >= phaseSince (50): this stint's own pass. Idempotence is the
+		// whole reason a retried `done` may not cost another run.
+		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 60 });
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage() {},
+		});
+		assert.equal(result.ok, true, result.message);
+		assert.equal(result.phase, "done");
+		assert.equal(getNode(fx.db, "root.team-a")?.phase, "done");
+		assert.deepEqual(commands, [], "a fresh pass must not be re-run");
+		assert.doesNotMatch(result.message, /Verification passed/, "nothing ran, so nothing may be claimed");
+	} finally { fx.cleanup(); }
+});
+
+test("#P0 D1: a stored failure from an earlier stint does not lock the team out", async () => {
+	const fx = doneGateFixture();
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 0, stdout: "green", stderr: "" };
+	};
+	try {
+		// Recorded BEFORE this stint began (20 < 50) and red. The fix landed since; the
+		// old failure is not a life sentence.
+		seedStoredVerification(fx.db, "root.team-a", { passed: false, checkedAt: 20 });
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage() {},
+		});
+		assert.equal(result.ok, true, result.message);
+		assert.equal(result.phase, "done", "a stored failure must not permanently block the finish");
+		assert.deepEqual(commands, ["npm test"], "re-measured, once");
+	} finally { fx.cleanup(); }
+});
+
+test("#P0 D1: a stored PASS from an earlier stint is not evidence — it is re-measured", async () => {
+	const fx = doneGateFixture();
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 1, stdout: "", stderr: "regressed" };
+	};
+	try {
+		// checkedAt (20) predates phaseSince (50): the pass belongs to another phase
+		// stint, so it may not stand as the evidence for this finish. The OTHER
+		// direction of the freshness rule — dropping this makes `phaseSince` decorative.
+		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 20 });
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage() {},
+		});
+		assert.equal(result.ok, true);
+		assert.equal(result.phase, "verifying", "a stale pass must not carry a finish");
+		assert.match(result.message, /Verification failed/);
+		assert.equal(getNode(fx.db, "root.team-a")?.phase, "verifying");
+		assert.deepEqual(commands, ["npm test"], "a stale pass is re-measured, once");
+	} finally { fx.cleanup(); }
+});
+
+test("#P0 D1: a phase with no clock cannot inherit a pass from another stint", async () => {
+	const fx = doneGateFixture();
+	const commands: string[] = [];
+	const runCommand: LegionCommandRunner = async (command) => {
+		commands.push(command);
+		return { code: 1, stdout: "", stderr: "still red" };
+	};
+	try {
+		// A legacy row: phase set, clock NULL. `checkedAt >= (phaseSince ?? 0)` would
+		// have read ANY stored pass as fresh — exactly the hole this gate closes, with
+		// an implicit reopening path. A missing clock means "unknown stint", so the
+		// contract is measured again instead.
+		updateNode(fx.db, "root.team-a", { phase: "verifying", phaseSince: null }, () => 50);
+		seedStoredVerification(fx.db, "root.team-a", { passed: true, checkedAt: 60 });
+		const result = await requestLegionPhase(fx.db, "root.team-a", "done", {
+			cwd: fx.cwd, runDir: fx.rootDir, now: () => 100, machine: DECLARED_VERIFY_DONE, runCommand,
+			sendSelfMessage() {},
+		});
+		assert.equal(result.ok, true, "a failed verification is a report, not a refusal");
+		assert.equal(result.phase, "verifying", "an unknown stint cannot vouch for a finish");
+		assert.match(result.message, /Verification failed/);
+		assert.deepEqual(commands, ["npm test"], "re-measured instead of trusting the stored pass");
+	} finally { fx.cleanup(); }
 });
 
 test("phase rework beyond the frozen limit forces failed and notifies the parent", async () => {

@@ -53,6 +53,27 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   信任下限按轴分开（decode 200ms / generation 1s），单条短消息不再被旧门禁整条吞掉。
 - 图表 x 轴冻结判定（#346）与 flat-run 折叠把 decode 采样一并纳入，避免「只有 decode
   前进」的真实进展被当成静态而被跳过。
+- **声明式机器的 `→ done` 不再绕过验证。** `maySelfComplete`（#371 G5）把 `done` 交给了
+  作者声明的边，但该请求随后直接进 `evaluatePhaseTransition` 落盘相位，而 `runVerification`
+  只挂在「离开成功相位」那条路上——于是 `{ id: "verifying", next: [{ to: "done" }] }`
+  （无 `require`）的机器可以在一份红契约上收队，一条命令都没跑：docker 演示会话
+  `01a1c964` 实测到了这个形状。`requestLegionPhase` 现在在执行 `done` 边**之前**补一道门：
+  存量 pass **必须是当前相位里产生的**（`checkedAt >= phaseSince`）才复用；否则立即重测
+  （存量失败、陈旧 pass 都算没有证据），失败则相位不动并回报 `Verification failed: <log>`。
+  这只补在作者写的边上——`state-machine.ts` 已为注入边写过同一个不变量。`to: "verifying"`
+  路径不变，`done` 的重试也不付二次执行成本（新增用例见 `test/unit/legion-tools.test.ts`）。
+- **只读守卫不再把 `2>/dev/null;` 判成写文件。** `child-guard` 的 `/dev/null` 放行靠
+  `/^\/dev\/null(\s|$)/`——目标后面必须跟空白，于是 `git config --list 2>/dev/null; …`
+  这种最普通的只读探针被拒（演示里 scout 为此废掉一回合）。改为取重定向目标 word
+  （终止于 `;` `&` `|` `(` `)` 与空白/换行）后全等比较，但只接受**不会隐藏未检命令**的终止符：
+  `;`（`shellChunks` 会切开）与 `)`、空白、行尾；`|` `&` `(` 保持历史拒绝，
+  `2>/dev/null|tee f` 不会成为过写检查的新旁路。`=>`/`>=`/`->`/引号内 `>`/`&>file`
+  的既有判定不变。
+- **`0 commands` 的回执点名「围栏」这个可修的原因。** `verificationHow` 的两个变体都写明
+  只有 ` ```legion-verify ` 围栏块会被解析、`## legion-verify` 标题不算；`agents/centurion.md`
+  与 `skills/**/SKILL.md` 补最小示例与「`0 commands` 不是绿灯」。格式要求此前只存在于 frozen 的
+  `docs/legion-v2-contract.md` §7.2，真正写契约的 agent 读的是角色卡/技能卡，于是「标题 +
+  普通围栏」静默解析为 0 条并直通 done。
 
 
 ## [5.6.0] — 2026-11-09

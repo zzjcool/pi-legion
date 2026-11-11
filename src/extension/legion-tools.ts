@@ -1716,6 +1716,55 @@ export async function requestLegionPhase(
 	const mayDeclareFailure = self.phase !== null && (findPhase(effectiveMachine, self.phase)?.next.some(
 		(rule) => rule.to === "failed" && (rule.actorRole === undefined || rule.actorRole === self.role),
 	) ?? false);
+	// #P0 D1 — a DECLARED `→ done` must not skip verification.
+	//
+	// `maySelfComplete` above opened `done` to the author of a declared machine
+	// (#371 G5), but from there the request walked straight into
+	// `evaluatePhaseTransition` and committed the phase: the verification branch at
+	// the bottom of this function only runs on the way out of `verifyPhase`, and an
+	// authored edge to `done` from anywhere else never passes through it. So a
+	// machine that declared `verifying → done` with no `require` finished a team on
+	// a red contract WITHOUT ever running `legion-verify`. `state-machine.ts`
+	// already refuses that shortcut for INJECTED edges (they belong to the
+	// supervisor's verified-completion path); this is the same invariant, applied
+	// to the edge an author WROTE.
+	//
+	// The freshness rule is what keeps the door cheap: a stored PASS from THIS
+	// phase stint (`checkedAt >= phaseSince`) is reused, so retrying `done` after a
+	// pass costs nothing. Everything else is measured NOW — no stored result, a
+	// pass inherited from an earlier stint, or a stored failure. A stale pass is
+	// not evidence for a finish that happened in another phase, and a stored
+	// failure must never lock a team out of a finish it has since earned.
+	const fromPhase = self.phase;
+	// Set only when the gate EXECUTED the contract during this request (see the
+	// `verifyPhase` early return below, which has to carry the receipt).
+	let doneGate: { commandCount: number; phase: string } | undefined;
+	// `maySelfComplete` already refused a node with no phase (a team without a
+	// declared machine has no `→ done` edge to take), so `fromPhase` is set here.
+	if (to === "done" && fromPhase !== null) {
+		const stored = taskMetadata(self.taskSummary).verification;
+		// A missing clock is NOT "this stint": phase and its clock are written
+		// together, so a legacy row without one must not turn any stored pass into
+		// evidence — that would reopen the very hole this gate closes.
+		const fresh = stored?.passed === true && self.phaseSince !== null && stored.checkedAt >= self.phaseSince;
+		if (!fresh) {
+			const current = getNode(db, nodeId) ?? self;
+			const verification = await runVerification(db, current, readContract(current, proposedContractPath), options);
+			if (!verification.passed) {
+				// Same words and the same log path as the `verifyPhase` branch below:
+				// one failure report, whichever door the team tried to leave by.
+				options.sendSelfMessage?.(`Verification failed. Read ${verification.outputFile} and fix the commands, then request implementing.`);
+				return { ok: true, phase: fromPhase, message: `Verification failed: ${verification.outputFile}` };
+			}
+			doneGate = { commandCount: verification.commandCount, phase: fromPhase };
+		}
+	}
+	// `runVerification` PERSISTED what the gate just measured, so the transition has
+	// to judge the row as it is NOW — `self` is the snapshot taken before the gate.
+	const decisionNode = doneGate ? (getNode(db, nodeId) ?? self) : self;
+	// #P0 D1: a refusal AFTER the gate ran still owes the agent the verification
+	// receipt — it paid for a full contract run either way.
+	const doneReceipt = doneGate ? `Verification passed ${verificationHow(doneGate.commandCount, doneGate.phase, machine)}; ` : "";
 	const decision = evaluatePhaseTransition({
 		from: self.phase ?? null,
 		to,
@@ -1725,7 +1774,7 @@ export async function requestLegionPhase(
 		children: children.map(({ id, role, status }) => ({ id, role, status })),
 		failedWorkerHandledIds: handledIds,
 		reviewerVerdictOk: verdictOk,
-		verificationPassed: readVerificationResult(self),
+		verificationPassed: readVerificationResult(decisionNode),
 		actorRole: self.role,
 		...(machine ? { machine } : {}),
 		...(declaredFailure && mayDeclareFailure ? { terminalReason: "parent_decision" as const } : {}),
@@ -1745,7 +1794,7 @@ export async function requestLegionPhase(
 			await notifyParent(db, self, decision.message, options.settings, now, options.eventBus);
 			return { ok: false, code: "BUDGET_EXCEEDED", message: decision.message };
 		}
-		return { ok: false, code: "INVALID_PARAMS", message: `phase transition ${self.phase ?? "<unset>"} → ${to} refused: ${decision.message}` };
+		return { ok: false, code: "INVALID_PARAMS", message: `${doneReceipt}phase transition ${self.phase ?? "<unset>"} → ${to} refused: ${decision.message}` };
 	}
 
 	// #371 (m7): the contract is recorded when the team leaves its machine's ENTRY
@@ -1808,7 +1857,15 @@ export async function requestLegionPhase(
 	// (`ship` absent, or no machine at all) this is byte-for-byte `to !==
 	// "verifying"` — the built-in machine's answer IS `verifying`.
 	const verifyPhase = successPhaseOf(machine ?? DEFAULT_PHASE_MACHINE);
-	if (to !== verifyPhase) return { ok: true, phase: decision.to, message: `Phase changed to ${decision.to}.` };
+	// #P0 D1: when the gate above really EXECUTED the contract, its receipt has to
+	// travel with this early return — otherwise the agent pays for a verification
+	// and never hears about it. A validated machine can never make `verifyPhase`
+	// itself `done` (a terminal phase declares no transitions), so the `|| doneGate`
+	// arm only covers a hand-built machine — and even there it must not buy a
+	// second execution.
+	if (to !== verifyPhase || doneGate) {
+		return { ok: true, phase: decision.to, message: `${doneReceipt}Phase changed to ${decision.to}.` };
+	}
 
 	const current = getNode(db, nodeId) ?? self;
 	const contract = readContract(current, proposedContractPath);
@@ -1892,15 +1949,22 @@ function taskMetadata(raw: string | null): TaskSummaryMetadata {
  * gate was satisfied without running anything, and every message that says so has
  * to name it. Otherwise a parent reads "verification passed" and merges a branch
  * nothing ever checked.
+ *
+ * #P0 D2: "0 commands" also has a cause the agent can FIX, and it is the one that
+ * was never told: `parseLegionVerifyCommands` reads ```legion-verify fenced blocks
+ * only. A contract that states the instruction as the `## legion-verify` HEADING
+ * verifies nothing, and the team then reports a pass. Both variants name the
+ * fenced shape for that reason.
  */
 function verificationHow(commandCount: number, phase: string, machine?: PhaseMachine): string {
 	if (commandCount > 0) return `(${commandCount} command(s))`;
+	const fence = "only a ```legion-verify fenced block is parsed, and a `## legion-verify` heading is not parsed";
 	const gated = (findPhase(machine ?? DEFAULT_PHASE_MACHINE, phase)?.next.find((rule) => rule.to === "done")?.require ?? []).includes(
 		"verification_passed",
 	);
 	return gated
-		? "by contract (0 commands — the machine gates on verification_passed, but the contract lists no legion-verify block)"
-		: "by contract (0 commands)";
+		? `by contract (0 commands — the machine gates on verification_passed, but the contract lists no block: ${fence})`
+		: `by contract (0 commands — the contract lists no block: ${fence})`;
 }
 
 function readVerificationResult(node: LegionNode): boolean | undefined {
