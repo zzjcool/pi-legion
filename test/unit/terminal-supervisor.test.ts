@@ -560,6 +560,103 @@ test("D10: steer is a send and reports only the turn-boundary deposit", async ()
 	}
 });
 
+// ── #392: a terminal child takes no new text ─────────────────────────────
+
+/**
+ * #392: `terminal.send` into a terminal that already ended is what turned a
+ * legal `finished` into an `aborted` verdict.
+ *
+ * The send used to go out anyway, and the record was then flipped back to
+ * `live` — so the settle that followed read a last turn with no assistant
+ * message and the session was retired as aborted (resume permanently refused).
+ * These three cases pin the guard: refuse BEFORE the send, with the code the
+ * ledger already uses for a child that is over, and never overwrite the state.
+ */
+test("#392 D392-1: a steer to a finished terminal is refused before the send and stays finished", async () => {
+	const h = harness();
+	h.client.on("terminal.get", (params) => {
+		if (params.terminal === TERMINAL_ID) return { state: "live", labels: {} };
+		return { state: "finished", turn: 3, exit_code: 0, status: null };
+	});
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root));
+		await assert.rejects(
+			async () => {
+				await h.supervisor.steer("root.centurion-0", "add a test");
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError, `the refusal must carry a code: ${String(error)}`);
+				assert.equal(error.code, ErrorCodes.CHILD_TERMINAL);
+				// The message must name the child, the state, and a way forward.
+				assert.match(error.message, /root\.centurion-0/);
+				assert.match(error.message, /finished/);
+				assert.match(error.message, /resume/i);
+				return true;
+			},
+		);
+		// Not one byte went into the terminal of a process that is gone.
+		assert.equal(h.client.paramsFor("terminal.send").length, 0, "a finished terminal must not be sent to");
+		// The record was NOT flipped back to `live` behind the guard (the `:348`
+		// lie): `isAlive` is the public read of that state.
+		assert.equal(h.supervisor.isAlive("root.centurion-0"), false, "a refused send must not resurrect the record");
+		// …and the settle that follows reads the honest finished fact, not a new
+		// prompt whose last turn has no assistant message (the `aborted` shape).
+		assert.deepEqual(await h.supervisor.waitSettled("root.centurion-0", 40), {
+			settled: true,
+			abnormal: false,
+			exitCode: 0,
+		});
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#392 D392-1: a steer to a retired child is refused before the send", async () => {
+	const h = harness();
+	// The record reaches `retired` through the public retire path; the core still
+	// answers a plain live reading for it, so the refusal comes from the record
+	// state and not from a failed `terminal.get`.
+	h.client.on("terminal.get", (params) => {
+		if (params.terminal === TERMINAL_ID) return { state: "live", labels: {} };
+		return { state: "live", turn: 1, status: { state: "done" } };
+	});
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root));
+		await h.supervisor.retire("root.centurion-0");
+		assert.equal(h.supervisor.isAlive("root.centurion-0"), false);
+		await assert.rejects(
+			async () => {
+				await h.supervisor.steer("root.centurion-0", "add a test");
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError, `the refusal must carry a code: ${String(error)}`);
+				assert.equal(error.code, ErrorCodes.CHILD_TERMINAL);
+				assert.match(error.message, /retired/);
+				assert.match(error.message, /root\.centurion-0/);
+				return true;
+			},
+		);
+		assert.equal(h.client.paramsFor("terminal.send").length, 0, "a retired child must not be sent to");
+		assert.equal(h.supervisor.isAlive("root.centurion-0"), false);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#392 D392-1: a live child still takes the steer, queued, and stays alive", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root));
+		assert.equal(await h.supervisor.steer("root.centurion-0", "add a test"), "queued");
+		const sends = h.client.paramsFor("terminal.send");
+		assert.equal(sends.length, 1, "a live child gets exactly the one send");
+		assert.equal(sends[0]!.text, "add a test");
+		assert.equal(h.supervisor.isAlive("root.centurion-0"), true);
+	} finally {
+		h.cleanup();
+	}
+});
+
 // ── D11: retire ───────────────────────────────────────────────────────────
 
 test("D11: retire kills then removes, and a failing rm never throws", async () => {

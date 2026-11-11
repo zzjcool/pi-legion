@@ -335,6 +335,17 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// D8: refresh and record the turn the text belongs to BEFORE it goes in, so
 		// a settle can never be satisfied by the turn that was already over.
 		await this.observe(child);
+		// #392 (D392-1): a terminal child that has already ended takes no new text.
+		// `observe` just reported the truth — a `send` would go into a program that
+		// is gone, `child.state` would be flipped back to `live` below, and the
+		// settle that follows would read a last turn with no assistant message and
+		// turn a legal `finished` into an `aborted` verdict (which retires the node
+		// and refuses every later resume). Refuse here, before the send, and leave
+		// the record saying what the core said: `finished`/`retired` are terminal
+		// for this transport, so the answer is a resume/new child, not a send.
+		if (child.state === "finished" || child.state === "retired") {
+			throw terminalChildError(child);
+		}
 		child.promptTurn = child.turn;
 		const result = await client.request<HcSendResult>("terminal.send", {
 			terminal: child.terminalName,
@@ -748,4 +759,23 @@ function isNameTaken(error: unknown): boolean {
 
 function isNotFound(error: unknown): boolean {
 	return error instanceof HcRpcError && error.kind === "not_found";
+}
+
+/**
+ * The refusal for a send to a terminal child that has already ended (#392).
+ *
+ * `CHILD_TERMINAL` is the code the ledger already uses for "this child is over"
+ * (`CHILD_TERMINAL`, #309 D4) — reused rather than minted, so a caller can tell
+ * a dead terminal from a transport failure (`START_FAILED`) or a missing child
+ * (`NOT_FOUND`). The text names the child, the state the core reported and the
+ * only ways forward; the code itself stays out of the message (codes ride in
+ * `details.error`).
+ */
+function terminalChildError(child: TerminalChildRecord): SubagentError {
+	const state = child.state === "retired" ? "retired" : "finished";
+	return new SubagentError(
+		`child '${child.name}' is ${state}: its terminal has already ended, so no text was sent. ` +
+			"To continue this work, resume it (subagent action resume) or launch a new child that reuses its session.",
+		ErrorCodes.CHILD_TERMINAL,
+	);
 }

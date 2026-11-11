@@ -3795,7 +3795,16 @@ export async function steerChild(
 		followChild(ctx, { watch: true });
 		return ok(steerReceipt(ctx.name, disposition));
 	} catch (error) {
-		return fail(`steer failed: ${String(error)}`, ErrorCodes.NOT_FOUND);
+		// #392 D392-4: a child whose terminal has already ended is refused before
+		// the send, and `CHILD_TERMINAL` IS that refusal's meaning — flattening it
+		// into `NOT_FOUND` would tell the parent the child never existed. Every
+		// other failure keeps the historical flattening into `NOT_FOUND`.
+		// The code rides in `details.error`; the visible text stays code-free.
+		const code =
+			error instanceof SubagentError && error.code === ErrorCodes.CHILD_TERMINAL
+				? error.code
+				: ErrorCodes.NOT_FOUND;
+		return fail(`steer failed: ${String(error)}`, code);
 	}
 }
 
