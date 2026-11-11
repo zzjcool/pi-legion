@@ -53,7 +53,7 @@ import {
 import { resolveTeamContext } from "./src/agents/context.ts";
 import { createSessionRuntime, renderLiveChildStatus, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
-import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
+import { LegionPostman, registerLegionTools, verificationSummary, type LegionMailCommand, type VerificationSummary } from "./src/extension/legion-tools.ts";
 import { registerLegionOutputTool } from "./src/extension/legion-output.ts";
 import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
 import { resolveLoopRadiusMs } from "./src/legion/stall-notice.ts";
@@ -2837,6 +2837,40 @@ export function artifactBytesLookup(
 }
 
 /**
+ * #5 (polish round): the child's last CONTRACT verification, by child name.
+ *
+ * A collect/wait render is the parent's merge decision, and the two shapes of an empty
+ * "passed" — `0 commands` (a pass by contract) and a stale pass (the checkout moved
+ * after it) — were only visible in the child's own prose. The lookup answers per name
+ * because the render is keyed by name; `null` means "legion child, nothing recorded",
+ * and the ABSENCE of the lookup means "not a legion run" (the line is omitted).
+ *
+ * Never throws: a closed database costs the renderer one line, never the result.
+ */
+export function verificationLookup(
+	legion: { db: DatabaseSync; nodeId: string } | undefined,
+): ((name: string) => VerificationSummary | null | undefined) | undefined {
+	if (!legion) return undefined;
+	const byName = new Map(getChildren(legion.db, legion.nodeId).map((child) => [child.name, child]));
+	const cache = new Map<string, VerificationSummary | null | undefined>();
+	return (name) => {
+		if (cache.has(name)) return cache.get(name);
+		const child = byName.get(name);
+		let facts: VerificationSummary | null | undefined;
+		try {
+			// A node without a phase is not a team: it never runs a contract, so
+			// "never ran" would be a false statement about it. `undefined` means
+			// "this line does not apply", which the render omits.
+			facts = child?.phase != null ? (verificationSummary(child) ?? null) : undefined;
+		} catch {
+			facts = undefined;
+		}
+		cache.set(name, facts);
+		return facts;
+	};
+}
+
+/**
  * The READ-side ledger target (`result-ledger-v1.md` §3 D3, P4a): the connection a
  * delivery is recorded in, and the CONSUMER whose row it advances.
  */
@@ -3205,6 +3239,7 @@ async function controlAction(input: {
 			allAgents: input.allAgents,
 			store,
 			cwd,
+			verificationOf: verificationLookup(input.legion),
 			mail: mailSeamOf(input.legion),
 			// P5c (§3 D8): the SAME identity whose artifacts this wait delivers — one
 			// helper (`artifactBytesLookup`) so `collect` and `wait` cannot disagree about
@@ -3489,6 +3524,7 @@ async function controlAction(input: {
 			input.signal,
 			mailSeamOf(input.legion),
 			artifactBytesLookup(input.legion),
+			verificationLookup(input.legion),
 		);
 	if (action === "retire") return retireChild(ctx);
 	if (action === "continue" || action === "resume") return reviveChild(ctx);
@@ -3852,6 +3888,11 @@ export async function collectChild(
 	 * Absent = no legion identity → the render says `at least`.
 	 */
 	fullBytesOf?: ArtifactBytesLookup,
+	/**
+	 * #5 (polish round): the child's last contract verification. Absent for a non-legion
+	 * caller, `null` for a legion child with nothing recorded.
+	 */
+	verificationOf?: (name: string) => VerificationSummary | null | undefined,
 ): Promise<AgentToolResult<unknown>> {
 	/**
 	 * P4a (`result-ledger-v1.md` §3 D3/D3b): the ONE way a snapshot becomes this tool's
@@ -3867,7 +3908,15 @@ export async function collectChild(
 	 * actually reached the parent (the abort net can still replace this whole result).
 	 */
 	const deliver = (snapshot: CollectSnapshot): AgentToolResult<unknown> => {
-		return ok(renderCollect(ctx.name, snapshot, fullBytesOf), ledgerReadsDetails([snapshot.artifactId]));
+		return ok(
+			renderCollect(
+				ctx.name,
+				snapshot,
+				fullBytesOf,
+				verificationOf ? verificationOf(ctx.name) : undefined,
+			),
+			ledgerReadsDetails([snapshot.artifactId]),
+		);
 	};
 	let stopPolling: (() => void) | undefined;
 	// #384 review round 3: same hold as `wait` — this node's postman stays off its inbox
@@ -6272,7 +6321,11 @@ function waitBodySnapshot(
 }
 
 /** Render one wait result, reusing the collect shape for finished children. */
-export function renderWait(results: WaitResult[], fullBytesOf?: ArtifactBytesLookup): string {
+export function renderWait(
+	results: WaitResult[],
+	fullBytesOf?: ArtifactBytesLookup,
+	verificationOf?: (name: string) => VerificationSummary | null | undefined,
+): string {
 	let done = 0;
 	let running = 0;
 	let interrupted = 0;
@@ -6282,7 +6335,12 @@ export function renderWait(results: WaitResult[], fullBytesOf?: ArtifactBytesLoo
 			done += 1;
 			// D4: preview-sized when the ledger can state the whole size, and only then.
 			parts.push(
-				renderCollect(result.name, waitBodySnapshot(result.snapshot, fullBytesOf), fullBytesOf),
+				renderCollect(
+					result.name,
+					waitBodySnapshot(result.snapshot, fullBytesOf),
+					fullBytesOf,
+					verificationOf ? verificationOf(result.name) : undefined,
+				),
 			);
 		} else if (result.stillRunning) {
 			running += 1;
@@ -6792,11 +6850,18 @@ function mailPreemptedWait(input: {
 	running: readonly string[];
 	/** P5c: the artifact-size lookup the delivered snapshots render with (§3 D8). */
 	fullBytesOf?: ArtifactBytesLookup;
+	/** #5: the contract-verification facts, when this is a legion run. */
+	verificationOf?: (name: string) => VerificationSummary | null | undefined;
 }): AgentToolResult<unknown> {
 	// D4 applies here too: a wait preempted by mail is still a wait, so a body the
 	// ledger can measure is previewed exactly like the ordinary path's.
 	const sections = input.delivered.map((result) =>
-		renderCollect(result.name, waitBodySnapshot(result.snapshot!, input.fullBytesOf), input.fullBytesOf),
+		renderCollect(
+			result.name,
+			waitBodySnapshot(result.snapshot!, input.fullBytesOf),
+			input.fullBytesOf,
+			input.verificationOf ? input.verificationOf(result.name) : undefined,
+		),
 	);
 	if (input.running.length > 0) sections.push(`Still running: ${input.running.join(", ")}`);
 	return mailPreemptedResult({
@@ -6841,8 +6906,13 @@ export async function waitAction(input: {
 	 * the model can see. Absent = no legion identity → the render says `at least`.
 	 */
 	fullBytesOf?: ArtifactBytesLookup;
+	/**
+	 * #5: the child's last contract verification, by child name. Absent for a non-legion
+	 * caller — then the render omits the line instead of guessing one.
+	 */
+	verificationOf?: (name: string) => VerificationSummary | null | undefined;
 }): Promise<AgentToolResult<unknown>> {
-	const { params, signal, runtime, agents, allAgents = agents, store, cwd, fullBytesOf } = input;
+	const { params, signal, runtime, agents, allAgents = agents, store, cwd, fullBytesOf, verificationOf } = input;
 	const jobs = runtime.activeJobs();
 	let targets = resolveWaitTargets(
 		{ name: params.name, all: params.all },
@@ -6866,6 +6936,7 @@ export async function waitAction(input: {
 				delivered: [],
 				running: targets.names,
 				...(fullBytesOf ? { fullBytesOf } : {}),
+				...(verificationOf ? { verificationOf } : {}),
 			});
 		}
 	}
@@ -6958,6 +7029,7 @@ export async function waitAction(input: {
 					.filter((result) => result.interrupted === true || result.stillRunning === true)
 					.map((result) => result.name),
 				...(fullBytesOf ? { fullBytesOf } : {}),
+				...(verificationOf ? { verificationOf } : {}),
 			});
 		}
 	}
@@ -6972,7 +7044,7 @@ export async function waitAction(input: {
 	// which is a cut-short call whose answer the tool layer's abort net may still discard
 	// in full.
 	const ledgerReads = ledgerReadsDetails(results.map((result) => result.snapshot?.artifactId));
-	const text = renderWait(results, fullBytesOf);
+	const text = renderWait(results, fullBytesOf, verificationOf);
 	const timeoutDetails = buildWaitTimeoutDetails(results);
 	const details: Record<string, unknown> = { ...(timeoutDetails ?? {}), ...ledgerReads };
 	return {
@@ -7101,7 +7173,7 @@ function findChild(
 	return { runId: picked.run.runId, run: picked.run, child: picked.child };
 }
 
-function renderCollect(
+export function renderCollect(
 	name: string,
 	collected: {
 		execution: { status: string; reason?: string };
@@ -7135,12 +7207,32 @@ function renderCollect(
 	 * says `at least`.
 	 */
 	fullBytesOf?: ArtifactBytesLookup,
+	/**
+	 * #5 (polish round): the child's last contract verification. `null` = a legion child
+	 * with nothing recorded; `undefined` = not a legion run (line omitted, never guessed).
+	 */
+	verification?: VerificationSummary | null,
 ): string {
 	const lines = [
 		`── ${name} ──`,
 		`execution: ${collected.execution.status}${collected.execution.reason ? ` (${collected.execution.reason})` : ""}`,
 		`acceptance: ${collected.acceptance.status}${collected.acceptance.level ? ` (${collected.acceptance.level})` : ""}`,
 	];
+	// #5: the CONTRACT verification is a different fact from `acceptance` (that one is
+	// the launch-level attestation). A `0 commands` pass and a stale pass are the two
+	// ways "verified" can be empty, and the parent decides on a merge right here — so
+	// they are named, not left to the child's own prose.
+	if (verification === null) {
+		lines.push("verification: never ran (no contract)");
+	} else if (verification) {
+		lines.push(
+			verification.commandCount === 0
+				? "verification: 0 commands — by contract, nothing ran"
+				: verification.stale
+					? `verification: STALE — the checkout changed after the pass (${verification.commandCount} command(s)${verification.outputFile ? `, ${verification.outputFile}` : ""})`
+					: `verification: ${verification.commandCount} command(s) · log ${verification.outputFile ?? "(not recorded)"}`,
+		);
+	}
 	// The mechanical verify outcome (which command failed / which commands had
 	// to pass) is the parent's primary trust anchor — surface it inline.
 	if (collected.acceptance.reason && /^(verified by|verification failed)/.test(collected.acceptance.reason)) {

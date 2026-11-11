@@ -19,9 +19,14 @@ import * as path from "node:path";
 import piLegion, {
 	buildWaitTimeoutDetails,
 	listFinishedChildrenForStatus,
+	renderCollect,
 	renderFinishedStatusSection,
 	renderWait,
+	verificationLookup,
 } from "../../index.ts";
+import { runVerification, verificationSummary } from "../../src/extension/legion-tools.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { getNode, insertNode, updateNode } from "../../src/legion/nodes.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 import { DEFAULTS } from "../../src/shared/types.ts";
 import type { CollectSnapshot } from "../../src/extension/runtime.ts";
@@ -348,5 +353,79 @@ test("D7: the `all` parameter documents what it adds to a status overview", asyn
 		assert.match(description, /stop every non-retired child/);
 	} finally {
 		await harness.cleanup();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// #5 — the collect head says what the CONTRACT verification measured
+// ---------------------------------------------------------------------------
+
+test("#5: the collect head names an empty pass, and says nothing when there is no legion run", () => {
+	const snapshot: CollectSnapshot = {
+		execution: { status: "success" },
+		output: "body text",
+		acceptance: { status: "accepted" },
+	};
+	const render = (verification: Parameters<typeof renderCollect>[3]) =>
+		renderCollect("team-a", snapshot, undefined, verification);
+
+	assert.match(
+		render({ commandCount: 3, outputFile: "/tmp/v.log", checkedAt: 1, stale: false }),
+		/^verification: 3 command\(s\) · log \/tmp\/v\.log$/m,
+		"a real pass names the count and the log",
+	);
+	assert.match(
+		render({ commandCount: 0, checkedAt: 1, stale: false }),
+		/^verification: 0 commands — by contract, nothing ran$/m,
+		"0 commands is named as a pass by contract, not as a green",
+	);
+	assert.match(
+		render({ commandCount: 3, outputFile: "/tmp/v.log", checkedAt: 1, stale: true }),
+		/^verification: STALE — the checkout changed after the pass \(3 command\(s\), \/tmp\/v\.log\)$/m,
+		"a stale pass is the other empty shape, and it says why",
+	);
+	assert.match(render(null), /^verification: never ran \(no contract\)$/m, "a legion child with no row says so");
+	assert.doesNotMatch(render(undefined), /^verification:/m, "a non-legion caller gets no line, not a guess");
+});
+
+test("#5: the lookup answers per child name and follows the checkout", async () => {
+	const db = openLegionDb(":memory:");
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-verify-head-"));
+	const contractFile = path.join(dir, ".pi-legion", "contract.md");
+	try {
+		mkdirSync(path.join(dir, ".pi-legion"), { recursive: true });
+		writeFileSync(contractFile, "```legion-verify\nnpm test\n```\n");
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" }, () => 10);
+		insertNode(db, { parentId: "root", name: "team", role: "centurion", status: "running", phase: "verifying", phaseSince: 10 }, () => 10);
+		insertNode(db, { parentId: "root.team", name: "worker", role: "worker", status: "running" }, () => 10);
+		// A TEAM-shaped child: a verification row only ever exists on a node with a phase
+		// (a worker never runs a contract, and the lookup must not claim it "never ran").
+		insertNode(db, { parentId: "root.team", name: "squad", role: "centurion", status: "running", phase: "verifying", phaseSince: 10 }, () => 10);
+		// A team that has not verified yet — present BEFORE the lookup is taken (the
+		// resolver is a snapshot of this node's children, which is all a tool call needs).
+		insertNode(db, { parentId: "root.team", name: "quiet", role: "centurion", status: "running", phase: "implementing", phaseSince: 10 }, () => 10);
+		await runVerification(db, getNode(db, "root.team.squad")!, "```legion-verify\nnpm test\n```\n", {
+			cwd: dir, runDir: dir, now: () => 20, contractFile,
+			runCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
+		});
+		const lookup = verificationLookup({ db, nodeId: "root.team" });
+		assert.ok(lookup, "a legion caller gets a resolver");
+		const facts = lookup("squad");
+		assert.equal(facts?.commandCount, 1);
+		assert.equal(facts?.stale, false, "the pass still describes its checkout");
+		assert.equal(lookup("no-such-child"), undefined, "a name that is not a child gets no verdict line");
+		assert.equal(lookup("worker"), undefined, "a child without a phase never runs a contract");
+		assert.equal(verificationLookup(undefined), undefined, "no legion identity, no resolver");
+
+		// The node moves to another checkout: the pass is still the last thing that ran,
+		// and the render has to say it no longer covers what would be delivered.
+		updateNode(db, "root.team.squad", { worktreePath: path.join(dir, "elsewhere") }, () => 21);
+		assert.equal(verificationSummary(getNode(db, "root.team.squad")!)?.stale, true);
+		// A team that has not verified yet has no record at all.
+		assert.equal(verificationSummary(getNode(db, "root.team.quiet")!), undefined);
+		assert.equal(lookup("quiet"), null, "a team with no row says it never ran");
+	} finally {
+		db.close();
+		rmSync(dir, { recursive: true, force: true });
 	}
 });

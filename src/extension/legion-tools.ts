@@ -2497,6 +2497,40 @@ function storedPassThisStint(node: LegionNode): (VerificationResult & { cwd: str
  *      the caller can name it — #P0 D11);
  *   3. the checkout still matches what it judged.
  */
+/**
+ * What a child's LAST contract verification measured, for a parent-facing render (#5).
+ *
+ * `stale` is the same question the gate asks, but here the answer is only DISPLAYED:
+ * a pass that no longer covers the checkout is still the last thing that happened, and
+ * hiding it is exactly the failure this line exists to prevent. `checkedAt` travels so
+ * a caller can say "before this turn" if it ever wants to.
+ */
+export interface VerificationSummary {
+	commandCount: number;
+	outputFile?: string;
+	checkedAt: number;
+	stale: boolean;
+}
+
+export function verificationSummary(node: LegionNode): VerificationSummary | undefined {
+	const stored = taskMetadata(node.taskSummary).verification;
+	if (!stored) return undefined;
+	// STALE here means "no longer describes what would be delivered" — the same two
+	// questions the gate's tree/checkout half asks, and NOT the phase-stint clock: a
+	// reader of the collect head is asking about the delivery, and the stint is the
+	// gate's own business.
+	const where = typeof stored.cwd === "string" ? stored.cwd : undefined;
+	const stale = where === undefined
+		|| !checkoutMatchesPass(where, node.worktreePath ?? null)
+		|| verificationTree(where, readTextOrEmpty(stored.contractFile)) !== stored.tree;
+	return {
+		commandCount: stored.commandCount,
+		...(stored.outputFile ? { outputFile: stored.outputFile } : {}),
+		checkedAt: stored.checkedAt,
+		stale,
+	};
+}
+
 function verificationIsCurrent(node: LegionNode, currentCwd?: string | null): boolean {
 	const stored = storedPassThisStint(node);
 	if (!stored) return false;

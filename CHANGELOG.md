@@ -29,6 +29,10 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   collect 的 `cached head (4.0 KB of X)` + `legion_output({ name, round })`
   指针；拿不到总数时保持全文——截断却编不出总数才是不可接受的。`still running` 行从 `(elapsed 190108ms)` 改成 `(spawned 190.1s
   ago)`：那个数字一直是「启动至今」，不是本次等待时长（D3），`elapsedMs` 本身未改。
+- **collect/wait 的头写明契约验证的事实**（#5）：正常是 `verification: N command(s) · log …`，两种「空绿灯」单独成句——
+  `0 commands — by contract, nothing ran` 与 `STALE — the checkout changed after the pass`；legion 子节点没有记录时写
+  有相位的子节点没有记录时写 `never ran (no contract)`；worker 这类没有相位的子节点、以及非 legion 调用，都不出现这一行。事实来自子节点的 verification 行，用与门禁同一套判据
+  （checkout + 树指纹，不看相位 stint），所以父级在决定合并时不需要相信子节点的措辞。
 - **`status all` 不再是空开关**（D7）：不带 `name` 的总览仍是 live-only；`all:true` 在其后追加 retired/finished 记录（同名 live 优先，不重复列一行）。
 - **launch 级 `verify` 与契约的 ```legion-verify 围栏互相点名**：`index.ts` 两处 schema 描述与 `agents/worker.md`
   各加一句「前者是 extension 在 collect 时自己跑的 attestation，后者由 supervisor 在 verifying 执行」，`wait` 的 `timeoutMs`
