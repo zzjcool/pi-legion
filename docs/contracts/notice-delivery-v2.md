@@ -140,9 +140,14 @@ footer **删除**承诺子句，只陈述事实：`Still running: a, b`。
 
 ## §4 与既有契约的关系
 
-- `notice-claim-v1.md`：D1-D10 的 **claim 语义**继续有效（claim 键、回滚、`release` 只丢当轮）；
-  被本契约取代的是 D-B（cap 发送）与 outbox 投递时机；另外 **D5 的「逐字节一致」条款**由本契约
-  D5 的首行标记覆盖（首行固定为机器来源标记，其余正文形状不变）。
+- `result-ledger-v1.md`（P4c 起）：**claim 语义已被整体取代**。交付判据不再是内存 claim 集合，而是
+  账本投影 `ledger.undelivered(consumerId)`（该契约 D4：读全文或已通知即离开投影，没有回滚 API）；
+  本契约 D1-D6（边界交付、一轮一条、交付时刻生成文本、`stillRunning` 只列确定会再发通知的兄弟、
+  首行机器来源标记、上限只做健康计数）**仍然有效**，P4c 删掉的只是 claim 三件套与 `join` 的
+  `dropBuffered*`。历史依据见 `archive/notice-claim-v1.md`。
+- `notice-claim-v1.md`（已归档）：它定义 claim 键/回滚/`release` 只丢当轮；本契约曾取代其 D-B（cap 发送）
+  与 outbox 投递时机，并覆盖 **D5 的「逐字节一致」条款**（首行固定为机器来源标记，其余正文形状不变）。
+  该文件的 claim 部分现由 `result-ledger-v1.md` 取代。
 - `display-liveness-v1.md`：本契约 D4 是其 D1「单一权威」在通知 footer 上的落地——判活不再只看 `jobs` 表。
 - #238 burst：本契约不改变 join 层的分组，只改变 outbox 的交付节奏。
 

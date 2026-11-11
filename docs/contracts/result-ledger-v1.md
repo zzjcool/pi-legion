@@ -205,6 +205,24 @@ flushOutbox() → ledger.undelivered(consumerId)
 - 发送失败 → 不写 `notified_at` → 下次边界重试（沿用 `notice-claim-v1` D5 的 `false → 不 claim`）；**没有回滚 API**。
 - `join.dropBuffered*` 整类删除：成员由投影决定，缓冲里没有「需要撤销的副本」。
 
+### D4a — 降级路径必须保留一份**最小 origin 戳**（P4c 复审判定 critical）
+
+删掉 `snapshotOrigins` 的前提是「只需投影就能判 round」，这对**无投影的降级路径**不成立：
+条目在 `onTerminal` 时用 `job.round` 打标签，而 `track()`（steer/continue）会把 live round 顶到 2，
+上一轮的快照落地时占的是 **round 2 的 `deliveredOnce` 键** → round 2 的完成通知被静默吞掉（探针复现：pending 2 → 只送达 1 条）。
+
+冻结：
+
+- 保留一份最小 origin 映射（`CollectSnapshot → {runId, round}`，WeakMap），**只在 collect 落定时抓 `job.round`**；
+  条目仍用它打 round 标签与 `deliveredOnce` 键。它不再参与任何 claim/回滚判定。
+- 因此「F1：通知携带它被 collect 时的 round」这条性质**仍然有效**，测试不得降级成只走投影路径。
+
+### D4b — `renewal` 提案只挂 `completed` 条目
+
+P4c 把 renewal proposal 的取点从 `watch` 搬到投递格式化处时，**不得**把它套到 `collect-failure` 条目上：
+HEAD 的 collect-failure 分支从不带 `renewal`，套上去会让失败通知多出 `renew:` 行（用户可见文案变化），
+且每个失败条目多付一次 `listRuns()` + `loadCatalog()` 扫描。
+
 ### D5 — 通用 `read` 也算消费（path → artifact 索引）
 
 - `index.ts` 的 `tool_result` handler（今天只做 `bindUi + refreshUi`，`index.ts:2555`）增加：
@@ -302,10 +320,11 @@ legion_output({ name, round?, offset?, limit? })
 
 | 删除 | 位置 |
 | --- | --- |
-| `reported` Set、`reportKey`、`claimReported`、`claimCachedResult`、`claimIfTerminal`、`unclaimReported`、`unclaimUndelivered` | `runtime.ts:838-917, 1088-1153` |
-| `ClaimedCollect.claimedNow`、`snapshotOrigins` WeakMap（round 不再需要 cross-check） | `runtime.ts:732-735, 1075-1086` |
+| `reported` Set、`claimReported`、`claimCachedResult`、`claimIfTerminal`、`unclaimReported`、`unclaimUndelivered` | `runtime.ts:838-917, 1088-1153` |
+| `ClaimedCollect.claimedNow` | `runtime.ts:732-735` |
+| **保留**：`reportKey`（`deliveredOnce` 的降级键仍用 `runId\0name\0round`）与一份**最小 origin 戳**（见 §3 D4a） | `runtime.ts` |
 | `TrackedJob.consumedByTool` / `notified`（及 watch 闸门） | `runtime.ts:2388, 2450` |
-| `join.dropBuffered` / `dropBufferedRound` / `buffered` 容器 | `join.ts` |
+| `join.dropBuffered` / `dropBufferedRound`（**`buffered` 分组窗口保留** —— 它是 10s 批处理机制，不是 claim 的附属物） | `join.ts` |
 | finished 缓存 strip + rehydrate + `outputTruncated` | `runtime.ts:87, 948-1061` |
 | `outputFileFor` 的 name-only 路径 | `orchestrator.ts:2946-2960` |
 | `renderCollect` 的无条件「read this file when the output above is truncated」文案 | `index.ts:6441-6444` |
@@ -402,6 +421,7 @@ legion_output({ name, round?, offset?, limit? })
 | 2026-11-10 | v1.8 FROZEN | P4 拆成 a/b/c 三步（读侧落账 → 投递改投影 → 一次性删除），finished strip 移到 P5；D3 补 bail 顺序、consumerId 取法、artifactId 缺失时不落账。 |
 | 2026-11-10 | v1.9 FROZEN | P4a 交付时新增 **D3b**：落账从 handler 挪到 abort net 之后（handler 只声明 `details.ledgerReads`，唯一写点是 `settleControlResult`）。原因：abort net 会把已落账的结果整条替换成 `interrupted …`，造成静默丢结果。 |
 | 2026-11-10 | v1.10 FROZEN | P4b 复审后补 D4 两条：① 投影权威只限「账本里存在的 artifact」，未知 id 必须 fail-open 投递（否则库重置/插入失败 ⇒ 永久静默）；② `deliveredOnce` 必须在 `owesDelivery` 最前面读，否则 markNotified 抛错时的兜底是死代码。 |
+| 2026-11-11 | v1.11 FROZEN | P4c 复审后补 **D4a**（降级路径保留最小 origin 戳，否则 re-track 后 round 键锉位 ⇒ 静默丢通知）、**D4b**（renewal 只挂 completed 条目）；§5 修正两处自相矛盾（`reportKey` 保留、`join.buffered` 保留）。 |
 
 ## 12. 裁决记录
 

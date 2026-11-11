@@ -15,7 +15,8 @@
 
 `src/extension/runtime.ts` 的 `finished` 是 **one-round 缓存**（D7b，按 name 键），存
 `{ runId, round, snapshot: CollectSnapshot }`，其中 `snapshot.output` 是 child 的**输出全文**。
-它只在 5 处被删（重新 `track` / `rewatch` / `unclaim` / `unclaimUndelivered` / `dispose`），
+它只在 3 处被删（重新 `track` / `rewatch` / `dispose`；claim 模型已由 `result-ledger-v1` 的账本投影取代，
+P4c 删除了 `unclaim` / `unclaimUndelivered` 这两个失效点），
 **没有任何上限**：实测 50 个 child × 204,800 B 输出 ⇒ 堆上驻留 **10.07 MB**（≈206 KB/child），
 把 50 个名字重新 `track` 后立刻回落（反向证明持有者就是它）。
 
@@ -108,11 +109,10 @@ finished: {
 
 ### R6 — 不动的边界
 
-- **不改 claim（`reported`）的淘汰语义**（#320 那一族的正确性依赖它），只加计数；
-- 不改 one-round 失效点（`track` / `rewatch` / `unclaim` / `unclaimUndelivered` / `dispose`）；
-- **不改 claim 键**：淘汰后的条目仍然带 `runId`/`round`，缓存命中的 claim 与淘汰前完全相同；
-  命中时交出的副本会重新登记 `(runId, round)` origin，`unclaimUndelivered`（#320 的回滚）
-  因此对缓存命中也照旧生效；
+- **不改淘汰语义**（`finished` 仍是一轮缓存，被 `track`/`rewatch`/`dispose` 失效），只加计数；
+- 不改 one-round 失效点（`track` / `rewatch` / `dispose` —— P4c 之后只剩这三处）；
+- **不改 `(runId, round)` 的登记**：淘汰后的条目仍然带 `runId`/`round`，命中时交出的副本会重新登记
+  origin 戳（`result-ledger-v1` D4a）—— 降级路径的 `deliveredOnce` 键靠它，与淘汰前完全相同；
 - 不改 `CollectSnapshot` 之外的形状（不进 wire、不改 ledger schema）；`outputTruncated` 是本轮
   唯一新增字段（R5），且是可选字段；
 - 不改 `RateSampler` 的样本保留（那是 #346 的地盘，见 `legion-chart-frame-buckets-v1.md`）。

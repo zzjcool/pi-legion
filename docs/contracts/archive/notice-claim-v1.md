@@ -1,3 +1,5 @@
+> STATUS: HISTORICAL — superseded by ../result-ledger-v1.md
+
 # 完成通知去重：claim-once（v1，冻结）
 
 > 修订（详见 `notice-delivery-v2.md`）：outbox 的**投递时机**与 **D-B** 被 v2 取代。

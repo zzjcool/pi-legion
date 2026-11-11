@@ -51,7 +51,7 @@ import {
 	resolveSubagentSettings,
 } from "./src/agents/settings.ts";
 import { resolveTeamContext } from "./src/agents/context.ts";
-import { createSessionRuntime, renderLiveChildStatus, type ClaimedCollect, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
+import { createSessionRuntime, renderLiveChildStatus, type CollectSnapshot, type SessionRuntime, shouldRecycleAfterCollect, type WaitResult } from "./src/extension/runtime.ts";
 import { createDbEventSource, createLegionEventBus, type DbEventSource, type LegionEventBus } from "./src/extension/event-bus.ts";
 import { LegionPostman, registerLegionTools, type LegionMailCommand } from "./src/extension/legion-tools.ts";
 import type { PhaseDefinition, PhaseMachine, PhaseTransitionRule } from "./src/legion/phase-machine.ts";
@@ -1994,19 +1994,19 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// The ledger handle + consumer id (`parent_id`) the runtime asks about, or
 		// `undefined` before this entry has an identity.
 		//
-		// Since P4b (`result-ledger-v1` §3 D4) this is the DELIVERY PROJECTION's input, not
-		// a diagnostic switch: every notice decision asks it — `ledger.undelivered(...)` for
-		// "still owed" and `ledger.listArtifacts(...)` for "does this id even exist", plus
-		// `markNotified` on a successful send. `PI_LEGION_LEDGER_SHADOW=1` only adds the
-		// P3 comparison line on top (D11); it is NOT what makes the hook live.
+		// This is the DELIVERY PROJECTION (`result-ledger-v1` §3 D4) — the ONE source of
+		// every notice decision since P4c deleted the claim model: `ledger.undelivered(...)`
+		// for "still owed", `ledger.listArtifacts(...)` for "does this id even exist", plus
+		// `markNotified` on a successful send. The P3 shadow that used to read it too is
+		// gone; nothing else answers this question.
 		//
 		// Answered from the connection THIS entry already owns — `openLegionDb` is
 		// deliberately not called here: a second connection to the same file for a
-		// diagnostic would be a fact neither the projection nor the shadow can justify. No
-		// identity yet (a root has no ledger before its first launch) answers `undefined`,
-		// which the runtime reads as "no projection" and handles by degrading to its
-		// in-memory `deliveredOnce` (宁多推一条，不静默丢).
-		getLedgerShadowFacts: () => {
+		// diagnostic would be a fact the projection cannot justify. No identity yet (a root
+		// has no ledger before its first launch) answers `undefined`, which the runtime
+		// reads as "no projection" and handles by degrading to its in-memory
+		// `deliveredOnce` (宁多推一条，不静默丢).
+		getLedgerProjection: () => {
 			const identity = ownLegionIdentity();
 			return identity ? { db: identity.db, consumerId: identity.nodeId } : undefined;
 		},
@@ -2415,7 +2415,6 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				// stop's result is delivered and settled like any other.
 				return settleControlResult({
 					result,
-					runtime,
 					...(activeLegion ? { legion: activeLegion } : {}),
 					aborted: signal?.aborted === true && action !== "stop",
 				});
@@ -2700,8 +2699,7 @@ const LEDGER_READS_DETAIL = "ledgerReads";
  * no artifact identity to name (empty turn, failed artifact write, an older result, a
  * running snapshot: §3 D3).
  *
- * `details` never affects the rendered text, so this cannot change what the model reads
- * — the same reason `#352`'s `waitClaims` lives there.
+ * `details` never affects the rendered text, so this cannot change what the model reads.
  */
 function ledgerReadsDetails(
 	artifactIds: ReadonlyArray<string | undefined>,
@@ -3419,9 +3417,7 @@ export async function abortChild(
 /**
  * Wait for the child's current turn and derive its outcome from the session.
  *
- * Exported alongside `waitAction` for the index-layer unit tests: the claim the
- * runtime seam takes has to be handed back when this call bails (D2), and that
- * wiring is only observable from here.
+ * Exported alongside `waitAction` for the index-layer unit tests.
  */
 export async function collectChild(
 	ctx: ChildContext,
@@ -3489,54 +3485,36 @@ export async function collectChild(
 				? ctx.runtime.consumeCollectInterruptible(ctx.name, combined)
 				: ctx.runtime.consumeCollect(ctx.name);
 		if (pending) {
+			// P4c/D12: the seam returns the bare snapshot again — nothing was claimed, so
+			// nothing has to be handed back on a bail. Delivery is recorded where it
+			// happens (`deliver` above declares the read; the abort net decides whether that
+			// declaration survives), which is why an abort/persist bail simply returns
+			// before `deliver` and leaves the notice owed (D3: 宁多推一条，不静默丢).
 			const collected = await pending;
-			// D2: the seam claims a terminal snapshot on the way out, because a flush in
-			// that tick would otherwise repeat it. Every bail from here hands the result
-			// to NOBODY, so the claim is handed back — a permanently suppressed notice
-			// for a result the parent never saw is the worse failure of the two. The
-			// rollback is told `claimedNow`, the flag this very call got back: only a claim
-			// THIS call took comes back (#320/1), so a result an earlier delivery already
-			// claimed keeps its evidence, and the job branch restores the notification
-			// route with it (#320/2).
-			//
-			// #384: a mail preempt is the reason the seam answered `undefined`, and it is
-			// resolved AFTER the rollback above so #352's invariant holds either way: no
-			// notice may be left claimed-but-undelivered by a preemption.
+			// #384: a mail preempt is the reason the seam answered `undefined`.
 			const callerGone = signal?.aborted === true;
 			const mailWon =
 				mail !== undefined && combined?.reason === MAIL_PREEMPT_REASON && !callerGone;
 			// #384 review P1.1: mail ended the collect, but the ledger is empty — the
 			// postman claimed the row first. Answer with what this collect DID get
-			// (`renderCollect`, the claim it took is the delivery) instead of the frozen
-			// `interrupted …`, which would blame the parent turn for something that
-			// never happened.
+			// (`renderCollect`) instead of the frozen `interrupted …`, which would blame
+			// the parent turn for something that never happened.
 			if (mailWon) {
 				const released = takePendingMail(mail.db, mail.nodeId);
 				if (released.length > 0) {
-					if (collected) {
-						// The mail wins and the child's text is dropped: hand the claim back
-						// so that round's notice can still deliver it (#352).
-						ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
-					}
+					// The mail wins and the child's text is dropped: `deliver` is never
+					// reached, so no read is declared and the notice stays owed.
 					return mailPreemptedCollect(ctx.name, released);
 				}
-				if (collected) return deliver(collected.snapshot);
+				if (collected) return deliver(collected);
 			}
 			if (!collected || signal?.aborted) {
-				if (collected) {
-					ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
-				}
 				return ok("interrupted (parent turn ended; children still running)");
 			}
-			try {
-				await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
-			} catch (error) {
-				// Same rule for the other bail: `renderCollect` is never reached, so the
-				// tool result will not carry this snapshot either.
-				ctx.runtime.unclaimUndelivered(ctx.name, collected.snapshot, collected.claimedNow);
-				throw error;
-			}
-			return deliver(collected.snapshot);
+			// The other bail: `renderCollect` is never reached, so the tool result will not
+			// carry this snapshot — the throw propagates and nothing was declared.
+			await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, ctx.name, { preserveRetired: true });
+			return deliver(collected);
 		}
 
 		const cached = ctx.orchestrator.cachedCollect(ctx.name);
@@ -6027,85 +6005,25 @@ export async function stopAction(input: {
 }
 
 /**
- * #352: one completion claim a `wait` took for a result the parent never saw.
- *
- * `waitAction` claims a settled child's result on its finished-cache probe
- * (`runtime.consumeCollect`, `index.ts` — the probe is NOT side-effect free since
- * notice-claim-v1), and the tool layer in this file can still throw the rendered
- * result away when the parent turn ends. Only a claim THIS call took travels here
- * (`claimedNow === true`): a key an earlier real delivery claimed is evidence, not
- * something a bail may spend (#320/1).
- */
-export interface WaitClaim {
-	name: string;
-	snapshot: CollectSnapshot;
-}
-
-/**
- * #352: hand back every claim a discarded `wait` result owed.
- *
- * `unclaimUndelivered`, never `unclaimReported`: nothing reached the parent, so the
- * queued notice is the ONLY remaining route — the rollback gives the claim back and
- * drops no copy (D2/D7). `claimedNow` is always `true` here: `WaitClaim`s only exist
- * for claims this call took.
- *
- * #352 review (major 1): the claim arrives ASYNCHRONOUSLY. `waitAction`'s
- * finished-cache probe is a promise (`consumeCollect` → `ensureCollect`), and the wait
- * can bail long before it answers — `signal?.aborted`, `WAIT_INTERRUPTED` and
- * `WaitTimeoutError` all win their race inside `waitOne` while that collect is still in
- * flight. The probe then resolves to a terminal snapshot and claims `(runId, name,
- * round)` AFTER the details object was already built, so the bail has to wait for that
- * answer before it rolls anything back: `details.waitClaims` is a live array (shared by
- * reference with `waitAction`), and `details.waitClaimsPending` is the promise that
- * resolves once the probe has folded its claim in. Awaited first, both windows are
- * covered: the claim that was already there, and the one that landed late.
- *
- * The await is bounded by the probe's own collect, which is what makes the claim
- * knowable at all; returning now and rolling back from a detached continuation would
- * hand the claim back after the frozen `interrupted …` line already went out.
- */
-export async function releaseWaitClaims(runtime: SessionRuntime, details: unknown): Promise<void> {
-	if (details === null || typeof details !== "object") return;
-	const record = details as { waitClaims?: unknown; waitClaimsPending?: unknown };
-	const pending = record.waitClaimsPending;
-	if (pending !== undefined) {
-		try {
-			await (pending as Promise<unknown>);
-		} catch {
-			// A throwing probe took no claim — nothing to give back.
-		}
-	}
-	const claims = record.waitClaims;
-	if (!Array.isArray(claims)) return;
-	for (const claim of claims as WaitClaim[]) {
-		runtime.unclaimUndelivered(claim.name, claim.snapshot, true);
-	}
-}
-
-/**
  * What a control call answers when the caller's abort lands after it returned
- * (#352 + #384 review P0-3).
+ * (#384 review P0-3).
  *
- * #352: the frozen head line REPLACES the rendered result, so the parent never sees
- * it — and `wait` CLAIMS a settled child's completion on its finished-cache probe.
- * The result is thrown away here, so the claim has to go back (exactly what
- * `collectChild` owes on its own bails): a claim nobody delivered suppresses that
- * round's notice forever.
+ * P4c deleted #352's claim rollback with the claim model: the handlers no longer take
+ * anything the abort net could owe back. A replaced result simply never declared its
+ * `ledgerReads` (D3b), so nothing was marked read and the notice stays owed — the same
+ * guarantee the rollback bought, without an API to undo.
  *
- * #384 review P0-3: a MAIL result is thrown away the same way, but a claim is not
- * the only thing it held — the mails inside it were already `PENDING → ACCEPTED`, and
- * `takePendingMail` has no way back. Left alone, the text would be lost for good
- * (before #384 the message was still `PENDING` and a restart would have delivered
- * it). So the discarded result's mail is re-enqueued as fresh `PENDING` rows
- * (`Redelivered: ` subject, same sender/recipient/body) and the postman's next tick
+ * #384 review P0-3: a MAIL result is thrown away here, and the mails inside it were
+ * already `PENDING → ACCEPTED` — `takePendingMail` has no way back. Left alone, the text
+ * would be lost for good (before #384 the message was still `PENDING` and a restart would
+ * have delivered it). So the discarded result's mail is re-enqueued as fresh `PENDING`
+ * rows (`Redelivered: ` subject, same sender/recipient/body) and the postman's next tick
  * delivers it like any other mail.
  */
 export async function interruptedControlResult(input: {
 	result: AgentToolResult<unknown>;
-	runtime: SessionRuntime;
 	legion?: OrchestratorLegionContext;
 }): Promise<AgentToolResult<unknown>> {
-	await releaseWaitClaims(input.runtime, input.result.details);
 	redeliverPreemptedMail(input.legion, input.result.details);
 	return ok("interrupted (parent turn ended; children still running)");
 }
@@ -6124,21 +6042,18 @@ export async function interruptedControlResult(input: {
  * function decides.
  *
  * `aborted` is the caller's verdict (`signal?.aborted`, with the pre-existing `stop`
- * exemption applied by the caller). Replaced results keep nothing:
- * `interruptedControlResult` releases the wait claims and re-queues the mail it carried,
- * and the artifact ids go with the text — no row was ever written, so there is nothing
- * to roll back and nothing that can suppress a notice.
+ * exemption applied by the caller). A replaced result keeps nothing:
+ * `interruptedControlResult` re-queues the mail it carried, and the artifact ids go with
+ * the text — no row was ever written, so nothing can suppress a notice.
  */
 export async function settleControlResult(input: {
 	result: AgentToolResult<unknown>;
-	runtime: SessionRuntime;
 	legion?: OrchestratorLegionContext;
 	aborted: boolean;
 }): Promise<AgentToolResult<unknown>> {
 	if (input.aborted) {
 		return interruptedControlResult({
 			result: input.result,
-			runtime: input.runtime,
 			...(input.legion ? { legion: input.legion } : {}),
 		});
 	}
@@ -6174,39 +6089,12 @@ function redeliverPreemptedMail(
 const MAIL_PREEMPT_REASON = Symbol("legion mail preempted the blocking call");
 
 /**
- * Mount the #352 claim record on a wait result's `details` (both fields, always).
- *
- * #352 review (major 1): mount BOTH unconditionally. Deciding on `claims.length` was
- * a no-op: one probe means at most one claim, and the probe has usually not answered
- * yet at this point — so the length test mounted nothing in the window that matters,
- * and when it did mount it shared a reference with a caller that could reach it anyway.
- * The array stays live (late pushes land in the same object) and the promise says
- * when the probe got its answer.
- */
-function withWaitClaims(
-	details: Record<string, unknown>,
-	claims: WaitClaim[],
-	pending?: Promise<WaitClaim[]>,
-): Record<string, unknown> {
-	details.waitClaims = claims;
-	if (pending) {
-		// Non-enumerable: this is a live promise, and `details` is the tool result's
-		// record — a promise has no business in a serialized transcript.
-		Object.defineProperty(details, "waitClaimsPending", {
-			value: pending,
-			enumerable: false,
-			configurable: true,
-		});
-	}
-	return details;
-}
-
-/**
  * Contract §2: the mail that ended the blocking call, as a NORMAL tool result.
  *
  * Not an error and not `interrupted …` — the model reads the mail and carries on.
- * The `details` shape is the one the contract froze: `state`, `mailIds`, `targets`,
- * plus the wait's claim record when the caller has one (a `collect` takes no claim).
+ * The `details` shape is the one the contract froze: `state`, `mailIds`, `targets`.
+ * (P4c removed the #352 claim record that used to ride along: the seam takes nothing
+ * to hand back any more, and the read side is declared by the handlers themselves.)
  *
  * `sections` are the parts of the blocking call that DID happen, in order: the mail
  * itself first (that is what ended the call), then whatever the call had already
@@ -6216,8 +6104,6 @@ function mailPreemptedResult(input: {
 	released: readonly LegionMessage[];
 	targets: readonly string[];
 	sections: readonly string[];
-	claims?: WaitClaim[];
-	pending?: Promise<WaitClaim[]>;
 }): AgentToolResult<unknown> {
 	return {
 		content: [
@@ -6226,15 +6112,11 @@ function mailPreemptedResult(input: {
 				text: [renderReleasedMail(input.released), ...input.sections].join("\n\n"),
 			},
 		],
-		details: withWaitClaims(
-			{
-				state: "mail",
-				mailIds: input.released.map((message) => message.id),
-				targets: [...input.targets],
-			},
-			input.claims ?? [],
-			input.pending,
-		),
+		details: {
+			state: "mail",
+			mailIds: input.released.map((message) => message.id),
+			targets: [...input.targets],
+		},
 	};
 }
 
@@ -6256,8 +6138,6 @@ function mailPreemptedWait(input: {
 	delivered: readonly WaitResult[];
 	/** Names this wait had not finished when the mail landed. */
 	running: readonly string[];
-	claims: WaitClaim[];
-	pending?: Promise<WaitClaim[]>;
 }): AgentToolResult<unknown> {
 	const sections = input.delivered.map((result) => renderCollect(result.name, result.snapshot!));
 	if (input.running.length > 0) sections.push(`Still running: ${input.running.join(", ")}`);
@@ -6265,8 +6145,6 @@ function mailPreemptedWait(input: {
 		released: input.released,
 		targets: input.names,
 		sections,
-		claims: input.claims,
-		...(input.pending ? { pending: input.pending } : {}),
 	});
 }
 
@@ -6302,25 +6180,14 @@ export async function waitAction(input: {
 }): Promise<AgentToolResult<unknown>> {
 	const { params, signal, runtime, agents, allAgents = agents, store, cwd } = input;
 	const jobs = runtime.activeJobs();
-	// #352: every claim THIS call takes. The array is shared by REFERENCE with the
-	// returned `details.waitClaims`, because the probe below answers asynchronously:
-	// a claim that lands after the details object was built must still be visible to
-	// a caller that discards the rendered result.
-	const claims: WaitClaim[] = [];
-	// #352 review (major 1): the probe's answer, absent when this wait has no probe at
-	// all (live targets). It resolves to `claims` once the probe's own claim — if any —
-	// has been folded in, and travels out as `details.waitClaimsPending` so a bail that
-	// lands while it is still in flight can wait for it instead of rolling back nothing.
-	let claimsPending: Promise<WaitClaim[]> | undefined;
 	let targets = resolveWaitTargets(
 		{ name: params.name, all: params.all },
 		jobs,
 	);
 	const mail = input.mail;
-	// #384: look in the inbox ONCE here — before the finished-cache probe below can
-	// take a #352 claim, so the preempted path is provably claim-free. `signal?.aborted`
-	// at entry means the caller is already gone: I5 keeps that path exactly as it was,
-	// mail or no mail.
+	// #384: look in the inbox ONCE here, before the finished-cache probe below can start
+	// a collect nobody reads. `signal?.aborted` at entry means the caller is already
+	// gone: I5 keeps that path exactly as it was, mail or no mail.
 	//
 	// Review P1.2: only a wait that HAS somewhere to wait is preempted. `unknown child`
 	// and the parameter/liveness errors keep precedence — mail is not an answer to a
@@ -6334,30 +6201,21 @@ export async function waitAction(input: {
 				names: targets.names,
 				delivered: [],
 				running: targets.names,
-				claims,
 			});
 		}
 	}
 	if (!targets.ok) {
 		// A name that is merely finished (not live) is still waitable via the
-		// runtime's finished cache — probe it with consumeCollect. NOTE: since
-		// notice-claim-v1 that probe is NOT side-effect free: a cache hit claims the
-		// result, which is correct here — the wait below returns the same result to the
-		// parent, so the pushed notice for it is suppressed instead of duplicating it.
-		// It is also why the claim travels back out (#352): if the caller never hands
-		// the result over, nobody else can, and the claim must be given back.
+		// runtime's finished cache: `consumeCollect` answers with the cached snapshot.
+		// P4c: the probe is a plain read again — it takes nothing, so nothing has to be
+		// handed back if this call is discarded; the wait below returns the same result
+		// to the parent and THAT is what declares the read.
 		if (params.name && !params.all) {
 			const probe = runtime.consumeCollect(params.name);
 			if (probe) {
-				const name = params.name;
-				claimsPending = probe.then((claimed: ClaimedCollect) => {
-					// #320/1: only a claim THIS call took may come back later.
-					if (claimed.claimedNow) claims.push({ name, snapshot: claimed.snapshot });
-					return claims;
-				}, () => {
-					// A throwing collect is the `wait` below's problem, not the probe's.
-					return claims;
-				});
+				// A throwing collect is the `wait` below's problem, not the probe's: park a
+				// no-op handler so the failure surfaces exactly once, through the wait.
+				void probe.catch(() => undefined);
 				targets = { ok: true, names: [params.name] };
 			} else {
 				return unknownChild(params.name, store, cwd);
@@ -6413,8 +6271,7 @@ export async function waitAction(input: {
 	// invention: they made a wait that received mail answer as if the wait had simply
 	// timed out, with `interrupted (parent turn ended…)` naming a turn that never
 	// ended. What the wait DID collect rides along in the body instead (delivered
-	// results verbatim), and `details.waitClaims` is still mounted, so a claim this
-	// call took is never dropped on the floor.
+	// results verbatim).
 	//
 	// Whoever aborted FIRST still wins (contract §4): a caller abort keeps the frozen
 	// `interrupted …` rendering even when mail landed a tick later (I5).
@@ -6435,8 +6292,6 @@ export async function waitAction(input: {
 					.filter((result) => result.snapshot === undefined)
 					.filter((result) => result.interrupted === true || result.stillRunning === true)
 					.map((result) => result.name),
-				claims,
-				...(claimsPending ? { pending: claimsPending } : {}),
 			});
 		}
 	}
@@ -6445,22 +6300,18 @@ export async function waitAction(input: {
 	// write itself happens in `settleControlResult`, after the tool layer has decided the
 	// text really goes out.
 	//
-	// This includes the finished-cache probe path: the probe only CLAIMS the cached
-	// result; the snapshot the parent actually reads is the one in `results`. It excludes
-	// the two answers that carry no delivery — the `interrupted …` entries (they have no
-	// snapshot at all) and the mail preempt above, which is a cut-short call whose answer
-	// the tool layer's abort net may still discard in full.
+	// This includes the finished-cache probe path: the snapshot the parent actually reads
+	// is the one in `results`. It excludes the two answers that carry no delivery — the
+	// `interrupted …` entries (they have no snapshot at all) and the mail preempt above,
+	// which is a cut-short call whose answer the tool layer's abort net may still discard
+	// in full.
 	const ledgerReads = ledgerReadsDetails(results.map((result) => result.snapshot?.artifactId));
 	const text = renderWait(results);
 	const timeoutDetails = buildWaitTimeoutDetails(results);
-	// #352: `details.waitClaims` is the only record of what this call took — the tool
-	// layer's abort net replaces the rendered result with the frozen `interrupted …`
-	// line, and without this the claim it leaves behind suppresses that round's notice
-	// forever (see `withWaitClaims`).
 	const details: Record<string, unknown> = { ...(timeoutDetails ?? {}), ...ledgerReads };
 	return {
 		content: [{ type: "text", text }],
-		details: withWaitClaims(details, claims, claimsPending),
+		details,
 	};
 }
 

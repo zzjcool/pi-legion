@@ -11,6 +11,21 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Added
+
+- `legion.db` schema **v3**（`LEGION_DB_USER_VERSION` 2 → 3，迁移幂等、旧四表零列变更）：`artifacts`（不可变结果的台账）+ `consumptions`（每个 consumer 的两维事实：`read_bytes` 高水位 / `notified_at` 只写一次）。`rebuild` 可从磁盘恢复 `artifacts`，`consumptions` 一律重置（只会多推、不会少推）。
+- 子 agent 输出改存 `<runDir>/artifacts/<name>/r<round>.md`（原子写、按轮次寻址，同名多轮不再互相覆盖），由 `src/runs/artifacts.ts` 统一负责路径/轮次/内容幂等。
+- `legion_db` 的 statement cache 上限 64 → 128（v3 把 distinct SQL 文本推到 69，旧上限已无 headroom）。
+
+### Changed
+
+- **“读过就不再提”从进程内 claim 集合改成账本投影**（`docs/contracts/result-ledger-v1.md`）：投递判据统一为 `owesDelivery`（投影 + 最小兜底集），账本不认识的 artifact id **fail-open** 投递（宁多推，不静默丢）。`collect`/`wait` 在 abort net **之后**才落 read 账（结果被 `interrupted …` 替换时一笔不记）。
+
+### Removed
+
+- `reported` set、`claimReported` / `claimCachedResult` / `claimIfTerminal` / `unclaimReported` / `unclaimUndelivered`、`snapshotOrigins` 的 claim 用途、`TrackedJob.consumedByTool` / `notified` 与 watch 闸门、`join.dropBuffered*`、`P3` 的 shadow 模块（共 -2.9k 行）。`consumeCollect*` 回退成返回裸 `CollectSnapshot`（**对外 API 破坏**，无兼容层）。
+- 契约 `notice-claim-v1.md` 归档到 `docs/contracts/archive/`（HISTORICAL），语义由 `result-ledger-v1.md` 取代；`notice-delivery-v2.md` 的 D1-D6 仍有效。
+
 ## [5.6.0] — 2026-11-09
 
 ### Added

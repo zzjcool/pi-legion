@@ -12,6 +12,7 @@ import {
 	formatCompletionNotice,
 	formatGroupedNotice,
 	collectFailureInput,
+	type CompletionInput,
 	type CompletionNotice,
 	type CompletionStatus,
 	type SendMessageApi,
@@ -57,7 +58,6 @@ import { getSubtree } from "../legion/nodes.ts";
 import { attachUsageTotals } from "../legion/usage.ts";
 import { maxEventId } from "../legion/events.ts";
 import { listArtifacts, markNotified, undelivered } from "../legion/ledger.ts";
-import { compareDelivery, shadowEnabled, SHADOW_MISMATCH_PREFIX } from "./ledger-shadow.ts";
 import { publishLegionRunActivity } from "../legion/run-active.ts";
 import type { TreeNodeSnapshot } from "../tui/tree-view.ts";
 import type { PhaseMachine } from "../legion/phase-machine.ts";
@@ -169,8 +169,6 @@ export interface TrackedJob extends TrackedJobInput {
 	 */
 	round: number;
 	state: string;
-	consumedByTool: boolean;
-	notified: boolean;
 	watching: boolean;
 	generation: number;
 	settledAt?: number;
@@ -266,12 +264,12 @@ export interface SessionRuntimeDeps {
 	 * The ledger handle plus the consumer id (`parent_id`) the runtime asks about — or
 	 * `undefined` when this host has neither.
 	 *
-	 * Since P4b (`result-ledger-v1` §3 D4) this is the DELIVERY PROJECTION: whether a
-	 * result still owes the parent a notice is answered by
-	 * `ledger.undelivered(consumerId)` (see `ledgerProjection` / `owesDelivery` below),
-	 * and a successful send is recorded with `ledger.markNotified`. P3 read it for the
-	 * shadow comparison (D11), which is where the name comes from, and `index.ts`
-	 * already wires it (from `ownLegionIdentity()`), so the projection is live in a
+	 * This is the DELIVERY PROJECTION (`result-ledger-v1` §3 D4): whether a result still
+	 * owes the parent a notice is answered by `ledger.undelivered(consumerId)` (see
+	 * `ledgerProjection` / `owesDelivery` below), and a successful send is recorded with
+	 * `ledger.markNotified`. Since P4c it is the ONLY source of that verdict — the P3
+	 * shadow (which also read it) was deleted together with the claim set — and
+	 * `index.ts` wires it from `ownLegionIdentity()`, so the projection is live in a
 	 * real session rather than waiting for a hookup.
 	 *
 	 * The runtime does not open its own connection — the host already owns one, and a
@@ -282,7 +280,7 @@ export interface SessionRuntimeDeps {
 	 * them for no behaviour. Absent (or throwing) ⇒ no projection ⇒ the `deliveredOnce`
 	 * fallback, never a failed delivery (D1e).
 	 */
-	getLedgerShadowFacts?: () => { db: DatabaseSync; consumerId: string } | undefined;
+	getLedgerProjection?: () => { db: DatabaseSync; consumerId: string } | undefined;
 }
 
 const DEFAULT_REFRESH_MS = 500;
@@ -705,28 +703,18 @@ export interface SessionRuntime {
 	track(input: TrackedJobInput): TrackedJob;
 	watch(name: string, opts?: { triggerTurn?: boolean }): void;
 	/**
-	 * Mark this result as belonging to an explicit `collect` tool call so the
-	 * watcher will not also inject a completion message. Returns the shared
-	 * collect promise when we are already tracking the child.
+	 * The explicit `collect` tool call's read of a child's result: the shared collect
+	 * promise when the child is tracked, otherwise the finished cache.
+	 *
+	 * P4c (`result-ledger-v1` D12): this returns the bare snapshot again. The seam used
+	 * to hand out a claim (`ClaimedCollect`) so a bail could roll it back; delivery is
+	 * now decided by the ledger projection (D4), which has no rollback API — a result the
+	 * tool call never handed over simply declares no `ledgerReads` (D3b), so nothing was
+	 * written and the notice still owes its delivery.
 	 */
-	consumeCollect(name: string): Promise<ClaimedCollect> | undefined;
+	consumeCollect(name: string): Promise<CollectSnapshot> | undefined;
 	/** Abortable variant used by an in-flight collect tool call. */
-	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<ClaimedCollect | undefined> | undefined;
-	/**
-	 * Undo the claim `consumeCollect*` took for a snapshot the caller never delivered
-	 * (the tool call bailed: the parent turn aborted, or persisting the child failed).
-	 * D2: a claim is earned by a delivery, not by a collect that reached nobody.
-	 *
-	 * `claimedNow` is the flag the seam handed out with the snapshot: only a claim THIS
-	 * call took may come back. A key an earlier real delivery claimed is evidence, not
-	 * something a bail may erase.
-	 *
-	 * Unlike `unclaimReported` (D7) this does NOT drop queued/buffered copies: after the
-	 * tool route bailed, that notice is the ONLY route left to the parent. On the job
-	 * branch it therefore also hands the notification route back (`consumedByTool`, plus
-	 * a watch re-arm), so that "only route left" actually exists (#320).
-	 */
-	unclaimUndelivered(name: string, snapshot: CollectSnapshot, claimedNow: boolean): void;
+	consumeCollectInterruptible(name: string, signal: AbortSignal): Promise<CollectSnapshot | undefined> | undefined;
 	/** Invalidate an in-flight notification watch without dropping the job. */
 	cancelWatch(name: string): void;
 	rewatch(name: string, opts?: { triggerTurn?: boolean }): void;
@@ -763,8 +751,9 @@ export interface SessionRuntime {
 	 */
 	publishRunActivity?(nodeId: string): void;
 	/**
-	 * Explicit wait: suppress auto-notify on the targets via consumedByTool
-	 * and aggregate their results. A timeout restores auto-notify.
+	 * Explicit wait: aggregate the targets' results. The notice for a result the parent
+	 * actually read is suppressed by the ledger projection, not by a flag this call sets
+	 * (P4c), so a timeout needs no restore.
 	 */
 	wait(
 		names: string[],
@@ -776,21 +765,6 @@ export interface SessionRuntime {
 	 */
 	drainBeforeShutdown(): Promise<void>;
 	dispose(): void;
-}
-
-/**
- * #320/1: what the `collect` seam hands its caller — the snapshot, plus whether THIS call
- * is the one that took the completion claim for its round.
- *
- * The flag travels with the RETURN VALUE, not in a table keyed by the snapshot, because it
- * is a property of the call: the watch and the tool call can await the same
- * `job.collectPromise` and therefore receive the same object, so a per-snapshot record lets
- * the second call overwrite the first's `true` with `false` — after which the first call's
- * bail leaves a claim standing that nobody delivered.
- */
-export interface ClaimedCollect {
-	snapshot: CollectSnapshot;
-	claimedNow: boolean;
 }
 
 /**
@@ -895,93 +869,27 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	let drainPromise: Promise<void> | undefined;
 	let busyRaised = false;
 
-	// ─────────────────── completion claim-once (notice-claim-v1) ───────────────────
+	// ───────────── the delivery verdict is a PROJECTION (result-ledger-v1 D4) ─────────────
 	//
-	// D1: the ONE marker that arbitrates the two delivery routes for a child's
-	// result — the tool result (`wait` / `collect`) and the pushed notice
-	// (watch → join → outbox). It is keyed by `(runId, name, round)` and lives for the
-	// whole session because the notice it has to beat routinely outlives the job:
-	// `waitOne` retires and releases the job while its buffered/queued notice is
-	// still pending (W1–W3). The old `consumedByTool`/`notified` pair lived ON the
-	// job, so a release erased the only evidence that the parent had already been
-	// told (W4) — that is the bug this replaces, not a second copy of it.
-	//
-	// Memory only, by contract: never in run.json / legion.db, and no cross-process
-	// meaning. Recovering a result from disk after a restart is `collect`'s job.
-	const reported = new Set<string>();
+	// P4c deleted the whole claim model that used to live in this closure: the reported
+	// key set and its six operations (claim, claim-if-terminal, claim-a-cached-result,
+	// revoke, hand-back, unclaim-on-reset), the per-snapshot round map that fed them, the
+	// two flags on `TrackedJob` and the watch gate that read those flags (D12: 旧模型直接
+	// 删除，不做兼容层). Nothing here is a memory bit set at a call site any more — see the
+	// projection below.
 	/**
 	 * D10: the key is `(runId, name, round)`. `\u0000` occurs in no component, so no
 	 * two triples can collide; and because the round comes from a monotonic per-name
 	 * counter, a new round can never be mistaken for an old one.
+	 *
+	 * P4c: the claim table this key was minted for is gone. It survives because the
+	 * `deliveredOnce` fallback below is still a per-round memory (the ledger write is
+	 * keyed by the artifact id, not by this string).
 	 */
 	const reportKey = (runId: string, name: string, round: number): string =>
 		`${runId}\u0000${name}\u0000${round}`;
-	const isReported = (runId: string, name: string, round: number): boolean =>
-		reported.has(reportKey(runId, name, round));
-	/**
-	 * D2: take the claim for `(runId, name, round)`, where `round` is the reporting
-	 * round handed out monotonically by `track()` (D10). Idempotent and side-effect
-	 * free for a key that is already claimed — and there is deliberately no unclaim on
-	 * the DELIVERY side: a timeout / interrupt / still-running result was never
-	 * claimed, and a claim taken by a real delivery IS the record that the parent read
-	 * it, so nothing on the send path may revoke it.
-	 *
-	 * The caller side is a different question, and the answer is NOT "a claim that did
-	 * happen has already reached the parent": a tool call can claim a result and then
-	 * bail before rendering it — `collectChild`'s abort/persist bails, and `wait`'s
-	 * result discarded by the tool layer's abort net (#352). Those callers owe the
-	 * claim back through `unclaimUndelivered`, which is why that rollback takes
-	 * `claimedNow` (below) and why `waitAction` carries its probe's pair out in
-	 * `details.waitClaims`.
-	 *
-	 * Returns whether THIS call is the one that took the claim (#320/1): a `false`
-	 * means a real delivery got there first, and that claim is evidence, not something
-	 * a later rollback may spend.
-	 */
-	const claimReported = (runId: string, name: string, round: number): boolean => {
-		const key = reportKey(runId, name, round);
-		if (reported.has(key)) return false;
-		reported.add(key);
-		return true;
-	};
-	/**
-	 * D7: revoke the claim AND every not-yet-sent copy of it, atomically.
-	 *
-	 * "Just delete the claim" is not enough: the outbox may still hold an entry for
-	 * this key, and reviving the claim without dropping that entry resurrects an
-	 * already-read notice into the next flush (measured: wait read the result,
-	 * re-`track` of the same child, settle sent it again). The buffered join entry
-	 * is the same hazard in the window layer.
-	 *
-	 * Called from exactly the places that reset `notified` (see D7); `dropQueued`
-	 * and `join` are declared later in this closure and are only touched at CALL
-	 * time, which is always after construction.
-	 */
-	const unclaimReported = (runId: string | undefined, name: string, round: number): void => {
-		if (runId === undefined) return;
-		// The revoke is keyed on the CURRENT round's claim (D10 #5): a round that was
-		// never claimed has no delivered result to revoke, so its queued/buffered copy
-		// is simply an unread result that must survive (D7's `had` gate, now precise).
-		const had = reported.delete(reportKey(runId, name, round));
-		if (!had) return;
-		// A revoked result invalidates every copy of this NAME — all rounds — because
-		// the parent is being asked to look at the child again (D10 #5).
-		dropQueued(runId, name);
-		join.dropBuffered(runId, name);
-		// …and the one-round cache for the name is stale from here on.
-		finished.delete(name);
-	};
-	/**
-	 * D9: claim a cached (already-released) result, keyed by the run the SNAPSHOT
-	 * came from — never by "the newest run seen for this name".
-	 *
-	 * Returns whether this call took the claim (#320/1), which the seam hands to the
-	 * caller as `ClaimedCollect.claimedNow`.
-	 */
-	const claimCachedResult = (name: string, cached: FinishedResult): boolean =>
-		claimReported(cached.runId, name, cached.round);
 
-	// ─────────────────── P4b: the delivery verdict is a PROJECTION ───────────────────
+	// ─────────────────── the projection, and its degraded fallback ───────────────────
 	//
 	// `result-ledger-v1` D4: whether a result still owes the parent a notice is no
 	// longer a memory bit set at four call sites — it is a query. `undelivered` names
@@ -1006,13 +914,27 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const deliveredOnce = new Set<string>();
 
 	/**
+	 * The env switch D11 introduced for the shadow, kept for the one diagnostic D4 still
+	 * owes after P4c.
+	 *
+	 * `./ledger-shadow.ts` is deleted (D11: the shadow lives only in P3), so the flag no
+	 * longer selects between two models — there is one model, the projection. What it
+	 * still gates is `artifact-id-without-ledger-row` below: an id the ledger has no row
+	 * for is a fact worth one stderr line, and D11's "默认零开销" (default silent) still
+	 * applies to the default path.
+	 */
+	const DIAGNOSTIC_ENV = "PI_LEGION_LEDGER_SHADOW";
+	const DIAGNOSTIC_PREFIX = "ledger-shadow mismatch";
+	const diagnosticsEnabled = (): boolean => process.env[DIAGNOSTIC_ENV] === "1";
+
+	/**
 	 * One read of the projection. `undefined` = no projection available (D1e: a
 	 * missing/closed handle or a throwing host hook is "no ledger", not a failed
 	 * send — the caller degrades, it never throws).
 	 */
 	const ledgerProjection = (): LedgerProjection | undefined => {
 		try {
-			const facts = deps.getLedgerShadowFacts?.();
+			const facts = deps.getLedgerProjection?.();
 			if (!facts) return undefined;
 			return {
 				db: facts.db,
@@ -1031,24 +953,24 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * v1.10 diagnostic (review critical): an artifact id this consumer has no row for.
 	 *
 	 * A diagnostic, never a decision: by the time this runs the verdict has already
-	 * failed OPEN. Gated on the shadow flag so the default path stays silent (D11), one
-	 * line per id (this runs on every `noticeQueueStats()` poll too, and a diagnostic must
-	 * not become a stderr firehose), and wrapped because a closed stderr pipe may not
-	 * become a failed delivery.
+	 * failed OPEN. Gated on the D11 flag so the default path stays silent, one line per id
+	 * (this runs on every `noticeQueueStats()` poll too, and a diagnostic must not become a
+	 * stderr firehose), and wrapped because a closed stderr pipe may not become a failed
+	 * delivery.
 	 */
 	const unknownArtifactReported = new Set<string>();
 	const reportUnknownArtifact = (artifactId: string, consumerId: string): void => {
-		if (!shadowEnabled()) return;
+		if (!diagnosticsEnabled()) return;
 		const key = `${consumerId}\u0000${artifactId}`;
 		if (unknownArtifactReported.has(key)) return;
 		unknownArtifactReported.add(key);
 		try {
 			process.stderr.write(
-				`${SHADOW_MISMATCH_PREFIX} reason=artifact-id-without-ledger-row ` +
+				`${DIAGNOSTIC_PREFIX} reason=artifact-id-without-ledger-row ` +
 					`artifact=${artifactId} consumer=${consumerId}\n`,
 			);
 		} catch {
-			// D11: diagnostics only.
+			// Diagnostics only: never a delivery outcome.
 		}
 	};
 
@@ -1072,8 +994,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * store writes one only at settle), so the `Still running` footer asks without an id
 	 * and the answer is always the `deliveredOnce` fallback.
 	 *
-	 * Deliberately does NOT consult the old claim set: mixing the two models here is what
-	 * would make a "delivered" verdict unexplainable. P4c deletes that set.
+	 * Since P4c this is the ONLY delivery verdict in the runtime: the claim set it once had
+	 * to agree with is gone, so there is no second model left to mix in.
 	 */
 	const owesDelivery = (
 		runId: string,
@@ -1218,8 +1140,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 *    right after (so `residentBytes` stays inside R1 at every instant, including
 	 *    right after a hit) and that re-bounding mutates the ENTRY's text, which no
 	 *    caller holds a reference to any more.
-	 *  - the `(runId, round)` origin is registered on the copy too, so
-	 *    `unclaimUndelivered` can still roll a claim back for a cached hit (#320).
+	 *  - the `(runId, round)` the entry was collected in travels with the hit, so a
+	 *    caller can label its own bookkeeping with the round this result came FROM
+	 *    rather than with the live job's current one (D9/F1).
 	 */
 	const cachedFinished = (name: string): FinishedResult | undefined => {
 		const entry = finished.get(name);
@@ -1230,22 +1153,29 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		const restored = rehydrateFinished(entry);
 		const snapshot: CollectSnapshot = { ...entry.snapshot };
 		if (!restored) snapshot.outputTruncated = true;
-		snapshotOrigins.set(snapshot, { runId: entry.runId, round: entry.round });
 		// Re-apply the bound: the hit needed the whole text, the cache does not keep it.
 		trimFinished();
 		return { runId: entry.runId, round: entry.round, snapshot, bytes: entry.bytes, stripped: entry.stripped };
 	};
 	/**
-	 * F1: the `(runId, round)` a snapshot was COLLECTED in.
+	 * D4a (v1.11): the `(runId, round)` a snapshot was COLLECTED in — the minimal origin
+	 * stamp the degraded path cannot do without.
 	 *
-	 * A round is a property of the collect, not of the job: `track()` on an existing
-	 * job bumps `job.round` (D10 #1) WITHOUT touching `generation`, so a snapshot
-	 * that resolves after a re-track would otherwise be attributed to the new round
-	 * while the cache — which captured the origin when the collect started — still
-	 * says the old one. Two labels for one output ⇒ delivered twice, or the new
-	 * round's real result filtered by the old entry's claim. Every consumer therefore
-	 * reads the origin stamped on the snapshot, falling back to the live job only when
-	 * there is no snapshot object at all (the watch's collect-failure path).
+	 * P4c deleted the claim model and, with it, the original use of this map. The stamp
+	 * itself is NOT part of that model: the notice entry has to be labelled with the
+	 * round the result BELONGS to, and `track()` (steer / continue) bumps `job.round`
+	 * while a collect is still in flight. Labelling with the live round puts round 1's
+	 * snapshot on ROUND 2's `deliveredOnce` key in a session with no projection, and
+	 * round 2's own completion is then filtered as "already sent" — one result silently
+	 * lost (the reviewer's probe: two pending notices, one delivered).
+	 *
+	 * Scope, frozen (§3 D4a): a LABEL, nothing else. No claim is taken from it, nothing
+	 * is revoked, and `owesDelivery` never reads it — the delivery verdict is the
+	 * projection (D4); this map only decides which round an entry SPEAKS about.
+	 *
+	 * Written in exactly one place (`ensureCollect`, when the collect lands) and read in
+	 * exactly one (`watch`'s terminal branch). A snapshot nobody collected here has no
+	 * entry, and the caller falls back to the live job.
 	 */
 	const snapshotOrigins = new WeakMap<CollectSnapshot, { runId: string; round: number }>();
 	const originOf = (
@@ -1256,80 +1186,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			runId: job.runId,
 			round: job.round,
 		};
-	/**
-	 * D2(b): a blocked / running snapshot is a progress signal, not a result, so it
-	 * is never claimed — claiming it would swallow the real completion later.
-	 */
-	const claimIfTerminal = (job: TrackedJob, snapshot: CollectSnapshot): ClaimedCollect => {
-		if (!snapshot.blocked && shouldRecycleAfterCollect(snapshot.execution.status)) {
-			const origin = originOf(snapshot, job);
-			return { snapshot, claimedNow: claimReported(origin.runId, job.name, origin.round) };
-		}
-		// Not a result: no claim was taken (D2(b)), and the caller must not imagine one.
-		return { snapshot, claimedNow: false };
-	};
-	/**
-	 * D2 (delivery, not collection): roll back a claim that reached nobody.
-	 *
-	 * The seam has to claim when the snapshot is handed to the caller, because a
-	 * join/outbox flush landing in that same tick must not repeat the result. But the
-	 * CALLER may still bail — `collectChild` returns "interrupted" when the parent turn
-	 * aborted, and fails the tool call when persisting the child throws. Neither hands
-	 * the text to the parent, so the claim has to go back: otherwise the pushed notice
-	 * for a result nobody saw is filtered out forever.
-	 *
-	 * Deliberately narrower than `unclaimReported`: no copies are dropped. The queued /
-	 * buffered notice is the only remaining route to the parent, and D7's question ("the
-	 * parent read it, so revoke") does not apply — nothing was read.
-	 *
-	 * Two #320 refinements:
-	 *
-	 * 1. Only a claim THIS seam call took comes back (`claimedNow`, handed out with the
-	 *    snapshot so two collects on one snapshot cannot overwrite each other's answer).
-	 *    A key a real delivery claimed earlier is not ours to spend.
-	 * 2. The rollback also hands the NOTIFICATION route back. The seam set
-	 *    `consumedByTool` before the claim, and the watch gate
-	 *    (`!consumedByTool && !notified`) reads it at settle — without clearing the flag
-	 *    and re-arming the watch, this round's notice would be suppressed forever, so
-	 *    "the pending notice is the only route left" would be false on exactly the branch
-	 *    that needs it.
-	 *
-	 * The re-arm is UNCONDITIONAL on purpose. In the production shape every child is
-	 * watched, so a watch is almost always in flight here — and by the time the caller
-	 * bails it has already passed its gate (that is why `consumedByTool` was true) and is
-	 * parked in `retire`, with `job.watching` still `true`. Gating the re-arm on
-	 * `!job.watching` therefore made the whole repair dead code. Re-arming is safe: the
-	 * generation bump makes the old watch skip its `release`, `notified` keeps this round
-	 * from `onTerminal`-ing twice, and `deliverBatch`'s claim filter is the last net.
-	 *
-	 * Timing differs from `waitOne`'s WAIT_INTERRUPTED branch, which wins its race BEFORE
-	 * the collect promise resolves (the watch then sees a cleared flag and a live job).
-	 * This path can only happen AFTER the snapshot resolved — the gate has already run —
-	 * so the flag alone is not enough and the watch has to be replaced.
-	 */
-	const unclaimUndelivered = (
-		name: string,
-		snapshot: CollectSnapshot,
-		claimedNow: boolean,
-	): void => {
-		// #320/1: the claim of an earlier delivery is evidence, not a loan.
-		if (!claimedNow) return;
-		const origin = snapshotOrigins.get(snapshot);
-		// No origin ⇒ this runtime did not collect it, so it cannot have claimed it.
-		if (!origin) return;
-		reported.delete(reportKey(origin.runId, name, origin.round));
-		// #320/2: only the job this collect belonged to owns `consumedByTool`; a job
-		// tracked since then is a different round with its own watch.
-		const job = jobs.get(name);
-		if (!job || job.runId !== origin.runId || job.round !== origin.round) return;
-		job.consumedByTool = false;
-		runtime.watch(name);
-	};
+
 	/**
 	 * D10 #1: the reporting round per child name.
 	 *
 	 * Monotonic and never rewound: reusing a number would let a new round inherit an
-	 * old round's claim (and so swallow its completion). `track()` — the only writer —
+	 * old round's notice (and so swallow its completion). `track()` — the only writer —
 	 * bumps it on BOTH branches, because both start a new reporting round.
 	 */
 	const roundOfName = new Map<string, number>();
@@ -1461,78 +1323,24 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	};
 
 	/**
-	 * D7: drop every not-yet-sent copy of `(runId, name)` from the outbox.
+	 * `subagent-renewal-v1` D3: the proposal the notice text may carry — built at the
+	 * moment the text is built.
 	 *
-	 * The outbox is the one buffer with no per-name undo, so an unclaim that only
-	 * deletes the key leaves the old entry alive and the next flush ships it again
-	 * (the "revived notice", measured). Removing members can invalidate the armed
-	 * horizon timer — it was priced off the entry that used to be at the head — so
-	 * the timer is retired and re-armed off the NEW head (the oldest survivor, i.e.
-	 * the earliest remaining horizon). Nothing left to send ⇒ no timer at all.
+	 * P4c moved this out of the watch. With the two job flags gone, every settle reaches
+	 * `join.onTerminal`, so asking the host hook there would cost a
+	 * run-registry scan per finished child — including the results the projection is about
+	 * to filter out (`control-scope-scan`'s #344 guard measures exactly that). The hook's
+	 * own rules are unchanged: it returns `undefined` for every case that must not offer a
+	 * renewal (completed / still running / opted out / no baseline), so "absent" is
+	 * meaningful, not a missing wire.
 	 */
-	const dropQueued = (runId: string, name: string): void => {
-		if (outbox.length === 0) return;
-		let changed = false;
-		for (let index = outbox.length - 1; index >= 0; index -= 1) {
-			const item = outbox[index]!;
-			const kept = item.entries.filter(
-				(entry) => !(entry.runId === runId && entry.name === name),
-			);
-			if (kept.length === item.entries.length) continue;
-			changed = true;
-			if (kept.length === 0) outbox.splice(index, 1);
-			else item.entries = kept;
-		}
-		if (!changed) return;
-		outboxTimer?.cancel();
-		outboxTimer = undefined;
-		armOutboxTimer();
-	};
-
-	/**
-	 * P3 (`docs/contracts/result-ledger-v1.md` §3 D11): the compressed shadow.
-	 *
-	 * For every entry that is ABOUT to be claim-filtered, computes BOTH verdicts —
-	 * `!isReported(...)` from the claim set and `ledger.undelivered(consumerId) ∋
-	 * artifactId` from the projection — and writes one stderr line per disagreement.
-	 * It changes nothing: `surviving`, its order, the batching, the outbox and the
-	 * send are all decided below, from the same inputs as before. The only consumer
-	 * of this output is a human reading stderr, which is why it must never throw.
-	 *
-	 * `shadowEnabled()` is the FIRST condition on purpose (D11: 默认零开销): with the
-	 * flag unset this function allocates nothing, builds no entry id and does not
-	 * touch the database — it is one environment-variable read on the delivery seam.
-	 */
-	const shadowBatch = (entries: readonly DeliverableEntry[]): void => {
-		if (!shadowEnabled()) return;
-		try {
-			const facts = deps.getLedgerShadowFacts?.();
-			// No ledger context ⇒ no projection to compare against. Reporting every
-			// artifact as "absent from undelivered" would invent a disagreement.
-			if (!facts) return;
-			const undeliveredIds = new Set(
-				undelivered(facts.db, facts.consumerId).map((artifact) => artifact.id),
-			);
-			const at = now();
-			for (const entry of entries) {
-				const artifactId = entry.input.artifactId;
-				const line = compareDelivery({
-					entry: {
-						// The claim key `(runId, name, round)` in a human-readable spelling —
-						// the shipped key joins the three with NUL, which no log line can carry.
-						entryId: `${entry.runId}/${entry.name}/r${entry.round}`,
-						...(artifactId === undefined ? {} : { artifactId }),
-					},
-					oldSaysDeliver: !isReported(entry.runId, entry.name, entry.round),
-					ledgerSaysDeliver: artifactId !== undefined && undeliveredIds.has(artifactId),
-					now: at,
-				});
-				if (line !== undefined) process.stderr.write(`${line}\n`);
-			}
-		} catch {
-			// D11: diagnostic only. A missing table, a closed handle, a throwing host
-			// hook or a closed stderr pipe must never become a failed delivery.
-		}
+	const withRenewalProposal = (entry: DeliverableEntry): CompletionInput => {
+		// D4b (v1.11): renewal is a COMPLETED result's affordance. The collect-failure
+		// notice never carried one before P4c, and asking the host here both changes that
+		// visible text and pays a `listRuns()` + `loadCatalog()` scan per failure.
+		if (entry.input.execution?.status !== "completed") return entry.input;
+		const renewal = deps.getRenewalProposal?.(entry.name, entry.input.execution);
+		return renewal === undefined ? entry.input : { ...entry.input, renewal };
 	};
 
 	/**
@@ -1545,21 +1353,23 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	 * Order is load-bearing:
 	 *  1. filter settled entries → empty ⇒ return (this IS "read once, never
 	 *     repeated");
-	 *  2. format what survives — single & whole ⇒ legacy `Background task …`
+	 *  2. hold the STRUCTURE (D4) if the parent run is live, or
+	 *  3. format what survives — single & whole ⇒ legacy `Background task …`
 	 *     shape, otherwise the grouped one with `stillRunning` recomputed NOW;
-	 *  3. send immediately, or hold the STRUCTURE (D4) until the run settles;
-	 *  4. record the delivery (`markNotified` / `deliveredOnce`) only after a real
-	 *     one: a host rejection (`false`) must mark nothing so the next boundary can
-	 *     still deliver it.
+	 *  4. send, then record the delivery (`markNotified` / `deliveredOnce`) only after
+	 *     a real one: a host rejection (`false`) must mark nothing so the next boundary
+	 *     can still deliver it.
+	 *
+	 * P4c: the TEXT is built at the delivery moment, i.e. AFTER the hold branch. A batch
+	 * that is going to be queued allocates no text and asks no host hook — the same shape
+	 * `flushOutbox` produces when it re-enters here, and the reason a settle the parent
+	 * already collected costs nothing but the projection read.
 	 */
 	const deliverBatch = (
 		entries: readonly DeliverableEntry[],
 		triggerTurn: boolean,
 		partial: boolean,
 	): number => {
-		// P3 shadow (D11): observe the batch BEFORE the filter below, and change nothing
-		// about it. A no-op unless `PI_LEGION_LEDGER_SHADOW=1`.
-		shadowBatch(entries);
 		// D10 #4: each entry is judged, and later marked notified, on ITS OWN round — so
 		// two unread rounds of one child both survive, while a repeated delivery inside one
 		// round is still filtered.
@@ -1572,9 +1382,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			owesDelivery(entry.runId, entry.name, entry.round, projection, entry.input.artifactId),
 		);
 		if (surviving.length === 0) return 0;
+		// D1: a run boundary is the ONLY delivery moment. While the parent run is
+		// live the batch is held STRUCTURALLY (D4) — not sent, not even as a
+		// followUp: the host cannot retract a message, so anything sent now would
+		// become visible at a moment the projection no longer controls (T0 ≠ T2).
+		if (parentRunActive) {
+			outbox.push({ entries: surviving, triggerTurn, partial, enqueuedAt: now() });
+			armOutboxTimer();
+			return 0;
+		}
 		let notice: CompletionNotice;
 		if (!partial && surviving.length === 1) {
-			notice = formatCompletionNotice(surviving[0]!.input);
+			notice = formatCompletionNotice(withRenewalProposal(surviving[0]!));
 		} else {
 			// `stillRunning` is derived from the live job table at the moment of
 			// DELIVERY, never stored: a member claimed by `wait`/`collect` while this
@@ -1607,24 +1426,14 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						// 宁少报不假报: a sibling this runtime has not already announced is
 						// listed.
 						owesDelivery(job.runId, job.name, job.round, projection) &&
-						!job.consumedByTool &&
 						!delivering.has(job.name),
 				)
 				.map((job) => job.name);
 			notice = formatGroupedNotice({
 				runId: surviving[0]!.runId,
-				entries: surviving.map((entry) => ({ ...entry.input, status: entry.status })),
+				entries: surviving.map((entry) => ({ ...withRenewalProposal(entry), status: entry.status })),
 				...(stillRunning.length > 0 ? { stillRunning } : {}),
 			});
-		}
-		// D1: a run boundary is the ONLY delivery moment. While the parent run is
-		// live the batch is held STRUCTURALLY (D4) — not sent, not even as a
-		// followUp: the host cannot retract a message, so anything sent now would
-		// become visible at a moment the projection no longer controls (T0 ≠ T2).
-		if (parentRunActive) {
-			outbox.push({ entries: surviving, triggerTurn, partial, enqueuedAt: now() });
-			armOutboxTimer();
-			return 0;
 		}
 		if (deliverCompletion({ sendMessage: deps.sendMessage }, notice, triggerTurn)) {
 			// P4b/D4 step 4: record the delivery. This is the ONLY write on the notice side,
@@ -2301,14 +2110,17 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const ensureCollect = (job: TrackedJob, signal?: AbortSignal): Promise<CollectSnapshot> => {
 		if (!job.collectPromise) {
 			const generation = job.generation;
-			// D7b/D10 #6/F1: the run id AND the round are captured when the collect
-			// STARTS, and stamped onto the snapshot below — `track()` on an existing job
-			// rewrites `job.runId` and bumps `job.round` without touching `generation`.
+			// D7b/D10 #6: the run id AND the round are captured when the collect STARTS,
+			// because `track()` on an existing job rewrites `job.runId` and bumps
+			// `job.round` without touching `generation`.
 			const origin = { runId: job.runId, round: job.round };
 			job.collectPromise = (async () => {
 				const snapshot = await job.collect(signal ? { signal } : undefined);
-				// F1: every later consumer (cache, notice entry, claim) must speak about
-				// the round this result came FROM, never about the live job's current one.
+				// D4a/F1: stamp the round this result came FROM, before anything can bump
+				// the live one. Every entry built from this snapshot speaks about `origin`,
+				// never about `job.round` (which a `track()` during this collect may have
+				// moved on) — that label is also the `deliveredOnce` key on the degraded
+				// path, so getting it wrong loses the NEXT round's notice.
 				snapshotOrigins.set(snapshot, origin);
 				const current = jobs.get(job.name) === job && job.generation === generation;
 				if (current) {
@@ -2347,9 +2159,15 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	};
 
 	/**
-	 * Wait for one child. Shares the in-flight watch's collect promise, so a
-	 * hit suppresses the auto-notify (consumedByTool stays set); a TIMEOUT
-	 * restores consumedByTool so the watch notifies normally when it lands.
+	 * Wait for one child. Shares the in-flight watch's collect promise, so the watch
+	 * and this wait never collect the child twice.
+	 *
+	 * P4c: this no longer arbitrates anything. The old shape claimed the result here so
+	 * the watch's two flags would skip their notice; the verdict is the
+	 * ledger projection now (`result-ledger-v1` D4), taken at delivery time inside
+	 * `deliverBatch` — a result the parent READ through this wait left the projection by
+	 * `read_bytes`, so its notice is filtered there and not here. A timeout or an abort
+	 * therefore has nothing to "restore": nothing was ever taken.
 	 */
 	const waitOne = async (
 		name: string,
@@ -2360,18 +2178,15 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		if (!job) {
 			const cached = cachedFinished(name);
 			if (cached) {
-				// D2(a): a cached hit hands the parent the same terminal result, so it
-				// claims too — for the run that snapshot CAME FROM (D9). The job is
-				// already released here, which is precisely the W2 window: the notice for
-				// this child may still be in the outbox.
-				claimCachedResult(name, cached);
+				// D2(a)/D9: a cached hit hands the parent the same terminal result. The
+				// job is already released here, which is precisely the W2 window: the
+				// notice for this child may still be in the outbox, and only the
+				// projection (the read row the tool layer writes) may settle it.
 				return { name, snapshot: cached.snapshot };
 			}
 			return { name, missing: true };
 		}
-		job.consumedByTool = true;
 		if (signal?.aborted) {
-			job.consumedByTool = false;
 			return { name, interrupted: true };
 		}
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2401,7 +2216,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			if (outcome === WAIT_INTERRUPTED) {
 				// Esc / parent-turn abort does not retire children (esc-no-retire-v3).
 				// Re-arm watch so settle still notifies the parent.
-				job.consumedByTool = false;
 				if (!job.watching) runtime.watch(name);
 				return { name, interrupted: true };
 			}
@@ -2411,7 +2225,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				!shouldRecycleAfterCollect(snapshot.execution.status)
 			) {
 				// Not terminal: keep the RPC child and let the watch flow handle it.
-				job.consumedByTool = false;
 				if (snapshot.blocked && !job.watching) {
 					// Nobody is collecting anymore: the previous watch consumed
 					// this blocked snapshot and went hold. Without a rewatch the
@@ -2422,14 +2235,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					// that blocks until the next timeout, so it cannot spin on the
 					// same snapshot). When no watch is in flight, wait() reports
 					// stillRunning and the caller (or a later collect) decides.
-					// Resume keeps the flag cleared on its own branch, so no
-					// double-reset.
 					job.collectPromise = undefined;
-					job.notified = false;
-					// D7: the next terminal may notify again. F1: the round to revoke is
-					// the one this (non-terminal) snapshot came from.
-					const blockedOrigin = originOf(snapshot, job);
-					unclaimReported(blockedOrigin.runId, name, blockedOrigin.round);
 					runtime.watch(name);
 				}
 				return {
@@ -2438,13 +2244,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					elapsedMs: Math.max(0, now() - job.spawnedAt),
 				};
 			}
-			// D2(a): the snapshot is terminal and IS the delivery — claim it BEFORE
-			// the retire await below, because a join/outbox flush landing inside that
-			// await would otherwise push the same result a second time. F1: the claim
-			// is for the round the snapshot came from, which is also the round its
-			// notice entry carries.
-			const origin = originOf(snapshot, job);
-			claimReported(origin.runId, name, origin.round);
+			// The snapshot is terminal and IS the delivery — but the delivery is
+			// recorded by whoever hands the text to the parent (the tool layer's
+			// `markRead`, D3b), never by this seam, which cannot know whether the caller
+			// renders it. Nothing is claimed before the retire await below: a flush
+			// landing inside that await is filtered by the projection, which at worst
+			// repeats one notice (D3: 宁多推一条，不静默丢).
 			if (jobs.get(name) === job) {
 				try {
 					await job.retire?.();
@@ -2456,9 +2261,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			return { name, snapshot };
 		} catch (error) {
 			if (error instanceof WaitTimeoutError) {
-				// The watch is still in flight and shares this collect promise —
-				// restore auto-notify or the result would never surface.
-				job.consumedByTool = false;
+				// The watch is still in flight and shares this collect promise, so the
+				// real completion still reaches the parent through it.
 				return {
 					name,
 					stillRunning: true,
@@ -2510,20 +2314,17 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				existing.settledAt = undefined;
 				existing.state = "working";
 				// D10 #1: steering/continuing a live child starts a NEW reporting round.
-				// The round only affects NEW claims (old rounds keep theirs), so the
-				// `notified` gate above is untouched.
-				existing.round = nextRoundFor(input.name);
-				// D7 invariant: unclaim ONLY where `notified` is reset. This branch
-				// (steer / continue on a still-live job) does NOT reset it on master, so
-				// a second round is already stopped by the legacy
-				// `!consumedByTool && !notified` gate; clearing the claim here would not
-				// re-open that round, it would only erase the evidence that this result
-				// was already delivered.
+				// Nothing is revoked here: the delivery verdict belongs to the ledger
+				// projection (`result-ledger-v1` D4), which is scoped by artifact id, so the
+				// PREVIOUS round's unread notice keeps its own row and stays deliverable
+				// while this round gets an id of its own.
 				//
 				// D7b: the finished cache is a ONE-ROUND cache. `runId` is the PARENT
 				// run id, so every round of the same child shares it — a surviving
 				// cache entry would hand round N the snapshot of round N-1 and, worse,
-				// claim round N's failure notice. Any (re)track starts a new round.
+				// settle round N's failure notice against the wrong artifact. Any
+				// (re)track starts a new round.
+				existing.round = nextRoundFor(input.name);
 				finished.delete(input.name);
 				join.addPending(input.runId, input.name);
 				ensureTimer();
@@ -2538,8 +2339,6 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				// a new round, drawn from the same monotonic per-name counter.
 				round: nextRoundFor(input.name),
 				state: "working",
-				consumedByTool: false,
-				notified: false,
 				watching: false,
 				generation: 0,
 			};
@@ -2551,14 +2350,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				);
 			}
 			jobs.set(job.name, job);
-			// D7 invariant: unclaim only where `notified` is RESET. This branch RESETS
-			// nothing — it *initializes* the flag to `false` on a brand-new job — and the
-			// round it just drew from the monotonic counter cannot have a claim yet, so an
-			// `unclaimReported(job.runId, job.name, job.round)` here would be a provable
-			// no-op whose `dropQueued` / `dropBuffered` / `finished.delete` were
-			// unreachable from this site (it read as a fifth reset point that did nothing).
-			// What actually has to be true here is the positive property: the PREVIOUS
-			// round's unread copies keep their own keys and stay deliverable (D10).
+			// P4c: nothing is claimed or revoked here. The round this job just drew from
+			// the monotonic counter describes a result the ledger has not seen yet, and the
+			// PREVIOUS round's unread artifact keeps its own row (D4/D10).
 			// D7b: same one-round rule as the revive branch above — a fresh job must
 			// never be served the previous round's snapshot.
 			finished.delete(job.name);
@@ -2586,11 +2380,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					job.state = "working";
 					job.settledAt = undefined;
 					job.collectPromise = undefined;
-					job.notified = false;
-					job.consumedByTool = false;
-					// D7: this round already reported? Then it is not over: the next
-					// completion must be allowed to notify.
-					unclaimReported(job.runId, job.name, job.round);
+					// P4c: no flag to reset. Whether the next completion may notify is
+					// decided at delivery time by the projection (D4); a non-terminal
+					// snapshot wrote no `notified_at`, so the real completion still owes it.
 					join.addPending(job.runId, job.name);
 					// Repaint before the new watch takes over so the panel cannot
 					// hold the old row's final second. watch() repaints too; this is
@@ -2619,12 +2411,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						if (next === "resume") {
 							job.settledAt = undefined;
 							job.collectPromise = undefined;
-							job.notified = false;
-							job.consumedByTool = false;
 							job.state = "working";
-							// D7: approval resumed the child, so its completion still owes a
-							// notice.
-							unclaimReported(job.runId, job.name, job.round);
+							// Approval resumed the child; its completion writes a fresh
+							// artifact, so the projection owes that one a notice (D4).
 							join.addPending(job.runId, job.name);
 							runtime.watch(name, opts);
 							return;
@@ -2649,43 +2438,45 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					// Repaint immediately: the row flips to a terminal state here, and
 					// waiting for the 500ms sampler leaves a phantom "working" row.
 					refreshUi();
-					if (!job.consumedByTool && !job.notified) {
-						job.notified = true;
-						// F1: the entry is labelled with the round the SNAPSHOT came from.
-						// A `track()` during the collect bumps `job.round`, and a notice
-						// labelled with the new round would steal that round's key.
-						const entryOrigin = originOf(snapshot, job);
-						join.onTerminal({
-							runId: entryOrigin.runId,
+					// P4c: THE GATE IS GONE (D4). It used to ask two job flags standing in
+					// for "the parent already has this result". Whether the notice is owed
+					// is a question about the ledger now, and it is asked at the last
+					// possible moment in `deliverBatch`, where the answer covers BOTH
+					// routes (a tool result the parent read, and a notice already sent).
+					//
+					// The round label is the one this SNAPSHOT was collected in (D4a/F1),
+					// not the live job's: a `track()` during the collect bumps `job.round`,
+					// and labelling with it would put this result on the NEXT round's
+					// `deliveredOnce` key — the next round's own notice would then be
+					// filtered as already sent. With a projection the label is only the
+					// fallback key, but the degraded path has nothing else.
+					const entryOrigin = originOf(snapshot, job);
+					join.onTerminal({
+						runId: entryOrigin.runId,
+						name: job.name,
+						round: entryOrigin.round,
+						input: {
 							name: job.name,
-							round: entryOrigin.round,
-							input: {
-								name: job.name,
-								agent: job.agent,
-								execution: snapshot.execution,
-								output: snapshot.output,
-								...(snapshot.outputFile ? { outputFile: snapshot.outputFile } : {}),
-								// §3 D1/P3: the artifact this notice is about, straight off the collect
-								// (absent for a running snapshot / empty output / no ledger row). The
-								// rendered text does not read it; the ledger shadow does.
-								...(snapshot.artifactId ? { artifactId: snapshot.artifactId } : {}),
-								sessionFile: job.sessionFile,
-								acceptance: snapshot.acceptance,
-								recycled: shouldRecycleAfterCollect(
-									snapshot.execution.status,
-								),
-								// D3: only the terminating path attaches a proposal. The
-								// hook itself returns undefined for every case that must not
-								// offer one (completed / still-running / opted out / no
-								// baseline), so "absent" is meaningful, not a missing wire.
-								...(() => {
-									const renewal = deps.getRenewalProposal?.(job.name, snapshot.execution);
-									return renewal === undefined ? {} : { renewal };
-								})(),
-							},
-							triggerTurn,
-						});
-					}
+							agent: job.agent,
+							execution: snapshot.execution,
+							output: snapshot.output,
+							...(snapshot.outputFile ? { outputFile: snapshot.outputFile } : {}),
+							// §3 D1: the artifact this notice is about, straight off the collect
+							// (absent for a running snapshot / empty output / no ledger row). The
+							// rendered text does not read it; the delivery projection does.
+							...(snapshot.artifactId ? { artifactId: snapshot.artifactId } : {}),
+							sessionFile: job.sessionFile,
+							acceptance: snapshot.acceptance,
+							recycled: shouldRecycleAfterCollect(
+								snapshot.execution.status,
+							),
+							// D3 (subagent-renewal-v1): the proposal is attached where the
+							// notice TEXT is built — `withRenewalProposal` in `deliverBatch` —
+							// not here, because a settle the projection filters out must not
+							// pay for it (P4c).
+						},
+						triggerTurn,
+					});
 				} catch (error) {
 					if (disposed || job.generation !== gen) return;
 					if (job.isAlive?.() && isTransientConnectionFailure(thrownText(error))) {
@@ -2697,11 +2488,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						job.state = "working";
 						job.settledAt = undefined;
 						job.collectPromise = undefined;
-						job.notified = false;
-						job.consumedByTool = false;
-						// D7: the blip was never a verdict — nothing was delivered, so the
-						// real completion must still be able to notify.
-						unclaimReported(job.runId, job.name, job.round);
+						// The blip was never a verdict — nothing was delivered, nothing was
+						// marked notified, so the real completion still owes its notice (D4).
 						join.addPending(job.runId, job.name);
 						refreshUi();
 						await new Promise((resolve) => setTimeout(resolve, TRANSIENT_CONNECTION_REARM_MS));
@@ -2715,20 +2503,17 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 					job.state = "awaiting";
 					job.settledAt = now();
 					refreshUi();
-					if (!job.consumedByTool && !job.notified) {
-						job.notified = true;
-						// Collect failures join the batch too, as a failed entry. No
-						// snapshot object exists here, so the origin falls back to the
-						// live job (F1's documented fallback).
-						const failureOrigin = originOf(undefined, job);
-						join.onTerminal({
-							runId: failureOrigin.runId,
-							name: job.name,
-							round: failureOrigin.round,
-							input: collectFailureInput(job.name, error),
-							triggerTurn,
-						});
-					}
+					// Collect failures join the batch too, as a failed entry. No snapshot
+					// object exists here, so `originOf` answers with the live job (there is
+					// no artifact id either — the projection answers from `deliveredOnce`).
+					const failureOrigin = originOf(undefined, job);
+					join.onTerminal({
+						runId: failureOrigin.runId,
+						name: job.name,
+						round: failureOrigin.round,
+						input: collectFailureInput(job.name, error),
+						triggerTurn,
+					});
 				} finally {
 					if (job.generation === gen && !hold) {
 						if (
@@ -2752,20 +2537,13 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		consumeCollect(name) {
 			const job = jobs.get(name);
 			if (job) {
-				job.consumedByTool = true;
-				// D2(b): `collectChild` (index.ts, not ours) renders this snapshot to
-				// the parent, so a terminal one is a delivery and claims here.
-				return ensureCollect(job).then((snapshot) =>
-					claimIfTerminal(job, snapshot),
-				);
+				// P4c/D12: the bare snapshot, as before notice-claim-v1. Whether this
+				// result is "delivered" is decided by the read the TOOL layer declares
+				// after the parent really got the text (D3b) — never by the seam.
+				return ensureCollect(job);
 			}
 			const cached = cachedFinished(name);
-			if (cached) {
-				return Promise.resolve({
-					snapshot: cached.snapshot,
-					claimedNow: claimCachedResult(name, cached),
-				});
-			}
+			if (cached) return Promise.resolve(cached.snapshot);
 			return undefined;
 		},
 
@@ -2774,27 +2552,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			if (!job) {
 				const cached = cachedFinished(name);
 				if (!cached) return undefined;
-				return Promise.resolve({
-					snapshot: cached.snapshot,
-					claimedNow: claimCachedResult(name, cached),
-				});
+				return Promise.resolve(cached.snapshot);
 			}
-			job.consumedByTool = true;
-			if (signal.aborted) {
-				job.consumedByTool = false;
-				return Promise.resolve(undefined);
-			}
+			if (signal.aborted) return Promise.resolve(undefined);
 			const pending = ensureCollect(job, signal);
-			return new Promise<ClaimedCollect | undefined>((resolve, reject) => {
+			return new Promise<CollectSnapshot | undefined>((resolve, reject) => {
 				let done = false;
 				const cleanup = () => signal.removeEventListener("abort", onAbort);
 				const onAbort = () => {
 					if (done) return;
 					done = true;
 					cleanup();
-					if (jobs.get(name) === job) {
-						job.consumedByTool = false;
-					}
+					// Nothing to hand back: this seam took nothing (P4c).
 					resolve(undefined);
 				};
 				signal.addEventListener("abort", onAbort, { once: true });
@@ -2804,8 +2573,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						if (done) return;
 						done = true;
 						cleanup();
-						// D2(b): the snapshot that actually reaches the caller claims.
-						resolve(claimIfTerminal(job, snapshot));
+						resolve(snapshot);
 					},
 					(error: unknown) => {
 						if (done) return;
@@ -2822,29 +2590,21 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			if (!job) return;
 			job.generation += 1;
 			job.watching = false;
-			job.consumedByTool = false;
 			refreshUi();
-		},
-
-		unclaimUndelivered(name, snapshot, claimedNow) {
-			unclaimUndelivered(name, snapshot, claimedNow);
 		},
 
 		rewatch(name, opts) {
 			const job = jobs.get(name);
 			if (!job || disposed) return;
-			job.notified = false;
-			job.consumedByTool = false;
 			job.collectPromise = undefined;
 			job.settledAt = undefined;
 			job.state = "working";
 			finished.delete(name);
-			// D7: `rewatch` is the parent explicitly asking to be told again, so the
-			// claim for this round must go — otherwise "report it once more" reports
-			// nothing. `rewatch` does not `track()`, so the round (and therefore the
-			// key) is unchanged: the next completion of this round is deliverable
-			// again, while an older round keeps its own state (D10).
-			unclaimReported(job.runId, job.name, job.round);
+			// P4c: `rewatch` used to revoke this round's claim and drop every queued /
+			// buffered copy of the name — the two ways to say "tell me again" in a model
+			// whose memory was the only record. The projection has no revoke API (D4), so
+			// what this call still does is re-arm the watch, and the NEXT completion
+			// writes a fresh artifact that the projection owes a notice for.
 			join.addPending(job.runId, job.name);
 			runtime.watch(name, opts);
 		},
@@ -2858,27 +2618,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			job.watching = false;
 			job.unsubscribeRpcEvents?.();
 			job.unsubscribeRpcEvents = undefined;
-			// D8/W3: `remove()` only clears `pending`, so an already-terminal member
-			// sitting in the window buffer would survive the release and fire as an
-			// orphan — exactly what happens after a wait() hit, which claims, retires
-			// and releases a child whose entry is still buffered.
-			//
-			// SAFETY NET / group convergence, NOT the suppression itself: the authority
-			// is `deliverBatch`'s claim filter, which also covers every entry that is
-			// already OUT of the buffer (outbox, mode "each", a group that flushed
-			// before the release). Do not delete that filter on the strength of this
-			// line — dropping a buffer entry that was never delivered would silently
-			// swallow the notice, which is why the call is gated on the claim.
-			//
-			// D10: this job owns ONE round, so only that round's copy may go. The
-			// name-wide drop is the revoke path (`unclaimReported`); using it here
-			// would delete an EARLIER round's still-unread notice along with it —
-			// "one round = one deliverable result" (D10), and the loss is reachable:
-			// round 1 buffered unread → re-track → round 2 buffered → `wait` claims
-			// round 2 → this release would drop round 1 too.
-			if (isReported(job.runId, name, job.round)) {
-				join.dropBufferedRound(job.runId, name, job.round);
-			}
+			// P4c: `join.remove(name)` and nothing else. The buffered-drop safety net
+			// that used to sit here (`dropBufferedRound`, gated on the claim) is gone with
+			// the claim: a buffered entry is now filtered by the projection at the flush,
+			// which is the one authority that covers every copy — the window buffer, the
+			// outbox, mode "each" and a group that flushed before the release.
 			join.remove(name);
 			stopTimerIfIdle();
 			refreshUi();
@@ -3068,11 +2812,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			for (const job of jobs.values()) job.unsubscribeRpcEvents?.();
 			jobs.clear();
 			finished.clear();
-			// D7: the claim table is session state, like the caches above it.
-			reported.clear();
-			// P4b/D4: the degraded-path memory is session state too — `dispose()` is the end
-			// of this runtime's delivery authority, not a boundary that may leak into a
-			// successor.
+			// D4: the degraded-path memory is session state — `dispose()` is the end of this
+			// runtime's delivery authority, not a boundary that may leak into a successor.
 			deliveredOnce.clear();
 			unknownArtifactReported.clear();
 			roundOfName.clear();

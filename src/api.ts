@@ -188,23 +188,20 @@ export {
 
 // ── parent session: completion notify + input-box status ────────────────────
 //
-// `SessionRuntime.consumeCollect*` answers with `ClaimedCollect`, not a bare
-// snapshot (#320):
+// `SessionRuntime.consumeCollect*` answers with the bare snapshot:
 //
 // ```ts
-// const { snapshot, claimedNow } = await rt.consumeCollect("worker-0")!;
+// const snapshot = await rt.consumeCollect("worker-0");
 // ```
 //
-// `claimedNow` is `true` only when THIS call took the round's completion claim, so a
-// caller that bails before handing the result to the agent (an aborted parent turn, a
-// failed persist) rolls it back with `unclaimUndelivered(name, snapshot, claimedNow)`
-// — a call that did not take the claim must leave the claim of the delivery that did
-// alone. The flag travels with the return value on purpose: two collects can await the
-// same job promise and therefore see the same snapshot object, so a per-snapshot record
-// would let the second call overwrite the first one's answer.
+// That is the shape v5.0.1 shipped: #320 wrapped it in a `ClaimedCollect` (snapshot plus
+// a rollback flag) because the seam used to arbitrate delivery between the tool route
+// and the pushed notice. `result-ledger-v1` D12 deleted that model — delivery is decided
+// by the ledger projection, which has no rollback API, and the read side is recorded by
+// the tool layer only when the text really reaches the caller. So there is no claim for a
+// caller to hold or to hand back.
 export { createSessionRuntime, shouldRecycleAfterCollect } from "./extension/runtime.ts";
 export type {
-	ClaimedCollect,
 	CollectSnapshot,
 	SessionRuntime,
 	SessionRuntimeDeps,

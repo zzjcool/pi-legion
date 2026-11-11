@@ -456,6 +456,7 @@ MAIL_DELIVERY_CLAIM_LEASE_MS = 60_000    → 只用于崩溃恢复；租约过�
 
 - 子 agent 不能回头 prompt 父会话。父会话侧 `deliverCompletion`（`src/extension/notify.ts`）把完成结果作为 `subagent-notify` 消息注入，`deliverAs: "followUp"`，并在首行写 `NOTICE_SOURCE_MARKER`（`▣ legion · automatic completion notice …`）以便模型区分「这不是用户说的话」。
 - **outbox**（`src/extension/runtime.ts`）：父 run 仍活跃时通知先入队，只在 run 边界（`agent_settled`）投递一次，避免同一批完成产生多次唤醒。
+- **交付判据 = 账本投影**（`result-ledger-v1.md` D4，P4c 起）：一条结果是否还欠父通知，由 `src/legion/ledger.ts` 的 `undelivered(consumerId)` 回答 —— 父把 artifact 读到 EOF（`read_bytes >= artifacts.bytes`）或已发过通知（`notified_at` 非空）就离开投影、不再投递；发送成功才写 `notified_at`，宿主拒收/写账失败则留到下一个边界重试，**没有回滚 API**（分页读 `read_bytes < bytes` 不抑制）。旧的内存 claim 集合（`reported` Set、`consumedByTool`/`notified` 闸门、`join.dropBuffered*`）已整体删除，历史依据见 `docs/contracts/archive/notice-claim-v1.md`。
 - `MAX_PENDING_AGE_MS = 80_000` 是**健康信号**而不是发送触发器：held 通知超过 80s 只把 `heldOverCap` 加一（每条一次）并续一个窗口，**不发消息**；唯一投递时机仍是 run 边界。
 
 ### 8.5 stall notice

@@ -87,13 +87,15 @@ function legionOf(db: DatabaseSync): OrchestratorLegionContext {
  */
 function settle(
 	result: Result,
-	runtime: SessionRuntime,
+	_runtime: SessionRuntime,
 	legion: OrchestratorLegionContext | undefined,
 	aborted = false,
 ): Promise<Result> {
+	// P4c: `settleControlResult` no longer needs the runtime — the wait-claim rollback it
+	// used to run through it was deleted with the claim model. The parameter stays so the
+	// call sites keep reading as "the same runtime that produced the result".
 	return settleControlResult({
 		result: result as Parameters<typeof settleControlResult>[0]["result"],
-		runtime,
 		...(legion ? { legion } : {}),
 		aborted,
 	}) as Promise<Result>;
