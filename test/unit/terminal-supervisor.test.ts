@@ -111,6 +111,11 @@ function agent(overrides: Partial<AgentConfig> = {}): AgentConfig {
 	};
 }
 
+/** The core's reply for a terminal name it no longer has (`terminal.rm` landed). */
+function notFoundError(): HcRpcError {
+	return new HcRpcError({ code: -32000, message: "not_found", data: { kind: "not_found" } });
+}
+
 function spawnInput(root: string, overrides: Partial<SpawnInput> = {}): SpawnInput {
 	return {
 		name: "root.centurion-0",
@@ -569,8 +574,12 @@ test("D10: steer is a send and reports only the turn-boundary deposit", async ()
  * The send used to go out anyway, and the record was then flipped back to
  * `live` — so the settle that followed read a last turn with no assistant
  * message and the session was retired as aborted (resume permanently refused).
- * These three cases pin the guard: refuse BEFORE the send, with the code the
+ * These four cases pin the guard: refuse BEFORE the send, with the code the
  * ledger already uses for a child that is over, and never overwrite the state.
+ * Two ways a terminal ends are covered (D392-6): the core says `finished`, and
+ * the core no longer knows the name at all (`retire` removes it). The fourth
+ * case is the rewrite boundary: a NON-`not_found` observation failure keeps its
+ * own shape instead of being reported as a lifecycle fact.
  */
 test("#392 D392-1: a steer to a finished terminal is refused before the send and stays finished", async () => {
 	const h = harness();
@@ -587,10 +596,14 @@ test("#392 D392-1: a steer to a finished terminal is refused before the send and
 			(error: unknown) => {
 				assert.ok(error instanceof SubagentError, `the refusal must carry a code: ${String(error)}`);
 				assert.equal(error.code, ErrorCodes.CHILD_TERMINAL);
-				// The message must name the child, the state, and a way forward.
+				// The message must name the child, the state, and where to go instead.
 				assert.match(error.message, /root\.centurion-0/);
 				assert.match(error.message, /finished/);
-				assert.match(error.message, /resume/i);
+				// F4: `resume` may be MENTIONED, but only as the truth that it is refused
+				// for a terminal child — never promised, and never as "reuse its session"
+				// (which `launch` has no parameter for).
+				assert.match(error.message, /cannot be resumed/);
+				assert.doesNotMatch(error.message, /resume it|reuses its session/);
 				return true;
 			},
 		);
@@ -611,33 +624,98 @@ test("#392 D392-1: a steer to a finished terminal is refused before the send and
 	}
 });
 
-test("#392 D392-1: a steer to a retired child is refused before the send", async () => {
+/**
+ * D392-6: `retire()` kills and then REMOVES the terminal record, so the core's
+ * next answer for that name is `not_found` — not a `finished` reading.
+ *
+ * The first cut of this case had the fake answer `live` for a name it had just
+ * been told to remove. That shape cannot occur against a real core, and it left
+ * the real one uncovered: a steer into a retired child surfaced as a raw
+ * `HcRpcError: … NOT_FOUND` transport failure, i.e. exactly the flattening
+ * D392-4 exists to remove. The fake now answers the real shape; what is pinned
+ * is the refusal's code, that no byte reaches `terminal.send`, and that neither
+ * the transport class name nor the core's error kind leaks into the message.
+ */
+test("#392 D392-6: a steer to a retired child is refused with CHILD_TERMINAL in the shape the core really gives", async () => {
 	const h = harness();
-	// The record reaches `retired` through the public retire path; the core still
-	// answers a plain live reading for it, so the refusal comes from the record
-	// state and not from a failed `terminal.get`.
+	let removed = false;
 	h.client.on("terminal.get", (params) => {
 		if (params.terminal === TERMINAL_ID) return { state: "live", labels: {} };
+		// Live before the retire, gone afterwards — what `terminal.rm` really leaves
+		// behind (D11: kill, then remove).
+		if (removed) throw notFoundError();
 		return { state: "live", turn: 1, status: { state: "done" } };
+	});
+	h.client.on("terminal.rm", () => {
+		removed = true;
+		return { removed: "t8" };
 	});
 	try {
 		await h.supervisor.spawnChild(spawnInput(h.root));
 		await h.supervisor.retire("root.centurion-0");
+		assert.equal(removed, true, "the retire must really have removed the terminal record");
 		assert.equal(h.supervisor.isAlive("root.centurion-0"), false);
 		await assert.rejects(
 			async () => {
 				await h.supervisor.steer("root.centurion-0", "add a test");
 			},
 			(error: unknown) => {
-				assert.ok(error instanceof SubagentError, `the refusal must carry a code: ${String(error)}`);
+				assert.ok(
+					error instanceof SubagentError,
+					`the refusal must carry a code, not a transport error: ${String(error)}`,
+				);
 				assert.equal(error.code, ErrorCodes.CHILD_TERMINAL);
-				assert.match(error.message, /retired/);
 				assert.match(error.message, /root\.centurion-0/);
+				assert.match(error.message, /retired/);
+				// A raw `terminal.get` failure would leak both of these.
+				assert.doesNotMatch(error.message, /HcRpcError/, `the transport class must not leak: ${error.message}`);
+				assert.doesNotMatch(error.message, /NOT_FOUND/, `the core's error kind must not leak: ${error.message}`);
 				return true;
 			},
 		);
 		assert.equal(h.client.paramsFor("terminal.send").length, 0, "a retired child must not be sent to");
-		assert.equal(h.supervisor.isAlive("root.centurion-0"), false);
+		assert.equal(h.supervisor.isAlive("root.centurion-0"), false, "a refused send must not resurrect the record");
+	} finally {
+		h.cleanup();
+	}
+});
+
+/**
+ * D392-6's rewrite boundary: ONLY "the core does not know this terminal" becomes
+ * `CHILD_TERMINAL`. A protocol/transport failure says nothing about the child's
+ * lifecycle, so it must surface untouched — rewriting it into a lifecycle
+ * verdict would turn an infrastructure problem into a `finished` child the
+ * caller then acts on.
+ */
+test("#392 D392-6: an observation failure that is NOT not_found is re-thrown unchanged", async () => {
+	const h = harness();
+	const transportError = new HcRpcError({
+		code: -32603,
+		message: "core connection closed",
+		data: { kind: "transport" },
+	});
+	h.client.on("terminal.get", (params) => {
+		if (params.terminal === TERMINAL_ID) return { state: "live", labels: {} };
+		throw transportError;
+	});
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root));
+		await assert.rejects(
+			async () => {
+				await h.supervisor.steer("root.centurion-0", "add a test");
+			},
+			(error: unknown) => {
+				assert.equal(error, transportError, "the very same error object must surface, not a reconstruction");
+				assert.ok(error instanceof HcRpcError);
+				assert.equal(error.kind, "transport", "the transport kind stays readable to the caller");
+				return true;
+			},
+		);
+		assert.equal(
+			h.client.paramsFor("terminal.send").length,
+			0,
+			"a failed observation must not fall through to a send",
+		);
 	} finally {
 		h.cleanup();
 	}

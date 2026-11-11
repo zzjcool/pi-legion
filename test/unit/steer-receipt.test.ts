@@ -43,6 +43,7 @@ import {
 	toSteerDisposition,
 	type SteerDisposition,
 } from "../../src/supervisor/types.ts";
+import { ErrorCodes, SubagentError } from "../../src/shared/types.ts";
 
 /** The one wording a queued steer may produce (em dash, no trailing period). */
 const QUEUED_RECEIPT = `Steered worker-0 (${STEER_QUEUED_NOTE})`;
@@ -154,6 +155,53 @@ test("toSteerDisposition: \"handled\" is interception, everything else is the ho
 	// The mapping can never produce a delivery claim.
 	const outputs = cases.map(([, raw, route]) => toSteerDisposition(raw, route));
 	assert.ok(!outputs.includes("delivered" as SteerDisposition));
+});
+
+/**
+ * The same stub, with the orchestrator's `steer` rejecting instead of reporting:
+ * the failure path `steerChild`'s catch owns (#392 D392-4).
+ */
+function ctxRejecting(error: unknown): SteerCtx {
+	return {
+		...ctxFor("queued", []),
+		orchestrator: {
+			steer: async () => {
+				throw error;
+			},
+			childrenSnapshot: () => [],
+		},
+	} as unknown as SteerCtx;
+}
+
+/** The failure's code as the tool reports it (never in the visible text). */
+function codeOf(result: { details?: unknown }): unknown {
+	return (result.details as { error?: unknown } | undefined)?.error;
+}
+
+test("steerChild: a CHILD_TERMINAL refusal keeps its code, every other failure stays NOT_FOUND", async () => {
+	// #392 D392-4's gate. The two branches are asserted apart, because the whole
+	// point of the decision is that they MUST differ: `CHILD_TERMINAL` means "this
+	// child is over" and is actionable, `NOT_FOUND` means "no such child".
+	const ended = new SubagentError(
+		"child 'worker-0' is finished: its terminal has already ended, so it can take no further text.",
+		ErrorCodes.CHILD_TERMINAL,
+	);
+	const refused = await steerChild(ctxRejecting(ended));
+	assert.equal(codeOf(refused), ErrorCodes.CHILD_TERMINAL, "a terminal child must not be flattened into NOT_FOUND");
+	assert.match(text(refused), /^steer failed: /, `the failure is still reported as a failure:\n${text(refused)}`);
+	assert.match(text(refused), /already ended/, "the backend's explanation reaches the model");
+
+	// The historical flattening, on a failure that is NOT a lifecycle verdict.
+	const crash = new Error("terminal.send failed for terminal 'lgl-worker-0': transport: core connection closed");
+	const flattened = await steerChild(ctxRejecting(crash));
+	assert.equal(codeOf(flattened), ErrorCodes.NOT_FOUND, "every other failure keeps the pre-#392 code");
+	assert.match(text(flattened), /^steer failed: Error: terminal\.send failed/, `the body keeps the raw error:\n${text(flattened)}`);
+
+	// Both codes ride in `details.error` only: a code spliced into the visible text
+	// would be read by the model as part of the message.
+	for (const result of [refused, flattened]) {
+		assert.doesNotMatch(text(result), /CHILD_TERMINAL|NOT_FOUND/, `no code may leak into the visible text:\n${text(result)}`);
+	}
 });
 
 test("steerChild: a queued disposition renders the queued receipt and reaches the orchestrator", async () => {

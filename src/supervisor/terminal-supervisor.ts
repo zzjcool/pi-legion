@@ -334,7 +334,24 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const client = await this.ensureClient();
 		// D8: refresh and record the turn the text belongs to BEFORE it goes in, so
 		// a settle can never be satisfied by the turn that was already over.
-		await this.observe(child);
+		try {
+			await this.observe(child);
+		} catch (error) {
+			// #392 (D392-6): the OTHER way a terminal ends. `retire()` kills and then
+			// removes the record, so the core's answer to the next `terminal.get` is
+			// `not_found`, not a `finished` reading — the guard below can never see it.
+			// A terminal the core no longer knows is as ended as one that says so, so
+			// it takes the same refusal instead of leaking a raw transport error. Only
+			// this exact fact is rewritten: a protocol/transport failure keeps its own
+			// shape, because rewriting it as "the child is over" would hide an
+			// infrastructure problem behind a lifecycle verdict (the `abort` and
+			// `waitSettled` calls fold `not_found` the same way).
+			if (!isNotFound(error)) throw error;
+			// `waitSettled` makes the same fold: gone from the core means terminal here.
+			// `retired` is the more specific fact when the record already has it.
+			if (child.state !== "retired") child.state = "finished";
+			throw terminalChildError(child);
+		}
 		// #392 (D392-1): a terminal child that has already ended takes no new text.
 		// `observe` just reported the truth — a `send` would go into a program that
 		// is gone, `child.state` would be flipped back to `live` below, and the
@@ -342,7 +359,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// turn a legal `finished` into an `aborted` verdict (which retires the node
 		// and refuses every later resume). Refuse here, before the send, and leave
 		// the record saying what the core said: `finished`/`retired` are terminal
-		// for this transport, so the answer is a resume/new child, not a send.
+		// for this transport, so the answer is a new child, not a send.
 		if (child.state === "finished" || child.state === "retired") {
 			throw terminalChildError(child);
 		}
@@ -768,14 +785,22 @@ function isNotFound(error: unknown): boolean {
  * (`CHILD_TERMINAL`, #309 D4) — reused rather than minted, so a caller can tell
  * a dead terminal from a transport failure (`START_FAILED`) or a missing child
  * (`NOT_FOUND`). The text names the child, the state the core reported and the
- * only ways forward; the code itself stays out of the message (codes ride in
- * `details.error`).
+ * ways forward that actually exist; the code itself stays out of the message
+ * (codes ride in `details.error`).
+ *
+ * D392-6/F4: the next step used to promise `resume` (refused for a terminal
+ * ledger node: `orchestrator.ts:648-650`) or "launch a new child that reuses
+ * its session" (`launch` has no `sessionFile` parameter). Both were undeliverable,
+ * so the message says only what is true: the turn is over, the result that was
+ * already produced can be read, and continuing the work means a NEW child.
  */
 function terminalChildError(child: TerminalChildRecord): SubagentError {
 	const state = child.state === "retired" ? "retired" : "finished";
 	return new SubagentError(
-		`child '${child.name}' is ${state}: its terminal has already ended, so no text was sent. ` +
-			"To continue this work, resume it (subagent action resume) or launch a new child that reuses its session.",
+		`child '${child.name}' is ${state}: its terminal has already ended (or the core no longer knows it), ` +
+			"so the turn it was running is over and it can take no further text — nothing was sent. " +
+			"Read the result it already produced (collect); if more work is needed, launch a new child — " +
+			"a terminal child cannot be resumed.",
 		ErrorCodes.CHILD_TERMINAL,
 	);
 }
