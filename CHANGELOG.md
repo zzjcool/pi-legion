@@ -11,6 +11,33 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [6.0.0] — 2026-11-11
+
+一次以**记账**为中心的发布。子 agent 的结果不再靠「谁认领过」传递，而是落成一个不可变的
+台账（`artifacts` + `consumptions`，schema v3）：投递判据从进程内 claim 集合改成账本投影，
+结果正文存成按轮次寻址的文件，agent 拿到的是预览加 `legion_output` 指针，那条路径不再交给它。
+验证也从「徽章」变成「对某一棵树的事实」：pass 记下 `cwd`、契约文本与树指纹，换树或换检出即
+失效，`to: "done"` 先判边后付费，`collect` 的头把契约究竟跑了什么说清楚。同版另有 floating
+viewer 的 transcript 对齐、`tok/s` 换成实测 decode 分母、TUI 文件缓存的自适应上限（#391）、
+以及模型选择链的三处修复。
+
+Major 只因为两件对程序化使用者的破坏：`consumeCollect*` 回到裸 `CollectSnapshot`，
+`ClaimedCollect` 从 `pi-legion/api` 消失，没有兼容层；`legion.db` 单向升到 v3。日常使用
+（`subagent` / `wait` / `collect` 工具、`/legion` UI、SQLite 账本）不需要任何动作。
+
+### Breaking
+
+- **`consumeCollect*` 重新返回裸 `CollectSnapshot`，`ClaimedCollect` 已从 `pi-legion/api` 移除**
+  （`result-ledger-v1` D12）：`const { snapshot, claimedNow } = await rt.consumeCollect(…)` 与随之
+  而来的 `unclaimUndelivered(…)` 一并删除——投递由账本投影判定，没有回滚 API，也就没有需要
+  交还的 claim。
+- **`legion.db` 是单向升级**：v2 → v3 自动、幂等、旧四表零列变更；但 v3 库不能被 5.x 打开
+  （`src/legion/db.ts:381` 的版本守卫会以 `schema version 3 is newer than supported version 2`
+  拒绝），要回退只能删掉 `legion.db` 让它重建（`rebuild` 可从磁盘恢复 `artifacts`，
+  `consumptions` 重置——只会多推，不会少推）。
+- **「读过就不再提」的判据换了**：进程内 claim 集合 → 账本投影（`owesDelivery`）。账本不认识的
+  artifact id **fail-open** 投递，宁可多推一次也不静默丢结果。
+
 ### Added
 
 - `legion.db` schema **v3**（`LEGION_DB_USER_VERSION` 2 → 3，迁移幂等、旧四表零列变更）：`artifacts`（不可变结果的台账）+ `consumptions`（每个 consumer 的两维事实：`read_bytes` 高水位 / `notified_at` 只写一次）。`rebuild` 可从磁盘恢复 `artifacts`，`consumptions` 一律重置（只会多推、不会少推）。
@@ -2123,7 +2150,17 @@ branch — pin `pi-legion@0.16.x` if you still need that model. See
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v5.0.0...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.0.0...HEAD
+[6.0.0]: https://github.com/zzjcool/pi-legion/compare/v5.6.0...v6.0.0
+[5.6.0]: https://github.com/zzjcool/pi-legion/compare/v5.5.1...v5.6.0
+[5.5.1]: https://github.com/zzjcool/pi-legion/compare/v5.5.0...v5.5.1
+[5.5.0]: https://github.com/zzjcool/pi-legion/compare/v5.4.1...v5.5.0
+[5.4.1]: https://github.com/zzjcool/pi-legion/compare/v5.4.0...v5.4.1
+[5.4.0]: https://github.com/zzjcool/pi-legion/compare/v5.3.0...v5.4.0
+[5.3.0]: https://github.com/zzjcool/pi-legion/compare/v5.2.0...v5.3.0
+[5.2.0]: https://github.com/zzjcool/pi-legion/compare/v5.1.0...v5.2.0
+[5.1.0]: https://github.com/zzjcool/pi-legion/compare/v5.0.1...v5.1.0
+[5.0.1]: https://github.com/zzjcool/pi-legion/compare/v5.0.0...v5.0.1
 [5.0.0]: https://github.com/zzjcool/pi-legion/compare/v4.0.0...v5.0.0
 [4.0.0]: https://github.com/zzjcool/pi-legion/compare/v3.1.0...v4.0.0
 [3.1.0]: https://github.com/zzjcool/pi-legion/compare/v3.0.3...v3.1.0
