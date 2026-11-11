@@ -88,9 +88,11 @@ Notes on the examples:
 Each team's `description` and `members` shape follows
 `subagents.teams.<name>`. Member objects apply their own `model` and
 `thinking` values to that role in this team; those values override the same
-fields in the role card's frontmatter. Omitted member override fields continue
-to use the role card/configuration defaults. The string `"centurion"` is a
-plain roster entry with no member-level override.
+fields in the role card's frontmatter **and** `subagents.agentOverrides`
+(including the provider-scoped `agentOverridesByProvider`), but lose to a
+referenced preset and to a `model` passed for this call. Omitted member
+override fields continue to use the role card/configuration defaults. The
+string `"centurion"` is a plain roster entry with no member-level override.
 
 To make one team the settings default, add a sibling `"team": "be-value"`
 under `"subagents"`. `PI_SUBAGENTS_TEAM` takes precedence over that configured
@@ -104,8 +106,11 @@ Omitted → `inprocess`, with an automatic `rpc` fallback when the resolved spaw
 needs an OS worktree (`worktree: true`, which only a `centurion` can hold —
 #214). A non-`pi` role is rejected before this point, so it never reaches the
 fallback. An explicit `spawnMode: "inprocess"` + `worktree: true` is still
-refused with `INVALID_PARAMS`. Precedence: frontmatter →
-`subagents.agentOverrides.<role>` → team member override.
+refused with `INVALID_PARAMS`. This precedence covers the SPAWN fields
+(`spawnMode`, `worktree`) only: frontmatter →
+`subagents.agentOverrides.<role>` → team member override. The model chain is a
+different, longer list — see
+[design.md §6.3](design.md) ("model 优先级 / Model precedence").
 
 `worktree: true` is centurion-only: any other role that asks for it is
 downgraded to `worktree: false` with a one-time warning, so squad members always

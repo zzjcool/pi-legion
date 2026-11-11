@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { displayStatus, nodesFromEntries, type VizNode } from "../../src/tui/viz/model.ts";
 import { FALLBACK_TOKENS, nodeToken, resolveRolePalette, roleColor, roleToken, swatchesClash, tokenSwatch } from "../../src/tui/viz/palette.ts";
-import { RateSampler, RATE_WINDOW_MS, MIN_RATE_GENERATION_MS, liveRateNodeIds, visibleRateNodeIds } from "../../src/tui/viz/rate.ts";
+import { RateSampler, RATE_WINDOW_MS, MIN_RATE_DECODE_MS, liveRateNodeIds, visibleRateNodeIds } from "../../src/tui/viz/rate.ts";
 import { assignLanes, axisColumn, formatRailLaneDetail, liveAt, maxLanesFor, RAIL_AXIS_MIN_COLS, railColumnPlan, renderRailway, resolveScroll, scrollIndicator } from "../../src/tui/viz/railway.ts";
 import { computeLayout, selectLayout, STATUS_LOG_RESERVE } from "../../src/tui/viz/layout.ts";
 import { breakdown } from "../../src/shared/timing-breakdown.ts";
@@ -17,7 +17,7 @@ const T0 = 1_700_000_000_000;
 const sec = (s: number): number => T0 + s * 1000;
 
 function node(id: string, opts: Partial<VizNode> = {}): VizNode {
-	return { id, name: id, role: id.replace(/-\d+$/, ""), parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, ...opts };
+	return { id, name: id, role: id.replace(/-\d+$/, ""), parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, decodeMs: 0, ...opts };
 }
 const ROOT = node("root", { name: "centurion-0", role: "centurion", parentId: null, depth: 0 });
 
@@ -243,7 +243,7 @@ test("layout: wide >= 140, stacked in between, portrait when narrow or tall", ()
 	}
 });
 
-test("rate: output over generationMs (60s window), cumulative counters never regress, late spawns start at zero", () => {
+test("rate: output over generationMs when nothing measured decode (60s window), counters never regress, late spawns start at zero", () => {
 	const sampler = new RateSampler();
 	for (let t = 0; t <= 300; t += 5) {
 		sampler.record(sec(t), [ROOT,
@@ -264,20 +264,101 @@ test("rate: output over generationMs (60s window), cumulative counters never reg
 	assert.deepEqual([...buckets.byRole.keys()].sort(), ["a", "b"]);
 });
 
-test("rate: idle/tool gaps do not dilute output tok/s (generationMs denominator)", () => {
+test("rate: no timing measurement at all yields 0, never a clamped 200ms spike (D6-b)", () => {
+	// The ledger-only row: `tokensOut` came from the usage ledger while the
+	// transcript is unreadable, so NEITHER generation nor decode ever moves. The
+	// clamp alone would answer 5000/(200ms) = 25000 tok/s for it.
 	const sampler = new RateSampler();
-	// 10s of generation producing 1000 output tokens, then 50s idle (genMs flat).
+	sampler.record(sec(0), [ROOT, node("a", { tokensOut: 0, generationMs: 0, decodeMs: 0 })]);
+	sampler.record(sec(30), [ROOT, node("a", { tokensOut: 5_000, generationMs: 0, decodeMs: 0 })]);
+	const live = [ROOT, node("a", { tokensOut: 5_000, generationMs: 0, decodeMs: 0 })];
+	assert.equal(sampler.nowRate(sec(30), live), 0, "no timing, no rate");
+	assert.equal(sampler.nodeRate("a", sec(30)), 0);
+	assert.notEqual(sampler.nodeRate("a", sec(30)), 5_000 / (MIN_RATE_DECODE_MS / 1_000));
+
+	// Counter-case (the boundary D6-b must NOT eat): a 1ms measurement is still a
+	// measurement, so it goes through the clamp instead of returning 0.
+	const measured = new RateSampler();
+	measured.record(sec(0), [ROOT, node("b", { tokensOut: 0, generationMs: 0, decodeMs: 0 })]);
+	measured.record(sec(30), [ROOT, node("b", { tokensOut: 2_100, generationMs: 1, decodeMs: 0 })]);
+	assert.ok(Math.abs(measured.nodeRate("b", sec(30)) - 2_100 / (MIN_RATE_DECODE_MS / 1_000)) < 1e-6);
+});
+
+test("rate: a decode-only change advances lastChangeAt and breaks the flat run (D8)", () => {
+	const sampler = new RateSampler();
+	sampler.record(sec(0), [ROOT, node("a", { tokensOut: 500, generationMs: 10_000, decodeMs: 5_000 })]);
+	assert.equal(sampler.lastChangeAt, sec(0));
+
+	// Frozen tokensOut AND frozen generationMs, but a message just closed and
+	// deposited 2s of measured decoding: that IS progress, so the chart x-axis must
+	// move. Without decode in the change test this sample would be collapsed into
+	// the previous one and `lastChangeAt` would stay at sec(0) — #346's freeze would
+	// silently hide a live child that is only reporting decode.
+	sampler.record(sec(10), [ROOT, node("a", { tokensOut: 500, generationMs: 10_000, decodeMs: 7_000 })]);
+	assert.equal(sampler.lastChangeAt, sec(10), "a decode-only change is a change");
+	// The sample is a REAL sample, not a collapsed one: the series interpolates.
+	assert.equal(sampler.decodeAt("a", sec(5)), 6_000);
+
+	// Control: with all three counters frozen the flat run still collapses and the
+	// x-axis still freezes (the #346 behaviour must survive D8).
+	sampler.record(sec(20), [ROOT, node("a", { tokensOut: 500, generationMs: 10_000, decodeMs: 7_000 })]);
+	assert.equal(sampler.lastChangeAt, sec(10), "a fully flat sample must not move the axis");
+});
+
+test("rate: idle/tool gaps do not dilute output tok/s (measured decode denominator)", () => {
+	const sampler = new RateSampler();
+	// 10s of DECODING producing 1000 output tokens, then 50s idle.
+	//
+	// generationMs carries the contract's measured ~4.3s fixed per-request cost on
+	// top (14.3s total for 10s of decoding), so the two denominators disagree and
+	// this fixture can actually tell them apart: 1000/10s = 100 tok/s decoded,
+	// while the old generation-based number was 1000/14.3s ≈ 70.
 	for (let t = 0; t <= 60; t += 1) {
 		const generating = t <= 10;
 		sampler.record(sec(t), [ROOT, node("a", {
 			tokensOut: generating ? t * 100 : 1000,
-			generationMs: generating ? t * 1000 : 10_000,
+			generationMs: generating ? 4_300 + t * 1000 : 14_300,
+			decodeMs: generating ? t * 1000 : 10_000,
 		})]);
 	}
-	// Trailing 60s wall includes idle, but denominator is only 10s of generation → 100 tok/s.
-	assert.ok(Math.abs(sampler.totalRate(sec(60)) - 100) < 1e-6);
-	// Wall-clock fallback would have been 1000/60 ≈ 16.7.
-	assert.ok(sampler.totalRate(sec(60)) > 50);
+	// The trailing 60s wall window includes the idle tail; neither denominator does.
+	const rate = sampler.totalRate(sec(60));
+	// WHAT IS ACTUALLY PINNED: the exact decode-axis answer …
+	assert.ok(Math.abs(rate - 100) < 1e-6, `decode denominator expected 100 got ${rate}`);
+	assert.equal(sampler.decodeAt("a", sec(60)), 10_000);
+	// … and that the generation axis is NOT the one in use. Both sides are exact, so
+	// this is a checked inequality rather than a "big enough" hand-wave (a bare
+	// `rate > 50` would also accept the generation answer, 1000/14.3 ≈ 70).
+	const generationAnswer = 1_000 / (14_300 / 1_000);
+	assert.ok(Math.abs(rate - generationAnswer) > 1, `rate must not be the generation answer ${generationAnswer}`);
+});
+
+test("rate: the denominator is MEASURED decode, not the request wall clock (tps-decode-denominator D6)", () => {
+	// The whole point of the contract: a steady fixture where tokensOut and
+	// generationMs share a slope reports the same tok/s whichever denominator is
+	// used, so it cannot prove the switch happened. This one separates them.
+	//
+	// Real shape (215 sessions / 22306 assistant calls): durationMs ≈ 4.3s +
+	// output/137, i.e. generationMs carries ~4.3s of prefill per call. Here one
+	// message decodes 1000 tokens in 2s of real streaming while generationMs says
+	// 12s (2s decoding + 10s of request overhead).
+	const sampler = new RateSampler();
+	sampler.record(sec(0), [ROOT, node("a", { tokensOut: 0, generationMs: 0, decodeMs: 0 })]);
+	sampler.record(sec(20), [ROOT, node("a", { tokensOut: 1_000, generationMs: 12_000, decodeMs: 2_000 })]);
+	const live = [ROOT, node("a", { tokensOut: 1_000, generationMs: 12_000, decodeMs: 2_000 })];
+
+	const rate = sampler.nowRate(sec(20), live);
+	assert.ok(Math.abs(rate - 500) < 1e-6, `decode denominator expected 500 tok/s got ${rate}`);
+	// The two answers this replaces: generationMs → 83 tok/s, wall window → 17.
+	const genOnly = new RateSampler();
+	genOnly.record(sec(0), [ROOT, node("a", { tokensOut: 0, generationMs: 0 })]);
+	genOnly.record(sec(20), [ROOT, node("a", { tokensOut: 1_000, generationMs: 12_000 })]);
+	const genRate = genOnly.nodeRate("a", sec(20));
+	assert.ok(Math.abs(genRate - 1_000 / 12) < 1e-6, `generation fallback expected 83 got ${genRate}`);
+	assert.ok(Math.abs(sampler.nodeRate("a", sec(20)) / genRate - 6) < 1e-6, "decode must report 6x the generation number");
+	// decodeMs is a real sampled counter, not a derived one.
+	assert.equal(sampler.decodeAt("a", sec(20)), 2_000);
+	assert.equal(sampler.genAt("a", sec(20)), 12_000);
 });
 
 test("rate: header now is 0 when all agents stopped (settled residual window ignored)", () => {
@@ -342,51 +423,56 @@ test("rate: header now stays non-zero while an agent is live", () => {
 	assert.ok(sampler.totalRate(sec(120)) > now);
 });
 
-test("rate: tiny in-window ΔgenerationMs + large ΔtokensOut cannot spike to M tok/s", () => {
+test("rate: ΔtokensOut with dDecode == 0 goes through the clamp, never 0 and never a spike", () => {
 	const sampler = new RateSampler();
 	// Warm a 60s wall history with zero tokens, then dump a huge output flush
-	// paired with only 1ms of generation — the old formula was 2_100_000 tok/s.
+	// whose decode counter has not landed yet (usage and decode both land at
+	// `message_end`, so a window CAN legitimately see tokens with no decode).
 	for (let t = 0; t <= 60; t += 1) {
 		sampler.record(sec(t), [ROOT, node("a", { tokensOut: 0, generationMs: 0 })]);
 	}
 	sampler.record(sec(61), [ROOT, node("a", {
 		tokensOut: 2_100,
-		generationMs: 1, // 1ms — below MIN_RATE_GENERATION_MS
+		generationMs: 1, // 1ms of generation — nothing to divide by
 	})]);
 	const live = [ROOT, node("a", { tokensOut: 2_100, generationMs: 1 })];
 	const now = sampler.nowRate(sec(61), live);
+	// The denominator is CLAMPED to MIN_RATE_DECODE_MS — not the 60s wall clock
+	// (that was 2100/60 ≈ 35, a 60x understatement) and not 1ms (2.1M).
+	assert.ok(Math.abs(now - 2_100 / (MIN_RATE_DECODE_MS / 1_000)) < 1e-6, `expected clamp got ${now}`);
 	assert.ok(now < 1_000_000, `expected <1M got ${now}`);
-	// Falls back to wall-clock window (RATE_WINDOW_MS): 2100 / 60 ≈ 35.
-	assert.ok(Math.abs(now - 2_100 / (RATE_WINDOW_MS / 1000)) < 1e-6, `expected wall fallback got ${now}`);
-	assert.equal(MIN_RATE_GENERATION_MS, 1_000);
+	// A zero Δout is still 0, whatever the denominator does.
+	assert.equal(sampler.nodeRate("a", sec(0), 1_000), 0);
+	assert.equal(MIN_RATE_DECODE_MS, 200);
 });
 
-test("rate: sub-second ΔgenerationMs floor; ≥1s still uses generation denominator", () => {
+test("rate: MIN_RATE_DECODE_MS clamps a short denominator; a real decode window is used as-is", () => {
 	const sampler = new RateSampler();
-	// Steady 100 tok/s for 90s with matching generationMs — floor must not bite.
+	// Steady 100 tok/s for 90s with matching decodeMs — the clamp must not bite.
 	for (let t = 0; t <= 90; t += 1) {
 		sampler.record(sec(t), [ROOT, node("a", {
 			tokensOut: t * 100,
 			generationMs: t * 1000,
+			decodeMs: t * 1000,
 		})]);
 	}
-	const steady = sampler.nowRate(sec(90), [ROOT, node("a", { tokensOut: 9_000, generationMs: 90_000 })]);
+	const steady = sampler.nowRate(sec(90), [ROOT, node("a", { tokensOut: 9_000, generationMs: 90_000, decodeMs: 90_000 })]);
 	assert.ok(Math.abs(steady - 100) < 1e-6, `steady expected ~100 got ${steady}`);
 
-	// Exactly MIN_RATE_GENERATION_MS of gen in-window: still trust gen denom.
+	// Exactly at the clamp: the measured denominator is used unchanged.
 	const edge = new RateSampler();
-	edge.record(sec(0), [ROOT, node("b", { tokensOut: 0, generationMs: 0 })]);
-	edge.record(sec(60), [ROOT, node("b", { tokensOut: 500, generationMs: MIN_RATE_GENERATION_MS })]);
+	edge.record(sec(0), [ROOT, node("b", { tokensOut: 0, generationMs: 0, decodeMs: 0 })]);
+	edge.record(sec(60), [ROOT, node("b", { tokensOut: 500, generationMs: 60_000, decodeMs: MIN_RATE_DECODE_MS })]);
 	const atFloor = edge.nodeRate("b", sec(60));
-	assert.ok(Math.abs(atFloor - 500) < 1e-6, `at 1s floor expected 500 got ${atFloor}`);
+	assert.ok(Math.abs(atFloor - 500 / (MIN_RATE_DECODE_MS / 1_000)) < 1e-6, `at clamp expected 2500 got ${atFloor}`);
 
-	// Just below floor → wall fallback, not gen (would be 500/0.999 ≈ 500.5, but
-	// more importantly not 500000 if dGen were 1ms).
+	// Below the clamp: clamped UP to MIN_RATE_DECODE_MS — never the wall window
+	// (that would be 500/60 ≈ 8.3) and never 500/0.1 = 5000.
 	const under = new RateSampler();
-	under.record(sec(0), [ROOT, node("c", { tokensOut: 0, generationMs: 0 })]);
-	under.record(sec(60), [ROOT, node("c", { tokensOut: 500, generationMs: MIN_RATE_GENERATION_MS - 1 })]);
+	under.record(sec(0), [ROOT, node("c", { tokensOut: 0, generationMs: 0, decodeMs: 0 })]);
+	under.record(sec(60), [ROOT, node("c", { tokensOut: 500, generationMs: 60_000, decodeMs: MIN_RATE_DECODE_MS - 100 })]);
 	const below = under.nodeRate("c", sec(60));
-	assert.ok(Math.abs(below - 500 / 60) < 1e-6, `below floor expected wall got ${below}`);
+	assert.ok(Math.abs(below - 500 / (MIN_RATE_DECODE_MS / 1_000)) < 1e-6, `below clamp expected 2500 got ${below}`);
 });
 
 test("rate: lastChangeAt advances only on tokensOut/gen change, not flat-collapse", () => {
@@ -2067,10 +2153,15 @@ test("status panel D1: portrait renders no status pane; wide/stacked render the 
 	}
 });
 
-test("status panel: VizNode new fields stay optional so bare literals keep compiling", () => {
-	// panels.ts:103-105 / legion-stop.test.ts:92 / this file's `node()` build these
-	// literals without the new keys — they must stay valid without defaults.
-	const bare: VizNode = { id: "x", name: "x", role: "worker", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0 };
+test("status panel: VizNode display fields stay optional, the denominator fields stay required", () => {
+	// panels.ts / legion-stop.test.ts / this file's `node()` build these literals
+	// without the display-only keys — those must stay valid without defaults.
+	//
+	// `decodeMs` is the opposite decision (tps-decode-denominator D5): making it
+	// OPTIONAL would let a fixture or a wiring point silently sample a decode
+	// series of zeros and keep the old, wrong denominator. Required means `tsc`
+	// names every such site instead.
+	const bare: VizNode = { id: "x", name: "x", role: "worker", parentId: "root", depth: 1, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, decodeMs: 0 };
 	assert.equal(bare.spawnMode, undefined);
 	assert.equal(bare.pid, undefined);
 	assert.equal(bare.contextTokens, undefined);
@@ -2607,11 +2698,19 @@ test("#364: the /legion page renders the same bytes it did before the frame-allo
 	const { nodes, sampler, now } = scenario(600, 40);
 	const data = { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
 	const shapes: ReadonlyArray<readonly [number, number]> = [[120, 40], [200, 60], [80, 24], [46, 60]];
+	//
+	// Re-pinned once, by contract `tps-decode-denominator-v1` D6: the chart's
+	// bucket rates changed because the tok/s denominator did. A bucket whose
+	// ΔgenerationMs sat under 1s used to be divided by the whole 60s wall window
+	// (≈60x low); it now divides by the measured Δdecode, clamped at
+	// MIN_RATE_DECODE_MS. Only bar heights at bucket edges move — 120x40 did not
+	// move a single byte, which is the control that this is the rate change and not
+	// a rendering drift.
 	const expected: Record<string, { plain: string; ansi: string }> = {
 		"120x40": { plain: "8d75b4fc85023179acd3efe8b2f84f58bb032b0c25a70011966137e3a45e8d3e", ansi: "c30f0d005cb24827e43351242de12ba7c0cabb7dbb28209e64f2bf025bd7063c" },
-		"200x60": { plain: "1c71e80d132197d3b7ceb797019889a2dd7db29ee7c536853c3511f31254bacd", ansi: "1f1145386e4893120d24a2cb23f3a16c7a39bdff5af43e25575fe9d2586c176b" },
-		"80x24": { plain: "5f71d89b9a98628f1fdf4f364941eac332cae92fe725af689b75cb2fb8c257e3", ansi: "37455f157fda3999916d12c356aa7cc80fe1abb4129d259b349bbf08b61ebabb" },
-		"46x60": { plain: "6f000ab58d8a36884240de3190d4c29557e6a5da9bdb958ff5fdcef013f850e4", ansi: "223f902d495535618c9f963bbb5950dd51bdc89cbca19d93aba57371c4fb8117" },
+		"200x60": { plain: "8b44f0963f0c78e4d97681c33c3c9dd7d3389e2d5f81ff9071b4013db803bf97", ansi: "308289fe20882564d9c97b47932739a4cf9a6e0532a79442dda0d5755fd55497" },
+		"80x24": { plain: "4fc0da09cdbd7a86221aadfa4332d18ab91b3c5b55fda906fd30c8d65bbb9805", ansi: "10a95a2ff47a52a39c656a4d78b70c9d4ad815cafcc0cae375a0617029c28ed6" },
+		"46x60": { plain: "40092887f3bda359f69e83612bc41058c4ddbabfbb8f1312e6ed5715f703b7f6", ansi: "0d50ca8039f098947abaaf02850ca7e61c8111fb4a41fa25afc8636d18f22d75" },
 	};
 	const actual: Record<string, { plain: string; ansi: string }> = {};
 	for (const [cols, rows] of shapes) {
@@ -2651,11 +2750,15 @@ test("#364: every painted cell is what it was before the frame-alloc work (contr
 	const { nodes, sampler, now } = scenario(600, 40);
 	const data = { nodes, sampler, now, rate: sampler.nowRate(now, nodes) };
 	const shapes: ReadonlyArray<readonly [number, number]> = [[120, 40], [200, 60], [80, 24], [46, 60]];
+	// Re-pinned with the I1 goldens above and for the same reason (D6: bucket rates
+	// follow the tok/s denominator). 120x40 again did not move — the guard this test
+	// exists for (`drawGalaxy`'s per-cell output under the frame-alloc rewrite) is
+	// intact wherever the rates did not change a bar.
 	const expected: Record<string, string> = {
 		"120x40": "5daf7add695cbd9885e70fecfaa9a8f0539b7db4cbd0e122f24d275684aff877",
-		"200x60": "717f4f7c9ec8158e5ac0dedbf9754dd99f12955fe12c6bc82d5493a0352baa22",
-		"80x24": "12c2f13dd8cf73e64bf801dee6a77f33537b7b2591a037f42a89a2c8201d0243",
-		"46x60": "34dc3f71c400e463b1a76339388ec53c747f5337514966bf4018e3138311f350",
+		"200x60": "43ee8e50b36038e81e40ef267a7728a45c7fe2a572ceedcb86a6d17a4329883c",
+		"80x24": "4afabade42da7c1d9f5acc32cb942118b1fd44ac2ff5d9d442dc5fa1db9e4262",
+		"46x60": "64c6fe881e2f299ddf66d28d69f2b0aa6b61deb8a8c93cf70ccfd11a6d973690",
 	};
 	const actual: Record<string, string> = {};
 	for (const [cols, rows] of shapes) {

@@ -29,6 +29,26 @@ export function listTeamNames(settings: SubagentsSettings): string[] {
 	return [DEFAULT_TEAM, ...Object.keys(settings.teams ?? {})];
 }
 
+/**
+ * Tag a version of `agent` whose `model` came from the team member override.
+ *
+ * The tag is what gives a team member's `model` its own precedence level
+ * (design §6.3 level 3): the folded string alone is indistinguishable from
+ * frontmatter, and `resolveModel` re-reads the settings-wide
+ * `agentOverrides` / `agentOverridesByProvider` BELOW that level — so an
+ * untagged fold silently loses to a global per-role pin even though this very
+ * team is the more specific choice.
+ *
+ * The recorded `model` is the value the tag belongs to, so a later fold that
+ * changes `agent.model` leaves a STALE tag behind; `resolveModel` ignores any
+ * tag whose `model` no longer matches `agent.model` (same rule as
+ * `applyDefaultModel`).
+ */
+function markTeamModel(agent: AgentConfig): AgentConfig {
+	if (agent.model === undefined) return agent;
+	return { ...agent, modelSource: { type: "team", model: agent.model } };
+}
+
 /** Apply the selected team to a fully discovered agent list. */
 export function applyTeam(
 	agents: AgentConfig[],
@@ -91,9 +111,16 @@ export function applyTeam(
 			selected.delete(base.name);
 			continue;
 		}
+		const folded = applyOverride(selected.get(base.name) ?? base, member);
+		// Only a non-blank member `model` is tagged: a member that sets some other
+		// field must keep an earlier tag (that tag still describes `agent.model`),
+		// and a member that only sets `preset` stays at level 2 — `applyPreset`
+		// records its own provenance there.
 		selected.set(
 			base.name,
-			applyOverride(selected.get(base.name) ?? base, member),
+			typeof member.model === "string" && member.model.trim()
+				? markTeamModel(folded)
+				: folded,
 		);
 	}
 

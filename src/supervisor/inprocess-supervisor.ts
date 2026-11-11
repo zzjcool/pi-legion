@@ -11,7 +11,9 @@
 import { statSync } from "node:fs";
 import { formatChildTask } from "../extension/child-guard.ts";
 import { childBudgetFromEnv } from "../extension/budget.ts";
+import { TEAM_ENV } from "../agents/teams.ts";
 import { parseSessionFile } from "../shared/session.ts";
+import { progressFromSessionFile } from "../shared/progress.ts";
 import {
 	appendLegionChildTools,
 	applyThinkingSuffix,
@@ -30,6 +32,7 @@ import {
 } from "../shared/types.ts";
 import { childBuiltinExtensionEntries, type ChildBuiltinFactories } from "./child-builtins.ts";
 import { bindChildSessionExtensions, attachChildSessionRelease } from "./child-session.ts";
+import { DECODE_ARCHIVE_MAX, foldDecode, seedDecode, type DecodeClock } from "./decode-clock.ts";
 import {
 	POLL_INTERVAL_MS,
 	DEFAULT_INPROCESS_MAX_ACTIVE,
@@ -134,6 +137,12 @@ export interface InProcessSessionFactoryInput {
 	 * inject it through another path for the same spawn.
 	 */
 	childContext?: string;
+	/**
+	 * Non-fatal model-resolution notice (B5). Called at most once, right after
+	 * `resolveCliModel` answers a `warning`; never used to fail the spawn. An
+	 * unknown/ignoring factory stays valid — this input is optional.
+	 */
+	onNotice?: (line: string) => void;
 }
 
 export type InProcessSessionFactory = (
@@ -363,6 +372,15 @@ interface ChildRecord {
 	 */
 	lastEventAt?: number;
 	/**
+	 * Contract `tps-decode-denominator-v1` D1/D2: the measured first-delta→last-
+	 * delta wall clock folded from this child's own event stream — the same stream
+	 * {@link inFlightTools} and {@link lastEventAt} already ride, so no new
+	 * subscription and no child-side change. Seeded at registration from the
+	 * session file's `generationMs` (D3) so a resume keeps a continuous axis;
+	 * display-only, never persisted.
+	 */
+	decode: DecodeClock;
+	/**
 	 * A19: an admission slot is freed exactly once per departure from the live
 	 * set. All three release points (`retireChild`, `rollbackSpawn`,
 	 * `disposeRecord`) can observe the same record, so the flag — not the call
@@ -397,6 +415,12 @@ function parentKeyOf(name: string): string {
  * why partial identity must not be mistaken for a complete one downstream.
  */
 function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
+	// B9 (D-B9.2): the team the parent chose for THIS spawn travels on
+	// `SpawnInput.env` — that is how an rpc child receives it. Lifted here for the
+	// in-process channel, and merged in BOTH branches below: the `provided` branch
+	// returns early, so a merge placed only in the fallback would leave exactly the
+	// legion (node-backed) spawns team-blind, i.e. the grandchildren this fixes.
+	const team = teamFromSpawnEnv(input.env);
 	const provided = input.childLaunchContext;
 	if (provided) {
 		// REV2-3: store a deep-enough snapshot, never the caller's live object.
@@ -405,6 +429,9 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		// child for its later dispatches — the A-becomes-B leak D5 exists to kill.
 		return {
 			...provided,
+			// …and for the same REV2-3 reason the spawn env wins over a reused
+			// template's `team`: env is per-spawn, the template is not.
+			...team,
 			// Element-level copy too: after the path became `NestedPathEntry[]`
 			// (objects), `[...path]` would still alias every entry, so a caller
 			// mutating `template.parentPath[0].runId` would rewrite an
@@ -424,7 +451,24 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		// gets as its real environment — and carry them in the context, because the
 		// in-process child shares the host's process.env and cannot see them there.
 		...budgetFromSpawnEnv(input.env),
+		// B9: same channel, same reason (see the `team` binding above).
+		...team,
 	};
+}
+
+/**
+ * Extract the parent's selected team from a spawn env (B9).
+ *
+ * Key presence, not truthiness: `team: "default"` is a real, expressible choice
+ * that must beat a `subagents.team` setting, so the only "no team" answer is an
+ * env without `PI_SUBAGENTS_TEAM` at all.
+ */
+function teamFromSpawnEnv(env: NodeJS.ProcessEnv | undefined): {
+	team?: string;
+} {
+	if (!env || !(TEAM_ENV in env)) return {};
+	const team = env[TEAM_ENV];
+	return team === undefined ? {} : { team };
 }
 
 /** Extract the child budget keys from a spawn env, for the in-process channel. */
@@ -695,6 +739,11 @@ async function defaultSessionFactory(
 			);
 		}
 		createOptions.model = resolved.model;
+		// B5: `warning` is a NON-FATAL resolution notice (custom model id, invalid
+		// `:thinking` suffix). Failing the spawn would break the supported custom-id
+		// usage, and dropping it is what made a child run silently on a model
+		// nobody registered — so it leaves through the notice channel instead.
+		if (resolved.warning) input.onNotice?.(resolved.warning);
 		if (resolved.thinkingLevel && isThinkingLevel(resolved.thinkingLevel)) {
 			createOptions.thinkingLevel = resolved.thinkingLevel;
 		} else if (
@@ -758,6 +807,21 @@ export class InProcessSupervisor implements LegionSupervisor {
 	 */
 	readonly capabilities = { promptDisposition: false } as const;
 	private readonly children = new Map<string, ChildRecord>();
+	/**
+	 * D4-b: the last measured decode ms per child NAME, kept after the record is
+	 * gone.
+	 *
+	 * `decodeMs` answers "how much did this child decode in its life", not "is it
+	 * alive right now", so retiring a child must not erase the denominator: the
+	 * status row would flip from the measured average back to the request-inclusive
+	 * `generationMs` (measured: 136 → 69 avg t/s on one unchanged row) while the
+	 * chart's series keeps the decode samples it already recorded.
+	 *
+	 * Bounded on purpose (a long session can retire thousands of children) and
+	 * memory-only: no DB column, no child JSONL entry, no wire field (D4's
+	 * prohibitions still stand).
+	 */
+	private readonly decodeArchive = new Map<string, number>();
 	private readonly subscriptionsBeforeSpawn = new Map<string, Set<EventSubscription>>();
 	private readonly sessionFactory: InProcessSessionFactory;
 	private readonly getLimits: () => InProcessLimits | undefined;
@@ -870,9 +934,16 @@ export class InProcessSupervisor implements LegionSupervisor {
 			spawnDepth: inProcessDepth() + 1,
 			parentKey: parentKeyOf(input.name),
 			context: resolveChildLaunchContext(input),
+			// D3: seed from the session file's own `generationMs` — 0 for a fresh
+			// spawn (empty file), the historical total for a resume/continue that
+			// reuses an old transcript, so measured decode continues the same axis.
+			decode: seedDecode(progressFromSessionFile(input.sessionFile).generationMs ?? 0),
 		};
 		this.subscriptionsBeforeSpawn.delete(input.name);
 		this.children.set(input.name, registration);
+		// B5: notices the session factory emits during THIS spawn. Collected here
+		// (not on the record) because they are a spawn result, not child state.
+		const notices: string[] = [];
 
 		try {
 			return await runAtInProcessChildDepthAsync(() =>
@@ -890,6 +961,10 @@ export class InProcessSupervisor implements LegionSupervisor {
 						cwd: input.cwd,
 						agent: input.agent,
 						sessionFile: input.sessionFile,
+						// B5: non-fatal resolution notices (see `ChildHandle.warning`).
+						onNotice: (line) => {
+							notices.push(line);
+						},
 						...(input.model !== undefined ? { model: input.model } : {}),
 						...(input.modelProvider !== undefined
 							? { modelProvider: input.modelProvider }
@@ -938,6 +1013,8 @@ export class InProcessSupervisor implements LegionSupervisor {
 					return {
 						name: registration.name,
 						sessionFile: registration.sessionFile,
+						// B5: absent (never empty) when the spawn had nothing to say.
+						...(notices.length > 0 ? { warning: notices.join("; ") } : {}),
 					};
 				}),
 			);
@@ -1350,6 +1427,35 @@ export class InProcessSupervisor implements LegionSupervisor {
 		return this.children.get(name)?.lastEventAt;
 	}
 
+	/**
+	 * tps-decode-denominator D4/D4-b: measured decode ms (first delta→last delta).
+	 *
+	 * Deliberately NOT gated on `isAlive` (D4-b). This answers a lifetime question,
+	 * so a retired/exited child — whose record has left `children` — keeps answering
+	 * through {@link decodeArchive}. Gating it on liveness made one unchanged row
+	 * swing from the measured average to `generationMs` at retire time, and made a
+	 * single short message look WORSE once the child ended (no label before, a tiny
+	 * one after).
+	 *
+	 * `undefined` now means exactly one thing: this backend has never observed that
+	 * name. A measured 0 is still a real answer (a child whose first message has not
+	 * closed yet).
+	 */
+	decodeMs(name: string): number | undefined {
+		return this.children.get(name)?.decode.measuredMs ?? this.decodeArchive.get(name);
+	}
+
+	/** Remember a child's last measured decode ms by name (D4-b), bounded FIFO. */
+	private rememberDecode(name: string, measuredMs: number): void {
+		if (this.decodeArchive.get(name) === measuredMs) return;
+		this.decodeArchive.set(name, measuredMs);
+		while (this.decodeArchive.size > DECODE_ARCHIVE_MAX) {
+			const oldest = this.decodeArchive.keys().next();
+			if (oldest.done) return;
+			this.decodeArchive.delete(oldest.value);
+		}
+	}
+
 	async stats(name: string): Promise<UsageSnapshot | null> {
 		const child = this.children.get(name);
 		if (!child || !child.session || !this.isAlive(name)) return null;
@@ -1619,6 +1725,16 @@ export class InProcessSupervisor implements LegionSupervisor {
 		// `lastEventAt`, which is why the age it produces cannot disagree with the stack
 		// it sits next to.
 		child.lastEventAt = at;
+		// tps-decode-denominator D1/D2: the third reader of the same clock reading.
+		// It MUST stay above `publishEvent` — that path drops every delta except
+		// text_delta/tool-name (`publishEventAtRoot`), so a thinking-only turn would
+		// measure nothing if the fold lived behind the filter.
+		const decode = foldDecode(child.decode, record, at);
+		if (decode !== child.decode) {
+			child.decode = decode;
+			// D4-b: archive on every change, so the value survives `children.delete()`.
+			this.rememberDecode(child.name, decode.measuredMs);
+		}
 		this.updateTurnState(child, record);
 		this.publishEvent(child, record);
 	}

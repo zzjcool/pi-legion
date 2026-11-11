@@ -66,6 +66,26 @@ export interface ChildLaunchContext {
 		maxTurns?: number;
 		toolTimeoutMs?: number;
 	};
+	/**
+	 * The team the parent chose for THIS spawn (B9) — carried here for exactly the
+	 * reason `budget` is (#295, above).
+	 *
+	 * Team selection travels on `SpawnInput.env`: a spawned rpc child receives that
+	 * object as its real environment, so `resolveActiveTeamName` reads it there. An
+	 * in-process child shares the HOST's `process.env` instead, so the parent's
+	 * choice is invisible to it — a tool-call `team:`, a card `team:` or a resume's
+	 * `node.team` addressed a GRANDCHILD only to have the child resolve the default
+	 * team (and with it, level 3 of the model chain: a team member's `model`).
+	 *
+	 * `InProcessSupervisor` lifts it off `SpawnInput.env` and `loadCatalog` (index.ts)
+	 * is the single consumer: it overlays this value on the env it hands `applyTeam`.
+	 *
+	 * Present only when the spawn env actually carried the key — absent means "this
+	 * spawn chose no team", so the child keeps resolving env > settings > default
+	 * exactly as before. Never `undefined` as a stand-in for `"default"`: an
+	 * explicit `team: "default"` has to beat a settings team.
+	 */
+	team?: string;
 }
 
 const STORE_KEY = Symbol.for("pi-legion.child-context.als");

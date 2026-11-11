@@ -884,8 +884,8 @@ test("/legion mounts the full page on the main screen, not as a full-screen over
 	// host restores the editor it swapped out.
 	const sampler = new RateSampler();
 	const vizNodes: VizNode[] = [
-		{ id: "root", name: "legion-0", role: "legion", parentId: null, depth: 0, status: "running", startedAt: 1_000, tokens: 0, tokensOut: 0, generationMs: 0 },
-		{ id: "root.worker", name: "worker", role: "worker", parentId: "root", depth: 1, status: "running", startedAt: 2_000, tokens: 100, tokensOut: 60, generationMs: 1_000 },
+		{ id: "root", name: "legion-0", role: "legion", parentId: null, depth: 0, status: "running", startedAt: 1_000, tokens: 0, tokensOut: 0, generationMs: 0, decodeMs: 0 },
+		{ id: "root.worker", name: "worker", role: "worker", parentId: "root", depth: 1, status: "running", startedAt: 2_000, tokens: 100, tokensOut: 60, generationMs: 1_000, decodeMs: 0 },
 	];
 	const harness = commandHarness(treeNodes, undefined, () => ({ nodes: vizNodes, sampler, now: 5_000, rate: 0 }));
 	const pageOpen = harness.handler("", harness.ctx);
@@ -1697,11 +1697,17 @@ test("runtime: a node with no tracked job still reports live tok/s from its sess
 			eventBus: createLegionEventBus(),
 			getTreeNodes: () => nodes,
 			now: () => NOW,
+			// tps-decode-denominator D5: the host injects the supervisor's measured
+			// decode counter. Deliberately a value that CANNOT be confused with
+			// generationMs (2.5s of decoding inside the request), so a wiring that
+			// silently kept the old denominator fails below.
+			getLiveDecode: (name) => (name === "worker" ? 2_500 : undefined),
 		});
 
 		const entry = runtime.statusEntries().find((item) => item.nodeId === "root.worker");
 		assert.equal(entry?.tokensOut, 500, "live tokensOut comes from the session file, not the empty ledger");
 		assert.ok(entry?.generationMs !== undefined, "generationMs must exist so tok/s has its denominator");
+		assert.equal(entry?.decodeMs, 2_500, "the measured decode counter reaches the StatusEntry");
 		assert.equal(entry?.state, "running", "the node maps to a live state so nowRate counts it");
 
 		// End-to-end: the railway header math must see a non-zero rate for this node.
@@ -1711,14 +1717,31 @@ test("runtime: a node with no tracked job still reports live tok/s from its sess
 		const worker = vizNodes.find((item) => item.id === "root.worker")!;
 		assert.equal(worker.tokensOut, 500, "viz keeps the live token count");
 		assert.ok(worker.generationMs > 0, "viz keeps the live generation denominator");
+		assert.equal(worker.decodeMs, 2_500, "viz keeps the measured decode denominator (full chain)");
 		assert.equal(worker.status, "running");
 		assert.deepEqual(liveRateNodeIds(vizNodes).includes("root.worker"), true, "the in-process node counts as live");
 		// Two samples with a growing counter: the sampler must produce a positive rate.
 		const sampler = new RateSampler();
-		sampler.record(NOW - 30_000, [{ ...worker, tokensOut: 500, generationMs: 1_000 }]);
-		const later = { ...worker, tokensOut: 800, generationMs: 2_000 };
+		sampler.record(NOW - 30_000, [{ ...worker, tokensOut: 500, generationMs: 1_000, decodeMs: 2_000 }]);
+		const later = { ...worker, tokensOut: 800, generationMs: 2_000, decodeMs: 2_500 };
 		sampler.record(NOW, [later]);
 		assert.ok(sampler.nowRate(NOW, [later]) > 0, "a node with live session data yields a non-zero tok/s");
+		// 300 tokens over 0.5s of MEASURED decoding = 600 tok/s. The generation
+		// denominator would say 300, and the wall window 5 — the whole contract.
+		const rate = sampler.nowRate(NOW, [later]);
+		assert.ok(Math.abs(rate - 600) < 1e-6, `decode denominator expected 600 tok/s got ${rate}`);
+
+		// A row the supervisor has no measurement for stays on generationMs — and
+		// the StatusEntry omits the key entirely rather than claiming a 0.
+		const unmeasured = createSessionRuntime({
+			sendMessage() {},
+			eventBus: createLegionEventBus(),
+			getTreeNodes: () => nodes,
+			now: () => NOW,
+			getLiveDecode: () => undefined,
+		}).statusEntries().find((item) => item.nodeId === "root.worker");
+		assert.ok(unmeasured !== undefined);
+		assert.ok(!("decodeMs" in unmeasured), "no observation must not fabricate a measured denominator");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

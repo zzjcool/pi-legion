@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
-import { ErrorCodes, type AgentConfig, type SubagentsSettings } from "../../src/shared/types.ts";
+import { ErrorCodes, SubagentError, type AgentConfig, type SubagentsSettings } from "../../src/shared/types.ts";
 import {
 	applyTeam,
 	DEFAULT_TEAM,
@@ -45,7 +45,13 @@ import {
 import { createSessionRuntime, type WaitResult } from "../../src/extension/runtime.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { InProcessSupervisor } from "../../src/supervisor/inprocess-supervisor.ts";
+import { runInChildContext } from "../../src/supervisor/child-context.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
+import {
+	INPROCESS_FIX_ADVICE,
+	INPROCESS_MODEL_FAILURE,
+	INPROCESS_MODEL_FAILURE_LINE,
+} from "../helpers/inprocess-failure.ts";
 import piLegion from "../../index.ts";
 
 const savedTeamEnv = process.env[TEAM_ENV];
@@ -163,6 +169,104 @@ test("teams: star expands each role once and later object overrides win", () => 
 	assert.equal(result.agents[0]?.model, "new-worker");
 	assert.equal(result.agents[1]?.model, "old-designer");
 	assert.deepEqual(result.warnings, []);
+});
+
+// ─────────── D1: a member `model` carries team provenance ───────────
+// Reason: the folded `model` alone is indistinguishable from frontmatter, and
+// the precedence chain re-reads `agentOverrides` BELOW the preset level. The
+// tag is what lets candidate 3 promote a team member's own choice above those
+// settings-wide overrides (design §6.3 level 3).
+
+test("teams: a member `model` is tagged with team provenance", () => {
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: "worker", model: "cb/team-model" }] } },
+		},
+		{},
+	);
+	const folded = result.agents[0];
+	assert.ok(folded);
+	assert.equal(folded.model, "cb/team-model");
+	assert.deepEqual(folded.modelSource, { type: "team", model: "cb/team-model" });
+});
+
+test("teams: the `inherit` sentinel is tagged verbatim", () => {
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: "worker", model: "inherit" }] } },
+		},
+		{},
+	);
+	assert.deepEqual(result.agents[0]?.modelSource, {
+		type: "team",
+		model: "inherit",
+	});
+});
+
+test("teams: a plain string member is not tagged as a team model", () => {
+	const result = applyTeam(
+		[agent("worker", { model: "cb/frontmatter" })],
+		{ team: "cheap", teams: { cheap: { members: ["worker"] } } },
+		{},
+	);
+	assert.equal(result.agents[0]?.model, "cb/frontmatter");
+	assert.equal(result.agents[0]?.modelSource, undefined);
+});
+
+test("teams: a member that only sets `preset` is not tagged as a team model", () => {
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: "worker", preset: "cheap" }] } },
+		},
+		{},
+	);
+	assert.equal(result.agents[0]?.preset, "cheap");
+	assert.equal(result.agents[0]?.modelSource, undefined);
+});
+
+test("teams: a blank member `model` is not tagged", () => {
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: { cheap: { members: [{ agent: "worker", model: "   " }] } },
+		},
+		{},
+	);
+	assert.equal(result.agents[0]?.modelSource, undefined);
+});
+
+test("teams: a later member without `model` keeps the earlier team tag", () => {
+	// The tag is provenance for the CURRENT `model`. A following member that
+	// touches another field must not erase it, or the fold loses its identity
+	// and the model silently drops back below `agentOverrides`.
+	const result = applyTeam(
+		[agent("worker")],
+		{
+			team: "cheap",
+			teams: {
+				cheap: {
+					members: [
+						{ agent: "worker", model: "cb/team-model" },
+						{ agent: "worker", thinking: "high" },
+					],
+				},
+			},
+		},
+		{},
+	);
+	assert.equal(result.agents[0]?.model, "cb/team-model");
+	assert.equal(result.agents[0]?.thinking, "high");
+	assert.deepEqual(result.agents[0]?.modelSource, {
+		type: "team",
+		model: "cb/team-model",
+	});
 });
 
 test("teams: a later member or star restores a role removed by disabled", () => {
@@ -1518,6 +1622,88 @@ test("index mainline: environment default team reaches the child", async () => {
 	}
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// B9: the team the parent chose for a spawn must be VISIBLE to the child
+// session, not merely present in `SpawnInput.env`.
+//
+// An in-process child shares the host's `process.env`, so the env entry below is
+// not something it can read — the choice travels on the ALS child context
+// (`ChildLaunchContext.team`) and `loadCatalog` overlays it on the env it hands
+// to `applyTeam`. These cases therefore read the CATALOG, not the spawn env: a
+// "the env has the key" assertion is exactly the false green that hid B9.
+// ─────────────────────────────────────────────────────────────────────────────
+
+test("B9: an in-process child's catalog sees the team its parent chose", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true, teams: { frontend: { members: [{ agent: "worker", model: "cb/team-model" }] } } },
+		{ "worker.md": WORKER_FILE, "designer.md": DESIGNER_FILE },
+	);
+	try {
+		// Root (no ALS team): settings alone decide, unchanged behaviour.
+		const root = loadCatalog(harness.cwd, harness.cwd, undefined);
+		assert.equal(root.team.name, DEFAULT_TEAM);
+		assert.equal(root.agents.find((entry) => entry.name === "worker")?.model, undefined);
+
+		const child = await runInChildContext(
+			{ allowNested: true, utility: false, spawnMode: "inprocess", team: "frontend" },
+			async () => loadCatalog(harness.cwd, harness.cwd, undefined),
+		);
+		assert.equal(child.team.name, "frontend", "the child resolves the parent's team, not the default");
+		// Team filtering happened…
+		assert.deepEqual(child.agents.map((entry) => entry.name), ["worker"]);
+		// …and level 3 (the member's `model`) folded — the observable consequence
+		// B9 hid for grandchildren.
+		const worker = child.agents.find((entry) => entry.name === "worker");
+		assert.equal(worker?.model, "cb/team-model");
+		assert.deepEqual(worker?.modelSource, { type: "team", model: "cb/team-model" });
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("B9: an explicit `default` on the child context beats the settings team", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true, team: "frontend", teams: { frontend: { members: ["designer"] } } },
+		{ "worker.md": WORKER_FILE, "designer.md": DESIGNER_FILE },
+	);
+	try {
+		const child = await runInChildContext(
+			{ allowNested: false, utility: false, spawnMode: "inprocess", team: "default" },
+			async () => loadCatalog(harness.cwd, harness.cwd, undefined),
+		);
+		assert.equal(child.team.name, "default");
+		// The settings team would have filtered `worker` out, so an explicit
+		// `team: "default"` must be expressible. The reason is LAYERING, not a
+		// truthiness trick: this layer carries the parent's SELECTION verbatim, and
+		// only `resolveActiveTeamName` may decide precedence (context/env > settings
+		// > default). Authoring a value here — or swallowing one — would move that
+		// decision a layer up, and `"default"` would stop beating the settings team
+		// it was chosen to override. (Downstream, `""` and an absent key ARE the same
+		// "nothing selected" answer, because the resolver trims.)
+		assert.deepEqual(child.agents.map((entry) => entry.name).sort(), ["designer", "worker"]);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("B9: a child context without a team keeps following the settings team", async () => {
+	const harness = indexHarness(
+		{ disableBuiltins: true, team: "frontend", teams: { frontend: { members: ["designer"] } } },
+		{ "worker.md": WORKER_FILE, "designer.md": DESIGNER_FILE },
+	);
+	try {
+		const child = await runInChildContext(
+			{ allowNested: true, utility: false, spawnMode: "inprocess" },
+			async () => loadCatalog(harness.cwd, harness.cwd, undefined),
+		);
+		assert.equal(child.team.name, "frontend");
+		assert.equal(child.team.source, "settings", "no context team means the env/settings chain decides");
+		assert.deepEqual(child.agents.map((entry) => entry.name), ["designer"]);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
 test("index verify: launch-supplied commands run at collect and gate the verdict", async () => {
 	const calls: Array<{ command: string; cwd: string }> = [];
 	const verifyRunner = async (command: string, cwd: string) => {
@@ -2269,4 +2455,115 @@ test("vexillatio refuses a per-item `name` instead of silently dropping it", asy
 	} finally {
 		await harness.cleanup();
 	}
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R5 hint: an in-process model-resolution failure used to reach the caller as
+// the bare `✗` line, while the rpc path got `enrichFailureWithAutoDoctor`.
+// `spawnFailureHint` already knew the wording; nothing called it here.
+//
+// Deliberately NOT routed through the auto-doctor ring: that buffer is
+// process-wide (8 entries, across runs), so an in-process record in it would be
+// offered as advice for a later, unrelated rpc failure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Drive one launch whose spawn throws `thrown`, and return the tool's text.
+ *
+ * The four hint cases below differ only in WHAT the spawn throws (and in which
+ * tool family carries it): the env, the agent card, the supervisor knobs and the
+ * teardown are identical, so they live here once. `utility` routes through
+ * `vexillatio`, which allocates its own handle and renders its own `✗` line.
+ */
+async function runSpawnFailure(
+	thrown: Error,
+	params: { task?: string; utility?: boolean } = {},
+): Promise<string> {
+	const harness = indexHarness(
+		{ disableBuiltins: true },
+		params.utility ? { "scout.md": UTILITY_FILE } : { "worker.md": WORKER_FILE },
+		{ autoSettle: false, immediateTimeout: false },
+	);
+	try {
+		harness.supervisor.spawnChild = async () => {
+			throw thrown;
+		};
+		if (params.utility) {
+			const result = await harness.utilityTool.execute(
+				"vex-hint",
+				{ agent: "scout", task: params.task ?? "recon", cwd: harness.cwd, timeoutMs: 600_000 },
+				undefined,
+				undefined,
+				{ cwd: harness.cwd, hasUI: false, ui: { notify() {}, setStatus() {} } },
+			);
+			return (result.content ?? []).map((item) => item.text ?? "").join("\n");
+		}
+		// `await`, not a bare `return` of the promise: otherwise the `finally` below
+		// runs — closing this harness's legion DB — while the launch is still in
+		// flight, and the failure path's rollback reports `database is not open`
+		// instead of the error under test.
+		return await invokeIndex(harness, {
+			agent: "worker",
+			task: params.task ?? "spawn",
+			async: true,
+			worktree: false,
+		});
+	} finally {
+		await harness.cleanup();
+	}
+}
+
+test("hint: an in-process model miss appends the Fix段 exactly once", async () => {
+	const text = await runSpawnFailure(
+		new SubagentError(INPROCESS_MODEL_FAILURE, ErrorCodes.START_FAILED),
+	);
+	// The failure line is still the `✗ <agent>:` shape and keeps the message.
+	assert.match(text, /✗ worker: START_FAILED: /);
+	assert.match(text, INPROCESS_MODEL_FAILURE_LINE);
+	// …and now carries the in-process fix path, not just argv-era prose.
+	assert.match(text, INPROCESS_FIX_ADVICE);
+	assert.match(text, /PI_LEGION_CHILD_EXTENSIONS/);
+	assert.equal(
+		(text.match(/Hint:/g) ?? []).length,
+		1,
+		`the hint is appended once, not per call site:\n${text}`,
+	);
+});
+
+test("hint: an rpc-style failure that already carries a Hint is not hinted twice", async () => {
+	// Shaped exactly like an enriched rpc failure: no `inprocess` marker, but
+	// it already ends with its own hint + auto-doctor section.
+	const failure =
+		'Pi RPC process exited during startup: Error: Model "ghost/model" not found. Use --list-models\n\n' +
+		"Hint: children start with `--no-extensions`, so host packages that register providers are not loaded.\n\n" +
+		"--- Legion auto-doctor ---\nmodels: ghost/model";
+	const text = await runSpawnFailure(
+		new SubagentError(failure, ErrorCodes.START_FAILED),
+		{ task: "rpc-style failure" },
+	);
+	assert.match(text, /✗ worker: START_FAILED: Pi RPC process exited during startup/);
+	assert.equal((text.match(/Hint:/g) ?? []).length, 1, `no second hint:\n${text}`);
+	assert.doesNotMatch(text, INPROCESS_FIX_ADVICE, "the in-process Fix段 must not ride along");
+});
+
+test("hint: a plain spawn failure stays byte-identical (no hint invented)", async () => {
+	const text = await runSpawnFailure(
+		new Error("spawn refused for the interrupt test"),
+		{ task: "plain failure" },
+	);
+	// Verbatim: `String(error)` is what launchStep has always rendered, and this
+	// shape must not grow a hint (the utility-interrupt test pins the same
+	// rule on its own path).
+	assert.equal(text, "✗ worker: Error: spawn refused for the interrupt test");
+});
+
+test("hint: the vexillatio failure path carries the same hint once", async () => {
+	const text = await runSpawnFailure(
+		new SubagentError(INPROCESS_MODEL_FAILURE, ErrorCodes.START_FAILED),
+		{ utility: true },
+	);
+	assert.match(text, /✗ scout: /);
+	assert.match(text, INPROCESS_MODEL_FAILURE_LINE);
+	assert.match(text, INPROCESS_FIX_ADVICE);
+	assert.equal((text.match(/Hint:/g) ?? []).length, 1, `one hint per failure:\n${text}`);
 });

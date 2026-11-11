@@ -41,7 +41,7 @@ import {
 	TEAM_ENV,
 	type ActiveTeam,
 } from "./src/agents/teams.ts";
-import { resolveModel } from "./src/agents/model-resolution.ts";
+import { INHERIT_MODEL_SENTINEL, resolveModel } from "./src/agents/model-resolution.ts";
 import { providerForModel, type ProviderLookup } from "./src/runs/provider-pin.ts";
 import { resolveStepModel } from "./src/agents/step-model.ts";
 import { checkModelScope } from "./src/agents/model-scope.ts";
@@ -102,6 +102,7 @@ import {
 } from "./src/extension/notify.ts";
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
 import { renderSpawnResult } from "./src/extension/spawn-render.ts";
+import { appendInprocessModelHint } from "./src/extension/spawn-hints.ts";
 import { PARENT_PLAYBOOK, TOOL_DESCRIPTION } from "./src/extension/playbook.ts";
 import { CHILD_ROLE_ENV } from "./src/extension/child-guard.ts";
 import { configureSessionErrors, recordSessionError } from "./src/extension/session-errors.ts";
@@ -1344,7 +1345,12 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
 	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus, ...(input.machineForRole ? { machineForRole: input.machineForRole } : {}) } });
 	orchestrator.restore(parentRun);
-	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.phases ? { phases: saved.phases } : {}), worktree: Boolean(saved.worktreePath) });
+	// #123 residual: replay the provider pin with the model it belongs to. The
+	// value comes from the child's `run.json` record (above); `legion.db`'s
+	// `nodes` table has no provider column and is deliberately not migrated, so
+	// this must never be looked up there. Records written before the field
+	// existed simply have none — then no pin is replayed rather than a guessed one.
+	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
@@ -2066,6 +2072,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			},
 			options,
 		) ?? (() => {}),
+		/**
+		 * tps-decode-denominator D5: the measured `tok/s` denominator, read live off
+		 * whichever backend hosts the child (the routing facade delegates).
+		 * `undefined` stays `undefined` — the row then keeps `generationMs`, which is
+		 * a different statement from "measured 0".
+		 */
+		getLiveDecode: (name) => supervisor.decodeMs?.(name),
 		emitBusy: (active, label, children = []) => {
 			try { pi.events.emit("pi-legion:busy", active ? { active: true, label } : { active: false }); }
 			catch { /* optional display integration */ }
@@ -2387,6 +2400,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					team,
 					runtime,
 					settings,
+					// #123 residual: a revive that runs on a model chosen by THIS call must
+					// compute its provider pin from the same registry the launch path uses.
+					modelRegistry: ctx.modelRegistry,
+					// D-B8a.1: `continue`/`resume` may pass the `inherit` sentinel, which can
+					// only be resolved against THIS session's model. Same channel as the
+					// registry above — the control path has no other view of the session.
+					...(ctx.model ? { parentModel: `${ctx.model.provider}/${ctx.model.id}` } : {}),
 					legion: activeLegion,
 					...(activeLegion ? { postman: activeLegion.postman } : {}),
 				});
@@ -2560,6 +2580,28 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 }
 
 /**
+ * The env `applyTeam` resolves the team from (B9, D-B9.3).
+ *
+ * A root session keeps `process.env` verbatim — its behaviour must not move, and
+ * an explicit `PI_SUBAGENTS_TEAM` there still wins the same way it always did.
+ *
+ * An in-process child shares that very env with its parent, so the team the
+ * parent chose for THIS spawn cannot be read from it. It rides on the ALS child
+ * context instead (`ChildLaunchContext.team`, lifted off `SpawnInput.env` by
+ * `InProcessSupervisor`). Overlaying it on the env — rather than branching
+ * around `applyTeam` — keeps ONE resolution funnel for every session shape:
+ * env (`active team`) > `subagents.team` > `default`. Key presence decides, so
+ * a child spawned with an explicit `team: "default"` really means "no team" and
+ * beats a settings team; an absent context team leaves the chain untouched.
+ */
+function teamEnvForCatalog(): NodeJS.ProcessEnv {
+	const contextTeam = currentChildContext()?.team;
+	return contextTeam === undefined
+		? process.env
+		: { ...process.env, [TEAM_ENV]: contextTeam };
+}
+
+/**
  * Load the effective agent catalog for a request.
  *
  * User settings (`~/.pi/agent/settings.json`) merge
@@ -2592,7 +2634,7 @@ export function loadCatalog(
 		includeBuiltin: settings.disableBuiltins !== true,
 	});
 	const overridden = applyAgentOverrides(discovery.agents, settings.agentOverrides);
-	const teamResult = applyTeam(overridden, settings);
+	const teamResult = applyTeam(overridden, settings, teamEnvForCatalog());
 	const utilityWarnings = [...new Map(
 		[...overridden, ...teamResult.agents]
 			.filter((agent) => agent.utility && agent.allowNestedSubagents)
@@ -2667,6 +2709,22 @@ async function controlAction(input: {
 	team: ActiveTeam;
 	runtime: SessionRuntime;
 	settings: ReturnType<typeof loadSubagentSettings>;
+	/**
+	 * Parent model registry (`ExtensionContext.modelRegistry`), forwarded only so
+	 * `continue`/`resume` can price a `--provider` pin — computed for a model this
+	 * call chose, or validated for one replayed from the record (#123). Absent =
+	 * the record is replayed unvalidated and no pin is computed; never a new
+	 * pipeline.
+	 */
+	modelRegistry?: ProviderLookup;
+	/**
+	 * The parent session's model as `provider/id` (`ExtensionContext.model`),
+	 * forwarded for the same reason and through the same channel as
+	 * `modelRegistry`: a revive that asks for `model: "inherit"` (D-B8a.1) has no
+	 * other view of what it is supposed to inherit. Absent = this session has no
+	 * model, and `inherit` is refused exactly like it is at launch.
+	 */
+	parentModel?: string;
 }): Promise<AgentToolResult<unknown>> {
 	const { action, params, store, cwd } = input;
 
@@ -2977,6 +3035,19 @@ interface ChildContext {
 	found: NonNullable<ReturnType<typeof findChild>>;
 	orchestrator: Orchestrator;
 	runtime: SessionRuntime;
+	/**
+	 * Parent registry, used to price the `--provider` pin of a revive: computed for
+	 * a model THIS call chose, validated for one replayed from the record (#123).
+	 * Optional: a scope without a registry replays the record verbatim and computes
+	 * no new pin — it never guesses one.
+	 */
+	modelRegistry?: ProviderLookup;
+	/**
+	 * The parent session's model as `provider/id`, when this call runs inside a
+	 * session that has one. Only `reviveChild` reads it: `model: "inherit"` means
+	 * "THIS session's model", and the control path has no other view of it.
+	 */
+	parentModel?: string;
 }
 
 /**
@@ -3679,11 +3750,61 @@ async function reviveChild(
 			return ok(`${prefix} (live child steered).`);
 		}
 
+		// A `model` passed to THIS call is the caller's own choice and wins over the
+		// model recorded at the first launch; without it the recorded model is kept,
+		// so a resume cannot silently move a child to whatever the settings say now.
+		const explicitModel = params.model?.trim();
+		const recordedModel = found.child.model;
+		let revivedModel = explicitModel || recordedModel;
+		// D-B8a.1 / D-B8a.3: `inherit` is a launch INSTRUCTION ("this session's
+		// model"), not a model id. Handing the literal down would be a silent
+		// demotion: `modelCandidates` drops the sentinel, so the child would start
+		// with NO model at all — not the parent's, not the recorded one, and with the
+		// provider pin gone. Resolved here, where the parent session's model is
+		// visible; with nothing to inherit it is refused in the same shape a launch
+		// refuses it, and the way to keep the child's own model is named.
+		if (explicitModel === INHERIT_MODEL_SENTINEL) {
+			if (!ctx.parentModel) {
+				return fail(
+					`✗ ${action} ${name}: model 'inherit' has no parent session model to inherit. ` +
+						"Drop the `model` param to keep " +
+						(recordedModel
+							? `this child's recorded model (${recordedModel}).`
+							: "this child's recorded model."),
+					ErrorCodes.INVALID_PARAMS,
+				);
+			}
+			revivedModel = ctx.parentModel;
+		}
+		// #123 residual: `--provider` has to be replayed TOGETHER with the model it
+		// was computed for, or a bare id can resolve into a colliding static
+		// provider with no auth — the failure the first launch already pins against.
+		//
+		// REV-1.4: a model equal to the recorded one means the child did not move, so
+		// the pin recorded WITH that model is the better answer than a fresh lookup —
+		// a custom id is absent from the registry by definition, and unpinning it
+		// would re-open #123 for exactly those deployments. A model THIS call chose
+		// was never priced against the recorded pin, so it is computed fresh.
+		const sameAsRecorded = recordedModel !== undefined && revivedModel === recordedModel;
+		const pinned = sameAsRecorded ? found.child.modelProvider : providerForModel(ctx.modelRegistry, revivedModel);
+		// REV-1.4 (the #123 scene itself): the pin was computed while an EXTENSION
+		// provider was loaded, and this process has not loaded it. `--provider
+		// <unknown>` is a fatal child error — worse than an unpinned bare id — so a
+		// pin the current registry does not know is dropped instead of forced. No
+		// registry at all means nothing to check against: keep what the record says.
+		const revivedProvider =
+			pinned && ctx.modelRegistry && !ctx.modelRegistry.getAll().some((entry) => entry.provider === pinned)
+				? undefined
+				: pinned;
 		const handle = await orchestrator.launch({
 			agent: agentDef,
 			task: params.message,
 			name,
-			...(found.child.model ? { model: found.child.model } : {}),
+			...(revivedModel ? { model: revivedModel } : {}),
+			...(revivedProvider ? { modelProvider: revivedProvider } : {}),
+			// `preset` is NOT expanded on a revive, on purpose: the child resumes the
+			// model it was persisted with, so a later settings edit cannot move a
+			// session that is already in flight.
 			// #374 §4: a team declared its machine at FIRST launch; a resume in a
 			// later process must replay that declaration or the child falls back to
 			// the role card and its custom phase names read as `invalid_phase`.
@@ -3720,8 +3841,12 @@ async function reviveChild(
 		if (budgetCut) chargeRenewal(resumedChild);
 		await persistChild(ctx.store, ctx.found.runId, ctx.orchestrator, handle.name);
 		followChild(ctx, { watch: true });
+		// REV-1.5/B5: the same non-fatal model-resolution notice a launch renders
+		// (`  ⚠ name: …`), same shape and column — a revived child must not be the
+		// one silent path onto a model nobody registered.
+		const warning = handle.warning ? `\n  ⚠ ${handle.name}: ${handle.warning}` : "";
 		return ok(
-			`Resumed ${handle.name} from its session. Context preserved from ${handle.sessionFile}`,
+			`Resumed ${handle.name} from its session. Context preserved from ${handle.sessionFile}${warning}`,
 		);
 	} catch (error) {
 		// #309 D4: preserve the code the launcher already decided on (e.g.
@@ -4054,11 +4179,21 @@ async function launchStep(
 		const violation = checkModelScope(
 			resolved.model,
 			session.settings.modelScope,
-			"explicit",
+			// The REAL origin of the winning model: a per-run override or a preset is
+			// a deliberate choice (refusable), while `subagents.defaultModel`, an
+			// `inherit` or the parent model falling through is not (warn only).
+			// Hardcoding `"explicit"` here refused every inherited out-of-scope model,
+			// i.e. the operator's own configured default.
+			model.modelOrigin,
 		);
-		if (violation && violation.severity === "error") {
-			session.results.push(`✗ ${violation.message}`);
-			return;
+		if (violation) {
+			if (violation.severity === "error") {
+				session.results.push(`✗ ${violation.message}`);
+				return;
+			}
+			// Inherited model: report it and START ANYWAY. Refusing would break an
+			// existing configuration whose default model predates the allow-list.
+			session.results.push(`⚠ ${violation.message}`);
 		}
 
 		// Honor `name=` in this order: a per-item `tasks[]` handle wins over the
@@ -4118,6 +4253,12 @@ async function launchStep(
 		session.results.push(
 			`▶ ${handle.name} (${effective.name}) supervisor=${handle.spawnMode}${launchLineQueueSuffix(handle)}`,
 		);
+		// B5: an in-process spawn's model resolution may only have produced a
+		// WARNING (custom model id / invalid `:thinking` suffix). It is never fatal
+		// — but it must not be invisible either, or a child quietly runs on a model
+		// nobody registered. Queued launches render this after admission instead
+		// (`Handle.queued` carries no warning; the queue notice does).
+		if (handle.warning) session.results.push(`  ⚠ ${handle.name}: ${handle.warning}`);
 		session.onUpdate?.({
 			content: [
 				{
@@ -4140,7 +4281,11 @@ async function launchStep(
 			error instanceof SubagentError
 				? `${error.code}: ${error.message}`
 				: String(error);
-		session.results.push(`✗ ${step.agent}: ${message}`);
+		// R5 hint (D-H1/D-H2): an in-process model miss only ever reached the `✗`
+		// line. `spawnFailureHint` already knew the in-process Fix段 — append it
+		// here, through the pure helper, so the process-wide failure ring (which a
+		// later rpc doctor snippet reads) is never written from this path.
+		session.results.push(`✗ ${step.agent}: ${appendInprocessModelHint(message)}`);
 	}
 }
 
@@ -4398,6 +4543,25 @@ async function launchUtilityFamily(input: {
 	if (!plan.ok) return fail(plan.message, ErrorCodes.INVALID_PARAMS);
 
 	const catalog = loadCatalog(input.sessionCwd, input.cwd, undefined);
+	/**
+	 * `modelScope` warnings for this batch, in step order.
+	 *
+	 * Collected here because the result channel (`results`) is created further
+	 * down, after the launch plan is resolved; a warning that is dropped is
+	 * exactly the silent refusal this path used to give inherited models.
+	 */
+	const scopeWarnings: string[] = [];
+	/**
+	 * Early exit that still reports the warnings collected so far.
+	 *
+	 * `results` only exists once the whole launch plan is resolved, so a refusal
+	 * raised inside the prep loop would drop the inherited-model warnings already
+	 * collected for its sibling steps — the caller is owed those lines even when
+	 * this batch ends in `fail()`. With nothing collected the message is passed
+	 * through byte for byte.
+	 */
+	const failUtility = (text: string, code: string): AgentToolResult<unknown> =>
+		scopeWarnings.length > 0 ? fail(`${scopeWarnings.join("\n")}\n${text}`, code) : fail(text, code);
 	const prepared: Array<{
 		step: UtilityTaskItem;
 		agent: AgentConfig;
@@ -4419,7 +4583,7 @@ async function launchUtilityFamily(input: {
 			}),
 		);
 		if (explicitlyMentionedByTeam) {
-			return fail(
+			return failUtility(
 				unknownAgentLineForCatalog(
 					catalog.agents,
 					catalog.allAgents,
@@ -4432,13 +4596,13 @@ async function launchUtilityFamily(input: {
 		}
 		const agent = selectedAgent ?? fallbackAgent;
 		if (!agent?.utility) {
-			return fail(
+			return failUtility(
 				`not a utility agent: ${step.agent} (mark it with 'utility: true')`,
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
 		if (agent.disabled) {
-			return fail(`utility agent is disabled: ${agent.name}`, ErrorCodes.DISABLED);
+			return failUtility(`utility agent is disabled: ${agent.name}`, ErrorCodes.DISABLED);
 		}
 		try {
 			const resolvedStep = resolveStepModel({
@@ -4457,7 +4621,12 @@ async function launchUtilityFamily(input: {
 				resolvedStep.modelOrigin,
 			);
 			if (violation?.severity === "error") {
-				return fail(violation.message, ErrorCodes.INVALID_PARAMS);
+				return failUtility(violation.message, ErrorCodes.INVALID_PARAMS);
+			}
+			// Inherited (not chosen) model: warn and launch anyway — same rule as
+			// `launchStep`, surfaced through this path's own result channel below.
+			if (violation) {
+				scopeWarnings.push(`⚠ ${step.agent}: ${violation.message}`);
 			}
 			prepared.push({
 				step,
@@ -4466,7 +4635,7 @@ async function launchUtilityFamily(input: {
 				modelOrigin: resolvedStep.modelOrigin,
 			});
 		} catch (error) {
-			return fail(`✗ ${step.agent}: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
+			return failUtility(`✗ ${step.agent}: ${error instanceof Error ? error.message : String(error)}`, ErrorCodes.INVALID_PARAMS);
 		}
 	}
 
@@ -4510,7 +4679,7 @@ async function launchUtilityFamily(input: {
 			path: parseNestedPathEnv(process.env.PI_SUBAGENT_PARENT_PATH),
 			herdr: { supervisor: currentProcessSpawnMode() },
 		});
-	if (!run) return fail("vexillatio parent run is not available", ErrorCodes.NOT_FOUND);
+	if (!run) return failUtility("vexillatio parent run is not available", ErrorCodes.NOT_FOUND);
 	const runId = run.runId;
 	const timeoutMs = input.params.timeoutMs ?? 600_000;
 	// §2.6: continue numbering from this parent's existing children only —
@@ -4526,7 +4695,7 @@ async function launchUtilityFamily(input: {
 	const names = new Map<UtilityTaskItem, string>();
 	for (let i = 0; i < prepared.length; i++) names.set(prepared[i]!.step, allocated[i]!);
 
-	const results: string[] = [];
+	const results: string[] = [...scopeWarnings];
 	const stillRunning = new Set<string>();
 	const launches = await Promise.all(prepared.map(async (item) => {
 		const cwd = item.step.cwd ? path.resolve(input.cwd, item.step.cwd) : input.cwd;
@@ -4625,8 +4794,16 @@ async function launchUtilityFamily(input: {
 		retire: (opts?: RetireOptions) => Promise<void>;
 	}> = [];
 	for (const launch of launches) {
-		if ("error" in launch) results.push(`✗ ${launch.item.agent.name}: ${launch.error}`);
-		else handles.push(launch.value);
+		// Same hint as `launchStep`: the utility family is the other place a failed
+		// spawn becomes a line, and it must not lose the fix path either. The
+		// collected `scopeWarnings` already sit at the head of `results`, so
+		// appending here cannot bypass them.
+		if ("error" in launch) {
+			// `String(...)` keeps the pre-hint rendering for the (impossible) undefined
+			// case byte-identical.
+			const failure = String(launch.error);
+			results.push(`✗ ${launch.item.agent.name}: ${appendInprocessModelHint(failure)}`);
+		} else handles.push(launch.value);
 	}
 
 	const followUtility = (handle: (typeof handles)[number], watch: boolean): void => {

@@ -147,6 +147,7 @@ function buildView(): ViewData {
 		tokens: 0,
 		tokensOut: 0,
 		generationMs: 0,
+		decodeMs: 0,
 		...opts,
 	});
 	const nodes: VizNode[] = [

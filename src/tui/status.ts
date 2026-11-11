@@ -67,6 +67,17 @@ export interface StatusEntry {
 	 * user/toolResult). Denominator for t/s when known.
 	 */
 	generationMs?: number;
+	/**
+	 * Measured decode ms (first streaming delta → last), folded by the supervisor
+	 * from the child's own event stream — contract `tps-decode-denominator-v1` D5.
+	 * Preferred `t/s` denominator: `generationMs` is the whole request
+	 * (prefill/TTFT included), which under-reports short turns by 2–12x.
+	 *
+	 * Optional on purpose: absent = nobody measured this row, and the row falls back
+	 * to `generationMs`. A measured 0 is the opposite answer — a real "no decoding
+	 * yet" — and also falls back, because dividing by it is meaningless.
+	 */
+	decodeMs?: number;
 	/** Legion tree identity; omitted for callers that still use the flat roster. */
 	nodeId?: string;
 	parentId?: string | null;
@@ -335,9 +346,20 @@ function detailBits(entry: StatusEntry): string[] {
 	if (entry.worktreeBranch) {
 		bits.push(`wt ${formatWorktreeBranch(entry.worktreeBranch)}`);
 	}
-	// Lifetime avg output tok/s over generationMs (not the header 60s window / live-only nowRate).
-	if (entry.tokensOut && entry.tokensOut > 0 && entry.generationMs && entry.generationMs >= 1_000) {
-		bits.push(`${formatTokensCompact(Math.round(entry.tokensOut / (entry.generationMs / 1_000)))} avg t/s`);
+	// Lifetime avg output tok/s. D7: the same denominator choice as the header —
+	// measured decode when the supervisor has one, `generationMs` when it does not.
+	//
+	// D7-b: each axis keeps its OWN trust floor. A flat `>= 1_000` kills the decode
+	// axis by construction: decode is smaller than generation by the ≈4.3s
+	// per-request cost, so a single 60-token message (≈438ms of decoding) used to
+	// show "13 avg t/s" and would vanish — the new denominator must not make a row
+	// LESS informative than the old one. 200ms mirrors `MIN_RATE_DECODE_MS` (the
+	// window clamp); 1_000 stays for the generation axis, whose values are seconds.
+	const usesDecode = entry.decodeMs !== undefined && entry.decodeMs > 0;
+	const denomMs = usesDecode ? entry.decodeMs : entry.generationMs;
+	const floorMs = usesDecode ? 200 : 1_000;
+	if (entry.tokensOut && entry.tokensOut > 0 && denomMs && denomMs >= floorMs) {
+		bits.push(`${formatTokensCompact(Math.round(entry.tokensOut / (denomMs / 1_000)))} avg t/s`);
 	}
 	return bits;
 }

@@ -38,9 +38,20 @@ export interface VizNode {
 	tokensOut: number;
 	/**
 	 * Cumulative model-generation wall ms (assistant − prior user/toolResult).
-	 * Denominator for tok/s when > 0.
+	 * Fallback denominator for tok/s.
 	 */
 	generationMs: number;
+	/**
+	 * Measured decode ms (first streaming delta → last), cumulative and aligned
+	 * with {@link generationMs} on the same axis — contract `tps-decode-denominator-v1`
+	 * D5. REQUIRED, not optional: `nodesFromEntries` always fills it
+	 * (`entry.decodeMs ?? 0`), and making it optional would let a fixture that
+	 * forgets it silently sample a 0 decode series instead of failing `tsc`.
+	 *
+	 * `> 0` means the sampler can difference it; `0` means nobody measured this
+	 * row yet, and `rate.ts` then falls back to `generationMs`.
+	 */
+	decodeMs: number;
 	/** Unix ms start of the current turn, when the status entry recorded one. */
 	currentTurnStartedAt?: number;
 	/** Unix ms the current turn settled. Absent while it is still in flight. */
@@ -122,6 +133,7 @@ export function nodesFromEntries(entries: readonly StatusEntry[]): VizNode[] {
 			tokens: Math.max(0, entry.tokensTotal ?? 0),
 			tokensOut: Math.max(0, entry.tokensOut ?? 0),
 			generationMs: Math.max(0, entry.generationMs ?? 0),
+			decodeMs: Math.max(0, entry.decodeMs ?? 0),
 			...(entry.currentTurnStartedAt !== undefined ? { currentTurnStartedAt: entry.currentTurnStartedAt } : {}),
 			...(entry.currentTurnEndedAt !== undefined ? { currentTurnEndedAt: entry.currentTurnEndedAt } : {}),
 			...(entry.turns !== undefined && entry.turns > 0 ? { turns: entry.turns } : {}),

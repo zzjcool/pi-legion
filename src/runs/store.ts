@@ -47,6 +47,11 @@ import {
  *   become `invalid_phase`. Only ever written for the role the declaration is
  *   forwarded to (`centurion`, see `Orchestrator.lineageEnv`), because replaying a
  *   card machine as a live DECLARATION would be refused by the launch guards.
+ * - `ChildRecord.modelProvider` (#123): the provider that owned `model` at first
+ *   launch, stored as a PAIR with it so `continue`/`resume` can replay both.
+ *   run.json only — `legion.db`'s `nodes` table has no provider column and the
+ *   schema is deliberately not upgraded, so a record written before this field
+ *   existed (or one whose provider was never pinned) simply has none.
  */
 declare module "../shared/types.ts" {
 	interface ChildRecord {

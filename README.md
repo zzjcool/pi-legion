@@ -437,9 +437,11 @@ The `PI_SUBAGENTS_TEAM` environment variable takes precedence over
 is used. Team definitions have a description and an ordered `members` list;
 each member can be a role-name string or an object with an `agent` name and
 per-member overrides. Object member overrides (for example `model` or
-`thinking`) take precedence over those fields in the role card's frontmatter;
-omitted override fields continue to use their normal role/configuration
-values.
+`thinking`) take precedence over those fields in the role card's frontmatter
+and over `subagents.agentOverrides` (including the provider-scoped
+`agentOverridesByProvider`), but lose to a referenced preset and to a `model`
+passed for this call; omitted override fields continue to use their normal
+role/configuration values.
 
 Teams may also set optional `parentContext` / `childContext` (same value forms
 as the global keys, including `@path` and `false`). When the active team
@@ -672,8 +674,10 @@ Keep the run records and session files while the tree may need to resume.
 Pi Legion runs `kind: pi` roles only. `kind` is still a legal frontmatter key,
 but `pi` is the only accepted value: a non-`pi` value is ignored (one note on
 stderr) and the role launches as `kind: pi`. The same holds for
-`subagents.presets.<role>.kind` and `subagents.agentOverrides.<role>.kind` —
-those three spots are the only places a role's `kind` can come from.
+`subagents.presets.<name>.kind` and `subagents.agentOverrides.<role>.kind` —
+those three spots are the only places a role's `kind` can come from. A preset is
+named, not role-scoped: `presets.<name>` is looked up by the `preset:` reference
+itself (role card, override or tool call).
 
 ```yaml
 ---

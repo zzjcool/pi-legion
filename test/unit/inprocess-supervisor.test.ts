@@ -15,8 +15,10 @@ import {
 import { RoutingSupervisor } from "../../src/supervisor/routing-supervisor.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 import { currentChildContext } from "../../src/supervisor/child-context.ts";
+import { TEAM_ENV, resolveActiveTeamName } from "../../src/agents/teams.ts";
 import { inProcessDepth } from "../../src/supervisor/inprocess-depth.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import { resolveStepModel } from "../../src/agents/step-model.ts";
 import {
 	discoveredHostExtensions,
 	resetExtensionDiscoveryCache,
@@ -31,6 +33,7 @@ import {
 	type SessionStats as SdkSessionStats,
 } from "@earendil-works/pi-coding-agent";
 import { statSync, writeFileSync } from "node:fs";
+import { MODEL_WARNING } from "../helpers/model-warning.ts";
 
 /** Raw answer from the SDK's `AgentSession.steer()` (#313): `"handled"` | `"queued"`. */
 type RawSteerDisposition = "queued" | "handled";
@@ -529,6 +532,37 @@ test("inprocess plan: tools + model + systemPrompt replace/append", () => {
 	assert.equal(appendPlan.modelRef, undefined);
 });
 
+/**
+ * B8b end-to-end on the in-process side: the launch layer strips the level that
+ * a configured `thinking` replaces, and THIS layer re-attaches the configured
+ * one as the model ref.
+ *
+ * Asserting `plan.modelRef` (not the spawn input) is the point: the ref is built
+ * by the same `applyThinkingSuffix` that builds the rpc argv, and it KEEPS any
+ * level it finds — so an unstripped model would silently keep `:high` while the
+ * operator configured `max`, and the two backends would agree on the wrong
+ * answer.
+ */
+test("inprocess plan e2e: a configured `thinking` beats the level inside the model", () => {
+	const resolved = resolveStepModel({
+		agent: testAgent({ model: "cb/x:high", thinking: "max" }),
+		step: {},
+		params: {},
+		settings: {},
+	});
+	const plan = buildInProcessSessionPlan({
+		name: "root.worker",
+		cwd: "/tmp/ws",
+		agent: resolved.agent,
+		sessionFile: "/tmp/ws/worker.jsonl",
+		...(resolved.resolved.model ? { model: resolved.resolved.model } : {}),
+		...(resolved.agent.thinking !== undefined
+			? { thinking: resolved.agent.thinking }
+			: {}),
+	});
+	assert.equal(plan.modelRef, "cb/x:max");
+});
+
 test("inprocess plan: omit tools leaves SDK default; utility skips vexillatio", () => {
 	const empty = buildInProcessSessionPlan({
 		name: "u",
@@ -648,6 +682,69 @@ test("inprocess: spawnChild forwards model/thinking/childContext to factory", as
 		assert.deepEqual(captured[0]!.agent.tools, ["read"]);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── B5: a non-fatal model-resolution notice leaves through the handle ─────
+
+/**
+ * `resolveCliModel`'s `warning` (custom model id / invalid `:thinking` suffix)
+ * used to be dropped here, so a child ran silently on a model nobody had
+ * registered. It is NOT fatal — a custom id is a supported usage — so it must
+ * leave as data on the handle, never as a thrown error.
+ *
+ * The fake factory below does the emitting, so the `model` on the spawn input is
+ * NOT what produces the notice; it is there because a real spawn would carry it.
+ */
+test("inprocess: a factory's `onNotice` becomes `handle.warning` without failing the spawn", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-notice-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async (input) => {
+			input.onNotice?.(MODEL_WARNING);
+			return new FakeSession();
+		},
+	});
+	try {
+		const handle = await supervisor.spawnChild({
+			...testInput(root),
+			model: "cb/custom-thing",
+		});
+		assert.equal(handle.warning, MODEL_WARNING);
+		assert.equal(supervisor.isAlive("root.worker"), true, "a warning must not fail the spawn");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("inprocess: every notice is kept, joined in order", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-notice2-"));
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async (input) => {
+			input.onNotice?.("first");
+			input.onNotice?.("second");
+			return new FakeSession();
+		},
+	});
+	try {
+		const handle = await supervisor.spawnChild(testInput(root));
+		assert.equal(handle.warning, "first; second");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+/** Anti-regression: a silent spawn must not grow an empty `warning` field. */
+test("inprocess: a silent spawn carries no `warning` key at all", async () => {
+	const h = harness();
+	try {
+		const input = testInput(h.root);
+		const handle = await h.supervisor.spawnChild(input);
+		assert.deepEqual(handle, { name: "root.worker", sessionFile: input.sessionFile });
+		assert.equal(Object.hasOwn(handle, "warning"), false);
+	} finally {
+		h.close();
 	}
 });
 
@@ -939,6 +1036,98 @@ test("inprocess: missing childLaunchContext falls back to a derived context", as
 		assert.equal(seen.utility, false);
 		assert.equal(seen.acceptanceRole, "writer");
 		assert.equal(seen.nodeId, undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("B9: the team the parent chose travels from SpawnInput.env into the child context", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-team-"));
+	let seenDuringFactory: ReturnType<typeof currentChildContext>;
+	let seenDuringPrompt: ReturnType<typeof currentChildContext>;
+	class ProbeSession extends FakeSession {
+		override async prompt(text: string): Promise<void> {
+			seenDuringPrompt = currentChildContext();
+			await super.prompt(text);
+		}
+	}
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			seenDuringFactory = currentChildContext();
+			return new ProbeSession();
+		},
+	});
+	try {
+		// The PROVIDED branch: legion spawns hand a full context over and the
+		// resolver returns early, so a merge placed only in the fallback branch
+		// would leave exactly the node-backed (grand)children team-blind.
+		await supervisor.spawnChild({
+			...testInput(root),
+			env: { [TEAM_ENV]: "frontend" },
+			childLaunchContext: {
+				nodeId: "node-11",
+				allowNested: true,
+				utility: false,
+				spawnMode: "inprocess",
+			},
+		});
+		assert.equal(seenDuringFactory?.team, "frontend");
+		assert.equal(seenDuringPrompt?.team, "frontend");
+		// The rest of the provided identity is untouched by the team merge.
+		assert.equal(seenDuringPrompt?.nodeId, "node-11");
+		assert.deepEqual(seenDuringPrompt?.budget, undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("B9: the derived context carries the team too, and never invents one", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-team-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	try {
+		// 1) the fallback branch (no childLaunchContext) must merge it as well;
+		// 2) `"default"` is carried verbatim — it is a real choice, and whether it
+		//    beats a settings team is decided downstream (teams.test.ts asserts
+		//    that against the catalog; this layer must not swallow the value);
+		// 3) no key at all must stay `undefined` (no invented team);
+		// 4) a BLANK value is the one case where key presence and truthiness stop
+		//    agreeing. `teamFromSpawnEnv` carries key presence (a `"default"` that
+		//    must beat settings cannot be confused with "absent"), so `""` reaches
+		//    the context verbatim; `resolveActiveTeamName` trims it to "nothing
+		//    selected" and falls through to settings. The two agree on everything
+		//    OBSERVABLE — a blank selection selects no team — which is the property
+		//    asserted below, not a new truth about `""`.
+		await supervisor.spawnChild({ ...testInput(root, "root.a"), env: { [TEAM_ENV]: "frontend" } });
+		await supervisor.spawnChild({ ...testInput(root, "root.b"), env: { [TEAM_ENV]: "default" } });
+		await supervisor.spawnChild({
+			...testInput(root, "root.c"),
+			env: { PI_SUBAGENT_MAX_TOOL_CALLS: "3" },
+		});
+		await supervisor.spawnChild(testInput(root, "root.d"));
+		await supervisor.spawnChild({ ...testInput(root, "root.e"), env: { [TEAM_ENV]: "" } });
+		assert.deepEqual(
+			contexts.map((context) => context?.team),
+			["frontend", "default", undefined, undefined, ""],
+		);
+		// The downstream reader turns that blank into the same answer it gives an
+		// absent key: "no team chosen, use settings".
+		assert.equal(
+			resolveActiveTeamName({ team: "settings-team" }, { [TEAM_ENV]: "" }).name,
+			resolveActiveTeamName({ team: "settings-team" }, {}).name,
+			"a blank env value and an absent one are observably equal downstream",
+		);
+		assert.equal(resolveActiveTeamName({ team: "settings-team" }, { [TEAM_ENV]: "" }).source, "settings");
+		// The neighbouring env-derived field still works: budget and team are read
+		// off the same object, independently.
+		assert.deepEqual(contexts[2]?.budget, { maxToolCalls: 3 });
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

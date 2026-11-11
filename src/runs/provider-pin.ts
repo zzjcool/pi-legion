@@ -15,6 +15,8 @@
  * provider is the one that can authenticate.
  */
 
+import { stripThinkingSuffix } from "../agents/model-scope.ts";
+
 /** Minimal registry surface `providerForModel` needs (subset of ModelRegistry). */
 export interface ProviderLookup {
 	getAll(): Array<{ provider: string; id: string }>;
@@ -35,7 +37,12 @@ export function providerForModel(
 	model: string | undefined,
 ): string | undefined {
 	if (!registry || !model) return undefined;
-	const bare = model.trim();
+	// `x/y:high` is a model id PLUS a thinking level, never a registry id: the
+	// registry stores `x/y`. Matching the raw string would answer `undefined` for
+	// every per-call model that carries its suffix, i.e. silently stop pinning on
+	// exactly the launches `continue`/`resume` replay (`stripThinkingSuffix`
+	// strips only KNOWN levels, so `provider/model:variant` survives intact).
+	const bare = stripThinkingSuffix(model.trim());
 	if (!bare) return undefined;
 
 	const models = registry.getAll();

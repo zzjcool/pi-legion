@@ -41,6 +41,19 @@ export interface ChildHandle {
 	name: string;
 	sessionFile: string;
 	pid?: number;
+	/**
+	 * In-process-only, NON-FATAL model-resolution notice (B5).
+	 *
+	 * `resolveCliModel` answers a `warning` for two legitimate situations — an
+	 * unregistered model id ("Using custom model id", a supported usage) and an
+	 * invalid `:thinking` suffix. Neither may fail a spawn, but both used to be
+	 * dropped on the floor, so a child could run on a model nobody registered
+	 * with nothing said about it. The in-process backend forwards them here; the
+	 * rpc backend never sets the field (its child reports the same thing itself).
+	 *
+	 * Absent — not empty — when the spawn said nothing.
+	 */
+	warning?: string;
 }
 
 /** Process id and process group id for one descendant of a supervised child. */
@@ -504,6 +517,33 @@ export interface LegionSupervisor {
 	 * readings, so the value carries no claim about what the child achieved.
 	 */
 	lastEventAt?(name: string): number | undefined;
+	/**
+	 * Measured decode ms for `name` — the cumulative first-delta→last-delta wall
+	 * clock this backend observed over that child's WHOLE LIFE, or `undefined` when
+	 * it has never observed the name at all.
+	 *
+	 * This is the `tok/s` denominator (contract
+	 * `docs/contracts/tps-decode-denominator-v1.md` D4): it replaces the
+	 * request-inclusive `generationMs`, which folds prompt prefill into the number
+	 * and under-reports short agentic turns by 2–12x.
+	 *
+	 * Frozen by D4-b: the answer is a lifetime fact, NOT a liveness query. A
+	 * retired/exited child — one this backend has already dropped from its live
+	 * registry — must keep answering its last total, so an idle row does not swing
+	 * back to `generationMs` at retire time (measured: 136 → 69 avg t/s on an
+	 * unchanged row). Implementations keep a bounded in-memory archive per name for
+	 * exactly that; only a name that was never observed answers `undefined`.
+	 *
+	 * Optional for the same reason as `inFlightTool`: a test double or a backend
+	 * predating this read has NO OBSERVATION, and absence must stay distinguishable
+	 * from a measured 0 (which is a real answer: a freshly spawned child whose first
+	 * message has not settled yet). Callers fall back to `generationMs` on
+	 * `undefined`.
+	 *
+	 * Deliberately NOT a DB column and NOT part of any wire format: it is a
+	 * session-derived live field, so the frozen ledger schema stays untouched.
+	 */
+	decodeMs?(name: string): number | undefined;
 	/**
 	 * What this backend can actually observe (#323).
 	 *

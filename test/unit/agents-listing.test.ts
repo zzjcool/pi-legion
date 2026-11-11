@@ -373,6 +373,43 @@ test("renderAgentsListing: unresolvable configuration is reported, not guessed",
 	assert.match(text, /unresolvable/);
 });
 
+test("renderAgentsListing: the model line shows the RUNNING form, with `thinking` appended", () => {
+	// The line described the resolved id while the child actually starts with
+	// `applyThinkingSuffix(model, thinking)` — so a role whose reasoning level
+	// came from `thinking` was displayed as if it had none (`cb/x` vs `cb/x:max`).
+	const text = renderAgentsListing({
+		agents: [stubAgent({ name: "strong", model: "cb/x", thinking: "max" })],
+		scope: "user",
+		projectAgentsDir: null,
+		builtinAgentsDir: "/pkg/agents",
+		settings: {},
+	});
+	assert.match(text, /model: cb\/x:max \(the agent's frontmatter\)/);
+	assert.doesNotMatch(text, /model: cb\/x \(the agent's frontmatter\)/);
+});
+
+/**
+ * D-B8a.4: `inherit` with no parent model is a REFUSAL, and the listing says so.
+ *
+ * The refusal is thrown by `resolveStepModel` (D-B8a.1), so it is the catch below
+ * that renders this line — the former success-path branch for a model-less
+ * `inherit` was unreachable and has been removed.
+ */
+test("renderAgentsListing: an `inherit` role with no parent model says a launch would refuse it", () => {
+	// `inherit` used to be reported as `(agent CLI default)` — a working
+	// configuration. A launch from a session with no model is REFUSED (B8a.1),
+	// so the line must say that instead of naming a fallback nobody would get.
+	const text = renderAgentsListing({
+		agents: [stubAgent({ name: "heir", model: "inherit" })],
+		scope: "user",
+		projectAgentsDir: null,
+		builtinAgentsDir: "/pkg/agents",
+		settings: {},
+	});
+	assert.match(text, /needs a parent session model — a launch would refuse this/);
+	assert.doesNotMatch(text, /\(agent CLI default\)/);
+});
+
 test("renderAgentsListing: alias and unenforced fields are surfaced", () => {
 	const text = renderAgentsListing({
 		agents: [
@@ -594,6 +631,32 @@ test("command: settings flow through — override model + disableBuiltins", asyn
 			// builtin layer gone, and the listing says why
 			assert.doesNotMatch(text, /  worker\n/);
 			assert.match(text, /builtin layer disabled by subagents\.disableBuiltins/);
+		},
+	);
+});
+
+test("command: a team member `model` shows the team override label", async () => {
+	// The listing drives the real loadCatalog → applyTeam → resolveStepModel →
+	// classifyModelOrigin path, so the label is the launch path's own verdict:
+	// a team member's model must read as the member override, not frontmatter.
+	await withSandbox(
+		{
+			settings: {
+				disableBuiltins: true,
+				team: "value",
+				teams: {
+					value: { members: [{ agent: "search", model: "cb/glm-5.3" }] },
+				},
+			},
+			extraAgents: {
+				"search.md": "---\nname: search\ndescription: s\n---\np",
+			},
+		},
+		async ({ pi, projectRoot }) => {
+			const text = await invoke(pi, "", projectRoot);
+			assert.ok(text);
+			assert.match(text, /Active team: value/);
+			assert.match(text, /model: cb\/glm-5\.3 \(the team member override\)/);
 		},
 	);
 });

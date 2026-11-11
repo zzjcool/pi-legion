@@ -39,7 +39,7 @@ function scenario(): ViewData {
 	const sampler = new RateSampler();
 	const snap = (seconds: number): VizNode[] => {
 		const nodes: VizNode[] = [
-			{ id: "root", name: "legion-0", role: "centurion", parentId: null, depth: 0, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0 },
+			{ id: "root", name: "legion-0", role: "centurion", parentId: null, depth: 0, status: "running", startedAt: T0, tokens: 0, tokensOut: 0, generationMs: 0, decodeMs: 0 },
 		];
 		for (let i = 0; i < 8; i++) {
 			const role = ROLES[i % ROLES.length]!;
@@ -57,6 +57,7 @@ function scenario(): ViewData {
 				tokens,
 				tokensOut: tokens,
 				generationMs: Math.max(1, seconds) * 1_000,
+				decodeMs: 0,
 			});
 		}
 		return nodes;
