@@ -9,7 +9,12 @@ import {
 	spawnFailureHint,
 	withSpawnFailureHint,
 } from "../../src/extension/spawn-hints.ts";
-import { INPROCESS_MODEL_FAILURE } from "../helpers/inprocess-failure.ts";
+import {
+	CREDENTIAL_FIX_ADVICE,
+	INPROCESS_CREDENTIAL_FAILURE,
+	INPROCESS_MODEL_FAILURE,
+	MODEL_MISS_ADVICE,
+} from "../helpers/inprocess-failure.ts";
 
 test("looksLikeMissingModel detects pi's model errors", () => {
 	assert.equal(looksLikeMissingModel('Error: Model "workbuddy/x:high" not found. Use --list-models'), true);
@@ -170,4 +175,66 @@ test("appendInprocessModelHint: pure gate, appended once, byte-identical otherwi
 
 	// The gate is case-insensitive, like `MODEL_NOT_FOUND`.
 	assert.match(appendInprocessModelHint("INPROCESS MODEL RESOLVE FAILED for 'x'"), /Hint: /);
+});
+
+// ── R7: a credential failure is not a model miss ─────────────────────────────
+//
+// `spawnFailureHint` only knows the model-miss wording, so an in-process child
+// rejected for `No API key found for "x"` reached the caller with NO hint at
+// all. Worse, `inprocess model resolve failed … No matching provider is
+// authenticated.` (the SDK's ambiguous-provider branch) matched the model gate
+// and got advice to edit `models.json` / add an extension — while the only
+// repair that works is `/login`.
+
+test("R7: a missing API key is diagnosed as authentication, not as a model miss", () => {
+	const hinted = appendInprocessModelHint(INPROCESS_CREDENTIAL_FAILURE);
+	assert.ok(
+		hinted.startsWith(INPROCESS_CREDENTIAL_FAILURE),
+		"the original failure survives verbatim as the prefix",
+	);
+	assert.match(hinted, CREDENTIAL_FIX_ADVICE, "the fix that actually creates the credential");
+	assert.doesNotMatch(hinted, MODEL_MISS_ADVICE, "editing models.json cannot create a credential");
+	assert.doesNotMatch(hinted, /PI_LEGION_CHILD_EXTENSIONS/);
+	assert.equal((hinted.match(/Hint:/g) ?? []).length, 1);
+});
+
+test("R7: an ambiguous-provider resolve failure routes to the credential hint, not the model hint", () => {
+	// The message contains BOTH the in-process resolve marker AND a credential
+	// root cause. The root cause wins: the model hint would teach the wrong repair.
+	const message = "inprocess model resolve failed for 'p/m': No matching provider is authenticated.";
+	const hinted = appendInprocessModelHint(message);
+	assert.match(hinted, CREDENTIAL_FIX_ADVICE);
+	assert.doesNotMatch(
+		hinted,
+		MODEL_MISS_ADVICE,
+		`a credential problem must not be reported as a declaration problem:\n${hinted}`,
+	);
+	assert.doesNotMatch(hinted, /inprocess children resolve models via ModelRuntime/);
+});
+
+test("R7: a genuine model miss still gets the model hint (regression guard)", () => {
+	const hinted = appendInprocessModelHint(INPROCESS_MODEL_FAILURE);
+	assert.match(hinted, MODEL_MISS_ADVICE);
+	assert.match(hinted, /PI_LEGION_CHILD_EXTENSIONS/);
+	assert.doesNotMatch(hinted, CREDENTIAL_FIX_ADVICE, "a model name is not an authentication problem");
+});
+
+test("R7: an already-hinted failure is never hinted twice", () => {
+	// A credential failure that already carries a hint stays byte-identical…
+	const credential = `${INPROCESS_CREDENTIAL_FAILURE}\n\nHint: run \`/login\` first.`;
+	assert.equal(appendInprocessModelHint(credential), credential);
+	// …and so does one carrying an auto-doctor section, marker or not.
+	const doctor = `${INPROCESS_MODEL_FAILURE}\n\n--- Legion auto-doctor ---\nmodels: ghost/model`;
+	assert.equal(appendInprocessModelHint(doctor), doctor);
+});
+
+test("R7: a hint section that OPENs the message counts too (no leading blank line)", () => {
+	// The SDK's rejection is often the whole text, so the `Hint: ` line is the
+	// first line — `/^Hint: /` with no preceding `\n\n`. The old `\n\n`-only gate
+	// missed it and appended a second `Fix:` block to the same message.
+	const opening = "Hint: run `/login workbuddy` and retry.";
+	assert.equal(appendInprocessModelHint(opening), opening);
+	// A marker + an opening hint is still one section, not two.
+	const openingWithMarker = `Hint: run \`/login workbuddy\`\n${INPROCESS_MODEL_FAILURE}`;
+	assert.equal(appendInprocessModelHint(openingWithMarker), openingWithMarker);
 });

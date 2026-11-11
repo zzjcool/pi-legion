@@ -24,7 +24,8 @@ import {
 	discoveredHostExtensions,
 	resetExtensionDiscoveryCache,
 } from "../../src/runs/extension-inheritance.ts";
-import { buildPiArgs } from "../../src/runs/args.ts";
+import { buildPiArgs, LEGION_IDENTITY_ENV_KEYS, LEGION_PHASES_ENV } from "../../src/runs/args.ts";
+import { parsePhaseMachine } from "../../src/agents/agents.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 import { ErrorCodes } from "../../src/shared/types.ts";
 import type { NestedPathEntry } from "../../src/shared/types.ts";
@@ -1254,6 +1255,222 @@ test("R6/F2: an empty PI_SUBAGENT_ROLE is no role — the key is absent, not \"\
 			"no `role` key at all — `role: \"\"` is what shadows the env fallback",
 		);
 		assert.equal(contexts[0]?.role, undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ── R7: the declared phase machine rides the same ALS channel ───────────────
+//
+// `PI_LEGION_PHASES` is written by `Orchestrator.lineageEnv` into the spawn env,
+// which is the rpc child's real environment. An in-process child shares the
+// HOST's `process.env`, so `phaseMachineForNode` read nothing there and a
+// declared machine silently degraded to the role card — every custom phase name
+// then failed `invalid_phase` at run time. The machine therefore travels on
+// `ChildLaunchContext.phases`, lifted off `SpawnInput.env` here.
+
+/** `spec → impl → ship → done`: names the built-in machine has never heard of. */
+const R7_MACHINE = {
+	start: "spec",
+	phases: [
+		{ id: "spec", next: [{ to: "impl" }] },
+		{ id: "impl", next: [{ to: "ship" }] },
+		{ id: "ship", next: [{ to: "done", require: ["verification_passed"] }] },
+	],
+};
+
+/** A second machine, so "A's declaration leaked into B" is observable. */
+const R7_OTHER_MACHINE = {
+	start: "audit",
+	phases: [{ id: "audit", next: [{ to: "done" }] }],
+};
+
+function r7Phases(value: unknown) {
+	return parsePhaseMachine(JSON.stringify(value), LEGION_PHASES_ENV);
+}
+
+test("R7: the declared machine rides the spawn env into the child context (both branches)", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-phases-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	const expected = r7Phases(R7_MACHINE);
+	assert.ok(expected, "the fixture must survive the production parser");
+	try {
+		// 1) the PROVIDED branch (legion spawns hand a full context over);
+		await supervisor.spawnChild({
+			...testInput(root, "root.a"),
+			env: { [LEGION_PHASES_ENV]: JSON.stringify(R7_MACHINE) },
+			childLaunchContext: {
+				nodeId: "node-41",
+				allowNested: true,
+				utility: false,
+				spawnMode: "inprocess",
+			},
+		});
+		// 2) the fallback branch (no childLaunchContext): the provided branch returns
+		//    early, so a merge placed only there would leave root-level in-process
+		//    children phase-blind again — the exact shape of the B9/R6 misses.
+		await supervisor.spawnChild({
+			...testInput(root, "root.b"),
+			env: { [LEGION_PHASES_ENV]: JSON.stringify(R7_MACHINE) },
+		});
+		assert.deepEqual(contexts.map((context) => context?.phases), [expected, expected]);
+		// The custom phase name survives the channel — `invalid_phase` on `ship` is
+		// the failure this fixes, so asserting "some machine arrived" is not enough.
+		assert.ok(
+			contexts[0]?.phases?.phases.some((phase) => phase.id === "ship"),
+			"the declared machine, not the built-in pipeline",
+		);
+		// The rest of the provided identity is untouched by the phases merge.
+		assert.equal(contexts[0]?.nodeId, "node-41");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("R7: no PI_LEGION_PHASES key means no phases — never invented", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-phases-absent-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	try {
+		// Key presence decides (like team/role): an env that carries other spawn
+		// keys but not the declaration must not grow a machine out of the card —
+		// "absent" and "the card's answer" are different facts, and this layer only
+		// owns the first.
+		await supervisor.spawnChild({
+			...testInput(root, "root.c"),
+			env: { PI_SUBAGENT_MAX_TOOL_CALLS: "3" },
+		});
+		assert.equal(contexts.length, 1, "the spawn ran");
+		assert.equal(Object.hasOwn(contexts[0] ?? {}, "phases"), false, "no `phases` key at all");
+		assert.equal(contexts[0]?.phases, undefined);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("R7: a provided template's phases are never inherited, only the per-spawn env authors them", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-phases-template-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	// One template object reused across two spawns (REV2-3): reusing a context is
+	// supported, so a machine left on it would hand A's declaration to a child of
+	// B — a template is not per-spawn, and the machine is.
+	const template: ChildLaunchContext = {
+		nodeId: "node-51",
+		allowNested: false,
+		utility: false,
+		spawnMode: "inprocess",
+		phases: r7Phases(R7_MACHINE),
+	};
+	try {
+		await supervisor.spawnChild({
+			...testInput(root, "root.d"),
+			childLaunchContext: template,
+		});
+		await supervisor.spawnChild({
+			...testInput(root, "root.e"),
+			env: { [LEGION_PHASES_ENV]: JSON.stringify(R7_OTHER_MACHINE) },
+			childLaunchContext: template,
+		});
+		assert.deepEqual(
+			contexts.map((context) => context?.phases?.phases.map((phase) => phase.id)),
+			[undefined, ["audit", "done", "failed", "aborted"]],
+			"the template's machine is dropped; the env's machine is the only source",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("R7: a broken declaration degrades to no phases and warns — the spawn never throws", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-phases-bad-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	const warnings: string[] = [];
+	const originalWarn = console.warn;
+	console.warn = (...args: unknown[]) => {
+		warnings.push(args.map((arg) => String(arg)).join(" "));
+	};
+	try {
+		// 1) not JSON at all; 2) JSON that fails the machine validator. Both are
+		// spawn-time input, so neither may cost the child its start — the same
+		// degrade-don't-throw rule `index.ts` applies to the env declaration.
+		await supervisor.spawnChild({
+			...testInput(root, "root.f"),
+			env: { [LEGION_PHASES_ENV]: "{oops" },
+		});
+		await supervisor.spawnChild({
+			...testInput(root, "root.g"),
+			env: { [LEGION_PHASES_ENV]: JSON.stringify({ phases: [] }) },
+		});
+	} finally {
+		console.warn = originalWarn;
+		rmSync(root, { recursive: true, force: true });
+	}
+	assert.equal(contexts.length, 2, "both children started");
+	// Same wording as the "no key" case: a rejected declaration is ABSENT, not a
+	// present-but-undefined property — a distinction an `?.` assertion cannot see.
+	assert.equal(Object.hasOwn(contexts[0] ?? {}, "phases"), false, "no `phases` key on the bad-JSON child");
+	assert.equal(Object.hasOwn(contexts[1] ?? {}, "phases"), false, "no `phases` key on the invalid-machine child");
+	assert.deepEqual(contexts.map((context) => context?.phases), [undefined, undefined]);
+	assert.ok(
+		warnings.filter((line) => line.includes(LEGION_PHASES_ENV)).length >= 2,
+		`each bad declaration is warned about:\n${warnings.join("\n")}`,
+	);
+});
+
+test("R7: stripLegionIdentity removes the declaration, so the child context carries no phases", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "legion-inprocess-phases-strip-"));
+	const contexts: Array<ReturnType<typeof currentChildContext>> = [];
+	const supervisor = new InProcessSupervisor({
+		limits: { maxActive: 8 },
+		sessionFactory: async () => {
+			contexts.push(currentChildContext());
+			return new FakeSession();
+		},
+	});
+	// The declaration IS lineage (`LEGION_IDENTITY_ENV_KEYS` lists it), so a
+	// detached launch must not inherit the tree's machine.
+	assert.ok(
+		LEGION_IDENTITY_ENV_KEYS.includes(LEGION_PHASES_ENV),
+		"the key is masked by the identity strip — no second masking rule may be needed",
+	);
+	const env: Record<string, string> = {
+		[LEGION_PHASES_ENV]: JSON.stringify(R7_MACHINE),
+		PI_SUBAGENT_MAX_DEPTH: "4",
+	};
+	// Exactly what `Orchestrator.launch` does for a `stripLegionIdentity` spawn.
+	for (const key of LEGION_IDENTITY_ENV_KEYS) delete env[key];
+	try {
+		await supervisor.spawnChild({ ...testInput(root, "root.h"), env });
+		assert.equal(contexts.length, 1, "the spawn ran");
+		assert.equal(contexts[0]?.phases, undefined);
+		assert.equal(Object.hasOwn(contexts[0] ?? {}, "phases"), false);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

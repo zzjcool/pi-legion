@@ -798,16 +798,32 @@ function resolveLoopNoticeMsUncached(
  *
  * Resolution order, exactly as the contract freezes it:
  *
- *   1. the machine the root declared in this dispatch (`PI_LEGION_PHASES`)
+ *   1. the machine the root declared in this dispatch — carried by
+ *      `ChildLaunchContext.phases` for an in-process child (R7) and by
+ *      `PI_LEGION_PHASES` for an rpc one (they are the same declaration, on the
+ *      two channels the two backends actually have)
  *   2. the role card's `phases:`
  *   3. neither — and then the node has NO machine, which is a different answer
  *      from "use the built-in one": no phase, no `legion_phase`, no collection
  *      prompt (invariant I2).
  *
- * Gated on the role because the environment is inherited: an in-process member
- * literally shares its lead's `process.env`, and a worker must never adopt its
- * lead's team machine as its own. A nested centurion cannot exist (G1), so the
- * gate loses nothing.
+ * The ALS value comes first on purpose. An in-process child shares its parent's
+ * `process.env`, so the env channel is EMPTY there (the declaration was never
+ * written to the host's env — `lineageEnv` only builds the spawn's own object).
+ * Reading env first therefore answered "no declaration" for exactly the
+ * backend-default children, and their custom phase names later failed
+ * `invalid_phase` against `DEFAULT_PHASE_MACHINE`. The env read stays for the
+ * rpc child, whose env really is the spawn env; and because a context value can
+ * only exist for a spawn we made, the two can never disagree in one process.
+ *
+ * Gated on the role because the environment is inherited: a worker must never
+ * adopt its lead's team machine as its own. A nested centurion cannot exist (G1),
+ * so the gate loses nothing.
+ *
+ * Exported for the same reason `loadCatalog` is: the false green this fixes came
+ * from tests that parsed the spawn env and hand-fed the machine to the tool
+ * layer, so the CONSUMER had zero coverage — deleting this function's env read
+ * kept every suite green. A test has to be able to call the real thing.
  *
  * A pre-existing ledger row with a phase but no obtainable declaration keeps the
  * card path and, failing that, no machine — the same degrade-don't-throw rule the
@@ -815,8 +831,14 @@ function resolveLoopNoticeMsUncached(
  * to stay registered (see `registerLegionTools`), so an in-flight team is never
  * stranded by an upgrade.
  */
-function phaseMachineForNode(role: string | null | undefined, cwd: string, settings: SubagentsSettings): PhaseMachine | undefined {
+export function phaseMachineForNode(role: string | null | undefined, cwd: string, settings: SubagentsSettings): PhaseMachine | undefined {
 	if (role === "centurion") {
+		// R7: the declaration the parent made for THIS spawn rides the child
+		// context (ALS), like `team` and `role` do. Only the per-spawn env authors
+		// it (`InProcessSupervisor.phasesFromSpawnEnv`), so a context value is
+		// already `parsePhaseMachine`'s normalized output.
+		const fromContext = currentChildContext()?.phases;
+		if (fromContext) return fromContext;
 		const declared = process.env[LEGION_PHASES_ENV];
 		if (declared) {
 			try {

@@ -20,7 +20,9 @@ import {
 	childEnablesMcp,
 	childInheritsExtensions,
 	collectChildExtensions,
+	LEGION_PHASES_ENV,
 } from "../runs/args.ts";
+import { parsePhaseMachine } from "../agents/agents.ts";
 import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import {
 	ErrorCodes,
@@ -424,6 +426,9 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 	// R6: the role this spawn runs as. Same channel and same rule as `team` —
 	// merged in BOTH branches below, because the `provided` branch returns early.
 	const role = roleFromSpawnEnv(input.env);
+	// R7: the phase machine the parent declared for THIS spawn. Same channel and
+	// same rule again (both branches, parsed fresh, never inherited).
+	const phases = phasesFromSpawnEnv(input.env);
 	const provided = input.childLaunchContext;
 	if (provided) {
 		// REV2-3: store a deep-enough snapshot, never the caller's live object.
@@ -434,13 +439,18 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		// R6: `role` is dropped from the template for that same reason. It is a
 		// per-spawn fact, so a reused template must not leak A's role into B; only
 		// the per-spawn env may author it (merged back below).
-		const { role: _templateRole, ...template } = provided;
+		//
+		// R7: `phases` is dropped for the same reason, and the reason is sharper
+		// here — a machine is an object tree, so an inherited one would put B's
+		// team on A's declared phases (custom names, wrong start phase).
+		const { role: _templateRole, phases: _templatePhases, ...template } = provided;
 		return {
 			...template,
 			// …and for the same REV2-3 reason the spawn env wins over a reused
 			// template's `team`: env is per-spawn, the template is not.
 			...team,
 			...role,
+			...phases,
 			// Element-level copy too: after the path became `NestedPathEntry[]`
 			// (objects), `[...path]` would still alias every entry, so a caller
 			// mutating `template.parentPath[0].runId` would rewrite an
@@ -464,6 +474,8 @@ function resolveChildLaunchContext(input: SpawnInput): ChildLaunchContext {
 		...team,
 		// R6: and the role, for the reason in `roleFromSpawnEnv` below.
 		...role,
+		// R7: and the declared machine, for the reason in `phasesFromSpawnEnv`.
+		...phases,
 	};
 }
 
@@ -502,6 +514,52 @@ function roleFromSpawnEnv(env: NodeJS.ProcessEnv | undefined): { role?: string }
 	if (!env || !(CHILD_ROLE_ENV in env)) return {};
 	const role = env[CHILD_ROLE_ENV];
 	return role ? { role } : {};
+}
+
+/**
+ * Extract the phase machine the parent declared for this spawn (R7).
+ *
+ * Same channel and same shape as `teamFromSpawnEnv` / `roleFromSpawnEnv`: the
+ * key lives on `SpawnInput.env` because that is how the rpc child receives it
+ * (`Orchestrator.lineageEnv` writes `JSON.stringify(machine)`, only for
+ * `centurion`). An in-process child shares the HOST's `process.env`, so the
+ * declaration has to be carried in the context or it is lost.
+ *
+ * Two rules, both load-bearing:
+ *
+ *  - **degrade, never throw.** This runs during `spawnChild`, so a bad
+ *    declaration (unreadable JSON, or a machine the validator rejects) must cost
+ *    the child its MACHINE, not its life — the same rule `index.ts` already
+ *    applies when it reads this env var. A warning is the whole failure mode.
+ *  - **parse into a NEW tree.** `parsePhaseMachine` re-builds what it returns, so
+ *    the context never aliases the env string or a caller's object; a reused
+ *    template therefore cannot mutate an already-spawned child's machine.
+ *
+ * Key presence is the gate (`phases: undefined` is not a value anyone can
+ * author), but a blank string is "nothing declared": `lineageEnv` only ever
+ * writes real JSON, and `parsePhaseMachine` already treats a blank declaration as
+ * absent, so there is nothing to warn about.
+ */
+function phasesFromSpawnEnv(env: NodeJS.ProcessEnv | undefined): {
+	phases?: ChildLaunchContext["phases"];
+} {
+	if (!env || !(LEGION_PHASES_ENV in env)) return {};
+	const declared = env[LEGION_PHASES_ENV];
+	if (declared === undefined || declared.trim() === "") return {};
+	try {
+		// `lineageEnv` serializes the machine, so a JSON parse is the only shape this
+		// channel can produce. Let `parsePhaseMachine` do the validation — it is the
+		// same validator the card loader and the launch path use, and having two
+		// machine parsers is how the layers drift apart.
+		const machine = parsePhaseMachine(JSON.parse(declared), LEGION_PHASES_ENV);
+		return machine ? { phases: machine } : {};
+	} catch (error) {
+		console.warn(
+			`[pi-legion] ignoring an unreadable ${LEGION_PHASES_ENV} declaration on an in-process spawn: ` +
+				(error instanceof Error ? error.message : String(error)),
+		);
+		return {};
+	}
 }
 
 /** Extract the child budget keys from a spawn env, for the in-process channel. */
