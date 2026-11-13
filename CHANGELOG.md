@@ -11,6 +11,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [6.0.1] — 2026-11-13
+
+### Changed
+
+- **`scout` 取消默认 `toolBudget`（回退 6.0.0 的 D12）**：`agents/scout.md` 不再声明
+  `maxToolCalls: 60`。计数上限不是侦察的边界——`toolTimeoutMs` 已经把单条命令的挂起挡住，
+  `timeoutMs` 已经把整轮定在 10 分钟，加一个调用数只是把「10 分钟」改写成「60 次」：一个范围合适但
+  读得多的侦察（没走 `codemode` 批量、纯 grep + read 配对）会在 60 次上停在一半的事实清单，父会话要么
+  重派要么自己补读，代价通常大于上限省下的那点时间。而且它失败的形态很脏：越限之后每次调用都被拒但
+  照样计数，子 agent 把剩下的轮次花在被拒的调用上，而不是把已经读到的东西写出来。回到 4.0.0 的既定原则
+  ——时间与深度才是边界，`toolBudget` 是给某个顽固角色留的手术刀，不是默认配置（`worker` / `centurion`
+  本来就不带计数上限）。字面量删除，其余卡片无变化；`parseBudgets` 的「省略 = 无限制」语义未动。
+
 ## [6.0.0] — 2026-11-11
 
 一次以**记账**为中心的发布。子 agent 的结果不再靠「谁认领过」传递，而是落成一个不可变的
@@ -2178,7 +2191,8 @@ branch — pin `pi-legion@0.16.x` if you still need that model. See
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.0.0...HEAD
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.0.1...HEAD
+[6.0.1]: https://github.com/zzjcool/pi-legion/compare/v6.0.0...v6.0.1
 [6.0.0]: https://github.com/zzjcool/pi-legion/compare/v5.6.0...v6.0.0
 [5.6.0]: https://github.com/zzjcool/pi-legion/compare/v5.5.1...v5.6.0
 [5.5.1]: https://github.com/zzjcool/pi-legion/compare/v5.5.0...v5.5.1
