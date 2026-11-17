@@ -144,7 +144,15 @@ function harness(options: { remoteSubdir?: string } = {}): Harness {
 	// path the fake core accepts as being on it.
 	const target = resolveHostTarget(HOST, {
 		enabled: true,
-		hosts: { [HOST]: { cwd: remoteCwd, piLegionRoot: path.posix.join(remoteRoot, ".pi-legion") } },
+		hosts: {
+			[HOST]: {
+				cwd: remoteCwd,
+				piLegionRoot: path.posix.join(remoteRoot, ".pi-legion"),
+				// S5.6: the launch now asks the child's own argv one question before it
+				// starts a terminal, so "pi" has to be something that machine can RUN.
+				piCli: installFakePiCli(remoteRoot),
+			},
+		},
 	});
 	const wire = (): WireRequest[] => {
 		if (!existsSync(wirePath)) return [];
@@ -223,6 +231,16 @@ function localSystemPrompt(spawnRoot: string): { file: string; text: string } {
 
 // ── the happy path ─────────────────────────────────────────────────────────
 
+
+/** A `pi` CLI the "remote" machine can actually run (S5.6's startup probe). */
+function installFakePiCli(remoteRoot: string): string {
+	const dir = path.join(remoteRoot, ".fake-pi");
+	mkdirSync(dir, { recursive: true });
+	const entry = path.join(dir, "cli.js");
+	writeFileSync(entry, "#!/usr/bin/env node\nprocess.stdout.write('ok\\n');\n", { mode: 0o755 });
+	return path.posix.join(remoteRoot, ".fake-pi", "cli.js");
+}
+
 test("S1: a remote spawn crosses the wire with the remote cwd/argv/env/labels and mirrors the prompt", async (t) => {
 	const h = harness();
 	t.after(() => h.cleanup());
@@ -246,7 +264,9 @@ test("S1: a remote spawn crosses the wire with the remote cwd/argv/env/labels an
 	assert.equal(run.cwd, h.remoteCwd);
 	const argv = (run.argv as string[]).map(String);
 	assert.equal(argv[0], "node", "the remote interpreter, not this process's node");
-	assert.equal(argv[1], "pi", "the remote CLI, not this machine's cli path");
+	// S5.6: the fixture's runnable stub CLI, on that machine — the point is that argv[1]
+	// is NOT this machine's cli path.
+	assert.ok(String(argv[1]).startsWith(h.remoteRoot), `the remote CLI, not this machine's: ${String(argv[1])}`);
 	assert.ok(!argv.includes(process.execPath));
 	for (const arg of argv) {
 		if (path.isAbsolute(arg)) {

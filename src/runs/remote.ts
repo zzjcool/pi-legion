@@ -247,6 +247,15 @@ export interface HostTarget {
 	 */
 	piLegionRoot: string;
 	/**
+	 * Extensions the child must LOAD on that machine (S5.6).
+	 *
+	 * A child argv carries `--no-extensions`; where the model provider itself is an
+	 * extension, that switch also removes the model. These are appended as
+	 * `--extension <p>` after the switch, untouched by `pathMap` (they are already
+	 * paths on that machine). Absent ⇒ nothing is appended.
+	 */
+	piExtensions: string[];
+	/**
 	 * Directory (on that machine) holding this launch's mirrored argv files.
 	 *
 	 * Beside the worktree root, never inside the checkout: a mirrored file in the
@@ -293,6 +302,68 @@ export const REMOTE_WORKTREE_DIR = ".pi-worktrees";
  * The three messages name the host, the setting and the value to write, because
  * the caller reading them is the one who can fix the settings file.
  */
+/**
+ * Run the child's exact argv (minus its task) on that machine and classify the
+ * answer (S5.6).
+ *
+ * The failure this exists for is silent in shape and loud in effect: a `pi` that
+ * starts, prints `No models available`, and then hangs until the collect deadline.
+ * Waiting five minutes to learn "the model provider was switched off with
+ * `--no-extensions`" is the wrong trade; the same argv with `-p ping` answers in
+ * seconds.
+ *
+ * Returns `undefined` when the probe did not decide anything (it ran and printed
+ * nothing recognisable, or the machine could not run it at all) — the launch then
+ * proceeds and the real child reports for itself.
+ */
+export function classifyRemoteStartupProbe(output: string): "no-model" | "conflict" | undefined {
+	if (/No models available|No API key( found)?/i.test(output)) return "no-model";
+	if (/conflicts with/i.test(output)) return "conflict";
+	return undefined;
+}
+
+/** Bound on that probe. Same "ten seconds or name the problem" rule as preflight. */
+export const REMOTE_STARTUP_PROBE_TIMEOUT_S = 10;
+
+/** The shell line for that probe: the launch's argv with its task replaced by `-p ping`. */
+export function remoteStartupProbeLine(argv: string[], cwd: string): string {
+	// Drop the task (the last element the backend appended) and ask the same binary
+	// the same flags one trivial question. `-p` is the headless prompt flag, so this
+	// exercises the model provider, which is exactly what can be missing.
+	const flags = argv.slice(0, -1);
+	const command = [...flags, "-p", "ping"].map((part) => shQuote(part)).join(" ");
+	return `cd -- ${shQuote(cwd)} && ${command}`;
+}
+
+/**
+ * `hosts.<host>.piExtensions`, validated as "already a path/package on THAT machine".
+ *
+ * These are handed to `pi` verbatim, so a relative entry is refused by name rather
+ * than resolved against some cwd: the child's cwd is its worktree, and a relative
+ * extension would be read from a directory nobody meant.
+ */
+function resolvePiExtensions(host: string, value: unknown): string[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) {
+		throw new SubagentError(
+			`host '${host}': subagents.crossMachine.hosts.${host}.piExtensions must be an array of paths on that machine`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host },
+		);
+	}
+	return value.map((entry) => {
+		const text = typeof entry === "string" ? entry.trim() : "";
+		if (text.length === 0 || !path.posix.isAbsolute(text)) {
+			throw new SubagentError(
+				`host '${host}': piExtensions entry '${String(entry)}' must be an absolute path on that machine`,
+				ErrorCodes.INVALID_PARAMS,
+				{ host },
+			);
+		}
+		return text;
+	});
+}
+
 export function resolveHostTarget(
 	host: string,
 	config: SubagentsSettings["crossMachine"] | undefined,
@@ -343,6 +414,7 @@ export function resolveHostTarget(
 		piLegionRoot: typeof entry.piLegionRoot === "string" && entry.piLegionRoot.trim().length > 0
 			? entry.piLegionRoot.trim()
 			: thisPackageRoot(),
+		piExtensions: resolvePiExtensions(name, entry.piExtensions),
 		mirrorRoot: path.posix.join(
 			path.posix.dirname(resolveWorktreeRoot(name, cwd, entry.worktreeRoot)),
 			REMOTE_MIRROR_DIR_NAME,

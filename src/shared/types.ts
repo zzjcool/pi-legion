@@ -863,6 +863,23 @@ export interface CrossMachineHostConfig {
 	 */
 	piLegionRoot?: string;
 	/**
+	 * Extensions to load INTO the remote child, as paths/packages ON THAT MACHINE.
+	 *
+	 * Why this exists (S5.6, real run): every child argv carries `--no-extensions`
+	 * (a child must not inherit the parent's plugin set), but on a machine whose
+	 * MODELS come from an extension (a provider such as `pi-any-endpoint`),
+	 * `--no-extensions` also removes the model provider — the child then answers
+	 * `No models available` / `No API key found` while the same `pi` run by hand on
+	 * that machine works. These entries are appended as `--extension <p>` after
+	 * `--no-extensions`, so the child gets exactly the host-local set the operator
+	 * names — no more (nothing here = today's behaviour).
+	 *
+	 * Do NOT list an extension that is already installed there as a package: an
+	 * explicit `--extension` of an already-loaded package collides
+	 * (`Tool "…" conflicts with …`), which the preflight reports by name.
+	 */
+	piExtensions?: string[];
+	/**
 	 * Prefix translation for argv paths that live OUTSIDE the checkout.
 	 *
 	 * Key: an absolute prefix on THIS machine; value: the absolute prefix the same

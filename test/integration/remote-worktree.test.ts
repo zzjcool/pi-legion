@@ -157,7 +157,15 @@ function harness(options: { remoteIsRepo?: boolean } = {}): Harness {
 	// mapped by content, so the target says where it lives over there (D6).
 	const target = resolveHostTarget(HOST, {
 		enabled: true,
-		hosts: { [HOST]: { cwd: remoteCwd, piLegionRoot: path.posix.join(remoteRoot, ".pi-legion") } },
+		hosts: {
+			[HOST]: {
+				cwd: remoteCwd,
+				piLegionRoot: path.posix.join(remoteRoot, ".pi-legion"),
+				// S5.6: the launch now asks the child's own argv one question before it
+				// starts a terminal, so "pi" has to be something that machine can RUN.
+				piCli: installFakePiCli(remoteRoot),
+			},
+		},
 	});
 	const wire = (): WireRequest[] => {
 		if (!existsSync(wirePath)) return [];
@@ -234,6 +242,16 @@ function spawnInput(h: Harness, overrides: Partial<SpawnInput> = {}): SpawnInput
 
 // ── the happy path ─────────────────────────────────────────────────────────
 
+
+/** A `pi` CLI the "remote" machine can actually run (S5.6's startup probe). */
+function installFakePiCli(remoteRoot: string): string {
+	const dir = path.join(remoteRoot, ".fake-pi");
+	mkdirSync(dir, { recursive: true });
+	const entry = path.join(dir, "cli.js");
+	writeFileSync(entry, "#!/usr/bin/env node\nprocess.stdout.write('ok\\n');\n", { mode: 0o755 });
+	return path.posix.join(remoteRoot, ".fake-pi", "cli.js");
+}
+
 test("S2: a remote worktree is created on that machine and the child starts inside it", async (t) => {
 	const h = harness();
 	t.after(() => h.cleanup());
@@ -272,7 +290,9 @@ test("S2: a remote worktree is created on that machine and the child starts insi
 	assert.equal("caller" in run, false, "a remote request must not carry the parent terminal id");
 	const argv = (run.argv as string[]).map(String);
 	assert.equal(argv[0], "node");
-	assert.equal(argv[1], "pi");
+	// The fixture's runnable stub CLI on that machine (S5.6: the launch runs it once
+	// before starting a terminal), never this machine's cli path.
+	assert.ok(argv[1]!.startsWith(h.remoteRoot), `argv[1] must be the remote CLI: ${argv[1]}`);
 	for (const arg of argv) {
 		if (path.isAbsolute(arg)) assert.ok(arg.startsWith(h.remoteRoot), `a parent-absolute argv element survived: ${arg}`);
 	}

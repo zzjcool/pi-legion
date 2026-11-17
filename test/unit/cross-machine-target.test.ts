@@ -75,7 +75,7 @@ class FakeRemoteClient implements HcClient {
 }
 
 function config(
-	hosts: Record<string, { cwd?: string; node?: string; piCli?: string; piLegionRoot?: string; pathMap?: Record<string, string> }>,
+	hosts: Record<string, { cwd?: string; node?: string; piCli?: string; piLegionRoot?: string; pathMap?: Record<string, string>; piExtensions?: string[] }>,
 	enabled = true,
 ): SubagentsSettings["crossMachine"] {
 	return { enabled, hosts };
@@ -83,7 +83,7 @@ function config(
 
 function target(overrides: Partial<HostTarget> = {}): HostTarget {
 	// `worktreeRoot` is resolved by `resolveHostTarget` (S2: `dirname(cwd)/.pi-worktrees`).
-	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], piLegionRoot: "/srv/pi-legion", mirrorRoot: "/srv/.pi-subagents-mirror", worktreeRoot: "/srv/.pi-worktrees", ...overrides };
+	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], piLegionRoot: "/srv/pi-legion", piExtensions: [], mirrorRoot: "/srv/.pi-subagents-mirror", worktreeRoot: "/srv/.pi-worktrees", ...overrides };
 }
 
 /** The package root, imported here so the fixture cannot drift from the resolver. */
@@ -164,13 +164,14 @@ test("D1: a valid entry resolves remote cwd/node/piCli, defaulting the two progr
 		pathMap: [packageRoot],
 		// review M2: the package root is also what the preflight checks over there.
 		piLegionRoot: thisPackageRoot(),
+		piExtensions: [],
 		mirrorRoot: "/srv/.pi-subagents-mirror",
 		// S2: remote trees live BESIDE the checkout (contract D11).
 		worktreeRoot: "/srv/.pi-worktrees",
 	});
 	assert.deepEqual(
 		resolveHostTarget("vps", config({ vps: { cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi" } })),
-		{ host: "vps", cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi", pathMap: [packageRoot], piLegionRoot: thisPackageRoot(), mirrorRoot: "/srv/.pi-subagents-mirror", worktreeRoot: "/srv/.pi-worktrees" },
+		{ host: "vps", cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi", pathMap: [packageRoot], piLegionRoot: thisPackageRoot(), piExtensions: [], mirrorRoot: "/srv/.pi-subagents-mirror", worktreeRoot: "/srv/.pi-worktrees" },
 	);
 	// An explicit mapping of the package root wins over `piLegionRoot`.
 	assert.deepEqual(
@@ -605,4 +606,17 @@ test("S5/D6: preflight refuses a piCli that node cannot execute (a shell launche
 	// The message must name the shape to use, not just the thing that is wrong.
 	assert.match((error as SubagentError).message, /bundle\/cli\.js/);
 	assert.match((error as SubagentError).message, /Unexpected token case/);
+});
+
+test("S5.6: `hosts.<host>.piExtensions` resolves onto the target, and is validated as remote-absolute", () => {
+	const provider = "/root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts";
+	const resolved = resolveHostTarget("vps", config({ vps: { cwd: "/srv/app", piExtensions: [provider] } }));
+	assert.deepEqual(resolved.piExtensions, [provider]);
+	// Absent ⇒ empty, so the argv is unchanged for every host that does not need it.
+	assert.deepEqual(resolveHostTarget("vps", config({ vps: { cwd: "/srv/app" } })).piExtensions, []);
+	// A relative entry would be read from the child's worktree — refuse by name.
+	assert.throws(
+		() => resolveHostTarget("vps", config({ vps: { cwd: "/srv/app", piExtensions: ["node_modules/x/index.ts"] } })),
+		/must be an absolute path on that machine/,
+	);
 });

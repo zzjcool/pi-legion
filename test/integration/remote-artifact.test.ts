@@ -65,6 +65,7 @@ function harness(prefix = "remote-artifact-"): Harness {
 		piCli: "pi",
 		pathMap: [],
 		piLegionRoot: path.posix.join(remoteRoot, ".pi-legion"),
+		piExtensions: [],
 		mirrorRoot: path.posix.join(remoteRoot, ".pi-subagents-mirror"),
 		worktreeRoot: path.posix.join(remoteRoot, ".pi-worktrees"),
 	};

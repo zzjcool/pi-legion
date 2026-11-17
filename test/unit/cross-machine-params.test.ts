@@ -278,6 +278,7 @@ function hostTarget(overrides: Partial<HostTarget> = {}): HostTarget {
 		piCli: "pi",
 		pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }],
 		piLegionRoot: REMOTE_LEGION_ROOT,
+		piExtensions: [],
 		mirrorRoot: path.posix.join(path.posix.dirname(REMOTE_CWD), ".pi-subagents-mirror"),
 		// S2: `resolveHostTarget` derives the tree root as a sibling of the checkout.
 		worktreeRoot: path.posix.join(path.posix.dirname(REMOTE_CWD), ".pi-worktrees"),
@@ -296,10 +297,11 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		const input = spawnInput(h.root, { host: "vps", hostTarget: target });
 		await h.supervisor.spawnChild(input);
 
-		// D6/D9: exactly three setup calls — the explicit checkout question (`test -d`,
-		// spike constraint 4), the preflight `line`, and one `mkdir -p`.
+		// D6/D9 + S5.6: four setup calls — the explicit checkout question (`test -d`,
+		// spike constraint 4), the preflight `line`, the startup probe (the child's own
+		// argv with `-p ping`), and one `mkdir -p`.
 		const execs = h.client.paramsFor("machine.exec");
-		assert.equal(execs.length, 3, "checkout probe + preflight + remote dir creation");
+		assert.equal(execs.length, 4, "checkout probe + preflight + startup probe + remote dir creation");
 		assert.equal(execs[0]!.on, "vps");
 		assert.deepEqual(execs[0]!.argv, ["test", "-d", "/srv/remote/work"]);
 		assert.equal(execs[1]!.on, "vps");
@@ -308,6 +310,12 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		const remoteDir = remoteDirFor(target, undefined, input.name);
 		assert.equal(execs[2]!.on, "vps");
 		assert.deepEqual(execs[2]!.argv, ["mkdir", "-p", remoteDir]);
+		// S5.6: the startup probe is the child's own argv, task replaced by `-p ping`,
+		// run on that machine BEFORE a terminal exists.
+		assert.equal(execs[3]!.on, "vps");
+		assert.match(String(execs[3]!.line), /--no-extensions/);
+		assert.match(String(execs[3]!.line), /'-p' 'ping'$/);
+		assert.match(String(execs[3]!.line), /cd -- '\/srv\/remote\/work'/);
 
 		const run = h.client.paramsFor("terminal.run")[0];
 		assert.ok(run, "terminal.run must be called");
@@ -601,5 +609,90 @@ test("m10: a launch that fails after making the remote dir removes it again", as
 		assert.equal(h.client.paramsFor("terminal.run").length, 0, "nothing may be started");
 	} finally {
 		h.cleanup();
+	}
+});
+
+test("S5.6: host piExtensions are appended as `--extension` AFTER `--no-extensions`", async () => {
+	// The provider that supplies the models on that machine is an extension; the
+	// child's `--no-extensions` removes it too, so the operator names the host-local
+	// set and the launch appends it. These entries are already paths ON THAT MACHINE,
+	// so they must NOT go through `mapRemoteArgPath` (a parent path there would be
+	// refused as unmappable — they are not in this checkout).
+	const h = harness(localEnv());
+	const provider = "/root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts";
+	try {
+		const input = spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget({ piExtensions: [provider] }),
+		});
+		await h.supervisor.spawnChild(input);
+		const argv = ((h.client.paramsFor("terminal.run")[0]?.argv ?? []) as string[]).map(String);
+		const noExtensions = argv.indexOf("--no-extensions");
+		assert.ok(noExtensions >= 0, "the child still starts without the parent's plugin set");
+		const appended = argv.flatMap((arg, index) => (arg === "--extension" && argv[index + 1] === provider ? [index] : []));
+		assert.equal(appended.length, 1, `the host extension must be there exactly once: ${JSON.stringify(argv)}`);
+		assert.ok(appended[0]! > noExtensions, "it must come AFTER --no-extensions, or the switch would drop it");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("S5.6: with no piExtensions the argv is byte-identical to before (nothing appended)", async () => {
+	const h = harness(localEnv());
+	try {
+		const input = spawnInput(h.root, { host: "vps", hostTarget: hostTarget() });
+		const before = input;
+		await h.supervisor.spawnChild(before);
+		const argv = ((h.client.paramsFor("terminal.run")[0]?.argv ?? []) as string[]).map(String);
+		const extensions = argv.filter((arg) => arg === "--extension").length;
+		// Only the ones `buildPiArgs` itself emits (builtins + this package's entry).
+		assert.equal(extensions, 3, `no extra --extension may appear: ${JSON.stringify(argv)}`);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("S5.6: the startup probe's three failures are named before a terminal exists", async () => {
+	const cases = [
+		{
+			name: "no-model",
+			result: { code: 1, stdout: "", stderr: Buffer.from("No API key found for the selected model.\nWarning: No models available. Use /login\n").toString("base64") },
+			expect: /cannot see a model there/,
+			details: "no-model",
+		},
+		{
+			name: "conflict",
+			result: { code: 1, stdout: "", stderr: Buffer.from('Error: Failed to load extension "/root/.pi/agent/npm/node_modules/pi-legion/index.ts":\n  Tool "legion_output" conflicts with /root/code/pi-legion/index.ts\n').toString("base64") },
+			expect: /extensions collide/,
+			details: "conflict",
+		},
+		{
+			name: "other",
+			result: { code: 2, stdout: "", stderr: Buffer.from("boom: something else\n").toString("base64") },
+			expect: /child's own argv failed on that machine \(exit 2\)/,
+			details: "failed",
+		},
+	];
+	for (const probeCase of cases) {
+		const h = harness(localEnv());
+		try {
+			// Every `machine.exec` answers the same thing: the two preflight questions
+			// pass (code 0), the startup probe gets this case's answer. Distinguishing by
+			// the params is the point — the probe is the only call that carries `line`.
+			h.client.on("machine.exec", (params: Record<string, unknown>) => {
+				if (typeof params.line === "string" && params.line.includes("-p")) return probeCase.result;
+				return { code: 0, stdout: "", stderr: "", timed_out: false };
+			});
+			const input = spawnInput(h.root, { host: "vps", hostTarget: hostTarget() });
+			const error = await h.supervisor.spawnChild(input).then(() => undefined, (thrown: unknown) => thrown);
+			assert.ok(error instanceof SubagentError, `${probeCase.name}: expected a refusal`);
+			assert.match((error as SubagentError).message, probeCase.expect, probeCase.name);
+			const details = (error as SubagentError).details as Record<string, unknown> | undefined;
+			assert.equal(details?.probe, probeCase.details, probeCase.name);
+			// The whole point: no terminal was created, so nothing can hang for five minutes.
+			assert.equal(h.client.paramsFor("terminal.run").length, 0, `${probeCase.name}: no terminal may start`);
+		} finally {
+			h.cleanup();
+		}
 	}
 });

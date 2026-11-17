@@ -25,6 +25,9 @@ import {
 	mapRemoteArgPath,
 	mirrorRemoteFile,
 	normalizeHost,
+	classifyRemoteStartupProbe,
+	remoteStartupProbeLine,
+	REMOTE_STARTUP_PROBE_TIMEOUT_S,
 	removeRemoteDir,
 	basenameCollisions,
 	remoteDirFor,
@@ -572,7 +575,14 @@ export class TerminalSupervisor implements LegionSupervisor {
 						`[pi-legion] host '${target.host}': ${droppedExtensions.length} extension(s) not loadable there (no pathMap entry maps them): ${droppedExtensions.join(", ")}. Add a prefix to subagents.crossMachine.hosts.${target.host}.pathMap if the child needs them.\n`,
 					);
 				}
-				argv = [target.node, target.piCli, ...mappedArgs, task];
+				// S5.6: `--no-extensions` is right (a child must not inherit the parent's
+				// plugin set) but on a machine whose MODELS come from an extension it also
+				// removes the model provider — the real run answered `No models available`
+				// for a `pi` that works by hand there. The operator names the host-local
+				// set; each entry is appended AFTER the switch and is already a path on
+				// that machine, so it does not go through `mapRemoteArgPath`.
+				const hostExtensions = target.piExtensions.flatMap((entry) => ["--extension", entry]);
+				argv = [target.node, target.piCli, ...mappedArgs, ...hostExtensions, task];
 			} else {
 				// `node <cli.js> <same flags as rpc> <task>`: the interpreter is the one
 				// running this process, so the child never depends on `node` being on the
@@ -584,6 +594,59 @@ export class TerminalSupervisor implements LegionSupervisor {
 			await rollbackRemoteWorktree();
 			await rollbackRemoteDir();
 			throw error;
+		}
+
+		// S5.6: the child's own argv, minus its task, asked one trivial question. A
+		// remote `pi` whose model provider was disabled by `--no-extensions` starts,
+		// prints `No models available`, and then hangs until the collect deadline;
+		// the same invocation answers in seconds. Every failure below therefore lands
+		// BEFORE `terminal.run`, in the launch, with the machine and the fix named.
+		if (target !== undefined) {
+			const probe = await client.request<{ code?: number | null; stdout?: string; stderr?: string; timed_out?: boolean }>(
+				"machine.exec",
+				{
+					on: target.host,
+					line: remoteStartupProbeLine(argv, remoteWorktree?.path ?? target.cwd),
+					timeout: REMOTE_STARTUP_PROBE_TIMEOUT_S,
+				},
+			).catch((error: unknown) => {
+				// The probe is a DIAGNOSTIC: if the machine cannot run it at all, the launch
+				// keeps its meaning (the real child reports for itself). Only an answer we
+				// can read is treated as a verdict.
+				process.stderr.write(
+					`[pi-legion] host '${target.host}': could not run the startup probe (${error instanceof Error ? error.message : String(error)}); launching anyway\n`,
+				);
+				return undefined;
+			});
+			const probeOut = probe === undefined
+				? undefined
+				: `${Buffer.from(String(probe.stdout ?? ""), "base64").toString("utf8")}\n${Buffer.from(String(probe.stderr ?? ""), "base64").toString("utf8")}`;
+			const verdict = probeOut === undefined ? undefined : classifyRemoteStartupProbe(probeOut);
+			const excerpt = (probeOut ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0).slice(0, 5).join("\n");
+			if (verdict === "no-model") {
+				await rollbackRemoteDir();
+				throw new SubagentError(
+					`host '${target.host}': the child cannot see a model there — the same argv answered:\n${excerpt}\nOn a machine whose models come from an EXTENSION, the child's \`--no-extensions\` also removes the provider. List it in subagents.crossMachine.hosts.${target.host}.piExtensions (e.g. /root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts).`,
+					ErrorCodes.INVALID_PARAMS,
+					{ host: target.host, probe: "no-model" },
+				);
+			}
+			if (verdict === "conflict") {
+				await rollbackRemoteDir();
+				throw new SubagentError(
+					`host '${target.host}': the child's extensions collide — they are already installed there:\n${excerpt}\nRemove the duplicate from subagents.crossMachine.hosts.${target.host}.piExtensions: an installed package must not be added again as \`--extension\`.`,
+					ErrorCodes.INVALID_PARAMS,
+					{ host: target.host, probe: "conflict" },
+				);
+			}
+			if (probe !== undefined && typeof probe.code === "number" && probe.code !== 0) {
+				await rollbackRemoteDir();
+				throw new SubagentError(
+					`host '${target.host}': the child's own argv failed on that machine (exit ${probe.code}):\n${excerpt || "(no output)"}`,
+					ErrorCodes.START_FAILED,
+					{ host: target.host, probe: "failed", code: probe.code },
+				);
+			}
 		}
 
 		const params = {

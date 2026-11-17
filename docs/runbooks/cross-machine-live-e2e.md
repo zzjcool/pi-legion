@@ -187,11 +187,67 @@ npm run test:live -- --test-name-pattern='S5\.'
 | 现象 | 含义 |
 |---|---|
 | spawn 抛 `terminal.run` 失败 | 目标机上 `pi` 起不来（版本/凭据/扩展） |
-| 起得来但 transcript 一直 0 行（5 分钟超时） | 远端 `pi` 没有可用模型凭据（**最可能的失败点**，见 §4） |
+| 起得来但 transcript 一直 0 行 | 远端 `pi` 没有可用模型：多数情况是模型来自扩展、而 child 的 `--no-extensions` 把它关了（见 §3.5）。现在 launch 前的探测会在 10 秒内拒绝并点名 `piExtensions`，所以**正常情况下不该再走到这里** |
 | handle 没有 `worktreePath` / `worktreeHost` | **先确认这棵树是谁建的**：跨机建树是**编排层**的一步（`createRemoteChildWorktree`），terminal 后端只复用被交给它的 `worktreePath`，或在被要求 `createWorktree` 时才自己建。S5.6 所以先建树再 spawn —— 直接 spawn 一个没给树的 child，handle 当然没有这两个字段（这是分层，不是 bug）。若树确实建过却仍缺失，看 stderr 里 `git worktree add failed` |
 | 测试跑完 node 进程不退出 | `hc` 连接没关：`TerminalSupervisor` 的 client 要用 `clientFactory` 抓住，并在 `t.after()` 里 `close()`（S5.6 第一次真跑就踩了这个，等了 7 分钟只能 kill） |
 
 ---
+
+---
+
+## 3.5 远端 child 的模型来自何处（S5.6 真跑题目）
+
+这一节是整套手册里最容易被忽略、也最容易让人误判成"远端环境坏了"的一块。
+
+**事实**：legion 给每个 child 的 argv 都带 `--no-extensions`（child 不能继承父机的插件集）。
+在**模型由扩展提供**的机器上（例如 `/root/.pi/agent/npm/package.json` 的 dependencies 里是
+`pi-any-endpoint`），`--no-extensions` **顺手把模型提供者也关掉了**：
+
+```
+node cli.js -p "say ok"                 → ok
+node cli.js --no-extensions -p "say ok" → No API key found / No models available   ← child 的症状
+```
+
+所以远端 child 需要一组**机器本地扩展**，由配置显式给出：
+
+```jsonc
+{
+  "subagents": {
+    "crossMachine": {
+      "enabled": true,
+      "hosts": {
+        "host-workspace": {
+          "cwd": "/root/code/pi-legion",
+          "piExtensions": ["/root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts"]
+        }
+      }
+    }
+  }
+}
+```
+
+这些条目被追加为 `--extension <p>`（在 `--no-extensions` 之后），且**不经过 pathMap**
+（它们本来就是那台机器上的路径）。
+
+**别把已安装的扩展再显式加一次**：如果远端已经把 pi-legion（或任何包）当 npm 包装着，
+再 `--extension` 同一个包会撞工具重名：
+
+```
+Error: Failed to load extension "…/node_modules/pi-legion/index.ts":
+  Tool "legion_output" conflicts with /root/code/pi-legion/index.ts
+```
+
+**launch 前的那一次探测**：现在每次远端 launch 会先用 child 的**完整 argv**（去掉 task、加
+`-p ping`）在目标机跑一次，10 秒内给出结论——
+
+| 症状（探测输出） | 判定 | launch 行为 |
+|---|---|---|
+| `No models available` / `No API key` | 远端模型提供者没加载 | 拒绝（INVALID_PARAMS），点名 `hosts.<host>.piExtensions` 并附原始两行 |
+| `conflicts with` | 扩展重复 | 拒绝（INVALID_PARAMS），指向"别把已装扩展再加一次" |
+| 其他非 0 退出 | 该 argv 在那台机器上跑不起来 | 拒绝（START_FAILED），附 stderr 前 5 行 |
+| 退出 0 / 无结论 | 正常 | 继续，创建终端 |
+
+探测**不可运行**时（`machine.exec` 本身失败）只打一行 stderr 并继续：它是诊断，不是门禁。
 
 ## 4. 剩余风险（S5 之后仍然存在的）
 
