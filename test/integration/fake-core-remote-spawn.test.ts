@@ -259,18 +259,13 @@ test("S1: a remote spawn crosses the wire with the remote cwd/argv/env/labels an
 	const promptFlag = argv.includes("--append-system-prompt") ? "--append-system-prompt" : "--system-prompt";
 	assert.equal(argv[argv.indexOf(promptFlag) + 1], `${remoteDir}/system-prompt.md`);
 
-	// 3. env: no parent facts, no legion identity (the core refuses either).
-	const env = run.env as Record<string, string>;
-	for (const key of ["PATH", "HOME", "TERM", "TERM_PROGRAM", "COLORTERM"]) {
-		assert.equal(key in env, false, `${key} must not be projected`);
-	}
-	for (const key of Object.keys(env)) {
-		assert.equal(
-			key.startsWith("PI_LEGION_") && key !== "PI_LEGION_CHILD_EXTENSIONS",
-			false,
-			`legion identity must not cross: ${key}`,
-		);
-	}
+	// 3. env: NOT SENT AT ALL. S5's real run proved that "forward the parent's env,
+	//    minus a few keys" is not a smaller version of the truth but a different
+	//    machine's facts: the remote pi looked for credentials where the PARENT keeps
+	//    them (`No models available`) and its PATH took the parent's shape, so `npx`
+	//    vanished (`spawn npx ENOENT`). `hc` merges an overlay into its own baseline,
+	//    so an absent key means the remote process keeps its own environment.
+	assert.equal("env" in run, false, `a remote launch must not carry env at all: ${JSON.stringify(run.env)}`);
 
 	// 4. labels: role + run + host, and never the parent's space.
 	const labels = run.labels as Record<string, string>;

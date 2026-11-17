@@ -195,7 +195,7 @@ test("D2: with a host, `on` carries it and the child record keeps it", async () 
 		const params = h.client.paramsFor("terminal.run")[0];
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.on, "vps");
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "env", "labels", "name", "on"]);
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on"]);
 		assert.equal(childRecord(h.supervisor, "root.centurion-0").host, "vps");
 	} finally {
 		h.cleanup();
@@ -219,7 +219,8 @@ test("D2: a remote request sends `on` and never `caller`", async () => {
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.caller, undefined, "a parent terminal id does not exist on the other machine");
 		assert.equal(params.on, "vps");
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "env", "labels", "name", "on"]);
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on"]);
+		// S5/D6: and no `env` key at all — see the dedicated test below.
 	} finally {
 		h.cleanup();
 	}
@@ -352,18 +353,8 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		assert.equal(prompt.on, "vps");
 		assert.match(Buffer.from(String(prompt.data), "base64").toString("utf8"), /You are a test centurion\./);
 
-		// D7: no parent PATH/HOME/TERM and no legion identity on the other machine.
-		const env = run.env as Record<string, string>;
-		for (const key of ["PATH", "HOME", "TERM", "TERM_PROGRAM", "COLORTERM"]) {
-			assert.equal(key in env, false, `${key} is a parent fact`);
-		}
-		for (const key of Object.keys(env)) {
-			assert.equal(
-				key.startsWith("PI_LEGION_") && key !== "PI_LEGION_CHILD_EXTENSIONS",
-				false,
-				`legion identity must not cross machines: ${key}`,
-			);
-		}
+		// D7/S5: no env at all on the other machine — not "some keys filtered out".
+		assert.equal("env" in run, false, `a remote launch must not carry env: ${JSON.stringify(run.env)}`);
 
 		// D8: role + host, and NO parent space label (and no read of it either).
 		const labels = run.labels as Record<string, string>;
@@ -555,26 +546,37 @@ test("M8: a stuck name is refused by ADDRESS, so the operator knows which machin
 	}
 });
 
-test("m4/m5: the remote env carries NO parent NODE_OPTIONS text and no heap cap", async () => {
-	// `childMemoryEnv` merges this host's NODE_OPTIONS verbatim (absolute paths) and
-	// adds a heap cap so a LOCAL child cannot eat this process's address space. On
-	// another machine that is both a path projection (D6/D7) and a cap on a bash
-	// tree living there — the remote core's own environment is the right answer.
+test("S5/D6: a remote launch sends NO env at all, so no parent fact can become the remote child's", async () => {
+	// The real cross-machine run (S5.6) failed with `No models available` and
+	// `spawn npx ENOENT` in the REMOTE child, while the same `pi` run by hand on that
+	// machine worked. Cause: the backend forwarded this machine's env (minus a few
+	// keys). `hc` treats `env` as an overlay on its own baseline, so every forwarded
+	// key REPLACED a truthful remote one — the remote child looked for credentials
+	// where this Mac keeps them, and its PATH shrank to this machine's shape.
+	//
+	// So the property is no longer "which keys are filtered out" (that was m4/m5, and
+	// it was the wrong instinct): it is "nothing is sent". A hostile parent env is the
+	// test: if any of it reaches the wire, that is the bug.
 	const env = callerEnv();
-	env.NODE_OPTIONS = "--require /root/code/pi-legion/hook.js --max-old-space-size=4096";
-	env.PI_LEGION_HOST_NODE_OPTIONS = "--require /root/elsewhere/hook.js";
+	Object.assign(env, {
+		PI_OPENAI_API_KEY: "parent-key",
+		PI_CONFIG_DIR: "/Users/parent/.pi",
+		XDG_CONFIG_HOME: "/Users/parent/.config",
+		NODE_OPTIONS: "--require /root/code/pi-legion/hook.js",
+		PI_LEGION_HOST_NODE_OPTIONS: "--require /root/elsewhere/hook.js",
+		PI_LEGION_DB: "/root/code/pi-legion/.pi-subagents/legion.db",
+		PI_LEGION_NODE_ID: "root.centurion-0",
+		PI_SUBAGENT_PARENT_PATH: "root",
+		PATH: "/root/.nvm/versions/node/v24.13.1/bin:/usr/bin",
+		HOME: "/root",
+	});
 	const h = harness(env);
 	try {
 		const input = spawnInput(h.root, { host: "vps", hostTarget: hostTarget() });
 		await h.supervisor.spawnChild(input);
 		const run = h.client.paramsFor("terminal.run")[0];
 		assert.ok(run);
-		const sent = (run.env ?? {}) as Record<string, string>;
-		assert.equal("NODE_OPTIONS" in sent, false, "no NODE_OPTIONS may travel: it is a parent fact");
-		assert.equal("PI_LEGION_HOST_NODE_OPTIONS" in sent, false);
-		for (const value of Object.values(sent)) {
-			assert.doesNotMatch(String(value), /\/root\/code\/pi-legion|--max-old-space-size/, `a parent memory fact leaked: ${value}`);
-		}
+		assert.equal("env" in run, false, `no env may travel: ${JSON.stringify(run.env)}`);
 	} finally {
 		h.cleanup();
 	}

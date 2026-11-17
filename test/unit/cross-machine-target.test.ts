@@ -582,3 +582,27 @@ test("m11: two local files with one basename are refused, never silently overwri
 	assert.deepEqual(basenameCollisions(["/tmp/a/system-prompt.md", "/tmp/b/task.md"]), []);
 	assert.deepEqual(basenameCollisions([]), []);
 });
+
+test("S5/D6: preflight refuses a piCli that node cannot execute (a shell launcher)", async () => {
+	// The release ships `/root/.pi/agent/bin/pi` as a shell launcher. Every child's
+	// argv is `[node, piCli, …]`, so that path makes node parse `case "$0" in` as
+	// JavaScript; the real run saw `SyntaxError: Unexpected token case` many layers
+	// below the launch. The preflight asks `<node> <piCli> --version` instead.
+	const launcher = "/root/.pi/agent/bin/pi";
+	const script = remotePreflightScript({ ...target(), piCli: launcher });
+	assert.match(script, new RegExp(`'node' '${launcher.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}' --version`));
+	// An ABSOLUTE piCli is judged (fatal); a bare name is only advised, because
+	// `command -v` already proved it resolves and the script cannot see its shape.
+	assert.match(script, /exit 16/);
+	assert.match(remotePreflightScript({ ...target(), piCli: "pi" }), /did not answer/);
+	assert.doesNotMatch(remotePreflightScript({ ...target(), piCli: "pi" }), /exit 16/);
+
+	const client = preflightClient(() => execResult({ code: 16 }));
+	const error = await remotePreflight(client, { ...target(), piCli: launcher }).then(() => undefined, (thrown: unknown) => thrown);
+	assert.ok(error instanceof SubagentError);
+	assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+	assert.match((error as SubagentError).message, /not a JavaScript entry point node can execute/);
+	// The message must name the shape to use, not just the thing that is wrong.
+	assert.match((error as SubagentError).message, /bundle\/cli\.js/);
+	assert.match((error as SubagentError).message, /Unexpected token case/);
+});

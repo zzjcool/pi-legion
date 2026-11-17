@@ -549,10 +549,30 @@ export function execResultText(result: HcExecResult | undefined): string {
  * the shell is the one place on this path where that could matter.
  */
 export function remotePreflightScript(target: HostTarget): string {
+	const probe = `${shQuote(target.node)} ${shQuote(target.piCli)} --version >/dev/null 2>&1`;
+	// The two sentences are deliberately different: one is a refusal (absolute path we
+	// can see and judge), the other is advice (a bare name this script cannot resolve
+	// to a verdict).
+	const piProbe = path.posix.isAbsolute(target.piCli)
+		? `${probe} || { printf '%s\\n' ${shQuote(`piCli ${target.piCli} is not a JavaScript entry point node can execute (every child's argv is [node, piCli, …]; a shell launcher cannot be argv[1])`)} >&2; exit 16; }`
+		: `${probe} || printf '%s\\n' ${shQuote(`piCli ${target.piCli} did not answer \`--version\` under node; if it is a launcher, give the absolute bundle cli.js path instead`)} >&2`;
 	return [
 		`cd -- ${shQuote(target.cwd)} || { printf '%s\\n' ${shQuote(`cwd ${target.cwd} is not a directory`)} >&2; exit 11; }`,
 		`command -v ${shQuote(target.node)} >/dev/null 2>&1 || exit 12`,
 		`command -v ${shQuote(target.piCli)} >/dev/null 2>&1 || exit 13`,
+		// A `piCli` that EXISTS is not necessarily a pi CLI: the release ships a SHELL
+		// LAUNCHER (`/root/.pi/agent/bin/pi`, a `case "$0"` wrapper around the bundle).
+		// Every child's argv is `[node, piCli, …]`, so pointing `piCli` at the launcher
+		// makes node parse shell as JavaScript (`SyntaxError: Unexpected token case`)
+		// many layers deeper, where the message names nothing and no exit code points
+		// here. Asking the pair to print a version is the cheapest question that
+		// separates "a JS entry node can run" from "a file that happens to exist".
+		//
+		// An ABSOLUTE launcher is fatal (that is the shape the real run hit, and the
+		// remote child cannot start at all); a bare name that merely fails this probe is
+		// a warning, because `command -v` already proved it resolves and some setups do
+		// run a launcher deliberately through their own wrapper.
+		piProbe,
 		// Review M2: this is the one absolute path EVERY child's argv carries. If it
 		// is missing the child either fails to start or starts without the guard
 		// extension -- the second is the silent failure, so it is checked here.
@@ -657,6 +677,13 @@ export async function remotePreflight(
 		throw new SubagentError(
 			`host '${target.host}': pi CLI '${target.piCli}' is not on PATH on ${target.host} (set subagents.crossMachine.hosts.${target.host}.piCli to a path on that machine)`,
 			ErrorCodes.START_FAILED,
+			{ host: target.host, piCli: target.piCli },
+		);
+	}
+	if (code === 16) {
+		throw new SubagentError(
+			`host '${target.host}': piCli '${target.piCli}' is not a JavaScript entry point node can execute. A shell launcher (a path like /root/.pi/agent/bin/pi, a \`case "$0"\` wrapper) cannot be the argv[1] of \`node\` — node parses it as JavaScript and dies with \`SyntaxError: Unexpected token case\`. Point subagents.crossMachine.hosts.${target.host}.piCli at the bundle entry instead, e.g. /root/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js.`,
+			ErrorCodes.INVALID_PARAMS,
 			{ host: target.host, piCli: target.piCli },
 		);
 	}

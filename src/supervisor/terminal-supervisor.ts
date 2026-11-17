@@ -17,7 +17,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatChildTask } from "../extension/child-guard.ts";
-import { LEGION_IDENTITY_ENV_KEYS, buildPiArgs } from "../runs/args.ts";
+import { buildPiArgs } from "../runs/args.ts";
 import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import {
@@ -74,24 +74,6 @@ export const LEGION_RUN_LABEL = "legion.run";
  * to the PARENT's document and would only create an orphan label there.
  */
 export const LEGION_HOST_LABEL = "legion.host";
-
-/**
- * Parent facts that must not be projected onto another machine (D7).
- *
- * `terminal.run`'s `env` is an overlay (merge-only, no delete), so these are
- * never added in the first place; on the remote branch the overlay is built
- * from scratch and this list is also applied as a delete, so an `input.env`
- * that carries one of them cannot smuggle it across either.
- */
-const PARENT_ENV_KEYS = ["PATH", "HOME", "TERM", "TERM_PROGRAM", "COLORTERM"] as const;
-/**
- * Legion facts that describe THIS machine's ledger, not the child's.
- *
- * `PI_LEGION_CHILD_EXTENSIONS` is the one exception: it is a request to the
- * child about which extensions to load, not a path into this host's state.
- */
-const LEGION_ENV_PREFIX = "PI_LEGION_";
-const REMOTE_KEPT_LEGION_ENV = "PI_LEGION_CHILD_EXTENSIONS";
 
 /** `hc` requires 1–32 chars of `[a-z0-9_-]`, unique among live terminals (D7). */
 export const TERMINAL_NAME_MAX = 32;
@@ -611,7 +593,13 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// one was created for it, the target's checkout otherwise. It is never
 			// `this.cwd` and never a local path that happens to exist here.
 			cwd: target !== undefined ? remoteWorktree?.path ?? target.cwd : input.cwd,
-			env: this.childEnv(input, remote ? host : undefined),
+			// Absent for a remote child (see `childEnv`): the core's own environment is the
+			// only truthful one over there. Local launches always have a value, so the
+			// params this machine produces keep their exact shape.
+			...((() => {
+				const env = this.childEnv(input, remote ? host : undefined);
+				return env === undefined ? {} : { env };
+			})()),
 			labels: await this.childLabels(input, remote ? host : undefined),
 			// Constraint 5: `caller` is a BARE terminal name in THIS core's
 			// namespace. A remote terminal lives in another one, where that id either
@@ -989,30 +977,32 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 * merge-only, so sending them would either create a forked root node there or
 	 * point a remote child at a database it cannot open.
 	 */
-	private childEnv(input: SpawnInput, host: string | undefined): Record<string, string> {
+	/**
+	 * The env for a child, by machine.
+	 *
+	 * LOCAL: the parent's PATH/HOME/terminal identity/memory profile plus the
+	 * launch's overlay — byte-identical to what this backend has always sent.
+	 *
+	 * REMOTE: **nothing**. Sending the parent's env there is not "more environment",
+	 * it is a different machine's facts dressed as its own: measured on the first
+	 * real cross-machine run, a forwarded env made the remote `pi` report
+	 * `No models available` (it looked for credentials where the PARENT keeps them)
+	 * and truncated its PATH to the parent's shape, so `npx` vanished and an MCP
+	 * server died with `spawn npx ENOENT`. `hc`'s own env is a small baseline that
+	 * the remote process already inherits; anything this process adds is pollution
+	 * with a plausible shape. The remote `pi` reads ITS credentials from ITS config,
+	 * which is the only correct source.
+	 *
+	 * Returns `undefined` for a remote child so `terminal.run` is sent WITHOUT the
+	 * `env` key at all: an empty object and an absent key are the same instruction to
+	 * `hc` (merge nothing), and absent is what a launch that never had an overlay
+	 * would send anyway.
+	 */
+	private childEnv(input: SpawnInput, host: string | undefined): Record<string, string> | undefined {
+		// `host` is the ONE machine dimension here: `normalizeHost` decided "remote"
+		// before this was called, so a non-undefined value means "not this machine".
+		if (host !== undefined) return undefined;
 		const env: Record<string, string> = {};
-		if (host !== undefined) {
-			// m4/m5 (review s01): the memory profile is a PARENT fact, like PATH/HOME.
-			// `childMemoryEnv` merges this host's `NODE_OPTIONS` text verbatim (a string
-			// full of absolute paths, e.g. `--require /abs/x.js`) and adds a heap cap so
-			// a LOCAL child cannot eat this process's address space. Sending either one
-			// over the wire projects this machine's paths onto another (D6/D7) and caps
-			// a bash tree that lives there; the remote core's own environment is the
-			// right answer for its own children. So neither key is sent.
-			for (const [key, value] of Object.entries(input.env ?? {})) {
-				if (typeof value === "string") env[key] = value;
-			}
-			for (const key of PARENT_ENV_KEYS) delete env[key];
-			for (const key of LEGION_IDENTITY_ENV_KEYS) delete env[key];
-			// The memory companion key (`PI_LEGION_HOST_NODE_OPTIONS`) is a parent
-			// fact like the rest of the prefix: it exists so a LOCAL child restores
-			// the host's NODE_OPTIONS. One exception survives, because it is an
-			// instruction to the child rather than a path into this host's state.
-			for (const key of Object.keys(env)) {
-				if (key.startsWith(LEGION_ENV_PREFIX) && key !== REMOTE_KEPT_LEGION_ENV) delete env[key];
-			}
-			return env;
-		}
 		const parentPath = this.env.PATH;
 		if (typeof parentPath === "string" && parentPath.length > 0) env.PATH = parentPath;
 		const home = this.env.HOME;

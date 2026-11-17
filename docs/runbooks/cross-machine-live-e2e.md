@@ -28,7 +28,8 @@ fetch 到。这一份只问真机器。
 | 同一仓库的 checkout，**同一提交** | `hc exec --on vps -- git -C /srv/app rev-parse HEAD` | S5.1 的 HEAD 断言不过；S5.5 的 worktree 会从旧提交起 |
 | 同一个 origin URL | `hc exec --on vps -- git -C /srv/app remote get-url origin` | 启动前就会拒绝（`its checkout ... has origin 'x' but this checkout's is 'y'`） |
 | `git` 可用 | `hc exec --on vps -- git --version` | S5.1 的 `--is-inside-work-tree` 拿不到 true |
-| `node` / `pi` 在 PATH | `hc exec --on vps -- sh -c 'command -v node pi'` | preflight exit 12 / 13（10 秒内） |
+| `node` 在 PATH（或给绝对路径） | `hc exec --on vps -- sh -c 'command -v node'` | preflight exit 12（10 秒内） |
+| **`piCli` 必须是 node 能执行的 JS 入口**，不是 shell 启动器 | `hc exec --on vps -- /root/.nvm/.../node /root/.pi/.../dist/bundle/cli.js --version` | 给 `/root/.pi/agent/bin/pi` 这种启动器 → preflight exit 16（10 秒内）。正确形态：`…/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js` |
 | 本包已装在目标机（`piLegionRoot`） | `hc exec --on vps -- test -f /srv/app/index.ts && echo ok` | preflight exit 14（10 秒内），文案点名 `piLegionRoot` |
 | **两侧 checkout 路径不同**（几乎总是如此） | 父机 `pwd` vs `PI_LEGION_REMOTE_CWD` | 若不同：**必须**设 `PI_LEGION_REMOTE_PI_LEGION_ROOT` = 目标机上本包的绝对路径。不设就会被 exit 14 拦住（实测：父机 Mac `/Users/zheng/code/pi-legion`，目标机 `/root/code/pi-legion`） |
 | **push 凭据**（S5.5 需要） | `hc exec --on vps -- git -C /srv/app ls-remote origin` | S5.5 在 `git push` 那步失败，stderr 是认证错 |
@@ -67,6 +68,8 @@ export PI_LEGION_REMOTE_NODE=/root/.nvm/versions/node/v24.13.1/bin/node
 export PI_LEGION_REMOTE_PI=/root/.pi/agent/bin/pi
 # 本包在目标机上的位置（与父机路径不同时必须给）
 export PI_LEGION_REMOTE_PI_LEGION_ROOT=/root/code/pi-legion
+# piCli 必须是 **node 能执行的 JS 入口**，不是 /root/.pi/agent/bin/pi 那种 shell 启动器
+export PI_LEGION_REMOTE_PI=/root/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
 # 可选：跑真 pi 子进程（要花一次真实 turn，且目标机必须有模型凭据）
 export PI_LEGION_REMOTE_FULL=1
 
@@ -134,7 +137,9 @@ npm run test:live -- --test-name-pattern='S5\.'
 | `cwd '/srv/app' does not exist on vps` | 目标机路径不对 | 改 `PI_LEGION_REMOTE_CWD` |
 | `node 'node' is not on PATH on vps` / `pi CLI 'pi' …` | 目标机 PATH 里没有 | 设 `PI_LEGION_REMOTE_NODE` / `_PI` 为绝对路径 |
 | `this package is not installed at /Users/zheng/code/pi-legion on that machine (every child argv loads /Users/zheng/code/pi-legion/index.ts; set subagents.crossMachine.hosts.host-workspace.piLegionRoot to where it really is, or install it there)` | **两侧 checkout 路径不同**，而 `piLegionRoot` 还指着父机路径——真机实测（Mac 父机 `/Users/zheng/code/pi-legion`，目标机 `/root/code/pi-legion`）就撞在这条上 | 设 `PI_LEGION_REMOTE_PI_LEGION_ROOT=/root/code/pi-legion`（目标机上的绝对路径），或在 settings 里配 `crossMachine.hosts.<host>.piLegionRoot`。**这条报错是正确行为**（M2 的 exit 14），不是 bug |
-| `node 'node' is not on PATH on vps` / `pi CLI 'pi' is not on PATH on vps` | 远端非交互 shell 没有 nvm/PATH（真机实测第二条） | `PI_LEGION_REMOTE_NODE=/root/.nvm/versions/node/v24.13.1/bin/node`、`PI_LEGION_REMOTE_PI=/root/.pi/agent/bin/pi` |
+| `node 'node' is not on PATH on vps` | 远端非交互 shell 没有 nvm/PATH（真机实测第二条） | `PI_LEGION_REMOTE_NODE=/root/.nvm/versions/node/v24.13.1/bin/node` |
+| `piCli '/root/.pi/agent/bin/pi' is not a JavaScript entry point node can execute …`（preflight exit 16） | `piCli` 指到了 **shell 启动器**（`case "$0"` 包一层）。子进程 argv 是 `[node, piCli, …]`，node 会把 shell 当 JS 解析，真机原文是 `SyntaxError: Unexpected token case` | 指向 JS 入口：`/root/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js` |
+| 远端 child 输出 `Warning: No models available` / `Error: No API key found` | **父机 env 曾被转发过去**（S5 真跑已修：远端 launch 现在完全不发 `env`）。若仍出现，说明该 core 自己带了这个变量 | 远端 child 的凭据只来自**那台机器**的 pi 配置；用 `hc exec --on vps -- env | grep -i pi` 看 core 自己带了什么 |
 | 所有用例都报 `machine_unknown: unknown machine: vps` | `hc machine` 注册是**按 session** 的，这个 `test-*` session 里没有那台机器 | 在同一 session 里 `hc machine add --temp --name vps ssh://user@host`，再 `hc machine ls` 确认 |
 | `the hc core there already carries legion identity` | 那个 core 自己就在一个 legion 树里（D7） | 用干净环境重起那边的 core |
 | `cross-machine delivery needs one shared remote` / `its checkout … has origin … but this checkout's is …` | 两侧 origin 不同 | 让两边指向同一个 URL |
