@@ -477,6 +477,20 @@ export function preCreateSessionFile(file: string): void {
 	}
 }
 
+/**
+ * The launcher-supplied verify commands on an agent definition (review B1).
+ *
+ * `index.ts` turns `verify:` into one criterion carrying a `command` on the
+ * LAUNCHED agent clone; nothing else writes `command`. So this predicate is the
+ * exact set of commands this machine would run on the child's behalf.
+ */
+function launcherVerifyCommands(agent: AgentConfig): string[] {
+	const criteria = agent.acceptance?.criteria ?? [];
+	return criteria
+		.map((criterion) => (typeof criterion.command === "string" ? criterion.command.trim() : ""))
+		.filter((command) => command.length > 0);
+}
+
 function canFallbackStart(error: unknown): boolean {
 	return error instanceof SubagentError &&
 		error.code !== ErrorCodes.NOT_FOUND &&
@@ -1272,6 +1286,20 @@ export class Orchestrator {
 				throw new SubagentError(
 					`host '${host}' cannot carry a utility dispatch: read-only helpers run in-process (drop host, or dispatch a command-chain role)`.trim(),
 					ErrorCodes.INVALID_PARAMS,
+				);
+			}
+			// D14 (S3 boundary, review B1): a launcher-supplied `verify` command runs
+			// through `applyVerification`, whose cwd is `child.worktreePath ?? this.cwd`
+			// — for a remote child that is THIS machine's checkout, so the verdict
+			// would describe a tree the child never touched and land on the remote
+			// child's acceptance. That is a fabricated green, the one outcome the
+			// contract refuses above all. Remote verify goes through `machine.exec`
+			// (S3); until then the launch is refused rather than quietly mis-measured.
+			if (launcherVerifyCommands(input.agent).length > 0) {
+				throw new SubagentError(
+					`host '${host}' cannot verify: a launcher-supplied \`verify\` command runs on THIS machine, so its result would describe this checkout and not the one the child works in (remote verify lands in S3). Drop \`verify\` for a cross-machine launch, or let the remote child attest for itself.`,
+					ErrorCodes.INVALID_PARAMS,
+					{ host, verify: launcherVerifyCommands(input.agent) },
 				);
 			}
 		}
@@ -3154,7 +3182,13 @@ export class Orchestrator {
 		// than having this machine's verifier run inside a path that means something
 		// else (remote verify is S3's work, not a silent local run).
 		assertLocalWorktree(child);
-		const acceptance = execution.status === "running"
+		// D14 (review B1): the same rule as the launch refusal, applied to a record
+		// that already exists (an old run.json, a resumed child, a record written
+		// before the refusal landed). `applyVerification` runs commands with a cwd on
+		// THIS machine, so for a child that ran elsewhere the honest answer is the
+		// child's own attestation, never a locally measured pass.
+		const remoteChild = normalizeHost(child.host) !== undefined;
+		const acceptance = execution.status === "running" || remoteChild
 			? derived
 			: await applyVerification(derived, {
 				cwd: child.worktreePath ?? this.cwd,

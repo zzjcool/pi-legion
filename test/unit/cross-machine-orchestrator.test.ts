@@ -228,3 +228,63 @@ test("D1: resolveHostTarget refuses a pathMap entry that is relative on either s
 		/must be absolute on both sides/,
 	);
 });
+
+test("B1: a launcher-supplied verify command is refused on a host launch (no fake green)", async () => {
+	// `applyVerification` runs with `cwd: child.worktreePath ?? this.cwd`. A remote
+	// child has no local worktree, so its verify would run in THIS machine's
+	// checkout and be recorded on the REMOTE child's acceptance — a verdict about
+	// a tree the child never touched. Until S3 runs it through `machine.exec`, the
+	// launch must be refused, not quietly mis-measured.
+	const h = harness("xm-guard-verify-");
+	await insideHcTerminal(async () => {
+		try {
+			const withVerify = {
+				...agent(),
+				acceptance: {
+					level: "attested" as const,
+					criteria: [{
+						id: "task-verify",
+						must: "Launcher-supplied verify commands pass",
+						evidence: ["verification-output"],
+						severity: "required" as const,
+						command: "npm test",
+					}],
+				},
+			};
+			await assert.rejects(
+				() => h.orchestrator.launch({ agent: withVerify, task: "t", host: HOST, hostTarget: target() }),
+				expectRefusal(/cannot verify/),
+			);
+			assert.equal(h.supervisor.calls.length, 0, "no child may start");
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("B1: a child-only acceptance criterion (no command) still launches on a host", async () => {
+	// The refusal is about COMMANDS this machine would run. A criterion the child
+	// itself attests to ("the suite is green") is the remote child's own claim and
+	// travels with its verdict — it must not be refused.
+	const h = harness("xm-guard-verify-ok-");
+	await insideHcTerminal(async () => {
+		try {
+			const attested = {
+				...agent(),
+				acceptance: {
+					level: "attested" as const,
+					criteria: [{
+						id: "self-report",
+						must: "the child reports the suite as green",
+						evidence: ["verdict"],
+						severity: "required" as const,
+					}],
+				},
+			};
+			const handle = await h.orchestrator.launch({ agent: attested, task: "t", host: HOST, hostTarget: target() });
+			assert.equal(handle.child.host, HOST);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
