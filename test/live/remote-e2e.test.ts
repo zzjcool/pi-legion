@@ -25,7 +25,19 @@
  *                           and costs a real turn; it is opt-in.
  *   PI_LEGION_REMOTE_NODE / PI_LEGION_REMOTE_PI
  *                           optional. Programs to use on that machine
- *                           (default `node` / `pi`).
+ *                           (default `node` / `pi`). A non-interactive remote
+ *                           shell usually has NO nvm/PATH setup, so give absolute
+ *                           paths (`/root/.nvm/versions/node/…/node`,
+ *                           `/root/.pi/agent/bin/pi`) or the preflight says
+ *                           `node 'node' is not on PATH on <host>` in ten seconds.
+ *   PI_LEGION_REMOTE_PI_LEGION_ROOT
+ *                           optional. Where THIS package lives on that machine.
+ *                           The two checkouts are almost never at the same path
+ *                           (parent Mac `/Users/…/code/pi-legion`, target
+ *                           `/root/code/pi-legion`), and every child's argv loads
+ *                           `<root>/index.ts` over there. Unset ⇒ the parent path
+ *                           is used and the preflight refuses with exit 14 — which
+ *                           is the right answer, not a bug.
  *
  * Missing gate ⇒ `test.skip` with the reason, so `npm run test:live` is a no-op on
  * a machine that has no remote configured instead of a false red.
@@ -64,6 +76,7 @@ const CWD = (process.env.PI_LEGION_REMOTE_CWD ?? "").trim();
 const ORIGIN = (process.env.PI_LEGION_REMOTE_ORIGIN ?? "").trim();
 const NODE = (process.env.PI_LEGION_REMOTE_NODE ?? "node").trim() || "node";
 const PI = (process.env.PI_LEGION_REMOTE_PI ?? "pi").trim() || "pi";
+const PI_LEGION_ROOT = (process.env.PI_LEGION_REMOTE_PI_LEGION_ROOT ?? "").trim();
 const FULL = process.env.PI_LEGION_REMOTE_FULL === "1";
 const SESSION = process.env.HC_SESSION ?? "";
 
@@ -97,7 +110,18 @@ const LOCAL_REPO = execFileSync("git", ["-C", path.resolve(import.meta.dirname),
 function target(): HostTarget {
 	const resolved = resolveHostTarget(HOST, {
 		enabled: true,
-		hosts: { [HOST]: { cwd: CWD, node: NODE, piCli: PI } },
+		hosts: {
+			[HOST]: {
+				cwd: CWD,
+				node: NODE,
+				piCli: PI,
+				// Only when the operator says where the package lives over there. Unset
+				// keeps today's behaviour (the parent's path, refused by the preflight):
+				// guessing another checkout's layout would be exactly the silent
+				// wrong-path launch M2 exists to prevent.
+				...(PI_LEGION_ROOT ? { piLegionRoot: PI_LEGION_ROOT } : {}),
+			},
+		},
 	});
 	return resolved;
 }

@@ -29,7 +29,8 @@ fetch 到。这一份只问真机器。
 | 同一个 origin URL | `hc exec --on vps -- git -C /srv/app remote get-url origin` | 启动前就会拒绝（`its checkout ... has origin 'x' but this checkout's is 'y'`） |
 | `git` 可用 | `hc exec --on vps -- git --version` | S5.1 的 `--is-inside-work-tree` 拿不到 true |
 | `node` / `pi` 在 PATH | `hc exec --on vps -- sh -c 'command -v node pi'` | preflight exit 12 / 13（10 秒内） |
-| 本包已装在目标机（`piLegionRoot`） | `hc exec --on vps -- test -f /srv/app/.pi-legion/index.ts && echo ok` | preflight exit 14（10 秒内），文案点名 `piLegionRoot` |
+| 本包已装在目标机（`piLegionRoot`） | `hc exec --on vps -- test -f /srv/app/index.ts && echo ok` | preflight exit 14（10 秒内），文案点名 `piLegionRoot` |
+| **两侧 checkout 路径不同**（几乎总是如此） | 父机 `pwd` vs `PI_LEGION_REMOTE_CWD` | 若不同：**必须**设 `PI_LEGION_REMOTE_PI_LEGION_ROOT` = 目标机上本包的绝对路径。不设就会被 exit 14 拦住（实测：父机 Mac `/Users/zheng/code/pi-legion`，目标机 `/root/code/pi-legion`） |
 | **push 凭据**（S5.5 需要） | `hc exec --on vps -- git -C /srv/app ls-remote origin` | S5.5 在 `git push` 那步失败，stderr 是认证错 |
 | **模型凭据**（S5.6 需要） | `hc exec --on vps -- pi -p 'say ok'` 之类 | S5.6 起得来但永远不写 session，最终超时 |
 | 该 core **不带** legion identity | `hc exec --on vps -- sh -c 'echo ${PI_LEGION_DB-}'` | 启动被拒（D7，exit 15）——这是刻意的 |
@@ -41,6 +42,18 @@ fetch 到。这一份只问真机器。
 
 ## 1. 一次性环境
 
+> **先在这个 session 里注册机器。** `HC_SESSION` 隔离的不只是终端命名空间，**`hc machine`
+> 的注册也是按 session 的**：父机 `hc machine ls` 里看得到的 host，在这个 `test-*` session 里
+> 是**看不到**的，所有用例都会报 `machine_unknown`。必须先在同一个 session 里注册：
+>
+> ```bash
+> export HC_SESSION=test-cross-machine-$$
+> hc machine add --temp --name vps ssh://user@host-workspace
+> hc machine ls                       # 必须在列表里看到 vps，再往下走
+> ```
+>
+> `--temp` 表示随 session 结束而消失，不会污染长期注册表。
+
 ```bash
 # 目标机的 hc 名字（hc machine ls 里的那个）
 export PI_LEGION_REMOTE_HOST=vps
@@ -48,9 +61,12 @@ export PI_LEGION_REMOTE_HOST=vps
 export PI_LEGION_REMOTE_CWD=/srv/app
 # 可选：双方都可达的 bare 仓库（S5.5 用）。不设 → S5.5 跳过
 export PI_LEGION_REMOTE_ORIGIN=/srv/git/pi-legion.git
-# 可选：目标机上的程序名（默认就是这两个）
-export PI_LEGION_REMOTE_NODE=node
-export PI_LEGION_REMOTE_PI=pi
+# 目标机上的程序：**给绝对路径**。远端非交互 shell 没有 nvm/PATH 初始化，
+# 用默认的 "node"/"pi" 会在 10 秒内报 node 'node' is not on PATH on <host>。
+export PI_LEGION_REMOTE_NODE=/root/.nvm/versions/node/v24.13.1/bin/node
+export PI_LEGION_REMOTE_PI=/root/.pi/agent/bin/pi
+# 本包在目标机上的位置（与父机路径不同时必须给）
+export PI_LEGION_REMOTE_PI_LEGION_ROOT=/root/code/pi-legion
 # 可选：跑真 pi 子进程（要花一次真实 turn，且目标机必须有模型凭据）
 export PI_LEGION_REMOTE_FULL=1
 
@@ -117,7 +133,9 @@ npm run test:live -- --test-name-pattern='S5\.'
 | `host 'vps' unreachable: <kind>: …` | core 连不上那台机器（ssh/socket） | 先手工 `hc exec --on vps -- true` |
 | `cwd '/srv/app' does not exist on vps` | 目标机路径不对 | 改 `PI_LEGION_REMOTE_CWD` |
 | `node 'node' is not on PATH on vps` / `pi CLI 'pi' …` | 目标机 PATH 里没有 | 设 `PI_LEGION_REMOTE_NODE` / `_PI` 为绝对路径 |
-| `this package is not installed at … on that machine` | `piLegionRoot` 不对 | 在目标机装本包，或配 `crossMachine.hosts.vps.piLegionRoot` |
+| `this package is not installed at /Users/zheng/code/pi-legion on that machine (every child argv loads /Users/zheng/code/pi-legion/index.ts; set subagents.crossMachine.hosts.host-workspace.piLegionRoot to where it really is, or install it there)` | **两侧 checkout 路径不同**，而 `piLegionRoot` 还指着父机路径——真机实测（Mac 父机 `/Users/zheng/code/pi-legion`，目标机 `/root/code/pi-legion`）就撞在这条上 | 设 `PI_LEGION_REMOTE_PI_LEGION_ROOT=/root/code/pi-legion`（目标机上的绝对路径），或在 settings 里配 `crossMachine.hosts.<host>.piLegionRoot`。**这条报错是正确行为**（M2 的 exit 14），不是 bug |
+| `node 'node' is not on PATH on vps` / `pi CLI 'pi' is not on PATH on vps` | 远端非交互 shell 没有 nvm/PATH（真机实测第二条） | `PI_LEGION_REMOTE_NODE=/root/.nvm/versions/node/v24.13.1/bin/node`、`PI_LEGION_REMOTE_PI=/root/.pi/agent/bin/pi` |
+| 所有用例都报 `machine_unknown: unknown machine: vps` | `hc machine` 注册是**按 session** 的，这个 `test-*` session 里没有那台机器 | 在同一 session 里 `hc machine add --temp --name vps ssh://user@host`，再 `hc machine ls` 确认 |
 | `the hc core there already carries legion identity` | 那个 core 自己就在一个 legion 树里（D7） | 用干净环境重起那边的 core |
 | `cross-machine delivery needs one shared remote` / `its checkout … has origin … but this checkout's is …` | 两侧 origin 不同 | 让两边指向同一个 URL |
 | `timed_out: preflight did not finish within 10s` | **10 秒判定点 ①**：目标机 shell 起不来或极慢 | 手工 `hc exec --on vps -- true` 计时 |
