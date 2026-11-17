@@ -337,22 +337,70 @@ test("S5.5 delivery: a remote worktree commits and pushes, and this machine fetc
 
 // ── S5.6 — a real `pi` child there (opt-in: needs a credential on that machine) ─
 
-test("S5.6 full child: a real pi process runs on that machine and its transcript is readable here", async (t) => {
+test("S5.6 full child: a real pi process runs on that machine, in the tree the parent gave it", async (t) => {
 	const skip = gateSkipReason({ full: true });
 	if (skip) return t.skip(skip);
-	// The one test that needs the remote `pi` to be installed, configured and able to
-	// reach a model. Everything it asserts is about the plumbing, not the answer: the
-	// child starts in ITS tree, writes a file there, and its transcript comes home.
+	// The one test that needs the remote `pi` installed, configured and able to reach
+	// a model. Everything it asserts is about the plumbing, not the answer.
+	//
+	// LAYERING (this is what the first real run taught): the terminal backend does not
+	// decide where a cross-machine child works. `createRemoteChildWorktree` is the
+	// orchestrator's step; the backend REUSES a tree it is handed (`worktreePath`) and
+	// only creates one when asked to (`createWorktree`). So this test does both steps
+	// in the order production does, instead of asserting that the backend invented a
+	// tree it was never asked for.
 	const { TerminalSupervisor } = await import("../../src/supervisor/terminal-supervisor.ts");
 	const { createRemoteSessionReadback } = await import("../../src/runs/remote-artifact.ts");
+	// `diff` a real checkout the remote tree's `origin` can be compared against; the
+	// suite's own checkout is that checkout, and `createRemoteChildWorktree` refuses
+	// to build a tree when the two sides do not share one origin.
 	const root = mkdtempSync(path.join(tmpdir(), "s5-child-"));
-	const supervisor = new TerminalSupervisor({ runId: "test-s5", env: process.env, pollIntervalMs: 250 });
 	const name = `s5-child-${process.pid}`;
 	const sessionFile = path.join(root, "placeholder.jsonl");
 	const tempDir = path.join(root, "temp");
 	fs.mkdirSync(tempDir, { recursive: true });
 	const runDir = path.join(root, "run");
+
+	// One client for the tree step, a second (inside the supervisor) for the spawn:
+	// both are closed below, and the supervisor is closed even when an assertion
+	// fails — an `hc` connection that outlives the test keeps the whole node process
+	// alive, so "the test finished" must mean "the process can exit".
+	let treeClient: HcClient | undefined;
+	let supervisorClient: HcClient | undefined;
+	let tree: { path: string; branch: string } | undefined;
+	const supervisor = new TerminalSupervisor({
+		runId: "test-s5",
+		env: process.env,
+		pollIntervalMs: 250,
+		clientFactory: () => {
+			supervisorClient = hcCliClient({ env: process.env });
+			return supervisorClient;
+		},
+	});
+	t.after(async () => {
+		await supervisor.retire(name).catch(() => undefined);
+		if (tree) {
+			try {
+				treeClient = treeClient ?? hcCliClient({ env: process.env });
+				await treeClient.start();
+				await removeRemoteChildWorktree({ client: treeClient, target: target(), path: tree.path });
+			} catch {
+				/* the runbook says how to clean a tree by hand */
+			}
+		}
+		supervisorClient?.close();
+		treeClient?.close();
+		rmSync(root, { recursive: true, force: true });
+	});
+
 	try {
+		// Step 1 — the tree (production: orchestrator, before the spawn).
+		treeClient = hcCliClient({ env: process.env });
+		await treeClient.start();
+		tree = await createRemoteChildWorktree({ client: treeClient, target: target(), name, localRepo: LOCAL_REPO });
+		assert.match(tree.branch, new RegExp(`^pi-subagent/${HOST.replace(/[^A-Za-z0-9._-]/g, "-")}/${name}-[0-9a-f]{8}$`));
+
+		// Step 2 — the child, told to work IN that tree.
 		const handle = await supervisor.spawnChild({
 			name,
 			sessionFile,
@@ -361,6 +409,8 @@ test("S5.6 full child: a real pi process runs on that machine and its transcript
 			host: HOST,
 			hostTarget: target(),
 			worktree: true,
+			worktreePath: tree.path,
+			worktreeBranch: tree.branch,
 			agent: {
 				name: "worker",
 				kind: "pi",
@@ -370,8 +420,11 @@ test("S5.6 full child: a real pi process runs on that machine and its transcript
 			} as unknown as SpawnInput["agent"],
 			task: "Write the single word ready into S5-READY.txt in your working directory, then stop.",
 		});
+		// The handle reports the trio it was GIVEN (and the ownership pair is one value,
+		// D13): a provided tree is reused, not rebuilt.
 		assert.equal(normalizeHost(handle.worktreeHost), HOST);
-		assert.ok(handle.worktreePath && path.posix.isAbsolute(handle.worktreePath));
+		assert.equal(handle.worktreePath, tree.path, "the child must be started in the tree it was handed");
+		assert.equal(handle.worktreeBranch, tree.branch);
 		assert.ok(handle.remoteDir, "the mirror dir must come back on the handle (m6)");
 
 		// The transcript is written THERE, and read back to here.
@@ -390,8 +443,18 @@ test("S5.6 full child: a real pi process runs on that machine and its transcript
 		if (read?.ok !== true) return;
 		assert.ok(read.lines > 0, "a started child writes its session header immediately");
 		assert.equal(read.localPath, localPath);
+		// And the transcript says it is working in the tree, not in the bare checkout:
+		// this is the fact the layering above exists to guarantee.
+		const mirrored = fs.readFileSync(read.localPath, "utf8");
+		assert.match(
+			mirrored,
+			new RegExp(tree.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+			`the session header must name the tree as its cwd: ${mirrored.slice(0, 400)}`,
+		);
 	} finally {
+		// Belt and braces: `t.after` also runs on failure, but a failing assertion can
+		// throw BEFORE `t.after` is registered by an inner helper — closing here makes
+		// "no leaked hc connection" true on every path out of this test.
 		await supervisor.retire(name).catch(() => undefined);
-		rmSync(root, { recursive: true, force: true });
 	}
 });

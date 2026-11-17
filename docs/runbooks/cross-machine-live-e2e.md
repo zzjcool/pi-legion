@@ -183,7 +183,8 @@ npm run test:live -- --test-name-pattern='S5\.'
 |---|---|
 | spawn 抛 `terminal.run` 失败 | 目标机上 `pi` 起不来（版本/凭据/扩展） |
 | 起得来但 transcript 一直 0 行（5 分钟超时） | 远端 `pi` 没有可用模型凭据（**最可能的失败点**，见 §4） |
-| handle 没有 `worktreePath` | 远端建树失败（看 stderr 里 `git worktree add failed`） |
+| handle 没有 `worktreePath` / `worktreeHost` | **先确认这棵树是谁建的**：跨机建树是**编排层**的一步（`createRemoteChildWorktree`），terminal 后端只复用被交给它的 `worktreePath`，或在被要求 `createWorktree` 时才自己建。S5.6 所以先建树再 spawn —— 直接 spawn 一个没给树的 child，handle 当然没有这两个字段（这是分层，不是 bug）。若树确实建过却仍缺失，看 stderr 里 `git worktree add failed` |
+| 测试跑完 node 进程不退出 | `hc` 连接没关：`TerminalSupervisor` 的 client 要用 `clientFactory` 抓住，并在 `t.after()` 里 `close()`（S5.6 第一次真跑就踩了这个，等了 7 分钟只能 kill） |
 
 ---
 
