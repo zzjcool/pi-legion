@@ -531,3 +531,26 @@ test("M3: an inherited-style extension that cannot be mapped is dropped with a n
 		h.cleanup();
 	}
 });
+
+test("M8: a stuck name is refused by ADDRESS, so the operator knows which machine holds it", async () => {
+	// `retire` failing leaves the record live on purpose (the terminal may really be
+	// running), which is what keeps this refusal armed. A bare name is then the only
+	// clue, and "root.worker-0 is alive" does not say which machine to clear.
+	const h = harness(callerEnv());
+	try {
+		const input = spawnInput(h.root, { host: "vps", hostTarget: hostTarget() });
+		await h.supervisor.spawnChild(input);
+		await assert.rejects(
+			() => h.supervisor.spawnChild(input),
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal((error as SubagentError).code, ErrorCodes.NAME_TAKEN);
+				assert.match((error as SubagentError).message, /already registered and alive: vps\//);
+				assert.match((error as SubagentError).message, /until it is retired/);
+				return true;
+			},
+		);
+	} finally {
+		h.cleanup();
+	}
+});

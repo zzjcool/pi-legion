@@ -282,8 +282,15 @@ export class TerminalSupervisor implements LegionSupervisor {
 		}
 		const previous = this.children.get(input.name);
 		if (previous && previous.state === "live") {
+			// Review M8: an address, not just a name. A name whose retire failed stays
+			// live (that is deliberate — the terminal may really be running), so this
+			// refusal is the operator's only clue. `vps/lgl-…` says WHICH machine to
+			// clear; a bare `root.worker-0` says only that something is stuck.
+			const previousAddress = terminalAddress(previous);
 			throw new SubagentError(
-				`child is already registered and alive: ${input.name}`,
+				previousAddress === input.name
+					? `child is already registered and alive: ${input.name}`
+					: `child is already registered and alive: ${previousAddress} (the name '${input.name}' is held by that terminal until it is retired)`,
 				ErrorCodes.NAME_TAKEN,
 			);
 		}

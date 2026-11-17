@@ -1154,7 +1154,18 @@ function updateLegionRunId(db: DatabaseSync, nodeId: string, runId: string): voi
 }
 
 async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input: { pi: ExtensionAPI; supervisor: LegionSupervisor; cwd: string } }): Promise<void> {
+	// Review M9 (S5): a restart cannot take over a child that ran on another machine.
+	// This process has no `(host, terminalName)` handle on it and no transcript here —
+	// `node.sessionFile` is the local placeholder S1 pre-created — so judging its
+	// liveness with `isAlive` or its outcome from that file would be measuring the
+	// wrong machine. Name the limitation once and leave those nodes untouched.
+	const remoteAfterRestart: string[] = [];
 	for (const node of getChildren(input.identity.db, input.identity.nodeId)) {
+		const nodeHost = normalizeHost(node.host);
+		if (nodeHost !== undefined) {
+			if (!["settled", "failed"].includes(node.status)) remoteAfterRestart.push(`${node.name} (host '${nodeHost}')`);
+			continue;
+		}
 		if (["settled", "failed"].includes(node.status) || ["done", "failed", "aborted"].includes(node.phase ?? "") || input.input.supervisor.isAlive(node.name)) continue;
 		if (node.sessionFile) {
 			const parsed = parseSessionFile(node.sessionFile);
@@ -1175,6 +1186,12 @@ async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input:
 		try {
 			await resumeLegionChild({ pi: input.input.pi, supervisor: input.input.supervisor, db: input.identity.db, dbPath: input.identity.dbPath, eventBus: input.identity.eventBus, settings: input.identity.settings, cwd: input.input.cwd, storeRootDir: input.identity.storeRootDir, parentNodeId: input.identity.nodeId, node, message: `Resume from saved session ${node.sessionFile} and continue interrupted work.`, ...(input.identity.machineForRole ? { machineForRole: input.identity.machineForRole } : {}) });
 		} catch (error) { notice(input.input.pi, `Could not resume ${node.id}: ${error instanceof Error ? error.message : String(error)}`); }
+	}
+	if (remoteAfterRestart.length > 0) {
+		notice(
+			input.input.pi,
+			`Not taken over after restart: ${remoteAfterRestart.join(", ")}. A child that ran on another machine has no handle in this process and its transcript is over there; cross-machine re-attach lands in S5.`,
+		);
 	}
 }
 
@@ -3989,6 +4006,20 @@ export async function collectChild(
 	if (mail) beginMailHold(mail.nodeId);
 	try {
 		if (signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
+		// D15 (review M5): the transcript of a cross-machine child is on THAT machine.
+		// Everything below parses `child.sessionFile` — a local path that S1 pre-created
+		// and the remote child never writes — so a collect would wait for the child and
+		// then answer with an empty result and no explanation. Read-back is S4; until it
+		// lands, say so instead of pretending the child produced nothing.
+		// `?.`: a control action can resolve a name to a run without a record (the
+		// durable path). No record is no host, which is "this machine".
+		const collectHost = normalizeHost(ctx.found.child?.host);
+		if (collectHost !== undefined) {
+			return fail(
+				`child '${ctx.name}' ran on host '${collectHost}': its transcript is on that machine, so this collect cannot read it (remote read-back lands in S4). Use \`status\` for liveness, or \`resume\` to relaunch it there.`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
 		// #384: the inbox is checked BEFORE anything claims a result, so a preempted
 		// collect never holds a #352 claim for a result it will not deliver.
 		if (mail) {

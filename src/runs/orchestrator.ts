@@ -1690,7 +1690,15 @@ export class Orchestrator {
 			};
 		} catch (error) {
 			this.admitting.delete(name);
-			if (spawned) await this.supervisor.retire(name).catch(() => {});
+			if (spawned) {
+				// Review M8: a failed rollback kill used to vanish, leaving a live terminal
+				// that keeps the NAME_TAKEN guard armed with no trace of why.
+				await this.supervisor.retire(name).catch((error: unknown) => {
+					process.stderr.write(
+						`[pi-legion] could not retire '${name}' after a failed launch: ${error instanceof Error ? error.message : String(error)}. That terminal may still be running; retire it explicitly before relaunching the name.\n`,
+					);
+				});
+			}
 			// #371 (m8): unconditional — `rollbackReservation` only runs once the launch
 			// reached `reserveNode`, but worktree creation and provisioning fail before
 			// that and still need the entry gone.

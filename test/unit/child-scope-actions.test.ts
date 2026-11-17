@@ -167,11 +167,11 @@ function indexHarness() {
 		 * `collect` then has to resolve the name from `run.json`, which is where the
 		 * old cross-run preference handed back another run's node.
 		 */
-		async addOwnChild(name: string, state: ChildRecord["state"], output: string) {
+		async addOwnChild(name: string, state: ChildRecord["state"], output: string, extra: Partial<ChildRecord> = {}) {
 			const runId = this.sessionRunId();
 			const sessionFile = path.join(store.runDir(runId), `${name}.jsonl`);
 			writeDecoySession(sessionFile, output);
-			await store.addChild(runId, childStub({ name, state, sessionFile }));
+			await store.addChild(runId, childStub({ name, state, sessionFile, ...extra }));
 			return { runId, sessionFile };
 		},
 		/** The record one run holds for `name`, read back from `run.json`. */
@@ -505,6 +505,33 @@ test("#312 status: a cross-store record that IS this session's child carries no 
 		assert.match(status.text, /worker-0 — state=/);
 		assert.doesNotMatch(status.text, /not a direct child/);
 		assert.doesNotMatch(status.text, /resolved:/);
+	} finally {
+		await harness.cleanup();
+	}
+});
+
+test("M5: collecting a child that ran on another machine says so instead of returning an empty result", async () => {
+	// The transcript is on THAT machine. `sessionFile` here is the local placeholder
+	// the remote launch pre-created, so parsing it yields nothing — and a silent empty
+	// answer reads as "the child produced nothing", which is a lie about another
+	// machine's work. Read-back is S4; until then the collect refuses by name.
+	const harness = indexHarness();
+	try {
+		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
+		await harness.addOwnChild(
+			"worker-0",
+			"exited",
+			'{"ok": true, "reason": "remote-work"}',
+			{ host: "vps", worktreePath: "/srv/app/.pi-worktrees/worker-0", worktreeHost: "vps" },
+		);
+		const collected = await harness.invoke({ action: "collect", name: "worker-0" });
+		assert.equal(collected.details?.error, "INVALID_PARAMS");
+		assert.match(collected.text, /ran on host 'vps'/);
+		assert.match(collected.text, /transcript is on that machine/);
+		assert.match(collected.text, /S4/);
+		// The child's own reason must NOT leak into the answer as if it were collected
+		// here — the whole point is that nothing was read on this machine.
+		assert.doesNotMatch(collected.text, /remote-work/);
 	} finally {
 		await harness.cleanup();
 	}
