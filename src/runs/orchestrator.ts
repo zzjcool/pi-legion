@@ -94,6 +94,7 @@ import {
 	resolveLaunchWorktree,
 } from "./worktree.ts";
 import { provisionWorktree } from "./provision.ts";
+import { normalizeHost } from "./remote.ts";
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
@@ -206,6 +207,13 @@ export interface LaunchInput {
 	modelProvider?: string;
 	thinking?: string | false;
 	worktree?: boolean;
+	/**
+	 * Target machine for this launch; absent = this host (contract
+	 * `cross-machine-spawn-v1` D4). Normalized once by `normalizeHost` below and
+	 * carried to the backend on `SpawnInput.host` — nothing else in the launch
+	 * reads it in S0.
+	 */
+	host?: string;
 	modelOrigin?: ModelOrigin;
 	/** Vexillatio launch: bypass nested-depth gates while recording its parent-side Legion node. */
 	utilityDispatch?: boolean;
@@ -762,7 +770,7 @@ export class Orchestrator {
 		return gate.value;
 	}
 
-	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string }): Promise<boolean> {
+	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string; host?: string }): Promise<boolean> {
 		const legion = this.legion;
 		const parentRunId = legion?.runId;
 		if (!legion?.runStore || !parentRunId) return false;
@@ -780,6 +788,7 @@ export class Orchestrator {
 				child.nodeId = input.nodeId;
 				if (input.model) child.model = input.model;
 				if (input.worktreePath) child.worktreePath = input.worktreePath;
+				if (input.host) child.host = input.host;
 			});
 			return false;
 		}
@@ -794,6 +803,7 @@ export class Orchestrator {
 			kind: input.agent.kind,
 			...(input.model ? { model: input.model } : {}),
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
+			...(input.host ? { host: input.host } : {}),
 		});
 		return true;
 	}
@@ -1099,6 +1109,10 @@ export class Orchestrator {
 		}
 		const generated = input.name ?? (this.legion ? this.allocateLegionName(input.agent.name) : this.allocateName(input.agent.name));
 		const name = this.legion ? this.legionLocalName(generated) : generated;
+		// The one host decision for this launch (contract D4): absent, blank and
+		// whitespace-only all mean this host, so every downstream read is a plain
+		// truthiness test on a normalized value instead of a per-site guess.
+		const host = normalizeHost(input.host);
 		const nodeId = this.legion ? nodeIdForChild(this.legion.nodeId, name) : undefined;
 		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
 		// D3-a: a `queued` record carries a PLACEHOLDER session file, so it must never
@@ -1370,7 +1384,7 @@ export class Orchestrator {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
 				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess, ...(machine ? { phases: machine } : {}) });
 				reserved = true;
-				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}) });
+				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}), ...(host ? { host } : {}) });
 			}
 			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId, machine);
 			if (input.stripLegionIdentity) {
@@ -1394,6 +1408,9 @@ export class Orchestrator {
 					tempDir,
 					cwd: worktreePath ?? this.cwd,
 					env: childEnv,
+					// S0: carried, never acted on beyond the terminal backend's `on`. The
+					// backend consumes `host` only; env/argv rewriting is a later stage.
+					...(host ? { host } : {}),
 					...(model ? { model } : {}),
 					// REV-1.2: the pin was computed for CANDIDATE 0's model, so only that
 					// candidate may carry it. Handing it to a fallback routes the retry to a
@@ -1513,6 +1530,7 @@ export class Orchestrator {
 					: input.thinking ?? input.agent.thinking,
 				...(worktreePath ? { worktreePath } : {}),
 				...(worktreeBranch ? { worktreeBranch } : {}),
+				...(host ? { host } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
 			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
@@ -2445,6 +2463,8 @@ export class Orchestrator {
 		thinking?: string | false;
 		worktreePath?: string;
 		worktreeBranch?: string;
+		/** Machine this child runs on; absent = this host (contract D5). */
+		host?: string;
 	}): ChildRecord {
 		const child: ChildRecord = {
 			name: input.name,
@@ -2465,6 +2485,7 @@ export class Orchestrator {
 			spawnMode: input.spawnMode,
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
+			...(input.host ? { host: input.host } : {}),
 		};
 		this.children.set(input.name, child);
 		this.spawned += 1;

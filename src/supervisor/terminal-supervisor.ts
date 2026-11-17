@@ -20,6 +20,7 @@ import { formatChildTask } from "../extension/child-guard.ts";
 import { buildPiArgs } from "../runs/args.ts";
 import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
+import { normalizeHost } from "../runs/remote.ts";
 import { childMemoryEnv } from "./child-memory.ts";
 import { defaultPiCliPath } from "./rpc-supervisor.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
@@ -130,6 +131,14 @@ interface TerminalChildRecord {
 	readonly name: string;
 	/** `hc` terminal name — the only name later calls use (D7). */
 	readonly terminalName: string;
+	/**
+	 * Machine the terminal runs on; absent = this host.
+	 *
+	 * Kept on the record because every later call (`get`/`send`/`interrupt`/
+	 * `kill`/`rm`) must address a remote terminal as `host/name`; the bare name is
+	 * unique per core, not across machines (contract D2).
+	 */
+	host?: string;
 	tempDir?: string;
 	state: "live" | "finished" | "retired";
 	/** Last observed turn counter. */
@@ -220,6 +229,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 		}
 		const client = await this.ensureClient();
 		const terminalNameForChild = terminalName(this.runId, input.name);
+		// Absent/blank = this host (contract D4). Normalized ONCE here: `on`, the
+		// record and every later address all read this one value.
+		const host = normalizeHost(input.host);
 
 		let tempDir: string | undefined;
 		let argv: string[];
@@ -240,6 +252,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 				tempDir: _tempDir,
 				stripLegionIdentity: _stripLegionIdentity,
 				childLaunchContext: _childLaunchContext,
+				// `host` is transport, not argv: it reaches the wire as `on` below and
+				// must never leak into `buildPiArgs`.
+				host: _host,
 				...buildInput
 			} = input;
 			const built = buildPiArgs({ ...buildInput, tempDir, includeTask: false });
@@ -263,6 +278,10 @@ export class TerminalSupervisor implements LegionSupervisor {
 			env: this.childEnv(input),
 			labels: await this.childLabels(input),
 			...(this.caller ? { caller: this.caller } : {}),
+			// The ONE machine dimension crossing the wire (contract D2): legion says
+			// `host`, `hc` says `on`. Absent ⇒ the key is absent, so the params are
+			// byte-identical to the local launch (D4).
+			...(host ? { on: host } : {}),
 		};
 
 		let run: HcTerminalFacts;
@@ -293,6 +312,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const record: TerminalChildRecord = {
 			name: input.name,
 			terminalName: mappedName,
+			...(host ? { host } : {}),
 			...(tempDir ? { tempDir } : {}),
 			state: "live",
 			turn,

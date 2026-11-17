@@ -148,6 +148,7 @@ import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
+import { normalizeHost } from "./src/runs/remote.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
@@ -278,6 +279,12 @@ const TaskItem = Type.Object({
 				"Parent decides isolation for this child. true = own git branch, child delivers that branch (an MR when the repository has a remote). false = write the current checkout. Reserved for `centurion` (#214): any other role asking for true is downgraded to false with a one-time warning.",
 		}),
 	),
+	host: Type.Optional(
+		Type.String({
+			description:
+				"Target machine name, spelled exactly as `hc machine ls` reports it. Only the terminal backend (an `hc` host) supports it; omit to run on this host. Remote paths are absolute paths ON that machine, not translated from here.",
+		}),
+	),
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
@@ -335,6 +342,12 @@ const SubagentParams = Type.Object({
 		Type.Boolean({
 			description:
 				"Parent decides isolation. true = isolated git branch, child delivers that branch (an MR when the repository has a remote). false = edit the current checkout. Reserved for `centurion` (#214): only a centurion gets a subtree worktree, every other role is downgraded to false with a one-time warning — dispatch a centurion when you need an isolated delivery unit.",
+		}),
+	),
+	host: Type.Optional(
+		Type.String({
+			description:
+				"Target machine name, spelled exactly as `hc machine ls` reports it (the `hc` host configured on this machine). Only the terminal backend supports a cross-machine launch: the child then runs on that machine's own `hc` core instead of here. Omit = this host. A remote path is an absolute path ON that machine; paths from here are never translated, so `cwd`/worktree paths refer to the remote filesystem. One `tasks[]` entry may name its own machine; the call-level value is the default for every step.",
 		}),
 	),
 	verify: Type.Optional(
@@ -458,6 +471,15 @@ const VexillatioParams = Type.Object({
 		}),
 	),
 	model: Type.Optional(Type.String()),
+	// Same wire meaning as `subagent.host` (`hc machine ls` name, omit = this host),
+	// per step or for the whole batch. Utility children are read-only helpers that
+	// return text, so a machine only matters once the transport honors it.
+	host: Type.Optional(
+		Type.String({
+			description:
+				"Target machine name, spelled exactly as `hc machine ls` reports it. Omit = this host; remote paths are absolute paths ON that machine.",
+		}),
+	),
 	// NOT the same default as the wait action's `timeoutMs`: this one settles a utility
 	// launch, and the handler uses a flat 600000 (`input.params.timeoutMs ?? 600_000`).
 	timeoutMs: Type.Optional(Type.Number({ description: "Per-child wait in ms, default 600000" })),
@@ -1396,7 +1418,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	// `nodes` table has no provider column and is deliberately not migrated, so
 	// this must never be looked up there. Records written before the field
 	// existed simply have none — then no pin is replayed rather than a guessed one.
-	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), worktree: Boolean(saved.worktreePath) });
+	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), ...(saved.host ? { host: saved.host } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
@@ -4668,7 +4690,7 @@ interface LaunchSession {
  */
 async function launchStep(
 	session: LaunchSession,
-	step: { agent: string; task: string; name?: string; model?: string; preset?: string; worktree?: boolean; verify?: string[] },
+	step: { agent: string; task: string; name?: string; model?: string; preset?: string; worktree?: boolean; host?: string; verify?: string[] },
 ): Promise<void> {
 	if (session.signal?.aborted) return;
 	const agent = findAgent(session.agents, step.agent);
@@ -4754,6 +4776,11 @@ async function launchStep(
 		// (scout-N). The index must not race separate subagent tool calls for auto
 		// names.
 		const name = step.name ?? session.launchName;
+		// Same precedence as `worktree`: an explicit per-step value wins over the
+		// call-level one, which wins over the role card's default; absent everywhere
+		// = this host (contract D4). Normalized here so the orchestrator and the
+		// backend never re-decide what "blank" means.
+		const host = normalizeHost(step.host) ?? normalizeHost(session.params.host) ?? normalizeHost(effective.host);
 		const handle = await session.orchestrator.launch({
 			agent: launchedAgent,
 			task: step.task,
@@ -4773,6 +4800,7 @@ async function launchStep(
 				launch: session.params.worktree,
 				step: step.worktree,
 			}),
+			...(host ? { host } : {}),
 			// #371: a phase machine is declared by the ROOT at dispatch time and is a
 			// property of the launch, not of a step — `tasks[]` fan-out carries the
 			// same declaration to every sibling (G3 then refuses any step that is not
@@ -5028,6 +5056,7 @@ type Plan =
 				model?: string;
 				preset?: string;
 				worktree?: boolean;
+				host?: string;
 			}>;
 	  }
 	| { ok: false; message: string };
@@ -5568,6 +5597,7 @@ export function buildPlan(params: {
 		model?: string;
 		preset?: string;
 		worktree?: boolean;
+		host?: string;
 		verify?: string[];
 	}>;
 	worktree?: boolean;
@@ -5626,6 +5656,8 @@ interface PlanStep {
 	model?: string;
 	preset?: string;
 	worktree?: boolean;
+	/** Per-step target machine; absent = the call-level `host`, then the card. */
+	host?: string;
 	verify?: string[];
 }
 

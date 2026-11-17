@@ -1439,3 +1439,34 @@ test("#301 prose guard: no shipped surface names a removed role outside an expli
 			`${hits.join("\n")}`,
 	);
 });
+
+// ── cross-machine-spawn-v1 D2: `host` is the machine, never `machine` ────────
+
+test("host is a known frontmatter field and lands on AgentConfig.host", () => {
+	const doc = [
+		"---",
+		"name: probe",
+		"description: d",
+		"kind: pi",
+		"worktree: true",
+		"host: vps",
+		"---",
+		"body",
+	].join("\n");
+	const agent = parseAgentDocument(doc, "/x/probe.md", "user");
+	assert.ok(agent);
+	assert.equal(agent.host, "vps", "the target machine must survive parsing");
+	assert.equal(agent.worktree, true, "host is independent of worktree ownership");
+
+	// Blank is "this host", not a machine whose name happens to be empty.
+	const blank = parseAgentDocument(doc.replace("host: vps", 'host: "   "'), "/x/probe.md", "user");
+	assert.ok(blank);
+	assert.equal(blank.host, undefined);
+
+	// The naming red line is enforced by the same closed field set: `machine` is
+	// taken by the phase machine, so a card spelling it that way must not load.
+	assert.throws(
+		() => parseAgentDocument(doc.replace("host: vps", "machine: vps"), "/x/probe.md", "user"),
+		/unknown frontmatter field: 'machine'/,
+	);
+});

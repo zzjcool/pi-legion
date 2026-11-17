@@ -203,6 +203,11 @@ export interface AgentConfig {
 	// ── execution metadata ──
 	kind: AgentKind;
 	worktree?: boolean;
+	/**
+	 * Target machine for a cross-machine launch; absent = this host. Wire name at
+	 * the hc boundary is `on`.
+	 */
+	host?: string;
 	steer?: boolean;
 	/**
 	 * Launch backend for this role. Omit → `inprocess` (createAgentSession in
@@ -452,6 +457,22 @@ export interface ChildRecord {
 	worktreePath?: string;
 	/** Branch created in that worktree; the child ships via MR, not the parent checkout. */
 	worktreeBranch?: string;
+	/**
+	 * Machine that ran this child; absent = this host.
+	 *
+	 * Persisted so a later `collect`/`resume` in another process can tell a local
+	 * child from a cross-machine one instead of assuming every record is local.
+	 */
+	host?: string;
+	/**
+	 * Machine that OWNS `worktreePath`; absent = this host.
+	 *
+	 * `worktreePath` is therefore a path on `worktreeHost`, not on whoever reads
+	 * the record — a local `fs`/`git` call against it is refused
+	 * (`assertLocalWorktree`, contract D13). The two fields are the (host, path)
+	 * ownership pair; neither is meaningful alone for a cleanup decision.
+	 */
+	worktreeHost?: string;
 
 	// artifacts
 	artifacts?: Array<{ kind: string; path: string }>;

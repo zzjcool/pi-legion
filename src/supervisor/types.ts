@@ -34,6 +34,13 @@ export interface SpawnInput extends Omit<BuildArgsInput, "cwd" | "includeTask"> 
 	stripLegionIdentity?: boolean;
 	/** Optional Pi CLI entry point override. */
 	cliPath?: string;
+	/**
+	 * Target machine for this spawn; absent = this host (contract
+	 * `cross-machine-spawn-v1` D4). Only the terminal backend acts on it, and it
+	 * normalizes through `normalizeHost` in `../runs/remote.ts` before deciding —
+	 * that predicate is the single definition of "absent means local".
+	 */
+	host?: string;
 }
 
 /** Handle returned after the RPC process accepts its first prompt. */

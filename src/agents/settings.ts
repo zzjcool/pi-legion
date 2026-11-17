@@ -571,7 +571,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function overrideFieldExpected(field: string): string | undefined {
-	if (["description", "model", "preset", "output", "systemPrompt"].includes(field)) return "a string";
+	if (["description", "model", "preset", "output", "systemPrompt", "host"].includes(field)) return "a string";
 	if (field === "thinking") return "a string or false";
 	if (field === "kind") return `one of: ${AGENT_KINDS.join(", ")}`;
 	if (field === "onBlocked") return "a valid onBlocked policy";
@@ -584,7 +584,7 @@ function overrideFieldExpected(field: string): string | undefined {
 }
 
 function isValidOverrideField(field: string, value: unknown): boolean {
-	if (["description", "model", "preset", "output", "systemPrompt"].includes(field)) return typeof value === "string";
+	if (["description", "model", "preset", "output", "systemPrompt", "host"].includes(field)) return typeof value === "string";
 	if (field === "thinking") return typeof value === "string" || value === false;
 	if (field === "kind") return typeof value === "string" && (AGENT_KINDS as readonly string[]).includes(value);
 	if (field === "onBlocked") return typeof value === "string" && VALID_ON_BLOCKED_POLICIES.has(value);
