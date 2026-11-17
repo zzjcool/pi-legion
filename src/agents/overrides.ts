@@ -41,6 +41,9 @@ export const OVERRIDE_FIELDS = [
 	"disabled",
 	"worktree",
 	"steer",
+	// cross-machine-spawn-v1 D2: a target machine name (`hc machine ls`), never
+	// the phase machine.
+	"host",
 	// numbers
 	"timeoutMs",
 	"toolTimeoutMs",

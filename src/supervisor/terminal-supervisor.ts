@@ -20,6 +20,27 @@ import { formatChildTask } from "../extension/child-guard.ts";
 import { buildPiArgs } from "../runs/args.ts";
 import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
+import {
+	ensureRemoteDir,
+	mapRemoteArgPath,
+	mirrorRemoteFile,
+	normalizeHost,
+	classifyRemoteStartupProbe,
+	remoteStartupProbeLine,
+	REMOTE_STARTUP_PROBE_TIMEOUT_S,
+	removeRemoteDir,
+	basenameCollisions,
+	remoteDirFor,
+	remotePreflight,
+	terminalAddress,
+	type HostTarget,
+} from "../runs/remote.ts";
+import {
+	createRemoteChildWorktree,
+	provisionRemoteWorktree,
+	remotePathIsDirectory,
+	removeRemoteChildWorktree,
+} from "../runs/remote-worktree.ts";
 import { childMemoryEnv } from "./child-memory.ts";
 import { defaultPiCliPath } from "./rpc-supervisor.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
@@ -47,6 +68,15 @@ export const HERDR_SPACE_LABEL = "herdr.space";
 /** Labels every terminal child carries (D6). */
 export const LEGION_ROLE_LABEL = "legion.role";
 export const LEGION_RUN_LABEL = "legion.run";
+/**
+ * The machine a remote terminal runs on (cross-machine contract D8).
+ *
+ * Only a remote child carries it: a local child's labels stay exactly as they
+ * were, so adding "which machine" to a window label cannot change a local
+ * launch. It replaces `herdr.space` on the remote side — a bare space id belongs
+ * to the PARENT's document and would only create an orphan label there.
+ */
+export const LEGION_HOST_LABEL = "legion.host";
 
 /** `hc` requires 1–32 chars of `[a-z0-9_-]`, unique among live terminals (D7). */
 export const TERMINAL_NAME_MAX = 32;
@@ -130,6 +160,32 @@ interface TerminalChildRecord {
 	readonly name: string;
 	/** `hc` terminal name — the only name later calls use (D7). */
 	readonly terminalName: string;
+	/**
+	 * Worktree the child really got, and the machine that owns it (S2/D13).
+	 *
+	 * Recorded here as well as on the handle: a `retire`/`resume` in this process
+	 * must be able to say which machine the path belongs to without reading the
+	 * parent's ledger back.
+	 */
+	worktreePath?: string;
+	worktreeBranch?: string;
+	worktreeHost?: string;
+	/**
+	 * Machine the terminal runs on; absent = this host.
+	 *
+	 * Kept on the record because every later call (`get`/`send`/`interrupt`/
+	 * `kill`/`rm`) must address a remote terminal as `host/name`; the bare name is
+	 * unique per core, not across machines (contract D2).
+	 */
+	host?: string;
+	/**
+	 * The mirrored temp dir on `host` (D9), when this is a remote child.
+	 *
+	 * Recorded so an operator (and `legion-doctor`) can find the files a remote
+	 * child was pointed at. `retire` does NOT delete it: the same posture as a
+	 * worktree or a session file — a finished child leaves its evidence behind.
+	 */
+	remoteDir?: string;
 	tempDir?: string;
 	state: "live" | "finished" | "retired";
 	/** Last observed turn counter. */
@@ -213,24 +269,176 @@ export class TerminalSupervisor implements LegionSupervisor {
 		}
 		const previous = this.children.get(input.name);
 		if (previous && previous.state === "live") {
+			// Review M8: an address, not just a name. A name whose retire failed stays
+			// live (that is deliberate — the terminal may really be running), so this
+			// refusal is the operator's only clue. `vps/lgl-…` says WHICH machine to
+			// clear; a bare `root.worker-0` says only that something is stuck.
+			const previousAddress = terminalAddress(previous);
 			throw new SubagentError(
-				`child is already registered and alive: ${input.name}`,
+				previousAddress === input.name
+					? `child is already registered and alive: ${input.name}`
+					: `child is already registered and alive: ${previousAddress} (the name '${input.name}' is held by that terminal until it is retired)`,
 				ErrorCodes.NAME_TAKEN,
 			);
 		}
 		const client = await this.ensureClient();
 		const terminalNameForChild = terminalName(this.runId, input.name);
+		// Absent/blank = this host (contract D4). Normalized ONCE here: `on`, the
+		// record and every later address all read this one value.
+		const host = normalizeHost(input.host);
+		// A named host without a resolved target is unreachable through the public API
+		// (the orchestrator refuses it, D1) and there is no correct fallback: the
+		// target carries the remote cwd, the remote programs and the preflight.
+		// Half-crossing — sending `on` with THIS machine's argv, env and cwd — is the
+		// exact shape D6/D7 forbid, so it is refused here too rather than existing as
+		// a silent second mode nobody declared.
+		if (host !== undefined && input.hostTarget === undefined) {
+			throw new SubagentError(
+				`host '${host}': the terminal backend needs a resolved target (cwd, node, piCli); resolve it with resolveHostTarget() and pass hostTarget`,
+				ErrorCodes.INVALID_PARAMS,
+				{ host },
+			);
+		}
+		// The resolved target is what makes a named host ACTUALLY remote: the
+		// remote cwd, the remote interpreter/CLI and the preflight all come from it
+		// (`resolveHostTarget` in `../runs/remote.ts`).
+		// m2 (review s01): ONE predicate for "this launch is remote". The guard above
+		// makes `host` and `hostTarget` inseparable, so `remote === (host !== undefined)`
+		// — and three spellings of that fact is how the env/argv/labels branches drift
+		// apart when the guard is ever relaxed.
+		const target: HostTarget | undefined = host === undefined ? undefined : input.hostTarget;
+		const remote = host !== undefined && target !== undefined;
+
+		// D11: a remote worktree is created ON THAT MACHINE, by the only layer that
+		// holds both the `hc` client and the target. It runs BEFORE the preflight
+		// because the preflight's `cd -- <cwd>` cannot tell "no checkout" from "no
+		// program" (the spike's constraint): `createRemoteChildWorktree` asks the
+		// three questions in an order that can name the failing one, and the
+		// preflight still covers `node`/`pi` afterwards. A launch that ASKS for a
+		// tree (createWorktree) must never fall through to the bare checkout: the
+		// child would then write into the checkout its own parent reads.
+		let remoteWorktree: { path: string; branch: string } | undefined;
+		let createdRemoteWorktree = false;
+		let createdRemoteDir = false;
+		if (target !== undefined) {
+			const requested = typeof input.worktreePath === "string" ? input.worktreePath.trim() : "";
+			if (requested.length > 0) {
+				// Resume (D17): the tree either still exists or the branch is all that
+				// survived. Nothing is rebuilt automatically, and the existence check is
+				// explicit here because `terminal.run`'s own error cannot distinguish a
+				// missing cwd from a missing program (constraint 4).
+				if (!(await remotePathIsDirectory(client, target, requested))) {
+					throw new SubagentError(
+						`host '${target.host}': worktree ${requested} does not exist on that machine (branch ${input.worktreeBranch ?? "<unknown>"} may still hold the work; fetch it from origin or retire the node)`,
+						ErrorCodes.START_FAILED,
+						{ host: target.host, worktreePath: requested },
+					);
+				}
+				remoteWorktree = { path: requested, branch: input.worktreeBranch ?? "" };
+			} else if (input.createWorktree === true) {
+				try {
+					const tree = await createRemoteChildWorktree({
+						client,
+						target,
+						name: input.name,
+						// The local checkout is what "one shared remote" is checked against.
+						localRepo: input.cwd,
+					});
+					remoteWorktree = { path: tree.path, branch: tree.branch };
+					createdRemoteWorktree = true;
+				} catch (error) {
+					throw this.failure("remote worktree", host ?? target.host, error);
+				}
+			}
+		}
+
+		// m10: the mirror directory's rollback. Only the directory this spawn created is
+		// removed, and only on a failure path; a successful launch keeps its mirror (the
+		// child reads those files for its whole life).
+		const rollbackRemoteDir = async (): Promise<void> => {
+			if (!createdRemoteDir || target === undefined || remoteDir === undefined) return;
+			const dir = remoteDir;
+			try {
+				await removeRemoteDir(client, target, dir);
+			} catch (error) {
+				process.stderr.write(
+					`[pi-legion] host '${target.host}': could not remove the empty mirror directory ${dir}: ${error instanceof Error ? error.message : String(error)}\n`,
+				);
+			}
+		};
+
+		// D11: the rollback that pairs with the tree created above. Best effort by
+		// design: this runs on a failure path, and a cleanup error must never replace
+		// the reason the launch actually failed.
+		const rollbackRemoteWorktree = async (): Promise<void> => {
+			if (!createdRemoteWorktree || target === undefined || remoteWorktree === undefined) return;
+			const treePath = remoteWorktree.path;
+			try {
+				await removeRemoteChildWorktree({ client, target, path: treePath });
+			} catch (error) {
+				// Diagnostic only — the original failure is what the caller sees.
+				process.stderr.write(
+					`[pi-legion] host '${target.host}': could not roll back worktree ${treePath}: ${error instanceof Error ? error.message : String(error)}\n`,
+				);
+			}
+		};
+
+		// D6/D9: prove the target can host this launch, and refuse rather than send
+		// a parent path or a relative cwd. Runs BEFORE `terminal.run` so a bad cwd
+		// never creates a terminal nobody can use.
+		if (target !== undefined) {
+			try {
+				await remotePreflight(client, target);
+			} catch (error) {
+				await rollbackRemoteWorktree();
+				throw this.failure("remote preflight", host ?? target.host, error);
+			}
+		}
+
+		// D11: provision the remote tree here, because the orchestrator's
+		// `provisionWorktree()` runs `bash -lc` on THIS machine and the tree is on
+		// the other one. Same mode, same command parser, same idempotency marker.
+		if (target !== undefined && remoteWorktree !== undefined && createdRemoteWorktree) {
+			try {
+				await provisionRemoteWorktree({
+					client,
+					target,
+					worktreePath: remoteWorktree.path,
+					...(input.worktreeBootstrap !== undefined ? { mode: input.worktreeBootstrap } : {}),
+					...(input.worktreeBootstrapTimeoutMs !== undefined
+						? { timeoutMs: input.worktreeBootstrapTimeoutMs }
+						: {}),
+				});
+			} catch (error) {
+				await rollbackRemoteWorktree();
+				throw this.failure("remote worktree bootstrap", host ?? target.host, error);
+			}
+		}
 
 		let tempDir: string | undefined;
+		let remoteDir: string | undefined;
 		let argv: string[];
 		try {
 			// The system prompt is passed by file (0600), exactly like rpc. The task
 			// is NOT written to a file: an hc terminal accepts a positional message,
 			// and that is what starts turn 1 in the TUI (D4).
+			//
+			// D9: this dir is the PARENT's cleanup right (owner file + startup sweep)
+			// and is never migrated. A remote child gets a SECOND dir (below) that the
+			// file copies land in.
 			const parentTempDir = path.resolve(input.tempDir);
 			fs.mkdirSync(parentTempDir, { recursive: true });
 			tempDir = fs.mkdtempSync(path.join(parentTempDir, "terminal-child-"));
 			writeOwnerFile(path.join(tempDir, TEMP_OWNER_FILE));
+
+			if (target !== undefined) {
+				remoteDir = remoteDirFor(target, this.runId, input.name);
+				await ensureRemoteDir(client, target, remoteDir);
+				// m10: from here on, a failure leaves an empty directory behind unless it
+				// is swept. `hc` has no `file.remove`, so this flag is what allows the
+				// rollback below to use `rm -rf` on a directory THIS spawn created.
+				createdRemoteDir = true;
+			}
 
 			const {
 				name: _name,
@@ -240,37 +448,245 @@ export class TerminalSupervisor implements LegionSupervisor {
 				tempDir: _tempDir,
 				stripLegionIdentity: _stripLegionIdentity,
 				childLaunchContext: _childLaunchContext,
+				// `host` is transport, not argv: it reaches the wire as `on` below and
+				// must never leak into `buildPiArgs`. The resolved target is transport
+				// too — `cwd`/`node`/`piCli` are read from it, never rebuilt here. The
+				// worktree fields are the backend's own instructions (D11) and are
+				// consumed above, so none of them may reach the argv builder either.
+				host: _host,
+				hostTarget: _hostTarget,
+				worktree: _worktree,
+				createWorktree: _createWorktree,
+				worktreePath: _worktreePath,
+				worktreeBootstrap: _worktreeBootstrap,
+				worktreeBootstrapTimeoutMs: _worktreeBootstrapTimeoutMs,
 				...buildInput
 			} = input;
-			const built = buildPiArgs({ ...buildInput, tempDir, includeTask: false });
+
+			// D6: EVERY parent-absolute path in `argv` is rewritten, because none of
+			// them exists on the other machine. The session file is its own case (it
+			// is not under the temp dir and must keep a name the child will write);
+			// everything else keeps its basename inside the remote dir, which is
+			// where the mirrored copies land.
+			const remoteDirPath = remoteDir;
+			const rewritePath = target !== undefined && remoteDirPath !== undefined
+				? (absolutePath: string): string =>
+					absolutePath === input.sessionFile
+						? path.posix.join(remoteDirPath, "session.jsonl")
+						: path.posix.join(remoteDirPath, path.posix.basename(absolutePath))
+				: undefined;
+			const built = buildPiArgs({
+				...buildInput,
+				tempDir,
+				includeTask: false,
+				...(rewritePath ? { pathRewrite: rewritePath } : {}),
+			});
+			if (target !== undefined && remoteDirPath !== undefined) {
+				// m11: the remote dir is FLAT, so two local files with one basename become
+				// one remote file — the second mirror silently overwriting the first. This
+				// runs after `buildPiArgs` (only it knows the temp-file names) and BEFORE
+				// the first mirror, so nothing has been overwritten yet.
+				const collisions = basenameCollisions(built.tempFiles);
+				if (collisions.length > 0) {
+					throw new SubagentError(
+						`host '${target.host}': two files mirrored into ${remoteDirPath} share a name (${collisions.join(", ")}); the remote dir is flat, so one would overwrite the other`,
+						ErrorCodes.INVALID_PARAMS,
+						{ host: target.host, collisions },
+					);
+				}
+			}
+			if (target !== undefined && rewritePath !== undefined) {
+				// Only the files THIS builder wrote are mirrored: they are the ones whose
+				// names are already in `argv` (`system-prompt.md`, an oversized task).
+				for (const localFile of built.tempFiles) {
+					const remoteFile = rewritePath(localFile);
+					if (remoteFile === localFile) continue;
+					await mirrorRemoteFile(client, target, localFile, remoteFile);
+				}
+			}
+			// The branch the child is told to commit on. For a remote tree it is the one
+			// THIS launch just created (`worktree add -b` on that machine), which the
+			// parent did not know until now (D11/D12).
+			const branchForTask = remoteWorktree?.branch || input.worktreeBranch;
 			const task = formatChildTask(input.task, {
 				allowNested: input.allowNestedSubagents === true,
-				...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
+				...(branchForTask ? { worktreeBranch: branchForTask } : {}),
+				// D10/D12: on another machine the branch is the DELIVERY, not a
+				// convenience: the parent can only read it through the shared origin,
+				// so the appendix says "push it" instead of "do not push".
+				...(remote ? { remoteDelivery: true } : {}),
 			});
-			// `node <cli.js> <same flags as rpc> <task>`: the interpreter is the one
-			// running this process, so the child never depends on `node` being on the
-			// core's PATH; the flags are byte-identical to the rpc backend (D4).
-			argv = [process.execPath, this.cliPath(input), ...built.args, task];
+			if (target !== undefined && rewritePath !== undefined && remoteDirPath !== undefined) {
+				// D6's closing rule: NO parent-absolute path may survive, and none may be
+				// mapped to a path that will not exist. Two classes are mappable:
+				//
+				//   - files this builder wrote (already rewritten into the mirrored dir);
+				//   - paths inside this checkout, which the other machine has at ITS root
+				//     (the git-remote delivery model: same content, different root).
+				//
+				// Anything else (`-e <plugin install>/index.ts`, `--skill <path>`) points
+				// at a file that is not in the checkout and is not mirrored, so rewriting
+				// it would hand the remote child a path to nothing. Refuse by name.
+				// Review M3: `inheritExtensions` is ON by default and the inherited set
+				// is a list of THIS machine's install paths (`.../node_modules/pi-lens/…`).
+				// They are neither in the checkout nor under a configured `pathMap`, so a
+				// strict sweep refuses every ordinary launch — the feature would be
+				// unusable in its default configuration. An extension that cannot be
+				// mapped simply cannot be loaded over there, so it is dropped WITH a
+				// notice (never silently), while any other unmappable argv path keeps the
+				// hard refusal below.
+				const droppedExtensions: string[] = [];
+				const mappedArgs: string[] = [];
+				for (let index = 0; index < built.args.length; index += 1) {
+					const arg = built.args[index] as string;
+					if (arg === "--extension" || arg === "-e") {
+						const value = built.args[index + 1];
+						if (typeof value === "string" && path.isAbsolute(value)) {
+							try {
+								mappedArgs.push(arg, mapRemoteArgPath({
+									arg: value,
+									host: target.host,
+									remoteCwd: remoteWorktree?.path ?? target.cwd,
+									remoteDir: remoteDirPath,
+									localCwd: input.cwd,
+									pathMap: target.pathMap,
+								}));
+							} catch {
+								droppedExtensions.push(value);
+							}
+							index += 1;
+							continue;
+						}
+					}
+					mappedArgs.push(mapRemoteArgPath({
+						arg,
+						host: target.host,
+						// A remote worktree child reads ITS tree, not the bare checkout:
+						// the git-remote model says both machines hold the same content,
+						// and the tree is this launch's copy of it.
+						remoteCwd: remoteWorktree?.path ?? target.cwd,
+						remoteDir: remoteDirPath,
+						localCwd: input.cwd,
+						pathMap: target.pathMap,
+					}));
+				}
+				if (droppedExtensions.length > 0) {
+					process.stderr.write(
+						`[pi-legion] host '${target.host}': ${droppedExtensions.length} extension(s) not loadable there (no pathMap entry maps them): ${droppedExtensions.join(", ")}. Add a prefix to subagents.crossMachine.hosts.${target.host}.pathMap if the child needs them.\n`,
+					);
+				}
+				// S5.6: `--no-extensions` is right (a child must not inherit the parent's
+				// plugin set) but on a machine whose MODELS come from an extension it also
+				// removes the model provider — the real run answered `No models available`
+				// for a `pi` that works by hand there. The operator names the host-local
+				// set; each entry is appended AFTER the switch and is already a path on
+				// that machine, so it does not go through `mapRemoteArgPath`.
+				const hostExtensions = target.piExtensions.flatMap((entry) => ["--extension", entry]);
+				argv = [target.node, target.piCli, ...mappedArgs, ...hostExtensions, task];
+			} else {
+				// `node <cli.js> <same flags as rpc> <task>`: the interpreter is the one
+				// running this process, so the child never depends on `node` being on the
+				// core's PATH; the flags are byte-identical to the rpc backend (D4).
+				argv = [process.execPath, this.cliPath(input), ...built.args, task];
+			}
 		} catch (error) {
 			this.removeTempDir(tempDir);
+			await rollbackRemoteWorktree();
+			await rollbackRemoteDir();
 			throw error;
+		}
+
+		// S5.6: the child's own argv, minus its task, asked one trivial question. A
+		// remote `pi` whose model provider was disabled by `--no-extensions` starts,
+		// prints `No models available`, and then hangs until the collect deadline;
+		// the same invocation answers in seconds. Every failure below therefore lands
+		// BEFORE `terminal.run`, in the launch, with the machine and the fix named.
+		if (target !== undefined) {
+			const probe = await client.request<{ code?: number | null; stdout?: string; stderr?: string; timed_out?: boolean }>(
+				"machine.exec",
+				{
+					on: target.host,
+					line: remoteStartupProbeLine(argv, remoteWorktree?.path ?? target.cwd),
+					timeout: REMOTE_STARTUP_PROBE_TIMEOUT_S,
+				},
+			).catch((error: unknown) => {
+				// The probe is a DIAGNOSTIC: if the machine cannot run it at all, the launch
+				// keeps its meaning (the real child reports for itself). Only an answer we
+				// can read is treated as a verdict.
+				process.stderr.write(
+					`[pi-legion] host '${target.host}': could not run the startup probe (${error instanceof Error ? error.message : String(error)}); launching anyway\n`,
+				);
+				return undefined;
+			});
+			const probeOut = probe === undefined
+				? undefined
+				: `${Buffer.from(String(probe.stdout ?? ""), "base64").toString("utf8")}\n${Buffer.from(String(probe.stderr ?? ""), "base64").toString("utf8")}`;
+			const verdict = probeOut === undefined ? undefined : classifyRemoteStartupProbe(probeOut);
+			const excerpt = (probeOut ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0).slice(0, 5).join("\n");
+			if (verdict === "no-model") {
+				await rollbackRemoteDir();
+				throw new SubagentError(
+					`host '${target.host}': the child cannot see a model there — the same argv answered:\n${excerpt}\nOn a machine whose models come from an EXTENSION, the child's \`--no-extensions\` also removes the provider. List it in subagents.crossMachine.hosts.${target.host}.piExtensions (e.g. /root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts).`,
+					ErrorCodes.INVALID_PARAMS,
+					{ host: target.host, probe: "no-model" },
+				);
+			}
+			if (verdict === "conflict") {
+				await rollbackRemoteDir();
+				throw new SubagentError(
+					`host '${target.host}': the child's extensions collide — they are already installed there:\n${excerpt}\nRemove the duplicate from subagents.crossMachine.hosts.${target.host}.piExtensions: an installed package must not be added again as \`--extension\`.`,
+					ErrorCodes.INVALID_PARAMS,
+					{ host: target.host, probe: "conflict" },
+				);
+			}
+			if (probe !== undefined && typeof probe.code === "number" && probe.code !== 0) {
+				await rollbackRemoteDir();
+				throw new SubagentError(
+					`host '${target.host}': the child's own argv failed on that machine (exit ${probe.code}):\n${excerpt || "(no output)"}`,
+					ErrorCodes.START_FAILED,
+					{ host: target.host, probe: "failed", code: probe.code },
+				);
+			}
 		}
 
 		const params = {
 			name: terminalNameForChild,
 			argv,
-			cwd: input.cwd,
-			env: this.childEnv(input),
-			labels: await this.childLabels(input),
-			...(this.caller ? { caller: this.caller } : {}),
+			// D6/D11: a remote child starts in the REMOTE directory — its own tree when
+			// one was created for it, the target's checkout otherwise. It is never
+			// `this.cwd` and never a local path that happens to exist here.
+			cwd: target !== undefined ? remoteWorktree?.path ?? target.cwd : input.cwd,
+			// Absent for a remote child (see `childEnv`): the core's own environment is the
+			// only truthful one over there. Local launches always have a value, so the
+			// params this machine produces keep their exact shape.
+			...((() => {
+				const env = this.childEnv(input, remote ? host : undefined);
+				return env === undefined ? {} : { env };
+			})()),
+			labels: await this.childLabels(input, remote ? host : undefined),
+			// Constraint 5: `caller` is a BARE terminal name in THIS core's
+			// namespace. A remote terminal lives in another one, where that id either
+			// does not exist or names somebody else's terminal — so a remote request
+			// never carries it.
+			...(this.callerFor(host) !== undefined ? { caller: this.callerFor(host) } : {}),
+			// The ONE machine dimension crossing the wire (contract D2): legion says
+			// `host`, `hc` says `on`. Absent ⇒ the key is absent, so the params are
+			// byte-identical to the local launch (D4).
+			...(host ? { on: host } : {}),
 		};
 
 		let run: HcTerminalFacts;
 		try {
-			run = await this.runTerminal(client, params, terminalNameForChild);
+			run = await this.runTerminal(client, params, terminalAddress({ terminalName: terminalNameForChild, ...(host ? { host } : {}) }), host);
 		} catch (error) {
 			this.removeTempDir(tempDir);
-			throw this.failure("terminal.run", terminalNameForChild, error);
+			await rollbackRemoteWorktree();
+			await rollbackRemoteDir();
+			// Review M7: the ADDRESS, not the bare name. A `terminal.run` failure is
+			// the case the spike's "cwd missing vs program missing" note makes least
+			// informative, and dropping the machine from the message is the difference
+			// between "look at vps" and "look at ... somewhere".
+			throw this.failure("terminal.run", terminalAddress({ terminalName: terminalNameForChild, host }), error);
 		}
 
 		// An address in the reply is the proof the terminal really started. Later
@@ -279,6 +695,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const address = typeof run.address === "string" ? run.address : "";
 		if (address.length === 0) {
 			this.removeTempDir(tempDir);
+			await rollbackRemoteDir();
 			throw new SubagentError(
 				`terminal.run for '${terminalNameForChild}' returned no address`,
 				ErrorCodes.START_FAILED,
@@ -290,10 +707,22 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// so the returned name wins over the requested one when present.
 		const mappedName =
 			typeof run.name === "string" && run.name.length > 0 ? run.name : terminalNameForChild;
+		// D13: the ownership pair, in one value, so the record and the handle cannot
+		// disagree about which machine a path belongs to.
+		const worktreeFacts = remoteWorktree !== undefined && target !== undefined
+			? {
+				worktreePath: remoteWorktree.path,
+				worktreeBranch: remoteWorktree.branch,
+				worktreeHost: target.host,
+			}
+			: {};
 		const record: TerminalChildRecord = {
 			name: input.name,
 			terminalName: mappedName,
+			...(host ? { host } : {}),
+			...(remoteDir ? { remoteDir } : {}),
 			...(tempDir ? { tempDir } : {}),
+			...worktreeFacts,
 			state: "live",
 			turn,
 			...(typeof run.status?.state === "string" ? { statusState: run.status.state } : {}),
@@ -307,6 +736,12 @@ export class TerminalSupervisor implements LegionSupervisor {
 			name: input.name,
 			sessionFile: input.sessionFile,
 			...(typeof run.pid === "number" ? { pid: run.pid } : {}),
+			// S2: the tree the BACKEND created comes back the same way `pid` does —
+			// the orchestrator could not know this path before the spawn.
+			...worktreeFacts,
+			// S4/m6: same reason, one more fact the backend owns. Without it the record
+			// cannot find the child's transcript in a later process.
+			...(remoteDir ? { remoteDir } : {}),
 		};
 	}
 
@@ -365,9 +800,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 		}
 		child.promptTurn = child.turn;
 		const result = await client.request<HcSendResult>("terminal.send", {
-			terminal: child.terminalName,
+			terminal: terminalAddress(child),
 			text,
-			...(this.caller ? { caller: this.caller } : {}),
+			...(this.callerFor(child.host) !== undefined ? { caller: this.callerFor(child.host) } : {}),
 		});
 		// The send reports the turn it landed in; it is never lower than what we
 		// saw, and it is the more precise of the two readings.
@@ -415,7 +850,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const client = await this.ensureClient();
 		const work = client
 			.request("terminal.interrupt", {
-				terminal: child.terminalName,
+				terminal: terminalAddress(child),
 				// `hc` counts its observation window in seconds; the caller's bound is
 				// the ceiling that matters, so the observation is capped by it.
 				timeout: Math.max(1, Math.ceil(bound / 1000)),
@@ -521,25 +956,28 @@ export class TerminalSupervisor implements LegionSupervisor {
 
 	private async retireChild(child: TerminalChildRecord): Promise<void> {
 		const client = await this.ensureClient();
+		const address = terminalAddress(child);
 		try {
 			await client.request("terminal.kill", {
-				terminal: child.terminalName,
-				...(this.caller ? { caller: this.caller } : {}),
+				terminal: address,
+				...(this.callerFor(child.host) !== undefined ? { caller: this.callerFor(child.host) } : {}),
 			});
 		} catch (error) {
 			// A terminal the core no longer knows is already gone; anything else is
 			// a real failure to end the child and must surface.
-			if (!isNotFound(error)) throw this.failure("terminal.kill", child.terminalName, error);
+			if (!isNotFound(error)) throw this.failure("terminal.kill", address, error);
 		}
 		try {
 			await client.request("terminal.rm", {
-				terminal: child.terminalName,
-				...(this.caller ? { caller: this.caller } : {}),
+				terminal: address,
+				...(this.callerFor(child.host) !== undefined ? { caller: this.callerFor(child.host) } : {}),
 			});
 		} catch {
 			/* D11: best effort — a killed terminal that cannot be removed is not an error */
 		}
 		child.state = "retired";
+		// D9: the parent temp dir is ours to remove; the mirrored remote copy is
+		// not (same posture as a child's worktree/session — it stays put).
 		this.removeTempDir(child.tempDir);
 	}
 
@@ -565,21 +1003,68 @@ export class TerminalSupervisor implements LegionSupervisor {
 		return trimmed.length > 0 ? trimmed : undefined;
 	}
 
+	/**
+	 * `caller`, but only for a request that addresses a terminal in THIS core's
+	 * namespace (cross-machine constraint 5).
+	 *
+	 * A `caller` is a BARE terminal name, resolved by the core that receives the
+	 * request. The remote core never heard of this process's terminal, so sending
+	 * it there either fails the call or — worse — names an unrelated terminal on
+	 * that machine. Absent host ⇒ unchanged local behaviour.
+	 */
+	private callerFor(host: string | undefined): string | undefined {
+		return normalizeHost(host) === undefined ? this.caller : undefined;
+	}
+
 	/** `HC_BIN` is honoured by the client; `PI_SUBAGENT_CLI`/host argv decide pi. */
 	private cliPath(input: SpawnInput): string {
 		return input.cliPath ? path.resolve(input.cliPath) : defaultPiCliPath();
 	}
 
 	/**
-	 * Environment overlay for `terminal.run` (D5).
+	 * Environment overlay for `terminal.run` (D5 / cross-machine D7).
 	 *
-	 * `terminal.run` merges this over the core's environment, and the core's PATH
-	 * is only `/usr/local/bin:/usr/bin` — no `node` — so the parent's PATH is
-	 * passed explicitly. Then memory flags, then `input.env` last: lineage,
-	 * identity, phases and budgets are facts the orchestrator just computed and
-	 * nothing here may overwrite them.
+	 * LOCAL (today's order, byte for byte): `terminal.run` merges this over the
+	 * core's environment, and the core's PATH is only `/usr/local/bin:/usr/bin` —
+	 * no `node` — so the parent's PATH is passed explicitly. Then memory flags,
+	 * then `input.env` last: lineage, identity, phases and budgets are facts the
+	 * orchestrator just computed and nothing here may overwrite them.
+	 *
+	 * REMOTE: that reasoning inverts. The other machine's core already has its own
+	 * login environment (its own PATH/HOME/TERM), so projecting the parent's is
+	 * wrong on every count — a parent `/usr/bin/node` need not exist there, and a
+	 * parent HOME points at a directory that machine does not have. The overlay is
+	 * therefore built from nothing but the memory flags and the caller's own
+	 * `input.env`, then stripped of (a) the parent-only keys above and (b) legion
+	 * identity: those are paths into THIS host's ledger, and `hc`'s `env` is
+	 * merge-only, so sending them would either create a forked root node there or
+	 * point a remote child at a database it cannot open.
 	 */
-	private childEnv(input: SpawnInput): Record<string, string> {
+	/**
+	 * The env for a child, by machine.
+	 *
+	 * LOCAL: the parent's PATH/HOME/terminal identity/memory profile plus the
+	 * launch's overlay — byte-identical to what this backend has always sent.
+	 *
+	 * REMOTE: **nothing**. Sending the parent's env there is not "more environment",
+	 * it is a different machine's facts dressed as its own: measured on the first
+	 * real cross-machine run, a forwarded env made the remote `pi` report
+	 * `No models available` (it looked for credentials where the PARENT keeps them)
+	 * and truncated its PATH to the parent's shape, so `npx` vanished and an MCP
+	 * server died with `spawn npx ENOENT`. `hc`'s own env is a small baseline that
+	 * the remote process already inherits; anything this process adds is pollution
+	 * with a plausible shape. The remote `pi` reads ITS credentials from ITS config,
+	 * which is the only correct source.
+	 *
+	 * Returns `undefined` for a remote child so `terminal.run` is sent WITHOUT the
+	 * `env` key at all: an empty object and an absent key are the same instruction to
+	 * `hc` (merge nothing), and absent is what a launch that never had an overlay
+	 * would send anyway.
+	 */
+	private childEnv(input: SpawnInput, host: string | undefined): Record<string, string> | undefined {
+		// `host` is the ONE machine dimension here: `normalizeHost` decided "remote"
+		// before this was called, so a non-undefined value means "not this machine".
+		if (host !== undefined) return undefined;
 		const env: Record<string, string> = {};
 		const parentPath = this.env.PATH;
 		if (typeof parentPath === "string" && parentPath.length > 0) env.PATH = parentPath;
@@ -606,15 +1091,25 @@ export class TerminalSupervisor implements LegionSupervisor {
 	}
 
 	/**
-	 * Labels that make the child visible next to its parent (D6): the parent's
-	 * `herdr.space` (read once per supervisor, cached), the role, and the run
-	 * when one is known. `herdr.tab` is deliberately NOT copied — each child gets
-	 * its own tab.
+	 * Labels that make the child visible next to its parent (D6 / cross-machine
+	 * D8): the parent's `herdr.space` (read once per supervisor, cached), the
+	 * role, and the run when one is known. `herdr.tab` is deliberately NOT copied
+	 * — each child gets its own tab.
+	 *
+	 * A REMOTE child gets no space label at all: a bare space id belongs to this
+	 * machine's document, so on the other machine it would only be an orphan
+	 * label pointing at a space that does not exist there. It carries
+	 * `legion.host` instead, which is true on both sides. No `terminal.get` is
+	 * issued for the parent on this branch — there is nothing to ask for.
 	 */
-	private async childLabels(input: SpawnInput): Promise<Record<string, string>> {
+	private async childLabels(input: SpawnInput, host: string | undefined): Promise<Record<string, string>> {
 		const labels: Record<string, string> = { [LEGION_ROLE_LABEL]: input.agent.name };
 		if (this.runId !== undefined && this.runId.length > 0) {
 			labels[LEGION_RUN_LABEL] = this.runId;
+		}
+		if (host !== undefined) {
+			labels[LEGION_HOST_LABEL] = host;
+			return labels;
 		}
 		const space = await this.parentSpaceLabel();
 		if (space !== undefined) labels[HERDR_SPACE_LABEL] = space;
@@ -651,19 +1146,25 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 * `terminal.run` with the one documented retry (D7): a *finished* terminal may
 	 * still hold the name; remove it and try once more. A live holder is a real
 	 * conflict and becomes `NAME_TAKEN`.
+	 *
+	 * `address` is the request's `terminal` value for the get/rm probes, in the
+	 * `host/name` form for a remote child (cross-machine contract §3.6): the bare
+	 * name is unique per core, not across machines.
 	 */
 	private async runTerminal(
 		client: HcClient,
 		params: Record<string, unknown>,
-		name: string,
+		address: string,
+		host?: string,
 	): Promise<HcTerminalFacts> {
+		const name = typeof params.name === "string" ? params.name : address;
 		try {
 			return await client.request<HcTerminalFacts>("terminal.run", params);
 		} catch (error) {
 			if (!isNameTaken(error)) throw error;
 			let holder: HcTerminalFacts | undefined;
 			try {
-				holder = await client.request<HcTerminalFacts>("terminal.get", { terminal: name });
+				holder = await client.request<HcTerminalFacts>("terminal.get", { terminal: address });
 			} catch {
 				holder = undefined;
 			}
@@ -675,8 +1176,8 @@ export class TerminalSupervisor implements LegionSupervisor {
 			}
 			try {
 				await client.request("terminal.rm", {
-					terminal: name,
-					...(this.caller ? { caller: this.caller } : {}),
+					terminal: address,
+					...(this.callerFor(host) !== undefined ? { caller: this.callerFor(host) } : {}),
 				});
 			} catch {
 				/* the retry below reports the real failure */
@@ -697,7 +1198,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 
 	private async readTerminal(child: TerminalChildRecord): Promise<HcTerminalFacts> {
 		const client = await this.ensureClient();
-		return client.request<HcTerminalFacts>("terminal.get", { terminal: child.terminalName });
+		return client.request<HcTerminalFacts>("terminal.get", { terminal: terminalAddress(child) });
 	}
 
 	/** Read the core's current view of a child and fold it into the record. */

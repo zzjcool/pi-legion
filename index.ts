@@ -148,6 +148,14 @@ import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
+import { normalizeHost, resolveHostTarget, resolveResumeCwd } from "./src/runs/remote.ts";
+import { createRemoteVerifyRunner } from "./src/runs/remote-verify.ts";
+import {
+	assertRemoteResume,
+	createRemoteSessionReadback,
+	type RemoteResumeFacts,
+	type RemoteResumeVerdict,
+} from "./src/runs/remote-artifact.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
@@ -278,6 +286,12 @@ const TaskItem = Type.Object({
 				"Parent decides isolation for this child. true = own git branch, child delivers that branch (an MR when the repository has a remote). false = write the current checkout. Reserved for `centurion` (#214): any other role asking for true is downgraded to false with a one-time warning.",
 		}),
 	),
+	host: Type.Optional(
+		Type.String({
+			description:
+				"Target machine name, spelled exactly as `hc machine ls` reports it. Only the terminal backend (an `hc` host) supports it; omit to run on this host. Remote paths are absolute paths ON that machine, not translated from here.",
+		}),
+	),
 	verify: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
@@ -335,6 +349,12 @@ const SubagentParams = Type.Object({
 		Type.Boolean({
 			description:
 				"Parent decides isolation. true = isolated git branch, child delivers that branch (an MR when the repository has a remote). false = edit the current checkout. Reserved for `centurion` (#214): only a centurion gets a subtree worktree, every other role is downgraded to false with a one-time warning — dispatch a centurion when you need an isolated delivery unit.",
+		}),
+	),
+	host: Type.Optional(
+		Type.String({
+			description:
+				"Target machine name, spelled exactly as `hc machine ls` reports it (the `hc` host configured on this machine). Only the terminal backend supports a cross-machine launch: the child then runs on that machine's own `hc` core instead of here. Omit = this host. A remote path is an absolute path ON that machine; paths from here are never translated, so `cwd`/worktree paths refer to the remote filesystem. One `tasks[]` entry may name its own machine; the call-level value is the default for every step.",
 		}),
 	),
 	verify: Type.Optional(
@@ -458,6 +478,15 @@ const VexillatioParams = Type.Object({
 		}),
 	),
 	model: Type.Optional(Type.String()),
+	// Same wire meaning as `subagent.host` (`hc machine ls` name, omit = this host),
+	// per step or for the whole batch. Utility children are read-only helpers that
+	// return text, so a machine only matters once the transport honors it.
+	host: Type.Optional(
+		Type.String({
+			description:
+				"Target machine name, spelled exactly as `hc machine ls` reports it. Omit = this host; remote paths are absolute paths ON that machine.",
+		}),
+	),
 	// NOT the same default as the wait action's `timeoutMs`: this one settles a utility
 	// launch, and the handler uses a flat 600000 (`input.params.timeoutMs ?? 600_000`).
 	timeoutMs: Type.Optional(Type.Number({ description: "Per-child wait in ms, default 600000" })),
@@ -1132,7 +1161,18 @@ function updateLegionRunId(db: DatabaseSync, nodeId: string, runId: string): voi
 }
 
 async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input: { pi: ExtensionAPI; supervisor: LegionSupervisor; cwd: string } }): Promise<void> {
+	// Review M9 (S5): a restart cannot take over a child that ran on another machine.
+	// This process has no `(host, terminalName)` handle on it and no transcript here —
+	// `node.sessionFile` is the local placeholder S1 pre-created — so judging its
+	// liveness with `isAlive` or its outcome from that file would be measuring the
+	// wrong machine. Name the limitation once and leave those nodes untouched.
+	const remoteAfterRestart: string[] = [];
 	for (const node of getChildren(input.identity.db, input.identity.nodeId)) {
+		const nodeHost = normalizeHost(node.host);
+		if (nodeHost !== undefined) {
+			if (!["settled", "failed"].includes(node.status)) remoteAfterRestart.push(`${node.name} (host '${nodeHost}')`);
+			continue;
+		}
 		if (["settled", "failed"].includes(node.status) || ["done", "failed", "aborted"].includes(node.phase ?? "") || input.input.supervisor.isAlive(node.name)) continue;
 		if (node.sessionFile) {
 			const parsed = parseSessionFile(node.sessionFile);
@@ -1153,6 +1193,12 @@ async function resumeLegionTeam(input: { identity: LegionRuntimeIdentity; input:
 		try {
 			await resumeLegionChild({ pi: input.input.pi, supervisor: input.input.supervisor, db: input.identity.db, dbPath: input.identity.dbPath, eventBus: input.identity.eventBus, settings: input.identity.settings, cwd: input.input.cwd, storeRootDir: input.identity.storeRootDir, parentNodeId: input.identity.nodeId, node, message: `Resume from saved session ${node.sessionFile} and continue interrupted work.`, ...(input.identity.machineForRole ? { machineForRole: input.identity.machineForRole } : {}) });
 		} catch (error) { notice(input.input.pi, `Could not resume ${node.id}: ${error instanceof Error ? error.message : String(error)}`); }
+	}
+	if (remoteAfterRestart.length > 0) {
+		notice(
+			input.input.pi,
+			`Not taken over after restart: ${remoteAfterRestart.join(", ")}. A child that ran on another machine has no handle in this process and its transcript is over there; cross-machine re-attach lands in S5.`,
+		);
 	}
 }
 
@@ -1374,12 +1420,28 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 			kind: input.node.kind as AgentConfig["kind"],
 			...(input.node.model ? { model: input.node.model } : {}),
 			...(input.node.worktreePath ? { worktreePath: input.node.worktreePath } : {}),
+			// D13: the reconstructed record keeps the OWNER of that path, so a later
+			// resume in another process does not mistake a remote tree for a local one.
+			...(input.node.worktreeHost ? { worktreeHost: input.node.worktreeHost } : {}),
+			...(input.node.host ? { host: input.node.host } : {}),
 		});
 		parentRun = store.readRun(parentRunId)!;
 		saved = parentRun.children.find((child) => child.nodeId === input.node.id);
 	}
 	if (!saved) throw new Error(`resume child record not found: ${input.node.id}`);
-	const cwd = input.node.worktreePath ?? parent.worktreePath ?? parentRun.cwd ?? input.cwd;
+	// D13/D17: a stored worktree path is a path ON the machine recorded beside it.
+	// A remote path must never become this process's `cwd` — `loadCatalog` reads
+	// agent cards from HERE, and a resume that quietly resolved a remote spelling
+	// against this filesystem would load a different checkout's roles (or nothing).
+	// So the pair decides: host present ⇒ no local path at all, and the tree's own
+	// existence is checked by the terminal backend on THAT machine.
+	const cwd = resolveResumeCwd({
+		saved,
+		node: input.node,
+		parent,
+		parentRunCwd: parentRun.cwd,
+		fallbackCwd: input.cwd,
+	});
 	const catalog = loadCatalog(cwd, cwd, undefined);
 	const resumedTeam = input.node.team
 		? applyTeam(catalog.allAgents, { ...catalog.settings, team: input.node.team }, { ...process.env, [TEAM_ENV]: input.node.team })
@@ -1396,7 +1458,13 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	// `nodes` table has no provider column and is deliberately not migrated, so
 	// this must never be looked up there. Records written before the field
 	// existed simply have none — then no pin is replayed rather than a guessed one.
-	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), worktree: Boolean(saved.worktreePath) });
+	// S0 carried `host` from the record; S1 also resolves what that name MEANS on
+	// the other machine (remote cwd / node / pi CLI). Resolution is where a
+	// missing or malformed `subagents.crossMachine` entry becomes a refusal
+	// instead of a resume that quietly runs here (contract D1/D17).
+	const savedHost = normalizeHost(saved.host);
+	const hostTarget = savedHost ? resolveHostTarget(savedHost, catalog.settings.crossMachine) : undefined;
+	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), ...(savedHost ? { host: savedHost } : {}), ...(hostTarget ? { hostTarget } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
@@ -3505,6 +3573,13 @@ async function controlAction(input: {
 		maxDepth: input.settings.legion?.maxDepth,
 		childContext: resolveTeamContext("child", input.settings, input.team),
 		verifyRunner: input.verifyRunner,
+		// S3: a child that ran on another machine is verified THERE. The runner is
+		// built per call from the same settings the launch resolved its target from,
+		// so the cwd/programs cannot drift from the ones the child was started with.
+		remoteVerify: createRemoteVerifyRunner({ crossMachine: input.settings.crossMachine }),
+		// S4/D15: the same settings resolve the child's machine, so the read-back reads
+		// the transcript the launch actually pointed the child at.
+		remoteReadback: createRemoteSessionReadback({ crossMachine: input.settings.crossMachine }),
 		worktreeBootstrap: input.settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: input.settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
@@ -3540,6 +3615,12 @@ async function controlAction(input: {
 /** A resolved child plus the collaborators every control action needs. */
 interface ChildContext {
 	action: string;
+	/**
+	 * S4/D17 test seam + extension point: the cross-machine `resume` gate. Defaults
+	 * to {@link assertRemoteResume} with the production client; a test injects the
+	 * four-step outcome it wants to exercise without a live core.
+	 */
+	remoteResumeCheck?: (request: RemoteResumeFacts) => Promise<RemoteResumeVerdict>;
 	params: SubagentParams;
 	/** Always set: named control actions reject a request without a name. */
 	name: string;
@@ -3550,6 +3631,12 @@ interface ChildContext {
 	cwd: string;
 	agents: AgentConfig[];
 	allAgents: AgentConfig[];
+	/**
+	 * Resolved settings for THIS call (already spread in from the tool input).
+	 * `reviveChild` reads `crossMachine` off it to re-resolve a remote child's
+	 * target, so a `resume` really relaunches on that machine (D17 / review B2).
+	 */
+	settings: ReturnType<typeof loadSubagentSettings>;
 	found: NonNullable<ReturnType<typeof findChild>>;
 	orchestrator: Orchestrator;
 	runtime: SessionRuntime;
@@ -4256,6 +4343,24 @@ async function reviveChild(
 ): Promise<AgentToolResult<unknown>> {
 	const { action, params, supervisor, name, found, orchestrator } = ctx;
 
+	// D17 (`cross-machine-spawn-v1`, review B2): the two actions mean different
+	// things and are refused for different reasons.
+	//
+	//   `continue` on a DEAD remote child would fall through to `orchestrator.launch`
+	//   with no host — a local relaunch of work that belongs to another machine, the
+	//   silent lie D1 refuses. A LIVE one is fine: `steer` addresses the terminal as
+	//   `host/name`, so the prompt really lands over there.
+	//   `resume` is the SUPPORTED recovery (D17): it relaunches on that machine, and
+	//   the host is replayed below. Refusing it here was the bug — the message even
+	//   told the caller to use it, and the only caller that could was the postman.
+	const recordHost = normalizeHost(found.child.host);
+	if (recordHost !== undefined && action === "continue" && !supervisor.isAlive(name)) {
+		return fail(
+			`child '${name}' ran on host '${recordHost}' and is no longer live; cross-machine continue cannot restart it (the transcript is on that machine). Use resume, which relaunches it there (D17).`,
+			ErrorCodes.INVALID_PARAMS,
+		);
+	}
+
 	if (!params.message) {
 		return fail(
 			`\`message\` is required for ${action}.`,
@@ -4338,12 +4443,44 @@ async function reviveChild(
 			pinned && ctx.modelRegistry && !ctx.modelRegistry.getAll().some((entry) => entry.provider === pinned)
 				? undefined
 				: pinned;
+		// D17 (review B2): a resume of a cross-machine child relaunches ON that
+		// machine. The target is resolved here, at the one place that knows the
+		// recorded host, and the worktree is named so the backend reuses the tree
+		// the child already has instead of creating a second one.
+		const resumeTarget = recordHost !== undefined
+			? resolveHostTarget(recordHost, ctx.settings.crossMachine)
+			: undefined;
+		// S4/D17: four facts, in order, before touching that machine. Each failure names
+		// its step, and none of them is inferred from a local path: the record's
+		// `sessionFile`/`worktreePath` describe the OTHER machine (review D13), so a
+		// local `existsSync` would answer a question nobody asked.
+		if (recordHost !== undefined && resumeTarget !== undefined) {
+			const check = ctx.remoteResumeCheck ?? ((request: RemoteResumeFacts) => assertRemoteResume({
+				crossMachine: ctx.settings.crossMachine,
+				request,
+			}));
+			const verdict = await check({
+				host: recordHost,
+				name,
+				...(found.child.worktreePath ? { worktreePath: found.child.worktreePath } : {}),
+			});
+			if (verdict.terminalState === "live") {
+				// Still running there: relaunching would be a SECOND child with the same
+				// name on that machine, which is the one thing a resume must never do.
+				return ok(
+					`${name} is still running on host '${recordHost}'; resume did not relaunch it. Collect it (the transcript is read back from that machine), or stop it first if you want a fresh launch.`,
+				);
+			}
+		}
 		const handle = await orchestrator.launch({
 			agent: agentDef,
 			task: params.message,
 			name,
 			...(revivedModel ? { model: revivedModel } : {}),
 			...(revivedProvider ? { modelProvider: revivedProvider } : {}),
+			...(resumeTarget ? { host: resumeTarget.host, hostTarget: resumeTarget } : {}),
+			...(resumeTarget && found.child.worktreePath ? { worktreePath: found.child.worktreePath } : {}),
+			...(resumeTarget ? { worktree: Boolean(found.child.worktreePath) } : {}),
 			// `preset` is NOT expanded on a revive, on purpose: the child resumes the
 			// model it was persisted with, so a later settings edit cannot move a
 			// session that is already in flight.
@@ -4491,6 +4628,13 @@ async function launchFamily(input: {
 		maxSpawns: settings.maxSubagentSpawnsPerSession ?? null,
 		childContext: resolveTeamContext("child", settings, input.team),
 		verifyRunner: input.verifyRunner,
+		// S3: a child that ran on another machine is verified THERE. The runner is
+		// built per call from the same settings the launch resolved its target from,
+		// so the cwd/programs cannot drift from the ones the child was started with.
+		remoteVerify: createRemoteVerifyRunner({ crossMachine: input.settings.crossMachine }),
+		// S4/D15: the same settings resolve the child's machine, so the read-back reads
+		// the transcript the launch actually pointed the child at.
+		remoteReadback: createRemoteSessionReadback({ crossMachine: input.settings.crossMachine }),
 		worktreeBootstrap: settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
@@ -4668,7 +4812,7 @@ interface LaunchSession {
  */
 async function launchStep(
 	session: LaunchSession,
-	step: { agent: string; task: string; name?: string; model?: string; preset?: string; worktree?: boolean; verify?: string[] },
+	step: { agent: string; task: string; name?: string; model?: string; preset?: string; worktree?: boolean; host?: string; verify?: string[] },
 ): Promise<void> {
 	if (session.signal?.aborted) return;
 	const agent = findAgent(session.agents, step.agent);
@@ -4754,6 +4898,16 @@ async function launchStep(
 		// (scout-N). The index must not race separate subagent tool calls for auto
 		// names.
 		const name = step.name ?? session.launchName;
+		// Same precedence as `worktree`: an explicit per-step value wins over the
+		// call-level one, which wins over the role card's default; absent everywhere
+		// = this host (contract D4). Normalized here so the orchestrator and the
+		// backend never re-decide what "blank" means.
+		const host = normalizeHost(step.host) ?? normalizeHost(session.params.host) ?? normalizeHost(effective.host);
+		// D1/D6: a named host is only usable when this machine knows what it points
+		// at (remote cwd, remote node/pi). Resolution fails LOUDLY and becomes a
+		// refusal line for this step — the alternative is a launch that runs HERE
+		// while the caller believes it ran elsewhere.
+		const hostTarget = host ? resolveHostTarget(host, session.settings.crossMachine) : undefined;
 		const handle = await session.orchestrator.launch({
 			agent: launchedAgent,
 			task: step.task,
@@ -4773,6 +4927,8 @@ async function launchStep(
 				launch: session.params.worktree,
 				step: step.worktree,
 			}),
+			...(host ? { host } : {}),
+			...(hostTarget ? { hostTarget } : {}),
 			// #371: a phase machine is declared by the ROOT at dispatch time and is a
 			// property of the launch, not of a step — `tasks[]` fan-out carries the
 			// same declaration to every sibling (G3 then refuses any step that is not
@@ -5028,6 +5184,7 @@ type Plan =
 				model?: string;
 				preset?: string;
 				worktree?: boolean;
+				host?: string;
 			}>;
 	  }
 	| { ok: false; message: string };
@@ -5283,6 +5440,13 @@ async function launchUtilityFamily(input: {
 		});
 		orchestrator.restore(run);
 		try {
+			// Cross-machine (contract `cross-machine-spawn-v1` D1): a utility
+			// dispatch carrying a host used to be SILENTLY ignored here, which is the
+			// worst of the three possible answers. Resolving the target now means the
+			// launch either really goes to that machine or is refused with the
+			// reason — never quietly run on this host.
+			const stepHost = normalizeHost(item.step.host) ?? normalizeHost(input.params.host);
+			const stepTarget = stepHost ? resolveHostTarget(stepHost, catalog.settings.crossMachine) : undefined;
 			const handle = await orchestrator.launch({
 				agent: item.agent,
 				task: item.step.task,
@@ -5292,6 +5456,8 @@ async function launchUtilityFamily(input: {
 				...(item.resolved.model ? { modelProvider: providerForModel(input.ctx.modelRegistry, item.resolved.model) } : {}),
 				modelOrigin: item.modelOrigin,
 				...(item.step.worktree !== undefined ? { worktree: item.step.worktree } : {}),
+				...(stepHost ? { host: stepHost } : {}),
+				...(stepTarget ? { hostTarget: stepTarget } : {}),
 				utilityDispatch: true,
 				stripLegionIdentity: true,
 			});
@@ -5568,6 +5734,7 @@ export function buildPlan(params: {
 		model?: string;
 		preset?: string;
 		worktree?: boolean;
+		host?: string;
 		verify?: string[];
 	}>;
 	worktree?: boolean;
@@ -5626,6 +5793,8 @@ interface PlanStep {
 	model?: string;
 	preset?: string;
 	worktree?: boolean;
+	/** Per-step target machine; absent = the call-level `host`, then the card. */
+	host?: string;
 	verify?: string[];
 }
 
@@ -5762,6 +5931,9 @@ function followJob(
 		...(child?.model ? { model: child.model } : {}),
 		...(child?.thinking !== undefined ? { thinking: child.thinking } : {}),
 		...(child?.worktreeBranch ? { worktreeBranch: child.worktreeBranch } : {}),
+		// D13: the machine travels with the branch, so the status row can render
+		// `vps:<branch>` instead of implying a local tree.
+		...(child?.worktreeHost ? { worktreeHost: child.worktreeHost } : {}),
 		...(spawnMode ? { spawnMode } : {}),
 		...(input.pid ? { pid: input.pid } : {}),
 		...(input.treeIdentity ? input.treeIdentity : child?.nodeId ? {
@@ -7201,6 +7373,16 @@ export function renderCollect(
 		 * complete result, including a cache hit that re-read the file.
 		 */
 		outputTruncated?: true;
+		/** S4/D15: how much of a cross-machine transcript this answer rests on. */
+		remoteReadback?: {
+			host: string;
+			lines: number;
+			returned: number;
+			truncated: boolean;
+			byteCapped?: boolean;
+			localPath?: string;
+			reason?: string;
+		};
 		/** §3 D1: the artifact this text came from, when a ledger row names one. */
 		artifactId?: string;
 		acceptance: {
@@ -7262,9 +7444,26 @@ export function renderCollect(
 			lines.push(`verification: ${verification.commandCount} command(s) · log ${verification.outputFile ?? "(not recorded)"}`);
 		}
 	}
+	// S4/D15: how much of a cross-machine transcript this answer rests on. A verdict
+	// derived from the tail of a file must say so — reading 4000 of 250000 lines and
+	// presenting it as the whole result is the silent-completeness bug this line
+	// exists to prevent.
+	if (collected.remoteReadback) {
+		const readback = collected.remoteReadback;
+		if (readback.reason) {
+			lines.push(`read-back from host '${readback.host}': FAILED — ${readback.reason} (the verdict below rests on no transcript at all)`);
+		} else if (readback.truncated) {
+			const what = readback.byteCapped ? "byte-capped by hc" : "tail only";
+			lines.push(
+				`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (truncated — ${what}; the verdict rests on that tail)`,
+			);
+		} else {
+			lines.push(`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (complete)`);
+		}
+	}
 	// The mechanical verify outcome (which command failed / which commands had
 	// to pass) is the parent's primary trust anchor — surface it inline.
-	if (collected.acceptance.reason && /^(verified by|verification failed)/.test(collected.acceptance.reason)) {
+	if (collected.acceptance.reason && /^(verified by|verification failed|verification unavailable)/.test(collected.acceptance.reason)) {
 		lines.push(collected.acceptance.reason);
 	}
 	if (collected.blocked) {

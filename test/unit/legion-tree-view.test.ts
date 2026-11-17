@@ -53,6 +53,8 @@ function node(
 		runId: null,
 		sessionFile: null,
 		worktreePath: null,
+		worktreeHost: null,
+		host: null,
 		model: "provider/model",
 		team: null,
 		status,

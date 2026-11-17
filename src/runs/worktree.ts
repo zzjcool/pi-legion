@@ -13,6 +13,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ErrorCodes, SubagentError } from "../shared/types.ts";
+import { assertLocalWorktree } from "./remote.ts";
 import { sanitizeNameForFs } from "./store.ts";
 
 export function worktreePathFor(runDir: string, name: string): string {
@@ -310,7 +311,17 @@ function worktreeErrorMessage(error: unknown): string {
 export function removeChildWorktree(opts: {
 	repoCwd: string;
 	dest: string;
+	/**
+	 * Owner of `dest` when it is not this host (contract D13).
+	 *
+	 * This function runs `git worktree remove --force` and then an `fs.rmSync`
+	 * fallback: against a REMOTE path both would destroy whatever exists at the
+	 * same spelling here. A pair with a host is therefore refused before the first
+	 * process is spawned — there is no downgrade.
+	 */
+	worktreeHost?: string;
 }): void {
+	assertLocalWorktree({ worktreePath: opts.dest, worktreeHost: opts.worktreeHost });
 	try {
 		execFileSync(
 			"git",

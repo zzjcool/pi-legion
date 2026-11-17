@@ -203,6 +203,11 @@ export interface AgentConfig {
 	// ── execution metadata ──
 	kind: AgentKind;
 	worktree?: boolean;
+	/**
+	 * Target machine for a cross-machine launch; absent = this host. Wire name at
+	 * the hc boundary is `on`.
+	 */
+	host?: string;
 	steer?: boolean;
 	/**
 	 * Launch backend for this role. Omit → `inprocess` (createAgentSession in
@@ -452,6 +457,33 @@ export interface ChildRecord {
 	worktreePath?: string;
 	/** Branch created in that worktree; the child ships via MR, not the parent checkout. */
 	worktreeBranch?: string;
+	/**
+	 * Machine that ran this child; absent = this host.
+	 *
+	 * Persisted so a later `collect`/`resume` in another process can tell a local
+	 * child from a cross-machine one instead of assuming every record is local.
+	 */
+	host?: string;
+	/**
+	 * Machine that OWNS `worktreePath`; absent = this host.
+	 *
+	 * `worktreePath` is therefore a path on `worktreeHost`, not on whoever reads
+	 * the record — a local `fs`/`git` call against it is refused
+	 * (`assertLocalWorktree`, contract D13). The two fields are the (host, path)
+	 * ownership pair; neither is meaningful alone for a cleanup decision.
+	 */
+	worktreeHost?: string;
+	/**
+	 * Directory (on `host`) holding this child's mirrored argv files — the session
+	 * transcript among them (`<remoteDir>/session.jsonl`).
+	 *
+	 * S4/m6: persisted so a later process can find the transcript of a child that
+	 * ran elsewhere. Before this field the value lived only in the supervisor's
+	 * memory, which made cross-machine read-back and resume impossible after a
+	 * restart — the path was recomputable, but nothing on the record said which
+	 * name/machine to recompute it for.
+	 */
+	remoteDir?: string;
 
 	// artifacts
 	artifacts?: Array<{ kind: string; path: string }>;
@@ -803,6 +835,98 @@ export interface RpcSettings {
 	approve?: boolean;
 }
 
+/**
+ * One entry of `subagents.crossMachine.hosts` (contract
+ * `cross-machine-spawn-v1` D7/D9).
+ *
+ * Every value describes the TARGET machine, never this one: `cwd` is an
+ * absolute path ON that machine and is not translated from here (contract
+ * D6/D13). `node`/`piCli` are resolved through that machine's `PATH` by the
+ * remote `machine.exec` preflight, so a bare name (`node`, `pi`) is the normal
+ * value and an absolute remote path is the escape hatch.
+ */
+export interface CrossMachineHostConfig {
+	/** Absolute path (on that machine) the remote child starts in. */
+	cwd?: string;
+	/** Remote `node` (default `"node"`), resolved on that machine's PATH. */
+	node?: string;
+	/** Remote `pi` CLI (default `"pi"`), resolved on that machine's PATH. */
+	piCli?: string;
+	/**
+	 * Where THIS package (pi-legion) lives on that machine.
+	 *
+	 * Not a nicety: `buildPiArgs` injects this package's extension entry into every
+	 * child's argv (`args.ts`, "absolute path to this package's extension entry"),
+	 * so a remote child always carries one absolute path to a file that has to
+	 * exist over there. Default: the same path as here, which is right when both
+	 * machines provision the plugin identically. Set it when they do not.
+	 */
+	piLegionRoot?: string;
+	/**
+	 * Extensions to load INTO the remote child, as paths/packages ON THAT MACHINE.
+	 *
+	 * Why this exists (S5.6, real run): every child argv carries `--no-extensions`
+	 * (a child must not inherit the parent's plugin set), but on a machine whose
+	 * MODELS come from an extension (a provider such as `pi-any-endpoint`),
+	 * `--no-extensions` also removes the model provider — the child then answers
+	 * `No models available` / `No API key found` while the same `pi` run by hand on
+	 * that machine works. These entries are appended as `--extension <p>` after
+	 * `--no-extensions`, so the child gets exactly the host-local set the operator
+	 * names — no more (nothing here = today's behaviour).
+	 *
+	 * Do NOT list an extension that is already installed there as a package: an
+	 * explicit `--extension` of an already-loaded package collides
+	 * (`Tool "…" conflicts with …`), which the preflight reports by name.
+	 */
+	piExtensions?: string[];
+	/**
+	 * Prefix translation for argv paths that live OUTSIDE the checkout.
+	 *
+	 * Key: an absolute prefix on THIS machine; value: the absolute prefix the same
+	 * content has on the target. Longest key wins, and only whole path segments
+	 * match (`/opt/pi` does not capture `/opt/pix`).
+	 *
+	 * This exists because a real child's argv carries `-e <extension>/index.ts`
+	 * paths from the running plugin's install, which is neither in the checkout nor
+	 * mirrored into the remote temp dir. Rewriting those by basename would hand the
+	 * remote child a path to nothing (D6), so without an entry here they are
+	 * REFUSED by name. A value that does not exist on the target fails later, in
+	 * that machine's own `pi` — this map only decides which path it is asked to
+	 * open.
+	 */
+	pathMap?: Record<string, string>;
+	/**
+	 * Directory (absolute, ON that machine) that holds remote child worktrees
+	 * (`cross-machine-spawn-v1` D11/D12).
+	 *
+	 * Default: `dirname(cwd)/.pi-worktrees` — deliberately a SIBLING of the
+	 * checkout, never inside it. A tree inside the checkout would be found by the
+	 * nested-worktree probe (`isInsideChildWorktree`), which suppresses worktree
+	 * creation exactly where a remote centurion wants it.
+	 */
+	worktreeRoot?: string;
+}
+
+/**
+ * Cross-machine spawn configuration (contract `cross-machine-spawn-v1`).
+ *
+ * Off by default: with `enabled` absent/false a launch that names a `host` is
+ * REFUSED rather than run locally — a child that ran here while the caller
+ * believed it ran elsewhere is the worst answer (contract D1).
+ */
+export interface CrossMachineSettings {
+	/** Master switch; absent/false refuses every launch that names a `host`. */
+	enabled?: boolean;
+	/**
+	 * Explicit allow-list of target machines, keyed by the `hc machine ls` name.
+	 *
+	 * A host with no entry here is refused (`resolveHostTarget` in
+	 * `src/runs/remote.ts`): the remote cwd cannot be guessed, and guessing is
+	 * how a remote launch lands in the wrong directory.
+	 */
+	hosts?: Record<string, CrossMachineHostConfig>;
+}
+
 export interface SubagentsSettings {
 	/**
 	 * Master switch (default true). `false` stops new launches, system-prompt
@@ -874,6 +998,15 @@ export interface SubagentsSettings {
 	 * `rpc.approve: true` to append it. Not an inherit-parent-trust channel.
 	 */
 	rpc?: RpcSettings;
+	/**
+	 * Cross-machine launches (contract `cross-machine-spawn-v1`). Absent = no
+	 * host is usable, and a launch that names one is refused (D1).
+	 *
+	 * Parsed EXPLICITLY in `parseSubagentSettings` — that parser drops any key it
+	 * does not read, so leaving this out of the whitelist would silently ignore
+	 * the whole block.
+	 */
+	crossMachine?: CrossMachineSettings;
 }
 
 /**

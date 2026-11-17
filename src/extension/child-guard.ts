@@ -27,14 +27,30 @@ export const CHILD_ACCEPTANCE_ROLE_ENV = "PI_SUBAGENT_ACCEPTANCE_ROLE";
 export function childTaskAppendix(opts?: {
 	allowNested?: boolean;
 	worktreeBranch?: string;
+	/**
+	 * This child's result must CROSS to another machine (cross-machine D10/D12).
+	 *
+	 * The only materialization channel across machines is a push to the shared
+	 * `origin`, so there the branch is not a convenience: an unpushed branch is a
+	 * result nobody can read. Absent ⇒ the appendix is byte-identical to what it
+	 * has always been (the local wording is frozen by tests and by every run's MR).
+	 */
+	remoteDelivery?: boolean;
 }): string {
 	const nested = opts?.allowNested
 		? "- Nested subagents via `subagent` tool only."
 		: "- Do not spawn nested agents.";
-	const worktree = opts?.worktreeBranch
+	const branch = opts?.worktreeBranch;
+	const remoteDelivery = opts?.remoteDelivery === true && typeof branch === "string" && branch.length > 0;
+	const worktree: string[] = branch
 		? [
-				`- You are in an isolated git worktree on branch \`${opts.worktreeBranch}\`. Do not write the parent checkout.`,
-				"- Commit on this branch. The branch is the deliverable: put its name and HEAD sha in your verdict reason. Do not merge locally; do not push to main or master.",
+				`- You are in an isolated git worktree on branch \`${branch}\`. Do not write the parent checkout.`,
+				remoteDelivery
+					? "- Commit on this branch. The branch is the deliverable: put its name and HEAD sha in your verdict reason. Do not merge locally."
+					: "- Commit on this branch. The branch is the deliverable: put its name and HEAD sha in your verdict reason. Do not merge locally; do not push to main or master.",
+				...(remoteDelivery
+					? [`- Push this branch to the shared remote when you are done: \`git push -u origin ${branch}\`. The parent machine fetches it from there; an unpushed branch is an undelivered result.`]
+					: []),
 				"- A merge request / pull request is a convenience, not a requirement: open one only when the repository has a remote and `gh`/`glab` is available, and then add its URL to the verdict. With no remote, write `no remote: branch <name> at <sha>`; never invent a URL, and a missing MR is not a failure.",
 			]
 		: [];
@@ -50,7 +66,7 @@ export const CHILD_TASK_APPENDIX = childTaskAppendix();
 
 export function formatChildTask(
 	task: string,
-	opts?: { allowNested?: boolean; worktreeBranch?: string },
+	opts?: { allowNested?: boolean; worktreeBranch?: string; remoteDelivery?: boolean },
 ): string {
 	return `Task: ${task}\n\n${childTaskAppendix(opts)}\n`;
 }

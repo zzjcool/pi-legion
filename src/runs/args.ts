@@ -119,6 +119,22 @@ export interface BuildArgsInput {
 	 * the flag (v1 never emits `--no-approve`).
 	 */
 	approve?: boolean;
+	/**
+	 * Rewrite every ABSOLUTE path this builder writes into `argv` (contract
+	 * `cross-machine-spawn-v1` D6). Default: identity, which is what every local
+	 * backend passes (rpc, inprocess, a local terminal child) — their argv is
+	 * byte-identical with and without this field.
+	 *
+	 * A cross-machine launch is the one caller that passes it: the child runs on
+	 * another machine, where this host's `/tmp/...` paths do not exist, so
+	 * `--session` and `--system-prompt` have to name paths on THAT machine
+	 * (D6: sending a parent path is the failure that produces the core's least
+	 * informative error, or a session file on the wrong machine).
+	 *
+	 * `tempFiles` is deliberately NOT rewritten: it reports the files this
+	 * process really created, and the caller decides whether to mirror them.
+	 */
+	pathRewrite?: (absolutePath: string) => string;
 }
 
 export interface BuildArgsResult {
@@ -139,7 +155,7 @@ export function buildPiArgs(input: BuildArgsInput): BuildArgsResult {
 
 	// Ordering follows pi's CLI: session → model → tools → extensions → skills
 	// → system prompt → task. Each helper appends its own flags.
-	args.push("--session", input.sessionFile);
+	args.push("--session", pathRewriteOf(input)(input.sessionFile));
 	pushModelArgs(args, input);
 	pushToolArgs(args, input.agent);
 	pushSkillArgs(args, input.agent);
@@ -381,7 +397,9 @@ function pushSkillArgs(args: string[], agent: AgentConfig): void {
  * Write the system prompt to a file and reference it.
  *
  * Passed by path rather than inline so a long prompt cannot hit the argv limit,
- * and so the file's mode (0600) keeps it out of other users' reach.
+ * and so the file's mode (0600) keeps it out of other users' reach. The FILE is
+ * always written here (this machine); only the path in `argv` can be rewritten
+ * (a remote child reads the mirrored copy).
  */
 function pushSystemPromptArgs(
 	args: string[],
@@ -412,7 +430,7 @@ function pushSystemPromptArgs(
 		: input.agent.systemPromptMode === "replace"
 			? "append"
 			: input.agent.systemPromptMode;
-	args.push(mode === "replace" ? "--system-prompt" : "--append-system-prompt", file);
+	args.push(mode === "replace" ? "--system-prompt" : "--append-system-prompt", pathRewriteOf(input)(file));
 }
 
 /**
@@ -443,5 +461,16 @@ function pushTaskArg(
 	const file = path.join(input.tempDir, "task.md");
 	fs.writeFileSync(file, taskText, { mode: 0o600 });
 	tempFiles.push(file);
-	args.push(`@${file}`);
+	args.push(`@${pathRewriteOf(input)(file)}`);
+}
+
+/**
+ * The caller's argv path mapping, or identity.
+ *
+ * One accessor so the three call sites cannot disagree about the default: a
+ * builder that rewrote `--session` but not `--system-prompt` would send a
+ * remote child to read a parent file and report the core's vaguest error.
+ */
+function pathRewriteOf(input: BuildArgsInput): (absolutePath: string) => string {
+	return input.pathRewrite ?? ((absolutePath: string) => absolutePath);
 }

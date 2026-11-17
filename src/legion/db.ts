@@ -13,8 +13,14 @@ import { createRequire } from "node:module";
  * v3 — result-ledger tables `artifacts` + `consumptions`
  *      (`docs/contracts/result-ledger-v1.md` D2). Purely additive: the four
  *      v1 tables gain no column, so a v2 ledger opens and is upgraded in place.
+ * v4 — `nodes.host` + `nodes.worktree_host` (contract
+ *      `cross-machine-spawn-v1` D5/D13): worktree ownership becomes the pair
+ *      `(host, path)`. Two nullable columns, no backfill — `NULL` is the legal,
+ *      permanent spelling of "this host", which is what every pre-v4 row means
+ *      (`normalizeHost` in `src/runs/remote.ts` is the one predicate that reads
+ *      it).
  */
-export const LEGION_DB_USER_VERSION = 3;
+export const LEGION_DB_USER_VERSION = 4;
 export const LEGION_DB_BUSY_TIMEOUT_MS = 5_000;
 
 /**
@@ -140,6 +146,34 @@ CREATE INDEX idx_messages_inbox ON messages(to_node, delivered, id);
 -- degrades monotonically because messages has no retention policy.
 CREATE INDEX idx_messages_rate ON messages(from_node, created_at);
 `;
+
+/**
+ * Schema v4 (cross-machine D5/D13): the worktree ownership pair on `nodes`.
+ *
+ * `worktree_path` alone was only ever a path; once a worktree can live on another
+ * machine, the pair `(worktree_host, worktree_path)` is the ownership fact, and a
+ * reader that sees only the path cannot tell a local tree from a remote one
+ * (`assertLocalWorktree` is what refuses the ambiguous pair).
+ *
+ * Both columns are nullable and NOTHING is backfilled: `NULL` means this host —
+ * exactly the meaning a row written before v4 has, so an old ledger keeps every
+ * row and every row keeps its meaning (D5).
+ *
+ * `ALTER TABLE` is the one DDL SQLite has no `IF NOT EXISTS` for, so the migration
+ * asks `PRAGMA table_info(nodes)` first (see `migrate`) instead of blindly adding
+ * a column that may already be there: a file that was created at v4 and then had
+ * its header rewound (a restored backup, the v1/v2 fixtures in this repo's tests)
+ * MUST re-migrate cleanly. The `ALTER` text itself lives here so it still goes
+ * through one `db.exec()`, which is what invalidates the statement cache
+ * (`SCHEMA_MUTATION_PATTERN`).
+ */
+const SCHEMA_V4 = `
+ALTER TABLE nodes ADD COLUMN host TEXT;
+ALTER TABLE nodes ADD COLUMN worktree_host TEXT;
+`;
+
+/** The two columns v4 adds to `nodes`, in the order {@link SCHEMA_V4} writes them. */
+const SCHEMA_V4_NODE_COLUMNS = ["host", "worktree_host"] as const;
 
 /**
  * Schema v3 (result-ledger D2): the artifact ledger and its per-consumer
@@ -415,6 +449,22 @@ function migrate(db: DatabaseSync): void {
 			// Two new tables only — `nodes`/`events`/`usage`/`messages` are untouched,
 			// so an existing ledger keeps every row and simply gains the new tables.
 			db.exec(SCHEMA_V3);
+			version = 3;
+		}
+		if (version === 3) {
+			// v3 → v4: the worktree ownership pair (cross-machine D5/D13). Additive:
+			// two nullable columns on `nodes`, no backfill (`NULL` IS the value for
+			// "this host").
+			//
+			// `ALTER TABLE ... ADD COLUMN` has no `IF NOT EXISTS`, and a file whose
+			// header was rewound can already carry the columns (this repo's v1/v2
+			// fixtures do exactly that), so the migration asks the schema first and
+			// then runs ONE `db.exec()` with whatever is still missing — which is how
+			// the prepared-statement cache gets invalidated for the new shape.
+			const missing = SCHEMA_V4_NODE_COLUMNS.filter((column) => !nodeColumnNames(db).includes(column));
+			if (missing.length === SCHEMA_V4_NODE_COLUMNS.length) db.exec(SCHEMA_V4);
+			else if (missing.length > 0) db.exec(missing.map((column) => `ALTER TABLE nodes ADD COLUMN ${column} TEXT;`).join("\n"));
+			version = 4;
 		}
 		db.exec(`PRAGMA user_version = ${LEGION_DB_USER_VERSION};`);
 		db.exec("COMMIT;");
@@ -478,4 +528,12 @@ function isMemoryLegionDb(db: DatabaseSync): boolean {
 function readUserVersion(db: DatabaseSync): number {
 	const row = db.prepare("PRAGMA user_version;").get();
 	return Number(row?.user_version ?? 0);
+}
+
+/** Column names of `nodes` as they exist right now (used by the v4 migration). */
+function nodeColumnNames(db: DatabaseSync): string[] {
+	return db
+		.prepare("PRAGMA table_info(nodes);")
+		.all()
+		.map((row) => String(row.name ?? ""));
 }

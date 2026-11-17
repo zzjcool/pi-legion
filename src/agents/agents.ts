@@ -687,7 +687,7 @@ const AGENT_FRONTMATTER_FIELDS: ReadonlySet<string> = new Set([
 	// budgets / guards / lifecycle
 	"defaultProgress", "async", "timeoutMs", "toolTimeoutMs", "loopNoticeMs", "completionGuard",
 	"maxSubagentDepth", "allowNestedSubagents", "renewable", "maxRenewals",
-	"utility", "disabled", "worktree", "steer", "onBlocked",
+	"utility", "disabled", "worktree", "host", "steer", "onBlocked",
 	"acceptance", "toolBudget", "turnBudget",
 ]);
 
@@ -846,6 +846,7 @@ function applyBehaviorFields(config: AgentConfig, fm: AgentFrontmatter): void {
 	setIf(config, "utility", bool(fm.utility));
 	setIf(config, "disabled", bool(fm.disabled));
 	setIf(config, "worktree", bool(fm.worktree));
+	setIf(config, "host", str(fm.host));
 	setIf(config, "steer", bool(fm.steer));
 	setIf(config, "acceptance", parseAcceptance(fm.acceptance, config.name));
 	const phases = parsePhaseMachine(fm.phases, config.filePath);

@@ -30,6 +30,14 @@ import { delimiter, join } from "node:path";
  * channel for the core (`server.stop`, `machine.*`, `file.write` …), and a
  * backend that only needs terminal facts must not be one typo away from
  * stopping the core.
+ *
+ * A cross-machine launch needs more than `terminal.*`: the child runs on another
+ * machine, so its argv-referenced files have to be mirrored with `file.read`/
+ * `file.write` and the remote checkout/probe commands go through
+ * `machine.exec`. Those three are allowed; the WRITE-side lifecycle
+ * (`machine.add`, `machine.rm`) and the enumeration (`machine.list`) stay
+ * excluded — configuring or dropping a machine is an operator action, never
+ * something a spawn does as a side effect.
  */
 export const HC_METHODS = [
 	"hello",
@@ -40,6 +48,9 @@ export const HC_METHODS = [
 	"terminal.interrupt",
 	"terminal.kill",
 	"terminal.rm",
+	"machine.exec",
+	"file.read",
+	"file.write",
 ] as const;
 
 export type HcMethod = (typeof HC_METHODS)[number];

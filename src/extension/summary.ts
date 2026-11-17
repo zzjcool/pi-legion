@@ -19,6 +19,7 @@ import {
 	RunStore,
 	pickChildByName,
 } from "../runs/store.ts";
+import { normalizeHost } from "../runs/remote.ts";
 import { resolveChildAcrossStores, unknownChildMessage } from "../runs/store-lookup.ts";
 import type {
 	ChildRecord,
@@ -654,7 +655,11 @@ export function formatSubagentDetail(input: SummaryDetailInput): string {
 	if (detailBits.length > 0) lines.push(`  ${detailBits.join(" · ")}`);
 
 	if (child.worktreeBranch || child.worktreePath) {
-		lines.push(`  worktree: ${child.worktreeBranch ?? child.worktreePath}`);
+		// D13: the display carries the OWNER, not just the path (`vps:/srv/.pi-worktrees/x`).
+		// A path without its machine is exactly the ambiguity the ownership pair
+		// exists to remove, and this line is where an operator first meets it.
+		// Absent host renders byte-identically to the local form.
+		lines.push(`  worktree: ${worktreeDisplay(child)}`);
 	}
 	if (child.sessionFile) {
 		const base = input.cwd ?? run.cwd;
@@ -662,6 +667,19 @@ export function formatSubagentDetail(input: SummaryDetailInput): string {
 		lines.push(`  session: ${relative || child.sessionFile}`);
 	}
 	return lines.join("\n");
+}
+
+/**
+ * `[host:]<branch-or-path>` — the display form of a worktree fact (D13).
+ *
+ * Display only: no `fs`, no `git`, no existence probe. A remote path may not
+ * exist here at all, and a "worktree" line that tried to be a check would lie in
+ * both directions.
+ */
+function worktreeDisplay(child: Pick<ChildRecord, "worktreePath" | "worktreeBranch" | "worktreeHost" | "host">): string {
+	const host = normalizeHost(child.worktreeHost) ?? normalizeHost(child.host);
+	const value = child.worktreeBranch ?? child.worktreePath ?? "";
+	return host ? `${host}:${value}` : value;
 }
 
 function parseSummaryArgs(

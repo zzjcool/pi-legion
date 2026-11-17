@@ -29,6 +29,8 @@ function makeNode(
 		runId: null,
 		sessionFile: null,
 		worktreePath: null,
+		worktreeHost: null,
+		host: null,
 		model: "test/model",
 		team: null,
 		status: "running",

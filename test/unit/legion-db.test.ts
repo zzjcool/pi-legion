@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createRequire } from "node:module";
 import {
 	LEGION_DB_BUSY_TIMEOUT_MS,
 	LEGION_DB_USER_VERSION,
@@ -11,10 +12,12 @@ import {
 	openLegionDb,
 	sqliteHasRow,
 } from "../../src/legion/db.ts";
-import { insertNode } from "../../src/legion/nodes.ts";
+import { getNode, insertNode } from "../../src/legion/nodes.ts";
 
 const TABLE_COLUMNS = {
-	nodes: ["id", "parent_id", "name", "role", "kind", "depth", "run_id", "session_file", "worktree_path", "model", "team", "status", "phase", "phase_since", "rework_count", "contract_path", "task_summary", "created_at", "updated_at"],
+	// schema v4 (`cross-machine-spawn-v1` D5/D13): the two ownership columns are
+	// APPENDED by `ALTER TABLE`, so they come after every v1 column.
+	nodes: ["id", "parent_id", "name", "role", "kind", "depth", "run_id", "session_file", "worktree_path", "model", "team", "status", "phase", "phase_since", "rework_count", "contract_path", "task_summary", "created_at", "updated_at", "host", "worktree_host"],
 	events: ["id", "node_id", "type", "data", "ts"],
 	usage: ["node_id", "tokens_in", "tokens_out", "cost_usd", "updated_at"],
 	messages: ["id", "from_node", "to_node", "subject", "body", "kind", "urgency", "delivered", "delivered_at", "created_at"],
@@ -33,7 +36,7 @@ const INDEX_COLUMNS = {
 	idx_artifacts_parent: ["parent_id", "created_at"],
 } as const;
 
-test("legion db schema snapshot matches contract columns and indexes (v3)", () => {
+test("legion db schema snapshot matches contract columns and indexes (v4)", () => {
 	const db = openLegionDb(":memory:");
 	try {
 		assert.equal(Number(db.prepare("PRAGMA user_version").get()?.user_version), LEGION_DB_USER_VERSION);
@@ -271,7 +274,8 @@ test("a v1 ledger opens as the current schema version without rewriting a single
 
 		const upgraded = openLegionDb(file);
 		try {
-			assert.equal(LEGION_DB_USER_VERSION, 3);
+			// schema v4 (cross-machine D5/D13): the version pin moves with the migration.
+			assert.equal(LEGION_DB_USER_VERSION, 4);
 			assert.equal(
 				Number(upgraded.prepare("PRAGMA user_version").get()?.user_version),
 				LEGION_DB_USER_VERSION,
@@ -295,6 +299,125 @@ test("a v1 ledger opens as the current schema version without rewriting a single
 			);
 		} finally {
 			upgraded.close();
+		}
+	} finally {
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+/**
+ * The exact `nodes` table a v3 ledger has on disk: the nineteen v1 columns and
+ * NOTHING from v4. Written out rather than derived from `SCHEMA_V1` on purpose —
+ * a fixture that follows the live code cannot prove an OLD file migrates, and
+ * `ALTER TABLE ... DROP COLUMN` (the alternative) needs SQLite ≥ 3.35 while the
+ * point here is to be independent of the migrator altogether.
+ */
+const V3_NODES_DDL = `
+CREATE TABLE nodes (
+  id            TEXT PRIMARY KEY,
+  parent_id     TEXT REFERENCES nodes(id),
+  name          TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  kind          TEXT NOT NULL DEFAULT 'pi',
+  depth         INTEGER NOT NULL,
+  run_id        TEXT,
+  session_file  TEXT,
+  worktree_path TEXT,
+  model         TEXT,
+  team          TEXT,
+  status        TEXT NOT NULL,
+  phase         TEXT,
+  phase_since   INTEGER,
+  rework_count  INTEGER NOT NULL DEFAULT 0,
+  contract_path TEXT,
+  task_summary  TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+CREATE INDEX idx_nodes_parent ON nodes(parent_id);
+CREATE INDEX idx_nodes_status ON nodes(status, updated_at);
+`;
+
+/** Raw handle for BUILDING an old-shaped file (the open path would migrate it). */
+function writeV3Ledger(file: string): void {
+	const required = createRequire(import.meta.url) as (id: string) => { DatabaseSync: new (path: string) => { exec(sql: string): void; close(): void } };
+	const { DatabaseSync } = required("node:sqlite");
+	const db = new DatabaseSync(file);
+	try {
+		db.exec(V3_NODES_DDL);
+		db.exec("PRAGMA user_version = 3;");
+		// Parent first: `node:sqlite` enforces the self-reference even here.
+		db.exec(
+			`INSERT INTO nodes (id, parent_id, name, role, kind, depth, worktree_path, status, created_at, updated_at)
+			 VALUES ('root', NULL, 'root', 'root', 'pi', 0, NULL, 'running', 100, 100);`,
+		);
+		db.exec(
+			`INSERT INTO nodes (id, parent_id, name, role, kind, depth, worktree_path, status, created_at, updated_at)
+			 VALUES ('root.old', 'root', 'old', 'worker', 'pi', 1, '/srv/legacy/tree', 'running', 111, 222);`,
+		);
+	} finally {
+		db.close();
+	}
+}
+
+test("a v3 ledger gains nodes.host/worktree_host, keeps its rows, and reads them as NULL = this host", () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "legion-db-v3-v4-"));
+	const file = path.join(directory, "ledger.db");
+	try {
+		writeV3Ledger(file);
+		// Guard the fixture itself: if this file already had the columns, the test
+		// would prove nothing.
+		const before = createRequire(import.meta.url)("node:sqlite") as { DatabaseSync: new (path: string) => { prepare(sql: string): { all(): Array<Record<string, unknown>> }; close(): void } };
+		const raw = new before.DatabaseSync(file);
+		try {
+			const columns = raw.prepare("PRAGMA table_info(nodes)").all().map((row) => String(row.name));
+			assert.deepEqual(columns, [...TABLE_COLUMNS.nodes].slice(0, 19), "the fixture must be a real v3 shape");
+		} finally {
+			raw.close();
+		}
+
+		const db = openLegionDb(file);
+		try {
+			assert.equal(
+				Number(db.prepare("PRAGMA user_version").get()?.user_version),
+				LEGION_DB_USER_VERSION,
+				"opening a v3 ledger upgrades it to the current schema version",
+			);
+			assert.deepEqual(
+				db.prepare("PRAGMA table_info(nodes)").all().map((row) => String(row.name)),
+				[...TABLE_COLUMNS.nodes],
+				"v3 → v4 appends exactly nodes.host + nodes.worktree_host",
+			);
+			// D5: an old row survives untouched, and the two new columns read as NULL —
+			// which is the legal, permanent spelling of "this host".
+			const node = getNode(db, "root.old");
+			assert.ok(node, "the pre-v4 row is still there");
+			assert.equal(node.name, "old");
+			assert.equal(node.worktreePath, "/srv/legacy/tree", "the old path keeps its value");
+			assert.equal(node.host, null, "NULL host means this host");
+			assert.equal(node.worktreeHost, null, "NULL worktreeHost means this host");
+			assert.equal(Number(db.prepare("SELECT COUNT(*) AS n FROM nodes").get()?.n), 2, "no row was added or lost");
+			// The new columns are writable through the normal path (schema + mapping).
+			insertNode(db, { parentId: "root", name: "remote", role: "centurion", worktreePath: "/srv/.pi-worktrees/remote", worktreeHost: "vps", host: "vps" });
+			const remote = getNode(db, "root.remote");
+			assert.equal(remote?.host, "vps");
+			assert.equal(remote?.worktreeHost, "vps");
+		} finally {
+			db.close();
+		}
+
+		// Idempotent: a second open sees user_version 4 and must not re-run the ALTERs.
+		const reopened = openLegionDb(file);
+		try {
+			assert.equal(Number(reopened.prepare("PRAGMA user_version").get()?.user_version), LEGION_DB_USER_VERSION);
+			assert.deepEqual(
+				reopened.prepare("PRAGMA table_info(nodes)").all().map((row) => String(row.name)),
+				[...TABLE_COLUMNS.nodes],
+				"re-opening does not duplicate the columns",
+			);
+			assert.equal(Number(reopened.prepare("SELECT COUNT(*) AS n FROM nodes").get()?.n), 3);
+		} finally {
+			reopened.close();
 		}
 	} finally {
 		fs.rmSync(directory, { recursive: true, force: true });

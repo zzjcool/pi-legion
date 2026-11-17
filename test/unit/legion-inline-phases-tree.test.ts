@@ -71,6 +71,8 @@ function node(
 		runId,
 		sessionFile: null,
 		worktreePath: null,
+		worktreeHost: null,
+		host: null,
 		model: null,
 		team: null,
 		status: "running",

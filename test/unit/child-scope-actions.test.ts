@@ -20,7 +20,7 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import piLegion from "../../index.ts";
+import piLegion, { renderCollect } from "../../index.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { RUN_OWNER_FILE, writeOwnerFile } from "../../src/runs/owner.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -167,11 +167,11 @@ function indexHarness() {
 		 * `collect` then has to resolve the name from `run.json`, which is where the
 		 * old cross-run preference handed back another run's node.
 		 */
-		async addOwnChild(name: string, state: ChildRecord["state"], output: string) {
+		async addOwnChild(name: string, state: ChildRecord["state"], output: string, extra: Partial<ChildRecord> = {}) {
 			const runId = this.sessionRunId();
 			const sessionFile = path.join(store.runDir(runId), `${name}.jsonl`);
 			writeDecoySession(sessionFile, output);
-			await store.addChild(runId, childStub({ name, state, sessionFile }));
+			await store.addChild(runId, childStub({ name, state, sessionFile, ...extra }));
 			return { runId, sessionFile };
 		},
 		/** The record one run holds for `name`, read back from `run.json`. */
@@ -508,4 +508,39 @@ test("#312 status: a cross-store record that IS this session's child carries no 
 	} finally {
 		await harness.cleanup();
 	}
+});
+
+test("M5/S4: a failed read-back is stated, and never replaced by the local placeholder's text", async () => {
+	// The transcript is on THAT machine; `sessionFile` here is the empty placeholder
+	// this machine pre-created. A collect that read it would present "no text" as the
+	// child's answer right next to "read-back failed" — two truths in one answer.
+	// The render is where the parent reads the difference, so it is asserted here.
+	const rendered = renderCollect("worker-0", {
+		execution: { status: "success" },
+		output: "",
+		acceptance: { status: "accepted", level: "attested" },
+		remoteReadback: { host: "vps", lines: 0, returned: 0, truncated: false, reason: "host 'vps' needs subagents.crossMachine.enabled = true" },
+	});
+	assert.match(rendered, /read-back from host 'vps': FAILED/);
+	assert.match(rendered, /crossMachine/);
+	assert.match(rendered, /rests on no transcript at all/);
+
+	// A truncated read says the ratio out loud instead of presenting a tail as the whole.
+	const truncated = renderCollect("worker-0", {
+		execution: { status: "success" },
+		output: "{}",
+		acceptance: { status: "accepted", level: "attested" },
+		remoteReadback: { host: "vps", lines: 250_000, returned: 4_000, truncated: true },
+	});
+	assert.match(truncated, /4000 of 250000 lines \(truncated — tail only/);
+	assert.match(truncated, /verdict rests on that tail/);
+
+	// And a complete read-back is marked complete, not left silent either.
+	const complete = renderCollect("worker-0", {
+		execution: { status: "success" },
+		output: "{}",
+		acceptance: { status: "accepted", level: "attested" },
+		remoteReadback: { host: "vps", lines: 40, returned: 40, truncated: false },
+	});
+	assert.match(complete, /40 of 40 lines \(complete\)/);
 });

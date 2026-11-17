@@ -43,6 +43,13 @@ export interface StatusEntry {
 	model?: string;
 	thinking?: string | false;
 	worktreeBranch?: string;
+	/**
+	 * Machine that owns the worktree (cross-machine D13).
+	 *
+	 * Display only: the row shows `host:branch` so a tree that lives on another
+	 * machine cannot be mistaken for one here. Absent ⇒ the row is unchanged.
+	 */
+	worktreeHost?: string;
 	turns?: number;
 	lastTools?: string[];
 	phase?: string;
@@ -333,7 +340,8 @@ function detailBits(entry: StatusEntry): string[] {
 		bits.push(entry.lastTools.slice(0, 2).join(", "));
 	}
 	if (entry.worktreeBranch) {
-		bits.push(`wt ${formatWorktreeBranch(entry.worktreeBranch)}`);
+		// D13: `vps:child-1-ab12cd34` — the machine is part of the fact.
+		bits.push(`wt ${entry.worktreeHost ? `${entry.worktreeHost}:` : ""}${formatWorktreeBranch(entry.worktreeBranch)}`);
 	}
 	// Lifetime avg output tok/s. D7: the same denominator choice as the header —
 	// measured decode when the supervisor has one, `generationMs` when it does not.
