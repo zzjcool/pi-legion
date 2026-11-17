@@ -11,6 +11,31 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Fixed
+
+- **scout-guard 的提醒不再「等干完才到」**：投递方式从 `deliverAs: "followUp"` 改为
+  `"steer"`。宿主在**每个 turn 边界**抽空 steering 队列——当前 assistant 消息的 tool 批跑完、
+  下一次 LLM 调用之前（`agent-loop.js:191`）——而 followUp 队列要等到模型**不再发起 tool call**
+  才抽（`agent-loop.js:197`）。只要 agent 还在连续读文件，旧实现的提醒就永远排在「本来要停」之后：
+  这正是「干完了才插一句、还多烧一轮」的成因，不是概率问题，是模式选错。改成 steer 后，第 N 次读
+  之后的那个边界就能看到提醒，模型还来得及当场改派 scout。`triggerTurn: true` 保留——宿主在
+  `triggerTurn: false` 时根本不走 steer，而是把消息压到 turn 结束再 append。
+  `#182` 的「subagent 已禁用」暂停通知**刻意不改**：它是说明性提示、不是行动请求，`triggerTurn: false`
+  保证它不会为此烧掉一轮。
+  streak / 冷却语义未变：提醒触发时 streak 同时归零并写入 `cooldownMs`，冷却期内的读调用既不计数
+  也不会二次提醒，所以一段连续 streak 仍然只提醒一次。回归用例
+  `test/integration/mock-llm-scout-guard-delivery.test.ts` 用真宿主断言提醒落在第 8 次读之后的
+  turn 边界（第 9 次读仍待发起），改回 `followUp` 立刻变红（观察到 turn 13）。
+- **取证：19/19 条历史提醒全部落在「回合结束之后」**。扫 `/root/.pi/agent/sessions/` 全量 236 个会话
+  （39 034 条 entry），共 19 条 `scout-guard-notify`、分布于 17 个 session：
+  19/19 的前一条 entry 都是 `role:"assistant"` 且 content 里**没有任何 toolCall**（`stopReason:"stop"` 18/19，
+  余一条是 `error` 空内容），提醒与其上一条的落盘时间差 **min 8ms / median 12ms / max 28ms**——
+  即提醒是在工具批已经结束、模型已经收尾之后才落盘的；19/19 的 `parentId` 都等于提醒自身的 `id`，
+  说明提醒**自己开启了新回合**（没有一条落在 toolResult 边界上，0/19）。其中 **9/19** 的下一轮
+  纯 text/thinking、一个工具都没调，是纯浪费；剩下 10 条里只有 5 条真的补派了
+  `subagent`/`vexillatio`，其余是 bash/async_status/write 之类的收尾调用。
+  提醒到下一轮 assistant 的间隔 min 6.0s / median 20.3s / max 92.4s。
+
 ## [6.0.1] — 2026-11-13
 
 ### Changed

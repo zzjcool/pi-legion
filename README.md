@@ -414,7 +414,9 @@ the inherited cap but cannot widen it.
 
 `subagents.scoutGuard` watches the main session. After `threshold` consecutive
 read-like tool calls with no `subagent` launch or `vexillatio` call in
-between, it injects one follow-up reminder and then waits out `cooldownMs`.
+between, it steers one reminder into the running turn — the host delivers it
+at the next tool boundary, while the agent can still change course — and then
+waits out `cooldownMs` before arming again.
 It is on by default. Set it in `~/.pi/agent/settings.json` or the project
 `.pi/settings.json`; a project file overrides the same fields from the user
 file.

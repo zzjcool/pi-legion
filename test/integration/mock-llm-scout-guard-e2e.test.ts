@@ -2,9 +2,9 @@
  * mock-llm / light extension harness for scout-guard (#108).
  *
  * Unit FSM/hook tests live in test/unit/scout-guard.test.ts. This file hangs
- * on `npm run test:mock-llm` so CI fails red when the real-tool_call → followUp
+ * on `npm run test:mock-llm` so CI fails red when the real-tool_call → steer
  * path regresses: N consecutive read-class calls, exactly one
- * scout-guard-notify followUp (copy includes threshold), dispatch clears the
+ * scout-guard-notify steer (copy includes threshold), dispatch clears the
  * streak, and cooldownMs blocks a second inject. No headed TUI required.
  */
 
@@ -187,7 +187,7 @@ test("e2e: extension harness — notify once, dispatch clears, cooldown blocks s
 				assert.equal(
 					hookReturned,
 					true,
-					"followUp must not run inside tool_call",
+					"the reminder must not be sent inside tool_call",
 				);
 				sent.push({ message, options });
 			},
@@ -238,12 +238,12 @@ test("e2e: extension harness — notify once, dispatch clears, cooldown blocks s
 			"dispatch must clear the streak before N",
 		);
 
-		// (1)+(2) N consecutive reads → exactly one scout-guard-notify followUp.
+		// (1)+(2) N consecutive reads → exactly one scout-guard-notify steer.
 		readAt(THRESHOLD - 1);
 		assert.equal(
 			reminders().length,
 			0,
-			"Nth read only schedules followUp after tool_call returns",
+			"Nth read only schedules the reminder after tool_call returns",
 		);
 		await flush();
 		assert.equal(reminders().length, 1);
@@ -255,7 +255,7 @@ test("e2e: extension harness — notify once, dispatch clears, cooldown blocks s
 		assert.match(reminder.message.content, new RegExp(`连续 ${THRESHOLD} 次`));
 		assert.deepEqual(reminder.options, {
 			triggerTurn: true,
-			deliverAs: "followUp",
+			deliverAs: "steer",
 		});
 
 		// (4) Within cooldownMs, another full streak must not inject again.
@@ -373,7 +373,7 @@ test("e2e: mock-llm + harness — feed scripted read names into scout-guard", as
 		assert.match(reminders[0]!.message.content, new RegExp(`连续 ${THRESHOLD} 次`));
 		assert.deepEqual(reminders[0]!.options, {
 			triggerTurn: true,
-			deliverAs: "followUp",
+			deliverAs: "steer",
 		});
 	} finally {
 		await mock.close();

@@ -300,7 +300,7 @@ function guardPi(input?: {
 	};
 }
 
-test("hook: N consecutive reads inject one followUp reminder and do not block tool_call", () => {
+test("hook: N consecutive reads inject one steer reminder and do not block tool_call", () => {
 	const guard = guardPi({ loadSettings: () => ({ scoutGuard: { threshold: 8, cooldownMs: 120_000 } }) });
 	for (let index = 0; index < 7; index += 1) {
 		assert.equal(guard.call("read", { path: `f${index}` }), undefined);
@@ -316,7 +316,7 @@ test("hook: N consecutive reads inject one followUp reminder and do not block to
 	assert.ok(reminder);
 	assert.equal(reminder.message.content, REMINDER_8);
 	assert.equal(reminder.message.display, true);
-	assert.deepEqual(reminder.options, { triggerTurn: true, deliverAs: "followUp" });
+	assert.deepEqual(reminder.options, { triggerTurn: true, deliverAs: "steer" });
 	guard.call("read", { path: "again" });
 	guard.flush();
 	assert.equal(guard.reminders().length, 1);
@@ -348,7 +348,7 @@ test("hook: default scheduler fires only after tool_call returns", async () => {
 	assert.equal(sent.length, 1);
 	assert.equal(sent[0]?.message.customType, SCOUT_GUARD_NOTIFY_TYPE);
 	assert.equal(sent[0]?.message.content, scoutGuardReminder(1));
-	assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "followUp" });
+	assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "steer" });
 });
 
 test("hook: dispatch, writes, cooldown, and slash/settings bypass", async () => {
@@ -426,7 +426,7 @@ test("hook: settings enabled false bypasses until /scout-guard", async () => {
 	guard.call("read", {});
 	guard.flush();
 	assert.equal(guard.reminders().length, 1);
-	assert.equal(guard.reminders()[0]?.options?.deliverAs, "followUp");
+	assert.equal(guard.reminders()[0]?.options?.deliverAs, "steer");
 });
 
 test("hook: streak persists across turns and children do not register", () => {
@@ -530,7 +530,7 @@ test("harness: N read-like calls notify once, dispatch clears the streak, cooldo
 			registerTool() {},
 			registerCommand() {},
 			sendMessage(message: SentMessage, options?: SentOptions) {
-				assert.equal(hookReturned, true, "followUp must not run inside tool_call");
+				assert.equal(hookReturned, true, "the reminder must not be sent inside tool_call");
 				sent.push({ message, options });
 			},
 			events: { emit() {} },
@@ -569,7 +569,7 @@ test("harness: N read-like calls notify once, dispatch clears the streak, cooldo
 		assert.equal(reminders().length, 0, "dispatch clears the streak before it reaches N");
 
 		readAt(threshold - 1);
-		assert.equal(reminders().length, 0, "the Nth read only schedules the followUp");
+		assert.equal(reminders().length, 0, "the Nth read only schedules the reminder");
 		await flush();
 		assert.equal(reminders().length, 1);
 		const [reminder] = reminders();
@@ -577,7 +577,7 @@ test("harness: N read-like calls notify once, dispatch clears the streak, cooldo
 		assert.equal(reminder.message.customType, SCOUT_GUARD_NOTIFY_TYPE);
 		assert.equal(reminder.message.display, true);
 		assert.match(reminder.message.content, new RegExp(`连续 ${threshold} 次`));
-		assert.deepEqual(reminder.options, { triggerTurn: true, deliverAs: "followUp" });
+		assert.deepEqual(reminder.options, { triggerTurn: true, deliverAs: "steer" });
 
 		for (let index = 0; index < threshold; index += 1) readAt(index);
 		await flush();

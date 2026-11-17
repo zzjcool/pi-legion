@@ -3,11 +3,19 @@
  *
  * Counts consecutive read-like tool calls in the parent session. When the
  * streak reaches N with no subagent/vexillatio dispatch in between, inject
- * one follow-up reminder. First-class read tools (`read`, `grep`, `find`,
+ * one steering reminder. First-class read tools (`read`, `grep`, `find`,
  * `ls`) count the same as read-only bash; playbooks prefer those over bash,
  * so ignoring them let a main-session scout miss the threshold. The
  * tool_call hook only updates state; the reminder is scheduled so it cannot
  * block the current tool call.
+ *
+ * Delivery must be `deliverAs: "steer"` (#17 follow-up). The host drains the
+ * steering queue at every turn boundary — after the current assistant message's
+ * tool-call batch finishes, before the next LLM call (`agent-loop.js:191`) —
+ * whereas the follow-up queue is drained only once the agent has no more tool
+ * calls (`agent-loop.js:197`). A reminder sent as `followUp` therefore always
+ * landed after the work was already over and could not change the next action:
+ * the model saw it one turn too late, at the price of an extra turn.
  *
  * Children carry PI_SUBAGENT_ROLE and must not run this logic.
  */
@@ -44,7 +52,7 @@ export interface ScoutGuardDeps {
 	loadSettings?: (cwd: string) => { scoutGuard?: ScoutGuardSettings };
 	now?: () => number;
 	/**
-	 * Defers the follow-up until after tool_call returns.
+	 * Defers the send until after tool_call returns.
 	 * Default is a zero-delay timer so the current tool call is not blocked.
 	 */
 	schedule?: (run: () => void) => void;
@@ -249,6 +257,10 @@ export function registerScoutGuard(pi: ExtensionAPI, deps: ScoutGuardDeps = {}):
 				const content = scoutGuardPausedNotice();
 				schedule(() => {
 					try {
+						// Deliberately NOT steered: this is an informational pause notice, not an
+						// action request. `triggerTurn: false` also makes `deliverAs` inert on the
+						// host (streaming appends it at turn end, idle appends it without starting
+						// a run), so the notice can never burn a turn.
 						pi.sendMessage(
 							{ customType: SCOUT_GUARD_NOTIFY_TYPE, content, display: true },
 							{ triggerTurn: false, deliverAs: "followUp" },
@@ -272,9 +284,16 @@ export function registerScoutGuard(pi: ExtensionAPI, deps: ScoutGuardDeps = {}):
 		const content = scoutGuardReminder(config.threshold);
 		schedule(() => {
 			try {
+				// `steer` is the mode that lands mid-work: the host drains the steering
+				// queue at the next turn boundary, so the model reads this before its next
+				// action and can still re-dispatch to a scout. `followUp` waits until the
+				// agent issues no more tool calls, i.e. after the streak already finished.
+				// `triggerTurn` must stay true: the host skips steering when it is false
+				// (docs/extensions.md:1649) and falls back to "append after the turn ends",
+				// which would restore the exact bug this fixes.
 				pi.sendMessage(
 					{ customType: SCOUT_GUARD_NOTIFY_TYPE, content, display: true },
-					{ triggerTurn: true, deliverAs: "followUp" },
+					{ triggerTurn: true, deliverAs: "steer" },
 				);
 			} catch {
 				// Parent session may already be gone.

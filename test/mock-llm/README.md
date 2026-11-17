@@ -97,7 +97,9 @@ npm run mock-llm -- --script test/mock-llm/examples/custom.json
 ```
 
 
-Scout-guard regression (#108) lives in `test/integration/mock-llm-scout-guard-e2e.test.ts` (picked up by `npm run test:mock-llm`): mock scripts N consecutive read-class tool_calls; light extension harness asserts one `scout-guard-notify` followUp, dispatch clear, and cooldown.
+Scout-guard regression (#108) lives in `test/integration/mock-llm-scout-guard-e2e.test.ts` (picked up by `npm run test:mock-llm`): mock scripts N consecutive read-class tool_calls; light extension harness asserts one `scout-guard-notify` steer message, dispatch clear, and cooldown.
+
+Where that message *lands* is covered separately by `test/integration/mock-llm-scout-guard-delivery.test.ts`: it runs the real host bundle with this repo's extension loaded and the mock keeps issuing read calls every turn, so the reminder must surface at the Nth-read turn boundary (`..._OK_AT_TURN_8`) rather than after the loop drains (`followUp` produces turn 13+).
 
 Per-request override: header `x-mock-scenario: child-done` or
 `?scenario=child-done` on the chat URL.
