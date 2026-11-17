@@ -878,7 +878,11 @@ test("B2/S4: `resume` on a child that ran on another host runs the four-step gat
 		// not a local relaunch wearing the remote child's name.
 		assert.doesNotMatch(text, /cannot restart it/, "resume must not hit the continue guard");
 		assert.match(text, /step 2\/4/);
-		assert.match(text, /not reachable/);
+		// Two shapes reach step 2, and both are correct: "host 'vps' is not reachable"
+		// when the transport is there but fails, and "unreachable: hc connect failed to
+		// start" when there is no `hc` binary at all (a CI runner has none). The step
+		// number is the contract; the wording is whatever the transport said.
+		assert.match(text, /not reachable|unreachable/);
 		assert.match(text, /vps/);
 		assert.equal(
 			h.supervisor.calls.filter((call) => call.method === "spawnChild").length,
