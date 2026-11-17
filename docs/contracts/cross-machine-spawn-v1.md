@@ -1,6 +1,6 @@
 # cross-machine spawn v1 (frozen contract)
 
-Status: **frozen** · scope: terminal backend + hc only · landed: S0 · in progress: S1 · pending: S2–S5
+Status: **frozen** · scope: terminal backend + hc only · landed: S0/S1 · pending: S2–S5
 
 ## Why
 
@@ -183,6 +183,62 @@ None of these changes a decision above.
   `normalizeHost` decides at that one point. D1's refusal for the non-terminal
   backends is not in S0, so a card `host` on an `rpc`/`inprocess` launch is
   ignored rather than refused until that guard lands.
+- **S1 scope.** S1 makes `host` a REAL remote spawn for `worktree: false` and
+  nothing else: remote `cwd`, remote `argv`, remote `env`, remote labels and a
+  preflight, plus D1's refusal. `host` with `worktree: true` is refused by name
+  (`remote worktrees land in S2`, D11) — a local worktree for a remote child
+  would be a checkout nobody delivers from, and the replacement (a remote
+  `git worktree add -b`) is exactly what S2 adds. Remote verify (S3) and
+  verdict/artifact recall (S4) are still open: a remote child launched now is a
+  transport fact, not yet a collectable deliverable.
+- **S1 env deletion happens on the CONSTRUCTION side.** D7's "no parent
+  `PATH`/`HOME`/`TERM*`, no legion identity" cannot be expressed as "send then
+  delete", because `terminal.run`'s `env` is a merge-only overlay with no delete
+  semantics. So the remote branch never puts those keys in the overlay at all
+  (and drops them from `input.env` if it carried one), which is not in tension
+  with the core's merge rule: we are not asking the core to remove anything, we
+  are not sending it. Measured on the fake core, whose `on` branch rejects a
+  parent-projected env outright.
+- **S1 fix round: no half-crossing, and no basename rewriting (D6 sharpened).**
+  Two shapes the first S1 pass accepted are now refused, because both would
+  start a remote child with an argv that cannot work:
+  1. `host` without a resolved `HostTarget`. The supervisor used to treat it as a
+     raw seam and send `on` with this machine's `argv`/`env`/`cwd`. The target is
+     now REQUIRED whenever a host is named (`INVALID_PARAMS`), so the only remote
+     launch that exists is a fully-resolved one.
+  2. An absolute argv path that is neither inside the checkout nor under a
+     configured prefix. The first pass rewrote every such path to
+     `<remoteDir>/<basename>`, with no copy behind it — the child was handed a
+     path to nothing. Now: paths inside the checkout are re-rooted onto
+     `target.cwd` (same content, the other machine's root — the git-remote
+     delivery model), configured `pathMap` prefixes are re-rooted onto their
+     remote side, and anything else is refused by name with the exact key to add.
+- **`piLegionRoot` exists because `buildPiArgs` is not extension-free.**
+  Every child's argv names THIS package's extension entry
+  (`args.ts`: "absolute path to this package's extension entry"), so a remote
+  launch always carries one absolute path that has to exist on the other machine.
+  `hosts.<host>.piLegionRoot` says where (default: the same path — right when both
+  machines are provisioned identically), and it is folded into `pathMap`
+  automatically. An explicit `pathMap` entry for the package root wins over it.
+  `pathMap` keys/values must be absolute on both sides (`resolveHostTarget`
+  refuses otherwise: a relative prefix resolves against two different homes).
+- **A utility dispatch cannot carry a `host` (D1).** `vexillatio`'s contract is
+  "a leaf process HERE that returns text to the caller it holds" (its inbox hold,
+  its inline collect). A remote terminal would be a child whose result nobody
+  reads, so `host` + `utilityDispatch` is refused by name instead of being
+  arbitrated into the terminal backend. That closes the S0 gap where
+  `VexillatioParams.host` was silently ignored.
+- **D17 in one more place.** `continue`/revive on a record whose `host` is set is
+  refused with the machine's name (`resume` is the supported action, and it
+  relaunches there). Without this guard the revive path would resume the child's
+  stored session file — which lives on the other machine — as if it were local.
+- **`file.read`'s `lines` is the FILE's total line count.** The fake-core
+  harness aligned `FileReadResult` with `hc schema` (herdr-core 0.1.21):
+  `{text, first, last, lines}` where `lines` is the total, not the returned
+  slice's length. So D15's `wc -l` step is not needed — one `file.read`
+  (`offset`/`limit`, ≤ 8 MB) both locates the tail and reports its size, and S4
+  should read it that way instead of spending a second `machine.exec` on
+  `wc -l`.
 
 ## Non-goals (v1)
 

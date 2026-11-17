@@ -11,6 +11,8 @@ import {
 	AGENT_KINDS,
 	DEFAULT_LEGION_SETTINGS,
 	type AgentOverride,
+	type CrossMachineHostConfig,
+	type CrossMachineSettings,
 	type LegionSettings,
 	type ModelScopeConfig,
 	type OnBlockedPolicy,
@@ -497,6 +499,7 @@ export function parseSubagentSettings(
 	setIf(out, "scoutGuard", parseScoutGuard(input.scoutGuard, filePath));
 	setIf(out, "inprocess", parseInProcessLimits(input.inprocess, filePath));
 	setIf(out, "rpc", parseRpcSettings(input.rpc, filePath));
+	setIf(out, "crossMachine", parseCrossMachine(input.crossMachine, filePath));
 
 	// THE WHITELIST: every key read above must be assigned, or it is silently
 	// discarded. `presets` and `agentOverridesByProvider` are the newest keys and
@@ -667,6 +670,109 @@ function parseRpcSettings(
 	setIf(out, "approve", requiredBoolean(value.approve, "rpc.approve", filePath));
 	// Unknown keys ignored; v1 does not accept / emit --no-approve.
 	return out;
+}
+
+/**
+ * `subagents.crossMachine` (contract `cross-machine-spawn-v1`).
+ *
+ * Required here, not optional: `parseSubagentSettings` is a whitelist, and a key
+ * it does not read is dropped without a word. Parsing it explicitly is the only
+ * thing that makes the block reachable at all.
+ *
+ * Validation policy — one choice, stated once: a host entry is kept even when
+ * its `cwd` is missing or not absolute, because the useful error names the
+ * VALUE the operator typed and arrives at the launch that needs it
+ * (`resolveHostTarget` in `src/runs/remote.ts`: "host 'vps' needs an absolute
+ * cwd in subagents.crossMachine.hosts.vps.cwd"). Throwing here would report a
+ * settings typo as a settings-load failure, long before anyone asks for that
+ * host, and would take the whole settings file down for one bad entry. What IS
+ * rejected here is a wrong SHAPE: a non-object block, a non-boolean `enabled`,
+ * a non-object `hosts`, an empty host name, or a non-string field value.
+ * Unknown keys are ignored, like every other settings blob.
+ */
+function parseCrossMachine(
+	value: unknown,
+	filePath: string,
+): CrossMachineSettings | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value)) {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid 'crossMachine'; expected an object.`,
+		);
+	}
+	const out: CrossMachineSettings = {};
+	setIf(
+		out,
+		"enabled",
+		requiredBoolean(value.enabled, "crossMachine.enabled", filePath),
+	);
+	if (value.hosts !== undefined) {
+		if (!isRecord(value.hosts)) {
+			throw new Error(
+				`Subagent settings in '${filePath}' have invalid 'crossMachine.hosts'; expected an object keyed by host name.`,
+			);
+		}
+		const hosts: Record<string, CrossMachineHostConfig> = {};
+		for (const [name, entry] of Object.entries(value.hosts)) {
+			const host = name.trim();
+			if (host.length === 0) {
+				throw new Error(
+					`Subagent settings in '${filePath}' have invalid 'crossMachine.hosts'; a host name must be a non-empty string.`,
+				);
+			}
+			if (!isRecord(entry)) {
+				throw new Error(
+					`Subagent settings in '${filePath}' have invalid 'crossMachine.hosts.${host}'; expected an object.`,
+				);
+			}
+			const target: CrossMachineHostConfig = {};
+			const cwd = optionalString(entry.cwd, `crossMachine.hosts.${host}.cwd`, filePath);
+			if (cwd !== undefined) target.cwd = cwd;
+			const node = optionalString(entry.node, `crossMachine.hosts.${host}.node`, filePath);
+			if (node !== undefined) target.node = node;
+			const piCli = optionalString(entry.piCli, `crossMachine.hosts.${host}.piCli`, filePath);
+			if (piCli !== undefined) target.piCli = piCli;
+			const piLegionRoot = optionalString(entry.piLegionRoot, `crossMachine.hosts.${host}.piLegionRoot`, filePath);
+			if (piLegionRoot !== undefined) target.piLegionRoot = piLegionRoot;
+			if (entry.pathMap !== undefined) {
+				if (!isRecord(entry.pathMap)) {
+					throw new Error(
+						`Subagent settings in '${filePath}' have invalid 'crossMachine.hosts.${host}.pathMap'; expected an object of absolute prefixes.`,
+					);
+				}
+				const pathMap: Record<string, string> = {};
+				for (const [from, to] of Object.entries(entry.pathMap)) {
+					const key = from.trim();
+					if (key.length === 0 || typeof to !== "string" || to.trim().length === 0) {
+						throw new Error(
+							`Subagent settings in '${filePath}' have invalid 'crossMachine.hosts.${host}.pathMap'; both sides must be non-empty strings.`,
+						);
+					}
+					pathMap[key] = to.trim();
+				}
+				target.pathMap = pathMap;
+			}
+			hosts[host] = target;
+		}
+		out.hosts = hosts;
+	}
+	return out;
+}
+
+/** A trimmed non-empty string, or `undefined` when the key is absent. */
+function optionalString(
+	value: unknown,
+	key: string,
+	filePath: string,
+): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid '${key}'; expected a string.`,
+		);
+	}
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : undefined;
 }
 
 /** Validate the types of the supported fields in one override object. */

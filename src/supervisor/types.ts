@@ -5,6 +5,7 @@
 import type { RpcClientOptions as PiRpcClientOptions } from "@earendil-works/pi-coding-agent";
 import type { Writable } from "node:stream";
 import type { BuildArgsInput } from "../runs/args.ts";
+import type { HostTarget } from "../runs/remote.ts";
 import type { ChildLaunchContext } from "./child-context.ts";
 import type { UIProxy } from "./ui-proxy.ts";
 
@@ -41,6 +42,17 @@ export interface SpawnInput extends Omit<BuildArgsInput, "cwd" | "includeTask"> 
 	 * that predicate is the single definition of "absent means local".
 	 */
 	host?: string;
+	/**
+	 * The RESOLVED target behind {@link host} (cross-machine contract D6/D7/D9).
+	 *
+	 * `host` is a name; this is everything that name has to mean on the other
+	 * machine: the remote cwd, the remote interpreter and the remote CLI, all
+	 * already validated against `subagents.crossMachine` by
+	 * `resolveHostTarget`. The backend refuses to launch without it, because
+	 * guessing a remote cwd is how a child lands in the wrong directory — the
+	 * orchestrator is the one place that checks the pair agrees.
+	 */
+	hostTarget?: HostTarget;
 }
 
 /** Handle returned after the RPC process accepts its first prompt. */

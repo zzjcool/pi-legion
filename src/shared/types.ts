@@ -824,6 +824,71 @@ export interface RpcSettings {
 	approve?: boolean;
 }
 
+/**
+ * One entry of `subagents.crossMachine.hosts` (contract
+ * `cross-machine-spawn-v1` D7/D9).
+ *
+ * Every value describes the TARGET machine, never this one: `cwd` is an
+ * absolute path ON that machine and is not translated from here (contract
+ * D6/D13). `node`/`piCli` are resolved through that machine's `PATH` by the
+ * remote `machine.exec` preflight, so a bare name (`node`, `pi`) is the normal
+ * value and an absolute remote path is the escape hatch.
+ */
+export interface CrossMachineHostConfig {
+	/** Absolute path (on that machine) the remote child starts in. */
+	cwd?: string;
+	/** Remote `node` (default `"node"`), resolved on that machine's PATH. */
+	node?: string;
+	/** Remote `pi` CLI (default `"pi"`), resolved on that machine's PATH. */
+	piCli?: string;
+	/**
+	 * Where THIS package (pi-legion) lives on that machine.
+	 *
+	 * Not a nicety: `buildPiArgs` injects this package's extension entry into every
+	 * child's argv (`args.ts`, "absolute path to this package's extension entry"),
+	 * so a remote child always carries one absolute path to a file that has to
+	 * exist over there. Default: the same path as here, which is right when both
+	 * machines provision the plugin identically. Set it when they do not.
+	 */
+	piLegionRoot?: string;
+	/**
+	 * Prefix translation for argv paths that live OUTSIDE the checkout.
+	 *
+	 * Key: an absolute prefix on THIS machine; value: the absolute prefix the same
+	 * content has on the target. Longest key wins, and only whole path segments
+	 * match (`/opt/pi` does not capture `/opt/pix`).
+	 *
+	 * This exists because a real child's argv carries `-e <extension>/index.ts`
+	 * paths from the running plugin's install, which is neither in the checkout nor
+	 * mirrored into the remote temp dir. Rewriting those by basename would hand the
+	 * remote child a path to nothing (D6), so without an entry here they are
+	 * REFUSED by name. A value that does not exist on the target fails later, in
+	 * that machine's own `pi` — this map only decides which path it is asked to
+	 * open.
+	 */
+	pathMap?: Record<string, string>;
+}
+
+/**
+ * Cross-machine spawn configuration (contract `cross-machine-spawn-v1`).
+ *
+ * Off by default: with `enabled` absent/false a launch that names a `host` is
+ * REFUSED rather than run locally — a child that ran here while the caller
+ * believed it ran elsewhere is the worst answer (contract D1).
+ */
+export interface CrossMachineSettings {
+	/** Master switch; absent/false refuses every launch that names a `host`. */
+	enabled?: boolean;
+	/**
+	 * Explicit allow-list of target machines, keyed by the `hc machine ls` name.
+	 *
+	 * A host with no entry here is refused (`resolveHostTarget` in
+	 * `src/runs/remote.ts`): the remote cwd cannot be guessed, and guessing is
+	 * how a remote launch lands in the wrong directory.
+	 */
+	hosts?: Record<string, CrossMachineHostConfig>;
+}
+
 export interface SubagentsSettings {
 	/**
 	 * Master switch (default true). `false` stops new launches, system-prompt
@@ -895,6 +960,15 @@ export interface SubagentsSettings {
 	 * `rpc.approve: true` to append it. Not an inherit-parent-trust channel.
 	 */
 	rpc?: RpcSettings;
+	/**
+	 * Cross-machine launches (contract `cross-machine-spawn-v1`). Absent = no
+	 * host is usable, and a launch that names one is refused (D1).
+	 *
+	 * Parsed EXPLICITLY in `parseSubagentSettings` — that parser drops any key it
+	 * does not read, so leaving this out of the whitelist would silently ignore
+	 * the whole block.
+	 */
+	crossMachine?: CrossMachineSettings;
 }
 
 /**

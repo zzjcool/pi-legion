@@ -148,7 +148,7 @@ import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
-import { normalizeHost } from "./src/runs/remote.ts";
+import { normalizeHost, resolveHostTarget } from "./src/runs/remote.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
@@ -1418,7 +1418,13 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	// `nodes` table has no provider column and is deliberately not migrated, so
 	// this must never be looked up there. Records written before the field
 	// existed simply have none — then no pin is replayed rather than a guessed one.
-	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), ...(saved.host ? { host: saved.host } : {}), worktree: Boolean(saved.worktreePath) });
+	// S0 carried `host` from the record; S1 also resolves what that name MEANS on
+	// the other machine (remote cwd / node / pi CLI). Resolution is where a
+	// missing or malformed `subagents.crossMachine` entry becomes a refusal
+	// instead of a resume that quietly runs here (contract D1/D17).
+	const savedHost = normalizeHost(saved.host);
+	const hostTarget = savedHost ? resolveHostTarget(savedHost, catalog.settings.crossMachine) : undefined;
+	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), ...(savedHost ? { host: savedHost } : {}), ...(hostTarget ? { hostTarget } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
 
@@ -4278,6 +4284,21 @@ async function reviveChild(
 ): Promise<AgentToolResult<unknown>> {
 	const { action, params, supervisor, name, found, orchestrator } = ctx;
 
+	// D17 (`cross-machine-spawn-v1`): `continue` on a child that ran on another
+	// machine is the one control action this version does NOT support. Its
+	// session JSONL lives over there, so a revival here would either run the work
+	// on the wrong machine or start a new turn from a transcript nobody can read —
+	// both are silent lies of the kind D1 refuses for launches. `resume` is
+	// different (it RELAUNCHES on that machine, see `resumeLegionChild`), and the
+	// message says so instead of only refusing.
+	const recordHost = normalizeHost(found.child.host);
+	if (recordHost !== undefined) {
+		return fail(
+			`child '${name}' ran on host '${recordHost}'; cross-machine continue is not supported (resume relaunches on that machine, see D17)`,
+			ErrorCodes.INVALID_PARAMS,
+		);
+	}
+
 	if (!params.message) {
 		return fail(
 			`\`message\` is required for ${action}.`,
@@ -4781,6 +4802,11 @@ async function launchStep(
 		// = this host (contract D4). Normalized here so the orchestrator and the
 		// backend never re-decide what "blank" means.
 		const host = normalizeHost(step.host) ?? normalizeHost(session.params.host) ?? normalizeHost(effective.host);
+		// D1/D6: a named host is only usable when this machine knows what it points
+		// at (remote cwd, remote node/pi). Resolution fails LOUDLY and becomes a
+		// refusal line for this step — the alternative is a launch that runs HERE
+		// while the caller believes it ran elsewhere.
+		const hostTarget = host ? resolveHostTarget(host, session.settings.crossMachine) : undefined;
 		const handle = await session.orchestrator.launch({
 			agent: launchedAgent,
 			task: step.task,
@@ -4801,6 +4827,7 @@ async function launchStep(
 				step: step.worktree,
 			}),
 			...(host ? { host } : {}),
+			...(hostTarget ? { hostTarget } : {}),
 			// #371: a phase machine is declared by the ROOT at dispatch time and is a
 			// property of the launch, not of a step — `tasks[]` fan-out carries the
 			// same declaration to every sibling (G3 then refuses any step that is not
@@ -5312,6 +5339,13 @@ async function launchUtilityFamily(input: {
 		});
 		orchestrator.restore(run);
 		try {
+			// Cross-machine (contract `cross-machine-spawn-v1` D1): a utility
+			// dispatch carrying a host used to be SILENTLY ignored here, which is the
+			// worst of the three possible answers. Resolving the target now means the
+			// launch either really goes to that machine or is refused with the
+			// reason — never quietly run on this host.
+			const stepHost = normalizeHost(item.step.host) ?? normalizeHost(input.params.host);
+			const stepTarget = stepHost ? resolveHostTarget(stepHost, catalog.settings.crossMachine) : undefined;
 			const handle = await orchestrator.launch({
 				agent: item.agent,
 				task: item.step.task,
@@ -5321,6 +5355,8 @@ async function launchUtilityFamily(input: {
 				...(item.resolved.model ? { modelProvider: providerForModel(input.ctx.modelRegistry, item.resolved.model) } : {}),
 				modelOrigin: item.modelOrigin,
 				...(item.step.worktree !== undefined ? { worktree: item.step.worktree } : {}),
+				...(stepHost ? { host: stepHost } : {}),
+				...(stepTarget ? { hostTarget: stepTarget } : {}),
 				utilityDispatch: true,
 				stripLegionIdentity: true,
 			});

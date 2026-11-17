@@ -24,8 +24,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type HcClient, type HcMethod } from "../../src/hc/client.ts";
-import { TerminalSupervisor, HERDR_SPACE_LABEL } from "../../src/supervisor/terminal-supervisor.ts";
-import { assertLocalWorktree, normalizeHost, terminalAddress } from "../../src/runs/remote.ts";
+import { TerminalSupervisor, HERDR_SPACE_LABEL, LEGION_HOST_LABEL } from "../../src/supervisor/terminal-supervisor.ts";
+import {
+	assertLocalWorktree,
+	normalizeHost,
+	remoteDirFor,
+	terminalAddress,
+	thisPackageRoot,
+	type HostTarget,
+} from "../../src/runs/remote.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 
@@ -69,6 +76,12 @@ class FakeHcClient implements HcClient {
 		return this.calls.filter((call) => call.method === method).map((call) => call.params);
 	}
 }
+
+// Hermetic on purpose: the host's discovered extensions are absolute paths from
+// whatever machine runs the suite, and a remote launch REFUSES an argv path it
+// cannot map (`pathMap`). Turning inheritance off leaves exactly one absolute
+// entry — this package's own — which the fixture maps portably.
+process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = "0";
 
 const TERMINAL_ID = "t1k";
 const SOCKET = "/tmp/hc-test/default.sock";
@@ -134,6 +147,11 @@ function harness(env: NodeJS.ProcessEnv): Harness {
 	client.on("terminal.interrupt", () => ({ key: "esc", outcome: "stopped" }));
 	client.on("terminal.kill", () => ({ address: "t8", state: "finished" }));
 	client.on("terminal.rm", () => ({ removed: "t8" }));
+	// S1 remote setup calls. Both answer 0 without touching a filesystem: the
+	// params (not the effect) are what these unit tests pin — the fake hc core in
+	// `test/integration/fake-core-remote-spawn.test.ts` proves the effect.
+	client.on("machine.exec", () => ({ code: 0, ms: 1, signal: null, stdout: "", stderr: "", truncated: false, timed_out: false }));
+	client.on("file.write", (params) => ({ path: params.path, bytes: String(params.data ?? "").length }));
 	const supervisor = new TerminalSupervisor({
 		clientFactory: () => client,
 		env,
@@ -171,7 +189,9 @@ test("D4: without a host, terminal.run gets exactly the five local params and no
 test("D2: with a host, `on` carries it and the child record keeps it", async () => {
 	const h = harness(localEnv());
 	try {
-		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps" }));
+		// A named host always carries a resolved target (S1): the backend refuses a
+		// bare name rather than sending this machine's argv to another machine.
+		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget() }));
 		const params = h.client.paramsFor("terminal.run")[0];
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.on, "vps");
@@ -185,7 +205,7 @@ test("D2: with a host, `on` carries it and the child record keeps it", async () 
 test("D2: host + caller send both `caller` and `on`", async () => {
 	const h = harness(callerEnv());
 	try {
-		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps" }));
+		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget() }));
 		const params = h.client.paramsFor("terminal.run")[0];
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.caller, TERMINAL_ID);
@@ -213,6 +233,134 @@ test("D4: a blank host is not a machine", async () => {
 		const params = h.client.paramsFor("terminal.run")[0];
 		assert.ok(params, "terminal.run must be called");
 		assert.ok(!("on" in params), "an all-whitespace host means this host");
+	} finally {
+		h.cleanup();
+	}
+});
+
+/** The remote root a host target points at (the fake client never looks at it). */
+const REMOTE_CWD = "/srv/remote/work";
+
+const REMOTE_LEGION_ROOT = `${REMOTE_CWD}/.pi-legion`;
+
+/**
+ * A resolved target as `resolveHostTarget` builds it: the package's own root is
+ * mapped, because `buildPiArgs` names that extension entry in EVERY child's argv.
+ */
+function hostTarget(overrides: Partial<HostTarget> = {}): HostTarget {
+	return {
+		host: "vps",
+		cwd: REMOTE_CWD,
+		node: "node",
+		piCli: "pi",
+		pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }],
+		...overrides,
+	};
+}
+
+// ── S1: the remote branch (D6/D7/D8/D9) ───────────────────────────────────
+
+test("S1: a remote spawn preflights, makes the remote dir, and sends the remote cwd/argv/env/labels", async () => {
+	// `callerEnv` on purpose: a LOCAL spawn would read the parent terminal's
+	// `herdr.space` here, so "no terminal.get happened" is a real assertion.
+	const h = harness(callerEnv());
+	const target = hostTarget();
+	try {
+		const input = spawnInput(h.root, { host: "vps", hostTarget: target });
+		await h.supervisor.spawnChild(input);
+
+		// D6/D9: exactly two setup calls — one preflight `line`, one `mkdir -p`.
+		const execs = h.client.paramsFor("machine.exec");
+		assert.equal(execs.length, 2, "preflight + remote dir creation");
+		assert.equal(execs[0]!.on, "vps");
+		assert.equal(typeof execs[0]!.line, "string");
+		assert.match(String(execs[0]!.line), /cd -- '\/srv\/remote\/work'/);
+		const remoteDir = remoteDirFor(target, undefined, input.name);
+		assert.equal(execs[1]!.on, "vps");
+		assert.deepEqual(execs[1]!.argv, ["mkdir", "-p", remoteDir]);
+
+		const run = h.client.paramsFor("terminal.run")[0];
+		assert.ok(run, "terminal.run must be called");
+		// D2: the one wire mapping, unchanged by S1.
+		assert.equal(run.on, "vps");
+		// D6: the child starts in the REMOTE cwd, never this machine's.
+		assert.equal(run.cwd, REMOTE_CWD);
+
+		// D6: remote argv — the remote programs and no parent-absolute path.
+		const argv = run.argv as string[];
+		assert.equal(argv[0], "node");
+		assert.equal(argv[1], "pi");
+		assert.ok(!argv.includes(process.execPath), "the parent interpreter must not travel");
+		assert.equal(argv[argv.indexOf("--session") + 1], `${remoteDir}/session.jsonl`);
+		const promptFlag = argv.includes("--append-system-prompt") ? "--append-system-prompt" : "--system-prompt";
+		const promptPath = argv[argv.indexOf(promptFlag) + 1];
+		assert.equal(promptPath, `${remoteDir}/system-prompt.md`);
+		// Every argv element that looks like a path is inside the remote dir: the
+		// inherited extensions are mirrored by path mapping too, never left pointing
+		// at this machine.
+		for (const arg of argv) {
+			if (!path.posix.isAbsolute(arg)) continue;
+			assert.ok(
+				arg.startsWith(REMOTE_CWD),
+				`a parent-absolute argv survived: ${arg} is neither in ${REMOTE_CWD} nor mirrored into ${remoteDir}`,
+			);
+		}
+		// The package's own `-e` entry (present in every child's argv) went through
+		// `pathMap`, not through a basename sweep that would hand the child a path
+		// to nothing.
+		assert.ok(
+			argv.includes(`${REMOTE_LEGION_ROOT}/index.ts`),
+			`the package entry must be re-rooted: ${argv.join(" ")}`,
+		);
+
+		// D9: the mirrored file carries the real prompt, not a placeholder.
+		const writes = h.client.paramsFor("file.write");
+		const prompt = writes.find((params) => params.path === `${remoteDir}/system-prompt.md`);
+		assert.ok(prompt, "the system prompt must be mirrored");
+		assert.equal(prompt.on, "vps");
+		assert.match(Buffer.from(String(prompt.data), "base64").toString("utf8"), /You are a test centurion\./);
+
+		// D7: no parent PATH/HOME/TERM and no legion identity on the other machine.
+		const env = run.env as Record<string, string>;
+		for (const key of ["PATH", "HOME", "TERM", "TERM_PROGRAM", "COLORTERM"]) {
+			assert.equal(key in env, false, `${key} is a parent fact`);
+		}
+		for (const key of Object.keys(env)) {
+			assert.equal(
+				key.startsWith("PI_LEGION_") && key !== "PI_LEGION_CHILD_EXTENSIONS",
+				false,
+				`legion identity must not cross machines: ${key}`,
+			);
+		}
+
+		// D8: role + host, and NO parent space label (and no read of it either).
+		const labels = run.labels as Record<string, string>;
+		assert.deepEqual(labels, { "legion.role": "centurion", [LEGION_HOST_LABEL]: "vps" });
+		assert.equal(HERDR_SPACE_LABEL in labels, false, "a parent space id is meaningless over there");
+		assert.deepEqual(h.client.paramsFor("terminal.get"), [], "no parent terminal read for a remote child");
+
+		// D9: the record remembers the remote dir (the parent temp dir stays local).
+		const record = childRecord(h.supervisor, input.name) as { remoteDir?: string; tempDir?: string; host?: string };
+		assert.equal(record.remoteDir, remoteDir);
+		assert.equal(record.host, "vps");
+		assert.ok(record.tempDir && !record.tempDir.startsWith(REMOTE_CWD), "the parent temp dir is not migrated");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("S1: a failing preflight refuses the launch before terminal.run", async () => {
+	const h = harness(callerEnv());
+	try {
+		h.client.on("machine.exec", () => ({ code: 11, stdout: "", stderr: "", timed_out: false }));
+		const error = await h.supervisor
+			.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget({ cwd: "/srv/missing" }) }))
+			.then(() => undefined, (thrown: unknown) => thrown);
+		assert.ok(error instanceof SubagentError);
+		assert.equal((error as SubagentError).code, ErrorCodes.START_FAILED);
+		assert.match((error as SubagentError).message, /host 'vps'/);
+		assert.match((error as SubagentError).message, /\/srv\/missing/);
+		assert.deepEqual(h.client.paramsFor("terminal.run"), [], "a bad cwd must not create a terminal");
 	} finally {
 		h.cleanup();
 	}
@@ -259,4 +407,62 @@ test("assertLocalWorktree: another machine's worktree is refused by name, host a
 	assert.match(message, /vps/);
 	assert.match(message, /\/srv\/app\/\.wt\/x/);
 	assert.match(message, /refused/);
+});
+
+// ── D6: a host without a target, and an unmappable argv path ───────────────
+
+test("D6: a host with no resolved target is refused instead of half-crossing", async () => {
+	// "Half-crossing" = sending `on` while the argv, env and cwd are still this
+	// machine's. It used to be accepted as a raw seam; it is now impossible,
+	// because a remote terminal that starts with a parent path is a child nobody
+	// can debug (D6/D7).
+	const h = harness(localEnv());
+	try {
+		await assert.rejects(
+			() => h.supervisor.spawnChild(spawnInput(h.root, { host: "vps" })),
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+				assert.match((error as SubagentError).message, /resolved target/);
+				return true;
+			},
+		);
+		// Refused BEFORE the wire: the client only answered the parent-space probe
+		// (the harness's `terminal.get` lookup), no `terminal.run` was sent.
+		assert.equal(h.client.paramsFor("terminal.run").length, 0);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("D6: an argv path outside the checkout and outside every pathMap is refused by name", async () => {
+	// `-e <plugin install>/index.ts` is the real shape of this: the running
+	// plugin's path is neither in the checkout nor mirrored, so rewriting it by
+	// basename would point the remote child at nothing. The launch must fail and
+	// name where the operator has to add the mapping.
+	const h = harness(localEnv());
+	try {
+		const args = spawnInput(h.root, {
+			host: "vps",
+			// No pathMap at all, so the package entry (which every child's argv
+			// carries) has nowhere to go except the identity default.
+			hostTarget: hostTarget({ pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }] }),
+		});
+		// An agent extension that lives somewhere no mapping covers.
+		args.agent = { ...args.agent, extensions: ["/opt/thirdparty/ext/index.ts"] };
+		await assert.rejects(
+			() => h.supervisor.spawnChild(args),
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+				const message = (error as SubagentError).message;
+				assert.match(message, /\/opt\/thirdparty\/ext\/index\.ts/);
+				assert.match(message, /pathMap/);
+				return true;
+			},
+		);
+		assert.equal(h.client.paramsFor("terminal.run").length, 0, "no terminal may be created");
+	} finally {
+		h.cleanup();
+	}
 });

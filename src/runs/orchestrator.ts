@@ -94,7 +94,7 @@ import {
 	resolveLaunchWorktree,
 } from "./worktree.ts";
 import { provisionWorktree } from "./provision.ts";
-import { normalizeHost } from "./remote.ts";
+import { normalizeHost, type HostTarget } from "./remote.ts";
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
@@ -210,10 +210,18 @@ export interface LaunchInput {
 	/**
 	 * Target machine for this launch; absent = this host (contract
 	 * `cross-machine-spawn-v1` D4). Normalized once by `normalizeHost` below and
-	 * carried to the backend on `SpawnInput.host` — nothing else in the launch
-	 * reads it in S0.
+	 * carried to the backend on `SpawnInput.host`.
 	 */
 	host?: string;
+	/**
+	 * The resolved target behind {@link host} (S1).
+	 *
+	 * Resolution belongs to the caller, because it needs `subagents.crossMachine`
+	 * — a settings object this layer does not read — while the PAIR has to be
+	 * checked where the launch is arbitrated: a host without a matching target is
+	 * refused here (D1/`resolveHostTarget`), never guessed.
+	 */
+	hostTarget?: HostTarget;
 	modelOrigin?: ModelOrigin;
 	/** Vexillatio launch: bypass nested-depth gates while recording its parent-side Legion node. */
 	utilityDispatch?: boolean;
@@ -1218,6 +1226,49 @@ export class Orchestrator {
 			this.warnWorktreeDenied(input.agent.name);
 			worktree = false;
 		}
+		// ── Cross-machine (contract `cross-machine-spawn-v1` D1) ──
+		//
+		// A host is honored by the terminal backend only. Everything here fails
+		// LOUDLY and before any artifact exists, because the alternative — a child
+		// that ran on this machine while the caller believed it ran on another — is
+		// the one outcome worse than a refusal. Placed after the worktree
+		// arbitration because `worktree: true` is one of the things being refused
+		// (the remote tree is S2's work; a local tree for a remote child would be a
+		// checkout nobody delivers from).
+		if (host !== undefined) {
+			const hostTarget = input.hostTarget;
+			if (hostTarget === undefined || hostTarget.host !== host) {
+				throw new SubagentError(
+					`host '${host}': the resolved target is missing or names a different machine`,
+					ErrorCodes.INVALID_PARAMS,
+				);
+			}
+			if (!terminalHostAvailable(process.env)) {
+				throw new SubagentError(
+					`host '${host}' needs an hc terminal host: start pi inside an hc terminal (HC_TERMINAL_SOCKET + HC_TERMINAL_ID), or drop host`,
+					ErrorCodes.INVALID_PARAMS,
+				);
+			}
+			if (worktree) {
+				throw new SubagentError(
+					`host '${host}' with worktree: true is not supported yet (remote worktrees land in S2): launch with worktree: false`,
+					ErrorCodes.INVALID_PARAMS,
+				);
+			}
+			// A utility dispatch is a hard leaf whose contract is "return text to the
+			// caller" (`vexillatio` holds the inbox and collects it inline). Every part
+			// of that assumes a process in THIS one: the hold, the inline collect, the
+			// result hand-back. Sending it to another machine would make it a terminal
+			// whose result nobody reads, so it is refused rather than silently
+			// downgraded to a local run (D1's rule, applied to the one role that never
+			// reaches the terminal backend by design).
+			if (input.utilityDispatch) {
+				throw new SubagentError(
+					`host '${host}' cannot carry a utility dispatch: read-only helpers run in-process (drop host, or dispatch a command-chain role)`.trim(),
+					ErrorCodes.INVALID_PARAMS,
+				);
+			}
+		}
 		// Spawn-mode arbitration. Role cards no longer carry a `spawnMode` field:
 		// the backend is a property of the LAUNCH, not a role, so a card cannot pin
 		// itself to a process model. rpc exists for exactly one reason — it is the
@@ -1238,9 +1289,17 @@ export class Orchestrator {
 		// markers and costs nothing (no subprocess, no socket probe, no git call —
 		// I3); outside `hc` the expression reduces byte-for-byte to the old one. The
 		// role test is the `isCenturion` already computed above.
-		const mode: SpawnMode = worktree === true
-			? isCenturion && terminalHostAvailable(process.env) ? "terminal" : "rpc"
-			: "inprocess";
+		//
+		// Cross-machine: a named host already proved above that this process IS an
+		// hc terminal, so the backend is `terminal` regardless of worktree —
+		// `inprocess` cannot leave this process and `rpc` cannot leave this
+		// machine, so either would silently run the child HERE (D1). With `host`
+		// absent the expression is byte-for-byte the pre-contract one.
+		const mode: SpawnMode = host !== undefined
+			? "terminal"
+			: worktree === true
+				? isCenturion && terminalHostAvailable(process.env) ? "terminal" : "rpc"
+				: "inprocess";
 		const inProcess = mode === "inprocess";
 		// Downstream must see the arbitrated result, otherwise RoutingSupervisor
 		// re-resolves the omitted field to `inprocess` on its own and throws
@@ -1408,9 +1467,11 @@ export class Orchestrator {
 					tempDir,
 					cwd: worktreePath ?? this.cwd,
 					env: childEnv,
-					// S0: carried, never acted on beyond the terminal backend's `on`. The
-					// backend consumes `host` only; env/argv rewriting is a later stage.
+					// S0: carried, never acted on beyond the terminal backend's `on`. S1 adds
+					// the resolved target: the remote cwd/argv/env/labels/preflight all come
+					// from it, and the backend refuses a host without one.
 					...(host ? { host } : {}),
+					...(host && input.hostTarget ? { hostTarget: input.hostTarget } : {}),
 					...(model ? { model } : {}),
 					// REV-1.2: the pin was computed for CANDIDATE 0's model, so only that
 					// candidate may carry it. Handing it to a fallback routes the retry to a
