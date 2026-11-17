@@ -116,6 +116,12 @@ export interface ChildHandle {
 	 */
 	worktreeHost?: string;
 	/**
+	 * S4/m6: the mirrored-argv directory on that machine (``<remoteDir>/session.jsonl``
+	 * is the child's transcript). Persisted onto the child record so read-back works
+	 * in a later process.
+	 */
+	remoteDir?: string;
+	/**
 	 * In-process-only, NON-FATAL model-resolution notice (B5).
 	 *
 	 * `resolveCliModel` answers a `warning` for two legitimate situations — an

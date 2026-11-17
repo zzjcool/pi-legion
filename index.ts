@@ -151,6 +151,12 @@ import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
 import { normalizeHost, resolveHostTarget, resolveResumeCwd } from "./src/runs/remote.ts";
 import { createRemoteVerifyRunner } from "./src/runs/remote-verify.ts";
 import {
+	assertRemoteResume,
+	createRemoteSessionReadback,
+	type RemoteResumeFacts,
+	type RemoteResumeVerdict,
+} from "./src/runs/remote-artifact.ts";
+import {
 	type AgentConfig,
 	type AgentScope,
 	type ChildRecord,
@@ -3571,6 +3577,9 @@ async function controlAction(input: {
 		// built per call from the same settings the launch resolved its target from,
 		// so the cwd/programs cannot drift from the ones the child was started with.
 		remoteVerify: createRemoteVerifyRunner({ crossMachine: input.settings.crossMachine }),
+		// S4/D15: the same settings resolve the child's machine, so the read-back reads
+		// the transcript the launch actually pointed the child at.
+		remoteReadback: createRemoteSessionReadback({ crossMachine: input.settings.crossMachine }),
 		worktreeBootstrap: input.settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: input.settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
@@ -3606,6 +3615,12 @@ async function controlAction(input: {
 /** A resolved child plus the collaborators every control action needs. */
 interface ChildContext {
 	action: string;
+	/**
+	 * S4/D17 test seam + extension point: the cross-machine `resume` gate. Defaults
+	 * to {@link assertRemoteResume} with the production client; a test injects the
+	 * four-step outcome it wants to exercise without a live core.
+	 */
+	remoteResumeCheck?: (request: RemoteResumeFacts) => Promise<RemoteResumeVerdict>;
 	params: SubagentParams;
 	/** Always set: named control actions reject a request without a name. */
 	name: string;
@@ -4011,20 +4026,6 @@ export async function collectChild(
 	if (mail) beginMailHold(mail.nodeId);
 	try {
 		if (signal?.aborted) return ok("interrupted (parent turn ended; children still running)");
-		// D15 (review M5): the transcript of a cross-machine child is on THAT machine.
-		// Everything below parses `child.sessionFile` — a local path that S1 pre-created
-		// and the remote child never writes — so a collect would wait for the child and
-		// then answer with an empty result and no explanation. Read-back is S4; until it
-		// lands, say so instead of pretending the child produced nothing.
-		// `?.`: a control action can resolve a name to a run without a record (the
-		// durable path). No record is no host, which is "this machine".
-		const collectHost = normalizeHost(ctx.found.child?.host);
-		if (collectHost !== undefined) {
-			return fail(
-				`child '${ctx.name}' ran on host '${collectHost}': its transcript is on that machine, so this collect cannot read it (remote read-back lands in S4). Use \`status\` for liveness, or \`resume\` to relaunch it there.`,
-				ErrorCodes.INVALID_PARAMS,
-			);
-		}
 		// #384: the inbox is checked BEFORE anything claims a result, so a preempted
 		// collect never holds a #352 claim for a result it will not deliver.
 		if (mail) {
@@ -4449,6 +4450,28 @@ async function reviveChild(
 		const resumeTarget = recordHost !== undefined
 			? resolveHostTarget(recordHost, ctx.settings.crossMachine)
 			: undefined;
+		// S4/D17: four facts, in order, before touching that machine. Each failure names
+		// its step, and none of them is inferred from a local path: the record's
+		// `sessionFile`/`worktreePath` describe the OTHER machine (review D13), so a
+		// local `existsSync` would answer a question nobody asked.
+		if (recordHost !== undefined && resumeTarget !== undefined) {
+			const check = ctx.remoteResumeCheck ?? ((request: RemoteResumeFacts) => assertRemoteResume({
+				crossMachine: ctx.settings.crossMachine,
+				request,
+			}));
+			const verdict = await check({
+				host: recordHost,
+				name,
+				...(found.child.worktreePath ? { worktreePath: found.child.worktreePath } : {}),
+			});
+			if (verdict.terminalState === "live") {
+				// Still running there: relaunching would be a SECOND child with the same
+				// name on that machine, which is the one thing a resume must never do.
+				return ok(
+					`${name} is still running on host '${recordHost}'; resume did not relaunch it. Collect it (the transcript is read back from that machine), or stop it first if you want a fresh launch.`,
+				);
+			}
+		}
 		const handle = await orchestrator.launch({
 			agent: agentDef,
 			task: params.message,
@@ -4609,6 +4632,9 @@ async function launchFamily(input: {
 		// built per call from the same settings the launch resolved its target from,
 		// so the cwd/programs cannot drift from the ones the child was started with.
 		remoteVerify: createRemoteVerifyRunner({ crossMachine: input.settings.crossMachine }),
+		// S4/D15: the same settings resolve the child's machine, so the read-back reads
+		// the transcript the launch actually pointed the child at.
+		remoteReadback: createRemoteSessionReadback({ crossMachine: input.settings.crossMachine }),
 		worktreeBootstrap: settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
@@ -7347,6 +7373,16 @@ export function renderCollect(
 		 * complete result, including a cache hit that re-read the file.
 		 */
 		outputTruncated?: true;
+		/** S4/D15: how much of a cross-machine transcript this answer rests on. */
+		remoteReadback?: {
+			host: string;
+			lines: number;
+			returned: number;
+			truncated: boolean;
+			byteCapped?: boolean;
+			localPath?: string;
+			reason?: string;
+		};
 		/** §3 D1: the artifact this text came from, when a ledger row names one. */
 		artifactId?: string;
 		acceptance: {
@@ -7406,6 +7442,23 @@ export function renderCollect(
 			);
 		} else {
 			lines.push(`verification: ${verification.commandCount} command(s) · log ${verification.outputFile ?? "(not recorded)"}`);
+		}
+	}
+	// S4/D15: how much of a cross-machine transcript this answer rests on. A verdict
+	// derived from the tail of a file must say so — reading 4000 of 250000 lines and
+	// presenting it as the whole result is the silent-completeness bug this line
+	// exists to prevent.
+	if (collected.remoteReadback) {
+		const readback = collected.remoteReadback;
+		if (readback.reason) {
+			lines.push(`read-back from host '${readback.host}': FAILED — ${readback.reason} (the verdict below rests on no transcript at all)`);
+		} else if (readback.truncated) {
+			const what = readback.byteCapped ? "byte-capped by hc" : "tail only";
+			lines.push(
+				`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (truncated — ${what}; the verdict rests on that tail)`,
+			);
+		} else {
+			lines.push(`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (complete)`);
 		}
 	}
 	// The mechanical verify outcome (which command failed / which commands had

@@ -250,6 +250,18 @@ test("S3/B1: `host` + `verify` runs the command on THAT machine — never in thi
 			remote.push(request);
 			return { code: 0, stdout: "", stderr: "", host: request.host };
 		},
+		// S4 wired the read-back: a remote collect fetches the transcript before it can
+		// derive anything. This test is about the verify step, so the read-back is a
+		// no-op that reports an empty (complete) file.
+		remoteReadback: async (request) => ({
+			ok: true,
+			host: request.host,
+			localPath: request.localPath,
+			lines: 0,
+			returned: 0,
+			truncated: false,
+			byteCapped: false,
+		}),
 	});
 	await insideHcTerminal(async () => {
 		try {

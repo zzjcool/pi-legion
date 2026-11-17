@@ -102,6 +102,20 @@ export interface CollectSnapshot {
 	 * whose output is larger than the whole cache budget.
 	 */
 	outputTruncated?: true;
+	/**
+	 * S4/D15: how much of a cross-machine transcript this snapshot rests on.
+	 * Present only for a child that ran elsewhere; the render states the ratio (and
+	 * the failure reason) instead of presenting a tail as the whole result.
+	 */
+	remoteReadback?: {
+		host: string;
+		lines: number;
+		returned: number;
+		truncated: boolean;
+		byteCapped?: boolean;
+		localPath?: string;
+		reason?: string;
+	};
 	acceptance: {
 		status: string;
 		level?: string;

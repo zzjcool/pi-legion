@@ -20,7 +20,7 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import piLegion from "../../index.ts";
+import piLegion, { renderCollect } from "../../index.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { RUN_OWNER_FILE, writeOwnerFile } from "../../src/runs/owner.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -510,29 +510,37 @@ test("#312 status: a cross-store record that IS this session's child carries no 
 	}
 });
 
-test("M5: collecting a child that ran on another machine says so instead of returning an empty result", async () => {
-	// The transcript is on THAT machine. `sessionFile` here is the local placeholder
-	// the remote launch pre-created, so parsing it yields nothing — and a silent empty
-	// answer reads as "the child produced nothing", which is a lie about another
-	// machine's work. Read-back is S4; until then the collect refuses by name.
-	const harness = indexHarness();
-	try {
-		await harness.invoke({ agent: "worker", task: "other", name: "worker-b", async: true, worktree: false });
-		await harness.addOwnChild(
-			"worker-0",
-			"exited",
-			'{"ok": true, "reason": "remote-work"}',
-			{ host: "vps", worktreePath: "/srv/app/.pi-worktrees/worker-0", worktreeHost: "vps" },
-		);
-		const collected = await harness.invoke({ action: "collect", name: "worker-0" });
-		assert.equal(collected.details?.error, "INVALID_PARAMS");
-		assert.match(collected.text, /ran on host 'vps'/);
-		assert.match(collected.text, /transcript is on that machine/);
-		assert.match(collected.text, /S4/);
-		// The child's own reason must NOT leak into the answer as if it were collected
-		// here — the whole point is that nothing was read on this machine.
-		assert.doesNotMatch(collected.text, /remote-work/);
-	} finally {
-		await harness.cleanup();
-	}
+test("M5/S4: a failed read-back is stated, and never replaced by the local placeholder's text", async () => {
+	// The transcript is on THAT machine; `sessionFile` here is the empty placeholder
+	// this machine pre-created. A collect that read it would present "no text" as the
+	// child's answer right next to "read-back failed" — two truths in one answer.
+	// The render is where the parent reads the difference, so it is asserted here.
+	const rendered = renderCollect("worker-0", {
+		execution: { status: "success" },
+		output: "",
+		acceptance: { status: "accepted", level: "attested" },
+		remoteReadback: { host: "vps", lines: 0, returned: 0, truncated: false, reason: "host 'vps' needs subagents.crossMachine.enabled = true" },
+	});
+	assert.match(rendered, /read-back from host 'vps': FAILED/);
+	assert.match(rendered, /crossMachine/);
+	assert.match(rendered, /rests on no transcript at all/);
+
+	// A truncated read says the ratio out loud instead of presenting a tail as the whole.
+	const truncated = renderCollect("worker-0", {
+		execution: { status: "success" },
+		output: "{}",
+		acceptance: { status: "accepted", level: "attested" },
+		remoteReadback: { host: "vps", lines: 250_000, returned: 4_000, truncated: true },
+	});
+	assert.match(truncated, /4000 of 250000 lines \(truncated — tail only/);
+	assert.match(truncated, /verdict rests on that tail/);
+
+	// And a complete read-back is marked complete, not left silent either.
+	const complete = renderCollect("worker-0", {
+		execution: { status: "success" },
+		output: "{}",
+		acceptance: { status: "accepted", level: "attested" },
+		remoteReadback: { host: "vps", lines: 40, returned: 40, truncated: false },
+	});
+	assert.match(complete, /40 of 40 lines \(complete\)/);
 });

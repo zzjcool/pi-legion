@@ -25,6 +25,8 @@ import {
 	mapRemoteArgPath,
 	mirrorRemoteFile,
 	normalizeHost,
+	removeRemoteDir,
+	basenameCollisions,
 	remoteDirFor,
 	remotePreflight,
 	terminalAddress,
@@ -332,6 +334,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// child would then write into the checkout its own parent reads.
 		let remoteWorktree: { path: string; branch: string } | undefined;
 		let createdRemoteWorktree = false;
+		let createdRemoteDir = false;
 		if (target !== undefined) {
 			const requested = typeof input.worktreePath === "string" ? input.worktreePath.trim() : "";
 			if (requested.length > 0) {
@@ -363,6 +366,21 @@ export class TerminalSupervisor implements LegionSupervisor {
 				}
 			}
 		}
+
+		// m10: the mirror directory's rollback. Only the directory this spawn created is
+		// removed, and only on a failure path; a successful launch keeps its mirror (the
+		// child reads those files for its whole life).
+		const rollbackRemoteDir = async (): Promise<void> => {
+			if (!createdRemoteDir || target === undefined || remoteDir === undefined) return;
+			const dir = remoteDir;
+			try {
+				await removeRemoteDir(client, target, dir);
+			} catch (error) {
+				process.stderr.write(
+					`[pi-legion] host '${target.host}': could not remove the empty mirror directory ${dir}: ${error instanceof Error ? error.message : String(error)}\n`,
+				);
+			}
+		};
 
 		// D11: the rollback that pairs with the tree created above. Best effort by
 		// design: this runs on a failure path, and a cleanup error must never replace
@@ -431,6 +449,10 @@ export class TerminalSupervisor implements LegionSupervisor {
 			if (target !== undefined) {
 				remoteDir = remoteDirFor(target, this.runId, input.name);
 				await ensureRemoteDir(client, target, remoteDir);
+				// m10: from here on, a failure leaves an empty directory behind unless it
+				// is swept. `hc` has no `file.remove`, so this flag is what allows the
+				// rollback below to use `rm -rf` on a directory THIS spawn created.
+				createdRemoteDir = true;
 			}
 
 			const {
@@ -474,6 +496,20 @@ export class TerminalSupervisor implements LegionSupervisor {
 				includeTask: false,
 				...(rewritePath ? { pathRewrite: rewritePath } : {}),
 			});
+			if (target !== undefined && remoteDirPath !== undefined) {
+				// m11: the remote dir is FLAT, so two local files with one basename become
+				// one remote file — the second mirror silently overwriting the first. This
+				// runs after `buildPiArgs` (only it knows the temp-file names) and BEFORE
+				// the first mirror, so nothing has been overwritten yet.
+				const collisions = basenameCollisions(built.tempFiles);
+				if (collisions.length > 0) {
+					throw new SubagentError(
+						`host '${target.host}': two files mirrored into ${remoteDirPath} share a name (${collisions.join(", ")}); the remote dir is flat, so one would overwrite the other`,
+						ErrorCodes.INVALID_PARAMS,
+						{ host: target.host, collisions },
+					);
+				}
+			}
 			if (target !== undefined && rewritePath !== undefined) {
 				// Only the files THIS builder wrote are mirrored: they are the ones whose
 				// names are already in `argv` (`system-prompt.md`, an oversized task).
@@ -564,6 +600,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		} catch (error) {
 			this.removeTempDir(tempDir);
 			await rollbackRemoteWorktree();
+			await rollbackRemoteDir();
 			throw error;
 		}
 
@@ -593,6 +630,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		} catch (error) {
 			this.removeTempDir(tempDir);
 			await rollbackRemoteWorktree();
+			await rollbackRemoteDir();
 			// Review M7: the ADDRESS, not the bare name. A `terminal.run` failure is
 			// the case the spike's "cwd missing vs program missing" note makes least
 			// informative, and dropping the machine from the message is the difference
@@ -606,6 +644,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const address = typeof run.address === "string" ? run.address : "";
 		if (address.length === 0) {
 			this.removeTempDir(tempDir);
+			await rollbackRemoteDir();
 			throw new SubagentError(
 				`terminal.run for '${terminalNameForChild}' returned no address`,
 				ErrorCodes.START_FAILED,
@@ -649,6 +688,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// S2: the tree the BACKEND created comes back the same way `pid` does —
 			// the orchestrator could not know this path before the spawn.
 			...worktreeFacts,
+			// S4/m6: same reason, one more fact the backend owns. Without it the record
+			// cannot find the child's transcript in a later process.
+			...(remoteDir ? { remoteDir } : {}),
 		};
 	}
 

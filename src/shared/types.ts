@@ -473,6 +473,17 @@ export interface ChildRecord {
 	 * ownership pair; neither is meaningful alone for a cleanup decision.
 	 */
 	worktreeHost?: string;
+	/**
+	 * Directory (on `host`) holding this child's mirrored argv files — the session
+	 * transcript among them (`<remoteDir>/session.jsonl`).
+	 *
+	 * S4/m6: persisted so a later process can find the transcript of a child that
+	 * ran elsewhere. Before this field the value lived only in the supervisor's
+	 * memory, which made cross-machine read-back and resume impossible after a
+	 * restart — the path was recomputable, but nothing on the record said which
+	 * name/machine to recompute it for.
+	 */
+	remoteDir?: string;
 
 	// artifacts
 	artifacts?: Array<{ kind: string; path: string }>;

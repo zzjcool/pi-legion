@@ -28,6 +28,7 @@ import {
 	execResultText,
 	mirrorRemoteFile,
 	remoteDirFor,
+	basenameCollisions,
 	remotePreflight,
 	remotePreflightScript,
 	resolveHostTarget,
@@ -569,4 +570,15 @@ test("S3/6: the preflight is bounded at ten seconds, so an unusable remote exec 
 	const error = await remotePreflight(timedOut, target()).then(() => undefined, (thrown: unknown) => thrown);
 	assert.ok(error instanceof SubagentError);
 	assert.match((error as SubagentError).message, /preflight did not finish within 10s/);
+});
+
+test("m11: two local files with one basename are refused, never silently overwritten", () => {
+	// The remote dir is flat: `a/system-prompt.md` and `b/system-prompt.md` would both
+	// become `<remoteDir>/system-prompt.md`, and the child would read one file where
+	// two were written.
+	assert.deepEqual(basenameCollisions(["/tmp/a/system-prompt.md", "/tmp/b/system-prompt.md"]), ["system-prompt.md"]);
+	// The same path twice is the SAME file, not a collision (idempotent rewrites).
+	assert.deepEqual(basenameCollisions(["/tmp/a/system-prompt.md", "/tmp/a/system-prompt.md"]), []);
+	assert.deepEqual(basenameCollisions(["/tmp/a/system-prompt.md", "/tmp/b/task.md"]), []);
+	assert.deepEqual(basenameCollisions([]), []);
 });

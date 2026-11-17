@@ -831,7 +831,7 @@ test("#123: a resume from a SYNTHESIZED record sends no pin — it never guesses
 
 // ── cross-machine review B2: resume is the supported recovery ──────────────
 
-test("B2: `resume` on a child that ran on another host relaunches THERE instead of being refused", async () => {
+test("B2/S4: `resume` on a child that ran on another host runs the four-step gate instead of being refused", async () => {
 	// The guard used to reject EVERY revive of a remote child, including `resume`
 	// — while its own message told the caller to use `resume`. The only supported
 	// recovery was unreachable from the tool. This drives the real action and
@@ -872,13 +872,19 @@ test("B2: `resume` on a child that ran on another host relaunches THERE instead 
 
 		const result = await h.call({ action: "resume", name: childName, message: "keep going" });
 		const text = JSON.stringify(result);
+		// S4/D17 supersedes the S2 behaviour this test used to pin: a remote resume now
+		// runs the four-step gate first, and step 2 is the machine itself. There is no
+		// core in this harness, so the answer is the PRECISE refusal — and, crucially,
+		// not a local relaunch wearing the remote child's name.
 		assert.doesNotMatch(text, /cannot restart it/, "resume must not hit the continue guard");
-		const relaunched = h.supervisor.calls.find((call) => call.method === "spawnChild");
-		assert.ok(relaunched, `resume must relaunch the child: ${text.slice(0, 400)}`);
-		assert.equal(relaunched.input?.host, "vps", "the recorded host must be replayed");
-		assert.equal(relaunched.input?.hostTarget?.cwd, "/srv/app", "the target must be re-resolved");
-		assert.equal(relaunched.input?.worktreePath, "/srv/app/.pi-worktrees/" + childName, "the stored tree is reused, not recreated");
-	} finally {
+		assert.match(text, /step 2\/4/);
+		assert.match(text, /not reachable/);
+		assert.match(text, /vps/);
+		assert.equal(
+			h.supervisor.calls.filter((call) => call.method === "spawnChild").length,
+			0,
+			"a failed gate must not spawn anything (least of all locally)",
+		);	} finally {
 		for (const [name, value] of previousEnv) {
 			if (value === undefined) delete process.env[name];
 			else process.env[name] = value;

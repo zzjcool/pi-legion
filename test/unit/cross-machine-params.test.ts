@@ -579,3 +579,25 @@ test("m4/m5: the remote env carries NO parent NODE_OPTIONS text and no heap cap"
 		h.cleanup();
 	}
 });
+
+test("m10: a launch that fails after making the remote dir removes it again", async () => {
+	// `ensureRemoteDir` runs BEFORE the argv mapping (which can refuse), so a failure
+	// there would leave an empty `<mirrorRoot>/<run>/<name>` on that machine forever.
+	// `hc` has no `file.remove`; the sweep is one best-effort `rm -rf` of the dir THIS
+	// spawn created.
+	const h = harness(callerEnv());
+	try {
+		const input = spawnInput(h.root, { host: "vps", hostTarget: hostTarget({ pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }] }) });
+		// An unmappable, non-extension path: the launch refuses AFTER the mkdir.
+		input.agent = { ...input.agent, skillPath: ["/opt/thirdparty/skill/SKILL.md"] };
+		await assert.rejects(() => h.supervisor.spawnChild(input), /pathMap|mirror/);
+		const execs = h.client.paramsFor("machine.exec");
+		const remoteDir = remoteDirFor(input.hostTarget ?? hostTarget(), undefined, input.name);
+		const sweeps = execs.filter((exec) => Array.isArray(exec.argv) && String(exec.argv[0]) === "rm");
+		assert.equal(sweeps.length, 1, `exactly one sweep, got ${JSON.stringify(execs.map((e) => e.argv ?? e.line))}`);
+		assert.deepEqual(sweeps[0]!.argv, ["rm", "-rf", remoteDir]);
+		assert.equal(h.client.paramsFor("terminal.run").length, 0, "nothing may be started");
+	} finally {
+		h.cleanup();
+	}
+});

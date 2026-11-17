@@ -95,6 +95,11 @@ import {
 } from "./worktree.ts";
 import { provisionWorktree } from "./provision.ts";
 import type { RemoteVerifyRunner } from "./remote-verify.ts";
+import {
+	remoteMirrorPathFor,
+	type RemoteReadbackResult,
+	type RemoteSessionRequest,
+} from "./remote-artifact.ts";
 import { assertLocalWorktree, normalizeHost, type HostTarget } from "./remote.ts";
 
 export interface BudgetRefusedEvent {
@@ -148,6 +153,12 @@ export interface OrchestratorDeps {
 	 * child's own attestation stands (never a locally measured pass).
 	 */
 	remoteVerify?: RemoteVerifyRunner;
+	/**
+	 * Cross-machine read-back (S4, D15): fetches a remote child's transcript onto
+	 * this machine so the collector can derive a verdict from it. Absent = the child
+	 * keeps today's behaviour (no remote text), which is what the local path is.
+	 */
+	remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
 	/** Post-create bootstrap for child worktrees (legion.worktreeBootstrap). */
 	worktreeBootstrap?: string;
 	worktreeBootstrapTimeoutMs?: number;
@@ -340,6 +351,26 @@ export interface CollectResult {
 	model: string | null;
 	acceptance: AcceptanceResult;
 	blocked?: boolean;
+	/**
+	 * S4/D15: how much of a cross-machine transcript this collect actually got.
+	 *
+	 * Present only for a child that ran elsewhere. `truncated` is stated, never
+	 * inferred by the reader: the tail window is what the verdict was derived from,
+	 * and a verdict derived from a tail must say so.
+	 */
+	remoteReadback?: {
+		host: string;
+		/** Lines the file has on that machine. */
+		lines: number;
+		/** Lines this machine received. */
+		returned: number;
+		truncated: boolean;
+		/** The core byte-capped the window we asked for (silent, no flag). */
+		byteCapped?: boolean;
+		localPath?: string;
+		/** Set when the read-back failed outright; the collect then has no text. */
+		reason?: string;
+	};
 }
 
 /**
@@ -537,6 +568,14 @@ export class Orchestrator {
 	private readonly maxSpawns: number | null;
 	private readonly verifyRunner?: VerifyRunner;
 	private readonly remoteVerify?: RemoteVerifyRunner;
+	private readonly remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
+	/**
+	 * This collect's remote transcripts, keyed by child name. Filled once per
+	 * `collect()` (a read-back is a network round trip, not a per-parse cost) and
+	 * read by {@link sessionFileOf}, so every `parseSessionFile` in the collect path
+	 * sees the LOCAL MIRROR without the record ever being mutated.
+	 */
+	private readonly remoteSessions = new Map<string, RemoteReadbackResult>();
 	private readonly worktreeBootstrap?: string;
 	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
@@ -615,6 +654,7 @@ export class Orchestrator {
 		this.maxSpawns = deps.maxSpawns ?? null;
 		this.verifyRunner = deps.verifyRunner;
 		this.remoteVerify = deps.remoteVerify;
+		this.remoteReadback = deps.remoteReadback;
 		this.worktreeBootstrap = deps.worktreeBootstrap?.trim() || undefined;
 		this.worktreeBootstrapTimeoutMs = deps.worktreeBootstrapTimeoutMs;
 		this.team = deps.team;
@@ -632,6 +672,41 @@ export class Orchestrator {
 	childPath(agentName: string): NestedPathEntry[] {
 		return [...this.parentPath, { runId: path.basename(this.runDir), agent: agentName }]
 			.slice(-MAX_NESTED_PATH_ENTRIES);
+	}
+
+	/**
+	 * The file `parseSessionFile` should read for this child.
+	 *
+	 * For a local child it is `child.sessionFile` — unchanged, byte for byte. For a
+	 * child that ran elsewhere it is the local mirror written by this collect's
+	 * read-back (`<runDir>/remote/<name>.jsonl`), NEVER the record's `sessionFile`:
+	 * that is an empty file this machine pre-created and the remote child never
+	 * writes, which is exactly the silent-empty-result bug of review M5.
+	 */
+	private sessionFileOf(child: ChildRecord): string {
+		const remote = this.remoteSessions.get(child.name);
+		if (remote === undefined) return child.sessionFile;
+		// A FAILED read-back must not fall back to the record's path: that file is the
+		// empty placeholder this machine pre-created, so reading it would present
+		// "no text" as the child's answer right next to "read-back failed". Point at
+		// the mirror that was never written instead — the parse yields nothing, and the
+		// render says why.
+		return remote.ok ? remote.localPath : remoteMirrorPathFor(this.runDir, child.name);
+	}
+
+	/** `CollectResult.remoteReadback`, or nothing when this child is local. */
+	private readbackFacts(child: ChildRecord): CollectResult["remoteReadback"] {
+		const remote = this.remoteSessions.get(child.name);
+		if (remote === undefined) return undefined;
+		if (!remote.ok) return { host: remote.host, lines: 0, returned: 0, truncated: false, reason: remote.reason };
+		return {
+			host: remote.host,
+			lines: remote.lines,
+			returned: remote.returned,
+			truncated: remote.truncated,
+			byteCapped: remote.byteCapped,
+			localPath: remote.localPath,
+		};
 	}
 
 	sessionFileFor(name: string): string {
@@ -1617,6 +1692,9 @@ export class Orchestrator {
 				if (result.worktreePath) previous.worktreePath = result.worktreePath;
 				if (result.worktreeBranch) previous.worktreeBranch = result.worktreeBranch;
 				if (appliedWorktreeHost && result.worktreePath) previous.worktreeHost = appliedWorktreeHost;
+				// S4/m6: the mirror dir is a fact the backend reports (the orchestrator
+				// cannot compute it: only the backend knows the run id it used).
+				if (result.remoteDir) previous.remoteDir = result.remoteDir;
 				this.children.set(name, previous);
 			}
 			const child = previous ?? this.recordChild({
@@ -1649,6 +1727,7 @@ export class Orchestrator {
 				...(appliedWorktreeBranch ? { worktreeBranch: appliedWorktreeBranch } : {}),
 				...(host ? { host } : {}),
 				...(appliedWorktreeHost ? { worktreeHost: appliedWorktreeHost } : {}),
+				...(result.remoteDir ? { remoteDir: result.remoteDir } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
 			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
@@ -2737,11 +2816,35 @@ export class Orchestrator {
 			// the outcome would be derived from a file nobody ever wrote.
 			child = this.requireChild(name);
 		}
-		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(child.sessionFile));
+		// S4/D15: a child that ran elsewhere writes its transcript THERE. Fetch it once
+		// into `<runDir>/remote/<name>.jsonl` (never `sessions/`: a mirror must not be
+		// mistaken for a local transcript) and let every parse below read the mirror.
+		// A failed read-back is NOT fatal: the collect continues with no text, and the
+		// render says why (an empty answer with no explanation is the M5 bug).
+		if (normalizeHost(child.host) !== undefined && this.remoteReadback === undefined) {
+			// A context without a read-back seam cannot read a transcript that lives on
+			// another machine. Saying so is the whole point (review M5): the alternative
+			// is parsing the empty file this machine pre-created and reporting silence as
+			// the child's result.
+			throw new SubagentError(
+				`child '${child.name}' ran on host '${child.host}': this context has no remote read-back wired, so its transcript cannot be read here (the transcript is on that machine). Use \`status\` for liveness.`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		if (this.remoteReadback !== undefined && normalizeHost(child.host) !== undefined) {
+			const request: RemoteSessionRequest = {
+				host: child.host as string,
+				name: child.name,
+				localPath: remoteMirrorPathFor(this.runDir, child.name),
+				...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+			};
+			this.remoteSessions.set(child.name, await this.remoteReadback(request));
+		}
+		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(this.sessionFileOf(child)));
 		if (opts.signal?.aborted) return abortedSnapshot();
 		if (this.pendingDialogs(name).length) return this.blockedResult(child);
 		let deadline = this.now() + timeoutMs;
-		const initial = parseSessionFile(child.sessionFile);
+		const initial = parseSessionFile(this.sessionFileOf(child));
 		// A connection blip writes stopReason "error" before the client retries.
 		// That looks like a finished turn, but the RPC child is still in it.
 		// Skipping the supervisor wait here is what retired a live worker.
@@ -2758,7 +2861,7 @@ export class Orchestrator {
 			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
-		let parsed = parseSessionFile(child.sessionFile);
+		let parsed = parseSessionFile(this.sessionFileOf(child));
 		// #232: no settle-quiet wait here.
 		//
 		// `wait === "settled"` already means the supervisor observed the turn end
@@ -2773,7 +2876,7 @@ export class Orchestrator {
 		// re-parse below: `parseSessionFile` leaves a trailing partial line out of
 		// its committed cache (#36), so a mid-write tail is never read as a verdict.
 		if (opts.signal?.aborted) return abortedSnapshot();
-		parsed = parseSessionFile(child.sessionFile);
+		parsed = parseSessionFile(this.sessionFileOf(child));
 		// #227 D5: a child whose process is gone cannot produce another message.
 		// When its last turn already ended with a terminal assistant message there
 		// is nothing left to wait for, so finish the completed turn here.
@@ -2851,7 +2954,7 @@ export class Orchestrator {
 				const held = await this.waitOutTransientConnection(child, deadline, signal);
 				if (held === "aborted" || signal?.aborted) return { kind: "aborted" };
 				if (held === "blocked") return { kind: "blocked" };
-				parsed = parseSessionFile(child.sessionFile);
+				parsed = parseSessionFile(this.sessionFileOf(child));
 				execution = deriveOutcome(parsed);
 			}
 			if (this.supervisor.isAlive(name) && (isTransientConnectionFailure(execution) || !isLastTurnComplete(parsed))) {
@@ -2955,7 +3058,7 @@ export class Orchestrator {
 		// `aborted`, a parent shutdown is attributed, and a still-running turn keeps
 		// its `running` snapshot. Only the note about the spent budget is added
 		// later, at the single terminal exit (`finishCollect`).
-		const classified = await this.classifyOutcome(child, parseSessionFile(child.sessionFile), settled, deadline, signal);
+		const classified = await this.classifyOutcome(child, parseSessionFile(this.sessionFileOf(child)), settled, deadline, signal);
 		if (classified.kind !== "outcome") return { kind: classified.kind };
 		return { kind: "retried", parsed: classified.parsed, execution: classified.execution };
 	}
@@ -3029,8 +3132,8 @@ export class Orchestrator {
 		deadline: number,
 		signal?: AbortSignal,
 	): Promise<"aborted" | "blocked" | "done"> {
-		let parsedSize = artifactSize(child.sessionFile);
-		let parsed = parseSessionFile(child.sessionFile);
+		let parsedSize = artifactSize(this.sessionFileOf(child));
+		let parsed = parseSessionFile(this.sessionFileOf(child));
 		let interval = POLL_INTERVAL_MS;
 		for (;;) {
 			if (signal?.aborted) return "aborted";
@@ -3044,9 +3147,9 @@ export class Orchestrator {
 			// A sleep dep that never advances the clock would make this loop a busy
 			// spin; stop holding instead of hammering the filesystem.
 			if (this.now() <= sleptFrom) return "done";
-			const size = artifactSize(child.sessionFile);
+			const size = artifactSize(this.sessionFileOf(child));
 			if (size !== parsedSize) {
-				parsed = parseSessionFile(child.sessionFile);
+				parsed = parseSessionFile(this.sessionFileOf(child));
 				parsedSize = size;
 			}
 			interval = Math.min(interval * 2, TRANSIENT_POLL_CAP_MS);
@@ -3137,7 +3240,7 @@ export class Orchestrator {
 	}
 
 	private blockedResult(child: ChildRecord): CollectResult {
-		const parsed = parseSessionFile(child.sessionFile);
+		const parsed = parseSessionFile(this.sessionFileOf(child));
 		const execution: Execution = { status: "running", reason: "blocked: waiting for a child UI approval" };
 		const acceptance = deriveAcceptance(parsed, execution, child.pendingCriteria, {
 			...(child.completionGuard ? { completionGuard: true } : {}),
@@ -3235,11 +3338,15 @@ export class Orchestrator {
 			child.artifactId = artifactId;
 		}
 		if (!isRetired()) this.onChildUpdate(child);
+		const readback = this.readbackFacts(child);
 		return {
 			execution,
 			output,
 			...(outputFile ? { outputFile } : {}),
 			...(artifactId ? { artifactId } : {}),
+			// S4/D15: present only for a child that ran elsewhere — the local result
+			// carries no extra key, so nothing about this machine's answers changed.
+			...(readback ? { remoteReadback: readback } : {}),
 			usage: parsed.usage,
 			model: parsed.model ?? child.model ?? null,
 			acceptance,
@@ -3409,7 +3516,7 @@ export class Orchestrator {
 	cachedCollect(name: string): CollectResult | undefined {
 		const child = this.children.get(name);
 		if (!child?.execution || !canUseCachedCollect(child.state)) return undefined;
-		const parsed = fs.existsSync(child.sessionFile) ? parseSessionFile(child.sessionFile) : emptyParsedSession();
+		const parsed = fs.existsSync(child.sessionFile) ? parseSessionFile(this.sessionFileOf(child)) : emptyParsedSession();
 		const cached: CollectResult = {
 			execution: child.execution,
 			output: child.execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output,
@@ -3453,7 +3560,7 @@ export class Orchestrator {
 			return child;
 		}
 		const sessionExists = fs.existsSync(child.sessionFile);
-		const parsed = sessionExists ? parseSessionFile(child.sessionFile) : emptyParsedSession();
+		const parsed = sessionExists ? parseSessionFile(this.sessionFileOf(child)) : emptyParsedSession();
 		if (!child.execution && sessionExists) child.execution = deriveOutcome(parsed);
 		// Stamp the cause before killing so an in-flight collect cannot
 		// overwrite it with "no assistant message" after the process dies.

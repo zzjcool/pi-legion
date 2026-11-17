@@ -429,6 +429,26 @@ function resolvePathMap(
 }
 
 /**
+ * Two different LOCAL files whose basenames collide inside one remote dir (m11).
+ *
+ * The remote dir is flat (one name per file), so `a/system-prompt.md` and
+ * `b/system-prompt.md` would both become `<remoteDir>/system-prompt.md`: the second
+ * mirror silently overwrites the first, and the child reads one file where two were
+ * written. Returns the colliding basenames, sorted; empty means the set is safe.
+ */
+export function basenameCollisions(paths: string[]): string[] {
+	const firstFor = new Map<string, string>();
+	const collisions = new Set<string>();
+	for (const candidate of paths) {
+		const base = path.posix.basename(candidate);
+		const previous = firstFor.get(base);
+		if (previous === undefined) firstFor.set(base, candidate);
+		else if (previous !== candidate) collisions.add(base);
+	}
+	return [...collisions].sort();
+}
+
+/**
  * `<mirrorRoot>/<runId>/<sanitized handle>` — where mirrored argv files land (D9).
  *
  * The parent's own `tempDir` stays where it is — it is the parent's cleanup
@@ -662,6 +682,27 @@ export async function remotePreflight(
 }
 
 /** `mkdir -p <dir>` on the target — the remote half of D9's two temp dirs. */
+/**
+ * Best-effort removal of a mirror directory THIS launch created (m10).
+ *
+ * `hc` has no `file.remove`, so this is a `rm -rf` through `machine.exec`. It is
+ * only ever called for a directory whose name this process just made
+ * (`ensureRemoteDir` on the same `remoteDir`), and only on a failure path — a
+ * successful launch keeps its mirror, because the child reads those files for its
+ * whole life.
+ */
+export async function removeRemoteDir(
+	client: HcClient,
+	target: HostTarget,
+	dir: string,
+): Promise<void> {
+	await client.request<HcExecResult>("machine.exec", {
+		on: target.host,
+		argv: ["rm", "-rf", dir],
+		timeout: REMOTE_SETUP_TIMEOUT_S,
+	});
+}
+
 export async function ensureRemoteDir(
 	client: HcClient,
 	target: HostTarget,
