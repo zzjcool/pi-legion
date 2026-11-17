@@ -68,6 +68,10 @@ export PI_LEGION_REMOTE_NODE=/root/.nvm/versions/node/v24.13.1/bin/node
 export PI_LEGION_REMOTE_PI=/root/.pi/agent/bin/pi
 # 本包在目标机上的位置（与父机路径不同时必须给）
 export PI_LEGION_REMOTE_PI_LEGION_ROOT=/root/code/pi-legion
+# 远端 child 要加载的扩展（逗号分隔，允许空白）。**模型来自扩展时必填**：
+# child 的 argv 带 --no-extensions，在那样的机器上会把模型提供者一起关掉；
+# 不填会在 launch 前被探测拒绝（`No models available`），这是期望行为，不是 bug。
+export PI_LEGION_REMOTE_PI_EXTENSIONS=/root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts
 # piCli 必须是 **node 能执行的 JS 入口**，不是 /root/.pi/agent/bin/pi 那种 shell 启动器
 export PI_LEGION_REMOTE_PI=/root/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
 # 可选：跑真 pi 子进程（要花一次真实 turn，且目标机必须有模型凭据）

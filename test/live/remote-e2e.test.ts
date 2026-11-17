@@ -30,6 +30,15 @@
  *                           paths (`/root/.nvm/versions/node/…/node`,
  *                           `/root/.pi/agent/bin/pi`) or the preflight says
  *                           `node 'node' is not on PATH on <host>` in ten seconds.
+ *   PI_LEGION_REMOTE_PI_EXTENSIONS
+ *                           optional. Comma-separated extensions the child must LOAD
+ *                           on that machine (whitespace around entries is ignored).
+ *                           Needed whenever the host's MODELS come from an extension:
+ *                           a child argv carries `--no-extensions`, which on such a
+ *                           machine also removes the provider, and the launch-time
+ *                           probe refuses with `No models available` until the
+ *                           provider is named here. Unset ⇒ the key is not sent at
+ *                           all (a host with builtin models needs nothing).
  *   PI_LEGION_REMOTE_PI_LEGION_ROOT
  *                           optional. Where THIS package lives on that machine.
  *                           The two checkouts are almost never at the same path
@@ -77,6 +86,17 @@ const ORIGIN = (process.env.PI_LEGION_REMOTE_ORIGIN ?? "").trim();
 const NODE = (process.env.PI_LEGION_REMOTE_NODE ?? "node").trim() || "node";
 const PI = (process.env.PI_LEGION_REMOTE_PI ?? "pi").trim() || "pi";
 const PI_LEGION_ROOT = (process.env.PI_LEGION_REMOTE_PI_LEGION_ROOT ?? "").trim();
+/**
+ * `PI_LEGION_REMOTE_PI_EXTENSIONS` → the host's `piExtensions`.
+ *
+ * Comma-separated, whitespace-tolerant: an operator pasting two paths should not have
+ * to think about spacing. An empty/blank value means "not given" — the key is then
+ * omitted from the host entry, which is exactly today's behaviour.
+ */
+const PI_EXTENSIONS = (process.env.PI_LEGION_REMOTE_PI_EXTENSIONS ?? "")
+	.split(",")
+	.map((entry) => entry.trim())
+	.filter((entry) => entry.length > 0);
 const FULL = process.env.PI_LEGION_REMOTE_FULL === "1";
 const SESSION = process.env.HC_SESSION ?? "";
 
@@ -99,6 +119,12 @@ function gateSkipReason(needs: { origin?: boolean; full?: boolean } = {}): strin
 	if (needs.full === true && !FULL) {
 		return "PI_LEGION_REMOTE_FULL is not set to 1 (spawns a real `pi` child on that machine)";
 	}
+	// Deliberately NOT gated on PI_LEGION_REMOTE_PI_EXTENSIONS. Whether that machine's
+	// models come from an extension is a property of ITS configuration, which this
+	// suite cannot know: a host with builtin models needs nothing here, and skipping
+	// "just in case" would turn "the operator forgot one env var" into "the test
+	// silently did not run". The launch-time probe already fails in ten seconds and
+	// names the key, which is the signal worth having.
 	return undefined;
 }
 
@@ -120,6 +146,9 @@ function target(): HostTarget {
 				// guessing another checkout's layout would be exactly the silent
 				// wrong-path launch M2 exists to prevent.
 				...(PI_LEGION_ROOT ? { piLegionRoot: PI_LEGION_ROOT } : {}),
+				// Only when named: an absent key keeps the argv byte-identical to a host
+				// that needs no extensions.
+				...(PI_EXTENSIONS.length > 0 ? { piExtensions: PI_EXTENSIONS } : {}),
 			},
 		},
 	});
