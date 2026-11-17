@@ -130,7 +130,7 @@ function isInsideFsPath(root: string, candidate: string): boolean {
  * A record with no path has nothing to guard, so that case returns: the guard
  * protects a path, not the mere presence of a host.
  */
-export function assertLocalWorktree(record: { worktreePath?: string; worktreeHost?: string }): void {
+export function assertLocalWorktree(record: { worktreePath?: string | null; worktreeHost?: string | null }): void {
 	const host = normalizeHost(record.worktreeHost);
 	if (!host) return;
 	const worktreePath = typeof record.worktreePath === "string" ? record.worktreePath.trim() : "";
@@ -140,6 +140,65 @@ export function assertLocalWorktree(record: { worktreePath?: string; worktreeHos
 		ErrorCodes.INVALID_PARAMS,
 		{ host, worktreePath },
 	);
+}
+
+/**
+ * The worktree path of a record, but only when it is a LOCAL one (D5/D13).
+ *
+ * This is the pair-decides rule in one place: `worktreeHost` absent/blank means
+ * this host (`normalizeHost`), so an old record's path is returned untouched —
+ * which is what makes a pre-v4 `run.json`/`nodes` row resume exactly as before.
+ * A pair that DOES name a host has no local path at all: the path is either on
+ * another machine (nothing to hand to `loadCatalog`/`fs`/`git` here) or, worse, it
+ * exists here and means something else — and `assertLocalWorktree` refuses that
+ * spelling rather than letting a caller treat it as a local directory.
+ */
+export function localWorktreePath(record: {
+	worktreePath?: string | null;
+	worktreeHost?: string | null;
+}): string | undefined {
+	const host = normalizeHost(record.worktreeHost);
+	if (host !== undefined) {
+		// Throws for a (host, path) pair: see the doc comment. A host with no path
+		// guards nothing and answers "no local path".
+		assertLocalWorktree({ worktreePath: record.worktreePath, worktreeHost: host });
+		return undefined;
+	}
+	return record.worktreePath ?? undefined;
+}
+
+/**
+ * The LOCAL `cwd` a resume must work in (contract D5/D13/D17).
+ *
+ * This is the whole decision, in one place, because it is the one place a stored
+ * `(host, path)` pair could become a path this machine reads:
+ *
+ *   - the child's own pair wins when it is local (`worktreeHost` absent — which is
+ *     every record written before v4, so an old run.json + old nodes row resolves
+ *     exactly as it always did);
+ *   - a child whose tree is on another machine contributes NO local path, and the
+ *     next candidate answers. Its tree's existence is checked later, on THAT
+ *     machine, by `remotePathIsDirectory` (never here: `existsSync` on a remote
+ *     spelling is the failure that destroys work);
+ *   - the parent's tree is a pair too, and a REMOTE one is refused by
+ *     `localWorktreePath` rather than silently resolved against this filesystem.
+ *
+ * `??`, not `||`: an empty parent-run cwd still wins, exactly as before.
+ */
+export function resolveResumeCwd(input: {
+	saved: { worktreePath?: string | null; worktreeHost?: string | null };
+	node: { worktreePath?: string | null; worktreeHost?: string | null };
+	parent: { worktreePath?: string | null; worktreeHost?: string | null };
+	parentRunCwd?: string | null;
+	fallbackCwd: string;
+}): string {
+	const remoteWorktreeHost = normalizeHost(input.saved.worktreeHost ?? input.node.worktreeHost);
+	const storedWorktreePath = input.saved.worktreePath ?? input.node.worktreePath;
+	const parentCwd = localWorktreePath({
+		worktreePath: input.parent.worktreePath,
+		worktreeHost: input.parent.worktreeHost,
+	});
+	return (remoteWorktreeHost ? undefined : storedWorktreePath) ?? parentCwd ?? input.parentRunCwd ?? input.fallbackCwd;
 }
 
 // ── S1: the resolved target ────────────────────────────────────────────────
@@ -174,11 +233,31 @@ export interface HostTarget {
 	piCli: string;
 	/** Prefix translations for argv paths outside the checkout, longest first. */
 	pathMap: HostPathMapEntry[];
+	/**
+	 * Directory (absolute, posix, ON that machine) that holds remote child
+	 * worktrees (contract D11/D12).
+	 *
+	 * Resolved here, once, from `hosts.<host>.worktreeRoot` (default:
+	 * `dirname(cwd)/.pi-worktrees`), so no call site ever has to invent a remote
+	 * path. It is a SIBLING of the checkout on purpose: a tree inside it would be
+	 * seen by the nested-worktree probe (`isInsideChildWorktree`) as "already in a
+	 * child worktree" and suppress the worktree its centurion asked for.
+	 */
+	worktreeRoot: string;
 }
 
 /** Defaults for the two programs, both resolved on the REMOTE machine. */
 export const DEFAULT_REMOTE_NODE = "node";
 export const DEFAULT_REMOTE_PI = "pi";
+
+/**
+ * Directory name (under `dirname(cwd)`) that holds remote child worktrees.
+ *
+ * `worktrees` is the local name too (`worktreePathFor` → `<runDir>/worktrees/<name>`),
+ * but this is deliberately NOT under `cwd`: a remote tree inside the checkout would
+ * be inside the repo the child commits to, adding its files to that repo's status.
+ */
+export const REMOTE_WORKTREE_DIR = ".pi-worktrees";
 
 /**
  * Turn `subagents.crossMachine` + a host name into the five facts a remote
@@ -236,7 +315,30 @@ export function resolveHostTarget(
 		node: nonEmpty(entry.node) ?? DEFAULT_REMOTE_NODE,
 		piCli: nonEmpty(entry.piCli) ?? DEFAULT_REMOTE_PI,
 		pathMap: resolvePathMap(name, entry.pathMap, entry.piLegionRoot),
+		worktreeRoot: resolveWorktreeRoot(name, cwd, entry.worktreeRoot),
 	};
+}
+
+/**
+ * Where that machine keeps remote child worktrees (`src/runs/remote-worktree.ts`).
+ *
+ * Default `dirname(cwd)/.pi-worktrees` keeps the tree beside the checkout instead
+ * of inside it (see {@link HostTarget.worktreeRoot}). A configured value must be
+ * absolute ON THAT MACHINE for the same reason `cwd` must be: a relative value
+ * would silently resolve against the remote core's home, which is how a remote
+ * child's tree lands somewhere nobody can find (D6/D13).
+ */
+function resolveWorktreeRoot(host: string, cwd: string, configured: string | undefined): string {
+	const raw = typeof configured === "string" ? configured.trim() : "";
+	if (raw.length === 0) return path.posix.join(path.posix.dirname(cwd), REMOTE_WORKTREE_DIR);
+	if (!path.posix.isAbsolute(raw)) {
+		throw new SubagentError(
+			`host '${host}' needs an absolute worktreeRoot in subagents.crossMachine.hosts.${host}.worktreeRoot (remote paths are not translated from this machine)`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host, worktreeRoot: raw },
+		);
+	}
+	return raw;
 }
 
 /**

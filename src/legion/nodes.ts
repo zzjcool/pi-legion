@@ -38,6 +38,20 @@ export interface LegionNode {
 	runId: string | null;
 	sessionFile: string | null;
 	worktreePath: string | null;
+	/**
+	 * Machine that OWNS {@link worktreePath}; `null` = this host
+	 * (contract `cross-machine-spawn-v1` D5/D13). Schema v4.
+	 */
+	worktreeHost: string | null;
+	/**
+	 * Machine that ran this child; `null` = this host (schema v4).
+	 *
+	 * Kept beside {@link worktreeHost} because they are two different facts: a
+	 * child can run remotely with no tree of its own (S1), and the pair
+	 * `(worktreeHost, worktreePath)` — not the path alone — is what decides
+	 * whether a local `fs`/`git` call is allowed.
+	 */
+	host: string | null;
 	model: string | null;
 	team: string | null;
 	status: NodeStatus;
@@ -60,6 +74,8 @@ export interface NewLegionNode {
 	runId?: string | null;
 	sessionFile?: string | null;
 	worktreePath?: string | null;
+	worktreeHost?: string | null;
+	host?: string | null;
 	model?: string | null;
 	team?: string | null;
 	status?: NodeStatus;
@@ -81,6 +97,8 @@ export type MutableNodeFields = Partial<
 		| "runId"
 		| "sessionFile"
 		| "worktreePath"
+		| "worktreeHost"
+		| "host"
 		| "model"
 		| "team"
 		| "status"
@@ -188,9 +206,9 @@ export function insertNode(
 		db.prepare(
 			`INSERT INTO nodes (
 				id, parent_id, name, role, kind, depth, run_id, session_file,
-				worktree_path, model, team, status, phase, phase_since, rework_count,
+				worktree_path, worktree_host, host, model, team, status, phase, phase_since, rework_count,
 				contract_path, task_summary, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		).run(
 			id,
 			input.parentId,
@@ -201,6 +219,8 @@ export function insertNode(
 			input.runId ?? null,
 			input.sessionFile ?? null,
 			input.worktreePath ?? null,
+			input.worktreeHost ?? null,
+			input.host ?? null,
 			input.model ?? null,
 			input.team ?? null,
 			input.status ?? "starting",
@@ -362,6 +382,8 @@ export function updateNode(
 				run_id = CASE WHEN ? THEN ? ELSE run_id END,
 				session_file = CASE WHEN ? THEN ? ELSE session_file END,
 				worktree_path = CASE WHEN ? THEN ? ELSE worktree_path END,
+				worktree_host = CASE WHEN ? THEN ? ELSE worktree_host END,
+				host = CASE WHEN ? THEN ? ELSE host END,
 				model = CASE WHEN ? THEN ? ELSE model END,
 				team = CASE WHEN ? THEN ? ELSE team END,
 				status = CASE WHEN ? THEN ? ELSE status END,
@@ -380,6 +402,8 @@ export function updateNode(
 			patch.runId !== undefined ? 1 : 0, patch.runId ?? null,
 			patch.sessionFile !== undefined ? 1 : 0, patch.sessionFile ?? null,
 			patch.worktreePath !== undefined ? 1 : 0, patch.worktreePath ?? null,
+			patch.worktreeHost !== undefined ? 1 : 0, patch.worktreeHost ?? null,
+			patch.host !== undefined ? 1 : 0, patch.host ?? null,
 			patch.model !== undefined ? 1 : 0, patch.model ?? null,
 			patch.team !== undefined ? 1 : 0, patch.team ?? null,
 			patch.status !== undefined ? 1 : 0, patch.status ?? null,
@@ -478,6 +502,8 @@ function mapNode(row: SqliteRow): LegionNode {
 		runId: nullableString(row.run_id),
 		sessionFile: nullableString(row.session_file),
 		worktreePath: nullableString(row.worktree_path),
+		worktreeHost: nullableString(row.worktree_host),
+		host: nullableString(row.host),
 		model: nullableString(row.model),
 		team: nullableString(row.team),
 		status: String(row.status) as NodeStatus,

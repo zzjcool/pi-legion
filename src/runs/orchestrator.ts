@@ -94,7 +94,7 @@ import {
 	resolveLaunchWorktree,
 } from "./worktree.ts";
 import { provisionWorktree } from "./provision.ts";
-import { normalizeHost, type HostTarget } from "./remote.ts";
+import { assertLocalWorktree, normalizeHost, type HostTarget } from "./remote.ts";
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
@@ -666,10 +666,10 @@ export class Orchestrator {
 			throw new SubagentError(`legion child is terminal and cannot be resumed: ${node.id}`, ErrorCodes.CHILD_TERMINAL);
 		}
 		if (!node.sessionFile) throw new SubagentError(`legion child has no session to resume: ${node.id}`, ErrorCodes.NOT_FOUND);
-		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}) };
+		return { name, nodeId: node.id, sessionFile: node.sessionFile, ownerToken: `legion-${node.id}`, state: "retired", spawnedAt: new Date(node.createdAt).toISOString(), agent: node.role, kind: node.kind as AgentConfig["kind"], ...(node.model ? { model: node.model } : {}), ...(node.worktreePath ? { worktreePath: node.worktreePath } : {}), ...(node.worktreeHost ? { worktreeHost: node.worktreeHost } : {}), ...(node.host ? { host: node.host } : {}) };
 	}
 
-	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; model?: string; utility?: boolean; inProcess?: boolean; phases?: PhaseMachine }): LegionNode | null {
+	private reserveNode(input: { nodeId: string; name: string; agent: AgentConfig; task: string; sessionFile: string; runId?: string; team?: string; worktreePath?: string; worktreeHost?: string; host?: string; model?: string; utility?: boolean; inProcess?: boolean; phases?: PhaseMachine }): LegionNode | null {
 		const legion = this.legion;
 		if (!legion) return null;
 		const parent = getNode(legion.db, legion.nodeId);
@@ -731,7 +731,7 @@ export class Orchestrator {
 				// ledger says why a stint restarted without a transition — the event set
 				// stays closed (no new type, no new mail subject).
 				const revivedAt = this.now();
-				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team, ...(previous.phase === null ? {} : { phaseSince: revivedAt }) }, this.now);
+				updateNode(legion.db, input.nodeId, { status: "starting", sessionFile: input.sessionFile, worktreePath: input.worktreePath ?? previous.worktreePath, worktreeHost: input.worktreeHost ?? previous.worktreeHost, host: input.host ?? previous.host, model: input.model ?? previous.model, team: team && team !== DEFAULT_TEAM ? team : previous.team, ...(previous.phase === null ? {} : { phaseSince: revivedAt }) }, this.now);
 				if (previous.phase !== null) {
 					this.emitStored(input.nodeId, "phase_change", { from: previous.phase, to: previous.phase, reworkCount: previous.reworkCount, reason: "revived" });
 				}
@@ -747,6 +747,8 @@ export class Orchestrator {
 				runId: input.runId,
 				sessionFile: input.sessionFile,
 				worktreePath: input.worktreePath ?? null,
+				worktreeHost: input.worktreeHost ?? null,
+				host: input.host ?? null,
 				model: input.model ?? null,
 				team: team && team !== DEFAULT_TEAM ? team : null,
 				status: "starting",
@@ -778,7 +780,7 @@ export class Orchestrator {
 		return gate.value;
 	}
 
-	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string; host?: string }): Promise<boolean> {
+	private async persistParentReservation(input: { nodeId: string; name: string; agent: AgentConfig; sessionFile: string; team?: string; model?: string; worktreePath?: string; worktreeBranch?: string; worktreeHost?: string; host?: string }): Promise<boolean> {
 		const legion = this.legion;
 		const parentRunId = legion?.runId;
 		if (!legion?.runStore || !parentRunId) return false;
@@ -796,6 +798,8 @@ export class Orchestrator {
 				child.nodeId = input.nodeId;
 				if (input.model) child.model = input.model;
 				if (input.worktreePath) child.worktreePath = input.worktreePath;
+				if (input.worktreeBranch) child.worktreeBranch = input.worktreeBranch;
+				if (input.worktreeHost) child.worktreeHost = input.worktreeHost;
 				if (input.host) child.host = input.host;
 			});
 			return false;
@@ -811,6 +815,8 @@ export class Orchestrator {
 			kind: input.agent.kind,
 			...(input.model ? { model: input.model } : {}),
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
+			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
+			...(input.worktreeHost ? { worktreeHost: input.worktreeHost } : {}),
 			...(input.host ? { host: input.host } : {}),
 		});
 		return true;
@@ -821,7 +827,7 @@ export class Orchestrator {
 		const team = teamOverride ?? agent.extraFields?.team ?? this.team?.name;
 		const current = getNode(this.legion.db, child.nodeId);
 		const childRun = current?.runId ?? this.legion.runId ?? path.basename(this.runDir);
-		updateNode(this.legion.db, child.nodeId, { status: "running", runId: childRun, sessionFile: child.sessionFile, worktreePath: child.worktreePath ?? null, model: child.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, taskSummary: task.slice(0, 2_000) }, this.now);
+		updateNode(this.legion.db, child.nodeId, { status: "running", runId: childRun, sessionFile: child.sessionFile, worktreePath: child.worktreePath ?? null, worktreeHost: child.worktreeHost ?? null, host: child.host ?? null, model: child.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, taskSummary: task.slice(0, 2_000) }, this.now);
 		this.emitStored(child.nodeId, resumed ? "node_resumed" : "node_launched", { parentId: this.legion.nodeId, runId: childRun, sessionFile: child.sessionFile, role: agent.name, kind: agent.kind });
 	}
 
@@ -1249,12 +1255,12 @@ export class Orchestrator {
 					ErrorCodes.INVALID_PARAMS,
 				);
 			}
-			if (worktree) {
-				throw new SubagentError(
-					`host '${host}' with worktree: true is not supported yet (remote worktrees land in S2): launch with worktree: false`,
-					ErrorCodes.INVALID_PARAMS,
-				);
-			}
+			// S2: `host` + `worktree: true` is now SUPPORTED, and it is the shape this
+			// whole stage exists for. The tree is created on that machine by the
+			// terminal backend (`createWorktree` on the SpawnInput below) — never
+			// here, because `createChildWorktree` runs `git -C <this.cwd>` and would
+			// hand the remote child a checkout on the wrong machine. A local tree for
+			// a remote child is exactly the "checkout nobody delivers from" S1 refused.
 			// A utility dispatch is a hard leaf whose contract is "return text to the
 			// caller" (`vexillatio` holds the inbox and collects it inline). Every part
 			// of that assumes a process in THIS one: the hold, the inline collect, the
@@ -1403,7 +1409,7 @@ export class Orchestrator {
 		try {
 			// #371 (m8): from here on a node may exist, so the declaration has an owner.
 			if (machine && this.legion && nodeId) this.declaredPhases.set(nodeId, machine);
-			if (worktree && !worktreePath) {
+			if (worktree && !worktreePath && input.hostTarget === undefined) {
 				const tree = createChildWorktree({ repoCwd: this.cwd, runDir: this.runDir, name });
 				worktreePath = tree.path;
 				worktreeBranch = tree.branch;
@@ -1441,9 +1447,9 @@ export class Orchestrator {
 			preCreateSessionFile(sessionFile);
 			if (this.legion && nodeId) {
 				const reservationRunId = createdRunId ?? (previous ? ledgerPrevious?.runId : undefined) ?? this.legion.runId;
-				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess, ...(machine ? { phases: machine } : {}) });
+				reservedNode = this.reserveNode({ nodeId, name, agent, task: input.task, sessionFile, runId: reservationRunId, team: input.team, worktreePath, ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}), model: models[0], utility: Boolean(input.utilityDispatch && input.agent.utility), inProcess, ...(machine ? { phases: machine } : {}) });
 				reserved = true;
-				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}), ...(host ? { host } : {}) });
+				parentReservationCreated = await this.persistParentReservation({ nodeId, name, agent: input.agent, sessionFile, ...(models[0] ? { model: models[0] } : {}), ...(worktreePath ? { worktreePath } : {}), ...(worktreeBranch ? { worktreeBranch } : {}), ...(host !== undefined && worktreePath ? { worktreeHost: host } : {}), ...(host ? { host } : {}) });
 			}
 			const childEnv = this.lineageEnv(name, input.agent, input.team, nodeId, machine);
 			if (input.stripLegionIdentity) {
@@ -1465,13 +1471,31 @@ export class Orchestrator {
 					agent,
 					sessionFile,
 					tempDir,
-					cwd: worktreePath ?? this.cwd,
+					// A remote launch starts from THIS machine's checkout: `cwd` is what the
+					// argv path map (`mapRemoteArgPath`) re-roots onto the other machine, and
+					// the backend replaces it with the remote directory before spawning. Using
+					// the remote tree path here would make a remote path look like a local one.
+					cwd: host !== undefined ? this.cwd : worktreePath ?? this.cwd,
 					env: childEnv,
 					// S0: carried, never acted on beyond the terminal backend's `on`. S1 adds
 					// the resolved target: the remote cwd/argv/env/labels/preflight all come
 					// from it, and the backend refuses a host without one.
 					...(host ? { host } : {}),
 					...(host && input.hostTarget ? { hostTarget: input.hostTarget } : {}),
+					// S2: only a remote launch asks the BACKEND for a tree, and only when
+					// `worktree` was arbitrated true and no tree is being reused. A resumed
+					// remote child names its existing tree instead (D17: never rebuilt
+					// automatically).
+					...(worktree ? { worktree: true } : {}),
+					...(host !== undefined && worktree && !worktreePath ? { createWorktree: true } : {}),
+					...(host !== undefined && worktreePath ? { worktreePath } : {}),
+					...(host !== undefined && worktreeBranch ? { worktreeBranch } : {}),
+					...(host !== undefined && this.worktreeBootstrap !== undefined
+						? { worktreeBootstrap: this.worktreeBootstrap }
+						: {}),
+					...(host !== undefined && this.worktreeBootstrapTimeoutMs !== undefined
+						? { worktreeBootstrapTimeoutMs: this.worktreeBootstrapTimeoutMs }
+						: {}),
 					...(model ? { model } : {}),
 					// REV-1.2: the pin was computed for CANDIDATE 0's model, so only that
 					// candidate may carry it. Handing it to a fallback routes the retry to a
@@ -1542,6 +1566,17 @@ export class Orchestrator {
 			// The child is in the supervisor's registry now, so the advisory in-flight
 			// reservation is superseded by the real counts (D2-b).
 			this.admitting.delete(name);
+			// S2: when the BACKEND created the tree (remote), the path and branch only
+			// exist on the handle — the orchestrator could not know them before the
+			// spawn. `?? result.*` keeps the LOCAL path byte-identical (there the
+			// orchestrator already holds both values and the handle carries none).
+			const appliedWorktreePath = worktreePath ?? result.worktreePath ?? undefined;
+			const appliedWorktreeBranch = worktreeBranch ?? result.worktreeBranch ?? undefined;
+			// D13: the owner of `appliedWorktreePath`. A remote child's tree belongs to
+			// that machine; a local child's to this one (absent).
+			const appliedWorktreeHost = appliedWorktreePath !== undefined
+				? normalizeHost(result.worktreeHost) ?? host
+				: undefined;
 			if (previous) {
 				previous.state = "working";
 				previous.spawnedAt = new Date(this.now()).toISOString();
@@ -1561,6 +1596,12 @@ export class Orchestrator {
 				else if (!sameModel) delete previous.modelProvider;
 				// A resume re-arbitrates the backend; keep the record truthful (#209).
 				previous.spawnMode = mode;
+				// A resumed REMOTE child learns its tree from the handle too (the local
+				// branch already had it). Only set what the handle actually reported, so a
+				// local resume keeps its stored pair untouched.
+				if (result.worktreePath) previous.worktreePath = result.worktreePath;
+				if (result.worktreeBranch) previous.worktreeBranch = result.worktreeBranch;
+				if (appliedWorktreeHost && result.worktreePath) previous.worktreeHost = appliedWorktreeHost;
 				this.children.set(name, previous);
 			}
 			const child = previous ?? this.recordChild({
@@ -1589,9 +1630,10 @@ export class Orchestrator {
 				thinking: startedModel
 					? splitThinkingSuffix(startedModel).thinking ?? input.thinking ?? input.agent.thinking
 					: input.thinking ?? input.agent.thinking,
-				...(worktreePath ? { worktreePath } : {}),
-				...(worktreeBranch ? { worktreeBranch } : {}),
+				...(appliedWorktreePath ? { worktreePath: appliedWorktreePath } : {}),
+				...(appliedWorktreeBranch ? { worktreeBranch: appliedWorktreeBranch } : {}),
 				...(host ? { host } : {}),
+				...(appliedWorktreeHost ? { worktreeHost: appliedWorktreeHost } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
 			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
@@ -2524,6 +2566,8 @@ export class Orchestrator {
 		thinking?: string | false;
 		worktreePath?: string;
 		worktreeBranch?: string;
+		/** Machine that OWNS `worktreePath`; absent = this host (contract D13). */
+		worktreeHost?: string;
 		/** Machine this child runs on; absent = this host (contract D5). */
 		host?: string;
 	}): ChildRecord {
@@ -2546,6 +2590,7 @@ export class Orchestrator {
 			spawnMode: input.spawnMode,
 			...(input.worktreePath ? { worktreePath: input.worktreePath } : {}),
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
+			...(input.worktreeHost ? { worktreeHost: input.worktreeHost } : {}),
 			...(input.host ? { host: input.host } : {}),
 		};
 		this.children.set(input.name, child);
@@ -3104,6 +3149,11 @@ export class Orchestrator {
 		//
 		// Only `running` is skipped: every other status keeps the exact behaviour it
 		// had before (#393 / D393-1, D393-2 are unchanged inside applyVerification).
+		// D13: acceptance runs HERE, so its cwd can only ever be a local path. A
+		// child whose tree belongs to another machine is refused by name here rather
+		// than having this machine's verifier run inside a path that means something
+		// else (remote verify is S3's work, not a silent local run).
+		assertLocalWorktree(child);
 		const acceptance = execution.status === "running"
 			? derived
 			: await applyVerification(derived, {

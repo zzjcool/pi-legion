@@ -16,6 +16,8 @@ function node(over: Partial<LegionNode> & Pick<LegionNode, "id" | "name" | "pare
 		runId: null,
 		sessionFile: null,
 		worktreePath: null,
+		worktreeHost: null,
+		host: null,
 		model: null,
 		team: null,
 		status: "running",

@@ -240,6 +240,48 @@ None of these changes a decision above.
   should read it that way instead of spending a second `machine.exec` on
   `wc -l`.
 
+- **S2 scope.** S2 makes D10–D12 real and nothing else: the remote tree is
+  created, provisioned and started in by the BACKEND, the ownership pair reaches
+  `nodes` (schema v4) and `run.json`, and the two local delivery primitives
+  (`fetchRemoteBranch` / `remoteBranchTipOnOrigin`) exist with a closing
+  fixture. Calling them during `collect` is S4; remote verify is S3.
+- **The tree checks run before the preflight, and that is deliberate.** The
+  spike measured that `terminal.run`'s own error cannot distinguish "the cwd does
+  not exist" from "the program does not exist", and the S1 preflight's `cd --`
+  can only answer the first. So when a launch asks for a tree, the ordering is
+  `test -d` → `rev-parse --git-dir` → shared `origin` → destination free →
+  `worktree add -b`, each with its own sentence, and the preflight follows for
+  `node`/`pi`. For `worktree: false` the S1 order (preflight first) is unchanged.
+- **`worktreeRoot` is a sibling of the checkout.** Default
+  `dirname(cwd)/.pi-worktrees`, overridable per host and required absolute. Not
+  inside the checkout for two reasons: the child's own `git status` must not
+  report its tree, and a tree inside a checkout looks like a nested worktree to
+  `isInsideChildWorktree`, which suppresses exactly the worktree a remote
+  centurion asked for.
+- **A remote request carries no `caller`.** `caller` is a bare terminal name
+  resolved by the receiving core; the remote core has never heard of this
+  process's terminal, so `terminal.run`/`send`/`kill`/`rm`/`interrupt` on a
+  remote address omit it. S1 sent it unconditionally; local requests still do.
+- **`remoteDelivery` is a wording flag, not a new bullet list.** With a branch
+  and `remoteDelivery`, the appendix replaces "do not push to main or master"
+  with the mandatory `git push -u origin <branch>` sentence; without it the text
+  is byte-identical to the frozen local one (the tests that pin it are untouched).
+- **`createRemoteChildWorktree` takes `localRepo`.** The frozen signature listing
+  above names four fields; `assertSharedOrigin` cannot answer "one shared remote"
+  without this machine's checkout, and the terminal backend (the only caller)
+  already has it as `input.cwd`.
+- **Provisioning a remote tree reuses `provision.ts`'s `resolveCommand`, with one
+  known gap:** the `npm-install` branch decides WHICH command by listing manifests
+  on the local filesystem, which is the wrong machine. A literal command
+  (`worktreeBootstrap: "npm ci"`) is exact today; the manifest probe belongs with
+  remote verify (S3).
+- **Schema v4 (`nodes.host`, `nodes.worktree_host`) is in `legion-v2-contract.md`
+  REV-35.** Two nullable columns, appended by `ALTER TABLE`, never backfilled —
+  `NULL` is the permanent spelling of "this host" (D5). The migration asks
+  `PRAGMA table_info(nodes)` first because `ADD COLUMN` has no `IF NOT EXISTS` and
+  a header-rewound file (a restored backup, this repo's own v1/v2 fixtures) must
+  re-migrate cleanly.
+
 ## Non-goals (v1)
 
 Worker/scout visibility on the remote machine, membership of a remote terminal

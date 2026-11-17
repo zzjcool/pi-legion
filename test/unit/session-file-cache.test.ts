@@ -386,6 +386,8 @@ function treeNode(
 		runId: null,
 		sessionFile,
 		worktreePath: null,
+		worktreeHost: null,
+		host: null,
 		model: null,
 		team: null,
 		status: "running",

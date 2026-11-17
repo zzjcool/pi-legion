@@ -867,6 +867,16 @@ export interface CrossMachineHostConfig {
 	 * open.
 	 */
 	pathMap?: Record<string, string>;
+	/**
+	 * Directory (absolute, ON that machine) that holds remote child worktrees
+	 * (`cross-machine-spawn-v1` D11/D12).
+	 *
+	 * Default: `dirname(cwd)/.pi-worktrees` — deliberately a SIBLING of the
+	 * checkout, never inside it. A tree inside the checkout would be found by the
+	 * nested-worktree probe (`isInsideChildWorktree`), which suppresses worktree
+	 * creation exactly where a remote centurion wants it.
+	 */
+	worktreeRoot?: string;
 }
 
 /**

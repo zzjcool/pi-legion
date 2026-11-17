@@ -148,7 +148,7 @@ import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
-import { normalizeHost, resolveHostTarget } from "./src/runs/remote.ts";
+import { normalizeHost, resolveHostTarget, resolveResumeCwd } from "./src/runs/remote.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
@@ -1396,12 +1396,28 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 			kind: input.node.kind as AgentConfig["kind"],
 			...(input.node.model ? { model: input.node.model } : {}),
 			...(input.node.worktreePath ? { worktreePath: input.node.worktreePath } : {}),
+			// D13: the reconstructed record keeps the OWNER of that path, so a later
+			// resume in another process does not mistake a remote tree for a local one.
+			...(input.node.worktreeHost ? { worktreeHost: input.node.worktreeHost } : {}),
+			...(input.node.host ? { host: input.node.host } : {}),
 		});
 		parentRun = store.readRun(parentRunId)!;
 		saved = parentRun.children.find((child) => child.nodeId === input.node.id);
 	}
 	if (!saved) throw new Error(`resume child record not found: ${input.node.id}`);
-	const cwd = input.node.worktreePath ?? parent.worktreePath ?? parentRun.cwd ?? input.cwd;
+	// D13/D17: a stored worktree path is a path ON the machine recorded beside it.
+	// A remote path must never become this process's `cwd` — `loadCatalog` reads
+	// agent cards from HERE, and a resume that quietly resolved a remote spelling
+	// against this filesystem would load a different checkout's roles (or nothing).
+	// So the pair decides: host present ⇒ no local path at all, and the tree's own
+	// existence is checked by the terminal backend on THAT machine.
+	const cwd = resolveResumeCwd({
+		saved,
+		node: input.node,
+		parent,
+		parentRunCwd: parentRun.cwd,
+		fallbackCwd: input.cwd,
+	});
 	const catalog = loadCatalog(cwd, cwd, undefined);
 	const resumedTeam = input.node.team
 		? applyTeam(catalog.allAgents, { ...catalog.settings, team: input.node.team }, { ...process.env, [TEAM_ENV]: input.node.team })
@@ -5830,6 +5846,9 @@ function followJob(
 		...(child?.model ? { model: child.model } : {}),
 		...(child?.thinking !== undefined ? { thinking: child.thinking } : {}),
 		...(child?.worktreeBranch ? { worktreeBranch: child.worktreeBranch } : {}),
+		// D13: the machine travels with the branch, so the status row can render
+		// `vps:<branch>` instead of implying a local tree.
+		...(child?.worktreeHost ? { worktreeHost: child.worktreeHost } : {}),
 		...(spawnMode ? { spawnMode } : {}),
 		...(input.pid ? { pid: input.pid } : {}),
 		...(input.treeIdentity ? input.treeIdentity : child?.nodeId ? {

@@ -81,7 +81,8 @@ function config(
 }
 
 function target(overrides: Partial<HostTarget> = {}): HostTarget {
-	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], ...overrides };
+	// `worktreeRoot` is resolved by `resolveHostTarget` (S2: `dirname(cwd)/.pi-worktrees`).
+	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], worktreeRoot: "/srv/.pi-worktrees", ...overrides };
 }
 
 /** The package root, imported here so the fixture cannot drift from the resolver. */
@@ -150,10 +151,12 @@ test("D1: a valid entry resolves remote cwd/node/piCli, defaulting the two progr
 		node: "node",
 		piCli: "pi",
 		pathMap: [packageRoot],
+		// S2: remote trees live BESIDE the checkout (contract D11).
+		worktreeRoot: "/srv/.pi-worktrees",
 	});
 	assert.deepEqual(
 		resolveHostTarget("vps", config({ vps: { cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi" } })),
-		{ host: "vps", cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi", pathMap: [packageRoot] },
+		{ host: "vps", cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi", pathMap: [packageRoot], worktreeRoot: "/srv/.pi-worktrees" },
 	);
 	// An explicit mapping of the package root wins over `piLegionRoot`.
 	assert.deepEqual(

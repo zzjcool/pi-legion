@@ -898,6 +898,8 @@ function mapNode(row: SqliteRow): LegionNode {
 		runId: row.run_id === null ? null : String(row.run_id),
 		sessionFile: row.session_file === null ? null : String(row.session_file),
 		worktreePath: row.worktree_path === null ? null : String(row.worktree_path),
+		worktreeHost: row.worktree_host === null || row.worktree_host === undefined ? null : String(row.worktree_host),
+		host: row.host === null || row.host === undefined ? null : String(row.host),
 		model: row.model === null ? null : String(row.model),
 		team: row.team === null ? null : String(row.team),
 		status: String(row.status) as LegionNode["status"],

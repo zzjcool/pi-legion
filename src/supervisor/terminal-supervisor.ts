@@ -30,6 +30,12 @@ import {
 	terminalAddress,
 	type HostTarget,
 } from "../runs/remote.ts";
+import {
+	createRemoteChildWorktree,
+	provisionRemoteWorktree,
+	remotePathIsDirectory,
+	removeRemoteChildWorktree,
+} from "../runs/remote-worktree.ts";
 import { childMemoryEnv } from "./child-memory.ts";
 import { defaultPiCliPath } from "./rpc-supervisor.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
@@ -168,6 +174,16 @@ interface TerminalChildRecord {
 	/** `hc` terminal name — the only name later calls use (D7). */
 	readonly terminalName: string;
 	/**
+	 * Worktree the child really got, and the machine that owns it (S2/D13).
+	 *
+	 * Recorded here as well as on the handle: a `retire`/`resume` in this process
+	 * must be able to say which machine the path belongs to without reading the
+	 * parent's ledger back.
+	 */
+	worktreePath?: string;
+	worktreeBranch?: string;
+	worktreeHost?: string;
+	/**
 	 * Machine the terminal runs on; absent = this host.
 	 *
 	 * Kept on the record because every later call (`get`/`send`/`interrupt`/
@@ -295,6 +311,64 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const target: HostTarget | undefined = host !== undefined ? input.hostTarget : undefined;
 		const remote = target !== undefined;
 
+		// D11: a remote worktree is created ON THAT MACHINE, by the only layer that
+		// holds both the `hc` client and the target. It runs BEFORE the preflight
+		// because the preflight's `cd -- <cwd>` cannot tell "no checkout" from "no
+		// program" (the spike's constraint): `createRemoteChildWorktree` asks the
+		// three questions in an order that can name the failing one, and the
+		// preflight still covers `node`/`pi` afterwards. A launch that ASKS for a
+		// tree (createWorktree) must never fall through to the bare checkout: the
+		// child would then write into the checkout its own parent reads.
+		let remoteWorktree: { path: string; branch: string } | undefined;
+		let createdRemoteWorktree = false;
+		if (target !== undefined) {
+			const requested = typeof input.worktreePath === "string" ? input.worktreePath.trim() : "";
+			if (requested.length > 0) {
+				// Resume (D17): the tree either still exists or the branch is all that
+				// survived. Nothing is rebuilt automatically, and the existence check is
+				// explicit here because `terminal.run`'s own error cannot distinguish a
+				// missing cwd from a missing program (constraint 4).
+				if (!(await remotePathIsDirectory(client, target, requested))) {
+					throw new SubagentError(
+						`host '${target.host}': worktree ${requested} does not exist on that machine (branch ${input.worktreeBranch ?? "<unknown>"} may still hold the work; fetch it from origin or retire the node)`,
+						ErrorCodes.START_FAILED,
+						{ host: target.host, worktreePath: requested },
+					);
+				}
+				remoteWorktree = { path: requested, branch: input.worktreeBranch ?? "" };
+			} else if (input.createWorktree === true) {
+				try {
+					const tree = await createRemoteChildWorktree({
+						client,
+						target,
+						name: input.name,
+						// The local checkout is what "one shared remote" is checked against.
+						localRepo: input.cwd,
+					});
+					remoteWorktree = { path: tree.path, branch: tree.branch };
+					createdRemoteWorktree = true;
+				} catch (error) {
+					throw this.failure("remote worktree", host ?? target.host, error);
+				}
+			}
+		}
+
+		// D11: the rollback that pairs with the tree created above. Best effort by
+		// design: this runs on a failure path, and a cleanup error must never replace
+		// the reason the launch actually failed.
+		const rollbackRemoteWorktree = async (): Promise<void> => {
+			if (!createdRemoteWorktree || target === undefined || remoteWorktree === undefined) return;
+			const treePath = remoteWorktree.path;
+			try {
+				await removeRemoteChildWorktree({ client, target, path: treePath });
+			} catch (error) {
+				// Diagnostic only — the original failure is what the caller sees.
+				process.stderr.write(
+					`[pi-legion] host '${target.host}': could not roll back worktree ${treePath}: ${error instanceof Error ? error.message : String(error)}\n`,
+				);
+			}
+		};
+
 		// D6/D9: prove the target can host this launch, and refuse rather than send
 		// a parent path or a relative cwd. Runs BEFORE `terminal.run` so a bad cwd
 		// never creates a terminal nobody can use.
@@ -302,7 +376,28 @@ export class TerminalSupervisor implements LegionSupervisor {
 			try {
 				await remotePreflight(client, target);
 			} catch (error) {
+				await rollbackRemoteWorktree();
 				throw this.failure("remote preflight", host ?? target.host, error);
+			}
+		}
+
+		// D11: provision the remote tree here, because the orchestrator's
+		// `provisionWorktree()` runs `bash -lc` on THIS machine and the tree is on
+		// the other one. Same mode, same command parser, same idempotency marker.
+		if (target !== undefined && remoteWorktree !== undefined && createdRemoteWorktree) {
+			try {
+				await provisionRemoteWorktree({
+					client,
+					target,
+					worktreePath: remoteWorktree.path,
+					...(input.worktreeBootstrap !== undefined ? { mode: input.worktreeBootstrap } : {}),
+					...(input.worktreeBootstrapTimeoutMs !== undefined
+						? { timeoutMs: input.worktreeBootstrapTimeoutMs }
+						: {}),
+				});
+			} catch (error) {
+				await rollbackRemoteWorktree();
+				throw this.failure("remote worktree bootstrap", host ?? target.host, error);
 			}
 		}
 
@@ -337,9 +432,16 @@ export class TerminalSupervisor implements LegionSupervisor {
 				childLaunchContext: _childLaunchContext,
 				// `host` is transport, not argv: it reaches the wire as `on` below and
 				// must never leak into `buildPiArgs`. The resolved target is transport
-				// too — `cwd`/`node`/`piCli` are read from it, never rebuilt here.
+				// too — `cwd`/`node`/`piCli` are read from it, never rebuilt here. The
+				// worktree fields are the backend's own instructions (D11) and are
+				// consumed above, so none of them may reach the argv builder either.
 				host: _host,
 				hostTarget: _hostTarget,
+				worktree: _worktree,
+				createWorktree: _createWorktree,
+				worktreePath: _worktreePath,
+				worktreeBootstrap: _worktreeBootstrap,
+				worktreeBootstrapTimeoutMs: _worktreeBootstrapTimeoutMs,
 				...buildInput
 			} = input;
 
@@ -370,9 +472,17 @@ export class TerminalSupervisor implements LegionSupervisor {
 					await mirrorRemoteFile(client, target, localFile, remoteFile);
 				}
 			}
+			// The branch the child is told to commit on. For a remote tree it is the one
+			// THIS launch just created (`worktree add -b` on that machine), which the
+			// parent did not know until now (D11/D12).
+			const branchForTask = remoteWorktree?.branch || input.worktreeBranch;
 			const task = formatChildTask(input.task, {
 				allowNested: input.allowNestedSubagents === true,
-				...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
+				...(branchForTask ? { worktreeBranch: branchForTask } : {}),
+				// D10/D12: on another machine the branch is the DELIVERY, not a
+				// convenience: the parent can only read it through the shared origin,
+				// so the appendix says "push it" instead of "do not push".
+				...(remote ? { remoteDelivery: true } : {}),
 			});
 			if (target !== undefined && rewritePath !== undefined && remoteDirPath !== undefined) {
 				// D6's closing rule: NO parent-absolute path may survive, and none may be
@@ -391,7 +501,10 @@ export class TerminalSupervisor implements LegionSupervisor {
 					...built.args.map((arg) => mapRemoteArgPath({
 						arg,
 						host: target.host,
-						remoteCwd: target.cwd,
+						// A remote worktree child reads ITS tree, not the bare checkout:
+						// the git-remote model says both machines hold the same content,
+						// and the tree is this launch's copy of it.
+						remoteCwd: remoteWorktree?.path ?? target.cwd,
 						remoteDir: remoteDirPath,
 						localCwd: input.cwd,
 						pathMap: target.pathMap,
@@ -406,18 +519,24 @@ export class TerminalSupervisor implements LegionSupervisor {
 			}
 		} catch (error) {
 			this.removeTempDir(tempDir);
+			await rollbackRemoteWorktree();
 			throw error;
 		}
 
 		const params = {
 			name: terminalNameForChild,
 			argv,
-			// D6: a remote child starts in the REMOTE cwd. It is never `this.cwd` and
-			// never a local path that happens to exist here.
-			cwd: target !== undefined ? target.cwd : input.cwd,
+			// D6/D11: a remote child starts in the REMOTE directory — its own tree when
+			// one was created for it, the target's checkout otherwise. It is never
+			// `this.cwd` and never a local path that happens to exist here.
+			cwd: target !== undefined ? remoteWorktree?.path ?? target.cwd : input.cwd,
 			env: this.childEnv(input, remote ? host : undefined),
 			labels: await this.childLabels(input, remote ? host : undefined),
-			...(this.caller ? { caller: this.caller } : {}),
+			// Constraint 5: `caller` is a BARE terminal name in THIS core's
+			// namespace. A remote terminal lives in another one, where that id either
+			// does not exist or names somebody else's terminal — so a remote request
+			// never carries it.
+			...(this.callerFor(host) !== undefined ? { caller: this.callerFor(host) } : {}),
 			// The ONE machine dimension crossing the wire (contract D2): legion says
 			// `host`, `hc` says `on`. Absent ⇒ the key is absent, so the params are
 			// byte-identical to the local launch (D4).
@@ -426,9 +545,10 @@ export class TerminalSupervisor implements LegionSupervisor {
 
 		let run: HcTerminalFacts;
 		try {
-			run = await this.runTerminal(client, params, terminalAddress({ terminalName: terminalNameForChild, ...(host ? { host } : {}) }));
+			run = await this.runTerminal(client, params, terminalAddress({ terminalName: terminalNameForChild, ...(host ? { host } : {}) }), host);
 		} catch (error) {
 			this.removeTempDir(tempDir);
+			await rollbackRemoteWorktree();
 			throw this.failure("terminal.run", terminalNameForChild, error);
 		}
 
@@ -449,12 +569,22 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// so the returned name wins over the requested one when present.
 		const mappedName =
 			typeof run.name === "string" && run.name.length > 0 ? run.name : terminalNameForChild;
+		// D13: the ownership pair, in one value, so the record and the handle cannot
+		// disagree about which machine a path belongs to.
+		const worktreeFacts = remoteWorktree !== undefined && target !== undefined
+			? {
+				worktreePath: remoteWorktree.path,
+				worktreeBranch: remoteWorktree.branch,
+				worktreeHost: target.host,
+			}
+			: {};
 		const record: TerminalChildRecord = {
 			name: input.name,
 			terminalName: mappedName,
 			...(host ? { host } : {}),
 			...(remoteDir ? { remoteDir } : {}),
 			...(tempDir ? { tempDir } : {}),
+			...worktreeFacts,
 			state: "live",
 			turn,
 			...(typeof run.status?.state === "string" ? { statusState: run.status.state } : {}),
@@ -468,6 +598,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 			name: input.name,
 			sessionFile: input.sessionFile,
 			...(typeof run.pid === "number" ? { pid: run.pid } : {}),
+			// S2: the tree the BACKEND created comes back the same way `pid` does —
+			// the orchestrator could not know this path before the spawn.
+			...worktreeFacts,
 		};
 	}
 
@@ -528,7 +661,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const result = await client.request<HcSendResult>("terminal.send", {
 			terminal: terminalAddress(child),
 			text,
-			...(this.caller ? { caller: this.caller } : {}),
+			...(this.callerFor(child.host) !== undefined ? { caller: this.callerFor(child.host) } : {}),
 		});
 		// The send reports the turn it landed in; it is never lower than what we
 		// saw, and it is the more precise of the two readings.
@@ -686,7 +819,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		try {
 			await client.request("terminal.kill", {
 				terminal: address,
-				...(this.caller ? { caller: this.caller } : {}),
+				...(this.callerFor(child.host) !== undefined ? { caller: this.callerFor(child.host) } : {}),
 			});
 		} catch (error) {
 			// A terminal the core no longer knows is already gone; anything else is
@@ -696,7 +829,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		try {
 			await client.request("terminal.rm", {
 				terminal: address,
-				...(this.caller ? { caller: this.caller } : {}),
+				...(this.callerFor(child.host) !== undefined ? { caller: this.callerFor(child.host) } : {}),
 			});
 		} catch {
 			/* D11: best effort — a killed terminal that cannot be removed is not an error */
@@ -727,6 +860,19 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const id = this.env[HC_TERMINAL_ID_ENV];
 		const trimmed = typeof id === "string" ? id.trim() : "";
 		return trimmed.length > 0 ? trimmed : undefined;
+	}
+
+	/**
+	 * `caller`, but only for a request that addresses a terminal in THIS core's
+	 * namespace (cross-machine constraint 5).
+	 *
+	 * A `caller` is a BARE terminal name, resolved by the core that receives the
+	 * request. The remote core never heard of this process's terminal, so sending
+	 * it there either fails the call or — worse — names an unrelated terminal on
+	 * that machine. Absent host ⇒ unchanged local behaviour.
+	 */
+	private callerFor(host: string | undefined): string | undefined {
+		return normalizeHost(host) === undefined ? this.caller : undefined;
 	}
 
 	/** `HC_BIN` is honoured by the client; `PI_SUBAGENT_CLI`/host argv decide pi. */
@@ -862,6 +1008,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		client: HcClient,
 		params: Record<string, unknown>,
 		address: string,
+		host?: string,
 	): Promise<HcTerminalFacts> {
 		const name = typeof params.name === "string" ? params.name : address;
 		try {
@@ -883,7 +1030,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 			try {
 				await client.request("terminal.rm", {
 					terminal: address,
-					...(this.caller ? { caller: this.caller } : {}),
+					...(this.callerFor(host) !== undefined ? { caller: this.callerFor(host) } : {}),
 				});
 			} catch {
 				/* the retry below reports the real failure */

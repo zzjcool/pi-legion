@@ -16,6 +16,7 @@ import { extractVerdict, parseSessionFile } from "../shared/session.ts";
 import type { LegionSupervisor } from "../supervisor/types.ts";
 import { inFlightToolStackOf } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
+import { assertLocalWorktree, normalizeHost } from "../runs/remote.ts";
 import {
 	isMailHeld,
 	MAIL_DELIVERY_CLAIM_LEASE_MS,
@@ -957,6 +958,11 @@ export class LegionPostman {
 		// the supervisor's own working directory, which is never this team's checkout.
 		const stored = storedPassThisStint(node);
 		if (!stored) return;
+		// D13: everything below probes THIS machine's filesystem. For a tree on
+		// another machine there is no such probe to make (that is remote verify, S3),
+		// so the nudge is skipped instead of measuring one machine's checkout against
+		// the other machine's pass.
+		if (normalizeHost(node.worktreeHost) !== undefined) return;
 		const checkoutMoved = !checkoutMatchesPass(stored.cwd, node.worktreePath);
 		const currentTree = checkoutMoved ? undefined : this.probeTree(stored.cwd, stored.contractFile, timestamp);
 		if (checkoutMoved || currentTree !== stored.tree) {
@@ -1859,7 +1865,9 @@ export async function requestLegionPhase(
 		// pass used to be free: `checkedAt >= phaseSince` alone reused it forever. The
 		// current checkout is the worktree when the node has one, else the cwd this
 		// request was made from.
-		&& !verificationIsCurrent(self, self.worktreePath ?? options.cwd)
+		// D13: a remote tree is never this machine's checkout, so the pass cannot be
+		// judged against it here — `assertLocalWorktree` makes that a refusal.
+		&& !verificationIsCurrent(assertLocalChecked(self), self.worktreePath ?? options.cwd)
 	) {
 		// "Would this request succeed if the contract came back green?" — judged with a
 		// PASS, not without one, so the answer does not depend on the order the author
@@ -2301,6 +2309,11 @@ export async function runVerification(
 	const commands = contract.commands;
 	const unrecognised = contract.shape === "unrecognised";
 	const timeoutMs = options.settings?.verifyCommandTimeoutMs ?? 600_000;
+	// D13: the verify commands run HERE (`runLegionCommand`), so the cwd must be a
+	// path this machine owns. A remote tree is refused by name instead of running
+	// this host's verifier inside a path that means something else (remote verify
+	// is S3's, and it goes through `machine.exec`).
+	assertLocalWorktree(node);
 	const cwd = node.worktreePath ?? options.cwd;
 	const contractFile = options.contractFile ?? path.resolve(cwd, ".pi-legion", "contract.md");
 	const runDir = options.runDir ?? (node.sessionFile ? path.dirname(node.sessionFile) : path.join(options.cwd, ".pi-subagents", "runs"));
@@ -2548,6 +2561,8 @@ function contractPathForRun(
 	node: Pick<LegionNode, "worktreePath" | "contractPath">,
 	options: Pick<PhaseRequestOptions, "cwd" | "runDir">,
 ): string {
+	// D13: the two probes below are `fs.existsSync` on THIS machine.
+	assertLocalWorktree(node);
 	const canonical = path.resolve(node.worktreePath ?? options.cwd, ".pi-legion", "contract.md");
 	// The RECORDED path is the team's own answer, but only while the file is still
 	// there: a node whose contractPath was recorded before its contract moved (or
@@ -2691,6 +2706,18 @@ export interface VerificationSummary {
 	stale: boolean;
 }
 
+/**
+ * `assertLocalWorktree`, returning the node it was given.
+ *
+ * The guard is a statement (`void`), and site 3 needs the value inside an
+ * expression; keeping the wrapping here means the call site cannot accidentally
+ * guard a DIFFERENT object than the one it then reads `worktreePath` off.
+ */
+function assertLocalChecked(node: LegionNode): LegionNode {
+	assertLocalWorktree(node);
+	return node;
+}
+
 export function verificationSummary(node: LegionNode): VerificationSummary | undefined {
 	const stored = taskMetadata(node.taskSummary).verification;
 	if (!stored) return undefined;
@@ -2699,6 +2726,8 @@ export function verificationSummary(node: LegionNode): VerificationSummary | und
 	// reader of the collect head is asking about the delivery, and the stint is the
 	// gate's own business.
 	const where = typeof stored.cwd === "string" ? stored.cwd : undefined;
+	// D13: `checkoutMatchesPass`/`verificationTree` read this machine's filesystem.
+	assertLocalWorktree(node);
 	const stale = where === undefined
 		|| !checkoutMatchesPass(where, node.worktreePath ?? null)
 		|| verificationTree(where, readTextOrEmpty(stored.contractFile)) !== stored.tree;

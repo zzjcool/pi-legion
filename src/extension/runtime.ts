@@ -127,6 +127,11 @@ export interface TrackedJobInput {
 	thinking?: string | false;
 	worktreeBranch?: string;
 	/**
+	 * Machine that owns the worktree (cross-machine D13): rendered beside the
+	 * branch so a remote tree is never displayed as a local one.
+	 */
+	worktreeHost?: string;
+	/**
 	 * Arbitrated backend for this child (`Handle.spawnMode`, #209). Optional:
 	 * a job tracked from a legacy record has no value and must render as
 	 * unknown rather than a guessed `rpc`.
@@ -2489,6 +2494,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				existing.model = input.model;
 				existing.thinking = input.thinking;
 				existing.worktreeBranch = input.worktreeBranch;
+				if (input.worktreeHost) existing.worktreeHost = input.worktreeHost;
 				// Only a known value overwrites: a re-follow without the handle must
 				// not erase the mode an earlier launch established.
 				if (input.spawnMode !== undefined) existing.spawnMode = input.spawnMode;
@@ -2862,6 +2868,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 						runId: null,
 						sessionFile: job.sessionFile || null,
 						worktreePath: null,
+						worktreeHost: null,
+						host: null,
 						model: job.model ?? null,
 						team: null,
 						status,
@@ -3152,6 +3160,7 @@ function statusEntryFromJob(
 		...(model ? { model } : {}),
 		...(thinking !== undefined ? { thinking } : {}),
 		...(job.worktreeBranch ? { worktreeBranch: job.worktreeBranch } : {}),
+		...(job.worktreeHost ? { worktreeHost: job.worktreeHost } : {}),
 		...(live.turns ? { turns: live.turns } : {}),
 		...(live.lastTools?.length ? { lastTools: live.lastTools } : {}),
 		...(live.currentTurnStartedAt !== undefined

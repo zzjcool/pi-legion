@@ -53,6 +53,43 @@ export interface SpawnInput extends Omit<BuildArgsInput, "cwd" | "includeTask"> 
 	 * orchestrator is the one place that checks the pair agrees.
 	 */
 	hostTarget?: HostTarget;
+	/**
+	 * Arbitrated `worktree` decision for THIS launch (cross-machine S2).
+	 *
+	 * The backend needs it next to {@link createWorktree}: "make me a tree" and
+	 * "this child is worktree-isolated" are two facts, and a remote child only
+	 * gets one when both say so. Local backends read the same fact off
+	 * `agent.worktree`, which the orchestrator normalizes identically.
+	 */
+	worktree?: boolean;
+	/**
+	 * Ask the BACKEND to create the worktree on `host` (cross-machine D11).
+	 *
+	 * Only the terminal backend acts on it, and only when a target is resolved:
+	 * the backend is the only layer holding both the `hc` client and the
+	 * `HostTarget`, so it is the only one that can run `git worktree add -b` on
+	 * that machine. The orchestrator sets it for `host && worktree`, and never
+	 * creates a local tree for a remote child.
+	 */
+	createWorktree?: boolean;
+	/**
+	 * `subagents.legion.worktreeBootstrap` for the tree the backend creates.
+	 *
+	 * Carried on the spawn because the tree is created (and provisioned) in the
+	 * backend for a remote child: the orchestrator's local `provisionWorktree()`
+	 * cannot reach that machine.
+	 */
+	worktreeBootstrap?: string;
+	/** `worktreeBootstrapTimeoutMs` for that same provision step. */
+	worktreeBootstrapTimeoutMs?: number;
+	/**
+	 * An existing tree on `host` that this launch must REUSE (cross-machine D17).
+	 *
+	 * Set by a resume: the tree either still exists or the branch is all that
+	 * survived, and rebuilding it automatically would silently restart work whose
+	 * output nobody collected. The backend checks existence before starting.
+	 */
+	worktreePath?: string;
 }
 
 /** Handle returned after the RPC process accepts its first prompt. */
@@ -60,6 +97,24 @@ export interface ChildHandle {
 	name: string;
 	sessionFile: string;
 	pid?: number;
+	/**
+	 * Worktree the child really got, when the BACKEND created it (S2).
+	 *
+	 * For a remote child the orchestrator could not know this path before the
+	 * spawn (the tree is created on that machine, by the backend), so the handle
+	 * is where the fact comes back — the same way `pid` does. Absent for a local
+	 * launch, whose path the orchestrator already holds.
+	 */
+	worktreePath?: string;
+	/** Branch created with that tree; the child's deliverable name (D12). */
+	worktreeBranch?: string;
+	/**
+	 * Machine that OWNS {@link worktreePath} (contract D13).
+	 *
+	 * Travels with the path because the pair is the ownership fact: a reader that
+	 * sees only the path cannot tell a local tree from one on another machine.
+	 */
+	worktreeHost?: string;
 	/**
 	 * In-process-only, NON-FATAL model-resolution notice (B5).
 	 *

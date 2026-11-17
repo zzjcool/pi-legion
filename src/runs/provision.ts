@@ -24,6 +24,7 @@ import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ErrorCodes, SubagentError } from "../shared/types.ts";
+import { assertLocalWorktree } from "./remote.ts";
 
 export const PROVISION_MARKER = ".pi-provisioned";
 
@@ -65,18 +66,35 @@ function writeMarker(worktreePath: string, mode: string): void {
  * repos carry stray package.json files for docs/tooling) than a real npm
  * project (which always has a lockfile). Without a lockfile we skip
  * provisioning instead of firing npm install into a Java checkout. */
+/**
+ * Lockfile → install command, in the order {@link installCommandFor} probes.
+ *
+ * One table, two consumers: the local path stats these files here, and the
+ * cross-machine path asks the OTHER machine which one it has and maps the answer
+ * through this same table (`installCommandForLockfile`). A second copy of the
+ * command strings is how the two machines would start installing differently.
+ */
+export const INSTALL_LOCKFILES = ["pnpm-lock.yaml", "bun.lockb", "yarn.lock", "package-lock.json"] as const;
+
+/** The command for one lockfile name, or `null` when the name is not one of ours. */
+export function installCommandForLockfile(name: string): string | null {
+	switch (name) {
+		case "pnpm-lock.yaml":
+			return "pnpm install --frozen-lockfile";
+		case "bun.lockb":
+			return "bun install --frozen-lockfile";
+		case "yarn.lock":
+			return "yarn install --frozen-lockfile";
+		case "package-lock.json":
+			return "npm ci";
+		default:
+			return null;
+	}
+}
+
 function installCommandFor(worktreePath: string): string | null {
-	if (fs.existsSync(path.join(worktreePath, "pnpm-lock.yaml"))) {
-		return "pnpm install --frozen-lockfile";
-	}
-	if (fs.existsSync(path.join(worktreePath, "bun.lockb"))) {
-		return "bun install --frozen-lockfile";
-	}
-	if (fs.existsSync(path.join(worktreePath, "yarn.lock"))) {
-		return "yarn install --frozen-lockfile";
-	}
-	if (fs.existsSync(path.join(worktreePath, "package-lock.json"))) {
-		return "npm ci";
+	for (const lockfile of INSTALL_LOCKFILES) {
+		if (fs.existsSync(path.join(worktreePath, lockfile))) return installCommandForLockfile(lockfile);
 	}
 	return null;
 }
@@ -87,7 +105,17 @@ function shellEnv(): NodeJS.ProcessEnv {
 	return env;
 }
 
-function resolveCommand(mode: string, worktreePath: string): string | null {
+/**
+ * Resolve the shell command one bootstrap mode stands for, or `null` when there
+ * is nothing to run.
+ *
+ * Exported for the cross-machine path (`remote-worktree.ts`, contract D11): the
+ * remote tree is provisioned with the SAME parser, so "npm-install" cannot come
+ * to mean two different things depending on which machine the tree lives on.
+ * Note the `npm-install` branch lists manifests on the local filesystem — see the
+ * S2 boundary note in `provisionRemoteWorktree`.
+ */
+export function resolveCommand(mode: string, worktreePath: string): string | null {
 	if (mode === BOOTSTRAP_MODE_INSTALL) return installCommandFor(worktreePath);
 	const trimmed = mode.trim();
 	return trimmed ? trimmed : null;
@@ -102,7 +130,16 @@ export function provisionWorktree(opts: {
 	worktreePath: string;
 	mode?: string;
 	timeoutMs?: number;
+	/**
+	 * Owner of `worktreePath`, when it is not this host (contract D13).
+	 *
+	 * Structured rather than derived: this function runs `bash -lc` INSIDE the
+	 * path, and a remote path may exist here and mean something else, so a pair
+	 * with a host must be refused before the first `fs` call.
+	 */
+	worktreeHost?: string;
 }): ProvisionResult {
+	assertLocalWorktree({ worktreePath: opts.worktreePath, worktreeHost: opts.worktreeHost });
 	const mode = (opts.mode ?? "").trim();
 	if (!mode) return { applied: "skip" };
 	const marker = readMarker(opts.worktreePath);

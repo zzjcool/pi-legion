@@ -202,15 +202,37 @@ test("D2: with a host, `on` carries it and the child record keeps it", async () 
 	}
 });
 
-test("D2: host + caller send both `caller` and `on`", async () => {
+/**
+ * S2 (constraint 5): a remote request carries `on` and NO `caller`.
+ *
+ * `caller` is a BARE terminal name, resolved by the core that receives the
+ * request. The remote core never heard of this process's terminal, so the id is
+ * either unknown there or — worse — names an unrelated terminal on that machine.
+ * S1 sent it unconditionally; the pair `{on}` without `{caller}` is the fix, and
+ * the local row below pins that the local shape did not move.
+ */
+test("D2: a remote request sends `on` and never `caller`", async () => {
 	const h = harness(callerEnv());
 	try {
 		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget() }));
 		const params = h.client.paramsFor("terminal.run")[0];
 		assert.ok(params, "terminal.run must be called");
-		assert.equal(params.caller, TERMINAL_ID);
+		assert.equal(params.caller, undefined, "a parent terminal id does not exist on the other machine");
 		assert.equal(params.on, "vps");
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "caller", "cwd", "env", "labels", "name", "on"]);
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "env", "labels", "name", "on"]);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("D2: the LOCAL request keeps `caller` exactly as before", async () => {
+	const h = harness(callerEnv());
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root));
+		const params = h.client.paramsFor("terminal.run")[0];
+		assert.ok(params, "terminal.run must be called");
+		assert.equal(params.caller, TERMINAL_ID);
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "caller", "cwd", "env", "labels", "name"]);
 	} finally {
 		h.cleanup();
 	}
@@ -254,6 +276,8 @@ function hostTarget(overrides: Partial<HostTarget> = {}): HostTarget {
 		node: "node",
 		piCli: "pi",
 		pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }],
+		// S2: `resolveHostTarget` derives the tree root as a sibling of the checkout.
+		worktreeRoot: path.posix.join(path.posix.dirname(REMOTE_CWD), ".pi-worktrees"),
 		...overrides,
 	};
 }

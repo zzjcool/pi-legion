@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
@@ -62,7 +62,7 @@ function harness(prefix: string) {
 }
 
 function target(overrides: Partial<HostTarget> = {}): HostTarget {
-	return { host: HOST, cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], ...overrides };
+	return { host: HOST, cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], worktreeRoot: "/srv/.pi-worktrees", ...overrides };
 }
 
 /** Run `body` with the two hc env markers set (so `terminalHostAvailable` is true). */
@@ -135,15 +135,36 @@ test("D1: a host outside an hc terminal is refused (rpc/inprocess cannot leave t
 	}
 });
 
-test("D1: host + worktree:true is refused until S2, and says so", async () => {
+/**
+ * S2: `host` + `worktree: true` is now the SUPPORTED remote shape (contract D11).
+ *
+ * The arbitration has to say two things at once — "this child is worktree
+ * isolated" AND "the tree is not mine to create" — because only the terminal
+ * backend holds both the `hc` client and the resolved target. A local
+ * `createChildWorktree` here would build a checkout on THIS machine for a child
+ * that runs on another one, which is the "nobody delivers from it" shape S1
+ * refused.
+ */
+test("D1/S2: host + worktree:true reaches the terminal backend with createWorktree", async () => {
 	const h = harness("xm-guard-worktree-");
 	await insideHcTerminal(async () => {
 		try {
-			await assert.rejects(
-				() => h.orchestrator.launch({ agent: agent({ worktree: true }), task: "t", host: HOST, hostTarget: target(), worktree: true }),
-				expectRefusal(/S2/),
-			);
-			assert.equal(h.supervisor.calls.length, 0);
+			const handle = await h.orchestrator.launch({
+				agent: agent({ worktree: true }),
+				task: "t",
+				host: HOST,
+				hostTarget: target(),
+				worktree: true,
+			});
+			const spawn = h.supervisor.calls.find((call) => call.method === "spawnChild");
+			assert.ok(spawn, "the supervisor must receive a spawn");
+			assert.equal(spawn.input?.agent.spawnMode, "terminal");
+			assert.equal(spawn.input?.worktree, true, "the arbitrated worktree decision travels");
+			assert.equal(spawn.input?.createWorktree, true, "the BACKEND creates a remote tree");
+			assert.equal(spawn.input?.host, HOST);
+			assert.equal(handle.child.host, HOST);
+			// No local tree was created: the run dir holds no `worktrees/` entry.
+			assert.equal(existsSync(path.join(h.root, "run", "worktrees")), false);
 		} finally {
 			h.cleanup();
 		}
