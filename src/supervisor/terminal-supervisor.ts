@@ -495,10 +495,38 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// Anything else (`-e <plugin install>/index.ts`, `--skill <path>`) points
 				// at a file that is not in the checkout and is not mirrored, so rewriting
 				// it would hand the remote child a path to nothing. Refuse by name.
-				argv = [
-					target.node,
-					target.piCli,
-					...built.args.map((arg) => mapRemoteArgPath({
+				// Review M3: `inheritExtensions` is ON by default and the inherited set
+				// is a list of THIS machine's install paths (`.../node_modules/pi-lens/…`).
+				// They are neither in the checkout nor under a configured `pathMap`, so a
+				// strict sweep refuses every ordinary launch — the feature would be
+				// unusable in its default configuration. An extension that cannot be
+				// mapped simply cannot be loaded over there, so it is dropped WITH a
+				// notice (never silently), while any other unmappable argv path keeps the
+				// hard refusal below.
+				const droppedExtensions: string[] = [];
+				const mappedArgs: string[] = [];
+				for (let index = 0; index < built.args.length; index += 1) {
+					const arg = built.args[index] as string;
+					if (arg === "--extension" || arg === "-e") {
+						const value = built.args[index + 1];
+						if (typeof value === "string" && path.isAbsolute(value)) {
+							try {
+								mappedArgs.push(arg, mapRemoteArgPath({
+									arg: value,
+									host: target.host,
+									remoteCwd: remoteWorktree?.path ?? target.cwd,
+									remoteDir: remoteDirPath,
+									localCwd: input.cwd,
+									pathMap: target.pathMap,
+								}));
+							} catch {
+								droppedExtensions.push(value);
+							}
+							index += 1;
+							continue;
+						}
+					}
+					mappedArgs.push(mapRemoteArgPath({
 						arg,
 						host: target.host,
 						// A remote worktree child reads ITS tree, not the bare checkout:
@@ -508,9 +536,14 @@ export class TerminalSupervisor implements LegionSupervisor {
 						remoteDir: remoteDirPath,
 						localCwd: input.cwd,
 						pathMap: target.pathMap,
-					})),
-					task,
-				];
+					}));
+				}
+				if (droppedExtensions.length > 0) {
+					process.stderr.write(
+						`[pi-legion] host '${target.host}': ${droppedExtensions.length} extension(s) not loadable there (no pathMap entry maps them): ${droppedExtensions.join(", ")}. Add a prefix to subagents.crossMachine.hosts.${target.host}.pathMap if the child needs them.\n`,
+					);
+				}
+				argv = [target.node, target.piCli, ...mappedArgs, task];
 			} else {
 				// `node <cli.js> <same flags as rpc> <task>`: the interpreter is the one
 				// running this process, so the child never depends on `node` being on the

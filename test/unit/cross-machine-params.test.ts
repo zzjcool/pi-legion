@@ -276,6 +276,7 @@ function hostTarget(overrides: Partial<HostTarget> = {}): HostTarget {
 		node: "node",
 		piCli: "pi",
 		pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }],
+		piLegionRoot: REMOTE_LEGION_ROOT,
 		// S2: `resolveHostTarget` derives the tree root as a sibling of the checkout.
 		worktreeRoot: path.posix.join(path.posix.dirname(REMOTE_CWD), ".pi-worktrees"),
 		...overrides,
@@ -459,34 +460,67 @@ test("D6: a host with no resolved target is refused instead of half-crossing", a
 	}
 });
 
-test("D6: an argv path outside the checkout and outside every pathMap is refused by name", async () => {
-	// `-e <plugin install>/index.ts` is the real shape of this: the running
-	// plugin's path is neither in the checkout nor mirrored, so rewriting it by
-	// basename would point the remote child at nothing. The launch must fail and
-	// name where the operator has to add the mapping.
+test("D6: an unmappable argv path that is NOT an extension is still refused by name", async () => {
+	// Extensions have their own policy (review M3: dropped with a notice, because
+	// every host has a default inherited set that could never be mapped). Everything
+	// else keeps the hard rule: an absolute path that is neither in the checkout nor
+	// under a `pathMap` entry cannot be rewritten to a path that exists.
 	const h = harness(localEnv());
 	try {
 		const args = spawnInput(h.root, {
 			host: "vps",
-			// No pathMap at all, so the package entry (which every child's argv
-			// carries) has nowhere to go except the identity default.
 			hostTarget: hostTarget({ pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }] }),
 		});
-		// An agent extension that lives somewhere no mapping covers.
-		args.agent = { ...args.agent, extensions: ["/opt/thirdparty/ext/index.ts"] };
+		args.agent = { ...args.agent, skillPath: ["/opt/thirdparty/skill/SKILL.md"] };
 		await assert.rejects(
 			() => h.supervisor.spawnChild(args),
 			(error: unknown) => {
 				assert.ok(error instanceof SubagentError);
 				assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
 				const message = (error as SubagentError).message;
-				assert.match(message, /\/opt\/thirdparty\/ext\/index\.ts/);
+				assert.match(message, /\/opt\/thirdparty\/skill\/SKILL.md/);
 				assert.match(message, /pathMap/);
 				return true;
 			},
 		);
 		assert.equal(h.client.paramsFor("terminal.run").length, 0, "no terminal may be created");
 	} finally {
+		h.cleanup();
+	}
+});
+
+test("M3: an inherited-style extension that cannot be mapped is dropped with a notice, not refused", async () => {
+	// The default configuration inherits the HOST's extension install paths, which
+	// are never in the checkout and never in a pathMap. Refusing them made the whole
+	// feature unusable out of the box; dropping them silently would change what the
+	// child loads without saying so. The middle path is a loud drop.
+	const h = harness(localEnv());
+	const writes: string[] = [];
+	const original = process.stderr.write.bind(process.stderr);
+	process.stderr.write = ((chunk: unknown) => {
+		writes.push(String(chunk));
+		return true;
+	}) as typeof process.stderr.write;
+	try {
+		const args = spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget({ pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }] }),
+		});
+		args.agent = { ...args.agent, extensions: ["/root/.pi/agent/npm/node_modules/pi-lens/extensions/index.ts"] };
+		await h.supervisor.spawnChild(args);
+		const run = h.client.paramsFor("terminal.run")[0];
+		assert.ok(run, "the launch must proceed");
+		const argv = run.argv as string[];
+		assert.ok(
+			!argv.some((arg) => arg.includes("pi-lens")),
+			`the unmappable extension must not appear in the remote argv: ${argv.join(" ")}`,
+		);
+		assert.ok(
+			writes.some((line) => line.includes("not loadable there") && line.includes("pi-lens")),
+			`the drop must be announced: ${writes.join("")}`,
+		);
+	} finally {
+		process.stderr.write = original;
 		h.cleanup();
 	}
 });

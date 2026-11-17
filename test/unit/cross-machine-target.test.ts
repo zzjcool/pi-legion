@@ -30,6 +30,7 @@ import {
 	mirrorRemoteFile,
 	remoteDirFor,
 	remotePreflight,
+	remotePreflightScript,
 	resolveHostTarget,
 	thisPackageRoot,
 	type HcExecResult,
@@ -82,7 +83,7 @@ function config(
 
 function target(overrides: Partial<HostTarget> = {}): HostTarget {
 	// `worktreeRoot` is resolved by `resolveHostTarget` (S2: `dirname(cwd)/.pi-worktrees`).
-	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], worktreeRoot: "/srv/.pi-worktrees", ...overrides };
+	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], piLegionRoot: "/srv/pi-legion", worktreeRoot: "/srv/.pi-worktrees", ...overrides };
 }
 
 /** The package root, imported here so the fixture cannot drift from the resolver. */
@@ -151,12 +152,14 @@ test("D1: a valid entry resolves remote cwd/node/piCli, defaulting the two progr
 		node: "node",
 		piCli: "pi",
 		pathMap: [packageRoot],
+		// review M2: the package root is also what the preflight checks over there.
+		piLegionRoot: thisPackageRoot(),
 		// S2: remote trees live BESIDE the checkout (contract D11).
 		worktreeRoot: "/srv/.pi-worktrees",
 	});
 	assert.deepEqual(
 		resolveHostTarget("vps", config({ vps: { cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi" } })),
-		{ host: "vps", cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi", pathMap: [packageRoot], worktreeRoot: "/srv/.pi-worktrees" },
+		{ host: "vps", cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi", pathMap: [packageRoot], piLegionRoot: thisPackageRoot(), worktreeRoot: "/srv/.pi-worktrees" },
 	);
 	// An explicit mapping of the package root wins over `piLegionRoot`.
 	assert.deepEqual(
@@ -307,6 +310,23 @@ test("D6: exit 11/12/13 name the cwd, the node and the pi CLI respectively", asy
 		assert.equal((error as SubagentError).code, ErrorCodes.START_FAILED);
 		assert.match((error as SubagentError).message, item.pattern);
 	}
+
+	// Review M2: exit 14 is the package entry itself — the one absolute path every
+	// child's argv carries. Missing it means `pi` either fails to start or (worse)
+	// starts without the guard extension, so it is a named refusal, not a guess.
+	const missingPackage = new FakeRemoteClient();
+	missingPackage.on("machine.exec", () => execResult({ code: 14 }));
+	const error = await remotePreflight(missingPackage, target()).then(
+		() => undefined,
+		(thrownError: unknown) => thrownError,
+	);
+	assert.ok(error instanceof SubagentError);
+	assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+	assert.match((error as SubagentError).message, /this package is not installed at \/srv\/pi-legion on that machine/);
+	assert.match((error as SubagentError).message, /piLegionRoot/);
+
+	// And the script really asks: one `test -f` on `<piLegionRoot>/index.ts`.
+	assert.match(remotePreflightScript(target()), /test -f '\/srv\/pi-legion\/index\.ts' \|\| exit 14/);
 });
 
 test("D6: an unreachable core is reported as such, never as a missing cwd", async () => {

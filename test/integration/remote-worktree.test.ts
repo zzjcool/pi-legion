@@ -122,6 +122,11 @@ function harness(options: { remoteIsRepo?: boolean } = {}): Harness {
 		execFileSync("git", ["-C", remoteCwd, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "remote"]);
 	}
 
+	// Review M2: the preflight `test -f`s this package's entry on that machine,
+	// because every child's argv loads it. The "operator" installed it here.
+	mkdirSync(path.join(remoteCwd, ".pi-legion"), { recursive: true });
+	writeFileSync(path.join(remoteCwd, ".pi-legion", "index.ts"), "// fake remote install\n");
+
 	const binDir = path.join(root, "bin");
 	mkdirSync(binDir, { recursive: true });
 	const wrapper = path.join(binDir, "hc");

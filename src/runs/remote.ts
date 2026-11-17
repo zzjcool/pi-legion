@@ -234,6 +234,16 @@ export interface HostTarget {
 	/** Prefix translations for argv paths outside the checkout, longest first. */
 	pathMap: HostPathMapEntry[];
 	/**
+	 * Where this package lives on that machine (review M2).
+	 *
+	 * `buildPiArgs` puts this package's extension entry into EVERY child's argv, so
+	 * a remote launch always names one absolute path over there. The identity
+	 * default ("same path as here") is a guess, and a guess that is wrong either
+	 * fails at `pi` start-up or, worse, runs a child without the guard extension.
+	 * The preflight therefore `test -f`s this file and names it when missing.
+	 */
+	piLegionRoot: string;
+	/**
 	 * Directory (absolute, posix, ON that machine) that holds remote child
 	 * worktrees (contract D11/D12).
 	 *
@@ -315,6 +325,9 @@ export function resolveHostTarget(
 		node: nonEmpty(entry.node) ?? DEFAULT_REMOTE_NODE,
 		piCli: nonEmpty(entry.piCli) ?? DEFAULT_REMOTE_PI,
 		pathMap: resolvePathMap(name, entry.pathMap, entry.piLegionRoot),
+		piLegionRoot: typeof entry.piLegionRoot === "string" && entry.piLegionRoot.trim().length > 0
+			? entry.piLegionRoot.trim()
+			: thisPackageRoot(),
 		worktreeRoot: resolveWorktreeRoot(name, cwd, entry.worktreeRoot),
 	};
 }
@@ -485,6 +498,10 @@ export function remotePreflightScript(target: HostTarget): string {
 		`cd -- ${shQuote(target.cwd)} || { printf '%s\\n' ${shQuote(`cwd ${target.cwd} is not a directory`)} >&2; exit 11; }`,
 		`command -v ${shQuote(target.node)} >/dev/null 2>&1 || exit 12`,
 		`command -v ${shQuote(target.piCli)} >/dev/null 2>&1 || exit 13`,
+		// Review M2: this is the one absolute path EVERY child's argv carries. If it
+		// is missing the child either fails to start or starts without the guard
+		// extension -- the second is the silent failure, so it is checked here.
+		`test -f ${shQuote(path.posix.join(target.piLegionRoot, "index.ts"))} || exit 14`,
 	].join(" ; ");
 }
 
@@ -552,6 +569,13 @@ export async function remotePreflight(
 			`host '${target.host}': pi CLI '${target.piCli}' is not on PATH on ${target.host} (set subagents.crossMachine.hosts.${target.host}.piCli to a path on that machine)`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, piCli: target.piCli },
+		);
+	}
+	if (code === 14) {
+		throw new SubagentError(
+			`host '${target.host}': this package is not installed at ${target.piLegionRoot} on that machine (every child's argv loads ${path.posix.join(target.piLegionRoot, "index.ts")}; set subagents.crossMachine.hosts.${target.host}.piLegionRoot to where it really is, or install it there)`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: target.host, piLegionRoot: target.piLegionRoot },
 		);
 	}
 	throw new SubagentError(
