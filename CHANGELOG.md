@@ -11,6 +11,27 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [6.1.1] — 2026-11-17
+
+修跨机器派发不可用：`hosts.<h>.piExtensions` 曾被 settings 白名单静默丢弃，导致 provider 扩展
+进不了 child argv（远端 child 报 `No API key`）。启动探测改为 `--list-models` 式（不依赖凭据），
+四类拒绝都附可复制命令行与目标机实际模型；`/legion doctor` 共用同一解析。
+
+**这不是行为变更，是让 6.1.0 宣称的跨机能力真正可用。** 不设 `host` 的本地路径与协议形状
+逐字节不变；变化只发生在跨机启动前的配置解析与探测。
+
+### Fixed
+
+- `parseCrossMachine` 现在解析 `piExtensions` / `worktreeRoot`：此前两者被白名单静默丢弃，按报错或
+  runbook 配好 provider 扩展也不会进 child argv。绝对路径校验仍在 `resolvePiExtensions` /
+  `resolveWorktreeRoot`（load 判 shape，use 判远端路径）。
+- 启动探测从 `-p ping` 改为 `--list-models`：期望的 model 可见即放行，不再因为另一个 provider 的
+  `No API key` 误判；列表非空但没有该 model 时新增 `model-missing` 分类；pi 明确
+  `Using custom model id` 时放行。
+- no-model / conflict / model-missing / exit-code 四类拒绝都附可复制的原命令行
+  （`Command (run on '<host>' to reproduce):`），model-missing 还会列出目标机实际可用的前 5 个 model。
+- runbook 修正 provider 扩展示例路径为 `.../pi-any-endpoint/extensions/index.ts`。
+
 ## [6.1.0] — 2026-11-17
 
 一次**跨机器**的发布：子 agent 可以跑在另一台机器上（`hc` 的 ssh 远端），而这台机器只负责
