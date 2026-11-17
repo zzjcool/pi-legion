@@ -1062,6 +1062,15 @@ export function resolveSubagentSettings(
 	if (project.modelScope !== undefined)
 		out.modelScope = project.modelScope as ModelScopeConfig;
 
+	// cross-machine (contract `cross-machine-spawn-v1` D1/D6): the host table is
+	// PROJECT-shaped — `hosts.<name>.cwd` is a path on another machine for THIS
+	// repository, and `pathMap` translates THIS checkout's prefixes. Dropping the
+	// project block (the whitelist default) made the only place that can sensibly
+	// configure a host silently unusable, and the settings file that carried it
+	// look accepted. Project wins wholesale: a half-merged `hosts` map would let a
+	// user-level `enabled` pair with a project's host entry by accident.
+	if (project.crossMachine !== undefined) out.crossMachine = project.crossMachine;
+
 	if (project.agentOverrides) {
 		out.agentOverrides = {
 			...(user.agentOverrides ?? {}),

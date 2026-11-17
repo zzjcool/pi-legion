@@ -828,3 +828,89 @@ test("#123: a resume from a SYNTHESIZED record sends no pin — it never guesses
 		h.cleanup();
 	}
 });
+
+// ── cross-machine review B2: resume is the supported recovery ──────────────
+
+test("B2: `resume` on a child that ran on another host relaunches THERE instead of being refused", async () => {
+	// The guard used to reject EVERY revive of a remote child, including `resume`
+	// — while its own message told the caller to use `resume`. The only supported
+	// recovery was unreachable from the tool. This drives the real action and
+	// asserts the relaunch carries the recorded host and target.
+	const h = harness("xm-b2-resume-");
+	// The host table is PROJECT-shaped (`hosts.<name>.cwd` is a path on another
+	// machine for THIS repository), so it exists before the session boots — the
+	// subagent tool snapshots settings at registration.
+	mkdirSync(path.join(h.repo, ".pi"), { recursive: true });
+	writeFileSync(path.join(h.repo, ".pi", "settings.json"), JSON.stringify({
+		subagents: { crossMachine: { enabled: true, hosts: { vps: { cwd: "/srv/app", piCli: "pi" } } } },
+	}));
+	h.boot();
+	const previousEnv = new Map(["HC_TERMINAL_SOCKET", "HC_TERMINAL_ID"].map((name) => [name, process.env[name]]));
+	try {
+		await h.launchTeam("build the thing");
+
+		// Make the recorded child a cross-machine one, as a real launch would.
+		const child = h.supervisor.calls.find((call) => call.method === "spawnChild");
+		assert.ok(child, "the team launch must have spawned a child");
+		const childName = child.name;
+		const runId = h.rootRun().runId;
+		const runPath = path.join(h.repo, ".pi-subagents", "runs", runId, "run.json");
+		const run = JSON.parse(readFileSync(runPath, "utf8")) as { children?: Array<Record<string, unknown>> };
+		const record = run.children?.find((entry) => entry.name === childName);
+		assert.ok(record, `the run record must hold ${childName}`);
+		record.host = "vps";
+		record.worktreePath = "/srv/app/.pi-worktrees/" + childName;
+		record.worktreeHost = "vps";
+		writeFileSync(runPath, JSON.stringify(run));
+
+		// Dead, so `resume` takes the relaunch branch rather than steering in place.
+		for (const name of [...h.supervisor.children.keys()]) await h.supervisor.retire(name).catch(() => {});
+		// Inside an hc terminal, which a cross-machine launch requires.
+		process.env.HC_TERMINAL_SOCKET = "/tmp/hc-b2/default.sock";
+		process.env.HC_TERMINAL_ID = "t1k";
+		h.supervisor.calls.length = 0;
+
+		const result = await h.call({ action: "resume", name: childName, message: "keep going" });
+		const text = JSON.stringify(result);
+		assert.doesNotMatch(text, /cannot restart it/, "resume must not hit the continue guard");
+		const relaunched = h.supervisor.calls.find((call) => call.method === "spawnChild");
+		assert.ok(relaunched, `resume must relaunch the child: ${text.slice(0, 400)}`);
+		assert.equal(relaunched.input?.host, "vps", "the recorded host must be replayed");
+		assert.equal(relaunched.input?.hostTarget?.cwd, "/srv/app", "the target must be re-resolved");
+		assert.equal(relaunched.input?.worktreePath, "/srv/app/.pi-worktrees/" + childName, "the stored tree is reused, not recreated");
+	} finally {
+		for (const [name, value] of previousEnv) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+		await h.shutdown();
+		rmSync(h.root, { recursive: true, force: true });
+	}
+});
+
+test("B2: `continue` on a dead remote child is still refused, and says which action to use", async () => {
+	const h = harness("xm-b2-continue-");
+	h.boot();
+	try {
+		await h.launchTeam("build the thing");
+		const child = h.supervisor.calls.find((call) => call.method === "spawnChild");
+		assert.ok(child);
+		const runId = h.rootRun().runId;
+		const runPath = path.join(h.repo, ".pi-subagents", "runs", runId, "run.json");
+		const run = JSON.parse(readFileSync(runPath, "utf8")) as { children?: Array<Record<string, unknown>> };
+		const record = run.children?.find((entry) => entry.name === child.name);
+		assert.ok(record);
+		record.host = "vps";
+		writeFileSync(runPath, JSON.stringify(run));
+		// Dead: nothing live under that name in this process.
+		for (const name of [...h.supervisor.children.keys()]) await h.supervisor.retire(name).catch(() => {});
+
+		const result = await h.call({ action: "continue", name: child.name, message: "go on" });
+		const text = JSON.stringify(result);
+		assert.match(text, /cannot restart it/);
+		assert.match(text, /Use resume/, "the refusal names the supported action");
+	} finally {
+		await h.shutdown();
+		rmSync(h.root, { recursive: true, force: true });
+	}
+});

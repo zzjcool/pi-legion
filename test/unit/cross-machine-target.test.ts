@@ -35,7 +35,7 @@ import {
 	type HcExecResult,
 	type HostTarget,
 } from "../../src/runs/remote.ts";
-import { parseSubagentSettings } from "../../src/agents/settings.ts";
+import { parseSubagentSettings, resolveSubagentSettings } from "../../src/agents/settings.ts";
 import { ErrorCodes, SubagentError, type SubagentsSettings } from "../../src/shared/types.ts";
 
 // ── fixtures ───────────────────────────────────────────────────────────────
@@ -424,4 +424,29 @@ test("S1: a malformed crossMachine block is rejected at load, a missing one is s
 		() => parseSubagentSettings({ subagents: { crossMachine: { hosts: { vps: { cwd: 42 } } } } }, "/tmp/settings.json"),
 		/crossMachine\.hosts\.vps\.cwd/,
 	);
+});
+
+test("B2: a PROJECT-level crossMachine block survives the merge (host config is project-shaped)", () => {
+	// `resolveSubagentSettings` is a whitelist. Before this, a project that
+	// configured `subagents.crossMachine` had it silently dropped — and the host
+	// table is exactly the setting that belongs in a project (its `cwd` is a path
+	// on another machine for THIS repository).
+	const project = parseSubagentSettings({
+		subagents: { crossMachine: { enabled: true, hosts: { vps: { cwd: "/srv/app", piCli: "/opt/pi/bin/pi" } } } },
+	}, "/proj/.pi/settings.json");
+	const merged = resolveSubagentSettings(parseSubagentSettings({}, "/user/settings.json"), project);
+	assert.deepEqual(merged.crossMachine, { enabled: true, hosts: { vps: { cwd: "/srv/app", piCli: "/opt/pi/bin/pi" } } });
+
+	// A user-level block still comes through when the project says nothing.
+	const user = parseSubagentSettings({
+		subagents: { crossMachine: { enabled: true, hosts: { a: { cwd: "/a" } } } },
+	}, "/user/settings.json");
+	assert.deepEqual(resolveSubagentSettings(user, parseSubagentSettings({}, "/p.json")).crossMachine, user.crossMachine);
+
+	// Project wins wholesale: no half-merged host table can pair a user `enabled`
+	// with a project's host entry by accident.
+	const overridden = resolveSubagentSettings(user, parseSubagentSettings({
+		subagents: { crossMachine: { enabled: false } },
+	}, "/p.json"));
+	assert.deepEqual(overridden.crossMachine, { enabled: false });
 });

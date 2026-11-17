@@ -3594,6 +3594,12 @@ interface ChildContext {
 	cwd: string;
 	agents: AgentConfig[];
 	allAgents: AgentConfig[];
+	/**
+	 * Resolved settings for THIS call (already spread in from the tool input).
+	 * `reviveChild` reads `crossMachine` off it to re-resolve a remote child's
+	 * target, so a `resume` really relaunches on that machine (D17 / review B2).
+	 */
+	settings: ReturnType<typeof loadSubagentSettings>;
 	found: NonNullable<ReturnType<typeof findChild>>;
 	orchestrator: Orchestrator;
 	runtime: SessionRuntime;
@@ -4300,17 +4306,20 @@ async function reviveChild(
 ): Promise<AgentToolResult<unknown>> {
 	const { action, params, supervisor, name, found, orchestrator } = ctx;
 
-	// D17 (`cross-machine-spawn-v1`): `continue` on a child that ran on another
-	// machine is the one control action this version does NOT support. Its
-	// session JSONL lives over there, so a revival here would either run the work
-	// on the wrong machine or start a new turn from a transcript nobody can read —
-	// both are silent lies of the kind D1 refuses for launches. `resume` is
-	// different (it RELAUNCHES on that machine, see `resumeLegionChild`), and the
-	// message says so instead of only refusing.
+	// D17 (`cross-machine-spawn-v1`, review B2): the two actions mean different
+	// things and are refused for different reasons.
+	//
+	//   `continue` on a DEAD remote child would fall through to `orchestrator.launch`
+	//   with no host — a local relaunch of work that belongs to another machine, the
+	//   silent lie D1 refuses. A LIVE one is fine: `steer` addresses the terminal as
+	//   `host/name`, so the prompt really lands over there.
+	//   `resume` is the SUPPORTED recovery (D17): it relaunches on that machine, and
+	//   the host is replayed below. Refusing it here was the bug — the message even
+	//   told the caller to use it, and the only caller that could was the postman.
 	const recordHost = normalizeHost(found.child.host);
-	if (recordHost !== undefined) {
+	if (recordHost !== undefined && action === "continue" && !supervisor.isAlive(name)) {
 		return fail(
-			`child '${name}' ran on host '${recordHost}'; cross-machine continue is not supported (resume relaunches on that machine, see D17)`,
+			`child '${name}' ran on host '${recordHost}' and is no longer live; cross-machine continue cannot restart it (the transcript is on that machine). Use resume, which relaunches it there (D17).`,
 			ErrorCodes.INVALID_PARAMS,
 		);
 	}
@@ -4397,12 +4406,22 @@ async function reviveChild(
 			pinned && ctx.modelRegistry && !ctx.modelRegistry.getAll().some((entry) => entry.provider === pinned)
 				? undefined
 				: pinned;
+		// D17 (review B2): a resume of a cross-machine child relaunches ON that
+		// machine. The target is resolved here, at the one place that knows the
+		// recorded host, and the worktree is named so the backend reuses the tree
+		// the child already has instead of creating a second one.
+		const resumeTarget = recordHost !== undefined
+			? resolveHostTarget(recordHost, ctx.settings.crossMachine)
+			: undefined;
 		const handle = await orchestrator.launch({
 			agent: agentDef,
 			task: params.message,
 			name,
 			...(revivedModel ? { model: revivedModel } : {}),
 			...(revivedProvider ? { modelProvider: revivedProvider } : {}),
+			...(resumeTarget ? { host: resumeTarget.host, hostTarget: resumeTarget } : {}),
+			...(resumeTarget && found.child.worktreePath ? { worktreePath: found.child.worktreePath } : {}),
+			...(resumeTarget ? { worktree: Boolean(found.child.worktreePath) } : {}),
 			// `preset` is NOT expanded on a revive, on purpose: the child resumes the
 			// model it was persisted with, so a later settings edit cannot move a
 			// session that is already in flight.
