@@ -272,6 +272,12 @@ export interface SessionRuntimeDeps {
 	/** Injectable timer for the MAX_PENDING_AGE_MS horizon (tests fire it manually); default = unref'd setTimeout. */
 	scheduleNoticeOverflow?: (ms: number, fn: () => void) => JoinSchedulerHandle;
 	/**
+	 * Injectable timer for the `agent_end` → settle fallback (tests fire it manually);
+	 * default = unref'd setTimeout. Kept separate from `scheduleNoticeOverflow` so a
+	 * test can drive the horizon and the fallback independently.
+	 */
+	scheduleSettleFallback?: (ms: number, fn: () => void) => JoinSchedulerHandle;
+	/**
 	 * The ledger handle plus the consumer id (`parent_id`) the runtime asks about — or
 	 * `undefined` when this host has neither.
 	 *
@@ -345,6 +351,30 @@ const DEFAULT_ORPHAN_STALE_MS = 90_000;
  * completion notice has been held, and it sends nothing.
  */
 export const MAX_PENDING_AGE_MS = 80_000;
+/**
+ * Grace period after `agent_end` before the outbox releases a held notice on its own.
+ *
+ * D1 makes a run boundary the only delivery moment, and `agent_settled` is that
+ * boundary. But `agent_settled` is only guaranteed for a run the host finishes
+ * normally: an aborted/ESC'd turn, a session that goes away, or a settle whose
+ * emission never completes leaves `parentRunActive` stuck at `true`, and every
+ * notice held behind it has no boundary left to arrive at (observed: a child
+ * retired at 03:25:30 and the parent never received the notice at all; the user
+ * only found the result by polling `subagent status`).
+ *
+ * So `agent_end` arms this one-shot fallback. It is deliberately NOT a second
+ * delivery moment in the normal path: `agent_settled` follows `agent_end`
+ * immediately and cancels the timer, so the common case still delivers exactly at
+ * the settle boundary. The fallback only fires when no settle arrived within the
+ * grace period, i.e. when the notice would otherwise be stranded forever.
+ *
+ * It cannot break "one waking message per boundary": the fallback reuses
+ * `flushOutbox`, whose `if (item.triggerTurn) break` stop condition is untouched
+ * (D2). 2s is a grace, not a deadline: a compaction or a slow settle handler
+ * still wins the race, and the fallback then finds `parentRunActive === false`
+ * and does nothing.
+ */
+export const SETTLE_FALLBACK_MS = 2_000;
 /** Fallback per-child timeout for wait(); index.ts passes the role value. */
 const DEFAULT_WAIT_TIMEOUT_MS = DEFAULTS.turnTimeoutMs;
 
@@ -765,6 +795,12 @@ export interface SessionRuntime {
 	setJoinConfig(config: JoinConfig): void;
 	/** Parent agent run started (pi `agent_start`): hold completion notices until settle (D-A/D-C). */
 	notifyParentRunStart(): void;
+	/**
+	 * Parent run ended for a turn (pi `agent_end`): arm the settle fallback so a later
+	 * abort/session-loss cannot strand held notices. No-op when nothing is held, and
+	 * cancelled by `notifyParentSettled` in the normal path.
+	 */
+	notifyParentRunEnd(): void;
 	/** Parent agent run settled (pi `agent_settled`): deliver the oldest held notice (and any `triggerTurn:false` one behind it), then repaint (D-A/D-D/D2). */
 	notifyParentSettled(): void;
 	/** Introspection seam for tests/doctor: deferred-notice queue state (D-B/D6 health). */
@@ -957,6 +993,25 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	// (`runId\0name\0round`): the round is what makes a child's SECOND round a
 	// different result rather than a repeat of the first (D1).
 	const deliveredOnce = new Set<string>();
+	/**
+	 * Terminal results the PARENT ALREADY TOOK through the `wait` channel.
+	 *
+	 * "A terminal state is announced to exactly one consumer" — either `wait` hands the
+	 * result to the parent, or the completion notice wakes it up, never both. The ledger
+	 * already enforces this for results that carry an `artifactId` (`markRead` → the
+	 * projection's `undeliveredIds`), but the degraded paths (no ledger handle, no
+	 * artifact row) only had `deliveredOnce` — a memory of what was SENT, with no notion
+	 * of what was already COLLECTED. There the parent could poll `wait`, get the text,
+	 * and still be woken minutes later by a notice for the same result (observed noise:
+	 * +138s and +85s).
+	 *
+	 * This is that missing latch, and it is deliberately the narrow one: only `wait`
+	 * writes it, because only `wait` is guaranteed to have handed the text to the
+	 * caller. `collect` declares its own read to the ledger (`markLedgerReads`), and
+	 * `status` never reads the result body at all — latching on either would delete the
+	 * only delivery of content the parent has not actually received.
+	 */
+	const consumedByControl = new Set<string>();
 
 	/**
 	 * The env switch D11 introduced for the shadow, kept for the one diagnostic D4 still
@@ -1049,6 +1104,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		projection: LedgerProjection | undefined,
 		artifactId?: string,
 	): boolean => {
+		// Latch first: a result the parent already took through `wait` owes no notice,
+		// whatever the artifact/ledger situation is.
+		if (consumedByControl.has(reportKey(runId, name, round))) return false;
 		if (deliveredOnce.has(reportKey(runId, name, round))) return false;
 		if (artifactId === undefined || !projection) return !deliveredOnce.has(reportKey(runId, name, round));
 		if (!projection.knownIds.has(artifactId)) {
@@ -1277,6 +1335,15 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const outbox: QueuedNotice[] = [];
 	let outboxTimer: JoinSchedulerHandle | undefined;
 	let heldOverCap = 0;
+	/**
+	 * One-shot `agent_end` → settle fallback (SETTLE_FALLBACK_MS). Cancelled by the
+	 * settle boundary it races against, and by a new run start.
+	 */
+	let settleFallbackTimer: JoinSchedulerHandle | undefined;
+	const cancelSettleFallback = (): void => {
+		settleFallbackTimer?.cancel();
+		settleFallbackTimer = undefined;
+	};
 
 	/**
 	 * D6: the oldest held batch that can still produce a message.
@@ -1602,7 +1669,12 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		}
 	};
 
+	const stillReachable = (name: string): boolean => jobs.get(name)?.watching !== false;
 	const join = new JoinCoordinator({
+		// A tracked-but-never-watched job (a utility child) cannot reach `onTerminal`,
+		// so waiting for it is waiting for an entry that cannot come. Unknown names
+		// stay reachable (the conservative default) — see `JoinCoordinatorDeps`.
+		stillReachable,
 		deliver: (batch) => {
 			if (disposed) return;
 			const first = batch[0];
@@ -2822,7 +2894,33 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		},
 
 		notifyParentRunStart() {
+			// A new run took the boundary before the fallback could: the notice it would
+			// have released belongs to this run's boundary now.
+			cancelSettleFallback();
 			parentRunActive = true;
+		},
+
+		notifyParentRunEnd() {
+			// Nothing held ⇒ no timer at all (the common idle-end case).
+			if (disposed || !parentRunActive || outbox.length === 0) return;
+			if (settleFallbackTimer) return;
+			let live = true;
+			const schedule = deps.scheduleSettleFallback ?? defaultNoticeOverflow;
+			settleFallbackTimer = schedule(SETTLE_FALLBACK_MS, () => {
+				if (!live) return;
+				live = false;
+				settleFallbackTimer = undefined;
+				// `agent_settled` won the race, a new run started, or the runtime is gone:
+				// the boundary is not ours to take.
+				if (disposed || !parentRunActive) return;
+				// The settle boundary never arrived (aborted run, torn-down session). Take
+				// the boundary this notice would otherwise never get. `flushOutbox` still
+				// stops after the first `triggerTurn` notice (D2), so this is one waking
+				// message, exactly like a settle.
+				parentRunActive = false;
+				flushOutbox();
+				refreshUi();
+			});
 		},
 
 		publishRunActivity(nodeId: string) {
@@ -2839,6 +2937,8 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		},
 
 		notifyParentSettled() {
+			// The real boundary arrived: the fallback must not also fire.
+			cancelSettleFallback();
 			parentRunActive = false;
 			flushOutbox();
 			refreshUi();
@@ -2882,11 +2982,37 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		},
 
 		async wait(names, opts = {}) {
-			return Promise.all(
+			// Capture the origin stamp BEFORE waiting: a child that settles during the wait is
+			// released from `jobs` immediately, so sniffing it afterwards would find nothing
+			// and the latch below would silently never fire.
+			const identities = new Map<string, { runId: string; round: number }>();
+			for (const name of names) {
+				const job = jobs.get(name);
+				if (job) {
+					identities.set(name, { runId: job.runId, round: job.round });
+					continue;
+				}
+				const entry = finished.get(name);
+				if (entry) identities.set(name, { runId: entry.runId, round: entry.round });
+			}
+			const results = await Promise.all(
 				names.map((name) =>
 					waitOne(name, opts.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS, opts.signal),
 				),
 			);
+			// The wait channel just handed these results to the parent. Latch the terminal
+			// ones so the completion notice does not wake it up again for the same text
+			// (one consumer per terminal state).
+			for (const result of results) {
+				const snapshot = result.snapshot;
+				if (!snapshot || snapshot.blocked) continue;
+				if (snapshot.execution.status === "running") continue;
+				const identity = identities.get(result.name);
+				if (identity) {
+					consumedByControl.add(reportKey(identity.runId, result.name, identity.round));
+				}
+			}
+			return results;
 		},
 
 		drainBeforeShutdown() {
@@ -2927,6 +3053,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			// D4: the degraded-path memory is session state — `dispose()` is the end of this
 			// runtime's delivery authority, not a boundary that may leak into a successor.
 			deliveredOnce.clear();
+			consumedByControl.clear();
 			unknownArtifactReported.clear();
 			roundOfName.clear();
 			join.dispose();
@@ -2935,6 +3062,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			// cache does NOT survive — it was cleared two statements up.
 			outboxTimer?.cancel();
 			outboxTimer = undefined;
+			// SETTLE_FALLBACK_MS: a teardown is not a delivery moment either. The child's
+			// session file still holds the result, so `collect` can recover it from disk.
+			cancelSettleFallback();
 			outbox.length = 0;
 			if (timer) clearInterval(timer);
 			timer = undefined;

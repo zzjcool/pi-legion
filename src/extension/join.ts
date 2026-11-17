@@ -73,6 +73,22 @@ export interface JoinCoordinatorDeps {
 	schedule?: (ms: number, fn: () => void) => JoinSchedulerHandle;
 	/** The single flush exit: the runtime wraps its completion delivery. */
 	deliver: (entries: Array<JoinEntry & { status: CompletionStatus }>) => void;
+	/**
+	 * Can this pending member still produce a terminal that lands in THIS batch?
+	 *
+	 * Default `true`, i.e. the pre-existing behaviour. The runtime answers from the
+	 * tracked job (`watching === true`): a utility child is tracked into the group
+	 * but never watched, so it never reaches `onTerminal` and can never contribute
+	 * an entry — yet as a `pending` member it used to hold every sibling's batch
+	 * open for the whole window. That was the structural half of a measured +32.2s
+	 * (retire 03:26:39.801 → notice 03:27:12.050): a lone async scout that had no
+	 * siblings still waited out the window because an unwatched job sat in `pending`.
+	 *
+	 * A member that is merely not watched YET still answers `true` here: an async
+	 * launch calls `track` + `watch` in the same turn, so by the time a sibling is
+	 * terminal the watch exists.
+	 */
+	stillReachable?: (name: string) => boolean;
 }
 
 /** Terminal entries already prepared with their coarse status. */
@@ -101,12 +117,14 @@ export class JoinCoordinator {
 	private readonly groupOf = new Map<string, string>();
 	private readonly scheduleFn: NonNullable<JoinCoordinatorDeps["schedule"]>;
 	private readonly deliverFn: JoinCoordinatorDeps["deliver"];
+	private readonly stillReachableFn: NonNullable<JoinCoordinatorDeps["stillReachable"]>;
 	private disposed = false;
 
 	constructor(deps: JoinCoordinatorDeps) {
 		this.config = defaultJoinConfig();
 		this.scheduleFn = deps.schedule ?? defaultSchedule;
 		this.deliverFn = deps.deliver;
+		this.stillReachableFn = deps.stillReachable ?? (() => true);
 	}
 
 	setConfig(config: JoinConfig): void {
@@ -161,8 +179,10 @@ export class JoinCoordinator {
 		}
 		group.pending.delete(entry.name);
 		group.buffered.push(buffered);
-		if (group.pending.size === 0) {
-			// Everyone is home: deliver the whole batch immediately.
+		if (this.unreachablePending(group) === 0) {
+			// Everyone that could still report is home: deliver the batch immediately.
+			// Waiting out the window here would be pure latency — nothing left to batch
+			// with — which is exactly how a lone async child ended up +10s late.
 			this.flush(entry.runId);
 			return;
 		}
@@ -177,7 +197,21 @@ export class JoinCoordinator {
 	allSettled(runId: string): boolean {
 		const group = this.groups.get(runId);
 		if (!group) return true;
-		return group.pending.size === 0;
+		return this.unreachablePending(group) === 0;
+	}
+
+	/**
+	 * Pending members that could STILL contribute an entry. Members the runtime
+	 * reports as unreachable (a tracked-but-never-watched utility child) are not
+	 * worth waiting for; they are left in `pending` so a later `watch()` that re-arms
+	 * them still finds them registered.
+	 */
+	private unreachablePending(group: Group): number {
+		let live = 0;
+		for (const name of group.pending) {
+			if (this.stillReachableFn(name)) live += 1;
+		}
+		return live;
 	}
 
 	/** Cancel every timer and drop all state (runtime.dispose). */
@@ -213,7 +247,7 @@ export class JoinCoordinator {
 		const batch = group.buffered;
 		group.buffered = [];
 		this.deliverFn(batch);
-		if (group.pending.size === 0 && group.buffered.length === 0) {
+		if (this.unreachablePending(group) === 0 && group.buffered.length === 0) {
 			this.dropGroup(runId, group);
 		}
 	}

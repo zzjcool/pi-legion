@@ -9,6 +9,7 @@ import {
 	lastJsonlEventAgeMs,
 	MAX_PENDING_AGE_MS,
 	renderLiveChildStatus,
+	SETTLE_FALLBACK_MS,
 	shouldRecycleAfterCollect,
 } from "../../src/extension/runtime.ts";
 import { collectChild } from "../../index.ts";
@@ -2120,6 +2121,296 @@ test("T1: runtime — a completion during the parent run is held until agent_set
 	runtime.dispose();
 });
 
+/** Manual settle-fallback timer: the test fires it itself (never a real 2s wait). */
+function manualSettleFallback() {
+	const timers: Array<{ ms: number; fn: () => void; canceled: boolean }> = [];
+	const scheduleSettleFallback = (ms: number, fn: () => void) => {
+		const slot = { ms, fn, canceled: false };
+		timers.push(slot);
+		return {
+			cancel: () => {
+				slot.canceled = true;
+			},
+		};
+	};
+	return { timers, scheduleSettleFallback };
+}
+
+test("T1b: runtime — an aborted parent run still delivers the held notice via the agent_end fallback", async () => {
+	const messages: unknown[] = [];
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const fallback = manualSettleFallback();
+	const runtime = createSessionRuntime({
+		sendMessage(message, options) {
+			messages.push({ message, options });
+		},
+		now: () => 1_000,
+		scheduleSettleFallback: fallback.scheduleSettleFallback,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "orphan",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/orphan.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("orphan");
+	resolveCollect(joinSnapshot({ output: "orphan output" }));
+
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held in the outbox");
+	assert.equal(messages.length, 0, "a live parent run holds the notice");
+
+	// `agent_end` fires, `agent_settled` never does: this is the abort/ESC shape.
+	runtime.notifyParentRunEnd();
+	assert.equal(fallback.timers.length, 1, "agent_end arms exactly one fallback");
+	assert.equal(fallback.timers[0]?.ms, SETTLE_FALLBACK_MS);
+	assert.equal(messages.length, 0, "arming the fallback delivers nothing by itself");
+
+	// The grace period expires with no settle in sight.
+	fallback.timers[0]!.fn();
+
+	assert.equal(messages.length, 1, "the fallback releases the stranded notice");
+	const sent = messages[0] as {
+		message: { customType: string; content: string };
+		options: { triggerTurn: boolean; deliverAs: string };
+	};
+	assert.equal(sent.message.customType, SUBAGENT_NOTIFY_TYPE);
+	assert.equal(sent.options.triggerTurn, true);
+	assert.match(sent.message.content, /orphan output/);
+	assert.equal(runtime.noticeQueueStats().pending, 0, "outbox drained by the fallback");
+	runtime.dispose();
+});
+
+test("T1c: runtime — agent_settled cancels the fallback, so a normal run delivers exactly one notice", async () => {
+	const messages: unknown[] = [];
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const fallback = manualSettleFallback();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => 1_000,
+		scheduleSettleFallback: fallback.scheduleSettleFallback,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "normal",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/normal.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("normal");
+	resolveCollect(joinSnapshot({ output: "normal output" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+
+	runtime.notifyParentRunEnd();
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 1, "the settle boundary delivers the notice");
+	assert.equal(fallback.timers[0]?.canceled, true, "settle cancelled the fallback");
+
+	// A cancelled-but-still-invoked timer (a zombie queued before the cancel landed)
+	// must be a strict no-op instead of a second delivery.
+	fallback.timers[0]!.fn();
+	assert.equal(messages.length, 1, "the cancelled fallback must not deliver twice");
+	runtime.dispose();
+});
+
+test("T1d: runtime — no fallback timer when nothing is held, and a new run cancels a stale one", async () => {
+	const messages: unknown[] = [];
+	const fallback = manualSettleFallback();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => 1_000,
+		scheduleSettleFallback: fallback.scheduleSettleFallback,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.notifyParentRunEnd();
+	assert.equal(fallback.timers.length, 0, "an empty outbox arms no timer");
+
+	// A held notice, then the parent starts ANOTHER run before the grace expires.
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	runtime.track({
+		name: "again",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/again.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("again");
+	resolveCollect(joinSnapshot({ output: "again output" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+	runtime.notifyParentRunEnd();
+	assert.equal(fallback.timers.length, 1);
+	runtime.notifyParentRunStart();
+	assert.equal(fallback.timers[0]?.canceled, true, "a new run cancels the stale fallback");
+	assert.equal(messages.length, 0, "nothing was delivered into the new run");
+	runtime.dispose();
+});
+
+test("T3a: runtime — a lone child's completion reaches the host in under 1s", async () => {
+	const messages: unknown[] = [];
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+	});
+
+	runtime.track({
+		name: "lone",
+		runId: "r-1",
+		agent: "scout",
+		sessionFile: "/tmp/lone.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("lone");
+
+	const startedAt = Date.now();
+	resolveCollect(joinSnapshot({ output: "lone output" }));
+	await waitFor(() => messages.length === 1, "the lone child's notice is delivered");
+	const elapsed = Date.now() - startedAt;
+
+	// The window (DEFAULT_FLUSH_MS = 10s) must NOT be paid when there is nothing to
+	// batch with. This is the regression that made a single async child look "late".
+	assert.ok(elapsed < 1_000, `a lone completion must not wait for the window (took ${elapsed}ms)`);
+	runtime.dispose();
+});
+
+test("T3b: runtime — an unwatched utility sibling does not hold the batch open", async () => {
+	const messages: unknown[] = [];
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+	});
+
+	// A utility child is tracked into the run's join group but never `watch()`ed, so
+	// it can never reach `onTerminal`. Before the `stillReachable` gate it sat in
+	// `pending` and forced every sibling to wait out the full window.
+	runtime.track({
+		name: "util",
+		runId: "r-1",
+		agent: "scout",
+		sessionFile: "/tmp/util.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "util output" }),
+	});
+	runtime.track({
+		name: "worker",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/worker.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("worker");
+
+	const startedAt = Date.now();
+	resolveCollect(joinSnapshot({ output: "worker output" }));
+	await waitFor(() => messages.length === 1, "the watched child is delivered");
+	const elapsed = Date.now() - startedAt;
+
+	assert.ok(
+		elapsed < 1_000,
+		`an unwatched sibling must not add the 10s window (took ${elapsed}ms)`,
+	);
+	const sent = messages[0] as { content: string };
+	assert.match(sent.content, /worker output/);
+	runtime.dispose();
+});
+
+test("T4: runtime — a result already taken through wait() is not announced again", async () => {
+	const messages: unknown[] = [];
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => 1_000,
+	});
+
+	// A live parent run holds the notice in the outbox — exactly the window in which
+	// the parent can still poll `wait` for the same result.
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "polled",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/polled.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("polled");
+	resolveCollect(joinSnapshot({ output: "polled output" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held in the outbox");
+
+	// The parent takes the result through the wait channel.
+	const results = await runtime.wait(["polled"], { timeoutMs: 1_000 });
+	assert.match(results[0]?.snapshot?.output ?? "", /polled output/);
+
+	// One consumer per terminal state: the boundary must NOT wake the parent again.
+	runtime.notifyParentSettled();
+	assert.equal(messages.length, 0, "a wait()-consumed result must not also notify");
+	assert.equal(runtime.noticeQueueStats().pending, 0, "the claim drops the held notice");
+	runtime.dispose();
+});
+
+test("T4b: runtime — a result that was NOT taken still gets its notice after wait() misses it", async () => {
+	const messages: unknown[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => 1_000,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "running",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/running.jsonl",
+		timeoutMs: 50,
+		collect: () => new Promise<CollectSnapshot>(() => {}),
+	});
+	runtime.watch("running");
+	// The wait times out and hands back nothing: nothing is consumed, so nothing may
+	// be latched — the completion notice remains the way this result gets delivered.
+	await runtime.wait(["running"], { timeoutMs: 20 });
+	runtime.dispose();
+	assert.equal(messages.length, 0);
+});
+
 test("T2: runtime — two runIds finishing in one parent run deliver one notice per run boundary (FIFO)", async () => {
 	const messages: Array<{ content: string }> = [];
 	const resolvers = new Map<string, (value: CollectSnapshot) => void>();
@@ -2812,7 +3103,11 @@ test("v2 §6.3: a `watching:false` utility sibling is never promised as `Still r
 	runtime.notifyParentSettled();
 	assert.equal(messages.length, 1, "the finished child is delivered");
 	const content = messages[0]!.content;
-	assert.match(content, /^Background tasks completed \(1\):$/m);
+	// `stillReachable` changed the SHAPE here, not the promise: scout-0 cannot reach
+	// `onTerminal`, so the batch is complete and the single settled entry keeps the
+	// legacy one-result shape. Before that gate the batch looked partial forever and
+	// used the grouped header while still listing exactly one entry.
+	assert.match(content, /^Background task completed:/m);
 	assert.match(content, /worker-0-out/);
 	// The whole point of D4: no footer, because scout-0 can never notify again.
 	assert.doesNotMatch(content, /Still running/, "an unwatched job cannot notify — do not promise it");
@@ -6972,11 +7267,15 @@ test("P4b/v1.10 major: a REFUSED markNotified still means \"sent once\" — `del
 	}
 });
 
-test("P4b/D4 fallback: a legacy result read through `wait` is still announced — deliberate over-notification (D3: 宁多推)", async () => {
-	// The accepted asymmetry (contract D3): a result with no artifact id has nowhere to
-	// record `read_bytes`, so reading it through the tool route cannot settle it and the
-	// boundary announces it anyway. That is the chosen direction, not a regression — a
-	// notice that was never sent is invisible, a repeated one is not.
+test("wait is an explicit consumer: a legacy result taken through `wait` is not announced again (supersedes the D3 宁多推 asymmetry for this channel)", async () => {
+	// Historical decision (contract D3): a result with no artifact id has nowhere to record
+	// `read_bytes`, so reading it could not settle the notice and the boundary announced it
+	// anyway — "a notice that was never sent is invisible, a repeated one is not".
+	//
+	// That asymmetry is now closed for the `wait` channel specifically, because it is the
+	// one path that provably handed the text to the parent: waking it again for the same
+	// result is pure noise (measured +138s / +85s). `collect` keeps the old direction (it
+	// declares its own ledger read) and `status` never reads the body at all.
 	const seam = projectionSeam();
 	const { runtime, messages } = seam;
 	runtime.notifyParentRunStart();
@@ -6995,8 +7294,8 @@ test("P4b/D4 fallback: a legacy result read through `wait` is still announced �
 	assert.equal(waited[0]?.snapshot?.artifactId, undefined, "no artifact id ⇒ nothing to record a read against");
 
 	runtime.notifyParentSettled();
-	await waitFor(() => messages.length === 1, "the boundary announces it anyway");
-	assert.match(messages[0]!.content, /legacy-out/);
+	assert.equal(messages.length, 0, "the wait channel was the one consumer; no second announcement");
+	assert.equal(runtime.noticeQueueStats().pending, 0, "the latch drops the held notice");
 	seam.close();
 });
 

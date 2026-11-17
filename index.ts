@@ -2670,6 +2670,11 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		bindUi(event, ctx);
 	});
 	pi.on("agent_end", (event, ctx) => {
+		// D-A/D1 rescue (SETTLE_FALLBACK_MS): the settle boundary is the only delivery
+		// moment, but a run that aborts or loses its session never reaches it. Arm a
+		// one-shot fallback here; `agent_settled` cancels it in the normal path, so
+		// this adds no second delivery moment and no extra waking message.
+		runtime.notifyParentRunEnd();
 		bindUi(event, ctx);
 	});
 	pi.on("agent_settled", (event, ctx) => {

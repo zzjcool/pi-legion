@@ -11,8 +11,33 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [6.0.2] — 2026-11-17
+
+四条都是「通知该到的时候没到」的同一族问题：scout-guard 提醒迟到一轮，完成通知在父 run
+不再 settle 时沉底，单 child 被攒批窗口白等，已经 `wait` 取过的结果又被播报一遍。
+
 ### Fixed
 
+- **完成通知不再沉底（`agent_end` 兜底放行）**。D1 把 `agent_settled` 当作唯一投递时刻，
+  但被 abort/ESC 打断、或会话半路消失的 run 可能永远走不到 settle，`parentRunActive` 就卡在
+  `true`，排在它后面的通知再没有边界可落（实测：子 agent 于 03:25:30.447 retire，父会话从未收到
+  push，用户靠 `subagent status` 轮询才捞到）。现在 `agent_end` 按一次 `SETTLE_FALLBACK_MS`（2s）
+  兜底定时器：正常路径上 `agent_settled` 紧接 `agent_end` 到达并取消它，所以**常规场景仍只在
+  settle 边界投递一次**；只有 settle 真的没来时才由兜底接管边界。兜底走的是同一个 `flushOutbox`，
+  `if (item.triggerTurn) break` 的「一个边界只叫醒一次」语义原样保留（新 run 开始、
+  runtime dispose 都会取消它）。
+- **单 child 完成不再白等攒批窗口**。`track()` 会把每个 job 都 `addPending` 进 run 的分组，
+  包括 `watching: false` 的 utility child；后者永远不会走到 `onTerminal`，却一直占着 `pending`，
+  于是兄弟的 batch 永远无法「全员到齐」，一律等满 `flushMs`（默认 10s）。现在协调器多一个
+  `stillReachable` 判定（runtime 按 `watching === true` 回答），不可达成员不再推迟 flush，也不影响
+  `allSettled`/`partial` 的分组形状。这就是实测 +32.2s（retire 03:26:39.801 → 通知 03:27:12.050）
+  里的结构性那一段；窗口本身是硬上限、永不续期，算术上不可能单独造成 32s。
+- **已 `wait` 取过的结果不再重复播报**。「终态只告诉一个消费者」：带 `artifactId` 的结果早就由台账
+  `markRead` → `undeliveredIds` 保证，但降级路径（无台账句柄 / 无 artifact 行）只认 `deliveredOnce`
+  —— 它记的是「发过什么」，没有「取过什么」。于是父会话 `wait` 拿到正文之后，仍可能被同一条结果的
+  完成通知叫醒（实测噪音 +138s / +85s）。新增 `consumedByControl` latch，只由 `wait` 通道写入
+  （因为它确实把正文交给了调用方）；`collect` 走自己的台账声明读，`status` 根本不读正文，
+  对它们加 latch 会删掉父会话唯一一次拿到内容的时机，故刻意不纳入。
 - **scout-guard 的提醒不再「等干完才到」**：投递方式从 `deliverAs: "followUp"` 改为
   `"steer"`。宿主在**每个 turn 边界**抽空 steering 队列——当前 assistant 消息的 tool 批跑完、
   下一次 LLM 调用之前（`agent-loop.js:191`）——而 followUp 队列要等到模型**不再发起 tool call**
