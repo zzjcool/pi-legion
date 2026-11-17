@@ -11,6 +11,28 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [6.0.3] — 2026-11-17
+
+### Fixed
+
+- **可用内存估算把 page cache 当成已占用，导致 spawn 准入闸误拒**。
+  `availableMemoryMb()`（`src/supervisor/child-memory.ts`）在 cgroup v2 下把
+  `memory.max - memory.current` 当作候选值，再与 `/proc/meminfo` 的 `MemAvailable` 取 `min`。
+  但 cgroup 的 `memory.current` **包含可回收的 page cache**：一台实际有 11.4 GB 可用的机器，
+  缓存热起来后 `max - current` 只剩 ~479 MB，闸门据此拒绝所有 spawn
+  （报错 `insufficient memory … 479 MB available, 1184 MB required`），而同一时刻
+  `free -m` 显示 11.4 GiB 可用。表现是「一台空闲机器莫名其妙起不了子 agent」，
+  而且随缓存变热而恶化：本机在早期跑的两次全量门禁是 2379/0，同一份代码到后来变成 35 条 supervisor
+  用例失败，唯一变量就是 page cache。
+  现在 cgroup 候选值改为 `min(limit, limit - current + inactive_file)`（`inactive_file` 从
+  `/sys/fs/cgroup/memory.stat` 读），即把可回收部分加回来，与内核 `MemAvailable` / `free -m` 对齐；
+  clamp 到 `[0, limit]`，`current` 超过 limit 时得到 0 而不是负数；读不到 `memory.stat` 时
+  **退回原来的 `limit - current`**（保守值，且不会抛）。
+  闸门本身与门槛语义（`PI_LEGION_MIN_FREE_MEM_MB` + 每 child 预留）完全未变，既有断言
+  （含「1280 MB 档位」那条准入算式用例）一条也没有放宽。
+  实测：本机 `availableMemoryMb()` 从 ~900 MB 变为 ~5150 MB，`npm test` 从 35 条失败变为
+  2386/0，`npm run test:integration` 从 1 条失败变为 123/123 —— 没有改任何测试、没有设环境变量。
+
 ## [6.0.2] — 2026-11-17
 
 四条都是「通知该到的时候没到」的同一族问题：scout-guard 提醒迟到一轮，完成通知在父 run

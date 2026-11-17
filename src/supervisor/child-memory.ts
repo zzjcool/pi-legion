@@ -94,31 +94,103 @@ export function restoreHostNodeOptions(env: NodeJS.ProcessEnv = process.env): vo
 
 // ── B) memory gate ────────────────────────────────────────────────────
 
-/** Available memory in MB: cgroup limit, /proc/meminfo, macOS vm_stat, os.freemem. */
-export function availableMemoryMb(): number {
+/**
+ * Raw inputs for the estimator. `null` = the file could not be read (not Linux,
+ * no cgroup v2 limit, permission, …). Kept as text so tests can feed fixtures.
+ */
+export interface MemorySources {
+	meminfoText: string | null;
+	cgroupMaxText: string | null;
+	cgroupCurrentText: string | null;
+	cgroupStatText: string | null;
+}
+
+const INACTIVE_FILE = /^inactive_file (\d+)$/m;
+const MEM_AVAILABLE = /MemAvailable:\s+(\d+)\s+kB/;
+
+function readOrNull(path: string): string | null {
+	try {
+		return fs.readFileSync(path, "utf8");
+	} catch {
+		return null;
+	}
+}
+
+/** Read the real sources; every failure degrades to `null`, never throws. */
+export function readMemorySources(): MemorySources {
+	return {
+		meminfoText: readOrNull("/proc/meminfo"),
+		cgroupMaxText: readOrNull("/sys/fs/cgroup/memory.max"),
+		cgroupCurrentText: readOrNull("/sys/fs/cgroup/memory.current"),
+		cgroupStatText: readOrNull("/sys/fs/cgroup/memory.stat"),
+	};
+}
+
+/**
+ * cgroup v2 headroom in MB, or `undefined` when there is no usable limit.
+ *
+ * `memory.current` counts **reclaimable page cache** as used: on a warm box it is
+ * routinely 8-9 GiB of `file`/`inactive_file` while the kernel reports ~11 GiB
+ * available. Subtracting `current` alone therefore claims the machine is nearly
+ * out of memory whenever its cache is warm — which is exactly how the spawn gate
+ * came to refuse children on a host with >11 GB free (the error said
+ * `479 MB available` while `free -m` said 11.4 GiB).
+ *
+ * `inactive_file` is the reclaimable part, so adding it back makes this number
+ * agree with `/proc/meminfo`'s `MemAvailable` and with `free -m`. Clamped to
+ * `[0, limit]`: a `current` that overshoots the limit means "nothing free", never
+ * a negative.
+ *
+ * No `memory.stat` ⇒ keep the old, deliberately conservative `limit - current`.
+ * A missing file must degrade the estimate, never throw.
+ */
+export function cgroupAvailableMb(input: {
+	maxText: string | null;
+	currentText: string | null;
+	statText: string | null;
+}): number | undefined {
+	const maxText = input.maxText?.trim();
+	if (!maxText || maxText === "max") return undefined;
+	const limit = Number(maxText);
+	const current = Number(input.currentText?.trim() ?? "");
+	if (!Number.isFinite(limit) || !Number.isFinite(current)) return undefined;
+	const inactive = input.statText ? Number(INACTIVE_FILE.exec(input.statText)?.[1] ?? "") : Number.NaN;
+	const reclaimable = Number.isFinite(inactive) ? inactive : 0;
+	const freeBytes = Math.min(limit, Math.max(0, limit - current + reclaimable));
+	return freeBytes / (1024 * 1024);
+}
+
+/**
+ * The Linux-side estimate: the pessimistic minimum over every source we have.
+ * `undefined` means "no Linux source available" (the caller then falls back).
+ */
+export function availableMbFromSources(sources: MemorySources): number | undefined {
 	const candidates: number[] = [];
-	try {
-		const m = /MemAvailable:\s+(\d+)\s+kB/.exec(fs.readFileSync("/proc/meminfo", "utf8"));
-		if (m) candidates.push(Number(m[1]) / 1024);
-	} catch { /* not linux */ }
-	try {
-		const max = fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
-		if (max !== "max") {
-			const cur = Number(fs.readFileSync("/sys/fs/cgroup/memory.current", "utf8").trim());
-			const limit = Number(max);
-			if (Number.isFinite(limit) && Number.isFinite(cur)) candidates.push((limit - cur) / (1024 * 1024));
-		}
-	} catch { /* no cgroup v2 limit */ }
-	if (candidates.length === 0 && process.platform === "darwin") {
+	const meminfo = sources.meminfoText ? MEM_AVAILABLE.exec(sources.meminfoText) : null;
+	if (meminfo) candidates.push(Number(meminfo[1]) / 1024);
+	const cgroup = cgroupAvailableMb({
+		maxText: sources.cgroupMaxText,
+		currentText: sources.cgroupCurrentText,
+		statText: sources.cgroupStatText,
+	});
+	if (cgroup !== undefined) candidates.push(cgroup);
+	if (candidates.length === 0) return undefined;
+	return Math.floor(Math.max(0, Math.min(...candidates)));
+}
+
+/** Available memory in MB: cgroup limit (reclaim-aware), /proc/meminfo, macOS vm_stat, os.freemem. */
+export function availableMemoryMb(): number {
+	const linux = availableMbFromSources(readMemorySources());
+	if (linux !== undefined) return linux;
+	if (process.platform === "darwin") {
 		try {
 			const out = execFileSync("vm_stat", { encoding: "utf8", timeout: 2_000 });
 			const page = Number(/page size of (\d+)/.exec(out)?.[1] ?? 4096);
 			const pages = (k: string) => Number(new RegExp(`Pages ${k}:\\s+(\\d+)`).exec(out)?.[1] ?? 0);
-			candidates.push(((pages("free") + pages("inactive") + pages("speculative")) * page) / (1024 * 1024));
+			return Math.floor(((pages("free") + pages("inactive") + pages("speculative")) * page) / (1024 * 1024));
 		} catch { /* fall through */ }
 	}
-	if (candidates.length === 0) candidates.push(os.freemem() / (1024 * 1024));
-	return Math.floor(Math.max(0, Math.min(...candidates)));
+	return Math.floor(Math.max(0, os.freemem() / (1024 * 1024)));
 }
 
 export interface MemoryGateConfig {

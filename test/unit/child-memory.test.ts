@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { availableMemoryMb, checkMemoryGate, childMemoryEnv, childNodeOptions, resolveMemoryGateConfig, restoreHostNodeOptions, HOST_NODE_OPTIONS_ENV, MIN_CHILD_MAX_OLD_SPACE_MB } from "../../src/supervisor/child-memory.ts";
+import { availableMbFromSources, availableMemoryMb, cgroupAvailableMb, checkMemoryGate, childMemoryEnv, childNodeOptions, resolveMemoryGateConfig, restoreHostNodeOptions, HOST_NODE_OPTIONS_ENV, MIN_CHILD_MAX_OLD_SPACE_MB } from "../../src/supervisor/child-memory.ts";
 import { RpcSupervisor } from "../../src/supervisor/rpc-supervisor.ts";
 
 test("child NODE_OPTIONS adds semi-space + old-space caps, keeps host options, 0 disables", () => {
@@ -46,6 +46,57 @@ test("memory gate: floor + per-starting-child reservation, 0 disables", () => {
 	assert.match(refuseTen.message!, /2469 MB available, 2624 MB required/);
 	assert.deepEqual(resolveMemoryGateConfig({ PI_LEGION_MIN_FREE_MEM_MB: "64", PI_LEGION_CHILD_RESERVE_MB: "x" }), { minFreeMb: 64, reserveMb: 160 });
 	assert.ok(availableMemoryMb() > 0);
+});
+
+// ── reclaim-aware cgroup estimate (6.0.3) ─────────────────────────────
+//
+// `memory.current` counts reclaimable page cache as used. The shipped bug: on a warm
+// host with >11 GB actually free, `limit - current` read ~479 MB and the spawn gate
+// refused every child. These fixtures pin the arithmetic, not the real machine.
+const GIB = 1024 * 1024 * 1024;
+
+test("memory estimate: cgroup inactive_file is reclaimable, not occupied", () => {
+	// 8 GiB limit, 7 GiB current, 4 GiB of it reclaimable page cache.
+	const sources = {
+		meminfoText: null, // isolate the cgroup term
+		cgroupMaxText: String(8 * GIB),
+		cgroupCurrentText: String(7 * GIB),
+		cgroupStatText: [
+			"anon 3000000000",
+			`inactive_file ${4 * GIB}`,
+			"active_file 1000000000",
+		].join("\n"),
+	};
+	// The buggy reading was limit - current = 1024 MB.
+	assert.equal(cgroupAvailableMb({ maxText: sources.cgroupMaxText, currentText: sources.cgroupCurrentText, statText: null }), 1024);
+	// Reclaim-aware: 1024 MB headroom + 4096 MB reclaimable cache.
+	assert.equal(cgroupAvailableMb({ maxText: sources.cgroupMaxText, currentText: sources.cgroupCurrentText, statText: sources.cgroupStatText }), 5120);
+	assert.equal(availableMbFromSources(sources), 5120);
+});
+
+test("memory estimate: a missing memory.stat keeps the conservative value and never throws", () => {
+	const noStat = {
+		meminfoText: null,
+		cgroupMaxText: String(8 * GIB),
+		cgroupCurrentText: String(7 * GIB),
+		cgroupStatText: null,
+	};
+	assert.equal(availableMbFromSources(noStat), 1024, "degrade to limit - current, not to a crash");
+	// A stat without inactive_file is treated the same way.
+	assert.equal(
+		cgroupAvailableMb({ maxText: String(8 * GIB), currentText: String(7 * GIB), statText: "anon 1\nfile 2" }),
+		1024,
+	);
+	// No usable cgroup limit at all.
+	assert.equal(cgroupAvailableMb({ maxText: "max", currentText: String(7 * GIB), statText: null }), undefined);
+	assert.equal(cgroupAvailableMb({ maxText: null, currentText: null, statText: null }), undefined);
+});
+
+test("memory estimate: oversized current clamps to zero, never negative", () => {
+	assert.equal(
+		cgroupAvailableMb({ maxText: String(GIB), currentText: String(4 * GIB), statText: `inactive_file ${GIB}` }),
+		0,
+	);
 });
 
 test("supervisor refuses spawn with INSUFFICIENT_MEMORY, notifies, and starts nothing", async () => {
