@@ -315,8 +315,12 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// The resolved target is what makes a named host ACTUALLY remote: the
 		// remote cwd, the remote interpreter/CLI and the preflight all come from it
 		// (`resolveHostTarget` in `../runs/remote.ts`).
-		const target: HostTarget | undefined = host !== undefined ? input.hostTarget : undefined;
-		const remote = target !== undefined;
+		// m2 (review s01): ONE predicate for "this launch is remote". The guard above
+		// makes `host` and `hostTarget` inseparable, so `remote === (host !== undefined)`
+		// — and three spellings of that fact is how the env/argv/labels branches drift
+		// apart when the guard is ever relaxed.
+		const target: HostTarget | undefined = host === undefined ? undefined : input.hostTarget;
+		const remote = host !== undefined && target !== undefined;
 
 		// D11: a remote worktree is created ON THAT MACHINE, by the only layer that
 		// holds both the `hc` client and the target. It runs BEFORE the preflight
@@ -946,9 +950,13 @@ export class TerminalSupervisor implements LegionSupervisor {
 	private childEnv(input: SpawnInput, host: string | undefined): Record<string, string> {
 		const env: Record<string, string> = {};
 		if (host !== undefined) {
-			for (const [key, value] of Object.entries(childMemoryEnv(this.env))) {
-				if (typeof value === "string") env[key] = value;
-			}
+			// m4/m5 (review s01): the memory profile is a PARENT fact, like PATH/HOME.
+			// `childMemoryEnv` merges this host's `NODE_OPTIONS` text verbatim (a string
+			// full of absolute paths, e.g. `--require /abs/x.js`) and adds a heap cap so
+			// a LOCAL child cannot eat this process's address space. Sending either one
+			// over the wire projects this machine's paths onto another (D6/D7) and caps
+			// a bash tree that lives there; the remote core's own environment is the
+			// right answer for its own children. So neither key is sent.
 			for (const [key, value] of Object.entries(input.env ?? {})) {
 				if (typeof value === "string") env[key] = value;
 			}

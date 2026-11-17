@@ -554,3 +554,28 @@ test("M8: a stuck name is refused by ADDRESS, so the operator knows which machin
 		h.cleanup();
 	}
 });
+
+test("m4/m5: the remote env carries NO parent NODE_OPTIONS text and no heap cap", async () => {
+	// `childMemoryEnv` merges this host's NODE_OPTIONS verbatim (absolute paths) and
+	// adds a heap cap so a LOCAL child cannot eat this process's address space. On
+	// another machine that is both a path projection (D6/D7) and a cap on a bash
+	// tree living there — the remote core's own environment is the right answer.
+	const env = callerEnv();
+	env.NODE_OPTIONS = "--require /root/code/pi-legion/hook.js --max-old-space-size=4096";
+	env.PI_LEGION_HOST_NODE_OPTIONS = "--require /root/elsewhere/hook.js";
+	const h = harness(env);
+	try {
+		const input = spawnInput(h.root, { host: "vps", hostTarget: hostTarget() });
+		await h.supervisor.spawnChild(input);
+		const run = h.client.paramsFor("terminal.run")[0];
+		assert.ok(run);
+		const sent = (run.env ?? {}) as Record<string, string>;
+		assert.equal("NODE_OPTIONS" in sent, false, "no NODE_OPTIONS may travel: it is a parent fact");
+		assert.equal("PI_LEGION_HOST_NODE_OPTIONS" in sent, false);
+		for (const value of Object.values(sent)) {
+			assert.doesNotMatch(String(value), /\/root\/code\/pi-legion|--max-old-space-size/, `a parent memory fact leaked: ${value}`);
+		}
+	} finally {
+		h.cleanup();
+	}
+});

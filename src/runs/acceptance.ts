@@ -26,6 +26,21 @@ export interface CommandResult {
 	code: number;
 	stdout: string;
 	stderr: string;
+	/**
+	 * Cross-machine verify (S3, `cross-machine-spawn-v1` D14): why a non-zero code
+	 * is not necessarily the child's fault.
+	 *
+	 * `code` — the command ran and failed: a verdict about the WORK.
+	 * `timeout` / `unreachable` / `unknown-host` — the command did not run or did
+	 * not finish: a verdict about the MACHINE, which must never be recorded as
+	 * `rejected` (that sentence would say "the work does not pass" about work that
+	 * was never measured). Absent ⇒ the local semantics, byte-identical.
+	 */
+	failure?: "code" | "timeout" | "unreachable" | "unknown-host";
+	/** The machine that produced this result, when it was not this one. */
+	host?: string;
+	/** Human-readable detail for a non-`code` failure (and a clamp note). */
+	failureDetail?: string;
 }
 
 export type VerifyRunner = (
@@ -350,19 +365,39 @@ export async function applyVerification(
 	);
 	// Run every command in order; stop at the first failure so the rejection
 	// names the command that actually broke, not a later one that never ran.
+	let ranOn: string | undefined;
 	for (const command of commands) {
 		const result = await run(command, opts.cwd, opts.timeoutMs);
+		if (result.host) ranOn = result.host;
+		// D14 (S3): a machine failure is NOT a code failure. The class decides the
+		// verdict — `unknown` keeps the parent asking instead of recording a rejection
+		// about work nobody measured. `code`, or no `failure` at all (the local shape),
+		// keeps the pre-S3 wording byte for byte.
+		if (result.failure !== undefined && result.failure !== "code") {
+			const where = result.host ? ` on host '${result.host}'` : "";
+			const detail = (result.failureDetail ?? result.failure).trim();
+			return {
+				...acceptance,
+				status: "unknown",
+				level: acceptance.level === "verified" ? "attested" : acceptance.level,
+				reason: `verification unavailable${where} (${result.failure}): ${detail.slice(0, REASON_TAIL_LIMIT)}`,
+				pendingCriteria: carried,
+			};
+		}
 		const output = `${result.stdout}\n${result.stderr}`.trim();
 		if (result.code === 0) continue;
+		const where = result.host ? ` on host '${result.host}'` : "";
 		return {
 			...acceptance,
 			status: "rejected",
 			level: "attested",
-			reason: `verification failed (\`${command}\`): ${output.slice(0, REASON_TAIL_LIMIT)}`,
+			reason: `verification failed${where} (\`${command}\`): ${output.slice(0, REASON_TAIL_LIMIT)}`,
 			pendingCriteria: carried,
 		};
 	}
-	const verifiedReason = `verified by ${commands.map((c) => `\`${c}\``).join(" && ")}`;
+	// The machine is part of the fact: "verified by `npm test`" on ANOTHER host is a
+	// claim about that machine's checkout, and the verdict must say so (S3).
+	const verifiedReason = `verified by ${commands.map((c) => `\`${c}\``).join(" && ")}${ranOn ? ` on host '${ranOn}'` : ""}`;
 	if (acceptance.status !== "accepted") {
 		// The commands did pass, so the level is `verified` — but the status the
 		// child reported stands verbatim, and its reason is kept alongside ours

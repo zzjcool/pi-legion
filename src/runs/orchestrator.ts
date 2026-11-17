@@ -86,7 +86,7 @@ import { inProcessDepth, runAtAbsoluteDepth } from "../supervisor/inprocess-dept
 import { subscribeInProcessSlotReleases } from "../supervisor/routing-supervisor.ts";
 import type { AbortOutcome, LegionSupervisor, SettleResult, SpawnInput, SteerDisposition } from "../supervisor/types.ts";
 import type { PendingUIRequest, UIProxy } from "../supervisor/ui-proxy.ts";
-import { applyVerification, type VerifyRunner } from "./acceptance.ts";
+import { DEFAULT_VERIFY_TIMEOUT_MS, applyVerification, type VerifyRunner } from "./acceptance.ts";
 import {
 	createChildWorktree,
 	isInsideChildWorktree,
@@ -94,6 +94,7 @@ import {
 	resolveLaunchWorktree,
 } from "./worktree.ts";
 import { provisionWorktree } from "./provision.ts";
+import type { RemoteVerifyRunner } from "./remote-verify.ts";
 import { assertLocalWorktree, normalizeHost, type HostTarget } from "./remote.ts";
 
 export interface BudgetRefusedEvent {
@@ -141,6 +142,12 @@ export interface OrchestratorDeps {
 	maxDepth?: number;
 	maxSpawns?: number | null;
 	verifyRunner?: VerifyRunner;
+	/**
+	 * Cross-machine verify (S3): runs a launcher's `verify:` command ON the machine
+	 * the child worked on. Absent = this build cannot verify that host, so the
+	 * child's own attestation stands (never a locally measured pass).
+	 */
+	remoteVerify?: RemoteVerifyRunner;
 	/** Post-create bootstrap for child worktrees (legion.worktreeBootstrap). */
 	worktreeBootstrap?: string;
 	worktreeBootstrapTimeoutMs?: number;
@@ -477,20 +484,6 @@ export function preCreateSessionFile(file: string): void {
 	}
 }
 
-/**
- * The launcher-supplied verify commands on an agent definition (review B1).
- *
- * `index.ts` turns `verify:` into one criterion carrying a `command` on the
- * LAUNCHED agent clone; nothing else writes `command`. So this predicate is the
- * exact set of commands this machine would run on the child's behalf.
- */
-function launcherVerifyCommands(agent: AgentConfig): string[] {
-	const criteria = agent.acceptance?.criteria ?? [];
-	return criteria
-		.map((criterion) => (typeof criterion.command === "string" ? criterion.command.trim() : ""))
-		.filter((command) => command.length > 0);
-}
-
 function canFallbackStart(error: unknown): boolean {
 	// Review M6: a remote setup failure is a fact about ANOTHER machine. The next
 	// candidate would run the same preflight/mkdir/mirror against the same broken
@@ -543,6 +536,7 @@ export class Orchestrator {
 	private readonly maxDepthValue: number;
 	private readonly maxSpawns: number | null;
 	private readonly verifyRunner?: VerifyRunner;
+	private readonly remoteVerify?: RemoteVerifyRunner;
 	private readonly worktreeBootstrap?: string;
 	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
@@ -620,6 +614,7 @@ export class Orchestrator {
 		this.maxDepthValue = effectiveMaxDepth(deps.maxDepth);
 		this.maxSpawns = deps.maxSpawns ?? null;
 		this.verifyRunner = deps.verifyRunner;
+		this.remoteVerify = deps.remoteVerify;
 		this.worktreeBootstrap = deps.worktreeBootstrap?.trim() || undefined;
 		this.worktreeBootstrapTimeoutMs = deps.worktreeBootstrapTimeoutMs;
 		this.team = deps.team;
@@ -1292,20 +1287,6 @@ export class Orchestrator {
 				throw new SubagentError(
 					`host '${host}' cannot carry a utility dispatch: read-only helpers run in-process (drop host, or dispatch a command-chain role)`.trim(),
 					ErrorCodes.INVALID_PARAMS,
-				);
-			}
-			// D14 (S3 boundary, review B1): a launcher-supplied `verify` command runs
-			// through `applyVerification`, whose cwd is `child.worktreePath ?? this.cwd`
-			// — for a remote child that is THIS machine's checkout, so the verdict
-			// would describe a tree the child never touched and land on the remote
-			// child's acceptance. That is a fabricated green, the one outcome the
-			// contract refuses above all. Remote verify goes through `machine.exec`
-			// (S3); until then the launch is refused rather than quietly mis-measured.
-			if (launcherVerifyCommands(input.agent).length > 0) {
-				throw new SubagentError(
-					`host '${host}' cannot verify: a launcher-supplied \`verify\` command runs on THIS machine, so its result would describe this checkout and not the one the child works in (remote verify lands in S3). Drop \`verify\` for a cross-machine launch, or let the remote child attest for itself.`,
-					ErrorCodes.INVALID_PARAMS,
-					{ host, verify: launcherVerifyCommands(input.agent) },
 				);
 			}
 		}
@@ -3196,18 +3177,32 @@ export class Orchestrator {
 		// than having this machine's verifier run inside a path that means something
 		// else (remote verify is S3's work, not a silent local run).
 		assertLocalWorktree(child);
-		// D14 (review B1): the same rule as the launch refusal, applied to a record
-		// that already exists (an old run.json, a resumed child, a record written
-		// before the refusal landed). `applyVerification` runs commands with a cwd on
-		// THIS machine, so for a child that ran elsewhere the honest answer is the
-		// child's own attestation, never a locally measured pass.
+		// S3/D14: whose machine runs the command. A child that ran elsewhere gets the
+		// remote runner — the command executes THERE, through `machine.exec{on}`, and
+		// its result carries the machine so a failure to reach it is `unknown`, never
+		// `rejected` (see `acceptance.ts`). A whole-file `assertLocalWorktree` above
+		// still refuses the local verifier against a remote TREE; this decides the
+		// cross-machine child that has no local tree at all.
+		//
+		// `remoteVerify` absent = this build cannot verify that host: the child's own
+		// attestation stands (pre-S3 behaviour), never a locally measured pass.
 		const remoteChild = normalizeHost(child.host) !== undefined;
-		const acceptance = execution.status === "running" || remoteChild
+		const remoteVerify = remoteChild && this.remoteVerify
+			? this.remoteVerify
+			: undefined;
+		const acceptance = execution.status === "running" || (remoteChild && remoteVerify === undefined)
 			? derived
 			: await applyVerification(derived, {
 				cwd: child.worktreePath ?? this.cwd,
 				criteria: child.pendingCriteria,
-				run: this.verifyRunner,
+				run: remoteVerify && child.host
+					? (command, _cwd, timeoutMs) => remoteVerify({
+						host: child.host as string,
+						command,
+						...(child.worktreePath ? { cwd: child.worktreePath } : {}),
+						timeoutMs: timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS,
+					})
+					: this.verifyRunner,
 				timeoutMs: Math.max(5_000, deadline - this.now()),
 			});
 		const isRetired = () => child.state === "retired";

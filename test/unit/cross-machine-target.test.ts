@@ -537,3 +537,36 @@ test("M2/D6: the preflight asks about the checkout explicitly and sends no `cwd`
 	assert.deepEqual(probe?.argv, ["test", "-d", "/srv/app"]);
 	assert.equal(script?.cwd, "/srv/app", "the paths are validated by the machine that owns them");
 });
+
+test("m3/D7: the preflight refuses a remote core that already carries legion identity", async () => {
+	// `terminal.run`'s env is a merge-only overlay, so identity keys cannot be
+	// DELETED there — only not sent. A core that already has them would make the
+	// child join a ledger it cannot open, which is why the launch is refused.
+	const script = remotePreflightScript(target());
+	assert.match(script, /PI_LEGION_DB/);
+	assert.match(script, /PI_LEGION_NODE_ID/);
+	assert.match(script, /exit 15/);
+
+	const client = preflightClient(() => execResult({ code: 15 }));
+	const error = await remotePreflight(client, target()).then(() => undefined, (thrown: unknown) => thrown);
+	assert.ok(error instanceof SubagentError);
+	assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+	assert.match((error as SubagentError).message, /already carries legion identity/);
+	assert.match((error as SubagentError).message, /D7/);
+});
+
+test("S3/6: the preflight is bounded at ten seconds, so an unusable remote exec fails fast", async () => {
+	// Requirement: a machine that cannot answer the preflight must fail in ~10s with
+	// a name, not hang a launch for minutes. Both preflight calls carry that bound.
+	const client = preflightClient(() => execResult({ code: 0 }));
+	await remotePreflight(client, target());
+	const [probe, script] = client.paramsFor("machine.exec");
+	assert.equal(probe?.timeout, 10);
+	assert.equal(script?.timeout, 10);
+
+	// A core that reports the deadline is named as such, with the bound in the text.
+	const timedOut = preflightClient(() => execResult({ code: null, timed_out: true }));
+	const error = await remotePreflight(timedOut, target()).then(() => undefined, (thrown: unknown) => thrown);
+	assert.ok(error instanceof SubagentError);
+	assert.match((error as SubagentError).message, /preflight did not finish within 10s/);
+});

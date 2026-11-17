@@ -319,9 +319,13 @@ export function resolveHostTarget(
 			{ host: name },
 		);
 	}
-	// The path must be absolute AND a path on that machine. `path.isAbsolute`
-	// answers for the POSIX shape `hc` uses, and a relative value here is always
-	// a mistake: it would silently resolve against the remote core's home.
+	// The path must be absolute AND a path on that machine. It is judged by
+	// `path.posix.isAbsolute`, deliberately and not by the platform helper (m8,
+	// review s01): `hc` speaks remote POSIX paths, and a Windows parent that read
+	// `C:\srv` as absolute-or-not with its own rules would be answering a question
+	// about a filesystem it cannot see. Every "is this a path on THAT machine"
+	// check in this file uses `path.posix`; every "is this a path on THIS machine"
+	// check uses the platform `path` (`isInsideFsPath`).
 	const cwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
 	if (cwd.length === 0 || !path.posix.isAbsolute(cwd)) {
 		throw new SubagentError(
@@ -490,6 +494,14 @@ export interface HcExecResult {
 export const REMOTE_SETUP_TIMEOUT_S = 30;
 
 /**
+ * The preflight's own bound (S3 requirement): a machine that cannot answer four
+ * trivial shell questions in ten seconds is not a machine this launch should wait
+ * on. It exists so "the remote exec is unusable" fails in ten seconds with a name,
+ * instead of surfacing ten minutes later as a mysterious verify timeout.
+ */
+export const REMOTE_PREFLIGHT_TIMEOUT_S = 10;
+
+/**
  * Decode `machine.exec`'s stdout/stderr (BASE64 on the wire, always) into text.
  *
  * The real core answers this way, so a caller that assumed plaintext would put
@@ -525,6 +537,12 @@ export function remotePreflightScript(target: HostTarget): string {
 		// is missing the child either fails to start or starts without the guard
 		// extension -- the second is the silent failure, so it is checked here.
 		`test -f ${shQuote(path.posix.join(target.piLegionRoot, "index.ts"))} || exit 14`,
+		// D7's second half (m3, review s01): the launch is refused when THAT core
+		// already carries legion identity. `terminal.run`'s `env` is a merge-only
+		// overlay with no delete semantics, so a child started there would inherit a
+		// ledger it cannot open and (worse) look like a node of THIS tree. Asking is
+		// the only way to know — `hc` has no "read the core's env" method.
+		`if [ -n "${'$'}{PI_LEGION_DB-}" ] || [ -n "${'$'}{PI_LEGION_NODE_ID-}" ]; then printf '%s\\n' ${shQuote("the hc core on that machine already carries legion identity")} >&2; exit 15; fi`,
 	].join(" ; ");
 }
 
@@ -555,7 +573,7 @@ export async function remotePreflight(
 		const probe = await client.request<HcExecResult>("machine.exec", {
 			on: target.host,
 			argv: ["test", "-d", target.cwd],
-			timeout: REMOTE_SETUP_TIMEOUT_S,
+			timeout: REMOTE_PREFLIGHT_TIMEOUT_S,
 		});
 		directoryExists = probe?.code === 0;
 	} catch (error) {
@@ -580,14 +598,14 @@ export async function remotePreflight(
 			// core told to chdir into a missing path cannot say which part failed
 			// (spike constraint 4).
 			cwd: target.cwd,
-			timeout: REMOTE_SETUP_TIMEOUT_S,
+			timeout: REMOTE_PREFLIGHT_TIMEOUT_S,
 		});
 	} catch (error) {
 		throw unreachable(target, error);
 	}
 	if (result?.timed_out === true) {
 		throw new SubagentError(
-			`host '${target.host}' unreachable: timed_out: preflight did not finish within ${REMOTE_SETUP_TIMEOUT_S}s (${execResultText(result) || "no output"})`,
+			`host '${target.host}' unreachable: timed_out: preflight did not finish within ${REMOTE_PREFLIGHT_TIMEOUT_S}s (${execResultText(result) || "no output"})`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host },
 		);
@@ -620,6 +638,13 @@ export async function remotePreflight(
 			`host '${target.host}': pi CLI '${target.piCli}' is not on PATH on ${target.host} (set subagents.crossMachine.hosts.${target.host}.piCli to a path on that machine)`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, piCli: target.piCli },
+		);
+	}
+	if (code === 15) {
+		throw new SubagentError(
+			`host '${target.host}': the hc core there already carries legion identity (PI_LEGION_DB / PI_LEGION_NODE_ID), so a child started from it would join a tree it cannot open (D7). Start that core without them, or launch on this machine.`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: target.host, remoteIdentity: true },
 		);
 	}
 	if (code === 14) {

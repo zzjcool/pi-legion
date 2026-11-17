@@ -149,6 +149,7 @@ import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
 import { normalizeHost, resolveHostTarget, resolveResumeCwd } from "./src/runs/remote.ts";
+import { createRemoteVerifyRunner } from "./src/runs/remote-verify.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
@@ -3566,6 +3567,10 @@ async function controlAction(input: {
 		maxDepth: input.settings.legion?.maxDepth,
 		childContext: resolveTeamContext("child", input.settings, input.team),
 		verifyRunner: input.verifyRunner,
+		// S3: a child that ran on another machine is verified THERE. The runner is
+		// built per call from the same settings the launch resolved its target from,
+		// so the cwd/programs cannot drift from the ones the child was started with.
+		remoteVerify: createRemoteVerifyRunner({ crossMachine: input.settings.crossMachine }),
 		worktreeBootstrap: input.settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: input.settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
@@ -4600,6 +4605,10 @@ async function launchFamily(input: {
 		maxSpawns: settings.maxSubagentSpawnsPerSession ?? null,
 		childContext: resolveTeamContext("child", settings, input.team),
 		verifyRunner: input.verifyRunner,
+		// S3: a child that ran on another machine is verified THERE. The runner is
+		// built per call from the same settings the launch resolved its target from,
+		// so the cwd/programs cannot drift from the ones the child was started with.
+		remoteVerify: createRemoteVerifyRunner({ crossMachine: input.settings.crossMachine }),
 		worktreeBootstrap: settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
@@ -7401,7 +7410,7 @@ export function renderCollect(
 	}
 	// The mechanical verify outcome (which command failed / which commands had
 	// to pass) is the parent's primary trust anchor — surface it inline.
-	if (collected.acceptance.reason && /^(verified by|verification failed)/.test(collected.acceptance.reason)) {
+	if (collected.acceptance.reason && /^(verified by|verification failed|verification unavailable)/.test(collected.acceptance.reason)) {
 		lines.push(collected.acceptance.reason);
 	}
 	if (collected.blocked) {

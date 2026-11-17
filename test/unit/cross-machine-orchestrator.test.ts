@@ -229,13 +229,28 @@ test("D1: resolveHostTarget refuses a pathMap entry that is relative on either s
 	);
 });
 
-test("B1: a launcher-supplied verify command is refused on a host launch (no fake green)", async () => {
-	// `applyVerification` runs with `cwd: child.worktreePath ?? this.cwd`. A remote
-	// child has no local worktree, so its verify would run in THIS machine's
-	// checkout and be recorded on the REMOTE child's acceptance — a verdict about
-	// a tree the child never touched. Until S3 runs it through `machine.exec`, the
-	// launch must be refused, not quietly mis-measured.
-	const h = harness("xm-guard-verify-");
+test("S3/B1: `host` + `verify` runs the command on THAT machine — never in this checkout", async () => {
+	// Pre-S3 this launch was refused, because `applyVerification` would have run the
+	// command with `cwd: child.worktreePath ?? this.cwd` — this machine's checkout —
+	// and recorded the answer on the remote child's acceptance. The refusal is gone
+	// because the command now travels: the local runner must never be called for a
+	// child that ran elsewhere.
+	const h = harness("xm-verify-remote-");
+	const local: string[] = [];
+	const remote: Array<{ host: string; command: string; cwd?: string; timeoutMs: number }> = [];
+	const orchestrator = new Orchestrator({
+		supervisor: h.supervisor,
+		runDir: path.join(h.root, "run"),
+		cwd: gitRepo(h.root),
+		verifyRunner: async (command) => {
+			local.push(command);
+			return { code: 0, stdout: "", stderr: "" };
+		},
+		remoteVerify: async (request) => {
+			remote.push(request);
+			return { code: 0, stdout: "", stderr: "", host: request.host };
+		},
+	});
 	await insideHcTerminal(async () => {
 		try {
 			const withVerify = {
@@ -251,11 +266,18 @@ test("B1: a launcher-supplied verify command is refused on a host launch (no fak
 					}],
 				},
 			};
-			await assert.rejects(
-				() => h.orchestrator.launch({ agent: withVerify, task: "t", host: HOST, hostTarget: target() }),
-				expectRefusal(/cannot verify/),
-			);
-			assert.equal(h.supervisor.calls.length, 0, "no child may start");
+			const handle = await orchestrator.launch({ agent: withVerify, task: "t", host: HOST, hostTarget: target() });
+			h.supervisor.settle(handle.name, { text: '{"ok":true,"reason":"done"}' });
+			const collected = await orchestrator.collect(handle.name);
+			assert.deepEqual(local, [], "the local runner must never verify another machine's child");
+			assert.equal(remote.length, 1, "exactly one remote verify");
+			assert.equal(remote[0]!.host, HOST);
+			assert.equal(remote[0]!.command, "npm test");
+			// The budget is the collect deadline's remainder (the pre-S3 semantics); the
+			// remote runner clamps it to hc's ceiling and announces that.
+			assert.ok((remote[0]!.timeoutMs ?? 0) > 0 && (remote[0]!.timeoutMs ?? 0) <= 900_000, `budget ${remote[0]!.timeoutMs}`);
+			assert.equal(collected.acceptance.level, "verified");
+			assert.match(String(collected.acceptance.reason), /on host '/);
 		} finally {
 			h.cleanup();
 		}
