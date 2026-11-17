@@ -244,12 +244,13 @@ Error: Failed to load extension "…/node_modules/pi-legion/index.ts":
 **launch 前的那一次探测**：现在每次远端 launch 会先用 child 的**完整 argv**（去掉 task、加
 `--list-models`）在目标机跑一次，10 秒内给出结论。它问的是**模型可见性**，与凭据无关——
 同一个 registry 里另一个 provider 缺 key 不会影响判定，只要期望的 model 出现在列表里就放行。
+pi 对未注册 id 明确回答 `Using custom model id` 时也放行：custom id 是受支持用法，由 endpoint 决定是否服务，探测不替它判死。
 任何拒绝都会在末尾附上**可直接复制粘贴**的那条命令行（`Command (run on '<host>' to reproduce):`）。
 
 | 症状（探测输出） | 判定 | launch 行为 |
 |---|---|---|
 | `--list-models` 列表为空且写着 `No models available` / `No API key` | 远端模型提供者没加载 | 拒绝（INVALID_PARAMS），点名 `hosts.<host>.piExtensions` 并附原始两行 |
-| 有模型列表，但没有期望的 `model` | 那台机器不提供这个模型 | 拒绝（INVALID_PARAMS，`probe: "model-missing"`），列出该机器实际前 5 条，并给出改 model / 补 provider 扩展两个方向 |
+| 有模型列表，但没有期望的 `model`（且 pi 没说 `Using custom model id`） | 那台机器不提供这个模型 | 拒绝（INVALID_PARAMS，`probe: "model-missing"`），列出该机器实际前 5 条，并给出改 model / 补 provider 扩展两个方向 |
 | `conflicts with` | 扩展重复 | 拒绝（INVALID_PARAMS），指向"别把已装扩展再加一次" |
 | 其他非 0 退出 | 该 argv 在那台机器上跑不起来 | 拒绝（START_FAILED），附 stderr 前 5 行 |
 | 退出 0 / 无结论（输出无法解析） | 正常 | 继续，创建终端 |

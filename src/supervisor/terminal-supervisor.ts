@@ -626,9 +626,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 				);
 				return undefined;
 			});
-			const probeOut = probe === undefined
-				? undefined
-				: `${Buffer.from(String(probe.stdout ?? ""), "base64").toString("utf8")}\n${Buffer.from(String(probe.stderr ?? ""), "base64").toString("utf8")}`;
+			const probeStdout = probe === undefined ? "" : Buffer.from(String(probe.stdout ?? ""), "base64").toString("utf8");
+			const probeStderr = probe === undefined ? "" : Buffer.from(String(probe.stderr ?? ""), "base64").toString("utf8");
+			const probeOut = probe === undefined ? undefined : `${probeStdout}\n${probeStderr}`;
 			const verdict = probeOut === undefined ? undefined : classifyRemoteStartupProbe(probeOut, input.model);
 			const excerpt = (probeOut ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0).slice(0, 5).join("\n");
 			// Appended to EVERY refusal: the line to paste on that machine. Without it the
@@ -652,11 +652,14 @@ export class TerminalSupervisor implements LegionSupervisor {
 				);
 			}
 			if (verdict === "model-missing") {
+				this.removeTempDir(tempDir);
+				await rollbackRemoteWorktree();
 				await rollbackRemoteDir();
 				// The machine HAS models, just not this one — a different problem from
 				// `no-model`, with different fixes. Quote what it does serve (first five)
-				// so the operator can pick a reachable model instead of guessing.
-				const listed = parseListModels(probeOut ?? "").slice(0, 5);
+				// so the operator can pick a reachable model instead of guessing. Parse
+				// STDOUT only: stderr warnings would otherwise be read as model rows.
+				const listed = parseListModels(probeStdout).slice(0, 5);
 				throw new SubagentError(
 					`host '${target.host}': the child's model '${input.model}' is not visible there — that machine lists:\n${listed.length > 0 ? listed.join("\n") : "(an empty listing)"}\nPoint this launch at a model that machine serves (the role's \`model\`, \`subagents.defaultModel\`, or \`agentOverrides.<role>.model\`), or put the provider extension that publishes '${input.model}' into subagents.crossMachine.hosts.${target.host}.piExtensions. A model that is LISTED there is enough: the probe does not need a credential.${reproduce}`,
 					ErrorCodes.INVALID_PARAMS,

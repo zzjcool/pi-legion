@@ -344,7 +344,14 @@ export function classifyRemoteStartupProbe(
 		return /No models available|No API key( found)?/i.test(output) ? "no-model" : undefined;
 	}
 	const expected = expectedModel?.trim() ?? "";
-	if (expected.length > 0 && !modelMatches(expected, models)) return "model-missing";
+	if (expected.length > 0 && !modelMatches(expected, models)) {
+		// pi accepts an unregistered id under a known provider ("Using custom model
+		// id") and lets the endpoint decide, which is a supported usage. A listing
+		// without that id is therefore not proof the launch cannot work; only pi's
+		// own refusal is.
+		if (/Using custom model id/i.test(output)) return undefined;
+		return "model-missing";
+	}
 	return undefined;
 }
 

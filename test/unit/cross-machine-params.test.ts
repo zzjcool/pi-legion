@@ -775,19 +775,31 @@ test("S5.6: a VISIBLE model passes even when another provider has no API key", a
 	const h = harness(localEnv());
 	try {
 		h.client.on("machine.exec", (params: Record<string, unknown>) => {
-			if (!String(params.line).includes("--list-models")) {
-				return { code: 0, stdout: "", stderr: "", timed_out: false };
+			const line = String(params.line);
+			if (line.includes("--list-models")) {
+				return {
+					code: 0,
+					stdout: b64([
+						"provider      model                                context  max-out  thinking  images",
+						"any-endpoint  workbuddy/deepseek-v4.1-flash         128k     8k       yes       no",
+					].join("\n") + "\n"),
+					// The line that used to turn a working launch into a refusal.
+					stderr: b64("No API key found for another-provider\n"),
+					timed_out: false,
+				};
 			}
-			return {
-				code: 0,
-				stdout: b64([
-					"provider      model                                context  max-out  thinking  images",
-					"any-endpoint  workbuddy/deepseek-v4.1-flash         128k     8k       yes       no",
-				].join("\n") + "\n"),
-				// The line that used to turn a working launch into a refusal.
-				stderr: b64("No API key found for another-provider\n"),
-				timed_out: false,
-			};
+			if (line.includes("'-p' 'ping'")) {
+				// The PARENT behaviour, answered with what it actually answered on the
+				// host. This makes the regression real: on c7609fd the probe takes this
+				// branch, classifies no-model and refuses — the test fails there.
+				return {
+					code: 0,
+					stdout: "",
+					stderr: b64("No API key found for any-endpoint.\nNo models available. Use /login\n"),
+					timed_out: false,
+				};
+			}
+			return { code: 0, stdout: "", stderr: "", timed_out: false };
 		});
 		const input = spawnInput(h.root, {
 			host: "vps",
@@ -799,6 +811,42 @@ test("S5.6: a VISIBLE model passes even when another provider has no API key", a
 		assert.equal(runs.length, 1, "a visible model must launch, and launch once");
 		const argv = (runs[0]!.argv ?? []) as string[];
 		assert.equal(argv[argv.indexOf("--model") + 1], "workbuddy/deepseek-v4.1-flash");
+	} finally {
+		h.cleanup();
+	}
+});
+
+/**
+ * pi treats an unregistered id under a known provider as a CUSTOM model and
+ * keeps going (`Using custom model id`); the endpoint decides whether it serves
+ * it. The listing will never contain that id, so a plain "not in the table" rule
+ * would refuse a launch pi itself supports — the same false-negative shape this
+ * probe exists to remove. Only pi's own refusal is a refusal.
+ */
+test("S5.6: a custom model id pi accepts is not refused as model-missing", async () => {
+	const h = harness(localEnv());
+	try {
+		h.client.on("machine.exec", (params: Record<string, unknown>) => {
+			if (!String(params.line).includes("--list-models")) {
+				return { code: 0, stdout: "", stderr: "", timed_out: false };
+			}
+			return {
+				code: 0,
+				stdout: b64([
+					"provider      model                                context  max-out  thinking  images",
+					"any-endpoint  workbuddy/deepseek-v4.1-flash         128k     8k       yes       no",
+				].join("\n") + "\n"),
+				stderr: b64('Warning: Model "any-endpoint/future-model" not found for provider "any-endpoint". Using custom model id.\n'),
+				timed_out: false,
+			};
+		});
+		const input = spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget(),
+			model: "any-endpoint/future-model",
+		});
+		await h.supervisor.spawnChild(input);
+		assert.equal(h.client.paramsFor("terminal.run").length, 1, "pi's custom-id warning is a pass, not a refusal");
 	} finally {
 		h.cleanup();
 	}
