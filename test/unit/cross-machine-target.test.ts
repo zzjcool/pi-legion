@@ -439,6 +439,85 @@ test("S1: subagents.crossMachine survives parseSubagentSettings instead of being
 	assert.match((error as SubagentError).message, /crossMachine\.hosts\.broken\.cwd/);
 });
 
+test("S1: hosts.<host>.piExtensions and worktreeRoot survive the whitelist", () => {
+	// S5.6's false negative, in its root cause: the whitelist dropped both keys
+	// without a word, so a `piExtensions` entry — the exact thing the runbook and
+	// the launch error both tell the operator to write — never reached the remote
+	// argv. `--no-extensions` then removed the model provider, and the probe kept
+	// demanding the setting it had just thrown away.
+	const provider = "/root/.pi/agent/npm/node_modules/pi-any-endpoint/extensions/index.ts";
+	const parsed = parseSubagentSettings(
+		{
+			subagents: {
+				crossMachine: {
+					enabled: true,
+					hosts: {
+						vps: {
+							cwd: "/srv/app",
+							// Padding is trimmed, the entry is kept as typed.
+							piExtensions: [`  ${provider}  `],
+							worktreeRoot: "/srv/trees",
+						},
+						// `[]` is a VALUE ("nothing is appended"), not "absent".
+						bare: { cwd: "/srv/app", piExtensions: [] },
+					},
+				},
+			},
+		},
+		"/tmp/settings.json",
+	);
+	assert.deepEqual(parsed.crossMachine, {
+		enabled: true,
+		hosts: {
+			vps: { cwd: "/srv/app", piExtensions: [provider], worktreeRoot: "/srv/trees" },
+			bare: { cwd: "/srv/app", piExtensions: [] },
+		},
+	});
+
+	// And the consumer sees them: `resolveHostTarget` is where they take effect.
+	const target = resolveHostTarget("vps", parsed.crossMachine);
+	assert.deepEqual(target.piExtensions, [provider]);
+	assert.equal(target.worktreeRoot, "/srv/trees");
+	// The mirror sits beside the configured tree root, not beside the default one.
+	assert.equal(target.mirrorRoot, path.posix.join("/srv", ".pi-subagents-mirror"));
+});
+
+test("S1: a malformed piExtensions / worktreeRoot is refused at load, naming the key", () => {
+	// Shape at load, value at use: a non-array (or an array with a non-string) is
+	// never a value `resolvePiExtensions` could use, so it is rejected where the
+	// operator can see the file and the key. The absolute-path check stays in
+	// `resolvePiExtensions`, because only the launch knows it must be a path ON
+	// THAT MACHINE.
+	const cases: Array<{ block: Record<string, unknown>; key: RegExp }> = [
+		{ block: { piExtensions: "nope" }, key: /crossMachine\.hosts\.vps\.piExtensions/ },
+		{ block: { piExtensions: ["/ok/index.ts", 42] }, key: /crossMachine\.hosts\.vps\.piExtensions/ },
+		{ block: { worktreeRoot: 42 }, key: /crossMachine\.hosts\.vps\.worktreeRoot/ },
+	];
+	for (const { block, key } of cases) {
+		assert.throws(
+			() => parseSubagentSettings(
+				{ subagents: { crossMachine: { enabled: true, hosts: { vps: { cwd: "/srv/app", ...block } } } } },
+				"/tmp/settings.json",
+			),
+			key,
+			JSON.stringify(block),
+		);
+	}
+	// A relative worktreeRoot is KEPT and refused at use, like `cwd`.
+	const kept = parseSubagentSettings(
+		{ subagents: { crossMachine: { enabled: true, hosts: { vps: { cwd: "/srv/app", worktreeRoot: "trees" } } } } },
+		"/tmp/settings.json",
+	);
+	assert.equal(kept.crossMachine?.hosts?.vps?.worktreeRoot, "trees");
+	assert.throws(() => resolveHostTarget("vps", kept.crossMachine), /crossMachine\.hosts\.vps\.worktreeRoot/);
+	// A relative piExtensions entry is refused at use by name, too.
+	const relativeExt = parseSubagentSettings(
+		{ subagents: { crossMachine: { enabled: true, hosts: { vps: { cwd: "/srv/app", piExtensions: ["npm:pi-any-endpoint"] } } } } },
+		"/tmp/settings.json",
+	);
+	assert.throws(() => resolveHostTarget("vps", relativeExt.crossMachine), /piExtensions/);
+});
+
 test("S1: a malformed crossMachine block is rejected at load, a missing one is simply absent", () => {
 	assert.equal(parseSubagentSettings({ subagents: {} }, "/tmp/settings.json").crossMachine, undefined);
 	for (const block of ["nope", 42, []]) {

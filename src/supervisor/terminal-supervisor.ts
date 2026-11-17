@@ -45,6 +45,7 @@ import { childMemoryEnv } from "./child-memory.ts";
 import { defaultPiCliPath } from "./rpc-supervisor.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
 import { hcCliClient, HcRpcError, type HcClient } from "../hc/client.ts";
+import { parseListModels } from "../shared/list-models.ts";
 import { ErrorCodes, SubagentError, unknownChildError } from "../shared/types.ts";
 import {
 	DEFAULT_ABORT_TIMEOUT_MS,
@@ -596,17 +597,24 @@ export class TerminalSupervisor implements LegionSupervisor {
 			throw error;
 		}
 
-		// S5.6: the child's own argv, minus its task, asked one trivial question. A
-		// remote `pi` whose model provider was disabled by `--no-extensions` starts,
-		// prints `No models available`, and then hangs until the collect deadline;
-		// the same invocation answers in seconds. Every failure below therefore lands
-		// BEFORE `terminal.run`, in the launch, with the machine and the fix named.
+		// S5.6: the child's own argv, minus its task, asked whether it can see its
+		// MODEL (`--list-models`). A remote `pi` whose model provider was disabled by
+		// `--no-extensions` starts, prints `No models available`, and then hangs until
+		// the collect deadline; the same invocation answers in seconds. The listing
+		// says nothing about credentials — that is the point: a keyless provider the
+		// child would never use must not refuse a launch that works.
+		//
+		// Every failure below therefore lands BEFORE `terminal.run`, in the launch,
+		// with the machine, the fix and a copyable command named.
 		if (target !== undefined) {
+			// One line, computed once: the request and all four refusals must quote the
+			// SAME command, or the operator debugs a command nobody ran.
+			const probeLine = remoteStartupProbeLine(argv, remoteWorktree?.path ?? target.cwd);
 			const probe = await client.request<{ code?: number | null; stdout?: string; stderr?: string; timed_out?: boolean }>(
 				"machine.exec",
 				{
 					on: target.host,
-					line: remoteStartupProbeLine(argv, remoteWorktree?.path ?? target.cwd),
+					line: probeLine,
 					timeout: REMOTE_STARTUP_PROBE_TIMEOUT_S,
 				},
 			).catch((error: unknown) => {
@@ -621,12 +629,16 @@ export class TerminalSupervisor implements LegionSupervisor {
 			const probeOut = probe === undefined
 				? undefined
 				: `${Buffer.from(String(probe.stdout ?? ""), "base64").toString("utf8")}\n${Buffer.from(String(probe.stderr ?? ""), "base64").toString("utf8")}`;
-			const verdict = probeOut === undefined ? undefined : classifyRemoteStartupProbe(probeOut);
+			const verdict = probeOut === undefined ? undefined : classifyRemoteStartupProbe(probeOut, input.model);
 			const excerpt = (probeOut ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0).slice(0, 5).join("\n");
+			// Appended to EVERY refusal: the line to paste on that machine. Without it the
+			// operator has the symptoms and not the reproduction, and the probe's argv is
+			// the one thing they cannot reconstruct by hand (mapped paths, host extensions).
+			const reproduce = `\n\nCommand (run on '${target.host}' to reproduce):\n${probeLine}`;
 			if (verdict === "no-model") {
 				await rollbackRemoteDir();
 				throw new SubagentError(
-					`host '${target.host}': the child cannot see a model there — the same argv answered:\n${excerpt}\nOn a machine whose models come from an EXTENSION, the child's \`--no-extensions\` also removes the provider. List it in subagents.crossMachine.hosts.${target.host}.piExtensions (e.g. /root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts).`,
+					`host '${target.host}': the child cannot see a model there — the same argv answered:\n${excerpt}\nOn a machine whose models come from an EXTENSION, the child's \`--no-extensions\` also removes the provider. List it in subagents.crossMachine.hosts.${target.host}.piExtensions (e.g. /root/.pi/agent/npm/node_modules/pi-any-endpoint/extensions/index.ts).${reproduce}`,
 					ErrorCodes.INVALID_PARAMS,
 					{ host: target.host, probe: "no-model" },
 				);
@@ -634,15 +646,27 @@ export class TerminalSupervisor implements LegionSupervisor {
 			if (verdict === "conflict") {
 				await rollbackRemoteDir();
 				throw new SubagentError(
-					`host '${target.host}': the child's extensions collide — they are already installed there:\n${excerpt}\nRemove the duplicate from subagents.crossMachine.hosts.${target.host}.piExtensions: an installed package must not be added again as \`--extension\`.`,
+					`host '${target.host}': the child's extensions collide — they are already installed there:\n${excerpt}\nRemove the duplicate from subagents.crossMachine.hosts.${target.host}.piExtensions: an installed package must not be added again as \`--extension\`.${reproduce}`,
 					ErrorCodes.INVALID_PARAMS,
 					{ host: target.host, probe: "conflict" },
+				);
+			}
+			if (verdict === "model-missing") {
+				await rollbackRemoteDir();
+				// The machine HAS models, just not this one — a different problem from
+				// `no-model`, with different fixes. Quote what it does serve (first five)
+				// so the operator can pick a reachable model instead of guessing.
+				const listed = parseListModels(probeOut ?? "").slice(0, 5);
+				throw new SubagentError(
+					`host '${target.host}': the child's model '${input.model}' is not visible there — that machine lists:\n${listed.length > 0 ? listed.join("\n") : "(an empty listing)"}\nPoint this launch at a model that machine serves (the role's \`model\`, \`subagents.defaultModel\`, or \`agentOverrides.<role>.model\`), or put the provider extension that publishes '${input.model}' into subagents.crossMachine.hosts.${target.host}.piExtensions. A model that is LISTED there is enough: the probe does not need a credential.${reproduce}`,
+					ErrorCodes.INVALID_PARAMS,
+					{ host: target.host, probe: "model-missing", model: input.model },
 				);
 			}
 			if (probe !== undefined && typeof probe.code === "number" && probe.code !== 0) {
 				await rollbackRemoteDir();
 				throw new SubagentError(
-					`host '${target.host}': the child's own argv failed on that machine (exit ${probe.code}):\n${excerpt || "(no output)"}`,
+					`host '${target.host}': the child's own argv failed on that machine (exit ${probe.code}):\n${excerpt || "(no output)"}${reproduce}`,
 					ErrorCodes.START_FAILED,
 					{ host: target.host, probe: "failed", code: probe.code },
 				);

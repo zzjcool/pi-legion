@@ -26,7 +26,7 @@ import {
 } from "../runs/role-tool-gates.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import { INHERIT_MODEL_SENTINEL } from "../agents/model-resolution.ts";
-import { splitThinkingSuffix } from "../agents/model-scope.ts";
+import { modelMatches, parseListModels } from "../shared/list-models.ts";
 import {
 	hostExtensionDiscoveryState,
 	type HostExtensionDiscoveryState,
@@ -321,36 +321,15 @@ function defaultRunPi(piCli: string, cwd: string | undefined) {
 	};
 }
 
-export function parseListModels(output: string): string[] {
-	const lines = output.split(/\r?\n/);
-	const models: string[] = [];
-	for (const line of lines) {
-		if (/^provider\b/i.test(line) || !line.trim()) continue;
-		if (/^No models available/i.test(line)) return [];
-		const m = /^(\S+)\s+(\S+)\s+/.exec(line);
-		if (!m) continue;
-		const provider = m[1];
-		const id = m[2];
-		if (provider === "provider" || id === "model") continue;
-		models.push(`${provider}/${id}`);
-	}
-	return models;
-}
-
 /**
- * Is `expected` present in the registry listing?
+ * Both live in `shared/list-models.ts`: the cross-machine startup probe asks the
+ * same question of the same output (`remote.ts`), and two parsers would let the
+ * probe and doctor disagree about whether a machine can see a model.
  *
- * The model id may carry a `:thinking` suffix, and only a KNOWN level is one
- * (`splitThinkingSuffix`, D-R8.3). The previous "drop the last `:` segment" rule
- * was a third, disagreeing definition of the same thing: it truncated
- * `provider/model:variant` — a real id whose `variant` segment is part of the
- * model — and then reported a model as missing that the host actually serves.
+ * Re-exported here because `/legion doctor` is where operators and the existing
+ * tests look for them (`test/unit/legion-doctor.test.ts`).
  */
-export function modelMatches(expected: string, available: readonly string[]): boolean {
-	const e = splitThinkingSuffix(expected).baseModel;
-	if (available.includes(e)) return true;
-	return available.some((a) => a === e || a.endsWith(`/${e}`) || a.split("/").slice(1).join("/") === e);
-}
+export { parseListModels, modelMatches };
 
 function sampleAgentConfig(agent?: AgentConfig): AgentConfig {
 	return (

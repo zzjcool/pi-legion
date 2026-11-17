@@ -18,6 +18,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { HcRpcError, type HcClient } from "../hc/client.ts";
+import { modelMatches, parseListModels } from "../shared/list-models.ts";
 import {
 	ErrorCodes,
 	SubagentError,
@@ -303,35 +304,65 @@ export const REMOTE_WORKTREE_DIR = ".pi-worktrees";
  * the caller reading them is the one who can fix the settings file.
  */
 /**
- * Run the child's exact argv (minus its task) on that machine and classify the
- * answer (S5.6).
+ * Ask the child's exact argv (minus its task) whether it can SEE its model, and
+ * classify the answer (S5.6).
  *
  * The failure this exists for is silent in shape and loud in effect: a `pi` that
  * starts, prints `No models available`, and then hangs until the collect deadline.
  * Waiting five minutes to learn "the model provider was switched off with
- * `--no-extensions`" is the wrong trade; the same argv with `-p ping` answers in
- * seconds.
+ * `--no-extensions`" is the wrong trade.
  *
- * Returns `undefined` when the probe did not decide anything (it ran and printed
- * nothing recognisable, or the machine could not run it at all) — the launch then
- * proceeds and the real child reports for itself.
+ * The probe asks `--list-models`, and that choice is the fix: a LISTING proves
+ * model visibility and says nothing about credentials, which is exactly the
+ * question worth asking before a terminal exists. The first version asked
+ * `-p ping` and read `No API key found for any-endpoint` as "no model" — but a
+ * registry can hold several providers, and one keyless provider that the child
+ * would never have used made a perfectly serviceable launch look dead. With
+ * `--list-models`, a model that is VISIBLE in the table is a pass even when the
+ * same output carries another provider's `No API key` complaint.
+ *
+ * `no-model` therefore means "the listing is empty AND says why". Output we
+ * cannot parse is NOT a verdict (`undefined`): the launch proceeds, because a
+ * fake or unknown `pi` must not be turned into a refusal by a diagnostic.
+ * `model-missing` is the tighter case — the machine lists models, just not this
+ * one.
  */
-export function classifyRemoteStartupProbe(output: string): "no-model" | "conflict" | undefined {
-	if (/No models available|No API key( found)?/i.test(output)) return "no-model";
+export function classifyRemoteStartupProbe(
+	output: string,
+	expectedModel?: string,
+): "no-model" | "conflict" | "model-missing" | undefined {
+	// First, because a collision kills the process before any listing is printed.
 	if (/conflicts with/i.test(output)) return "conflict";
+	// Without a table header there is no listing to compare; the two failure phrases
+	// still mean "this machine has no model", and any other output is undecidable.
+	// (`parseListModels` would read `No API key found for ...` as a provider/model row.)
+	if (!/^\s*provider\s+model\b/im.test(output)) {
+		return /No models available|No API key( found)?/i.test(output) ? "no-model" : undefined;
+	}
+	const models = parseListModels(output);
+	if (models.length === 0) {
+		return /No models available|No API key( found)?/i.test(output) ? "no-model" : undefined;
+	}
+	const expected = expectedModel?.trim() ?? "";
+	if (expected.length > 0 && !modelMatches(expected, models)) return "model-missing";
 	return undefined;
 }
 
 /** Bound on that probe. Same "ten seconds or name the problem" rule as preflight. */
 export const REMOTE_STARTUP_PROBE_TIMEOUT_S = 10;
 
-/** The shell line for that probe: the launch's argv with its task replaced by `-p ping`. */
+/**
+ * The shell line for that probe: the launch's argv with its task replaced by
+ * `--list-models`.
+ */
 export function remoteStartupProbeLine(argv: string[], cwd: string): string {
 	// Drop the task (the last element the backend appended) and ask the same binary
-	// the same flags one trivial question. `-p` is the headless prompt flag, so this
-	// exercises the model provider, which is exactly what can be missing.
+	// the same flags one trivial question. `--list-models` prints the registry the
+	// child would see, without spending a turn and without needing a credential: it
+	// answers "is this model visible there", which is the question the launch can
+	// actually act on.
 	const flags = argv.slice(0, -1);
-	const command = [...flags, "-p", "ping"].map((part) => shQuote(part)).join(" ");
+	const command = [...flags, "--list-models"].map((part) => shQuote(part)).join(" ");
 	return `cd -- ${shQuote(cwd)} && ${command}`;
 }
 

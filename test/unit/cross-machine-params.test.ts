@@ -29,10 +29,12 @@ import {
 	assertLocalWorktree,
 	normalizeHost,
 	remoteDirFor,
+	resolveHostTarget,
 	terminalAddress,
 	thisPackageRoot,
 	type HostTarget,
 } from "../../src/runs/remote.ts";
+import { parseSubagentSettings } from "../../src/agents/settings.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
 
@@ -131,6 +133,11 @@ interface Harness {
 	supervisor: TerminalSupervisor;
 	root: string;
 	cleanup(): void;
+}
+
+/** `machine.exec` carries stdout/stderr base64-encoded — the wire shape, not a choice. */
+function b64(text: string): string {
+	return Buffer.from(text).toString("base64");
 }
 
 function harness(env: NodeJS.ProcessEnv): Harness {
@@ -299,7 +306,7 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 
 		// D6/D9 + S5.6: four setup calls — the explicit checkout question (`test -d`,
 		// spike constraint 4), the preflight `line`, the startup probe (the child's own
-		// argv with `-p ping`), and one `mkdir -p`.
+		// argv with `--list-models`), and one `mkdir -p`.
 		const execs = h.client.paramsFor("machine.exec");
 		assert.equal(execs.length, 4, "checkout probe + preflight + startup probe + remote dir creation");
 		assert.equal(execs[0]!.on, "vps");
@@ -310,11 +317,12 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		const remoteDir = remoteDirFor(target, undefined, input.name);
 		assert.equal(execs[2]!.on, "vps");
 		assert.deepEqual(execs[2]!.argv, ["mkdir", "-p", remoteDir]);
-		// S5.6: the startup probe is the child's own argv, task replaced by `-p ping`,
-		// run on that machine BEFORE a terminal exists.
+		// S5.6: the startup probe is the child's own argv, task replaced by
+		// `--list-models`, run on that machine BEFORE a terminal exists. The listing
+		// proves model VISIBILITY; credentials play no part in it.
 		assert.equal(execs[3]!.on, "vps");
 		assert.match(String(execs[3]!.line), /--no-extensions/);
-		assert.match(String(execs[3]!.line), /'-p' 'ping'$/);
+		assert.match(String(execs[3]!.line), /'--list-models'$/);
 		assert.match(String(execs[3]!.line), /cd -- '\/srv\/remote\/work'/);
 
 		const run = h.client.paramsFor("terminal.run")[0];
@@ -652,23 +660,61 @@ test("S5.6: with no piExtensions the argv is byte-identical to before (nothing a
 	}
 });
 
-test("S5.6: the startup probe's three failures are named before a terminal exists", async () => {
-	const cases = [
+test("S5.6: the startup probe's four failures are named before a terminal exists", async () => {
+	const MODEL = "workbuddy/deepseek-v4.1-flash";
+	const cases: Array<{
+		name: string;
+		result: { code: number; stdout: string; stderr: string; timed_out: boolean };
+		expect: RegExp;
+		details: string;
+		model?: string;
+		also?: Array<RegExp | string>;
+	}> = [
 		{
+			// Both shapes are real: `--list-models` prints the bare marker, while an
+			// older/alternate failure path prints `No API key` and the marker as a
+			// warning. Neither carries a table, so both stay `no-model` (the parser
+			// must not mistake the first sentence for a provider/model row).
 			name: "no-model",
-			result: { code: 1, stdout: "", stderr: Buffer.from("No API key found for the selected model.\nWarning: No models available. Use /login\n").toString("base64") },
+			result: { code: 0, stdout: b64("No API key found for the selected model.\nWarning: No models available. Use /login\n"), stderr: "", timed_out: false },
 			expect: /cannot see a model there/,
 			details: "no-model",
+			also: [/No models available/],
 		},
 		{
 			name: "conflict",
-			result: { code: 1, stdout: "", stderr: Buffer.from('Error: Failed to load extension "/root/.pi/agent/npm/node_modules/pi-legion/index.ts":\n  Tool "legion_output" conflicts with /root/code/pi-legion/index.ts\n').toString("base64") },
+			result: {
+				code: 1,
+				stdout: "",
+				stderr: b64('Error: Failed to load extension "/root/.pi/agent/npm/node_modules/pi-legion/index.ts":\n  Tool "legion_output" conflicts with /root/code/pi-legion/index.ts\n'),
+				timed_out: false,
+			},
 			expect: /extensions collide/,
 			details: "conflict",
 		},
 		{
+			// The machine HAS models, just not this one — output deliberately free of
+			// any `No API key` line, so this cannot be confused with `no-model`.
+			name: "model-missing",
+			result: {
+				code: 0,
+				stdout: b64([
+					"provider      model                    context  max-out  thinking  images",
+					"some-provider other/model-x            128k     8k       yes       no",
+				].join("\n") + "\n"),
+				stderr: "",
+				timed_out: false,
+			},
+			expect: /is not visible there/,
+			details: "model-missing",
+			model: MODEL,
+			// host, the expected model, the first entries of the REAL listing, both fix
+			// directions, and the same command line the probe ran.
+			also: [/vps/, MODEL, /some-provider\/other\/model-x/, /subagents\.defaultModel/, /agentOverrides\.<role>\.model/, /piExtensions/],
+		},
+		{
 			name: "other",
-			result: { code: 2, stdout: "", stderr: Buffer.from("boom: something else\n").toString("base64") },
+			result: { code: 2, stdout: "", stderr: b64("boom: something else\n"), timed_out: false },
 			expect: /child's own argv failed on that machine \(exit 2\)/,
 			details: "failed",
 		},
@@ -680,19 +726,127 @@ test("S5.6: the startup probe's three failures are named before a terminal exist
 			// pass (code 0), the startup probe gets this case's answer. Distinguishing by
 			// the params is the point — the probe is the only call that carries `line`.
 			h.client.on("machine.exec", (params: Record<string, unknown>) => {
-				if (typeof params.line === "string" && params.line.includes("-p")) return probeCase.result;
+				if (String(params.line).includes("--list-models")) return probeCase.result;
 				return { code: 0, stdout: "", stderr: "", timed_out: false };
 			});
-			const input = spawnInput(h.root, { host: "vps", hostTarget: hostTarget() });
+			const input = spawnInput(h.root, {
+				host: "vps",
+				hostTarget: hostTarget(),
+				...(probeCase.model ? { model: probeCase.model } : {}),
+			});
 			const error = await h.supervisor.spawnChild(input).then(() => undefined, (thrown: unknown) => thrown);
 			assert.ok(error instanceof SubagentError, `${probeCase.name}: expected a refusal`);
-			assert.match((error as SubagentError).message, probeCase.expect, probeCase.name);
+			const message = (error as SubagentError).message;
+			assert.match(message, probeCase.expect, probeCase.name);
+			for (const pattern of probeCase.also ?? []) {
+				if (typeof pattern === "string") {
+					assert.ok(message.includes(pattern), `${probeCase.name}: the message must contain ${pattern}`);
+				} else {
+					assert.match(message, pattern, probeCase.name);
+				}
+			}
 			const details = (error as SubagentError).details as Record<string, unknown> | undefined;
 			assert.equal(details?.probe, probeCase.details, probeCase.name);
+			if (probeCase.model) assert.equal(details?.model, probeCase.model, probeCase.name);
+			// Every refusal ends with the line to paste on that machine — and it is the
+			// SAME line the probe ran, not a hand-reconstructed approximation.
+			const probeLine = h.client.paramsFor("machine.exec").map((params) => String(params.line)).find((line) => line.includes("--list-models"));
+			assert.ok(probeLine, `${probeCase.name}: the probe must have run`);
+			assert.ok(message.includes(probeLine), `${probeCase.name}: the message must quote the probe line`);
+			assert.match(message, /Command \(run on 'vps' to reproduce\):/, probeCase.name);
 			// The whole point: no terminal was created, so nothing can hang for five minutes.
 			assert.equal(h.client.paramsFor("terminal.run").length, 0, `${probeCase.name}: no terminal may start`);
 		} finally {
 			h.cleanup();
 		}
+	}
+});
+
+/**
+ * The false negative this run is about (S5.6 follow-up).
+ *
+ * Real argv on the host: with the provider extension finally appended, the same
+ * line answered `pong` — but a `-p ping` probe still said `No API key found for
+ * any-endpoint`, because that registry also holds a second provider with no key. A
+ * model that is VISIBLE in `--list-models` is enough for this launch; a credential
+ * the child never uses must not refuse it.
+ */
+test("S5.6: a VISIBLE model passes even when another provider has no API key", async () => {
+	const h = harness(localEnv());
+	try {
+		h.client.on("machine.exec", (params: Record<string, unknown>) => {
+			if (!String(params.line).includes("--list-models")) {
+				return { code: 0, stdout: "", stderr: "", timed_out: false };
+			}
+			return {
+				code: 0,
+				stdout: b64([
+					"provider      model                                context  max-out  thinking  images",
+					"any-endpoint  workbuddy/deepseek-v4.1-flash         128k     8k       yes       no",
+				].join("\n") + "\n"),
+				// The line that used to turn a working launch into a refusal.
+				stderr: b64("No API key found for another-provider\n"),
+				timed_out: false,
+			};
+		});
+		const input = spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget(),
+			model: "workbuddy/deepseek-v4.1-flash",
+		});
+		await h.supervisor.spawnChild(input);
+		const runs = h.client.paramsFor("terminal.run");
+		assert.equal(runs.length, 1, "a visible model must launch, and launch once");
+		const argv = (runs[0]!.argv ?? []) as string[];
+		assert.equal(argv[argv.indexOf("--model") + 1], "workbuddy/deepseek-v4.1-flash");
+	} finally {
+		h.cleanup();
+	}
+});
+
+/**
+ * End to end for the root cause: a `piExtensions` written in a settings FILE has
+ * to reach the remote argv. Before, `parseSubagentSettings` dropped the key, so
+ * this exact test would have produced an argv without the provider extension while
+ * the launch error still told the operator to add it.
+ */
+test("S5.6: piExtensions from a settings file reach the remote argv and its probe", async () => {
+	const provider = "/root/.pi/agent/npm/node_modules/pi-any-endpoint/extensions/index.ts";
+	const settings = parseSubagentSettings(
+		{
+			subagents: {
+				crossMachine: {
+					enabled: true,
+					hosts: {
+						vps: {
+							cwd: REMOTE_CWD,
+							piLegionRoot: REMOTE_LEGION_ROOT,
+							piExtensions: [provider],
+						},
+					},
+				},
+			},
+		},
+		"/tmp/settings.json",
+	);
+	const target = resolveHostTarget("vps", settings.crossMachine);
+	assert.deepEqual(target.piExtensions, [provider], "the settings entry must survive parsing");
+	const h = harness(localEnv());
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: target }));
+		const argv = ((h.client.paramsFor("terminal.run")[0]?.argv ?? []) as string[]).map(String);
+		const noExtensions = argv.indexOf("--no-extensions");
+		assert.ok(noExtensions >= 0, "the child still starts without the parent's plugin set");
+		const appended = argv.flatMap((arg, index) => (arg === "--extension" && argv[index + 1] === provider ? [index] : []));
+		assert.equal(appended.length, 1, `the host extension must appear exactly once: ${JSON.stringify(argv)}`);
+		assert.ok(appended[0]! > noExtensions, "it must come AFTER --no-extensions, or the switch would drop it");
+		// The probe has to ask the SAME argv: a probe run without the extension would
+		// report a model-less machine and refuse the very launch it should pass.
+		const probeLine = h.client.paramsFor("machine.exec").map((params) => String(params.line)).find((line) => line.includes("--list-models"));
+		assert.ok(probeLine, "the startup probe must be a --list-models call");
+		assert.ok(probeLine!.includes(provider), `the probe must carry the host extension too: ${probeLine}`);
+		assert.equal(h.client.paramsFor("terminal.run").length, 1);
+	} finally {
+		h.cleanup();
 	}
 });

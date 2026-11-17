@@ -752,11 +752,52 @@ function parseCrossMachine(
 				}
 				target.pathMap = pathMap;
 			}
+			// S5.6: the two host keys that decide where the child's MODELS and its
+			// worktrees come from. Both were dropped here (the whitelist is silent),
+			// which made a `piExtensions` entry unusable while the launch error kept
+			// telling the operator to write one: the provider extension never reached
+			// the child's argv, `--no-extensions` removed the provider, and the probe
+			// answered `No API key found`. Only the SHAPE is judged here — an absolute
+			// path ON THAT MACHINE is judged at use time (`resolvePiExtensions` /
+			// `resolveWorktreeRoot`), same policy as `cwd`.
+			const worktreeRoot = optionalString(entry.worktreeRoot, `crossMachine.hosts.${host}.worktreeRoot`, filePath);
+			if (worktreeRoot !== undefined) target.worktreeRoot = worktreeRoot;
+			const piExtensions = parsePiExtensions(
+				entry.piExtensions,
+				`crossMachine.hosts.${host}.piExtensions`,
+				filePath,
+			);
+			if (piExtensions !== undefined) target.piExtensions = piExtensions;
 			hosts[host] = target;
 		}
 		out.hosts = hosts;
 	}
 	return out;
+}
+
+/**
+ * `hosts.<host>.piExtensions`: an array of strings, kept in order.
+ *
+ * Entries are trimmed and kept as typed — including an empty string, which
+ * `resolvePiExtensions` refuses by name at launch. The same "shape here, value
+ * at use" split as `cwd`: a settings file that names no extension (`[]`) is
+ * legal and means "nothing appended".
+ */
+function parsePiExtensions(
+	value: unknown,
+	key: string,
+	filePath: string,
+): string[] | undefined {
+	if (value === undefined) return undefined;
+	const invalid = (): Error =>
+		new Error(
+			`Subagent settings in '${filePath}' have invalid '${key}'; expected an array of paths on that machine.`,
+		);
+	if (!Array.isArray(value)) throw invalid();
+	return value.map((entry) => {
+		if (typeof entry !== "string") throw invalid();
+		return entry.trim();
+	});
 }
 
 /** A trimmed non-empty string, or `undefined` when the key is absent. */

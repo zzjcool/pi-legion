@@ -71,7 +71,7 @@ export PI_LEGION_REMOTE_PI_LEGION_ROOT=/root/code/pi-legion
 # 远端 child 要加载的扩展（逗号分隔，允许空白）。**模型来自扩展时必填**：
 # child 的 argv 带 --no-extensions，在那样的机器上会把模型提供者一起关掉；
 # 不填会在 launch 前被探测拒绝（`No models available`），这是期望行为，不是 bug。
-export PI_LEGION_REMOTE_PI_EXTENSIONS=/root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts
+export PI_LEGION_REMOTE_PI_EXTENSIONS=/root/.pi/agent/npm/node_modules/pi-any-endpoint/extensions/index.ts
 # piCli 必须是 **node 能执行的 JS 入口**，不是 /root/.pi/agent/bin/pi 那种 shell 启动器
 export PI_LEGION_REMOTE_PI=/root/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
 # 可选：跑真 pi 子进程（要花一次真实 turn，且目标机必须有模型凭据）
@@ -222,7 +222,7 @@ node cli.js --no-extensions -p "say ok" → No API key found / No models availab
       "hosts": {
         "host-workspace": {
           "cwd": "/root/code/pi-legion",
-          "piExtensions": ["/root/.pi/agent/npm/node_modules/pi-any-endpoint/index.ts"]
+          "piExtensions": ["/root/.pi/agent/npm/node_modules/pi-any-endpoint/extensions/index.ts"]
         }
       }
     }
@@ -242,14 +242,17 @@ Error: Failed to load extension "…/node_modules/pi-legion/index.ts":
 ```
 
 **launch 前的那一次探测**：现在每次远端 launch 会先用 child 的**完整 argv**（去掉 task、加
-`-p ping`）在目标机跑一次，10 秒内给出结论——
+`--list-models`）在目标机跑一次，10 秒内给出结论。它问的是**模型可见性**，与凭据无关——
+同一个 registry 里另一个 provider 缺 key 不会影响判定，只要期望的 model 出现在列表里就放行。
+任何拒绝都会在末尾附上**可直接复制粘贴**的那条命令行（`Command (run on '<host>' to reproduce):`）。
 
 | 症状（探测输出） | 判定 | launch 行为 |
 |---|---|---|
-| `No models available` / `No API key` | 远端模型提供者没加载 | 拒绝（INVALID_PARAMS），点名 `hosts.<host>.piExtensions` 并附原始两行 |
+| `--list-models` 列表为空且写着 `No models available` / `No API key` | 远端模型提供者没加载 | 拒绝（INVALID_PARAMS），点名 `hosts.<host>.piExtensions` 并附原始两行 |
+| 有模型列表，但没有期望的 `model` | 那台机器不提供这个模型 | 拒绝（INVALID_PARAMS，`probe: "model-missing"`），列出该机器实际前 5 条，并给出改 model / 补 provider 扩展两个方向 |
 | `conflicts with` | 扩展重复 | 拒绝（INVALID_PARAMS），指向"别把已装扩展再加一次" |
 | 其他非 0 退出 | 该 argv 在那台机器上跑不起来 | 拒绝（START_FAILED），附 stderr 前 5 行 |
-| 退出 0 / 无结论 | 正常 | 继续，创建终端 |
+| 退出 0 / 无结论（输出无法解析） | 正常 | 继续，创建终端 |
 
 探测**不可运行**时（`machine.exec` 本身失败）只打一行 stderr 并继续：它是诊断，不是门禁。
 

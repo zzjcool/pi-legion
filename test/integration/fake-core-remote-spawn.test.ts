@@ -210,6 +210,10 @@ function spawnInput(h: Harness, overrides: Partial<SpawnInput> = {}): SpawnInput
 		name: "root.centurion-0",
 		task: "Implement the slice.",
 		agent: agent(),
+		// The model this launch asks for — and the one the fake remote `pi` lists. The
+		// startup probe compares the two, so a fixture without a model would skip the
+		// comparison this file exists to exercise (S5.6).
+		model: "workbuddy/deepseek-v4.1-flash",
 		sessionFile: path.join(h.spawnRoot, "session.jsonl"),
 		tempDir: h.spawnRoot,
 		cwd: h.remoteCwd,
@@ -232,12 +236,29 @@ function localSystemPrompt(spawnRoot: string): { file: string; text: string } {
 // ── the happy path ─────────────────────────────────────────────────────────
 
 
-/** A `pi` CLI the "remote" machine can actually run (S5.6's startup probe). */
+/**
+ * A `pi` CLI the "remote" machine can actually run (S5.6's startup probe).
+ *
+ * The probe asks `--list-models`, so the stub answers like a real registry: a
+ * table that LISTS the model this launch asks for. Anything else is the child's
+ * own invocation, which only has to prove it started.
+ */
 function installFakePiCli(remoteRoot: string): string {
 	const dir = path.join(remoteRoot, ".fake-pi");
 	mkdirSync(dir, { recursive: true });
 	const entry = path.join(dir, "cli.js");
-	writeFileSync(entry, "#!/usr/bin/env node\nprocess.stdout.write('ok\\n');\n", { mode: 0o755 });
+	writeFileSync(
+		entry,
+		`#!/usr/bin/env node
+if (process.argv.includes("--list-models")) {
+	process.stdout.write("provider      model                                context  max-out  thinking  images\\n");
+	process.stdout.write("any-endpoint  workbuddy/deepseek-v4.1-flash         128k     8k       yes       no\\n");
+} else {
+	process.stdout.write("ok\\n");
+}
+`,
+		{ mode: 0o755 },
+	);
 	return path.posix.join(remoteRoot, ".fake-pi", "cli.js");
 }
 
@@ -308,6 +329,14 @@ test("S1: a remote spawn crosses the wire with the remote cwd/argv/env/labels an
 	const execs = h.wireFor("machine.exec");
 	assert.ok(execs.length >= 2, "preflight + mkdir");
 	assert.ok(execs.some((params) => JSON.stringify(params.argv ?? []).includes(remoteDir)));
+	// S5.6: the startup probe is `--list-models` on that machine, and the model it
+	// listed is the one this launch asked for — so the launch proceeded instead of
+	// being refused for a credential it never needed.
+	const probe = execs.find((params) => String(params.line ?? "").includes("--list-models"));
+	assert.ok(probe, `the startup probe must ask --list-models, saw ${JSON.stringify(execs.map((e) => e.line ?? e.argv))}`);
+	assert.equal(probe.on, HOST);
+	assert.match(String(probe.line), /--no-extensions/);
+	assert.ok(h.replies.some((entry) => entry.method === "terminal.run"), "a visible model must still start the terminal");
 
 	// 7. Later calls address the child by its QUALIFIED name: a bare name never
 	//    resolves a remote terminal, so this is what makes abort/collect work.
