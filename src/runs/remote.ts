@@ -206,6 +206,9 @@ export function resolveResumeCwd(input: {
 /** Directory (on the target machine) that holds a run's mirrored temp files. */
 export const REMOTE_DIR_NAME = ".pi-subagents-remote";
 
+/** The mirrored-file directory, a sibling of the worktree root (review M4). */
+export const REMOTE_MIRROR_DIR_NAME = ".pi-subagents-mirror";
+
 /**
  * `file.write`'s ceiling in `hc` (bytes of the DECODED payload). A file above
  * it is refused, never truncated: a half-written system prompt or session is a
@@ -243,6 +246,14 @@ export interface HostTarget {
 	 * The preflight therefore `test -f`s this file and names it when missing.
 	 */
 	piLegionRoot: string;
+	/**
+	 * Directory (on that machine) holding this launch's mirrored argv files.
+	 *
+	 * Beside the worktree root, never inside the checkout: a mirrored file in the
+	 * checkout would land in the child's `git status` and could be committed into
+	 * the delivered branch (review M4).
+	 */
+	mirrorRoot: string;
 	/**
 	 * Directory (absolute, posix, ON that machine) that holds remote child
 	 * worktrees (contract D11/D12).
@@ -328,6 +339,10 @@ export function resolveHostTarget(
 		piLegionRoot: typeof entry.piLegionRoot === "string" && entry.piLegionRoot.trim().length > 0
 			? entry.piLegionRoot.trim()
 			: thisPackageRoot(),
+		mirrorRoot: path.posix.join(
+			path.posix.dirname(resolveWorktreeRoot(name, cwd, entry.worktreeRoot)),
+			REMOTE_MIRROR_DIR_NAME,
+		),
 		worktreeRoot: resolveWorktreeRoot(name, cwd, entry.worktreeRoot),
 	};
 }
@@ -410,13 +425,21 @@ function resolvePathMap(
 }
 
 /**
- * `<target.cwd>/.pi-subagents-remote/<runId>/<sanitized handle>` (D9).
+ * `<mirrorRoot>/<runId>/<sanitized handle>` — where mirrored argv files land (D9).
  *
  * The parent's own `tempDir` stays where it is — it is the parent's cleanup
  * right (`TEMP_OWNER_FILE`) — and this is the OTHER temp dir: the place the
  * argv-referenced files are mirrored to, so a remote child reads files that
  * exist on its machine. Both segments are sanitized because a handle can carry
  * `/` or `..` and this path is joined on posix rules.
+ *
+ * Review M4: this used to live INSIDE the checkout (`<target.cwd>/.pi-subagents-remote`).
+ * But `<target.cwd>` is the tree the child delivers from, so a mirror there shows
+ * up in that repo's `git status`, and a routine `git add -A` would commit a
+ * system prompt (role text + injected settings context) and a session transcript
+ * into the branch the parent then fetches. It is a SIBLING of the checkout now —
+ * the same neighbourhood as the worktrees — so nothing the child delivers can
+ * ever include it.
  *
  * `runId` is optional: the supervisor is constructed without one in production
  * (`index.ts` has no run id at that point), and a directory label is not a
@@ -429,7 +452,7 @@ export function remoteDirFor(
 ): string {
 	const run = sanitizePathSegment(runId, "no-run");
 	const handle = sanitizePathSegment(name, "child");
-	return path.posix.join(target.cwd, REMOTE_DIR_NAME, run, handle);
+	return path.posix.join(target.mirrorRoot, run, handle);
 }
 
 /**
@@ -524,11 +547,39 @@ export async function remotePreflight(
 	client: HcClient,
 	target: HostTarget,
 ): Promise<void> {
+	// Spike constraint 4, first question: is the checkout there at all? Asked without
+	// a `cwd`, so the answer is an exit code we can name instead of a core-level
+	// chdir failure that looks like a missing program.
+	let directoryExists = false;
+	try {
+		const probe = await client.request<HcExecResult>("machine.exec", {
+			on: target.host,
+			argv: ["test", "-d", target.cwd],
+			timeout: REMOTE_SETUP_TIMEOUT_S,
+		});
+		directoryExists = probe?.code === 0;
+	} catch (error) {
+		throw unreachable(target, error);
+	}
+	if (!directoryExists) {
+		throw new SubagentError(
+			`host '${target.host}': cwd '${target.cwd}' does not exist on ${target.host} (remote paths are absolute on that machine; local paths are not translated)`,
+			ErrorCodes.START_FAILED,
+			{ host: target.host, cwd: target.cwd },
+		);
+	}
 	let result: HcExecResult;
 	try {
 		result = await client.request<HcExecResult>("machine.exec", {
 			on: target.host,
 			line: remotePreflightScript(target),
+			// The same `cwd` `terminal.run` will carry, so the CORE validates that this
+			// path is on ITS filesystem (a path that exists here and not there is
+			// rejected by the target). A MISSING directory never reaches this call:
+			// `remotePathIsDirectory` above asked that question explicitly, because a
+			// core told to chdir into a missing path cannot say which part failed
+			// (spike constraint 4).
+			cwd: target.cwd,
 			timeout: REMOTE_SETUP_TIMEOUT_S,
 		});
 	} catch (error) {
@@ -666,11 +717,37 @@ export async function mirrorRemoteFile(
 }
 
 /** `unreachable` is a fact about the MACHINE, never about a path (D14 wording). */
+/**
+ * One failure from the target, classified by what the CORE said (review M6).
+ *
+ * `unreachable` was the only class, so a host name the core does not know was
+ * reported as a network problem — and, being START_FAILED, it also entered the
+ * per-model retry chain, re-running preflight/mkdir/mirror for every candidate.
+ * The core already names the fact (`machine_unknown`, `bad_cwd`, …); this maps
+ * each name to the class the contract's D14 lists and refuses to guess.
+ */
 function unreachable(target: HostTarget, error: unknown): SubagentError {
+	const kind = error instanceof HcRpcError ? error.kind : undefined;
+	if (kind === "machine_unknown") {
+		return new SubagentError(
+			`host '${target.host}' is not a machine this core knows (machine_unknown: ${describeError(error)}); check \`hc machine ls\` and the spelling in subagents.crossMachine.hosts`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: target.host, unknownHost: true },
+		);
+	}
+	if (kind === "bad_cwd") {
+		return new SubagentError(
+			`host '${target.host}': cwd '${target.cwd}' does not exist on ${target.host} (remote paths are absolute on that machine; local paths are not translated): ${describeError(error)}`,
+			ErrorCodes.START_FAILED,
+			{ host: target.host, cwd: target.cwd },
+		);
+	}
 	return new SubagentError(
 		`host '${target.host}' unreachable: ${describeError(error)}`,
 		ErrorCodes.START_FAILED,
-		{ host: target.host },
+		// A setup failure is a fact about the TARGET, not about the model: retrying
+		// the next candidate would repeat every remote round trip and bury the cause.
+		{ host: target.host, noModelFallback: true },
 	);
 }
 

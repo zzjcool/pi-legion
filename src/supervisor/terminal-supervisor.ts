@@ -582,7 +582,11 @@ export class TerminalSupervisor implements LegionSupervisor {
 		} catch (error) {
 			this.removeTempDir(tempDir);
 			await rollbackRemoteWorktree();
-			throw this.failure("terminal.run", terminalNameForChild, error);
+			// Review M7: the ADDRESS, not the bare name. A `terminal.run` failure is
+			// the case the spike's "cwd missing vs program missing" note makes least
+			// informative, and dropping the machine from the message is the difference
+			// between "look at vps" and "look at ... somewhere".
+			throw this.failure("terminal.run", terminalAddress({ terminalName: terminalNameForChild, host }), error);
 		}
 
 		// An address in the reply is the proof the terminal really started. Later

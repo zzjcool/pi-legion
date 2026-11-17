@@ -492,6 +492,12 @@ function launcherVerifyCommands(agent: AgentConfig): string[] {
 }
 
 function canFallbackStart(error: unknown): boolean {
+	// Review M6: a remote setup failure is a fact about ANOTHER machine. The next
+	// candidate would run the same preflight/mkdir/mirror against the same broken
+	// target and then report its own failure as the last error, burying the cause.
+	if (error instanceof SubagentError && (error.details as { noModelFallback?: unknown } | undefined)?.noModelFallback === true) {
+		return false;
+	}
 	return error instanceof SubagentError &&
 		error.code !== ErrorCodes.NOT_FOUND &&
 		error.code !== ErrorCodes.BUDGET_EXCEEDED &&

@@ -124,8 +124,8 @@ function harness(options: { remoteIsRepo?: boolean } = {}): Harness {
 
 	// Review M2: the preflight `test -f`s this package's entry on that machine,
 	// because every child's argv loads it. The "operator" installed it here.
-	mkdirSync(path.join(remoteCwd, ".pi-legion"), { recursive: true });
-	writeFileSync(path.join(remoteCwd, ".pi-legion", "index.ts"), "// fake remote install\n");
+	mkdirSync(path.join(remoteRoot, ".pi-legion"), { recursive: true });
+	writeFileSync(path.join(remoteRoot, ".pi-legion", "index.ts"), "// fake remote install\n");
 
 	const binDir = path.join(root, "bin");
 	mkdirSync(binDir, { recursive: true });
@@ -157,7 +157,7 @@ function harness(options: { remoteIsRepo?: boolean } = {}): Harness {
 	// mapped by content, so the target says where it lives over there (D6).
 	const target = resolveHostTarget(HOST, {
 		enabled: true,
-		hosts: { [HOST]: { cwd: remoteCwd, piLegionRoot: path.posix.join(remoteCwd, ".pi-legion") } },
+		hosts: { [HOST]: { cwd: remoteCwd, piLegionRoot: path.posix.join(remoteRoot, ".pi-legion") } },
 	});
 	const wire = (): WireRequest[] => {
 		if (!existsSync(wirePath)) return [];
@@ -252,6 +252,14 @@ test("S2: a remote worktree is created on that machine and the child starts insi
 	assert.equal(treeHead, execFileSync("git", ["-C", h.remoteCwd, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(), "the tree starts at that checkout's HEAD");
 
 	// 3. Provisioning happened there: the marker is on the remote side only.
+	// Review M4: the mirrored argv files live BESIDE the checkout, never inside the
+	// tree the child delivers from.
+	assert.equal(existsSync(path.join(h.remoteCwd, ".pi-subagents-remote")), false, "the mirror must not be inside the checkout");
+	assert.equal(existsSync(path.join(h.remoteCwd, ".pi-subagents-mirror")), false, "the mirror must not be inside the checkout");
+	assert.ok(
+		existsSync(path.posix.join(path.dirname(h.remoteCwd), ".pi-subagents-mirror")),
+		"the mirror must exist beside the checkout",
+	);
 	assert.ok(existsSync(path.join(treePath, ".pi-provisioned")), "the provision marker must be written on that machine");
 	assert.equal(existsSync(path.join(h.localCheckout, ".pi-provisioned")), false);
 

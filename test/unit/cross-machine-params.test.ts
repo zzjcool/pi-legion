@@ -277,6 +277,7 @@ function hostTarget(overrides: Partial<HostTarget> = {}): HostTarget {
 		piCli: "pi",
 		pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }],
 		piLegionRoot: REMOTE_LEGION_ROOT,
+		mirrorRoot: path.posix.join(path.posix.dirname(REMOTE_CWD), ".pi-subagents-mirror"),
 		// S2: `resolveHostTarget` derives the tree root as a sibling of the checkout.
 		worktreeRoot: path.posix.join(path.posix.dirname(REMOTE_CWD), ".pi-worktrees"),
 		...overrides,
@@ -294,15 +295,18 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		const input = spawnInput(h.root, { host: "vps", hostTarget: target });
 		await h.supervisor.spawnChild(input);
 
-		// D6/D9: exactly two setup calls — one preflight `line`, one `mkdir -p`.
+		// D6/D9: exactly three setup calls — the explicit checkout question (`test -d`,
+		// spike constraint 4), the preflight `line`, and one `mkdir -p`.
 		const execs = h.client.paramsFor("machine.exec");
-		assert.equal(execs.length, 2, "preflight + remote dir creation");
+		assert.equal(execs.length, 3, "checkout probe + preflight + remote dir creation");
 		assert.equal(execs[0]!.on, "vps");
-		assert.equal(typeof execs[0]!.line, "string");
-		assert.match(String(execs[0]!.line), /cd -- '\/srv\/remote\/work'/);
-		const remoteDir = remoteDirFor(target, undefined, input.name);
+		assert.deepEqual(execs[0]!.argv, ["test", "-d", "/srv/remote/work"]);
 		assert.equal(execs[1]!.on, "vps");
-		assert.deepEqual(execs[1]!.argv, ["mkdir", "-p", remoteDir]);
+		assert.equal(typeof execs[1]!.line, "string");
+		assert.match(String(execs[1]!.line), /cd -- '\/srv\/remote\/work'/);
+		const remoteDir = remoteDirFor(target, undefined, input.name);
+		assert.equal(execs[2]!.on, "vps");
+		assert.deepEqual(execs[2]!.argv, ["mkdir", "-p", remoteDir]);
 
 		const run = h.client.paramsFor("terminal.run")[0];
 		assert.ok(run, "terminal.run must be called");
@@ -325,9 +329,12 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		// at this machine.
 		for (const arg of argv) {
 			if (!path.posix.isAbsolute(arg)) continue;
+			// Review M4 moved the mirror BESIDE the checkout, so "inside the checkout"
+			// is no longer the whole rule: in-checkout, in the mirror, or the mapped
+			// package root are the three legal neighbourhoods.
 			assert.ok(
-				arg.startsWith(REMOTE_CWD),
-				`a parent-absolute argv survived: ${arg} is neither in ${REMOTE_CWD} nor mirrored into ${remoteDir}`,
+				arg.startsWith(REMOTE_CWD) || arg.startsWith(target.mirrorRoot) || arg.startsWith(REMOTE_LEGION_ROOT),
+				`a parent-absolute argv survived: ${arg} is in none of ${REMOTE_CWD}, ${target.mirrorRoot}, ${REMOTE_LEGION_ROOT}`,
 			);
 		}
 		// The package's own `-e` entry (present in every child's argv) went through

@@ -62,7 +62,7 @@ function harness(prefix: string) {
 }
 
 function target(overrides: Partial<HostTarget> = {}): HostTarget {
-	return { host: HOST, cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], piLegionRoot: "/srv/pi-legion", worktreeRoot: "/srv/.pi-worktrees", ...overrides };
+	return { host: HOST, cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], piLegionRoot: "/srv/pi-legion", mirrorRoot: "/srv/.pi-subagents-mirror", worktreeRoot: "/srv/.pi-worktrees", ...overrides };
 }
 
 /** Run `body` with the two hc env markers set (so `terminalHostAvailable` is true). */

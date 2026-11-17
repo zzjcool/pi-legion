@@ -24,7 +24,6 @@ import * as path from "node:path";
 import { HcRpcError, type HcClient, type HcMethod } from "../../src/hc/client.ts";
 import {
 	MAX_REMOTE_FILE_BYTES,
-	REMOTE_DIR_NAME,
 	ensureRemoteDir,
 	execResultText,
 	mirrorRemoteFile,
@@ -83,10 +82,20 @@ function config(
 
 function target(overrides: Partial<HostTarget> = {}): HostTarget {
 	// `worktreeRoot` is resolved by `resolveHostTarget` (S2: `dirname(cwd)/.pi-worktrees`).
-	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], piLegionRoot: "/srv/pi-legion", worktreeRoot: "/srv/.pi-worktrees", ...overrides };
+	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], piLegionRoot: "/srv/pi-legion", mirrorRoot: "/srv/.pi-subagents-mirror", worktreeRoot: "/srv/.pi-worktrees", ...overrides };
 }
 
 /** The package root, imported here so the fixture cannot drift from the resolver. */
+
+/**
+ * Answer the preflight's two questions differently: the `test -d` probe says the
+ * checkout exists (unless `probe` overrides), the script call returns `answer`.
+ */
+function preflightClient(answer: () => HcExecResult, probe: () => HcExecResult = () => execResult({ code: 0 })): FakeRemoteClient {
+	const client = new FakeRemoteClient();
+	client.on("machine.exec", (params) => (Array.isArray(params.argv) ? probe() : answer()));
+	return client;
+}
 
 function execResult(overrides: Partial<HcExecResult> = {}): HcExecResult {
 	return { code: 0, ms: 3, signal: null, stdout: "", stderr: "", truncated: false, timed_out: false, ...overrides };
@@ -154,12 +163,13 @@ test("D1: a valid entry resolves remote cwd/node/piCli, defaulting the two progr
 		pathMap: [packageRoot],
 		// review M2: the package root is also what the preflight checks over there.
 		piLegionRoot: thisPackageRoot(),
+		mirrorRoot: "/srv/.pi-subagents-mirror",
 		// S2: remote trees live BESIDE the checkout (contract D11).
 		worktreeRoot: "/srv/.pi-worktrees",
 	});
 	assert.deepEqual(
 		resolveHostTarget("vps", config({ vps: { cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi" } })),
-		{ host: "vps", cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi", pathMap: [packageRoot], piLegionRoot: thisPackageRoot(), worktreeRoot: "/srv/.pi-worktrees" },
+		{ host: "vps", cwd: "/srv/app", node: "/opt/node/bin/node", piCli: "/opt/pi/bin/pi", pathMap: [packageRoot], piLegionRoot: thisPackageRoot(), mirrorRoot: "/srv/.pi-subagents-mirror", worktreeRoot: "/srv/.pi-worktrees" },
 	);
 	// An explicit mapping of the package root wins over `piLegionRoot`.
 	assert.deepEqual(
@@ -178,20 +188,25 @@ test("D1: a valid entry resolves remote cwd/node/piCli, defaulting the two progr
 
 // ── D9: remoteDirFor ───────────────────────────────────────────────────────
 
-test("D9: the remote dir is a posix path under the target cwd, with sanitized segments", () => {
+test("D9: the remote dir is a posix path BESIDE the checkout, with sanitized segments", () => {
 	const t = target({ cwd: "/srv/app" });
 	assert.equal(
 		remoteDirFor(t, "run-abc123", "root.centurion-0"),
-		`/srv/app/${REMOTE_DIR_NAME}/run-abc123/root.centurion-0`,
+		"/srv/.pi-subagents-mirror/run-abc123/root.centurion-0",
 	);
+	// Review M4: the mirrored files must never be inside the tree the child
+	// delivers from — a `git add -A` there would commit the system prompt and the
+	// session transcript into the branch the parent fetches.
+	const relative = path.posix.relative(t.cwd, remoteDirFor(t, "r", "x"));
+	assert.ok(relative.startsWith(".."), `the mirror must be outside the checkout, got ${relative}`);
 	// Both segments are operator/caller input: a slash must not create a new
 	// level, and `..` must not climb out of the remote dir.
 	assert.equal(
 		remoteDirFor(t, "../../etc", "a/b/../c d"),
-		`/srv/app/${REMOTE_DIR_NAME}/..-..-etc/a-b-..-c-d`,
+		"/srv/.pi-subagents-mirror/..-..-etc/a-b-..-c-d",
 	);
-	assert.equal(remoteDirFor(t, undefined, ".."), `/srv/app/${REMOTE_DIR_NAME}/no-run/child`);
-	assert.equal(remoteDirFor(target({ cwd: "/srv/app/" }), "r1", "x"), `/srv/app/${REMOTE_DIR_NAME}/r1/x`);
+	assert.equal(remoteDirFor(t, undefined, ".."), "/srv/.pi-subagents-mirror/no-run/child");
+	assert.equal(remoteDirFor(target({ cwd: "/srv/app/" }), "r1", "x"), "/srv/.pi-subagents-mirror/r1/x");
 });
 
 // ── D9: execResultText ─────────────────────────────────────────────────────
@@ -279,18 +294,23 @@ test("D9: a core-side too_large is re-thrown as START_FAILED with the core's wor
 
 // ── D6/D9: preflight classification ────────────────────────────────────────
 
-test("D6: preflight runs one machine.exec `line` on the target, quoting every value", async () => {
-	const client = new FakeRemoteClient();
-	client.on("machine.exec", () => execResult());
+test("D6: preflight asks the checkout question explicitly, then runs one `line` quoting every value", async () => {
+	const client = preflightClient(() => execResult());
 	await remotePreflight(client, target({ cwd: "/srv/app dir" }));
-	const [params] = client.paramsFor("machine.exec");
-	assert.ok(params);
-	assert.equal(params.on, "vps");
-	assert.equal(typeof params.line, "string");
-	assert.equal("argv" in params, false);
-	assert.match(String(params.line), /cd -- '\/srv\/app dir'/);
-	assert.match(String(params.line), /command -v 'node'/);
-	assert.match(String(params.line), /command -v 'pi'/);
+	const [probe, script] = client.paramsFor("machine.exec");
+	// Spike constraint 4: `test -d` first, in the core's own directory, so a missing
+	// checkout is a message rather than an unattributable chdir failure.
+	assert.deepEqual(probe?.argv, ["test", "-d", "/srv/app dir"]);
+	assert.equal("cwd" in (probe ?? {}), false);
+	assert.ok(script);
+	assert.equal(script.on, "vps");
+	assert.equal(typeof script.line, "string");
+	assert.equal("argv" in script, false);
+	assert.equal(script.cwd, "/srv/app dir", "the script runs IN the checkout, so the core validates it");
+	assert.match(String(script.line), /cd -- '\/srv\/app dir'/);
+	assert.match(String(script.line), /command -v 'node'/);
+	assert.match(String(script.line), /command -v 'pi'/);
+	assert.equal(client.paramsFor("machine.exec").length, 2, "exactly two questions");
 });
 
 test("D6: exit 11/12/13 name the cwd, the node and the pi CLI respectively", async () => {
@@ -300,8 +320,7 @@ test("D6: exit 11/12/13 name the cwd, the node and the pi CLI respectively", asy
 		{ code: 13, pattern: /pi CLI 'pi' is not on PATH on vps/ },
 	];
 	for (const item of cases) {
-		const client = new FakeRemoteClient();
-		client.on("machine.exec", () => execResult({ code: item.code, stderr: b64("from the shell") }));
+		const client = preflightClient(() => execResult({ code: item.code, stderr: b64("from the shell") }));
 		const error = await remotePreflight(client, target()).then(
 			() => undefined,
 			(thrownError: unknown) => thrownError,
@@ -314,8 +333,7 @@ test("D6: exit 11/12/13 name the cwd, the node and the pi CLI respectively", asy
 	// Review M2: exit 14 is the package entry itself — the one absolute path every
 	// child's argv carries. Missing it means `pi` either fails to start or (worse)
 	// starts without the guard extension, so it is a named refusal, not a guess.
-	const missingPackage = new FakeRemoteClient();
-	missingPackage.on("machine.exec", () => execResult({ code: 14 }));
+	const missingPackage = preflightClient(() => execResult({ code: 14 }));
 	const error = await remotePreflight(missingPackage, target()).then(
 		() => undefined,
 		(thrownError: unknown) => thrownError,
@@ -339,15 +357,18 @@ test("D6: an unreachable core is reported as such, never as a missing cwd", asyn
 		(thrownError: unknown) => thrownError,
 	);
 	assert.ok(error instanceof SubagentError);
-	assert.equal((error as SubagentError).code, ErrorCodes.START_FAILED);
-	assert.match((error as SubagentError).message, /host 'vps' unreachable: machine_unknown: unknown machine: vps/);
+	// Review M6 changed the CLASS: an unknown machine name is an input error, not a
+	// connectivity problem, and it must not enter the per-model retry chain.
+	assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+	assert.match((error as SubagentError).message, /host 'vps' is not a machine this core knows/);
+	assert.match((error as SubagentError).message, /machine_unknown: unknown machine: vps/);
 	assert.doesNotMatch((error as SubagentError).message, /does not exist/);
+	assert.doesNotMatch((error as SubagentError).message, /unreachable/);
 });
 
 test("D6: a timed-out or exit-code-less preflight is `unreachable`, not a path problem", async () => {
 	for (const result of [execResult({ code: null, timed_out: true }), execResult({ code: undefined })]) {
-		const client = new FakeRemoteClient();
-		client.on("machine.exec", () => result);
+		const client = preflightClient(() => result);
 		const error = await remotePreflight(client, target()).then(
 			() => undefined,
 			(thrownError: unknown) => thrownError,
@@ -469,4 +490,50 @@ test("B2: a PROJECT-level crossMachine block survives the merge (host config is 
 		subagents: { crossMachine: { enabled: false } },
 	}, "/p.json"));
 	assert.deepEqual(overridden.crossMachine, { enabled: false });
+});
+
+test("M6: the core's own failure kinds are classified, not folded into `unreachable`", async () => {
+	// `machine_unknown` used to read as a network problem ("host 'vps' unreachable:
+	// machine_unknown: …"), sending the operator to look at connectivity for a
+	// misspelled machine name. It is an input error and must say so.
+	const unknown = new FakeRemoteClient();
+	unknown.on("machine.exec", () => {
+		throw new HcRpcError({ code: -32602, message: "unknown machine: vps", data: { kind: "machine_unknown" } });
+	});
+	const unknownError = await remotePreflight(unknown, target()).then(() => undefined, (error: unknown) => error);
+	assert.ok(unknownError instanceof SubagentError);
+	assert.equal((unknownError as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+	assert.match((unknownError as SubagentError).message, /is not a machine this core knows/);
+	assert.doesNotMatch((unknownError as SubagentError).message, /unreachable/);
+
+	// A core that rejects the `cwd` (the path exists here, not there) keeps the cwd
+	// wording instead of becoming "unreachable" too.
+	const badCwd = preflightClient(() => {
+		throw new HcRpcError({ code: -32602, message: "no such directory", data: { kind: "bad_cwd" } });
+	});
+	const cwdError = await remotePreflight(badCwd, target()).then(() => undefined, (error: unknown) => error);
+	assert.ok(cwdError instanceof SubagentError);
+	assert.match((cwdError as SubagentError).message, /cwd '\/srv\/app' does not exist on vps/);
+
+	// Everything else stays `unreachable` — but carries the no-fallback marker, so a
+	// host launch never re-runs remote setup once per model candidate.
+	const transport = preflightClient(() => {
+		throw new Error("socket closed");
+	});
+	const transportError = await remotePreflight(transport, target()).then(() => undefined, (error: unknown) => error);
+	assert.ok(transportError instanceof SubagentError);
+	assert.match((transportError as SubagentError).message, /unreachable: socket closed/);
+	assert.deepEqual((transportError as SubagentError).details as Record<string, unknown>, { host: "vps", noModelFallback: true });
+});
+
+test("M2/D6: the preflight asks about the checkout explicitly and sends no `cwd`", async () => {
+	// A core asked to run with a missing cwd cannot tell that from a missing program
+	// (spike constraint 4), so the checkout is TESTED in the script and the exec
+	// itself runs in the core's own default directory.
+	const client = preflightClient(() => execResult({ code: 0 }));
+	await remotePreflight(client, target());
+	const [probe, script] = client.paramsFor("machine.exec");
+	assert.equal("cwd" in (probe ?? {}), false, "the directory question must not chdir first");
+	assert.deepEqual(probe?.argv, ["test", "-d", "/srv/app"]);
+	assert.equal(script?.cwd, "/srv/app", "the paths are validated by the machine that owns them");
 });
