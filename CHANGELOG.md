@@ -11,6 +11,55 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+## [6.1.0] — 2026-11-17
+
+一次**跨机器**的发布：子 agent 可以跑在另一台机器上（`hc` 的 ssh 远端），而这台机器只负责
+调度、判定和收结果。新增的维度只有一个 —— `host`：本机（缺省）或某个 `hc` machine 的名字。
+选它作为 6.1.0 而不是 7.0.0 的理由很简单：**不设 `host` 时，行为与 6.0.x 逐字节相同** ——
+同一份 params（恰好 5 个本机键、没有 `on`）、同一套 argv、同一个本地 worktree 语义、同样
+的 collect/verify 路径；新增能力全部挂在「名字了另一个机器」这一条分支上。
+
+跨机时，交付通道只有一个：**git remote**。远端那棵树自己 commit、自己
+`git push -u origin pi-subagent/<host>/<name>-<sha8>`，父机再从同一个 remote fetch 那个 sha；
+远端路径永远不被翻译成本地路径（翻译不了的 argv 路径就拒绝，不静默降级）。
+
+同版还有两件**只有真机器才能教**的事：远端 child 的 env 不能被本机 env 覆盖（`hc` 的 env 是
+merge-only overlay，父机的每一条都会盖掉远端正确的那条 —— 实测表现是远端 `pi` 报
+`No models available` 与 `spawn npx ENOENT`）；以及远端 `piCli` 必须是 node 能执行的 JS 入口，
+`/root/.pi/agent/bin/pi` 那种 shell 启动器会让 node 去解析 `case "$0" in`。
+
+### Added
+
+- **`host` 维度贯通**（`cross-machine-spawn-v1`）：`AgentConfig.host`、frontmatter/overrides、`subagent` 工具参数、`ChildRecord.host`/`worktreeHost`、run.json 与 `legion.db`（schema v3 → v4，`PRAGMA table_info` 预检后 ALTER）。legion 侧一律叫 `host`，`hc` 线上叫 `on`，两者**只在一处**映射（`grep -rn 'on: host' src/` 恰好 1 条）；缺省时 params 保持恰好 5 个本机键。
+- **远端 worktree + git remote 交付**：`src/runs/remote-worktree.ts`（建树/删树/provision/origin 归一化等 12 个函数），分支名 `pi-subagent/<host>/<name>-<hex8>`；树是 checkout 的**兄弟目录**（`<dirname(cwd)>/.pi-worktrees/<name>`），镜像目录同样是兄弟（`.pi-subagents-mirror`），都不进交付分支。`assertLocalWorktree()` 单点兜底：远端路径上的本机 `fs`/`git` 操作一律拒绝（D13）。
+- **远端 verify 四分类**（`src/runs/remote-verify.ts`）：`code`（真跑完、退出码非 0）/ `timeout`（`hc` 在 `machine.exec` 截止点杀进程）/ `unreachable`（机器连不上）/ `unknown-host`（core 不认识这个名字）。**只有 `code` 会变成 `rejected`**；其余三类一律 `unknown` —— 没测过的活儿不判不合格。预算超过 `hc` 的 600s 上限会被 clamp，并在判词与 stderr 里各说一次。
+- **产物回收与截断标记**（`src/runs/remote-artifact.ts`）：先问 `file.read` 的**总行数**（`lines` 就是文件总行数），再读尾部窗口，`truncated` / `byteCapped` 由本进程自己判定（`hc` 的字节截断是静默的，不能靠"调用成功"推断完整）。镜像落在 `<runDir>/remote/<name>.jsonl`，绝不进 `sessions/`。collect 的正文会写 `4000 of 250000 lines (truncated — tail only…)` 或 `read-back … FAILED (… rests on no transcript at all)`。
+- **跨机 resume 四步校验**：记录有 host → 该 host 可达 → 远端终端存在（报**地址**与出路）→ 远端 worktree 存在。四步各自失败文案带 `(step N/4)`；终端仍 `live` 时 resume **接管而不重启**（不在远端 fork 出同名第二个终端）。
+- **`subagents.crossMachine` 配置**：`hosts.<host>.{cwd,node,piCli,piLegionRoot,pathMap,piExtensions,worktreeRoot}`，以及 `enabled`（缺省关闭；关了还点名 host 会**拒绝**而不是悄悄在本机跑，D1）。
+- **`piExtensions`**（S5.6 真跑结论）：远端 child 的模型可能**由扩展提供**，而 child 的 argv 带 `--no-extensions`（不能继承本机插件集）。该键列出「那台机器上要加载的扩展」，按 `--extension <p>` 追加在开关之后；模型来自扩展时不填，launch 前的探测会在 10 秒内拒绝并点名这个键。
+
+### Changed
+
+- **远端 child 不再继承本机 env**：`hc` 的 `env` 是 merge-only overlay，父机每一条都会**盖掉**远端正确的那条。现在远端 launch 完全不发 `env` 键（远端进程保留它自己的环境与凭据），本机分支保持不变。这是实测修复：同一台机器上 `pi` 手动可跑，作为 child 却报 `No models available` / `spawn npx ENOENT`。
+- **launch 前多一次可跑性探测**（远端）：用 child 的**完整 argv**（去掉 task、加 `-p ping`）在目标机跑一次，10 秒级。`No models available` / `No API key` → 指向 `piExtensions`；`conflicts with` → 指向"别把已装扩展再加一次"；其它非 0 退出 → 带回 stderr 前 5 行。目的是**10 秒内失败并说清原因**，而不是等 5 分钟到 collect 截止。
+- **preflight 加两项**：`piCli` 必须能被 `node` 执行（绝对路径的 shell 启动器 → `INVALID_PARAMS`，文案给出 `…/dist/bundle/cli.js` 形态）；远端 core 若已携带 legion identity 则拒绝 launch（D7）。
+- **collect 依赖注入 `remoteVerify` / `remoteReadback`**：两者都在 `index.ts` 的两处 `verifyRunner` 位点装配；未装配时远端 child 仍**显式拒绝**而不是拿本机文件冒充结果。
+
+### Fixed
+
+- **远端 worktree 不再把镜像写进交付分支**：镜像目录从 checkout 内移到其兄弟位置（否则一次 `git add -A` 会把 system prompt 与会话转录提交进交付分支）。
+- **`resume` 的 project 级 `crossMachine` 不再被 settings 白名单丢弃**（此前只有 user 级生效）。
+- **`npm-install` 的锁文件探测发往属主机**：`INSTALL_LOCKFILES` 一张表两消费者；远端无锁文件时拒绝，且不写 marker。
+- **失败残留清理**：launch 失败后远端空的镜像目录会被 `rm -rf` 掉；同一远端目录里两个文件同名不同源会被**拒绝**（否则后一个静默覆盖前一个）。
+- **`NAME_TAKEN` 报地址而非裸名**，回滚 retire 失败也不再吞掉（否则那个名字永久被占且无线索）。
+- **`collect` 一个跑在别处的 child**：不再返回"空结果"，而是说明转录在那边、并给出 `status`/`resume` 的出路。
+
+### Compatibility
+
+- **不设 `host` 时，行为与 6.0.x 逐字节相同**：本机 launch 的 params（恰好 5 个键、无 `on`）、argv、`--session` 路径、worktree 语义、acceptance/verify 判词格式全部未变；`collect` 结果里不会多出 `remoteReadback` 键。
+- `legion.db` 从 v3 **单向**升到 v4（新增 `host` / `worktree_host` 两列，`PRAGMA table_info` 预检、幂等）；v4 库不能被 6.0.x 打开。
+- 远端 launch 需要目标机上有 `node`、可被 `node` 执行的 `pi` CLI、以及本包（`piLegionRoot`）；缺任一项会在 preflight 的 10 秒内拒绝并点名该配的键。
+
 ## [6.0.3] — 2026-11-17
 
 ### Fixed
