@@ -87,6 +87,15 @@ function target(overrides: Partial<HostTarget> = {}): HostTarget {
 	return { host: "vps", cwd: "/srv/app", node: "node", piCli: "pi", pathMap: [], piLegionRoot: "/srv/pi-legion", piExtensions: [], mirrorRoot: "/srv/.pi-subagents-mirror", worktreeRoot: "/srv/.pi-worktrees", ...overrides };
 }
 
+test("xm-dispatch D4: resolveHostTarget stamps the role allowlist — default centurion only, explicit wins", () => {
+	// The launch guard reads this off the TARGET (the one object resolver and guard
+	// share), so the default has to be resolved exactly once, here.
+	// Unconfigured = absent, so an existing target keeps its exact shape; the DEFAULT
+	// is the launch guard's, which is also why it is a constant and not a field here.
+	assert.equal(resolveHostTarget("vps", config({ vps: { cwd: "/srv/app" } })).allowRoles, undefined);
+	assert.deepEqual(resolveHostTarget("vps", { enabled: true, allowRoles: ["centurion", "worker"], hosts: { vps: { cwd: "/srv/app" } } }).allowRoles, ["centurion", "worker"]);
+});
+
 /** The package root, imported here so the fixture cannot drift from the resolver. */
 
 /**

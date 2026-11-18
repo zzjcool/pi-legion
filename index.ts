@@ -116,6 +116,7 @@ import { crossMachineCheckupRequested, runCrossMachineCheckup } from "./src/runs
 import { readFileSync } from "node:fs";
 import {
 	effectiveMaxDepth,
+	launchNoticeLines,
 	Orchestrator,
 	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
@@ -5072,7 +5073,10 @@ async function launchStep(
 		// — but it must not be invisible either, or a child quietly runs on a model
 		// nobody registered. Queued launches render this after admission instead
 		// (`Handle.queued` carries no warning; the queue notice does).
-		if (handle.warning) session.results.push(`  ⚠ ${handle.name}: ${handle.warning}`);
+		// B5 (`warning`) and xm-dispatch D2 (`warnings`, the cross-machine extension
+		// skips) share ONE renderer: a skipped provider extension must be as visible as
+		// a custom model id, and the queued path renders through the same function.
+		session.results.push(...launchNoticeLines(handle.name, handle));
 		session.onUpdate?.({
 			content: [
 				{
@@ -7500,12 +7504,8 @@ export function renderCollect(
 			truncated: boolean;
 			byteCapped?: boolean;
 			localPath?: string;
-			/**
-			 * D15: the post-turn refresh failed, so these numbers are the last
-			 * PRE-turn read and were never confirmed as this turn's transcript.
-			 * The word `complete` may not stand alone when this is set.
-			 */
-			stale?: string;
+			/** The transcript's path on that machine (xm-dispatch D3.3). */
+			remotePath?: string;
 			reason?: string;
 			/** `remote-child-fate-v1` §5: why it failed, as a class. */
 			fate?: "no-child" | "no-session" | "path" | "unreachable";
@@ -7597,6 +7597,14 @@ export function renderCollect(
 				);
 				const evidence = readback.evidence ?? [];
 				if (evidence.length > 0) lines.push(`  evidence: ${evidence.join("; ")}`);
+				// xm-dispatch D3.3: a failed read-back names the file it could not read and
+				// the command that fetches it. "No transcript" without an address is the
+				// difference between an operator fixing it and re-running blind.
+				if (readback.remotePath) {
+					lines.push(
+						`  remote: ${readback.remotePath} — retrieve it with: hc exec --on ${readback.host} -- cat ${readback.remotePath}`,
+					);
+				}
 				const screen = readback.screenTail ?? [];
 				if (screen.length > 0) lines.push(`  screen: ${screen.join(" ⏎ ")}`);
 				if (readback.nextStep) lines.push(`  next: ${readback.nextStep}`);
@@ -7606,15 +7614,7 @@ export function renderCollect(
 		} else if (readback.truncated) {
 			const what = readback.byteCapped ? "byte-capped by hc" : "tail only";
 			lines.push(
-				`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (truncated — ${what}; the verdict rests on that tail${readback.stale ? `; the post-turn refresh failed: ${readback.stale}` : ""})`,
-			);
-		} else if (readback.stale) {
-			// D15: the mirror exists and parses, but the refresh that would have made
-			// it THIS turn's transcript failed. Printing `(complete)` here is exactly
-			// the demo's lie — the numbers are a real read, they are just not a
-			// confirmed-current one, so the line says both.
-			lines.push(
-				`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (not confirmed current — the post-turn refresh failed: ${readback.stale}; the verdict rests on this earlier read)`,
+				`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (truncated — ${what}; the verdict rests on that tail)`,
 			);
 		} else {
 			lines.push(`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (complete)`);

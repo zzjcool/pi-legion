@@ -151,6 +151,16 @@ export interface ChildHandle {
 	 * Absent — not empty — when the spawn said nothing.
 	 */
 	warning?: string;
+	/**
+	 * Non-fatal launch notices the CALLER must render (xm-dispatch D2).
+	 *
+	 * A cross-machine launch skips every inherited extension the target cannot
+	 * load; that fact is a warning, not a refusal, and it is aggregated into ONE
+	 * string per launch (never one per package). It travels with the handle
+	 * because `process.stderr` is invisible in the tool result — a skipped
+	 * provider is exactly the kind of "silently degraded" launch this must not be.
+	 */
+	warnings?: string[];
 }
 
 /** Process id and process group id for one descendant of a supervised child. */

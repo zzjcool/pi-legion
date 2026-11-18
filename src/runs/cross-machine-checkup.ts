@@ -53,6 +53,7 @@ import {
 	listHcMachines,
 	missingRemoteCwdQuestion,
 	packageLoaderFor,
+	requiredExtensionMatches,
 	resolveHostTargetAsync,
 	resolvePackagePathOnHost,
 	type HcExecResult,
@@ -747,17 +748,19 @@ async function probeInheritedExtensions(input: {
 	}
 
 	/**
-	 * One extension a launch must be able to load, with its PROVENANCE (D14).
+	 * One extension a launch would try to load, with the role that carries it.
 	 *
-	 * The two sources are NOT equal at launch, which is the whole point of this
-	 * item: `terminal-supervisor` puts what the card declares
-	 * (`extensions` + `subagentOnlyExtensions`, already team-merged and overridden)
-	 * into its `required` set, so a package missing on the target is a HARD REFUSAL
-	 * (D4) — while an inherited one is dropped with a warning and the launch
-	 * continues. D13 removed this contradiction for `entry-missing` and left it for
-	 * the card's own list: doctor printed PASS for a dispatch that then refused.
+	 * "Required" is xm-dispatch D2's definition and NOTHING else: the value matches
+	 * a pattern the card itself wrote into `requiredExtensions`. Everything else —
+	 * an inherited entry AND an extension the card merely lists in
+	 * `extensions`/`subagentOnlyExtensions` — is SKIPPED by the launch with one
+	 * aggregated warning. `requiredExtensionMatches` is the launch's own matcher, so
+	 * this item cannot grow a second reading of the same setting (the demo's doctor
+	 * printed PASS for a dispatch that then refused, and the inverse — doctor
+	 * predicting a refusal for a launch that actually skipped — would be the same
+	 * bug pointing the other way).
 	 */
-	type WantedExtension = { role: string; extension: string; required: boolean };
+	type WantedExtension = { role: string; extension: string; declared: boolean };
 	/**
 	 * Is this value a fact about the TARGET's packages at all?
 	 *
@@ -773,8 +776,9 @@ async function probeInheritedExtensions(input: {
 	const wanted: WantedExtension[] = [];
 	for (const agent of agents) {
 		// The card's own list first: it wins over inheritance when both name the same
-		// entry (`collectChildExtensions` dedupes the same way), and it is what the
-		// launch treats as required.
+		// entry (`collectChildExtensions` dedupes the same way). D2 made it SKIPPABLE
+		// like an inherited one, so the order here is about the count, not about a
+		// verdict.
 		const declared = [...(agent.extensions ?? []), ...(agent.subagentOnlyExtensions ?? [])];
 		const seen = new Set<string>();
 		for (const extension of declared) {
@@ -782,19 +786,19 @@ async function probeInheritedExtensions(input: {
 			const key = extensionDedupeKey(extension);
 			if (seen.has(key)) continue;
 			seen.add(key);
-			wanted.push({ role: agent.name, extension, required: true });
+			wanted.push({ role: agent.name, extension, declared: true });
 		}
 		if (!childInheritsExtensions(agent, env)) continue;
 		for (const extension of inheritedExtensions(agent, hostExtensions, env)) {
 			// Legion's own extension is never inherited — the child-guard names it
 			// explicitly, and loading it twice kills the child (`args.ts` rule).
 			if (matchesExcludedExtension(extension, SELF_EXTENSION_NAME)) continue;
-			// Already collected as the card's (required) entry: listed twice, the same
-			// package would appear under two provenances and one of them would be wrong.
+			// Already collected as the card's own entry: listed twice, the same package
+			// would be counted twice.
 			const key = extensionDedupeKey(extension);
 			if (seen.has(key)) continue;
 			seen.add(key);
-			wanted.push({ role: agent.name, extension, required: false });
+			wanted.push({ role: agent.name, extension, declared: false });
 		}
 	}
 	if (wanted.length === 0) {
@@ -846,39 +850,55 @@ async function probeInheritedExtensions(input: {
 		role: string;
 		reason: "not-installed" | "entry-missing";
 		relative: string;
-		/** Does the ROLE CARD declare it (a launch refuses), or did it merely inherit it? */
+		/** Does the ROLE's `requiredExtensions` claim it (a launch refuses), or is it skippable? */
 		required: boolean;
 	};
+	const requiredByRole = new Map(agents.map((agent) => [agent.name, agent.requiredExtensions ?? []]));
+	const declaredCount = wanted.filter((entry) => entry.declared).length;
 	const missing = new Map<string, UnresolvedPackage>();
 	let checked = 0;
+	let requiredCount = 0;
 	for (const entry of wanted) {
 		checked++;
 		const resolution = resolvePackagePathOnHost(entry.extension, index);
+		// D2's required set — `requiredExtensions`, matched by the LAUNCH's own matcher
+		// (path, package name, or the package-relative spelling). Computed for every
+		// entry, not only the missing ones: the PASS line counts what the card required.
+		const required = requiredExtensionMatches(
+			{
+				extension: entry.extension,
+				...(resolution.packageName !== undefined ? { pkg: resolution.packageName } : {}),
+				...(resolution.relative !== undefined ? { relative: resolution.relative } : {}),
+			},
+			requiredByRole.get(entry.role) ?? [],
+		);
+		if (required) requiredCount++;
 		if (resolution.ok) continue;
-		// D13: the launch REFUSES on `entry-missing` too, so a checkup that skips it
-		// printed PASS for a dispatch that then failed — the demo's contradiction
-		// (doctor green, launch refused). Only `no-package` (this machine cannot say
-		// which package the path belongs to) stays out of the count: it is not a fact
-		// about the target.
+		// Both reasons are facts about the target and both change what a launch does:
+		// `not-installed`/`entry-missing` are exactly the two the launch classifies as
+		// skippable (xm-dispatch D2), or refuses on when the card requires them. A
+		// checkup that dropped either printed PASS for a dispatch that then warned or
+		// refused — the demo's contradiction (doctor green, launch stopped). Only
+		// `no-package` (this machine cannot say which package the path belongs to)
+		// stays out of the count: it is not a fact about the target.
 		if (resolution.reason !== "not-installed" && resolution.reason !== "entry-missing") continue;
 		const name = resolution.packageName ?? path.basename(entry.extension);
 		// One role per package: the FIRST role whose set contained it, because the
 		// `excludeExtensions` fix is written per role and one is enough to launch.
-		// The one exception is provenance: a package that is merely INHERITED by one
-		// role and DECLARED by another is a refusal, and the stricter answer wins —
-		// the JSON fix cannot reach a card-declared entry at all.
+		// The one exception is the verdict: a package that one role merely inherits
+		// (skippable) and another role REQUIRES is a refusal, and the stricter answer
+		// wins — the JSON fix cannot reach a required entry at all.
 		const prior = missing.get(name);
-		if (prior === undefined || (!prior.required && entry.required)) {
+		if (prior === undefined || (!prior.required && required)) {
 			missing.set(name, {
 				role: entry.role,
 				reason: resolution.reason,
 				relative: resolution.relative ?? "",
-				required: entry.required,
+				required,
 			});
 		}
 	}
-	const declaredCount = wanted.filter((entry) => entry.required).length;
-	const inheritedCount = wanted.length - declaredCount;
+
 	if (missing.size === 0) {
 		if (hostUnreadable) {
 			// The card half was checked and is fine; `pi list` on THIS machine failed, so
@@ -886,18 +906,21 @@ async function probeInheritedExtensions(input: {
 			return {
 				id: "inherited-extensions",
 				status: "skip",
-				line: `${declaredCount} extension(s) the role cards declare resolve on ${target.host}, but inherited extensions were not checked (pi list failed on this machine) — run pi list here, then re-run /legion doctor crossmachine`,
+				line: `${checked} extension(s) resolve on ${target.host}, but inherited extensions were not checked (pi list failed on this machine) — run pi list here, then re-run /legion doctor crossmachine`,
 			};
 		}
 		return {
 			id: "inherited-extensions",
 			status: "pass",
-			// The count names the provenance it verified: with no card-declared entry in
-			// the set this is exactly the pre-D14 sentence, and only a set that also holds
-			// the card's own entries says so.
-			line: declaredCount === 0
-				? `${checked} inherited extension(s) resolve on ${target.host}`
-				: `${checked} extension(s) resolve on ${target.host} (${declaredCount} declared by ${declaredCount === 1 ? "a role card" : "role cards"}${inheritedCount > 0 ? `, ${inheritedCount} inherited` : ""})`,
+			// The sentence names what the launch will actually DO with this set: there is
+			// no "inherited vs declared" verdict any more (D2), only "required — a
+			// missing one refuses" vs "skippable — a missing one warns". A set with
+			// neither keeps the pre-D2 sentence byte for byte.
+			line: requiredCount > 0
+				? `${checked} extension(s) resolve on ${target.host} (${requiredCount} required by ${requiredCount === 1 ? "a role card" : "role cards"}, ${checked - requiredCount} skippable)`
+				: declaredCount === 0
+					? `${checked} inherited extension(s) resolve on ${target.host}`
+					: `${checked} extension(s) resolve on ${target.host} (none named in requiredExtensions, so a launch would skip any it cannot load)`,
 		};
 	}
 	const entries = [...missing.entries()];
@@ -905,11 +928,11 @@ async function probeInheritedExtensions(input: {
 	const more = entries.length - shown.length;
 	const requiredMissing = entries.filter(([, info]) => info.required).length;
 	const optionalMissing = entries.length - requiredMissing;
-	// D14's second way out (`excludeExtensions`) filters INHERITANCE, so it is one for
-	// the inherited entries only — a card-declared extension is refused at launch and
-	// no setting can make the child load a package that machine does not have. Merging
-	// by role keeps the snippet composable (review M8), and the cap is applied to the
-	// inherited entries alone so a required one cannot push an inherited one out.
+	// D2's second way out (`excludeExtensions`) is the SKIPPABLE half only: a required
+	// entry (`requiredExtensions`) is a launch refusal, and no setting can make the
+	// child load a package that machine does not have. Merging by role keeps the
+	// snippet composable (review M8), and the cap is applied to the skippable entries
+	// alone so a required one cannot push an inherited one out.
 	const optional = entries.filter(([, info]) => !info.required);
 	const byRole = new Map<string, string[]>();
 	const inJson = new Set<string>();
@@ -929,8 +952,8 @@ async function probeInheritedExtensions(input: {
 			fixes.push(`# ${name} is installed on ${target.host} but does not declare './${info.relative}' — align the package versions on both machines${inJson.has(name) ? ", or exclude it below" : ""}`);
 			continue;
 		}
-		// D4's first way out, with the concrete values — the only one for a required
-		// entry, and the first one for an inherited entry.
+		// D4/D2's first way out, with the concrete values — the only one for a required
+		// entry, and the first one for a skippable entry.
 		fixes.push(`hc exec --on ${target.host} -- pi install npm:${name}`);
 	}
 	if (byRole.size > 0) {
@@ -944,19 +967,19 @@ async function probeInheritedExtensions(input: {
 		status: "fail",
 		line: `${entries.length} package(s) missing on ${target.host}: ${shown
 			.map(([name, info]) => {
-				// D13: the two reasons send the reader to different fixes (install it /
+				// The two reasons send the reader to different fixes (install it /
 				// exclude it here), so the line says which one it is — and the role stays
 				// because the `excludeExtensions` fix below is written per role.
 				const why = info.reason === "entry-missing"
 					? `entry '${info.relative}' not declared on ${target.host}`
 					: `not installed on ${target.host}`;
-				// D14: the consequence is the PROVENANCE's, not the item's. A card-declared
-				// package is a launch refusal (D4); an inherited one is skipped with a
-				// warning. Saying "skip" for the first would be the doctor-vs-launch lie in
-				// the other direction.
-				return `${name} (${why}) for role '${info.role}'${info.required ? " (the role card declares it, so a launch REFUSES)" : ""}`;
+				// D2: the consequence follows `requiredExtensions` and nothing else. An
+				// entry the card merely declares is skipped exactly like an inherited one,
+				// so the tail below is the truth for both; only a REQUIRED entry refuses
+				// the launch.
+				return `${name} (${why}) for role '${info.role}'${info.required ? " (the card requires it, so a launch REFUSES)" : ""}`;
 			})
-			.join(", ")}${more > 0 ? ` and ${more} more` : ""}${optionalMissing === 0 ? "" : ` — the launch will skip ${optionalMissing === 1 ? "it" : "them"} with a warning and continue; an extension the role card declares itself in extensions: is refused instead`}`,
+			.join(", ")}${more > 0 ? ` and ${more} more` : ""}${optionalMissing === 0 ? "" : ` — the launch will skip ${optionalMissing === 1 ? "it" : "them"} with a warning and continue`}`,
 		fixes,
 	};
 }

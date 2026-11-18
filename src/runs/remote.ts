@@ -19,6 +19,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { HcCliClient, HcRpcError, type HcClient } from "../hc/client.ts";
 import { modelMatches, parseListModels } from "../shared/list-models.ts";
+import { matchesExcludedExtension } from "./extension-inheritance.ts";
 import {
 	ErrorCodes,
 	SubagentError,
@@ -94,41 +95,6 @@ export type PackagePathResolution =
 	  };
 
 /**
- * The declared DIRECTORY that covers one requested entry, if any (D13).
- *
- * pi expands a directory declaration (`pi.extensions: ["./extensions"]`) into the
- * concrete files under it, so the parent asks for `extensions/<name>/index.ts`
- * while the target can only report the directory it declared. The declaration is
- * therefore a prefix — and the LONGEST matching one wins, because
- * `extensions` and `extensions/provider` are both legal declarations of one
- * package and only the more specific one names the right directory.
- *
- * Two rules keep this from becoming a guess:
- *
- *   - the prefix ends at a path SEPARATOR (`extensions/`), never a bare
- *     `startsWith`: `extensions-other/x.ts` is a DIFFERENT directory;
- *   - `directory !== true` never matches. A row cached before the flag existed has
- *     `undefined` there, which means "not known to be a directory" — refusing for
- *     one cache TTL is the conservative side of that unknown.
- */
-function directoryEntryCovering(
-	declared: readonly HostPackageEntry[],
-	relative: string,
-): { entry: HostPackageEntry; rest: string } | undefined {
-	let best: { entry: HostPackageEntry; rest: string } | undefined;
-	for (const entry of declared) {
-		if (entry.directory !== true || entry.relative.length === 0) continue;
-		const prefix = `${entry.relative}/`;
-		if (!relative.startsWith(prefix)) continue;
-		const rest = relative.slice(prefix.length);
-		// The rest must stay INSIDE that directory: non-empty, relative, no `..`.
-		if (rest.length === 0 || rest.startsWith("/") || rest.split("/").includes("..")) continue;
-		if (best === undefined || entry.relative.length > best.entry.relative.length) best = { entry, rest };
-	}
-	return best;
-}
-
-/**
  * Re-root a parent package path onto the target by PACKAGE NAME (v1.2).
  *
  * The failure this removes (real run): a Mac parent inherited five extensions as
@@ -141,11 +107,6 @@ function directoryEntryCovering(
  * Deliberately conservative: a package that IS installed there but does NOT
  * expose the same relative entry (a different version/layout) is a REFUSAL, not
  * a best-effort guess — `entry-missing` names what the package does declare.
- *
- * D13: a declared DIRECTORY is a declaration of everything under it, so an exact
- * match is tried first (file declarations stay byte-identical) and then the
- * longest declared directory that properly prefixes the request. A request no
- * declaration covers — file or directory — is still `entry-missing`.
  */
 export function resolvePackagePathOnHost(
 	file: string,
@@ -162,13 +123,17 @@ export function resolvePackagePathOnHost(
 	const declared = index.entries.filter((entry) => entry.name === local.name);
 	const same = declared.find((entry) => entry.relative === relative);
 	if (same !== undefined) return { ok: true, path: same.path, packageName: local.name, relative };
-	const covering = directoryEntryCovering(declared, relative);
-	if (covering !== undefined) {
+	// A package may declare a DIRECTORY (`pi.extensions: ["./extensions"]`): pi then
+	// loads the entries inside it, so the parent's own expansion
+	// (`extensions/<name>/index.ts`, see `resolveExtensionEntries`) names a file the
+	// manifest never spelled out. Matching on the `/` boundary is what makes that
+	// legal, and it cannot loosen a FILE declaration into a directory one — a file
+	// has no sub-paths, so no request can ever start with `<file>/`.
+	const under = declared.find((entry) => entry.relative.length > 0 && relative.startsWith(`${entry.relative}/`));
+	if (under !== undefined) {
 		return {
-			// `path.posix`, never `path.join`: this path lives on THAT machine, and the
-			// parent may well be on a platform whose separator is not `/`.
 			ok: true,
-			path: path.posix.join(covering.entry.path, covering.rest),
+			path: path.posix.join(under.path, relative.slice(under.relative.length + 1)),
 			packageName: local.name,
 			relative,
 		};
@@ -219,12 +184,8 @@ function packagePathError(
 		);
 	}
 	const declared = resolution.declared ?? [];
-	// D13: render a declared DIRECTORY as a directory (trailing `/`). In the real
-	// demo `declared: ./extensions -> /Users/me/pi-autoresearch/extensions` sat next
-	// to a request for `./extensions/pi-autoresearch/index.ts`, and the operator
-	// read that as a layout/version mismatch instead of a directory declaration.
 	const available = declared.length > 0
-		? declared.map((entry) => `./${entry.relative}${entry.directory === true ? "/" : ""} -> ${entry.path}`).join(", ")
+		? declared.map((entry) => `./${entry.relative} -> ${entry.path}`).join(", ")
 		: "(it declares no pi.extensions entries)";
 	return new SubagentError(
 		`host '${host}': package '${name}' IS installed there at ${resolution.remoteDir}, but it does not expose './${resolution.relative}' (declared: ${available}); the launch would have loaded a different entry than the one this machine asked for. ${fix}`,
@@ -234,51 +195,17 @@ function packagePathError(
 }
 
 /**
- * One `--extension` a cross-machine launch DROPPED instead of refusing (D14).
+ * Map a whole argv, including `-e/--extension` pairs (the STRICT mapper).
  *
- * Provenance is not recoverable from argv: `collectChildExtensions` merges the
- * inherited set, the card's own list, the env extras and the builtins into one
- * `string[]` and dedupes it. So the LAUNCH decides which values may be skipped
- * (it still holds `input.agent`) and this record is the report it gets back —
- * never a decision.
- */
-export interface SkippedExtension {
-	/** The parent-absolute `--extension` value that was removed from argv. */
-	file: string;
-	/** The npm package `file` belongs to, when this machine could name one. */
-	package?: string;
-	/**
-	 * Why the value could not be mapped: the resolver's own reason, or `no-index`
-	 * when the target's package list never arrived (`opts.packages === undefined`).
-	 */
-	reason: "not-installed" | "entry-missing" | "no-package" | "no-index";
-	/** The role this launch is starting, when the caller knows it (D4). */
-	role?: string;
-}
-
-/**
- * Map a whole argv, including `-e/--extension` pairs.
+ * Every element either maps or the launch is refused, and an unserializable
+ * `"-e"`/`"--extension"` pair is refused like any other path. Skipping an
+ * unloadable inherited extension is a DIFFERENT decision
+ * ({@link mapRemoteArgvAllowingSkips}); this function is what callers that must
+ * not degrade still use, and widening it would resurrect the silent drop the
+ * A6 rule removed.
  *
- * Without `skippable` this is the byte-for-byte v1.2 behaviour: every element
- * maps or the launch is refused, and an unserializable `"-e"`/`"--extension"`
- * pair is refused like any other path. That default is deliberate and pinned by
- * a test — widening it would resurrect the silent drop this branch removed.
- *
- * With `skippable` (D14) the caller states, per value, whether losing that
- * extension may DEGRADE the launch instead of ending it. Only an `-e`/
- * `--extension` element followed by an ABSOLUTE path is eligible: a builtin ref
- * (`builtin:codemode`) is never dropped and never mapped. When the value is
- * skippable and its mapping would be refused, BOTH argv elements are removed —
- * a lone `--extension`/`--extension <next flag>` is a dangling pair pi cannot
- * parse — and `{file, package?, reason, role?}` is appended to `skipped`.
- *
- * `skippable` and `skipped` are a PAIR: the first permits a drop, the second is
- * the only place the drop is recorded. `skippable` without `skipped` is the
- * exact silent loss D14 exists to remove (`skippable: () => true` and no
- * collector drops an extension and tells nobody), so it is refused as a
- * programmer error — a plain `Error`, not a `SubagentError`, because it is a bug
- * in the caller and not a fact about the machine. (`skipped` alone stays legal:
- * with no policy nothing may be dropped, so nothing needs recording.)
+ * `role` is only read by the missing-package refusal, which names the role in the
+ * `excludeExtensions` fix it hands back (first-run-success D4).
  */
 export function mapRemoteArgv(
 	args: readonly string[],
@@ -289,64 +216,278 @@ export function mapRemoteArgv(
 		localCwd: string;
 		pathMap?: readonly HostPathMapEntry[];
 		packages?: HostPackageIndex;
-		/** The role being launched; the D4 refusal reads it. */
+		/** The role being launched; the missing-package refusal names it (D4). */
 		role?: string;
-		/** May this `--extension` value be dropped instead of refusing (D14)? */
-		skippable?: (file: string) => boolean;
-		/** Collects every dropped value, in argv order. */
-		skipped?: SkippedExtension[];
 	},
 ): string[] {
-	const { skippable, skipped } = opts;
-	// The pair rule (D14): a permitted drop with nowhere to record it would be the
-	// silent loss this whole feature removed. Fail loudly at the call site instead.
-	if (skippable !== undefined && skipped === undefined) {
-		throw new Error(
-			"mapRemoteArgv: `skippable` was supplied without `skipped`, so a dropped extension would be lost silently — pass both (the caller states what may be dropped and where the drop is recorded) or neither",
-		);
-	}
-	// No policy supplied ⇒ the pre-D14 sweep, unchanged: `args.map(...)`.
-	if (skippable === undefined) return args.map((arg) => mapRemoteArgPath({ arg, ...opts }));
+	// The STRICT walk, kept as its own loop on purpose: what this function always
+	// did is "the first unmappable element in ARGV order throws", and a version that
+	// collected skips first would let a later hard error win over an earlier
+	// extension error. Nothing may degrade for callers that still use it.
 	const out: string[] = [];
-	const skip = (file: string): void => {
-		if (skipped === undefined) return;
-		// The refusal already knows which package and why; recomputing the same
-		// resolution here is what keeps `mapRemoteArgPath` a pure "map or refuse"
-		// with no policy inside it (D14 §1).
-		const resolution = opts.packages === undefined ? undefined : resolvePackagePathOnHost(file, opts.packages);
-		const refused = resolution !== undefined && !resolution.ok ? resolution : undefined;
-		// `no-index`: the probe did not answer, so NOTHING can be said about the
-		// package there — a failed probe must not resurrect the dead stop (D14).
-		// `no-package`: the index answered, but this file is inside no npm package
-		// (only reachable for an extension that does not come from `pi list`).
-		const reason: SkippedExtension["reason"] = resolution === undefined
-			? "no-index"
-			: refused !== undefined ? refused.reason : "no-package";
-		const name = refused?.packageName ?? localPackageForFile(file)?.name;
-		skipped.push({
-			file,
-			...(name !== undefined ? { package: name } : {}),
-			reason,
-			...(typeof opts.role === "string" && opts.role.trim().length > 0 ? { role: opts.role.trim() } : {}),
-		});
-	};
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i]!;
-		const value = arg === "-e" || arg === "--extension" ? args[i + 1] : undefined;
-		if (value === undefined || !path.isAbsolute(value) || skippable(value) !== true) {
-			out.push(mapRemoteArgPath({ arg, ...opts }));
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index] as string;
+		const pair = arg === "-e" || arg === "--extension" ? args[index + 1] : undefined;
+		if (pair !== undefined) {
+			out.push(arg, mapRemoteArgPath({ arg: pair, ...opts }));
+			index += 1;
 			continue;
 		}
-		// The pair is skippable: map it, and drop BOTH elements if that is refused.
-		try {
-			out.push(arg, mapRemoteArgPath({ arg: value, ...opts }));
-		} catch (error) {
-			if (!(error instanceof SubagentError)) throw error;
-			skip(value);
+		const inline = inlineExtensionValue(arg);
+		if (inline !== undefined) {
+			out.push(`${EXTENSION_INLINE_PREFIX}${mapRemoteArgPath({ arg: inline, ...opts })}`);
+			continue;
 		}
-		i += 1;
+		out.push(mapRemoteArgPath({ arg, ...opts }));
 	}
 	return out;
+}
+
+/** The one-token spelling `--extension=<path>` (`args.ts` emits the pair form). */
+const EXTENSION_INLINE_PREFIX = "--extension=";
+
+/**
+ * The `--extension=<path>` value, or `undefined`.
+ *
+ * The args builder only ever emits `--extension <path>` as a pair, so this exists
+ * for argv this file did NOT build (a hand-written launch, a future flag form): an
+ * absolute parent path inside it would otherwise reach the remote `pi` verbatim,
+ * because it is neither mapped nor refused.
+ */
+function inlineExtensionValue(arg: string): string | undefined {
+	if (!arg.startsWith(EXTENSION_INLINE_PREFIX)) return undefined;
+	const value = arg.slice(EXTENSION_INLINE_PREFIX.length);
+	return value.length === 0 ? undefined : value;
+}
+
+/**
+ * One inherited extension the target machine cannot load.
+ *
+ * `error` is the refusal that WOULD have been thrown (`cross-machine-spawn-v1`
+ * A6). It travels with the record so a caller that decides to skip can still
+ * hard-fail byte-identically when the extension turns out to be required, and so
+ * the strict wrapper above does not have to rebuild the message from parts.
+ */
+export interface RemoteExtensionSkip {
+	/** The value passed to `-e/--extension` on THIS machine. */
+	extension: string;
+	/** Package the path belongs to, when it is inside one. */
+	package?: string;
+	/** Package-relative entry the parent asked for. */
+	relative?: string;
+	/** Why that machine cannot load it (the only two skippable reasons). */
+	reason: "not-installed" | "entry-missing";
+	/** The refusal A6 defines for this case. */
+	error: SubagentError;
+}
+
+/** The argv, plus every `-e/--extension` pair that could not be mapped. */
+export interface RemoteArgvMapping {
+	args: string[];
+	skipped: RemoteExtensionSkip[];
+}
+
+/**
+ * The two answers a package re-root gives that mean "this machine does not have
+ * that entry" — as opposed to "this argv element was never an extension"
+ * (`no-package`), which is a configuration error and stays fatal.
+ */
+const SKIPPABLE_EXTENSION_REASONS: ReadonlySet<string> = new Set(["not-installed", "entry-missing"]);
+
+/** Read a refusal as a skippable extension, or `undefined` when it is not one. */
+function skippableExtension(error: unknown, extension: string): RemoteExtensionSkip | undefined {
+	if (!(error instanceof SubagentError)) return undefined;
+	const details = error.details as { reason?: unknown; package?: unknown; relative?: unknown } | null | undefined;
+	const reason = typeof details?.reason === "string" ? details.reason : "";
+	if (!SKIPPABLE_EXTENSION_REASONS.has(reason)) return undefined;
+	return {
+		extension,
+		reason: reason as RemoteExtensionSkip["reason"],
+		error,
+		...(typeof details?.package === "string" ? { package: details.package } : {}),
+		...(typeof details?.relative === "string" ? { relative: details.relative } : {}),
+	};
+}
+
+/**
+ * Map an argv onto the target, SKIPPING inherited extensions it cannot load.
+ *
+ * Why this is not the D6 "no drops" rule any more (real run, 6.2.0 → `hw-nj`):
+ * a parent inherits every extension it has installed, the target legitimately has
+ * a different set, and refusing the launch made the operator discover the
+ * difference ONE PACKAGE PER CALL (`pi-autoresearch` first, then `pi-sop`, …).
+ * An inherited extension is a convenience the parent happens to have, not a
+ * contract of the task, so the default is to skip it — WITH a notice, never
+ * silently (that silence is the pre-v1.3 bug A6 removed). Only an extension the
+ * role CARD calls required (`requiredExtensions`) is a refusal, and that
+ * refusal is aggregated by the caller into one message.
+ *
+ * The scope is deliberately exactly `-e/--extension`: every other absolute argv
+ * element (`--skill <path>`, a mirrored file, this machine's `node`) still has
+ * D6's hard refusal, because none of them is a thing the child can run without.
+ */
+export function mapRemoteArgvAllowingSkips(
+	args: readonly string[],
+	opts: {
+		host: string;
+		remoteCwd: string;
+		remoteDir: string;
+		localCwd: string;
+		pathMap?: readonly HostPathMapEntry[];
+		packages?: HostPackageIndex;
+		/**
+		 * The role being launched, forwarded to every refusal this maps (D4).
+		 *
+		 * Optional and additive: it changes nothing about WHICH values are skipped,
+		 * only the sentence an unmappable non-extension argv element is refused
+		 * with (and the `excludeExtensions` fix the missing-package refusal carries).
+		 */
+		role?: string;
+	},
+): RemoteArgvMapping {
+	const out: string[] = [];
+	const skipped: RemoteExtensionSkip[] = [];
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index] as string;
+		const pair = arg === "-e" || arg === "--extension" ? args[index + 1] : undefined;
+		if (pair !== undefined) {
+			try {
+				out.push(arg, mapRemoteArgPath({ arg: pair, ...opts }));
+			} catch (error) {
+				const skip = skippableExtension(error, pair);
+				if (skip === undefined) throw error;
+				skipped.push(skip);
+			}
+			// The VALUE belongs to the switch: dropping only one of the two would hand
+			// the remote pi a flag with the wrong argument.
+			index += 1;
+			continue;
+		}
+		const inline = inlineExtensionValue(arg);
+		if (inline !== undefined) {
+			try {
+				out.push(`${EXTENSION_INLINE_PREFIX}${mapRemoteArgPath({ arg: inline, ...opts })}`);
+			} catch (error) {
+				const skip = skippableExtension(error, inline);
+				if (skip === undefined) throw error;
+				skipped.push(skip);
+			}
+			continue;
+		}
+		out.push(mapRemoteArgPath({ arg, ...opts }));
+	}
+	return { args: out, skipped };
+}
+
+/**
+ * The ONE warning a launch emits for the extensions it skipped (never one per
+ * package — the real run made that the whole complaint).
+ *
+ * The `agentOverrides` snippet is the durable fix: skipping is per launch, so an
+ * operator who keeps hitting the same three missing packages wants them gone from
+ * the inheritance set, not re-skipped every time.
+ */
+export function skippedExtensionsWarning(
+	host: string,
+	agentName: string,
+	skipped: readonly RemoteExtensionSkip[],
+): string {
+	const names = [...new Set(skipped.map((entry) => entry.package ?? path.basename(entry.extension)))];
+	const snippet = JSON.stringify({
+		subagents: { agentOverrides: { [agentName]: { excludeExtensions: names } } },
+	});
+	return `host '${host}': skipped ${names.length} inherited extension${names.length === 1 ? "" : "s"} that machine cannot install/load: ${names.join(", ")}. Install them there, or exclude them permanently: ${snippet}`;
+}
+
+/**
+ * The ONE error a launch emits when a card's `requiredExtensions` cannot be met.
+ *
+ * Aggregated on purpose: a launch that names three required-but-missing packages
+ * must answer once, not make the operator iterate package by package.
+ */
+export function requiredExtensionsError(
+	host: string,
+	agentName: string,
+	missing: readonly RemoteExtensionSkip[],
+): SubagentError {
+	const listed = missing
+		.map((entry) => `${entry.package ?? path.basename(entry.extension)} (${entry.reason === "not-installed" ? "not installed there" : "entry missing there"})`)
+		.join(", ");
+	return new SubagentError(
+		`host '${host}': agent '${agentName}' declares requiredExtensions that machine cannot load: ${listed}. Install them there, or remove them from the card's requiredExtensions (a card that declares an extension required is asking for a hard failure, unlike an inherited one).`,
+		ErrorCodes.INVALID_PARAMS,
+		{ host, agent: agentName, required: missing.map((entry) => ({ extension: entry.extension, package: entry.package, reason: entry.reason })) },
+	);
+}
+
+/**
+ * Does a card's `requiredExtensions` claim one extension?
+ *
+ * Both spellings are accepted, matching `excludeExtensions`' grammar (they are
+ * read by the same matcher): the path the parent passed to `-e` and the package
+ * name the refusal reports. A card that writes
+ * `requiredExtensions: [pi-any-endpoint]` must be understood whether the value
+ * came from a package-shaped path or from a loose one.
+ *
+ * Exported because the launch (which turns a match into a REFUSAL) and
+ * `/legion doctor crossmachine` (which predicts what that launch will do) must
+ * answer this question the SAME way — a doctor that used its own reading is how
+ * the demo got a green checkup for a dispatch that then refused.
+ */
+export function requiredExtensionMatches(
+	entry: {
+		/** The value on `-e/--extension` on THIS machine. */
+		extension: string;
+		/** Package the path belongs to, when this machine can name one. */
+		pkg?: string;
+		/** Package-relative entry the parent asked for, when known. */
+		relative?: string;
+	},
+	required: readonly string[],
+): boolean {
+	if (required.length === 0) return false;
+	const candidates = [entry.extension, ...(entry.pkg !== undefined ? [entry.pkg] : [])];
+	return required.some((pattern) => {
+		// The package-relative spelling a card is most likely to write
+		// (`extensions/pi-sop/index.ts`) is not a name and not an absolute path, so
+		// neither `matchesExcludedExtension` branch would see it. Compared here so a
+		// required entry cannot silently degrade into a skip (fail-open).
+		const relative = pattern.trim().replace(/^\.\//, "");
+		if (entry.relative !== undefined && relative.length > 0) {
+			if (entry.relative === relative || entry.relative.endsWith(`/${relative}`)) return true;
+		}
+		return candidates.some((candidate) => matchesExcludedExtension(candidate, pattern));
+	});
+}
+
+/** The launch's reading of {@link requiredExtensionMatches} for one skip record. */
+function isRequiredExtension(skip: RemoteExtensionSkip, required: readonly string[]): boolean {
+	return requiredExtensionMatches({ extension: skip.extension, ...(skip.package !== undefined ? { pkg: skip.package } : {}), ...(skip.relative !== undefined ? { relative: skip.relative } : {}) }, required);
+}
+
+/**
+ * The whole "what do we do with the skipped extensions" decision, as one pure
+ * answer (xm-dispatch D2).
+ *
+ * Two outcomes and nothing else: ONE aggregated refusal when the card declared any
+ * of them required, otherwise ONE aggregated warning. Returning them from one
+ * function is what keeps the backend from growing a second, drifting copy of the
+ * rule — and it is why the rule can be tested without a terminal, a core or a
+ * socket.
+ */
+export function planSkippedExtensions(opts: {
+	host: string;
+	agentName: string;
+	skipped: readonly RemoteExtensionSkip[];
+	required?: readonly string[];
+}): { warnings: string[]; refused?: SubagentError } {
+	if (opts.skipped.length === 0) return { warnings: [] };
+	const required = opts.required ?? [];
+	const missingRequired = opts.skipped.filter((skip) => isRequiredExtension(skip, required));
+	if (missingRequired.length > 0) {
+		return { warnings: [], refused: requiredExtensionsError(opts.host, opts.agentName, missingRequired) };
+	}
+	return { warnings: [skippedExtensionsWarning(opts.host, opts.agentName, opts.skipped)] };
 }
 
 /**
@@ -592,6 +733,16 @@ export interface HostTarget {
 	 * paths on that machine). Absent ⇒ nothing is appended.
 	 */
 	piExtensions: string[];
+	/**
+	 * Roles allowed to DISPATCH to this machine (xm-dispatch D4).
+	 *
+	 * Absent means {@link DEFAULT_CROSS_MACHINE_ALLOW_ROLES} (`["centurion"]`):
+	 * cross-machine launch is a DELIVERY-UNIT ability, and a scout/worker belongs to
+	 * the remote centurion's own team, created on that machine. The value travels on
+	 * the target because the target is the only object both the resolver (which reads
+	 * the settings) and the launch guard already share.
+	 */
+	allowRoles?: string[];
 	/**
 	 * Directory (on that machine) holding this launch's mirrored argv files.
 	 *
@@ -894,6 +1045,11 @@ export function resolveHostTarget(
 		pathMap: resolvePathMap(name, entry.pathMap, entry.piLegionRoot ?? discoveredRoot),
 		piLegionRoot: nonEmpty(entry.piLegionRoot) ?? discoveredRoot ?? thisPackageRoot(),
 		piExtensions,
+		// xm-dispatch D4: "who may dispatch here". Present only when the operator wrote
+		// it — an unconfigured target keeps the exact pre-v1.6 shape, field for field
+		// (the same promise `piExtensions` makes below), and the DEFAULT lives with the
+		// launch guard, which reads {@link DEFAULT_CROSS_MACHINE_ALLOW_ROLES}.
+		...(config?.allowRoles !== undefined ? { allowRoles: [...config.allowRoles] } : {}),
 		mirrorRoot: path.posix.join(
 			path.posix.dirname(resolveWorktreeRoot(name, cwd, entry.worktreeRoot)),
 			REMOTE_MIRROR_DIR_NAME,
@@ -1126,13 +1282,6 @@ export interface HostPackageEntry {
 	relative: string;
 	/** Absolute path (on that machine). */
 	path: string;
-	/**
-	 * True when the declared entry is a DIRECTORY (D13), which pi expands into the
-	 * files under it; `false` when it is a file; ABSENT when the row predates the
-	 * flag (`undefined` = "not known to be a directory", so it never prefix-matches
-	 * — a stale cache answers `entry-missing` until its TTL expires).
-	 */
-	directory?: boolean;
 }
 
 /**
@@ -1303,24 +1452,11 @@ export function remoteDiscoveryScript(): string {
 		`  for (const rel of list) {`,
 		`    if (typeof rel !== "string") continue;`,
 		`    const abs = path.resolve(dir, rel);`,
-		// D13: ONE stat answers both "is it there" and "is it a directory". A
-		// package may declare a DIRECTORY (`pi.extensions: ["./extensions"]`), and
-		// the parent expands that into concrete files before it asks; without this
-		// fact the target could only report a path the parent never requests.
-		`    let st; try { st = fs.statSync(abs); } catch { continue; }`,
-		`    const isDir = st.isDirectory();`,
+		`    if (!fs.existsSync(abs)) continue;`,
 		`    const relative = path.relative(dir, abs).split(path.sep).join("/");`,
-		// A directory is never an `EXT` line: it is not something `pi --extension`
-		// can execute, so auto-injecting it is worse than not auto-detecting that
-		// provider there. The declaration still reaches the caller as PKGENTRY, and
-		// the parent resolves the files under it itself.
-		`    if (!isDir) {`,
-		`      if (!provider) { try { provider = /registerProvider|registerModelProvider/.test(fs.readFileSync(abs, "utf8")); } catch {} }`,
-		`      process.stdout.write(["EXT", name, abs, provider ? "1" : "0"].join("\\t") + "\\n");`,
-		`    }`,
-		// 5th field: `1`/`0`. A pre-D13 parser splits and ignores it, and a pre-D13
-		// cached row has no 4th value at all — "not known to be a directory".
-		`    process.stdout.write(["PKGENTRY", name, relative, abs, isDir ? "1" : "0"].join("\\t") + "\\n");`,
+		`    if (!provider) { try { provider = /registerProvider|registerModelProvider/.test(fs.readFileSync(abs, "utf8")); } catch {} }`,
+		`    process.stdout.write(["EXT", name, abs, provider ? "1" : "0"].join("\\t") + "\\n");`,
+		`    process.stdout.write(["PKGENTRY", name, relative, abs].join("\\t") + "\\n");`,
 		`  }`,
 		`}' $EXT_DIRS 2>/dev/null || true`,
 		`fi`,
@@ -1381,22 +1517,12 @@ export function buildDiscoveryReport(facts: DiscoveryFacts, source: HostDiscover
 		packages.push({ name, dir });
 	}
 	for (const value of facts.all("PKGENTRY")) {
-		const [name, relative, entryPath, directory] = value.split("\t");
+		const [name, relative, entryPath] = value.split("\t");
 		if (!name || !relative || !entryPath) continue;
 		const key = `${name}\u0000${relative}`;
 		if (seenEntries.has(key)) continue;
 		seenEntries.add(key);
-		// D13: the 5th field of the row — the 4th payload segment, after `name`,
-		// `relative` and `path` — is the probe's `1`/`0`. A row written before it (or a
-		// report read from a cache that old) has no value here, and the field stays
-		// ABSENT on purpose — an unknown entry is not a directory as far as
-		// `resolvePackagePathOnHost` is concerned.
-		packageEntries.push({
-			name,
-			relative,
-			path: entryPath,
-			...(directory === "1" ? { directory: true } : directory === "0" ? { directory: false } : {}),
-		});
+		packageEntries.push({ name, relative, path: entryPath });
 	}
 	const nodeBinary = facts.get("NODE_BIN");
 	const nodeCommand = facts.get("NODE_CMD");
@@ -1443,15 +1569,7 @@ export function buildDiscoveryReport(facts: DiscoveryFacts, source: HostDiscover
  * on its own — the child's argv must stay the set the operator can predict.
  */
 export function discoveredFields(report: HostDiscoveryReport): DiscoveredHostFields {
-	// D13: a declared DIRECTORY is not something `pi --extension` can execute, so it
-	// must never reach argv. The probe stopped emitting those `EXT` rows; this
-	// filter also covers a report cached before it did (TTL heals it).
-	const directories = new Set(
-		report.packageEntries.filter((entry) => entry.directory === true).map((entry) => entry.path),
-	);
-	const providers = report.extensions
-		.filter((extension) => extension.provider && !directories.has(extension.path))
-		.map((extension) => extension.path);
+	const providers = report.extensions.filter((extension) => extension.provider).map((extension) => extension.path);
 	return {
 		...(report.node?.binary ? { node: report.node.binary } : {}),
 		...(report.pi?.entry ? { piCli: report.pi.entry } : {}),
@@ -2017,6 +2135,10 @@ export async function resolveHostTargetAsync(
 	const merged: SubagentsSettings["crossMachine"] = {
 		enabled: true,
 		hosts: { [name]: entry },
+		// xm-dispatch D4: the role allowlist travels with the merged view, or the
+		// async resolver (the path every tool launch uses) would silently fall back to
+		// the default and ignore an operator's `allowRoles`.
+		...(config?.allowRoles !== undefined ? { allowRoles: config.allowRoles } : {}),
 		...(config?.discover !== undefined ? { discover: config.discover } : {}),
 		...(config?.discoveryTtlSeconds !== undefined ? { discoveryTtlSeconds: config.discoveryTtlSeconds } : {}),
 	};

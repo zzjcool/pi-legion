@@ -39,7 +39,6 @@ import {
 } from "../extension/budget.ts";
 import { canUseCachedCollect } from "../extension/recycle.ts";
 import {
-	NO_ASSISTANT_ABORT_REASON,
 	attributeParentSessionShutdown,
 	deriveOutcome,
 	emptyParsedSession,
@@ -55,6 +54,7 @@ import {
 	type AgentConfig,
 	type ChildRecord,
 	DEFAULTS,
+	DEFAULT_CROSS_MACHINE_ALLOW_ROLES,
 	ErrorCodes,
 	unknownChildError,
 	type Execution,
@@ -98,6 +98,7 @@ import { provisionWorktree } from "./provision.ts";
 import type { RemoteVerifyRunner } from "./remote-verify.ts";
 import {
 	remoteMirrorPathFor,
+	type RemoteReadbackFailure,
 	type RemoteReadbackResult,
 	type RemoteSessionRequest,
 } from "./remote-artifact.ts";
@@ -369,16 +370,8 @@ export interface CollectResult {
 		/** The core byte-capped the window we asked for (silent, no flag). */
 		byteCapped?: boolean;
 		localPath?: string;
-		/**
-		 * D15 follow-up: the post-turn refresh FAILED, so this read is the last good
-		 * one and could not be confirmed as the transcript the turn produced.
-		 *
-		 * The numbers above still describe a real read (the mirror was kept, it is the
-		 * only answer this machine has), but they no longer describe THIS turn. The
-		 * reason travels verbatim so the render can say `not confirmed current`
-		 * instead of printing the demo's unqualified `5 of 5 lines (complete)`.
-		 */
-		stale?: string;
+		/** The transcript's path ON THAT MACHINE (so a failure can be acted on). */
+		remotePath?: string;
 		/** Set when the read-back failed outright; the collect then has no text. */
 		reason?: string;
 		/**
@@ -423,6 +416,41 @@ export const COLLECT_GRACE_EXTENSIONS = 2;
 export const COLLECT_DEADLINE_REASON = "collect deadline (per collect attempt) exceeded; child still alive";
 /** Shown when a live child's session ends on an OpenAI/GPT connection blip. */
 export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC child still alive";
+/**
+ * Shown when a cross-machine transcript could not be read (xm-dispatch D3.3).
+ *
+ * Deliberately NOT `no assistant message for the last prompt`: that sentence claims
+ * the child never replied. When the read-back failed the truth is narrower — this
+ * machine could not read the child's words — and the two must never be confused,
+ * because only one of them justifies retiring a working child.
+ */
+export function transcriptNotRetrievedReason(host: string, detail: string): string {
+	return `transcript not retrieved from host '${host}' (${detail}): the child's work cannot be graded from here`;
+}
+
+/**
+ * The `  ⚠ <name>: <text>` lines one launch owes its caller.
+ *
+ * One definition for BOTH render paths — the immediate `▶` line in `launchStep`
+ * and the "started after queued Ns" notice — because a queued (fan-out) launch
+ * renders no `▶` line at all, and a warning that only exists on the immediate path
+ * is exactly the silent degradation D2 forbids. `warning` (model resolution) and
+ * `warnings` (cross-machine extension skips) are different lists and both render.
+ */
+export function launchNoticeLines(
+	name: string,
+	handle: { warning?: string; warnings?: string[] },
+): string[] {
+	const notices = [handle.warning, ...(handle.warnings ?? [])]
+		.filter((line): line is string => typeof line === "string" && line.length > 0);
+	return notices.map((line) => `  ⚠ ${name}: ${line}`);
+}
+
+/** The warning lines of this launch's notice, or the bare notice when there are none. */
+export function noticeWithWarnings(line: string, name: string, handle: { warning?: string; warnings?: string[] }): string {
+	const warnings = launchNoticeLines(name, handle);
+	return warnings.length > 0 ? `${line}\n${warnings.join("\n")}` : line;
+}
 /**
  * #316 D2: the text sent to a child whose last turn produced an empty
  * generation. Addressed to the still-live child, which already holds the task
@@ -601,18 +629,8 @@ export class Orchestrator {
 	 * trip, not a per-parse cost) and read by {@link sessionFileOf}, so every
 	 * `parseSessionFile` in the collect path sees the LOCAL MIRROR without the record
 	 * ever being mutated.
-	 *
-	 * Always holds the LAST SUCCESSFUL read: a failed refresh must not erase a mirror
-	 * that is still the best text this machine has (see {@link refreshRemoteMirror}).
 	 */
 	private readonly remoteSessions = new Map<string, RemoteReadbackResult>();
-	/**
-	 * Why the mirror above could not be refreshed after the turn ended, keyed by
-	 * child name. Set only when a refresh failed on top of a good mirror: the text is
-	 * then possibly a mid-turn snapshot, and {@link mirrorUntrustedReason} keeps the
-	 * verdict from presenting it as the whole transcript.
-	 */
-	private readonly mirrorRefreshFailure = new Map<string, string>();
 	private readonly worktreeBootstrap?: string;
 	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
@@ -722,13 +740,82 @@ export class Orchestrator {
 	 */
 	private sessionFileOf(child: ChildRecord): string {
 		const remote = this.remoteSessions.get(child.name);
-		if (remote === undefined) return child.sessionFile;
+		if (remote === undefined) {
+			// No read-back in THIS process (a fresh process, or `cachedCollect` which
+			// deliberately drops the seam). A remote child still has no local transcript
+			// of its own — the placeholder this machine pre-created is empty forever — so
+			// the only local bytes are a mirror a PREVIOUS collect wrote. Preferring it
+			// over the placeholder is what makes a mirrored transcript readable after a
+			// restart (xm-dispatch D3.2); a local child never has a `remote/` directory,
+			// so its answer is unchanged byte for byte.
+			if (normalizeHost(child.host) !== undefined) {
+				const mirror = remoteMirrorPathFor(this.runDir, child.name);
+				if (fs.existsSync(mirror)) return mirror;
+			}
+			return child.sessionFile;
+		}
 		// A FAILED read-back must not fall back to the record's path: that file is the
 		// empty placeholder this machine pre-created, so reading it would present
 		// "no text" as the child's answer right next to "read-back failed". Point at
 		// the mirror that was never written instead — the parse yields nothing, and the
 		// render says why.
 		return remote.ok ? remote.localPath : remoteMirrorPathFor(this.runDir, child.name);
+	}
+
+	/** The read-back request for one child; the launch and every refresh share it. */
+	private remoteRequestFor(child: ChildRecord): RemoteSessionRequest {
+		return {
+			host: child.host as string,
+			name: child.name,
+			localPath: remoteMirrorPathFor(this.runDir, child.name),
+			...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+			// The address the core really holds: the core may have shortened the name
+			// it was asked for, and asking about a name that never existed would
+			// report "the core does not know it" as a verdict.
+			...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
+		};
+	}
+
+	/**
+	 * Re-read a remote transcript (xm-dispatch D3.1).
+	 *
+	 * The launch-time read is a SNAPSHOT: a cross-machine child writes its words on
+	 * the other machine over the whole turn, so a mirror fetched at launch+ε holds
+	 * the header and the prompt and nothing else. Deriving a verdict from it read a
+	 * finished child as `aborted (no assistant message for the last prompt)` while
+	 * its 11-line transcript, its report and its files were all there — the single
+	 * worst bug of the 6.2.0 real run.
+	 *
+	 * So every point that may now be reading a settled transcript refreshes first.
+	 * A refresh FAILURE is not fatal: the previous mirror stays, and the failure
+	 * itself is recorded (a verdict is never invented from silence).
+	 *
+	 * Is there anything to (re-)fetch at all? See {@link canRefreshRemote}, which is
+	 * asked BEFORE the await — the reason is there.
+	 */
+	/**
+	 * Is there a cross-machine transcript to (re-)fetch for this child?
+	 *
+	 * Asked BEFORE the `await` on purpose: `collect()` must reach the supervisor
+	 * wait without yielding the microtask queue for a LOCAL child (a caller may
+	 * `collect()` and act on the supervisor's first synchronous call). Only a remote
+	 * child pays the hop, which it has to pay anyway.
+	 */
+	private canRefreshRemote(child: ChildRecord): boolean {
+		return this.remoteReadback !== undefined && normalizeHost(child.host) !== undefined;
+	}
+
+	private async refreshRemoteSession(child: ChildRecord): Promise<void> {
+		const readback = this.remoteReadback;
+		if (readback === undefined) return;
+		if (normalizeHost(child.host) === undefined) return;
+		this.remoteSessions.set(child.name, await readback(this.remoteRequestFor(child)));
+	}
+
+	/** The failed read-back for this child, when its words never arrived here. */
+	private transcriptUnavailable(child: ChildRecord): RemoteReadbackFailure | undefined {
+		const remote = this.remoteSessions.get(child.name);
+		return remote !== undefined && !remote.ok ? remote : undefined;
 	}
 
 	/** `CollectResult.remoteReadback`, or nothing when this child is local. */
@@ -745,15 +832,12 @@ export class Orchestrator {
 				truncated: false,
 				reason: remote.reason,
 				fate: remote.fate,
+				...(remote.remotePath ? { remotePath: remote.remotePath } : {}),
 				evidence: remote.evidence,
 				nextStep: remote.nextStep,
 				...(remote.screenTail && remote.screenTail.length > 0 ? { screenTail: remote.screenTail } : {}),
 			};
 		}
-		// D15: a refresh that failed did not replace the mirror, so these numbers are
-		// the last PRE-turn read. Carrying the reason is what stops the render from
-		// calling them `complete` — the same read D15 called a lie by name.
-		const stale = this.mirrorRefreshFailure.get(child.name);
 		return {
 			host: remote.host,
 			lines: remote.lines,
@@ -761,122 +845,8 @@ export class Orchestrator {
 			truncated: remote.truncated,
 			byteCapped: remote.byteCapped,
 			localPath: remote.localPath,
-			...(stale === undefined ? {} : { stale }),
+			remotePath: remote.remotePath,
 		};
-	}
-
-	/**
-	 * The read-back request for a child that ran elsewhere. One spelling, used by the
-	 * collect-time read and by the post-turn refresh, so the mirror path both write to
-	 * cannot diverge.
-	 */
-	private remoteSessionRequestFor(child: ChildRecord): RemoteSessionRequest {
-		return {
-			host: child.host as string,
-			name: child.name,
-			localPath: remoteMirrorPathFor(this.runDir, child.name),
-			...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
-			// The address the core really holds: the core may have shortened the name
-			// it was asked for, and asking about a name that never existed would
-			// report "the core does not know it" as a verdict.
-			...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
-		};
-	}
-
-	/**
-	 * Read the mirror AGAIN, once the turn is over.
-	 *
-	 * Why this exists (real 6.2.0 demo, Mac → hw-nj): the mirror used to be fetched
-	 * exactly once, at the top of `collect()`, BEFORE `awaitSupervisor`. A collect that
-	 * started mid-turn therefore derived its verdict — and reported `readbackFacts` —
-	 * from a snapshot taken while the turn was still writing. That demo read 5 lines
-	 * off the machine, called it "5 of 5 lines (complete)", and returned
-	 * `aborted (no assistant message for the last prompt)` while the machine went on to
-	 * hold 11 lines for a remote centurion that had answered.
-	 *
-	 * Only ever called after a wait returned `settled`/`gone`: while the turn is in
-	 * flight the mirror is EXPECTED to be short, so re-reading it would buy nothing and
-	 * would turn every poll into a round trip. The "never read the remote for a live,
-	 * still-running child" rule is exactly why this is one refresh at the end and not a
-	 * loop.
-	 *
-	 * Never throws, and never overwrites a good mirror with a failure: the text already
-	 * on disk stays parsable, and {@link mirrorUntrustedReason} keeps the verdict from
-	 * presenting it as the whole transcript.
-	 */
-	private async refreshRemoteMirror(child: ChildRecord): Promise<void> {
-		if (this.remoteReadback === undefined || normalizeHost(child.host) === undefined) return;
-		let read: RemoteReadbackResult;
-		try {
-			read = await this.remoteReadback(this.remoteSessionRequestFor(child));
-		} catch (error) {
-			// The seam answers with a failure OBJECT; a throw is a bug in it, and must not
-			// turn a finished turn into a thrown collect. Treat it as an unreachable host.
-			read = {
-				ok: false,
-				host: child.host as string,
-				reason: error instanceof Error ? error.message : String(error),
-				fate: "unreachable",
-				evidence: [],
-				nextStep: "retry collect (the transcript is on that machine; the refresh did not reach it)",
-			};
-		}
-		if (read.ok) {
-			this.remoteSessions.set(child.name, read);
-			this.mirrorRefreshFailure.delete(child.name);
-			return;
-		}
-		if (this.remoteSessions.get(child.name)?.ok) {
-			// Keep the last good mirror, but remember that it could not be confirmed as
-			// current — that is what stops a stale snapshot from being read as a verdict.
-			this.mirrorRefreshFailure.set(child.name, `${read.fate}: ${read.reason}`);
-			return;
-		}
-		// Nothing was ever read: record the fresh failure so `readbackFacts` names it.
-		this.remoteSessions.set(child.name, read);
-	}
-
-	/**
-	 * Why the mirror cannot be presented as this turn's complete transcript.
-	 *
-	 * `deriveOutcome` only sees bytes: it cannot tell "the child really never replied"
-	 * from "we are looking at a short or partial snapshot of a transcript that does
-	 * reply". Those must not collapse into the frozen
-	 * `aborted (no assistant message …)` reason — the first is the child's fate, the
-	 * second is this machine's blind spot, and D15 of `cross-machine-spawn-v1.md`
-	 * promises an honest `unknown` for exactly that case.
-	 */
-	private mirrorUntrustedReason(child: ChildRecord): string | undefined {
-		if (normalizeHost(child.host) === undefined) return undefined; // a local transcript is authoritative
-		const refreshFailure = this.mirrorRefreshFailure.get(child.name);
-		if (refreshFailure !== undefined) {
-			return `read-back could not be refreshed after the turn ended (${refreshFailure}), so the mirror may still be a mid-turn snapshot`;
-		}
-		const remote = this.remoteSessions.get(child.name);
-		// No text at all: `deriveOutcome` already answers "no messages in session", which
-		// is honest about having read nothing (and `readbackFacts` names the failure).
-		if (remote === undefined || !remote.ok) return undefined;
-		if (remote.lines === 0) return "read-back was empty (0 lines on that machine), so no reply can be read here";
-		if (remote.truncated) {
-			return `read-back was truncated (${remote.returned} of ${remote.lines} lines), so the last turn's reply may be outside the window`;
-		}
-		return undefined;
-	}
-
-	/**
-	 * `deriveOutcome`, minus the one verdict this machine cannot honestly reach from a
-	 * partial mirror. See {@link mirrorUntrustedReason}.
-	 *
-	 * A COMPLETE remote transcript that ends without an assistant message still derives
-	 * `aborted`, with the frozen reason: that is the child's own fate (`session.test.ts`
-	 * pins it), not a read-back artifact.
-	 */
-	private deriveMirroredOutcome(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>): Execution {
-		const outcome = deriveOutcome(parsed);
-		if (outcome.reason !== NO_ASSISTANT_ABORT_REASON) return outcome;
-		const untrusted = this.mirrorUntrustedReason(child);
-		if (untrusted === undefined) return outcome;
-		return { ...outcome, status: "unknown", reason: untrusted };
 	}
 
 	sessionFileFor(name: string): string {
@@ -1509,6 +1479,27 @@ export class Orchestrator {
 					ErrorCodes.INVALID_PARAMS,
 				);
 			}
+			// xm-dispatch D4: only a DELIVERY-UNIT role crosses machines, and that is a
+			// design rule, not a shortcut: a centurion owns the tree, the team and the
+			// collect on the machine it works on, so its scouts and workers belong to a
+			// team created THERE. A scout or worker launched from here would put one
+			// agent's turn on a machine whose team, ledger and deliverable the parent
+			// never sees — the shape the real run produced (a remote scout whose 11-line
+			// transcript and report were judged from an empty local placeholder).
+			//
+			// A RESUME is not a dispatch (`previous` is the child being reconnected), so
+			// it is deliberately outside this rule: an already-running cross-machine child
+			// must stay controllable whatever a later settings edit says.
+			if (previous === undefined) {
+				const allowed = hostTarget.allowRoles ?? [...DEFAULT_CROSS_MACHINE_ALLOW_ROLES];
+				if (!allowed.includes(input.agent.name)) {
+					throw new SubagentError(
+						`host '${host}' cannot be dispatched to agent '${input.agent.name}': cross-machine launch is for a DELIVERY UNIT, and only ${allowed.map((role) => `'${role}'`).join(", ")} may cross. Dispatch a centurion to that machine and let IT create its ${input.agent.name} team there. To allow it anyway: "subagents": { "crossMachine": { "allowRoles": [${[...new Set([...allowed, input.agent.name])].map((role) => `"${role}"`).join(", ")}] } }`,
+						ErrorCodes.INVALID_PARAMS,
+						{ host, agent: input.agent.name, allowRoles: allowed },
+					);
+				}
+			}
 		}
 		// ── Cross-machine delivery preflight (contract `cross-machine-demo-ux` D7) ──
 		//
@@ -1951,6 +1942,10 @@ export class Orchestrator {
 				// B5: an in-process spawn's non-fatal model-resolution notice, one hop
 				// closer to the caller so `launchStep` can render it. Never persisted.
 				...(result.warning ? { warning: result.warning } : {}),
+				// xm-dispatch D2: the extensions this launch skipped (aggregated by the
+				// backend). Same reasoning as `warning`, and never persisted: it describes
+				// THIS spawn against THIS target's package set.
+				...(result.warnings ? { warnings: result.warnings } : {}),
 			};
 		} catch (error) {
 			this.admitting.delete(name);
@@ -2505,7 +2500,10 @@ export class Orchestrator {
 			// become visible. Same two-space `⚠` shape `launchStep` uses; the caller
 			// pushes nothing extra there (`Handle.queued` carries no warning).
 			const startedLine = `▶ ${payload.name} started after queued ${Math.round(waitedMs / 1000)}s`;
-			this.notice(handle.warning ? `${startedLine}\n  ⚠ ${payload.name}: ${handle.warning}` : startedLine);
+			// Every launch notice travels here too: a queued (fan-out) launch renders no
+			// `▶` line of its own, so this notice is the ONLY place its warnings can
+			// become visible — the D2 skipped-extension summary included.
+			this.notice(noticeWithWarnings(startedLine, payload.name, handle));
 			guard?.settle({ kind: "admitted", waitedMs });
 		} catch (error) {
 			const again = guard?.probe() ?? ({ admitted: true } as AdmissionVerdict);
@@ -3026,11 +3024,15 @@ export class Orchestrator {
 			// the outcome would be derived from a file nobody ever wrote.
 			child = this.requireChild(name);
 		}
-		// S4/D15: a child that ran elsewhere writes its transcript THERE. Fetch it once
-		// into `<runDir>/remote/<name>.jsonl` (never `sessions/`: a mirror must not be
+		// S4/D15: a child that ran elsewhere writes its transcript THERE. Fetch it into
+		// `<runDir>/remote/<name>.jsonl` (never `sessions/`: a mirror must not be
 		// mistaken for a local transcript) and let every parse below read the mirror.
 		// A failed read-back is NOT fatal: the collect continues with no text, and the
 		// render says why (an empty answer with no explanation is the M5 bug).
+		// xm-dispatch D3.1: this FIRST fetch is only the starting snapshot — the mirror
+		// is re-fetched below once the wait settles, because a cross-machine child is
+		// still writing when this line runs.
+		if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
 		if (normalizeHost(child.host) !== undefined && this.remoteReadback === undefined) {
 			// A context without a read-back seam cannot read a transcript that lives on
 			// another machine. Saying so is the whole point (review M5): the alternative
@@ -3041,10 +3043,6 @@ export class Orchestrator {
 				ErrorCodes.INVALID_PARAMS,
 			);
 		}
-		if (this.remoteReadback !== undefined && normalizeHost(child.host) !== undefined) {
-			this.remoteSessions.set(child.name, await this.remoteReadback(this.remoteSessionRequestFor(child)));
-			this.mirrorRefreshFailure.delete(child.name);
-		}
 		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(this.sessionFileOf(child)));
 		if (opts.signal?.aborted) return abortedSnapshot();
 		if (this.pendingDialogs(name).length) return this.blockedResult(child);
@@ -3053,11 +3051,7 @@ export class Orchestrator {
 		// A connection blip writes stopReason "error" before the client retries.
 		// That looks like a finished turn, but the RPC child is still in it.
 		// Skipping the supervisor wait here is what retired a live worker.
-		const initialComplete = isLastTurnComplete(initial) && !this.liveConnectionBlip(child, initial);
-		// Did a real wait run? When the snapshot already ended a turn there is no
-		// `awaitSupervisor` return, so there is nothing new to read back either.
-		const waitedForTurn = !initialComplete;
-		let wait: CollectWait = initialComplete
+		let wait: CollectWait = isLastTurnComplete(initial) && !this.liveConnectionBlip(child, initial)
 			? "settled"
 			: await this.awaitSupervisor(child, deadline, opts.signal);
 		if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
@@ -3070,13 +3064,10 @@ export class Orchestrator {
 			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
-		// S4/D15 follow-up (real 6.2.0 demo): the mirror was taken BEFORE the wait, so
-		// for a turn that ENDED during it that snapshot is a mid-turn one. Re-read it
-		// now — the verdict and `readbackFacts` must both describe the transcript the
-		// turn actually produced, not the tail of it that existed when collect started.
-		// Nothing is read while the turn is still in flight (`timeout` keeps the
-		// running snapshot and the next collect reads again).
-		if (waitedForTurn && (wait === "settled" || wait === "gone")) await this.refreshRemoteMirror(child);
+		// xm-dispatch D3.1: the verdict about to be derived must describe the transcript
+		// as it is NOW. Everything above only ever read the launch-time snapshot, which
+		// is how a finished 11-line transcript was judged from its first 5 lines.
+		if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
 		let parsed = parseSessionFile(this.sessionFileOf(child));
 		// #232: no settle-quiet wait here.
 		//
@@ -3102,7 +3093,10 @@ export class Orchestrator {
 		// dead child never received the `running` snapshot. Keeping the guard makes
 		// the intent explicit instead of relying on that coincidence — see D5 and
 		// the disclosure in the #227 contract.
-		if (wait === "timeout" && !this.supervisor.isAlive(name) && isLastTurnComplete(parsed)) {
+		// xm-dispatch D3.3: never on a transcript this attempt could not read — the
+		// "complete turn" here would be a PREVIOUS mirror's, and finishing on it is how
+		// a stale snapshot becomes this turn's delivery.
+		if (wait === "timeout" && !this.supervisor.isAlive(name) && isLastTurnComplete(parsed) && this.transcriptUnavailable(child) === undefined) {
 			return this.finishCollect(child, parsed, deriveOutcome(parsed), deadline);
 		}
 		// The ladder that turns (transcript, wait verdict) into an outcome lives in
@@ -3161,9 +3155,7 @@ export class Orchestrator {
 	> {
 		const name = child.name;
 		let parsed = input;
-		// `deriveMirroredOutcome`, not `deriveOutcome`: a short/truncated mirror cannot
-		// reach the frozen "no assistant message" verdict (see mirrorUntrustedReason).
-		let execution = this.deriveMirroredOutcome(child, parsed);
+		let execution = deriveOutcome(parsed);
 		if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
 			// Same non-terminal signal as the deadline path: watch() re-arms on
 			// `running` and does not retire. An already-settled blip has to keep
@@ -3172,8 +3164,9 @@ export class Orchestrator {
 				const held = await this.waitOutTransientConnection(child, deadline, signal);
 				if (held === "aborted" || signal?.aborted) return { kind: "aborted" };
 				if (held === "blocked") return { kind: "blocked" };
+				if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
 				parsed = parseSessionFile(this.sessionFileOf(child));
-				execution = this.deriveMirroredOutcome(child, parsed);
+				execution = deriveOutcome(parsed);
 			}
 			if (this.supervisor.isAlive(name) && (isTransientConnectionFailure(execution) || !isLastTurnComplete(parsed))) {
 				execution = { ...execution, status: "running", reason: TRANSIENT_CONNECTION_REASON };
@@ -3187,6 +3180,25 @@ export class Orchestrator {
 			execution = { ...execution, status: "running", reason: COLLECT_DEADLINE_REASON };
 		} else if (wait === "gone" && parsed.turns.length === 0) {
 			execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
+		}
+		// xm-dispatch D3.3: a transcript that did not arrive is NOT a verdict about the
+		// child. Two wrong answers were possible here, and both were live: judging the
+		// empty mirror gave `aborted (no assistant message for the last prompt)` for a
+		// finished worker, and grading the PREVIOUS mirror gave `success` for a turn
+		// this attempt never read (presenting last turn's output as this turn's
+		// delivery). So any terminal status is rewritten to `unknown` — the one honest
+		// statement is "this machine cannot read the words, so it cannot grade the
+		// work". `running` is left alone: a live child is already saying the truthful
+		// thing, and `shouldRecycleAfterCollect` must keep refusing to retire it.
+		const unavailable = this.transcriptUnavailable(child);
+		if (unavailable !== undefined && execution.status !== "running") {
+			execution = {
+				status: "unknown",
+				reason: transcriptNotRetrievedReason(unavailable.host, unavailable.reason),
+				turns: execution.turns,
+				toolErrors: execution.toolErrors,
+				...(child.model ? { model: child.model } : {}),
+			};
 		}
 		// A parent shutdown can resolve the in-flight wait by killing the child.
 		// That is not the child settling a turn with no assistant reply.
@@ -3271,15 +3283,14 @@ export class Orchestrator {
 		const settled = await this.awaitSupervisor(child, deadline, signal);
 		if (settled === "aborted" || signal?.aborted) return { kind: "aborted" };
 		if (settled === "blocked") return { kind: "blocked" };
-		// The retried turn is a NEW turn on that child, so a mirror read before the
-		// re-prompt is older than the turn it is about to be asked to judge. Same
-		// refresh rule as the first wait: only once the wait says the turn ended.
-		if (settled === "settled" || settled === "gone") await this.refreshRemoteMirror(child);
 		// The retried turn is classified by the SAME ladder as a first turn (major 1):
 		// a connection blip stays `running`, a dead child with an empty transcript is
 		// `aborted`, a parent shutdown is attributed, and a still-running turn keeps
 		// its `running` snapshot. Only the note about the spent budget is added
 		// later, at the single terminal exit (`finishCollect`).
+		// xm-dispatch D3.1: a retried turn on another machine wrote its words THERE, so
+		// the retry's own verdict needs the retry's own read-back.
+		if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
 		const classified = await this.classifyOutcome(child, parseSessionFile(this.sessionFileOf(child)), settled, deadline, signal);
 		if (classified.kind !== "outcome") return { kind: classified.kind };
 		return { kind: "retried", parsed: classified.parsed, execution: classified.execution };
@@ -3539,7 +3550,12 @@ export class Orchestrator {
 		child.acceptance = acceptance;
 		if (execution.status !== "running") this.recordSettled(child, execution, isLastTurnComplete(parsed));
 		if (!isRetired()) this.onChildUpdate(child);
-		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
+		// xm-dispatch D3.3: a transcript this attempt could not read contributes NO
+		// text. Keeping the parsed bytes would hand the parent a previous mirror's last
+		// turn as this turn's delivery, right next to a verdict that says `unknown`.
+		const output = this.transcriptUnavailable(child) !== undefined
+			? ""
+			: execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
 		// A stop can land between the snapshot and here. The lifecycle state must not
 		// be revived (above), but the terminal text still belongs on disk: this collect
 		// is the only writer of the child's artifact, so returning early here dropped
@@ -3695,34 +3711,36 @@ export class Orchestrator {
 	 * returns on the first observed growth. The sleeps stay on the injected
 	 * `now`/`sleep` deps, so `test/perf/collect-latency.test.ts` can drive them
 	 * on its virtual clock.
-	 *
-	 * D15 follow-up: a child that ran elsewhere answers `false` without sleeping —
-	 * growth there is only visible through a read-back, which this window does not
-	 * perform (see the body). The local path below is unchanged.
 	 */
 	private async collectArtifactGrowing(child: ChildRecord, signal?: AbortSignal): Promise<boolean> {
-		// D15 follow-up: a child that ran elsewhere is never graced, and must not pay
-		// for the question either. Growth on that machine is only observable through a
-		// read-back, and D15 deliberately does not read the remote inside this window
-		// (the one read is the post-turn refresh, after a wait has settled — never a
-		// poll). Pointing the probe at the mirror therefore bought nothing: no local
-		// writer can grow that file, so the loop only slept up to `POLL_INTERVAL_MS`
-		// before answering the same `false` the empty placeholder used to answer
-		// immediately. A real grace extension for a remote child would have to call
-		// `refreshRemoteMirror` inside the window; this contract does not poll there.
-		if (normalizeHost(child.host) !== undefined) return false;
-		// A local child's artifact is the file the verdict is parsed from, so ask the same
-		// resolver everything else in collect asks (for a local child it is
-		// `child.sessionFile`, byte for byte — the resolver only differs for the remote
-		// case excluded above).
-		const artifact = this.sessionFileOf(child);
-		const before = artifactSize(artifact);
+		if (normalizeHost(child.host) !== undefined && this.remoteReadback !== undefined) {
+			// A remote child's transcript grows on ITS machine. The local placeholder never
+			// moves, so the size probe below answered "no growth" on the first iteration
+			// and the grace loop broke immediately — the second half of xm-dispatch D3.1
+			// ("a running child must show what it has already written"). Growth is the
+			// remote line count, re-fetched on each poll.
+			// ONE refresh per window, not one per local poll tick: a remote read-back is a
+			// fresh client plus two `file.read` round trips, and `ARTIFACT_GROWTH_POLL_MS`
+			// (50ms) would pay that ten times for a single 500ms window.
+			const before = this.remoteLineCount(child);
+			if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return false;
+			if (signal?.aborted) return false;
+			await this.refreshRemoteSession(child);
+			return this.remoteLineCount(child) > before;
+		}
+		const before = artifactSize(child.sessionFile);
 		if (before <= 0 || signal?.aborted) return false;
 		for (let waited = 0; waited < POLL_INTERVAL_MS; waited += ARTIFACT_GROWTH_POLL_MS) {
 			if (await this.sleepOrAbort(Math.min(ARTIFACT_GROWTH_POLL_MS, POLL_INTERVAL_MS - waited), signal)) return false;
-			if (artifactSize(artifact) > before) return true;
+			if (artifactSize(child.sessionFile) > before) return true;
 		}
 		return false;
+	}
+
+	/** Lines the last read-back saw on that machine (`0` before any read succeeded). */
+	private remoteLineCount(child: ChildRecord): number {
+		const remote = this.remoteSessions.get(child.name);
+		return remote !== undefined && remote.ok ? remote.lines : 0;
 	}
 
 	private async sleepOrAbort(ms: number, signal?: AbortSignal): Promise<boolean> {
@@ -3802,22 +3820,11 @@ export class Orchestrator {
 		}
 		const sessionExists = fs.existsSync(child.sessionFile);
 		const parsed = sessionExists ? parseSessionFile(this.sessionFileOf(child)) : emptyParsedSession();
-		// D15: the verdict stamped here must be the one a collect would reach. A mirror
-		// that is truncated, empty or could not be refreshed is THIS machine's blind
-		// spot, not the child's fate, so `deriveMirroredOutcome` answers `unknown` with
-		// the read-back reason instead of the frozen `no assistant message` sentence
-		// D15 disowned — through the retire door, which is the same sentence otherwise.
-		if (!child.execution && sessionExists) child.execution = this.deriveMirroredOutcome(child, parsed);
+		if (!child.execution && sessionExists) child.execution = deriveOutcome(parsed);
 		// Stamp the cause before killing so an in-flight collect cannot
 		// overwrite it with "no assistant message" after the process dies.
 		if (opts?.cause === "session-shutdown" && this.supervisor.isAlive(name)) {
-			const derived = child.execution ?? this.deriveMirroredOutcome(child, parsed);
-			// D15: the shutdown sentence asserts the child produced no assistant message,
-			// which an untrusted mirror cannot show. Attribution is only honest for a
-			// transcript this machine actually has; a local one always is.
-			child.execution = this.mirrorUntrustedReason(child) === undefined
-				? attributeParentSessionShutdown(derived, parsed)
-				: derived;
+			child.execution = attributeParentSessionShutdown(child.execution ?? deriveOutcome(parsed), parsed);
 		}
 		if (this.supervisor.isAlive(name)) {
 			await this.supervisor.retire(

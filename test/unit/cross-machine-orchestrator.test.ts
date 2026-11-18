@@ -227,6 +227,93 @@ test("D1: host + worktree:false reaches the terminal backend with the target", a
 	});
 });
 
+// NB: `utility: true` is the SCOUT CARD's field (the role must stay a leaf); the
+// `cannot carry a utility dispatch` refusal is a different flag (`utilityDispatch`,
+// set by `vexillatio`) with its own contract test, and it fires before this rule.
+test("xm-dispatch D4: a scout cannot cross machines by default — only a delivery-unit role may", async () => {
+	// The user's design intent, verbatim: "why can scout and worker be dispatched
+	// across machines? only centurion should cross." A scout is a member of the team
+	// that remote centurion creates ON that machine.
+	const h = harness("xm-roles-scout-");
+	await insideHcTerminal(async () => {
+		try {
+			await assert.rejects(
+				() => h.orchestrator.launch({ agent: agent({ name: "scout", utility: true }), task: "t", host: HOST, hostTarget: target() }),
+				(rejected: unknown): boolean => {
+					assert.ok(rejected instanceof SubagentError, `must refuse with a SubagentError, got ${String(rejected)}`);
+					assert.equal((rejected as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+					const message = (rejected as SubagentError).message;
+					// The reason AND the way out are both in the sentence.
+					assert.match(message, /cross-machine launch is for a DELIVERY UNIT, and only 'centurion' may cross/);
+					assert.match(message, /Dispatch a centurion to that machine and let IT create its scout team there/);
+					assert.match(message, /"allowRoles": \["centurion", "scout"\]/);
+					return true;
+				},
+			);
+			assert.equal(h.supervisor.calls.length, 0, "the refusal must precede any spawn");
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("xm-dispatch D4: a worker is refused too, unless the target's allowRoles says otherwise", async () => {
+	const h = harness("xm-roles-worker-");
+	await insideHcTerminal(async () => {
+		try {
+			await assert.rejects(
+				() => h.orchestrator.launch({ agent: agent({ name: "worker" }), task: "t", host: HOST, hostTarget: target() }),
+				/cannot be dispatched to agent 'worker'/,
+			);
+			// Explicit allowlist = the operator's decision, and the launch proceeds.
+			const handle = await h.orchestrator.launch({
+				agent: agent({ name: "worker" }),
+				task: "t",
+				host: HOST,
+				hostTarget: target({ allowRoles: ["centurion", "worker"] }),
+			});
+			assert.equal(handle.child.host, HOST);
+			assert.ok(h.supervisor.calls.some((call) => call.method === "spawnChild"));
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("xm-dispatch D4: the role rule is a DISPATCH rule — a name that ALREADY exists over there is not re-gated", async () => {
+	// What this proves, precisely: the guard keys on "is this a new dispatch", not on
+	// "does the role appear in allowRoles". An operator who tightens `allowRoles` after
+	// a child exists must still be able to continue/reconnect that child — a rule that
+	// locks them out of work already running on the other machine would be worse than
+	// the bug it fixes. It does NOT prove a resume: `launch` on an existing name
+	// re-spawns (the second `spawnChild` below is real), and the resume gate for an
+	// existing remote child lives in `resolveHostTargetAsync({admission:"never"})`
+	// (`src/runs/remote.ts`), which this rule never touches.
+	const h = harness("xm-roles-resume-");
+	await insideHcTerminal(async () => {
+		try {
+			const first = await h.orchestrator.launch({ agent: agent({ name: "worker" }), task: "t", host: HOST, hostTarget: target({ allowRoles: ["centurion", "worker"] }) });
+			await h.orchestrator.retire(first.name, { graceful: false });
+			const spawnsBefore = h.supervisor.calls.filter((call) => call.method === "spawnChild").length;
+			const again = await h.orchestrator.launch({
+				agent: agent({ name: "worker" }),
+				task: "t",
+				name: first.name,
+				host: HOST,
+				hostTarget: target(),
+			});
+			assert.equal(again.name, first.name);
+			assert.equal(
+				h.supervisor.calls.filter((call) => call.method === "spawnChild").length,
+				spawnsBefore + 1,
+				"a re-launch on an existing name DOES spawn: the exemption is about not re-gating, not about resuming",
+			);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
 test("D1: resolveHostTarget refuses a pathMap entry that is relative on either side", () => {
 	// A relative prefix would resolve against two different homes; the settings
 	// parser keeps it and the resolver is the one place that can name it.
@@ -268,6 +355,7 @@ test("S3/B1: `host` + `verify` runs the command on THAT machine — never in thi
 			ok: true,
 			host: request.host,
 			localPath: request.localPath,
+			remotePath: `/home/there/${request.name}/session.jsonl`,
 			lines: 0,
 			returned: 0,
 			truncated: false,
@@ -364,6 +452,11 @@ const FINISHED = [
 	assistantMsg({ text: '{"ok":true,"reason":"report written"}' }),
 ];
 
+/** Where a cross-machine transcript lives on the target (xm-dispatch D3.2). */
+function remoteMirrorSample(name: string): string {
+	return path.posix.join("/srv/.pi-subagents-mirror", "no-run", name, "session.jsonl");
+}
+
 /** Write `lines` to the mirror the request names, the way the real seam does. */
 function writeMirror(localPath: string, lines: string[]): void {
 	mkdirSync(path.dirname(localPath), { recursive: true });
@@ -385,6 +478,7 @@ test("S4/D15 (demo): a mid-turn mirror is re-read before the verdict, so 11 line
 			ok: true,
 			host: request.host,
 			localPath: request.localPath,
+			remotePath: remoteMirrorSample(request.name),
 			lines: lines.length,
 			returned: lines.length,
 			truncated: false,
@@ -405,52 +499,11 @@ test("S4/D15 (demo): a mid-turn mirror is re-read before the verdict, so 11 line
 			// can no longer describe a transcript that has 11 lines.
 			assert.equal(collected.remoteReadback?.lines, FINISHED.length);
 			assert.equal(collected.remoteReadback?.returned, FINISHED.length);
-			// ... and a refresh that DID run is the only shape allowed to say plain
-			// `complete` (the failure case below must not).
-			assert.equal(collected.remoteReadback?.stale, undefined);
 			assert.match(
 				renderCollect(handle.name, collected),
 				/read-back from host 'vps': 11 of 11 lines \(complete\)$/m,
 			);
 			assert.match(collected.output, /report written/);
-		} finally {
-			h.cleanup();
-		}
-	});
-});
-
-test("S4/D15: a truncated read-back is an honest `unknown`, never `no assistant message`", async () => {
-	// A tail window that ends on the user prompt because the reply is past the cut is
-	// THIS machine's blind spot, not the child's fate. Naming it
-	// `aborted (no assistant message for the last prompt)` is the lie the demo
-	// produced; D15 promises an honest `unknown` instead.
-	const calls = { count: 0 };
-	const h = harness("xm-truncated-", async (request) => {
-		calls.count += 1;
-		writeMirror(request.localPath, MID_TURN);
-		return {
-			ok: true,
-			host: request.host,
-			localPath: request.localPath,
-			lines: 9_000,
-			returned: MID_TURN.length,
-			truncated: true,
-			byteCapped: true,
-		};
-	});
-	await insideHcTerminal(async () => {
-		try {
-			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
-			h.supervisor.settle(handle.name, { text: "settled" });
-			const collected = await h.orchestrator.collect(handle.name);
-			assert.equal(calls.count, 2, "the refresh ran; it just could not get the whole file");
-			assert.equal(collected.execution.status, "unknown", JSON.stringify(collected.execution));
-			assert.notEqual(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
-			assert.match(String(collected.execution.reason), /read-back was truncated \(5 of 9000 lines\)/);
-			// The read-back the render prints says the same thing, so the two cannot
-			// disagree the way `5 of 5 (complete)` did.
-			assert.equal(collected.remoteReadback?.truncated, true);
-			assert.equal(collected.remoteReadback?.lines, 9_000);
 		} finally {
 			h.cleanup();
 		}
@@ -467,6 +520,7 @@ test("S4/D15: a COMPLETE remote transcript with no assistant is still `aborted` 
 			ok: true,
 			host: request.host,
 			localPath: request.localPath,
+			remotePath: remoteMirrorSample(request.name),
 			lines: MID_TURN.length,
 			returned: MID_TURN.length,
 			truncated: false,
@@ -481,152 +535,6 @@ test("S4/D15: a COMPLETE remote transcript with no assistant is still `aborted` 
 			assert.equal(collected.execution.status, "aborted");
 			assert.equal(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
 			assert.equal(collected.remoteReadback?.truncated, false);
-		} finally {
-			h.cleanup();
-		}
-	});
-});
-
-test("S4/D15: a refresh that FAILS keeps the old mirror and stays honest about it", async () => {
-	// The mirror is a network round trip, so the refresh can fail. Two rules then:
-	// the text already read is kept (it is the only answer this machine has), and the
-	// verdict is NOT `aborted (no assistant message …)` — an unconfirmed snapshot is
-	// not evidence about the child.
-	const calls = { count: 0 };
-	const h = harness("xm-refresh-fail-", async (request) => {
-		calls.count += 1;
-		if (calls.count === 1) {
-			writeMirror(request.localPath, MID_TURN);
-			return {
-				ok: true,
-				host: request.host,
-				localPath: request.localPath,
-				lines: MID_TURN.length,
-				returned: MID_TURN.length,
-				truncated: false,
-				byteCapped: false,
-			};
-		}
-		return {
-			ok: false,
-			host: request.host,
-			reason: "machine 'hw-nj' did not answer in time",
-			fate: "unreachable",
-			evidence: ["no answer to machine.exec"],
-			nextStep: "retry collect",
-		};
-	});
-	await insideHcTerminal(async () => {
-		try {
-			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
-			h.supervisor.settle(handle.name, { text: "settled" });
-			const collected = await h.orchestrator.collect(handle.name);
-			assert.equal(calls.count, 2, "a failed refresh does not throw and is not retried in place");
-			assert.equal(collected.execution.status, "unknown", JSON.stringify(collected.execution));
-			assert.notEqual(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
-			assert.match(String(collected.execution.reason), /read-back could not be refreshed after the turn ended \(unreachable: machine 'hw-nj' did not answer in time\)/);
-			// The reported facts are the LAST SUCCESSFUL read, not the failure — but they
-			// must carry the fact that this read could not be confirmed as current. The
-			// demo's lie was the unqualified `5 of 5 lines (complete)` on exactly this
-			// shape, so the render may not print that word here.
-			assert.equal(collected.remoteReadback?.lines, MID_TURN.length);
-			assert.equal(collected.remoteReadback?.truncated, false);
-			assert.match(
-				String(collected.remoteReadback?.stale),
-				/unreachable: machine 'hw-nj' did not answer in time/,
-			);
-			const rendered = renderCollect(handle.name, collected);
-			assert.equal(
-				rendered.split("\n").find((line) => line.startsWith("read-back from host")),
-				`read-back from host 'vps': 5 of 5 lines (not confirmed current — the post-turn refresh failed: unreachable: machine 'hw-nj' did not answer in time; the verdict rests on this earlier read)`,
-			);
-			assert.doesNotMatch(rendered, /lines \(complete\)/, "a stale mirror may never stand alone as `complete`");
-		} finally {
-			h.cleanup();
-		}
-	});
-});
-
-/* ------------------------------------------------------------------------- *
- * D15 follow-ups: the grace window and `retire()` are the two other doors the
- * stale mirror can leave through.
- * ------------------------------------------------------------------------- */
-
-test("D15 follow-up: a remote grace window costs no sleep — growth there needs a read-back", async () => {
-	// The growth probe used to look at the local placeholder (an empty file, so the
-	// window never opened). D15 pointed it at the mirror, which exists and has
-	// bytes — but nothing on THIS machine can grow it: the only way growth becomes
-	// visible is a read-back, and D15 deliberately does not poll the remote while a
-	// turn is live. The loop therefore bought nothing and cost up to 2×500ms of dead
-	// time. It must answer `false` now, without sleeping.
-	const sleeps: number[] = [];
-	let clock = 0;
-	let mirrorPath = "";
-	const h = harness(
-		"xm-remote-grace-",
-		async (request) => {
-			writeMirror(request.localPath, MID_TURN);
-			mirrorPath = request.localPath;
-			return {
-				ok: true,
-				host: request.host,
-				localPath: request.localPath,
-				lines: MID_TURN.length,
-				returned: MID_TURN.length,
-				truncated: false,
-				byteCapped: false,
-			};
-		},
-		{ now: () => clock, sleep: async (ms) => { clock += ms; sleeps.push(ms); } },
-	);
-	await insideHcTerminal(async () => {
-		try {
-			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
-			// No settle: the wait times out, which is the only way into the grace loop.
-			const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 1_000 });
-			assert.ok(existsSync(mirrorPath), "the read-back wrote the mirror, so the old probe would have seen bytes and slept");
-			assert.deepEqual(sleeps, [], `a remote grace window may not sleep (slept ${sleeps.join(",")}ms)`);
-			assert.equal(clock, 0, `a remote collect burned ${clock}ms of grace sleeps`);
-			// The untouched timeout snapshot is still what the caller gets.
-			assert.equal(collected.execution.status, "running");
-		} finally {
-			h.cleanup();
-		}
-	});
-});
-
-test("D15: a remote retire from a truncated mirror is `unknown`, never `no assistant message`", async () => {
-	// `retire()` used to derive from bare bytes, so a stop that landed between the
-	// read-back and the verdict stamped the demo's sentence — `aborted (no assistant
-	// message for the last prompt)` — on a child whose reply was simply past the
-	// tail window. It must reach the same verdict `collect` does.
-	const h = harness("xm-retire-truncated-", async (request) => {
-		writeMirror(request.localPath, MID_TURN);
-		return {
-			ok: true,
-			host: request.host,
-			localPath: request.localPath,
-			lines: 9_000,
-			returned: MID_TURN.length,
-			truncated: true,
-			byteCapped: true,
-		};
-	});
-	await insideHcTerminal(async () => {
-		try {
-			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
-			// Populate the mirror the way an in-flight collect does, then retire before
-			// that collect reaches its verdict: an already-aborted signal returns right
-			// after the read-back, leaving `child.execution` unset — the exact state a
-			// `stop` racing a live collect sees.
-			const aborted = new AbortController();
-			aborted.abort();
-			const interrupted = await h.orchestrator.collect(handle.name, { signal: aborted.signal });
-			assert.equal(interrupted.execution.reason, "aborted by parent");
-			const retired = await h.orchestrator.retire(handle.name);
-			assert.equal(retired.execution?.status, "unknown", JSON.stringify(retired.execution));
-			assert.notEqual(retired.execution?.reason, NO_ASSISTANT_ABORT_REASON);
-			assert.match(String(retired.execution?.reason), /read-back was truncated \(5 of 9000 lines\)/);
 		} finally {
 			h.cleanup();
 		}

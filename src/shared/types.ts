@@ -148,6 +148,21 @@ export interface AgentConfig {
 	 * `inheritExtensions: false`, because there is nothing to subtract from.
 	 */
 	excludeExtensions?: string[];
+	/**
+	 * Extensions this card REFUSES to run without (xm-dispatch D2).
+	 *
+	 * Inherited extensions are skipped when the target machine cannot load them
+	 * (they are a convenience the parent happens to have, not a contract of the
+	 * task) — but a card that names one here says the opposite: a launch that
+	 * cannot load it is a hard failure, aggregated into one message. Entries use
+	 * the same grammar as {@link excludeExtensions} (a path or a package name).
+	 *
+	 * Absent (the default) means every inherited extension is optional. A card
+	 * whose role truly needs a provider belongs here — that is the difference
+	 * between "this machine runs it without the endpoint" and "the child hangs
+	 * with no models".
+	 */
+	requiredExtensions?: string[];
 
 	// ── behavior ──
 	output?: string;
@@ -699,6 +714,16 @@ export interface Handle {
 	 * persisted, since it describes THIS spawn.
 	 */
 	warning?: string;
+	/**
+	 * NON-FATAL launch notices the CALLER renders (xm-dispatch D2).
+	 *
+	 * One aggregated string per launch — currently the inherited extensions a
+	 * cross-machine target could not load. Same channel as {@link warning} (never
+	 * `process.stderr`, which the tool result does not show), but a LIST because a
+	 * launch may have more than one unrelated thing to say and collapsing them
+	 * would lose one.
+	 */
+	warnings?: string[];
 }
 
 // =============================================================================
@@ -951,6 +976,15 @@ export interface CrossMachineHostConfig {
 }
 
 /**
+ * Who may dispatch across machines, when `crossMachine.allowRoles` is absent.
+ *
+ * Lives beside the type (not in a `DEFAULTS` bag) because the consumer that reads
+ * it is the launch guard, and the resolver that stamps it onto a `HostTarget`
+ * reads the same constant — one value, two readers, no drift.
+ */
+export const DEFAULT_CROSS_MACHINE_ALLOW_ROLES: readonly string[] = ["centurion"];
+
+/**
  * Cross-machine spawn configuration (contract `cross-machine-spawn-v1`,
  * addendum v1.1).
  *
@@ -972,6 +1006,18 @@ export interface CrossMachineSettings {
 	 * works and means the same thing).
 	 */
 	enabled?: boolean;
+	/**
+	 * Roles allowed to DISPATCH to any machine (xm-dispatch D4).
+	 *
+	 * Defaults to {@link DEFAULT_CROSS_MACHINE_ALLOW_ROLES} — `["centurion"]`.
+	 * Cross-machine launch exists for a DELIVERY UNIT: a centurion owns one, and it
+	 * creates its own scout/worker team ON that machine. Letting a scout or a worker
+	 * cross would put one agent's turn on a machine whose team, ledger and
+	 * deliverable the parent never sees — which is exactly how the 6.2.0 real run
+	 * lost a finished worker's report. Roles are names (`agent.name`); `kind` is
+	 * always `"pi"` and carries no role.
+	 */
+	allowRoles?: string[];
 	/**
 	 * Per-host overrides, keyed by the `hc machine ls` name. Every key except
 	 * those you deliberately change may be omitted; a host with no entry at all
