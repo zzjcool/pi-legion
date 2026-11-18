@@ -5,6 +5,7 @@
 import type { RpcClientOptions as PiRpcClientOptions } from "@earendil-works/pi-coding-agent";
 import type { Writable } from "node:stream";
 import type { BuildArgsInput } from "../runs/args.ts";
+import type { DeliveryPreflightReport } from "../runs/cross-machine-preflight.ts";
 import type { HostTarget } from "../runs/remote.ts";
 import type { ChildLaunchContext } from "./child-context.ts";
 import type { UIProxy } from "./ui-proxy.ts";
@@ -549,6 +550,29 @@ export function nextInFlightTool(
 /** The orchestrator's frozen backend seam (legion-v2-contract.md §3.1). */
 export interface LegionSupervisor {
 	spawnChild(input: SpawnInput): Promise<ChildHandle>;
+	/**
+	 * Ask, BEFORE anything is spawned, whether this machine and the target can
+	 * share one git remote (cross-machine contract `cross-machine-demo-ux` D7).
+	 *
+	 * Optional on purpose, exactly like the display reads below. The question is
+	 * only answerable by a backend that holds an `hc` client AND a resolved
+	 * `HostTarget` — i.e. the terminal backend — so a supervisor that cannot ask
+	 * it (a test double, the rpc/in-process backends, a backend predating this
+	 * contract) must keep satisfying this seam. Absence means "no preflight",
+	 * which is the pre-contract behaviour: the launch proceeds and the worktree
+	 * creator in `remote-worktree.ts` still refuses an unusable delivery with the
+	 * same sentences (its checks stay — defence in depth, D10/D11 order intact).
+	 *
+	 * Callers read it as `supervisor.preflightRemoteDelivery?.(...)`. The report is
+	 * thrown away by the orchestrator: its VALUE is for `/legion doctor`
+	 * (`lastDeliveryPreflight()`), its ERROR is what refuses the launch.
+	 */
+	preflightRemoteDelivery?(input: {
+		host: string;
+		target: HostTarget;
+		/** This machine's checkout — what "one shared remote" is checked against. */
+		localRepo: string;
+	}): Promise<DeliveryPreflightReport>;
 	prompt(name: string, text: string): Promise<void>;
 	/**
 	 * Steer a running child (#313): the returned disposition says what happened

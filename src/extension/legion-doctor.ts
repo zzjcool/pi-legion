@@ -50,6 +50,9 @@ import {
 } from "../runs/hygiene.ts";
 import { TEMP_OWNER_FILE, ownerState } from "../runs/owner.ts";
 import { legionDbPath } from "../legion/db.ts";
+import { loadSubagentSettings } from "../agents/settings.ts";
+import { resolveHostTarget, type HostTarget } from "../runs/remote.ts";
+import { lastDeliveryPreflight } from "../runs/cross-machine-preflight.ts";
 import {
 	VERIFY_CONCURRENCY_ENV,
 	VERIFY_LOCK_DIR_ENV,
@@ -59,7 +62,7 @@ import {
 } from "../runs/verify-queue.ts";
 import { ALLOW_NESTED_ENV } from "./budget.ts";
 import { IDLE_STOP_HINT, IDLE_STOP_HINT_SHORT } from "./legion-stop.ts";
-import type { AgentConfig, SpawnMode } from "../shared/types.ts";
+import type { AgentConfig, SpawnMode, SubagentsSettings } from "../shared/types.ts";
 import { resolveSpawnMode } from "../supervisor/spawn-mode.ts";
 import {
 	recentSpawnFailures,
@@ -99,6 +102,7 @@ export const DOCTOR_SECTIONS = [
 	"memory",
 	"tools",
 	"storage",
+	"crossmachine",
 	"runtime",
 	"errors",
 	"next",
@@ -187,6 +191,17 @@ export interface DoctorOptions {
 	runtime?: DoctorRuntimeSnapshot;
 	/** Limit to these sections (plus always `next` when issues exist). */
 	sections?: readonly DoctorSection[];
+	/**
+	 * `subagents.crossMachine` for the Cross-machine section (contract
+	 * `cross-machine-demo-ux` D8).
+	 *
+	 * Injected by both callers that already hold the settings (`index.ts` reads
+	 * `catalog.settings.crossMachine`, `/legion doctor` loads the same files). When
+	 * ABSENT — every other caller, every test that does not care — doctor reads it
+	 * itself, and only when the `crossmachine` section is actually selected: the
+	 * settings file is not touched by a `doctor models` run.
+	 */
+	crossMachine?: SubagentsSettings["crossMachine"];
 	/** Injected session-error summary (tests); defaults to reading storeRoot log. */
 	sessionErrors?: SessionErrorSummary;
 	/**
@@ -450,6 +465,61 @@ function formatDiscoveryProbe(state: HostExtensionDiscoveryState, now = Date.now
 		default:
 			return "never";
 	}
+}
+
+/**
+ * Collapse a message to one line: doctor renders each fact as ONE bullet, so a
+ * multi-line `SubagentError` would otherwise break the section's shape.
+ */
+function oneLine(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * `- last preflight:` in its three honest states (contract `cross-machine-demo-ux`
+ * D8): `ok (<host>, <n>s ago)` / `failed (<host>, <n>s ago): <message>` / `never`.
+ *
+ * A pure read of what the process recorded (`lastDeliveryPreflight()`), never a
+ * probe: doctor must be able to answer `never` without starting one. The age is
+ * what tells a live failure apart from a stale one, the same reason the discovery
+ * line carries one.
+ */
+function formatLastPreflight(
+	report: ReturnType<typeof lastDeliveryPreflight>,
+	now = Date.now(),
+): string {
+	if (!report) return "never";
+	const ageS = Math.max(0, Math.floor((now - report.at) / 1000));
+	if (report.ok) {
+		const fetch = report.fetch === "unreachable"
+			? ` — origin unreachable from there${report.fetchDetail ? `: ${oneLine(report.fetchDetail)}` : ""}`
+			: "";
+		return `ok (${report.host}, ${ageS}s ago)${fetch}`;
+	}
+	const message = report.failure?.message ?? "unknown failure";
+	return `failed (${report.host}, ${ageS}s ago): ${oneLine(message)}`;
+}
+
+/**
+ * The smallest launch that really crosses a machine (contract D8), built from the
+ * host a reader of THIS report can actually use.
+ *
+ * Not a template with a blank in it: doctor knows the configured host names, so
+ * it prints one of them, and the phase list is the minimal legal machine from D2
+ * (`{ id: "done", terminal: true }` — a terminal phase omits `next`). The `task`
+ * is a real, runnable goal too (review m4): a `<one-line goal>` placeholder made the
+ * line a sketch — pasting it ran nothing, or ran a literal placeholder. The operator
+ * edits the goal, which is the one fact doctor cannot know, but the line as printed
+ * is a command that does something. Deliberately ONE line so it can be copied out
+ * of the report verbatim, and it carries no `<`/`>` at all.
+ */
+function crossMachineMinimalLaunch(host: string): string {
+	return "subagent({ agent: \"centurion\", "
+		+ `host: "${host}", `
+		+ "task: \"demo: report pwd and stop\", "
+		+ "phases: [{ id: \"planning\", next: [{ to: \"implementing\" }] }, "
+		+ "{ id: \"implementing\", next: [{ to: \"done\" }] }, "
+		+ "{ id: \"done\", terminal: true }] })";
 }
 
 function scanOrphanTemps(storeRoot: string): { total: number; orphanDead: number; live: number; unknown: number; samples: string[] } {
@@ -1050,6 +1120,79 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		push("");
 	}
 
+	if (want(selected, "crossmachine")) {
+		// D8: the config comes from the caller when it already holds the settings,
+		// and from the SAME files doctor would read otherwise — user then project,
+		// project over user (`loadSubagentSettings` owns that merge; it is not
+		// re-implemented here). Read only when this section was asked for, and read
+		// once: `doctor models` must not open a settings file, and a failed read is
+		// `enabled: unset` rather than a crash. No probe of any kind: doctor is
+		// read-only, so nothing here runs `hc`, `git` or `pi`.
+		let crossMachine = options.crossMachine;
+		if (crossMachine === undefined) {
+			try {
+				crossMachine = loadSubagentSettings({
+					userSettingsPath: path.join(agentDir, "settings.json"),
+					...(options.cwd ? { projectSettingsPath: path.join(options.cwd, ".pi", "settings.json") } : {}),
+				}).crossMachine;
+			} catch {
+				crossMachine = undefined;
+			}
+		}
+		push("## Cross-machine (host targets)");
+		push(`- enabled: ${crossMachine?.enabled === true ? "true" : crossMachine?.enabled === false ? "false" : "unset"}`);
+		const hostNames = Object.keys(crossMachine?.hosts ?? {});
+		push(`- hosts: ${hostNames.length ? hostNames.join(", ") : "none configured"}`);
+		// One loop keeps the report in the configured order — no `.sort()`: the settings
+		// file's own order is what \`subagents.crossMachine.hosts\` means to its author
+		// (review m4; the comment below already promised it), and re-alphabetising a
+		// human's list in a read-only report is an edit they did not ask for. Resolved
+		// hosts accumulate here for the minimal launch below.
+		const resolvable: Array<{ host: string; target: HostTarget }> = [];
+		for (const hostName of hostNames) {
+			try {
+				const target = resolveHostTarget(hostName, crossMachine);
+				resolvable.push({ host: hostName, target });
+				push(`- ${hostName}: resolved`);
+				push(`    cwd: ${target.cwd}`);
+				push(`    node: ${target.node}`);
+				push(`    piCli: ${target.piCli}`);
+				push(`    legionRoot: ${target.piLegionRoot}`);
+				push(`    extensions: ${target.piExtensions.length}${target.piExtensions.length ? ` (${target.piExtensions.join(", ")})` : ""}`);
+				push(`    worktreeRoot: ${target.worktreeRoot}`);
+			} catch (error) {
+				// The resolver's own sentence, verbatim: it names the exact settings key
+				// to fix, and paraphrasing it here would create a second wording of the
+				// same refusal.
+				const message = oneLine(error instanceof Error ? error.message : String(error));
+				push(`- ${hostName}: INVALID — ${message}`);
+				issues.push({
+					severity: "error",
+					code: "CROSSMACHINE_UNRESOLVED",
+					section: "crossmachine",
+					message: `cross-machine host '${hostName}' is declared but cannot be resolved: ${message}`,
+					fix: `Fix subagents.crossMachine.hosts.${hostName} (an absolute path on that machine; enabled must be true), or remove the entry.`,
+				});
+			}
+		}
+		// What the LAST real attempt concluded (D5 records it either way). The host of
+		// that attempt outranks the first configured one for the launch line: the
+		// caller is looking at doctor precisely because something just failed, and
+		// pasting the line that failed is the reproducible next step.
+		const last = lastDeliveryPreflight();
+		push(`- last preflight: ${formatLastPreflight(last)}`);
+		const launchHost = last && resolvable.some((r) => r.host === last.host)
+			? last.host
+			: resolvable[0]?.host;
+		if (launchHost !== undefined) {
+			push("- minimal launch (copy-paste, built from this configuration):");
+			push(`    ${crossMachineMinimalLaunch(launchHost)}`);
+		} else {
+			push("- minimal launch: (nothing to paste yet — add a resolvable host under subagents.crossMachine.hosts)");
+		}
+		push("");
+	}
+
 	if (want(selected, "next")) {
 		push("## Issues");
 		const shown = options.sections?.length
@@ -1078,6 +1221,13 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 			steps.push(`# set role frontmatter extensions: […], or export ${CHILD_EXTENSIONS_ENV}=<paths>`);
 		}
 		steps.push(...roleToolGateNextSteps(issues));
+		// The crossmachine section reports an error per unresolvable host, so the
+		// generic "no blocking fixes" fallback would contradict its own Issues list.
+		if (issues.some((i) => i.code === "CROSSMACHINE_UNRESOLVED")) {
+			steps.push(
+				"Cross-machine: fix the named `subagents.crossMachine.hosts.<host>` entry (an absolute `cwd` on that machine, `enabled: true`), then re-run `/legion doctor crossmachine`.",
+			);
+		}
 		if (issues.some((i) => i.code === "MEMORY_GATE_WOULD_REFUSE")) {
 			steps.push("Stop idle children (`/legion stop`) or lower/disable PI_LEGION_MIN_FREE_MEM_MB before launching more.");
 		}

@@ -26,7 +26,7 @@ fetch 到。这一份只问真机器。
 | 前置 | 怎么确认 | 不满足时的症状 |
 |---|---|---|
 | 同一仓库的 checkout，**同一提交** | `hc exec --on vps -- git -C /srv/app rev-parse HEAD` | S5.1 的 HEAD 断言不过；S5.5 的 worktree 会从旧提交起 |
-| 同一个 origin URL | `hc exec --on vps -- git -C /srv/app remote get-url origin` | 启动前就会拒绝（`its checkout ... has origin 'x' but this checkout's is 'y'`） |
+| 同一个 origin URL | `hc exec --on vps -- git -C /srv/app remote get-url origin` | 启动前就会拒绝（`its checkout at <cwd> has origin '<remote>' but this checkout's is '<local>'; cross-machine delivery needs one shared remote.`） |
 | `git` 可用 | `hc exec --on vps -- git --version` | S5.1 的 `--is-inside-work-tree` 拿不到 true |
 | `node` 在 PATH（或给绝对路径） | `hc exec --on vps -- sh -c 'command -v node'` | preflight exit 12（10 秒内） |
 | **`piCli` 必须是 node 能执行的 JS 入口**，不是 shell 启动器 | `hc exec --on vps -- /root/.nvm/.../node /root/.pi/.../dist/bundle/cli.js --version` | 给 `/root/.pi/agent/bin/pi` 这种启动器 → preflight exit 16（10 秒内）。正确形态：`…/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js` |
@@ -146,7 +146,8 @@ npm run test:live -- --test-name-pattern='S5\.'
 | 远端 child 输出 `Warning: No models available` / `Error: No API key found` | **父机 env 曾被转发过去**（S5 真跑已修：远端 launch 现在完全不发 `env`）。若仍出现，说明该 core 自己带了这个变量 | 远端 child 的凭据只来自**那台机器**的 pi 配置；用 `hc exec --on vps -- env | grep -i pi` 看 core 自己带了什么 |
 | 所有用例都报 `machine_unknown: unknown machine: vps` | `hc machine` 注册是**按 session** 的，这个 `test-*` session 里没有那台机器 | 在同一 session 里 `hc machine add --temp --name vps ssh://user@host`，再 `hc machine ls` 确认 |
 | `the hc core there already carries legion identity` | 那个 core 自己就在一个 legion 树里（D7） | 用干净环境重起那边的 core |
-| `cross-machine delivery needs one shared remote` / `its checkout … has origin … but this checkout's is …` | 两侧 origin 不同 | 让两边指向同一个 URL |
+| `cross-machine delivery needs one shared remote` / `has no origin` / `its checkout at … has origin '…' but this checkout's is '…'` | 两侧没有同一个 origin（本机没有 / 目标机没有 / 两边不是同一个） | 见下一行的两条出路 |
+| `Two ways out: 1) … 2) dispatch a worker instead` | 拒绝文案自带的两种出路（不必再去猜怎么修） | ① 让两侧指向同一个 URL（本机 `git remote add origin <url>`、任一侧 `git remote set-url origin <url>`；目标机那侧加 `hc exec --on vps -- ` 前缀）；② 改派 `worker`：`subagent({ agent: "worker", host: "vps", task: "..." })`，它不需要 origin |
 | `timed_out: preflight did not finish within 10s` | **10 秒判定点 ①**：目标机 shell 起不来或极慢 | 手工 `hc exec --on vps -- true` 计时 |
 
 ### resume 四步（S5.2，以及任何 `resume`）

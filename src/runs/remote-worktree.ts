@@ -274,7 +274,7 @@ function gitErrorText(error: unknown): string {
  * `stderr`/`stdout` arrive BASE64 on the real wire and are decoded here
  * (`execResultText`), so an error message carries git's own words.
  */
-async function remoteExec(
+export async function remoteExec(
 	client: HcClient,
 	target: HostTarget,
 	params: { argv?: string[]; line?: string; cwd?: string; timeout?: number },
@@ -300,7 +300,12 @@ async function remoteExec(
 		throw new SubagentError(
 			`host '${target.host}' unreachable: timed_out: ${operation} did not finish within ${params.timeout ?? REMOTE_SETUP_TIMEOUT_S}s (${execResultText(result) || "no output"})`,
 			ErrorCodes.START_FAILED,
-			{ host: target.host },
+			// `timedOut` is what lets a SOFT caller tell "that machine answered, too
+			// slowly" apart from "the round trip itself died" — both arrive here as one
+			// `START_FAILED`. The preflight's `git ls-remote` step is soft on the first and
+			// hard on the second (review M2), and re-parsing the prose to find out would be
+			// a second, drifting answer.
+			{ host: target.host, timedOut: true },
 		);
 	}
 	if (typeof result?.code !== "number") {
@@ -350,6 +355,10 @@ async function remotePathExists(
  * demanded: on a real core "cwd does not exist" and "program does not exist" are
  * the same `terminal.run` error, so the only way to tell an operator which one it
  * is, is to ask `test -d` before trying to start anything.
+ *
+ * Also the delivery preflight's third step (`cross-machine-preflight.ts`), which
+ * reuses this instead of re-deriving the `code === 1` rule: a second copy of that
+ * rule is how "no" and "cannot tell" collapse back together.
  */
 export async function remotePathIsDirectory(
 	client: HcClient,
@@ -388,6 +397,101 @@ function decodeStdout(result: HcExecResult): string {
 }
 
 /**
+ * One uniform tail so a checkout that is missing, broken or unreadable ends with
+ * the SAME two ways out (contract D6).
+ *
+ * The failure on its own is a fact the operator cannot act on: a cross-machine
+ * centurion delivers through a git worktree, so a machine without a usable
+ * checkout cannot host one — but the launch can still happen locally, and the
+ * cheapest correct answer is to say both options in one line instead of leaving
+ * the reader to infer them. `<url>` stands for "whatever both sides can reach";
+ * naming this checkout's origin here would need another git call on this host
+ * before the order the contract froze has even looked at the remote.
+ */
+function checkoutTwoWaysOut(host: string, cwd: string): string {
+	return (
+		` Two ways out: 1) give that machine a checkout at ${cwd} — git clone <url> ${cwd} on '${host}' — or point ` +
+		`subagents.crossMachine.hosts.${host}.cwd at a directory that is a git checkout; ` +
+		"2) dispatch a worker instead (workers need no worktree and no git)."
+	);
+}
+
+/** D6: the configured cwd does not exist on that machine. */
+export function missingRemoteCheckoutMessage(host: string, cwd: string): string {
+	return `host '${host}' has no checkout at ${cwd} (the configured cwd does not exist on that machine).${checkoutTwoWaysOut(host, cwd)}`;
+}
+
+/** D6: the cwd exists there but is not a git repository. */
+export function notARepositoryMessage(host: string, cwd: string): string {
+	return `host '${host}': ${cwd} is not a git repository on that machine.${checkoutTwoWaysOut(host, cwd)}`;
+}
+
+/**
+ * D6: git itself is missing on the target machine.
+ *
+ * A separate message from "not a git repository" on purpose: `git worktree add`
+ * cannot run at all there, so telling the operator their checkout is not a repo
+ * (which `rev-parse --git-dir` also exits non-zero for) would send them to fix a
+ * directory that is fine and leave the real missing program unnamed. Exit 127 is
+ * the shell's "command not found" — with a real `git` on PATH it never happens.
+ */
+export function remoteGitMissingMessage(opts: { host: string; code: number | null; detail: string; command: string }): string {
+	const detail = opts.detail.trim().slice(0, STDERR_CLIP) || "no output";
+	const code = opts.code === null ? "no exit code" : String(opts.code);
+	// Review m1: name the command that ACTUALLY ran. Two callers reach this with two
+	// different commands (`git --version` at step 4, `git -C <cwd> rev-parse --git-dir`
+	// at step 5 and in the worktree creator), and telling an operator `git --version`
+	// failed when `rev-parse` is what ran sends them to test the wrong thing.
+	return (
+		`host '${opts.host}': git is not available on that machine (${opts.command} exited ${code}: ${detail}). ` +
+		"A cross-machine centurion delivers through git worktrees, so git must be on PATH there. " +
+		`Two ways out: 1) install git on '${opts.host}' and retry; 2) dispatch a worker instead (workers need no worktree and no git).`
+	);
+}
+
+/**
+ * D6: THIS checkout has no `origin`.
+ *
+ * The two ways out are asymmetric because the fix is: add a remote HERE (and make
+ * sure that machine can reach the same url), or stop asking for a worktree — a
+ * worker needs no origin at all. The `subagent(...)` call is spelled out complete
+ * enough to paste, because "dispatch a worker instead" is not an instruction an
+ * operator can follow without knowing the shape.
+ */
+export function noLocalOriginMessage(opts: { host: string; localRepo: string }): string {
+	return (
+		`cross-machine delivery needs one shared remote: this checkout (${opts.localRepo}) has no origin. ` +
+		`Two ways out: 1) add one and retry — git -C ${opts.localRepo} remote add origin <url> ` +
+		`(the machine '${opts.host}' must be able to reach the same url); ` +
+		`2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "${opts.host}", task: "..." }) needs no origin.`
+	);
+}
+
+/** D6: that machine's checkout has no `origin`. Fixable over there, so it says where. */
+export function noRemoteOriginMessage(opts: { host: string; cwd: string; localOrigin: string }): string {
+	return (
+		`host '${opts.host}': ${opts.cwd} has no origin on that machine; cross-machine delivery needs one shared remote. ` +
+		`Two ways out: 1) add one there — hc exec --on ${opts.host} -- git -C ${opts.cwd} remote add origin <url> ` +
+		`(same url as this checkout's '${opts.localOrigin}'); 2) dispatch a worker instead (workers need no origin).`
+	);
+}
+
+/** D6: both sides have an `origin`, and they are different remotes. Names BOTH urls. */
+export function originMismatchMessage(opts: {
+	host: string;
+	cwd: string;
+	remoteOrigin: string;
+	localOrigin: string;
+}): string {
+	return (
+		`host '${opts.host}': its checkout at ${opts.cwd} has origin '${opts.remoteOrigin}' but this checkout's is '${opts.localOrigin}'; ` +
+		"cross-machine delivery needs one shared remote. " +
+		"Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); " +
+		"2) dispatch a worker instead (workers need no origin)."
+	);
+}
+
+/**
  * Prove both checkouts point at the SAME `origin` before a tree is created (D10).
  *
  * Order matters for the message: "this checkout has no origin" is fixed here, on
@@ -408,23 +512,27 @@ export async function assertSharedOrigin(opts: {
 		localOrigin = "";
 	}
 	if (localOrigin.length === 0) {
-		throw new SubagentError(
-			"cross-machine delivery needs one shared remote: this checkout has no origin",
-			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, localRepo },
-		);
+		throw new SubagentError(noLocalOriginMessage({ host: target.host, localRepo }), ErrorCodes.INVALID_PARAMS, {
+			host: target.host,
+			localRepo,
+		});
 	}
 	const remoteOrigin = await remoteOriginUrl(client, target, target.cwd);
 	if (remoteOrigin === undefined) {
 		throw new SubagentError(
-			`host '${target.host}': ${target.cwd} has no origin on that machine; cross-machine delivery needs one shared remote`,
+			noRemoteOriginMessage({ host: target.host, cwd: target.cwd, localOrigin }),
 			ErrorCodes.INVALID_PARAMS,
 			{ host: target.host, cwd: target.cwd },
 		);
 	}
 	if (normalizeGitRemoteUrl(localOrigin) !== normalizeGitRemoteUrl(remoteOrigin)) {
 		throw new SubagentError(
-			`host '${target.host}': its checkout at ${target.cwd} has origin '${remoteOrigin}' but this checkout's is '${localOrigin}'; cross-machine delivery needs one shared remote`,
+			originMismatchMessage({
+				host: target.host,
+				cwd: target.cwd,
+				remoteOrigin,
+				localOrigin,
+			}),
 			ErrorCodes.INVALID_PARAMS,
 			{ host: target.host, cwd: target.cwd, remoteOrigin, localOrigin },
 		);
@@ -460,7 +568,7 @@ export async function createRemoteChildWorktree(opts: {
 	const { client, target, name, localRepo, nonce } = opts;
 	if (!(await remotePathIsDirectory(client, target, target.cwd))) {
 		throw new SubagentError(
-			`host '${target.host}' has no checkout at ${target.cwd} (the configured cwd does not exist on that machine)`,
+			missingRemoteCheckoutMessage(target.host, target.cwd),
 			ErrorCodes.INVALID_PARAMS,
 			{ host: target.host, cwd: target.cwd },
 		);
@@ -472,10 +580,24 @@ export async function createRemoteChildWorktree(opts: {
 		`git -C ${target.cwd} rev-parse --git-dir`,
 	);
 	if (probe.code !== 0) {
+		// D6: 127 is the shell's "command not found" — git is absent there, which is
+		// NOT "this directory is not a repository" and is fixed by installing git.
+		if (probe.code === 127) {
+			throw new SubagentError(
+				remoteGitMissingMessage({
+					host: target.host,
+					code: 127,
+					detail: execResultText(probe),
+					command: `git -C ${target.cwd} rev-parse --git-dir`,
+				}),
+				ErrorCodes.INVALID_PARAMS,
+				{ host: target.host, cwd: target.cwd, code: 127 },
+			);
+		}
 		throw new SubagentError(
-			`host '${target.host}': ${target.cwd} is not a git repository on that machine`,
+			notARepositoryMessage(target.host, target.cwd),
 			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, cwd: target.cwd },
+			{ host: target.host, cwd: target.cwd, code: probe.code },
 		);
 	}
 	await assertSharedOrigin({ client, target, localRepo });

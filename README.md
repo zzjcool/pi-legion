@@ -499,7 +499,8 @@ same idea as `pi list` / `pi auth check`.
 
 - `/legion doctor` — full report in the chat (works outside TUI too).
 - `/legion doctor [section]` — one of: `summary`, `extensions`, `models`,
-  `spawn`, `memory`, `tools`, `storage`, `runtime`, `errors`, `next`.
+  `spawn`, `memory`, `tools`, `storage`, `crossmachine`, `runtime`, `errors`,
+  `next`.
 - `subagent({ action: "diagnose" })` — same full report as tool output so the
   main agent can call it without waiting for you. It takes the same optional
   `section` filter: `subagent({ action: "diagnose", section: "models spawn" })`
@@ -683,6 +684,11 @@ Resuming follows the tree's saved sessions and node records. If a supervisor
 process ends, its child processes do not become detached workers; resuming the
 parent restores the squad, while already-settled children are not restarted.
 Keep the run records and session files while the tree may need to resume.
+
+Cross-machine delivery — a centurion that runs on another `hc` machine and
+delivers through the one shared `origin` — is a three-step setup (one shared
+remote → `subagents.crossMachine` → one `subagent` call):
+[docs/runbooks/cross-machine-centurion-demo.md](docs/runbooks/cross-machine-centurion-demo.md).
 
 ## Supported kinds
 

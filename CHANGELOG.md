@@ -86,6 +86,19 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   就丢弃 + 打一行 stderr」这条路**，所以本版也不再需要把被丢弃的扩展搬到结果里：映射不了
   的启动前就拒绝了。
 
+### Fixed（phases 与跨机交付的报错可用性）
+
+- **phases 的终态阶段可以省略 `next`**（`phase-machine`，契约 D2）：`{ id: "done", terminal: true }` 与 `next: []` 现在完全等价，`parsePhaseMachine` / `normalizePhaseMachine` / `validatePhaseMachine` / `isTerminalIn` 任何路径都不再抛 TypeError（此前这份最小机器会报 `phases[2].next: next must be an array`）。
+- **phases 校验一次报出全部问题，并按分类点名到具体阶段与边**（`phase-machine` / `agents`，契约 D1/D3）：每条错误带 `category`（固定顺序 `structure` → `terminal` → `successor` → `unreachable` → `rework`）和一行 `fix:`（缩进 4 空格；terminal / successor / unreachable 三类必带最小合法示例）；首行仍是 `Agent '<file>' has an invalid phase machine: N problems in M categories.`，错误条目行仍是 `  - <path>: <message>`。
+- **跨机交付预检提前到 phases 校验之前**（`orchestrator`，契约 D7）：`host` + `worktree` 时先问「那台机器能不能交付」，再问 phases。此前 phases 写错会先报 phases，改完才发现真正挡路的是一个没有 origin 的 checkout。预检顺序固定：`local-git` → `local-origin` → `remote-checkout` → `remote-git` → 「是 git 仓库」→ `remote-origin` → 「两侧同一个 origin」；硬失败一律 `INVALID_PARAMS` + `noModelFallback`（机器事实不去试下一个模型候选），最后一步 `git ls-remote origin` 是软的：只记 `fetch: "unreachable"` + detail，不 throw。
+- **跨机交付的拒绝文案给出两条出路**（`remote-worktree` / `cross-machine-preflight`，契约 D6）：本机无 origin、目标机无 origin、两侧 origin 不同、目标机 checkout 缺失或不是仓库，全部以 `Two ways out:` 收尾 —— ①修好这个前提（加 remote / `set-url` / 装 git / 换 `cwd`）②改派 `worker`（不需要 worktree、origin 或 git，文案里给了可粘贴的 `subagent` 形状）。开头那句 `cross-machine delivery needs one shared remote` 原地保留，仍然可 grep。
+
+### Added（跨机演示的可发现性）
+
+- **目标机没有 `git` 现在是一类自己的拒绝**（`cross-machine-preflight` / `remote-worktree`，契约 D5/D6）：`host '<h>': git is not available on that machine (git --version exited <n>: <detail>).`，不再把它说成「不是 git 仓库」；建树路径里 `rev-parse --git-dir` 的 exit 127 同样判成 `remote-git`。
+- **`/legion doctor` 新增 `crossmachine` 一节**（`legion-doctor`，契约 D8）：标题 `## Cross-machine (host targets)`，逐 host 列 `cwd` / `node` / `piCli` / `legionRoot` / extensions / `worktreeRoot` 的解析结果（解析不了的打 `INVALID` 并给 `CROSSMACHINE_UNRESOLVED` issue）、最近一次交付预检（`ok (…)` / `failed (…): <message>` / `never`），以及一条按当前配置拼好、可直接粘贴的最小 `subagent` launch（terminal 阶段省略 `next`）。这一节是只读的：不跑 `--list-models`，不发任何远端探测。
+- **新 runbook [`docs/runbooks/cross-machine-centurion-demo.md`](docs/runbooks/cross-machine-centurion-demo.md)**：照着演示的三步（同一个 origin → `subagents.crossMachine` → 一条 `subagent` 调用），含每个配置键「不填会怎样」与失败文案对照表。真机 e2e 断言仍在 [`docs/runbooks/cross-machine-live-e2e.md`](docs/runbooks/cross-machine-live-e2e.md)（要 `HC_SESSION=test-*`），两份不混用环境变量。
+
 ## [6.1.1] — 2026-11-17
 
 修跨机器派发不可用：`hosts.<h>.piExtensions` 曾被 settings 白名单静默丢弃，导致 provider 扩展

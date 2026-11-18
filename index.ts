@@ -461,7 +461,7 @@ const SubagentParams = Type.Object({
 	section: Type.Optional(
 		Type.String({
 			description:
-				'diagnose only: optional section filter (summary|extensions|models|spawn|memory|tools|storage|runtime|errors|next), same as `/legion doctor [section]`. Space/comma-separated for multiple.',
+				'diagnose only: optional section filter (summary|extensions|models|spawn|memory|tools|storage|crossmachine|runtime|errors|next), same as `/legion doctor [section]`. Space/comma-separated for multiple.',
 		}),
 	),
 });
@@ -2530,6 +2530,11 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					cwd,
 					storeRoot: store.rootDir,
 					expectedModels: expectedModelsFromSettings(settings),
+					// D8: the Cross-machine section reads the settings this process ALREADY
+					// parsed for the launch (`catalog.settings`), not a second raw-JSON read
+					// of the same file — one load, one merge rule, no drift between the
+					// hosts doctor lists and the hosts a launch would resolve.
+					crossMachine: catalog.settings.crossMachine,
 					sampleAgent: agents[0],
 					agents,
 					sections,
