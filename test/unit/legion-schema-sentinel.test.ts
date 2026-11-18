@@ -35,6 +35,10 @@ const EXPECTED_COLUMNS: Record<string, readonly string[]> = {
 		// APPENDED by `ALTER TABLE`, so the order is part of the expectation.
 		"host",
 		"worktree_host",
+		// schema v5: where a cross-machine child's transcript and terminal live, so a
+		// later session can recover it (same append-only rule as v4).
+		"remote_dir",
+		"remote_terminal",
 	],
 	events: ["id", "node_id", "type", "data", "ts"],
 	usage: ["node_id", "tokens_in", "tokens_out", "cost_usd", "updated_at"],
@@ -215,11 +219,11 @@ test("legion v2 contract §4.2 keeps the frozen six-table schema (columns, types
 		Number(userVersions[0]),
 		"Schema sentinel: §4.2's PRAGMA user_version must equal the code's LEGION_DB_USER_VERSION.",
 	);
-	const unexpectedUserVersions = userVersions.filter((version) => version !== "4");
+	const unexpectedUserVersions = userVersions.filter((version) => version !== "5");
 	assert.deepEqual(
 		unexpectedUserVersions,
 		[],
-		`Schema sentinel: every §4.2 PRAGMA user_version declaration must remain 4 (found: ${userVersions.join(", ")}). If the contract schema is intentionally revised, update this test explicitly.`,
+		`Schema sentinel: every §4.2 PRAGMA user_version declaration must remain 5 (found: ${userVersions.join(", ")}). If the contract schema is intentionally revised, update this test explicitly.`,
 	);
 
 	const expectedTables = Object.keys(EXPECTED_COLUMNS);

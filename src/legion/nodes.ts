@@ -52,6 +52,30 @@ export interface LegionNode {
 	 * whether a local `fs`/`git` call is allowed.
 	 */
 	host: string | null;
+	/**
+	 * Directory ON {@link host} that holds this child's transcript, when it ran
+	 * elsewhere (schema v5). `NULL` = not recorded: every local child, and every
+	 * row written by a build before v5.
+	 *
+	 * The transcript is `<remoteDir>/session.jsonl` (`remoteSessionPathFor`), which
+	 * is why only the directory is stored — the file name is the launch's
+	 * convention, not a fact a later reader should have to trust.
+	 *
+	 * Optional for the same reason `host` is nullable rather than absent: a row READ
+	 * from the ledger always carries it (`mapNode`), while a node the product
+	 * synthesizes in memory (the runtime's tree overlay, `mail.ts`'s reconstructed
+	 * row) has no column to carry. `undefined` and `null` both mean "not recorded".
+	 */
+	remoteDir?: string | null;
+	/**
+	 * The address the core holds for this child's terminal on {@link host}
+	 * (`host/name`, `terminalAddress`), when it ran elsewhere (schema v5).
+	 *
+	 * Kept beside {@link remoteDir} because they answer different questions: the dir
+	 * finds the words, the terminal says whether the work is over. `NULL` = not
+	 * recorded — a pre-v5 row, or a launch whose handle reported none.
+	 */
+	remoteTerminal?: string | null;
 	model: string | null;
 	team: string | null;
 	status: NodeStatus;
@@ -76,6 +100,8 @@ export interface NewLegionNode {
 	worktreePath?: string | null;
 	worktreeHost?: string | null;
 	host?: string | null;
+	remoteDir?: string | null;
+	remoteTerminal?: string | null;
 	model?: string | null;
 	team?: string | null;
 	status?: NodeStatus;
@@ -99,6 +125,8 @@ export type MutableNodeFields = Partial<
 		| "worktreePath"
 		| "worktreeHost"
 		| "host"
+		| "remoteDir"
+		| "remoteTerminal"
 		| "model"
 		| "team"
 		| "status"
@@ -206,9 +234,9 @@ export function insertNode(
 		db.prepare(
 			`INSERT INTO nodes (
 				id, parent_id, name, role, kind, depth, run_id, session_file,
-				worktree_path, worktree_host, host, model, team, status, phase, phase_since, rework_count,
+				worktree_path, worktree_host, host, remote_dir, remote_terminal, model, team, status, phase, phase_since, rework_count,
 				contract_path, task_summary, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		).run(
 			id,
 			input.parentId,
@@ -221,6 +249,8 @@ export function insertNode(
 			input.worktreePath ?? null,
 			input.worktreeHost ?? null,
 			input.host ?? null,
+			input.remoteDir ?? null,
+			input.remoteTerminal ?? null,
 			input.model ?? null,
 			input.team ?? null,
 			input.status ?? "starting",
@@ -384,6 +414,8 @@ export function updateNode(
 				worktree_path = CASE WHEN ? THEN ? ELSE worktree_path END,
 				worktree_host = CASE WHEN ? THEN ? ELSE worktree_host END,
 				host = CASE WHEN ? THEN ? ELSE host END,
+				remote_dir = CASE WHEN ? THEN ? ELSE remote_dir END,
+				remote_terminal = CASE WHEN ? THEN ? ELSE remote_terminal END,
 				model = CASE WHEN ? THEN ? ELSE model END,
 				team = CASE WHEN ? THEN ? ELSE team END,
 				status = CASE WHEN ? THEN ? ELSE status END,
@@ -404,6 +436,8 @@ export function updateNode(
 			patch.worktreePath !== undefined ? 1 : 0, patch.worktreePath ?? null,
 			patch.worktreeHost !== undefined ? 1 : 0, patch.worktreeHost ?? null,
 			patch.host !== undefined ? 1 : 0, patch.host ?? null,
+			patch.remoteDir !== undefined ? 1 : 0, patch.remoteDir ?? null,
+			patch.remoteTerminal !== undefined ? 1 : 0, patch.remoteTerminal ?? null,
 			patch.model !== undefined ? 1 : 0, patch.model ?? null,
 			patch.team !== undefined ? 1 : 0, patch.team ?? null,
 			patch.status !== undefined ? 1 : 0, patch.status ?? null,
@@ -474,6 +508,52 @@ export function listNodesNamed(db: DatabaseSync, name: string): LegionNode[] {
 		.map(mapNode);
 }
 
+/**
+ * Cross-machine rows that are still open: `host` recorded and NOT ended.
+ *
+ * This is the SQL twin of `normalizeHost(node.host) !== undefined && !hasEnded(node)`
+ * and exists for exactly one caller — a NEW session discovering what a previous
+ * process left running on another machine (`src/runs/remote-recover.ts`).
+ *
+ * The status set is spelled as the three live statuses rather than `NOT IN
+ * (settled, failed, retired)` so the query and {@link hasEnded} cannot drift: a
+ * status that is not listed here is, by construction, one this query does not
+ * consider recoverable.
+ *
+ * `host <> ''` is part of the predicate, not decoration: an empty string is what a
+ * caller that "set" the field to nothing would store, and it must not make a LOCAL
+ * child look recoverable from another machine.
+ */
+export function listUnsettledRemoteNodes(db: DatabaseSync): LegionNode[] {
+	return db
+		.prepare(
+			`SELECT * FROM nodes
+			 WHERE host IS NOT NULL AND host <> ''
+			   AND status IN (?, ?, ?)
+			 ORDER BY updated_at, id`,
+		)
+		.all(...LIVE_CHILD_STATUSES)
+		.map(mapNode);
+}
+
+/**
+ * Every cross-machine row with this name, newest last — settled or not.
+ *
+ * The recovery action needs both halves: an unsettled row is work to collect, and
+ * a settled one is the answer to a SECOND `recover` ("already settled", with the
+ * outcome the first call recorded). A local row is deliberately not in this set:
+ * recovery reads a transcript from another machine and has nothing to say about a
+ * child of this one.
+ */
+export function listRemoteNodesNamed(db: DatabaseSync, name: string): LegionNode[] {
+	return db
+		.prepare(
+			"SELECT * FROM nodes WHERE name = ? AND host IS NOT NULL AND host <> '' ORDER BY updated_at, id",
+		)
+		.all(sanitizeNodeSlug(name))
+		.map(mapNode);
+}
+
 function padStatuses(statuses: readonly NodeStatus[]): Array<NodeStatus | null> {
 	return [
 		...statuses,
@@ -504,6 +584,8 @@ function mapNode(row: SqliteRow): LegionNode {
 		worktreePath: nullableString(row.worktree_path),
 		worktreeHost: nullableString(row.worktree_host),
 		host: nullableString(row.host),
+		remoteDir: nullableString(row.remote_dir),
+		remoteTerminal: nullableString(row.remote_terminal),
 		model: nullableString(row.model),
 		team: nullableString(row.team),
 		status: String(row.status) as NodeStatus,

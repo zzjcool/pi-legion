@@ -180,12 +180,13 @@ interface LegionSupervisor {
 - 连接约定：每 supervisor 进程一连接；`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`；写入均为短事务 prepared statement
   - **WAL 是前置条件，不是请求**：`PRAGMA journal_mode=WAL` 是**查询**，返回值才是实际生效的 journal mode，它可能在**不报错**的情况下降级（网络/FUSE 挂载无 shared-memory 支持、只读介质、争用锁）。`openLegionDb()` 因此**读取返回值并在其为文件库时校验**：非 `wal` 直接抛错，在启动期炸掉，而不是带着「已开 WAL」的假设继续跑、把问题拖成后发性数据事故。`:memory:` 是唯一的刻意豁免——SQLite 对内存库不实现 WAL、永远报 `memory`，而该库本来就不跨进程存活（由 `PRAGMA database_list` 的空 `file` 判定，不是靠路径字符串匹配）。测试见 `test/unit/legion-db.test.ts`。
 
-### 4.2 Schema（`PRAGMA user_version = 4`）
+### 4.2 Schema（`PRAGMA user_version = 5`）
 
 ```sql
-PRAGMA user_version = 4;   -- v1→v2 无 DDL：只把 messages.delivered 收宽为五值语义（§8.3.1，REV-23）
+PRAGMA user_version = 5;   -- v1→v2 无 DDL：只把 messages.delivered 收宽为五值语义（§8.3.1，REV-23）
                            -- v2→v3 无列变更：只新增结果账本两张表（§4.2 末，result-ledger-v1 D2）
                            -- v3→v4 两列追加：nodes.host / nodes.worktree_host（NULL = 本机，REV-35）
+                           -- v4→v5 两列追加：nodes.remote_dir / nodes.remote_terminal（NULL = 未记录，REV-36）
 
 CREATE TABLE nodes (
   id            TEXT PRIMARY KEY,     -- 树形 id（§5）
@@ -212,7 +213,13 @@ CREATE TABLE nodes (
   -- 追加（所以位置在 updated_at 之后），可空且**不回填**：NULL 就是「本机」，
   -- 与 v4 之前写下的行含义完全一致（D5）。
   host          TEXT,                 -- 跑这个 child 的机器；NULL = 本机
-  worktree_host TEXT                  -- worktree_path 的属主机；NULL = 本机
+  worktree_host TEXT,                 -- worktree_path 的属主机；NULL = 本机
+  -- schema v5（REV-36）：跨机 child 落在**另一台机器上**的两条事实，让「下一次打开
+  -- 会话」能把它收回来（`subagent({action:"recover", name})`）。同样 `ALTER TABLE ...
+  -- ADD COLUMN` 追加、可空、**不回填**：NULL = 「未记录」（v5 之前写下的每一行，以及
+  -- 此后的每个本机 child）。两条都只对 host 非空的行走读：本机 child 不读、不算。
+  remote_dir      TEXT,               -- 该 child 转写所在目录（另一台机器上）；转写 = <remote_dir>/session.jsonl
+  remote_terminal TEXT                -- 该 core 持有的终端地址（host/name，terminalAddress）；NULL = 未记录
 );
 CREATE INDEX idx_nodes_parent ON nodes(parent_id);
 CREATE INDEX idx_nodes_status ON nodes(status, updated_at);
@@ -642,3 +649,4 @@ interface LegionEventBus {
 | 2026-11-09 | REV-33 | §8.3 根收件箱注入语义（**语义修订，非 schema / 非事件类型 / 非权限变更**，按 §15-1 追加；子契约 `docs/contracts/root-mail-run-boundary-v1.md`）：原文「根节点收件箱 → `pi.sendMessage` 注入（复用现有 notify 机制）」读起来是无条件注入，而 `followUp` 只在一个 turn 边界被消费——turn 期间 push 不买任何延迟收益，只把文本放进宿主一个**不可撤回**的队列（实测事故：hold 释放后 2s tick 立即注入 `ACCEPTED`，父 14s 后 `stop` 该子节点，`ACCEPTED→OBSOLETE` 只改标签，通知仍送达）。现在 `LegionPostman.deliverRootInbox` 在 `isMailHeld` 之后、遍历 `pendingInbox` 之前加一道**整轮 `return`**：root 自身 run 活跃 ⇒ 本轮不投递、行留 `PENDING`，由既有作废谓词在真正注入前的那一 tick 重新判活。作用面是**整个 root 收件箱的全部 kind**（不做 kind 白名单：`question`/`report`/`handoff` 同样只在 turn 边界被消费）。判据走单一权威：`src/legion/run-active.ts` 的进程内注册表只存**读取器** `() => parentRunActive`（不存布尔副本，`display-liveness-v1` R1），生产写侧唯一落点是 `adoptLegionIdentity`（真 root 的 identity 由首次 launch 的 `createRootLegion` 懒创建），`dispose()` 最先释放归属校验的 disposer；未接线/抛错一律 fail-open（立即投递）。五态、`MAIL_BOUNCE_REASON` 闭集、事件闭集（16）、schema 与 2s tick 全部不变，`deliverChildren` 不受影响（子通道不在本门作用面）。范围外四条（`steer` 通道仍 mid-turn 注入、`parentRunActive` 卡死、未注册 run 事件的会话 fail-open、持续忙碌会话把 root 邮件推迟任意多 turn）登记在子契约 D7。触发：2026-11-09 实测一条 L2 通知在 child 已被 stop 之后仍然送达（同 `notice-delivery-v2` 的 T0≠T2 家族）。 |
 | 2026-11-10 | REV-35 | §4.2 `nodes` 追加 `host` / `worktree_host` 两列，`LEGION_DB_USER_VERSION` 3→4（**schema 版本变更，按 §15-4 走修订**；子契约 `docs/contracts/cross-machine-spawn-v1.md` D5/D13）。理由：worktree 所有权此前只有一个路径字符串，跨机之后 `(host, path)` 才是所有权事实 —— 只看路径的读取方会把另一台机器上的树当成自己机器上的路径去做 `fs`/`git` 操作，这是本设计里唯一「毁数据而不是响亮失败」的形状（`assertLocalWorktree` 是唯一守卫）。两列**可空、不回填**：`NULL` 就是「本机」，与 v4 之前写下的每一行含义相同，故老 run/老账本一律照旧 resume（D5）。迁移幂等：`ALTER TABLE ... ADD COLUMN` 没有 `IF NOT EXISTS`，所以迁移先问 `PRAGMA table_info(nodes)` 再补缺列，一个被倒回旧版本号的库（备份恢复、仓内 v1/v2 fixture）重开时不会因重复列失败。事件闭集不变（仍 16 种），`events`/`usage`/`messages`/`artifacts`/`consumptions` 一个列都不动。`test/unit/legion-schema-sentinel.test.ts` 的 `EXPECTED_COLUMNS.nodes` 与 `PRAGMA user_version` 字面量随本修订同步（6.0.4 / S2）。 |
 | 2026-11-10 | REV-34 | §4.2 新增结果账本两张表 `artifacts` / `consumptions`，`LEGION_DB_USER_VERSION` 2→3（**schema 版本变更，按 §15-4 走修订**；子契约 `docs/contracts/result-ledger-v1.md` D2）。四张既有表**一个列都不改**：v3 是纯增量，`nodes`/`events`/`usage`/`messages` 的行与列全部原样保留，`migrate()` 的 v2→v3 只有 `CREATE TABLE/INDEX IF NOT EXISTS`（幂等，`user_version=2` 的旧库打开即补建并升到 3，不降级、不删表）。`consumptions` 的每行对 `(artifact_id, consumer_id)` 只存**两个正交事实**：`read_bytes`（已读字节高水位，只增不减）与 `notified_at`（通知首次成功交付时刻，只写一次，`COALESCE` 保旧值）——**禁止**把它们压成一个 `kind` 等级：那会把「通知后再分页读几行」误判成没通知过而重发、把「先分页读一半」误判成读完而漏发（A2）。抑制谓词只有一处（`ledger.undelivered`），三个合取项缺一不可：`a.parent_id = :consumerId AND c.notified_at IS NULL AND COALESCE(c.read_bytes,0) < a.bytes`（`parent_id` 是 consumer 作用域，去掉它会把兄弟子树/别的 run 的 artifact 交给错的 consumer）。§4.4 的重建边界同时补第 4 条：`artifacts` 可从 `<runDir>/artifacts/<name>/r<round>.md` 恢复（`name`/`round` 取自路径、`bytes` 取自 `stat`、`created_at` 取文件 mtime、`node_id`/`parent_id` **只在本次 run 作用域内**按 name 反查重建后的 `nodes`，查不到或同名歧义**跳过不猜**，不做全树同名回落），`consumptions` 一律重置为空 ⇒ 重建后一律视为未读（只会多推、不会少推）。事件闭集**不变**（仍 16 种，本次不新增事件类型）；同批更新 `test/unit/legion-schema-sentinel.test.ts` 与 `test/unit/legion-db.test.ts` 的 schema 快照。触发：结果账本重构 P1 |
+| 2026-11-10 | REV-36 | §4.2 `nodes` 追加 `remote_dir` / `remote_terminal` 两列，`LEGION_DB_USER_VERSION` 4→5（**schema 版本变更，按 §15-4 走修订**）。理由（用户原话：「这个是不是可以放到数据库里面，下次打开会话恢复？」）：跨机 child 跑在**另一台机器**上，父进程退出后本机对它零句柄——`nodes.host` 只说明「它在哪台机器」，不足以取回任何东西：转写的位置（`<remote_dir>/session.jsonl`）与 core 持有的终端地址（`host/name`）都只存在于当年那个进程的内存里，于是下一次会话既看不见也收不回它，只能看到一个再也动不了的行。两列**可空、不回填**：`NULL` = 「未记录」，与 v5 之前写下的每一行含义相同（本机 child 永远为 NULL，读取方一律先看 `host` 非空）。写入点是跨机 spawn 成功后的那条 `updateNode`（`host` 已经在写，同一处补两列）。迁移幂等同 v4：先问 `PRAGMA table_info(nodes)` 再补缺列，倒回版本号的库重开不会因重复列失败。只读语义：`recover` 用这两列 + 既有 read-back 缝取回转写、用既有 `deriveOutcome`/`deriveAcceptance` 判分、按既有 settle 映射写 `node_settled`/`node_failed`/`node_retired`；**不接管**活的 child（不向 live supervisor 里塞第二个写者），终端仍活着 / 转写读不到 / 机器答不上三种情形一律不落终态。事件闭集不变（仍 16 种），`events`/`usage`/`messages`/`artifacts`/`consumptions` 一个列都不动。`test/unit/legion-schema-sentinel.test.ts` 的 `EXPECTED_COLUMNS.nodes` 与 `PRAGMA user_version` 字面量随本修订同步。 |

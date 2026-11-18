@@ -19,8 +19,17 @@ import { createRequire } from "node:module";
  *      permanent spelling of "this host", which is what every pre-v4 row means
  *      (`normalizeHost` in `src/runs/remote.ts` is the one predicate that reads
  *      it).
+ * v5 — `nodes.remote_dir` + `nodes.remote_terminal`: where a CROSS-MACHINE
+ *      child's transcript lives on ITS machine, and the address the core holds
+ *      for its terminal. A new session has no in-memory handle on a child the
+ *      previous process launched, so these two facts are what make it
+ *      recoverable at all (`src/runs/remote-recover.ts`). Two nullable columns,
+ *      NO backfill, same convention as v4: `NULL` means "not recorded" (every
+ *      row written before v5, and every local child afterwards), and a reader
+ *      that needs the value recomputes the path exactly as `remoteSessionPathFor`
+ *      does rather than pretending it knows it.
  */
-export const LEGION_DB_USER_VERSION = 4;
+export const LEGION_DB_USER_VERSION = 5;
 export const LEGION_DB_BUSY_TIMEOUT_MS = 5_000;
 
 /**
@@ -174,6 +183,30 @@ ALTER TABLE nodes ADD COLUMN worktree_host TEXT;
 
 /** The two columns v4 adds to `nodes`, in the order {@link SCHEMA_V4} writes them. */
 const SCHEMA_V4_NODE_COLUMNS = ["host", "worktree_host"] as const;
+
+/**
+ * Schema v5: the two facts a LATER session needs to recover a cross-machine child.
+ *
+ * `remote_dir` is the mirrored-argv directory the launch created on that machine
+ * (`remoteSessionPathFor` appends `session.jsonl` to it), and `remote_terminal` is
+ * the address the core holds (`host/name`, `terminalAddress`). Neither can be
+ * derived from anything else this machine stores: a new process has no handle on a
+ * child the previous one spawned, and the core may have shortened the name it was
+ * asked for.
+ *
+ * Nullable, nothing backfilled — `NULL` means "not recorded": every row written by
+ * a build before v5, and every local child afterwards. The migration asks
+ * `PRAGMA table_info(nodes)` first for the same reason as v4: `ALTER TABLE ... ADD
+ * COLUMN` has no `IF NOT EXISTS`, and a ledger whose header was rewound (a restored
+ * backup, this repo's fixtures) may already carry the columns.
+ */
+const SCHEMA_V5 = `
+ALTER TABLE nodes ADD COLUMN remote_dir TEXT;
+ALTER TABLE nodes ADD COLUMN remote_terminal TEXT;
+`;
+
+/** The two columns v5 adds to `nodes`, in the order {@link SCHEMA_V5} writes them. */
+const SCHEMA_V5_NODE_COLUMNS = ["remote_dir", "remote_terminal"] as const;
 
 /**
  * Schema v3 (result-ledger D2): the artifact ledger and its per-consumer
@@ -466,6 +499,16 @@ function migrate(db: DatabaseSync): void {
 			else if (missing.length > 0) db.exec(missing.map((column) => `ALTER TABLE nodes ADD COLUMN ${column} TEXT;`).join("\n"));
 			version = 4;
 		}
+		if (version === 4) {
+			// v4 → v5: where a cross-machine child's transcript and terminal live
+			// (`src/runs/remote-recover.ts`). Additive: two nullable columns on `nodes`,
+			// no backfill (`NULL` = "not recorded", which is what every existing row
+			// means). Same shape as v4's step, including the schema-first guard.
+			const missing = SCHEMA_V5_NODE_COLUMNS.filter((column) => !nodeColumnNames(db).includes(column));
+			if (missing.length === SCHEMA_V5_NODE_COLUMNS.length) db.exec(SCHEMA_V5);
+			else if (missing.length > 0) db.exec(missing.map((column) => `ALTER TABLE nodes ADD COLUMN ${column} TEXT;`).join("\n"));
+			version = 5;
+		}
 		db.exec(`PRAGMA user_version = ${LEGION_DB_USER_VERSION};`);
 		db.exec("COMMIT;");
 	} catch (error) {
@@ -530,7 +573,7 @@ function readUserVersion(db: DatabaseSync): number {
 	return Number(row?.user_version ?? 0);
 }
 
-/** Column names of `nodes` as they exist right now (used by the v4 migration). */
+/** Column names of `nodes` as they exist right now (used by the v4/v5 migrations). */
 function nodeColumnNames(db: DatabaseSync): string[] {
 	return db
 		.prepare("PRAGMA table_info(nodes);")
