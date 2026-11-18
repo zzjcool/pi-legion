@@ -3,6 +3,7 @@
 - 仓库 / 分支：`pi-legion`（`pi-legion`）`chore/verify-622`，基线 `4611ce3 docs(report): the 6.2.2 release record`（已发布 6.2.2 = `4d9ea75` + 该文档提交）
 - 验证对象：已发布并安装好的 **6.2.2**（本机 `~/.pi/agent/npm/node_modules/pi-legion/package.json` = `6.2.2`，pi = `1.5.2`）
 - 验证方式：**真进程 `pi -p -a`**（不是只读源码），四条修复各自一条可粘贴命令 + 原文输出
+- MR：<https://github.com/zzjcool/pi-legion/pull/400>（本报告单独一个提交，不改产品代码）
 - 本报告只写证据与判定；**未改动任何产品代码**（唯一改动的仓库文件就是本报告）
 
 ---
