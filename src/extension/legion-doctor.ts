@@ -1143,7 +1143,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		push(`- enabled: ${crossMachine?.enabled === true ? "true" : crossMachine?.enabled === false ? "false" : "unset"}`);
 		const hostNames = Object.keys(crossMachine?.hosts ?? {});
 		push(`- hosts: ${hostNames.length ? hostNames.join(", ") : "none configured"}`);
-		// One loop keeps the report in the configured order — no \`.sort()\`: the settings
+		// One loop keeps the report in the configured order — no `.sort()`: the settings
 		// file's own order is what \`subagents.crossMachine.hosts\` means to its author
 		// (review m4; the comment below already promised it), and re-alphabetising a
 		// human's list in a read-only report is an edit they did not ask for. Resolved
