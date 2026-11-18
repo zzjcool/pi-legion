@@ -274,13 +274,13 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(
 		Type.String({
 			description:
-				"Directory the child records live under (`<cwd>/.pi-subagents`), used by launch and by every control action. Defaults to the session cwd. A name miss searches the neighbouring stores too, so this is rarely needed. With `host`, an ABSOLUTE `cwd` is the remote working directory for this step instead (a path ON that machine).",
+				"Directory the child records live under (`<cwd>/.pi-subagents`). With `host`, an ABSOLUTE value is instead the directory ON that machine (the same meaning as `hostCwd`; prefer `hostCwd` for clarity). Without `host` it is the local record directory, defaulting to the session cwd (a name miss also searches the neighbouring stores).",
 		}),
 	),
 	hostCwd: Type.Optional(
 		Type.String({
 			description:
-				"Remote working directory for THIS step (absolute path ON the `host` machine). Overrides `subagents.crossMachine.hosts.<host>.cwd` for this launch only; the path must exist there. Ignored without `host`.",
+				"Directory ON the `host` machine for THIS step — an absolute path there, read on that machine and never translated from this one. This is the field to use when the call names a machine (an absolute `cwd` means the same thing). Overrides `subagents.crossMachine.hosts.<host>.cwd` for this launch only; the path must exist there. Ignored without `host`.",
 		}),
 	),
 	model: Type.Optional(Type.String()),
@@ -355,7 +355,7 @@ const SubagentParams = Type.Object({
 	hostCwd: Type.Optional(
 		Type.String({
 			description:
-				"Remote working directory for this launch (absolute path ON the `host` machine). Overrides subagents.crossMachine.hosts.<host>.cwd for this call only; the directory must exist there. Ignored without `host`.",
+				"Directory ON the `host` machine for this launch — an absolute path there, read on that machine and never translated from this one. This is the field to use when the call names a machine (an absolute `cwd` means the same thing). Overrides subagents.crossMachine.hosts.<host>.cwd for this call only; the directory must exist there. Ignored without `host`.",
 		}),
 	),
 	worktree: Type.Optional(
@@ -487,13 +487,13 @@ const VexillatioParams = Type.Object({
 	cwd: Type.Optional(
 		Type.String({
 			description:
-				"Directory the child records live under (`<cwd>/.pi-subagents`) for launch and every control action. Defaults to the session cwd. A name miss also searches neighbouring stores, so setting this is rarely needed. With `host`, an ABSOLUTE `cwd` is the remote working directory for this batch.",
+				"Directory the child records live under (`<cwd>/.pi-subagents`). With `host`, an ABSOLUTE value is instead the directory ON that machine (the same meaning as `hostCwd`; prefer `hostCwd` for clarity). Without `host` it is the local record directory, defaulting to the session cwd (a name miss also searches neighbouring stores).",
 		}),
 	),
 	hostCwd: Type.Optional(
 		Type.String({
 			description:
-				"Remote working directory for this batch (absolute path ON the `host` machine). Overrides subagents.crossMachine.hosts.<host>.cwd for this call only. Ignored without `host`.",
+				"Directory ON the `host` machine for this batch — an absolute path there, read on that machine and never translated from this one. This is the field to use when the call names a machine (an absolute `cwd` means the same thing). Overrides subagents.crossMachine.hosts.<host>.cwd for this call only. Ignored without `host`.",
 		}),
 	),
 	model: Type.Optional(Type.String()),
