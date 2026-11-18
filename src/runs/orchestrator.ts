@@ -369,6 +369,16 @@ export interface CollectResult {
 		/** The core byte-capped the window we asked for (silent, no flag). */
 		byteCapped?: boolean;
 		localPath?: string;
+		/**
+		 * D15 follow-up: the post-turn refresh FAILED, so this read is the last good
+		 * one and could not be confirmed as the transcript the turn produced.
+		 *
+		 * The numbers above still describe a real read (the mirror was kept, it is the
+		 * only answer this machine has), but they no longer describe THIS turn. The
+		 * reason travels verbatim so the render can say `not confirmed current`
+		 * instead of printing the demo's unqualified `5 of 5 lines (complete)`.
+		 */
+		stale?: string;
 		/** Set when the read-back failed outright; the collect then has no text. */
 		reason?: string;
 		/**
@@ -740,6 +750,10 @@ export class Orchestrator {
 				...(remote.screenTail && remote.screenTail.length > 0 ? { screenTail: remote.screenTail } : {}),
 			};
 		}
+		// D15: a refresh that failed did not replace the mirror, so these numbers are
+		// the last PRE-turn read. Carrying the reason is what stops the render from
+		// calling them `complete` — the same read D15 called a lie by name.
+		const stale = this.mirrorRefreshFailure.get(child.name);
 		return {
 			host: remote.host,
 			lines: remote.lines,
@@ -747,6 +761,7 @@ export class Orchestrator {
 			truncated: remote.truncated,
 			byteCapped: remote.byteCapped,
 			localPath: remote.localPath,
+			...(stale === undefined ? {} : { stale }),
 		};
 	}
 
@@ -3680,13 +3695,26 @@ export class Orchestrator {
 	 * returns on the first observed growth. The sleeps stay on the injected
 	 * `now`/`sleep` deps, so `test/perf/collect-latency.test.ts` can drive them
 	 * on its virtual clock.
+	 *
+	 * D15 follow-up: a child that ran elsewhere answers `false` without sleeping —
+	 * growth there is only visible through a read-back, which this window does not
+	 * perform (see the body). The local path below is unchanged.
 	 */
 	private async collectArtifactGrowing(child: ChildRecord, signal?: AbortSignal): Promise<boolean> {
-		// The artifact that may grow is the one the verdict is parsed from, so ask the
-		// same resolver everything else in collect asks. Polling `child.sessionFile`
-		// looked at the LOCAL placeholder for a child that ran elsewhere — a file that
-		// child never writes — so a remote child could never be granted the growth
-		// grace no matter how much its transcript grew on that machine.
+		// D15 follow-up: a child that ran elsewhere is never graced, and must not pay
+		// for the question either. Growth on that machine is only observable through a
+		// read-back, and D15 deliberately does not read the remote inside this window
+		// (the one read is the post-turn refresh, after a wait has settled — never a
+		// poll). Pointing the probe at the mirror therefore bought nothing: no local
+		// writer can grow that file, so the loop only slept up to `POLL_INTERVAL_MS`
+		// before answering the same `false` the empty placeholder used to answer
+		// immediately. A real grace extension for a remote child would have to call
+		// `refreshRemoteMirror` inside the window; this contract does not poll there.
+		if (normalizeHost(child.host) !== undefined) return false;
+		// A local child's artifact is the file the verdict is parsed from, so ask the same
+		// resolver everything else in collect asks (for a local child it is
+		// `child.sessionFile`, byte for byte — the resolver only differs for the remote
+		// case excluded above).
 		const artifact = this.sessionFileOf(child);
 		const before = artifactSize(artifact);
 		if (before <= 0 || signal?.aborted) return false;
@@ -3774,11 +3802,22 @@ export class Orchestrator {
 		}
 		const sessionExists = fs.existsSync(child.sessionFile);
 		const parsed = sessionExists ? parseSessionFile(this.sessionFileOf(child)) : emptyParsedSession();
-		if (!child.execution && sessionExists) child.execution = deriveOutcome(parsed);
+		// D15: the verdict stamped here must be the one a collect would reach. A mirror
+		// that is truncated, empty or could not be refreshed is THIS machine's blind
+		// spot, not the child's fate, so `deriveMirroredOutcome` answers `unknown` with
+		// the read-back reason instead of the frozen `no assistant message` sentence
+		// D15 disowned — through the retire door, which is the same sentence otherwise.
+		if (!child.execution && sessionExists) child.execution = this.deriveMirroredOutcome(child, parsed);
 		// Stamp the cause before killing so an in-flight collect cannot
 		// overwrite it with "no assistant message" after the process dies.
 		if (opts?.cause === "session-shutdown" && this.supervisor.isAlive(name)) {
-			child.execution = attributeParentSessionShutdown(child.execution ?? deriveOutcome(parsed), parsed);
+			const derived = child.execution ?? this.deriveMirroredOutcome(child, parsed);
+			// D15: the shutdown sentence asserts the child produced no assistant message,
+			// which an untrusted mirror cannot show. Attribution is only honest for a
+			// transcript this machine actually has; a local one always is.
+			child.execution = this.mirrorUntrustedReason(child) === undefined
+				? attributeParentSessionShutdown(derived, parsed)
+				: derived;
 		}
 		if (this.supervisor.isAlive(name)) {
 			await this.supervisor.retire(

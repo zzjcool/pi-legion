@@ -7500,6 +7500,12 @@ export function renderCollect(
 			truncated: boolean;
 			byteCapped?: boolean;
 			localPath?: string;
+			/**
+			 * D15: the post-turn refresh failed, so these numbers are the last
+			 * PRE-turn read and were never confirmed as this turn's transcript.
+			 * The word `complete` may not stand alone when this is set.
+			 */
+			stale?: string;
 			reason?: string;
 			/** `remote-child-fate-v1` §5: why it failed, as a class. */
 			fate?: "no-child" | "no-session" | "path" | "unreachable";
@@ -7600,7 +7606,15 @@ export function renderCollect(
 		} else if (readback.truncated) {
 			const what = readback.byteCapped ? "byte-capped by hc" : "tail only";
 			lines.push(
-				`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (truncated — ${what}; the verdict rests on that tail)`,
+				`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (truncated — ${what}; the verdict rests on that tail${readback.stale ? `; the post-turn refresh failed: ${readback.stale}` : ""})`,
+			);
+		} else if (readback.stale) {
+			// D15: the mirror exists and parses, but the refresh that would have made
+			// it THIS turn's transcript failed. Printing `(complete)` here is exactly
+			// the demo's lie — the numbers are a real read, they are just not a
+			// confirmed-current one, so the line says both.
+			lines.push(
+				`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (not confirmed current — the post-turn refresh failed: ${readback.stale}; the verdict rests on this earlier read)`,
 			);
 		} else {
 			lines.push(`read-back from host '${readback.host}': ${readback.returned} of ${readback.lines} lines (complete)`);

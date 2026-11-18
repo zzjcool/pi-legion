@@ -16,6 +16,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { renderCollect } from "../../index.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import type { RemoteReadbackResult, RemoteSessionRequest } from "../../src/runs/remote-artifact.ts";
 import { resolveHostTarget, type HostTarget } from "../../src/runs/remote.ts";
@@ -49,7 +50,12 @@ function gitRepo(root: string): string {
 	return repo;
 }
 
-function harness(prefix: string, remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>) {
+function harness(
+	prefix: string,
+	remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>,
+	/** Injected virtual clock (the collect grace window is asserted in ms, not slept). */
+	deps: { now?: () => number; sleep?: (ms: number) => Promise<void> } = {},
+) {
 	const root = mkdtempSync(path.join(tmpdir(), prefix));
 	const supervisor = new FakeSupervisor();
 	return {
@@ -60,6 +66,7 @@ function harness(prefix: string, remoteReadback?: (request: RemoteSessionRequest
 			runDir: path.join(root, "run"),
 			cwd: gitRepo(root),
 			...(remoteReadback ? { remoteReadback } : {}),
+			...deps,
 		}),
 		cleanup: () => rmSync(root, { recursive: true, force: true }),
 	};
@@ -398,6 +405,13 @@ test("S4/D15 (demo): a mid-turn mirror is re-read before the verdict, so 11 line
 			// can no longer describe a transcript that has 11 lines.
 			assert.equal(collected.remoteReadback?.lines, FINISHED.length);
 			assert.equal(collected.remoteReadback?.returned, FINISHED.length);
+			// ... and a refresh that DID run is the only shape allowed to say plain
+			// `complete` (the failure case below must not).
+			assert.equal(collected.remoteReadback?.stale, undefined);
+			assert.match(
+				renderCollect(handle.name, collected),
+				/read-back from host 'vps': 11 of 11 lines \(complete\)$/m,
+			);
 			assert.match(collected.output, /report written/);
 		} finally {
 			h.cleanup();
@@ -511,11 +525,125 @@ test("S4/D15: a refresh that FAILS keeps the old mirror and stays honest about i
 			assert.equal(collected.execution.status, "unknown", JSON.stringify(collected.execution));
 			assert.notEqual(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
 			assert.match(String(collected.execution.reason), /read-back could not be refreshed after the turn ended \(unreachable: machine 'hw-nj' did not answer in time\)/);
-			// The reported facts are the LAST SUCCESSFUL read, not the failure.
+			// The reported facts are the LAST SUCCESSFUL read, not the failure — but they
+			// must carry the fact that this read could not be confirmed as current. The
+			// demo's lie was the unqualified `5 of 5 lines (complete)` on exactly this
+			// shape, so the render may not print that word here.
 			assert.equal(collected.remoteReadback?.lines, MID_TURN.length);
 			assert.equal(collected.remoteReadback?.truncated, false);
+			assert.match(
+				String(collected.remoteReadback?.stale),
+				/unreachable: machine 'hw-nj' did not answer in time/,
+			);
+			const rendered = renderCollect(handle.name, collected);
+			assert.equal(
+				rendered.split("\n").find((line) => line.startsWith("read-back from host")),
+				`read-back from host 'vps': 5 of 5 lines (not confirmed current — the post-turn refresh failed: unreachable: machine 'hw-nj' did not answer in time; the verdict rests on this earlier read)`,
+			);
+			assert.doesNotMatch(rendered, /lines \(complete\)/, "a stale mirror may never stand alone as `complete`");
 		} finally {
 			h.cleanup();
 		}
 	});
+});
+
+/* ------------------------------------------------------------------------- *
+ * D15 follow-ups: the grace window and `retire()` are the two other doors the
+ * stale mirror can leave through.
+ * ------------------------------------------------------------------------- */
+
+test("D15 follow-up: a remote grace window costs no sleep — growth there needs a read-back", async () => {
+	// The growth probe used to look at the local placeholder (an empty file, so the
+	// window never opened). D15 pointed it at the mirror, which exists and has
+	// bytes — but nothing on THIS machine can grow it: the only way growth becomes
+	// visible is a read-back, and D15 deliberately does not poll the remote while a
+	// turn is live. The loop therefore bought nothing and cost up to 2×500ms of dead
+	// time. It must answer `false` now, without sleeping.
+	const sleeps: number[] = [];
+	let clock = 0;
+	let mirrorPath = "";
+	const h = harness(
+		"xm-remote-grace-",
+		async (request) => {
+			writeMirror(request.localPath, MID_TURN);
+			mirrorPath = request.localPath;
+			return {
+				ok: true,
+				host: request.host,
+				localPath: request.localPath,
+				lines: MID_TURN.length,
+				returned: MID_TURN.length,
+				truncated: false,
+				byteCapped: false,
+			};
+		},
+		{ now: () => clock, sleep: async (ms) => { clock += ms; sleeps.push(ms); } },
+	);
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
+			// No settle: the wait times out, which is the only way into the grace loop.
+			const collected = await h.orchestrator.collect(handle.name, { timeoutMs: 1_000 });
+			assert.ok(existsSync(mirrorPath), "the read-back wrote the mirror, so the old probe would have seen bytes and slept");
+			assert.deepEqual(sleeps, [], `a remote grace window may not sleep (slept ${sleeps.join(",")}ms)`);
+			assert.equal(clock, 0, `a remote collect burned ${clock}ms of grace sleeps`);
+			// The untouched timeout snapshot is still what the caller gets.
+			assert.equal(collected.execution.status, "running");
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("D15: a remote retire from a truncated mirror is `unknown`, never `no assistant message`", async () => {
+	// `retire()` used to derive from bare bytes, so a stop that landed between the
+	// read-back and the verdict stamped the demo's sentence — `aborted (no assistant
+	// message for the last prompt)` — on a child whose reply was simply past the
+	// tail window. It must reach the same verdict `collect` does.
+	const h = harness("xm-retire-truncated-", async (request) => {
+		writeMirror(request.localPath, MID_TURN);
+		return {
+			ok: true,
+			host: request.host,
+			localPath: request.localPath,
+			lines: 9_000,
+			returned: MID_TURN.length,
+			truncated: true,
+			byteCapped: true,
+		};
+	});
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
+			// Populate the mirror the way an in-flight collect does, then retire before
+			// that collect reaches its verdict: an already-aborted signal returns right
+			// after the read-back, leaving `child.execution` unset — the exact state a
+			// `stop` racing a live collect sees.
+			const aborted = new AbortController();
+			aborted.abort();
+			const interrupted = await h.orchestrator.collect(handle.name, { signal: aborted.signal });
+			assert.equal(interrupted.execution.reason, "aborted by parent");
+			const retired = await h.orchestrator.retire(handle.name);
+			assert.equal(retired.execution?.status, "unknown", JSON.stringify(retired.execution));
+			assert.notEqual(retired.execution?.reason, NO_ASSISTANT_ABORT_REASON);
+			assert.match(String(retired.execution?.reason), /read-back was truncated \(5 of 9000 lines\)/);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("D15: a local retire keeps today's verdict — a transcript with no reply is still `aborted`", async () => {
+	// The honesty rule is about a MIRROR; a local transcript is authoritative, so
+	// the frozen sentence stays exactly as `session.test.ts` pins it.
+	const h = harness("xm-retire-local-");
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "t", worktree: false });
+		writeFileSync(handle.sessionFile, `${MID_TURN.join("\n")}\n`);
+		const retired = await h.orchestrator.retire(handle.name);
+		assert.equal(retired.execution?.status, "aborted");
+		assert.equal(retired.execution?.reason, NO_ASSISTANT_ABORT_REASON);
+	} finally {
+		h.cleanup();
+	}
 });
