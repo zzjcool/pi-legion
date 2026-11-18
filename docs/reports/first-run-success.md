@@ -579,3 +579,25 @@ D1/D2/D3 的断言随实现一起留在 master（本分支合并时删掉了自�
 - **对抗式 review 的六条修正已落库**：契约 `docs/contracts/first-run-success-v1.md` 的「Amendments」记录了
   A1–A6（read-back 路径也提问 / D5 带 `hostCwd` / 体检的 `enabled:false` 与零机器档 / launch 标签与 model /
   合并的 role JSON 与 `# where:` / 共享 section 门禁 + scoped 包名匹配）。
+
+## 11. 6.2.1 发布记录
+
+- **master**：`1cd9c7e`（合并 `feat/first-run-success`，含 master 的 `xm-dispatch` 三条修复）；
+  发版提交 `4cd9c2a`（`package.json` / `package-lock.json` 6.2.0 → 6.2.1，`CHANGELOG` 定稿）。
+- **发版前门禁（在 master `1cd9c7e` 上实跑）**：
+  - `npm run typecheck` → `tsc --noEmit`，退出 0；
+  - `npm test` → `ℹ tests 2636 / pass 2635 / fail 0 / skipped 1`；
+  - `npm run test:integration` → `ℹ tests 173 / pass 173 / fail 0`；
+  - `npm run test:mock-llm` → `ℹ tests 25 / pass 25 / fail 0`（Release workflow 也跑这一条）。
+- **tag**：`v6.2.1`（annotated；正文即 GitHub Release 的 body，含两块变更与已知限制）。
+- **Release workflow**：run [`44297289414`](https://github.com/zzjcool/pi-legion/actions/runs/44297289414)，
+  `release: 6.2.1`，6m20s，全部步骤绿（typecheck / test / integration / mock-llm /
+  tag↔version 校验 / manifest 校验 / GitHub Release / npm trusted publish）。
+  发布日志：`+ pi-legion@6.2.1 … Published pi-legion@6.2.1 with provenance`，
+  provenance 写入 transparency log（`logIndex=3968711974`）。
+- **GitHub Release**：<https://github.com/zzjcool/pi-legion/releases/tag/v6.2.1>（非 prerelease）。
+- **registry**：`npm view pi-legion version` → `6.2.1`；`gitHead = 4cd9c2a`，
+  `dist.integrity = sha512-+aUbnbO7+4eHk59v+FF+f3XXgybcdHrfDLhG7RS9J5h1TB77zBOlgMu7gqYnVpEcsdXXBoItaDdRpafr01cjzw==`
+  （与发布日志里的 integrity 一致）；publish 后约 4 分钟 registry 才可查（npm 的 "being processed"）。
+- 本记录是 tag 之后的一次**文档-only** 提交（tag 指 `4cd9c2a`，master 在此之后多这一条文档提交）；
+  代码与 tag 逐字节一致。
