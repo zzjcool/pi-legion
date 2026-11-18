@@ -601,3 +601,70 @@ D1/D2/D3 的断言随实现一起留在 master（本分支合并时删掉了自�
   （与发布日志里的 integrity 一致）；publish 后约 4 分钟 registry 才可查（npm 的 "being processed"）。
 - 本记录是 tag 之后的一次**文档-only** 提交（tag 指 `4cd9c2a`，master 在此之后多这一条文档提交）；
   代码与 tag 逐字节一致。
+
+## 12. 6.2.1 之后：三个真机问题 + 两个产品要求（未发版，6.2.2）
+
+6.2.1 发布后再次真机复跑，暴露三处「文案许诺了不存在的能力」，外加两条产品要求。四个提交，全部带
+「改回去即红」的测试；CHANGELOG 记在 `## [Unreleased] — 6.2.2（patch）`。
+
+### 12.1 预检不认 `cwd`（`583eeae`）
+
+before（真实调用，`cwd: "../code/anotify"` + `hostCwd`，两者都真实存在）：
+
+```text
+INVALID_PARAMS: cross-machine delivery needs a git checkout on this machine too, and this session's directory
+(/Users/.../agents) is not one.
+```
+
+根因：`Orchestrator.launch` 把父机 checkout 写死成 `this.cwd`（预检、远端 spawn 的 `cwd`、以及
+terminal 后端建 worktree 用的 `localRepo` 全是它），调用方的 `cwd` 只被用来选 store。
+
+现在：`LaunchInput.localRepo` 由 `index.ts` 计算 —— **相对** `cwd` 解析成父机 checkout（git 就在那个
+目录里问 origin，worktree 也从它建），**绝对** `cwd` 是那台机器上的目录（跳过），没传则仍是会话目录；
+拒绝文案点名真正被问的那个目录（`the directory it delivers from (<dir>) is not one`）。`resume` /
+revive 不带这个字段，行为不变。
+
+### 12.2 文案推荐了被 `allowRoles` 禁止的调用（`583eeae` + 本轮）
+
+三条本地交付拒绝（不是仓库 / 没有 origin / 没有 git）与三条远端交付拒绝（目标机 checkout / origin /
+git）以前都写「改派 worker —— `subagent({ agent: "worker", host, task })`」，而默认只有 `centurion`
+能跨机 —— 照着做必然再撞一次。现在统一成「改派 centurion，让它在那台机器上创建 worker/scout」，
+并点明 `allowRoles` 的默认值；`src/` 里不再出现 `agent: "worker", host` 这种调用片段。
+
+### 12.3 模型：配置 > 远端默认（`567417a`）
+
+解析顺序（只有**完全没有**可用模型时才失败）：
+
+1. 本次调用显式 `model`；
+2. `subagents.crossMachine.hosts.<h>.model`（新键）；
+3. 那台机器 `--list-models` 的第一个（优先与请求同 provider）；
+4. 空清单 → 硬失败，打印该机可见模型（最多 20 条）或空清单的 `piExtensions` 解释。
+
+回退时 launch 继续，handle 一条 warning：`host 'hw-nj': model 'codebuddy/glm-5.2' is not visible there; using 'codebuddy/glm-5' from that machine's listing (pin it with subagents.crossMachine.hosts.hw-nj.model)`。
+实现是在启动探针判 `model-missing` 时就地改写 argv 的 `--model`（连带 `--provider` pin 与 thinking 级别），
+然后**再探一次**新 argv，确认能跑才继续。`/legion doctor crossmachine` 用同一顺序选模型。
+
+### 12.4 父会话退出后的遗留 child（`483deda` … `9a2e51d`）
+
+- `nodes` schema v5 新增 `remote_dir` / `remote_terminal`（可空、不回填），跨机 launch 成功时写入。
+- `/legion status` 新增块：`Recoverable cross-machine children (this session never launched them):`，
+  每行名字/角色/host/状态/远端终端/年龄，加一条 `collect: subagent({ action: "recover", name: "…" })`。
+  本进程已跟踪的 child 不重复显示。
+- 新 action `subagent({ action: "recover", name })`：从旧会话的 ledger 行直接读回
+  `<remote_dir>/session.jsonl`，用 collect 的同一套规则判分并落定 ledger 行；仍在远端活着的只说
+  「还活着」、不落定；第二次调用是 `already settled` + 已记录结果。**不做**把 child 收养进当前
+  supervisor（那是另一个量级的改动，已作为边界记录）。
+
+### 12.5 门禁与状态
+
+合并前在 `b0f832c`（= master `e9ed558` + 本轮四个提交 + 文档）上实跑：
+
+```text
+$ npm run typecheck                       → tsc --noEmit（退出 0）
+$ npm test                                → ℹ tests 2656 / pass 2655 / fail 0 / skipped 1
+$ npm run test:integration                → ℹ tests 179 / pass 179 / fail 0
+```
+
+本轮新增测试：预检/文案（`cross-machine-preflight`、`remote-worktree`、`cross-machine-orchestrator`）、
+模型回退 9 条（`xm-model-fallback`）、恢复 6 条 integration（`recover-cross-machine`）。
+未发版 —— master 上以 `## [Unreleased] — 6.2.2（patch）` 收口，何时 tag 由维护者定。

@@ -29,6 +29,7 @@ import { createSummaryCommand } from "./summary.ts";
 import { createTimingCommand } from "./timing.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import { loadSubagentSettings } from "../agents/settings.ts";
+import type { LegionNode } from "../legion/nodes.ts";
 import { crossMachineCheckupRequested, runCrossMachineCheckup } from "../runs/cross-machine-checkup.ts";
 import type { CrossMachineSettings } from "../shared/types.ts";
 import type {
@@ -107,6 +108,12 @@ export interface LegionCommandDeps {
 	 * Undefined when this process has no run-store record for `name`.
 	 */
 	childStatus?: (name: string, cwd: string) => LegionChildStatusFacts | undefined;
+	/**
+	 * Cross-machine rows a previous process left unsettled (schema v5), read from
+	 * the ledger: the `/legion status` recoverable block. Optional so an isolated
+	 * test (and a session with no ledger) renders exactly what it did before.
+	 */
+	recoverable?: () => readonly LegionNode[];
 	/** Existing user-facing subcommand handlers; absent only in isolated tests. */
 	commands?: {
 		team: TeamCommandDeps;
@@ -779,6 +786,10 @@ export function registerLegionCommand(
 					query: rest.join(" "),
 					nodes: deps.runtime.treeNodes(),
 					jobs: deps.runtime.activeJobs(),
+					// Schema v5: rows a previous process left running on another machine.
+					// Read from the LEDGER on every status call, so a recovery this session
+					// performed disappears from this block immediately.
+					...(deps.recoverable ? { recoverable: deps.recoverable() } : {}),
 					lookupChild: deps.childStatus
 						? (name) => deps.childStatus!(name, ctx.cwd)
 						: undefined,

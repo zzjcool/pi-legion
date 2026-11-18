@@ -265,8 +265,8 @@ test("a v2 ledger opens as v3: the two tables appear and no existing row is lost
 		const upgraded = openLegionDb(file);
 		try {
 			assert.equal(Number(upgraded.prepare("PRAGMA user_version").get()?.user_version), LEGION_DB_USER_VERSION);
-			// schema v4 (cross-machine D5/D13): the version pin moves with the migration.
-			assert.equal(LEGION_DB_USER_VERSION, 4);
+			// schema v5: the version pin moves with the migration.
+			assert.equal(LEGION_DB_USER_VERSION, 5);
 			const tables = upgraded
 				.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
 				.all()

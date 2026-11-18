@@ -15,9 +15,9 @@ import {
 import { getNode, insertNode } from "../../src/legion/nodes.ts";
 
 const TABLE_COLUMNS = {
-	// schema v4 (`cross-machine-spawn-v1` D5/D13): the two ownership columns are
-	// APPENDED by `ALTER TABLE`, so they come after every v1 column.
-	nodes: ["id", "parent_id", "name", "role", "kind", "depth", "run_id", "session_file", "worktree_path", "model", "team", "status", "phase", "phase_since", "rework_count", "contract_path", "task_summary", "created_at", "updated_at", "host", "worktree_host"],
+	// schema v5: v4's ownership columns and v5's recovery facts are APPENDED by
+	// `ALTER TABLE`, so they come after every v1 column and in that order.
+	nodes: ["id", "parent_id", "name", "role", "kind", "depth", "run_id", "session_file", "worktree_path", "model", "team", "status", "phase", "phase_since", "rework_count", "contract_path", "task_summary", "created_at", "updated_at", "host", "worktree_host", "remote_dir", "remote_terminal"],
 	events: ["id", "node_id", "type", "data", "ts"],
 	usage: ["node_id", "tokens_in", "tokens_out", "cost_usd", "updated_at"],
 	messages: ["id", "from_node", "to_node", "subject", "body", "kind", "urgency", "delivered", "delivered_at", "created_at"],
@@ -36,7 +36,7 @@ const INDEX_COLUMNS = {
 	idx_artifacts_parent: ["parent_id", "created_at"],
 } as const;
 
-test("legion db schema snapshot matches contract columns and indexes (v4)", () => {
+test("legion db schema snapshot matches contract columns and indexes (v5)", () => {
 	const db = openLegionDb(":memory:");
 	try {
 		assert.equal(Number(db.prepare("PRAGMA user_version").get()?.user_version), LEGION_DB_USER_VERSION);
@@ -274,8 +274,8 @@ test("a v1 ledger opens as the current schema version without rewriting a single
 
 		const upgraded = openLegionDb(file);
 		try {
-			// schema v4 (cross-machine D5/D13): the version pin moves with the migration.
-			assert.equal(LEGION_DB_USER_VERSION, 4);
+			// schema v5: the version pin moves with the migration.
+			assert.equal(LEGION_DB_USER_VERSION, 5);
 			assert.equal(
 				Number(upgraded.prepare("PRAGMA user_version").get()?.user_version),
 				LEGION_DB_USER_VERSION,
@@ -386,7 +386,7 @@ test("a v3 ledger gains nodes.host/worktree_host, keeps its rows, and reads them
 			assert.deepEqual(
 				db.prepare("PRAGMA table_info(nodes)").all().map((row) => String(row.name)),
 				[...TABLE_COLUMNS.nodes],
-				"v3 → v4 appends exactly nodes.host + nodes.worktree_host",
+				"v3 → v5 appends exactly nodes.host + nodes.worktree_host + the v5 recovery pair",
 			);
 			// D5: an old row survives untouched, and the two new columns read as NULL —
 			// which is the legal, permanent spelling of "this host".
@@ -406,7 +406,7 @@ test("a v3 ledger gains nodes.host/worktree_host, keeps its rows, and reads them
 			db.close();
 		}
 
-		// Idempotent: a second open sees user_version 4 and must not re-run the ALTERs.
+		// Idempotent: a second open sees user_version 5 and must not re-run the ALTERs.
 		const reopened = openLegionDb(file);
 		try {
 			assert.equal(Number(reopened.prepare("PRAGMA user_version").get()?.user_version), LEGION_DB_USER_VERSION);
@@ -418,6 +418,118 @@ test("a v3 ledger gains nodes.host/worktree_host, keeps its rows, and reads them
 			assert.equal(Number(reopened.prepare("SELECT COUNT(*) AS n FROM nodes").get()?.n), 3);
 		} finally {
 			reopened.close();
+		}
+	} finally {
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+/**
+ * The exact `nodes` table a v4 ledger has on disk: v1's nineteen columns plus v4's
+ * pair, and NOTHING from v5. Written out for the same reason as {@link V3_NODES_DDL}
+ * — a fixture derived from the live code proves nothing about an old file.
+ */
+const V4_NODES_DDL = `
+CREATE TABLE nodes (
+  id            TEXT PRIMARY KEY,
+  parent_id     TEXT REFERENCES nodes(id),
+  name          TEXT NOT NULL,
+  role          TEXT NOT NULL,
+  kind          TEXT NOT NULL DEFAULT 'pi',
+  depth         INTEGER NOT NULL,
+  run_id        TEXT,
+  session_file  TEXT,
+  worktree_path TEXT,
+  model         TEXT,
+  team          TEXT,
+  status        TEXT NOT NULL,
+  phase         TEXT,
+  phase_since   INTEGER,
+  rework_count  INTEGER NOT NULL DEFAULT 0,
+  contract_path TEXT,
+  task_summary  TEXT,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL,
+  host          TEXT,
+  worktree_host TEXT
+);
+CREATE INDEX idx_nodes_parent ON nodes(parent_id);
+CREATE INDEX idx_nodes_status ON nodes(status, updated_at);
+`;
+
+function writeV4Ledger(file: string): void {
+	const required = createRequire(import.meta.url) as (id: string) => { DatabaseSync: new (path: string) => { exec(sql: string): void; close(): void } };
+	const { DatabaseSync } = required("node:sqlite");
+	const db = new DatabaseSync(file);
+	try {
+		db.exec(V4_NODES_DDL);
+		db.exec("PRAGMA user_version = 4;");
+		db.exec(
+			`INSERT INTO nodes (id, parent_id, name, role, kind, depth, host, worktree_host, status, created_at, updated_at)
+			 VALUES ('root', NULL, 'root', 'root', 'pi', 0, NULL, NULL, 'running', 100, 100);`,
+		);
+		db.exec(
+			`INSERT INTO nodes (id, parent_id, name, role, kind, depth, host, worktree_host, status, created_at, updated_at)
+			 VALUES ('root.worker', 'root', 'worker', 'worker', 'pi', 1, 'hw-nj', 'hw-nj', 'running', 111, 222);`,
+		);
+	} finally {
+		db.close();
+	}
+}
+
+test("a v4 ledger gains nodes.remote_dir/remote_terminal with no backfill (v5)", () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "legion-db-v4-v5-"));
+	const file = path.join(directory, "ledger.db");
+	try {
+		writeV4Ledger(file);
+		// Guard the fixture: if it already carried the v5 columns the test proves nothing.
+		const sqlite = createRequire(import.meta.url)("node:sqlite") as { DatabaseSync: new (path: string) => { prepare(sql: string): { all(): Array<Record<string, unknown>> }; close(): void } };
+		const raw = new sqlite.DatabaseSync(file);
+		try {
+			assert.deepEqual(
+				raw.prepare("PRAGMA table_info(nodes)").all().map((row) => String(row.name)),
+				[...TABLE_COLUMNS.nodes].slice(0, 21),
+				"the fixture must be a real v4 shape (21 columns, none from v5)",
+			);
+		} finally {
+			raw.close();
+		}
+
+		const db = openLegionDb(file);
+		try {
+			assert.equal(
+				Number(db.prepare("PRAGMA user_version").get()?.user_version),
+				LEGION_DB_USER_VERSION,
+				"opening a v4 ledger upgrades it to the current schema version",
+			);
+			assert.deepEqual(
+				db.prepare("PRAGMA table_info(nodes)").all().map((row) => String(row.name)),
+				[...TABLE_COLUMNS.nodes],
+				"v4 → v5 appends exactly nodes.remote_dir + nodes.remote_terminal",
+			);
+			// No backfill: a pre-v5 row keeps every value and the new columns read NULL,
+			// which is the permanent spelling of "not recorded".
+			const node = getNode(db, "root.worker");
+			assert.ok(node, "the pre-v5 row is still there");
+			assert.equal(node.host, "hw-nj", "the host the launch recorded is untouched");
+			assert.equal(node.worktreeHost, "hw-nj");
+			assert.equal(node.remoteDir, null, "NULL = not recorded");
+			assert.equal(node.remoteTerminal, null, "NULL = not recorded");
+			// And the new columns are writable through the normal path (schema + mapping),
+			// which is what the recovery action depends on.
+			insertNode(db, {
+				parentId: "root",
+				name: "remote",
+				role: "worker",
+				host: "hw-nj",
+				remoteDir: "/srv/.pi-subagents-mirror/run-1/remote",
+				remoteTerminal: "hw-nj/lgl-run1-remote",
+			});
+			const stored = getNode(db, "root.remote");
+			assert.equal(stored?.remoteDir, "/srv/.pi-subagents-mirror/run-1/remote");
+			assert.equal(stored?.remoteTerminal, "hw-nj/lgl-run1-remote");
+		} finally {
+			db.close();
 		}
 	} finally {
 		fs.rmSync(directory, { recursive: true, force: true });

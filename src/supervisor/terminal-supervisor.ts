@@ -38,8 +38,12 @@ import {
 	remoteDirFor,
 	remotePreflight,
 	terminalAddress,
+	applyRemoteModelFallback,
+	planRemoteModelFallback,
+	remoteModelMissingError,
 	type HostTarget,
 	type RemoteChildFate,
+	type RemoteModelFallback,
 } from "../runs/remote.ts";
 import {
 	createRemoteChildWorktree,
@@ -720,33 +724,87 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// Every failure below therefore lands BEFORE `terminal.run`, in the launch,
 		// with the machine, the fix and a copyable command named.
 		if (target !== undefined) {
-			// One line, computed once: the request and all four refusals must quote the
-			// SAME command, or the operator debugs a command nobody ran.
-			const probeLine = remoteStartupProbeLine(argv, remoteWorktree?.path ?? target.cwd);
-			const probe = await client.request<{ code?: number | null; stdout?: string; stderr?: string; timed_out?: boolean }>(
-				"machine.exec",
-				{
-					on: target.host,
-					line: probeLine,
-					timeout: REMOTE_STARTUP_PROBE_TIMEOUT_S,
-				},
-			).catch((error: unknown) => {
-				// The probe is a DIAGNOSTIC: if the machine cannot run it at all, the launch
-				// keeps its meaning (the real child reports for itself). Only an answer we
-				// can read is treated as a verdict.
-				process.stderr.write(
-					`[pi-legion] host '${target.host}': could not run the startup probe (${error instanceof Error ? error.message : String(error)}); launching anyway\n`,
-				);
-				return undefined;
-			});
-			const probeStdout = probe === undefined ? "" : Buffer.from(String(probe.stdout ?? ""), "base64").toString("utf8");
-			const probeStderr = probe === undefined ? "" : Buffer.from(String(probe.stderr ?? ""), "base64").toString("utf8");
-			const probeOut = probe === undefined ? undefined : `${probeStdout}\n${probeStderr}`;
-			const verdict = probeOut === undefined ? undefined : classifyRemoteStartupProbe(probeOut, input.model);
-			const excerpt = (probeOut ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0).slice(0, 5).join("\n");
-			// Appended to EVERY refusal: the line to paste on that machine. Without it the
-			// operator has the symptoms and not the reproduction, and the probe's argv is
-			// the one thing they cannot reconstruct by hand (mapped paths, host extensions).
+			// A `const` alias so the closure below is not re-narrowing a `let` on every
+			// call; `target` is not reassigned in this scope.
+			const probeTarget = target;
+			// The child's own directory: its tree when one was created, the checkout
+			// otherwise. `cd` there, because a probe run elsewhere asks about the wrong
+			// checkout's `pi`.
+			const probeCwd = remoteWorktree?.path ?? probeTarget.cwd;
+			/**
+			 * One `machine.exec` of the probe line, decoded.
+			 *
+			 * `out` is `undefined` when the machine could not run it at all: the probe is
+			 * a DIAGNOSTIC, so an unrunnable probe keeps the launch's meaning (the real
+			 * child reports for itself). Only an answer we can read is a verdict.
+			 */
+			const runProbe = async (line: string): Promise<{
+				code?: number | null;
+				stdout: string;
+				out?: string;
+			}> => {
+				const answer = await client.request<{ code?: number | null; stdout?: string; stderr?: string; timed_out?: boolean }>(
+					"machine.exec",
+					{
+						on: probeTarget.host,
+						line,
+						timeout: REMOTE_STARTUP_PROBE_TIMEOUT_S,
+					},
+				).catch((error: unknown) => {
+					process.stderr.write(
+						`[pi-legion] host '${probeTarget.host}': could not run the startup probe (${error instanceof Error ? error.message : String(error)}); launching anyway\n`,
+					);
+					return undefined;
+				});
+				const stdout = answer === undefined ? "" : Buffer.from(String(answer.stdout ?? ""), "base64").toString("utf8");
+				const stderr = answer === undefined ? "" : Buffer.from(String(answer.stderr ?? ""), "base64").toString("utf8");
+				return {
+					...(answer === undefined ? {} : { code: answer.code }),
+					stdout,
+					...(answer === undefined ? {} : { out: `${stdout}\n${stderr}` }),
+				};
+			};
+			// One line per PROBE: a refusal must quote the command that answered it, or the
+			// operator debugs a command nobody ran. It is recomputed when the model is
+			// rewritten below (xm-model-fallback), because the second probe is a different
+			// command and the refusal after it has to name THAT one.
+			let probeLine = remoteStartupProbeLine(argv, probeCwd);
+			let probe = await runProbe(probeLine);
+			let verdict = probe.out === undefined ? undefined : classifyRemoteStartupProbe(probe.out, input.model);
+			// xm-model-fallback: "configure the model up front, and when nothing is
+			// configured fall back to a model on the target machine" — so a model this
+			// machine does not serve is no longer a dead end. The launch resolves one
+			// (`planRemoteModelFallback`: the operator's `hosts.<host>.model`, else that
+			// machine's own listing), rewrites the `--model` pair IN PLACE, and RE-ASKS:
+			// a listing is a claim, and a claim is not proof that the child will start.
+			let askedModel = input.model;
+			let fallbackSource: RemoteModelFallback["source"] | undefined;
+			if (verdict === "model-missing" && input.model !== undefined) {
+				const fallback = planRemoteModelFallback({
+					host: probeTarget.host,
+					requested: input.model,
+					...(probeTarget.model !== undefined ? { configured: probeTarget.model } : {}),
+					available: parseListModels(probe.stdout),
+				});
+				if (fallback !== undefined) {
+					applyRemoteModelFallback(argv, fallback.model);
+					askedModel = fallback.model;
+					fallbackSource = fallback.source;
+					probeLine = remoteStartupProbeLine(argv, probeCwd);
+					probe = await runProbe(probeLine);
+					verdict = probe.out === undefined ? undefined : classifyRemoteStartupProbe(probe.out, fallback.model);
+					// The warning rides on the handle, and ONLY when the launch really
+					// continues: a fallback that is refused too would leave a notice about a
+					// child that never existed. One line, bounded (`planRemoteModelFallback`
+					// writes it), because stderr is invisible in the tool result.
+					launchWarnings.push(fallback.warning);
+				}
+			}
+			const probeStdout = probe.stdout;
+			const excerpt = (probe.out ?? "").split("\n").map((line) => line.trim()).filter((line) => line.length > 0).slice(0, 5).join("\n");
+			// Appended to every refusal built here: the line to paste on that machine. Without
+			// it the operator has the symptoms and not the reproduction, and the probe's argv
+			// is the one thing they cannot reconstruct by hand (mapped paths, host extensions).
 			const reproduce = `\n\nCommand (run on '${target.host}' to reproduce):\n${probeLine}`;
 			if (verdict === "no-model") {
 				await rollbackRemoteDir();
@@ -768,18 +826,24 @@ export class TerminalSupervisor implements LegionSupervisor {
 				this.removeTempDir(tempDir);
 				await rollbackRemoteWorktree();
 				await rollbackRemoteDir();
-				// The machine HAS models, just not this one — a different problem from
-				// `no-model`, with different fixes. Quote what it does serve (first five)
-				// so the operator can pick a reachable model instead of guessing. Parse
-				// STDOUT only: stderr warnings would otherwise be read as model rows.
-				const listed = parseListModels(probeStdout).slice(0, 5);
-				throw new SubagentError(
-					`host '${target.host}': the child's model '${input.model}' is not visible there — that machine lists:\n${listed.length > 0 ? listed.join("\n") : "(an empty listing)"}\nPoint this launch at a model that machine serves (the role's \`model\`, \`subagents.defaultModel\`, or \`agentOverrides.<role>.model\`), or put the provider extension that publishes '${input.model}' into subagents.crossMachine.hosts.${target.host}.piExtensions. A model that is LISTED there is enough: the probe does not need a credential.${reproduce}`,
-					ErrorCodes.INVALID_PARAMS,
-					{ host: target.host, probe: "model-missing", model: input.model },
-				);
+				// The machine HAS models, just not the ones this launch can use. The sentence
+				// lives with the fallback it now has to explain (`remoteModelMissingError`):
+				// what was looked for, what that machine serves, and the two ways out. Parse
+				// STDOUT only — stderr warnings would otherwise be read as model rows.
+				// `model-missing` is only ever decided against a model the launch ASKED for
+				// (`classifyRemoteStartupProbe` needs one), so this is a narrowing.
+				const requested = input.model ?? askedModel ?? "";
+				throw remoteModelMissingError({
+					host: target.host,
+					requested,
+					asked: askedModel ?? requested,
+					...(target.model !== undefined ? { configured: target.model } : {}),
+					...(fallbackSource !== undefined ? { fallbackSource } : {}),
+					available: parseListModels(probeStdout),
+					probeLine,
+				});
 			}
-			if (probe !== undefined && typeof probe.code === "number" && probe.code !== 0) {
+			if (typeof probe.code === "number" && probe.code !== 0) {
 				await rollbackRemoteDir();
 				throw new SubagentError(
 					`host '${target.host}': the child's own argv failed on that machine (exit ${probe.code}):\n${excerpt || "(no output)"}${reproduce}`,

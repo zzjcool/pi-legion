@@ -479,7 +479,7 @@ function checkoutTwoWaysOut(host: string, cwd: string): string {
 	return (
 		` Two ways out: 1) give that machine a checkout at ${cwd} — git clone <url> ${cwd} on '${host}' — or point ` +
 		`subagents.crossMachine.hosts.${host}.cwd at a directory that is a git checkout; ` +
-		"2) dispatch a worker instead (workers need no worktree and no git)."
+		"2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion)."
 	);
 }
 
@@ -512,7 +512,7 @@ export function remoteGitMissingMessage(opts: { host: string; code: number | nul
 	return (
 		`host '${opts.host}': git is not available on that machine (${opts.command} exited ${code}: ${detail}). ` +
 		"A cross-machine centurion delivers through git worktrees, so git must be on PATH there. " +
-		`Two ways out: 1) install git on '${opts.host}' and retry; 2) dispatch a worker instead (workers need no worktree and no git).`
+		`Two ways out: 1) install git on '${opts.host}' and retry; 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).`
 	);
 }
 
@@ -535,26 +535,54 @@ export function noLocalGitMessage(opts: {
 	return (
 		`this machine has no usable git (git --version exited ${code}: ${opts.detail}); ` +
 		"a cross-machine centurion delivers through git worktrees, so git must be on PATH here too. " +
-		"Two ways out: 1) install git here and retry; " +
-		`2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "${opts.host}", task: "..." }) needs no worktree and no git.`
+		`Two ways out: 1) install git here and retry; ` +
+		// The old tail named a `subagent({ agent: "worker", … })` call that
+		// `allowRoles` refuses (see `dispatchCenturionInstead`); dropping the worktree
+		// delivery is the real second way out, and it needs no git on either side.
+		`2) drop the worktree delivery and dispatch the centurion — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), and launched without \`worktree: true\` it needs no git here; the scout or worker it creates is born ON '${opts.host}'.`
 	);
 }
 
 /**
- * D5: this session's directory is not a git checkout at all.
+ * The policy-true alternative to a dispatch this session would REFUSE
+ * (contract `xm-dispatch` D4 / `first-run-success-v1`).
+ *
+ * `subagents.crossMachine.allowRoles` defaults to `["centurion"]`, so the old
+ * tail — `subagent({ agent: "worker", host: …, task: … })` — recommended a call
+ * the tool rejects one turn later. That is worse than no advice: the reader
+ * spends a turn on a guaranteed refusal. What is true is the other direction:
+ * the worker is created ON that machine by the centurion dispatched there.
+ *
+ * Returns the second way out WITHOUT its closing period, so a caller can append
+ * its own reason clause and the three messages stay one family.
+ */
+function dispatchCenturionInstead(host: string): string {
+	return (
+		`2) dispatch the centurion instead and let IT create the worker on '${host}' — ` +
+		"a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all " +
+		'(the default list is ["centurion"]), while a scout or a worker is created ON that machine by the centurion running there'
+	);
+}
+
+/**
+ * D5: this machine's checkout for the delivery is not a git checkout at all.
  *
  * The advice `noLocalOriginMessage` gives (`git remote add origin`) is IMPOSSIBLE
  * here — a directory that is not a repository has nowhere to add a remote — so
  * this sentence must not borrow it. What actually works is to run the launch from
- * a checkout (pi started inside one, or a relative `cwd` that points at one) or to
- * dispatch a worker, which needs neither checkout nor origin.
+ * a checkout (pi started inside one, or a RELATIVE `cwd` that points at one) or to
+ * dispatch a centurion, which creates its own worker ON that machine.
+ *
+ * `localRepo` is the directory that was actually asked — a relative `cwd` resolved
+ * against this session's directory (D5), never the session directory by default —
+ * so a caller who pointed at the wrong directory reads that directory back.
  */
 export function notALocalCheckoutMessage(opts: { host: string; localRepo: string }): string {
 	return (
-		`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${opts.localRepo}) is not one. ` +
+		`cross-machine delivery needs a git checkout on this machine too, and the directory it delivers from (${opts.localRepo}) is not one. ` +
 		"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
 		`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "${opts.host}", cwd: "../my-repo", hostCwd: "/abs/path/on/${opts.host}", task: "..." }); ` +
-		`2) dispatch a worker instead — subagent({ agent: "worker", host: "${opts.host}", task: "..." }) needs no checkout and no origin.`
+		`${dispatchCenturionInstead(opts.host)}.`
 	);
 }
 
@@ -562,17 +590,17 @@ export function notALocalCheckoutMessage(opts: { host: string; localRepo: string
  * D6: THIS checkout has no `origin`.
  *
  * The two ways out are asymmetric because the fix is: add a remote HERE (and make
- * sure that machine can reach the same url), or stop asking for a worktree — a
- * worker needs no origin at all. The `subagent(...)` call is spelled out complete
- * enough to paste, because "dispatch a worker instead" is not an instruction an
- * operator can follow without knowing the shape.
+ * sure that machine can reach the same url), or stop asking THIS session to make
+ * the delivery — a centurion creates its worker on that machine. The `subagent(...)`
+ * call is spelled out complete enough to paste for the first way out; the second
+ * one names no call on purpose (see {@link dispatchCenturionInstead}).
  */
 export function noLocalOriginMessage(opts: { host: string; localRepo: string }): string {
 	return (
 		`cross-machine delivery needs one shared remote: this checkout (${opts.localRepo}) has no origin. ` +
 		`Two ways out: 1) add one and retry — git -C ${opts.localRepo} remote add origin <url> ` +
 		`(the machine '${opts.host}' must be able to reach the same url); ` +
-		`2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "${opts.host}", task: "..." }) needs no origin.`
+		`${dispatchCenturionInstead(opts.host)}.`
 	);
 }
 
@@ -581,7 +609,7 @@ export function noRemoteOriginMessage(opts: { host: string; cwd: string; localOr
 	return (
 		`host '${opts.host}': ${opts.cwd} has no origin on that machine; cross-machine delivery needs one shared remote. ` +
 		`Two ways out: 1) add one there — hc exec --on ${opts.host} -- git -C ${opts.cwd} remote add origin <url> ` +
-		`(same url as this checkout's '${opts.localOrigin}'); 2) dispatch a worker instead (workers need no origin).`
+		`(same url as this checkout's '${opts.localOrigin}'); 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).`
 	);
 }
 
@@ -596,7 +624,7 @@ export function originMismatchMessage(opts: {
 		`host '${opts.host}': its checkout at ${opts.cwd} has origin '${opts.remoteOrigin}' but this checkout's is '${opts.localOrigin}'; ` +
 		"cross-machine delivery needs one shared remote. " +
 		"Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); " +
-		"2) dispatch a worker instead (workers need no origin)."
+		"2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion)."
 	);
 }
 

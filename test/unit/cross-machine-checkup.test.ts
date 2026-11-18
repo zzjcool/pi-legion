@@ -481,7 +481,10 @@ test("D5: a session directory that is not a checkout gets D5's sentence, not `gi
 		assert.equal(parent.status, "fail");
 		// The D5 sentence, verbatim (a paraphrase would let the bad advice return).
 		assert.match(parent.line, /cross-machine delivery needs a git checkout on this machine too/);
-		assert.match(parent.line, /this session's directory \(\/Users\/me\/agents\) is not one/);
+		// The directory NAMED is the one the delivery asks git about (D5: a relative
+		// cwd resolves to the caller's checkout, so "this session's directory" would
+		// be a lie for that shape).
+		assert.match(parent.line, /the directory it delivers from \(\/Users\/me\/agents\) is not one/);
 		assert.match(parent.line, /start pi inside yours, or pass a relative cwd/);
 		assert.doesNotMatch(parent.line, /remote add origin/);
 		// …and the pasteable next step names the REAL first host.
@@ -1039,6 +1042,40 @@ test("D7: a model the target does not serve FAILs and lists what that machine DO
 		assert.equal(models.fixes?.length, 1);
 		assert.match(models.fixes![0]!, /model: "workbuddy\/deepseek-v4\.1-pro"/);
 		assert.match(models.line, /hosts\.fakebox\.piExtensions/);
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+		repo.cleanup();
+	}
+});
+
+test("xm-model-fallback: `hosts.<host>.model` is the model the target-models item judges", async () => {
+	// Doctor must predict the launch it is checking. A launch on this host starts
+	// with the per-machine pin when the caller names no model of its own
+	// (`Orchestrator.launch`: `input.model ?? input.hostTarget.model`), so the
+	// CALLER's default — `model` below — is the wrong model to compare here: it is
+	// not in that machine's listing, and judging by it would report FAIL for a
+	// launch that works.
+	const repo = localRepo();
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	try {
+		const client = healthyTarget({
+			models: "PROVIDER\tMODEL\tCONTEXT\ncodebuddy\tglm-5\t200k\tctx\n",
+		});
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost({ model: "codebuddy/glm-5" }) } },
+			agents: [role("centurion", { model: MODEL })],
+			model: MODEL,
+			env,
+			client,
+		});
+		const models = item(checkup.hosts[0]!.items, "target-models");
+		assert.equal(models.status, "pass", `the pin is what a launch uses: ${models.line}`);
+		assert.match(models.line, /^codebuddy\/glm-5 is in fakebox's listing/);
+		// The pasteable launch line names it too: it is the launch this checkup judged.
+		assert.ok(checkup.hosts[0]!.launch?.includes('model: "codebuddy/glm-5"'), checkup.hosts[0]!.launch);
 	} finally {
 		rmSync(cache, { recursive: true, force: true });
 		repo.cleanup();

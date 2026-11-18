@@ -712,6 +712,14 @@ test("S5.6: the startup probe's four failures are named before a terminal exists
 		details: string;
 		model?: string;
 		also?: Array<RegExp | string>;
+		/**
+		 * The answer to the SECOND `--list-models` call (xm-model-fallback).
+		 *
+		 * A `model-missing` probe is no longer the end of a launch: the launch falls
+		 * back and RE-ASKS, so "this refusal" is now the case where that second answer
+		 * refuses too. Absent = the same answer every time.
+		 */
+		then?: { code: number; stdout: string; stderr: string; timed_out: boolean };
 	}> = [
 		{
 			// Both shapes are real: `--list-models` prints the bare marker, while an
@@ -738,6 +746,10 @@ test("S5.6: the startup probe's four failures are named before a terminal exists
 		{
 			// The machine HAS models, just not this one — output deliberately free of
 			// any `No API key` line, so this cannot be confused with `no-model`.
+			//
+			// xm-model-fallback: the first answer names `other/model-x`, which the launch
+			// therefore TRIES; the second answer drops it again, so this is the refusal
+			// that survives — the one where the fallback did not save the launch either.
 			name: "model-missing",
 			result: {
 				code: 0,
@@ -748,12 +760,21 @@ test("S5.6: the startup probe's four failures are named before a terminal exists
 				stderr: "",
 				timed_out: false,
 			},
+			then: {
+				code: 0,
+				stdout: b64([
+					"provider      model                    context  max-out  thinking  images",
+					"some-provider other/model-y            128k     8k       yes       no",
+				].join("\n") + "\n"),
+				stderr: "",
+				timed_out: false,
+			},
 			expect: /is not visible there/,
 			details: "model-missing",
 			model: MODEL,
-			// host, the expected model, the first entries of the REAL listing, both fix
-			// directions, and the same command line the probe ran.
-			also: [/vps/, MODEL, /some-provider\/other\/model-x/, /subagents\.defaultModel/, /agentOverrides\.<role>\.model/, /piExtensions/],
+			// host, the expected model, the model the fallback tried and the listing that
+			// refused it, both fix directions, and the same command line the probe ran.
+			also: [/vps/, MODEL, /some-provider\/other\/model-x/, /some-provider\/other\/model-y/, /subagents\.defaultModel/, /agentOverrides\.<role>\.model/, /piExtensions/],
 		},
 		{
 			name: "other",
@@ -768,9 +789,11 @@ test("S5.6: the startup probe's four failures are named before a terminal exists
 			// Every `machine.exec` answers the same thing: the two preflight questions
 			// pass (code 0), the startup probe gets this case's answer. Distinguishing by
 			// the params is the point — the probe is the only call that carries `line`.
+			let probes = 0;
 			h.client.on("machine.exec", (params: Record<string, unknown>) => {
-				if (String(params.line).includes("--list-models")) return probeCase.result;
-				return { code: 0, stdout: "", stderr: "", timed_out: false };
+				if (!String(params.line).includes("--list-models")) return { code: 0, stdout: "", stderr: "", timed_out: false };
+				probes += 1;
+				return probes === 1 || probeCase.then === undefined ? probeCase.result : probeCase.then;
 			});
 			const input = spawnInput(h.root, {
 				host: "vps",
@@ -792,8 +815,10 @@ test("S5.6: the startup probe's four failures are named before a terminal exists
 			assert.equal(details?.probe, probeCase.details, probeCase.name);
 			if (probeCase.model) assert.equal(details?.model, probeCase.model, probeCase.name);
 			// Every refusal ends with the line to paste on that machine — and it is the
-			// SAME line the probe ran, not a hand-reconstructed approximation.
-			const probeLine = h.client.paramsFor("machine.exec").map((params) => String(params.line)).find((line) => line.includes("--list-models"));
+			// SAME line the probe ran, not a hand-reconstructed approximation. The LAST
+			// one when a fallback was tried: the command the operator must reproduce is
+			// the one that refused, not the one that answered first.
+			const probeLine = h.client.paramsFor("machine.exec").map((params) => String(params.line)).filter((line) => line.includes("--list-models")).at(-1);
 			assert.ok(probeLine, `${probeCase.name}: the probe must have run`);
 			assert.ok(message.includes(probeLine), `${probeCase.name}: the message must quote the probe line`);
 			assert.match(message, /Command \(run on 'vps' to reproduce\):/, probeCase.name);
@@ -962,4 +987,274 @@ test("xm-dispatch D4: crossMachine.allowRoles is parsed, and a wrong shape is re
 		() => parseSubagentSettings({ subagents: { crossMachine: { allowRoles: [] } } }, "/tmp/settings.json"),
 		/at least one role name/,
 	);
+});
+
+// ── C: the model-mismatch refusal must say what that machine serves ─────────
+
+/**
+ * Run `spawnChild` with a probe that answers `stdout`/`stderr`, return the refusal.
+ *
+ * `then` is the answer to the SECOND `--list-models` call: since xm-model-fallback a
+ * first `model-missing` answer makes the launch try another model, so a refusal that
+ * quotes a LISTING is the case where that second answer refuses too.
+ */
+async function modelRefusal(
+	listing: { stdout: string; stderr: string },
+	then?: { stdout: string; stderr: string },
+): Promise<string> {
+	const h = harness(localEnv());
+	try {
+		let probes = 0;
+		h.client.on("machine.exec", (params: Record<string, unknown>) => {
+			if (!String(params.line ?? "").includes("--list-models")) return { code: 0, stdout: "", stderr: "", timed_out: false };
+			probes += 1;
+			const answer = probes === 1 || then === undefined ? listing : then;
+			return { code: 0, stdout: b64(answer.stdout), stderr: b64(answer.stderr), timed_out: false };
+		});
+		const error = await h.supervisor
+			.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget(), model: "workbuddy/deepseek-v4.1-flash" }))
+			.then(() => undefined, (thrown: unknown) => thrown);
+		assert.ok(error instanceof SubagentError, `expected a model refusal, got ${String(error)}`);
+		const message = (error as SubagentError).message;
+		assert.match(message, /is not visible there/);
+		const details = (error as SubagentError).details as Record<string, unknown> | undefined;
+		assert.equal(details?.probe, "model-missing");
+		return message;
+	} finally {
+		h.cleanup();
+	}
+}
+
+/** A `--list-models` table of `count` rows in one group, none of them a launch model. */
+function listingOf(count: number, group = "served"): string {
+	const rows = Array.from({ length: count }, (_, index) => `some-provider\t${group}/model-${index + 1}\t128k\t8k\tyes\tno`);
+	return ["provider\tmodel\tcontext\tmax-out\tthinking\timages", ...rows].join("\n") + "\n";
+}
+
+test("S5.6: the model refusal quotes SEVEN models — none dropped without saying so", async () => {
+	// Five was the old cap: a machine with a bigger registry looked like it had
+	// exactly those, and the model the operator needed was silently cut off.
+	const message = await modelRefusal({ stdout: listingOf(7), stderr: "" }, { stdout: listingOf(7, "other"), stderr: "" });
+	for (let index = 1; index <= 7; index += 1) {
+		assert.ok(message.includes(`some-provider/other/model-${index}`), `model-${index} must be listed: ${message}`);
+	}
+	assert.doesNotMatch(message, /and \d+ more/, "nothing is hidden at seven");
+});
+
+test("S5.6: a long registry quotes twenty and SAYS how many it left out", async () => {
+	const message = await modelRefusal({ stdout: listingOf(25), stderr: "" }, { stdout: listingOf(25, "other"), stderr: "" });
+	assert.ok(message.includes("some-provider/other/model-20"), "the twentieth entry is still printed");
+	assert.equal(message.includes("some-provider/other/model-21"), false);
+	assert.match(message, /and 5 more/, "truncation is announced, never silent");
+});
+
+test("S5.6: an EMPTY listing says what to add, not `(an empty listing)`", async () => {
+	// The shape that produced the useless sentence: the table reached the verdict
+	// (stderr) while stdout — the only stream the listing is parsed from — was empty.
+	const message = await modelRefusal({ stdout: "", stderr: listingOf(3) });
+	assert.doesNotMatch(message, /\(an empty listing\)/);
+	assert.doesNotMatch(message, /--- and \d+ more/);
+	// The cause AND the key, because `--no-extensions` is what hid the provider.
+	assert.match(message, /the probe saw NO model on that machine/);
+	assert.match(message, /`--no-extensions` hides every provider that is installed there as an extension/);
+	assert.ok(message.includes("subagents.crossMachine.hosts.vps.piExtensions"), message);
+	assert.match(message, /\/legion doctor crossmachine/, "the same listing is readable from doctor");
+});
+
+// ── xm-model-fallback: an unpinned machine is no longer a dead end ─────────
+//
+// The user's requirement, verbatim: "configure the model up front, and when
+// nothing is configured fall back to a model on the target machine". The launch
+// therefore resolves its model in THREE steps and only refuses at the end:
+//
+//   1. the model this launch asked for (per-call `model`, role card, overrides —
+//      all upstream, already resolved into `input.model`);
+//   2. `subagents.crossMachine.hosts.<host>.model` (this file: `target.model`);
+//   3. the first row of that machine's own `--list-models`, preferring the
+//      provider the failed model named.
+//
+// A fallback CONTINUES the launch and leaves ONE warning line on the handle.
+// Nothing is trusted blindly: the winning model is re-probed before a terminal
+// exists, so a listing that lied still ends in the hard failure.
+
+/** A `--list-models` table built from `provider/model` ids. */
+function listingOfIds(ids: readonly string[]): string {
+	const rows = ids.map((id) => {
+		const [provider = "", ...rest] = id.split("/");
+		return `${provider}\t${rest.join("/")}\t128k\t8k\tyes\tno`;
+	});
+	return ["provider\tmodel\tcontext\tmax-out\tthinking\timages", ...rows].join("\n") + "\n";
+}
+
+/**
+ * Answer every `--list-models` probe from `listing` (one listing for every
+ * model it is asked about) and return the model each probe asked for.
+ *
+ * The probe is the child's own argv with its task replaced, so the model is
+ * readable from the shell line — that is how these tests prove the launch
+ * RE-ASKS instead of trusting the listing it just read.
+ */
+function probeListing(h: Harness, listing: string): string[] {
+	const asked: string[] = [];
+	h.client.on("machine.exec", (params: Record<string, unknown>) => {
+		const line = String(params.line ?? "");
+		if (!line.includes("--list-models")) return { code: 0, stdout: "", stderr: "", timed_out: false };
+		const found = /--model' '([^']+)'/.exec(line);
+		if (found) asked.push(found[1]!);
+		return { code: 0, stdout: b64(listing), stderr: "", timed_out: false };
+	});
+	return asked;
+}
+
+/** The models the terminal really asked for, from the argv that crossed the wire. */
+function launchedModels(h: Harness): string[] {
+	return h.client.paramsFor("terminal.run").map((params) => {
+		const argv = (params.argv ?? []) as string[];
+		const at = argv.indexOf("--model");
+		return at < 0 ? "" : String(argv[at + 1] ?? "");
+	});
+}
+
+test("xm-model-fallback: a model missing there falls back to a same-provider row and the launch continues", async () => {
+	const h = harness(localEnv());
+	try {
+		// The preferred row is NOT the first one: step 3 prefers the provider the
+		// failed model named (`codebuddy/*`), which is the operator's intent.
+		const asked = probeListing(h, listingOfIds(["workbuddy/x", "codebuddy/y"]));
+		const handle = await h.supervisor.spawnChild(spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget(),
+			model: "codebuddy/glm-5.2",
+		}));
+		assert.deepEqual(launchedModels(h), ["codebuddy/y"], "the same-provider row wins over the first row");
+		// ONE warning, ONE line, both models and the key that pins the answer.
+		assert.deepEqual(handle.warnings, [
+			"host 'vps': model 'codebuddy/glm-5.2' is not visible there; using 'codebuddy/y' from that machine's listing (pin it with subagents.crossMachine.hosts.vps.model)",
+		]);
+		assert.ok(!handle.warnings![0]!.includes("\n"), "the handle carries one LINE, not a block");
+		// The listing is not trusted blindly: the child's own argv was asked again,
+		// with the model about to be used.
+		assert.deepEqual(asked, ["codebuddy/glm-5.2", "codebuddy/y"]);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("xm-model-fallback: with no same-provider row the first row of the listing is used", async () => {
+	const h = harness(localEnv());
+	try {
+		probeListing(h, listingOfIds(["workbuddy/x", "workbuddy/y"]));
+		const handle = await h.supervisor.spawnChild(spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget(),
+			model: "codebuddy/glm-5.2",
+		}));
+		assert.deepEqual(launchedModels(h), ["workbuddy/x"], "step 3 ends at the first row");
+		assert.match(handle.warnings![0]!, /using 'workbuddy\/x' from that machine's listing/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("xm-model-fallback: a configured hosts.<host>.model is the fallback, not a listing row", async () => {
+	// Step 2: the operator already answered "which model on that machine". Picking
+	// a row instead would ignore the only value they wrote down.
+	const h = harness(localEnv());
+	try {
+		probeListing(h, listingOfIds(["workbuddy/x", "codebuddy/pinned"]));
+		const handle = await h.supervisor.spawnChild(spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget({ model: "codebuddy/pinned" }),
+			model: "codebuddy/glm-5.2",
+		}));
+		assert.deepEqual(launchedModels(h), ["codebuddy/pinned"]);
+		assert.deepEqual(handle.warnings, [
+			"host 'vps': model 'codebuddy/glm-5.2' is not visible there; using 'codebuddy/pinned' from subagents.crossMachine.hosts.vps.model",
+		]);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("xm-model-fallback: the #123 `--provider` pin follows the model it was computed for", async () => {
+	// The pin was computed for the model that FAILED. Leaving it behind routes the
+	// fallback to a provider that does not own it — the `No API key found` the pin
+	// exists to prevent, one layer later.
+	const h = harness(localEnv());
+	try {
+		// No `codebuddy` row at all, so the fallback crosses PROVIDERS — the case a
+		// stale pin breaks.
+		probeListing(h, listingOfIds(["workbuddy/x"]));
+		await h.supervisor.spawnChild(spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget(),
+			model: "codebuddy/glm-5.2",
+			modelProvider: "codebuddy",
+			thinking: "high",
+		}));
+		const argv = (h.client.paramsFor("terminal.run")[0]!.argv ?? []) as string[];
+		assert.equal(argv[argv.indexOf("--model") + 1], "workbuddy/x:high", "the thinking level rides along");
+		assert.equal(argv[argv.indexOf("--provider") + 1], "workbuddy", "the pin moves with the model");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("xm-model-fallback: a fallback that is ALSO missing there ends in the hard failure, naming both", async () => {
+	// The re-probe is the point: a listing that named a model which does not answer
+	// must not become a terminal. This is the `model-missing` refusal, unchanged in
+	// shape, with the fallback attempt spelled out.
+	const h = harness(localEnv());
+	try {
+		h.client.on("machine.exec", (params: Record<string, unknown>) => {
+			const line = String(params.line ?? "");
+			if (!line.includes("--list-models")) return { code: 0, stdout: "", stderr: "", timed_out: false };
+			const listing = line.includes("codebuddy/y")
+				? listingOfIds(["workbuddy/x", "codebuddy/z"])
+				: listingOfIds(["workbuddy/x", "codebuddy/y"]);
+			return { code: 0, stdout: b64(listing), stderr: "", timed_out: false };
+		});
+		const error = await h.supervisor
+			.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget(), model: "codebuddy/glm-5.2" }))
+			.then(() => undefined, (thrown: unknown) => thrown);
+		assert.ok(error instanceof SubagentError, `expected the model refusal, got ${String(error)}`);
+		const message = (error as SubagentError).message;
+		assert.match(message, /is not visible there/, "the existing refusal sentence is kept");
+		assert.ok(message.includes("'codebuddy/y'"), `the fallback this launch tried must be named: ${message}`);
+		assert.match(message, /codebuddy\/z/, "the listing that refused the fallback is quoted");
+		assert.equal(h.client.paramsFor("terminal.run").length, 0, "no terminal for a model that is still missing");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("xm-model-fallback: an EMPTY listing is still the hard failure — there is nothing to fall back to", async () => {
+	// The deliberate non-change: a pin cannot rescue a machine whose listing is
+	// empty, because an empty listing means `--no-extensions` hid the provider. A
+	// second probe would answer the same way, and the operator needs the KEY, not
+	// another attempt.
+	const h = harness(localEnv());
+	try {
+		// The listing reached the VERDICT through stderr while stdout — the only
+		// stream the rows are read from — stayed empty: the machine says "no model"
+		// in the one way that leaves nothing to fall back to.
+		h.client.on("machine.exec", (params: Record<string, unknown>) => {
+			if (!String(params.line ?? "").includes("--list-models")) return { code: 0, stdout: "", stderr: "", timed_out: false };
+			return { code: 0, stdout: "", stderr: b64(listingOfIds(["workbuddy/x", "codebuddy/y"])), timed_out: false };
+		});
+		const error = await h.supervisor
+			.spawnChild(spawnInput(h.root, {
+				host: "vps",
+				hostTarget: hostTarget({ model: "codebuddy/pinned" }),
+				model: "codebuddy/glm-5.2",
+			}))
+			.then(() => undefined, (thrown: unknown) => thrown);
+		assert.ok(error instanceof SubagentError, `expected the model refusal, got ${String(error)}`);
+		const message = (error as SubagentError).message;
+		assert.match(message, /the probe saw NO model on that machine/);
+		assert.ok(message.includes("subagents.crossMachine.hosts.vps.piExtensions"), message);
+		assert.equal(h.client.paramsFor("terminal.run").length, 0);
+	} finally {
+		h.cleanup();
+	}
 });

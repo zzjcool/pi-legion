@@ -92,7 +92,7 @@
 | 你看到的那一行 | 它意味着什么 | 下一步 |
 |---|---|---|
 | `PASS parent checkout: <dir> is a git checkout; origin <url>` | 本会话目录是 checkout，origin 已打印 | 不用动；目标机那侧归一化后必须是同一个 url（第 1 节） |
-| `FAIL parent checkout: cross-machine delivery needs a git checkout on this machine too, and this session's directory (<dir>) is not one. …` | 本会话目录**根本不是 git 仓库**（D5） | 粘它下面的 `fix:` 行（在 checkout 里重开 pi，或传相对 `cwd`），或照原话第 2 条改派 `worker` —— **不要**在这里 `git remote add` |
+| `FAIL parent checkout: cross-machine delivery needs a git checkout on this machine too, and the directory it delivers from (<dir>) is not one. …` | 父机这个 checkout 目录**根本不是 git 仓库**（D5）。`<dir>` 是预检真正问的那个目录：传了相对 `cwd` 就是它，否则是会话目录 | 粘它下面的 `fix:` 行（在 checkout 里重开 pi，或传相对 `cwd` + `hostCwd`），或改派 `centurion`（默认唯一允许跨机的角色）—— **不要**在这里 `git remote add` |
 | `FAIL parent checkout: <dir> is a git checkout but has no origin` | 是仓库但没有 origin | 粘 `fix: git -C <dir> remote add origin <url>` |
 | `PASS hc machines: <names>` / `FAIL hc machines: … unknown to hc: <h>` | `hc machine ls` 的答案 | FAIL 粘 `fix: hc machine add --name <h> ssh://user@<h>`；注意清单按 `HC_SESSION` 走（见第 5 节） |
 | `FAIL target checkout: host '<h>' needs a directory on that machine …` | 没给目标机目录（D2 提问） | 粘它的 `fix:` 行（带 `cwd` 的调用），或问用户那台机器上是哪个目录 |
@@ -104,6 +104,7 @@
 | `FAIL inherited extensions: … (the card requires it, so a launch REFUSES)` | 角色卡把它写进了 `requiredExtensions`：launch 会**拒**（同样聚合成一条错误），没有跳过这条路 | 只能在那台机器 `pi install`，或把它从卡片的 `requiredExtensions` 里去掉；`excludeExtensions` 对这条无效（所以不给 JSON） |
 | `FAIL inherited extensions: … (entry '<相对路径>' not declared on <h>)` | 包装了，但两边的 `pi.extensions` 布局/版本不同（master `xm-dispatch` D1 的 `entry-missing`；体检里由本卡 D2 报出）。继承来的只跳过 + warning；角色卡声明的那条会拒 | 把两台的包版本对齐（目录声明 `./extensions` 现在已自动按目录包含）；继承来的也可以粘 `excludeExtensions` JSON |
 | `FAIL target models: <model> is not in <h>'s listing: …` | 那台机器的 `pi --list-models` 里没有这个模型（行尾同时说明 `--no-extensions` 与 `piExtensions` 的关系） | 粘 `fix:`：换成它列出来的模型；如果模型本来就该由 provider 扩展提供，把它写进 `subagents.crossMachine.hosts.<h>.piExtensions` |
+| 派生：`⚠ <name>: host '<h>': model 'A' is not visible there; using 'B' from that machine's listing …` | 请求的模型那台机器没有，已**自动回退**到它列出的模型（优先同 provider），launch 继续（6.2.2 起不再硬失败） | 想钉住就写 `subagents.crossMachine.hosts.<h>.model`；想让 A 可用就在那台机器装发布 A 的 provider 扩展（`piExtensions`）。清单为空时仍会失败并解释 |
 | `FAIL hc machines: no machines are registered …` | 这个 hc core 一台机器都不认识，配置里也没有 host | 粘 `fix: hc machine add --name my-vps ssh://user@my-vps`，再 `hc machine ls` |
 | `FAIL hc machines: cross-machine launch is disabled (subagents.crossMachine.enabled = false), so nothing here was probed` | `subagents.crossMachine.enabled` 是 `false`（真 launch 会被拒） | 按 `fix:` 把它改成 `true`（同一个 settings 文件），再跑同一条命令 |
 | `SKIP hc machines: … cross-machine is not configured, so no target was probed` | `enabled` 没写、也没有 `hosts` 条目：注册表照打，但不去探目标机 | 想体检某一台就配 `{ "enabled": true }` 再跑 `/legion doctor crossmachine` |
@@ -350,12 +351,12 @@ phases 校验**之前**，所以 host + 坏 phases 同时存在时，你**先**�
 
 | 你看到的字 | 它意味着什么 / 改哪个键 |
 |---|---|
-| `cross-machine delivery needs a git checkout on this machine too, and this session's directory (<dir>) is not one. Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "<h>", cwd: "../my-repo", hostCwd: "/abs/path/on/<h>", task: "..." }); 2) dispatch a worker instead — subagent({ agent: "worker", host: "<h>", task: "..." }) needs no checkout and no origin.` | **本会话目录根本不是 git 仓库**（D5）。`1)` 在 checkout 里重开 pi，或用**相对** `cwd` 指向一个 checkout（带了 `host` 时，绝对 `cwd` 指的是**那台机器**上的目录，所以这里要用相对路径）；`2)` 改派 `worker`（不需要 checkout、不需要 origin）。**不要**在这个目录里 `git remote add` —— 那不是仓库，没有地方加。注意这条只说「父机这一侧」：目标机上的目录仍然要有（`hosts.<h>.cwd`，或调用里再给一个绝对 `cwd`；都没有就会收到 D2 的那句提问） |
-| `cross-machine delivery needs one shared remote: this checkout (<localRepo>) has no origin. Two ways out: 1) add one and retry — git -C <localRepo> remote add origin <url> (the machine '<host>' must be able to reach the same url); 2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "<host>", task: "..." }) needs no origin.` | **父机这个 checkout 没有 origin**。`1)` 在本机加一个 remote 再重试（那台机器要能访问同一个 url）；`2)` 改派 `worker` |
-| `host '<h>': <cwd> has no origin on that machine; cross-machine delivery needs one shared remote. Two ways out: 1) add one there — hc exec --on <h> -- git -C <cwd> remote add origin <url> (same url as this checkout's '<local>'); 2) dispatch a worker instead (workers need no origin).` | **目标机那侧的 checkout 没有 origin**。`1)` 在那台机器上加（用本机那个 url，文案里已给出）；`2)` 改派 `worker` |
-| `host '<h>': its checkout at <cwd> has origin '<remote>' but this checkout's is '<local>'; cross-machine delivery needs one shared remote. Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); 2) dispatch a worker instead (workers need no origin).` | **两侧都配了，但不是一个 remote**（文案把两个 url 都点名了）。`1)` 任一侧 `git remote set-url origin <url>` 让两侧一致；`2)` 改派 `worker` |
-| `host '<h>': git is not available on that machine (git --version exited <n>: <detail>). A cross-machine centurion delivers through git worktrees, so git must be on PATH there. Two ways out: 1) install git on '<h>' and retry; 2) dispatch a worker instead (workers need no worktree and no git).` | **目标机没有 git**。`1)` 在 `<h>` 上装 git 后重试；`2)` 改派 `worker`。本机没有 git 时是同族的另一句：`this machine has no usable git (git --version exited <n>: …)…` |
-| `host '<h>' has no checkout at <cwd> (the configured cwd does not exist on that machine). Two ways out: 1) give that machine a checkout at <cwd> — git clone <url> <cwd> on '<h>' — or point subagents.crossMachine.hosts.<h>.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).` | **`cwd` 指错**（那台机器上没有这个目录）。`1)` 给那台机器一个 checkout，或把 `cwd` 指向真的是 git checkout 的目录；`2)` 改派 `worker`。目录存在但不是仓库时是同族的 `host '<h>': <cwd> is not a git repository on that machine.`，末尾是同样的 `Two ways out:` |
+| `cross-machine delivery needs a git checkout on this machine too, and the directory it delivers from (<dir>) is not one. Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "<h>", cwd: "../my-repo", hostCwd: "/abs/path/on/<h>", task: "..." }); 2) dispatch the centurion instead and let IT create the worker on '<h>' — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), while a scout or a worker is created ON that machine by the centurion running there.` | **父机没有可交付的 checkout**（D5）。`<dir>` 是预检真正问的目录（传了相对 `cwd` 就是它）。`1)` 在 checkout 里重开 pi，或用**相对** `cwd` + `hostCwd`（带了 `host` 时绝对 `cwd` 指**那台机器**上的目录，所以父机这一侧要用相对路径）；`2)` 改派 `centurion`（默认唯一允许跨机的角色），worker/scout 由它在远端创建。**不要**在非仓库目录里 `git remote add`。目标机上的目录仍然要有（`hosts.<h>.cwd`，或调用里再给绝对 `cwd`；都没有就是 D2 那句提问） |
+| `cross-machine delivery needs one shared remote: this checkout (<localRepo>) has no origin. Two ways out: 1) add one and retry — git -C <localRepo> remote add origin <url> (the machine '<host>' must be able to reach the same url); 2) dispatch the centurion instead and let IT create the worker on '<host>' — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]).` | **父机这个 checkout 没有 origin**。`1)` 在本机加 remote 再重试；`2)` 改派 `centurion`（默认唯一允许跨机），worker 由它在远端创建 |
+| `host '<h>': <cwd> has no origin on that machine; cross-machine delivery needs one shared remote. Two ways out: 1) add one there — hc exec --on <h> -- git -C <cwd> remote add origin <url> (same url as this checkout's '<local>'); 2) dispatch a worker instead (workers need no origin).` | **目标机那侧的 checkout 没有 origin**。`1)` 在那台机器上加（用本机那个 url，文案里已给出）；`2)` 改派 `centurion`（worker 由它在远端创建） |
+| `host '<h>': its checkout at <cwd> has origin '<remote>' but this checkout's is '<local>'; cross-machine delivery needs one shared remote. Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); 2) dispatch a worker instead (workers need no origin).` | **两侧都配了，但不是一个 remote**（文案把两个 url 都点名了）。`1)` 任一侧 `git remote set-url origin <url>` 让两侧一致；`2)` 改派 `centurion`（worker 由它在远端创建） |
+| `host '<h>': git is not available on that machine (git --version exited <n>: <detail>). A cross-machine centurion delivers through git worktrees, so git must be on PATH there. Two ways out: 1) install git on '<h>' and retry; 2) dispatch a worker instead (workers need no worktree and no git).` | **目标机没有 git**。`1)` 在 `<h>` 上装 git 后重试；`2)` 改派 `centurion`（worker 由它在远端创建）。本机没有 git 时是同族的另一句：`this machine has no usable git (git --version exited <n>: …)…` |
+| `host '<h>' has no checkout at <cwd> (the configured cwd does not exist on that machine). Two ways out: 1) give that machine a checkout at <cwd> — git clone <url> <cwd> on '<h>' — or point subagents.crossMachine.hosts.<h>.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).` | **`cwd` 指错**（那台机器上没有这个目录）。`1)` 给那台机器一个 checkout，或把 `cwd` 指向真的是 git checkout 的目录；`2)` 改派 `centurion`（worker 由它在远端创建）。目录存在但不是仓库时是同族的 `host '<h>': <cwd> is not a git repository on that machine.`，末尾是同样的 `Two ways out:` |
 | `host '<h>': the delivery preflight could not talk to that machine (…)` | 传输层问题：`hc` 连不上那台机器 → 先手工 `hc exec --on <h> -- true` |
 
 `fail` 出来的都是 `INVALID_PARAMS`，且带 `noModelFallback` —— 机器事实不会去试下一个模型候选，
@@ -415,7 +416,21 @@ Agent '<file>' has an invalid phase machine: N problems in M categories.
 （设成 `test-*` 之后你看不到自己的机器注册，命令会以为 `machine_unknown`；
 真跑 e2e 时则反过来，必须设，且**必须** `test-` 开头）。
 
-## 6. 已知限制：远端镜像目录按 handle 共享
+## 6. 父会话退出后的遗留跨机 child（6.2.2）
+
+headless 父进程打完 launch 就退出时，child 可能还在远端跑；新会话现在能看到并收回来：
+
+- `/legion status` 会多一块 `Recoverable cross-machine children (this session never launched them):`，
+  每行是 `名字 · 角色 · host <h> · 状态 · terminal <terminal> · Nm old`，下面一条
+  `collect: subagent({ action: "recover", name: "<name>" })`。
+- 那条调用会从旧会话的 ledger 行直接读回那台机器的 `<remote_dir>/session.jsonl`，用 collect 的规则判分
+  （截断/读不到仍是 `unknown` + `hc exec --cat` 取回命令，不是 `aborted`），落定 ledger 行并返回
+  collect 文本；第二次调用是 `already settled` + 已记录结果。
+- child 仍在远端活着时只报告「还活着」，不落定 —— 先 `stop` 或等它结束再 recover。
+- 依赖 schema v5 的 `remote_dir` / `remote_terminal`：**6.2.1 之前启动的 child 没有这两列**，
+  recover 会说缺少远端路径（那时只能按下面的手工命令去那台机器找）。
+
+## 7. 已知限制：远端镜像目录按 handle 共享
 
 同一台机器上，两个 run 派生**同名** child（例如两次都叫 `worker-0`）会共用
 `…/.pi-subagents-mirror/no-run/<handle>/session.jsonl`。后果有两种，都很像「child 没干活」：

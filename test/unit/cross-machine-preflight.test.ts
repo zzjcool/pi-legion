@@ -234,7 +234,7 @@ test("D5 step 1: a machine without git is `local-git`, and nothing remote is ask
 			"this machine has no usable git (git --version exited 1: git: simulated failure); " +
 				"a cross-machine centurion delivers through git worktrees, so git must be on PATH here too. " +
 				"Two ways out: 1) install git here and retry; " +
-				'2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "vps", task: "..." }) needs no worktree and no git.',
+				'2) drop the worktree delivery and dispatch the centurion — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), and launched without `worktree: true` it needs no git here; the scout or worker it creates is born ON \'vps\'.',
 		);
 		assert.deepEqual(client.calls, [], "step 1 is local: the machine is not contacted at all");
 		assert.equal(recorded().ok, false);
@@ -260,8 +260,10 @@ test("D5 step 2: this checkout has no origin — the D6 sentence with two ways o
 			`cross-machine delivery needs one shared remote: this checkout (${local.repo}) has no origin. ` +
 				`Two ways out: 1) add one and retry — git -C ${local.repo} remote add origin <url> ` +
 				"(the machine 'vps' must be able to reach the same url); " +
-				'2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "vps", task: "..." }) needs no origin.',
+				`2) dispatch the centurion instead and let IT create the worker on 'vps' — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), while a scout or a worker is created ON that machine by the centurion running there.`,
 		);
+		// BUG B: the second way out names no call `allowRoles` would refuse.
+		assert.doesNotMatch(error.message, /subagent\(\{ agent: "worker"/);
 		assert.deepEqual(client.calls, [], "the local half answers before the machine is contacted");
 		const report = recorded();
 		assert.equal(report.ok, false);
@@ -379,7 +381,7 @@ test("D5 step 3: a missing checkout there stops the order after `test -d`", asyn
 			`host 'vps' has no checkout at ${REMOTE_CWD} (the configured cwd does not exist on that machine). ` +
 				`Two ways out: 1) give that machine a checkout at ${REMOTE_CWD} — git clone <url> ${REMOTE_CWD} on 'vps' — ` +
 				"or point subagents.crossMachine.hosts.vps.cwd at a directory that is a git checkout; " +
-				"2) dispatch a worker instead (workers need no worktree and no git).",
+				"2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 		);
 		assert.deepEqual(client.commands(), [`test -d ${REMOTE_CWD}`], "git is not asked about a path that is not there");
 	} finally {
@@ -399,7 +401,7 @@ test("D5 step 4: git missing on that machine is `remote-git`, not a missing chec
 			error.message,
 			"host 'vps': git is not available on that machine (git --version exited 127: sh: 1: git: not found). " +
 				"A cross-machine centurion delivers through git worktrees, so git must be on PATH there. " +
-				"Two ways out: 1) install git on 'vps' and retry; 2) dispatch a worker instead (workers need no worktree and no git).",
+				"Two ways out: 1) install git on 'vps' and retry; 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 		);
 		// The checkout question was answered first, and `rev-parse` is never asked:
 		// without git its answer would be another phrasing of the same missing program.
@@ -425,7 +427,7 @@ test("D5 step 5: a directory that is not a repository is `remote-checkout`", asy
 			`host 'vps': ${REMOTE_CWD} is not a git repository on that machine. ` +
 				`Two ways out: 1) give that machine a checkout at ${REMOTE_CWD} — git clone <url> ${REMOTE_CWD} on 'vps' — ` +
 				"or point subagents.crossMachine.hosts.vps.cwd at a directory that is a git checkout; " +
-				"2) dispatch a worker instead (workers need no worktree and no git).",
+				"2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 		);
 		assert.deepEqual(client.commands().slice(-1), [`git -C ${REMOTE_CWD} rev-parse --git-dir`]);
 		assert.equal(client.commands().some((command) => command.includes("remote get-url")), false);
@@ -449,7 +451,7 @@ test("D5 step 5: `rev-parse` exiting 127 is `remote-git`, and the sentence names
 			error.message,
 			`host 'vps': git is not available on that machine (git -C ${REMOTE_CWD} rev-parse --git-dir exited 127: sh: 1: git: not found). ` +
 				"A cross-machine centurion delivers through git worktrees, so git must be on PATH there. " +
-				"Two ways out: 1) install git on 'vps' and retry; 2) dispatch a worker instead (workers need no worktree and no git).",
+				"Two ways out: 1) install git on 'vps' and retry; 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 		);
 	} finally {
 		local.cleanup();
@@ -472,7 +474,7 @@ test("D5 step 6: that checkout has no origin — the D6 sentence naming the loca
 			`host 'vps': ${REMOTE_CWD} has no origin on that machine; cross-machine delivery needs one shared remote. ` +
 				`Two ways out: 1) add one there — hc exec --on vps -- git -C ${REMOTE_CWD} remote add origin <url> ` +
 				"(same url as this checkout's 'git@example.com:acme/pi-legion.git'); " +
-				"2) dispatch a worker instead (workers need no origin).",
+				"2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 		);
 	} finally {
 		local.cleanup();
@@ -493,7 +495,7 @@ test("D5 step 7: two different origins — the D6 sentence names BOTH urls", asy
 			`host 'vps': its checkout at ${REMOTE_CWD} has origin 'git@example.com:acme/fork.git' but this checkout's is ` +
 				"'git@example.com:acme/pi-legion.git'; cross-machine delivery needs one shared remote. " +
 				"Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); " +
-				"2) dispatch a worker instead (workers need no origin).",
+				"2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 		);
 		assert.equal(
 			client.commands().some((command) => command.includes("ls-remote")),

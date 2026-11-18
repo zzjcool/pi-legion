@@ -242,6 +242,19 @@ export interface LaunchInput {
 	 * refused here (D1/`resolveHostTarget`), never guessed.
 	 */
 	hostTarget?: HostTarget;
+	/**
+	 * The parent checkout a cross-machine delivery is made FROM
+	 * (`first-run-success-v1` D5), when it is not {@link Orchestrator}'s own
+	 * `cwd`.
+	 *
+	 * `cwd` cannot carry it: it is the caller's record directory (and the remote
+	 * launch already uses it for the LOCAL side of the argv path map), while with
+	 * `host` named a RELATIVE `cwd` names a checkout on THIS machine — resolved
+	 * by the caller, which is the only layer that knows this session's directory.
+	 * Absent (resume/revive, which have no caller directory) keeps the previous
+	 * behaviour byte for byte: `this.cwd`.
+	 */
+	localRepo?: string;
 	modelOrigin?: ModelOrigin;
 	/** Vexillatio launch: bypass nested-depth gates while recording its parent-side Legion node. */
 	utilityDispatch?: boolean;
@@ -429,6 +442,23 @@ export function transcriptNotRetrievedReason(host: string, detail: string): stri
 }
 
 /**
+ * The ledger status a TERMINAL execution settles into.
+ *
+ * One mapping for every settle path: `finishCollect` → `recordSettled` writes it
+ * for a child this process collected, and `recover` (`src/runs/remote-recover.ts`)
+ * writes it for a child a PREVIOUS process launched. A second copy of this ladder
+ * would let the same transcript settle as `failed` in one path and `retired` in the
+ * other, which is a ledger that contradicts itself rather than a rendering bug.
+ *
+ * `unknown` maps to `retired` by construction (it is neither a success nor a
+ * failure); callers that must not settle an ungraded child check the status BEFORE
+ * asking (recovery does: an unreadable transcript is never settled).
+ */
+export function settledStatusFor(execution: Pick<Execution, "status">): "settled" | "failed" | "retired" {
+	return execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
+}
+
+/**
  * The `  ⚠ <name>: <text>` lines one launch owes its caller.
  *
  * One definition for BOTH render paths — the immediate `▶` line in `launchStep`
@@ -523,7 +553,14 @@ function isApprovalRequest(request: PendingUIRequest): boolean {
 	return request.request.method === "confirm";
 }
 
-function deriveAcceptance(
+/**
+ * The acceptance ladder for one parsed turn — the SAME one `collect` uses.
+ *
+ * Exported for `src/runs/remote-recover.ts`: a recovered child is graded by the
+ * rules a collected one is, and a second implementation of "what does this
+ * transcript claim" is exactly the drift the recovery path must not introduce.
+ */
+export function deriveAcceptance(
 	parsed: ReturnType<typeof parseSessionFile>,
 	execution: Execution,
 	pendingCriteria: ChildRecord["pendingCriteria"],
@@ -1057,7 +1094,7 @@ export class Orchestrator {
 		const team = teamOverride ?? agent.extraFields?.team ?? this.team?.name;
 		const current = getNode(this.legion.db, child.nodeId);
 		const childRun = current?.runId ?? this.legion.runId ?? path.basename(this.runDir);
-		updateNode(this.legion.db, child.nodeId, { status: "running", runId: childRun, sessionFile: child.sessionFile, worktreePath: child.worktreePath ?? null, worktreeHost: child.worktreeHost ?? null, host: child.host ?? null, model: child.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, taskSummary: task.slice(0, 2_000) }, this.now);
+		updateNode(this.legion.db, child.nodeId, { status: "running", runId: childRun, sessionFile: child.sessionFile, worktreePath: child.worktreePath ?? null, worktreeHost: child.worktreeHost ?? null, host: child.host ?? null, remoteDir: child.remoteDir ?? null, remoteTerminal: child.remoteTerminal ?? null, model: child.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, taskSummary: task.slice(0, 2_000) }, this.now);
 		this.emitStored(child.nodeId, resumed ? "node_resumed" : "node_launched", { parentId: this.legion.nodeId, runId: childRun, sessionFile: child.sessionFile, role: agent.name, kind: agent.kind });
 	}
 
@@ -1072,7 +1109,7 @@ export class Orchestrator {
 			const current = getNode(this.legion.db, child.nodeId);
 			if (current?.status === "retired") return;
 		}
-		const status = execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
+		const status = settledStatusFor(execution);
 		const current = getNode(this.legion.db, child.nodeId);
 		if (!current || current.status === status) return;
 		// #372 m2: a VERDICT is not a pause. The safety net can fail a team while its
@@ -1357,6 +1394,12 @@ export class Orchestrator {
 		// whitespace-only all mean this host, so every downstream read is a plain
 		// truthiness test on a normalized value instead of a per-site guess.
 		const host = normalizeHost(input.host);
+		// The parent checkout a cross-machine delivery is made FROM (D5). `this.cwd` is
+		// the caller's record directory — which, with `host` named and a RELATIVE
+		// `cwd`, is NOT the checkout the caller pointed at. The caller resolves that
+		// (`LaunchInput.localRepo`); a resume/revive has no caller directory and keeps
+		// `this.cwd`, unchanged.
+		const localRepo = input.localRepo ?? this.cwd;
 		const nodeId = this.legion ? nodeIdForChild(this.legion.nodeId, name) : undefined;
 		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
 		// D3-a: a `queued` record carries a PLACEHOLDER session file, so it must never
@@ -1366,9 +1409,17 @@ export class Orchestrator {
 			? priorRecord
 			: (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
 		if (previous && !this.children.has(name)) this.children.set(name, previous);
+		// xm-model-fallback: "configure the model up front" is a per-MACHINE key
+		// (`subagents.crossMachine.hosts.<host>.model`), so the resolution order starts
+		// here: an explicit model for this launch always wins, and a launch without one
+		// takes the pin the operator wrote FOR that machine. Still `undefined` when
+		// nothing is configured — then the child's own configuration decides, and a
+		// target that does not serve that model falls back to that machine's own
+		// listing in the terminal backend (`planRemoteModelFallback`).
+		const launchModel = input.model ?? input.hostTarget?.model;
 		const models = this.planModelCandidates({
 			agent: input.agent,
-			...(input.model !== undefined ? { model: input.model } : {}),
+			...(launchModel !== undefined ? { model: launchModel } : {}),
 			origin: input.modelOrigin ?? (input.model !== undefined ? "explicit" : input.agent.modelSource?.type === "subagents.defaultModel" ? "inherited" : input.agent.model ? "explicit" : "inherited"),
 			...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
 		});
@@ -1526,7 +1577,11 @@ export class Orchestrator {
 			await this.supervisor.preflightRemoteDelivery?.({
 				host,
 				target: input.hostTarget,
-				localRepo: this.cwd,
+				// D5: the checkout the CALLER delivers from, not this process's record
+				// directory. A relative `cwd` next to `host` names a checkout here, and
+				// asking git about the wrong directory is what refused a launch that
+				// could have worked.
+				localRepo,
 			});
 		}
 		// #371 G2: a phase machine is the root's declaration about a team IT owns.
@@ -1756,7 +1811,9 @@ export class Orchestrator {
 					// argv path map (`mapRemoteArgPath`) re-roots onto the other machine, and
 					// the backend replaces it with the remote directory before spawning. Using
 					// the remote tree path here would make a remote path look like a local one.
-					cwd: host !== undefined ? this.cwd : worktreePath ?? this.cwd,
+					// For a remote launch that checkout is `localRepo` — the backend also asks
+					// git about it (`createRemoteChildWorktree`) before making the tree.
+					cwd: host !== undefined ? localRepo : worktreePath ?? this.cwd,
 					env: childEnv,
 					// S0: carried, never acted on beyond the terminal backend's `on`. S1 adds
 					// the resolved target: the remote cwd/argv/env/labels/preflight all come

@@ -489,8 +489,14 @@ async function checkHost(input: {
 	/** A parent-side item FAILed, so no launch is "ready" for this host either. */
 	parentFailed: boolean;
 }): Promise<CrossMachineCheckupHost> {
-	const { host, source, settings, env, client, agents, model, localOrigin, cwd } = input;
+	const { host, source, settings, env, client, agents, localOrigin, cwd } = input;
 	const items: CrossMachineCheckupItem[] = [];
+	// xm-model-fallback: a launch on this host starts with `hosts.<host>.model` when the
+	// caller names none (`Orchestrator.launch`: `input.model ?? input.hostTarget.model`),
+	// so judging the CALLER's default here would predict a launch nobody makes — a FAIL
+	// for a model the child will never ask for, or, worse, a PASS that hides the model it
+	// WILL ask for. Host pin first, caller default second — the launch's own order.
+	const model = firstNonEmpty(settings?.hosts?.[host]?.model) ?? input.model;
 
 	// Transport already dead before this host was reached (no `hc` core): one
 	// sentence, then every probe is skipped for the same reason.

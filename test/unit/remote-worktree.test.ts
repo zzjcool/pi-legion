@@ -31,6 +31,7 @@ import {
 	fetchRemoteBranch,
 	localCheckoutState,
 	noLocalGitMessage,
+	noLocalOriginMessage,
 	normalizeGitRemoteUrl,
 	notALocalCheckoutMessage,
 	provisionRemoteWorktree,
@@ -264,7 +265,7 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 	assert.equal(noCheckout.code, ErrorCodes.INVALID_PARAMS);
 	assert.equal(
 		noCheckout.message,
-		"host 'vps' has no checkout at /srv/app (the configured cwd does not exist on that machine). Two ways out: 1) give that machine a checkout at /srv/app — git clone <url> /srv/app on 'vps' — or point subagents.crossMachine.hosts.vps.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).",
+		"host 'vps' has no checkout at /srv/app (the configured cwd does not exist on that machine). Two ways out: 1) give that machine a checkout at /srv/app — git clone <url> /srv/app on 'vps' — or point subagents.crossMachine.hosts.vps.cwd at a directory that is a git checkout; 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 	);
 
 	// 2. It exists but is not a git repository (rev-parse exits 128).
@@ -275,7 +276,7 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 	assert.equal(notRepository.code, ErrorCodes.INVALID_PARAMS);
 	assert.equal(
 		notRepository.message,
-		"host 'vps': /srv/app is not a git repository on that machine. Two ways out: 1) give that machine a checkout at /srv/app — git clone <url> /srv/app on 'vps' — or point subagents.crossMachine.hosts.vps.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).",
+		"host 'vps': /srv/app is not a git repository on that machine. Two ways out: 1) give that machine a checkout at /srv/app — git clone <url> /srv/app on 'vps' — or point subagents.crossMachine.hosts.vps.cwd at a directory that is a git checkout; 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 	);
 
 	// 3. THIS checkout has no origin: fixed here, so the message does not blame the host.
@@ -291,8 +292,12 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 		assert.equal(noLocalOrigin.code, ErrorCodes.INVALID_PARAMS);
 		assert.equal(
 			noLocalOrigin.message,
-			`cross-machine delivery needs one shared remote: this checkout (${local.repo}) has no origin. Two ways out: 1) add one and retry — git -C ${local.repo} remote add origin <url> (the machine 'vps' must be able to reach the same url); 2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "vps", task: "..." }) needs no origin.`,
+			`cross-machine delivery needs one shared remote: this checkout (${local.repo}) has no origin. Two ways out: 1) add one and retry — git -C ${local.repo} remote add origin <url> (the machine 'vps' must be able to reach the same url); 2) dispatch the centurion instead and let IT create the worker on 'vps' — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), while a scout or a worker is created ON that machine by the centurion running there.`,
 		);
+		// BUG B: `allowRoles` defaults to centurion-only, so the old tail recommended a
+		// call this session refuses. No message may spell it.
+		assert.doesNotMatch(noLocalOrigin.message, /subagent\(\{ agent: "worker"/);
+		assert.match(noLocalOrigin.message, /subagents\.crossMachine\.allowRoles/);
 
 		// 4. THAT machine's checkout has no origin: fixed there, so it names the host.
 		const withLocal = localRepo("git@example.com:acme/pi-legion.git");
@@ -306,7 +311,7 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 			);
 			assert.equal(
 				noRemoteOrigin.message,
-				"host 'vps': /srv/app has no origin on that machine; cross-machine delivery needs one shared remote. Two ways out: 1) add one there — hc exec --on vps -- git -C /srv/app remote add origin <url> (same url as this checkout's 'git@example.com:acme/pi-legion.git'); 2) dispatch a worker instead (workers need no origin).",
+				"host 'vps': /srv/app has no origin on that machine; cross-machine delivery needs one shared remote. Two ways out: 1) add one there — hc exec --on vps -- git -C /srv/app remote add origin <url> (same url as this checkout's 'git@example.com:acme/pi-legion.git'); 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 			);
 
 			// 5. Both have one, and they disagree: the message names BOTH.
@@ -319,7 +324,7 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 			);
 			assert.equal(
 				mismatch.message,
-				"host 'vps': its checkout at /srv/app has origin 'git@example.com:acme/fork.git' but this checkout's is 'git@example.com:acme/pi-legion.git'; cross-machine delivery needs one shared remote. Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); 2) dispatch a worker instead (workers need no origin).",
+				"host 'vps': its checkout at /srv/app has origin 'git@example.com:acme/fork.git' but this checkout's is 'git@example.com:acme/pi-legion.git'; cross-machine delivery needs one shared remote. Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 			);
 		} finally {
 			withLocal.cleanup();
@@ -339,7 +344,7 @@ test("D6: `rev-parse` exiting 127 means git is missing there, not that the direc
 	assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
 	assert.equal(
 		error.message,
-		"host 'vps': git is not available on that machine (git -C /srv/app rev-parse --git-dir exited 127: sh: 1: git: not found). A cross-machine centurion delivers through git worktrees, so git must be on PATH there. Two ways out: 1) install git on 'vps' and retry; 2) dispatch a worker instead (workers need no worktree and no git).",
+		"host 'vps': git is not available on that machine (git -C /srv/app rev-parse --git-dir exited 127: sh: 1: git: not found). A cross-machine centurion delivers through git worktrees, so git must be on PATH there. Two ways out: 1) install git on 'vps' and retry; 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).",
 	);
 });
 
@@ -411,10 +416,10 @@ test("D5: a session directory that is NOT a checkout gets its own answer, never 
 		assert.equal(error.message, notALocalCheckoutMessage({ host: HOST, localRepo: plain }));
 		assert.equal(
 			error.message,
-			`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${plain}) is not one. ` +
+			`cross-machine delivery needs a git checkout on this machine too, and the directory it delivers from (${plain}) is not one. ` +
 				"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
 				`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "vps", cwd: "../my-repo", hostCwd: "/abs/path/on/vps", task: "..." }); ` +
-				'2) dispatch a worker instead — subagent({ agent: "worker", host: "vps", task: "..." }) needs no checkout and no origin.',
+				`2) dispatch the centurion instead and let IT create the worker on 'vps' — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), while a scout or a worker is created ON that machine by the centurion running there.`,
 		);
 		// The impossible advice is GONE, not merely reordered.
 		assert.doesNotMatch(error.message, /remote add/, "`git remote add` cannot work in a non-repository");
@@ -423,10 +428,11 @@ test("D5: a session directory that is NOT a checkout gets its own answer, never 
 		// Both halves of the shape: a relative cwd alone would drop the remote directory
 		// and send the reader into the D2 question next.
 		assert.match(error.message, /subagent\(\{ agent: "centurion", host: "vps", cwd: "\.\.\/my-repo", hostCwd: "\/abs\/path\/on\/vps", task: "\.\.\." \}\)/);
-		assert.match(
-			error.message,
-			/subagent\(\{ agent: "worker", host: "vps", task: "\.\.\." \}\) needs no checkout and no origin/,
-		);
+		// BUG B: the second way out must NOT be a call `allowRoles` refuses (default:
+		// centurion only) — the worker is created ON that machine by that centurion.
+		assert.doesNotMatch(error.message, /subagent\(\{ agent: "worker"/);
+		assert.match(error.message, /subagents\.crossMachine\.allowRoles/);
+		assert.match(error.message, /created ON that machine by the centurion running there/);
 		// The remote half is never asked: the local fact already refuses.
 		assert.equal(
 			client.execs().some((params) => JSON.stringify(params.argv ?? []).includes("remote get-url")),
@@ -730,4 +736,28 @@ test("D11: no lockfile on that machine is a REFUSAL, never a written marker", as
 	);
 	// marker probe + lockfile probe only: no bootstrap command, no file.write.
 	assert.equal(none.calls.filter((call) => call.method === "file.write").length, 0);
+});
+
+test("BUG B: the three local delivery refusals never recommend a dispatch `allowRoles` refuses", () => {
+	// `subagents.crossMachine.allowRoles` defaults to `["centurion"]`, so the old
+	// `subagent({ agent: "worker", host, task })` tail pointed at a call this
+	// session rejects. One table, one wording family: the action first, the policy,
+	// then the fact that makes it true — the worker is created ON that machine.
+	const messages: Array<[string, string]> = [
+		["not-a-checkout", notALocalCheckoutMessage({ host: "vps", localRepo: "/tmp/agents" })],
+		["no-local-origin", noLocalOriginMessage({ host: "vps", localRepo: "/tmp/repo" })],
+		["no-local-git", noLocalGitMessage({ host: "vps", localRepo: "/tmp/repo", code: 127, detail: "sh: git: not found" })],
+	];
+	for (const [name, message] of messages) {
+		assert.doesNotMatch(message, /subagent\(\{ agent: "worker"/, name);
+		assert.doesNotMatch(message, /needs no (?:checkout and no )?origin/, name);
+		assert.match(message, /subagents\.crossMachine\.allowRoles/, name);
+		assert.match(message, /cannot be dispatched from this session at all/, name);
+		assert.match(message, /default list is \["centurion"\]/, name);
+		assert.match(message, /created ON that machine|born ON 'vps'/, name);
+		// The first way out survives: a checkout here, spelled for a relative `cwd`.
+		assert.match(message, /1\) /, name);
+	}
+	// …and the pasteable call that IS legal from here is still spelled out.
+	assert.match(messages[0]![1], /subagent\(\{ agent: "centurion", host: "vps", cwd: "\.\.\/my-repo"/);
 });
