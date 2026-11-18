@@ -32,8 +32,12 @@ import { getAgentDir } from "./paths.ts";
 import { ignoredKindMessage, reportIgnoredOnce } from "../shared/ignored-kind.ts";
 import {
 	canReachTerminal,
+	PHASE_MACHINE_CATEGORIES,
+	PHASE_MACHINE_CATEGORY_HINTS,
 	type PhaseDefinition,
 	type PhaseMachine,
+	type PhaseMachineCategory,
+	type PhaseMachineError,
 	type PhaseTransitionRule,
 	normalizePhaseMachine,
 	phaseStart,
@@ -581,25 +585,90 @@ export function parsePhaseMachine(
 	if (!Array.isArray(machine.phases)) {
 		throw new Error(`Agent '${filePath}' has invalid phases: 'phases' must be a list.`);
 	}
+	// #坑1 / contract D2: a terminal phase may OMIT `next`, and `{ id: "done",
+	// terminal: true }` must mean exactly the same thing as `next: []`. Normalizing
+	// on the INPUT side (rather than only inside the validator) means every later
+	// step — injection, validation, the terminal-reachability question — sees the
+	// same machine, so no path can disagree about what the author declared.
+	const declared: PhaseMachine = {
+		...machine,
+		phases: machine.phases.map((phase) =>
+			phase && typeof phase === "object" && phase.next === undefined
+				? { ...phase, next: [] }
+				: phase,
+		),
+	};
 	// Inject the universal terminals before validating, so reachability is judged
 	// on the machine as it will actually run.
-	const normalized = normalizePhaseMachine(machine);
+	const normalized = normalizePhaseMachine(declared);
 	const errors = validatePhaseMachine(normalized);
 	// #371 G4: a well-formed graph may still be a loop. Asked only when the graph
 	// is otherwise valid (a structural error already names the real problem), and
 	// asked of the DECLARED graph — `normalizePhaseMachine` appends `done` to every
 	// non-terminal phase, so the normalized machine answers "yes" by construction.
-	if (options.requireTerminal === true && errors.length === 0 && !canReachTerminal(machine)) {
+	if (options.requireTerminal === true && errors.length === 0 && !canReachTerminal(declared)) {
 		errors.push({
 			path: "phases",
-			message: `phase machine cannot reach a terminal phase from '${phaseStart(machine)}'`,
+			message: `phase machine cannot reach a terminal phase from '${phaseStart(declared)}'`,
+			category: "unreachable",
+			fix:
+				`give the walk a phase it can END in, e.g. phases: [{ id: "planning", next: [{ to: "implementing" }] }, ` +
+				`{ id: "implementing", next: [{ to: "done" }] }, { id: "done", terminal: true }] — every phase needs an exit, and at least one must be terminal`,
 		});
 	}
 	if (errors.length > 0) {
-		const detail = errors.map((error) => `  - ${error.path}: ${error.message}`).join("\n");
-		throw new Error(`Agent '${filePath}' has an invalid phase machine:\n${detail}`);
+		throw new Error(`Agent '${filePath}' has an invalid phase machine: ${formatPhaseMachineHeadline(errors)}\n${formatPhaseMachineErrors(errors)}`);
 	}
 	return normalized;
+}
+
+/**
+ * Group problems by category, in the fixed order the contract froze (#坑1 / D3).
+ *
+ * "A model wrote `phases` from a demo and got one line back" was the real bug: a
+ * self-edge and a terminal-shaped mistake arrived as two unrelated lines, and the
+ * author could not tell which one the parser was complaining about first. Shape
+ * problems come first because a malformed declaration makes every later verdict
+ * unreliable; routing next; reachability last, because it is computed FROM the
+ * edges and is meaningless until they parse.
+ */
+function groupPhaseMachineErrors(
+	errors: readonly PhaseMachineError[],
+): { category: PhaseMachineCategory; items: PhaseMachineError[] }[] {
+	const groups: { category: PhaseMachineCategory; items: PhaseMachineError[] }[] = [];
+	for (const category of PHASE_MACHINE_CATEGORIES) {
+		const items = errors.filter((error) => error.category === category);
+		if (items.length > 0) groups.push({ category, items });
+	}
+	// A category the renderer does not know (a future one, or a hand-built error)
+	// is still REPORTED rather than silently dropped: a swallowed problem is the
+	// failure mode this whole path exists to remove.
+	const known = new Set<string>(PHASE_MACHINE_CATEGORIES);
+	const strays = errors.filter((error) => !known.has(error.category));
+	if (strays.length > 0) groups.push({ category: "structure", items: strays });
+	return groups;
+}
+
+/** `4 problems in 3 categories.` — the tail of the first line. */
+function formatPhaseMachineHeadline(errors: readonly PhaseMachineError[]): string {
+	const groups = groupPhaseMachineErrors(errors);
+	const problems = `${errors.length} problem${errors.length === 1 ? "" : "s"}`;
+	const categories = `${groups.length} categor${groups.length === 1 ? "y" : "ies"}`;
+	return `${problems} in ${categories}.`;
+}
+
+/** The `[category] N problems — …` blocks, each problem followed by its `fix:`. */
+function formatPhaseMachineErrors(errors: readonly PhaseMachineError[]): string {
+	const lines: string[] = [];
+	for (const { category, items } of groupPhaseMachineErrors(errors)) {
+		const problems = `${items.length} problem${items.length === 1 ? "" : "s"}`;
+		lines.push(`[${category}] ${problems} — ${PHASE_MACHINE_CATEGORY_HINTS[category]}`);
+		for (const item of items) {
+			lines.push(`  - ${item.path}: ${item.message}`);
+			if (item.fix) lines.push(`    fix: ${item.fix}`);
+		}
+	}
+	return lines.join("\n");
 }
 
 /**
