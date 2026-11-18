@@ -9,9 +9,13 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
-## [Unreleased]
+## [6.2.0] — 2026-11-18
 
-### Added（v1.1，minor 建议 6.2.0）
+跨机器派发从「能跑」变成「能配、能排查、能演示」：配置只写覆盖，失败带证据与下一步，
+演示照着文档能把一台 Mac 父机 + 一台远端机器走完。minor 是刻意的——下面是能力新增，
+不是修修补补。
+
+### 跨机配置：hosts 默认来自 `hc machine ls`，扩展按包名在远端解析，`cwd` 可按次覆盖
 
 跨机器配置不再要求父机替远端手写一堆路径，也不再「一台机器只能一个工作目录」：
 
@@ -44,7 +48,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 契约增补：`docs/contracts/cross-machine-spawn-v1.md` Addendum v1.1；
 报告：`docs/reports/cross-machine-host-discovery.md`。
 
-### Fixed（v1.2，远端 child 启动期死亡不再静默）
+### 失败可解释：启动 8 秒门给出退出码 / 屏幕原文 / 可复现命令，read-back 分四类，doctor 给下一步
 
 远端 child 的 stdout/stderr/退出码从来不会被读回，唯一的结果载体是那台机器上的
 `<remoteDir>/session.jsonl`。于是「child 死在第一个 turn 之前」在父会话里只剩一个观测：
@@ -85,19 +89,28 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   换了个根」，这一条管「显式写下的路径在那台机器上根本不存在」。**v1.2 起不再有「映射不了
   就丢弃 + 打一行 stderr」这条路**，所以本版也不再需要把被丢弃的扩展搬到结果里：映射不了
   的启动前就拒绝了。
+- **`/legion doctor` 新增 `crossmachine` 一节**（`legion-doctor`，契约 D8）：标题
+  `## Cross-machine (host targets)`，逐 host 列 `cwd` / `node` / `piCli` / `legionRoot` /
+  extensions / `worktreeRoot` 的解析结果（解析不了的打 `INVALID` 并给
+  `CROSSMACHINE_UNRESOLVED` issue）、最近一次交付预检（`ok (…)` / `failed (…): <message>` /
+  `never`），以及一条按当前配置拼好、可直接粘贴的最小 `subagent` launch（terminal 阶段
+  省略 `next`）。这一节是只读的：不跑 `--list-models`，不发任何远端探测。
+- **解析不了的 host 不再以 `No blocking fixes` 收尾**：`crossmachine` 一节每个解析失败的
+  host 都会产出一条 error issue，于是 `report.ok` 已经是 false，而 actionable 列表仍打印
+  通用的「没有阻塞性修复」——报告自己跟自己矛盾。现在补一条点名 settings 键与
+  `/legion doctor crossmachine` 的下一步（`CROSSMACHINE_UNRESOLVED` 触发）。
 
-### Fixed（phases 与跨机交付的报错可用性）
+报告：[`docs/reports/remote-child-startup.md`](docs/reports/remote-child-startup.md)。
+
+### 演示可用性：phases 校验放宽并点名、共享 origin 预检前置、新增演示 runbook
 
 - **phases 的终态阶段可以省略 `next`**（`phase-machine`，契约 D2）：`{ id: "done", terminal: true }` 与 `next: []` 现在完全等价，`parsePhaseMachine` / `normalizePhaseMachine` / `validatePhaseMachine` / `isTerminalIn` 任何路径都不再抛 TypeError（此前这份最小机器会报 `phases[2].next: next must be an array`）。
 - **phases 校验一次报出全部问题，并按分类点名到具体阶段与边**（`phase-machine` / `agents`，契约 D1/D3）：每条错误带 `category`（固定顺序 `structure` → `terminal` → `successor` → `unreachable` → `rework`）和一行 `fix:`（缩进 4 空格；terminal / successor / unreachable 三类必带最小合法示例）；首行仍是 `Agent '<file>' has an invalid phase machine: N problems in M categories.`，错误条目行仍是 `  - <path>: <message>`。
 - **跨机交付预检提前到 phases 校验之前**（`orchestrator`，契约 D7）：`host` + `worktree` 时先问「那台机器能不能交付」，再问 phases。此前 phases 写错会先报 phases，改完才发现真正挡路的是一个没有 origin 的 checkout。预检顺序固定：`local-git` → `local-origin` → `remote-checkout` → `remote-git` → 「是 git 仓库」→ `remote-origin` → 「两侧同一个 origin」；硬失败一律 `INVALID_PARAMS` + `noModelFallback`（机器事实不去试下一个模型候选），最后一步 `git ls-remote origin` 是软的：只记 `fetch: "unreachable"` + detail，不 throw。
 - **跨机交付的拒绝文案给出两条出路**（`remote-worktree` / `cross-machine-preflight`，契约 D6）：本机无 origin、目标机无 origin、两侧 origin 不同、目标机 checkout 缺失或不是仓库，全部以 `Two ways out:` 收尾 —— ①修好这个前提（加 remote / `set-url` / 装 git / 换 `cwd`）②改派 `worker`（不需要 worktree、origin 或 git，文案里给了可粘贴的 `subagent` 形状）。开头那句 `cross-machine delivery needs one shared remote` 原地保留，仍然可 grep。
-
-### Added（跨机演示的可发现性）
-
 - **目标机没有 `git` 现在是一类自己的拒绝**（`cross-machine-preflight` / `remote-worktree`，契约 D5/D6）：`host '<h>': git is not available on that machine (git --version exited <n>: <detail>).`，不再把它说成「不是 git 仓库」；建树路径里 `rev-parse --git-dir` 的 exit 127 同样判成 `remote-git`。
-- **`/legion doctor` 新增 `crossmachine` 一节**（`legion-doctor`，契约 D8）：标题 `## Cross-machine (host targets)`，逐 host 列 `cwd` / `node` / `piCli` / `legionRoot` / extensions / `worktreeRoot` 的解析结果（解析不了的打 `INVALID` 并给 `CROSSMACHINE_UNRESOLVED` issue）、最近一次交付预检（`ok (…)` / `failed (…): <message>` / `never`），以及一条按当前配置拼好、可直接粘贴的最小 `subagent` launch（terminal 阶段省略 `next`）。这一节是只读的：不跑 `--list-models`，不发任何远端探测。
 - **新 runbook [`docs/runbooks/cross-machine-centurion-demo.md`](docs/runbooks/cross-machine-centurion-demo.md)**：照着演示的三步（同一个 origin → `subagents.crossMachine` → 一条 `subagent` 调用），含每个配置键「不填会怎样」与失败文案对照表。真机 e2e 断言仍在 [`docs/runbooks/cross-machine-live-e2e.md`](docs/runbooks/cross-machine-live-e2e.md)（要 `HC_SESSION=test-*`），两份不混用环境变量。
+- **三个演示坑的前后对照**写在 [`docs/reports/cross-machine-demo-ux.md`](docs/reports/cross-machine-demo-ux.md)：phases 报错、origin 预检顺序、doctor 的下一步，各自贴了改动前后的真实输出。
 
 ## [6.1.1] — 2026-11-17
 
