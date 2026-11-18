@@ -29,6 +29,12 @@ make status       # 容器 + 镜像状态
 make clean        # 删容器（镜像保留）
 
 make tui-visual   # mock 模型确定性 TUI 回归
+
+make xm           # 跨机伪真机自测台：两容器 + 真 hc + 真 ssh，跑四个断言（见下）
+make xm-model     # 跨机特例：远端没有该模型时必须拒绝并列出远端可见模型
+make xm-real      # 同上但用真模型驱动（非门禁：模型自由度会失败）
+make xm-up        # 只起双容器拓扑（调试用）
+make xm-down      # 清掉双容器 + 网络（卷默认保留）
 ```
 
 路径全部从 Makefile 位置反推仓库根，不硬编码 `/root/...`。
@@ -151,7 +157,84 @@ L1 只证明模型可达。镜像自带的包照样能跑模型，但本仓库�
 `/plugin` 未登记为 package 时就是这个状态，静默无报错。只有 `pi list` 出 `/plugin`
 （L2）+ 模型认得 `subagent` 工具（L3）才算验证。
 
-## 与 pi-async 的差异
+## 跨机自测（`make xm`）—— 改跨机代码前后都必须跑
+
+单机测试证明不了跨机。仓库里其他所有跨机用例都跑在 `test/helpers/fake-hc-core.mjs` 上：
+同一个进程、同一台机器，只是脚本说成两台。连续三个线上 bug（转录 0 字节 / 入口校验
+假阳性 / 预检不认 cwd）在它上面全绿，只在真双机才暴露。`make xm` 就是为了堵这个洞。
+
+### 拓扑
+
+```
+  xm-parent  ── hc connect(JSON-RPC) ──┐        xm-remote
+  (hc + pi + /plugin + mock 8765/8766) │        (sshd + pi + /plugin + git)
+        │                              └── ssh ──→ hc core → terminal.run 真跑在远端
+        └── 共享 bare origin 卷 /srv/git/app.git ←── 远端 push 的交付分支
+```
+
+两容器同一镜像（沙箱镜像 + openssh），跑在两个文件系统上，传输是真的：
+父机 `hc` 用 ssh 连远端 core，`machine.exec` / `file.read` / `file.write` 全部跨网络。
+
+### 前置
+
+| 需要 | 缺失时 |
+|---|---|
+| docker | `SKIPPED: docker …` + **exit 1** |
+| 真 `hc`（herdr-core，`HC_BIN` / `PATH` / `~/.local/bin/hc`） | `SKIPPED: no herdr-core (hc) binary` + **exit 1** |
+| 宿主 `~/.pi/agent/{auth.json,models.json}` | `SKIPPED: no host pi credentials` + **exit 1** |
+
+镜像缺失会自动 build。模型凭据只用于 `make xm-real`；`make xm` 默认全部走仓库自带的
+`test/mock-llm`（两个端口：8765 父机、8766 远端 child），所以**不花钱、不受模型自由度影响**。
+
+### 耗时
+
+镜像已存在时 **3–5 分钟**（两容器起来 + 3 次 mock 驱动的 pi 运行）；首次 build 再加 1–2 分钟。
+
+### 只看这几行判断通过
+
+```
+XM_ASSERT a1 PASS role-policy            # scout+host 被拒，文案含 allowRoles/'centurion'/'scout'
+XM_ASSERT a2 PASS machine-list           # 未知机器被拒，文案含 hc machine ls + remote
+XM_ASSERT b  PASS launch                 # 零配置（只有 enabled:true）启动成功
+XM_ASSERT c  PASS remote-artifact        # 远端真出现 .pi-worktrees/<child> + pi-subagent/remote/… 分支 + 本轮 nonce 文件
+XM_ASSERT d0 PASS known-gap: …           # 零配置收集的已知缺口（见下）
+XM_ASSERT c2 PASS remote-artifact        # hosts 条目配置下再验一次产物
+XM_ASSERT d  PASS transcript-readback    # runs/<id>/remote/<child>.jsonl 有内容且含远端最后一条 assistant 文本
+XM_ALL_PASS run=… child=…
+```
+
+任何 `FAIL` 后面紧跟 `evidence: {…}`（一行 JSON：实测路径、字节数、原始文本、复现命令）。
+`XM_CONTRAST` 专门打印「父机预创建的空占位文件 vs 真 mirror」的字节对照 —— 断言绝不用占位文件。
+
+### 已知缺口（`d0` 就是把它钉住的断言）
+
+`subagents.crossMachine` 只用 `{"enabled": true}` 时：**launch 成功，但 `collect` 拿不到转录**。
+read-back 走同步 `resolveHostTarget`（`src/runs/remote-artifact.ts:199`），它要求
+`subagents.crossMachine.hosts.<name>` 条目存在（`src/runs/remote.ts:976-982`），
+所以零配置下父机永远写不出 `runs/<id>/remote/<child>.jsonl`。
+
+对策（也是 Run B 的配置）：显式给条目，`hosts.remote = { "cwd": "/root/work" }`。
+`d0` 断言的就是**当前**行为；等这个缺口被修（read-back 与 launch 解析同一个 target），
+`d0` 会变红，提醒把断言翻成正向。
+
+### `make xm-model`
+
+远端 `models.json` 里整条 provider 缺失，断言：远端 `pi --list-models` 没有该 model、
+派发被 `model-missing` 拒绝、错误里列出远端可见模型、远端**不产生**新 worktree。
+现状是硬拒绝（`src/supervisor/terminal-supervisor.ts:767-780`），**没有**自动回退到远端默认模型。
+待远端模型回退逻辑合入后，这个 target 的断言要翻成「回退 + warning」。
+
+### 限制（真的限制，不是 TODO）
+
+1. **`hc` 二进制由宿主提供**：npm 上 `herdr` 是 0.0.0 占位，herdr-core 不从 registry 装。
+   没有它的机器只能 `SKIPPED`（exit 1）。CI 不跑 `make xm`（与 `test:live` 同级）。
+2. **ssh 是 hc 的传输层**：远端容器跑 `sshd`，`hc machine add --install` 会把 hc 拷进去。
+   容器重建后必须重跑 `make xm-up`（`make xm` 自带）。
+3. **`make xm` 会写 `/tmp/xm-models.*` 临时 models.json**，跑完可删；容器与网络会被 `xm-up` 幂等重建。
+4. **`make xm-real` 非门禁**：真模型经常忽略 `host=remote`（实测 deepseek 一次都没传、hy4std 一半概率），
+   失败只打印 `XM_REAL_FAIL`，不影响 `make xm`。
+
+### 与 pi-async 的差异
 
 pi-async 的镜像只在本地构建，不发布 ghcr；pi-legion 的 `tui-sandbox` 由
 `.github/workflows/docker-tui-sandbox.yml` 在 master 上自动发布到
