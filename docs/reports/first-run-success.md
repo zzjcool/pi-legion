@@ -127,8 +127,9 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
 … Pass it with the call: subagent({ agent: "centurion", host: "vps", cwd: "/abs/path/on/vps", task: "..." }) (that path is read ON vps; it is never translated from here).
 ```
 
-落在哪：`src/runs/remote.ts:649`；`cwd`/`hostCwd` 的 schema 描述仍在 `index.ts`（step / call / batch 三处），
-但**唯一权威的说明**现在随报错一起到达读者。
+落在哪：`src/runs/remote.ts:649`（提问）。同一坑的另一半也补在了 **schema 描述**上：`index.ts` 的 step / call / batch 三处
+`cwd` / `hostCwd` 描述改成「带 `host` 时，这就是**那台机器上**的目录，在那里读、从不翻译」（提交 `254c788`）。
+但**唯一权威的说明**仍然随报错一起到达读者 —— schema 描述要等读者去查，报错不用。
 
 ### 坑 5：没有哪条命令能回答「现在缺什么，下一句敲什么」（D6–D8）
 
@@ -411,5 +412,8 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
   其中几处旧退出码文案（exit 12/13/14/16）随 W1 的新措辞已过时，但它不在本卡的文件所有权内，留给后续一次单独的文档提交。
 - **`docs/reports/cross-machine-host-discovery.md:247` 仍引用旧的 `has no cwd: set a default …` 句子**：同上，
   那是历史报告（记录当时的行为），本卡不改写历史记录。
-- **未做**：`hostCwd` 的 schema 描述（`index.ts`）没有改 —— 唯一权威说明现在随 D2 的提问一起到达读者；
-  如果以后要收窄两个参数名，那是另一份契约的事。
+- **坑 4 的另一半已在同一分支补上**：`index.ts` 三处 schema 描述（`cwd` / `hostCwd`）改成「带 `host` 时是那台机器上的
+  目录、不从本机翻译」（提交 `254c788`，另一个 writer 的改动，不属本卡文件所有权）；本报告坑 4 只描述**报错侧**的变化。
+- **跟随项（未落库的改动）**：本工作树里还有一份未提交的体检改动（launch 行带上 `model:`、以及
+  `launchAfterFixes` 标签）。如果它落库，本文与 runbook 里的样例最后两行需要同步一行 —— 现在的样例是逐字抄
+  提交 `30b393f` 的渲染。
