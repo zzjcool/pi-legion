@@ -345,7 +345,8 @@ test("D7 wiring: the routing facade delegates to its terminal backend, which run
 		assert.equal(report.host, HOST);
 		assert.equal(report.fetch, "ok");
 		assert.equal(core.started, 1, "the hc client is started once, exactly as a spawn would");
-		// The eight steps, in D5's order — this is the real module, not a stand-in.
+		// The five REMOTE questions of D5's eight steps, in order (steps 1 and 2 ask
+		// this machine) — the real module, not a stand-in.
 		assert.deepEqual(core.execs.map((argv) => argv.join(" ")), [
 			"test -d /srv/app",
 			"git --version",
