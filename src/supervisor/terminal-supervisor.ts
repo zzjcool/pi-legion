@@ -22,7 +22,9 @@ import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import {
 	ensureRemoteDir,
-	mapRemoteArgPath,
+	mapRemoteArgv,
+	needsPackageIndex,
+	packageLoaderFor,
 	mirrorRemoteFile,
 	normalizeHost,
 	classifyRemoteStartupProbe,
@@ -307,7 +309,13 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// makes `host` and `hostTarget` inseparable, so `remote === (host !== undefined)`
 		// — and three spellings of that fact is how the env/argv/labels branches drift
 		// apart when the guard is ever relaxed.
-		const target: HostTarget | undefined = host === undefined ? undefined : input.hostTarget;
+		// `let`, not `const`: a target whose `piCli`/`node`/`piLegionRoot` came from
+		// the discovery cache can go STALE when that machine upgrades `pi` (the
+		// bundle moves to `install/releases/<new>/…`). The preflight is the first
+		// place that fact becomes visible, and it is the right place to re-probe
+		// once and retry (see below) instead of failing a launch whose only problem
+		// is a cache entry.
+		let target: HostTarget | undefined = host === undefined ? undefined : input.hostTarget;
 		const remote = host !== undefined && target !== undefined;
 
 		// D11: a remote worktree is created ON THAT MACHINE, by the only layer that
@@ -391,8 +399,23 @@ export class TerminalSupervisor implements LegionSupervisor {
 			try {
 				await remotePreflight(client, target);
 			} catch (error) {
-				await rollbackRemoteWorktree();
-				throw this.failure("remote preflight", host ?? target.host, error);
+				// Self-heal (addendum v1.1): when a DISCOVERED field is what the preflight
+				// just refused (exit 12/13/14/16 = node / piCli / piLegionRoot), re-probe
+				// that machine once and retry. A fully explicit target carries no
+				// `rediscover`, so nothing is re-probed behind the operator's back, and a
+				// second failure is reported as-is (no retry loop).
+				const refreshed = isStaleDiscoveryFailure(error) ? await target.rediscover?.().catch(() => undefined) : undefined;
+				if (refreshed === undefined) {
+					await rollbackRemoteWorktree();
+					throw this.failure("remote preflight", host ?? target.host, error);
+				}
+				target = refreshed;
+				try {
+					await remotePreflight(client, target);
+				} catch (retryError) {
+					await rollbackRemoteWorktree();
+					throw this.failure("remote preflight", host ?? target.host, retryError);
+				}
 			}
 		}
 
@@ -517,6 +540,26 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// so the appendix says "push it" instead of "do not push".
 				...(remote ? { remoteDelivery: true } : {}),
 			});
+			// v1.2: the parent's inherited extensions are paths in ITS package tree.
+			// Ask that machine what it has installed (one cached probe, and only when
+			// argv actually carries `--extension`) so they can be re-rooted by package
+			// name instead of dropped.
+			let packages = target?.packageIndex;
+			const loadPackages = target === undefined ? undefined : packageLoaderFor(target);
+			if (
+				target !== undefined &&
+				packages === undefined &&
+				loadPackages !== undefined &&
+				remoteDirPath !== undefined &&
+				needsPackageIndex(built.args, {
+					remoteCwd: remoteWorktree?.path ?? target.cwd,
+					remoteDir: remoteDirPath,
+					localCwd: input.cwd,
+					pathMap: target.pathMap,
+				})
+			) {
+				packages = await loadPackages().catch(() => undefined);
+			}
 			if (target !== undefined && rewritePath !== undefined && remoteDirPath !== undefined) {
 				// D6's closing rule: NO parent-absolute path may survive, and none may be
 				// mapped to a path that will not exist. Two classes are mappable:
@@ -536,46 +579,22 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// mapped simply cannot be loaded over there, so it is dropped WITH a
 				// notice (never silently), while any other unmappable argv path keeps the
 				// hard refusal below.
-				const droppedExtensions: string[] = [];
-				const mappedArgs: string[] = [];
-				for (let index = 0; index < built.args.length; index += 1) {
-					const arg = built.args[index] as string;
-					if (arg === "--extension" || arg === "-e") {
-						const value = built.args[index + 1];
-						if (typeof value === "string" && path.isAbsolute(value)) {
-							try {
-								mappedArgs.push(arg, mapRemoteArgPath({
-									arg: value,
-									host: target.host,
-									remoteCwd: remoteWorktree?.path ?? target.cwd,
-									remoteDir: remoteDirPath,
-									localCwd: input.cwd,
-									pathMap: target.pathMap,
-								}));
-							} catch {
-								droppedExtensions.push(value);
-							}
-							index += 1;
-							continue;
-						}
-					}
-					mappedArgs.push(mapRemoteArgPath({
-						arg,
-						host: target.host,
-						// A remote worktree child reads ITS tree, not the bare checkout:
-						// the git-remote model says both machines hold the same content,
-						// and the tree is this launch's copy of it.
-						remoteCwd: remoteWorktree?.path ?? target.cwd,
-						remoteDir: remoteDirPath,
-						localCwd: input.cwd,
-						pathMap: target.pathMap,
-					}));
-				}
-				if (droppedExtensions.length > 0) {
-					process.stderr.write(
-						`[pi-legion] host '${target.host}': ${droppedExtensions.length} extension(s) not loadable there (no pathMap entry maps them): ${droppedExtensions.join(", ")}. Add a prefix to subagents.crossMachine.hosts.${target.host}.pathMap if the child needs them.\n`,
-					);
-				}
+				// v1.2: NO drops. Every absolute argv element either maps (checkout /
+				// pathMap / same package on that machine) or the launch is refused with
+				// the package, the parent path and the candidates. A child that quietly
+				// lost the provider extension starts, prints no models, and hangs — the
+				// worst of the three answers.
+				const mappedArgs = mapRemoteArgv(built.args, {
+					host: target.host,
+					// A remote worktree child reads ITS tree, not the bare checkout: the
+					// git-remote model says both machines hold the same content, and the
+					// tree is this launch's copy of it.
+					remoteCwd: remoteWorktree?.path ?? target.cwd,
+					remoteDir: remoteDirPath,
+					localCwd: input.cwd,
+					pathMap: target.pathMap,
+					...(packages ? { packages } : {}),
+				});
 				// S5.6: `--no-extensions` is right (a child must not inherit the parent's
 				// plugin set) but on a machine whose MODELS come from an extension it also
 				// removes the model provider — the real run answered `No models available`
@@ -1331,4 +1350,18 @@ function terminalChildError(child: TerminalChildRecord): SubagentError {
 			"a terminal child cannot be resumed.",
 		ErrorCodes.CHILD_TERMINAL,
 	);
+}
+
+/**
+ * Is this preflight failure a fact about a DISCOVERED path (addendum v1.1)?
+ *
+ * Only the four "that file/program is not there" exits qualify — node (12),
+ * `pi` on PATH (13), this package's entry (14), and "piCli is not a JS entry"
+ * (16). A missing cwd (11), a legion-identity core (15) or a transport failure
+ * are not fixed by re-probing, and retrying them would only double the wait.
+ */
+function isStaleDiscoveryFailure(error: unknown): boolean {
+	if (!(error instanceof SubagentError)) return false;
+	const code = (error.details as { code?: unknown } | undefined)?.code;
+	return code === 12 || code === 13 || code === 14 || code === 16;
 }

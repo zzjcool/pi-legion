@@ -21,6 +21,13 @@
  * Env:
  *   FAKE_HC_REMOTE_ROOT   required for remote calls; stands for that machine's fs
  *   FAKE_HC_MACHINES      comma-separated names (default: "fakebox")
+ *   FAKE_HC_MACHINE_LIST  what `machine.list` reports (v1.1 admission):
+ *                         unset = FAKE_HC_MACHINES, "empty" = a registered-nothing
+ *                         core, "unsupported" = the method fails (an old core),
+ *                         otherwise a comma-separated override list
+ *   FAKE_HC_REMOTE_PATH   PATH the "other machine" has for machine.exec — the
+ *                         only way a test can say "there is no node there"
+ *   FAKE_HC_REMOTE_HOME   HOME that machine's shell sees (pi install layout)
  *   FAKE_HC_LOG           optional path; every request is appended as JSONL
  *   FAKE_HC_LOCAL_ROOT    where local (no `on`) file/temp paths may live
  *                         (default: FAKE_HC_REMOTE_ROOT)
@@ -44,6 +51,9 @@ const MACHINES = (process.env.FAKE_HC_MACHINES ?? "fakebox")
 	.map((name) => name.trim())
 	.filter(Boolean);
 const LOG = (process.env.FAKE_HC_LOG ?? "").trim();
+/** v1.1: the machine.exec sandbox, so a test can control that machine's PATH/HOME. */
+const REMOTE_PATH = (process.env.FAKE_HC_REMOTE_PATH ?? "").trim();
+const REMOTE_HOME = (process.env.FAKE_HC_REMOTE_HOME ?? "").trim();
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_EXEC_TIMEOUT_S = 600;
@@ -254,6 +264,32 @@ function withTerminal(id, params, fn) {
 	fn(terminal);
 }
 
+// ── machine.list ────────────────────────────────────────────────────────────
+
+/**
+ * `machine.list` — the ADMISSION registry of a v1.1 launch.
+ *
+ * Deliberately richer than the real core has to be: `FAKE_HC_MACHINE_LIST` can
+ * say "this core knows nothing" (`empty`) or "this core cannot answer"
+ * (`unsupported`), which are the two failure modes legion must tell apart from
+ * "the machine is registered but the launch is misconfigured".
+ */
+function machineList(id) {
+	const override = (process.env.FAKE_HC_MACHINE_LIST ?? "").trim();
+	if (override === "unsupported") {
+		fail(id, "method_not_found", "unknown method: machine.list");
+		return;
+	}
+	let names = MACHINES;
+	if (override === "empty" || override === "none") names = [];
+	else if (override.length > 0) {
+		names = override.split(",").map((name) => name.trim()).filter(Boolean);
+	}
+	reply(id, {
+		machines: names.map((name) => ({ name, kind: "ssh", address: `ssh://${name}` })),
+	});
+}
+
 // ── machine.exec ────────────────────────────────────────────────────────────
 
 function machineExec(id, params) {
@@ -282,6 +318,10 @@ function machineExec(id, params) {
 	const line = typeof params.line === "string" ? params.line : undefined;
 	const input = typeof params.input === "string" ? Buffer.from(params.input, "base64") : undefined;
 	const env = { ...process.env, ...(params.env && typeof params.env === "object" ? params.env : {}) };
+	// The "other machine" has its own PATH/HOME. Both are only set when a test
+	// asks for them, so every existing fixture keeps running with the parent's.
+	if (on && REMOTE_PATH.length > 0) env.PATH = REMOTE_PATH;
+	if (on && REMOTE_HOME.length > 0) env.HOME = REMOTE_HOME;
 	const started = Date.now();
 	const run = line !== undefined
 		? spawnSync("sh", ["-c", line], {
@@ -410,7 +450,7 @@ function handle(request) {
 				framed: false,
 				methods: ["hello", "terminal.run", "terminal.get", "terminal.send", "terminal.wait",
 					"terminal.interrupt", "terminal.kill", "terminal.rm", "machine.exec",
-					"file.read", "file.write"],
+					"machine.list", "file.read", "file.write"],
 				features: [],
 				keeps_running_after_logout: null,
 				logout_linger_user: null,
@@ -454,6 +494,9 @@ function handle(request) {
 				terminals.delete(terminal.address);
 				reply(id, { removed: terminal.address });
 			});
+			return;
+		case "machine.list":
+			machineList(id);
 			return;
 		case "machine.exec":
 			machineExec(id, p);

@@ -199,6 +199,30 @@ npm run test:live -- --test-name-pattern='S5\.'
 
 ---
 
+## 3.4 v1.1：host 配置可以只剩 `enabled`
+
+从 6.2.0（契约 Addendum v1.1）起，`subagents.crossMachine.hosts` **不是必填项**：
+一台机器只要在 `hc machine ls` 里，就可以直接派发，`cwd` 每次调用给：
+
+```jsonc
+// settings：只需要打开开关；host 清单来自 hc
+{ "subagents": { "crossMachine": { "enabled": true } } }
+```
+
+```ts
+// 同一台机器、不同项目
+subagent({ host: "vps", cwd: "/srv/app-a", agent: "worker", task: "…" })
+subagent({ host: "vps", cwd: "/srv/app-b", agent: "scout", task: "…" })
+```
+
+`node` / `piCli` / `piLegionRoot` / provider 扩展由一次 `machine.exec` 探测自动发现
+（mise/asdf shim 会解析成真实 node；`pi` launcher 会解析成 `bundle/cli.js`），结果缓存
+900 秒；`"refresh": true` 或 `discoveryTtlSeconds` 控制失效。探测结果、缓存策略和错误文案
+见 `docs/reports/cross-machine-host-discovery.md`。
+
+仍建议在下面「必须显式」的两处保留手写值：`piLegionRoot`（两侧安装路径不同）和
+`pathMap`（argv 里出现 checkout 之外的父机绝对路径时）。
+
 ## 3.5 远端 child 的模型来自何处（S5.6 真跑题目）
 
 这一节是整套手册里最容易被忽略、也最容易让人误判成"远端环境坏了"的一块。

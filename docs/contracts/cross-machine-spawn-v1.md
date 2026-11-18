@@ -290,3 +290,102 @@ into the parent TUI, `legion_mail` / nested subtree crossing machines, automatic
 recovery of a dead remote terminal or a deleted remote worktree, automated
 `machine.add` / `machine.rm`, non-git delivery (rsync, scp, tarballs), and
 `host` on the `rpc` / `inprocess` backends.
+
+---
+
+# Addendum v1.1 — hc is the machine list; discovery fills the paths
+
+Status: **landed** · supersedes only what is listed below · D1–D17 otherwise unchanged
+
+## Why
+
+v1 answered "can this launch cross?" but not "where does that machine keep
+things". Every launch therefore required the parent to hand-write `cwd`, `node`,
+`piCli` (and usually `piLegionRoot` / `piExtensions`) for a filesystem it is not
+sitting on — and, worse, to re-declare a machine that `hc` already knew. One
+`hosts.<h>` entry also meant one `cwd`, i.e. one project per machine.
+
+The user's report is the contract text for this addendum: *"这里的意思是只能一个
+工作目录？… 实际我们可能不同项目有不同的路径，然后 pi 这东西，为什么不可以直接
+使用 hc 的能力"*.
+
+## Amendments
+
+- **A1 Admission and configuration are two questions.** Admission (may this
+  launch go to that machine?) comes from the `hc` registry: the host must be a
+  name `machine.list` reports, and it is the same name that travels as `on`. A
+  host the registry does not know is refused BY NAME with the machines this core
+  DOES know and the `hc machine add --name …` line — never as `machine_unknown`
+  from ten layers down, and never by running the child on this machine.
+  Configuration (`cwd`/`node`/`piCli`/`piLegionRoot`/`piExtensions`/`pathMap`)
+  comes from `subagents.crossMachine.hosts.<h>` when written, else from the
+  discovery probe.
+  - `subagents.crossMachine.hosts` is OPTIONAL, and so is each key in it: `{}` is
+    a valid host entry. Admission is enforced for a NEW launch
+    (`admission: "always"`); a resume/read-back of a child that already ran there
+    does not consult the registry (`admission: "never"`), because machine
+    registration is per `HC_SESSION` and the resume gate asks the machine
+    directly with a better message.
+- **A2 One probe fills the holes.** Missing fields are discovered by ONE
+  `machine.exec` on the target (`remoteDiscoveryScript`, `src/runs/remote.ts`)
+  and cached. The probe answers five questions: the REAL `node` binary (never a
+  mise/asdf shim — `node -e process.execPath` is the oracle), the JavaScript
+  entry behind `command -v pi` (never the shell launcher: it is resolved to
+  `.js` and then PROVEN with `<node> <entry> --version`), this package's root
+  (matched by `package.json` name, not by directory), the installed
+  `pi.extensions` packages, and a probe-completion marker so "no answer" is not
+  read as "nothing installed".
+  - **Explicit configuration always wins.** A discovered value only fills a hole;
+    an explicit `piExtensions: []` also wins (it means "add nothing").
+  - A fully explicit pre-v1.1 entry (`cwd`+`node`+`piCli`+`piLegionRoot`) does
+    NOT probe and resolves to the byte-identical target object.
+  - Discovery failure is reported by CAUSE: a missing tool names the field, what
+    the probe found, and the JSON to paste; a transport failure says the probe
+    could not run. `piLegionRoot` is the one best-effort field (its pre-v1.1
+    default is kept and the preflight names it if wrong).
+- **A3 `cwd` is the DEFAULT, not the only directory.** `hosts.<h>.cwd` is what a
+  launch uses when the call does not pass one; a call may pass
+  `subagent({ host, cwd })` (or the explicit `hostCwd`) with an absolute path on
+  that machine. Neither present ⇒ refusal that names both fixes; the remote
+  HOME / the core's cwd is never guessed. A per-call `cwd` is never used as this
+  process's store directory (an absolute `cwd` next to a host is remote-only).
+- **A6 Extensions are re-rooted by package name (v1.2).** An argv `--extension`
+  path that is neither in the checkout nor under `pathMap` is resolved by the
+  npm package that contains it: the probe reports every installed package on the
+  target (`name` + dir) and each declared `pi.extensions` entry by
+  package-relative path, and the parent path is rewritten to
+  `<remote package dir>/<same relative entry>`. Three outcomes, all explicit:
+  same package + same entry ⇒ mapped; package not installed there ⇒ **refused**
+  before launch (naming the package, the parent path and the three fixes:
+  install it, `pathMap`, or stop inheriting); package installed but a different
+  entry layout ⇒ **refused** naming what the package does declare. The pre-v1.2
+  "drop it with a stderr notice" is gone: a child that silently lost its provider
+  starts, prints no models, and hangs. The target's package list is fetched on
+  demand and only when an argv path actually needs it (`needsPackageIndex`), so
+  a fully explicit launch whose only extension is this package's own entry still
+  costs zero extra round trips.
+- **A4 Discovery is cached and self-heals.** Memory + optional disk
+  (`$XDG_CACHE_HOME/pi-legion/host-discovery/<host>.json`), TTL
+  `crossMachine.discoveryTtlSeconds` (default 900 s). `refresh: true` bypasses
+  both. A failed resolution invalidates the entry (install the tool → next
+  launch re-probes), and a preflight refusal of a DISCOVERED `node`/`piCli`/
+  `piLegionRoot` (exit 12/13/14/16) re-probes once and retries — which is how a
+  target that upgraded `pi` (new `install/releases/<v>/…`) heals without a
+  restart. A failed probe is never cached.
+- **A5 Settings switches.** `crossMachine.discover` (default true) and
+  `hosts.<h>.discover` (per host) disable probing; `crossMachine.refresh`
+  forces a fresh probe; `crossMachine.discoveryTtlSeconds` sets the TTL.
+  `crossMachine.enabled: false` still refuses every host.
+
+## Acceptance (v1.1)
+
+- `npm run typecheck`, `npm test`, `npm run test:integration` green.
+- `test/unit/cross-machine-discovery.test.ts` — the probe runs for real (`sh -c`)
+  against a temp pi layout: shim → real node, launcher → bundle entry,
+  legion/provider found; admission wording; probe-failure wording; cache TTL +
+  refresh + never-cache-a-failure; explicit-wins; cwd override.
+- `test/integration/fake-core-host-discovery.test.ts` — fake `hc` core: `{}` host
+  launches end to end, no `hosts` block at all (registry-provided), empty
+  registry, registered-but-tool-less, pre-v1.1 entry with zero probes,
+  per-call cwd + missing-directory refusal, stale-`piCli` self-heal.
+- `docs/reports/cross-machine-host-discovery.md` records the evidence.

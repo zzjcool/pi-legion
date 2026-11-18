@@ -503,38 +503,26 @@ test("D6: an unmappable argv path that is NOT an extension is still refused by n
 	}
 });
 
-test("M3: an inherited-style extension that cannot be mapped is dropped with a notice, not refused", async () => {
-	// The default configuration inherits the HOST's extension install paths, which
-	// are never in the checkout and never in a pathMap. Refusing them made the whole
-	// feature unusable out of the box; dropping them silently would change what the
-	// child loads without saying so. The middle path is a loud drop.
+test("M3/v1.2: an inherited-style extension that cannot be mapped now REFUSES the launch (no silent drop)", async () => {
+	// v1.1 dropped unmappable extensions with a stderr notice. That is how a
+	// remote child lost its provider extension, started anyway, printed "no
+	// models" and hung — the "half-dead child" the operator reported. v1.2 asks
+	// the target for its installed packages (by name) and refuses when the package
+	// is not there, naming the package and the three fixes. No terminal is created.
 	const h = harness(localEnv());
-	const writes: string[] = [];
-	const original = process.stderr.write.bind(process.stderr);
-	process.stderr.write = ((chunk: unknown) => {
-		writes.push(String(chunk));
-		return true;
-	}) as typeof process.stderr.write;
 	try {
 		const args = spawnInput(h.root, {
 			host: "vps",
 			hostTarget: hostTarget({ pathMap: [{ from: thisPackageRoot(), to: REMOTE_LEGION_ROOT }] }),
 		});
 		args.agent = { ...args.agent, extensions: ["/root/.pi/agent/npm/node_modules/pi-lens/extensions/index.ts"] };
-		await h.supervisor.spawnChild(args);
-		const run = h.client.paramsFor("terminal.run")[0];
-		assert.ok(run, "the launch must proceed");
-		const argv = run.argv as string[];
-		assert.ok(
-			!argv.some((arg) => arg.includes("pi-lens")),
-			`the unmappable extension must not appear in the remote argv: ${argv.join(" ")}`,
-		);
-		assert.ok(
-			writes.some((line) => line.includes("not loadable there") && line.includes("pi-lens")),
-			`the drop must be announced: ${writes.join("")}`,
-		);
+		const failure = await h.supervisor.spawnChild(args).then(() => undefined, (error: unknown) => error);
+		assert.ok(failure instanceof SubagentError, `expected a refusal, got ${String(failure)}`);
+		assert.equal(failure.code, ErrorCodes.INVALID_PARAMS);
+		assert.match(failure.message, /pi-lens\/extensions\/index\.ts/);
+		assert.match(failure.message, /pathMap|not installed on that machine/);
+		assert.equal(h.client.paramsFor("terminal.run").length, 0, "no terminal may be created");
 	} finally {
-		process.stderr.write = original;
 		h.cleanup();
 	}
 });

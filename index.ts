@@ -148,7 +148,7 @@ import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
-import { normalizeHost, resolveHostTarget, resolveResumeCwd } from "./src/runs/remote.ts";
+import { normalizeHost, resolveHostTarget, resolveHostTargetAsync, resolveResumeCwd } from "./src/runs/remote.ts";
 import { createRemoteVerifyRunner } from "./src/runs/remote-verify.ts";
 import {
 	assertRemoteResume,
@@ -273,7 +273,13 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(
 		Type.String({
 			description:
-				"Directory the child records live under (`<cwd>/.pi-subagents`), used by launch and by every control action. Defaults to the session cwd. A name miss searches the neighbouring stores too, so this is rarely needed.",
+				"Directory the child records live under (`<cwd>/.pi-subagents`), used by launch and by every control action. Defaults to the session cwd. A name miss searches the neighbouring stores too, so this is rarely needed. With `host`, an ABSOLUTE `cwd` is the remote working directory for this step instead (a path ON that machine).",
+		}),
+	),
+	hostCwd: Type.Optional(
+		Type.String({
+			description:
+				"Remote working directory for THIS step (absolute path ON the `host` machine). Overrides `subagents.crossMachine.hosts.<host>.cwd` for this launch only; the path must exist there. Ignored without `host`.",
 		}),
 	),
 	model: Type.Optional(Type.String()),
@@ -342,7 +348,13 @@ const SubagentParams = Type.Object({
 	cwd: Type.Optional(
 		Type.String({
 			description:
-				"Directory the child records live under (`<cwd>/.pi-subagents`) for launch and every control action. Defaults to the session cwd. A name miss also searches neighbouring stores, so setting this is rarely needed.",
+				"Directory the child records live under (`<cwd>/.pi-subagents`) for launch and every control action. Defaults to the session cwd. A name miss also searches neighbouring stores, so setting this is rarely needed. With `host`, an ABSOLUTE `cwd` is the REMOTE working directory (a path ON that machine), e.g. one host serving several projects: subagent({ host: \"hw-nj\", cwd: \"/root/code/other-project\" }).",
+		}),
+	),
+	hostCwd: Type.Optional(
+		Type.String({
+			description:
+				"Remote working directory for this launch (absolute path ON the `host` machine). Overrides subagents.crossMachine.hosts.<host>.cwd for this call only; the directory must exist there. Ignored without `host`.",
 		}),
 	),
 	worktree: Type.Optional(
@@ -474,7 +486,13 @@ const VexillatioParams = Type.Object({
 	cwd: Type.Optional(
 		Type.String({
 			description:
-				"Directory the child records live under (`<cwd>/.pi-subagents`) for launch and every control action. Defaults to the session cwd. A name miss also searches neighbouring stores, so setting this is rarely needed.",
+				"Directory the child records live under (`<cwd>/.pi-subagents`) for launch and every control action. Defaults to the session cwd. A name miss also searches neighbouring stores, so setting this is rarely needed. With `host`, an ABSOLUTE `cwd` is the remote working directory for this batch.",
+		}),
+	),
+	hostCwd: Type.Optional(
+		Type.String({
+			description:
+				"Remote working directory for this batch (absolute path ON the `host` machine). Overrides subagents.crossMachine.hosts.<host>.cwd for this call only. Ignored without `host`.",
 		}),
 	),
 	model: Type.Optional(Type.String()),
@@ -1463,7 +1481,9 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	// missing or malformed `subagents.crossMachine` entry becomes a refusal
 	// instead of a resume that quietly runs here (contract D1/D17).
 	const savedHost = normalizeHost(saved.host);
-	const hostTarget = savedHost ? resolveHostTarget(savedHost, catalog.settings.crossMachine) : undefined;
+	const hostTarget = savedHost
+		? await resolveHostTargetAsync(savedHost, catalog.settings.crossMachine, { admission: "never" })
+		: undefined;
 	const handle = await orchestrator.launch({ agent, task: input.message, name: saved.name, ...(input.node.team ? { team: input.node.team } : {}), ...(saved.model ? { model: saved.model } : {}), ...(saved.model && saved.modelProvider ? { modelProvider: saved.modelProvider } : {}), ...(saved.phases ? { phases: saved.phases } : {}), ...(savedHost ? { host: savedHost } : {}), ...(hostTarget ? { hostTarget } : {}), worktree: Boolean(saved.worktreePath) });
 	await store.updateChild(parentRun.runId, saved.name, (child) => Object.assign(child, handle.child));
 }
@@ -2464,7 +2484,10 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					ErrorCodes.DISABLED,
 				);
 			}
-			const cwd = params.cwd ?? ctx.cwd;
+			// v1.1: an absolute `cwd` next to `host` is a path ON that machine — it
+			// must never become this process's store dir (a local mkdir under a remote
+			// spelling is how a launch lands in the wrong tree).
+			const cwd = cwdIsRemote(params) ? ctx.cwd : params.cwd ?? ctx.cwd;
 			const store = runStoreFor(cwd);
 			configureSessionErrors({ storeRoot: store.rootDir, tool: "subagent", action });
 			const catalog = loadCatalog(ctx.cwd, cwd, params.agentScope);
@@ -4448,7 +4471,7 @@ async function reviveChild(
 		// recorded host, and the worktree is named so the backend reuses the tree
 		// the child already has instead of creating a second one.
 		const resumeTarget = recordHost !== undefined
-			? resolveHostTarget(recordHost, ctx.settings.crossMachine)
+			? await resolveHostTargetAsync(recordHost, ctx.settings.crossMachine, { admission: "never" })
 			: undefined;
 		// S4/D17: four facts, in order, before touching that machine. Each failure names
 		// its step, and none of them is inferred from a local path: the record's
@@ -4810,9 +4833,46 @@ interface LaunchSession {
  * Launch one step, recording either a launch line or a refusal.
  * Never throws: a bad step degrades to a message so the others still run.
  */
+/**
+ * The per-call REMOTE working directory (contract addendum v1.1).
+ *
+ * Two spellings, one meaning: `hostCwd` always names a directory ON the host
+ * machine; `cwd` does too when a host is named and the value is absolute. The
+ * absolute-only rule is what keeps the old local meaning intact — a RELATIVE
+ * `cwd` (or one without a host) is still the local record directory, so an
+ * existing call is never silently re-pointed at another machine's path.
+ */
+function nonBlankText(value: unknown): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+/** A value that can only be a path on THAT machine (posix, absolute). */
+function absoluteRemotePath(value: unknown): string | undefined {
+	const text = nonBlankText(value);
+	return text !== undefined && path.posix.isAbsolute(text) ? text : undefined;
+}
+
+/** First remote cwd among the given sources, in precedence order. */
+export function firstRemoteCwd(...sources: Array<unknown>): string | undefined {
+	for (const source of sources) {
+		const value = absoluteRemotePath(source);
+		if (value !== undefined) return value;
+	}
+	return undefined;
+}
+
+/** True when `cwd` is a remote path, so it must not become this process's store dir. */
+export function cwdIsRemote(params: { host?: string; cwd?: string; hostCwd?: string }, fallbackHost?: string): boolean {
+	const host = normalizeHost(params.host) ?? normalizeHost(fallbackHost);
+	if (host === undefined) return false;
+	// `hostCwd` is remote by definition; `cwd` only when it is absolute (relative
+	// keeps its long-standing local meaning, see the doc comment above).
+	return absoluteRemotePath(params.cwd) !== undefined || absoluteRemotePath(params.hostCwd) !== undefined;
+}
+
 async function launchStep(
 	session: LaunchSession,
-	step: { agent: string; task: string; name?: string; model?: string; preset?: string; worktree?: boolean; host?: string; verify?: string[] },
+	step: { agent: string; task: string; name?: string; model?: string; preset?: string; worktree?: boolean; host?: string; cwd?: string; hostCwd?: string; verify?: string[] },
 ): Promise<void> {
 	if (session.signal?.aborted) return;
 	const agent = findAgent(session.agents, step.agent);
@@ -4907,7 +4967,20 @@ async function launchStep(
 		// at (remote cwd, remote node/pi). Resolution fails LOUDLY and becomes a
 		// refusal line for this step — the alternative is a launch that runs HERE
 		// while the caller believes it ran elsewhere.
-		const hostTarget = host ? resolveHostTarget(host, session.settings.crossMachine) : undefined;
+		// v1.1: the step's own override wins over the call-level one, and a host whose
+	// settings leave fields empty is filled by the discovery probe.
+	const hostCwdOverride = firstRemoteCwd(
+		step.hostCwd,
+		step.cwd,
+		session.params.hostCwd,
+		session.params.cwd,
+	);
+	const hostTarget = host
+		? await resolveHostTargetAsync(host, session.settings.crossMachine, {
+				admission: "always",
+				...(hostCwdOverride !== undefined ? { cwd: hostCwdOverride } : {}),
+			})
+		: undefined;
 		const handle = await session.orchestrator.launch({
 			agent: launchedAgent,
 			task: step.task,
@@ -5407,7 +5480,10 @@ async function launchUtilityFamily(input: {
 	const results: string[] = [...scopeWarnings];
 	const stillRunning = new Set<string>();
 	const launches = await Promise.all(prepared.map(async (item) => {
-		const cwd = item.step.cwd ? path.resolve(input.cwd, item.step.cwd) : input.cwd;
+		// v1.1: a step that names a host and an absolute cwd is describing a path on
+		// THAT machine; the local store stays on this one.
+		const stepCwdIsRemote = normalizeHost(item.step.host) !== undefined && path.posix.isAbsolute((item.step.cwd ?? "").trim());
+		const cwd = item.step.cwd && !stepCwdIsRemote ? path.resolve(input.cwd, item.step.cwd) : input.cwd;
 		const orchestrator = new Orchestrator({
 			supervisor: input.supervisor,
 			uiProxy: input.uiProxy,
@@ -5446,7 +5522,13 @@ async function launchUtilityFamily(input: {
 			// launch either really goes to that machine or is refused with the
 			// reason — never quietly run on this host.
 			const stepHost = normalizeHost(item.step.host) ?? normalizeHost(input.params.host);
-			const stepTarget = stepHost ? resolveHostTarget(stepHost, catalog.settings.crossMachine) : undefined;
+			const stepCwdOverride = firstRemoteCwd(item.step.hostCwd, item.step.cwd, input.params.hostCwd, input.params.cwd);
+			const stepTarget = stepHost
+				? await resolveHostTargetAsync(stepHost, catalog.settings.crossMachine, {
+						admission: "always",
+						...(stepCwdOverride !== undefined ? { cwd: stepCwdOverride } : {}),
+					})
+				: undefined;
 			const handle = await orchestrator.launch({
 				agent: item.agent,
 				task: item.step.task,
@@ -5795,6 +5877,10 @@ interface PlanStep {
 	worktree?: boolean;
 	/** Per-step target machine; absent = the call-level `host`, then the card. */
 	host?: string;
+	/** Per-step remote working directory (absolute on the step's host). */
+	cwd?: string;
+	/** Per-step remote working directory, explicit spelling. */
+	hostCwd?: string;
 	verify?: string[];
 }
 

@@ -34,10 +34,12 @@ import { delimiter, join } from "node:path";
  * A cross-machine launch needs more than `terminal.*`: the child runs on another
  * machine, so its argv-referenced files have to be mirrored with `file.read`/
  * `file.write` and the remote checkout/probe commands go through
- * `machine.exec`. Those three are allowed; the WRITE-side lifecycle
- * (`machine.add`, `machine.rm`) and the enumeration (`machine.list`) stay
- * excluded — configuring or dropping a machine is an operator action, never
- * something a spawn does as a side effect.
+ * `machine.exec`. `machine.list` is allowed too (addendum v1.1): the `hc`
+ * machine registry is the ADMISSION list for a launch that names a host, so
+ * legion has to be able to read it ("is this a machine this core knows?").
+ * The WRITE-side lifecycle (`machine.add`, `machine.rm`) stays excluded —
+ * registering or dropping a machine is an operator action, never something a
+ * spawn does as a side effect.
  */
 export const HC_METHODS = [
 	"hello",
@@ -49,6 +51,7 @@ export const HC_METHODS = [
 	"terminal.kill",
 	"terminal.rm",
 	"machine.exec",
+	"machine.list",
 	"file.read",
 	"file.write",
 ] as const;
