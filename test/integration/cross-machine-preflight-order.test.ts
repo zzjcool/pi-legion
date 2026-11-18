@@ -45,6 +45,7 @@ import {
 	resetDeliveryPreflightState,
 	type DeliveryPreflightReport,
 } from "../../src/runs/cross-machine-preflight.ts";
+import { notALocalCheckoutMessage } from "../../src/runs/remote-worktree.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
 
@@ -129,10 +130,14 @@ function okReport(): DeliveryPreflightReport {
 /**
  * The preflight's own refusal, as D5 throws it: `INVALID_PARAMS` with
  * `noModelFallback` (a machine fact must not walk the model chain).
+ *
+ * The text is D5's not-a-checkout sentence, taken from the same builder the real
+ * preflight calls — the middle arm (a checkout without `origin`) and this one are
+ * two different answers now, and the fixture must not freeze the old collapse.
  */
 function deliveryFailure(): SubagentError {
 	return new SubagentError(
-		`cross-machine delivery needs one shared remote: this checkout (/tmp/repo) has no origin. Two ways out: 1) add one and retry — git -C /tmp/repo remote add origin <url>; 2) drop the worktree delivery — dispatch a worker instead.`,
+		notALocalCheckoutMessage({ host: HOST, localRepo: "/tmp/agents" }),
 		ErrorCodes.INVALID_PARAMS,
 		{ host: HOST, category: "local-origin", noModelFallback: true },
 	);
@@ -204,6 +209,8 @@ test("D7 order: a failing delivery preflight is reported BEFORE the phases typo,
 			// phases error that used to arrive first.
 			assert.equal(thrown, failure, `expected the preflight's own error, got ${String(thrown)}`);
 			assert.match((thrown as SubagentError).message, /delivery|origin/);
+			assert.match((thrown as SubagentError).message, /needs a git checkout on this machine too/);
+			assert.doesNotMatch((thrown as SubagentError).message, /remote add/);
 			assert.doesNotMatch((thrown as SubagentError).message, /invalid phase machine/);
 			assert.deepEqual(
 				(thrown as SubagentError).details,

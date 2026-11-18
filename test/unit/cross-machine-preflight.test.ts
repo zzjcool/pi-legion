@@ -36,6 +36,12 @@ import {
 	type DeliveryPreflightReport,
 } from "../../src/runs/cross-machine-preflight.ts";
 import { resolveHostTarget, type HcExecResult, type HostTarget } from "../../src/runs/remote.ts";
+import {
+	localCheckoutState,
+	noLocalGitMessage,
+	noLocalOriginMessage,
+	notALocalCheckoutMessage,
+} from "../../src/runs/remote-worktree.ts";
 import { ErrorCodes, SubagentError } from "../../src/shared/types.ts";
 
 // ── fixtures ───────────────────────────────────────────────────────────────
@@ -264,6 +270,98 @@ test("D5 step 2: this checkout has no origin — the D6 sentence with two ways o
 		assert.equal(report.failure?.message, error.message);
 	} finally {
 		local.cleanup();
+	}
+});
+
+test("D5 step 2: the three local states get three answers, and the order stops at step 2", async () => {
+	// The state that produced the bad advice: `/Users/me/agents` is not a repository,
+	// so `git remote add origin` (the no-origin remedy) cannot work there. Step 2 must
+	// ask git TWO questions to tell the two apart, and say a third thing when git
+	// itself cannot be started.
+	const plainRoot = mkdtempSync(path.join(tmpdir(), "cross-machine-preflight-plain-"));
+	const plain = path.join(plainRoot, "agents");
+	mkdirSync(plain, { recursive: true });
+	try {
+		// (a) NOT a checkout at all
+		resetDeliveryPreflightState();
+		const notACheckoutClient = new FakePreflightClient();
+		const notACheckout = await hardFailure(
+			preflightDelivery({ client: notACheckoutClient, target: target(), localRepo: plain }),
+			"local-origin",
+		);
+		assert.equal(notACheckout.message, notALocalCheckoutMessage({ host: HOST, localRepo: plain }));
+		assert.doesNotMatch(notACheckout.message, /remote add/, "`git remote add` cannot work in a non-repository");
+		assert.match(notACheckout.message, /needs a git checkout on this machine too/);
+		// The order: step 2 answered locally, so nothing was asked of that machine.
+		assert.deepEqual(notACheckoutClient.commands(), [], "no `machine.exec` at all");
+		assert.deepEqual(notACheckoutClient.calls, [], "the wire stays empty for a local fact");
+		assert.equal(recorded().failure?.category, "local-origin", "no new category: the local half is `local-origin`");
+		assert.equal(recorded().fetch, "skipped");
+
+		// (b) a checkout WITHOUT origin — the frozen D6 sentence, unchanged
+		resetDeliveryPreflightState();
+		const noOrigin = localRepo();
+		try {
+			const noOriginClient = new FakePreflightClient();
+			const noOriginError = await hardFailure(
+				preflightDelivery({ client: noOriginClient, target: target(), localRepo: noOrigin.repo }),
+				"local-origin",
+			);
+			assert.equal(noOriginError.message, noLocalOriginMessage({ host: HOST, localRepo: noOrigin.repo }));
+			assert.match(noOriginError.message, /needs one shared remote/);
+			assert.match(noOriginError.message, new RegExp(`git -C ${noOrigin.repo} remote add origin <url>`));
+			assert.deepEqual(noOriginClient.commands(), []);
+
+			// (c) git that RUNS for step 1 and is gone by step 2: the missing-program
+			// sentence, not "no origin". The wrapper deletes itself, which is the only
+			// reachable shape of this arm (step 1 already proves `git --version`).
+			resetDeliveryPreflightState();
+			const bin = path.join(plainRoot, "bin");
+			mkdirSync(bin, { recursive: true });
+			const wrapper = path.join(bin, "git");
+			writeFileSync(
+				wrapper,
+				// The wrapper must delete itself with an ABSOLUTE path: PATH holds only this
+				// directory (so git cannot be found anywhere else), which means `rm` is not
+				// resolvable by name.
+				"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  /bin/rm -f \"$0\"\n  echo 'git version 2.43.0'\n  exit 0\nfi\nexit 1\n",
+				{ mode: 0o755 },
+			);
+			chmodSync(wrapper, 0o755);
+			const previousPath = process.env.PATH;
+			try {
+				process.env.PATH = bin;
+				const noGitClient = new FakePreflightClient();
+				const noGit = await hardFailure(
+					preflightDelivery({ client: noGitClient, target: target(), localRepo: noOrigin.repo }),
+					"local-origin",
+				);
+				const state = localCheckoutState(noOrigin.repo);
+				assert.equal(state.kind, "no-git");
+				const noGitState = state as Extract<typeof state, { kind: "no-git" }>;
+				assert.equal(
+					noGit.message,
+					noLocalGitMessage({ host: HOST, localRepo: noOrigin.repo, code: noGitState.code, detail: noGitState.detail }),
+				);
+				assert.match(noGit.message, /^this machine has no usable git \(git --version exited no exit code: /);
+				assert.doesNotMatch(noGit.message, /has no origin/);
+				assert.deepEqual(noGitClient.calls, []);
+
+				// The three sentences are three, not three spellings of one.
+				assert.equal(
+					new Set([notACheckout.message, noOriginError.message, noGit.message]).size,
+					3,
+					"not-a-checkout / no-origin / no-git must not collapse",
+				);
+			} finally {
+				if (previousPath === undefined) delete process.env.PATH;
+				else process.env.PATH = previousPath;
+			}
+		} finally {
+			noOrigin.cleanup();
+		}
+	} finally {
+		rmSync(plainRoot, { recursive: true, force: true });
 	}
 });
 
