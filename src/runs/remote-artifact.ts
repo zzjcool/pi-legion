@@ -49,6 +49,8 @@ export interface RemoteReadback {
 	host: string;
 	/** Local copy the collector parses (under `<runDir>/remote/`). */
 	localPath: string;
+	/** The file's path ON THAT MACHINE — the one fact a failed read cannot infer. */
+	remotePath: string;
 	/** Lines the file has ON THAT MACHINE. */
 	lines: number;
 	/** Lines actually received. */
@@ -63,6 +65,8 @@ export interface RemoteReadbackFailure {
 	ok: false;
 	host: string;
 	reason: string;
+	/** The file this machine asked for, on THAT machine (for the retrieve command). */
+	remotePath?: string;
 	/** `started` never appears here: a failure is one of these four. */
 	fate: RemoteReadbackFate;
 	/** 1..5 short lines ("terminal finished", "exit 1", "dir holds: system-prompt.md"). */
@@ -209,8 +213,11 @@ export function createRemoteSessionReadback(opts: {
 				nextStep: `check that \`hc\` is on PATH (or HC_BIN) and that this machine's core is running — a child on '${request.host}' cannot be asked about from here`,
 			});
 		}
+		// The transcript's path on THAT machine, computed once so a success and a
+		// failure name the SAME file (a failure that cannot say which file it tried is
+		// the `not_found`-with-no-address bug this contract exists to remove).
+		const remotePath = remoteSessionPathFor(target, request);
 		try {
-			const remotePath = remoteSessionPathFor(target, request);
 			const read = await readRemoteText({
 				client,
 				target,
@@ -221,11 +228,17 @@ export function createRemoteSessionReadback(opts: {
 			// The text is written as-is: a marker line inside a JSONL transcript would be
 			// one more unparsable line, and the truncation fact belongs to the RESULT
 			// (which the render reads), not to the file the collector parses.
-			fs.writeFileSync(request.localPath, read.text, { mode: 0o600 });
+			// xm-dispatch D3.3: a ZERO-line read never truncates a mirror that already has
+			// bytes. The old unconditional write turned one transient `lines: 0` answer
+			// into an empty file that the collector then read as "the child said nothing".
+			if (!(read.lines === 0 && existingBytes(request.localPath) > 0)) {
+				fs.writeFileSync(request.localPath, read.text, { mode: 0o600 });
+			}
 			return {
 				ok: true,
 				host: request.host,
 				localPath: request.localPath,
+				remotePath,
 				lines: read.lines,
 				returned: read.returned,
 				truncated: read.truncated,
@@ -265,7 +278,7 @@ export function createRemoteSessionReadback(opts: {
 				});
 			}
 			const classified = classifyReadbackFailure({ target, request, fate, configuredDir });
-			return { ok: false, host: request.host, reason: detail, ...classified };
+			return { ok: false, host: request.host, reason: detail, remotePath, ...classified };
 		} finally {
 			try {
 				client.close();
@@ -365,9 +378,26 @@ function classifyReadbackFailure(opts: {
 function unreachableFailure(
 	host: string,
 	reason: string,
-	parts: { evidence: string[]; nextStep: string },
+	parts: { evidence: string[]; nextStep: string; remotePath?: string },
 ): RemoteReadbackFailure {
-	return { ok: false, host, reason, fate: "unreachable", evidence: parts.evidence, nextStep: parts.nextStep };
+	return {
+		ok: false,
+		host,
+		reason,
+		...(parts.remotePath !== undefined ? { remotePath: parts.remotePath } : {}),
+		fate: "unreachable",
+		evidence: parts.evidence,
+		nextStep: parts.nextStep,
+	};
+}
+
+/** Bytes already in a local file (`0` when it is absent or unreadable). */
+function existingBytes(file: string): number {
+	try {
+		return fs.statSync(file).size;
+	} catch {
+		return 0;
+	}
 }
 
 /**

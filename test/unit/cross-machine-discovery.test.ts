@@ -27,7 +27,9 @@ import {
 	clearHostDiscoveryCache,
 	localPackageForFile,
 	mapRemoteArgv,
+	mapRemoteArgvAllowingSkips,
 	needsPackageIndex,
+	planSkippedExtensions,
 	resolvePackagePathOnHost,
 	describeDiscovery,
 	discoveredFields,
@@ -442,6 +444,89 @@ test("v1.1 probe failure: a workable legacy entry (cwd + one program) survives a
 	assert.match((bare as SubagentError).message, /host discovery could not run/);
 });
 
+// ── xm-dispatch D2: skipped inherited extensions ──────────────────────────
+
+test("xm-dispatch D2: a missing inherited extension is SKIPPED, and the whole launch yields ONE aggregated warning", (t) => {
+	const sop = parentPackage(t, "pi-sop", { entry: "src/index.ts" });
+	const sysmon = parentPackage(t, "pi-sysmon", { entry: "src/index.ts" });
+	const index = packageIndex("/srv/pi", [{ name: "pi-any-endpoint", entry: "extensions/index.ts" }]);
+	const mapping = mapRemoteArgvAllowingSkips(
+		["--no-extensions", "-e", sop.entry, "-e", sysmon.entry, "-e", sop.entry, "--model", "x"],
+		{
+			host: "hw-nj",
+			remoteCwd: "/srv/app",
+			remoteDir: "/srv/.mirror/r/n",
+			localCwd: "/local/app",
+			pathMap: [],
+			packages: index,
+		},
+	);
+	// The PAIR goes: dropping `-e` alone would hand the remote pi the path as its task.
+	assert.deepEqual(mapping.args, ["--no-extensions", "--model", "x"]);
+	assert.deepEqual(mapping.skipped.map((entry) => entry.reason), ["not-installed", "not-installed", "not-installed"]);
+	const plan = planSkippedExtensions({ host: "hw-nj", agentName: "scout", skipped: mapping.skipped });
+	assert.equal(plan.refused, undefined);
+	assert.equal(plan.warnings.length, 1, "one warning per launch, never one per package");
+	const warning = plan.warnings[0] as string;
+	assert.match(warning, /host 'hw-nj': skipped 2 inherited extensions/);
+	assert.match(warning, /pi-sop, pi-sysmon/);
+	// The durable fix travels with the warning, ready to paste.
+	assert.match(warning, /"agentOverrides":\{"scout":\{"excludeExtensions":\["pi-sop","pi-sysmon"\]\}\}/);
+});
+
+test("xm-dispatch D2: a card that declares the extension REQUIRED gets one aggregated refusal instead of a skip", (t) => {
+	const sop = parentPackage(t, "pi-sop", { entry: "src/index.ts" });
+	const sysmon = parentPackage(t, "pi-sysmon", { entry: "src/index.ts" });
+	const index = packageIndex("/srv/pi", []);
+	const mapping = mapRemoteArgvAllowingSkips(["-e", sop.entry, "-e", sysmon.entry], {
+		host: "hw-nj",
+		remoteCwd: "/srv/app",
+		remoteDir: "/srv/.mirror/r/n",
+		localCwd: "/local/app",
+		pathMap: [],
+		packages: index,
+	});
+	const plan = planSkippedExtensions({ host: "hw-nj", agentName: "worker", skipped: mapping.skipped, required: ["pi-sop", "pi-sysmon"] });
+	assert.ok(plan.refused instanceof SubagentError);
+	assert.equal(plan.warnings.length, 0, "a refusal is not also a warning");
+	const message = (plan.refused as SubagentError).message;
+	assert.match(message, /agent 'worker' declares requiredExtensions that machine cannot load/);
+	assert.match(message, /pi-sop \(not installed there\)/);
+	assert.match(message, /pi-sysmon \(not installed there\)/);
+	// A required name the target CAN load is not a refusal: only the unmet ones are.
+	const partial = planSkippedExtensions({ host: "hw-nj", agentName: "worker", skipped: mapping.skipped, required: ["pi-lens"] });
+	assert.equal(partial.refused, undefined);
+	assert.equal(partial.warnings.length, 1);
+});
+
+test("xm-dispatch D2: the skip is scoped to `-e/--extension` — any other unmappable path still refuses", (t) => {
+	const sop = parentPackage(t, "pi-sop", { entry: "src/index.ts" });
+	const index = packageIndex("/srv/pi", []);
+	const outcome = thrownSync(() => mapRemoteArgvAllowingSkips(["--skill", "/opt/loose/thing.md", "-e", sop.entry], {
+		host: "hw-nj",
+		remoteCwd: "/srv/app",
+		remoteDir: "/srv/.mirror/r/n",
+		localCwd: "/local/app",
+		pathMap: [],
+		packages: index,
+	}));
+	assert.ok(outcome instanceof SubagentError);
+	assert.match((outcome as SubagentError).message, /cannot be mapped to that machine/);
+	// And the STRICT entry point keeps D6 exactly as it was: the first unmappable
+	// extension is refused, so nothing that still uses `mapRemoteArgv` degrades.
+	const strict = thrownSync(() => mapRemoteArgv(["-e", sop.entry], {
+		host: "hw-nj",
+		remoteCwd: "/srv/app",
+		remoteDir: "/srv/.mirror/r/n",
+		localCwd: "/local/app",
+		pathMap: [],
+		packages: index,
+	}));
+	assert.ok(strict instanceof SubagentError);
+	assert.match((strict as SubagentError).message, /not installed on that machine/);
+});
+
+
 // ── 2b. extensions by package name (v1.2) ──────────────────────────────────
 
 /**
@@ -542,6 +627,70 @@ test("v1.2 extensions: the package IS there but the entry differs — refuse, li
 	assert.match((refusal as SubagentError).message, /package 'pi-any-endpoint' IS installed there at \/srv\/pi\/npm\/node_modules\/pi-any-endpoint/);
 	assert.match((refusal as SubagentError).message, /does not expose '\.\/extensions\/index\.ts'/);
 	assert.match((refusal as SubagentError).message, /declared: \.\/dist\/index\.js -> \/srv\/pi\/npm\/node_modules\/pi-any-endpoint\/dist\/index\.js/);
+});
+
+test("xm-dispatch D1: a package that declares a DIRECTORY covers the entries inside it (pi-autoresearch@1.9.0 layout)", (t) => {
+	// The real failure: `pi.extensions: ["./extensions"]` on both machines, the file
+	// `extensions/pi-autoresearch/index.ts` present on both, and the launch refused
+	// because the remote manifest never spelled that file out.
+	const root = mkdtempSync(path.join(tmpdir(), "legion-parent-pkg-"));
+	const dir = path.join(root, "node_modules", "pi-autoresearch");
+	const entry = path.join(dir, "extensions", "pi-autoresearch", "index.ts");
+	mkdirSync(path.dirname(entry), { recursive: true });
+	writeFileSync(entry, "export const x = 1;\n");
+	writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "pi-autoresearch", pi: { extensions: ["./extensions"] } }));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	const index = packageIndex("/srv/pi", [{ name: "pi-autoresearch", entry: "extensions" }]);
+	assert.deepEqual(resolvePackagePathOnHost(entry, index), {
+		ok: true,
+		path: "/srv/pi/npm/node_modules/pi-autoresearch/extensions/pi-autoresearch/index.ts",
+		packageName: "pi-autoresearch",
+		relative: "extensions/pi-autoresearch/index.ts",
+	});
+	assert.deepEqual(
+		mapRemoteArgv(["--no-extensions", "-e", entry], {
+			host: "hw-nj",
+			remoteCwd: "/srv/app",
+			remoteDir: "/srv/.mirror/r/n",
+			localCwd: "/local/app",
+			pathMap: [],
+			packages: index,
+		}),
+		["--no-extensions", "-e", "/srv/pi/npm/node_modules/pi-autoresearch/extensions/pi-autoresearch/index.ts"],
+	);
+});
+
+test("xm-dispatch D1: a directory declaration is matched on the `/` boundary, never as a bare string prefix", (t) => {
+	const parent = parentPackage(t, "pi-sibling", { entry: "extensions/a/index.ts" });
+	// Declared `extensions` must not cover a sibling directory whose name merely
+	// STARTS with it — `extensions-other/a/index.ts` is not under `extensions/`.
+	const index = packageIndex("/srv/pi", [{ name: "pi-sibling", entry: "extensions" }]);
+	const resolution = resolvePackagePathOnHost(
+		path.join(parent.dir, "extensions-other", "a", "index.ts"),
+		index,
+	);
+	assert.equal(resolution.ok, false);
+	assert.equal(resolution.ok === false ? resolution.reason : "", "entry-missing");
+});
+
+test("xm-dispatch D1: a FILE declaration still refuses an entry it does not name (the only failing case)", (t) => {
+	const parent = parentPackage(t, "pi-autoresearch", { entry: "extensions/pi-autoresearch/index.ts" });
+	// The target holds the package at a DIFFERENT layout: a file declaration cannot
+	// be widened by the directory rule, so this must stay `entry-missing`.
+	const index = packageIndex("/srv/pi", [{ name: "pi-autoresearch", entry: "dist/index.js" }]);
+	const resolution = resolvePackagePathOnHost(parent.entry, index);
+	assert.equal(resolution.ok, false);
+	assert.equal(resolution.ok === false ? resolution.reason : "", "entry-missing");
+	const refusal = thrownSync(() => mapRemoteArgv(["-e", parent.entry], {
+		host: "hw-nj",
+		remoteCwd: "/srv/app",
+		remoteDir: "/srv/.mirror/r/n",
+		localCwd: "/local/app",
+		pathMap: [],
+		packages: index,
+	}));
+	assert.ok(refusal instanceof SubagentError);
+	assert.match((refusal as SubagentError).message, /does not expose/);
 });
 
 test("v1.2 extensions: the probe index is only fetched when an argv path NEEDS it", () => {

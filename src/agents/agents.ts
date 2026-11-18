@@ -749,6 +749,8 @@ const AGENT_FRONTMATTER_FIELDS: ReadonlySet<string> = new Set([
 	// prompt / context
 	"systemPromptMode", "inheritProjectContext", "inheritSkills", "inheritExtensions",
 	"excludeExtensions",
+	// xm-dispatch D2: an inherited extension this card cannot run without.
+	"requiredExtensions",
 	"phases",
 	"skillPath", "skills", "defaultReads",
 	// tools
@@ -885,6 +887,7 @@ function applyCapabilityFields(
 	setIf(config, "skillPath", list(fm.skillPath));
 	setIf(config, "extensions", list(fm.extensions));
 	if (list(fm.excludeExtensions)) config.excludeExtensions = list(fm.excludeExtensions);
+	if (list(fm.requiredExtensions)) config.requiredExtensions = list(fm.requiredExtensions);
 	setIf(config, "subagentOnlyExtensions", list(fm.subagentOnlyExtensions));
 	setIf(config, "alias", list(fm.alias) ?? list(fm.aliases));
 	setIf(config, "output", str(fm.output));

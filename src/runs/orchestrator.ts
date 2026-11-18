@@ -54,6 +54,7 @@ import {
 	type AgentConfig,
 	type ChildRecord,
 	DEFAULTS,
+	DEFAULT_CROSS_MACHINE_ALLOW_ROLES,
 	ErrorCodes,
 	unknownChildError,
 	type Execution,
@@ -97,6 +98,7 @@ import { provisionWorktree } from "./provision.ts";
 import type { RemoteVerifyRunner } from "./remote-verify.ts";
 import {
 	remoteMirrorPathFor,
+	type RemoteReadbackFailure,
 	type RemoteReadbackResult,
 	type RemoteSessionRequest,
 } from "./remote-artifact.ts";
@@ -368,6 +370,8 @@ export interface CollectResult {
 		/** The core byte-capped the window we asked for (silent, no flag). */
 		byteCapped?: boolean;
 		localPath?: string;
+		/** The transcript's path ON THAT MACHINE (so a failure can be acted on). */
+		remotePath?: string;
 		/** Set when the read-back failed outright; the collect then has no text. */
 		reason?: string;
 		/**
@@ -412,6 +416,17 @@ export const COLLECT_GRACE_EXTENSIONS = 2;
 export const COLLECT_DEADLINE_REASON = "collect deadline (per collect attempt) exceeded; child still alive";
 /** Shown when a live child's session ends on an OpenAI/GPT connection blip. */
 export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC child still alive";
+/**
+ * Shown when a cross-machine transcript could not be read (xm-dispatch D3.3).
+ *
+ * Deliberately NOT `no assistant message for the last prompt`: that sentence claims
+ * the child never replied. When the read-back failed the truth is narrower — this
+ * machine could not read the child's words — and the two must never be confused,
+ * because only one of them justifies retiring a working child.
+ */
+export function transcriptNotRetrievedReason(host: string, detail: string): string {
+	return `transcript not retrieved from host '${host}' (${detail}): the child's work cannot be graded from here`;
+}
 /**
  * #316 D2: the text sent to a child whose last turn produced an empty
  * generation. Addressed to the still-live child, which already holds the task
@@ -700,13 +715,79 @@ export class Orchestrator {
 	 */
 	private sessionFileOf(child: ChildRecord): string {
 		const remote = this.remoteSessions.get(child.name);
-		if (remote === undefined) return child.sessionFile;
+		if (remote === undefined) {
+			// No read-back in THIS process (a fresh process, or `cachedCollect` which
+			// deliberately drops the seam). A remote child still has no local transcript
+			// of its own — the placeholder this machine pre-created is empty forever — so
+			// the only local bytes are a mirror a PREVIOUS collect wrote. Preferring it
+			// over the placeholder is what makes a mirrored transcript readable after a
+			// restart (xm-dispatch D3.2); a local child never has a `remote/` directory,
+			// so its answer is unchanged byte for byte.
+			if (normalizeHost(child.host) !== undefined) {
+				const mirror = remoteMirrorPathFor(this.runDir, child.name);
+				if (fs.existsSync(mirror)) return mirror;
+			}
+			return child.sessionFile;
+		}
 		// A FAILED read-back must not fall back to the record's path: that file is the
 		// empty placeholder this machine pre-created, so reading it would present
 		// "no text" as the child's answer right next to "read-back failed". Point at
 		// the mirror that was never written instead — the parse yields nothing, and the
 		// render says why.
 		return remote.ok ? remote.localPath : remoteMirrorPathFor(this.runDir, child.name);
+	}
+
+	/** The read-back request for one child; the launch and every refresh share it. */
+	private remoteRequestFor(child: ChildRecord): RemoteSessionRequest {
+		return {
+			host: child.host as string,
+			name: child.name,
+			localPath: remoteMirrorPathFor(this.runDir, child.name),
+			...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+			// The address the core really holds: the core may have shortened the name
+			// it was asked for, and asking about a name that never existed would
+			// report "the core does not know it" as a verdict.
+			...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
+		};
+	}
+
+	/**
+	 * Re-read a remote transcript (xm-dispatch D3.1).
+	 *
+	 * The launch-time read is a SNAPSHOT: a cross-machine child writes its words on
+	 * the other machine over the whole turn, so a mirror fetched at launch+ε holds
+	 * the header and the prompt and nothing else. Deriving a verdict from it read a
+	 * finished child as `aborted (no assistant message for the last prompt)` while
+	 * its 11-line transcript, its report and its files were all there — the single
+	 * worst bug of the 6.2.0 real run.
+	 *
+	 * So every point that may now be reading a settled transcript refreshes first.
+	 * A refresh FAILURE is not fatal: the previous mirror stays, and the failure
+	 * itself is recorded (a verdict is never invented from silence).
+	 */
+	/**
+	 * Is there a cross-machine transcript to (re-)fetch for this child?
+	 *
+	 * Asked BEFORE the `await` on purpose: `collect()` must reach the supervisor
+	 * wait without yielding the microtask queue for a LOCAL child (a caller may
+	 * `collect()` and act on the supervisor's first synchronous call). Only a remote
+	 * child pays the hop, which it has to pay anyway.
+	 */
+	private canRefreshRemote(child: ChildRecord): boolean {
+		return this.remoteReadback !== undefined && normalizeHost(child.host) !== undefined;
+	}
+
+	private async refreshRemoteSession(child: ChildRecord): Promise<void> {
+		const readback = this.remoteReadback;
+		if (readback === undefined) return;
+		if (normalizeHost(child.host) === undefined) return;
+		this.remoteSessions.set(child.name, await readback(this.remoteRequestFor(child)));
+	}
+
+	/** The failed read-back for this child, when its words never arrived here. */
+	private transcriptUnavailable(child: ChildRecord): RemoteReadbackFailure | undefined {
+		const remote = this.remoteSessions.get(child.name);
+		return remote !== undefined && !remote.ok ? remote : undefined;
 	}
 
 	/** `CollectResult.remoteReadback`, or nothing when this child is local. */
@@ -723,6 +804,7 @@ export class Orchestrator {
 				truncated: false,
 				reason: remote.reason,
 				fate: remote.fate,
+				...(remote.remotePath ? { remotePath: remote.remotePath } : {}),
 				evidence: remote.evidence,
 				nextStep: remote.nextStep,
 				...(remote.screenTail && remote.screenTail.length > 0 ? { screenTail: remote.screenTail } : {}),
@@ -735,6 +817,7 @@ export class Orchestrator {
 			truncated: remote.truncated,
 			byteCapped: remote.byteCapped,
 			localPath: remote.localPath,
+			remotePath: remote.remotePath,
 		};
 	}
 
@@ -1368,6 +1451,27 @@ export class Orchestrator {
 					ErrorCodes.INVALID_PARAMS,
 				);
 			}
+			// xm-dispatch D4: only a DELIVERY-UNIT role crosses machines, and that is a
+			// design rule, not a shortcut: a centurion owns the tree, the team and the
+			// collect on the machine it works on, so its scouts and workers belong to a
+			// team created THERE. A scout or worker launched from here would put one
+			// agent's turn on a machine whose team, ledger and deliverable the parent
+			// never sees — the shape the real run produced (a remote scout whose 11-line
+			// transcript and report were judged from an empty local placeholder).
+			//
+			// A RESUME is not a dispatch (`previous` is the child being reconnected), so
+			// it is deliberately outside this rule: an already-running cross-machine child
+			// must stay controllable whatever a later settings edit says.
+			if (previous === undefined) {
+				const allowed = hostTarget.allowRoles ?? [...DEFAULT_CROSS_MACHINE_ALLOW_ROLES];
+				if (!allowed.includes(input.agent.name)) {
+					throw new SubagentError(
+						`host '${host}' cannot be dispatched to agent '${input.agent.name}': cross-machine launch is for a DELIVERY UNIT, and only ${allowed.map((role) => `'${role}'`).join(", ")} may cross. Dispatch a centurion to that machine and let IT create its ${input.agent.name} team there. To allow it anyway: "subagents": { "crossMachine": { "allowRoles": [${[...new Set([...allowed, input.agent.name])].map((role) => `"${role}"`).join(", ")}] } }`,
+						ErrorCodes.INVALID_PARAMS,
+						{ host, agent: input.agent.name, allowRoles: allowed },
+					);
+				}
+			}
 		}
 		// ── Cross-machine delivery preflight (contract `cross-machine-demo-ux` D7) ──
 		//
@@ -1810,6 +1914,10 @@ export class Orchestrator {
 				// B5: an in-process spawn's non-fatal model-resolution notice, one hop
 				// closer to the caller so `launchStep` can render it. Never persisted.
 				...(result.warning ? { warning: result.warning } : {}),
+				// xm-dispatch D2: the extensions this launch skipped (aggregated by the
+				// backend). Same reasoning as `warning`, and never persisted: it describes
+				// THIS spawn against THIS target's package set.
+				...(result.warnings ? { warnings: result.warnings } : {}),
 			};
 		} catch (error) {
 			this.admitting.delete(name);
@@ -2885,11 +2993,15 @@ export class Orchestrator {
 			// the outcome would be derived from a file nobody ever wrote.
 			child = this.requireChild(name);
 		}
-		// S4/D15: a child that ran elsewhere writes its transcript THERE. Fetch it once
-		// into `<runDir>/remote/<name>.jsonl` (never `sessions/`: a mirror must not be
+		// S4/D15: a child that ran elsewhere writes its transcript THERE. Fetch it into
+		// `<runDir>/remote/<name>.jsonl` (never `sessions/`: a mirror must not be
 		// mistaken for a local transcript) and let every parse below read the mirror.
 		// A failed read-back is NOT fatal: the collect continues with no text, and the
 		// render says why (an empty answer with no explanation is the M5 bug).
+		// xm-dispatch D3.1: this FIRST fetch is only the starting snapshot — the mirror
+		// is re-fetched below once the wait settles, because a cross-machine child is
+		// still writing when this line runs.
+		if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
 		if (normalizeHost(child.host) !== undefined && this.remoteReadback === undefined) {
 			// A context without a read-back seam cannot read a transcript that lives on
 			// another machine. Saying so is the whole point (review M5): the alternative
@@ -2899,19 +3011,6 @@ export class Orchestrator {
 				`child '${child.name}' ran on host '${child.host}': this context has no remote read-back wired, so its transcript cannot be read here (the transcript is on that machine). Use \`status\` for liveness.`,
 				ErrorCodes.INVALID_PARAMS,
 			);
-		}
-		if (this.remoteReadback !== undefined && normalizeHost(child.host) !== undefined) {
-			const request: RemoteSessionRequest = {
-				host: child.host as string,
-				name: child.name,
-				localPath: remoteMirrorPathFor(this.runDir, child.name),
-				...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
-				// The address the core really holds: the core may have shortened the name
-				// it was asked for, and asking about a name that never existed would
-				// report "the core does not know it" as a verdict.
-				...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
-			};
-			this.remoteSessions.set(child.name, await this.remoteReadback(request));
 		}
 		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(this.sessionFileOf(child)));
 		if (opts.signal?.aborted) return abortedSnapshot();
@@ -2934,6 +3033,10 @@ export class Orchestrator {
 			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
+		// xm-dispatch D3.1: the verdict about to be derived must describe the transcript
+		// as it is NOW. Everything above only ever read the launch-time snapshot, which
+		// is how a finished 11-line transcript was judged from its first 5 lines.
+		if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
 		let parsed = parseSessionFile(this.sessionFileOf(child));
 		// #232: no settle-quiet wait here.
 		//
@@ -3027,6 +3130,7 @@ export class Orchestrator {
 				const held = await this.waitOutTransientConnection(child, deadline, signal);
 				if (held === "aborted" || signal?.aborted) return { kind: "aborted" };
 				if (held === "blocked") return { kind: "blocked" };
+				if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
 				parsed = parseSessionFile(this.sessionFileOf(child));
 				execution = deriveOutcome(parsed);
 			}
@@ -3042,6 +3146,24 @@ export class Orchestrator {
 			execution = { ...execution, status: "running", reason: COLLECT_DEADLINE_REASON };
 		} else if (wait === "gone" && parsed.turns.length === 0) {
 			execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
+		}
+		// xm-dispatch D3.3: a transcript that never arrived is NOT a child that never
+		// spoke. Judging the empty mirror as `aborted (no assistant message for the
+		// last prompt)` claimed a finished worker had produced nothing — and, worse,
+		// `shouldRecycleAfterCollect("aborted")` then retired a child that was working.
+		// `unknown` is the honest answer: this machine cannot read the words, so it
+		// cannot grade the work. Only an `aborted` is rewritten — a `running` child is
+		// already saying the truthful thing, and a success (a mirror from an earlier
+		// collect) outranks a read this attempt could not repeat.
+		const unavailable = this.transcriptUnavailable(child);
+		if (unavailable !== undefined && execution.status === "aborted") {
+			execution = {
+				status: "unknown",
+				reason: transcriptNotRetrievedReason(unavailable.host, unavailable.reason),
+				turns: execution.turns,
+				toolErrors: execution.toolErrors,
+				...(child.model ? { model: child.model } : {}),
+			};
 		}
 		// A parent shutdown can resolve the in-flight wait by killing the child.
 		// That is not the child settling a turn with no assistant reply.
@@ -3131,6 +3253,9 @@ export class Orchestrator {
 		// `aborted`, a parent shutdown is attributed, and a still-running turn keeps
 		// its `running` snapshot. Only the note about the spent budget is added
 		// later, at the single terminal exit (`finishCollect`).
+		// xm-dispatch D3.1: a retried turn on another machine wrote its words THERE, so
+		// the retry's own verdict needs the retry's own read-back.
+		if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
 		const classified = await this.classifyOutcome(child, parseSessionFile(this.sessionFileOf(child)), settled, deadline, signal);
 		if (classified.kind !== "outcome") return { kind: classified.kind };
 		return { kind: "retried", parsed: classified.parsed, execution: classified.execution };
@@ -3548,6 +3673,21 @@ export class Orchestrator {
 	 * on its virtual clock.
 	 */
 	private async collectArtifactGrowing(child: ChildRecord, signal?: AbortSignal): Promise<boolean> {
+		if (normalizeHost(child.host) !== undefined && this.remoteReadback !== undefined) {
+			// A remote child's transcript grows on ITS machine. The local placeholder never
+			// moves, so the size probe below answered "no growth" on the first iteration
+			// and the grace loop broke immediately — the second half of xm-dispatch D3.1
+			// ("a running child must show what it has already written"). Growth is the
+			// remote line count, re-fetched on each poll.
+			const before = this.remoteLineCount(child);
+			for (let waited = 0; waited < POLL_INTERVAL_MS; waited += ARTIFACT_GROWTH_POLL_MS) {
+				if (await this.sleepOrAbort(Math.min(ARTIFACT_GROWTH_POLL_MS, POLL_INTERVAL_MS - waited), signal)) return false;
+				if (signal?.aborted) return false;
+				if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
+				if (this.remoteLineCount(child) > before) return true;
+			}
+			return false;
+		}
 		const before = artifactSize(child.sessionFile);
 		if (before <= 0 || signal?.aborted) return false;
 		for (let waited = 0; waited < POLL_INTERVAL_MS; waited += ARTIFACT_GROWTH_POLL_MS) {
@@ -3555,6 +3695,12 @@ export class Orchestrator {
 			if (artifactSize(child.sessionFile) > before) return true;
 		}
 		return false;
+	}
+
+	/** Lines the last read-back saw on that machine (`0` before any read succeeded). */
+	private remoteLineCount(child: ChildRecord): number {
+		const remote = this.remoteSessions.get(child.name);
+		return remote !== undefined && remote.ok ? remote.lines : 0;
 	}
 
 	private async sleepOrAbort(ms: number, signal?: AbortSignal): Promise<boolean> {

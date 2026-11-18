@@ -32,6 +32,7 @@ export const OVERRIDE_FIELDS = [
 	"inheritSkills",
 	"inheritExtensions",
 	"excludeExtensions",
+	"requiredExtensions",
 	"defaultProgress",
 	"async",
 	"completionGuard",
