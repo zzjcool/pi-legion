@@ -28,6 +28,8 @@ import {
 import { createSummaryCommand } from "./summary.ts";
 import { createTimingCommand } from "./timing.ts";
 import { getAgentDir } from "../agents/paths.ts";
+import { loadSubagentSettings } from "../agents/settings.ts";
+import type { CrossMachineSettings } from "../shared/types.ts";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -575,6 +577,26 @@ export async function confirmAndStopNode(ui: ExtensionUIContext, deps: Pick<Legi
 }
 
 
+/**
+ * `subagents.crossMachine` for the doctor's Cross-machine section (D8).
+ *
+ * Read from the same two files {@link runLegionDoctor} reads when the value is not
+ * injected (`loadSubagentSettings`: user then project, project over user — the merge
+ * is that function's job, not re-done here). A failed/absent read is `undefined`,
+ * which the section renders as `enabled: unset`: doctor's whole point is to report
+ * the state, so an unreadable settings file must not take the report down with it.
+ */
+function loadCrossMachineSettings(cwd: string): CrossMachineSettings | undefined {
+	try {
+		return loadSubagentSettings({
+			userSettingsPath: path.join(getAgentDir(), "settings.json"),
+			projectSettingsPath: path.join(cwd, ".pi", "settings.json"),
+		}).crossMachine;
+	} catch {
+		return undefined;
+	}
+}
+
 function buildDoctorReport(
 	deps: LegionCommandDeps,
 	ctxCwd: string,
@@ -625,6 +647,12 @@ function buildDoctorReport(
 		cwd: ctxCwd,
 		storeRoot: path.join(ctxCwd, ".pi-subagents"),
 		expectedModels: expectedModelsFromSettings(settings),
+		// D8: the Cross-machine section reads the SAME settings doctor would load
+		// itself when it is not injected (`loadSubagentSettings`, project over user).
+		// Passing it here saves the second read and keeps one source of truth; a
+		// failed read is left to `undefined` = `enabled: unset`, exactly what the
+		// section prints when nobody configured a host.
+		crossMachine: loadCrossMachineSettings(ctxCwd),
 		runtime,
 		sections,
 	});

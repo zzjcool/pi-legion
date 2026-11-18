@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { BUILTIN_AGENTS_DIR, loadAgentsFromDir } from "../../src/agents/agents.ts";
+import { BUILTIN_AGENTS_DIR, loadAgentsFromDir, parsePhaseMachine } from "../../src/agents/agents.ts";
 import {
 	DOCTOR_SECTIONS,
 	HYGIENE_SWEEP_STALE_DAYS,
@@ -18,6 +18,11 @@ import { clearSpawnFailures, recordSpawnFailure } from "../../src/extension/spaw
 import { HYGIENE_DEFAULTS, HYGIENE_LAST_FILE } from "../../src/runs/hygiene.ts";
 import { BUILTIN_CODEMODE, buildPiArgs, childGuardExtensionPath } from "../../src/runs/args.ts";
 import { ensureHostExtensions, resetExtensionDiscoveryCache } from "../../src/runs/extension-inheritance.ts";
+import {
+	resetDeliveryPreflightState,
+	type DeliveryPreflightReport,
+} from "../../src/runs/cross-machine-preflight.ts";
+import type { CrossMachineSettings } from "../../src/shared/types.ts";
 
 /** Every value that follows an `--extension` flag, in argv order. */
 function extensionsOf(args: string[]): string[] {
@@ -1190,5 +1195,297 @@ test("#317: doctor shows whether host discovery is ok, failed or never probed", 
 		if (prevPath === undefined) delete process.env.PATH;
 		else process.env.PATH = prevPath;
 		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+// ── cross-machine host targets (contract `cross-machine-demo-ux` D8/D9) ─────
+//
+// The section answers ONE question a caller asks right before a remote launch:
+// "which machine does this name mean, and what would I actually run against it?".
+// It is composed entirely of facts this process already has — the parsed
+// `subagents.crossMachine`, `resolveHostTarget`'s own answers, and the delivery
+// preflight this process recorded — so a doctor run costs no `hc` round trip and
+// no extra `pi` process. The `host.piCalls() === 1` case below is the proof of the
+// last part: one, and that one is the discovery probe another test already warmed.
+
+/** The one host every case below resolves against. */
+const XM_HOSTS: NonNullable<CrossMachineSettings["hosts"]> = {
+	vps: {
+		cwd: "/srv/app",
+		node: "/usr/bin/node",
+		piCli: "/usr/local/bin/pi",
+		piLegionRoot: "/srv/pi-legion",
+		piExtensions: ["/srv/ext/provider.ts", "/srv/ext/lens.ts"],
+		worktreeRoot: "/srv/.pi-worktrees",
+	},
+};
+
+function crossMachineSettings(overrides: Partial<CrossMachineSettings> = {}): CrossMachineSettings {
+	return { enabled: true, hosts: { ...XM_HOSTS }, ...overrides };
+}
+
+/** The report's Cross-machine block, up to the next `## ` heading. */
+function crossMachineBlock(text: string): string {
+	const at = text.indexOf("## Cross-machine (host targets)");
+	assert.ok(at >= 0, `precondition: the report has a cross-machine section, got:\n${text}`);
+	const end = text.indexOf("\n## ", at + 1);
+	return end < 0 ? text.slice(at) : text.slice(at, end);
+}
+
+/**
+ * Seed the outcome `lastDeliveryPreflight()` reads.
+ *
+ * Doctor's contract is "render what was recorded, never record anything", so the
+ * three states must be presentable without an `hc` round trip. The slot is the
+ * preflight module's own shared holder (`Symbol.for("pi-legion.delivery-preflight")`,
+ * the documented escape hatch that survives extension re-evaluation) — assigning
+ * `last` on it is exactly what `preflightDelivery` does eight git checks further up.
+ */
+function seedLastPreflight(report: DeliveryPreflightReport): void {
+	const key = Symbol.for("pi-legion.delivery-preflight");
+	const holder = ((globalThis as unknown as Record<symbol, { last?: DeliveryPreflightReport }>)[key] ??= {});
+	holder.last = report;
+}
+
+/**
+ * One scratch agent dir for every case here — deliberately holding no
+ * `settings.json`, so a case that injects nothing reads the honest "unset".
+ */
+const XM_AGENT_DIR = mkdtempSync(path.join(tmpdir(), "legion-doctor-xm-"));
+
+function crossMachineText(crossMachine: CrossMachineSettings | undefined): string {
+	return runLegionDoctor({
+		agentDir: XM_AGENT_DIR,
+		probeModels: false,
+		sections: ["crossmachine"],
+		...(crossMachine !== undefined ? { crossMachine } : {}),
+		env: {
+			...process.env,
+			PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+			PI_LEGION_CHILD_EXTENSIONS: undefined,
+		},
+	}).text;
+}
+
+test("D8: the Cross-machine section resolves every declared host, field by field", () => {
+	try {
+		const block = crossMachineBlock(crossMachineText(crossMachineSettings()));
+		assert.match(block, /^- enabled: true$/m);
+		assert.match(block, /^- hosts: vps$/m);
+		// Resolved: every fact `resolveHostTarget` produces, on its own line, so a
+		// reader can compare it against what the other machine really has.
+		assert.match(block, /^- vps: resolved$/m);
+		assert.match(block, /^ {4}cwd: \/srv\/app$/m);
+		assert.match(block, /^ {4}node: \/usr\/bin\/node$/m);
+		assert.match(block, /^ {4}piCli: \/usr\/local\/bin\/pi$/m);
+		assert.match(block, /^ {4}legionRoot: \/srv\/pi-legion$/m);
+		assert.match(block, /^ {4}extensions: 2 \(\/srv\/ext\/provider\.ts, \/srv\/ext\/lens\.ts\)$/m);
+		assert.match(block, /^ {4}worktreeRoot: \/srv\/\.pi-worktrees$/m);
+		assert.doesNotMatch(block, /INVALID/, "a resolvable host must not be reported as broken");
+	} finally {
+		resetDeliveryPreflightState();
+	}
+});
+
+test("D8: an unconfigured host list says so and offers no launch line", () => {
+	try {
+		const none = crossMachineBlock(crossMachineText(undefined));
+		assert.match(none, /^- enabled: unset$/m);
+		assert.match(none, /^- hosts: none configured$/m);
+		assert.match(none, /^- last preflight: never$/m);
+		// Nothing to paste: a template with a blank host name is exactly the
+		// placeholder this section exists to remove.
+		assert.match(none, /^- minimal launch: \(nothing to paste yet/m);
+		assert.doesNotMatch(none, /subagent\(\{/);
+	} finally {
+		resetDeliveryPreflightState();
+	}
+});
+
+test("D8: a declared host that cannot be resolved is an ERROR issue with the resolver's own sentence", () => {
+	try {
+		const report = runLegionDoctor({
+			agentDir: mkdtempSync(path.join(tmpdir(), "legion-doctor-xm-bad-")),
+			probeModels: false,
+			sections: ["crossmachine"],
+			// Relative cwd: the resolver refuses it because a remote path is never
+			// translated from this machine — the class of typo this section must name.
+			crossMachine: { enabled: true, hosts: { ...XM_HOSTS, broken: { cwd: "srv/app" } } },
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+		});
+		const block = crossMachineBlock(report.text);
+		assert.match(block, /^- hosts: broken, vps$/m, "hosts are listed in a stable order");
+		const invalid = block.split("\n").find((line) => line.startsWith("- broken:"));
+		assert.ok(invalid, `expected a broken-host line, got:\n${block}`);
+		// `INVALID — <the resolver's sentence>`: verbatim, because that sentence
+		// names the exact settings key to fix.
+		assert.match(invalid, /^- broken: INVALID — host 'broken' needs an absolute cwd in subagents\.crossMachine\.hosts\.broken\.cwd/);
+		const issue = report.issues.find((i) => i.code === "CROSSMACHINE_UNRESOLVED");
+		assert.ok(issue, "an unresolvable host must produce an issue");
+		assert.equal(issue.severity, "error");
+		assert.equal(issue.section, "crossmachine");
+		assert.match(issue.message, /host 'broken'/);
+		assert.match(String(issue.fix), /subagents\.crossMachine\.hosts\.broken/);
+		assert.equal(report.ok, false, "an error-level issue makes the report not-ok");
+		// The healthy host still renders in full: one broken entry does not hide the rest.
+		assert.match(block, /^- vps: resolved$/m);
+		// …and the launch line is built from the host that DOES resolve.
+		assert.match(block, /host: "vps",/);
+	} finally {
+		resetDeliveryPreflightState();
+	}
+});
+
+test("D8/D9: last preflight renders never/ok/failed and the minimal launch is pasteable", () => {
+	try {
+		// 1) never — no preflight in this process.
+		resetDeliveryPreflightState();
+		assert.match(crossMachineBlock(crossMachineText(crossMachineSettings())), /^- last preflight: never$/m);
+
+		// 2) ok — names the host, the age, and (from D5) an unreachable origin when
+		//    the soft step said so. The age is what separates "live" from "stale".
+		seedLastPreflight({
+			host: "vps",
+			cwd: "/srv/app",
+			at: Date.now() - 42_000,
+			ok: true,
+			fetch: "unreachable",
+			fetchDetail: "fatal: could not read from remote repository",
+		});
+		const okBlock = crossMachineBlock(crossMachineText(crossMachineSettings()));
+		assert.match(okBlock, /^- last preflight: ok \(vps, 4[0-9]s ago\) — origin unreachable from there: fatal: could not read/m);
+
+		// 3) failed — the whole sentence, one line, so the reason survives rendering.
+		seedLastPreflight({
+			host: "vps",
+			cwd: "/srv/app",
+			at: Date.now() - 5_000,
+			ok: false,
+			fetch: "skipped",
+			failure: {
+				category: "remote-origin",
+				code: "INVALID_PARAMS",
+				message: "host 'vps': /srv/app has no origin on that machine; cross-machine delivery needs one shared remote.",
+			},
+		});
+		const failedBlock = crossMachineBlock(crossMachineText(crossMachineSettings()));
+		assert.match(failedBlock, /^- last preflight: failed \(vps, [0-9]+s ago\): host 'vps': \/srv\/app has no origin on that machine/m);
+
+		// 4) The launch line, in all three states, is built from THIS configuration:
+		//    a real host name, a legal phase machine, and nothing to fill in but the
+		//    goal (the one fact doctor cannot know).
+		for (const block of [okBlock, failedBlock]) {
+			const line = block.split("\n").find((l) => l.trimStart().startsWith("subagent({"));
+			assert.ok(line, `expected a launch line in:\n${block}`);
+			assert.ok(line.startsWith("    "), "the launch line is indented as one copyable command");
+			assert.match(line, /host: "vps",/, "the host is the configured one, never a placeholder");
+			assert.ok(!line.includes("<host>") && !/<host>/.test(line), "no `<host>` placeholder may survive");
+			assert.ok(!/host:\s*"/.test(line) || !/host: "<"/.test(line), "the host value is not an empty template");
+			assert.match(line, /agent: "centurion"/);
+			assert.match(
+				line,
+				/phases: \[\{ id: "planning", next: \[\{ to: "implementing" \}\] \}, \{ id: "implementing", next: \[\{ to: "done" \}\] \}, \{ id: "done", terminal: true \}\]/,
+			);
+			assert.match(line, /task: "<one-line goal>"/, "the goal is the caller's to fill in");
+		}
+
+		// The pasted phases are a LEGAL machine — D2's terminal-without-`next` shape —
+		// which is what makes the line something a caller can run rather than a sketch.
+		assert.doesNotThrow(() =>
+			parsePhaseMachine(
+				[
+					{ id: "planning", next: [{ to: "implementing" }] },
+					{ id: "implementing", next: [{ to: "done" }] },
+					{ id: "done", terminal: true },
+				],
+				"subagent.phases",
+				{ requireTerminal: true },
+			),
+		);
+	} finally {
+		resetDeliveryPreflightState();
+	}
+});
+
+test("D8: the launch line prefers the host the LAST preflight tried", () => {
+	// The caller reading doctor is usually the one whose launch just failed, so the
+	// reproducible next step is the machine that just failed — not the first host
+	// in the alphabet, and not a host they never tried.
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-xm-last-"));
+	try {
+		seedLastPreflight({
+			host: "zeta",
+			cwd: "/srv/b",
+			at: Date.now(),
+			ok: false,
+			fetch: "skipped",
+			failure: { category: "origin-mismatch", code: "INVALID_PARAMS", message: "host 'zeta': two origins" },
+		});
+		const text = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			sections: ["crossmachine"],
+			crossMachine: {
+				enabled: true,
+				hosts: { alpha: { cwd: "/srv/a" }, zeta: { cwd: "/srv/b" } },
+			},
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+		}).text;
+		const line = crossMachineBlock(text).split("\n").find((l) => l.trimStart().startsWith("subagent({"));
+		assert.ok(line);
+		assert.match(line, /host: "zeta",/);
+	} finally {
+		resetDeliveryPreflightState();
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("D8: without injection doctor reads subagents.crossMachine from settings — never a second probe", async () => {
+	const prevPath = process.env.PATH;
+	const dir = mkdtempSync(path.join(tmpdir(), "legion-doctor-xm-settings-"));
+	writeFileSync(
+		path.join(dir, "settings.json"),
+		JSON.stringify({ subagents: { crossMachine: { enabled: true, hosts: XM_HOSTS } } }),
+	);
+	const host = discoveryPiHost();
+	try {
+		process.env.PATH = host.pathValue;
+		resetExtensionDiscoveryCache();
+		// One warm probe, exactly as #317 does: discovery is the ONLY thing on this
+		// path allowed to run `pi`, and doctor must add none of its own (no
+		// `--list-models`, no `pi list`).
+		await ensureHostExtensions();
+		const report = runLegionDoctor({
+			agentDir: dir,
+			probeModels: false,
+			sections: ["crossmachine"],
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+		});
+		const block = crossMachineBlock(report.text);
+		// Read from the settings file because nothing injected it (D8's fallback),
+		// through the same `loadSubagentSettings` merge the launch path uses.
+		assert.match(block, /^- enabled: true$/m);
+		assert.match(block, /^- hosts: vps$/m);
+		assert.match(block, /^- vps: resolved$/m);
+		assert.equal(host.piCalls(), 1, "the cross-machine section probes nothing of its own");
+	} finally {
+		host.cleanup();
+		resetExtensionDiscoveryCache();
+		if (prevPath === undefined) delete process.env.PATH;
+		else process.env.PATH = prevPath;
+		rmSync(dir, { recursive: true, force: true });
+		resetDeliveryPreflightState();
 	}
 });
