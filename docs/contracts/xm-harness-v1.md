@@ -308,3 +308,24 @@ hc exec --on remote "git -C /root/work worktree list"
 - `test/docker/xm/**`：W2。
 - `test/docker/README.md`、`docs/runbooks/cross-machine-live-e2e.md`：W2。
 - `docs/reports/xm-harness.md`：父会话。
+
+---
+
+# 修订 v1.2（父会话，2026-11-18）— 基线前移到 6.2.2，`make xm-model` 翻正向
+
+`origin/master` 已从 `e9ed558`(6.2.1) 前进到 `4611ce3`(6.2.2)，本分支已 rebase。
+6.2.2 的两条改动直接影响本契约：
+
+1. **`567417a feat(cross-machine): fall back to a model on the target instead of refusing`**
+   → 契约 §5.4 的「现状 = 硬拒绝」不再成立。`make xm-model` 的断言**翻成正向**：
+   m1 远端没有请求的模型；m2 回退 + warning（三句语义）；m3 远端 child 的 provider/model
+   就是回退后的模型且新增 worktree；m4 父机无本地 child。
+   确定性三条件（实测缺一不可）：远端整条缺 provider（`Using custom model id` 不算拒绝，
+   `src/runs/remote.ts:871-878`）、远端模型表只有 mock 提供的一行、model-missing 场景清空
+   远端 `models-store.json`。
+2. **`3370910 feat(recover): collect a cross-machine child a previous session left behind`**
+   → 没有修掉 `d1`：`finishCollect` 仍在 `src/runs/orchestrator.ts:3572` 无条件
+   `assertLocalWorktree`，远端树必被拒。`d1` 继续断言现状。
+   `d0`（零配置 read-back 缺 `hosts.<name>`，`src/runs/remote.ts:976-982`）同样仍在。
+
+`docs/reports/xm-harness.md` 记录的是 6.2.2 上的实测输出。
