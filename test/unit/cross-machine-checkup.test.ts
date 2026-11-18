@@ -193,8 +193,9 @@ function testEnv(cacheDir: string, extra: NodeJS.ProcessEnv = {}): NodeJS.Proces
  * index and a host resolved from an explicit entry does not (the case the
  * on-demand loader exists for).
  */
-function discoveryPayload(options: { packages?: string[] } = {}): string {
+function discoveryPayload(options: { packages?: string[]; directories?: Record<string, string> } = {}): string {
 	const packages = options.packages ?? ["pi-sysmon", "pi-any-endpoint"];
+	const directories = options.directories ?? {};
 	const rows = [
 		"MACHINE\tfakebox",
 		"NODE_CMD\t/usr/bin/node",
@@ -209,7 +210,15 @@ function discoveryPayload(options: { packages?: string[] } = {}): string {
 		const dir = `/srv/npm/node_modules/${name}`;
 		const relative = name === "pi-any-endpoint" ? "extensions/index.ts" : "src/index.ts";
 		rows.push(`PKG\t${name}\t${dir}`);
-		rows.push(`PKGENTRY\t${name}\t${relative}\t${dir}/${relative}`);
+		// D13: a package may declare a DIRECTORY (`pi.extensions: ["./extensions"]`).
+		// The 5th field is the probe's `1`/`0`, and such a declaration is never an
+		// `EXT` row — a directory is not something `pi --extension` can execute.
+		const declaredDirectory = directories[name];
+		if (declaredDirectory !== undefined) {
+			rows.push(`PKGENTRY\t${name}\t${declaredDirectory}\t${dir}/${declaredDirectory}\t1`);
+			continue;
+		}
+		rows.push(`PKGENTRY\t${name}\t${relative}\t${dir}/${relative}\t0`);
 		rows.push(`EXT\t${name}\t${dir}/${relative}\t${name === "pi-any-endpoint" ? "1" : "0"}`);
 	}
 	rows.push("PROBE_OK\t1");
@@ -247,7 +256,10 @@ function healthyTarget(options: { models?: string; packages?: string[] } = {}): 
  * A `pi` on PATH that reports one package directory — the same fixture
  * `legion-doctor.test.ts` uses for #317, so host-extension discovery is real.
  */
-function hostExtensionPackage(name = "pi-sysmon"): {
+function hostExtensionPackage(
+	name = "pi-sysmon",
+	options: { declaredDirectory?: boolean } = {},
+): {
 	packageDir: string;
 	entry: string;
 	pathValue: string;
@@ -255,12 +267,19 @@ function hostExtensionPackage(name = "pi-sysmon"): {
 } {
 	const root = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-pi-"));
 	const packageDir = path.join(root, "npm", "node_modules", name);
-	mkdirSync(path.join(packageDir, "src"), { recursive: true });
+	// D13: the real `pi-autoresearch` shape — the manifest declares a DIRECTORY and
+	// the loadable entry sits one level inside it, so `pi list` expansion on THIS
+	// machine hands the parent `extensions/<name>/index.ts`.
+	const declared = options.declaredDirectory === true ? ["./extensions"] : ["src/index.ts"];
+	const entryRelative = options.declaredDirectory === true
+		? path.join("extensions", name, "index.ts")
+		: path.join("src", "index.ts");
+	const entry = path.join(packageDir, entryRelative);
+	mkdirSync(path.dirname(entry), { recursive: true });
 	writeFileSync(
 		path.join(packageDir, "package.json"),
-		JSON.stringify({ name, version: "1.0.0", pi: { extensions: ["src/index.ts"] } }),
+		JSON.stringify({ name, version: "1.0.0", pi: { extensions: declared } }),
 	);
-	const entry = path.join(packageDir, "src", "index.ts");
 	writeFileSync(entry, "export default {};\n");
 	const bin = path.join(root, "bin");
 	mkdirSync(bin, { recursive: true });
@@ -549,10 +568,96 @@ test("D4: a package missing on the target FAILs with the role and a pasteable ex
 		});
 		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
 		assert.equal(inherited.status, "fail", `expected a FAIL, got: ${inherited.line}`);
-		// The line names the package AND the role whose set contained it (D4).
-		assert.match(inherited.line, /^1 package\(s\) missing on fakebox: pi-sysmon \(role 'centurion'\)$/);
+		// The line names the package, WHY it does not resolve, and the role whose set
+		// contained it (D4). D13 put the reason in the parentheses so the two causes
+		// send the reader to different fixes; the role moved after them, unchanged.
+		assert.match(inherited.line, /^1 package\(s\) missing on fakebox: pi-sysmon \(not installed on fakebox\) for role 'centurion'$/);
 		// The install action, then the settings key as pasteable JSON (pitfall #2).
 		assert.equal(inherited.fixes?.[0], "hc exec --on fakebox -- pi install npm:pi-sysmon");
+		const json = inherited.fixes?.map((fix) => {
+			try {
+				return JSON.parse(fix) as { subagents?: { agentOverrides?: Record<string, { excludeExtensions?: string[] }> } };
+			} catch {
+				return undefined;
+			}
+		}).find((parsed) => parsed !== undefined);
+		assert.ok(json, `expected a settings JSON fix, got: ${JSON.stringify(inherited.fixes)}`);
+		assert.deepEqual(json!.subagents?.agentOverrides?.centurion?.excludeExtensions, ["pi-sysmon"]);
+	} finally {
+		core.cleanup();
+		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+test("D13: a target that declares './extensions' resolves the file under it — inherited-extensions PASSes", async () => {
+	const repo = localRepo();
+	// The parent's package declares the DIRECTORY too, so `pi list` expansion on
+	// THIS machine gives the parent `extensions/pi-sysmon/index.ts` — the path the
+	// launch hands to the mapper. Before the fix the target reported its
+	// declaration as `./extensions` and string equality refused it forever.
+	const ext = hostExtensionPackage("pi-sysmon", { declaredDirectory: true });
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const core = fakeHcCore(discoveryPayload({ packages: ["pi-sysmon"], directories: { "pi-sysmon": "extensions" } }));
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(ext.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [role("centurion", { model: MODEL })],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		// The demo's false positive in the other direction: this used to FAIL for a
+		// layout that is fine on both machines.
+		assert.equal(inherited.status, "pass", `expected a PASS, got: ${inherited.line}`);
+		assert.match(inherited.line, /^1 inherited extension\(s\) resolve on fakebox$/);
+	} finally {
+		core.cleanup();
+		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+test("D13: a target whose declaration does NOT cover the entry FAILs and names it (was a silent PASS)", async () => {
+	const repo = localRepo();
+	// The parent asks for `extensions/pi-sysmon/index.ts`; the target has the
+	// package installed but declares only `src/index.ts`. The launch REFUSES that
+	// (`entry-missing`), so the checkup must FAIL too — the demo printed PASS here
+	// and then the dispatch died.
+	const ext = hostExtensionPackage("pi-sysmon", { declaredDirectory: true });
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const core = fakeHcCore(discoveryPayload({ packages: ["pi-sysmon"] }));
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(ext.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [role("centurion", { model: MODEL })],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		assert.equal(inherited.status, "fail", `expected a FAIL, got: ${inherited.line}`);
+		// Distinguishable from "not installed": this one says WHICH entry is missing,
+		// because the fix is a layout/version change, not an install.
+		assert.match(
+			inherited.line,
+			/^1 package\(s\) missing on fakebox: pi-sysmon \(entry 'extensions\/pi-sysmon\/index\.ts' not declared on fakebox\) for role 'centurion'$/,
+		);
+		// The merged D4 snippet still applies (excluding the package by name is one
+		// way out), and the caps/JSON shape are untouched.
 		const json = inherited.fixes?.map((fix) => {
 			try {
 				return JSON.parse(fix) as { subagents?: { agentOverrides?: Record<string, { excludeExtensions?: string[] }> } };

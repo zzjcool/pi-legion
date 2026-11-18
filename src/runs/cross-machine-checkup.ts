@@ -789,16 +789,26 @@ async function probeInheritedExtensions(input: {
 		}
 	}
 
-	const missing = new Map<string, string>();
+	/** One package that does not resolve on the target, and WHY it does not. */
+	type UnresolvedPackage = { role: string; reason: "not-installed" | "entry-missing"; relative: string };
+	const missing = new Map<string, UnresolvedPackage>();
 	let checked = 0;
 	for (const entry of wanted) {
 		checked++;
 		const resolution = resolvePackagePathOnHost(entry.extension, index);
-		if (resolution.ok || resolution.reason !== "not-installed") continue;
+		if (resolution.ok) continue;
+		// D13: the launch REFUSES on `entry-missing` too, so a checkup that skips it
+		// printed PASS for a dispatch that then failed — the demo's contradiction
+		// (doctor green, launch refused). Only `no-package` (this machine cannot say
+		// which package the path belongs to) stays out of the count: it is not a fact
+		// about the target.
+		if (resolution.reason !== "not-installed" && resolution.reason !== "entry-missing") continue;
 		const name = resolution.packageName ?? path.basename(entry.extension);
 		// One role per package: the FIRST role whose set contained it, because the
 		// `excludeExtensions` fix is written per role and one is enough to launch.
-		if (!missing.has(name)) missing.set(name, entry.role);
+		if (!missing.has(name)) {
+			missing.set(name, { role: entry.role, reason: resolution.reason, relative: resolution.relative ?? "" });
+		}
 	}
 	if (missing.size === 0) {
 		return {
@@ -820,8 +830,8 @@ async function probeInheritedExtensions(input: {
 	// the top-level `subagents` key, so pasting the second would silently drop the
 	// first role's fix (review M8); merging by role keeps them composable.
 	const byRole = new Map<string, string[]>();
-	for (const [name, role] of entries.slice(0, MAX_JSON_PACKAGES)) {
-		byRole.set(role, [...(byRole.get(role) ?? []), name]);
+	for (const [name, info] of entries.slice(0, MAX_JSON_PACKAGES)) {
+		byRole.set(info.role, [...(byRole.get(info.role) ?? []), name]);
 	}
 	if (byRole.size > 0) {
 		const agentOverrides = Object.fromEntries([...byRole].map(([role, names]) => [role, { excludeExtensions: names }]));
@@ -832,7 +842,15 @@ async function probeInheritedExtensions(input: {
 		id: "inherited-extensions",
 		status: "fail",
 		line: `${entries.length} package(s) missing on ${target.host}: ${shown
-			.map(([name, role]) => `${name} (role '${role}')`)
+			.map(([name, info]) => {
+				// D13: the two reasons send the reader to different fixes (install it /
+				// exclude it here), so the line says which one it is — and the role stays
+				// because the `excludeExtensions` fix below is written per role.
+				const why = info.reason === "entry-missing"
+					? `entry '${info.relative}' not declared on ${target.host}`
+					: `not installed on ${target.host}`;
+				return `${name} (${why}) for role '${info.role}'`;
+			})
 			.join(", ")}${more > 0 ? ` and ${more} more` : ""}`,
 		fixes,
 	};

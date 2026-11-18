@@ -94,6 +94,41 @@ export type PackagePathResolution =
 	  };
 
 /**
+ * The declared DIRECTORY that covers one requested entry, if any (D13).
+ *
+ * pi expands a directory declaration (`pi.extensions: ["./extensions"]`) into the
+ * concrete files under it, so the parent asks for `extensions/<name>/index.ts`
+ * while the target can only report the directory it declared. The declaration is
+ * therefore a prefix — and the LONGEST matching one wins, because
+ * `extensions` and `extensions/provider` are both legal declarations of one
+ * package and only the more specific one names the right directory.
+ *
+ * Two rules keep this from becoming a guess:
+ *
+ *   - the prefix ends at a path SEPARATOR (`extensions/`), never a bare
+ *     `startsWith`: `extensions-other/x.ts` is a DIFFERENT directory;
+ *   - `directory !== true` never matches. A row cached before the flag existed has
+ *     `undefined` there, which means "not known to be a directory" — refusing for
+ *     one cache TTL is the conservative side of that unknown.
+ */
+function directoryEntryCovering(
+	declared: readonly HostPackageEntry[],
+	relative: string,
+): { entry: HostPackageEntry; rest: string } | undefined {
+	let best: { entry: HostPackageEntry; rest: string } | undefined;
+	for (const entry of declared) {
+		if (entry.directory !== true || entry.relative.length === 0) continue;
+		const prefix = `${entry.relative}/`;
+		if (!relative.startsWith(prefix)) continue;
+		const rest = relative.slice(prefix.length);
+		// The rest must stay INSIDE that directory: non-empty, relative, no `..`.
+		if (rest.length === 0 || rest.startsWith("/") || rest.split("/").includes("..")) continue;
+		if (best === undefined || entry.relative.length > best.entry.relative.length) best = { entry, rest };
+	}
+	return best;
+}
+
+/**
  * Re-root a parent package path onto the target by PACKAGE NAME (v1.2).
  *
  * The failure this removes (real run): a Mac parent inherited five extensions as
@@ -106,6 +141,11 @@ export type PackagePathResolution =
  * Deliberately conservative: a package that IS installed there but does NOT
  * expose the same relative entry (a different version/layout) is a REFUSAL, not
  * a best-effort guess — `entry-missing` names what the package does declare.
+ *
+ * D13: a declared DIRECTORY is a declaration of everything under it, so an exact
+ * match is tried first (file declarations stay byte-identical) and then the
+ * longest declared directory that properly prefixes the request. A request no
+ * declaration covers — file or directory — is still `entry-missing`.
  */
 export function resolvePackagePathOnHost(
 	file: string,
@@ -122,6 +162,17 @@ export function resolvePackagePathOnHost(
 	const declared = index.entries.filter((entry) => entry.name === local.name);
 	const same = declared.find((entry) => entry.relative === relative);
 	if (same !== undefined) return { ok: true, path: same.path, packageName: local.name, relative };
+	const covering = directoryEntryCovering(declared, relative);
+	if (covering !== undefined) {
+		return {
+			// `path.posix`, never `path.join`: this path lives on THAT machine, and the
+			// parent may well be on a platform whose separator is not `/`.
+			ok: true,
+			path: path.posix.join(covering.entry.path, covering.rest),
+			packageName: local.name,
+			relative,
+		};
+	}
 	return {
 		ok: false,
 		reason: "entry-missing",
@@ -168,8 +219,12 @@ function packagePathError(
 		);
 	}
 	const declared = resolution.declared ?? [];
+	// D13: render a declared DIRECTORY as a directory (trailing `/`). In the real
+	// demo `declared: ./extensions -> /Users/me/pi-autoresearch/extensions` sat next
+	// to a request for `./extensions/pi-autoresearch/index.ts`, and the operator
+	// read that as a layout/version mismatch instead of a directory declaration.
 	const available = declared.length > 0
-		? declared.map((entry) => `./${entry.relative} -> ${entry.path}`).join(", ")
+		? declared.map((entry) => `./${entry.relative}${entry.directory === true ? "/" : ""} -> ${entry.path}`).join(", ")
 		: "(it declares no pi.extensions entries)";
 	return new SubagentError(
 		`host '${host}': package '${name}' IS installed there at ${resolution.remoteDir}, but it does not expose './${resolution.relative}' (declared: ${available}); the launch would have loaded a different entry than the one this machine asked for. ${fix}`,
@@ -972,6 +1027,13 @@ export interface HostPackageEntry {
 	relative: string;
 	/** Absolute path (on that machine). */
 	path: string;
+	/**
+	 * True when the declared entry is a DIRECTORY (D13), which pi expands into the
+	 * files under it; `false` when it is a file; ABSENT when the row predates the
+	 * flag (`undefined` = "not known to be a directory", so it never prefix-matches
+	 * — a stale cache answers `entry-missing` until its TTL expires).
+	 */
+	directory?: boolean;
 }
 
 /**
@@ -1142,11 +1204,24 @@ export function remoteDiscoveryScript(): string {
 		`  for (const rel of list) {`,
 		`    if (typeof rel !== "string") continue;`,
 		`    const abs = path.resolve(dir, rel);`,
-		`    if (!fs.existsSync(abs)) continue;`,
+		// D13: ONE stat answers both "is it there" and "is it a directory". A
+		// package may declare a DIRECTORY (`pi.extensions: ["./extensions"]`), and
+		// the parent expands that into concrete files before it asks; without this
+		// fact the target could only report a path the parent never requests.
+		`    let st; try { st = fs.statSync(abs); } catch { continue; }`,
+		`    const isDir = st.isDirectory();`,
 		`    const relative = path.relative(dir, abs).split(path.sep).join("/");`,
-		`    if (!provider) { try { provider = /registerProvider|registerModelProvider/.test(fs.readFileSync(abs, "utf8")); } catch {} }`,
-		`    process.stdout.write(["EXT", name, abs, provider ? "1" : "0"].join("\\t") + "\\n");`,
-		`    process.stdout.write(["PKGENTRY", name, relative, abs].join("\\t") + "\\n");`,
+		// A directory is never an `EXT` line: it is not something `pi --extension`
+		// can execute, so auto-injecting it is worse than not auto-detecting that
+		// provider there. The declaration still reaches the caller as PKGENTRY, and
+		// the parent resolves the files under it itself.
+		`    if (!isDir) {`,
+		`      if (!provider) { try { provider = /registerProvider|registerModelProvider/.test(fs.readFileSync(abs, "utf8")); } catch {} }`,
+		`      process.stdout.write(["EXT", name, abs, provider ? "1" : "0"].join("\\t") + "\\n");`,
+		`    }`,
+		// 5th field: `1`/`0`. A pre-D13 parser splits and ignores it, and a pre-D13
+		// cached row has no 4th value at all — "not known to be a directory".
+		`    process.stdout.write(["PKGENTRY", name, relative, abs, isDir ? "1" : "0"].join("\\t") + "\\n");`,
 		`  }`,
 		`}' $EXT_DIRS 2>/dev/null || true`,
 		`fi`,
@@ -1207,12 +1282,21 @@ export function buildDiscoveryReport(facts: DiscoveryFacts, source: HostDiscover
 		packages.push({ name, dir });
 	}
 	for (const value of facts.all("PKGENTRY")) {
-		const [name, relative, entryPath] = value.split("\t");
+		const [name, relative, entryPath, directory] = value.split("\t");
 		if (!name || !relative || !entryPath) continue;
 		const key = `${name}\u0000${relative}`;
 		if (seenEntries.has(key)) continue;
 		seenEntries.add(key);
-		packageEntries.push({ name, relative, path: entryPath });
+		// D13: the 4th segment is the probe's `1`/`0`. A row written before it (or a
+		// report read from a cache that old) has no value here, and the field stays
+		// ABSENT on purpose — an unknown entry is not a directory as far as
+		// `resolvePackagePathOnHost` is concerned.
+		packageEntries.push({
+			name,
+			relative,
+			path: entryPath,
+			...(directory === "1" ? { directory: true } : directory === "0" ? { directory: false } : {}),
+		});
 	}
 	const nodeBinary = facts.get("NODE_BIN");
 	const nodeCommand = facts.get("NODE_CMD");
@@ -1259,7 +1343,15 @@ export function buildDiscoveryReport(facts: DiscoveryFacts, source: HostDiscover
  * on its own — the child's argv must stay the set the operator can predict.
  */
 export function discoveredFields(report: HostDiscoveryReport): DiscoveredHostFields {
-	const providers = report.extensions.filter((extension) => extension.provider).map((extension) => extension.path);
+	// D13: a declared DIRECTORY is not something `pi --extension` can execute, so it
+	// must never reach argv. The probe stopped emitting those `EXT` rows; this
+	// filter also covers a report cached before it did (TTL heals it).
+	const directories = new Set(
+		report.packageEntries.filter((entry) => entry.directory === true).map((entry) => entry.path),
+	);
+	const providers = report.extensions
+		.filter((extension) => extension.provider && !directories.has(extension.path))
+		.map((extension) => extension.path);
 	return {
 		...(report.node?.binary ? { node: report.node.binary } : {}),
 		...(report.pi?.entry ? { piCli: report.pi.entry } : {}),

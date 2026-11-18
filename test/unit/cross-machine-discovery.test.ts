@@ -322,6 +322,70 @@ test("v1.1 probe: repeated EXT rows survive parsing (a Map would keep only the l
 	);
 });
 
+test("D13 probe: a package that declares a DIRECTORY says so, and never becomes an EXT row", (t) => {
+	const machine = fakeMachine(t);
+	// The real layout from the demo (`pi-autoresearch`): the declaration is the
+	// DIRECTORY, and the loadable entries are inside it, one directory per entry.
+	const modules = path.join(machine.home, ".pi", "agent", "npm", "node_modules");
+	const dirPackage = path.join(modules, "pi-autoresearch");
+	const inner = path.join(dirPackage, "extensions", "pi-autoresearch", "index.ts");
+	mkdirSync(path.dirname(inner), { recursive: true });
+	writeFileSync(inner, "export function registerProvider() {}\n");
+	writeFileSync(
+		path.join(dirPackage, "package.json"),
+		JSON.stringify({ name: "pi-autoresearch", keywords: ["provider"], pi: { extensions: ["./extensions"] } }),
+	);
+	const report = buildDiscoveryReport(parseDiscoveryReport(runProbe(machine)));
+	// The fact the old probe withheld: the declaration IS a directory, so the
+	// parent's request for `extensions/pi-autoresearch/index.ts` is not a
+	// different layout — it is the expansion of this very declaration.
+	assert.deepEqual(
+		report.packageEntries.filter((entry) => entry.name === "pi-autoresearch"),
+		[{ name: "pi-autoresearch", relative: "extensions", path: path.join(dirPackage, "extensions"), directory: true }],
+	);
+	// A directory is not something `pi --extension` can execute, so it is never
+	// auto-injected — even though this package declares itself a provider.
+	assert.deepEqual(
+		report.extensions.filter((entry) => entry.name === "pi-autoresearch"),
+		[],
+		"a directory declaration must not become a provider EXT row",
+	);
+	// The file-declared package next to it reports `0`, so "file" and "unknown"
+	// stay distinguishable in the cache.
+	assert.deepEqual(
+		report.packageEntries.filter((entry) => entry.name === "pi-any-endpoint"),
+		[{ name: "pi-any-endpoint", relative: "extensions/index.ts", path: machine.providerExtension, directory: false }],
+	);
+});
+
+test("D13 report: a PKGENTRY row without the directory field is UNKNOWN, not a file", () => {
+	// A row written before the flag existed (or read from a cache that old) must
+	// still parse: the extra segment is simply absent, and the entry stays
+	// `directory: undefined` — the state `resolvePackagePathOnHost` refuses to
+	// prefix-match on, until the cache TTL expires.
+	const legacy = buildDiscoveryReport(parseDiscoveryReport(
+		["PKG\tpi-autoresearch\t/srv/x", "PKGENTRY\tpi-autoresearch\textensions\t/srv/x/extensions", "PROBE_OK\t1"].join("\n"),
+	));
+	assert.deepEqual(legacy.packageEntries, [
+		{ name: "pi-autoresearch", relative: "extensions", path: "/srv/x/extensions" },
+	]);
+	assert.equal(legacy.packageEntries[0]!.directory, undefined);
+	// A provider `EXT` row pointing at a directory (a report cached before the
+	// probe stopped emitting them) must never reach argv either: `-e <dir>` cannot
+	// load, so a broken provider is worse than none.
+	const stale = buildDiscoveryReport(parseDiscoveryReport(
+		[
+			"PKG\tpi-autoresearch\t/srv/x",
+			"PKGENTRY\tpi-autoresearch\textensions\t/srv/x/extensions\t1",
+			"EXT\tpi-autoresearch\t/srv/x/extensions\t1",
+			"PROBE_OK\t1",
+		].join("\n"),
+	));
+	assert.equal(stale.packageEntries[0]!.directory, true);
+	assert.deepEqual(stale.extensions.map((entry) => entry.path), ["/srv/x/extensions"]);
+	assert.deepEqual(discoveredFields(stale), {}, "a directory is never auto-injected as --extension");
+});
+
 // ── 2. admission + refusal wording ─────────────────────────────────────────
 
 test("v1.1 admission: a host this core does not know is refused by name, listing what it DOES know", async () => {
@@ -536,6 +600,10 @@ test("v1.2 extensions: the package is ABSENT there — refuse before launch, nam
 		extension: parent.entry,
 		package: "pi-sysmon",
 		reason: "not-installed",
+		// A6: a package that is not on that machine is deterministic, so the
+		// candidate chain must not retry it. (This assertion was stale at HEAD:
+		// `remote.ts` gained the flag in 3752669, the expectation did not.)
+		noModelFallback: true,
 	});
 });
 
@@ -586,6 +654,128 @@ test("v1.2 extensions: the package IS there but the entry differs — refuse, li
 	assert.match((refusal as SubagentError).message, /package 'pi-any-endpoint' IS installed there at \/srv\/pi\/npm\/node_modules\/pi-any-endpoint/);
 	assert.match((refusal as SubagentError).message, /does not expose '\.\/extensions\/index\.ts'/);
 	assert.match((refusal as SubagentError).message, /declared: \.\/dist\/index\.js -> \/srv\/pi\/npm\/node_modules\/pi-any-endpoint\/dist\/index\.js/);
+});
+
+/** An installed package on the target that declares exactly the given entries. */
+function declaredIndex(
+	name: string,
+	dir: string,
+	entries: Array<{ relative: string; path: string; directory?: boolean }>,
+) {
+	return { packages: [{ name, dir }], entries: entries.map((entry) => ({ name, ...entry })) };
+}
+
+test("D13 extensions: a declared DIRECTORY covers the entry under it (pi asked for the expanded file)", (t) => {
+	// The real demo, in miniature: the parent expanded `./extensions` into
+	// `extensions/pi-autoresearch/index.ts` and asked for THAT; the target declared
+	// only `./extensions`. Strings for equality said "does not expose" forever.
+	const parent = parentPackage(t, "pi-autoresearch", { entry: "extensions/pi-autoresearch/index.ts" });
+	const index = declaredIndex("pi-autoresearch", "/srv/x", [
+		{ relative: "extensions", path: "/srv/x/extensions", directory: true },
+	]);
+	assert.deepEqual(resolvePackagePathOnHost(parent.entry, index), {
+		ok: true,
+		path: "/srv/x/extensions/pi-autoresearch/index.ts",
+		packageName: "pi-autoresearch",
+		relative: "extensions/pi-autoresearch/index.ts",
+	});
+	// …and the mapper a launch actually goes through returns that argv.
+	assert.deepEqual(
+		mapRemoteArgv(["--no-extensions", "-e", parent.entry], {
+			host: "hw-nj",
+			remoteCwd: "/srv/app",
+			remoteDir: "/srv/.mirror/r/n",
+			localCwd: "/local/app",
+			pathMap: [],
+			packages: index,
+		}),
+		["--no-extensions", "-e", "/srv/x/extensions/pi-autoresearch/index.ts"],
+	);
+});
+
+test("D13 extensions: the LONGEST declared directory wins when two of them prefix the request", (t) => {
+	const parent = parentPackage(t, "pi-autoresearch", { entry: "extensions/pi-autoresearch/index.ts" });
+	const index = declaredIndex("pi-autoresearch", "/srv/x", [
+		{ relative: "extensions", path: "/srv/x/extensions", directory: true },
+		{ relative: "extensions/pi-autoresearch", path: "/srv/x/extensions/pi-autoresearch", directory: true },
+	]);
+	const resolved = resolvePackagePathOnHost(parent.entry, index);
+	assert.equal(resolved.ok, true);
+	// The more specific declaration names the directory the file is really in: a
+	// first-match implementation would answer `/srv/x/extensions/pi-autoresearch/index.ts`
+	// by luck here, so the assertion is about the JOINED remainder, not the prefix.
+	assert.equal(resolved.ok === true ? resolved.path : "", "/srv/x/extensions/pi-autoresearch/index.ts");
+	// Make the two roots differ, so "which declaration was used" is observable.
+	const split = declaredIndex("pi-autoresearch", "/srv/x", [
+		{ relative: "extensions", path: "/srv/x/extensions", directory: true },
+		{ relative: "extensions/pi-autoresearch", path: "/srv/y/pi-autoresearch", directory: true },
+	]);
+	const specific = resolvePackagePathOnHost(parent.entry, split);
+	assert.equal(specific.ok === true ? specific.path : "", "/srv/y/pi-autoresearch/index.ts");
+});
+
+test("D13 extensions: a request OUTSIDE the declared directory stays entry-missing (and names the directory as one)", (t) => {
+	const parent = parentPackage(t, "pi-autoresearch", { entry: "src/index.ts" });
+	const index = declaredIndex("pi-autoresearch", "/srv/x", [
+		{ relative: "extensions", path: "/srv/x/extensions", directory: true },
+	]);
+	const resolution = resolvePackagePathOnHost(parent.entry, index);
+	assert.equal(resolution.ok, false);
+	assert.equal(resolution.ok === false ? resolution.reason : "", "entry-missing");
+	// The rejection surface: a directory must LOOK like a directory. The demo's
+	// operator read `./extensions -> …` as a layout/version mismatch.
+	const refusal = thrownSync(() => mapRemoteArgv(["-e", parent.entry], {
+		host: "hw-nj",
+		remoteCwd: "/srv/app",
+		remoteDir: "/srv/.mirror/r/n",
+		localCwd: "/local/app",
+		pathMap: [],
+		packages: index,
+	}));
+	assert.ok(refusal instanceof SubagentError);
+	assert.match((refusal as SubagentError).message, /does not expose '\.\/src\/index\.ts'/);
+	assert.match((refusal as SubagentError).message, /declared: \.\/extensions\/ -> \/srv\/x\/extensions/);
+});
+
+test("D13 extensions: a sibling directory is not under the declaration (no bare startsWith)", (t) => {
+	// `extensions-other` starts with the string `extensions` and contains none of
+	// its files: a bare `startsWith` would answer ok with `rest = "-other/x.ts"`.
+	const parent = parentPackage(t, "pi-autoresearch", { entry: "extensions-other/x.ts" });
+	const index = declaredIndex("pi-autoresearch", "/srv/x", [
+		{ relative: "extensions", path: "/srv/x/extensions", directory: true },
+	]);
+	const resolution = resolvePackagePathOnHost(parent.entry, index);
+	assert.equal(resolution.ok, false);
+	assert.equal(resolution.ok === false ? resolution.reason : "", "entry-missing");
+});
+
+test("D13 extensions: a FILE declaration covers exactly that path, never what looks like it is under it", (t) => {
+	const parent = parentPackage(t, "pi-autoresearch", { entry: "extensions/index.ts/foo" });
+	const index = declaredIndex("pi-autoresearch", "/srv/x", [
+		{ relative: "extensions/index.ts", path: "/srv/x/extensions/index.ts", directory: false },
+	]);
+	const resolution = resolvePackagePathOnHost(parent.entry, index);
+	assert.equal(resolution.ok, false);
+	assert.equal(resolution.ok === false ? resolution.reason : "", "entry-missing");
+});
+
+test("D13 extensions: a cache row without the flag is NOT known to be a directory (conservative)", (t) => {
+	// `directory` absent = an entry cached before the flag existed. The prefix
+	// would match, and the guess would usually be right — but a guess is exactly
+	// what this resolver refused to do; one cache TTL later the probe answers.
+	const parent = parentPackage(t, "pi-autoresearch", { entry: "extensions/pi-autoresearch/index.ts" });
+	const index = declaredIndex("pi-autoresearch", "/srv/x", [
+		{ relative: "extensions", path: "/srv/x/extensions" },
+	]);
+	const resolution = resolvePackagePathOnHost(parent.entry, index);
+	assert.equal(resolution.ok, false);
+	assert.equal(resolution.ok === false ? resolution.reason : "", "entry-missing");
+	// The exact same request DOES resolve once the flag is there: the negative
+	// above is about the unknown flag, not about the layout.
+	const known = resolvePackagePathOnHost(parent.entry, declaredIndex("pi-autoresearch", "/srv/x", [
+		{ relative: "extensions", path: "/srv/x/extensions", directory: true },
+	]));
+	assert.equal(known.ok === true ? known.path : "", "/srv/x/extensions/pi-autoresearch/index.ts");
 });
 
 test("v1.2 extensions: the probe index is only fetched when an argv path NEEDS it", () => {
