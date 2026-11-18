@@ -115,6 +115,17 @@ export const REMOTE_STARTUP_CONFIRM_MS = 8_000;
 /** Poll cadence inside that window. */
 export const REMOTE_STARTUP_CONFIRM_POLL_MS = 500;
 
+/**
+ * How many of that machine's models a `model-missing` refusal quotes.
+ *
+ * Five was arbitrary: a registry commonly lists more, and a truncated list that
+ * does not SAY it is truncated reads as "this is everything there is", which is
+ * how the operator concludes the machine serves nothing usable. Twenty covers a
+ * realistic registry and still fits one tool result; a longer one is announced
+ * (`and N more`) instead of silently cut.
+ */
+const MODEL_LIST_QUOTE_CAP = 20;
+
 /** Parent terminal identity is forwarded to the child when present (D5). */
 const TERMINAL_IDENTITY_ENV_KEYS = ["TERM", "TERM_PROGRAM", "COLORTERM"] as const;
 
@@ -769,12 +780,23 @@ export class TerminalSupervisor implements LegionSupervisor {
 				await rollbackRemoteWorktree();
 				await rollbackRemoteDir();
 				// The machine HAS models, just not this one — a different problem from
-				// `no-model`, with different fixes. Quote what it does serve (first five)
-				// so the operator can pick a reachable model instead of guessing. Parse
-				// STDOUT only: stderr warnings would otherwise be read as model rows.
-				const listed = parseListModels(probeStdout).slice(0, 5);
+				// `no-model`, with different fixes. Quote what it does serve so the
+				// operator can pick a reachable model instead of guessing, and say what
+				// to add when it quotes NOTHING: an empty quote has one cause worth
+				// naming, and `(an empty listing)` told the reader nothing to try.
+				// Parse STDOUT only: stderr warnings would otherwise be read as model rows.
+				const served = parseListModels(probeStdout);
+				const quoted = served.slice(0, MODEL_LIST_QUOTE_CAP);
+				const hidden = served.length - quoted.length;
+				const address = `subagents.crossMachine.hosts.${target.host}.piExtensions`;
+				const listing = quoted.length > 0
+					? `that machine lists:\n${quoted.join("\n")}${hidden > 0 ? `\nand ${hidden} more` : ""}\nPoint this launch at a model that machine serves (the role's \`model\`, \`subagents.defaultModel\`, or \`agentOverrides.<role>.model\`), or put the provider extension that publishes '${input.model}' into ${address}.`
+					// An empty LISTING (not an empty machine): the probe ran the child's own
+					// argv with `--no-extensions`, which hides every provider installed there
+					// as an extension — the one fix the reader can actually apply.
+					: `the probe saw NO model on that machine — \`--no-extensions\` hides every provider that is installed there as an extension, so add the provider extension that publishes '${input.model}' to ${address} (\`/legion doctor crossmachine\` shows the same listing).`;
 				throw new SubagentError(
-					`host '${target.host}': the child's model '${input.model}' is not visible there — that machine lists:\n${listed.length > 0 ? listed.join("\n") : "(an empty listing)"}\nPoint this launch at a model that machine serves (the role's \`model\`, \`subagents.defaultModel\`, or \`agentOverrides.<role>.model\`), or put the provider extension that publishes '${input.model}' into subagents.crossMachine.hosts.${target.host}.piExtensions. A model that is LISTED there is enough: the probe does not need a credential.${reproduce}`,
+					`host '${target.host}': the child's model '${input.model}' is not visible there — ${listing} A model that is LISTED there is enough: the probe does not need a credential.${reproduce}`,
 					ErrorCodes.INVALID_PARAMS,
 					{ host: target.host, probe: "model-missing", model: input.model },
 				);

@@ -4707,6 +4707,7 @@ async function launchFamily(input: {
 
 	const session: LaunchSession = {
 		params,
+		sessionCwd: ctx.cwd,
 		signal: input.signal,
 		teamOverride: params.team,
 		store,
@@ -4827,6 +4828,12 @@ async function launchFamily(input: {
 /** Accumulated state for one launch-family request. */
 interface LaunchSession {
 	params: SubagentParams;
+	/**
+	 * This session's directory (`ctx.cwd`) — the base a RELATIVE `cwd` resolves
+	 * against when the launch names a `host` (`first-run-success-v1` D5).
+	 * Distinct from `store`/orchestrator `cwd`, which is where records live.
+	 */
+	sessionCwd: string;
 	signal?: AbortSignal;
 	teamOverride?: string;
 	store: RunStore;
@@ -4902,6 +4909,32 @@ export function cwdIsRemote(params: { host?: string; cwd?: string; hostCwd?: str
 	// `hostCwd` is remote by definition; `cwd` only when it is absolute (relative
 	// keeps its long-standing local meaning, see the doc comment above).
 	return absoluteRemotePath(params.cwd) !== undefined || absoluteRemotePath(params.hostCwd) !== undefined;
+}
+
+/**
+ * The parent checkout a cross-machine delivery is made FROM
+ * (contract `first-run-success-v1` D5).
+ *
+ * The promised semantics of `cwd` next to `host`: a RELATIVE value names a
+ * checkout on THIS machine, an ABSOLUTE one is the directory ON that machine
+ * (`hostCwd` is the unambiguous spelling of it). So the parent side is
+ * `path.resolve(sessionCwd, <first relative cwd>)` — and `sessionCwd` itself when
+ * no candidate is relative, which is exactly the old behaviour for a launch that
+ * named no directory at all.
+ *
+ * The candidates are tried in precedence order (a step's own value wins over the
+ * call-level one). An ABSOLUTE candidate is skipped rather than resolved: it
+ * describes the other machine, and asking git about it here is the bug this
+ * function exists to remove.
+ */
+export function localRepoFor(sessionCwd: string, ...candidates: Array<unknown>): string {
+	for (const candidate of candidates) {
+		const text = nonBlankText(candidate);
+		if (text === undefined) continue;
+		if (absoluteRemotePath(text) !== undefined) continue;
+		return path.resolve(sessionCwd, text);
+	}
+	return sessionCwd;
 }
 
 async function launchStep(
@@ -5036,6 +5069,11 @@ async function launchStep(
 			}),
 			...(host ? { host } : {}),
 			...(hostTarget ? { hostTarget } : {}),
+			// D5: a RELATIVE `cwd` next to `host` names the checkout on THIS machine
+			// the delivery is made from. Resolved here because only this layer knows the
+			// SESSION directory (`ctx.cwd`) — the orchestrator only knows the record
+			// directory, and asking git about that one is the bug (`localRepoFor`).
+			...(host ? { localRepo: localRepoFor(session.sessionCwd, step.cwd, session.params.cwd) } : {}),
 			// #371: a phase machine is declared by the ROOT at dispatch time and is a
 			// property of the launch, not of a step — `tasks[]` fan-out carries the
 			// same declaration to every sibling (G3 then refuses any step that is not
@@ -5577,6 +5615,9 @@ async function launchUtilityFamily(input: {
 				...(item.step.worktree !== undefined ? { worktree: item.step.worktree } : {}),
 				...(stepHost ? { host: stepHost } : {}),
 				...(stepTarget ? { hostTarget: stepTarget } : {}),
+				// D5: same rule as `launchStep` — the step's own RELATIVE `cwd` names the
+				// checkout on THIS machine; the call-level value is its fallback.
+				...(stepHost ? { localRepo: localRepoFor(input.sessionCwd, item.step.cwd, input.params.cwd) } : {}),
 				utilityDispatch: true,
 				stripLegionIdentity: true,
 			});

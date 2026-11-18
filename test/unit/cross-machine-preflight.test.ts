@@ -234,7 +234,7 @@ test("D5 step 1: a machine without git is `local-git`, and nothing remote is ask
 			"this machine has no usable git (git --version exited 1: git: simulated failure); " +
 				"a cross-machine centurion delivers through git worktrees, so git must be on PATH here too. " +
 				"Two ways out: 1) install git here and retry; " +
-				'2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "vps", task: "..." }) needs no worktree and no git.',
+				'2) drop the worktree delivery and dispatch the centurion — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), and launched without `worktree: true` it needs no git here; the scout or worker it creates is born ON \'vps\'.',
 		);
 		assert.deepEqual(client.calls, [], "step 1 is local: the machine is not contacted at all");
 		assert.equal(recorded().ok, false);
@@ -260,8 +260,10 @@ test("D5 step 2: this checkout has no origin — the D6 sentence with two ways o
 			`cross-machine delivery needs one shared remote: this checkout (${local.repo}) has no origin. ` +
 				`Two ways out: 1) add one and retry — git -C ${local.repo} remote add origin <url> ` +
 				"(the machine 'vps' must be able to reach the same url); " +
-				'2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "vps", task: "..." }) needs no origin.',
+				`2) dispatch the centurion instead and let IT create the worker on 'vps' — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), while a scout or a worker is created ON that machine by the centurion running there.`,
 		);
+		// BUG B: the second way out names no call `allowRoles` would refuse.
+		assert.doesNotMatch(error.message, /subagent\(\{ agent: "worker"/);
 		assert.deepEqual(client.calls, [], "the local half answers before the machine is contacted");
 		const report = recorded();
 		assert.equal(report.ok, false);

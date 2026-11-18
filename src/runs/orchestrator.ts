@@ -242,6 +242,19 @@ export interface LaunchInput {
 	 * refused here (D1/`resolveHostTarget`), never guessed.
 	 */
 	hostTarget?: HostTarget;
+	/**
+	 * The parent checkout a cross-machine delivery is made FROM
+	 * (`first-run-success-v1` D5), when it is not {@link Orchestrator}'s own
+	 * `cwd`.
+	 *
+	 * `cwd` cannot carry it: it is the caller's record directory (and the remote
+	 * launch already uses it for the LOCAL side of the argv path map), while with
+	 * `host` named a RELATIVE `cwd` names a checkout on THIS machine — resolved
+	 * by the caller, which is the only layer that knows this session's directory.
+	 * Absent (resume/revive, which have no caller directory) keeps the previous
+	 * behaviour byte for byte: `this.cwd`.
+	 */
+	localRepo?: string;
 	modelOrigin?: ModelOrigin;
 	/** Vexillatio launch: bypass nested-depth gates while recording its parent-side Legion node. */
 	utilityDispatch?: boolean;
@@ -1357,6 +1370,12 @@ export class Orchestrator {
 		// whitespace-only all mean this host, so every downstream read is a plain
 		// truthiness test on a normalized value instead of a per-site guess.
 		const host = normalizeHost(input.host);
+		// The parent checkout a cross-machine delivery is made FROM (D5). `this.cwd` is
+		// the caller's record directory — which, with `host` named and a RELATIVE
+		// `cwd`, is NOT the checkout the caller pointed at. The caller resolves that
+		// (`LaunchInput.localRepo`); a resume/revive has no caller directory and keeps
+		// `this.cwd`, unchanged.
+		const localRepo = input.localRepo ?? this.cwd;
 		const nodeId = this.legion ? nodeIdForChild(this.legion.nodeId, name) : undefined;
 		const ledgerPrevious = nodeId ? getNode(this.legion!.db, nodeId) : null;
 		// D3-a: a `queued` record carries a PLACEHOLDER session file, so it must never
@@ -1526,7 +1545,11 @@ export class Orchestrator {
 			await this.supervisor.preflightRemoteDelivery?.({
 				host,
 				target: input.hostTarget,
-				localRepo: this.cwd,
+				// D5: the checkout the CALLER delivers from, not this process's record
+				// directory. A relative `cwd` next to `host` names a checkout here, and
+				// asking git about the wrong directory is what refused a launch that
+				// could have worked.
+				localRepo,
 			});
 		}
 		// #371 G2: a phase machine is the root's declaration about a team IT owns.
@@ -1756,7 +1779,9 @@ export class Orchestrator {
 					// argv path map (`mapRemoteArgPath`) re-roots onto the other machine, and
 					// the backend replaces it with the remote directory before spawning. Using
 					// the remote tree path here would make a remote path look like a local one.
-					cwd: host !== undefined ? this.cwd : worktreePath ?? this.cwd,
+					// For a remote launch that checkout is `localRepo` — the backend also asks
+					// git about it (`createRemoteChildWorktree`) before making the tree.
+					cwd: host !== undefined ? localRepo : worktreePath ?? this.cwd,
 					env: childEnv,
 					// S0: carried, never acted on beyond the terminal backend's `on`. S1 adds
 					// the resolved target: the remote cwd/argv/env/labels/preflight all come

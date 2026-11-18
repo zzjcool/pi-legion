@@ -963,3 +963,63 @@ test("xm-dispatch D4: crossMachine.allowRoles is parsed, and a wrong shape is re
 		/at least one role name/,
 	);
 });
+
+// ── C: the model-mismatch refusal must say what that machine serves ─────────
+
+/** Run `spawnChild` with a probe that answers `stdout`/`stderr`, return the refusal. */
+async function modelRefusal(listing: { stdout: string; stderr: string }): Promise<string> {
+	const h = harness(localEnv());
+	try {
+		h.client.on("machine.exec", (params: Record<string, unknown>) => {
+			if (!String(params.line ?? "").includes("--list-models")) return { code: 0, stdout: "", stderr: "", timed_out: false };
+			return { code: 0, stdout: b64(listing.stdout), stderr: b64(listing.stderr), timed_out: false };
+		});
+		const error = await h.supervisor
+			.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget(), model: "workbuddy/deepseek-v4.1-flash" }))
+			.then(() => undefined, (thrown: unknown) => thrown);
+		assert.ok(error instanceof SubagentError, `expected a model refusal, got ${String(error)}`);
+		const message = (error as SubagentError).message;
+		assert.match(message, /is not visible there/);
+		const details = (error as SubagentError).details as Record<string, unknown> | undefined;
+		assert.equal(details?.probe, "model-missing");
+		return message;
+	} finally {
+		h.cleanup();
+	}
+}
+
+/** A `--list-models` table of `count` rows, none of them the launch's model. */
+function listingOf(count: number): string {
+	const rows = Array.from({ length: count }, (_, index) => `some-provider\tserved/model-${index + 1}\t128k\t8k\tyes\tno`);
+	return ["provider\tmodel\tcontext\tmax-out\tthinking\timages", ...rows].join("\n") + "\n";
+}
+
+test("S5.6: the model refusal quotes SEVEN models — none dropped without saying so", async () => {
+	// Five was the old cap: a machine with a bigger registry looked like it had
+	// exactly those, and the model the operator needed was silently cut off.
+	const message = await modelRefusal({ stdout: listingOf(7), stderr: "" });
+	for (let index = 1; index <= 7; index += 1) {
+		assert.ok(message.includes(`some-provider/served/model-${index}`), `model-${index} must be listed: ${message}`);
+	}
+	assert.doesNotMatch(message, /and \d+ more/, "nothing is hidden at seven");
+});
+
+test("S5.6: a long registry quotes twenty and SAYS how many it left out", async () => {
+	const message = await modelRefusal({ stdout: listingOf(25), stderr: "" });
+	assert.ok(message.includes("some-provider/served/model-20"), "the twentieth entry is still printed");
+	assert.equal(message.includes("some-provider/served/model-21"), false);
+	assert.match(message, /and 5 more/, "truncation is announced, never silent");
+});
+
+test("S5.6: an EMPTY listing says what to add, not `(an empty listing)`", async () => {
+	// The shape that produced the useless sentence: the table reached the verdict
+	// (stderr) while stdout — the only stream the listing is parsed from — was empty.
+	const message = await modelRefusal({ stdout: "", stderr: listingOf(3) });
+	assert.doesNotMatch(message, /\(an empty listing\)/);
+	assert.doesNotMatch(message, /--- and \d+ more/);
+	// The cause AND the key, because `--no-extensions` is what hid the provider.
+	assert.match(message, /the probe saw NO model on that machine/);
+	assert.match(message, /`--no-extensions` hides every provider that is installed there as an extension/);
+	assert.ok(message.includes("subagents.crossMachine.hosts.vps.piExtensions"), message);
+	assert.match(message, /\/legion doctor crossmachine/, "the same listing is readable from doctor");
+});

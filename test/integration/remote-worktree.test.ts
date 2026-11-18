@@ -401,11 +401,13 @@ test("D5: a cwd that is not a checkout here is named as the SESSION's directory,
 	assert.doesNotMatch(message, /remote add/, "`git remote add` cannot work in a non-repository");
 	assert.equal(
 		message,
-		`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${plain}) is not one. ` +
+		`cross-machine delivery needs a git checkout on this machine too, and the directory it delivers from (${plain}) is not one. ` +
 			"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
 			`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "fakebox", cwd: "../my-repo", hostCwd: "/abs/path/on/fakebox", task: "..." }); ` +
-			'2) dispatch a worker instead — subagent({ agent: "worker", host: "fakebox", task: "..." }) needs no checkout and no origin.',
+			`2) dispatch the centurion instead and let IT create the worker on 'fakebox' — a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session at all (the default list is ["centurion"]), while a scout or a worker is created ON that machine by the centurion running there.`,
 	);
+	// BUG B: no forbidden `subagent({ agent: "worker", … })` call in any message.
+	assert.doesNotMatch(message, /subagent\(\{ agent: "worker"/);
 	// The real spawn path stops before a tree or a terminal exists.
 	assert.deepEqual(h.wireFor("terminal.run"), [], "no terminal may be created for a local non-checkout");
 	const commands = h.wireFor("machine.exec").map((params) =>

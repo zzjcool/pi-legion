@@ -481,7 +481,10 @@ test("D5: a session directory that is not a checkout gets D5's sentence, not `gi
 		assert.equal(parent.status, "fail");
 		// The D5 sentence, verbatim (a paraphrase would let the bad advice return).
 		assert.match(parent.line, /cross-machine delivery needs a git checkout on this machine too/);
-		assert.match(parent.line, /this session's directory \(\/Users\/me\/agents\) is not one/);
+		// The directory NAMED is the one the delivery asks git about (D5: a relative
+		// cwd resolves to the caller's checkout, so "this session's directory" would
+		// be a lie for that shape).
+		assert.match(parent.line, /the directory it delivers from \(\/Users\/me\/agents\) is not one/);
 		assert.match(parent.line, /start pi inside yours, or pass a relative cwd/);
 		assert.doesNotMatch(parent.line, /remote add origin/);
 		// …and the pasteable next step names the REAL first host.

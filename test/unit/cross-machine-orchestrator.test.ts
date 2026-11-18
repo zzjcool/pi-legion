@@ -17,9 +17,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { renderCollect } from "../../index.ts";
+import { lastDeliveryPreflight, preflightDelivery, resetDeliveryPreflightState } from "../../src/runs/cross-machine-preflight.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import type { RemoteReadbackResult, RemoteSessionRequest } from "../../src/runs/remote-artifact.ts";
 import { resolveHostTarget, type HostTarget } from "../../src/runs/remote.ts";
+import type { HcClient, HcMethod } from "../../src/hc/client.ts";
 import { NO_ASSISTANT_ABORT_REASON } from "../../src/shared/session.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
@@ -555,3 +557,168 @@ test("D15: a local retire keeps today's verdict — a transcript with no reply i
 		h.cleanup();
 	}
 });
+
+// ── D5: the CALLER's checkout, not this process's record directory ──────────
+//
+// The released bug: a launch with `host` + a RELATIVE `cwd` refused with "this
+// session's directory (<session dir>) is not a checkout" even though the relative
+// `cwd` named a real clone. The preflight was asking git about `Orchestrator.cwd`
+// (the record directory) because `LaunchInput` had no way to carry the caller's.
+//
+// The seam below is the real one (`preflightRemoteDelivery` → the frozen D5 order)
+// over a fake `hc` client, so these tests pin the ARGUMENT the preflight asks git
+// about — not merely that a call happened.
+
+/** A minimal `hc` client: the target answers every question code 0. */
+class FakeDeliveryClient implements HcClient {
+	readonly commands: string[] = [];
+	private readonly origin: string;
+
+	constructor(origin: string) {
+		this.origin = origin;
+	}
+
+	async start(): Promise<void> {}
+	close(): void {}
+
+	async request<T = unknown>(method: HcMethod, params: Record<string, unknown> = {}): Promise<T> {
+		if (method !== "machine.exec") throw new Error(`fake delivery client: unexpected ${method}`);
+		const command = Array.isArray(params.argv) ? (params.argv as string[]).join(" ") : String(params.line ?? "");
+		this.commands.push(command);
+		// Only `origin` has an answer that matters; `test -d`, `git --version`,
+		// `rev-parse --git-dir` and `ls-remote` all succeed on that machine.
+		const answer = command.includes("remote get-url origin")
+			? { code: 0, stdout: Buffer.from(this.origin).toString("base64"), stderr: "", timed_out: false }
+			: { code: 0, stdout: "", stderr: "", timed_out: false };
+		return answer as T;
+	}
+}
+
+/** Records the D7 seam AND answers it with the real preflight. */
+class DeliveryPreflightSupervisor extends FakeSupervisor {
+	readonly preflights: Array<{ host: string; target: HostTarget; localRepo: string }> = [];
+	private readonly deliveryClient: FakeDeliveryClient;
+
+	constructor(deliveryClient: FakeDeliveryClient) {
+		super();
+		this.deliveryClient = deliveryClient;
+	}
+
+	async preflightRemoteDelivery(input: { host: string; target: HostTarget; localRepo: string }) {
+		this.preflights.push(input);
+		return preflightDelivery({ client: this.deliveryClient, target: input.target, localRepo: input.localRepo });
+	}
+}
+
+/**
+ * A session directory that is NOT a checkout, plus the clone a relative `cwd`
+ * points at — the exact shape of the report (`/Users/…/agents` next to a repo).
+ */
+function deliveryHarness(prefix: string) {
+	const root = mkdtempSync(path.join(tmpdir(), prefix));
+	const sessionDir = path.join(root, "agents");
+	mkdirSync(sessionDir, { recursive: true });
+	const origin = "git@example.com:acme/pi-legion.git";
+	const repo = path.join(root, "my-repo");
+	execFileSync("git", ["init", "-q", repo]);
+	execFileSync("git", ["-C", repo, "remote", "add", "origin", origin]);
+	const client = new FakeDeliveryClient(origin);
+	const supervisor = new DeliveryPreflightSupervisor(client);
+	const orchestrator = new Orchestrator({ supervisor, runDir: path.join(root, "run"), cwd: sessionDir });
+	return {
+		root,
+		sessionDir,
+		repo,
+		client,
+		supervisor,
+		orchestrator,
+		cleanup: () => rmSync(root, { recursive: true, force: true }),
+	};
+}
+
+test("D5: `localRepo` is the checkout the delivery asks git about, not this record dir", async () => {
+	resetDeliveryPreflightState();
+	const h = deliveryHarness("xm-local-repo-");
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({
+				agent: agent({ worktree: true }),
+				task: "t",
+				host: HOST,
+				hostTarget: target(),
+				worktree: true,
+				// What index.ts computes for `cwd: "../my-repo"` next to `host`.
+				localRepo: path.resolve(h.sessionDir, "../my-repo"),
+			});
+			assert.equal(h.supervisor.preflights.length, 1, "the D7 preflight must run once");
+			const asked = h.supervisor.preflights[0]!;
+			assert.equal(asked.localRepo, h.repo, "the preflight asks about the CALLER's checkout");
+			assert.notEqual(asked.localRepo, h.sessionDir, "never the record directory");
+			// The preflight PASSED (this clone has an origin, the target answers), so
+			// the target really was reached instead of being refused for a local fact.
+			const report = lastDeliveryPreflight();
+			assert.equal(report?.ok, true, `the delivery must pass, got ${JSON.stringify(report?.failure)}`);
+			assert.notEqual(report?.failure?.category, "local-origin");
+			assert.ok(h.client.commands.length > 0, "the target was probed");
+			// The tree is created FROM that checkout too (the backend reads the same
+			// value as its spawn cwd).
+			const spawn = h.supervisor.calls.find((call) => call.method === "spawnChild");
+			assert.equal(spawn?.input?.cwd, h.repo, "createRemoteChildWorktree gets the caller's checkout");
+			assert.equal(handle.child.host, HOST);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("D5: a relative `cwd` that is NOT a checkout is refused, naming the RESOLVED directory", async () => {
+	resetDeliveryPreflightState();
+	const h = deliveryHarness("xm-local-repo-missing-");
+	const resolved = path.resolve(h.sessionDir, "../no-such-repo");
+	await insideHcTerminal(async () => {
+		try {
+			const error = await h.orchestrator
+				.launch({
+					agent: agent({ worktree: true }),
+					task: "t",
+					host: HOST,
+					hostTarget: target(),
+					worktree: true,
+					localRepo: resolved,
+				})
+				.then(() => undefined, (thrown: unknown) => thrown);
+			assert.ok(error instanceof SubagentError, `expected a refusal, got ${String(error)}`);
+			const message = (error as SubagentError).message;
+			assert.match(message, /cross-machine delivery needs a git checkout on this machine too/);
+			assert.ok(message.includes(resolved), `the message must name ${resolved}: ${message}`);
+			assert.equal(
+				message.includes(`(${h.sessionDir})`),
+				false,
+				"the SESSION directory is not what the caller pointed at",
+			);
+			assert.equal(h.supervisor.calls.filter((call) => call.method === "spawnChild").length, 0);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("D5: no `localRepo` keeps the old behaviour — resume/revive still read this record dir", async () => {
+	// Resume and revive have no caller directory to carry. Their argument must stay
+	// `this.cwd`, or a remote resume would start asking git about a path nobody named.
+	resetDeliveryPreflightState();
+	const h = deliveryHarness("xm-local-repo-absent-");
+	await insideHcTerminal(async () => {
+		try {
+			const error = await h.orchestrator
+				.launch({ agent: agent({ worktree: true }), task: "t", host: HOST, hostTarget: target(), worktree: true })
+				.then(() => undefined, (thrown: unknown) => thrown);
+			assert.ok(error instanceof SubagentError, `expected a refusal, got ${String(error)}`);
+			assert.equal(h.supervisor.preflights.length, 1);
+			assert.equal(h.supervisor.preflights[0]!.localRepo, h.sessionDir, "absent = the record directory, unchanged");
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+

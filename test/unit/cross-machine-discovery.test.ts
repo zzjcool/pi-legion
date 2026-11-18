@@ -45,7 +45,7 @@ import {
 	type HcExecResult,
 } from "../../src/runs/remote.ts";
 import { ErrorCodes, SubagentError, type SubagentsSettings } from "../../src/shared/types.ts";
-import { cwdIsRemote, firstRemoteCwd } from "../../index.ts";
+import { cwdIsRemote, firstRemoteCwd, localRepoFor } from "../../index.ts";
 
 // ── fixtures ───────────────────────────────────────────────────────────────
 
@@ -950,6 +950,23 @@ test("v1.1 tool params: an absolute cwd next to a host is REMOTE, a relative one
 	assert.equal(cwdIsRemote({ cwd: "/srv/proj" }), false, "no host = local, exactly as before");
 	assert.equal(cwdIsRemote({ host: "vps", cwd: "sub/dir" }), false, "relative keeps its local meaning");
 	assert.equal(cwdIsRemote({ host: "vps", hostCwd: "/srv/proj" }), true);
+});
+
+test("D5: `localRepoFor` resolves a RELATIVE cwd against the SESSION dir and never the remote one", () => {
+	// The reported bug: with `host` named, a relative `cwd` points at a checkout on
+	// THIS machine, so the parent side is that resolved directory — while an
+	// ABSOLUTE `cwd` (or `hostCwd`) is the directory ON that machine and must not
+	// be handed to git here.
+	assert.equal(localRepoFor("/Users/me/agents", "../my-repo"), path.resolve("/Users/me/agents", "../my-repo"));
+	assert.equal(localRepoFor("/Users/me/agents", "sub/dir"), "/Users/me/agents/sub/dir");
+	// Absolute = remote: skipped, so the session directory stays the parent side.
+	assert.equal(localRepoFor("/Users/me/agents", "/srv/app"), "/Users/me/agents");
+	assert.equal(localRepoFor("/Users/me/agents"), "/Users/me/agents", "nothing named = the session dir, exactly as before");
+	assert.equal(localRepoFor("/Users/me/agents", "   ", ""), "/Users/me/agents", "blank is not a path");
+	// Step precedence: a step's own relative cwd wins over the call-level one, and a
+	// remote step cwd falls through to a local call-level cwd.
+	assert.equal(localRepoFor("/session", "step/dir", "call/dir"), "/session/step/dir");
+	assert.equal(localRepoFor("/session", "/srv/step", "call/dir"), "/session/call/dir");
 });
 
 test("v1.1 machine.list parsing survives the shapes a core may answer", () => {
