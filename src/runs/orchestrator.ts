@@ -370,6 +370,21 @@ export interface CollectResult {
 		localPath?: string;
 		/** Set when the read-back failed outright; the collect then has no text. */
 		reason?: string;
+		/**
+		 * `remote-child-fate-v1` §5: WHY the read-back failed, as a class.
+		 *
+		 * Absent on a successful read-back (there is no failure to classify) and on
+		 * the legacy failure shape a caller may still hand the render. When present,
+		 * the render appends `· read-back: <fate>` to the execution line, so the
+		 * verdict line can never leave `unknown` unexplained.
+		 */
+		fate?: "no-child" | "no-session" | "path" | "unreachable";
+		/** 1..5 short lines: what the parent actually saw ("terminal finished"). */
+		evidence?: string[];
+		/** One actionable sentence. Never empty when `fate` is set. */
+		nextStep?: string;
+		/** The child's own last screen lines, when the probe could read them. */
+		screenTail?: string[];
 	};
 }
 
@@ -698,7 +713,21 @@ export class Orchestrator {
 	private readbackFacts(child: ChildRecord): CollectResult["remoteReadback"] {
 		const remote = this.remoteSessions.get(child.name);
 		if (remote === undefined) return undefined;
-		if (!remote.ok) return { host: remote.host, lines: 0, returned: 0, truncated: false, reason: remote.reason };
+		if (!remote.ok) {
+			// The class, its evidence and the next step travel with the failure (§5):
+			// a bare `not_found` is what made a dead remote launch unreadable.
+			return {
+				host: remote.host,
+				lines: 0,
+				returned: 0,
+				truncated: false,
+				reason: remote.reason,
+				fate: remote.fate,
+				evidence: remote.evidence,
+				nextStep: remote.nextStep,
+				...(remote.screenTail && remote.screenTail.length > 0 ? { screenTail: remote.screenTail } : {}),
+			};
+		}
 		return {
 			host: remote.host,
 			lines: remote.lines,
@@ -1695,6 +1724,9 @@ export class Orchestrator {
 				// S4/m6: the mirror dir is a fact the backend reports (the orchestrator
 				// cannot compute it: only the backend knows the run id it used).
 				if (result.remoteDir) previous.remoteDir = result.remoteDir;
+				// `remote-child-fate-v1` §3: same reason, one hop further — the address the
+				// core really holds, so a later process asks about that very terminal.
+				if (result.remoteTerminal) previous.remoteTerminal = result.remoteTerminal;
 				this.children.set(name, previous);
 			}
 			const child = previous ?? this.recordChild({
@@ -1728,6 +1760,7 @@ export class Orchestrator {
 				...(host ? { host } : {}),
 				...(appliedWorktreeHost ? { worktreeHost: appliedWorktreeHost } : {}),
 				...(result.remoteDir ? { remoteDir: result.remoteDir } : {}),
+				...(result.remoteTerminal ? { remoteTerminal: result.remoteTerminal } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
 			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
@@ -2672,6 +2705,10 @@ export class Orchestrator {
 		worktreeHost?: string;
 		/** Machine this child runs on; absent = this host (contract D5). */
 		host?: string;
+		/** Mirrored-argv dir on that machine (`remote-child-fate-v1` §3). */
+		remoteDir?: string;
+		/** The address the core really holds for this child's terminal. */
+		remoteTerminal?: string;
 	}): ChildRecord {
 		const child: ChildRecord = {
 			name: input.name,
@@ -2694,6 +2731,8 @@ export class Orchestrator {
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
 			...(input.worktreeHost ? { worktreeHost: input.worktreeHost } : {}),
 			...(input.host ? { host: input.host } : {}),
+			...(input.remoteDir ? { remoteDir: input.remoteDir } : {}),
+			...(input.remoteTerminal ? { remoteTerminal: input.remoteTerminal } : {}),
 		};
 		this.children.set(input.name, child);
 		this.spawned += 1;
@@ -2837,6 +2876,10 @@ export class Orchestrator {
 				name: child.name,
 				localPath: remoteMirrorPathFor(this.runDir, child.name),
 				...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+				// The address the core really holds: the core may have shortened the name
+				// it was asked for, and asking about a name that never existed would
+				// report "the core does not know it" as a verdict.
+				...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
 			};
 			this.remoteSessions.set(child.name, await this.remoteReadback(request));
 		}

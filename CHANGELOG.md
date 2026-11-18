@@ -44,6 +44,48 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 契约增补：`docs/contracts/cross-machine-spawn-v1.md` Addendum v1.1；
 报告：`docs/reports/cross-machine-host-discovery.md`。
 
+### Fixed（v1.2，远端 child 启动期死亡不再静默）
+
+远端 child 的 stdout/stderr/退出码从来不会被读回，唯一的结果载体是那台机器上的
+`<remoteDir>/session.jsonl`。于是「child 死在第一个 turn 之前」在父会话里只剩一个观测：
+`execution: unknown (no messages in session)` + 一句 `read-back … FAILED — not_found`，
+既没有原因也没有下一步。实测（pi 1.5.2）：`-e <不存在的路径>` 与不可用的模型都会让 `pi`
+**exit 1 且不创建会话文件**——所以「没有转录」就是「启动期死了」，不是「跑完了没说话」。
+契约 `docs/contracts/remote-child-fate-v1.md`；运维版 `docs/runbooks/cross-machine-live-e2e.md` §3.6。
+本机 launch 逐字节不变。
+
+- **启动期死亡在 launch 阶段被证明，而不是 collect 时猜**：remote launch 在 `terminal.run`
+  之后过一道启动确认门（`REMOTE_STARTUP_CONFIRM_MS = 8_000`，500ms 一轮，
+  `TerminalSupervisorOptions.remoteStartupConfirmMs` 可调/可关）。每轮读一次
+  `<remoteDir>/session.jsonl`，而 `terminal.get` 报 `finished` 或数字 `exit_code` 即**证明已死**
+  → `START_FAILED`，报错里带退出码（或 `the core reported none`）、镜像目录现状、child 自己
+  渲染出的最后几行屏幕（它自己的 stderr/stdout）以及一行可复制的
+  `Command (run on '<host>' to reproduce):`。到点仍活着只是没写 ⇒ 只 warn 并照常 launch
+  （慢机器不是 bug），记录 `startupUnconfirmed: true`。`remoteStartupConfirmMs: 0` 保持旧行为。
+- **read-back 失败带上是哪一种「没有」**：`RemoteReadbackFailure` 增加
+  `fate`（`no-child` / `no-session` / `path` / `unreachable`）、`evidence`（1..5 行短证据，
+  如 `terminal finished`、`exit 1`、`dir holds: system-prompt.md`）与 `nextStep`，`reason`
+  保留 core 原文、渲染前缀不变。`no-child` = 终端已结束且没写转录；`no-session` = 还活着
+  但还没写（不是判决，附 `no pid` 那条证据）；`path` = 记录与当前配置的镜像目录不一致；
+  `unreachable` = target 解析失败 / core 起不来 / 探测的 `machine.exec` 被拒。
+  `CollectResult.remoteReadback` 带上三者，于是 `execution:` 不再把 `unknown` 留在那里：
+  追加 ` · read-back: <fate>`（例如
+  `execution: unknown (no messages in session) · read-back: no-child`）。`started` 永远不会
+  是失败：文件在而读失败一律归 `path`。**「死亡」是关于地址的断言**——没有
+  `remoteTerminal` 的旧记录只能推断终端地址，推断出的名字 core 不认识时**不判死**
+  （归 `no-session` 并在 evidence 里明说名字是推断的）。`ChildRecord` 因此新增
+  `remoteTerminal`（core 实际持有的 `host/mappedName`），供后续进程直接发问。
+- **`hosts.<host>.piExtensions` 在终端存在之前就按那台机器校验**：`remotePreflightScript`
+  对每个条目 `test -e`，第一个不存在就 **exit 17**：
+  `host '<host>': piExtensions entry '<entry>' does not exist on that machine (subagents.crossMachine.hosts.<host>.piExtensions is read ON <host>; …)`，
+  映射为 `INVALID_PARAMS` + details `{ host, missingExtension }`，且 `terminal.run` 一次都不发。
+  这类路径是 argv 里的 `--extension`，pi 对不存在的扩展 **exit 1**（pi 1.5.2 实测：
+  `Error: Failed to load extension "/missing/x/index.ts": Extension path does not exist`），
+  修复前只会表现为「转录一直没出现」。它与 v1.2 的按包名重锚互补：重锚管「同一个包在远端
+  换了个根」，这一条管「显式写下的路径在那台机器上根本不存在」。**v1.2 起不再有「映射不了
+  就丢弃 + 打一行 stderr」这条路**，所以本版也不再需要把被丢弃的扩展搬到结果里：映射不了
+  的启动前就拒绝了。
+
 ## [6.1.1] — 2026-11-17
 
 修跨机器派发不可用：`hosts.<h>.piExtensions` 曾被 settings 白名单静默丢弃，导致 provider 扩展

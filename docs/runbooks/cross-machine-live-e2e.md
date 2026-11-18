@@ -278,8 +278,169 @@ pi 对未注册 id 明确回答 `Using custom model id` 时也放行：custom id
 | `conflicts with` | 扩展重复 | 拒绝（INVALID_PARAMS），指向"别把已装扩展再加一次" |
 | 其他非 0 退出 | 该 argv 在那台机器上跑不起来 | 拒绝（START_FAILED），附 stderr 前 5 行 |
 | 退出 0 / 无结论（输出无法解析） | 正常 | 继续，创建终端 |
+| 探测**通过**（含 `Using custom model id` 放行），但 child 仍然**启动即死** | 探测只回答「模型可见」，不回答「起来之后会不会死」：`piExtensions` 里那一条在那台机器上不存在、或那台机器的模型凭据其实不可用，都会让 `pi` 在第一个 turn 之前退出 | **不再靠 collect 发现**：launch 阶段新增的**启动确认门**（`REMOTE_STARTUP_CONFIRM_MS = 8_000`，500ms 一轮）会给出 exit code + 终端屏幕尾部 + 可复现命令行。当前只对「**终端已结束且没有 transcript**」（`no-child`）硬失败；到点仍然活着只是没写，就只 warn 并照常 launch（见 §3.6） |
 
 探测**不可运行**时（`machine.exec` 本身失败）只打一行 stderr 并继续：它是诊断，不是门禁。
+
+## 3.6 远端 child 启动失败的三种形状（以及各自怎么读）
+
+> 契约：`docs/contracts/remote-child-fate-v1.md`（§2 分类 / §3 启动前检查 / §4 启动确认门 / §5 read-back 失败分类 / §6 渲染文本）。
+> 一句话前提：**远端 child 的 stdout/stderr/exit code 从来不会被读回**，唯一的结果载体是那台机器上的
+> `<remoteDir>/session.jsonl`。所以「没有 transcript」本身不是判决 —— 判决是**没有 transcript 的哪一种**。
+
+### 3.6.1 一张表：三种形状
+
+探针 `probeRemoteChild` 只做两次往返（`terminal.get` 拿 state / `exit_code` / screen，一次 `machine.exec` 打出
+`dir=1|0`、`session=1|0` 与 ≤12 行目录清单），判定顺序是**第一条命中的赢**：
+
+| 症状 | class | 含义（契约里冻结的 `summary` 原文） | 下一步（契约里冻结的 `nextStep` 原文） |
+|---|---|---|---|
+| 终端已经 `finished`，或 `terminal.get` 带数字 `exit_code`，或 core 已经不认得这个终端（`missing`）——而 `session.jsonl` 不存在 | `no-child` | the child's terminal ended before it wrote a transcript | run the command below on that machine: the child's own error is on its terminal, and pi exits before its first turn when a --extension / --model is not usable there |
+| 终端还活着（`live` / `running` / `idle`），`session.jsonl` 还不存在 | `no-session` | the child's terminal is alive but has written no transcript yet | collect after it reaches a turn, or `status` for liveness — a live terminal with no transcript is not a verdict |
+| 记录里持久化的 `remoteDir` 有值、且不等于 `dirname(sessionPath)` 算出来的目录 | `path` | the record and this configuration disagree about the mirror dir | the transcript may have landed in the recorded dir; fix `subagents.crossMachine.hosts.<host>.cwd`/`worktreeRoot`, or retire and relaunch the child |
+
+三类的**判定依据**分别就是上表第一列的症状：
+
+1. **`no-child`** = 「终端已经结束（`finished` / 有 `exit_code` / `missing`）却没有 transcript」。
+   这是**唯一**会让 launch 硬失败的一类（见 §3.6.5）。
+2. **`no-session`** = 「终端还活着但没写 transcript」。慢机器不是 bug，**不判死**，launch 照常继续。
+3. **`path`** = 「记录里的 `remoteDir` 与当前配置算出来的不一致」。它排在 `no-child` **之前**：
+   目录对不上时，「没找到转录」可能只是找错了地方，用终端状态判死就成了误判。
+
+`session.jsonl` 存在时探针回答 `started`（`summary`: the transcript exists on that machine）—— 这**不是**失败。
+连分类都做不到时（`resolveHostTarget` 拒绝、hc core 起不来、`machine.exec` 传输失败）不属于上面三类：
+read-back 会报四类里的第四类 **`unreachable`**，`nextStep` 点名该看哪个配置键或哪条连接。
+
+### 3.6.2 新渲染行的样子（逐字引用契约 §6）
+
+**(1) read-back 失败** —— 老前缀原样保留（既有断言与运维习惯都不变）：
+
+```text
+read-back from host '<host>': FAILED (<fate>) — <reason> (the verdict below rests on no transcript at all)
+  evidence: <evidence joined by "; ">
+  screen: <screenTail joined by " ⏎ ">          # only when the fate carries one
+  next: <nextStep>
+```
+
+`screen:` 那一行只在 fate 自带屏幕尾部时出现（契约里行尾那句注释就是在标注这件事）；`evidence` 是 1..5 行短证据，
+例如 `terminal finished`、`exit 1`、`dir holds: system-prompt.md`。
+
+**(2) `execution:` 行不再把 `unknown` 留在那里解释** —— 只要 `remoteReadback.fate` 有值，就追加 ` · read-back: <fate>`：
+
+```text
+execution: unknown (no messages in session) · read-back: no-child
+```
+
+这条后缀的意思是：**判词所依据的那次 read-back 是「一个字节都没有」里的哪一类**。
+`read-back: no-child` = 终端已经结束、没留转录（启动期就死了）；`read-back: no-session` = 终端还活着、只是还没写（不是判决）；
+`read-back: path` = 记录与配置的镜像目录不一致；`read-back: unreachable` = 连分类都没做到。
+`started` 不会出现在这里 —— 转录在，就构不成失败（契约 §5：*a failure is one of these four*）。
+
+**(3) 关于扩展：没有第三段了** —— v1.2 起，父机 argv 里的绝对扩展路径**要么按包名重锚到那台机器上的同一个包，
+要么启动前直接拒绝**（点名包名 / 父机路径 / 三种修法），不存在「悄悄丢掉一个扩展」这条路了。
+所以「child 少了一个 provider 扩展还在跑」这种状态在产品里不可达，渲染自然也没有对应的一段。
+
+### 3.6.3 `no-run` 不是故障信号
+
+镜像目录名里出现 `no-run`（形如 `~/.pi-subagents-mirror/no-run/<handle>/session.jsonl`，那台机器上的写法是
+`<remoteDir> = <checkout 的兄弟目录>/.pi-subagents-mirror/no-run/<handle>`）**不是**故障信号：
+生产里的 `index.ts` 用 `new TerminalSupervisor()` 起 supervisor，**不传 `runId`**，所以
+`remoteDirFor(target, undefined, name)` 永远算成 `…/no-run/<name>` —— launch 与 read-back 用的是同一个约定，
+两边一致。`no-run` 什么都不证明，**不要据此排查**。真要排查，看 §3.6.1 的三种形状和 §3.6.7 的三条命令。
+
+### 3.6.4 启动前的新检查：`piExtensions` 必须**在那台机器上**存在（preflight exit 17）
+
+`remotePreflightScript` 现在对 `hosts.<host>.piExtensions` 的每一个条目做 `test -e`；**第一个不存在的**就把它
+写进 stderr 并 **exit 17**，因此终端根本不会被创建（`terminal.run` 不会被调用）。文案形态（冻结）：
+
+```text
+host '<host>': piExtensions entry '<entry>' does not exist on that machine
+(subagents.crossMachine.hosts.<host>.piExtensions is read ON <host>; the child's
+argv loads it with --extension, so a missing file makes pi exit 1 before its
+first turn)
+```
+
+映射为 `ErrorCodes.INVALID_PARAMS`，details `{ host, missingExtension }`。
+
+**为什么要在启动前拦**：这些条目被原样追加成 child argv 的 `--extension <entry>`（它们本来就是那台机器上的路径，
+不经过 `pathMap`），而 `pi` 对不存在的扩展**直接 exit 1**（见 §3.6.6 本机实测）。也就是说，配置里写错一条路径，
+过去的症状是「child 一起来就没了、没有 transcript」；现在变成启动前一次点名该条的拒绝。手工确认：
+
+```bash
+hc exec --on vps -- sh -c 'test -e /root/.pi/agent/npm/node_modules/pi-any-endpoint/extensions/index.ts && echo ok'
+```
+
+### 3.6.5 launch 阶段的启动确认门（8 秒）与被丢弃的扩展
+
+`terminal.run` 返回地址之后，远端 launch 会做一次**启动确认**：`REMOTE_STARTUP_CONFIRM_MS = 8_000`，每 500ms
+用 `file.read {limit: 0}` 看 `<remoteDir>/session.jsonl` 是否已经出现。一轮里只有三种结局：
+
+1. `session.jsonl` 出现 ⇒ 确认，继续（正常路径，读者看不到任何额外输出）。
+2. `terminal.get` 报 `state === "finished"` 或带数字 `exit_code` ⇒ **证明死亡**，抛 `START_FAILED`。
+3. 到点两者都没有 ⇒ **只 warn 并照常 launch**，记录上打 `startupUnconfirmed: true`。**慢不是 bug**，不判死。
+
+第 2 种的文案（冻结）：
+
+```text
+host '<host>': the child did not survive startup — its terminal ended before it wrote <sessionPath>
+  exit: <code|the core reported none>
+  dir: <dirExists ? "the mirror dir is there" : "the mirror dir is gone"> (<dir>)
+  screen: <screenTail joined by " ⏎ " | "(the core reported none)">
+  next: <nextStep>
+  Command (run on '<host>' to reproduce):
+<remoteStartupProbeLine(argv, cwd)>
+```
+
+同一个错误码 `START_FAILED`，details `{ host, fate: "no-child", exitCode }`。
+
+门被关掉时（`TerminalSupervisorOptions.remoteStartupConfirmMs = 0`，假 core 的测试就是这样）⇒ 行为与今天完全一致。
+
+记录里还多了一个 `remoteTerminal`（core 真正持有的 `host/mappedName` 地址），这样后来的进程问这个终端时，
+不必再算一遍可能已经被截短的名字。**旧记录没有这个字段**：read-back 只能推断地址，而推断出来的名字不被当作
+「child 已结束」的证据（归 `no-session`，并在 `evidence` 里明说名字是推断的）。
+
+> §4 里 R1 的「判定点 ③（10 秒内 transcript 仍 0 行）」描述的是 **live e2e 用例自己的观测量**；
+> 生产代码不再因为「终端还活着但没写」判死 —— 那只是慢，只 warn（`startupUnconfirmed: true`）。
+
+### 3.6.6 为什么「没有会话文件」等于「启动期死了」（pi 1.5.2 本机实测）
+
+以下两条是 **pi 1.5.2 本机实测**（`node <cli.js>` 直跑，不是推断）：
+
+```bash
+# ① 扩展路径不存在 → 起来之前就退出，非 0
+node cli.js -ne -e /missing/x/index.ts -p ok
+# → exit 1
+# Error: Failed to load extension "/missing/x/index.ts": Extension path does not exist
+#（整行还会把路径再重复一遍，并附一行 Hint: Start without extensions using "pi -ne".）
+
+# ② 那台机器没有可用模型 → 起来之前就退出，且**没有**写出 session 文件
+node cli.js -ne --session /tmp/pc/session.jsonl -p ok
+# → exit 1
+# No API key found for the selected model.
+#   且 session.jsonl 没有被创建
+```
+
+结论：**child 启动期死掉时不会留下任何 transcript，所以「没有会话文件」等于「启动期死了」，不是「跑完了但没说话」。**
+这也是为什么 `no-child` 是唯一能判死的一类，而 `no-session` 不能。
+
+### 3.6.7 手工取证的 3 条命令（照抄级）
+
+`<host>/<terminal>` 就是记录里的 `remoteTerminal`（形如 `vps/lgl-worker-0`）。
+
+```bash
+# 1) 终端还在不在、core 自己记的 exit_code 是什么（不要在父机上猜；--json 可直接进脚本）
+hc get <host>/<terminal>
+
+# 2) 终端屏幕 / 历史：child 自己的 stderr/stdout 就在这里（pi 的 Error: 那一行）
+#    默认只打屏幕，要往上看就加 --lines <N>（历史在屏幕上方）
+hc read <host>/<terminal>
+
+# 3) 那台机器上的镜像目录到底有什么（session.jsonl 在不在、还剩什么残留）
+hc exec --on <host> -- sh -c 'ls -la <remoteDir>'
+```
+
+新的 launch 报错**已经自带** `Command (run on '<host>' to reproduce):` 那一行（就是 §3.6.5 里 `<remoteStartupProbeLine(argv, cwd)>`
+渲染出来的东西 —— child 的完整 argv 去掉 task）：照抄它到那台机器上跑，就不必自己拼 argv。
 
 ## 4. 剩余风险（S5 之后仍然存在的）
 

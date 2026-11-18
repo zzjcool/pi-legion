@@ -138,6 +138,9 @@ function harness(options: { remoteSubdir?: string } = {}): Harness {
 		env,
 		runId: "run-xm-1",
 		pollIntervalMs: 5,
+		// `remote-child-fate-v1` §4: the fake core's terminals write no session, so
+		// the remote start-up gate would only ever wait out its deadline here.
+		remoteStartupConfirmMs: 0,
 	});
 	// A real child's argv always carries this package's extension entry (args.ts),
 	// so the target must say where that lives on the "other machine" — here, a

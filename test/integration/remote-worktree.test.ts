@@ -152,7 +152,7 @@ function harness(options: { remoteIsRepo?: boolean } = {}): Harness {
 		request: async <T = unknown>(method: HcMethod, params: Record<string, unknown> = {}): Promise<T> =>
 			(await real.request<T>(method, params)) as T,
 	};
-	const supervisor = new TerminalSupervisor({ clientFactory: () => client, env, runId: "run-xm-2", pollIntervalMs: 5 });
+	const supervisor = new TerminalSupervisor({ clientFactory: () => client, env, runId: "run-xm-2", pollIntervalMs: 5, remoteStartupConfirmMs: 0 });
 	// The package's own extension entry is in EVERY child's argv and cannot be
 	// mapped by content, so the target says where it lives over there (D6).
 	const target = resolveHostTarget(HOST, {

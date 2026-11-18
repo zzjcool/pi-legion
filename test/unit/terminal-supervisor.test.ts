@@ -163,6 +163,10 @@ function harness(options: { env?: NodeJS.ProcessEnv; runId?: string; pollInterva
 		env: options.env ?? parentEnv(),
 		...(options.runId ? { runId: options.runId } : {}),
 		pollIntervalMs: options.pollIntervalMs ?? 5,
+		// `remote-child-fate-v1` §4: this harness is about the LOCAL transport, and
+		// its fake terminal never writes a session — the remote start-up gate could
+		// only ever wait out its deadline here.
+		remoteStartupConfirmMs: 0,
 	});
 	return {
 		client,

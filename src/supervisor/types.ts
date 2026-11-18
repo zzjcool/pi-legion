@@ -122,6 +122,19 @@ export interface ChildHandle {
 	 */
 	remoteDir?: string;
 	/**
+	 * The address the core actually holds for this child's terminal (`host/name`).
+	 *
+	 * The core may SHORTEN a name it already knows, so a later process cannot always
+	 * recompute the address the launch used. Recorded here so a collect can ask
+	 * about that very terminal instead of guessing a name it may never have had.
+	 */
+	remoteTerminal?: string;
+	/**
+	 * The launch gate could not confirm a transcript, but nothing proved the child
+	 * dead either (`remote-child-fate-v1` §4). A slow machine is not a bug.
+	 */
+	startupUnconfirmed?: boolean;
+	/**
 	 * In-process-only, NON-FATAL model-resolution notice (B5).
 	 *
 	 * `resolveCliModel` answers a `warning` for two legitimate situations — an

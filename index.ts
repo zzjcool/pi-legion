@@ -7468,6 +7468,14 @@ export function renderCollect(
 			byteCapped?: boolean;
 			localPath?: string;
 			reason?: string;
+			/** `remote-child-fate-v1` §5: why it failed, as a class. */
+			fate?: "no-child" | "no-session" | "path" | "unreachable";
+			/** 1..5 short lines of what the parent saw on that machine. */
+			evidence?: string[];
+			/** One actionable sentence. */
+			nextStep?: string;
+			/** The child's own last screen lines. */
+			screenTail?: string[];
 		};
 		/** §3 D1: the artifact this text came from, when a ledger row names one. */
 		artifactId?: string;
@@ -7495,9 +7503,13 @@ export function renderCollect(
 	 */
 	verification?: VerificationSummary | null,
 ): string {
+	// `remote-child-fate-v1` §6.2: an `unknown` execution on a remote child is not
+	// self-explanatory — the class of the failed read-back is the explanation, and
+	// the verdict line is where a parent looks first.
+	const readbackFate = collected.remoteReadback?.fate;
 	const lines = [
 		`── ${name} ──`,
-		`execution: ${collected.execution.status}${collected.execution.reason ? ` (${collected.execution.reason})` : ""}`,
+		`execution: ${collected.execution.status}${collected.execution.reason ? ` (${collected.execution.reason})` : ""}${readbackFate ? ` · read-back: ${readbackFate}` : ""}`,
 		`acceptance: ${collected.acceptance.status}${collected.acceptance.level ? ` (${collected.acceptance.level})` : ""}`,
 	];
 	// #5: the CONTRACT verification is a different fact from `acceptance` (that one is
@@ -7537,7 +7549,21 @@ export function renderCollect(
 	if (collected.remoteReadback) {
 		const readback = collected.remoteReadback;
 		if (readback.reason) {
-			lines.push(`read-back from host '${readback.host}': FAILED — ${readback.reason} (the verdict below rests on no transcript at all)`);
+			// The prefix is unchanged when no class is known (an older caller, or a
+			// failure the seam could not classify); with a class, the class plus its
+			// evidence and next step are what make the failure actionable.
+			if (readback.fate) {
+				lines.push(
+					`read-back from host '${readback.host}': FAILED (${readback.fate}) — ${readback.reason} (the verdict below rests on no transcript at all)`,
+				);
+				const evidence = readback.evidence ?? [];
+				if (evidence.length > 0) lines.push(`  evidence: ${evidence.join("; ")}`);
+				const screen = readback.screenTail ?? [];
+				if (screen.length > 0) lines.push(`  screen: ${screen.join(" ⏎ ")}`);
+				if (readback.nextStep) lines.push(`  next: ${readback.nextStep}`);
+			} else {
+				lines.push(`read-back from host '${readback.host}': FAILED — ${readback.reason} (the verdict below rests on no transcript at all)`);
+			}
 		} else if (readback.truncated) {
 			const what = readback.byteCapped ? "byte-capped by hc" : "tail only";
 			lines.push(

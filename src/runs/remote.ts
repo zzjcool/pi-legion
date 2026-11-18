@@ -1889,6 +1889,13 @@ export function remotePreflightScript(target: HostTarget): string {
 		// is missing the child either fails to start or starts without the guard
 		// extension -- the second is the silent failure, so it is checked here.
 		`test -f ${shQuote(path.posix.join(target.piLegionRoot, "index.ts"))} || exit 14`,
+		// `hosts.<host>.piExtensions` is read ON that machine and handed to `pi` as
+		// `--extension <path>`. A missing entry is not a warning there: `pi` exits 1
+		// before its first turn, and the parent only ever sees "no transcript". Asked
+		// here, the same fact becomes a refusal that names the file and the key. The
+		// path printed to stderr is what `remotePreflight` quotes back, because this
+		// script knows WHICH entry failed and the caller does not.
+		...target.piExtensions.map((entry) => `test -e ${shQuote(entry)} || { printf '%s\\n' ${shQuote(entry)} >&2; exit 17; }`),
 		// D7's second half (m3, review s01): the launch is refused when THAT core
 		// already carries legion identity. `terminal.run`'s `env` is a merge-only
 		// overlay with no delete semantics, so a child started there would inherit a
@@ -2013,11 +2020,277 @@ export async function remotePreflight(
 			{ host: target.host, piLegionRoot: target.piLegionRoot, code: 14 },
 		);
 	}
+	if (code === 17) {
+		// The script prints the first missing entry to stderr, so the message names the
+		// file rather than "one of your piExtensions". A script that printed nothing
+		// still has to produce actionable text: fall back to the declared list.
+		const missingExtension = execResultText(result).split("\n")[0]?.trim()
+			|| target.piExtensions[0]
+			|| "(unknown)";
+		throw new SubagentError(
+			`host '${target.host}': piExtensions entry '${missingExtension}' does not exist on that machine (subagents.crossMachine.hosts.${target.host}.piExtensions is read ON ${target.host}; the child's argv loads it with --extension, so a missing file makes pi exit 1 before its first turn)`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: target.host, missingExtension },
+		);
+	}
 	throw new SubagentError(
 		`host '${target.host}': preflight failed with exit code ${code} (${execResultText(result) || "no output"})`,
 		ErrorCodes.START_FAILED,
 		{ host: target.host, code },
 	);
+}
+
+// ── remote child fate (contract `remote-child-fate-v1` §2) ────────────────
+
+/**
+ * What the parent can prove about a remote child it holds no transcript for.
+ *
+ * `started` — the transcript is there. `no-child` — the terminal is over (or the
+ * core never knew it), so nothing more will ever be written. `no-session` — the
+ * terminal is alive and simply has not written yet. `path` — the record and the
+ * configuration disagree about the mirror dir, so the file may exist somewhere
+ * this reader is not looking.
+ */
+export type RemoteFateClass = "started" | "no-child" | "no-session" | "path";
+
+/** At most this many lines of the mirror dir travel back. */
+export const REMOTE_FATE_DIR_LINES = 12;
+
+/** The terminal's own words: at most this many trailing lines. */
+export const REMOTE_FATE_SCREEN_LINES = 6;
+
+/**
+ * One remote child, as far as this machine can see it.
+ *
+ * The fields are the EVIDENCE for {@link RemoteChildFate.kind}, not decoration:
+ * the parent renders them so an operator can act without attaching to the
+ * terminal, and every one of them is something a core actually answered.
+ */
+export interface RemoteChildFate {
+	kind: RemoteFateClass;
+	host: string;
+	/** `host/name` exactly as the launch addressed it. */
+	terminal: string;
+	/** `live` | `running` | `idle` | `finished` | `missing` (= the core does not know it). */
+	terminalState: string;
+	exitCode?: number;
+	/**
+	 * The pid the core reports for the child's program, when it reports one.
+	 *
+	 * A terminal can exist with nothing running in it (the core accepted the name
+	 * but no program was ever started), and that is a different fault from a child
+	 * that ran and stayed silent. `undefined` is not proof of either — it is the
+	 * answer this core gave.
+	 */
+	pid?: number;
+	/** Last non-empty lines the child's terminal rendered (its own stderr/stdout). At most 6. */
+	screenTail: string[];
+	sessionPath: string;
+	dir: string;
+	dirExists: boolean;
+	sessionExists: boolean;
+	/** At most 12 lines of the remote dir listing. */
+	dirLines: string[];
+	/** One sentence, no trailing period. What this class means. */
+	summary: string;
+	/** One sentence, actionable. Never empty. */
+	nextStep: string;
+}
+
+/**
+ * The frozen anchor sentences (contract §2), one pair per class.
+ *
+ * They are frozen because they are the only place the product turns a class
+ * into an instruction; a reworded sentence is a reworded verdict for whoever
+ * reads the parent's output. `<host>` is the single substitution — a config key
+ * the operator has to edit is useless without the host they must edit it for.
+ */
+const REMOTE_FATE_TEXT: Record<RemoteFateClass, { summary: string; nextStep: string }> = {
+	"no-child": {
+		summary: "the child's terminal ended before it wrote a transcript",
+		nextStep:
+			"run the command below on that machine: the child's own error is on its terminal, and pi exits before its first turn when a --extension / --model is not usable there",
+	},
+	"no-session": {
+		summary: "the child's terminal is alive but has written no transcript yet",
+		nextStep:
+			"collect after it reaches a turn, or `status` for liveness — a live terminal with no transcript is not a verdict",
+	},
+	path: {
+		summary: "the record and this configuration disagree about the mirror dir",
+		nextStep:
+			"the transcript may have landed in the recorded dir; fix `subagents.crossMachine.hosts.<host>.cwd`/`worktreeRoot`, or retire and relaunch the child",
+	},
+	started: {
+		summary: "the transcript exists on that machine",
+		nextStep: "—",
+	},
+};
+
+/** The frozen `nextStep` for one class, with `<host>` resolved to the real host. */
+export function remoteFateNextStep(kind: RemoteFateClass, host: string): string {
+	return REMOTE_FATE_TEXT[kind].nextStep.split("<host>").join(host);
+}
+
+/** The frozen `summary` for one class. */
+export function remoteFateSummary(kind: RemoteFateClass): string {
+	return REMOTE_FATE_TEXT[kind].summary;
+}
+
+/**
+ * The shell line that answers "what is on that machine" in one round trip.
+ *
+ * Three prefixed lines, never prose: the answer has to survive a core that
+ * prepends its own warnings to stdout. `dir=` and `session=` are existence
+ * facts (`test -d` / `test -e`), and `entry=` repeats the dir listing so an
+ * operator can see whether the mirror was ever written. Everything interpolated
+ * is `shQuote`d: a mirror path comes from operator settings.
+ */
+export function remoteChildProbeScript(sessionPath: string): string {
+	const dir = path.posix.dirname(sessionPath);
+	return [
+		`if [ -d ${shQuote(dir)} ]; then printf '%s\\n' dir=1; else printf '%s\\n' dir=0; fi`,
+		`if [ -e ${shQuote(sessionPath)} ]; then printf '%s\\n' session=1; else printf '%s\\n' session=0; fi`,
+		`ls -A1 ${shQuote(dir)} 2>/dev/null | head -n ${REMOTE_FATE_DIR_LINES} | sed 's/^/entry=/'`,
+	].join(" ; ");
+}
+
+/** The three facts {@link remoteChildProbeScript} prints, parsed back. */
+interface RemoteChildProbeFacts {
+	dirExists: boolean;
+	sessionExists: boolean;
+	dirLines: string[];
+}
+
+function parseChildProbeFacts(text: string): RemoteChildProbeFacts {
+	let dirExists = false;
+	let sessionExists = false;
+	const dirLines: string[] = [];
+	for (const raw of text.split("\n")) {
+		const line = raw.trim();
+		if (line.startsWith("dir=")) dirExists = line.slice(4) === "1";
+		else if (line.startsWith("session=")) sessionExists = line.slice(8) === "1";
+		else if (line.startsWith("entry=") && dirLines.length < REMOTE_FATE_DIR_LINES) {
+			// A file name is anything after the prefix; it may itself contain `=`.
+			dirLines.push(line.slice(6));
+		}
+	}
+	return { dirExists, sessionExists, dirLines };
+}
+
+/**
+ * The last few lines a terminal rendered, ANSI stripped.
+ *
+ * This is the child's OWN words — on pi 1.5.2 a startup death is one line
+ * (`Error: Failed to load extension …`, `No API key found…`) and that line is
+ * the whole answer. Escape sequences are noise in a one-line error, and a TUI's
+ * blank padding is not evidence either.
+ */
+function screenTailOf(screen: unknown): string[] {
+	if (typeof screen !== "string" || screen.length === 0) return [];
+	const cleaned = screen
+		// OSC (title/hyperlink) first: it may contain `[` and would defeat the CSI rule.
+		.replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
+		.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+		.replace(/\u001b[@-_]/g, "")
+		.replace(/\r/g, "");
+	return cleaned
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.filter((line) => line.trim().length > 0)
+		.slice(-REMOTE_FATE_SCREEN_LINES);
+}
+
+function isNotFoundError(error: unknown): boolean {
+	return error instanceof HcRpcError && /not.?found/i.test(`${error.kind} ${error.message}`);
+}
+
+/**
+ * Ask the core and the machine what became of one remote child (§2).
+ *
+ * Two round trips, both already in the whitelist (no new `hc` method): the
+ * terminal is the only place the child's own error survives, the shell is the
+ * only place its files are visible. The classification order is the contract's
+ * and matters: a transcript that exists is `started` no matter what else is
+ * odd, and only after that can a dir disagreement, a dead terminal or mere
+ * silence be claimed.
+ *
+ * A `terminal.get` that says `not_found` is a FACT (`terminalState: "missing"`),
+ * never an error — the core not knowing the terminal is exactly the state the
+ * parent has to render. Every other failure means this probe cannot see enough
+ * to classify, so it is thrown and the caller answers `unreachable`; a class
+ * invented from a failed read would send the operator to the wrong fix.
+ */
+export async function probeRemoteChild(opts: {
+	client: HcClient;
+	target: HostTarget;
+	/** `host/name` — the address the core holds, not a bare name (D2). */
+	terminal: string;
+	sessionPath: string;
+	/** The record's persisted mirror dir, when it differs from dirname(sessionPath). */
+	recordedDir?: string;
+	/**
+	 * `true` when `terminal` was RECOMPUTED from the record instead of read from it.
+	 *
+	 * `terminal.get` answering `not_found` for a name this process invented is not
+	 * proof that the child ended: the core may simply hold a different spelling
+	 * (a run-scoped prefix, a core-shortened name). Death may only be claimed on an
+	 * address the launch really recorded, so an inferred one never yields
+	 * `no-child` on its own.
+	 */
+	terminalInferred?: boolean;
+}): Promise<RemoteChildFate> {
+	const dir = path.posix.dirname(opts.sessionPath);
+	let terminalState = "missing";
+	let exitCode: number | undefined;
+	let pid: number | undefined;
+	let screenTail: string[] = [];
+	try {
+		const facts = await opts.client.request<{ state?: string; exit_code?: number | null; pid?: number | null; screen?: string }>(
+			"terminal.get",
+			{ terminal: opts.terminal },
+		);
+		terminalState = typeof facts?.state === "string" && facts.state.length > 0 ? facts.state : "missing";
+		if (typeof facts?.exit_code === "number") exitCode = facts.exit_code;
+		if (typeof facts?.pid === "number") pid = facts.pid;
+		screenTail = screenTailOf(facts?.screen);
+	} catch (error) {
+		if (!isNotFoundError(error)) throw error;
+	}
+	const listing = await opts.client.request<HcExecResult>("machine.exec", {
+		on: opts.target.host,
+		line: remoteChildProbeScript(opts.sessionPath),
+		timeout: REMOTE_PREFLIGHT_TIMEOUT_S,
+	});
+	const probe = parseChildProbeFacts(execResultText(listing));
+	const recorded = typeof opts.recordedDir === "string" ? opts.recordedDir.trim() : "";
+	// Death is a claim about the ADDRESS. An inferred name that the core does not
+	// know says nothing about the child, so `missing` stops counting as proof there.
+	const terminalGone = exitCode !== undefined || terminalState === "finished"
+		|| (terminalState === "missing" && opts.terminalInferred !== true);
+	const kind: RemoteFateClass = probe.sessionExists
+		? "started"
+		: recorded.length > 0 && recorded !== dir
+			? "path"
+			: terminalGone
+				? "no-child"
+				: "no-session";
+	return {
+		kind,
+		host: opts.target.host,
+		terminal: opts.terminal,
+		terminalState,
+		...(exitCode !== undefined ? { exitCode } : {}),
+		...(pid !== undefined ? { pid } : {}),
+		screenTail,
+		sessionPath: opts.sessionPath,
+		dir,
+		dirExists: probe.dirExists,
+		sessionExists: probe.sessionExists,
+		dirLines: probe.dirLines,
+		summary: remoteFateSummary(kind),
+		nextStep: remoteFateNextStep(kind, opts.target.host),
+	};
 }
 
 /** `mkdir -p <dir>` on the target — the remote half of D9's two temp dirs. */

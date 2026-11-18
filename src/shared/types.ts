@@ -484,6 +484,19 @@ export interface ChildRecord {
 	 * name/machine to recompute it for.
 	 */
 	remoteDir?: string;
+	/**
+	 * The address the core actually holds for that child's terminal (`host/name`).
+	 *
+	 * Persisted because the core may shorten the name it was asked for: a later
+	 * `collect` in another process then asks about the terminal that exists instead
+	 * of one it guessed from the record.
+	 */
+	remoteTerminal?: string;
+	/**
+	 * The remote launch gate could not confirm the child wrote a transcript, and
+	 * nothing proved it dead either (`remote-child-fate-v1` §4).
+	 */
+	startupUnconfirmed?: boolean;
 
 	// artifacts
 	artifacts?: Array<{ kind: string; path: string }>;

@@ -28,6 +28,8 @@ import {
 	mirrorRemoteFile,
 	normalizeHost,
 	classifyRemoteStartupProbe,
+	probeRemoteChild,
+	remoteFateNextStep,
 	remoteStartupProbeLine,
 	REMOTE_STARTUP_PROBE_TIMEOUT_S,
 	removeRemoteDir,
@@ -36,6 +38,7 @@ import {
 	remotePreflight,
 	terminalAddress,
 	type HostTarget,
+	type RemoteChildFate,
 } from "../runs/remote.ts";
 import {
 	createRemoteChildWorktree,
@@ -90,6 +93,22 @@ const ILLEGAL_NAME_CHARS = /[^a-z0-9_-]/g;
 
 /** Poll cadence for `waitSettled` (D8). */
 export const SETTLE_POLL_INTERVAL_MS = 1_000;
+
+/**
+ * How long a REMOTE launch waits for proof that the child survived start-up
+ * (`docs/contracts/remote-child-fate-v1.md` §4).
+ *
+ * The window exists because a remote `pi` that dies during start-up (a missing
+ * `--extension`, a model the machine cannot use) exits 1 and NEVER creates its
+ * session file: the parent's only observable afterwards is `not_found`, minutes
+ * later, with no exit code and no words. Eight seconds is long enough for a
+ * healthy child to open its transcript on a slow machine and short enough that
+ * a launch still fails while the operator is watching.
+ */
+export const REMOTE_STARTUP_CONFIRM_MS = 8_000;
+
+/** Poll cadence inside that window. */
+export const REMOTE_STARTUP_CONFIRM_POLL_MS = 500;
 
 /** Parent terminal identity is forwarded to the child when present (D5). */
 const TERMINAL_IDENTITY_ENV_KEYS = ["TERM", "TERM_PROGRAM", "COLORTERM"] as const;
@@ -189,6 +208,10 @@ interface TerminalChildRecord {
 	 * worktree or a session file — a finished child leaves its evidence behind.
 	 */
 	remoteDir?: string;
+	/** The address the core really holds for this terminal (`host/name`). */
+	remoteTerminal?: string;
+	/** The start-up gate timed out without proving the child dead (§4). */
+	startupUnconfirmed?: boolean;
 	tempDir?: string;
 	state: "live" | "finished" | "retired";
 	/** Last observed turn counter. */
@@ -219,6 +242,14 @@ export interface TerminalSupervisorOptions {
 	runId?: string;
 	/** Poll cadence for `waitSettled`; tests shrink it, production uses 1 s. */
 	pollIntervalMs?: number;
+	/**
+	 * Bound on the post-`terminal.run` start-up gate of a REMOTE launch (§4).
+	 *
+	 * `0` disables the gate. The fake-core harnesses pass `0`: their terminals
+	 * never write a session, so the gate could only ever wait out its deadline on
+	 * a launch that is not under test.
+	 */
+	remoteStartupConfirmMs?: number;
 	/** Per-call `hc` request bound. */
 	requestTimeoutMs?: number;
 }
@@ -244,6 +275,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 	private readonly env: NodeJS.ProcessEnv;
 	private readonly runId: string | undefined;
 	private readonly pollIntervalMs: number;
+	private readonly remoteStartupConfirmMs: number;
 	private client: HcClient | undefined;
 	/** Parent space label; `null` = not read yet, `undefined` = no space known. */
 	private parentSpace: string | null | undefined = null;
@@ -252,6 +284,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 		this.env = options.env ?? process.env;
 		this.runId = options.runId;
 		this.pollIntervalMs = options.pollIntervalMs ?? SETTLE_POLL_INTERVAL_MS;
+		this.remoteStartupConfirmMs = options.remoteStartupConfirmMs ?? REMOTE_STARTUP_CONFIRM_MS;
 		this.clientFactory =
 			options.clientFactory ??
 			(() => hcCliClient({ env: this.env, ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}) }));
@@ -753,6 +786,26 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// so the returned name wins over the requested one when present.
 		const mappedName =
 			typeof run.name === "string" && run.name.length > 0 ? run.name : terminalNameForChild;
+		// The address the core really holds. The core shortens a name it already knows,
+		// so this is the only spelling that is guaranteed to resolve later (a collect
+		// in another process, the read-back probe).
+		const remoteTerminalAddress = target !== undefined ? terminalAddress({ terminalName: mappedName, host: target.host }) : undefined;
+		// §4: proof of death, not a guess. A remote `pi` that dies during start-up
+		// (an unmappable --extension, no model the machine can use) exits 1 and NEVER
+		// creates its session file: without this gate the parent's only observable is
+		// `not_found` a collect later. Asked HERE, the same fact fails the launch with
+		// the child's own screen line. Silence is not death, so a deadline only warns.
+		let startupUnconfirmed = false;
+		if (target !== undefined && remoteDir !== undefined && remoteTerminalAddress !== undefined && this.remoteStartupConfirmMs > 0) {
+			startupUnconfirmed = await this.confirmRemoteStartup({
+				client,
+				target,
+				address: remoteTerminalAddress,
+				remoteDir,
+				argv,
+				cwd: typeof params.cwd === "string" ? params.cwd : target.cwd,
+			});
+		}
 		// D13: the ownership pair, in one value, so the record and the handle cannot
 		// disagree about which machine a path belongs to.
 		const worktreeFacts = remoteWorktree !== undefined && target !== undefined
@@ -767,6 +820,8 @@ export class TerminalSupervisor implements LegionSupervisor {
 			terminalName: mappedName,
 			...(host ? { host } : {}),
 			...(remoteDir ? { remoteDir } : {}),
+			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
+			...(startupUnconfirmed ? { startupUnconfirmed: true } : {}),
 			...(tempDir ? { tempDir } : {}),
 			...worktreeFacts,
 			state: "live",
@@ -788,6 +843,8 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// S4/m6: same reason, one more fact the backend owns. Without it the record
 			// cannot find the child's transcript in a later process.
 			...(remoteDir ? { remoteDir } : {}),
+			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
+			...(startupUnconfirmed ? { startupUnconfirmed: true } : {}),
 		};
 	}
 
@@ -1242,6 +1299,135 @@ export class TerminalSupervisor implements LegionSupervisor {
 		}
 	}
 
+	/**
+	 * Wait for proof that a remote child survived start-up (contract §4).
+	 *
+	 * Two facts end the wait and only one of them is a verdict: a transcript that
+	 * appeared (confirmed) or a terminal the core reports as over / holding an exit
+	 * code (PROVEN death, which fails the launch with the child's own words). The
+	 * deadline ends it as well, but with a warning: a slow machine is not a bug,
+	 * and refusing to launch on silence would reject every child that is merely
+	 * slow to its first turn.
+	 *
+	 * Nothing is rolled back when death is proven: the finished terminal and the
+	 * mirrored argv files are exactly the evidence the error points at.
+	 */
+	private async confirmRemoteStartup(opts: {
+		client: HcClient;
+		target: HostTarget;
+		/** `host/name` of the terminal that was just created. */
+		address: string;
+		remoteDir: string;
+		/** The launch argv (task last), quoted back as a reproduce command. */
+		argv: string[];
+		cwd: string;
+	}): Promise<boolean> {
+		const sessionPath = path.posix.join(opts.remoteDir, "session.jsonl");
+		const deadline = Date.now() + this.remoteStartupConfirmMs;
+		let lastError: string | undefined;
+		let lastPid: number | undefined;
+		for (;;) {
+			// `limit: 0` is the cheapest "does this file exist" the core answers: the
+			// reply carries the line count and the text is thrown away.
+			try {
+				await opts.client.request("file.read", { on: opts.target.host, path: sessionPath, limit: 0 });
+				return false;
+			} catch (error) {
+				// `not_found` is the answer being watched for; anything else is a machine
+				// problem the gate must not turn into a launch refusal.
+				if (!isNotFound(error)) lastError = describeFailure(error);
+			}
+			const alive = await this.startupFacts(opts.client, opts.address).catch((error: unknown) => {
+				if (!isNotFound(error)) lastError = describeFailure(error);
+				return undefined;
+			});
+			if (alive?.finished === true) {
+				throw await this.startupDeathError({ ...opts, sessionPath, ...(alive.code !== undefined ? { exitCode: alive.code } : {}) });
+			}
+			if (alive !== undefined) lastPid = alive.pid;
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) break;
+			await this.sleep(Math.min(REMOTE_STARTUP_CONFIRM_POLL_MS, remaining));
+		}
+		// A terminal the core still holds with no pid is the shape "hc accepted the
+		// name and never started the program" — silence for a reason the class alone
+		// cannot tell apart from a slow first turn.
+		const noPid = lastPid === undefined ? " (the core reports no pid for it: nothing may have been started in that terminal)" : "";
+		process.stderr.write(
+			`[pi-legion] host '${opts.target.host}': no transcript at ${sessionPath} after ${this.remoteStartupConfirmMs}ms and the terminal is still alive${noPid}${lastError ? ` (last error: ${lastError})` : ""}; launching anyway — a collect will classify it\n`,
+		);
+		return true;
+	}
+
+	/**
+	 * The one `terminal.get` a startup poll needs: is the child over, with what exit
+	 * code, and does the core hold a pid for it at all?
+	 *
+	 * `undefined` is a failed question, never "dead".
+	 */
+	private async startupFacts(
+		client: HcClient,
+		address: string,
+	): Promise<{ finished: boolean; code?: number; pid?: number }> {
+		const facts = await client.request<HcTerminalFacts>("terminal.get", { terminal: address });
+		const code = typeof facts?.exit_code === "number" ? facts.exit_code : undefined;
+		const pid = typeof facts?.pid === "number" ? facts.pid : undefined;
+		return {
+			finished: code !== undefined || facts?.state === "finished",
+			...(code !== undefined ? { code } : {}),
+			...(pid !== undefined ? { pid } : {}),
+		};
+	}
+
+	/**
+	 * The frozen start-up-death error (§4.1).
+	 *
+	 * The gate already knows the child is dead; the PROBE is what makes the message
+	 * evidence instead of assertion (is the mirror dir there? what did the screen
+	 * say?). A probe that cannot answer must never replace the death with its own
+	 * failure — the launch already failed for a reason worth reading.
+	 */
+	private async startupDeathError(opts: {
+		client: HcClient;
+		target: HostTarget;
+		address: string;
+		remoteDir: string;
+		sessionPath: string;
+		argv: string[];
+		cwd: string;
+		exitCode?: number;
+	}): Promise<SubagentError> {
+		let fate: RemoteChildFate | undefined;
+		try {
+			fate = await probeRemoteChild({
+				client: opts.client,
+				target: opts.target,
+				terminal: opts.address,
+				sessionPath: opts.sessionPath,
+			});
+		} catch {
+			fate = undefined;
+		}
+		const exitCode = fate?.exitCode ?? opts.exitCode;
+		const screen = fate !== undefined && fate.screenTail.length > 0
+			? fate.screenTail.join(" ⏎ ")
+			: "(the core reported none)";
+		// The mirror dir was created by THIS launch moments ago, so "there" is what an
+		// unaskable probe leaves us with; only the probe itself can say "gone".
+		const dirLine = fate?.dirExists === false ? "the mirror dir is gone" : "the mirror dir is there";
+		const nextStep = fate?.nextStep ?? remoteFateNextStep("no-child", opts.target.host);
+		return new SubagentError(
+			`host '${opts.target.host}': the child did not survive startup — its terminal ended before it wrote ${opts.sessionPath}\n` +
+				`  exit: ${typeof exitCode === "number" ? exitCode : "the core reported none"}\n` +
+				`  dir: ${dirLine} (${opts.remoteDir})\n` +
+				`  screen: ${screen}\n` +
+				`  next: ${nextStep}\n` +
+				`  Command (run on '${opts.target.host}' to reproduce):\n${remoteStartupProbeLine(opts.argv, opts.cwd)}`,
+			ErrorCodes.START_FAILED,
+			{ host: opts.target.host, fate: "no-child", ...(typeof exitCode === "number" ? { exitCode } : {}) },
+		);
+	}
+
 	private async readTerminal(child: TerminalChildRecord): Promise<HcTerminalFacts> {
 		const client = await this.ensureClient();
 		return client.request<HcTerminalFacts>("terminal.get", { terminal: terminalAddress(child) });
@@ -1323,6 +1509,13 @@ function isNameTaken(error: unknown): boolean {
 
 function isNotFound(error: unknown): boolean {
 	return error instanceof HcRpcError && error.kind === "not_found";
+}
+
+/** One failure as text, with the core's own `kind` when it named one. */
+function describeFailure(error: unknown): string {
+	if (error instanceof HcRpcError) return `${error.kind}: ${error.message}`;
+	if (error instanceof Error) return error.message;
+	return String(error);
 }
 
 /**

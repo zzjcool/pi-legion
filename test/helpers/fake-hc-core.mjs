@@ -31,6 +31,12 @@
  *   FAKE_HC_LOG           optional path; every request is appended as JSONL
  *   FAKE_HC_LOCAL_ROOT    where local (no `on`) file/temp paths may live
  *                         (default: FAKE_HC_REMOTE_ROOT)
+ *   FAKE_HC_TERMINALS     optional JSON (or a path to a JSON file holding it):
+ *                         one entry per terminal NAME (`"*"` = fallback) that
+ *                         says how that terminal ENDS (`state`, `exit_code`,
+ *                         `screen`) and what it WRITES before it does. Applied
+ *                         once, at `terminal.run`; see §7 of
+ *                         `docs/contracts/remote-child-fate-v1.md`.
  *
  * Protocol: newline-delimited JSON-RPC on stdin/stdout, same as `hc connect`.
  * Result shapes mirror `hc schema` (verified against herdr-core 0.1.21):
@@ -54,6 +60,8 @@ const LOG = (process.env.FAKE_HC_LOG ?? "").trim();
 /** v1.1: the machine.exec sandbox, so a test can control that machine's PATH/HOME. */
 const REMOTE_PATH = (process.env.FAKE_HC_REMOTE_PATH ?? "").trim();
 const REMOTE_HOME = (process.env.FAKE_HC_REMOTE_HOME ?? "").trim();
+/** Path-or-inline JSON: read at every `terminal.run`, so a test may replace it. */
+const TERMINALS_SPEC = (process.env.FAKE_HC_TERMINALS ?? "").trim();
 
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_EXEC_TIMEOUT_S = 600;
@@ -93,6 +101,31 @@ const inside = (root, candidate) => {
 	const rel = path.relative(root, candidate);
 	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
 };
+
+/**
+ * The `FAKE_HC_TERMINALS` manifest, or `{}` when the harness declared none.
+ *
+ * A fake terminal that only ever "runs" cannot express the bug the contract
+ * exists for: a remote child that exited 1 before writing its first transcript.
+ * One entry per requested terminal name (`"*"` is the fallback) makes that
+ * terminal die, stay silent, or write files onto the "remote" filesystem.
+ * Parsed per `terminal.run` (not once at boot) so a test can change the fate
+ * between two launches of the same harness.
+ */
+function terminalManifest() {
+	if (TERMINALS_SPEC.length === 0) return {};
+	let text = TERMINALS_SPEC;
+	if (!TERMINALS_SPEC.startsWith("{")) {
+		// A path that does not exist yet is "no manifest declared", not an error.
+		if (!fs.existsSync(TERMINALS_SPEC)) return {};
+		text = fs.readFileSync(TERMINALS_SPEC, "utf8");
+	}
+	const parsed = JSON.parse(text);
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+		throw new Error("FAKE_HC_TERMINALS must be a JSON object keyed by terminal name");
+	}
+	return parsed;
+}
 
 /** The positive form of "this path belongs to the parent machine". */
 function remotePathProblem(value, root) {
@@ -172,13 +205,36 @@ function terminalRun(id, params) {
 		}
 	}
 
+	// The declared fate of this terminal, if the harness named one (§7). No entry
+	// means a terminal that runs forever and writes nothing — today's behaviour.
+	const manifest = terminalManifest();
+	const fate = manifest[name ?? ""] ?? manifest["*"] ?? undefined;
+	if (fate !== undefined && (fate === null || typeof fate !== "object" || Array.isArray(fate))) {
+		fail(id, "bad_manifest", `terminal manifest for '${String(name)}' must be an object`, { name });
+		return;
+	}
+	const writes = Array.isArray(fate?.writes) ? fate.writes : [];
+	// Validate every path BEFORE the terminal exists: a bad manifest is a harness
+	// bug, and a half-created terminal would hide it behind "name taken".
+	for (const write of writes) {
+		const file = typeof write?.path === "string" ? write.path : "";
+		const problem = remotePathProblem(file, REMOTE_ROOT);
+		if (problem) {
+			fail(id, "bad_path", `host '${on ?? "(local)"}': manifest write '${file}' is ${problem}`, { path: file });
+			return;
+		}
+	}
+
 	terminalSeq += 1;
 	const address = on ? `${on}/t${terminalSeq}` : `t${terminalSeq}`;
 	const terminal = {
 		address,
 		name: name ?? address,
 		host: on,
-		state: "running",
+		state: typeof fate?.state === "string" && fate.state.length > 0 ? fate.state : "running",
+		// Only ever reported by `terminal.get` once the terminal is `finished`.
+		exit_code: typeof fate?.exit_code === "number" ? fate.exit_code : 0,
+		screen: typeof fate?.screen === "string" ? fate.screen : "",
 		turn: 0,
 		pid: 900000 + terminalSeq,
 		argv,
@@ -188,10 +244,21 @@ function terminalRun(id, params) {
 		created_ms: Date.now(),
 	};
 	terminals.set(address, terminal);
+	// The child's own effects on that machine (its transcript, most of the time).
+	for (const write of writes) {
+		const file = path.resolve(write.path);
+		try {
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, typeof write.text === "string" ? write.text : "");
+		} catch (error) {
+			fail(id, "write_failed", `cannot write ${file}: ${error?.message ?? error}`, { path: file });
+			return;
+		}
+	}
 	reply(id, {
 		address,
 		name: terminal.name,
-		state: "running",
+		state: terminal.state,
 		turn: 0,
 		cwd,
 		argv,
@@ -203,8 +270,8 @@ function terminalRun(id, params) {
 		keep: false,
 		rm: false,
 		die_with_parent: false,
-		status: { state: "idle" },
-		screen: "",
+		status: { state: terminal.state === "running" ? "idle" : terminal.state },
+		screen: terminal.screen,
 		identity: "",
 	});
 }
@@ -249,9 +316,11 @@ function terminalGet(id, params) {
 		keep: false,
 		rm: false,
 		die_with_parent: false,
-		...(terminal.state === "finished" ? { exit_code: 0, finished_ms: Date.now() } : {}),
+		// The manifest's own exit code: "the child died" is only half the answer, and
+		// `1` vs `137` is what tells an operator which failure they are looking at.
+		...(terminal.state === "finished" ? { exit_code: terminal.exit_code ?? 0, finished_ms: Date.now() } : {}),
 		status: { state: terminal.state === "running" ? "idle" : "finished" },
-		screen: "",
+		screen: terminal.screen ?? "",
 	});
 }
 

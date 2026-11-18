@@ -401,6 +401,9 @@ test("S5.6 full child: a real pi process runs on that machine, in the tree the p
 		runId: "test-s5",
 		env: process.env,
 		pollIntervalMs: 250,
+		// `remote-child-fate-v1` §4: the live harness asserts the LAUNCH, not the
+		// start-up gate; keeping the gate off keeps this case's timing as it was.
+		remoteStartupConfirmMs: 0,
 		clientFactory: () => {
 			supervisorClient = hcCliClient({ env: process.env });
 			return supervisorClient;

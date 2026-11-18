@@ -25,7 +25,13 @@ import * as path from "node:path";
 import { HcRpcError, hcCliClient, type HcClient } from "../hc/client.ts";
 import type { CrossMachineSettings, SubagentError as SubagentErrorType } from "../shared/types.ts";
 import { SubagentError, ErrorCodes } from "../shared/types.ts";
-import { resolveHostTarget, type HostTarget } from "./remote.ts";
+import {
+	probeRemoteChild,
+	remoteFateNextStep,
+	resolveHostTarget,
+	type HostTarget,
+	type RemoteChildFate,
+} from "./remote.ts";
 import { terminalName } from "../supervisor/terminal-supervisor.ts";
 
 /**
@@ -57,7 +63,23 @@ export interface RemoteReadbackFailure {
 	ok: false;
 	host: string;
 	reason: string;
+	/** `started` never appears here: a failure is one of these four. */
+	fate: RemoteReadbackFate;
+	/** 1..5 short lines ("terminal finished", "exit 1", "dir holds: system-prompt.md"). */
+	evidence: string[];
+	nextStep: string;
+	/**
+	 * The child's own last screen lines, when the probe could read them.
+	 *
+	 * Not in the contract's field list (§5) but the render it freezes (§6.1) prints
+	 * `screen: <screenTail …>` "only when the fate carries one" — the probe is the
+	 * only thing that can carry it, so it travels beside the three new fields.
+	 */
+	screenTail?: string[];
 }
+
+/** The three classes a read-back failure can carry, plus "we could not even ask". */
+export type RemoteReadbackFate = "no-child" | "no-session" | "path" | "unreachable";
 
 export type RemoteReadbackResult = RemoteReadback | RemoteReadbackFailure;
 
@@ -145,6 +167,14 @@ export interface RemoteSessionRequest {
 	localPath: string;
 	/** The record's persisted mirror dir, when it has one (m6). */
 	remoteDir?: string;
+	/**
+	 * The address the record says the core holds (`host/name`).
+	 *
+	 * Falls back to `terminalName(undefined, name)` — the same convention
+	 * `assertRemoteResume` uses — because a core may have shortened the name it was
+	 * asked for, and asking about the shortened one is the only way to get an answer.
+	 */
+	remoteTerminal?: string;
 	tailLines?: number;
 }
 
@@ -163,17 +193,21 @@ export function createRemoteSessionReadback(opts: {
 		try {
 			target = resolveHostTarget(request.host, opts.crossMachine);
 		} catch (error) {
-			return { ok: false, host: request.host, reason: error instanceof Error ? error.message : String(error) };
+			// Nothing about the child is knowable: this machine cannot even name its
+			// target. The next step is the config key, because that is the fix.
+			return unreachableFailure(request.host, error instanceof Error ? error.message : String(error), {
+				evidence: ["the host target could not be resolved"],
+				nextStep: `fix subagents.crossMachine.hosts.${request.host} (enabled, cwd, piExtensions): the launch and this read-back must resolve the same target`,
+			});
 		}
 		const client = opts.clientFactory ? opts.clientFactory() : hcCliClient({ env: process.env });
 		try {
 			await client.start();
 		} catch (error) {
-			return {
-				ok: false,
-				host: request.host,
-				reason: `cannot reach the hc core: ${error instanceof Error ? error.message : String(error)}`,
-			};
+			return unreachableFailure(request.host, `cannot reach the hc core: ${error instanceof Error ? error.message : String(error)}`, {
+				evidence: ["the hc core on this machine did not start"],
+				nextStep: `check that \`hc\` is on PATH (or HC_BIN) and that this machine's core is running — a child on '${request.host}' cannot be asked about from here`,
+			});
 		}
 		try {
 			const remotePath = remoteSessionPathFor(target, request);
@@ -203,7 +237,35 @@ export function createRemoteSessionReadback(opts: {
 				: error instanceof Error
 					? error.message
 					: String(error);
-			return { ok: false, host: request.host, reason: detail };
+			// A bare `not_found` is the bug this contract exists for: the class, the
+			// evidence and the next step are what turn it into something an operator can
+			// act on. The probe never invents a class it cannot support, so a probe that
+			// cannot answer is `unreachable` — never "no child".
+			const configuredDir = configuredMirrorDirFor(target, request);
+			let fate: RemoteChildFate;
+			const recordedTerminal = typeof request.remoteTerminal === "string" && request.remoteTerminal.trim().length > 0;
+			try {
+				fate = await probeRemoteChild({
+					client,
+					target,
+					terminal: recordedTerminal ? (request.remoteTerminal as string).trim() : `${target.host}/${terminalName(undefined, request.name)}`,
+					sessionPath: path.posix.join(configuredDir, "session.jsonl"),
+					...(recordedTerminal ? {} : { terminalInferred: true }),
+					...(request.remoteDir && request.remoteDir.trim().length > 0 ? { recordedDir: request.remoteDir.trim() } : {}),
+				});
+			} catch (probeError) {
+				const probeDetail = probeError instanceof HcRpcError
+					? `${probeError.kind}: ${probeError.message}`
+					: probeError instanceof Error
+						? probeError.message
+						: String(probeError);
+				return unreachableFailure(request.host, detail, {
+					evidence: [`the read failed (${detail})`, `the probe could not classify it (${probeDetail})`],
+					nextStep: `ask that machine directly, or check subagents.crossMachine.hosts.${request.host}: the read-back could not classify what it saw`,
+				});
+			}
+			const classified = classifyReadbackFailure({ target, request, fate, configuredDir });
+			return { ok: false, host: request.host, reason: detail, ...classified };
 		} finally {
 			try {
 				client.close();
@@ -212,6 +274,100 @@ export function createRemoteSessionReadback(opts: {
 			}
 		}
 	};
+}
+
+/**
+ * The mirror dir THIS configuration would use for the record's run segment.
+ *
+ * Both segments come from the record on purpose: the run label and the handle are
+ * facts the launch wrote, and the one thing that can move under a record's feet is
+ * the PREFIX — `subagents.crossMachine.hosts.<host>.cwd` / `worktreeRoot` decide
+ * `mirrorRoot`. Rebuilding the segments from the name instead would report a
+ * disagreement every time a run id differs from the production default, i.e. it
+ * would turn "nothing has been written yet" into "the dirs disagree".
+ */
+function configuredMirrorDirFor(target: HostTarget, request: RemoteSessionRequest): string {
+	const recorded = typeof request.remoteDir === "string" ? request.remoteDir.trim() : "";
+	const runSegment = recorded.length > 0 ? path.posix.basename(path.posix.dirname(recorded)) : "no-run";
+	const handleSegment = recorded.length > 0 ? path.posix.basename(recorded) : request.name.replace(/[^A-Za-z0-9._-]/g, "-");
+	return path.posix.join(target.mirrorRoot, runSegment, handleSegment);
+}
+
+/** The evidence lines a terminal contributes (`terminal finished`, `exit 1`). */
+function terminalEvidence(fate: RemoteChildFate): string[] {
+	const lines = [
+		fate.terminalState === "missing"
+			? "terminal missing: the core does not know it"
+			: `terminal ${fate.terminalState}`,
+	];
+	if (fate.exitCode !== undefined) lines.push(`exit ${fate.exitCode}`);
+	// A terminal the core still holds, with no pid, is a program that was never
+	// started — the ordinary shape of "the launch reached hc and hc never ran it".
+	// Said only when the terminal is otherwise alive: a finished one legitimately
+	// has no pid, and claiming death twice would blur the class.
+	if (fate.pid === undefined && (fate.terminalState === "live" || fate.terminalState === "running" || fate.terminalState === "idle")) {
+		lines.push("no pid: the core never started a program in that terminal");
+	}
+	return lines;
+}
+
+/**
+ * One probe reply, as the three fields a failure carries (§5).
+ *
+ * `started` cannot be a failure: if the file is there while `file.read` failed,
+ * the bytes came back wrong — a path/read problem, never "no child" — so that
+ * case becomes `path` with the read's own reason preserved by the caller.
+ */
+function classifyReadbackFailure(opts: {
+	target: HostTarget;
+	request: RemoteSessionRequest;
+	fate: RemoteChildFate;
+	configuredDir: string;
+}): { fate: RemoteReadbackFate; evidence: string[]; nextStep: string; screenTail?: string[] } {
+	const { fate, request, configuredDir } = opts;
+	const recorded = typeof request.remoteDir === "string" ? request.remoteDir.trim() : "";
+	const kind: RemoteReadbackFate = fate.kind === "started" ? "path" : fate.kind;
+	const mismatch = recorded.length > 0 && recorded !== configuredDir;
+	const evidence: string[] = [];
+	if (fate.kind === "started") evidence.push(`the transcript exists at ${fate.sessionPath} but the read failed`);
+	// An inferred address explains its own `missing`: the record predates the address
+	// field, so the core was asked about a name this process made up.
+	if (fate.terminalState === "missing" && fate.kind === "no-session") {
+		evidence.push(`the terminal name was inferred (the record has no address): '${fate.terminal}' may not be its name`);
+	}
+	if (mismatch || kind === "path") {
+		// T4: both dirs, because "the dirs disagree" is unfalsifiable otherwise.
+		evidence.push(`recorded dir: ${recorded.length > 0 ? recorded : "(none recorded)"}`);
+		evidence.push(`configured dir: ${configuredDir}`);
+	}
+	evidence.push(...terminalEvidence(fate));
+	if (kind !== "path") {
+		evidence.push(
+			!fate.dirExists
+				? `the mirror dir does not exist (${fate.dir})`
+				: fate.dirLines.length > 0
+					? `dir holds: ${fate.dirLines.join(", ")}`
+					: `the mirror dir is empty (${fate.dir})`,
+		);
+	}
+	// The screen travels in its own field, not here: `renderCollect` prints it as its own
+	// `screen:` line, and repeating the last line inside `evidence` made one fact look
+	// like two.
+	return {
+		fate: kind,
+		evidence: evidence.slice(0, 5),
+		nextStep: remoteFateNextStep(fate.kind === "started" ? "path" : fate.kind, opts.target.host),
+		...(fate.screenTail.length > 0 ? { screenTail: fate.screenTail } : {}),
+	};
+}
+
+/** A failure this machine cannot classify: `fate` is `unreachable` by definition. */
+function unreachableFailure(
+	host: string,
+	reason: string,
+	parts: { evidence: string[]; nextStep: string },
+): RemoteReadbackFailure {
+	return { ok: false, host, reason, fate: "unreachable", evidence: parts.evidence, nextStep: parts.nextStep };
 }
 
 /**

@@ -163,6 +163,9 @@ function harness(env: NodeJS.ProcessEnv): Harness {
 		clientFactory: () => client,
 		env,
 		pollIntervalMs: 5,
+		// `remote-child-fate-v1` §4: the fake terminal here never writes a session,
+		// and these tests pin the wire PARAMS, not the start-up gate.
+		remoteStartupConfirmMs: 0,
 	});
 	return { client, supervisor, root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
