@@ -13,13 +13,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import type { RemoteReadbackResult, RemoteSessionRequest } from "../../src/runs/remote-artifact.ts";
 import { resolveHostTarget, type HostTarget } from "../../src/runs/remote.ts";
+import { NO_ASSISTANT_ABORT_REASON } from "../../src/shared/session.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
+import { assistantMsg, sessionHeader, toolResult, userMsg } from "../helpers/fixtures.ts";
 
 const HOST = "vps";
 
@@ -46,7 +49,7 @@ function gitRepo(root: string): string {
 	return repo;
 }
 
-function harness(prefix: string) {
+function harness(prefix: string, remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>) {
 	const root = mkdtempSync(path.join(tmpdir(), prefix));
 	const supervisor = new FakeSupervisor();
 	return {
@@ -56,6 +59,7 @@ function harness(prefix: string) {
 			supervisor,
 			runDir: path.join(root, "run"),
 			cwd: gitRepo(root),
+			...(remoteReadback ? { remoteReadback } : {}),
 		}),
 		cleanup: () => rmSync(root, { recursive: true, force: true }),
 	};
@@ -317,6 +321,199 @@ test("B1: a child-only acceptance criterion (no command) still launches on a hos
 			};
 			const handle = await h.orchestrator.launch({ agent: attested, task: "t", host: HOST, hostTarget: target() });
 			assert.equal(handle.child.host, HOST);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+/* ------------------------------------------------------------------------- *
+ * S4/D15 — the read-back the verdict is derived from (real 6.2.0 demo)
+ *
+ * The demo: a remote `centurion` on hw-nj wrote 11 lines and answered, and the
+ * parent's `wait` reported `aborted (no assistant message for the last prompt)` +
+ * `read-back: 5 of 5 lines (complete)`. Both described a mirror that was read
+ * BEFORE the turn ended: five lines whose last one is the user prompt — exactly
+ * the shape `deriveOutcome` calls "no assistant message".
+ * ------------------------------------------------------------------------- */
+
+/** The mid-turn prefix: 5 lines, the last one the user prompt (no reply yet). */
+const MID_TURN = [
+	sessionHeader(),
+	userMsg("dispatch the review"),
+	assistantMsg({ stopReason: "toolUse", tools: ["read"] }),
+	toolResult({ toolName: "read" }),
+	userMsg("now write the report"),
+];
+
+/** The transcript that turn really produced: 11 lines, ending on the report. */
+const FINISHED = [
+	...MID_TURN,
+	assistantMsg({ stopReason: "toolUse", tools: ["write"] }),
+	toolResult({ toolName: "write" }),
+	assistantMsg({ stopReason: "toolUse", tools: ["bash"] }),
+	toolResult({ toolName: "bash" }),
+	assistantMsg({ text: "half-way summary" }),
+	assistantMsg({ text: '{"ok":true,"reason":"report written"}' }),
+];
+
+/** Write `lines` to the mirror the request names, the way the real seam does. */
+function writeMirror(localPath: string, lines: string[]): void {
+	mkdirSync(path.dirname(localPath), { recursive: true });
+	writeFileSync(localPath, `${lines.join("\n")}\n`);
+}
+
+test("S4/D15 (demo): a mid-turn mirror is re-read before the verdict, so 11 lines are not judged as 5", async () => {
+	// What the demo did: `collect()` entered while the remote centurion was still
+	// working, read 5 lines off that machine, and — because the mirror was never
+	// read again — derived the verdict from that snapshot while the turn went on to
+	// write 11 lines answering the task.
+	const calls = { count: 0 };
+	const h = harness("xm-midturn-", async (request) => {
+		calls.count += 1;
+		// First read: mid-turn. Every later read: the finished transcript.
+		const lines = calls.count === 1 ? MID_TURN : FINISHED;
+		writeMirror(request.localPath, lines);
+		return {
+			ok: true,
+			host: request.host,
+			localPath: request.localPath,
+			lines: lines.length,
+			returned: lines.length,
+			truncated: false,
+			byteCapped: false,
+		};
+	});
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
+			h.supervisor.settle(handle.name, { text: '{"ok":true,"reason":"report written"}' });
+			const collected = await h.orchestrator.collect(handle.name);
+			// The verdict first: this is the demo's lie (`aborted (no assistant message
+			// for the last prompt)` for a child that answered).
+			assert.equal(collected.execution.status, "success", JSON.stringify(collected.execution));
+			assert.notEqual(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
+			assert.equal(calls.count, 2, "exactly one refresh — the remote is NOT polled while the turn is in flight");
+			// The facts reported to the render are the LAST read, so "5 of 5 (complete)"
+			// can no longer describe a transcript that has 11 lines.
+			assert.equal(collected.remoteReadback?.lines, FINISHED.length);
+			assert.equal(collected.remoteReadback?.returned, FINISHED.length);
+			assert.match(collected.output, /report written/);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("S4/D15: a truncated read-back is an honest `unknown`, never `no assistant message`", async () => {
+	// A tail window that ends on the user prompt because the reply is past the cut is
+	// THIS machine's blind spot, not the child's fate. Naming it
+	// `aborted (no assistant message for the last prompt)` is the lie the demo
+	// produced; D15 promises an honest `unknown` instead.
+	const calls = { count: 0 };
+	const h = harness("xm-truncated-", async (request) => {
+		calls.count += 1;
+		writeMirror(request.localPath, MID_TURN);
+		return {
+			ok: true,
+			host: request.host,
+			localPath: request.localPath,
+			lines: 9_000,
+			returned: MID_TURN.length,
+			truncated: true,
+			byteCapped: true,
+		};
+	});
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
+			h.supervisor.settle(handle.name, { text: "settled" });
+			const collected = await h.orchestrator.collect(handle.name);
+			assert.equal(calls.count, 2, "the refresh ran; it just could not get the whole file");
+			assert.equal(collected.execution.status, "unknown", JSON.stringify(collected.execution));
+			assert.notEqual(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
+			assert.match(String(collected.execution.reason), /read-back was truncated \(5 of 9000 lines\)/);
+			// The read-back the render prints says the same thing, so the two cannot
+			// disagree the way `5 of 5 (complete)` did.
+			assert.equal(collected.remoteReadback?.truncated, true);
+			assert.equal(collected.remoteReadback?.lines, 9_000);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("S4/D15: a COMPLETE remote transcript with no assistant is still `aborted` (frozen reason kept)", async () => {
+	// The honesty guard must not swallow the child's own fate: when the whole file
+	// was read and it really ends without a reply, the frozen reason stands — the
+	// same verdict `test/unit/session.test.ts` pins for a local transcript.
+	const h = harness("xm-noassistant-", async (request) => {
+		writeMirror(request.localPath, MID_TURN);
+		return {
+			ok: true,
+			host: request.host,
+			localPath: request.localPath,
+			lines: MID_TURN.length,
+			returned: MID_TURN.length,
+			truncated: false,
+			byteCapped: false,
+		};
+	});
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
+			h.supervisor.settle(handle.name, { text: "settled" });
+			const collected = await h.orchestrator.collect(handle.name);
+			assert.equal(collected.execution.status, "aborted");
+			assert.equal(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
+			assert.equal(collected.remoteReadback?.truncated, false);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("S4/D15: a refresh that FAILS keeps the old mirror and stays honest about it", async () => {
+	// The mirror is a network round trip, so the refresh can fail. Two rules then:
+	// the text already read is kept (it is the only answer this machine has), and the
+	// verdict is NOT `aborted (no assistant message …)` — an unconfirmed snapshot is
+	// not evidence about the child.
+	const calls = { count: 0 };
+	const h = harness("xm-refresh-fail-", async (request) => {
+		calls.count += 1;
+		if (calls.count === 1) {
+			writeMirror(request.localPath, MID_TURN);
+			return {
+				ok: true,
+				host: request.host,
+				localPath: request.localPath,
+				lines: MID_TURN.length,
+				returned: MID_TURN.length,
+				truncated: false,
+				byteCapped: false,
+			};
+		}
+		return {
+			ok: false,
+			host: request.host,
+			reason: "machine 'hw-nj' did not answer in time",
+			fate: "unreachable",
+			evidence: ["no answer to machine.exec"],
+			nextStep: "retry collect",
+		};
+	});
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
+			h.supervisor.settle(handle.name, { text: "settled" });
+			const collected = await h.orchestrator.collect(handle.name);
+			assert.equal(calls.count, 2, "a failed refresh does not throw and is not retried in place");
+			assert.equal(collected.execution.status, "unknown", JSON.stringify(collected.execution));
+			assert.notEqual(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
+			assert.match(String(collected.execution.reason), /read-back could not be refreshed after the turn ended \(unreachable: machine 'hw-nj' did not answer in time\)/);
+			// The reported facts are the LAST SUCCESSFUL read, not the failure.
+			assert.equal(collected.remoteReadback?.lines, MID_TURN.length);
+			assert.equal(collected.remoteReadback?.truncated, false);
 		} finally {
 			h.cleanup();
 		}

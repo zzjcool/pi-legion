@@ -39,6 +39,7 @@ import {
 } from "../extension/budget.ts";
 import { canUseCachedCollect } from "../extension/recycle.ts";
 import {
+	NO_ASSISTANT_ABORT_REASON,
 	attributeParentSessionShutdown,
 	deriveOutcome,
 	emptyParsedSession,
@@ -585,12 +586,23 @@ export class Orchestrator {
 	private readonly remoteVerify?: RemoteVerifyRunner;
 	private readonly remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
 	/**
-	 * This collect's remote transcripts, keyed by child name. Filled once per
-	 * `collect()` (a read-back is a network round trip, not a per-parse cost) and
-	 * read by {@link sessionFileOf}, so every `parseSessionFile` in the collect path
-	 * sees the LOCAL MIRROR without the record ever being mutated.
+	 * This collect's remote transcripts, keyed by child name. Filled at the top of
+	 * `collect()` and refreshed once the turn is over (a read-back is a network round
+	 * trip, not a per-parse cost) and read by {@link sessionFileOf}, so every
+	 * `parseSessionFile` in the collect path sees the LOCAL MIRROR without the record
+	 * ever being mutated.
+	 *
+	 * Always holds the LAST SUCCESSFUL read: a failed refresh must not erase a mirror
+	 * that is still the best text this machine has (see {@link refreshRemoteMirror}).
 	 */
 	private readonly remoteSessions = new Map<string, RemoteReadbackResult>();
+	/**
+	 * Why the mirror above could not be refreshed after the turn ended, keyed by
+	 * child name. Set only when a refresh failed on top of a good mirror: the text is
+	 * then possibly a mid-turn snapshot, and {@link mirrorUntrustedReason} keeps the
+	 * verdict from presenting it as the whole transcript.
+	 */
+	private readonly mirrorRefreshFailure = new Map<string, string>();
 	private readonly worktreeBootstrap?: string;
 	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
@@ -736,6 +748,120 @@ export class Orchestrator {
 			byteCapped: remote.byteCapped,
 			localPath: remote.localPath,
 		};
+	}
+
+	/**
+	 * The read-back request for a child that ran elsewhere. One spelling, used by the
+	 * collect-time read and by the post-turn refresh, so the mirror path both write to
+	 * cannot diverge.
+	 */
+	private remoteSessionRequestFor(child: ChildRecord): RemoteSessionRequest {
+		return {
+			host: child.host as string,
+			name: child.name,
+			localPath: remoteMirrorPathFor(this.runDir, child.name),
+			...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+			// The address the core really holds: the core may have shortened the name
+			// it was asked for, and asking about a name that never existed would
+			// report "the core does not know it" as a verdict.
+			...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
+		};
+	}
+
+	/**
+	 * Read the mirror AGAIN, once the turn is over.
+	 *
+	 * Why this exists (real 6.2.0 demo, Mac → hw-nj): the mirror used to be fetched
+	 * exactly once, at the top of `collect()`, BEFORE `awaitSupervisor`. A collect that
+	 * started mid-turn therefore derived its verdict — and reported `readbackFacts` —
+	 * from a snapshot taken while the turn was still writing. That demo read 5 lines
+	 * off the machine, called it "5 of 5 lines (complete)", and returned
+	 * `aborted (no assistant message for the last prompt)` while the machine went on to
+	 * hold 11 lines for a remote centurion that had answered.
+	 *
+	 * Only ever called after a wait returned `settled`/`gone`: while the turn is in
+	 * flight the mirror is EXPECTED to be short, so re-reading it would buy nothing and
+	 * would turn every poll into a round trip. The "never read the remote for a live,
+	 * still-running child" rule is exactly why this is one refresh at the end and not a
+	 * loop.
+	 *
+	 * Never throws, and never overwrites a good mirror with a failure: the text already
+	 * on disk stays parsable, and {@link mirrorUntrustedReason} keeps the verdict from
+	 * presenting it as the whole transcript.
+	 */
+	private async refreshRemoteMirror(child: ChildRecord): Promise<void> {
+		if (this.remoteReadback === undefined || normalizeHost(child.host) === undefined) return;
+		let read: RemoteReadbackResult;
+		try {
+			read = await this.remoteReadback(this.remoteSessionRequestFor(child));
+		} catch (error) {
+			// The seam answers with a failure OBJECT; a throw is a bug in it, and must not
+			// turn a finished turn into a thrown collect. Treat it as an unreachable host.
+			read = {
+				ok: false,
+				host: child.host as string,
+				reason: error instanceof Error ? error.message : String(error),
+				fate: "unreachable",
+				evidence: [],
+				nextStep: "retry collect (the transcript is on that machine; the refresh did not reach it)",
+			};
+		}
+		if (read.ok) {
+			this.remoteSessions.set(child.name, read);
+			this.mirrorRefreshFailure.delete(child.name);
+			return;
+		}
+		if (this.remoteSessions.get(child.name)?.ok) {
+			// Keep the last good mirror, but remember that it could not be confirmed as
+			// current — that is what stops a stale snapshot from being read as a verdict.
+			this.mirrorRefreshFailure.set(child.name, `${read.fate}: ${read.reason}`);
+			return;
+		}
+		// Nothing was ever read: record the fresh failure so `readbackFacts` names it.
+		this.remoteSessions.set(child.name, read);
+	}
+
+	/**
+	 * Why the mirror cannot be presented as this turn's complete transcript.
+	 *
+	 * `deriveOutcome` only sees bytes: it cannot tell "the child really never replied"
+	 * from "we are looking at a short or partial snapshot of a transcript that does
+	 * reply". Those must not collapse into the frozen
+	 * `aborted (no assistant message …)` reason — the first is the child's fate, the
+	 * second is this machine's blind spot, and D15 of `cross-machine-spawn-v1.md`
+	 * promises an honest `unknown` for exactly that case.
+	 */
+	private mirrorUntrustedReason(child: ChildRecord): string | undefined {
+		if (normalizeHost(child.host) === undefined) return undefined; // a local transcript is authoritative
+		const refreshFailure = this.mirrorRefreshFailure.get(child.name);
+		if (refreshFailure !== undefined) {
+			return `read-back could not be refreshed after the turn ended (${refreshFailure}), so the mirror may still be a mid-turn snapshot`;
+		}
+		const remote = this.remoteSessions.get(child.name);
+		// No text at all: `deriveOutcome` already answers "no messages in session", which
+		// is honest about having read nothing (and `readbackFacts` names the failure).
+		if (remote === undefined || !remote.ok) return undefined;
+		if (remote.lines === 0) return "read-back was empty (0 lines on that machine), so no reply can be read here";
+		if (remote.truncated) {
+			return `read-back was truncated (${remote.returned} of ${remote.lines} lines), so the last turn's reply may be outside the window`;
+		}
+		return undefined;
+	}
+
+	/**
+	 * `deriveOutcome`, minus the one verdict this machine cannot honestly reach from a
+	 * partial mirror. See {@link mirrorUntrustedReason}.
+	 *
+	 * A COMPLETE remote transcript that ends without an assistant message still derives
+	 * `aborted`, with the frozen reason: that is the child's own fate (`session.test.ts`
+	 * pins it), not a read-back artifact.
+	 */
+	private deriveMirroredOutcome(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>): Execution {
+		const outcome = deriveOutcome(parsed);
+		if (outcome.reason !== NO_ASSISTANT_ABORT_REASON) return outcome;
+		const untrusted = this.mirrorUntrustedReason(child);
+		if (untrusted === undefined) return outcome;
+		return { ...outcome, status: "unknown", reason: untrusted };
 	}
 
 	sessionFileFor(name: string): string {
@@ -2901,17 +3027,8 @@ export class Orchestrator {
 			);
 		}
 		if (this.remoteReadback !== undefined && normalizeHost(child.host) !== undefined) {
-			const request: RemoteSessionRequest = {
-				host: child.host as string,
-				name: child.name,
-				localPath: remoteMirrorPathFor(this.runDir, child.name),
-				...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
-				// The address the core really holds: the core may have shortened the name
-				// it was asked for, and asking about a name that never existed would
-				// report "the core does not know it" as a verdict.
-				...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
-			};
-			this.remoteSessions.set(child.name, await this.remoteReadback(request));
+			this.remoteSessions.set(child.name, await this.remoteReadback(this.remoteSessionRequestFor(child)));
+			this.mirrorRefreshFailure.delete(child.name);
 		}
 		const abortedSnapshot = (): CollectResult => this.interruptedCollect(child, parseSessionFile(this.sessionFileOf(child)));
 		if (opts.signal?.aborted) return abortedSnapshot();
@@ -2921,7 +3038,11 @@ export class Orchestrator {
 		// A connection blip writes stopReason "error" before the client retries.
 		// That looks like a finished turn, but the RPC child is still in it.
 		// Skipping the supervisor wait here is what retired a live worker.
-		let wait: CollectWait = isLastTurnComplete(initial) && !this.liveConnectionBlip(child, initial)
+		const initialComplete = isLastTurnComplete(initial) && !this.liveConnectionBlip(child, initial);
+		// Did a real wait run? When the snapshot already ended a turn there is no
+		// `awaitSupervisor` return, so there is nothing new to read back either.
+		const waitedForTurn = !initialComplete;
+		let wait: CollectWait = initialComplete
 			? "settled"
 			: await this.awaitSupervisor(child, deadline, opts.signal);
 		if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
@@ -2934,6 +3055,13 @@ export class Orchestrator {
 			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
+		// S4/D15 follow-up (real 6.2.0 demo): the mirror was taken BEFORE the wait, so
+		// for a turn that ENDED during it that snapshot is a mid-turn one. Re-read it
+		// now — the verdict and `readbackFacts` must both describe the transcript the
+		// turn actually produced, not the tail of it that existed when collect started.
+		// Nothing is read while the turn is still in flight (`timeout` keeps the
+		// running snapshot and the next collect reads again).
+		if (waitedForTurn && (wait === "settled" || wait === "gone")) await this.refreshRemoteMirror(child);
 		let parsed = parseSessionFile(this.sessionFileOf(child));
 		// #232: no settle-quiet wait here.
 		//
@@ -3018,7 +3146,9 @@ export class Orchestrator {
 	> {
 		const name = child.name;
 		let parsed = input;
-		let execution = deriveOutcome(parsed);
+		// `deriveMirroredOutcome`, not `deriveOutcome`: a short/truncated mirror cannot
+		// reach the frozen "no assistant message" verdict (see mirrorUntrustedReason).
+		let execution = this.deriveMirroredOutcome(child, parsed);
 		if (this.supervisor.isAlive(name) && isTransientConnectionFailure(execution)) {
 			// Same non-terminal signal as the deadline path: watch() re-arms on
 			// `running` and does not retire. An already-settled blip has to keep
@@ -3028,7 +3158,7 @@ export class Orchestrator {
 				if (held === "aborted" || signal?.aborted) return { kind: "aborted" };
 				if (held === "blocked") return { kind: "blocked" };
 				parsed = parseSessionFile(this.sessionFileOf(child));
-				execution = deriveOutcome(parsed);
+				execution = this.deriveMirroredOutcome(child, parsed);
 			}
 			if (this.supervisor.isAlive(name) && (isTransientConnectionFailure(execution) || !isLastTurnComplete(parsed))) {
 				execution = { ...execution, status: "running", reason: TRANSIENT_CONNECTION_REASON };
@@ -3126,6 +3256,10 @@ export class Orchestrator {
 		const settled = await this.awaitSupervisor(child, deadline, signal);
 		if (settled === "aborted" || signal?.aborted) return { kind: "aborted" };
 		if (settled === "blocked") return { kind: "blocked" };
+		// The retried turn is a NEW turn on that child, so a mirror read before the
+		// re-prompt is older than the turn it is about to be asked to judge. Same
+		// refresh rule as the first wait: only once the wait says the turn ended.
+		if (settled === "settled" || settled === "gone") await this.refreshRemoteMirror(child);
 		// The retried turn is classified by the SAME ladder as a first turn (major 1):
 		// a connection blip stays `running`, a dead child with an empty transcript is
 		// `aborted`, a parent shutdown is attributed, and a still-running turn keeps
@@ -3548,11 +3682,17 @@ export class Orchestrator {
 	 * on its virtual clock.
 	 */
 	private async collectArtifactGrowing(child: ChildRecord, signal?: AbortSignal): Promise<boolean> {
-		const before = artifactSize(child.sessionFile);
+		// The artifact that may grow is the one the verdict is parsed from, so ask the
+		// same resolver everything else in collect asks. Polling `child.sessionFile`
+		// looked at the LOCAL placeholder for a child that ran elsewhere — a file that
+		// child never writes — so a remote child could never be granted the growth
+		// grace no matter how much its transcript grew on that machine.
+		const artifact = this.sessionFileOf(child);
+		const before = artifactSize(artifact);
 		if (before <= 0 || signal?.aborted) return false;
 		for (let waited = 0; waited < POLL_INTERVAL_MS; waited += ARTIFACT_GROWTH_POLL_MS) {
 			if (await this.sleepOrAbort(Math.min(ARTIFACT_GROWTH_POLL_MS, POLL_INTERVAL_MS - waited), signal)) return false;
-			if (artifactSize(child.sessionFile) > before) return true;
+			if (artifactSize(artifact) > before) return true;
 		}
 		return false;
 	}
