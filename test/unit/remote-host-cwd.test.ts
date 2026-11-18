@@ -153,20 +153,15 @@ test("D2: the resolver's per-call branch throws the question, with details that 
 	assert.deepEqual(error.details, { host: HOST, cwd: "", reason: "cwd-missing", noModelFallback: true });
 });
 
-test("D2: the pure resolver used DIRECTLY keeps its pre-v1.1 sentence (read-back paths, frozen by the target tests)", () => {
-	// `remote-verify` / `remote-artifact` / doctor call `resolveHostTarget` with no
-	// overrides at all; their sentence is pinned byte-for-byte by
-	// `cross-machine-target.test.ts` and `cross-machine-discovery.test.ts`, so the
-	// question is taught on the launch path (async resolver + per-call branch)
-	// rather than by rewriting a frozen message. Asserting it here keeps the
-	// decision in ONE place instead of hidden in a test nobody edits.
+test("D2: the pure resolver used DIRECTLY asks the same question (read-back paths included)", () => {
+	// `remote-verify` / `remote-artifact` call `resolveHostTarget` with no overrides
+	// at all: a resume that cannot name the directory must get the QUESTION too,
+	// not a settings lesson — the first-run session's whole failure mode was one
+	// sentence telling the reader to edit a file it could not edit.
 	const error = thrownSync(() => resolveHostTarget(HOST, { enabled: true, hosts: { [HOST]: {} } }));
 	assert.ok(error instanceof SubagentError);
-	assert.equal(
-		error.message,
-		"host 'vps' needs an absolute cwd in subagents.crossMachine.hosts.vps.cwd (remote paths are not translated from this machine)",
-	);
-	assert.deepEqual(error.details, { host: HOST, cwd: "" });
+	assert.equal(error.message, missingRemoteCwdQuestion(HOST));
+	assert.deepEqual(error.details, { host: HOST, cwd: "", reason: "cwd-missing", noModelFallback: true });
 });
 
 test("D2 ordering: the async resolver asks the question with ZERO machine.exec (machine.list is allowed)", async () => {

@@ -702,17 +702,16 @@ export function resolveHostTarget(
 		// Never HOME, never the remote core's cwd: a child that lands in the wrong
 		// directory is the failure this whole file is built to refuse (D1/D6).
 		//
-		// The v1.1 resolver ALSO offers the per-call override, because that is the
-		// new way out of this error; a pre-v1.1 caller (and its pinned test) gets the
-		// old sentence, untouched.
+		// One ANSWER for every caller (contract `first-run-success-v1` D2): the
+		// directory on that machine is the one fact nothing here can discover, so it
+		// is asked as a question — the same sentence the async resolver throws BEFORE
+		// it probes, and the same one the read-back paths (remote-verify,
+		// remote-artifact) now get, so a resume cannot teach a configuration lesson
+		// the launch path no longer teaches.
 		throw new SubagentError(
-			overrides.mentionPerCallCwd === true
-				? missingRemoteCwdQuestion(name)
-				: `host '${name}' needs an absolute cwd in subagents.crossMachine.hosts.${name}.cwd (remote paths are not translated from this machine)`,
+			missingRemoteCwdQuestion(name),
 			ErrorCodes.INVALID_PARAMS,
-			overrides.mentionPerCallCwd === true
-				? { host: name, cwd: "", reason: "cwd-missing", noModelFallback: true }
-				: { host: name, cwd: "" },
+			{ host: name, cwd: "", reason: "cwd-missing", noModelFallback: true },
 		);
 	}
 	if (!path.posix.isAbsolute(cwd)) {

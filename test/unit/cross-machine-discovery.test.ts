@@ -38,6 +38,7 @@ import {
 	remoteDiscoveryScript,
 	resolveHostTarget,
 	resolveHostTargetAsync,
+	missingRemoteCwdQuestion,
 	thisPackageRoot,
 	type HcExecResult,
 } from "../../src/runs/remote.ts";
@@ -699,15 +700,12 @@ test("v1.1 cwd: the per-call override wins over the host default, and must be ab
 	const relative = thrownSync(() => resolveHostTarget("vps", legacy, { cwd: "other-project" }));
 	assert.ok(relative instanceof SubagentError);
 	assert.match((relative as SubagentError).message, /per-call cwd override must be an absolute path/);
-	// No default and no override: refuse, never guess HOME. The pre-v1.1 caller
-	// keeps the exact old sentence (backward compatibility), while the v1.1
-	// resolver also teaches the per-call override.
+	// No default and no override: refuse, never guess HOME. D2: the answer is the
+	// question (which directory on that machine?), not an instruction to edit a
+	// settings file — the resolver's callers include the read-back paths.
 	const none = thrownSync(() => resolveHostTarget("vps", config({ vps: {} })));
 	assert.ok(none instanceof SubagentError);
-	assert.equal(
-		(none as SubagentError).message,
-		"host 'vps' needs an absolute cwd in subagents.crossMachine.hosts.vps.cwd (remote paths are not translated from this machine)",
-	);
+	assert.equal((none as SubagentError).message, missingRemoteCwdQuestion("vps"));
 });
 
 test("v1.1 tool params: an absolute cwd next to a host is REMOTE, a relative one keeps its old local meaning", () => {
