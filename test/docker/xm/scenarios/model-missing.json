@@ -1,0 +1,44 @@
+{
+  "models": [
+    {
+      "id": "flash",
+      "name": "XM Flash"
+    }
+  ],
+  "rules": [
+    {
+      "name": "m-turn0-dispatch-a-model-the-remote-cannot-see",
+      "when": {
+        "turnIndex": 0
+      },
+      "then": {
+        "type": "tool_call",
+        "name": "subagent",
+        "arguments": {
+          "agent": "centurion",
+          "task": "XM_MODEL_PROBE — the dispatch must be refused because the remote machine does not serve this model",
+          "host": "{{HOST}}",
+          "hostCwd": "{{HOST_CWD}}",
+          "model": "{{MOCK_MODEL}}"
+        }
+      }
+    },
+    {
+      "name": "m-turn1-echo-the-tool-result-verbatim",
+      "when": {
+        "turnIndex": 1
+      },
+      "then": {
+        "type": "text",
+        "content": "MODEL_TOOL_RESULT {{lastToolContent}}"
+      }
+    },
+    {
+      "name": "catch-all-final-text",
+      "then": {
+        "type": "text",
+        "content": "MODEL_TOOL_RESULT (extra turn; earlier text above)"
+      }
+    }
+  ]
+}

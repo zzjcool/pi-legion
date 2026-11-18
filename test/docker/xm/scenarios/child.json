@@ -1,0 +1,40 @@
+{
+  "models": [
+    {
+      "id": "flash",
+      "name": "XM Flash"
+    }
+  ],
+  "rules": [
+    {
+      "name": "child-turn0-write-marker-on-its-own-machine",
+      "when": {
+        "turnIndex": 0
+      },
+      "then": {
+        "type": "tool_call",
+        "name": "bash",
+        "arguments": {
+          "command": "printf '%s\\n' '{{NONCE}}' > XM_READY.txt && git -C . status --short | head -3"
+        }
+      }
+    },
+    {
+      "name": "child-turn1-final-text",
+      "when": {
+        "turnIndex": 1
+      },
+      "then": {
+        "type": "text",
+        "content": "XM_CHILD_FINAL_{{NONCE}} ready in XM_READY.txt"
+      }
+    },
+    {
+      "name": "catch-all-final-text",
+      "then": {
+        "type": "text",
+        "content": "XM_CHILD_FINAL_{{NONCE}} ready in XM_READY.txt"
+      }
+    }
+  ]
+}
