@@ -837,20 +837,42 @@ export interface RpcSettings {
 
 /**
  * One entry of `subagents.crossMachine.hosts` (contract
- * `cross-machine-spawn-v1` D7/D9).
+ * `cross-machine-spawn-v1` D7/D9, addendum v1.1).
  *
  * Every value describes the TARGET machine, never this one: `cwd` is an
  * absolute path ON that machine and is not translated from here (contract
- * D6/D13). `node`/`piCli` are resolved through that machine's `PATH` by the
- * remote `machine.exec` preflight, so a bare name (`node`, `pi`) is the normal
- * value and an absolute remote path is the escape hatch.
+ * D6/D13).
+ *
+ * The entry is an OVERRIDE LIST, not a required form: a host that `hc machine
+ * ls` knows needs no entry at all (`{}` is a valid entry), and every field left
+ * out is discovered on the target by one `machine.exec` probe
+ * (`remoteDiscoveryScript` in `src/runs/remote.ts`) and cached. An explicit
+ * value always wins over a discovered one; a host with `discover: false` uses
+ * only what is written here.
  */
 export interface CrossMachineHostConfig {
-	/** Absolute path (on that machine) the remote child starts in. */
+	/**
+	 * DEFAULT absolute path (on that machine) the remote child starts in.
+	 *
+	 * One host can serve many projects: a call may override it with
+	 * `subagent({ host, cwd })` / `hostCwd`, and that override — not this value —
+	 * is what the child starts in for that launch. Absent here AND at the call
+	 * means the launch is refused; it is never guessed (not HOME, not the
+	 * remote core's cwd).
+	 */
 	cwd?: string;
-	/** Remote `node` (default `"node"`), resolved on that machine's PATH. */
+	/**
+	 * Remote `node` (discovered when absent), resolved on that machine's PATH.
+	 * A discovered value is always the REAL binary (`process.execPath`), never a
+	 * version-manager shim (mise/asdf).
+	 */
 	node?: string;
-	/** Remote `pi` CLI (default `"pi"`), resolved on that machine's PATH. */
+	/**
+	 * Remote `pi` CLI (discovered when absent): the JavaScript entry point node
+	 * executes (`…/dist/bundle/cli.js`), NEVER the shell launcher `…/bin/pi`. The
+	 * discovered value is validated by running `<node> <entry> --version` on the
+	 * target, which is the same question the preflight asks.
+	 */
 	piCli?: string;
 	/**
 	 * Where THIS package (pi-legion) lives on that machine.
@@ -905,26 +927,60 @@ export interface CrossMachineHostConfig {
 	 * creation exactly where a remote centurion wants it.
 	 */
 	worktreeRoot?: string;
+	/**
+	 * Per-host switch for auto-discovery (default: the `crossMachine.discover`
+	 * value, which defaults to true). `false` means every field must be written
+	 * here — useful on a machine whose layout the probe cannot read.
+	 */
+	discover?: boolean;
 }
 
 /**
- * Cross-machine spawn configuration (contract `cross-machine-spawn-v1`).
+ * Cross-machine spawn configuration (contract `cross-machine-spawn-v1`,
+ * addendum v1.1).
  *
- * Off by default: with `enabled` absent/false a launch that names a `host` is
- * REFUSED rather than run locally — a child that ran here while the caller
- * believed it ran elsewhere is the worst answer (contract D1).
+ * Admission ("may this launch go to that machine at all?") and configuration
+ * ("where do its paths live?") are two different questions now:
+ *
+ *   - admission comes from `hc` itself: the host must be a name `hc machine ls`
+ *     reports (that is the operator's opt-in, and it is the same name that
+ *     travels as `on`). A host `hc` does not know is refused by NAME, with the
+ *     machines this core does know listed; it is never run locally instead.
+ *   - configuration is this block plus per-host overrides. `hosts.<h>` is
+ *     optional (`{}` means "discover everything"), and `enabled` only has to be
+ *     written to turn the whole feature OFF (`enabled: false`).
  */
 export interface CrossMachineSettings {
-	/** Master switch; absent/false refuses every launch that names a `host`. */
+	/**
+	 * Master switch. `false` refuses every launch that names a `host`; absent
+	 * means "decide by the `hc` machine registry" (the old `enabled: true` still
+	 * works and means the same thing).
+	 */
 	enabled?: boolean;
 	/**
-	 * Explicit allow-list of target machines, keyed by the `hc machine ls` name.
-	 *
-	 * A host with no entry here is refused (`resolveHostTarget` in
-	 * `src/runs/remote.ts`): the remote cwd cannot be guessed, and guessing is
-	 * how a remote launch lands in the wrong directory.
+	 * Per-host overrides, keyed by the `hc machine ls` name. Every key except
+	 * those you deliberately change may be omitted; a host with no entry at all
+	 * is still launchable when `hc` knows it.
 	 */
 	hosts?: Record<string, CrossMachineHostConfig>;
+	/**
+	 * Master switch for auto-discovery (default true). `false` disables probing
+	 * for every host and makes a missing `node`/`piCli` fall back to the pre-v1.1
+	 * defaults (`node` / `pi`, resolved on the target's PATH).
+	 */
+	discover?: boolean;
+	/**
+	 * How long a discovery result may be reused, in seconds (default 900). After
+	 * that the next launch probes again — which is how a target that upgraded
+	 * `pi` (and moved its bundle to a new release directory) heals by itself.
+	 */
+	discoveryTtlSeconds?: number;
+	/**
+	 * Force a fresh probe on the next launch, ignoring both the memory and the
+	 * disk cache (the same switch `subagents.crossMachine.refresh`, and the
+	 * doctor's `refresh` flag, flip). Written by the operator, read per launch.
+	 */
+	refresh?: boolean;
 }
 
 export interface SubagentsSettings {

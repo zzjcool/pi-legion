@@ -553,6 +553,27 @@ function parseDefaultModel(value: unknown, filePath: string): string | undefined
 	return model;
 }
 
+/**
+ * A positive number of seconds, or `undefined` when the key is absent.
+ *
+ * Used by `crossMachine.discoveryTtlSeconds`: a `0` would mean "always stale",
+ * which is expressed as `refresh: true` instead, so zero and negatives are
+ * rejected rather than silently turned into a probe on every launch.
+ */
+function optionalPositiveSeconds(
+	value: unknown,
+	key: string,
+	filePath: string,
+): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+		throw new Error(
+			`Subagent settings in '${filePath}' have invalid '${key}'; expected a positive number of seconds.`,
+		);
+	}
+	return value;
+}
+
 /** A boolean, or `undefined` when the key is absent. */
 function requiredBoolean(
 	value: unknown,
@@ -706,6 +727,21 @@ function parseCrossMachine(
 		"enabled",
 		requiredBoolean(value.enabled, "crossMachine.enabled", filePath),
 	);
+	setIf(
+		out,
+		"discover",
+		requiredBoolean(value.discover, "crossMachine.discover", filePath),
+	);
+	setIf(
+		out,
+		"refresh",
+		requiredBoolean(value.refresh, "crossMachine.refresh", filePath),
+	);
+	setIf(
+		out,
+		"discoveryTtlSeconds",
+		optionalPositiveSeconds(value.discoveryTtlSeconds, "crossMachine.discoveryTtlSeconds", filePath),
+	);
 	if (value.hosts !== undefined) {
 		if (!isRecord(value.hosts)) {
 			throw new Error(
@@ -768,6 +804,13 @@ function parseCrossMachine(
 				filePath,
 			);
 			if (piExtensions !== undefined) target.piExtensions = piExtensions;
+			// v1.1: per-host opt-out of the discovery probe. Absent = inherit
+			// `crossMachine.discover` (which itself defaults to true).
+			setIf(
+				target,
+				"discover",
+				requiredBoolean(entry.discover, `crossMachine.hosts.${host}.discover`, filePath),
+			);
 			hosts[host] = target;
 		}
 		out.hosts = hosts;

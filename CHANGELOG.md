@@ -11,6 +11,39 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased]
 
+### Added（v1.1，minor 建议 6.2.0）
+
+跨机器配置不再要求父机替远端手写一堆路径，也不再「一台机器只能一个工作目录」：
+
+- **hc 就是机器清单**：`subagents.crossMachine.hosts` 可以完全不写；机器只要在
+  `hc machine ls` 里就能派发。准入（是否允许去那台机器）与配置（路径在哪）分开：
+  不在注册表里的机器**按名字拒绝**并列出这个 core 认识的机器 + `hc machine add` 命令，
+  不会再报一句 `machine_unknown` 了事。resume / 读回不查注册表（注册是按 `HC_SESSION`
+  的），仍走原来的四步 gate。
+- **自动发现**：`hosts.<h>` 最少可以是 `{}`（或只写 `cwd`）。缺的 `node` / `piCli` /
+  `piLegionRoot` / provider 扩展由**一次** `machine.exec` 探测填充：node 解析到
+  **真实二进制**（不是 mise/asdf shim），`pi` 解析到 launcher 背后的 **JS 入口**
+  （`dist/bundle/cli.js`，用 `--version` 验证）。显式配置永远优先，写全了的旧配置
+  **零探测**、解析结果逐字段不变。
+- **cwd 允许多个**：`hosts.<h>.cwd` 降级为默认值；每次调用可用
+  `subagent({ host, cwd })`（或 `hostCwd`）覆盖，路径必须是那台机器上的绝对路径，
+  不存在在启动前报错；既没默认也没覆盖时明确拒绝（不猜 HOME）。
+- **扩展按包名重锚（v1.2）**：父机 argv 里的 `-e <父机绝对路径>` 不再"映射不了就丢"。
+  探测会报告远端每个已安装包的 `name + dir` 和它声明的 `pi.extensions` 相对入口，
+  于是 `…/pi-any-endpoint/extensions/index.ts` 自动变成远端同名包下的同一相对路径
+  （Mac 父机 → Linux 目标机的实测场景）。包在远端不存在 ⇒ **启动前报错**，点名包名、
+  父机路径与三种修法（远端安装 / pathMap / 关继承）；包在但入口不同 ⇒ 同样报错并列出
+  它实际声明的入口。探测只在 argv 真的需要时才发（`needsPackageIndex`），全显式旧配置
+  仍然零额外往返。
+- **缓存与自愈**：发现结果内存 + 磁盘缓存（TTL 默认 900s，`discoveryTtlSeconds` 可调，
+  `refresh: true` 强制重探）。探测失败不缓存；远端升级 `pi` 后 preflight 会触发一次
+  重新探测并重试。
+- 新增 `crossMachine.discover` / `hosts.<h>.discover` 开关；`hc` 客户端 allowlist 增加
+  只读的 `machine.list`（写侧 `machine.add` / `machine.rm` 仍禁止）。
+
+契约增补：`docs/contracts/cross-machine-spawn-v1.md` Addendum v1.1；
+报告：`docs/reports/cross-machine-host-discovery.md`。
+
 ## [6.1.1] — 2026-11-17
 
 修跨机器派发不可用：`hosts.<h>.piExtensions` 曾被 settings 白名单静默丢弃，导致 provider 扩展

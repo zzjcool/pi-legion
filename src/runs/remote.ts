@@ -17,7 +17,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { HcRpcError, type HcClient } from "../hc/client.ts";
+import { HcCliClient, HcRpcError, type HcClient } from "../hc/client.ts";
 import { modelMatches, parseListModels } from "../shared/list-models.ts";
 import {
 	ErrorCodes,
@@ -55,6 +55,152 @@ export function terminalAddress(record: { terminalName: string; host?: string })
 }
 
 /**
+ * The npm package a file belongs to on THIS machine, found by walking up.
+ *
+ * Why by manifest and not by path shape: an extension entry can be
+ * `<pkg>/extensions/index.ts`, `<pkg>/src/index.ts` or `<pkg>/dist/x/index.js`,
+ * and the only stable identity across two machines is the `name` in the nearest
+ * `package.json`. The walk stops at the filesystem root, so a path that is not
+ * inside a package answers `undefined` (and gets the pre-v1.2 refusal).
+ */
+export function localPackageForFile(file: string): { name: string; dir: string } | undefined {
+	let dir = path.dirname(path.resolve(file));
+	for (;;) {
+		try {
+			const manifest = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")) as { name?: unknown };
+			const name = typeof manifest.name === "string" ? manifest.name.trim() : "";
+			if (name.length > 0) return { name, dir };
+		} catch {
+			/* no manifest here: keep walking */
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
+}
+
+/** The three answers a package re-root can give (see {@link resolvePackagePathOnHost}). */
+export type PackagePathResolution =
+	| { ok: true; path: string; packageName: string; relative: string }
+	| {
+			ok: false;
+			reason: "no-package" | "not-installed" | "entry-missing";
+			packageName?: string;
+			relative?: string;
+			/** Package dir on the target, when the package IS installed there. */
+			remoteDir?: string;
+			/** Entries the installed package DOES declare (entry-missing). */
+			declared?: HostPackageEntry[];
+	  };
+
+/**
+ * Re-root a parent package path onto the target by PACKAGE NAME (v1.2).
+ *
+ * The failure this removes (real run): a Mac parent inherited five extensions as
+ * Mac absolute paths — `pi-sysmon/src/index.ts`,
+ * `pi-any-endpoint/extensions/index.ts`, … — none of which exist on the Linux
+ * target, so all five were dropped and the child silently lost its provider.
+ * Both machines have the packages; only the roots differ. Asking "which package
+ * is this, and where is that package there?" answers it without a `pathMap`.
+ *
+ * Deliberately conservative: a package that IS installed there but does NOT
+ * expose the same relative entry (a different version/layout) is a REFUSAL, not
+ * a best-effort guess — `entry-missing` names what the package does declare.
+ */
+export function resolvePackagePathOnHost(
+	file: string,
+	index: HostPackageIndex | undefined,
+): PackagePathResolution {
+	if (index === undefined) return { ok: false, reason: "no-package" };
+	const local = localPackageForFile(file);
+	if (local === undefined) return { ok: false, reason: "no-package" };
+	const relative = path.relative(local.dir, path.resolve(file)).split(path.sep).join("/").replace(/^\.\//, "");
+	const install = index.packages.find((entry) => entry.name === local.name);
+	if (install === undefined) {
+		return { ok: false, reason: "not-installed", packageName: local.name, relative };
+	}
+	const declared = index.entries.filter((entry) => entry.name === local.name);
+	const same = declared.find((entry) => entry.relative === relative);
+	if (same !== undefined) return { ok: true, path: same.path, packageName: local.name, relative };
+	return {
+		ok: false,
+		reason: "entry-missing",
+		packageName: local.name,
+		relative,
+		remoteDir: install.dir,
+		declared,
+	};
+}
+
+/** The refusal for a package path that exists here but not in the same shape there. */
+function packagePathError(host: string, file: string, resolution: PackagePathResolution): SubagentError {
+	if (resolution.ok) throw new Error("packagePathError called with a successful resolution");
+	const name = resolution.packageName ?? path.basename(file);
+	const settingsPath = `subagents.crossMachine.hosts.${host}.pathMap`;
+	const fix = `Install '${name}' on '${host}' (same entry names are then mapped automatically), or add an explicit prefix to ${settingsPath}, or stop inheriting the parent's extensions (PI_LEGION_CHILD_INHERIT_EXTENSIONS=0 / inheritExtensions: false on the card).`;
+	if (resolution.reason === "not-installed") {
+		return new SubagentError(
+			`host '${host}': the extension '${file}' belongs to package '${name}', which is not installed on that machine (the launch would have silently dropped it). ${fix}`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host, extension: file, package: name, reason: resolution.reason },
+		);
+	}
+	const declared = resolution.declared ?? [];
+	const available = declared.length > 0
+		? declared.map((entry) => `./${entry.relative} -> ${entry.path}`).join(", ")
+		: "(it declares no pi.extensions entries)";
+	return new SubagentError(
+		`host '${host}': package '${name}' IS installed there at ${resolution.remoteDir}, but it does not expose './${resolution.relative}' (declared: ${available}); the launch would have loaded a different entry than the one this machine asked for. ${fix}`,
+		ErrorCodes.INVALID_PARAMS,
+		{ host, extension: file, package: name, reason: resolution.reason, declared },
+	);
+}
+
+/** Map a whole argv, including `-e/--extension` pairs (one rule, no drops). */
+export function mapRemoteArgv(
+	args: readonly string[],
+	opts: {
+		host: string;
+		remoteCwd: string;
+		remoteDir: string;
+		localCwd: string;
+		pathMap?: readonly HostPathMapEntry[];
+		packages?: HostPackageIndex;
+	},
+): string[] {
+	return args.map((arg) => mapRemoteArgPath({ arg, ...opts }));
+}
+
+/**
+ * Does this argv contain a path that only PACKAGE-NAME resolution can map?
+ *
+ * The question exists to keep a fully explicit pre-v1.1 launch at ZERO extra
+ * round trips: every child argv carries this package's own extension entry, but
+ * that one is under the automatic `pathMap` entry, so it does not need the
+ * target's package list. Only inherited extensions (paths in the parent's npm
+ * tree) do — and only then is the probe paid for.
+ */
+export function needsPackageIndex(
+	args: readonly string[],
+	opts: {
+		remoteCwd: string;
+		remoteDir: string;
+		localCwd: string;
+		pathMap?: readonly HostPathMapEntry[];
+	},
+): boolean {
+	const pathMap = opts.pathMap ?? [];
+	for (const arg of args) {
+		if (!path.isAbsolute(arg)) continue;
+		if (isInsidePosix(opts.remoteDir, arg)) continue;
+		if (pathMap.some((entry) => isInsideFsPath(entry.from, arg))) continue;
+		if (isInsideFsPath(opts.localCwd, arg)) continue;
+		return true;
+	}
+	return false;
+}
+
+/**
  * Map ONE argv element onto the target machine, or refuse (D6).
  *
  * Three answers, and the third is the point:
@@ -86,6 +232,8 @@ export function mapRemoteArgPath(opts: {
 	localCwd: string;
 	/** Prefix translations from `hosts.<host>.pathMap`, longest first. */
 	pathMap?: readonly HostPathMapEntry[];
+	/** Packages installed on the target; enables re-rooting by package name (v1.2). */
+	packages?: HostPackageIndex;
 }): string {
 	const { arg, host, remoteCwd, remoteDir, localCwd, pathMap = [] } = opts;
 	if (!path.isAbsolute(arg)) return arg;
@@ -99,6 +247,14 @@ export function mapRemoteArgPath(opts: {
 		const relative = path.relative(path.resolve(localCwd), path.resolve(arg)).split(path.sep).join("/");
 		return path.posix.join(remoteCwd, relative);
 	}
+	// v1.2: a path inside an installed npm package is re-rooted by PACKAGE NAME,
+	// which is how the parent's inherited extensions reach a machine whose pi home
+	// is elsewhere. A package that is installed but lacks this entry is a refusal
+	// (not a drop): a child that quietly lost its provider is the failure this
+	// whole branch exists to remove.
+	const byPackage = resolvePackagePathOnHost(arg, opts.packages);
+	if (byPackage.ok) return byPackage.path;
+	if (byPackage.reason !== "no-package") throw packagePathError(host, arg, byPackage);
 	throw new SubagentError(
 		`host '${host}': argv references '${arg}', which is neither in this checkout nor under a configured pathMap entry, so it cannot be mapped to that machine (add { "${arg.split(path.sep).slice(0, 2).join(path.sep)}": "/abs/path/on/${host}" } to subagents.crossMachine.hosts.${host}.pathMap, or drop the flag)`,
 		ErrorCodes.INVALID_PARAMS,
@@ -275,6 +431,30 @@ export interface HostTarget {
 	 * child worktree" and suppress the worktree its centurion asked for.
 	 */
 	worktreeRoot: string;
+	/**
+	 * Field names that came from the discovery probe instead of the settings file
+	 * (addendum v1.1). Absent when every field was written by the operator, which
+	 * is what keeps a pre-v1.1 host entry byte-identical.
+	 */
+	discovered?: string[];
+	/** The probe result those fields came from, for diagnostics. */
+	discovery?: HostDiscoveryReport;
+	/**
+	 * Packages installed on that machine, by name (v1.2).
+	 *
+	 * The extension-inheritance path is a list of THIS machine's package paths
+	 * (`.../node_modules/pi-any-endpoint/extensions/index.ts`). Re-rooting them by
+	 * PACKAGE NAME is what makes them usable over there without an operator-written
+	 * `pathMap`; this index is the remote half of that mapping.
+	 */
+	packageIndex?: HostPackageIndex;
+	/**
+	 * Re-probe and re-resolve this target (self-heal). Present only when something
+	 * was discovered: a stale cached `piCli` (the target upgraded `pi` and the
+	 * bundle moved to a new release directory) is retried ONCE with this, and a
+	 * fully explicit host never re-probes.
+	 */
+	rediscover?: () => Promise<HostTarget>;
 }
 
 /** Defaults for the two programs, both resolved on the REMOTE machine. */
@@ -402,9 +582,36 @@ function resolvePiExtensions(host: string, value: unknown): string[] {
 	});
 }
 
+/**
+ * Everything a per-call resolution may add on top of the settings file.
+ *
+ * `cwd` is the ONLY per-call override (addendum v1.1): one machine can host many
+ * projects, so "the cwd" is a property of the launch rather than of the host.
+ * The other fields are filled by {@link resolveHostTargetAsync} after its probe,
+ * and exist so this function stays a pure decision function with no `hc` round
+ * trip inside it.
+ */
+export interface HostTargetOverrides {
+	/** Per-call remote cwd (`subagent({ host, cwd })`), absolute on that machine. */
+	cwd?: string;
+	/** Values discovered on the target; used only where the settings are silent. */
+	discovered?: DiscoveredHostFields;
+	/** Field names that came from discovery (diagnostics + self-heal). */
+	discoveredFields?: string[];
+	/** The report those fields came from, kept for `/legion doctor`. */
+	discovery?: HostDiscoveryReport;
+	/** Re-probe closure; see {@link HostTarget.rediscover}. */
+	rediscover?: () => Promise<HostTarget>;
+	/** Package index discovered on the target (v1.2 extension re-rooting). */
+	packageIndex?: HostPackageIndex;
+	/** Teach the per-call cwd override in the "no cwd" refusal (v1.1 callers). */
+	mentionPerCallCwd?: boolean;
+}
+
 export function resolveHostTarget(
 	host: string,
 	config: SubagentsSettings["crossMachine"] | undefined,
+	overrides: HostTargetOverrides = {},
 ): HostTarget {
 	const name = normalizeHost(host);
 	if (name === undefined) {
@@ -435,29 +642,71 @@ export function resolveHostTarget(
 	// about a filesystem it cannot see. Every "is this a path on THAT machine"
 	// check in this file uses `path.posix`; every "is this a path on THIS machine"
 	// check uses the platform `path` (`isInsideFsPath`).
-	const cwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
-	if (cwd.length === 0 || !path.posix.isAbsolute(cwd)) {
+	//
+	// v1.1: the per-call override wins over the host's default, and both are
+	// judged by the same rule — a relative value on either side would resolve
+	// against the remote core's home, the one directory nobody asked for.
+	const overrideCwd = typeof overrides.cwd === "string" ? overrides.cwd.trim() : "";
+	if (overrides.cwd !== undefined && (overrideCwd.length === 0 || !path.posix.isAbsolute(overrideCwd))) {
+		throw new SubagentError(
+			`host '${name}': the per-call cwd override must be an absolute path on that machine (got '${String(overrides.cwd)}'); remote paths are not translated from this machine`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: name, cwd: overrides.cwd },
+		);
+	}
+	const configuredCwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
+	const cwd = overrideCwd.length > 0 ? overrideCwd : configuredCwd;
+	if (cwd.length === 0) {
+		// Never HOME, never the remote core's cwd: a child that lands in the wrong
+		// directory is the failure this whole file is built to refuse (D1/D6).
+		//
+		// The v1.1 resolver ALSO offers the per-call override, because that is the
+		// new way out of this error; a pre-v1.1 caller (and its pinned test) gets the
+		// old sentence, untouched.
+		throw new SubagentError(
+			overrides.mentionPerCallCwd === true
+				? `host '${name}' has no cwd: set a default in subagents.crossMachine.hosts.${name}.cwd, or pass one per call with subagent({ host: "${name}", cwd: "/abs/path/on/${name}" })`
+				: `host '${name}' needs an absolute cwd in subagents.crossMachine.hosts.${name}.cwd (remote paths are not translated from this machine)`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: name, cwd: "" },
+		);
+	}
+	if (!path.posix.isAbsolute(cwd)) {
 		throw new SubagentError(
 			`host '${name}' needs an absolute cwd in subagents.crossMachine.hosts.${name}.cwd (remote paths are not translated from this machine)`,
 			ErrorCodes.INVALID_PARAMS,
 			{ host: name, cwd },
 		);
 	}
+	const discovered = overrides.discovered;
+	const discoveredRoot = nonEmpty(discovered?.piLegionRoot);
+	// Explicit wins, including an explicitly EMPTY `piExtensions: []` — an operator
+	// who wrote the key has answered the question, and a discovered provider must
+	// not sneak past that answer.
+	const piExtensions = entry.piExtensions !== undefined
+		? resolvePiExtensions(name, entry.piExtensions)
+		: (discovered?.piExtensions ?? []).filter((value) => path.posix.isAbsolute(value));
 	return {
 		host: name,
 		cwd,
-		node: nonEmpty(entry.node) ?? DEFAULT_REMOTE_NODE,
-		piCli: nonEmpty(entry.piCli) ?? DEFAULT_REMOTE_PI,
-		pathMap: resolvePathMap(name, entry.pathMap, entry.piLegionRoot),
-		piLegionRoot: typeof entry.piLegionRoot === "string" && entry.piLegionRoot.trim().length > 0
-			? entry.piLegionRoot.trim()
-			: thisPackageRoot(),
-		piExtensions: resolvePiExtensions(name, entry.piExtensions),
+		node: nonEmpty(entry.node) ?? nonEmpty(discovered?.node) ?? DEFAULT_REMOTE_NODE,
+		piCli: nonEmpty(entry.piCli) ?? nonEmpty(discovered?.piCli) ?? DEFAULT_REMOTE_PI,
+		pathMap: resolvePathMap(name, entry.pathMap, entry.piLegionRoot ?? discoveredRoot),
+		piLegionRoot: nonEmpty(entry.piLegionRoot) ?? discoveredRoot ?? thisPackageRoot(),
+		piExtensions,
 		mirrorRoot: path.posix.join(
 			path.posix.dirname(resolveWorktreeRoot(name, cwd, entry.worktreeRoot)),
 			REMOTE_MIRROR_DIR_NAME,
 		),
 		worktreeRoot: resolveWorktreeRoot(name, cwd, entry.worktreeRoot),
+		// Only present when a probe actually contributed: a fully explicit entry
+		// resolves to exactly the pre-v1.1 object, field for field.
+		...(overrides.discoveredFields && overrides.discoveredFields.length > 0
+			? { discovered: [...overrides.discoveredFields] }
+			: {}),
+		...(overrides.discovery ? { discovery: overrides.discovery } : {}),
+		...(overrides.packageIndex ? { packageIndex: overrides.packageIndex } : {}),
+		...(overrides.rediscover ? { rediscover: overrides.rediscover } : {}),
 	};
 }
 
@@ -607,6 +856,959 @@ function nonEmpty(value: unknown): string | undefined {
 	return trimmed.length > 0 ? trimmed : undefined;
 }
 
+// ── v1.1: host discovery (one probe, then cached) ─────────────────────────
+//
+// The problem this section removes: `subagents.crossMachine.hosts.<h>` used to
+// require `cwd`/`node`/`piCli` (and often `piLegionRoot`/`piExtensions`) to be
+// written by hand, on the PARENT, about a machine the parent is not sitting on.
+// Nothing about those values is a secret: they are answers to three shell
+// questions (`command -v node`, `command -v pi`, where is the bundle). So they
+// are ASKED, once, over the same `hc machine.exec` the preflight already uses,
+// and cached; the settings block becomes an override list instead of a form to
+// fill in.
+//
+// Two rules keep this safe:
+//   - explicit configuration always wins (a discovered value only fills a hole);
+//   - a discovered `node`/`piCli` is a VALIDATED absolute path on the target,
+//     never a name this machine would have to resolve and never a shim.
+
+/** The `pi` install locations the probe searches, relative to the launcher. */
+export const DISCOVERY_TIMEOUT_S = 20;
+
+/** How long a discovery result is reused before the target is asked again. */
+export const DEFAULT_DISCOVERY_TTL_S = 900;
+
+/** One installed pi extension found on the target. */
+export interface HostDiscoveryExtension {
+	/** Package name from its `package.json`. */
+	name: string;
+	/** Absolute path (on that machine) of the extension entry. */
+	path: string;
+	/** True when the package looks like a model provider. */
+	provider: boolean;
+}
+
+/** One installed npm package on the target, by name and directory. */
+export interface HostPackage {
+	name: string;
+	dir: string;
+}
+
+/** One declared `pi.extensions` entry of an installed package. */
+export interface HostPackageEntry {
+	name: string;
+	/** Entry path relative to the package dir, posix, no leading `./`. */
+	relative: string;
+	/** Absolute path (on that machine). */
+	path: string;
+}
+
+/**
+ * What the target has installed, keyed by package name.
+ *
+ * This is what turns a PARENT extension path into a path on the other machine
+ * without an operator-written `pathMap`: both machines run the same packages,
+ * just from different roots (`/Users/me/.pi/...` vs `/root/.pi/...`).
+ */
+export interface HostPackageIndex {
+	packages: HostPackage[];
+	entries: HostPackageEntry[];
+}
+
+/** What one probe found on the target machine. */
+export interface HostDiscoveryReport {
+	/** `uname -n`, diagnostics only. */
+	machine?: string;
+	/** `command -v node` and the REAL binary behind it. */
+	node?: { command: string; binary: string; version?: string; shim?: string };
+	/** `command -v node` even when that path could not be turned into a binary. */
+	nodeCommand?: string;
+	/** `command -v pi` and the JavaScript entry node can execute. */
+	pi?: { command: string; entry: string; version?: string };
+	/** `command -v pi` even when no runnable JavaScript entry sits behind it. */
+	piCommand?: string;
+	/** Where this package (pi-legion) lives there. */	piLegionRoot?: string;
+	/** Installed extensions that declare `pi.extensions`. */
+	extensions: HostDiscoveryExtension[];
+	/** Every installed package, by name (v1.2: extension re-rooting). */
+	packages: HostPackage[];
+	/** Declared `pi.extensions` entries, by package-relative path (v1.2). */
+	packageEntries: HostPackageEntry[];
+	/** Epoch ms of the probe (or of the cached probe this came from). */
+	at: number;
+	/** Where the answer came from, for diagnostics. */
+	source: "probe" | "memory-cache" | "disk-cache";
+}
+
+/** The subset of a report that fills holes in a host entry. */
+export interface DiscoveredHostFields {
+	node?: string;
+	piCli?: string;
+	piLegionRoot?: string;
+	piExtensions?: string[];
+}
+
+/**
+ * The discovery shell line (POSIX `sh`), one `machine.exec` round trip.
+ *
+ * Output is `KEY<TAB>VALUE`, one fact per line, because the three questions have
+ * three-valued answers (`found`, `found a shim`, `absent`) and prose is not a
+ * protocol. Everything is best-effort: a missing tool prints a marker line and
+ * the rest of the probe still runs, so the error the caller sees can name
+ * exactly what the machine does have.
+ *
+ * The two hard parts, both learned from real runs:
+ *
+ *   - `command -v node` can be a version-manager SHIM (mise/asdf), i.e. a shell
+ *     script. Handing that path to `terminal.run` as argv[0] is the 6.1.0 bug in
+ *     a different costume, so the probe asks node itself (`process.execPath`) and
+ *     reports the REAL binary; the shim is kept only for diagnostics.
+ *   - `command -v pi` is a shell LAUNCHER (`…/bin/pi`, a `case "$0"` wrapper),
+ *     and every child's argv is `[node, piCli, …]`. The probe therefore resolves
+ *     the launcher to a `.js` entry and then PROVES it by running
+ *     `<node> <entry> --version` — the same question the preflight asks, asked
+ *     here so the failure can name the field instead of surfacing as
+ *     `SyntaxError: Unexpected token case` ten layers down.
+ */
+export function remoteDiscoveryScript(): string {
+	// Heredoc-free on purpose: the body is a single `sh -c` line list, and every
+	// dynamic value is a quoted variable, never an interpolated path.
+	return [
+		`emit() { printf '%s\\t%s\\n' "$1" "$2"; }`,
+		`emit MACHINE "$(uname -n 2>/dev/null || true)"`,
+		// ── node ───────────────────────────────────────────────────────────────
+		`NODE_CMD=$(command -v node 2>/dev/null || true)`,
+		`NODE_BIN=""`,
+		`if [ -n "$NODE_CMD" ]; then`,
+		`  emit NODE_CMD "$NODE_CMD"`,
+		`  NODE_REAL=$("$NODE_CMD" -e 'process.stdout.write(process.execPath)' 2>/dev/null || true)`,
+		`  if [ -n "$NODE_REAL" ] && [ -x "$NODE_REAL" ]; then`,
+		`    NODE_BIN=$NODE_REAL`,
+		`    emit NODE_BIN "$NODE_REAL"`,
+		`    emit NODE_VERSION "$("$NODE_REAL" -v 2>/dev/null || true)"`,
+		`    [ "$NODE_REAL" = "$NODE_CMD" ] || emit NODE_SHIM "$NODE_CMD"`,
+		`  else`,
+		`    emit NODE_UNUSABLE "$NODE_CMD"`,
+		`  fi`,
+		`else`,
+		`  emit NODE_MISSING 1`,
+		`fi`,
+		// ── realpath (node when there is one: `readlink -f` is GNU-only) ───────
+		`rp() { if [ -n "$NODE_BIN" ]; then "$NODE_BIN" -e 'try{console.log(require("node:fs").realpathSync(process.argv[1]))}catch{}' "$1" 2>/dev/null && return 0; fi; if readlink -f "$1" >/dev/null 2>&1; then readlink -f "$1"; else readlink "$1" 2>/dev/null || printf '%s\\n' "$1"; fi; }`,
+		// ── pi ─────────────────────────────────────────────────────────────────
+		`PI_CMD=$(command -v pi 2>/dev/null || true)`,
+		`PI_ENTRY=""`,
+		`if [ -n "$PI_CMD" ]; then`,
+		`  emit PI_CMD "$PI_CMD"`,
+		`  PI_REAL=$(rp "$PI_CMD")`,
+		// The install root comes from the LAUNCHER's real path: `/usr/local/bin/pi`
+		// may be a symlink into `…/.pi/agent/bin/pi`, and `../install` only means
+		// anything next to the real launcher.
+		`  PI_DIR=$(dirname "$PI_REAL")`,
+		`  PI_CANDIDATES=$( {`,
+		`    printf '%s\\n' "$PI_CMD"`,
+		`    printf '%s\\n' "$PI_REAL"`,
+		`    CURRENT=$(cat "$PI_DIR/../install/current-version" 2>/dev/null || true)`,
+		`    [ -n "$CURRENT" ] && [ -e "$PI_DIR/../install/releases/$CURRENT/node_modules/.bin/pi" ] && rp "$PI_DIR/../install/releases/$CURRENT/node_modules/.bin/pi"`,
+		`    for c in "$PI_DIR"/../install/releases/*/node_modules/.bin/pi "$PI_DIR"/../install/releases/*/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js "$PI_DIR"/../npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js "$PI_DIR"/../node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js; do`,
+		`      [ -e "$c" ] && rp "$c"`,
+		`    done`,
+		`    if [ -f "$PI_CMD" ]; then grep -oE '(/[A-Za-z0-9._+@-]+)+[.](m?js|cjs)' "$PI_CMD" 2>/dev/null | head -n 20; fi`,
+		`  } | awk '!seen[$0]++' 2>/dev/null )`,
+		`  if [ -n "$NODE_BIN" ]; then`,
+		`    PI_ENTRY=$(printf '%s\\n' "$PI_CANDIDATES" | while IFS= read -r candidate; do`,
+		`      [ -n "$candidate" ] || continue`,
+		`      case "$candidate" in *.js|*.mjs|*.cjs) ;; *) continue ;; esac`,
+		`      [ -f "$candidate" ] || continue`,
+		`      if "$NODE_BIN" "$candidate" --version >/dev/null 2>&1; then printf '%s' "$candidate"; break; fi`,
+		`    done)`,
+		`  fi`,
+		`  if [ -n "$PI_ENTRY" ]; then`,
+		`    emit PI_ENTRY "$PI_ENTRY"`,
+		`    emit PI_VERSION "$("$NODE_BIN" "$PI_ENTRY" --version 2>/dev/null | head -n 1)"`,
+		`  else`,
+		`    emit PI_ENTRY_MISSING "$PI_CMD"`,
+		`  fi`,
+		`else`,
+		`  emit PI_MISSING 1`,
+		`fi`,
+		// ── this package (pi-legion) ─────────────────────────────────────────
+		`LEGION_CANDIDATES=$( {`,
+		`  printf '%s\\n' "$PI_DIR/../npm/node_modules/pi-legion" "$HOME/.pi/agent/npm/node_modules/pi-legion"`,
+		`  if command -v npm >/dev/null 2>&1; then NPM_ROOT=$(npm root -g 2>/dev/null || true); [ -n "$NPM_ROOT" ] && printf '%s\\n' "$NPM_ROOT/pi-legion"; fi`,
+		`} | awk '!seen[$0]++' 2>/dev/null )`,
+		`LEGION_ROOT=$(printf '%s\\n' "$LEGION_CANDIDATES" | while IFS= read -r candidate; do`,
+		`  [ -n "$candidate" ] || continue`,
+		`  [ -f "$candidate/index.ts" ] || continue`,
+		`  if [ -f "$candidate/package.json" ] && grep -q '"name"[[:space:]]*:[[:space:]]*"pi-legion"' "$candidate/package.json" 2>/dev/null; then rp "$candidate"; break; fi`,
+		`done)`,
+		`if [ -n "$LEGION_ROOT" ]; then`,
+		`  emit LEGION_ROOT "$LEGION_ROOT"`,
+		`  emit LEGION_VERSION "$("$NODE_BIN" -e 'try{process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8")).version||"")}catch{}' "$LEGION_ROOT/package.json" 2>/dev/null || true)"`,
+		`else`,
+		`  emit LEGION_ROOT_MISSING 1`,
+		`fi`,
+		// ── installed pi extensions (providers matter: --no-extensions) ────
+		`EXT_DIRS=$( {`,
+		`  for d in "$HOME/.pi/agent/npm/node_modules" "$PI_DIR"/../npm/node_modules; do`,
+		`    [ -d "$d" ] && for p in "$d"/*; do [ -d "$p" ] && rp "$p"; done`,
+		`  done`,
+		`  if command -v npm >/dev/null 2>&1; then G=$(npm root -g 2>/dev/null || true); [ -n "$G" ] && [ -d "$G" ] && for p in "$G"/*; do [ -d "$p" ] && rp "$p"; done; fi`,
+		`} | awk '!seen[$0]++' 2>/dev/null )`,
+		`if [ -n "$NODE_BIN" ] && [ -n "$EXT_DIRS" ]; then`,
+		`  "$NODE_BIN" -e '`,
+		`const fs = require("node:fs"), path = require("node:path");`,
+		`for (const dir of process.argv.slice(1)) {`,
+		`  let pkg; try { pkg = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")); } catch { continue; }`,
+		`  const name = typeof pkg.name === "string" && pkg.name.trim() ? pkg.name.trim() : "";`,
+		// v1.2: EVERY installed package is reported by name+dir, so a parent
+		// extension path can be re-rooted onto that machine without a pathMap.
+		`  if (!name || name === "pi-legion") continue;`,
+		`  process.stdout.write(["PKG", name, dir].join("\\t") + "\\n");`,
+		`  const list = pkg && pkg.pi && pkg.pi.extensions;`,
+		`  if (!Array.isArray(list)) continue;`,
+		`  let provider = (Array.isArray(pkg.keywords) ? pkg.keywords : []).includes("provider");`,
+		`  for (const rel of list) {`,
+		`    if (typeof rel !== "string") continue;`,
+		`    const abs = path.resolve(dir, rel);`,
+		`    if (!fs.existsSync(abs)) continue;`,
+		`    const relative = path.relative(dir, abs).split(path.sep).join("/");`,
+		`    if (!provider) { try { provider = /registerProvider|registerModelProvider/.test(fs.readFileSync(abs, "utf8")); } catch {} }`,
+		`    process.stdout.write(["EXT", name, abs, provider ? "1" : "0"].join("\\t") + "\\n");`,
+		`    process.stdout.write(["PKGENTRY", name, relative, abs].join("\\t") + "\\n");`,
+		`  }`,
+		`}' $EXT_DIRS 2>/dev/null || true`,
+		`fi`,
+		`emit PROBE_OK 1`,
+	].join("\n");
+}
+
+/** The probe's answers: `get` is the last row for a key, `all` keeps every row. */
+export interface DiscoveryFacts {
+	get(key: string): string | undefined;
+	all(key: string): string[];
+	has(key: string): boolean;
+}
+
+/**
+ * Split the probe's stdout into `KEY -> VALUE` rows.
+ *
+ * Repeated keys are KEPT (`all`): the probe emits one `EXT` row per installed
+ * extension, and a plain `Map` would collapse them to the last one — the exact
+ * shape of bug where a machine's provider extension silently disappears.
+ */
+export function parseDiscoveryReport(text: string): DiscoveryFacts {
+	const rows = new Map<string, string[]>();
+	for (const line of text.split(/\r?\n/)) {
+		if (line.length === 0) continue;
+		const tab = line.indexOf("\t");
+		if (tab <= 0) continue;
+		const key = line.slice(0, tab);
+		const list = rows.get(key);
+		if (list === undefined) rows.set(key, [line.slice(tab + 1)]);
+		else list.push(line.slice(tab + 1));
+	}
+	return {
+		get: (key) => rows.get(key)?.at(-1),
+		all: (key) => rows.get(key) ?? [],
+		has: (key) => rows.has(key),
+	};
+}
+
+/** One probe answer, as the report the cache stores and errors quote. */
+export function buildDiscoveryReport(facts: DiscoveryFacts, source: HostDiscoveryReport["source"] = "probe"): HostDiscoveryReport {
+	const extensions: HostDiscoveryExtension[] = [];
+	const seen = new Set<string>();
+	for (const value of facts.all("EXT")) {
+		const [name, entryPath, provider] = value.split("\t");
+		if (!name || !entryPath || seen.has(entryPath)) continue;
+		seen.add(entryPath);
+		extensions.push({ name, path: entryPath, provider: provider === "1" });
+	}
+	const packages: HostPackage[] = [];
+	const packageEntries: HostPackageEntry[] = [];
+	const seenPackages = new Set<string>();
+	const seenEntries = new Set<string>();
+	for (const value of facts.all("PKG")) {
+		const [name, dir] = value.split("\t");
+		if (!name || !dir || seenPackages.has(name)) continue;
+		seenPackages.add(name);
+		packages.push({ name, dir });
+	}
+	for (const value of facts.all("PKGENTRY")) {
+		const [name, relative, entryPath] = value.split("\t");
+		if (!name || !relative || !entryPath) continue;
+		const key = `${name}\u0000${relative}`;
+		if (seenEntries.has(key)) continue;
+		seenEntries.add(key);
+		packageEntries.push({ name, relative, path: entryPath });
+	}
+	const nodeBinary = facts.get("NODE_BIN");
+	const nodeCommand = facts.get("NODE_CMD");
+	const piEntry = facts.get("PI_ENTRY");
+	const piCommand = facts.get("PI_CMD");
+	return {
+		at: Date.now(),
+		source,
+		...(facts.get("MACHINE") ? { machine: facts.get("MACHINE") } : {}),
+		...(nodeCommand ? { nodeCommand } : {}),
+		...(piCommand ? { piCommand } : {}),
+		...(nodeBinary && nodeCommand
+			? {
+				node: {
+					command: nodeCommand,
+					binary: nodeBinary,
+					...(facts.get("NODE_VERSION") ? { version: facts.get("NODE_VERSION") } : {}),
+					...(facts.get("NODE_SHIM") ? { shim: facts.get("NODE_SHIM") } : {}),
+				},
+			}
+			: {}),
+		...(piEntry && piCommand
+			? {
+				pi: {
+					command: piCommand,
+					entry: piEntry,
+					...(facts.get("PI_VERSION") ? { version: facts.get("PI_VERSION") } : {}),
+				},
+			}
+			: {}),
+		...(facts.get("LEGION_ROOT") ? { piLegionRoot: facts.get("LEGION_ROOT") } : {}),
+		extensions,
+		packages,
+		packageEntries,
+	};
+}
+
+/**
+ * The fields a report can fill, in the order an error message should name them.
+ *
+ * `piExtensions` only ever contributes PROVIDER extensions: those are the ones
+ * `--no-extensions` silently removed (the `No models available` failure in
+ * S5.6). A non-provider extension is reported for diagnostics but never added
+ * on its own — the child's argv must stay the set the operator can predict.
+ */
+export function discoveredFields(report: HostDiscoveryReport): DiscoveredHostFields {
+	const providers = report.extensions.filter((extension) => extension.provider).map((extension) => extension.path);
+	return {
+		...(report.node?.binary ? { node: report.node.binary } : {}),
+		...(report.pi?.entry ? { piCli: report.pi.entry } : {}),
+		...(report.piLegionRoot ? { piLegionRoot: report.piLegionRoot } : {}),
+		...(providers.length > 0 ? { piExtensions: providers } : {}),
+	};
+}
+
+/** Human-readable "what the probe found", used by every discovery error. */
+export function describeDiscovery(report: HostDiscoveryReport): string {
+	const lines: string[] = [];
+	lines.push(`node: ${report.node ? `${report.node.version ?? "?"} at ${report.node.binary}${report.node.shim ? ` (via shim ${report.node.shim})` : ""}` : report.nodeCommand ? `${report.nodeCommand} is not a runnable node` : `not found on PATH`}`);
+	lines.push(`pi: ${report.pi ? `${report.pi.version ?? "?"} entry ${report.pi.entry}` : report.piCommand ? `${report.piCommand} is a launcher, no JavaScript entry behind it` : `not found on PATH`}`);
+	lines.push(`legion: ${report.piLegionRoot ?? "not found (no pi-legion install with a matching package.json)"}`);
+	const providers = report.extensions.filter((extension) => extension.provider);
+	if (providers.length > 0) lines.push(`provider extensions: ${providers.map((entry) => `${entry.name} -> ${entry.path}`).join(", ")}`);
+	return lines.join("\n");
+}
+
+// ── the discovery cache (memory + optional disk, TTL) ──────────────────────
+
+interface DiscoveryCacheEntry {
+	report: HostDiscoveryReport;
+	expiresAt: number;
+}
+
+const DISCOVERY_MEMORY = new Map<string, DiscoveryCacheEntry>();
+/**
+ * Probes in flight, keyed by host.
+ *
+ * A `tasks[]` batch resolves every step through the async resolver at the same
+ * time; without this, N steps would each pay one `machine.exec` for the same
+ * host. Sharing the promise is safe because the probe is read-only, and a
+ * rejected promise is removed in `finally` so a failure is never cached.
+ */
+const DISCOVERY_INFLIGHT = new Map<string, Promise<HostDiscoveryReport>>();
+/**
+ * On-demand package-index loaders, keyed by the target they belong to (v1.2).
+ *
+ * Deliberately NOT a field on {@link HostTarget}: a fully explicit pre-v1.1 entry
+ * must resolve to the byte-identical object it always did, and a closure on it
+ * would be a visible difference for anything that compares targets. A WeakMap
+ * keeps the loader attached without changing the shape, and lets it disappear
+ * with the target.
+ */
+const PACKAGE_LOADERS = new WeakMap<HostTarget, () => Promise<HostPackageIndex | undefined>>();
+
+/** Attach the on-demand package loader to a resolved target. */
+export function registerPackageLoader(
+	target: HostTarget,
+	loader: () => Promise<HostPackageIndex | undefined>,
+): void {
+	PACKAGE_LOADERS.set(target, loader);
+}
+
+/** The loader registered for a target, if any (see {@link PACKAGE_LOADERS}). */
+export function packageLoaderFor(target: HostTarget): (() => Promise<HostPackageIndex | undefined>) | undefined {
+	return PACKAGE_LOADERS.get(target);
+}
+const MACHINE_LIST_MEMORY = new Map<string, { names: string[]; expiresAt: number }>();
+
+/** Bound on the machine registry cache; it changes on operator action only. */
+export const MACHINE_LIST_TTL_MS = 60_000;
+
+/** Forget one host's probe (or all of them), in memory and on disk. */
+export function clearHostDiscoveryCache(host?: string, env: NodeJS.ProcessEnv = process.env): void {
+	if (host === undefined) {
+		DISCOVERY_MEMORY.clear();
+		MACHINE_LIST_MEMORY.clear();
+		for (const file of listDiskCacheFiles(env)) {
+			try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+		}
+		return;
+	}
+	const name = normalizeHost(host);
+	if (name === undefined) return;
+	DISCOVERY_MEMORY.delete(name);
+	// The registry is not host-specific knowledge, but a probe for one host and
+	// the admission list are read together; clearing both keeps `refresh` honest.
+	MACHINE_LIST_MEMORY.clear();
+	try { fs.rmSync(diskCachePath(name, env), { force: true }); } catch { /* best effort */ }
+}
+
+function listDiskCacheFiles(env: NodeJS.ProcessEnv): string[] {
+	try {
+		return fs.readdirSync(diskCacheDir(env)).map((entry) => path.join(diskCacheDir(env), entry));
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * `$XDG_CACHE_HOME/pi-legion/host-discovery` (or `~/.cache/...`).
+ *
+ * A disk cache, not a memory one, because the expensive unit is a launch: a
+ * fresh `pi` process would otherwise re-probe the target on every dispatch even
+ * though the answer changes only when that machine is re-provisioned.
+ */
+function diskCacheDir(env: NodeJS.ProcessEnv): string {
+	const home = env.HOME ?? "";
+	const base = env.XDG_CACHE_HOME ?? (home.length > 0 ? path.join(home, ".cache") : path.join(path.sep, "tmp"));
+	return path.join(base, "pi-legion", "host-discovery");
+}
+
+function diskCachePath(host: string, env: NodeJS.ProcessEnv): string {
+	const safe = host.replace(/[^A-Za-z0-9._-]+/g, "-");
+	return path.join(diskCacheDir(env), `${safe}.json`);
+}
+
+function readDiskCache(host: string, env: NodeJS.ProcessEnv, now: number): DiscoveryCacheEntry | undefined {
+	try {
+		const parsed = JSON.parse(fs.readFileSync(diskCachePath(host, env), "utf8")) as DiscoveryCacheEntry;
+		if (typeof parsed?.expiresAt !== "number" || parsed.expiresAt <= now) return undefined;
+		if (!parsed.report || !Array.isArray(parsed.report.extensions)) return undefined;
+		// A cache written before v1.2 has no package list; normalize rather than
+		// discard, so an upgrade does not turn into a surprise re-probe mid-launch.
+		return {
+			expiresAt: parsed.expiresAt,
+			report: {
+				...parsed.report,
+				packages: Array.isArray(parsed.report.packages) ? parsed.report.packages : [],
+				packageEntries: Array.isArray(parsed.report.packageEntries) ? parsed.report.packageEntries : [],
+			},
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function writeDiskCache(host: string, entry: DiscoveryCacheEntry, env: NodeJS.ProcessEnv): void {
+	try {
+		fs.mkdirSync(diskCacheDir(env), { recursive: true });
+		fs.writeFileSync(diskCachePath(host, env), `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+	} catch {
+		/* a cache that cannot be written is not a launch failure */
+	}
+}
+
+/** Options for the two discovery entry points. */
+export interface HostDiscoveryOptions {
+	/** Reuse this client; otherwise a short-lived one is created and closed. */
+	client?: HcClient;
+	env?: NodeJS.ProcessEnv;
+	/** Ignore both caches (the `crossMachine.refresh` switch). */
+	refresh?: boolean;
+	/** Override the TTL in milliseconds. */
+	ttlMs?: number;
+	/** Disk cache directory; `null` disables the disk cache (tests). */
+	cacheDir?: string | null;
+	/** In-process cache switch (default true; `false` exercises the disk path). */
+	useMemoryCache?: boolean;
+	now?: () => number;
+}
+
+function cacheTtlMs(config: SubagentsSettings["crossMachine"] | undefined, options: HostDiscoveryOptions): number {
+	if (options.ttlMs !== undefined) return options.ttlMs;
+	const seconds = config?.discoveryTtlSeconds;
+	return (typeof seconds === "number" && seconds > 0 ? seconds : DEFAULT_DISCOVERY_TTL_S) * 1000;
+}
+
+/**
+ * Run ONE `machine.exec` probe on `host` and return its report.
+ *
+ * The probe is a fact-finding call, so a transport failure is reported as such
+ * and is NEVER turned into "this field is missing": those two sentences send
+ * the operator to different fixes (start the core vs install pi).
+ */
+export async function probeHost(
+	host: string,
+	options: HostDiscoveryOptions = {},
+): Promise<HostDiscoveryReport> {
+	const name = normalizeHost(host);
+	if (name === undefined) {
+		throw new SubagentError("host discovery needs a host name", ErrorCodes.INVALID_PARAMS);
+	}
+	const env = options.env ?? process.env;
+	const client = options.client;
+	const run = async (active: HcClient): Promise<HostDiscoveryReport> => {
+		let result: HcExecResult;
+		try {
+			result = await active.request<HcExecResult>("machine.exec", {
+				on: name,
+				line: remoteDiscoveryScript(),
+				timeout: DISCOVERY_TIMEOUT_S,
+			});
+		} catch (error) {
+			throw discoveryTransportError(name, error);
+		}
+		const text = execResultText(result);
+		if (result?.timed_out === true) {
+			throw new SubagentError(
+				`host '${name}': host discovery timed out after ${DISCOVERY_TIMEOUT_S}s (${text || "no output"}); the machine answered hc but not this probe. Set the fields by hand in subagents.crossMachine.hosts.${name} or retry with subagents.crossMachine.refresh = true`,
+				ErrorCodes.START_FAILED,
+				{ host: name, discovery: true, timedOut: true },
+			);
+		}
+		const code = typeof result?.code === "number" ? result.code : null;
+		if (code !== 0) {
+			throw new SubagentError(
+				`host '${name}': host discovery probe exited ${code === null ? "without a status" : code} (${text || "no output"}); set the fields by hand in subagents.crossMachine.hosts.${name} (${HOST_FIELD_HINT})`,
+				ErrorCodes.START_FAILED,
+				{ host: name, discovery: true, code },
+			);
+		}
+		const report = buildDiscoveryReport(parseDiscoveryReport(text));
+		if (!parseDiscoveryReport(text).has("PROBE_OK")) {
+			throw new SubagentError(
+				`host '${name}': host discovery produced no answer (${text || "empty output"}); the remote shell did not reach the end of the probe. Set the fields by hand in subagents.crossMachine.hosts.${name} (${HOST_FIELD_HINT})`,
+				ErrorCodes.START_FAILED,
+				{ host: name, discovery: true },
+			);
+		}
+		return report;
+	};
+	if (client !== undefined) return run(client);
+	const created = new HcCliClient({ env });
+	try {
+		await created.start();
+		return await run(created);
+	} finally {
+		created.close();
+	}
+}
+
+/** How to write the fields by hand, quoted in every discovery error. */
+const HOST_FIELD_HINT = `"node" / "piCli" / "piLegionRoot"`;
+
+function discoveryTransportError(host: string, error: unknown): SubagentError {
+	const kind = error instanceof HcRpcError ? error.kind : undefined;
+	if (kind === "machine_unknown") {
+		return new SubagentError(
+			`host '${host}' is not a machine this core knows (machine_unknown). Run \`hc machine ls\` here and \`hc machine add --name ${host} ssh://user@that-machine\` if it is missing; legion will not run the child on this host instead.`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host, unknownHost: true },
+		);
+	}
+	return new SubagentError(
+		`host '${host}': host discovery could not run (${describeError(error)}); the machine may be unreachable. Nothing was guessed: set subagents.crossMachine.hosts.${host} by hand (${HOST_FIELD_HINT}) if the machine is meant to be offline`,
+		ErrorCodes.START_FAILED,
+		{ host, discovery: true, unreachable: true },
+	);
+}
+
+/**
+ * The host's discovery report, from memory, disk or one fresh probe.
+ *
+ * A FAILED probe is never cached: the next launch must be free to succeed after
+ * the operator installs the missing tool. A successful one is cached for
+ * {@link DEFAULT_DISCOVERY_TTL_S} seconds, and `refresh` bypasses both caches —
+ * which is how a target that upgraded `pi` (moving its bundle to a new release
+ * directory) heals without a restart.
+ */
+export async function discoverHost(
+	host: string,
+	config: SubagentsSettings["crossMachine"] | undefined,
+	options: HostDiscoveryOptions = {},
+): Promise<HostDiscoveryReport> {
+	const name = normalizeHost(host) ?? "";
+	const env = options.env ?? process.env;
+	const now = options.now ?? Date.now;
+	const ttlMs = cacheTtlMs(config, options);
+	const useMemory = options.useMemoryCache !== false;
+	if (options.refresh !== true && (config?.refresh ?? false) !== true) {
+		const memory = useMemory ? DISCOVERY_MEMORY.get(name) : undefined;
+		if (memory && memory.expiresAt > now()) {
+			return { ...memory.report, source: "memory-cache" };
+		}
+		if (options.cacheDir !== null) {
+			const disk = readDiskCache(name, env, now());
+			if (disk) {
+				DISCOVERY_MEMORY.set(name, disk);
+				return { ...disk.report, source: "disk-cache" };
+			}
+		}
+	}
+	const pending = DISCOVERY_INFLIGHT.get(name);
+	if (pending !== undefined) return pending;
+	const probe = probeHost(name, options);
+	DISCOVERY_INFLIGHT.set(name, probe);
+	let report: HostDiscoveryReport;
+	try {
+		report = await probe;
+	} finally {
+		DISCOVERY_INFLIGHT.delete(name);
+	}
+	const entry: DiscoveryCacheEntry = { report, expiresAt: now() + ttlMs };
+	if (useMemory) DISCOVERY_MEMORY.set(name, entry);
+	if (options.cacheDir !== null) writeDiskCache(name, entry, env);
+	return report;
+}
+
+// ── the machine registry (admission, not configuration) ────────────────────
+
+/** One row of `hc machine ls` / `machine.list`. */
+export interface HcMachineEntry {
+	name: string;
+	kind?: string;
+	address?: string;
+}
+
+/**
+ * Read `machine.list` defensively.
+ *
+ * The registry is the ADMISSION list ("is this a machine this core knows?"),
+ * so a shape this function does not recognize must not become "no machines":
+ * it returns `undefined` and the caller falls back to the settings-only rule.
+ */
+export function parseMachineList(result: unknown): HcMachineEntry[] | undefined {
+	const rows = Array.isArray(result)
+		? result
+		: result !== null && typeof result === "object"
+			? ([ (result as Record<string, unknown>).machines, (result as Record<string, unknown>).items, (result as Record<string, unknown>).list, (result as Record<string, unknown>).rows ].find(Array.isArray) as unknown[] | undefined)
+			: undefined;
+	if (rows === undefined) return undefined;
+	const out: HcMachineEntry[] = [];
+	const seen = new Set<string>();
+	for (const row of rows) {
+		const record = row !== null && typeof row === "object" ? (row as Record<string, unknown>) : undefined;
+		const rawName = typeof row === "string" ? row : record ? [record.name, record.machine, record.host, record.id].find((value) => typeof value === "string" && value.trim().length > 0) : undefined;
+		if (typeof rawName !== "string") continue;
+		const name = rawName.trim();
+		if (name.length === 0 || seen.has(name)) continue;
+		seen.add(name);
+		out.push({
+			name,
+			...(record && typeof record.kind === "string" ? { kind: record.kind } : {}),
+			...(record && typeof record.address === "string" ? { address: record.address } : {}),
+		});
+	}
+	return out;
+}
+
+/**
+ * The machines this core knows, or `undefined` when it cannot answer.
+ *
+ * `undefined` is a THIRD answer and must stay one: an old core without
+ * `machine.list` predates registry admission, and turning its "unknown method"
+ * into "no machines" would refuse every launch that used to work.
+ */
+export async function listHcMachines(
+	options: HostDiscoveryOptions = {},
+): Promise<HcMachineEntry[] | undefined> {
+	const env = options.env ?? process.env;
+	const key = `${env.HC_BIN ?? "hc"}\u0000${env.HC_SESSION ?? ""}`;
+	const now = options.now ?? Date.now;
+	if (options.refresh !== true) {
+		const cached = MACHINE_LIST_MEMORY.get(key);
+		if (cached && cached.expiresAt > now()) return cached.names.map((name) => ({ name }));
+	}
+	const run = async (client: HcClient): Promise<HcMachineEntry[] | undefined> => {
+		try {
+			const result = await client.request("machine.list");
+			return parseMachineList(result);
+		} catch (error) {
+			const kind = error instanceof HcRpcError ? error.kind : "";
+			const message = error instanceof Error ? error.message : String(error);
+			if (/method_not_found|unknown_method|unsupported|not_found|invalid_method/i.test(kind) || /unknown method|not supported|method not found/i.test(message)) {
+				return undefined;
+			}
+			// Any other failure (transport, core restarting) is not evidence about the
+			// host: answer "cannot tell" and let `machine.exec` report the machine.
+			return undefined;
+		}
+	};
+	let names: string[] | undefined;
+	if (options.client !== undefined) {
+		const parsed = await run(options.client);
+		names = parsed?.map((entry) => entry.name);
+	} else {
+		const created = new HcCliClient({ env });
+		try {
+			await created.start();
+			const parsed = await run(created);
+			names = parsed?.map((entry) => entry.name);
+		} finally {
+			created.close();
+		}
+	}
+	if (names === undefined) return undefined;
+	MACHINE_LIST_MEMORY.set(key, { names, expiresAt: now() + MACHINE_LIST_TTL_MS });
+	return names.map((name) => ({ name }));
+}
+
+/** A "register it first" refusal that lists what this core DOES know. */
+function unknownMachineError(host: string, known: string[]): SubagentError {
+	const listing = known.length > 0 ? `\`hc machine ls\` here lists: ${known.join(", ")}` : "`hc machine ls` here lists no machines";
+	return new SubagentError(
+		`host '${host}' is not a machine this hc core knows (${listing}). Register it first:\n  hc machine add --name ${host} ssh://user@that-machine\n(or use one of the names above). Legion will not run the child on this machine instead.`,
+		ErrorCodes.INVALID_PARAMS,
+		{ host, unknownHost: true, known },
+	);
+}
+
+/** What a caller may pass per launch. */
+export interface HostResolutionRequest extends HostDiscoveryOptions {
+	/** Per-call remote cwd override; absolute on that machine. */
+	cwd?: string;
+	/** Per-call discovery switch (wins over settings); `false` = explicit only. */
+	discover?: boolean;
+	/**
+	 * When the `hc` registry decides whether this launch may happen at all.
+	 *
+	 *   - `always` — a NEW launch: the name must be a machine this core knows,
+	 *     whether or not the settings describe it (admission and configuration are
+	 *     two different questions).
+	 *   - `when-unconfigured` (default) — the registry is consulted only when the
+	 *     settings say nothing about the host, i.e. it provides the configuration.
+	 *   - `never` — resume/read-back of a child that already ran there: the
+	 *     machine registration is per `HC_SESSION`, and the operation's own gate
+	 *     asks that machine directly with a better message.
+	 */
+	admission?: "always" | "when-unconfigured" | "never";
+}
+
+/**
+ * Resolve a host the v1.1 way: admit it through `hc`, fill the holes by probe.
+ *
+ * Order is deliberate and each step names its own failure:
+ *
+ *   1. admission — a name this core does not know is refused with the names it
+ *      DOES know (and the `hc machine add` line). This is the difference between
+ *      "you never registered the machine" and "your settings entry is wrong".
+ *   2. cwd — per-call override, else the host default, else a refusal. Never a
+ *      guess: not HOME, not the remote core's cwd.
+ *   3. discovery — only the fields the entry left empty, only when enabled.
+ *      A failed probe that still names a missing field produces an error with
+ *      the field, what WAS found, and the JSON to paste.
+ *   4. resolution — the pure function above, so every caller (launch, resume,
+ *      remote verify, artifact read-back) agrees on the target.
+ */
+export async function resolveHostTargetAsync(
+	host: string,
+	config: SubagentsSettings["crossMachine"] | undefined,
+	request: HostResolutionRequest = {},
+): Promise<HostTarget> {
+	const name = normalizeHost(host);
+	if (name === undefined) {
+		throw new SubagentError(
+			"cross-machine launch needs a host name; omit `host` to run on this machine",
+			ErrorCodes.INVALID_PARAMS,
+		);
+	}
+	if (config?.enabled === false) {
+		throw new SubagentError(
+			`host '${name}' needs subagents.crossMachine.enabled = true`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: name },
+		);
+	}
+	let entry = config?.hosts?.[name];
+	// 1. admission. The `hc` registry is the source of truth EXACTLY when the
+	// settings say nothing about the host: that is the "why can't legion just use
+	// hc?" case, and the name that travels as `on` is the same name hc knows.
+	//
+	// A host that DOES have a settings entry keeps the pre-v1.1 rule — the entry
+	// is the operator's explicit claim, and a machine registered in another
+	// `HC_SESSION` (the runbook's own warning) must not turn every resume of an
+	// existing remote child into a refusal. A machine that is genuinely not
+	// registered still fails, one step later, with `machine_unknown` and the same
+	// `hc machine add` advice.
+	const admission = request.admission ?? "when-unconfigured";
+	if (admission !== "never" && (admission === "always" || entry === undefined)) {
+		const machines = await listHcMachines({ ...request, env: request.env ?? process.env });
+		if (machines !== undefined) {
+			const known = machines.map((machine) => machine.name);
+			if (!known.includes(name)) throw unknownMachineError(name, known);
+			// A host the registry knows needs no settings entry at all: `{}` is the
+			// normal, minimal configuration (and so is no `hosts` block whatsoever).
+			entry ??= {};
+		}
+	}
+	if (entry === undefined) {
+		throw new SubagentError(
+			`host '${name}' has no entry in subagents.crossMachine.hosts and this hc core did not answer \`machine list\` (add { "cwd": "/abs/path/on/${name}" }, or register the machine with \`hc machine add --name ${name} …\`)`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: name },
+		);
+	}
+	// 2. cwd is decided BEFORE the probe, so a missing cwd is a cwd error and not
+	// a discovery error that happens to mention paths.
+	const overrideCwd = typeof request.cwd === "string" ? request.cwd.trim() : "";
+	const configuredCwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
+	const cwd = overrideCwd.length > 0 ? overrideCwd : configuredCwd;
+	// 3. discovery, only for the holes.
+	const discoverEnabled = request.discover ?? entry.discover ?? config?.discover ?? true;
+	const hole = (value: string | undefined): boolean => typeof value !== "string" || value.trim().length === 0;
+	// `piExtensions` alone does NOT trigger a probe: a pre-v1.1 entry that wrote
+	// `cwd`+`node`+`piCli`+`piLegionRoot` is complete, and probing it would change
+	// an existing launch for no reason. When a probe runs for another hole, the
+	// provider extensions it finds are added only if the key was never written.
+	const wantsDiscovery = discoverEnabled && (hole(entry.node) || hole(entry.piCli) || hole(entry.piLegionRoot));
+	let report: HostDiscoveryReport | undefined;
+	let discovered: DiscoveredHostFields | undefined;
+	let used: string[] = [];
+	if (wantsDiscovery) {
+		try {
+			report = await discoverHost(name, config, { ...request, env: request.env ?? process.env });
+		} catch (error) {
+			// A probe that cannot RUN is not the same fact as a probe that ran and
+			// found nothing. When the operator already wrote a workable pre-v1.1
+			// entry (an absolute cwd plus at least one program), keep that entry and
+			// let the preflight / the four-step resume gate name the machine problem
+			// — a resume in a session where the machine is not registered must reach
+			// its own gate, not die in discovery.
+			const usableLegacy =
+				!hole(entry.cwd) &&
+				(!hole(entry.node) || !hole(entry.piCli));
+			if (!usableLegacy) throw error;
+			process.stderr.write(`[pi-legion] host '${name}': ${(error as Error).message}\n`);
+		}
+		if (report !== undefined) discovered = discoveredFields(report);
+		// A field the machine genuinely lacks is a refusal that names the field, the
+		// probe's own findings, and the JSON to paste. `piLegionRoot` is exempt: its
+		// pre-v1.1 default ("same path as here") is kept, and the preflight names it
+		// if that guess is wrong.
+		const missing: string[] = [];
+		if (hole(entry.node) && discovered?.node === undefined) missing.push("node");
+		if (hole(entry.piCli) && discovered?.piCli === undefined) missing.push("piCli");
+		if (report !== undefined && discovered !== undefined) {
+			const facts = discovered;
+			if (missing.length > 0) {
+				// A probe that answered "this machine has no node" must not be reused:
+				// the operator installs node/pi and retries, and the next launch has to
+				// ask again rather than replay the refusal for a whole TTL.
+				clearHostDiscoveryCache(name, request.env ?? process.env);
+				throw discoveryIncompleteError(name, report, missing, entry.cwd, overrideCwd);
+			}
+			// Only the fields the RESOLVER will actually use count as discovered: a
+			// probe runs for the holes, but an explicit value still wins, and neither
+			// `discovered` nor `discovery` may appear on the target because of it.
+			used = [
+				...(facts.node !== undefined && hole(entry.node) ? ["node"] : []),
+				...(facts.piCli !== undefined && hole(entry.piCli) ? ["piCli"] : []),
+				...(facts.piLegionRoot !== undefined && hole(entry.piLegionRoot) ? ["piLegionRoot"] : []),
+				...(facts.piExtensions !== undefined && entry.piExtensions === undefined ? ["piExtensions"] : []),
+			];
+			discovered = Object.fromEntries(
+				used.map((field) => [field, facts[field as keyof DiscoveredHostFields]]),
+			) as DiscoveredHostFields;
+			if (used.length === 0) {
+				report = undefined;
+				discovered = undefined;
+			}
+		}
+	}
+	const discoveredList = used;
+	const merged: SubagentsSettings["crossMachine"] = {
+		enabled: true,
+		hosts: { [name]: entry },
+		...(config?.discover !== undefined ? { discover: config.discover } : {}),
+		...(config?.discoveryTtlSeconds !== undefined ? { discoveryTtlSeconds: config.discoveryTtlSeconds } : {}),
+	};
+	const resolved = resolveHostTarget(name, merged, {
+		...(overrideCwd.length > 0 ? { cwd: overrideCwd } : {}),
+		...(discovered ? { discovered } : {}),
+		...(discoveredList.length > 0 ? { discoveredFields: discoveredList } : {}),
+		...(report
+			? {
+					discovery: report,
+					packageIndex: { packages: report.packages, entries: report.packageEntries },
+				}
+			: {}),
+		mentionPerCallCwd: true,
+		...(discoveredList.length > 0
+			? {
+				rediscover: () => resolveHostTargetAsync(name, config, {
+					...request,
+					refresh: true,
+					client: undefined,
+					cwd: overrideCwd.length > 0 ? overrideCwd : request.cwd,
+				}),
+			}
+			: {}),
+	});
+	// On demand, even for a fully explicit entry: the argv may carry the parent's
+	// inherited extensions, and re-rooting them needs the remote package list.
+	// `discover: false` is the operator's opt-out (and then an unmappable
+	// extension is a refusal, never a silent drop).
+	if (discoverEnabled) {
+		registerPackageLoader(resolved, async () => {
+			try {
+				const fresh = await discoverHost(name, config, { ...request, client: undefined });
+				return { packages: fresh.packages, entries: fresh.packageEntries };
+			} catch {
+				return undefined;
+			}
+		});
+	}
+	return resolved;
+}
+
+
+/**
+ * The "probe ran, field is not there" refusal.
+ *
+ * Every sentence is load-bearing: what was missing (so the operator knows which
+ * key), what the probe DID find (so "is this even the machine I meant?" has an
+ * answer), and the exact JSON to paste — because the whole point of v1.1 is
+ * that this should almost never be necessary.
+ */
+function discoveryIncompleteError(
+	host: string,
+	report: HostDiscoveryReport,
+	missing: string[],
+	configuredCwd: string | undefined,
+	overrideCwd: string,
+): SubagentError {
+	const cwd = overrideCwd.length > 0 ? overrideCwd : configuredCwd ?? `/abs/path/on/${host}`;
+	const fields = missing.map((field) => (field === "node" ? `"node": "/abs/path/on/${host}/bin/node"` : `"piCli": "/abs/path/on/${host}/…/dist/bundle/cli.js"`));
+	const example = `"subagents": { "crossMachine": { "hosts": { "${host}": { "cwd": "${cwd}", ${fields.join(", ")} } } } }`;
+	const hint = report.pi?.command !== undefined && missing.includes("piCli")
+		? `\n\`command -v pi\` there answered ${report.pi.command}, which is not a JavaScript entry node can execute — point \`piCli\` at the bundle (\`…/dist/bundle/cli.js\`), never at the launcher.`
+		: "";
+	return new SubagentError(
+		`host '${host}': host discovery could not find ${missing.join(" / ")} on that machine.\nWhat the probe found:\n${describeDiscovery(report)}\nWrite the missing field by hand and retry:\n  ${example}${hint}`,
+		ErrorCodes.INVALID_PARAMS,
+		{ host, discovery: true, missing, probe: report },
+	);
+}
+
 // ── S1: the transport layer (one round trip each) ──────────────────────────
 
 /** The `hc` `machine.exec` result, with BASE64 stdout/stderr (real core shape). */
@@ -731,7 +1933,7 @@ export async function remotePreflight(
 	}
 	if (!directoryExists) {
 		throw new SubagentError(
-			`host '${target.host}': cwd '${target.cwd}' does not exist on ${target.host} (remote paths are absolute on that machine; local paths are not translated)`,
+			`host '${target.host}': cwd '${target.cwd}' does not exist on ${target.host} (remote paths are absolute on that machine; local paths are not translated; ${remoteLsHint(target.host, target.cwd)})`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, cwd: target.cwd },
 		);
@@ -771,7 +1973,7 @@ export async function remotePreflight(
 	if (code === 0) return;
 	if (code === 11) {
 		throw new SubagentError(
-			`host '${target.host}': cwd '${target.cwd}' does not exist on ${target.host} (remote paths are absolute on that machine; local paths are not translated)`,
+			`host '${target.host}': cwd '${target.cwd}' does not exist on ${target.host} (remote paths are absolute on that machine; local paths are not translated; ${remoteLsHint(target.host, target.cwd)})`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, cwd: target.cwd },
 		);
@@ -780,21 +1982,21 @@ export async function remotePreflight(
 		throw new SubagentError(
 			`host '${target.host}': node '${target.node}' is not on PATH on ${target.host} (set subagents.crossMachine.hosts.${target.host}.node to a path on that machine)`,
 			ErrorCodes.START_FAILED,
-			{ host: target.host, node: target.node },
+			{ host: target.host, node: target.node, code: 12 },
 		);
 	}
 	if (code === 13) {
 		throw new SubagentError(
 			`host '${target.host}': pi CLI '${target.piCli}' is not on PATH on ${target.host} (set subagents.crossMachine.hosts.${target.host}.piCli to a path on that machine)`,
 			ErrorCodes.START_FAILED,
-			{ host: target.host, piCli: target.piCli },
+			{ host: target.host, piCli: target.piCli, code: 13 },
 		);
 	}
 	if (code === 16) {
 		throw new SubagentError(
 			`host '${target.host}': piCli '${target.piCli}' is not a JavaScript entry point node can execute. A shell launcher (a path like /root/.pi/agent/bin/pi, a \`case "$0"\` wrapper) cannot be the argv[1] of \`node\` — node parses it as JavaScript and dies with \`SyntaxError: Unexpected token case\`. Point subagents.crossMachine.hosts.${target.host}.piCli at the bundle entry instead, e.g. /root/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js.`,
 			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, piCli: target.piCli },
+			{ host: target.host, piCli: target.piCli, code: 16 },
 		);
 	}
 	if (code === 15) {
@@ -808,7 +2010,7 @@ export async function remotePreflight(
 		throw new SubagentError(
 			`host '${target.host}': this package is not installed at ${target.piLegionRoot} on that machine (every child's argv loads ${path.posix.join(target.piLegionRoot, "index.ts")}; set subagents.crossMachine.hosts.${target.host}.piLegionRoot to where it really is, or install it there)`,
 			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, piLegionRoot: target.piLegionRoot },
+			{ host: target.host, piLegionRoot: target.piLegionRoot, code: 14 },
 		);
 	}
 	throw new SubagentError(
@@ -929,6 +2131,18 @@ export async function mirrorRemoteFile(
  * The core already names the fact (`machine_unknown`, `bad_cwd`, …); this maps
  * each name to the class the contract's D14 lists and refuses to guess.
  */
+/**
+ * "Go look at it on that machine" — the command an operator can paste.
+ *
+ * A remote path that does not exist is the one failure where the fix is almost
+ * always "you are thinking of a directory on THIS machine". Naming the exact
+ * `hc exec … ls` line turns a settings guess into an observable fact (and the
+ * core is already reachable, so it is one cheap call away).
+ */
+function remoteLsHint(host: string, candidate: string): string {
+	return `list it on that machine with \`hc exec --on ${host} -- ls -ld ${candidate}\``;
+}
+
 function unreachable(target: HostTarget, error: unknown): SubagentError {
 	const kind = error instanceof HcRpcError ? error.kind : undefined;
 	if (kind === "machine_unknown") {
@@ -940,7 +2154,7 @@ function unreachable(target: HostTarget, error: unknown): SubagentError {
 	}
 	if (kind === "bad_cwd") {
 		return new SubagentError(
-			`host '${target.host}': cwd '${target.cwd}' does not exist on ${target.host} (remote paths are absolute on that machine; local paths are not translated): ${describeError(error)}`,
+			`host '${target.host}': cwd '${target.cwd}' does not exist on ${target.host} (remote paths are absolute on that machine; local paths are not translated; ${remoteLsHint(target.host, target.cwd)}): ${describeError(error)}`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, cwd: target.cwd },
 		);
