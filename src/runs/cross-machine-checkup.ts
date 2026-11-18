@@ -99,6 +99,12 @@ export interface CrossMachineCheckupHost {
 	items: CrossMachineCheckupItem[];
 	/** Real, pasteable launch line built from resolved values; absent when no cwd is known. */
 	launch?: string;
+	/**
+	 * True when at least one item FAILed: the launch is still the right command to
+	 * paste, but only AFTER the fix lines above it were applied. Doctor labels it
+	 * accordingly, so "copy-paste" and "this will work" stay the same thing.
+	 */
+	launchAfterFixes?: boolean;
 	/** When `launch` is absent: the D2 question (`missingRemoteCwdQuestion(host)`). */
 	question?: string;
 }
@@ -138,6 +144,16 @@ const TARGET_ITEM_IDS: readonly CrossMachineCheckupItemId[] = [
  */
 function itemLabel(id: CrossMachineCheckupItemId): string {
 	return id.replace(/-/g, " ");
+}
+
+/**
+ * D6's gate: the checkup runs only when the `crossmachine` section was asked for.
+ *
+ * A shared predicate (rather than the same `includes` twice) so a future third
+ * caller cannot quietly probe on every `/legion doctor models` run.
+ */
+export function crossMachineCheckupRequested(sections: readonly string[] | undefined): boolean {
+	return sections === undefined || sections.includes("crossmachine");
 }
 
 export async function runCrossMachineCheckup(options: {
@@ -228,7 +244,35 @@ interface CollectInput {
 async function collect(input: CollectInput): Promise<CrossMachineCheckup> {
 	const { cwd, settings, env, client, at } = input;
 	const agents: AgentConfig[] = input.agents !== undefined ? [...input.agents] : loadAgents(cwd, env);
-	const model = firstNonEmpty(input.model) ?? firstNonEmpty(agents[0]?.model);
+	// The model a launch would use: an explicit one, else the role the launch line
+	// names (`centurion`), else any role that carries one. Not `agents[0]` — that is
+	// whatever role happens to be listed first, and judging a launch by it is the
+	// wrong question (review M11).
+	const model = firstNonEmpty(input.model)
+		?? firstNonEmpty(agents.find((agent) => agent.name === "centurion")?.model)
+		?? firstNonEmpty(agents.find((agent) => firstNonEmpty(agent.model) !== undefined)?.model);
+
+	// `enabled: false` is the one setting that REFUSES every launch (remote.ts
+	// `resolveHostTargetAsync`). Probing anyway would print PASS lines and a
+	// pasteable launch for a feature that is switched off (review C2) — so this is
+	// the zero-probe answer, and the only FAIL is the switch itself.
+	if (settings?.enabled === false) {
+		return {
+			enabled: false,
+			cwd,
+			parent: [{
+				id: "hc-machines",
+				status: "fail",
+				line: "cross-machine launch is disabled (subagents.crossMachine.enabled = false), so nothing here was probed",
+				fixes: [
+					`# set "enabled": true in the file that holds subagents.crossMachine — user: ~/.pi/agent/settings.json, project: ${cwd}/.pi/settings.json`,
+					"then re-run: /legion doctor crossmachine",
+				],
+			}],
+			hosts: [],
+			at,
+		};
+	}
 
 	// 1. the machine registry. `undefined` is a THIRD answer ("old core / no
 	// answer") and stays one: turning it into "no machines" would report every
@@ -247,8 +291,13 @@ async function collect(input: CollectInput): Promise<CrossMachineCheckup> {
 		...machineNames.filter((name) => !settingsHosts.includes(name)).map((host) => ({ host, source: "hc" as const })),
 	];
 	const firstHost = hostRefs[0]?.host ?? "";
-	const checkedHosts = hostRefs.slice(0, MAX_HOSTS);
-	const remainder = hostRefs.length - checkedHosts.length;
+	// Cross-machine is CONFIGURED when the switch is on or a host entry exists.
+	// With neither, a plain `/legion doctor` must not fan out into one remote probe
+	// per machine this core happens to know (review R1#4): the registry is printed,
+	// targets are not touched.
+	const configured = settings?.enabled === true || settingsHosts.length > 0;
+	const checkedHosts = configured ? hostRefs.slice(0, MAX_HOSTS) : [];
+	const remainder = configured ? hostRefs.length - checkedHosts.length : 0;
 
 	// 3. this session's directory, from the ONE probe D5 froze (`localCheckoutState`).
 	let parentState: LocalCheckoutState;
@@ -267,6 +316,7 @@ async function collect(input: CollectInput): Promise<CrossMachineCheckup> {
 		machineError,
 		settingsHosts,
 		remainder,
+		configured,
 	});
 
 	// 5. per host, one block each.
@@ -299,27 +349,49 @@ function parentItem(state: LocalCheckoutState, cwd: string, firstHost: string): 
 		return { id: "parent-checkout", status: "pass", line: `${cwd} is a git checkout; origin ${state.origin}` };
 	}
 	if (state.kind === "checkout") {
-		// `noLocalOriginMessage` names a host and teaches a settings rule; here the
-		// fact is about THIS directory, and the fix is the one command that adds a
-		// remote. `<url>` stays a metavariable because no url is knowable here —
-		// inventing one would be worse than naming the slot.
+		// The one fact nothing here can know is the url both machines should reach —
+		// naming the slot is honest; inventing a url would be worse. Everywhere else
+		// in this module a fix carries real values, and here it cannot.
 		return {
 			id: "parent-checkout",
 			status: "fail",
 			line: `${cwd} is a git checkout but has no origin`,
-			fixes: [`git -C ${cwd} remote add origin <url>`],
+			fixes: [`git -C ${cwd} remote add origin <url>  # the url both machines can reach`],
 		};
 	}
 	if (state.kind === "not-a-checkout") {
 		// D5's sentence, verbatim: the advice "git remote add origin" is IMPOSSIBLE
 		// in a directory that is not a repository, and that was pitfall #1.
+		//
+		// Host-less (nothing configured, no registry answer): the same fact WITHOUT
+		// a `subagent(...)` shape, because a call with `host: ""` is a LOCAL launch —
+		// i.e. exactly the substitution the message warns about (review C1).
+		if (firstHost.length === 0) {
+			return {
+				id: "parent-checkout",
+				status: "fail",
+				line: `${cwd} is not a git checkout, and no host is known yet — cross-machine delivery needs a checkout on this machine too`,
+				fixes: [
+					"start pi inside the checkout you want to deliver from (that session directory is the parent side of the delivery)",
+					"then register the machine and re-run: hc machine add --name my-vps ssh://user@my-vps && /legion doctor crossmachine",
+				],
+			};
+		}
 		return {
 			id: "parent-checkout",
 			status: "fail",
 			line: oneLine(notALocalCheckoutMessage({ host: firstHost, localRepo: cwd })),
 			fixes: [
-				`restart pi inside the checkout, or pass a relative cwd: subagent({ agent: "centurion", host: "${firstHost}", cwd: "../my-repo", task: "..." })`,
+				`start pi inside the checkout, or pass a relative cwd plus the remote directory: subagent({ agent: "centurion", host: "${firstHost}", cwd: "../my-repo", hostCwd: "/abs/path/on/${firstHost}", task: "..." })`,
 			],
+		};
+	}
+	if (firstHost.length === 0) {
+		return {
+			id: "parent-checkout",
+			status: "fail",
+			line: `git is not usable on this machine (${state.detail || "git --version failed"})`,
+			fixes: ["install git on this machine (git --version must work here), then re-run: /legion doctor crossmachine"],
 		};
 	}
 	return {
@@ -336,6 +408,7 @@ function machinesItem(input: {
 	machineError: string | undefined;
 	settingsHosts: string[];
 	remainder: number;
+	configured: boolean;
 }): CrossMachineCheckupItem {
 	const note = input.remainder > 0 ? `; ${input.remainder} more host(s) not checked (cap ${MAX_HOSTS})` : "";
 	if (input.machines === undefined) {
@@ -354,6 +427,30 @@ function machinesItem(input: {
 			status: "fail",
 			line: `${listing}; configured in settings but unknown to hc: ${absent.join(", ")}${note}`,
 			fixes: absent.slice(0, MAX_PACKAGE_FIXES).map((host) => `hc machine add --name ${host} ssh://user@${host}`),
+		};
+	}
+	if (known.length === 0 && input.settingsHosts.length === 0) {
+		// Nothing to check and no first step printed anywhere else: "PASS: no machines
+		// registered" was a green fact with no next command (review M4).
+		return {
+			id: "hc-machines",
+			status: "fail",
+			line: "no machines are registered with this hc core, and no host is configured in subagents.crossMachine",
+			fixes: [
+				"hc machine add --name my-vps ssh://user@my-vps  # then: hc machine ls",
+				`# or set {"subagents":{"crossMachine":{"enabled":true}}} in ~/.pi/agent/settings.json and pass cwd per call`,
+			],
+		};
+	}
+	if (!input.configured) {
+		// The registry answered, but nothing says "cross-machine": print the names and
+		// stop, instead of one remote probe per machine a plain `/legion doctor` never
+		// asked about (review R1#4).
+		return {
+			id: "hc-machines",
+			status: "skip",
+			line: `${listing}; cross-machine is not configured, so no target was probed${note}`,
+			fixes: [`# to check one: {"subagents":{"crossMachine":{"enabled":true}}} in ~/.pi/agent/settings.json, then /legion doctor crossmachine`],
 		};
 	}
 	return { id: "hc-machines", status: "pass", line: `${listing}${note}` };
@@ -406,7 +503,17 @@ async function checkHost(input: {
 		// nothing after it can be asked, because every probe needs its `cwd`.
 		const message = oneLine(errorMessage(error));
 		const question = message === oneLine(missingRemoteCwdQuestion(host)) ? missingRemoteCwdQuestion(host) : undefined;
-		items.push({ id: "target-checkout", status: "fail", line: message });
+		items.push({
+			id: "target-checkout",
+			status: "fail",
+			line: message,
+			// The question already carries the call, but doctor's own Next steps tell a
+			// reader to paste each FAIL's `fix:` line — so the shape is repeated here in
+			// the one field that is a fix (review M3). The path itself is the unknown.
+			...(question !== undefined
+				? { fixes: [`subagent({ agent: "centurion", host: "${host}", cwd: "/abs/path/on/${host}", task: "..." })`] }
+				: {}),
+		});
 		// No `cwd` is a fact about ONE input, not five separate unknowns: the SKIP
 		// lines say it once, in the same words, instead of repeating the question
 		// (which needs three sentences) under every item.
@@ -425,7 +532,7 @@ async function checkHost(input: {
 		{ id: "target-runtime", run: () => probeTargetRuntime(client, target) },
 		{
 			id: "inherited-extensions",
-			run: () => probeInheritedExtensions({ target, agents, env }),
+			run: () => probeInheritedExtensions({ target, agents, env, cwd }),
 		},
 		{ id: "target-models", run: () => probeTargetModels({ client, target, model }) },
 	];
@@ -448,9 +555,18 @@ async function checkHost(input: {
 		}
 	}
 
-	// D8: the last line of the block is a launch with REAL values. Built from the
-	// RESOLVED target, so the directory printed is the one a child would start in.
-	return { host, source, items, launch: launchLine(host, target.cwd) };
+	// D8: a launch with REAL values, built from the RESOLVED target (and the model
+	// this checkup judged, when one is known). Labelled "once the FAILs are fixed"
+	// when any item failed: a command printed as copy-paste must be one that works
+	// (review M1).
+	const failed = items.some((item) => item.status === "fail");
+	return {
+		host,
+		source,
+		items,
+		launch: launchLine(host, target.cwd, model),
+		...(failed ? { launchAfterFixes: true } : {}),
+	};
 }
 
 /** a. does the directory exist ON that machine? */
@@ -590,8 +706,10 @@ async function probeInheritedExtensions(input: {
 	target: HostTarget;
 	agents: readonly AgentConfig[];
 	env: NodeJS.ProcessEnv;
+	/** Session directory: the project settings file a JSON snippet would go in. */
+	cwd: string;
 }): Promise<CrossMachineCheckupItem> {
-	const { target, agents, env } = input;
+	const { target, agents, env, cwd } = input;
 
 	// The inherited set is a list of THIS machine's package paths, so it is
 	// collected first: a host where nothing is inherited needs no probe at all.
@@ -674,12 +792,22 @@ async function probeInheritedExtensions(input: {
 	const shown = entries.slice(0, MAX_MISSING_PACKAGES);
 	const more = entries.length - shown.length;
 	const fixes: string[] = [];
-	for (const [name, role] of entries.slice(0, MAX_PACKAGE_FIXES)) {
-		// D4's two ways out, with the concrete values: install it there, or keep it
-		// on this machine only for ONE role — as pasteable settings JSON, which is
-		// the key the reader would otherwise have to look up in the source.
+	const fixed = entries.slice(0, MAX_PACKAGE_FIXES);
+	for (const [name] of fixed) {
+		// D4's first way out, with the concrete values.
 		fixes.push(`hc exec --on ${target.host} -- pi install npm:${name}`);
-		fixes.push(JSON.stringify({ subagents: { agentOverrides: { [role]: { excludeExtensions: [name] } } } }));
+	}
+	// D4's second way out as ONE settings snippet. Two snippets would both start at
+	// the top-level `subagents` key, so pasting the second would silently drop the
+	// first role's fix (review M8); merging by role keeps them composable.
+	const byRole = new Map<string, string[]>();
+	for (const [name, role] of fixed) {
+		byRole.set(role, [...(byRole.get(role) ?? []), name]);
+	}
+	if (byRole.size > 0) {
+		const agentOverrides = Object.fromEntries([...byRole].map(([role, names]) => [role, { excludeExtensions: names }]));
+		fixes.push(JSON.stringify({ subagents: { agentOverrides } }));
+		fixes.push(`# where: ~/.pi/agent/settings.json (user) or ${cwd}/.pi/settings.json (project)`);
 	}
 	return {
 		id: "inherited-extensions",
@@ -698,11 +826,6 @@ async function probeTargetModels(input: {
 	model: string | undefined;
 }): Promise<CrossMachineCheckupItem> {
 	const { client, target, model } = input;
-	if (model === undefined) {
-		// Nothing to compare: the checkup does not invent a model, and a PASS on a
-		// model nobody would launch is a false green.
-		return { id: "target-models", status: "skip", line: "no model to check (no role carries one and this run named none)" };
-	}
 	const argv = [
 		target.node,
 		target.piCli,
@@ -725,21 +848,44 @@ async function probeTargetModels(input: {
 		};
 	}
 	const models = parseListModels(execResultText({ stdout: result.stdout }));
+	const listingOf = (): string => {
+		const shown = models.slice(0, MAX_MODELS_LISTED);
+		const more = models.length - shown.length;
+		return shown.length > 0 ? `${shown.join(", ")}${more > 0 ? ` and ${more} more` : ""}` : "no models at all";
+	};
+	// No model to compare is still a fact worth reporting: a machine whose pi sees
+	// NO models runs a child that dies at its first turn, whether or not a role
+	// named one (the old code SKIPped this away and called it a day).
+	if (model === undefined) {
+		if (models.length === 0) {
+			return {
+				id: "target-models",
+				status: "fail",
+				line: `${target.host}'s pi lists no models (no role names one either)`,
+				fixes: [
+					`hc exec --on ${target.host} -- ${target.node} ${target.piCli} auth check`,
+					`# or name the provider extension there: subagents.crossMachine.hosts.${target.host}.piExtensions`,
+				],
+			};
+		}
+		return {
+			id: "target-models",
+			status: "pass",
+			line: `${target.host}'s pi lists ${models.length} model(s); no role names one, so the child uses its default`,
+		};
+	}
 	if (modelMatches(model, models)) {
 		return { id: "target-models", status: "pass", line: `${model} is in ${target.host}'s listing (${models.length} model(s))` };
 	}
 	const shown = models.slice(0, MAX_MODELS_LISTED);
-	const more = models.length - shown.length;
-	const listing = shown.length > 0 ? `${shown.join(", ")}${more > 0 ? ` and ${more} more` : ""}` : "no models at all";
 	return {
 		id: "target-models",
 		status: "fail",
-		line: `${model} is not in ${target.host}'s listing: ${listing}`,
+		line: `${model} is not in ${target.host}'s listing: ${listingOf()} (the child runs with --no-extensions, so a provider installed there must also be named in hosts.${target.host}.piExtensions)`,
 		fixes: [
 			shown.length > 0
 				? `use a model that machine serves, e.g. model: "${shown[0]}" on the role card`
 				: `that machine's pi serves no models: hc exec --on ${target.host} -- ${target.node} ${target.piCli} auth check, then re-run: /legion doctor crossmachine`,
-			`# aside: the child runs with --no-extensions, so a provider extension installed there must be named in subagents.crossMachine.hosts.${target.host}.piExtensions (list them: hc exec --on ${target.host} -- ${target.node} ${target.piCli} list)`,
 		],
 	};
 }
@@ -751,10 +897,11 @@ async function probeTargetModels(input: {
  * checkup has just proved both sides share an origin), and the phase list is the
  * minimal legal machine — a terminal phase carries no `next`.
  */
-function launchLine(host: string, cwd: string): string {
+function launchLine(host: string, cwd: string, model?: string): string {
 	return "subagent({ agent: \"centurion\", "
 		+ `host: "${host}", `
 		+ `cwd: "${cwd}", `
+		+ (model !== undefined ? `model: "${model}", ` : "")
 		+ "worktree: true, "
 		+ "task: \"demo: report pwd and stop\", "
 		+ "phases: [{ id: \"planning\", next: [{ to: \"implementing\" }] }, "

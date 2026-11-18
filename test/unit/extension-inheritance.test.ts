@@ -71,6 +71,12 @@ test("#280: excludeExtensions accepts a package NAME and a PATH, and nothing els
 	// Names must not leak across packages.
 	assert.equal(matchesExcludedExtension("/h/node_modules/pi-lens-extra/index.ts", "pi-lens"), false);
 	assert.equal(matchesExcludedExtension("/h/node_modules/pi-lens/index.ts", ""), false);
+	// Scoped package: the D4 fix prints the FULL name (`@scope/name`), so that
+	// spelling has to match the two-segment package directory. The short name keeps
+	// matching too, because the entry's own parent IS the package directory.
+	assert.equal(matchesExcludedExtension("/h/node_modules/@acme/pi-lens/index.ts", "@acme/pi-lens"), true);
+	assert.equal(matchesExcludedExtension("/h/node_modules/@acme/pi-lens/extensions/x.ts", "@acme/pi-lens"), true);
+	assert.equal(matchesExcludedExtension("/h/node_modules/@acme/pi-lens/index.ts", "@other/pi-lens"), false);
 });
 
 test("#280: excludeExtensions subtracts, and an unlisted pattern changes nothing", () => {

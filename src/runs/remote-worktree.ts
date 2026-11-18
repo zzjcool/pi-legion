@@ -630,13 +630,17 @@ export async function assertSharedOrigin(opts: {
 				detail: local.detail,
 			}),
 			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, localRepo, code: local.code },
+			{ host: target.host, localRepo, code: local.code, noModelFallback: true },
 		);
 	}
 	if (local.kind === "not-a-checkout") {
+		// A local-repository fact is about the MACHINE, not the model: without this flag
+		// the deterministic refusal walks the whole candidate chain, re-running the same
+		// three git probes per candidate.
 		throw new SubagentError(notALocalCheckoutMessage({ host: target.host, localRepo }), ErrorCodes.INVALID_PARAMS, {
 			host: target.host,
 			localRepo,
+			noModelFallback: true,
 		});
 	}
 	const localOrigin = (local.origin ?? "").trim();
@@ -644,6 +648,7 @@ export async function assertSharedOrigin(opts: {
 		throw new SubagentError(noLocalOriginMessage({ host: target.host, localRepo }), ErrorCodes.INVALID_PARAMS, {
 			host: target.host,
 			localRepo,
+			noModelFallback: true,
 		});
 	}
 	const remoteOrigin = await remoteOriginUrl(client, target, target.cwd);
@@ -651,7 +656,7 @@ export async function assertSharedOrigin(opts: {
 		throw new SubagentError(
 			noRemoteOriginMessage({ host: target.host, cwd: target.cwd, localOrigin }),
 			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, cwd: target.cwd },
+			{ host: target.host, cwd: target.cwd, noModelFallback: true },
 		);
 	}
 	if (normalizeGitRemoteUrl(localOrigin) !== normalizeGitRemoteUrl(remoteOrigin)) {
@@ -663,7 +668,7 @@ export async function assertSharedOrigin(opts: {
 				localOrigin,
 			}),
 			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, cwd: target.cwd, remoteOrigin, localOrigin },
+			{ host: target.host, cwd: target.cwd, remoteOrigin, localOrigin, noModelFallback: true },
 		);
 	}
 }

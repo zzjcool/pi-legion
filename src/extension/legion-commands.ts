@@ -29,7 +29,7 @@ import { createSummaryCommand } from "./summary.ts";
 import { createTimingCommand } from "./timing.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import { loadSubagentSettings } from "../agents/settings.ts";
-import { runCrossMachineCheckup } from "../runs/cross-machine-checkup.ts";
+import { crossMachineCheckupRequested, runCrossMachineCheckup } from "../runs/cross-machine-checkup.ts";
 import type { CrossMachineSettings } from "../shared/types.ts";
 import type {
 	ExtensionAPI,
@@ -629,7 +629,7 @@ async function buildDoctorReport(
 	// doctor models` must stay exactly as cheap as it is today — no `hc` connect,
 	// no `machine.exec`.
 	const crossMachine = loadCrossMachineSettings(ctxCwd);
-	const crossMachineCheckup = sections === undefined || sections.includes("crossmachine")
+	const crossMachineCheckup = crossMachineCheckupRequested(sections)
 		? await runCrossMachineCheckup({ cwd: ctxCwd, settings: crossMachine })
 		: undefined;
 	const runtime: DoctorRuntimeSnapshot = {

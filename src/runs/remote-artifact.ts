@@ -26,6 +26,7 @@ import { HcRpcError, hcCliClient, type HcClient } from "../hc/client.ts";
 import type { CrossMachineSettings, SubagentError as SubagentErrorType } from "../shared/types.ts";
 import { SubagentError, ErrorCodes } from "../shared/types.ts";
 import {
+	missingRemoteCwdQuestion,
 	probeRemoteChild,
 	remoteFateNextStep,
 	resolveHostTarget,
@@ -194,10 +195,15 @@ export function createRemoteSessionReadback(opts: {
 			target = resolveHostTarget(request.host, opts.crossMachine);
 		} catch (error) {
 			// Nothing about the child is knowable: this machine cannot even name its
-			// target. The next step is the config key, because that is the fix.
-			return unreachableFailure(request.host, error instanceof Error ? error.message : String(error), {
+			// target. D1: the missing directory is answered by the CALL, not by a
+			// settings lesson, so the same two shapes the launch path prints appear here.
+			const message = error instanceof Error ? error.message : String(error);
+			const missingCwd = message.includes(missingRemoteCwdQuestion(request.host));
+			return unreachableFailure(request.host, message, {
 				evidence: ["the host target could not be resolved"],
-				nextStep: `fix subagents.crossMachine.hosts.${request.host} (enabled, cwd, piExtensions): the launch and this read-back must resolve the same target`,
+				nextStep: missingCwd
+					? `pass the directory ON ${request.host} with the call (and on the launch that started it): subagent({ host: "${request.host}", cwd: "/abs/path/on/${request.host}", task: "..." })`
+					: `fix subagents.crossMachine.hosts.${request.host} (enabled, cwd, piExtensions): the launch and this read-back must resolve the same target`,
 			});
 		}
 		const client = opts.clientFactory ? opts.clientFactory() : hcCliClient({ env: process.env });

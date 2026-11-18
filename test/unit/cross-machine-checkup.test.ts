@@ -34,7 +34,7 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { HcRpcError, type HcClient, type HcMethod } from "../../src/hc/client.ts";
 import type { AgentConfig, SubagentsSettings } from "../../src/shared/types.ts";
-import { runCrossMachineCheckup } from "../../src/runs/cross-machine-checkup.ts";
+import { crossMachineCheckupRequested, runCrossMachineCheckup } from "../../src/runs/cross-machine-checkup.ts";
 import { clearHostDiscoveryCache } from "../../src/runs/remote.ts";
 import { ensureHostExtensions, resetExtensionDiscoveryCache } from "../../src/runs/extension-inheritance.ts";
 import type { HcExecResult } from "../../src/runs/remote.ts";
@@ -467,7 +467,8 @@ test("D5: a session directory that is not a checkout gets D5's sentence, not `gi
 		assert.doesNotMatch(parent.line, /remote add origin/);
 		// …and the pasteable next step names the REAL first host.
 		assert.ok(parent.fixes?.length, "a FAIL must carry a fix");
-		assert.match(parent.fixes![0]!, /subagent\(\{ agent: "centurion", host: "fakebox", cwd: "\.\.\/my-repo", task: "\.\.\." \}\)/);
+		// …including the remote half, so pasting it cannot walk into the D2 question.
+		assert.match(parent.fixes![0]!, /subagent\(\{ agent: "centurion", host: "fakebox", cwd: "\.\.\/my-repo", hostCwd: "\/abs\/path\/on\/fakebox", task: "\.\.\." \}\)/);
 		// One broken parent fact does not hide the host block: those are different questions.
 		const host = checkup.hosts[0]!;
 		assert.equal(host.items.length, 5);
@@ -589,11 +590,11 @@ test("D7: a model the target does not serve FAILs and lists what that machine DO
 		});
 		const models = item(checkup.hosts[0]!.items, "target-models");
 		assert.equal(models.status, "fail");
-		assert.match(models.line, /^workbuddy\/deepseek-v4\.1-flash is not in fakebox's listing: workbuddy\/deepseek-v4\.1-pro$/);
-		// Two actions: pick a listed model, and the `--no-extensions` aside.
-		assert.equal(models.fixes?.length, 2);
+		assert.match(models.line, /^workbuddy\/deepseek-v4\.1-flash is not in fakebox's listing: workbuddy\/deepseek-v4\.1-pro/);
+		// One action + the `--no-extensions` aside, which is context, not a command.
+		assert.equal(models.fixes?.length, 1);
 		assert.match(models.fixes![0]!, /model: "workbuddy\/deepseek-v4\.1-pro"/);
-		assert.match(models.fixes![1]!, /subagents\.crossMachine\.hosts\.fakebox\.piExtensions/);
+		assert.match(models.line, /hosts\.fakebox\.piExtensions/);
 	} finally {
 		rmSync(cache, { recursive: true, force: true });
 		repo.cleanup();
@@ -659,6 +660,124 @@ test("D7: a transport failure FAILs its own item and SKIPs the rest with the rea
 		}
 		// Nothing is inferred about a machine that did not answer.
 		assert.equal(host.items.filter((entry) => entry.status === "pass").length, 0);
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+		repo.cleanup();
+	}
+});
+
+test("D6: `enabled: false` probes NOTHING and offers no launch a launch would refuse", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	try {
+		const client = healthyTarget();
+		const checkup = await runCrossMachineCheckup({
+			cwd: "/Users/me/app",
+			settings: { enabled: false, hosts: { [HOST]: explicitHost() } },
+			agents: [role("centurion", { model: MODEL })],
+			model: MODEL,
+			env,
+			client,
+			localCheckout: () => ({ kind: "checkout", origin: LOCAL_ORIGIN }),
+		});
+		assert.equal(checkup.enabled, false);
+		assert.deepEqual(checkup.hosts, [], "a switched-off feature is not probed");
+		assert.deepEqual(client.calls, [], "zero round trips: not even machine.list");
+		const parent = item(checkup.parent, "hc-machines");
+		assert.equal(parent.status, "fail");
+		assert.match(parent.line, /cross-machine launch is disabled/);
+		assert.match(parent.fixes![0]!, /"enabled": true/);
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+	}
+});
+
+test("D7: nothing registered and nothing configured FAILs with the `hc machine add` first step", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	try {
+		const client = new FakeCheckupClient().onMachineList(() => []);
+		const checkup = await runCrossMachineCheckup({
+			cwd: "/Users/me/app",
+			settings: { enabled: true },
+			agents: [role("centurion", { model: MODEL })],
+			env,
+			client,
+			localCheckout: () => ({ kind: "checkout", origin: LOCAL_ORIGIN }),
+		});
+		assert.deepEqual(checkup.hosts, []);
+		const machines = item(checkup.parent, "hc-machines");
+		assert.equal(machines.status, "fail");
+		assert.match(machines.line, /no machines are registered/);
+		assert.match(machines.fixes![0]!, /^hc machine add --name /);
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+	}
+});
+
+test("D6: the checkup is paid only when the crossmachine section was asked for", () => {
+	assert.equal(crossMachineCheckupRequested(undefined), true, "no filter = every section, so this one too");
+	assert.equal(crossMachineCheckupRequested(["crossmachine"]), true);
+	assert.equal(crossMachineCheckupRequested(["crossmachine", "next"]), true);
+	assert.equal(crossMachineCheckupRequested(["models"]), false, "`/legion doctor models` must stay probe-free");
+	assert.equal(crossMachineCheckupRequested([]), false, "an empty selection selects nothing");
+});
+
+test("D8: the launch is labelled after-the-fixes only when something actually failed", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	const repo = localRepo();
+	try {
+		const good = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [],
+			env,
+			client: healthyTarget(),
+		});
+		assert.equal(good.hosts[0]!.launchAfterFixes, undefined, "all PASS = paste it now");
+		assert.doesNotMatch(good.hosts[0]!.launch!, /model: /, "no model named, so no model flag");
+		const bad = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [],
+			env,
+			client: healthyTarget({ models: "PROVIDER\tMODEL\tCTX\nworkbuddy\tdeepseek-v4.1-pro\t200k\tctx\n" }),
+			model: MODEL,
+		});
+		assert.equal(bad.hosts[0]!.launchAfterFixes, true, "a FAIL above the launch must relabel it");
+		assert.match(bad.hosts[0]!.launch!, /model: "workbuddy\/deepseek-v4\.1-flash"/, "the model judged is the model launched");
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+		repo.cleanup();
+	}
+});
+
+test("D7: an origin mismatch names both urls and the set-url command with the REAL url", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	const repo = localRepo();
+	try {
+		const client = healthyTarget();
+		client.override(`git -C ${REMOTE_CWD} remote get-url origin`, () => stdoutResult("https://git.example.invalid/acme/fork.git\n"));
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [],
+			env,
+			client,
+		});
+		const origin = item(checkup.hosts[0]!.items, "target-origin");
+		assert.equal(origin.status, "fail");
+		assert.match(origin.line, /acme\/fork\.git/);
+		assert.ok(
+			origin.fixes?.some((fix) => fix.includes(`git -C ${REMOTE_CWD} remote set-url origin ${LOCAL_ORIGIN}`)),
+			`expected the real set-url command, got: ${JSON.stringify(origin.fixes)}`,
+		);
 	} finally {
 		rmSync(cache, { recursive: true, force: true });
 		repo.cleanup();

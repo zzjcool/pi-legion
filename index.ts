@@ -112,7 +112,7 @@ import { CHILD_ROLE_ENV } from "./src/extension/child-guard.ts";
 import { configureSessionErrors, recordSessionError } from "./src/extension/session-errors.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
 import { expectedModelsFromSettings, parseDoctorSections, runLegionDoctor } from "./src/extension/legion-doctor.ts";
-import { runCrossMachineCheckup } from "./src/runs/cross-machine-checkup.ts";
+import { crossMachineCheckupRequested, runCrossMachineCheckup } from "./src/runs/cross-machine-checkup.ts";
 import { readFileSync } from "node:fs";
 import {
 	effectiveMaxDepth,
@@ -349,7 +349,7 @@ const SubagentParams = Type.Object({
 	cwd: Type.Optional(
 		Type.String({
 			description:
-				"Directory the child records live under (`<cwd>/.pi-subagents`) for launch and every control action. Defaults to the session cwd. A name miss also searches neighbouring stores, so setting this is rarely needed. With `host`, an ABSOLUTE `cwd` is the REMOTE working directory (a path ON that machine), e.g. one host serving several projects: subagent({ host: \"hw-nj\", cwd: \"/root/code/other-project\" }).",
+				"With `host`: an ABSOLUTE `cwd` is the directory ON that machine (the same meaning as `hostCwd`, which is the clearer spelling); a RELATIVE `cwd` still names a directory on THIS machine. Without `host` it is the directory the child records live under (`<cwd>/.pi-subagents`), defaulting to the session cwd. A name miss also searches the neighbouring stores.",
 		}),
 	),
 	hostCwd: Type.Optional(
@@ -2529,7 +2529,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				// D6/D7: the Cross-machine section is the ONE async part of doctor, and it is
 				// paid only when that section was asked for (`sections` undefined = the full
 				// report). `doctor models` stays as cheap as it was: no `hc`, no probe.
-				const crossMachineCheckup = sections === undefined || sections.includes("crossmachine")
+				const crossMachineCheckup = crossMachineCheckupRequested(sections)
 					? await runCrossMachineCheckup({
 						cwd,
 						settings: catalog.settings.crossMachine,
@@ -4489,7 +4489,16 @@ async function reviveChild(
 		// recorded host, and the worktree is named so the backend reuses the tree
 		// the child already has instead of creating a second one.
 		const resumeTarget = recordHost !== undefined
-			? await resolveHostTargetAsync(recordHost, ctx.settings.crossMachine, { admission: "never" })
+			// D2 on a resume must be answerable: a `resume` call may carry the same
+			// `cwd`/`hostCwd` a launch takes, and replaying it here is what keeps the
+			// zero-config shape (`{enabled:true}` + a per-call directory) resumable —
+			// otherwise the refusal asks for an input this path silently dropped.
+			? await resolveHostTargetAsync(recordHost, ctx.settings.crossMachine, {
+				admission: "never",
+				...(firstRemoteCwd(ctx.params.hostCwd, ctx.params.cwd) !== undefined
+					? { cwd: firstRemoteCwd(ctx.params.hostCwd, ctx.params.cwd) }
+					: {}),
+			})
 			: undefined;
 		// S4/D17: four facts, in order, before touching that machine. Each failure names
 		// its step, and none of them is inferred from a local path: the record's

@@ -1199,6 +1199,9 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		const snapshot = options.crossMachineCheckup;
 		if (snapshot !== undefined) {
 			push(`- hosts: ${snapshot.hosts.length ? snapshot.hosts.map((entry) => entry.host).join(", ") : "none configured"}`);
+			// Printed BEFORE the per-host blocks: D8 makes the pasteable launch the last
+			// line of the section, and a trailing "last preflight" would sit under it.
+			push(`- last preflight: ${formatLastPreflight(lastDeliveryPreflight())}`);
 			for (const item of snapshot.parent) {
 				const label = crossMachineItemLabel(item);
 				push(`  - ${crossMachineStatusText(item.status)} ${label}: ${item.line}`);
@@ -1216,7 +1219,12 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 					pushCrossMachineIssue(issues, item, `${entry.host}: ${item.line}`);
 				}
 				if (entry.launch !== undefined) {
-					push("    - launch (copy-paste, real values):");
+					// A command labelled copy-paste must be one that works: when something
+					// above failed, the same line is labelled with the precondition instead of
+					// telling a reader to paste a launch the report just disproved.
+					push(entry.launchAfterFixes === true
+						? "    - launch (copy-paste once the FAILs above are fixed):"
+						: "    - launch (copy-paste, real values):");
 					push(`        ${entry.launch}`);
 				} else if (entry.question !== undefined && !entry.items.some((item) => item.status === "fail")) {
 					// D2/D8: no cwd means the question IS the answer — never a launch line
@@ -1233,9 +1241,6 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 					});
 				}
 			}
-			// What the LAST real attempt concluded (D5 records it either way), kept in
-			// the same place the static path prints it.
-			push(`- last preflight: ${formatLastPreflight(lastDeliveryPreflight())}`);
 			push("");
 		} else {
 			// Snapshot ABSENT: today's behaviour, byte for byte. This is the path every
