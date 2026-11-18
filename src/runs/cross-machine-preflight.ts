@@ -11,10 +11,12 @@
  *
  * So this module is the ONE place that asks every question a cross-machine
  * delivery depends on, in a fixed order, against the machine that owns each
- * fact: `git` exists here, this checkout has an `origin`, the target's checkout
- * exists and is a repo, `git` exists there, that checkout has an `origin`, the
- * two `origin`s name one remote — and finally (softly) whether that remote is
- * actually reachable from there.
+ * fact: `git` exists here, what this session's directory IS (a checkout with an
+ * `origin`, a checkout without one, not a checkout at all, or no usable `git` —
+ * contract `first-run-success-v1` D5 asks git TWO questions to tell them apart),
+ * the target's checkout exists and is a repo, `git` exists there, that checkout has
+ * an `origin`, the two `origin`s name one remote — and finally (softly) whether
+ * that remote is actually reachable from there.
  *
  * Shape rules that are not negotiable:
  *
@@ -54,8 +56,11 @@ import {
 	type HostTarget,
 } from "./remote.ts";
 import {
+	localCheckoutState,
 	missingRemoteCheckoutMessage,
+	noLocalGitMessage,
 	noLocalOriginMessage,
+	notALocalCheckoutMessage,
 	noRemoteOriginMessage,
 	normalizeGitRemoteUrl,
 	notARepositoryMessage,
@@ -235,22 +240,6 @@ function localGitVersion(): { ok: boolean; code: number | null; detail: string }
 	}
 }
 
-/** This checkout's `origin`, or `""` when it has none (step 2). */
-function localOriginUrl(localRepo: string): string {
-	try {
-		const url = execFileSync("git", ["-C", localRepo, "remote", "get-url", "origin"], {
-			stdio: ["ignore", "pipe", "pipe"],
-			encoding: "utf8",
-			timeout: GIT_PROBE_TIMEOUT_MS,
-		}).trim();
-		return url;
-	} catch {
-		// "no origin" and "not a repository" are the same ANSWER here: neither
-		// gives this checkout a remote a delivery could share (D5 step 2).
-		return "";
-	}
-}
-
 /** git's own stderr first (it says why), then the message, then the bare error. */
 function localGitFailureText(error: unknown): string {
 	if (error && typeof error === "object") {
@@ -308,10 +297,11 @@ function timedOutOf(error: unknown): boolean {
  *
  * The order is the contract (`docs/contracts/cross-machine-spawn-v1.md` D10/D11
  * freeze the same sequence for the worktree creator), and it is ordered by "what
- * can this reader fix": this machine's git, this checkout's origin, that
- * machine's checkout, its git, that it is a repo, its origin, that both name one
- * remote. A later question never runs after an earlier one failed, because its
- * answer would be a guess about a state that cannot be reached.
+ * can this reader fix": this machine's git, what this session's directory is (a
+ * checkout with an origin, without one, or not a checkout at all), that machine's
+ * checkout, its git, that it is a repo, its origin, that both name one remote. A
+ * later question never runs after an earlier one failed, because its answer would
+ * be a guess about a state that cannot be reached.
  *
  * Returns the report on success (fetch included) and records it for doctor.
  * Throws on every hard failure and records THAT too, so doctor can show what the
@@ -324,23 +314,34 @@ export async function preflightDelivery(input: DeliveryPreflightInput): Promise<
 	// 1. git on THIS machine → local-git
 	const git = localGitVersion();
 	if (!git.ok) {
-		const code = git.code === null ? "no exit code" : String(git.code);
 		fail(
 			base,
 			"local-git",
-			`this machine has no usable git (git --version exited ${code}: ${git.detail}); ` +
-				"a cross-machine centurion delivers through git worktrees, so git must be on PATH here too. " +
-				"Two ways out: 1) install git here and retry; " +
-				`2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "${base.host}", task: "..." }) needs no worktree and no git.`,
+			noLocalGitMessage({ host: base.host, localRepo, code: git.code, detail: git.detail }),
 			{ localRepo, code: git.code },
 		);
 	}
 
-	// 2. this checkout's origin → local-origin
-	const localOrigin = localOriginUrl(localRepo);
-	if (localOrigin.length === 0) {
+	// 2. what this session's directory IS → local-origin (`first-run-success-v1`
+	// D5: git is asked twice, so "not a checkout" and "no origin" stop collapsing)
+	const local = localCheckoutState(localRepo);
+	if (local.kind === "no-git") {
+		// Git ran at step 1 but not here (a `git` wrapper that answers `--version` and
+		// nothing else): the same missing-program sentence, not "no origin".
+		fail(
+			base,
+			"local-origin",
+			noLocalGitMessage({ host: base.host, localRepo, code: local.code, detail: local.detail }),
+			{ localRepo, code: local.code },
+		);
+	}
+	if (local.kind === "not-a-checkout") {
+		fail(base, "local-origin", notALocalCheckoutMessage({ host: base.host, localRepo }), { localRepo });
+	}
+	if (local.origin === undefined) {
 		fail(base, "local-origin", noLocalOriginMessage({ host: base.host, localRepo }), { localRepo });
 	}
+	const localOrigin = local.origin;
 
 	// 3. the target's checkout exists → remote-checkout
 	let checkoutIsDirectory: boolean;
