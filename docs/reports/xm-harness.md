@@ -263,7 +263,15 @@ docker exec xm-remote bash -lc 'git -C /root/work worktree list; ls /root/.pi-wo
 - `npm run test:integration` → **fail 0**（173 pass）
 - `git diff --stat origin/master -- src/ index.ts` → **空**（本卡零产品代码改动）
 
-## 10. review
+## 10. 一个仓库陷阱（差点漏交付）
+
+`.gitignore:30` 有 `reports/`（给临时 agent 笔记用的），它同时匹配 `docs/reports/`，
+所以**新建**的 `docs/reports/*.md` 会被静默忽略 —— 本报告第一次 `git add -A` 就没进去。
+已经存在的那些报告（`first-run-success.md`、`xm-dispatch-fixes.md` …）当年都是 `-f` 加进去的。
+要交付 `docs/reports/` 下的新文件，用 `git add -f`，然后 `git ls-files docs/reports/` 复核。
+（没有改 `.gitignore`：那是仓库级策略，不属于本卡。）
+
+## 11. review
 
 一轮对抗式 review 提了 13 条（1 critical + 2 major + 10 minor），全部修复在
 `test/docker` 内（`541b80a`），其中 critical 就是 §6 第 3 条「d 绿但 collect 真失败」——
