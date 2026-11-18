@@ -259,7 +259,7 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 	assert.equal(noCheckout.code, ErrorCodes.INVALID_PARAMS);
 	assert.equal(
 		noCheckout.message,
-		"host 'vps' has no checkout at /srv/app (the configured cwd does not exist on that machine)",
+		"host 'vps' has no checkout at /srv/app (the configured cwd does not exist on that machine). Two ways out: 1) give that machine a checkout at /srv/app — git clone <url> /srv/app on 'vps' — or point subagents.crossMachine.hosts.vps.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).",
 	);
 
 	// 2. It exists but is not a git repository (rev-parse exits 128).
@@ -268,7 +268,10 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 		.onArgv("rev-parse --git-dir", () => execResult({ code: 128, stderr: base64("fatal: not a git repository") }));
 	const notRepository = await refusal(createRemoteChildWorktree({ client: notRepo, target: target(), name: "child", localRepo: "/tmp" }));
 	assert.equal(notRepository.code, ErrorCodes.INVALID_PARAMS);
-	assert.equal(notRepository.message, "host 'vps': /srv/app is not a git repository on that machine");
+	assert.equal(
+		notRepository.message,
+		"host 'vps': /srv/app is not a git repository on that machine. Two ways out: 1) give that machine a checkout at /srv/app — git clone <url> /srv/app on 'vps' — or point subagents.crossMachine.hosts.vps.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).",
+	);
 
 	// 3. THIS checkout has no origin: fixed here, so the message does not blame the host.
 	const local = localRepo();
@@ -281,7 +284,10 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 			createRemoteChildWorktree({ client: remoteHasOrigin, target: target(), name: "child", localRepo: local.repo }),
 		);
 		assert.equal(noLocalOrigin.code, ErrorCodes.INVALID_PARAMS);
-		assert.equal(noLocalOrigin.message, "cross-machine delivery needs one shared remote: this checkout has no origin");
+		assert.equal(
+			noLocalOrigin.message,
+			`cross-machine delivery needs one shared remote: this checkout (${local.repo}) has no origin. Two ways out: 1) add one and retry — git -C ${local.repo} remote add origin <url> (the machine 'vps' must be able to reach the same url); 2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "vps", task: "..." }) needs no origin.`,
+		);
 
 		// 4. THAT machine's checkout has no origin: fixed there, so it names the host.
 		const withLocal = localRepo("git@example.com:acme/pi-legion.git");
@@ -295,7 +301,7 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 			);
 			assert.equal(
 				noRemoteOrigin.message,
-				"host 'vps': /srv/app has no origin on that machine; cross-machine delivery needs one shared remote",
+				"host 'vps': /srv/app has no origin on that machine; cross-machine delivery needs one shared remote. Two ways out: 1) add one there — hc exec --on vps -- git -C /srv/app remote add origin <url> (same url as this checkout's 'git@example.com:acme/pi-legion.git'); 2) dispatch a worker instead (workers need no origin).",
 			);
 
 			// 5. Both have one, and they disagree: the message names BOTH.
@@ -308,7 +314,7 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 			);
 			assert.equal(
 				mismatch.message,
-				"host 'vps': its checkout at /srv/app has origin 'git@example.com:acme/fork.git' but this checkout's is 'git@example.com:acme/pi-legion.git'; cross-machine delivery needs one shared remote",
+				"host 'vps': its checkout at /srv/app has origin 'git@example.com:acme/fork.git' but this checkout's is 'git@example.com:acme/pi-legion.git'; cross-machine delivery needs one shared remote. Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); 2) dispatch a worker instead (workers need no origin).",
 			);
 		} finally {
 			withLocal.cleanup();
@@ -316,6 +322,20 @@ test("D10/D11: cwd missing, cwd not a repo, no origin, different origin — four
 	} finally {
 		local.cleanup();
 	}
+});
+
+test("D6: `rev-parse` exiting 127 means git is missing there, not that the directory is not a repo", async () => {
+	// The shell answers 127 when the program does not exist. Reporting that as "not
+	// a git repository" sends the operator to fix a directory that is fine.
+	const noGit = new FakeRemoteClient()
+		.onArgv("test -d", () => execResult({ code: 0 }))
+		.onArgv("rev-parse --git-dir", () => execResult({ code: 127, stderr: base64("sh: 1: git: not found") }));
+	const error = await refusal(createRemoteChildWorktree({ client: noGit, target: target(), name: "child", localRepo: "/tmp" }));
+	assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
+	assert.equal(
+		error.message,
+		"host 'vps': git is not available on that machine (git --version exited 127: sh: 1: git: not found). A cross-machine centurion delivers through git worktrees, so git must be on PATH there. Two ways out: 1) install git on 'vps' and retry; 2) dispatch a worker instead (workers need no worktree and no git).",
+	);
 });
 
 test("D11: an existing destination is refused, and a failing add names cwd + git's own words", async () => {

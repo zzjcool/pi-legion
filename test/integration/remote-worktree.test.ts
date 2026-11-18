@@ -352,9 +352,10 @@ test("S2: a configured cwd that does not exist is named as a missing checkout, a
 		.spawnChild(spawnInput(h, { hostTarget: { ...h.target, cwd: missing } }))
 		.then(() => undefined, (thrown: unknown) => thrown);
 	assert.ok(error instanceof SubagentError, `expected a SubagentError, got ${String(error)}`);
+	// D6: the fact first, then the two ways out (a checkout there, or a worker).
 	assert.equal(
 		(error as SubagentError).message,
-		`host 'fakebox' has no checkout at ${missing} (the configured cwd does not exist on that machine)`,
+		`host 'fakebox' has no checkout at ${missing} (the configured cwd does not exist on that machine). Two ways out: 1) give that machine a checkout at ${missing} — git clone <url> ${missing} on 'fakebox' — or point subagents.crossMachine.hosts.fakebox.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).`,
 	);
 	assert.deepEqual(h.wireFor("terminal.run"), [], "no terminal may be created for a missing checkout");
 });
@@ -371,7 +372,10 @@ test("S2: a cwd that is not a git repository is named as such, and no terminal i
 		.then(() => undefined, (thrown: unknown) => thrown);
 	assert.ok(error instanceof SubagentError);
 	assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
-	assert.equal((error as SubagentError).message, `host 'fakebox': ${plain} is not a git repository on that machine`);
+	assert.equal(
+		(error as SubagentError).message,
+		`host 'fakebox': ${plain} is not a git repository on that machine. Two ways out: 1) give that machine a checkout at ${plain} — git clone <url> ${plain} on 'fakebox' — or point subagents.crossMachine.hosts.fakebox.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).`,
+	);
 	assert.deepEqual(h.wireFor("terminal.run"), []);
 });
 
@@ -390,7 +394,7 @@ test("S2/D10: a checkout whose origin differs is refused, naming BOTH remotes", 
 	const message = (error as SubagentError).message;
 	assert.equal(
 		message,
-		`host 'fakebox': its checkout at ${h.remoteCwd} has origin '${otherOrigin}' but this checkout's is '${h.origin}'; cross-machine delivery needs one shared remote`,
+		`host 'fakebox': its checkout at ${h.remoteCwd} has origin '${otherOrigin}' but this checkout's is '${h.origin}'; cross-machine delivery needs one shared remote. Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); 2) dispatch a worker instead (workers need no origin).`,
 	);
 	assert.deepEqual(h.wireFor("terminal.run"), []);
 	// The destination was never even attempted.
