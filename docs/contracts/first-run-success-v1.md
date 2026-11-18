@@ -174,3 +174,50 @@ W1 → W2 → W3 → W4, each with its own verify gate.
 - `{"subagents":{"crossMachine":{"enabled":true}}}` + `cwd` launches (fake core).
 - Missing cwd: message contains the question, the pass shape, the ask-the-user sentence,
   the no-probe sentence, and the wire log contains zero `machine.exec`.
+
+## Amendments recorded while landing v1
+
+Adversarial review (three fresh-context reviewers) produced these corrections. Each is
+a strengthening of the decision it names, not a new scope; the code, tests and docs in
+this branch implement the amended text.
+
+- **A1 (D2).** The pre-v1.1 `resolveHostTarget` branch (no `mentionPerCallCwd`) now
+  throws the SAME question. It is the branch the read-back paths (`remote-verify`,
+  `remote-artifact`) take, and a resume that cannot name the directory must get the
+  question rather than a settings lesson. The two assertions that pinned the old
+  sentence for an empty entry (`cross-machine-target.test.ts`,
+  `cross-machine-discovery.test.ts`) were updated with it; the single assertion for a
+  WRONG (relative) value is untouched.
+- **A2 (D5).** The pasteable shape carries the remote half too:
+  `subagent({ agent: "centurion", host: "vps", cwd: "../my-repo", hostCwd: "/abs/path/on/vps", task: "..." })`.
+  A relative `cwd` alone only points the parent at a checkout — it would drop the
+  remote directory and send the reader straight into D2.
+- **A3 (D7/D8).** Four corrections to the checkup output:
+  1. `enabled: false` probes nothing (not even `machine.list`) and reports one FAIL on
+     the switch: a report that prints PASS lines and a launch for a feature every
+     launch refuses is worse than no report.
+  2. `machine.list` empty AND no configured host is a FAIL carrying the
+     `hc machine add --name …` first step (a green "no machines registered" gave the
+     reader nothing to type).
+  3. A launch is labelled `launch (copy-paste once the FAILs above are fixed)` when any
+     item failed; "copy-paste, real values" is reserved for an all-green block.
+  4. The launch carries the model the checkup judged (`centurion`'s model, else any
+     role's, else absent). With no model known, `target models` still probes and FAILs
+     when that machine's `pi` lists none, instead of skipping the item away.
+- **A4 (D7).** The missing-package fix is ONE merged
+  `{"subagents":{"agentOverrides":{…}}}` snippet (per-role arrays) plus a
+  `# where:` line naming the user and project settings files — two separate snippets
+  would overwrite each other on paste. `target origin` fixes use this checkout's real
+  url whenever it is known (only the parent-side "no origin anywhere" keeps `<url>`).
+- **A5 (D6).** The section gate is one exported predicate
+  (`crossMachineCheckupRequested`) used by both callers and tested; with cross-machine
+  unconfigured (`enabled` unset and no host entry) the registry is printed but no target
+  is probed, so a plain `/legion doctor` keeps its cost on machines that never used the
+  feature.
+- **A6 (D2, adjacent paths).** `resume` replays the caller's `cwd`/`hostCwd` into the
+  resolver, so the zero-config shape is resumable; a tree revive (which has no caller
+  parameters) still asks, and that is recorded as a boundary in the report.
+  `assertSharedOrigin` / `packagePathError` now set `noModelFallback` (a local git or a
+  missing package is deterministic — retrying the candidate chain re-runs the same
+  probes). Scoped package names (`@scope/name`) match `excludeExtensions` again, so the
+  D4 snippet works for them.
