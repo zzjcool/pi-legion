@@ -657,6 +657,14 @@ git）以前都写「改派 worker —— `subagent({ agent: "worker", host, tas
 
 ### 12.5 门禁与状态
 
-`npm run typecheck`、`npm test`、`npm run test:integration` 全绿（数字见第 11 节之后的下一次发布记录；
-本轮新增：预检/文案、模型回退 9 条、恢复 6 条 integration）。未发版 —— master 上以 `## [6.2.2]` 收口时
-再跑一次发版门禁与 tag。
+合并前在 `b0f832c`（= master `e9ed558` + 本轮四个提交 + 文档）上实跑：
+
+```text
+$ npm run typecheck                       → tsc --noEmit（退出 0）
+$ npm test                                → ℹ tests 2656 / pass 2655 / fail 0 / skipped 1
+$ npm run test:integration                → ℹ tests 179 / pass 179 / fail 0
+```
+
+本轮新增测试：预检/文案（`cross-machine-preflight`、`remote-worktree`、`cross-machine-orchestrator`）、
+模型回退 9 条（`xm-model-fallback`）、恢复 6 条 integration（`recover-cross-machine`）。
+未发版 —— master 上以 `## [Unreleased] — 6.2.2（patch）` 收口，何时 tag 由维护者定。
