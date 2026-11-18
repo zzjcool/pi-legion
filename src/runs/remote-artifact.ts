@@ -165,6 +165,99 @@ export function remoteSessionPathFor(target: HostTarget, record: { name: string;
 	return path.posix.join(dir, "session.jsonl");
 }
 
+/**
+ * What one machine says about a child's TERMINAL — the one fact a transcript
+ * cannot answer.
+ *
+ * A transcript says what the child wrote; it does not say whether the child is
+ * still writing. Recovery (`src/runs/remote-recover.ts`) needs the second fact
+ * before it may settle a ledger row: a live terminal means the work is still in
+ * flight over there, and a settled row would claim it finished.
+ */
+export interface RemoteTerminalProbe {
+	/** `host/terminal-name`, exactly as asked. */
+	address: string;
+	/** The core's word: `live` | `running` | `idle` | `finished` | `missing`. */
+	state: string;
+	/** The terminal is still doing work over there (see {@link assertRemoteResume}'s rule). */
+	live: boolean;
+	/**
+	 * Set when the machine could not be asked at all.
+	 *
+	 * Then nothing is claimed about the terminal — not `missing`, not `finished`:
+	 * `state` is `unknown` and the caller must not read this as "over".
+	 */
+	unreachable?: string;
+}
+
+export interface RemoteTerminalProbeRequest {
+	host: string;
+	name: string;
+	/** The address the record says the core holds (`host/name`). */
+	remoteTerminal?: string;
+}
+
+/**
+ * Ask that machine about one child's terminal, in one round trip.
+ *
+ * The address is used EXACTLY as recorded when there is one: the core may have
+ * shortened the name it was asked for, and asking about a name that never existed
+ * would report "the core does not know it" as a verdict (`remote-child-fate-v1`
+ * §3). With no recorded address the derived `host/lgl-…-name` is asked instead and
+ * a `missing` answer is a real answer about that inferred name.
+ *
+ * A `not_found` is a FACT (`state: "missing"`) — a core that never held the
+ * terminal is exactly the state after a restart. Every other failure is reported as
+ * `unreachable`, because a class invented from a failed call is worse than "could
+ * not ask".
+ *
+ * One client per CALL, closed in `finally` — same reasoning as the read-back: a
+ * recovery owns no lifecycle, so a cache would leak a socket per call.
+ */
+export function createRemoteTerminalProbe(opts: {
+	crossMachine: CrossMachineSettings | undefined;
+	clientFactory?: () => HcClient;
+}): (request: RemoteTerminalProbeRequest) => Promise<RemoteTerminalProbe> {
+	return async (request) => {
+		const recorded = typeof request.remoteTerminal === "string" && request.remoteTerminal.trim().length > 0
+			? request.remoteTerminal.trim()
+			: undefined;
+		let target: HostTarget;
+		try {
+			target = resolveHostTarget(request.host, opts.crossMachine);
+		} catch (error) {
+			return {
+				address: recorded ?? `${request.host}/${terminalName(undefined, request.name)}`,
+				state: "unknown",
+				live: false,
+				unreachable: error instanceof Error ? error.message : String(error),
+			};
+		}
+		const address = recorded ?? `${target.host}/${terminalName(undefined, request.name)}`;
+		const client = opts.clientFactory ? opts.clientFactory() : hcCliClient({ env: process.env });
+		try {
+			await client.start();
+			const facts = await client.request<{ state?: string }>("terminal.get", { terminal: address });
+			const state = typeof facts?.state === "string" ? facts.state : "unknown";
+			// The wire's word for "alive" is `live` on some replies and `running` on others
+			// (the fake core mirrors `hc`'s RunResult, which says `running`). Both mean the
+			// work is in flight; only `finished` means it is over.
+			return { address, state, live: state === "live" || state === "running" || state === "idle" };
+		} catch (error) {
+			const gone = error instanceof HcRpcError && /not.?found|unknown terminal/i.test(`${error.kind} ${error.message}`);
+			if (gone) return { address, state: "missing", live: false };
+			const detail = error instanceof HcRpcError ? `${error.kind}: ${error.message}` : error instanceof Error ? error.message : String(error);
+			return { address, state: "unknown", live: false, unreachable: detail };
+		} finally {
+			try {
+				client.close();
+			} catch {
+				/* closing a socket is not a verdict */
+			}
+		}
+	};
+}
+
 export interface RemoteSessionRequest {
 	host: string;
 	name: string;

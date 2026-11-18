@@ -442,6 +442,23 @@ export function transcriptNotRetrievedReason(host: string, detail: string): stri
 }
 
 /**
+ * The ledger status a TERMINAL execution settles into.
+ *
+ * One mapping for every settle path: `finishCollect` → `recordSettled` writes it
+ * for a child this process collected, and `recover` (`src/runs/remote-recover.ts`)
+ * writes it for a child a PREVIOUS process launched. A second copy of this ladder
+ * would let the same transcript settle as `failed` in one path and `retired` in the
+ * other, which is a ledger that contradicts itself rather than a rendering bug.
+ *
+ * `unknown` maps to `retired` by construction (it is neither a success nor a
+ * failure); callers that must not settle an ungraded child check the status BEFORE
+ * asking (recovery does: an unreadable transcript is never settled).
+ */
+export function settledStatusFor(execution: Pick<Execution, "status">): "settled" | "failed" | "retired" {
+	return execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
+}
+
+/**
  * The `  ⚠ <name>: <text>` lines one launch owes its caller.
  *
  * One definition for BOTH render paths — the immediate `▶` line in `launchStep`
@@ -536,7 +553,14 @@ function isApprovalRequest(request: PendingUIRequest): boolean {
 	return request.request.method === "confirm";
 }
 
-function deriveAcceptance(
+/**
+ * The acceptance ladder for one parsed turn — the SAME one `collect` uses.
+ *
+ * Exported for `src/runs/remote-recover.ts`: a recovered child is graded by the
+ * rules a collected one is, and a second implementation of "what does this
+ * transcript claim" is exactly the drift the recovery path must not introduce.
+ */
+export function deriveAcceptance(
 	parsed: ReturnType<typeof parseSessionFile>,
 	execution: Execution,
 	pendingCriteria: ChildRecord["pendingCriteria"],
@@ -1070,7 +1094,7 @@ export class Orchestrator {
 		const team = teamOverride ?? agent.extraFields?.team ?? this.team?.name;
 		const current = getNode(this.legion.db, child.nodeId);
 		const childRun = current?.runId ?? this.legion.runId ?? path.basename(this.runDir);
-		updateNode(this.legion.db, child.nodeId, { status: "running", runId: childRun, sessionFile: child.sessionFile, worktreePath: child.worktreePath ?? null, worktreeHost: child.worktreeHost ?? null, host: child.host ?? null, model: child.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, taskSummary: task.slice(0, 2_000) }, this.now);
+		updateNode(this.legion.db, child.nodeId, { status: "running", runId: childRun, sessionFile: child.sessionFile, worktreePath: child.worktreePath ?? null, worktreeHost: child.worktreeHost ?? null, host: child.host ?? null, remoteDir: child.remoteDir ?? null, remoteTerminal: child.remoteTerminal ?? null, model: child.model ?? null, team: team && team !== DEFAULT_TEAM ? team : null, taskSummary: task.slice(0, 2_000) }, this.now);
 		this.emitStored(child.nodeId, resumed ? "node_resumed" : "node_launched", { parentId: this.legion.nodeId, runId: childRun, sessionFile: child.sessionFile, role: agent.name, kind: agent.kind });
 	}
 
@@ -1085,7 +1109,7 @@ export class Orchestrator {
 			const current = getNode(this.legion.db, child.nodeId);
 			if (current?.status === "retired") return;
 		}
-		const status = execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
+		const status = settledStatusFor(execution);
 		const current = getNode(this.legion.db, child.nodeId);
 		if (!current || current.status === status) return;
 		// #372 m2: a VERDICT is not a pause. The safety net can fail a team while its
