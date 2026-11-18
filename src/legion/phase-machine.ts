@@ -563,7 +563,7 @@ export function validatePhaseMachine(machine: PhaseMachine): PhaseMachineError[]
 				path: `${path}.next`,
 				message: `terminal phase '${name}' must not declare transitions (it declares ${edges.map((rule) => `'${String(rule?.to)}'`).join(", ")})`,
 				category: "terminal",
-				fix: `keep \`terminal: true\` and remove \`next\` (a terminal phase may omit it), e.g. ${terminalMachineExample(name)}`,
+				fix: `keep \`terminal: true\` and remove \`next\` (a terminal phase may omit it), e.g. ${terminalMachineExample(name)} — or drop \`terminal: true\` if the walk really does continue past '${name}'`,
 			});
 		}
 		if (!selfTerminal && !malformedNext && edges.length === 0) {
