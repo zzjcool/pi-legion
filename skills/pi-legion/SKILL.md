@@ -1,6 +1,6 @@
 ---
 name: pi-legion
-description: "Use the subagent tool to delegate to a loaded role; use centurion for recursive squads and /legion to inspect the tree. Pi Legion v2 runs children in-process by default (rpc only for a worktree-owning centurion) and records their shared tree state in legion.db."
+description: "Use the subagent tool to delegate to a loaded role; use centurion for recursive squads and /legion to inspect the tree. Cross-machine dispatch adds host + cwd to the same call. Pi Legion v2 runs children in-process by default (rpc only for a worktree-owning centurion) and records their shared tree state in legion.db."
 ---
 
 # Pi Legion
@@ -34,6 +34,36 @@ ordinary roles should not be assumed to have that permission. Give every child
 a concrete task and acceptance criteria. Children communicate through the
 Legion tools, not by starting another runtime or editing the shared tree ledger
 directly.
+
+## Cross-machine dispatch
+
+The same `subagent` call crosses a machine by naming one: add `host` (exactly the
+name `hc machine ls` prints) plus the directory ON that machine. Nothing else
+changes — role, task, phases, `model` and `verify` are the local fields.
+
+```text
+subagent({ agent: "scout", host: "hw-nj", cwd: "/home/you/code/x", task: "<question list>" })
+subagent({ agent: "centurion", host: "hw-nj", cwd: "/home/you/code/x", task: "<goal + acceptance>" })
+```
+
+`cwd` is the ONE new required input: an absolute path read on the target machine
+(remote paths are never translated from this one). Take it from the conversation
+when it was already named; otherwise **ask the user** which directory on that
+machine to use. Never `ssh` or run `hc exec` to browse that machine looking for a
+checkout: a guessed path puts the child in the wrong tree. `hostCwd` says the
+same thing without ambiguity when `cwd` is already the local record directory
+(with `host`, an ABSOLUTE `cwd` is the remote side).
+
+Run `/legion doctor crossmachine` before the first launch. That one command
+prints PASS/FAIL for this checkout's git origin, the `hc machine ls` list, the
+target's checkout/origin/node/pi, every inherited extension package (with the
+`subagents.agentOverrides.<role>.excludeExtensions` JSON for anything missing
+there) and the target's model list — then a pasteable `subagent(...)` line.
+Manual walkthrough: `docs/runbooks/cross-machine-centurion-demo.md`.
+
+A remote child that dies at start-up answers with the exit code, the last screen
+text and a `Command (run on '<host>' to reproduce):` line — paste that command
+instead of guessing, and do not report `execution: unknown` as the reason.
 
 ## Legion visualization
 

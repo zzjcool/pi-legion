@@ -33,6 +33,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   每个 `FAIL` 带真值的 `fix:` 行，最后一行是可粘贴的 launch（真 host、真 cwd、真 phase machine）。`legion-doctor.ts`
   仍然同步、零探测：只渲染传进来的快照，`/legion doctor` 与 `subagent({action:"diagnose"})` **只在选中这一节时**才
   `await` 体检；没有快照时旧的静态块逐字节不变（`auto-doctor` 仍走它）。
+- **skill 终于写了这个能力（agent 的第一入口）**：6.2.0 的 `skills/pi-legion/SKILL.md` 对 `host`/`cwd` 零命中，
+  agent 因此不知道跨机存在。现在 description 多一句 `Cross-machine dispatch adds host + cwd to the same call`，
+  正文新增 `## Cross-machine dispatch`（最小调用、唯一必填的目标机目录、目录来源优先级、不知道就问用户、
+  禁止 `ssh`/`hc exec` 试探远端、`/legion doctor crossmachine` 与 runbook 的指路、远端 child 起不来时读退出码 +
+  screen 原文 + 可复现命令）。`files` 与 `npm pack` 都会带上它，`test/unit/skill-cross-machine.test.ts` 钉住
+  「删掉即红」与打包可见。
 - **换掉「先读三条命令」的开场（D9）**：`docs/runbooks/cross-machine-centurion-demo.md` 第 0 步就是
   `/legion doctor crossmachine`（一条命令 + PASS/FAIL 怎么读 + 它打印的可粘贴 launch），原来的手工三条检查降级为
   它下面的「手工兜底」；配置一节改成最小配置 `{"subagents":{"crossMachine":{"enabled":true}}}` + 按次 `cwd`

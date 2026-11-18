@@ -297,6 +297,29 @@ function schemaHarness() {
 	};
 }
 
+test("first-run D2/D4: the remote-directory fields lead with the remote meaning", async () => {
+	// Pitfall #4 of the 103-line session: `--help` truncates descriptions, so the
+	// one sentence that distinguishes `cwd` from `hostCwd` has to be FIRST, not
+	// after two sentences about the local record directory. Pinned here because a
+	// later re-ordering silently restores the trap.
+	const harness = schemaHarness();
+	try {
+		const params = harness.schema("subagent");
+		const hostCwd = params.properties?.hostCwd?.description ?? "";
+		const cwd = params.properties?.cwd?.description ?? "";
+		const stepHostCwd = params.properties?.tasks?.items?.properties?.hostCwd?.description ?? "";
+		assert.match(hostCwd, /^Directory ON the `host` machine/, "subagent.hostCwd leads with the remote meaning");
+		assert.match(cwd, /^With `host`: an ABSOLUTE `cwd` is the directory ON that machine/, "subagent.cwd leads with the host branch");
+		assert.match(cwd, /a RELATIVE `cwd` still names a directory on THIS machine/, "the relative spelling stays local");
+		assert.match(stepHostCwd, /^Directory ON the `host` machine/, "tasks[].hostCwd leads the same way");
+		// Both must name the field to prefer, or the two schemas contradict each other.
+		assert.match(hostCwd, /`cwd`/, "hostCwd explains its relation to cwd");
+		assert.match(cwd, /`hostCwd`/, "cwd points at the unambiguous spelling");
+	} finally {
+		await harness.cleanup();
+	}
+});
+
 test("D2: both launch-level `verify` fields say they are NOT the legion-verify fence", async () => {
 	const harness = schemaHarness();
 	try {

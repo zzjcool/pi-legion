@@ -1592,7 +1592,7 @@ function crossMachineSnapshot(): CrossMachineCheckup {
 					{
 						id: "inherited-extensions",
 						status: "fail",
-						line: "1 package(s) missing on fakebox: pi-sysmon(role 'centurion')",
+						line: "1 package(s) missing on fakebox: pi-sysmon (role 'centurion')",
 						fixes: [
 							"hc exec --on fakebox -- pi install npm:pi-sysmon",
 							'{"subagents":{"agentOverrides":{"centurion":{"excludeExtensions":["pi-sysmon"]}}}}',
@@ -1631,7 +1631,7 @@ test("D6/D8: a snapshot renders PASS/FAIL/SKIP with fixes and a launch, and a FA
 		// The host block: 2-space header, 4-space items.
 		assert.match(block, /^ {2}- fakebox:$/m);
 		assert.match(block, /^ {4}- PASS target checkout: \/srv\/app exists$/m);
-		assert.match(block, /^ {4}- FAIL inherited extensions: 1 package\(s\) missing on fakebox: pi-sysmon\(role 'centurion'\)$/m);
+		assert.match(block, /^ {4}- FAIL inherited extensions: 1 package\(s\) missing on fakebox: pi-sysmon \(role 'centurion'\)$/m);
 		assert.match(block, /^ {4}- SKIP target models: no model to check/m);
 		// Fixes are pasteable, in order, under the FAIL they belong to.
 		assert.match(block, /^ {10}fix: hc exec --on fakebox -- pi install npm:pi-sysmon$/m);

@@ -175,6 +175,7 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
 ## Cross-machine (host targets)
 - enabled: true
 - hosts: vps
+- last preflight: never
   - PASS parent checkout: /Users/me/app is a git checkout; origin https://github.com/acme/app.git
   - PASS hc machines: vps
   - vps:
@@ -184,10 +185,10 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
     - FAIL inherited extensions: 1 package(s) missing on vps: pi-sysmon (role 'centurion')
           fix: hc exec --on vps -- pi install npm:pi-sysmon
           fix: {"subagents":{"agentOverrides":{"centurion":{"excludeExtensions":["pi-sysmon"]}}}}
+          fix: # where: ~/.pi/agent/settings.json (user) or /Users/me/app/.pi/settings.json (project)
     - PASS target models: workbuddy/deepseek-v4.1-flash is in vps's listing (1 model(s))
-    - launch (copy-paste, real values):
-        subagent({ agent: "centurion", host: "vps", cwd: "/srv/app", worktree: true, task: "demo: report pwd and stop", phases: [{ id: "planning", next: [{ to: "implementing" }] }, { id: "implementing", next: [{ to: "done" }] }, { id: "done", terminal: true }] })
-- last preflight: never
+    - launch (copy-paste once the FAILs above are fixed):
+        subagent({ agent: "centurion", host: "vps", cwd: "/srv/app", model: "workbuddy/deepseek-v4.1-flash", worktree: true, task: "demo: report pwd and stop", phases: [{ id: "planning", next: [{ to: "implementing" }] }, { id: "implementing", next: [{ to: "done" }] }, { id: "done", terminal: true }] })
 ```
 
 ### B. 零配置、还不知道目录：它提问，四项 SKIP
@@ -206,9 +207,8 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
 ### C. 模型那台机器没有：FAIL 带两条 `fix:`
 
 ```text
-    - FAIL target models: acme/missing-model is not in vps's listing: workbuddy/deepseek-v4.1-flash
+    - FAIL target models: acme/missing-model is not in vps's listing: workbuddy/deepseek-v4.1-flash (the child runs with --no-extensions, so a provider installed there must also be named in hosts.vps.piExtensions)
           fix: use a model that machine serves, e.g. model: "workbuddy/deepseek-v4.1-flash" on the role card
-          fix: # aside: the child runs with --no-extensions, so a provider extension installed there must be named in subagents.crossMachine.hosts.vps.piExtensions (list them: hc exec --on vps -- /opt/node/bin/node /root/.pi/agent/install/releases/1.5.2/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js list)
 ```
 
 ### 每一项 ↔ 探的是什么 ↔ FAIL 的下一步
@@ -265,12 +265,53 @@ A/B/C 三个真样例、以及「手工兜底：三条命令」（旧的 `git re
 | model | role 卡或默认 | 同本地，但那台机器的 `pi` 必须真的提供 | 仍是必填（与本地相同）+ 目标机校验（`target models` 那行给出可替换的模型） |
 | git origin（交付通道） | 不需要 | 两侧归一化后必须相同（D10） | 自动发现；缺失/不同 → 原话点名两个 url 与 `set-url` / `add origin` |
 | pi 必须跑在 hc 终端里 | 不需要 | 需要（`HC_TERMINAL_SOCKET` + `HC_TERMINAL_ID`） | 仍是必填的**环境前提**（工具无法替你创造），错误原话说清怎么补 |
+| agent 怎么知道有这个能力 | 本来就是默认行为 | skill 的 description + 「跨机器派发」一节 | 自动（见第 6 节）：`host` + `cwd` 与「不知道就问用户」都写在 agent 每轮先读的地方 |
 
 **一句话结论：只有「目标机上的那个目录」是新增的必填输入**；其余要么是自动发现（host 准入、`node`/`pi`/包根、
 继承的扩展、两侧 origin），要么与本地**同一项**（role/task/phases/verify、model），要么是环境前提（pi 在 hc 终端里）——
 而唯一新增的那一项，不知道时工具**问**，不发配置讲义。
 
-## 6. 测试红绿证据
+## 6. 第一入口：skill 现在会告诉 agent 跨机派发存在
+
+这一条是「agent 不知道」的最上游原因。6.2.0 的 `skills/pi-legion/SKILL.md`（agent 每轮最先读到的清单项与正文）
+grep `cross-machine` / `host` / `跨机` **零命中**：agent 既不知道有这个能力，也不知道唯一必填的是目标机上的目录，
+所以只能翻源码或绕开工具。
+
+现在（`skills/pi-legion/SKILL.md`）：
+
+- **description** 多了一句 capability 声明：`Cross-machine dispatch adds host + cwd to the same call.`
+  —— agent 从描述里就能看出这个能力存在，不必读正文。
+- **正文新增 `## Cross-machine dispatch`**，六句话：同一套调用只多一个 `host`；最小例子
+  （`subagent({ agent: "scout", host: "hw-nj", cwd: "/home/you/code/x", task: "…" })`）；`cwd` 是唯一必填，
+  来源顺序是「对话里已提到的 → 问用户」；**明确禁止** `ssh` / `hc exec` 去远端找目录（猜出来的路径会让孩子
+  在错误的树里干活）；`/legion doctor crossmachine` 与 runbook 的指路；远端 child 起不来时的读法（退出码 +
+  screen 原文 + `Command (run on '<host>' to reproduce):`，不再把 `execution: unknown` 当原因）。
+- **打包可见**：`package.json` 的 `files` 已含 `skills/**/*`；`npm pack --dry-run` 的清单里有
+  `skills/pi-legion/SKILL.md`（8.6 kB）。测试 `test/unit/skill-cross-machine.test.ts` 四条断言把这两件事钉住：
+  删掉那一节或那句描述 → 立刻红（红/绿证据见下）；清单或 tarball 里没有这个文件 → 也红。
+
+```
+$ npm pack --dry-run 2>&1 | grep SKILL.md
+npm notice 8.6kB skills/pi-legion/SKILL.md
+
+$ node --experimental-strip-types --test test/unit/skill-cross-machine.test.ts
+✔ skill: the description advertises cross-machine dispatch (host + cwd)
+✔ skill: the body teaches the minimal call, the one required input, and the ask-don't-probe rule
+✔ skill: the shipped tarball contains it (the manifest globs actually cover the file)
+✔ skill: npm pack --dry-run really lists SKILL.md
+ℹ pass 4  ℹ fail 0
+```
+
+**红（把那一节与那句描述删掉，恢复后重跑）：**
+
+```text
+✖ skill: the description advertises cross-machine dispatch (host + cwd)
+✖ skill: the body teaches the minimal call, the one required input, and the ask-don't-probe rule
+ℹ tests 4  ℹ pass 2  ℹ fail 2
+# 恢复后：ℹ tests 4  ℹ pass 4  ℹ fail 0
+```
+
+## 7. 测试红绿证据
 
 ### 四个错误情形（D10）+ 四个体检情形
 
@@ -362,13 +403,13 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
 `npm test`（`node --experimental-strip-types --test test/unit/*.test.ts`）：
 
 ```text
-ℹ tests 2583
-ℹ pass 2582
+ℹ tests 2588
+ℹ pass 2587
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 1
 ℹ todo 0
-ℹ duration_ms 54313.043837
+ℹ duration_ms 53583.677113
 ```
 
 `npm run test:integration`（`… test/integration/*.test.ts`）：
@@ -385,7 +426,7 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
 
 三条命令的退出码都是 0。`test/unit/terminal-supervisor.test.ts` 未修改（D18 of `cross-machine-spawn-v1`）。
 
-## 7. 版本建议：`6.3.0`（minor）
+## 8. 版本建议：`6.3.0`（minor）
 
 - **为什么是 minor**：新增了一项**能力** —— `/legion doctor crossmachine` 从「配置回显」变成一次体检（一次 `hc` 连接、
   PASS/FAIL/SKIP、每项带真值的 `fix:`、末尾可粘贴的 launch）；同时新增了一条**零配置的 launch 路径**
@@ -395,16 +436,17 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
   静态 doctor 块逐字节保留给 `auto-doctor` 与无快照路径），没有数据迁移（settings 与磁盘缓存格式都没变）。
   唯一"行为变化"是**报错文案与它的时机**（D2 在任何 `machine.exec` 之前），而文案不是 API。
 
-## 8. 边界 / 未做
+## 9. 边界 / 未做
 
 - **D2 的提问不可能知道对话里从未提过的目录**：这是设计（它问），不是缺陷；它只保证「不猜、不翻译、不绕过」。
 - **`hc machine ls` 是按 `HC_SESSION` 的**：真实会话里注册的机器，在 `HC_SESSION=test-*` 里看不见（反之亦然）。
   所以体检里 `hc machines` 那行 FAIL 时，先确认你跑在哪个会话里（runbook 第 5 节）。
 - **体检的 host 上限是 5**：第 6 个起只给计数（`… N more host(s) not checked (cap 5)`）；缺包 8、模型 10 同理。
 - **`model-missing` 仍然放行候选链**：体检把「那台机器没有这个模型」作为 FAIL 报出来，但运行期的启动探测
-  仍旧允许模型候选链。`noModelFallback` 只钉在「机器事实」那几条上（`cwd` 缺失 `src/runs/remote.ts:714`/`:1731`、
-  交付预检 `src/runs/cross-machine-preflight.ts:208`、目标机不可达 `src/runs/remote.ts:2506`）；D4 的缺包与
-  `model-missing` 不在其列 —— 换模型重跑是合法的。
+  仍旧允许模型候选链。`noModelFallback` 钉在「机器事实」那几条上（`cwd` 缺失 `src/runs/remote.ts:714`/`:1731`、
+  交付预检 `src/runs/cross-machine-preflight.ts:208`、目标机不可达 `src/runs/remote.ts:2506`、**D4 的缺包**
+  与 D5 的四条交付拒绝 —— 它们都是确定性的，换模型重跑只会重复同样的探针）；`model-missing` 不在其列 ——
+  换模型重跑是合法的。
 - **D5 的「相对 `cwd`」只修父机那一侧**：`cwdIsRemote`（`index.ts:4887`）只把**绝对** `cwd` 当远端目录，所以
   `cwd: "../my-repo"` 修的是「父机 checkout」这一半；目标机上的目录仍要 `hosts.<h>.cwd` 或另一次绝对 `cwd`，
   否则就会收到 D2 的提问。D5 的文案是合同冻结的（不属本卡改动），runbook 第 4 节补了这一句说明。
@@ -414,6 +456,14 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
   那是历史报告（记录当时的行为），本卡不改写历史记录。
 - **坑 4 的另一半已在同一分支补上**：`index.ts` 三处 schema 描述（`cwd` / `hostCwd`）改成「带 `host` 时是那台机器上的
   目录、不从本机翻译」（提交 `254c788`，另一个 writer 的改动，不属本卡文件所有权）；本报告坑 4 只描述**报错侧**的变化。
-- **跟随项（未落库的改动）**：本工作树里还有一份未提交的体检改动（launch 行带上 `model:`、以及
-  `launchAfterFixes` 标签）。如果它落库，本文与 runbook 里的样例最后两行需要同步一行 —— 现在的样例是逐字抄
-  提交 `30b393f` 的渲染。
+- **resume 的两种形状不一样**：`subagent({ action: "resume", name, cwd })` 会把 `cwd`/`hostCwd` 回放给
+  解析器（零配置形态因此可恢复）；而「从树里 revive 一个已存在的节点」没有调用方参数，记录里也没存远端目录
+  （`ChildRecord` 没有这个字段），所以那条路仍会得到 D2 的提问 —— 这是**下一步**要补的记录字段，本卡不做。
+- **两个 launch 构造器**：无快照的静态块仍打 `minimal launch (copy-paste, built from this configuration)`
+  （不含 `cwd`，因为它只知道配置）；探测路径打 `launch (copy-paste …)`，带真 `cwd` 与真 `model`。两者措辞
+  有意不同：前者是配置的形状，后者是这一次真跑的命令。
+- **`<url>` 只剩一处**：本机 checkout 没有 origin 时，那个 url 没有任何来源可查（目标机那侧的 fix 已经用本
+  checkout 的真 url 填好了），体检里保留 `git -C <dir> remote add origin <url>  # the url both machines can reach`。
+- **对抗式 review 的六条修正已落库**：契约 `docs/contracts/first-run-success-v1.md` 的「Amendments」记录了
+  A1–A6（read-back 路径也提问 / D5 带 `hostCwd` / 体检的 `enabled:false` 与零机器档 / launch 标签与 model /
+  合并的 role JSON 与 `# where:` / 共享 section 门禁 + scoped 包名匹配）。

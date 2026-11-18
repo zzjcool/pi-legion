@@ -5,6 +5,9 @@
 > `docs/contracts/first-run-success-v1.md`（D1–D12）与 `CHANGELOG.md` 的 `## [Unreleased]`。
 > 配置键：`subagents.crossMachine`　前置：①父机与目标机都能被同一个 `hc` core 看见
 > ②**pi 本身跑在 hc 终端里**（`HC_TERMINAL_SOCKET` + `HC_TERMINAL_ID`，见第 2 节的「前置自检」）
+>
+> agent 侧的先验知识在 `skills/pi-legion/SKILL.md` 的 `## Cross-machine dispatch`：同一套 `subagent` 调用只多一个
+> `host` 和那台机器上的绝对 `cwd`，目录不知道就问用户（禁止 `ssh`/`hc exec` 试探远端文件系统）。
 
 这份是**给人照着演示**的：第 0 步一条命令体检，过了就只剩三步 —— 一个有 origin 的仓库、
 一份（几乎为零的）配置、一条 `subagent` 调用。
@@ -38,6 +41,7 @@
 ## Cross-machine (host targets)
 - enabled: true
 - hosts: vps
+- last preflight: never
   - PASS parent checkout: /Users/me/app is a git checkout; origin https://github.com/acme/app.git
   - PASS hc machines: vps
   - vps:
@@ -47,10 +51,10 @@
     - FAIL inherited extensions: 1 package(s) missing on vps: pi-sysmon (role 'centurion')
           fix: hc exec --on vps -- pi install npm:pi-sysmon
           fix: {"subagents":{"agentOverrides":{"centurion":{"excludeExtensions":["pi-sysmon"]}}}}
+          fix: # where: ~/.pi/agent/settings.json (user) or /Users/me/app/.pi/settings.json (project)
     - PASS target models: workbuddy/deepseek-v4.1-flash is in vps's listing (1 model(s))
-    - launch (copy-paste, real values):
-        subagent({ agent: "centurion", host: "vps", cwd: "/srv/app", worktree: true, task: "demo: report pwd and stop", phases: [{ id: "planning", next: [{ to: "implementing" }] }, { id: "implementing", next: [{ to: "done" }] }, { id: "done", terminal: true }] })
-- last preflight: never
+    - launch (copy-paste once the FAILs above are fixed):
+        subagent({ agent: "centurion", host: "vps", cwd: "/srv/app", model: "workbuddy/deepseek-v4.1-flash", worktree: true, task: "demo: report pwd and stop", phases: [{ id: "planning", next: [{ to: "implementing" }] }, { id: "implementing", next: [{ to: "done" }] }, { id: "done", terminal: true }] })
 ```
 
 （这一段取自真机渲染的样例；路径与主机名换成了本文的 `/Users/me/app`、`/srv/app`、`vps`，
@@ -59,13 +63,14 @@
 ### 一个 FAIL 长什么样（模型不在这台机器上）
 
 ```text
-    - FAIL target models: acme/missing-model is not in vps's listing: workbuddy/deepseek-v4.1-flash
+    - FAIL target models: acme/missing-model is not in vps's listing: workbuddy/deepseek-v4.1-flash (the child runs with --no-extensions, so a provider installed there must also be named in hosts.vps.piExtensions)
           fix: use a model that machine serves, e.g. model: "workbuddy/deepseek-v4.1-flash" on the role card
-          fix: # aside: the child runs with --no-extensions, so a provider extension installed there must be named in subagents.crossMachine.hosts.vps.piExtensions (list them: hc exec --on vps -- /opt/node/bin/node /root/.pi/agent/install/releases/1.5.2/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js list)
 ```
 
-`fix:` 行是可以直接粘的**命令**或**配置 JSON**，带的都是这一台机器的真值。两行通常意味着
-「二选一或按顺序做」：先按第一行改，第二行是同一件事的另一条路（或一个 aside）。
+`fix:` 行是可以直接粘的**命令**或**配置 JSON**，带的都是这一台机器的真值（唯一例外：本机 checkout
+没有 origin 时，那个 url 没人知道，用 `<url>` 明示）。多行通常意味着「二选一或按顺序做」：缺包时的
+`pi install` 与 `excludeExtensions` JSON 就是二选一（JSON 会合并成一条，多个角色不会互相覆盖），
+后面的 `# where:` 说明那份 JSON 写进哪个文件。
 
 ### 连目录都没有时：它提问，不猜
 
@@ -95,8 +100,11 @@
 | `FAIL target origin: …` | 那侧不是仓库 / 没有 origin / url 与这侧不同（原话把两个 url 都点名） | 粘 `fix:` 里的 `hc exec --on <h> -- git …` 那一行 |
 | `PASS target runtime: <node> vX and <cli.js> Y — the paths the child will use there` | 远端 `node` 与 `pi` 的真实路径与版本（就是 child 会用的那两个） | 不用动 |
 | `FAIL target runtime: …` | 目标机缺 node / 缺 pi / 这个包不在那儿 / `piCli` 是 shell 启动器 | 粘 `fix:`：装 node、`pi install npm:pi-legion`、或把 `piCli` 指到 `…/dist/bundle/cli.js` |
-| `FAIL inherited extensions: N package(s) missing on <h>: <pkg> (role '<role>')` | 继承来的包在那台机器上没装（D4） | 两行 `fix:` 任选一条：`hc exec --on <h> -- pi install npm:<pkg>`，或那条 `excludeExtensions` 的 settings JSON |
-| `FAIL target models: <model> is not in <h>'s listing: …` | 那台机器的 `pi --list-models` 里没有这个模型 | 两行 `fix:`：换成它列出来的模型，或把 provider 扩展写进 `subagents.crossMachine.hosts.<h>.piExtensions` |
+| `FAIL inherited extensions: N package(s) missing on <h>: <pkg> (role '<role>')` | 继承来的包在那台机器上没装（D4） | `fix:` 任选一条：`hc exec --on <h> -- pi install npm:<pkg>`，或那条 `excludeExtensions` 的 settings JSON（`# where:` 说了写进哪个文件） |
+| `FAIL target models: <model> is not in <h>'s listing: …` | 那台机器的 `pi --list-models` 里没有这个模型（行尾同时说明 `--no-extensions` 与 `piExtensions` 的关系） | 粘 `fix:`：换成它列出来的模型；如果模型本来就该由 provider 扩展提供，把它写进 `subagents.crossMachine.hosts.<h>.piExtensions` |
+| `FAIL hc machines: no machines are registered …` | 这个 hc core 一台机器都不认识，配置里也没有 host | 粘 `fix: hc machine add --name my-vps ssh://user@my-vps`，再 `hc machine ls` |
+| `FAIL hc machines: cross-machine launch is disabled (enabled = false), so nothing here was probed` | `subagents.crossMachine.enabled` 是 `false`（真 launch 会被拒） | 按 `fix:` 把它改成 `true`（同一个 settings 文件），再跑同一条命令 |
+| `SKIP hc machines: … cross-machine is not configured, so no target was probed` | `enabled` 没写、也没有 `hosts` 条目：注册表照打，但不去探目标机 | 想体检某一台就配 `{ "enabled": true }` 再跑 `/legion doctor crossmachine` |
 | `SKIP <项>: … not checked: <一句原因>` | 前面那条 FAIL 让这一项没法问（例如还没有目录） | 先修上面那条 FAIL，再跑同一条命令 |
 
 ### 手工兜底：三条命令（doctor 不方便跑时）

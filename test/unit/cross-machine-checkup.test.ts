@@ -148,12 +148,12 @@ const LOCAL_ORIGIN = "https://git.example.invalid/acme/app.git";
 const MODEL = "workbuddy/deepseek-v4.1-flash";
 
 /** A local git checkout with `origin` set (the parent D5 asks about). */
-function localRepo(origin: string | undefined = LOCAL_ORIGIN): { root: string; repo: string; cleanup: () => void } {
+function localRepo(origin: string | null = LOCAL_ORIGIN): { root: string; repo: string; cleanup: () => void } {
 	const root = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-unit-"));
 	const repo = path.join(root, "repo");
 	mkdirSync(repo, { recursive: true });
 	execFileSync("git", ["init", "--quiet", repo], { stdio: "ignore" });
-	if (origin !== undefined) execFileSync("git", ["-C", repo, "remote", "add", "origin", origin], { stdio: "ignore" });
+	if (origin !== null) execFileSync("git", ["-C", repo, "remote", "add", "origin", origin], { stdio: "ignore" });
 	return { root, repo, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -778,6 +778,57 @@ test("D7: an origin mismatch names both urls and the set-url command with the RE
 			origin.fixes?.some((fix) => fix.includes(`git -C ${REMOTE_CWD} remote set-url origin ${LOCAL_ORIGIN}`)),
 			`expected the real set-url command, got: ${JSON.stringify(origin.fixes)}`,
 		);
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+		repo.cleanup();
+	}
+});
+
+test("D7: a checkout without origin is a FAIL whose fix is the add-origin command (the ONLY `<url>` left)", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	const repo = localRepo(null);
+	try {
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [],
+			env,
+			client: healthyTarget(),
+		});
+		const parent = item(checkup.parent, "parent-checkout");
+		assert.equal(parent.status, "fail");
+		assert.match(parent.line, /is a git checkout but has no origin/);
+		assert.match(parent.fixes![0]!, new RegExp(`^git -C ${repo.repo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} remote add origin <url>`));
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+		repo.cleanup();
+	}
+});
+
+test("D7: the target has no origin — the fix uses THIS checkout's real url, not a metavariable", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	const repo = localRepo();
+	try {
+		const client = healthyTarget();
+		client.override(`git -C ${REMOTE_CWD} remote get-url origin`, () =>
+			execResult({ code: 1, stderr: base64("error: No such remote 'origin'\n") }),
+		);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [],
+			model: MODEL,
+			env,
+			client,
+		});
+		const origin = item(checkup.hosts[0]!.items, "target-origin");
+		assert.equal(origin.status, "fail");
+		assert.match(origin.line, new RegExp(`^${REMOTE_CWD} has no origin on ${HOST}$`));
+		assert.deepEqual(origin.fixes, [`hc exec --on ${HOST} -- git -C ${REMOTE_CWD} remote add origin ${LOCAL_ORIGIN}`]);
 	} finally {
 		rmSync(cache, { recursive: true, force: true });
 		repo.cleanup();

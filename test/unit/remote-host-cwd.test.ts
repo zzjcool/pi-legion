@@ -233,7 +233,7 @@ test("D1: exit 12 (no node) says install node there, and the settings key is the
 	assert.ok(error instanceof SubagentError);
 	assert.equal(error.code, ErrorCodes.START_FAILED, "the exit-code semantics are unchanged");
 	const message = error.message;
-	assert.match(message, /^host 'vps': node '\/opt\/node\/bin\/node' is not on PATH on vps — install node there, then retry\./);
+	assert.match(message, /^host 'vps': node '\/opt\/node\/bin\/node' is not on PATH on vps — install node there, then retry \(check it with: hc exec --on vps -- node --version\)\./);
 	assert.match(message, /subagents\.crossMachine\.hosts\.vps\.node/);
 	assert.ok(message.indexOf("install node there") < message.indexOf("subagents.crossMachine.hosts.vps.node"), "the action comes first");
 	assert.deepEqual(error.details, { host: HOST, node: "/opt/node/bin/node", code: 12 });

@@ -784,6 +784,31 @@ export function thisPackageRoot(): string {
 	return path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
 }
 
+let SELF_PACKAGE_NAME: string | undefined;
+
+/**
+ * This package's PUBLISHED name, read from its own manifest.
+ *
+ * The install advice (`pi install npm:<name>`) is copy-pasted by a reader, so the
+ * name has to be the real npm one — the repository's display name and the package
+ * name are not always the same string, and a hardcoded guess is a command that
+ * fails on the other machine. Read once; the manifest does not change at runtime.
+ */
+export function selfPackageName(): string {
+	if (SELF_PACKAGE_NAME !== undefined) return SELF_PACKAGE_NAME;
+	try {
+		const manifest = JSON.parse(fs.readFileSync(path.join(thisPackageRoot(), "package.json"), "utf8")) as { name?: unknown };
+		if (typeof manifest.name === "string" && manifest.name.trim().length > 0) {
+			SELF_PACKAGE_NAME = manifest.name.trim();
+			return SELF_PACKAGE_NAME;
+		}
+	} catch {
+		/* fall through to the import name */
+	}
+	SELF_PACKAGE_NAME = "pi-legion";
+	return SELF_PACKAGE_NAME;
+}
+
 /**
  * Validate and order `hosts.<name>.pathMap`: both sides absolute, longest local
  * prefix first so `/opt/pi-legion/ext` beats `/opt/pi-legion`, and a relative
@@ -2048,7 +2073,7 @@ export async function remotePreflight(
 		throw new SubagentError(
 			// D1: the action first (install it); the settings key appears once, as the
 			// fallback for an install that exists but is off that core's PATH.
-			`host '${target.host}': node '${target.node}' is not on PATH on ${target.host} — install node there, then retry. If it is installed but off that core's PATH, name it once in subagents.crossMachine.hosts.${target.host}.node.`,
+			`host '${target.host}': node '${target.node}' is not on PATH on ${target.host} — install node there, then retry (check it with: hc exec --on ${target.host} -- node --version). If it is installed but off that core's PATH, name it once in subagents.crossMachine.hosts.${target.host}.node.`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, node: target.node, code: 12 },
 		);
@@ -2057,7 +2082,7 @@ export async function remotePreflight(
 		throw new SubagentError(
 			// Same shape: `install pi there` is the instruction; the settings key is
 			// the fallback for a CLI that exists but is off that core's PATH.
-			`host '${target.host}': pi CLI '${target.piCli}' is not on PATH on ${target.host} — install pi there, then retry (and put this package on that machine too: hc exec --on ${target.host} -- pi install npm:pi-legion, same entry names are then mapped automatically). Only if an existing CLI is off that core's PATH, name it in subagents.crossMachine.hosts.${target.host}.piCli.`,
+			`host '${target.host}': pi CLI '${target.piCli}' is not on PATH on ${target.host} — install pi there, then retry (and put this package on that machine too: hc exec --on ${target.host} -- pi install npm:${selfPackageName()}, same entry names are then mapped automatically). Only if an existing CLI is off that core's PATH, name it in subagents.crossMachine.hosts.${target.host}.piCli.`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, piCli: target.piCli, code: 13 },
 		);
@@ -2081,7 +2106,7 @@ export async function remotePreflight(
 		throw new SubagentError(
 			// Two ways out, action first: install it there, or — when it IS installed
 			// but somewhere else — point piLegionRoot at that root.
-			`host '${target.host}': this package is not installed at ${target.piLegionRoot} on that machine — install this package there, then retry: hc exec --on ${target.host} -- pi install npm:pi-legion (every child's argv loads ${path.posix.join(target.piLegionRoot, "index.ts")}). If it is already installed somewhere else on that machine, put that root in subagents.crossMachine.hosts.${target.host}.piLegionRoot.`,
+			`host '${target.host}': this package is not installed at ${target.piLegionRoot} on that machine — install this package there, then retry: hc exec --on ${target.host} -- pi install npm:${selfPackageName()} (every child's argv loads ${path.posix.join(target.piLegionRoot, "index.ts")}). If it is already installed somewhere else on that machine, put that root in subagents.crossMachine.hosts.${target.host}.piLegionRoot.`,
 			ErrorCodes.INVALID_PARAMS,
 			{ host: target.host, piLegionRoot: target.piLegionRoot, code: 14 },
 		);
