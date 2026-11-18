@@ -1329,7 +1329,14 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		// would contradict its own Issues list. One line for both codes: the
 		// pasteable `fix:` under each FAIL is the action, and a settings key is only
 		// ever the aside (D1).
-		if (issues.some((i) => i.code.startsWith("CROSSMACHINE_"))) {
+		if (issues.some((i) => i.code === "CROSSMACHINE_UNRESOLVED")) {
+			// The static path (no snapshot) names the settings key because that is the
+			// only thing it can know; the probed path names the FAIL's own fix line.
+			steps.push(
+				"Cross-machine: fix the named `subagents.crossMachine.hosts.<host>` entry (an absolute `cwd` on that machine, `enabled: true`), then re-run `/legion doctor crossmachine`.",
+			);
+		}
+		if (issues.some((i) => i.code.startsWith("CROSSMACHINE_") && i.code !== "CROSSMACHINE_UNRESOLVED")) {
 			steps.push(
 				"Cross-machine: paste each FAIL's `fix:` line above (a command, or the settings JSON it prints), then re-run `/legion doctor crossmachine`.",
 			);
