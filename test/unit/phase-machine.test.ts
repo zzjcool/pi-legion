@@ -12,6 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
 	DEFAULT_PHASE_MACHINE,
+	normalizePhaseMachine,
 	validatePhaseMachine,
 	type PhaseMachine,
 } from "../../src/legion/phase-machine.ts";
@@ -187,7 +188,11 @@ test("#298: an invalid machine is rejected at load with every problem listed", (
 		],
 	};
 	const errors = validatePhaseMachine(broken);
-	assert.ok(errors.length >= 3, `expected several problems, got ${JSON.stringify(errors)}`);
+	// Pinned exactly (review m6): `>= 3` accepted a report that had grown or shrunk a
+	// line without anyone noticing. Five is the truth for this declaration — the
+	// duplicate id, the ghost edge, the zero-edge phase `a`, the zero-edge phase `b`,
+	// and `b` being unreachable.
+	assert.equal(errors.length, 5, `expected exactly five problems, got ${JSON.stringify(errors)}`);
 	const messages = errors.map((error) => `${error.path}: ${error.message}`).join("\n");
 	assert.match(messages, /duplicate phase id 'a'/);
 	assert.match(messages, /unknown target phase 'ghost'/);
@@ -320,7 +325,7 @@ test("# 坑1: a self-edge is a successor problem that names the phase and shows 
 	const [error] = self;
 	assert.ok(error, "expected a self-edge problem");
 	assert.equal(error.category, "successor");
-	assert.match(error.path, /next\[1\]\.to$/, "the path must name the exact edge");
+	assert.equal(error.path, "phases[1].next[1].to", "the path pins the exact edge, not any edge");
 	assert.match(error.message, /'implementing'/, "the message must name the phase");
 	assert.ok(error.fix, "every problem must say what to write instead");
 	assert.match(error.fix, /\{ id: "implementing"/, "the fix must carry a copy-pasteable example");
@@ -343,7 +348,13 @@ test("# 坑1: an unreachable phase is reported with the start phase in the messa
 	assert.match(unreachable[0]!.message, /'planning'/, "the message must name the start it is unreachable FROM");
 	assert.match(unreachable[0]!.path, /^phases\[\d+\]$/, "one namespace: the same phases[i] every other problem uses");
 	assert.ok(unreachable[0]!.fix, "an unreachable phase needs a fix with a legal edge");
-	assert.match(unreachable[0]!.fix!, /\{ id: "planning"/);
+	// Review m3: a NEUTRAL, executable sentence. Normalization injects `failed` and
+	// `aborted` into every non-terminal phase, so "add an edge or delete it" pointed the
+	// author at a phase they never wrote; this wording works for a real orphan too.
+	assert.equal(
+		unreachable[0]!.fix,
+		"declare an edge that reaches 'orphan' from a phase the team can be in, or rename 'orphan' if it was a typo",
+	);
 });
 
 test("# 坑1: several problems come back at once, grouped by category in a fixed order", () => {
@@ -359,7 +370,8 @@ test("# 坑1: several problems come back at once, grouped by category in a fixed
 	};
 	const errors = validatePhaseMachine(machine);
 	const categories = new Set(errors.map((error) => error.category));
-	assert.ok(errors.length >= 3, `expected several problems, got ${JSON.stringify(errors)}`);
+	// Pinned exactly (review m6): one terminal, one successor, one unreachable.
+	assert.equal(errors.length, 3, `expected exactly three problems, got ${JSON.stringify(errors)}`);
 	for (const expected of ["terminal", "successor", "unreachable"] as const) {
 		assert.ok(categories.has(expected), `expected a '${expected}' problem, got ${[...categories].join(", ")}`);
 	}
@@ -431,4 +443,160 @@ test("# 坑1: a non-terminal phase that omits next is told both ways out", () =>
 	assert.ok(terminal[0]!.fix, "the author must be told what to write");
 	assert.match(terminal[0]!.fix!, /add a transition/, "one way out: give the phase an edge");
 	assert.match(terminal[0]!.fix!, /terminal: true/, "the other way out: end the walk there");
+});
+
+// ---------------------------------------------------------------------------
+// Review M1 — a `require` that is not a list, and shapes that are not objects
+//
+// The measured failures: `require: 5` threw `TypeError: number 5 is not iterable`
+// out of the VALIDATOR (the one function that must never throw), and the card-shaped
+// `require: "children_settled"` was iterated CHARACTER BY CHARACTER, producing one
+// `unknown condition 'c'/'h'/…` line per letter — sixteen problems for one missing
+// pair of brackets. Every one of these is now ONE `structure` problem carrying the
+// correct spelling, and normalization closes the `next` hole on every branch.
+// ---------------------------------------------------------------------------
+
+test("# 坑1/M1: a phase-level require that is not a list is ONE structure problem with the fix", () => {
+	for (const [label, requireValue, got] of [
+		["number", 5, /got number \(5\)/],
+		["string", "children_settled", /got a string \("children_settled"\)/],
+	] as const) {
+		const errors = validatePhaseMachine({
+			start: "a",
+			phases: [
+				{ id: "a", require: requireValue, next: [{ to: "done" }] },
+				{ id: "done", terminal: true, next: [] },
+			],
+		} as unknown as PhaseMachine);
+		assert.equal(errors.length, 1, `${label}: exactly one problem — got ${JSON.stringify(errors)}`);
+		const [error] = errors;
+		assert.equal(error!.category, "structure");
+		assert.equal(error!.path, "phases[0].require", "the path names the field, not a character of it");
+		assert.match(error!.message, /require on phase 'a' must be a list of conditions/);
+		assert.match(error!.message, got, "the message quotes what was actually written");
+		assert.match(error!.fix!, /require: \["children_settled"\]/, "the fix spells the correct shape");
+	}
+});
+
+test("# 坑1/M1: an edge-level require is read the same way, and non-string entries never throw", () => {
+	const notList = validatePhaseMachine({
+		start: "a",
+		phases: [
+			{ id: "a", next: [{ to: "done", require: 5 }] },
+			{ id: "done", terminal: true, next: [] },
+		],
+	} as unknown as PhaseMachine);
+	assert.equal(notList.length, 1, JSON.stringify(notList));
+	assert.equal(notList[0]!.category, "structure");
+	assert.equal(notList[0]!.path, "phases[0].next[0].require");
+	assert.match(notList[0]!.message, /on the 'a' → 'done' edge/, "the message names both ends of the edge");
+	assert.match(notList[0]!.fix!, /\{ to: "done", require: \["children_settled"\] \}/);
+
+	// A non-STRING element inside a real list: the closed vocabulary cannot name it,
+	// and one line per FIELD is the budget (the `unknown condition '<value>'` shape is
+	// kept — only the per-character explosion is gone).
+	const badEntries = validatePhaseMachine({
+		start: "a",
+		phases: [
+			{ id: "a", next: [{ to: "done", require: [5, 7] }] },
+			{ id: "done", terminal: true, next: [] },
+		],
+	} as unknown as PhaseMachine);
+	assert.equal(badEntries.length, 1, JSON.stringify(badEntries));
+	assert.equal(badEntries[0]!.category, "structure");
+	assert.equal(badEntries[0]!.path, "phases[0].next[0].require");
+	assert.match(badEntries[0]!.message, /unknown condition '5'/);
+});
+
+test("# 坑1/M1: a next entry, an edge target and a phase that are not objects stay structure problems", () => {
+	// `next: [5]` — an element that is not a rule.
+	const bareRule = validatePhaseMachine({
+		start: "a",
+		phases: [
+			{ id: "a", next: [5] },
+			{ id: "done", terminal: true, next: [] },
+		],
+	} as unknown as PhaseMachine);
+	assert.equal(bareRule.length, 1, JSON.stringify(bareRule));
+	assert.equal(bareRule[0]!.category, "structure");
+	assert.equal(bareRule[0]!.path, "phases[0].next[0]");
+
+	// `rule.to` is not a string.
+	const badTarget = validatePhaseMachine({
+		start: "a",
+		phases: [
+			{ id: "a", next: [{ to: 5 }] },
+			{ id: "done", terminal: true, next: [] },
+		],
+	} as unknown as PhaseMachine);
+	assert.equal(badTarget.length, 1, JSON.stringify(badTarget));
+	assert.equal(badTarget[0]!.category, "structure");
+	assert.equal(badTarget[0]!.path, "phases[0].next[0].to");
+
+	// A phase that is `null`: the `id` problem is the ONE thing to fix, and no edge or
+	// terminal verdict is invented on top of it.
+	const nullPhase = validatePhaseMachine({
+		start: "a",
+		phases: [null, { id: "a", next: [{ to: "done" }] }, { id: "done", terminal: true, next: [] }],
+	} as unknown as PhaseMachine);
+	assert.equal(nullPhase.length, 1, JSON.stringify(nullPhase));
+	assert.equal(nullPhase[0]!.category, "structure");
+	assert.equal(nullPhase[0]!.path, "phases[0].id");
+});
+
+test("# 坑1/M1: normalization makes `next` a list on every branch, the already-declared one included", () => {
+	const declared = {
+		start: "planning",
+		phases: [
+			{ id: "planning", next: [{ to: "done" }] },
+			{ id: "done", terminal: true },
+			{ id: "failed", terminal: true },
+			{ id: "aborted", terminal: true },
+		],
+	} as unknown as PhaseMachine;
+	// All three universal terminals are already declared, so nothing is injected — the
+	// branch that used to `return machine` untouched, leaving `next` ABSENT on `done`.
+	// `state-machine.ts`, `extension/legion-tools.ts` and `tui/tree-view.ts` read
+	// `phase.next` directly, so the omission must not survive normalization.
+	const normalized = normalizePhaseMachine(declared);
+	assert.deepEqual(
+		normalized.phases.map((phase) => phase.id),
+		["planning", "done", "failed", "aborted"],
+		"nothing was injected: the four declared phases are the machine",
+	);
+	for (const phase of normalized.phases) {
+		assert.ok(Array.isArray(phase.next), `phase '${phase.id}' must carry a next list`);
+	}
+	assert.deepEqual(normalized.phases[1]!.next, [], "the omission became an explicit empty list");
+	assert.deepEqual(
+		normalized.phases[0]!.next.map((rule) => rule.to),
+		["done"],
+		"the author's own edges are untouched",
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Review m2 — one problem per phase, not two that contradict each other
+// ---------------------------------------------------------------------------
+
+test("# 坑1/m2: a zero-edge start reports the terminal problem only, and `start … is terminal` needs terminal: true", () => {
+	// The contradiction: `[terminal] phase 'a' is not terminal and declares no
+	// transitions` immediately followed by `[structure] start phase 'a' is terminal`.
+	// The second line read as "…but you said it was terminal", which is exactly what
+	// the author had NOT said. A zero-edge phase belongs to the `terminal` category;
+	// the start rule now speaks only about an EXPLICIT `terminal: true`.
+	const zeroEdgeStart = validatePhaseMachine({ start: "a", phases: [{ id: "a" }] } as unknown as PhaseMachine);
+	assert.equal(zeroEdgeStart.length, 1, JSON.stringify(zeroEdgeStart));
+	assert.equal(zeroEdgeStart[0]!.category, "terminal");
+	assert.equal(zeroEdgeStart[0]!.path, "phases[0].next");
+
+	// …and a start that really is declared terminal is still caught.
+	const declaredTerminalStart = validatePhaseMachine({
+		start: "a",
+		phases: [{ id: "a", terminal: true }, { id: "b", next: [{ to: "b2" }] }],
+	} as unknown as PhaseMachine);
+	const startProblem = declaredTerminalStart.find((error) => error.path === "start");
+	assert.ok(startProblem, `expected a start problem, got ${JSON.stringify(declaredTerminalStart)}`);
+	assert.equal(startProblem.category, "structure");
+	assert.match(startProblem.message, /start phase 'a' is terminal/);
 });

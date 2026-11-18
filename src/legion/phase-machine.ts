@@ -367,8 +367,6 @@ export function normalizePhaseMachine(machine: PhaseMachine): PhaseMachine {
 	const declaredPhases: PhaseDefinition[] = Array.isArray(machine?.phases) ? machine.phases : [];
 	const declared = new Set(declaredPhases.map((phase) => phase?.id));
 	const missing = (["done", "failed", "aborted"] as const).filter((id) => !declared.has(id));
-	if (missing.length === 0) return machine;
-	const injected: PhaseDefinition[] = missing.map((id) => ({ id, terminal: true, next: [] }));
 	const phases = declaredPhases.map((phase) => {
 		// #坑1: every read of `next` goes through `declaredEdges`/`terminalShaped`. A
 		// machine is data from a card or from a model's tool call, so `.length` on a
@@ -390,6 +388,13 @@ export function normalizePhaseMachine(machine: PhaseMachine): PhaseMachine {
 		const extra = missing.filter((id) => !existing.has(id)).map((to) => ({ to, injected: true as const }));
 		return extra.length > 0 ? { ...phase, next: [...edges, ...extra] } : phase;
 	});
+	// #坑1: even when all three universal terminals are ALREADY declared, the copied
+	// list is what gets returned. Returning `machine` itself here left `next` as the
+	// author wrote it — absent on a terminal phase — and `state-machine.ts`,
+	// `extension/legion-tools.ts` and `tui/tree-view.ts` read `phase.next` directly.
+	// The omission is therefore closed for EVERY branch, not only the injecting one.
+	if (missing.length === 0) return { ...machine, phases };
+	const injected: PhaseDefinition[] = missing.map((id) => ({ id, terminal: true, next: [] }));
 	return { ...machine, phases: [...phases, ...injected] };
 }
 
@@ -448,6 +453,36 @@ function describeValue(value: unknown): string {
 	if (typeof value === "string") return `a string (${JSON.stringify(value)})`;
 	if (typeof value === "object") return "an object";
 	return `${typeof value} (${JSON.stringify(value)})`;
+}
+
+/**
+ * ONE reading of a `require` field (#坑1, review M1).
+ *
+ * `require` is the field an author is most likely to write as a bare value:
+ * `require: "children_settled"` iterates CHARACTER BY CHARACTER (sixteen
+ * "unknown condition 'c'/'h'/…" lines for one typo), and `require: 5` used to
+ * throw `TypeError: number 5 is not iterable` straight out of the validator — the
+ * one thing a validator must never do. Both are now one `structure` problem.
+ *
+ * A non-list is reported by the caller (the path and the phase/edge differ), so
+ * this only answers "is it a list" and "what is in it".
+ */
+function declaredConditions(value: unknown): { list: unknown[]; isList: boolean } {
+	if (value === undefined) return { list: [], isList: true };
+	if (!Array.isArray(value)) return { list: [], isList: false };
+	return { list: value, isList: true };
+}
+
+/**
+ * The invalid elements of one `require` list, as ONE sentence.
+ *
+ * Several bad entries still make one problem per field: the author has one typo to
+ * find, and repeating the closed vocabulary per element is the noise this report
+ * exists to remove. The shape (`unknown condition '<value>'`) is unchanged.
+ */
+function conditionProblem(invalid: unknown[]): string {
+	const extra = invalid.length > 1 ? ` (+${invalid.length - 1} more)` : "";
+	return `unknown condition '${String(invalid[0])}'${extra}`;
 }
 
 /** The smallest legal machine; the fallback example when no phase-specific one fits. */
@@ -528,11 +563,22 @@ export function validatePhaseMachine(machine: PhaseMachine): PhaseMachineError[]
 			continue;
 		}
 		ids.set(phase.id, phase);
-		for (const condition of phase.require ?? []) {
-			if (!isPhaseCondition(condition)) {
+		// #坑1 / M1: `require` is read through `declaredConditions`, so a bare string or a
+		// number is ONE problem naming this phase — never sixteen, and never a TypeError.
+		const phaseRequire = declaredConditions(phase.require);
+		if (!phaseRequire.isList) {
+			errors.push({
+				path: `${path}.require`,
+				message: `require on phase '${phase.id}' must be a list of conditions (got ${describeValue(phase.require)})`,
+				category: "structure",
+				fix: `write them as a list, e.g. { id: ${JSON.stringify(phase.id)}, require: ["children_settled"], next: [...] }`,
+			});
+		} else {
+			const invalid = phaseRequire.list.filter((condition) => !isPhaseCondition(condition));
+			if (invalid.length > 0) {
 				errors.push({
 					path: `${path}.require`,
-					message: `unknown condition '${String(condition)}' on phase '${phase.id}'`,
+					message: `${conditionProblem(invalid)} on phase '${phase.id}'`,
 					category: "structure",
 					fix: `use one of the closed vocabulary (${conditions}), e.g. { id: ${JSON.stringify(phase.id)}, require: ["children_settled"], next: [...] }`,
 				});
@@ -554,6 +600,11 @@ export function validatePhaseMachine(machine: PhaseMachine): PhaseMachineError[]
 	// Second pass: edges need every id resolved, and the terminal set known.
 	for (const [index, phase] of phases.entries()) {
 		const path = `phases[${index}]`;
+		// M1: an entry that is not an object (`null`, a number) already failed the `id`
+		// check above. Edge and terminal verdicts about it would be second and third
+		// complaints on top of that one problem — and this is the pass that would crash
+		// on `.next`/`.terminal` if the readers below were not defensive.
+		if (!phase || typeof phase !== "object") continue;
 		const name = typeof phase?.id === "string" && phase.id.trim() ? phase.id : `(phase #${index})`;
 		const edges = declaredEdges(phase);
 		const selfTerminal = phase?.terminal === true;
@@ -613,11 +664,22 @@ export function validatePhaseMachine(machine: PhaseMachine): PhaseMachineError[]
 					fix: `point that edge at a different phase, e.g. { id: ${JSON.stringify(name)}, next: [{ to: "done" }] } — a phase cannot be its own successor`,
 				});
 			}
-			for (const condition of rule.require ?? []) {
-				if (!isPhaseCondition(condition)) {
+			// Same reading as the phase-level field: a bare string here used to produce one
+			// problem per character, a number a TypeError (M1).
+			const edgeRequire = declaredConditions(rule.require);
+			if (!edgeRequire.isList) {
+				errors.push({
+					path: `${rulePath}.require`,
+					message: `require on the '${name}' → '${to}' edge must be a list of conditions (got ${describeValue(rule.require)})`,
+					category: "structure",
+					fix: `write them as a list, e.g. { to: ${JSON.stringify(to)}, require: ["children_settled"] }`,
+				});
+			} else {
+				const invalid = edgeRequire.list.filter((condition) => !isPhaseCondition(condition));
+				if (invalid.length > 0) {
 					errors.push({
 						path: `${rulePath}.require`,
-						message: `unknown condition '${String(condition)}' on the '${name}' → '${to}' edge`,
+						message: `${conditionProblem(invalid)} on the '${name}' → '${to}' edge`,
 						category: "structure",
 						fix: `use one of the closed vocabulary (${conditions}), e.g. { to: ${JSON.stringify(to)}, require: ["children_settled"] }`,
 					});
@@ -648,7 +710,11 @@ export function validatePhaseMachine(machine: PhaseMachine): PhaseMachineError[]
 			category: "structure",
 			fix: `set start to one of the declared phases (declared: ${[...ids.keys()].map((id) => `'${id}'`).join(", ")}), e.g. start: "${[...ids.keys()][0]}"`,
 		});
-	} else if (terminalShaped(startPhase)) {
+	} else if (startPhase?.terminal === true) {
+		// Review m2: only an EXPLICIT `terminal: true` is reported here. A phase that
+		// merely declares no edges is terminal-SHAPED, and it is already reported once by
+		// the `terminal` category ("is not terminal and declares no transitions"); two
+		// lines saying different things about one phase is the confusion #坑1 removed.
 		errors.push({
 			path: "start",
 			message: `start phase '${start}' is terminal, so the team could never progress`,
@@ -716,7 +782,11 @@ export function validatePhaseMachine(machine: PhaseMachine): PhaseMachineError[]
 				path: `phases[${index}]`,
 				message: `phase '${id}' is unreachable from the start phase '${start}' because no declared edge leads to it`,
 				category: "unreachable",
-				fix: `add an edge to it from a reachable phase, e.g. { id: ${JSON.stringify(start)}, next: [{ to: ${JSON.stringify(id)} }] } — or delete the phase if it was a leftover`,
+				// Review m3: a neutral, executable sentence. Normalization injects `failed` and
+				// `aborted` into every non-terminal phase, so "add an edge or delete it" told the
+				// author to edit a phase THEY never wrote; naming the id and the two real
+				// repairs works for a genuine orphan and for an injected terminal alike.
+				fix: `declare an edge that reaches '${id}' from a phase the team can be in, or rename '${id}' if it was a typo`,
 			});
 		}
 	}
