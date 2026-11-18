@@ -132,17 +132,36 @@ export function resolvePackagePathOnHost(
 	};
 }
 
-/** The refusal for a package path that exists here but not in the same shape there. */
-function packagePathError(host: string, file: string, resolution: PackagePathResolution): SubagentError {
+/**
+ * The refusal for a package path that exists here but not in the same shape there.
+ *
+ * D4: the MISSING-package refusal carries the fix, not a lesson, and it names the
+ * concrete role the fix is written for: `mapRemoteArgv(..., { role })` is fed by
+ * `terminal-supervisor` from `input.agent.name`, because the key that keeps an
+ * extension on THIS machine only is a key PER ROLE. Without it the reader has to
+ * open `src/runs/extension-inheritance.ts`, which is the failure D4 removes.
+ */
+function packagePathError(
+	host: string,
+	file: string,
+	resolution: PackagePathResolution,
+	role?: string,
+): SubagentError {
 	if (resolution.ok) throw new Error("packagePathError called with a successful resolution");
 	const name = resolution.packageName ?? path.basename(file);
 	const settingsPath = `subagents.crossMachine.hosts.${host}.pathMap`;
 	const fix = `Install '${name}' on '${host}' (same entry names are then mapped automatically), or add an explicit prefix to ${settingsPath}, or stop inheriting the parent's extensions (PI_LEGION_CHILD_INHERIT_EXTENSIONS=0 / inheritExtensions: false on the card).`;
+	const roleName = typeof role === "string" ? role.trim() : "";
 	if (resolution.reason === "not-installed") {
+		// D4's frozen shape: install it there, or keep it here for ONE concrete role
+		// with the settings JSON this reader would otherwise have to look up.
+		const keepHere = roleName.length > 0
+			? `keep it on this machine only, for role '${roleName}': subagents.agentOverrides.${roleName}.excludeExtensions — {"subagents":{"agentOverrides":{"${roleName}":{"excludeExtensions":["${name}"]}}}}`
+			: "keep it on this machine only, for the role you launch: subagents.agentOverrides.<role>.excludeExtensions";
 		return new SubagentError(
-			`host '${host}': the extension '${file}' belongs to package '${name}', which is not installed on that machine (the launch would have silently dropped it). ${fix}`,
+			`host '${host}': the extension '${file}' belongs to package '${name}', which is not installed on that machine (the launch would have silently dropped it). Two ways out: 1) install it there — hc exec --on ${host} -- pi install npm:${name} (same entry names are then mapped automatically); 2) ${keepHere}`,
 			ErrorCodes.INVALID_PARAMS,
-			{ host, extension: file, package: name, reason: resolution.reason },
+			{ host, extension: file, package: name, reason: resolution.reason, ...(roleName.length > 0 ? { role: roleName } : {}) },
 		);
 	}
 	const declared = resolution.declared ?? [];
@@ -166,6 +185,8 @@ export function mapRemoteArgv(
 		localCwd: string;
 		pathMap?: readonly HostPathMapEntry[];
 		packages?: HostPackageIndex;
+		/** The role being launched; only the D4 refusal reads it. */
+		role?: string;
 	},
 ): string[] {
 	return args.map((arg) => mapRemoteArgPath({ arg, ...opts }));
@@ -234,8 +255,10 @@ export function mapRemoteArgPath(opts: {
 	pathMap?: readonly HostPathMapEntry[];
 	/** Packages installed on the target; enables re-rooting by package name (v1.2). */
 	packages?: HostPackageIndex;
+	/** The role being launched; the missing-package refusal names it (D4). */
+	role?: string;
 }): string {
-	const { arg, host, remoteCwd, remoteDir, localCwd, pathMap = [] } = opts;
+	const { arg, host, remoteCwd, remoteDir, localCwd, pathMap = [], role } = opts;
 	if (!path.isAbsolute(arg)) return arg;
 	if (isInsidePosix(remoteDir, arg)) return arg;
 	for (const entry of pathMap) {
@@ -254,7 +277,7 @@ export function mapRemoteArgPath(opts: {
 	// whole branch exists to remove.
 	const byPackage = resolvePackagePathOnHost(arg, opts.packages);
 	if (byPackage.ok) return byPackage.path;
-	if (byPackage.reason !== "no-package") throw packagePathError(host, arg, byPackage);
+	if (byPackage.reason !== "no-package") throw packagePathError(host, arg, byPackage, role);
 	throw new SubagentError(
 		`host '${host}': argv references '${arg}', which is neither in this checkout nor under a configured pathMap entry, so it cannot be mapped to that machine (add { "${arg.split(path.sep).slice(0, 2).join(path.sep)}": "/abs/path/on/${host}" } to subagents.crossMachine.hosts.${host}.pathMap, or drop the flag)`,
 		ErrorCodes.INVALID_PARAMS,
@@ -608,6 +631,25 @@ export interface HostTargetOverrides {
 	mentionPerCallCwd?: boolean;
 }
 
+/**
+ * D2: a launch that did not name the directory on THAT machine is a QUESTION.
+ *
+ * The one thing a caller cannot get from anywhere else is which directory on the
+ * other machine the child should work in — it is not in `hc machine ls`, it is
+ * not derivable from this machine's cwd (remote paths are never translated), and
+ * a guess lands the child in the wrong tree, where it edits the wrong files and
+ * reports success. So the tool asks, in one message: what the missing input is,
+ * the exact call that passes it, whose answer it is when this conversation has
+ * not named one, and the one workaround that must NOT be attempted.
+ *
+ * Produced in exactly two places — `resolveHostTarget`'s per-call-cwd branch and
+ * the async resolver's refusal BEFORE discovery starts — so a launch can never
+ * grow a second, drifting version of this sentence.
+ */
+export function missingRemoteCwdQuestion(host: string): string {
+	return `host '${host}' needs a directory on that machine, and this call did not name one — which directory should the child work in? Pass it with the call: subagent({ agent: "centurion", host: "${host}", cwd: "/abs/path/on/${host}", task: "..." }) (that path is read ON ${host}; it is never translated from here). If this conversation has not named a directory on ${host}, ask the user which one to use. Do not ssh or run \`hc exec\` to browse that machine — a guess here becomes a child in the wrong tree.`;
+}
+
 export function resolveHostTarget(
 	host: string,
 	config: SubagentsSettings["crossMachine"] | undefined,
@@ -665,10 +707,12 @@ export function resolveHostTarget(
 		// old sentence, untouched.
 		throw new SubagentError(
 			overrides.mentionPerCallCwd === true
-				? `host '${name}' has no cwd: set a default in subagents.crossMachine.hosts.${name}.cwd, or pass one per call with subagent({ host: "${name}", cwd: "/abs/path/on/${name}" })`
+				? missingRemoteCwdQuestion(name)
 				: `host '${name}' needs an absolute cwd in subagents.crossMachine.hosts.${name}.cwd (remote paths are not translated from this machine)`,
 			ErrorCodes.INVALID_PARAMS,
-			{ host: name, cwd: "" },
+			overrides.mentionPerCallCwd === true
+				? { host: name, cwd: "", reason: "cwd-missing", noModelFallback: true }
+				: { host: name, cwd: "" },
 		);
 	}
 	if (!path.posix.isAbsolute(cwd)) {
@@ -1661,10 +1705,14 @@ export async function resolveHostTargetAsync(
 		}
 	}
 	if (entry === undefined) {
+		// D1's shape: the ACTION first (one pasteable command), the diagnosis second,
+		// and the settings key once as an aside. `machine.list` did not answer, so
+		// nothing has confirmed this machine exists — and running the child here
+		// instead is exactly the substitution the operator did not ask for.
 		throw new SubagentError(
-			`host '${name}' has no entry in subagents.crossMachine.hosts and this hc core did not answer \`machine list\` (add { "cwd": "/abs/path/on/${name}" }, or register the machine with \`hc machine add --name ${name} …\`)`,
+			`host '${name}': register the machine, then retry — hc machine add --name ${name} ssh://user@that-machine. Nothing has confirmed it exists yet: this hc core did not answer \`machine list\`, and there is no entry in subagents.crossMachine.hosts for '${name}' either (an entry like { "cwd": "/abs/path/on/${name}" } works too). Legion will not run the child on this machine instead.`,
 			ErrorCodes.INVALID_PARAMS,
-			{ host: name },
+			{ host: name, reason: "host-unconfirmed" },
 		);
 	}
 	// 2. cwd is decided BEFORE the probe, so a missing cwd is a cwd error and not
@@ -1672,6 +1720,18 @@ export async function resolveHostTargetAsync(
 	const overrideCwd = typeof request.cwd === "string" ? request.cwd.trim() : "";
 	const configuredCwd = typeof entry.cwd === "string" ? entry.cwd.trim() : "";
 	const cwd = overrideCwd.length > 0 ? overrideCwd : configuredCwd;
+	// D2: the directory on THAT machine is the one input nothing can discover, so
+	// it is asked as a question — here, after admission (`machine.list` is one
+	// round trip and is allowed) and BEFORE `discoverHost`, so a launch that
+	// cannot name its directory costs zero `machine.exec`, no `test -d`, no
+	// `--list-models`, and never a guess.
+	if (cwd.length === 0) {
+		throw new SubagentError(
+			missingRemoteCwdQuestion(name),
+			ErrorCodes.INVALID_PARAMS,
+			{ host: name, cwd: "", reason: "cwd-missing", noModelFallback: true },
+		);
+	}
 	// 3. discovery, only for the holes.
 	const discoverEnabled = request.discover ?? entry.discover ?? config?.discover ?? true;
 	const hole = (value: string | undefined): boolean => typeof value !== "string" || value.trim().length === 0;
@@ -1987,21 +2047,26 @@ export async function remotePreflight(
 	}
 	if (code === 12) {
 		throw new SubagentError(
-			`host '${target.host}': node '${target.node}' is not on PATH on ${target.host} (set subagents.crossMachine.hosts.${target.host}.node to a path on that machine)`,
+			// D1: the action first (install it); the settings key appears once, as the
+			// fallback for an install that exists but is off that core's PATH.
+			`host '${target.host}': node '${target.node}' is not on PATH on ${target.host} — install node there, then retry. If it is installed but off that core's PATH, name it once in subagents.crossMachine.hosts.${target.host}.node.`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, node: target.node, code: 12 },
 		);
 	}
 	if (code === 13) {
 		throw new SubagentError(
-			`host '${target.host}': pi CLI '${target.piCli}' is not on PATH on ${target.host} (set subagents.crossMachine.hosts.${target.host}.piCli to a path on that machine)`,
+			// Same shape: `install pi there` is the instruction; the settings key is
+			// the fallback for a CLI that exists but is off that core's PATH.
+			`host '${target.host}': pi CLI '${target.piCli}' is not on PATH on ${target.host} — install pi there, then retry (and put this package on that machine too: hc exec --on ${target.host} -- pi install npm:pi-legion, same entry names are then mapped automatically). Only if an existing CLI is off that core's PATH, name it in subagents.crossMachine.hosts.${target.host}.piCli.`,
 			ErrorCodes.START_FAILED,
 			{ host: target.host, piCli: target.piCli, code: 13 },
 		);
 	}
 	if (code === 16) {
 		throw new SubagentError(
-			`host '${target.host}': piCli '${target.piCli}' is not a JavaScript entry point node can execute. A shell launcher (a path like /root/.pi/agent/bin/pi, a \`case "$0"\` wrapper) cannot be the argv[1] of \`node\` — node parses it as JavaScript and dies with \`SyntaxError: Unexpected token case\`. Point subagents.crossMachine.hosts.${target.host}.piCli at the bundle entry instead, e.g. /root/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js.`,
+			// Action first: the path to paste, then why the launcher cannot work.
+			`host '${target.host}': point piCli at the JS entry node can execute, e.g. /root/.pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js. piCli '${target.piCli}' is not a JavaScript entry point node can execute: a shell launcher (a path like /root/.pi/agent/bin/pi, a \`case "$0"\` wrapper) cannot be the argv[1] of \`node\` — node parses it as JavaScript and dies with \`SyntaxError: Unexpected token case\`. That path goes in subagents.crossMachine.hosts.${target.host}.piCli.`,
 			ErrorCodes.INVALID_PARAMS,
 			{ host: target.host, piCli: target.piCli, code: 16 },
 		);
@@ -2015,7 +2080,9 @@ export async function remotePreflight(
 	}
 	if (code === 14) {
 		throw new SubagentError(
-			`host '${target.host}': this package is not installed at ${target.piLegionRoot} on that machine (every child's argv loads ${path.posix.join(target.piLegionRoot, "index.ts")}; set subagents.crossMachine.hosts.${target.host}.piLegionRoot to where it really is, or install it there)`,
+			// Two ways out, action first: install it there, or — when it IS installed
+			// but somewhere else — point piLegionRoot at that root.
+			`host '${target.host}': this package is not installed at ${target.piLegionRoot} on that machine — install this package there, then retry: hc exec --on ${target.host} -- pi install npm:pi-legion (every child's argv loads ${path.posix.join(target.piLegionRoot, "index.ts")}). If it is already installed somewhere else on that machine, put that root in subagents.crossMachine.hosts.${target.host}.piLegionRoot.`,
 			ErrorCodes.INVALID_PARAMS,
 			{ host: target.host, piLegionRoot: target.piLegionRoot, code: 14 },
 		);

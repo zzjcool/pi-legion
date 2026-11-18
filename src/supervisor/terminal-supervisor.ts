@@ -660,6 +660,11 @@ export class TerminalSupervisor implements LegionSupervisor {
 					localCwd: input.cwd,
 					pathMap: target.pathMap,
 					...(packages ? { packages } : {}),
+					// D4: the missing-package refusal names the ROLE, because the key that
+					// keeps the extension on this machine only is per role. The agent config
+					// is the authority on that name (`input.agent.name`, the same value the
+					// child label carries).
+					role: input.agent.name,
 				});
 				// S5.6: `--no-extensions` is right (a child must not inherit the parent's
 				// plugin set) but on a machine whose MODELS come from an extension it also
