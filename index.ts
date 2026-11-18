@@ -112,6 +112,7 @@ import { CHILD_ROLE_ENV } from "./src/extension/child-guard.ts";
 import { configureSessionErrors, recordSessionError } from "./src/extension/session-errors.ts";
 import { getAgentDir } from "./src/agents/paths.ts";
 import { expectedModelsFromSettings, parseDoctorSections, runLegionDoctor } from "./src/extension/legion-doctor.ts";
+import { runCrossMachineCheckup } from "./src/runs/cross-machine-checkup.ts";
 import { readFileSync } from "node:fs";
 import {
 	effectiveMaxDepth,
@@ -2525,6 +2526,17 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				} catch {
 					settings = undefined;
 				}
+				// D6/D7: the Cross-machine section is the ONE async part of doctor, and it is
+				// paid only when that section was asked for (`sections` undefined = the full
+				// report). `doctor models` stays as cheap as it was: no `hc`, no probe.
+				const crossMachineCheckup = sections === undefined || sections.includes("crossmachine")
+					? await runCrossMachineCheckup({
+						cwd,
+						settings: catalog.settings.crossMachine,
+						agents,
+						model: agents[0]?.model,
+					})
+					: undefined;
 				const report = runLegionDoctor({
 					agentDir: getAgentDir(),
 					cwd,
@@ -2535,6 +2547,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					// of the same file — one load, one merge rule, no drift between the
 					// hosts doctor lists and the hosts a launch would resolve.
 					crossMachine: catalog.settings.crossMachine,
+					...(crossMachineCheckup !== undefined ? { crossMachineCheckup } : {}),
 					sampleAgent: agents[0],
 					agents,
 					sections,
