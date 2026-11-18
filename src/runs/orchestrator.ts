@@ -1385,9 +1385,17 @@ export class Orchestrator {
 			? priorRecord
 			: (ledgerPrevious ? this.childFromNode(name, ledgerPrevious) : undefined);
 		if (previous && !this.children.has(name)) this.children.set(name, previous);
+		// xm-model-fallback: "configure the model up front" is a per-MACHINE key
+		// (`subagents.crossMachine.hosts.<host>.model`), so the resolution order starts
+		// here: an explicit model for this launch always wins, and a launch without one
+		// takes the pin the operator wrote FOR that machine. Still `undefined` when
+		// nothing is configured — then the child's own configuration decides, and a
+		// target that does not serve that model falls back to that machine's own
+		// listing in the terminal backend (`planRemoteModelFallback`).
+		const launchModel = input.model ?? input.hostTarget?.model;
 		const models = this.planModelCandidates({
 			agent: input.agent,
-			...(input.model !== undefined ? { model: input.model } : {}),
+			...(launchModel !== undefined ? { model: launchModel } : {}),
 			origin: input.modelOrigin ?? (input.model !== undefined ? "explicit" : input.agent.modelSource?.type === "subagents.defaultModel" ? "inherited" : input.agent.model ? "explicit" : "inherited"),
 			...(input.thinking !== undefined ? { thinking: input.thinking } : {}),
 		});

@@ -1048,6 +1048,40 @@ test("D7: a model the target does not serve FAILs and lists what that machine DO
 	}
 });
 
+test("xm-model-fallback: `hosts.<host>.model` is the model the target-models item judges", async () => {
+	// Doctor must predict the launch it is checking. A launch on this host starts
+	// with the per-machine pin when the caller names no model of its own
+	// (`Orchestrator.launch`: `input.model ?? input.hostTarget.model`), so the
+	// CALLER's default — `model` below — is the wrong model to compare here: it is
+	// not in that machine's listing, and judging by it would report FAIL for a
+	// launch that works.
+	const repo = localRepo();
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	try {
+		const client = healthyTarget({
+			models: "PROVIDER\tMODEL\tCONTEXT\ncodebuddy\tglm-5\t200k\tctx\n",
+		});
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost({ model: "codebuddy/glm-5" }) } },
+			agents: [role("centurion", { model: MODEL })],
+			model: MODEL,
+			env,
+			client,
+		});
+		const models = item(checkup.hosts[0]!.items, "target-models");
+		assert.equal(models.status, "pass", `the pin is what a launch uses: ${models.line}`);
+		assert.match(models.line, /^codebuddy\/glm-5 is in fakebox's listing/);
+		// The pasteable launch line names it too: it is the launch this checkup judged.
+		assert.ok(checkup.hosts[0]!.launch?.includes('model: "codebuddy/glm-5"'), checkup.hosts[0]!.launch);
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+		repo.cleanup();
+	}
+});
+
 test("D6: an old core (`machine.list` unsupported) is a SKIP, and the named hosts are still checked", async () => {
 	const repo = localRepo();
 	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));

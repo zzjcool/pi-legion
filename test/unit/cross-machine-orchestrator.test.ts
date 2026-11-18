@@ -149,6 +149,65 @@ test("D1: a host outside an hc terminal is refused (rpc/inprocess cannot leave t
 });
 
 /**
+ * xm-model-fallback, steps 1 and 2 of the resolution order.
+ *
+ * The user's requirement: "configure the model up front, and when nothing is
+ * configured fall back to a model on the target machine". "Up front" is the
+ * per-machine key `subagents.crossMachine.hosts.<host>.model`; the launch uses it
+ * when it has no model of its own, and an explicit one always wins. Both facts
+ * live in `Orchestrator.launch` (`input.model ?? input.hostTarget.model`) because
+ * the target is the only object that carries what the operator wrote for THAT
+ * machine.
+ */
+test("xm-model-fallback: a launch with no explicit model starts with the machine's pin, and argv carries it", async () => {
+	const h = harness("xm-model-host-");
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({
+				agent: agent(),
+				task: "t",
+				host: HOST,
+				hostTarget: target({ model: "codebuddy/glm-5" }),
+			});
+			const spawn = h.supervisor.spawns.find((entry) => entry.input.name === handle.name);
+			assert.ok(spawn, "the supervisor must receive a spawn");
+			assert.equal(spawn.input.model, "codebuddy/glm-5", "the per-machine pin resolves the launch's model");
+			// and it is what the CHILD is started with, not a value only the ledger knows.
+			const at = spawn.args.indexOf("--model");
+			assert.ok(at >= 0, `the child's argv must carry --model: ${spawn.args.join(" ")}`);
+			assert.equal(spawn.args[at + 1], "codebuddy/glm-5");
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("xm-model-fallback: an explicit model WINS over the machine's pin", async () => {
+	const h = harness("xm-model-explicit-");
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({
+				agent: agent(),
+				task: "t",
+				host: HOST,
+				hostTarget: target({ model: "codebuddy/glm-5" }),
+				model: "workbuddy/deepseek-v4.1-flash",
+			});
+			const spawn = h.supervisor.spawns.find((entry) => entry.input.name === handle.name);
+			assert.ok(spawn, "the supervisor must receive a spawn");
+			assert.equal(spawn.input.model, "workbuddy/deepseek-v4.1-flash");
+			const at = spawn.args.indexOf("--model");
+			assert.equal(spawn.args[at + 1], "workbuddy/deepseek-v4.1-flash");
+			// The pin is not lost when the machine is retried without its own model:
+			// it is a property of the target, so the next launch on it still sees it.
+			assert.equal(spawn.input.hostTarget?.model, "codebuddy/glm-5");
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+/**
  * S2: `host` + `worktree: true` is now the SUPPORTED remote shape (contract D11).
  *
  * The arbitration has to say two things at once — "this child is worktree

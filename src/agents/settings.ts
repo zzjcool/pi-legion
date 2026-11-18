@@ -815,6 +815,13 @@ function parseCrossMachine(
 			// `resolveWorktreeRoot`), same policy as `cwd`.
 			const worktreeRoot = optionalString(entry.worktreeRoot, `crossMachine.hosts.${host}.worktreeRoot`, filePath);
 			if (worktreeRoot !== undefined) target.worktreeRoot = worktreeRoot;
+			// xm-model-fallback: the model a launch WITHOUT an explicit one starts with
+			// on this machine (`Orchestrator.launch`: `input.model ?? input.hostTarget.model`).
+			// Shape only, like every other host field: whether that machine SERVES the
+			// value is decided at the launch's own `--list-models` probe, where the
+			// answer can still be acted on.
+			const model = optionalString(entry.model, `crossMachine.hosts.${host}.model`, filePath);
+			if (model !== undefined) target.model = model;
 			const piExtensions = parsePiExtensions(
 				entry.piExtensions,
 				`crossMachine.hosts.${host}.piExtensions`,

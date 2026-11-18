@@ -613,6 +613,31 @@ test("xm-dispatch D4: the ASYNC resolver carries allowRoles onto the target (the
 	assert.equal(plain.allowRoles, undefined);
 });
 
+test("xm-model-fallback: the ASYNC resolver carries hosts.<h>.model onto the target too", async (t) => {
+	// The tool launch path resolves its target here, so a `model` key only the sync
+	// resolver stamped would be a key no real launch ever sees — the same trap
+	// `allowRoles` fell into, one stage earlier.
+	clearHostDiscoveryCache();
+	const machine = fakeMachine(t);
+	const client = new FakeClient({
+		machines: () => ({ machines: [{ name: "fakebox" }] }),
+		exec: () => probeResult(runProbe(machine)),
+	});
+	const resolved = await resolveHostTargetAsync(
+		"fakebox",
+		{ enabled: true, hosts: { fakebox: { cwd: "/srv/app", model: "codebuddy/glm-5.2" } } },
+		{ client, cacheDir: null },
+	);
+	assert.equal(resolved.model, "codebuddy/glm-5.2");
+	// Absent stays absent (the fallback to that machine's listing is the launch's rule).
+	const plain = await resolveHostTargetAsync(
+		"fakebox",
+		{ enabled: true, hosts: { fakebox: { cwd: "/srv/app" } } },
+		{ client, cacheDir: null },
+	);
+	assert.equal(plain.model, undefined);
+});
+
 // ── 2b. extensions by package name (v1.2) ──────────────────────────────────
 
 /**

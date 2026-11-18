@@ -958,6 +958,26 @@ export interface CrossMachineHostConfig {
 	 */
 	pathMap?: Record<string, string>;
 	/**
+	 * The model a launch on this machine starts with, when the CALLER names none.
+	 *
+	 * This is "configure the model up front" for one machine: a launch with no
+	 * explicit `model` (per-call, role card, `agentOverrides`, `subagents.defaultModel`)
+	 * uses this value, so an operator who runs everything on `hw-nj` writes the model
+	 * ONCE instead of pinning it on every role card or every call. An explicit model
+	 * always wins.
+	 *
+	 * It is honoured as written only when that machine really serves it: the launch's
+	 * `--list-models` startup probe decides, and a value that is not in the listing
+	 * falls through to the machine's own first row with a warning naming this key
+	 * (`planRemoteModelFallback` in `src/runs/remote.ts`). Absent ⇒ a launch with no
+	 * explicit model falls straight through to that machine's own listing, which is
+	 * the "just work without configuring anything" path.
+	 *
+	 * The value is a `provider/model` id, exactly as it would appear on a role card
+	 * (`codebuddy/glm-5.2`), thinking suffix included when one is wanted.
+	 */
+	model?: string;
+	/**
 	 * Directory (absolute, ON that machine) that holds remote child worktrees
 	 * (`cross-machine-spawn-v1` D11/D12).
 	 *

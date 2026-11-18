@@ -19,6 +19,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { HcCliClient, HcRpcError, type HcClient } from "../hc/client.ts";
 import { modelMatches, parseListModels } from "../shared/list-models.ts";
+import { splitThinkingSuffix, withThinkingLevel } from "../agents/model-scope.ts";
 import { matchesExcludedExtension } from "./extension-inheritance.ts";
 import {
 	ErrorCodes,
@@ -744,6 +745,20 @@ export interface HostTarget {
 	 */
 	allowRoles?: string[];
 	/**
+	 * The model a launch on this machine starts with when the CALLER names none
+	 * (`hosts.<host>.model`).
+	 *
+	 * Stamped only when the operator wrote it — like {@link allowRoles}, an
+	 * unconfigured target keeps the exact pre-v1.7 shape, and "nothing configured"
+	 * must stay distinguishable from "configured and unset" so the fallback to the
+	 * machine's own listing is the launch's decision, not a default baked in here.
+	 *
+	 * `Orchestrator.launch` reads it as `input.model ?? input.hostTarget?.model`, and
+	 * the launch's startup probe decides whether that machine really serves it
+	 * (`planRemoteModelFallback`).
+	 */
+	model?: string;
+	/**
 	 * Directory (on that machine) holding this launch's mirrored argv files.
 	 *
 	 * Beside the worktree root, never inside the checkout: a mirrored file in the
@@ -882,6 +897,192 @@ export function remoteStartupProbeLine(argv: string[], cwd: string): string {
 	const flags = argv.slice(0, -1);
 	const command = [...flags, "--list-models"].map((part) => shQuote(part)).join(" ");
 	return `cd -- ${shQuote(cwd)} && ${command}`;
+}
+
+/**
+ * How many of that machine's models a model refusal quotes.
+ *
+ * Five was arbitrary: a registry commonly lists more, and a truncated list that
+ * does not SAY it is truncated reads as "this is everything there is", which is
+ * how the operator concludes the machine serves nothing usable. Twenty covers a
+ * realistic registry and still fits one tool result; a longer one is announced
+ * (`and N more`) instead of silently cut.
+ */
+const MODEL_LIST_QUOTE_CAP = 20;
+
+/**
+ * The model a remote launch falls back to when the one it asked for is not
+ * visible on that machine (xm-model-fallback).
+ *
+ * The whole resolution order, in one place: an explicit model for this launch,
+ * then `subagents.crossMachine.hosts.<host>.model`, then the TARGET's own first
+ * row. Only the absence of all three is a refusal; the operator's requirement was
+ * "configure it up front, and when nothing is configured fall back to a model on
+ * the target machine", so a machine nobody pinned must still launch.
+ */
+export interface RemoteModelFallback {
+	/** The model to launch with instead of the one that is missing. */
+	model: string;
+	/** Which input it came from — an operator pin, or the machine's own listing. */
+	source: "host-config" | "listing";
+	/**
+	 * ONE line for the handle (never a block: it is rendered inside a tool result).
+	 *
+	 * It names both models, so the caller can see WHAT was substituted, and the key
+	 * that turns the substitution into a decision.
+	 */
+	warning: string;
+}
+
+/**
+ * Steps 2 and 3 of that order, as one decision.
+ *
+ * `available` is the listing of the probe that said `model-missing` — STDOUT only,
+ * the same stream `classifyRemoteStartupProbe` reads rows from (a stderr warning
+ * is not a model).
+ *
+ *   2. `configured` (`hosts.<host>.model`) — when it names a DIFFERENT model that
+ *      the machine really lists. A pin the machine cannot serve is not honoured,
+ *      because launching with it would fail exactly like the model it replaced;
+ *   3. a row of the listing whose provider is the failed model's
+ *      (`codebuddy/glm-5.2` → the first `codebuddy/*` row), else the first row.
+ *
+ * `undefined` means "nothing to fall back to": an empty listing, or a pin that is
+ * not visible either. That is the HARD failure — never a silent retry, because a
+ * second probe of a machine that lists nothing says the same thing, and what the
+ * operator has to change is the machine's provider set.
+ */
+export function planRemoteModelFallback(input: {
+	host: string;
+	/** The model this launch asked for (`input.model`). */
+	requested: string;
+	/** `hosts.<host>.model`, when the operator pinned one. */
+	configured?: string;
+	/** `parseListModels` of the probe that said `model-missing`. */
+	available: readonly string[];
+}): RemoteModelFallback | undefined {
+	const { host, requested, configured, available } = input;
+	const key = `subagents.crossMachine.hosts.${host}.model`;
+	if (configured !== undefined && configured !== requested && modelMatches(configured, available)) {
+		return {
+			model: configured,
+			source: "host-config",
+			warning: `host '${host}': model '${requested}' is not visible there; using '${configured}' from ${key}`,
+		};
+	}
+	const provider = providerOf(requested);
+	const picked = available.find((row) => providerOf(row) === provider) ?? available[0];
+	if (picked === undefined) return undefined;
+	// A pin that IS there but does not serve the model must not read as "nothing was
+	// configured": the reader's next move is to re-point it, and the line says so.
+	const tail = configured === undefined
+		? `(pin it with ${key})`
+		: `(${key} names '${configured}', which that machine does not list)`;
+	return {
+		model: picked,
+		source: "listing",
+		warning: `host '${host}': model '${requested}' is not visible there; using '${picked}' from that machine's listing ${tail}`,
+	};
+}
+
+/** The provider segment of a `provider/model` id (a thinking suffix is not one). */
+function providerOf(model: string): string | undefined {
+	const base = splitThinkingSuffix(model).baseModel;
+	const slash = base.indexOf("/");
+	return slash > 0 ? base.slice(0, slash) : undefined;
+}
+
+/**
+ * Rewrite the `--model` pair of a built remote argv IN PLACE.
+ *
+ * In place, never rebuilt: every other element is already mapped onto that
+ * machine's paths and mirrored there (`mapRemoteArgvAllowingSkips`, D6), so a
+ * fresh `buildPiArgs` would hand the child this machine's paths — the one outcome
+ * the whole mapping exists to prevent.
+ *
+ * The `:thinking` level rides along: the ARGV's own value already carries the
+ * level that would run (`applyThinkingSuffix` ran), and a fallback is not a reason
+ * to change how the child thinks. The `--provider` pin (#123) MOVES with the
+ * model: it was computed for the model that failed, and a pin left behind routes
+ * the fallback to a provider that does not own it — the `No API key found` it
+ * exists to prevent, one layer later. An id with no provider drops the pin (pi
+ * rejects `--provider` alone, so the two move together).
+ */
+export function applyRemoteModelFallback(argv: string[], model: string): void {
+	const at = argv.indexOf("--model");
+	if (at < 0 || at + 1 >= argv.length) return;
+	argv[at + 1] = withThinkingLevel(model, splitThinkingSuffix(argv[at + 1]!).thinking) ?? model;
+	const pinAt = argv.indexOf("--provider");
+	if (pinAt < 0 || pinAt + 1 >= argv.length) return;
+	const provider = providerOf(model);
+	if (provider === undefined) argv.splice(pinAt, 2);
+	else argv[pinAt + 1] = provider;
+}
+
+/**
+ * The `model-missing` refusal, in one place and with the fallback attempt in it.
+ *
+ * The machine HAS models, just not the ones this launch can use — a different
+ * problem from `no-model`, with different fixes. What the sentence has to carry:
+ * every model that was LOOKED FOR (this launch's, the pin, and the fallback that
+ * was tried), what the machine DOES serve, and the two ways out — point the launch
+ * at a served model, or publish the provider on that machine. An empty quote says
+ * so explicitly instead of printing nothing: an empty listing has exactly one
+ * cause worth naming (`--no-extensions` hid the provider) and the reader cannot
+ * act on a blank line.
+ *
+ * `probeLine` is the line of the probe that produced `available` — for a failed
+ * fallback that is the SECOND probe, so the command pasted on that machine is the
+ * one that refused, not the one that worked.
+ */
+export function remoteModelMissingError(input: {
+	host: string;
+	/** The model this launch asked for (`input.model`). */
+	requested: string;
+	/** The model the FAILING probe asked for — differs once a fallback was tried. */
+	asked: string;
+	/** `hosts.<host>.model`, when the operator pinned one. */
+	configured?: string;
+	/** Where a tried fallback came from (absent when none was tried). */
+	fallbackSource?: RemoteModelFallback["source"];
+	/** `parseListModels` of the failing probe's STDOUT. */
+	available: readonly string[];
+	/** The line the failing probe ran, for the `Command (run on …)` tail. */
+	probeLine: string;
+}): SubagentError {
+	const { host, requested, asked, configured, available, probeLine } = input;
+	const address = `subagents.crossMachine.hosts.${host}.piExtensions`;
+	const quoted = available.slice(0, MODEL_LIST_QUOTE_CAP);
+	const hidden = available.length - quoted.length;
+	const listing = quoted.length > 0
+		? `that machine lists:\n${quoted.join("\n")}${hidden > 0 ? `\nand ${hidden} more` : ""}\nPoint this launch at a model that machine serves (the role's \`model\`, \`subagents.defaultModel\`, \`agentOverrides.<role>.model\`, or \`subagents.crossMachine.hosts.${host}.model\`), or put the provider extension that publishes '${asked}' into ${address}.`
+		// An empty LISTING (not an empty machine): the probe ran the child's own
+		// argv with `--no-extensions`, which hides every provider installed there as
+		// an extension — the one fix the reader can actually apply. There is nothing
+		// to fall back to, and the sentence says so rather than printing a blank list.
+		: `the probe saw NO model on that machine, so there is nothing to fall back to — \`--no-extensions\` hides every provider that is installed there as an extension, so add the provider extension that publishes '${asked}' to ${address} (\`/legion doctor crossmachine\` shows the same listing).`;
+	// Every model that was LOOKED FOR, so "not visible there" cannot be read as
+	// "nobody tried anything else". The pin is named only when it exists and is not
+	// one of the other two, and the failed fallback only when one was tried.
+	const configuredClause = configured !== undefined && configured !== requested && configured !== asked
+		? ` (subagents.crossMachine.hosts.${host}.model names '${configured}', which that machine does not list)`
+		: "";
+	const fallbackClause = asked === requested
+		? ""
+		: `, and the fallback this launch tried ('${asked}'${input.fallbackSource === "host-config" ? ` from subagents.crossMachine.hosts.${host}.model` : " from that machine's listing"}) is not visible there either`;
+	const reproduce = `\n\nCommand (run on '${host}' to reproduce):\n${probeLine}`;
+	return new SubagentError(
+		`host '${host}': the child's model '${requested}'${configuredClause} is not visible there${fallbackClause} — ${listing} A model that is LISTED there is enough: the probe does not need a credential.${reproduce}`,
+		ErrorCodes.INVALID_PARAMS,
+		{
+			host,
+			probe: "model-missing",
+			model: requested,
+			// The handle/details of a failed fallback say which model refused it, so a
+			// reader of a structured log does not have to parse the prose.
+			...(asked !== requested ? { fallback: asked } : {}),
+		},
+	);
 }
 
 /**
@@ -1037,6 +1238,12 @@ export function resolveHostTarget(
 	const piExtensions = entry.piExtensions !== undefined
 		? resolvePiExtensions(name, entry.piExtensions)
 		: (discovered?.piExtensions ?? []).filter((value) => path.posix.isAbsolute(value));
+	// xm-model-fallback: the per-machine model a launch with no explicit one uses.
+	// Not discovered (a listing is read per launch, not cached), and present only
+	// when written — the same shape promise `allowRoles` makes below, because a
+	// target that always carried a `model` field could not tell "configured" from
+	// "empty", and the fallback needs to know which question it is answering.
+	const configuredModel = nonEmpty(entry.model);
 	return {
 		host: name,
 		cwd,
@@ -1050,6 +1257,7 @@ export function resolveHostTarget(
 		// (the same promise `piExtensions` makes below), and the DEFAULT lives with the
 		// launch guard, which reads {@link DEFAULT_CROSS_MACHINE_ALLOW_ROLES}.
 		...(config?.allowRoles !== undefined ? { allowRoles: [...config.allowRoles] } : {}),
+		...(configuredModel !== undefined ? { model: configuredModel } : {}),
 		mirrorRoot: path.posix.join(
 			path.posix.dirname(resolveWorktreeRoot(name, cwd, entry.worktreeRoot)),
 			REMOTE_MIRROR_DIR_NAME,

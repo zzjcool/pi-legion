@@ -76,7 +76,7 @@ class FakeRemoteClient implements HcClient {
 }
 
 function config(
-	hosts: Record<string, { cwd?: string; node?: string; piCli?: string; piLegionRoot?: string; pathMap?: Record<string, string>; piExtensions?: string[] }>,
+	hosts: Record<string, { cwd?: string; node?: string; piCli?: string; piLegionRoot?: string; pathMap?: Record<string, string>; piExtensions?: string[]; model?: string }>,
 	enabled = true,
 ): SubagentsSettings["crossMachine"] {
 	return { enabled, hosts };
@@ -94,6 +94,28 @@ test("xm-dispatch D4: resolveHostTarget stamps the role allowlist — default ce
 	// is the launch guard's, which is also why it is a constant and not a field here.
 	assert.equal(resolveHostTarget("vps", config({ vps: { cwd: "/srv/app" } })).allowRoles, undefined);
 	assert.deepEqual(resolveHostTarget("vps", { enabled: true, allowRoles: ["centurion", "worker"], hosts: { vps: { cwd: "/srv/app" } } }).allowRoles, ["centurion", "worker"]);
+});
+
+test("xm-model-fallback: hosts.<host>.model is parsed and stamped on the target, absent stays absent", () => {
+	// The key a launch falls back to when the CALLER names no model (`Orchestrator.launch`:
+	// `input.model ?? input.hostTarget.model`). It has to survive parsing — the settings
+	// whitelist drops what it does not read — and reach the one object the resolver and
+	// the launch share, exactly like `allowRoles`.
+	const parsed = parseSubagentSettings(
+		{ subagents: { crossMachine: { enabled: true, hosts: { vps: { cwd: "/srv/app", model: "codebuddy/glm-5.2" } } } } },
+		"/tmp/settings.json",
+	);
+	assert.equal(parsed?.crossMachine?.hosts?.vps?.model, "codebuddy/glm-5.2");
+	assert.equal(resolveHostTarget("vps", parsed?.crossMachine).model, "codebuddy/glm-5.2");
+	// Unconfigured = ABSENT, so an existing target keeps its exact pre-fallback shape;
+	// the fallback to that machine's own listing is the consumer's rule, not a default
+	// written into the target.
+	assert.equal(resolveHostTarget("vps", config({ vps: { cwd: "/srv/app" } })).model, undefined);
+	// A wrong SHAPE is refused by name at load time, like every other host field.
+	assert.throws(
+		() => parseSubagentSettings({ subagents: { crossMachine: { hosts: { vps: { model: 7 } } } } }, "/tmp/settings.json"),
+		/crossMachine\.hosts\.vps\.model.*expected a string/,
+	);
 });
 
 /** The package root, imported here so the fixture cannot drift from the resolver. */
