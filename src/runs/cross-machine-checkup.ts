@@ -42,6 +42,8 @@ import { SELF_EXTENSION_NAME } from "./args.ts";
 import {
 	childInheritsExtensions,
 	discoveredHostExtensions,
+	ensureHostExtensions,
+	hostExtensionDiscoveryState,
 	inheritedExtensions,
 	matchesExcludedExtension,
 } from "./extension-inheritance.ts";
@@ -587,7 +589,23 @@ async function probeInheritedExtensions(input: {
 
 	// The inherited set is a list of THIS machine's package paths, so it is
 	// collected first: a host where nothing is inherited needs no probe at all.
-	const hostExtensions = discoveredHostExtensions() ?? [];
+	//
+	// A cold process has never run `pi list`, and `discoveredHostExtensions()` is a
+	// pure read — treating its `undefined` as "nothing is inherited" would turn the
+	// one question this item exists to answer into a false PASS. So warm it here
+	// (the same probe a launch runs) and keep "could not ask" apart from "asked,
+	// nothing there": the first is a SKIP with the reason, the second a PASS.
+	let hostExtensions = discoveredHostExtensions();
+	if (hostExtensions === undefined) {
+		hostExtensions = await ensureHostExtensions(env);
+		if (hostExtensions.length === 0 && hostExtensionDiscoveryState().status === "failed") {
+			return {
+				id: "inherited-extensions",
+				status: "skip",
+				line: `could not list this machine's packages (pi list failed), so inherited extensions were not checked — run pi list here, then re-run /legion doctor crossmachine`,
+			};
+		}
+	}
 	const wanted: Array<{ role: string; extension: string }> = [];
 	for (const agent of agents) {
 		if (!childInheritsExtensions(agent, env)) continue;
@@ -661,7 +679,7 @@ async function probeInheritedExtensions(input: {
 		id: "inherited-extensions",
 		status: "fail",
 		line: `${entries.length} package(s) missing on ${target.host}: ${shown
-			.map(([name, role]) => `${name}(role '${role}')`)
+			.map(([name, role]) => `${name} (role '${role}')`)
 			.join(", ")}${more > 0 ? ` and ${more} more` : ""}`,
 		fixes,
 	};

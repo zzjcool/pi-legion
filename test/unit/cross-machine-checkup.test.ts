@@ -549,7 +549,7 @@ test("D4: a package missing on the target FAILs with the role and a pasteable ex
 		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
 		assert.equal(inherited.status, "fail", `expected a FAIL, got: ${inherited.line}`);
 		// The line names the package AND the role whose set contained it (D4).
-		assert.match(inherited.line, /^1 package\(s\) missing on fakebox: pi-sysmon\(role 'centurion'\)$/);
+		assert.match(inherited.line, /^1 package\(s\) missing on fakebox: pi-sysmon \(role 'centurion'\)$/);
 		// The install action, then the settings key as pasteable JSON (pitfall #2).
 		assert.equal(inherited.fixes?.[0], "hc exec --on fakebox -- pi install npm:pi-sysmon");
 		const json = inherited.fixes?.map((fix) => {
