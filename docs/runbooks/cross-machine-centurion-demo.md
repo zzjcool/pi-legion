@@ -100,12 +100,15 @@
 | `FAIL target origin: …` | 那侧不是仓库 / 没有 origin / url 与这侧不同（原话把两个 url 都点名） | 粘 `fix:` 里的 `hc exec --on <h> -- git …` 那一行 |
 | `PASS target runtime: <node> vX and <cli.js> Y — the paths the child will use there` | 远端 `node` 与 `pi` 的真实路径与版本（就是 child 会用的那两个） | 不用动 |
 | `FAIL target runtime: …` | 那台机器上的 `node` 或 `node <piCli>` 跑不起来（「本包不在那儿」由 preflight 的 exit 14 报，**不在**这一行） | 粘 `fix:`：`hc exec --on <h> -- <node> --version` / 装 node；或把 `piCli` 指到 `…/dist/bundle/cli.js` |
-| `FAIL inherited extensions: N package(s) missing on <h>: <pkg> (role '<role>')` | 继承来的包在那台机器上没装（D4） | `fix:` 任选一条：`hc exec --on <h> -- pi install npm:<pkg>`，或那条 `excludeExtensions` 的 settings JSON（`# where:` 说了写进哪个文件） |
+| `FAIL inherited extensions: N package(s) missing on <h>: <pkg> (not installed on <h>)` | 继承来的包在那台机器上没装（D4/D14）。**它不再拦住 launch**：继承来的会跳过并给一行 warning | 想让它真正加载：`hc exec --on <h> -- pi install npm:<pkg>`；只想这次跑通：什么都不用做，或粘那条 `excludeExtensions` JSON（`# where:` 说了写进哪个文件） |
+| `FAIL inherited extensions: … (entry '<相对路径>' not declared on <h>)` | 包装了，但两边的 `pi.extensions` 布局/版本不同（D13）；launch 同样只跳过 + warning | 把两台的包版本对齐（目录声明 `./extensions` 现在已自动按目录包含），或粘 `excludeExtensions` JSON |
 | `FAIL target models: <model> is not in <h>'s listing: …` | 那台机器的 `pi --list-models` 里没有这个模型（行尾同时说明 `--no-extensions` 与 `piExtensions` 的关系） | 粘 `fix:`：换成它列出来的模型；如果模型本来就该由 provider 扩展提供，把它写进 `subagents.crossMachine.hosts.<h>.piExtensions` |
 | `FAIL hc machines: no machines are registered …` | 这个 hc core 一台机器都不认识，配置里也没有 host | 粘 `fix: hc machine add --name my-vps ssh://user@my-vps`，再 `hc machine ls` |
 | `FAIL hc machines: cross-machine launch is disabled (subagents.crossMachine.enabled = false), so nothing here was probed` | `subagents.crossMachine.enabled` 是 `false`（真 launch 会被拒） | 按 `fix:` 把它改成 `true`（同一个 settings 文件），再跑同一条命令 |
 | `SKIP hc machines: … cross-machine is not configured, so no target was probed` | `enabled` 没写、也没有 `hosts` 条目：注册表照打，但不去探目标机 | 想体检某一台就配 `{ "enabled": true }` 再跑 `/legion doctor crossmachine` |
 | `SKIP <项>: … not checked: <一句原因>` | 前面那条 FAIL 让这一项没法问（例如还没有目录） | 先修上面那条 FAIL，再跑同一条命令 |
+| 派生：`execution: unknown (read-back was truncated (N of M lines)…)` | 判定用的远端转录被截断/为空（D15）。**这不是 child 的结局，是本机的盲区** | 看 `read-back from host …` 那行的 N/M；上一行 `error:` 会说明是没读到还是只读到一部分。完整转录、确实没有 assistant 才叫 `aborted` |
+| 派生：`⚠ <name>: cross-machine on '<h>': N inherited extension(s) cannot be loaded there …` | 继承来的扩展在那台机器上缺（D14），launch 继续了 | 按这行给的两条出路：在那台机器 `pi install`，或把它写进 `excludeExtensions`；角色卡自己声明的扩展不会被跳过，仍然硬拒 |
 
 ### 手工兜底：三条命令（doctor 不方便跑时）
 
@@ -367,7 +370,7 @@ phases 校验**之前**，所以 host + 坏 phases 同时存在时，你**先**�
 
 | 你看到的字 | 它意味着什么 / 改哪个键 |
 |---|---|
-| `host '<h>': the extension '<父机路径>' belongs to package '<pkg>', which is not installed on that machine (the launch would have silently dropped it). Two ways out: 1) install it there — hc exec --on <h> -- pi install npm:<pkg> (same entry names are then mapped automatically); 2) keep it on this machine only, for role '<role>': subagents.agentOverrides.<role>.excludeExtensions — {"subagents":{"agentOverrides":{"<role>":{"excludeExtensions":["<pkg>"]}}}}` | 继承来的扩展所属的包在那台机器上没装。`1)` 在那台机器上装这个包（入口名相同就自动重锚）；`2)` 只让**这个角色**不继承它 —— 照抄原话里那条 settings JSON（`<role>` 已经是具体角色名，不是占位符）。不知道角色时（resume / 读回）这一句是 `for the role you launch: subagents.agentOverrides.<role>.excludeExtensions`，不带 JSON |
+| `host '<h>': the extension '<父机路径>' belongs to package '<pkg>', which is not installed on that machine (the launch would have silently dropped it). Two ways out: 1) install it there — hc exec --on <h> -- pi install npm:<pkg> (same entry names are then mapped automatically); 2) keep it on this machine only, for role '<role>': subagents.agentOverrides.<role>.excludeExtensions — {"subagents":{"agentOverrides":{"<role>":{"excludeExtensions":["<pkg>"]}}}}` | **只有角色卡自己声明**（`extensions:` / `subagentOnlyExtensions:`）或 child guard 缺失时才会出现这句（D14）；继承来的同一种缺失现在是「跳过 + 一行 warning」。`1)` 装这个包；`2)` 只让这个角色不继承它 —— 照抄 JSON（`<role>` 已是具体角色名）。不知道角色时（resume / 读回）是 `for the role you launch: …`，不带 JSON |
 | `host '<h>': package '<pkg>' IS installed there at <dir>, but it does not expose './<相对入口>' (declared: …); …` | 包在，但声明的入口不同（版本/布局不同）→ 原话列出它实际声明的入口；要么在父机不继承这个扩展，要么在 `subagents.crossMachine.hosts.<h>.pathMap` 里加显式前缀 |
 
 ### phases：一次报全部，并按分类点名

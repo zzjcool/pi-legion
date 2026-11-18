@@ -311,7 +311,86 @@ $ node --experimental-strip-types --test test/unit/skill-cross-machine.test.ts
 # 恢复后：ℹ tests 4  ℹ pass 4  ℹ fail 0
 ```
 
-## 7. 测试红绿证据
+## 7. 第二次真机演示：三个新坑（D13–D15）
+
+第一次演示修好之后同一天又跑了一次（Mac → `hw-nj`，派一个远端 `centurion`），又暴露三处。
+契约把它们冻成 D13–D15；下面各自 before / after，红绿证据在第 8 节末尾。
+
+### 坑 6：声明的是目录，却被判成「未声明的入口」（D13）
+
+```text
+host 'hw-nj': package 'pi-autoresearch' IS installed there at /Users/me/pi-autoresearch, but it does not expose
+'./extensions/pi-autoresearch/index.ts' (declared: ./extensions -> /Users/me/pi-autoresearch/extensions);
+the launch would have loaded a different entry than the one this machine asked for. Install 'pi-autoresearch' on 'hw-nj' …
+```
+
+不可执行：**那个文件在两台机器上都真实存在**，版本相同（`pi-autoresearch@1.9.0`，`pi.extensions: ["./extensions"]`）。
+父机把目录声明展开成具体文件再比对，远端探测只报「声明项就是这个目录」，而比较是**字符串相等** —— 必然判「未声明」；
+照原话去「装一遍」也修不好。doctor 更糟：它把 `entry-missing` 当成已解析，打 PASS。
+
+现在（D13）：
+
+- 探测端多带一个事实位（一次 `statSync`，不多一轮往返）：`PKGENTRY` 第 5 段 `1|0`；目录声明**不再**变成 provider `EXT` 行
+  （`pi --extension <目录>` 跑不起来，自动注入比不注入更坏）。
+- 判定：精确相等优先（文件声明逐字节不变），否则「落在某个**声明目录**之下」——最长前缀、`path.posix.join`、
+  不许 `..`、不许裸 `startsWith`（`extensions-other/x.ts` 不算）。
+- 报错里的 `declared:` 对目录带尾 `/`（`./extensions/ -> …`），一眼看出是目录不是「布局不同」。
+- 旧缓存没有这个事实位 ⇒ 当作「不知道是目录」（保守，靠 TTL 自愈），并在代码里写明。
+- doctor 与 launch 统一口径：checkup 的 `entry-missing` 也是 FAIL，行里说明 `entry '…' not declared on <h>`。
+
+### 坑 7：一个继承包缺失就拦住整个 launch（D14）
+
+```text
+host 'hw-nj': the extension '/Users/me/pi-sop/extensions/index.ts' belongs to package 'pi-sop', which is not installed on
+that machine (the launch would have silently dropped it). Two ways out: 1) install it there — …
+```
+
+不可执行：用户的原话是「我只想派个 scout，为什么得先研究 5 个扩展装没装」。一个环境性扩展缺失，
+把整次派发拦下来，还一个包一条错误，第一次用的人只会去翻配置。
+
+现在（D14）：
+
+- **角色卡自己声明的**（`extensions` / `subagentOnlyExtensions`）与 child guard 仍然是**硬拒**：D4 的句子与 role JSON 原样保留。
+- **继承来的**（父机已安装、随环境带下去）改成**尽力**：argv 里成对丢掉 `-e <path>`（不会有悬空的 `--extension`），
+  launch 继续，并在 `subagent(...)` 的返回文本里给**一行**汇总（`⚠ <name>: …`）：
+
+```text
+cross-machine on 'hw-nj': 2 inherited extension(s) cannot be loaded there, so this launch dropped them and continues:
+pi-sop (not installed on hw-nj), pi-lens (not installed on hw-nj). Two ways out: 1) install them there —
+hc exec --on hw-nj -- pi install npm:pi-sop; hc exec --on hw-nj -- pi install npm:pi-lens; 2) keep them on this machine
+only for role 'scout': subagents.agentOverrides.scout.excludeExtensions —
+{"subagents":{"agentOverrides":{"scout":{"excludeExtensions":["pi-sop","pi-lens"]}}}} (in ~/.pi/agent/settings.json (user)
+or /Users/me/work/app/.pi/settings.json (project)). The role's own extensions: are never skipped — an extension the role
+card declares, and this package's child guard, still refuse the launch when it is missing on hw-nj.
+```
+
+- 探针没答（`packages === undefined`）走同一策略（`no-index`），不会把「问不到」变回「死给你看」。
+- `ChildHandle.warning` 不再是 in-process 专属：terminal 后端也会设它（不持久化、不致命）。
+
+### 坑 8：远端写完报告，父端却判 `aborted`（D15）
+
+```text
+execution: aborted (no assistant message for the last prompt)
+acceptance: rejected (none)
+read-back from host 'hw-nj': 5 of 5 lines (complete)
+```
+
+远端当时有 11 行（`system → user → 两轮 assistant+工具 → 最后一条 assistant 正在写报告`）。
+根因不是 wait 超时（没有这条路径：deadline 是 `running` + `COLLECT_DEADLINE_REASON`，父端 abort 是 `running` + `aborted by parent`），
+而是**镜像只读一次**：`collect()` 入口读回，`awaitSupervisor` 之后仍拿这份快照去 `deriveOutcome`，
+`readbackFacts` 也报告同一份快照 —— 于是 `5 of 5 complete` 与判定互相自洽，却与那台机器不一致。
+
+现在（D15）：
+
+- turn 真的结束后**再读一次**（单次刷新，不轮询）：verdict 与 `read-back N of M` 都用最后一次成功读回的文本。
+- 如果用于判定的文本是**截断**或**空**的，不许输出 `aborted (no assistant message for the last prompt)`，
+  而是诚实的 `unknown` + 原因（`read-back was truncated (5 of 9000 lines)…` / `read-back was empty …` /
+  `read-back could not be refreshed after the turn ended (…)…`）。
+- 完整转录、真的没有 assistant 回复 —— 仍然是 `aborted` 与那句冻结的 reason（`test/unit/session.test.ts:77-89` 继续钉住它）。
+- `collectArtifactGrowing` 改看 `sessionFileOf(child)`（判定真正用的那份文件），远端 child 也能拿到增长宽限。
+- 读数：一次 collect 从 1 次读回变 2 次（且最多 2 次）；本地 child 不变。
+
+## 8. 测试红绿证据
 
 ### 四个错误情形（D10）+ 四个体检情形
 
@@ -389,6 +468,49 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
 四次红都是在**临时副本**里跑的（`/tmp/redcheck`，`src/` 只在该副本里被改回，工作树与本分支一次都没被改）：
 每次跑完把文件恢复；本文引用的就是那三次的原始输出。
 
+
+### 第二轮：三条新坑的红 / 绿（D13–D15）
+
+**D13**（把探测的目录事实位与包含匹配退回旧代码，保留新测试）：
+
+```text
+✖ D13 probe: a package that declares a DIRECTORY says so, and never becomes an EXT row
+✖ D13 report: a PKGENTRY row without the directory field is UNKNOWN, not a file
+✖ D13 extensions: a declared DIRECTORY covers the entry under it
+    { ok: false, reason: 'entry-missing' }   ← 应为 { ok: true, path: '/srv/x/extensions/pi-autoresearch/index.ts' }
+✖ D13 extensions: the LONGEST declared directory wins when two of them prefix the request
+✖ D13 extensions: a request OUTSIDE the declared directory stays entry-missing
+✖ D13 extensions: a cache row without the flag is NOT known to be a directory
+ℹ tests 8   ℹ pass 2   ℹ fail 6
+checkup  ✖ D13: a target whose declaration does NOT cover the entry FAILs …
+         AssertionError: expected a FAIL, got: 1 inherited extension(s) resolve on fakebox   ← 演示里的自相矛盾
+integration ✖ v1.2/D13: a target package that declares a DIRECTORY is mapped through it
+```
+
+两条「负向守卫」本来就在旧代码下也是红的（它们要求拒绝），所以另做了三个突变证明：
+删掉 `entry.directory !== true` 守卫 → 文件声明与大写前缀两条红；改成裸 `startsWith(entry.relative)`
+→ 「兄弟目录不算子目录」那条红；让探测继续给目录发 `EXT` → 探测那条红。全部复原后 8/8 绿。
+
+**D14**（把 `skippable` 去掉，或把「必需」判定改成恒 false）：
+
+```text
+✖ D14: an inherited extension the target lacks is dropped, recorded and warned about — one line
+✖ D14: the same path declared by the CARD still refuses before any terminal
+✖ … the SAME call without `skippable` must still throw (the default refuses)
+```
+
+**D15**（去掉 turn 后的刷新，或去掉诚实 unknown）：
+
+```text
+✖ S4/D15 (demo): a mid-turn mirror is re-read before the verdict, so 11 lines are not judged as 5
+    actual: aborted (no assistant message for the last prompt)   ← 演示原样
+✖ S4/D15: a truncated read-back is an honest unknown, never no assistant message
+✖ S4/D15: a COMPLETE remote transcript with no assistant message still aborts (the frozen reason)
+```
+
+`test/unit/session.test.ts:77-89`（完整转录、确实没有 assistant ⇒ `aborted` + 冻结 reason）始终未改、始终绿 ——
+说明新逻辑只放宽「这份文本够不够格当判定」，没有动那条真语义。
+
 ### 绿：本卡的最终门禁（2026-11-18，本分支实跑）
 
 `npm run typecheck`（`tsc --noEmit`）：
@@ -403,30 +525,30 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
 `npm test`（`node --experimental-strip-types --test test/unit/*.test.ts`）：
 
 ```text
-ℹ tests 2595
-ℹ pass 2594
+ℹ tests 2624
+ℹ pass 2623
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 1
 ℹ todo 0
-ℹ duration_ms 54619.481839
+ℹ duration_ms 62382.430297
 ```
 
 `npm run test:integration`（`… test/integration/*.test.ts`）：
 
 ```text
-ℹ tests 171
-ℹ pass 171
+ℹ tests 173
+ℹ pass 173
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 47080.637832
+ℹ duration_ms 56453.558457
 ```
 
 三条命令的退出码都是 0。`test/unit/terminal-supervisor.test.ts` 未修改（D18 of `cross-machine-spawn-v1`）。
 
-## 8. 版本建议：`6.3.0`（minor）
+## 9. 版本建议：`6.3.0`（minor）
 
 - **为什么是 minor**：新增了一项**能力** —— `/legion doctor crossmachine` 从「配置回显」变成一次体检（一次 `hc` 连接、
   PASS/FAIL/SKIP、每项带真值的 `fix:`、末尾可粘贴的 launch）；同时新增了一条**零配置的 launch 路径**
@@ -436,11 +558,18 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
   静态 doctor 块逐字节保留给 `auto-doctor` 与无快照路径），没有数据迁移（settings 与磁盘缓存格式都没变）。
   唯一"行为变化"是**报错文案与它的时机**（D2 在任何 `machine.exec` 之前），而文案不是 API。
 
-## 9. 边界 / 未做
+## 10. 边界 / 未做
 
 - **D2 的提问不可能知道对话里从未提过的目录**：这是设计（它问），不是缺陷；它只保证「不猜、不翻译、不绕过」。
 - **`hc machine ls` 是按 `HC_SESSION` 的**：真实会话里注册的机器，在 `HC_SESSION=test-*` 里看不见（反之亦然）。
   所以体检里 `hc machines` 那行 FAIL 时，先确认你跑在哪个会话里（runbook 第 5 节）。
+- **远端镜像目录仍按 handle 共享**：`…/.pi-subagents-mirror/no-run/<handle>/session.jsonl` 跨轮次保留，上一轮残留的转录
+  仍可能让新的启动确认门提前通过（仓库里 `docs/reports/remote-child-startup.md` 的 R1 记过同一件事）。彻底修需要 per-launch
+  目录（或一次不会与 resume 竞争的清理），属于交付通道改动，本卡不做 —— D15 只保证「判定用的文本是 turn 结束后那次读回」。
+- **目录声明下 provider 扩展不再自动注入**：`pi.extensions: ["./extensions"]` 的 provider 包不会再出现在 `piExtensions` 里
+  （`pi --extension <目录>` 跑不起来）。继承来的场景由 argv 的 `-e <file>` 映射覆盖；只有「角色卡关掉继承、又只靠
+  `piExtensions`」才会少一个 provider —— 此时 `target models` 那一行会 FAIL 并给 `piExtensions` 的修法。
+- **整包声明（`pi.extensions: ["./"]`）仍解析不了**：探测端给 `relative: ""`，被现有守卫丢弃；属 D13 之外，已记录。
 - **体检的 host 上限是 5**：第 6 个起只给计数（`… N more host(s) not checked (cap 5)`）；缺包 8、模型 10 同理。
 - **`model-missing` 仍然放行候选链**：体检把「那台机器没有这个模型」作为 FAIL 报出来，但运行期的启动探测
   仍旧允许模型候选链。`noModelFallback` 钉在「机器事实」那几条上（`cwd` 缺失 `src/runs/remote.ts:714`/`:1756`、

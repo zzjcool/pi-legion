@@ -63,7 +63,14 @@ Manual walkthrough: `docs/runbooks/cross-machine-centurion-demo.md`.
 
 A remote child that dies at start-up answers with the exit code, the last screen
 text and a `Command (run on '<host>' to reproduce):` line — paste that command
-instead of guessing, and do not report `execution: unknown` as the reason.
+instead of guessing, and do not report `execution: unknown` as the reason. An
+`execution: unknown (read-back was truncated …)` is this machine's blind spot, not
+the child's fate: re-collect instead of reporting a failure.
+
+Extensions this machine has and the target does not are not a reason to stop: an
+INHERITED one is dropped with one `⚠` line in the result (install it there or add
+it to `excludeExtensions`), while an extension the ROLE CARD itself declares is a
+hard refusal before launch.
 
 ## Legion visualization
 

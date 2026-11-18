@@ -822,7 +822,14 @@ async function probeInheritedExtensions(input: {
 	const more = entries.length - shown.length;
 	const fixes: string[] = [];
 	const fixed = entries.slice(0, MAX_PACKAGE_FIXES);
-	for (const [name] of fixed) {
+	for (const [name, info] of fixed) {
+		if (info.reason === "entry-missing") {
+			// Installing it again is not the fix: the package IS there, it declares a
+			// different layout. Say that instead of printing a command that changes
+			// nothing (this is exactly the demo's `./extensions` vs file case).
+			fixes.push(`# ${name} is installed on ${target.host} but does not declare './${info.relative}' — align the package versions on both machines, or exclude it below`);
+			continue;
+		}
 		// D4's first way out, with the concrete values.
 		fixes.push(`hc exec --on ${target.host} -- pi install npm:${name}`);
 	}

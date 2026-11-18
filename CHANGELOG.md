@@ -39,6 +39,15 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   禁止 `ssh`/`hc exec` 试探远端、`/legion doctor crossmachine` 与 runbook 的指路、远端 child 起不来时读退出码 +
   screen 原文 + 可复现命令）。`files` 与 `npm pack` 都会带上它，`test/unit/skill-cross-machine.test.ts` 钉住
   「删掉即红」与打包可见。
+- **声明目录就是声明（D13）**：`pi.extensions: ["./extensions"]` 的包不再被判「未声明入口」——远端探测多带一个
+  「这是目录」的事实位，解析时按**最长声明目录**包含（posix 拼接、不许 `..`、不许裸 `startsWith`），精确匹配优先；
+  报错里目录带尾 `/`，doctor 的 `entry-missing` 也从静默 PASS 改成 FAIL（与 launch 同口径）。
+- **继承来的扩展缺了不再拦住 launch（D14）**：argv 里成对丢掉 `-e <path>`，launch 继续，并在 `subagent(...)` 的返回里给
+  **一行**汇总（包名 + 每包的 `pi install` + 一条合并的 `excludeExtensions` JSON + 写进哪个文件 + 一句「角色卡自己声明的
+  扩展不会被跳过」）。角色卡显式声明与 child guard 仍然是硬拒，D4 的句子原样保留；探针没答（`no-index`）同策略。
+- **不再拿中途快照当判决（D15）**：turn 结束后重新读一次远端转录，verdict 与 `read-back N of M` 都用这一次；截断/空文本
+  不再产出 `aborted (no assistant message for the last prompt)`，而是带原因的诚实 `unknown`；完整转录确实没有 assistant
+  仍是 `aborted`。`collectArtifactGrowing` 改看判定真正用的那份文件。
 - **换掉「先读三条命令」的开场（D9）**：`docs/runbooks/cross-machine-centurion-demo.md` 第 0 步就是
   `/legion doctor crossmachine`（一条命令 + PASS/FAIL 怎么读 + 它打印的可粘贴 launch），原来的手工三条检查降级为
   它下面的「手工兜底」；配置一节改成最小配置 `{"subagents":{"crossMachine":{"enabled":true}}}` + 按次 `cwd`
