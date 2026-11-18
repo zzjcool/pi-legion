@@ -221,3 +221,47 @@ this branch implement the amended text.
   missing package is deterministic — retrying the candidate chain re-runs the same
   probes). Scoped package names (`@scope/name`) match `excludeExtensions` again, so the
   D4 snippet works for them.
+
+## Amendments from the second real demo (D13–D15)
+
+A second live run (Mac → `hw-nj`) surfaced three more first-attempt failures. They are
+frozen here as D13–D15; the code, tests and docs in this branch implement them.
+
+- **D13 — a declared DIRECTORY is a declaration.** A package that declares
+  `pi.extensions: ["./extensions"]` exposes every entry under it. The remote probe now
+  reports whether each declared entry is a directory (one `statSync`, no extra round
+  trip), and `resolvePackagePathOnHost` accepts a requested entry that lives **under** a
+  declared directory (longest proper posix prefix, `path.posix` join, no `..`, no bare
+  `startsWith`). Exact matches keep priority, so file declarations behave byte-identically.
+  `entry-missing` remains for a request that no declaration — file or directory — covers.
+  Old caches without the flag are treated conservatively (no prefix matching; TTL heals).
+  A directory declaration is never emitted as a provider `EXT` line (a directory is not
+  something `pi --extension` can execute). `/legion doctor crossmachine` and the launch
+  path must now agree: `entry-missing` is a FAIL in the checkup, not a silent PASS.
+- **D14 — inherited extensions are best-effort; the card's own are required.** When an
+  extension that the child inherited from this machine's installed packages cannot be
+  mapped on the target, the launch **drops it and continues**, and the `subagent(...)`
+  result carries ONE warning line: the package names, one pasteable
+  `hc exec --on <host> -- pi install npm:<pkg>` per package, one merged
+  `{"subagents":{"agentOverrides":{"<role>":{"excludeExtensions":[…]}}}}` JSON plus where
+  to put it, and a sentence saying the role's own `extensions:` are never skipped. An
+  extension the role card itself declares (`extensions` / `subagentOnlyExtensions`, after
+  overrides and team merge) and the child guard remain **hard refusals** — D4's sentence
+  and JSON apply there unchanged. A missing package index (`packages === undefined`) is
+  the same policy with reason `no-index`. `ChildHandle.warning` stops being
+  "in-process-only": the terminal backend sets it too.
+- **D15 — a verdict may not be derived from a stale snapshot.** The remote mirror is
+  read once when `collect` starts; the verdict must therefore be derived from a
+  read-back taken **after** the turn settles (one refresh, no polling), and the
+  `read-back … N of M` line must report that same read. A text that is `truncated` or
+  empty may NOT produce `aborted (no assistant message for the last prompt)`: it
+  produces the honest `unknown` outcome with a reason naming the read-back. A complete
+  transcript that genuinely ends without an assistant message stays `aborted` with the
+  frozen reason. `collectArtifactGrowing` watches the file the verdict is actually
+  derived from (`sessionFileOf(child)`), not the local placeholder.
+
+Not fixed here (recorded as a boundary in the report): the shared remote mirror
+directory (`…/.pi-subagents-mirror/no-run/<handle>`) still keeps a previous launch's
+`session.jsonl`, so a stale file can confirm a new start-up early. Fixing that needs a
+per-launch mirror directory (or a pre-launch cleanup that cannot race a resume), which
+is a delivery-channel change beyond this card.
