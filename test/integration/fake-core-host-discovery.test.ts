@@ -502,9 +502,19 @@ test("v1.2: an extension the target does not have is refused before any terminal
 		localCwd: h.remoteRoot,
 		pathMap: target.pathMap,
 		...(target.packageIndex ? { packages: target.packageIndex } : {}),
+		// D4: the launch path knows the role, so the refusal can name the key for it.
+		role: "centurion",
 	}));
-	assert.match(String((failure as Error)?.message ?? failure), /package 'pi-not-installed', which is not installed on that machine/);
-	assert.match(String((failure as Error)?.message ?? failure), /Install 'pi-not-installed' on 'fakebox'/);
+	const message = String((failure as Error)?.message ?? failure);
+	assert.match(message, /package 'pi-not-installed', which is not installed on that machine/);
+	// D4's two ways out, with the real host and the real role — the snippet is the
+	// fix the operator asked for, not a pointer to the source file.
+	assert.match(message, /hc exec --on fakebox -- pi install npm:pi-not-installed/);
+	assert.match(message, /for role 'centurion': subagents\.agentOverrides\.centurion\.excludeExtensions/);
+	const settingsJson = message.match(/\{"subagents":\{"agentOverrides":\{.*\}\}\}/)?.[0];
+	assert.ok(settingsJson, `expected the D4 settings JSON, got: ${message}`);
+	const parsed = JSON.parse(settingsJson) as { subagents: { agentOverrides: Record<string, { excludeExtensions: string[] }> } };
+	assert.deepEqual(parsed.subagents.agentOverrides.centurion?.excludeExtensions, ["pi-not-installed"]);
 	// Nothing was started: argv mapping runs before `terminal.run`.
 	assert.deepEqual(h.wireFor("terminal.run"), []);
 });

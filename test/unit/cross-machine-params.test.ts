@@ -20,7 +20,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type HcClient, type HcMethod } from "../../src/hc/client.ts";
@@ -527,6 +527,47 @@ test("M3/v1.2: an inherited-style extension that cannot be mapped now REFUSES th
 		assert.equal(h.client.paramsFor("terminal.run").length, 0, "no terminal may be created");
 	} finally {
 		h.cleanup();
+	}
+});
+
+test("D4: a package missing on the target names the ROLE and the exact excludeExtensions JSON, before any terminal", async () => {
+	// The parent inherits an extension from a REAL package here (the manifest walk
+	// needs one to name the package), the target reports a package index that does
+	// not contain it, and the launch knows which role it is starting.
+	const parentRoot = mkdtempSync(path.join(tmpdir(), "cross-machine-d4-parent-"));
+	const h = harness(localEnv());
+	try {
+		const pkgDir = path.join(parentRoot, "node_modules", "pi-sysmon");
+		mkdirSync(path.join(pkgDir, "extensions"), { recursive: true });
+		const entry = path.join(pkgDir, "extensions", "index.ts");
+		writeFileSync(entry, "export function registerProvider() {}\n");
+		writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "pi-sysmon", pi: { extensions: ["./extensions/index.ts"] } }));
+		const args = spawnInput(h.root, {
+			host: "vps",
+			hostTarget: hostTarget({
+				packageIndex: { packages: [{ name: "pi-other", dir: "/srv/pi/npm/node_modules/pi-other" }], entries: [] },
+			}),
+		});
+		args.agent = { ...args.agent, extensions: [entry] };
+		const failure = await h.supervisor.spawnChild(args).then(() => undefined, (error: unknown) => error);
+		assert.ok(failure instanceof SubagentError, `expected a refusal, got ${String(failure)}`);
+		assert.equal(failure.code, ErrorCodes.INVALID_PARAMS);
+		const message = failure.message;
+		// D4's frozen shape, with the role the launch is actually starting.
+		assert.match(message, /which is not installed on that machine/);
+		assert.match(message, /Two ways out: 1\) install it there — hc exec --on vps -- pi install npm:pi-sysmon/);
+		assert.match(message, /for role 'centurion': subagents\.agentOverrides\.centurion\.excludeExtensions/);
+		const settingsJson = message.match(/\{"subagents":\{"agentOverrides":\{.*\}\}\}/)?.[0];
+		assert.ok(settingsJson, `expected the D4 settings JSON in the refusal, got: ${message}`);
+		assert.equal(settingsJson, '{"subagents":{"agentOverrides":{"centurion":{"excludeExtensions":["pi-sysmon"]}}}}');
+		const parsed = JSON.parse(settingsJson) as { subagents: { agentOverrides: Record<string, { excludeExtensions: string[] }> } };
+		assert.deepEqual(parsed.subagents.agentOverrides.centurion?.excludeExtensions, ["pi-sysmon"]);
+		// The role travels in details too (the resume/read-back paths need it).
+		assert.equal(((failure.details as { role?: string }) ?? {}).role, "centurion");
+		assert.equal(h.client.paramsFor("terminal.run").length, 0, "no terminal may be created");
+	} finally {
+		h.cleanup();
+		rmSync(parentRoot, { recursive: true, force: true });
 	}
 });
 
