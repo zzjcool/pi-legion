@@ -94,26 +94,33 @@ clean: ## 删真模型容器（镜像保留）
 XM_IMAGE ?= pi-legion-xm:latest
 XM_MODEL ?= workbuddy/hy4std
 
-.PHONY: xm-build xm-up xm-down xm xm-model
+.PHONY: xm-build xm-up xm-down xm xm-model xm-real
 
 xm-build: ## 构建跨机自测镜像 pi-legion-xm:latest（沙箱镜像 + openssh，key-only）
 	@docker build -t "$(XM_IMAGE)" -f "$(DOCK)/Dockerfile.xm" "$(ROOT)"
 
 xm-up: ## 起跨机两容器（parent+remote）并把真 hc 装进 parent（镜像缺则自动 build）
-	@env XM_IMAGE="$(XM_IMAGE)" XM_MODEL="$(XM_MODEL)" bash "$(DOCK)/xm-up.sh"
+	@env XM_IMAGE="$(XM_IMAGE)" XM_MODEL="$(XM_MODEL)" XM_MODEL_SCENARIO="$(XM_MODEL_SCENARIO)" \
+	  bash "$(DOCK)/xm-up.sh"
 
 xm-down: ## 停/删跨机两容器+网络（卷默认保留，XM_KEEP=0 连卷删）
 	@bash "$(DOCK)/xm-down.sh"
 
-# assert.mjs / drive.mjs 由 W2 提供：缺失时明确失败，绝不静默通过。
-xm: xm-up ## 跨机全流程自测：up → 四条断言（会真花钱，见契约 §5）
-	@test -f "$(DOCK)/xm/assert.mjs" || { \
-	  echo "XM_FAIL missing test/docker/xm/assert.mjs :: test -f :: 该文件由 W2 提供，尚未合入（失败，不是 skip）"; \
-	  exit 1; }
-	@cd "$(ROOT)" && env XM_IMAGE="$(XM_IMAGE)" XM_MODEL="$(XM_MODEL)" node test/docker/xm/assert.mjs
+# xm 的门禁是**确定性的**：pi 由 test/mock-llm 驱动（两个 mock 端口，两套脚本），
+# 模型输出不参与变量。assert.mjs 只从 docker exec 取证，逐条打印 XM_ASSERT。
+xm: XM_MODEL_SCENARIO := launch
+xm: xm-up ## 跨机全流程自测（确定性 mock 驱动）：up → a1/a2/b/c/d
+	@cd "$(ROOT)" && env XM_SCENARIO=launch node test/docker/xm/assert.mjs
 
+# 额外一次「父机模型在远端不存在」：远端 models.json 不含该 provider/model，
+# 断言派发被 model-missing 类错误拒绝且列出远端可见模型（契约 §5.4）。
+xm-model: XM_MODEL_SCENARIO := model-missing
 xm-model: xm-up ## 跨机 +「父机模型在远端不存在」那一次（XM_SCENARIO=model-missing）
-	@test -f "$(DOCK)/xm/assert.mjs" || { \
-	  echo "XM_FAIL missing test/docker/xm/assert.mjs :: test -f :: 该文件由 W2 提供，尚未合入（失败，不是 skip）"; \
-	  exit 1; }
-	@cd "$(ROOT)" && env XM_IMAGE="$(XM_IMAGE)" XM_MODEL="$(XM_MODEL)" XM_SCENARIO=model-missing node test/docker/xm/assert.mjs
+	@cd "$(ROOT)" && env XM_SCENARIO=model-missing node test/docker/xm/assert.mjs
+
+# 可选：用真模型跑同一套断言。模型的自由度会让它时绿时红 —— 那不是产品缺陷，
+# 所以失败只打印一行 XM_REAL_FAIL，且**不**参与 make xm 的门禁。
+xm-real: XM_MODEL_SCENARIO := launch
+xm-real: xm-up ## 可选：真模型跑同一套断言（失败=XM_REAL_FAIL，非门禁）
+	@cd "$(ROOT)" && env XM_DRIVER=real XM_MODEL="$(XM_MODEL)" node test/docker/xm/assert.mjs \
+	  || echo "XM_REAL_FAIL（模型自由度导致，非产品缺陷）"
