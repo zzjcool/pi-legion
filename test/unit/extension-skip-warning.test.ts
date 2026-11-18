@@ -134,11 +134,46 @@ test("D14: only `-e`/`--extension` pairs are eligible — every other absolute p
 test("D14: a REQUIRED extension (skippable false) refuses even though the mapper could drop", (t) => {
 	const missing = parentPackage(t, "pi-sysmon");
 	// The backend's `skippable` is `!required.has(...)`: this mirrors the card case.
+	// `skipped` is always supplied by that caller — the two options travel together.
+	const skipped: SkippedExtension[] = [];
 	assert.throws(
-		() => mapRemoteArgv(["-e", missing.entry], { ...MAP_OPTS, packages: TARGET_INDEX, skippable: () => false }),
+		() => mapRemoteArgv(["-e", missing.entry], { ...MAP_OPTS, packages: TARGET_INDEX, skippable: () => false, skipped }),
 		(error: unknown) => {
 			assert.ok(error instanceof SubagentError);
 			assert.match(error.message, /for role|excludeExtensions|not installed on that machine/);
+			return true;
+		},
+	);
+	assert.deepEqual(skipped, [], "a refusal is not a skip");
+});
+
+test("D14: `skippable` without `skipped` THROWS instead of dropping an extension silently", (t) => {
+	const missing = parentPackage(t, "pi-sysmon");
+	// The API footgun this closes: `skippable` permits a drop, `skipped` is where the
+	// drop is RECORDED. A caller who supplies the first and forgets the second asked
+	// for exactly the silent loss D14 removed — so it is a programmer error (plain
+	// `Error`) at the call site, not a launch refusal a user would have to decode.
+	assert.throws(
+		() => mapRemoteArgv(["-e", missing.entry], { ...MAP_OPTS, packages: TARGET_INDEX, skippable: () => true }),
+		(error: unknown) => {
+			assert.ok(error instanceof Error, "a plain Error is enough");
+			assert.ok(
+				!(error instanceof SubagentError),
+				"it must not look like a launch refusal (SubagentError is what the operator sees)",
+			);
+			assert.match(error.message, /skippable/);
+			assert.match(error.message, /skipped/);
+			return true;
+		},
+	);
+	// The no-`skippable` path is byte-identical: `skipped` alone records nothing,
+	// because nothing may be dropped, and the v1.2 refusal still stands.
+	assert.deepEqual(mapRemoteArgv(["--model", "x"], { ...MAP_OPTS, packages: TARGET_INDEX, skipped: [] }), ["--model", "x"]);
+	assert.throws(
+		() => mapRemoteArgv(["-e", missing.entry], { ...MAP_OPTS, packages: TARGET_INDEX, skipped: [] }),
+		(error: unknown) => {
+			assert.ok(error instanceof SubagentError);
+			assert.match(error.message, /which is not installed on that machine/);
 			return true;
 		},
 	);
@@ -189,7 +224,9 @@ test("D14: the warning is ONE line that names host, packages, installs, the merg
 test("D14: the warning is bounded — 8 names + `and N more`, 5 installs, one JSON", () => {
 	const line = skippedExtensionWarning({ host: "vps", role: "centurion", cwd: "/work/app", skipped: skippedPackages(10, "not-installed") });
 	assert.ok(line);
-	assert.match(line, /10 inherited extension\(s\)/);
+	// The count is PACKAGES (the dedupe key), not argv entries: two entries of one
+	// package are one package, and the noun says so.
+	assert.match(line, /10 inherited package\(s\)/);
 	// 8 named, the other 2 counted.
 	for (let index = 0; index < 8; index++) assert.ok(line.includes(`pi-pkg${index} `), `missing pi-pkg${index}`);
 	assert.doesNotMatch(line, /pi-pkg8 \(/, "the 9th package must not be listed by name");
@@ -201,6 +238,25 @@ test("D14: the warning is bounded — 8 names + `and N more`, 5 installs, one JS
 	assert.ok(json, `expected the merged settings JSON, got: ${line}`);
 	const parsed = JSON.parse(json) as { subagents: { agentOverrides: Record<string, { excludeExtensions: string[] }> } };
 	assert.deepEqual(parsed.subagents.agentOverrides.centurion?.excludeExtensions, skippedPackages(10, "not-installed").map((entry) => entry.package));
+});
+
+test("D14: two skipped ENTRIES of one package are reported as ONE package", () => {
+	// `mapRemoteArgv` reports every dropped value, so one package with two loadable
+	// entries arrives twice. The warning dedupes by package name; before this the
+	// count said "2 inherited extension(s)" over one package name — a number the
+	// reader cannot match to anything on disk.
+	const line = skippedExtensionWarning({
+		host: "vps",
+		role: "centurion",
+		cwd: "/work/app",
+		skipped: [
+			{ file: "/me/pi-lens/index.ts", package: "pi-lens", reason: "not-installed", role: "centurion" },
+			{ file: "/me/pi-lens/dist/index.js", package: "pi-lens", reason: "not-installed", role: "centurion" },
+		],
+	});
+	assert.ok(line);
+	assert.match(line, /1 inherited package\(s\) cannot be loaded there/);
+	assert.equal(line.match(/pi-lens \(not installed on vps\)/g)?.length, 1, `the package must be named once: ${line}`);
 });
 
 test("D14: a skip with NO package index says so instead of inventing an install", () => {

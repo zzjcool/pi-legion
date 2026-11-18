@@ -577,6 +577,10 @@ test("D4: a package missing on the target FAILs with the role and a pasteable ex
 			inherited.line,
 			/^1 package\(s\) missing on fakebox: pi-sysmon \(not installed on fakebox\) for role 'centurion' — the launch will skip it with a warning and continue; an extension the role card declares itself in extensions: is refused instead$/,
 		);
+		// Guard the two D14 variants apart: an INHERITED entry keeps the skip tail and
+		// must never carry the card-declared refusal (that would make doctor refuse
+		// every ordinary launch).
+		assert.doesNotMatch(inherited.line, /the role card declares it, so a launch REFUSES/);
 		// The install action, then the settings key as pasteable JSON (pitfall #2).
 		assert.equal(inherited.fixes?.[0], "hc exec --on fakebox -- pi install npm:pi-sysmon");
 		const json = inherited.fixes?.map((fix) => {
@@ -661,6 +665,8 @@ test("D13: a target whose declaration does NOT cover the entry FAILs and names i
 			inherited.line,
 			/^1 package\(s\) missing on fakebox: pi-sysmon \(entry 'extensions\/pi-sysmon\/index\.ts' not declared on fakebox\) for role 'centurion' — the launch will skip it with a warning and continue; an extension the role card declares itself in extensions: is refused instead$/,
 		);
+		// The inherited variant stays skippable even when the reason is `entry-missing`.
+		assert.doesNotMatch(inherited.line, /the role card declares it, so a launch REFUSES/);
 		// The merged D4 snippet still applies (excluding the package by name is one
 		// way out), and the caps/JSON shape are untouched.
 		const json = inherited.fixes?.map((fix) => {
@@ -675,6 +681,331 @@ test("D13: a target whose declaration does NOT cover the entry FAILs and names i
 	} finally {
 		core.cleanup();
 		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+// ── D14 (the mirrored half): the ROLE CARD's own extensions are required ────
+
+/**
+ * A parent-side npm package whose loadable entry a ROLE CARD names.
+ *
+ * `excludeExtensions` cannot express this case — it filters INHERITANCE — so the
+ * card path is checked as its own fact, exactly as `terminal-supervisor` puts it
+ * in the launch's `required` set (`extensions` + `subagentOnlyExtensions`).
+ */
+function cardPackage(
+	name: string,
+	entryRelative = path.join("src", "index.ts"),
+): { entry: string; cleanup: () => void } {
+	const root = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-card-"));
+	const dir = path.join(root, "npm", "node_modules", name);
+	const entry = path.join(dir, entryRelative);
+	mkdirSync(path.dirname(entry), { recursive: true });
+	writeFileSync(entry, "export default {};\n");
+	writeFileSync(
+		path.join(dir, "package.json"),
+		JSON.stringify({ name, version: "1.0.0", pi: { extensions: [`./${entryRelative.split(path.sep).join("/")}`] } }),
+	);
+	return { entry, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+test("D14: an extension the ROLE CARD declares and the target lacks FAILs — and no JSON is offered", async () => {
+	const repo = localRepo();
+	const ext = hostExtensionPackage();
+	const card = cardPackage("pi-cardonly");
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	// The target's payload does NOT contain pi-cardonly: `not-installed`, the very
+	// refusal `terminal-supervisor` raises for a required extension.
+	const core = fakeHcCore(discoveryPayload());
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(ext.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			// `inheritExtensions: false` keeps the inherited half empty, so the line is
+			// about ONE provenance only — the card's.
+			agents: [role("centurion", { model: MODEL, inheritExtensions: false, extensions: [card.entry] })],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		assert.equal(inherited.status, "fail", `a card-declared extension the target lacks must FAIL, got: ${inherited.line}`);
+		// The card's provenance decides the consequence: a launch REFUSES (D4/D14).
+		assert.match(
+			inherited.line,
+			/^1 package\(s\) missing on fakebox: pi-cardonly \(not installed on fakebox\) for role 'centurion' \(the role card declares it, so a launch REFUSES\)$/,
+		);
+		// D14's boundary, said out loud: inherited entries are skipped, the card's are not.
+		assert.doesNotMatch(inherited.line, /the launch will skip/);
+		// The only fix that can work: install it there.
+		assert.deepEqual(inherited.fixes, ["hc exec --on fakebox -- pi install npm:pi-cardonly"]);
+		// `excludeExtensions` filters inheritance, so it is NOT a fix for a card's own
+		// entry — offering it would send the reader to a setting that changes nothing.
+		assert.ok(
+			!inherited.fixes?.some((fix) => fix.includes("excludeExtensions")),
+			`no excludeExtensions JSON for a card-declared entry, got: ${JSON.stringify(inherited.fixes)}`,
+		);
+		assert.ok(!inherited.fixes?.some((fix) => fix.includes("# where:")), "no where-to-put-it line without a JSON");
+	} finally {
+		core.cleanup();
+		card.cleanup();
+		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+test("D14: the SAME card-declared extension PASSes when the target has the package", async () => {
+	const repo = localRepo();
+	const ext = hostExtensionPackage();
+	const card = cardPackage("pi-lens");
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	// The target has pi-lens, declaring the same entry relative — the re-root works.
+	const core = fakeHcCore(discoveryPayload({ packages: ["pi-sysmon", "pi-lens"] }));
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(ext.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [role("centurion", { model: MODEL, inheritExtensions: false, extensions: [card.entry] })],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		assert.equal(inherited.status, "pass", `expected a PASS, got: ${inherited.line}`);
+		// The count names the provenance it verified (no "inherited" claim here).
+		assert.match(inherited.line, /^1 extension\(s\) resolve on fakebox \(1 declared by a role card\)$/);
+		assert.equal(inherited.fixes, undefined, "a PASS carries no fixes");
+	} finally {
+		core.cleanup();
+		card.cleanup();
+		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+test("D14: a card-declared entry the target declares differently gets the align-versions fix, not the JSON", async () => {
+	const repo = localRepo();
+	const ext = hostExtensionPackage();
+	// The parent asks for `extensions/index.ts`; the target declares `src/index.ts`
+	// (the D13 `entry-missing` shape), and this time the asker is the CARD.
+	const card = cardPackage("pi-cardonly", path.join("extensions", "index.ts"));
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const core = fakeHcCore(discoveryPayload({ packages: ["pi-sysmon", "pi-cardonly"] }));
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(ext.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [role("centurion", { model: MODEL, inheritExtensions: false, extensions: [card.entry] })],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		assert.equal(inherited.status, "fail", inherited.line);
+		assert.match(
+			inherited.line,
+			/^1 package\(s\) missing on fakebox: pi-cardonly \(entry 'extensions\/index\.ts' not declared on fakebox\) for role 'centurion' \(the role card declares it, so a launch REFUSES\)$/,
+		);
+		// Re-installing cannot fix a layout mismatch, and excluding does not apply: the
+		// ONE fix says the truth and points nowhere that would not work.
+		assert.deepEqual(inherited.fixes, [
+			"# pi-cardonly is installed on fakebox but does not declare './extensions/index.ts' — align the package versions on both machines",
+		]);
+	} finally {
+		core.cleanup();
+		card.cleanup();
+		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+test("D14: an extension BOTH inherited and card-declared is checked ONCE, as required", async () => {
+	const repo = localRepo();
+	// The parent inherits pi-sysmon from `pi list` AND the card names the same path.
+	const ext = hostExtensionPackage();
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	// pi-sysmon is absent from the target's payload, so the ONE checked entry is
+	// missing there — the point is the provenance it is reported under.
+	const core = fakeHcCore(discoveryPayload({ packages: ["pi-any-endpoint"] }));
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(ext.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [role("centurion", { model: MODEL, extensions: [ext.entry] })],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		assert.equal(inherited.status, "fail", inherited.line);
+		// ONE entry, and the CARD wins: the same path arriving twice must not turn a
+		// required extension into a skippable one.
+		assert.match(
+			inherited.line,
+			/^1 package\(s\) missing on fakebox: pi-sysmon \(not installed on fakebox\) for role 'centurion' \(the role card declares it, so a launch REFUSES\)$/,
+		);
+		assert.doesNotMatch(inherited.line, /pi-sysmon \(not installed on fakebox\) for role 'centurion' —/);
+		assert.deepEqual(inherited.fixes, ["hc exec --on fakebox -- pi install npm:pi-sysmon"]);
+	} finally {
+		core.cleanup();
+		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+test("D14: the two provenances stay distinguishable in ONE line (inherited skips, the card's refuses)", async () => {
+	const repo = localRepo();
+	const ext = hostExtensionPackage();
+	const card = cardPackage("pi-cardonly");
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	// Two roles: `scout` merely inherits (`inheritExtensions` default), `centurion`
+	// DECLARES its own. Both packages are absent from the target — the payload lists
+	// only pi-any-endpoint, so pi-sysmon (inherited) and pi-cardonly (declared) are
+	// both missing, one for each provenance.
+	const core = fakeHcCore(discoveryPayload({ packages: ["pi-any-endpoint"] }));
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(ext.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [
+				role("scout", { model: MODEL }),
+				role("centurion", { model: MODEL, inheritExtensions: false, extensions: [card.entry] }),
+			],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		assert.equal(inherited.status, "fail", inherited.line);
+		// D4's frozen sentence stays for the inherited entry…
+		assert.match(inherited.line, /\(not installed on fakebox\) for role 'scout'/);
+		assert.match(inherited.line, /— the launch will skip it with a warning and continue; an extension the role card declares itself in extensions: is refused instead/);
+		// …and the card's entry says REFUSES, in the same line.
+		assert.match(inherited.line, /pi-cardonly \(not installed on fakebox\) for role 'centurion' \(the role card declares it, so a launch REFUSES\)/);
+		// The JSON covers the inherited package only — it cannot reach the card's.
+		const json = inherited.fixes?.map((fix) => {
+			try {
+				return JSON.parse(fix) as { subagents?: { agentOverrides?: Record<string, { excludeExtensions?: string[] }> } };
+			} catch {
+				return undefined;
+			}
+		}).find((parsed) => parsed !== undefined);
+		assert.ok(json, `expected a settings JSON fix for the inherited half, got: ${JSON.stringify(inherited.fixes)}`);
+		assert.deepEqual(json!.subagents?.agentOverrides, { scout: { excludeExtensions: ["pi-sysmon"] } });
+	} finally {
+		core.cleanup();
+		card.cleanup();
+		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+test("D14: a card-declared `builtin:` ref is not a package to install on that machine", async () => {
+	const repo = localRepo();
+	const ext = hostExtensionPackage();
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const core = fakeHcCore(discoveryPayload());
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(ext.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			// `builtin:codemode` is a pi builtin, not an npm package: `mapRemoteArgv`
+			// neither maps nor drops one, so a checkup that probed its "package" would
+			// FAIL a launch that works. (It is also NOT `path.resolve`d — resolving it here
+			// would have found this repository's own package.json and reported pi-legion.)
+			agents: [role("centurion", { model: MODEL, inheritExtensions: false, extensions: ["builtin:codemode"] })],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		assert.equal(inherited.status, "pass", inherited.line);
+		assert.match(inherited.line, /^no extension to check: no role card declares an absolute package path/);
+	} finally {
+		core.cleanup();
+		ext.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+/** A `pi` that fails `pi list` — an unreadable host, not an empty one. */
+function brokenPi(): { pathValue: string; cleanup: () => void } {
+	const root = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-nopi-"));
+	const bin = path.join(root, "bin");
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(path.join(bin, "pi"), "#!/bin/sh\nexit 1\n");
+	chmodSync(path.join(bin, "pi"), 0o755);
+	return { pathValue: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+test("D14: an unreadable host still checks the card's half — and says the inherited half was not checked", async () => {
+	const repo = localRepo();
+	const card = cardPackage("pi-lens");
+	const broken = brokenPi();
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const core = fakeHcCore(discoveryPayload({ packages: ["pi-sysmon", "pi-lens"] }));
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	const logs: string[] = [];
+	const realError = console.error;
+	console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+	try {
+		// `pi list` fails HERE, so nothing is inherited/known about this machine — but the
+		// card's own list is a fact about the target and needs no probe of this one.
+		await warmHostExtensions(broken.pathValue);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [role("centurion", { model: MODEL, extensions: [card.entry] })],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		// SKIP, never PASS: the card half resolved, the inherited half was never read.
+		assert.equal(inherited.status, "skip", inherited.line);
+		assert.match(
+			inherited.line,
+			/^1 extension\(s\) the role cards declare resolve on fakebox, but inherited extensions were not checked \(pi list failed on this machine\)/,
+		);
+	} finally {
+		console.error = realError;
+		core.cleanup();
+		broken.cleanup();
+		card.cleanup();
 		rmSync(cache, { recursive: true, force: true });
 		resetExtensionDiscoveryCache();
 		repo.cleanup();

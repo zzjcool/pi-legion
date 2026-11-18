@@ -204,7 +204,11 @@ export function skippedExtensionWarning(input: {
 				: `${name} (not installed on ${host})`)
 			.join(", ");
 		parts.push(
-			`cross-machine on '${host}': ${entries.length} inherited extension(s) cannot be loaded there, so this launch dropped them and continues: ${why}${more > 0 ? ` and ${more} more` : ""}`,
+			// The count is PACKAGES: `missing` is keyed by `label` (`entry.package`, else
+			// the file's basename when this machine could not name one), so two entries of
+			// one package are one package here — and the noun has to say that, or the
+			// reader counts entries on disk and finds a different number.
+			`cross-machine on '${host}': ${entries.length} inherited package(s) cannot be loaded there, so this launch dropped them and continues: ${why}${more > 0 ? ` and ${more} more` : ""}`,
 		);
 	}
 	if (unchecked.length > 0) {

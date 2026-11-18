@@ -271,6 +271,14 @@ export interface SkippedExtension {
  * skippable and its mapping would be refused, BOTH argv elements are removed —
  * a lone `--extension`/`--extension <next flag>` is a dangling pair pi cannot
  * parse — and `{file, package?, reason, role?}` is appended to `skipped`.
+ *
+ * `skippable` and `skipped` are a PAIR: the first permits a drop, the second is
+ * the only place the drop is recorded. `skippable` without `skipped` is the
+ * exact silent loss D14 exists to remove (`skippable: () => true` and no
+ * collector drops an extension and tells nobody), so it is refused as a
+ * programmer error — a plain `Error`, not a `SubagentError`, because it is a bug
+ * in the caller and not a fact about the machine. (`skipped` alone stays legal:
+ * with no policy nothing may be dropped, so nothing needs recording.)
  */
 export function mapRemoteArgv(
 	args: readonly string[],
@@ -290,6 +298,13 @@ export function mapRemoteArgv(
 	},
 ): string[] {
 	const { skippable, skipped } = opts;
+	// The pair rule (D14): a permitted drop with nowhere to record it would be the
+	// silent loss this whole feature removed. Fail loudly at the call site instead.
+	if (skippable !== undefined && skipped === undefined) {
+		throw new Error(
+			"mapRemoteArgv: `skippable` was supplied without `skipped`, so a dropped extension would be lost silently — pass both (the caller states what may be dropped and where the drop is recorded) or neither",
+		);
+	}
 	// No policy supplied ⇒ the pre-D14 sweep, unchanged: `args.map(...)`.
 	if (skippable === undefined) return args.map((arg) => mapRemoteArgPath({ arg, ...opts }));
 	const out: string[] = [];
@@ -1371,7 +1386,8 @@ export function buildDiscoveryReport(facts: DiscoveryFacts, source: HostDiscover
 		const key = `${name}\u0000${relative}`;
 		if (seenEntries.has(key)) continue;
 		seenEntries.add(key);
-		// D13: the 4th segment is the probe's `1`/`0`. A row written before it (or a
+		// D13: the 5th field of the row — the 4th payload segment, after `name`,
+		// `relative` and `path` — is the probe's `1`/`0`. A row written before it (or a
 		// report read from a cache that old) has no value here, and the field stays
 		// ABSENT on purpose — an unknown entry is not a directory as far as
 		// `resolvePackagePathOnHost` is concerned.
