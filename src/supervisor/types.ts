@@ -698,6 +698,24 @@ export interface LegionSupervisor {
 	capabilities?: { readonly promptDisposition: boolean };
 	stats(name: string): Promise<UsageSnapshot | null>;
 	retire(name: string, opts?: { graceful?: boolean }): Promise<void>;
+	/**
+	 * Release whatever this backend keeps open for the WHOLE session, after the
+	 * children have been retired (defect E2).
+	 *
+	 * The terminal backend is the reason this exists: it holds ONE long-lived
+	 * `hc connect` child process, and a ref'd child process is exactly what keeps
+	 * Node's event loop alive. `pi --print` returns from its turn and lets the loop
+	 * drain (it never calls `process.exit`), so a leftover `hc connect` made a
+	 * finished headless run hang forever — measured 6+ minutes of idle `Sl` with the
+	 * transport still attached, killed by hand. Retire does not help: it ends a
+	 * CHILD's terminal, not the transport.
+	 *
+	 * Optional like the display reads: a backend whose transport is per-child
+	 * (rpc) or in-process (inprocess) has nothing to release, and a test double must
+	 * keep satisfying the seam. Callers read it as `supervisor.shutdown?.()`; a throw
+	 * is swallowed there because this runs on the way out.
+	 */
+	shutdown?(): void;
 }
 
 /**

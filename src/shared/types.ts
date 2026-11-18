@@ -1192,6 +1192,36 @@ export class SubagentError extends Error {
 }
 
 /**
+ * Attach CLEANUP failures to the error that already explains a failure — never
+ * replace it (`secondary:` lines, one per cleanup step).
+ *
+ * The defect this exists for (6.2.2, E1): a launch failed, the rollback that ran
+ * afterwards threw its own error, and `throw error` was reached with the ROLLBACK's
+ * message — so the verdict named a worktree-ownership guard instead of the reason
+ * the launch died. A cleanup step is additional information about a failure; it can
+ * never BE the failure. One shape for the message, so a reader (and a test) can
+ * find the original reason first and the cleanup facts after it.
+ *
+ * `code`/`details` survive: the caller's error class is what every branch on
+ * `ErrorCodes` reads, and a Secondary line must not turn an INVALID_PARAMS refusal
+ * into a generic START_FAILED.
+ */
+export function withSecondaryFailures(error: unknown, failures: readonly string[]): unknown {
+	const lines = failures.map((line) => line.trim()).filter((line) => line.length > 0);
+	if (lines.length === 0) return error;
+	const suffix = lines.map((line) => `\n  secondary: ${line}`).join("");
+	if (error instanceof SubagentError) return new SubagentError(`${error.message}${suffix}`, error.code, error.details);
+	if (error instanceof Error) {
+		const wrapped = new Error(`${error.message}${suffix}`);
+		wrapped.name = error.name;
+		// Keep the original frames: the stack still points at the real failure.
+		wrapped.stack = error.stack;
+		return wrapped;
+	}
+	return new SubagentError(`${String(error)}${suffix}`, ErrorCodes.START_FAILED);
+}
+
+/**
  * The one "name is not in this registry" error (#288).
  *
  * Six call sites (four supervisors, the orchestrator, and the stop loop) each

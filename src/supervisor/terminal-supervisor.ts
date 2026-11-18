@@ -38,6 +38,7 @@ import {
 	remoteDirFor,
 	remotePreflight,
 	terminalAddress,
+	terminalProgramEnd,
 	applyRemoteModelFallback,
 	planRemoteModelFallback,
 	remoteModelMissingError,
@@ -1212,6 +1213,29 @@ export class TerminalSupervisor implements LegionSupervisor {
 
 	// ── internals ───────────────────────────────────────────────────────
 
+	/**
+	 * Close the one `hc connect` child this backend owns (defect E2).
+	 *
+	 * The transport is session-scoped by design (one connection for every terminal
+	 * this backend addresses), so nothing else ever closes it — and a ref'd child
+	 * process keeps Node's event loop alive. `pi --print` ends its turn and lets the
+	 * loop drain, so a live `hc connect` after the last child retired was a headless
+	 * run that never exited. Called from `session_shutdown`, AFTER the children have
+	 * been retired (retire needs the transport).
+	 *
+	 * Idempotent and non-throwing: this runs on the way out, and a second close is a
+	 * no-op in `HcCliClient.close()`.
+	 */
+	shutdown(): void {
+		const client = this.client;
+		this.client = undefined;
+		try {
+			client?.close();
+		} catch {
+			/* closing a transport is not a verdict */
+		}
+	}
+
 	private async ensureClient(): Promise<HcClient> {
 		try {
 			if (!this.client) this.client = this.clientFactory();
@@ -1499,7 +1523,12 @@ export class TerminalSupervisor implements LegionSupervisor {
 		const code = typeof facts?.exit_code === "number" ? facts.exit_code : undefined;
 		const pid = typeof facts?.pid === "number" ? facts.pid : undefined;
 		return {
-			finished: code !== undefined || facts?.state === "finished",
+			// The same rule recovery uses (`terminalProgramEnd`): a kept terminal stays
+			// `state: "live"` after its program exits, so `state` alone is not "is the
+			// child over". `terminalInferred` suppresses the `missing` answer here on
+			// purpose: a core that lost its registry must not turn this gate into a
+			// launch refusal (the pre-existing rule never read `missing` as death).
+			finished: terminalProgramEnd(facts, { terminalInferred: true }) !== undefined,
 			...(code !== undefined ? { code } : {}),
 			...(pid !== undefined ? { pid } : {}),
 		};
