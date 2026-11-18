@@ -87,3 +87,33 @@ status: ## 容器与镜像状态（含子 agent 扩展注入是否就位）
 down: clean
 clean: ## 删真模型容器（镜像保留）
 	@docker rm -f $(NAME) >/dev/null 2>&1 && echo "已删 $(NAME)" || echo "$(NAME) 不存在"
+
+# ────────────── 跨机真机自测台（契约 docs/contracts/xm-harness-v1.md） ──────────────
+# 两个容器 / 两套文件系统 / 真 ssh / 真 hc。变量与上面的 IMAGE、MODEL 分开，
+# 免得跑 xm 时误用真模型容器的镜像或模型名。
+XM_IMAGE ?= pi-legion-xm:latest
+XM_MODEL ?= workbuddy/hy4std
+
+.PHONY: xm-build xm-up xm-down xm xm-model
+
+xm-build: ## 构建跨机自测镜像 pi-legion-xm:latest（沙箱镜像 + openssh，key-only）
+	@docker build -t "$(XM_IMAGE)" -f "$(DOCK)/Dockerfile.xm" "$(ROOT)"
+
+xm-up: ## 起跨机两容器（parent+remote）并把真 hc 装进 parent（镜像缺则自动 build）
+	@env XM_IMAGE="$(XM_IMAGE)" XM_MODEL="$(XM_MODEL)" bash "$(DOCK)/xm-up.sh"
+
+xm-down: ## 停/删跨机两容器+网络（卷默认保留，XM_KEEP=0 连卷删）
+	@bash "$(DOCK)/xm-down.sh"
+
+# assert.mjs / drive.mjs 由 W2 提供：缺失时明确失败，绝不静默通过。
+xm: xm-up ## 跨机全流程自测：up → 四条断言（会真花钱，见契约 §5）
+	@test -f "$(DOCK)/xm/assert.mjs" || { \
+	  echo "XM_FAIL missing test/docker/xm/assert.mjs :: test -f :: 该文件由 W2 提供，尚未合入（失败，不是 skip）"; \
+	  exit 1; }
+	@cd "$(ROOT)" && env XM_IMAGE="$(XM_IMAGE)" XM_MODEL="$(XM_MODEL)" node test/docker/xm/assert.mjs
+
+xm-model: xm-up ## 跨机 +「父机模型在远端不存在」那一次（XM_SCENARIO=model-missing）
+	@test -f "$(DOCK)/xm/assert.mjs" || { \
+	  echo "XM_FAIL missing test/docker/xm/assert.mjs :: test -f :: 该文件由 W2 提供，尚未合入（失败，不是 skip）"; \
+	  exit 1; }
+	@cd "$(ROOT)" && env XM_IMAGE="$(XM_IMAGE)" XM_MODEL="$(XM_MODEL)" XM_SCENARIO=model-missing node test/docker/xm/assert.mjs
