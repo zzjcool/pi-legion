@@ -31,7 +31,7 @@ make clean        # 删容器（镜像保留）
 make tui-visual   # mock 模型确定性 TUI 回归
 
 make xm           # 跨机伪真机自测台：两容器 + 真 hc + 真 ssh，跑四个断言（见下）
-make xm-model     # 跨机特例：远端没有该模型时必须拒绝并列出远端可见模型
+make xm-model     # 跨机特例：远端没有该模型时回退到目标机可见模型（6.2.2）+ warning
 make xm-real      # 同上但用真模型驱动（非门禁：模型自由度会失败）
 make xm-up        # 只起双容器拓扑（调试用）
 make xm-down      # 清掉双容器 + 网络（卷默认保留）
@@ -237,12 +237,41 @@ guard **且** mirror 非空」，并打 `XM_GAP` 原文。
 不用占位文件）；`d0`、`d1` 证的是产品还欠的两截。两个 gap 断言都是**断言现状**：任一缺口被
 修好，对应断言会变红，提醒把自测台翻成正向。
 
-### `make xm-model`
+### `make xm-model`（§5.4，6.2.2 的「目标机回退」）
 
-远端 `models.json` 里整条 provider 缺失，断言：远端 `pi --list-models` 没有该 model、
-派发被 `model-missing` 拒绝、错误里列出远端可见模型、远端**不产生**新 worktree。
-现状是硬拒绝（`src/supervisor/terminal-supervisor.ts:767-780`），**没有**自动回退到远端默认模型。
-待远端模型回退逻辑合入后，这个 target 的断言要翻成「回退 + warning」。
+6.2.2 起 `567417a feat(cross-machine): fall back to a model on the target instead of
+refusing` 把「远端没有该模型」从硬拒绝改成了**回退 + 一条 warning**。这个 target 现在断言的是
+回退本身，四条：
+
+```
+XM_ASSERT m1 PASS remote-model-absent   # 远端模型表没有 parent 请求的模型
+XM_ASSERT m2 PASS fallback-warning      # 派发成功，工具结果同时含：请求的模型不可见 / 用了哪个替代 / pin 的位置
+XM_ASSERT m3 PASS fallback-is-real      # 远端 child 的转录里 provider/model 就是回退后的那个 + 远端新增 worktree
+XM_ASSERT m4 PASS no-local-fallback     # 没有无 host 的 child：回退发生在目标机，不是偷偷本地跑
+XM_ALL_PASS run=… child=…
+```
+
+**确定性怎么来的**（这三件事缺一件，回退就不可重复）：
+
+1. 远端的 `models.json` **没有** `xm` provider。pi 对「已知 provider + 未注册 model id」只答
+   `Warning: Model "flash" not found for provider "xm". Using custom model id.`，产品的探针
+   （`src/runs/remote.ts:871-878`）把这句话读作「不是拒绝」，只有**未知 provider** 才判
+   `model-missing`；
+2. 远端模型表**只有一行**，且这一行由 mock 提供（`xmock/other` → mock 端口 8766）。
+   `planRemoteModelFallback` 的规则是「同 provider 优先，否则第一行」（`src/runs/remote.ts:975-977`），
+   所以行数必须是一，才能保证回退落到 mock 而不是真模型；
+3. 远端的 `models-store.json` 在 `model-missing` 场景里被**清空**：宿主缓存里的
+   `any-endpoint/workbuddy/*` 会排在表的最前面，实测第一版就是回退到了
+   `any-endpoint/workbuddy/deepseek-v4.1-flash`（真模型、不可重复）。
+
+实测（6.2.2）两处细节，写在这里免得下次再猜：
+
+- **warning 原文**（产品生成，`src/runs/remote.ts:997-1004`）：
+  `host 'remote': model 'xm/flash' is not visible there; using 'xmock/other' from that
+  machine's listing (pin it with subagents.crossMachine.hosts.remote.model)`
+- **`run.json` 的 child 记录里 `model` 仍是请求值 `xm/flash`**，不是回退值。回退后的
+  provider/model 只能从远端 child 的转录（assistant 消息的 `provider`/`model`）或它的 argv 里读，
+  所以 m3 认的是转录，`run.json` 只作「当初请求的是什么」的对照。
 
 ### 限制（真的限制，不是 TODO）
 

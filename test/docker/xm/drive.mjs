@@ -37,6 +37,8 @@ export const XM_ENV = {
 	hostCwd: process.env.XM_HOST_CWD || "/root/work",
 	/** The mock model both containers register (`<provider>/<model>`). */
 	mockModel: process.env.XM_MOCK_MODEL || "xm/flash",
+	/** The one row the model-missing remote lists — the deterministic fallback pick. */
+	fallbackModel: process.env.XM_FALLBACK_MODEL || "xmock/other",
 	/** The real model `make xm-real` uses. */
 	realModel: process.env.XM_MODEL || "workbuddy/hy4std",
 	/** Directory inside the parent container that holds scripts/scripts' output. */
@@ -286,6 +288,30 @@ export function readRemoteFile(remotePath) {
  * or an array of parts (`{type:"text",text}` / tool calls). Empty text parts are
  * skipped so a tool-only turn cannot answer for a later final message.
  */
+/**
+ * The provider/model the child's LAST assistant turn actually ran with.
+ *
+ * This is the "the fallback is real" fact: the child's session records what the
+ * endpoint was called with, not what the parent asked for. `undefined` when the
+ * transcript has no assistant turn yet.
+ */
+export function lastAssistantModel(jsonl) {
+	let last;
+	for (const line of String(jsonl ?? "").split("\n")) {
+		if (line.trim().length === 0) continue;
+		let entry;
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const message = entry?.message ?? entry;
+		if (message?.role !== "assistant") continue;
+		last = { provider: message.provider, model: message.model };
+	}
+	return last;
+}
+
 export function lastAssistantText(jsonl) {
 	let last = "";
 	for (const line of String(jsonl ?? "").split("\n")) {
@@ -577,6 +603,18 @@ export function remoteLastAssistantText(child) {
 	}
 	const final = collected.at(-1);
 	return { paths, text: final?.text ?? "", source: final?.path };
+}
+
+/** The same idea as `remoteLastAssistantText`, for the model the child ran with. */
+export function remoteLastAssistantModel(child) {
+	const paths = remoteJsonlPaths(child);
+	const collected = [];
+	for (const remotePath of paths) {
+		const model = lastAssistantModel(readRemoteFile(remotePath));
+		if (model !== undefined && (model.model || model.provider)) collected.push({ path: remotePath, ...model });
+	}
+	const final = collected.at(-1);
+	return { paths, provider: final?.provider, model: final?.model, source: final?.path };
 }
 
 export function scenarioDir() {

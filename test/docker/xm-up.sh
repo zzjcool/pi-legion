@@ -129,12 +129,20 @@ xm_run models-parent node "$HERE/xm/models-merge.mjs" \
   --out "$XM_MODELS_DIR/parent/models.json" \
   --base-url "http://parent:$XM_MOCK_PORT_PARENT/v1"
 if [ "$XM_MODEL_SCENARIO" = "model-missing" ]; then
-  # 远端不认识 xm provider：pi 的启动探针会答 “Unknown provider” + 远端真实模型表，
-  # 产品据此报 model-missing（remote.ts:841-867）。
+  # 6.2.2 的「目标机回退」场景。两个条件缺一不可，否则回退不可确定性重复：
+  #   1. 远端**没有** xm provider。pi 对「已知 provider + 未注册 model id」只答
+  #      "Using custom model id" 并继续，探针据此不判 model-missing（remote.ts:871-878）,
+  #      所以 provider 必须整条缺失，只剩一个未知 provider 的错误；
+  #   2. 远端模型表**只有一行**，且这一行由 mock 提供（provider xmock → 8766）。
+  #      planRemoteModelFallback 选 `同 provider 优先 ?? 第一行`（remote.ts:975-977），
+  #      单行才能保证回退落到 mock，而不是宿主 any-endpoint 的真模型。
   xm_run models-remote node "$HERE/xm/models-merge.mjs" \
     --base "$AGENT/models.json" \
     --out "$XM_MODELS_DIR/remote/models.json" \
-    --no-xm
+    --no-host-providers \
+    --provider xmock \
+    --models other \
+    --base-url "http://parent:$XM_MOCK_PORT_CHILD/v1"
 else
   xm_run models-remote node "$HERE/xm/models-merge.mjs" \
     --base "$AGENT/models.json" \
@@ -164,10 +172,19 @@ PARENT_MODELS_MOUNT=(-v "$XM_MODELS_DIR/parent/models.json:$AGENT/models.json:ro
 REMOTE_MODELS_MOUNT=(-v "$XM_MODELS_DIR/remote/models.json:$AGENT/models.json:ro")
 if [ -f "$AGENT/models-store.json" ]; then
   cp "$AGENT/models-store.json" "$XM_MODELS_DIR/parent/models-store.json"
-  cp "$AGENT/models-store.json" "$XM_MODELS_DIR/remote/models-store.json"
+  if [ "$XM_MODEL_SCENARIO" = "model-missing" ]; then
+    # 回退场景里远端必须是「只列一行」的模型表：宿主 models-store 里缓存的
+    # any-endpoint/wokbuddy 模型会排在前面，planRemoteModelFallback 的 `available[0]`
+    # 就会选中真模型（实测：回退到了 any-endpoint/workbuddy/deepseek-v4.1-flash）。
+    # 远端给它一个空 store，模型表就只剩 mock provider 那一行，回退必然落到 mock。
+    printf '{}\n' > "$XM_MODELS_DIR/remote/models-store.json"
+    step "models-store: parent copied, remote emptied (model-missing scenario)"
+  else
+    cp "$AGENT/models-store.json" "$XM_MODELS_DIR/remote/models-store.json"
+    step "models-store copied per container (parent/remote)"
+  fi
   PARENT_MODELS_MOUNT+=(-v "$XM_MODELS_DIR/parent/models-store.json:$AGENT/models-store.json")
   REMOTE_MODELS_MOUNT+=(-v "$XM_MODELS_DIR/remote/models-store.json:$AGENT/models-store.json")
-  step "models-store copied per container (parent/remote)"
 else
   step "warn: $AGENT/models-store.json 不存在，容器里模型库可能为空"
 fi
@@ -209,7 +226,8 @@ step "sshd ready $XM_HOST:22"
 # settings-merge.mjs 的硬不变量守住。
 XM_SETTINGS_PATCH='{"subagents":{"crossMachine":{"enabled":true}},"defaultProvider":"xm","defaultModel":"flash"}'
 if [ "$XM_MODEL_SCENARIO" = "model-missing" ]; then
-  # 远端没有 xm provider，默认模型名就不该指向它。
+  # 远端不认识 xm，默认模型名当然不指向它（回退后的 xmock/other 由产品从模型表选，
+  # 不需要默认值）。
   XM_SETTINGS_PATCH_REMOTE='{"subagents":{"crossMachine":{"enabled":true}}}'
 else
   XM_SETTINGS_PATCH_REMOTE="$XM_SETTINGS_PATCH"
