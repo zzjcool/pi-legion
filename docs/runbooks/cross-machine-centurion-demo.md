@@ -102,14 +102,17 @@
 | `FAIL target runtime: …` | 那台机器上的 `node` 或 `node <piCli>` 跑不起来（「本包不在那儿」由 preflight 的 exit 14 报，**不在**这一行） | 粘 `fix:`：`hc exec --on <h> -- <node> --version` / 装 node；或把 `piCli` 指到 `…/dist/bundle/cli.js` |
 | `FAIL inherited extensions: … <pkg> (not installed on <h>) for role '<role>'`（尾句 `— the launch will skip …`） | 继承来的包在那台机器上没装（`xm-dispatch` D2）。**它不拦住 launch**：跳过 + 一行 warning | 想让它真正加载：`hc exec --on <h> -- pi install npm:<pkg>`；只想这次跑通：什么都不用做，或粘那条 `excludeExtensions` JSON（`# where:` 说了写进哪个文件） |
 | `FAIL inherited extensions: … (the card requires it, so a launch REFUSES)` | 角色卡把它写进了 `requiredExtensions`：launch 会**拒**（同样聚合成一条错误），没有跳过这条路 | 只能在那台机器 `pi install`，或把它从卡片的 `requiredExtensions` 里去掉；`excludeExtensions` 对这条无效（所以不给 JSON） |
-| `FAIL inherited extensions: … (entry '<相对路径>' not declared on <h>)` | 包装了，但两边的 `pi.extensions` 布局/版本不同（D13）。继承来的只跳过 + warning；角色卡声明的那条会拒 | 把两台的包版本对齐（目录声明 `./extensions` 现在已自动按目录包含）；继承来的也可以粘 `excludeExtensions` JSON |
+| `FAIL inherited extensions: … (entry '<相对路径>' not declared on <h>)` | 包装了，但两边的 `pi.extensions` 布局/版本不同（master `xm-dispatch` D1 的 `entry-missing`；体检里由本卡 D2 报出）。继承来的只跳过 + warning；角色卡声明的那条会拒 | 把两台的包版本对齐（目录声明 `./extensions` 现在已自动按目录包含）；继承来的也可以粘 `excludeExtensions` JSON |
 | `FAIL target models: <model> is not in <h>'s listing: …` | 那台机器的 `pi --list-models` 里没有这个模型（行尾同时说明 `--no-extensions` 与 `piExtensions` 的关系） | 粘 `fix:`：换成它列出来的模型；如果模型本来就该由 provider 扩展提供，把它写进 `subagents.crossMachine.hosts.<h>.piExtensions` |
 | `FAIL hc machines: no machines are registered …` | 这个 hc core 一台机器都不认识，配置里也没有 host | 粘 `fix: hc machine add --name my-vps ssh://user@my-vps`，再 `hc machine ls` |
 | `FAIL hc machines: cross-machine launch is disabled (subagents.crossMachine.enabled = false), so nothing here was probed` | `subagents.crossMachine.enabled` 是 `false`（真 launch 会被拒） | 按 `fix:` 把它改成 `true`（同一个 settings 文件），再跑同一条命令 |
 | `SKIP hc machines: … cross-machine is not configured, so no target was probed` | `enabled` 没写、也没有 `hosts` 条目：注册表照打，但不去探目标机 | 想体检某一台就配 `{ "enabled": true }` 再跑 `/legion doctor crossmachine` |
 | `SKIP <项>: … not checked: <一句原因>` | 前面那条 FAIL 让这一项没法问（例如还没有目录） | 先修上面那条 FAIL，再跑同一条命令 |
-| 派生：`execution: unknown (transcript not retrieved from host '<h>' …)` | 父端**没读到**远端转录（`xm-dispatch` D3）。这不是 child 的结局，是本机的盲区 | 照 reason 里附的远端路径与 `hc exec` 命令取回；先看下面「已知限制」里的 `no-run` 目录共用问题。完整转录、确实没有 assistant 才叫 `aborted` |
+| 派生：`execution: unknown (transcript not retrieved from host '<h>' …)` | 父端**没读到**远端转录（`xm-dispatch` D3）。这不是 child 的结局，是本机的盲区 | 照同一段 read-back 里附的 `remote: <path> — retrieve it with: hc exec --on <h> -- cat <path>` 取回；先看下面「已知限制」里的 `no-run` 目录共用问题。完整转录、确实没有 assistant 才叫 `aborted` |
 | 派生：`⚠ <name>: host '<h>': skipped N inherited extensions that machine cannot install/load: …` | 继承来的扩展在那台机器上缺（master `xm-dispatch` D2），launch 继续了 | 按这行：在那台机器 `pi install`，或照抄它给的 `excludeExtensions` JSON；只有卡片写了 `requiredExtensions` 才会硬拒 |
+
+> 表里所有「改派 `worker`」都以 `subagents.crossMachine.allowRoles` 已放行 `worker` 为前提（默认只允许 `centurion`）；
+> 没放行时先撞的是那句 `cross-machine launch is for a DELIVERY UNIT …`，而不是表里这条。
 
 ### 手工兜底：三条命令（doctor 不方便跑时）
 
@@ -151,6 +154,9 @@ scheme、用户名、末尾斜杠、末尾 `.git` 都不计。
    url 必须是两边都能访问的那一个（同一台机器上加、另一台访问不到，等于没加）。
 2. **改派 `worker`**：worker 不建 worktree、不交付分支，**不需要 origin** ——
    `subagent({ agent: "worker", host: "<host>", task: "..." })`。
+   注意默认只有 `centurion` 能跨机：要这样改派，得先把 `worker` 写进
+   `subagents.crossMachine.allowRoles`，否则会在交付预检之前就收到
+   `host '<host>' cannot be dispatched to agent 'worker': cross-machine launch is for a DELIVERY UNIT …`。
 
 > 本会话目录连仓库都不是时，这两个出路都不适用（没有地方 `git remote add`）：那是另一句答案，
 > 见第 4 节的「交付：一条共享的 origin」。
@@ -344,7 +350,7 @@ phases 校验**之前**，所以 host + 坏 phases 同时存在时，你**先**�
 
 | 你看到的字 | 它意味着什么 / 改哪个键 |
 |---|---|
-| `cross-machine delivery needs a git checkout on this machine too, and this session's directory (<dir>) is not one. Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one (with `host` named, an ABSOLUTE cwd is the directory ON that machine): subagent({ agent: "centurion", host: "<h>", cwd: "../my-repo", task: "..." }); 2) dispatch a worker instead — subagent({ agent: "worker", host: "<h>", task: "..." }) needs no checkout and no origin.` | **本会话目录根本不是 git 仓库**（D5）。`1)` 在 checkout 里重开 pi，或用**相对** `cwd` 指向一个 checkout（带了 `host` 时，绝对 `cwd` 指的是**那台机器**上的目录，所以这里要用相对路径）；`2)` 改派 `worker`（不需要 checkout、不需要 origin）。**不要**在这个目录里 `git remote add` —— 那不是仓库，没有地方加。注意这条只说「父机这一侧」：目标机上的目录仍然要有（`hosts.<h>.cwd`，或调用里再给一个绝对 `cwd`；都没有就会收到 D2 的那句提问） |
+| `cross-machine delivery needs a git checkout on this machine too, and this session's directory (<dir>) is not one. Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "<h>", cwd: "../my-repo", hostCwd: "/abs/path/on/<h>", task: "..." }); 2) dispatch a worker instead — subagent({ agent: "worker", host: "<h>", task: "..." }) needs no checkout and no origin.` | **本会话目录根本不是 git 仓库**（D5）。`1)` 在 checkout 里重开 pi，或用**相对** `cwd` 指向一个 checkout（带了 `host` 时，绝对 `cwd` 指的是**那台机器**上的目录，所以这里要用相对路径）；`2)` 改派 `worker`（不需要 checkout、不需要 origin）。**不要**在这个目录里 `git remote add` —— 那不是仓库，没有地方加。注意这条只说「父机这一侧」：目标机上的目录仍然要有（`hosts.<h>.cwd`，或调用里再给一个绝对 `cwd`；都没有就会收到 D2 的那句提问） |
 | `cross-machine delivery needs one shared remote: this checkout (<localRepo>) has no origin. Two ways out: 1) add one and retry — git -C <localRepo> remote add origin <url> (the machine '<host>' must be able to reach the same url); 2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "<host>", task: "..." }) needs no origin.` | **父机这个 checkout 没有 origin**。`1)` 在本机加一个 remote 再重试（那台机器要能访问同一个 url）；`2)` 改派 `worker` |
 | `host '<h>': <cwd> has no origin on that machine; cross-machine delivery needs one shared remote. Two ways out: 1) add one there — hc exec --on <h> -- git -C <cwd> remote add origin <url> (same url as this checkout's '<local>'); 2) dispatch a worker instead (workers need no origin).` | **目标机那侧的 checkout 没有 origin**。`1)` 在那台机器上加（用本机那个 url，文案里已给出）；`2)` 改派 `worker` |
 | `host '<h>': its checkout at <cwd> has origin '<remote>' but this checkout's is '<local>'; cross-machine delivery needs one shared remote. Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); 2) dispatch a worker instead (workers need no origin).` | **两侧都配了，但不是一个 remote**（文案把两个 url 都点名了）。`1)` 任一侧 `git remote set-url origin <url>` 让两侧一致；`2)` 改派 `worker` |
@@ -371,7 +377,7 @@ phases 校验**之前**，所以 host + 坏 phases 同时存在时，你**先**�
 
 | 你看到的字 | 它意味着什么 / 改哪个键 |
 |---|---|
-| `host '<h>': the extension '<父机路径>' belongs to package '<pkg>', which is not installed on that machine (the launch would have silently dropped it). Two ways out: 1) install it there — hc exec --on <h> -- pi install npm:<pkg> (same entry names are then mapped automatically); 2) keep it on this machine only, for role '<role>': subagents.agentOverrides.<role>.excludeExtensions — {"subagents":{"agentOverrides":{"<role>":{"excludeExtensions":["<pkg>"]}}}}` | **只有角色卡自己声明**（`extensions:` / `subagentOnlyExtensions:`）或 child guard 缺失时才会出现这句（D14）；继承来的同一种缺失现在是「跳过 + 一行 warning」。`1)` 装这个包；`2)` 只让这个角色不继承它 —— 照抄 JSON（`<role>` 已是具体角色名）。不知道角色时（resume / 读回）是 `for the role you launch: …`，不带 JSON |
+| `host '<h>': the extension '<父机路径>' belongs to package '<pkg>', which is not installed on that machine (the launch would have silently dropped it). Two ways out: 1) install it there — hc exec --on <h> -- pi install npm:<pkg> (same entry names are then mapped automatically); 2) keep it on this machine only, for role '<role>': subagents.agentOverrides.<role>.excludeExtensions — {"subagents":{"agentOverrides":{"<role>":{"excludeExtensions":["<pkg>"]}}}}` | **只有非 `-e/--extension` 的包内参数**（`--skill` 等）还会出现这句；`-e` 上的缺失（继承来的、以及卡片在 `extensions` 里自己列的）现在一律「跳过 + 一行 warning」，卡片把它写进 `requiredExtensions` 时给的是另一句聚合错误（`host '<h>': agent '<role>' declares requiredExtensions that machine cannot load: …`）。`1)` 装这个包；`2)` 只让这个角色不继承它 —— 照抄 JSON（`<role>` 已是具体角色名） |
 | `host '<h>': package '<pkg>' IS installed there at <dir>, but it does not expose './<相对入口>' (declared: …); …` | 包在，但声明的入口不同（版本/布局不同）→ 原话列出它实际声明的入口；要么在父机不继承这个扩展，要么在 `subagents.crossMachine.hosts.<h>.pathMap` 里加显式前缀 |
 
 ### phases：一次报全部，并按分类点名
@@ -417,8 +423,8 @@ Agent '<file>' has an invalid phase machine: N problems in M categories.
 - 上一轮残留的转录让新的**启动确认**提前通过；
 - `collect` 读回时拿到的是**上一轮**那份（特别短）的转录。
 
-master 的 `xm-dispatch` 契约/报告把它记为既有风险，本卡不改交付通道。遇到时：
+master 的 `xm-dispatch` 报告（「已知遗留」）把它记为既有风险，本卡不改交付通道。遇到时：
 
-1. 看那台机器上这个目录的文件时间与行数（`hc exec --on <h> -- sh -c 'ls -la ~/.pi-subagents-mirror/no-run/*/ && wc -l ~/.pi-subagents-mirror/no-run/*/session.jsonl'`）；
+1. 看那台机器上这个目录的文件时间与行数（`hc exec --on <h> -- sh -c 'ls -la $(dirname <cwd>)/.pi-subagents-mirror/no-run/*/ && wc -l $(dirname <cwd>)/.pi-subagents-mirror/no-run/*/session.jsonl'`）；
 2. 第一行 `session` 头的 id 与本轮 launch 的时间对不上 ⇒ 就是它；
 3. 换一个 child 名字重派（`name: "worker-1"`）能立刻绕开；拍板要根治的话，需要 per-launch 目录，属另一张卡。

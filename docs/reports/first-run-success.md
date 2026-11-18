@@ -58,7 +58,7 @@ cross-machine delivery needs a git checkout on this machine too, and this sessio
 
 - 句子：`src/runs/remote-worktree.ts:552`（`notALocalCheckoutMessage`）
 - 抛出：`src/runs/cross-machine-preflight.ts:339`（交付预检第 2 步）、`src/runs/remote-worktree.ts:640`（`assertSharedOrigin`，建树前的守卫）
-- doctor 的 `parent checkout` 行复用同一句：`src/runs/cross-machine-checkup.ts:383`
+- doctor 的 `parent checkout` 行复用同一句：`src/runs/cross-machine-checkup.ts:401`
 
 ### 坑 2：缺扩展包的错误不带「能修它的那个键」（D4）
 
@@ -82,13 +82,14 @@ host 'vps': the extension '/Users/me/pi-sysmon/extensions/index.ts' belongs to p
 
 > 分工（合并 master 后）：`-e/--extension` 上的缺包/入口不符现在由 master 的 `xm-dispatch` D2 接管
 > （跳过 + 一条汇总 warning，只有卡片写了 `requiredExtensions` 才硬拒）；下面这段 D4 文案留在
-> **其它包内参数**（`--skill` 等）与严格映射路径上，`which is not installed on that machine` 逐字未变。
+> **其它包内参数**（`--skill` 等）上，`which is not installed on that machine` 逐字未变（严格映射器
+> `mapRemoteArgv` 现在没有生产调用者）。
 
 落在哪：
 
-- 函数：`src/runs/remote.ts:144`（`packagePathError`），role 子句在 `src/runs/remote.ts:159`
-- 调用点：`src/runs/remote.ts:280`
-- role 的来源：`src/supervisor/terminal-supervisor.ts:667`（`role: input.agent.name`）
+- 函数：`src/runs/remote.ts:160`（`packagePathError`），role 子句在 `src/runs/remote.ts:175`
+- 调用点：`src/runs/remote.ts:578`
+- role 的来源：`src/supervisor/terminal-supervisor.ts:671`（`role: input.agent.name`）
 
 ### 坑 3：读者绕开工具（`hc run … pi -p …`）烧 turn（D2 的「不要绕过」那句）
 
@@ -110,8 +111,8 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
 
 并且 D2/D4/D5 三类文案的结尾都是可粘贴的 `subagent(...)` 形状 —— 「下一步」永远是回到工具，而不是离开它。
 
-落在哪：`src/runs/remote.ts:649`（`missingRemoteCwdQuestion`）；抛出点 `src/runs/remote.ts:712`（纯 resolver，
-读回 / resume 也走这里）与 `src/runs/remote.ts:1754`（异步 resolver，**在任何发现探测之前**）。
+落在哪：`src/runs/remote.ts:957`（`missingRemoteCwdQuestion`）；抛出点 `src/runs/remote.ts:1020`（纯 resolver，
+读回 / resume 也走这里）与 `src/runs/remote.ts:2067`（异步 resolver，**在任何发现探测之前**）。
 
 ### 坑 4：每次调用的远端目录靠猜（`hostCwd` vs `cwd`，`--help` 截断）
 
@@ -131,7 +132,7 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
 … Pass it with the call: subagent({ agent: "centurion", host: "vps", cwd: "/abs/path/on/vps", task: "..." }) (that path is read ON vps; it is never translated from here).
 ```
 
-落在哪：`src/runs/remote.ts:649`（提问）。同一坑的另一半也补在了 **schema 描述**上：`index.ts` 的 step / call / batch 三处
+落在哪：`src/runs/remote.ts:957`（提问）。同一坑的另一半也补在了 **schema 描述**上：`index.ts` 的 step / call / batch 三处
 `cwd` / `hostCwd` 描述改成「带 `host` 时，这就是**那台机器上**的目录，在那里读、从不翻译」（提交 `254c788`）。
 但**唯一权威的说明**仍然随报错一起到达读者 —— schema 描述要等读者去查，报错不用。
 
@@ -346,7 +347,9 @@ the launch would have loaded a different entry than the one this machine asked f
 
 ```text
 host 'hw-nj': the extension '/Users/me/pi-sop/extensions/index.ts' belongs to package 'pi-sop', which is not installed on
-that machine (the launch would have silently dropped it). Two ways out: 1) install it there — …
+that machine (the launch would have silently dropped it). Install 'pi-sop' on 'hw-nj' (same entry names are then mapped
+automatically), or add an explicit prefix to subagents.crossMachine.hosts.hw-nj.pathMap, or stop inheriting the parent's
+extensions (PI_LEGION_CHILD_INHERIT_EXTENSIONS=0 / inheritExtensions: false on the card).
 ```
 
 不可执行：用户原话是「我只想派个 scout，为什么得先研究 5 个扩展装没装」。一个环境性扩展缺失把整次派发拦下来，
@@ -379,7 +382,7 @@ read-back from host 'hw-nj': 5 of 5 lines (complete)
 ### 已知限制（master 记录、本分支不改）
 
 同一台机器上两个 run 派生**同名 child** 会共用 `…/.pi-subagents-mirror/no-run/<handle>/session.jsonl`：
-上一轮残留的转录可能让新的启动确认门提前通过、也可能被读成这一轮的转录。master 的契约/报告把它记为既有风险；
+上一轮残留的转录可能让新的启动确认门提前通过、也可能被读成这一轮的转录。master 的 `xm-dispatch` 报告（「已知遗留」）把它记为既有风险；
 本分支的 doctor **不检查 mirror**，因此没有体检项会因此变绿或变红——但遇到「远端看起来没干活、transcript 又很短」时，
 先怀疑这个目录，再怀疑 child。
 
@@ -391,15 +394,15 @@ read-back from host 'hw-nj': 5 of 5 lines (complete)
 |---|---|
 | 父机目录不是 checkout（D5） | `test/unit/remote-worktree.test.ts:396`「D5: a session directory that is NOT a checkout gets its own answer, never `git remote add`」；`test/integration/remote-worktree.test.ts:387`（真 spawn 路径，wire 上无 `terminal.run`、无 `git worktree add`） |
 | 是 checkout 但没有 origin（原句不变） | `test/unit/remote-worktree.test.ts:260`「D10/D11: cwd missing, cwd not a repo, no origin, different origin — four exact messages」；`test/unit/cross-machine-preflight.test.ts:276` |
-| 目标机缺扩展包（D4） | `test/unit/cross-machine-discovery.test.ts:610`（带 role 的 JSON，且能 `JSON.parse` 回 settings）；`test/unit/cross-machine-params.test.ts:606`（起终端**之前**拒绝）；`test/integration/fake-core-host-discovery.test.ts:513` |
-| 目标机没有这个模型 | `test/unit/cross-machine-params.test.ts:768`「S5.6: the startup probe's four failures are named before a terminal exists」（case `model-missing`，断言点名 host / 模型 / 该机真实清单 / 两个方向的 fix） |
+| 目标机缺扩展包（D4） | `test/unit/cross-machine-discovery.test.ts:710`（带 role 的 JSON，且能 `JSON.parse` 回 settings）；`test/unit/cross-machine-params.test.ts:537`（起终端**之前**拒绝）；`test/integration/fake-core-host-discovery.test.ts:513` |
+| 目标机没有这个模型 | `test/unit/cross-machine-params.test.ts:706`「S5.6: the startup probe's four failures are named before a terminal exists」（case `model-missing`，断言点名 host / 模型 / 该机真实清单 / 两个方向的 fix） |
 | 体检：全绿 | `test/unit/cross-machine-checkup.test.ts:381`「D7/D8: a healthy host reports every item PASS in the frozen order, and a real launch line」 |
 | 体检：没有 checkout | `test/unit/cross-machine-checkup.test.ts:465`「D5: a session directory that is not a checkout gets D5's sentence, not `git remote add origin`」 |
 | 体检：缺包 | `test/unit/cross-machine-checkup.test.ts:547`「D4: a package missing on the target FAILs with the role and a pasteable excludeExtensions JSON」 |
-| 体检：模型不提供 | `test/unit/cross-machine-checkup.test.ts:1015`「D7: a model the target does not serve FAILs and lists what that machine DOES see」 |
+| 体检：模型不提供 | `test/unit/cross-machine-checkup.test.ts:1018`「D7: a model the target does not serve FAILs and lists what that machine DOES see」 |
 
 外加（同一批 D6）：`test/unit/cross-machine-checkup.test.ts:500`（`{enabled:true}` + 只有 `machine list` 认识的 host）、
-`:1045`（旧 core，`machine.list` 不支持 → SKIP，指名 host 仍照检）、`:1075`（传输失败 FAIL 自己、其余 SKIP）；
+`:1048`（旧 core，`machine.list` 不支持 → SKIP，指名 host 仍照检）、`:1078`（传输失败 FAIL 自己、其余 SKIP）；
 `test/unit/legion-doctor.test.ts:1612` 与 `:1669` 两例（快照渲染：FAIL 进 Issues、`report.ok` 为假）。
 
 ### 红：把修好的那句退回去，测试就红（三次实跑）
@@ -466,20 +469,22 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
 
 D1/D2/D3 的断言随实现一起留在 master（本分支合并时删掉了自己那版同义测试，同一行为不再有两套断言）：
 
-- **D1 目录声明**：`test/unit/cross-machine-discovery.test.ts`（T1–T5 表）、`test/integration/fake-core-host-discovery.test.ts`；
+- **D1 目录声明**：`test/unit/cross-machine-discovery.test.ts`（T2 `:759`、`/` 边界 `:790`、T4 `:803`；T1 `:649`、T5 `:676`；
+  **T3 请求恰为目录没有专门断言**）、`test/integration/fake-core-host-discovery.test.ts`；
 - **D2 跳过 + 聚合 warning / `requiredExtensions` 硬拒**：`test/unit/cross-machine-discovery.test.ts`（纯映射）、
-  `test/unit/cross-machine-params.test.ts`（后端：argv 里成对消失、handle 带 `warnings`、必需项仍拒）、
-  `test/unit/agents.test.ts`（`requiredExtensions` / `allowRoles` 的解析与合并）；
+  `test/integration/fake-core-host-discovery.test.ts:536-567`（argv 里成对消失 + handle 带 `warnings`）、
+  `test/unit/xm-dispatch-remote-transcript.test.ts:464-505`（notice 行）、`test/unit/agents.test.ts:150`
+  （`requiredExtensions`；`allowRoles` 的解析在 `cross-machine-params.test.ts:945` 与 `cross-machine-target.test.ts:95`）；
 - **D3 读回时机与诚实 unknown**：`test/unit/xm-dispatch-remote-transcript.test.ts`、
   `test/unit/cross-machine-orchestrator.test.ts`。
 
 本分支在这一轮唯一新增的红绿点，是 doctor 与 launch 的同口径（`test/unit/cross-machine-checkup.test.ts`）：
 
 ```text
-✖ D13: a target whose declaration does NOT cover the entry FAILs …（合并前）
+✖ D13: a target whose declaration does NOT cover the entry FAILs …（合并前，演示里的自相矛盾）
     AssertionError: expected a FAIL, got: 1 inherited extension(s) resolve on fakebox
-✖ D4: a card that declares requiredExtensions marks the item as a REFUSAL …（合并后新增）
-    缺 `(the card requires it, so a launch REFUSES)` 这一句就红
+✖ D2: an extension the card REQUIRES (`requiredExtensions`) and the target lacks FAILs — and no JSON is offered
+    整行正则含 \(the card requires it, so a launch REFUSES\)$；删掉这个后缀即红（`cross-machine-checkup.test.ts:715`）
 ```
 
 **新增的两条一致性断言**（改回去即红）：
@@ -541,16 +546,16 @@ D1/D2/D3 的断言随实现一起留在 master（本分支合并时删掉了自�
   所以体检里 `hc machines` 那行 FAIL 时，先确认你跑在哪个会话里（runbook 第 5 节）。
 - **远端镜像目录仍按 handle 共享**：`…/.pi-subagents-mirror/no-run/<handle>/session.jsonl` 跨轮次保留，上一轮残留的转录
   仍可能让新的启动确认门提前通过（仓库里 `docs/reports/remote-child-startup.md` 的 R1 记过同一件事）。彻底修需要 per-launch
-  目录（或一次不会与 resume 竞争的清理），属于交付通道改动，本卡不做 —— D15 只保证「判定用的文本是 turn 结束后那次读回」。
+  目录（或一次不会与 resume 竞争的清理），属于交付通道改动，本卡不做 —— master 的 `xm-dispatch` D3.1/D3.3 只保证「判定用的文本是 turn 结束后那次读回」。
 - **体检不看 mirror**：`no-run` 目录共用是 master 记录的既有风险（见第 7 节末），doctor 不检查它，
   所以不会因此变绿或变红；遇到「远端像没干活、转录又很短」时按 runbook 的提示查那个目录。
 - **体检的 host 上限是 5**：第 6 个起只给计数（`… N more host(s) not checked (cap 5)`）；缺包 8、模型 10 同理。
 - **`model-missing` 仍然放行候选链**：体检把「那台机器没有这个模型」作为 FAIL 报出来，但运行期的启动探测
-  仍旧允许模型候选链。`noModelFallback` 钉在「机器事实」那几条上（`cwd` 缺失 `src/runs/remote.ts:714`/`:1756`、
-  交付预检 `src/runs/cross-machine-preflight.ts:208`、目标机不可达 `src/runs/remote.ts:2531`、**D4 的缺包**
+  仍旧允许模型候选链。`noModelFallback` 钉在「机器事实」那几条上（`cwd` 缺失 `src/runs/remote.ts:1022`/`:2069`、
+  交付预检 `src/runs/cross-machine-preflight.ts:208`、目标机不可达 `src/runs/remote.ts:2848`、**D4 的缺包**
   与 D5 的四条交付拒绝 —— 它们都是确定性的，换模型重跑只会重复同样的探针）；`model-missing` 不在其列 ——
   换模型重跑是合法的。
-- **D5 的「相对 `cwd`」只修父机那一侧**：`cwdIsRemote`（`index.ts:4892`）只把**绝对** `cwd` 当远端目录，所以
+- **D5 的「相对 `cwd`」只修父机那一侧**：`cwdIsRemote`（`index.ts:4899`）只把**绝对** `cwd` 当远端目录，所以
   `cwd: "../my-repo"` 修的是「父机 checkout」这一半；目标机上的目录仍要 `hosts.<h>.cwd` 或另一次绝对 `cwd`，
   否则就会收到 D2 的提问。D5 的文案是合同冻结的（不属本卡改动），runbook 第 4 节补了这一句说明。
 - **`docs/runbooks/cross-machine-live-e2e.md` 未改**：它引用的 `PI_LEGION_REMOTE_*` 环境变量路径与本轮无关；
@@ -565,8 +570,9 @@ D1/D2/D3 的断言随实现一起留在 master（本分支合并时删掉了自�
 - **两个 launch 构造器**：无快照的静态块仍打 `minimal launch (copy-paste, built from this configuration)`
   （不含 `cwd`，因为它只知道配置）；探测路径打 `launch (copy-paste …)`，带真 `cwd` 与真 `model`。两者措辞
   有意不同：前者是配置的形状，后者是这一次真跑的命令。
-- **`<url>` 只剩一处**：本机 checkout 没有 origin 时，那个 url 没有任何来源可查（目标机那侧的 fix 已经用本
-  checkout 的真 url 填好了），体检里保留 `git -C <dir> remote add origin <url>  # the url both machines can reach`。
+- **`<url>` 只在「本机 checkout 也没有 origin」时出现**（两处：父机那行 `git -C <dir> remote add origin <url>  # the url both can reach`，
+  以及目标机那行 `hc exec --on <h> -- git -C <cwd> remote add origin <url>`）—— 那种情况下没有任何来源可查。
+  只要本机有 origin，目标机那侧的 fix 就用真 url。
 - **对抗式 review 的六条修正已落库**：契约 `docs/contracts/first-run-success-v1.md` 的「Amendments」记录了
   A1–A6（read-back 路径也提问 / D5 带 `hostCwd` / 体检的 `enabled:false` 与零机器档 / launch 标签与 model /
   合并的 role JSON 与 `# where:` / 共享 section 门禁 + scoped 包名匹配）。

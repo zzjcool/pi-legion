@@ -32,7 +32,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   那个目录」**，而这一项不知道时工具**提问**，不发配置讲义。下面的条目是真实会话（103 行、五次
   失败）里每个坑的答案，最后一条把它们变成一条命令。契约：`docs/contracts/first-run-success-v1.md`；
   报告：`docs/reports/first-run-success.md`。
-- **缺失的远程目录变成一句提问（D2）**：`resolveHostTarget` 的两个分支与 `resolveHostTargetAsync`
+- **缺失的远程目录变成一句提问（本卡 D2）**：`resolveHostTarget` 的两个分支与 `resolveHostTargetAsync`
   共用 `missingRemoteCwdQuestion(host)`，在任何 `machine.exec` **之前**抛出——问「那台机器上哪个
   目录」，附可粘贴的 `subagent({ …, cwd })`、一句「这个路径是在那台机器上读的」、一句「本对话没提过
   就去问用户」，以及一句「不要 ssh / `hc exec` 去翻目录」。旧的
@@ -46,7 +46,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   重开 pi（或传相对 `cwd`）**与**改派 worker**，不再教 `git remote add origin` —— 在一个不是仓库
   的目录里，那条命令不可能奏效。`assertSharedOrigin` 复用同一次探测，两处不会漂移。
   `noModelFallback` 也随之为确定性的失败（本机 git / 缺包）置位。
-- **包内参数的拒绝自带 role 与可粘贴 JSON（D4 保留部分）**：`packagePathError` 接收 role（由
+- **包内参数的拒绝自带 role 与可粘贴 JSON（本卡 D4 保留部分）**：`packagePathError` 接收 role（由
   `terminal-supervisor` 从 `input.agent.name` 传入），第二条出路直接写成
   `subagents.agentOverrides.<role>.excludeExtensions` 加一条
   `{"subagents":{"agentOverrides":{"<role>":{"excludeExtensions":["<pkg>"]}}}}`；不知道角色
@@ -62,7 +62,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `legion-doctor.ts` 仍然同步、零探测：只渲染传进来的快照，`/legion doctor` 与
   `subagent({action:"diagnose"})` **只在选中这一节时**才 `await` 体检；没有快照时旧的静态块
   逐字节不变（`auto-doctor` 仍走它）。
-- **doctor 与 launch 同一口径（本分支与 D2 对齐）**：`inherited extensions` 这一项的判据就是
+- **doctor 与 launch 同一口径（与 master 的 `xm-dispatch` D2 对齐）**：`inherited extensions` 这一项的判据就是
   `requiredExtensions` ——命中的固定报「the card requires it, so a launch REFUSES」，其余（角色卡
   自己在 `extensions` 里列出的、以及继承来的）报「the launch will skip … with a warning」，
   合并后的 `excludeExtensions` JSON 只覆盖这些可跳过的项。两边共用

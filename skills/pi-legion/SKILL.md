@@ -62,14 +62,16 @@ Run `/legion doctor crossmachine` before the first launch. That one command
 prints PASS/FAIL for this checkout's git origin, the `hc machine ls` list, the
 target's checkout/origin/node/pi, every inherited extension package (with the
 `subagents.agentOverrides.<role>.excludeExtensions` JSON for anything missing
-there) and the target's model list — then a pasteable `subagent(...)` line.
+there that the card does not require — a `requiredExtensions` hit gets no JSON)
+and the target's model list — then a pasteable `subagent(...)` line.
 Manual walkthrough: `docs/runbooks/cross-machine-centurion-demo.md`.
 
 A remote child that dies at start-up answers with the exit code, the last screen
 text and a `Command (run on '<host>' to reproduce):` line — paste that command
 instead of guessing. An `execution: unknown (transcript not retrieved from host '…')`
-is this machine's blind spot, not the child's fate: the reason carries the remote
-path and the `hc exec` command that fetches it — use it before reporting a failure.
+is this machine's blind spot, not the child's fate: the collect's read-back block
+carries the remote path and the `hc exec --on <host> -- cat <path>` line that fetches
+it — use that before reporting a failure.
 
 Extensions this machine has and the target does not are not a reason to stop: an
 INHERITED one is skipped with ONE `⚠` line in the result (install it there or add

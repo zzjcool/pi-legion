@@ -1228,7 +1228,7 @@ test("D7: an origin mismatch names both urls and the set-url command with the RE
 	}
 });
 
-test("D7: a checkout without origin is a FAIL whose fix is the add-origin command (the ONLY `<url>` left)", async () => {
+test("D7: a checkout without origin is a FAIL whose fix is the add-origin command (with a <url> nothing can know)", async () => {
 	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
 	const env = testEnv(cache);
 	resetProbes(env);
