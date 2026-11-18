@@ -120,8 +120,11 @@ export interface CrossMachineCheckup {
 
 /** Bounds from D7: the rest is a count, never a wall of text. */
 const MAX_HOSTS = 5;
+const MAX_HOST_FIXES = 5;
 const MAX_MISSING_PACKAGES = 8;
 const MAX_PACKAGE_FIXES = 5;
+/** The merged JSON is cheap to paste, so it covers more packages than the commands. */
+const MAX_JSON_PACKAGES = 20;
 const MAX_MODELS_LISTED = 10;
 /** How much of a program's stderr a one-line item carries. */
 const DETAIL_CLIP = 300;
@@ -161,7 +164,7 @@ export async function runCrossMachineCheckup(options: {
 	settings?: SubagentsSettings["crossMachine"];
 	/** Role cards; when absent the checkup loads them (`discoverAgents(cwd,"both")` + `applyAgentOverrides` + `loadSubagentSettings`). */
 	agents?: readonly AgentConfig[];
-	/** Model a launch would use; falls back to `agents[0]?.model`, then SKIP. */
+	/** Model a launch would use; falls back to the `centurion` card's model, then any card's, then "none named". */
 	model?: string;
 	env?: NodeJS.ProcessEnv;
 	/** Test seam: reuse one client for `machine.list` + every `machine.exec`. */
@@ -176,6 +179,13 @@ export async function runCrossMachineCheckup(options: {
 	const now = options.now ?? Date.now;
 	const at = now();
 	const enabled = settings?.enabled === true;
+
+	// `enabled: false` refuses every launch, so the answer is the switch and nothing
+	// else — not even an `hc` connection. The gate lives here, before the client is
+	// created, because "zero probes" has to include the transport itself.
+	if (settings?.enabled === false) {
+		return disabledCheckup(cwd, at);
+	}
 
 	// ONE connection for the whole checkup: `machine.list`, discovery and every
 	// probe share it, so a checkup costs one `hc connect` instead of one per
@@ -241,6 +251,25 @@ interface CollectInput {
 	startError?: string;
 }
 
+/** The `enabled: false` answer: one FAIL on the switch, no host block, no probes. */
+function disabledCheckup(cwd: string, at: number): CrossMachineCheckup {
+	return {
+		enabled: false,
+		cwd,
+		parent: [{
+			id: "hc-machines",
+			status: "fail",
+			line: "cross-machine launch is disabled (subagents.crossMachine.enabled = false), so nothing here was probed",
+			fixes: [
+				`# set "enabled": true in the file that holds subagents.crossMachine — user: ~/.pi/agent/settings.json, project: ${cwd}/.pi/settings.json`,
+				"then re-run: /legion doctor crossmachine",
+			],
+		}],
+		hosts: [],
+		at,
+	};
+}
+
 async function collect(input: CollectInput): Promise<CrossMachineCheckup> {
 	const { cwd, settings, env, client, at } = input;
 	const agents: AgentConfig[] = input.agents !== undefined ? [...input.agents] : loadAgents(cwd, env);
@@ -256,23 +285,7 @@ async function collect(input: CollectInput): Promise<CrossMachineCheckup> {
 	// `resolveHostTargetAsync`). Probing anyway would print PASS lines and a
 	// pasteable launch for a feature that is switched off (review C2) — so this is
 	// the zero-probe answer, and the only FAIL is the switch itself.
-	if (settings?.enabled === false) {
-		return {
-			enabled: false,
-			cwd,
-			parent: [{
-				id: "hc-machines",
-				status: "fail",
-				line: "cross-machine launch is disabled (subagents.crossMachine.enabled = false), so nothing here was probed",
-				fixes: [
-					`# set "enabled": true in the file that holds subagents.crossMachine — user: ~/.pi/agent/settings.json, project: ${cwd}/.pi/settings.json`,
-					"then re-run: /legion doctor crossmachine",
-				],
-			}],
-			hosts: [],
-			at,
-		};
-	}
+	if (settings?.enabled === false) return disabledCheckup(cwd, at);
 
 	// 1. the machine registry. `undefined` is a THIRD answer ("old core / no
 	// answer") and stays one: turning it into "no machines" would report every
@@ -318,6 +331,9 @@ async function collect(input: CollectInput): Promise<CrossMachineCheckup> {
 		remainder,
 		configured,
 	});
+	// A parent-side FAIL fails the launch too: a `machine_unknown` host or a session
+	// directory that is not a checkout refuses the same call the host block prints.
+	const parentFailed = [parent, machineItem].some((item) => item.status === "fail");
 
 	// 5. per host, one block each.
 	const hosts: CrossMachineCheckupHost[] = [];
@@ -334,6 +350,7 @@ async function collect(input: CollectInput): Promise<CrossMachineCheckup> {
 				localOrigin,
 				cwd,
 				unreachable: machineError,
+				parentFailed,
 			}),
 		);
 	}
@@ -373,7 +390,7 @@ function parentItem(state: LocalCheckoutState, cwd: string, firstHost: string): 
 				line: `${cwd} is not a git checkout, and no host is known yet — cross-machine delivery needs a checkout on this machine too`,
 				fixes: [
 					"start pi inside the checkout you want to deliver from (that session directory is the parent side of the delivery)",
-					"then register the machine and re-run: hc machine add --name my-vps ssh://user@my-vps && /legion doctor crossmachine",
+					"then register the machine and re-run: hc machine add --name <name> ssh://user@<address>  # <name> is what you pass as host",
 				],
 			};
 		}
@@ -426,7 +443,7 @@ function machinesItem(input: {
 			id: "hc-machines",
 			status: "fail",
 			line: `${listing}; configured in settings but unknown to hc: ${absent.join(", ")}${note}`,
-			fixes: absent.slice(0, MAX_PACKAGE_FIXES).map((host) => `hc machine add --name ${host} ssh://user@${host}`),
+			fixes: absent.slice(0, MAX_HOST_FIXES).map((host) => `hc machine add --name ${host} ssh://user@${host}`),
 		};
 	}
 	if (known.length === 0 && input.settingsHosts.length === 0) {
@@ -437,7 +454,7 @@ function machinesItem(input: {
 			status: "fail",
 			line: "no machines are registered with this hc core, and no host is configured in subagents.crossMachine",
 			fixes: [
-				"hc machine add --name my-vps ssh://user@my-vps  # then: hc machine ls",
+				"hc machine add --name <name> ssh://user@<address>  # replace both with the machine you want; then: hc machine ls",
 				`# or set {"subagents":{"crossMachine":{"enabled":true}}} in ~/.pi/agent/settings.json and pass cwd per call`,
 			],
 		};
@@ -468,6 +485,8 @@ async function checkHost(input: {
 	localOrigin: string | undefined;
 	cwd: string;
 	unreachable: string | undefined;
+	/** A parent-side item FAILed, so no launch is "ready" for this host either. */
+	parentFailed: boolean;
 }): Promise<CrossMachineCheckupHost> {
 	const { host, source, settings, env, client, agents, model, localOrigin, cwd } = input;
 	const items: CrossMachineCheckupItem[] = [];
@@ -559,7 +578,7 @@ async function checkHost(input: {
 	// this checkup judged, when one is known). Labelled "once the FAILs are fixed"
 	// when any item failed: a command printed as copy-paste must be one that works
 	// (review M1).
-	const failed = items.some((item) => item.status === "fail");
+	const failed = input.parentFailed || items.some((item) => item.status === "fail");
 	return {
 		host,
 		source,
@@ -801,7 +820,7 @@ async function probeInheritedExtensions(input: {
 	// the top-level `subagents` key, so pasting the second would silently drop the
 	// first role's fix (review M8); merging by role keeps them composable.
 	const byRole = new Map<string, string[]>();
-	for (const [name, role] of fixed) {
+	for (const [name, role] of entries.slice(0, MAX_JSON_PACKAGES)) {
 		byRole.set(role, [...(byRole.get(role) ?? []), name]);
 	}
 	if (byRole.size > 0) {

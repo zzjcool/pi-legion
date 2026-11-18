@@ -413,14 +413,16 @@ test("D5: a session directory that is NOT a checkout gets its own answer, never 
 			error.message,
 			`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${plain}) is not one. ` +
 				"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
-				`(with \`host\` named, an ABSOLUTE cwd is the directory ON that machine): subagent({ agent: "centurion", host: "vps", cwd: "../my-repo", task: "..." }); ` +
+				`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "vps", cwd: "../my-repo", hostCwd: "/abs/path/on/vps", task: "..." }); ` +
 				'2) dispatch a worker instead — subagent({ agent: "worker", host: "vps", task: "..." }) needs no checkout and no origin.',
 		);
 		// The impossible advice is GONE, not merely reordered.
 		assert.doesNotMatch(error.message, /remote add/, "`git remote add` cannot work in a non-repository");
 		assert.doesNotMatch(error.message, /has no origin/);
 		// …and both ways out are pasteable shapes, not prose.
-		assert.match(error.message, /subagent\(\{ agent: "centurion", host: "vps", cwd: "\.\.\/my-repo", task: "\.\.\." \}\)/);
+		// Both halves of the shape: a relative cwd alone would drop the remote directory
+		// and send the reader into the D2 question next.
+		assert.match(error.message, /subagent\(\{ agent: "centurion", host: "vps", cwd: "\.\.\/my-repo", hostCwd: "\/abs\/path\/on\/vps", task: "\.\.\." \}\)/);
 		assert.match(
 			error.message,
 			/subagent\(\{ agent: "worker", host: "vps", task: "\.\.\." \}\) needs no checkout and no origin/,

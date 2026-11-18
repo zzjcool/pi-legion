@@ -49,7 +49,7 @@ cross-machine delivery needs one shared remote: this checkout (/Users/me/agents)
 现在（`notALocalCheckoutMessage`）：
 
 ```text
-cross-machine delivery needs a git checkout on this machine too, and this session's directory (/Users/me/agents) is not one. Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one (with `host` named, an ABSOLUTE cwd is the directory ON that machine): subagent({ agent: "centurion", host: "vps", cwd: "../my-repo", task: "..." }); 2) dispatch a worker instead — subagent({ agent: "worker", host: "vps", task: "..." }) needs no checkout and no origin.
+cross-machine delivery needs a git checkout on this machine too, and this session's directory (/Users/me/agents) is not one. Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one, plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "vps", cwd: "../my-repo", hostCwd: "/abs/path/on/vps", task: "..." }); 2) dispatch a worker instead — subagent({ agent: "worker", host: "vps", task: "..." }) needs no checkout and no origin.
 ```
 
 「是仓库但没有 origin」「两侧 origin 不同」两句**一字未改**（它们原来就是对的，且各有 4 条测试钉着）。
@@ -57,8 +57,8 @@ cross-machine delivery needs a git checkout on this machine too, and this sessio
 落在哪：
 
 - 句子：`src/runs/remote-worktree.ts:552`（`notALocalCheckoutMessage`）
-- 抛出：`src/runs/cross-machine-preflight.ts:339`（交付预检第 2 步）、`src/runs/remote-worktree.ts:637`（`assertSharedOrigin`，建树前的守卫）
-- doctor 的 `parent checkout` 行复用同一句：`src/runs/cross-machine-checkup.ts:319`
+- 抛出：`src/runs/cross-machine-preflight.ts:339`（交付预检第 2 步）、`src/runs/remote-worktree.ts:640`（`assertSharedOrigin`，建树前的守卫）
+- doctor 的 `parent checkout` 行复用同一句：`src/runs/cross-machine-checkup.ts:383`
 
 ### 坑 2：缺扩展包的错误不带「能修它的那个键」（D4）
 
@@ -107,7 +107,7 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
 并且 D2/D4/D5 三类文案的结尾都是可粘贴的 `subagent(...)` 形状 —— 「下一步」永远是回到工具，而不是离开它。
 
 落在哪：`src/runs/remote.ts:649`（`missingRemoteCwdQuestion`）；抛出点 `src/runs/remote.ts:712`（纯 resolver，
-读回 / resume 也走这里）与 `src/runs/remote.ts:1729`（异步 resolver，**在任何发现探测之前**）。
+读回 / resume 也走这里）与 `src/runs/remote.ts:1754`（异步 resolver，**在任何发现探测之前**）。
 
 ### 坑 4：每次调用的远端目录靠猜（`hostCwd` vs `cwd`，`--help` 截断）
 
@@ -160,7 +160,7 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
 
 落在哪：
 
-- 探测与结构化结果：`src/runs/cross-machine-checkup.ts:143`（`runCrossMachineCheckup`）
+- 探测与结构化结果：`src/runs/cross-machine-checkup.ts:159`（`runCrossMachineCheckup`）
 - 渲染：`src/extension/legion-doctor.ts:1199`–`1230`（快照存在时走这条；不存在时**逐字节**保留旧静态块，`auto-doctor` 也仍走它）
 - 两个异步调用方，且**只在选中 `crossmachine` 这一节时**才探测：`src/extension/legion-commands.ts:632`、`index.ts:2532`
 
@@ -204,7 +204,7 @@ host 'vps' has no cwd: set a default in subagents.crossMachine.hosts.vps.cwd, or
 
 （这一块本身不产生任何 `machine.exec`：`machine.list` 在整次体检里只问一次，缺目录在探测之前就变成了提问。）
 
-### C. 模型那台机器没有：FAIL 带两条 `fix:`
+### C. 模型那台机器没有：行尾说明 `--no-extensions`，可粘的 `fix:` 一条
 
 ```text
     - FAIL target models: acme/missing-model is not in vps's listing: workbuddy/deepseek-v4.1-flash (the child runs with --no-extensions, so a provider installed there must also be named in hosts.vps.piExtensions)
@@ -256,13 +256,13 @@ A/B/C 三个真样例、以及「手工兜底：三条命令」（旧的 `git re
 
 | 本地 centurion 需要的输入 | 本地 centurion | 跨机 centurion | 这一行怎么回答 |
 |---|---|---|---|
-| role / task / phases / verify | 调用参数 | **同本地，一字不差** | 仍是必填（与本地相同） |
+| role / task / phases / verify | 调用参数（`role`、`task` 必填；`phases`/`verify` 可选） | **同本地，一字不差** | 与本地同一项：必填/可选的规则不变 |
 | 工作目录 | 本机 cwd | **那台机器上的绝对路径** | **仍是必填**；不给就**提问**（D2），不猜 HOME、不回落到父机 cwd |
 | 父机记录目录 + checkout | `legion.db` 所在目录，无需 git | 还需要**父机 checkout** 以及与目标机共享的 origin | 自动发现（`localCheckoutState` 一次判定）；不是仓库 → D5 的独立答案，是仓库没 origin → 另一句 |
 | host 名 | 没有这一项 | `host: "<h>"` | 仍是必填，但**不用配置**：只要 `hc machine ls` 认识它 |
 | node / pi / legion root | 就是本进程的那几个 | 一次发现探测填好（真实二进制、launcher 背后的 JS 入口、包根） | 自动发现；探测答不出来 → 错误先给**动作**（install / 指到 `cli.js`），settings 键只作 trailing aside |
 | 继承的扩展 | 直接用父机路径 | 按**包名**在那台机器的索引里重锚；缺包 → 报错带 role 与 JSON | 自动发现；缺了就是「装 / 只这个角色不继承」二选一，**不是**提问 |
-| model | role 卡或默认 | 同本地，但那台机器的 `pi` 必须真的提供 | 仍是必填（与本地相同）+ 目标机校验（`target models` 那行给出可替换的模型） |
+| model | role 卡或默认，可省 | 同本地，但那台机器的 `pi` 必须真的提供 | 与本地同一个字段（可省）+ 目标机校验（一个都没命名时，校验「那台机器看得到模型」） |
 | git origin（交付通道） | 不需要 | 两侧归一化后必须相同（D10） | 自动发现；缺失/不同 → 原话点名两个 url 与 `set-url` / `add origin` |
 | pi 必须跑在 hc 终端里 | 不需要 | 需要（`HC_TERMINAL_SOCKET` + `HC_TERMINAL_ID`） | 仍是必填的**环境前提**（工具无法替你创造），错误原话说清怎么补 |
 | agent 怎么知道有这个能力 | 本来就是默认行为 | skill 的 description + 「跨机器派发」一节 | 自动（见第 6 节）：`host` + `cwd` 与「不知道就问用户」都写在 agent 每轮先读的地方 |
@@ -287,12 +287,12 @@ grep `cross-machine` / `host` / `跨机` **零命中**：agent 既不知道有�
   在错误的树里干活）；`/legion doctor crossmachine` 与 runbook 的指路；远端 child 起不来时的读法（退出码 +
   screen 原文 + `Command (run on '<host>' to reproduce):`，不再把 `execution: unknown` 当原因）。
 - **打包可见**：`package.json` 的 `files` 已含 `skills/**/*`；`npm pack --dry-run` 的清单里有
-  `skills/pi-legion/SKILL.md`（8.6 kB）。测试 `test/unit/skill-cross-machine.test.ts` 四条断言把这两件事钉住：
+  `skills/pi-legion/SKILL.md`（10.4 kB）。测试 `test/unit/skill-cross-machine.test.ts` 四条断言把这两件事钉住：
   删掉那一节或那句描述 → 立刻红（红/绿证据见下）；清单或 tarball 里没有这个文件 → 也红。
 
 ```
 $ npm pack --dry-run 2>&1 | grep SKILL.md
-npm notice 8.6kB skills/pi-legion/SKILL.md
+npm notice 10.4kB skills/pi-legion/SKILL.md
 
 $ node --experimental-strip-types --test test/unit/skill-cross-machine.test.ts
 ✔ skill: the description advertises cross-machine dispatch (host + cwd)
@@ -323,12 +323,12 @@ $ node --experimental-strip-types --test test/unit/skill-cross-machine.test.ts
 | 目标机没有这个模型 | `test/unit/cross-machine-params.test.ts:695`「S5.6: the startup probe's four failures are named before a terminal exists」（case `model-missing`，断言点名 host / 模型 / 该机真实清单 / 两个方向的 fix） |
 | 体检：全绿 | `test/unit/cross-machine-checkup.test.ts:362`「D7/D8: a healthy host reports every item PASS in the frozen order, and a real launch line」 |
 | 体检：没有 checkout | `test/unit/cross-machine-checkup.test.ts:446`「D5: a session directory that is not a checkout gets D5's sentence, not `git remote add origin`」 |
-| 体检：缺包 | `test/unit/cross-machine-checkup.test.ts:527`「D4: a package missing on the target FAILs with the role and a pasteable excludeExtensions JSON」 |
-| 体检：模型不提供 | `test/unit/cross-machine-checkup.test.ts:573`「D7: a model the target does not serve FAILs and lists what that machine DOES see」 |
+| 体检：缺包 | `test/unit/cross-machine-checkup.test.ts:528`「D4: a package missing on the target FAILs with the role and a pasteable excludeExtensions JSON」 |
+| 体检：模型不提供 | `test/unit/cross-machine-checkup.test.ts:574`「D7: a model the target does not serve FAILs and lists what that machine DOES see」 |
 
-外加（同一批 D6）：`test/unit/cross-machine-checkup.test.ts:480`（`{enabled:true}` + 只有 `machine list` 认识的 host）、
-`:603`（旧 core，`machine.list` 不支持 → SKIP，指名 host 仍照检）、`:633`（传输失败 FAIL 自己、其余 SKIP）；
-`test/unit/legion-doctor.test.ts:1568` 起两例（快照渲染：FAIL 进 Issues、`report.ok` 为假）。
+外加（同一批 D6）：`test/unit/cross-machine-checkup.test.ts:481`（`{enabled:true}` + 只有 `machine list` 认识的 host）、
+`:604`（旧 core，`machine.list` 不支持 → SKIP，指名 host 仍照检）、`:634`（传输失败 FAIL 自己、其余 SKIP）；
+`test/unit/legion-doctor.test.ts:1609` 与 `:1663` 两例（快照渲染：FAIL 进 Issues、`report.ok` 为假）。
 
 ### 红：把修好的那句退回去，测试就红（三次实跑）
 
@@ -403,13 +403,13 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
 `npm test`（`node --experimental-strip-types --test test/unit/*.test.ts`）：
 
 ```text
-ℹ tests 2588
-ℹ pass 2587
+ℹ tests 2595
+ℹ pass 2594
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 1
 ℹ todo 0
-ℹ duration_ms 53583.677113
+ℹ duration_ms 54619.481839
 ```
 
 `npm run test:integration`（`… test/integration/*.test.ts`）：
@@ -443,11 +443,11 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
   所以体检里 `hc machines` 那行 FAIL 时，先确认你跑在哪个会话里（runbook 第 5 节）。
 - **体检的 host 上限是 5**：第 6 个起只给计数（`… N more host(s) not checked (cap 5)`）；缺包 8、模型 10 同理。
 - **`model-missing` 仍然放行候选链**：体检把「那台机器没有这个模型」作为 FAIL 报出来，但运行期的启动探测
-  仍旧允许模型候选链。`noModelFallback` 钉在「机器事实」那几条上（`cwd` 缺失 `src/runs/remote.ts:714`/`:1731`、
-  交付预检 `src/runs/cross-machine-preflight.ts:208`、目标机不可达 `src/runs/remote.ts:2506`、**D4 的缺包**
+  仍旧允许模型候选链。`noModelFallback` 钉在「机器事实」那几条上（`cwd` 缺失 `src/runs/remote.ts:714`/`:1756`、
+  交付预检 `src/runs/cross-machine-preflight.ts:208`、目标机不可达 `src/runs/remote.ts:2531`、**D4 的缺包**
   与 D5 的四条交付拒绝 —— 它们都是确定性的，换模型重跑只会重复同样的探针）；`model-missing` 不在其列 ——
   换模型重跑是合法的。
-- **D5 的「相对 `cwd`」只修父机那一侧**：`cwdIsRemote`（`index.ts:4887`）只把**绝对** `cwd` 当远端目录，所以
+- **D5 的「相对 `cwd`」只修父机那一侧**：`cwdIsRemote`（`index.ts:4892`）只把**绝对** `cwd` 当远端目录，所以
   `cwd: "../my-repo"` 修的是「父机 checkout」这一半；目标机上的目录仍要 `hosts.<h>.cwd` 或另一次绝对 `cwd`，
   否则就会收到 D2 的提问。D5 的文案是合同冻结的（不属本卡改动），runbook 第 4 节补了这一句说明。
 - **`docs/runbooks/cross-machine-live-e2e.md` 未改**：它引用的 `PI_LEGION_REMOTE_*` 环境变量路径与本轮无关；

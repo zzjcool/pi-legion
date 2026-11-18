@@ -834,3 +834,143 @@ test("D7: the target has no origin — the fix uses THIS checkout's real url, no
 		repo.cleanup();
 	}
 });
+
+test("D7: `enabled: false` does not even START an hc connection", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	let started = 0;
+	const client: HcClient = {
+		start: async () => {
+			started++;
+			throw new Error("the disabled gate must not connect");
+		},
+		close: async () => {},
+		request: async () => {
+			throw new Error("the disabled gate must not request");
+		},
+	};
+	try {
+		const checkup = await runCrossMachineCheckup({
+			cwd: "/Users/me/app",
+			settings: { enabled: false },
+			agents: [],
+			env,
+			client,
+			localCheckout: () => ({ kind: "checkout", origin: LOCAL_ORIGIN }),
+		});
+		assert.equal(started, 0, "no `hc connect` for a feature that is switched off");
+		assert.equal(item(checkup.parent, "hc-machines").status, "fail");
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+	}
+});
+
+test("D7: machines exist but cross-machine is unconfigured → registry printed, no target probed", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	const repo = localRepo();
+	try {
+		const client = healthyTarget();
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			// No `subagents.crossMachine` block at all: a plain `/legion doctor` on a
+			// machine that never used the feature must not fan out into remote probes.
+			settings: undefined,
+			agents: [],
+			env,
+			client,
+		});
+		assert.deepEqual(checkup.hosts, []);
+		assert.equal(client.execs().length, 0, "no machine.exec for an unconfigured feature");
+		const machines = item(checkup.parent, "hc-machines");
+		assert.equal(machines.status, "skip");
+		assert.match(machines.line, /cross-machine is not configured, so no target was probed/);
+		assert.match(machines.line, /fakebox/, "the registry answer is still printed");
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+		repo.cleanup();
+	}
+});
+
+test("D4: two missing packages for two roles merge into ONE settings JSON (plus the where-to-put-it line)", async () => {
+	const repo = localRepo();
+	const root = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-multi-"));
+	const npmDir = path.join(root, "npm", "node_modules");
+	for (const name of ["pi-sysmon", "pi-lens"]) {
+		const dir = path.join(npmDir, name);
+		mkdirSync(path.join(dir, "src"), { recursive: true });
+		writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, pi: { extensions: ["src/index.ts"] } }));
+		writeFileSync(path.join(dir, "src", "index.ts"), "export default {};\n");
+	}
+	const bin = path.join(root, "bin");
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(
+		path.join(bin, "pi"),
+		["#!/bin/sh", "echo 'User packages:'", `echo '    ${path.join(npmDir, "pi-sysmon")}'`, `echo '    ${path.join(npmDir, "pi-lens")}'`].join("\n") + "\n",
+	);
+	chmodSync(path.join(bin, "pi"), 0o755);
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const core = fakeHcCore(discoveryPayload({ packages: ["pi-any-endpoint"] }));
+	const env = testEnv(cache, { HC_BIN: core.bin });
+	resetProbes(env);
+	try {
+		await warmHostExtensions(`${bin}${path.delimiter}${process.env.PATH ?? ""}`);
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			// Different sets per role: the JSON must carry BOTH keys, and one snippet.
+			agents: [
+				role("centurion", { model: MODEL, excludeExtensions: ["pi-lens"] }),
+				role("worker", { excludeExtensions: [] }),
+			],
+			model: MODEL,
+			env,
+			client: healthyTarget(),
+		});
+		const inherited = item(checkup.hosts[0]!.items, "inherited-extensions");
+		assert.equal(inherited.status, "fail", inherited.line);
+		const jsonText = inherited.fixes?.find((fix) => fix.trimStart().startsWith("{"));
+		assert.ok(jsonText, `expected one settings JSON, got ${JSON.stringify(inherited.fixes)}`);
+		const json = JSON.parse(jsonText!) as { subagents?: { agentOverrides?: Record<string, { excludeExtensions?: string[] }> } };
+		assert.deepEqual(json.subagents?.agentOverrides?.centurion?.excludeExtensions, ["pi-sysmon"]);
+		assert.deepEqual(json.subagents?.agentOverrides?.worker?.excludeExtensions, ["pi-lens"]);
+		// …and where it goes, with this machine's real project path.
+		assert.ok(
+			inherited.fixes?.some((fix) => fix.includes(`${repo.repo}/.pi/settings.json`) && fix.includes("~/.pi/agent/settings.json")),
+			`expected the where line, got ${JSON.stringify(inherited.fixes)}`,
+		);
+	} finally {
+		core.cleanup();
+		rmSync(cache, { recursive: true, force: true });
+		rmSync(root, { recursive: true, force: true });
+		resetExtensionDiscoveryCache();
+		repo.cleanup();
+	}
+});
+
+test("D7: no model named and the machine's pi lists none → FAIL (not a skip)", async () => {
+	const cache = mkdtempSync(path.join(tmpdir(), "cross-machine-checkup-cache-"));
+	const env = testEnv(cache);
+	resetProbes(env);
+	const repo = localRepo();
+	try {
+		const client = healthyTarget();
+		client.override("--list-models", () => stdoutResult("provider      model                          context\n"));
+		const checkup = await runCrossMachineCheckup({
+			cwd: repo.repo,
+			settings: { enabled: true, hosts: { [HOST]: explicitHost() } },
+			agents: [],
+			env,
+			client,
+		});
+		const models = item(checkup.hosts[0]!.items, "target-models");
+		assert.equal(models.status, "fail", models.line);
+		assert.match(models.line, /lists no models \(no role names one either\)/);
+		assert.match(models.fixes![0]!, /auth check/);
+	} finally {
+		rmSync(cache, { recursive: true, force: true });
+		repo.cleanup();
+	}
+});

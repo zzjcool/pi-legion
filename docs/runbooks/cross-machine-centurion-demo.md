@@ -99,11 +99,11 @@
 | `FAIL target checkout: <cwd> does not exist on <h>` | 目录在那台机器上不存在 | 粘 `fix:` 的 `hc exec --on <h> -- ls -d <cwd>`，或把那两行里的 `cwd` 改成真实路径 |
 | `FAIL target origin: …` | 那侧不是仓库 / 没有 origin / url 与这侧不同（原话把两个 url 都点名） | 粘 `fix:` 里的 `hc exec --on <h> -- git …` 那一行 |
 | `PASS target runtime: <node> vX and <cli.js> Y — the paths the child will use there` | 远端 `node` 与 `pi` 的真实路径与版本（就是 child 会用的那两个） | 不用动 |
-| `FAIL target runtime: …` | 目标机缺 node / 缺 pi / 这个包不在那儿 / `piCli` 是 shell 启动器 | 粘 `fix:`：装 node、`pi install npm:pi-legion`、或把 `piCli` 指到 `…/dist/bundle/cli.js` |
+| `FAIL target runtime: …` | 那台机器上的 `node` 或 `node <piCli>` 跑不起来（「本包不在那儿」由 preflight 的 exit 14 报，**不在**这一行） | 粘 `fix:`：`hc exec --on <h> -- <node> --version` / 装 node；或把 `piCli` 指到 `…/dist/bundle/cli.js` |
 | `FAIL inherited extensions: N package(s) missing on <h>: <pkg> (role '<role>')` | 继承来的包在那台机器上没装（D4） | `fix:` 任选一条：`hc exec --on <h> -- pi install npm:<pkg>`，或那条 `excludeExtensions` 的 settings JSON（`# where:` 说了写进哪个文件） |
 | `FAIL target models: <model> is not in <h>'s listing: …` | 那台机器的 `pi --list-models` 里没有这个模型（行尾同时说明 `--no-extensions` 与 `piExtensions` 的关系） | 粘 `fix:`：换成它列出来的模型；如果模型本来就该由 provider 扩展提供，把它写进 `subagents.crossMachine.hosts.<h>.piExtensions` |
 | `FAIL hc machines: no machines are registered …` | 这个 hc core 一台机器都不认识，配置里也没有 host | 粘 `fix: hc machine add --name my-vps ssh://user@my-vps`，再 `hc machine ls` |
-| `FAIL hc machines: cross-machine launch is disabled (enabled = false), so nothing here was probed` | `subagents.crossMachine.enabled` 是 `false`（真 launch 会被拒） | 按 `fix:` 把它改成 `true`（同一个 settings 文件），再跑同一条命令 |
+| `FAIL hc machines: cross-machine launch is disabled (subagents.crossMachine.enabled = false), so nothing here was probed` | `subagents.crossMachine.enabled` 是 `false`（真 launch 会被拒） | 按 `fix:` 把它改成 `true`（同一个 settings 文件），再跑同一条命令 |
 | `SKIP hc machines: … cross-machine is not configured, so no target was probed` | `enabled` 没写、也没有 `hosts` 条目：注册表照打，但不去探目标机 | 想体检某一台就配 `{ "enabled": true }` 再跑 `/legion doctor crossmachine` |
 | `SKIP <项>: … not checked: <一句原因>` | 前面那条 FAIL 让这一项没法问（例如还没有目录） | 先修上面那条 FAIL，再跑同一条命令 |
 
@@ -220,9 +220,9 @@ subagent({ agent: "centurion", host: "vps", cwd: "/srv/app", task: "..." })
 
 | 键 | 填什么 | **不填会怎样** |
 |---|---|---|
-| `enabled` | `true`。缺省关闭 | 关了还点名 `host` 会被**拒绝**（不是悄悄在本机跑）：`host '<h>' needs subagents.crossMachine.enabled = true` |
+| `enabled` | `true`（推荐显式写）；**不写也不拦 launch**（只有读回/静态 doctor 那条同步解析器要求它显式为 `true`） | 显式写 `false` → 任何 launch 都被**拒绝**（不是悄悄在本机跑）：`host '<h>' needs subagents.crossMachine.enabled = true`；此时 doctor 的 `crossmachine` 一节零探测，只打这一条 FAIL |
 | `cwd` | 目标机上那个 checkout 的绝对路径（entry 里是默认值，调用里可覆盖） | **不填（或为空）→ 提问**：`host '<h>' needs a directory on that machine, and this call did not name one — which directory should the child work in? …`（四句话，带可粘贴的调用与「别 ssh 去翻目录」；没有「回落到父机 cwd」这回事）；填了**相对**路径 → `host '<h>' needs an absolute cwd in subagents.crossMachine.hosts.<h>.cwd (remote paths are not translated from this machine)`（按次覆盖给相对路径是另一句：`host '<h>': the per-call cwd override must be an absolute path on that machine (got '…'); remote paths are not translated from this machine`）；路径填了但那个目录在那台机器上不存在 → 预检报 `host '<h>' has no checkout at <cwd> (the configured cwd does not exist on that machine). …` |
-| `node` | 目标机上 node 的**绝对路径** | **不填 → 由发现探测填**（解析到真实二进制，不是 mise/asdf shim）；探测也答不出来（远端非交互 shell 没有 nvm、PATH 没初始化）→ `host '<h>': node 'node' is not on PATH on <h> — install node there, then retry. If it is installed but off that core's PATH, name it once in subagents.crossMachine.hosts.<h>.node.`（exit 12，10 秒内给结论） |
+| `node` | 目标机上 node 的**绝对路径** | **不填 → 由发现探测填**（解析到真实二进制，不是 mise/asdf shim）；探测也答不出来（远端非交互 shell 没有 nvm、PATH 没初始化）→ `host '<h>': node 'node' is not on PATH on <h> — install node there, then retry (check it with: hc exec --on <h> -- node --version). If it is installed but off that core's PATH, name it once in subagents.crossMachine.hosts.<h>.node.`（exit 12，10 秒内给结论） |
 | `piCli` | node 能执行的**JS 入口**，形如 `…/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js` | **不填 → 由发现探测填**（launcher 背后的 JS 入口，用 `--version` 验证）；指到 `/root/.pi/agent/bin/pi` 这种 shell 启动器 → `host '<h>': point piCli at the JS entry node can execute, e.g. …/dist/bundle/cli.js. piCli '<path>' is not a JavaScript entry point node can execute …`（exit 16；子进程 argv 是 `[node, piCli, …]`，node 把 shell 当 JS 解析） |
 | `piLegionRoot` | 本包在**目标机**上的绝对路径 | **不填 → 由发现探测填**；那台机器上没有这个包 → `host '<h>': this package is not installed at <path> on that machine — install this package there, then retry: hc exec --on <h> -- pi install npm:pi-legion …`（exit 14；已装在别处就把那个根写进这个键） |
 | `piExtensions` | **那台机器上**要加载的扩展（数组，绝对路径）；显式写 `[]` = 这台机器不加载任何 provider 扩展 | **不填 → 用探测到的 provider 扩展**。写了的路径在那台机器上不存在 → `host '<h>': piExtensions entry '<path>' does not exist on that machine …`（exit 17）；模型由扩展提供而那台机器的 `pi` 看不到它 → child 报 `No API key found` / `No models available`（doctor 的 `target models` 那行会先告诉你，并给出这个键的 `fix:`） |

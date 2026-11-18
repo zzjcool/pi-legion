@@ -161,7 +161,10 @@ function packagePathError(
 		return new SubagentError(
 			`host '${host}': the extension '${file}' belongs to package '${name}', which is not installed on that machine (the launch would have silently dropped it). Two ways out: 1) install it there — hc exec --on ${host} -- pi install npm:${name} (same entry names are then mapped automatically); 2) ${keepHere}`,
 			ErrorCodes.INVALID_PARAMS,
-			{ host, extension: file, package: name, reason: resolution.reason, ...(roleName.length > 0 ? { role: roleName } : {}) },
+			// A package that is not on that machine is deterministic: retrying the next
+			// model candidate re-runs the same mapping (and a preflight, a mkdir and a
+			// mirror on the target) to reach the same refusal.
+			{ host, extension: file, package: name, reason: resolution.reason, noModelFallback: true, ...(roleName.length > 0 ? { role: roleName } : {}) },
 		);
 	}
 	const declared = resolution.declared ?? [];
@@ -171,7 +174,7 @@ function packagePathError(
 	return new SubagentError(
 		`host '${host}': package '${name}' IS installed there at ${resolution.remoteDir}, but it does not expose './${resolution.relative}' (declared: ${available}); the launch would have loaded a different entry than the one this machine asked for. ${fix}`,
 		ErrorCodes.INVALID_PARAMS,
-		{ host, extension: file, package: name, reason: resolution.reason, declared },
+		{ host, extension: file, package: name, reason: resolution.reason, declared, noModelFallback: true },
 	);
 }
 

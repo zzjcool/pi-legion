@@ -553,7 +553,7 @@ export function notALocalCheckoutMessage(opts: { host: string; localRepo: string
 	return (
 		`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${opts.localRepo}) is not one. ` +
 		"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
-		`(with \`host\` named, an ABSOLUTE cwd is the directory ON that machine): subagent({ agent: "centurion", host: "${opts.host}", cwd: "../my-repo", task: "..." }); ` +
+		`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "${opts.host}", cwd: "../my-repo", hostCwd: "/abs/path/on/${opts.host}", task: "..." }); ` +
 		`2) dispatch a worker instead — subagent({ agent: "worker", host: "${opts.host}", task: "..." }) needs no checkout and no origin.`
 	);
 }

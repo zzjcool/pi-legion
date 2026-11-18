@@ -1598,8 +1598,11 @@ function crossMachineSnapshot(): CrossMachineCheckup {
 							'{"subagents":{"agentOverrides":{"centurion":{"excludeExtensions":["pi-sysmon"]}}}}',
 						],
 					},
-					{ id: "target-models", status: "skip", line: "no model to check (no role carries one and this run named none)" },
+					{ id: "target-models", status: "skip", line: "target models not checked: no directory on fakebox yet — the FAIL above says how to pass it" },
 				],
+				// The fixture has a FAIL, so the launch is the after-fixes variant — the
+				// same flag the checkup sets (`items.some(status === "fail")`).
+				launchAfterFixes: true,
 				launch: 'subagent({ agent: "centurion", host: "fakebox", cwd: "/srv/app", worktree: true, task: "demo: report pwd and stop", phases: [{ id: "done", terminal: true }] })',
 			},
 		],
@@ -1632,13 +1635,16 @@ test("D6/D8: a snapshot renders PASS/FAIL/SKIP with fixes and a launch, and a FA
 		assert.match(block, /^ {2}- fakebox:$/m);
 		assert.match(block, /^ {4}- PASS target checkout: \/srv\/app exists$/m);
 		assert.match(block, /^ {4}- FAIL inherited extensions: 1 package\(s\) missing on fakebox: pi-sysmon \(role 'centurion'\)$/m);
-		assert.match(block, /^ {4}- SKIP target models: no model to check/m);
+		assert.match(block, /^ {4}- SKIP target models: target models not checked: no directory on fakebox yet/m);
 		// Fixes are pasteable, in order, under the FAIL they belong to.
 		assert.match(block, /^ {10}fix: hc exec --on fakebox -- pi install npm:pi-sysmon$/m);
 		assert.match(block, /^ {10}fix: \{"subagents":\{"agentOverrides":\{"centurion":\{"excludeExtensions":\["pi-sysmon"\]\}\}\}\}$/m);
-		// D8: the launch line is REAL values and is not a `<…>` template.
-		const launchHeader = block.split("\n").find((line) => line.includes("launch (copy-paste, real values):"));
-		assert.ok(launchHeader, `expected a launch header in:\n${block}`);
+		// D8: the launch line is REAL values and is not a `<…>` template. A FAIL above
+		// it relabels the header, so "copy-paste" never promises a call the report
+		// just disproved.
+		const launchHeader = block.split("\n").find((line) => line.includes("launch (copy-paste once the FAILs above are fixed):"));
+		assert.ok(launchHeader, `expected the after-fixes launch header in:\n${block}`);
+		assert.doesNotMatch(block, /launch \(copy-paste, real values\):/, "an all-green block is the only one that says plain copy-paste");
 		const launchLine = block.split("\n").find((line) => line.trimStart().startsWith("subagent({"));
 		assert.ok(launchLine, `expected a launch line in:\n${block}`);
 		assert.ok(launchLine!.startsWith("        "), "the launch is indented as one copyable command");

@@ -2534,7 +2534,9 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 						cwd,
 						settings: catalog.settings.crossMachine,
 						agents,
-						model: agents[0]?.model,
+						// No `model`: the checkup prefers the role the launch line names
+						// (`centurion`), which is the one a launch would actually use. Passing
+						// `agents[0]` here judged the launch by whatever role was listed first.
 					})
 					: undefined;
 				const report = runLegionDoctor({
@@ -4494,7 +4496,11 @@ async function reviveChild(
 			// zero-config shape (`{enabled:true}` + a per-call directory) resumable —
 			// otherwise the refusal asks for an input this path silently dropped.
 			? await resolveHostTargetAsync(recordHost, ctx.settings.crossMachine, {
-				admission: "never",
+				// `when-unconfigured`, not `never`: with the D3 minimal config the host has
+				// no settings entry, so `never` skipped the registry and then refused with
+				// "register the machine" for a machine the core already knows — the same
+				// settings launched fine and could not be resumed. A configured host still
+				// costs no `machine.list` (the entry is the operator's claim).
 				...(firstRemoteCwd(ctx.params.hostCwd, ctx.params.cwd) !== undefined
 					? { cwd: firstRemoteCwd(ctx.params.hostCwd, ctx.params.cwd) }
 					: {}),

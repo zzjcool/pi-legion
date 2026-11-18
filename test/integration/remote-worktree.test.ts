@@ -403,7 +403,7 @@ test("D5: a cwd that is not a checkout here is named as the SESSION's directory,
 		message,
 		`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${plain}) is not one. ` +
 			"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
-			`(with \`host\` named, an ABSOLUTE cwd is the directory ON that machine): subagent({ agent: "centurion", host: "fakebox", cwd: "../my-repo", task: "..." }); ` +
+			`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "fakebox", cwd: "../my-repo", hostCwd: "/abs/path/on/fakebox", task: "..." }); ` +
 			'2) dispatch a worker instead — subagent({ agent: "worker", host: "fakebox", task: "..." }) needs no checkout and no origin.',
 	);
 	// The real spawn path stops before a tree or a terminal exists.
