@@ -115,6 +115,7 @@ import { expectedModelsFromSettings, parseDoctorSections, runLegionDoctor } from
 import { readFileSync } from "node:fs";
 import {
 	effectiveMaxDepth,
+	launchNoticeLines,
 	Orchestrator,
 	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
@@ -5044,7 +5045,10 @@ async function launchStep(
 		// — but it must not be invisible either, or a child quietly runs on a model
 		// nobody registered. Queued launches render this after admission instead
 		// (`Handle.queued` carries no warning; the queue notice does).
-		if (handle.warning) session.results.push(`  ⚠ ${handle.name}: ${handle.warning}`);
+		// B5 (`warning`) and xm-dispatch D2 (`warnings`, the cross-machine extension
+		// skips) share ONE renderer: a skipped provider extension must be as visible as
+		// a custom model id, and the queued path renders through the same function.
+		session.results.push(...launchNoticeLines(handle.name, handle));
 		session.onUpdate?.({
 			content: [
 				{
@@ -7472,6 +7476,8 @@ export function renderCollect(
 			truncated: boolean;
 			byteCapped?: boolean;
 			localPath?: string;
+			/** The transcript's path on that machine (xm-dispatch D3.3). */
+			remotePath?: string;
 			reason?: string;
 			/** `remote-child-fate-v1` §5: why it failed, as a class. */
 			fate?: "no-child" | "no-session" | "path" | "unreachable";
@@ -7563,6 +7569,14 @@ export function renderCollect(
 				);
 				const evidence = readback.evidence ?? [];
 				if (evidence.length > 0) lines.push(`  evidence: ${evidence.join("; ")}`);
+				// xm-dispatch D3.3: a failed read-back names the file it could not read and
+				// the command that fetches it. "No transcript" without an address is the
+				// difference between an operator fixing it and re-running blind.
+				if (readback.remotePath) {
+					lines.push(
+						`  remote: ${readback.remotePath} — retrieve it with: hc exec --on ${readback.host} -- cat ${readback.remotePath}`,
+					);
+				}
 				const screen = readback.screenTail ?? [];
 				if (screen.length > 0) lines.push(`  screen: ${screen.join(" ⏎ ")}`);
 				if (readback.nextStep) lines.push(`  next: ${readback.nextStep}`);

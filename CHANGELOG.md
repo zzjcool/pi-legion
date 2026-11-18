@@ -9,6 +9,41 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [Unreleased] — patch（建议 6.2.1）
+
+跨机派发实跑（Mac 父机 → `hw-nj`）暴露的三个 bug + 一条设计意图落实。详见
+`docs/reports/xm-dispatch-fixes.md`，判据冻结在 `docs/contracts/xm-dispatch-fixes-v1.md`。
+
+### Fixed
+
+- **扩展入口校验假阳性（阻断派发）**：包把 `pi.extensions` 声明成**目录**
+  （`["./extensions"]`，如 `pi-autoresearch@1.9.0`）时，父机侧会把该目录展开成
+  `extensions/<name>/index.ts`，而远端探测原样记录 `extensions`，两侧用字符串全等比较
+  ⇒ 恒判 `entry-missing`。现在目录声明按其**子树**匹配（以 `/` 为界），只有「声明的是
+  具体文件、且远端不是那一个」才失败。文件声明不可能成为目录前缀，所以这条规则不会放宽
+  版本/布局不符的拒绝。
+- **继承扩展缺失时逐个硬失败**：跨机 launch 现在**跳过**目标机装不上/入口不符的
+  `-e/--extension`，并给出**一条**汇总 warning（含可直接粘贴的 `agentOverrides`
+  `excludeExtensions` 片段），不再「一个包一次调用」地撞。只有角色卡显式声明
+  `requiredExtensions` 时才硬失败（同样聚合成一条错误）。`--skill` 等非扩展路径参数保持
+  D6 的硬拒绝。
+- **判成 `aborted` 但 child 其实跑完了**（最严重）：跨机转录的读回以前只在 collect 开头做
+  一次，判词却在这之后基于那份**冻结快照**，于是「远端 11 行、父端 `5 of 5 (complete)`、
+  `aborted (no assistant message for the last prompt)`」。现在 wait 落定后（以及 grace
+  重试、retry 判词前）**重新读回**，判词只建立在最后一次读回上；读取方在无内存态读回时
+  优先磁盘上的 `<runDir>/remote/<name>.jsonl`，不再读本机预创建的空占位文件；
+  read-back **失败**改为 `unknown (transcript not retrieved from host …)` 并给出远端路径与
+  `hc exec` 取回命令——「读不到」不再伪装成「child 没说」。`lines === 0` 的瞬时读也不再
+  截断已有的非空镜像。
+
+### Changed
+
+- **默认只允许 `centurion` 跨机**：新增 `subagents.crossMachine.allowRoles`
+  （默认 `["centurion"]`）。跨机派发是**交付单元**的能力，scout/worker 应当由远端
+  centurion 在其本机派生。把 `host` 写在角色卡 / `agentOverrides` 里同样受此约束；
+  `resume`（重连既有远端子）不受影响。要放行：`"subagents": { "crossMachine":
+  { "allowRoles": ["centurion", "worker"] } }`。
+
 ## [6.2.0] — 2026-11-18
 
 跨机器派发从「能跑」变成「能配、能排查、能演示」：配置只写覆盖，失败带证据与下一步，

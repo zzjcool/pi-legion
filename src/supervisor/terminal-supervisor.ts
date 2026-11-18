@@ -22,8 +22,9 @@ import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import {
 	ensureRemoteDir,
-	mapRemoteArgv,
+	mapRemoteArgvAllowingSkips,
 	needsPackageIndex,
+	planSkippedExtensions,
 	packageLoaderFor,
 	mirrorRemoteFile,
 	normalizeHost,
@@ -395,6 +396,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 		let remoteWorktree: { path: string; branch: string } | undefined;
 		let createdRemoteWorktree = false;
 		let createdRemoteDir = false;
+		// xm-dispatch D2: non-fatal launch notices, aggregated ONE per launch and
+		// carried on the handle (stderr is invisible in the tool result).
+		const launchWarnings: string[] = [];
 		if (target !== undefined) {
 			const requested = typeof input.worktreePath === "string" ? input.worktreePath.trim() : "";
 			if (requested.length > 0) {
@@ -650,7 +654,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// the package, the parent path and the candidates. A child that quietly
 				// lost the provider extension starts, prints no models, and hangs — the
 				// worst of the three answers.
-				const mappedArgs = mapRemoteArgv(built.args, {
+				const mapped = mapRemoteArgvAllowingSkips(built.args, {
 					host: target.host,
 					// A remote worktree child reads ITS tree, not the bare checkout: the
 					// git-remote model says both machines hold the same content, and the
@@ -661,6 +665,20 @@ export class TerminalSupervisor implements LegionSupervisor {
 					pathMap: target.pathMap,
 					...(packages ? { packages } : {}),
 				});
+				const mappedArgs = mapped.args;
+				if (mapped.skipped.length > 0) {
+					// xm-dispatch D2: inherited extensions the target cannot load are SKIPPED
+					// (one aggregated warning), unless the card declared them required —
+					// then it is ONE aggregated refusal instead of one package per call.
+					const plan = planSkippedExtensions({
+						host: target.host,
+						agentName: input.agent.name,
+						skipped: mapped.skipped,
+						required: input.agent.requiredExtensions,
+					});
+					if (plan.refused !== undefined) throw plan.refused;
+					launchWarnings.push(...plan.warnings);
+				}
 				// S5.6: `--no-extensions` is right (a child must not inherit the parent's
 				// plugin set) but on a machine whose MODELS come from an extension it also
 				// removes the model provider — the real run answered `No models available`
@@ -878,6 +896,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 			...(remoteDir ? { remoteDir } : {}),
 			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
 			...(startupUnconfirmed ? { startupUnconfirmed: true } : {}),
+			...(launchWarnings.length > 0 ? { warnings: launchWarnings } : {}),
 		};
 	}
 

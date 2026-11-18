@@ -216,6 +216,93 @@ test("D1: host + worktree:false reaches the terminal backend with the target", a
 	});
 });
 
+// NB: `utility: true` is the SCOUT CARD's field (the role must stay a leaf); the
+// `cannot carry a utility dispatch` refusal is a different flag (`utilityDispatch`,
+// set by `vexillatio`) with its own contract test, and it fires before this rule.
+test("xm-dispatch D4: a scout cannot cross machines by default — only a delivery-unit role may", async () => {
+	// The user's design intent, verbatim: "why can scout and worker be dispatched
+	// across machines? only centurion should cross." A scout is a member of the team
+	// that remote centurion creates ON that machine.
+	const h = harness("xm-roles-scout-");
+	await insideHcTerminal(async () => {
+		try {
+			await assert.rejects(
+				() => h.orchestrator.launch({ agent: agent({ name: "scout", utility: true }), task: "t", host: HOST, hostTarget: target() }),
+				(rejected: unknown): boolean => {
+					assert.ok(rejected instanceof SubagentError, `must refuse with a SubagentError, got ${String(rejected)}`);
+					assert.equal((rejected as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+					const message = (rejected as SubagentError).message;
+					// The reason AND the way out are both in the sentence.
+					assert.match(message, /cross-machine launch is for a DELIVERY UNIT, and only 'centurion' may cross/);
+					assert.match(message, /Dispatch a centurion to that machine and let IT create its scout team there/);
+					assert.match(message, /"allowRoles": \["centurion", "scout"\]/);
+					return true;
+				},
+			);
+			assert.equal(h.supervisor.calls.length, 0, "the refusal must precede any spawn");
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("xm-dispatch D4: a worker is refused too, unless the target's allowRoles says otherwise", async () => {
+	const h = harness("xm-roles-worker-");
+	await insideHcTerminal(async () => {
+		try {
+			await assert.rejects(
+				() => h.orchestrator.launch({ agent: agent({ name: "worker" }), task: "t", host: HOST, hostTarget: target() }),
+				/cannot be dispatched to agent 'worker'/,
+			);
+			// Explicit allowlist = the operator's decision, and the launch proceeds.
+			const handle = await h.orchestrator.launch({
+				agent: agent({ name: "worker" }),
+				task: "t",
+				host: HOST,
+				hostTarget: target({ allowRoles: ["centurion", "worker"] }),
+			});
+			assert.equal(handle.child.host, HOST);
+			assert.ok(h.supervisor.calls.some((call) => call.method === "spawnChild"));
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("xm-dispatch D4: the role rule is a DISPATCH rule — a name that ALREADY exists over there is not re-gated", async () => {
+	// What this proves, precisely: the guard keys on "is this a new dispatch", not on
+	// "does the role appear in allowRoles". An operator who tightens `allowRoles` after
+	// a child exists must still be able to continue/reconnect that child — a rule that
+	// locks them out of work already running on the other machine would be worse than
+	// the bug it fixes. It does NOT prove a resume: `launch` on an existing name
+	// re-spawns (the second `spawnChild` below is real), and the resume gate for an
+	// existing remote child lives in `resolveHostTargetAsync({admission:"never"})`
+	// (`src/runs/remote.ts`), which this rule never touches.
+	const h = harness("xm-roles-resume-");
+	await insideHcTerminal(async () => {
+		try {
+			const first = await h.orchestrator.launch({ agent: agent({ name: "worker" }), task: "t", host: HOST, hostTarget: target({ allowRoles: ["centurion", "worker"] }) });
+			await h.orchestrator.retire(first.name, { graceful: false });
+			const spawnsBefore = h.supervisor.calls.filter((call) => call.method === "spawnChild").length;
+			const again = await h.orchestrator.launch({
+				agent: agent({ name: "worker" }),
+				task: "t",
+				name: first.name,
+				host: HOST,
+				hostTarget: target(),
+			});
+			assert.equal(again.name, first.name);
+			assert.equal(
+				h.supervisor.calls.filter((call) => call.method === "spawnChild").length,
+				spawnsBefore + 1,
+				"a re-launch on an existing name DOES spawn: the exemption is about not re-gating, not about resuming",
+			);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
 test("D1: resolveHostTarget refuses a pathMap entry that is relative on either side", () => {
 	// A relative prefix would resolve against two different homes; the settings
 	// parser keeps it and the resolver is the one place that can name it.
@@ -257,6 +344,7 @@ test("S3/B1: `host` + `verify` runs the command on THAT machine — never in thi
 			ok: true,
 			host: request.host,
 			localPath: request.localPath,
+			remotePath: `/home/there/${request.name}/session.jsonl`,
 			lines: 0,
 			returned: 0,
 			truncated: false,

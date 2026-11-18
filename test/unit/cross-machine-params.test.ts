@@ -889,3 +889,25 @@ test("S5.6: piExtensions from a settings file reach the remote argv and its prob
 		h.cleanup();
 	}
 });
+
+test("xm-dispatch D4: crossMachine.allowRoles is parsed, and a wrong shape is refused by name", () => {
+	const parsed = parseSubagentSettings(
+		{ subagents: { crossMachine: { enabled: true, allowRoles: ["centurion", "worker"] } } },
+		"/tmp/settings.json",
+	);
+	assert.deepEqual(parsed?.crossMachine?.allowRoles, ["centurion", "worker"]);
+	// Absent stays absent: the DEFAULT is the consumer's, so a settings file can never
+	// pin a value this build would not recognize.
+	assert.equal(
+		parseSubagentSettings({ subagents: { crossMachine: { enabled: true } } }, "/tmp/settings.json")?.crossMachine?.allowRoles,
+		undefined,
+	);
+	assert.throws(
+		() => parseSubagentSettings({ subagents: { crossMachine: { allowRoles: "centurion" } } }, "/tmp/settings.json"),
+		/crossMachine\.allowRoles.*array of role names/,
+	);
+	assert.throws(
+		() => parseSubagentSettings({ subagents: { crossMachine: { allowRoles: [] } } }, "/tmp/settings.json"),
+		/at least one role name/,
+	);
+});

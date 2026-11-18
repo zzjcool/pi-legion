@@ -603,7 +603,7 @@ function overrideFieldExpected(field: string): string | undefined {
 	if (["inheritProjectContext", "inheritSkills", "inheritExtensions", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer", "renewable"].includes(field)) return "a boolean";
 	if (["timeoutMs", "toolTimeoutMs", "maxSubagentDepth", "maxRenewals"].includes(field)) return "a number";
 	if (field === "skills") return "an array of strings or false";
-	if (["tools", "extensions", "subagentOnlyExtensions", "excludeExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return "an array of strings";
+	if (["tools", "extensions", "subagentOnlyExtensions", "excludeExtensions", "requiredExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return "an array of strings";
 	return undefined;
 }
 
@@ -616,7 +616,7 @@ function isValidOverrideField(field: string, value: unknown): boolean {
 	if (["inheritProjectContext", "inheritSkills", "inheritExtensions", "defaultProgress", "async", "completionGuard", "allowNestedSubagents", "utility", "disabled", "worktree", "steer", "renewable"].includes(field)) return typeof value === "boolean";
 	if (["timeoutMs", "toolTimeoutMs", "maxSubagentDepth", "maxRenewals"].includes(field)) return typeof value === "number";
 	if (field === "skills") return value === false || isStringArray(value);
-	if (["tools", "extensions", "subagentOnlyExtensions", "excludeExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return isStringArray(value);
+	if (["tools", "extensions", "subagentOnlyExtensions", "excludeExtensions", "requiredExtensions", "skillPath", "defaultReads", "fallbackModels", "alias"].includes(field)) return isStringArray(value);
 	return true;
 }
 
@@ -742,6 +742,23 @@ function parseCrossMachine(
 		"discoveryTtlSeconds",
 		optionalPositiveSeconds(value.discoveryTtlSeconds, "crossMachine.discoveryTtlSeconds", filePath),
 	);
+	// xm-dispatch D4: a role allowlist. An empty array is a SHAPE error, not "nobody":
+	// an operator who wants cross-machine dispatch off disables the feature
+	// (`enabled: false`) rather than leaving a list that silently refuses every role.
+	if (value.allowRoles !== undefined) {
+		if (!isStringArray(value.allowRoles)) {
+			throw new Error(
+				`Subagent settings in '${filePath}' have invalid 'crossMachine.allowRoles'; expected an array of role names.`,
+			);
+		}
+		const roles = value.allowRoles.map((role) => role.trim()).filter((role) => role.length > 0);
+		if (roles.length === 0) {
+			throw new Error(
+				`Subagent settings in '${filePath}' have invalid 'crossMachine.allowRoles'; expected at least one role name (disable with crossMachine.enabled: false instead).`,
+			);
+		}
+		out.allowRoles = roles;
+	}
 	if (value.hosts !== undefined) {
 		if (!isRecord(value.hosts)) {
 			throw new Error(

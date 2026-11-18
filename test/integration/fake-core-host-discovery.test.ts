@@ -509,6 +509,73 @@ test("v1.2: an extension the target does not have is refused before any terminal
 	assert.deepEqual(h.wireFor("terminal.run"), []);
 });
 
+test("xm-dispatch D2: an inherited extension that machine cannot load is SKIPPED — the launch proceeds and says so once", async (t) => {
+	const h = harness(t);
+	clearHostDiscoveryCache();
+	const target = await resolveHostTargetAsync(HOST, { enabled: true }, {
+		client: h.client,
+		cwd: h.remoteCwd,
+		admission: "always",
+		cacheDir: null,
+	});
+	// Two parent-side packages the target does not have: the real run made this the
+	// whole complaint, because BOTH used to be refused one call at a time.
+	const missing = ["pi-sop", "pi-sysmon"].map((name) => {
+		const root = path.join(h.root, "parent", "node_modules", name);
+		const entry = path.join(root, "src", "index.ts");
+		mkdirSync(path.dirname(entry), { recursive: true });
+		writeFileSync(entry, "export const x = 1;\n");
+		writeFileSync(path.join(root, "package.json"), JSON.stringify({ name }));
+		return entry;
+	});
+	const handle = await h.supervisor.spawnChild(
+		spawnInput(h, target, { agent: { ...agent(), extensions: missing } }),
+	);
+	// The launch HAPPENED: no refusal, one terminal, and neither `-e` pair survived.
+	const runs = h.wireFor("terminal.run");
+	assert.equal(runs.length, 1, "a skipped extension must not block the launch");
+	const argv = runs[0]?.argv as string[];
+	assert.ok(!argv.includes(missing[0] as string), "the unmappable pair goes, it is not handed to pi");
+	assert.deepEqual(handle.warnings?.length, 1, "ONE warning per launch, never one per package");
+	const warning = handle.warnings?.[0] as string;
+	assert.match(warning, /skipped 2 inherited extensions/);
+	assert.match(warning, /pi-sop, pi-sysmon/);
+	assert.match(warning, /excludeExtensions/);
+});
+
+test("xm-dispatch D2: a card that declares the extension REQUIRED still hard-fails, with ONE aggregated message", async (t) => {
+	const h = harness(t);
+	clearHostDiscoveryCache();
+	const target = await resolveHostTargetAsync(HOST, { enabled: true }, {
+		client: h.client,
+		cwd: h.remoteCwd,
+		admission: "always",
+		cacheDir: null,
+	});
+	const missing = ["pi-sop", "pi-sysmon"].map((name) => {
+		const root = path.join(h.root, "parent", "node_modules", name);
+		const entry = path.join(root, "src", "index.ts");
+		mkdirSync(path.dirname(entry), { recursive: true });
+		writeFileSync(entry, "export const x = 1;\n");
+		writeFileSync(path.join(root, "package.json"), JSON.stringify({ name }));
+		return entry;
+	});
+	const failure = await rejected(() => h.supervisor.spawnChild(
+		spawnInput(h, target, { agent: { ...agent(), extensions: missing, requiredExtensions: ["pi-sop", "pi-sysmon"] } }),
+	));
+	const message = String((failure as Error)?.message ?? failure);
+	// Aggregated: both required-but-missing packages are named in the SAME sentence.
+	assert.match(message, /declares requiredExtensions that machine cannot load: pi-sop \(not installed there\), pi-sysmon \(not installed there\)/);
+	const oneRequired = await rejected(() => h.supervisor.spawnChild(
+		spawnInput(h, target, { agent: { ...agent(), extensions: missing, requiredExtensions: ["pi-sop"] } }),
+	));
+	// A required item fails the launch; an OPTIONAL one next to it is still only skipped,
+	// so its name must not appear in the refusal.
+	assert.match(String((oneRequired as Error)?.message ?? oneRequired), /pi-sop \(not installed there\)/);
+	assert.doesNotMatch(String((oneRequired as Error)?.message ?? oneRequired), /pi-sysmon/);
+	assert.deepEqual(h.wireFor("terminal.run"), [], "a required extension fails before any terminal");
+});
+
 // ── 4. self-healing cache ─────────────────────────────────────────────────
 
 test("v1.1: a stale discovered piCli is re-probed once by the preflight (upgrade self-heal)", async (t) => {
