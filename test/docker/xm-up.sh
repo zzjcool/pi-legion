@@ -35,6 +35,14 @@ XM_REMOTE="${XM_REMOTE:-xm-remote}"
 XM_HOST="${XM_HOST:-remote}"
 XM_HOST_CWD="${XM_HOST_CWD:-/root/work}"
 XM_MODEL="${XM_MODEL:-workbuddy/hy4std}"
+# Which topology the deterministic driver is about to exercise:
+#   launch        — both containers register the mock provider `xm/flash`
+#   model-missing — the REMOTE machine does not know that provider at all (§5.4)
+XM_MODEL_SCENARIO="${XM_MODEL_SCENARIO:-launch}"
+# The two mock LLM ports. These are FROZEN: test/docker/xm/drive.mjs (MOCK_PORTS)
+# points the parent container's pi at 8765 and the remote child at 8766.
+XM_MOCK_PORT_PARENT=8765
+XM_MOCK_PORT_CHILD=8766
 
 # 每一步失败都按契约 §3 的三段式报出来：哪一步、哪条命令、原始输出。
 die() {
@@ -107,6 +115,31 @@ else
   xm_run image-build docker build -t "$XM_IMAGE" -f "$HERE/Dockerfile.xm" "$ROOT" | tail -5
 fi
 
+# ------------------------------------------- 1.5 每容器各自的 models.json
+# v1.1：provider id 与 model id 必须**两端同名**（父机 argv 把 `<provider>/<model>`
+# 传给远端），只有 baseUrl 不同。容器的 /root/.pi/agent/models.json 是宿主
+# models.json 的只读挂载，没法原地追加 provider，所以这里生成两份合并文件，
+# 再分别挂进两个容器。宿主文件里的真实 provider 原样保留（make xm-real 用得上）。
+XM_MODELS_DIR="${XM_MODELS_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/xm-models.XXXXXX")}"
+step "models dir $XM_MODELS_DIR scenario=$XM_MODEL_SCENARIO"
+xm_run models-parent node "$HERE/xm/models-merge.mjs" \
+  --base "$AGENT/models.json" \
+  --out "$XM_MODELS_DIR/parent/models.json" \
+  --base-url "http://parent:$XM_MOCK_PORT_PARENT/v1"
+if [ "$XM_MODEL_SCENARIO" = "model-missing" ]; then
+  # 远端不认识 xm provider：pi 的启动探针会答 “Unknown provider” + 远端真实模型表，
+  # 产品据此报 model-missing（remote.ts:841-867）。
+  xm_run models-remote node "$HERE/xm/models-merge.mjs" \
+    --base "$AGENT/models.json" \
+    --out "$XM_MODELS_DIR/remote/models.json" \
+    --no-xm
+else
+  xm_run models-remote node "$HERE/xm/models-merge.mjs" \
+    --base "$AGENT/models.json" \
+    --out "$XM_MODELS_DIR/remote/models.json" \
+    --base-url "http://parent:$XM_MOCK_PORT_CHILD/v1"
+fi
+
 # ------------------------------------------------- 2. 幂等清理 + 网络 + 卷
 step "cleanup (idempotent) $XM_PARENT $XM_REMOTE $XM_NET $XM_VOL"
 docker rm -f "$XM_PARENT" "$XM_REMOTE" >/dev/null 2>&1 || true
@@ -123,26 +156,28 @@ CRED_MOUNTS=()
 if [ -f "$AGENT/auth.json" ]; then
   CRED_MOUNTS+=(-v "$AGENT/auth.json:$AGENT/auth.json:ro")
 fi
-if [ -f "$AGENT/models.json" ]; then
-  CRED_MOUNTS+=(-v "$AGENT/models.json:$AGENT/models.json:ro")
-fi
 if [ -f "$AGENT/models-store.json" ]; then
   CRED_MOUNTS+=(-v "$AGENT/models-store.json:$AGENT/models-store.json")
 else
   step "warn: $AGENT/models-store.json 不存在，容器里模型库可能为空"
 fi
+# models.json 每个容器一份（v1.1）：父机 8765，远端 child 8766。
+PARENT_MODELS_MOUNT=(-v "$XM_MODELS_DIR/parent/models.json:$AGENT/models.json:ro")
+REMOTE_MODELS_MOUNT=(-v "$XM_MODELS_DIR/remote/models.json:$AGENT/models.json:ro")
 
 # ------------------------------------------------------ 3. 两容器（契约 §6）
 # --hostname 与容器名都可解析，但不用 --network=host：跨机必须走真网络。
 step "run $XM_REMOTE (sshd :22)"
 xm_run run-remote docker run -d --name "$XM_REMOTE" --hostname "$XM_HOST" --network "$XM_NET" \
   -v "$ROOT:/plugin:ro" -v "$XM_VOL:/srv/git" \
+  ${REMOTE_MODELS_MOUNT[@]+"${REMOTE_MODELS_MOUNT[@]}"} \
   ${CRED_MOUNTS[@]+"${CRED_MOUNTS[@]}"} -e HOME=/root \
   "$XM_IMAGE" /usr/sbin/sshd -D -e >/dev/null
 
 step "run $XM_PARENT"
 xm_run run-parent docker run -d --name "$XM_PARENT" --hostname parent --network "$XM_NET" \
   -v "$ROOT:/plugin:ro" -v "$XM_VOL:/srv/git" \
+  ${PARENT_MODELS_MOUNT[@]+"${PARENT_MODELS_MOUNT[@]}"} \
   ${CRED_MOUNTS[@]+"${CRED_MOUNTS[@]}"} -e HOME=/root \
   "$XM_IMAGE" sleep infinity >/dev/null
 
@@ -163,10 +198,19 @@ step "sshd ready $XM_HOST:22"
 
 # ---------------------------------------- 4. settings：MERGE（绝不能覆盖写）
 # 覆盖写会丢 packages → provider 与 /plugin 注册消失 → 容器里 pi --list-models 变空。
-for c in "$XM_PARENT" "$XM_REMOTE"; do
-  xm_run "settings-$c" docker exec "$c" \
-    node /plugin/test/docker/xm/settings-merge.mjs /root/.pi/agent/settings.json
-done
+# v1.1 追加 defaultProvider/defaultModel（xm/flash），同样走 merge；packages 由
+# settings-merge.mjs 的硬不变量守住。
+XM_SETTINGS_PATCH='{"subagents":{"crossMachine":{"enabled":true}},"defaultProvider":"xm","defaultModel":"flash"}'
+if [ "$XM_MODEL_SCENARIO" = "model-missing" ]; then
+  # 远端没有 xm provider，默认模型名就不该指向它。
+  XM_SETTINGS_PATCH_REMOTE='{"subagents":{"crossMachine":{"enabled":true}}}'
+else
+  XM_SETTINGS_PATCH_REMOTE="$XM_SETTINGS_PATCH"
+fi
+xm_run settings-parent docker exec "$XM_PARENT" \
+  node /plugin/test/docker/xm/settings-merge.mjs /root/.pi/agent/settings.json "$XM_SETTINGS_PATCH"
+xm_run settings-remote docker exec "$XM_REMOTE" \
+  node /plugin/test/docker/xm/settings-merge.mjs /root/.pi/agent/settings.json "$XM_SETTINGS_PATCH_REMOTE"
 
 # ------------------------------------ 5. 共享 bare origin + 两端同名 origin
 # 预检（cross-machine-preflight.ts）要求两端 origin 归一化后同名 → 同一个卷 + 同一路径。
