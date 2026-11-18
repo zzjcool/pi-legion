@@ -9,6 +9,35 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [Unreleased]
+
+首跑就成：跨机 centurion 与本地 centurion 的输入**逐项相同**，唯一新增的必填输入是「那台机器上的那个目录」——
+而这一项不知道时工具**提问**，不发配置讲义。下面四条是真实会话（103 行、五次失败）里每个坑的答案，
+最后一条把它们变成一条命令。契约：`docs/contracts/first-run-success-v1.md`（D1–D12）；报告：`docs/reports/first-run-success.md`。
+
+- **缺失的远程目录变成一句提问（D2）**：`resolveHostTarget` 的两个分支与 `resolveHostTargetAsync` 共用
+  `missingRemoteCwdQuestion(host)`，在任何 `machine.exec` **之前**抛出——问「那台机器上哪个目录」，附可粘贴的
+  `subagent({ …, cwd })`、一句「这个路径是在那台机器上读的」、一句「本对话没提过就去问用户」，以及一句
+  「不要 ssh / `hc exec` 去翻目录」。旧的 `set a default in subagents.crossMachine.hosts.<h>.cwd` 不再出现。
+- **父机目录不是仓库有它自己的答案（D5）**：`localCheckoutState` 问 git 两个问题（`rev-parse --git-dir`，再
+  `remote get-url origin`），于是「不是仓库 / 是仓库但没 origin / 两侧 origin 不同 / 本机没有 git」是四句不同的文案；
+  「不是仓库」那句的两条出路是**在 checkout 里重开 pi（或传相对 `cwd`）**与**改派 worker**，不再教
+  `git remote add origin` —— 在一个不是仓库的目录里，那条命令不可能奏效。`assertSharedOrigin` 复用同一次探测，两处不会漂移。
+- **缺扩展包的错误自带 role 与可粘贴 JSON（D4）**：`packagePathError` 接收 role（由 `terminal-supervisor` 从
+  `input.agent.name` 传入），第二条出路直接写成 `subagents.agentOverrides.<role>.excludeExtensions` 加一条
+  `{"subagents":{"agentOverrides":{"<role>":{"excludeExtensions":["<pkg>"]}}}}`；不知道角色（resume / 读回）时保留
+  `<role>` 占位且不带 JSON。`which is not installed on that machine` 逐字保留。
+- **`/legion doctor crossmachine` 变成一次体检（D6–D8）**：新模块 `src/runs/cross-machine-checkup.ts` 用**一次** `hc`
+  连接、只读地探测：本机 checkout 与 origin、`hc machine ls`、目标机的目录 / 仓库 origin / `node` 与 `pi` 的真实路径与版本 /
+  继承来的包按**包名**在那台机器的索引里解析 / 那台机器的 `pi --list-models`；每项一行 `PASS`/`FAIL`/`SKIP`，
+  每个 `FAIL` 带真值的 `fix:` 行，最后一行是可粘贴的 launch（真 host、真 cwd、真 phase machine）。`legion-doctor.ts`
+  仍然同步、零探测：只渲染传进来的快照，`/legion doctor` 与 `subagent({action:"diagnose"})` **只在选中这一节时**才
+  `await` 体检；没有快照时旧的静态块逐字节不变（`auto-doctor` 仍走它）。
+- **换掉「先读三条命令」的开场（D9）**：`docs/runbooks/cross-machine-centurion-demo.md` 第 0 步就是
+  `/legion doctor crossmachine`（一条命令 + PASS/FAIL 怎么读 + 它打印的可粘贴 launch），原来的手工三条检查降级为
+  它下面的「手工兜底」；配置一节改成最小配置 `{"subagents":{"crossMachine":{"enabled":true}}}` + 按次 `cwd`
+  （或只写 `cwd` 的 entry），配置键表逐行换成新文案（不写 `hosts` 合法、缺 `cwd` 是提问、缺程序先给动作、settings 键降为 trailing aside）。
+
 ## [6.2.0] — 2026-11-18
 
 跨机器派发从「能跑」变成「能配、能排查、能演示」：配置只写覆盖，失败带证据与下一步，
