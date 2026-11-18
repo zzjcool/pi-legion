@@ -668,3 +668,20 @@ $ npm run test:integration                → ℹ tests 179 / pass 179 / fail 0
 本轮新增测试：预检/文案（`cross-machine-preflight`、`remote-worktree`、`cross-machine-orchestrator`）、
 模型回退 9 条（`xm-model-fallback`）、恢复 6 条 integration（`recover-cross-machine`）。
 未发版 —— master 上以 `## [Unreleased] — 6.2.2（patch）` 收口，何时 tag 由维护者定。
+
+## 13. 6.2.2 发布记录
+
+- **master**：`4d9ea75`（`release: 6.2.2`；其父 `4910f21` 是本轮功能的合并提交）。
+- **发版前门禁（在 `4d9ea75` 上实跑）**：
+  - `npm run typecheck` → `tsc --noEmit`，退出 0；
+  - `npm test` → `ℹ tests 2656 / pass 2655 / fail 0 / skipped 1`；
+  - `npm run test:integration` → `ℹ tests 179 / pass 179 / fail 0`；
+  - `npm run test:mock-llm` → `ℹ tests 25 / pass 25 / fail 0`（Release workflow 也跑这一条）。
+- **tag**：`v6.2.2`（annotated；正文即 GitHub Release body）。
+- **Release workflow**：run [`44360960492`](https://github.com/zzjcool/pi-legion/actions/runs/44360960492)，
+  `release: 6.2.2`，全部步骤绿（typecheck / test / integration / mock-llm / tag↔version /
+  manifest 校验 / GitHub Release / npm trusted publish + provenance）。
+- **GitHub Release**：<https://github.com/zzjcool/pi-legion/releases/tag/v6.2.2>。
+- **registry**：`npm view pi-legion version` → `6.2.2`（发布后约 2 分钟可查）；`gitHead = 4d9ea75`，
+  发布日志 `Published pi-legion@6.2.2 with provenance`。
+- 本记录是 tag 之后的一次**文档-only** 提交（tag 指 `4d9ea75`，master 在此之后多这一条文档提交）。
