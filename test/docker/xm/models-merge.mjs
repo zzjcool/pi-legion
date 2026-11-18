@@ -80,6 +80,26 @@ const providers = typeof base.providers === "object" && base.providers !== null 
 	? { ...base.providers }
 	: {};
 
+// F6: never copy a credential out of the host's models.json. Everything this file
+// contains is read by two throwaway containers and lives in /tmp, so any host `apiKey`
+// is dropped here. It is not needed: real credentials come from auth.json, which is
+// mounted read-only and never copied.
+//
+// The generated `xm` provider is the ONE exception and it is not a credential: its
+// value is the literal "mock". pi HIDES a provider that has no apiKey at all
+// (verified on pi 1.5.0: `pi --list-models` answers "No models available"), so the
+// dummy is what makes the mock visible — not a secret.
+let strippedApiKeys = 0;
+for (const [name, value] of Object.entries(providers)) {
+	if (name === XM_PROVIDER) continue;
+	if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+	if (!("apiKey" in value)) continue;
+	const next = { ...value };
+	delete next.apiKey;
+	providers[name] = next;
+	strippedApiKeys += 1;
+}
+
 if (args.withXm) {
 	providers[XM_PROVIDER] = {
 		baseUrl: args.baseUrl,
@@ -108,5 +128,5 @@ try {
 }
 
 process.stdout.write(
-	`XM_MODELS_WRITTEN out=${args.out} providers=${Object.keys(providers).sort().join(",") || "-"} xm=${args.withXm ? "yes" : "no"} baseUrl=${args.withXm ? args.baseUrl : "-"} models=${args.withXm ? args.models.join(",") : "-"}\n`,
+	`XM_MODELS_WRITTEN out=${args.out} providers=${Object.keys(providers).sort().join(",") || "-"} xm=${args.withXm ? "yes" : "no"} baseUrl=${args.withXm ? args.baseUrl : "-"} models=${args.withXm ? args.models.join(",") : "-"} stripped_api_keys=${strippedApiKeys}\n`,
 );

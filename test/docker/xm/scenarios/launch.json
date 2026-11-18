@@ -57,14 +57,14 @@
       },
       "then": {
         "type": "text",
-        "content": "RESULT: done"
+        "content": "RESULT: done {{NONCE}}"
       }
     },
     {
       "name": "catch-all-final-text",
       "then": {
         "type": "text",
-        "content": "RESULT: done (XM_PARENT_EXTRA_TURN)"
+        "content": "RESULT: done {{NONCE}} (extra turn)"
       }
     }
   ]

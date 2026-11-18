@@ -84,8 +84,10 @@ docker info >/dev/null 2>&1 \
   || die preflight-docker "docker info" "SKIPPED: docker not available"
 
 # 模型凭据来自宿主（契约 §7.4）：缺了容器里 pi 一个模型都没有。
-[ -f "$AGENT/auth.json" ] || [ -f "$AGENT/models.json" ] \
-  || die preflight-credentials "test -f $AGENT/auth.json $AGENT/models.json" \
+# F8: auth.json 与 models.json **两个都要有**——只有 auth 没有 provider 注册（或反过来）
+# 都会让容器里的 pi 静默少模型，那必须在 preflight 变成 SKIPPED + exit 1，不是跑下去再猜。
+{ [ -f "$AGENT/auth.json" ] && [ -f "$AGENT/models.json" ]; } \
+  || die preflight-credentials "test -f $AGENT/auth.json && test -f $AGENT/models.json" \
          "SKIPPED: no host pi credentials"
 
 # 真 hc：契约 §7.2 的硬限制 —— 容器不联网装 herdr-core，二进制只能由宿主提供。
@@ -156,14 +158,19 @@ CRED_MOUNTS=()
 if [ -f "$AGENT/auth.json" ]; then
   CRED_MOUNTS+=(-v "$AGENT/auth.json:$AGENT/auth.json:ro")
 fi
+# F7: models-store.json 是 pi 的运行期缓存，**不能**两个容器 rw 挂同一个宿主文件
+# （两边写同一份缓存 = 互相踩）。每个容器一份副本，各挂各的。
+PARENT_MODELS_MOUNT=(-v "$XM_MODELS_DIR/parent/models.json:$AGENT/models.json:ro")
+REMOTE_MODELS_MOUNT=(-v "$XM_MODELS_DIR/remote/models.json:$AGENT/models.json:ro")
 if [ -f "$AGENT/models-store.json" ]; then
-  CRED_MOUNTS+=(-v "$AGENT/models-store.json:$AGENT/models-store.json")
+  cp "$AGENT/models-store.json" "$XM_MODELS_DIR/parent/models-store.json"
+  cp "$AGENT/models-store.json" "$XM_MODELS_DIR/remote/models-store.json"
+  PARENT_MODELS_MOUNT+=(-v "$XM_MODELS_DIR/parent/models-store.json:$AGENT/models-store.json")
+  REMOTE_MODELS_MOUNT+=(-v "$XM_MODELS_DIR/remote/models-store.json:$AGENT/models-store.json")
+  step "models-store copied per container (parent/remote)"
 else
   step "warn: $AGENT/models-store.json 不存在，容器里模型库可能为空"
 fi
-# models.json 每个容器一份（v1.1）：父机 8765，远端 child 8766。
-PARENT_MODELS_MOUNT=(-v "$XM_MODELS_DIR/parent/models.json:$AGENT/models.json:ro")
-REMOTE_MODELS_MOUNT=(-v "$XM_MODELS_DIR/remote/models.json:$AGENT/models.json:ro")
 
 # ------------------------------------------------------ 3. 两容器（契约 §6）
 # --hostname 与容器名都可解析，但不用 --network=host：跨机必须走真网络。

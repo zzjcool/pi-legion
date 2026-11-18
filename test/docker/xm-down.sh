@@ -39,4 +39,15 @@ else
   echo "XM_DOWN volume-kept $XM_VOL（XM_KEEP=0 才删）"
 fi
 
+# F6: `xm-up.sh` generates one models.json/models-store.json per container under a
+# mktemp dir. They are per-run scratch (the next `make xm-up` makes a fresh one), so
+# they go with the containers. The containers are already gone: removing the host
+# directory cannot pull a mount out from under a live process.
+removed_models=0
+for dir in /tmp/xm-models.*; do
+  [ -d "$dir" ] || continue
+  rm -rf "$dir" && removed_models=$((removed_models + 1))
+done
+echo "XM_DOWN models-dirs-removed=$removed_models"
+
 echo "XM_DOWN_OK parent=$XM_PARENT remote=$XM_REMOTE net=$XM_NET vol=$XM_VOL keep=$XM_KEEP"
