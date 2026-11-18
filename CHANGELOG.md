@@ -45,9 +45,10 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 - **继承来的扩展缺了不再拦住 launch（D14）**：argv 里成对丢掉 `-e <path>`，launch 继续，并在 `subagent(...)` 的返回里给
   **一行**汇总（包名 + 每包的 `pi install` + 一条合并的 `excludeExtensions` JSON + 写进哪个文件 + 一句「角色卡自己声明的
   扩展不会被跳过」）。角色卡显式声明与 child guard 仍然是硬拒，D4 的句子原样保留；探针没答（`no-index`）同策略。
-- **不再拿中途快照当判决（D15）**：turn 结束后重新读一次远端转录，verdict 与 `read-back N of M` 都用这一次；截断/空文本
-  不再产出 `aborted (no assistant message for the last prompt)`，而是带原因的诚实 `unknown`；完整转录确实没有 assistant
-  仍是 `aborted`。`collectArtifactGrowing` 改看判定真正用的那份文件。
+  `/legion doctor crossmachine` 也把**角色卡自己声明的**扩展一并体检（缺了 FAIL 且提示 launch 会拒），doctor 与 launch 不再互相矛盾。
+- **不再拿中途快照当判决（D15）**：turn 结束后重新读一次远端转录，verdict 与 `read-back N of M` 都用这一次；截断、
+  或刷新失败的文本不再产出 `aborted (no assistant message for the last prompt)`，而是带原因的诚实 `unknown`；
+  完整转录确实没有 assistant 仍是 `aborted`。`collectArtifactGrowing` 看判定真正用的那份文件（远端没有回读窗口，见报告）。
 - **换掉「先读三条命令」的开场（D9）**：`docs/runbooks/cross-machine-centurion-demo.md` 第 0 步就是
   `/legion doctor crossmachine`（一条命令 + PASS/FAIL 怎么读 + 它打印的可粘贴 launch），原来的手工三条检查降级为
   它下面的「手工兜底」；配置一节改成最小配置 `{"subagents":{"crossMachine":{"enabled":true}}}` + 按次 `cwd`

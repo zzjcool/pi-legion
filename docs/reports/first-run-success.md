@@ -287,12 +287,12 @@ grep `cross-machine` / `host` / `跨机` **零命中**：agent 既不知道有�
   在错误的树里干活）；`/legion doctor crossmachine` 与 runbook 的指路；远端 child 起不来时的读法（退出码 +
   screen 原文 + `Command (run on '<host>' to reproduce):`，不再把 `execution: unknown` 当原因）。
 - **打包可见**：`package.json` 的 `files` 已含 `skills/**/*`；`npm pack --dry-run` 的清单里有
-  `skills/pi-legion/SKILL.md`（10.4 kB）。测试 `test/unit/skill-cross-machine.test.ts` 四条断言把这两件事钉住：
+  `skills/pi-legion/SKILL.md`（10.8 kB）。测试 `test/unit/skill-cross-machine.test.ts` 四条断言把这两件事钉住：
   删掉那一节或那句描述 → 立刻红（红/绿证据见下）；清单或 tarball 里没有这个文件 → 也红。
 
 ```
 $ npm pack --dry-run 2>&1 | grep SKILL.md
-npm notice 10.4kB skills/pi-legion/SKILL.md
+npm notice 10.8kB skills/pi-legion/SKILL.md
 
 $ node --experimental-strip-types --test test/unit/skill-cross-machine.test.ts
 ✔ skill: the description advertises cross-machine dispatch (host + cwd)
@@ -355,7 +355,7 @@ that machine (the launch would have silently dropped it). Two ways out: 1) insta
   launch 继续，并在 `subagent(...)` 的返回文本里给**一行**汇总（`⚠ <name>: …`）：
 
 ```text
-cross-machine on 'hw-nj': 2 inherited extension(s) cannot be loaded there, so this launch dropped them and continues:
+cross-machine on 'hw-nj': 2 inherited package(s) cannot be loaded there, so this launch dropped them and continues:
 pi-sop (not installed on hw-nj), pi-lens (not installed on hw-nj). Two ways out: 1) install them there —
 hc exec --on hw-nj -- pi install npm:pi-sop; hc exec --on hw-nj -- pi install npm:pi-lens; 2) keep them on this machine
 only for role 'scout': subagents.agentOverrides.scout.excludeExtensions —
@@ -366,6 +366,9 @@ card declares, and this package's child guard, still refuse the launch when it i
 
 - 探针没答（`packages === undefined`）走同一策略（`no-index`），不会把「问不到」变回「死给你看」。
 - `ChildHandle.warning` 不再是 in-process 专属：terminal 后端也会设它（不持久化、不致命）。
+- doctor 与 launch 现在连「角色卡自己声明的扩展」也对齐了：checkup 把卡片里的 `extensions:` / `subagentOnlyExtensions:`
+  一并体检，缺了就是 FAIL，行尾点明 `(the role card declares it, so a launch REFUSES)`，且**不给** `excludeExtensions`
+  JSON（那个键只过滤继承，对卡片声明无效）。
 
 ### 坑 8：远端写完报告，父端却判 `aborted`（D15）
 
@@ -383,12 +386,16 @@ read-back from host 'hw-nj': 5 of 5 lines (complete)
 现在（D15）：
 
 - turn 真的结束后**再读一次**（单次刷新，不轮询）：verdict 与 `read-back N of M` 都用最后一次成功读回的文本。
-- 如果用于判定的文本是**截断**或**空**的，不许输出 `aborted (no assistant message for the last prompt)`，
-  而是诚实的 `unknown` + 原因（`read-back was truncated (5 of 9000 lines)…` / `read-back was empty …` /
-  `read-back could not be refreshed after the turn ended (…)…`）。
+- 如果用于判定的文本是**截断**的（或读回在 turn 后**刷新失败**），不许输出 `aborted (no assistant message for the last prompt)`，
+  而是诚实的 `unknown` + 原因（`read-back was truncated (5 of 9000 lines)…` /
+  `read-back could not be refreshed after the turn ended (…)…`）。空文件那条 reason 只是防御分支：
+  真实 seam 下空文件会写成空镜像，走的是 `unknown (no messages in session)`，不会到这句。
+- 保留旧镜像但刷新失败时，`read-back …` 那行**不再**只说 `complete`：变成
+  `5 of 5 lines (not confirmed current — the post-turn refresh failed: …, so the verdict rests on this earlier read)`。
 - 完整转录、真的没有 assistant 回复 —— 仍然是 `aborted` 与那句冻结的 reason（`test/unit/session.test.ts:77-89` 继续钉住它）。
 - `collectArtifactGrowing` 改看 `sessionFileOf(child)`（判定真正用的那份文件），远端 child 也能拿到增长宽限。
-- 读数：一次 collect 从 1 次读回变 2 次（且最多 2 次）；本地 child 不变。
+- 读数：一次 collect 从 1 次读回变 2 次；本地 child 仍是 0 次；只有 #316 的「空生成重试」那一支会再读一次（3 次），
+  且没有任何轮询。
 
 ## 8. 测试红绿证据
 
@@ -494,9 +501,10 @@ integration ✖ v1.2/D13: a target package that declares a DIRECTORY is mapped t
 **D14**（把 `skippable` 去掉，或把「必需」判定改成恒 false）：
 
 ```text
-✖ D14: an inherited extension the target lacks is dropped, recorded and warned about — one line
-✖ D14: the same path declared by the CARD still refuses before any terminal
-✖ … the SAME call without `skippable` must still throw (the default refuses)
+✖ D14: a skippable missing extension loses BOTH argv elements, the rest of argv survives
+✖ D14: the SAME call without `skippable` still REFUSES — the default is not widened
+✖ D14: a REQUIRED extension (skippable false) refuses even though the mapper could drop
+✖ D14: the warning is ONE line that names host, packages, installs, the merged JSON and its file
 ```
 
 **D15**（去掉 turn 后的刷新，或去掉诚实 unknown）：
@@ -504,8 +512,9 @@ integration ✖ v1.2/D13: a target package that declares a DIRECTORY is mapped t
 ```text
 ✖ S4/D15 (demo): a mid-turn mirror is re-read before the verdict, so 11 lines are not judged as 5
     actual: aborted (no assistant message for the last prompt)   ← 演示原样
-✖ S4/D15: a truncated read-back is an honest unknown, never no assistant message
-✖ S4/D15: a COMPLETE remote transcript with no assistant message still aborts (the frozen reason)
+✖ S4/D15: a truncated read-back is an honest `unknown`, never `no assistant message`
+✖ S4/D15: a COMPLETE remote transcript with no assistant is still `aborted` (frozen reason kept)
+✖ S4/D15: a refresh that FAILS keeps the old mirror and stays honest about it
 ```
 
 `test/unit/session.test.ts:77-89`（完整转录、确实没有 assistant ⇒ `aborted` + 冻结 reason）始终未改、始终绿 ——
