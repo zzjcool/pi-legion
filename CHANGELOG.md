@@ -46,9 +46,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   **一行**汇总（包名 + 每包的 `pi install` + 一条合并的 `excludeExtensions` JSON + 写进哪个文件 + 一句「角色卡自己声明的
   扩展不会被跳过」）。角色卡显式声明与 child guard 仍然是硬拒，D4 的句子原样保留；探针没答（`no-index`）同策略。
   `/legion doctor crossmachine` 也把**角色卡自己声明的**扩展一并体检（缺了 FAIL 且提示 launch 会拒），doctor 与 launch 不再互相矛盾。
-- **不再拿中途快照当判决（D15）**：turn 结束后重新读一次远端转录，verdict 与 `read-back N of M` 都用这一次；截断、
+- **不再拿中途快照当判决（D15）**：turn 结束后重新读一次远端转录，verdict 与 `read-back N of M` 都用最后一次成功读回
+  （刷新失败时那一行写 `not confirmed current`，不再只印 `complete`）；截断、
   或刷新失败的文本不再产出 `aborted (no assistant message for the last prompt)`，而是带原因的诚实 `unknown`；
-  完整转录确实没有 assistant 仍是 `aborted`。`collectArtifactGrowing` 看判定真正用的那份文件（远端没有回读窗口，见报告）。
+  完整转录确实没有 assistant 仍是 `aborted`。`collectArtifactGrowing` 对本地仍看判定真正用的那份文件；远端 child 直接返回
+  `false`、不睡（那台机器的文件只能靠读回增长，这个窗口里不读回）。另：`mapRemoteArgv` 收到 `skippable` 却没收到 `skipped`
+  时抛普通 `Error`——「成对删除却无人记账」这个静默丢扩展的口子在 API 上也堵掉了。
 - **换掉「先读三条命令」的开场（D9）**：`docs/runbooks/cross-machine-centurion-demo.md` 第 0 步就是
   `/legion doctor crossmachine`（一条命令 + PASS/FAIL 怎么读 + 它打印的可粘贴 launch），原来的手工三条检查降级为
   它下面的「手工兜底」；配置一节改成最小配置 `{"subagents":{"crossMachine":{"enabled":true}}}` + 按次 `cwd`

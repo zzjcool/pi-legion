@@ -100,14 +100,15 @@
 | `FAIL target origin: …` | 那侧不是仓库 / 没有 origin / url 与这侧不同（原话把两个 url 都点名） | 粘 `fix:` 里的 `hc exec --on <h> -- git …` 那一行 |
 | `PASS target runtime: <node> vX and <cli.js> Y — the paths the child will use there` | 远端 `node` 与 `pi` 的真实路径与版本（就是 child 会用的那两个） | 不用动 |
 | `FAIL target runtime: …` | 那台机器上的 `node` 或 `node <piCli>` 跑不起来（「本包不在那儿」由 preflight 的 exit 14 报，**不在**这一行） | 粘 `fix:`：`hc exec --on <h> -- <node> --version` / 装 node；或把 `piCli` 指到 `…/dist/bundle/cli.js` |
-| `FAIL inherited extensions: … <pkg> (not installed on <h>) for role '<role>' …` / `… (the role card declares it, so a launch REFUSES)` | 继承来的包在那台机器上没装（D4/D14）。**它不再拦住 launch**：继承来的会跳过并给一行 warning | 想让它真正加载：`hc exec --on <h> -- pi install npm:<pkg>`；只想这次跑通：什么都不用做，或粘那条 `excludeExtensions` JSON（`# where:` 说了写进哪个文件） |
-| `FAIL inherited extensions: … (entry '<相对路径>' not declared on <h>)`（角色卡声明的那条会多一句 `the role card declares it, so a launch REFUSES`） | 包装了，但两边的 `pi.extensions` 布局/版本不同（D13）；launch 同样只跳过 + warning | 把两台的包版本对齐（目录声明 `./extensions` 现在已自动按目录包含），或粘 `excludeExtensions` JSON |
+| `FAIL inherited extensions: … <pkg> (not installed on <h>) for role '<role>' — the launch will skip…` | 继承来的包在那台机器上没装（D4/D14）。**它不再拦住 launch**：跳过 + 一行 warning | 想让它真正加载：`hc exec --on <h> -- pi install npm:<pkg>`；只想这次跑通：什么都不用做，或粘那条 `excludeExtensions` JSON（`# where:` 说了写进哪个文件） |
+| `FAIL inherited extensions: … for role '<role>' (the role card declares it, so a launch REFUSES)` | 角色卡自己声明的包在那台机器上没装：launch 会**拒**（D4），没有跳过这条路 | 只能在那台机器 `hc exec --on <h> -- pi install npm:<pkg>`；`excludeExtensions` 对这条无效（所以不给 JSON） |
+| `FAIL inherited extensions: … (entry '<相对路径>' not declared on <h>)` | 包装了，但两边的 `pi.extensions` 布局/版本不同（D13）。继承来的只跳过 + warning；角色卡声明的那条会拒 | 把两台的包版本对齐（目录声明 `./extensions` 现在已自动按目录包含）；继承来的也可以粘 `excludeExtensions` JSON |
 | `FAIL target models: <model> is not in <h>'s listing: …` | 那台机器的 `pi --list-models` 里没有这个模型（行尾同时说明 `--no-extensions` 与 `piExtensions` 的关系） | 粘 `fix:`：换成它列出来的模型；如果模型本来就该由 provider 扩展提供，把它写进 `subagents.crossMachine.hosts.<h>.piExtensions` |
 | `FAIL hc machines: no machines are registered …` | 这个 hc core 一台机器都不认识，配置里也没有 host | 粘 `fix: hc machine add --name my-vps ssh://user@my-vps`，再 `hc machine ls` |
 | `FAIL hc machines: cross-machine launch is disabled (subagents.crossMachine.enabled = false), so nothing here was probed` | `subagents.crossMachine.enabled` 是 `false`（真 launch 会被拒） | 按 `fix:` 把它改成 `true`（同一个 settings 文件），再跑同一条命令 |
 | `SKIP hc machines: … cross-machine is not configured, so no target was probed` | `enabled` 没写、也没有 `hosts` 条目：注册表照打，但不去探目标机 | 想体检某一台就配 `{ "enabled": true }` 再跑 `/legion doctor crossmachine` |
 | `SKIP <项>: … not checked: <一句原因>` | 前面那条 FAIL 让这一项没法问（例如还没有目录） | 先修上面那条 FAIL，再跑同一条命令 |
-| 派生：`execution: unknown (read-back was truncated (N of M lines)…)` | 判定用的远端转录被截断（D15）。**这不是 child 的结局，是本机的盲区** | 看同一份结果里 `read-back from host …` 那行的 N/M 与它的后缀（`truncated — tail only …` 或 `could not be refreshed …`）。完整转录、确实没有 assistant 才叫 `aborted` |
+| 派生：`execution: unknown (read-back was truncated (N of M lines)…)` | 判定用的远端转录被截断（D15）。**这不是 child 的结局，是本机的盲区** | 看同一份结果里 `read-back from host …` 那行的 N/M 与它的后缀（`truncated — tail only …`；刷新失败时是 `not confirmed current — the post-turn refresh failed …`，与本行 reason 里的 `could not be refreshed` 是同一件事）。完整转录、确实没有 assistant 才叫 `aborted` |
 | 派生：`⚠ <name>: cross-machine on '<h>': N inherited package(s) cannot be loaded there …` | 继承来的扩展在那台机器上缺（D14），launch 继续了 | 按这行给的两条出路：在那台机器 `pi install`，或把它写进 `excludeExtensions`；角色卡自己声明的扩展不会被跳过，仍然硬拒 |
 
 ### 手工兜底：三条命令（doctor 不方便跑时）

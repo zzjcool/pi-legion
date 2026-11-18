@@ -391,9 +391,10 @@ read-back from host 'hw-nj': 5 of 5 lines (complete)
   `read-back could not be refreshed after the turn ended (…)…`）。空文件那条 reason 只是防御分支：
   真实 seam 下空文件会写成空镜像，走的是 `unknown (no messages in session)`，不会到这句。
 - 保留旧镜像但刷新失败时，`read-back …` 那行**不再**只说 `complete`：变成
-  `5 of 5 lines (not confirmed current — the post-turn refresh failed: …, so the verdict rests on this earlier read)`。
+  `5 of 5 lines (not confirmed current — the post-turn refresh failed: …; the verdict rests on this earlier read)`。
 - 完整转录、真的没有 assistant 回复 —— 仍然是 `aborted` 与那句冻结的 reason（`test/unit/session.test.ts:77-89` 继续钉住它）。
-- `collectArtifactGrowing` 改看 `sessionFileOf(child)`（判定真正用的那份文件），远端 child 也能拿到增长宽限。
+- `collectArtifactGrowing` 对本地 child 仍看 `sessionFileOf(child)`（行为逐字节不变）；远端 child **拿不到**增长宽限——
+  直接返回 `false`、一次都不睡（那台机器的文件只能靠读回增长，D15 在这个窗口里不读回）。
 - 读数：一次 collect 从 1 次读回变 2 次；本地 child 仍是 0 次；只有 #316 的「空生成重试」那一支会再读一次（3 次），
   且没有任何轮询。
 
@@ -405,16 +406,16 @@ read-back from host 'hw-nj': 5 of 5 lines (complete)
 |---|---|
 | 父机目录不是 checkout（D5） | `test/unit/remote-worktree.test.ts:396`「D5: a session directory that is NOT a checkout gets its own answer, never `git remote add`」；`test/integration/remote-worktree.test.ts:387`（真 spawn 路径，wire 上无 `terminal.run`、无 `git worktree add`） |
 | 是 checkout 但没有 origin（原句不变） | `test/unit/remote-worktree.test.ts:260`「D10/D11: cwd missing, cwd not a repo, no origin, different origin — four exact messages」；`test/unit/cross-machine-preflight.test.ts:276` |
-| 目标机缺扩展包（D4） | `test/unit/cross-machine-discovery.test.ts:542`（带 role 的 JSON，且能 `JSON.parse` 回 settings）；`test/unit/cross-machine-params.test.ts:533`（起终端**之前**拒绝）；`test/integration/fake-core-host-discovery.test.ts:513` |
-| 目标机没有这个模型 | `test/unit/cross-machine-params.test.ts:695`「S5.6: the startup probe's four failures are named before a terminal exists」（case `model-missing`，断言点名 host / 模型 / 该机真实清单 / 两个方向的 fix） |
-| 体检：全绿 | `test/unit/cross-machine-checkup.test.ts:362`「D7/D8: a healthy host reports every item PASS in the frozen order, and a real launch line」 |
-| 体检：没有 checkout | `test/unit/cross-machine-checkup.test.ts:446`「D5: a session directory that is not a checkout gets D5's sentence, not `git remote add origin`」 |
-| 体检：缺包 | `test/unit/cross-machine-checkup.test.ts:528`「D4: a package missing on the target FAILs with the role and a pasteable excludeExtensions JSON」 |
-| 体检：模型不提供 | `test/unit/cross-machine-checkup.test.ts:574`「D7: a model the target does not serve FAILs and lists what that machine DOES see」 |
+| 目标机缺扩展包（D4） | `test/unit/cross-machine-discovery.test.ts:610`（带 role 的 JSON，且能 `JSON.parse` 回 settings）；`test/unit/cross-machine-params.test.ts:606`（起终端**之前**拒绝）；`test/integration/fake-core-host-discovery.test.ts:513` |
+| 目标机没有这个模型 | `test/unit/cross-machine-params.test.ts:768`「S5.6: the startup probe's four failures are named before a terminal exists」（case `model-missing`，断言点名 host / 模型 / 该机真实清单 / 两个方向的 fix） |
+| 体检：全绿 | `test/unit/cross-machine-checkup.test.ts:381`「D7/D8: a healthy host reports every item PASS in the frozen order, and a real launch line」 |
+| 体检：没有 checkout | `test/unit/cross-machine-checkup.test.ts:465`「D5: a session directory that is not a checkout gets D5's sentence, not `git remote add origin`」 |
+| 体检：缺包 | `test/unit/cross-machine-checkup.test.ts:547`「D4: a package missing on the target FAILs with the role and a pasteable excludeExtensions JSON」 |
+| 体检：模型不提供 | `test/unit/cross-machine-checkup.test.ts:1015`「D7: a model the target does not serve FAILs and lists what that machine DOES see」 |
 
-外加（同一批 D6）：`test/unit/cross-machine-checkup.test.ts:481`（`{enabled:true}` + 只有 `machine list` 认识的 host）、
-`:604`（旧 core，`machine.list` 不支持 → SKIP，指名 host 仍照检）、`:634`（传输失败 FAIL 自己、其余 SKIP）；
-`test/unit/legion-doctor.test.ts:1609` 与 `:1663` 两例（快照渲染：FAIL 进 Issues、`report.ok` 为假）。
+外加（同一批 D6）：`test/unit/cross-machine-checkup.test.ts:500`（`{enabled:true}` + 只有 `machine list` 认识的 host）、
+`:1045`（旧 core，`machine.list` 不支持 → SKIP，指名 host 仍照检）、`:1075`（传输失败 FAIL 自己、其余 SKIP）；
+`test/unit/legion-doctor.test.ts:1612` 与 `:1669` 两例（快照渲染：FAIL 进 Issues、`report.ok` 为假）。
 
 ### 红：把修好的那句退回去，测试就红（三次实跑）
 
@@ -483,15 +484,15 @@ test/unit/cross-machine-checkup.test.ts + test/unit/legion-doctor.test.ts
 ```text
 ✖ D13 probe: a package that declares a DIRECTORY says so, and never becomes an EXT row
 ✖ D13 report: a PKGENTRY row without the directory field is UNKNOWN, not a file
-✖ D13 extensions: a declared DIRECTORY covers the entry under it
+✖ D13 extensions: a declared DIRECTORY covers the entry under it (pi asked for the expanded file)
     { ok: false, reason: 'entry-missing' }   ← 应为 { ok: true, path: '/srv/x/extensions/pi-autoresearch/index.ts' }
 ✖ D13 extensions: the LONGEST declared directory wins when two of them prefix the request
-✖ D13 extensions: a request OUTSIDE the declared directory stays entry-missing
-✖ D13 extensions: a cache row without the flag is NOT known to be a directory
+✖ D13 extensions: a request OUTSIDE the declared directory stays entry-missing (and names the directory as one)
+✖ D13 extensions: a cache row without the flag is NOT known to be a directory (conservative)
 ℹ tests 8   ℹ pass 2   ℹ fail 6
 checkup  ✖ D13: a target whose declaration does NOT cover the entry FAILs …
          AssertionError: expected a FAIL, got: 1 inherited extension(s) resolve on fakebox   ← 演示里的自相矛盾
-integration ✖ v1.2/D13: a target package that declares a DIRECTORY is mapped through it
+integration ✖ v1.2/D13: a target package that declares a DIRECTORY is mapped through it (the demo's false refusal)
 ```
 
 两条「负向守卫」本来就在旧代码下也是红的（它们要求拒绝），所以另做了三个突变证明：
@@ -534,13 +535,13 @@ integration ✖ v1.2/D13: a target package that declares a DIRECTORY is mapped t
 `npm test`（`node --experimental-strip-types --test test/unit/*.test.ts`）：
 
 ```text
-ℹ tests 2624
-ℹ pass 2623
+ℹ tests 2636
+ℹ pass 2635
 ℹ fail 0
 ℹ cancelled 0
 ℹ skipped 1
 ℹ todo 0
-ℹ duration_ms 62382.430297
+ℹ duration_ms 69680.043048
 ```
 
 `npm run test:integration`（`… test/integration/*.test.ts`）：
@@ -552,7 +553,7 @@ integration ✖ v1.2/D13: a target package that declares a DIRECTORY is mapped t
 ℹ cancelled 0
 ℹ skipped 0
 ℹ todo 0
-ℹ duration_ms 56453.558457
+ℹ duration_ms 64906.991935
 ```
 
 三条命令的退出码都是 0。`test/unit/terminal-supervisor.test.ts` 未修改（D18 of `cross-machine-spawn-v1`）。
