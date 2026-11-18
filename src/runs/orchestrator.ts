@@ -1262,33 +1262,8 @@ export class Orchestrator {
 				ErrorCodes.BUDGET_EXCEEDED,
 			);
 		}
-		// #371 G2: a phase machine is the root's declaration about a team IT owns.
-		// Refused rather than ignored — silently dropping it would leave the caller
-		// believing a state machine was in force while the child runs free.
-		if (declaredPhases && !isRootShell) {
-			throw new SubagentError(
-				`phases are declared by the root shell only; '${this.legion!.nodeId}' cannot`,
-				ErrorCodes.INVALID_PARAMS,
-			);
-		}
-		// #371 G3: a machine governs a TEAM. Declaring one for a worker is not a
-		// smaller version of the same thing — it is a category error, and the fix is
-		// a different dispatch, so name it.
-		if (declaredPhases && !isCenturion) {
-			throw new SubagentError(
-				"phases belong to a centurion team; dispatch a worker for solo work",
-				ErrorCodes.INVALID_PARAMS,
-			);
-		}
-		// #371 G4: an inline declaration is validated HERE, before artifacts, with the
-		// same parser (and therefore the same rules) the card layer uses. The card is
-		// the FALLBACK, never the override: a dispatch that names its machine wins
-		// over a role card that also names one (contract §2).
-		const machine = declaredPhases ? this.declaredPhaseMachine(input) : input.agent.phases;
-		// #371 (m8, review r2): the declaration is recorded INSIDE the try below, not
-		// here. Admission/budget refusals and queued launches return or throw before a
-		// node exists, so recording it here would leave an entry that `abortLegionPhase`
-		// could later read for a node that never ran.
+		// #371 G2/G3/G4 live BELOW the cross-machine guards on purpose — see the
+		// "why the preflight runs before the phases validation" note there.
 		// #214 D4: only centurion may hold worktree. Legion path still forces
 		// centurion→true and centurion-parent→member false; non-centurion
 		// requests from any source are demoted below (D1: warn, never throw).
@@ -1365,6 +1340,61 @@ export class Orchestrator {
 				);
 			}
 		}
+		// ── Cross-machine delivery preflight (contract `cross-machine-demo-ux` D7) ──
+		//
+		// WHY THIS RUNS BEFORE THE `phases` VALIDATION (G2/G3/G4 below):
+		// the two failures it separates are not equally fixable from here. A phase
+		// machine is a pure LOCAL typo — it is parsed and rejected in this process,
+		// and the caller fixes it by editing one argument. A broken delivery (no
+		// `origin`, no `git` there, two checkouts pointing at two remotes) is a fact
+		// about ANOTHER machine, and this process can do nothing about it: no retry,
+		// no rewrite, no local patch will change it. Reporting the local typo first
+		// meant a caller fixed its phases, relaunched, waited out the whole remote
+		// setup, and only then got the sentence it could not act on from here. So the
+		// least-self-fixable answer comes first: if the delivery cannot work, say so
+		// before asking the caller to proofread anything else.
+		//
+		// `worktree === true` is the condition, not `host` alone: a bare remote child
+		// needs no shared remote (nothing is created or delivered through git), so
+		// asking there would refuse launches that work.
+		//
+		// The `hostTarget` re-check is only TypeScript narrowing — the host guard
+		// above already refused every launch where it is missing or names another
+		// machine. Absent method (a test double, another backend) = skipped.
+		if (host !== undefined && worktree === true && input.hostTarget !== undefined) {
+			await this.supervisor.preflightRemoteDelivery?.({
+				host,
+				target: input.hostTarget,
+				localRepo: this.cwd,
+			});
+		}
+		// #371 G2: a phase machine is the root's declaration about a team IT owns.
+		// Refused rather than ignored — silently dropping it would leave the caller
+		// believing a state machine was in force while the child runs free.
+		if (declaredPhases && !isRootShell) {
+			throw new SubagentError(
+				`phases are declared by the root shell only; '${this.legion!.nodeId}' cannot`,
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		// #371 G3: a machine governs a TEAM. Declaring one for a worker is not a
+		// smaller version of the same thing — it is a category error, and the fix is
+		// a different dispatch, so name it.
+		if (declaredPhases && !isCenturion) {
+			throw new SubagentError(
+				"phases belong to a centurion team; dispatch a worker for solo work",
+				ErrorCodes.INVALID_PARAMS,
+			);
+		}
+		// #371 G4: an inline declaration is validated HERE, before artifacts, with the
+		// same parser (and therefore the same rules) the card layer uses. The card is
+		// the FALLBACK, never the override: a dispatch that names its machine wins
+		// over a role card that also names one (contract §2).
+		const machine = declaredPhases ? this.declaredPhaseMachine(input) : input.agent.phases;
+		// #371 (m8, review r2): the declaration is recorded INSIDE the try below, not
+		// here. Admission/budget refusals and queued launches return or throw before a
+		// node exists, so recording it here would leave an entry that `abortLegionPhase`
+		// could later read for a node that never ran.
 		// Spawn-mode arbitration. Role cards no longer carry a `spawnMode` field:
 		// the backend is a property of the LAUNCH, not a role, so a card cannot pin
 		// itself to a process model. rpc exists for exactly one reason — it is the

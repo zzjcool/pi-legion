@@ -20,6 +20,8 @@ import { RpcSupervisor } from "./rpc-supervisor.ts";
 import type { TerminalSupervisor } from "./terminal-supervisor.ts";
 import { resolveSpawnMode } from "./spawn-mode.ts";
 import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
+import type { DeliveryPreflightReport } from "../runs/cross-machine-preflight.ts";
+import type { HostTarget } from "../runs/remote.ts";
 import type { UIProxy } from "./ui-proxy.ts";
 import type {
 	AbortOutcome,
@@ -206,6 +208,36 @@ export class RoutingSupervisor implements LegionSupervisor {
 
 	async prompt(name: string, text: string): Promise<void> {
 		await this.backendFor(name).prompt(name, text);
+	}
+
+	/**
+	 * The cross-machine delivery preflight (contract `cross-machine-demo-ux` D7),
+	 * routed to the one backend that can ask it.
+	 *
+	 * Not routed by child name like the other members: this runs BEFORE any child
+	 * exists, so there is no owner to look up. The question — "can these two
+	 * checkouts share one git remote" — is answerable only through an `hc` client
+	 * plus `HostTarget`, i.e. the terminal backend; the rpc and in-process backends
+	 * cannot leave this machine at all (`cross-machine-spawn-v1` D1). So an absent
+	 * terminal backend is refused HERE, by name, instead of being silently skipped:
+	 * by the time the orchestrator calls this, the launch has already been
+	 * arbitrated to `terminal` (a named host that survives the env guard IS inside
+	 * an hc terminal), and "skip the preflight" would mean spawning a remote child
+	 * without asking the one question the whole stage exists for.
+	 */
+	async preflightRemoteDelivery(input: {
+		host: string;
+		target: HostTarget;
+		localRepo: string;
+	}): Promise<DeliveryPreflightReport> {
+		if (this.terminal === undefined) {
+			throw new SubagentError(
+				`host '${input.host}' needs an hc terminal host: start pi inside an hc terminal (HC_TERMINAL_SOCKET + HC_TERMINAL_ID), or drop host`,
+				ErrorCodes.INVALID_PARAMS,
+				{ host: input.host },
+			);
+		}
+		return this.terminal.preflightRemoteDelivery(input);
 	}
 
 	/**

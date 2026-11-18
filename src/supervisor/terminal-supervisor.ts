@@ -41,6 +41,10 @@ import {
 	remotePathIsDirectory,
 	removeRemoteChildWorktree,
 } from "../runs/remote-worktree.ts";
+import {
+	preflightDelivery,
+	type DeliveryPreflightReport,
+} from "../runs/cross-machine-preflight.ts";
 import { childMemoryEnv } from "./child-memory.ts";
 import { defaultPiCliPath } from "./rpc-supervisor.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
@@ -256,6 +260,35 @@ export class TerminalSupervisor implements LegionSupervisor {
 	}
 
 	// ── spawn (D4/D5/D6/D7) ─────────────────────────────────────────────
+
+	/**
+	 * The cross-machine delivery preflight, asked before a launch exists
+	 * (contract `cross-machine-demo-ux` D7).
+	 *
+	 * This backend is the only one that can answer it: the questions are about the
+	 * OTHER machine (`test -d`, `git --version`, `git remote get-url origin` run
+	 * there via `hc`), and `HostTarget` is what says which machine that is. The
+	 * call shape is the frozen one from `cross-machine-preflight.ts` (D5) — this
+	 * method adds the `hc` client and nothing else, so the orchestrator and the
+	 * worktree creator cannot disagree about WHAT a delivery needs.
+	 *
+	 * `localRepo` is the caller's checkout, never `input.cwd` of a spawn: the pair
+	 * being compared is "this machine's clone" vs "that machine's clone".
+	 *
+	 * The preflight THROWS on every hard failure (already `INVALID_PARAMS` +
+	 * `noModelFallback`) and records the report either way; the orchestrator only
+	 * needs the throw. It does NOT replace the checks inside
+	 * `createRemoteChildWorktree`: this one runs earlier and names the reason, that
+	 * one still guards the moment a tree is actually made (D10/D11).
+	 */
+	async preflightRemoteDelivery(input: {
+		host: string;
+		target: HostTarget;
+		localRepo: string;
+	}): Promise<DeliveryPreflightReport> {
+		const client = await this.ensureClient();
+		return preflightDelivery({ client, target: input.target, localRepo: input.localRepo });
+	}
 
 	async spawnChild(input: SpawnInput): Promise<ChildHandle> {
 		// #280 parity with the rpc backend: the inherited `-e` set is read from the
