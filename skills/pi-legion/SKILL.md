@@ -42,9 +42,13 @@ name `hc machine ls` prints) plus the directory ON that machine. Nothing else
 changes — role, task, phases, `model` and `verify` are the local fields.
 
 ```text
-subagent({ agent: "scout", host: "hw-nj", cwd: "/home/you/code/x", task: "<question list>" })
 subagent({ agent: "centurion", host: "hw-nj", cwd: "/home/you/code/x", task: "<goal + acceptance>" })
 ```
+
+Cross-machine is for a DELIVERY UNIT: only `centurion` crosses by default. A scout or
+worker that belongs on that machine is created THERE by the remote centurion, not
+dispatched from here; `subagents.crossMachine.allowRoles` is the explicit opt-out when
+you really need another role to cross.
 
 `cwd` is the ONE new required input: an absolute path read on the target machine
 (remote paths are never translated from this one). Take it from the conversation
@@ -63,14 +67,14 @@ Manual walkthrough: `docs/runbooks/cross-machine-centurion-demo.md`.
 
 A remote child that dies at start-up answers with the exit code, the last screen
 text and a `Command (run on '<host>' to reproduce):` line — paste that command
-instead of guessing, and do not report `execution: unknown` as the reason. An
-`execution: unknown (read-back was truncated …)` is this machine's blind spot, not
-the child's fate: re-collect instead of reporting a failure.
+instead of guessing. An `execution: unknown (transcript not retrieved from host '…')`
+is this machine's blind spot, not the child's fate: the reason carries the remote
+path and the `hc exec` command that fetches it — use it before reporting a failure.
 
 Extensions this machine has and the target does not are not a reason to stop: an
-INHERITED one is dropped with one `⚠` line in the result (install it there or add
-it to `excludeExtensions`), while an extension the ROLE CARD itself declares is a
-hard refusal before launch.
+INHERITED one is skipped with ONE `⚠` line in the result (install it there or add
+it to `excludeExtensions`). Only a package the card lists in `requiredExtensions`
+is a hard refusal before launch.
 
 ## Legion visualization
 
