@@ -529,15 +529,18 @@ D1/D2/D3 的断言随实现一起留在 master（本分支合并时删掉了自�
 
 三条命令的退出码都是 0。`test/unit/terminal-supervisor.test.ts` 未修改（D18 of `cross-machine-spawn-v1`）。
 
-## 9. 版本建议：`6.3.0`（minor）
+## 9. 版本：`6.2.1`（patch，按维护者裁定）
 
-- **为什么是 minor**：新增了一项**能力** —— `/legion doctor crossmachine` 从「配置回显」变成一次体检（一次 `hc` 连接、
-  PASS/FAIL/SKIP、每项带真值的 `fix:`、末尾可粘贴的 launch）；同时新增了一条**零配置的 launch 路径**
-  （`{ "enabled": true }` + 按次 `cwd`）。按 SemVer，向后兼容地新增能力 = minor。
-- **为什么不是 patch**：patch 只留给「行为不变、只改错字」；这里多了新功能，读者也该被提示「可以少写配置了」。
-- **为什么不是 major**：没有删任何 API / settings 键 / 退出码（11/15/17 逐字节未变，`resolveHostTarget` 的签名不变，
-  静态 doctor 块逐字节保留给 `auto-doctor` 与无快照路径），没有数据迁移（settings 与磁盘缓存格式都没变）。
-  唯一"行为变化"是**报错文案与它的时机**（D2 在任何 `machine.exec` 之前），而文案不是 API。
+- 交付时建议的是 `6.3.0`（minor）：`/legion doctor crossmachine` 从「配置回显」变成一次体检，
+  外加一条零配置 launch 路径 —— 按 SemVer 属向后兼容地新增能力。
+- 实际发布定为 **`6.2.1`（patch）**：这批的主体是把「第一次跨机派发」从不可用修到可用（转录回传、
+  入口目录声明、缺失扩展跳过、判词不再误报 aborted），doctor 与提问是同一目标下的可用性修复；
+  没有新增必填配置，也没有删任何键/退出码。维护者按 patch 收口（发布记录见第 11 节）。
+- **为什么不是 major**：没有删任何 API / settings 键 / 退出码（11/15/17 逐字节未变，
+  `resolveHostTarget` 的签名不变，静态 doctor 块逐字节保留给 `auto-doctor` 与无快照路径），
+  没有数据迁移（settings 与磁盘缓存格式都没变）。唯一「行为变化」是**报错文案与它的时机**
+  （D2 在任何 `machine.exec` 之前），而文案不是 API。
+- 下一批若动交付通道（per-launch 镜像目录等），再按 minor 走。
 
 ## 10. 边界 / 未做
 
