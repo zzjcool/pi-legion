@@ -336,7 +336,7 @@ test("D5 step 5: a directory that is not a repository is `remote-checkout`", asy
 	}
 });
 
-test("D5 step 5: `rev-parse` exiting 127 is `remote-git`, never 'not a repository'", async () => {
+test("D5 step 5: `rev-parse` exiting 127 is `remote-git`, and the sentence names the command that RAN", async () => {
 	resetDeliveryPreflightState();
 	const local = localRepo("git@example.com:acme/pi-legion.git");
 	try {
@@ -344,7 +344,15 @@ test("D5 step 5: `rev-parse` exiting 127 is `remote-git`, never 'not a repositor
 			execResult({ code: 127, stderr: base64("sh: 1: git: not found") }),
 		);
 		const error = await hardFailure(preflightDelivery({ client, target: target(), localRepo: local.repo }), "remote-git");
-		assert.match(error.message, /^host 'vps': git is not available on that machine \(git --version exited 127:/);
+		// Review m1: the frozen D6 sentence used to end "(git --version exited 127: …)"
+		// even though this step runs `git -C <cwd> rev-parse --git-dir` — the operator was
+		// sent to test a command that had succeeded two steps earlier.
+		assert.equal(
+			error.message,
+			`host 'vps': git is not available on that machine (git -C ${REMOTE_CWD} rev-parse --git-dir exited 127: sh: 1: git: not found). ` +
+				"A cross-machine centurion delivers through git worktrees, so git must be on PATH there. " +
+				"Two ways out: 1) install git on 'vps' and retry; 2) dispatch a worker instead (workers need no worktree and no git).",
+		);
 	} finally {
 		local.cleanup();
 	}
@@ -417,6 +425,50 @@ test("D5 step 8: an unreachable origin is RECORDED, never thrown", async () => {
 			"git's own words must survive into the report doctor shows",
 		);
 		assert.deepEqual(recorded(), report);
+	} finally {
+		local.cleanup();
+	}
+});
+
+test("D5 step 8: a `timed_out` probe is the SOFT outcome — `fetch: unreachable`, and the original words are kept", async () => {
+	resetDeliveryPreflightState();
+	const local = localRepo("git@example.com:acme/pi-legion.git");
+	try {
+		// Review M2: `remoteExec` throws for `timed_out: true`, and the catch used to map
+		// that throw to a hard `transport` refusal — contradicting this file's own rule
+		// that a slow network is recorded, never thrown. The machine ANSWERED; it was
+		// merely slower than the probe's 10s budget.
+		const client = healthyClient().override("ls-remote origin", () =>
+			execResult({ code: 0, timed_out: true, stdout: base64("partial") }),
+		);
+		const report = await preflightDelivery({ client, target: target(), localRepo: local.repo });
+		assert.equal(report.ok, true, "a slow remote is not a reason to refuse the launch");
+		assert.equal(report.fetch, "unreachable");
+		assert.match(String(report.fetchDetail), /timed_out/, "the detail keeps remoteExec's own words");
+		assert.match(String(report.fetchDetail), /ls-remote origin did not finish within 10s/);
+		assert.equal(report.failure, undefined, "nothing failed: the order completed");
+		assert.deepEqual(recorded(), report);
+	} finally {
+		local.cleanup();
+	}
+});
+
+test("D5 step 8: a machine that does not answer AT ALL — `machine_unknown` — is still a hard `transport`", async () => {
+	resetDeliveryPreflightState();
+	const local = localRepo("git@example.com:acme/pi-legion.git");
+	try {
+		// The other half of M2: the soft turn is for a slow machine, not for a machine
+		// that does not exist. A wrong host name is a fact about the configuration, so it
+		// must stay hard (and must not walk the model fallback chain).
+		const client = healthyClient().override("ls-remote origin", () => {
+			throw new HcRpcError({ code: -32000, message: "unknown machine: vps", data: { kind: "machine_unknown" } });
+		});
+		const error = await hardFailure(preflightDelivery({ client, target: target(), localRepo: local.repo }), "transport");
+		assert.match(error.message, /machine_unknown: unknown machine: vps/, "the core's own kind and words are kept");
+		const report = recorded();
+		assert.equal(report.ok, false);
+		assert.equal(report.fetch, "skipped", "an unanswered probe has no fetch verdict to report");
+		assert.equal(report.failure?.category, "transport");
 	} finally {
 		local.cleanup();
 	}

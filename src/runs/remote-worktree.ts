@@ -300,7 +300,12 @@ export async function remoteExec(
 		throw new SubagentError(
 			`host '${target.host}' unreachable: timed_out: ${operation} did not finish within ${params.timeout ?? REMOTE_SETUP_TIMEOUT_S}s (${execResultText(result) || "no output"})`,
 			ErrorCodes.START_FAILED,
-			{ host: target.host },
+			// `timedOut` is what lets a SOFT caller tell "that machine answered, too
+			// slowly" apart from "the round trip itself died" — both arrive here as one
+			// `START_FAILED`. The preflight's `git ls-remote` step is soft on the first and
+			// hard on the second (review M2), and re-parsing the prose to find out would be
+			// a second, drifting answer.
+			{ host: target.host, timedOut: true },
 		);
 	}
 	if (typeof result?.code !== "number") {
@@ -430,11 +435,15 @@ export function notARepositoryMessage(host: string, cwd: string): string {
  * directory that is fine and leave the real missing program unnamed. Exit 127 is
  * the shell's "command not found" — with a real `git` on PATH it never happens.
  */
-export function remoteGitMissingMessage(opts: { host: string; code: number | null; detail: string }): string {
+export function remoteGitMissingMessage(opts: { host: string; code: number | null; detail: string; command: string }): string {
 	const detail = opts.detail.trim().slice(0, STDERR_CLIP) || "no output";
 	const code = opts.code === null ? "no exit code" : String(opts.code);
+	// Review m1: name the command that ACTUALLY ran. Two callers reach this with two
+	// different commands (`git --version` at step 4, `git -C <cwd> rev-parse --git-dir`
+	// at step 5 and in the worktree creator), and telling an operator `git --version`
+	// failed when `rev-parse` is what ran sends them to test the wrong thing.
 	return (
-		`host '${opts.host}': git is not available on that machine (git --version exited ${code}: ${detail}). ` +
+		`host '${opts.host}': git is not available on that machine (${opts.command} exited ${code}: ${detail}). ` +
 		"A cross-machine centurion delivers through git worktrees, so git must be on PATH there. " +
 		`Two ways out: 1) install git on '${opts.host}' and retry; 2) dispatch a worker instead (workers need no worktree and no git).`
 	);
@@ -579,6 +588,7 @@ export async function createRemoteChildWorktree(opts: {
 					host: target.host,
 					code: 127,
 					detail: execResultText(probe),
+					command: `git -C ${target.cwd} rev-parse --git-dir`,
 				}),
 				ErrorCodes.INVALID_PARAMS,
 				{ host: target.host, cwd: target.cwd, code: 127 },

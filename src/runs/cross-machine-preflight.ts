@@ -284,6 +284,25 @@ function transportFailure(base: PreflightBase, error: unknown, operation: string
 }
 
 /**
+ * Did the machine ANSWER, too slowly?
+ *
+ * `remoteExec` throws ONE `START_FAILED` for three different things, and the soft
+ * step has to tell them apart (review M2): a `timed_out: true` result is a machine
+ * that is there and slow — a network fact, exactly what D5 says is recorded, never
+ * thrown. A dead round trip (`machine_unknown`, a closed socket, a missing exit
+ * code) is a machine we cannot talk to at all, which stays hard.
+ *
+ * The flag is set where the result is read (`remote-worktree.ts`), not recovered
+ * from the message: re-parsing prose here would be a second, drifting verdict on
+ * the same fact.
+ */
+function timedOutOf(error: unknown): boolean {
+	if (!(error instanceof SubagentError)) return false;
+	const details = error.details as { timedOut?: unknown } | undefined | null;
+	return details?.timedOut === true;
+}
+
+/**
  * Ask every question a cross-machine delivery depends on, in D5's fixed order,
  * and refuse at the first one with a fact to fix.
  *
@@ -348,10 +367,17 @@ export async function preflightDelivery(input: DeliveryPreflightInput): Promise<
 	}
 	if (gitVersion.code !== 0) {
 		const code = typeof gitVersion.code === "number" ? gitVersion.code : null;
-		fail(base, "remote-git", remoteGitMissingMessage({ host: base.host, code, detail: detailOf(gitVersion) }), {
-			cwd: base.cwd,
-			code,
-		});
+		fail(
+			base,
+			"remote-git",
+			remoteGitMissingMessage({
+				host: base.host,
+				code,
+				detail: detailOf(gitVersion),
+				command: "git --version",
+			}),
+			{ cwd: base.cwd, code },
+		);
 	}
 
 	// 5. that checkout is a git repository → remote-checkout
@@ -370,10 +396,17 @@ export async function preflightDelivery(input: DeliveryPreflightInput): Promise<
 		// 127 means the program is not there — the same fact step 4 names, never
 		// "this directory is not a repository" (D6).
 		if (gitDir.code === 127) {
-			fail(base, "remote-git", remoteGitMissingMessage({ host: base.host, code: 127, detail: detailOf(gitDir) }), {
-				cwd: base.cwd,
-				code: 127,
-			});
+			fail(
+				base,
+				"remote-git",
+				remoteGitMissingMessage({
+					host: base.host,
+					code: 127,
+					detail: detailOf(gitDir),
+					command: `git -C ${target.cwd} rev-parse --git-dir`,
+				}),
+				{ cwd: base.cwd, code: 127 },
+			);
 		}
 		fail(base, "remote-checkout", notARepositoryMessage(base.host, base.cwd), {
 			cwd: base.cwd,
@@ -434,8 +467,19 @@ export async function preflightDelivery(input: DeliveryPreflightInput): Promise<
 			report.fetchDetail = detailOf(lsRemote);
 		}
 	} catch (error) {
-		// ... but the round trip dying is the machine, and that is hard.
-		return transportFailure(base, error, `git -C ${target.cwd} ls-remote origin`);
+		// A SLOW `ls-remote` is the soft outcome (review M2): the machine answered, so a
+		// 10s budget says something about this network, not about the delivery. Refusing
+		// here was the preflight contradicting its own `fetch: "unreachable"` rule — the
+		// same situation reported as a hard `transport` failure just because git took
+		// longer than the probe's budget. The child still pushes from THAT machine with
+		// its own credentials, so a slow parent-side probe proves nothing.
+		if (timedOutOf(error)) {
+			report.fetch = "unreachable";
+			report.fetchDetail = error instanceof Error ? error.message : String(error);
+		} else {
+			// ... but the round trip dying is the machine, and that is hard.
+			return transportFailure(base, error, `git -C ${target.cwd} ls-remote origin`);
+		}
 	}
 
 	store.last = report;

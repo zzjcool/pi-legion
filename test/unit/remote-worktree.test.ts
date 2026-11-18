@@ -334,7 +334,7 @@ test("D6: `rev-parse` exiting 127 means git is missing there, not that the direc
 	assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
 	assert.equal(
 		error.message,
-		"host 'vps': git is not available on that machine (git --version exited 127: sh: 1: git: not found). A cross-machine centurion delivers through git worktrees, so git must be on PATH there. Two ways out: 1) install git on 'vps' and retry; 2) dispatch a worker instead (workers need no worktree and no git).",
+		"host 'vps': git is not available on that machine (git -C /srv/app rev-parse --git-dir exited 127: sh: 1: git: not found). A cross-machine centurion delivers through git worktrees, so git must be on PATH there. Two ways out: 1) install git on 'vps' and retry; 2) dispatch a worker instead (workers need no worktree and no git).",
 	);
 });
 
