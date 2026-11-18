@@ -184,12 +184,44 @@ export function mapRemoteArgv(
 		packages?: HostPackageIndex;
 	},
 ): string[] {
-	const mapping = mapRemoteArgvAllowingSkips(args, opts);
-	// The STRICT answer: the first extension the target cannot load is refused with
-	// the error that describes it, byte for byte what this function always threw.
-	const first = mapping.skipped[0];
-	if (first !== undefined) throw first.error;
-	return mapping.args;
+	// The STRICT walk, kept as its own loop on purpose: what this function always
+	// did is "the first unmappable element in ARGV order throws", and a version that
+	// collected skips first would let a later hard error win over an earlier
+	// extension error. Nothing may degrade for callers that still use it.
+	const out: string[] = [];
+	for (let index = 0; index < args.length; index += 1) {
+		const arg = args[index] as string;
+		const pair = arg === "-e" || arg === "--extension" ? args[index + 1] : undefined;
+		if (pair !== undefined) {
+			out.push(arg, mapRemoteArgPath({ arg: pair, ...opts }));
+			index += 1;
+			continue;
+		}
+		const inline = inlineExtensionValue(arg);
+		if (inline !== undefined) {
+			out.push(`${EXTENSION_INLINE_PREFIX}${mapRemoteArgPath({ arg: inline, ...opts })}`);
+			continue;
+		}
+		out.push(mapRemoteArgPath({ arg, ...opts }));
+	}
+	return out;
+}
+
+/** The one-token spelling `--extension=<path>` (`args.ts` emits the pair form). */
+const EXTENSION_INLINE_PREFIX = "--extension=";
+
+/**
+ * The `--extension=<path>` value, or `undefined`.
+ *
+ * The args builder only ever emits `--extension <path>` as a pair, so this exists
+ * for argv this file did NOT build (a hand-written launch, a future flag form): an
+ * absolute parent path inside it would otherwise reach the remote `pi` verbatim,
+ * because it is neither mapped nor refused.
+ */
+function inlineExtensionValue(arg: string): string | undefined {
+	if (!arg.startsWith(EXTENSION_INLINE_PREFIX)) return undefined;
+	const value = arg.slice(EXTENSION_INLINE_PREFIX.length);
+	return value.length === 0 ? undefined : value;
 }
 
 /**
@@ -273,18 +305,29 @@ export function mapRemoteArgvAllowingSkips(
 	const skipped: RemoteExtensionSkip[] = [];
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index] as string;
-		const value = args[index + 1];
-		if ((arg === "-e" || arg === "--extension") && value !== undefined) {
+		const pair = arg === "-e" || arg === "--extension" ? args[index + 1] : undefined;
+		if (pair !== undefined) {
 			try {
-				out.push(arg, mapRemoteArgPath({ arg: value, ...opts }));
+				out.push(arg, mapRemoteArgPath({ arg: pair, ...opts }));
 			} catch (error) {
-				const skip = skippableExtension(error, value);
+				const skip = skippableExtension(error, pair);
 				if (skip === undefined) throw error;
 				skipped.push(skip);
 			}
 			// The VALUE belongs to the switch: dropping only one of the two would hand
 			// the remote pi a flag with the wrong argument.
 			index += 1;
+			continue;
+		}
+		const inline = inlineExtensionValue(arg);
+		if (inline !== undefined) {
+			try {
+				out.push(`${EXTENSION_INLINE_PREFIX}${mapRemoteArgPath({ arg: inline, ...opts })}`);
+			} catch (error) {
+				const skip = skippableExtension(error, inline);
+				if (skip === undefined) throw error;
+				skipped.push(skip);
+			}
 			continue;
 		}
 		out.push(mapRemoteArgPath({ arg, ...opts }));
@@ -345,7 +388,17 @@ export function requiredExtensionsError(
 function isRequiredExtension(skip: RemoteExtensionSkip, required: readonly string[]): boolean {
 	if (required.length === 0) return false;
 	const candidates = [skip.extension, ...(skip.package !== undefined ? [skip.package] : [])];
-	return required.some((pattern) => candidates.some((candidate) => matchesExcludedExtension(candidate, pattern)));
+	return required.some((pattern) => {
+		// The package-relative spelling a card is most likely to write
+		// (`extensions/pi-sop/index.ts`) is not a name and not an absolute path, so
+		// neither `matchesExcludedExtension` branch would see it. Compared here so a
+		// required entry cannot silently degrade into a skip (fail-open).
+		const relative = pattern.trim().replace(/^\.\//, "");
+		if (skip.relative !== undefined && relative.length > 0) {
+			if (skip.relative === relative || skip.relative.endsWith(`/${relative}`)) return true;
+		}
+		return candidates.some((candidate) => matchesExcludedExtension(candidate, pattern));
+	});
 }
 
 /**
@@ -634,7 +687,8 @@ export interface HostTarget {
 	mirrorRoot: string;
 	/**
 	 * Directory (absolute, posix, ON that machine) that holds remote child
-	 * worktrees (contract D11/D12).	 *
+	 * worktrees (contract D11/D12).
+	 *
 	 * Resolved here, once, from `hosts.<host>.worktreeRoot` (default:
 	 * `dirname(cwd)/.pi-worktrees`), so no call site ever has to invent a remote
 	 * path. It is a SIBLING of the checkout on purpose: a tree inside it would be

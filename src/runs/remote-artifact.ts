@@ -205,12 +205,16 @@ export function createRemoteSessionReadback(opts: {
 			});
 		}
 		const client = opts.clientFactory ? opts.clientFactory() : hcCliClient({ env: process.env });
+		// The target resolved, so the file this machine WOULD have read is knowable —
+		// and a failure that cannot name it leaves the operator with nothing to fetch.
+		const attemptedPath = remoteSessionPathFor(target, request);
 		try {
 			await client.start();
 		} catch (error) {
 			return unreachableFailure(request.host, `cannot reach the hc core: ${error instanceof Error ? error.message : String(error)}`, {
 				evidence: ["the hc core on this machine did not start"],
 				nextStep: `check that \`hc\` is on PATH (or HC_BIN) and that this machine's core is running — a child on '${request.host}' cannot be asked about from here`,
+				remotePath: attemptedPath,
 			});
 		}
 		// The transcript's path on THAT machine, computed once so a success and a
@@ -228,12 +232,28 @@ export function createRemoteSessionReadback(opts: {
 			// The text is written as-is: a marker line inside a JSONL transcript would be
 			// one more unparsable line, and the truncation fact belongs to the RESULT
 			// (which the render reads), not to the file the collector parses.
-			// xm-dispatch D3.3: a ZERO-line read never truncates a mirror that already has
-			// bytes. The old unconditional write turned one transient `lines: 0` answer
-			// into an empty file that the collector then read as "the child said nothing".
-			if (!(read.lines === 0 && existingBytes(request.localPath) > 0)) {
-				fs.writeFileSync(request.localPath, read.text, { mode: 0o600 });
+			// xm-dispatch D3.3: a ZERO-line answer over a mirror that already holds bytes
+			// is not "0 of 0 complete" — it is a read this machine cannot trust. The old
+			// unconditional write turned it into an empty file the collector read as "the
+			// child said nothing"; keeping the old bytes silently would mark a STALE
+			// transcript as complete. Neither is a verdict, so the answer is a failure
+			// that says so (and the collector grades nothing from it).
+			const held = existingBytes(request.localPath);
+			if (read.lines === 0 && held > 0) {
+				return {
+					ok: false,
+					host: request.host,
+					reason: `the read answered 0 lines while this machine already holds ${held} bytes of an earlier read-back`,
+					remotePath,
+					fate: "path",
+					evidence: [
+						`0-line answer for ${remotePath}`,
+						`local mirror kept: ${held} bytes`,
+					],
+					nextStep: `check the file on '${request.host}' by hand (hc exec --on ${request.host} -- wc -l ${remotePath}) before trusting any verdict for this child`,
+				};
 			}
+			fs.writeFileSync(request.localPath, read.text, { mode: 0o600 });
 			return {
 				ok: true,
 				host: request.host,

@@ -427,6 +427,30 @@ export const TRANSIENT_CONNECTION_REASON = "transient connection error; RPC chil
 export function transcriptNotRetrievedReason(host: string, detail: string): string {
 	return `transcript not retrieved from host '${host}' (${detail}): the child's work cannot be graded from here`;
 }
+
+/**
+ * The `  ⚠ <name>: <text>` lines one launch owes its caller.
+ *
+ * One definition for BOTH render paths — the immediate `▶` line in `launchStep`
+ * and the "started after queued Ns" notice — because a queued (fan-out) launch
+ * renders no `▶` line at all, and a warning that only exists on the immediate path
+ * is exactly the silent degradation D2 forbids. `warning` (model resolution) and
+ * `warnings` (cross-machine extension skips) are different lists and both render.
+ */
+export function launchNoticeLines(
+	name: string,
+	handle: { warning?: string; warnings?: string[] },
+): string[] {
+	const notices = [handle.warning, ...(handle.warnings ?? [])]
+		.filter((line): line is string => typeof line === "string" && line.length > 0);
+	return notices.map((line) => `  ⚠ ${name}: ${line}`);
+}
+
+/** The warning lines of this launch's notice, or the bare notice when there are none. */
+export function noticeWithWarnings(line: string, name: string, handle: { warning?: string; warnings?: string[] }): string {
+	const warnings = launchNoticeLines(name, handle);
+	return warnings.length > 0 ? `${line}\n${warnings.join("\n")}` : line;
+}
 /**
  * #316 D2: the text sent to a child whose last turn produced an empty
  * generation. Addressed to the still-live child, which already holds the task
@@ -764,6 +788,9 @@ export class Orchestrator {
 	 * So every point that may now be reading a settled transcript refreshes first.
 	 * A refresh FAILURE is not fatal: the previous mirror stays, and the failure
 	 * itself is recorded (a verdict is never invented from silence).
+	 *
+	 * Is there anything to (re-)fetch at all? See {@link canRefreshRemote}, which is
+	 * asked BEFORE the await — the reason is there.
 	 */
 	/**
 	 * Is there a cross-machine transcript to (re-)fetch for this child?
@@ -2472,7 +2499,10 @@ export class Orchestrator {
 			// become visible. Same two-space `⚠` shape `launchStep` uses; the caller
 			// pushes nothing extra there (`Handle.queued` carries no warning).
 			const startedLine = `▶ ${payload.name} started after queued ${Math.round(waitedMs / 1000)}s`;
-			this.notice(handle.warning ? `${startedLine}\n  ⚠ ${payload.name}: ${handle.warning}` : startedLine);
+			// Every launch notice travels here too: a queued (fan-out) launch renders no
+			// `▶` line of its own, so this notice is the ONLY place its warnings can
+			// become visible — the D2 skipped-extension summary included.
+			this.notice(noticeWithWarnings(startedLine, payload.name, handle));
 			guard?.settle({ kind: "admitted", waitedMs });
 		} catch (error) {
 			const again = guard?.probe() ?? ({ admitted: true } as AdmissionVerdict);
@@ -3062,7 +3092,10 @@ export class Orchestrator {
 		// dead child never received the `running` snapshot. Keeping the guard makes
 		// the intent explicit instead of relying on that coincidence — see D5 and
 		// the disclosure in the #227 contract.
-		if (wait === "timeout" && !this.supervisor.isAlive(name) && isLastTurnComplete(parsed)) {
+		// xm-dispatch D3.3: never on a transcript this attempt could not read — the
+		// "complete turn" here would be a PREVIOUS mirror's, and finishing on it is how
+		// a stale snapshot becomes this turn's delivery.
+		if (wait === "timeout" && !this.supervisor.isAlive(name) && isLastTurnComplete(parsed) && this.transcriptUnavailable(child) === undefined) {
 			return this.finishCollect(child, parsed, deriveOutcome(parsed), deadline);
 		}
 		// The ladder that turns (transcript, wait verdict) into an outcome lives in
@@ -3147,16 +3180,17 @@ export class Orchestrator {
 		} else if (wait === "gone" && parsed.turns.length === 0) {
 			execution = { status: "aborted", reason: "RPC child exited before writing session JSONL", model: child.model ?? null };
 		}
-		// xm-dispatch D3.3: a transcript that never arrived is NOT a child that never
-		// spoke. Judging the empty mirror as `aborted (no assistant message for the
-		// last prompt)` claimed a finished worker had produced nothing — and, worse,
-		// `shouldRecycleAfterCollect("aborted")` then retired a child that was working.
-		// `unknown` is the honest answer: this machine cannot read the words, so it
-		// cannot grade the work. Only an `aborted` is rewritten — a `running` child is
-		// already saying the truthful thing, and a success (a mirror from an earlier
-		// collect) outranks a read this attempt could not repeat.
+		// xm-dispatch D3.3: a transcript that did not arrive is NOT a verdict about the
+		// child. Two wrong answers were possible here, and both were live: judging the
+		// empty mirror gave `aborted (no assistant message for the last prompt)` for a
+		// finished worker, and grading the PREVIOUS mirror gave `success` for a turn
+		// this attempt never read (presenting last turn's output as this turn's
+		// delivery). So any terminal status is rewritten to `unknown` — the one honest
+		// statement is "this machine cannot read the words, so it cannot grade the
+		// work". `running` is left alone: a live child is already saying the truthful
+		// thing, and `shouldRecycleAfterCollect` must keep refusing to retire it.
 		const unavailable = this.transcriptUnavailable(child);
-		if (unavailable !== undefined && execution.status === "aborted") {
+		if (unavailable !== undefined && execution.status !== "running") {
 			execution = {
 				status: "unknown",
 				reason: transcriptNotRetrievedReason(unavailable.host, unavailable.reason),
@@ -3515,7 +3549,12 @@ export class Orchestrator {
 		child.acceptance = acceptance;
 		if (execution.status !== "running") this.recordSettled(child, execution, isLastTurnComplete(parsed));
 		if (!isRetired()) this.onChildUpdate(child);
-		const output = execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
+		// xm-dispatch D3.3: a transcript this attempt could not read contributes NO
+		// text. Keeping the parsed bytes would hand the parent a previous mirror's last
+		// turn as this turn's delivery, right next to a verdict that says `unknown`.
+		const output = this.transcriptUnavailable(child) !== undefined
+			? ""
+			: execution.status !== "running" && parsed.lastTurnOutput === null ? "" : parsed.output;
 		// A stop can land between the snapshot and here. The lifecycle state must not
 		// be revived (above), but the terminal text still belongs on disk: this collect
 		// is the only writer of the child's artifact, so returning early here dropped
@@ -3679,14 +3718,14 @@ export class Orchestrator {
 			// and the grace loop broke immediately — the second half of xm-dispatch D3.1
 			// ("a running child must show what it has already written"). Growth is the
 			// remote line count, re-fetched on each poll.
+			// ONE refresh per window, not one per local poll tick: a remote read-back is a
+			// fresh client plus two `file.read` round trips, and `ARTIFACT_GROWTH_POLL_MS`
+			// (50ms) would pay that ten times for a single 500ms window.
 			const before = this.remoteLineCount(child);
-			for (let waited = 0; waited < POLL_INTERVAL_MS; waited += ARTIFACT_GROWTH_POLL_MS) {
-				if (await this.sleepOrAbort(Math.min(ARTIFACT_GROWTH_POLL_MS, POLL_INTERVAL_MS - waited), signal)) return false;
-				if (signal?.aborted) return false;
-				if (this.canRefreshRemote(child)) await this.refreshRemoteSession(child);
-				if (this.remoteLineCount(child) > before) return true;
-			}
-			return false;
+			if (await this.sleepOrAbort(POLL_INTERVAL_MS, signal)) return false;
+			if (signal?.aborted) return false;
+			await this.refreshRemoteSession(child);
+			return this.remoteLineCount(child) > before;
 		}
 		const before = artifactSize(child.sessionFile);
 		if (before <= 0 || signal?.aborted) return false;

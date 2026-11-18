@@ -216,6 +216,9 @@ test("D1: host + worktree:false reaches the terminal backend with the target", a
 	});
 });
 
+// NB: `utility: true` is the SCOUT CARD's field (the role must stay a leaf); the
+// `cannot carry a utility dispatch` refusal is a different flag (`utilityDispatch`,
+// set by `vexillatio`) with its own contract test, and it fires before this rule.
 test("xm-dispatch D4: a scout cannot cross machines by default — only a delivery-unit role may", async () => {
 	// The user's design intent, verbatim: "why can scout and worker be dispatched
 	// across machines? only centurion should cross." A scout is a member of the team
@@ -266,15 +269,21 @@ test("xm-dispatch D4: a worker is refused too, unless the target's allowRoles sa
 	});
 });
 
-test("xm-dispatch D4: the role rule is a DISPATCH rule — reconnecting an existing remote child still works", async () => {
+test("xm-dispatch D4: the role rule is a DISPATCH rule — a name that ALREADY exists over there is not re-gated", async () => {
+	// What this proves, precisely: the guard keys on "is this a new dispatch", not on
+	// "does the role appear in allowRoles". An operator who tightens `allowRoles` after
+	// a child exists must still be able to continue/reconnect that child — a rule that
+	// locks them out of work already running on the other machine would be worse than
+	// the bug it fixes. It does NOT prove a resume: `launch` on an existing name
+	// re-spawns (the second `spawnChild` below is real), and the resume gate for an
+	// existing remote child lives in `resolveHostTargetAsync({admission:"never"})`
+	// (`src/runs/remote.ts`), which this rule never touches.
 	const h = harness("xm-roles-resume-");
 	await insideHcTerminal(async () => {
 		try {
 			const first = await h.orchestrator.launch({ agent: agent({ name: "worker" }), task: "t", host: HOST, hostTarget: target({ allowRoles: ["centurion", "worker"] }) });
-			// Finish that child, so the name can be reconnected rather than re-spawned.
 			await h.orchestrator.retire(first.name, { graceful: false });
-			// Same name, and the operator has since TIGHTENED the allowlist: the child
-			// already exists over there, so this is a reconnect, not a new dispatch.
+			const spawnsBefore = h.supervisor.calls.filter((call) => call.method === "spawnChild").length;
 			const again = await h.orchestrator.launch({
 				agent: agent({ name: "worker" }),
 				task: "t",
@@ -283,6 +292,11 @@ test("xm-dispatch D4: the role rule is a DISPATCH rule — reconnecting an exist
 				hostTarget: target(),
 			});
 			assert.equal(again.name, first.name);
+			assert.equal(
+				h.supervisor.calls.filter((call) => call.method === "spawnChild").length,
+				spawnsBefore + 1,
+				"a re-launch on an existing name DOES spawn: the exemption is about not re-gating, not about resuming",
+			);
 		} finally {
 			h.cleanup();
 		}

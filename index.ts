@@ -115,6 +115,7 @@ import { expectedModelsFromSettings, parseDoctorSections, runLegionDoctor } from
 import { readFileSync } from "node:fs";
 import {
 	effectiveMaxDepth,
+	launchNoticeLines,
 	Orchestrator,
 	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
@@ -5044,11 +5045,10 @@ async function launchStep(
 		// — but it must not be invisible either, or a child quietly runs on a model
 		// nobody registered. Queued launches render this after admission instead
 		// (`Handle.queued` carries no warning; the queue notice does).
-		if (handle.warning) session.results.push(`  ⚠ ${handle.name}: ${handle.warning}`);
-		// xm-dispatch D2: a cross-machine launch that SKIPPED inherited extensions says
-		// so here, once, next to the child it affects — the same `⚠` channel as B5, so
-		// a silently degraded child (no provider extension) cannot happen.
-		for (const warning of handle.warnings ?? []) session.results.push(`  ⚠ ${handle.name}: ${warning}`);
+		// B5 (`warning`) and xm-dispatch D2 (`warnings`, the cross-machine extension
+		// skips) share ONE renderer: a skipped provider extension must be as visible as
+		// a custom model id, and the queued path renders through the same function.
+		session.results.push(...launchNoticeLines(handle.name, handle));
 		session.onUpdate?.({
 			content: [
 				{

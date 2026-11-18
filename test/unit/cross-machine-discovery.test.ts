@@ -527,6 +527,85 @@ test("xm-dispatch D2: the skip is scoped to `-e/--extension` — any other unmap
 });
 
 
+test("xm-dispatch D2: an `entry-missing` skip is skipped too (a different layout is not a hard failure)", (t) => {
+	// The other skippable reason: the package IS there, its declared entries just do not
+	// include this one (a version/layout difference). Before D2 that refused the launch.
+	const parent = parentPackage(t, "pi-layout", { entry: "extensions/deep/index.ts" });
+	const index = packageIndex("/srv/pi", [{ name: "pi-layout", entry: "dist/index.js" }]);
+	const mapping = mapRemoteArgvAllowingSkips(["--no-extensions", "-e", parent.entry], {
+		host: "hw-nj",
+		remoteCwd: "/srv/app",
+		remoteDir: "/srv/.mirror/r/n",
+		localCwd: "/local/app",
+		pathMap: [],
+		packages: index,
+	});
+	assert.deepEqual(mapping.args, ["--no-extensions"]);
+	assert.equal(mapping.skipped.length, 1);
+	assert.equal(mapping.skipped[0]?.reason, "entry-missing");
+	// And a card that REQUIRES it still refuses (the same upgrade path as not-installed).
+	const plan = planSkippedExtensions({ host: "hw-nj", agentName: "worker", skipped: mapping.skipped, required: ["pi-layout"] });
+	assert.ok(plan.refused instanceof SubagentError);
+	assert.match((plan.refused as SubagentError).message, /pi-layout \(entry missing there\)/);
+});
+
+test("xm-dispatch D2: a path that is not inside a package keeps the hard refusal (it is not an inherited extension)", (t) => {
+	// `no-package` means "this argv element was never an extension we could hand over":
+	// a hand-written absolute path is a configuration error, not something to skip.
+	const index = packageIndex("/srv/pi", []);
+	const outcome = thrownSync(() => mapRemoteArgvAllowingSkips(["-e", "/opt/loose/plugin.ts"], {
+		host: "hw-nj",
+		remoteCwd: "/srv/app",
+		remoteDir: "/srv/.mirror/r/n",
+		localCwd: "/local/app",
+		pathMap: [],
+		packages: index,
+	}));
+	assert.ok(outcome instanceof SubagentError);
+	assert.match((outcome as SubagentError).message, /cannot be mapped to that machine/);
+});
+
+test("xm-dispatch D2: the one-token `--extension=<path>` form takes the same rules", (t) => {
+	const sop = parentPackage(t, "pi-sop", { entry: "src/index.ts" });
+	const index = packageIndex("/srv/pi", []);
+	const opts = { host: "hw-nj", remoteCwd: "/srv/app", remoteDir: "/srv/.mirror/r/n", localCwd: "/local/app", pathMap: [], packages: index };
+	// Skipped like the pair form (the args builder emits pairs; a hand-written launch
+	// may not, and an absolute parent path in it must not reach the remote `pi`).
+	const mapping = mapRemoteArgvAllowingSkips([`--extension=${sop.entry}`, "--model", "x"], opts);
+	assert.deepEqual(mapping.args, ["--model", "x"]);
+	assert.equal(mapping.skipped.length, 1);
+	// And the strict walk refuses it exactly like the pair form.
+	const strict = thrownSync(() => mapRemoteArgv([`--extension=${sop.entry}`], opts));
+	assert.ok(strict instanceof SubagentError);
+	assert.match((strict as SubagentError).message, /not installed on that machine/);
+});
+
+test("xm-dispatch D4: the ASYNC resolver carries allowRoles onto the target (the tool launch path)", async (t) => {
+	// Every real launch resolves its target through the async resolver, so a whitelist
+	// that only the sync one stamped would silently fall back to the default and make
+	// `subagents.crossMachine.allowRoles` a no-op.
+	clearHostDiscoveryCache();
+	const machine = fakeMachine(t);
+	const client = new FakeClient({
+		machines: () => ({ machines: [{ name: "fakebox" }] }),
+		exec: () => probeResult(runProbe(machine)),
+	});
+	const resolved = await resolveHostTargetAsync(
+		"fakebox",
+		{ enabled: true, allowRoles: ["centurion", "worker"], hosts: { fakebox: { cwd: "/srv/app" } } },
+		{ client, cacheDir: null },
+	);
+	assert.deepEqual(resolved.allowRoles, ["centurion", "worker"]);
+	// Absent stays absent: the default lives with the launch guard, so an unconfigured
+	// target keeps the exact pre-v1.6 shape.
+	const plain = await resolveHostTargetAsync(
+		"fakebox",
+		{ enabled: true, hosts: { fakebox: { cwd: "/srv/app" } } },
+		{ client, cacheDir: null },
+	);
+	assert.equal(plain.allowRoles, undefined);
+});
+
 // ── 2b. extensions by package name (v1.2) ──────────────────────────────────
 
 /**

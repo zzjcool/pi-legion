@@ -22,6 +22,7 @@ import {
 	resetExtraAgentDirsDeprecationWarnForTests,
 } from "../../src/agents/agents.ts";
 import type { AgentConfig } from "../../src/shared/types.ts";
+import { OVERRIDE_FIELDS } from "../../src/agents/overrides.ts";
 import {
 	DEFAULT_MAX_RENEWALS,
 	DEFAULT_RENEWABLE,
@@ -144,6 +145,27 @@ test("agent: requires name and description", () => {
 			"user",
 		),
 	);
+});
+
+test("xm-dispatch D2: `requiredExtensions` is a real card field (parsed, and reachable from an override)", () => {
+	// The whole point of the field is that a card can say "without this extension the
+	// launch must FAIL" instead of being silently downgraded to a skip. A field that the
+	// frontmatter whitelist rejects (or that nothing parses) would make that promise
+	// unkeepable while looking wired — so this pins both halves.
+	const card = parseAgentDocument(
+		"---\nname: r\ndescription: d\nrequiredExtensions:\n  - pi-any-endpoint\n  - pi-lens\n---\nprompt",
+		"/f.md",
+		"user",
+	);
+	assert.ok(card);
+	assert.deepEqual(card.requiredExtensions, ["pi-any-endpoint", "pi-lens"]);
+	// Absent stays absent (the default is "every inherited extension is optional").
+	const plain = parseAgentDocument("---\nname: r\ndescription: d\n---\nprompt", "/f.md", "user");
+	assert.ok(plain);
+	assert.equal(plain.requiredExtensions, undefined);
+	// An override may set it too (`OVERRIDE_FIELDS` must carry the key, or the setting
+	// is accepted and then silently dropped).
+	assert.ok(OVERRIDE_FIELDS.includes("requiredExtensions"));
 });
 
 test("agent: defaults match the documented conventions", () => {

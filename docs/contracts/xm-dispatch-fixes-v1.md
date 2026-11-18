@@ -75,3 +75,42 @@
 3. 有 assistant 消息 ⇒ 不 aborted；read-back 计数 == 真实行数；wait 超时文案非 abort（三条各一测试）；快照不刷新 ⇒ 红。
 4. `scout + host` 默认被拒；`allowRoles` 放行；`centurion + host` 正常。
 5. `npm run typecheck` + `npm test` + `npm run test:integration` 全绿。
+
+---
+
+## 修订 2（review 后，实现侧冻结补充）
+
+以下不改变 D1–D4 的判据，只补齐 review 指出「必须显式写死」的边界：
+
+### D3.4 失败读回的判词（改写范围）
+
+- 读回失败时**任何非 `running` 的派生判词**一律改写为 `unknown`，reason 为
+  `transcript not retrieved from host '<host>': <detail>: the child's work cannot be graded from here`。
+  - 只改写 `aborted` 不够：磁盘上留着**上一轮完整的** mirror 时，`deriveOutcome` 会给出
+    `success`，那会把上一轮产出当这一轮交付。
+  - `running` 不改写：活着的 child 已经在说真话，且 `shouldRecycleAfterCollect("running")` 为假。
+  - `output` 在失败读回时强制为空（同上理由）。
+  - 「进程已死 + 末轮完整」的快路径在读回失败时**禁用**。
+- 失败结果必须带 `remotePath`（target 解析成功即必须能算出来）；渲染附
+  `hc exec --on <host> -- cat <path>`。
+- `lines === 0` 且本地 mirror 已有字节 ⇒ 判**失败**（`fate: path`）：既不清空旧字节，也不把
+  陈旧镜像标成 `0 of 0 (complete)`。
+
+### D3.5 刷新时序的可证性
+
+读回 seam 的测试必须**按阶段**（`waitSettled` 是否已被调用）作答，不得按调用序号作答——后者
+只能证明「读了 ≥2 次」，无法区分「wait 后再读」与「wait 前多读一次」。
+
+### D2.5 `requiredExtensions` 的匹配面
+
+必需声明接受三种写法：包名、绝对路径、包内相对路径（`extensions/x/index.ts`）。
+第三种必须显式比对，否则 `matchesExcludedExtension` 的两条分支都看不见它，必需项会被静默降级
+成 skip（fail-open）。
+
+### D4.5 `allowRoles` 的传递与守卫
+
+- 同步（`resolveHostTarget`）与异步（`resolveHostTargetAsync`）两个解析器都必须 stamp；
+  只 stamp 一个会让真实派发静默退回默认白名单。
+- 未配置时字段**不出现**在 `HostTarget` 上（未配置的 target 逐字保持旧形状）。
+- 守卫在 `utilityDispatch` 拒绝之后（`vexillatio` 文案不变），只拦 `previous === undefined`；
+  「已有记录的同名 launch 会重新 spawn」是已知且刻意保留的语义。
