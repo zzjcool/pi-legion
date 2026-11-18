@@ -506,12 +506,16 @@ test("D6: an unmappable argv path that is NOT an extension is still refused by n
 	}
 });
 
-test("M3/v1.2: an inherited-style extension that cannot be mapped now REFUSES the launch (no silent drop)", async () => {
+test("D14: an extension the CARD declares is REQUIRED — it still REFUSES the launch (no silent drop)", async () => {
 	// v1.1 dropped unmappable extensions with a stderr notice. That is how a
 	// remote child lost its provider extension, started anyway, printed "no
 	// models" and hung — the "half-dead child" the operator reported. v1.2 asks
 	// the target for its installed packages (by name) and refuses when the package
 	// is not there, naming the package and the three fixes. No terminal is created.
+	//
+	// D14 narrows the refusal by PROVENANCE and leaves this case alone: this value
+	// is in `agent.extensions`, i.e. the role ASKED for it, so dropping it would
+	// change what was requested instead of degrading an ambient capability.
 	const h = harness(localEnv());
 	try {
 		const args = spawnInput(h.root, {
@@ -527,6 +531,75 @@ test("M3/v1.2: an inherited-style extension that cannot be mapped now REFUSES th
 		assert.equal(h.client.paramsFor("terminal.run").length, 0, "no terminal may be created");
 	} finally {
 		h.cleanup();
+	}
+});
+
+test("D14: the INHERITED twin of that extension is dropped with ONE warning and the launch proceeds", async () => {
+	// Same path, same target, same missing package as the card case above — the ONLY
+	// difference is provenance: this value comes from this machine's installed set
+	// (`pi list`), not from the card. The real demo's operator wanted exactly this:
+	// "I just want to dispatch a scout" without studying five extensions first.
+	//
+	// The inherited set is read from the process-wide discovery holder (`pi list`
+	// is never run here) and from `PI_LEGION_CHILD_INHERIT_EXTENSIONS`, which this
+	// file turns OFF for every other case.
+	const parentRoot = mkdtempSync(path.join(tmpdir(), "cross-machine-d14-parent-"));
+	const pkgDir = path.join(parentRoot, "node_modules", "pi-sysmon");
+	mkdirSync(path.join(pkgDir, "extensions"), { recursive: true });
+	const entry = path.join(pkgDir, "extensions", "index.ts");
+	writeFileSync(entry, "export function registerProvider() {}");
+	writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "pi-sysmon", pi: { extensions: ["./extensions/index.ts"] } }));
+	const holder = (globalThis as unknown as Record<symbol, { discovered?: string[] } | undefined>)[
+		Symbol.for("pi-legion.extension-discovery")
+	];
+	assert.ok(holder, "the discovery cache lives on the shared holder");
+	const previousInherit = process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+	holder.discovered = [entry];
+	process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = "1";
+	const h = harness(localEnv());
+	try {
+		const input = spawnInput(h.root, {
+			host: "vps",
+			// The target's package list answers, and it does NOT contain pi-sysmon.
+			hostTarget: hostTarget({
+				packageIndex: { packages: [{ name: "pi-other", dir: "/srv/pi/npm/node_modules/pi-other" }], entries: [] },
+			}),
+		});
+		const handle = await h.supervisor.spawnChild(input);
+
+		// 1) The launch happened: one terminal, and the dropped path is nowhere in it.
+		const params = h.client.paramsFor("terminal.run");
+		assert.equal(params.length, 1, "the launch must proceed — this is the whole point of D14");
+		const argv = params[0]!.argv as string[];
+		assert.ok(!argv.some((arg) => arg.includes("pi-sysmon")), `the dropped extension must leave no trace: ${argv.join(" ")}`);
+		// No DANGLING pair: every `--extension` still owns a value (pi refuses a flag
+		// whose value is missing or is the next flag).
+		for (let index = 0; index < argv.length; index++) {
+			if (argv[index] !== "--extension" && argv[index] !== "-e") continue;
+			const value = argv[index + 1];
+			assert.ok(typeof value === "string" && !value.startsWith("--"), `dangling ${argv[index]} at ${index}: ${argv.join(" ")}`);
+		}
+		// The child guard is still there: it is required, never skippable.
+		assert.ok(
+			argv.includes(path.posix.join(REMOTE_LEGION_ROOT, "index.ts")),
+			`the child guard must survive the skip: ${argv.join(" ")}`,
+		);
+
+		// 2) The caller is told, ONCE, in the channel that reaches its tool result.
+		const warning = handle.warning;
+		assert.ok(typeof warning === "string" && warning.length > 0, "a dropped extension must be reported, never silent");
+		assert.doesNotMatch(warning, /\n/, "`index.ts` renders it inline after `⚠ <name>: `: one line");
+		assert.match(warning, /host 'vps'|on 'vps'|on vps/);
+		assert.match(warning, /pi-sysmon/);
+		assert.match(warning, /hc exec --on vps -- pi install npm:pi-sysmon/);
+		assert.match(warning, /"excludeExtensions":\["pi-sysmon"\]/);
+		assert.match(warning, /The role's own extensions: are never skipped/);
+	} finally {
+		holder.discovered = undefined;
+		if (previousInherit === undefined) delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+		else process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = previousInherit;
+		h.cleanup();
+		rmSync(parentRoot, { recursive: true, force: true });
 	}
 });
 

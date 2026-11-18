@@ -851,7 +851,7 @@ async function probeInheritedExtensions(input: {
 					: `not installed on ${target.host}`;
 				return `${name} (${why}) for role '${info.role}'`;
 			})
-			.join(", ")}${more > 0 ? ` and ${more} more` : ""}`,
+			.join(", ")}${more > 0 ? ` and ${more} more` : ""} — the launch will skip ${entries.length === 1 ? "it" : "them"} with a warning and continue; an extension the role card declares itself in extensions: is refused instead`,
 		fixes,
 	};
 }

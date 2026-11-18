@@ -233,7 +233,45 @@ function packagePathError(
 	);
 }
 
-/** Map a whole argv, including `-e/--extension` pairs (one rule, no drops). */
+/**
+ * One `--extension` a cross-machine launch DROPPED instead of refusing (D14).
+ *
+ * Provenance is not recoverable from argv: `collectChildExtensions` merges the
+ * inherited set, the card's own list, the env extras and the builtins into one
+ * `string[]` and dedupes it. So the LAUNCH decides which values may be skipped
+ * (it still holds `input.agent`) and this record is the report it gets back —
+ * never a decision.
+ */
+export interface SkippedExtension {
+	/** The parent-absolute `--extension` value that was removed from argv. */
+	file: string;
+	/** The npm package `file` belongs to, when this machine could name one. */
+	package?: string;
+	/**
+	 * Why the value could not be mapped: the resolver's own reason, or `no-index`
+	 * when the target's package list never arrived (`opts.packages === undefined`).
+	 */
+	reason: "not-installed" | "entry-missing" | "no-package" | "no-index";
+	/** The role this launch is starting, when the caller knows it (D4). */
+	role?: string;
+}
+
+/**
+ * Map a whole argv, including `-e/--extension` pairs.
+ *
+ * Without `skippable` this is the byte-for-byte v1.2 behaviour: every element
+ * maps or the launch is refused, and an unserializable `"-e"`/`"--extension"`
+ * pair is refused like any other path. That default is deliberate and pinned by
+ * a test — widening it would resurrect the silent drop this branch removed.
+ *
+ * With `skippable` (D14) the caller states, per value, whether losing that
+ * extension may DEGRADE the launch instead of ending it. Only an `-e`/
+ * `--extension` element followed by an ABSOLUTE path is eligible: a builtin ref
+ * (`builtin:codemode`) is never dropped and never mapped. When the value is
+ * skippable and its mapping would be refused, BOTH argv elements are removed —
+ * a lone `--extension`/`--extension <next flag>` is a dangling pair pi cannot
+ * parse — and `{file, package?, reason, role?}` is appended to `skipped`.
+ */
 export function mapRemoteArgv(
 	args: readonly string[],
 	opts: {
@@ -243,11 +281,57 @@ export function mapRemoteArgv(
 		localCwd: string;
 		pathMap?: readonly HostPathMapEntry[];
 		packages?: HostPackageIndex;
-		/** The role being launched; only the D4 refusal reads it. */
+		/** The role being launched; the D4 refusal reads it. */
 		role?: string;
+		/** May this `--extension` value be dropped instead of refusing (D14)? */
+		skippable?: (file: string) => boolean;
+		/** Collects every dropped value, in argv order. */
+		skipped?: SkippedExtension[];
 	},
 ): string[] {
-	return args.map((arg) => mapRemoteArgPath({ arg, ...opts }));
+	const { skippable, skipped } = opts;
+	// No policy supplied ⇒ the pre-D14 sweep, unchanged: `args.map(...)`.
+	if (skippable === undefined) return args.map((arg) => mapRemoteArgPath({ arg, ...opts }));
+	const out: string[] = [];
+	const skip = (file: string): void => {
+		if (skipped === undefined) return;
+		// The refusal already knows which package and why; recomputing the same
+		// resolution here is what keeps `mapRemoteArgPath` a pure "map or refuse"
+		// with no policy inside it (D14 §1).
+		const resolution = opts.packages === undefined ? undefined : resolvePackagePathOnHost(file, opts.packages);
+		const refused = resolution !== undefined && !resolution.ok ? resolution : undefined;
+		// `no-index`: the probe did not answer, so NOTHING can be said about the
+		// package there — a failed probe must not resurrect the dead stop (D14).
+		// `no-package`: the index answered, but this file is inside no npm package
+		// (only reachable for an extension that does not come from `pi list`).
+		const reason: SkippedExtension["reason"] = resolution === undefined
+			? "no-index"
+			: refused !== undefined ? refused.reason : "no-package";
+		const name = refused?.packageName ?? localPackageForFile(file)?.name;
+		skipped.push({
+			file,
+			...(name !== undefined ? { package: name } : {}),
+			reason,
+			...(typeof opts.role === "string" && opts.role.trim().length > 0 ? { role: opts.role.trim() } : {}),
+		});
+	};
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i]!;
+		const value = arg === "-e" || arg === "--extension" ? args[i + 1] : undefined;
+		if (value === undefined || !path.isAbsolute(value) || skippable(value) !== true) {
+			out.push(mapRemoteArgPath({ arg, ...opts }));
+			continue;
+		}
+		// The pair is skippable: map it, and drop BOTH elements if that is refused.
+		try {
+			out.push(arg, mapRemoteArgPath({ arg: value, ...opts }));
+		} catch (error) {
+			if (!(error instanceof SubagentError)) throw error;
+			skip(value);
+		}
+		i += 1;
+	}
+	return out;
 }
 
 /**

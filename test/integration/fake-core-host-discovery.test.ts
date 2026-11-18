@@ -530,7 +530,7 @@ test("v1.2/D13: a target package that declares a DIRECTORY is mapped through it 
 	assert.deepEqual(mapped, ["--no-extensions", "-e", remoteEntry]);
 });
 
-test("v1.2: an extension the target does not have is refused before any terminal, naming package and fixes", async (t) => {
+test("v1.2/D14: a CARD-declared extension the target does not have is refused before any terminal, naming package and fixes", async (t) => {
 	const h = harness(t);
 	clearHostDiscoveryCache();
 	const target = await resolveHostTargetAsync(HOST, { enabled: true }, {
@@ -544,16 +544,11 @@ test("v1.2: an extension the target does not have is refused before any terminal
 	mkdirSync(path.dirname(parentEntry), { recursive: true });
 	writeFileSync(parentEntry, "export const x = 1;\n");
 	writeFileSync(path.join(parentRoot, "package.json"), JSON.stringify({ name: "pi-not-installed" }));
-	const failure = await rejected(async () => mapRemoteArgv(["-e", parentEntry], {
-		host: HOST,
-		remoteCwd: h.remoteCwd,
-		remoteDir: path.posix.join(h.remoteRoot, ".mirror", "run", "child"),
-		localCwd: h.remoteRoot,
-		pathMap: target.pathMap,
-		...(target.packageIndex ? { packages: target.packageIndex } : {}),
-		// D4: the launch path knows the role, so the refusal can name the key for it.
-		role: "centurion",
-	}));
+	// D14's REQUIRED half, through the backend: the value is in `agent.extensions`,
+	// i.e. the role asked for it, so the launch must stop instead of degrading.
+	const failure = await rejected(() => h.supervisor.spawnChild(spawnInput(h, target, {
+		agent: { ...agent(), extensions: [parentEntry] },
+	})));
 	const message = String((failure as Error)?.message ?? failure);
 	assert.match(message, /package 'pi-not-installed', which is not installed on that machine/);
 	// D4's two ways out, with the real host and the real role — the snippet is the
@@ -566,6 +561,64 @@ test("v1.2: an extension the target does not have is refused before any terminal
 	assert.deepEqual(parsed.subagents.agentOverrides.centurion?.excludeExtensions, ["pi-not-installed"]);
 	// Nothing was started: argv mapping runs before `terminal.run`.
 	assert.deepEqual(h.wireFor("terminal.run"), []);
+});
+
+test("D14: the INHERITED twin of that extension is dropped — the launch reaches the wire and the handle warns", async (t) => {
+	// Same machine, same missing package, same role. The ONLY difference from the
+	// case above is PROVENANCE: this path comes from this machine's installed set
+	// (`pi list`), not from the card, so losing it degrades the child instead of
+	// changing what was requested. That is the real demo's first-attempt failure:
+	// one inherited package the target lacked refused the whole dispatch.
+	const h = harness(t);
+	clearHostDiscoveryCache();
+	const target = await resolveHostTargetAsync(HOST, { enabled: true }, {
+		client: h.client,
+		cwd: h.remoteCwd,
+		admission: "always",
+		cacheDir: null,
+	});
+	const parentRoot = path.join(h.root, "parent", "node_modules", "pi-not-installed");
+	const parentEntry = path.join(parentRoot, "src", "index.ts");
+	mkdirSync(path.dirname(parentEntry), { recursive: true });
+	writeFileSync(parentEntry, "export const x = 1;\n");
+	writeFileSync(path.join(parentRoot, "package.json"), JSON.stringify({ name: "pi-not-installed" }));
+
+	// The inherited set is the process-wide discovery holder: warm it directly so
+	// no `pi list` runs here, and turn inheritance on for this case only (the file
+	// turns it off for every other one).
+	const holder = (globalThis as unknown as Record<symbol, { discovered?: string[] } | undefined>)[
+		Symbol.for("pi-legion.extension-discovery")
+	];
+	assert.ok(holder, "the discovery cache lives on the shared holder");
+	const previousInherit = process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+	holder.discovered = [parentEntry];
+	process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = "1";
+	try {
+		const handle = await h.supervisor.spawnChild(spawnInput(h, target));
+		// 1) The launch proceeded — this is what D14 buys.
+		const run = h.wireFor("terminal.run").at(-1);
+		assert.ok(run, "the launch must reach terminal.run instead of being refused");
+		const argv = run.argv as string[];
+		assert.ok(!argv.some((arg) => arg.includes("pi-not-installed")), `the dropped extension must leave no trace: ${argv.join(" ")}`);
+		// No dangling pair: pi refuses `--extension` with no value.
+		for (let index = 0; index < argv.length; index++) {
+			if (argv[index] !== "--extension" && argv[index] !== "-e") continue;
+			const value = argv[index + 1];
+			assert.ok(typeof value === "string" && !value.startsWith("--"), `dangling ${argv[index]}: ${argv.join(" ")}`);
+		}
+
+		// 2) The caller gets ONE line, through the field `index.ts` renders.
+		const warning = handle.warning;
+		assert.ok(typeof warning === "string", `expected a warning, got handle: ${JSON.stringify(handle)}`);
+		assert.doesNotMatch(warning, /\n/, "one line");
+		assert.match(warning, /cross-machine on 'fakebox'/);
+		assert.match(warning, /pi-not-installed \(not installed on fakebox\)/);
+		assert.match(warning, /hc exec --on fakebox -- pi install npm:pi-not-installed/);
+	} finally {
+		holder.discovered = undefined;
+		if (previousInherit === undefined) delete process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS;
+		else process.env.PI_LEGION_CHILD_INHERIT_EXTENSIONS = previousInherit;
+	}
 });
 
 // ── 4. self-healing cache ─────────────────────────────────────────────────

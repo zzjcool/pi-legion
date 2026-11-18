@@ -17,7 +17,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatChildTask } from "../extension/child-guard.ts";
-import { buildPiArgs } from "../runs/args.ts";
+import { buildPiArgs, childGuardExtensionPath, extensionDedupeKey } from "../runs/args.ts";
 import { ensureHostExtensions } from "../runs/extension-inheritance.ts";
 import { TEMP_OWNER_FILE, writeOwnerFile } from "../runs/owner.ts";
 import {
@@ -39,6 +39,7 @@ import {
 	terminalAddress,
 	type HostTarget,
 	type RemoteChildFate,
+	type SkippedExtension,
 } from "../runs/remote.ts";
 import {
 	createRemoteChildWorktree,
@@ -130,6 +131,109 @@ export function terminalHostAvailable(env: NodeJS.ProcessEnv = process.env): boo
 	const id = env[HC_TERMINAL_ID_ENV];
 	return typeof socket === "string" && socket.trim().length > 0 &&
 		typeof id === "string" && id.trim().length > 0;
+}
+
+/**
+ * Caps for the ONE skip warning, taken from the checkup so doctor and launch
+ * print the same numbers (D7's bounds: 8 listed packages, 5 commands).
+ */
+const MAX_WARN_PACKAGES = 8;
+const MAX_WARN_INSTALLS = 5;
+const MAX_WARN_JSON = 20;
+
+/**
+ * The single line a cross-machine launch reports when it DROPPED settings it
+ * could not map instead of refusing the launch (D14).
+ *
+ * Why one line and not a refusal: an inherited extension is ambient capability
+ * this machine happens to have installed, and every one of them used to be a
+ * hard stop — the operator's words were "I just want to dispatch a scout — why
+ * do I have to study 5 extensions first?". The extension the ROLE asked for is
+ * still a refusal (`packagePathError`, D4); everything it merely inherited is
+ * best-effort, and this is what "best-effort" reports.
+ *
+ * It goes through `ChildHandle.warning` → `index.ts` renders it inline after
+ * `⚠ <name>: `, so: no newlines, and self-sufficient — host, packages, the
+ * pasteable install command, the `excludeExtensions` JSON and the file that
+ * JSON belongs in. The closing sentence is the boundary: it says out loud that
+ * a card-declared extension (and the child guard) is never skipped, so nobody
+ * reads "inherited is best-effort" as "nothing is required".
+ */
+export function skippedExtensionWarning(input: {
+	/** The machine this launch targets. */
+	host: string;
+	/** The role being launched; it keys the `excludeExtensions` JSON (D4). */
+	role?: string;
+	/** This session's directory: the PROJECT settings file the JSON goes in. */
+	cwd: string;
+	/** What `mapRemoteArgv` actually dropped, in argv order. */
+	skipped: readonly SkippedExtension[];
+}): string | undefined {
+	if (input.skipped.length === 0) return undefined;
+	const host = input.host;
+	const role = typeof input.role === "string" ? input.role.trim() : "";
+	// Three buckets, because they send the reader to different fixes.
+	const missing = new Map<string, SkippedExtension>();
+	const unchecked: string[] = [];
+	const unnamed: string[] = [];
+	for (const entry of input.skipped) {
+		// The package name when this machine could name one, else the file — the
+		// reader has to recognize what was lost either way.
+		const label = entry.package ?? path.basename(entry.file);
+		if (entry.reason === "no-index") {
+			if (!unchecked.includes(label)) unchecked.push(label);
+			continue;
+		}
+		if (entry.reason === "no-package") {
+			if (!unnamed.includes(label)) unnamed.push(label);
+			continue;
+		}
+		if (!missing.has(label)) missing.set(label, entry);
+	}
+	const entries = [...missing.entries()];
+	const shown = entries.slice(0, MAX_WARN_PACKAGES);
+	const more = entries.length - shown.length;
+	const parts: string[] = [];
+	if (entries.length > 0) {
+		// D13's two causes are kept apart: `not-installed` is fixed by installing the
+		// package there, `entry-missing` by installing a build whose manifest
+		// declares the entry this machine uses.
+		const why = shown
+			.map(([name, info]) => info.reason === "entry-missing"
+				? `${name} (installed on ${host}, but it does not declare the entry this machine uses)`
+				: `${name} (not installed on ${host})`)
+			.join(", ");
+		parts.push(
+			`cross-machine on '${host}': ${entries.length} inherited extension(s) cannot be loaded there, so this launch dropped them and continues: ${why}${more > 0 ? ` and ${more} more` : ""}`,
+		);
+	}
+	if (unchecked.length > 0) {
+		parts.push(
+			`${unchecked.join(", ")} could not be checked at all — the installed-package probe on ${host} did not answer (re-run /legion doctor crossmachine to retry it)`,
+		);
+	}
+	if (unnamed.length > 0) {
+		parts.push(
+			`${unnamed.join(", ")} is not inside an npm package this machine can name, so it cannot be re-rooted by package name on ${host}`,
+		);
+	}
+	const where = `~/.pi/agent/settings.json (user) or ${input.cwd}/.pi/settings.json (project)`;
+	if (entries.length > 0) {
+		const installs = entries
+			.slice(0, MAX_WARN_INSTALLS)
+			.map(([name]) => `hc exec --on ${host} -- pi install npm:${name}`)
+			.join("; ");
+		const names = entries.slice(0, MAX_WARN_JSON).map(([name]) => name);
+		const json = JSON.stringify({ subagents: { agentOverrides: { [role.length > 0 ? role : "<role>"]: { excludeExtensions: names } } } });
+		parts.push(
+			`Two ways out: 1) install them there — ${installs}; 2) keep them on this machine only${role.length > 0 ? ` for role '${role}'` : " for the role you launch"}: subagents.agentOverrides.${role.length > 0 ? role : "<role>"}.excludeExtensions — ${json} (in ${where})`,
+		);
+	}
+	// The boundary, stated once: D14 relaxed INHERITANCE only.
+	parts.push(
+		`The role's own extensions: are never skipped — an extension the role card declares, and this package's child guard, still refuse the launch when it is missing on ${host}`,
+	);
+	return parts.join(". ") + ".";
 }
 
 /**
@@ -508,6 +612,11 @@ export class TerminalSupervisor implements LegionSupervisor {
 		let tempDir: string | undefined;
 		let remoteDir: string | undefined;
 		let argv: string[];
+		// D14: filled by `mapRemoteArgv` in argv order and rendered ONCE, after the
+		// launch is accepted — the warning describes this spawn, so it is neither
+		// persisted nor retried (a second refusal for the same package would only
+		// repeat the same line).
+		const skippedExtensions: SkippedExtension[] = [];
 		try {
 			// The system prompt is passed by file (0600), exactly like rpc. The task
 			// is NOT written to a file: an hc terminal accepts a positional message,
@@ -645,11 +754,27 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// mapped simply cannot be loaded over there, so it is dropped WITH a
 				// notice (never silently), while any other unmappable argv path keeps the
 				// hard refusal below.
-				// v1.2: NO drops. Every absolute argv element either maps (checkout /
+				// v1.2: NO silent drops. Every absolute argv element either maps (checkout /
 				// pathMap / same package on that machine) or the launch is refused with
 				// the package, the parent path and the candidates. A child that quietly
 				// lost the provider extension starts, prints no models, and hangs — the
 				// worst of the three answers.
+				//
+				// D14 narrows that rule by PROVENANCE, which argv no longer carries
+				// (`collectChildExtensions` merged four sources into one deduped list):
+				//
+				//   - an extension the ROLE CARD declares (`extensions` /
+				//     `subagentOnlyExtensions`, already team-merged and overridden) is
+				//     what the launch was ASKED for — still a hard refusal (D4);
+				//   - the child guard is unconditional, so it is required too;
+				//   - everything else arrived by INHERITANCE from this machine's
+				//     installed set, which the target may simply not have — dropping it
+				//     degrades the child, it does not break the dispatch. That is the
+				//     drop the real demo needed ("I just want to dispatch a scout").
+				const required = new Set(
+					[...(input.agent.extensions ?? []), ...(input.agent.subagentOnlyExtensions ?? []), childGuardExtensionPath()]
+						.map(extensionDedupeKey),
+				);
 				const mappedArgs = mapRemoteArgv(built.args, {
 					host: target.host,
 					// A remote worktree child reads ITS tree, not the bare checkout: the
@@ -665,6 +790,10 @@ export class TerminalSupervisor implements LegionSupervisor {
 					// is the authority on that name (`input.agent.name`, the same value the
 					// child label carries).
 					role: input.agent.name,
+					// Only the NOT-required values may be dropped, and `mapRemoteArgv` decides
+					// nothing on its own: an absent `skippable` is still the v1.2 refusal.
+					skippable: (file) => !required.has(extensionDedupeKey(file)),
+					skipped: skippedExtensions,
 				});
 				// S5.6: `--no-extensions` is right (a child must not inherit the parent's
 				// plugin set) but on a machine whose MODELS come from an extension it also
@@ -672,6 +801,11 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// for a `pi` that works by hand there. The operator names the host-local
 				// set; each entry is appended AFTER the switch and is already a path on
 				// that machine, so it does not go through `mapRemoteArgPath`.
+				//
+				// These lines are unaffected by a D14 skip: `piExtensions` ARE the target's
+				// own provider set (`hosts.<host>.piExtensions`), so dropping an inherited
+				// provider package can never leave the child without the provider the
+				// operator configured FOR that machine — the reason they exist at all.
 				const hostExtensions = target.piExtensions.flatMap((entry) => ["--extension", entry]);
 				argv = [target.node, target.piCli, ...mappedArgs, ...hostExtensions, task];
 			} else {
@@ -686,6 +820,19 @@ export class TerminalSupervisor implements LegionSupervisor {
 			await rollbackRemoteDir();
 			throw error;
 		}
+
+		// D14: what the mapper dropped, as ONE self-sufficient line. Computed here
+		// (not inside the argv block) because it belongs to the accepted launch: a
+		// refused launch throws above and never has anything to warn about.
+		const extensionWarning = target === undefined
+			? undefined
+			: skippedExtensionWarning({
+				host: target.host,
+				role: input.agent.name,
+				// The PARENT's directory: a settings file here is read on this machine.
+				cwd: input.cwd,
+				skipped: skippedExtensions,
+			});
 
 		// S5.6: the child's own argv, minus its task, asked whether it can see its
 		// MODEL (`--list-models`). A remote `pi` whose model provider was disabled by
@@ -883,6 +1030,10 @@ export class TerminalSupervisor implements LegionSupervisor {
 			...(remoteDir ? { remoteDir } : {}),
 			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
 			...(startupUnconfirmed ? { startupUnconfirmed: true } : {}),
+			// D14: NON-FATAL and not persisted — it describes THIS spawn. `index.ts`
+			// renders it as `  ⚠ <name>: <warning>`, which is the only channel that
+			// reaches the caller's tool result.
+			...(extensionWarning !== undefined ? { warning: extensionWarning } : {}),
 		};
 	}
 

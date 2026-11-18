@@ -571,7 +571,12 @@ test("D4: a package missing on the target FAILs with the role and a pasteable ex
 		// The line names the package, WHY it does not resolve, and the role whose set
 		// contained it (D4). D13 put the reason in the parentheses so the two causes
 		// send the reader to different fixes; the role moved after them, unchanged.
-		assert.match(inherited.line, /^1 package\(s\) missing on fakebox: pi-sysmon \(not installed on fakebox\) for role 'centurion'$/);
+		// D14 appends the launch's own policy: an INHERITED package is skipped with a
+		// warning (doctor and launch must tell one story), a card-declared one is not.
+		assert.match(
+			inherited.line,
+			/^1 package\(s\) missing on fakebox: pi-sysmon \(not installed on fakebox\) for role 'centurion' — the launch will skip it with a warning and continue; an extension the role card declares itself in extensions: is refused instead$/,
+		);
 		// The install action, then the settings key as pasteable JSON (pitfall #2).
 		assert.equal(inherited.fixes?.[0], "hc exec --on fakebox -- pi install npm:pi-sysmon");
 		const json = inherited.fixes?.map((fix) => {
@@ -654,7 +659,7 @@ test("D13: a target whose declaration does NOT cover the entry FAILs and names i
 		// because the fix is a layout/version change, not an install.
 		assert.match(
 			inherited.line,
-			/^1 package\(s\) missing on fakebox: pi-sysmon \(entry 'extensions\/pi-sysmon\/index\.ts' not declared on fakebox\) for role 'centurion'$/,
+			/^1 package\(s\) missing on fakebox: pi-sysmon \(entry 'extensions\/pi-sysmon\/index\.ts' not declared on fakebox\) for role 'centurion' — the launch will skip it with a warning and continue; an extension the role card declares itself in extensions: is refused instead$/,
 		);
 		// The merged D4 snippet still applies (excluding the package by name is one
 		// way out), and the caps/JSON shape are untouched.
