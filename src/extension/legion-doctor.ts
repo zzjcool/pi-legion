@@ -1221,6 +1221,13 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 			steps.push(`# set role frontmatter extensions: […], or export ${CHILD_EXTENSIONS_ENV}=<paths>`);
 		}
 		steps.push(...roleToolGateNextSteps(issues));
+		// The crossmachine section reports an error per unresolvable host, so the
+		// generic "no blocking fixes" fallback would contradict its own Issues list.
+		if (issues.some((i) => i.code === "CROSSMACHINE_UNRESOLVED")) {
+			steps.push(
+				"Cross-machine: fix the named `subagents.crossMachine.hosts.<host>` entry (an absolute `cwd` on that machine, `enabled: true`), then re-run `/legion doctor crossmachine`.",
+			);
+		}
 		if (issues.some((i) => i.code === "MEMORY_GATE_WOULD_REFUSE")) {
 			steps.push("Stop idle children (`/legion stop`) or lower/disable PI_LEGION_MIN_FREE_MEM_MB before launching more.");
 		}

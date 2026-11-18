@@ -1331,6 +1331,13 @@ test("D8: a declared host that cannot be resolved is an ERROR issue with the res
 		assert.match(issue.message, /host 'broken'/);
 		assert.match(String(issue.fix), /subagents\.crossMachine\.hosts\.broken/);
 		assert.equal(report.ok, false, "an error-level issue makes the report not-ok");
+		// …and the actionable list must not claim there is nothing to fix.
+		assert.match(
+			report.text,
+			/subagents\.crossMachine\.hosts\.<host>.*\/legion doctor crossmachine/s,
+			"an unresolvable host gets a next step, not the generic 'no blocking fixes'",
+		);
+		assert.doesNotMatch(report.text, /No blocking fixes/);
 		// The healthy host still renders in full: one broken entry does not hide the rest.
 		assert.match(block, /^- vps: resolved$/m);
 		// …and the launch line is built from the host that DOES resolve.
