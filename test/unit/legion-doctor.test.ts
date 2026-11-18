@@ -1318,7 +1318,7 @@ test("D8: a declared host that cannot be resolved is an ERROR issue with the res
 			},
 		});
 		const block = crossMachineBlock(report.text);
-		assert.match(block, /^- hosts: broken, vps$/m, "hosts are listed in a stable order");
+		assert.match(block, /^- hosts: vps, broken$/m, "hosts keep the CONFIGURED order, not an alphabetical one (review m4)");
 		const invalid = block.split("\n").find((line) => line.startsWith("- broken:"));
 		assert.ok(invalid, `expected a broken-host line, got:\n${block}`);
 		// `INVALID — <the resolver's sentence>`: verbatim, because that sentence
@@ -1383,14 +1383,15 @@ test("D8/D9: last preflight renders never/ok/failed and the minimal launch is pa
 			assert.ok(line, `expected a launch line in:\n${block}`);
 			assert.ok(line.startsWith("    "), "the launch line is indented as one copyable command");
 			assert.match(line, /host: "vps",/, "the host is the configured one, never a placeholder");
-			assert.ok(!line.includes("<host>") && !/<host>/.test(line), "no `<host>` placeholder may survive");
-			assert.ok(!/host:\s*"/.test(line) || !/host: "<"/.test(line), "the host value is not an empty template");
+			// Review m6: the old assertion here was `!A || !B`, which no line could fail.
+			// What actually matters is that NOTHING on the line is left as a placeholder.
+			assert.ok(!/[<>]/.test(line), `the launch line carries no <placeholder>: ${line}`);
 			assert.match(line, /agent: "centurion"/);
 			assert.match(
 				line,
 				/phases: \[\{ id: "planning", next: \[\{ to: "implementing" \}\] \}, \{ id: "implementing", next: \[\{ to: "done" \}\] \}, \{ id: "done", terminal: true \}\]/,
 			);
-			assert.match(line, /task: "<one-line goal>"/, "the goal is the caller's to fill in");
+			assert.match(line, /task: "demo: report pwd and stop"/, "the task is a real runnable goal, not a placeholder (review m4)");
 		}
 
 		// The pasted phases are a LEGAL machine — D2's terminal-without-`next` shape —
@@ -1486,6 +1487,68 @@ test("D8: without injection doctor reads subagents.crossMachine from settings �
 		if (prevPath === undefined) delete process.env.PATH;
 		else process.env.PATH = prevPath;
 		rmSync(dir, { recursive: true, force: true });
+		resetDeliveryPreflightState();
+	}
+});
+
+test("D8/m4: `enabled: false` resolves NO host — every declared host is INVALID and there is nothing to paste", () => {
+	try {
+		const report = runLegionDoctor({
+			agentDir: XM_AGENT_DIR,
+			probeModels: false,
+			sections: ["crossmachine"],
+			// The switch is off: every host below is a declaration without a meaning,
+			// and doctor's job is to say so once per host — not to hide the config and
+			// not to offer a launch that cannot run.
+			crossMachine: { enabled: false, hosts: { ...XM_HOSTS } },
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+		});
+		const block = crossMachineBlock(report.text);
+		assert.match(block, /^- enabled: false$/m);
+		assert.match(block, /^- hosts: vps$/m, "the declared host is still listed: doctor reports the config it was given");
+		assert.match(
+			block,
+			/^- vps: INVALID — host 'vps' needs subagents\.crossMachine\.enabled = true$/m,
+			"the resolver's own sentence, verbatim",
+		);
+		assert.doesNotMatch(block, /^- vps: resolved$/m);
+		assert.doesNotMatch(block, /subagent\(\{/, "a launch line for a disabled feature would be a lie");
+		assert.match(block, /^- minimal launch: \(nothing to paste yet/m);
+		const issue = report.issues.find((i) => i.code === "CROSSMACHINE_UNRESOLVED");
+		assert.ok(issue, "an unresolvable host must produce an issue whatever the switch says");
+		assert.equal(issue.severity, "error");
+		assert.equal(issue.section, "crossmachine");
+		assert.equal(report.ok, false);
+	} finally {
+		resetDeliveryPreflightState();
+	}
+});
+
+test("D8/m4: a host with no configured extensions prints `extensions: 0`, with no `(none)` suffix", () => {
+	try {
+		const text = runLegionDoctor({
+			agentDir: XM_AGENT_DIR,
+			probeModels: false,
+			sections: ["crossmachine"],
+			crossMachine: { enabled: true, hosts: { bare: { cwd: "/srv/bare" } } },
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+		}).text;
+		const block = crossMachineBlock(text);
+		assert.match(block, /^- bare: resolved$/m);
+		// Contract D8's shape is `extensions: N (…)`: the parenthetical lists real paths,
+		// so it has no zero-extension reading. `(none)` invented a fourth shape for a fact
+		// the number already states.
+		assert.match(block, /^ {4}extensions: 0$/m);
+		assert.doesNotMatch(block, /extensions: 0 \(none\)/);
+	} finally {
 		resetDeliveryPreflightState();
 	}
 });

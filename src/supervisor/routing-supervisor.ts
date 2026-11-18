@@ -234,7 +234,12 @@ export class RoutingSupervisor implements LegionSupervisor {
 			throw new SubagentError(
 				`host '${input.host}' needs an hc terminal host: start pi inside an hc terminal (HC_TERMINAL_SOCKET + HC_TERMINAL_ID), or drop host`,
 				ErrorCodes.INVALID_PARAMS,
-				{ host: input.host },
+				// Review m5: same reason as the preflight's own hard failures — "this machine
+				// cannot be the hc terminal host" is a fact about the ENVIRONMENT, not about
+				// the model, and `canFallbackStart` reads this flag. Without it the launch walks
+				// the model fallback chain and re-asks the same unanswerable question per
+				// candidate, then reports the last candidate's failure as the cause.
+				{ host: input.host, noModelFallback: true },
 			);
 		}
 		return this.terminal.preflightRemoteDelivery(input);

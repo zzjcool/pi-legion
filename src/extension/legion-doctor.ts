@@ -506,15 +506,17 @@ function formatLastPreflight(
  *
  * Not a template with a blank in it: doctor knows the configured host names, so
  * it prints one of them, and the phase list is the minimal legal machine from D2
- * (`{ id: "done", terminal: true }` — a terminal phase omits `next`). The only
- * thing left for the caller is the goal, because that is the one fact doctor
- * cannot know. Deliberately ONE line so it can be copied out of the report
- * verbatim.
+ * (`{ id: "done", terminal: true }` — a terminal phase omits `next`). The `task`
+ * is a real, runnable goal too (review m4): a `<one-line goal>` placeholder made the
+ * line a sketch — pasting it ran nothing, or ran a literal placeholder. The operator
+ * edits the goal, which is the one fact doctor cannot know, but the line as printed
+ * is a command that does something. Deliberately ONE line so it can be copied out
+ * of the report verbatim, and it carries no `<`/`>` at all.
  */
 function crossMachineMinimalLaunch(host: string): string {
 	return "subagent({ agent: \"centurion\", "
 		+ `host: "${host}", `
-		+ "task: \"<one-line goal>\", "
+		+ "task: \"demo: report pwd and stop\", "
 		+ "phases: [{ id: \"planning\", next: [{ to: \"implementing\" }] }, "
 		+ "{ id: \"implementing\", next: [{ to: \"done\" }] }, "
 		+ "{ id: \"done\", terminal: true }] })";
@@ -1139,10 +1141,13 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		}
 		push("## Cross-machine (host targets)");
 		push(`- enabled: ${crossMachine?.enabled === true ? "true" : crossMachine?.enabled === false ? "false" : "unset"}`);
-		const hostNames = Object.keys(crossMachine?.hosts ?? {}).sort();
+		const hostNames = Object.keys(crossMachine?.hosts ?? {});
 		push(`- hosts: ${hostNames.length ? hostNames.join(", ") : "none configured"}`);
-		// One loop keeps the report in the configured order and lets the resolved
-		// set accumulate for the minimal launch below.
+		// One loop keeps the report in the configured order — no \`.sort()\`: the settings
+		// file's own order is what \`subagents.crossMachine.hosts\` means to its author
+		// (review m4; the comment below already promised it), and re-alphabetising a
+		// human's list in a read-only report is an edit they did not ask for. Resolved
+		// hosts accumulate here for the minimal launch below.
 		const resolvable: Array<{ host: string; target: HostTarget }> = [];
 		for (const hostName of hostNames) {
 			try {
@@ -1153,7 +1158,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 				push(`    node: ${target.node}`);
 				push(`    piCli: ${target.piCli}`);
 				push(`    legionRoot: ${target.piLegionRoot}`);
-				push(`    extensions: ${target.piExtensions.length}${target.piExtensions.length ? ` (${target.piExtensions.join(", ")})` : " (none)"}`);
+				push(`    extensions: ${target.piExtensions.length}${target.piExtensions.length ? ` (${target.piExtensions.join(", ")})` : ""}`);
 				push(`    worktreeRoot: ${target.worktreeRoot}`);
 			} catch (error) {
 				// The resolver's own sentence, verbatim: it names the exact settings key
