@@ -706,10 +706,12 @@ export interface Handle {
 	/** D4: 1-based queue position at enqueue time (always set when `queued === true`). */
 	queuePosition?: number;
 	/**
-	 * NON-FATAL model-resolution notice from the backend that spawned the child
-	 * (B5, in-process only — see `ChildHandle.warning`). Same meaning, one hop
-	 * closer to the caller, so `launchStep` can render it. Absent when the spawn
-	 * reported none; never persisted, since it describes THIS spawn.
+	 * NON-FATAL notice from the backend that spawned the child (B5, D14 — see
+	 * `ChildHandle.warning`). Same meaning, one hop closer to the caller, so
+	 * `launchStep` can render it. Carries both an in-process model-resolution
+	 * notice and the ONE line a cross-machine launch prints for the inherited
+	 * extensions it had to drop. Absent when the spawn reported none; never
+	 * persisted, since it describes THIS spawn.
 	 */
 	warning?: string;
 	/**

@@ -23,6 +23,7 @@ import {
 	type DeliveryPreflightReport,
 } from "../../src/runs/cross-machine-preflight.ts";
 import type { CrossMachineSettings } from "../../src/shared/types.ts";
+import type { CrossMachineCheckup } from "../../src/runs/cross-machine-checkup.ts";
 
 /** Every value that follows an `--extension` flag, in argv order. */
 function extensionsOf(args: string[]): string[] {
@@ -1555,6 +1556,158 @@ test("D8/m4: a host with no configured extensions prints `extensions: 0`, with n
 		// the number already states.
 		assert.match(block, /^ {4}extensions: 0$/m);
 		assert.doesNotMatch(block, /extensions: 0 \(none\)/);
+	} finally {
+		resetDeliveryPreflightState();
+	}
+});
+
+// ── the probed snapshot (contract `first-run-success-v1` D6/D7/D8) ──────────
+//
+// `legion-doctor.ts` renders what the async callers probed; it runs nothing
+// itself. These two cases pin both halves of that split: with a snapshot the
+// section is the checkup's PASS/FAIL/SKIP report (fixes included, `report.ok`
+// false when a FAIL exists), and WITHOUT one it is byte-for-byte the static
+// block the 32 tests above already pin.
+
+/** A hand-built snapshot: one PASS parent fact, one FAIL on the host. */
+function crossMachineSnapshot(): CrossMachineCheckup {
+	return {
+		enabled: true,
+		cwd: "/Users/me/app",
+		at: 1,
+		parent: [
+			{
+				id: "parent-checkout",
+				status: "pass",
+				line: "/Users/me/app is a git checkout; origin git@github.com:acme/app.git",
+			},
+			{ id: "hc-machines", status: "pass", line: "fakebox" },
+		],
+		hosts: [
+			{
+				host: "fakebox",
+				source: "settings",
+				items: [
+					{ id: "target-checkout", status: "pass", line: "/srv/app exists" },
+					{
+						id: "inherited-extensions",
+						status: "fail",
+						line: "1 package(s) missing on fakebox: pi-sysmon (role 'centurion')",
+						fixes: [
+							"hc exec --on fakebox -- pi install npm:pi-sysmon",
+							'{"subagents":{"agentOverrides":{"centurion":{"excludeExtensions":["pi-sysmon"]}}}}',
+						],
+					},
+					{ id: "target-models", status: "skip", line: "target models not checked: no directory on fakebox yet — the FAIL above says how to pass it" },
+				],
+				// The fixture has a FAIL, so the launch is the after-fixes variant — the
+				// same flag the checkup sets (`items.some(status === "fail")`).
+				launchAfterFixes: true,
+				launch: 'subagent({ agent: "centurion", host: "fakebox", cwd: "/srv/app", worktree: true, task: "demo: report pwd and stop", phases: [{ id: "done", terminal: true }] })',
+			},
+		],
+	};
+}
+
+test("D6/D8: a snapshot renders PASS/FAIL/SKIP with fixes and a launch, and a FAIL makes report.ok false", () => {
+	try {
+		const report = runLegionDoctor({
+			agentDir: XM_AGENT_DIR,
+			probeModels: false,
+			sections: ["crossmachine"],
+			crossMachine: { enabled: true, hosts: { fakebox: { cwd: "/srv/app" } } },
+			crossMachineCheckup: crossMachineSnapshot(),
+			env: {
+				...process.env,
+				PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+				PI_LEGION_CHILD_EXTENSIONS: undefined,
+			},
+		});
+		const block = crossMachineBlock(report.text);
+		// The configuration lines survive; the host line comes from the snapshot, so
+		// an `hc`-only host (invisible to the settings) can appear here too.
+		assert.match(block, /^- enabled: true$/m);
+		assert.match(block, /^- hosts: fakebox$/m);
+		// Parent facts, at the section's 2-space indent, in the checkup's order.
+		assert.match(block, /^ {2}- PASS parent checkout: \/Users\/me\/app is a git checkout; origin git@github\.com:acme\/app\.git$/m);
+		assert.match(block, /^ {2}- PASS hc machines: fakebox$/m);
+		// The host block: 2-space header, 4-space items.
+		assert.match(block, /^ {2}- fakebox:$/m);
+		assert.match(block, /^ {4}- PASS target checkout: \/srv\/app exists$/m);
+		assert.match(block, /^ {4}- FAIL inherited extensions: 1 package\(s\) missing on fakebox: pi-sysmon \(role 'centurion'\)$/m);
+		assert.match(block, /^ {4}- SKIP target models: target models not checked: no directory on fakebox yet/m);
+		// Fixes are pasteable, in order, under the FAIL they belong to.
+		assert.match(block, /^ {10}fix: hc exec --on fakebox -- pi install npm:pi-sysmon$/m);
+		assert.match(block, /^ {10}fix: \{"subagents":\{"agentOverrides":\{"centurion":\{"excludeExtensions":\["pi-sysmon"\]\}\}\}\}$/m);
+		// D8: the launch line is REAL values and is not a `<…>` template. A FAIL above
+		// it relabels the header, so "copy-paste" never promises a call the report
+		// just disproved.
+		const launchHeader = block.split("\n").find((line) => line.includes("launch (copy-paste once the FAILs above are fixed):"));
+		assert.ok(launchHeader, `expected the after-fixes launch header in:\n${block}`);
+		assert.doesNotMatch(block, /launch \(copy-paste, real values\):/, "an all-green block is the only one that says plain copy-paste");
+		const launchLine = block.split("\n").find((line) => line.trimStart().startsWith("subagent({"));
+		assert.ok(launchLine, `expected a launch line in:\n${block}`);
+		assert.ok(launchLine!.startsWith("        "), "the launch is indented as one copyable command");
+		assert.match(launchLine!, /host: "fakebox"/);
+		assert.ok(!/[<>]/.test(launchLine!), `the launch line carries no placeholder: ${launchLine}`);
+
+		// Every FAIL is an ERROR issue: the report cannot claim to be fine.
+		assert.equal(report.ok, false);
+		const issue = report.issues.find((i) => i.code === "CROSSMACHINE_INHERITED_EXTENSIONS");
+		assert.ok(issue, `expected a CROSSMACHINE_INHERITED_EXTENSIONS issue, got: ${report.issues.map((i) => i.code).join(",")}`);
+		assert.equal(issue!.severity, "error");
+		assert.equal(issue!.section, "crossmachine");
+		assert.match(issue!.message, /^fakebox: 1 package\(s\) missing on fakebox: pi-sysmon/);
+		assert.equal(issue!.fix, "hc exec --on fakebox -- pi install npm:pi-sysmon");
+		// …and the next steps point AT those fixes instead of the old settings lecture.
+		assert.match(nextStepsBlock(report.text), /paste each FAIL's `fix:` line above/);
+	} finally {
+		resetDeliveryPreflightState();
+	}
+});
+
+test("D6: WITHOUT a snapshot the section is the static block — same host, different content", () => {
+	try {
+		const settings: CrossMachineSettings = { enabled: true, hosts: { fakebox: XM_HOSTS.vps! } };
+		const staticBlock = crossMachineBlock(
+			runLegionDoctor({
+				agentDir: XM_AGENT_DIR,
+				probeModels: false,
+				sections: ["crossmachine"],
+				crossMachine: settings,
+				env: {
+					...process.env,
+					PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+					PI_LEGION_CHILD_EXTENSIONS: undefined,
+				},
+			}).text,
+		);
+		// Unchanged: the resolver's own fields, the preflight line, the minimal launch.
+		assert.match(staticBlock, /^- fakebox: resolved$/m);
+		assert.match(staticBlock, /^ {4}cwd: \/srv\/app$/m);
+		assert.match(staticBlock, /^- last preflight: never$/m);
+		assert.match(staticBlock, /^- minimal launch \(copy-paste, built from this configuration\):$/m);
+		// …and none of the snapshot vocabulary, because nothing was probed.
+		assert.doesNotMatch(staticBlock, /PASS parent checkout|FAIL target|launch \(copy-paste, real values\)/);
+
+		// The same settings WITH a snapshot renders the probed form instead — the two
+		// paths are chosen by the presence of the snapshot, not by the settings.
+		const probed = crossMachineBlock(
+			runLegionDoctor({
+				agentDir: XM_AGENT_DIR,
+				probeModels: false,
+				sections: ["crossmachine"],
+				crossMachine: settings,
+				crossMachineCheckup: crossMachineSnapshot(),
+				env: {
+					...process.env,
+					PI_LEGION_CHILD_INHERIT_EXTENSIONS: undefined,
+					PI_LEGION_CHILD_EXTENSIONS: undefined,
+				},
+			}).text,
+		);
+		assert.doesNotMatch(probed, /^- fakebox: resolved$/m);
+		assert.match(probed, /^ {2}- PASS parent checkout:/m);
 	} finally {
 		resetDeliveryPreflightState();
 	}

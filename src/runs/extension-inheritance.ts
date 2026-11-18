@@ -581,8 +581,15 @@ export function matchesExcludedExtension(extension: string, exclude: string): bo
 	if (ext === target) return true;
 	const parts = path.resolve(ext).split(path.sep);
 	// `.../node_modules/<name>/...` — the package dir is the segment after node_modules.
+	// A SCOPED package (`@scope/name`) spans two segments, and the D4 advice prints
+	// exactly that name (`pi install npm:@scope/name`), so a name that contains `/`
+	// must match both segments — otherwise the recommended key silently does nothing.
 	const nodeModulesAt = parts.lastIndexOf("node_modules");
-	if (nodeModulesAt >= 0 && parts[nodeModulesAt + 1] === target) return true;
+	if (nodeModulesAt >= 0) {
+		if (parts[nodeModulesAt + 1] === target) return true;
+		const scoped = `${parts[nodeModulesAt + 1] ?? ""}/${parts[nodeModulesAt + 2] ?? ""}`;
+		if (target.includes("/") && scoped === target) return true;
+	}
 	// `.../<name>/extensions/index.ts` or `.../<name>/index.ts`.
 	const file = parts.at(-1) ?? "";
 	const dir = parts.at(-2) ?? "";

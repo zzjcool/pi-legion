@@ -9,40 +9,77 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
-## [Unreleased] — patch（建议 6.2.1）
+## [Unreleased] — minor（建议 6.3.0）
 
-跨机派发实跑（Mac 父机 → `hw-nj`）暴露的三个 bug + 一条设计意图落实。详见
-`docs/reports/xm-dispatch-fixes.md`，判据冻结在 `docs/contracts/xm-dispatch-fixes-v1.md`。
+两条并行的跨机修复线合并成一次发布。master 上的 `feat/xm-fixes`（四个修复，判据冻结在
+`docs/contracts/xm-dispatch-fixes-v1.md`，实跑记录见 `docs/reports/xm-dispatch-fixes.md`）
+已并入本分支；它是基线，不是并列的另一份实现，所以这里不重复它的条目，只记结论：
 
-### Fixed
+- 声明成**目录**的 `pi.extensions` 按其子树匹配（以 `/` 为界，文件声明不会因此放宽）；
+- 目标机装不上/入口不符的继承扩展**跳过**并给一条汇总 warning，只有角色卡写了
+  `requiredExtensions` 才硬失败（同样聚合成一条）；
+- 跨机转录在 wait 落定后**重新读回**，判词只建立在最后一次读回上；读不到转录是
+  `unknown (transcript not retrieved from host …)` 并附远端路径与 `hc exec` 取回命令，
+  而不是「child 没说」；
+- 默认只允许 `centurion` 跨机（新键 `subagents.crossMachine.allowRoles`）。
 
-- **扩展入口校验假阳性（阻断派发）**：包把 `pi.extensions` 声明成**目录**
-  （`["./extensions"]`，如 `pi-autoresearch@1.9.0`）时，父机侧会把该目录展开成
-  `extensions/<name>/index.ts`，而远端探测原样记录 `extensions`，两侧用字符串全等比较
-  ⇒ 恒判 `entry-missing`。现在目录声明按其**子树**匹配（以 `/` 为界），只有「声明的是
-  具体文件、且远端不是那一个」才失败。文件声明不可能成为目录前缀，所以这条规则不会放宽
-  版本/布局不符的拒绝。
-- **继承扩展缺失时逐个硬失败**：跨机 launch 现在**跳过**目标机装不上/入口不符的
-  `-e/--extension`，并给出**一条**汇总 warning（含可直接粘贴的 `agentOverrides`
-  `excludeExtensions` 片段），不再「一个包一次调用」地撞。只有角色卡显式声明
-  `requiredExtensions` 时才硬失败（同样聚合成一条错误）。`--skill` 等非扩展路径参数保持
-  D6 的硬拒绝。
-- **判成 `aborted` 但 child 其实跑完了**（最严重）：跨机转录的读回以前只在 collect 开头做
-  一次，判词却在这之后基于那份**冻结快照**，于是「远端 11 行、父端 `5 of 5 (complete)`、
-  `aborted (no assistant message for the last prompt)`」。现在 wait 落定后（以及 grace
-  重试、retry 判词前）**重新读回**，判词只建立在最后一次读回上；读取方在无内存态读回时
-  优先磁盘上的 `<runDir>/remote/<name>.jsonl`，不再读本机预创建的空占位文件；
-  read-back **失败**改为 `unknown (transcript not retrieved from host …)` 并给出远端路径与
-  `hc exec` 取回命令——「读不到」不再伪装成「child 没说」。`lines === 0` 的瞬时读也不再
-  截断已有的非空镜像。
+本分支独立实现的同一批缺陷（D13 目录声明 / D14 继承扩展跳过 / D15 快照判词）已**删除**，
+以 master 的实现为准——不包括下面这些 master 没有的能力。
 
-### Changed
+### 新增（本分支）
 
-- **默认只允许 `centurion` 跨机**：新增 `subagents.crossMachine.allowRoles`
-  （默认 `["centurion"]`）。跨机派发是**交付单元**的能力，scout/worker 应当由远端
-  centurion 在其本机派生。把 `host` 写在角色卡 / `agentOverrides` 里同样受此约束；
-  `resume`（重连既有远端子）不受影响。要放行：`"subagents": { "crossMachine":
-  { "allowRoles": ["centurion", "worker"] } }`。
+- **首跑就成：跨机 centurion 与本地 centurion 的输入逐项相同，唯一新增的必填输入是「那台机器上的
+  那个目录」**，而这一项不知道时工具**提问**，不发配置讲义。下面的条目是真实会话（103 行、五次
+  失败）里每个坑的答案，最后一条把它们变成一条命令。契约：`docs/contracts/first-run-success-v1.md`；
+  报告：`docs/reports/first-run-success.md`。
+- **缺失的远程目录变成一句提问（本卡 D2）**：`resolveHostTarget` 的两个分支与 `resolveHostTargetAsync`
+  共用 `missingRemoteCwdQuestion(host)`，在任何 `machine.exec` **之前**抛出——问「那台机器上哪个
+  目录」，附可粘贴的 `subagent({ …, cwd })`、一句「这个路径是在那台机器上读的」、一句「本对话没提过
+  就去问用户」，以及一句「不要 ssh / `hc exec` 去翻目录」。旧的
+  `set a default in subagents.crossMachine.hosts.<h>.cwd` 不再出现。
+- **零配置可跑**：`{"subagents":{"crossMachine":{"enabled":true}}}`（不写 `hosts`）+ 调用里的
+  `cwd`/`hostCwd` 就是完整配置——机器只要在 `hc machine ls` 里；`resume` 会重放调用方的
+  `cwd`/`hostCwd`，所以这条路径可恢复。
+- **父机目录不是仓库有它自己的答案（D5）**：`localCheckoutState` 问 git 两个问题
+  （`rev-parse --git-dir`，再 `remote get-url origin`），于是「不是仓库 / 是仓库但没 origin /
+  两侧 origin 不同 / 本机没有 git」是四句不同的文案；「不是仓库」那句的两条出路是**在 checkout 里
+  重开 pi（或传相对 `cwd`）**与**改派 worker**，不再教 `git remote add origin` —— 在一个不是仓库
+  的目录里，那条命令不可能奏效。`assertSharedOrigin` 复用同一次探测，两处不会漂移。
+  `noModelFallback` 也随之为确定性的失败（本机 git / 缺包）置位。
+- **包内参数的拒绝自带 role 与可粘贴 JSON（本卡 D4 保留部分）**：`packagePathError` 接收 role（由
+  `terminal-supervisor` 从 `input.agent.name` 传入），第二条出路直接写成
+  `subagents.agentOverrides.<role>.excludeExtensions` 加一条
+  `{"subagents":{"agentOverrides":{"<role>":{"excludeExtensions":["<pkg>"]}}}}`；不知道角色
+  （resume / 读回）时保留 `<role>` 占位且不带 JSON。`which is not installed on that machine`
+  逐字保留。注意分工：`-e/--extension` 由上面的 xm-dispatch D2 聚合接管（跳过 + 一条汇总
+  warning，`requiredExtensions` 才硬失败），这句话保留在**其它**包内参数路径（`--skill` 等）
+  与严格映射路径上。
+- **`/legion doctor crossmachine` 变成一次体检（D6–D8）**：新模块
+  `src/runs/cross-machine-checkup.ts` 用**一次** `hc` 连接、只读地探测：本机 checkout 与 origin、
+  `hc machine ls`、目标机的目录 / 仓库 origin / `node` 与 `pi` 的真实路径与版本 / 继承来的包
+  按**包名**在那台机器的索引里解析 / 那台机器的 `pi --list-models`；每项一行 `PASS`/`FAIL`/`SKIP`，
+  每个 `FAIL` 带真值的 `fix:` 行，最后一行是可粘贴的 launch（真 host、真 cwd、真 model）。
+  `legion-doctor.ts` 仍然同步、零探测：只渲染传进来的快照，`/legion doctor` 与
+  `subagent({action:"diagnose"})` **只在选中这一节时**才 `await` 体检；没有快照时旧的静态块
+  逐字节不变（`auto-doctor` 仍走它）。
+- **doctor 与 launch 同一口径（与 master 的 `xm-dispatch` D2 对齐）**：`inherited extensions` 这一项的判据就是
+  `requiredExtensions` ——命中的固定报「the card requires it, so a launch REFUSES」，其余（角色卡
+  自己在 `extensions` 里列出的、以及继承来的）报「the launch will skip … with a warning」，
+  合并后的 `excludeExtensions` JSON 只覆盖这些可跳过的项。两边共用
+  `requiredExtensionMatches`，所以「doctor 全绿、launch 却拒」和反向的谎都不再有土壤。
+- **skill 终于写了这个能力（agent 的第一入口）**：6.2.0 的 `skills/pi-legion/SKILL.md` 对
+  `host`/`cwd` 零命中，agent 因此不知道跨机存在。现在 description 多一句
+  `Cross-machine dispatch adds host + cwd to the same call`，正文新增
+  `## Cross-machine dispatch`（最小调用、唯一必填的目标机目录、目录来源优先级、不知道就问用户、
+  禁止 `ssh`/`hc exec` 试探远端、`/legion doctor crossmachine` 与 runbook 的指路、远端 child
+  起不来时读退出码 + screen 原文 + 可复现命令）。`files` 与 `npm pack` 都会带上它，
+  `test/unit/skill-cross-machine.test.ts` 钉住「删掉即红」与打包可见。
+- **换掉「先读三条命令」的开场（D9）**：`docs/runbooks/cross-machine-centurion-demo.md` 第 0 步
+  就是 `/legion doctor crossmachine`（一条命令 + PASS/FAIL 怎么读 + 它打印的可粘贴 launch），
+  原来的手工三条检查降级为它下面的「手工兜底」；配置一节改成最小配置
+  `{"subagents":{"crossMachine":{"enabled":true}}}` + 按次 `cwd`（或只写 `cwd` 的 entry），
+  配置键表逐行换成新文案。
+
 
 ## [6.2.0] — 2026-11-18
 

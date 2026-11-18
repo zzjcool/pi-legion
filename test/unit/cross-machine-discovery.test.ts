@@ -40,6 +40,7 @@ import {
 	remoteDiscoveryScript,
 	resolveHostTarget,
 	resolveHostTargetAsync,
+	missingRemoteCwdQuestion,
 	thisPackageRoot,
 	type HcExecResult,
 } from "../../src/runs/remote.ts";
@@ -350,14 +351,20 @@ test("v1.1 admission: an EMPTY registry says so and still prints the fix", async
 	assert.match((error as SubagentError).message, /hc machine add --name hw-nj/);
 });
 
-test("v1.1 admission: a core without machine.list falls back to the settings entry (old rule)", async () => {
+test("v1.1 admission: a core without machine.list cannot confirm the host — the ACTION is `hc machine add` (D1/F2)", async () => {
 	clearHostDiscoveryCache();
 	// No `machines` handler: the call throws kind=method_not_found.
 	const client = new FakeClient();
 	const error = await thrown(() => resolveHostTargetAsync("vps", { enabled: true }, { client, cacheDir: null }));
 	assert.ok(error instanceof SubagentError);
-	assert.match((error as SubagentError).message, /has no entry in subagents\.crossMachine\.hosts/);
-	assert.match((error as SubagentError).message, /did not answer `machine list`/);
+	const message = (error as SubagentError).message;
+	// Action first: register the machine (pasteable), settings key as one aside.
+	assert.match(message, /^host 'vps': register the machine, then retry — hc machine add --name vps ssh:\/\/user@that-machine\./);
+	assert.match(message, /did not answer `machine list`/);
+	assert.match(message, /no entry in subagents\.crossMachine\.hosts/);
+	assert.match(message, /Legion will not run the child on this machine instead\./);
+	assert.equal(((error as SubagentError).details as { reason?: string }).reason, "host-unconfirmed");
+	assert.deepEqual(client.paramsFor("machine.exec"), [], "an unconfirmed host is never probed");
 });
 
 test("v1.1 admission: `always` refuses a configured host the registry does not know; `never` lets resume ask the machine itself", async () => {
@@ -680,10 +687,51 @@ test("v1.2 extensions: the package is ABSENT there — refuse before launch, nam
 	assert.ok(outcome instanceof SubagentError);
 	const message = (outcome as SubagentError).message;
 	assert.match(message, /the extension '.*pi-sysmon\/src\/index\.ts' belongs to package 'pi-sysmon'/);
-	assert.match(message, /not installed on that machine/);
-	assert.match(message, /Install 'pi-sysmon' on 'hw-nj'/);
-	assert.match(message, /subagents\.crossMachine\.hosts\.hw-nj\.pathMap/);
-	assert.match(message, /PI_LEGION_CHILD_INHERIT_EXTENSIONS=0/);
+	assert.match(message, /which is not installed on that machine/, "the greppable sentence is preserved verbatim (D4)");
+	// D4: TWO ways out, both pasteable, and no reader has to open the source.
+	assert.match(message, /Two ways out: 1\) install it there — hc exec --on hw-nj -- pi install npm:pi-sysmon \(same entry names are then mapped automatically\)/);
+	// No role at this layer (resume / read-back): the second way out names the key
+	// with a placeholder and omits the JSON, because a JSON for `<role>` is not a
+	// pasteable fix.
+	assert.match(message, /2\) keep it on this machine only, for the role you launch: subagents\.agentOverrides\.<role>\.excludeExtensions/);
+	assert.doesNotMatch(message, /agentOverrides":\{/, "no role, no JSON block");
+	assert.deepEqual((outcome as SubagentError).details, {
+		host: "hw-nj",
+		extension: parent.entry,
+		package: "pi-sysmon",
+		reason: "not-installed",
+		// A6: a package that is not on that machine is deterministic, so the
+		// candidate chain must not retry it. (This assertion was stale at HEAD:
+		// `remote.ts` gained the flag in 3752669, the expectation did not.)
+		noModelFallback: true,
+	});
+});
+
+test("v1.2/D4: with a role, the missing-package refusal carries the concrete excludeExtensions JSON (and it parses as settings)", (t) => {
+	const parent = parentPackage(t, "pi-sysmon", { entry: "src/index.ts" });
+	const index = packageIndex("/srv/pi", [{ name: "pi-any-endpoint", entry: "extensions/index.ts" }]);
+	const outcome = thrownSync(() => mapRemoteArgv(["-e", parent.entry], {
+		host: "hw-nj",
+		remoteCwd: "/srv/app",
+		remoteDir: "/srv/.mirror/r/n",
+		localCwd: "/local/app",
+		pathMap: [],
+		packages: index,
+		role: "centurion",
+	}));
+	assert.ok(outcome instanceof SubagentError);
+	const message = (outcome as SubagentError).message;
+	assert.match(message, /for role 'centurion': subagents\.agentOverrides\.centurion\.excludeExtensions/);
+	const json = message.match(/\{"subagents":\{"agentOverrides":\{.*\}\}\}/)?.[0];
+	assert.ok(json, `expected the settings JSON in the message, got:\n${message}`);
+	assert.equal(
+		json,
+		'{"subagents":{"agentOverrides":{"centurion":{"excludeExtensions":["pi-sysmon"]}}}}',
+	);
+	// Settings-shaped, not prose-shaped: the operator can paste it into settings.json.
+	const parsed = JSON.parse(json) as { subagents?: { agentOverrides?: Record<string, { excludeExtensions?: string[] }> } };
+	assert.deepEqual(parsed.subagents?.agentOverrides?.centurion?.excludeExtensions, ["pi-sysmon"]);
+	assert.equal(((outcome as SubagentError).details as { role?: string }).role, "centurion");
 });
 
 test("v1.2 extensions: the package IS there but the entry differs — refuse, listing what it declares", (t) => {
@@ -884,15 +932,12 @@ test("v1.1 cwd: the per-call override wins over the host default, and must be ab
 	const relative = thrownSync(() => resolveHostTarget("vps", legacy, { cwd: "other-project" }));
 	assert.ok(relative instanceof SubagentError);
 	assert.match((relative as SubagentError).message, /per-call cwd override must be an absolute path/);
-	// No default and no override: refuse, never guess HOME. The pre-v1.1 caller
-	// keeps the exact old sentence (backward compatibility), while the v1.1
-	// resolver also teaches the per-call override.
+	// No default and no override: refuse, never guess HOME. D2: the answer is the
+	// question (which directory on that machine?), not an instruction to edit a
+	// settings file — the resolver's callers include the read-back paths.
 	const none = thrownSync(() => resolveHostTarget("vps", config({ vps: {} })));
 	assert.ok(none instanceof SubagentError);
-	assert.equal(
-		(none as SubagentError).message,
-		"host 'vps' needs an absolute cwd in subagents.crossMachine.hosts.vps.cwd (remote paths are not translated from this machine)",
-	);
+	assert.equal((none as SubagentError).message, missingRemoteCwdQuestion("vps"));
 });
 
 test("v1.1 tool params: an absolute cwd next to a host is REMOTE, a relative one keeps its old local meaning", () => {

@@ -32,6 +32,7 @@ import {
 	remotePreflight,
 	remotePreflightScript,
 	resolveHostTarget,
+	missingRemoteCwdQuestion,
 	thisPackageRoot,
 	type HcExecResult,
 	type HostTarget,
@@ -147,8 +148,18 @@ test("D1: an enabled config with no entry for the host is refused with the shape
 	assert.match((error as SubagentError).message, /"cwd": "\/abs\/path\/on\/vps"/);
 });
 
-test("D1: a missing or non-absolute remote cwd is refused, naming the exact key", () => {
-	for (const entry of [{}, { cwd: "" }, { cwd: "srv/app" }, { cwd: "./app" }]) {
+test("D2: a MISSING remote cwd is the shared question, not a settings lesson", () => {
+	for (const entry of [{}, { cwd: "" }]) {
+		const error = thrown(() => resolveHostTarget("vps", config({ vps: entry })));
+		assert.ok(error instanceof SubagentError, `expected a SubagentError for ${JSON.stringify(entry)}`);
+		assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+		assert.equal((error as SubagentError).message, missingRemoteCwdQuestion("vps"));
+		assert.deepEqual((error as SubagentError).details, { host: "vps", cwd: "", reason: "cwd-missing", noModelFallback: true });
+	}
+});
+
+test("D2: a cwd that IS given but non-absolute is refused, naming the exact key", () => {
+	for (const entry of [{ cwd: "srv/app" }, { cwd: "./app" }]) {
 		const error = thrown(() => resolveHostTarget("vps", config({ vps: entry })));
 		assert.ok(error instanceof SubagentError, `expected a SubagentError for ${JSON.stringify(entry)}`);
 		assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);

@@ -13,7 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { HcRpcError, type HcClient, type HcMethod } from "../../src/hc/client.ts";
@@ -26,9 +26,13 @@ import {
 	type HostTarget,
 } from "../../src/runs/remote.ts";
 import {
+	assertSharedOrigin,
 	createRemoteChildWorktree,
 	fetchRemoteBranch,
+	localCheckoutState,
+	noLocalGitMessage,
 	normalizeGitRemoteUrl,
+	notALocalCheckoutMessage,
 	provisionRemoteWorktree,
 	remoteBranchTipOnOrigin,
 	remoteOriginUrl,
@@ -36,6 +40,7 @@ import {
 	remoteWorktreeBranchFor,
 	remoteWorktreePathFor,
 	removeRemoteChildWorktree,
+	type LocalCheckoutState,
 } from "../../src/runs/remote-worktree.ts";
 import { worktreeBranchFor } from "../../src/runs/worktree.ts";
 import { ErrorCodes, SubagentError } from "../../src/shared/types.ts";
@@ -336,6 +341,134 @@ test("D6: `rev-parse` exiting 127 means git is missing there, not that the direc
 		error.message,
 		"host 'vps': git is not available on that machine (git -C /srv/app rev-parse --git-dir exited 127: sh: 1: git: not found). A cross-machine centurion delivers through git worktrees, so git must be on PATH there. Two ways out: 1) install git on 'vps' and retry; 2) dispatch a worker instead (workers need no worktree and no git).",
 	);
+});
+
+test("D5: one probe, four facts — checkout with origin, checkout without, not a checkout, no usable git", () => {
+	// The collapse this pins: `catch { "" }` answered "no origin" for BOTH a
+	// checkout that was never cloned and a directory that is not a repository, so a
+	// real operator was told to `git remote add origin` where no repository exists.
+	const withOrigin = localRepo("git@example.com:acme/pi-legion.git");
+	const withoutOrigin = localRepo();
+	const root = mkdtempSync(path.join(tmpdir(), "remote-worktree-local-state-"));
+	try {
+		assert.deepEqual(localCheckoutState(withOrigin.repo), { kind: "checkout", origin: "git@example.com:acme/pi-legion.git" });
+		assert.deepEqual(localCheckoutState(withoutOrigin.repo), { kind: "checkout", origin: undefined });
+
+		// git ANSWERED 128: the directory is not a checkout. A missing path is the
+		// same answer — that is a fact about the path, not about the git binary.
+		const plain = path.join(root, "agents");
+		mkdirSync(plain, { recursive: true });
+		assert.deepEqual(localCheckoutState(plain), { kind: "not-a-checkout" });
+		assert.deepEqual(localCheckoutState(path.join(root, "absent")), { kind: "not-a-checkout" });
+
+		const previousPath = process.env.PATH;
+		const bin = path.join(root, "bin");
+		mkdirSync(bin, { recursive: true });
+		writeFileSync(path.join(bin, "git"), "#!/bin/sh\necho 'git: simulated failure' >&2\nexit 1\n", { mode: 0o755 });
+		chmodSync(path.join(bin, "git"), 0o755);
+		try {
+			// A `git` that RUNS and refuses is still an answer about the directory:
+			// `no-git` may only mean "the binary could not be started".
+			process.env.PATH = bin;
+			assert.deepEqual(localCheckoutState(plain), { kind: "not-a-checkout" }, "exit 1 is not no-git");
+
+			// ENOENT: there is no git on PATH at all (the state assertSharedOrigin used
+			// to report as "this checkout has no origin").
+			const empty = path.join(root, "empty-path");
+			mkdirSync(empty, { recursive: true });
+			process.env.PATH = empty;
+			const state = localCheckoutState(withOrigin.repo);
+			assert.equal(state.kind, "no-git");
+			const noGit = state as Extract<LocalCheckoutState, { kind: "no-git" }>;
+			assert.equal(noGit.code, null, "a spawn failure has no exit code");
+			assert.match(noGit.detail, /ENOENT/, "the spawn error's own words survive");
+		} finally {
+			if (previousPath === undefined) delete process.env.PATH;
+			else process.env.PATH = previousPath;
+		}
+	} finally {
+		withOrigin.cleanup();
+		withoutOrigin.cleanup();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("D5: a session directory that is NOT a checkout gets its own answer, never `git remote add`", async () => {
+	// The real 6.2.0 session: cwd `/Users/me/agents`, not a repository. The old
+	// message told the reader to add an `origin` there — impossible.
+	const root = mkdtempSync(path.join(tmpdir(), "remote-worktree-not-a-checkout-"));
+	try {
+		const plain = path.join(root, "agents");
+		mkdirSync(plain, { recursive: true });
+		const client = new FakeRemoteClient()
+			.onArgv("test -d", () => execResult({ code: 0 }))
+			.onArgv("rev-parse --git-dir", () => execResult({ code: 0 }));
+		const error = await refusal(
+			createRemoteChildWorktree({ client, target: target(), name: "child", localRepo: plain }),
+		);
+		assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
+		// Full equality: the whole sentence is the contract (D5).
+		assert.equal(error.message, notALocalCheckoutMessage({ host: HOST, localRepo: plain }));
+		assert.equal(
+			error.message,
+			`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${plain}) is not one. ` +
+				"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
+				`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "vps", cwd: "../my-repo", hostCwd: "/abs/path/on/vps", task: "..." }); ` +
+				'2) dispatch a worker instead — subagent({ agent: "worker", host: "vps", task: "..." }) needs no checkout and no origin.',
+		);
+		// The impossible advice is GONE, not merely reordered.
+		assert.doesNotMatch(error.message, /remote add/, "`git remote add` cannot work in a non-repository");
+		assert.doesNotMatch(error.message, /has no origin/);
+		// …and both ways out are pasteable shapes, not prose.
+		// Both halves of the shape: a relative cwd alone would drop the remote directory
+		// and send the reader into the D2 question next.
+		assert.match(error.message, /subagent\(\{ agent: "centurion", host: "vps", cwd: "\.\.\/my-repo", hostCwd: "\/abs\/path\/on\/vps", task: "\.\.\." \}\)/);
+		assert.match(
+			error.message,
+			/subagent\(\{ agent: "worker", host: "vps", task: "\.\.\." \}\) needs no checkout and no origin/,
+		);
+		// The remote half is never asked: the local fact already refuses.
+		assert.equal(
+			client.execs().some((params) => JSON.stringify(params.argv ?? []).includes("remote get-url")),
+			false,
+			"an origin question about that machine is not reached",
+		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("D5: no git on THIS machine is its own answer, and the guard never asks that machine", async () => {
+	// Before D5 this state reached `catch { localOrigin = "" }` and was reported as
+	// "this checkout has no origin" — advice for a missing remote, given when the
+	// program that would add one does not exist.
+	const local = localRepo("git@example.com:acme/pi-legion.git");
+	const root = mkdtempSync(path.join(tmpdir(), "remote-worktree-local-nogit-"));
+	const previousPath = process.env.PATH;
+	try {
+		const empty = path.join(root, "empty-path");
+		mkdirSync(empty, { recursive: true });
+		process.env.PATH = empty;
+		const state = localCheckoutState(local.repo);
+		assert.equal(state.kind, "no-git");
+		const noGit = state as Extract<LocalCheckoutState, { kind: "no-git" }>;
+		const client = new FakeRemoteClient();
+		const error = await refusal(assertSharedOrigin({ client, target: target(), localRepo: local.repo }));
+		assert.equal(error.code, ErrorCodes.INVALID_PARAMS);
+		assert.equal(
+			error.message,
+			noLocalGitMessage({ host: HOST, localRepo: local.repo, code: noGit.code, detail: noGit.detail }),
+		);
+		assert.match(error.message, /^this machine has no usable git \(git --version exited no exit code: /);
+		assert.match(error.message, /install git here and retry/);
+		assert.doesNotMatch(error.message, /has no origin/);
+		assert.deepEqual(client.calls, [], "a local fact must not cost a round trip");
+	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		local.cleanup();
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 test("D11: an existing destination is refused, and a failing add names cwd + git's own words", async () => {

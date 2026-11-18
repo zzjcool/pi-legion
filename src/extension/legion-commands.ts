@@ -29,6 +29,7 @@ import { createSummaryCommand } from "./summary.ts";
 import { createTimingCommand } from "./timing.ts";
 import { getAgentDir } from "../agents/paths.ts";
 import { loadSubagentSettings } from "../agents/settings.ts";
+import { crossMachineCheckupRequested, runCrossMachineCheckup } from "../runs/cross-machine-checkup.ts";
 import type { CrossMachineSettings } from "../shared/types.ts";
 import type {
 	ExtensionAPI,
@@ -597,7 +598,7 @@ function loadCrossMachineSettings(cwd: string): CrossMachineSettings | undefined
 	}
 }
 
-function buildDoctorReport(
+async function buildDoctorReport(
 	deps: LegionCommandDeps,
 	ctxCwd: string,
 	sectionArg?: string,
@@ -623,6 +624,14 @@ function buildDoctorReport(
 			packages: [],
 		};
 	}
+	// D6/D7: the ONE probe of the Cross-machine section, paid only when that
+	// section is selected (`sections === undefined` = the full report). `/legion
+	// doctor models` must stay exactly as cheap as it is today — no `hc` connect,
+	// no `machine.exec`.
+	const crossMachine = loadCrossMachineSettings(ctxCwd);
+	const crossMachineCheckup = crossMachineCheckupRequested(sections)
+		? await runCrossMachineCheckup({ cwd: ctxCwd, settings: crossMachine })
+		: undefined;
 	const runtime: DoctorRuntimeSnapshot = {
 		liveJobs: deps.runtime.activeJobs().map((job) => ({
 			name: job.name,
@@ -652,7 +661,8 @@ function buildDoctorReport(
 		// Passing it here saves the second read and keeps one source of truth; a
 		// failed read is left to `undefined` = `enabled: unset`, exactly what the
 		// section prints when nobody configured a host.
-		crossMachine: loadCrossMachineSettings(ctxCwd),
+		crossMachine,
+		...(crossMachineCheckup !== undefined ? { crossMachineCheckup } : {}),
 		runtime,
 		sections,
 	});
@@ -783,7 +793,7 @@ export function registerLegionCommand(
 			}
 			if (/^doctor(?:\s|$)/i.test(query)) {
 				const sectionArg = query.replace(/^doctor\s*/i, "").trim();
-				const report = buildDoctorReport(deps, ctx.cwd, sectionArg || undefined);
+				const report = await buildDoctorReport(deps, ctx.cwd, sectionArg || undefined);
 				pi.sendMessage({
 					customType: "legion-doctor",
 					content: report.text,

@@ -649,7 +649,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// mapped simply cannot be loaded over there, so it is dropped WITH a
 				// notice (never silently), while any other unmappable argv path keeps the
 				// hard refusal below.
-				// v1.2: NO drops. Every absolute argv element either maps (checkout /
+				// v1.2: NO silent drops. Every absolute argv element either maps (checkout /
 				// pathMap / same package on that machine) or the launch is refused with
 				// the package, the parent path and the candidates. A child that quietly
 				// lost the provider extension starts, prints no models, and hangs — the
@@ -664,6 +664,11 @@ export class TerminalSupervisor implements LegionSupervisor {
 					localCwd: input.cwd,
 					pathMap: target.pathMap,
 					...(packages ? { packages } : {}),
+					// D4: the missing-package refusal names the ROLE, because the key that
+					// keeps the extension on this machine only is per role. The agent config
+					// is the authority on that name (`input.agent.name`, the same value the
+					// child label carries).
+					role: input.agent.name,
 				});
 				const mappedArgs = mapped.args;
 				if (mapped.skipped.length > 0) {
@@ -685,6 +690,11 @@ export class TerminalSupervisor implements LegionSupervisor {
 				// for a `pi` that works by hand there. The operator names the host-local
 				// set; each entry is appended AFTER the switch and is already a path on
 				// that machine, so it does not go through `mapRemoteArgPath`.
+				//
+				// These lines are unaffected by a D2 skip: `piExtensions` ARE the target's
+				// own provider set (`hosts.<host>.piExtensions`), so dropping an inherited
+				// provider package can never leave the child without the provider the
+				// operator configured FOR that machine — the reason they exist at all.
 				const hostExtensions = target.piExtensions.flatMap((entry) => ["--extension", entry]);
 				argv = [target.node, target.piCli, ...mappedArgs, ...hostExtensions, task];
 			} else {

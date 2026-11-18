@@ -136,14 +136,17 @@ export interface ChildHandle {
 	 */
 	startupUnconfirmed?: boolean;
 	/**
-	 * In-process-only, NON-FATAL model-resolution notice (B5).
+	 * NON-FATAL notice from the backend that spawned the child (B5, D14).
 	 *
-	 * `resolveCliModel` answers a `warning` for two legitimate situations — an
-	 * unregistered model id ("Using custom model id", a supported usage) and an
-	 * invalid `:thinking` suffix. Neither may fail a spawn, but both used to be
-	 * dropped on the floor, so a child could run on a model nobody registered
-	 * with nothing said about it. The in-process backend forwards them here; the
-	 * rpc backend never sets the field (its child reports the same thing itself).
+	 * Two sources, one channel: `resolveCliModel` answers a `warning` for an
+	 * unregistered model id ("Using custom model id", a supported usage) or an
+	 * invalid `:thinking` suffix, and a cross-machine launch reports the inherited
+	 * extensions it DROPPED in ONE line (D14: an extension the target lacks is a
+	 * degraded child, not a refused launch, unless the role card asked for it).
+	 * None of these may fail a spawn — `index.ts` renders the text inline after
+	 * `  ⚠ <name>: ` — and none of them is persisted: a warning describes THIS
+	 * spawn, not the child's identity. The in-process backend joins several notices
+	 * with `"; "`; the terminal backend sets the single D14 line.
 	 *
 	 * Absent — not empty — when the spawn said nothing.
 	 */

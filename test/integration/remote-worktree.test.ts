@@ -36,7 +36,12 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { HcCliClient, type HcClient, type HcMethod } from "../../src/hc/client.ts";
 import { resolveHostTarget, type HostTarget } from "../../src/runs/remote.ts";
-import { fetchRemoteBranch, remoteBranchTipOnOrigin, remoteWorktreePathFor } from "../../src/runs/remote-worktree.ts";
+import {
+	fetchRemoteBranch,
+	notALocalCheckoutMessage,
+	remoteBranchTipOnOrigin,
+	remoteWorktreePathFor,
+} from "../../src/runs/remote-worktree.ts";
 import { TerminalSupervisor } from "../../src/supervisor/terminal-supervisor.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import type { SpawnInput } from "../../src/supervisor/types.ts";
@@ -377,6 +382,41 @@ test("S2: a cwd that is not a git repository is named as such, and no terminal i
 		`host 'fakebox': ${plain} is not a git repository on that machine. Two ways out: 1) give that machine a checkout at ${plain} — git clone <url> ${plain} on 'fakebox' — or point subagents.crossMachine.hosts.fakebox.cwd at a directory that is a git checkout; 2) dispatch a worker instead (workers need no worktree and no git).`,
 	);
 	assert.deepEqual(h.wireFor("terminal.run"), []);
+});
+
+test("D5: a cwd that is not a checkout here is named as the SESSION's directory, and no terminal is created", async (t) => {
+	// The real 6.2.0 session: the parent ran in `/Users/me/agents`, a plain directory.
+	// The old answer told the operator to add an `origin` there, which is impossible.
+	const h = harness();
+	t.after(() => h.cleanup());
+	const plain = path.join(h.root, "agents");
+	mkdirSync(plain, { recursive: true });
+	const error = await h.supervisor
+		.spawnChild(spawnInput(h, { cwd: plain }))
+		.then(() => undefined, (thrown: unknown) => thrown);
+	assert.ok(error instanceof SubagentError, `expected a SubagentError, got ${String(error)}`);
+	assert.equal((error as SubagentError).code, ErrorCodes.INVALID_PARAMS);
+	const message = (error as SubagentError).message;
+	assert.equal(message, notALocalCheckoutMessage({ host: HOST, localRepo: plain }));
+	assert.doesNotMatch(message, /remote add/, "`git remote add` cannot work in a non-repository");
+	assert.equal(
+		message,
+		`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${plain}) is not one. ` +
+			"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
+			`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "fakebox", cwd: "../my-repo", hostCwd: "/abs/path/on/fakebox", task: "..." }); ` +
+			'2) dispatch a worker instead — subagent({ agent: "worker", host: "fakebox", task: "..." }) needs no checkout and no origin.',
+	);
+	// The real spawn path stops before a tree or a terminal exists.
+	assert.deepEqual(h.wireFor("terminal.run"), [], "no terminal may be created for a local non-checkout");
+	const commands = h.wireFor("machine.exec").map((params) =>
+		Array.isArray(params.argv) ? (params.argv as string[]).join(" ") : String(params.line ?? ""),
+	);
+	assert.equal(
+		commands.some((command) => command.includes("worktree add")),
+		false,
+		`no worktree may be created: ${JSON.stringify(commands)}`,
+	);
+	assert.equal(existsSync(remoteWorktreePathFor(h.target, CHILD_NAME)), false);
 });
 
 test("S2/D10: a checkout whose origin differs is refused, naming BOTH remotes", async (t) => {

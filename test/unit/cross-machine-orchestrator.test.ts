@@ -13,13 +13,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
+import { renderCollect } from "../../index.ts";
 import { Orchestrator } from "../../src/runs/orchestrator.ts";
+import type { RemoteReadbackResult, RemoteSessionRequest } from "../../src/runs/remote-artifact.ts";
 import { resolveHostTarget, type HostTarget } from "../../src/runs/remote.ts";
+import { NO_ASSISTANT_ABORT_REASON } from "../../src/shared/session.ts";
 import { ErrorCodes, SubagentError, type AgentConfig } from "../../src/shared/types.ts";
 import { FakeSupervisor } from "../helpers/fake-supervisor.ts";
+import { assistantMsg, sessionHeader, toolResult, userMsg } from "../helpers/fixtures.ts";
 
 const HOST = "vps";
 
@@ -46,7 +50,12 @@ function gitRepo(root: string): string {
 	return repo;
 }
 
-function harness(prefix: string) {
+function harness(
+	prefix: string,
+	remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>,
+	/** Injected virtual clock (the collect grace window is asserted in ms, not slept). */
+	deps: { now?: () => number; sleep?: (ms: number) => Promise<void> } = {},
+) {
 	const root = mkdtempSync(path.join(tmpdir(), prefix));
 	const supervisor = new FakeSupervisor();
 	return {
@@ -56,6 +65,8 @@ function harness(prefix: string) {
 			supervisor,
 			runDir: path.join(root, "run"),
 			cwd: gitRepo(root),
+			...(remoteReadback ? { remoteReadback } : {}),
+			...deps,
 		}),
 		cleanup: () => rmSync(root, { recursive: true, force: true }),
 	};
@@ -409,4 +420,138 @@ test("B1: a child-only acceptance criterion (no command) still launches on a hos
 			h.cleanup();
 		}
 	});
+});
+
+/* ------------------------------------------------------------------------- *
+ * S4/D15 — the read-back the verdict is derived from (real 6.2.0 demo)
+ *
+ * The demo: a remote `centurion` on hw-nj wrote 11 lines and answered, and the
+ * parent's `wait` reported `aborted (no assistant message for the last prompt)` +
+ * `read-back: 5 of 5 lines (complete)`. Both described a mirror that was read
+ * BEFORE the turn ended: five lines whose last one is the user prompt — exactly
+ * the shape `deriveOutcome` calls "no assistant message".
+ * ------------------------------------------------------------------------- */
+
+/** The mid-turn prefix: 5 lines, the last one the user prompt (no reply yet). */
+const MID_TURN = [
+	sessionHeader(),
+	userMsg("dispatch the review"),
+	assistantMsg({ stopReason: "toolUse", tools: ["read"] }),
+	toolResult({ toolName: "read" }),
+	userMsg("now write the report"),
+];
+
+/** The transcript that turn really produced: 11 lines, ending on the report. */
+const FINISHED = [
+	...MID_TURN,
+	assistantMsg({ stopReason: "toolUse", tools: ["write"] }),
+	toolResult({ toolName: "write" }),
+	assistantMsg({ stopReason: "toolUse", tools: ["bash"] }),
+	toolResult({ toolName: "bash" }),
+	assistantMsg({ text: "half-way summary" }),
+	assistantMsg({ text: '{"ok":true,"reason":"report written"}' }),
+];
+
+/** Where a cross-machine transcript lives on the target (xm-dispatch D3.2). */
+function remoteMirrorSample(name: string): string {
+	return path.posix.join("/srv/.pi-subagents-mirror", "no-run", name, "session.jsonl");
+}
+
+/** Write `lines` to the mirror the request names, the way the real seam does. */
+function writeMirror(localPath: string, lines: string[]): void {
+	mkdirSync(path.dirname(localPath), { recursive: true });
+	writeFileSync(localPath, `${lines.join("\n")}\n`);
+}
+
+test("S4/D15 (demo): a mid-turn mirror is re-read before the verdict, so 11 lines are not judged as 5", async () => {
+	// What the demo did: `collect()` entered while the remote centurion was still
+	// working, read 5 lines off that machine, and — because the mirror was never
+	// read again — derived the verdict from that snapshot while the turn went on to
+	// write 11 lines answering the task.
+	const calls = { count: 0 };
+	const h = harness("xm-midturn-", async (request) => {
+		calls.count += 1;
+		// First read: mid-turn. Every later read: the finished transcript.
+		const lines = calls.count === 1 ? MID_TURN : FINISHED;
+		writeMirror(request.localPath, lines);
+		return {
+			ok: true,
+			host: request.host,
+			localPath: request.localPath,
+			remotePath: remoteMirrorSample(request.name),
+			lines: lines.length,
+			returned: lines.length,
+			truncated: false,
+			byteCapped: false,
+		};
+	});
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
+			h.supervisor.settle(handle.name, { text: '{"ok":true,"reason":"report written"}' });
+			const collected = await h.orchestrator.collect(handle.name);
+			// The verdict first: this is the demo's lie (`aborted (no assistant message
+			// for the last prompt)` for a child that answered).
+			assert.equal(collected.execution.status, "success", JSON.stringify(collected.execution));
+			assert.notEqual(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
+			assert.equal(calls.count, 2, "exactly one refresh — the remote is NOT polled while the turn is in flight");
+			// The facts reported to the render are the LAST read, so "5 of 5 (complete)"
+			// can no longer describe a transcript that has 11 lines.
+			assert.equal(collected.remoteReadback?.lines, FINISHED.length);
+			assert.equal(collected.remoteReadback?.returned, FINISHED.length);
+			assert.match(
+				renderCollect(handle.name, collected),
+				/read-back from host 'vps': 11 of 11 lines \(complete\)$/m,
+			);
+			assert.match(collected.output, /report written/);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("S4/D15: a COMPLETE remote transcript with no assistant is still `aborted` (frozen reason kept)", async () => {
+	// The honesty guard must not swallow the child's own fate: when the whole file
+	// was read and it really ends without a reply, the frozen reason stands — the
+	// same verdict `test/unit/session.test.ts` pins for a local transcript.
+	const h = harness("xm-noassistant-", async (request) => {
+		writeMirror(request.localPath, MID_TURN);
+		return {
+			ok: true,
+			host: request.host,
+			localPath: request.localPath,
+			remotePath: remoteMirrorSample(request.name),
+			lines: MID_TURN.length,
+			returned: MID_TURN.length,
+			truncated: false,
+			byteCapped: false,
+		};
+	});
+	await insideHcTerminal(async () => {
+		try {
+			const handle = await h.orchestrator.launch({ agent: agent(), task: "t", host: HOST, hostTarget: target() });
+			h.supervisor.settle(handle.name, { text: "settled" });
+			const collected = await h.orchestrator.collect(handle.name);
+			assert.equal(collected.execution.status, "aborted");
+			assert.equal(collected.execution.reason, NO_ASSISTANT_ABORT_REASON);
+			assert.equal(collected.remoteReadback?.truncated, false);
+		} finally {
+			h.cleanup();
+		}
+	});
+});
+
+test("D15: a local retire keeps today's verdict — a transcript with no reply is still `aborted`", async () => {
+	// The honesty rule is about a MIRROR; a local transcript is authoritative, so
+	// the frozen sentence stays exactly as `session.test.ts` pins it.
+	const h = harness("xm-retire-local-");
+	try {
+		const handle = await h.orchestrator.launch({ agent: agent(), task: "t", worktree: false });
+		writeFileSync(handle.sessionFile, `${MID_TURN.join("\n")}\n`);
+		const retired = await h.orchestrator.retire(handle.name);
+		assert.equal(retired.execution?.status, "aborted");
+		assert.equal(retired.execution?.reason, NO_ASSISTANT_ABORT_REASON);
+	} finally {
+		h.cleanup();
+	}
 });

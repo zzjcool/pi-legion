@@ -481,32 +481,56 @@ test("v1.2: a parent extension path is re-rooted by PACKAGE NAME from the target
 	assert.deepEqual(mapped, ["--no-extensions", "-e", h.providerExtension]);
 });
 
-test("v1.2: an extension the target does not have is refused before any terminal, naming package and fixes", async (t) => {
+test("v1.2/D1: a target package that declares a DIRECTORY is mapped through it (the demo's false refusal)", async (t) => {
 	const h = harness(t);
 	clearHostDiscoveryCache();
+	// The target's copy of the real `pi-autoresearch`: the manifest declares the
+	// DIRECTORY and the loadable entries sit one level inside it.
+	const npmModules = path.dirname(h.legionRoot);
+	const remotePackage = path.join(npmModules, "pi-autoresearch");
+	const remoteEntry = path.join(remotePackage, "extensions", "pi-autoresearch", "index.ts");
+	mkdirSync(path.dirname(remoteEntry), { recursive: true });
+	writeFileSync(remoteEntry, "export class AutoResearch {}\n");
+	writeFileSync(
+		path.join(remotePackage, "package.json"),
+		JSON.stringify({ name: "pi-autoresearch", pi: { extensions: ["./extensions"] } }),
+	);
+
 	const target = await resolveHostTargetAsync(HOST, { enabled: true }, {
 		client: h.client,
 		cwd: h.remoteCwd,
 		admission: "always",
 		cacheDir: null,
 	});
-	const parentRoot = path.join(h.root, "parent", "node_modules", "pi-not-installed");
-	const parentEntry = path.join(parentRoot, "src", "index.ts");
+	// 1) The probe reports the entry the manifest spells out — `extensions`, the
+	// DIRECTORY itself. xm-dispatch D1 decides what a directory declaration may
+	// cover; the probe only reports the fact, so nothing about "is it a directory"
+	// is stamped on the row.
+	const declared = target.packageIndex?.entries.find((entry) => entry.name === "pi-autoresearch");
+	assert.deepEqual(
+		declared,
+		{ name: "pi-autoresearch", relative: "extensions", path: path.join(remotePackage, "extensions") },
+		"the target must report its declared entry by package-relative path",
+	);
+
+	// 2) The parent's expanded entry (what `pi list` gives it on THIS machine) maps.
+	const parentRoot = path.join(h.root, "parent", "node_modules", "pi-autoresearch");
+	const parentEntry = path.join(parentRoot, "extensions", "pi-autoresearch", "index.ts");
 	mkdirSync(path.dirname(parentEntry), { recursive: true });
-	writeFileSync(parentEntry, "export const x = 1;\n");
-	writeFileSync(path.join(parentRoot, "package.json"), JSON.stringify({ name: "pi-not-installed" }));
-	const failure = await rejected(async () => mapRemoteArgv(["-e", parentEntry], {
+	writeFileSync(parentEntry, "export class AutoResearch {}\n");
+	writeFileSync(
+		path.join(parentRoot, "package.json"),
+		JSON.stringify({ name: "pi-autoresearch", pi: { extensions: ["./extensions"] } }),
+	);
+	const mapped = mapRemoteArgv(["--no-extensions", "-e", parentEntry], {
 		host: HOST,
 		remoteCwd: h.remoteCwd,
 		remoteDir: path.posix.join(h.remoteRoot, ".mirror", "run", "child"),
 		localCwd: h.remoteRoot,
 		pathMap: target.pathMap,
 		...(target.packageIndex ? { packages: target.packageIndex } : {}),
-	}));
-	assert.match(String((failure as Error)?.message ?? failure), /package 'pi-not-installed', which is not installed on that machine/);
-	assert.match(String((failure as Error)?.message ?? failure), /Install 'pi-not-installed' on 'fakebox'/);
-	// Nothing was started: argv mapping runs before `terminal.run`.
-	assert.deepEqual(h.wireFor("terminal.run"), []);
+	});
+	assert.deepEqual(mapped, ["--no-extensions", "-e", remoteEntry]);
 });
 
 test("xm-dispatch D2: an inherited extension that machine cannot load is SKIPPED — the launch proceeds and says so once", async (t) => {

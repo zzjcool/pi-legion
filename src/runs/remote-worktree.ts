@@ -263,6 +263,73 @@ function gitErrorText(error: unknown): string {
 	return String(error);
 }
 
+/**
+ * What this machine's side of a delivery actually is (contract D5).
+ *
+ * The bug this type exists to stop: `rev-parse` is never asked, so "this path is
+ * not a repository" and "this repository has no origin" collapsed into one
+ * answer (`catch { "" }`) and the reader was told to `git remote add origin` in a
+ * directory that is not a repository — the one advice that cannot work there.
+ * Three states need three sentences, so the state is a value, not an empty string.
+ */
+export type LocalCheckoutState =
+	| { kind: "checkout"; origin?: string }
+	| { kind: "not-a-checkout" }
+	| { kind: "no-git"; code: number | null; detail: string };
+
+/**
+ * Ask git TWO questions about `repo` on THIS machine (D5): is it a checkout, and
+ * if so what is its `origin`?
+ *
+ * The ONE probe both call sites use (`cross-machine-preflight.ts` step 2 and
+ * {@link assertSharedOrigin}), so the preflight and the worktree creator cannot
+ * drift into answering the same situation differently. Same probe budget as every
+ * other `rev-parse`/`remote` probe in this file (`GIT_PROBE_TIMEOUT_MS`) and the
+ * same stderr-first detail formatting (`gitErrorText`).
+ *
+ * `no-git` is a fact about the MACHINE, not about the directory: it is returned
+ * only when `git` could not be spawned at all (ENOENT, or a spawn failure with no
+ * exit status and no stderr). Anything git answered — including a broken-repo 128
+ * — is `not-a-checkout`.
+ */
+export function localCheckoutState(repo: string): LocalCheckoutState {
+	try {
+		localGit(repo, ["rev-parse", "--git-dir"]);
+	} catch (error) {
+		if (gitCouldNotRun(error)) {
+			const { status, code } = error as { status?: unknown; code?: unknown };
+			return { kind: "no-git", code: typeof status === "number" ? status : null, detail: gitErrorText(error) };
+		}
+		return { kind: "not-a-checkout" };
+	}
+	let origin: string | undefined;
+	try {
+		const url = localGit(repo, ["remote", "get-url", "origin"]).trim();
+		origin = url.length > 0 ? url : undefined;
+	} catch {
+		// A checkout that was never cloned: "no origin" is an ANSWER here (D10), and
+		// the caller words it differently from "not a checkout at all".
+		origin = undefined;
+	}
+	return { kind: "checkout", origin };
+}
+
+/**
+ * Could the `git` binary not be started at all?
+ *
+ * `execFileSync` throws with `code: "ENOENT"` when the program is not on PATH; a
+ * spawn-level failure also carries `status: null` with no `stderr` (a git that
+ * RAN and refused always has a numeric status and usually says why). Those two
+ * shapes are the whole test — anything else is git answering about the directory.
+ */
+function gitCouldNotRun(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const { status, code, stderr } = error as { status?: unknown; code?: unknown; stderr?: Buffer | string | null };
+	if (code === "ENOENT") return true;
+	const said = stderr === undefined || stderr === null ? "" : String(stderr).trim();
+	return status === null && said.length === 0;
+}
+
 // ── the transport layer (one `machine.exec` each) ──────────────────────────
 
 /**
@@ -450,6 +517,48 @@ export function remoteGitMissingMessage(opts: { host: string; code: number | nul
 }
 
 /**
+ * D5: this machine has no usable `git` at all.
+ *
+ * The text used to live inline in `cross-machine-preflight.ts` step 1; it moved
+ * here verbatim so that {@link assertSharedOrigin} — which previously had no
+ * answer for this state and would have reported "no origin" — says the same
+ * thing. `git --version exited …` stays accurate for both call sites: a git that
+ * cannot be spawned fails that command too.
+ */
+export function noLocalGitMessage(opts: {
+	host: string;
+	localRepo: string;
+	code: number | null;
+	detail: string;
+}): string {
+	const code = opts.code === null ? "no exit code" : String(opts.code);
+	return (
+		`this machine has no usable git (git --version exited ${code}: ${opts.detail}); ` +
+		"a cross-machine centurion delivers through git worktrees, so git must be on PATH here too. " +
+		"Two ways out: 1) install git here and retry; " +
+		`2) drop the worktree delivery — dispatch a worker instead: subagent({ agent: "worker", host: "${opts.host}", task: "..." }) needs no worktree and no git.`
+	);
+}
+
+/**
+ * D5: this session's directory is not a git checkout at all.
+ *
+ * The advice `noLocalOriginMessage` gives (`git remote add origin`) is IMPOSSIBLE
+ * here — a directory that is not a repository has nowhere to add a remote — so
+ * this sentence must not borrow it. What actually works is to run the launch from
+ * a checkout (pi started inside one, or a relative `cwd` that points at one) or to
+ * dispatch a worker, which needs neither checkout nor origin.
+ */
+export function notALocalCheckoutMessage(opts: { host: string; localRepo: string }): string {
+	return (
+		`cross-machine delivery needs a git checkout on this machine too, and this session's directory (${opts.localRepo}) is not one. ` +
+		"Two ways out: 1) run the launch from a checkout — start pi inside yours, or pass a relative cwd that points at one " +
+		`plus hostCwd for the directory ON that machine: subagent({ agent: "centurion", host: "${opts.host}", cwd: "../my-repo", hostCwd: "/abs/path/on/${opts.host}", task: "..." }); ` +
+		`2) dispatch a worker instead — subagent({ agent: "worker", host: "${opts.host}", task: "..." }) needs no checkout and no origin.`
+	);
+}
+
+/**
  * D6: THIS checkout has no `origin`.
  *
  * The two ways out are asymmetric because the fix is: add a remote HERE (and make
@@ -494,6 +603,12 @@ export function originMismatchMessage(opts: {
 /**
  * Prove both checkouts point at the SAME `origin` before a tree is created (D10).
  *
+ * The three local facts get three answers (D5) from the ONE probe
+ * {@link localCheckoutState}: git that cannot run, a directory that is not a
+ * checkout, and a checkout without `origin`. Collapsing the first two into "this
+ * checkout has no origin" is what told a real operator to `git remote add origin`
+ * inside a directory that is not a repository.
+ *
  * Order matters for the message: "this checkout has no origin" is fixed here, on
  * this machine, by adding a remote; "that machine's checkout has no origin" is
  * fixed there. Then the different-remote case names BOTH urls, because the
@@ -505,16 +620,35 @@ export async function assertSharedOrigin(opts: {
 	localRepo: string;
 }): Promise<void> {
 	const { client, target, localRepo } = opts;
-	let localOrigin: string;
-	try {
-		localOrigin = localGit(localRepo, ["remote", "get-url", "origin"]).trim();
-	} catch {
-		localOrigin = "";
+	const local = localCheckoutState(localRepo);
+	if (local.kind === "no-git") {
+		throw new SubagentError(
+			noLocalGitMessage({
+				host: target.host,
+				localRepo,
+				code: local.code,
+				detail: local.detail,
+			}),
+			ErrorCodes.INVALID_PARAMS,
+			{ host: target.host, localRepo, code: local.code, noModelFallback: true },
+		);
 	}
+	if (local.kind === "not-a-checkout") {
+		// A local-repository fact is about the MACHINE, not the model: without this flag
+		// the deterministic refusal walks the whole candidate chain, re-running the same
+		// three git probes per candidate.
+		throw new SubagentError(notALocalCheckoutMessage({ host: target.host, localRepo }), ErrorCodes.INVALID_PARAMS, {
+			host: target.host,
+			localRepo,
+			noModelFallback: true,
+		});
+	}
+	const localOrigin = (local.origin ?? "").trim();
 	if (localOrigin.length === 0) {
 		throw new SubagentError(noLocalOriginMessage({ host: target.host, localRepo }), ErrorCodes.INVALID_PARAMS, {
 			host: target.host,
 			localRepo,
+			noModelFallback: true,
 		});
 	}
 	const remoteOrigin = await remoteOriginUrl(client, target, target.cwd);
@@ -522,7 +656,7 @@ export async function assertSharedOrigin(opts: {
 		throw new SubagentError(
 			noRemoteOriginMessage({ host: target.host, cwd: target.cwd, localOrigin }),
 			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, cwd: target.cwd },
+			{ host: target.host, cwd: target.cwd, noModelFallback: true },
 		);
 	}
 	if (normalizeGitRemoteUrl(localOrigin) !== normalizeGitRemoteUrl(remoteOrigin)) {
@@ -534,7 +668,7 @@ export async function assertSharedOrigin(opts: {
 				localOrigin,
 			}),
 			ErrorCodes.INVALID_PARAMS,
-			{ host: target.host, cwd: target.cwd, remoteOrigin, localOrigin },
+			{ host: target.host, cwd: target.cwd, remoteOrigin, localOrigin, noModelFallback: true },
 		);
 	}
 }

@@ -624,10 +624,11 @@ export class Orchestrator {
 	private readonly remoteVerify?: RemoteVerifyRunner;
 	private readonly remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
 	/**
-	 * This collect's remote transcripts, keyed by child name. Filled once per
-	 * `collect()` (a read-back is a network round trip, not a per-parse cost) and
-	 * read by {@link sessionFileOf}, so every `parseSessionFile` in the collect path
-	 * sees the LOCAL MIRROR without the record ever being mutated.
+	 * This collect's remote transcripts, keyed by child name. Filled at the top of
+	 * `collect()` and refreshed once the turn is over (a read-back is a network round
+	 * trip, not a per-parse cost) and read by {@link sessionFileOf}, so every
+	 * `parseSessionFile` in the collect path sees the LOCAL MIRROR without the record
+	 * ever being mutated.
 	 */
 	private readonly remoteSessions = new Map<string, RemoteReadbackResult>();
 	private readonly worktreeBootstrap?: string;
