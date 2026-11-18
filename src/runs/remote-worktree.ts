@@ -479,7 +479,7 @@ function checkoutTwoWaysOut(host: string, cwd: string): string {
 	return (
 		` Two ways out: 1) give that machine a checkout at ${cwd} — git clone <url> ${cwd} on '${host}' — or point ` +
 		`subagents.crossMachine.hosts.${host}.cwd at a directory that is a git checkout; ` +
-		"2) dispatch a worker instead (workers need no worktree and no git)."
+		"2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion)."
 	);
 }
 
@@ -512,7 +512,7 @@ export function remoteGitMissingMessage(opts: { host: string; code: number | nul
 	return (
 		`host '${opts.host}': git is not available on that machine (${opts.command} exited ${code}: ${detail}). ` +
 		"A cross-machine centurion delivers through git worktrees, so git must be on PATH there. " +
-		`Two ways out: 1) install git on '${opts.host}' and retry; 2) dispatch a worker instead (workers need no worktree and no git).`
+		`Two ways out: 1) install git on '${opts.host}' and retry; 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).`
 	);
 }
 
@@ -609,7 +609,7 @@ export function noRemoteOriginMessage(opts: { host: string; cwd: string; localOr
 	return (
 		`host '${opts.host}': ${opts.cwd} has no origin on that machine; cross-machine delivery needs one shared remote. ` +
 		`Two ways out: 1) add one there — hc exec --on ${opts.host} -- git -C ${opts.cwd} remote add origin <url> ` +
-		`(same url as this checkout's '${opts.localOrigin}'); 2) dispatch a worker instead (workers need no origin).`
+		`(same url as this checkout's '${opts.localOrigin}'); 2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion).`
 	);
 }
 
@@ -624,7 +624,7 @@ export function originMismatchMessage(opts: {
 		`host '${opts.host}': its checkout at ${opts.cwd} has origin '${opts.remoteOrigin}' but this checkout's is '${opts.localOrigin}'; ` +
 		"cross-machine delivery needs one shared remote. " +
 		"Two ways out: 1) make both sides point at one url (git remote set-url origin <url> on either side); " +
-		"2) dispatch a worker instead (workers need no origin)."
+		"2) dispatch the centurion and let it create that role there (a role outside subagents.crossMachine.allowRoles cannot be dispatched from this session; the default is centurion)."
 	);
 }
 

@@ -9,6 +9,32 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [Unreleased] — 6.2.2（patch）
+
+6.2.1 真机复跑暴露的三个问题 + 两个产品要求，都是「第一次就能跑通」这一目标的收尾。
+
+- **预检真的认 `cwd` 了**：之前 `Orchestrator.launch` 把父机 checkout 写死成会话目录，于是
+  `cwd: "../my-repo"`（相对，本机 checkout）+ `hostCwd` 仍报「这个会话目录不是 git 仓库」——
+  文案许诺的能力并不存在。现在相对 `cwd` 解析成父机 checkout（git 就在**那个**目录里问 origin，
+  worktree 也从它建），绝对 `cwd` 仍是那台机器上的目录；拒绝时点名真正被问的那个目录。
+  `resume` / revive 不传这个字段，行为逐字节不变。
+- **文案不再推荐被策略禁止的调用**：三条本地交付拒绝（不是仓库 / 没有 origin / 没有 git）以前都写
+  「改派 worker —— `subagent({ agent: "worker", host, task })`」，而 `allowRoles` 默认只允许
+  `centurion`。现在第二条出路统一成「改派 centurion，让它在那台机器上创建 worker/scout」，并点明
+  `allowRoles` 的默认值，不再打印一个必然被拒的调用。
+- **模型：配置 > 远端默认，缺模型不再硬失败**：新键 `subagents.crossMachine.hosts.<h>.model`。
+  解析顺序：本次调用显式 `model` → 该键 → 那台机器 `--list-models` 的第一个（优先同 provider）
+  → 仍然没有才失败。回退时 launch 继续，handle 上一条 warning 说明「已从 X 换成 Y」以及怎么钉住；
+  失败时才打印该机可用模型清单（最多 20 条，或空清单的 `piExtensions` 解释）。
+  `/legion doctor crossmachine` 用同一顺序选模型，所以 doctor 的预判就是要发生的事。
+- **父会话退出后，遗留的跨机 child 可以恢复**：`nodes` schema v5 记录 `remote_dir` /
+  `remote_terminal`；`/legion status` 多一块「上一次会话启动、本会话没接手的跨机 child」（名字、
+  角色、host、状态、远端终端、年龄 + 一条可粘贴的恢复调用）；新 action
+  `subagent({ action: "recover", name })` 从旧会话的 ledger 行直接读回那台机器上的
+  `<remote_dir>/session.jsonl`，用 collect 的同一套规则判分（截断/读不到仍是 `unknown` + 取回命令，
+  不是 `aborted`），落定 ledger 行并返回 collect 文本；仍在远端活着的只说「还活着」，不落定；
+  第二次调用是 `already settled` + 已记录结果。
+
 ## [6.2.1] — 2026-11-18
 
 跨机派发从「反复失败」变成「第一次就能跑通」。两块：**跨机派发实际可用**（转录回传、入口目录声明、
