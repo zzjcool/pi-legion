@@ -1654,7 +1654,7 @@ test("D6/D8: a snapshot renders PASS/FAIL/SKIP with fixes and a launch, and a FA
 		assert.match(issue!.message, /^fakebox: 1 package\(s\) missing on fakebox: pi-sysmon/);
 		assert.equal(issue!.fix, "hc exec --on fakebox -- pi install npm:pi-sysmon");
 		// …and the next steps point AT those fixes instead of the old settings lecture.
-		assert.match(nextStepsBlock(report.text), /paste the `fix:` line under each FAIL above/);
+		assert.match(nextStepsBlock(report.text), /paste each FAIL's `fix:` line above/);
 	} finally {
 		resetDeliveryPreflightState();
 	}

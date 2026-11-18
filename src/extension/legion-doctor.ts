@@ -1331,7 +1331,7 @@ export function runLegionDoctor(options: DoctorOptions = {}): DoctorReport {
 		// ever the aside (D1).
 		if (issues.some((i) => i.code.startsWith("CROSSMACHINE_"))) {
 			steps.push(
-				"Cross-machine: paste the `fix:` line under each FAIL above (a FAIL that names `subagents.crossMachine.hosts.<host>` is a settings key — an absolute `cwd` on that machine, `enabled: true`), then re-run `/legion doctor crossmachine`.",
+				"Cross-machine: paste each FAIL's `fix:` line above (a command, or the settings JSON it prints), then re-run `/legion doctor crossmachine`.",
 			);
 		}
 		if (issues.some((i) => i.code === "MEMORY_GATE_WOULD_REFUSE")) {

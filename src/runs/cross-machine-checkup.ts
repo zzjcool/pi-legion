@@ -407,8 +407,14 @@ async function checkHost(input: {
 		const message = oneLine(errorMessage(error));
 		const question = message === oneLine(missingRemoteCwdQuestion(host)) ? missingRemoteCwdQuestion(host) : undefined;
 		items.push({ id: "target-checkout", status: "fail", line: message });
+		// No `cwd` is a fact about ONE input, not five separate unknowns: the SKIP
+		// lines say it once, in the same words, instead of repeating the question
+		// (which needs three sentences) under every item.
+		const skipReason = question !== undefined
+			? `no directory on ${host} yet — the FAIL above says how to pass it`
+			: firstSentence(message);
 		for (const id of TARGET_ITEM_IDS.slice(1)) {
-			items.push({ id, status: "skip", line: `${itemLabel(id)} not checked: ${firstSentence(message)}` });
+			items.push({ id, status: "skip", line: `${itemLabel(id)} not checked: ${skipReason}` });
 		}
 		return { host, source, items, ...(question !== undefined ? { question } : {}) };
 	}

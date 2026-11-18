@@ -514,7 +514,7 @@ test("D3/D6: bare `{enabled:true}` + a host only `machine list` knows → source
 		for (const id of ["target-origin", "target-runtime", "inherited-extensions", "target-models"]) {
 			const skipped = item(host.items, id);
 			assert.equal(skipped.status, "skip", id);
-			assert.match(skipped.line, /not checked: host 'fakebox' needs a directory on that machine/, id);
+			assert.match(skipped.line, /not checked: no directory on fakebox yet/, id);
 		}
 		// No probe was attempted: the refusal happens before discovery starts (D2).
 		assert.deepEqual(client.execs(), []);
