@@ -7,6 +7,7 @@
  */
 
 import { NODE_STATUSES, type LegionNode } from "../legion/nodes.ts";
+import { recoveryCallFor } from "../runs/remote-recover.ts";
 import type { InFlightToolStack } from "../supervisor/types.ts";
 import { formatInFlightToolLine } from "../supervisor/types.ts";
 import { formatTree } from "./legion-tools.ts";
@@ -14,6 +15,7 @@ import {
 	renderLiveChildStatus,
 	type LiveChildStatusInput,
 } from "./runtime.ts";
+import { formatDuration } from "./summary.ts";
 
 /** Child snapshot the status tool already prints. `now` is supplied by the caller. */
 export type LegionChildStatusFacts = Omit<LiveChildStatusInput, "now"> & {
@@ -61,6 +63,13 @@ export interface LegionStatusInput {
 	query?: string;
 	nodes: readonly LegionNode[];
 	jobs?: readonly LegionStatusJob[];
+	/**
+	 * Cross-machine rows a PREVIOUS process left unsettled (schema v5): the ones
+	 * `subagent({ action: "recover" })` can collect. Read from the ledger by the
+	 * caller (`listUnsettledRemoteNodes`), never from this process's memory — the
+	 * whole point is that this session has no handle on them.
+	 */
+	recoverable?: readonly LegionNode[];
 	/**
 	 * Persisted child behind the subagent status action.
 	 * Undefined when this process has no run-store record for the name.
@@ -164,7 +173,12 @@ function jobsOutsideTree(nodes: readonly LegionNode[], jobs: readonly LegionStat
 	);
 }
 
-function renderTree(nodes: readonly LegionNode[], jobs: readonly LegionStatusJob[]): string {
+function renderTree(
+	nodes: readonly LegionNode[],
+	jobs: readonly LegionStatusJob[],
+	recoverable: readonly LegionNode[],
+	now: number,
+): string {
 	const noun = nodes.length === 1 ? "node" : "nodes";
 	const counts = nodes.length > 0 ? ` · ${statusCounts(nodes)}` : "";
 	const lines = [`Legion status · ${nodes.length} ${noun}${counts}`];
@@ -175,7 +189,49 @@ function renderTree(nodes: readonly LegionNode[], jobs: readonly LegionStatusJob
 		lines.push("", "Live jobs not in the tree:");
 		for (const job of extras) lines.push(`- ${job.name} state=${job.state}`);
 	}
+	const recovery = renderRecoverableSection(recoverable, jobs, now);
+	if (recovery !== undefined) lines.push("", recovery);
 	lines.push("", "One node: /legion status <name>");
+	return lines.join("\n");
+}
+
+/**
+ * The `Recoverable cross-machine children` block, or `undefined` when there is none.
+ *
+ * A child of THIS process is skipped: a live job is already rendered (its own
+ * `alive` block, or the tree), and repeating it here would read as two children —
+ * the exact confusion `jobsOutsideTree` above avoids. What is left is precisely the
+ * set the user asked about: work a PREVIOUS session started on another machine and
+ * this one cannot reach any other way.
+ *
+ * Every line carries the two facts the user needs to act: what it is (name, role,
+ * host, status, terminal address, age) and the call that collects it. The call is
+ * `recoveryCallFor`, the same string the recovery header uses, so a typo cannot
+ * send the reader to an action that does not exist.
+ */
+export function renderRecoverableSection(
+	recoverable: readonly LegionNode[],
+	jobs: readonly LegionStatusJob[],
+	now: number,
+): string | undefined {
+	const seen = new Set<string>();
+	const rows = recoverable.filter((node) => {
+		if (!node.host) return false;
+		if (liveJobForNode(node, jobs)) return false;
+		if (seen.has(node.id)) return false;
+		seen.add(node.id);
+		return true;
+	});
+	if (rows.length === 0) return undefined;
+	const lines = ["Recoverable cross-machine children (this session never launched them):"];
+	for (const node of rows) {
+		const age = Number.isFinite(node.updatedAt) ? `${formatDuration(Math.max(0, now - node.updatedAt))} old` : "age unknown";
+		const terminal = node.remoteTerminal ?? "(terminal not recorded)";
+		lines.push(
+			`- ${node.name} · ${node.role} · host ${node.host} · ${node.status} · terminal ${terminal} · ${age}`,
+		);
+		lines.push(`  collect: ${recoveryCallFor(node.name)}`);
+	}
 	return lines.join("\n");
 }
 
@@ -183,7 +239,7 @@ function renderTree(nodes: readonly LegionNode[], jobs: readonly LegionStatusJob
 export function renderLegionStatus(input: LegionStatusInput): LegionStatusReport {
 	const query = input.query?.trim() ?? "";
 	const jobs = input.jobs ?? [];
-	if (!query) return { ok: true, text: renderTree(input.nodes, jobs) };
+	if (!query) return { ok: true, text: renderTree(input.nodes, jobs, input.recoverable ?? [], input.now ?? Date.now()) };
 
 	const matches = nodesMatching(input.nodes, query);
 	if (matches.length > 1) {

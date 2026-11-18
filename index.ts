@@ -62,7 +62,7 @@ import type { VerifyRunner } from "./src/runs/acceptance.ts";
 import { legionDbPath, openLegionDb, type DatabaseSync } from "./src/legion/db.ts";
 import { appendEvent, maxEventId } from "./src/legion/events.ts";
 import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
-import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, type LegionNode, updateNode } from "./src/legion/nodes.ts";
+import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, listUnsettledRemoteNodes, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { artifactById, markRead } from "./src/legion/ledger.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
@@ -155,13 +155,20 @@ import { createRemoteVerifyRunner } from "./src/runs/remote-verify.ts";
 import {
 	assertRemoteResume,
 	createRemoteSessionReadback,
+	createRemoteTerminalProbe,
+	type RemoteReadbackResult,
 	type RemoteResumeFacts,
 	type RemoteResumeVerdict,
+	type RemoteSessionRequest,
+	type RemoteTerminalProbe,
+	type RemoteTerminalProbeRequest,
 } from "./src/runs/remote-artifact.ts";
+import { recoverCrossMachineChild, recoveryHeadline, RECOVERY_ACTION } from "./src/runs/remote-recover.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
 	type ChildRecord,
+	type CrossMachineSettings,
 	DEFAULTS,
 	DEFAULT_MAX_RENEWALS,
 	DEFAULT_ON_BLOCKED,
@@ -325,8 +332,9 @@ const SubagentParams = Type.Object({
 				Type.Literal("stop"),
 				Type.Literal("diagnose"),
 				Type.Literal("extend"),
+				Type.Literal("recover"),
 			],
-			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor. extend = defer the `may be looping` REMINDER for one child only; it addresses this node's own direct children (an unknown or already-ended child is refused, and `runId` does not apply), it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`/`steer`/`renewal`." },
+			{ description: "Defaults to launch. wait REQUIRES name or all:true (mutually exclusive) — bare wait is rejected. A `stop` that reaches a child which already finished reports it as `already retired` / `Retired … already-settled` (nothing was interrupted), not as a failed stop. diagnose = Legion doctor self-check (extensions/models/spawn/memory/tools/storage/runtime); optional section filters like /legion doctor. extend = defer the `may be looping` REMINDER for one child only; it addresses this node's own direct children (an unknown or already-ended child is refused, and `runId` does not apply), it does not extend a collect/wait budget, does not restart or revive the child, and is not `continue`/`steer`/`renewal`. recover = collect a CROSS-MACHINE child a previous session launched and no longer holds (name it; no run store, no runId): it reads that child's transcript from its machine, grades it with the collect rules, settles the ledger row, and answers with the collect text. A child still LIVE on that machine is reported as such and nothing is settled; a second call answers `already settled` with the recorded outcome. `/legion status` lists what is recoverable." },
 		),
 	),
 	agent: Type.Optional(
@@ -2423,6 +2431,19 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				return undefined;
 			}
 		},
+		// Schema v5: the cross-machine rows a previous process left unsettled. Read
+		// from THIS session's ledger on every `/legion status`; a session with no
+		// identity (nothing launched yet, or a fresh run) has nothing to offer, and
+		// answering [] keeps the block out of the report rather than inventing it.
+		recoverable: () => {
+			try {
+				const identity = ownLegionIdentity();
+				return identity ? listUnsettledRemoteNodes(identity.db) : [];
+			} catch {
+				// A closed/stale ledger handle must never cost the user the status view.
+				return [];
+			}
+		},
 		commands: {
 			team: { loadCatalog: commandCatalogLoader },
 			agents: { loadCatalog: commandCatalogLoader },
@@ -3334,6 +3355,18 @@ async function controlAction(input: {
 	parentModel?: string;
 }): Promise<AgentToolResult<unknown>> {
 	const { action, params, store, cwd } = input;
+
+	// `recover` addresses a child THIS process never launched, so it runs before any
+	// name resolution: there is no run to scope it to and no supervisor handle to
+	// find (`src/runs/remote-recover.ts` explains why). Everything it needs is the
+	// ledger row plus the machine that row names.
+	if (action === RECOVERY_ACTION) {
+		return recoverAction({
+			params,
+			legion: input.legion,
+			crossMachine: input.settings.crossMachine,
+		});
+	}
 
 	if (action === "wait") {
 		if (params.name && params.all) {
@@ -6898,6 +6931,91 @@ function dedupeChildScopeCandidates(
 		out.push(candidate);
 	}
 	return out.sort((a, b) => a.runId.localeCompare(b.runId));
+}
+
+/**
+ * `subagent({ action: "recover", name })` — collect a cross-machine child this
+ * session never launched.
+ *
+ * The user's own words for the gap: *“这个是不是可以放到数据库里面，下次打开会话恢复？”*
+ * — a parent's launch exits, the child keeps running on the other machine, and the
+ * next session can neither see nor collect it. This action is the second half: the
+ * `nodes` row (schema v5) carries the host, the remote dir and the terminal
+ * address, so a process with no supervisor handle can still fetch that child's
+ * transcript, grade it, and settle the row.
+ *
+ * Deliberately narrow, and everything it does NOT do is on purpose:
+ *
+ *  - it does not adopt the child (no live supervisor handle, no second writer for
+ *    one child's ledger row) — that is S5's problem, not this action's;
+ *  - it needs no run store and no `runId`: a leftover is addressed by NAME against
+ *    the ledger, and a `--session`-reopened tree finds it there;
+ *  - it never invents a verdict: a live terminal, an unreadable transcript or an
+ *    unanswerable machine all report what they are and settle nothing;
+ *  - it renders through `renderCollect` — one formatter for collected and recovered
+ *    children alike — after ONE leading line that says what recovery did.
+ */
+export async function recoverAction(input: {
+	params: { name?: string };
+	/**
+	 * This session's ledger (`LegionRuntimeIdentity`'s handle + path). Absent = this
+	 * session has no tree at all, which is the honest "nothing recorded to recover"
+	 * answer rather than a NOT_FOUND for a name nobody could have written.
+	 */
+	legion: { db: DatabaseSync; dbPath: string } | undefined;
+	crossMachine: CrossMachineSettings | undefined;
+	/** Test seam: the transcript read-back. Defaults to the production `hc` client. */
+	readback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
+	/** Test seam: the terminal probe. Defaults to the production `hc` client. */
+	probeTerminal?: (request: RemoteTerminalProbeRequest) => Promise<RemoteTerminalProbe>;
+	now?: () => number;
+}): Promise<AgentToolResult<unknown>> {
+	const name = input.params.name?.trim();
+	if (!name) {
+		return fail(
+			"`name` is required for recover (the child's handle, exactly as `/legion status` lists it).",
+			ErrorCodes.INVALID_PARAMS,
+		);
+	}
+	if (!input.legion) {
+		return ok(
+			"No legion ledger in this session: there is no cross-machine child to recover, because no row recording one exists here. `recover` works on the tree a PREVIOUS session of this conversation left behind.",
+		);
+	}
+	const outcome = await recoverCrossMachineChild({
+		db: input.legion.db,
+		name,
+		crossMachine: input.crossMachine,
+		// The mirror sits beside the LEDGER, i.e. `<runDir>/remote/<name>.jsonl` — the
+		// very path a collect writes. A recovery therefore refreshes the bytes the
+		// earlier session fetched instead of opening a second mirror of the same file.
+		mirrorDir: path.dirname(input.legion.dbPath),
+		...(input.readback ? { readback: input.readback } : {}),
+		...(input.probeTerminal ? { probeTerminal: input.probeTerminal } : {}),
+		...(input.now ? { now: input.now } : {}),
+	});
+	if (!outcome.ok) return fail(outcome.text, ErrorCodes.NOT_FOUND);
+	const { recovery } = outcome;
+	return ok(
+		[
+			recoveryHeadline(recovery),
+			renderCollect(recovery.node.name, {
+				execution: recovery.execution,
+				output: recovery.output,
+				acceptance: recovery.acceptance,
+				remoteReadback: recovery.readback,
+			}),
+		].join("\n"),
+		{
+			recover: {
+				nodeId: recovery.node.id,
+				kind: recovery.kind,
+				host: recovery.node.host,
+				execution: recovery.execution.status,
+				...(recovery.settledStatus ? { settledStatus: recovery.settledStatus } : {}),
+			},
+		},
+	);
 }
 
 /**
