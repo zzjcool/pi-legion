@@ -151,12 +151,37 @@ make xm-model                      # 额外一次「父机模型在远端不存�
 XM_ASSERT a1 PASS  role-policy
 XM_ASSERT a2 PASS  machine-list
 XM_ASSERT b  PASS  launch
+XM_ASSERT x0 PASS  the parent pi --print exits on its own
 XM_ASSERT c  PASS  remote-artifact
-XM_ASSERT d  PASS  transcript-readback
-XM_ALL_PASS run=r-xxxx child=centurion-0
+XM_ASSERT d0 PASS  zero-config collect delivers the transcript
+XM_ASSERT c2 PASS  remote-artifact          （Run B）
+XM_ASSERT d  PASS  transcript-readback      （Run B）
+XM_ASSERT d1 PASS  collect on a remote child delivers
+XM_ASSERT x0 PASS  the parent pi --print exits on its own  （Run B）
+XM_ALL_PASS run=r-xxxx,r-yyyy child=centurion-0,centurion-b
 ```
 
 任何 `FAIL` 后面必须紧跟 `evidence:` 一行 JSON。
+
+### 5.3.1 d0 / d1（原 known-gap，6.2.3 翻成正向）
+
+这两条曾是「钉住现状」的断言（产品有 bug 时它们 PASS，修好后变红）。6.2.3 修掉了两个 bug，
+断言随之翻成正向 —— **不要再把它们改回 known-gap**：
+
+- **d0（Run A，零配置）**：settings 只有 `subagents.crossMachine.enabled: true`。要求 `collect`
+  真的把 transcript 拉回来：`<runDir>/remote/<child>.jsonl` 行数 > 0、**包含远端 session 最后
+  一条 assistant 文本**、collect 文本里有 verdict 行，且**不出现**任何旧拒绝句
+  （`collect failed` / `belongs to host` / `local filesystem and git operations on it are refused`
+  / `has no entry in subagents.crossMachine.hosts`）。根因是 read-back 用了 launch 解析器
+  （要求 `hosts.<h>.cwd`），修法是 `resolveReadTarget`（读只需要 host）。
+- **d1（Run B，有 `hosts.remote`）**：要求 collect **出 verdict**：read-back 行（`read-back from
+  host '<h>': N of M lines`）、`execution:` 行、child 自己的最后文本，且无 ownership 句子。
+  根因是 `assertLocalWorktree(child)` 无条件站在验收路径上（跨机 child 拥有自己的树）；修法是把
+  D13 守卫收窄到「本机 fs/git 操作」。
+- **x0（Run A + B）**：父 `pi --print` 必须**自己退出**（`rc` 落盘、`natural_exit=true`、
+  `killed=false`）。`runParentStep` 曾经为这个缺陷写了容错（等 sentinel 然后自己 kill 终端），
+  现在把「有没有被 kill」变成断言：`killed` 即失败。根因是终端后端的会话级 `hc connect`
+  从未关闭，而 `pi --print` 靠事件循环排空退出。
 
 ### 5.4 `make xm-model`
 
