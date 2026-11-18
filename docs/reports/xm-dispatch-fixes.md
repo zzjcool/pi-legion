@@ -360,6 +360,23 @@ npm run test:integration → ℹ tests 169    ℹ pass 169    ℹ fail 0
   记录格式——读回路径由 `remoteDir`（记录里）与 `mirrorRoot`（配置）决定，两者一致时读取正确，
   不一致时 `classifyReadbackFailure` 会把「recorded dir vs configured dir」作为证据打印出来。
 
+## 已知遗留（不在本次范围，但与本路径命名同源）
+
+- **远端镜像目录在生产里恒为 `no-run`**：`index.ts:1635` 是唯一的生产构造点
+  `new TerminalSupervisor()`，**不传 `runId`**（构造函数注释也写了"index.ts 在构造 supervisor 时
+  拿不到 run id"），于是 `remoteDirFor(target, undefined, name)` → `<mirrorRoot>/no-run/<name>`。
+  测试全部显式传了 `runId`（`test/integration/fake-core-remote-fate*.test.ts`），所以这个形状
+  只出现在真机上。`no-run` 本身**不是故障信号**（`docs/contracts/remote-child-fate-v1.md` 已写明）。
+- **由此带来的跨 run 撞名风险（既有，非本次引入）**：同一台机器上，两个不同 run 若派生**同名**
+  child（`worker-0` 是最常见的名字），在远端会用**同一个** `<mirrorRoot>/no-run/worker-0/session.jsonl`
+  ——`--session` 是显式指到那个路径的（`terminal-supervisor.ts:561-570`）。后一个 child 启动会接着写
+  或覆盖同一个文件；前一个 run 之后若再 collect，读到的可能是**另一个 run 的转录**。
+  本次修复把判词改成"读最后一次"，因此这一场景的失败形态从"陈旧快照 → `aborted`"变成
+  "读到别人的转录 → 看起来正常的判词"，**更隐蔽**，故在此明写。
+  缓解方向（未实现，需要单独设计）：把真实 run id 传进 `TerminalSupervisor`，让远端镜像目录成为
+  `<mirrorRoot>/<runId>/<name>`；不能只改 `remoteDirFor` 的 fallback——launch 与 read-back 必须同时
+  切换，否则两边算出两个路径。
+
 ## 版本建议
 
 三个 bug 都是**行为错误修复 + 一个默认收紧**（`allowRoles` 默认只放 centurion）。默认收紧对
