@@ -1,5 +1,11 @@
 # 跨机器 e2e 执行手册（S5）
 
+> **硬规定（v6.2.2 起）：任何跨机改动的交付，必须附 `cd test/docker && make xm` 的实测输出
+> （含 `XM_ALL_PASS` 那一行）；没有实测输出的跨机改动不算完成。** 这条没有例外：
+> 「单测全绿」只证明 fake core 上的协议形状，`make xm` 才证明真双机（两容器、两套文件系统、
+> 真 `hc` + 真 ssh）上四件事同时成立——角色策略、零配置启动、远端产物落地、转录回传。
+> 自测台的建设与限制见 `docs/reports/xm-harness.md`。
+
 > 配套测试：`test/live/remote-e2e.test.ts`　契约：`docs/contracts/cross-machine-spawn-v1.md`
 > 这份手册的命令可以逐行照抄。每一步都写了**期望输出**和**失败时怎么读**。
 

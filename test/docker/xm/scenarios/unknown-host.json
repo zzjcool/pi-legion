@@ -1,0 +1,43 @@
+{
+  "models": [
+    {
+      "id": "flash",
+      "name": "XM Flash"
+    }
+  ],
+  "rules": [
+    {
+      "name": "a2-turn0-unknown-machine-must-be-refused",
+      "when": {
+        "turnIndex": 0
+      },
+      "then": {
+        "type": "tool_call",
+        "name": "subagent",
+        "arguments": {
+          "agent": "centurion",
+          "task": "XM_A2_PROBE — this dispatch must be refused because the machine does not exist",
+          "host": "no-such-machine",
+          "hostCwd": "{{HOST_CWD}}"
+        }
+      }
+    },
+    {
+      "name": "a2-turn1-echo-the-tool-result-verbatim",
+      "when": {
+        "turnIndex": 1
+      },
+      "then": {
+        "type": "text",
+        "content": "A2_TOOL_RESULT {{lastToolContent}}"
+      }
+    },
+    {
+      "name": "catch-all-final-text",
+      "then": {
+        "type": "text",
+        "content": "A2_TOOL_RESULT (extra turn; earlier text above)"
+      }
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "models": [
+    {
+      "id": "flash",
+      "name": "XM Flash"
+    }
+  ],
+  "rules": [
+    {
+      "name": "parent-turn0-launch-remote-centurion",
+      "when": {
+        "turnIndex": 0
+      },
+      "then": {
+        "type": "tool_call",
+        "name": "subagent",
+        "arguments": {
+          "agent": "centurion",
+          "name": "{{CHILD_NAME}}",
+          "task": "XM_CHILD_TASK {{NONCE}} — you are the deterministic child. Run the bash step, then answer with the single XM_CHILD_FINAL line and stop.",
+          "host": "{{HOST}}",
+          "hostCwd": "{{HOST_CWD}}"
+        }
+      }
+    },
+    {
+      "name": "parent-turn1-wait-until-the-remote-child-settles",
+      "when": {
+        "turnIndex": 1
+      },
+      "then": {
+        "type": "tool_call",
+        "name": "bash",
+        "arguments": {
+          "command": "for i in $(seq 1 60); do out=$(timeout 20 /usr/local/bin/hc wait {{HOST}}/lgl-{{CHILD_NAME}} --json 2>&1 || true); case \"$out\" in *'\"status\":\"done\"'*) echo XM_CHILD_SETTLED; exit 0;; esac; done; echo XM_CHILD_NOT_SETTLED; exit 1"
+        }
+      }
+    },
+    {
+      "name": "parent-turn2-collect-the-child",
+      "when": {
+        "turnIndex": 2
+      },
+      "then": {
+        "type": "tool_call",
+        "name": "subagent",
+        "arguments": {
+          "action": "collect",
+          "name": "{{CHILD_NAME}}"
+        }
+      }
+    },
+    {
+      "name": "parent-turn3-done",
+      "when": {
+        "turnIndex": 3
+      },
+      "then": {
+        "type": "text",
+        "content": "RESULT: done {{NONCE}}"
+      }
+    },
+    {
+      "name": "catch-all-final-text",
+      "then": {
+        "type": "text",
+        "content": "RESULT: done {{NONCE}} (extra turn)"
+      }
+    }
+  ]
+}

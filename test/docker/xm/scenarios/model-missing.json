@@ -1,0 +1,58 @@
+{
+  "models": [
+    {
+      "id": "flash",
+      "name": "XM Flash"
+    }
+  ],
+  "rules": [
+    {
+      "name": "m-turn0-dispatch-a-model-the-remote-cannot-see",
+      "when": {
+        "turnIndex": 0
+      },
+      "then": {
+        "type": "tool_call",
+        "name": "subagent",
+        "arguments": {
+          "agent": "centurion",
+          "name": "{{CHILD_NAME}}",
+          "task": "XM_MODEL_PROBE {{NONCE}} — the remote machine does not serve the requested model, so the launch must fall back to a model that machine lists",
+          "host": "{{HOST}}",
+          "hostCwd": "{{HOST_CWD}}",
+          "model": "{{MOCK_MODEL}}"
+        }
+      }
+    },
+    {
+      "name": "m-turn1-wait-until-the-fallback-child-settles",
+      "when": {
+        "turnIndex": 1
+      },
+      "then": {
+        "type": "tool_call",
+        "name": "bash",
+        "arguments": {
+          "command": "for i in $(seq 1 60); do out=$(timeout 20 /usr/local/bin/hc wait {{HOST}}/lgl-{{CHILD_NAME}} --json 2>&1 || true); case \"$out\" in *'\"status\":\"done\"'*) echo XM_CHILD_SETTLED; exit 0;; esac; done; echo XM_CHILD_NOT_SETTLED; exit 1"
+        }
+      }
+    },
+    {
+      "name": "m-turn2-echo-the-tool-result-verbatim",
+      "when": {
+        "turnIndex": 2
+      },
+      "then": {
+        "type": "text",
+        "content": "MODEL_TOOL_RESULT {{lastToolContent}}"
+      }
+    },
+    {
+      "name": "catch-all-final-text",
+      "then": {
+        "type": "text",
+        "content": "MODEL_TOOL_RESULT (extra turn; earlier text above)"
+      }
+    }
+  ]
+}
