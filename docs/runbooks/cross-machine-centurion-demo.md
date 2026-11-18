@@ -34,8 +34,8 @@ checkout 的 origin」必须是**同一个 url**：少了这个共同点，父�
 
 | 你看到的字 | 它意味着什么 / 改哪里 |
 |---|---|
-| 第一行退出 1、stderr 是 `error: No such remote 'origin'` | 父机这个 checkout 没有 origin → 走下面第 1 条出路 |
-| 第三行退出 1、stderr 是 `fatal: not a git repository (or any of the parent directories)` | 目标机上那个 `<cwd>` 不是 git checkout（或路径不对）→ 先修正 `subagents.crossMachine.hosts.<host>.cwd` |
+| 第一行退出 2、stderr 是 `error: No such remote 'origin'` | 父机这个 checkout 没有 origin → 走下面第 1 条出路 |
+| 第三行退出 128、stderr 是 `fatal: not a git repository (or any of the parent directories): .git` | 目标机上那个 `<cwd>` 不是 git checkout（或路径不对）→ 先修正 `subagents.crossMachine.hosts.<host>.cwd` |
 | 两行的 url 不一样 | 两侧指向了两个 remote → `git remote set-url origin <url>` 改其中一侧 |
 
 ### 没有 origin 时的两种出路
@@ -72,10 +72,12 @@ checkout 的 origin」必须是**同一个 url**：少了这个共同点，父�
 }
 ```
 
+可选：`worktreeRoot` 缺省是 `<dirname(cwd)>/.pi-worktrees` —— 步骤 2 要找的那棵树就在这个位置。
+
 | 键 | 填什么 | **不填会怎样** |
 |---|---|---|
 | `enabled` | `true`。缺省关闭 | 关了还点名 `host` 会被**拒绝**（不是悄悄在本机跑） |
-| `cwd` | 目标机上那个 checkout 的绝对路径 | 路径按父机的解析 → 远端 `cd` 到不存在的地方 |
+| `cwd` | 目标机上那个 checkout 的绝对路径 | 缺省会拿**父机**的 cwd 当远端路径 → 那台机器上通常没有这个目录（`host '<h>' has no checkout at <cwd> …`） |
 | `node` | 目标机上 node 的**绝对路径** | 远端非交互 shell 没有 nvm、PATH 没初始化 → `host 'vps': node 'node' is not on PATH on vps (set subagents.crossMachine.hosts.vps.node to a path on that machine)`，在 preflight 的 10 秒内就失败 |
 | `piCli` | node 能执行的**JS 入口**，形如 `…/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js` | 指到 `/root/.pi/agent/bin/pi` 这种 shell 启动器 → preflight `exit 16`，真机原文是 `SyntaxError: Unexpected token case`（子进程 argv 是 `[node, piCli, …]`，node 把 shell 当 JS 解析） |
 | `piLegionRoot` | 本包在**目标机**上的绝对路径 | 两侧 checkout 路径不同（几乎总是）时 → `host 'vps': this package is not installed at /Users/you/code/app on that machine (every child's argv loads /Users/you/code/app/index.ts; set subagents.crossMachine.hosts.vps.piLegionRoot to where it really is, or install it there)` |
@@ -127,8 +129,7 @@ subagent({
 ```
 
 `<name>` 是 handle 名（`centurion-0` 之类），`supervisor=terminal` 说明它真的被交给了
-远端终端后端，而不是悄悄在本机起了一个。随后 `subagent({ action: "status", name: "<name>" })`
-能看到同一个 handle 的 `host`。
+远端终端后端，而不是悄悄在本机起了一个。物证在下一小节 —— 树建在哪台机器上，活儿就在哪台机器上。
 
 ### 怎么确认它真的在目标机上
 
