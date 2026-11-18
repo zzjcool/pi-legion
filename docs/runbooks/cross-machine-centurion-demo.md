@@ -1,7 +1,9 @@
 # 跨机器 centurion 演示手册（三步）
 
-> 配套契约：`docs/contracts/cross-machine-spawn-v1.md`（D5 交付预检 / D6 文案 / D7 顺序 / D8 doctor）
-> 配置键：`subagents.crossMachine`　前置：父机与目标机都能被同一个 `hc` core 看见
+> 交付通道与共享 origin 的冻结语义见 `docs/contracts/cross-machine-spawn-v1.md`（D10 一致 origin、D11 远端建树）；
+> 本次三处 UX 修复（phases 报错文案 / 交付预检顺序 / `doctor crossmachine`）见 `CHANGELOG.md` 的 `## [Unreleased]`。
+> 配置键：`subagents.crossMachine`　前置：①父机与目标机都能被同一个 `hc` core 看见
+> ②**pi 本身跑在 hc 终端里**（`HC_TERMINAL_SOCKET` + `HC_TERMINAL_ID`，见步骤 1 的「前置自检」）
 
 这份是**给人照着演示**的三步：把一个 centurion 派到另一台机器上跑，活儿在那里干、交付仍走 git。
 它不是测试手册 —— 真机 e2e 的断言在 `docs/runbooks/cross-machine-live-e2e.md`，两者别混用（见最后一节）。
@@ -20,7 +22,9 @@ centurion 的交付单位是 **git worktree**：它在目标机上建一棵树�
 `push` 到 `origin`，父机再从**同一个** `origin` `fetch` 回那个 sha。跨机交付只有这一条通道 ——
 git remote，远端路径永远不会被翻译成本地路径。所以「父机 checkout 的 origin」与「目标机
 checkout 的 origin」必须是**同一个 url**：少了这个共同点，父机拿不到目标机交付的东西，
-跨机 centurion 就交付不了。
+跨机 centurion 就交付不了。**「同一个」是归一化后相同，不是逐字相同** ——
+`normalizeGitRemoteUrl` 把 `git@host:path` 与 `ssh://git@host/path` 归一成同一个，
+scheme、用户名、末尾斜杠、末尾 `.git` 都不计。
 
 ### 检查（三步，都很快）
 
@@ -28,7 +32,7 @@ checkout 的 origin」必须是**同一个 url**：少了这个共同点，父�
 |---|---|
 | `git remote get-url origin`（在父机的 checkout 里） | 一个**双方都能访问**的 url，例如 `git@github.com:you/your-repo.git` |
 | `hc machine ls` | 列表里有你要用的 `<host>` |
-| `hc exec --on <host> -- git -C <cwd> remote get-url origin` | 与上一行**逐字相同**的 url |
+| `hc exec --on <host> -- git -C <cwd> remote get-url origin` | 与上一行**归一化后相同**的 url（`git@host:path` 与 `ssh://git@host/path` 视为同一个） |
 
 ### 失败怎么读
 
@@ -36,7 +40,7 @@ checkout 的 origin」必须是**同一个 url**：少了这个共同点，父�
 |---|---|
 | 第一行退出 2、stderr 是 `error: No such remote 'origin'` | 父机这个 checkout 没有 origin → 走下面第 1 条出路 |
 | 第三行退出 128、stderr 是 `fatal: not a git repository (or any of the parent directories): .git` | 目标机上那个 `<cwd>` 不是 git checkout（或路径不对）→ 先修正 `subagents.crossMachine.hosts.<host>.cwd` |
-| 两行的 url 不一样 | 两侧指向了两个 remote → `git remote set-url origin <url>` 改其中一侧 |
+| 两行的 url 归一化后仍不一样 | 两侧指向了两个不同 remote → `git remote set-url origin <url>` 改其中一侧 |
 
 ### 没有 origin 时的两种出路
 
@@ -50,8 +54,12 @@ checkout 的 origin」必须是**同一个 url**：少了这个共同点，父�
 
 ## 1. 配置：`subagents.crossMachine`
 
-最小的一份（`.pi/settings.json` 放在项目里，或 `~/.pi/settings.json` 用户级；
-`piLegionRoot` 的取法见下表）：
+最小的一份。它只从下面**两个**位置读，项目级在用户级之上（`piLegionRoot` 的取法见下表）：
+
+| 位置 | 说明 |
+|---|---|
+| `~/.pi/agent/settings.json` | **用户级**。代码读的是 `getAgentDir()/settings.json`，注意**不是** `~/.pi/settings.json` —— 写在后者不会报错，只是**永远读不到**，launch 会告诉你 `host '<h>' has no entry in subagents.crossMachine.hosts …` |
+| `<项目>/.pi/settings.json` | **项目级**，**覆盖**用户级：同名块整块替换（`subagents.crossMachine` 不做深合并），项目里配了就只用项目的那一份 |
 
 ```json
 {
@@ -77,26 +85,74 @@ checkout 的 origin」必须是**同一个 url**：少了这个共同点，父�
 | 键 | 填什么 | **不填会怎样** |
 |---|---|---|
 | `enabled` | `true`。缺省关闭 | 关了还点名 `host` 会被**拒绝**（不是悄悄在本机跑） |
-| `cwd` | 目标机上那个 checkout 的绝对路径 | 缺省会拿**父机**的 cwd 当远端路径 → 那台机器上通常没有这个目录（`host '<h>' has no checkout at <cwd> …`） |
+| `cwd` | 目标机上那个 checkout 的绝对路径 | 不填（或为空）→ `host '<h>' has no entry in subagents.crossMachine.hosts (add { "cwd": "/abs/path/on/<h>" })`（没有「回落到父机 cwd」这回事）；填了相对路径 → `host '<h>' needs an absolute cwd in subagents.crossMachine.hosts.<h>.cwd (remote paths are not translated from this machine)`；路径填了但那个目录在那台机器上不存在 → `host '<h>' has no checkout at <cwd> …`（预检那一步才报） |
 | `node` | 目标机上 node 的**绝对路径** | 远端非交互 shell 没有 nvm、PATH 没初始化 → `host 'vps': node 'node' is not on PATH on vps (set subagents.crossMachine.hosts.vps.node to a path on that machine)`，在 preflight 的 10 秒内就失败 |
 | `piCli` | node 能执行的**JS 入口**，形如 `…/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js` | 指到 `/root/.pi/agent/bin/pi` 这种 shell 启动器 → preflight `exit 16`，真机原文是 `SyntaxError: Unexpected token case`（子进程 argv 是 `[node, piCli, …]`，node 把 shell 当 JS 解析） |
 | `piLegionRoot` | 本包在**目标机**上的绝对路径 | 两侧 checkout 路径不同（几乎总是）时 → `host 'vps': this package is not installed at /Users/you/code/app on that machine (every child's argv loads /Users/you/code/app/index.ts; set subagents.crossMachine.hosts.vps.piLegionRoot to where it really is, or install it there)` |
 | `piExtensions` | **那台机器上**要加载的扩展（数组，绝对路径） | 模型由扩展提供时必填：child 的 argv 带 `--no-extensions`，会把模型提供者一起关掉 → child 报 `No API key found` / `No models available`（当前版本会在 launch 前的探测里就拒绝并点名这个键） |
 
-### 三条前置自检
+### 最快的自检：`/legion doctor crossmachine`
+
+配置写完，先跑 doctor 的这一节，比直接 launch 便宜 —— 它是**只读**的：不跑 `--list-models`，
+不发任何远端探测。
+
+```text
+/legion doctor crossmachine
+```
+
+期望形状（`<host>` 就是 `hosts` 里那个键；launch 那一行由你当前的配置拼出来）：
+
+```text
+## Cross-machine (host targets)
+- enabled: true
+- hosts: <host>
+- <host>: resolved
+    cwd: <cwd>
+    …
+- last preflight: never
+- minimal launch (copy-paste, built from this configuration):
+    subagent({ agent: "centurion", host: "<host>", …
+```
+
+- `- <host>: resolved` = 这个 entry 解析得出 host target；解析不了会写成
+  `- <host>: INVALID — <resolveHostTarget 的原话>`，原话点名该改哪个键。
+- `- last preflight: …` 是**最近一次真的跨机尝试**的结论：`never`（还没试过）/ `ok (<host>, 12s ago)` /
+  `failed (<host>, 3s ago): <一句原因>`。
+- `minimal launch` 下面那一行按**你现在的配置**拼好、带具体任务文本，可以整行复制粘贴
+  （任务改成你自己的就行），不用自己填占位符。
+
+### 前置自检：三句命令 + 一个环境前提
 
 配好之后先自己问三句，比让 launch 去猜便宜得多：
 
 | 自检命令 | 期望输出 |
 |---|---|
-| `git remote get-url origin` | 一个 url（与步骤 0 那条**逐字相同**） |
+| `git remote get-url origin` | 一个 url（与步骤 0 那条**归一化后相同**） |
 | `hc exec --on <host> -- git --version` | `git version 2.x.y`（有版本号就够；**没有 git = 走不下去**，见失败表） |
 | `hc exec --on <host> -- test -f <piLegionRoot>/index.ts` | **无输出、exit 0**（`… && echo ok` 时才会看到 `ok`） |
+
+第四条不在远端，在**本机**：`host` 只能在 **hc 终端里**用。在你要发 launch 的那个终端里跑：
+
+```bash
+env | grep HC_TERMINAL_
+```
+
+要打出两行 `HC_TERMINAL_SOCKET=…` 与 `HC_TERMINAL_ID=…`。`terminalHostAvailable` 要求两者都在；
+缺任一条，任何带 `host` 的 launch 都会被拒绝（原文，见下面失败表）：
+
+```text
+host '<h>' needs an hc terminal host: start pi inside an hc terminal (HC_TERMINAL_SOCKET + HC_TERMINAL_ID), or drop host
+```
+
+改法是在 hc 终端里重开 pi；不想跨机就去掉 `host`。
 
 | 你看到的字 | 它意味着什么 / 改哪个键 |
 |---|---|
 | 第三条 `exit 1`、无输出 | `piLegionRoot` 指错了（那台机器上没有这个文件）→ 改成目标机上的真实路径 |
 | 第二条 `exit 127` / `command not found` | 目标机没有 git → 装上再演示，或改派 `worker` |
+| `host '<h>' needs an hc terminal host: start pi inside an hc terminal (HC_TERMINAL_SOCKET + HC_TERMINAL_ID), or drop host` | 这个 pi 不在 hc 终端里 → 在 hc 终端里重开 pi（`env \| grep HC_TERMINAL_` 应有两条），或去掉调用里的 `host` |
+| `host '<h>' has no entry in subagents.crossMachine.hosts (add { "cwd": "/abs/path/on/<h>" })` | 这个 host 名在 `hosts` 里查不到：settings 写错了位置（用户级是 `~/.pi/agent/settings.json`，不是 `~/.pi/settings.json`）、键名与 `hc machine ls` 不一致，或那条 entry 里 `cwd` 缺失/为空 |
+| `host '<h>' needs an absolute cwd in subagents.crossMachine.hosts.<h>.cwd (remote paths are not translated from this machine)` | `cwd` 是相对路径（或空）→ 换成目标机上的**绝对**路径；远端路径不会被翻译 |
 | `.pi/settings.json` 里改名后再跑仍是旧的错 | 配置是按 host 名查的：确认 `hc machine ls` 里的名字与 `hosts.<host>` 的键**逐字相同**（大小写也算） |
 
 ---
@@ -200,7 +256,7 @@ Agent '<file>' has an invalid phase machine: N problems in M categories.
 | `[successor] … phase '<id>' lists itself as a successor` | 自指边（`to` 等于自己）。`fix` 给出把那条边指向别的阶段的最小示例 |
 | `[successor] … unknown target phase '<x>' from phase '<id>'` | 边指向了没声明的阶段。`fix` 会列出**已声明**的阶段，或给你一个声明它的最小写法 |
 | `[unreachable] …` | 声明的阶段从 `start` 走不到，或整张图到不了任何 terminal |
-| `[structure] … next must be a list of transition rules (got string)` | `next` 不是数组（注意：**缺省**和 `[]` 都是合法的，只有"存在但类型不对"才报结构错） |
+| `[structure] … next must be a list of transition rules (got a string ("done"))` | `next` 不是数组（原话里的 `"done"` 就是你写的那个值，例如 `next: "done"`；注意：**缺省**和 `[]` 都是合法的，只有"存在但类型不对"才报结构错） |
 
 `[structure]` 排在最前是刻意的：形状错了，后面每一条判断都不可靠。
 
