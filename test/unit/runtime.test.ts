@@ -1820,7 +1820,13 @@ test("renderLiveChildStatus long-quiet alive worker: (living) leads; collect-dea
 		const lines = text.split("\n");
 		assert.equal(lines[0], "worker-0 — state=working agent=worker kind=pi");
 		assert.match(lines[1]!, /^alive · quiet \d+s \(living\)$/);
-		assert.equal(lines[2], "execution snapshot: running");
+		// D5: the liveness lead is followed by the host/terminal pair, then the
+		// snapshot. The invariant this test is about is the ORDER (quiet age before
+		// the snapshot before the path meta), not the line number — pinning the number
+		// is what made a new identity line look like a regression.
+		assert.equal(lines[2], "host=local");
+		assert.equal(lines[3], "terminal=-");
+		assert.equal(lines[4], "execution snapshot: running");
 		assert.ok(text.indexOf("alive · quiet") < text.indexOf("execution snapshot:"));
 		assert.ok(text.indexOf("execution snapshot:") < text.indexOf("supervisor="));
 		assert.doesNotMatch(text, /collect deadline|child still alive/);

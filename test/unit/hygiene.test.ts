@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { openLegionDb } from "../../src/legion/db.ts";
-import { insertNode } from "../../src/legion/nodes.ts";
+import { getNode, hasEnded, insertNode, listRemoteNodesNamed, listUnsettledRemoteNodes } from "../../src/legion/nodes.ts";
 import { appendEvent } from "../../src/legion/events.ts";
 import { RunStore } from "../../src/runs/store.ts";
 import { RUN_OWNER_FILE, TEMP_OWNER_FILE, isPidAlive, ownerState, readOwnerFile, writeOwnerFile } from "../../src/runs/owner.ts";
@@ -93,11 +93,11 @@ test("#37 prune disabled by retentionDays=0", () => {
 	assert.ok(fs.existsSync(old));
 });
 
-function seedDb(dir: string, nodes: Array<{ id: string; status: string; updatedAt: number; parent?: string | null }>): string {
+function seedDb(dir: string, nodes: Array<{ id: string; status: string; updatedAt: number; parent?: string | null; host?: string; remoteDir?: string; remoteTerminal?: string }>): string {
 	const dbPath = path.join(dir, "legion.db");
 	const db = openLegionDb(dbPath);
 	for (const n of nodes) {
-		insertNode(db, { id: n.id === "root" ? "root" : `root.${n.id}`, parentId: n.parent === undefined ? "root" : n.parent, name: n.id, role: n.id === "root" ? "root" : "worker", kind: "pi", depth: n.id === "root" ? 0 : 1, status: n.status as never, createdAt: n.updatedAt, updatedAt: n.updatedAt } as never, () => n.updatedAt);
+		insertNode(db, { id: n.id === "root" ? "root" : `root.${n.id}`, parentId: n.parent === undefined ? "root" : n.parent, name: n.id, role: n.id === "root" ? "root" : "worker", kind: "pi", depth: n.id === "root" ? 0 : 1, host: n.host ?? null, remoteDir: n.remoteDir ?? null, remoteTerminal: n.remoteTerminal ?? null, status: n.status as never, createdAt: n.updatedAt, updatedAt: n.updatedAt } as never, () => n.updatedAt);
 	}
 	db.close();
 	return dbPath;
@@ -129,6 +129,98 @@ test("#38 stale working records in dead-owner runs are marked failed + node_aban
 	assert.equal(ldb.prepare("SELECT status FROM nodes WHERE id='root.stale'").get()?.status, "running");
 	ldb.close();
 	assert.ok(!fs.existsSync(`${dbPath}-wal`) || fs.statSync(`${dbPath}-wal`).size === 0);
+});
+
+test("#407 the 72h sweep never re-judges a cross-machine row, so it stays in the status block and stays recoverable", () => {
+	const { root, store: s } = store();
+	const dir = makeRun(s, DEAD);
+	const now = Date.now();
+	const dbPath = seedDb(dir, [
+		{ id: "root", status: "running", updatedAt: now - 10 * DAY, parent: null },
+		{ id: "stale", status: "running", updatedAt: now - 5 * DAY },
+		{ id: "remote", status: "running", updatedAt: now - 5 * DAY, host: "hw-nj" },
+	]);
+	const r = runStartupHygiene({ storeRoot: root, isAlive: alive });
+	// The local row is still swept: the exemption is the cross-machine marker, not
+	// "the sweep stopped working".
+	assert.deepEqual(r.abandonedNodes, [`${path.basename(dir)}/root.stale`]);
+	const db = openLegionDb(dbPath);
+	try {
+		assert.equal(getNode(db, "root.stale")?.status, "failed");
+		const remote = getNode(db, "root.remote");
+		assert.equal(remote?.status, "running", "a dead owner HERE did not end the work THERE");
+		assert.equal(
+			db.prepare("SELECT COUNT(*) n FROM events WHERE node_id = 'root.remote' AND type = 'node_abandoned'").get()?.n,
+			0,
+			"no abandonment verdict was invented for a row this sweep cannot judge",
+		);
+		// Both surfaces agree again: `/legion status` lists it (live status + host),
+		// and `recover`'s precondition — an OPEN row — still holds.
+		assert.deepEqual(listUnsettledRemoteNodes(db).map((node) => node.id), ["root.remote"]);
+		assert.equal(hasEnded(remote!), false, "recover is allowed to treat it as work to fetch");
+		assert.deepEqual(listRemoteNodesNamed(db, "remote").map((node) => node.id), ["root.remote"]);
+	} finally {
+		db.close();
+	}
+});
+
+test("#408 retention keeps a run dir whose ledger still owns an unsettled cross-machine row", () => {
+	const { root, store: s } = store();
+	const now = Date.now();
+	// A: idle, dead owner, and the ledger still has an OPEN cross-machine row. The
+	// far side (dir + terminal) is still out there, so this dir is not garbage.
+	const held = makeRun(s, DEAD);
+	seedDb(held, [
+		{ id: "root", status: "running", updatedAt: now - 20 * DAY, parent: null },
+		{ id: "remote", status: "running", updatedAt: now - 20 * DAY, host: "hw-nj", remoteDir: "/home/xm/legion-run-7", remoteTerminal: "hw-nj/pi-7" },
+	]);
+	age(held, 20 * DAY);
+	// B: same shape, but the remote row ENDED — nothing left to protect.
+	const settled = makeRun(s, DEAD);
+	seedDb(settled, [
+		{ id: "root", status: "running", updatedAt: now - 20 * DAY, parent: null },
+		{ id: "remote", status: "settled", updatedAt: now - 20 * DAY, host: "hw-nj", remoteDir: "/home/xm/legion-run-8", remoteTerminal: "hw-nj/pi-8" },
+	]);
+	age(settled, 20 * DAY);
+	// C: never had a cross-machine row.
+	const plain = makeRun(s, DEAD, 20 * DAY);
+
+	const r = runStartupHygiene({ storeRoot: root, isAlive: alive });
+	assert.deepEqual(r.prunedRuns.sort(), [plain, settled].sort(), "only the runs with nothing remote to lose are pruned");
+	assert.deepEqual(r.keptRemoteRuns.map((hold) => path.basename(hold.runDir)), [path.basename(held)]);
+	assert.ok(fs.existsSync(held), "the only local record of the remote dir/terminal is still there");
+	const hold = r.keptRemoteRuns[0]!;
+	assert.deepEqual(hold.rows.map((row) => [row.nodeId, row.host, row.status]), [["root.remote", "hw-nj", "running"]]);
+	assert.equal(hold.rows[0]!.remoteDir, "/home/xm/legion-run-7");
+	assert.equal(hold.rows[0]!.remoteTerminal, "hw-nj/pi-7");
+	assert.match(formatHygieneReport(r) ?? "", /kept 1 run dir\(s\) holding an unsettled cross-machine row/);
+	// #407's predicate is untouched, so the same row is still open everywhere that
+	// reads it: `/legion status` lists it and `recover` is allowed to collect it.
+	const db = openLegionDb(path.join(held, "legion.db"));
+	try {
+		assert.deepEqual(listUnsettledRemoteNodes(db).map((n) => n.id), ["root.remote"]);
+		assert.equal(getNode(db, "root.remote")?.status, "running");
+		assert.equal(getNode(db, "root.remote")?.remoteDir, "/home/xm/legion-run-7");
+	} finally {
+		db.close();
+	}
+});
+
+test("#408 the hold is scoped to unsettled rows: a cross-machine row that ENDED blocks nothing", () => {
+	const { root, store: s } = store();
+	const now = Date.now();
+	// A `failed` row is ended too — `recover` has nothing to collect from it, and
+	// its remote_dir is no longer an ownership claim. The dir must still go.
+	const failed = makeRun(s, DEAD);
+	seedDb(failed, [
+		{ id: "root", status: "running", updatedAt: now - 20 * DAY, parent: null },
+		{ id: "remote", status: "failed", updatedAt: now - 20 * DAY, host: "hw-nj", remoteDir: "/x", remoteTerminal: "hw-nj/pi-9" },
+	]);
+	age(failed, 20 * DAY);
+	const r = runStartupHygiene({ storeRoot: root, isAlive: alive });
+	assert.deepEqual(r.prunedRuns, [failed]);
+	assert.deepEqual(r.keptRemoteRuns, []);
+	assert.ok(!fs.existsSync(failed));
 });
 
 test("#40 event retention: old terminal-node events go, live-node + retained types stay, row cap, WAL truncated", () => {

@@ -23,6 +23,12 @@
  *
  * This module never decides to abort, stop or retire anything (D3). It produces a
  * decision and two strings; the parent decides.
+ *
+ * **#413: the de-duplication key is the crossed THRESHOLD, never a timestamp.**
+ * `floor(elapsed / thresholdMs)` names the boundary (`tier`); a window announces
+ * each tier at most once, so every check inside the same boundary is silent. The
+ * caller passes what it has already announced ({@link StallLineState}) and records
+ * the `tier` of the line it just wrote — see {@link crossedTier} and `decideStallNotice`.
  */
 
 import { DEFAULTS } from "../shared/types.ts";
@@ -38,7 +44,7 @@ export const STALL_NOTICE_SUBJECT_PREFIX = "Stall notice: ";
 
 /** L1 announces at `1×` and `2×` the threshold, then stops (D6). */
 export const SILENCE_NOTICE_LIMIT = 2;
-/** L2 repeats once per radius, and at most three times per window (D6). */
+/** L2 announces at three boundaries per window at most (D6). */
 export const LONG_RUNNING_NOTICE_LIMIT = 3;
 /**
  * D8's last rung: a role that declares neither `loopNoticeMs` nor `timeoutMs`
@@ -71,14 +77,25 @@ export interface StallThresholds {
 }
 
 /**
- * What has already been said in ONE window (D6).
+ * What has already been said in ONE window (D6) — #413: the de-duplication key is
+ * the crossed THRESHOLD, not the time the previous line was sent.
  *
- * `count` and `lastAt` travel together on purpose: the repeat clock is "one
- * interval after the PREVIOUS line", so a count without the time it was sent at is
- * not enough to decide anything. The caller records `lastAt = now` of the tick that
- * emitted.
+ * `tier` is `floor(elapsed / thresholdMs)`: the ordinal of the boundary the window
+ * has reached (`1` = the first threshold, `2` = twice it, …). Recording the highest
+ * tier announced makes "this boundary was already announced" a fact the next tick
+ * can re-derive from `(windowBase, thresholdMs, elapsed)` alone — so N checks inside
+ * one boundary produce exactly ONE line, no matter how the caller's clock moves.
+ * `count` is separate because it is D6's cap: a child first observed three radii in
+ * spends one line, not three, so `count` can stay below `tier` forever.
+ *
+ * `lastAt` is kept for diagnostics only ("when did the last line go out"); nothing
+ * decides on it any more. Measuring the next repeat from the SENT time was the
+ * pre-#413 rule, and it could not answer "was THIS boundary announced?" because a
+ * re-created detector had no sent time to compare against.
  */
 export interface StallLineState {
+	/** Highest boundary index already announced; `0` = nothing yet. */
+	readonly tier: number;
 	/** Lines already announced in this window. */
 	readonly count: number;
 	/** Host-clock reading of the last of them; `undefined` when `count === 0`. */
@@ -101,10 +118,17 @@ export interface StallAnnouncement {
 	readonly childName: string;
 	/**
 	 * The window this line belongs to — L1: `lastEventAt`; L2: the base the radius
-	 * is measured from. It IS the `sinceBucket` of the D6 de-duplication key: a new
-	 * event (L1) or an `extend` (L2) produces a new bucket, which restarts the count.
+	 * is measured from. Half of the D6 de-duplication key: a new event (L1) or an
+	 * `extend` (L2) produces a new bucket, which re-arms the boundary ladder.
 	 */
 	readonly sinceBucket: number;
+	/**
+	 * Which boundary this line announces: `floor(elapsedMs / thresholdMs)`, `>= 1`.
+	 * The OTHER half of the D6 key (#413): `(child, kind, bucket, threshold, tier)`
+	 * is announced at most once, so a child that sits past its threshold does not
+	 * re-mail on every check.
+	 */
+	readonly tier: number;
 	/** 1-based index of this line within its window. */
 	readonly sequence: number;
 	readonly elapsedMs: number;
@@ -129,7 +153,7 @@ export function isActiveStallThreshold(value: number | undefined): value is numb
  * a child that has been silent with an empty stack for a whole role budget is
  * already described by the sharper fact, and two lines about one child in one mail
  * spends the parent's attention twice on the same node. L2 keeps its own count and
- * still fires on later ticks once L1 has spent its two announcements.
+ * still fires on later boundaries once L1 has spent its two announcements.
  */
 export function decideStallNotice(input: {
 	readonly now: number;
@@ -157,12 +181,14 @@ function silenceAnnouncement(input: {
 	if (sinceBucket === undefined || !Number.isFinite(sinceBucket)) return undefined;
 	const elapsedMs = now - sinceBucket;
 	if (!(elapsedMs >= thresholdMs)) return undefined;
+	// #413: the boundary IS the de-duplication key. `tier <= announced.tier` means
+	// this crossing (or a later one) has already been announced, so every further
+	// check inside the same boundary is silent — the defect the issue reports.
+	const tier = crossedTier(elapsedMs, thresholdMs);
+	if (tier <= window.silence.tier) return undefined;
 	const sequence = window.silence.count + 1;
 	if (sequence > SILENCE_NOTICE_LIMIT) return undefined;
-	// The rhythm, not merely "past the threshold" (D6): the FIRST line is measured
-	// from the window's start, every LATER line from the line before it.
-	if (!afterPreviousLine(window.silence, now, thresholdMs)) return undefined;
-	return { kind: "silence", childName: child.name, sinceBucket, sequence, elapsedMs, thresholdMs };
+	return { kind: "silence", childName: child.name, sinceBucket, tier, sequence, elapsedMs, thresholdMs };
 }
 
 function longRunningAnnouncement(input: {
@@ -178,14 +204,18 @@ function longRunningAnnouncement(input: {
 	if (!Number.isFinite(sinceBucket)) return undefined;
 	const elapsedMs = now - sinceBucket;
 	if (!(elapsedMs >= thresholdMs)) return undefined;
+	// #413: one line per crossed boundary — see `crossedTier`. The cap below is the
+	// other half of D6 and stays: three boundaries, then silence until `extend`.
+	const tier = crossedTier(elapsedMs, thresholdMs);
+	if (tier <= window.longRunning.tier) return undefined;
 	const sequence = window.longRunning.count + 1;
 	if (sequence > LONG_RUNNING_NOTICE_LIMIT) return undefined;
-	if (!afterPreviousLine(window.longRunning, now, thresholdMs)) return undefined;
 	const inFlightMs = child.inFlightTool === undefined ? undefined : now - (child.inFlightToolStartedAt ?? Number.NaN);
 	return {
 		kind: "long-running",
 		childName: child.name,
 		sinceBucket,
+		tier,
 		sequence,
 		elapsedMs,
 		thresholdMs,
@@ -195,26 +225,20 @@ function longRunningAnnouncement(input: {
 }
 
 /**
- * D6's repeat clock: nothing has been said yet, or one whole interval has passed
- * since the last line.
+ * The boundary ordinal of an elapsed time: `1` at the threshold, `2` at twice it, …
  *
- * Measuring repeats from the WINDOW BASE (`base + n × radius`) is the bug this
- * function exists to prevent: a child first observed long past its threshold would
- * satisfy every `n` at once and spend the entire quota in three consecutive 2s
- * ticks. A line once sent is a fact with a timestamp — the next one waits for it.
+ * `Math.floor`, never `round`: the tier is the de-duplication key (#413), so the
+ * instant it flips must be exactly `base + n × threshold` — the same boundary the
+ * `elapsed >= thresholdMs` gate uses. Rounding up would announce a boundary a hair
+ * early; rounding down would repeat a boundary for half a radius.
  *
- * A `count > 0` with no `lastAt` is a caller defect (the two fields travel
- * together), and the safe reading is "not due": guessing would re-spam.
+ * The caller has already checked `elapsed >= threshold`, so the result is `>= 1`.
+ * A non-finite or non-positive threshold cannot reach here (the detectors are gated
+ * by `isActiveStallThreshold`), and a non-finite elapsed would make the comparisons
+ * false rather than crash.
  */
-function afterPreviousLine(
-	state: StallLineState,
-	now: number,
-	intervalMs: number,
-): boolean {
-	if (state.count === 0) return true;
-	const lastAt = state.lastAt;
-	if (lastAt === undefined || !Number.isFinite(lastAt)) return false;
-	return now - lastAt >= intervalMs;
+function crossedTier(elapsedMs: number, thresholdMs: number): number {
+	return Math.floor(elapsedMs / thresholdMs);
 }
 
 /**

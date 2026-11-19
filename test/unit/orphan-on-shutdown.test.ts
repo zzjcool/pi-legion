@@ -269,7 +269,7 @@ test("/legion status: a leftover the exit kept open is listed, and the fate is n
 		const node = getNode(l.db, l.childId)!;
 		const plain = renderLegionStatus({ nodes: [node], jobs: [], recoverable: [node], now: Date.now() }).text;
 		assert.match(plain, /Recoverable cross-machine children/);
-		assert.match(plain, new RegExp(`- worker-0 · worker · host ${HOST} · running · terminal ${REMOTE_TERMINAL}`));
+		assert.match(plain, new RegExp(`- worker-0 · root.worker-0 · host ${HOST} · running · terminal ${REMOTE_TERMINAL}`));
 
 		const orphaned = renderLegionStatus({
 			nodes: [node],
@@ -277,7 +277,7 @@ test("/legion status: a leftover the exit kept open is listed, and the fate is n
 			recoverable: [{ ...node, orphaned: "orphaned" }],
 			now: Date.now(),
 		}).text;
-		assert.match(orphaned, new RegExp(`- worker-0 · worker · host ${HOST} · orphaned · terminal ${REMOTE_TERMINAL}`));
+		assert.match(orphaned, new RegExp(`- worker-0 · root.worker-0 · host ${HOST} · orphaned · terminal ${REMOTE_TERMINAL}`));
 
 		const unfetched = renderLegionStatus({
 			nodes: [node],
@@ -285,7 +285,7 @@ test("/legion status: a leftover the exit kept open is listed, and the fate is n
 			recoverable: [{ ...node, orphaned: "unfetched" }],
 			now: Date.now(),
 		}).text;
-		assert.match(unfetched, /· running \(unfetched\) ·/, "the row is running; the RESULT is unfetched");
+		assert.match(unfetched, /· unfetched · terminal/, "the frozen D4 state word is the fate");
 		assert.equal(renderRecoverableSection([], [], 0), undefined);
 	} finally {
 		l.close();

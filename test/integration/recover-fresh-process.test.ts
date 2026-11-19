@@ -203,7 +203,7 @@ test("D1: a NEW process (no cached identity) FINDS the previous process's cross-
 	// The `/legion status` surface renders the block a fresh session must show.
 	const status = statusText(h, newSession);
 	assert.match(status, /Recoverable cross-machine children \(this session never launched them\):/);
-	assert.match(status, new RegExp(`- ${NODE_NAME} · centurion · host ${HOST}`));
+	assert.match(status, new RegExp(`- ${NODE_NAME} · ${NODE_ID} · host ${HOST}`));
 	assert.match(status, new RegExp(recoveryCallFor(NODE_NAME).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 	found.db.close();
 });
