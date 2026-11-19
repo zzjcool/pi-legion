@@ -413,6 +413,8 @@ type SentMessage = {
 	customType: string;
 	content: string;
 	display: boolean;
+	/** TUI-only metadata persisted with the entry (#414 asserts `runId` here). */
+	details?: unknown;
 };
 
 function joinSnapshot(over: Partial<CollectSnapshot> = {}): CollectSnapshot {
@@ -829,6 +831,31 @@ test("runtime.wait: timeout yields stillRunning and the auto-notify still lands"
 	resolveCollect(joinSnapshot({ output: "finally" }));
 	await waitFor(() => messages.length === 1, "auto-notify after timeout");
 	assert.match(messages[0]!.content, /Background task completed: \*\*slow/);
+});
+
+test("#414: the completion notice carries the run that dispatched the child", async () => {
+	// The notice used to name only the handle, so attribution depended on a guess:
+	// a same-named child of another run reads identically (the 408/410 incident).
+	// The run id travels in the body AND in the machine details.
+	const messages: SentMessage[] = [];
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message as SentMessage);
+		},
+	});
+	runtime.track({
+		name: "worker-0",
+		runId: "r-initiator-1",
+		agent: "worker",
+		sessionFile: "/tmp/worker-0.jsonl",
+		timeoutMs: 1_000,
+		collect: async () => joinSnapshot({ output: "done" }),
+	});
+	runtime.watch("worker-0");
+	await waitFor(() => messages.length === 1, "completion notice with the run id");
+	assert.match(messages[0]!.content, /^Run: r-initiator-1$/m);
+	assert.equal((messages[0]!.details as { runId?: string }).runId, "r-initiator-1");
+	runtime.dispose();
 });
 
 test("runtime.wait: parent abort interrupts promptly, clears its timer, and restores notifications", async () => {

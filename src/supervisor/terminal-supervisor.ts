@@ -254,11 +254,14 @@ export interface TerminalSupervisorOptions {
 	/** Environment read for host detection, parent identity and PATH/HOME (D5). */
 	env?: NodeJS.ProcessEnv;
 	/**
-	 * Value for the `legion.run` label (D6), when the caller knows it.
+	 * Fallback value for the `legion.run` label and the terminal/mirror names (D6/D7/D9),
+	 * used only when a spawn carries no {@link SpawnInput.runId}.
 	 *
-	 * Omitted when unknown: a run id is a fact, and this backend will not derive
-	 * one from a path or a node name. The wiring in `index.ts` has no run id at
-	 * supervisor-construction time, so the label is simply absent there.
+	 * Omitted when unknown: a run id is a fact, and this backend will not derive one
+	 * from a path or a node name. Production builds one supervisor per process,
+	 * BEFORE any run exists, so it passes nothing here — every real launch names its
+	 * run on the spawn itself. This option remains the seam for tests (and for a
+	 * caller that really owns one run for the supervisor's whole lifetime).
 	 */
 	runId?: string;
 	/** Poll cadence for `waitSettled`; tests shrink it, production uses 1 s. */
@@ -320,6 +323,20 @@ export class TerminalSupervisor implements LegionSupervisor {
 			(() => hcCliClient({ env: this.env, ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}) }));
 	}
 
+	/**
+	 * #414: the run id THIS spawn belongs to — the run that dispatched the child.
+	 *
+	 * The spawn's own value wins: production constructs ONE supervisor before any
+	 * run exists, so the constructor value cannot name the run a child belongs to.
+	 * Absent everywhere returns `undefined` on purpose — the caller then gets the
+	 * legacy shape (`lgl-<handle>`, `<mirrorRoot>/no-run/<handle>`, no run label),
+	 * never an invented run id.
+	 */
+	private runIdFor(input: SpawnInput): string | undefined {
+		const dispatched = typeof input.runId === "string" ? input.runId.trim() : "";
+		return dispatched.length > 0 ? dispatched : this.runId;
+	}
+
 	// ── spawn (D4/D5/D6/D7) ─────────────────────────────────────────────
 
 	/**
@@ -377,7 +394,8 @@ export class TerminalSupervisor implements LegionSupervisor {
 			);
 		}
 		const client = await this.ensureClient();
-		const terminalNameForChild = terminalName(this.runId, input.name);
+		const spawnRunId = this.runIdFor(input);
+		const terminalNameForChild = terminalName(spawnRunId, input.name);
 		// Absent/blank = this host (contract D4). Normalized ONCE here: `on`, the
 		// record and every later address all read this one value.
 		const host = normalizeHost(input.host);
@@ -551,7 +569,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 			writeOwnerFile(path.join(tempDir, TEMP_OWNER_FILE));
 
 			if (target !== undefined) {
-				remoteDir = remoteDirFor(target, this.runId, input.name);
+				remoteDir = remoteDirFor(target, spawnRunId, input.name);
 				await ensureRemoteDir(client, target, remoteDir);
 				// m10: from here on, a failure leaves an empty directory behind unless it
 				// is swept. `hc` has no `file.remove`, so this flag is what allows the
@@ -886,40 +904,55 @@ export class TerminalSupervisor implements LegionSupervisor {
 			}
 		}
 
-		// #409: every terminal this backend creates must have a parent, and the address
-		// must be one the TARGET core resolves (see `parent-anchor.ts` for the three
-		// measured spellings). Resolved AFTER the preflight so a launch that is about to
-		// be refused never leaves an anchor on a machine it will not use.
-		const launchParent = await this.resolveLaunchParent(client, host, target?.cwd ?? input.cwd);
-
-		// #410: a LOCAL worktree launch starts its terminal IN the tree, and
-		// `terminal.run` cannot chdir into a path whose parent does not exist — the
-		// core then reports it as a fact about the PROGRAM (`spawn_failed: cannot
-		// start "<node>": No such file or directory`), which sends the operator after
-		// an interpreter that is right there. Measured on a real core (`hc 0.1.21`):
+		// #410/#432: the LAUNCH DIRECTORY of a LOCAL child is resolved, prepared and
+		// verified HERE — before `terminal.run`, not after it. `terminal.run` cannot
+		// chdir into a path that is absent, and the core reports that as a fact about
+		// the PROGRAM (`spawn_failed: cannot start "<node>": No such file or
+		// directory`), which sends the operator after an interpreter that is right
+		// there. Measured on a real core (`hc 0.1.21`):
 		//
 		//   $ hc run --cwd /nope -- /usr/bin/node -v
 		//   {"error":{"kind":"spawn_failed","message":"cannot start \"/usr/bin/node\": No such file or directory (os error 2)"}}
 		//
-		// The tree's PARENT is therefore created BEFORE the request, exactly as the
-		// cross-machine path already does for the remote tree root (`ensureRemoteDir`
-		// in `createRemoteChildWorktree`, whose comment says `git worktree add`
-		// creates the final directory but not its parents). The tree itself is NOT
-		// created here: `git worktree add` owns that path, and handing it an existing
-		// directory is a refusal.
-		//
-		// A failure to create it is NOT fatal and NOT reported from here: `terminal.run`
-		// still runs (the directory may exist for a reason this process cannot see),
-		// and the error path below reports the STATE that matters (the launch
-		// directory is absent) instead of this process's attempt.
-		const launchCwd = target !== undefined ? remoteWorktree?.path ?? target.cwd : input.cwd;
-		if (target === undefined && input.worktree === true) {
+		// A REMOTE child's cwd is a path on the OTHER machine (D13) and is asked about
+		// there (`remotePreflight`, D6/D9). This is the LOCAL half of that posture:
+		// #410 could only re-explain the core's failure afterwards, and #432 measured
+		// what that leaves — a cwd that is RELATIVE is resolved by the core against
+		// the CORE's own directory (a directory that exists here is `~real` for the
+		// core), so the same launch was still reported as "cannot start <node>".
+		// `preflightLocalLaunch` therefore answers three questions before any
+		// terminal exists: what path does the child really get (absolute), is it a
+		// directory on THIS machine, and what part of it does this launch own.
+		let launchCwd: string;
+		if (target !== undefined) {
+			launchCwd = remoteWorktree?.path ?? target.cwd;
+		} else {
 			try {
-				fs.mkdirSync(path.dirname(launchCwd), { recursive: true });
-			} catch {
-				/* best effort — `cwdDoesNotExistMessage` says what the parent looks like */
+				launchCwd = this.preflightLocalLaunch({
+					cwd: input.cwd,
+					// The one program a local launch carries (`argv[0]` below): named in the
+					// refusal only to say it is NOT the problem.
+					program: process.execPath,
+					terminal: terminalAddress({ terminalName: terminalNameForChild }),
+					// A worktree launch owns the PARENT chain of its tree, never the tree: it
+					// belongs to `git worktree add`, and handing git an existing directory is a
+					// refusal (the same split `ensureRemoteDir` keeps on the remote side).
+					createParent: input.worktree === true,
+				});
+			} catch (error) {
+				// The refusal is this launch's verdict, so nothing of it may survive: the
+				// temp dir (system prompt + owner file) is dropped exactly like the argv
+				// builder's own failure path below. No terminal, no mirror, no record.
+				this.removeTempDir(tempDir);
+				throw error;
 			}
 		}
+
+		// #409: every terminal this backend creates must have a parent, and the address
+		// must be one the TARGET core resolves (see `parent-anchor.ts` for the three
+		// measured spellings). Resolved AFTER the preflights so a launch that is about to
+		// be refused never leaves an anchor on a machine it will not use.
+		const launchParent = await this.resolveLaunchParent(client, host, target?.cwd ?? launchCwd);
 
 		const params = {
 			name: terminalNameForChild,
@@ -927,6 +960,10 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// D6/D11: a remote child starts in the REMOTE directory — its own tree when
 			// one was created for it, the target's checkout otherwise. It is never
 			// `this.cwd` and never a local path that happens to exist here.
+			// LOCAL (#432): always the ABSOLUTE path `preflightLocalLaunch` verified —
+			// the core would otherwise resolve a relative value against its OWN
+			// directory, which is how a cwd that exists here failed there as "cannot
+			// start <node>".
 			cwd: launchCwd,
 			// Absent for a remote child (see `childEnv`): the core's own environment is the
 			// only truthful one over there. Local launches always have a value, so the
@@ -1376,6 +1413,80 @@ export class TerminalSupervisor implements LegionSupervisor {
 	}
 
 	/**
+	 * #432: the LOCAL counterpart of `remotePreflight` — the launch directory,
+	 * resolved and verified BEFORE `terminal.run`.
+	 *
+	 * The remote half of D6/D9 asks the TARGET machine `test -d <cwd>` and refuses
+	 * with `cwd '…' does not exist on <host>`; nothing asked THIS machine the same
+	 * question, so a local launch whose cwd is not a directory here reached the core
+	 * anyway — and the core cannot tell "no directory" from "no program". It words
+	 * both as `spawn_failed: cannot start "<argv[0]>": No such file or directory`,
+	 * which sends the operator after an interpreter that is right there (measured,
+	 * `hc 0.1.21`; #410 mapped that sentence back to the directory only AFTER the
+	 * failure, #432 asks first):
+	 *
+	 *   $ hc run --cwd /nope -- /usr/bin/node -v
+	 *   {"error":{"kind":"spawn_failed","message":"cannot start \"/usr/bin/node\": No such file or directory (os error 2)"}}
+	 *
+	 * Three facts, in this order:
+	 *
+	 *   1. **The absolute path.** A relative `cwd` is resolved by the CORE against
+	 *      the core's own directory, not against this process's — so a directory that
+	 *      exists here (`real`) is `~real` for the core and the launch dies blaming
+	 *      `node` (#432 measured exactly that on this path). One `path.resolve`
+	 *      here, and the absolute path is what travels on the wire.
+	 *   2. **It is a directory on this machine.** Not a file (`ENOTDIR`), not
+	 *      absent, not a symlink to nothing: `terminal.run` needs somewhere to
+	 *      chdir, and every later `git`/verify command runs there.
+	 *   3. **What this launch owns.** A worktree launch owns its tree's PARENT chain
+	 *      (`git worktree add` creates the leaf and refuses an existing directory —
+	 *      the same split `ensureRemoteDir` keeps on the remote side), so that chain
+	 *      is `mkdir -p`'d. The leaf is never created, and no other launch directory
+	 *      is ever invented: an empty directory is not a checkout, and a child put
+	 *      in one fails every command it was dispatched to run — loudly at best,
+	 *      silently at worst. Everything that is still not a directory after the
+	 *      step above is REFUSED with `cwd does not exist: <path>`, the sentence
+	 *      #432 asks for, naming the program only to say it is not the problem.
+	 *
+	 * Returns the path the caller must put on `terminal.run` (never `opts.cwd`
+	 * verbatim: it may be relative).
+	 */
+	private preflightLocalLaunch(opts: {
+		cwd: string;
+		/** `argv[0]` of this launch — the thing the core would have blamed. */
+		program: string;
+		/** Terminal address, for the refusal's first line. */
+		terminal: string;
+		/** Whether this launch owns the cwd's PARENT chain (a worktree launch). */
+		createParent: boolean;
+	}): string {
+		const cwd = path.resolve(opts.cwd);
+		if (isDirectoryOnDisk(cwd)) return cwd;
+		if (opts.createParent) {
+			// `git worktree add` creates the final directory but not its parents — the
+			// same gap `createRemoteChildWorktree`/`ensureRemoteDir` close over there.
+			try {
+				fs.mkdirSync(path.dirname(cwd), { recursive: true });
+			} catch {
+				/* the refusal below measures the state that matters, not this attempt */
+			}
+			// Creation is not a promise (a file in the way, an unwritable parent, a race
+			// that removed it again): ask the filesystem, never this process's intent.
+			if (isDirectoryOnDisk(cwd)) return cwd;
+		}
+		throw new SubagentError(
+			cwdRefusedBeforeSpawnMessage({
+				operation: "terminal.run",
+				terminal: opts.terminal,
+				cwd,
+				program: opts.program,
+			}),
+			ErrorCodes.START_FAILED,
+			{ cwd, program: opts.program, preflight: "local-cwd" },
+		);
+	}
+
+	/**
 	 * The parent address for one launch, or the reason there is none (#409).
 	 *
 	 * LOCAL: this process's own terminal. `HC_TERMINAL_ID` is an address in THIS
@@ -1578,8 +1689,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 */
 	private async childLabels(input: SpawnInput, host: string | undefined): Promise<Record<string, string>> {
 		const labels: Record<string, string> = { [LEGION_ROLE_LABEL]: input.agent.name };
-		if (this.runId !== undefined && this.runId.length > 0) {
-			labels[LEGION_RUN_LABEL] = this.runId;
+		const runId = this.runIdFor(input);
+		if (runId !== undefined && runId.length > 0) {
+			labels[LEGION_RUN_LABEL] = runId;
 		}
 		if (host !== undefined) {
 			labels[LEGION_HOST_LABEL] = host;
@@ -1896,11 +2008,16 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 * Wrap a transport failure so callers see one error vocabulary.
 	 *
 	 * `cwdContext` is passed by the ONE call site that starts a terminal in a
-	 * directory (#410): when the core answers `spawn_failed`/`bad_cwd` and that
-	 * directory is not on disk, the failure is about the DIRECTORY, not the
-	 * program, and the message says so (`cwdDoesNotExistMessage`). Every other
+	 * directory (LOCAL launches; a remote cwd is another machine's path and
+	 * `remotePreflight` asked about it there, D13): when the core answers
+	 * `spawn_failed`/`bad_cwd` and that directory is not on disk, the failure is
+	 * about the DIRECTORY, not the program, and the message says so
+	 * (`cwdDoesNotExistMessage`). Since #432 this is the SECOND line of defence —
+	 * `preflightLocalLaunch` asks the same question before the core is involved, so
+	 * this mapping only speaks for a cwd that disappeared in between. Every other
 	 * failure keeps the plain `operation failed for terminal '<addr>': <detail>`
-	 * shape.
+	 * shape, and that includes the honest program case: a cwd that IS there keeps
+	 * the core's own `cannot start "<program>"` (nothing here rewrites it).
 	 */
 	private failure(
 		operation: string,
@@ -2030,7 +2147,47 @@ function isDirectoryOnDisk(dir: string): boolean {
 }
 
 /**
- * #410: the refusal for a spawn whose LAUNCH DIRECTORY is what is missing.
+ * #432: the refusal for a LOCAL launch whose launch directory is not there,
+ * decided BEFORE the core is asked.
+ *
+ * Same fact as {@link cwdDoesNotExistMessage}, one step earlier: #410 learned it
+ * from the core's `spawn_failed`, this asks the filesystem first, so no terminal,
+ * no temp dir and no half-launch is created for a launch that cannot work. The
+ * first line keeps the shape the issue asks for (`cwd does not exist: <path>`),
+ * and the second line is the point of both messages: the program is NAMED only
+ * to say it is not the problem — the core's own sentence would have said
+ * `cannot start "<node>"`, which is a fact about the wrong thing entirely.
+ *
+ * `spawn_failed` is deliberately absent: nothing was spawned, so quoting the
+ * core's vocabulary here would be a lie about where this verdict came from. The
+ * post-hoc message (a cwd that vanished between this check and `terminal.run`)
+ * keeps it, because there the core really did say it.
+ */
+function cwdRefusedBeforeSpawnMessage(input: {
+	operation: string;
+	terminal: string;
+	cwd: string;
+	program: string;
+}): string {
+	const lines = [
+		`${input.operation} failed for terminal '${input.terminal}': cwd does not exist: ${input.cwd}`,
+		`  refused before the core was asked to spawn: ${input.program} is not the problem, and was never tried`,
+	];
+	const parent = path.dirname(input.cwd);
+	if (!isDirectoryOnDisk(parent)) {
+		lines.push(`  its parent directory is missing or is not a directory: ${parent}`);
+	}
+	return lines.join("\n");
+}
+
+/**
+ * #410: the refusal for a spawn whose LAUNCH DIRECTORY is what is missing —
+ * learned from the core, so the core's own word comes first.
+ *
+ * This is the post-hoc half of #432: the preflight ({@link cwdRefusedBeforeSpawnMessage})
+ * answers the same question before `terminal.run`, and this one only speaks when
+ * a directory vanished between that check and the core's spawn (a race, a `git`
+ * that removed a tree, a concurrent cleanup).
  *
  * The shape issue #410 asks for is `spawn_failed: cwd does not exist: <path>` —
  * the core's own word first, then the fact it could not report. The program is

@@ -17,7 +17,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -406,6 +406,63 @@ test("D6: with no runId known the run label is omitted, not invented", async () 
 		const labels = h.client.paramsFor("terminal.run")[0]!.labels as Record<string, string>;
 		assert.equal(LEGION_RUN_LABEL in labels, false);
 		assert.equal(labels[LEGION_ROLE_LABEL], "centurion");
+	} finally {
+		h.cleanup();
+	}
+});
+
+// ── #414: the run that DISPATCHED this child names it ─────────────────────
+
+test("#414: SpawnInput.runId names the terminal and the legion.run label", async () => {
+	// Production builds ONE supervisor before any run exists, so the fact has to
+	// travel on the spawn. The legacy shape (no runId) is pinned by D6/D7 above.
+	const h = harness();
+	try {
+		const runId = "r-1a2b3c4d";
+		const input = spawnInput(h.root, { runId });
+		await h.supervisor.spawnChild(input);
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal(run.name, terminalName(runId, input.name));
+		assert.match(String(run.name), /^lgl-r-1a2b3c-/);
+		assert.equal((run.labels as Record<string, string>)[LEGION_RUN_LABEL], runId);
+		// The collision the issue measured: SAME child name, DIFFERENT runs. Their
+		// terminal names must differ (the name is unique only per core, and the
+		// handle is unique only per run).
+		assert.notEqual(
+			terminalName("r-1a2b3c4d", "root.worker-0"),
+			terminalName("r-5e6f7a8b", "root.worker-0"),
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#414: the spawn's runId wins over the constructor value (per-spawn fact)", async () => {
+	const h = harness({ runId: "r-constructor" });
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root, { runId: "r-dispatch" }));
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal((run.labels as Record<string, string>)[LEGION_RUN_LABEL], "r-dispatch");
+		assert.match(String(run.name), /^lgl-r-dispat-/);
+		// A spawn that names nothing still gets the constructor fallback — the
+		// pre-#414 seam keeps working for a caller that really owns one run.
+		await h.supervisor.spawnChild(spawnInput(h.root, { name: "root.centurion-1" }));
+		const second = h.client.paramsFor("terminal.run")[1]!;
+		assert.equal((second.labels as Record<string, string>)[LEGION_RUN_LABEL], "r-constructor");
+		assert.match(String(second.name), /^lgl-r-constr-/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#414: no runId anywhere keeps the legacy shape byte for byte", async () => {
+	const h = harness();
+	try {
+		const input = spawnInput(h.root);
+		await h.supervisor.spawnChild(input);
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal(run.name, "lgl-root-centurion-0");
+		assert.equal(LEGION_RUN_LABEL in (run.labels as Record<string, string>), false);
 	} finally {
 		h.cleanup();
 	}
@@ -902,58 +959,130 @@ test("D3: HC_BIN wins, then PATH, then ~/.local/bin/hc, then the bare name", () 
 	}
 });
 
-// ── #410: a launch directory that does not exist ──────────────────────────
+// ── #432: the local cwd preflight (the local half of D6/D9) ────────────────
 //
-// The reported defect: a worktree-holding child's cwd can be a path whose PARENT
-// does not exist yet (a fresh checkout with no worktree root, a reused tree whose
-// root was cleaned). `terminal.run` cannot enter it, and the core answers
-// `spawn_failed: cannot start "<node>": No such file or directory` — a sentence
-// about the PROGRAM that sends the operator after an interpreter that is right
-// there. Two facts are pinned here: the parent is created BEFORE the request, and
-// a request that still fails names the DIRECTORY.
+// #410 re-explained the core's `spawn_failed` AFTER the fact; #432 asks the same
+// question BEFORE `terminal.run`, so a launch that cannot work never creates a
+// terminal, a temp dir or a half-record — and the operator is never told that
+// `node` is missing when what is missing is the DIRECTORY (the core cannot tell
+// the two apart: both are `ENOENT` on the exec/chdir pair). Two harms are pinned
+// here: the attribution, and the fact that a RELATIVE cwd is resolved by the core
+// against the CORE's directory (measured: `hc run --cwd real …` where `real`
+// exists under this process's cwd dies blaming node).
+//
+// #410's post-hoc mapping stays as the second line of defence: a cwd that is
+// removed between the preflight and the spawn still has to be named.
 
-test("#410: a worktree launch creates the missing parent directory before terminal.run", async () => {
+test("#432: a local launch with a missing cwd is refused before terminal.run, naming the cwd", async () => {
 	const h = harness();
 	try {
-		// `<root>/tree-root/<name>`: the shape a worktree launch cwd has, with the
-		// root itself absent — the "fresh checkout" half of the report.
-		const cwd = path.join(h.root, ".pi-worktrees", "lgl-spawn-probe");
-		assert.equal(existsSync(path.dirname(cwd)), false, "precondition: the parent directory is missing");
+		// A FILE where the parent directory would go: nothing can create through it,
+		// and the message has to say so instead of blaming the interpreter.
+		const blocker = path.join(h.root, "blocked");
+		writeFileSync(blocker, "not a directory\n");
+		const cwd = path.join(blocker, "tree");
+		const program = process.execPath;
 
-		// Ask the question INSIDE the request: the directory must exist by the time
-		// the core is asked to start there, not merely by the time the launch returns.
-		const parentAtRequest: boolean[] = [];
-		h.client.on("terminal.run", (params) => {
-			parentAtRequest.push(existsSync(path.dirname(String(params.cwd))));
-			return { address: "t410", state: "live", turn: 0, status: { state: "idle" }, pid: 4242 };
-		});
+		await assert.rejects(
+			async () => {
+				await h.supervisor.spawnChild(spawnInput(h.root, { cwd }));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.START_FAILED);
+				const message = error.message;
+				// The sentence #432 asks for, with the path verbatim.
+				assert.ok(message.includes(`cwd does not exist: ${cwd}`), `the cwd must be named verbatim: ${message}`);
+				// The program is NAMED — as the thing that is NOT the problem. The core's
+				// own `cannot start "<node>"` is exactly what must not appear here.
+				assert.ok(message.includes(program), `the program is named as a note: ${message}`);
+				assert.match(message, /is not the problem/);
+				assert.doesNotMatch(message, /cannot start/);
+				// Nothing was spawned, so the core's own vocabulary would be a lie about
+				// where this verdict came from (the post-hoc path below keeps it).
+				assert.doesNotMatch(message, /spawn_failed/);
+				// And what the launch directory's parent looks like (a FILE here), measured.
+				assert.match(message, /its parent directory is missing or is not a directory/);
+				const details = error.details as { cwd?: string; program?: string; preflight?: string };
+				assert.equal(details.cwd, cwd);
+				assert.equal(details.program, program);
+				assert.equal(details.preflight, "local-cwd");
+				return true;
+			},
+		);
+		// The core was never asked: no terminal was created for a launch that cannot work.
+		assert.deepEqual(h.client.paramsFor("terminal.run"), []);
+		// …and nothing of the refused launch survives it: the temp dir (system prompt +
+		// owner file) is gone, so a bad cwd does not leave a pile of prompt files.
+		assert.deepEqual(
+			readdirSync(h.root).filter((entry) => entry.startsWith("terminal-child-")),
+			[],
+			"a refused launch leaves no temp dir behind",
+		);
+	} finally {
+		h.cleanup();
+	}
+});
 
-		const handle = await h.supervisor.spawnChild(spawnInput(h.root, { cwd, worktree: true }));
+test("#432: a worktree launch mkdir -p's the missing parent chain, and leaves the tree to git", async () => {
+	const h = harness();
+	try {
+		// Two missing levels, so a single-level `mkdir` would not pass.
+		const cwd = path.join(h.root, "runs", "r-432", "worktrees", "lgl-tree");
+		assert.equal(existsSync(path.dirname(path.dirname(cwd))), false, "precondition: two levels are missing");
 
-		assert.deepEqual(parentAtRequest, [true], "the parent directory exists before terminal.run");
-		assert.ok(statSync(path.dirname(cwd)).isDirectory(), "it is a real directory afterwards");
-		// The tree itself is NOT invented here: `git worktree add` owns that path, so
-		// a launcher that creates it would hand git an existing directory to refuse.
+		await assert.rejects(
+			async () => {
+				await h.supervisor.spawnChild(spawnInput(h.root, { cwd, worktree: true }));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.START_FAILED);
+				assert.ok(error.message.includes(`cwd does not exist: ${cwd}`), error.message);
+				return true;
+			},
+		);
+
+		// The whole parent chain exists now: that is the half the launcher owns
+		// (`git worktree add` creates the final directory but not its parents — the
+		// same split `ensureRemoteDir` keeps on the remote side).
+		assert.ok(statSync(path.dirname(cwd)).isDirectory(), "the whole parent chain was created");
+		// The tree itself is NOT invented: handing `git worktree add` an existing
+		// directory is a refusal (#410's frozen decision).
 		assert.equal(existsSync(cwd), false, "the launch directory itself belongs to git, not to this backend");
-		assert.equal(h.client.paramsFor("terminal.run")[0]?.cwd, cwd);
+		// Refused before the request, so the core never heard about it.
+		assert.deepEqual(h.client.paramsFor("terminal.run"), []);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#432: a relative local cwd is resolved HERE, not by the core", async () => {
+	const h = harness();
+	try {
+		const relative = path.relative(process.cwd(), h.root);
+		assert.equal(path.isAbsolute(relative), false, "precondition: a relative path");
+
+		const handle = await h.supervisor.spawnChild(spawnInput(h.root, { cwd: relative }));
+
+		const run = h.client.paramsFor("terminal.run")[0];
+		assert.ok(run, "terminal.run must be called");
+		// What travels on the wire is absolute: a relative path would be resolved against
+		// the CORE's own directory, which is how a directory that exists here became
+		// `No such file or directory` on `node` there (#432's measured failure).
+		assert.equal(run.cwd, path.resolve(h.root));
 		assert.equal(handle.name, "root.centurion-0");
 	} finally {
 		h.cleanup();
 	}
 });
 
-test("#410: spawn_failed on a missing cwd names the cwd, and the program only as a note", async () => {
+test("#432: a cwd that DOES exist keeps the program's sentence — the attributions never merge", async () => {
 	const h = harness();
 	try {
-		// A FILE where the parent directory would go: `mkdirSync` can never create the
-		// parent, so the launch reaches `terminal.run` with a directory that is absent
-		// and cannot be prepared (`ENOTDIR`), which is the second half of the report.
-		const blocker = path.join(h.root, "blocked");
-		writeFileSync(blocker, "not a directory\n");
-		const cwd = path.join(blocker, "tree");
 		const program = process.execPath;
 		h.client.on("terminal.run", () => {
-			// The real core's own wording, measured: it blames argv[0].
+			// The real core's wording for a program it cannot start, measured.
 			throw new HcRpcError({
 				code: -32000,
 				message: `cannot start "${program}": No such file or directory (os error 2)`,
@@ -963,20 +1092,55 @@ test("#410: spawn_failed on a missing cwd names the cwd, and the program only as
 
 		await assert.rejects(
 			async () => {
-				await h.supervisor.spawnChild(spawnInput(h.root, { cwd, worktree: true }));
+				// cwd = h.root: it IS a directory, so the directory is not the story here.
+				await h.supervisor.spawnChild(spawnInput(h.root));
 			},
 			(error: unknown) => {
 				assert.ok(error instanceof SubagentError);
 				assert.equal(error.code, ErrorCodes.START_FAILED);
-				const message = error.message;
-				// The frozen shape: the core's own word, then the fact it could not report.
-				assert.match(message, /spawn_failed: cwd does not exist: /);
-				assert.ok(message.includes(cwd), `the cwd must be named verbatim: ${message}`);
-				// The program is named — as the thing that is NOT the problem.
-				assert.ok(message.includes(program), `the program is named as a note: ${message}`);
-				assert.match(message, /the program is not the problem/);
-				// And what the launch directory's parent looks like (a FILE here).
-				assert.match(message, /its parent directory is missing or is not a directory/);
+				assert.match(error.message, /spawn_failed: cannot start/);
+				assert.equal(
+					error.message.includes("cwd does not exist"),
+					false,
+					`a present cwd must never be blamed: ${error.message}`,
+				);
+				return true;
+			},
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#410: a cwd removed between the preflight and the spawn still names the cwd", async () => {
+	const h = harness();
+	try {
+		const cwd = path.join(h.root, "vanishing");
+		mkdirSync(cwd, { recursive: true });
+		const program = process.execPath;
+		h.client.on("terminal.run", () => {
+			// The directory was there when the preflight looked, and is gone by the time
+			// the core answers: the post-hoc mapping is what has to carry that.
+			rmSync(cwd, { recursive: true, force: true });
+			throw new HcRpcError({
+				code: -32000,
+				message: `cannot start "${program}": No such file or directory (os error 2)`,
+				data: { kind: "spawn_failed" },
+			});
+		});
+
+		await assert.rejects(
+			async () => {
+				await h.supervisor.spawnChild(spawnInput(h.root, { cwd }));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.START_FAILED);
+				// #410's frozen shape: the core's own word first, then the fact it could
+				// not report — the second line of defence, unchanged.
+				assert.match(error.message, /spawn_failed: cwd does not exist: /);
+				assert.ok(error.message.includes(cwd), `the cwd must be named verbatim: ${error.message}`);
+				assert.match(error.message, /the program is not the problem/);
 				return true;
 			},
 		);
