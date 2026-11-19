@@ -34,6 +34,22 @@ export interface SpawnInput extends Omit<BuildArgsInput, "cwd" | "includeTask"> 
 	childLaunchContext?: ChildLaunchContext;
 	/** Whether to remove Legion lineage identity from the inherited environment. */
 	stripLegionIdentity?: boolean;
+	/**
+	 * #414: the run that DISPATCHED this child — the initiating run's id.
+	 *
+	 * Carried per SPAWN because the supervisor is built once per process, before
+	 * any run exists (so its constructor value can never name the run a child
+	 * belongs to). The terminal backend derives three facts from it — the hc
+	 * terminal name (`lgl-<runId8>-<handle>`), the remote mirror directory
+	 * (`<mirrorRoot>/<runId>/<name>`) and the `legion.run` label — which is what
+	 * keeps two same-named children of different runs from sharing a directory
+	 * or a terminal name on one machine.
+	 *
+	 * Absent is meaningful and must stay supported: an old caller (or a launch
+	 * with no run id at all) keeps the legacy shape — `lgl-<handle>`,
+	 * `<mirrorRoot>/no-run/<handle>`, no run label.
+	 */
+	runId?: string;
 	/** Optional Pi CLI entry point override. */
 	cliPath?: string;
 	/**
