@@ -14,7 +14,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 `status` 的归属事实：遗留行不再猜 age，也不再只说「有个叫 X 的东西在远端」。
 报告：`docs/reports/status-attribution.md`。本轮范围**只含 D1/D4/D5-rendering**，
 其余项已拆分为 issue：#407（72h sweep 抹掉跨机遗留，本版已修，见
-`docs/reports/leftover-visibility.md`）、#408（14 天 retention 删归属证据）、
+`docs/reports/leftover-visibility.md`）、#408（14 天 retention 删归属证据，本版已修，见
+`docs/reports/retention-keeps-attribution.md`）、
 #409（anchor / where 归属）、#410（spawn cwd 误报成程序不存在）、
 #411（跨机 transcript 实时镜像）。
 
@@ -41,6 +42,17 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   状态）把它藏起来，`recover` 却仍按名字收得到 —— status 说「没了」，recover 说
   「还能收」。现在行保持 open（`orphaned`/`unfetched` 依赖的同一不变量），年龄仍由
   归属块的 `launched`/`heartbeat` 如实显示。报告：`docs/reports/leftover-visibility.md`。
+- **#408：14 天 retention 不再删掉唯一的归属证据。** prune 之前先读 run 的 ledger，
+  只要其中还有 **unsettled 跨机行**（`host` 非空且 status ∈ `starting/running/blocked`，
+  与 `listUnsettledRemoteNodes` / `/legion status` / `recover` 同一谓词）就跳过这个
+  run dir：它的 `nodes.remote_dir` / `nodes.remote_terminal`（schema v5）是本机唯一能回答
+  「远端那个目录/终端是谁的」的记录，删掉之后远端目录与终端还在、本地查无此人。
+  **只保护这一类行**：没有跨机行、或跨机行已经结算（`settled`/`failed`/`retired`）的
+  空闲 run dir 照旧删（不是「永不删除」）；ledger 读不出来时保留并记进 sweep 的 `errors`
+  （不盲删）。`/legion doctor` 的 storage 段把它们列出来，带 `remote_dir=` /
+  `remote_terminal=` 与 `hc terminal ls --on <host>` 的查法，`.hygiene-last.json` 多一个
+  `keptRemoteRuns` 计数。`markAbandoned` 的本地行谓词（#407）一行未动。
+  报告：`docs/reports/retention-keeps-attribution.md`。
 
 ## [6.2.4] — 2026-11-19
 
