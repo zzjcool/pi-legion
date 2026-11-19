@@ -16,6 +16,8 @@ import {
 } from "../../src/extension/legion-doctor.ts";
 import { clearSpawnFailures, recordSpawnFailure } from "../../src/extension/spawn-hints.ts";
 import { HYGIENE_DEFAULTS, HYGIENE_LAST_FILE } from "../../src/runs/hygiene.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { insertNode } from "../../src/legion/nodes.ts";
 import { BUILTIN_CODEMODE, buildPiArgs, childGuardExtensionPath } from "../../src/runs/args.ts";
 import { ensureHostExtensions, resetExtensionDiscoveryCache } from "../../src/runs/extension-inheritance.ts";
 import {
@@ -473,6 +475,45 @@ test("doctor storage labels env hygiene overrides and ignores invalid values", (
 		assert.match(report.text, new RegExp(`staleNodeHours=${HYGIENE_DEFAULTS.staleNodeHours}h \\(default\\)`));
 		assert.match(report.text, new RegExp(`legacyTempHours=${HYGIENE_DEFAULTS.legacyTempHours}h \\(default\\)`));
 		assert.equal(report.issues.some((issue) => issue.code === "HYGIENE_SWEEP_STALE"), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(store, { recursive: true, force: true });
+	}
+});
+
+test("#408 doctor names the run dirs retention keeps and how to inspect the far side", () => {
+	const store = mkdtempSync(path.join(tmpdir(), "legion-store-408-"));
+	const runDir = path.join(store, "runs", "run-408");
+	mkdirSync(runDir, { recursive: true });
+	const db = openLegionDb(path.join(runDir, "legion.db"));
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" });
+		insertNode(db, {
+			parentId: "root",
+			name: "remote",
+			role: "worker",
+			host: "hw-nj",
+			remoteDir: "/home/xm/legion-run-7",
+			remoteTerminal: "hw-nj/pi-7",
+			status: "running",
+		});
+	} finally {
+		db.close();
+	}
+	const { dir, report } = runStorageDoctor({}, store);
+	try {
+		assert.match(report.text, /- runs: 1; legion\.db total/);
+		assert.match(report.text, /- kept by retention: 1 run dir\(s\) hold an unsettled cross-machine row \(prune skips them\)/);
+		assert.match(report.text, /run-408\/root\.remote remote@hw-nj running/);
+		assert.match(report.text, /remote_dir=\/home\/xm\/legion-run-7 remote_terminal=hw-nj\/pi-7/);
+		assert.match(report.text, /inspect: hc terminal ls --on hw-nj/);
+		const issue = report.issues.find((item) => item.code === "RETENTION_HOLDS_REMOTE");
+		assert.equal(issue?.severity, "info");
+		assert.equal(issue?.section, "storage");
+		assert.match(issue?.message ?? "", /still hold 1 unsettled cross-machine row\(s\)/);
+		assert.match(issue?.message ?? "", /\(hw-nj\)/);
+		assert.match(issue?.fix ?? "", /hc terminal ls --on hw-nj/);
+		assert.match(report.text, /\[info\] RETENTION_HOLDS_REMOTE @storage:/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 		rmSync(store, { recursive: true, force: true });
