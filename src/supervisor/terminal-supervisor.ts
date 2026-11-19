@@ -854,13 +854,42 @@ export class TerminalSupervisor implements LegionSupervisor {
 			}
 		}
 
+		// #410: a LOCAL worktree launch starts its terminal IN the tree, and
+		// `terminal.run` cannot chdir into a path whose parent does not exist — the
+		// core then reports it as a fact about the PROGRAM (`spawn_failed: cannot
+		// start "<node>": No such file or directory`), which sends the operator after
+		// an interpreter that is right there. Measured on a real core (`hc 0.1.21`):
+		//
+		//   $ hc run --cwd /nope -- /usr/bin/node -v
+		//   {"error":{"kind":"spawn_failed","message":"cannot start \"/usr/bin/node\": No such file or directory (os error 2)"}}
+		//
+		// The tree's PARENT is therefore created BEFORE the request, exactly as the
+		// cross-machine path already does for the remote tree root (`ensureRemoteDir`
+		// in `createRemoteChildWorktree`, whose comment says `git worktree add`
+		// creates the final directory but not its parents). The tree itself is NOT
+		// created here: `git worktree add` owns that path, and handing it an existing
+		// directory is a refusal.
+		//
+		// A failure to create it is NOT fatal and NOT reported from here: `terminal.run`
+		// still runs (the directory may exist for a reason this process cannot see),
+		// and the error path below reports the STATE that matters (the launch
+		// directory is absent) instead of this process's attempt.
+		const launchCwd = target !== undefined ? remoteWorktree?.path ?? target.cwd : input.cwd;
+		if (target === undefined && input.worktree === true) {
+			try {
+				fs.mkdirSync(path.dirname(launchCwd), { recursive: true });
+			} catch {
+				/* best effort — `cwdDoesNotExistMessage` says what the parent looks like */
+			}
+		}
+
 		const params = {
 			name: terminalNameForChild,
 			argv,
 			// D6/D11: a remote child starts in the REMOTE directory — its own tree when
 			// one was created for it, the target's checkout otherwise. It is never
 			// `this.cwd` and never a local path that happens to exist here.
-			cwd: target !== undefined ? remoteWorktree?.path ?? target.cwd : input.cwd,
+			cwd: launchCwd,
 			// Absent for a remote child (see `childEnv`): the core's own environment is the
 			// only truthful one over there. Local launches always have a value, so the
 			// params this machine produces keep their exact shape.
@@ -891,7 +920,17 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// the case the spike's "cwd missing vs program missing" note makes least
 			// informative, and dropping the machine from the message is the difference
 			// between "look at vps" and "look at ... somewhere".
-			throw this.failure("terminal.run", terminalAddress({ terminalName: terminalNameForChild, host }), error);
+			// #410: a LOCAL launch hands its cwd over, so a `spawn_failed` that is
+			// really about a missing directory says that instead of blaming `node`.
+			// A REMOTE launch never gets this context: its cwd is a path on the OTHER
+			// machine (D13), so asking THIS filesystem about it would answer a
+			// different question than the one the core just failed to.
+			throw this.failure(
+				"terminal.run",
+				terminalAddress({ terminalName: terminalNameForChild, host }),
+				error,
+				target === undefined ? { cwd: launchCwd, program: argv[0] ?? "" } : undefined,
+			);
 		}
 
 		// An address in the reply is the proof the terminal really started. Later
@@ -1606,9 +1645,40 @@ export class TerminalSupervisor implements LegionSupervisor {
 		return child;
 	}
 
-	/** Wrap a transport failure so callers see one error vocabulary. */
-	private failure(operation: string, terminal: string, error: unknown): Error {
+	/**
+	 * Wrap a transport failure so callers see one error vocabulary.
+	 *
+	 * `cwdContext` is passed by the ONE call site that starts a terminal in a
+	 * directory (#410): when the core answers `spawn_failed`/`bad_cwd` and that
+	 * directory is not on disk, the failure is about the DIRECTORY, not the
+	 * program, and the message says so (`cwdDoesNotExistMessage`). Every other
+	 * failure keeps the plain `operation failed for terminal '<addr>': <detail>`
+	 * shape.
+	 */
+	private failure(
+		operation: string,
+		terminal: string,
+		error: unknown,
+		cwdContext?: { cwd: string; program: string },
+	): Error {
 		if (error instanceof SubagentError) return error;
+		if (
+			cwdContext !== undefined &&
+			error instanceof HcRpcError &&
+			CWD_FAILURE_KINDS.has(error.kind) &&
+			!isDirectoryOnDisk(cwdContext.cwd)
+		) {
+			return new SubagentError(
+				cwdDoesNotExistMessage({
+					operation,
+					terminal,
+					detail: `${error.kind}: ${error.message}`,
+					...cwdContext,
+				}),
+				ErrorCodes.START_FAILED,
+				{ cwd: cwdContext.cwd, program: cwdContext.program, kind: error.kind },
+			);
+		}
 		const detail =
 			error instanceof HcRpcError
 				? `${error.kind}: ${error.message}`
@@ -1671,6 +1741,79 @@ function describeFailure(error: unknown): string {
 	if (error instanceof HcRpcError) return `${error.kind}: ${error.message}`;
 	if (error instanceof Error) return error.message;
 	return String(error);
+}
+
+/**
+ * The core's own names for "the program could not be started" (#410).
+ *
+ * A cwd that is not there surfaces as `spawn_failed`, because that is the one
+ * failure the core reports when its own chdir/exec pair fails — and it words it
+ * as a fact about the PROGRAM (`cannot start "<argv[0]>": No such file or
+ * directory (os error 2)`), which sends the operator after a binary that is
+ * right there. Measured on a real core (`hc 0.1.21`):
+ *
+ * ```
+ * $ hc run --cwd /nope -- /usr/bin/node -v
+ * {"error":{"kind":"spawn_failed",
+ *   "message":"cannot start \"/usr/bin/node\": No such file or directory (os error 2)"}}
+ * ```
+ *
+ * `bad_cwd` is the same situation spelled honestly (the fake core in
+ * `test/helpers/fake-hc-core.mjs` answers it when it can see the directory is
+ * absent, and a future core may do the same). Both kinds are normalized here
+ * when the launch directory really is missing, so the message names the
+ * directory the launch needed.
+ */
+const CWD_FAILURE_KINDS: ReadonlySet<string> = new Set(["spawn_failed", "bad_cwd"]);
+
+/**
+ * Is `dir` a directory ON THIS MACHINE? (never a question about another one)
+ *
+ * A path this process cannot stat is reported as absent on purpose: the caller
+ * asks only to explain a `spawn_failed`, and "I cannot see it either" is the same
+ * sentence the operator needs. A path that exists but is a FILE is `false` too,
+ * because a terminal cannot start in one (`ENOTDIR`).
+ */
+function isDirectoryOnDisk(dir: string): boolean {
+	try {
+		return fs.statSync(dir).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * #410: the refusal for a spawn whose LAUNCH DIRECTORY is what is missing.
+ *
+ * The shape issue #410 asks for is `spawn_failed: cwd does not exist: <path>` —
+ * the core's own word first, then the fact it could not report. The program is
+ * named as a NOTE, because that is the one thing the core's sentence gets wrong:
+ * it blames the interpreter, which exists (`isDirectoryOnDisk` and the
+ * operator's own `hc run … -- <node> -v` both agree).
+ *
+ * When the parent is ALSO missing, that is appended as its own line: it is the
+ * difference between "someone removed the tree" (the parent is fine, `git
+ * worktree add` can rebuild it) and "this launch could never have started here"
+ * (an unwritable or non-directory parent). The state is measured at error time,
+ * not inferred from this backend's own mkdir attempt, so the sentence stays true
+ * even when the creation was skipped or raced.
+ */
+function cwdDoesNotExistMessage(input: {
+	operation: string;
+	terminal: string;
+	detail: string;
+	cwd: string;
+	program: string;
+}): string {
+	const lines = [
+		`${input.operation} failed for terminal '${input.terminal}': spawn_failed: cwd does not exist: ${input.cwd}`,
+		`  the program is not the problem: ${input.program} (the core said: ${input.detail})`,
+	];
+	const parent = path.dirname(input.cwd);
+	if (!isDirectoryOnDisk(parent)) {
+		lines.push(`  its parent directory is missing or is not a directory: ${parent}`);
+	}
+	return lines.join("\n");
 }
 
 /**
