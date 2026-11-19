@@ -106,6 +106,7 @@ import {
 	type RenewalProposal,
 	SUBAGENT_NOTIFY_TYPE,
 } from "./src/extension/notify.ts";
+import { createSettleHold, fileHoldTrace } from "./src/extension/hold.ts";
 import { renderSubagentNotice } from "./src/extension/notice-renderer.ts";
 import { renderSpawnResult } from "./src/extension/spawn-render.ts";
 import { appendInprocessModelHint } from "./src/extension/spawn-hints.ts";
@@ -2339,6 +2340,23 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		},
 	});
 	sessionRuntime = runtime;
+	// #417 settle hold. The host awaits `agent_before_settle` handlers serially and with
+	// no timeout, which makes that boundary the ONE place where spending wall time is
+	// legitimate: while a child of this session is still running we wait for it there
+	// and hand its completion to the SAME turn (entries + one continuation) instead of
+	// letting it wait for the next `agent_settled` (+32.2s end to end, CHANGELOG 6.0.2).
+	//
+	// Policy lives in `src/extension/hold.ts` (testable without a host); the runtime owns
+	// "who is live" and the outbox item, and the trace sink is inert unless
+	// `PI_LEGION_HOLD_TRACE` names a file (it is the report's evidence).
+	const settleHold = createSettleHold({
+		liveChildren: () => runtime.holdableChildren?.(),
+		takeNotice: () => runtime.takeHeldNotice?.(),
+		commitNotice: () => runtime.commitHeldNotice?.(),
+		releaseNotice: () => runtime.releaseHeldNotice?.(),
+		ownsBoundary: () => runtime.holdOwnsBoundary?.(),
+		record: fileHoldTrace(process.env.PI_LEGION_HOLD_TRACE),
+	});
 	blockedUi.set(runtime, {
 		getConfirm: () => lastConfirm,
 		notifyBlocked: (message) => {
@@ -2918,6 +2936,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	// that is #415, and it is why the child-side sink for this diagnostic is degraded
 	// in `child-session.ts` (`skippedTurnEndBoundary`) instead of being left to look
 	// like a failing extension.
+	// #417 settle hold: the extension's SINGLE `agent_before_settle` owner. The host runs
+	// these handlers as one serial chain with ONE continuation per settle, so a second
+	// registrant is not a second wait: `continue: false` would silently cancel this hold
+	// and a bare `entries` list would silently delete its drafts (`hold-spike.md` §1,
+	// cases 1i and 1d). The hold therefore never returns `continue: false` and always
+	// spreads `event.entries`. No `turn_end` handler is involved — see the block above.
+	pi.on("agent_before_settle", (event, ctx) => settleHold.beforeSettle(event, ctx));
 	pi.on("agent_start", (event, ctx) => {
 		runtime.notifyParentRunStart();
 		bindUi(event, ctx);
@@ -2963,7 +2988,13 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			return undefined;
 		}
 	});
-	pi.on("session_shutdown", shutdownRetireAll);
+	pi.on("session_shutdown", (event, ctx) => {
+		// #417: the hold must not keep waiting after teardown. (A disposed runtime already
+		// answers `holdableChildren()` with `[]`, so this is the explicit half of the same
+		// promise rather than the only guard.)
+		settleHold.dispose();
+		return shutdownRetireAll(event, ctx);
+	});
 }
 
 /**

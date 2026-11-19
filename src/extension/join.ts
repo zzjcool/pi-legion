@@ -193,6 +193,21 @@ export class JoinCoordinator {
 		}
 	}
 
+	/**
+	 * #417: drain what is buffered right now, for every run that still has a buffer.
+	 *
+	 * The window exists to batch siblings that are still coming. When the settle hold
+	 * has no live child left there is nothing left for it to wait for, and an entry
+	 * parked here would otherwise miss the boundary it was meant to reach — the hold
+	 * would find an empty outbox and settle with the notice still buffered for up to
+	 * `flushMs`. Identical to what the window expiry does: same `deliverFn`, same
+	 * group-drop rule, and a later firing timer is a no-op.
+	 */
+	flushBuffered(): void {
+		if (this.disposed) return;
+		for (const runId of [...this.groups.keys()]) this.flush(runId);
+	}
+
 	/** True when a group has no non-blocked members still pending. */
 	allSettled(runId: string): boolean {
 		const group = this.groups.get(runId);
