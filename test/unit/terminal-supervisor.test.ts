@@ -17,7 +17,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { delimiter } from "node:path";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
@@ -822,5 +822,88 @@ test("D3: HC_BIN wins, then PATH, then ~/.local/bin/hc, then the bare name", () 
 	} finally {
 		rmSync(home, { recursive: true, force: true });
 		rmSync(pathDir, { recursive: true, force: true });
+	}
+});
+
+// ── #410: a launch directory that does not exist ──────────────────────────
+//
+// The reported defect: a worktree-holding child's cwd can be a path whose PARENT
+// does not exist yet (a fresh checkout with no worktree root, a reused tree whose
+// root was cleaned). `terminal.run` cannot enter it, and the core answers
+// `spawn_failed: cannot start "<node>": No such file or directory` — a sentence
+// about the PROGRAM that sends the operator after an interpreter that is right
+// there. Two facts are pinned here: the parent is created BEFORE the request, and
+// a request that still fails names the DIRECTORY.
+
+test("#410: a worktree launch creates the missing parent directory before terminal.run", async () => {
+	const h = harness();
+	try {
+		// `<root>/tree-root/<name>`: the shape a worktree launch cwd has, with the
+		// root itself absent — the "fresh checkout" half of the report.
+		const cwd = path.join(h.root, ".pi-worktrees", "lgl-spawn-probe");
+		assert.equal(existsSync(path.dirname(cwd)), false, "precondition: the parent directory is missing");
+
+		// Ask the question INSIDE the request: the directory must exist by the time
+		// the core is asked to start there, not merely by the time the launch returns.
+		const parentAtRequest: boolean[] = [];
+		h.client.on("terminal.run", (params) => {
+			parentAtRequest.push(existsSync(path.dirname(String(params.cwd))));
+			return { address: "t410", state: "live", turn: 0, status: { state: "idle" }, pid: 4242 };
+		});
+
+		const handle = await h.supervisor.spawnChild(spawnInput(h.root, { cwd, worktree: true }));
+
+		assert.deepEqual(parentAtRequest, [true], "the parent directory exists before terminal.run");
+		assert.ok(statSync(path.dirname(cwd)).isDirectory(), "it is a real directory afterwards");
+		// The tree itself is NOT invented here: `git worktree add` owns that path, so
+		// a launcher that creates it would hand git an existing directory to refuse.
+		assert.equal(existsSync(cwd), false, "the launch directory itself belongs to git, not to this backend");
+		assert.equal(h.client.paramsFor("terminal.run")[0]?.cwd, cwd);
+		assert.equal(handle.name, "root.centurion-0");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#410: spawn_failed on a missing cwd names the cwd, and the program only as a note", async () => {
+	const h = harness();
+	try {
+		// A FILE where the parent directory would go: `mkdirSync` can never create the
+		// parent, so the launch reaches `terminal.run` with a directory that is absent
+		// and cannot be prepared (`ENOTDIR`), which is the second half of the report.
+		const blocker = path.join(h.root, "blocked");
+		writeFileSync(blocker, "not a directory\n");
+		const cwd = path.join(blocker, "tree");
+		const program = process.execPath;
+		h.client.on("terminal.run", () => {
+			// The real core's own wording, measured: it blames argv[0].
+			throw new HcRpcError({
+				code: -32000,
+				message: `cannot start "${program}": No such file or directory (os error 2)`,
+				data: { kind: "spawn_failed" },
+			});
+		});
+
+		await assert.rejects(
+			async () => {
+				await h.supervisor.spawnChild(spawnInput(h.root, { cwd, worktree: true }));
+			},
+			(error: unknown) => {
+				assert.ok(error instanceof SubagentError);
+				assert.equal(error.code, ErrorCodes.START_FAILED);
+				const message = error.message;
+				// The frozen shape: the core's own word, then the fact it could not report.
+				assert.match(message, /spawn_failed: cwd does not exist: /);
+				assert.ok(message.includes(cwd), `the cwd must be named verbatim: ${message}`);
+				// The program is named — as the thing that is NOT the problem.
+				assert.ok(message.includes(program), `the program is named as a note: ${message}`);
+				assert.match(message, /the program is not the problem/);
+				// And what the launch directory's parent looks like (a FILE here).
+				assert.match(message, /its parent directory is missing or is not a directory/);
+				return true;
+			},
+		);
+	} finally {
+		h.cleanup();
 	}
 });
