@@ -30,7 +30,7 @@
 （node 是 `node -v` 正常打印的同一个二进制）：
 
 ```
-$ /usr/bin/env node -v
+$ node -v
 v26.8.1
 $ hc run --cwd /tmp/l410-r2-nocwd/does-not-exist -- \
     /home/zzjcool/.local/share/mise/installs/node/26.8.1/bin/node -v
@@ -162,8 +162,7 @@ $ ls -a | grep -E 'pi-worktrees|pi-subagents' || echo '(neither .pi-worktrees no
 ```
 $ cd /tmp/l410-r2-e2e && pi --print --mode json --provider mock --model flash --thinking off \
     -e /tmp/l410-r2-e2e/index.ts -- \
-    'MOCK_TOOL: subagent | {"agent":"centurion","name":"l410-r2-probe","worktree":true,
-      "model":"flash","task":"MOCK_SAY: CENTURION_UP"}'
+    'MOCK_TOOL: subagent | {"agent":"centurion","name":"l410-r2-probe","worktree":true,"model":"flash","task":"MOCK_SAY: CENTURION_UP"}'
 ```
 
 启动回执（父进程工具结果原文）：
