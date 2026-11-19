@@ -94,6 +94,17 @@ quiet 判据）已由 #411 补齐输入，第 3 层不在本 PR。
   `keptRemoteRuns` 计数。`markAbandoned` 的本地行谓词（#407）一行未动。
   报告：`docs/reports/retention-keeps-attribution.md`。
 
+## [6.2.6] — 2026-11-19
+
+**一句话：跨机 child 从"派出去就看不见"变成"边跑边看得见"；任务在回合内就能被处理完，而不是回合结束才发现。**
+
+- **`#411` PR #429 跨机实时镜像泵（三层）。** ①泵：`hc` `wc -c` + `tail -c`(1-based) + BASE64 直解，按 **byte offset 增量**追加，默认 5s，本地留末尾 4 MiB（按行边界裁）；远端变小 → 重置 + 一条 warning；稳态用 `O_APPEND`（**inode 不变**，既有增量解析缓存不失效），只有 cap 裁剪/重置才走 temp+rename；tick 串行化，`stop()` 后在飞 tick 不再落盘。②settle 最终同步：`collect()` settled 时 `finalSyncLiveMirror({stop:true})`，**带 5s deadline + race**（不能把"child 结束了"变成"还在 collect"）；泵失败只 warn 一次，绝不影响 child。③状态机：`onGrowth` 推动 run.json `launching → working` 并推账本 `starting → running` —— 此前 `persistParentReservation` 写 `launching` 后**全仓无人写回 `working`**，这就是"永远 launching"的机制。`status` 新增 `mirror=off` / `mirror=ok(<n> bytes)` / `mirror=stale(<n> bytes)`，本地 child 输出**逐字节不变**。真机：`0 → 31162 → 32926 → 33232`（5 次采样）→ settle 后 `38094`，与远端 `wc -c` 逐字节相等。变异 5/5 红。
+- **`#417` PR #436 settle hold。** 有 subagent 时父回合在 settle 前停留，让"任务完成"在同一回合内被处理：`agent_before_settle` **唯一 owner**（无 `turn_end`）、**永不 `continue:false`**、必须 `entries: [...event.entries, ...drafts]`、预算 `legionHoldMaxMs=600000` 到期不续跑、退出**先 release 再 return** + 持久 `notified_at` 闩锁（重启不重发）、正常与取消分词且 **abort 后不发通知**、用户消息路径不阻塞。真机：正常 settle `heldMs 7619`，通知在 `hold:end+1ms` 落盘并被同轮续跑读到；Esc abort **13ms 释放**（盲等写法 5689ms），`entriesOut 0`、**0 条通知 + 0 条孤儿 draft**。附带修 `join.ts`：被阻塞兄弟的 join 窗口不再藏住另一个已完成的兄弟通知。变异 9/9 红。已知边界（报告 §7）：`SETTLE_FALLBACK_MS` 在 hold 后未重新武装；`continue:true` 会覆盖前一个 handler 的 `continue:false`；亚毫秒 abort 窗口不可观测。
+- **`#414` PR #435 runId 透传（零迁移）。** 发起方 run id 进三个面：spawn 上下文（终端名 `lgl-<runId8>-<handle>`、远端目录 `<mirrorRoot>/<runId>/<name>`、`legion.run` 标签）、`run.json`/ledger（`parentRunId` + `initiatorRunIdOf` 子→父反查、产物 id `<runId>/<name>/r<round>`）、完成通知（`Run: <id>` 行 + `details.runId`）。**缺 runId 时旧形状逐字不变**（`lgl-<name>`/`no-run`/无标签/通知字节相同/老 run.json 仍可读），变异删兜底 → 20+ 条旧形状断言红。**不做 psid 身份层**（#405 以 not planned 关闭）。
+- **`#432` PR #434 本地 launch 的 cwd 预检。** 此前只有跨机侧有 preflight：本地 cwd 缺失时 Node 报 `ENOENT` 并把**程序名**写进 message，于是显示成 `cannot start "<node>": No such file or directory`，让人去查一个根本没问题的 node。现在本地分支在 `terminal.run` **之前**做 `path.resolve` 绝对化 + `isDirectoryOnDisk`（`worktree:true` 只建树的父链），拒绝时明确报 `cwd does not exist: <abs>` 并把程序标为 "is not the problem, and was never tried"；cwd 真存在时保留核心原文 `cannot start "<program>"`。变异：去掉预检 3 红、去掉 `resolve` 1 红。
+
+**测试**：单测 2830（6.2.5 为 2749，+81，全部为新增能力），集成 193/193，typecheck 绿。
+
 ## [6.2.5] — 2026-11-19
 
 **一句话：派出去的 agent「到底有没有在跑」这件事，从这一版起有机制保证，而不是靠人肉 `find session.jsonl` 猜。**
