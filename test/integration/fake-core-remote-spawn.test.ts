@@ -265,6 +265,11 @@ if (process.argv.includes("--list-models")) {
 	return path.posix.join(remoteRoot, ".fake-pi", "cli.js");
 }
 
+/** `terminal.run` requests that are NOT the machine's #409 anchor (i.e. the child's own). */
+function childRuns(h: Harness): Record<string, unknown>[] {
+	return h.wireFor("terminal.run").filter((params) => params.name !== "lgl-anchor");
+}
+
 test("S1: a remote spawn crosses the wire with the remote cwd/argv/env/labels and mirrors the prompt", async (t) => {
 	const h = harness();
 	t.after(() => h.cleanup());
@@ -272,18 +277,27 @@ test("S1: a remote spawn crosses the wire with the remote cwd/argv/env/labels an
 	const handle = await h.supervisor.spawnChild(input);
 
 	// 1. The core accepted it as a REMOTE terminal: `on` was sent, and the reply
-	//    address is qualified with that machine.
-	const runReply = h.replies.find((entry) => entry.method === "terminal.run");
+	//    address is qualified with that machine. #409: the FIRST `terminal.run` is
+	//    the machine's anchor, so the child's own reply is the last one.
+	const runReply = h.replies.filter((entry) => entry.method === "terminal.run").at(-1);
 	assert.ok(runReply, "terminal.run must have been sent");
 	const address = (runReply.result as { address?: string }).address;
-	assert.equal(address, `${HOST}/t1`);
+	assert.equal(address, `${HOST}/t2`);
 	// The handle keeps the registry name, not the hc address (D7).
 	assert.equal(handle.name, input.name);
 
 	// 2. What crossed the wire for `terminal.run`.
-	const [run] = h.wireFor("terminal.run");
+	const [run] = childRuns(h);
 	assert.ok(run, "terminal.run must appear in the wire log");
 	assert.equal(run.on, HOST);
+	// #409: the parent is the machine's ANCHOR, spelled as the TARGET core resolves it
+	// (a target-local address, here the anchor's `t1`), never this process's caller id.
+	const [anchorRun] = h.wireFor("terminal.run");
+	assert.ok(anchorRun, "a cross-machine launch creates the machine's anchor first");
+	assert.equal(anchorRun.name, "lgl-anchor");
+	assert.equal((anchorRun.labels as Record<string, string>)["legion.anchor"], HOST);
+	assert.equal(run.parent, "t1");
+	assert.equal(handle.parentTerminal, "t1", "the handle carries the address that was used");
 	assert.ok(String(run.cwd).startsWith(h.remoteRoot), `cwd must be on that machine: ${String(run.cwd)}`);
 	assert.equal(run.cwd, h.remoteCwd);
 	const argv = (run.argv as string[]).map(String);

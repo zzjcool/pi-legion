@@ -377,7 +377,8 @@ test("T1: a remote child that writes its transcript reads back complete, with no
 	// §7 T1: launch and read-back must agree about the mirror dir, so the record's
 	// own `remoteDir` is what a later process reads from.
 	assert.equal(handle.remoteDir, dir);
-	assert.equal(h.wireFor("terminal.run").length, 1);
+	// #409: the anchor's own `terminal.run` comes first; the child's is the other one.
+	assert.equal(h.wireFor("terminal.run").filter((params) => params.name !== "lgl-anchor").length, 1);
 
 	const collected = await readback(h, handle);
 	assert.ok(collected.ok, `the read-back must succeed: ${JSON.stringify(collected)}`);
@@ -429,8 +430,9 @@ test("T2: a child that dies during start-up fails the launch with its own exit c
 	assert.equal(details.fate, "no-child");
 	assert.equal(details.exitCode, 1);
 	// §7 T2: the terminal WAS created — this is a proven death, not a pre-launch
-	// refusal, which is the distinction the whole gate exists for.
-	assert.equal(h.wireFor("terminal.run").length, 1);
+	// refusal, which is the distinction the whole gate exists for. (#409: the
+	// machine's anchor is the other `terminal.run` in this log.)
+	assert.equal(h.wireFor("terminal.run").filter((params) => params.name !== "lgl-anchor").length, 1);
 	const gets = h.wireFor("terminal.get");
 	assert.ok(
 		gets.some((params) => String(params.terminal) === `${HOST}/${terminalName(RUN_ID, input.name)}`),

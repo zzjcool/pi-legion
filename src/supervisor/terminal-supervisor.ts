@@ -58,6 +58,11 @@ import {
 	preflightDelivery,
 	type DeliveryPreflightReport,
 } from "../runs/cross-machine-preflight.ts";
+import {
+	ANCHOR_TERMINAL_NAME,
+	LEGION_ANCHOR_LABEL,
+	anchorLocalAddress,
+} from "../runs/parent-anchor.ts";
 import { childMemoryEnv } from "./child-memory.ts";
 import { defaultPiCliPath } from "./rpc-supervisor.ts";
 import { raceWithTimeout } from "./race-timeout.ts";
@@ -295,6 +300,15 @@ export class TerminalSupervisor implements LegionSupervisor {
 	private client: HcClient | undefined;
 	/** Parent space label; `null` = not read yet, `undefined` = no space known. */
 	private parentSpace: string | null | undefined = null;
+	/**
+	 * Machine → the anchor terminal already established on it (#409).
+	 *
+	 * Process-scoped on purpose: the anchor is a fact about a CORE, not about one
+	 * launch, so a centurion dispatching N children to one machine asks once. A
+	 * second process asks again (one `terminal.get`) and reuses the same terminal —
+	 * the name, not this cache, is what makes it shared.
+	 */
+	private readonly anchors = new Map<string, string>();
 
 	constructor(options: TerminalSupervisorOptions = {}) {
 		this.env = options.env ?? process.env;
@@ -872,6 +886,12 @@ export class TerminalSupervisor implements LegionSupervisor {
 			}
 		}
 
+		// #409: every terminal this backend creates must have a parent, and the address
+		// must be one the TARGET core resolves (see `parent-anchor.ts` for the three
+		// measured spellings). Resolved AFTER the preflight so a launch that is about to
+		// be refused never leaves an anchor on a machine it will not use.
+		const launchParent = await this.resolveLaunchParent(client, host, target?.cwd ?? input.cwd);
+
 		// #410: a LOCAL worktree launch starts its terminal IN the tree, and
 		// `terminal.run` cannot chdir into a path whose parent does not exist — the
 		// core then reports it as a fact about the PROGRAM (`spawn_failed: cannot
@@ -916,6 +936,14 @@ export class TerminalSupervisor implements LegionSupervisor {
 				return env === undefined ? {} : { env };
 			})()),
 			labels: await this.childLabels(input, remote ? host : undefined),
+			// #409: the parent, in the namespace of the core that receives this request.
+			// LOCAL: this process's own terminal (the same value `caller` carries, made
+			// explicit so the record does not depend on the core's default). REMOTE: the
+			// target machine's anchor — the caller's local id is meaningless there
+			// (`no terminal "t1t"`) and a machine-/core-qualified spelling is refused by
+			// the SENDING core (`unknown machine`). Absent only when no parent could be
+			// named, and the reason travels on the handle (#409 req 2).
+			...(launchParent.parent !== undefined ? { parent: launchParent.parent } : {}),
 			// Constraint 5: `caller` is a BARE terminal name in THIS core's
 			// namespace. A remote terminal lives in another one, where that id either
 			// does not exist or names somebody else's terminal — so a remote request
@@ -1042,6 +1070,13 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// cannot find the child's transcript in a later process.
 			...(remoteDir ? { remoteDir } : {}),
 			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
+			// #409: the parent this launch used, in the target core's namespace, and the
+			// reason when there is none. The orchestrator persists both on the child
+			// record (parentRunId travels beside them), so the chain
+			// child terminal → parent terminal → run can be walked from `run.json`
+			// alone.
+			...(launchParent.parent !== undefined ? { parentTerminal: launchParent.parent } : {}),
+			...(launchParent.absent !== undefined ? { parentAbsent: launchParent.absent } : {}),
 			...(launchWarnings.length > 0 ? { warnings: launchWarnings } : {}),
 		};
 	}
@@ -1338,6 +1373,121 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 */
 	private callerFor(host: string | undefined): string | undefined {
 		return normalizeHost(host) === undefined ? this.caller : undefined;
+	}
+
+	/**
+	 * The parent address for one launch, or the reason there is none (#409).
+	 *
+	 * LOCAL: this process's own terminal. `HC_TERMINAL_ID` is an address in THIS
+	 * core's namespace, which is the namespace the request lands in — so it works
+	 * both ways (measured: `terminal.run{caller:"t77"}` stores `parent: "t77"`, and
+	 * an explicit `parent: "t77"` does the same). It is sent explicitly as well as
+	 * through `caller` because #409 asks the request itself to carry it.
+	 *
+	 * REMOTE: the target machine's anchor. Not the caller's id (that core answers
+	 * `no terminal "t1t"`) and not a qualified spelling (the sending core answers
+	 * `unknown machine`), so the only address that works is one that already
+	 * exists over there — see {@link ensureAnchor}.
+	 *
+	 * No caller at all (a headless process: `hc exec`, cron, a bare `pi`) is the
+	 * one case where nothing can be named. That is NOT silently dropped: the reason
+	 * travels to the record and to both renderers as `parent=absent(<reason>)`.
+	 */
+	private async resolveLaunchParent(
+		client: HcClient,
+		host: string | undefined,
+		remoteCwd: string,
+	): Promise<{ parent?: string; absent?: string }> {
+		const caller = this.caller;
+		if (host === undefined) {
+			return caller !== undefined
+				? { parent: caller }
+				: { absent: `no caller terminal (${HC_TERMINAL_ID_ENV} is unset: this process runs outside an hc terminal)` };
+		}
+		return this.ensureAnchor(client, host, remoteCwd);
+	}
+
+	/**
+	 * The anchor terminal on `host`: reuse it when it is live, otherwise create it.
+	 *
+	 * Why a terminal at all: a cross-machine child's parent has to be an address in
+	 * the TARGET core's namespace, and this process owns no terminal there. The
+	 * anchor is one per machine (name {@link ANCHOR_TERMINAL_NAME}, label
+	 * `legion.anchor=<host>`), created the way `hc run` creates a child — no
+	 * explicit parent, but the caller forwarded — so herdr itself qualifies it into
+	 * `<core-id>/<terminal-id>` and the anchor inherits `where` from the terminal
+	 * that asked for it. That is the "default-parent path" in #409's acceptance:
+	 * the chain root → anchor → children is connected end to end, and every child
+	 * below the anchor is parented to a terminal that EXISTS on that machine.
+	 *
+	 * Failure is not fatal: a machine whose core refuses a shell (headless, a
+	 * terminal-less core, a name held by somebody else) still gets its child, with
+	 * `parent=absent(<why>)` on the record — the same posture as the local
+	 * no-caller case.
+	 */
+	private async ensureAnchor(
+		client: HcClient,
+		host: string,
+		remoteCwd: string,
+	): Promise<{ parent?: string; absent?: string }> {
+		const cached = this.anchors.get(host);
+		if (cached !== undefined) return { parent: cached };
+		const address = terminalAddress({ terminalName: ANCHOR_TERMINAL_NAME, host });
+		// 1. An anchor this process (or an earlier one) already made. `terminal.get`
+		//    answers by address, so the machine prefix is required: the bare name is
+		//    unique per core, not across machines (contract D7).
+		const existing = await client
+			.request<HcTerminalFacts>("terminal.get", { terminal: address })
+			.catch(() => undefined);
+		if (existing !== undefined && existing.state !== "finished") {
+			this.anchors.set(host, ANCHOR_TERMINAL_NAME);
+			return { parent: ANCHOR_TERMINAL_NAME };
+		}
+		// 2. A FINISHED anchor still holds the name. `runTerminal` removes the holder on
+		//    its own retry, but the anchor's request is not the child's request, so the
+		//    cleanup is explicit here.
+		if (existing !== undefined) {
+			await client.request("terminal.rm", { terminal: address }).catch(() => {
+				/* the create below reports the real failure */
+			});
+		}
+		// 3. Create it. `argv: []` is `hc`'s own shell for that machine, `keep: true`
+		//    keeps it usable after a lost program, and the caller is forwarded (no
+		//    explicit parent: there is no terminal over there to name yet).
+		try {
+			const run = await client.request<HcTerminalFacts>("terminal.run", {
+				on: host,
+				name: ANCHOR_TERMINAL_NAME,
+				argv: [],
+				...(remoteCwd.length > 0 ? { cwd: remoteCwd } : {}),
+				keep: true,
+				labels: { [LEGION_ANCHOR_LABEL]: host },
+				...(this.caller !== undefined ? { caller: this.caller } : {}),
+			});
+			// The core may shorten a name it was asked for; the address it returns is the
+			// only spelling guaranteed to resolve later, and the TARGET-LOCAL form is the
+			// part after the machine prefix (#409's accepted `--parent t5j` shape).
+			const local = anchorLocalAddress(run, host);
+			if (local === undefined) {
+				return { absent: `no usable anchor address on ${host} (terminal.run answered no address)` };
+			}
+			this.anchors.set(host, local);
+			return { parent: local };
+		} catch (error) {
+			// A concurrent launch (another legion process, or a child of this one) may
+			// have won the name. Its anchor is as good as ours when it says so, so the
+			// refusal is retried as a read before it becomes a verdict.
+			if (isNameTaken(error)) {
+				const holder = await client
+					.request<HcTerminalFacts>("terminal.get", { terminal: address })
+					.catch(() => undefined);
+				if (holder?.state !== "finished" && holder?.labels?.[LEGION_ANCHOR_LABEL] === host) {
+					this.anchors.set(host, ANCHOR_TERMINAL_NAME);
+					return { parent: ANCHOR_TERMINAL_NAME };
+				}
+			}
+			return { absent: `no anchor on ${host} (${describeFailure(error)})` };
+		}
 	}
 
 	/** `HC_BIN` is honoured by the client; `PI_SUBAGENT_CLI`/host argv decide pi. */

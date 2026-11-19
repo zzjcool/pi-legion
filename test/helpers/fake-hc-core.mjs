@@ -197,6 +197,29 @@ function terminalRun(id, params) {
 		}
 	}
 
+	// #409: a `parent` must RESOLVE in the namespace that receives the request. The
+	// real core answers `no terminal "<value>"` for a bare name that lives on the
+	// OTHER side, and `unknown machine "<prefix>"` for a qualified spelling — the
+	// SENDING core resolves the prefix, and a machine name is not a registered
+	// machine there. Both are the shapes #409 fixed, so the oracle refuses them
+	// here: a parent that only *looks* plausible must not pass a unit test.
+	const parent = typeof params.parent === "string" && params.parent.trim().length > 0 ? params.parent.trim() : undefined;
+	if (parent !== undefined) {
+		const slash = parent.indexOf("/");
+		if (slash > 0) {
+			fail(id, "machine_unknown", `unknown machine "${parent.slice(0, slash)}"`, { machine: parent.slice(0, slash) });
+			return;
+		}
+		const resolved = [...terminals.values()].find((terminal) =>
+			terminal.host === on &&
+			(terminal.name === parent || terminal.address === parent ||
+				(on !== undefined && terminal.address.slice(on.length + 1) === parent)));
+		if (resolved === undefined) {
+			fail(id, "not_found", `no terminal "${parent}"`, { parent });
+			return;
+		}
+	}
+
 	// Names are unique per core; a remote terminal lives in the remote namespace.
 	for (const terminal of terminals.values()) {
 		if (terminal.state !== "finished" && terminal.name === name && terminal.host === on) {
@@ -241,6 +264,10 @@ function terminalRun(id, params) {
 		cwd,
 		env,
 		labels,
+		// #409: the address the request named as the parent (resolved above), recorded so
+		// a test can read the ancestry off the created terminal rather than only off
+		// the request that made it.
+		parent: parent ?? null,
 		created_ms: Date.now(),
 	};
 	terminals.set(address, terminal);

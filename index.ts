@@ -2476,6 +2476,10 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					sessionFile: child.sessionFile,
 					...(remote.host ? { host: remote.host } : {}),
 					...(remote.remoteTerminal ? { remoteTerminal: remote.remoteTerminal } : {}),
+					// #409: the ancestry facts travel with the machine/terminal pair — the
+					// slash command must print the same `parent=` line as `subagent status`.
+					...(remote.parentTerminal ? { parentTerminal: remote.parentTerminal } : {}),
+					...(remote.parentAbsent ? { parentAbsent: remote.parentAbsent } : {}),
 					...(child.execution ? { execution: child.execution } : {}),
 					...(child.acceptance
 						? { acceptance: { status: child.acceptance.status, level: child.acceptance.level } }
@@ -5285,7 +5289,16 @@ async function launchStep(
 		// B5 (`warning`) and xm-dispatch D2 (`warnings`, the cross-machine extension
 		// skips) share ONE renderer: a skipped provider extension must be as visible as
 		// a custom model id, and the queued path renders through the same function.
-		session.results.push(...launchNoticeLines(handle.name, handle));
+		// #409: the same renderer carries the launch's parent — the target-local address
+		// a cross-machine child hangs from, or `parent=absent(<reason>)` when none could
+		// be named. Read off the persisted record, which is where the backend's facts
+		// land (`Handle.child`).
+		session.results.push(...launchNoticeLines(handle.name, {
+			...handle,
+			host: handle.child.host,
+			parentTerminal: handle.child.parentTerminal,
+			parentAbsent: handle.child.parentAbsent,
+		}));
 		session.onUpdate?.({
 			content: [
 				{
@@ -6687,6 +6700,9 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				// instead of leaving them to `recover`'s first line.
 				...(child.host ? { host: child.host } : {}),
 				...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
+				// #409: and whose terminal it hangs from — or why nobody can say.
+				...(child.parentTerminal ? { parentTerminal: child.parentTerminal } : {}),
+				...(child.parentAbsent ? { parentAbsent: child.parentAbsent } : {}),
 				alive,
 				...(owner ? { owner } : {}),
 				...(pid ? { pid } : {}),

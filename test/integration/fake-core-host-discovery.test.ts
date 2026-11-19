@@ -562,8 +562,10 @@ test("xm-dispatch D2: an inherited extension that machine cannot load is SKIPPED
 	const handle = await h.supervisor.spawnChild(
 		spawnInput(h, target, { agent: { ...agent(), extensions: missing } }),
 	);
-	// The launch HAPPENED: no refusal, one terminal, and neither `-e` pair survived.
-	const runs = h.wireFor("terminal.run");
+	// The launch HAPPENED: no refusal, one child terminal, and neither `-e` pair
+	// survived. (#409: a cross-machine launch also creates the machine's anchor, so
+	// the child's own request is the one identified by name.)
+	const runs = h.wireFor("terminal.run").filter((params) => params.name !== "lgl-anchor");
 	assert.equal(runs.length, 1, "a skipped extension must not block the launch");
 	const argv = runs[0]?.argv as string[];
 	assert.ok(!argv.includes(missing[0] as string), "the unmappable pair goes, it is not handed to pi");

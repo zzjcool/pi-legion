@@ -22,6 +22,7 @@ import { wasFailedBySupervisor, wasSessionInterrupted } from "../legion/interrup
 import { isCrossMachineHost, remoteSessionPathFor, shutdownFate } from "../legion/orphan.ts";
 import { obsoleteStaleStallNotices } from "../legion/mail-release.ts";
 import { crossMachineHost, isUnstartedShell, shellReason, transcriptBytesOf } from "./launch-evidence.ts";
+import { parentNoticeLines } from "./parent-anchor.ts";
 import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
@@ -494,18 +495,43 @@ function executionIsTerminal(status: string | undefined): boolean {
  * renders no `▶` line at all, and a warning that only exists on the immediate path
  * is exactly the silent degradation D2 forbids. `warning` (model resolution) and
  * `warnings` (cross-machine extension skips) are different lists and both render.
+ *
+ * #409 adds the launch's PARENT to the same channel: a cross-machine child says
+ * which target-local address it hangs from (the proof the ancestry is connected
+ * on the other machine), and a launch that could not name one prints
+ * `parent=absent(<reason>)` instead of omitting the fact (`parent-anchor.ts`
+ * owns both sentences). Never fatal: a missing parent does not refuse a child.
  */
 export function launchNoticeLines(
 	name: string,
-	handle: { warning?: string; warnings?: string[] },
+	handle: {
+		warning?: string;
+		warnings?: string[];
+		parentTerminal?: string;
+		parentAbsent?: string;
+		host?: string;
+	},
 ): string[] {
 	const notices = [handle.warning, ...(handle.warnings ?? [])]
 		.filter((line): line is string => typeof line === "string" && line.length > 0);
-	return notices.map((line) => `  ⚠ ${name}: ${line}`);
+	return [
+		...notices.map((line) => `  ⚠ ${name}: ${line}`),
+		...parentNoticeLines(name, handle),
+	];
 }
 
 /** The warning lines of this launch's notice, or the bare notice when there are none. */
-export function noticeWithWarnings(line: string, name: string, handle: { warning?: string; warnings?: string[] }): string {
+export function noticeWithWarnings(
+	line: string,
+	name: string,
+	handle: {
+		warning?: string;
+		warnings?: string[];
+		parentTerminal?: string;
+		parentAbsent?: string;
+		host?: string;
+	},
+): string {
 	const warnings = launchNoticeLines(name, handle);
 	return warnings.length > 0 ? `${line}\n${warnings.join("\n")}` : line;
 }
@@ -1159,7 +1185,13 @@ export class Orchestrator {
 		const runId = legion?.runId;
 		const host = crossMachineHost(child.host);
 		if (!legion?.runStore || !runId || !child.nodeId) return;
-		if (host === undefined && child.remoteDir === undefined && child.remoteTerminal === undefined) return;
+		if (
+			host === undefined &&
+			child.remoteDir === undefined &&
+			child.remoteTerminal === undefined &&
+			child.parentTerminal === undefined &&
+			child.parentAbsent === undefined
+		) return;
 		try {
 			const recorded = legion.runStore.findChild(runId, child.name);
 			if (!recorded) return;
@@ -1168,6 +1200,12 @@ export class Orchestrator {
 				if (host !== undefined) current.host = host;
 				if (child.remoteDir !== undefined) current.remoteDir = child.remoteDir;
 				if (child.remoteTerminal !== undefined) current.remoteTerminal = child.remoteTerminal;
+				// #409: the ancestry chain lands with the other launch facts, for the same
+				// reason: a later control call may never come, and a record without it can
+				// only show a terminal whose parent nobody can name.
+				if (child.parentRunId !== undefined) current.parentRunId = child.parentRunId;
+				if (child.parentTerminal !== undefined) current.parentTerminal = child.parentTerminal;
+				if (child.parentAbsent !== undefined) current.parentAbsent = child.parentAbsent;
 			});
 		} catch (error) {
 			process.stderr.write(
@@ -2033,6 +2071,14 @@ export class Orchestrator {
 				// `remote-child-fate-v1` §3: same reason, one hop further — the address the
 				// core really holds, so a later process asks about that very terminal.
 				if (result.remoteTerminal) previous.remoteTerminal = result.remoteTerminal;
+				// #409: a relaunch re-resolves the parent (the anchor may have been
+				// recreated, and a headless relaunch may have none), so the pair is
+				// rewritten together — never one half kept beside the other's absence.
+				previous.parentRunId = path.basename(this.runDir);
+				if (result.parentTerminal) previous.parentTerminal = result.parentTerminal;
+				if (result.parentAbsent) previous.parentAbsent = result.parentAbsent;
+				if (result.parentTerminal && !result.parentAbsent) delete previous.parentAbsent;
+				if (result.parentAbsent && !result.parentTerminal) delete previous.parentTerminal;
 				this.children.set(name, previous);
 			}
 			const child = previous ?? this.recordChild({
@@ -2067,6 +2113,12 @@ export class Orchestrator {
 				...(appliedWorktreeHost ? { worktreeHost: appliedWorktreeHost } : {}),
 				...(result.remoteDir ? { remoteDir: result.remoteDir } : {}),
 				...(result.remoteTerminal ? { remoteTerminal: result.remoteTerminal } : {}),
+				// #409: the ancestry chain (child terminal → parent terminal → run). The run
+				// id is this run's own: the parent terminal is the one that dispatched, which
+				// is this record's owner.
+				parentRunId: path.basename(this.runDir),
+				...(result.parentTerminal ? { parentTerminal: result.parentTerminal } : {}),
+				...(result.parentAbsent ? { parentAbsent: result.parentAbsent } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
 			// #423 req 3: land the machine facts on the run.json record NOW, not when
@@ -3069,6 +3121,12 @@ export class Orchestrator {
 		remoteDir?: string;
 		/** The address the core really holds for this child's terminal. */
 		remoteTerminal?: string;
+		/** #409: the run that dispatched this child (this run's own id). */
+		parentRunId?: string;
+		/** #409: the address this launch used as the terminal's parent, target-local. */
+		parentTerminal?: string;
+		/** #409: why no parent address could be named. */
+		parentAbsent?: string;
 	}): ChildRecord {
 		const child: ChildRecord = {
 			name: input.name,
@@ -3093,6 +3151,9 @@ export class Orchestrator {
 			...(input.host ? { host: input.host } : {}),
 			...(input.remoteDir ? { remoteDir: input.remoteDir } : {}),
 			...(input.remoteTerminal ? { remoteTerminal: input.remoteTerminal } : {}),
+			...(input.parentRunId ? { parentRunId: input.parentRunId } : {}),
+			...(input.parentTerminal ? { parentTerminal: input.parentTerminal } : {}),
+			...(input.parentAbsent ? { parentAbsent: input.parentAbsent } : {}),
 		};
 		this.children.set(input.name, child);
 		this.spawned += 1;

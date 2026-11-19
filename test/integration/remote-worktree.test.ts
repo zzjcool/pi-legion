@@ -288,7 +288,9 @@ test("S2: a remote worktree is created on that machine and the child starts insi
 
 	// 4. `terminal.run` started in the TREE (not the checkout), and carried no
 	//    `caller`: a bare parent terminal id does not exist on that machine.
-	const [run] = h.wireFor("terminal.run");
+	// #409: a cross-machine launch creates the machine's anchor first, so the child's
+	// own request is the one this case is about.
+	const [run] = h.wireFor("terminal.run").filter((params) => params.name !== "lgl-anchor");
 	assert.ok(run, "terminal.run must appear in the wire log");
 	assert.equal(run.on, HOST);
 	assert.equal(run.cwd, treePath);
