@@ -9,7 +9,7 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
-## [Unreleased] — 6.2.3（patch）
+## [6.2.3] — 2026-11-19
 
 6.2.2 真机复跑暴露的 D / E 两个缺陷，外加自测台 `make xm` 钉住的两条真 bug（d0 / d1）。
 报告：`docs/reports/recover-and-false-failed.md`。
@@ -2567,7 +2567,8 @@ branch — pin `pi-legion@0.16.x` if you still need that model. See
 Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.2.2...HEAD
+[6.2.3]: https://github.com/zzjcool/pi-legion/compare/v6.2.2...v6.2.3
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.2.3...HEAD
 [6.2.2]: https://github.com/zzjcool/pi-legion/compare/v6.2.1...v6.2.2
 [6.2.1]: https://github.com/zzjcool/pi-legion/compare/v6.2.0...v6.2.1
 [6.0.1]: https://github.com/zzjcool/pi-legion/compare/v6.0.0...v6.0.1
