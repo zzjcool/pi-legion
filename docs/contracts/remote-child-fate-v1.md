@@ -35,8 +35,12 @@
   (`mapRemoteArgv` / `HostPackageIndex`). This contract does not add a fallback
   beside it: the only new pre-launch fact is that an explicitly configured
   `hosts.<host>.piExtensions` path must exist on that machine (§3).
-- **No new hc method.** Only `terminal.get`, `terminal.run`, `machine.exec`,
-  `file.read`, `file.write` are used.
+- **No new hc method** (#423 amended: one read-side addition). `terminal.get`,
+  `terminal.run`, `machine.exec`, `file.read`, `file.write` are used, plus
+  `terminal.read` — added because `terminal.get`'s `screen` field turned out not
+  to be the screen at all (see §2: on hc 0.1.21 it answers the mode word
+  `"exact"`). `terminal.read` is a pure read (`{terminal, lines?}` →
+  `{text, how, complete}`); every write-side method stays out of the whitelist.
 - **No hard failure for "still alive but has not written yet"** — a slow machine
   is not a bug. Only *proven* death fails a launch (§4).
 
@@ -82,10 +86,20 @@ export async function probeRemoteChild(opts: {
 Behaviour:
 
 - `dir = path.posix.dirname(sessionPath)`.
-- **Two round trips, both already in the whitelist**: `terminal.get` (state,
-  `exit_code`, `screen`) and ONE `machine.exec` that prints prefixed evidence
-  lines (`dir=1|0`, `session=1|0`, `entry=<ls line>`, ≤12). `terminal.get`
-  throwing `not_found` ⇒ `terminalState = "missing"`, never an error.
+- **Three round trips** (#423: was two): `terminal.get` (state, `exit_code`,
+  `screen`), `terminal.read` (the terminal's TEXT — see below) and ONE
+  `machine.exec` that prints prefixed evidence lines (`dir=1|0`, `session=1|0`,
+  `entry=<ls line>`, ≤12). `terminal.get` throwing `not_found` ⇒
+  `terminalState = "missing"`, never an error; `terminal.read` is asked only when
+  the core still holds the terminal, and its failure is never a failure of the
+  probe.
+- **`screenTail` comes from `terminal.read`, not from `terminal.get.screen`.**
+  Measured on hc 0.1.21 (@423): `terminal.get` answers `"screen": "exact"` — the
+  doc comment said the reply carried the child's screen, and every receipt built
+  from it printed `| exact` as the child's last words. `terminal.read` returns
+  `{text, how, complete}`; the probe takes its last
+  `REMOTE_FATE_SCREEN_LINES` non-empty lines (ANSI stripped), and falls back to
+  `terminal.get.screen` only for a core that does not know the method.
 - Classification, in this order (first match wins):
   1. `sessionExists` → `started`.
   2. `recordedDir` set and ≠ `dir` → `path`.
@@ -135,20 +149,61 @@ down is simply not there". Neither one drops anything from argv.
 core actually holds, so a later process can ask about it without recomputing a
 name that may have been shortened).
 
-## 4. After `terminal.run`: proof of death, not a guess
+## 4. After `terminal.run`: proof of START, not a guess (#423 revision)
 
 In `TerminalSupervisor.spawnChild`, remote launches only, once `run.address` is
 known:
 
-- `REMOTE_STARTUP_CONFIRM_MS = 8_000`, poll interval 500 ms, plus
+- `REMOTE_STARTUP_CONFIRM_MS = 20_000`, poll interval 500 ms, plus
   `TerminalSupervisorOptions.remoteStartupConfirmMs` (`0` = gate disabled; the
-  fake-core harnesses pass `0` so their launches stay instant).
+  fake-core harnesses pass `0` so their launches stay instant). **#423 raised it
+  from 8 s**: the deadline is no longer a warning, it is the operator's patience
+  as well as the machine's start-up budget, and the issue's ceiling is 30 s.
 - Each poll: `file.read {limit: 0}` on `<remoteDir>/session.jsonl` ⇒ exists ⇒
   confirmed, done. `terminal.get` ⇒ `state === "finished"` or a numeric
-  `exit_code` ⇒ **proven death**: throw `START_FAILED` (§4.1). Deadline without
-  either ⇒ **warn on stderr and launch anyway**, recording
-  `startupUnconfirmed: true` on the record (`ChildHandle.startupUnconfirmed`).
+  `exit_code` ⇒ **proven death**: throw `START_FAILED` (§4.1).
+- **Deadline with neither is now §4.2, not a warning.** The old rule ("warn on
+  stderr, launch anyway, record `startupUnconfirmed`") is withdrawn: it produced a
+  child the parent renders as `working`, that the stall detector counts as busy,
+  and that retires as `execution: success` without ever having run — measured four
+  times in one day (@423). `startupUnconfirmed` no longer exists on
+  `ChildHandle`/`ChildRecord`; a launch either proved itself or failed.
 - A remote launch whose gate is disabled behaves exactly as today.
+
+### 4.2 A launch that never proved itself is refused (#423, frozen)
+
+`START_FAILED`, details `{ host, terminal, cwd, fate: "not-started" }`. The
+receipt is built from facts the launch measured — never from a guess about the
+child's intent:
+
+```
+host '<host>': the launch never proved the child started — no session file appeared at <sessionPath> within <N>ms
+  host: <host>
+  cwd: <cwd> (the directory this launch asked for, on <host>)
+  terminal: <host/name> (created, then killed and removed: the name is free again)
+  mirror dir: <there|gone|unknown> (<why>)
+  transcript: <sessionPath> (<does not exist|exists|could not be checked>)
+  hc error: <kind: message of the last hc failure | "(the core reported no error: every call answered)">
+  process: <pid N (a program is running there, but it has written no transcript)|the core reports no pid for it: nothing may have been started in that terminal>
+  screen (last 6 lines of that terminal):
+    | <line>
+  next: <one actionable sentence>
+  Command (run on '<host>' to reproduce):
+<remoteLaunchReproLine(argv, cwd)>
+```
+
+Three properties are part of the contract, because each one was the difference
+between a 30-minute wait and a one-minute diagnosis:
+
+1. **`screen` is the terminal's own text** (`terminal.read`, §2) — this is where
+   `Trust project folder?` appears (#424's root cause).
+2. **The terminal this launch created is killed and removed** before the throw,
+   and the receipt says so. A live holder keeps its NAME in that core, so leaving
+   it behind turns the next dispatch of the same handle into `NAME_TAKEN`; a
+   removal that fails is reported as `KEPT: <error>` with what it means.
+3. **Nothing is left behind that could render as `working`**: no registry entry,
+   no `launching` run.json record (the launch rollback removes the created one and
+   retires a pre-existing one as `execution: unknown`).
 
 ### 4.1 The launch error (frozen)
 

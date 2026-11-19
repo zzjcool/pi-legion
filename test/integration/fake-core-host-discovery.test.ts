@@ -200,7 +200,14 @@ else if (process.argv.includes("--list-models")) {
 		request: async <T = unknown>(method: HcMethod, params: Record<string, unknown> = {}): Promise<T> =>
 			(await real.request<T>(method, params)) as T,
 	};
-	const supervisor = new TerminalSupervisor({ clientFactory: () => client, env, runId: "run-discover-1", pollIntervalMs: 5 });
+	// #423: these cases are about ADMISSION and DISCOVERY (which node/pi/legion a
+	// `{}` entry resolves to). The fake core answers `terminal.run` but its fake
+	// `pi` never writes a transcript, so the start-up gate could only ever wait out
+	// its deadline on a launch that is not under test — the same reason the local
+	// unit harness passes 0 (`test/unit/terminal-supervisor.test.ts`). The gate
+	// itself is covered by `remote-child-fate.test.ts` (integration T2/T3b) and
+	// `test/unit/remote-launch-refusal.test.ts`.
+	const supervisor = new TerminalSupervisor({ clientFactory: () => client, env, runId: "run-discover-1", pollIntervalMs: 5, remoteStartupConfirmMs: 0 });
 	const wire = (): WireRequest[] => {
 		if (!existsSync(wirePath)) return [];
 		return readFileSync(wirePath, "utf8")

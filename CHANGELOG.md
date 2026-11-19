@@ -11,6 +11,15 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased] — 6.2.5（patch）
 
+**`#423`：跨机 launch 不再静默变成本地空壳。** launch 现在**必须拿到启动证据**才成功：拿不到远端 terminal
+地址、或窗口内看不到远端 `session.jsonl`（`REMOTE_STARTUP_CONFIRM_MS` 8s → 20s），就是 `START_FAILED`，
+回执带机器名 / cwd / 终端地址 / `hc` 错误原文 / **该终端最后 6 行原文**；失败的 launch 不留下任何 `working`
+或 `launching` 记录，并会 kill + rm 自己建的空终端（同名重派不再撞 `NAME_TAKEN`）。
+同时：`run.json` 落 `host`/`remoteDir`/`remoteTerminal`；`subagent status` 对「无 terminal 且无 session」
+打 `liveness=unknown (…)` 而不是 `working`；无执行证据的退役不再是 `execution: success`；空壳不进 stall 候选集。
+真机还发现 `terminal.get` 的 `screen` 字段回的是模式词（hc 0.1.21 实测 `"exact"`），屏幕文本改为读
+`terminal.read`（纯读方法，新加入 `HC_METHODS`）。报告：`docs/reports/launch-verification.md`。
+
 **`#413`：L2 stall notice 的重复投递。** 去重键从「上一封的发出时刻」改成**越过的阈值线**
 （`(child, kind, windowBase, thresholdMs, tier)`，`tier = floor(elapsed / thresholdMs)`）：
 同一条阈值线无论检查多少次都只 1 封，越过下一条线才再发一封；`extend` 把基准前移到

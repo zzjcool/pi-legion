@@ -21,6 +21,7 @@ import type { LegionEventBus, LegionProcessEventType } from "../extension/event-
 import { wasFailedBySupervisor, wasSessionInterrupted } from "../legion/interrupt.ts";
 import { isCrossMachineHost, remoteSessionPathFor, shutdownFate } from "../legion/orphan.ts";
 import { obsoleteStaleStallNotices } from "../legion/mail-release.ts";
+import { crossMachineHost, isUnstartedShell, shellReason, transcriptBytesOf } from "./launch-evidence.ts";
 import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
 import { getChildByName, getNode, insertNode, nodeIdForChild, sanitizeNodeSlug, type LegionNode, updateNode } from "../legion/nodes.ts";
@@ -879,6 +880,26 @@ export class Orchestrator {
 	}
 
 	/** The failed read-back for this child, when its words never arrived here. */
+	/**
+	 * #423: the launch facts of one child, read the same way everywhere.
+	 *
+	 * `transcriptBytes` is measured on the file that actually holds the child's
+	 * words (`sessionFileOf`, i.e. the mirror for a cross-machine child) — a
+	 * placeholder with no bytes and a missing file answer the same question: the
+	 * child wrote nothing.
+	 */
+	private launchEvidenceFor(child: ChildRecord, transcriptFile = this.sessionFileOf(child)): {
+		host?: string;
+		remoteTerminal?: string;
+		transcriptBytes: number;
+	} {
+		return {
+			...(child.host !== undefined ? { host: child.host } : {}),
+			...(child.remoteTerminal !== undefined ? { remoteTerminal: child.remoteTerminal } : {}),
+			transcriptBytes: transcriptBytesOf(transcriptFile),
+		};
+	}
+
 	private transcriptUnavailable(child: ChildRecord): RemoteReadbackFailure | undefined {
 		const remote = this.remoteSessions.get(child.name);
 		return remote !== undefined && !remote.ok ? remote : undefined;
@@ -1116,6 +1137,43 @@ export class Orchestrator {
 			...(input.host ? { host: input.host } : {}),
 		});
 		return true;
+	}
+
+	/**
+	 * #423 req 3: write `host` / `remoteDir` / `remoteTerminal` onto the run.json
+	 * child the moment the backend reports them.
+	 *
+	 * Before this, the three fields existed on the in-memory record and on the
+	 * ledger row (`updateNode` in {@link recordLegionLaunch}) but reached `run.json`
+	 * only if a later control call happened to persist the whole object — so the
+	 * record a fresh process reads first (and the one the issue was debugged from)
+	 * had `cwd=<this host>` and NO machine at all. A reader cannot then answer
+	 * "where does this child run" or "which terminal do I look at", which is the
+	 * whole point of persisting them.
+	 *
+	 * Best effort by construction: the launch already succeeded, and a store write
+	 * that fails must not turn a running child into a failed launch.
+	 */
+	private async persistChildRemoteFacts(child: ChildRecord): Promise<void> {
+		const legion = this.legion;
+		const runId = legion?.runId;
+		const host = crossMachineHost(child.host);
+		if (!legion?.runStore || !runId || !child.nodeId) return;
+		if (host === undefined && child.remoteDir === undefined && child.remoteTerminal === undefined) return;
+		try {
+			const recorded = legion.runStore.findChild(runId, child.name);
+			if (!recorded) return;
+			if (recorded.nodeId !== child.nodeId) return;
+			await legion.runStore.updateChild(runId, child.name, (current) => {
+				if (host !== undefined) current.host = host;
+				if (child.remoteDir !== undefined) current.remoteDir = child.remoteDir;
+				if (child.remoteTerminal !== undefined) current.remoteTerminal = child.remoteTerminal;
+			});
+		} catch (error) {
+			process.stderr.write(
+				`[pi-legion] could not record the machine facts of '${child.name}' in ${runId}/run.json (${messageOf(error)}); the child itself is unaffected.\n`,
+			);
+		}
 	}
 
 	private recordLegionLaunch(child: ChildRecord, agent: AgentConfig, task: string, teamOverride: string | undefined, resumed: boolean): void {
@@ -2011,6 +2069,12 @@ export class Orchestrator {
 				...(result.remoteTerminal ? { remoteTerminal: result.remoteTerminal } : {}),
 			});
 			if (previous) this.onChildUpdate(child);
+			// #423 req 3: land the machine facts on the run.json record NOW, not when
+			// some later control call happens to persist the object. A launch whose
+			// record says `cwd=<this host>` without `host`/`remoteTerminal` is exactly
+			// the shell the issue measured: nothing downstream can tell a cross-machine
+			// child from a local one, and there is no terminal address to ask about.
+			await this.persistChildRemoteFacts(child);
 			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
 			this.emitProcess("node_launched", nodeId ?? name, { name, agent: input.agent.name, pid: result.pid });
 			return {
@@ -2066,6 +2130,26 @@ export class Orchestrator {
 			if (reserved && nodeId) cleanup("ledger reservation rollback failed", () => this.rollbackReservation(nodeId, reservedNode));
 			if (parentReservationCreated && this.legion?.runStore) {
 				try { await this.legion.runStore.removeChild(this.legion.runId!, name, nodeId); } catch { /* rollback is best effort */ }
+			} else if (this.legion?.runStore && this.legion.runId) {
+				// #423 req 1: a launch that THREW must not leave a `launching` record
+				// behind. Before this branch the reservation made by
+				// `persistParentReservation` survived a failed spawn untouched, so the
+				// record said `launching` forever — the "empty shell" of the issue, with
+				// `subagent status` reading it as work in progress. The verdict is
+				// `unknown` on purpose: nothing was measured, so nothing is graded.
+				try {
+					await this.legion.runStore.updateChild(this.legion.runId, name, (current) => {
+						if (nodeId !== undefined && current.nodeId !== nodeId) return;
+						current.state = "retired";
+						current.retiredAt = new Date(this.now()).toISOString();
+						current.execution = {
+							status: "unknown",
+							reason: `launch failed: ${messageOf(error).slice(0, 300)}`,
+							turns: 0,
+							toolErrors: 0,
+						};
+					});
+				} catch { /* rollback is best effort */ }
 			}
 			if (createdRunId && this.legion?.runStore) {
 				try { fs.rmSync(this.legion.runStore.runDir(createdRunId), { recursive: true, force: true }); } catch { /* rollback is best effort */ }
@@ -4029,9 +4113,33 @@ export class Orchestrator {
 			this.onChildUpdate(child);
 			return child;
 		}
-		const sessionExists = fs.existsSync(child.sessionFile);
-		const parsed = sessionExists ? parseSessionFile(this.sessionFileOf(child)) : emptyParsedSession();
+		// Which file says what the child DID: for a cross-machine child that is the
+		// local mirror (when one was written), never `child.sessionFile` — that path
+		// is the empty placeholder THIS machine pre-created and the child never
+		// writes (`sessionFileOf`'s doc). Asking the placeholder for existence made
+		// `deriveOutcome` run on a file with no bytes whenever the mirror was the
+		// real answer.
+		const transcriptFile = this.sessionFileOf(child);
+		const sessionExists = fs.existsSync(transcriptFile);
+		const parsed = sessionExists ? parseSessionFile(transcriptFile) : emptyParsedSession();
 		if (!child.execution && sessionExists) child.execution = deriveOutcome(parsed);
+		// #423 req 4: `success` is a claim that WORK was delivered, and a child whose
+		// launch never proved it started cannot make it — there is no terminal and no
+		// transcript, so any `success` here was parsed from a file that is not this
+		// child's work (a leftover mirror, a previous round under the same name). The
+		// issue measured exactly that: a shell that never ran retired as
+		// `execution: success`, which a parent (or an automated flow) reads as DELIVERED.
+		if (child.execution?.status === "success") {
+			const evidence = this.launchEvidenceFor(child, transcriptFile);
+			if (isUnstartedShell(evidence)) {
+				child.execution = {
+					status: "unknown",
+					reason: `never started: ${shellReason(evidence) ?? "no execution evidence"}`,
+					turns: 0,
+					toolErrors: 0,
+				};
+			}
+		}
 		// Stamp the cause before killing so an in-flight collect cannot
 		// overwrite it with "no assistant message" after the process dies.
 		if (opts?.cause === "session-shutdown" && this.supervisor.isAlive(name)) {

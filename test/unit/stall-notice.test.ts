@@ -610,7 +610,19 @@ interface Fixture {
 }
 
 function fixture(options: {
-	children?: Array<{ name: string; role: string; createdAt?: number; phase?: string | null; status?: "running" | "settled" }>;
+	children?: Array<{
+		name: string;
+		role: string;
+		createdAt?: number;
+		phase?: string | null;
+		status?: "running" | "settled";
+		/** #423: the machine the child runs on (absent = this host). */
+		host?: string;
+		/** #423: `host/name` of the terminal the core holds, when it holds one. */
+		remoteTerminal?: string;
+		/** #423: the transcript path this host knows (empty/missing = nothing written). */
+		sessionFile?: string;
+	}>;
 	loopRadiusMs?: number;
 	silenceNoticeMs?: number;
 	mailRatePer5Min?: number;
@@ -629,6 +641,9 @@ function fixture(options: {
 				role: spec.role,
 				status: spec.status ?? "running",
 				...(spec.phase === undefined ? {} : { phase: spec.phase }),
+				...(spec.host === undefined ? {} : { host: spec.host }),
+				...(spec.remoteTerminal === undefined ? {} : { remoteTerminal: spec.remoteTerminal }),
+				...(spec.sessionFile === undefined ? {} : { sessionFile: spec.sessionFile }),
 			},
 			// A child born at THIS tick is below every radius by default, so a test that
 			// cares about L2 must say how old its child is. Keeps L1 tests about L1.
@@ -736,6 +751,65 @@ test("postman: a dead child and a terminal child produce nothing", async () => {
 		assert.deepEqual(inbox(fx.db, "root"), [], "L1 is only judged for a child this process runs");
 	} finally {
 		fx.db.close();
+	}
+});
+
+test("#423 req 5: a SHELL is not a stall candidate — no terminal and no session means nothing was ever running", async () => {
+	// The measured notice: `anotify-456: running for 30m 0s, no tool in flight` for a
+	// child that had never started (no terminal on `host-workspace`, no transcript,
+	// a run.json that never moved after creation). It was ALIVE in the supervisor's
+	// registry — that is exactly why the `isAlive` gate cannot be the whole story.
+	const root = mkdtempSync(path.join(tmpdir(), "stall-shell-"));
+	try {
+		const emptyTrace = path.join(root, "shell.jsonl");
+		writeFileSync(emptyTrace, "");
+		const fx = fixture({
+			children: [
+				// The shell: a cross-machine row with neither of the two facts that
+				// prove a launch happened.
+				{ name: "shell", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", sessionFile: emptyTrace },
+				// The control: the SAME age, the same role, but a terminal the core holds.
+				{ name: "real", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", remoteTerminal: "host-workspace/lgl-rx-real" },
+			],
+			loopRadiusMs: 15 * MINUTE,
+		});
+		try {
+			await fx.postman.tick();
+			fx.stop();
+			const mails = inbox(fx.db, "root");
+			assert.equal(mails.length, 1, `one line, not two:\n${mails.map((mail) => mail.body).join("\n")}`);
+			assert.match(mails[0]!.body, /real: running for /);
+			assert.doesNotMatch(mails[0]!.body, /shell: /, "a child that never started cannot have been quiet for 30 minutes");
+		} finally {
+			fx.db.close();
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("#423 req 5: the SAME shell becomes a candidate once a transcript with bytes exists", async () => {
+	// The gate is evidence, not a name or a host: one byte of transcript is enough
+	// for the detector to judge it again (the shell above is otherwise identical).
+	const root = mkdtempSync(path.join(tmpdir(), "stall-shell-bytes-"));
+	try {
+		const written = path.join(root, "written.jsonl");
+		writeFileSync(written, '{"type":"message","message":{"role":"user","content":"hi"}}\n');
+		const fx = fixture({
+			children: [{ name: "slow", role: "worker", createdAt: TICK_AT - 30 * MINUTE, host: "host-workspace", sessionFile: written }],
+			loopRadiusMs: 15 * MINUTE,
+		});
+		try {
+			await fx.postman.tick();
+			fx.stop();
+			const mails = inbox(fx.db, "root");
+			assert.equal(mails.length, 1);
+			assert.match(mails[0]!.body, /slow: running for /);
+		} finally {
+			fx.db.close();
+		}
+	} finally {
+		rmSync(root, { recursive: true, force: true });
 	}
 });
 

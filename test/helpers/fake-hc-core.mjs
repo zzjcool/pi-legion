@@ -320,7 +320,11 @@ function terminalGet(id, params) {
 		// `1` vs `137` is what tells an operator which failure they are looking at.
 		...(terminal.state === "finished" ? { exit_code: terminal.exit_code ?? 0, finished_ms: Date.now() } : {}),
 		status: { state: terminal.state === "running" ? "idle" : "finished" },
-		screen: terminal.screen ?? "",
+		// #423: measured on hc 0.1.21 — `terminal.get` answers the MODE WORD here, not
+		// the screen. The text is `terminal.read`'s reply (below). A fake that put the
+		// text in this field is how the receipts came to quote `| exact` and nothing
+		// else, so this file now models the core it claims to be.
+		screen: "exact",
 	});
 }
 
@@ -517,7 +521,7 @@ function handle(request) {
 				version: "fake-hc-0",
 				core: { id: "fake", name: "fake", machine_id: "fake" },
 				framed: false,
-				methods: ["hello", "terminal.run", "terminal.get", "terminal.send", "terminal.wait",
+				methods: ["hello", "terminal.run", "terminal.get", "terminal.read", "terminal.send", "terminal.wait",
 					"terminal.interrupt", "terminal.kill", "terminal.rm", "machine.exec",
 					"machine.list", "file.read", "file.write"],
 				features: [],
@@ -531,6 +535,13 @@ function handle(request) {
 			return;
 		case "terminal.get":
 			terminalGet(id, p);
+			return;
+		// #423: the terminal's TEXT (screen + optional history), the only read that
+		// returns it.
+		case "terminal.read":
+			withTerminal(id, p, (terminal) => {
+				reply(id, { text: terminal.screen ?? "", how: "screen", complete: true });
+			});
 			return;
 		case "terminal.send":
 			withTerminal(id, p, (terminal) => {

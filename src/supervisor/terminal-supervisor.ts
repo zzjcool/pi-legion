@@ -30,7 +30,9 @@ import {
 	normalizeHost,
 	classifyRemoteStartupProbe,
 	probeRemoteChild,
+	probeRemoteStartupFailure,
 	remoteFateNextStep,
+	remoteStartupFailureMessage,
 	remoteStartupProbeLine,
 	REMOTE_STARTUP_PROBE_TIMEOUT_S,
 	removeRemoteDir,
@@ -105,17 +107,23 @@ const ILLEGAL_NAME_CHARS = /[^a-z0-9_-]/g;
 export const SETTLE_POLL_INTERVAL_MS = 1_000;
 
 /**
- * How long a REMOTE launch waits for proof that the child survived start-up
- * (`docs/contracts/remote-child-fate-v1.md` §4).
+ * How long a REMOTE launch waits for proof that the child STARTED
+ * (`docs/contracts/remote-child-fate-v1.md` §4, revised by #423).
  *
- * The window exists because a remote `pi` that dies during start-up (a missing
- * `--extension`, a model the machine cannot use) exits 1 and NEVER creates its
- * session file: the parent's only observable afterwards is `not_found`, minutes
- * later, with no exit code and no words. Eight seconds is long enough for a
- * healthy child to open its transcript on a slow machine and short enough that
- * a launch still fails while the operator is watching.
+ * The window exists because a remote `pi` that never starts leaves the parent
+ * with no observable at all: no exit code, no transcript, no error — only a live
+ * terminal. A missing `--extension`, a model the machine cannot use, and an
+ * interactive prompt the child stopped at ("Trust project folder?", #424) all
+ * look exactly like that, and the parent's next observable used to be
+ * `not_found` minutes later with nothing to act on.
+ *
+ * #423 turned the deadline from a warning into a refusal, so the number is now
+ * the operator's patience as well as the machine's start-up budget: long enough
+ * for a cold `node` + pi first turn on a loaded machine, and bounded by the
+ * issue's 30 s ceiling so a launch still fails while somebody is watching. It is
+ * read once per launch, and a receipt always says how long it waited.
  */
-export const REMOTE_STARTUP_CONFIRM_MS = 8_000;
+export const REMOTE_STARTUP_CONFIRM_MS = 20_000;
 
 /** Poll cadence inside that window. */
 export const REMOTE_STARTUP_CONFIRM_POLL_MS = 500;
@@ -220,8 +228,6 @@ interface TerminalChildRecord {
 	remoteDir?: string;
 	/** The address the core really holds for this terminal (`host/name`). */
 	remoteTerminal?: string;
-	/** The start-up gate timed out without proving the child dead (§4). */
-	startupUnconfirmed?: boolean;
 	tempDir?: string;
 	state: "live" | "finished" | "retired";
 	/** Last observed turn counter. */
@@ -972,16 +978,32 @@ export class TerminalSupervisor implements LegionSupervisor {
 		// creates its session file: without this gate the parent's only observable is
 		// `not_found` a collect later. Asked HERE, the same fact fails the launch with
 		// the child's own screen line. Silence is not death, so a deadline only warns.
-		let startupUnconfirmed = false;
 		if (target !== undefined && remoteDir !== undefined && remoteTerminalAddress !== undefined && this.remoteStartupConfirmMs > 0) {
-			startupUnconfirmed = await this.confirmRemoteStartup({
-				client,
-				target,
-				address: remoteTerminalAddress,
-				remoteDir,
-				argv,
-				cwd: typeof params.cwd === "string" ? params.cwd : target.cwd,
-			});
+			// #423: this is now a REFUSAL, not a warning. A launch that cannot prove
+			// the child started has already failed; leaving a `working` record behind
+			// is the failure mode the issue measured (a shell that answered `working`
+			// for 30 minutes and then retired as `execution: success`).
+			try {
+				await this.confirmRemoteStartup({
+					client,
+					target,
+					address: remoteTerminalAddress,
+					remoteDir,
+					argv,
+					cwd: typeof params.cwd === "string" ? params.cwd : target.cwd,
+				});
+			} catch (error) {
+				// The refusal is the launch's verdict, so the evidence it needs (screen,
+				// hc error) has already been captured. What is left is the partially
+				// created state: the mirrored argv dir and the tree this launch made are
+				// unusable by anybody (the child never started), and leaving the tree
+				// behind would make the re-dispatch fail on `git worktree add` — the
+				// other half of req 6.
+				this.removeTempDir(tempDir);
+				await rollbackRemoteWorktree();
+				await rollbackRemoteDir();
+				throw error;
+			}
 		}
 		// D13: the ownership pair, in one value, so the record and the handle cannot
 		// disagree about which machine a path belongs to.
@@ -998,7 +1020,6 @@ export class TerminalSupervisor implements LegionSupervisor {
 			...(host ? { host } : {}),
 			...(remoteDir ? { remoteDir } : {}),
 			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
-			...(startupUnconfirmed ? { startupUnconfirmed: true } : {}),
 			...(tempDir ? { tempDir } : {}),
 			...worktreeFacts,
 			state: "live",
@@ -1021,7 +1042,6 @@ export class TerminalSupervisor implements LegionSupervisor {
 			// cannot find the child's transcript in a later process.
 			...(remoteDir ? { remoteDir } : {}),
 			...(remoteTerminalAddress ? { remoteTerminal: remoteTerminalAddress } : {}),
-			...(startupUnconfirmed ? { startupUnconfirmed: true } : {}),
 			...(launchWarnings.length > 0 ? { warnings: launchWarnings } : {}),
 		};
 	}
@@ -1522,20 +1542,21 @@ export class TerminalSupervisor implements LegionSupervisor {
 		/** The launch argv (task last), quoted back as a reproduce command. */
 		argv: string[];
 		cwd: string;
-	}): Promise<boolean> {
+	}): Promise<void> {
 		const sessionPath = path.posix.join(opts.remoteDir, "session.jsonl");
-		const deadline = Date.now() + this.remoteStartupConfirmMs;
+		const started = Date.now();
+		const deadline = started + this.remoteStartupConfirmMs;
 		let lastError: string | undefined;
-		let lastPid: number | undefined;
 		for (;;) {
 			// `limit: 0` is the cheapest "does this file exist" the core answers: the
 			// reply carries the line count and the text is thrown away.
 			try {
 				await opts.client.request("file.read", { on: opts.target.host, path: sessionPath, limit: 0 });
-				return false;
+				return;
 			} catch (error) {
 				// `not_found` is the answer being watched for; anything else is a machine
-				// problem the gate must not turn into a launch refusal.
+				// problem worth quoting in the receipts (both of them) rather than a
+				// reason of its own.
 				if (!isNotFound(error)) lastError = describeFailure(error);
 			}
 			const alive = await this.startupFacts(opts.client, opts.address).catch((error: unknown) => {
@@ -1545,19 +1566,83 @@ export class TerminalSupervisor implements LegionSupervisor {
 			if (alive?.finished === true) {
 				throw await this.startupDeathError({ ...opts, sessionPath, ...(alive.code !== undefined ? { exitCode: alive.code } : {}) });
 			}
-			if (alive !== undefined) lastPid = alive.pid;
 			const remaining = deadline - Date.now();
 			if (remaining <= 0) break;
 			await this.sleep(Math.min(REMOTE_STARTUP_CONFIRM_POLL_MS, remaining));
 		}
-		// A terminal the core still holds with no pid is the shape "hc accepted the
-		// name and never started the program" — silence for a reason the class alone
-		// cannot tell apart from a slow first turn.
-		const noPid = lastPid === undefined ? " (the core reports no pid for it: nothing may have been started in that terminal)" : "";
-		process.stderr.write(
-			`[pi-legion] host '${opts.target.host}': no transcript at ${sessionPath} after ${this.remoteStartupConfirmMs}ms and the terminal is still alive${noPid}${lastError ? ` (last error: ${lastError})` : ""}; launching anyway — a collect will classify it\n`,
+		// #423 req 1/2/6: the deadline is a REFUSAL with evidence, not a warning.
+		//
+		// Three things happen in this order, and the order matters:
+		//   1. PROBE while the terminal still exists — the screen tail is the only
+		//      place the child's own words survive (`Trust project folder?` was on it),
+		//      and a removed terminal has no screen left to read;
+		//   2. KILL+REMOVE the terminal this launch created. It is a shell nobody will
+		//      ever use, and it holds its NAME in that core: `terminal.run` answers
+		//      `name_taken` for a live holder, so leaving it behind turns the next
+		//      dispatch of the same handle into `NAME_TAKEN` (req 6);
+		//   3. THROW `START_FAILED` with the machine, cwd, terminal, hc's own error and
+		//      the screen. The caller rolls the tree/mirror back, so the name and the
+		//      path are both reusable.
+		const failure = await probeRemoteStartupFailure({
+			client: opts.client,
+			target: opts.target,
+			terminal: opts.address,
+			remoteDir: opts.remoteDir,
+			cwd: opts.cwd,
+			waitedMs: Date.now() - started,
+			...(lastError !== undefined ? { lastError } : {}),
+		});
+		const disposal = await this.discardRemoteTerminal(opts.client, opts.address, opts.target.host);
+		throw new SubagentError(
+			remoteStartupFailureMessage(failure, {
+				disposal: disposal.kind,
+				argv: opts.argv,
+				...(disposal.kind === "kept" && disposal.error !== undefined ? { disposalError: disposal.error } : {}),
+			}),
+			ErrorCodes.START_FAILED,
+			{
+				host: opts.target.host,
+				terminal: opts.address,
+				cwd: opts.cwd,
+				fate: "not-started",
+				...(disposal.kind === "kept" ? { disposalError: disposal.error } : {}),
+			},
 		);
-		return true;
+	}
+
+	/**
+	 * #423 req 6: give the terminal name back after a launch that never started.
+	 *
+	 * `kill` then `rm`, each best-effort, each reported: `hc` answers `name_taken`
+	 * for a LIVE holder, so a terminal left alive here is a name the next dispatch
+	 * of the same handle cannot take. A kill that already removed it is not a
+	 * failure (the core no longer knows the address), and a removal that fails is
+	 * `kept` — the receipt then names the machine and says the name is not free.
+	 */
+	private async discardRemoteTerminal(
+		client: HcClient,
+		address: string,
+		host: string | undefined,
+	): Promise<{ kind: "removed" } | { kind: "kept"; error: string }> {
+		const caller = this.callerFor(host) !== undefined ? { caller: this.callerFor(host) } : {};
+		try {
+			await client.request("terminal.kill", { terminal: address, ...caller });
+		} catch (error) {
+			if (!isNotFound(error)) {
+				return { kind: "kept", error: `terminal.kill: ${describeFailure(error)}` };
+			}
+		}
+		try {
+			await client.request("terminal.rm", { terminal: address, ...caller });
+		} catch (error) {
+			if (!isNotFound(error)) {
+				// Killed but not removed: the core keeps a `finished` terminal, which its
+				// own `terminal.run` retry DOES clear (D7), so this is reported rather
+				// than claimed as a hard conflict.
+				return { kind: "kept", error: `terminal.rm: ${describeFailure(error)}` };
+			}
+		}
+		return { kind: "removed" };
 	}
 
 	/**
