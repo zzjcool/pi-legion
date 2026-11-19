@@ -2,6 +2,7 @@
 
 - 仓库 / 分支：`pi-legion` `fix/orphan-on-natural-exit`，基线 `origin/master` `0813b35`（= 6.2.3）
 - 依据：`docs/reports/release-6.2.3-verification.md`（PR #402）§3.2 / §3.3
+- PR：<https://github.com/zzjcool/pi-legion/pull/403>
 - 验收方式：**真进程两步**（`pi -p` 在 `hc` 终端里 launch → 父进程**自然退出** → 全新进程 `status` + `recover`），
   加上单测 / 集成测试与变异（每条断言「改回去即红」）
 - 版本：`6.2.4`；CHANGELOG `## [Unreleased] — 6.2.4（patch）`；**不发版、不打 tag**
