@@ -171,6 +171,12 @@ child 的 quiet 判据、#411 镜像）不在本 PR。
   checkout/origin/git）以前都写「改派 worker —— `subagent({ agent: "worker", host, task })`」，
   而 `allowRoles` 默认只允许 `centurion`，照着做必然再撞一次。现在统一成「改派 centurion，让它在那台
   机器上创建 worker/scout」，并点明 `allowRoles` 的默认值，不再打印一个必然被拒的调用。
+- **in-process child 的 `turn_end` 诊断不再冒充扩展故障 (#415)**：`pi` 宿主在「这一轮的 assistant
+  条目没有落盘」时会往 `onError` 报一条 `extensionPath: "<boundary>"` 的记录（`<boundary>` 是宿主自己
+  的伪扩展名）。现场 `hygiene-doctor` 的 `turn_end` handler 来自被继承的 `pi-async`，所以 #383 的
+  「不注册」挡不住它。现在 child 侧这个 sink 按三字段全等识别该记录，改印 `turn_end hook skipped: …`
+  并说明「宿主一个 handler 都没跑」——不抛错、不静默、也不再指着健康的扩展。复现步骤与归属分析见
+  `docs/reports/turn-end-entry-id.md`。
 
 ### 已知限制
 

@@ -150,6 +150,63 @@ test("D7.3 an unnamed child still binds (label is optional, bindings are not)", 
 	});
 });
 
+// #415 — the host's SKIPPED `turn_end` boundary (see `skippedTurnEndBoundary`).
+
+/** The exact record the host's `_dispatchTurnEndBoundary` emits (`agent-session.js`), verbatim. */
+const SKIPPED_BOUNDARY_RECORD = {
+	extensionPath: "<boundary>",
+	event: "turn_end",
+	error: "turn_end could not resolve the persisted assistant entry ID",
+};
+
+test("#415: a skipped turn_end boundary is reported as a skip, not as an extension error", async () => {
+	// Reproduction: `pi-async` registers a real `turn_end` handler, so the host's
+	// `hasHandlers("turn_end")` gate is true. The host then fails to resolve this turn's
+	// assistant message to a persisted entry — a turn ended by `dispose()`'s abort, by
+	// compaction, or after a fork — and emits this record against the `<boundary>`
+	// pseudo-extension. Before the fix legion printed it as
+	// `<child> extension error: <boundary> turn_end: …`, blaming a healthy extension.
+	// Mutation that must turn this red: deleting the `skippedTurnEndBoundary` branch.
+	const { session, calls } = fakeSession();
+	await bindChildSessionExtensions(session, "hygiene-doctor");
+
+	await captureWarnings(async (warnings) => {
+		assert.doesNotThrow(() => calls[0]!.onError!(SKIPPED_BOUNDARY_RECORD), "degrade, never throw");
+
+		assert.equal(warnings.length, 1, "still exactly one line — a skip is not silence");
+		const line = warnings[0]!;
+		assert.match(line, /^\[pi-legion\] in-process child hygiene-doctor /, "the child is still named");
+		assert.match(line, /turn_end hook skipped/, "the log says the HOOK was skipped");
+		assert.doesNotMatch(line, /extension error/, "no extension failed, so do not claim one did");
+		assert.match(line, /turn_end could not resolve the persisted assistant entry ID/, "the host's cause survives");
+		assert.match(line, /no persisted entry/, "and the reader learns why it was skipped");
+	});
+});
+
+test("#415: the degrade is exact — anything else still says \"extension error\"", async () => {
+	// Pins the match width. A broad match (substring, or the path alone) would silently
+	// reclassify genuine extension failures as benign skips — the inverse of the bug.
+	const { session, calls } = fakeSession();
+	await bindChildSessionExtensions(session, "hygiene-doctor");
+
+	await captureWarnings(async (warnings) => {
+		// Same pseudo-extension, different cause: not the entry-id diagnostic.
+		calls[0]!.onError!({
+			...SKIPPED_BOUNDARY_RECORD,
+			error: "turn_end requested continuation without runnable model context",
+		});
+		// Same message, but a real extension failed while handling turn_end.
+		calls[0]!.onError!({ ...SKIPPED_BOUNDARY_RECORD, extensionPath: "builtin:mcp" });
+		// Same message, a near-miss path.
+		calls[0]!.onError!({ ...SKIPPED_BOUNDARY_RECORD, extensionPath: "<boundary>x" });
+
+		assert.equal(warnings.length, 3, "one line each, never silence");
+		for (const line of warnings) assert.match(line, / extension error: /, "these are real failures");
+		assert.match(warnings[0]!, /requested continuation without runnable model context/);
+		assert.match(warnings[1]!, /builtin:mcp turn_end: turn_end could not resolve/);
+	});
+});
+
 test("D7.3 a bind failure propagates (it is not swallowed)", async () => {
 	// `extendResourcesFromExtensions` runs inside bindExtensions and can throw.
 	// Rare, but a spawn whose extensions never learned the session exists must fail
