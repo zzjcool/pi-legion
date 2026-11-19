@@ -29,6 +29,7 @@ import {
 } from "../../src/extension/hold.ts";
 import { SUBAGENT_NOTIFY_TYPE } from "../../src/extension/notify.ts";
 import {
+	SETTLE_FALLBACK_MS,
 	createSessionRuntime,
 	type CollectSnapshot,
 	type SessionRuntime,
@@ -60,7 +61,9 @@ interface Harness {
 	/** Every wait the hold asked for, in order. */
 	sleeps: number[];
 	/** How many times each seam member was called. */
-	calls: { take: number; commit: number; release: number; owns: number };
+	calls: { take: number; commit: number; release: number; owns: number; returns: number };
+	/** Seam calls AND trace events, in the order they happened (#418's ORDER pins read this). */
+	order: string[];
 	setChildren(children: HoldChild[]): void;
 	setPending(pending: boolean): void;
 	/** Fire the lone-ESC channel the hold subscribed to (when the ctx has one). */
@@ -89,7 +92,8 @@ function harness(
 	let esc: (() => void) | undefined;
 	const records: HoldRecord[] = [];
 	const sleeps: number[] = [];
-	const calls = { take: 0, commit: 0, release: 0, owns: 0 };
+	const order: string[] = [];
+	const calls = { take: 0, commit: 0, release: 0, owns: 0, returns: 0 };
 	const ctx: Record<string, unknown> = {
 		mode: "tui",
 		hasPendingMessages: () => pending,
@@ -108,6 +112,7 @@ function harness(
 		records,
 		sleeps,
 		calls,
+		order,
 		setChildren(next) {
 			children = next;
 		},
@@ -122,17 +127,25 @@ function harness(
 		liveChildren: () => (opts.degraded === true ? undefined : children),
 		takeNotice: (): TakenHoldNotice | undefined => {
 			calls.take += 1;
+			order.push("take");
 			if (opts.nothingOwed === true) return undefined;
 			return { drafts: [DRAFT], content: DRAFT.content } satisfies TakenHoldNotice;
 		},
 		commitNotice: () => {
 			calls.commit += 1;
+			order.push("commit");
 		},
 		releaseNotice: () => {
 			calls.release += 1;
+			order.push("release");
 		},
 		ownsBoundary: () => {
 			calls.owns += 1;
+			order.push("owns");
+		},
+		returnsBoundary: () => {
+			calls.returns += 1;
+			order.push("returns");
 		},
 		holdMaxMs: opts.holdMaxMs ?? legionHoldMaxMs,
 		pollMs: opts.pollMs ?? 100,
@@ -147,6 +160,7 @@ function harness(
 		},
 		record: (record) => {
 			records.push(record);
+			order.push(record.ev);
 		},
 	});
 	return state;
@@ -353,6 +367,15 @@ test("rule 1: exactly ONE `agent_before_settle` registration, and NO `turn_end` 
 		0,
 		"`turn_end` stays unregistered (see the block comment in index.ts)",
 	);
+	// #418: the pair must be wired together. A hold that claims the boundary and never hands
+	// it back is exactly the gap this pin closes; `ownsBoundary` without `returnsBoundary`
+	// leaves the settle window with no rescue at all, and nothing else would notice.
+	assert.match(code, /ownsBoundary: \(\) => runtime\.holdOwnsBoundary\?\.\(\)/);
+	assert.match(
+		code,
+		/returnsBoundary: \(\) => runtime\.holdReturnsBoundary\?\.\(\)/,
+		"the hold's hand-back is wired to the very runtime that armed the rescue",
+	);
 });
 
 test("rule 1: no hold in print/json/rpc, and none inside a legion child", async () => {
@@ -382,7 +405,7 @@ test("rule 1: an idle or degraded boundary costs nothing — no poll, no seam ca
 	const idle = harness({ children: [] });
 	assert.equal(await idle.hold.beforeSettle({ entries: [EXISTING], outcome: "completed" }, idle.ctx), undefined);
 	assert.equal(idle.sleeps.length, 0);
-	assert.deepEqual(idle.calls, { take: 0, commit: 0, release: 0, owns: 0 });
+	assert.deepEqual(idle.calls, { take: 0, commit: 0, release: 0, owns: 0, returns: 0 });
 	assert.equal(idle.records.at(-1)?.outcome, "idle");
 
 	// A degraded seam abstains too: a wrong list would either park the turn for nothing or
@@ -392,6 +415,7 @@ test("rule 1: an idle or degraded boundary costs nothing — no poll, no seam ca
 	assert.equal(degraded.sleeps.length, 0);
 	assert.equal(degraded.records.at(-1)?.outcome, "degraded");
 	assert.equal(degraded.calls.owns, 0);
+	assert.equal(degraded.calls.returns, 0, "a boundary the hold never took has nothing to hand back");
 });
 
 test("rule 4 (R3): the same still-running set cannot burn a second budget", async () => {
@@ -464,13 +488,17 @@ test("rule 2: no exit ever returns `continue: false`", async () => {
 		const result = (await run()) as { continue?: boolean } | undefined;
 		assert.notEqual(result?.continue, false, `exit #${index} returned continue:false`);
 	}
-	// Structural: the field is never even spelled in the module's CODE (the doc block
-	// names it on purpose, which is why comment lines are dropped first).
+	// Structural: the field is never even spelled as a VALUE in the module's CODE (the doc
+	// block names it on purpose, which is why comment lines are dropped first). String
+	// literals are blanked too: the trace REASON quotes the host's field verbatim
+	// (`hold skipped: peer continue:false`, #421), and a reason is not a return.
 	const source = readFileSync(new URL("../../src/extension/hold.ts", import.meta.url), "utf8");
 	const code = source
 		.split("\n")
 		.filter((line) => !/^\s*(\*|\/\/|\/\*)/.test(line))
-		.join("\n");
+		.join("\n")
+		.replace(/"(?:[^"\\]|\\.)*"/g, '""')
+		.replace(/`(?:[^`\\]|\\.)*`/g, '""');
 	assert.doesNotMatch(code, /continue:\s*false/, "the module must not contain `continue: false`");
 	const continuations = [...code.matchAll(/continue:\s*(\w+)/g)].map((match) => match[1]);
 	assert.ok(continuations.length > 0, "the delivery exit does ask for one continuation");
@@ -510,6 +538,194 @@ test("dispose(): a torn-down session stops holding", async () => {
 	assert.equal(await h.hold.beforeSettle({}, h.ctx), undefined);
 	assert.equal(h.sleeps.length, 0);
 	assert.equal(h.records.at(-1)?.outcome, "disposed");
+});
+
+// ────────────────── #418: handing the boundary back (fallback re-arm) ──────────────────
+
+test("#418: every exit that claimed the boundary hands it back, and the abstains do not", async () => {
+	// The rescue timer that `ownsBoundary` cancelled covers the window "the hold is over, the
+	// host has not settled yet". EVERY exit from the owned region opens that window, so every
+	// exit restores the timer — an abstain never claimed the boundary, so it restores nothing
+	// (the timer was never cancelled, and arming one there would be a second rescue).
+	const delivered = harness({
+		onSleep: (state, index) => {
+			if (index === 0) state.setChildren([]);
+		},
+	});
+	assert.ok(await delivered.hold.beforeSettle({ entries: [], outcome: "completed" }, delivered.ctx));
+	assert.equal(delivered.calls.owns, 1);
+	assert.equal(delivered.calls.returns, 1, "a delivery hands the boundary back too: the outbox may hold more");
+
+	const owned: Array<[string, Harness]> = [
+		["timeout", harness({ holdMaxMs: 300, pollMs: 100 })],
+		[
+			"cancelled",
+			harness({
+				holdMaxMs: 100_000,
+				pollMs: 100,
+				onSleep: (state, index) => {
+					if (index === 1) state.pressEsc();
+				},
+			}),
+		],
+		[
+			"user-waiting",
+			harness({
+				holdMaxMs: 100_000,
+				pollMs: 100,
+				onSleep: (state, index) => {
+					if (index === 0) state.setPending(true);
+				},
+			}),
+		],
+		[
+			"completed-empty",
+			harness({
+				nothingOwed: true,
+				onSleep: (state, index) => {
+					if (index === 0) state.setChildren([]);
+				},
+			}),
+		],
+	];
+	for (const [outcome, h] of owned) {
+		assert.equal(await h.hold.beforeSettle({ entries: [], outcome: "completed" }, h.ctx), undefined);
+		assert.equal(h.records.filter((record) => record.ev === "hold:end").at(-1)?.outcome, outcome);
+		assert.equal(h.calls.owns, 1, `${outcome}: the hold did claim the boundary`);
+		assert.equal(h.calls.returns, 1, `${outcome}: so the rescue has to be armed again`);
+	}
+
+	const abstains: Array<[string, Harness]> = [
+		["idle", harness({ children: [] })],
+		["degraded", harness({ degraded: true })],
+	];
+	for (const [outcome, h] of abstains) {
+		assert.equal(await h.hold.beforeSettle({ entries: [], outcome: "completed" }, h.ctx), undefined);
+		assert.equal(h.records.at(-1)?.outcome, outcome);
+		assert.equal(h.calls.returns, 0, `${outcome}: nothing was claimed, so nothing is handed back`);
+	}
+	// A hold that never ran (print mode) must not arm a timer either.
+	const noTui = harness();
+	assert.equal(await noTui.hold.beforeSettle({ entries: [], outcome: "completed" }, { mode: "print" }), undefined);
+	assert.equal(noTui.calls.returns, 0);
+});
+
+test("#418: the hand-back is the LAST thing the hold does — after the release, and after the drafts are final", async () => {
+	// Ordering matters for one reason: a rescue that fires while the notice is still CLAIMED
+	// would announce nothing (the outbox is empty at that instant), and a rescue that fires
+	// before the drafts are returned would be a second delivery of the same boundary.
+	const delivered = harness({
+		onSleep: (state, index) => {
+			if (index === 0) state.setChildren([]);
+		},
+	});
+	await delivered.hold.beforeSettle({ entries: [], outcome: "completed" }, delivered.ctx);
+	assert.deepEqual(delivered.order, ["owns", "hold:begin", "take", "commit", "hold:commit", "hold:end", "returns"]);
+
+	const released = harness({ holdMaxMs: 300, pollMs: 100 });
+	await released.hold.beforeSettle({ entries: [], outcome: "completed" }, released.ctx);
+	assert.deepEqual(released.order, ["owns", "hold:begin", "release", "hold:release", "hold:end", "returns"]);
+});
+
+test("#418: a rescue seam that throws cannot fail the boundary", async () => {
+	// `returnsBoundary` is a timer arm, not a delivery: if it explodes the hold must still
+	// have settled the turn the way it promised (hold:end, not the error abstain).
+	let clock = 0;
+	const records: HoldRecord[] = [];
+	const hold = createSettleHold({
+		liveChildren: () => [{ name: "worker-0", round: 1 }],
+		takeNotice: () => undefined,
+		commitNotice: () => undefined,
+		releaseNotice: () => undefined,
+		ownsBoundary: () => undefined,
+		returnsBoundary: () => {
+			throw new Error("the rescue timer is unavailable");
+		},
+		holdMaxMs: 100,
+		pollMs: 50,
+		now: () => (clock += 100),
+		sleep: async () => undefined,
+		record: (record) => {
+			records.push(record);
+		},
+	});
+	assert.equal(await hold.beforeSettle({ entries: [], outcome: "completed" }, { mode: "tui" }), undefined);
+	assert.equal(records.at(-1)?.ev, "hold:end", "the boundary settled; the throwing seam did not become the verdict");
+	assert.equal(records.at(-1)?.outcome, "timeout");
+});
+
+// ────────────────── #421: the chain's continuation vote (peer veto) ──────────────────
+
+test("#421: a handler BEFORE us that refused the continuation is not overwritten — the hold stands down", async () => {
+	// On a host that expresses "nobody has spoken yet" (no field on the boundary), a `false`
+	// can only be a handler's own answer. Continuing the turn anyway would overwrite the one
+	// vote the chain holds, so the hold stands down: zero waiting, nothing taken (the notice
+	// keeps waiting for the normal path), and the reason recorded instead of swallowed.
+	const h = harness({ holdMaxMs: 100, pollMs: 50 });
+	// First boundary: the host omits the field — that is what teaches the instance that this
+	// host CAN say "nobody spoke".
+	assert.equal(await h.hold.beforeSettle({ entries: [], outcome: "completed" }, h.ctx), undefined);
+	assert.equal(h.records.at(-1)?.outcome, "timeout");
+	assert.equal(h.records.at(-1)?.chainVote, "absent");
+	const waited = h.sleeps.length;
+
+	// Second boundary: a handler before us refused the continuation.
+	const vetoed = await h.hold.beforeSettle({ entries: [EXISTING], outcome: "completed", continue: false }, h.ctx);
+	assert.equal(vetoed, undefined, "legion must not continue a turn a peer refused to continue");
+	const end = h.records.at(-1);
+	assert.equal(end?.outcome, "peer-continue-false");
+	assert.equal(end?.reason, "hold skipped: peer continue:false", "the reason is the diagnosable string");
+	assert.equal(end?.chainVote, "veto");
+	assert.equal(h.sleeps.length, waited, "a vetoed boundary waits ZERO polls");
+	assert.equal(h.calls.take, 0, "nothing is taken: the notice goes through the normal path");
+	assert.equal(h.calls.owns, 1, "and the boundary is never claimed, so the rescue timer was never cancelled");
+});
+
+test("#421: on a host whose \"nobody spoke\" value IS `false` (pi 1.5.2) the same boundary behaves exactly as before", async () => {
+	// runner.js:770 starts the chain at `false` and :785-786 assigns each handler's answer
+	// over it, so on 1.5.2 a prior handler's veto and an untouched chain are the SAME BYTE.
+	// Reading that byte as a veto would switch the hold off for every user of the current
+	// host, so it is recorded as `sentinel` and the boundary behaves as it did before #421.
+	const control = harness({
+		onSleep: (state, index) => {
+			if (index === 0) state.setChildren([]);
+		},
+	});
+	const controlResult = await control.hold.beforeSettle({ entries: [], outcome: "completed" }, control.ctx);
+
+	const withFalse = harness({
+		onSleep: (state, index) => {
+			if (index === 0) state.setChildren([]);
+		},
+	});
+	const falseResult = await withFalse.hold.beforeSettle(
+		{ entries: [], outcome: "completed", continue: false },
+		withFalse.ctx,
+	);
+
+	// Byte-identical: same seams in the same order, same waits, same answer.
+	assert.deepEqual(withFalse.order, control.order);
+	assert.deepEqual(withFalse.sleeps, control.sleeps);
+	assert.deepEqual(falseResult, controlResult);
+	assert.equal(falseResult?.continue, true);
+	assert.equal(falseResult?.entries.length, 1);
+	// The ONLY difference is what the trace says the chain had decided.
+	assert.equal(control.records[0]?.chainVote, "absent");
+	assert.equal(withFalse.records[0]?.chainVote, "sentinel");
+});
+
+test("#421: `continue: true` from an earlier handler is echoed, not invented", async () => {
+	// A peer that already asked the host to continue makes our continuation a no-op, so the
+	// hold may proceed — and the trace says which of the two it was.
+	const h = harness({
+		onSleep: (state, index) => {
+			if (index === 0) state.setChildren([]);
+		},
+	});
+	const result = await h.hold.beforeSettle({ entries: [], outcome: "completed", continue: true }, h.ctx);
+	assert.equal(result?.continue, true);
+	assert.equal(h.records[0]?.chainVote, "continue");
+	assert.equal(h.calls.take, 1);
 });
 
 // ─────────────────────── 2. seam (real runtime + real ledger) ───────────────────────
@@ -706,6 +922,101 @@ test("the hold skips an outbox item that no longer owes a notice", async () => {
 	db.close();
 });
 
+test("#418: a hold that hands the boundary back leaves the rescue armed — the notice arrives though the settle never does", async () => {
+	// End-to-end through the PRODUCTION seams: the real hold policy drives the real outbox
+	// against a real ledger, and the only injected piece is the host timer (a 2 s claim fired
+	// by hand). What is under test is "somebody still arms it", not "setTimeout works" —
+	// the real setTimeout variant is the test right below this one.
+	const db = openLegionDb(":memory:");
+	const artifactId = "r-1/worker-0/r1";
+	recordOneArtifact(db, artifactId);
+	const sent: string[] = [];
+	const timers: Array<{ ms: number; fn: () => void; canceled: boolean }> = [];
+	const runtime = createSessionRuntime({
+		sendMessage: ((message: { content: string }) => sent.push(message.content)) as never,
+		getLedgerProjection: () => ({ db, consumerId: "root" }),
+		scheduleSettleFallback: (ms, fn) => {
+			const slot = { ms, fn, canceled: false };
+			timers.push(slot);
+			return {
+				cancel: () => {
+					slot.canceled = true;
+				},
+			};
+		},
+	});
+	await settleOneChild(runtime, artifactId);
+	assert.equal(runtime.noticeQueueStats().pending, 1, "the live parent run holds the notice");
+
+	// The parent's turn ended and `agent_settled` was never seen — the aborted/ESC shape.
+	runtime.notifyParentRunEnd();
+	assert.equal(timers.length, 1, "agent_end armed the rescue");
+
+	// The hold claims the boundary, waits out its budget on a child that never settles (the
+	// worst case: nothing is delivered, the notice is released) and hands the boundary back.
+	const hold = createSettleHold({
+		liveChildren: () => [{ name: "worker-0", round: 1 }],
+		takeNotice: () => runtime.takeHeldNotice?.(),
+		commitNotice: () => runtime.commitHeldNotice?.(),
+		releaseNotice: () => runtime.releaseHeldNotice?.(),
+		ownsBoundary: () => runtime.holdOwnsBoundary?.(),
+		returnsBoundary: () => runtime.holdReturnsBoundary?.(),
+		pollMs: 5,
+		holdMaxMs: 15,
+	});
+	assert.equal(await hold.beforeSettle({ entries: [], outcome: "completed" }, { mode: "tui" }), undefined);
+	assert.equal(timers[0]?.canceled, true, "the hold cancelled the rescue it took over from");
+	assert.equal(timers.length, 2, "and the hand-back armed it again");
+	assert.equal(timers[1]?.ms, SETTLE_FALLBACK_MS);
+	assert.equal(sent.length, 0, "the hold itself delivered nothing");
+
+	// The net the hold restored is what releases the notice now.
+	timers[1]!.fn();
+	assert.equal(sent.length, 1, "the notice the settle never delivered arrives anyway");
+	assert.match(sent[0] ?? "", /Background task completed: \*\*worker-0 \(worker\)\*\*/);
+	assert.equal(runtime.noticeQueueStats().pending, 0, "the outbox is drained");
+	runtime.dispose();
+	db.close();
+});
+
+test("#418 (real timer): the production rescue timer really fires after the hold hands the boundary back", async () => {
+	// The same end-to-end with NOTHING injected: the runtime's own unref'd `setTimeout`
+	// (`defaultNoticeOverflow`) and the frozen 2 s delay. This is the reproducible proof that
+	// the re-arm is not a test-only seam.
+	const db = openLegionDb(":memory:");
+	const artifactId = "r-1/worker-0/r1";
+	recordOneArtifact(db, artifactId);
+	const sent: string[] = [];
+	const runtime = ledgerRuntime((message) => sent.push(message.content), db);
+	await settleOneChild(runtime, artifactId);
+	runtime.notifyParentRunEnd();
+
+	const hold = createSettleHold({
+		liveChildren: () => [{ name: "worker-0", round: 1 }],
+		takeNotice: () => runtime.takeHeldNotice?.(),
+		commitNotice: () => runtime.commitHeldNotice?.(),
+		releaseNotice: () => runtime.releaseHeldNotice?.(),
+		ownsBoundary: () => runtime.holdOwnsBoundary?.(),
+		returnsBoundary: () => runtime.holdReturnsBoundary?.(),
+		pollMs: 5,
+		holdMaxMs: 15,
+	});
+	assert.equal(await hold.beforeSettle({ entries: [], outcome: "completed" }, { mode: "tui" }), undefined);
+	assert.equal(sent.length, 0);
+
+	const startedAt = Date.now();
+	while (sent.length === 0 && Date.now() - startedAt < 3_000) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	const firedAfterMs = Date.now() - startedAt;
+	assert.equal(sent.length, 1, `the production timer did not release the notice (waited ${firedAfterMs}ms)`);
+	assert.ok(firedAfterMs >= SETTLE_FALLBACK_MS - 50, `fired after ${firedAfterMs}ms: it must not fire EARLIER than the frozen delay`);
+	assert.match(sent[0] ?? "", /Background task completed/);
+	assert.equal(runtime.noticeQueueStats().pending, 0);
+	runtime.dispose();
+	db.close();
+});
+
 test("a blocked sibling cannot hide a finished child's notice from the hold", async () => {
 	// The hold's gate (`state === "working"`) is narrower than the join's
 	// (`watching !== false`): a child blocked on an approval prompt keeps a finished
@@ -748,6 +1059,21 @@ test("a blocked sibling cannot hide a finished child's notice from the hold", as
 	assert.match(taken.content, /Still running: worker-1/, "the blocked sibling is reported truthfully");
 	runtime.dispose();
 	db.close();
+});
+
+test("rule 1: `holdReturnsBoundary` is the settle-rescue ARM, and nothing else", () => {
+	// The mirror of the pin below, and the reason #418 cannot regress quietly: a hand-back that
+	// did anything besides re-arm the ONE timer would either invent a second rescue path or
+	// start delivering from a place that has no drafts to deliver.
+	const source = readFileSync(new URL("../../src/extension/runtime.ts", import.meta.url), "utf8");
+	const start = source.indexOf("holdReturnsBoundary() {");
+	assert.ok(start >= 0, "the seam is wired on the runtime");
+	const body = source.slice(start, source.indexOf("},", start));
+	const statements = body
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && !line.startsWith("//") && !line.startsWith("holdReturnsBoundary"));
+	assert.deepEqual(statements, ["armSettleFallback();"]);
 });
 
 test("rule 1: `holdOwnsBoundary` is the settle-rescue cancel, and nothing else", () => {

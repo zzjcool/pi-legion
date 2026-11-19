@@ -1069,6 +1069,18 @@ export interface SessionRuntime {
 	 */
 	holdOwnsBoundary?(): void;
 	/**
+	 * #418: the hold is done with the boundary — arm the `SETTLE_FALLBACK_MS` rescue again,
+	 * in the same form `agent_end` arms it.
+	 *
+	 * `holdOwnsBoundary` cancels a timer that would otherwise fire INSIDE the hold. The
+	 * mirror image is just as load-bearing: the hold's exits all reopen the window it was
+	 * covering ("a notice is held, no boundary has arrived"), so the rescue has to come
+	 * back. Without it the only remaining net is `agent_settled`, and a settle the host
+	 * never emits leaves the released notice parked in the outbox until an unrelated
+	 * boundary pushes it.
+	 */
+	holdReturnsBoundary?(): void;
+	/**
 	 * `root-mail-run-boundary-v1` D2: hand this session's run-activity reader to the
 	 * process-wide registry (`src/legion/run-active.ts`) under `nodeId`, so the mail
 	 * postman can ask "is this node's run still live?" without a second copy of the
@@ -1643,6 +1655,43 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 	const cancelSettleFallback = (): void => {
 		settleFallbackTimer?.cancel();
 		settleFallbackTimer = undefined;
+	};
+	/**
+	 * Arm the rescue timer — the ONE arming path, shared by both arms of the race.
+	 *
+	 * Extracted (#418) instead of copied: the `agent_end` arm and the hold's exit arm are
+	 * the same promise ("a notice is held and no boundary has arrived yet"), so they must
+	 * not be able to drift in delay, guards or payload. The three guards are the original
+	 * semantics and each is load-bearing:
+	 *
+	 * - `disposed || !parentRunActive` — a teardown or an already-taken boundary is not a
+	 *   race to lose; a `false` here means the notice is parked for the NEXT boundary, which
+	 *   is the correct place for it (`docs/reports/legion-hold.md` §1.7);
+	 * - `outbox.length === 0` — nothing is held, so the common idle-end case allocates no
+	 *   timer at all;
+	 * - `settleFallbackTimer` — never two timers, so a re-arm cannot shorten the delay an
+	 *   already-armed timer promised.
+	 */
+	const armSettleFallback = (): void => {
+		if (disposed || !parentRunActive || outbox.length === 0) return;
+		if (settleFallbackTimer) return;
+		let live = true;
+		const schedule = deps.scheduleSettleFallback ?? defaultNoticeOverflow;
+		settleFallbackTimer = schedule(SETTLE_FALLBACK_MS, () => {
+			if (!live) return;
+			live = false;
+			settleFallbackTimer = undefined;
+			// `agent_settled` won the race, a new run started, or the runtime is gone:
+			// the boundary is not ours to take.
+			if (disposed || !parentRunActive) return;
+			// The settle boundary never arrived (aborted run, torn-down session). Take
+			// the boundary this notice would otherwise never get. `flushOutbox` still
+			// stops after the first `triggerTurn` notice (D2), so this is one waking
+			// message, exactly like a settle.
+			parentRunActive = false;
+			flushOutbox();
+			refreshUi();
+		});
 	};
 
 	/**
@@ -3407,26 +3456,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		},
 
 		notifyParentRunEnd() {
-			// Nothing held ⇒ no timer at all (the common idle-end case).
-			if (disposed || !parentRunActive || outbox.length === 0) return;
-			if (settleFallbackTimer) return;
-			let live = true;
-			const schedule = deps.scheduleSettleFallback ?? defaultNoticeOverflow;
-			settleFallbackTimer = schedule(SETTLE_FALLBACK_MS, () => {
-				if (!live) return;
-				live = false;
-				settleFallbackTimer = undefined;
-				// `agent_settled` won the race, a new run started, or the runtime is gone:
-				// the boundary is not ours to take.
-				if (disposed || !parentRunActive) return;
-				// The settle boundary never arrived (aborted run, torn-down session). Take
-				// the boundary this notice would otherwise never get. `flushOutbox` still
-				// stops after the first `triggerTurn` notice (D2), so this is one waking
-				// message, exactly like a settle.
-				parentRunActive = false;
-				flushOutbox();
-				refreshUi();
-			});
+			armSettleFallback();
 		},
 
 		publishRunActivity(nodeId: string) {
@@ -3463,6 +3493,18 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			// never arrives. Leaving it armed would let it fire inside a ten-minute hold and
 			// deliver (and latch) the very notice the boundary is waiting to announce.
 			cancelSettleFallback();
+		},
+
+		holdReturnsBoundary() {
+			// #418: the hold is done with the boundary. It cancelled the rescue when it took
+			// over, so the timer has to be armed again in its ORIGINAL form — otherwise the
+			// window between "the hold returned" and "the host settles" has no rescue at all,
+			// and a settle the host never emits parks the notice until something else pushes
+			// it. Same guards as `agent_end`: a delivered hold leaves an empty outbox (no
+			// timer), and the continuation it asked for cancels this timer via
+			// `notifyParentRunStart`. `armSettleFallback` is the one arming path, so the
+			// re-arm cannot drift from the first arm.
+			armSettleFallback();
 		},
 
 		noticeQueueStats(): NoticeQueueStats {

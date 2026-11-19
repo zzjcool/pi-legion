@@ -2355,6 +2355,11 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		commitNotice: () => runtime.commitHeldNotice?.(),
 		releaseNotice: () => runtime.releaseHeldNotice?.(),
 		ownsBoundary: () => runtime.holdOwnsBoundary?.(),
+		// #418: the pair is symmetric. Claiming the boundary cancels the `SETTLE_FALLBACK_MS`
+		// rescue so it cannot fire mid-hold; handing it back re-arms the same timer, so the
+		// window between the hold's exit and the host's settle is covered exactly as it was
+		// before the hold existed.
+		returnsBoundary: () => runtime.holdReturnsBoundary?.(),
 		record: fileHoldTrace(process.env.PI_LEGION_HOLD_TRACE),
 	});
 	blockedUi.set(runtime, {

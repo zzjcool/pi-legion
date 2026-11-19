@@ -2301,6 +2301,132 @@ test("T1d: runtime — no fallback timer when nothing is held, and a new run can
 	runtime.dispose();
 });
 
+test("T1e: runtime — the hold hands the boundary back, so the settle rescue is armed again (#418)", async () => {
+	// The hold cancels the rescue when it claims the boundary (`holdOwnsBoundary`). Without a
+	// re-arm the window "hold returned → host settles" has NO net at all, and a settle the host
+	// never emits leaves the released notice parked until an unrelated boundary pushes it.
+	const messages: unknown[] = [];
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	const fallback = manualSettleFallback();
+	const runtime = createSessionRuntime({
+		sendMessage(message, options) {
+			messages.push({ message, options });
+		},
+		now: () => 1_000,
+		scheduleSettleFallback: fallback.scheduleSettleFallback,
+	});
+
+	runtime.notifyParentRunStart();
+	runtime.track({
+		name: "rescue",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/rescue.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("rescue");
+	resolveCollect(joinSnapshot({ output: "rescue output" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held in the outbox");
+
+	runtime.notifyParentRunEnd();
+	assert.equal(fallback.timers.length, 1, "agent_end arms the rescue");
+
+	// The hold takes the boundary: the rescue must not fire mid-hold.
+	runtime.holdOwnsBoundary?.();
+	assert.equal(fallback.timers[0]?.canceled, true, "the hold cancelled the rescue it took over from");
+	assert.equal(messages.length, 0);
+
+	// The hold leaves without delivering: the notice is back in the outbox and the settle
+	// boundary still has not been seen, which is exactly the window the rescue covers.
+	runtime.releaseHeldNotice?.();
+	runtime.holdReturnsBoundary?.();
+	assert.equal(fallback.timers.length, 2, "handing the boundary back arms the SAME rescue again");
+	assert.equal(fallback.timers[1]?.ms, SETTLE_FALLBACK_MS, "same delay, not a shorter or longer one");
+	assert.equal(fallback.timers[1]?.canceled, false);
+	assert.equal(messages.length, 0, "re-arming delivers nothing by itself");
+
+	fallback.timers[1]!.fn();
+	assert.equal(messages.length, 1, "the re-armed rescue delivers the notice the settle never did");
+	const sent = messages[0] as {
+		message: { customType: string; content: string };
+		options: { triggerTurn: boolean; deliverAs: string };
+	};
+	assert.equal(sent.message.customType, SUBAGENT_NOTIFY_TYPE);
+	assert.equal(sent.options.triggerTurn, true);
+	assert.equal(sent.options.deliverAs, "followUp", "the re-armed rescue uses the ordinary followUp shape");
+	assert.match(sent.message.content, /rescue output/);
+	assert.equal(runtime.noticeQueueStats().pending, 0, "outbox drained by the re-armed rescue");
+	runtime.dispose();
+});
+
+test("T1f: runtime — handing the boundary back arms nothing when there is nothing to rescue, and never stacks", async () => {
+	const messages: unknown[] = [];
+	const fallback = manualSettleFallback();
+	const runtime = createSessionRuntime({
+		sendMessage(message) {
+			messages.push(message);
+		},
+		now: () => 1_000,
+		scheduleSettleFallback: fallback.scheduleSettleFallback,
+	});
+
+	// (1) Nothing held: the common idle-end case allocates no timer at all.
+	runtime.notifyParentRunStart();
+	runtime.holdReturnsBoundary?.();
+	assert.equal(fallback.timers.length, 0, "an empty outbox arms no rescue");
+
+	// (2) The boundary already arrived: `notifyParentSettled` cancelled the rescue, so a
+	// re-arm here would resurrect a boundary this runtime no longer owns.
+	let resolveCollect!: (value: CollectSnapshot) => void;
+	runtime.track({
+		name: "settled",
+		runId: "r-1",
+		agent: "worker",
+		sessionFile: "/tmp/settled.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveCollect = resolve;
+			}),
+	});
+	runtime.watch("settled");
+	resolveCollect(joinSnapshot({ output: "settled output" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "notice held");
+	runtime.notifyParentRunEnd();
+	runtime.notifyParentSettled();
+	const armed = fallback.timers.length;
+	runtime.holdReturnsBoundary?.();
+	assert.equal(fallback.timers.length, armed, "a re-arm after the boundary was taken must not arm anything");
+	assert.equal(messages.length, 1, "the settle delivered it once");
+
+	// (3) Never two timers: an already-armed rescue is not duplicated (nor its delay reset).
+	runtime.notifyParentRunStart();
+	let resolveAgain!: (value: CollectSnapshot) => void;
+	runtime.track({
+		name: "again",
+		runId: "r-2",
+		agent: "worker",
+		sessionFile: "/tmp/again.jsonl",
+		timeoutMs: 1_000,
+		collect: () =>
+			new Promise<CollectSnapshot>((resolve) => {
+				resolveAgain = resolve;
+			}),
+	});
+	runtime.watch("again");
+	resolveAgain(joinSnapshot({ output: "again output" }));
+	await waitFor(() => runtime.noticeQueueStats().pending === 1, "second notice held");
+	runtime.notifyParentRunEnd();
+	const before = fallback.timers.length;
+	runtime.holdReturnsBoundary?.();
+	assert.equal(fallback.timers.length, before, "a live rescue is never duplicated by the hand-back");
+	runtime.dispose();
+});
+
 test("T3a: runtime — a lone child's completion reaches the host in under 1s", async () => {
 	const messages: unknown[] = [];
 	let resolveCollect!: (value: CollectSnapshot) => void;
