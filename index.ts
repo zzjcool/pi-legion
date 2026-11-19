@@ -28,7 +28,7 @@ import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor
 import { TerminalSupervisor } from "./src/supervisor/terminal-supervisor.ts";
 import type { AbortOutcome, InFlightToolStack, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
 import { inFlightToolStackOf } from "./src/supervisor/types.ts";
-import { withInFlightToolLine } from "./src/extension/legion-status.ts";
+import { childRemoteFacts, withInFlightToolLine } from "./src/extension/legion-status.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, parsePhaseMachine, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
 import {
@@ -148,7 +148,7 @@ import {
 	unknownChildMessage,
 	type CandidateStore,
 } from "./src/runs/store-lookup.ts";
-import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
+import { RUN_OWNER_FILE, isPidAlive, ownerState, readOwnerFile } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
@@ -2461,12 +2461,20 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				// #315/#331: same display-only activity fact `subagent status` prints,
 				// so the slash command cannot drift from the tool surface.
 				const inFlightTools = inFlightToolStackOf(supervisor, child.name);
+				// 6.2.5 / D5: `/legion status <name>` and `subagent status` must print the
+				// same host/terminal pair. This path used to drop both fields entirely, so
+				// the slash command disagreed with the tool about the same child.
+				const identity = ownLegionIdentity();
+				const ledgerNode = child.nodeId && identity ? getNode(identity.db, child.nodeId) : undefined;
+				const remote = childRemoteFacts(child, ledgerNode);
 				return {
 					name: child.name,
 					state: child.state,
 					agent: child.agent,
 					kind: child.kind,
 					sessionFile: child.sessionFile,
+					...(remote.host ? { host: remote.host } : {}),
+					...(remote.remoteTerminal ? { remoteTerminal: remote.remoteTerminal } : {}),
 					...(child.execution ? { execution: child.execution } : {}),
 					...(child.acceptance
 						? { acceptance: { status: child.acceptance.status, level: child.acceptance.level } }
@@ -2503,12 +2511,40 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 						const fate = orphanFateOf(db, node.id);
 						return fate ? { ...node, orphaned: fate } : node;
 					});
-				if (identity) return annotate(identity.db, listUnsettledRemoteNodes(identity.db));
+				// 6.2.5 / D4: the same ownership facts the recover path prints — the run id,
+				// the checkout, the owning session and the run dir's owner pid — travel with
+				// the node so `/legion status` can print the shared block.
+				const withOwnership = (entry: {
+					node: LegionNode;
+					runId: string;
+					cwd?: string;
+					sessionFile?: string;
+					ownerPid?: number;
+					ownerAlive?: boolean;
+					orphaned?: "orphaned" | "unfetched";
+				}) => ({
+					...entry.node,
+					ledgerRunId: entry.runId,
+					...(entry.cwd ? { cwd: entry.cwd } : {}),
+					...(entry.sessionFile ? { ownerSessionFile: entry.sessionFile } : {}),
+					...(entry.ownerPid !== undefined ? { ownerPid: entry.ownerPid } : {}),
+					...(entry.ownerAlive !== undefined ? { ownerAlive: entry.ownerAlive } : {}),
+					...(entry.orphaned ? { orphaned: entry.orphaned } : {}),
+				});
+				if (identity) return listUnsettledRemoteNodes(identity.db).map((node) => {
+					const fate = orphanFateOf(identity.db, node.id);
+					const runId = path.basename(identity.runDir);
+					const owner = readOwnerFile(path.join(identity.runDir, RUN_OWNER_FILE));
+					return withOwnership({
+						node,
+						runId,
+						...(owner ? { ownerPid: owner.pid, ownerAlive: isPidAlive(owner.pid) } : {}),
+						...(fate ? { orphaned: fate } : {}),
+					});
+				});
 				// The disk fallback already reads each run's ledger: `listRecoverableLeftovers`
 				// returns the exit's fate beside the node, so nothing is reopened here.
-				return listRecoverableLeftovers(runStoreFor(lastCwd), { sessionFile: lastSessionFile }).map((entry) =>
-					entry.orphaned ? { ...entry.node, orphaned: entry.orphaned } : entry.node,
-				);
+				return listRecoverableLeftovers(runStoreFor(lastCwd), { sessionFile: lastSessionFile }).map(withOwnership);
 			} catch {
 				// A closed/stale ledger handle must never cost the user the status view.
 				return [];
@@ -3540,6 +3576,9 @@ async function controlAction(input: {
 
 	// status: no name (or all:true) → live-children overview; named → one child.
 	if (action === "status") {
+		// 6.2.5 / D5: the ledger row for a run-store child, when this session owns one.
+		const ledgerNodeFor = (child: StatusChildRecord): LegionNode | null | undefined =>
+			input.legion && child.nodeId ? getNode(input.legion.db, child.nodeId) : undefined;
 		if (params.name && params.all) {
 			return fail(
 				"`name` and `all` are mutually exclusive for status.",
@@ -3574,11 +3613,15 @@ async function controlAction(input: {
 			};
 			const classified = classifyChildrenForStatus(runs, factsFor);
 			const now = Date.now();
+			// 6.2.5 / D5: the run-store record is the first source for where a child runs;
+			// this session's ledger row for the same node is the second (a run.json written
+			// by a rebuild or an older build can lack the pair, while the ledger has it).
 			const overview = renderStatusOverview(
 				classified.map(({ child, live }) => {
 					const { pid, inFlightTools, ...facts } = factsFor(child);
+					const remote = childRemoteFacts(child, ledgerNodeFor(child));
 					return {
-						child,
+						child: { ...child, ...remote },
 						...facts,
 						...(pid ? { pid } : {}),
 						...(inFlightTools ? { inFlightTools } : {}),
@@ -3660,8 +3703,8 @@ async function controlAction(input: {
 			spawnMode: found.child.spawnMode,
 			// 6.2.4 / D3: `/legion status <name>` and `subagent status` share this
 			// renderer, so the machine and terminal come from the record on both.
-			...(found.child.host ? { host: found.child.host } : {}),
-			...(found.child.remoteTerminal ? { remoteTerminal: found.child.remoteTerminal } : {}),
+			// 6.2.5 / D5: the ledger row answers when the record cannot.
+			...childRemoteFacts(found.child, ledgerNodeFor(found.child)),
 			alive,
 			...(owner ? { owner } : {}),
 		});
@@ -6223,6 +6266,9 @@ function followJob(
 		// 6.2.4 / D2: the shutdown releases children by this fact alone (a host record
 		// means the process over there outlives this one).
 		...(child?.host ? { host: child.host } : {}),
+		// 6.2.5 / D5: the job-only status fallback (`/legion status <name>` without a
+		// run-store record) prints where it runs instead of guessing `local`.
+		...(child?.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
 		...(spawnMode ? { spawnMode } : {}),
 		...(input.pid ? { pid: input.pid } : {}),
 		...(input.treeIdentity ? input.treeIdentity : child?.nodeId ? {
@@ -7121,6 +7167,30 @@ export async function recoverAction(input: {
 			...(input.probeTerminal ? { probeTerminal: input.probeTerminal } : {}),
 			...(input.now ? { now: input.now } : {}),
 		});
+		// 6.2.5 / D4: the recover headline carries the SAME ownership block `/legion
+		// status` prints. Built INSIDE the try because the ledger this process opened is
+		// closed by the `finally` below (the fate query would hit a closed handle).
+		if (outcome.ok) {
+			const recovery = outcome.recovery;
+			const directoryRunId = path.basename(path.dirname(ledger.dbPath));
+			const ownershipRunId = recovery.node.runId ?? (/^r-[0-9a-f]{6,}$/i.test(directoryRunId) ? directoryRunId : undefined);
+			const ownershipRun = ownershipRunId ? input.store?.listRuns().find((run) => run.runId === ownershipRunId) : undefined;
+			const ownershipOwner = readOwnerFile(path.join(path.dirname(ledger.dbPath), RUN_OWNER_FILE));
+			recovery.ownership = {
+				name: recovery.node.name,
+				nodeId: recovery.node.id,
+				host: recovery.node.host ?? "(unknown host)",
+				state: orphanFateOf(ledger.db, recovery.node.id) ?? recovery.node.status,
+				...(recovery.node.remoteTerminal ? { terminal: recovery.node.remoteTerminal } : {}),
+				launchedAt: recovery.node.createdAt,
+				...(Number.isFinite(recovery.node.updatedAt) ? { heartbeatAt: recovery.node.updatedAt } : {}),
+				...(ownershipRunId ? { runId: ownershipRunId } : {}),
+				...(ownershipRun?.cwd ? { cwd: ownershipRun.cwd } : {}),
+				...(ownershipRun?.sessionFile ? { sessionFile: ownershipRun.sessionFile } : {}),
+				...(ownershipOwner ? { ownerPid: ownershipOwner.pid, ownerAlive: isPidAlive(ownershipOwner.pid) } : {}),
+				now: (input.now ?? Date.now)(),
+			};
+		}
 	} finally {
 		// Only a handle this call opened is closed here; an adopted identity's is owned
 		// by the session runtime (`stopLegionRuntime`).
