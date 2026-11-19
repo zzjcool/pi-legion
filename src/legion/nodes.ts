@@ -518,7 +518,9 @@ export function listNodesNamed(db: DatabaseSync, name: string): LegionNode[] {
  * The status set is spelled as the three live statuses rather than `NOT IN
  * (settled, failed, retired)` so the query and {@link hasEnded} cannot drift: a
  * status that is not listed here is, by construction, one this query does not
- * consider recoverable.
+ * consider recoverable. The startup sweep (`markAbandoned`, hygiene) leaves
+ * cross-machine rows open on purpose (#407) — a dead owner on THIS host never
+ * ended the work on that one, so it must not fail the row out of this list.
  *
  * `host <> ''` is part of the predicate, not decoration: an empty string is what a
  * caller that "set" the field to nothing would store, and it must not make a LOCAL

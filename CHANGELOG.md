@@ -13,8 +13,9 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 `status` 的归属事实：遗留行不再猜 age，也不再只说「有个叫 X 的东西在远端」。
 报告：`docs/reports/status-attribution.md`。本轮范围**只含 D1/D4/D5-rendering**，
-其余项已拆分为 issue #407（72h sweep 抹掉跨机遗留）、#408（14 天 retention
-删归属证据）、#409（anchor / where 归属）、#410（spawn cwd 误报成程序不存在）、
+其余项已拆分为 issue：#407（72h sweep 抹掉跨机遗留，本版已修，见
+`docs/reports/leftover-visibility.md`）、#408（14 天 retention 删归属证据）、
+#409（anchor / where 归属）、#410（spawn cwd 误报成程序不存在）、
 #411（跨机 transcript 实时镜像）。
 
 - **D1：`<N> old` 改用 `createdAt`。** `updatedAt` 会被 hygiene 的 `markAbandoned`
@@ -34,6 +35,12 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
   `see: hc read <machine>/<terminal>   (cross-machine children have no Herdr pane)`。
   数据来源：run store 的 `child.host`/`child.remoteTerminal` 优先，缺了读 ledger 的
   `nodes.host`/`nodes.remote_terminal`；`/legion status` 与 `subagent status` 同源。
+- **#407：72h sweep 不再改判跨机遗留。** hygiene 的 `markAbandoned` 只处理 `host`
+  为空的本地行：owner 在本机死掉不等于远端的工作结束，而这一行是 `recover` 唯一
+  还能收的证据。之前它被改成 `failed`，于是 `/legion status` 的遗留块（只筛 live
+  状态）把它藏起来，`recover` 却仍按名字收得到 —— status 说「没了」，recover 说
+  「还能收」。现在行保持 open（`orphaned`/`unfetched` 依赖的同一不变量），年龄仍由
+  归属块的 `launched`/`heartbeat` 如实显示。报告：`docs/reports/leftover-visibility.md`。
 
 ## [6.2.4] — 2026-11-19
 

@@ -8,10 +8,12 @@
  *
  *  - #38 temp sweep: `runs/<id>/rpc-child-*` dirs whose owner pid is dead
  *    (or, for legacy dirs without a marker, older than the legacy age).
- *  - #38 stale records: in run dirs whose owner pid is dead, non-root ledger
- *    nodes still `starting`/`running`/`blocked` and not updated for
+ *  - #38 stale records: in run dirs whose owner pid is dead, non-root LOCAL
+ *    ledger nodes still `starting`/`running`/`blocked` and not updated for
  *    `staleNodeHours` are marked `failed` with a `node_abandoned` event, and
- *    a leftover WAL is checkpointed.
+ *    a leftover WAL is checkpointed. Cross-machine rows (`host` recorded) are
+ *    exempt since #407: the owner dying HERE does not end the work THERE, and
+ *    such a row is the only record `recover` can still collect.
  *  - #37 prune: whole run dirs idle longer than `retentionDays`, owner dead,
  *    and WITHOUT a `worktrees/` entry (retired worktrees are kept on purpose
  *    as resume credentials — docs/legion-v2-contract.md:270).
@@ -155,8 +157,19 @@ const ACTIVE_STATUSES = ["starting", "running", "blocked"];
 function markAbandoned(dbPath: string, staleBefore: number, now: number): string[] {
 	const db = openLegionDb(dbPath);
 	try {
+		// #407: a dead owner on THIS host says nothing about a child that ran on
+		// ANOTHER one — that process kept going, and its row is the only record
+		// `recover` can still collect. Failing the row also failed the visibility
+		// test: `listUnsettledRemoteNodes` (the `/legion status` block) lists live
+		// statuses only, while `recover` reads the row by name regardless of status.
+		// So the sweep hid a leftover it had just proven nothing about, and status
+		// said "gone" while recover said "here". The row stays OPEN, which is the
+		// same invariant 6.2.4's exit fate (`orphaned`/`unfetched`) relies on; its
+		// age is still on screen (`launched` / `heartbeat` in the ownership block).
+		// `host IS NOT NULL AND host <> ''` is the ledger's cross-machine marker,
+		// spelled exactly as `listUnsettledRemoteNodes` spells it.
 		const rows = db.prepare(
-			`SELECT id FROM nodes WHERE parent_id IS NOT NULL AND status IN (${ACTIVE_STATUSES.map(() => "?").join(",")}) AND updated_at < ?`,
+			`SELECT id FROM nodes WHERE parent_id IS NOT NULL AND status IN (${ACTIVE_STATUSES.map(() => "?").join(",")}) AND updated_at < ? AND (host IS NULL OR host = '')`,
 		).all(...ACTIVE_STATUSES, staleBefore);
 		const ids = rows.map((r) => String(r.id));
 		for (const id of ids) {
