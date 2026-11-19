@@ -254,11 +254,14 @@ export interface TerminalSupervisorOptions {
 	/** Environment read for host detection, parent identity and PATH/HOME (D5). */
 	env?: NodeJS.ProcessEnv;
 	/**
-	 * Value for the `legion.run` label (D6), when the caller knows it.
+	 * Fallback value for the `legion.run` label and the terminal/mirror names (D6/D7/D9),
+	 * used only when a spawn carries no {@link SpawnInput.runId}.
 	 *
-	 * Omitted when unknown: a run id is a fact, and this backend will not derive
-	 * one from a path or a node name. The wiring in `index.ts` has no run id at
-	 * supervisor-construction time, so the label is simply absent there.
+	 * Omitted when unknown: a run id is a fact, and this backend will not derive one
+	 * from a path or a node name. Production builds one supervisor per process,
+	 * BEFORE any run exists, so it passes nothing here — every real launch names its
+	 * run on the spawn itself. This option remains the seam for tests (and for a
+	 * caller that really owns one run for the supervisor's whole lifetime).
 	 */
 	runId?: string;
 	/** Poll cadence for `waitSettled`; tests shrink it, production uses 1 s. */
@@ -320,6 +323,20 @@ export class TerminalSupervisor implements LegionSupervisor {
 			(() => hcCliClient({ env: this.env, ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}) }));
 	}
 
+	/**
+	 * #414: the run id THIS spawn belongs to — the run that dispatched the child.
+	 *
+	 * The spawn's own value wins: production constructs ONE supervisor before any
+	 * run exists, so the constructor value cannot name the run a child belongs to.
+	 * Absent everywhere returns `undefined` on purpose — the caller then gets the
+	 * legacy shape (`lgl-<handle>`, `<mirrorRoot>/no-run/<handle>`, no run label),
+	 * never an invented run id.
+	 */
+	private runIdFor(input: SpawnInput): string | undefined {
+		const dispatched = typeof input.runId === "string" ? input.runId.trim() : "";
+		return dispatched.length > 0 ? dispatched : this.runId;
+	}
+
 	// ── spawn (D4/D5/D6/D7) ─────────────────────────────────────────────
 
 	/**
@@ -377,7 +394,8 @@ export class TerminalSupervisor implements LegionSupervisor {
 			);
 		}
 		const client = await this.ensureClient();
-		const terminalNameForChild = terminalName(this.runId, input.name);
+		const spawnRunId = this.runIdFor(input);
+		const terminalNameForChild = terminalName(spawnRunId, input.name);
 		// Absent/blank = this host (contract D4). Normalized ONCE here: `on`, the
 		// record and every later address all read this one value.
 		const host = normalizeHost(input.host);
@@ -551,7 +569,7 @@ export class TerminalSupervisor implements LegionSupervisor {
 			writeOwnerFile(path.join(tempDir, TEMP_OWNER_FILE));
 
 			if (target !== undefined) {
-				remoteDir = remoteDirFor(target, this.runId, input.name);
+				remoteDir = remoteDirFor(target, spawnRunId, input.name);
 				await ensureRemoteDir(client, target, remoteDir);
 				// m10: from here on, a failure leaves an empty directory behind unless it
 				// is swept. `hc` has no `file.remove`, so this flag is what allows the
@@ -1578,8 +1596,9 @@ export class TerminalSupervisor implements LegionSupervisor {
 	 */
 	private async childLabels(input: SpawnInput, host: string | undefined): Promise<Record<string, string>> {
 		const labels: Record<string, string> = { [LEGION_ROLE_LABEL]: input.agent.name };
-		if (this.runId !== undefined && this.runId.length > 0) {
-			labels[LEGION_RUN_LABEL] = this.runId;
+		const runId = this.runIdFor(input);
+		if (runId !== undefined && runId.length > 0) {
+			labels[LEGION_RUN_LABEL] = runId;
 		}
 		if (host !== undefined) {
 			labels[LEGION_HOST_LABEL] = host;

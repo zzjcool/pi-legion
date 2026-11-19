@@ -83,6 +83,18 @@ export interface RenewalProposal {
 export interface CompletionInput {
 	name: string;
 	agent?: string;
+	/**
+	 * #414: the run that DISPATCHED this child — the initiating run's id.
+	 *
+	 * The notice only ever named the child's handle, so attribution relied on a
+	 * guess: a same-named child of another run reads identically. Carrying the
+	 * dispatching run id makes both the body (`Run: <id>`) and the machine
+	 * details answer "whose result is this" without one.
+	 *
+	 * Optional by contract: old records and callers that never had a run id keep
+	 * the exact pre-#414 notice — no line, no `details.runId` key.
+	 */
+	runId?: string;
 	execution: {
 		status: string;
 		reason?: string;
@@ -138,6 +150,8 @@ export interface CompletionDetails {
 	status: CompletionStatus;
 	name: string;
 	agent?: string;
+	/** #414: the run that dispatched this child; absent on a notice that never had one. */
+	runId?: string;
 	execution: {
 		status: string;
 		reason?: string;
@@ -500,6 +514,10 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 				(input.artifactId ? ` · read via ${OUTPUT_TOOL}({ name: ${JSON.stringify(input.name)} })` : "")
 			: undefined;
 	const lines: Array<string | undefined> = [
+		// #414: the dispatching run, when the caller knows it. Same shape as the
+		// grouped notice's header, and absent (not blank) when unknown — the
+		// pre-#414 body stays byte-identical for every old record/caller.
+		input.runId ? `Run: ${sanitizeNoticeField(input.runId)}` : undefined,
 		`Background task ${status}: **${label}**`,
 		"",
 		`execution: ${input.execution.status}${reason}`,
@@ -531,6 +549,7 @@ export function formatCompletionNotice(input: CompletionInput): CompletionNotice
 			status,
 			name: input.name,
 			agent: input.agent,
+			...(input.runId ? { runId: input.runId } : {}),
 			execution: {
 				status: input.execution.status,
 				reason: input.execution.reason,
@@ -693,6 +712,10 @@ export function formatGroupedNotice(
 			// `✓ worker-0, worker-1 · 2 of 2 · 4.5 KB`.
 			name: entries.map((entry) => entry.name).join(", "),
 			execution: { status: `batch ${entries.length}` },
+			// #414: the dispatching run, machine-readable here as well as in the
+			// body's `Run:` line. `sessionFile` keeps its historic value (the run id)
+			// byte for byte — this field is the additive one.
+			...(input.runId ? { runId: input.runId } : {}),
 			sessionFile: input.runId,
 			outputBytes: Buffer.byteLength(preview),
 			// D9: the batch's members' artifact ids, machine-only. Absent — never an

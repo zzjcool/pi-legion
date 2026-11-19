@@ -24,7 +24,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { type HcClient, type HcMethod } from "../../src/hc/client.ts";
-import { TerminalSupervisor, HERDR_SPACE_LABEL, LEGION_HOST_LABEL } from "../../src/supervisor/terminal-supervisor.ts";
+import { TerminalSupervisor, HERDR_SPACE_LABEL, LEGION_HOST_LABEL, LEGION_RUN_LABEL, terminalName } from "../../src/supervisor/terminal-supervisor.ts";
 import {
 	assertLocalWorktree,
 	normalizeHost,
@@ -418,6 +418,55 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		assert.equal(record.remoteDir, remoteDir);
 		assert.equal(record.host, "vps");
 		assert.ok(record.tempDir && !record.tempDir.startsWith(REMOTE_CWD), "the parent temp dir is not migrated");
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#414: a spawn-carried runId names the remote dir, the terminal and the run label", async () => {
+	// The issue's collision: `<mirrorRoot>/no-run/<name>` and `lgl-<name>` are
+	// machine-wide, so two same-named children of different runs share both. The
+	// spawn body is the channel that can carry the dispatching run id (production
+	// builds one supervisor before any run exists); everything below is derived
+	// from that one fact.
+	const h = harness(callerEnv());
+	const target = hostTarget();
+	try {
+		const runId = "r-7c1d2e3f";
+		const input = spawnInput(h.root, { host: "vps", hostTarget: target, runId });
+		const handle = await h.supervisor.spawnChild(input);
+		const remoteDir = remoteDirFor(target, runId, input.name);
+		assert.equal(remoteDir, "/srv/remote/.pi-subagents-mirror/r-7c1d2e3f/root.centurion-0");
+		// Same name, another run → another directory. Neither is the machine-wide
+		// `no-run` segment that made two sessions share one transcript.
+		const otherDir = remoteDirFor(target, "r-9a8b7c6d", input.name);
+		assert.notEqual(remoteDir, otherDir);
+		assert.doesNotMatch(remoteDir, /\/no-run\//);
+		assert.doesNotMatch(otherDir, /\/no-run\//);
+
+		// 1) the directory the launch creates on that machine
+		const mkdir = h.client
+			.paramsFor("machine.exec")
+			.find((params) => Array.isArray(params.argv) && (params.argv as unknown[])[0] === "mkdir");
+		assert.ok(mkdir, "the remote dir must be created");
+		assert.deepEqual(mkdir!.argv, ["mkdir", "-p", remoteDir]);
+
+		// 2) the transcript the child writes lives in it
+		const run = h.client.paramsFor("terminal.run").at(-1)!;
+		const argv = run.argv as string[];
+		assert.equal(argv[argv.indexOf("--session") + 1], `${remoteDir}/session.jsonl`);
+		// The startup probe uses the same argv, so it cannot point somewhere else.
+		const probe = h.client.paramsFor("machine.exec").at(-1)!;
+		assert.match(String(probe.line), new RegExp(`${remoteDir}/session.jsonl`));
+
+		// 3) the terminal name (visible in `hc ls` on that machine) and the label
+		assert.equal(run.name, terminalName(runId, input.name));
+		assert.equal((run.labels as Record<string, string>)[LEGION_RUN_LABEL], runId);
+
+		// 4) the facts come back on the handle/record, so a later process reads them
+		// instead of recomputing a name it might get wrong.
+		assert.equal(handle.remoteDir, remoteDir);
+		assert.equal(handle.remoteTerminal, `vps/${terminalName(runId, input.name)}`);
 	} finally {
 		h.cleanup();
 	}

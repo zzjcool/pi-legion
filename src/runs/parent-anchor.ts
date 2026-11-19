@@ -34,6 +34,8 @@
  * posture `launch-evidence` (#423) took for "did the child ever start".
  */
 
+import type { NestedPathEntry } from "../shared/types.ts";
+
 /** The one anchor terminal a target machine gets, shared by every legion launch. */
 export const ANCHOR_TERMINAL_NAME = "lgl-anchor";
 
@@ -160,4 +162,28 @@ export function parentNoticeLines(name: string, facts: ParentChainFacts): string
 	const host = text(facts.host);
 	if (parent === undefined || host === undefined) return [];
 	return [`  parent=${parent} (target-local address on ${host})`];
+}
+
+/**
+ * #414: the run that dispatched the run whose `run.json` this is — the
+ * initiating run id, read from the record's own lineage.
+ *
+ * The fact is persisted twice on purpose, which is what makes the parent/child
+ * relation walkable in BOTH directions with one file each:
+ *
+ *   - the dispatcher's `run.json` carries it on every child record
+ *     (`ChildRecord.parentRunId`, #409), so parent → children is one read;
+ *   - the child's own `run.json` carries it as the LAST lineage step, because
+ *     the dispatcher appends `{ runId: <its own run id>, agent }` when it creates
+ *     the child's record (`Orchestrator.childPath`), so child → parent needs no
+ *     second file.
+ *
+ * A ROOT run has no lineage (`path: []`): this answers `undefined` rather than
+ * inventing a parent. Legacy/blank steps are treated as "no fact" for the same
+ * reason — a missing run id is not a guess.
+ */
+export function initiatorRunIdOf(record: { path?: readonly NestedPathEntry[] }): string | undefined {
+	const lineage = record.path;
+	if (!Array.isArray(lineage) || lineage.length === 0) return undefined;
+	return text(lineage[lineage.length - 1]?.runId);
 }

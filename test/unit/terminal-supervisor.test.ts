@@ -411,6 +411,63 @@ test("D6: with no runId known the run label is omitted, not invented", async () 
 	}
 });
 
+// ── #414: the run that DISPATCHED this child names it ─────────────────────
+
+test("#414: SpawnInput.runId names the terminal and the legion.run label", async () => {
+	// Production builds ONE supervisor before any run exists, so the fact has to
+	// travel on the spawn. The legacy shape (no runId) is pinned by D6/D7 above.
+	const h = harness();
+	try {
+		const runId = "r-1a2b3c4d";
+		const input = spawnInput(h.root, { runId });
+		await h.supervisor.spawnChild(input);
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal(run.name, terminalName(runId, input.name));
+		assert.match(String(run.name), /^lgl-r-1a2b3c-/);
+		assert.equal((run.labels as Record<string, string>)[LEGION_RUN_LABEL], runId);
+		// The collision the issue measured: SAME child name, DIFFERENT runs. Their
+		// terminal names must differ (the name is unique only per core, and the
+		// handle is unique only per run).
+		assert.notEqual(
+			terminalName("r-1a2b3c4d", "root.worker-0"),
+			terminalName("r-5e6f7a8b", "root.worker-0"),
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#414: the spawn's runId wins over the constructor value (per-spawn fact)", async () => {
+	const h = harness({ runId: "r-constructor" });
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root, { runId: "r-dispatch" }));
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal((run.labels as Record<string, string>)[LEGION_RUN_LABEL], "r-dispatch");
+		assert.match(String(run.name), /^lgl-r-dispat-/);
+		// A spawn that names nothing still gets the constructor fallback — the
+		// pre-#414 seam keeps working for a caller that really owns one run.
+		await h.supervisor.spawnChild(spawnInput(h.root, { name: "root.centurion-1" }));
+		const second = h.client.paramsFor("terminal.run")[1]!;
+		assert.equal((second.labels as Record<string, string>)[LEGION_RUN_LABEL], "r-constructor");
+		assert.match(String(second.name), /^lgl-r-constr-/);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#414: no runId anywhere keeps the legacy shape byte for byte", async () => {
+	const h = harness();
+	try {
+		const input = spawnInput(h.root);
+		await h.supervisor.spawnChild(input);
+		const run = h.client.paramsFor("terminal.run")[0]!;
+		assert.equal(run.name, "lgl-root-centurion-0");
+		assert.equal(LEGION_RUN_LABEL in (run.labels as Record<string, string>), false);
+	} finally {
+		h.cleanup();
+	}
+});
+
 // ── D7: name mapping ──────────────────────────────────────────────────────
 
 test("D7: names are lgl-<runId8>-<handle>, [a-z0-9_-] only, ≤32 chars", () => {

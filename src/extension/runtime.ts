@@ -1771,7 +1771,11 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 		}
 		let notice: CompletionNotice;
 		if (!partial && surviving.length === 1) {
-			notice = formatCompletionNotice(withRenewalProposal(surviving[0]!));
+			// #414: the notice carries the run that dispatched this child (the same
+			// id the grouped shape already prints), so attribution never depends on
+			// the handle alone. It rides beside the entry, not inside it: the
+			// runtime's job table is the authority for this fact.
+			notice = formatCompletionNotice({ ...withRenewalProposal(surviving[0]!), runId: surviving[0]!.runId });
 		} else {
 			// `stillRunning` is derived from the live job table at the moment of
 			// DELIVERY, never stored: a member claimed by `wait`/`collect` while this

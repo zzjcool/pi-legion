@@ -1444,6 +1444,10 @@ export class Orchestrator {
 				if (input.worktreeBranch) child.worktreeBranch = input.worktreeBranch;
 				if (input.worktreeHost) child.worktreeHost = input.worktreeHost;
 				if (input.host) child.host = input.host;
+				// #414: the dispatching run, written from the reservation moment on, so
+				// even a record left behind by a launch killed later still answers
+				// "whose child is this". Same value `recordChild` persists.
+				child.parentRunId = parentRunId;
 			});
 			return false;
 		}
@@ -1461,6 +1465,8 @@ export class Orchestrator {
 			...(input.worktreeBranch ? { worktreeBranch: input.worktreeBranch } : {}),
 			...(input.worktreeHost ? { worktreeHost: input.worktreeHost } : {}),
 			...(input.host ? { host: input.host } : {}),
+			// #414: the reverse-lookup key, present from the first write (see above).
+			parentRunId,
 		});
 		return true;
 	}
@@ -2232,6 +2238,12 @@ export class Orchestrator {
 					agent,
 					sessionFile,
 					tempDir,
+					// #414: the run that dispatched this child travels with the spawn, so
+					// the terminal backend can name the remote dir/terminal after it
+					// instead of falling back to the machine-wide `no-run`/`lgl-<name>`
+					// shape (two same-named children of different runs used to collide).
+					// The same expression `recordChild` persists as `parentRunId`.
+					runId: this.artifactRunId(),
 					// A remote launch starts from THIS machine's checkout: `cwd` is what the
 					// argv path map (`mapRemoteArgPath`) re-roots onto the other machine, and
 					// the backend replaces it with the remote directory before spawning. Using
