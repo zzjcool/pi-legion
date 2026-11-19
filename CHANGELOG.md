@@ -9,7 +9,7 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
-## [Unreleased] — 6.2.4（patch）
+## [6.2.4] — 2026-11-19
 
 6.2.3 真机验证（`docs/reports/release-6.2.3-verification.md` §3.2 / §3.3）暴露的两个遗留。
 报告：`docs/reports/orphan-on-natural-exit.md`。
@@ -2607,7 +2607,8 @@ Earlier 0.11–0.15 history (including the `pi-herdr-swarm` /
 `@zzjcool/pi-herdr-subagents` renames) lives in git tags and older Releases.
 
 [6.2.3]: https://github.com/zzjcool/pi-legion/compare/v6.2.2...v6.2.3
-[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.2.3...HEAD
+[6.2.4]: https://github.com/zzjcool/pi-legion/compare/v6.2.3...v6.2.4
+[Unreleased]: https://github.com/zzjcool/pi-legion/compare/v6.2.4...HEAD
 [6.2.2]: https://github.com/zzjcool/pi-legion/compare/v6.2.1...v6.2.2
 [6.2.1]: https://github.com/zzjcool/pi-legion/compare/v6.2.0...v6.2.1
 [6.0.1]: https://github.com/zzjcool/pi-legion/compare/v6.0.0...v6.0.1
