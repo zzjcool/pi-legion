@@ -645,6 +645,9 @@ container, read-only mount).
 | `PI_LEGION_VERIFY_CONCURRENCY` | 2 | Machine-wide limit on concurrent acceptance / legion-verify commands, using slot lock files. `0` = unlimited. |
 | `PI_LEGION_VERIFY_QUEUE_MAX_MS` | 1800000 | Overall queue-wait cap. After it expires the command runs without a slot. Queue wait does not count toward the command timeout. |
 | `PI_LEGION_VERIFY_LOCK_DIR` | `$TMPDIR/pi-legion-verify-<uid>` | Slot directory. Set it to scope the limit more narrowly. |
+| `PI_LEGION_LIVE_MIRROR` | on | `0`/`off`/`false` disables the cross-machine transcript mirror. The pump copies a remote child's `session.jsonl` into its local `sessionFile` incrementally, which is what makes the panel readable and `quiet` real (#411). When off, `subagent status` prints `mirror=off`. |
+| `PI_LEGION_LIVE_MIRROR_INTERVAL_MS` | 5000 | Mirror cadence (floor 500). |
+| `PI_LEGION_LIVE_MIRROR_MAX_BYTES` | 4194304 | How many trailing bytes of the mirror are kept (floor 4096). The head is trimmed on a line boundary. |
 
 The child restores the host `NODE_OPTIONS` when its extension loads, so bash
 commands it runs (`tsc`, `npm test`) keep the default heap.

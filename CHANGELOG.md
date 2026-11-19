@@ -11,6 +11,30 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased] — 6.2.5（patch）
 
+**`#411`：跨机 child 的 transcript 不再实时镜像。** 跨机 child 的 `sessionFile` 是本机预先创建的
+**空占位文件**，远端写的是另一台机器上的 `<remoteDir>/session.jsonl`，两者之间没有字节搬运 ——
+于是面板永远 `No displayable messages`、`quiet` 恒增长（它 stat 的就是那个空文件）、
+run.json 的 `state` 永远停在 `launching`（`persistParentReservation` 写了 `launching`，
+spawn 成功后没有任何人写回 `working`）。现在 spawn 成功后启动 per-child **镜像泵**：
+按 byte offset 增量追加远端新增字节（`wc -c` + `tail -c +N`），默认 5 s、本地只留末尾 4 MiB、
+远端变小重置 offset 并 warning、单行超窗时窗口增长而不冻死、稳态是 `O_APPEND` 追加（inode 不变，
+既有增量解析缓存不失效）；`collect` 在 `settled` 时做**最终同步**再停泵（带 5 s deadline），
+泵失败只 warn 一次、绝不影响 child；`retire`/`retireAll` 停泵。`quiet` 因此自动变成
+「最后一次真实增量」，并且在第一个增长 tick 把 run.json 的 `launching` 推成 `working`。
+`subagent status` 新增一行 `mirror=ok(<n> bytes)` / `mirror=stale(<n> bytes)` / `mirror=off`。
+`PI_LEGION_LIVE_MIRROR=off` 可关（关闭时不装定时器）。
+报告：`docs/reports/live-mirror.md`。
+
+- **D1：泵写 `child.sessionFile`，不写 `remote/<name>.jsonl`。** 后者是 `sessionFileOf()`
+  优先读的读回镜像，由 `createRemoteSessionReadback` 在 collect 时整段覆盖写；两个文件
+  不同名、不同写者。写 `sessionFile` 让面板、`lastJsonlEventAgeMs`、`progressFromSessionFile`
+  全都不改就能工作。
+- **D2：`index.ts` 的 5 个 `new Orchestrator(...)` 站点各加 `...liveMirrorFrom()`**（与既有
+  `...rpcApproveFrom(settings)` 同型）—— seam 缺席仍然是「没有泵」，但生产必须有人提供它，
+  否则 #411 在真实运行里一个字都不会变（对抗式审查把这点列为 critical）。
+- **D3：变异可红。** 删掉追加 → 7 红；删掉 settle 最终同步 → 2 红；`tail -c` 丢 1-based
+  → 1 红；删掉缩小重置 → 2 红；no-op tick 也重写 → 3 红。
+
 **`#423`：跨机 launch 不再静默变成本地空壳。** launch 现在**必须拿到启动证据**才成功：拿不到远端 terminal
 地址、或窗口内看不到远端 `session.jsonl`（`REMOTE_STARTUP_CONFIRM_MS` 8s → 20s），就是 `START_FAILED`，
 回执带机器名 / cwd / 终端地址 / `hc` 错误原文 / **该终端最后 6 行原文**；失败的 launch 不留下任何 `working`
@@ -24,8 +48,8 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 （`(child, kind, windowBase, thresholdMs, tier)`，`tier = floor(elapsed / thresholdMs)`）：
 同一条阈值线无论检查多少次都只 1 封，越过下一条线才再发一封；`extend` 把基准前移到
 `now` 并清空 L2 的已通知阶梯，下一封在 `now + loopRadiusMs`（整条阈值重新起算）。
-报告：`docs/reports/stall-notice-dedupe.md`。本轮**只做第 1 层**，第 2/3 层（跨机
-child 的 quiet 判据、#411 镜像）不在本 PR。
+报告：`docs/reports/stall-notice-dedupe.md`。本轮**只做第 1 层**；第 2 层（跨机 child 的
+quiet 判据）已由 #411 补齐输入，第 3 层不在本 PR。
 
 `status` 的归属事实：遗留行不再猜 age，也不再只说「有个叫 X 的东西在远端」。
 报告：`docs/reports/status-attribution.md`。本轮范围**只含 D1/D4/D5-rendering**，
@@ -33,7 +57,7 @@ child 的 quiet 判据、#411 镜像）不在本 PR。
 `docs/reports/leftover-visibility.md`）、#408（14 天 retention 删归属证据，本版已修，见
 `docs/reports/retention-keeps-attribution.md`）、
 #409（anchor / where 归属）、#410（spawn cwd 误报成程序不存在）、
-#411（跨机 transcript 实时镜像）。
+#411（跨机 transcript 实时镜像，本版已修，见 `docs/reports/live-mirror.md`）。
 
 - **D1：`<N> old` 改用 `createdAt`。** `updatedAt` 会被 hygiene 的 `markAbandoned`
   每次 sweep 改写，于是搁置一周的遗留显示「2m old」—— age 是假的。现在 age 取

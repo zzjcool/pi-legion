@@ -115,6 +115,15 @@ import {
 	type LiveMirrorFacts,
 } from "./live-mirror.ts";
 
+/**
+ * How long `collect`'s final mirror sync may spend before it is abandoned (#411).
+ *
+ * A settle is on the parent's critical path. The mirror is a convenience; a machine
+ * that answers in 30 s per round trip must not be able to turn "the child finished"
+ * into "the child is still collecting".
+ */
+export const LIVE_MIRROR_FINAL_SYNC_MS = 5_000;
+
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
 	reason: string;
@@ -157,7 +166,8 @@ export interface OrchestratorLegionContext {
 export interface LiveMirrorHandle {
 	start(): void;
 	stop(): void;
-	syncNow(): Promise<unknown>;
+	/** `deadlineMs` bounds the round trips a final sync may spend. */
+	syncNow(opts?: { deadlineMs?: number }): Promise<unknown>;
 	facts(): LiveMirrorFacts;
 }
 
@@ -180,17 +190,13 @@ export interface LiveMirrorSeam {
 	config?: Partial<LiveMirrorConfig>;
 	/** The env the config is resolved against (absent = `process.env`). */
 	env?: Record<string, string | undefined>;
-	/** Test seam; production = `new LiveMirror({...})` with a `createLiveMirrorRemote` remote. */
-	create?: (request: LiveMirrorRequest) => LiveMirrorHandle | undefined;
 	/**
-	 * The SAME seam under the name the frozen contract (§3) gives it.
+	 * Test seam; production is `new LiveMirror({...})` over a `createLiveMirrorRemote`.
 	 *
-	 * The contract text and this layer's task sheet spell this field differently
-	 * (`factory` there, `create` here) and both are frozen, so both are honoured:
-	 * either one replaces the production pump, and passing both is a programming
-	 * error the first one wins over.
+	 * ONE name for this seam: an alias would make two spellings of the same
+	 * freedom, and a caller that passed both would have to guess which one won.
 	 */
-	factory?: (request: LiveMirrorRequest) => LiveMirrorHandle | undefined;
+	create?: (request: LiveMirrorRequest) => LiveMirrorHandle | undefined;
 	/** One warning sink; absent = one `[pi-legion]` line on stderr. Never throws. */
 	warn?: (message: string) => void;
 }
@@ -1128,7 +1134,7 @@ export class Orchestrator {
 			void this.promoteLiveChild(child.name).catch(() => undefined);
 		};
 		const request: LiveMirrorRequest = { child, localPath, onGrowth };
-		const seam = deps.create ?? deps.factory;
+		const seam = deps.create;
 		if (seam) return seam(request);
 		const config = resolveLiveMirrorConfig({ env: this.liveMirrorEnv, overrides: this.liveMirrorConfig });
 		const warn = (message: string): void => this.warnLiveMirror(message);
@@ -1204,10 +1210,26 @@ export class Orchestrator {
 	private async finalSyncLiveMirror(child: ChildRecord, opts?: { stop?: boolean }): Promise<void> {
 		const entry = this.liveMirrors.get(child.name);
 		if (entry === undefined) return;
+		// BOUNDED, and bounded twice. `deadlineMs` stops the read loop at a wall clock,
+		// and the race stops the AWAIT even when one `hc` round trip hangs — a settle is
+		// on `collect`'s critical path, and "the mirror is behind" must never present
+		// itself to the parent as "the child is still collecting". The abandoned tick is
+		// harmless: `stop()` flips the pump's `stopped` flag, so it writes nothing more.
+		const deadlineMs = LIVE_MIRROR_FINAL_SYNC_MS;
+		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
-			await entry.syncNow();
+			await Promise.race([
+				Promise.resolve(entry.syncNow({ deadlineMs })).then(() => undefined),
+				new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, deadlineMs * 2);
+					const unrefable = timer as unknown as { unref?: () => void };
+					if (typeof unrefable.unref === "function") unrefable.unref();
+				}),
+			]);
 		} catch (error) {
 			this.warnLiveMirror(`live mirror final sync for '${child.name}' failed: ${messageOf(error)}`);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
 		}
 		if (opts?.stop === true) this.stopLiveMirror(child.name);
 	}
@@ -3600,9 +3622,9 @@ export class Orchestrator {
 		}
 		if (wait === "blocked") return this.blockedResult(child);
 		// #411: the turn is over, so the remote transcript will never grow again. One
-		// last fetch into `child.sessionFile`, then the pump is retired — placed BEFORE
-		// the read-back refresh so that refresh reads a file this machine just brought
-		// up to date.
+		// last fetch into `child.sessionFile`, then the pump is retired. The deadline
+		// keeps a half-dead machine from holding this collect open (see
+		// `finalSyncLiveMirror`).
 		if (wait === "settled") await this.finalSyncLiveMirror(child, { stop: true });
 		// xm-dispatch D3.1: the verdict about to be derived must describe the transcript
 		// as it is NOW. Everything above only ever read the launch-time snapshot, which

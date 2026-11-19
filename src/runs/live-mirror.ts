@@ -14,23 +14,34 @@
  *     mirror has consumed". It is independent of the local byte count: the cap
  *     drops bytes from the head of the mirror, and that must not make the pump
  *     re-read the remote from zero.
- *   - **Atomic visible writes.** Every local write is `<target>.<pid>-<n>.tmp` in
- *     the SAME directory, then `renameSync`. A concurrent reader sees the old
- *     length or the new one, never a half-written line.
+ *   - **Incremental appends, atomic where it matters.** The steady state is ONE
+ *     `O_APPEND` write of exactly the new bytes: the inode does NOT change, so the
+ *     repository's incremental parser (`sessionFileStillValid`, keyed on
+ *     `dev`/`ino`, and `parseSessionFileCached`, keyed on size+mtime) keeps its
+ *     cache — replacing the file every tick made every consumer re-parse up to
+ *     `maxBytes` every 5 s. An append can only ever expose a torn LAST line,
+ *     which is the property a live local child's own transcript already has and
+ *     `parseSessionFile` already drops (#36). The stricter `<target>.<pid>-<n>.tmp`
+ *     + `renameSync` replace is kept where a rewrite is unavoidable: the cap trim
+ *     and the shrink reset.
  *   - **Complete lines only.** Bytes after the last `\n` of what was read are NOT
  *     written; they are read again on the next tick, once the newline exists. The
- *     local file therefore always ends on a complete line, which is what a JSONL
- *     reader needs to make progress.
+ *     local file therefore ends on a complete line, which is what a JSONL reader
+ *     needs to make progress.
  *   - **The pump can never hurt the child.** `syncNow()` swallows everything: a
  *     dead connection, a missing remote command, a full disk. It records the
  *     message in `facts().error` and tails off; it never throws into `launch`,
  *     `collect` or a status render. The same text is warned once, not every tick.
+ *     Ticks are SERIALISED (a periodic tick and a settle's final sync must never
+ *     share one offset) and a final sync carries a deadline, so a half-dead
+ *     machine cannot hold a `collect` open.
  *
- * One known limitation, deliberately inside the contract rather than around it:
- * a single remote line longer than `chunkBytes` (default 256 KiB) cannot be
- * committed while it has no newline, so the mirror waits for that line to
- * complete. That is invariant 7 taken literally; the alternative (writing a
- * partial line) breaks the reader.
+ * One row size the design has to bend for: a single remote line longer than the
+ * read window. Invariant 7 taken literally would say "wait for the newline", and
+ * for a row longer than `chunkBytes` that wait never ends — a real transcript has
+ * 256 KiB+ rows (a giant tool result), so the pump GROWS the window instead, up to
+ * `maxBytes`. Only a row bigger than the mirror's own cap is written torn, because
+ * refusing it would mean never mirroring anything again.
  */
 
 import { Buffer } from "node:buffer";
@@ -215,6 +226,8 @@ export function createLiveMirrorRemote(opts: {
 	// cannot race a second connection into existence.
 	let client: HcClient | undefined;
 	let started: Promise<void> | undefined;
+	/** Last size this reader ever saw; see the `code !== 0` rule inside `size()`. */
+	let lastSeen = 0;
 	const connected = async (): Promise<HcClient> => {
 		if (!client) {
 			client = opts.clientFactory ? opts.clientFactory() : hcCliClient({ env: process.env });
@@ -234,11 +247,23 @@ export function createLiveMirrorRemote(opts: {
 				argv: ["wc", "-c", remotePath],
 				timeout: timeoutS,
 			});
-			if (result?.code !== 0) return undefined; // `wc` failed ⇒ the file is not there yet.
+			if (result?.code !== 0) {
+				// `wc` failing is "that file is not there yet" only BEFORE it has ever been
+				// seen. After a success the same answer means the transcript went away (or the
+				// command itself failed); turning that into `undefined` would report
+				// `mirror=ok(0 bytes)` while nothing is being mirrored — the exact "looks fine,
+				// is not" shape this marker exists to remove.
+				if (lastSeen > 0) {
+					throw new Error(`wc -c ${remotePath} exited ${result?.code === undefined ? "without a status" : result.code}`);
+				}
+				return undefined; // `wc` failed ⇒ the file is not there yet.
+			}
 			const text = execResultText({ stdout: result?.stdout });
 			const token = text.split(/\s+/)[0] ?? "";
 			const value = Number.parseInt(token, 10);
-			return Number.isFinite(value) && value >= 0 ? value : undefined;
+			if (!Number.isFinite(value) || value < 0) return undefined;
+			lastSeen = value;
+			return value;
 		},
 		async read(from: number, max: number): Promise<Buffer> {
 			const active = await connected();
@@ -335,6 +360,17 @@ export class LiveMirror {
 	private timer: ReturnType<typeof setInterval> | undefined;
 	private runningFlag = false;
 	private closed = false;
+	/** Tail of the tick chain: one tick at a time (see {@link syncNow}). */
+	private chain: Promise<unknown> = Promise.resolve();
+	/** Set by {@link stop}: a tick already in flight writes nothing more. */
+	private stopped = false;
+	/**
+	 * The next commit must REPLACE the file instead of appending to it.
+	 *
+	 * True after a shrink reset: the local file still holds the previous (longer)
+	 * transcript, so appending the new one would interleave two sessions.
+	 */
+	private replaceNext = false;
 	/** Distinct warning texts already emitted (invariant: no retry storm). */
 	private readonly warned = new Set<string>();
 
@@ -403,10 +439,28 @@ export class LiveMirror {
 	 * one try/catch, because this runs inside a launch and inside a collect: an
 	 * exception here would turn a readable child into a failed run.
 	 */
-	async syncNow(): Promise<LiveMirrorFacts> {
+	async syncNow(opts: { deadlineMs?: number } = {}): Promise<LiveMirrorFacts> {
+		// SERIALISED. A periodic tick and a settle's final sync can overlap — the
+		// interval does not pause for a caller — and two ticks sharing one `offset`
+		// would append the same bytes twice and then read the over-run as "the remote
+		// shrank", i.e. reset a healthy transcript on itself. Chaining makes the second
+		// caller wait its turn instead.
+		const run = this.chain.then(
+			() => this.tick(opts),
+			() => this.tick(opts),
+		);
+		this.chain = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	}
+
+	/** One serialised tick. Never rejects; `opts.deadlineMs` bounds the round trips. */
+	private async tick(opts: { deadlineMs?: number }): Promise<LiveMirrorFacts> {
 		this.grew = false;
 		try {
-			await this.pump();
+			await this.pump(opts.deadlineMs === undefined ? undefined : this.clock() + Math.max(1, opts.deadlineMs));
 			this.error = undefined;
 		} catch (error) {
 			this.error = errorText(error);
@@ -436,6 +490,18 @@ export class LiveMirror {
 	start(): void {
 		if (this.runningFlag) return;
 		this.runningFlag = true;
+		if (this.remote === undefined) {
+			// `mode: "off"`: the ONE thing a disabled pump still owes the UI is the facts
+			// row that says so. Written once here, and no timer is scheduled at all — a
+			// disabled feature must not tick every interval forever just to rewrite one
+			// unchanged line.
+			try {
+				this.persist();
+			} catch {
+				/* diagnostics only, exactly like a tick */
+			}
+			return;
+		}
 		const timer = setInterval(() => {
 			// `syncNow()` never rejects; `void` keeps a lint honest about that.
 			void this.syncNow();
@@ -458,6 +524,10 @@ export class LiveMirror {
 			this.timer = undefined;
 		}
 		this.runningFlag = false;
+		// A tick may still be in flight (`clearInterval` cannot cancel an awaited
+		// `hc` round trip). `stopped` is what makes "stop means stop": the in-flight
+		// tick finishes its bookkeeping but writes nothing more.
+		this.stopped = true;
 		if (this.closed) return;
 		this.closed = true;
 		try {
@@ -469,8 +539,8 @@ export class LiveMirror {
 
 	// ── internals ────────────────────────────────────────────────────────
 
-	/** One remote read pass. Throws on transport failure; `syncNow` contains it. */
-	private async pump(): Promise<void> {
+	/** One remote read pass. Throws on transport failure; `tick` contains it. */
+	private async pump(deadline?: number): Promise<void> {
 		const remote = this.remote;
 		if (!remote) return; // mode "off": no network, by definition
 
@@ -496,6 +566,7 @@ export class LiveMirror {
 			const previous = this.offset;
 			this.offset = 0;
 			this.held = Buffer.alloc(0);
+			this.replaceNext = true;
 			this.warnOnce(
 				`live mirror ${this.localPath}: the remote transcript shrank (${remoteBytes} bytes, mirror had consumed ${previous}); restarting from the remote's first byte`,
 			);
@@ -515,8 +586,20 @@ export class LiveMirror {
 		// Per-tick read budget: a machine that produced 100 MB while we were away must
 		// not turn one tick into 400 round trips. The default is 16 × chunkBytes.
 		let budget = Math.max(this.chunkBytes, this.maxBytes);
+		/**
+		 * Window size for the NEXT read.
+		 *
+		 * Normally one `chunkBytes`. It GROWS when a window came back with no newline at
+		 * all, because that answer means "a single remote line is longer than this
+		 * window" — not "wait for more". A real transcript contains 256 KiB+ rows (a
+		 * giant tool result), so shrinking back and retrying at the same size would stall
+		 * the pump at `offset` forever, silently, which is worse than the torn line this
+		 * invariant exists to avoid.
+		 */
+		let window = this.chunkBytes;
 		while (this.offset < remoteBytes && budget > 0) {
-			const want = Math.min(this.chunkBytes, remoteBytes - this.offset);
+			if (deadline !== undefined && this.clock() >= deadline) break;
+			const want = Math.min(window, remoteBytes - this.offset);
 			if (want <= 0) break;
 			let chunk: Buffer;
 			try {
@@ -530,9 +613,24 @@ export class LiveMirror {
 			const lineEnd = bounded.lastIndexOf(NEWLINE);
 			if (lineEnd < 0) {
 				// Invariant 7: not one byte of a partial line is written. The offset stays
-				// put, so the next tick re-reads these bytes together with the newline that
-				// is still to come.
-				break;
+				// put, so the next attempt re-reads these bytes together with the newline
+				// that is still to come.
+				if (bounded.length >= this.maxBytes) {
+					// The row is bigger than the mirror's own cap. Refusing it would mean never
+					// mirroring anything again, so the cap wins over the line boundary: the
+					// bytes are kept (torn) and the rest of the row joins them next time.
+					try {
+						this.commit(bounded);
+					} catch (error) {
+						throw new Error(`local write ${this.localPath} failed: ${errorText(error)}`);
+					}
+					this.offset += bounded.length;
+					window = this.chunkBytes;
+					continue;
+				}
+				if (bounded.length < want) break; // short read: the row is still being written
+				window = Math.min(this.maxBytes, Math.max(window * 2, bounded.length * 2));
+				continue;
 			}
 			const usable = bounded.subarray(0, lineEnd + 1);
 			try {
@@ -541,6 +639,7 @@ export class LiveMirror {
 				throw new Error(`local write ${this.localPath} failed: ${errorText(error)}`);
 			}
 			this.offset += usable.length;
+			window = this.chunkBytes;
 			// A short read is the core's own word for "end of file" (it may also have
 			// capped its capture at ~1 MiB): stop asking this tick.
 			if (bounded.length < want) break;
@@ -548,8 +647,8 @@ export class LiveMirror {
 	}
 
 	/**
-	 * Append to the in-memory mirror, trim the head when the cap is exceeded, and
-	 * replace the visible file atomically.
+	 * Append to the in-memory mirror, trim the head when the cap is exceeded, and land
+	 * it on disk.
 	 *
 	 * Transactional on purpose: the new buffer is built, WRITTEN, and only then adopted.
 	 * Adopting first and writing second would leave the in-memory mirror holding bytes
@@ -557,17 +656,45 @@ export class LiveMirror {
 	 * the next successful tick would append them a second time.
 	 */
 	private commit(bytes: Buffer): void {
-		if (bytes.length === 0) return;
+		if (bytes.length === 0 || this.stopped) return;
 		const joined = this.held.length === 0 ? Buffer.from(bytes) : Buffer.concat([this.held, bytes]);
-		const next = joined.length > this.maxBytes ? trimToLineBoundaryTail(joined, this.maxBytes) : joined;
-		this.writeLocalAtomic(next);
-		this.held = next;
+		if (this.replaceNext || joined.length > this.maxBytes) {
+			const next = joined.length > this.maxBytes ? trimToLineBoundaryTail(joined, this.maxBytes) : joined;
+			this.writeLocalAtomic(next);
+			this.held = next;
+			this.replaceNext = false;
+		} else {
+			this.appendLocal(bytes);
+			this.held = joined;
+		}
 		this.lastGrowthAt = this.clock();
 		this.grew = true;
 	}
 
+	/**
+	 * The steady-state write: ONE `O_APPEND` write of the new bytes, so the inode does
+	 * not change.
+	 *
+	 * Inode stability is not cosmetic. `session.ts`'s incremental parser keys its cache
+	 * on `(size, mtimeMs)` and treats a changed `dev`/`ino` as "the file was rewritten"
+	 * (`sessionFileStillValid`): replacing the file every 5 s made every consumer — the
+	 * panel's `progressFromSessionFile` included — re-parse the whole mirror (up to
+	 * `maxBytes`) on every tick. Appending keeps that cache warm.
+	 *
+	 * `O_APPEND` + one `write(2)` also means no other writer can interleave and a reader
+	 * can only ever see a torn LAST line — exactly the property a live local child's own
+	 * transcript has, which `parseSessionFile` already drops (#36). The stricter
+	 * "replace, never append" rule is kept where it is actually needed: the cap trim and
+	 * the shrink reset replace the file ({@link writeLocalAtomic}).
+	 */
+	private appendLocal(bytes: Buffer): void {
+		fs.mkdirSync(path.dirname(this.localPath), { recursive: true });
+		fs.appendFileSync(this.localPath, bytes, { mode: 0o600 });
+	}
+
 	/** Invariant 6: temp file in the same directory, then `renameSync`. */
 	private writeLocalAtomic(content: Buffer): void {
+		if (this.stopped) return;
 		const dir = path.dirname(this.localPath);
 		fs.mkdirSync(dir, { recursive: true });
 		const temp = tempPathFor(this.localPath);
@@ -575,9 +702,8 @@ export class LiveMirror {
 			fs.writeFileSync(temp, content, { mode: 0o600 });
 			fs.renameSync(temp, this.localPath);
 		} catch (error) {
-			// A temp file is not a mirror: leaving one behind would litter the run dir (and
-			// a reader that globs `*.jsonl*` could pick it up). Cleanup is best-effort; the
-			// original failure is what the caller must see.
+			// A temp file is not a mirror: leaving one behind would litter the run dir.
+			// Cleanup is best-effort; the original failure is what the caller must see.
 			try {
 				fs.rmSync(temp, { force: true });
 			} catch {
@@ -607,7 +733,7 @@ export class LiveMirror {
 
 	/** Write the facts row (temp + rename, so a reader never parses half a JSON). */
 	private persist(): void {
-		if (this.statePath === false) return;
+		if (this.statePath === false || this.stopped) return;
 		fs.mkdirSync(path.dirname(this.statePath), { recursive: true });
 		const temp = tempPathFor(this.statePath);
 		try {
