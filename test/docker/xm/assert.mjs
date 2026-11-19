@@ -3,7 +3,7 @@
 // v1.1 — the deterministic driver — plus the zero-config / product-gap ruling).
 //
 //   cd test/docker && make xm            # Run A (zero-config) + Run B (hosts entry)
-//   cd test/docker && make xm-model      # XM_SCENARIO=model-missing (§5.4)
+//   cd test/docker && make xm-model      # §5.4 target-model fallback (6.2.2): m1..m4
 //   cd test/docker && make xm-real       # optional real-model pass (never a gate)
 //
 // TWO passes, one command:
@@ -23,6 +23,9 @@
 //           remote collect finishes with a VERDICT: read-back line for that host,
 //           `execution:` line, the child's own text, and no worktree-ownership
 //           refusal (D13 guards local git/fs operations, never the delivery).
+//           x0 (both runs) the parent `pi --print` exits ON ITS OWN: a killed parent
+//           is a failure, because a ref'd handle that survives session_shutdown is
+//           exactly the headless hang this harness used to work around.
 //
 // Every fact comes from `docker exec` on the two containers. Nothing is loosened: a
 // missing piece of evidence is a FAIL; an environment that cannot host the run is a
@@ -49,6 +52,7 @@ import {
 	readContainerFile,
 	readRemoteFile,
 	readRunJson,
+	remoteLastAssistantModel,
 	remoteLastAssistantText,
 	remoteWorktreeList,
 	runIds,
@@ -85,9 +89,12 @@ const PROMPT = {
 		`Use the subagent tool exactly once: subagent({ agent: "centurion", host: "no-such-machine", hostCwd: ${JSON.stringify(XM_ENV.hostCwd)}, task: "probe" }).`,
 		"Then reply with the tool result text verbatim and stop. Do not retry and do not fall back to a local run.",
 	].join("\n"),
+	// A real model: dispatch the model this machine serves, then report what the launch
+	// did. 6.2.2 answers with a fallback + warning instead of a refusal, so the prompt
+	// must not demand a refusal any more.
 	modelMissing: [
 		`Use the subagent tool exactly once: subagent({ agent: "centurion", host: ${JSON.stringify(XM_ENV.host)}, hostCwd: ${JSON.stringify(XM_ENV.hostCwd)}, model: ${JSON.stringify(XM_ENV.mockModel)}, task: "probe" }).`,
-		"Then reply with the tool result text verbatim and stop. Do not retry and do not fall back to a local run.",
+		"Then reply with the tool result text verbatim and stop. Do not retry, and do not fall back to a local run.",
 	].join("\n"),
 };
 
@@ -745,9 +752,9 @@ async function runLaunchScenario() {
 	await assertMachineList();
 	const passA = await launchPass({ label: "launch-a", childName: "centurion-0", nonceValue: nonceA });
 	assertLaunchSucceeded(passA);
-	assertParentExitsOnItsOwn(passA);
 	assertRemoteArtifact("c", passA);
 	assertZeroConfigCollect(passA);
+	assertParentExitsOnItsOwn(passA);
 
 	// ── Run B: the supported shape (`hosts.remote` present) ─────────────
 	print(`XM_SETTINGS ${applySettingsMode("host-entry")}`);
@@ -764,82 +771,153 @@ async function runLaunchScenario() {
 	};
 }
 
-// ──────────────────────────────────────────────── model-missing scenario (§5.4)
+// ────────────────────────────────────── target-model fallback scenario (§5.4, 6.2.2)
 
+/**
+ * The 6.2.2 shape of §5.4: a model the target machine does not serve is no longer a
+ * dead end — the launch falls back to a model THAT machine lists, warns once, and the
+ * child really runs with the substituted model. These four assertions replace the
+ * pre-6.2.2 "must be refused" trio (which went red exactly as designed when 567417a
+ * landed).
+ *
+ * Determinism (why the topology looks the way it does): the remote's models.json has
+ * NO `xm` provider and lists exactly ONE row, `xmock/other`, served by mock port 8766
+ * — see `xm-up.sh`. A known provider with a missing id is not a refusal (pi says
+ * "Using custom model id"), and with several rows `planRemoteModelFallback` would pick
+ * the first one — which would be a real host model.
+ */
 async function runModelMissingScenario() {
 	print(`XM_SETTINGS ${applySettingsMode("zero-config")}`);
-	const worktreesBefore = remoteWorktreeList();
 	const nonceValue = nonce();
-	installScenarios(scenarioDir(), nonceValue, { childName: "centurion-0" });
-	await ensureMocks([{ port: MOCK_PORTS.parent, scriptName: "model-missing.json" }]);
+	const childName = "centurion-0";
+	installScenarios(scenarioDir(), nonceValue, { childName });
+	await ensureMocks([
+		{ port: MOCK_PORTS.parent, scriptName: "model-missing.json" },
+		{ port: MOCK_PORTS.child, scriptName: "child.json" },
+	]);
 
-	// What the remote machine really serves — the listing the refusal must quote.
+	// What the remote machine really serves — both the absence and the fallback row.
 	const remoteList = remoteModels();
-	// `pi --list-models` prints `provider  model  …`, and the refusal quotes the same
-	// rows as `provider/model` (src/shared/list-models.ts). Both spellings are handled.
-	const remoteModelIds = remoteList
+	const remoteRows = remoteList
 		.split("\n")
 		.slice(1)
-		.map((line) => line.trim().split(/\s+/).slice(0, 2).join("/"))
-		.filter((id) => id.includes("/"));
+		.map((line) => line.trim().split(/\s+/))
+		.filter((columns) => columns.length >= 2 && columns[0] !== "provider");
 	const [mockProvider, ...mockRest] = XM_ENV.mockModel.split("/");
 	const mockModelId = mockRest.join("/");
+	const [fallbackProvider, ...fallbackRest] = XM_ENV.fallbackModel.split("/");
+	const fallbackModelId = fallbackRest.join("/");
 
 	assertThat("m1", "remote-model-absent", () => {
-		const listed = remoteList
-			.split("\n")
-			.some((line) => {
-				const columns = line.trim().split(/\s+/);
-				return columns[0] === mockProvider && columns[1] === mockModelId;
-			});
+		const hasRequested = remoteRows.some((c) => c[0] === mockProvider && c[1] === mockModelId);
+		const hasFallback = remoteRows.some((c) => c[0] === fallbackProvider && c[1] === fallbackModelId);
 		return {
-			ok: !listed,
-			evidence: { mock_model: XM_ENV.mockModel, remote_models: remoteList, remote_model_ids: remoteModelIds },
+			ok: !hasRequested && hasFallback,
+			evidence: {
+				requested: XM_ENV.mockModel,
+				fallback: XM_ENV.fallbackModel,
+				remote_rows: remoteRows.map((c) => `${c[0]}/${c[1]}`),
+				remote_models: remoteList,
+			},
 		};
 	});
 
+	const worktreesBefore = remoteWorktreeList();
 	const before = new Set(runIds());
 	const step = await runParentStep("model", {
 		model: MODEL,
 		prompt: PROMPT.modelMissing,
-		budgetMs: 240_000,
+		budgetMs: 300_000,
 		sentinel: "MODEL_TOOL_RESULT",
 	});
 	const tool = stepToolResults(step);
-	const toolResult = lastSubagentResult(tool.results);
-	const text = toolResult?.text ?? `${step.output}\n${step.raw}`;
 	const run = findStepRun(before, tool.sessionPath);
+	if (run === undefined) {
+		failHard("model-missing: the run for this pi session could not be identified unambiguously", {
+			session: tool.sessionPath,
+			candidates: runCandidates(before),
+			pi_output: `${step.output}\n${step.raw}`.slice(-4000),
+		});
+	}
+	const childRecord = run.children.find((entry) => entry?.host === XM_ENV.host) ?? run.children[0];
+	const child = childRecord?.name;
+	const launchResult = tool.results.find((entry) => entry.toolName === "subagent");
+	const launchText = launchResult?.text ?? "";
 
-	assertThat("m2", "model-missing-refusal", () => {
-		const classOk = /is not visible there|model-missing/i.test(text);
-		const listedSomeRemoteModel = remoteModelIds.some((id) => text.includes(id));
-		// F11: "no child was created" only means something about the run we actually
-		// identified; an unidentified run must not pass this by default.
-		const notCreated = run !== undefined && run.children.length === 0;
+	assertThat("m2", "fallback-warning", () => {
+		// Three semantic pieces, and the text of each is the PRODUCT's (remote.ts:997-1004),
+		// not invented here: what was asked for, what was substituted, and where to pin it.
+		const expected = [
+			`model '${XM_ENV.mockModel}' is not visible there`,
+			`using '${XM_ENV.fallbackModel}' from that machine's listing`,
+			`subagents.crossMachine.hosts.${XM_ENV.host}.model`,
+		];
+		const missing = expected.filter((needle) => !launchText.includes(needle));
+		const launched = launchResult !== undefined && launchResult.isError !== true && !launchText.includes("INVALID_PARAMS");
+		const childOnHost = run.children.some((entry) => entry?.host === XM_ENV.host);
 		return {
-			ok: classOk && listedSomeRemoteModel && notCreated,
+			ok: missing.length === 0 && launched && childOnHost,
 			evidence: {
-				run_found: run !== undefined,
-				candidates: run === undefined ? runCandidates(before) : undefined,
-				class_marker: classOk,
-				remote_models_quoted: listedSomeRemoteModel,
-				local_children_created: run?.children.length ?? 0,
-				remote_model_ids: remoteModelIds,
-				tool_result: text.slice(0, 2500),
+				missing_substrings: missing,
+				launch_tool_is_error: launchResult?.isError ?? null,
+				child_on_host: childOnHost,
+				launch_tool_result: launchText.slice(0, 1500),
 				session: tool.sessionPath,
 			},
 		};
 	});
 
-	assertThat("m3", "no-remote-worktree", () => {
+	assertThat("m3", "fallback-is-real", () => {
+		const facts = worktreeFacts(child);
+		const sessionModel = remoteLastAssistantModel(child);
+		const runModel = childRecord?.model;
+		// The child's own transcript is the proof: it records the endpoint it called.
+		const sessionOk = sessionModel.provider === fallbackProvider && sessionModel.model === fallbackModelId;
+		// `run.json`'s child record keeps the REQUESTED model (`xm/flash`), measured on
+		// 6.2.2 — the resolved one lives in the child's argv/transcript. So the gate is
+		// the transcript, and the record is printed as the "what was asked" contrast.
 		const worktreesAfter = remoteWorktreeList();
 		const added = worktreesAfter.text
 			.split("\n")
 			.filter((line) => line.trim().length > 0 && !worktreesBefore.text.includes(line.trim()));
-		return { ok: added.length === 0, evidence: { added, worktrees_after: worktreesAfter.text } };
+		// "New" is about THIS child's path, not about every line that moved: the shared
+		// /root/work checkout can re-render (e.g. its branch annotation) during a run.
+		const worktreeIsNew = !worktreesBefore.text.includes(facts.worktreePath);
+		return {
+			ok: sessionOk && facts.line !== undefined && facts.branchOk && worktreeIsNew,
+			evidence: {
+				child,
+				expected_fallback: XM_ENV.fallbackModel,
+				session_provider: sessionModel.provider,
+				session_model: sessionModel.model,
+				session_source: sessionModel.source,
+				run_json_child_model: runModel,
+				run_json_child_model_is_requested: runModel === XM_ENV.mockModel,
+				worktree_is_new: worktreeIsNew,
+				worktree_path: facts.worktreePath,
+				branch: facts.branch,
+				branch_ok: facts.branchOk,
+				new_remote_worktrees: added,
+				nonce: nonceValue,
+			},
+		};
 	});
 
-	return { runId: run?.runId ?? "none", child: "none" };
+	assertThat("m4", "no-local-fallback", () => {
+		const children = Array.isArray(run.children) ? run.children : [];
+		const localChildren = children.filter((entry) => !entry?.host);
+		const remoteChildren = children.filter((entry) => entry?.host === XM_ENV.host);
+		return {
+			ok: localChildren.length === 0 && remoteChildren.length === 1,
+			evidence: {
+				children: children.map((entry) => ({ name: entry?.name, host: entry?.host, model: entry?.model })),
+				local_children: localChildren.length,
+				remote_children: remoteChildren.length,
+			},
+		};
+	});
+
+	return { runId: run.runId, child: child ?? "none" };
 }
 
 // ─────────────────────────────────────────────────────────────────────── main

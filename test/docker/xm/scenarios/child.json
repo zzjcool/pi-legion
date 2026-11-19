@@ -3,6 +3,10 @@
     {
       "id": "flash",
       "name": "XM Flash"
+    },
+    {
+      "id": "other",
+      "name": "XM Other"
     }
   ],
   "rules": [
