@@ -76,11 +76,47 @@ function describeExtensionError(error: unknown): string {
 }
 
 /**
+ * The host's skipped-`turn_end` record, and why it is a SKIP rather than a failure (#415).
+ *
+ * `_dispatchTurnEndBoundary` (`pi-coding-agent/dist/core/agent-session.js`) resolves the
+ * turn's assistant message to a persisted session entry first, and when there is none it
+ * emits an `onError` record attributed to a pseudo-extension literally named `<boundary>`.
+ * That situation is expected, not exceptional: a turn ended after `dispose()` aborted it,
+ * or after compaction collapsed the branch, or after a fork left the message behind — the
+ * message simply has no entry. The host then returns without running ANY `turn_end`
+ * handler, so no extension misbehaved; calling it an "extension error" aims every reader
+ * at the wrong owner.
+ *
+ * Legion cannot close this the #383 way (unregister our own `turn_end`): `hasHandlers`
+ * covers the whole extension set, and a sibling package (pi-async) registers that handler
+ * to flush its steer queue. So the degradation lives here, at the sink that prints it.
+ */
+const BOUNDARY_PSEUDO_EXTENSION = "<boundary>";
+const TURN_END_MISSING_ENTRY = "turn_end could not resolve the persisted assistant entry ID";
+
+/**
+ * Recognize the host's skipped-`turn_end` record; `undefined` for everything else.
+ *
+ * Exact on all three fields on purpose. A broader match (message substring, or path
+ * alone) would swallow real extension failures that merely mention `turn_end`, and a
+ * looser one would drift from the host's wording without a test going red.
+ */
+function skippedTurnEndBoundary(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null) return undefined;
+	const record = error as { extensionPath?: unknown; event?: unknown; error?: unknown };
+	if (record.extensionPath !== BOUNDARY_PSEUDO_EXTENSION) return undefined;
+	if (record.event !== "turn_end") return undefined;
+	if (record.error !== TURN_END_MISSING_ENTRY) return undefined;
+	return TURN_END_MISSING_ENTRY;
+}
+
+/**
  * Emit `session_start` exactly once for an in-process child session.
  *
  * `name` is optional and only labels the warn line (the contract's D3 message is
  * `[pi-legion] in-process child <name> extension error: …`); omitting it keeps the
- * frozen one-argument call shape intact.
+ * frozen one-argument call shape intact. The one exception is the host's skipped
+ * `turn_end` boundary, which is labelled `… turn_end hook skipped: …` instead (#415).
  *
  * Errors are NOT caught here. A throw from a `session_start` handler is reported
  * through `onError` by the runner itself, and a failure of `bindExtensions`
@@ -101,6 +137,16 @@ export async function bindChildSessionExtensions(
 	await session.bindExtensions({
 		mode: "print",
 		onError: (error) => {
+			// #415: the host SKIPPED the hook (it ran no `turn_end` handler). Report the skip,
+			// never silence it and never throw — but do not point at an extension that is fine.
+			const skipped = skippedTurnEndBoundary(error);
+			if (skipped !== undefined) {
+				console.warn(
+					`[pi-legion] in-process child${label} turn_end hook skipped: ${skipped} ` +
+						"(this turn's assistant message has no persisted entry, so the host ran no turn_end handler)",
+				);
+				return;
+			}
 			console.warn(`[pi-legion] in-process child${label} extension error: ${describeExtensionError(error)}`);
 		},
 	});
