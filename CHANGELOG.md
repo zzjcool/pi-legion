@@ -9,6 +9,45 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [Unreleased] — 6.2.4（patch）
+
+6.2.3 真机验证（`docs/reports/release-6.2.3-verification.md` §3.2 / §3.3）暴露的两个遗留。
+报告：`docs/reports/orphan-on-natural-exit.md`。
+
+- **D2：父进程「自然退出」不再把仍在远端跑的 child 记成 `aborted`。** 6.2.3 的 shutdown 给
+  **每一个** live child 写 `retired` + `node_retired{reason:"session-shutdown"}`，跨机 child 也被
+  盖上 `aborted (session-shutdown)`。它既没有杀掉远端进程（实测：父进程退出后远端 `pi` 又跑了
+  75s 并写出了真实结果），也没有取回那个结果 —— `recover` 把 terminal 行当「already settled」，
+  零 fetch、只回 launch 时的 5 行快照，真实结果**永久不可取**。现在退出按三态判定（判定函数
+  `shutdownFate`，`src/legion/orphan.ts`）：
+  - 本地 child → **`aborted`**（进程随父退出而死，6.2.3 的行为逐字保留）；
+  - 跨机 child 仍在跑 / 状态未知 → **`orphaned`**；
+  - 跨机 child 的轮次已经结束（已有判词，或本机已有完整 mirror）而结果没取回 → **`unfetched`**；
+  - 收到 abort 且**确认**停止 → 仍记 `aborted`（`stop`/`abort` 路径不变）。
+  `orphaned`/`unfetched` 是 `TaskState` 与 run.json 的 `child.orphaned`（含 host / remoteDir /
+  remoteTerminal / **remoteSessionPath**），ledger 里是 `orphan_detected{reason:"session-shutdown",
+  fate}`（事件类型本来就在闭集 16 条内，契约不动），**节点行故意保持 open**：`hasEnded` 为假，
+  `listUnsettledRemoteNodes`（`/legion status` 的 recoverable 块）照旧列得出来。
+- **D2：退出不再杀、不再等跨机 child。** 一个还要在远端跑 30–60s 的 child，原来的 shutdown 会
+  `terminal.kill` 它，并且在 `--print` 的 `drainBeforeShutdown` 里**等它**（ref 住的轮询定时器
+  ⇒ `pi --print` 迟迟不退出）。现在 `releaseCrossMachineChildren()`（`src/extension/runtime.ts`）
+  在 drain 之前做三件事，顺序承重：先落定 fate（此时事实还在）、再 abort 这条 in-flight collect
+  （`job.collectAbort` 的 signal 合进 `ensureCollect`，因此定时器被清掉）、最后把 job 从表里摘掉
+  （drain 与 retire 循环都看不见它）。实测：父进程 **7.96s / 11.81s 自然退出（EXIT=0）**，远端
+  `sleep 30` 仍在跑。
+- **D2：`recover` 对 `orphaned`/`unfetched` 允许 fetch。** 判定阶梯里「already settled」收紧为
+  **`hasEnded` 且没有更新过的 orphan 标记、且 ledger 真的记过判词（`execution`）**。于是：
+  6.2.3 留下的 `aborted (session-shutdown)` 行（有 reason、无 execution）、被 hygiene 收敛成
+  `failed` 的遗留行、`orphan_detected` 标记行都会**真的去读远端转录**；读回并 settle 之后，
+  第二次调用仍是原来的 `already settled` + **零 fetch**（实测镜像 mtime 不变）。
+  `recover` 成功时还会 best-effort 把 run.json 记录同步成 `retired`（两本账不再互相打脸）。
+- **D3：`subagent({action:"status"})` 的 dead 块补上 host / 远端终端。** 之前只有 `recover` 的首行
+  才有这两个事实；现在 `host=remote` / `terminal=remote/lgl-<name>` 与 `supervisor=` / `session=`
+  并列（本地 child 不产生这两行）。
+- **回归**：SIGKILL 路径（ledger 留 `working` → 新进程 recover 16/16 → 二次 `already settled`）
+  未改；本地 child 的 shutdown 仍是 `retired` + `aborted (session-shutdown)`；有 assistant 回复
+  即不得 `aborted` 的规则（`attributeParentSessionShutdown`）未动。
+
 ## [6.2.3] — 2026-11-19
 
 6.2.2 真机复跑暴露的 D / E 两个缺陷，外加自测台 `make xm` 钉住的两条真 bug（d0 / d1）。
