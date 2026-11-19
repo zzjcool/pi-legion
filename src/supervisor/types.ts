@@ -131,6 +131,21 @@ export interface ChildHandle {
 	 */
 	remoteTerminal?: string;
 	/**
+	 * #409: the address this launch used as the terminal's PARENT, in the namespace
+	 * of the core that received the request (a target-local address for a
+	 * cross-machine child — the machine's anchor).
+	 *
+	 * Persisted onto the child record beside `parentRunId`, so the chain
+	 * child terminal → parent terminal → run is walkable from `run.json` alone.
+	 * Absent when the launch could not name one; {@link parentAbsent} then says why.
+	 */
+	parentTerminal?: string;
+	/**
+	 * #409: why no parent address could be named. Never a silent omission: the
+	 * receipt and the status render `parent=absent(<reason>)`.
+	 */
+	parentAbsent?: string;
+	/**
 	 * NON-FATAL notice from the backend that spawned the child (B5, D14).
 	 *
 	 * Two sources, one channel: `resolveCliModel` answers a `warning` for an

@@ -645,7 +645,11 @@ test("§4.1: a terminal that ended during start-up fails the LAUNCH, quoting the
 		assert.match(message, /^ {2}Command \(run on 'vps' to reproduce\):$/m);
 		assert.match(message, /--list-models/, "the reproduce command is the child's own argv");
 		assert.deepEqual((error as SubagentError).details, { host: HOST, fate: "no-child", exitCode: 1 });
-		assert.equal(h.client.paramsFor("terminal.run").length, 1, "the terminal was reached before the gate judged it");
+		// #409: a cross-machine launch creates the machine's anchor first, so the
+		// child's own request is the one under test here — it must have reached the core
+		// before the gate judged it.
+		const childRuns = h.client.paramsFor("terminal.run").filter((params) => params.name !== "lgl-anchor");
+		assert.equal(childRuns.length, 1, "the terminal was reached before the gate judged it");
 	} finally {
 		h.cleanup();
 	}

@@ -38,6 +38,7 @@ import {
 import { progressFromSessionFile } from "../shared/progress.ts";
 import type { LiveProgress } from "../shared/progress.ts";
 import { shellReason, transcriptBytesOf } from "../runs/launch-evidence.ts";
+import { parentLine } from "../runs/parent-anchor.ts";
 import { readProcRss } from "../supervisor/proc-memory.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
 import { isTerminalState, liveness } from "./liveness.ts";
@@ -595,6 +596,15 @@ export interface LiveChildStatusInput {
 	 */
 	remoteTerminal?: string;
 	/**
+	 * #409: the address this launch used as the child's terminal PARENT, in the
+	 * namespace of the core that received it. Rendered beside `terminal=` for a
+	 * cross-machine child (where the anchor address is the proof the ancestry is
+	 * connected) and whenever {@link parentAbsent} says one could not be named.
+	 */
+	parentTerminal?: string;
+	/** #409: why no parent address could be named; renders `parent=absent(<reason>)`. */
+	parentAbsent?: string;
+	/**
 	 * Own OS process of an `rpc` child (`Handle.pid`), when this session owns it.
 	 *
 	 * Only a pid of THIS host is ever supplied — pids are not persisted, so a
@@ -790,6 +800,16 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	if (input.alive) {
 		lines.push(`host=${input.host ?? "local"}`);
 		lines.push(`terminal=${input.remoteTerminal ?? "-"}`);
+		// #409: whose terminal it hangs from, in the target core's namespace. Right
+		// below the address because the two answer one question — "where do I look
+		// for this child, and what is it attached to". A local launch grows no line
+		// (its parent is the terminal the reader is sitting in); an ABSENT parent is
+		// always printed, with its reason: "no parent" and "we never asked" must
+		// not look alike.
+		const parent = parentLine({ parentTerminal: input.parentTerminal, parentAbsent: input.parentAbsent });
+		if (parent !== undefined && (input.host !== undefined || input.parentAbsent !== undefined)) {
+			lines.push(parent);
+		}
 		// The address `hc` accepts (`hc read <machine>/<terminal>`), and the reason a
 		// human needs it at all: there is no pane on THIS machine to click.
 		if (input.host) {
@@ -799,6 +819,13 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		// 6.2.4 / D3, byte for byte: a dead record only grows the lines it has facts for.
 		if (input.host) lines.push(`host=${input.host}`);
 		if (input.remoteTerminal) lines.push(`terminal=${input.remoteTerminal}`);
+		// #409: a dead record prints the parent it has — always for a cross-machine
+		// child, always when absent, and never for a local one (that record's shape is
+		// frozen: a fate note is not a place to look).
+		const parent = parentLine({ parentTerminal: input.parentTerminal, parentAbsent: input.parentAbsent });
+		if (parent !== undefined && (input.host !== undefined || input.parentAbsent !== undefined)) {
+			lines.push(parent);
+		}
 	}
 	if (execution) {
 		lines.push(formatExecutionStatusLine(input.alive, execution));

@@ -106,11 +106,17 @@ export interface LegionStatusJob {
 export interface ChildRemoteFacts {
 	host?: string;
 	remoteTerminal?: string;
+	/** #409: the address this launch used as the child's terminal parent. */
+	parentTerminal?: string;
+	/** #409: why no parent address could be named (renders `parent=absent(...)`). */
+	parentAbsent?: string;
 }
 
 interface RemoteFactSource {
 	host?: string | null;
 	remoteTerminal?: string | null;
+	parentTerminal?: string | null;
+	parentAbsent?: string | null;
 }
 
 function nonEmpty(value: unknown): string | undefined {
@@ -125,9 +131,16 @@ export function childRemoteFacts(
 ): ChildRemoteFacts {
 	const host = nonEmpty(record?.host) ?? nonEmpty(node?.host);
 	const remoteTerminal = nonEmpty(record?.remoteTerminal) ?? nonEmpty(node?.remoteTerminal);
+	// #409: the parent is a run.json fact only — the ledger's `nodes` table has no
+	// ancestry column and this fix does not add one (the same deliberate boundary
+	// `modelProvider` took). A record without it renders no line, never a guess.
+	const parentTerminal = nonEmpty(record?.parentTerminal);
+	const parentAbsent = nonEmpty(record?.parentAbsent);
 	return {
 		...(host ? { host } : {}),
 		...(remoteTerminal ? { remoteTerminal } : {}),
+		...(parentTerminal ? { parentTerminal } : {}),
+		...(parentAbsent ? { parentAbsent } : {}),
 	};
 }
 

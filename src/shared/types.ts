@@ -546,6 +546,34 @@ export interface ChildRecord {
 	 */
 	remoteTerminal?: string;
 	/**
+	 * #409: the run that dispatched this child — the `run.json` whose `children`
+	 * list holds this record.
+	 *
+	 * Stored per child (not only as the file's own `runId`) so the ancestry chain
+	 * can be walked from ONE record: child terminal → parent terminal → run. A
+	 * reader that finds a terminal in `hc ls` and wants to know whose it is does
+	 * not have to guess which `run.json` under `.pi-legion/runs/` to open.
+	 */
+	parentRunId?: string;
+	/**
+	 * #409: the address the launch passed as `parent` to `terminal.run`, in the
+	 * namespace of the core that received it.
+	 *
+	 * For a cross-machine child that is a TARGET-LOCAL address (the machine's
+	 * `lgl-anchor`): the caller's own id is meaningless there and a
+	 * machine-qualified spelling is refused by the sending core. Absent exactly
+	 * when {@link parentAbsent} is set.
+	 */
+	parentTerminal?: string;
+	/**
+	 * #409: why no parent address could be named (headless caller, no anchor).
+	 *
+	 * Recorded rather than omitted because "no parent" and "we never asked" look
+	 * identical otherwise: the receipt and `/legion status` both render
+	 * `parent=absent(<reason>)` from this field.
+	 */
+	parentAbsent?: string;
+	/**
 	 * 6.2.4 / D2: the parent session left this cross-machine child behind, and
 	 * where its result lives over there.
 	 *

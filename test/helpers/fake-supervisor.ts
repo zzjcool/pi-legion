@@ -101,6 +101,10 @@ export interface FakeSupervisorOptions {
 		remoteDir?: string;
 		/** #423: the `host/name` address the core holds for the child's terminal. */
 		remoteTerminal?: string;
+		/** #409: the address the launch used as the terminal's parent. */
+		parentTerminal?: string;
+		/** #409: why no parent address could be named. */
+		parentAbsent?: string;
 	};
 	/** Optional initial cumulative stats snapshot. */
 	usage?: UsageSnapshot | null;

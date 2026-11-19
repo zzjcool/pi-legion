@@ -202,10 +202,17 @@ test("D2: with a host, `on` carries it and the child record keeps it", async () 
 		// A named host always carries a resolved target (S1): the backend refuses a
 		// bare name rather than sending this machine's argv to another machine.
 		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget() }));
-		const params = h.client.paramsFor("terminal.run")[0];
+		// #409: the child's own request is the LAST one — the anchor probe/creation
+		// for a cross-machine launch comes first (`parent-anchor.ts`).
+		const params = h.client.paramsFor("terminal.run").at(-1);
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.on, "vps");
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on"]);
+		// #409: `parent` is the TARGET-LOCAL anchor address. Not the caller id (that
+		// core answers `no terminal "…"`) and not a machine-qualified spelling (the
+		// sending core refuses it), so the anchor's name is the one address both
+		// cores agree on.
+		assert.equal(params.parent, "lgl-anchor");
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on", "parent"]);
 		assert.equal(childRecord(h.supervisor, "root.centurion-0").host, "vps");
 	} finally {
 		h.cleanup();
@@ -225,11 +232,15 @@ test("D2: a remote request sends `on` and never `caller`", async () => {
 	const h = harness(callerEnv());
 	try {
 		await h.supervisor.spawnChild(spawnInput(h.root, { host: "vps", hostTarget: hostTarget() }));
-		const params = h.client.paramsFor("terminal.run")[0];
+		const params = h.client.paramsFor("terminal.run").at(-1);
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.caller, undefined, "a parent terminal id does not exist on the other machine");
 		assert.equal(params.on, "vps");
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on"]);
+		// #409: the parent is the machine's ANCHOR — an address that exists there —
+		// never this process's caller id. The anchor's own creation is the one request
+		// that DOES carry `caller` (the default-parent path, see the #409 test file).
+		assert.equal(params.parent, "lgl-anchor");
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "cwd", "labels", "name", "on", "parent"]);
 		// S5/D6: and no `env` key at all — see the dedicated test below.
 	} finally {
 		h.cleanup();
@@ -240,10 +251,13 @@ test("D2: the LOCAL request keeps `caller` exactly as before", async () => {
 	const h = harness(callerEnv());
 	try {
 		await h.supervisor.spawnChild(spawnInput(h.root));
-		const params = h.client.paramsFor("terminal.run")[0];
+		const params = h.client.paramsFor("terminal.run").at(-1);
 		assert.ok(params, "terminal.run must be called");
 		assert.equal(params.caller, TERMINAL_ID);
-		assert.deepEqual(Object.keys(params).sort(), ["argv", "caller", "cwd", "env", "labels", "name"]);
+		// #409: and the same address as an explicit `parent` — a local launch's parent
+		// is the terminal this process runs in, which is an address of THIS core.
+		assert.equal(params.parent, TERMINAL_ID);
+		assert.deepEqual(Object.keys(params).sort(), ["argv", "caller", "cwd", "env", "labels", "name", "parent"]);
 	} finally {
 		h.cleanup();
 	}
@@ -391,7 +405,13 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 		const labels = run.labels as Record<string, string>;
 		assert.deepEqual(labels, { "legion.role": "centurion", [LEGION_HOST_LABEL]: "vps" });
 		assert.equal(HERDR_SPACE_LABEL in labels, false, "a parent space id is meaningless over there");
-		assert.deepEqual(h.client.paramsFor("terminal.get"), [], "no parent terminal read for a remote child");
+		// #409: the ONE `terminal.get` a remote launch issues is the anchor probe. No
+		// read of THIS process's caller terminal is made for a remote child — that id
+		// means nothing on the other machine.
+		assert.deepEqual(
+			h.client.paramsFor("terminal.get").map((params) => params.terminal),
+			[terminalAddress({ terminalName: "lgl-anchor", host: "vps" })],
+		);
 
 		// D9: the record remembers the remote dir (the parent temp dir stays local).
 		const record = childRecord(h.supervisor, input.name) as { remoteDir?: string; tempDir?: string; host?: string };
