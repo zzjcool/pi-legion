@@ -11,6 +11,13 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 
 ## [Unreleased] — 6.2.5（patch）
 
+**`#413`：L2 stall notice 的重复投递。** 去重键从「上一封的发出时刻」改成**越过的阈值线**
+（`(child, kind, windowBase, thresholdMs, tier)`，`tier = floor(elapsed / thresholdMs)`）：
+同一条阈值线无论检查多少次都只 1 封，越过下一条线才再发一封；`extend` 把基准前移到
+`now` 并清空 L2 的已通知阶梯，下一封在 `now + loopRadiusMs`（整条阈值重新起算）。
+报告：`docs/reports/stall-notice-dedupe.md`。本轮**只做第 1 层**，第 2/3 层（跨机
+child 的 quiet 判据、#411 镜像）不在本 PR。
+
 `status` 的归属事实：遗留行不再猜 age，也不再只说「有个叫 X 的东西在远端」。
 报告：`docs/reports/status-attribution.md`。本轮范围**只含 D1/D4/D5-rendering**，
 其余项已拆分为 issue：#407（72h sweep 抹掉跨机遗留，本版已修，见

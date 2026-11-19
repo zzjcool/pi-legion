@@ -69,6 +69,7 @@ function queueStallNotice(
 		names.map((childName) => ({
 			kind: "long-running" as const,
 			childName,
+			tier: 1,
 			sinceBucket: createdAt,
 			sequence: 1,
 			elapsedMs: 600_000,
