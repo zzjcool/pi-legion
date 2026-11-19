@@ -66,6 +66,7 @@ import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, listUnsettledRemoteNodes, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { artifactById, markRead } from "./src/legion/ledger.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
+import { orphanFateOf } from "./src/legion/orphan.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
 import { type ExecutionStatus, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
@@ -1947,6 +1948,16 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			} catch { /* the ledger may already be closing; never block shutdown */ }
 
 			try {
+				// 6.2.4 / D2: a cross-machine child is not ours to kill and not ours to wait
+				// for. The exit records it `orphaned`/`unfetched` (record + ledger marker),
+				// cancels the collect that would otherwise hold `pi --print` alive on ref'd
+				// poll timers, and drops it from the job map — so the drain below only waits
+				// for children that die with this process, and the retire loop cannot kill a
+				// child whose result a later session is supposed to recover.
+				await sessionRuntime?.releaseCrossMachineChildren();
+			} catch { /* a record we cannot stamp is still recoverable from run.json */ }
+
+			try {
 				// #181: short --print exits before the deferred timer; flush now so
 				// orphan rpc-child-* dirs still get swept on a clean exit.
 				if (!isChild) flushHygieneIfPending();
@@ -2484,8 +2495,20 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		recoverable: () => {
 			try {
 				const identity = ownLegionIdentity();
-				if (identity) return listUnsettledRemoteNodes(identity.db);
-				return listRecoverableLeftovers(runStoreFor(lastCwd), { sessionFile: lastSessionFile }).map((entry) => entry.node);
+				// 6.2.4 / D2: annotate each row with the exit's fate (`orphaned` /
+				// `unfetched`), so the block says what happened to it instead of printing
+				// a bare `running` for a child a previous session walked away from.
+				const annotate = (db: DatabaseSync, nodes: readonly LegionNode[]) =>
+					nodes.map((node) => {
+						const fate = orphanFateOf(db, node.id);
+						return fate ? { ...node, orphaned: fate } : node;
+					});
+				if (identity) return annotate(identity.db, listUnsettledRemoteNodes(identity.db));
+				// The disk fallback already reads each run's ledger: `listRecoverableLeftovers`
+				// returns the exit's fate beside the node, so nothing is reopened here.
+				return listRecoverableLeftovers(runStoreFor(lastCwd), { sessionFile: lastSessionFile }).map((entry) =>
+					entry.orphaned ? { ...entry.node, orphaned: entry.orphaned } : entry.node,
+				);
 			} catch {
 				// A closed/stale ledger handle must never cost the user the status view.
 				return [];
@@ -3635,6 +3658,10 @@ async function controlAction(input: {
 			execution: found.child.execution,
 			acceptance: found.child.acceptance,
 			spawnMode: found.child.spawnMode,
+			// 6.2.4 / D3: `/legion status <name>` and `subagent status` share this
+			// renderer, so the machine and terminal come from the record on both.
+			...(found.child.host ? { host: found.child.host } : {}),
+			...(found.child.remoteTerminal ? { remoteTerminal: found.child.remoteTerminal } : {}),
 			alive,
 			...(owner ? { owner } : {}),
 		});
@@ -6193,6 +6220,9 @@ function followJob(
 		// D13: the machine travels with the branch, so the status row can render
 		// `vps:<branch>` instead of implying a local tree.
 		...(child?.worktreeHost ? { worktreeHost: child.worktreeHost } : {}),
+		// 6.2.4 / D2: the shutdown releases children by this fact alone (a host record
+		// means the process over there outlives this one).
+		...(child?.host ? { host: child.host } : {}),
 		...(spawnMode ? { spawnMode } : {}),
 		...(input.pid ? { pid: input.pid } : {}),
 		...(input.treeIdentity ? input.treeIdentity : child?.nodeId ? {
@@ -6601,6 +6631,10 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				execution: child.execution,
 				acceptance: child.acceptance,
 				spawnMode: child.spawnMode,
+				// 6.2.4 / D3: the dead block names the machine and the remote terminal,
+				// instead of leaving them to `recover`'s first line.
+				...(child.host ? { host: child.host } : {}),
+				...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
 				alive,
 				...(owner ? { owner } : {}),
 				...(pid ? { pid } : {}),
@@ -7096,6 +7130,31 @@ export async function recoverAction(input: {
 	}
 	if (!outcome.ok) return fail(outcome.text, ErrorCodes.NOT_FOUND);
 	const { recovery } = outcome;
+	// 6.2.4 / D2: the ledger now holds the verdict — make the RUN RECORD agree.
+	//
+	// `subagent({action:"status"})` reads run.json, not the ledger, so a record the
+	// exit marked `orphaned` would keep claiming that after the child was recovered:
+	// the two ledgers would describe the same child differently, which is exactly the
+	// class of bug this release is fixing. Best-effort on purpose — the verdict is
+	// already written, and a record we cannot refresh must not fail the recovery.
+	if (recovery.kind === "settled-now" || recovery.kind === "already-settled") {
+		const store = input.store as { updateChild?: RunStore["updateChild"] } | undefined;
+		if (store?.updateChild) {
+			const runId = path.basename(path.dirname(ledger.dbPath));
+			const at = new Date((input.now ?? Date.now)()).toISOString();
+			const recoveredNow = recovery.kind === "settled-now";
+			try {
+				await store.updateChild(runId, recovery.node.name, (current) => {
+					// `already settled` reconciles only a record that still carries the
+					// exit's marker; a `settled-now` recovery always retires it.
+					if (!recoveredNow && !current.orphaned) return;
+					current.state = "retired";
+					current.retiredAt ??= at;
+					delete current.orphaned;
+				});
+			} catch { /* the ledger is the authority; the record is a mirror */ }
+		}
+	}
 	return ok(
 		[
 			recoveryHeadline(recovery),
