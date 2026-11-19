@@ -171,7 +171,7 @@ ok
 
 ### 4.2 第一步：launch → **立即结束回合**（不 wait / 不 collect）
 
-`/tmp/o624-prompt-A.txt`（`o624-a`；`o624-b` 只是把名字 sed 换掉）：
+prompt（`/tmp/o624-prompt-B.txt`；`o624-a` 那一次是同一份、只把名字 sed 换掉）：
 
 ```
 立即调用一次 subagent 工具，参数完全如下（禁止修改参数，禁止先做调研，禁止追加第二次调用）：
@@ -186,8 +186,14 @@ task: "只做一件事：用 bash 工具跑 `sleep 30`（前台等它结束）�
 不要 wait、不要 collect、不要 sleep、不要再调用任何工具。
 ```
 
+父进程由 `hc run` 起（`host:` 派发要求父 `pi` 自己在 `hc` 终端里），脚本内容与调用：
+
 ```bash
-$ docker exec xm-parent bash -lc 'cd /root/work && { time pi -p -a "$(cat /tmp/o624-prompt-B.txt)"; echo "EXIT=$?"; } 2>&1 | tee /tmp/o624-logA-b.txt'
+$ docker exec xm-parent bash -lc 'cat /tmp/o624-runB.sh'
+#!/usr/bin/env bash
+set -u
+cd /root/work
+{ time pi -p -a "$(cat /tmp/o624-prompt-B.txt)"; echo "EXIT=$?"; } 2>&1 | tee /tmp/o624-logA-b.txt
 ```
 
 父进程**自然退出**的原文（`hc run --json` 的 `wait` 段说明它不是被 timeout 杀的）：
@@ -222,10 +228,12 @@ $ docker exec xm-parent bash -lc 'hc get remote/lgl-o624-b'
 {'state': 'live', 'turn': 0, 'exit_code': None, 'finished_ms': None, 'pid': 448,
  'status': {'app': 'pi', 'state': 'working'}}
 
-$ docker exec xm-remote bash -lc 'ps aux | grep "[s]leep 30"; ls -l /tmp/o624-child.txt'
+$ docker exec xm-remote bash -lc 'ps aux | grep "[s]leep 30"; ls -l /tmp/o624-child.txt; cat /tmp/o624-child.txt'
 root         465 … /bin/bash -c sleep 30; { hostname; pwd; } > /tmp/o624-child.txt; cat /tmp/o624-child.txt
 root         466 … sleep 30
-ls: cannot access '/tmp/o624-child.txt': No such file or directory    # 还没有结果 —— 正是「仍在跑」
+-rw-r--r-- 1 root root 34 Nov 19 02:43 /tmp/o624-child.txt
+remote
+/root/.pi-worktrees/o624-a      # 还是 o624-a 留下的旧内容 —— o624-b 的结果此刻还不存在
 ```
 
 run.json（`/root/work/.pi-subagents/runs/r-c75f1c52/run.json`，节选）：
