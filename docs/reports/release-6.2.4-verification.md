@@ -210,7 +210,8 @@ run.json（`/tmp/.pi-subagents/runs/r-a7f86909/run.json`，节选）——**父�
 ```
 
 `orphaned.at = 1795059546294` = **03:39:06.294**，与父进程退出时刻（03:39:06）一致；
-这里**没有 `retiredAt`、没有 `execution`** —— 6.2.3 会在同一时刻写 `aborted (session-shutdown)`。
+这里**没有 `retiredAt`、没有 `execution`** —— 6.2.3 会在同一时刻写 `aborted (session-shutdown)`
+（对照：`docs/reports/release-6.2.3-verification.md` §1.1 与 `docs/reports/orphan-on-natural-exit.md` §4.3）。
 远端进程**没有被杀**（`sleep 30` 还活着），也**没有被等待**（父进程 19.6s 就退了）。
 
 child 在父进程死后**自己跑完了**：
