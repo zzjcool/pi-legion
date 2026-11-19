@@ -120,6 +120,7 @@ import {
 	effectiveMaxDepth,
 	launchNoticeLines,
 	Orchestrator,
+	type LiveMirrorSeam,
 	type OrchestratorLegionContext,
 } from "./src/runs/orchestrator.ts";
 import { RunStore, pickChildByName } from "./src/runs/store.ts";
@@ -1494,7 +1495,7 @@ async function resumeLegionChild(input: { pi: ExtensionAPI; supervisor: LegionSu
 	const childRun = store.readRun(input.node.runId);
 	if (!childRun) throw new Error(`child run.json not found: ${input.node.runId}`);
 	const parentOfSupervisor = parent.parentId ? getNode(input.db, parent.parentId) : null;
-	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus, ...(input.machineForRole ? { machineForRole: input.machineForRole } : {}) } });
+	const orchestrator = new Orchestrator({ supervisor: input.supervisor, runDir: store.runDir(parentRun.runId), cwd, maxDepth: catalog.settings.legion?.maxDepth, maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null, team: resumedTeam.team, childContext: resolveTeamContext("child", catalog.settings, resumedTeam.team), parentPath: parentRun.path, ...rpcApproveFrom(catalog.settings), ...liveMirrorFrom(), launchQueue: launchQueueBounds(catalog.settings), onLaunchQueueNotice: launchQueueNoticeSink(input.pi), legion: { db: input.db, dbPath: input.dbPath, nodeId: parent.id, parentNodeId: parent.parentId, parentRunId: parentOfSupervisor?.runId ?? null, runId: parentRun.runId, runStore: store, settings: input.settings, eventBus: input.eventBus, ...(input.machineForRole ? { machineForRole: input.machineForRole } : {}) } });
 	orchestrator.restore(parentRun);
 	// #123 residual: replay the provider pin with the model it belongs to. The
 	// value comes from the child's `run.json` record (above); `legion.db`'s
@@ -3573,7 +3574,7 @@ async function controlAction(input: {
 					maxDepth: input.settings.legion?.maxDepth,
 					childContext: resolveTeamContext("child", input.settings, input.team),
 					...teamForChildren(input.team),
-					...rpcApproveFrom(input.settings),
+					...rpcApproveFrom(input.settings), ...liveMirrorFrom(),
 					...(input.legion ? { legion: { ...input.legion, runId, runStore: input.store } } : {}),
 					onBudgetRefused: input.onBudgetRefused,
 				});
@@ -3802,7 +3803,7 @@ async function controlAction(input: {
 		worktreeBootstrap: input.settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: input.settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
-		...rpcApproveFrom(input.settings),
+		...rpcApproveFrom(input.settings), ...liveMirrorFrom(),
 		...(input.legion ? { legion: { ...input.legion, runId: found.runId, runStore: store } } : {}),
 		onBudgetRefused: input.onBudgetRefused,
 	});
@@ -4870,7 +4871,7 @@ async function launchFamily(input: {
 		worktreeBootstrap: settings.legion?.worktreeBootstrap,
 		worktreeBootstrapTimeoutMs: settings.legion?.worktreeBootstrapTimeoutMs,
 		...teamForChildren(input.team),
-		...rpcApproveFrom(settings),
+		...rpcApproveFrom(settings), ...liveMirrorFrom(),
 		// #266 D6-a/D10: queue bounds + the D9 notice channel. The command chain is
 		// the bug's main path (a 12-step `tasks[]` fanout against `maxChildrenPerNode`).
 		launchQueue: launchQueueBounds(settings),
@@ -5752,7 +5753,7 @@ async function launchUtilityFamily(input: {
 			maxSpawns: catalog.settings.maxSubagentSpawnsPerSession ?? null,
 			childContext: resolveTeamContext("child", catalog.settings, catalog.team),
 			team: catalog.team,
-			...rpcApproveFrom(catalog.settings),
+			...rpcApproveFrom(catalog.settings), ...liveMirrorFrom(),
 			// #266: the parallel-recon path shares the same bounds and notice channel
 			// as the command chain — one scheduler for every dispatch family (D2).
 			launchQueue: launchQueueBounds(catalog.settings),
@@ -7845,6 +7846,21 @@ function teamForChildren(team: ActiveTeam): { team?: ActiveTeam } {
 /** Opt-in `--approve` for RPC children (`subagents.rpc.approve`, #193). */
 function rpcApproveFrom(settings: Pick<SubagentsSettings, "rpc">): { rpcApprove?: boolean } {
 	return settings.rpc?.approve === true ? { rpcApprove: true } : {};
+}
+
+/**
+ * #411: the cross-machine live mirror, wired exactly once per Orchestrator.
+ *
+ * A SPREAD, like {@link rpcApproveFrom} above: the seam is present, and the pump
+ * itself decides whether it may run from `PI_LEGION_LIVE_MIRROR*` (see
+ * `resolveLiveMirrorConfig`). Two reasons for the split. The Orchestrator must keep
+ * "no `liveMirror` dep ⇒ no pump at all" for every test double and embedder that
+ * never asked for one; and an operator must be able to turn the pump off for a
+ * process without editing a settings file. `liveMirror: { config, env, create }`
+ * stays the test seam only.
+ */
+function liveMirrorFrom(): { liveMirror?: LiveMirrorSeam } {
+	return { liveMirror: {} };
 }
 
 /** Prefer a role under the active team, then fall back for existing children. */

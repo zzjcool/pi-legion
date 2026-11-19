@@ -107,6 +107,22 @@ import {
 	type RemoteSessionRequest,
 } from "./remote-artifact.ts";
 import { assertLocalWorktree, localWorktreePath, normalizeHost, type HostTarget } from "./remote.ts";
+import {
+	createLiveMirrorRemote,
+	LiveMirror,
+	resolveLiveMirrorConfig,
+	type LiveMirrorConfig,
+	type LiveMirrorFacts,
+} from "./live-mirror.ts";
+
+/**
+ * How long `collect`'s final mirror sync may spend before it is abandoned (#411).
+ *
+ * A settle is on the parent's critical path. The mirror is a convenience; a machine
+ * that answers in 30 s per round trip must not be able to turn "the child finished"
+ * into "the child is still collecting".
+ */
+export const LIVE_MIRROR_FINAL_SYNC_MS = 5_000;
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
@@ -140,6 +156,51 @@ export interface OrchestratorLegionContext {
 	machineForRole?: (role: string | null | undefined) => PhaseMachine | undefined;
 }
 
+/**
+ * #411: the pump this layer holds for one child, as a plain shape.
+ *
+ * Structurally what `LiveMirror` is (`syncNow` is covariant, so the real class is
+ * assignable), but written out so the test seam can return any object of the same
+ * shape — including one made of counters.
+ */
+export interface LiveMirrorHandle {
+	start(): void;
+	stop(): void;
+	/** `deadlineMs` bounds the round trips a final sync may spend. */
+	syncNow(opts?: { deadlineMs?: number }): Promise<unknown>;
+	facts(): LiveMirrorFacts;
+}
+
+/** One `startLiveMirror` call's arguments, handed to the test seam. */
+export interface LiveMirrorRequest {
+	child: ChildRecord;
+	localPath: string;
+	/** Fired by the pump for every tick that GREW the mirror (never for a no-op). */
+	onGrowth: () => void;
+}
+
+/**
+ * The cross-machine live mirror seam (#411, contract §3).
+ *
+ * Every field is optional: `OrchestratorDeps.liveMirror` absent means "no pump is
+ * ever started", i.e. today's behaviour byte for byte.
+ */
+export interface LiveMirrorSeam {
+	/** Operator overrides; `resolveLiveMirrorConfig` gives env the last word. */
+	config?: Partial<LiveMirrorConfig>;
+	/** The env the config is resolved against (absent = `process.env`). */
+	env?: Record<string, string | undefined>;
+	/**
+	 * Test seam; production is `new LiveMirror({...})` over a `createLiveMirrorRemote`.
+	 *
+	 * ONE name for this seam: an alias would make two spellings of the same
+	 * freedom, and a caller that passed both would have to guess which one won.
+	 */
+	create?: (request: LiveMirrorRequest) => LiveMirrorHandle | undefined;
+	/** One warning sink; absent = one `[pi-legion]` line on stderr. Never throws. */
+	warn?: (message: string) => void;
+}
+
 export interface OrchestratorDeps {
 	supervisor?: LegionSupervisor;
 	uiProxy?: UIProxy;
@@ -165,6 +226,16 @@ export interface OrchestratorDeps {
 	 * keeps today's behaviour (no remote text), which is what the local path is.
 	 */
 	remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
+	/**
+	 * #411: the cross-machine live mirror. Absent = no pump is ever started.
+	 *
+	 * A remote child writes `session.jsonl` on ITS machine while the record's
+	 * `sessionFile` here is an empty placeholder this machine pre-created, so the
+	 * panel, `lastJsonlEventAgeMs` and `progressFromSessionFile` all read zero bytes
+	 * forever. The pump copies the remote bytes into exactly that file, which is why
+	 * none of those readers had to change.
+	 */
+	liveMirror?: LiveMirrorSeam;
 	/**
 	 * Test seam for the launch ROLLBACK's worktree removal (defect E).
 	 *
@@ -723,6 +794,30 @@ export class Orchestrator {
 	 * ever being mutated.
 	 */
 	private readonly remoteSessions = new Map<string, RemoteReadbackResult>();
+	/**
+	 * #411: one transcript pump per child, keyed by name.
+	 *
+	 * Only ever filled for a child that runs ELSEWHERE (`normalizeHost(child.host)`
+	 * is defined) and only when `OrchestratorDeps.liveMirror` is present, so a local
+	 * run's map stays empty and every method below is a no-op.
+	 */
+	private readonly liveMirrors = new Map<string, LiveMirrorHandle>();
+	/**
+	 * #411: children whose pump already promoted their record.
+	 *
+	 * A cross-machine child has no local settle signal at launch time, so the FIRST
+	 * byte that arrives is the only evidence that the launch produced a working
+	 * turn. Promoting more than once per pump would rewrite `run.json` on every
+	 * growth tick for nothing.
+	 */
+	private readonly liveMirrorPromoted = new Set<string>();
+	/** Distinct warning texts already emitted by the mirror seam (no retry storm). */
+	private readonly liveMirrorWarned = new Set<string>();
+	private readonly liveMirrorDeps?: LiveMirrorSeam;
+	/** Operator overrides for the pump (`liveMirror.config`). */
+	private readonly liveMirrorConfig?: Partial<LiveMirrorConfig>;
+	/** The env the pump's config is resolved against (`liveMirror.env`). */
+	private readonly liveMirrorEnv?: Record<string, string | undefined>;
 	private readonly worktreeBootstrap?: string;
 	private readonly worktreeBootstrapTimeoutMs?: number;
 	private readonly team?: ActiveTeam;
@@ -803,6 +898,9 @@ export class Orchestrator {
 		this.remoteVerify = deps.remoteVerify;
 		this.removeWorktree = deps.removeWorktree ?? removeChildWorktree;
 		this.remoteReadback = deps.remoteReadback;
+		this.liveMirrorDeps = deps.liveMirror;
+		this.liveMirrorConfig = deps.liveMirror?.config;
+		this.liveMirrorEnv = deps.liveMirror?.env;
 		this.worktreeBootstrap = deps.worktreeBootstrap?.trim() || undefined;
 		this.worktreeBootstrapTimeoutMs = deps.worktreeBootstrapTimeoutMs;
 		this.team = deps.team;
@@ -960,6 +1058,208 @@ export class Orchestrator {
 			localPath: remote.localPath,
 			remotePath: remote.remotePath,
 		};
+	}
+
+	// ── #411: the cross-machine live mirror ──────────────────────────────
+
+	/**
+	 * One warning through the seam's sink, once per distinct text.
+	 *
+	 * Everything the mirror can go wrong with is DIAGNOSTICS: a launch, a collect or
+	 * a retire must never fail because a transcript could not be copied.
+	 */
+	private warnLiveMirror(message: string): void {
+		const line = message.trim();
+		if (line.length === 0) return;
+		if (this.liveMirrorWarned.has(line)) return;
+		this.liveMirrorWarned.add(line);
+		try {
+			const sink = this.liveMirrorDeps?.warn;
+			if (sink) sink(line);
+			else process.stderr.write(`[pi-legion] ${line}\n`);
+		} catch {
+			/* an unruly log sink is not a mirror failure */
+		}
+	}
+
+	/**
+	 * Start the transcript pump for a freshly spawned child (#411, contract §3).
+	 *
+	 * Called right after `recordLegionLaunch` in `launch`, i.e. only once the child
+	 * really exists. A LOCAL child has its transcript on this machine already, so
+	 * the pump is not created for it at all — `create` is not even called.
+	 *
+	 * Never throws: an exception here would turn a readable child into a failed
+	 * launch, which is the one outcome this feature must not produce.
+	 */
+	private startLiveMirror(child: ChildRecord): void {
+		const deps = this.liveMirrorDeps;
+		if (deps === undefined) return;
+		try {
+			const host = normalizeHost(child.host);
+			if (host === undefined) return; // this host's own child: nothing to mirror
+			const localPath = typeof child.sessionFile === "string" ? child.sessionFile.trim() : "";
+			if (localPath.length === 0) return; // no destination, no pump
+			// A relaunch/resume replaces the pump instead of running two of them on one
+			// file, and the promotion fires again for the NEW turn.
+			this.stopLiveMirror(child.name);
+			this.liveMirrorPromoted.delete(child.name);
+			const entry = this.buildLiveMirror(deps, child, localPath, host);
+			if (entry === undefined) return;
+			this.liveMirrors.set(child.name, entry);
+			entry.start();
+		} catch (error) {
+			this.warnLiveMirror(`live mirror for '${child.name}' was not started: ${messageOf(error)}`);
+		}
+	}
+
+	/**
+	 * The production pump for one child, or the seam's replacement.
+	 *
+	 * `undefined` means "do not start a pump": either the seam declined, or this
+	 * build cannot know where that child writes (no `remoteDir`, i.e.
+	 * `createLiveMirrorRemote` has no path to read). A configured-OFF pump is still
+	 * created: it persists the one `mode:"off"` facts row `status` renders, and it
+	 * opens no connection at all.
+	 */
+	private buildLiveMirror(
+		deps: LiveMirrorSeam,
+		child: ChildRecord,
+		localPath: string,
+		host: string,
+	): LiveMirrorHandle | undefined {
+		const onGrowth = (): void => {
+			// Growth happens on the pump's own tick; the promotion is bookkeeping and must
+			// never be able to reject back into the pump.
+			void this.promoteLiveChild(child.name).catch(() => undefined);
+		};
+		const request: LiveMirrorRequest = { child, localPath, onGrowth };
+		const seam = deps.create;
+		if (seam) return seam(request);
+		const config = resolveLiveMirrorConfig({ env: this.liveMirrorEnv, overrides: this.liveMirrorConfig });
+		const warn = (message: string): void => this.warnLiveMirror(message);
+		const common = { localPath, intervalMs: config.intervalMs, maxBytes: config.maxBytes, onGrowth, warn };
+		if (!config.enabled) {
+			// Contract §3: a disabled pump still writes its facts row, so `status` can say
+			// `mirror=off` instead of an unexplained silence.
+			return new LiveMirror({ ...common, remote: undefined });
+		}
+		const remote = createLiveMirrorRemote({
+			host,
+			name: child.name,
+			...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+		});
+		// `remoteDir` unknowable: guessing it would turn "we do not know where that
+		// child writes" into a permanent error row on every tick.
+		if (remote === undefined) return undefined;
+		return new LiveMirror({ ...common, remote });
+	}
+
+	/**
+	 * #411 (contract §3, "growth promotes the record"): the first byte that reaches
+	 * the mirror is the only local evidence that a cross-machine launch produced a
+	 * working turn.
+	 *
+	 * `persistParentReservation` writes `state:"launching"` into `run.json` and, for a
+	 * remote child, nobody ever wrote `working` back — that is the record that stuck
+	 * at `launching` forever. The ledger row gets the same treatment
+	 * (`starting` → `running`); `recordLegionLaunch` usually already did it, so this
+	 * is a guarded no-op in the common case and the correction in the other one.
+	 *
+	 * Runs ONCE per pump (see {@link liveMirrorPromoted}) and never throws.
+	 */
+	private async promoteLiveChild(childName: string): Promise<void> {
+		if (this.liveMirrorPromoted.has(childName)) return;
+		this.liveMirrorPromoted.add(childName);
+		try {
+			const memory = this.children.get(childName);
+			if (memory?.state === "launching") memory.state = "working";
+			const runStore = this.legion?.runStore;
+			const runId = this.legion?.runId;
+			if (runStore && runId) {
+				// Read first: `updateChild` throws `not found` for a name this run.json does
+				// not hold, and a pump must not spend its one promotion on a "not found".
+				const persisted = runStore.readRun(runId)?.children.find((entry) => entry.name === childName);
+				if (persisted?.state === "launching") {
+					await runStore.updateChild(runId, childName, (recorded) => {
+						recorded.state = "working";
+					});
+				}
+			}
+			const nodeId = memory?.nodeId;
+			const legion = this.legion;
+			if (legion && nodeId) {
+				const node = getNode(legion.db, nodeId);
+				if (node?.status === "starting") updateNode(legion.db, nodeId, { status: "running" }, this.now);
+			}
+		} catch (error) {
+			this.warnLiveMirror(`live mirror could not promote '${childName}': ${messageOf(error)}`);
+		}
+	}
+
+	/**
+	 * #411 (contract §3, "final sync + stop on settle"): one last fetch, then the
+	 * pump is retired.
+	 *
+	 * `collect` reaches this at the point its wait is known `settled`, immediately
+	 * before the read-back refresh — the transcript cannot grow once the turn is
+	 * over, so this is the last chance to have the child's words on this machine.
+	 *
+	 * Never throws: a failing final sync is a warning, never a failed collect.
+	 */
+	private async finalSyncLiveMirror(child: ChildRecord, opts?: { stop?: boolean }): Promise<void> {
+		const entry = this.liveMirrors.get(child.name);
+		if (entry === undefined) return;
+		// BOUNDED, and bounded twice. `deadlineMs` stops the read loop at a wall clock,
+		// and the race stops the AWAIT even when one `hc` round trip hangs — a settle is
+		// on `collect`'s critical path, and "the mirror is behind" must never present
+		// itself to the parent as "the child is still collecting". The abandoned tick is
+		// harmless: `stop()` flips the pump's `stopped` flag, so it writes nothing more.
+		const deadlineMs = LIVE_MIRROR_FINAL_SYNC_MS;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				Promise.resolve(entry.syncNow({ deadlineMs })).then(() => undefined),
+				new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, deadlineMs * 2);
+					const unrefable = timer as unknown as { unref?: () => void };
+					if (typeof unrefable.unref === "function") unrefable.unref();
+				}),
+			]);
+		} catch (error) {
+			this.warnLiveMirror(`live mirror final sync for '${child.name}' failed: ${messageOf(error)}`);
+		} finally {
+			if (timer !== undefined) clearTimeout(timer);
+		}
+		if (opts?.stop === true) this.stopLiveMirror(child.name);
+	}
+
+	/** Stop and forget one child's pump. Idempotent, never throws. */
+	private stopLiveMirror(name: string): void {
+		const entry = this.liveMirrors.get(name);
+		if (entry === undefined) return;
+		this.liveMirrors.delete(name);
+		try {
+			entry.stop();
+		} catch (error) {
+			this.warnLiveMirror(`live mirror for '${name}' did not stop cleanly: ${messageOf(error)}`);
+		}
+	}
+
+	/**
+	 * #411: the pump's own facts for one child (`undefined` when it never had one).
+	 *
+	 * The seam `status` reads through, and the assertion target for the wiring tests:
+	 * "was a pump created, and is it on or off" is not derivable from the record.
+	 */
+	liveMirrorFacts(name: string): LiveMirrorFacts | undefined {
+		const entry = this.liveMirrors.get(name);
+		if (entry === undefined) return undefined;
+		try {
+			return entry.facts();
+		} catch {
+			return undefined;
+		}
 	}
 
 	sessionFileFor(name: string): string {
@@ -2128,6 +2428,11 @@ export class Orchestrator {
 			// child from a local one, and there is no terminal address to ask about.
 			await this.persistChildRemoteFacts(child);
 			if (this.legion && nodeId) this.recordLegionLaunch(child, input.agent, input.task, input.team, Boolean(reservedNode));
+			// #411: a child that runs ELSEWHERE writes its transcript on that machine.
+			// The pump is what puts those bytes where every local reader already looks
+			// (`child.sessionFile`), and it is also the only "this launch works" signal
+			// such a child can give. Local children never get one.
+			this.startLiveMirror(child);
 			this.emitProcess("node_launched", nodeId ?? name, { name, agent: input.agent.name, pid: result.pid });
 			return {
 				name: result.name,
@@ -3316,6 +3621,11 @@ export class Orchestrator {
 			if (wait === "aborted" || opts.signal?.aborted) return abortedSnapshot();
 		}
 		if (wait === "blocked") return this.blockedResult(child);
+		// #411: the turn is over, so the remote transcript will never grow again. One
+		// last fetch into `child.sessionFile`, then the pump is retired. The deadline
+		// keeps a half-dead machine from holding this collect open (see
+		// `finalSyncLiveMirror`).
+		if (wait === "settled") await this.finalSyncLiveMirror(child, { stop: true });
 		// xm-dispatch D3.1: the verdict about to be derived must describe the transcript
 		// as it is NOW. Everything above only ever read the launch-time snapshot, which
 		// is how a finished 11-line transcript was judged from its first 5 lines.
@@ -4136,6 +4446,10 @@ export class Orchestrator {
 
 	async retire(name: string, opts?: RetireOptions): Promise<ChildRecord> {
 		const child = this.requireChild(name);
+		// #411: a retired child has no transcript left to copy. Idempotent, and it runs
+		// on every exit path below (queued, orphaned, killed) instead of only the ones
+		// that reach the kill.
+		this.stopLiveMirror(name);
 		if (opts?.cause === "session-shutdown") this.parentShutdownRetire.add(name);
 		if (child.state === "retired") return child;
 		if (child.state === "queued") {
@@ -4352,6 +4666,10 @@ export class Orchestrator {
 		for (const name of [...this.children.keys()]) {
 			try { results.push(await this.retire(name)); } catch { /* continue with other child processes */ }
 		}
+		// #411: `retire` already stopped each of these; this sweep catches a pump whose
+		// child record is no longer in `children` (a replaced or restored name) so no
+		// interval outlives the run.
+		for (const name of [...this.liveMirrors.keys()]) this.stopLiveMirror(name);
 		return results;
 	}
 
