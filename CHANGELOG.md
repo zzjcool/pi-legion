@@ -70,6 +70,35 @@ child 的 quiet 判据、#411 镜像）不在本 PR。
   `keptRemoteRuns` 计数。`markAbandoned` 的本地行谓词（#407）一行未动。
   报告：`docs/reports/retention-keeps-attribution.md`。
 
+## [6.2.5] — 2026-11-19
+
+**一句话：派出去的 agent「到底有没有在跑」这件事，从这一版起有机制保证，而不是靠人肉 `find session.jsonl` 猜。**
+
+- **`#428` 新 worktree 不再卡在 pi 的 `Trust project folder?`。** 终端 child 的 argv 现在强制带
+  pi 的单次运行信任 `--approve`（本地与跨机两条路径都带）。**只影响 legion 自己创建的 worktree**：
+  不写 trust store、不改用户配置、不选 `Trust parent folder`，RPC/in-process 路径不动。此前跨机
+  launch 会返回成功、终端 `state=live`、父机记 `working`，而子进程永远停在那个交互提示上（0 字节
+  session，实测白等 30 分钟）。真机对照：同一路径去掉 `--approve` 就复现提示且无 session。
+- **`#430` launch 拿不到启动证据就 `START_FAILED`（不再留 `working` 空壳）。** 判据是「远端终端
+  地址可得 **且** session 文件出现」；失败回执带机器名、尝试的 cwd、终端地址、hc 原始错误、**该终端
+  最后 6 行**与可复现命令，并 kill+rm 自己建的空终端、回滚远端 worktree/镜像（名字释放，重派不再
+  `NAME_TAKEN`）。判词收敛在 `src/runs/launch-evidence.ts` 一处，status / stall / retire / stop 四面
+  共用：**没有执行证据的 child 退役不再报 `success`**。
+- **`#431` 每个终端 launch 都带 parent，祖先链可查。** 本地取 `HC_TERMINAL_ID`，跨机取目标机上
+  `lgl-anchor` 的**目标机本地地址**（用调用方 id 会被真 core 答 `no terminal`，用 `host/id` 这种
+  限定形式会被发送方 core 答 `unknown machine`）。`run.json` 记 `remoteTerminal → parentTerminal →
+  parentRunId`；解析不到父时**不静默**：回执与 `status` 打 `parent=absent(<原因>)`。
+- **`#426` spawn 的 cwd 缺失不再冤枉 node。** 父目录按需创建；真坏时报
+  `spawn_failed: cwd does not exist: <path>`，程序路径只作附注（此前会报 `cannot start "<node>":
+  No such file or directory`，让人去查一个根本没问题的 node）。
+- **`#425` `turn_end` 记录不再把健康的扩展点成故障源。** 宿主在「本轮 assistant 条目没有落盘 id」时
+  产生的 `<boundary>` 伪扩展记录（来自被继承扩展注册的 `turn_end` handler，不是扩展本身出错），
+  现在按三字段全等识别并降级为 `turn_end hook skipped: …`：不抛错、不静默、不再指着健康的扩展。
+
+**已知边界（本版不含，已在 issue 跟踪）**
+- 镜像泵（`#411` / PR #429）不在本版：跨机 child 的本地 mirror 仍是「settle 时才有内容」。
+- 本地（非跨机）launch 还没有 cwd preflight，报错仍可能归因到 node（`#432`）；跨机侧已修。
+
 ## [6.2.4] — 2026-11-19
 
 6.2.3 真机验证（`docs/reports/release-6.2.3-verification.md` §3.2 / §3.3）暴露的两个遗留。
