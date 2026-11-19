@@ -215,7 +215,8 @@ test("D4: argv is rpc's argv (includeTask:false) plus the task as one positional
 		assert.match(readFileSync(promptFile, "utf8"), /You are a test centurion\./);
 
 		// Byte-for-byte parity with the builder the rpc backend uses (D4): the only
-		// difference allowed is the temp dir the prompt file lives in.
+		// differences allowed are the temp dir the prompt file lives in and the
+		// per-run trust flag this backend adds on purpose (#424, asserted below).
 		const expectedDir = mkdtempSync(path.join(h.root, "expected-"));
 		const expected = buildPiArgs({
 			agent: input.agent,
@@ -223,10 +224,26 @@ test("D4: argv is rpc's argv (includeTask:false) plus the task as one positional
 			sessionFile: input.sessionFile,
 			tempDir: expectedDir,
 			includeTask: false,
+			approve: true,
 		}).args;
 		const normalize = (values: string[], dir: string): string[] =>
 			values.map((value) => (value === path.join(dir, "system-prompt.md") ? "<tmp>/system-prompt.md" : value));
 		assert.deepEqual(normalize(flags, supervisorTempDir), normalize(expected, expectedDir));
+		// The delta against rpc's argv is exactly that one flag — nothing else may
+		// drift in while adding it.
+		assert.deepEqual(
+			normalize(flags.filter((flag) => flag !== "--approve"), supervisorTempDir),
+			normalize(
+				buildPiArgs({
+					agent: input.agent,
+					task: input.task,
+					sessionFile: input.sessionFile,
+					tempDir: expectedDir,
+					includeTask: false,
+				}).args,
+				expectedDir,
+			),
+		);
 
 		// `--no-extensions` + an explicit `-e` set (provider extensions included by
 		// the shared builder) is what makes the TUI load a model at all.
@@ -246,6 +263,66 @@ test("D4: argv is rpc's argv (includeTask:false) plus the task as one positional
 		assert.equal(handle.name, input.name);
 		assert.equal(handle.sessionFile, input.sessionFile);
 		assert.equal(handle.pid, 4242);
+	} finally {
+		h.cleanup();
+	}
+});
+
+// ── #424: per-run project trust ───────────────────────────────────────────
+
+/**
+ * The one question a TUI child cannot answer for itself (#424).
+ *
+ * A terminal child starts in a directory legion created moments earlier — a fresh
+ * worktree, or a checkout nobody has opened. pi has no trust decision for that
+ * cwd, so without `--approve` it stops at the interactive
+ * `Trust project folder?` prompt BEFORE writing a session file: the parent sees a
+ * live terminal that never starts, and a human has to press Enter. `--approve` is
+ * per RUN (pi does not write the trust store for it), never `--no-approve`, and
+ * exactly once — a second one would be a contradictory trust decision on the same
+ * command line.
+ */
+function assertApprovedForRun(argv: readonly string[], label: string): void {
+	assert.equal(argv.includes("--no-approve"), false, `${label}: a child must never opt OUT of project trust`);
+	assert.equal(
+		argv.filter((arg) => arg === "--approve").length,
+		1,
+		`${label}: argv must carry exactly one --approve (#424), got: ${argv.join(" ")}`,
+	);
+}
+
+test("#424: a local terminal child's argv trusts the project for THIS run only", async () => {
+	const h = harness();
+	try {
+		await h.supervisor.spawnChild(spawnInput(h.root));
+		const argv = h.client.paramsFor("terminal.run")[0]!.argv as string[];
+		assertApprovedForRun(argv, "local child");
+		// The last element is the positional task that starts turn 1 (D4); the trust
+		// flag must be a real flag, not that message.
+		assert.notEqual(argv[argv.length - 1], "--approve");
+		// Negative control: the verdict above is evidence only if the same predicate
+		// REJECTS the argv with the flag removed. This is the mutation the report
+		// claims turns this test red (drop `approve: true` from the spawn).
+		assert.throws(
+			() => assertApprovedForRun(argv.filter((arg) => arg !== "--approve"), "mutant"),
+			/exactly one --approve/,
+		);
+	} finally {
+		h.cleanup();
+	}
+});
+
+test("#424: approve is FORCED, not inherited from subagents.rpc.approve", async () => {
+	const h = harness();
+	try {
+		// `approve: false` is the one spelling upstream config can produce that would
+		// UNDO this. The terminal backend must override it: that setting is the RPC
+		// backend's opt-in (#193), where no UI can block a launch.
+		await h.supervisor.spawnChild(spawnInput(h.root, { approve: false }));
+		assertApprovedForRun(h.client.paramsFor("terminal.run")[0]!.argv as string[], "approve:false child");
+		// An explicit `true` is not added twice (argv is a set, not a stack).
+		await h.supervisor.spawnChild(spawnInput(h.root, { name: "root.centurion-1", approve: true }));
+		assertApprovedForRun(h.client.paramsFor("terminal.run")[1]!.argv as string[], "approve:true child");
 	} finally {
 		h.cleanup();
 	}

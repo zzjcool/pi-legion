@@ -357,6 +357,18 @@ test("S1: a remote spawn preflights, makes the remote dir, and sends the remote 
 				`a parent-absolute argv survived: ${arg} is in none of ${REMOTE_CWD}, ${target.mirrorRoot}, ${REMOTE_LEGION_ROOT}`,
 			);
 		}
+		// #424: this child lands in a worktree created on THAT machine moments ago, so
+		// its argv must answer pi's `Trust project folder?` prompt for this run. It is
+		// not a path, so D6 must carry it through unchanged — and the start-up probe,
+		// which runs the child's own argv minus the task, must carry it too.
+		assert.equal(argv.includes("--no-approve"), false);
+		assert.equal(
+			argv.filter((arg) => arg === "--approve").length,
+			1,
+			`remote argv must carry exactly one --approve (#424): ${argv.join(" ")}`,
+		);
+		assert.match(String(execs[3]!.line), /'--approve'/);
+
 		// The package's own `-e` entry (present in every child's argv) went through
 		// `pathMap`, not through a basename sweep that would hand the child a path
 		// to nothing.

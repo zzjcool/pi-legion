@@ -578,6 +578,18 @@ export class TerminalSupervisor implements LegionSupervisor {
 				...buildInput,
 				tempDir,
 				includeTask: false,
+				// #424: a terminal child is launched into a directory LEGION just made (a
+				// fresh worktree of this checkout, or one on the other machine). A TUI `pi`
+				// with no trust decision for that cwd stops at "Trust project folder?"
+				// BEFORE it writes a session file, so the parent sees a live terminal that
+				// never starts (`working` until the stall detector gives up) and a human
+				// only has to press Enter. `--approve` is pi's per-RUN trust: it answers
+				// that question for this one process and does NOT write the trust store,
+				// global settings or any user-level file (unlike "Trust parent folder" or
+				// `defaultProjectTrust: always`), so the security boundary stays where it
+				// was. Forced here, not inherited from the caller: `subagents.rpc.approve`
+				// stays the opt-in for the HEADLESS rpc backend, which has no UI to block.
+				approve: true,
 				...(rewritePath ? { pathRewrite: rewritePath } : {}),
 			});
 			if (target !== undefined && remoteDirPath !== undefined) {
