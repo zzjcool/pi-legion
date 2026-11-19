@@ -1159,6 +1159,71 @@ export function missingRemoteCwdQuestion(host: string): string {
 	return `host '${host}' needs a directory on that machine, and this call did not name one — which directory should the child work in? Pass it with the call: subagent({ agent: "centurion", host: "${host}", cwd: "/abs/path/on/${host}", task: "..." }) (that path is read ON ${host}; it is never translated from here). If this conversation has not named a directory on ${host}, ask the user which one to use. Do not ssh or run \`hc exec\` to browse that machine — a guess here becomes a child in the wrong tree.`;
 }
 
+/**
+ * What a READ-ONLY remote call needs to know about a machine: WHO, not WHERE.
+ *
+ * Deliberately a narrower type than {@link HostTarget}. A target carries the launch
+ * facts (cwd, node, piCli, pathMap, extensions) and `resolveHostTarget` refuses to
+ * build one without an absolute `cwd` — correctly, because a launch in a guessed
+ * directory edits the wrong tree. A read has no such question: `file.read`/
+ * `terminal.get`/`machine.exec` are addressed by `on: <host>` plus an absolute path
+ * the RECORD already holds. Requiring a launch target for a read is what made a
+ * zero-config `collect` refuse before it ever fetched anything (`d0`): the launch had
+ * discovered its cwd per call, so `hosts.<host>` stayed empty, and the read-back
+ * treated "no settings entry" as "this machine cannot be named".
+ *
+ * `mirrorRoot` is present only when it can be derived (`hosts.<host>.cwd` or a
+ * `worktreeRoot`), and it is a FALLBACK: a record written by schema v5 carries
+ * `remote_dir`, so the transcript's path is known without any host config at all.
+ */
+export interface RemoteReadTarget {
+	/** `hc` machine name — the `on` parameter of every read. */
+	host: string;
+	/** Where that machine keeps mirrored run dirs, when derivable from the settings. */
+	mirrorRoot?: string;
+}
+
+/**
+ * Resolve a machine for a READ-ONLY call, from `crossMachine` alone (`d0`).
+ *
+ * The only requirement is what the launch's own gate requires: cross-machine must be
+ * enabled and the host must have a name. No `cwd`, no `piExtensions`, no discovery —
+ * none of those is a fact a read needs, and demanding them is how a working launch
+ * became an un-readable child.
+ *
+ * Throws exactly where a read genuinely cannot proceed: cross-machine disabled, or no
+ * host name. A missing `hosts.<host>` entry is NOT one of those cases; it only means
+ * `mirrorRoot` is unknown, and a record with `remote_dir` does not need it.
+ */
+export function resolveReadTarget(
+	host: string,
+	config: SubagentsSettings["crossMachine"] | undefined,
+): RemoteReadTarget {
+	const name = normalizeHost(host);
+	if (name === undefined) {
+		throw new SubagentError(
+			"a remote read needs a host name; a local child has no transcript on another machine",
+			ErrorCodes.INVALID_PARAMS,
+		);
+	}
+	if (config?.enabled !== true) {
+		throw new SubagentError(
+			`host '${name}' needs subagents.crossMachine.enabled = true`,
+			ErrorCodes.INVALID_PARAMS,
+			{ host: name },
+		);
+	}
+	const entry = config.hosts?.[name];
+	const cwd = typeof entry?.cwd === "string" ? entry.cwd.trim() : "";
+	const mirrorRoot = entry !== undefined && cwd.length > 0 && path.posix.isAbsolute(cwd)
+		// The SAME expression `resolveHostTarget` uses for `mirrorRoot` (worktreeRoot
+		// decides the prefix, `REMOTE_MIRROR_DIR_NAME` is the leaf), so a configured host
+		// cannot have two mirror dirs depending on who asks.
+		? path.posix.join(path.posix.dirname(resolveWorktreeRoot(name, cwd, entry.worktreeRoot)), REMOTE_MIRROR_DIR_NAME)
+		: undefined;
+	return { host: name, ...(mirrorRoot !== undefined ? { mirrorRoot } : {}) };
+}
+
 export function resolveHostTarget(
 	host: string,
 	config: SubagentsSettings["crossMachine"] | undefined,
@@ -2420,6 +2485,81 @@ function discoveryIncompleteError(
 
 // ── S1: the transport layer (one round trip each) ──────────────────────────
 
+/**
+ * What a `terminal.get` reply says about the PROGRAM in that terminal.
+ *
+ * `hc`'s own schema separates the two questions, and so must we:
+ *  - `state` is the TERMINAL's: `"live"` or `"finished"`. A terminal the core
+ *    KEEPS (`keep`/`rm` off, the default) stays `"live"` after its program exits
+ *    — that is the whole point of keeping it, and it is why reading `state` alone
+ *    reports a finished child as "still working there" (the defect `recover`
+ *    shipped with: `read-back 8 of 8 lines` next to `still 'live'`).
+ *  - the PROGRAM's end is said by `exit_code` / `finished_ms` / `reason` (hc's
+ *    documented end reasons), or by its own last word `status.state` leaving the
+ *    working set (`done`/`error`).
+ *
+ * One rule, two readers (`createRemoteTerminalProbe` for recovery,
+ * `TerminalSupervisor.startupFacts` for the startup-death gate), so "is that child
+ * over?" cannot be answered two ways.
+ */
+export interface HcTerminalRunFacts {
+	/** The TERMINAL's state: `"live"` or `"finished"` (hc `RunResult.state`). */
+	state?: string;
+	/** Set once the program ended — the core's exit code. */
+	exit_code?: number | null;
+	/** Set once the program ended (hc `RunResult.finished_ms`). */
+	finished_ms?: number | null;
+	/** Why the program ended: exited, killed, signaled, holder_lost, … */
+	reason?: string | null;
+	/**
+	 * The program's own word (hc `RunResult.status`, OSC 7501):
+	 * `idle` | `working` | `done` | `blocked` | `error`.
+	 */
+	status?: { state?: string } | null;
+}
+
+/** The program's words that mean "this turn is over", never "still working". */
+const TERMINAL_PROGRAM_ENDED_STATUS = new Set(["done", "error"]);
+
+/**
+ * The one judgement: has the PROGRAM in this terminal ended?
+ *
+ * Returns WHY, so a caller can say it (a verdict line, a startup-death probe):
+ * `exit` (the core recorded the end), `status` (the program said it was done) or
+ * `missing` (the core does not hold the terminal at all). `undefined` = still
+ * running, i.e. every end signal is absent and the program's own word is one of
+ * the working set or absent entirely.
+ */
+export function terminalProgramEnd(
+	facts: HcTerminalRunFacts | undefined,
+	opts: { terminalInferred?: boolean } = {},
+): { by: "exit" | "status" | "missing"; detail: string } | undefined {
+	if (!facts) return { by: "missing", detail: "the core returned no facts" };
+	const state = typeof facts.state === "string" ? facts.state.trim() : "";
+	if (state === "missing") {
+		// `terminal.get` said `not_found`: a fact about the ADDRESS. Only a recorded
+		// one proves the child ended (an inferred spelling proves nothing).
+		return opts.terminalInferred === true ? undefined : { by: "missing", detail: "the core does not hold that terminal" };
+	}
+	if (typeof facts.exit_code === "number") {
+		return { by: "exit", detail: `exit ${facts.exit_code}` };
+	}
+	if (typeof facts.finished_ms === "number") return { by: "exit", detail: "the core recorded when it finished" };
+	if (typeof facts.reason === "string" && facts.reason.trim().length > 0) {
+		return { by: "exit", detail: `the core says it ended (${facts.reason.trim()})` };
+	}
+	if (state === "finished") return { by: "exit", detail: "terminal state 'finished'" };
+	const program = typeof facts.status?.state === "string" ? facts.status.state.trim() : "";
+	if (TERMINAL_PROGRAM_ENDED_STATUS.has(program)) return { by: "status", detail: `the program reported '${program}'` };
+	return undefined;
+}
+
+/** The program's own word, for a verdict line (`done`, `working`, …), or `undefined`. */
+export function terminalProgramWord(facts: HcTerminalRunFacts | undefined): string | undefined {
+	const word = typeof facts?.status?.state === "string" ? facts.status.state.trim() : "";
+	return word.length > 0 ? word : undefined;
+}
+
 /** The `hc` `machine.exec` result, with BASE64 stdout/stderr (real core shape). */
 export interface HcExecResult {
 	code?: number | null;
@@ -2839,7 +2979,8 @@ function isNotFoundError(error: unknown): boolean {
  */
 export async function probeRemoteChild(opts: {
 	client: HcClient;
-	target: HostTarget;
+	/** WHO to ask (`d0`): the probe addresses the machine and a path it already has. */
+	target: RemoteReadTarget;
 	/** `host/name` — the address the core holds, not a bare name (D2). */
 	terminal: string;
 	sessionPath: string;

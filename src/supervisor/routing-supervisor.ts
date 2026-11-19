@@ -351,6 +351,22 @@ export class RoutingSupervisor implements LegionSupervisor {
 		return this.backendFor(name).retire(name, opts);
 	}
 
+	/**
+	 * E2: release every backend's session-scoped transport. Best-effort and
+	 * isolated per backend: one backend failing to close must not leave another's
+	 * `hc connect` attached, which is the state that hangs `pi --print`.
+	 */
+	shutdown(): void {
+		const backends: Array<LegionSupervisor | undefined> = [this.rpc, this.inprocess, this.terminalSeam];
+		for (const backend of backends) {
+			try {
+				backend?.shutdown?.();
+			} catch {
+				/* closing a transport is not a verdict, and this runs on the way out */
+			}
+		}
+	}
+
 	onEvent(
 		name: string,
 		listener: SupervisorEventListener,

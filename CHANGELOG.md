@@ -9,6 +9,51 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [Unreleased] — 6.2.3（patch）
+
+6.2.2 真机复跑暴露的 D / E 两个缺陷，外加自测台 `make xm` 钉住的两条真 bug（d0 / d1）。
+报告：`docs/reports/recover-and-false-failed.md`。
+
+- **D：新会话真的能恢复上一个进程的跨机 child**。`recover` 之前只认**本进程内存里的** ledger
+  identity（`ownLegionIdentity()`），而 identity 只在「本进程 launch 过一次」时存在 —— 于是
+  「上一个进程已经退出」这个 action 唯一的用途恰好不可用，一律回
+  `No legion ledger in this session`，`/legion status` 的 recoverable 块也永远空。
+  现在没有内存 identity 时**从磁盘**找（`<cwd>/.pi-subagents` 的 run store）：
+  `run.json` 的 `sessionFile` 命中本会话优先，否则 store 内最新、含该 node 名的 run；找到的句柄由
+  这次调用自己开关。`/legion status` 与 `recover` 用同一个发现函数，两个界面不会各说一套。
+- **D：settle 真的写回，第二次调用零 fetch**。判定阶梯重排为「已 terminal 的行第一，且不碰网络」——
+  只读**本机已存在的 mirror**，没有 mirror 就如实说「没有 fetch」+ 远端路径 + 取回命令。
+  之前 `already-settled` 排在 liveness 之后，而 `hc` 的终端在程序退出后仍保留
+  （`state` 恒为 `live`），所以第二次 `recover` 永远答「still live」、行永远不 settle。
+  同时把「终端还活着」与「程序已结束」拆开（`terminalProgramEnd`：`exit_code` /
+  `finished_ms` / `reason` / `state === "finished"` / program `done|error`），不再让保留终端冒充活进程。
+- **E：成功的跨机 child 不再被判 `failed`**。`assertLocalWorktree(child)` 站在 collect 的验收路径上，
+  而跨机 child 拥有自己的树（`worktreeHost`）—— 于是在任何 verdict 被评出之前整条记录就被拒，
+  2/2 复现。D13 守卫按它真正保护的东西收窄：远端树上的**本机** fs/git（删除、复用）仍拒，
+  远端 verify 走 `machine.exec{on}`，没有 remote-verify 时一条命令都不跑（attestation 照旧）。
+- **E：清理失败只做补充，绝不顶替真因**。launch 的 rollback 之前裸调 `removeChildWorktree`，
+  它自己再抛就把原始原因覆盖掉；现在逐步 try/catch 聚合成 `secondary: …`（原错误在前，
+  `code`/`details`/`stack` 保留）。collect 侧同一原则：有 assistant 回复的一轮就**是**交付，
+  管道抛错降级成 `<verdict> (delivered with cleanup warning: <原因>)`，输出 / artifact / ledger
+  的二次写入全部 best-effort。
+- **E：`pi -p` 自己退出**。终端后端持有一个会话级 `hc connect` 子进程，但没有任何地方关闭它；
+  `pi --print` 是「turn 结束让事件循环排空」（从不 `process.exit`），一个 ref 住的子进程就是一次
+  永不返回的 headless run（6.2.2 真机是手动 kill 的）。新增 `LegionSupervisor.shutdown?()`，
+  `session_shutdown` 在 retire 之后无条件关闭它（幂等、不抛），retire 等待本身也加了 5s 上限。
+  真机实测：父进程 `natural_exit=true, killed=false`，13s / 6s。
+- **d0：零配置 `collect` 真的会拉 transcript**。read-back 用的是 **launch** 解析器
+  （`resolveHostTarget` 要求 `hosts.<h>.cwd`），而零配置启动按调用发现目录、`hosts` 本来就空 ——
+  于是在第一次 fetch 之前就失败，还被上层吞掉，调用者只看到随后 D13 那句。新增
+  `resolveReadTarget`：读只需要 host，`mirrorRoot` 仅作 fallback；read-back 与终端探针都改用它。
+- **d1：远端 child 的 `collect` 能出 verdict**（同 E 的收窄）。另外
+  `verificationSummary` 之前用同一守卫读**本机**文件系统，而它的调用者正是 collect head，
+  跨机 child 因此丢一整行 `verification:`；现在远端树报记录值并标 `staleUnknown`
+  （`staleness not checked here (the tree is on another machine)`）。
+- **自测台**：`test/docker/xm/assert.mjs` 的 d0 / d1 从「钉住现状」翻成**正向断言**（mirror 行数、
+  远端最后一条 assistant 文本、read-back 行、verdict，且不得出现任何 ownership 句子）；
+  新增 `x0`：父 `pi --print` 必须**自己退出**（`killed` 即失败）——harness 之前把这个缺陷写成注释
+  并绕过了它。`xm-up.sh` 修一个只在「宿主 HOME 恰好是 `/root`」时才工作的挂载假设。
+
 ## [6.2.2] — 2026-11-19
 
 6.2.1 真机复跑暴露的三个问题 + 两个产品要求，都是「第一次就能跑通」这一目标的收尾。

@@ -2704,6 +2704,17 @@ export interface VerificationSummary {
 	outputFile?: string;
 	checkedAt: number;
 	stale: boolean;
+	/**
+	 * The tree belongs to ANOTHER machine, so staleness cannot be judged here (`d1`).
+	 *
+	 * `stale` is computed from this machine's filesystem (`checkoutMatchesPass`,
+	 * `verificationTree`), and a remote `worktreePath` only *looks* like a local path.
+	 * The two honest answers were "refuse the whole read" (which dropped the line from
+	 * the collect head entirely) and "claim it is current" (which cannot be checked);
+	 * this field is the third: report what was recorded, and say the staleness question
+	 * was not answered here.
+	 */
+	staleUnknown?: true;
 }
 
 /**
@@ -2726,8 +2737,22 @@ export function verificationSummary(node: LegionNode): VerificationSummary | und
 	// reader of the collect head is asking about the delivery, and the stint is the
 	// gate's own business.
 	const where = typeof stored.cwd === "string" ? stored.cwd : undefined;
-	// D13: `checkoutMatchesPass`/`verificationTree` read this machine's filesystem.
-	assertLocalWorktree(node);
+	// `d1`: the staleness question is asked of a FILESYSTEM, so it is asked only when
+	// this machine owns the tree. D13 used to answer "not yours" by throwing, and the
+	// caller of this function is the collect head — so a cross-machine child lost its
+	// verification line (or, one layer up, its whole delivery). The recorded facts are
+	// still the truth about what ran; only the re-check is skipped, and it says so.
+	const treeHost = normalizeHost(node.worktreeHost);
+	if (treeHost !== undefined) {
+		return {
+			commandCount: stored.commandCount,
+			...(typeof stored.passed === "boolean" ? { passed: stored.passed } : {}),
+			...(stored.outputFile ? { outputFile: stored.outputFile } : {}),
+			checkedAt: stored.checkedAt,
+			stale: false,
+			staleUnknown: true,
+		};
+	}
 	const stale = where === undefined
 		|| !checkoutMatchesPass(where, node.worktreePath ?? null)
 		|| verificationTree(where, readTextOrEmpty(stored.contractFile)) !== stored.tree;

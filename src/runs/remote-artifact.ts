@@ -30,8 +30,13 @@ import {
 	probeRemoteChild,
 	remoteFateNextStep,
 	resolveHostTarget,
+	resolveReadTarget,
+	terminalProgramEnd,
+	terminalProgramWord,
+	type HcTerminalRunFacts,
 	type HostTarget,
 	type RemoteChildFate,
+	type RemoteReadTarget,
 } from "./remote.ts";
 import { terminalName } from "../supervisor/terminal-supervisor.ts";
 
@@ -114,7 +119,7 @@ function integer(value: unknown): number | undefined {
  */
 export async function readRemoteText(opts: {
 	client: HcClient;
-	target: HostTarget;
+	target: RemoteReadTarget;
 	remotePath: string;
 	tailLines?: number;
 }): Promise<{ text: string; lines: number; returned: number; truncated: boolean; byteCapped: boolean }> {
@@ -158,11 +163,16 @@ export function remoteMirrorPathFor(runDir: string, name: string): string {
  * resolver + the same sanitizer the launch used — the two can only agree, because
  * both are `remoteDirFor(target, runId, name)`'s answer.
  */
-export function remoteSessionPathFor(target: HostTarget, record: { name: string; remoteDir?: string }): string {
+export function remoteSessionPathFor(target: RemoteReadTarget, record: { name: string; remoteDir?: string }): string {
 	const dir = record.remoteDir && record.remoteDir.length > 0
 		? record.remoteDir
-		: path.posix.join(target.mirrorRoot, "no-run", record.name.replace(/[^A-Za-z0-9._-]/g, "-"));
-	return path.posix.join(dir, "session.jsonl");
+		// No recorded dir (a pre-v5 record) and no settings entry to derive one from: the
+		// path is UNKNOWN, and saying so beats naming a directory that was never written
+		// (`d0` — a zero-config read-back used to die on the missing entry instead).
+		: target.mirrorRoot !== undefined
+			? path.posix.join(target.mirrorRoot, "no-run", record.name.replace(/[^A-Za-z0-9._-]/g, "-"))
+			: "";
+	return dir.length > 0 ? path.posix.join(dir, "session.jsonl") : "";
 }
 
 /**
@@ -179,8 +189,23 @@ export interface RemoteTerminalProbe {
 	address: string;
 	/** The core's word: `live` | `running` | `idle` | `finished` | `missing`. */
 	state: string;
-	/** The terminal is still doing work over there (see {@link assertRemoteResume}'s rule). */
+	/**
+	 * The terminal is still doing work over there (see {@link assertRemoteResume}'s rule).
+	 *
+	 * False also when the TERMINAL is kept alive but its PROGRAM has ended — see
+	 * {@link terminalProgramEnd}: a kept terminal stays `state: "live"` after the
+	 * program exits, and reading that alone reported finished children as running.
+	 */
 	live: boolean;
+	/**
+	 * The PROGRAM's own last word (`done`, `error`, `working`, …), when it said one.
+	 *
+	 * Kept so a verdict line can say what ended rather than only that something did:
+	 * `terminal 'vps/t2' is done` is the fact the operator can check.
+	 */
+	program?: string;
+	/** The core's exit code, once the program ended. */
+	exitCode?: number;
 	/**
 	 * Set when the machine could not be asked at all.
 	 *
@@ -222,9 +247,12 @@ export function createRemoteTerminalProbe(opts: {
 		const recorded = typeof request.remoteTerminal === "string" && request.remoteTerminal.trim().length > 0
 			? request.remoteTerminal.trim()
 			: undefined;
-		let target: HostTarget;
+		let target: RemoteReadTarget;
 		try {
-			target = resolveHostTarget(request.host, opts.crossMachine);
+			// `d0`: the same read-only resolution the transcript read uses. `terminal.get` is
+			// addressed by the host and an address the record holds — a launch target (with
+			// its cwd) is not a fact this question needs.
+			target = resolveReadTarget(request.host, opts.crossMachine);
 		} catch (error) {
 			return {
 				address: recorded ?? `${request.host}/${terminalName(undefined, request.name)}`,
@@ -237,12 +265,22 @@ export function createRemoteTerminalProbe(opts: {
 		const client = opts.clientFactory ? opts.clientFactory() : hcCliClient({ env: process.env });
 		try {
 			await client.start();
-			const facts = await client.request<{ state?: string }>("terminal.get", { terminal: address });
+			const facts = await client.request<HcTerminalRunFacts>("terminal.get", { terminal: address });
 			const state = typeof facts?.state === "string" ? facts.state : "unknown";
-			// The wire's word for "alive" is `live` on some replies and `running` on others
-			// (the fake core mirrors `hc`'s RunResult, which says `running`). Both mean the
-			// work is in flight; only `finished` means it is over.
-			return { address, state, live: state === "live" || state === "running" || state === "idle" };
+			// TWO questions, not one (defect D): `state` is the TERMINAL's and a kept
+			// terminal stays `live` after its program exits; the PROGRAM's end is said by
+			// `exit_code`/`finished_ms`/`reason` or by its own word leaving the working set.
+			// `terminalProgramEnd` is the one rule (the startup-death gate reads it too), so
+			// "the terminal exists" can never again be presented as "the child is working".
+			const end = terminalProgramEnd(facts);
+			const program = terminalProgramWord(facts);
+			return {
+				address,
+				state,
+				live: end === undefined,
+				...(program !== undefined ? { program } : {}),
+				...(typeof facts?.exit_code === "number" ? { exitCode: facts.exit_code } : {}),
+			};
 		} catch (error) {
 			const gone = error instanceof HcRpcError && /not.?found|unknown terminal/i.test(`${error.kind} ${error.message}`);
 			if (gone) return { address, state: "missing", live: false };
@@ -287,13 +325,17 @@ export function createRemoteSessionReadback(opts: {
 	clientFactory?: () => HcClient;
 }): (request: RemoteSessionRequest) => Promise<RemoteReadbackResult> {
 	return async (request) => {
-		let target: HostTarget;
+		let target: RemoteReadTarget;
 		try {
-			target = resolveHostTarget(request.host, opts.crossMachine);
+			// `d0`: a READ needs the host, not a launch target. `resolveReadTarget` accepts
+			// a zero-config machine (`crossMachine.enabled` only) because `file.read` is
+			// addressed by `on: <host>` plus a path the RECORD already holds — that is the
+			// whole fix: a launch that discovered its directory per call left
+			// `hosts.<host>` empty, and this read-back used to refuse on that emptiness
+			// before attempting a single fetch.
+			target = resolveReadTarget(request.host, opts.crossMachine);
 		} catch (error) {
-			// Nothing about the child is knowable: this machine cannot even name its
-			// target. D1: the missing directory is answered by the CALL, not by a
-			// settings lesson, so the same two shapes the launch path prints appear here.
+			// Only a genuinely unnameable machine lands here now (disabled, or no host).
 			const message = error instanceof Error ? error.message : String(error);
 			const missingCwd = message.includes(missingRemoteCwdQuestion(request.host));
 			return unreachableFailure(request.host, message, {
@@ -303,10 +345,23 @@ export function createRemoteSessionReadback(opts: {
 					: `fix subagents.crossMachine.hosts.${request.host} (enabled, cwd, piExtensions): the launch and this read-back must resolve the same target`,
 			});
 		}
-		const client = opts.clientFactory ? opts.clientFactory() : hcCliClient({ env: process.env });
 		// The target resolved, so the file this machine WOULD have read is knowable —
 		// and a failure that cannot name it leaves the operator with nothing to fetch.
 		const attemptedPath = remoteSessionPathFor(target, request);
+		if (attemptedPath.length === 0) {
+			// Neither the record nor the settings can say where the transcript is. Naming
+			// the missing fact is the only actionable answer; fetching a guess is not.
+			// Decided BEFORE the transport exists, so this path opens nothing to close.
+			return unreachableFailure(
+				request.host,
+				`the record for '${request.name}' has no remote_dir, and this machine has no subagents.crossMachine.hosts.${request.host}.cwd to derive one from`,
+				{
+					evidence: ["no remote_dir on the record", `no hosts entry for '${request.host}'`],
+					nextStep: `pin the directory ON ${request.host}, or read the transcript by hand: hc exec --on ${request.host} -- cat <mirror dir>/session.jsonl`,
+				},
+			);
+		}
+		const client = opts.clientFactory ? opts.clientFactory() : hcCliClient({ env: process.env });
 		try {
 			await client.start();
 		} catch (error) {
@@ -418,11 +473,15 @@ export function createRemoteSessionReadback(opts: {
  * disagreement every time a run id differs from the production default, i.e. it
  * would turn "nothing has been written yet" into "the dirs disagree".
  */
-function configuredMirrorDirFor(target: HostTarget, request: RemoteSessionRequest): string {
+function configuredMirrorDirFor(target: RemoteReadTarget, request: RemoteSessionRequest): string {
 	const recorded = typeof request.remoteDir === "string" ? request.remoteDir.trim() : "";
 	const runSegment = recorded.length > 0 ? path.posix.basename(path.posix.dirname(recorded)) : "no-run";
 	const handleSegment = recorded.length > 0 ? path.posix.basename(recorded) : request.name.replace(/[^A-Za-z0-9._-]/g, "-");
-	return path.posix.join(target.mirrorRoot, runSegment, handleSegment);
+	// No derivable prefix (`d0`: a zero-config machine): the record's own dir is the only
+	// dir there is, so there is nothing to disagree with.
+	return target.mirrorRoot !== undefined
+		? path.posix.join(target.mirrorRoot, runSegment, handleSegment)
+		: recorded;
 }
 
 /** The evidence lines a terminal contributes (`terminal finished`, `exit 1`). */
@@ -451,7 +510,7 @@ function terminalEvidence(fate: RemoteChildFate): string[] {
  * case becomes `path` with the read's own reason preserved by the caller.
  */
 function classifyReadbackFailure(opts: {
-	target: HostTarget;
+	target: RemoteReadTarget;
 	request: RemoteSessionRequest;
 	fate: RemoteChildFate;
 	configuredDir: string;
@@ -459,7 +518,7 @@ function classifyReadbackFailure(opts: {
 	const { fate, request, configuredDir } = opts;
 	const recorded = typeof request.remoteDir === "string" ? request.remoteDir.trim() : "";
 	const kind: RemoteReadbackFate = fate.kind === "started" ? "path" : fate.kind;
-	const mismatch = recorded.length > 0 && recorded !== configuredDir;
+	const mismatch = recorded.length > 0 && configuredDir.length > 0 && recorded !== configuredDir;
 	const evidence: string[] = [];
 	if (fate.kind === "started") evidence.push(`the transcript exists at ${fate.sessionPath} but the read failed`);
 	// An inferred address explains its own `missing`: the record predates the address

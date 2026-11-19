@@ -24,7 +24,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,7 +34,7 @@ import { Orchestrator } from "../../src/runs/orchestrator.ts";
 import { renderLegionStatus } from "../../src/extension/legion-status.ts";
 import { hcCliClient } from "../../src/hc/client.ts";
 import { openLegionDb, type DatabaseSync } from "../../src/legion/db.ts";
-import { readEventsAfter } from "../../src/legion/events.ts";
+import { appendEvent, readEventsAfter } from "../../src/legion/events.ts";
 import {
 	getNode,
 	getSubtree,
@@ -68,6 +68,8 @@ interface Harness {
 	/** The same file on THIS filesystem (the fake core's `FAKE_HC_REMOTE_ROOT`). */
 	localSessionPath: string;
 	settings: CrossMachineSettings;
+	/** The fake core's request log: "no second fetch" is asserted against the wire. */
+	coreLog: string;
 	cleanup: () => void;
 }
 
@@ -81,11 +83,13 @@ function harness(prefix = "recover-xm-"): Harness {
 	const wrapper = path.join(binDir, "hc");
 	writeFileSync(wrapper, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_CORE)} "$@"\n`, { mode: 0o755 });
 	chmodSync(wrapper, 0o755);
+	const coreLog = path.join(root, "core.jsonl");
 	const previous = { ...process.env };
 	Object.assign(process.env, {
 		HC_BIN: wrapper,
 		FAKE_HC_REMOTE_ROOT: remoteRoot,
 		FAKE_HC_MACHINES: HOST,
+		FAKE_HC_LOG: coreLog,
 	});
 	const remoteDir = path.posix.join(remoteRoot, ".pi-subagents-mirror", "run-1", NODE_NAME);
 	const remoteSessionPath = path.posix.join(remoteDir, "session.jsonl");
@@ -98,8 +102,9 @@ function harness(prefix = "recover-xm-"): Harness {
 		remoteSessionPath,
 		localSessionPath: path.join(remoteRoot, ".pi-subagents-mirror", "run-1", NODE_NAME, "session.jsonl"),
 		settings: { enabled: true, hosts: { [HOST]: { cwd: remoteCwd } } },
+		coreLog,
 		cleanup: () => {
-			for (const key of ["HC_BIN", "FAKE_HC_REMOTE_ROOT", "FAKE_HC_MACHINES"]) {
+			for (const key of ["HC_BIN", "FAKE_HC_REMOTE_ROOT", "FAKE_HC_MACHINES", "FAKE_HC_LOG"]) {
 				if (previous[key] === undefined) delete process.env[key];
 				else process.env[key] = previous[key];
 			}
@@ -176,6 +181,13 @@ function seedLeftover(h: Harness, overrides: { status?: "running" | "settled" } 
 /** This session's connection to the same ledger: no state shared with the seeder. */
 function newSessionDb(h: Harness): DatabaseSync {
 	return openLegionDb(h.dbPath);
+}
+
+/** How many hc requests the fake core has answered so far. */
+function coreRequests(h: Harness): number {
+	return existsSync(h.coreLog)
+		? readFileSync(h.coreLog, "utf8").split("\n").filter((line) => line.trim().length > 0).length
+		: 0;
 }
 
 function textOf(result: Awaited<ReturnType<typeof recoverAction>>): string {
@@ -301,22 +313,42 @@ test("a transcript that is not on that machine is `unknown` with the fetch comma
 	assert.deepEqual(listUnsettledRemoteNodes(db).map((node) => node.name), [NODE_NAME]);
 });
 
-test("a row that is already terminal answers `already settled` and writes nothing", async (t) => {
+/**
+ * D3: `already settled` is answered from the LEDGER — no fetch, no probe, no write.
+ *
+ * The recorded settle event is the verdict (that is what a settled row means), and
+ * the child's prose comes from the mirror this machine already holds. A second
+ * `recover` used to re-read the transcript and re-probe the machine even though the
+ * answer could not change; the fake core's request log is what makes "no fetch"
+ * assertable rather than implied.
+ */
+test("a row that is already terminal answers `already settled` with the RECORDED verdict, and fetches nothing", async (t) => {
 	const h = harness("recover-xm-terminal-");
 	t.after(() => h.cleanup());
 	writeRemoteSession(h, finishedTranscript("finished before the restart"));
 	seedLeftover(h, { status: "settled" });
 	const db = newSessionDb(h);
 	t.after(() => db.close());
+	// The settle event a previous recovery wrote: `emitStored`'s shape.
+	appendEvent(db, NODE_ID, "node_settled", { execution: "success", reason: "recovered earlier" }, { now: () => Date.now() - 60_000 });
+	// The mirror that earlier read-back left behind (`<ledger dir>/remote/<name>.jsonl`),
+	// so the child's own prose is available from THIS machine's disk.
+	const mirrorDir = path.join(h.root, "run", "remote");
+	mkdirSync(mirrorDir, { recursive: true });
+	writeFileSync(path.join(mirrorDir, `${NODE_NAME}.jsonl`), finishedTranscript("finished before the restart"));
 
-	const before = eventsFor(db, NODE_ID).length;
+	const beforeEvents = eventsFor(db, NODE_ID).length;
+	const beforeRequests = coreRequests(h);
 	const text = textOf(
 		await recoverAction({ params: { name: NODE_NAME }, legion: { db, dbPath: h.dbPath }, crossMachine: h.settings }),
 	);
 	assert.match(text, new RegExp(`^recover: '${NODE_NAME}' is already settled \\(settled\\)`), text);
-	assert.match(text, /^execution: success$/m);
-	assert.match(text, /finished before the restart/);
-	assert.equal(eventsFor(db, NODE_ID).length, before, "no event was appended");
+	assert.match(text, /nothing was fetched/, "the idempotent answer says it did not go to the wire");
+	assert.match(text, /^execution: success \(recovered earlier\)$/m, "the verdict and its reason are the RECORDED ones");
+	assert.match(text, /recovered earlier/, "and its recorded reason");
+	assert.match(text, /finished before the restart/, "the prose comes from the local mirror");
+	assert.equal(coreRequests(h), beforeRequests, "a settled row must not fetch or probe the machine");
+	assert.equal(eventsFor(db, NODE_ID).length, beforeEvents, "no event was appended");
 	assert.equal(getNode(db, NODE_ID)?.status, "settled");
 });
 

@@ -84,6 +84,16 @@ export interface FakeSupervisorOptions {
 	 * field at all, exactly like a clean spawn.
 	 */
 	handleWarning?: string | ((input: SpawnInput) => string | undefined);
+	/**
+	 * Fields the returned {@link ChildHandle} should carry, as a REAL backend's
+	 * cross-machine spawn does.
+	 *
+	 * A remote terminal backend creates the tree on THAT machine and can only report
+	 * it on the handle (`Orchestrator.launch` reads `result.worktreePath`). Tests for a
+	 * child that OWNS a remote tree (D13's pair, defect E1) need the same shape without
+	 * an `hc` core, so the fake can be told what its handle says.
+	 */
+	handleExtras?: { worktreePath?: string; worktreeBranch?: string; worktreeHost?: string };
 	/** Optional initial cumulative stats snapshot. */
 	usage?: UsageSnapshot | null;
 }
@@ -132,6 +142,7 @@ export class FakeSupervisor implements LegionSupervisor {
 	private readonly autoSettle?: FakeSupervisorOptions["autoSettle"];
 	private readonly rejectSpawn?: FakeSupervisorOptions["rejectSpawn"];
 	private readonly handleWarning?: FakeSupervisorOptions["handleWarning"];
+	private readonly handleExtras?: FakeSupervisorOptions["handleExtras"];
 	private readonly initialUsage: UsageSnapshot | null;
 	/**
 	 * Disposition every `steer` call reports (#313). Defaults to the honest
@@ -145,6 +156,7 @@ export class FakeSupervisor implements LegionSupervisor {
 		this.autoSettle = options.autoSettle;
 		this.rejectSpawn = options.rejectSpawn;
 		this.handleWarning = options.handleWarning;
+		this.handleExtras = options.handleExtras;
 		this.initialUsage = options.usage ?? null;
 	}
 
@@ -208,6 +220,7 @@ export class FakeSupervisor implements LegionSupervisor {
 			sessionFile: input.sessionFile,
 			pid: 1000 + this.spawns.length,
 			...(warning ? { warning } : {}),
+			...(this.handleExtras ?? {}),
 		};
 	}
 

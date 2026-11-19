@@ -66,6 +66,7 @@ import {
 	type RunRecord,
 	type SpawnMode,
 	SubagentError,
+	withSecondaryFailures,
 	type Usage,
 } from "../shared/types.ts";
 import { RpcSupervisor } from "../supervisor/rpc-supervisor.ts";
@@ -102,7 +103,7 @@ import {
 	type RemoteReadbackResult,
 	type RemoteSessionRequest,
 } from "./remote-artifact.ts";
-import { assertLocalWorktree, normalizeHost, type HostTarget } from "./remote.ts";
+import { assertLocalWorktree, localWorktreePath, normalizeHost, type HostTarget } from "./remote.ts";
 
 export interface BudgetRefusedEvent {
 	type: "budget_refused";
@@ -161,6 +162,15 @@ export interface OrchestratorDeps {
 	 * keeps today's behaviour (no remote text), which is what the local path is.
 	 */
 	remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
+	/**
+	 * Test seam for the launch ROLLBACK's worktree removal (defect E).
+	 *
+	 * The aggregation the launch path performs (`withSecondaryFailures`) is about
+	 * what happens when a cleanup step throws, and a step that cannot be made to
+	 * throw on purpose is a rule with no test. Production passes nothing and gets
+	 * the real {@link removeChildWorktree}.
+	 */
+	removeWorktree?: (opts: { repoCwd: string; dest: string; worktreeHost?: string }) => void;
 	/** Post-create bootstrap for child worktrees (legion.worktreeBootstrap). */
 	worktreeBootstrap?: string;
 	worktreeBootstrapTimeoutMs?: number;
@@ -179,6 +189,11 @@ export interface OrchestratorDeps {
 	launchQueue?: { maxPending?: number; timeoutMs?: number };
 	/** D9: one user-visible line per queued / admitted / expired / stopped launch. */
 	onLaunchQueueNotice?: (line: string) => void;
+}
+
+/** One failure as text — the form every rollback/diagnostic line uses (defect E). */
+function messageOf(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -659,6 +674,7 @@ export class Orchestrator {
 	private readonly maxSpawns: number | null;
 	private readonly verifyRunner?: VerifyRunner;
 	private readonly remoteVerify?: RemoteVerifyRunner;
+	private readonly removeWorktree: (opts: { repoCwd: string; dest: string; worktreeHost?: string }) => void;
 	private readonly remoteReadback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
 	/**
 	 * This collect's remote transcripts, keyed by child name. Filled at the top of
@@ -746,6 +762,7 @@ export class Orchestrator {
 		this.maxSpawns = deps.maxSpawns ?? null;
 		this.verifyRunner = deps.verifyRunner;
 		this.remoteVerify = deps.remoteVerify;
+		this.removeWorktree = deps.removeWorktree ?? removeChildWorktree;
 		this.remoteReadback = deps.remoteReadback;
 		this.worktreeBootstrap = deps.worktreeBootstrap?.trim() || undefined;
 		this.worktreeBootstrapTimeoutMs = deps.worktreeBootstrapTimeoutMs;
@@ -2015,19 +2032,40 @@ export class Orchestrator {
 					);
 				});
 			}
+			// E: every cleanup step below is ADDITIONAL information. A rollback that
+			// throws its own error used to replace the reason the launch died (`throw
+			// error` was reached with the cleanup's message — the 6.2.2 run reported a
+			// worktree-ownership guard as the reason a successful child "failed"), so each
+			// one is caught and attached as a `secondary:` line instead.
+			const secondary: string[] = [];
+			const cleanup = (what: string, step: () => void): void => {
+				try {
+					step();
+				} catch (cleanupError) {
+					const detail = `${what}: ${messageOf(cleanupError)}`;
+					secondary.push(detail);
+					process.stderr.write(`[pi-legion] rollback of '${name}' did not complete — ${detail}. The launch failed for the reason above; this is what could not be undone.\n`);
+				}
+			};
 			// #371 (m8): unconditional — `rollbackReservation` only runs once the launch
 			// reached `reserveNode`, but worktree creation and provisioning fail before
 			// that and still need the entry gone.
 			if (nodeId) this.declaredPhases.delete(nodeId);
-			if (reserved && nodeId) this.rollbackReservation(nodeId, reservedNode);
+			if (reserved && nodeId) cleanup("ledger reservation rollback failed", () => this.rollbackReservation(nodeId, reservedNode));
 			if (parentReservationCreated && this.legion?.runStore) {
 				try { await this.legion.runStore.removeChild(this.legion.runId!, name, nodeId); } catch { /* rollback is best effort */ }
 			}
 			if (createdRunId && this.legion?.runStore) {
 				try { fs.rmSync(this.legion.runStore.runDir(createdRunId), { recursive: true, force: true }); } catch { /* rollback is best effort */ }
 			}
-			if (createdWorktree && worktreePath) removeChildWorktree({ repoCwd: this.cwd, dest: worktreePath });
-			throw error;
+			// D13 keeps its power here — `removeChildWorktree` still refuses a tree that
+			// belongs to another machine. What changed is only WHAT that refusal may do:
+			// it becomes a `secondary:` line, never the launch's verdict.
+			const rollbackTree = createdWorktree ? worktreePath : undefined;
+			if (rollbackTree !== undefined) {
+				cleanup(`worktree rollback for '${rollbackTree}' failed`, () => this.removeWorktree({ repoCwd: this.cwd, dest: rollbackTree }));
+			}
+			throw withSecondaryFailures(error, secondary);
 		}
 	}
 
@@ -3544,7 +3582,83 @@ export class Orchestrator {
 		return { execution, output: parsed.output, usage: parsed.usage, model: parsed.model ?? child.model ?? null, acceptance, blocked: true };
 	}
 
+	/**
+	 * The delivery verdict for one finished turn, and the ONE exit every collect takes.
+	 *
+	 * Defect E: the plumbing BELOW this line (verification, ledger settle, artifact
+	 * write, a D13 guard) is not the child's verdict. A throw from it used to escape
+	 * `collect`, and the watch turned any thrown collect into a `failed` notice — so a
+	 * cross-machine centurion that had answered correctly was reported `failed` for a
+	 * reason that had nothing to do with its work. A finished turn with an assistant
+	 * message IS a delivered reply (the same rule `deriveOutcome` uses to decide
+	 * `aborted`), so the delivery survives a cleanup failure and says so:
+	 * `success (delivered with cleanup warning: …)`. The original reason travels
+	 * verbatim inside that line, so nothing is swallowed either.
+	 */
 	private async finishCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>, input: Execution, deadline: number): Promise<CollectResult> {
+		try {
+			return await this.gradeCollect(child, parsed, input, deadline);
+		} catch (error) {
+			const delivered = this.deliveredDespiteCleanupFailure(child, parsed, error);
+			if (!delivered) throw error;
+			return delivered;
+		}
+	}
+
+	/**
+	 * The turn's own grade, published with the cleanup failure ATTACHED (defect E).
+	 *
+	 * Deliberately not a second grading ladder: the execution is `deriveOutcome`'s (the
+	 * same function the normal path uses), and only the reason is extended. `undefined`
+	 * when the child never delivered a reply — an unfinished or silent child must keep
+	 * the original failure, because for it the failure really is the verdict.
+	 */
+	private deliveredDespiteCleanupFailure(
+		child: ChildRecord,
+		parsed: ReturnType<typeof parseSessionFile>,
+		error: unknown,
+	): CollectResult | undefined {
+		if (!isLastTurnComplete(parsed) || parsed.lastTurnOutput === null) return undefined;
+		const graded = deriveOutcome(parsed);
+		if (graded.status === "running" || graded.status === "unknown") return undefined;
+		const warning = `delivered with cleanup warning: ${messageOf(error)}`;
+		const execution: Execution = { ...graded, reason: graded.reason ? `${graded.reason}; ${warning}` : warning };
+		process.stderr.write(
+			`[pi-legion] '${child.name}': its turn finished, so this result is delivered — ${messageOf(error)}\n`,
+		);
+		const acceptance = deriveAcceptance(parsed, execution, child.pendingCriteria, { ...(child.completionGuard ? { completionGuard: true } : {}) });
+		// The publication steps that remain are best-effort BY DEFINITION here: the
+		// failure being handled is one of them, so a second throw must not replace the
+		// delivery either.
+		let outputFile: string | undefined;
+		let artifactId: string | undefined;
+		try {
+			const output = parsed.output;
+			const written = this.writeOutputFile(child, output);
+			outputFile = written?.file;
+			artifactId = written?.artifactId;
+		} catch { /* a missing artifact costs the pointer, never the text */ }
+		if (child.state !== "retired") child.state = "awaiting";
+		child.execution = execution;
+		child.acceptance = acceptance;
+		child.outputFile = outputFile;
+		child.artifactId = artifactId;
+		try { this.recordSettled(child, execution, true); } catch { /* the ledger row is a record of the result, not the result */ }
+		try { this.onChildUpdate(child); } catch { /* a repaint may not cost a delivery */ }
+		const readback = this.readbackFacts(child);
+		return {
+			execution,
+			output: parsed.output,
+			...(outputFile ? { outputFile } : {}),
+			...(artifactId ? { artifactId } : {}),
+			...(readback ? { remoteReadback: readback } : {}),
+			usage: parsed.usage,
+			model: parsed.model ?? child.model ?? null,
+			acceptance,
+		};
+	}
+
+	private async gradeCollect(child: ChildRecord, parsed: ReturnType<typeof parseSessionFile>, input: Execution, deadline: number): Promise<CollectResult> {
 		// Every collect ends here, so this is the one place a sticky "retried once"
 		// note can be applied without either writing it twice or losing it when the
 		// retry's own wait did not see the terminal turn (#316 review, minor 4).
@@ -3565,28 +3679,41 @@ export class Orchestrator {
 		//
 		// Only `running` is skipped: every other status keeps the exact behaviour it
 		// had before (#393 / D393-1, D393-2 are unchanged inside applyVerification).
-		// D13: acceptance runs HERE, so its cwd can only ever be a local path. A
-		// child whose tree belongs to another machine is refused by name here rather
-		// than having this machine's verifier run inside a path that means something
-		// else (remote verify is S3's work, not a silent local run).
-		assertLocalWorktree(child);
-		// S3/D14: whose machine runs the command. A child that ran elsewhere gets the
-		// remote runner — the command executes THERE, through `machine.exec{on}`, and
-		// its result carries the machine so a failure to reach it is `unknown`, never
-		// `rejected` (see `acceptance.ts`). A whole-file `assertLocalWorktree` above
-		// still refuses the local verifier against a remote TREE; this decides the
-		// cross-machine child that has no local tree at all.
 		//
+		// S3/D14 + D13 NARROWED (defect E1). Whose machine runs the command:
+		// a child that ran elsewhere gets the remote runner — the command executes
+		// THERE, through `machine.exec{on}`, and its result carries the machine so a
+		// failure to reach it is `unknown`, never `rejected` (see `acceptance.ts`).
 		// `remoteVerify` absent = this build cannot verify that host: the child's own
 		// attestation stands (pre-S3 behaviour), never a locally measured pass.
+		//
+		// The whole-record `assertLocalWorktree(child)` used to stand right here, and
+		// it is the reason a SUCCESSFUL cross-machine delivery was reported `failed`:
+		// a remote child OWNS its tree (`worktreeHost` is that machine), so the guard
+		// threw "worktree … belongs to host …" before any verdict was graded (2/2 on
+		// the 6.2.2 release run). D13's purpose is to keep a LOCAL filesystem/git
+		// operation away from a path that means something else — so it belongs on the
+		// command that RUNS, never on the delivery verdict:
+		//   - remote verify  → `machine.exec{on}`, that machine's path; nothing local;
+		//   - no remote verify → no command runs at all (the attestation stands).
+		// D13 still refuses the DELETE (`removeChildWorktree`), which is where a local
+		// recursive `rmSync` on a remote spelling could actually destroy data.
 		const remoteChild = normalizeHost(child.host) !== undefined;
-		const remoteVerify = remoteChild && this.remoteVerify
+		// The tree is on another machine when the pair names a host. Asked of the RECORD,
+		// never of `localWorktreePath`: that helper is the D13 guard itself and THROWS on
+		// a (host, path) pair, so using it as a predicate here turned the guard into the
+		// collect's verdict all over again (measured in the xm harness: the same refusal,
+		// one line lower). Absent host ⇒ today's local path, untouched.
+		const treeOnAnotherMachine = normalizeHost(child.worktreeHost) !== undefined;
+		const remoteVerify = this.remoteVerify && (remoteChild || treeOnAnotherMachine)
 			? this.remoteVerify
 			: undefined;
-		const acceptance = execution.status === "running" || (remoteChild && remoteVerify === undefined)
+		const localCwd = treeOnAnotherMachine ? this.cwd : (localWorktreePath(child) ?? this.cwd);
+		const acceptance = execution.status === "running"
+			|| (remoteVerify === undefined && (remoteChild || treeOnAnotherMachine))
 			? derived
 			: await applyVerification(derived, {
-				cwd: child.worktreePath ?? this.cwd,
+				cwd: treeOnAnotherMachine ? child.worktreePath ?? this.cwd : localCwd,
 				criteria: child.pendingCriteria,
 				run: remoteVerify && child.host
 					? (command, _cwd, timeoutMs) => remoteVerify({
