@@ -105,6 +105,18 @@ const CASES: CaseSpec[] = [
 		note: "A holds, B explicitly returns continue:false — can a sibling cancel a hold?",
 	},
 	{
+		name: "1i2-veto-first",
+		env: {
+			SPIKE_A_ITERS: "1",
+			SPIKE_A_HOLD_MS: "0",
+			SPIKE_A_MODE: "veto",
+			SPIKE_B_ITERS: "0",
+		},
+		note:
+			"A (registered FIRST) returns continue:false, B only observes — what does B see in `event.continue`? " +
+			"The pair (1f, this) is the whole #421 question: a prior veto has to be distinguishable from the sentinel",
+	},
+	{
 		name: "1j-order-ba",
 		env: { SPIKE_A_ITERS: "1", SPIKE_A_HOLD_MS: "80", SPIKE_B_ITERS: "1", SPIKE_B_HOLD_MS: "80" },
 		order: "ba",

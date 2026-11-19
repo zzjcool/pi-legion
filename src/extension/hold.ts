@@ -91,6 +91,8 @@ export interface TakenHoldNotice {
 /**
  * Why a boundary did or did not hold. `completed*` are the only outcomes that can
  * return entries; `cancelled` is the abort/Esc verdict and is never announced.
+ * `peer-continue-false` is #421: a handler BEFORE us in the settle chain said this turn
+ * must not continue, so legion may not continue it on its own account.
  */
 export type HoldOutcome =
 	| "completed"
@@ -98,6 +100,7 @@ export type HoldOutcome =
 	| "cancelled"
 	| "timeout"
 	| "user-waiting"
+	| "peer-continue-false"
 	| "idle"
 	| "nested"
 	| "mode"
@@ -105,6 +108,25 @@ export type HoldOutcome =
 	| "already-gave-up"
 	| "disposed"
 	| "error";
+
+/**
+ * What the settle chain has already decided about continuing THIS turn, as far as this
+ * host is willing to say (#421).
+ *
+ * The host hands every handler the accumulated vote (`BoundaryState.continue`) and lets
+ * the LAST writer win (`runner.js:770/775-786`). That makes the reading subtle:
+ *
+ * - `continue` — a handler before us asked the host to continue. Echoing `true` back is
+ *   not an override: the value we would write is the value the chain already holds.
+ * - `absent` — the host does not put the field on the boundary at all. "Nobody spoke" is
+ *   therefore expressible, and from then on a `false` can ONLY be a handler's own answer.
+ * - `sentinel` — `false` on a host whose "no proposal yet" value IS `false` (pi 1.5.2:
+ *   `let shouldContinue = false`, `runner.js:770`). A prior handler's veto and the empty
+ *   chain are byte-identical here, so this value CANNOT be read as a veto (see `veto`).
+ * - `veto` — `false` on a host that has already shown it omits the field when nobody has
+ *   spoken. The only reading left is that a handler before us really did return it.
+ */
+export type ChainVote = "continue" | "absent" | "sentinel" | "veto";
 
 export interface HoldRecord {
 	ev: "hold:begin" | "hold:end" | "hold:abstain" | "hold:release" | "hold:commit";
@@ -115,6 +137,8 @@ export interface HoldRecord {
 	heldMs?: number;
 	/** `name#round` of every child the hold was waiting on. */
 	children?: string[];
+	/** The chain's continuation vote at the moment this boundary opened (#421). */
+	chainVote?: ChainVote;
 	/** Entries the host already had queued for this boundary, and what we returned. */
 	entriesIn?: number;
 	entriesOut?: number;
@@ -158,6 +182,21 @@ export interface SettleHoldDeps {
 	 * must not fire mid-hold and steal the notice from under it.
 	 */
 	ownsBoundary?(): void;
+	/**
+	 * #418: the hold is done with the boundary — the settle rescue timer it cancelled in
+	 * `ownsBoundary` is armed again, in its original form.
+	 *
+	 * Called on EVERY exit after `ownsBoundary`, because every one of them opens the same
+	 * window: the notice is (back) in the outbox, the boundary that would have delivered it
+	 * has not been seen yet, and if the host never emits that boundary the notice parks
+	 * until something else pushes it. Delivering nothing (`timeout`/`cancelled`/
+	 * `user-waiting`/`completed-empty`) is the case that NEEDS the net; a delivery exit
+	 * leaves the outbox empty and the re-arm is a no-op, and the continuation it asks for
+	 * cancels the timer the normal way. Unlike `releaseNotice` this is not part of the
+	 * release-before-return order: a timer is a net for a LATER boundary, not a delivery
+	 * of this one, so it cannot make the drafts announced twice.
+	 */
+	returnsBoundary?(): void;
 	/** Frozen budget; injected only by tests. */
 	holdMaxMs?: number;
 	pollMs?: number;
@@ -191,6 +230,8 @@ interface HoldContext {
 interface BoundaryEvent {
 	entries?: unknown;
 	outcome?: unknown;
+	/** #421: the vote the host has accumulated from the handlers before us. */
+	continue?: unknown;
 }
 
 /** A lone ESC. Arrow/Alt keys arrive as `\x1b[A` / `\x1b a`. */
@@ -231,6 +272,14 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 	 * next boundary for another ten minutes.
 	 */
 	const gaveUp = new Set<string>();
+	/**
+	 * #421: has this host ever left `continue` OFF the boundary? Set once and kept: it is a
+	 * fact about the HOST, not about the boundary that revealed it. Until it is set, a
+	 * `false` is the sentinel (pi 1.5.2) and must not be read as a veto — reading it as one
+	 * would switch the whole feature off for every user of a host that starts the chain at
+	 * `false`.
+	 */
+	let absenceIsExpressible = false;
 
 	const record = (value: HoldRecord): void => {
 		try {
@@ -275,9 +324,33 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 		}
 	};
 
-	const abstain = (outcome: HoldOutcome, at: number, reason?: string): undefined => {
-		record({ ev: "hold:abstain", at, outcome, ...(reason === undefined ? {} : { reason }) });
+	const abstain = (outcome: HoldOutcome, at: number, reason?: string, chainVote?: ChainVote): undefined => {
+		record({
+			ev: "hold:abstain",
+			at,
+			outcome,
+			...(reason === undefined ? {} : { reason }),
+			...(chainVote === undefined ? {} : { chainVote }),
+		});
 		return undefined;
+	};
+
+	/**
+	 * #421: read the chain's continuation vote, and learn from it what this host can express.
+	 *
+	 * A `false` is only allowed to mean "a handler vetoed" once the host has shown that it
+	 * omits the field for "nobody has spoken yet". pi 1.5.2 hard-codes `false` as that
+	 * starting value (`runner.js:770`) and assigns every handler's `continue` over it
+	 * (`:785-786`), so on 1.5.2 a veto and an empty chain are the same byte and this
+	 * function answers `sentinel` — deliberately NOT a veto.
+	 */
+	const chainVote = (boundary: BoundaryEvent): ChainVote => {
+		if (boundary.continue === true) return "continue";
+		if (boundary.continue === undefined) {
+			absenceIsExpressible = true;
+			return "absent";
+		}
+		return absenceIsExpressible ? "veto" : "sentinel";
 	};
 
 	const beforeSettle = async (
@@ -287,29 +360,40 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 		const startedAt = now();
 		const boundary = (event ?? {}) as BoundaryEvent;
 		const entriesIn = Array.isArray(boundary.entries) ? boundary.entries : [];
+		// #421: read the vote first, on every boundary, so the "what can this host express"
+		// fact is learned even from a boundary the hold abstains on.
+		const vote = chainVote(boundary);
 		try {
-			if (disposed) return abstain("disposed", startedAt);
+			if (disposed) return abstain("disposed", startedAt, undefined, vote);
 			// The nested gate (#417 D4): a legion child keeps its own bounded reminder
 			// channel and must never park its parent's boundary — otherwise every level of
 			// a recursive team would wait for the level below it.
-			if (process.env.PI_LEGION_NODE_ID !== undefined) return abstain("nested", startedAt);
+			if (process.env.PI_LEGION_NODE_ID !== undefined) return abstain("nested", startedAt, undefined, vote);
 			const context = ctx as HoldContext | undefined;
 			// Mode whitelist (#417 禁止): `print`/`json` would delay the process exit and
 			// `rpc` runs under a client timeout. A missing/unknown mode abstains too — the
 			// whitelist is the safe direction, and an absent ctx is never a TUI session.
-			if (context?.mode !== "tui") return abstain("mode", startedAt);
+			if (context?.mode !== "tui") return abstain("mode", startedAt, undefined, vote);
 			// A run the host ALREADY marked aborted/errored is the cancel exit: no hold, and
 			// above all no announcement (entries persist through an abort — §3 H11).
 			const outcome = boundary.outcome;
-			if (outcome !== undefined && outcome !== "completed") return abstain("cancelled", startedAt);
+			if (outcome !== undefined && outcome !== "completed") return abstain("cancelled", startedAt, undefined, vote);
 			const children = deps.liveChildren();
-			if (children === undefined) return abstain("degraded", startedAt);
-			if (children.length === 0) return abstain("idle", startedAt);
+			if (children === undefined) return abstain("degraded", startedAt, undefined, vote);
+			if (children.length === 0) return abstain("idle", startedAt, undefined, vote);
+			// #421: a handler BEFORE us said this turn must not continue. legion's own rule is
+			// "never be the one that stops a turn" — and this is not that rule: the turn was
+			// already stopped, and continuing it here would overwrite the only vote the chain
+			// holds. So the hold stands down, nothing is taken (the notice keeps waiting for
+			// the normal path) and the reason is recorded instead of swallowed.
+			if (vote === "veto") {
+				return abstain("peer-continue-false", startedAt, "hold skipped: peer continue:false", vote);
+			}
 			// §7: the user's own message must never wait behind this hold. Checked before the
 			// first sleep, so a boundary that opens with a queued message is not held at all.
-			if (userWaiting(context)) return abstain("user-waiting", startedAt);
+			if (userWaiting(context)) return abstain("user-waiting", startedAt, undefined, vote);
 			const signature = signatureOf(children);
-			if (gaveUp.has(signature)) return abstain("already-gave-up", startedAt);
+			if (gaveUp.has(signature)) return abstain("already-gave-up", startedAt, undefined, vote);
 
 			// From here the hold owns the boundary.
 			deps.ownsBoundary?.();
@@ -329,6 +413,7 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 				outcome: "completed",
 				children: children.map((child) => `${child.name}#${child.round}`),
 				entriesIn: entriesIn.length,
+				chainVote: vote,
 			});
 
 			/**
@@ -349,6 +434,7 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 					heldMs: at - heldFrom,
 					entriesIn: entriesIn.length,
 					entriesOut: 0,
+					chainVote: vote,
 					...(reason === undefined ? {} : { reason }),
 				});
 				return undefined;
@@ -397,17 +483,31 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 						entriesIn: entriesIn.length,
 						entriesOut: entriesIn.length + taken.drafts.length,
 						noticeChars: taken.content.length,
+						chainVote: vote,
 					});
 					return {
 						// #417 rule 3: spread. The host REPLACES `entries`; a bare list here would
 						// silently delete every draft another handler queued before us (§1 1d).
 						entries: [...(entriesIn as HoldDraft[]), ...taken.drafts],
-						// #417 rule 2: the only `continue` this module ever returns.
+						// #417 rule 2: the only continuation this module ever returns. #421: it is
+						// reached only when the chain has not already refused one (`vote === "veto"`
+						// returned above), so it can echo a `true` a peer wrote but never drown one.
 						continue: true,
 					};
 				}
 			} finally {
 				detach();
+				// #418: hand the boundary back LAST, on every way out of the owned region —
+				// delivered, released, cancelled, timed out, or thrown. `ownsBoundary` cancelled
+				// the settle rescue; each of these exits leaves a notice (back) in the outbox
+				// with no boundary seen yet, which is exactly the window that timer covers. A
+				// seam that throws must not fail the boundary: the release above already put the
+				// notice back, and the next boundary is still a delivery moment.
+				try {
+					deps.returnsBoundary?.();
+				} catch {
+					/* a rescue timer is a courtesy, never a condition of the boundary */
+				}
 			}
 		} catch (error) {
 			// A hold is a courtesy: any failure lets the turn settle as it would have, and
@@ -417,7 +517,7 @@ export function createSettleHold(deps: SettleHoldDeps): SettleHold {
 			} catch {
 				/* the release path is itself best-effort */
 			}
-			return abstain("error", now(), error instanceof Error ? error.message : String(error));
+			return abstain("error", now(), error instanceof Error ? error.message : String(error), vote);
 		}
 	};
 
