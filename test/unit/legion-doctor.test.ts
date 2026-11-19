@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
@@ -16,6 +16,9 @@ import {
 } from "../../src/extension/legion-doctor.ts";
 import { clearSpawnFailures, recordSpawnFailure } from "../../src/extension/spawn-hints.ts";
 import { HYGIENE_DEFAULTS, HYGIENE_LAST_FILE } from "../../src/runs/hygiene.ts";
+import { openLegionDb } from "../../src/legion/db.ts";
+import { insertNode } from "../../src/legion/nodes.ts";
+import { RUN_OWNER_FILE, writeOwnerFile } from "../../src/runs/owner.ts";
 import { BUILTIN_CODEMODE, buildPiArgs, childGuardExtensionPath } from "../../src/runs/args.ts";
 import { ensureHostExtensions, resetExtensionDiscoveryCache } from "../../src/runs/extension-inheritance.ts";
 import {
@@ -473,6 +476,72 @@ test("doctor storage labels env hygiene overrides and ignores invalid values", (
 		assert.match(report.text, new RegExp(`staleNodeHours=${HYGIENE_DEFAULTS.staleNodeHours}h \\(default\\)`));
 		assert.match(report.text, new RegExp(`legacyTempHours=${HYGIENE_DEFAULTS.legacyTempHours}h \\(default\\)`));
 		assert.equal(report.issues.some((issue) => issue.code === "HYGIENE_SWEEP_STALE"), false);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+		rmSync(store, { recursive: true, force: true });
+	}
+});
+
+const DOCTOR_TEST_DAY_MS = 24 * 60 * 60 * 1000;
+const DOCTOR_TEST_DEAD_PID = 2 ** 22 + 12345; // beyond default pid_max on most hosts
+
+/** A run dir with an open cross-machine row (the #408 attribution record). */
+function seedRemoteRun(runDir: string): void {
+	mkdirSync(runDir, { recursive: true });
+	writeFileSync(path.join(runDir, "run.json"), "{}");
+	const db = openLegionDb(path.join(runDir, "legion.db"));
+	try {
+		insertNode(db, { parentId: null, name: "root", role: "root", status: "running" });
+		insertNode(db, {
+			parentId: "root",
+			name: "remote",
+			role: "worker",
+			host: "hw-nj",
+			remoteDir: "/home/xm/legion-run-7",
+			remoteTerminal: "hw-nj/pi-7",
+			status: "running",
+		});
+	} finally {
+		db.close();
+	}
+}
+
+/** Age every direct entry (the sweep's idleness signal). */
+function ageDoctorRun(runDir: string, ms: number): void {
+	const t = new Date(Date.now() - ms);
+	utimesSync(runDir, t, t);
+	for (const name of readdirSync(runDir)) utimesSync(path.join(runDir, name), t, t);
+}
+
+test("#408 doctor names the run dirs retention keeps and how to inspect the far side", () => {
+	const store = mkdtempSync(path.join(tmpdir(), "legion-store-408-"));
+	// Past retention, dead owner: the sweep would delete this dir, and it must skip
+	// it because of the open cross-machine row inside.
+	const runDir = path.join(store, "runs", "run-408");
+	seedRemoteRun(runDir);
+	writeOwnerFile(path.join(runDir, RUN_OWNER_FILE), DOCTOR_TEST_DEAD_PID);
+	ageDoctorRun(runDir, 20 * DOCTOR_TEST_DAY_MS);
+	// A LIVE run with the same kind of row: retention was never going to touch it,
+	// so doctor must not call it "kept by retention" (nor read its ledger).
+	const liveDir = path.join(store, "runs", "run-live");
+	seedRemoteRun(liveDir);
+	writeOwnerFile(path.join(liveDir, RUN_OWNER_FILE), process.pid);
+	const { dir, report } = runStorageDoctor({}, store);
+	try {
+		assert.match(report.text, /- runs: 2; legion\.db total/);
+		assert.match(report.text, /- kept by retention: 1 run dir\(s\) hold an unsettled cross-machine row \(past 14d, owner gone — prune skips them\)/);
+		assert.match(report.text, /run-408\/root\.remote remote@hw-nj running/);
+		assert.match(report.text, /remote_dir=\/home\/xm\/legion-run-7 remote_terminal=hw-nj\/pi-7/);
+		assert.match(report.text, /inspect: hc terminal ls --on hw-nj/);
+		assert.doesNotMatch(report.text, /run-live/);
+		const issue = report.issues.find((item) => item.code === "RETENTION_HOLDS_REMOTE");
+		assert.equal(issue?.severity, "info");
+		assert.equal(issue?.section, "storage");
+		assert.match(issue?.message ?? "", /keeps 1 run dir\(s\) that still hold 1 unsettled cross-machine row\(s\)/);
+		assert.match(issue?.message ?? "", /\(hw-nj\)/);
+		assert.match(issue?.fix ?? "", /hc terminal ls --on hw-nj/);
+		assert.match(issue?.fix ?? "", /once the far side is gone/);
+		assert.match(report.text, /\[info\] RETENTION_HOLDS_REMOTE @storage:/);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 		rmSync(store, { recursive: true, force: true });

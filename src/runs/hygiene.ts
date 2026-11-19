@@ -16,13 +16,22 @@
  *    such a row is the only record `recover` can still collect.
  *  - #37 prune: whole run dirs idle longer than `retentionDays`, owner dead,
  *    and WITHOUT a `worktrees/` entry (retired worktrees are kept on purpose
- *    as resume credentials — docs/legion-v2-contract.md:270).
+ *    as resume credentials — docs/legion-v2-contract.md:270). A run dir that
+ *    still owns an UNSETTLED cross-machine row is skipped since #408: its
+ *    `nodes.remote_dir` / `nodes.remote_terminal` is the only record on this
+ *    machine of which remote directory and terminal the row left behind, so
+ *    pruning it would orphan a directory that is still there. Retention keeps
+ *    deleting everything else — the protection is that row, not "never prune".
+ *    `retentionEligible` is the one predicate the sweep and `legion doctor`
+ *    share, so what the report calls "kept by retention" is what the sweep
+ *    would actually have deleted.
  *  - #40 event retention: see `applyEventRetention` (called on the live db).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { openLegionDb, type DatabaseSync } from "../legion/db.ts";
+import { legionDbPath, openLegionDb, type DatabaseSync } from "../legion/db.ts";
+import { listUnsettledRemoteNodes } from "../legion/nodes.ts";
 import { RUN_OWNER_FILE, TEMP_OWNER_FILE, isPidAlive, ownerState } from "./owner.ts";
 
 const HOUR_MS = 60 * 60 * 1000;
@@ -89,9 +98,35 @@ export interface HygieneReport {
 	abandonedNodes: string[];
 	checkpointedDbs: string[];
 	prunedRuns: string[];
+	/** #408: run dirs retention refused to prune because a live cross-machine row lives there. */
+	keptRemoteRuns: RemoteHold[];
 	deletedEvents: number;
 	freedBytes: number;
 	errors: string[];
+}
+
+/** One unsettled cross-machine row: the reason its run dir is not prunable (#408). */
+export interface RemoteHoldRow {
+	nodeId: string;
+	name: string;
+	host: string;
+	status: string;
+	remoteDir: string | null;
+	remoteTerminal: string | null;
+}
+
+/**
+ * #408: a run dir retention must not prune, and the rows that keep it.
+ *
+ * `error` is set when the ledger could not be read at all: the dir is then kept
+ * too, because "cannot tell" is not "nothing to lose" — the bytes on the other
+ * machine outlive any bookkeeping mistake on this one.
+ */
+export interface RemoteHold {
+	runId: string;
+	runDir: string;
+	rows: RemoteHoldRow[];
+	error?: string;
 }
 
 export interface HygieneOptions {
@@ -152,6 +187,87 @@ function hasWorktrees(runDir: string): boolean {
 	}
 }
 
+/**
+ * #37/#408: is this run dir past retention AND otherwise prunable right now?
+ *
+ * One predicate for two callers. The sweep uses it to decide, and `legion
+ * doctor` uses it to report only the dirs retention is ACTUALLY holding back:
+ * a fresh dir, a live-owner dir or one with `worktrees/` is not "kept by
+ * retention" — it was never a prune candidate. `retentionDays <= 0` disables
+ * the step, so nothing is eligible then either.
+ */
+export function retentionEligible(
+	runDir: string,
+	opts: { retentionDays: number; now?: number; isAlive?: (pid: number) => boolean },
+): boolean {
+	if (!(opts.retentionDays > 0)) return false;
+	if (ownerState(path.join(runDir, RUN_OWNER_FILE), opts.isAlive ?? isPidAlive) === "live") return false;
+	if (hasWorktrees(runDir)) return false;
+	if (!safeStat(path.join(runDir, "run.json"))) return false;
+	return (opts.now ?? Date.now()) - lastActivityMs(runDir) > opts.retentionDays * DAY_MS;
+}
+
+/**
+ * #408: the unsettled cross-machine rows still open in ONE run dir's ledger.
+ *
+ * The predicate is `listUnsettledRemoteNodes` — the same one `/legion status`
+ * lists and `recover` collects from (`host` recorded and NOT ended, #407), so
+ * retention, status and recovery can never disagree about "this row is still
+ * work somewhere else". Only the fields a human needs to chase the far side
+ * are carried over: `remote_dir` / `remote_terminal` (schema v5) are the two
+ * facts that cannot be re-derived from anything else this machine stores.
+ */
+export function readRemoteHold(runDir: string): RemoteHold {
+	const runId = path.basename(runDir);
+	const dbPath = legionDbPath(runDir);
+	if (!safeStat(dbPath)) return { runId, runDir, rows: [] };
+	let db: DatabaseSync | undefined;
+	try {
+		db = openLegionDb(dbPath);
+		const rows = listUnsettledRemoteNodes(db).map((node) => ({
+			nodeId: node.id,
+			name: node.name,
+			host: node.host ?? "",
+			status: node.status,
+			remoteDir: node.remoteDir ?? null,
+			remoteTerminal: node.remoteTerminal ?? null,
+		}));
+		return { runId, runDir, rows };
+	} catch (error) {
+		return { runId, runDir, rows: [], error: String(error) };
+	} finally {
+		db?.close();
+	}
+}
+
+/**
+ * Exactly the run dirs a sweep would REFUSE to prune because of #408: they are
+ * past retention (same `retentionEligible` predicate) and still own an
+ * unsettled cross-machine row, or their ledger cannot be read at all.
+ *
+ * Backs the `legion doctor` storage report. Filtering by pruning eligibility
+ * first is deliberate: doctor must not call a fresh or live-owner run dir
+ * "kept by retention" (retention would never have touched it), and it must not
+ * open the ledger of a run whose owner is alive — status reports in-flight
+ * cross-machine children, this block reports records retention is holding on
+ * to.
+ */
+export function findRetentionHolds(storeRoot: string, opts: RetentionHoldOptions): RemoteHold[] {
+	if (!(opts.retentionDays > 0)) return [];
+	const now = opts.now ?? Date.now();
+	return listDirs(path.join(storeRoot, "runs"))
+		.filter((runDir) => retentionEligible(runDir, { retentionDays: opts.retentionDays, now, isAlive: opts.isAlive }))
+		.map(readRemoteHold)
+		.filter((hold) => hold.rows.length > 0 || hold.error !== undefined);
+}
+
+export interface RetentionHoldOptions {
+	/** Effective `HygieneConfig.retentionDays` (0 = prune disabled). */
+	retentionDays: number;
+	now?: number;
+	isAlive?: (pid: number) => boolean;
+}
+
 const ACTIVE_STATUSES = ["starting", "running", "blocked"];
 
 function markAbandoned(dbPath: string, staleBefore: number, now: number): string[] {
@@ -198,7 +314,7 @@ export function runStartupHygiene(opts: HygieneOptions): HygieneReport {
 	const now = (opts.now ?? Date.now)();
 	const alive = opts.isAlive ?? isPidAlive;
 	const protect = new Set(opts.protectRunIds ?? []);
-	const report: HygieneReport = { removedTempDirs: [], abandonedNodes: [], checkpointedDbs: [], prunedRuns: [], deletedEvents: 0, freedBytes: 0, errors: [] };
+	const report: HygieneReport = { removedTempDirs: [], abandonedNodes: [], checkpointedDbs: [], prunedRuns: [], keptRemoteRuns: [], deletedEvents: 0, freedBytes: 0, errors: [] };
 	const runsRoot = path.join(opts.storeRoot, "runs");
 
 	for (const runDir of listDirs(runsRoot)) {
@@ -227,15 +343,34 @@ export function runStartupHygiene(opts: HygieneOptions): HygieneReport {
 		const idleMs = now - lastActivityMs(runDir);
 
 		// #37: prune whole idle run dirs, keeping any with worktrees.
-		if (config.retentionDays > 0 && idleMs > config.retentionDays * DAY_MS && !hasWorktrees(runDir) && safeStat(path.join(runDir, "run.json"))) {
-			try {
-				const bytes = dirBytes(runDir);
-				fs.rmSync(runDir, { recursive: true, force: true });
-				report.prunedRuns.push(runDir);
-				report.freedBytes += bytes;
+		if (retentionEligible(runDir, { retentionDays: config.retentionDays, now, isAlive: alive })) {
+			// #408: an idle run dir is NOT automatically garbage. If its ledger still
+			// owns an unsettled cross-machine row, the far side (directory + terminal)
+			// is still out there and this dir is the only local record of where — the
+			// row's `remote_dir` / `remote_terminal` cannot be re-derived from host
+			// config or from the core, so deleting it makes the leftover unanswerable.
+			// Skip the dir, report it, and let the sweep keep working on everything else:
+			// the protection is that row, not "never prune".
+			const hold = readRemoteHold(runDir);
+			if (hold.rows.length > 0) {
+				report.keptRemoteRuns.push(hold);
+			} else if (hold.error !== undefined) {
+				// Unreadable ledger: keep it rather than delete blind. "Cannot tell" is
+				// not "nothing to lose" (a newer-schema ledger is unreadable to this
+				// build while still owning the record). One error, not two: the #38(2)
+				// step below could only re-open the same unreadable file.
+				report.errors.push(`${runDir}: retention kept the dir (${hold.error})`);
 				continue;
-			} catch (error) {
-				report.errors.push(`${runDir}: ${String(error)}`);
+			} else {
+				try {
+					const bytes = dirBytes(runDir);
+					fs.rmSync(runDir, { recursive: true, force: true });
+					report.prunedRuns.push(runDir);
+					report.freedBytes += bytes;
+					continue;
+				} catch (error) {
+					report.errors.push(`${runDir}: ${String(error)}`);
+				}
 			}
 		}
 
@@ -272,6 +407,7 @@ export function runStartupHygiene(opts: HygieneOptions): HygieneReport {
 				removedTempDirs: report.removedTempDirs.length,
 				abandonedNodes: report.abandonedNodes.length,
 				prunedRuns: report.prunedRuns.length,
+				keptRemoteRuns: report.keptRemoteRuns.length,
 				deletedEvents: report.deletedEvents,
 				freedBytes: report.freedBytes,
 				errors: report.errors.length,
@@ -338,6 +474,7 @@ export function applyEventRetention(db: DatabaseSync, config: HygieneConfig = re
 export function formatHygieneReport(report: HygieneReport): string | undefined {
 	const parts: string[] = [];
 	if (report.prunedRuns.length) parts.push(`pruned ${report.prunedRuns.length} idle run dir(s)`);
+	if (report.keptRemoteRuns.length) parts.push(`kept ${report.keptRemoteRuns.length} run dir(s) holding an unsettled cross-machine row`);
 	if (report.removedTempDirs.length) parts.push(`removed ${report.removedTempDirs.length} orphan rpc-child temp dir(s)`);
 	if (report.abandonedNodes.length) parts.push(`marked ${report.abandonedNodes.length} abandoned node(s) failed`);
 	if (report.deletedEvents) parts.push(`dropped ${report.deletedEvents} old ledger event(s)`);
