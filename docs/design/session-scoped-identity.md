@@ -1,5 +1,13 @@
 # 用父 session 身份（psid）给跨机产物加固命名空间
 
+> **已废弃（2026-11-19）** —— 本设计未采纳。
+>
+> 否决理由：① 两份独立评审均认为过度建造（psid 对「同名不串台」零唯一性贡献，代价 ~700-1010 行，最小替代 ~160-230 行）；
+> ② 与既有契约 `docs/contracts/legion-session-continuity-v1.md:15-16` 冲突（「仓内没有 session id 概念，不要新造，判据只有会话文件绝对路径」）。
+> 采用方案见 issue #414：把已存在的 runId 透传进远端目录与终端名 + 归属行（cwd / session basename / runId / node.id）。
+> 保留本文仅为记录被否方案与推演过程。
+
+
 - 状态：**设计稿（未实现）**。本分支只含文档，不改产品代码。
 - 基线：`origin/master` `0ed298d`（= 6.2.4）。
 - 跟踪 issue：<https://github.com/zzjcool/pi-legion/issues/405>
