@@ -19,6 +19,7 @@
  */
 import { appendEvent } from "./events.ts";
 import { getChildren, LIVE_CHILD_STATUSES, updateNode } from "./nodes.ts";
+import { isCrossMachineHost } from "./orphan.ts";
 import type { DatabaseSync } from "./db.ts";
 
 /** The event field that distinguishes "paused by an exit" from "stopped on purpose". */
@@ -29,11 +30,23 @@ export const SESSION_INTERRUPT_REASON = "session-shutdown";
  *
  * Returns the ids it marked, so a caller can report what it interrupted without
  * re-deriving the predicate.
+ *
+ * 6.2.4 / D2: a CROSS-MACHINE child is skipped on purpose. This host cannot
+ * kill it (the shutdown never did: the child kept running and finished its work
+ * over there) and it cannot honestly call it aborted either, so the row stays
+ * OPEN — `orphaned`/`unfetched` is written by the orchestrator's retire path,
+ * which sees the verdict. Marking it `retired` here was the first half of the
+ * 6.2.3 defect: `hasEnded` became true, `recover` answered `already settled` and
+ * fetched nothing, so the real result could never be collected.
+ *
+ * A local child keeps the #374 behaviour byte for byte: it dies with this
+ * process, and the pause marker is what the next start reads.
  */
 export function markSessionInterrupted(db: DatabaseSync, parentId: string, now: () => number): string[] {
 	const marked: string[] = [];
 	for (const node of getChildren(db, parentId)) {
 		if (!(LIVE_CHILD_STATUSES as readonly string[]).includes(node.status)) continue;
+		if (isCrossMachineHost(node.host)) continue;
 		updateNode(db, node.id, { status: "retired" }, now);
 		appendEvent(db, node.id, "node_retired", { parentId, reason: SESSION_INTERRUPT_REASON }, { now });
 		marked.push(node.id);

@@ -49,6 +49,7 @@ import {
 	type LegionNode,
 	type NodeStatus,
 } from "../legion/nodes.ts";
+import { orphanFateOf, orphanMarkFor, type OrphanFate } from "../legion/orphan.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { deriveOutcome, parseSessionFile, parseSessionText } from "../shared/session.ts";
 import type { AcceptanceResult, CrossMachineSettings, Execution, ExecutionStatus } from "../shared/types.ts";
@@ -148,8 +149,8 @@ export function findRecoveryLedgerForName(
 export function listRecoverableLeftovers(
 	store: RunStore,
 	opts: { sessionFile?: string | undefined } = {},
-): Array<{ node: LegionNode; runId: string; dbPath: string }> {
-	const out: Array<{ node: LegionNode; runId: string; dbPath: string }> = [];
+): Array<{ node: LegionNode; runId: string; dbPath: string; orphaned?: OrphanFate }> {
+	const out: Array<{ node: LegionNode; runId: string; dbPath: string; orphaned?: OrphanFate }> = [];
 	const seen = new Set<string>();
 	for (const run of runsInRecoveryOrder(store, opts.sessionFile)) {
 		const dbPath = path.resolve(legionDbPath(store.runDir(run.runId)));
@@ -161,7 +162,10 @@ export function listRecoverableLeftovers(
 				const key = `${run.runId}\u0000${node.id}`;
 				if (seen.has(key)) continue;
 				seen.add(key);
-				out.push({ node, runId: run.runId, dbPath });
+				// 6.2.4 / D2: read the exit's fate while the handle is already open, so
+				// `/legion status` does not have to reopen every run's ledger for it.
+				const orphaned = orphanFateOf(db, node.id);
+				out.push({ node, runId: run.runId, dbPath, ...(orphaned ? { orphaned } : {}) });
 			}
 		} catch {
 			// A corrupt/unreadable ledger contributes nothing; it must not cost the list.
@@ -335,6 +339,26 @@ export async function recoverCrossMachineChild(
 	const alreadySettled = hasEnded(node);
 	const ageMs = Math.max(0, now - node.updatedAt);
 
+	// 6.2.4 / D2: an ENDED row is only "already settled" when it actually recorded
+	// an outcome. Two kinds of row are ended and still owe a fetch:
+	//
+	//   - the exit left it behind (`orphan_detected{reason:"session-shutdown"}`,
+	//     written when a parent session walked away from work still running over
+	//     there). The marker is only current while it is NEWER than the last settle
+	//     event, so the `settled-now` write below turns the next call back into a
+	//     zero-fetch `already settled`;
+	//   - it was retired WITHOUT a verdict (any `node_retired` with no `execution`,
+	//     including every row 6.2.3's shutdown stamped aborted). Nothing was graded,
+	//     so there is nothing to be idempotent about — the transcript is on that
+	//     machine and it is the answer.
+	//
+	// A row that DID record an outcome (settled / failed / aborted-with-execution)
+	// is untouched: that is 6.2.3's idempotency, and it still touches no wire.
+	const recorded = recordedSettle(input.db, node.id);
+	const orphan = orphanMarkFor(input.db, node.id);
+	const graded = recorded?.status !== undefined;
+	const settledAlready = alreadySettled && orphan === undefined && graded;
+
 	// 1. A terminal row comes FIRST and touches NO wire (defect D3, idempotency).
 	//
 	//    Two reasons, and the order is load-bearing for both:
@@ -348,8 +372,7 @@ export async function recoverCrossMachineChild(
 	//        Measured in the fake core's request log (`no second fetch`).
 	//    The transcript this machine already holds is a LOCAL file, so reading it
 	//    costs nothing and still gives the caller the child's own words.
-	if (alreadySettled) {
-		const recorded = recordedSettle(input.db, node.id);
+	if (settledAlready) {
 		const mirrorPath = remoteMirrorPathFor(input.mirrorDir, node.name);
 		let parsedMirror: ReturnType<typeof parseSessionFile> | undefined;
 		try {

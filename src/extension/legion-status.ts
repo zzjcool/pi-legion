@@ -28,6 +28,16 @@ export type LegionChildStatusFacts = Omit<LiveChildStatusInput, "now"> & {
 };
 
 /**
+ * 6.2.4 / D2/D3: a recoverable row, annotated with the exit's three-way fate.
+ *
+ * The fate lives in the ledger as `orphan_detected{reason:"session-shutdown"}`
+ * and is read by the caller (which has the database handle); the renderer only
+ * needs the word. `LegionNode` plus one optional field keeps every existing
+ * caller valid — a row without a marker renders exactly as before.
+ */
+export type RecoverableNode = LegionNode & { orphaned?: "orphaned" | "unfetched" };
+
+/**
  * Put the live-activity line at the TOP of one rendered child block (#315).
  *
  * The fact is the whole stack (#331) so the line can name nesting and parallel
@@ -69,7 +79,7 @@ export interface LegionStatusInput {
 	 * caller (`listUnsettledRemoteNodes`), never from this process's memory — the
 	 * whole point is that this session has no handle on them.
 	 */
-	recoverable?: readonly LegionNode[];
+	recoverable?: readonly RecoverableNode[];
 	/**
 	 * Persisted child behind the subagent status action.
 	 * Undefined when this process has no run-store record for the name.
@@ -210,7 +220,7 @@ function renderTree(
  * send the reader to an action that does not exist.
  */
 export function renderRecoverableSection(
-	recoverable: readonly LegionNode[],
+	recoverable: readonly RecoverableNode[],
 	jobs: readonly LegionStatusJob[],
 	now: number,
 ): string | undefined {
@@ -227,8 +237,15 @@ export function renderRecoverableSection(
 	for (const node of rows) {
 		const age = Number.isFinite(node.updatedAt) ? `${formatDuration(Math.max(0, now - node.updatedAt))} old` : "age unknown";
 		const terminal = node.remoteTerminal ?? "(terminal not recorded)";
+		// 6.2.4 / D2: the exit's fate is the actionable part — `orphaned` means the
+		// work may still be running over there, `unfetched` means it is over and only
+		// the read-back is missing. Rows from before 6.2.4 carry no marker and print
+		// their status alone, byte for byte as they did.
+		const state = node.orphaned === "orphaned"
+			? "orphaned"
+			: node.orphaned === "unfetched" ? `${node.status} (unfetched)` : node.status;
 		lines.push(
-			`- ${node.name} · ${node.role} · host ${node.host} · ${node.status} · terminal ${terminal} · ${age}`,
+			`- ${node.name} · ${node.role} · host ${node.host} · ${state} · terminal ${terminal} · ${age}`,
 		);
 		lines.push(`  collect: ${recoveryCallFor(node.name)}`);
 	}

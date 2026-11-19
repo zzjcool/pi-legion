@@ -307,7 +307,22 @@ export type TaskState =
 	| "awaiting"
 	| "blocked"
 	| "retired"
-	| "exited";
+	| "exited"
+	/**
+	 * 6.2.4 / D2: a CROSS-MACHINE child the parent session left behind while it
+	 * was still running over there (or while nobody could say). NOT terminal on
+	 * purpose: `recover` must be allowed to fetch its result, and `status` must
+	 * keep showing it. Never assigned to a local child — that one dies with the
+	 * parent and stays `retired` + `aborted`.
+	 */
+	| "orphaned"
+	/**
+	 * 6.2.4 / D2: the turn over there was already over (graded, or a complete
+	 * transcript is here) and the result was never read back. Same non-terminal
+	 * treatment as {@link TaskState} `orphaned`; the difference is only how much
+	 * is already known about it.
+	 */
+	| "unfetched";
 
 /** Execution outcome, derived ONLY from session jsonl (F26-F31). */
 export type ExecutionStatus =
@@ -399,6 +414,29 @@ export interface NestedPathEntry {
 }
 
 export const MAX_NESTED_PATH_ENTRIES = 4;
+
+/**
+ * 6.2.4 / D2: the record of a cross-machine child its parent session left behind.
+ *
+ * `fate` is the exit's three-way answer minus `aborted` (an aborted child has no
+ * record here — it was stopped, and `state` already says so). `remoteSessionPath`
+ * is spelled out because it is the one fact a recovering process needs and the
+ * one it cannot recompute without knowing that machine's layout.
+ */
+export interface OrphanRecord {
+	/** When the parent session ended. */
+	at: number;
+	fate: "orphaned" | "unfetched";
+	/** Always the #374 pause reason: the parent left, the child did not fail. */
+	reason: "session-shutdown";
+	host?: string;
+	remoteDir?: string;
+	remoteTerminal?: string;
+	/** `<remoteDir>/session.jsonl` — where the result is written on that machine. */
+	remoteSessionPath?: string;
+	/** This machine's placeholder/mirror path (never the transcript itself). */
+	sessionFile?: string;
+}
 
 export interface ChildRecord {
 	/** Supervisor-local child name; unique among live children in this run. */
@@ -512,6 +550,17 @@ export interface ChildRecord {
 	 * nothing proved it dead either (`remote-child-fate-v1` §4).
 	 */
 	startupUnconfirmed?: boolean;
+	/**
+	 * 6.2.4 / D2: the parent session left this cross-machine child behind, and
+	 * where its result lives over there.
+	 *
+	 * Written at shutdown in place of the 6.2.3 `retired` + `aborted
+	 * (session-shutdown)` stamp, which made the row look finished when the work
+	 * was still running. The ledger carries the same facts as an
+	 * `orphan_detected` event, so `recover` and `/legion status` can find it
+	 * without this file; the record copy is what a fresh process reads first.
+	 */
+	orphaned?: OrphanRecord;
 
 	// artifacts
 	artifacts?: Array<{ kind: string; path: string }>;

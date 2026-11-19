@@ -19,6 +19,7 @@ import type { DatabaseSync } from "../legion/db.ts";
 import type { RunStore } from "./store.ts";
 import type { LegionEventBus, LegionProcessEventType } from "../extension/event-bus.ts";
 import { wasFailedBySupervisor, wasSessionInterrupted } from "../legion/interrupt.ts";
+import { isCrossMachineHost, remoteSessionPathFor, shutdownFate } from "../legion/orphan.ts";
 import { obsoleteStaleStallNotices } from "../legion/mail-release.ts";
 import { appendEvent } from "../legion/events.ts";
 import { checkLaunchBudget, withLaunchBudget, type LegionBudgetLimits } from "../legion/budget.ts";
@@ -471,6 +472,17 @@ export function transcriptNotRetrievedReason(host: string, detail: string): stri
  */
 export function settledStatusFor(execution: Pick<Execution, "status">): "settled" | "failed" | "retired" {
 	return execution.status === "success" ? "settled" : execution.status === "failed" || execution.status === "truncated" ? "failed" : "retired";
+}
+
+/**
+ * 6.2.4 / D2: did the work over there already end?
+ *
+ * Only the three graded outcomes count. `aborted`/`running`/`unknown` all answer
+ * `false` on purpose: an aborted collect snapshot says "aborted by parent", which
+ * is this side's exit talking, not the child's turn having finished.
+ */
+function executionIsTerminal(status: string | undefined): boolean {
+	return status === "success" || status === "failed" || status === "truncated";
 }
 
 /**
@@ -4002,6 +4014,21 @@ export class Orchestrator {
 			this.schedulePump();
 			return child;
 		}
+		// 6.2.4 / D2: a cross-machine child is NOT ours to kill.
+		//
+		// The parent session leaving is a PAUSE for it too (#374), but unlike a local
+		// child the work keeps running over there — measured: after 6.2.3's shutdown
+		// stamped `aborted (session-shutdown)`, the remote pi kept working for another
+		// 75s and wrote its result, which `recover` then refused to fetch because a
+		// terminal row is "already settled". So the exit records what it actually
+		// knows (`orphaned` / `unfetched`) and leaves the terminal alive and the
+		// ledger row open. `stop`/`abort` still deliver a kill and still record
+		// `aborted` — this branch only runs for the exit.
+		if (opts?.cause === "session-shutdown" && isCrossMachineHost(child.host)) {
+			this.orphanOnShutdown(name);
+			this.onChildUpdate(child);
+			return child;
+		}
 		const sessionExists = fs.existsSync(child.sessionFile);
 		const parsed = sessionExists ? parseSessionFile(this.sessionFileOf(child)) : emptyParsedSession();
 		if (!child.execution && sessionExists) child.execution = deriveOutcome(parsed);
@@ -4073,6 +4100,82 @@ export class Orchestrator {
 		// the edge it just observed. `pumping` makes the duplicate wake harmless.
 		this.schedulePump();
 		return child;
+	}
+
+	/**
+	 * 6.2.4 / D2: record a cross-machine child the exit is leaving behind.
+	 *
+	 * Called from {@link retire} for `cause: "session-shutdown"` and from the
+	 * runtime's shutdown release (which is what stops the parent from waiting for
+	 * or killing it). Idempotent: the record marker is written once, and a second
+	 * call is a no-op, so a re-entrant shutdown cannot double-stamp it.
+	 *
+	 * The node row is deliberately NOT updated: `running`/`starting`/`blocked` is
+	 * exactly what keeps it recoverable (`listUnsettledRemoteNodes`, `hasEnded`
+	 * false). Moving it to `retired` here is the 6.2.3 defect.
+	 */
+	orphanOnShutdown(name: string): ChildRecord {
+		const child = this.requireChild(name);
+		if (child.orphaned) return child;
+		const fate = shutdownFate({
+			crossMachine: isCrossMachineHost(child.host),
+			// A shutdown never delivers a stop to another machine; see the branch in
+			// `retire`. `stop`/`abort` do, and they keep recording `aborted`.
+			stopped: false,
+			programEnded: this.remoteTurnEnded(child),
+		});
+		if (fate === "aborted") {
+			// Unreachable for a cross-machine child today (stopped is always false
+			// here); kept so the three-way decision lives in ONE place.
+			return child;
+		}
+		const remoteSessionPath = remoteSessionPathFor(child.remoteDir);
+		child.state = fate;
+		child.orphaned = {
+			at: this.now(),
+			fate,
+			reason: "session-shutdown",
+			...(child.host ? { host: child.host } : {}),
+			...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+			...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
+			...(remoteSessionPath ? { remoteSessionPath } : {}),
+			...(child.sessionFile ? { sessionFile: child.sessionFile } : {}),
+		};
+		if (child.nodeId && this.legion) {
+			// The event type is already in the closed set of 16; the fate is a field.
+			this.emitStored(child.nodeId, "orphan_detected", {
+				parentId: this.legion.nodeId,
+				reason: "session-shutdown",
+				fate,
+				...(child.host ? { host: child.host } : {}),
+				...(child.remoteDir ? { remoteDir: child.remoteDir } : {}),
+				...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
+				...(remoteSessionPath ? { remoteSessionPath } : {}),
+				...(child.sessionFile ? { sessionFile: child.sessionFile } : {}),
+			});
+		}
+		return child;
+	}
+
+	/**
+	 * Is the work over THERE? Used only to pick `unfetched` over `orphaned`.
+	 *
+	 * Two local facts qualify, and nothing else (no wire at shutdown): the record
+	 * was already graded, or the mirror this machine already holds parses to a
+	 * terminal outcome. Anything weaker (`unknown`, an empty placeholder) answers
+	 * `false` — an unknown fate must read `orphaned`, never a confident
+	 * "finished".
+	 */
+	private remoteTurnEnded(child: ChildRecord): boolean {
+		if (executionIsTerminal(child.execution?.status)) return true;
+		const mirror = remoteMirrorPathFor(this.runDir, child.name);
+		try {
+			if (!fs.existsSync(mirror)) return false;
+			return executionIsTerminal(deriveOutcome(parseSessionFile(mirror)).status);
+		} catch {
+			// An unreadable mirror is not evidence of a finished turn.
+			return false;
+		}
 	}
 
 	async retireAll(): Promise<ChildRecord[]> {
