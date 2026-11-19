@@ -153,6 +153,11 @@ export interface TrackedJobInput {
 	 */
 	host?: string;
 	/**
+	 * 6.2.5 / D5: the address the core holds for that child's terminal
+	 * (`host/name`), so the job-only status fallback can name it.
+	 */
+	remoteTerminal?: string;
+	/**
 	 * Arbitrated backend for this child (`Handle.spawnMode`, #209). Optional:
 	 * a job tracked from a legacy record has no value and must render as
 	 * unknown rather than a guessed `rpc`.
@@ -575,9 +580,18 @@ export interface LiveChildStatusInput {
 	 * not this one. The `subagent({action:"status"})` dead block printed only the
 	 * local path facts, so a leftover from another machine had to be read from
 	 * `recover`'s first line to learn where it lives.
+	 *
+	 * 6.2.5 / D5: `undefined` means "this machine" for a LIVE child, and the block
+	 * now says so (`host=local`) instead of printing nothing. Before that, silence
+	 * meant two different things — "local" and "the fact never reached the
+	 * renderer" — and a live child on `hw-nj` rendered byte-identically to a local
+	 * one, which is why nobody could find it in the Herdr UI.
 	 */
 	host?: string;
-	/** The address the core holds for that child's terminal (`host/name`). */
+	/**
+	 * The address the core holds for that child's terminal (`host/name`).
+	 * `undefined` on a live child renders `terminal=-` (unknown), never nothing.
+	 */
 	remoteTerminal?: string;
 	/**
 	 * Own OS process of an `rpc` child (`Handle.pid`), when this session owns it.
@@ -747,9 +761,26 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	];
 	// 6.2.4 / D3: where a cross-machine child actually lives. Right after the owner
 	// line — identity facts first, verdicts after — so every existing line keeps its
-	// text and relative order. A local child has neither value and grows no line.
-	if (input.host) lines.push(`host=${input.host}`);
-	if (input.remoteTerminal) lines.push(`terminal=${input.remoteTerminal}`);
+	// text and relative order.
+	//
+	// 6.2.5 / D5: a LIVE child always names both facts, with an explicit fallback.
+	// Silence was the bug: a child on `hw-nj` printed exactly the block a local one
+	// did, so "local" and "we never got the fact" were indistinguishable and there
+	// was no way to find its terminal. A DEAD record keeps the 6.2.4 shape (a dead
+	// LOCAL record grows no lines), because a fate note is not a place to look.
+	if (input.alive) {
+		lines.push(`host=${input.host ?? "local"}`);
+		lines.push(`terminal=${input.remoteTerminal ?? "-"}`);
+		// The address `hc` accepts (`hc read <machine>/<terminal>`), and the reason a
+		// human needs it at all: there is no pane on THIS machine to click.
+		if (input.host) {
+			lines.push(`see: hc read ${input.remoteTerminal ?? input.host}   (cross-machine children have no Herdr pane)`);
+		}
+	} else {
+		// 6.2.4 / D3, byte for byte: a dead record only grows the lines it has facts for.
+		if (input.host) lines.push(`host=${input.host}`);
+		if (input.remoteTerminal) lines.push(`terminal=${input.remoteTerminal}`);
+	}
 	if (execution) {
 		lines.push(formatExecutionStatusLine(input.alive, execution));
 		if (execution.usage) {

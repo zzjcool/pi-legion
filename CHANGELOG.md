@@ -9,6 +9,32 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [Unreleased] — 6.2.5（patch）
+
+`status` 的归属事实：遗留行不再猜 age，也不再只说「有个叫 X 的东西在远端」。
+报告：`docs/reports/status-attribution.md`。本轮范围**只含 D1/D4/D5-rendering**，
+其余项已拆分为 issue #407（72h sweep 抹掉跨机遗留）、#408（14 天 retention
+删归属证据）、#409（anchor / where 归属）、#410（spawn cwd 误报成程序不存在）、
+#411（跨机 transcript 实时镜像）。
+
+- **D1：`<N> old` 改用 `createdAt`。** `updatedAt` 会被 hygiene 的 `markAbandoned`
+  每次 sweep 改写，于是搁置一周的遗留显示「2m old」—— age 是假的。现在 age 取
+  不可变的 launch 时刻（`nodes.created_at`），`updatedAt` 作为「最后心跳」单独打印。
+- **D4：一套归属行，三处共用。** `/legion status` 的遗留块、`recover` 的首行、
+  `recover` 的 miss 现在都打印同一个 `renderRemoteOwnershipBlock()`：
+  `- <name> · <node.id> · host <h> · <orphaned|unfetched|running|abandoned> · terminal <h>/<addr>`
+  + `launched <ISO> (<human>)  · run <runId> · cwd <cwd> · session <basename>`
+  + `owner pid <pid> (<alive|gone since <ISO>>)` + `heartbeat <ISO> (<human>)` +
+  `collect: …`。`cwd`/`sessionFile` 本来就在 run.json 里，是 `runsNewestFirst`
+  把它们丢了 —— 现在带出来，零迁移。owner pid 读 run dir 的 `owner.json`。
+- **D5（只做渲染）：live 跨机 child 一定打印 `host=` / `terminal=`。** 之前只有
+  记录里恰好有值才有这两行，「本地」与「字段没送到渲染器」在输出里长得一模一样。
+  现在每个 live child 都写 `host=<机器>` / `terminal=<machine>/<addr>`，拿不到时
+  显式写 `host=local` / `terminal=-`；跨机行再加一行
+  `see: hc read <machine>/<terminal>   (cross-machine children have no Herdr pane)`。
+  数据来源：run store 的 `child.host`/`child.remoteTerminal` 优先，缺了读 ledger 的
+  `nodes.host`/`nodes.remote_terminal`；`/legion status` 与 `subagent status` 同源。
+
 ## [6.2.4] — 2026-11-19
 
 6.2.3 真机验证（`docs/reports/release-6.2.3-verification.md` §3.2 / §3.3）暴露的两个遗留。
