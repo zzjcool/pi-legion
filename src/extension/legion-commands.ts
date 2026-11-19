@@ -13,6 +13,7 @@ import {
 import {
 	renderLegionStatus,
 	type LegionChildStatusFacts,
+	type RecoverableNode,
 } from "./legion-status.ts";
 import { ALLOW_NESTED_ENV } from "./budget.ts";
 import {
@@ -113,7 +114,7 @@ export interface LegionCommandDeps {
 	 * the ledger: the `/legion status` recoverable block. Optional so an isolated
 	 * test (and a session with no ledger) renders exactly what it did before.
 	 */
-	recoverable?: () => readonly LegionNode[];
+	recoverable?: () => readonly RecoverableNode[];
 	/** Existing user-facing subcommand handlers; absent only in isolated tests. */
 	commands?: {
 		team: TeamCommandDeps;

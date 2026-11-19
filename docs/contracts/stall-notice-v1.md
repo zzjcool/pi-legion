@@ -135,7 +135,10 @@ urgency   = "action-needed"
 **已知依赖**：路径 3 要求父节点自己活着。父死 = 整棵树的投递都断了，这是整个 mail 系统的既有
 前提（`legion-v2-contract.md` §8.3 的邮差表），不在本契约里改。
 
-**去重**：`(toNode, childName, kind, sinceBucket)` 在 postman 内存里去重，**不写 events 表**。
+**去重**：`(toNode, childName, kind, sinceBucket, thresholdMs, tier)` 在 postman 内存里去重，**不写 events 表**。
+其中 `tier = floor(elapsed / thresholdMs)` 是**越过的那条阈值线**（`1` = 刚到阈值，`2` = 两倍，…），
+见 D6。**去重键不是 `detectedAt` / 上一封的发出时刻**（#413）：那种键回答不了
+「这条阈值线通知过没有」，于是一个稳稳停在阈值之外的 child 会被每一次检查重新投递。
 理由见 D9：新增事件类型会动 `test/unit/legion-schema-sentinel.test.ts` 与契约 §15-4，
 而这条通知没有任何需要审计的历史价值（一次性的、可再生的、父收到即消费）。
 
@@ -153,6 +156,7 @@ urgency   = "action-needed"
 语义**只有一条**：把该子的 L2 基准前移到 `now`。
 
 ```ts
+// #413: 已通知的 L2 阈值阶梯同时清零 → 下一封 = now + loopRadiusMs
 loopBaseAt   = now                    // 下一次到期 = now + loopRadiusMs
 loopRadiusMs = ms ?? loopRadiusMs     // 不给就沿用当前半径
 ```
@@ -171,7 +175,7 @@ loopRadiusMs = ms ?? loopRadiusMs     // 不给就沿用当前半径
 | 该子从「不在 alive 集合」重新出现（resume / re-spawn） | 重置为 `now` |
 | 子进入终态 / 被 retire | 保留一条 `absent` 墓碑（清空计数），**不删条目**——删掉就丢了「它曾经不在」这件事，`continue` 复活后第一次见到会拿旧的 `created_at` 当基准，立刻误报一次 L2 |
 | 子从账本里彻底消失（名字不在 `getChildren` 里） | 删除该条目 |
-| `extend` | 前移为 `now`，可选改半径；**已终态 / 已 retire 的子不接受 `extend`**（回执承诺一封永远不会到来的提醒比拒绝更糟） |
+| `extend` | 前移为 `now`，可选改半径，**并把 L2 的已通知 `tier` 清空**（下一封 = `now + 半径`，整条阈值重新起算）；**已终态 / 已 retire 的子不接受 `extend`**（回执承诺一封永远不会到来的提醒比拒绝更糟） |
 | 进程重启 | 全部丢失，按「首次见到」规则重建（重启本身就是合理的「很久了」起点） |
 
 **命名警告**：`renewal` 已表示「子预算耗尽后续跑」、`continue` 已表示「给结束的子发新消息」、
@@ -182,13 +186,27 @@ loopRadiusMs = ms ?? loopRadiusMs     // 不给就沿用当前半径
 
 | | 触发 | 重复 |
 |---|---|---|
-| L1 | `elapsed >= silenceNoticeMs` | 在 `1×` 与 `2×` 各一封，之后**不再重复**（一个死子不能每 2 分钟刷一封） |
-| L2 | `elapsed >= loopRadiusMs` | 到期一封；不理会则**每再过一个 `loopRadiusMs` 复用同一封**，同一 `(child, L2)` 连续未处理**上限 3 封**，之后静默到 `extend` 或子结束 |
+| L1 | `elapsed >= silenceNoticeMs` | 在 `1×` 与 `2×` 两条阈值线各一封，之后**不再重复**（一个死子不能每 2 分钟刷一封） |
+| L2 | `elapsed >= loopRadiusMs` | **每越过一条阈值线一封**（`1×`、`2×`、`3×` …），同一 `(child, L2)` 连续未处理**上限 3 封**，之后静默到 `extend` 或子结束 |
 
-**重复的时钟是「上一封的发出时刻」，不是基准点。** 第 1 封的条件是 `now - base >= radius`；
-第 2 封起的条件是 `now - 上一封 >= radius`。用 `base + n × radius` 做累积判断是错的：
-一个首次被观察到时就已经远超阈值的子（例如 postman 重启后接手一个跑了 3 小时的子），
-会在连续几个 2s tick 里把全部额度一次性打光。
+**去重键是「越过的那条阈值线」，不是时间戳（#413）。** 令
+`tier = floor(elapsed / thresholdMs)`、窗口基准 `bucket`（L1: `lastEventAt`，L2: `loopBaseAt`，
+见 D5）。窗口记下**已通知过的最高 `tier`**；`tier <= 已通知` ⇒ 本 tick 不发。于是：
+
+- 同一条阈值线被检查 N 次（postman 每 2s 一次）→ **只 1 封**；
+- 越过下一条线（`2×`、`3×` …）→ 可以再发 1 封；
+- L1 的窗口基准换了（child 又发了事件）→ 这是**另一个窗口**，同一个 `tier=1` 重新可用；
+- `extend` 把基准前移到 `now` → 窗口重置，下一封在 `now + loopRadiusMs`，即**整条阈值重新起算**，
+  不是旧阈值线的尾巴。
+
+**为什么不用「上一封发出时刻 + radius」：** 那个规则在单个 detector 实例里看着等价，但它把
+「这条线通知过没有」编码成一个**时间差**——一个重新创建的 detector（或同账本上的另一个实例）
+没有这个 `lastAt`，于是每次检查都重新判定「已到阈值」并投递一封；`extend` 也只改了被它
+链到的那个实例的 deadline，拦不住另一条路径。`(child, threshold)` 是**由 `base`、`threshold`
+和当前时钟直接算得**的，不依赖「上一封什么时候发」。
+
+**「首次观察已远超阈值」仍然只花 1 封：** 一个 3 小时后才被接管的子，`tier = 4`，第一封只
+把 `tier=4` 记成已通知，后面几条桶内 tick 不再重复；D6 的上限仍由 `count`（已发封数）计。
 
 上限 3 的理由：mail 有 `mailRatePer5Min`（默认 10 封/5 分钟）的**全局**限流，
 一个刷屏的子会把别人的邮件挤掉。

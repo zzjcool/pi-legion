@@ -23,11 +23,12 @@ import { Type, type Static } from "typebox";
 import { RpcSupervisor } from "./src/supervisor/rpc-supervisor.ts";
 import { InProcessSupervisor } from "./src/supervisor/inprocess-supervisor.ts";
 import { runAtAbsoluteDepth } from "./src/supervisor/inprocess-depth.ts";
+import { raceWithTimeout } from "./src/supervisor/race-timeout.ts";
 import { notifyInProcessSlotReleased, RoutingSupervisor } from "./src/supervisor/routing-supervisor.ts";
 import { TerminalSupervisor } from "./src/supervisor/terminal-supervisor.ts";
 import type { AbortOutcome, InFlightToolStack, LegionSupervisor, SteerDisposition } from "./src/supervisor/types.ts";
 import { inFlightToolStackOf } from "./src/supervisor/types.ts";
-import { withInFlightToolLine } from "./src/extension/legion-status.ts";
+import { childRemoteFacts, withInFlightToolLine } from "./src/extension/legion-status.ts";
 import { InMemoryUIProxy, type UIProxy } from "./src/supervisor/ui-proxy.ts";
 import { discoverAgents, findAgent, formatAgentRoster, parsePhaseMachine, BUILTIN_AGENTS_DIR } from "./src/agents/agents.ts";
 import {
@@ -65,6 +66,7 @@ import { attachUsageTotals, upsertUsage } from "./src/legion/usage.ts";
 import { getChildByName, getChildren, getNode, getSubtree, insertNode, isTerminalNode, LIVE_CHILD_STATUSES, listUnsettledRemoteNodes, type LegionNode, updateNode } from "./src/legion/nodes.ts";
 import { artifactById, markRead } from "./src/legion/ledger.ts";
 import { markSessionInterrupted } from "./src/legion/interrupt.ts";
+import { orphanFateOf } from "./src/legion/orphan.ts";
 import { isLegionRunActive } from "./src/legion/run-active.ts";
 import { type ExecutionStatus, type LegionSettings } from "./src/shared/types.ts";
 import { parseNestedPathEnv } from "./src/shared/nested-path.ts";
@@ -146,7 +148,7 @@ import {
 	unknownChildMessage,
 	type CandidateStore,
 } from "./src/runs/store-lookup.ts";
-import { RUN_OWNER_FILE, ownerState } from "./src/runs/owner.ts";
+import { RUN_OWNER_FILE, isPidAlive, ownerState, readOwnerFile } from "./src/runs/owner.ts";
 import { isStaleUiError } from "./src/tui/status.ts";
 import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts";
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
@@ -163,7 +165,7 @@ import {
 	type RemoteTerminalProbe,
 	type RemoteTerminalProbeRequest,
 } from "./src/runs/remote-artifact.ts";
-import { recoverCrossMachineChild, recoveryHeadline, RECOVERY_ACTION } from "./src/runs/remote-recover.ts";
+import { findRecoveryLedgerForName, listRecoverableLeftovers, recoverCrossMachineChild, recoveryCallFor, recoveryHeadline, RECOVERY_ACTION } from "./src/runs/remote-recover.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
@@ -621,6 +623,18 @@ function isUtilityChild(): boolean {
  * `esc-no-retire-v3` records why it leads every interrupted result).
  */
 const INTERRUPTED_HEAD = "interrupted (parent turn ended; children still running)";
+
+/**
+ * How long `session_shutdown` waits for its child retires before it stops waiting
+ * (defect E2).
+ *
+ * A retire is a remote round trip (`terminal.kill` + `terminal.rm`) on the terminal
+ * backend, so it needs a real budget — but an unbounded one is exactly how the
+ * 6.2.2 headless run failed to exit. Reaching this bound retires nothing new: the
+ * session-scoped transport is closed right after it, and a child that outlived the
+ * budget keeps running on its machine (which is the truth, not a failure).
+ */
+const SHUTDOWN_RETIRE_BUDGET_MS = 5_000;
 
 function notice(pi: ExtensionAPI, text: string): void {
 	// #273: `sendMessage` is a host ACTION and pi throws
@@ -1608,6 +1622,15 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 	// Mutable host cwd so inprocess limits can re-read project settings as the
 	// extension follows the parent session's working directory (#197).
 	let lastCwd = process.cwd();
+	/**
+	 * This session's transcript path, as last seen on an `ExtensionContext` (D1).
+	 *
+	 * The `/legion status` recoverable block is a no-argument seam (the slash command
+	 * has a ctx; the seam does not), and recovery's priority 1 needs the session
+	 * credential. Captured where a ctx already exists instead of threading a second
+	 * parameter through the command layer for one reader.
+	 */
+	let lastSessionFile: string | undefined;
 	const supervisor = deps.supervisor ?? new RoutingSupervisor({
 		rpc: new RpcSupervisor({ onSpawnRefused }),
 		// The in-process supervisor is constructed here (not by RoutingSupervisor) so
@@ -1925,6 +1948,16 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			} catch { /* the ledger may already be closing; never block shutdown */ }
 
 			try {
+				// 6.2.4 / D2: a cross-machine child is not ours to kill and not ours to wait
+				// for. The exit records it `orphaned`/`unfetched` (record + ledger marker),
+				// cancels the collect that would otherwise hold `pi --print` alive on ref'd
+				// poll timers, and drops it from the job map — so the drain below only waits
+				// for children that die with this process, and the retire loop cannot kill a
+				// child whose result a later session is supposed to recover.
+				await sessionRuntime?.releaseCrossMachineChildren();
+			} catch { /* a record we cannot stamp is still recoverable from run.json */ }
+
+			try {
 				// #181: short --print exits before the deferred timer; flush now so
 				// orphan rpc-child-* dirs still get swept on a clean exit.
 				if (!isChild) flushHygieneIfPending();
@@ -1955,12 +1988,30 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				// at a closed database.
 				try { sessionRuntime?.dispose(); } catch { /* retirement below still runs */ }
 				const shutdownRetire: RetireOptions = { cause: "session-shutdown" };
-				await Promise.all([
-					...children.map((job) => job.retire?.(shutdownRetire).catch(() => {})),
-					...pendingUtilityRetires.map((retire) => retire(shutdownRetire).catch(() => {})),
-				]);
+				// E2: BOUNDED. A retire that never settles used to hold `pi --print`'s
+				// `dispose()` open forever (the "not exiting" half of the 6.2.2 run), so the
+				// wait has a budget of its own. Nothing is killed by reaching it: the
+				// transport is closed in the `finally` below either way, and a child that
+				// outlived the budget stays running over there instead of being falsely
+				// reported as ended.
+				const retired: Array<Promise<unknown>> = [
+					...children.map(async (job) => { await job.retire?.(shutdownRetire).catch(() => {}); }),
+					...pendingUtilityRetires.map(async (retire) => { await retire(shutdownRetire).catch(() => {}); }),
+				];
+				await raceWithTimeout<Array<unknown> | "timeout">(
+					Promise.all(retired),
+					SHUTDOWN_RETIRE_BUDGET_MS,
+					() => "timeout",
+				);
 			} catch { /* each job already swallows its own failure; never block the close */ }
 		} finally {
+			// E2: close the session-scoped TRANSPORT (the terminal backend's long-lived
+			// `hc connect` child). This is what makes a headless run exit at all: `pi
+			// --print` returns from its turn and lets the event loop drain instead of
+			// calling `process.exit`, so one ref'd child process here is an immortal
+			// process. AFTER the retires above — they need the transport — and
+			// unconditionally, because a missed transport is not recoverable any other way.
+			try { supervisor.shutdown?.(); } catch { /* closing a transport is not a verdict */ }
 			// r5 G1: the ledger close lives in `finally` so no earlier throw can skip it.
 			// Scope to the ledger THIS entry opened (#283): `ownLegionKey === undefined`
 			// means this entry never adopted one (an identity-less child, or a child
@@ -2410,12 +2461,20 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 				// #315/#331: same display-only activity fact `subagent status` prints,
 				// so the slash command cannot drift from the tool surface.
 				const inFlightTools = inFlightToolStackOf(supervisor, child.name);
+				// 6.2.5 / D5: `/legion status <name>` and `subagent status` must print the
+				// same host/terminal pair. This path used to drop both fields entirely, so
+				// the slash command disagreed with the tool about the same child.
+				const identity = ownLegionIdentity();
+				const ledgerNode = child.nodeId && identity ? getNode(identity.db, child.nodeId) : undefined;
+				const remote = childRemoteFacts(child, ledgerNode);
 				return {
 					name: child.name,
 					state: child.state,
 					agent: child.agent,
 					kind: child.kind,
 					sessionFile: child.sessionFile,
+					...(remote.host ? { host: remote.host } : {}),
+					...(remote.remoteTerminal ? { remoteTerminal: remote.remoteTerminal } : {}),
 					...(child.execution ? { execution: child.execution } : {}),
 					...(child.acceptance
 						? { acceptance: { status: child.acceptance.status, level: child.acceptance.level } }
@@ -2435,10 +2494,57 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// from THIS session's ledger on every `/legion status`; a session with no
 		// identity (nothing launched yet, or a fresh run) has nothing to offer, and
 		// answering [] keeps the block out of the report rather than inventing it.
+		//
+		// D1: "no identity" is NOT "nothing to list". The case this block exists for is
+		// the previous process being gone, and a fresh one never owns a runtime identity
+		// (only a launch creates one) — so the fallback reads the store on disk, the same
+		// lookup `recover` uses. Both must agree, or the block would advertise nothing
+		// while `recover` would have worked.
 		recoverable: () => {
 			try {
 				const identity = ownLegionIdentity();
-				return identity ? listUnsettledRemoteNodes(identity.db) : [];
+				// 6.2.4 / D2: annotate each row with the exit's fate (`orphaned` /
+				// `unfetched`), so the block says what happened to it instead of printing
+				// a bare `running` for a child a previous session walked away from.
+				const annotate = (db: DatabaseSync, nodes: readonly LegionNode[]) =>
+					nodes.map((node) => {
+						const fate = orphanFateOf(db, node.id);
+						return fate ? { ...node, orphaned: fate } : node;
+					});
+				// 6.2.5 / D4: the same ownership facts the recover path prints — the run id,
+				// the checkout, the owning session and the run dir's owner pid — travel with
+				// the node so `/legion status` can print the shared block.
+				const withOwnership = (entry: {
+					node: LegionNode;
+					runId: string;
+					cwd?: string;
+					sessionFile?: string;
+					ownerPid?: number;
+					ownerAlive?: boolean;
+					orphaned?: "orphaned" | "unfetched";
+				}) => ({
+					...entry.node,
+					ledgerRunId: entry.runId,
+					...(entry.cwd ? { cwd: entry.cwd } : {}),
+					...(entry.sessionFile ? { ownerSessionFile: entry.sessionFile } : {}),
+					...(entry.ownerPid !== undefined ? { ownerPid: entry.ownerPid } : {}),
+					...(entry.ownerAlive !== undefined ? { ownerAlive: entry.ownerAlive } : {}),
+					...(entry.orphaned ? { orphaned: entry.orphaned } : {}),
+				});
+				if (identity) return listUnsettledRemoteNodes(identity.db).map((node) => {
+					const fate = orphanFateOf(identity.db, node.id);
+					const runId = path.basename(identity.runDir);
+					const owner = readOwnerFile(path.join(identity.runDir, RUN_OWNER_FILE));
+					return withOwnership({
+						node,
+						runId,
+						...(owner ? { ownerPid: owner.pid, ownerAlive: isPidAlive(owner.pid) } : {}),
+						...(fate ? { orphaned: fate } : {}),
+					});
+				});
+				// The disk fallback already reads each run's ledger: `listRecoverableLeftovers`
+				// returns the exit's fate beside the node, so nothing is reopened here.
+				return listRecoverableLeftovers(runStoreFor(lastCwd), { sessionFile: lastSessionFile }).map(withOwnership);
 			} catch {
 				// A closed/stale ledger handle must never cost the user the status view.
 				return [];
@@ -2626,6 +2732,7 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 					verifyRunner,
 					store,
 					cwd,
+					sessionFile: ctx.sessionManager?.getSessionFile(),
 					// #270: the session cwd is a second store worth searching when the
 					// call passes an explicit `cwd` that differs from it.
 					...(ctx.cwd && ctx.cwd !== cwd ? { callerCwd: ctx.cwd } : {}),
@@ -2712,6 +2819,8 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 			hasUi = ctx.hasUI;
 			ui = hasUi ? ctx.ui : undefined;
 			if (ctx.cwd) lastCwd = ctx.cwd;
+			const sessionFile = ctx.sessionManager?.getSessionFile?.();
+			if (typeof sessionFile === "string") lastSessionFile = sessionFile;
 		} catch (error) {
 			if (!isStaleUiError(error)) throw error;
 			lastUi = undefined;
@@ -3333,6 +3442,12 @@ async function controlAction(input: {
 	store: RunStore;
 	cwd: string;
 	/**
+	 * This process's session transcript (the identity credential). Passed to
+	 * `recover` so a ledger THIS session already owns outranks a leftover of
+	 * another run (defect D1's priority 1).
+	 */
+	sessionFile?: string | undefined;
+	/**
 	 * #270: the session's own cwd, when the call also passes an explicit `cwd`.
 	 * Child records may live in either store, so both are searched on a miss.
 	 */
@@ -3369,6 +3484,12 @@ async function controlAction(input: {
 		return recoverAction({
 			params,
 			legion: input.legion,
+			// D1: a session that has not launched anything owns no runtime identity, and
+			// THAT is the case `recover` exists for. The store on disk is the source of
+			// truth then (`findRecoveryLedgerForName` documents the priority); the ledger
+			// it finds is opened here and closed by `recoverAction`.
+			store: input.legion ? undefined : store,
+			sessionFile: input.sessionFile,
 			crossMachine: input.settings.crossMachine,
 		});
 	}
@@ -3460,6 +3581,9 @@ async function controlAction(input: {
 
 	// status: no name (or all:true) → live-children overview; named → one child.
 	if (action === "status") {
+		// 6.2.5 / D5: the ledger row for a run-store child, when this session owns one.
+		const ledgerNodeFor = (child: StatusChildRecord): LegionNode | null | undefined =>
+			input.legion && child.nodeId ? getNode(input.legion.db, child.nodeId) : undefined;
 		if (params.name && params.all) {
 			return fail(
 				"`name` and `all` are mutually exclusive for status.",
@@ -3494,11 +3618,15 @@ async function controlAction(input: {
 			};
 			const classified = classifyChildrenForStatus(runs, factsFor);
 			const now = Date.now();
+			// 6.2.5 / D5: the run-store record is the first source for where a child runs;
+			// this session's ledger row for the same node is the second (a run.json written
+			// by a rebuild or an older build can lack the pair, while the ledger has it).
 			const overview = renderStatusOverview(
 				classified.map(({ child, live }) => {
 					const { pid, inFlightTools, ...facts } = factsFor(child);
+					const remote = childRemoteFacts(child, ledgerNodeFor(child));
 					return {
-						child,
+						child: { ...child, ...remote },
 						...facts,
 						...(pid ? { pid } : {}),
 						...(inFlightTools ? { inFlightTools } : {}),
@@ -3578,6 +3706,10 @@ async function controlAction(input: {
 			execution: found.child.execution,
 			acceptance: found.child.acceptance,
 			spawnMode: found.child.spawnMode,
+			// 6.2.4 / D3: `/legion status <name>` and `subagent status` share this
+			// renderer, so the machine and terminal come from the record on both.
+			// 6.2.5 / D5: the ledger row answers when the record cannot.
+			...childRemoteFacts(found.child, ledgerNodeFor(found.child)),
 			alive,
 			...(owner ? { owner } : {}),
 		});
@@ -6136,6 +6268,12 @@ function followJob(
 		// D13: the machine travels with the branch, so the status row can render
 		// `vps:<branch>` instead of implying a local tree.
 		...(child?.worktreeHost ? { worktreeHost: child.worktreeHost } : {}),
+		// 6.2.4 / D2: the shutdown releases children by this fact alone (a host record
+		// means the process over there outlives this one).
+		...(child?.host ? { host: child.host } : {}),
+		// 6.2.5 / D5: the job-only status fallback (`/legion status <name>` without a
+		// run-store record) prints where it runs instead of guessing `local`.
+		...(child?.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
 		...(spawnMode ? { spawnMode } : {}),
 		...(input.pid ? { pid: input.pid } : {}),
 		...(input.treeIdentity ? input.treeIdentity : child?.nodeId ? {
@@ -6544,6 +6682,10 @@ export function renderStatusOverview(children: StatusChildEntry[], now: number =
 				execution: child.execution,
 				acceptance: child.acceptance,
 				spawnMode: child.spawnMode,
+				// 6.2.4 / D3: the dead block names the machine and the remote terminal,
+				// instead of leaving them to `recover`'s first line.
+				...(child.host ? { host: child.host } : {}),
+				...(child.remoteTerminal ? { remoteTerminal: child.remoteTerminal } : {}),
 				alive,
 				...(owner ? { owner } : {}),
 				...(pid ? { pid } : {}),
@@ -6953,8 +7095,11 @@ function dedupeChildScopeCandidates(
  *
  *  - it does not adopt the child (no live supervisor handle, no second writer for
  *    one child's ledger row) — that is S5's problem, not this action's;
- *  - it needs no run store and no `runId`: a leftover is addressed by NAME against
- *    the ledger, and a `--session`-reopened tree finds it there;
+ *  - it needs no `runId`: a leftover is addressed by NAME against the ledger, and
+ *    when this session owns NO ledger at all (the fresh-process case — defect D1) it
+ *    reads the store on disk through `findRecoveryLedgerForName`. That is the whole
+ *    point: the situation recovery exists for is the one where the process that
+ *    created the tree is gone, so the identity has to come from disk, not memory;
  *  - it never invents a verdict: a live terminal, an unreadable transcript or an
  *    unanswerable machine all report what they are and settle nothing;
  *  - it renders through `renderCollect` — one formatter for collected and recovered
@@ -6963,11 +7108,21 @@ function dedupeChildScopeCandidates(
 export async function recoverAction(input: {
 	params: { name?: string };
 	/**
-	 * This session's ledger (`LegionRuntimeIdentity`'s handle + path). Absent = this
-	 * session has no tree at all, which is the honest "nothing recorded to recover"
-	 * answer rather than a NOT_FOUND for a name nobody could have written.
+	 * This session's ledger (`LegionRuntimeIdentity`'s handle + path), when it has one.
+	 *
+	 * Absent does NOT mean "nothing to recover" any more (defect D1): it means "ask the
+	 * store on disk" — `input.store` below. The old shape returned `No legion ledger in
+	 * this session` for every fresh process, i.e. for the only case this action exists.
 	 */
 	legion: { db: DatabaseSync; dbPath: string } | undefined;
+	/**
+	 * The run store of this session's cwd (`<cwd>/.pi-subagents`), searched when this
+	 * process owns no ledger. A ledger found here is opened by this call and closed by
+	 * it — recovery is a READER of a previous process's tree, never its owner.
+	 */
+	store?: Pick<RunStore, "listRuns" | "runDir" | "rootDir"> | undefined;
+	/** This process's session transcript, so this session's own run wins (priority 1). */
+	sessionFile?: string | undefined;
 	crossMachine: CrossMachineSettings | undefined;
 	/** Test seam: the transcript read-back. Defaults to the production `hc` client. */
 	readback?: (request: RemoteSessionRequest) => Promise<RemoteReadbackResult>;
@@ -6982,25 +7137,99 @@ export async function recoverAction(input: {
 			ErrorCodes.INVALID_PARAMS,
 		);
 	}
-	if (!input.legion) {
+	// D1: this session's own ledger wins; otherwise the store on disk decides, because
+	// a fresh process has no runtime identity by construction (only a launch creates
+	// one). A handle discovered here is OURS to close.
+	const discovered = input.legion === undefined && input.store !== undefined
+		? findRecoveryLedgerForName(input.store as RunStore, name, { sessionFile: input.sessionFile })
+		: undefined;
+	const ledger = input.legion ?? discovered;
+	if (!ledger) {
+		// D1: say WHERE we looked. A miss has to be actionable, and "no ledger in this
+		// session" was not: it never mentioned the directory the search is scoped to.
+		const where = input.store ? ` (searched ${path.join(input.store.rootDir, "runs")})` : "";
+		const recoverable = input.store
+			? listRecoverableLeftovers(input.store as RunStore, { sessionFile: input.sessionFile }).map((entry) => entry.node.name)
+			: [];
+		const hint = recoverable.length > 0
+			? ` Waiting for recovery: ${[...new Set(recoverable)].join(", ")} — call ${recoveryCallFor(recoverable[0]!)}.`
+			: " Nothing is waiting for recovery: no cross-machine node in this store is unsettled.";
 		return ok(
-			"No legion ledger in this session: there is no cross-machine child to recover, because no row recording one exists here. `recover` works on the tree a PREVIOUS session of this conversation left behind.",
+			`No cross-machine child named ${JSON.stringify(name)} in this session's or cwd's ledgers${where}.${hint} \`recover\` reads the tree a PREVIOUS session of this conversation left behind, so a launch that happened in another directory is recovered from that directory.`,
 		);
 	}
-	const outcome = await recoverCrossMachineChild({
-		db: input.legion.db,
-		name,
-		crossMachine: input.crossMachine,
-		// The mirror sits beside the LEDGER, i.e. `<runDir>/remote/<name>.jsonl` — the
-		// very path a collect writes. A recovery therefore refreshes the bytes the
-		// earlier session fetched instead of opening a second mirror of the same file.
-		mirrorDir: path.dirname(input.legion.dbPath),
-		...(input.readback ? { readback: input.readback } : {}),
-		...(input.probeTerminal ? { probeTerminal: input.probeTerminal } : {}),
-		...(input.now ? { now: input.now } : {}),
-	});
+	let outcome;
+	try {
+		outcome = await recoverCrossMachineChild({
+			db: ledger.db,
+			name,
+			crossMachine: input.crossMachine,
+			// The mirror sits beside the LEDGER, i.e. `<runDir>/remote/<name>.jsonl` — the
+			// very path a collect writes. A recovery therefore refreshes the bytes the
+			// earlier session fetched instead of opening a second mirror of the same file.
+			mirrorDir: path.dirname(ledger.dbPath),
+			...(input.readback ? { readback: input.readback } : {}),
+			...(input.probeTerminal ? { probeTerminal: input.probeTerminal } : {}),
+			...(input.now ? { now: input.now } : {}),
+		});
+		// 6.2.5 / D4: the recover headline carries the SAME ownership block `/legion
+		// status` prints. Built INSIDE the try because the ledger this process opened is
+		// closed by the `finally` below (the fate query would hit a closed handle).
+		if (outcome.ok) {
+			const recovery = outcome.recovery;
+			const directoryRunId = path.basename(path.dirname(ledger.dbPath));
+			const ownershipRunId = recovery.node.runId ?? (/^r-[0-9a-f]{6,}$/i.test(directoryRunId) ? directoryRunId : undefined);
+			const ownershipRun = ownershipRunId ? input.store?.listRuns().find((run) => run.runId === ownershipRunId) : undefined;
+			const ownershipOwner = readOwnerFile(path.join(path.dirname(ledger.dbPath), RUN_OWNER_FILE));
+			recovery.ownership = {
+				name: recovery.node.name,
+				nodeId: recovery.node.id,
+				host: recovery.node.host ?? "(unknown host)",
+				state: orphanFateOf(ledger.db, recovery.node.id) ?? recovery.node.status,
+				...(recovery.node.remoteTerminal ? { terminal: recovery.node.remoteTerminal } : {}),
+				launchedAt: recovery.node.createdAt,
+				...(Number.isFinite(recovery.node.updatedAt) ? { heartbeatAt: recovery.node.updatedAt } : {}),
+				...(ownershipRunId ? { runId: ownershipRunId } : {}),
+				...(ownershipRun?.cwd ? { cwd: ownershipRun.cwd } : {}),
+				...(ownershipRun?.sessionFile ? { sessionFile: ownershipRun.sessionFile } : {}),
+				...(ownershipOwner ? { ownerPid: ownershipOwner.pid, ownerAlive: isPidAlive(ownershipOwner.pid) } : {}),
+				now: (input.now ?? Date.now)(),
+			};
+		}
+	} finally {
+		// Only a handle this call opened is closed here; an adopted identity's is owned
+		// by the session runtime (`stopLegionRuntime`).
+		if (discovered !== undefined) {
+			try { discovered.db.close(); } catch { /* already closed */ }
+		}
+	}
 	if (!outcome.ok) return fail(outcome.text, ErrorCodes.NOT_FOUND);
 	const { recovery } = outcome;
+	// 6.2.4 / D2: the ledger now holds the verdict — make the RUN RECORD agree.
+	//
+	// `subagent({action:"status"})` reads run.json, not the ledger, so a record the
+	// exit marked `orphaned` would keep claiming that after the child was recovered:
+	// the two ledgers would describe the same child differently, which is exactly the
+	// class of bug this release is fixing. Best-effort on purpose — the verdict is
+	// already written, and a record we cannot refresh must not fail the recovery.
+	if (recovery.kind === "settled-now" || recovery.kind === "already-settled") {
+		const store = input.store as { updateChild?: RunStore["updateChild"] } | undefined;
+		if (store?.updateChild) {
+			const runId = path.basename(path.dirname(ledger.dbPath));
+			const at = new Date((input.now ?? Date.now)()).toISOString();
+			const recoveredNow = recovery.kind === "settled-now";
+			try {
+				await store.updateChild(runId, recovery.node.name, (current) => {
+					// `already settled` reconciles only a record that still carries the
+					// exit's marker; a `settled-now` recovery always retires it.
+					if (!recoveredNow && !current.orphaned) return;
+					current.state = "retired";
+					current.retiredAt ??= at;
+					delete current.orphaned;
+				});
+			} catch { /* the ledger is the authority; the record is a mirror */ }
+		}
+	}
 	return ok(
 		[
 			recoveryHeadline(recovery),
@@ -7737,6 +7966,13 @@ export function renderCollect(
 			);
 		} else if (verification.commandCount === 0) {
 			lines.push("verification: 0 commands — by contract, nothing ran");
+		} else if (verification.staleUnknown) {
+			// `d1`: the recorded pass happened on another machine. Re-checking it here is
+			// not a weaker answer — it is a different question (this filesystem's copy of a
+			// path that means something else), so the line says which half is known.
+			lines.push(
+				`verification: ${verification.commandCount} command(s) · log ${verification.outputFile ?? "(not recorded)"} · staleness not checked here (the tree is on another machine)`,
+			);
 		} else if (verification.stale) {
 			lines.push(
 				`verification: STALE — the checkout changed after the pass (${verification.commandCount} command(s)${verification.outputFile ? `, ${verification.outputFile}` : ""})`,

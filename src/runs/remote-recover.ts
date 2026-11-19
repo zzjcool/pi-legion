@@ -35,7 +35,10 @@
  * it work from a process that never launched the child.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { DatabaseSync, SqliteRow } from "../legion/db.ts";
+import { legionDbPath, openLegionDb } from "../legion/db.ts";
 import { appendEvent } from "../legion/events.ts";
 import {
 	hasEnded,
@@ -46,10 +49,12 @@ import {
 	type LegionNode,
 	type NodeStatus,
 } from "../legion/nodes.ts";
+import { orphanFateOf, orphanMarkFor, type OrphanFate } from "../legion/orphan.ts";
 import { upsertUsage } from "../legion/usage.ts";
 import { deriveOutcome, parseSessionFile, parseSessionText } from "../shared/session.ts";
 import type { AcceptanceResult, CrossMachineSettings, Execution, ExecutionStatus } from "../shared/types.ts";
 import { deriveAcceptance, settledStatusFor, transcriptNotRetrievedReason } from "./orchestrator.ts";
+import type { RunStore } from "./store.ts";
 import {
 	createRemoteSessionReadback,
 	createRemoteTerminalProbe,
@@ -60,6 +65,8 @@ import {
 	type RemoteTerminalProbeRequest,
 } from "./remote-artifact.ts";
 import { normalizeHost } from "./remote.ts";
+import { readOwnerFile, isPidAlive, RUN_OWNER_FILE } from "./owner.ts";
+import { formatDuration } from "../extension/summary.ts";
 
 /** The action name and the exact call a leftover is collected with. */
 export const RECOVERY_ACTION = "recover";
@@ -67,6 +74,252 @@ export const RECOVERY_ACTION = "recover";
 /** `subagent({ action: "recover", name: "worker-0" })` — the one string a user copies. */
 export function recoveryCallFor(name: string): string {
 	return `subagent({ action: "recover", name: ${JSON.stringify(name)} })`;
+}
+
+/**
+ * 6.2.5 / D1+D4: the ONE ownership block, shared by every surface that lists a
+ * cross-machine leftover (`/legion status`'s block, `recover`'s headline, and
+ * `recover`'s miss).
+ *
+ * Why one renderer: the three used to describe the same row differently, and the
+ * block is where a human learns WHOSE leftover this is. Six facts were printed
+ * and zero of them said which session, which checkout, or which run owned the
+ * thing — the reader had a name and a machine and nothing else.
+ *
+ * The time facts are split on purpose (D1):
+ *   - `launched` is `createdAt`, the launch moment. It is immutable, and it is
+ *     the ONLY honest answer to "how old is this leftover";
+ *   - `heartbeat` is `updatedAt`, the last write to the row. Hygiene's
+ *     `markAbandoned` used to rewrite `updated_at` on every sweep, so an
+ *     age computed from it reported "2m old" for something abandoned a week
+ *     ago. As a heartbeat it is a perfectly good fact — as an age it was a lie.
+ *
+ * `owner pid` is the run dir's `owner.json`. `gone since <ISO>` is the last
+ * heartbeat (the last moment anyone is known to have been alive there); it is a
+ * bound derived from evidence, never a measured death time.
+ */
+export interface RemoteOwnershipFacts {
+	name: string;
+	nodeId: string;
+	host: string;
+	/** `orphaned` / `unfetched` / a node status (`running`, `failed`, …). */
+	state: string;
+	terminal?: string;
+	launchedAt?: number;
+	heartbeatAt?: number;
+	runId?: string;
+	cwd?: string;
+	sessionFile?: string;
+	ownerPid?: number;
+	ownerAlive?: boolean;
+	now: number;
+}
+
+/** The ownership block, as lines (no trailing newline). */
+export function renderRemoteOwnershipBlock(facts: RemoteOwnershipFacts): string[] {
+	const age = (at: number | undefined): string =>
+		at === undefined || !Number.isFinite(at) ? "age unknown" : `${formatDuration(Math.max(0, facts.now - at))} old`;
+	const iso = (at: number | undefined): string | undefined =>
+		at === undefined || !Number.isFinite(at) ? undefined : new Date(at).toISOString();
+	const launchedIso = iso(facts.launchedAt);
+	const lines = [
+		`- ${facts.name} · ${facts.nodeId} · host ${facts.host} · ${facts.state} · terminal ${facts.terminal ?? "(terminal not recorded)"}`,
+		`  launched ${launchedIso ?? "(not recorded)"} (${age(facts.launchedAt)})  · run ${facts.runId ?? "(run not recorded)"} · cwd ${facts.cwd ?? "(cwd not recorded)"} · session ${facts.sessionFile ? path.basename(facts.sessionFile) : "(session not recorded)"}`,
+	];
+	if (facts.ownerPid !== undefined) {
+		const heartbeatIso = iso(facts.heartbeatAt);
+		lines.push(
+			`  owner pid ${facts.ownerPid} (${facts.ownerAlive ? "alive" : `gone since ${heartbeatIso ?? "an unrecorded time"}`})`,
+		);
+	} else {
+		lines.push("  owner pid (not recorded)");
+	}
+	if (facts.heartbeatAt !== undefined) {
+		lines.push(`  heartbeat ${iso(facts.heartbeatAt) ?? "(not recorded)"} (${age(facts.heartbeatAt)})`);
+	}
+	lines.push(`  collect: ${recoveryCallFor(facts.name)}`);
+	return lines;
+}
+
+/** The state word D4 freezes: the fate wins over the row status. */
+export function recoveryStateWord(node: LegionNode & { orphaned?: "orphaned" | "unfetched" }): string {
+	if (node.orphaned === "orphaned") return "orphaned";
+	if (node.orphaned === "unfetched") return "unfetched";
+	return node.status;
+}
+
+/**
+ * One ledger a `recover` / `/legion status` call may read, and the run it belongs to.
+ *
+ * Read as a READER of the store, not as a root runtime: recovery needs the `nodes`
+ * table and nothing else, so it deliberately does not become an
+ * `OrchestratorLegionContext`/`LegionRuntimeIdentity` (no postman, no phase machine,
+ * no tools, no second writer for one child).
+ */
+export interface RecoveryLedger {
+	db: DatabaseSync;
+	dbPath: string;
+	runId: string;
+}
+
+/**
+ * Which ledger a `recover` call reads, in priority order (defect D1).
+ *
+ * The defect: `recover` used to read only the identity THIS process had created,
+ * i.e. `ownLegionIdentity()` — which a fresh process does not have, because a root
+ * runtime is created by a launch (`createRootLegion`/`reopenSessionRun`) and by
+ * nothing else. So the one situation recovery exists for — the previous process is
+ * GONE — was exactly the situation where it answered `No legion ledger in this
+ * session`.
+ *
+ * The source of truth is therefore the STORE on disk, not this process's memory:
+ *
+ *  1. **this session's own run** (`run.sessionFile` === our transcript path): the
+ *     reopen case, and the only one where the ledger is unambiguously "ours";
+ *  2. **the newest other run in this store root** (`<cwd>/.pi-subagents/runs/*`)
+ *     that holds a cross-machine row with this NAME — settled or not, so a second
+ *     `recover` finds the same ledger and can answer `already settled`;
+ *  3. nothing: no row anywhere in this store root has that name.
+ *
+ * Priority 2 is deliberately scoped to the store root, i.e. to this cwd: "a
+ * leftover is the tree a PREVIOUS session of this conversation left behind", and a
+ * different project's ledger is never consulted, adopted or written (invariant I1).
+ */
+export function findRecoveryLedgerForName(
+	store: RunStore,
+	name: string,
+	opts: { sessionFile?: string | undefined } = {},
+): RecoveryLedger | undefined {
+	const slug = sanitizeNodeSlug(name);
+	for (const run of runsInRecoveryOrder(store, opts.sessionFile)) {
+		const dbPath = path.resolve(legionDbPath(store.runDir(run.runId)));
+		if (!fs.existsSync(dbPath)) continue;
+		let db: DatabaseSync | undefined;
+		try {
+			db = openLegionDb(dbPath);
+			if (listRemoteNodesNamed(db, slug).length === 0) {
+				db.close();
+				db = undefined;
+				continue;
+			}
+			return { db, dbPath, runId: run.runId };
+		} catch {
+			// An unreadable ledger is not this call's verdict; keep looking.
+			try { db?.close(); } catch { /* already closed */ }
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Every cross-machine leftover in this store root, newest run first.
+ *
+ * The discovery half of `recover`: a session that never launched anything still has
+ * to be able to LIST what the previous process left (the `/legion status` block),
+ * otherwise the only way to learn a leftover's name is to guess it. Deduplicated by
+ * `runId\0nodeId` so one ledger reached twice cannot be listed twice, and every
+ * handle is closed before returning (this is a read-only scan).
+ */
+export interface RecoverableLeftover {
+	node: LegionNode;
+	runId: string;
+	dbPath: string;
+	/** `run.json`'s cwd: the checkout the owning session worked in (D4). */
+	cwd?: string;
+	/** `run.json`'s sessionFile: the transcript of the session that owns the row (D4). */
+	sessionFile?: string;
+	/** Pid recorded in that run dir's `owner.json`, when it has one (D4). */
+	ownerPid?: number;
+	/** Whether that pid is alive — the difference between "waiting" and "abandoned". */
+	ownerAlive?: boolean;
+	orphaned?: OrphanFate;
+}
+
+export function listRecoverableLeftovers(
+	store: RunStore,
+	opts: { sessionFile?: string | undefined } = {},
+): RecoverableLeftover[] {
+	const out: RecoverableLeftover[] = [];
+	const seen = new Set<string>();
+	for (const run of runsInRecoveryOrder(store, opts.sessionFile)) {
+		const dbPath = path.resolve(legionDbPath(store.runDir(run.runId)));
+		if (!fs.existsSync(dbPath)) continue;
+		let db: DatabaseSync | undefined;
+		try {
+			db = openLegionDb(dbPath);
+			for (const node of listUnsettledRemoteNodes(db)) {
+				const key = `${run.runId}\u0000${node.id}`;
+				if (seen.has(key)) continue;
+				seen.add(key);
+				// 6.2.4 / D2: read the exit's fate while the handle is already open, so
+				// `/legion status` does not have to reopen every run's ledger for it.
+				const orphaned = orphanFateOf(db, node.id);
+				// 6.2.5 / D4: the ownership facts. `cwd`/`sessionFile` were already in
+				// run.json — `runsNewestFirst` was dropping them, which is why the block
+				// could not say whose leftover this is without a migration.
+				const runDir = store.runDir(run.runId);
+				const owner = readOwnerFile(path.join(runDir, RUN_OWNER_FILE));
+				out.push({
+					node,
+					runId: run.runId,
+					dbPath,
+					...(run.cwd ? { cwd: run.cwd } : {}),
+					...(run.sessionFile ? { sessionFile: run.sessionFile } : {}),
+					...(owner ? { ownerPid: owner.pid, ownerAlive: isPidAlive(owner.pid) } : {}),
+					...(orphaned ? { orphaned } : {}),
+				});
+			}
+		} catch {
+			// A corrupt/unreadable ledger contributes nothing; it must not cost the list.
+		} finally {
+			try { db?.close(); } catch { /* already closed */ }
+		}
+	}
+	return out;
+}
+
+/**
+ * The store's runs in the order recovery reads them: THIS session's own run first,
+ * then every other run newest-first.
+ *
+ * The split is priority 1/2 of {@link findRecoveryLedgerForName} and is explicit
+ * rather than implied by timestamps: a session that reopened its own tree must read
+ * that tree even when a launch in a newer run holds the same name (a name is reused
+ * across runs by design).
+ */
+function runsInRecoveryOrder(
+	store: RunStore,
+	sessionFile: string | undefined,
+): Array<{ runId: string; sessionFile?: string; cwd?: string }> {
+	const all = runsNewestFirst(store);
+	const target = sessionFile !== undefined ? path.resolve(sessionFile) : undefined;
+	if (target === undefined) return all;
+	const own = all.filter((run) => run.sessionFile !== undefined && path.resolve(run.sessionFile) === target);
+	if (own.length === 0) return all;
+	const rest = all.filter((run) => !own.includes(run));
+	return [...own, ...rest];
+}
+
+/**
+ * `store.listRuns()` newest-first, in a stable order.
+ *
+ * `listRuns()` is documented oldest-first, but "the newest run that has the name"
+ * must be true by construction, not by luck (the same reason `findSessionRun`
+ * compares timestamps explicitly). `RunRecord.createdAt` is an ISO string, so it is
+ * parsed for the comparison and the `runId` breaks ties: two runs written in the
+ * same millisecond cannot make `recover` answer about a different ledger on the
+ * second call, which is exactly what "already settled is idempotent" forbids.
+ */
+function runsNewestFirst(store: RunStore): Array<{ runId: string; sessionFile?: string; cwd?: string }> {
+	const runs = store.listRuns().map((run) => ({
+		runId: run.runId,
+		stamp: Date.parse(run.createdAt) || 0,
+		...(typeof run.sessionFile === "string" ? { sessionFile: run.sessionFile } : {}),
+		...(typeof run.cwd === "string" && run.cwd.length > 0 ? { cwd: run.cwd } : {}),
+	}));
+	return runs
+		.sort((a, b) => (b.stamp - a.stamp) || a.runId.localeCompare(b.runId))
+		.map(({ runId, sessionFile, cwd }) => ({ runId, ...(sessionFile ? { sessionFile } : {}), ...(cwd ? { cwd } : {}) }));
 }
 
 /**
@@ -116,7 +369,16 @@ export interface CrossMachineRecovery {
 	output: string;
 	readback: RecoveryReadbackFacts;
 	/** What the machine said about the terminal, when it could be asked. */
-	terminal?: { address: string; state: string; unreachable?: string };
+	terminal?: {
+		address: string;
+		/** The TERMINAL's state (`live` / `finished`), exactly as the core said. */
+		state: string;
+		/** The PROGRAM's own last word (`done`, `error`, `working`), when it said one. */
+		program?: string;
+		/** The core's exit code, once the program ended. */
+		exitCode?: number;
+		unreachable?: string;
+	};
 	/** The status this call wrote to the ledger (set only for `settled-now`). */
 	settledStatus?: Extract<NodeStatus, "settled" | "failed" | "retired">;
 	/** The one-line summary recorded in the settle event. */
@@ -125,8 +387,10 @@ export interface CrossMachineRecovery {
 	holdReason?: string;
 	/** Timestamp of the settle event a SECOND recovery read back. */
 	recordedAt?: number;
-	/** Age of the row (last movement → now), for the caller's context. */
+	/** Age of the row from its LAUNCH moment (D1) — not from the last write. */
 	ageMs: number;
+	/** D4: the ownership facts this row was found with, when the caller knew them. */
+	ownership?: RemoteOwnershipFacts;
 }
 
 export type RecoveryOutcome =
@@ -135,6 +399,13 @@ export type RecoveryOutcome =
 
 export interface RecoverCrossMachineChildInput {
 	db: DatabaseSync;
+	/**
+	 * 6.2.5 / D4: the run context this ledger belongs to (`runId`/`cwd`/`sessionFile`
+	 * from run.json, `ownerPid`/`ownerAlive` from the run dir's owner.json). Optional
+	 * so the recovery core keeps working for a caller that only holds the ledger; the
+	 * ownership block is then omitted rather than invented.
+	 */
+	ownership?: Omit<RemoteOwnershipFacts, "name" | "nodeId" | "host" | "state" | "terminal" | "launchedAt" | "heartbeatAt" | "now">;
 	/** The child's handle (the name it was launched under). */
 	name: string;
 	/** Cross-machine settings, so the read-back resolves the same target the launch did. */
@@ -166,7 +437,7 @@ export async function recoverCrossMachineChild(
 ): Promise<RecoveryOutcome> {
 	const now = (input.now ?? Date.now)();
 	const rows = listRemoteNodesNamed(input.db, input.name);
-	if (rows.length === 0) return { ok: false, text: unknownRecoveryMessage(input.db, input.name) };
+	if (rows.length === 0) return { ok: false, text: unknownRecoveryMessage(input.db, input.name, { now, ...(input.ownership ? { ownership: input.ownership } : {}) }) };
 	// The newest unsettled row wins; a settled one is only ever consulted for the
 	// idempotent answer (`already-settled`) below.
 	const unsettled = rows.filter((row) => !hasEnded(row));
@@ -178,6 +449,97 @@ export async function recoverCrossMachineChild(
 		return { ok: false, text: `node ${node.id} has no host: it did not run on another machine, so there is nothing to recover there` };
 	}
 	const alreadySettled = hasEnded(node);
+	// 6.2.5 / D1: age from the LAUNCH moment. `updatedAt` is rewritten by the
+	// hygiene sweep, so an age computed from it turned a week-old leftover into
+	// "2m old"; it is reported as the heartbeat instead.
+	const ageMs = Math.max(0, now - node.createdAt);
+
+
+	// 6.2.4 / D2: an ENDED row is only "already settled" when it actually recorded
+	// an outcome. Two kinds of row are ended and still owe a fetch:
+	//
+	//   - the exit left it behind (`orphan_detected{reason:"session-shutdown"}`,
+	//     written when a parent session walked away from work still running over
+	//     there). The marker is only current while it is NEWER than the last settle
+	//     event, so the `settled-now` write below turns the next call back into a
+	//     zero-fetch `already settled`;
+	//   - it was retired WITHOUT a verdict (any `node_retired` with no `execution`,
+	//     including every row 6.2.3's shutdown stamped aborted). Nothing was graded,
+	//     so there is nothing to be idempotent about — the transcript is on that
+	//     machine and it is the answer.
+	//
+	// A row that DID record an outcome (settled / failed / aborted-with-execution)
+	// is untouched: that is 6.2.3's idempotency, and it still touches no wire.
+	const recorded = recordedSettle(input.db, node.id);
+	const orphan = orphanMarkFor(input.db, node.id);
+	const graded = recorded?.status !== undefined;
+	const settledAlready = alreadySettled && orphan === undefined && graded;
+
+	// 1. A terminal row comes FIRST and touches NO wire (defect D3, idempotency).
+	//
+	//    Two reasons, and the order is load-bearing for both:
+	//      - the recorded verdict is a fact about the past, so liveness over there
+	//        cannot change what this call answers — a kept terminal stays
+	//        `state: "live"` forever (see `terminalProgramEnd`), and asking liveness
+	//        first made a SECOND `recover` of a settled child answer `still live …`;
+	//      - a settled row needs no fetch at all. It used to do one anyway, which
+	//        made "already settled is idempotent" true only for the TEXT, not for the
+	//        wire: every repeat call re-read the transcript and re-probed the machine.
+	//        Measured in the fake core's request log (`no second fetch`).
+	//    The transcript this machine already holds is a LOCAL file, so reading it
+	//    costs nothing and still gives the caller the child's own words.
+	if (settledAlready) {
+		const mirrorPath = remoteMirrorPathFor(input.mirrorDir, node.name);
+		let parsedMirror: ReturnType<typeof parseSessionFile> | undefined;
+		try {
+			if (fs.existsSync(mirrorPath)) parsedMirror = parseSessionFile(mirrorPath);
+		} catch {
+			// A part-written mirror is not a verdict: the recorded reason still answers.
+			parsedMirror = undefined;
+		}
+		const base: Execution = parsedMirror
+			? deriveOutcome(parsedMirror)
+			: {
+				status: "unknown",
+				reason: transcriptNotRetrievedReason(
+					host,
+					`the row was already settled, so this call fetched nothing (the transcript, if needed, is on that machine)`,
+				),
+			};
+		const reason = recorded?.reason ?? base.reason;
+		const execution: Execution = {
+			...base,
+			status: recorded?.status ?? base.status,
+			...(reason ? { reason } : {}),
+		};
+		return {
+			ok: true,
+			recovery: {
+				kind: "already-settled",
+				node,
+				execution,
+				acceptance: acceptanceFor(parsedMirror, execution),
+				output: outputOf(parsedMirror, execution),
+				...(parsedMirror
+					? { readback: mirrorFacts(host, mirrorPath) }
+					: {
+						readback: {
+							host,
+							lines: 0,
+							returned: 0,
+							truncated: false,
+							reason: `not fetched: the row was already settled${node.remoteDir ? "" : " (the record has no remote_dir)"}`,
+							fate: "no-session",
+							...(node.remoteDir ? { remotePath: path.posix.join(node.remoteDir, "session.jsonl") } : {}),
+							evidence: [`no local mirror at ${mirrorPath}`],
+							nextStep: `nothing to do — the verdict above is the recorded one. For the prose: hc exec --on ${host} -- cat ${node.remoteDir ? path.posix.join(node.remoteDir, "session.jsonl") : "<remote dir>/session.jsonl"}`,
+						},
+					}),
+				...(recorded?.ts !== undefined ? { recordedAt: recorded.ts } : {}),
+				ageMs,
+			},
+		};
+	}
 
 	const read = (input.readback ?? createRemoteSessionReadback({ crossMachine: input.crossMachine }))({
 		host,
@@ -196,13 +558,15 @@ export async function recoverCrossMachineChild(
 	const terminalFacts: CrossMachineRecovery["terminal"] = {
 		address: terminal.address,
 		state: terminal.state,
+		...(terminal.program !== undefined ? { program: terminal.program } : {}),
+		...(terminal.exitCode !== undefined ? { exitCode: terminal.exitCode } : {}),
 		...(terminal.unreachable !== undefined ? { unreachable: terminal.unreachable } : {}),
 	};
 	const parsed = readback.ok ? parseSessionFile(readback.localPath) : undefined;
-	const ageMs = Math.max(0, now - node.updatedAt);
 
-	// 1. A live terminal outranks every other fact: the child is still working over
-	//    there, so there is no verdict to settle whatever the transcript's tail says.
+	// 2. A LIVE program outranks every other fact about an UNSETTLED row: the child is
+	//    still working over there, so there is no verdict to settle whatever the
+	//    transcript's tail says.
 	if (terminal.live) {
 		const execution: Execution = {
 			status: "running",
@@ -222,35 +586,6 @@ export async function recoverCrossMachineChild(
 				output: parsed?.output ?? "",
 				readback: facts,
 				terminal: terminalFacts,
-				ageMs,
-			},
-		};
-	}
-
-	// 2. A terminal row is the idempotent case: nothing to write, and the recorded
-	//    outcome — not a fresh guess — is what the caller gets back.
-	if (alreadySettled) {
-		const recorded = recordedSettle(input.db, node.id);
-		const base: Execution = parsed
-			? deriveOutcome(parsed)
-			: { status: "unknown", reason: transcriptNotRetrievedReason(host, readback.ok ? "no text" : readback.reason) };
-		const reason = recorded?.reason ?? base.reason;
-		const execution: Execution = {
-			...base,
-			status: recorded?.status ?? base.status,
-			...(reason ? { reason } : {}),
-		};
-		return {
-			ok: true,
-			recovery: {
-				kind: "already-settled",
-				node,
-				execution,
-				acceptance: acceptanceFor(parsed, execution),
-				output: outputOf(parsed, execution),
-				readback: facts,
-				terminal: terminalFacts,
-				...(recorded?.ts !== undefined ? { recordedAt: recorded.ts } : {}),
 				ageMs,
 			},
 		};
@@ -353,18 +688,52 @@ export function recoveryHeadline(recovery: CrossMachineRecovery): string {
 	const name = recovery.node.name;
 	const host = normalizeHost(recovery.node.host) ?? "(unknown host)";
 	const address = recovery.terminal?.address ?? recovery.node.remoteTerminal ?? "(not recorded)";
+	const headline = recoveryHeadlineSentence(recovery, name, host, address);
+	// 6.2.5 / D4: the SAME ownership block `/legion status` prints, so a recover
+	// headline answers "whose leftover was that" without a second call.
+	return recovery.ownership ? `${renderRemoteOwnershipBlock(recovery.ownership).join("\n")}\n${headline}` : headline;
+}
+
+function recoveryHeadlineSentence(recovery: CrossMachineRecovery, name: string, host: string, address: string): string {
 	switch (recovery.kind) {
 		case "settled-now":
-			return `recover: '${name}' is over on '${host}' (terminal '${address}' is ${recovery.terminal?.state ?? "gone"}); settled node ${recovery.node.id} as ${recovery.settledStatus} — ${recovery.summary ?? "recovered from the transcript"}`;
+			// `program` first: a kept terminal reports `state: live` long after its program
+			// ended, so "is over" next to "(terminal is live)" would contradict itself.
+			return `recover: '${name}' is over on '${host}' (terminal '${address}' is ${recovery.terminal?.program ?? recovery.terminal?.state ?? "gone"}); settled node ${recovery.node.id} as ${recovery.settledStatus} — ${recovery.summary ?? "recovered from the transcript"}`;
 		case "already-settled":
-			return `recover: '${name}' is already settled (${recovery.node.status}) — nothing was written; this is the outcome the ledger recorded${recovery.recordedAt !== undefined ? ` at ${new Date(recovery.recordedAt).toISOString()}` : ""}.`;
+			// No wire, and it says so: the verdict is the recorded one, and the transcript
+			// text (when this machine holds it) is the local mirror. That sentence is the
+			// difference between "idempotent" and "looks like it fetched again".
+			return `recover: '${name}' is already settled (${recovery.node.status}) — nothing was written and nothing was fetched; this is the outcome the ledger recorded${recovery.recordedAt !== undefined ? ` at ${new Date(recovery.recordedAt).toISOString()}` : ""}.`;
 		case "live":
+			// The TERMINAL's own word here, not the program's: this line explains why
+			// nothing was settled, and "the terminal is live" is that reason.
 			return `recover: terminal '${address}' is still '${recovery.terminal?.state ?? "live"}' on '${host}' — the child is still working there, so nothing was settled.`;
 		case "unreadable":
 			return `recover: the transcript could not be read from '${host}' — nothing was settled (an unreadable transcript is not a verdict).`;
 		case "unsettled":
 			return `recover: graded from the transcript, but nothing was settled — ${recovery.holdReason ?? recovery.execution.reason ?? recovery.execution.status}.`;
 	}
+}
+
+/**
+ * The read-back facts for a mirror this machine ALREADY holds (`already-settled`).
+ *
+ * `ok`/`lines` describe a local file, and the renderer prints it as a read-back —
+ * which is what it is, just an earlier one. `fetched: false` keeps the claim honest
+ * for anyone reading the JSON body: this call did not go to the wire.
+ */
+function mirrorFacts(host: string, localPath: string): RecoveryReadbackFacts {
+	// The mirror's own line count, not a reconstruction from the parse: the render
+	// prints "N of M lines (complete)", and M has to be the file's count or it means
+	// something else here than it does in `collect`.
+	let lines = 0;
+	try {
+		lines = fs.readFileSync(localPath, "utf8").split("\n").filter((line) => line.trim().length > 0).length;
+	} catch {
+		lines = 0;
+	}
+	return { host, lines, returned: lines, truncated: false, localPath };
 }
 
 /** The `read-back from host …` facts, in the shape `renderCollect` reads. */
@@ -513,10 +882,35 @@ function isExecutionStatus(value: unknown): value is ExecutionStatus {
  * What a `recover` on an unknown name answers: the name, and the names that WOULD
  * work — a leftover is discovered by reading, so a miss has to say where to look.
  */
-function unknownRecoveryMessage(db: DatabaseSync, name: string): string {
-	const recoverable = listUnsettledRemoteNodes(db).map((node) => node.name);
-	const hint = recoverable.length > 0
-		? `Waiting for recovery: ${recoverable.join(", ")} — call ${recoveryCallFor(recoverable[0]!)}.`
-		: "Nothing is waiting for recovery: no cross-machine node in this ledger is unsettled.";
-	return `unknown cross-machine child ${JSON.stringify(sanitizeNodeSlug(name))}: no row in this ledger has that name and a host. ${hint}`;
+function unknownRecoveryMessage(
+	db: DatabaseSync,
+	name: string,
+	context: {
+		now: number;
+		ownership?: Omit<RemoteOwnershipFacts, "name" | "nodeId" | "host" | "state" | "terminal" | "launchedAt" | "heartbeatAt" | "now">;
+	} = { now: Date.now() },
+): string {
+	const rows = listUnsettledRemoteNodes(db);
+	if (rows.length === 0) {
+		return `unknown cross-machine child ${JSON.stringify(sanitizeNodeSlug(name))}: no row in this ledger has that name and a host. Nothing is waiting for recovery: no cross-machine node in this ledger is unsettled.`;
+	}
+	// 6.2.5 / D4: the miss lists the SAME ownership block the status block prints, so
+	// the names that WOULD work come with the facts needed to choose one (D4: one
+	// format, three surfaces).
+	const blocks = rows.map((node) => renderRemoteOwnershipBlock({
+		name: node.name,
+		nodeId: node.id,
+		host: normalizeHost(node.host) ?? "(unknown host)",
+		state: recoveryStateWord(node),
+		...(node.remoteTerminal ? { terminal: node.remoteTerminal } : {}),
+		launchedAt: node.createdAt,
+		...(Number.isFinite(node.updatedAt) ? { heartbeatAt: node.updatedAt } : {}),
+		...(context.ownership?.runId ? { runId: context.ownership.runId } : {}),
+		...(context.ownership?.cwd ? { cwd: context.ownership.cwd } : {}),
+		...(context.ownership?.sessionFile ? { sessionFile: context.ownership.sessionFile } : {}),
+		...(context.ownership?.ownerPid !== undefined ? { ownerPid: context.ownership.ownerPid } : {}),
+		...(context.ownership?.ownerAlive !== undefined ? { ownerAlive: context.ownership.ownerAlive } : {}),
+		now: context.now,
+	}).join("\n"));
+	return `unknown cross-machine child ${JSON.stringify(sanitizeNodeSlug(name))}: no row in this ledger has that name and a host.\nWaiting for recovery:\n${blocks.join("\n")}`;
 }

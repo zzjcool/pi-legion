@@ -146,6 +146,18 @@ export interface TrackedJobInput {
 	 */
 	worktreeHost?: string;
 	/**
+	 * 6.2.4 / D2: machine that RAN the child, when it was not this one.
+	 *
+	 * The shutdown needs it for one decision only: a cross-machine child is not
+	 * killed and not waited for by this process — it is released as `orphaned`.
+	 */
+	host?: string;
+	/**
+	 * 6.2.5 / D5: the address the core holds for that child's terminal
+	 * (`host/name`), so the job-only status fallback can name it.
+	 */
+	remoteTerminal?: string;
+	/**
 	 * Arbitrated backend for this child (`Handle.spawnMode`, #209). Optional:
 	 * a job tracked from a legacy record has no value and must render as
 	 * unknown rather than a guessed `rpc`.
@@ -194,6 +206,17 @@ export interface TrackedJob extends TrackedJobInput {
 	settledAt?: number;
 	unsubscribeRpcEvents?: () => void;
 	collectPromise?: Promise<CollectSnapshot>;
+	/**
+	 * 6.2.4 / D2: this job's in-flight collect can be stopped.
+	 *
+	 * A collect on a still-running cross-machine child polls until its deadline, and
+	 * those timers are ref'd — that is a `pi --print` run that cannot exit while the
+	 * work over there continues. Before this, the exit killed the remote child,
+	 * which unblocked the collect; now the exit leaves it running (that is the whole
+	 * point of `orphaned`), so the wait itself has to be cancellable. Per job, not
+	 * per runtime: a local child still owes its one last collect during the drain.
+	 */
+	collectAbort: AbortController;
 }
 
 export interface LegionTreeIdentity {
@@ -553,6 +576,24 @@ export interface LiveChildStatusInput {
 	 */
 	owner?: "live" | "dead" | "unknown";
 	/**
+	 * 6.2.4 / D3: the machine that RAN the child (`ChildRecord.host`), when it was
+	 * not this one. The `subagent({action:"status"})` dead block printed only the
+	 * local path facts, so a leftover from another machine had to be read from
+	 * `recover`'s first line to learn where it lives.
+	 *
+	 * 6.2.5 / D5: `undefined` means "this machine" for a LIVE child, and the block
+	 * now says so (`host=local`) instead of printing nothing. Before that, silence
+	 * meant two different things — "local" and "the fact never reached the
+	 * renderer" — and a live child on `hw-nj` rendered byte-identically to a local
+	 * one, which is why nobody could find it in the Herdr UI.
+	 */
+	host?: string;
+	/**
+	 * The address the core holds for that child's terminal (`host/name`).
+	 * `undefined` on a live child renders `terminal=-` (unknown), never nothing.
+	 */
+	remoteTerminal?: string;
+	/**
 	 * Own OS process of an `rpc` child (`Handle.pid`), when this session owns it.
 	 *
 	 * Only a pid of THIS host is ever supplied — pids are not persisted, so a
@@ -718,6 +759,28 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 		`supervisor=${input.spawnMode ?? "unknown"}`,
 		`session=${input.sessionFile}`,
 	];
+	// 6.2.4 / D3: where a cross-machine child actually lives. Right after the owner
+	// line — identity facts first, verdicts after — so every existing line keeps its
+	// text and relative order.
+	//
+	// 6.2.5 / D5: a LIVE child always names both facts, with an explicit fallback.
+	// Silence was the bug: a child on `hw-nj` printed exactly the block a local one
+	// did, so "local" and "we never got the fact" were indistinguishable and there
+	// was no way to find its terminal. A DEAD record keeps the 6.2.4 shape (a dead
+	// LOCAL record grows no lines), because a fate note is not a place to look.
+	if (input.alive) {
+		lines.push(`host=${input.host ?? "local"}`);
+		lines.push(`terminal=${input.remoteTerminal ?? "-"}`);
+		// The address `hc` accepts (`hc read <machine>/<terminal>`), and the reason a
+		// human needs it at all: there is no pane on THIS machine to click.
+		if (input.host) {
+			lines.push(`see: hc read ${input.remoteTerminal ?? input.host}   (cross-machine children have no Herdr pane)`);
+		}
+	} else {
+		// 6.2.4 / D3, byte for byte: a dead record only grows the lines it has facts for.
+		if (input.host) lines.push(`host=${input.host}`);
+		if (input.remoteTerminal) lines.push(`terminal=${input.remoteTerminal}`);
+	}
 	if (execution) {
 		lines.push(formatExecutionStatusLine(input.alive, execution));
 		if (execution.usage) {
@@ -801,6 +864,26 @@ export interface SessionRuntime {
 	release(name: string): void;
 	get(name: string): TrackedJob | undefined;
 	activeJobs(): TrackedJob[];
+	/**
+	 * 6.2.4 / D2: let go of every CROSS-MACHINE child before anything drains.
+	 *
+	 * A cross-machine child is not this process's to kill or to wait for: the exit
+	 * records it `orphaned`/`unfetched` and leaves it running over there, where a
+	 * later session can `recover` its result. Releasing it means three things, in
+	 * this order and no other:
+	 *
+	 *  1. stamp the fate/record WHILE the facts still exist (the collect below is
+	 *     about to answer `running · aborted by parent`, which would erase them);
+	 *  2. cancel its in-flight collect — a collect on a live child polls ref'd
+	 *     timers until its deadline, and that is a `pi --print` run that never
+	 *     exits (`--print` waits for the event loop to drain, never calls
+	 *     `process.exit`);
+	 *  3. drop it from the job map, so the drain does not wait for it and the
+	 *     retire loop does not kill it.
+	 *
+	 * Returns the released names (for the caller's log/notice).
+	 */
+	releaseCrossMachineChildren(): Promise<string[]>;
 	/** Immutable metadata snapshot for tree/custom UI consumers. */
 	treeNodes(): TreeNodeSnapshot[];
 	/** Current live widget rows, including any retained Legion tree facts. */
@@ -933,6 +1016,43 @@ interface FinishedResult {
 	 * the head and the metadata is untouched.
 	 */
 	stripped: boolean;
+}
+
+/**
+ * One abort signal that fires when ANY of its inputs does, plus its own release.
+ *
+ * 6.2.4 / D2: a collect has two independent reasons to stop — the caller gave up
+ * (an explicit `collect`/`wait` signal) and this session is exiting
+ * (`job.collectAbort`). Merging them means the shutdown does not depend on which
+ * call site happened to start the collect first. Listeners are removed by
+ * `release()` when the collect settles, so neither signal grows a listener per
+ * poll.
+ */
+function mergeSignals(...candidates: Array<AbortSignal | undefined>): { signal?: AbortSignal; release: () => void } {
+	const live = candidates.filter((signal): signal is AbortSignal => signal !== undefined);
+	if (live.length === 0) return { release: () => {} };
+	if (live.length === 1) return { signal: live[0], release: () => {} };
+	const controller = new AbortController();
+	let released = false;
+	const forward = (): void => {
+		if (released) return;
+		controller.abort();
+	};
+	for (const signal of live) {
+		if (signal.aborted) {
+			controller.abort();
+			break;
+		}
+		signal.addEventListener("abort", forward, { once: true });
+	}
+	return {
+		signal: controller.signal,
+		release: () => {
+			if (released) return;
+			released = true;
+			for (const signal of live) signal.removeEventListener("abort", forward);
+		},
+	};
 }
 
 export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
@@ -2317,45 +2437,54 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 			// because `track()` on an existing job rewrites `job.runId` and bumps
 			// `job.round` without touching `generation`.
 			const origin = { runId: job.runId, round: job.round };
+			// 6.2.4 / D2: the caller's signal AND the job's own, so a shutdown can stop
+			// the wait on a child it is leaving behind (see
+			// `releaseCrossMachineChildren`).
+			const merged = mergeSignals(signal, job.collectAbort.signal);
 			job.collectPromise = (async () => {
-				const snapshot = await job.collect(signal ? { signal } : undefined);
-				// D4a/F1: stamp the round this result came FROM, before anything can bump
-				// the live one. Every entry built from this snapshot speaks about `origin`,
-				// never about `job.round` (which a `track()` during this collect may have
-				// moved on) — that label is also the `deliveredOnce` key on the degraded
-				// path, so getting it wrong loses the NEXT round's notice.
-				snapshotOrigins.set(snapshot, origin);
-				const current = jobs.get(job.name) === job && job.generation === generation;
-				if (current) {
-					try {
-						await job.persist?.(snapshot);
-					} catch {
-						// Notification still happens; the tool-side persist is the backup.
+				try {
+					const snapshot = await job.collect(merged.signal ? { signal: merged.signal } : undefined);
+					// D4a/F1: stamp the round this result came FROM, before anything can bump
+					// the live one. Every entry built from this snapshot speaks about `origin`,
+					// never about `job.round` (which a `track()` during this collect may have
+					// moved on) — that label is also the `deliveredOnce` key on the degraded
+					// path, so getting it wrong loses the NEXT round's notice.
+					snapshotOrigins.set(snapshot, origin);
+					const current = jobs.get(job.name) === job && job.generation === generation;
+					if (current) {
+						try {
+							await job.persist?.(snapshot);
+						} catch {
+							// Notification still happens; the tool-side persist is the backup.
+						}
 					}
+					// C: a `running` snapshot is a timeout on a live child, not a result.
+					// Caching it would let a later wait/collect hand out a stale
+					// "still working" snapshot as if it were the final answer. Also do not
+					// revive a result after an explicit stop invalidates this generation.
+					//
+					// F2: re-validate AFTER the `persist` await, and include the round. A
+					// `track()` landing during persist does not bump `generation`, so `current`
+					// alone would let this stale round-1 write-back undo the invalidation
+					// `track()` just performed (D7b) — and the next `wait` would serve the
+					// previous round's result.
+					const stillCurrent =
+						jobs.get(job.name) === job &&
+						job.generation === generation &&
+						job.round === origin.round;
+					if (
+						stillCurrent &&
+						!snapshot.blocked &&
+						snapshot.execution.status !== "running"
+					) {
+						// #349: remember as the newest entry and keep the resident text bounded.
+						rememberFinished(job.name, origin.runId, origin.round, snapshot);
+					}
+					return snapshot;
+				} finally {
+					// The merged signal only lives as long as this one collect.
+					merged.release();
 				}
-				// C: a `running` snapshot is a timeout on a live child, not a result.
-				// Caching it would let a later wait/collect hand out a stale
-				// "still working" snapshot as if it were the final answer. Also do not
-				// revive a result after an explicit stop invalidates this generation.
-				//
-				// F2: re-validate AFTER the `persist` await, and include the round. A
-				// `track()` landing during persist does not bump `generation`, so `current`
-				// alone would let this stale round-1 write-back undo the invalidation
-				// `track()` just performed (D7b) — and the next `wait` would serve the
-				// previous round's result.
-				const stillCurrent =
-					jobs.get(job.name) === job &&
-					job.generation === generation &&
-					job.round === origin.round;
-				if (
-					stillCurrent &&
-					!snapshot.blocked &&
-					snapshot.execution.status !== "running"
-				) {
-					// #349: remember as the newest entry and keep the resident text bounded.
-					rememberFinished(job.name, origin.runId, origin.round, snapshot);
-				}
-				return snapshot;
 			})();
 		}
 		return job.collectPromise;
@@ -2509,6 +2638,9 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				existing.thinking = input.thinking;
 				existing.worktreeBranch = input.worktreeBranch;
 				if (input.worktreeHost) existing.worktreeHost = input.worktreeHost;
+				// A re-follow of a cross-machine child keeps carrying that fact; a local
+				// re-follow must not erase a host an earlier launch established either.
+				if (input.host) existing.host = input.host;
 				// Only a known value overwrites: a re-follow without the handle must
 				// not erase the mode an earlier launch established.
 				if (input.spawnMode !== undefined) existing.spawnMode = input.spawnMode;
@@ -2545,6 +2677,7 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 				state: "working",
 				watching: false,
 				generation: 0,
+				collectAbort: new AbortController(),
 			};
 			if (deps.subscribeSupervisorEvents) {
 				job.unsubscribeRpcEvents = deps.subscribeSupervisorEvents(
@@ -2838,6 +2971,25 @@ export function createSessionRuntime(deps: SessionRuntimeDeps): SessionRuntime {
 
 		activeJobs() {
 			return [...jobs.values()];
+		},
+
+		async releaseCrossMachineChildren() {
+			if (disposed) return [];
+			const released: string[] = [];
+			for (const job of [...jobs.values()]) {
+				// No host ⇒ a local child. It dies with this process, so the drain and
+				// the retire below still own it exactly as before.
+				if (!job.host) continue;
+				released.push(job.name);
+				// 1. stamp the record/ledger while the facts still exist.
+				try { await job.retire?.({ cause: "session-shutdown" }); } catch { /* the marker is best-effort on the way out */ }
+				// 2. stop waiting on it (ref'd poll timers would keep `pi --print` alive).
+				try { job.collectAbort.abort(); } catch { /* already aborted */ }
+				// 3. forget it, so neither the drain nor the retire loop touches it.
+				jobs.delete(job.name);
+			}
+			if (released.length > 0) refreshUi();
+			return released;
 		},
 
 		statusTui() {

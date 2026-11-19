@@ -10,20 +10,22 @@
 //
 //   Run A — settings carry `subagents.crossMachine.enabled: true` and NOTHING else:
 //           a1 role policy, a2 machine list, b zero-config launch, c remote artefact,
-//           d0 the CURRENT zero-config behaviour: the collect is refused by the
-//           worktree-ownership guard, which MASKS the missing read-back host entry
-//           (root cause is swallowed first: src/runs/remote.ts:976-982), and no
-//           non-empty mirror exists. d0 asserts the GAP, so it turns red the day the
-//           product is fixed — that is the intended signal.
+//           d0 zero-config COLLECT DELIVERS: the mirror has lines, the collect's text
+//           carries the remote's LAST assistant text and a verdict, and none of the
+//           old refusal sentences (the read-back needs the host, not a launch cwd —
+//           `resolveReadTarget`, which is what turned this from a gap into a pass).
 //
 //   Run B — the same topology with `hosts.remote = { cwd: "/root/work" }`:
 //           c2 the worktree is really on the remote machine, d the transcript is
 //           really read back (mirror line count > 0, contains the remote's LAST
 //           assistant text, mtime after the launch; the parent's placeholders are
 //           printed as the contrast that must NOT be used as evidence), and d1 the
-//           SECOND product gap asserted: the fetch did happen (mirror non-empty) but
-//           `collect` itself is still refused by assertLocalWorktree
-//           (src/runs/orchestrator.ts:3515). d1 also turns red when that is fixed.
+//           remote collect finishes with a VERDICT: read-back line for that host,
+//           `execution:` line, the child's own text, and no worktree-ownership
+//           refusal (D13 guards local git/fs operations, never the delivery).
+//           x0 (both runs) the parent `pi --print` exits ON ITS OWN: a killed parent
+//           is a failure, because a ref'd handle that survives session_shutdown is
+//           exactly the headless hang this harness used to work around.
 //
 // Every fact comes from `docker exec` on the two containers. Nothing is loosened: a
 // missing piece of evidence is a FAIL; an environment that cannot host the run is a
@@ -359,6 +361,51 @@ async function launchPass({ label, childName, nonceValue }) {
 	return { step, tool, run, childRecord, start, nonceValue, label };
 }
 
+/**
+ * x0 — the parent `pi --print` EXITS ON ITS OWN (defect E2, measured here).
+ *
+ * `runParentStep` was written around this defect: a parent pi that launched a child
+ * "can keep its event loop alive after printing its last line", so the driver waits
+ * for the final text and then ends the terminal itself. That workaround recorded
+ * which of the two happened (`naturalExit` / `killed`) and nothing asserted on it —
+ * so the product's own hang never failed the harness.
+ *
+ * The cause was the terminal backend's session-scoped `hc connect` child: a ref'd
+ * handle keeps Node alive, and `pi --print` lets the loop drain instead of calling
+ * `process.exit`. It is closed on `session_shutdown` now, so this assertion requires
+ * the natural exit and treats a kill as the failure it is.
+ */
+function assertParentExitsOnItsOwn(pass) {
+	return assertThat("x0", "the parent pi --print exits on its own (no kill, no leftover hc connect)", () => {
+		const step = pass.step;
+		const natural = step?.naturalExit === true && step?.killed !== true;
+		const elapsed = typeof step?.endedAt === "number" && typeof step?.startedAt === "number"
+			? step.endedAt - step.startedAt
+			: null;
+		print(
+			`XM_EXIT ${JSON.stringify({
+				id: "x0",
+				step: step?.step,
+				rc: step?.rc,
+				natural_exit: step?.naturalExit ?? null,
+				killed: step?.killed ?? null,
+				elapsed_s: elapsed,
+			})}`,
+		);
+		return {
+			ok: natural,
+			evidence: {
+				step: step?.step,
+				rc: step?.rc,
+				natural_exit: step?.naturalExit ?? null,
+				killed: step?.killed ?? null,
+				elapsed_s: elapsed,
+				hint: "killed=true means the parent pi never exited: a ref'd handle survived session_shutdown",
+			},
+		};
+	});
+}
+
 function assertLaunchSucceeded(pass) {
 	return assertThat("b", "launch", () => {
 		const child = pass.childRecord?.name;
@@ -453,66 +500,78 @@ function assertRemoteArtifact(id, pass) {
 }
 
 /**
- * d0 — the CURRENT zero-config behaviour, asserted instead of skipped.
+ * d0 — zero-config `collect` DELIVERS (positive assertion; the gap is fixed).
  *
- * Zero-config launches fine, but the collect never even fetches a transcript. The
- * ROOT CAUSE is the read-back resolving the host through the settings-only resolver,
- * which refuses a host with no `subagents.crossMachine.hosts.<name>` entry
- * (src/runs/remote.ts:976-982) — but that failure is SWALLOWED, so what the caller
- * actually sees today is the worktree-ownership guard: `collect failed: … worktree
- * '…' belongs to host 'remote': local filesystem and git operations on it are
- * refused`. The parent's mirror must NOT be written.
+ * Zero-config means `subagents.crossMachine.enabled: true` and nothing else: no
+ * `hosts.<name>` entry, because the launch discovered that machine's directory per
+ * call. `collect` used to refuse here before attempting a single fetch — the
+ * read-back resolved its target through `resolveHostTarget`, which demands an
+ * absolute `hosts.<name>.cwd` (a LAUNCH question), and that failure was then masked
+ * by the worktree-ownership guard. The product fix separates the two questions
+ * (`resolveReadTarget`: who, not where), so this assertion is now the positive one:
+ * the transcript really comes back, and the verdict is the child's own.
  *
- * F2: the assertion requires BOTH — the collect failed against a gap signature AND
- * that ownership-guard sentence is present. Fixing only the resolver (so the fetch
- * succeeds but the guard still throws) must keep d0 red; only a zero-config collect
- * that actually returns a transcript may turn it green (and then d0 needs rewriting).
+ * What it requires, all of it observable from outside:
+ *   - the mirror `<runDir>/remote/<child>.jsonl` has > 0 JSONL lines (the fetch
+ *     happened), and
+ *   - the collect's TEXT carries the remote session's LAST assistant text (so the
+ *     bytes are this turn's, not a launch snapshot), and
+ *   - the collect's verdict is a real one (`execution: …`), and
+ *   - none of the old refusal sentences are anywhere in it.
  */
-function assertZeroConfigGap(pass) {
+function assertZeroConfigCollect(pass) {
 	return assertThat(
 		"d0",
-		"known-gap: zero-config collect refused by the worktree-ownership guard, masking the missing hosts.<name> read-back (src/runs/remote.ts:976-982)",
+		"zero-config collect delivers the transcript: mirror lines > 0, verdict present, remote's last assistant text carried",
 		() => {
 			const child = pass.childRecord?.name;
 			const collect = lastSubagentResult(pass.tool.results);
 			const text = collect?.text ?? "";
 			const mirrorPath = `${XM_ENV.runStore}/${pass.run.runId}/remote/${child}.jsonl`;
 			const mirrorStat = containerFileStat(XM_ENV.parent, mirrorPath);
-			const gapSignatures = [
-				/has no entry in subagents\.crossMachine\.hosts/,
+			const mirrorText = mirrorStat === undefined || mirrorStat.size === 0
+				? ""
+				: (readContainerFile(XM_ENV.parent, mirrorPath) ?? "");
+			const mirrorLines = mirrorText
+				.split("\n")
+				.filter((line) => line.trim().length > 0 && line.trimStart().startsWith("{")).length;
+			const remote = remoteLastAssistantText(child);
+			const carriesRemoteText = remote.text.length > 0 && text.includes(remote.text);
+			const verdict = /^execution: /m.test(text) || /execution: [a-z]+/i.test(text);
+			// Every sentence that used to stand in for the transcript. None may appear.
+			const refusal = [
+				/collect failed/i,
+				/belongs to host/,
 				/local filesystem and git operations on it are refused/,
-			];
-			const signature = gapSignatures.find((re) => re.test(text));
-			// The sentence the caller really sees today (F2): without it, a resolver-only
-			// fix would leave the mirror empty AND `collect failed` true, i.e. d0 would go
-			// green while nothing was actually delivered.
-			const ownershipGuard = /belongs to host ['‘’]?/.test(text) &&
-				/local filesystem and git operations on it are refused/.test(text);
-			const failed = /collect failed|INVALID_PARAMS|transcript/i.test(text);
-			const noMirror = mirrorStat === undefined || mirrorStat.size === 0;
-			// Always printed: the current gap's EXACT shape, so the report can quote it
-			// and a future product fix shows up as this line disappearing (and d0 going red).
+				/has no entry in subagents\.crossMachine\.hosts/,
+			].find((re) => re.test(text));
+			const refused = collect?.isError === true || refusal !== undefined;
 			print(
-				`XM_GAP ${JSON.stringify({
+				`XM_ZEROCONFIG ${JSON.stringify({
 					id: "d0",
 					child,
 					mirror_path: mirrorPath,
 					mirror_bytes: mirrorStat?.size ?? 0,
-					gap_signature: signature?.source ?? null,
-					ownership_guard: ownershipGuard,
+					mirror_lines: mirrorLines,
+					carries_remote_last_assistant: carriesRemoteText,
+					remote_last_assistant_chars: remote.text.length,
+					verdict,
+					refusal_signature: refusal?.source ?? null,
 					collect_result: text.slice(0, 600),
 				})}`,
 			);
-			// The zero-config probe must not silently look like a read-back success.
 			return {
-				ok: failed && signature !== undefined && noMirror && ownershipGuard,
+				ok: mirrorLines > 0 && carriesRemoteText && verdict && !refused,
 				evidence: {
 					child,
-					collect_failed: failed,
-					gap_signature: signature?.source,
-					ownership_guard: ownershipGuard,
 					mirror_path: mirrorPath,
 					mirror_bytes: mirrorStat?.size ?? 0,
+					mirror_lines: mirrorLines,
+					carries_remote_last_assistant: carriesRemoteText,
+					remote_last_assistant_chars: remote.text.length,
+					verdict_present: verdict,
+					collect_is_error: collect?.isError ?? null,
+					refusal_signature: refusal?.source ?? null,
 					collect_result: text.slice(0, 2000),
 					session: pass.tool.sessionPath,
 				},
@@ -614,49 +673,65 @@ function assertTranscriptReadback(pass) {
 }
 
 /**
- * d1 — the SECOND product gap, asserted instead of hidden (F1).
+ * d1 — `collect` on a remote child finishes with a VERDICT (positive assertion).
  *
- * With `hosts.<name>` present the pre-wait refresh inside `collect` DOES fetch the
- * transcript and writes the mirror (that is what d proves), and only afterwards
- * `finishCollect` runs `assertLocalWorktree(child)` (src/runs/orchestrator.ts:3515) and
- * refuses the child, so the collect tool result is a failure even though the bytes
- * arrived. Today's shape: mirror non-empty AND collect failed with the ownership guard.
+ * With `hosts.<name>` present the pre-wait refresh always fetched the transcript
+ * (that is what `d` proves), and then `finishCollect` ran `assertLocalWorktree(child)`
+ * unconditionally: a remote child OWNS its tree (`worktreeHost` = that machine), so
+ * the guard refused the whole collect. The verdict never got graded, and the
+ * ownership sentence replaced it.
  *
- * This is again an assertion of a GAP: when the product lets a remote child's collect
- * finish, d1 must go RED so the harness gets updated (and d's `collect_ok` becomes true).
+ * The guard is now narrowed to what it protects (a LOCAL filesystem/git operation),
+ * so this assertion requires the delivery: the mirror is non-empty, the collect's
+ * text carries the read-back line for that host, a verdict line, and the child's own
+ * final text — and none of the ownership sentences.
  */
-function assertRemoteCollectGap(pass) {
+function assertRemoteCollectVerdict(pass) {
 	return assertThat(
 		"d1",
-		"known-gap: collect on a remote child is refused by assertLocalWorktree (src/runs/orchestrator.ts:3515)",
+		"collect on a remote child delivers: read-back line, verdict, child text — and no worktree-ownership refusal",
 		() => {
 			const child = pass.childRecord?.name;
 			const collect = lastSubagentResult(pass.tool.results);
 			const text = collect?.text ?? "";
 			const mirrorPath = `${XM_ENV.runStore}/${pass.run.runId}/remote/${child}.jsonl`;
 			const mirrorStat = containerFileStat(XM_ENV.parent, mirrorPath);
-			const signature =
-				/belongs to host|assertLocalWorktree|local filesystem and git operations on it are refused/.test(text);
 			const mirrorNonEmpty = mirrorStat !== undefined && mirrorStat.size > 0;
+			const readback = new RegExp(`read-back from host '${XM_ENV.host}':\\s*\\d+ of \\d+ lines`).test(text);
+			const verdict = /execution: [a-z]+/i.test(text);
+			const remote = remoteLastAssistantText(child);
+			const carriesRemoteText = remote.text.length > 0 && text.includes(remote.text);
+			const refusal = [
+				/belongs to host/,
+				/assertLocalWorktree/,
+				/local filesystem and git operations on it are refused/,
+				/collect failed/i,
+			].find((re) => re.test(text));
+			const refused = collect?.isError === true || refusal !== undefined;
 			print(
-				`XM_GAP ${JSON.stringify({
+				`XM_REMOTE_COLLECT ${JSON.stringify({
 					id: "d1",
 					child,
 					mirror_path: mirrorPath,
 					mirror_bytes: mirrorStat?.size ?? 0,
-					signature,
+					readback_line: readback,
+					verdict,
+					carries_remote_last_assistant: carriesRemoteText,
+					refusal_signature: refusal?.source ?? null,
 					collect_result: text.slice(0, 600),
 				})}`,
 			);
 			return {
-				ok: signature && mirrorNonEmpty,
+				ok: mirrorNonEmpty && readback && verdict && carriesRemoteText && !refused,
 				evidence: {
 					child,
-					signature,
 					mirror_path: mirrorPath,
 					mirror_bytes: mirrorStat?.size ?? 0,
-					mirror_non_empty: mirrorNonEmpty,
+					readback_line: readback,
+					verdict_present: verdict,
+					carries_remote_last_assistant: carriesRemoteText,
 					collect_is_error: collect?.isError ?? null,
+					refusal_signature: refusal?.source ?? null,
 					collect_result: text.slice(0, 2000),
 					session: pass.tool.sessionPath,
 				},
@@ -678,7 +753,8 @@ async function runLaunchScenario() {
 	const passA = await launchPass({ label: "launch-a", childName: "centurion-0", nonceValue: nonceA });
 	assertLaunchSucceeded(passA);
 	assertRemoteArtifact("c", passA);
-	assertZeroConfigGap(passA);
+	assertZeroConfigCollect(passA);
+	assertParentExitsOnItsOwn(passA);
 
 	// ── Run B: the supported shape (`hosts.remote` present) ─────────────
 	print(`XM_SETTINGS ${applySettingsMode("host-entry")}`);
@@ -686,7 +762,8 @@ async function runLaunchScenario() {
 	const passB = await launchPass({ label: "launch-b", childName: "centurion-b", nonceValue: nonceB });
 	assertRemoteArtifact("c2", passB);
 	assertTranscriptReadback(passB);
-	assertRemoteCollectGap(passB);
+	assertRemoteCollectVerdict(passB);
+	assertParentExitsOnItsOwn(passB);
 
 	return {
 		runId: `${passA.run.runId},${passB.run.runId}`,

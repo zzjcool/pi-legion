@@ -63,22 +63,28 @@ const MINUTE = 60_000;
 
 // ───────────────────────────── 1. pure decision ─────────────────────────────
 
-/** The window as the postman builds it: `announced` = lines already sent. */
-/** The window as the postman builds it: per-kind `{ count, lastAt }` (D6). */
+/** The window as the postman builds it: per-kind `{ tier, count }` (D6/#413). */
 function window(
 	loopBaseAt: number,
 	announced: { silence?: StallLineState; longRunning?: StallLineState } = {},
 ) {
 	return {
 		loopBaseAt,
-		silence: announced.silence ?? { count: 0 },
-		longRunning: announced.longRunning ?? { count: 0 },
+		silence: announced.silence ?? EMPTY_LINE,
+		longRunning: announced.longRunning ?? EMPTY_LINE,
 	};
 }
 
-/** A line already sent at `lastAt` (the repeat clock's whole input). */
-function sentAt(count: number, lastAt: number): StallLineState {
-	return { count, lastAt };
+/** Nothing announced yet in this window. */
+const EMPTY_LINE: StallLineState = { tier: 0, count: 0 };
+
+/**
+ * What one window has already announced (#413): the highest crossed BOUNDARY
+ * (`tier`), and how many lines D6's cap has spent (`count`, which can be lower
+ * when a child was first observed past several boundaries at once).
+ */
+function sent(tier: number, count: number): StallLineState {
+	return { tier, count };
 }
 
 function child(facts: Partial<StallChildFacts> = {}): StallChildFacts {
@@ -168,14 +174,16 @@ test("L1: announced at 1× and 2×, then never again in the same silence window 
 			window: window(0, { silence: already }),
 		});
 
-	assert.equal(announce(silenceNoticeMs, { count: 0 })?.sequence, 1);
-	// D6: the second line waits one threshold after the FIRST line, not after `2×base`.
-	assert.equal(announce(silenceNoticeMs + 1_000, sentAt(1, silenceNoticeMs)), undefined, "no second mail one tick later");
-	assert.equal(announce(2 * silenceNoticeMs - 1, sentAt(1, silenceNoticeMs)), undefined, "one threshold after the first line");
-	assert.equal(announce(2 * silenceNoticeMs, sentAt(1, silenceNoticeMs))?.sequence, 2);
+	assert.equal(announce(silenceNoticeMs, EMPTY_LINE)?.sequence, 1);
+	// #413/D6: the second line waits for the NEXT boundary, not for one threshold
+	// after the first line's timestamp (the two agree here because the first line
+	// landed exactly on `1×`).
+	assert.equal(announce(silenceNoticeMs + 1_000, sent(1, 1)), undefined, "no second mail one tick later");
+	assert.equal(announce(2 * silenceNoticeMs - 1, sent(1, 1)), undefined, "not before the second boundary");
+	assert.equal(announce(2 * silenceNoticeMs, sent(1, 1))?.sequence, 2);
 	assert.equal(SILENCE_NOTICE_LIMIT, 2);
-	assert.equal(announce(3 * silenceNoticeMs, sentAt(2, 2 * silenceNoticeMs)), undefined, "a dead child must not mail every 2 minutes");
-	assert.equal(announce(100 * silenceNoticeMs, sentAt(2, 3 * silenceNoticeMs)), undefined);
+	assert.equal(announce(3 * silenceNoticeMs, sent(2, 2)), undefined, "a dead child must not mail every 2 minutes");
+	assert.equal(announce(100 * silenceNoticeMs, sent(2, 2)), undefined);
 	// A NEW event opens a new window, and the count restarts with it.
 	assert.equal(
 		decideStallNotice({
@@ -218,15 +226,55 @@ test("L2: it repeats once per radius and stops after three unhandled lines (D6)"
 			window: window(base, { longRunning }),
 		});
 
-	assert.equal(at(radius, { count: 0 })?.sequence, 1);
-	// ‘每再过一个 loopRadiusMs’ measured from the PREVIOUS line (D6), not one tick later.
-	assert.equal(at(radius + 1, sentAt(1, radius)), undefined);
-	assert.equal(at(2 * radius - 1, sentAt(1, radius)), undefined);
-	assert.equal(at(2 * radius, sentAt(1, radius))?.sequence, 2);
-	assert.equal(at(3 * radius, sentAt(2, 2 * radius))?.sequence, 3);
+	assert.equal(at(radius, EMPTY_LINE)?.sequence, 1);
+	// #413: one line per crossed BOUNDARY, not one tick and not one sent-time window.
+	assert.equal(at(radius + 1, sent(1, 1)), undefined);
+	assert.equal(at(2 * radius - 1, sent(1, 1)), undefined);
+	assert.equal(at(2 * radius, sent(1, 1))?.sequence, 2);
+	assert.equal(at(3 * radius, sent(2, 2))?.sequence, 3);
 	assert.equal(LONG_RUNNING_NOTICE_LIMIT, 3);
-	assert.equal(at(4 * radius, sentAt(3, 3 * radius)), undefined, "the cap holds until an `extend` or the child ends");
-	assert.equal(at(100 * radius, sentAt(3, 4 * radius)), undefined);
+	assert.equal(at(4 * radius, sent(3, 3)), undefined, "the cap holds until an `extend` or the child ends");
+	assert.equal(at(100 * radius, sent(3, 3)), undefined);
+});
+
+test("#413: N checks inside ONE boundary announce exactly once (the key is the threshold, not a timestamp)", () => {
+	const radius = 30 * MINUTE;
+	const base = 0;
+	// The reported defect: a child sits past its 30m threshold and every check
+	// re-detects it. Ten checks spread over the SAME boundary must write one line.
+	let announced = EMPTY_LINE;
+	const tiers: number[] = [];
+	for (let tick = 0; tick < 10; tick += 1) {
+		const decision = decideStallNotice({
+			now: base + radius + tick * 1_000,
+			child: child(),
+			thresholds: long(radius),
+			window: window(base, { longRunning: announced }),
+		});
+		if (!decision) continue;
+		tiers.push(decision.tier);
+		// The caller's whole job: record the boundary it just spent.
+		announced = { tier: decision.tier, count: decision.sequence };
+	}
+	assert.deepEqual(tiers, [1], "ten checks, one line — the second 30m boundary was never crossed");
+	// `floor`, not `round`: the boundary flips exactly at `base + n × threshold`.
+	assert.equal(decideStallNotice({ now: base + 2 * radius - 1, child: child(), thresholds: long(radius), window: window(base, { longRunning: sent(1, 1) }) }), undefined);
+	assert.equal(decideStallNotice({ now: base + 2 * radius, child: child(), thresholds: long(radius), window: window(base, { longRunning: sent(1, 1) }) })?.tier, 2);
+});
+
+test("#413: the NEXT boundary re-arms — one threshold after the last line was the old rule", () => {
+	const radius = 45 * MINUTE;
+	const base = 0;
+	const at = (now: number, longRunning: StallLineState) =>
+		decideStallNotice({ now, child: child(), thresholds: long(radius), window: window(base, { longRunning }) });
+	// First observed 10 minutes into its fourth boundary (190m): that boundary is
+	// announced once, and the next line belongs to the boundary at 225m — 35m away,
+	// not a full radius after the line that was just sent.
+	const late = at(190 * MINUTE, EMPTY_LINE);
+	assert.equal(late?.sequence, 1);
+	assert.equal(late?.tier, 4);
+	assert.equal(at(224 * MINUTE, sent(4, 1)), undefined, "still inside the boundary just announced");
+	assert.equal(at(225 * MINUTE, sent(4, 1))?.tier, 5, "crossing the next boundary re-arms the reminder");
 });
 
 test("L2: a non-empty stack becomes EVIDENCE inside the line, never a verdict of its own (D1)", () => {
@@ -264,7 +312,7 @@ test("L1 wins over L2 for the same child in the same tick (one line per child)",
 		now: 60 * MINUTE,
 		child: child({ lastEventAt: 0 }),
 		thresholds: { silenceNoticeMs: 120_000, loopRadiusMs: 45 * MINUTE },
-		window: window(0, { silence: sentAt(SILENCE_NOTICE_LIMIT, 2 * 120_000) }),
+		window: window(0, { silence: sent(SILENCE_NOTICE_LIMIT, SILENCE_NOTICE_LIMIT) }),
 	});
 	assert.equal(later?.kind, "long-running");
 });
@@ -285,6 +333,7 @@ function silenceAnnouncement(childName: string, overrides: Partial<StallAnnounce
 		kind: "silence",
 		childName,
 		sinceBucket: 0,
+		tier: 1,
 		sequence: 1,
 		elapsedMs: 125_000,
 		thresholdMs: 120_000,
@@ -297,6 +346,7 @@ test("L1 text carries the frozen qualifier: steer cannot land, abort can (D3)", 
 		kind: "silence",
 		childName: "root.worker",
 		sinceBucket: 0,
+		tier: 1,
 		sequence: 1,
 		elapsedMs: 125_000,
 		thresholdMs: 120_000,
@@ -340,6 +390,7 @@ test("L2 text does NOT tell the parent that steer is useless (D3)", () => {
 			kind: "long-running",
 			childName: "root.worker",
 			sinceBucket: 0,
+			tier: 1,
 			sequence: 1,
 			elapsedMs: 46 * MINUTE,
 			thresholdMs: 45 * MINUTE,
@@ -360,9 +411,9 @@ test("L2 text does NOT tell the parent that steer is useless (D3)", () => {
 
 test("many children in one tick merge into ONE mail with one line each (D7)", () => {
 	const merged = formatStallNotice([
-		{ kind: "silence", childName: "root.a", sinceBucket: 0, sequence: 1, elapsedMs: 130_000, thresholdMs: 120_000 },
-		{ kind: "silence", childName: "root.b", sinceBucket: 0, sequence: 1, elapsedMs: 140_000, thresholdMs: 120_000 },
-		{ kind: "long-running", childName: "root.c", sinceBucket: 0, sequence: 1, elapsedMs: 46 * MINUTE, thresholdMs: 45 * MINUTE },
+		{ kind: "silence", childName: "root.a", sinceBucket: 0, tier: 1, sequence: 1, elapsedMs: 130_000, thresholdMs: 120_000 },
+		{ kind: "silence", childName: "root.b", sinceBucket: 0, tier: 1, sequence: 1, elapsedMs: 140_000, thresholdMs: 120_000 },
+		{ kind: "long-running", childName: "root.c", sinceBucket: 0, tier: 1, sequence: 1, elapsedMs: 46 * MINUTE, thresholdMs: 45 * MINUTE },
 	], DETECTED_AT);
 	assert.equal(merged.subject, "Stall notice: 3 children");
 	const lines = merged.body.split("\n").filter((line) => line.startsWith("- "));
@@ -759,6 +810,102 @@ test("postman L2: 3 lines per window, then silence until `extend` (D5/D6)", asyn
 	}
 });
 
+test("#413 postman: ten checks inside ONE boundary write ONE mail", async () => {
+	const radius = 30 * MINUTE;
+	let now = TICK_AT;
+	const fx = fixture({
+		now: () => now,
+		// Just past the 30m boundary at the first check, and still inside it at the
+		// last: the reported defect is that EVERY such check mailed the parent.
+		children: [{ name: "worker", role: "worker", createdAt: TICK_AT - radius - 1_000 }],
+		noticeMsForRole: () => radius,
+	});
+	try {
+		for (let tick = 0; tick < 10; tick += 1) {
+			now = TICK_AT + tick * 1_000;
+			await fx.postman.tick();
+		}
+		fx.stop();
+
+		const rows = inbox(fx.db, "root");
+		assert.equal(rows.length, 1, "the (child, threshold) pair is announced exactly once");
+		assert.equal(fx.rootMessages.length, 1, "and it is delivered once, not once per check");
+		assert.match(rows[0]!.body, /running for 30m 1s/);
+	} finally {
+		fx.db.close();
+	}
+});
+
+test("#413 postman: activity then a second silence re-arms ONE more line (a new window, not a new tick)", async () => {
+	const silenceNoticeMs = 120_000;
+	let now = TICK_AT;
+	const fx = fixture({ now: () => now, silenceNoticeMs });
+	try {
+		const count = () => inbox(fx.db, "root").length;
+		// The first silence window has crossed 2m.
+		fx.supervisor.eventAges.set("worker", now - 125_000);
+		await fx.postman.tick();
+		assert.equal(count(), 1);
+
+		// More checks inside the SAME window: nothing is said again.
+		now += 2_000;
+		await fx.postman.tick();
+		now += 2_000;
+		await fx.postman.tick();
+		assert.equal(count(), 1, "the same boundary is spent, however many checks see it");
+
+		// The child moves: D6 says a new event opens a new window, so the 1× boundary
+		// of that window is announceable again — exactly one line.
+		fx.supervisor.eventAges.set("worker", now);
+		await fx.postman.tick();
+		assert.equal(count(), 1, "the activity itself is not an announcement");
+		now += 125_000;
+		await fx.postman.tick();
+		now += 2_000;
+		await fx.postman.tick();
+		assert.equal(count(), 2, "one more line for the new silence window, and only one");
+	} finally {
+		fx.db.close();
+	}
+});
+
+test("#413 postman: `extend` pushes the WHOLE threshold out and re-arms the ladder", async () => {
+	const radius = 10 * MINUTE;
+	let now = TICK_AT;
+	const fx = fixture({
+		now: () => now,
+		children: [{ name: "worker", role: "worker", createdAt: TICK_AT - radius }],
+		noticeMsForRole: () => radius,
+	});
+	try {
+		const count = () => inbox(fx.db, "root").length;
+		await fx.postman.tick();
+		assert.equal(count(), 1, "the first boundary is due");
+
+		// Extend three minutes PAST the boundary, with a bigger radius. The next line
+		// must be one whole new threshold from the extend — not the leftover of the
+		// boundary that was just crossed, and not the old radius.
+		now = TICK_AT + 3 * MINUTE;
+		await fx.postman.tick();
+		assert.equal(count(), 1, "a spent boundary stays spent while time moves inside it");
+		const receipt = fx.postman.extendStallWindow("worker", 2 * radius);
+		assert.ok("childName" in receipt, "a live child gets a receipt");
+		assert.equal(receipt.loopBaseAt, now, "the baseline moves to the extend");
+		assert.equal(receipt.loopRadiusMs, 2 * radius, "and the radius is the operator's");
+
+		await fx.postman.tick();
+		assert.equal(count(), 1, "the extend instant is the far side of a whole threshold");
+		now += 2 * radius - 1;
+		await fx.postman.tick();
+		assert.equal(count(), 1, "one millisecond short is not the next boundary");
+		now += 1;
+		await fx.postman.tick();
+		assert.equal(count(), 2, "the re-armed ladder fires at exactly base + the new radius");
+	} finally {
+		fx.db.close();
+	}
+});
+
 test("postman: `extend` refuses an unknown name and an ended child (D5)", async () => {
 	const fx = fixture();
 	try {
@@ -981,15 +1128,17 @@ test("D6 late first line: one line now, the next only after a whole radius", () 
 	const at = (now: number, longRunning: StallLineState) =>
 		decideStallNotice({ now, child: child(), thresholds: long(radius), window: window(base, { longRunning }) });
 
-	const first = at(180 * MINUTE, { count: 0 });
+	const first = at(180 * MINUTE, EMPTY_LINE);
 	assert.equal(first?.sequence, 1, "the late first line is due at once");
-	// Three ticks 2s apart must not walk through 2× and 3× of the base.
+	assert.equal(first?.tier, 4, "180m at a 45m radius is the FOURTH boundary, announced once");
+	// Three ticks 2s apart must not walk through 5× and 6× of the base: the first
+	// line spent the whole boundary it landed in.
 	for (const tick of [180 * MINUTE + 2_000, 180 * MINUTE + 4_000, 180 * MINUTE + 6_000]) {
-		assert.equal(at(tick, sentAt(1, 180 * MINUTE)), undefined, "the repeat clock starts at the SENT line");
+		assert.equal(at(tick, sent(4, 1)), undefined, "a tick inside a spent boundary says nothing");
 	}
-	assert.equal(at(180 * MINUTE + radius, sentAt(1, 180 * MINUTE))?.sequence, 2);
-	assert.equal(at(180 * MINUTE + 2 * radius, sentAt(2, 180 * MINUTE + radius))?.sequence, 3);
-	assert.equal(at(180 * MINUTE + 3 * radius, sentAt(3, 180 * MINUTE + 2 * radius)), undefined, "cap holds");
+	assert.equal(at(180 * MINUTE + radius, sent(4, 1))?.sequence, 2);
+	assert.equal(at(180 * MINUTE + 2 * radius, sent(5, 2))?.sequence, 3);
+	assert.equal(at(180 * MINUTE + 3 * radius, sent(6, 3)), undefined, "cap holds");
 });
 
 test("m4: the role radius is cached per (cwd, role) for the TTL, then re-resolved", () => {

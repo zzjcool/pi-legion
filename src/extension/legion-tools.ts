@@ -76,6 +76,7 @@ import { upsertUsage } from "../legion/usage.ts";
 import {
 	decideStallNotice,
 	formatStallNotice,
+	isActiveStallThreshold,
 	type StallAnnouncement,
 	type StallChildFacts,
 	type StallLineState,
@@ -242,14 +243,23 @@ export class LegionPostman {
 	/**
 	 * stall-notice D6 de-duplication, in memory only (D4: never an events row).
 	 *
-	 * Keyed `(childName, kind)` with the `sinceBucket` stored INSIDE the value: a new
-	 * bucket is exactly "a zeroed counter", and one row per `(child, kind)` keeps the
-	 * map bounded by the number of children instead of by the number of windows that
-	 * ever elapsed. `count` is the last sequence announced, so `count + 1` is the next
-	 * line the pure decision will accept, and `lastAt` is WHEN that line was written —
-	 * D6's repeat clock measures from it, not from the window base.
+	 * Keyed `(childName, kind)` with the window stored INSIDE the value: a new bucket
+	 * (an L1 event, an `extend`/revival for L2) or a new threshold is exactly "a
+	 * zeroed ladder", and one row per `(child, kind)` keeps the map bounded by the
+	 * number of children instead of by the number of windows that ever elapsed.
+	 *
+	 * #413: `tier` is the boundary the entry has announced (`floor(elapsed/
+	 * thresholdMs)`), NOT the time of the last line. That is what makes the key
+	 * `(child, threshold)` instead of `(child, detectedAt)`: a child sitting past its
+	 * threshold is re-judged every 2s tick, and each of those checks must find "this
+	 * boundary is spent" in here — not write a second mail. `thresholdMs` travels
+	 * with it because a tier number only means something relative to a threshold
+	 * (a changed radius or a role-card change re-arms a different ladder).
 	 */
-	private readonly stallAnnouncements = new Map<string, { bucket: number; count: number; lastAt: number }>();
+	private readonly stallAnnouncements = new Map<
+		string,
+		{ bucket: number; thresholdMs: number; tier: number; count: number; lastAt: number }
+	>();
 	/** One nudge per distinct mismatch when a stored pass no longer matches the checkout (#P0 S4). */
 	private readonly staleVerificationNudges = new Set<string>();
 	/** Short-lived tree probes: a wrong stint must not shell out to git twice a tick. */
@@ -1136,20 +1146,19 @@ export class LegionPostman {
 			live.add(child.name);
 			const clock = this.stallClockFor(child, timestamp);
 			const facts = this.stallFactsFor(child);
+			// The same two thresholds the decision uses, held in locals because the
+			// announced state is only comparable WITHIN one threshold (#413): a `tier`
+			// number means nothing without the radius it was measured against.
+			const silenceNoticeMs = this.settings.silenceNoticeMs ?? DEFAULT_LEGION_SETTINGS.silenceNoticeMs;
+			const loopRadiusMs = this.stallLoopRadiusMs(child, clock);
 			const announcement = decideStallNotice({
 				now: timestamp,
 				child: facts,
-				thresholds: {
-					// The settings object is normally the resolved one (defaults filled), so the
-					// `??` only matters for a hand-built postman (tests, callers): it must behave
-					// like production rather than silently turning L1 off.
-					silenceNoticeMs: this.settings.silenceNoticeMs ?? DEFAULT_LEGION_SETTINGS.silenceNoticeMs,
-					loopRadiusMs: this.stallLoopRadiusMs(child, clock),
-				},
+				thresholds: { silenceNoticeMs, loopRadiusMs },
 				window: {
 					loopBaseAt: clock.loopBaseAt,
-					silence: this.stallAnnouncedState(child.name, "silence", facts.lastEventAt),
-					longRunning: this.stallAnnouncedState(child.name, "long-running", clock.loopBaseAt),
+					silence: this.stallAnnouncedState(child.name, "silence", facts.lastEventAt, silenceNoticeMs),
+					longRunning: this.stallAnnouncedState(child.name, "long-running", clock.loopBaseAt, loopRadiusMs),
 				},
 			});
 			if (announcement) announcements.push(announcement);
@@ -1163,6 +1172,10 @@ export class LegionPostman {
 		for (const announcement of announcements) {
 			this.stallAnnouncements.set(stallAnnouncementKey(announcement.childName, announcement.kind), {
 				bucket: announcement.sinceBucket,
+				thresholdMs: announcement.thresholdMs,
+				// #413: the BOUNDARY, not the clock. Every later check inside this same
+				// boundary re-derives the same `tier` and finds it already spent.
+				tier: announcement.tier,
 				count: announcement.sequence,
 				lastAt: timestamp,
 			});
@@ -1283,22 +1296,25 @@ export class LegionPostman {
 	}
 
 	/**
-	 * What this window has already said, or the empty state.
+	 * What this window has already announced, or the empty state.
 	 *
 	 * A different `sinceBucket` IS a different window (a new event for L1, an
-	 * `extend` or a revival for L2), so a stale entry contributes nothing — that is
-	 * the whole de-duplication rule of D6, with the entry keyed `(child, kind)` and
-	 * the bucket carried in the value.
+	 * `extend` or a revival for L2), and a different `thresholdMs` is a different
+	 * ladder of boundaries — either one contributes nothing. That is the whole
+	 * de-duplication rule of D6/#413, with the entry keyed `(child, kind)` and the
+	 * window carried in the value.
 	 */
 	private stallAnnouncedState(
 		name: string,
 		kind: StallNoticeKind,
 		bucket: number | undefined,
+		thresholdMs: number | undefined,
 	): StallLineState {
-		if (bucket === undefined) return { count: 0 };
+		if (bucket === undefined || !Number.isFinite(bucket)) return { tier: 0, count: 0 };
+		if (!isActiveStallThreshold(thresholdMs)) return { tier: 0, count: 0 };
 		const known = this.stallAnnouncements.get(stallAnnouncementKey(name, kind));
-		if (!known || known.bucket !== bucket) return { count: 0 };
-		return { count: known.count, lastAt: known.lastAt };
+		if (!known || known.bucket !== bucket || known.thresholdMs !== thresholdMs) return { tier: 0, count: 0 };
+		return { tier: known.tier, count: known.count, lastAt: known.lastAt };
 	}
 
 	/**
@@ -1321,8 +1337,13 @@ export class LegionPostman {
 		const radius = ms ?? known?.loopRadiusMs;
 		const clock: StallClock = { loopBaseAt: now, ...(radius === undefined ? {} : { loopRadiusMs: radius }) };
 		this.stallClocks.set(name, clock);
-		// The new baseline is a new `sinceBucket`, so the L2 count restarts on its own
-		// (D6: "after the cap, silent until extend or the child ends").
+		// #413: `extend` is a re-arm, not a patch on an already-queued reminder. The new
+		// baseline is a new bucket, so the L2 ladder restarts on its own — and the entry
+		// is dropped explicitly so a same-millisecond extend (same bucket, same
+		// threshold) cannot inherit the previous ladder's `tier` and swallow the next
+		// boundary. The next line is due at `now + loopRadiusMs`, one WHOLE threshold
+		// from here, not the leftover of the boundary that was just crossed.
+		this.stallAnnouncements.delete(stallAnnouncementKey(name, "long-running"));
 		return { childName: name, loopBaseAt: now, loopRadiusMs: this.stallLoopRadiusMs(child, clock) };
 	}
 
@@ -2704,6 +2725,17 @@ export interface VerificationSummary {
 	outputFile?: string;
 	checkedAt: number;
 	stale: boolean;
+	/**
+	 * The tree belongs to ANOTHER machine, so staleness cannot be judged here (`d1`).
+	 *
+	 * `stale` is computed from this machine's filesystem (`checkoutMatchesPass`,
+	 * `verificationTree`), and a remote `worktreePath` only *looks* like a local path.
+	 * The two honest answers were "refuse the whole read" (which dropped the line from
+	 * the collect head entirely) and "claim it is current" (which cannot be checked);
+	 * this field is the third: report what was recorded, and say the staleness question
+	 * was not answered here.
+	 */
+	staleUnknown?: true;
 }
 
 /**
@@ -2726,8 +2758,22 @@ export function verificationSummary(node: LegionNode): VerificationSummary | und
 	// reader of the collect head is asking about the delivery, and the stint is the
 	// gate's own business.
 	const where = typeof stored.cwd === "string" ? stored.cwd : undefined;
-	// D13: `checkoutMatchesPass`/`verificationTree` read this machine's filesystem.
-	assertLocalWorktree(node);
+	// `d1`: the staleness question is asked of a FILESYSTEM, so it is asked only when
+	// this machine owns the tree. D13 used to answer "not yours" by throwing, and the
+	// caller of this function is the collect head — so a cross-machine child lost its
+	// verification line (or, one layer up, its whole delivery). The recorded facts are
+	// still the truth about what ran; only the re-check is skipped, and it says so.
+	const treeHost = normalizeHost(node.worktreeHost);
+	if (treeHost !== undefined) {
+		return {
+			commandCount: stored.commandCount,
+			...(typeof stored.passed === "boolean" ? { passed: stored.passed } : {}),
+			...(stored.outputFile ? { outputFile: stored.outputFile } : {}),
+			checkedAt: stored.checkedAt,
+			stale: false,
+			staleUnknown: true,
+		};
+	}
 	const stale = where === undefined
 		|| !checkoutMatchesPass(where, node.worktreePath ?? null)
 		|| verificationTree(where, readTextOrEmpty(stored.contractFile)) !== stored.tree;
