@@ -17,6 +17,7 @@ import type { LegionSupervisor } from "../supervisor/types.ts";
 import { inFlightToolStackOf } from "../supervisor/types.ts";
 import { sqliteHasRow, withTransaction, type DatabaseSync } from "../legion/db.ts";
 import { assertLocalWorktree, normalizeHost } from "../runs/remote.ts";
+import { isUnstartedShell, transcriptBytesOf } from "../runs/launch-evidence.ts";
 import {
 	isMailHeld,
 	MAIL_DELIVERY_CLAIM_LEASE_MS,
@@ -1143,6 +1144,26 @@ export class LegionPostman {
 			// already owns — a child this process is not running cannot be judged
 			// "stuck" by it, and a *dead* child is the orphan scan's business.
 			if (!this.supervisor.isAlive(child.name)) continue;
+			// #423 req 5: a SHELL is not a candidate. The issue measured a child whose
+			// launch never started anything — no terminal on the target machine, no
+			// transcript — being reported as "running for 30m 0s, no tool in flight"
+			// while a real sibling appeared on the same line. The judge below reads
+			// `createdAt` and the supervisor's aliveness, so a name that never ran
+			// looks exactly like a child thinking hard.
+			//
+			// The judgement is the launch's own evidence (`launch-evidence`): a remote
+			// terminal exists, or a transcript with bytes exists. Neither ⇒ nothing was
+			// ever started, and "it has been quiet for 30 minutes" is a claim about a
+			// process that does not exist. Tombstoned like an ended child, so a
+			// re-dispatch (which starts a NEW process) gets a fresh baseline.
+			if (isUnstartedShell({
+				...(child.host !== undefined ? { host: child.host } : {}),
+				...(child.remoteTerminal !== undefined ? { remoteTerminal: child.remoteTerminal } : {}),
+				transcriptBytes: transcriptBytesOf(child.sessionFile),
+			})) {
+				this.tombstoneStallClock(child.name);
+				continue;
+			}
 			live.add(child.name);
 			const clock = this.stallClockFor(child, timestamp);
 			const facts = this.stallFactsFor(child);

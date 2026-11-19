@@ -546,11 +546,6 @@ export interface ChildRecord {
 	 */
 	remoteTerminal?: string;
 	/**
-	 * The remote launch gate could not confirm the child wrote a transcript, and
-	 * nothing proved it dead either (`remote-child-fate-v1` §4).
-	 */
-	startupUnconfirmed?: boolean;
-	/**
 	 * 6.2.4 / D2: the parent session left this cross-machine child behind, and
 	 * where its result lives over there.
 	 *

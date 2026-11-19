@@ -93,7 +93,15 @@ export interface FakeSupervisorOptions {
 	 * child that OWNS a remote tree (D13's pair, defect E1) need the same shape without
 	 * an `hc` core, so the fake can be told what its handle says.
 	 */
-	handleExtras?: { worktreePath?: string; worktreeBranch?: string; worktreeHost?: string };
+	handleExtras?: {
+		worktreePath?: string;
+		worktreeBranch?: string;
+		worktreeHost?: string;
+		/** #423: the mirror dir a cross-machine launch reports. */
+		remoteDir?: string;
+		/** #423: the `host/name` address the core holds for the child's terminal. */
+		remoteTerminal?: string;
+	};
 	/** Optional initial cumulative stats snapshot. */
 	usage?: UsageSnapshot | null;
 }

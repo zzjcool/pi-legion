@@ -45,6 +45,14 @@ export const HC_METHODS = [
 	"hello",
 	"terminal.run",
 	"terminal.get",
+	// #423: the only way to read a terminal's TEXT. `terminal.get`'s `screen` field
+	// is not it — measured on hc 0.1.21, that field answers the literal word
+	// `"exact"` (a mode), so every receipt built from it quoted nothing. `read` is a
+	// pure read (`{terminal} | {terminal, lines}` → `{text, how, complete}`), so it
+	// belongs on this side of the boundary exactly like `terminal.get`: the refusal
+	// to expose write-side lifecycle (`tail/send/kill/rm`-adjacent power) is
+	// untouched, and `attach` (which takes the operator's keyboard) stays out.
+	"terminal.read",
 	"terminal.send",
 	"terminal.wait",
 	"terminal.interrupt",

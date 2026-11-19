@@ -118,12 +118,19 @@ function probeClient(opts: {
 	session?: boolean;
 	dir?: boolean;
 	entries?: string[];
+	/** The text `terminal.read` answers (the core's screen, not the mode word). */
+	screen?: string;
 }): FakeRemoteClient {
 	const client = new FakeRemoteClient();
 	client.on("terminal.get", () => {
 		if (opts.terminal === "missing") throw notFound();
-		return { terminal: `vps/lgl-worker-0`, ...(opts.terminal ?? { state: "live", turn: 0 }) };
+		// The real core's answer: `screen` is a MODE, never the text (#423).
+		return { terminal: `vps/lgl-worker-0`, screen: "exact", ...(opts.terminal ?? { state: "live", turn: 0 }) };
 	});
+	// #423: the screen TEXT is read through `terminal.read` (a real core's
+	// `terminal.get.screen` is the mode word "exact"), so the fake answers it the
+	// way the core does — the same text `terminal.get` used to carry.
+	client.on("terminal.read", () => ({ text: opts.terminal === "missing" ? "" : opts.screen ?? "", how: "screen", complete: true }));
 	client.on("machine.exec", () =>
 		execResult({
 			stdout: b64(
@@ -249,7 +256,7 @@ test("§2: `path` when the record's dir and this configuration disagree", async 
 	);
 });
 
-test("§2: exactly two round trips, and the shell line is quoted", async () => {
+test("§2: three round trips (get + read + exec), and the shell line is quoted", async () => {
 	const client = probeClient({ terminal: { state: "live" }, session: false });
 	await probeRemoteChild({
 		client,
@@ -257,8 +264,12 @@ test("§2: exactly two round trips, and the shell line is quoted", async () => {
 		terminal: "vps/lgl-worker-0",
 		sessionPath: "/srv/.pi-subagents-mirror/no-run/worker-0/session.jsonl",
 	});
-	assert.equal(client.calls.length, 2, "one terminal.get + one machine.exec, nothing else");
+	// #423: `terminal.read` joined the probe because a real core answers
+	// `terminal.get.screen` with the mode word `"exact"` — the text is a separate
+	// read. One of each, and nothing else.
+	assert.deepEqual(client.calls.map((call) => call.method).sort(), ["machine.exec", "terminal.get", "terminal.read"]);
 	assert.equal(client.paramsFor("terminal.get")[0]?.terminal, "vps/lgl-worker-0");
+	assert.equal(client.paramsFor("terminal.read")[0]?.terminal, "vps/lgl-worker-0");
 	const exec = client.paramsFor("machine.exec")[0] ?? {};
 	assert.equal(exec.on, HOST);
 	const line = String(exec.line ?? "");
@@ -589,6 +600,8 @@ function launchHarness(opts: {
 		...(opts.terminal?.exit_code !== undefined ? { exit_code: opts.terminal.exit_code } : {}),
 		screen: opts.terminal?.screen ?? "",
 	}));
+	// #423: the child's own words come from `terminal.read` on a real core.
+	client.on("terminal.read", () => ({ text: opts.terminal?.screen ?? "", how: "screen", complete: true }));
 	client.on("terminal.run", () => ({ address: "t9", name: `lgl-${CHILD}`, state: "running", turn: 0, status: { state: "idle" }, pid: 4242 }));
 	const supervisor = new TerminalSupervisor({
 		clientFactory: () => client,
@@ -643,30 +656,30 @@ test("§4: a confirmed transcript launches, and the handle carries the address t
 	try {
 		const handle = await h.supervisor.spawnChild(spawnInput(h.root));
 		assert.equal(handle.remoteTerminal, "vps/lgl-worker-0");
-		assert.equal(handle.startupUnconfirmed, undefined, "confirmed launches say nothing");
 		assert.equal(handle.remoteDir, `/srv/.pi-subagents-mirror/${RUN_ID}/${CHILD}`);
 	} finally {
 		h.cleanup();
 	}
 });
 
-test("§4: silence is not death — the launch proceeds with a warning and startupUnconfirmed", async () => {
+test("§4 (#423): silence is NOT a launch — no transcript within the window refuses with START_FAILED", async () => {
+	// #423 reversed this half of §4. The old rule ("warn and launch anyway") left a
+	// child the parent renders as `working` and cannot verify; measured, four of them
+	// in one day, and one retired as `execution: success` without ever running. The
+	// refusal (with the machine, cwd, terminal, hc error and the terminal's last
+	// lines) is `test/unit/remote-launch-refusal.test.ts`'s subject; here only the
+	// §4 boundary is pinned: the gate fires, and no child record survives.
 	const h = launchHarness({ sessionArrives: false, remoteStartupConfirmMs: 40 });
-	const written: string[] = [];
-	const original = process.stderr.write.bind(process.stderr);
-	process.stderr.write = ((chunk: string | Uint8Array) => {
-		written.push(String(chunk));
-		return true;
-	}) as typeof process.stderr.write;
 	try {
-		const handle = await h.supervisor.spawnChild(spawnInput(h.root));
-		assert.equal(handle.startupUnconfirmed, true);
-		assert.equal(handle.remoteTerminal, "vps/lgl-worker-0");
+		const error = await h.supervisor.spawnChild(spawnInput(h.root)).then(
+			() => undefined,
+			(thrown: unknown) => thrown,
+		);
+		assert.ok(error instanceof SubagentError, `a silent launch must be refused, got ${String(error)}`);
+		assert.equal(error.code, ErrorCodes.START_FAILED);
+		assert.match(error.message, new RegExp(`no session file appeared at ${SESSION_PATH.replaceAll("/", "\\/")}`));
+		assert.equal(h.supervisor.isAlive(CHILD), false, "no `working` shell may be registered");
 	} finally {
-		process.stderr.write = original;
 		h.cleanup();
 	}
-	const warning = written.join("");
-	assert.match(warning, /\[pi-legion\] host 'vps': no transcript at \/srv\/\.pi-subagents-mirror\/run-fate\/worker-0\/session\.jsonl after 40ms/);
-	assert.match(warning, /launching anyway/);
 });

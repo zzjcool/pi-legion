@@ -131,11 +131,6 @@ export interface ChildHandle {
 	 */
 	remoteTerminal?: string;
 	/**
-	 * The launch gate could not confirm a transcript, but nothing proved the child
-	 * dead either (`remote-child-fate-v1` §4). A slow machine is not a bug.
-	 */
-	startupUnconfirmed?: boolean;
-	/**
 	 * NON-FATAL notice from the backend that spawned the child (B5, D14).
 	 *
 	 * Two sources, one channel: `resolveCliModel` answers a `warning` for an

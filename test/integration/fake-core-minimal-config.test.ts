@@ -179,7 +179,10 @@ else if (process.argv.includes("--list-models")) {
 		request: async <T = unknown>(method: HcMethod, params: Record<string, unknown> = {}): Promise<T> =>
 			(await real.request<T>(method, params)) as T,
 	};
-	const supervisor = new TerminalSupervisor({ clientFactory: () => client, env, runId: "run-minimal-1", pollIntervalMs: 5 });
+	// #423: same reason as `fake-core-host-discovery` — the fake core's child never
+	// writes a transcript, and these cases are about a `{ enabled: true }` config
+	// resolving at all, not about the start-up gate.
+	const supervisor = new TerminalSupervisor({ clientFactory: () => client, env, runId: "run-minimal-1", pollIntervalMs: 5, remoteStartupConfirmMs: 0 });
 	const wire = (): WireRequest[] => {
 		if (!existsSync(wirePath)) return [];
 		return readFileSync(wirePath, "utf8")

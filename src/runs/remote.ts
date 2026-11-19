@@ -900,6 +900,19 @@ export function remoteStartupProbeLine(argv: string[], cwd: string): string {
 }
 
 /**
+ * #423: the launch's own command line, `cd`ed into the directory it asked for.
+ *
+ * Not {@link remoteStartupProbeLine}: that one replaces the task with
+ * `--list-models` because it asks a different question ("can this machine see
+ * the model"). A failed-startup receipt has to hand the operator the command that
+ * FAILED, task included, or reproducing it reproduces something else.
+ */
+export function remoteLaunchReproLine(argv: readonly string[], cwd: string): string {
+	const command = argv.map((part) => shQuote(part)).join(" ");
+	return `cd -- ${shQuote(cwd)} && ${command}`;
+}
+
+/**
  * How many of that machine's models a model refusal quotes.
  *
  * Five was arbitrary: a registry commonly lists more, and a truncated list that
@@ -2962,6 +2975,30 @@ function isNotFoundError(error: unknown): boolean {
 }
 
 /**
+ * The last non-empty lines a terminal shows, read over `terminal.read` (#423).
+ *
+ * `terminal.get`'s `screen` field LOOKS like this and is not: on hc 0.1.21 it
+ * answers the literal word `"exact"` (a mode name), which is why every receipt
+ * built from it quoted `| exact` and nothing else. The text lives behind
+ * `terminal.read` (`{text, how, complete}`), so that is what this asks; a core
+ * that does not know the method (older build) leaves `[]` and the caller falls
+ * back to whatever `terminal.get` said.
+ *
+ * Never throws: a receipt must not be lost to a screen it could not read.
+ */
+export async function readTerminalScreenTail(
+	client: HcClient,
+	terminal: string,
+): Promise<string[]> {
+	try {
+		const reply = await client.request<{ text?: unknown }>("terminal.read", { terminal });
+		return screenTailOf(reply?.text);
+	} catch {
+		return [];
+	}
+}
+
+/**
  * Ask the core and the machine what became of one remote child (§2).
  *
  * Two round trips, both already in the whitelist (no new `hc` method): the
@@ -3002,6 +3039,7 @@ export async function probeRemoteChild(opts: {
 	let exitCode: number | undefined;
 	let pid: number | undefined;
 	let screenTail: string[] = [];
+	let terminalKnown = false;
 	try {
 		const facts = await opts.client.request<{ state?: string; exit_code?: number | null; pid?: number | null; screen?: string }>(
 			"terminal.get",
@@ -3010,9 +3048,18 @@ export async function probeRemoteChild(opts: {
 		terminalState = typeof facts?.state === "string" && facts.state.length > 0 ? facts.state : "missing";
 		if (typeof facts?.exit_code === "number") exitCode = facts.exit_code;
 		if (typeof facts?.pid === "number") pid = facts.pid;
+		terminalKnown = true;
 		screenTail = screenTailOf(facts?.screen);
 	} catch (error) {
 		if (!isNotFoundError(error)) throw error;
+	}
+	// #423: the SCREEN TEXT is its own read (`terminal.read`) — `terminal.get`'s
+	// `screen` field is a mode word on a real core (see `readTerminalScreenTail`).
+	// Asked only when the core still holds the terminal: a `not_found` terminal has
+	// no screen left to read, and one extra round trip on that path buys nothing.
+	if (terminalKnown) {
+		const text = await readTerminalScreenTail(opts.client, opts.terminal);
+		if (text.length > 0) screenTail = text;
 	}
 	const listing = await opts.client.request<HcExecResult>("machine.exec", {
 		on: opts.target.host,
@@ -3048,6 +3095,154 @@ export async function probeRemoteChild(opts: {
 		summary: remoteFateSummary(kind),
 		nextStep: remoteFateNextStep(kind, opts.target.host),
 	};
+}
+
+/**
+ * #423: what a launch that never proved it started can say about itself.
+ *
+ * The gate exists because "the parent cannot see the child" is not the same fact
+ * as "the child is fine": a remote `pi` that stopped at an interactive prompt
+ * ("Trust project folder?", #424), a spawn that failed on the machine, or a
+ * network that ate the reply all leave the SAME observable at the parent — a
+ * live terminal, no transcript, no error. Left alone that observable becomes a
+ * `working` shell nobody looks at again, so the launch now refuses and must say
+ * enough for one read to locate the cause.
+ *
+ * The five facts below are exactly the ones an operator asked for on 2026-08
+ * (@423): machine, attempted cwd, terminal, `hc`'s own error, and the terminal's
+ * last lines. The screen tail is the load-bearing one — it is where
+ * "Trust project folder?" appeared, one keystroke away from a diagnosis that
+ * instead took 30 minutes of waiting.
+ */
+export interface RemoteStartupFailure {
+	host: string;
+	/** The directory this launch asked the child to start in (on THAT machine). */
+	cwd: string;
+	/** `host/name` — the address the core returned for the terminal it created. */
+	terminal: string;
+	/** `<remoteDir>/session.jsonl` — the file whose absence is the failure. */
+	sessionPath: string;
+	/** How long the launch waited for that file. */
+	waitedMs: number;
+	/** Last non-empty lines of the child's terminal, newest last. At most 6. */
+	screenTail: string[];
+	/** The last `hc` error the gate saw (`kind: message`), when it saw one. */
+	lastError?: string;
+	/** The pid the core reports: absent means "nothing may have been started". */
+	pid?: number;
+	/** `false` when the core cannot see the mirror dir at all. */
+	dirExists?: boolean;
+	/** `false` when the transcript is missing (the normal case). */
+	sessionExists?: boolean;
+}
+
+/**
+ * Ask the core and the machine for the evidence a failed startup leaves behind.
+ *
+ * Never throws: this runs on the failure path, where the launch's own reason is
+ * worth more than the probe's. A probe that cannot answer leaves the optional
+ * fields absent instead of inventing them, and the message says which question
+ * went unanswered.
+ */
+export async function probeRemoteStartupFailure(opts: {
+	client: HcClient;
+	target: RemoteReadTarget;
+	/** `host/name` the core holds. */
+	terminal: string;
+	remoteDir: string;
+	cwd: string;
+	waitedMs: number;
+	lastError?: string;
+}): Promise<RemoteStartupFailure> {
+	const sessionPath = path.posix.join(opts.remoteDir, "session.jsonl");
+	const base: RemoteStartupFailure = {
+		host: opts.target.host,
+		cwd: opts.cwd,
+		terminal: opts.terminal,
+		sessionPath,
+		waitedMs: opts.waitedMs,
+		screenTail: [],
+		...(opts.lastError !== undefined ? { lastError: opts.lastError } : {}),
+	};
+	let fate: RemoteChildFate | undefined;
+	try {
+		fate = await probeRemoteChild({
+			client: opts.client,
+			target: opts.target,
+			terminal: opts.terminal,
+			sessionPath,
+		});
+	} catch {
+		// A probe that cannot answer must not replace the failure with its own.
+		return base;
+	}
+	return {
+		...base,
+		screenTail: fate.screenTail,
+		...(fate.pid !== undefined ? { pid: fate.pid } : {}),
+		dirExists: fate.dirExists,
+		sessionExists: fate.sessionExists,
+	};
+}
+
+/** What the launch managed to do about the terminal it created. */
+export type RemoteTerminalDisposal = "removed" | "kept";
+
+/**
+ * #423 req 6: the receipt for a launch that never proved it started.
+ *
+ * Every line is a fact this launch measured (never a guess about the child's
+ * intent), and the last one is the reproduce command, because "what would I type
+ * to see it myself" is the only way to confirm a fix on a machine this process
+ * cannot reach.
+ *
+ * `removed`/`kept` is reported rather than assumed: a terminal left behind holds
+ * its NAME in that core (`terminal.run` answers `name_taken` for it), so a
+ * re-dispatch of the same handle is only free if this line says `removed`.
+ */
+export function remoteStartupFailureMessage(
+	failure: RemoteStartupFailure,
+	opts: {
+		/** Did the launch kill+remove the terminal it created? */
+		disposal: RemoteTerminalDisposal;
+		/** The launch argv (task last): quoted back as a reproduce command. */
+		argv: readonly string[];
+		/** Why the terminal was kept, when it was (a kill that failed). */
+		disposalError?: string;
+	},
+): string {
+	const screen = failure.screenTail.length > 0
+		? failure.screenTail.map((line) => `    | ${line}`).join("\n")
+		: "    | (the terminal rendered nothing)";
+	const dirLine = failure.dirExists === false
+		? "gone (the launch created it; nothing is in it to read)"
+		: failure.dirExists === true
+			? "there (the child never wrote into it)"
+			: "unknown (the machine did not answer the directory question)";
+	const transcript = failure.sessionExists === true
+		? `${failure.sessionPath} (the file exists — this launch gave up on a file that IS there)`
+		: failure.sessionExists === false
+			? `${failure.sessionPath} (does not exist)`
+			: `${failure.sessionPath} (could not be checked)`;
+	const pidLine = failure.pid === undefined
+		? "the core reports no pid for it: nothing may have been started in that terminal"
+		: `pid ${failure.pid} (a program is running there, but it has written no transcript)`;
+	const terminalLine = opts.disposal === "removed"
+		? `${failure.terminal} (created, then killed and removed: the name is free again)`
+		: `${failure.terminal} (KEPT${opts.disposalError ? `: ${opts.disposalError}` : ""} — a re-dispatch of this name will answer NAME_TAKEN until it is removed on that machine)`;
+	return [
+		`host '${failure.host}': the launch never proved the child started — no session file appeared at ${failure.sessionPath} within ${failure.waitedMs}ms`,
+		`  host: ${failure.host}`,
+		`  cwd: ${failure.cwd} (the directory this launch asked for, on ${failure.host})`,
+		`  terminal: ${terminalLine}`,
+		`  mirror dir: ${dirLine}`,
+		`  transcript: ${transcript}`,
+		`  hc error: ${failure.lastError ?? "(the core reported no error: every call answered)"}`,
+		`  process: ${pidLine}`,
+		`  screen (last ${REMOTE_FATE_SCREEN_LINES} lines of that terminal):\n${screen}`,
+		`  next: ${failure.host} accepted the launch but the child did not start. The screen above is the child's own words — an interactive prompt, a missing provider, a rejected --extension. Fix that on ${failure.host} and re-dispatch (a launch that fails later is now refused here instead of becoming a "working" shell).`,
+		`  Command (run on '${failure.host}' to reproduce):\n${remoteLaunchReproLine(opts.argv, failure.cwd)}`,
+	].join("\n");
 }
 
 /** `mkdir -p <dir>` on the target — the remote half of D9's two temp dirs. */

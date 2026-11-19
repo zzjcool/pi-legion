@@ -154,6 +154,7 @@ import { measureProgress, readSessionLines } from "./src/runs/progress-signal.ts
 import { resolveLaunchWorktree } from "./src/runs/worktree.ts";
 import { normalizeHost, resolveHostTarget, resolveHostTargetAsync, resolveResumeCwd } from "./src/runs/remote.ts";
 import { createRemoteVerifyRunner } from "./src/runs/remote-verify.ts";
+import { shellReason, transcriptBytesOf } from "./src/runs/launch-evidence.ts";
 import {
 	assertRemoteResume,
 	createRemoteSessionReadback,
@@ -7012,11 +7013,27 @@ function stopResolutionFromJob(job: {
 	return { targets: [{ name: job.name, runId: job.runId, ...(settled ? { settled } : {}) }] };
 }
 
-/** `worker-2 is already retired (execution: success, retired at 2026-…).` */
+/**
+ * `worker-2 is already retired (execution: success, retired at 2026-…).`
+ *
+ * #423 req 4: `success` is a claim that work was delivered, and it is the one
+ * answer a parent (or an automated flow) acts on without asking again. A record
+ * with no execution evidence — no terminal, no transcript — cannot support it: the
+ * issue measured `legion-408` retiring as `execution: success` after never having
+ * started on the target machine. Such a record says `unknown` and names the two
+ * missing facts instead, and the reason rides on its own bit so the sentence stays
+ * readable.
+ */
 function retiredRecordNote(child: ChildRecord): string {
 	const bits: string[] = [];
 	const status = child.execution?.status;
-	if (status) bits.push(`execution: ${status}`);
+	const shell = shellReason({
+		...(child.host !== undefined ? { host: child.host } : {}),
+		...(child.remoteTerminal !== undefined ? { remoteTerminal: child.remoteTerminal } : {}),
+		transcriptBytes: transcriptBytesOf(child.sessionFile),
+	});
+	if (status) bits.push(`execution: ${status === "success" && shell !== undefined ? "unknown" : status}`);
+	if (shell !== undefined) bits.push(`never started: ${shell}`);
 	if (child.retiredAt) bits.push(`retired at ${child.retiredAt}`);
 	return `${child.name} is already retired${bits.length > 0 ? ` (${bits.join(", ")})` : ""}.`;
 }

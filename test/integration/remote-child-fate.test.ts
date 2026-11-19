@@ -441,16 +441,19 @@ test("T2: a child that dies during start-up fails the launch with its own exit c
 // ── T3: alive, no transcript ───────────────────────────────────────────────
 
 test("T3: a live terminal with no transcript reads back `no-session`, with a next step", async (t) => {
-	// §4: a slow machine is not a bug — the gate's deadline launches anyway and
-	// records that it could not confirm.
-	const h = harness({ remoteStartupConfirmMs: 200 });
+	// §4 + #423: the LAUNCH gate now refuses this shape (see T3b below and
+	// `test/unit/remote-launch-refusal.test.ts`), so the state is reached here the
+	// only way it still exists in production: a child launched with the gate off
+	// (harnesses, pre-#423 records). This test's subject is the READ-BACK
+	// classification, and that must keep answering `no-session` — never `no-child` —
+	// for a terminal the core still holds.
+	const h = harness({ remoteStartupConfirmMs: 0 });
 	t.after(() => h.cleanup());
 	const input = spawnInput(h);
 	// §7 T3: the terminal runs and writes NOTHING (no `writes`).
 	h.terminals({ "*": { state: "running" } });
 
 	const handle = await h.supervisor.spawnChild(input);
-	assert.equal(handle.startupUnconfirmed, true, "silence must be recorded, not turned into a refusal");
 
 	const collected = await readback(h, handle);
 	assert.ok(!collected.ok, `a missing transcript is not a success: ${JSON.stringify(collected)}`);
@@ -468,6 +471,29 @@ test("T3: a live terminal with no transcript reads back `no-session`, with a nex
 	assert.match(text, /  next: /);
 	// §6.2: the execution line must never leave `unknown` unexplained.
 	assert.match(text, /^execution: unknown \(no messages in session\) · read-back: no-session$/m);
+});
+
+test("T3b (#423): the same silent terminal with the gate ON fails the launch, naming the machine, cwd, terminal and screen", async (t) => {
+	const h = harness({ remoteStartupConfirmMs: 200 });
+	t.after(() => h.cleanup());
+	const input = spawnInput(h);
+	// The child stops at a prompt and never writes: no session, no exit code, and the
+	// reason exists only on its terminal.
+	h.terminals({ "*": { state: "running", screen: " Trust project folder?\n /srv/app\n → Trust" } });
+
+	const error = await h.supervisor.spawnChild(input).then(() => undefined, (thrown: unknown) => thrown);
+	assert.ok(error instanceof SubagentError, `a silent launch must be refused, got ${String(error)}`);
+	const failure = error as SubagentError;
+	assert.equal(failure.code, ErrorCodes.START_FAILED);
+	// req 2: the five facts, on their own lines.
+	assert.match(failure.message, new RegExp(`^host '${HOST}': the launch never proved the child started`, "m"));
+	assert.match(failure.message, new RegExp(`^ {2}host: ${HOST}$`, "m"));
+	assert.match(failure.message, /^ {2}cwd: /m);
+	assert.match(failure.message, new RegExp(`^ {2}terminal: ${HOST}/`, "m"));
+	assert.match(failure.message, /^ {2}hc error: /m);
+	assert.match(failure.message, /^ {4}\|  Trust project folder\?$/m);
+	// req 4: nothing that renders as `working` survives the refusal.
+	assert.equal(h.supervisor.isAlive(input.name), false);
 });
 
 // ── T4: the record disagrees with the configuration ────────────────────────

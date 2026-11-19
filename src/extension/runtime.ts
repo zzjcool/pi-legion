@@ -37,6 +37,7 @@ import {
 } from "../tui/status.ts";
 import { progressFromSessionFile } from "../shared/progress.ts";
 import type { LiveProgress } from "../shared/progress.ts";
+import { shellReason, transcriptBytesOf } from "../runs/launch-evidence.ts";
 import { readProcRss } from "../supervisor/proc-memory.ts";
 import { isTransientConnectionFailure } from "../shared/session.ts";
 import { isTerminalState, liveness } from "./liveness.ts";
@@ -737,18 +738,36 @@ export function renderLiveChildStatus(input: LiveChildStatusInput): string {
 	// dead, not working. `stale` (alive process + retired/failed snapshot) keeps
 	// owning the opposite direction, so the two never fight over one record.
 	const ownerDead = input.owner === "dead" && !input.alive;
-	const state = stale
-		? "working"
-		: ownerDead && input.state === "working"
-			? "failed"
-			: input.state;
+	// #423 req 4: a cross-machine child with NO terminal address and NO transcript
+	// never proved it started, and neither `working` nor `living` is a fact this
+	// renderer can support. Measured in the issue: `state=working` + `quiet 1057s
+	// (living)` next to an empty placeholder and nothing on the target machine.
+	// The state word and the liveness line are the two places that lie, so both
+	// come from the one shared rule (`launch-evidence`) instead of each guessing.
+	const shell = shellReason({
+		...(input.host !== undefined ? { host: input.host } : {}),
+		...(input.remoteTerminal !== undefined ? { remoteTerminal: input.remoteTerminal } : {}),
+		transcriptBytes: transcriptBytesOf(input.sessionFile),
+	});
+	const state = shell !== undefined
+		? "unknown"
+		: stale
+			? "working"
+			: ownerDead && input.state === "working"
+				? "failed"
+				: input.state;
 	const execution = stale
 		? { status: "running", reason: "rpc child alive", usage: input.execution?.usage }
 		: input.execution;
 	const lines = [
 		`${input.name} — state=${state} agent=${input.agent ?? "?"} kind=${input.kind ?? "?"}`,
 	];
-	if (input.alive) {
+	if (shell !== undefined) {
+		// A shell is not "quiet": nothing was ever running to be quiet. This line is
+		// the answer to "is it working?", and `unknown` is the only claim the facts
+		// support (display-liveness D2: unknown must never render as live).
+		lines.push(`liveness=unknown (${shell})`);
+	} else if (input.alive) {
 		const age = lastJsonlEventAgeMs(input.sessionFile, input.now ?? Date.now());
 		lines.push(formatAliveQuiet(age));
 	}
