@@ -1786,14 +1786,17 @@ test("#273: notice() survives a host whose sendMessage is not available yet", ()
 	});
 });
 
-test("#273: the notice guard is present in the source (a removed try/catch would silently return to crashing)", async () => {
+test("#273/#442: the notice guard is present in the source (a removed guard would silently return to crashing)", async () => {
 	const { readFileSync } = await import("node:fs");
 	const source = readFileSync(new URL("../../index.ts", import.meta.url), "utf8");
+	// #442: the delivery seam owns the guard, the summary line and the log path; the
+	// extension entry only says WHICH session a notice belongs to.
+	const delivery = readFileSync(new URL("../../src/extension/notice-delivery.ts", import.meta.url), "utf8");
 	// The whole point is that this is a code-shape fix: behaviour is identical
 	// until the host throws, so no behavioural assertion can catch a removal.
 	// Extract the function body by brace matching rather than a loose regex: the
 	// doc comment inside it mentions `}` and would defeat a naive pattern.
-	const start = source.indexOf("function notice(pi: ExtensionAPI, text: string): void {");
+	const start = source.indexOf("export function notice(pi: ExtensionAPI, text: string): void {");
 	assert.ok(start >= 0, "notice() must exist");
 	let depth = 0;
 	let end = start;
@@ -1808,15 +1811,35 @@ test("#273: the notice guard is present in the source (a removed try/catch would
 		}
 	}
 	const body = source.slice(start, end);
-	assert.match(
+	// #442 A: the load-captured `pi` may not be the delivery path. The host
+	// invalidates it on session replacement while the runtimes that call notice()
+	// outlive that, so a `pi`-only notice is a silent loss with a red line instead.
+	assert.match(body, /deliverNotice\(\{/, "notice() must hand the text to the delivery seam");
+	assert.match(body, /live: liveNoticeChannel\(scope\)/, "…and resolve the LIVE channel of its scope");
+	assert.match(body, /fallback: \(body\) => sendNoticeMessage\(pi, body\)/, "…keeping the captured pi as the LAST fallback");
+	assert.doesNotMatch(
 		body,
-		/try \{[\s\S]*?pi\.sendMessage\([\s\S]*?\} catch \(error\) \{/,
-		"notice() must guard sendMessage: an unguarded call crashes the process during extension loading",
+		/^\s*pi\.sendMessage\(/m,
+		"notice() must not send through the load-captured pi directly (#442 A)",
 	);
+	// #273: an unguarded send crashes the process during extension loading — the
+	// error handler may never be more fatal than the error it reports.
 	assert.match(
-		source,
-		/console\.error\(`\[pi-legion\] notice not delivered/,
+		delivery,
+		/try \{[\s\S]*?attempt\.send\(text\);\n[\s\S]*?\} catch \(error\) \{/,
+		"the send must be guarded: an unguarded call crashes the process during extension loading",
+	);
+	// #442 B: and the degrade is ONE line — the body goes to the log file, never to
+	// the transcript (that interpolation is exactly the red wall the issue reports).
+	assert.match(
+		delivery,
+		/`\[pi-legion\] notice not delivered: /,
 		"and it must degrade to stderr rather than swallowing silently",
+	);
+	assert.doesNotMatch(
+		delivery,
+		/\[pi-legion\] notice not delivered[^\n]*\$\{text\}/,
+		"the notice BODY must never be interpolated into the transcript line (#442 B)",
 	);
 });
 
