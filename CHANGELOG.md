@@ -31,7 +31,7 @@ summary so you can see **2.x vs 0.16** without leaving the tree.
 **测试**：单测 2866（trunk 2855，+11，全部为新增能力），集成 193/193，typecheck 绿。
 报告：`docs/reports/notice-delivery.md`。
 
-## [Unreleased] — 待发（patch）
+## [6.2.8] — 2026-11-20
 
 **`#441`：stall 告警不再给已退休的 child 发「跑了 1h45m」，也不再跨机恒真。** 今天 10+ 封误报的两个根因：
 (a) 候选集只看 ledger 行，而 `run.json` 早已 `state=retired`（行要等父 collect 才动），于是退役 1h23m 后还在
