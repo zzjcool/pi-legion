@@ -7,7 +7,7 @@
   候选过滤（#441 的地盘）；本 issue 只新增 run store 读取、session start 钩子、账本心跳、
   通知闩锁。
 - 不动版本号 / 不打 tag / 不 publish。
-- 用例：unit **2866 → 2888**（+22），integration **193 → 201**（+8），trunk 用例数不减。
+- 用例：unit **2866 → 2889**（+23），integration **193 → 201**（+8），trunk 用例数不减。
 
 ---
 
@@ -199,12 +199,14 @@ not announced`、记录原样保留、`formatReattachSummary = undefined`。单�
 - 设置解析：`reattachLiveChildren: false` 经真实 `loadSubagentSettings` 读出来，project 覆盖
   user，错误形状报错（`unit` 最后一条）。
 - watcher 的罢工预算：连续 3 次不可答 ⇒ 停止观看（不留无界 watcher）。
+- 通知的最后一寸：`deliverReattachNotice`（`reattach.ts:1056`）在**替换后的新会话活通道**上投递成功
+  ⇒ `true`；活通道抛错时退回捕获的 send；两边都失败 ⇒ `false`（闩锁不写，下次补发）。
 
 ## §5 门禁
 
 ```
 npm run typecheck        ✔
-npm test                 ✔ 2888 pass / 0 fail   (trunk 2866)
+npm test                 ✔ 2889 pass / 0 fail   (trunk 2866)
 npm run test:integration ✔ 201 pass / 0 fail    (trunk 193)
 ```
 
@@ -241,9 +243,9 @@ npm run test:integration ✔ 201 pass / 0 fail    (trunk 193)
 
 | 文件 | 作用 |
 |---|---|
-| `src/runs/reattach.ts`（新，~1170 行） | 候选发现、活性判据、两道 gate、采纳、watcher、闩锁、生产 seam |
+| `src/runs/reattach.ts`（新，~1200 行） | 候选发现、活性判据、两道 gate、采纳、watcher、闩锁、生产 seam |
 | `index.ts` | `session_start` 的 root-only 入口（1977-2123）、watcher 装配与 `session_shutdown` 停机（3201-3204）、import |
 | `src/shared/types.ts` / `src/agents/settings.ts` | `subagents.reattachLiveChildren` 类型 + parser + 合并 |
 | `test/helpers/fake-hc-core.mjs` | `finish_after_ms`（terminal 自己会结束）+ `FAKE_HC_TERMINAL_STATE`（跨进程看见 terminal，都是加法，不设环境变量时行为不变） |
-| `test/unit/reattach.test.ts`（新，22 条） | 决策层 |
+| `test/unit/reattach.test.ts`（新，23 条） | 决策层 |
 | `test/integration/reattach-live-children.test.ts`（新，8 条） | 端到端 |

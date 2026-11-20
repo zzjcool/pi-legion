@@ -172,6 +172,7 @@ import {
 import { findRecoveryLedgerForName, listRecoverableLeftovers, recoverCrossMachineChild, recoveryCallFor, recoveryHeadline, RECOVERY_ACTION } from "./src/runs/remote-recover.ts";
 import {
 	createReattachSettle,
+	deliverReattachNotice,
 	formatReattachSummary,
 	pendingReattachNotice,
 	pendingReattachNotices,
@@ -1993,19 +1994,14 @@ export default function piLegion(pi: ExtensionAPI, deps: ExtensionSupervisorDeps
 		// The SAME live-channel delivery every other notice uses (#442 A): a captured
 		// `pi` is invalidated by session replacement, so the scope's current channel is
 		// resolved at delivery time and the `pi` of this load stays the last resort.
-		try {
-			const scope = noticeScopeOf(pi);
-			const outcome = deliverNotice({
-				scope,
-				owner: pi,
-				live: liveNoticeChannel(scope),
-				text,
-				fallback: (body) => sendNoticeMessage(pi, body),
-			});
-			return outcome.status === "delivered";
-		} catch {
-			return false;
-		}
+		const scope = noticeScopeOf(pi);
+		return deliverReattachNotice({
+			scope,
+			owner: pi,
+			live: liveNoticeChannel(scope),
+			fallback: (body) => sendNoticeMessage(pi, body),
+			text,
+		});
 	};
 	const startReattach = (cwd: string, sessionFile: string | undefined, notify: ((text: string) => void) | undefined): void => {
 		if (reattachStarted) return;

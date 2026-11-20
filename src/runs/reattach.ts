@@ -73,6 +73,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { hcCliClient, type HcClient } from "../hc/client.ts";
+import { deliverNotice, type NoticeChannel, type NoticeSend } from "../extension/notice-delivery.ts";
 import { formatCompletionNotice, type CompletionNotice } from "../extension/notify.ts";
 import { legionDbPath, openLegionDb } from "../legion/db.ts";
 import { getNode, hasEnded, updateNode } from "../legion/nodes.ts";
@@ -1041,6 +1042,42 @@ export function createReattachSettle(crossMachine: CrossMachineSettings | undefi
 }
 
 // ── the latch (#445 §7) ─────────────────────────────────────────────────────
+
+/**
+ * Deliver one completion notice through the SAME live-channel seam every other
+ * notice uses (#442 A): a captured `pi` is invalidated by session replacement, so
+ * the scope's CURRENT channel is tried first and the caller's captured send is the
+ * last resort.
+ *
+ * Factored out of the extension wiring so the "通知自动到 B" claim is testable one
+ * inch further than the watcher: `true` means a channel really took it (and only
+ * then may the latch be written), `false` means the notice is still owed.
+ */
+export function deliverReattachNotice(input: {
+	scope: string;
+	/** The `pi` this extension load captured. */
+	owner: unknown;
+	/** The scope's current channel, resolved AT DELIVERY TIME by the caller. */
+	live: NoticeChannel | undefined;
+	/** Last resort: the caller's own send. */
+	fallback: NoticeSend;
+	text: string;
+}): boolean {
+	try {
+		const outcome = deliverNotice({
+			scope: input.scope,
+			owner: input.owner,
+			live: input.live,
+			fallback: input.fallback,
+			text: input.text,
+		});
+		return outcome.status === "delivered";
+	} catch {
+		// Never throws by construction (deliverNotice swallows), but a re-attach notice
+		// is not worth taking a session down for.
+		return false;
+	}
+}
 
 /** Is this child's completion already announced? (`reattached.notifiedAt`) */
 export function alreadyNotified(child: Pick<ChildRecord, "reattached">): boolean {

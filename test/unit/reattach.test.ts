@@ -30,8 +30,10 @@ import { legionDbPath, openLegionDb } from "../../src/legion/db.ts";
 import { getNode, insertNode, updateNode } from "../../src/legion/nodes.ts";
 import { RUN_OWNER_FILE, writeOwnerFile } from "../../src/runs/owner.ts";
 import type { RemoteTerminalProbe } from "../../src/runs/remote-artifact.ts";
+import { resetNoticeDelivery } from "../../src/extension/notice-delivery.ts";
 import {
 	alreadyNotified,
+	deliverReattachNotice,
 	discoverReattachCandidates,
 	formatReattachSummary,
 	type ReattachWatchTarget,
@@ -631,4 +633,53 @@ test("#445 §5: `subagents.reattachLiveChildren: false` survives the settings pa
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+// ── the last inch: the notice reaches the session's LIVE channel ──────────
+
+test("#445 §6: a completion notice goes to the scope's CURRENT channel (session replacement does not lose it)", () => {
+	resetNoticeDelivery();
+	const sent: string[] = [];
+	// What the replacement session's load installs (#442 A): a channel owned by the
+	// NEW `pi`, which the old closure can only reach through the registry.
+	const freshPi = { id: "fresh" };
+	const delivered = deliverReattachNotice({
+		scope: "root",
+		owner: { id: "stale" },
+		live: { owner: freshPi, send: (text) => sent.push(text) },
+		fallback: () => {
+			throw new Error("the captured pi is stale; this must not be reached");
+		},
+		text: "Background task completed: **worker-0**",
+	});
+	assert.equal(delivered, true);
+	assert.deepEqual(sent, ["Background task completed: **worker-0**"]);
+
+	// No live channel at all: the captured send is the last resort and still counts.
+	const fallbackSent: string[] = [];
+	assert.equal(deliverReattachNotice({
+		scope: "root",
+		owner: { id: "stale" },
+		live: undefined,
+		fallback: (text) => fallbackSent.push(text),
+		text: "second",
+	}), true);
+	assert.deepEqual(fallbackSent, ["second"]);
+
+	// Nothing took it: `false`, which is exactly what keeps the latch unset.
+	const quiet = { ...console, error: () => {} };
+	const original = console.error;
+	console.error = quiet.error as typeof console.error;
+	try {
+		assert.equal(deliverReattachNotice({
+			scope: "root",
+			owner: { id: "stale" },
+			live: { owner: { id: "dead" }, send: () => { throw new Error("stale ctx"); } },
+			fallback: () => { throw new Error("stale ctx"); },
+			text: "undeliverable",
+		}), false);
+	} finally {
+		console.error = original;
+	}
+	resetNoticeDelivery();
 });
