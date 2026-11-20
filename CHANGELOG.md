@@ -9,6 +9,28 @@ Published GitHub Release notes remain available at
 https://github.com/zzjcool/pi-legion/releases — this file is the in-repo
 summary so you can see **2.x vs 0.16** without leaving the tree.
 
+## [6.2.7] — 2026-11-20
+
+**一句话：通知不再因为"会话被替换/重载"而静默丢失，也不会再把整条正文刷进 transcript。**
+
+- **`#442` PR #443 通知投递改用活 ctx。** `notice()` 此前用**扩展加载期捕获的 `pi`** 投递；
+  `ctx.newSession()`（会话替换/重载）之后宿主把它判为 stale，于是**那之后的每一条通知都静默丢失**，
+  只在 stderr 留一行 `notice not delivered`。现在按 **scope** 在调用时解析「活通道」：
+  `root` 常量 / 子节点 `(dbPath,nodeId)`（与 `resolveLegionIdentity` 同一信道，in-process child 走 ALS
+  而非 `PI_LEGION_*`），状态挂 `globalThis[Symbol.for(...)]` 以跨宿主 `moduleCache:false` 重载；
+  每次扩展加载 `rememberNoticeScope` + `installNoticeChannel`，`session_shutdown` 带 owner 校验地卸载；
+  捕获的 `pi` 只作最后兜底。自证：**真扩展加载两次 + 用旧 `pi` 调 `notice()`** → 新 `pi` 收到正文、
+  旧 `pi` 零调用、`console.error` 零行；把 `notice()` 回退成只用 `pi` → 3 条测试红。
+- **`#442` 失败路径不再刷屏。** 投递失败只出一行摘要（`reason` + `kind` + `bytes` + 去向），
+  正文写 `<run store>/notice-delivery.log`；同类失败 1s 内最多一行、其余计数。
+  自证：注入总抛错的 sender → 连续 10 次失败在 transcript 里只留**一行**，日志 10 条、末条 `deduped=9`。
+- **`#442` 同一次检测不再重复投递。** 同一 stall 检测 **60s 内只投递一次**并合并计数，
+  键 = `child + kind + tier + windowBase`（从冻结正文解析，归一掉 `[legion mail #N]` 与 `Detected at …`）。
+  自证：30ms 内三次同档检测 → 投递 1 次、日志 `deduped=2`；跨档（3h）照常投递。
+
+**测试**：单测 2866（trunk 2855，+11，全部为新增能力），集成 193/193，typecheck 绿。
+报告：`docs/reports/notice-delivery.md`。
+
 ## [Unreleased] — 6.2.5（patch）
 
 **`#411`：跨机 child 的 transcript 不再实时镜像。** 跨机 child 的 `sessionFile` 是本机预先创建的
